@@ -1,0 +1,609 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FrontMind Strategy Pack",
+  "type": "object",
+  "required": [
+    "meta",
+    "artifacts",
+    "recommended_business_actions",
+    "s7_branch",
+    "pause_log"
+  ],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "brand",
+        "version",
+        "created_at",
+        "created_by",
+        "strategy_nodes_completed"
+      ],
+      "properties": {
+        "brand": {
+          "type": "string",
+          "description": "品牌中文简称，如'浚源检测'"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "策略包版本号，初始为 1，每次回流重算递增"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 格式的创建时间"
+        },
+        "created_by": {
+          "type": "string",
+          "const": "S0_strategy_orchestrator"
+        },
+        "strategy_nodes_completed": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "S1",
+              "S2",
+              "S3",
+              "S4",
+              "S5",
+              "S5.5",
+              "S6",
+              "S7",
+              "S8",
+              "S9"
+            ]
+          },
+          "minItems": 9
+        },
+        "client_report_nodes_completed": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "S10"
+            ]
+          },
+          "description": "客户交付型报告节点完成情况；不影响执行层 artifacts 契约"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "description": "各策略节点的产出文件路径与校验哈希",
+      "required": [
+        "S1_brand_facts",
+        "S2_marketing_atlas",
+        "S3_category_trend",
+        "S4_positioning",
+        "S5_diagnosis",
+        "S5.5_semantic_audit",
+        "S6_verbal_identity",
+        "S7_supersign",
+        "S8_question_qa",
+        "S9_enablement"
+      ],
+      "properties": {
+        "S1_brand_facts": {
+          "type": "object",
+          "required": [
+            "json",
+            "md",
+            "pdf",
+            "sha256"
+          ],
+          "properties": {
+            "json": {
+              "type": "string",
+              "description": "品牌事实图谱 JSON 文件路径"
+            },
+            "md": {
+              "type": "string",
+              "description": "品牌知识库 MD 文件路径"
+            },
+            "pdf": {
+              "type": "string",
+              "description": "品牌知识库 PDF 文件路径"
+            },
+            "gap_report": {
+              "type": "string",
+              "description": "缺口报告 MD 文件路径"
+            },
+            "sha256": {
+              "type": "string",
+              "description": "主文件 SHA256 哈希"
+            }
+          }
+        },
+        "S2_marketing_atlas": {
+          "type": "object",
+          "required": [
+            "json",
+            "md",
+            "pdf",
+            "sha256"
+          ],
+          "properties": {
+            "json": {
+              "type": "string"
+            },
+            "md": {
+              "type": "string"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "S3_category_trend": {
+          "type": "object",
+          "required": [
+            "md",
+            "pdf",
+            "json",
+            "sha256"
+          ],
+          "properties": {
+            "md": {
+              "type": "string"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "json": {
+              "type": "string",
+              "description": "趋势打分卡 JSON"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "S4_positioning": {
+          "type": "object",
+          "required": [
+            "md",
+            "pdf",
+            "json",
+            "sha256"
+          ],
+          "properties": {
+            "md": {
+              "type": "string",
+              "description": "品牌定位声明 MD"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "json": {
+              "type": "string",
+              "description": "定位声明结构化 JSON"
+            },
+            "report_md": {
+              "type": "string",
+              "description": "定位分析报告 MD"
+            },
+            "report_pdf": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "S5_diagnosis": {
+          "type": "object",
+          "required": [
+            "json",
+            "md",
+            "pdf",
+            "gap_md",
+            "sha256"
+          ],
+          "properties": {
+            "json": {
+              "type": "string"
+            },
+            "md": {
+              "type": "string"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "gap_md": {
+              "type": "string",
+              "description": "Gap 报告 MD"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "S5.5_semantic_audit": {
+          "type": "object",
+          "required": [
+            "json",
+            "md",
+            "pdf",
+            "sha256"
+          ],
+          "properties": {
+            "json": {
+              "type": "string",
+              "description": "语义资产评分卡 JSON"
+            },
+            "md": {
+              "type": "string",
+              "description": "语义资产审计报告 MD"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "S6_verbal_identity": {
+          "type": "object",
+          "required": [
+            "md",
+            "pdf",
+            "token_json",
+            "sha256"
+          ],
+          "properties": {
+            "md": {
+              "type": "string"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "token_json": {
+              "type": "string",
+              "description": "话语 Token JSON"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "S7_supersign": {
+          "type": "object",
+          "required": [
+            "prompt_json",
+            "md",
+            "pdf",
+            "sha256"
+          ],
+          "properties": {
+            "prompt_json": {
+              "type": "string",
+              "description": "视觉 Prompt 包 JSON"
+            },
+            "md": {
+              "type": "string"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "S8_question_qa": {
+          "type": "object",
+          "required": [
+            "json",
+            "matrix_json",
+            "calendar_json",
+            "md",
+            "pdf",
+            "sha256"
+          ],
+          "properties": {
+            "json": {
+              "type": "string",
+              "description": "问答树 JSON"
+            },
+            "matrix_json": {
+              "type": "string",
+              "description": "问答矩阵 JSON（≥ 30 条）"
+            },
+            "calendar_json": {
+              "type": "string",
+              "description": "内容日历 JSON（12 周）"
+            },
+            "md": {
+              "type": "string"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "blueprint_md": {
+              "type": "string",
+              "description": "落地页蓝图 MD"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "S9_enablement": {
+          "type": "object",
+          "required": [
+            "md",
+            "pdf",
+            "completeness_md",
+            "sha256"
+          ],
+          "properties": {
+            "md": {
+              "type": "string"
+            },
+            "pdf": {
+              "type": "string"
+            },
+            "completeness_md": {
+              "type": "string",
+              "description": "策略完整性检查 MD"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "recommended_business_actions": {
+      "type": "array",
+      "description": "S9 基于 S1-S8 企业问题总结输出的 GEO 业务优先行动清单；S10 只负责客户报告呈现，不再使用 M1-M5 旧赋能板块。",
+      "items": {
+        "type": "object",
+        "required": [
+          "action_id",
+          "title",
+          "problem_linked",
+          "priority",
+          "reason",
+          "expected_business_effect",
+          "owner_hint"
+        ],
+        "properties": {
+          "action_id": {
+            "type": "string",
+            "enum": [
+              "GEO_A1_entity_facts",
+              "GEO_A2_ai_visibility",
+              "GEO_A3_qa_assets",
+              "GEO_A4_positioning_language",
+              "GEO_A5_site_schema",
+              "GEO_A6_distribution_citations"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "problem_linked": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^P-[0-9]{2}$"
+            }
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "P0",
+              "P1",
+              "P2"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "description": "必须引用 S1-S8 证据说明推荐原因。"
+          },
+          "expected_business_effect": {
+            "type": "string"
+          },
+          "owner_hint": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "s7_branch": {
+      "type": "string",
+      "enum": [
+        "A",
+        "B"
+      ],
+      "description": "S7 执行的分支（A=已有VI, B=无VI）"
+    },
+    "pause_log": {
+      "type": "object",
+      "required": [
+        "pause_1",
+        "pause_2",
+        "pause_3",
+        "pause_4"
+      ],
+      "properties": {
+        "pause_1": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "confirmed",
+                "modified"
+              ]
+            },
+            "user_feedback": {
+              "type": "string"
+            }
+          }
+        },
+        "pause_2": {
+          "type": "object",
+          "required": [
+            "status",
+            "uploaded_file"
+          ],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "completed",
+                "pending_upload"
+              ],
+              "description": "AI 可见性监测数据上传状态。S4 完成后必须由客户自行确认 AI 监控问题、监测地域/平台并上传监测 JSON；S2 不再提供 S5 问题来源，也不再经过前置收集表。"
+            },
+            "region": {
+              "type": "string",
+              "enum": [
+                "海外",
+                "国内",
+                "全球",
+                ""
+              ],
+              "description": "客户确认的 AI 监测地域范围。"
+            },
+            "uploaded_file": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "AI 可见性监测数据 JSON。"
+            }
+          },
+          "description": "策略层暂停 2：S4 完成后、S5 启动前的 AI 监测问题/地域/数据确认。"
+        },
+        "pause_3": {
+          "type": "object",
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "completed",
+                "pending_generation",
+                "pending_client_confirmation"
+              ],
+              "description": "暂停3 应答逻辑确认表回填状态：completed 表示企业已回填应答逻辑确认表；pending_generation 表示 S9 完成但尚未生成确认表；pending_client_confirmation 表示确认表已生成待企业回填。"
+            },
+            "generated_file": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "S9 完成后生成、交企业回填的《应答逻辑确认表》Excel（如 {brand}_应答逻辑确认表.xlsx）。"
+            },
+            "uploaded_file": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "企业现场讨论回填后的《应答逻辑确认表》Excel（如 {brand}_应答逻辑确认表_现场讨论.xlsx），作为 S10 子表2 数据源。"
+            },
+            "confirmation_record": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "企业直接回复确认无误时生成的确认记录 JSON。"
+            }
+          },
+          "description": "策略层暂停 3：S9 全部执行完后、S10 和执行层启动前，生成《应答逻辑确认表》交企业现场讨论回填，回填结果作为 S10 品牌信息确认表子表2 的数据源。"
+        },
+        "pause_4": {
+          "type": "object",
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "completed",
+                "pending_generation",
+                "pending_client_confirmation"
+              ],
+              "description": "暂停4 品牌信息确认表最终确认状态：completed 表示企业已回传最终确认版且修改已回灌 S1-S9；pending_generation 表示 S10 尚未生成确认表；pending_client_confirmation 表示确认表已生成待企业最终确认。"
+            },
+            "generated_file": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "S10 生成、交企业最终确认的《品牌信息确认表》（如 S10_{brand}_品牌信息确认表.xlsx）。"
+            },
+            "uploaded_file": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "企业回填/确认后回传的《品牌信息确认表》（如 S10_{brand}_品牌信息确认表_已确认.xlsx）。"
+            },
+            "diff_record": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "解析企业回填后生成的《品牌信息修改清单》JSON（如 {brand}_品牌信息修改清单.json），记录需回灌 S1-S9 的修改项。"
+            }
+          },
+          "description": "策略层暂停 4：S10 品牌信息确认表发出后、封包前，等企业最终确认并将修改逐项回灌 S1-S9，是策略层最后一个强制暂停点。"
+        }
+      },
+      "description": "策略层四个暂停/确认点：pause_1=事实图谱确认，pause_2=AI 监测问题与数据确认，pause_3=应答逻辑确认表回填，pause_4=品牌信息确认表最终确认与回灌。"
+    },
+    "client_deliverables": {
+      "type": "object",
+      "properties": {
+        "brand_info_confirmation_sheet": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "S10 输出的《品牌信息确认表》XLSX（双子表：子表1 品牌信息确认、子表2 监控问题与应答逻辑确认），如 S10_{brand}_品牌信息确认表.xlsx；属于客户交付物，不进入执行层 artifacts。"
+        },
+        "answer_logic_confirmation_form": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "暂停3 生成、交企业回填的《应答逻辑确认表》Excel；属于客户确认/留档交付物，不进入执行层 artifacts。"
+        },
+        "answer_logic_confirmation_form_confirmed": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "企业现场讨论回填后的《应答逻辑确认表》Excel，作为 S10 子表2 数据源。"
+        },
+        "brand_info_confirmation_confirmed": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "企业最终确认回传的《品牌信息确认表》XLSX（如 S10_{brand}_品牌信息确认表_已确认.xlsx）；暂停4 回灌的依据。"
+        },
+        "brand_info_modification_list": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "解析企业回填后生成的《品牌信息修改清单》JSON，记录已回灌 S1-S9 的修改项与影响节点。"
+        }
+      }
+    }
+  }
+}

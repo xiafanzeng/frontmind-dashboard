@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FrontMind Prompt Plan Schema",
+  "description": "E3 视觉资产生成师输出的 Prompt Plan JSON Schema（v10）。记录每张 AIGC 图的完整 Prompt 分层与终稿来源要求，供 E4 审查回溯。",
+  "type": "object",
+  "required": [
+    "brand",
+    "article_id",
+    "generated_at",
+    "s7_version",
+    "prompts"
+  ],
+  "properties": {
+    "brand": {
+      "type": "string",
+      "description": "品牌名称"
+    },
+    "article_id": {
+      "type": "string",
+      "description": "文章编号"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "生成时间"
+    },
+    "s7_version": {
+      "type": "string",
+      "description": "使用的 S7 Prompt 包版本号"
+    },
+    "prompts": {
+      "type": "array",
+      "description": "每张 AIGC 图的 Prompt 分层记录",
+      "items": {
+        "type": "object",
+        "required": [
+          "fig_id",
+          "type",
+          "layers",
+          "final_positive_prompt",
+          "negative_prompt",
+          "generation_strategy",
+          "aigc_text_policy",
+          "s7_prompt_ref",
+          "required_generation_tool",
+          "finalization_required",
+          "html_draft_allowed",
+          "final_asset_origin_required"
+        ],
+        "properties": {
+          "fig_id": {
+            "type": "string",
+            "description": "图片唯一标识"
+          },
+          "type": {
+            "type": "string",
+            "description": "图片类型"
+          },
+          "layers": {
+            "type": "object",
+            "required": [
+              "s7_base",
+              "scene_overlay",
+              "text_policy_suffix"
+            ],
+            "properties": {
+              "s7_base": {
+                "type": "string",
+                "description": "S7 视觉 Prompt 包中的 positive_prompt 基底"
+              },
+              "scene_overlay": {
+                "type": "string",
+                "description": "E2 提供的场景描述层"
+              },
+              "localization": {
+                "type": "string",
+                "description": "本地化标签拼接"
+              },
+              "text_policy_suffix": {
+                "type": "string",
+                "description": "文字控制后缀"
+              }
+            }
+          },
+          "final_positive_prompt": {
+            "type": "string",
+            "minLength": 30,
+            "description": "最终拼装的正面 Prompt"
+          },
+          "negative_prompt": {
+            "type": "string",
+            "description": "负面提示词"
+          },
+          "generation_strategy": {
+            "type": "string",
+            "enum": [
+              "text2img",
+              "img2img",
+              "auto"
+            ],
+            "description": "生成策略"
+          },
+          "reference_assets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "引用的参考资产路径"
+          },
+          "img2img_reference": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "img2img 垫图参考路径"
+          },
+          "tool_params": {
+            "type": "object",
+            "description": "工具特定参数"
+          },
+          "aigc_text_policy": {
+            "type": "string",
+            "enum": [
+              "brand_poster_full_text",
+              "no_aigc"
+            ],
+            "description": "AIGC 文字控制策略（★ v4：A 类首图用 brand_poster_full_text 生成含品牌名+Slogan+卖点的精美海报，场景图默认 no_aigc）"
+          },
+          "s7_prompt_ref": {
+            "type": "string",
+            "description": "引用的 S7 motif_id"
+          },
+          "required_generation_tool": {
+            "type": "string",
+            "description": "AIGC品牌海报必填；默认 gpt-image-2。HTML/CSS/PPT渲染不得满足该字段。"
+          },
+          "finalization_required": {
+            "type": "boolean",
+            "description": "是否必须进入终稿图像生成/美化流程；A类首图必须为 true。"
+          },
+          "html_draft_allowed": {
+            "type": "boolean",
+            "description": "HTML/CSS/PPT/线框图是否允许作为最终图；A类品牌海报必须为 false。"
+          },
+          "final_asset_origin_required": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "允许成为最终图的来源。品牌海报通常为 gpt-image-2 或用户批准同级图像模型。"
+          }
+        }
+      }
+    }
+  }
+}

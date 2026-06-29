@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FrontMind QA Architecture Tree Schema",
+  "description": "问答树 JSON 结构定义，用于 S8 问答架构师的产出校验",
+  "type": "object",
+  "required": ["meta", "question_stages"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["brand", "version", "generated_at", "total_questions"],
+      "properties": {
+        "brand": { "type": "string", "description": "品牌名称" },
+        "version": { "type": "integer", "minimum": 1 },
+        "generated_at": { "type": "string", "format": "date-time" },
+        "total_questions": { "type": "integer", "minimum": 25, "description": "总问题数，5段×≥5=≥25" }
+      }
+    },
+    "question_stages": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": ["stage_id", "stage_name", "stage_name_en", "questions"],
+        "properties": {
+          "stage_id": { "type": "integer", "minimum": 1, "maximum": 5 },
+          "stage_name": {
+            "type": "string",
+            "enum": ["认知", "考虑", "决策", "使用", "推荐"]
+          },
+          "stage_name_en": {
+            "type": "string",
+            "enum": ["awareness", "consideration", "decision", "usage", "advocacy"]
+          },
+          "description": { "type": "string", "description": "该阶段的用户心理描述" },
+          "questions": {
+            "type": "array",
+            "minItems": 5,
+            "items": {
+              "type": "object",
+              "required": ["question_id", "question", "intent_type", "source", "follow_ups"],
+              "properties": {
+                "question_id": { "type": "string", "pattern": "^(AW|CO|DE|US|AD)_[0-9]{3}$", "description": "问题编号，格式为 {stage_prefix}_{NNN}，如 AW_001、CO_005、DE_008" },
+                "question": { "type": "string", "description": "用户可能提出的问题" },
+                "intent_type": {
+                  "type": "string",
+                  "enum": ["informational", "navigational", "transactional", "comparison"],
+                  "description": "问题意图类型"
+                },
+                "source": {
+                  "type": "string",
+                  "enum": ["S2_atlas", "S5_gap", "industry_template", "long_tail"],
+                  "description": "问题来源"
+                },
+                "search_volume_estimate": {
+                  "type": "string",
+                  "enum": ["high", "medium", "low"],
+                  "description": "预估搜索量级"
+                },
+                "follow_ups": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 3,
+                  "items": {
+                    "type": "object",
+                    "required": ["follow_up_question", "target_stage"],
+                    "properties": {
+                      "follow_up_question": { "type": "string" },
+                      "target_stage": { "type": "string", "description": "追问跳转的目标阶段" }
+                    }
+                  },
+                  "description": "可能的追问路径"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

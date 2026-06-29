@@ -1,0 +1,1834 @@
+/**
+ * ChatArea Component - Main chat interface
+ * Design: Glassmorphism cards, fluid animations, spacious layout.
+ * Features: Message display, file/image attachments, status indicators,
+ *           inline PDF viewer (blob-based for auth), inline Markdown reader,
+ *           HTML file preview.
+ *
+ * FIX: PDF/HTML files now render correctly by fetching with auth headers
+ * and creating blob URLs for iframe rendering.
+ */
+import React, { useRef, useEffect, useState, useCallback } from "react";
+import { parseOutputMessages, useConversation, type LocalMessage } from "@/contexts/ConversationContext";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Badge } from "@/components/ui/badge";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  ExternalLink,
+  FileText,
+  Download,
+  Clock,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  Bot,
+  User,
+  Sparkles,
+  Copy,
+  Trash2,
+  MoreHorizontal,
+  X,
+  BookOpen,
+  UploadCloud,
+} from "lucide-react";
+import { cn, copyToClipboard } from "@/lib/utils";
+import { creditEventBus, getConfig, MODEL_OPTIONS, retrieveTask, sanitizeBrandText, uploadFile, type OutputMessage } from "@/lib/frontmind-api";
+import ChatInput from "./ChatInput";
+import MarkdownRenderer from "./MarkdownRenderer";
+import ImagePreview from "./ImagePreview";
+import FilePreview from "./FilePreview";
+import MessageActions from "./MessageActions";
+import { toast } from "sonner";
+import TypingIndicator, { PulsingDot } from "./TypingIndicator";
+import IntermediateSteps from "./IntermediateSteps";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+
+const EMPTY_STATE_IMG = "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
+
+const REPORT_POLL_INTERVAL = 3000;
+
+type ReportTaskStatus = "idle" | "running" | "pending" | "completed" | "error" | "failed";
+
+interface OneClickTaskStartResponse {
+  visibleMessage?: string;
+  startedAt?: number;
+  task: {
+    id: string;
+    status: ReportTaskStatus;
+    taskUrl?: string;
+    title?: string;
+    output?: OutputMessage[];
+  };
+}
+
+interface DeepReportStartInput {
+  companyName: string;
+  operatorNotes?: string;
+  agentProfile?: string;
+  files: File[];
+}
+
+function normalizeReportStatus(status: string | undefined): ReportTaskStatus {
+  if (status === "failed") return "error";
+  if (status === "pending" || status === "completed" || status === "error") return status;
+  return "running";
+}
+
+async function readErrorMessage(response: Response) {
+  try {
+    const data = await response.json();
+    return data.error || data.message || `请求失败 (${response.status})`;
+  } catch {
+    return `请求失败 (${response.status})`;
+  }
+}
+
+
+
+/**
+ * Filter out "等待用户输入" text from assistant messages (req 8)
+ */
+function filterWaitingText(content: string): string {
+  if (!content || typeof content !== "string") return content || "";
+  try {
+    return content
+      .replace(/^等待用户输入[。.…]*$/gm, "")
+      .replace(/等待用户输入[。.…]*/g, "")
+      .trim();
+  } catch (e) {
+    console.error("[filterWaitingText] Error:", e);
+    return content;
+  }
+}
+
+/**
+ * Fetch a file URL with auth headers and return a blob URL.
+ * Works for both /api/frontmind/v1/files/ URLs, proxy-download URLs, and external URLs.
+ * 
+ * The server proxy now handles:
+ * - /v1/files/:id → fetches metadata, then downloads binary from S3
+ * - /proxy-download?url=... → proxies binary from external URLs
+ * So this function should receive proper binary content.
+ */
+function buildProxyDownloadUrl(fileUrl: string, fileName?: string, asDownload = false): string | null {
+  try {
+    const parsed = new URL(fileUrl, window.location.origin);
+    if (parsed.pathname.endsWith("/api/frontmind/proxy-download")) {
+      if (fileName) parsed.searchParams.set("filename", sanitizeBrandText(fileName));
+      if (asDownload) parsed.searchParams.set("download", "1");
+      return `${parsed.pathname}${parsed.search}`;
+    }
+    if (/^https?:\/\//i.test(fileUrl)) {
+      const params = new URLSearchParams({ url: fileUrl });
+      if (fileName) params.set("filename", sanitizeBrandText(fileName));
+      if (asDownload) params.set("download", "1");
+      return `/api/frontmind/proxy-download?${params.toString()}`;
+    }
+  } catch {
+    // Ignore malformed URLs and keep the normal proxy path.
+  }
+  return null;
+}
+
+function nativeDownload(url: string, fileName: string) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+/**
+ * Fetch a file URL with auth headers and return a blob URL.
+ * External signed URLs are normalized to the same-origin proxy so file content
+ * and response headers can be sanitized before the browser renders or downloads them.
+ */
+async function fetchWithAuth(fileUrl: string, fileName?: string): Promise<string> {
+  const normalizedUrl = buildProxyDownloadUrl(fileUrl, fileName, false) || fileUrl;
+  const config = getConfig();
+  const headers: Record<string, string> = {};
+
+  // Only add auth headers for our proxy URLs
+  if (normalizedUrl.startsWith("/api/frontmind/")) {
+    headers["X-FrontMind-API-Key"] = config.apiKey;
+    headers["X-FrontMind-Base-URL"] = config.baseUrl;
+  }
+
+  const response = await fetch(normalizedUrl, {
+    headers,
+    credentials: "include",
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch: HTTP ${response.status}`);
+  }
+
+  // Safety check: if we got JSON instead of binary, it might be metadata
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json") && normalizedUrl.includes("/v1/files/")) {
+    const text = await response.text();
+    try {
+      const data = JSON.parse(text);
+      if (data.upload_url) {
+        // Got metadata instead of binary - fetch from S3 URL via proxy
+        const proxyUrl = buildProxyDownloadUrl(data.upload_url, fileName, false) || `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
+        const s3Response = await fetch(proxyUrl, {
+          headers: {
+            "X-FrontMind-API-Key": config.apiKey,
+            "X-FrontMind-Base-URL": config.baseUrl,
+          },
+          credentials: "include",
+        });
+        if (!s3Response.ok) {
+          throw new Error(`S3 proxy download failed: HTTP ${s3Response.status}`);
+        }
+        const blob = await s3Response.blob();
+        return URL.createObjectURL(blob);
+      }
+    } catch (err) {
+      // Not valid JSON or no upload_url
+    }
+    throw new Error("Received JSON metadata instead of file content");
+  }
+
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}
+
+export default function ChatArea() {
+  const {
+    activeConversation,
+    deleteConversation,
+    deleteMessage,
+    addMessage,
+    updateStatus,
+    updateAssistantMessages,
+    updateTitle,
+  } = useConversation();
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const reportPollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reportPollingTokenRef = useRef(0);
+
+  const [, setTick] = useState(0);
+
+  const status = activeConversation?.status;
+  const startedAt = activeConversation?.startedAt;
+  const completedAt = activeConversation?.completedAt;
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [activeConversation?.messages?.length, status]);
+
+  // Force re-render every second when running to update elapsed time
+  useEffect(() => {
+    if (status === "running" && startedAt) {
+      const timer = setInterval(() => setTick((t) => t + 1), 1000);
+      return () => clearInterval(timer);
+    }
+  }, [status, startedAt]);
+
+  const stopReportPolling = useCallback(() => {
+    reportPollingTokenRef.current += 1;
+    if (reportPollingTimeoutRef.current) {
+      clearTimeout(reportPollingTimeoutRef.current);
+      reportPollingTimeoutRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => stopReportPolling();
+  }, [stopReportPolling]);
+
+  const pollReportTask = useCallback(
+    (
+      conversationId: string,
+      taskId: string,
+      responseStartedAt: number,
+      modelName?: string,
+      completionToast = "任务制作完成"
+    ) => {
+      stopReportPolling();
+      const token = reportPollingTokenRef.current;
+      let pollCount = 0;
+      let consecutiveErrors = 0;
+      let completionHandled = false;
+
+      const applyOutput = (output: OutputMessage[] | undefined, elapsedSeconds?: number) => {
+        if (!output || output.length === 0) return;
+        try {
+          const assistantMessages = parseOutputMessages(output, responseStartedAt, modelName);
+          if (elapsedSeconds != null && assistantMessages.length > 0) {
+            assistantMessages[assistantMessages.length - 1].elapsedTime = elapsedSeconds;
+          }
+          if (assistantMessages.length > 0) {
+            updateAssistantMessages(conversationId, assistantMessages);
+          }
+        } catch (error) {
+          console.error("[One Click Workflow] Failed to parse output:", error);
+        }
+      };
+
+      const pollOnce = async () => {
+        if (token !== reportPollingTokenRef.current || completionHandled) return;
+
+        try {
+          pollCount += 1;
+          const updated = await retrieveTask(taskId);
+          if (token !== reportPollingTokenRef.current || completionHandled) return;
+
+          const normalizedStatus = normalizeReportStatus(updated.status);
+          const totalOutputLength = updated.output?.length || 0;
+
+          if (normalizedStatus === "completed") {
+            completionHandled = true;
+            const completedAt = Date.now();
+            const elapsedSeconds = (completedAt - responseStartedAt) / 1000;
+            applyOutput(updated.output, elapsedSeconds);
+            updateStatus(conversationId, "completed", {
+              taskId: updated.id,
+              taskUrl: updated.metadata?.task_url,
+              previousResponseId: updated.id,
+              completedAt,
+              lastKnownOutputLength: totalOutputLength,
+            });
+            toast.success(completionToast, {
+              description: "结果已同步到当前内容流程。",
+              duration: 3200,
+            });
+            creditEventBus.emit();
+            return;
+          }
+
+          if (normalizedStatus === "error") {
+            completionHandled = true;
+            const completedAt = Date.now();
+            const errorMessage = updated.error?.message || "任务执行出错";
+            applyOutput(updated.output);
+            updateStatus(conversationId, "error", {
+              taskId: updated.id,
+              taskUrl: updated.metadata?.task_url,
+              previousResponseId: updated.id,
+              completedAt,
+              lastKnownOutputLength: totalOutputLength,
+            });
+            addMessage(conversationId, {
+              id: `msg-report-err-${Date.now()}`,
+              role: "assistant",
+              content: `错误: ${errorMessage}`,
+              timestamp: Date.now(),
+            });
+            toast.error(errorMessage);
+            creditEventBus.emit();
+            return;
+          }
+
+          applyOutput(updated.output);
+          updateStatus(conversationId, normalizedStatus, {
+            taskId: updated.id,
+            taskUrl: updated.metadata?.task_url,
+            previousResponseId: updated.id,
+            lastKnownOutputLength: totalOutputLength,
+          });
+
+          if (pollCount > 1200) {
+            completionHandled = true;
+            updateStatus(conversationId, "error", { completedAt: Date.now() });
+            toast.warning("轮询超时，请稍后手动刷新查看结果");
+            creditEventBus.emit();
+            return;
+          }
+
+          consecutiveErrors = 0;
+        } catch (error: any) {
+          consecutiveErrors += 1;
+          console.error("[One Click Workflow] Polling error:", error);
+
+          if (consecutiveErrors >= 10) {
+            completionHandled = true;
+            updateStatus(conversationId, "error", { completedAt: Date.now() });
+            toast.error("连续多次请求失败，已停止轮询");
+            return;
+          }
+        }
+
+        if (token === reportPollingTokenRef.current && !completionHandled) {
+          reportPollingTimeoutRef.current = setTimeout(pollOnce, REPORT_POLL_INTERVAL);
+        }
+      };
+
+      reportPollingTimeoutRef.current = setTimeout(pollOnce, REPORT_POLL_INTERVAL);
+    },
+    [addMessage, stopReportPolling, updateAssistantMessages, updateStatus]
+  );
+
+  const startNewsRelease = useCallback(
+    async ({ companyName, operatorNotes, agentProfile, files }: DeepReportStartInput) => {
+      if (!activeConversation) return;
+
+      const config = getConfig();
+      if (!config.apiKey) {
+        toast.error("请先在设置中填写 API Key");
+        return;
+      }
+      const selectedAgentProfile = agentProfile || "frontmind-pro";
+
+      const conversationId = activeConversation.id;
+      const responseStartedAt = Date.now();
+      stopReportPolling();
+
+      addMessage(conversationId, {
+        id: `msg-news-start-${responseStartedAt}`,
+        role: "user",
+        content: "开始制作品牌新闻稿样例",
+        timestamp: responseStartedAt,
+      });
+      updateTitle(conversationId, "品牌新闻稿样例");
+      updateStatus(conversationId, "running", { startedAt: responseStartedAt });
+
+      try {
+        const uploadedAttachments: Array<{ file_id: string; filename: string }> = [];
+        for (const file of files) {
+          const uploaded = await uploadFile(file);
+          uploadedAttachments.push({
+            file_id: uploaded.fileId,
+            filename: uploaded.filename,
+          });
+        }
+
+        const response = await fetch("/api/news-release/start", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-FrontMind-API-Key": config.apiKey,
+            "X-FrontMind-Base-URL": config.baseUrl,
+          },
+          credentials: "include",
+          body: JSON.stringify({
+            companyName,
+            operatorNotes,
+            agentProfile: selectedAgentProfile,
+            attachments: uploadedAttachments,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error(await readErrorMessage(response));
+        }
+
+        const data = (await response.json()) as OneClickTaskStartResponse;
+        if (!data.task?.id) {
+          throw new Error("任务创建失败：未返回任务 ID");
+        }
+
+        const normalizedStatus = normalizeReportStatus(data.task.status);
+        const taskStartedAt = data.startedAt || responseStartedAt;
+        const totalOutputLength = data.task.output?.length || 0;
+
+        updateStatus(conversationId, normalizedStatus, {
+          taskId: data.task.id,
+          taskUrl: data.task.taskUrl,
+          previousResponseId: data.task.id,
+          startedAt: taskStartedAt,
+          lastKnownOutputLength: totalOutputLength,
+        });
+
+        if (data.task.output && data.task.output.length > 0) {
+          const assistantMessages = parseOutputMessages(
+            data.task.output,
+            taskStartedAt,
+            selectedAgentProfile
+          );
+          if (assistantMessages.length > 0) {
+            updateAssistantMessages(conversationId, assistantMessages);
+          }
+        }
+
+        toast.success("已开始制作品牌新闻稿样例", {
+          description: "结果会自动出现在当前内容流程中。",
+          duration: 3200,
+        });
+
+        if (normalizedStatus === "running" || normalizedStatus === "pending") {
+          pollReportTask(conversationId, data.task.id, taskStartedAt, selectedAgentProfile, "品牌新闻稿样例制作完成");
+        } else if (normalizedStatus === "completed") {
+          updateStatus(conversationId, "completed", {
+            completedAt: Date.now(),
+            lastKnownOutputLength: totalOutputLength,
+          });
+          creditEventBus.emit();
+        }
+      } catch (error: any) {
+        const errorMessage = error?.message || "启动失败";
+        updateStatus(conversationId, "error", { completedAt: Date.now() });
+        addMessage(conversationId, {
+          id: `msg-news-start-err-${Date.now()}`,
+          role: "assistant",
+          content: `错误: ${errorMessage}`,
+          timestamp: Date.now(),
+        });
+        toast.error("启动失败", { description: errorMessage });
+      }
+    },
+    [
+      activeConversation,
+      addMessage,
+      pollReportTask,
+      stopReportPolling,
+      updateAssistantMessages,
+      updateStatus,
+      updateTitle,
+    ]
+  );
+
+  if (!activeConversation) {
+    return <EmptyState />;
+  }
+
+  const { messages } = activeConversation;
+
+  const sanitizedTitle = activeConversation.title ? sanitizeBrandText(activeConversation.title) : activeConversation.title;
+
+  return (
+    <div className="flex-1 flex flex-col h-full relative">
+      {/* Header bar */}
+      <div className="flex items-center justify-between px-4 py-3.5 sm:px-6 border-b border-border/60 bg-background/85 backdrop-blur-xl">
+        <div className="flex min-w-0 items-center gap-3 pl-10 sm:pl-0">
+          <h2 className="text-sm font-semibold text-foreground/80 truncate max-w-[400px]">
+            {sanitizedTitle}
+          </h2>
+          <StatusBadge status={status || "idle"} />
+        </div>
+      </div>
+
+      {/* Messages area */}
+      <div className="flex-1 overflow-y-auto custom-scrollbar">
+        <div className="max-w-4xl mx-auto px-3 py-6 space-y-6 sm:px-5 sm:py-8 sm:space-y-7">
+          {messages.length === 0 && status === "idle" && (
+            <EmptyConversationHint
+              onStartNewsRelease={startNewsRelease}
+            />
+          )}
+
+          <AnimatePresence initial={false}>
+            {messages.map((msg) => (
+              <MessageBubble
+                key={msg.id}
+                message={msg}
+                isRunning={status === "running"}
+                onDelete={() => {
+                  if (activeConversation) {
+                    deleteMessage(activeConversation.id, msg.id);
+                  }
+                }}
+              />
+            ))}
+          </AnimatePresence>
+
+          {/* Typing indicator when running */}
+          {status === "running" && (() => {
+            let lastUserIdx = -1;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if (messages[i].role === "user") { lastUserIdx = i; break; }
+            }
+            const recentAssistantMsgs = messages.slice(lastUserIdx + 1).filter(m => m.role === "assistant");
+            const hasStepsOrContent = recentAssistantMsgs.some(
+              m => (m.stepGroups && m.stepGroups.length > 0) || (m.content && m.content.trim() !== "")
+            );
+            return !hasStepsOrContent;
+          })() && (
+            <TypingIndicator />
+          )}
+
+          <div ref={bottomRef} />
+        </div>
+      </div>
+
+      {/* Input area */}
+      <ChatInput />
+    </div>
+  );
+}
+
+function EmptyState() {
+  const { createConversation } = useConversation();
+
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center px-6">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ type: "spring", stiffness: 200, damping: 20 }}
+        className="text-center max-w-xl"
+      >
+        <img
+          src={EMPTY_STATE_IMG}
+          alt="FrontMind AI"
+          className="w-24 h-24 mx-auto mb-7 object-contain drop-shadow-sm rounded-2xl"
+        />
+        <h2 className="text-2xl font-bold text-foreground/80 mb-2 tracking-tight">
+          FrontMind 内容制作智能体
+        </h2>
+        <p className="text-sm text-muted-foreground mb-8 leading-relaxed max-w-sm mx-auto">
+          面向客户交付的智能内容生产工作台，支持文本、图片、文件输入与多智能体编排。
+        </p>
+        <button
+          onClick={() => createConversation()}
+          className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all shadow-lg glow-indigo active:scale-[0.98]"
+        >
+          <Sparkles className="w-4 h-4" />
+          创建内容制作流程
+        </button>
+      </motion.div>
+    </div>
+  );
+}
+
+function EmptyConversationHint({
+  onStartNewsRelease,
+}: {
+  onStartNewsRelease: (input: DeepReportStartInput) => Promise<void>;
+}) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [companyName, setCompanyName] = useState("");
+  const [agentProfile, setAgentProfile] = useState("frontmind-pro");
+  const [operatorNotes, setOperatorNotes] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+
+  const addFiles = useCallback((fileList: FileList | File[]) => {
+    const incoming = Array.from(fileList);
+    setFiles((current) => {
+      const seen = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+      const next = [...current];
+      for (const file of incoming) {
+        const key = `${file.name}:${file.size}:${file.lastModified}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          next.push(file);
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  const resetDialog = useCallback(() => {
+    setCompanyName("");
+    setAgentProfile("frontmind-pro");
+    setOperatorNotes("");
+    setFiles([]);
+    setIsDragging(false);
+    setIsStarting(false);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }, []);
+
+  const removeFile = useCallback((index: number) => {
+    setFiles((current) => current.filter((_, fileIndex) => fileIndex !== index));
+  }, []);
+
+  const handleStart = useCallback(async () => {
+    const normalizedCompanyName = companyName.trim();
+    if (!normalizedCompanyName) {
+      toast.error("请输入企业名称");
+      return;
+    }
+
+    setIsStarting(true);
+    try {
+      const payload = {
+        companyName: normalizedCompanyName,
+        agentProfile,
+        operatorNotes: operatorNotes.trim(),
+        files,
+      };
+      await onStartNewsRelease(payload);
+      setDialogOpen(false);
+      resetDialog();
+    } finally {
+      setIsStarting(false);
+    }
+  }, [
+    agentProfile,
+    companyName,
+    files,
+    onStartNewsRelease,
+    operatorNotes,
+    resetDialog,
+  ]);
+
+  return (
+    <>
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="space-y-7"
+      >
+        {/* Introduction section */}
+        <div className="text-center py-8">
+          <h3 className="text-lg font-semibold text-foreground/70 mb-3">
+            内容制作智能体编排工作流
+          </h3>
+          <p className="text-sm text-muted-foreground leading-relaxed max-w-lg mx-auto">
+            以研究、分析与交付为核心的专业内容生产引擎
+          </p>
+          <div className="flex flex-wrap justify-center gap-3 pt-6">
+            <Button
+              type="button"
+              onClick={() => setDialogOpen(true)}
+              className="h-11 rounded-xl px-5 gap-2 shadow-sm"
+            >
+              <Sparkles className="w-4 h-4" />
+              制作品牌新闻稿样例
+            </Button>
+          </div>
+        </div>
+
+        {/* Features highlight */}
+        <div className="flex flex-wrap justify-center gap-4 pt-1">
+          <FeatureBadge icon={<FileText className="w-3.5 h-3.5" />} text="资料输入" />
+          <FeatureBadge icon={<Sparkles className="w-3.5 h-3.5" />} text="智能分析" />
+          <FeatureBadge icon={<Download className="w-3.5 h-3.5" />} text="报告交付" />
+        </div>
+      </motion.div>
+
+      <Dialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          if (isStarting) return;
+          setDialogOpen(open);
+          if (!open) resetDialog();
+        }}
+      >
+        <DialogContent className="w-[calc(100vw-1rem)] sm:max-w-[560px] max-h-[calc(100dvh-1rem)] overflow-y-auto p-4 sm:p-6">
+          <DialogTitle>制作品牌新闻稿样例</DialogTitle>
+          <DialogDescription>
+            输入企业名称、备注并上传相关资料，系统会在当前对话中开始制作。
+          </DialogDescription>
+
+          <div className="space-y-5 py-2">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground/80">企业名称</label>
+              <Input
+                value={companyName}
+                onChange={(event) => setCompanyName(event.target.value)}
+                placeholder="填写企业名称"
+                disabled={isStarting}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    void handleStart();
+                  }
+                }}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground/80">模型</label>
+              <div className="grid grid-cols-3 rounded-xl border border-border/70 bg-muted/30 p-1">
+                {MODEL_OPTIONS.map((model) => {
+                  const label =
+                    model.value === "frontmind-lite"
+                      ? "Lite"
+                      : model.value === "frontmind-base"
+                        ? "Base"
+                        : "Pro";
+                  const selected = agentProfile === model.value;
+                  return (
+                    <button
+                      key={model.value}
+                      type="button"
+                      disabled={isStarting}
+                      onClick={() => setAgentProfile(model.value)}
+                      className={cn(
+                        "h-9 rounded-lg text-sm font-medium transition-colors",
+                        selected
+                          ? "bg-primary text-primary-foreground shadow-sm"
+                          : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
+                        isStarting && "cursor-not-allowed opacity-60"
+                      )}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground/80">备注</label>
+              <Textarea
+                value={operatorNotes}
+                onChange={(event) => setOperatorNotes(event.target.value)}
+                placeholder="填写用户想法、关注点、限制或特别要求"
+                disabled={isStarting}
+                className="min-h-24 resize-none"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground/80">资料</label>
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => fileInputRef.current?.click()}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    fileInputRef.current?.click();
+                  }
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  if (!isStarting) setIsDragging(true);
+                }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setIsDragging(false);
+                  if (!isStarting && event.dataTransfer.files.length > 0) {
+                    addFiles(event.dataTransfer.files);
+                  }
+                }}
+                className={cn(
+                  "flex min-h-[132px] cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed bg-card/70 px-4 py-5 text-center transition-colors",
+                  isDragging
+                    ? "border-primary/70 bg-primary/5"
+                    : "border-border hover:border-primary/40 hover:bg-muted/40",
+                  isStarting && "cursor-not-allowed opacity-60"
+                )}
+              >
+                <UploadCloud className="mb-3 h-6 w-6 text-primary" />
+                <div className="text-sm font-medium text-foreground/80">
+                  拖入资料，或点击选择文件
+                </div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  支持 PDF、Word、图片、表格等企业资料
+                </div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  className="sr-only"
+                  disabled={isStarting}
+                  onChange={(event) => {
+                    if (event.target.files) addFiles(event.target.files);
+                  }}
+                />
+              </div>
+
+              {files.length > 0 && (
+                <div className="space-y-2 rounded-xl border border-border/70 bg-muted/20 p-3">
+                  {files.map((file, index) => (
+                    <div
+                      key={`${file.name}-${file.size}-${file.lastModified}`}
+                      className="flex items-center justify-between gap-3 rounded-lg bg-background/80 px-3 py-2 text-sm"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-foreground/80">{file.name}</div>
+                        <div className="text-xs text-muted-foreground">
+                          {(file.size / 1024 / 1024).toFixed(2)} MB
+                        </div>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 shrink-0"
+                        disabled={isStarting}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          removeFile(index);
+                        }}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setDialogOpen(false);
+                resetDialog();
+              }}
+              disabled={isStarting}
+            >
+              取消
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void handleStart()}
+              disabled={isStarting || !companyName.trim()}
+              className="gap-2"
+            >
+              {isStarting ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <FileText className="h-4 w-4" />
+              )}
+              开始制作
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function FeatureBadge({ icon, text }: { icon: React.ReactNode; text: string }) {
+  return (
+    <div className="flex items-center gap-2 px-3.5 py-2 rounded-full bg-card/80 border border-border/70 text-xs text-muted-foreground shadow-sm">
+      {icon}
+      {text}
+    </div>
+  );
+}
+
+/**
+ * Inline Markdown File Reader - opens .md files in a resizable dialog overlay.
+ */
+function MarkdownFileReader({
+  fileUrl,
+  fileName,
+  isOpen,
+  onClose,
+}: {
+  fileUrl: string;
+  fileName: string;
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const [content, setContent] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [size, setSize] = useState({ width: 720, height: 560 });
+  const displayFileName = sanitizeBrandText(fileName);
+  const resizingRef = useRef(false);
+  const startRef = useRef({ x: 0, y: 0, w: 0, h: 0 });
+
+  useEffect(() => {
+    if (isOpen && fileUrl) {
+      setLoading(true);
+      setError(null);
+      setContent(null);
+
+      // Fetch through the same-origin proxy when the source is an external signed URL.
+      const config = getConfig();
+      const headers: Record<string, string> = {};
+      const displayName = sanitizeBrandText(fileName);
+      const normalizedUrl = buildProxyDownloadUrl(fileUrl, displayName, false) || fileUrl;
+      if (normalizedUrl.startsWith("/api/frontmind/")) {
+        headers["X-FrontMind-API-Key"] = config.apiKey;
+        headers["X-FrontMind-Base-URL"] = config.baseUrl;
+      }
+
+      fetch(normalizedUrl, { headers, credentials: "include" })
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+          const text = await res.text();
+          
+          // Safety: check if we got JSON metadata instead of markdown content
+          const ct = res.headers.get("content-type") || "";
+          if (ct.includes("application/json") && fileUrl.includes("/v1/files/")) {
+            try {
+              const data = JSON.parse(text);
+              if (data.upload_url) {
+                // Fetch actual content from S3 via proxy
+                const proxyUrl = buildProxyDownloadUrl(data.upload_url, displayName, false) || `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
+                const s3Res = await fetch(proxyUrl, {
+                  headers: {
+                    "X-FrontMind-API-Key": config.apiKey,
+                    "X-FrontMind-Base-URL": config.baseUrl,
+                  },
+                  credentials: "include",
+                });
+                if (!s3Res.ok) {
+                  throw new Error(`S3 download failed: HTTP ${s3Res.status}`);
+                }
+                return s3Res.text();
+              }
+            } catch (err) {
+              if ((err as Error)?.message?.includes("download failed")) throw err;
+              // Not valid JSON or no upload_url - use text as-is
+            }
+          }
+          return text;
+        })
+        .then((text) => {
+          // FIX #4: Sanitize FrontMind references in file content before display
+          setContent(sanitizeBrandText(text));
+          setLoading(false);
+        })
+        .catch((err) => {
+          setError(err.message || "加载失败");
+          setLoading(false);
+        });
+    }
+  }, [isOpen, fileUrl, fileName]);
+
+  const handleDownload = useCallback(async () => {
+    setIsDownloading(true);
+    try {
+      if (content) {
+        const downloadName = sanitizeBrandText(fileName);
+        const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        nativeDownload(url, downloadName);
+        URL.revokeObjectURL(url);
+      } else {
+        const downloadName = sanitizeBrandText(fileName);
+        const proxiedUrl = buildProxyDownloadUrl(fileUrl, downloadName, true);
+        if (proxiedUrl) {
+          nativeDownload(proxiedUrl, downloadName);
+          return;
+        }
+        const blobUrl = await fetchWithAuth(fileUrl, downloadName);
+        nativeDownload(blobUrl, downloadName);
+        URL.revokeObjectURL(blobUrl);
+      }
+    } catch (err) {
+      console.error("Download failed:", err);
+    } finally {
+      setIsDownloading(false);
+    }
+  }, [content, fileUrl, fileName]);
+
+  const onResizeMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      resizingRef.current = true;
+      startRef.current = { x: e.clientX, y: e.clientY, w: size.width, h: size.height };
+
+      const onMouseMove = (ev: MouseEvent) => {
+        if (!resizingRef.current) return;
+        const dw = ev.clientX - startRef.current.x;
+        const dh = ev.clientY - startRef.current.y;
+        setSize({
+          width: Math.max(400, Math.min(window.innerWidth * 0.95, startRef.current.w + dw)),
+          height: Math.max(300, Math.min(window.innerHeight * 0.95, startRef.current.h + dh)),
+        });
+      };
+
+      const onMouseUp = () => {
+        resizingRef.current = false;
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+      };
+
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    },
+    [size]
+  );
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        showCloseButton={false}
+        className="p-0 flex flex-col overflow-hidden"
+        style={{
+          width: size.width,
+          height: size.height,
+          maxWidth: "95vw",
+          maxHeight: "95vh",
+        }}
+      >
+        <DialogTitle className="sr-only">{displayFileName}</DialogTitle>
+
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-3 border-b border-border/30 flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <BookOpen className="w-4 h-4 text-primary" />
+            <span className="text-sm font-medium text-foreground/80 truncate max-w-[400px]">
+              {displayFileName}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleDownload}
+              disabled={isDownloading}
+              className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md hover:bg-muted transition-colors text-muted-foreground hover:text-foreground disabled:opacity-50"
+            >
+              {isDownloading ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              下载
+            </button>
+            <Button variant="ghost" size="icon" onClick={onClose} className="w-8 h-8">
+              <X className="w-4 h-4" />
+            </Button>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto custom-scrollbar px-8 py-6">
+          {loading && (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 className="w-6 h-6 animate-spin text-primary" />
+              <span className="ml-2 text-sm text-muted-foreground">加载中...</span>
+            </div>
+          )}
+          {error && (
+            <div className="flex items-center justify-center py-12 text-destructive">
+              <AlertCircle className="w-5 h-5 mr-2" />
+              <span className="text-sm">加载失败: {error}</span>
+            </div>
+          )}
+          {content !== null && !loading && (
+            <div className="max-w-3xl mx-auto">
+              <MarkdownRenderer
+                content={content}
+                className="prose prose-sm max-w-none prose-p:my-2 prose-headings:my-3 prose-pre:my-3 prose-ul:my-2 prose-ol:my-2"
+              />
+            </div>
+          )}
+        </div>
+
+        {/* Resize handle */}
+        <div
+          onMouseDown={onResizeMouseDown}
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-se-resize"
+          style={{ touchAction: "none" }}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" className="text-muted-foreground/40">
+            <path d="M14 14L8 14L14 8Z" fill="currentColor" />
+            <path d="M14 14L11 14L14 11Z" fill="currentColor" opacity="0.5" />
+          </svg>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * Inline PDF/HTML Viewer - opens files in an embedded iframe viewer with download support.
+ * FIX: Uses blob URLs fetched with auth headers for proper rendering.
+ */
+function PdfViewer({
+  fileUrl,
+  fileName,
+  isOpen,
+  onClose,
+}: {
+  fileUrl: string;
+  fileName: string;
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [size, setSize] = useState({ width: 800, height: 640 });
+  const displayFileName = sanitizeBrandText(fileName);
+  const resizingRef = useRef(false);
+  const startRef = useRef({ x: 0, y: 0, w: 0, h: 0 });
+
+  // Load blob URL when dialog opens
+  useEffect(() => {
+    if (isOpen && fileUrl) {
+      setLoading(true);
+      setError(null);
+      setBlobUrl(null);
+
+      // If it's already a blob URL, use directly
+      if (fileUrl.startsWith("blob:")) {
+        setBlobUrl(fileUrl);
+        setLoading(false);
+        return;
+      }
+
+      // If it's a data: URL (base64), convert to blob URL for PDF rendering
+      // (browsers can't render PDF from data: URLs in iframes)
+      if (fileUrl.startsWith("data:")) {
+        try {
+          const parts = fileUrl.split(",");
+          const mimeMatch = parts[0]?.match(/:(.*?);/);
+          const mime = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const binaryStr = atob(parts[1]);
+          const bytes = new Uint8Array(binaryStr.length);
+          for (let k = 0; k < binaryStr.length; k++) {
+            bytes[k] = binaryStr.charCodeAt(k);
+          }
+          const blob = new Blob([bytes], { type: mime });
+          setBlobUrl(URL.createObjectURL(blob));
+        } catch (e) {
+          console.error("Failed to convert data URL to blob:", e);
+          setError("文件格式转换失败");
+        }
+        setLoading(false);
+        return;
+      }
+
+      // Fetch with auth headers and create a sanitized blob URL through the proxy.
+      const displayName = sanitizeBrandText(fileName);
+      fetchWithAuth(fileUrl, displayName)
+        .then((url) => {
+          setBlobUrl(url);
+          setLoading(false);
+        })
+        .catch((err) => {
+          console.error("Failed to load file for preview:", err);
+          setError(err.message);
+          setLoading(false);
+        });
+    }
+
+    return () => {
+      if (blobUrl && blobUrl.startsWith("blob:") && !fileUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(blobUrl);
+      }
+    };
+  }, [isOpen, fileUrl]);
+
+  const handleDownload = useCallback(async () => {
+    setIsDownloading(true);
+    try {
+      // If we already have a blobUrl from preview, use it directly. Blob/data
+      // URLs use the download attribute; external fallback URLs use native HTTPS.
+      if (blobUrl) {
+        nativeDownload(blobUrl, sanitizeBrandText(fileName));
+      } else if (fileUrl.startsWith("blob:") || fileUrl.startsWith("data:")) {
+        nativeDownload(fileUrl, sanitizeBrandText(fileName));
+      } else {
+        const downloadName = sanitizeBrandText(fileName);
+        const proxiedUrl = buildProxyDownloadUrl(fileUrl, downloadName, true);
+        if (proxiedUrl) {
+          nativeDownload(proxiedUrl, downloadName);
+          return;
+        }
+        const downloadBlobUrl = await fetchWithAuth(fileUrl, downloadName);
+        nativeDownload(downloadBlobUrl, downloadName);
+        URL.revokeObjectURL(downloadBlobUrl);
+      }
+    } catch (err) {
+      console.error("Download failed:", err);
+    } finally {
+      setIsDownloading(false);
+    }
+  }, [fileUrl, fileName, blobUrl]);
+
+  const onResizeMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      resizingRef.current = true;
+      startRef.current = { x: e.clientX, y: e.clientY, w: size.width, h: size.height };
+
+      const onMouseMove = (ev: MouseEvent) => {
+        if (!resizingRef.current) return;
+        const dw = ev.clientX - startRef.current.x;
+        const dh = ev.clientY - startRef.current.y;
+        setSize({
+          width: Math.max(400, Math.min(window.innerWidth * 0.95, startRef.current.w + dw)),
+          height: Math.max(300, Math.min(window.innerHeight * 0.95, startRef.current.h + dh)),
+        });
+      };
+
+      const onMouseUp = () => {
+        resizingRef.current = false;
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+      };
+
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    },
+    [size]
+  );
+
+  const isHtml = displayFileName.toLowerCase().endsWith(".html") || displayFileName.toLowerCase().endsWith(".htm");
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        showCloseButton={false}
+        className="p-0 flex flex-col overflow-hidden"
+        style={{
+          width: size.width,
+          height: size.height,
+          maxWidth: "95vw",
+          maxHeight: "95vh",
+        }}
+      >
+        <DialogTitle className="sr-only">{displayFileName}</DialogTitle>
+
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-3 border-b border-border/30 flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <FileText className="w-4 h-4 text-primary" />
+            <span className="text-sm font-medium text-foreground/80 truncate max-w-[400px]">
+              {displayFileName}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleDownload}
+              disabled={isDownloading}
+              className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md hover:bg-muted transition-colors text-muted-foreground hover:text-foreground disabled:opacity-50"
+            >
+              {isDownloading ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              下载
+            </button>
+            <Button variant="ghost" size="icon" onClick={onClose} className="w-8 h-8">
+              <X className="w-4 h-4" />
+            </Button>
+          </div>
+        </div>
+
+        {/* File viewer */}
+        <div className="flex-1 overflow-hidden bg-muted/20">
+          {loading ? (
+            <div className="flex items-center justify-center h-full">
+              <Loader2 className="w-8 h-8 animate-spin text-primary/50" />
+              <span className="ml-2 text-sm text-muted-foreground">加载文件中...</span>
+            </div>
+          ) : error ? (
+            <div className="flex flex-col items-center justify-center h-full gap-3">
+              <FileText className="w-12 h-12 text-muted-foreground/30" />
+              <p className="text-sm text-muted-foreground">文件加载失败</p>
+              <p className="text-xs text-muted-foreground/60">{error}</p>
+              <Button onClick={handleDownload} variant="outline" size="sm">
+                <Download className="w-4 h-4 mr-1" />
+                直接下载
+              </Button>
+            </div>
+          ) : blobUrl ? (
+            <iframe
+              src={blobUrl}
+              title={displayFileName}
+              className="w-full h-full border-0"
+              style={{ minHeight: "100%" }}
+              sandbox={isHtml ? "allow-same-origin allow-scripts" : undefined}
+            />
+          ) : null}
+        </div>
+
+        {/* Resize handle */}
+        <div
+          onMouseDown={onResizeMouseDown}
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-se-resize"
+          style={{ touchAction: "none" }}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" className="text-muted-foreground/40">
+            <path d="M14 14L8 14L14 8Z" fill="currentColor" />
+            <path d="M14 14L11 14L14 11Z" fill="currentColor" opacity="0.5" />
+          </svg>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage; isRunning?: boolean; onDelete?: () => void }) {
+  const isUser = message.role === "user";
+  const [mdReaderOpen, setMdReaderOpen] = useState(false);
+  const [mdReaderFile, setMdReaderFile] = useState<{ url: string; name: string } | null>(null);
+  const [pdfViewerOpen, setPdfViewerOpen] = useState(false);
+  const [pdfViewerFile, setPdfViewerFile] = useState<{ url: string; name: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const openMdReader = useCallback((url: string, name: string) => {
+    setMdReaderFile({ url, name });
+    setMdReaderOpen(true);
+  }, []);
+
+  const openPdfViewer = useCallback((url: string, name: string) => {
+    setPdfViewerFile({ url, name });
+    setPdfViewerOpen(true);
+  }, []);
+
+  // Calculate running elapsed time for this specific response
+  const getRunningElapsed = () => {
+    if (!isUser && isRunning && message.responseStartedAt && !message.elapsedTime) {
+      const elapsed = (Date.now() - message.responseStartedAt) / 1000;
+      if (elapsed >= 0) {
+        if (elapsed < 60) return `${elapsed.toFixed(1)}s`;
+        const mins = Math.floor(elapsed / 60);
+        const secs = (elapsed % 60).toFixed(0);
+        return `${mins}m ${secs}s`;
+      }
+    }
+    return null;
+  };
+
+  const getCompletedElapsed = () => {
+    if (message.elapsedTime != null && message.elapsedTime >= 0) {
+      const elapsed = message.elapsedTime;
+      if (elapsed < 60) return `${elapsed.toFixed(1)}s`;
+      const mins = Math.floor(elapsed / 60);
+      const secs = (elapsed % 60).toFixed(0);
+      return `${mins}m ${secs}s`;
+    }
+    return null;
+  };
+
+  const runningElapsed = getRunningElapsed();
+  const completedElapsed = getCompletedElapsed();
+  const elapsedDisplay = completedElapsed || runningElapsed;
+
+  // Check file types
+  const isMdFile = (fileName: string) => {
+    const ext = fileName.split(".").pop()?.toLowerCase();
+    return ext === "md" || ext === "markdown";
+  };
+
+  const isPdfFile = (fileName: string, mimeType?: string) => {
+    if (mimeType?.includes("pdf")) return true;
+    const ext = fileName.split(".").pop()?.toLowerCase();
+    return ext === "pdf";
+  };
+
+  const isHtmlFile = (fileName: string, mimeType?: string) => {
+    if (mimeType?.includes("html")) return true;
+    const ext = fileName.split(".").pop()?.toLowerCase();
+    return ext === "html" || ext === "htm";
+  };
+
+  // Filter "等待用户输入" from content (req 8)
+  const displayContent = isUser ? message.content : filterWaitingText(message.content);
+
+  // Apply FrontMind brand sanitization for assistant messages
+  const sanitizedContent = !isUser && displayContent ? sanitizeBrandText(displayContent) : displayContent;
+
+  // Sanitize step groups labels and descriptions
+  const sanitizedStepGroups = !isUser && message.stepGroups
+    ? message.stepGroups.map(group => ({
+        ...group,
+        title: sanitizeBrandText(group.title),
+        description: group.description ? sanitizeBrandText(group.description) : undefined,
+        steps: group.steps.map(step => ({
+          ...step,
+          label: sanitizeBrandText(step.label),
+          description: step.description ? sanitizeBrandText(step.description) : undefined,
+        })),
+      }))
+    : message.stepGroups;
+
+  // Copy handler - uses sanitizedContent for assistant messages
+  const handleCopyMessage = () => {
+    const contentToCopy = isUser ? displayContent : sanitizedContent;
+    if (!contentToCopy) return;
+    void copyToClipboard(contentToCopy).then((ok) => {
+      if (ok) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } else {
+        toast.error("复制失败");
+      }
+    });
+  };
+
+  return (
+    <>
+      <MessageActions message={message} onDelete={onDelete}>
+        <motion.div
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ type: "spring", stiffness: 400, damping: 30 }}
+          className={cn("flex items-start gap-3", isUser && "flex-row-reverse")}
+        >
+          {/* Avatar with model name label for assistant */}
+          <div className={cn("flex flex-col items-center flex-shrink-0 gap-0.5", isUser && "items-center")}>
+            {!isUser && message.modelName && (
+              <span className="text-[10px] text-muted-foreground/60 font-medium leading-tight whitespace-nowrap">
+                {(() => {
+	                  const m = message.modelName;
+	                  if (m === "frontmind-lite") return "Lite";
+	                  if (m === "frontmind-base") return "Base";
+	                  if (m === "frontmind-pro") return "Pro";
+	                  return m;
+                })()}
+              </span>
+            )}
+            <div
+              className={cn(
+                "w-8 h-8 rounded-full flex items-center justify-center mt-0.5",
+                isUser
+                  ? "bg-accent/15 text-accent"
+                  : "bg-primary/10 text-primary"
+              )}
+            >
+              {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+            </div>
+          </div>
+
+          {/* Message content */}
+          <div className={cn("max-w-[92%] space-y-2 sm:max-w-[80%]", isUser ? "items-end" : "items-start")}>
+            {/* Intermediate steps (assistant only) */}
+            {!isUser && sanitizedStepGroups && sanitizedStepGroups.length > 0 && (
+              <IntermediateSteps
+                stepGroups={sanitizedStepGroups}
+                isRunning={isRunning && !message.elapsedTime}
+              />
+            )}
+
+            {/* Attachments (user) - with PDF/HTML inline viewer support */}
+            {message.attachments && message.attachments.length > 0 && (
+              <div className={cn("flex flex-wrap gap-2 mb-1", isUser && "justify-end")}>
+                {message.attachments.map((att) => (
+                  <div key={att.id}>
+                    {/* Image attachment: show ImagePreview with proper src */}
+                    {att.type === "image" && (
+                      (() => {
+                        // Determine image src: base64 > file (local object) > fileId (API proxy)
+                        let imageSrc = "";
+                        if (att.base64) {
+                          imageSrc = att.base64;
+                        } else if (att.file) {
+                          imageSrc = URL.createObjectURL(att.file);
+                        } else if (att.fileId) {
+                          // Fallback: try API proxy URL (works for AI-generated files)
+                          imageSrc = `/api/frontmind/v1/files/${att.fileId}`;
+                        }
+                        if (!imageSrc) return null;
+                        return (
+                          <ImagePreview
+                            src={imageSrc}
+                            alt={sanitizeBrandText(att.name)}
+                            className="max-w-[200px] max-h-[200px]"
+                          />
+                        );
+                      })()
+                    )}
+                    {att.type !== "image" && (isPdfFile(att.name, att.file?.type) || isHtmlFile(att.name, att.file?.type)) ? (
+                      <div
+                        onClick={() => {
+                          // Priority: blobUrl > File > base64 (convert to blob) > fileId
+                          let fileViewUrl = "";
+                          if (att.blobUrl) {
+                            fileViewUrl = att.blobUrl;
+                          } else if (att.file) {
+                            fileViewUrl = URL.createObjectURL(att.file);
+                          } else if (att.base64) {
+                            // Convert base64 to blob URL for PDF rendering
+                            try {
+                              const parts = att.base64.split(",");
+                              const mimeMatch = parts[0]?.match(/:(.*?);/);
+                              const mime = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+                              const binaryStr = atob(parts[1]);
+                              const bytes = new Uint8Array(binaryStr.length);
+                              for (let j = 0; j < binaryStr.length; j++) {
+                                bytes[j] = binaryStr.charCodeAt(j);
+                              }
+                              const blob = new Blob([bytes], { type: mime });
+                              fileViewUrl = URL.createObjectURL(blob);
+                            } catch (e) {
+                              console.error("Failed to convert base64 to blob:", e);
+                            }
+                          } else if (att.fileId) {
+                            fileViewUrl = `/api/frontmind/v1/files/${att.fileId}`;
+                          }
+                          if (fileViewUrl) {
+                            openPdfViewer(fileViewUrl, sanitizeBrandText(att.name));
+                          }
+                        }}
+                        className="flex items-center gap-2.5 px-3 py-2.5 rounded-2xl bg-card/80 hover:bg-secondary/70 transition-all group border border-border/70 cursor-pointer shadow-sm"
+                      >
+                        <div className="w-8 h-8 rounded-lg bg-red-500/10 flex items-center justify-center flex-shrink-0">
+                          <FileText className="w-4 h-4 text-red-500/60" />
+                        </div>
+                        <div className="flex-1 overflow-hidden">
+                          <p className="text-xs font-medium text-foreground/70 truncate">
+                            {sanitizeBrandText(att.name)}
+                          </p>
+                          <p className="text-[10px] text-muted-foreground/50">
+                            {isPdfFile(att.name, att.file?.type) ? "点击查看 PDF" : "点击查看文件"}
+                          </p>
+                        </div>
+                        <BookOpen className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                      </div>
+                    ) : att.type !== "image" ? (
+                      <FilePreview file={att} />
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Text content */}
+            {displayContent && displayContent.trim() !== "" && (
+              <div
+                className={cn(
+                  "rounded-3xl px-4.5 py-3 text-[14px] leading-relaxed",
+                  isUser
+                    ? "bg-primary text-primary-foreground rounded-tr-md shadow-sm"
+                    : "bg-card/80 border border-border/70 rounded-tl-md text-foreground shadow-sm"
+                )}
+              >
+                {isUser ? (
+                  <p className="whitespace-pre-wrap break-words">{displayContent}</p>
+                ) : (
+                  <MarkdownRenderer
+                    content={sanitizedContent}
+                    className="prose prose-sm max-w-none prose-p:my-1.5 prose-headings:my-2 prose-pre:my-2 prose-ul:my-1 prose-ol:my-1"
+                  />
+                )}
+              </div>
+            )}
+
+            {/* Inline images (from API output) */}
+            {message.inlineImages && message.inlineImages.length > 0 && (
+              <div className="flex flex-wrap gap-2 mt-1">
+                {message.inlineImages.map((img, i) => (
+                  <ImagePreview
+                    key={i}
+                    src={img.src}
+                    alt={sanitizeBrandText(img.alt || "image")}
+                    className="max-w-[300px]"
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Output files (assistant) - with PDF/HTML inline viewer and MD reader */}
+            {message.outputFiles && message.outputFiles.length > 0 && (
+              <div className="space-y-1.5 mt-1">
+                {message.outputFiles.map((file, i) => {
+                  const displayOutputFileName = sanitizeBrandText(file.fileName);
+                  const isMarkdown = isMdFile(displayOutputFileName);
+                  const isPdf = isPdfFile(displayOutputFileName, file.mimeType);
+                  const isHtml = isHtmlFile(displayOutputFileName, file.mimeType);
+                  return (
+                    <div
+                      key={i}
+                      onClick={(e) => {
+                        if (isMarkdown) {
+                          e.preventDefault();
+                          openMdReader(file.fileUrl, displayOutputFileName);
+                        } else if (isPdf || isHtml) {
+                          e.preventDefault();
+                          openPdfViewer(file.fileUrl, displayOutputFileName);
+                        }
+                      }}
+                      className="cursor-pointer"
+                    >
+                      {isMarkdown ? (
+                        <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-2xl bg-card/80 hover:bg-secondary/70 transition-all group border border-border/70 shadow-sm">
+                          <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0">
+                            <BookOpen className="w-4 h-4 text-primary/60" />
+                          </div>
+                          <div className="flex-1 overflow-hidden">
+                            <p className="text-xs font-medium text-foreground/70 truncate">
+                              {displayOutputFileName}
+                            </p>
+                            <p className="text-[10px] text-muted-foreground/50">
+                              点击在页面内阅读
+                            </p>
+                          </div>
+                          <BookOpen className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                        </div>
+                      ) : isPdf || isHtml ? (
+                        <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-2xl bg-card/80 hover:bg-secondary/70 transition-all group border border-border/70 shadow-sm">
+                          <div className="w-8 h-8 rounded-lg bg-red-500/10 flex items-center justify-center flex-shrink-0">
+                            <FileText className="w-4 h-4 text-red-500/60" />
+                          </div>
+                          <div className="flex-1 overflow-hidden">
+                            <p className="text-xs font-medium text-foreground/70 truncate">
+                              {displayOutputFileName}
+                            </p>
+                            <p className="text-[10px] text-muted-foreground/50">
+                              {isPdf ? "点击查看 PDF" : "点击查看 HTML"}
+                            </p>
+                          </div>
+                          <BookOpen className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                        </div>
+                      ) : (
+                        <div
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            try {
+                              const downloadName = displayOutputFileName;
+                              const proxiedUrl = buildProxyDownloadUrl(file.fileUrl, downloadName, true);
+                              if (proxiedUrl) {
+                                nativeDownload(proxiedUrl, downloadName);
+                                return;
+                              }
+                              const blobUrl = await fetchWithAuth(file.fileUrl, downloadName);
+                              nativeDownload(blobUrl, downloadName);
+                              URL.revokeObjectURL(blobUrl);
+                            } catch (err) {
+                              console.error("Download failed:", err);
+                            }
+                          }}
+                          className="flex items-center gap-2.5 px-3 py-2.5 rounded-2xl bg-card/80 hover:bg-secondary/70 transition-all group border border-border/70 cursor-pointer shadow-sm"
+                        >
+                          <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0">
+                            <FileText className="w-4 h-4 text-primary/60" />
+                          </div>
+                          <div className="flex-1 overflow-hidden">
+                            <p className="text-xs font-medium text-foreground/70 truncate">
+                              {displayOutputFileName}
+                            </p>
+                            <p className="text-[10px] text-muted-foreground/50">
+                              {file.mimeType}
+                            </p>
+                          </div>
+                          <Download className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Timestamp, elapsed time, and copy button */}
+            {!(message.isStepsPlaceholder && !displayContent?.trim()) && (
+            <div
+              className={cn(
+                "flex items-center gap-2 mt-1 px-1",
+                isUser ? "justify-end" : "justify-start"
+              )}
+            >
+              <p className="text-[10px] text-muted-foreground/40">
+                {new Date(message.timestamp).toLocaleTimeString("zh-CN", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+              </p>
+              {!isUser && elapsedDisplay && (
+                <span className="text-[10px] font-mono text-muted-foreground/50 flex items-center gap-0.5">
+                  <Clock className="w-2.5 h-2.5" />
+                  {elapsedDisplay}
+                </span>
+              )}
+              {/* Copy button for assistant messages */}
+              {!isUser && displayContent && displayContent.trim() !== "" && (
+                <button
+                  type="button"
+                  onClick={handleCopyMessage}
+                  className={cn(
+                    "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium transition-all duration-200 ml-1",
+                    copied
+                      ? "bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400"
+                      : "bg-muted/60 text-muted-foreground hover:bg-primary/10 hover:text-primary active:scale-95"
+                  )}
+                  title="复制内容"
+                >
+                  {copied ? (
+                    <>
+                      <CheckCircle2 className="w-3 h-3" />
+                      已复制
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3 h-3" />
+                      复制
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+            )}
+          </div>
+        </motion.div>
+      </MessageActions>
+
+      {/* Markdown file reader dialog */}
+      {mdReaderFile && (
+        <MarkdownFileReader
+          fileUrl={mdReaderFile.url}
+          fileName={mdReaderFile.name}
+          isOpen={mdReaderOpen}
+          onClose={() => {
+            setMdReaderOpen(false);
+            setMdReaderFile(null);
+          }}
+        />
+      )}
+
+      {/* PDF/HTML viewer dialog */}
+      {pdfViewerFile && (
+        <PdfViewer
+          fileUrl={pdfViewerFile.url}
+          fileName={pdfViewerFile.name}
+          isOpen={pdfViewerOpen}
+          onClose={() => {
+            setPdfViewerOpen(false);
+            setPdfViewerFile(null);
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * StatusBadge — simplified: removed "已完成" icon display per req 4
+ */
+function StatusBadge({ status }: { status: string }) {
+  const config: Record<string, { icon: React.ReactNode; label: string; className: string }> = {
+    idle: {
+      icon: <Clock className="w-3 h-3" />,
+      label: "就绪",
+      className: "bg-muted/60 text-muted-foreground border-border/30",
+    },
+    running: {
+      icon: <Loader2 className="w-3 h-3 animate-spin" />,
+      label: "处理中",
+      className: "bg-amber-50 text-amber-600 border-amber-200/60",
+    },
+    pending: {
+      icon: <Clock className="w-3 h-3" />,
+      label: "就绪",
+      className: "bg-muted/60 text-muted-foreground border-border/30",
+    },
+    completed: {
+      icon: null,
+      label: "就绪",
+      className: "bg-muted/60 text-muted-foreground border-border/30",
+    },
+    error: {
+      icon: <AlertCircle className="w-3 h-3" />,
+      label: "错误",
+      className: "bg-red-50 text-red-600 border-red-200/60",
+    },
+    failed: {
+      icon: <AlertCircle className="w-3 h-3" />,
+      label: "失败",
+      className: "bg-red-50 text-red-600 border-red-200/60",
+    },
+  };
+
+  const c = config[status] || config.idle;
+
+  return (
+    <Badge variant="outline" className={cn("gap-1 text-[11px] font-medium py-0.5", c.className)}>
+      {c.icon}
+      {c.label}
+    </Badge>
+  );
+}

@@ -1,0 +1,1033 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FrontMind BSAS Scorecard Schema",
+  "description": "S5.5 品牌语义资产审计师的评分卡 JSON 结构定义（Brand Semantic Asset Score）",
+  "type": "object",
+  "required": [
+    "meta",
+    "bsas_total",
+    "grade",
+    "dimensions",
+    "competitive_benchmark",
+    "priority_actions",
+    "twelve_week_targets",
+    "ranking_position_diagnostics"
+  ],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "brand",
+        "version",
+        "generated_at",
+        "data_sources"
+      ],
+      "properties": {
+        "brand": {
+          "type": "string",
+          "description": "品牌中文简称"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "评分卡版本号"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "data_sources": {
+          "type": "object",
+          "description": "数据来源文件引用",
+          "properties": {
+            "s1_brand_facts": {
+              "type": "string"
+            },
+            "s2_marketing_atlas": {
+              "type": "string"
+            },
+            "s4_positioning": {
+              "type": "string"
+            },
+            "s5_diagnosis": {
+              "type": "string"
+            }
+          }
+        },
+        "evaluation_scope": {
+          "type": "object",
+          "description": "评估范围说明",
+          "properties": {
+            "search_engines": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "ai_engines": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "social_platforms": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "keywords_evaluated": {
+              "type": "integer",
+              "description": "评估的关键词/问题总数"
+            },
+            "competitors_compared": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "bsas_total": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "BSAS 总分（满分 100）"
+    },
+    "grade": {
+      "type": "string",
+      "enum": [
+        "A",
+        "B",
+        "C",
+        "D",
+        "E"
+      ],
+      "description": "总分等级（A=优秀 80-100, B=良好 60-79, C=及格 40-59, D=较差 20-39, E=缺失 0-19）"
+    },
+    "dimensions": {
+      "type": "object",
+      "required": [
+        "semantic_visibility",
+        "semantic_coherence",
+        "semantic_richness",
+        "semantic_authority",
+        "competitive_advantage"
+      ],
+      "properties": {
+        "semantic_visibility": {
+          "type": "object",
+          "description": "维度一：语义可见度（满分 30）",
+          "required": [
+            "score",
+            "max_score",
+            "sub_indicators"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 30
+            },
+            "max_score": {
+              "type": "number",
+              "const": 30
+            },
+            "sub_indicators": {
+              "type": "object",
+              "required": [
+                "ai_search_visibility",
+                "web_search_sov",
+                "multi_platform_coverage"
+              ],
+              "properties": {
+                "ai_search_visibility": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 15
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 15
+                    },
+                    "raw_value": {
+                      "type": "number",
+                      "description": "原始比率（0-1）"
+                    },
+                    "calculation_basis": {
+                      "type": "string",
+                      "description": "计算依据说明"
+                    }
+                  }
+                },
+                "web_search_sov": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 10
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 10
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "multi_platform_coverage": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 5
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 5
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "platforms_present": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "semantic_coherence": {
+          "type": "object",
+          "description": "维度二：语义一致性（满分 20）",
+          "required": [
+            "score",
+            "max_score",
+            "sub_indicators"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 20
+            },
+            "max_score": {
+              "type": "number",
+              "const": 20
+            },
+            "sub_indicators": {
+              "type": "object",
+              "required": [
+                "core_proposition_hit_rate",
+                "tone_deviation_rate"
+              ],
+              "properties": {
+                "core_proposition_hit_rate": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 12
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 12
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "propositions_evaluated": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "tone_deviation_rate": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 8
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 8
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "semantic_richness": {
+          "type": "object",
+          "description": "维度三：语义多样性与深度（满分 20）",
+          "required": [
+            "score",
+            "max_score",
+            "sub_indicators"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 20
+            },
+            "max_score": {
+              "type": "number",
+              "const": 20
+            },
+            "sub_indicators": {
+              "type": "object",
+              "required": [
+                "question_stage_coverage",
+                "semantic_entity_richness",
+                "content_format_diversity"
+              ],
+              "properties": {
+                "question_stage_coverage": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 10
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 10
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "stages_covered": {
+                      "type": "object",
+                      "properties": {
+                        "awareness": {
+                          "type": "boolean"
+                        },
+                        "consideration": {
+                          "type": "boolean"
+                        },
+                        "decision": {
+                          "type": "boolean"
+                        },
+                        "usage": {
+                          "type": "boolean"
+                        },
+                        "advocacy": {
+                          "type": "boolean"
+                        }
+                      }
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "semantic_entity_richness": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 6
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 6
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "entity_count": {
+                      "type": "integer"
+                    },
+                    "industry_benchmark": {
+                      "type": "integer"
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "content_format_diversity": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 4
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 4
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "formats_present": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "semantic_authority": {
+          "type": "object",
+          "description": "维度四：语义权威性（满分 15）",
+          "required": [
+            "score",
+            "max_score",
+            "sub_indicators"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 15
+            },
+            "max_score": {
+              "type": "number",
+              "const": 15
+            },
+            "sub_indicators": {
+              "type": "object",
+              "required": [
+                "authoritative_source_ratio",
+                "structured_data_completeness",
+                "third_party_endorsement"
+              ],
+              "properties": {
+                "authoritative_source_ratio": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 8
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 8
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "structured_data_completeness": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 4
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 4
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "third_party_endorsement": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 3
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 3
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "competitive_advantage": {
+          "type": "object",
+          "description": "维度五：竞品语义占优度（满分 15）",
+          "required": [
+            "score",
+            "max_score",
+            "sub_indicators"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 15
+            },
+            "max_score": {
+              "type": "number",
+              "const": 15
+            },
+            "sub_indicators": {
+              "type": "object",
+              "required": [
+                "first_mention_rate",
+                "exclusive_semantic_space"
+              ],
+              "properties": {
+                "first_mention_rate": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 8
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 8
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "exclusive_semantic_space": {
+                  "type": "object",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 7
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 7
+                    },
+                    "raw_value": {
+                      "type": "number"
+                    },
+                    "exclusive_topics": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "rank_quality_score": {
+                  "type": "object",
+                  "description": "排名位次质量诊断分，满分 10 分；该指标用于解释位次质量，不改变 BSAS 100 分制中竞品语义占优度的 15 分权重。",
+                  "required": [
+                    "score",
+                    "max_score",
+                    "raw_value",
+                    "calculation_basis"
+                  ],
+                  "properties": {
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 10
+                    },
+                    "max_score": {
+                      "type": "number",
+                      "const": 10
+                    },
+                    "raw_value": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1,
+                      "description": "由 Top3 率、Top5 率、平均位次与竞品位次差综合归一化得到的 0-1 位次质量值"
+                    },
+                    "calculation_basis": {
+                      "type": "string"
+                    },
+                    "top3_rate": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "top5_rate": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "avg_rank": {
+                      "type": [
+                        "number",
+                        "null"
+                      ],
+                      "minimum": 0
+                    },
+                    "competitor_rank_gap": {
+                      "type": [
+                        "number",
+                        "null"
+                      ],
+                      "description": "品牌平均位次 - 竞品平均位次；正值代表品牌落后，负值代表品牌领先"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "competitive_benchmark": {
+      "type": "object",
+      "description": "竞品对比基准",
+      "required": [
+        "brand_score",
+        "competitors"
+      ],
+      "properties": {
+        "brand_score": {
+          "type": "number"
+        },
+        "competitors": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "estimated_score"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "estimated_score": {
+                "type": "number"
+              },
+              "relative_position": {
+                "type": "string",
+                "enum": [
+                  "ahead",
+                  "behind",
+                  "comparable"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "priority_actions": {
+      "type": "array",
+      "minItems": 3,
+      "description": "优先建设行动建议",
+      "items": {
+        "type": "object",
+        "required": [
+          "priority",
+          "dimension",
+          "action",
+          "expected_impact",
+          "downstream_node"
+        ],
+        "properties": {
+          "priority": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "dimension": {
+            "type": "string",
+            "description": "对应的评分维度"
+          },
+          "action": {
+            "type": "string",
+            "description": "具体行动建议"
+          },
+          "expected_impact": {
+            "type": "string",
+            "description": "预期影响（分数提升估计）"
+          },
+          "downstream_node": {
+            "type": "string",
+            "description": "对应的下游执行节点（S6/S8/E1 等）"
+          }
+        }
+      }
+    },
+    "twelve_week_targets": {
+      "type": "object",
+      "description": "12 周目标分数",
+      "required": [
+        "target_total",
+        "dimension_targets"
+      ],
+      "properties": {
+        "target_total": {
+          "type": "number",
+          "description": "12 周后目标总分"
+        },
+        "dimension_targets": {
+          "type": "object",
+          "properties": {
+            "semantic_visibility": {
+              "type": "number"
+            },
+            "semantic_coherence": {
+              "type": "number"
+            },
+            "semantic_richness": {
+              "type": "number"
+            },
+            "semantic_authority": {
+              "type": "number"
+            },
+            "competitive_advantage": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    "radar_chart_data": {
+      "type": "object",
+      "description": "雷达图数据（用于可视化）",
+      "properties": {
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "current_scores_pct": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "各维度得分百分比（0-100%）"
+        },
+        "target_scores_pct": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "12 周目标百分比"
+        },
+        "industry_avg_pct": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "行业平均百分比"
+        }
+      }
+    },
+    "ranking_position_diagnostics": {
+      "type": "object",
+      "description": "AI 搜索/回答中品牌排名位次质量诊断。S5.5 必须优先继承 S5 品牌诊断数据顶层 ranking_position_diagnostics，用于补充“是否被提及”之外的“排在第几位、是否进入 Top3/Top5、相对竞品落后或领先多少位”。",
+      "required": [
+        "data_source",
+        "total_observations",
+        "avg_rank",
+        "first_place_rate",
+        "top3_rate",
+        "top5_rate",
+        "best_rank",
+        "worst_rank",
+        "rank_distribution",
+        "competitor_rank_gap",
+        "platform_breakdown",
+        "per_question_rank_matrix"
+      ],
+      "properties": {
+        "data_source": {
+          "type": "string",
+          "description": "排名位次诊断来源；正式链路应指向 S5_{brand}_品牌诊断数据.json.ranking_position_diagnostics，历史兼容回退必须显式标注"
+        },
+        "total_observations": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "S5 AI 监测样本总数"
+        },
+        "ranked_observations": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "品牌进入可识别排名的样本数"
+        },
+        "unmentioned_observations": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "品牌未提及或未进入可识别排名的样本数"
+        },
+        "avg_rank": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "跨全部有效测试问题的品牌平均排名位次；数值越小越好"
+        },
+        "first_place_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "品牌获得首位的问题占比"
+        },
+        "top3_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "品牌进入前三位的问题占比"
+        },
+        "top5_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "品牌进入前五位的问题占比"
+        },
+        "best_rank": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "品牌最佳位次"
+        },
+        "worst_rank": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "品牌最差位次"
+        },
+        "rank_distribution": {
+          "type": "object",
+          "required": [
+            "rank_1",
+            "rank_2_3",
+            "rank_4_5",
+            "rank_6_10",
+            "rank_11_plus"
+          ],
+          "properties": {
+            "rank_1": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank_2_3": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank_4_5": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank_6_10": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank_11_plus": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "第 11 位及以后、未进入可识别排名或未被提及的问题数"
+            }
+          }
+        },
+        "competitor_rank_gap": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "品牌平均位次 - 竞品平均位次；正值代表品牌落后，负值代表品牌领先"
+        },
+        "platform_breakdown": {
+          "type": "object",
+          "description": "S5 按 AI/搜索平台拆解的样本量、平均位次、Top3/Top5 占比和竞品位次差"
+        },
+        "per_question_rank_matrix": {
+          "type": "array",
+          "description": "问题级排名矩阵，用于追踪每个客户确认监控问题的品牌位次、竞品最高位次和位次差",
+          "items": {
+            "type": "object",
+            "required": [
+              "question",
+              "brand_rank",
+              "top_competitor_rank",
+              "rank_gap",
+              "diagnosis"
+            ],
+            "properties": {
+              "question": {
+                "type": "string"
+              },
+              "brand_rank": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "top_competitor_rank": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "rank_gap": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "description": "品牌位次 - 竞品最高位次；正值代表品牌落后"
+              },
+              "diagnosis": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

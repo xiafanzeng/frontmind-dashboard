@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <title>FrontMind Client</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <!-- Analytics: only loaded when VITE_ANALYTICS_ENDPOINT is configured -->
+    <script>
+      (function() {
+        var endpoint = "%VITE_ANALYTICS_ENDPOINT%";
+        var websiteId = "%VITE_ANALYTICS_WEBSITE_ID%";
+        // Only load analytics if the env vars were actually replaced by Vite
+        if (endpoint && !endpoint.includes('VITE_ANALYTICS') && websiteId && !websiteId.includes('VITE_ANALYTICS')) {
+          var s = document.createElement('script');
+          s.defer = true;
+          s.src = endpoint + '/umami';
+          s.setAttribute('data-website-id', websiteId);
+          document.head.appendChild(s);
+        }
+      })();
+    </script>
+  </body>
+
+</html>

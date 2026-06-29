@@ -1,0 +1,106 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FrontMind 问答矩阵 Schema",
+  "description": "S8 问答架构师输出的问答矩阵 JSON 结构定义。问题阶段枚举值与全工作流统一标准一致：awareness/consideration/decision/usage/advocacy。",
+  "type": "object",
+  "required": ["meta", "questions"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["brand", "version", "generated_at", "total_questions", "stage_distribution"],
+      "properties": {
+        "brand": { "type": "string", "minLength": 1 },
+        "version": { "type": "string" },
+        "generated_at": { "type": "string", "format": "date" },
+        "total_questions": { "type": "integer", "minimum": 30, "description": "问答总数，必须 ≥ 30" },
+        "stage_distribution": {
+          "type": "object",
+          "description": "各问题阶段的问答数量分布",
+          "required": ["awareness", "consideration", "decision", "usage", "advocacy"],
+          "properties": {
+            "awareness": { "type": "integer", "minimum": 5 },
+            "consideration": { "type": "integer", "minimum": 8 },
+            "decision": { "type": "integer", "minimum": 8 },
+            "usage": { "type": "integer", "minimum": 5 },
+            "advocacy": { "type": "integer", "minimum": 4 }
+          }
+        }
+      }
+    },
+    "questions": {
+      "type": "array",
+      "minItems": 30,
+      "items": {
+        "type": "object",
+        "required": [
+          "question_id", "question", "question_stage", "source",
+          "intent_type", "standard_answer", "content_type",
+          "target_platform", "priority", "assigned_to"
+        ],
+        "properties": {
+          "question_id": {
+            "type": "string",
+            "pattern": "^(AW|CO|DE|US|AD)_\\d{3}$",
+            "description": "问题唯一编号，前缀对应问题阶段：AW=awareness, CO=consideration, DE=decision, US=usage, AD=advocacy"
+          },
+          "question": { "type": "string", "minLength": 5, "description": "用户可能提出的问题" },
+          "question_stage": {
+            "type": "string",
+            "enum": ["awareness", "consideration", "decision", "usage", "advocacy"],
+            "description": "所属问题阶段（全工作流统一枚举值）"
+          },
+          "source": {
+            "type": "string",
+            "enum": ["S2_atlas", "S5_gap", "industry_template", "long_tail"],
+            "description": "问题来源"
+          },
+          "intent_type": {
+            "type": "string",
+            "enum": ["informational", "navigational", "transactional", "comparison"],
+            "description": "问题意图类型"
+          },
+          "standard_answer": {
+            "type": "string",
+            "minLength": 100,
+            "description": "理想 AI 回答，100-2000 字（< 100 校验失败，> 2000 触发警告）"
+          },
+          "key_evidence": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "支撑答案的关键证据"
+          },
+          "verbal_tokens_used": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "答案中使用的 S6 话语 Token"
+          },
+          "content_type": {
+            "type": "string",
+            "enum": ["long_article", "faq", "case_study", "comparison", "whitepaper", "video_script", "social_post"],
+            "description": "内容类型（与内容日历 schema 统一）"
+          },
+          "target_platform": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["official_blog", "zhihu", "wechat", "xiaohongshu", "bilibili", "industry_media", "github"]
+            },
+            "minItems": 1,
+            "description": "目标发布平台（与内容日历 schema 统一）"
+          },
+          "priority": {
+            "type": "string",
+            "enum": ["P0", "P1", "P2"],
+            "description": "执行优先级，P0 数量建议 ≥ 5"
+          },
+          "estimated_word_count": { "type": "integer", "minimum": 500, "description": "预估字数" },
+          "assigned_to": {
+            "type": "string",
+            "enum": ["E1_geo_strategist", "E2_copywriter"],
+            "description": "分配给执行层节点"
+          }
+        }
+      }
+    }
+  }
+}

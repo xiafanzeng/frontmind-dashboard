@@ -1,0 +1,920 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FrontMind 品牌诊断数据 Schema",
+  "description": "S5 品牌诊断专家输出的诊断数据 JSON 结构定义（v3.5 — 按客户确认问题和实际上传样本诊断，兼容部分题目/部分平台数据）",
+  "type": "object",
+  "required": [
+    "meta",
+    "core_metrics",
+    "ranking_position_diagnostics",
+    "reputation_issue_diagnostics",
+    "seven_dimensions",
+    "overall",
+    "citation_sources",
+    "gap_analysis",
+    "recommendations"
+  ],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "brand",
+        "diagnosed_at",
+        "platforms",
+        "question_count",
+        "response_count"
+      ],
+      "properties": {
+        "brand": {
+          "type": "string"
+        },
+        "diagnosed_at": {
+          "type": "string",
+          "format": "date"
+        },
+        "platforms": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "实际上传并可解析的平台列表；允许少于3个平台"
+        },
+        "question_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "实际上传并可解析的客户确认问题数量；不得因题量少判定为数据不完全"
+        },
+        "response_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "platform_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "实际上传并可解析的平台数量；允许小于3"
+        },
+        "planned_question_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "客户确认的计划监测题量；仅用于覆盖率说明，不作为硬校验"
+        },
+        "is_partial_sample": {
+          "type": "boolean",
+          "description": "是否为部分样本诊断"
+        },
+        "sample_scope": {
+          "type": "object",
+          "description": "实际样本覆盖说明，必须如实说明已覆盖与未覆盖范围",
+          "properties": {
+            "analysis_basis": {
+              "type": "string"
+            },
+            "covered_questions": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "covered_platforms": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "coverage_limitations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "core_metrics": {
+      "type": "object",
+      "required": [
+        "citation_rate",
+        "avg_position",
+        "sentiment_score",
+        "fact_accuracy"
+      ],
+      "properties": {
+        "citation_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "avg_position": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 10,
+          "description": "实际有排名样本的平均位次；若无可用位次可为 null"
+        },
+        "sentiment_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "fact_accuracy": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    "seven_dimensions": {
+      "type": "object",
+      "required": [
+        "D1_visibility",
+        "D2_accuracy",
+        "D3_eeat",
+        "D4_competitive",
+        "D5_intent_coverage",
+        "D6_negative",
+        "D7_positioning_gap"
+      ],
+      "properties": {
+        "D1_visibility": {
+          "$ref": "#/definitions/dimension_score"
+        },
+        "D2_accuracy": {
+          "$ref": "#/definitions/dimension_score"
+        },
+        "D3_eeat": {
+          "$ref": "#/definitions/dimension_score"
+        },
+        "D4_competitive": {
+          "$ref": "#/definitions/dimension_score"
+        },
+        "D5_intent_coverage": {
+          "$ref": "#/definitions/dimension_score"
+        },
+        "D6_negative": {
+          "$ref": "#/definitions/dimension_score"
+        },
+        "D7_positioning_gap": {
+          "$ref": "#/definitions/dimension_score"
+        }
+      }
+    },
+    "overall": {
+      "type": "object",
+      "required": [
+        "score",
+        "grade",
+        "summary"
+      ],
+      "properties": {
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "grade": {
+          "type": "string",
+          "enum": [
+            "A+",
+            "A",
+            "B",
+            "C",
+            "D"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 50
+        }
+      }
+    },
+    "citation_sources": {
+      "type": "object",
+      "description": "信源分析数据 — E5 分发编排师渠道选择的第一优先级输入",
+      "required": [
+        "domain_frequency",
+        "top_sources",
+        "competitor_gap_matrix"
+      ],
+      "properties": {
+        "domain_frequency": {
+          "type": "array",
+          "description": "各信源域名的引用频次统计（按 value_score 降序排列）；无可解析信源时允许为空数组并在报告中说明",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "required": [
+              "domain",
+              "frequency",
+              "platform_coverage",
+              "question_coverage",
+              "position_weight",
+              "competitor_cooccurrence",
+              "value_score"
+            ],
+            "properties": {
+              "domain": {
+                "type": "string",
+                "description": "归一化后的信源域名/平台名称（如：搜狐、知乎专栏、百家号）"
+              },
+              "frequency": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "在所有 AI 回答中被引用的绝对次数"
+              },
+              "platform_coverage": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "被多少个不同 AI 平台引用"
+              },
+              "question_coverage": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "在多少个不同问题的回答中被引用"
+              },
+              "position_weight": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "排在引用列表前 3 位的次数"
+              },
+              "competitor_cooccurrence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "与竞品内容同时出现在同一回答中的比例"
+              },
+              "value_score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 100,
+                "description": "综合信源价值评分（公式见 SKILL.md Step 2.3）"
+              }
+            }
+          }
+        },
+        "top_sources": {
+          "type": "array",
+          "description": "高频信源的深度分析（最多 Top 10；按实际可解析信源数量输出，可为 0）",
+          "minItems": 0,
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "required": [
+              "url",
+              "domain",
+              "media_name",
+              "content_type",
+              "frequency",
+              "content_features"
+            ],
+            "properties": {
+              "url": {
+                "type": "string",
+                "format": "uri",
+                "description": "信源的具体 URL"
+              },
+              "domain": {
+                "type": "string",
+                "description": "归一化域名"
+              },
+              "media_name": {
+                "type": "string",
+                "description": "媒体/账号名称"
+              },
+              "content_type": {
+                "type": "string",
+                "enum": [
+                  "A",
+                  "B",
+                  "C",
+                  "D",
+                  "E",
+                  "F"
+                ],
+                "description": "内容类型代码：A=GEO文章, B=权威长内容, C=媒体公关, D=社交媒体, E=官网内容, F=多媒体"
+              },
+              "frequency": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "该具体 URL 被引用的次数"
+              },
+              "content_features": {
+                "type": "string",
+                "minLength": 30,
+                "description": "内容结构特征摘要（50-100 字）"
+              }
+            }
+          }
+        },
+        "competitor_gap_matrix": {
+          "type": "array",
+          "description": "竞品已占位但本品牌缺失的信源缺口矩阵；小样本或无竞品信源时允许为空数组并在报告中说明",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "required": [
+              "platform",
+              "brand_covered",
+              "competitors_covered",
+              "gap_priority"
+            ],
+            "properties": {
+              "platform": {
+                "type": "string",
+                "description": "信源平台/域名"
+              },
+              "brand_covered": {
+                "type": "boolean",
+                "description": "本品牌是否已在该平台有内容被引用"
+              },
+              "competitors_covered": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "已在该平台占位的竞品列表"
+              },
+              "gap_priority": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ],
+                "description": "缺口优先级：high=竞品已覆盖+高权值+高频次, medium=中权值或未覆盖+高权值, low=低权值"
+              }
+            }
+          }
+        }
+      }
+    },
+    "platform_details": {
+      "type": "object",
+      "description": "各 AI 平台的详细诊断数据（按平台名称为键）",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "citation_rate": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "avg_position": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10
+          },
+          "sentiment_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "fact_accuracy": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          }
+        }
+      }
+    },
+    "gap_analysis": {
+      "type": "array",
+      "minItems": 7,
+      "items": {
+        "type": "object",
+        "required": [
+          "dimension",
+          "ideal_state",
+          "actual_state",
+          "gap_score",
+          "fix_priority",
+          "fix_suggestion"
+        ],
+        "properties": {
+          "dimension": {
+            "type": "string"
+          },
+          "ideal_state": {
+            "type": "string"
+          },
+          "actual_state": {
+            "type": "string"
+          },
+          "gap_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "fix_priority": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "fix_suggestion": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "priority",
+          "dimension",
+          "action",
+          "expected_impact"
+        ],
+        "properties": {
+          "priority": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "expected_impact": {
+            "type": "string"
+          },
+          "timeline": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ranking_position_diagnostics": {
+      "type": "object",
+      "description": "AI 回答/搜索结果中的品牌排名位次诊断；由 S5 根据 AI 监测 JSON 的 responses[].answers.*.position 字段前置生成，供 S5.5 直接评分复用。负面/舆情/口碑/缺点类直接点名品牌的问题必须排除出可见度与排名聚合指标，并转入 reputation_issue_diagnostics。",
+      "required": [
+        "data_source",
+        "total_observations",
+        "total_raw_observations",
+        "ranking_metric_observations",
+        "excluded_reputation_observations",
+        "ranked_observations",
+        "unmentioned_observations",
+        "avg_rank",
+        "first_place_rate",
+        "top3_rate",
+        "top5_rate",
+        "rank_distribution",
+        "competitor_rank_gap",
+        "platform_breakdown",
+        "per_question_rank_matrix"
+      ],
+      "properties": {
+        "data_source": {
+          "type": "string",
+          "minLength": 10
+        },
+        "total_observations": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "参与可见度与排名聚合计算的样本数量；不包含舆情类排除样本。若本次上传全部为舆情类问题，则该值允许为 0。"
+        },
+        "ranked_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unmentioned_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "avg_rank": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 20
+        },
+        "first_place_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "top3_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "top5_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "best_rank": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "worst_rank": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "rank_distribution": {
+          "type": "object",
+          "required": [
+            "rank_1",
+            "rank_2_3",
+            "rank_4_5",
+            "rank_6_10",
+            "rank_11_plus"
+          ],
+          "properties": {
+            "rank_1": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank_2_3": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank_4_5": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank_6_10": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank_11_plus": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "competitor_rank_gap": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "品牌平均位次 - 最强竞品平均位次；正值代表品牌落后。"
+        },
+        "platform_breakdown": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "response_count",
+              "mentioned_count",
+              "citation_rate",
+              "avg_rank",
+              "top3_rate",
+              "top5_rate"
+            ],
+            "properties": {
+              "response_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "mentioned_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "citation_rate": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "avg_rank": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 1,
+                "maximum": 20
+              },
+              "top3_rate": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "top5_rate": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        },
+        "per_question_rank_matrix": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "question_id",
+              "question",
+              "platform",
+              "question_type",
+              "ranking_metric_eligible",
+              "ranking_exclusion_reason",
+              "brand_mentioned",
+              "brand_rank",
+              "top_competitor_rank",
+              "rank_gap",
+              "rank_bucket",
+              "diagnosis"
+            ],
+            "properties": {
+              "question_id": {
+                "type": "string"
+              },
+              "question": {
+                "type": "string"
+              },
+              "platform": {
+                "type": "string"
+              },
+              "brand_mentioned": {
+                "type": "boolean"
+              },
+              "brand_rank": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "competitor_ranks": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "top_competitor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "top_competitor_rank": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "rank_gap": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "rank_bucket": {
+                "type": "string",
+                "enum": [
+                  "rank_1",
+                  "rank_2_3",
+                  "rank_4_5",
+                  "rank_6_10",
+                  "rank_11_plus",
+                  "excluded_reputation_issue"
+                ],
+                "description": "仅可排名/可见度题使用 rank_* 分桶；舆情类排除样本必须使用 excluded_reputation_issue，避免被误读为排名优势。"
+              },
+              "raw_detected_position": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "description": "AI 回答中检测到的原始出现位次，仅作审计追溯；当 ranking_metric_eligible=false 时不得用于 D1 可见度、平均排名或 Top3/Top5 计算。"
+              },
+              "diagnosis": {
+                "type": "string",
+                "minLength": 10
+              },
+              "question_type": {
+                "type": "string",
+                "enum": [
+                  "ranking_visibility",
+                  "brand_comparison",
+                  "general_visibility",
+                  "reputation_issue",
+                  "fact_check",
+                  "other"
+                ],
+                "description": "问题类型。reputation_issue 表示缺点、问题、投诉、口碑、风险、负面评价等舆情类问题。"
+              },
+              "ranking_metric_eligible": {
+                "type": "boolean",
+                "description": "该样本是否参与可见度、排名、Top3/Top5 和竞品位次差聚合。舆情类问题必须为 false。"
+              },
+              "ranking_exclusion_reason": {
+                "type": "string",
+                "description": "若 ranking_metric_eligible=false，说明排除原因；可排名样本可为空字符串。"
+              }
+            }
+          }
+        },
+        "total_raw_observations": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "实际上传并解析到的原始回答样本总数，包含可排名样本与舆情类排除样本。"
+        },
+        "ranking_metric_observations": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "参与 D1 可见度、平均位次、Top3/Top5、竞品位次差等聚合计算的样本数量。"
+        },
+        "excluded_reputation_observations": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "因题目属于负面/舆情/口碑/缺点/投诉/风险类而被排除出可见度与排名指标的样本数量。"
+        }
+      }
+    },
+    "reputation_issue_diagnostics": {
+      "type": "object",
+      "description": "负面/舆情/口碑/缺点/投诉/风险类直接点名品牌问题的独立诊断结果；不参与 D1 可见度或排名评分，主要供 D6 负面舆情与 S9 GEO 业务建议使用。",
+      "required": [
+        "data_source",
+        "total_observations",
+        "question_count",
+        "platform_breakdown",
+        "per_question_issue_matrix"
+      ],
+      "properties": {
+        "data_source": {
+          "type": "string",
+          "minLength": 10
+        },
+        "total_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "question_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "platform_breakdown": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "response_count",
+              "positive_count",
+              "neutral_count",
+              "negative_count",
+              "unknown_count",
+              "severity_distribution"
+            ],
+            "properties": {
+              "response_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "positive_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "neutral_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "negative_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "unknown_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "severity_distribution": {
+                "type": "object",
+                "required": [
+                  "high",
+                  "medium",
+                  "low"
+                ],
+                "properties": {
+                  "high": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "medium": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "low": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        "per_question_issue_matrix": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "required": [
+              "question_id",
+              "question",
+              "platform",
+              "brand_mentioned",
+              "sentiment",
+              "severity",
+              "issue_summary",
+              "recommended_response"
+            ],
+            "properties": {
+              "question_id": {
+                "type": "string"
+              },
+              "question": {
+                "type": "string"
+              },
+              "platform": {
+                "type": "string"
+              },
+              "brand_mentioned": {
+                "type": "boolean"
+              },
+              "sentiment": {
+                "type": "string",
+                "enum": [
+                  "positive",
+                  "neutral",
+                  "negative",
+                  "mixed",
+                  "unknown"
+                ]
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "medium",
+                  "low",
+                  "none",
+                  "unknown"
+                ]
+              },
+              "issue_summary": {
+                "type": "string",
+                "minLength": 10
+              },
+              "evidence_fragments": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "suspected_source_bias": {
+                "type": "string"
+              },
+              "recommended_response": {
+                "type": "string",
+                "minLength": 10
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "dimension_score": {
+      "type": "object",
+      "required": [
+        "score",
+        "details"
+      ],
+      "properties": {
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "details": {
+          "type": "string",
+          "minLength": 20
+        },
+        "sub_scores": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        }
+      }
+    }
+  }
+}
