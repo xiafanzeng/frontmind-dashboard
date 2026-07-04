@@ -1364,8 +1364,8 @@ function isZipMagicBytes(data) {
 }
 async function sanitizeOfficeXmlBuffer(data) {
   try {
-    const JSZip2 = (await import("jszip")).default;
-    const zip = await JSZip2.loadAsync(data);
+    const JSZip3 = (await import("jszip")).default;
+    const zip = await JSZip3.loadAsync(data);
     let modified = false;
     const fileNames = Object.keys(zip.files);
     for (const fname of fileNames) {
@@ -3252,6 +3252,186 @@ router4.post("/start", async (req, res) => {
 });
 var news_release_api_default = router4;
 
+// server/knowledge-base-api.ts
+import axios4 from "axios";
+import { Router as Router4 } from "express";
+import fs5 from "fs/promises";
+import JSZip2 from "jszip";
+import path5 from "path";
+var router5 = Router4();
+var skillArchiveCandidates = [
+  process.env.FRONTMIND_KB_SKILL_PATH,
+  path5.resolve(process.cwd(), "private-workflows", "socratic-kb-builder.skill"),
+  path5.resolve(import.meta.dirname, "..", "private-workflows", "socratic-kb-builder.skill"),
+  path5.resolve(import.meta.dirname, "..", "..", "private-workflows", "socratic-kb-builder.skill")
+].filter(Boolean);
+var cachedSkillInstructions = null;
+function sanitizeFilename3(value, fallback) {
+  const safe = String(value || "").replace(/[\\/\0]/g, "_").replace(/^\.+$/, "").trim().slice(0, 160);
+  return safe || fallback;
+}
+function normalizeUserAttachments2(attachments) {
+  return (attachments || []).map((attachment) => {
+    const fileId = attachment.file_id || attachment.fileId || "";
+    const filename = sanitizeFilename3(
+      attachment.filename || attachment.name || "company_material",
+      "company_material"
+    );
+    return fileId ? { file_id: fileId, filename } : null;
+  }).filter(Boolean);
+}
+async function readSkillArchive() {
+  if (cachedSkillInstructions) return cachedSkillInstructions;
+  let lastError;
+  for (const candidate of skillArchiveCandidates) {
+    try {
+      const archive = await fs5.readFile(candidate);
+      const zip = await JSZip2.loadAsync(archive);
+      const entries = [
+        ["SKILL.md", "Skill"],
+        ["references/knowledge-tree.md", "Knowledge Tree"],
+        ["references/questioning-strategy.md", "Questioning Strategy"],
+        ["references/output-format.md", "Output Format"]
+      ];
+      const sections = [];
+      for (const [entryName, title] of entries) {
+        const entry = zip.file(entryName);
+        if (!entry) {
+          throw new Error(`Missing ${entryName} in socratic-kb-builder.skill`);
+        }
+        const content = await entry.async("string");
+        sections.push(`# ${title}
+
+${content.trim()}`);
+      }
+      cachedSkillInstructions = sections.join("\n\n---\n\n");
+      return cachedSkillInstructions;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Could not load socratic-kb-builder.skill");
+}
+async function buildKnowledgeBasePrompt({
+  companyName,
+  companyWebsite,
+  operatorNotes,
+  attachments
+}) {
+  const skillInstructions = await readSkillArchive();
+  const attachmentList = attachments.length > 0 ? attachments.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u548C\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
+  return [
+    "\u4F60\u5FC5\u987B\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u7ED3\u6784\u5316\u77E5\u8BC6\u5E93\u3002",
+    "",
+    "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
+    `\u4F01\u4E1A\u540D\u79F0\uFF1A${companyName}`,
+    `\u4F01\u4E1A\u5B98\u7F51\uFF1A${companyWebsite || "\u672A\u586B\u5199"}`,
+    "\u7528\u6237\u4E0A\u4F20\u8D44\u6599\uFF1A",
+    attachmentList,
+    operatorNotes ? `\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A
+${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
+    "",
+    "## \u6267\u884C\u8981\u6C42",
+    "1. \u5148\u8BFB\u53D6\u7528\u6237\u4E0A\u4F20\u8D44\u6599\uFF0C\u5E76\u7ED3\u5408\u4F01\u4E1A\u5B98\u7F51\u548C\u516C\u5F00\u8D44\u6599\u505A\u6DF1\u5EA6\u7814\u7A76\u3002",
+    "2. \u6309 skill \u8981\u6C42\u5148\u9884\u586B\u77E5\u8BC6\u6811\uFF0C\u518D\u4EE5\u82CF\u683C\u62C9\u5E95\u5F0F\u786E\u8BA4\u63A8\u8FDB\uFF0C\u4E0D\u80FD\u8BA9\u7528\u6237\u4ECE\u7A7A\u767D\u95EE\u9898\u5F00\u59CB\u5199\u3002",
+    "3. \u5BF9\u6BCF\u4E2A\u4E8B\u5B9E\u6807\u6CE8\u6765\u6E90\uFF1A\u4E0A\u4F20\u8D44\u6599\u3001\u4F01\u4E1A\u5B98\u7F51\u3001\u516C\u5F00\u8D44\u6599\u6216\u884C\u4E1A\u8C03\u7814\u3002",
+    "4. \u5982\u5F53\u524D\u4FE1\u606F\u4E0D\u8DB3\uFF0C\u8BF7\u5C55\u793A\u5DF2\u9884\u586B\u8349\u7A3F\u3001\u7F3A\u53E3\u548C\u53EF\u786E\u8BA4\u95EE\u9898\uFF0C\u7B49\u5F85\u7528\u6237\u786E\u8BA4\u6216\u8865\u5145\u3002",
+    "5. \u6700\u7EC8\u4EA4\u4ED8\u5E94\u6309 skill \u7684 ZIP/Markdown \u77E5\u8BC6\u5E93\u7ED3\u6784\u7EC4\u7EC7\u3002",
+    "",
+    "## socratic-kb-builder.skill",
+    skillInstructions
+  ].join("\n");
+}
+async function createFrontMindTask2({
+  baseUrl,
+  apiKey,
+  prompt,
+  agentProfile,
+  attachments
+}) {
+  const taskResponse = await axios4.post(
+    `${baseUrl}/v1/tasks`,
+    {
+      prompt,
+      agentProfile: toUpstreamAgentProfile(agentProfile),
+      taskMode: "agent",
+      attachments
+    },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        API_KEY: apiKey,
+        Authorization: `Bearer ${apiKey}`
+      },
+      timeout: 12e4,
+      validateStatus: () => true
+    }
+  );
+  if (taskResponse.status < 200 || taskResponse.status >= 300) {
+    const detail = taskResponse.data?.error?.message || taskResponse.data?.message || `Create task failed (${taskResponse.status})`;
+    return { ok: false, status: taskResponse.status, detail };
+  }
+  const taskData = taskResponse.data || {};
+  const taskId = taskData.id || taskData.task_id;
+  if (!taskId) {
+    return { ok: false, status: 502, detail: "Create task failed: missing task id" };
+  }
+  return {
+    ok: true,
+    task: {
+      id: taskId,
+      status: taskData.status === "failed" ? "error" : taskData.status || "running",
+      taskUrl: taskData.task_url || taskData.metadata?.task_url,
+      title: taskData.task_title || taskData.metadata?.task_title,
+      output: taskData.output || []
+    }
+  };
+}
+router5.post("/start", async (req, res) => {
+  const body = req.body || {};
+  const companyName = String(body.companyName || "").trim();
+  const companyWebsite = String(body.companyWebsite || "").trim();
+  const operatorNotes = String(body.operatorNotes || "").trim();
+  if (!companyName) {
+    res.status(400).json({ error: "Missing company name" });
+    return;
+  }
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
+  if (!apiKey) {
+    res.status(401).json({ error: "Missing API key" });
+    return;
+  }
+  try {
+    const userAttachments = normalizeUserAttachments2(body.attachments);
+    const created = await createFrontMindTask2({
+      baseUrl,
+      apiKey,
+      prompt: await buildKnowledgeBasePrompt({
+        companyName,
+        companyWebsite,
+        operatorNotes,
+        attachments: userAttachments
+      }),
+      agentProfile: body.agentProfile,
+      attachments: userAttachments
+    });
+    if (!created.ok) {
+      console.warn("[Knowledge Base Start] create task failed:", created.detail);
+      res.status(created.status).json({ error: "\u521B\u5EFA\u4F01\u4E1A\u77E5\u8BC6\u5E93\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5 API Key \u6216\u7A0D\u540E\u91CD\u8BD5" });
+      return;
+    }
+    res.json({
+      visibleMessage: "\u5F00\u59CB\u6784\u5EFA\u4F01\u4E1A\u77E5\u8BC6\u5E93",
+      task: created.task,
+      startedAt: Date.now()
+    });
+  } catch (error) {
+    console.error("[Knowledge Base Start] error:", error.message);
+    res.status(500).json({ error: "\u542F\u52A8\u4F01\u4E1A\u77E5\u8BC6\u5E93\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" });
+  }
+});
+var knowledge_base_api_default = router5;
+
 // server/_core/index.ts
 function isPortAvailable(port) {
   return new Promise((resolve) => {
@@ -3289,6 +3469,7 @@ async function startServer() {
   });
   app.use("/api/workflow", workflow_api_default);
   app.use("/api/news-release", news_release_api_default);
+  app.use("/api/knowledge-base", knowledge_base_api_default);
   app.use(
     "/api/trpc",
     createExpressMiddleware({

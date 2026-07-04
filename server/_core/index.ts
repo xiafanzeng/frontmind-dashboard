@@ -9,6 +9,7 @@ import { serveStatic, setupVite } from "./vite";
 import manusProxy from "../manus-proxy";
 import workflowApi, { cleanupStaleWorkflowUploads } from "../workflow-api";
 import newsReleaseApi from "../news-release-api";
+import knowledgeBaseApi from "../knowledge-base-api";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -52,6 +53,8 @@ async function startServer() {
   app.use("/api/workflow", workflowApi);
   // One-click homepage news release workflow. Hidden execution prompt is assembled server-side.
   app.use("/api/news-release", newsReleaseApi);
+  // One-click enterprise knowledge base workflow powered by the Socratic KB skill.
+  app.use("/api/knowledge-base", knowledgeBaseApi);
   // tRPC API
   app.use(
     "/api/trpc",
