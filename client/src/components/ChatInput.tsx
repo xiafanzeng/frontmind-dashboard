@@ -6,12 +6,22 @@
  */
 import { useState, useRef, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useSendMessage } from "@/hooks/useSendMessage";
 import { useConversation } from "@/contexts/ConversationContext";
-import { isImageFile, fileToBase64, MODEL_OPTIONS, getConfig } from "@/lib/frontmind-api";
+import { isImageFile, MODEL_OPTIONS, getConfig } from "@/lib/frontmind-api";
+import {
+  inspectImageFile,
+  formatImageInspectionSummary,
+  type ImageInspection,
+} from "@/lib/image-inspection";
 import { Progress } from "@/components/ui/progress";
 import { motion, AnimatePresence } from "framer-motion";
+import { toast } from "sonner";
 import {
   Send,
   Paperclip,
@@ -27,7 +37,8 @@ import { cn } from "@/lib/utils";
 interface FilePreview {
   file: File;
   id: string;
-  preview?: string; // base64 for images
+  preview?: string; // object URL for images
+  imageInspection?: ImageInspection;
 }
 
 export default function ChatInput() {
@@ -40,6 +51,7 @@ export default function ChatInput() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
+  const previewUrlsRef = useRef<Set<string>>(new Set());
   // Synchronous lock ref to prevent duplicate sends (React state updates are async)
   const sendLockRef = useRef(false);
 
@@ -53,22 +65,49 @@ export default function ChatInput() {
   const { activeConversation } = useConversation();
 
   // Only show upload progress if it belongs to the current active conversation
-  const uploadProgress = rawUploadProgress && rawUploadProgress.conversationId === activeConversation?.id
-    ? rawUploadProgress
-    : null;
+  const uploadProgress =
+    rawUploadProgress &&
+    rawUploadProgress.conversationId === activeConversation?.id
+      ? rawUploadProgress
+      : null;
 
   const isRunning = activeConversation?.status === "running";
+
+  useEffect(() => {
+    return () => {
+      previewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      previewUrlsRef.current.clear();
+    };
+  }, []);
+
+  const revokePreviewUrl = useCallback((preview?: string) => {
+    if (preview?.startsWith("blob:")) {
+      URL.revokeObjectURL(preview);
+      previewUrlsRef.current.delete(preview);
+    }
+  }, []);
+
+  const clearSelectedFiles = useCallback(() => {
+    setFiles((prev) => {
+      prev.forEach((fp) => revokePreviewUrl(fp.preview));
+      return [];
+    });
+  }, [revokePreviewUrl]);
 
   // Close model menu when clicking outside
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (modelMenuRef.current && !modelMenuRef.current.contains(e.target as Node)) {
+      if (
+        modelMenuRef.current &&
+        !modelMenuRef.current.contains(e.target as Node)
+      ) {
         setModelMenuOpen(false);
       }
     };
     if (modelMenuOpen) {
       document.addEventListener("mousedown", handleClickOutside);
-      return () => document.removeEventListener("mousedown", handleClickOutside);
+      return () =>
+        document.removeEventListener("mousedown", handleClickOutside);
     }
   }, [modelMenuOpen]);
 
@@ -77,17 +116,42 @@ export default function ChatInput() {
     for (const file of newFiles) {
       const id = `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       let preview: string | undefined;
+      let imageInspection: ImageInspection | undefined;
       if (isImageFile(file)) {
-        preview = await fileToBase64(file);
+        try {
+          imageInspection = await inspectImageFile(file);
+        } catch (err: any) {
+          toast.error(`图片 "${file.name}" 读取失败`, {
+            description: err?.message || "请确认图片文件可以正常打开后再上传。",
+          });
+          continue;
+        }
+
+        preview = URL.createObjectURL(file);
+        previewUrlsRef.current.add(preview);
+
+        if (imageInspection.isLarge) {
+          toast.warning("图片像素较大", {
+            description: `${file.name}：${formatImageInspectionSummary(imageInspection)}。上游可能处理较慢或返回服务繁忙。`,
+            duration: 6000,
+          });
+        }
       }
-      previews.push({ file, id, preview });
+      previews.push({ file, id, preview, imageInspection });
     }
     setFiles((prev) => [...prev, ...previews]);
   }, []);
 
-  const removeFile = useCallback((id: string) => {
-    setFiles((prev) => prev.filter((f) => f.id !== id));
-  }, []);
+  const removeFile = useCallback(
+    (id: string) => {
+      setFiles((prev) => {
+        const removed = prev.find((f) => f.id === id);
+        revokePreviewUrl(removed?.preview);
+        return prev.filter((f) => f.id !== id);
+      });
+    },
+    [revokePreviewUrl],
+  );
 
   const handleSubmit = useCallback(async () => {
     if ((!text.trim() && files.length === 0) || isSending || isRunning) return;
@@ -101,16 +165,24 @@ export default function ChatInput() {
       await sendMessage(
         text,
         files.map((f) => f.file),
-        { agentProfile: selectedModel }
+        { agentProfile: selectedModel },
       );
       setText("");
-      setFiles([]);
+      clearSelectedFiles();
       textareaRef.current?.focus();
     } finally {
       setIsSending(false);
       sendLockRef.current = false;
     }
-  }, [text, files, isSending, isRunning, sendMessage, selectedModel]);
+  }, [
+    text,
+    files,
+    isSending,
+    isRunning,
+    sendMessage,
+    selectedModel,
+    clearSelectedFiles,
+  ]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -119,7 +191,7 @@ export default function ChatInput() {
         handleSubmit();
       }
     },
-    [handleSubmit]
+    [handleSubmit],
   );
 
   // Drag and drop handlers
@@ -142,7 +214,7 @@ export default function ChatInput() {
         addFiles(droppedFiles);
       }
     },
-    [addFiles]
+    [addFiles],
   );
 
   // Auto-resize textarea
@@ -153,13 +225,14 @@ export default function ChatInput() {
       el.style.height = "auto";
       el.style.height = Math.min(el.scrollHeight, 160) + "px";
     },
-    []
+    [],
   );
 
   const isUploading = uploadProgress !== null;
 
   // Get current model display info
-  const currentModelInfo = MODEL_OPTIONS.find(m => m.value === selectedModel) || MODEL_OPTIONS[2];
+  const currentModelInfo =
+    MODEL_OPTIONS.find((m) => m.value === selectedModel) || MODEL_OPTIONS[2];
 
   return (
     <div
@@ -179,7 +252,9 @@ export default function ChatInput() {
           >
             <div className="text-center">
               <Paperclip className="w-8 h-8 text-primary/50 mx-auto mb-2" />
-              <p className="text-sm text-primary/70 font-medium">拖放文件到此处</p>
+              <p className="text-sm text-primary/70 font-medium">
+                拖放文件到此处
+              </p>
             </div>
           </motion.div>
         )}
@@ -198,14 +273,20 @@ export default function ChatInput() {
               <div className="flex items-center gap-2 mb-1.5">
                 <Upload className="w-3.5 h-3.5 text-primary animate-pulse" />
                 <span className="text-xs text-muted-foreground">
-                  上传文件 ({uploadProgress.currentFileIndex + 1}/{uploadProgress.totalFiles})：
-                  <span className="text-foreground font-medium ml-1">{uploadProgress.currentFileName}</span>
+                  上传文件 ({uploadProgress.currentFileIndex + 1}/
+                  {uploadProgress.totalFiles})：
+                  <span className="text-foreground font-medium ml-1">
+                    {uploadProgress.currentFileName}
+                  </span>
                 </span>
                 <span className="text-xs font-mono text-primary ml-auto">
                   {uploadProgress.overallPercent}%
                 </span>
               </div>
-              <Progress value={uploadProgress.overallPercent} className="h-1.5" />
+              <Progress
+                value={uploadProgress.overallPercent}
+                className="h-1.5"
+              />
             </motion.div>
           )}
         </AnimatePresence>
@@ -225,7 +306,7 @@ export default function ChatInput() {
                   initial={{ opacity: 0, scale: 0.8 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.8 }}
-                  className="relative group"
+                  className="relative group w-24"
                 >
                   {fp.preview ? (
                     <div className="w-20 h-20 rounded-xl overflow-hidden border border-border/40 shadow-sm">
@@ -242,6 +323,14 @@ export default function ChatInput() {
                         {fp.file.name}
                       </span>
                     </div>
+                  )}
+                  {fp.imageInspection?.isLarge && (
+                    <p
+                      className="mt-1 text-[10px] leading-tight text-amber-600 truncate"
+                      title={formatImageInspectionSummary(fp.imageInspection)}
+                    >
+                      像素较大
+                    </p>
                   )}
                   <button
                     onClick={() => removeFile(fp.id)}
@@ -260,7 +349,7 @@ export default function ChatInput() {
           className={cn(
             "bg-card/90 border border-border/70 rounded-[1.5rem] transition-all duration-300 shadow-[0_18px_60px_rgba(15,23,42,0.08)] backdrop-blur-xl",
             isDragging && "ring-2 ring-primary/30",
-            "focus-within:shadow-[0_24px_70px_rgba(15,23,42,0.11)] focus-within:border-primary/35"
+            "focus-within:shadow-[0_24px_70px_rgba(15,23,42,0.11)] focus-within:border-primary/35",
           )}
         >
           <div className="flex items-end gap-1.5 p-2.5 sm:gap-2 sm:p-3.5">
@@ -327,11 +416,18 @@ export default function ChatInput() {
                       className={cn(
                         "flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-[11px] font-medium transition-all",
                         "bg-secondary/80 text-muted-foreground hover:bg-primary/10 hover:text-primary",
-                        modelMenuOpen && "bg-primary/10 text-primary"
+                        modelMenuOpen && "bg-primary/10 text-primary",
                       )}
                     >
-                      <span className="truncate max-w-[76px] sm:max-w-[148px]">{currentModelInfo.label}</span>
-                      <ChevronDown className={cn("w-3 h-3 transition-transform", modelMenuOpen && "rotate-180")} />
+                      <span className="truncate max-w-[76px] sm:max-w-[148px]">
+                        {currentModelInfo.label}
+                      </span>
+                      <ChevronDown
+                        className={cn(
+                          "w-3 h-3 transition-transform",
+                          modelMenuOpen && "rotate-180",
+                        )}
+                      />
                     </button>
                   </TooltipTrigger>
                   <TooltipContent>选择模型</TooltipContent>
@@ -358,7 +454,7 @@ export default function ChatInput() {
                             "w-full text-left px-3 py-2.5 flex items-center justify-between transition-colors",
                             selectedModel === model.value
                               ? "bg-primary/10 text-primary"
-                              : "hover:bg-muted/60 text-foreground"
+                              : "hover:bg-muted/60 text-foreground",
                           )}
                         >
                           <div>
@@ -380,13 +476,18 @@ export default function ChatInput() {
               {/* Send button */}
               <Button
                 onClick={handleSubmit}
-                disabled={(!text.trim() && files.length === 0) || isSending || isRunning || isUploading}
+                disabled={
+                  (!text.trim() && files.length === 0) ||
+                  isSending ||
+                  isRunning ||
+                  isUploading
+                }
                 size="icon"
                 className={cn(
                   "w-10 h-10 rounded-2xl transition-all flex-shrink-0",
                   text.trim() || files.length > 0
                     ? "bg-primary text-primary-foreground shadow-md glow-indigo"
-                    : "bg-muted text-muted-foreground"
+                    : "bg-muted text-muted-foreground",
                 )}
               >
                 {isSending || isRunning || isUploading ? (

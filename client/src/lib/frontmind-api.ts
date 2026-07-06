@@ -39,6 +39,8 @@ const DEFAULT_CONFIG = {
   agentProfile: "frontmind-pro",
 };
 
+export const CREATE_TASK_TIMEOUT_MS = 300_000;
+
 function normalizePublicAgentProfile(value: string | undefined): string {
   if (value === "frontmind-lite") return "frontmind-lite";
   if (value === "frontmind-base") return "frontmind-base";
@@ -116,7 +118,9 @@ export function saveConfig(config: Partial<typeof DEFAULT_CONFIG>) {
   // Detect API key change and emit event
   if (config.apiKey && config.apiKey !== oldConfig.apiKey) {
     const newFingerprint = getApiKeyFingerprint(config.apiKey);
-    console.log(`[saveConfig] API Key changed. New fingerprint: ${newFingerprint}`);
+    console.log(
+      `[saveConfig] API Key changed. New fingerprint: ${newFingerprint}`,
+    );
     apiKeyChangeEventBus.emit(newFingerprint);
   }
 
@@ -126,7 +130,7 @@ export function saveConfig(config: Partial<typeof DEFAULT_CONFIG>) {
 /**
  * Sanitize text by replacing source-brand strings with FrontMind equivalents.
  * This is applied to all API response text before rendering to the user.
- * 
+ *
  */
 export function sanitizeBrandText(text: string): string {
   if (!text) return "";
@@ -142,11 +146,23 @@ export function sanitizeBrandText(text: string): string {
   try {
     const source = ["ma", "nus"].join("");
     return text
-      .replace(new RegExp(`https?:\\/\\/api\\.${source}\\.`, "gi"), "https://api.frontmind.")
-      .replace(new RegExp(`https?:\\/\\/www\\.${source}\\.`, "gi"), "https://www.frontmind.")
-      .replace(new RegExp(`https?:\\/\\/${source}\\.`, "gi"), "https://frontmind.")
+      .replace(
+        new RegExp(`https?:\\/\\/api\\.${source}\\.`, "gi"),
+        "https://api.frontmind.",
+      )
+      .replace(
+        new RegExp(`https?:\\/\\/www\\.${source}\\.`, "gi"),
+        "https://www.frontmind.",
+      )
+      .replace(
+        new RegExp(`https?:\\/\\/${source}\\.`, "gi"),
+        "https://frontmind.",
+      )
       .replace(new RegExp(`\\b${source.toUpperCase()}\\b`, "g"), "FrontMind")
-      .replace(new RegExp(`\\b${source[0].toUpperCase()}${source.slice(1)}\\b`, "g"), "FrontMind")
+      .replace(
+        new RegExp(`\\b${source[0].toUpperCase()}${source.slice(1)}\\b`, "g"),
+        "FrontMind",
+      )
       .replace(new RegExp(`\\b${source}\\b`, "g"), "frontmind");
   } catch (e) {
     console.error("[sanitizeBrandText] Error:", e);
@@ -274,7 +290,7 @@ export interface FileRecord {
 async function apiRequest(
   endpoint: string,
   options: RequestInit = {},
-  timeoutMs?: number
+  timeoutMs?: number,
 ): Promise<Response> {
   const config = getConfig();
   const url = `/api/frontmind${endpoint}`;
@@ -286,7 +302,9 @@ async function apiRequest(
     ...(options.headers as Record<string, string>),
   };
 
-  const isPost = options.method?.toUpperCase() === "POST" || options.method?.toUpperCase() === "PUT";
+  const isPost =
+    options.method?.toUpperCase() === "POST" ||
+    options.method?.toUpperCase() === "PUT";
   const timeout = timeoutMs ?? (isPost ? 120_000 : 30_000);
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -322,7 +340,7 @@ async function apiRequest(
     clearTimeout(timeoutId);
     if (err.name === "AbortError") {
       throw new Error(
-        `请求超时 (${Math.round(timeout / 1000)}s)，API 服务器响应过慢。可尝试重新发送。`
+        `请求超时 (${Math.round(timeout / 1000)}s)，API 服务器响应过慢。可尝试重新发送。`,
       );
     }
     throw err;
@@ -355,7 +373,7 @@ function buildPromptText(input: Message[]): string {
 /**
  * Extract attachments (images and files) from user input content items.
  * Returns an array suitable for the /v1/tasks attachments field.
- * 
+ *
  * Per FrontMind API docs: attachments must use { filename: "xxx", file_id: "file-xxx" } format.
  */
 function extractAttachments(input: Message[]): any[] {
@@ -404,7 +422,7 @@ export async function createTask(
     taskId?: string;
     projectId?: string;
     agentProfile?: string;
-  }
+  },
 ): Promise<TaskResponse> {
   const config = getConfig();
 
@@ -442,10 +460,14 @@ export async function createTask(
 
   // No 404 retry logic needed: API key changes now force a new workflow,
   // so taskId will always belong to the current key.
-  const response = await apiRequest("/v1/tasks", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
+  const response = await apiRequest(
+    "/v1/tasks",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+    CREATE_TASK_TIMEOUT_MS,
+  );
   const data = await response.json();
 
   // Normalize the response format
@@ -479,13 +501,11 @@ export async function createTask(
 
 /**
  * Retrieve task status and results.
- * 
+ *
  * Try /v1/tasks/ first for richer intermediate step data,
  * falls back to /v1/responses/ if /v1/tasks/ fails.
  */
-export async function retrieveTask(
-  responseId: string
-): Promise<TaskResponse> {
+export async function retrieveTask(responseId: string): Promise<TaskResponse> {
   // Try native tasks API first for richer intermediate step data
   try {
     const response = await apiRequest(`/v1/tasks/${responseId}`);
@@ -495,7 +515,9 @@ export async function retrieveTask(
     }
     return data;
   } catch (err: any) {
-    console.warn(`[retrieveTask] /v1/tasks/ failed (${err.message}), trying /v1/responses/`);
+    console.warn(
+      `[retrieveTask] /v1/tasks/ failed (${err.message}), trying /v1/responses/`,
+    );
     try {
       const response = await apiRequest(`/v1/responses/${responseId}`);
       const data = await response.json();
@@ -550,9 +572,7 @@ export async function deleteTask(responseId: string): Promise<void> {
 /**
  * Upload a file - Step 1: Create file record
  */
-export async function createFileRecord(
-  filename: string
-): Promise<FileRecord> {
+export async function createFileRecord(filename: string): Promise<FileRecord> {
   const response = await apiRequest("/v1/files", {
     method: "POST",
     body: JSON.stringify({ filename }),
@@ -566,14 +586,14 @@ export async function createFileRecord(
 export async function uploadFileToUrl(
   uploadUrl: string,
   file: File,
-  onProgress?: (percent: number) => void
+  onProgress?: (percent: number) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", uploadUrl, true);
     xhr.setRequestHeader(
       "Content-Type",
-      file.type || "application/octet-stream"
+      file.type || "application/octet-stream",
     );
 
     if (onProgress) {
@@ -613,7 +633,7 @@ export async function uploadFileToUrl(
  */
 export async function uploadFile(
   file: File,
-  onProgress?: (percent: number) => void
+  onProgress?: (percent: number) => void,
 ): Promise<{ fileId: string; filename: string }> {
   if (onProgress) onProgress(0);
   const fileRecord = await createFileRecord(file.name);
@@ -630,7 +650,7 @@ export async function uploadFile(
     await uploadFileToUrl(fileRecord.upload_url, file, onProgress);
   } catch (directErr: any) {
     console.warn(
-      `Direct S3 upload failed (${directErr.message}), trying server proxy...`
+      `Direct S3 upload failed (${directErr.message}), trying server proxy...`,
     );
     if (onProgress) onProgress(10);
     await uploadFileToUrlViaProxy(fileRecord.upload_url, file, onProgress);
@@ -648,7 +668,7 @@ export async function uploadFile(
 async function uploadFileToUrlViaProxy(
   uploadUrl: string,
   file: File,
-  onProgress?: (percent: number) => void
+  onProgress?: (percent: number) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -663,7 +683,7 @@ async function uploadFileToUrlViaProxy(
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.setRequestHeader(
       "X-Original-Content-Type",
-      file.type || "application/octet-stream"
+      file.type || "application/octet-stream",
     );
 
     if (onProgress) {
@@ -683,14 +703,18 @@ async function uploadFileToUrlViaProxy(
           new Error(
             `Proxy upload failed (${xhr.status}): ${
               xhr.responseText?.slice(0, 200) || xhr.statusText
-            }`
-          )
+            }`,
+          ),
         );
       }
     });
 
-    xhr.addEventListener("error", () => reject(new Error("Proxy upload network error")));
-    xhr.addEventListener("abort", () => reject(new Error("Proxy upload aborted")));
+    xhr.addEventListener("error", () =>
+      reject(new Error("Proxy upload network error")),
+    );
+    xhr.addEventListener("abort", () =>
+      reject(new Error("Proxy upload aborted")),
+    );
 
     xhr.send(file);
   });
@@ -734,15 +758,24 @@ interface CreditUsageCacheData extends CreditUsageResult {
   fetchedAt: number;
 }
 
-function readCreditUsageCache(fingerprint: string, allowStale: boolean): CreditUsageCacheData | null {
+function readCreditUsageCache(
+  fingerprint: string,
+  allowStale: boolean,
+): CreditUsageCacheData | null {
   try {
     const stored = localStorage.getItem(CREDIT_USAGE_CACHE_KEY);
     if (!stored) return null;
     const data = JSON.parse(stored) as Partial<CreditUsageCacheData>;
-    if (data.fingerprint !== fingerprint || !Number.isFinite(Number(data.fetchedAt))) {
+    if (
+      data.fingerprint !== fingerprint ||
+      !Number.isFinite(Number(data.fetchedAt))
+    ) {
       return null;
     }
-    if (!allowStale && Date.now() - Number(data.fetchedAt) > CREDIT_USAGE_CACHE_TTL_MS) {
+    if (
+      !allowStale &&
+      Date.now() - Number(data.fetchedAt) > CREDIT_USAGE_CACHE_TTL_MS
+    ) {
       return null;
     }
     return {
@@ -797,7 +830,9 @@ function getTaskCreditUsage(task: any): number {
  * still forces a live request.
  * The displayed total equals the sum of all listed tasks from the last 30 days.
  */
-export async function fetchCreditUsage(options: { force?: boolean } = {}): Promise<CreditUsageResult> {
+export async function fetchCreditUsage(
+  options: { force?: boolean } = {},
+): Promise<CreditUsageResult> {
   const emptyResult: CreditUsageResult = { totalUsed: 0, recentTasks: [] };
 
   try {
@@ -812,28 +847,36 @@ export async function fetchCreditUsage(options: { force?: boolean } = {}): Promi
       if (cached) return cached;
     }
 
-    const cutoffMs = Date.now() - CREDIT_USAGE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+    const cutoffMs =
+      Date.now() - CREDIT_USAGE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
     const seenTaskIds = new Set<string>();
     let totalUsed = 0;
     const recentTasks: CreditUsageTask[] = [];
     let after: string | undefined;
     let reachedCutoff = false;
 
-    for (let page = 0; page < CREDIT_USAGE_MAX_PAGES && !reachedCutoff; page += 1) {
+    for (
+      let page = 0;
+      page < CREDIT_USAGE_MAX_PAGES && !reachedCutoff;
+      page += 1
+    ) {
       const searchParams = new URLSearchParams({
         limit: String(CREDIT_USAGE_PAGE_LIMIT),
         order: "desc",
       });
       if (after) searchParams.set("after", after);
 
-      const response = await fetch(`/api/frontmind/v1/tasks?${searchParams.toString()}`, {
-        headers: {
-          "Content-Type": "application/json",
-          "X-FrontMind-API-Key": config.apiKey,
-          "X-FrontMind-Base-URL": config.baseUrl,
+      const response = await fetch(
+        `/api/frontmind/v1/tasks?${searchParams.toString()}`,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-FrontMind-API-Key": config.apiKey,
+            "X-FrontMind-Base-URL": config.baseUrl,
+          },
+          credentials: "include",
         },
-        credentials: "include",
-      });
+      );
 
       if (!response.ok) {
         return readCreditUsageCache(fingerprint, true) || emptyResult;
@@ -860,9 +903,15 @@ export async function fetchCreditUsage(options: { force?: boolean } = {}): Promi
         totalUsed += usage;
         recentTasks.push({
           id: taskId,
-          title: task.metadata?.task_title || task.instructions?.slice(0, 30) || taskId.slice(0, 12),
+          title:
+            task.metadata?.task_title ||
+            task.instructions?.slice(0, 30) ||
+            taskId.slice(0, 12),
           creditUsage: usage,
-          createdAt: createdAtMs !== null ? new Date(createdAtMs).toLocaleDateString("zh-CN") : undefined,
+          createdAt:
+            createdAtMs !== null
+              ? new Date(createdAtMs).toLocaleDateString("zh-CN")
+              : undefined,
         });
       }
 
@@ -887,7 +936,11 @@ export async function fetchCreditUsage(options: { force?: boolean } = {}): Promi
 /**
  * Test API connection through the proxy
  */
-export async function testConnection(): Promise<{ ok: boolean; message: string; taskCount?: number }> {
+export async function testConnection(): Promise<{
+  ok: boolean;
+  message: string;
+  taskCount?: number;
+}> {
   try {
     const config = getConfig();
     if (!config.apiKey) {
@@ -907,7 +960,11 @@ export async function testConnection(): Promise<{ ok: boolean; message: string; 
     if (response.ok) {
       const data = await response.json();
       const count = data.data?.length ?? 0;
-      return { ok: true, message: `连接成功，已有 ${count} 个任务`, taskCount: count };
+      return {
+        ok: true,
+        message: `连接成功，已有 ${count} 个任务`,
+        taskCount: count,
+      };
     }
 
     let errorDetail = `HTTP ${response.status}`;
