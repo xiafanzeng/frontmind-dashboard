@@ -12,7 +12,6 @@ import {
   retrieveTask,
   uploadFile,
   fileToBase64,
-  isImageFile,
   creditEventBus,
   getApiKeyFingerprint,
   type ContentItem,
@@ -25,6 +24,12 @@ import {
   type Attachment,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
+import {
+  prepareUploadFiles,
+  ZIP_REFERENCE_PROMPT,
+  isImageUpload,
+  type PreparedUploadFiles,
+} from "@/lib/attachment-files";
 import { toast } from "sonner";
 
 const MAX_RETRIES = 3;
@@ -137,7 +142,7 @@ function getFailureAdvice(errorMsg: string) {
     return "请检查设置中的 API Key 是否正确。";
   }
   if (failureKind === "busy") {
-    return "服务暂时繁忙，或本次图片任务较重。请稍后手动重试；如果反复失败，可以减少图片数量、裁切超长图后再发送。";
+    return "服务暂时繁忙，或本次附件任务较重。请稍后手动重试；如果反复失败，可以把原图手动压缩为 ZIP 后再发送。";
   }
   return "请求未完成，请稍后手动重试。";
 }
@@ -464,174 +469,131 @@ export function useSendMessage() {
           contentItems.push({ type: "input_text", text: text.trim() });
         }
 
-        // Process files with progress tracking
-        const totalFiles = files.length;
+        let preparedUploads: PreparedUploadFiles;
+        try {
+          preparedUploads = await prepareUploadFiles(files);
+        } catch (err: any) {
+          toast.error("图片 ZIP 打包失败", {
+            description:
+              err?.message || "请手动将原图压缩为 ZIP 后通过上传文件发送。",
+          });
+          return;
+        }
+
+        if (preparedUploads.didZipLargeImages) {
+          contentItems.push({ type: "input_text", text: ZIP_REFERENCE_PROMPT });
+          toast.info("超高像素图片已无损打包为 ZIP", {
+            description:
+              "原图像素和文件内容不会被压缩或重编码，将作为文件附件发送。",
+            duration: 5000,
+          });
+        }
+
+        // Process files with progress tracking. All attachments are sent as files,
+        // including images, to avoid the direct oversized image visual path.
+        const totalFiles = preparedUploads.files.length;
         if (totalFiles > 0) {
           setUploadProgress({
             currentFileIndex: 0,
             totalFiles,
-            currentFileName: files[0].name,
+            currentFileName: preparedUploads.files[0].file.name,
             currentFilePercent: 0,
             overallPercent: 0,
             conversationId: convId,
           });
         }
 
-        for (let i = 0; i < files.length; i++) {
-          const file = files[i];
+        for (let i = 0; i < preparedUploads.files.length; i++) {
+          const prepared = preparedUploads.files[i];
+          const file = prepared.file;
+
+          setUploadProgress({
+            currentFileIndex: i,
+            totalFiles,
+            currentFileName: file.name,
+            currentFilePercent: 0,
+            overallPercent: Math.round((i / totalFiles) * 100),
+            conversationId: convId,
+          });
+
+          // For files: use blob URL for large files (>1MB) to avoid localStorage overflow,
+          // and base64 only for small non-image files that can be persisted.
+          const FILE_SIZE_THRESHOLD = 1 * 1024 * 1024; // 1MB
+          const isLargeFile = file.size > FILE_SIZE_THRESHOLD;
+          const isImageFile = isImageUpload(file);
+          let fileBase64: string | undefined;
+          let fileBlobUrl: string | undefined;
+
+          if (isLargeFile) {
+            fileBlobUrl = URL.createObjectURL(file);
+          } else if (!isImageFile) {
+            fileBase64 = await fileToBase64(file);
+          }
+
           try {
-            setUploadProgress({
-              currentFileIndex: i,
-              totalFiles,
-              currentFileName: file.name,
-              currentFilePercent: 0,
-              overallPercent: Math.round((i / totalFiles) * 100),
-              conversationId: convId,
+            console.log("[SendMessage] Uploading file attachment", {
+              filename: file.name,
+              size: file.size,
+              generatedFromImages: prepared.generatedFromImages?.map(
+                (image) => image.name,
+              ),
             });
 
-            if (isImageFile(file)) {
-              // Always generate base64 for local preview (API file download may not work for user uploads)
-              const imageBase64 = await fileToBase64(file);
-              try {
-                const result = await withRetry(
-                  () =>
-                    uploadFile(file, (percent) => {
-                      setUploadProgress({
-                        currentFileIndex: i,
-                        totalFiles,
-                        currentFileName: file.name,
-                        currentFilePercent: percent,
-                        overallPercent: Math.round(
-                          ((i + percent / 100) / totalFiles) * 100,
-                        ),
-                        conversationId: convId,
-                      });
-                    }),
-                  retryConfig,
-                );
-                contentItems.push({
-                  type: "input_image",
-                  file_id: result.fileId,
-                  filename: result.filename,
-                });
-                attachments.push({
-                  id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                  type: "image",
-                  name: file.name,
-                  fileId: result.fileId,
-                  base64: imageBase64,
-                  file,
-                });
-              } catch (uploadErr: any) {
-                console.warn(
-                  `Image upload failed for "${file.name}", falling back to base64:`,
-                  uploadErr.message,
-                );
-                contentItems.push({
-                  type: "input_image",
-                  image_url: imageBase64,
-                  filename: file.name,
-                });
-                attachments.push({
-                  id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                  type: "image",
-                  name: file.name,
-                  base64: imageBase64,
-                  file,
-                });
-              }
+            const result = await withRetry(
+              () =>
+                uploadFile(file, (percent) => {
+                  setUploadProgress({
+                    currentFileIndex: i,
+                    totalFiles,
+                    currentFileName: file.name,
+                    currentFilePercent: percent,
+                    overallPercent: Math.round(
+                      ((i + percent / 100) / totalFiles) * 100,
+                    ),
+                    conversationId: convId,
+                  });
+                }),
+              retryConfig,
+            );
 
-              setUploadProgress({
-                currentFileIndex: i,
-                totalFiles,
-                currentFileName: file.name,
-                currentFilePercent: 100,
-                overallPercent: Math.round(((i + 1) / totalFiles) * 100),
-                conversationId: convId,
-              });
-            } else {
-              // For files: use blob URL for large files (>1MB) to avoid localStorage overflow,
-              // and base64 for small files that can be persisted.
-              const FILE_SIZE_THRESHOLD = 1 * 1024 * 1024; // 1MB
-              const isLargeFile = file.size > FILE_SIZE_THRESHOLD;
-              let fileBase64: string | undefined;
-              let fileBlobUrl: string | undefined;
+            console.log("[SendMessage] Uploaded file attachment", {
+              filename: result.filename,
+              fileId: result.fileId,
+            });
 
-              if (isLargeFile) {
-                // Large file: create blob URL (in-memory only, not persisted)
-                fileBlobUrl = URL.createObjectURL(file);
-              } else {
-                // Small file: generate base64 (can be persisted to localStorage)
-                fileBase64 = await fileToBase64(file);
-              }
-
-              try {
-                const result = await withRetry(
-                  () =>
-                    uploadFile(file, (percent) => {
-                      setUploadProgress({
-                        currentFileIndex: i,
-                        totalFiles,
-                        currentFileName: file.name,
-                        currentFilePercent: percent,
-                        overallPercent: Math.round(
-                          ((i + percent / 100) / totalFiles) * 100,
-                        ),
-                        conversationId: convId,
-                      });
-                    }),
-                  retryConfig,
-                );
-                contentItems.push({
-                  type: "input_file",
-                  file_id: result.fileId,
-                  filename: result.filename,
-                });
-                attachments.push({
-                  id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                  type: "file",
-                  name: file.name,
-                  fileId: result.fileId,
-                  base64: fileBase64,
-                  blobUrl: fileBlobUrl,
-                  file,
-                });
-              } catch (uploadErr: any) {
-                console.warn(
-                  `File upload failed for "${file.name}", falling back to base64:`,
-                  uploadErr.message,
-                );
-                // If we don't have base64 yet (large file), generate it now as fallback
-                if (!fileBase64) {
-                  fileBase64 = await fileToBase64(file);
-                }
-                contentItems.push({
-                  type: "input_file",
-                  file_id: fileBase64,
-                  filename: file.name,
-                });
-                attachments.push({
-                  id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                  type: "file",
-                  name: file.name,
-                  base64: fileBase64,
-                  blobUrl: fileBlobUrl,
-                  file,
-                });
-              }
-
-              setUploadProgress({
-                currentFileIndex: i,
-                totalFiles,
-                currentFileName: file.name,
-                currentFilePercent: 100,
-                overallPercent: Math.round(((i + 1) / totalFiles) * 100),
-                conversationId: convId,
-              });
-            }
-          } catch (err: any) {
-            toast.error(`文件 "${file.name}" 处理失败: ${err.message}`);
+            contentItems.push({
+              type: "input_file",
+              file_id: result.fileId,
+              filename: result.filename,
+            });
+            attachments.push({
+              id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              type: "file",
+              name: file.name,
+              fileId: result.fileId,
+              base64: fileBase64,
+              blobUrl: fileBlobUrl,
+              file,
+            });
+          } catch (uploadErr: any) {
+            console.warn(
+              `File upload failed for "${file.name}":`,
+              uploadErr.message,
+            );
+            toast.error(`文件 "${file.name}" 上传失败`, {
+              description: uploadErr?.message || "请稍后重试。",
+            });
+            return;
           }
+
+          setUploadProgress({
+            currentFileIndex: i,
+            totalFiles,
+            currentFileName: file.name,
+            currentFilePercent: 100,
+            overallPercent: Math.round(((i + 1) / totalFiles) * 100),
+            conversationId: convId,
+          });
         }
 
         // Clear upload progress
@@ -688,6 +650,15 @@ export function useSendMessage() {
           if (agentProfile) {
             taskOptions.agentProfile = agentProfile;
           }
+
+          console.log("[SendMessage] Creating task", {
+            attachmentCount: contentItems.filter(
+              (item) => item.type === "input_file" && item.file_id,
+            ).length,
+            zippedImages: preparedUploads.zippedImages.map(
+              (image) => image.name,
+            ),
+          });
 
           // Create task exactly once. POST /v1/tasks is non-idempotent, so retrying
           // can create multiple upstream task windows for a single user send.

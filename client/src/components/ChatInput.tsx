@@ -1,7 +1,7 @@
 /**
- * ChatInput Component - Message input with file/image upload and model selector
+ * ChatInput Component - Message input with file upload and model selector
  * Design: Floating glass card input area with drag-and-drop support.
- * Features: Text input, file picker, image preview, drag & drop, upload progress,
+ * Features: Text input, file picker, drag & drop, upload progress,
  *           per-message model selection (FrontMind-Lite/Base/Pro).
  */
 import { useState, useRef, useCallback, useEffect } from "react";
@@ -13,19 +13,12 @@ import {
 } from "@/components/ui/tooltip";
 import { useSendMessage } from "@/hooks/useSendMessage";
 import { useConversation } from "@/contexts/ConversationContext";
-import { isImageFile, MODEL_OPTIONS, getConfig } from "@/lib/frontmind-api";
-import {
-  inspectImageFile,
-  formatImageInspectionSummary,
-  type ImageInspection,
-} from "@/lib/image-inspection";
+import { MODEL_OPTIONS, getConfig } from "@/lib/frontmind-api";
 import { Progress } from "@/components/ui/progress";
 import { motion, AnimatePresence } from "framer-motion";
-import { toast } from "sonner";
 import {
   Send,
   Paperclip,
-  Image as ImageIcon,
   X,
   FileText,
   Loader2,
@@ -37,8 +30,6 @@ import { cn } from "@/lib/utils";
 interface FilePreview {
   file: File;
   id: string;
-  preview?: string; // object URL for images
-  imageInspection?: ImageInspection;
 }
 
 export default function ChatInput() {
@@ -49,9 +40,7 @@ export default function ChatInput() {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
-  const previewUrlsRef = useRef<Set<string>>(new Set());
   // Synchronous lock ref to prevent duplicate sends (React state updates are async)
   const sendLockRef = useRef(false);
 
@@ -73,26 +62,9 @@ export default function ChatInput() {
 
   const isRunning = activeConversation?.status === "running";
 
-  useEffect(() => {
-    return () => {
-      previewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-      previewUrlsRef.current.clear();
-    };
-  }, []);
-
-  const revokePreviewUrl = useCallback((preview?: string) => {
-    if (preview?.startsWith("blob:")) {
-      URL.revokeObjectURL(preview);
-      previewUrlsRef.current.delete(preview);
-    }
-  }, []);
-
   const clearSelectedFiles = useCallback(() => {
-    setFiles((prev) => {
-      prev.forEach((fp) => revokePreviewUrl(fp.preview));
-      return [];
-    });
-  }, [revokePreviewUrl]);
+    setFiles([]);
+  }, []);
 
   // Close model menu when clicking outside
   useEffect(() => {
@@ -115,43 +87,14 @@ export default function ChatInput() {
     const previews: FilePreview[] = [];
     for (const file of newFiles) {
       const id = `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      let preview: string | undefined;
-      let imageInspection: ImageInspection | undefined;
-      if (isImageFile(file)) {
-        try {
-          imageInspection = await inspectImageFile(file);
-        } catch (err: any) {
-          toast.error(`图片 "${file.name}" 读取失败`, {
-            description: err?.message || "请确认图片文件可以正常打开后再上传。",
-          });
-          continue;
-        }
-
-        preview = URL.createObjectURL(file);
-        previewUrlsRef.current.add(preview);
-
-        if (imageInspection.isLarge) {
-          toast.warning("图片像素较大", {
-            description: `${file.name}：${formatImageInspectionSummary(imageInspection)}。上游可能处理较慢或返回服务繁忙。`,
-            duration: 6000,
-          });
-        }
-      }
-      previews.push({ file, id, preview, imageInspection });
+      previews.push({ file, id });
     }
     setFiles((prev) => [...prev, ...previews]);
   }, []);
 
-  const removeFile = useCallback(
-    (id: string) => {
-      setFiles((prev) => {
-        const removed = prev.find((f) => f.id === id);
-        revokePreviewUrl(removed?.preview);
-        return prev.filter((f) => f.id !== id);
-      });
-    },
-    [revokePreviewUrl],
-  );
+  const removeFile = useCallback((id: string) => {
+    setFiles((prev) => prev.filter((f) => f.id !== id));
+  }, []);
 
   const handleSubmit = useCallback(async () => {
     if ((!text.trim() && files.length === 0) || isSending || isRunning) return;
@@ -306,32 +249,14 @@ export default function ChatInput() {
                   initial={{ opacity: 0, scale: 0.8 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.8 }}
-                  className="relative group w-24"
+                  className="relative group"
                 >
-                  {fp.preview ? (
-                    <div className="w-20 h-20 rounded-xl overflow-hidden border border-border/40 shadow-sm">
-                      <img
-                        src={fp.preview}
-                        alt={fp.file.name}
-                        className="w-full h-full object-cover"
-                      />
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-2 px-3 py-2 rounded-xl border border-border/40 bg-muted/30 shadow-sm">
-                      <FileText className="w-4 h-4 text-muted-foreground" />
-                      <span className="text-xs text-muted-foreground truncate max-w-[100px]">
-                        {fp.file.name}
-                      </span>
-                    </div>
-                  )}
-                  {fp.imageInspection?.isLarge && (
-                    <p
-                      className="mt-1 text-[10px] leading-tight text-amber-600 truncate"
-                      title={formatImageInspectionSummary(fp.imageInspection)}
-                    >
-                      像素较大
-                    </p>
-                  )}
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl border border-border/40 bg-muted/30 shadow-sm max-w-[180px]">
+                    <FileText className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <span className="text-xs text-muted-foreground truncate">
+                      {fp.file.name}
+                    </span>
+                  </div>
                   <button
                     onClick={() => removeFile(fp.id)}
                     className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
@@ -368,21 +293,6 @@ export default function ChatInput() {
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>上传文件</TooltipContent>
-              </Tooltip>
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="w-9 h-9 rounded-xl text-muted-foreground hover:text-foreground hover:bg-secondary"
-                    onClick={() => imageInputRef.current?.click()}
-                    disabled={isRunning || isUploading}
-                  >
-                    <ImageIcon className="w-4 h-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>上传图片</TooltipContent>
               </Tooltip>
             </div>
 
@@ -513,18 +423,6 @@ export default function ChatInput() {
         ref={fileInputRef}
         type="file"
         multiple
-        className="hidden"
-        onChange={(e) => {
-          const selected = Array.from(e.target.files || []);
-          if (selected.length > 0) addFiles(selected);
-          e.target.value = "";
-        }}
-      />
-      <input
-        ref={imageInputRef}
-        type="file"
-        multiple
-        accept="image/*"
         className="hidden"
         onChange={(e) => {
           const selected = Array.from(e.target.files || []);
