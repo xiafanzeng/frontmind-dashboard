@@ -160,13 +160,9 @@ export default function ChatInput() {
     [addFiles],
   );
 
-  // Auto-resize textarea
   const handleTextChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       setText(e.target.value);
-      const el = e.target;
-      el.style.height = "auto";
-      el.style.height = Math.min(el.scrollHeight, 160) + "px";
     },
     [],
   );
@@ -277,7 +273,7 @@ export default function ChatInput() {
             "focus-within:shadow-[0_24px_70px_rgba(15,23,42,0.11)] focus-within:border-primary/35",
           )}
         >
-          <div className="flex items-end gap-1.5 p-2.5 sm:gap-2 sm:p-3.5">
+          <div className="flex min-h-[68px] items-center gap-1.5 p-2.5 sm:gap-2 sm:p-3.5">
             {/* File buttons */}
             <div className="flex items-center gap-1 pb-0.5">
               <Tooltip>
@@ -310,8 +306,8 @@ export default function ChatInput() {
                     : "输入你的内容需求，按 Enter 开始编排..."
               }
               disabled={isRunning || isUploading}
-              rows={1}
-              className="flex-1 resize-none bg-transparent text-[15px] text-foreground placeholder:text-muted-foreground/55 focus:outline-none py-2 max-h-[180px]"
+              rows={2}
+              className="h-11 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground/55 focus:outline-none"
             />
 
             {/* Model selector + Send button */}
