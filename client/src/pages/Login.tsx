@@ -87,7 +87,7 @@ export default function Login() {
               FrontMind 智能体工作流
             </h1>
             <p className="text-base leading-7 text-primary-foreground/65">
-              使用 FrontMind 智能体，探索当前最强 AI 工作流的能力边界。
+              与FrontMind一起，探索当前最强 AI 工作流的能力边界。
             </p>
           </div>
 

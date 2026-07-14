@@ -977,6 +977,10 @@ async function recordUpstreamResource(input) {
 import { TRPCError as TRPCError2 } from "@trpc/server";
 import { z } from "zod";
 
+// shared/auth-constraints.ts
+var MIN_PASSWORD_LENGTH = 6;
+var MAX_PASSWORD_LENGTH = 128;
+
 // server/_core/cookies.ts
 function isSecureRequest(req) {
   if (req.protocol === "https") return true;
@@ -995,7 +999,10 @@ function getSessionCookieOptions(req) {
 }
 
 // server/auth-router.ts
-var passwordSchema = z.string().min(12, "Password must contain at least 12 characters").max(128, "Password is too long");
+var passwordSchema = z.string().min(
+  MIN_PASSWORD_LENGTH,
+  `Password must contain at least ${MIN_PASSWORD_LENGTH} characters`
+).max(MAX_PASSWORD_LENGTH, "Password is too long");
 function toTrpcError(error) {
   if (!(error instanceof AuthServiceError)) {
     return new TRPCError2({
@@ -1034,7 +1041,7 @@ var authRouter = router({
   login: publicProcedure.input(
     z.object({
       username: z.string().trim().min(1).max(64),
-      password: z.string().min(1).max(128)
+      password: z.string().min(1).max(MAX_PASSWORD_LENGTH)
     })
   ).mutation(async ({ ctx, input }) => {
     try {
@@ -1242,6 +1249,14 @@ function requireDb2(db) {
     });
   }
   return db;
+}
+async function permanentlyDeleteConversation(executor, userId, persistedConversationId) {
+  await executor.delete(conversations).where(
+    and2(
+      eq3(conversations.id, persistedConversationId),
+      eq3(conversations.userId, userId)
+    )
+  );
 }
 async function getActiveCredentialId(executor, userId) {
   const rows = await executor.select({ id: apiCredentials.id }).from(apiCredentials).where(
@@ -1798,27 +1813,11 @@ var conversationRouter = router({
     if (!existing[0] || existing[0].userId !== ctx.user.id) {
       throw new TRPCError3({ code: "NOT_FOUND", message: "\u4F1A\u8BDD\u4E0D\u5B58\u5728" });
     }
-    const now = /* @__PURE__ */ new Date();
-    await db.transaction(async (tx) => {
-      await tx.update(conversations).set({ deletedAt: now, updatedAt: now }).where(
-        and2(
-          eq3(conversations.id, persistedConversationId),
-          eq3(conversations.userId, ctx.user.id)
-        )
-      );
-      await tx.update(messages).set({ deletedAt: now }).where(
-        and2(
-          eq3(messages.conversationId, persistedConversationId),
-          eq3(messages.userId, ctx.user.id)
-        )
-      );
-      await tx.update(attachments).set({ deletedAt: now }).where(
-        and2(
-          eq3(attachments.conversationId, persistedConversationId),
-          eq3(attachments.userId, ctx.user.id)
-        )
-      );
-    });
+    await permanentlyDeleteConversation(
+      db,
+      ctx.user.id,
+      persistedConversationId
+    );
     return { success: true };
   }),
   importLocal: protectedProcedure.input(z3.object({ conversations: z3.array(conversationSnapshotSchema).max(200) })).mutation(async ({ ctx, input }) => {
@@ -2120,11 +2119,26 @@ function vitePluginFrontMindDebugCollector() {
     }
   };
 }
+function vitePluginFrontMindBuildVersion(buildVersion) {
+  return {
+    name: "frontmind-build-version",
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "__frontmind__/version.json",
+        source: `${JSON.stringify({ version: buildVersion })}
+`
+      });
+    }
+  };
+}
 var vite_config_default = defineConfig(({ mode }) => {
   const isProduction = mode === "production";
+  const buildVersion = process.env.FRONTMIND_BUILD_VERSION?.trim() || `${Date.now()}`;
   const plugins = [
     react(),
     tailwindcss(),
+    vitePluginFrontMindBuildVersion(buildVersion),
     !isProduction && jsxLocPlugin(),
     !isProduction && vitePluginFrontMindDebugCollector()
   ].filter(Boolean);
@@ -2136,6 +2150,9 @@ var vite_config_default = defineConfig(({ mode }) => {
         "@shared": path.resolve(import.meta.dirname, "shared"),
         "@assets": path.resolve(import.meta.dirname, "attached_assets")
       }
+    },
+    define: {
+      __FRONTMIND_BUILD_VERSION__: JSON.stringify(buildVersion)
     },
     envDir: path.resolve(import.meta.dirname),
     root: path.resolve(import.meta.dirname, "client"),
@@ -2204,6 +2221,12 @@ function serveStatic(app) {
       `Could not find the build directory: ${distPath}, make sure to build the client first`
     );
   }
+  app.get("/__frontmind__/version.json", (_req, res) => {
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.sendFile(path2.resolve(distPath, "__frontmind__", "version.json"));
+  });
   app.use(
     "/assets",
     express.static(path2.resolve(distPath, "assets"), {

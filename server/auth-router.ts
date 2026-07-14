@@ -1,6 +1,10 @@
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { COOKIE_NAME } from "../shared/const";
+import {
+  MAX_PASSWORD_LENGTH,
+  MIN_PASSWORD_LENGTH,
+} from "../shared/auth-constraints";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import {
@@ -14,8 +18,11 @@ import {
 
 const passwordSchema = z
   .string()
-  .min(12, "Password must contain at least 12 characters")
-  .max(128, "Password is too long");
+  .min(
+    MIN_PASSWORD_LENGTH,
+    `Password must contain at least ${MIN_PASSWORD_LENGTH} characters`,
+  )
+  .max(MAX_PASSWORD_LENGTH, "Password is too long");
 
 export function toTrpcError(error: unknown): TRPCError {
   if (!(error instanceof AuthServiceError)) {
@@ -59,7 +66,7 @@ export const authRouter = router({
     .input(
       z.object({
         username: z.string().trim().min(1).max(64),
-        password: z.string().min(1).max(128),
+        password: z.string().min(1).max(MAX_PASSWORD_LENGTH),
       })
     )
     .mutation(async ({ ctx, input }) => {

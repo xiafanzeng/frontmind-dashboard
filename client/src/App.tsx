@@ -42,7 +42,7 @@ function AppShell() {
   );
 }
 
-function AuthBoundary() {
+export function AuthBoundary() {
   const { user, loading, error, refresh } = useAuth();
 
   if (loading) {

@@ -12,6 +12,10 @@ import {
 import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
+import {
+  MAX_PASSWORD_LENGTH,
+  MIN_PASSWORD_LENGTH,
+} from "@shared/auth-constraints";
 import { trpc } from "@/lib/trpc";
 import { cn } from "@/lib/utils";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -217,8 +221,8 @@ function ChangePasswordDialog({
       toast.error("请填写所有密码字段");
       return;
     }
-    if (newPassword.length < 12) {
-      toast.error("新密码至少需要 12 个字符");
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      toast.error(`新密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
       return;
     }
     if (newPassword !== confirmation) {
@@ -254,7 +258,7 @@ function ChangePasswordDialog({
             修改密码
           </DialogTitle>
           <DialogDescription>
-            更新当前账号密码。请使用至少 12 个字符的独立密码。
+            更新当前账号密码。请使用至少 {MIN_PASSWORD_LENGTH} 个字符的独立密码。
           </DialogDescription>
         </DialogHeader>
 
@@ -278,6 +282,8 @@ function ChangePasswordDialog({
               autoComplete="new-password"
               value={newPassword}
               onChange={(event) => setNewPassword(event.target.value)}
+              minLength={MIN_PASSWORD_LENGTH}
+              maxLength={MAX_PASSWORD_LENGTH}
               disabled={changePasswordMutation.isPending}
             />
           </div>
@@ -289,6 +295,8 @@ function ChangePasswordDialog({
               autoComplete="new-password"
               value={confirmation}
               onChange={(event) => setConfirmation(event.target.value)}
+              minLength={MIN_PASSWORD_LENGTH}
+              maxLength={MAX_PASSWORD_LENGTH}
               disabled={changePasswordMutation.isPending}
             />
           </div>

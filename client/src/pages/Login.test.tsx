@@ -43,9 +43,7 @@ describe("Login", () => {
       screen.getByRole("heading", { name: "FrontMind 智能体工作流" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(
-        "使用 FrontMind 智能体，探索当前最强 AI 工作流的能力边界。",
-      ),
+      screen.getByText("与FrontMind一起，探索当前最强 AI 工作流的能力边界。"),
     ).toBeInTheDocument();
   });
 

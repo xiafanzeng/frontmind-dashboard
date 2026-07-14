@@ -127,6 +127,26 @@ function requireDb(db: Awaited<ReturnType<typeof getDb>>) {
   return db;
 }
 
+/**
+ * Permanently removes a conversation. Foreign keys cascade to its turns,
+ * messages, and attachments. Upstream ownership ledger rows deliberately
+ * remain and only lose their conversation link.
+ */
+export async function permanentlyDeleteConversation(
+  executor: any,
+  userId: number,
+  persistedConversationId: string,
+) {
+  await executor
+    .delete(conversations)
+    .where(
+      and(
+        eq(conversations.id, persistedConversationId),
+        eq(conversations.userId, userId),
+      ),
+    );
+}
+
 async function getActiveCredentialId(executor: any, userId: number) {
   const rows = await executor
     .select({ id: apiCredentials.id })
@@ -907,36 +927,11 @@ export const conversationRouter = router({
       if (!existing[0] || existing[0].userId !== ctx.user.id) {
         throw new TRPCError({ code: "NOT_FOUND", message: "会话不存在" });
       }
-      const now = new Date();
-      await db.transaction(async tx => {
-        await tx
-          .update(conversations)
-          .set({ deletedAt: now, updatedAt: now })
-          .where(
-            and(
-              eq(conversations.id, persistedConversationId),
-              eq(conversations.userId, ctx.user.id),
-            )
-          );
-        await tx
-          .update(messages)
-          .set({ deletedAt: now })
-          .where(
-            and(
-              eq(messages.conversationId, persistedConversationId),
-              eq(messages.userId, ctx.user.id),
-            )
-          );
-        await tx
-          .update(attachments)
-          .set({ deletedAt: now })
-          .where(
-            and(
-              eq(attachments.conversationId, persistedConversationId),
-              eq(attachments.userId, ctx.user.id)
-            )
-          );
-      });
+      await permanentlyDeleteConversation(
+        db,
+        ctx.user.id,
+        persistedConversationId,
+      );
       return { success: true } as const;
     }),
 

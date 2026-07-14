@@ -15,6 +15,10 @@ import {
 import { toast } from "sonner";
 
 import { useAuth, type AuthUser } from "@/_core/hooks/useAuth";
+import {
+  MAX_PASSWORD_LENGTH,
+  MIN_PASSWORD_LENGTH,
+} from "@shared/auth-constraints";
 import { trpc } from "@/lib/trpc";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
@@ -398,8 +402,8 @@ function CreateUserDialog({
       toast.error("请填写用户名和初始密码");
       return;
     }
-    if (password.length < 12) {
-      toast.error("初始密码至少需要 12 个字符");
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      toast.error(`初始密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
       return;
     }
 
@@ -464,7 +468,9 @@ function CreateUserDialog({
               autoComplete="new-password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
-              placeholder="至少 12 个字符"
+              minLength={MIN_PASSWORD_LENGTH}
+              maxLength={MAX_PASSWORD_LENGTH}
+              placeholder={`至少 ${MIN_PASSWORD_LENGTH} 个字符`}
               disabled={createMutation.isPending}
             />
           </div>
@@ -517,8 +523,8 @@ function ResetPasswordDialog({
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!user) return;
-    if (password.length < 12) {
-      toast.error("新密码至少需要 12 个字符");
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      toast.error(`新密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
       return;
     }
     if (password !== confirmation) {
@@ -563,6 +569,8 @@ function ResetPasswordDialog({
               autoComplete="new-password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
+              minLength={MIN_PASSWORD_LENGTH}
+              maxLength={MAX_PASSWORD_LENGTH}
               disabled={resetMutation.isPending}
             />
           </div>
@@ -574,6 +582,8 @@ function ResetPasswordDialog({
               autoComplete="new-password"
               value={confirmation}
               onChange={(event) => setConfirmation(event.target.value)}
+              minLength={MIN_PASSWORD_LENGTH}
+              maxLength={MAX_PASSWORD_LENGTH}
               disabled={resetMutation.isPending}
             />
           </div>

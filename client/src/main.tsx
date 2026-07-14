@@ -6,6 +6,8 @@ import superjson from "superjson";
 import App from "./App";
 import "./index.css";
 
+declare const __FRONTMIND_BUILD_VERSION__: string;
+
 const queryClient = new QueryClient();
 
 function loadOptionalAnalytics() {
@@ -67,7 +69,7 @@ const trpcClient = trpc.createClient({
 //   - One lightweight check (~100 bytes) when the tab regains focus
 //   - Automatic reload only when a genuinely new version is detected
 // ============================================================
-let initialVersion: string | null = null;
+const initialVersion = __FRONTMIND_BUILD_VERSION__;
 
 async function checkVersion() {
   try {
@@ -76,13 +78,9 @@ async function checkVersion() {
     });
     if (!res.ok) return;
     const data = await res.json();
-    const version = data.version as string;
+    const version = typeof data.version === "string" ? data.version : null;
 
-    if (initialVersion === null) {
-      // First load — record the current version
-      initialVersion = version;
-      console.log(`[VersionCheck] Initial version: ${version}`);
-    } else if (version !== initialVersion) {
+    if (version && version !== initialVersion) {
       // New version detected — reload to pick up new assets
       console.log(
         `[VersionCheck] New version detected: ${version} (was ${initialVersion}). Reloading...`
@@ -94,20 +92,21 @@ async function checkVersion() {
   }
 }
 
-// Record the initial version on first load
-checkVersion();
+if (import.meta.env.PROD) {
+  void checkVersion();
 
-// Re-check when the user switches back to this tab
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") {
-    checkVersion();
-  }
-});
+  // Re-check when the user switches back to this tab.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      void checkVersion();
+    }
+  });
 
-// Also check on window focus (covers some edge cases not caught by visibilitychange)
-window.addEventListener("focus", () => {
-  checkVersion();
-});
+  // Also check on window focus (covers some edge cases not caught by visibilitychange).
+  window.addEventListener("focus", () => {
+    void checkVersion();
+  });
+}
 
 createRoot(document.getElementById("root")!).render(
   <trpc.Provider client={trpcClient} queryClient={queryClient}>

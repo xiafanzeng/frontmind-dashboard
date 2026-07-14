@@ -65,6 +65,13 @@ export function serveStatic(app: Express) {
     );
   }
 
+  app.get("/__frontmind__/version.json", (_req, res) => {
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.sendFile(path.resolve(distPath, "__frontmind__", "version.json"));
+  });
+
   // Serve hashed static assets with long-term caching.
   // Vite outputs JS/CSS with content hashes in filenames (e.g. index-abc123.js),
   // so they can be cached aggressively. When the content changes, the filename

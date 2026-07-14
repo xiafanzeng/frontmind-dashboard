@@ -149,11 +149,27 @@ function vitePluginFrontMindDebugCollector(): Plugin {
   };
 }
 
+function vitePluginFrontMindBuildVersion(buildVersion: string): Plugin {
+  return {
+    name: "frontmind-build-version",
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "__frontmind__/version.json",
+        source: `${JSON.stringify({ version: buildVersion })}\n`,
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const isProduction = mode === "production";
+  const buildVersion =
+    process.env.FRONTMIND_BUILD_VERSION?.trim() || `${Date.now()}`;
   const plugins = [
     react(),
     tailwindcss(),
+    vitePluginFrontMindBuildVersion(buildVersion),
     !isProduction && jsxLocPlugin(),
     !isProduction && vitePluginFrontMindDebugCollector(),
   ].filter(Boolean) as Plugin[];
@@ -166,6 +182,9 @@ export default defineConfig(({ mode }) => {
         "@shared": path.resolve(import.meta.dirname, "shared"),
         "@assets": path.resolve(import.meta.dirname, "attached_assets"),
       },
+    },
+    define: {
+      __FRONTMIND_BUILD_VERSION__: JSON.stringify(buildVersion),
     },
     envDir: path.resolve(import.meta.dirname),
     root: path.resolve(import.meta.dirname, "client"),

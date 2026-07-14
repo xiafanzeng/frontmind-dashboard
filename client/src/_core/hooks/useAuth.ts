@@ -17,6 +17,9 @@ export function useAuth() {
 
   const meQuery = trpc.auth.me.useQuery(undefined, {
     retry: false,
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnReconnect: true,
     refetchOnWindowFocus: true,
   });
 

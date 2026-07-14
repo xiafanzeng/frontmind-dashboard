@@ -75,9 +75,14 @@ pnpm db:generate
 
 # 只执行仓库内已有迁移（部署时）
 pnpm db:migrate
+
+# 永久清理超过 30 天未更新的会话（供 1Panel 计划任务调用）
+pnpm db:cleanup-expired
 ```
 
 不要在发布服务器上用 schema push 替代版本化迁移。数据库备份、1Panel 应用配置、反向代理和正式发布属于部署阶段，需在检查目标面板后单独执行。
+
+用户主动删除会话时，服务端会立即物理删除该会话，并由外键级联删除消息、附件和对话轮次。`db:cleanup-expired` 按会话最后更新时间执行 30 天滚动保留；超过 30 天未更新的会话及其关联记录将无法恢复。
 
 ## Keyboard Shortcuts
 

@@ -1,5 +1,9 @@
 import "dotenv/config";
 import { createManagedUser, normalizeUsername } from "../server/auth-service";
+import {
+  MAX_PASSWORD_LENGTH,
+  MIN_PASSWORD_LENGTH,
+} from "../shared/auth-constraints";
 
 function readFlag(name: string) {
   const index = process.argv.indexOf(name);
@@ -89,9 +93,16 @@ async function main() {
 
   const displayName =
     readFlag("--display-name") ?? (await promptLine("显示名称（可留空）："));
-  const password = await promptHidden("管理员密码（至少 12 位）：");
-  if (password.length < 12 || password.length > 128) {
-    throw new Error("密码长度需为 12-128 位");
+  const password = await promptHidden(
+    `管理员密码（至少 ${MIN_PASSWORD_LENGTH} 位）：`,
+  );
+  if (
+    password.length < MIN_PASSWORD_LENGTH ||
+    password.length > MAX_PASSWORD_LENGTH
+  ) {
+    throw new Error(
+      `密码长度需为 ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} 位`,
+    );
   }
   const confirmation = await promptHidden("再次输入密码：");
   if (password !== confirmation) throw new Error("两次输入的密码不一致");

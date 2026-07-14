@@ -13,6 +13,7 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "pnpm db:generate && pnpm db:migrate",
+    "db:cleanup-expired": "tsx scripts/cleanup-expired-conversations.ts",
     "admin:init": "tsx scripts/init-admin.ts"
   },
   "dependencies": {

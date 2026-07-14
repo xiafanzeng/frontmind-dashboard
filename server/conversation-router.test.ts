@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   collectSnapshotResourceRefs,
   mergeConversationMessages,
+  permanentlyDeleteConversation,
   validateUpstreamResourceAccess,
   type ConversationSnapshot,
 } from "./conversation-router";
@@ -74,6 +75,22 @@ describe("conversation multi-device merge", () => {
         item => item.id,
       ),
     ).toEqual(["user-a"]);
+  });
+});
+
+describe("conversation deletion", () => {
+  it("physically deletes the owned conversation instead of marking it deleted", async () => {
+    const where = vi.fn().mockResolvedValue(undefined);
+    const deleteFrom = vi.fn().mockReturnValue({ where });
+
+    await permanentlyDeleteConversation(
+      { delete: deleteFrom },
+      7,
+      "u7:conversation-1",
+    );
+
+    expect(deleteFrom).toHaveBeenCalledTimes(1);
+    expect(where).toHaveBeenCalledTimes(1);
   });
 });
 
