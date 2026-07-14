@@ -8,6 +8,7 @@ import {
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  Trash2,
   UserRoundCheck,
   UserRoundX,
   Users,
@@ -63,6 +64,7 @@ export default function AdminUsers() {
   const [createOpen, setCreateOpen] = useState(false);
   const [resetUser, setResetUser] = useState<AuthUser | null>(null);
   const [statusChange, setStatusChange] = useState<StatusChange | null>(null);
+  const [deleteUser, setDeleteUser] = useState<AuthUser | null>(null);
 
   const usersQuery = trpc.admin.users.list.useQuery(undefined, {
     enabled: currentUser?.role === "admin",
@@ -70,6 +72,9 @@ export default function AdminUsers() {
   });
   const utils = trpc.useUtils();
   const setActiveMutation = trpc.admin.users.setActive.useMutation({
+    onSuccess: () => utils.admin.users.list.invalidate(),
+  });
+  const deleteMutation = trpc.admin.users.delete.useMutation({
     onSuccess: () => utils.admin.users.list.invalidate(),
   });
 
@@ -92,6 +97,21 @@ export default function AdminUsers() {
       setStatusChange(null);
     } catch (error) {
       toast.error("无法更新账号状态", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    }
+  };
+
+  const applyDelete = async () => {
+    if (!deleteUser) return;
+    try {
+      await deleteMutation.mutateAsync({ userId: deleteUser.id });
+      toast.success("账号已永久删除", {
+        description: deleteUser.displayName || deleteUser.username,
+      });
+      setDeleteUser(null);
+    } catch (error) {
+      toast.error("无法删除账号", {
         description: error instanceof Error ? error.message : "请稍后重试",
       });
     }
@@ -150,7 +170,7 @@ export default function AdminUsers() {
                 </h1>
               </div>
               <p className="mt-1 text-sm text-muted-foreground">
-                创建员工账号、重置密码及控制访问权限。
+                创建员工账号、重置密码及管理账号生命周期。
               </p>
             </div>
           </div>
@@ -218,13 +238,15 @@ export default function AdminUsers() {
                     account={account}
                     isCurrent={account.id === currentUser.id}
                     pending={
-                      setActiveMutation.isPending &&
-                      statusChange?.user.id === account.id
+                      (setActiveMutation.isPending &&
+                        statusChange?.user.id === account.id) ||
+                      (deleteMutation.isPending && deleteUser?.id === account.id)
                     }
                     onResetPassword={() => setResetUser(account)}
                     onChangeStatus={(isActive) =>
                       setStatusChange({ user: account, isActive })
                     }
+                    onDelete={() => setDeleteUser(account)}
                   />
                 ))}
               </div>
@@ -269,6 +291,42 @@ export default function AdminUsers() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <AlertDialog
+        open={Boolean(deleteUser)}
+        onOpenChange={(open) =>
+          !open && !deleteMutation.isPending && setDeleteUser(null)
+        }
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>永久删除账号</AlertDialogTitle>
+            <AlertDialogDescription>
+              删除后，{deleteUser?.displayName || deleteUser?.username}
+              的账号、会话、消息、附件、API 凭据及登录会话都会从
+              FrontMind 数据库永久删除，且无法恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteMutation.isPending}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                void applyDelete();
+              }}
+              disabled={deleteMutation.isPending}
+              className="bg-destructive text-white hover:bg-destructive/90"
+            >
+              {deleteMutation.isPending && (
+                <Loader2 className="animate-spin" />
+              )}
+              确认永久删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </main>
   );
 }
@@ -300,12 +358,14 @@ function UserRow({
   pending,
   onResetPassword,
   onChangeStatus,
+  onDelete,
 }: {
   account: AuthUser;
   isCurrent: boolean;
   pending: boolean;
   onResetPassword: () => void;
   onChangeStatus: (isActive: boolean) => void;
+  onDelete: () => void;
 }) {
   const name = account.displayName || account.username;
   const initials = Array.from(name).slice(0, 2).join("").toUpperCase();
@@ -359,6 +419,17 @@ function UserRow({
             <UserRoundCheck className="h-3.5 w-3.5" />
           )}
           {account.isActive ? "禁用" : "启用"}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+          disabled={pending || isCurrent}
+          title={isCurrent ? "不能删除当前登录账号" : undefined}
+          onClick={onDelete}
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+          删除
         </Button>
       </div>
     </div>

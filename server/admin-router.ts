@@ -2,6 +2,7 @@ import { z } from "zod";
 import { adminProcedure, router } from "./_core/trpc";
 import {
   createManagedUser,
+  deleteManagedUser,
   listManagedUsers,
   resetManagedUserPassword,
   setManagedUserActive,
@@ -73,6 +74,17 @@ export const adminRouter = router({
         try {
           const user = await setManagedUserActive(input.userId, input.isActive);
           return { user };
+        } catch (error) {
+          throw toTrpcError(error);
+        }
+      }),
+
+    delete: adminProcedure
+      .input(z.object({ userId: z.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        try {
+          await deleteManagedUser(ctx.user.id, input.userId);
+          return { success: true } as const;
         } catch (error) {
           throw toTrpcError(error);
         }

@@ -516,6 +516,63 @@ export async function setManagedUserActive(userId: number, isActive: boolean) {
   return updated;
 }
 
+export async function permanentlyDeleteManagedUserRows(
+  executor: any,
+  userId: number,
+) {
+  // These security-ledger rows use restrictive foreign keys, so remove them
+  // before deleting the user. All remaining account-owned rows cascade from
+  // users, conversations, and messages.
+  await executor
+    .delete(upstreamResources)
+    .where(eq(upstreamResources.userId, userId));
+  await executor
+    .delete(apiKeyOwnership)
+    .where(eq(apiKeyOwnership.userId, userId));
+  await executor.delete(users).where(eq(users.id, userId));
+}
+
+export async function deleteManagedUser(
+  actorUserId: number,
+  targetUserId: number,
+) {
+  if (actorUserId === targetUserId) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "The current administrator account cannot be deleted",
+    );
+  }
+
+  const db = await requireDb();
+  await db.transaction(async tx => {
+    const rows = await tx
+      .select()
+      .from(users)
+      .where(eq(users.id, targetUserId))
+      .limit(1)
+      .for("update");
+    const user = rows[0];
+    if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+
+    if (user.role === "admin" && user.isActive) {
+      const activeAdmins = await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(and(eq(users.role, "admin"), eq(users.isActive, true)))
+        .limit(2)
+        .for("update");
+      if (activeAdmins.length <= 1) {
+        throw new AuthServiceError(
+          "LAST_ADMIN",
+          "The last active administrator cannot be deleted",
+        );
+      }
+    }
+
+    await permanentlyDeleteManagedUserRows(tx, targetUserId);
+  });
+}
+
 function decodeMasterKey(value: string): Buffer {
   const trimmed = value.trim();
   let decoded: Buffer;

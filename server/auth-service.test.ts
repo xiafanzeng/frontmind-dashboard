@@ -1,13 +1,20 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  apiKeyOwnership,
+  upstreamResources,
+  users,
+} from "../drizzle/schema";
 import {
   AuthServiceError,
+  deleteManagedUser,
   decryptApiKey,
   encryptApiKey,
   getApiKeyFingerprint,
   hashPassword,
   hashSessionToken,
   normalizeUsername,
+  permanentlyDeleteManagedUserRows,
   verifyPassword,
 } from "./auth-service";
 
@@ -40,6 +47,27 @@ describe("password authentication primitives", () => {
     expect(hash).toMatch(/^[a-f0-9]{64}$/);
     expect(hash).not.toContain(token);
     expect(hashSessionToken(token)).toBe(hash);
+  });
+});
+
+describe("managed account deletion", () => {
+  it("physically removes restrictive ledgers before deleting the user", async () => {
+    const where = vi.fn().mockResolvedValue(undefined);
+    const deleteFrom = vi.fn().mockReturnValue({ where });
+
+    await permanentlyDeleteManagedUserRows({ delete: deleteFrom }, 42);
+
+    expect(deleteFrom).toHaveBeenCalledTimes(3);
+    expect(deleteFrom).toHaveBeenNthCalledWith(1, upstreamResources);
+    expect(deleteFrom).toHaveBeenNthCalledWith(2, apiKeyOwnership);
+    expect(deleteFrom).toHaveBeenNthCalledWith(3, users);
+    expect(where).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects deleting the administrator's current account", async () => {
+    await expect(deleteManagedUser(42, 42)).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
   });
 });
 

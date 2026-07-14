@@ -682,6 +682,35 @@ async function setManagedUserActive(userId, isActive) {
   if (!updated) throw new AuthServiceError("NOT_FOUND", "User not found");
   return updated;
 }
+async function permanentlyDeleteManagedUserRows(executor, userId) {
+  await executor.delete(upstreamResources).where(eq2(upstreamResources.userId, userId));
+  await executor.delete(apiKeyOwnership).where(eq2(apiKeyOwnership.userId, userId));
+  await executor.delete(users).where(eq2(users.id, userId));
+}
+async function deleteManagedUser(actorUserId, targetUserId) {
+  if (actorUserId === targetUserId) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "The current administrator account cannot be deleted"
+    );
+  }
+  const db = await requireDb();
+  await db.transaction(async (tx) => {
+    const rows = await tx.select().from(users).where(eq2(users.id, targetUserId)).limit(1).for("update");
+    const user = rows[0];
+    if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+    if (user.role === "admin" && user.isActive) {
+      const activeAdmins = await tx.select({ id: users.id }).from(users).where(and(eq2(users.role, "admin"), eq2(users.isActive, true))).limit(2).for("update");
+      if (activeAdmins.length <= 1) {
+        throw new AuthServiceError(
+          "LAST_ADMIN",
+          "The last active administrator cannot be deleted"
+        );
+      }
+    }
+    await permanentlyDeleteManagedUserRows(tx, targetUserId);
+  });
+}
 function decodeMasterKey(value) {
   const trimmed = value.trim();
   let decoded;
@@ -1144,6 +1173,14 @@ var adminRouter = router({
       try {
         const user = await setManagedUserActive(input.userId, input.isActive);
         return { user };
+      } catch (error) {
+        throw toTrpcError(error);
+      }
+    }),
+    delete: adminProcedure.input(z2.object({ userId: z2.number().int().positive() })).mutation(async ({ ctx, input }) => {
+      try {
+        await deleteManagedUser(ctx.user.id, input.userId);
+        return { success: true };
       } catch (error) {
         throw toTrpcError(error);
       }
