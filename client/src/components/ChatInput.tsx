@@ -13,7 +13,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useSendMessage } from "@/hooks/useSendMessage";
 import { useConversation } from "@/contexts/ConversationContext";
-import { MODEL_OPTIONS, getConfig } from "@/lib/frontmind-api";
+import { MODEL_OPTIONS, getConfig, saveConfig } from "@/lib/frontmind-api";
 import { Progress } from "@/components/ui/progress";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -354,6 +354,7 @@ export default function ChatInput() {
                           key={model.value}
                           onClick={() => {
                             setSelectedModel(model.value);
+                            saveConfig({ agentProfile: model.value });
                             setModelMenuOpen(false);
                           }}
                           className={cn(

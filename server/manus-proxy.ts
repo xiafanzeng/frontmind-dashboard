@@ -24,8 +24,14 @@ import { Router, Request, Response } from "express";
 import axios from "axios";
 import zlib from "zlib";
 import { randomUUID } from "crypto";
-import net from "net";
 import { getFrontMindCredentials, translateTaskBodyForUpstream } from "./upstream-config";
+import { recordUpstreamResource } from "./auth-service";
+import {
+  assertSafeExternalUrl,
+  ExternalUrlRejectedError,
+  SAFE_EXTERNAL_MAX_BYTES,
+  safeExternalRequestOptions,
+} from "./_core/safe-external-url";
 
 const router = Router();
 
@@ -39,78 +45,26 @@ const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 // reducing browser "unsafe download" prompts caused by blob/data URLs.
 const downloadTokenCache = new Map<string, {
   fileId: string;
+  userId: number;
   apiKey: string;
   baseUrl: string;
   createdAt: number;
 }>();
 const DOWNLOAD_TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
+const PROXY_UPLOAD_MAX_BYTES = Math.max(
+  1,
+  Number(process.env.FRONTMIND_PROXY_UPLOAD_MAX_BYTES) || 100 * 1024 * 1024,
+);
 
-class ExternalUrlRejectedError extends Error {}
+class ProxyUploadTooLargeError extends Error {}
 
-function isBlockedExternalHostname(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!host) return true;
-  if (
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".local") ||
-    host === "host.docker.internal" ||
-    host === "metadata.google.internal"
-  ) {
-    return true;
-  }
-
-  if (net.isIP(host) === 4) {
-    const parts = host.split(".").map((part) => Number(part));
-    const [a, b] = parts;
-    return (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 198 && (b === 18 || b === 19)) ||
-      a >= 224
-    );
-  }
-
-  if (net.isIP(host) === 6) {
-    return (
-      host === "::1" ||
-      host.startsWith("fc") ||
-      host.startsWith("fd") ||
-      host.startsWith("fe8") ||
-      host.startsWith("fe9") ||
-      host.startsWith("fea") ||
-      host.startsWith("feb") ||
-      host.startsWith("::ffff:127.") ||
-      host.startsWith("::ffff:10.") ||
-      host.startsWith("::ffff:192.168.") ||
-      host.startsWith("::ffff:169.254.")
-    );
-  }
-
-  return false;
-}
-
-function assertSafeExternalUrl(value: string): string {
-  let parsed: URL;
+function safeUrlForLog(value: string) {
   try {
-    parsed = new URL(value);
+    const parsed = new URL(value);
+    return `${parsed.origin}${parsed.pathname}`.slice(0, 160);
   } catch {
-    throw new ExternalUrlRejectedError("Invalid external URL");
+    return "[invalid URL]";
   }
-
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new ExternalUrlRejectedError("Unsupported external URL protocol");
-  }
-  if (parsed.username || parsed.password || isBlockedExternalHostname(parsed.hostname)) {
-    throw new ExternalUrlRejectedError("Blocked external URL host");
-  }
-
-  return parsed.toString();
 }
 
 function cleanupExpiredDownloadTokens() {
@@ -379,6 +333,47 @@ function deepSanitizeJson(value: unknown, currentKey?: string, depth: number = 0
 
   // numbers, booleans, etc. - pass through
   return value;
+}
+
+function collectOutputFileIds(
+  value: unknown,
+  ids = new Set<string>(),
+  currentKey?: string,
+  depth = 0,
+) {
+  if (value === null || value === undefined || depth > 50) return ids;
+  if (typeof value === "string") {
+    if ((currentKey === "file_id" || currentKey === "fileId") && value) {
+      ids.add(value);
+    }
+    if (
+      currentKey === "url" ||
+      currentKey === "file_url" ||
+      currentKey === "fileUrl" ||
+      currentKey === "image_url" ||
+      currentKey === "imageUrl"
+    ) {
+      const match = value.match(/\/v1\/files\/([^/?#]+)/);
+      if (match?.[1]) {
+        try {
+          ids.add(decodeURIComponent(match[1]));
+        } catch {
+          // Ignore malformed upstream URLs; they will not be downloadable.
+        }
+      }
+    }
+    return ids;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectOutputFileIds(item, ids, undefined, depth + 1);
+    return ids;
+  }
+  if (typeof value === "object") {
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      collectOutputFileIds(item, ids, key, depth + 1);
+    }
+  }
+  return ids;
 }
 
 /**
@@ -1360,13 +1355,34 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
     }
     const target = assertSafeExternalUrl(rawTarget);
 
-    console.log(`[FrontMind Proxy] Proxy-upload to: ${target.slice(0, 120)}...`);
+    console.log(`[FrontMind Proxy] Proxy-upload to: ${safeUrlForLog(target)}`);
+
+    const declaredLength = Number(req.headers["content-length"] || 0);
+    if (declaredLength > PROXY_UPLOAD_MAX_BYTES) {
+      throw new ProxyUploadTooLargeError("Upload body is too large");
+    }
 
     // Try to collect the raw body from the request stream.
     const chunks: Buffer[] = [];
     await new Promise<void>((resolve, reject) => {
-      req.on("data", (chunk: Buffer) => chunks.push(chunk));
-      req.on("end", resolve);
+      if (req.readableEnded) {
+        resolve();
+        return;
+      }
+      let received = 0;
+      let tooLarge = false;
+      req.on("data", (chunk: Buffer) => {
+        received += chunk.length;
+        if (received > PROXY_UPLOAD_MAX_BYTES) {
+          tooLarge = true;
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("end", () => {
+        if (tooLarge) reject(new ProxyUploadTooLargeError("Upload body is too large"));
+        else resolve();
+      });
       req.on("error", reject);
     });
     let body = Buffer.concat(chunks);
@@ -1385,6 +1401,9 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
       }
       console.log(`[FrontMind Proxy] Recovered body from req.body (${body.length} bytes) – stream was consumed by body-parser`);
     }
+    if (body.length > PROXY_UPLOAD_MAX_BYTES) {
+      throw new ProxyUploadTooLargeError("Upload body is too large");
+    }
 
     // Forward to the presigned S3 URL.
     // The client sends application/octet-stream to avoid express.json() interference,
@@ -1394,19 +1413,25 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
       req.headers["content-type"] ||
       "application/octet-stream";
     const response = await axios.put(target, body, {
+      ...safeExternalRequestOptions,
       headers: {
         "Content-Type": realContentType,
         "Content-Length": String(body.length),
       },
       timeout: 300000,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
+      maxBodyLength: body.length,
+      maxContentLength: 1024 * 1024,
       validateStatus: () => true,
     });
 
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response.status}`);
     res.status(response.status).send(response.data || "");
   } catch (error: any) {
+    if (error instanceof ProxyUploadTooLargeError) {
+      return res.status(413).json({
+        error: { message: "上传文件过大", code: "UPLOAD_TOO_LARGE" },
+      });
+    }
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {
@@ -1444,12 +1469,13 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
     }
     const targetUrl = assertSafeExternalUrl(rawTargetUrl);
 
-    console.log(`[FrontMind Proxy] Proxy-download: ${targetUrl.slice(0, 120)}...`);
+    console.log(`[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`);
 
     const response = await axios.get(targetUrl, {
+      ...safeExternalRequestOptions,
       responseType: "arraybuffer",
       timeout: 120000,
-      maxContentLength: Infinity,
+      maxContentLength: SAFE_EXTERNAL_MAX_BYTES,
       validateStatus: () => true,
     });
 
@@ -1572,12 +1598,14 @@ async function downloadFromS3(
   filename: string,
   disposition: "inline" | "attachment" = "inline"
 ): Promise<void> {
-  console.log(`[FrontMind Proxy] Downloading from S3: ${s3Url.slice(0, 120)}...`);
+  const safeS3Url = assertSafeExternalUrl(s3Url);
+  console.log(`[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`);
 
-  const response = await axios.get(s3Url, {
+  const response = await axios.get(safeS3Url, {
+    ...safeExternalRequestOptions,
     responseType: "arraybuffer",
     timeout: 120000,
-    maxContentLength: Infinity,
+    maxContentLength: SAFE_EXTERNAL_MAX_BYTES,
     validateStatus: () => true,
   });
 
@@ -1738,7 +1766,16 @@ router.post("/download-token", async (req: Request, res: Response) => {
     }
 
     const token = randomUUID();
-    downloadTokenCache.set(token, { fileId, apiKey, baseUrl, createdAt: Date.now() });
+    if (!req.frontmindUser || !req.frontmindCredential) {
+      return res.status(401).json({ error: { message: "请先登录", code: "UNAUTHORIZED" } });
+    }
+    downloadTokenCache.set(token, {
+      fileId,
+      userId: req.frontmindUser.id,
+      apiKey,
+      baseUrl,
+      createdAt: Date.now(),
+    });
     res.json({ downloadUrl: `/api/frontmind/download/${token}`, expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL });
   } catch (error: any) {
     console.error("[FrontMind Proxy] Create download token error:", error.message);
@@ -1757,6 +1794,10 @@ router.get("/download/:token", async (req: Request, res: Response) => {
     const data = downloadTokenCache.get(token);
     if (!data) {
       return res.status(410).json({ error: { message: "Download link expired", code: "DOWNLOAD_LINK_EXPIRED" } });
+    }
+
+    if (!req.frontmindUser || req.frontmindUser.id !== data.userId) {
+      return res.status(403).json({ error: { message: "下载链接不属于当前账号", code: "DOWNLOAD_FORBIDDEN" } });
     }
 
     // One-time use reduces accidental link sharing risk while keeping UX fast.
@@ -1848,6 +1889,40 @@ router.all("/*", async (req: Request, res: Response) => {
     }
 
     const response = await axios(axiosConfig);
+
+    if (
+      response.status >= 200 &&
+      response.status < 300 &&
+      req.frontmindUser &&
+      req.frontmindCredential &&
+      response.data &&
+      typeof response.data === "object"
+    ) {
+      const resourceId = String(response.data.id || response.data.task_id || "");
+      const isTaskCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/tasks";
+      const isFileCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/files";
+      if (resourceId && (isTaskCreate || isFileCreate)) {
+        await recordUpstreamResource({
+          userId: req.frontmindUser.id,
+          apiCredentialId: req.frontmindCredential.id,
+          kind: isTaskCreate ? "task" : "file",
+          upstreamId: resourceId,
+        });
+      }
+
+      // Generated output files are discovered in task responses rather than
+      // through this application's upload endpoint. Record them before the
+      // browser receives their URLs so later preview/download requests remain
+      // bound to the same account and credential version.
+      for (const fileId of collectOutputFileIds(response.data)) {
+        await recordUpstreamResource({
+          userId: req.frontmindUser.id,
+          apiCredentialId: req.frontmindCredential.id,
+          kind: "file",
+          upstreamId: fileId,
+        });
+      }
+    }
 
     // Enhanced logging
     if (typeof response.data === 'object' && response.data?.output) {

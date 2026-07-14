@@ -32,12 +32,13 @@ export function getModelDisplayName(modelValue: string | undefined): string {
   return found ? found.label : modelValue;
 }
 
-// Default configuration - can be overridden via settings
+// Non-sensitive, device-local display preference. API credentials are stored
+// only by the server; legacy browser credentials are handled by the explicit
+// one-time migration helper.
 const DEFAULT_CONFIG = {
-  baseUrl: "",
-  apiKey: "",
   agentProfile: "frontmind-pro",
 };
+const DEVICE_PREFERENCES_STORAGE_KEY = "frontmind-client-preferences";
 
 export const CREATE_TASK_TIMEOUT_MS = 300_000;
 
@@ -49,14 +50,12 @@ function normalizePublicAgentProfile(value: string | undefined): string {
 }
 
 export function getConfig() {
-  const stored = localStorage.getItem("frontmind-client-config");
+  const stored = localStorage.getItem(DEVICE_PREFERENCES_STORAGE_KEY);
   if (stored) {
     try {
       const parsed = JSON.parse(stored);
       return {
         ...DEFAULT_CONFIG,
-        ...parsed,
-        baseUrl: parsed.baseUrl || "",
         agentProfile: normalizePublicAgentProfile(parsed.agentProfile),
       };
     } catch {
@@ -66,64 +65,12 @@ export function getConfig() {
   return DEFAULT_CONFIG;
 }
 
-/**
- * Generate a short fingerprint from an API key.
- * Used to bind conversations to the API key that created them.
- * Returns empty string if no key is set.
- */
-export function getApiKeyFingerprint(apiKey?: string): string {
-  const key = apiKey ?? getConfig().apiKey;
-  if (!key || key.length < 8) return "";
-  // Use first 4 + last 4 characters as a stable fingerprint
-  return `${key.slice(0, 4)}...${key.slice(-4)}`;
-}
-
-// ============================================================
-// API Key Change Event Bus
-// Fires when the user saves a different API key in settings.
-// Subscribers (e.g. ConversationContext) can react by forcing
-// a new workflow window.
-// ============================================================
-type ApiKeyChangeListener = (newFingerprint: string) => void;
-
-class ApiKeyChangeEventBus {
-  private listeners: Set<ApiKeyChangeListener> = new Set();
-
-  subscribe(listener: ApiKeyChangeListener): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
-  }
-
-  emit(newFingerprint: string) {
-    this.listeners.forEach((listener) => {
-      try {
-        listener(newFingerprint);
-      } catch (e) {
-        console.error("[ApiKeyChangeEventBus] Listener error:", e);
-      }
-    });
-  }
-}
-
-export const apiKeyChangeEventBus = new ApiKeyChangeEventBus();
-
 export function saveConfig(config: Partial<typeof DEFAULT_CONFIG>) {
-  const oldConfig = getConfig();
-  const merged = { ...oldConfig, ...config };
-  merged.agentProfile = normalizePublicAgentProfile(merged.agentProfile);
-  localStorage.setItem("frontmind-client-config", JSON.stringify(merged));
-
-  // Detect API key change and emit event
-  if (config.apiKey && config.apiKey !== oldConfig.apiKey) {
-    const newFingerprint = getApiKeyFingerprint(config.apiKey);
-    console.log(
-      `[saveConfig] API Key changed. New fingerprint: ${newFingerprint}`,
-    );
-    apiKeyChangeEventBus.emit(newFingerprint);
-  }
-
+  const merged = {
+    ...getConfig(),
+    agentProfile: normalizePublicAgentProfile(config.agentProfile),
+  };
+  localStorage.setItem(DEVICE_PREFERENCES_STORAGE_KEY, JSON.stringify(merged));
   return merged;
 }
 
@@ -292,13 +239,10 @@ async function apiRequest(
   options: RequestInit = {},
   timeoutMs?: number,
 ): Promise<Response> {
-  const config = getConfig();
   const url = `/api/frontmind${endpoint}`;
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    "X-FrontMind-API-Key": config.apiKey,
-    "X-FrontMind-Base-URL": config.baseUrl,
     ...(options.headers as Record<string, string>),
   };
 
@@ -836,12 +780,7 @@ export async function fetchCreditUsage(
   const emptyResult: CreditUsageResult = { totalUsed: 0, recentTasks: [] };
 
   try {
-    const config = getConfig();
-    if (!config.apiKey) {
-      return emptyResult;
-    }
-
-    const fingerprint = getApiKeyFingerprint(config.apiKey);
+    const fingerprint = "account-credential";
     if (!options.force) {
       const cached = readCreditUsageCache(fingerprint, false);
       if (cached) return cached;
@@ -869,11 +808,7 @@ export async function fetchCreditUsage(
       const response = await fetch(
         `/api/frontmind/v1/tasks?${searchParams.toString()}`,
         {
-          headers: {
-            "Content-Type": "application/json",
-            "X-FrontMind-API-Key": config.apiKey,
-            "X-FrontMind-Base-URL": config.baseUrl,
-          },
+          headers: { "Content-Type": "application/json" },
           credentials: "include",
         },
       );
@@ -928,7 +863,7 @@ export async function fetchCreditUsage(
     writeCreditUsageCache(fingerprint, result);
     return result;
   } catch {
-    const fingerprint = getApiKeyFingerprint();
+    const fingerprint = "account-credential";
     return readCreditUsageCache(fingerprint, true) || emptyResult;
   }
 }
@@ -942,18 +877,9 @@ export async function testConnection(): Promise<{
   taskCount?: number;
 }> {
   try {
-    const config = getConfig();
-    if (!config.apiKey) {
-      return { ok: false, message: "请先设置 API Key" };
-    }
-
     const url = `/api/frontmind/v1/tasks?limit=1`;
     const response = await fetch(url, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-FrontMind-API-Key": config.apiKey,
-        "X-FrontMind-Base-URL": config.baseUrl,
-      },
+      headers: { "Content-Type": "application/json" },
       credentials: "include",
     });
 

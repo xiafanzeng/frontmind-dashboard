@@ -27,7 +27,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { getConfig, sanitizeBrandText } from "@/lib/frontmind-api";
+import { sanitizeBrandText } from "@/lib/frontmind-api";
 import type { Attachment } from "@/contexts/ConversationContext";
 
 interface FilePreviewProps {
@@ -155,14 +155,9 @@ function nativeDownload(url: string, fileName: string) {
  * the upload_url and fetch from S3 via the proxy-download endpoint.
  */
 async function fetchFileAsBlob(fileId: string, fileName?: string): Promise<string> {
-  const config = getConfig();
   const url = buildProxyDownloadUrl(fileId, fileName, false) || `/api/frontmind/v1/files/${fileId}`;
 
   const response = await fetch(url, {
-    headers: {
-      "X-FrontMind-API-Key": config.apiKey,
-      "X-FrontMind-Base-URL": config.baseUrl,
-    },
     credentials: "include",
   });
 
@@ -180,10 +175,6 @@ async function fetchFileAsBlob(fileId: string, fileName?: string): Promise<strin
         // Got metadata - fetch binary from S3 via proxy
         const proxyUrl = buildProxyDownloadUrl(data.upload_url, fileName, false) || `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
         const s3Response = await fetch(proxyUrl, {
-          headers: {
-            "X-FrontMind-API-Key": config.apiKey,
-            "X-FrontMind-Base-URL": config.baseUrl,
-          },
           credentials: "include",
         });
         if (!s3Response.ok) {
@@ -204,13 +195,10 @@ async function fetchFileAsBlob(fileId: string, fileName?: string): Promise<strin
 
 
 async function createDirectDownloadUrl(fileId: string): Promise<string> {
-  const config = getConfig();
   const response = await fetch("/api/frontmind/download-token", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-FrontMind-API-Key": config.apiKey,
-      "X-FrontMind-Base-URL": config.baseUrl,
     },
     credentials: "include",
     body: JSON.stringify({ fileId }),
@@ -242,7 +230,6 @@ export default function FilePreview({
   const Icon = getFileIcon(file.file?.type, displayFileName);
   const fileSize = file.file?.size ? formatFileSize(file.file.size) : "";
   const isPdf = isPdfFile(file.file?.type, displayFileName);
-  const isHtml = isHtmlFile(file.file?.type, displayFileName);
   const isPreviewable = isPreviewableFile(file.file?.type, displayFileName);
 
   // Load blob URL when dialog opens for previewable files
@@ -485,7 +472,7 @@ export default function FilePreview({
                     title={displayFileName}
                     className="w-full h-full border-0"
                     style={{ minHeight: "100%" }}
-                    sandbox={isHtml ? "allow-same-origin allow-scripts" : undefined}
+                    sandbox=""
                   />
                 ) : null}
               </div>

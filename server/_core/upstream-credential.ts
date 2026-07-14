@@ -1,0 +1,133 @@
+import type { NextFunction, Response } from "express";
+import {
+  AuthServiceError,
+  getCredentialForUpstreamResource,
+  getDecryptedCredentialForUser,
+} from "../auth-service";
+import type { FrontMindRequest } from "./express-auth";
+
+type ResourceRef = { kind: "task" | "file"; id: string };
+
+function pathWithoutQuery(req: FrontMindRequest) {
+  return req.originalUrl.replace(/^\/api\/frontmind/, "").split("?")[0] || "/";
+}
+
+function getPrimaryResource(req: FrontMindRequest): ResourceRef | null {
+  const path = pathWithoutQuery(req);
+  const taskMatch = path.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
+  if (taskMatch) return { kind: "task", id: decodeURIComponent(taskMatch[1]) };
+
+  const fileMatch = path.match(/^\/v1\/files\/([^/]+)/);
+  if (fileMatch) return { kind: "file", id: decodeURIComponent(fileMatch[1]) };
+
+  if (path === "/download-token" && typeof req.body?.fileId === "string") {
+    return { kind: "file", id: req.body.fileId };
+  }
+
+  if (req.method === "POST" && path === "/v1/tasks") {
+    const continuationId = req.body?.taskId ?? req.body?.previous_response_id;
+    if (typeof continuationId === "string" && continuationId) {
+      return { kind: "task", id: continuationId };
+    }
+  }
+  return null;
+}
+
+function getAttachmentFileIds(req: FrontMindRequest) {
+  if (req.method !== "POST") return [];
+  if (!Array.isArray(req.body?.attachments)) return [];
+  return req.body.attachments
+    .map((item: unknown) =>
+      item && typeof item === "object"
+        ? String(
+            (item as { file_id?: unknown; fileId?: unknown }).file_id ??
+              (item as { fileId?: unknown }).fileId ??
+              "",
+          )
+        : "",
+    )
+    .filter(Boolean);
+}
+
+function sendCredentialError(res: Response, status: number, message: string, code: string) {
+  res.status(status).json({ error: { message, code } });
+}
+
+/**
+ * Selects the credential version for a proxy request. Existing task/file IDs
+ * must already be present in the ownership ledger; new resource creation uses
+ * the account's active credential.
+ */
+export async function resolveUpstreamCredential(
+  req: FrontMindRequest,
+  res: Response,
+  next: NextFunction,
+) {
+  const user = req.frontmindUser;
+  if (!user) {
+    sendCredentialError(res, 401, "请先登录", "UNAUTHORIZED");
+    return;
+  }
+
+  try {
+    // A one-time download token already carries the credential version chosen
+    // when it was issued. The route itself binds that token to the logged-in
+    // user, so requiring a currently active key here would break downloads for
+    // historical conversations after key rotation.
+    const requestPath = pathWithoutQuery(req);
+    if (
+      requestPath === "/proxy-download" ||
+      /^\/download\/[^/]+$/.test(requestPath)
+    ) {
+      next();
+      return;
+    }
+
+    const primaryResource = getPrimaryResource(req);
+    const credential = primaryResource
+      ? await getCredentialForUpstreamResource(
+          user.id,
+          primaryResource.kind,
+          primaryResource.id,
+        )
+      : await getDecryptedCredentialForUser(user.id);
+
+    if (!credential) {
+      sendCredentialError(
+        res,
+        primaryResource ? 403 : 428,
+        primaryResource
+          ? "该任务或文件不属于当前账号，或其原 API Key 已删除"
+          : "请先在账号设置中配置 API Key",
+        primaryResource ? "UPSTREAM_RESOURCE_FORBIDDEN" : "API_CREDENTIAL_REQUIRED",
+      );
+      return;
+    }
+
+    for (const fileId of getAttachmentFileIds(req)) {
+      const ownedFile = await getCredentialForUpstreamResource(user.id, "file", fileId);
+      if (!ownedFile || ownedFile.id !== credential.id) {
+        sendCredentialError(
+          res,
+          403,
+          "附件不属于当前账号或使用了不同的 API Key",
+          "ATTACHMENT_FORBIDDEN",
+        );
+        return;
+      }
+    }
+
+    req.frontmindCredential = credential;
+    next();
+  } catch (error) {
+    const configurationError =
+      error instanceof AuthServiceError && error.code === "INVALID_MASTER_KEY";
+    console.error("[Credential] Failed to resolve upstream credential", error);
+    sendCredentialError(
+      res,
+      503,
+      configurationError ? "服务端凭据加密配置无效" : "API Key 暂不可用",
+      configurationError ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE" : "CREDENTIAL_UNAVAILABLE",
+    );
+  }
+}

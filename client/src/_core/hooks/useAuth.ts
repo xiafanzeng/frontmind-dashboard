@@ -1,83 +1,79 @@
-import { getLoginUrl } from "@/const";
 import { trpc } from "@/lib/trpc";
 import { TRPCClientError } from "@trpc/client";
-import { useCallback, useEffect, useMemo } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useMemo } from "react";
 
-type UseAuthOptions = {
-  redirectOnUnauthenticated?: boolean;
-  redirectPath?: string;
+export type AuthUser = {
+  id: number;
+  username: string;
+  displayName: string | null;
+  role: "user" | "admin";
+  isActive: boolean;
 };
 
-export function useAuth(options?: UseAuthOptions) {
-  const { redirectOnUnauthenticated = false, redirectPath = getLoginUrl() } =
-    options ?? {};
+export function useAuth() {
   const utils = trpc.useUtils();
+  const queryClient = useQueryClient();
 
   const meQuery = trpc.auth.me.useQuery(undefined, {
     retry: false,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: true,
   });
 
-  const logoutMutation = trpc.auth.logout.useMutation({
-    onSuccess: () => {
-      utils.auth.me.setData(undefined, null);
+  const loginMutation = trpc.auth.login.useMutation({
+    onSuccess: ({ user }) => {
+      utils.auth.me.setData(undefined, user);
     },
   });
+
+  const logoutMutation = trpc.auth.logout.useMutation();
+
+  const login = useCallback(
+    (username: string, password: string) =>
+      loginMutation.mutateAsync({ username, password }),
+    [loginMutation]
+  );
 
   const logout = useCallback(async () => {
     try {
       await logoutMutation.mutateAsync();
     } catch (error: unknown) {
       if (
-        error instanceof TRPCClientError &&
-        error.data?.code === "UNAUTHORIZED"
+        !(error instanceof TRPCClientError) ||
+        error.data?.code !== "UNAUTHORIZED"
       ) {
-        return;
+        throw error;
       }
-      throw error;
     } finally {
+      // Conversations, credential metadata and admin data must not survive an
+      // account switch in the shared React Query cache.
       utils.auth.me.setData(undefined, null);
-      await utils.auth.me.invalidate();
+      queryClient.clear();
+      logoutMutation.reset();
     }
-  }, [logoutMutation, utils]);
+  }, [logoutMutation, queryClient, utils]);
 
-  const state = useMemo(() => {
-    localStorage.setItem(
-      "frontmind-runtime-user-info",
-      JSON.stringify(meQuery.data)
-    );
-    return {
-      user: meQuery.data ?? null,
+  const state = useMemo(
+    () => ({
+      user: (meQuery.data ?? null) as AuthUser | null,
       loading: meQuery.isLoading || logoutMutation.isPending,
       error: meQuery.error ?? logoutMutation.error ?? null,
       isAuthenticated: Boolean(meQuery.data),
-    };
-  }, [
-    meQuery.data,
-    meQuery.error,
-    meQuery.isLoading,
-    logoutMutation.error,
-    logoutMutation.isPending,
-  ]);
-
-  useEffect(() => {
-    if (!redirectOnUnauthenticated) return;
-    if (meQuery.isLoading || logoutMutation.isPending) return;
-    if (state.user) return;
-    if (typeof window === "undefined") return;
-    if (window.location.pathname === redirectPath) return;
-
-    window.location.href = redirectPath
-  }, [
-    redirectOnUnauthenticated,
-    redirectPath,
-    logoutMutation.isPending,
-    meQuery.isLoading,
-    state.user,
-  ]);
+    }),
+    [
+      meQuery.data,
+      meQuery.error,
+      meQuery.isLoading,
+      logoutMutation.error,
+      logoutMutation.isPending,
+    ]
+  );
 
   return {
     ...state,
+    login,
+    loginPending: loginMutation.isPending,
+    loginError: loginMutation.error,
     refresh: () => meQuery.refetch(),
     logout,
   };

@@ -6,7 +6,6 @@ import React from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import rehypeRaw from "rehype-raw";
 import { cn, copyToClipboard } from "@/lib/utils";
 import { toast } from "sonner";
 import type { Components } from "react-markdown";
@@ -252,7 +251,6 @@ function MarkdownRendererInner({ content, className }: MarkdownRendererProps) {
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[
           rehypeHighlight,
-          rehypeRaw,
         ]}
         components={components}
       >

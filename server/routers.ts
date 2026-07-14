@@ -1,22 +1,16 @@
-import { COOKIE_NAME } from "@shared/const";
-import { getSessionCookieOptions } from "./_core/cookies";
+import { adminRouter } from "./admin-router";
+import { authRouter } from "./auth-router";
+import { conversationRouter } from "./conversation-router";
+import { credentialRouter } from "./credential-router";
 import { systemRouter } from "./_core/systemRouter";
-import { publicProcedure, router } from "./_core/trpc";
+import { router } from "./_core/trpc";
 
 export const appRouter = router({
   system: systemRouter,
-  auth: router({
-    me: publicProcedure.query(() => null),
-    logout: publicProcedure.mutation(({ ctx }) => {
-      ctx.res.clearCookie(COOKIE_NAME, {
-        ...getSessionCookieOptions(ctx.req),
-        maxAge: -1,
-      });
-      return {
-        success: true,
-      } as const;
-    }),
-  }),
+  auth: authRouter,
+  admin: adminRouter,
+  credential: credentialRouter,
+  conversation: conversationRouter,
 });
 
 export type AppRouter = typeof appRouter;

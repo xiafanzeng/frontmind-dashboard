@@ -8,6 +8,20 @@
       "when": 1774143224392,
       "tag": "0000_fine_shotgun",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1783955311040,
+      "tag": "0001_smooth_madripoor",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1783956390188,
+      "tag": "0002_living_shinobi_shaw",
+      "breakpoints": true
     }
   ]
 }

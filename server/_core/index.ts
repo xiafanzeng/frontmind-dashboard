@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
-import net from "net";
+import { sql } from "drizzle-orm";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
@@ -10,51 +10,94 @@ import manusProxy from "../manus-proxy";
 import workflowApi, { cleanupStaleWorkflowUploads } from "../workflow-api";
 import newsReleaseApi from "../news-release-api";
 import knowledgeBaseApi from "../knowledge-base-api";
+import {
+  attachOptionalActiveCredential,
+  requireExpressAuth,
+} from "./express-auth";
+import { resolveUpstreamCredential } from "./upstream-credential";
+import { assertCredentialEncryptionConfigured } from "../auth-service";
+import { getDb } from "../db";
 
-function isPortAvailable(port: number): Promise<boolean> {
-  return new Promise(resolve => {
-    const server = net.createServer();
-    server.listen(port, () => {
-      server.close(() => resolve(true));
-    });
-    server.on("error", () => resolve(false));
-  });
-}
-
-async function findAvailablePort(startPort: number = 3000): Promise<number> {
-  for (let port = startPort; port < startPort + 20; port++) {
-    if (await isPortAvailable(port)) {
-      return port;
-    }
+function assertProductionConfiguration() {
+  if (process.env.NODE_ENV !== "production") return;
+  if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is required in production");
   }
-  throw new Error(`No available port found starting from ${startPort}`);
+  assertCredentialEncryptionConfigured();
 }
 
 async function startServer() {
+  assertProductionConfiguration();
   const app = express();
   const server = createServer(app);
   void cleanupStaleWorkflowUploads();
   app.disable("x-powered-by");
+  // 1Panel/OpenResty is the single trusted reverse proxy in production.
+  app.set("trust proxy", 1);
   app.use((_req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    res.setHeader(
+      "Content-Security-Policy",
+      "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+    );
+    if (process.env.NODE_ENV === "production") {
+      res.setHeader(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains",
+      );
+    }
     next();
   });
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+  app.get("/healthz", async (_req, res) => {
+    try {
+      const db = await getDb();
+      if (!db) throw new Error("Database is not configured");
+      await db.execute(sql`select 1`);
+      res.json({ status: "ok" });
+    } catch (error) {
+      console.error("[Health] Database readiness check failed", error);
+      res.status(503).json({ status: "unavailable" });
+    }
+  });
+
   // FrontMind API proxy - avoids CORS issues while keeping upstream details server-side.
-  app.use("/api/frontmind", manusProxy);
+  app.use(
+    "/api/frontmind",
+    requireExpressAuth,
+    resolveUpstreamCredential,
+    manusProxy,
+  );
   app.use("/api/manus", (_req, res) => {
     res.status(404).json({ error: { message: "Not found", code: "NOT_FOUND" } });
   });
   // Server-side workflow loader. Public manifest only; private skill content never leaves server.
-  app.use("/api/workflow", workflowApi);
+  app.use(
+    "/api/workflow",
+    requireExpressAuth,
+    attachOptionalActiveCredential,
+    workflowApi,
+  );
   // One-click homepage news release workflow. Hidden execution prompt is assembled server-side.
-  app.use("/api/news-release", newsReleaseApi);
+  app.use(
+    "/api/news-release",
+    requireExpressAuth,
+    resolveUpstreamCredential,
+    newsReleaseApi,
+  );
   // One-click enterprise knowledge base workflow powered by the Socratic KB skill.
-  app.use("/api/knowledge-base", knowledgeBaseApi);
+  app.use(
+    "/api/knowledge-base",
+    requireExpressAuth,
+    resolveUpstreamCredential,
+    knowledgeBaseApi,
+  );
   // tRPC API
   app.use(
     "/api/trpc",
@@ -73,23 +116,34 @@ async function startServer() {
     serveStatic(app);
   }
 
-  // Global error handler to suppress URIError from unresolved Vite
-  // environment variable placeholders (e.g. %VITE_ANALYTICS_ENDPOINT%)
-  // that cause Express to crash with "Failed to decode param" errors.
+  // Return a controlled response for malformed percent-encoded request paths.
   app.use((err: any, _req: any, res: any, next: any) => {
     if (err instanceof URIError) {
       // Silently ignore URI decode errors from malformed paths
       res.status(400).end();
       return;
     }
-    next(err);
+    console.error("[HTTP] Unhandled request error", err);
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const candidateStatus = Number(err?.status ?? err?.statusCode);
+    const status =
+      Number.isInteger(candidateStatus) && candidateStatus >= 400 && candidateStatus < 600
+        ? candidateStatus
+        : 500;
+    res.status(status).json({
+      error: {
+        message: status === 413 ? "请求内容过大" : "服务器暂时无法完成请求",
+        code: status === 413 ? "PAYLOAD_TOO_LARGE" : "INTERNAL_SERVER_ERROR",
+      },
+    });
   });
 
-  const preferredPort = parseInt(process.env.PORT || "3001");
-  const port = await findAvailablePort(preferredPort);
-
-  if (port !== preferredPort) {
-    console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
+  const port = Number.parseInt(process.env.PORT || "3001", 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("PORT must be an integer between 1 and 65535");
   }
 
   server.listen(port, "0.0.0.0", () => {
@@ -97,4 +151,7 @@ async function startServer() {
   });
 }
 
-startServer().catch(console.error);
+startServer().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});

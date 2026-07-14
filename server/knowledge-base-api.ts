@@ -4,6 +4,7 @@ import fs from "fs/promises";
 import JSZip from "jszip";
 import path from "path";
 import { getFrontMindCredentials, toUpstreamAgentProfile } from "./upstream-config";
+import { recordUpstreamResource } from "./auth-service";
 
 const router = Router();
 
@@ -224,6 +225,17 @@ router.post("/start", async (req, res) => {
       res.status(created.status).json({ error: "创建企业知识库任务失败，请检查 API Key 或稍后重试" });
       return;
     }
+
+    if (!req.frontmindUser || !req.frontmindCredential) {
+      res.status(401).json({ error: "请先登录并配置 API Key" });
+      return;
+    }
+    await recordUpstreamResource({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      kind: "task",
+      upstreamId: String(created.task.id),
+    });
 
     res.json({
       visibleMessage: "开始构建企业知识库",

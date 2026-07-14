@@ -10,6 +10,8 @@ FrontMind Client 是一个面向内容生产工作流的现代 Web 应用，用�
 - **Image Preview**: 支持图片全屏预览、缩放与旋转。
 - **File Preview and Download Sanitization**: 文件预览、代理下载、文本类文件、PDF 与 Office Open XML 文件会经过品牌替换处理。
 - **Real-time Updates**: 任务状态轮询与重试逻辑。
+- **Account Sync**: 内部账号登录、跨设备会话同步与管理员账号管理。
+- **Server-side Credentials**: 每个账号的 API Key 经验证后使用 AES-256-GCM 加密保存，浏览器不再长期保存或随请求发送明文 Key。
 - **Mobile Responsive**: 支持不同屏幕尺寸。
 - **Keyboard Shortcuts**: 支持常用快捷键。
 
@@ -29,7 +31,7 @@ FrontMind Client 是一个面向内容生产工作流的现代 Web 应用，用�
 ## Tech Stack
 
 - **Frontend**: React 19, TypeScript, Tailwind CSS v4, Radix UI
-- **Backend**: Express, tRPC
+- **Backend**: Express, tRPC, Drizzle ORM, MySQL 8
 - **Styling**: Custom CSS with oklch colors, Framer Motion animations
 - **Build**: Vite 7
 
@@ -37,13 +39,22 @@ FrontMind Client 是一个面向内容生产工作流的现代 Web 应用，用�
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20+
 - pnpm 8+
+- MySQL 8+
 
 ### Installation
 
 ```bash
 pnpm install
+cp .env.example .env
+```
+
+编辑 `.env`，至少设置 `DATABASE_URL` 和 `FRONTMIND_CREDENTIAL_ENCRYPTION_KEY`。加密主密钥必须长期保持不变；更换或丢失会导致已保存的 API Key 无法解密。
+
+```bash
+pnpm db:migrate
+pnpm admin:init
 pnpm dev
 ```
 
@@ -51,9 +62,22 @@ pnpm dev
 
 ### Configuration
 
-1. 点击侧边栏中的 Settings 图标。
-2. 输入 FrontMind API Key，并按需要配置 API URL。
-3. 默认 API URL 可在设置面板或环境配置中调整。
+1. 使用 `pnpm admin:init` 创建首个管理员；密码通过隐藏输入读取，不写入命令行历史。
+2. 管理员登录后可在“账号管理”中创建、停用账号或重置密码。
+3. 每个账号首次进入“API Key 设置”时填写自己的 Key。服务端验证后加密入库，后续设备只需登录。
+4. 旧版本浏览器若存在本地 Key 或会话，会显示显式迁移提示；未经用户确认不会上传或归属到账号。
+
+### Database Commands
+
+```bash
+# 根据 schema 生成迁移（开发时）
+pnpm db:generate
+
+# 只执行仓库内已有迁移（部署时）
+pnpm db:migrate
+```
+
+不要在发布服务器上用 schema push 替代版本化迁移。数据库备份、1Panel 应用配置、反向代理和正式发布属于部署阶段，需在检查目标面板后单独执行。
 
 ## Keyboard Shortcuts
 
@@ -76,6 +100,8 @@ frontmind-client/
 │   │   ├── lib/            # Utilities and API client
 │   │   └── pages/          # Page components
 ├── server/                 # Backend Express server
+├── drizzle/                # MySQL schema and versioned migrations
+├── scripts/                # Operational CLI (initial administrator)
 ├── shared/                 # Shared types and constants
 └── package.json            # Root package.json
 ```
@@ -86,8 +112,11 @@ frontmind-client/
 
 ```bash
 pnpm build
+pnpm db:migrate
 pnpm start
 ```
+
+生产进程固定监听 `PORT`（默认 `3001`），`GET /healthz` 会同时检查数据库连接。生产启动时若缺少数据库地址或凭据加密主密钥会直接失败，避免以不完整配置对外服务。
 
 ### Run Tests
 

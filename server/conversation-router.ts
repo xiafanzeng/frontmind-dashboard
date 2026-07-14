@@ -1,0 +1,965 @@
+import { TRPCError } from "@trpc/server";
+import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
+import {
+  apiCredentials,
+  attachments,
+  conversations,
+  messages,
+  upstreamResources,
+  type MessageMetadata,
+} from "../drizzle/schema";
+import { getDecryptedCredentialForUser } from "./auth-service";
+import { getDb } from "./db";
+import { protectedProcedure, router } from "./_core/trpc";
+import { getUpstreamBaseUrl } from "./upstream-config";
+
+const attachmentSchema = z.object({
+  id: z.string().min(1).max(128),
+  type: z.enum(["file", "image"]),
+  name: z.string().min(1).max(512),
+  fileId: z.string().min(1).max(255).optional(),
+});
+
+const outputFileSchema = z.object({
+  fileUrl: z.string().max(4096),
+  fileName: z.string().max(512),
+  mimeType: z.string().max(255),
+});
+
+const inlineImageSchema = z.object({
+  src: z.string().max(4096),
+  alt: z.string().max(512).optional(),
+});
+
+const messageSchema = z.object({
+  id: z.string().min(1).max(128),
+  role: z.enum(["user", "assistant"]),
+  content: z.string().max(2_000_000),
+  attachments: z.array(attachmentSchema).max(100).optional(),
+  timestamp: z.number().finite().nonnegative(),
+  outputFiles: z.array(outputFileSchema).max(200).optional(),
+  inlineImages: z.array(inlineImageSchema).max(200).optional(),
+  elapsedTime: z.number().finite().nonnegative().optional(),
+  responseStartedAt: z.number().finite().nonnegative().optional(),
+  intermediateSteps: z.array(z.unknown()).max(2_000).optional(),
+  stepGroups: z.array(z.unknown()).max(500).optional(),
+  isStepsPlaceholder: z.boolean().optional(),
+  modelName: z.string().max(128).optional(),
+});
+
+export const conversationSnapshotSchema = z.object({
+  id: z.string().min(1).max(128),
+  title: z.string().min(1).max(255),
+  messages: z.array(messageSchema).max(5_000),
+  taskId: z.string().max(255).optional(),
+  previousResponseId: z.string().max(255).optional(),
+  status: z.enum(["idle", "running", "pending", "completed", "error", "failed"]),
+  taskUrl: z.string().max(4096).optional(),
+  createdAt: z.number().finite().nonnegative(),
+  updatedAt: z.number().finite().nonnegative(),
+  startedAt: z.number().finite().nonnegative().optional(),
+  completedAt: z.number().finite().nonnegative().optional(),
+  lastKnownOutputLength: z.number().int().nonnegative().optional(),
+  deletedMessageIds: z.array(z.string().max(128)).max(5_000).optional(),
+});
+
+export type ConversationSnapshot = z.infer<typeof conversationSnapshotSchema>;
+
+type UpstreamResourceRef = { kind: "task" | "file"; id: string };
+const LEGACY_IMPORT_MAX_RESOURCES = 200;
+const LEGACY_IMPORT_VALIDATION_CONCURRENCY = 4;
+const LEGACY_IMPORT_VALIDATION_TIMEOUT_MS = 30_000;
+
+function upstreamResourceKey(kind: "task" | "file", id: string) {
+  return JSON.stringify([kind, id]);
+}
+
+export function collectSnapshotResourceRefs(
+  snapshots: ConversationSnapshot[],
+): UpstreamResourceRef[] {
+  const resources = new Map<string, UpstreamResourceRef>();
+  const add = (kind: "task" | "file", id: string | undefined) => {
+    if (!id) return;
+    resources.set(upstreamResourceKey(kind, id), { kind, id });
+    if (resources.size > LEGACY_IMPORT_MAX_RESOURCES) {
+      throw new TRPCError({
+        code: "PAYLOAD_TOO_LARGE",
+        message: `单次最多迁移 ${LEGACY_IMPORT_MAX_RESOURCES} 个历史任务或文件`,
+      });
+    }
+  };
+
+  for (const snapshot of snapshots) {
+    add("task", snapshot.taskId);
+    for (const message of snapshot.messages) {
+      for (const attachment of message.attachments ?? []) {
+        add("file", attachment.fileId);
+      }
+    }
+  }
+  return Array.from(resources.values());
+}
+
+function storageId(userId: number, publicId: string) {
+  return `u${userId}:${publicId}`;
+}
+
+function publicId(userId: number, persistedId: string) {
+  const prefix = `u${userId}:`;
+  return persistedId.startsWith(prefix) ? persistedId.slice(prefix.length) : persistedId;
+}
+
+function asDate(value: number | undefined): Date | null {
+  if (value === undefined) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function requireDb(db: Awaited<ReturnType<typeof getDb>>) {
+  if (!db) {
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "数据库暂不可用",
+    });
+  }
+  return db;
+}
+
+async function getActiveCredentialId(executor: any, userId: number) {
+  const rows = await executor
+    .select({ id: apiCredentials.id })
+    .from(apiCredentials)
+    .where(
+      and(
+        eq(apiCredentials.userId, userId),
+        eq(apiCredentials.status, "active"),
+        eq(apiCredentials.validationStatus, "verified"),
+        isNull(apiCredentials.deletedAt)
+      )
+    )
+    .orderBy(desc(apiCredentials.version))
+    .limit(1);
+  return rows[0]?.id as string | undefined;
+}
+
+async function assertResourceOwnership(
+  executor: any,
+  userId: number,
+  kind: "task" | "file",
+  upstreamId: string,
+) {
+  const rows = await executor
+    .select({ userId: upstreamResources.userId })
+    .from(upstreamResources)
+    .where(
+      and(
+        eq(upstreamResources.kind, kind),
+        eq(upstreamResources.upstreamId, upstreamId)
+      )
+    )
+    .limit(1);
+  if (rows[0] && rows[0].userId !== userId) {
+    throw new TRPCError({ code: "FORBIDDEN", message: "上游资源不属于当前账号" });
+  }
+  return rows[0] ?? null;
+}
+
+/**
+ * A client-supplied legacy ID is not ownership proof. Before writing a new
+ * ledger row, verify that the credential selected for this conversation can
+ * actually read the resource from the upstream API.
+ */
+export async function validateUpstreamResourceAccess(
+  apiKey: string,
+  kind: "task" | "file",
+  upstreamId: string,
+  request: typeof fetch = fetch,
+  signal: AbortSignal = AbortSignal.timeout(15_000),
+) {
+  let response: Response;
+  try {
+    const collection = kind === "task" ? "tasks" : "files";
+    response = await request(
+      `${getUpstreamBaseUrl()}/v1/${collection}/${encodeURIComponent(upstreamId)}`,
+      {
+        method: "GET",
+        redirect: "error",
+        headers: {
+          API_KEY: apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json",
+        },
+        signal,
+      },
+    );
+  } catch {
+    throw new TRPCError({
+      code: "SERVICE_UNAVAILABLE",
+      message: "上游服务暂时不可用，无法验证历史任务或文件归属",
+    });
+  }
+
+  const { ok, status } = response;
+  await response.body?.cancel().catch(() => undefined);
+  if (status === 401 || status === 403 || status === 404) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "当前 API Key 无法访问该历史任务或文件",
+    });
+  }
+  if (!ok) {
+    throw new TRPCError({
+      code: "SERVICE_UNAVAILABLE",
+      message: "上游服务暂时无法验证历史任务或文件归属",
+    });
+  }
+}
+
+async function persistResource(
+  executor: any,
+  input: {
+    userId: number;
+    apiCredentialId: string;
+    kind: "task" | "file";
+    upstreamId: string;
+    conversationId: string;
+  },
+  validatedResourceKeys?: ReadonlySet<string>,
+) {
+  const existing = await assertResourceOwnership(
+    executor,
+    input.userId,
+    input.kind,
+    input.upstreamId,
+  );
+  if (existing) return;
+  if (!validatedResourceKeys?.has(upstreamResourceKey(input.kind, input.upstreamId))) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "历史任务或文件尚未验证，请通过本地记录迁移入口导入",
+    });
+  }
+  await executor
+    .insert(upstreamResources)
+    .values({
+      id: randomUUID(),
+      userId: input.userId,
+      apiCredentialId: input.apiCredentialId,
+      kind: input.kind,
+      upstreamId: input.upstreamId,
+      conversationId: input.conversationId,
+    })
+    .onDuplicateKeyUpdate({
+      // Never mutate an existing owner's row on a duplicate-key race.
+      set: { upstreamId: input.upstreamId },
+    });
+  await assertResourceOwnership(executor, input.userId, input.kind, input.upstreamId);
+}
+
+function buildMessageMetadata(
+  message: z.infer<typeof messageSchema>,
+): MessageMetadata | null {
+  const metadata: MessageMetadata = {};
+  if (message.outputFiles) metadata.outputFiles = message.outputFiles;
+  if (message.inlineImages) metadata.inlineImages = message.inlineImages;
+  if (message.elapsedTime !== undefined) metadata.elapsedTime = message.elapsedTime;
+  if (message.responseStartedAt !== undefined) {
+    metadata.responseStartedAt = message.responseStartedAt;
+  }
+  if (message.intermediateSteps) metadata.intermediateSteps = message.intermediateSteps;
+  if (message.stepGroups) metadata.stepGroups = message.stepGroups;
+  if (message.isStepsPlaceholder !== undefined) {
+    metadata.isStepsPlaceholder = message.isStepsPlaceholder;
+  }
+  if (message.modelName) metadata.modelName = message.modelName;
+  return Object.keys(metadata).length > 0 ? metadata : null;
+}
+
+async function loadPersistedMessages(
+  executor: any,
+  userId: number,
+  conversationId: string,
+): Promise<ConversationSnapshot["messages"]> {
+  const messageRows = await executor
+    .select()
+    .from(messages)
+    .where(
+      and(
+        eq(messages.userId, userId),
+        eq(messages.conversationId, conversationId),
+        isNull(messages.deletedAt),
+      ),
+    )
+    .orderBy(asc(messages.sequence));
+  const messageIds = messageRows.map((row: { id: string }) => row.id);
+  const attachmentRows =
+    messageIds.length === 0
+      ? []
+      : await executor
+          .select()
+          .from(attachments)
+          .where(
+            and(
+              eq(attachments.userId, userId),
+              inArray(attachments.messageId, messageIds),
+              isNull(attachments.deletedAt),
+            ),
+          );
+  const attachmentsByMessage = new Map<string, typeof attachmentRows>();
+  for (const attachment of attachmentRows) {
+    const current = attachmentsByMessage.get(attachment.messageId) ?? [];
+    current.push(attachment);
+    attachmentsByMessage.set(attachment.messageId, current);
+  }
+
+  return messageRows.map((message: typeof messages.$inferSelect) => {
+    const metadata = (message.metadata ?? {}) as MessageMetadata;
+    return {
+      id: publicId(userId, message.id),
+      role: message.role === "assistant" ? "assistant" as const : "user" as const,
+      content: message.content,
+      timestamp: message.sentAt.getTime(),
+      attachments: (attachmentsByMessage.get(message.id) ?? []).map(
+        (attachment: typeof attachments.$inferSelect) => ({
+          id: publicId(userId, attachment.id),
+          type: attachment.kind,
+          name: attachment.fileName,
+          ...(attachment.upstreamFileId
+            ? { fileId: attachment.upstreamFileId }
+            : {}),
+        }),
+      ),
+      ...(metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {}),
+      ...(metadata.inlineImages ? { inlineImages: metadata.inlineImages } : {}),
+      ...(metadata.elapsedTime !== undefined
+        ? { elapsedTime: metadata.elapsedTime }
+        : {}),
+      ...(metadata.responseStartedAt !== undefined
+        ? { responseStartedAt: metadata.responseStartedAt }
+        : {}),
+      ...(metadata.intermediateSteps
+        ? { intermediateSteps: metadata.intermediateSteps }
+        : {}),
+      ...(metadata.stepGroups ? { stepGroups: metadata.stepGroups } : {}),
+      ...(metadata.isStepsPlaceholder !== undefined
+        ? { isStepsPlaceholder: metadata.isStepsPlaceholder }
+        : {}),
+      ...(metadata.modelName ? { modelName: metadata.modelName } : {}),
+    };
+  });
+}
+
+type SnapshotMessage = ConversationSnapshot["messages"][number];
+type MessageTurn = { user: SnapshotMessage; assistants: SnapshotMessage[] };
+
+function splitMessageTurns(messagesToSplit: SnapshotMessage[]) {
+  const prelude: SnapshotMessage[] = [];
+  const turns: MessageTurn[] = [];
+  let currentTurn: MessageTurn | null = null;
+  for (const message of messagesToSplit) {
+    if (message.role === "user") {
+      currentTurn = { user: message, assistants: [] };
+      turns.push(currentTurn);
+    } else if (currentTurn) {
+      currentTurn.assistants.push(message);
+    } else {
+      prelude.push(message);
+    }
+  }
+  return { prelude, turns };
+}
+
+function assistantProjectionScore(projected: SnapshotMessage[]) {
+  const hasConcreteResult = projected.some(message => !message.isStepsPlaceholder);
+  return projected.reduce((score, message) => {
+    if (message.isStepsPlaceholder) return score + 1;
+    return (
+      score +
+      message.content.length +
+      (message.outputFiles?.length ?? 0) * 10_000 +
+      (message.inlineImages?.length ?? 0) * 10_000 +
+      (message.stepGroups?.length ?? 0) * 1_000 +
+      (message.intermediateSteps?.length ?? 0) * 100
+    );
+  }, hasConcreteResult ? 1_000_000_000 : 0);
+}
+
+/**
+ * Merge by user turn rather than replacing an entire conversation snapshot.
+ * The incoming assistant set is authoritative for a turn it knows about
+ * (allowing polling placeholders to disappear), while turns created on
+ * another device are retained. Explicit deletion tombstones win everywhere.
+ */
+export function mergeConversationMessages(
+  persisted: SnapshotMessage[],
+  incoming: SnapshotMessage[],
+  deletedMessageIds: string[],
+) {
+  const deleted = new Set(deletedMessageIds);
+  const persistedSplit = splitMessageTurns(persisted);
+  const incomingSplit = splitMessageTurns(incoming);
+  const prelude = new Map<string, SnapshotMessage>();
+  for (const message of persistedSplit.prelude) prelude.set(message.id, message);
+  for (const message of incomingSplit.prelude) prelude.set(message.id, message);
+
+  const turns = new Map<string, MessageTurn>();
+  for (const turn of persistedSplit.turns) turns.set(turn.user.id, turn);
+  for (const turn of incomingSplit.turns) {
+    const persistedTurn = turns.get(turn.user.id);
+    if (!persistedTurn) {
+      turns.set(turn.user.id, turn);
+      continue;
+    }
+    // Polling projections only become richer (placeholder -> partial -> final).
+    // A stale device changing an unrelated scalar must not regress a final
+    // assistant result back to its older placeholder/partial projection.
+    if (
+      assistantProjectionScore(turn.assistants) >
+      assistantProjectionScore(persistedTurn.assistants)
+    ) {
+      turns.set(turn.user.id, {
+        user: persistedTurn.user,
+        assistants: turn.assistants,
+      });
+    }
+  }
+
+  const mergedPrelude = Array.from(prelude.values())
+    .filter(message => !deleted.has(message.id))
+    .sort((left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id));
+  const mergedTurns = Array.from(turns.values())
+    .filter(turn => !deleted.has(turn.user.id))
+    .sort(
+      (left, right) =>
+        left.user.timestamp - right.user.timestamp ||
+        left.user.id.localeCompare(right.user.id),
+    );
+
+  return [
+    ...mergedPrelude,
+    ...mergedTurns.flatMap(turn => [
+      turn.user,
+      ...turn.assistants.filter(message => !deleted.has(message.id)),
+    ]),
+  ];
+}
+
+async function persistSnapshot(
+  executor: any,
+  userId: number,
+  snapshot: ConversationSnapshot,
+  options: {
+    skipExisting?: boolean;
+    importCredentialId?: string;
+    validatedResourceKeys?: ReadonlySet<string>;
+  } = {},
+): Promise<"imported" | "skipped" | "updated"> {
+  const persistedConversationId = storageId(userId, snapshot.id);
+  const existingRows = await executor
+    .select()
+    .from(conversations)
+    .where(eq(conversations.id, persistedConversationId))
+    .limit(1)
+    // Serialize whole-snapshot merges for this conversation. Without this
+    // lock, two transactions can both merge from the same old message set and
+    // the later delete/reinsert phase would erase the other device's new turn.
+    .for("update");
+  const existing = existingRows[0];
+
+  if (existing && existing.userId !== userId) {
+    throw new TRPCError({ code: "FORBIDDEN", message: "会话 ID 已属于其他账号" });
+  }
+  if (existing?.deletedAt) {
+    if (options.skipExisting) return "skipped";
+    throw new TRPCError({ code: "NOT_FOUND", message: "会话已删除" });
+  }
+  if (existing && options.skipExisting) return "skipped";
+
+  if (existing) {
+    const deletedMessageIds = Array.from(
+      new Set([
+        ...existing.deletedMessageIds,
+        ...(snapshot.deletedMessageIds ?? []),
+      ]),
+    );
+    const persistedMessages = await loadPersistedMessages(
+      executor,
+      userId,
+      persistedConversationId,
+    );
+    snapshot = {
+      ...snapshot,
+      messages: mergeConversationMessages(
+        persistedMessages,
+        snapshot.messages,
+        deletedMessageIds,
+      ),
+      taskId: snapshot.taskId ?? existing.upstreamTaskId ?? undefined,
+      previousResponseId:
+        snapshot.previousResponseId ?? existing.previousResponseId ?? undefined,
+      taskUrl: snapshot.taskUrl ?? existing.taskUrl ?? undefined,
+      startedAt: snapshot.startedAt ?? existing.startedAt?.getTime(),
+      completedAt: snapshot.completedAt ?? existing.completedAt?.getTime(),
+      lastKnownOutputLength: Math.max(
+        snapshot.lastKnownOutputLength ?? 0,
+        existing.lastKnownOutputLength,
+      ),
+      deletedMessageIds,
+      createdAt: existing.createdAt.getTime(),
+      // Server arrival order determines scalar-field precedence; message turns
+      // are merged above, so device clock skew cannot erase another turn.
+      updatedAt: Date.now(),
+    };
+  }
+
+  const apiCredentialId =
+    existing?.apiCredentialId ??
+    options.importCredentialId ??
+    (await getActiveCredentialId(executor, userId)) ??
+    null;
+  const hasUpstreamResources =
+    Boolean(snapshot.taskId) ||
+    snapshot.messages.some(message =>
+      message.attachments?.some(attachment => Boolean(attachment.fileId)),
+    );
+  if (hasUpstreamResources && !apiCredentialId) {
+    throw new TRPCError({
+      code: "PRECONDITION_FAILED",
+      message: "请先迁移或配置该会话原来使用的 API Key，再导入历史会话",
+    });
+  }
+
+  if (hasUpstreamResources && apiCredentialId) {
+    const credentialRows = await executor
+      .select({ status: apiCredentials.status })
+      .from(apiCredentials)
+      .where(
+        and(
+          eq(apiCredentials.id, apiCredentialId),
+          eq(apiCredentials.userId, userId),
+        ),
+      )
+      .limit(1);
+    const credential = credentialRows[0];
+    if (!credential || credential.status === "deleted") {
+      throw new TRPCError({
+        code: "PRECONDITION_FAILED",
+        message: "该会话原来使用的 API Key 已不可用",
+      });
+    }
+  }
+
+  const conversationValues = {
+    userId,
+    apiCredentialId,
+    title: snapshot.title,
+    status: snapshot.status,
+    upstreamTaskId: snapshot.taskId ?? null,
+    previousResponseId: snapshot.previousResponseId ?? null,
+    taskUrl: snapshot.taskUrl ?? null,
+    lastKnownOutputLength: snapshot.lastKnownOutputLength ?? 0,
+    deletedMessageIds: snapshot.deletedMessageIds ?? [],
+    startedAt: asDate(snapshot.startedAt),
+    completedAt: asDate(snapshot.completedAt),
+    createdAt: asDate(snapshot.createdAt) ?? new Date(),
+    updatedAt: asDate(snapshot.updatedAt) ?? new Date(),
+  };
+
+  if (existing) {
+    await executor
+      .update(conversations)
+      .set({ ...conversationValues, version: existing.version + 1 })
+      .where(
+        and(
+          eq(conversations.id, persistedConversationId),
+          eq(conversations.userId, userId),
+        )
+      );
+  } else {
+    await executor.insert(conversations).values({
+      id: persistedConversationId,
+      ...conversationValues,
+      version: 1,
+    });
+  }
+
+  const incomingMessageIds = snapshot.messages.map(message => storageId(userId, message.id));
+  if (incomingMessageIds.length > 0) {
+    const collisions = await executor
+      .select({ id: messages.id, conversationId: messages.conversationId, userId: messages.userId })
+      .from(messages)
+      .where(inArray(messages.id, incomingMessageIds));
+    if (
+      collisions.some(
+        (row: { conversationId: string; userId: number }) =>
+          row.userId !== userId || row.conversationId !== persistedConversationId,
+      )
+    ) {
+      throw new TRPCError({ code: "CONFLICT", message: "消息 ID 与其他会话冲突" });
+    }
+  }
+
+  // A snapshot is authoritative for this conversation. Replacing children also
+  // removes stale polling placeholders and preserves manual-delete tombstones on
+  // the parent conversation.
+  await executor
+    .delete(messages)
+    .where(eq(messages.conversationId, persistedConversationId));
+
+  for (let sequence = 0; sequence < snapshot.messages.length; sequence += 1) {
+    const message = snapshot.messages[sequence];
+    const sentAt = asDate(message.timestamp) ?? new Date();
+    await executor.insert(messages).values({
+      id: storageId(userId, message.id),
+      conversationId: persistedConversationId,
+      userId,
+      role: message.role,
+      content: message.content,
+      sequence,
+      metadata: buildMessageMetadata(message),
+      sentAt,
+      createdAt: sentAt,
+    });
+
+    for (const attachment of message.attachments ?? []) {
+      await executor.insert(attachments).values({
+        id: storageId(userId, attachment.id),
+        userId,
+        conversationId: persistedConversationId,
+        messageId: storageId(userId, message.id),
+        apiCredentialId,
+        kind: attachment.type,
+        fileName: attachment.name,
+        upstreamFileId: attachment.fileId ?? null,
+      });
+      if (attachment.fileId && apiCredentialId) {
+        await persistResource(executor, {
+          userId,
+          apiCredentialId,
+          kind: "file",
+          upstreamId: attachment.fileId,
+          conversationId: persistedConversationId,
+        }, options.validatedResourceKeys);
+      }
+    }
+  }
+
+  if (snapshot.taskId && apiCredentialId) {
+    await persistResource(executor, {
+      userId,
+      apiCredentialId,
+      kind: "task",
+      upstreamId: snapshot.taskId,
+      conversationId: persistedConversationId,
+    }, options.validatedResourceKeys);
+  }
+
+  return existing ? "updated" : "imported";
+}
+
+async function validateWithBoundedConcurrency(
+  resources: UpstreamResourceRef[],
+  apiKey: string,
+) {
+  if (resources.length === 0) return;
+  const abortController = new AbortController();
+  const signal = AbortSignal.any([
+    abortController.signal,
+    AbortSignal.timeout(LEGACY_IMPORT_VALIDATION_TIMEOUT_MS),
+  ]);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < resources.length) {
+      const resource = resources[nextIndex];
+      nextIndex += 1;
+      await validateUpstreamResourceAccess(
+        apiKey,
+        resource.kind,
+        resource.id,
+        fetch,
+        signal,
+      );
+    }
+  };
+
+  try {
+    await Promise.all(
+      Array.from(
+        { length: Math.min(LEGACY_IMPORT_VALIDATION_CONCURRENCY, resources.length) },
+        () => worker(),
+      ),
+    );
+  } catch (error) {
+    abortController.abort();
+    throw error;
+  }
+}
+
+async function prepareLegacyImport(
+  userId: number,
+  snapshots: ConversationSnapshot[],
+) {
+  const db = requireDb(await getDb());
+  const persistedIds = snapshots.map(snapshot => storageId(userId, snapshot.id));
+  const existingRows =
+    persistedIds.length === 0
+      ? []
+      : await db
+          .select({ id: conversations.id })
+          .from(conversations)
+          .where(inArray(conversations.id, persistedIds));
+  const existingIds = new Set(existingRows.map(row => row.id));
+  const newSnapshots = snapshots.filter(
+    snapshot => !existingIds.has(storageId(userId, snapshot.id)),
+  );
+  const resources = collectSnapshotResourceRefs(newSnapshots);
+  if (resources.length === 0) {
+    return { credentialId: undefined, validatedResourceKeys: new Set<string>() };
+  }
+
+  const taskIds = resources.filter(item => item.kind === "task").map(item => item.id);
+  const fileIds = resources.filter(item => item.kind === "file").map(item => item.id);
+  const [knownTasks, knownFiles] = await Promise.all([
+    taskIds.length === 0
+      ? []
+      : db
+          .select({
+            kind: upstreamResources.kind,
+            upstreamId: upstreamResources.upstreamId,
+            userId: upstreamResources.userId,
+          })
+          .from(upstreamResources)
+          .where(
+            and(
+              eq(upstreamResources.kind, "task"),
+              inArray(upstreamResources.upstreamId, taskIds),
+            ),
+          ),
+    fileIds.length === 0
+      ? []
+      : db
+          .select({
+            kind: upstreamResources.kind,
+            upstreamId: upstreamResources.upstreamId,
+            userId: upstreamResources.userId,
+          })
+          .from(upstreamResources)
+          .where(
+            and(
+              eq(upstreamResources.kind, "file"),
+              inArray(upstreamResources.upstreamId, fileIds),
+            ),
+          ),
+  ]);
+  const known = new Set<string>();
+  for (const resource of [...knownTasks, ...knownFiles]) {
+    if (resource.userId !== userId) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: "历史任务或文件已属于其他账号",
+      });
+    }
+    known.add(upstreamResourceKey(resource.kind, resource.upstreamId));
+  }
+
+  const unknown = resources.filter(
+    resource => !known.has(upstreamResourceKey(resource.kind, resource.id)),
+  );
+  const credential = await getDecryptedCredentialForUser(userId);
+  if (!credential) {
+    throw new TRPCError({
+      code: "PRECONDITION_FAILED",
+      message: "请先迁移或配置该会话原来使用的 API Key，再导入历史会话",
+    });
+  }
+  await validateWithBoundedConcurrency(unknown, credential.apiKey);
+  return {
+    credentialId: credential.id,
+    validatedResourceKeys: new Set(
+      unknown.map(resource => upstreamResourceKey(resource.kind, resource.id)),
+    ),
+  };
+}
+
+async function listSnapshots(userId: number): Promise<ConversationSnapshot[]> {
+  const db = requireDb(await getDb());
+  const conversationRows = await db
+    .select()
+    .from(conversations)
+    .where(and(eq(conversations.userId, userId), isNull(conversations.deletedAt)))
+    .orderBy(desc(conversations.updatedAt));
+  if (conversationRows.length === 0) return [];
+
+  const ids = conversationRows.map(row => row.id);
+  const messageRows = await db
+    .select()
+    .from(messages)
+    .where(
+      and(
+        eq(messages.userId, userId),
+        inArray(messages.conversationId, ids),
+        isNull(messages.deletedAt)
+      )
+    )
+    .orderBy(asc(messages.sequence));
+  const messageIds = messageRows.map(row => row.id);
+  const attachmentRows =
+    messageIds.length === 0
+      ? []
+      : await db
+          .select()
+          .from(attachments)
+          .where(
+            and(
+              eq(attachments.userId, userId),
+              inArray(attachments.messageId, messageIds),
+              isNull(attachments.deletedAt)
+            )
+          );
+
+  const attachmentsByMessage = new Map<string, typeof attachmentRows>();
+  for (const attachment of attachmentRows) {
+    const current = attachmentsByMessage.get(attachment.messageId) ?? [];
+    current.push(attachment);
+    attachmentsByMessage.set(attachment.messageId, current);
+  }
+
+  const messagesByConversation = new Map<string, typeof messageRows>();
+  for (const message of messageRows) {
+    const current = messagesByConversation.get(message.conversationId) ?? [];
+    current.push(message);
+    messagesByConversation.set(message.conversationId, current);
+  }
+
+  return conversationRows.map(row => ({
+    id: publicId(userId, row.id),
+    title: row.title,
+    messages: (messagesByConversation.get(row.id) ?? []).map(message => {
+      const metadata = (message.metadata ?? {}) as MessageMetadata;
+      return {
+        id: publicId(userId, message.id),
+        role: message.role === "assistant" ? "assistant" as const : "user" as const,
+        content: message.content,
+        timestamp: message.sentAt.getTime(),
+        attachments: (attachmentsByMessage.get(message.id) ?? []).map(attachment => ({
+          id: publicId(userId, attachment.id),
+          type: attachment.kind,
+          name: attachment.fileName,
+          ...(attachment.upstreamFileId ? { fileId: attachment.upstreamFileId } : {}),
+        })),
+        ...(metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {}),
+        ...(metadata.inlineImages ? { inlineImages: metadata.inlineImages } : {}),
+        ...(metadata.elapsedTime !== undefined ? { elapsedTime: metadata.elapsedTime } : {}),
+        ...(metadata.responseStartedAt !== undefined
+          ? { responseStartedAt: metadata.responseStartedAt }
+          : {}),
+        ...(metadata.intermediateSteps ? { intermediateSteps: metadata.intermediateSteps } : {}),
+        ...(metadata.stepGroups ? { stepGroups: metadata.stepGroups } : {}),
+        ...(metadata.isStepsPlaceholder !== undefined
+          ? { isStepsPlaceholder: metadata.isStepsPlaceholder }
+          : {}),
+        ...(metadata.modelName ? { modelName: metadata.modelName } : {}),
+      };
+    }),
+    ...(row.upstreamTaskId ? { taskId: row.upstreamTaskId } : {}),
+    ...(row.previousResponseId ? { previousResponseId: row.previousResponseId } : {}),
+    status: row.status === "archived" ? "completed" : row.status,
+    ...(row.taskUrl ? { taskUrl: row.taskUrl } : {}),
+    createdAt: row.createdAt.getTime(),
+    updatedAt: row.updatedAt.getTime(),
+    ...(row.startedAt ? { startedAt: row.startedAt.getTime() } : {}),
+    ...(row.completedAt ? { completedAt: row.completedAt.getTime() } : {}),
+    lastKnownOutputLength: row.lastKnownOutputLength,
+    deletedMessageIds: row.deletedMessageIds,
+  }));
+}
+
+export const conversationRouter = router({
+  list: protectedProcedure.query(({ ctx }) => listSnapshots(ctx.user.id)),
+
+  syncSnapshot: protectedProcedure
+    .input(z.object({ conversation: conversationSnapshotSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const db = requireDb(await getDb());
+      await db.transaction(async tx => {
+        await persistSnapshot(tx, ctx.user.id, input.conversation);
+      });
+      const snapshots = await listSnapshots(ctx.user.id);
+      const persisted = snapshots.find(item => item.id === input.conversation.id);
+      if (!persisted) {
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "会话保存失败" });
+      }
+      return persisted;
+    }),
+
+  delete: protectedProcedure
+    .input(z.object({ id: z.string().min(1).max(128) }))
+    .mutation(async ({ ctx, input }) => {
+      const db = requireDb(await getDb());
+      const persistedConversationId = storageId(ctx.user.id, input.id);
+      const existing = await db
+        .select({ userId: conversations.userId })
+        .from(conversations)
+        .where(eq(conversations.id, persistedConversationId))
+        .limit(1);
+      if (!existing[0] || existing[0].userId !== ctx.user.id) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "会话不存在" });
+      }
+      const now = new Date();
+      await db.transaction(async tx => {
+        await tx
+          .update(conversations)
+          .set({ deletedAt: now, updatedAt: now })
+          .where(
+            and(
+              eq(conversations.id, persistedConversationId),
+              eq(conversations.userId, ctx.user.id),
+            )
+          );
+        await tx
+          .update(messages)
+          .set({ deletedAt: now })
+          .where(
+            and(
+              eq(messages.conversationId, persistedConversationId),
+              eq(messages.userId, ctx.user.id),
+            )
+          );
+        await tx
+          .update(attachments)
+          .set({ deletedAt: now })
+          .where(
+            and(
+              eq(attachments.conversationId, persistedConversationId),
+              eq(attachments.userId, ctx.user.id)
+            )
+          );
+      });
+      return { success: true } as const;
+    }),
+
+  importLocal: protectedProcedure
+    .input(z.object({ conversations: z.array(conversationSnapshotSchema).max(200) }))
+    .mutation(async ({ ctx, input }) => {
+      const db = requireDb(await getDb());
+      // Upstream ownership proof happens before any transaction or row lock.
+      // Normal sync never creates ledger rows from client-supplied IDs.
+      const prepared = await prepareLegacyImport(ctx.user.id, input.conversations);
+      let imported = 0;
+      let skipped = 0;
+      for (const conversation of input.conversations) {
+        const result = await db.transaction(tx =>
+          persistSnapshot(tx, ctx.user.id, conversation, {
+            skipExisting: true,
+            importCredentialId: prepared.credentialId,
+            validatedResourceKeys: prepared.validatedResourceKeys,
+          }),
+        );
+        if (result === "imported") imported += 1;
+        else skipped += 1;
+      }
+      return { imported, skipped };
+    }),
+});

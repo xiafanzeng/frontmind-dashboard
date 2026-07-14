@@ -5,21 +5,11 @@ const DEFAULT_UPSTREAM_BASE_URL = `https://api.${UPSTREAM_VENDOR}.im`;
 
 export function getUpstreamBaseUrl(req?: Request) {
   const configured = process.env.FRONTMIND_UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL;
-  const allowClientOverride = process.env.FRONTMIND_ALLOW_CLIENT_BASE_URL === "1";
-  const clientBaseUrl =
-    allowClientOverride && req
-      ? String(req.headers["x-frontmind-base-url"] || "")
-      : "";
-
-  return (clientBaseUrl || configured).replace(/\/$/, "");
+  return configured.replace(/\/$/, "");
 }
 
 export function getFrontMindApiKey(req: Request) {
-  return String(
-    process.env.FRONTMIND_API_KEY ||
-    req.headers["x-frontmind-api-key"] ||
-    ""
-  );
+  return req.frontmindCredential?.apiKey ?? "";
 }
 
 export function getFrontMindCredentials(req: Request) {

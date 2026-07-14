@@ -21,7 +21,6 @@ import {
   Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { getConfig } from "@/lib/frontmind-api";
 
 interface ImagePreviewProps {
   src: string;
@@ -41,16 +40,7 @@ function needsAuthHeaders(url: string): boolean {
  * Fetch image with auth headers and return blob URL
  */
 async function fetchImageWithAuth(url: string): Promise<string> {
-  const config = getConfig();
-  const headers: Record<string, string> = {};
-
-  if (needsAuthHeaders(url)) {
-    headers["X-FrontMind-API-Key"] = config.apiKey;
-    headers["X-FrontMind-Base-URL"] = config.baseUrl;
-  }
-
   const response = await fetch(url, {
-    headers,
     credentials: "include",
   });
 
@@ -69,10 +59,6 @@ async function fetchImageWithAuth(url: string): Promise<string> {
       if (data.upload_url) {
         const proxyUrl = `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
         const proxyResponse = await fetch(proxyUrl, {
-          headers: {
-            "X-FrontMind-API-Key": config.apiKey,
-            "X-FrontMind-Base-URL": config.baseUrl,
-          },
           credentials: "include",
         });
         if (!proxyResponse.ok) {

@@ -32,7 +32,7 @@ import {
   UploadCloud,
 } from "lucide-react";
 import { cn, copyToClipboard } from "@/lib/utils";
-import { creditEventBus, getConfig, MODEL_OPTIONS, retrieveTask, sanitizeBrandText, uploadFile, type OutputMessage } from "@/lib/frontmind-api";
+import { creditEventBus, MODEL_OPTIONS, retrieveTask, sanitizeBrandText, uploadFile, type OutputMessage } from "@/lib/frontmind-api";
 import ChatInput from "./ChatInput";
 import MarkdownRenderer from "./MarkdownRenderer";
 import ImagePreview from "./ImagePreview";
@@ -159,17 +159,8 @@ function nativeDownload(url: string, fileName: string) {
  */
 async function fetchWithAuth(fileUrl: string, fileName?: string): Promise<string> {
   const normalizedUrl = buildProxyDownloadUrl(fileUrl, fileName, false) || fileUrl;
-  const config = getConfig();
-  const headers: Record<string, string> = {};
-
-  // Only add auth headers for our proxy URLs
-  if (normalizedUrl.startsWith("/api/frontmind/")) {
-    headers["X-FrontMind-API-Key"] = config.apiKey;
-    headers["X-FrontMind-Base-URL"] = config.baseUrl;
-  }
 
   const response = await fetch(normalizedUrl, {
-    headers,
     credentials: "include",
   });
 
@@ -187,10 +178,6 @@ async function fetchWithAuth(fileUrl: string, fileName?: string): Promise<string
         // Got metadata instead of binary - fetch from S3 URL via proxy
         const proxyUrl = buildProxyDownloadUrl(data.upload_url, fileName, false) || `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
         const s3Response = await fetch(proxyUrl, {
-          headers: {
-            "X-FrontMind-API-Key": config.apiKey,
-            "X-FrontMind-Base-URL": config.baseUrl,
-          },
           credentials: "include",
         });
         if (!s3Response.ok) {
@@ -383,11 +370,6 @@ export default function ChatArea() {
     async ({ companyName, operatorNotes, agentProfile, files }: DeepReportStartInput) => {
       if (!activeConversation) return;
 
-      const config = getConfig();
-      if (!config.apiKey) {
-        toast.error("请先在设置中填写 API Key");
-        return;
-      }
       const selectedAgentProfile = agentProfile || "frontmind-pro";
 
       const conversationId = activeConversation.id;
@@ -417,8 +399,6 @@ export default function ChatArea() {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-FrontMind-API-Key": config.apiKey,
-            "X-FrontMind-Base-URL": config.baseUrl,
           },
           credentials: "include",
           body: JSON.stringify({
@@ -502,11 +482,6 @@ export default function ChatArea() {
     async ({ companyName, companyWebsite, operatorNotes, agentProfile, files }: DeepReportStartInput) => {
       if (!activeConversation) return;
 
-      const config = getConfig();
-      if (!config.apiKey) {
-        toast.error("请先在设置中填写 API Key");
-        return;
-      }
       const selectedAgentProfile = agentProfile || "frontmind-pro";
 
       const conversationId = activeConversation.id;
@@ -536,8 +511,6 @@ export default function ChatArea() {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-FrontMind-API-Key": config.apiKey,
-            "X-FrontMind-Base-URL": config.baseUrl,
           },
           credentials: "include",
           body: JSON.stringify({
@@ -1109,16 +1082,10 @@ function MarkdownFileReader({
       setContent(null);
 
       // Fetch through the same-origin proxy when the source is an external signed URL.
-      const config = getConfig();
-      const headers: Record<string, string> = {};
       const displayName = sanitizeBrandText(fileName);
       const normalizedUrl = buildProxyDownloadUrl(fileUrl, displayName, false) || fileUrl;
-      if (normalizedUrl.startsWith("/api/frontmind/")) {
-        headers["X-FrontMind-API-Key"] = config.apiKey;
-        headers["X-FrontMind-Base-URL"] = config.baseUrl;
-      }
 
-      fetch(normalizedUrl, { headers, credentials: "include" })
+      fetch(normalizedUrl, { credentials: "include" })
         .then(async (res) => {
           if (!res.ok) {
             throw new Error(`HTTP ${res.status}`);
@@ -1134,10 +1101,6 @@ function MarkdownFileReader({
                 // Fetch actual content from S3 via proxy
                 const proxyUrl = buildProxyDownloadUrl(data.upload_url, displayName, false) || `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
                 const s3Res = await fetch(proxyUrl, {
-                  headers: {
-                    "X-FrontMind-API-Key": config.apiKey,
-                    "X-FrontMind-Base-URL": config.baseUrl,
-                  },
                   credentials: "include",
                 });
                 if (!s3Res.ok) {
@@ -1436,8 +1399,6 @@ function PdfViewer({
     [size]
   );
 
-  const isHtml = displayFileName.toLowerCase().endsWith(".html") || displayFileName.toLowerCase().endsWith(".htm");
-
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <DialogContent
@@ -1502,7 +1463,7 @@ function PdfViewer({
               title={displayFileName}
               className="w-full h-full border-0"
               style={{ minHeight: "100%" }}
-              sandbox={isHtml ? "allow-same-origin allow-scripts" : undefined}
+              sandbox=""
             />
           ) : null}
         </div>

@@ -8,7 +8,6 @@ const mocks = vi.hoisted(() => ({
   uploadFile: vi.fn(),
   fileToBase64: vi.fn(),
   creditEmit: vi.fn(),
-  getApiKeyFingerprint: vi.fn(),
   addMessage: vi.fn(),
   updateStatus: vi.fn(),
   updateAssistantMessages: vi.fn(),
@@ -28,7 +27,6 @@ vi.mock("@/lib/frontmind-api", () => ({
   creditEventBus: {
     emit: mocks.creditEmit,
   },
-  getApiKeyFingerprint: mocks.getApiKeyFingerprint,
 }));
 
 vi.mock("@/lib/attachment-files", () => ({
@@ -93,7 +91,6 @@ describe("useSendMessage", () => {
     }));
     mocks.fileToBase64.mockResolvedValue("data:text/plain;base64,dGVzdA==");
     mocks.isImageUpload.mockReturnValue(false);
-    mocks.getApiKeyFingerprint.mockReturnValue("");
     mocks.createConversation.mockReturnValue("test-conv-id");
     mocks.parseOutputMessages.mockReturnValue([]);
     mocks.useConversation.mockReturnValue(mockConversationContext());

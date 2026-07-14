@@ -8,6 +8,26 @@ import "./index.css";
 
 const queryClient = new QueryClient();
 
+function loadOptionalAnalytics() {
+  const endpoint = import.meta.env.VITE_ANALYTICS_ENDPOINT;
+  const websiteId = import.meta.env.VITE_ANALYTICS_WEBSITE_ID;
+  if (!endpoint || !websiteId) return;
+
+  try {
+    const scriptUrl = new URL("umami", `${endpoint.replace(/\/$/, "")}/`);
+    if (scriptUrl.protocol !== "https:" && scriptUrl.protocol !== "http:") return;
+    const script = document.createElement("script");
+    script.defer = true;
+    script.src = scriptUrl.toString();
+    script.dataset.websiteId = websiteId;
+    document.head.appendChild(script);
+  } catch {
+    console.warn("[Analytics] Ignoring invalid VITE_ANALYTICS_ENDPOINT");
+  }
+}
+
+loadOptionalAnalytics();
+
 queryClient.getQueryCache().subscribe(event => {
   if (event.type === "updated" && event.action.type === "error") {
     const error = event.query.state.error;

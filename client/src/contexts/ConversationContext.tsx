@@ -1,5 +1,24 @@
-import React, { createContext, useContext, useReducer, useCallback, useEffect } from "react";
-import { sanitizeBrandText, getApiKeyFingerprint, apiKeyChangeEventBus, type TaskResponse, type OutputMessage } from "@/lib/frontmind-api";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
+import { useAuth } from "@/_core/hooks/useAuth";
+import {
+  batchLegacyConversationImports,
+  ConversationSyncQueue,
+  getErrorMessage,
+} from "@/lib/conversation-sync";
+import { trpc } from "@/lib/trpc";
+import {
+  sanitizeBrandText,
+  type TaskResponse,
+  type OutputMessage,
+} from "@/lib/frontmind-api";
 
 // Types for local conversation management
 export interface Attachment {
@@ -66,7 +85,7 @@ export interface Conversation {
   taskUrl?: string;
   createdAt: number;
   updatedAt: number;
-  startedAt?: number;    // Task start timestamp
+  startedAt?: number; // Task start timestamp
   completedAt?: number; // Task completion timestamp
   /**
    * Bug 3 fix: Track the total number of output items from the API after each
@@ -93,15 +112,39 @@ interface ConversationState {
 type Action =
   | { type: "NEW_CONVERSATION"; payload: Conversation }
   | { type: "SET_ACTIVE"; payload: string }
-  | { type: "ADD_MESSAGE"; payload: { conversationId: string; message: LocalMessage } }
-  | { type: "UPDATE_STATUS"; payload: { conversationId: string; status: Conversation["status"]; taskId?: string; taskUrl?: string; previousResponseId?: string; startedAt?: number; completedAt?: number; lastKnownOutputLength?: number } }
-  | { type: "UPDATE_ASSISTANT_MESSAGES"; payload: { conversationId: string; messages: LocalMessage[] } }
+  | {
+      type: "ADD_MESSAGE";
+      payload: { conversationId: string; message: LocalMessage };
+    }
+  | {
+      type: "UPDATE_STATUS";
+      payload: {
+        conversationId: string;
+        status: Conversation["status"];
+        taskId?: string;
+        taskUrl?: string;
+        previousResponseId?: string;
+        startedAt?: number;
+        completedAt?: number;
+        lastKnownOutputLength?: number;
+      };
+    }
+  | {
+      type: "UPDATE_ASSISTANT_MESSAGES";
+      payload: { conversationId: string; messages: LocalMessage[] };
+    }
   | { type: "UPDATE_TITLE"; payload: { conversationId: string; title: string } }
   | { type: "DELETE_CONVERSATION"; payload: string }
-  | { type: "DELETE_MESSAGE"; payload: { conversationId: string; messageId: string } }
+  | {
+      type: "DELETE_MESSAGE";
+      payload: { conversationId: string; messageId: string };
+    }
   | { type: "LOAD_STATE"; payload: ConversationState };
 
-function conversationReducer(state: ConversationState, action: Action): ConversationState {
+function conversationReducer(
+  state: ConversationState,
+  action: Action,
+): ConversationState {
   switch (action.type) {
     case "NEW_CONVERSATION": {
       return {
@@ -123,7 +166,7 @@ function conversationReducer(state: ConversationState, action: Action): Conversa
                 messages: [...c.messages, action.payload.message],
                 updatedAt: Date.now(),
               }
-            : c
+            : c,
         ),
       };
     }
@@ -137,13 +180,16 @@ function conversationReducer(state: ConversationState, action: Action): Conversa
                 status: action.payload.status,
                 taskId: action.payload.taskId ?? c.taskId,
                 taskUrl: action.payload.taskUrl ?? c.taskUrl,
-                previousResponseId: action.payload.previousResponseId ?? c.previousResponseId,
+                previousResponseId:
+                  action.payload.previousResponseId ?? c.previousResponseId,
                 startedAt: action.payload.startedAt ?? c.startedAt,
                 completedAt: action.payload.completedAt ?? c.completedAt,
-                lastKnownOutputLength: action.payload.lastKnownOutputLength ?? c.lastKnownOutputLength,
+                lastKnownOutputLength:
+                  action.payload.lastKnownOutputLength ??
+                  c.lastKnownOutputLength,
                 updatedAt: Date.now(),
               }
-            : c
+            : c,
         ),
       };
     }
@@ -176,9 +222,9 @@ function conversationReducer(state: ConversationState, action: Action): Conversa
           // This prevents old turn messages from re-appearing in multi-turn.
           // We only check by ID — content dedup is removed because it was too
           // aggressive and caused legitimate new messages to be silently dropped.
-          const historicalIds = new Set(kept.map(m => m.id));
+          const historicalIds = new Set(kept.map((m) => m.id));
 
-          const newMessages = action.payload.messages.filter(m => {
+          const newMessages = action.payload.messages.filter((m) => {
             // Skip messages that were manually deleted
             if (m.id && deletedIds.has(m.id)) return false;
             // Steps placeholders always pass through (they get replaced each poll)
@@ -200,13 +246,14 @@ function conversationReducer(state: ConversationState, action: Action): Conversa
     case "UPDATE_TITLE": {
       // Safety net: always truncate title to 10 chars + ellipsis
       const rawTitle = action.payload.title || "新内容流程";
-      const safeTitle = rawTitle.length > 10 ? rawTitle.slice(0, 10) + "..." : rawTitle;
+      const safeTitle =
+        rawTitle.length > 10 ? rawTitle.slice(0, 10) + "..." : rawTitle;
       return {
         ...state,
         conversations: state.conversations.map((c) =>
           c.id === action.payload.conversationId
-            ? { ...c, title: safeTitle }
-            : c
+            ? { ...c, title: safeTitle, updatedAt: Date.now() }
+            : c,
         ),
       };
     }
@@ -217,22 +264,29 @@ function conversationReducer(state: ConversationState, action: Action): Conversa
           c.id === action.payload.conversationId
             ? {
                 ...c,
-                messages: c.messages.filter((m) => m.id !== action.payload.messageId),
-                deletedMessageIds: [...(c.deletedMessageIds || []), action.payload.messageId],
+                messages: c.messages.filter(
+                  (m) => m.id !== action.payload.messageId,
+                ),
+                deletedMessageIds: [
+                  ...(c.deletedMessageIds || []),
+                  action.payload.messageId,
+                ],
                 updatedAt: Date.now(),
               }
-            : c
+            : c,
         ),
       };
     }
     case "DELETE_CONVERSATION": {
-      const remaining = state.conversations.filter((c) => c.id !== action.payload);
+      const remaining = state.conversations.filter(
+        (c) => c.id !== action.payload,
+      );
       return {
         ...state,
         conversations: remaining,
         activeConversationId:
           state.activeConversationId === action.payload
-            ? remaining[0]?.id ?? null
+            ? (remaining[0]?.id ?? null)
             : state.activeConversationId,
       };
     }
@@ -244,85 +298,376 @@ function conversationReducer(state: ConversationState, action: Action): Conversa
   }
 }
 
-const STORAGE_KEY = "frontmind-client-conversations";
+export const LEGACY_CONVERSATION_STORAGE_KEY = "frontmind-client-conversations";
+const EMPTY_STATE: ConversationState = {
+  conversations: [],
+  activeConversationId: null,
+};
 
-function loadState(): ConversationState {
+function readLegacyState(): ConversationState | null {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY);
+    const stored = localStorage.getItem(LEGACY_CONVERSATION_STORAGE_KEY);
     if (stored) {
-      const parsed = JSON.parse(stored);
-      return parsed;
+      const parsed: unknown = JSON.parse(stored);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        Array.isArray((parsed as ConversationState).conversations)
+      ) {
+        return parsed as ConversationState;
+      }
     }
   } catch {
     // ignore
   }
-  return { conversations: [], activeConversationId: null };
+  return null;
+}
+
+function getTrpcErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const data = (error as { data?: { code?: unknown } }).data;
+  return typeof data?.code === "string" ? data.code : undefined;
 }
 
 /**
- * Strip non-serializable fields (File, blobUrl) from attachments before saving.
- * Also strips large base64 data to prevent localStorage quota issues.
+ * Convert an optimistic browser conversation into the JSON snapshot accepted by
+ * the server. Browser-only File/blob/base64 values and the legacy API-key
+ * fingerprint are deliberately excluded from cloud persistence.
  */
-function prepareStateForStorage(state: ConversationState, stripLargeBase64 = false): ConversationState {
+export function prepareConversationForCloud(
+  conversation: Conversation,
+): Conversation {
+  const { apiKeyFingerprint: _legacyFingerprint, ...cloudConversation } =
+    conversation;
+
   return {
-    ...state,
-    conversations: state.conversations.map((conv) => ({
-      ...conv,
-      messages: conv.messages.map((msg) => ({
-        ...msg,
-        attachments: msg.attachments?.map((att) => {
-          // Always strip non-serializable fields
-          const { file, blobUrl, ...rest } = att;
-          // Optionally strip large base64 to save space
-          if (stripLargeBase64 && rest.base64 && rest.base64.length > 100_000) {
-            return { ...rest, base64: undefined };
-          }
-          return rest;
-        }),
-      })),
+    ...cloudConversation,
+    messages: conversation.messages.map((message) => ({
+      ...message,
+      attachments: message.attachments?.map((attachment) => {
+        const {
+          file: _file,
+          blobUrl: _blobUrl,
+          base64: _base64,
+          ...metadata
+        } = attachment;
+        return metadata;
+      }),
+      inlineImages: message.inlineImages?.filter(
+        (image) =>
+          !image.src.startsWith("data:") && !image.src.startsWith("blob:"),
+      ),
     })),
   };
 }
 
-function saveState(state: ConversationState) {
-  try {
-    const cleanState = prepareStateForStorage(state);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(cleanState));
-  } catch (e: any) {
-    // If localStorage is full (QuotaExceededError), try saving without large base64 data
-    if (e?.name === "QuotaExceededError" || e?.code === 22) {
-      try {
-        const trimmedState = prepareStateForStorage(state, true);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmedState));
-      } catch {
-        // Last resort: ignore
-      }
-    }
-  }
+function normalizeConversation(conversation: Conversation): Conversation {
+  const toTimestamp = (value: unknown, fallback: number) => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    const parsed = new Date(value as string | Date).getTime();
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const now = Date.now();
+  const createdAt = toTimestamp(conversation.createdAt, now);
+
+  return {
+    ...conversation,
+    messages: Array.isArray(conversation.messages)
+      ? conversation.messages.map((message) => ({
+          ...message,
+          timestamp: toTimestamp(message.timestamp, createdAt),
+        }))
+      : [],
+    createdAt,
+    updatedAt: toTimestamp(conversation.updatedAt, createdAt),
+    startedAt:
+      conversation.startedAt === undefined
+        ? undefined
+        : toTimestamp(conversation.startedAt, createdAt),
+    completedAt:
+      conversation.completedAt === undefined
+        ? undefined
+        : toTimestamp(conversation.completedAt, createdAt),
+  };
 }
+
+interface ConversationMutation<TInput, TOutput> {
+  mutateAsync: (input: TInput) => Promise<TOutput>;
+}
+
+interface ConversationTrpcHooks {
+  list: {
+    useQuery: (
+      input: undefined,
+      options: {
+        enabled: boolean;
+        retry: boolean;
+        refetchOnWindowFocus: boolean;
+      },
+    ) => {
+      refetch: () => Promise<{
+        data?: Conversation[];
+        error?: unknown;
+      }>;
+    };
+  };
+  syncSnapshot: {
+    useMutation: () => ConversationMutation<
+      { conversation: Conversation },
+      Conversation
+    >;
+  };
+  delete: {
+    useMutation: () => ConversationMutation<{ id: string }, { success: true }>;
+  };
+  importLocal: {
+    useMutation: () => ConversationMutation<
+      { conversations: Conversation[] },
+      { imported: number; skipped: number }
+    >;
+  };
+}
+
+type ImportLocalResult = { imported: number; skipped: number };
 
 interface ConversationContextType {
   state: ConversationState;
   activeConversation: Conversation | null;
+  loading: boolean;
+  hydrated: boolean;
+  syncError: string | null;
+  hasLegacyConversations: boolean;
+  legacyConversationCount: number;
+  importingLegacyConversations: boolean;
   createConversation: () => string;
   setActive: (id: string) => void;
   addMessage: (conversationId: string, message: LocalMessage) => void;
-  updateStatus: (conversationId: string, status: Conversation["status"], extra?: { taskId?: string; taskUrl?: string; previousResponseId?: string; startedAt?: number; completedAt?: number; lastKnownOutputLength?: number }) => void;
-  updateAssistantMessages: (conversationId: string, messages: LocalMessage[]) => void;
+  updateStatus: (
+    conversationId: string,
+    status: Conversation["status"],
+    extra?: {
+      taskId?: string;
+      taskUrl?: string;
+      previousResponseId?: string;
+      startedAt?: number;
+      completedAt?: number;
+      lastKnownOutputLength?: number;
+    },
+  ) => void;
+  updateAssistantMessages: (
+    conversationId: string,
+    messages: LocalMessage[],
+  ) => void;
   updateTitle: (conversationId: string, title: string) => void;
   deleteConversation: (id: string) => void;
   deleteMessage: (conversationId: string, messageId: string) => void;
+  refreshConversations: () => Promise<void>;
+  importLegacyConversations: () => Promise<ImportLocalResult>;
+  discardLegacyConversations: () => void;
+  clearSyncError: () => void;
 }
 
 const ConversationContext = createContext<ConversationContextType | null>(null);
 
-export function ConversationProvider({ children }: { children: React.ReactNode }) {
-  const [state, dispatch] = useReducer(conversationReducer, undefined, loadState);
+export function ConversationProvider({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const auth = useAuth();
+  const authenticatedUser = auth.user as { id: number } | null;
+  const userId = authenticatedUser?.id ?? null;
+  const conversationApi = (
+    trpc as unknown as { conversation: ConversationTrpcHooks }
+  ).conversation;
+  const listQuery = conversationApi.list.useQuery(undefined, {
+    enabled: false,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  const syncSnapshotMutation = conversationApi.syncSnapshot.useMutation();
+  const deleteMutation = conversationApi.delete.useMutation();
+  const importLocalMutation = conversationApi.importLocal.useMutation();
 
-  // Persist state on every change
-  React.useEffect(() => {
-    saveState(state);
-  }, [state]);
+  const [state, dispatch] = useReducer(conversationReducer, EMPTY_STATE);
+  const stateRef = useRef(state);
+  const [hydrated, setHydrated] = useState(false);
+  const [hydrationLoading, setHydrationLoading] = useState(true);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [legacyState, setLegacyState] = useState<ConversationState | null>(() =>
+    readLegacyState(),
+  );
+  const [importingLegacyConversations, setImportingLegacyConversations] =
+    useState(false);
+  const accountIdRef = useRef<number | null>(null);
+  const hydrationGenerationRef = useRef(0);
+  const canSyncRef = useRef(false);
+  const listRefetchRef = useRef(listQuery.refetch);
+  const syncSnapshotRef = useRef(syncSnapshotMutation.mutateAsync);
+  const deleteRemoteRef = useRef(deleteMutation.mutateAsync);
+  const importLocalRef = useRef(importLocalMutation.mutateAsync);
+
+  listRefetchRef.current = listQuery.refetch;
+  syncSnapshotRef.current = syncSnapshotMutation.mutateAsync;
+  deleteRemoteRef.current = deleteMutation.mutateAsync;
+  importLocalRef.current = importLocalMutation.mutateAsync;
+
+  const syncQueueRef = useRef<ConversationSyncQueue<Conversation> | null>(null);
+  if (!syncQueueRef.current) {
+    syncQueueRef.current = new ConversationSyncQueue<Conversation>({
+      syncSnapshot: (conversation) => syncSnapshotRef.current({ conversation }),
+      deleteConversation: (id) => deleteRemoteRef.current({ id }),
+      onError: (error) => setSyncError(getErrorMessage(error)),
+      onSuccess: () => setSyncError(null),
+      shouldRetry: error => {
+        const code = getTrpcErrorCode(error);
+        return ![
+          "BAD_REQUEST",
+          "CONFLICT",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "PRECONDITION_FAILED",
+          "UNAUTHORIZED",
+        ].includes(code ?? "");
+      },
+      onPermanentError: (error, operation) => {
+        if (
+          getTrpcErrorCode(error) === "NOT_FOUND" &&
+          operation.kind === "snapshot"
+        ) {
+          const nextState = conversationReducer(stateRef.current, {
+            type: "DELETE_CONVERSATION",
+            payload: operation.conversation.id,
+          });
+          stateRef.current = nextState;
+          dispatch({ type: "LOAD_STATE", payload: nextState });
+          setSyncError(null);
+        }
+      },
+      debounceMs: 50,
+    });
+  }
+
+  const replaceState = useCallback((nextState: ConversationState) => {
+    stateRef.current = nextState;
+    dispatch({ type: "LOAD_STATE", payload: nextState });
+  }, []);
+
+  const commit = useCallback(
+    (action: Action, conversationIdsToSync: string[] = []) => {
+      const nextState = conversationReducer(stateRef.current, action);
+      replaceState(nextState);
+
+      if (!canSyncRef.current) return;
+      for (const conversationId of conversationIdsToSync) {
+        const conversation = nextState.conversations.find(
+          (candidate) => candidate.id === conversationId,
+        );
+        if (conversation) {
+          syncQueueRef.current!.enqueueSnapshot(
+            prepareConversationForCloud(conversation),
+          );
+        }
+      }
+    },
+    [replaceState],
+  );
+
+  const hydrateForUser = useCallback(
+    async (expectedUserId: number, initial: boolean) => {
+      const generation = ++hydrationGenerationRef.current;
+      if (initial) {
+        setHydrated(false);
+        setHydrationLoading(true);
+      }
+
+      try {
+        const result = await listRefetchRef.current();
+        if (result.error) throw result.error;
+        if (
+          accountIdRef.current !== expectedUserId ||
+          hydrationGenerationRef.current !== generation
+        ) {
+          return;
+        }
+
+        const remoteConversations = (result.data ?? []).map(
+          normalizeConversation,
+        );
+        // The workspace is already visible while its first conversation query
+        // is in flight. Preserve brand-new local conversations created during
+        // that short window, then persist them once hydration succeeds.
+        const remoteIds = new Set(
+          remoteConversations.map((conversation) => conversation.id),
+        );
+        const optimisticConversations = initial
+          ? stateRef.current.conversations.filter(
+              (conversation) => !remoteIds.has(conversation.id),
+            )
+          : [];
+        const conversations = [
+          ...optimisticConversations,
+          ...remoteConversations,
+        ];
+        const previousActiveId = stateRef.current.activeConversationId;
+        const activeConversationId = conversations.some(
+          (conversation) => conversation.id === previousActiveId,
+        )
+          ? previousActiveId
+          : (conversations[0]?.id ?? null);
+        replaceState({ conversations, activeConversationId });
+        setSyncError(null);
+        setHydrated(true);
+        canSyncRef.current = true;
+        for (const conversation of optimisticConversations) {
+          syncQueueRef.current!.enqueueSnapshot(
+            prepareConversationForCloud(conversation),
+            true,
+          );
+        }
+      } catch (error: unknown) {
+        if (
+          accountIdRef.current === expectedUserId &&
+          hydrationGenerationRef.current === generation
+        ) {
+          setSyncError(getErrorMessage(error));
+          if (initial) setHydrated(false);
+        }
+      } finally {
+        if (
+          accountIdRef.current === expectedUserId &&
+          hydrationGenerationRef.current === generation
+        ) {
+          setHydrationLoading(false);
+        }
+      }
+    },
+    [replaceState],
+  );
+
+  useEffect(() => {
+    if (auth.loading) return;
+
+    hydrationGenerationRef.current += 1;
+    syncQueueRef.current!.reset();
+    canSyncRef.current = false;
+    accountIdRef.current = userId;
+    replaceState(EMPTY_STATE);
+    setSyncError(null);
+
+    if (userId === null) {
+      setHydrated(false);
+      setHydrationLoading(false);
+      return;
+    }
+
+    setHydrationLoading(true);
+    void hydrateForUser(userId, true);
+  }, [auth.loading, hydrateForUser, replaceState, userId]);
+
+  useEffect(() => {
+    canSyncRef.current = hydrated && userId !== null;
+  }, [hydrated, userId]);
 
   const createConversation = useCallback(() => {
     const id = `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -333,73 +678,200 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
       status: "idle",
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      apiKeyFingerprint: getApiKeyFingerprint(),
     };
-    dispatch({ type: "NEW_CONVERSATION", payload: conversation });
+    const nextState = conversationReducer(stateRef.current, {
+      type: "NEW_CONVERSATION",
+      payload: conversation,
+    });
+    replaceState(nextState);
+    if (canSyncRef.current) {
+      syncQueueRef.current!.enqueueSnapshot(
+        prepareConversationForCloud(conversation),
+        true,
+      );
+    }
     return id;
-  }, []);
+  }, [replaceState]);
 
-  const setActive = useCallback((id: string) => {
-    dispatch({ type: "SET_ACTIVE", payload: id });
-  }, []);
+  const setActive = useCallback(
+    (id: string) => {
+      commit({ type: "SET_ACTIVE", payload: id });
+    },
+    [commit],
+  );
 
-  const addMessage = useCallback((conversationId: string, message: LocalMessage) => {
-    dispatch({ type: "ADD_MESSAGE", payload: { conversationId, message } });
-  }, []);
+  const addMessage = useCallback(
+    (conversationId: string, message: LocalMessage) => {
+      commit({ type: "ADD_MESSAGE", payload: { conversationId, message } }, [
+        conversationId,
+      ]);
+    },
+    [commit],
+  );
 
   const updateStatus = useCallback(
-    (conversationId: string, status: Conversation["status"], extra?: { taskId?: string; taskUrl?: string; previousResponseId?: string; startedAt?: number; completedAt?: number; lastKnownOutputLength?: number }) => {
-      dispatch({ type: "UPDATE_STATUS", payload: { conversationId, status, ...extra } });
+    (
+      conversationId: string,
+      status: Conversation["status"],
+      extra?: {
+        taskId?: string;
+        taskUrl?: string;
+        previousResponseId?: string;
+        startedAt?: number;
+        completedAt?: number;
+        lastKnownOutputLength?: number;
+      },
+    ) => {
+      commit(
+        {
+          type: "UPDATE_STATUS",
+          payload: { conversationId, status, ...extra },
+        },
+        [conversationId],
+      );
     },
-    []
+    [commit],
   );
 
   const updateAssistantMessages = useCallback(
     (conversationId: string, messages: LocalMessage[]) => {
-      dispatch({ type: "UPDATE_ASSISTANT_MESSAGES", payload: { conversationId, messages } });
+      commit(
+        {
+          type: "UPDATE_ASSISTANT_MESSAGES",
+          payload: { conversationId, messages },
+        },
+        [conversationId],
+      );
     },
-    []
+    [commit],
   );
 
-  const updateTitle = useCallback((conversationId: string, title: string) => {
-    dispatch({ type: "UPDATE_TITLE", payload: { conversationId, title } });
+  const updateTitle = useCallback(
+    (conversationId: string, title: string) => {
+      commit({ type: "UPDATE_TITLE", payload: { conversationId, title } }, [
+        conversationId,
+      ]);
+    },
+    [commit],
+  );
+
+  const deleteConversation = useCallback(
+    (id: string) => {
+      commit({ type: "DELETE_CONVERSATION", payload: id });
+      if (canSyncRef.current) syncQueueRef.current!.enqueueDelete(id);
+    },
+    [commit],
+  );
+
+  const deleteMessage = useCallback(
+    (conversationId: string, messageId: string) => {
+      commit(
+        { type: "DELETE_MESSAGE", payload: { conversationId, messageId } },
+        [conversationId],
+      );
+    },
+    [commit],
+  );
+
+  const refreshConversations = useCallback(async () => {
+    const expectedUserId = accountIdRef.current;
+    if (expectedUserId === null) return;
+    if (!hydrated) {
+      await hydrateForUser(expectedUserId, true);
+      return;
+    }
+    if (!canSyncRef.current) return;
+    const flushed = await syncQueueRef.current!.flushAll();
+    if (!flushed) return;
+    await hydrateForUser(expectedUserId, false);
+  }, [hydrateForUser, hydrated]);
+
+  const importLegacyConversations = useCallback(async () => {
+    if (!legacyState || accountIdRef.current === null || !hydrated) {
+      throw new Error("请先登录并等待云端对话加载完成");
+    }
+
+    setImportingLegacyConversations(true);
+    setSyncError(null);
+    try {
+      const conversations = legacyState.conversations.map((conversation) =>
+        prepareConversationForCloud(normalizeConversation(conversation)),
+      );
+      const result: ImportLocalResult = { imported: 0, skipped: 0 };
+      // The server caps each request by both conversation and upstream-resource
+      // count. Completed batches are idempotent, while the browser copy remains
+      // until every batch succeeds.
+      for (const batch of batchLegacyConversationImports(conversations)) {
+        const batchResult = await importLocalRef.current({
+          conversations: batch,
+        });
+        result.imported += batchResult.imported;
+        result.skipped += batchResult.skipped;
+      }
+      localStorage.removeItem(LEGACY_CONVERSATION_STORAGE_KEY);
+      setLegacyState(null);
+      await hydrateForUser(accountIdRef.current, false);
+      return result;
+    } catch (error: unknown) {
+      setSyncError(getErrorMessage(error));
+      throw error;
+    } finally {
+      setImportingLegacyConversations(false);
+    }
+  }, [hydrateForUser, hydrated, legacyState]);
+
+  const discardLegacyConversations = useCallback(() => {
+    localStorage.removeItem(LEGACY_CONVERSATION_STORAGE_KEY);
+    setLegacyState(null);
   }, []);
 
-  const deleteConversation = useCallback((id: string) => {
-    dispatch({ type: "DELETE_CONVERSATION", payload: id });
-  }, []);
+  const clearSyncError = useCallback(() => setSyncError(null), []);
 
-  const deleteMessage = useCallback((conversationId: string, messageId: string) => {
-    dispatch({ type: "DELETE_MESSAGE", payload: { conversationId, messageId } });
-  }, []);
+  const activeConversation =
+    state.conversations.find((c) => c.id === state.activeConversationId) ??
+    null;
 
-  const activeConversation = state.conversations.find((c) => c.id === state.activeConversationId) ?? null;
-
-  // Listen for API key changes and force a new workflow
   useEffect(() => {
-    const unsubscribe = apiKeyChangeEventBus.subscribe((newFingerprint: string) => {
-      console.log(`[ConversationProvider] API Key changed to ${newFingerprint}, creating new workflow`);
-      // Create a new conversation bound to the new key
-      const id = `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const conversation: Conversation = {
-        id,
-        title: "新内容流程",
-        messages: [],
-        status: "idle",
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        apiKeyFingerprint: newFingerprint,
-      };
-      dispatch({ type: "NEW_CONVERSATION", payload: conversation });
-    });
-    return unsubscribe;
-  }, []);
+    const handleFocus = () => void refreshConversations();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refreshConversations();
+      } else {
+        void syncQueueRef.current!.flushAll();
+      }
+    };
+    const handlePageHide = () => {
+      void syncQueueRef.current!.flushAll();
+    };
+
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("pagehide", handlePageHide);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("pagehide", handlePageHide);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [refreshConversations]);
+
+  useEffect(
+    () => () => {
+      syncQueueRef.current?.reset();
+    },
+    [],
+  );
 
   return (
     <ConversationContext.Provider
       value={{
         state,
         activeConversation,
+        loading: auth.loading || hydrationLoading,
+        hydrated,
+        syncError,
+        hasLegacyConversations: Boolean(legacyState?.conversations.length),
+        legacyConversationCount: legacyState?.conversations.length ?? 0,
+        importingLegacyConversations,
         createConversation,
         setActive,
         addMessage,
@@ -408,6 +880,10 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
         updateTitle,
         deleteConversation,
         deleteMessage,
+        refreshConversations,
+        importLegacyConversations,
+        discardLegacyConversations,
+        clearSyncError,
       }}
     >
       {children}
@@ -417,7 +893,8 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
 
 export function useConversation() {
   const ctx = useContext(ConversationContext);
-  if (!ctx) throw new Error("useConversation must be used within ConversationProvider");
+  if (!ctx)
+    throw new Error("useConversation must be used within ConversationProvider");
   return ctx;
 }
 
@@ -428,8 +905,11 @@ function getStepLabel(type: string, msg: OutputMessage): string {
   switch (type) {
     case "web_search_call": {
       // Try to extract the search query
-      const query = msg.action?.query || (msg as any).query || 
-                    (Array.isArray(msg.queries) && msg.queries[0]) || "";
+      const query =
+        msg.action?.query ||
+        (msg as any).query ||
+        (Array.isArray(msg.queries) && msg.queries[0]) ||
+        "";
       return query ? `搜索 ${query}` : "网络搜索";
     }
     case "file_search_call":
@@ -441,7 +921,8 @@ function getStepLabel(type: string, msg: OutputMessage): string {
         return `查看 ${action.url || "网页"}`;
       }
       if (action?.type === "click") return "点击操作";
-      if (action?.type === "type" || action?.type === "input") return "输入操作";
+      if (action?.type === "type" || action?.type === "input")
+        return "输入操作";
       if (action?.type === "scroll") return "滚动页面";
       if (action?.type === "screenshot") return "截图";
       return "浏览器操作";
@@ -451,8 +932,10 @@ function getStepLabel(type: string, msg: OutputMessage): string {
     case "function_call": {
       const name = msg.name || "";
       if (name.includes("search")) return `搜索 ${name}`;
-      if (name.includes("browse") || name.includes("navigate")) return `浏览 ${name}`;
-      if (name.includes("write") || name.includes("create")) return `撰写 ${name}`;
+      if (name.includes("browse") || name.includes("navigate"))
+        return `浏览 ${name}`;
+      if (name.includes("write") || name.includes("create"))
+        return `撰写 ${name}`;
       if (name.includes("read")) return `读取 ${name}`;
       return name ? `调用 ${name}` : "工具调用";
     }
@@ -482,15 +965,25 @@ function getStepLabel(type: string, msg: OutputMessage): string {
 /**
  * Get description text for an intermediate step
  */
-function getStepDescription(type: string, msg: OutputMessage): string | undefined {
+function getStepDescription(
+  type: string,
+  msg: OutputMessage,
+): string | undefined {
   switch (type) {
     case "web_search_call": {
-      const query = msg.action?.query || (msg as any).query ||
-                    (Array.isArray(msg.queries) && msg.queries[0]) || "";
+      const query =
+        msg.action?.query ||
+        (msg as any).query ||
+        (Array.isArray(msg.queries) && msg.queries[0]) ||
+        "";
       return query ? undefined : undefined;
     }
     case "reasoning": {
-      const summaryText = msg.summary?.map((s: any) => s.text).filter(Boolean).join("\n") || "";
+      const summaryText =
+        msg.summary
+          ?.map((s: any) => s.text)
+          .filter(Boolean)
+          .join("\n") || "";
       return summaryText || undefined;
     }
     case "computer_call": {
@@ -514,7 +1007,10 @@ function getStepDescription(type: string, msg: OutputMessage): string | undefine
           // Show a brief summary of the arguments
           const keys = Object.keys(parsed);
           if (keys.length > 0) {
-            return keys.map(k => `${k}: ${String(parsed[k]).slice(0, 50)}`).join(", ").slice(0, 150);
+            return keys
+              .map((k) => `${k}: ${String(parsed[k]).slice(0, 50)}`)
+              .join(", ")
+              .slice(0, 150);
           }
         } catch {
           return args.slice(0, 100);
@@ -530,7 +1026,9 @@ function getStepDescription(type: string, msg: OutputMessage): string | undefine
 /**
  * Determine the step icon type category
  */
-export function getStepIconType(type: string): "search" | "browse" | "code" | "write" | "reasoning" | "tool" {
+export function getStepIconType(
+  type: string,
+): "search" | "browse" | "code" | "write" | "reasoning" | "tool" {
   switch (type) {
     case "web_search_call":
     case "file_search_call":
@@ -549,7 +1047,12 @@ export function getStepIconType(type: string): "search" | "browse" | "code" | "w
     default:
       // Try to infer from type name
       if (type.includes("search")) return "search";
-      if (type.includes("browse") || type.includes("computer") || type.includes("navigate")) return "browse";
+      if (
+        type.includes("browse") ||
+        type.includes("computer") ||
+        type.includes("navigate")
+      )
+        return "browse";
       if (type.includes("code") || type.includes("interpreter")) return "code";
       if (type.includes("reason") || type.includes("think")) return "reasoning";
       if (type.includes("write") || type.includes("create")) return "write";
@@ -562,14 +1065,14 @@ export function getStepIconType(type: string): "search" | "browse" | "code" | "w
  */
 function inferGroupTitle(steps: IntermediateStep[]): string {
   if (steps.length === 0) return "处理中";
-  
-  const types = steps.map(s => getStepIconType(s.type));
+
+  const types = steps.map((s) => getStepIconType(s.type));
   const hasSearch = types.includes("search");
   const hasBrowse = types.includes("browse");
   const hasCode = types.includes("code");
   const hasWrite = types.includes("write");
   const hasReasoning = types.includes("reasoning");
-  
+
   if (hasSearch && hasBrowse) return "搜集信息与数据";
   if (hasSearch) return "搜索相关信息";
   if (hasBrowse) return "浏览网页内容";
@@ -583,14 +1086,17 @@ function inferGroupTitle(steps: IntermediateStep[]): string {
  * Build step groups from a flat list of intermediate steps.
  * Groups steps by their icon type category.
  */
-function buildStepGroups(steps: IntermediateStep[], descriptions: string[]): StepGroup[] {
+function buildStepGroups(
+  steps: IntermediateStep[],
+  descriptions: string[],
+): StepGroup[] {
   const stepGroups: StepGroup[] = [];
   if (steps.length === 0) return stepGroups;
 
   // Group steps by their icon type category
   let currentGroup: IntermediateStep[] = [];
   let lastCategory = "";
-  
+
   for (const step of steps) {
     const category = getStepIconType(step.type);
     if (lastCategory && category !== lastCategory && currentGroup.length > 0) {
@@ -599,7 +1105,8 @@ function buildStepGroups(steps: IntermediateStep[], descriptions: string[]): Ste
         id: `grp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         title: inferGroupTitle(currentGroup),
         steps: currentGroup,
-        description: descriptions.length > 0 ? descriptions.join("\n") : undefined,
+        description:
+          descriptions.length > 0 ? descriptions.join("\n") : undefined,
       });
       currentGroup = [];
       descriptions = [];
@@ -607,14 +1114,15 @@ function buildStepGroups(steps: IntermediateStep[], descriptions: string[]): Ste
     currentGroup.push(step);
     lastCategory = category;
   }
-  
+
   // Push the last group
   if (currentGroup.length > 0) {
     stepGroups.push({
       id: `grp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       title: inferGroupTitle(currentGroup),
       steps: currentGroup,
-      description: descriptions.length > 0 ? descriptions.join("\n") : undefined,
+      description:
+        descriptions.length > 0 ? descriptions.join("\n") : undefined,
     });
   }
 
@@ -627,7 +1135,7 @@ function buildStepGroups(steps: IntermediateStep[], descriptions: string[]): Ste
 function isIntermediateStepType(type: string): boolean {
   // "message" is a regular message, everything else is an intermediate step
   if (type === "message") return false;
-  
+
   // Known intermediate step types
   const knownStepTypes = [
     "reasoning",
@@ -641,14 +1149,19 @@ function isIntermediateStepType(type: string): boolean {
     "mcp_list_tools",
     "mcp_approval_request",
   ];
-  
+
   if (knownStepTypes.includes(type)) return true;
-  
+
   // Heuristic: if the type contains "call", "search", "reason", "tool", it's likely a step
-  if (type.includes("call") || type.includes("search") || type.includes("reason") || type.includes("tool")) {
+  if (
+    type.includes("call") ||
+    type.includes("search") ||
+    type.includes("reason") ||
+    type.includes("tool")
+  ) {
     return true;
   }
-  
+
   // Default: treat unknown non-message types as intermediate steps
   return true;
 }
@@ -699,34 +1212,44 @@ function normalizeFileUrl(url: string): string {
  * Parse FrontMind API output messages into local messages
  * Handles both OpenAI Responses API format and native FrontMind API format.
  * Now also extracts intermediate steps from non-message output items.
- * 
+ *
  * INTERMEDIATE STEPS FIX: Enhanced to properly handle:
  * 1. Non-message output types (reasoning, web_search_call, computer_call, etc.)
  * 2. Steps-only polls (when no assistant message has arrived yet)
  * 3. Proper grouping and display of step sequences
  */
-export function parseOutputMessages(output: OutputMessage[], responseStartedAt?: number, modelName?: string): LocalMessage[] {
+export function parseOutputMessages(
+  output: OutputMessage[],
+  responseStartedAt?: number,
+  modelName?: string,
+): LocalMessage[] {
   try {
     return _parseOutputMessagesInner(output, responseStartedAt, modelName);
   } catch (e) {
     console.error("[parseOutputMessages] Unexpected error:", e);
     // Return a safe fallback message so the UI doesn't crash
-    return [{
-      id: `msg-err-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      role: "assistant",
-      content: "",
-      timestamp: Date.now(),
-      responseStartedAt,
-      modelName,
-    }];
+    return [
+      {
+        id: `msg-err-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        role: "assistant",
+        content: "",
+        timestamp: Date.now(),
+        responseStartedAt,
+        modelName,
+      },
+    ];
   }
 }
 
-function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: number, modelName?: string): LocalMessage[] {
+function _parseOutputMessagesInner(
+  output: OutputMessage[],
+  responseStartedAt?: number,
+  modelName?: string,
+): LocalMessage[] {
   if (!output || !Array.isArray(output)) return [];
 
   const messages: LocalMessage[] = [];
-  
+
   // Collect intermediate steps that appear before each assistant message
   let pendingSteps: IntermediateStep[] = [];
   // Also collect reasoning/description text between steps
@@ -734,26 +1257,26 @@ function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: 
 
   for (const msg of output) {
     const msgType = msg.type || "message";
-    
+
     // Check if this is an intermediate step (non-message type)
     if (isIntermediateStepType(msgType)) {
       const step: IntermediateStep = {
-        id: msg.id || `step-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        id:
+          msg.id ||
+          `step-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         type: msgType,
         label: getStepLabel(msgType, msg),
         description: getStepDescription(msgType, msg),
       };
-      
+
       // For reasoning type, also extract the text as description
       if (msgType === "reasoning" && msg.summary) {
-        const summaryTexts = msg.summary
-          .map((s) => s.text)
-          .filter(Boolean);
+        const summaryTexts = msg.summary.map((s) => s.text).filter(Boolean);
         if (summaryTexts.length > 0) {
           pendingDescriptions.push(summaryTexts.join(" "));
         }
       }
-      
+
       pendingSteps.push(step);
       continue;
     }
@@ -761,7 +1284,8 @@ function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: 
     // This is a regular message
     if (msg.role === "assistant") {
       const textParts: string[] = [];
-      const files: { fileUrl: string; fileName: string; mimeType: string }[] = [];
+      const files: { fileUrl: string; fileName: string; mimeType: string }[] =
+        [];
       const inlineImages: { src: string; alt?: string }[] = [];
       const contentSteps: IntermediateStep[] = [];
 
@@ -773,7 +1297,8 @@ function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: 
         }
       } else if (!rawContent || !Array.isArray(rawContent)) {
         // Try to extract text from the message object itself (fallback)
-        const fallbackText = (msg as any).text || (msg as any).message || (msg as any).output;
+        const fallbackText =
+          (msg as any).text || (msg as any).message || (msg as any).output;
         if (typeof fallbackText === "string" && fallbackText.trim()) {
           textParts.push(fallbackText);
         }
@@ -783,7 +1308,7 @@ function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: 
         // there are steps, files, or images.
       } else {
         // msg.content is an array
-        for (const content of (rawContent as any[])) {
+        for (const content of rawContent as any[]) {
           if (!content) continue;
 
           // Handle plain string content items
@@ -800,7 +1325,10 @@ function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: 
           const mimeType = c.mimeType || c.mime_type || c.content_type || "";
           const textValue = c.text ?? c.value ?? null;
 
-          if ((contentType === "output_file" || contentType === "file") && fileUrl) {
+          if (
+            (contentType === "output_file" || contentType === "file") &&
+            fileUrl
+          ) {
             // Normalize file URL: route external API URLs through our proxy for auth
             const normalizedFileUrl = normalizeFileUrl(fileUrl);
             // Check if it's an image file
@@ -816,7 +1344,10 @@ function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: 
                 mimeType: mimeType || "application/octet-stream",
               });
             }
-          } else if ((contentType === "output_image" || contentType === "image") && fileUrl) {
+          } else if (
+            (contentType === "output_image" || contentType === "image") &&
+            fileUrl
+          ) {
             const normalizedFileUrl = normalizeFileUrl(fileUrl);
             inlineImages.push({
               src: normalizedFileUrl,
@@ -855,37 +1386,62 @@ function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: 
 
       // Merge content-level steps with pending output-level steps
       const allSteps = [...pendingSteps, ...contentSteps];
-      
+
       // Build step groups from the collected steps
       const stepGroups = buildStepGroups(allSteps, [...pendingDescriptions]);
 
-      if (textParts.length > 0 || files.length > 0 || inlineImages.length > 0 || allSteps.length > 0) {
+      if (
+        textParts.length > 0 ||
+        files.length > 0 ||
+        inlineImages.length > 0 ||
+        allSteps.length > 0
+      ) {
         messages.push({
-          id: msg.id || `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          id:
+            msg.id ||
+            `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           role: "assistant",
-          content: textParts.length > 0 ? sanitizeBrandText(textParts.join("\n\n")) : "",
+          content:
+            textParts.length > 0
+              ? sanitizeBrandText(textParts.join("\n\n"))
+              : "",
           timestamp: Date.now(),
-          outputFiles: files.length > 0 ? files.map(f => ({
-            ...f,
-            fileName: sanitizeBrandText(f.fileName),
-          })) : undefined,
+          outputFiles:
+            files.length > 0
+              ? files.map((f) => ({
+                  ...f,
+                  fileName: sanitizeBrandText(f.fileName),
+                }))
+              : undefined,
           inlineImages: inlineImages.length > 0 ? inlineImages : undefined,
           responseStartedAt,
-          intermediateSteps: allSteps.length > 0 ? allSteps.map(s => ({
-            ...s,
-            label: sanitizeBrandText(s.label),
-            description: s.description ? sanitizeBrandText(s.description) : undefined,
-          })) : undefined,
-          stepGroups: stepGroups.length > 0 ? stepGroups.map(g => ({
-            ...g,
-            title: sanitizeBrandText(g.title),
-            description: g.description ? sanitizeBrandText(g.description) : undefined,
-            steps: g.steps.map(s => ({
-              ...s,
-              label: sanitizeBrandText(s.label),
-              description: s.description ? sanitizeBrandText(s.description) : undefined,
-            })),
-          })) : undefined,
+          intermediateSteps:
+            allSteps.length > 0
+              ? allSteps.map((s) => ({
+                  ...s,
+                  label: sanitizeBrandText(s.label),
+                  description: s.description
+                    ? sanitizeBrandText(s.description)
+                    : undefined,
+                }))
+              : undefined,
+          stepGroups:
+            stepGroups.length > 0
+              ? stepGroups.map((g) => ({
+                  ...g,
+                  title: sanitizeBrandText(g.title),
+                  description: g.description
+                    ? sanitizeBrandText(g.description)
+                    : undefined,
+                  steps: g.steps.map((s) => ({
+                    ...s,
+                    label: sanitizeBrandText(s.label),
+                    description: s.description
+                      ? sanitizeBrandText(s.description)
+                      : undefined,
+                  })),
+                }))
+              : undefined,
           modelName,
         });
       }
@@ -909,19 +1465,25 @@ function _parseOutputMessagesInner(output: OutputMessage[], responseStartedAt?: 
       content: "",
       timestamp: Date.now(),
       responseStartedAt,
-      intermediateSteps: pendingSteps.map(s => ({
+      intermediateSteps: pendingSteps.map((s) => ({
         ...s,
         label: sanitizeBrandText(s.label),
-        description: s.description ? sanitizeBrandText(s.description) : undefined,
+        description: s.description
+          ? sanitizeBrandText(s.description)
+          : undefined,
       })),
-      stepGroups: stepGroups.map(g => ({
+      stepGroups: stepGroups.map((g) => ({
         ...g,
         title: sanitizeBrandText(g.title),
-        description: g.description ? sanitizeBrandText(g.description) : undefined,
-        steps: g.steps.map(s => ({
+        description: g.description
+          ? sanitizeBrandText(g.description)
+          : undefined,
+        steps: g.steps.map((s) => ({
           ...s,
           label: sanitizeBrandText(s.label),
-          description: s.description ? sanitizeBrandText(s.description) : undefined,
+          description: s.description
+            ? sanitizeBrandText(s.description)
+            : undefined,
         })),
       })),
       isStepsPlaceholder: true,
@@ -944,7 +1506,10 @@ function extractInlineImages(text: string): { src: string; alt?: string }[] {
   try {
     // Skip extraction for very large strings (>500KB) to avoid regex performance issues
     if (text.length > 500_000) {
-      console.warn("[extractInlineImages] Skipping extraction for very large text:", text.length);
+      console.warn(
+        "[extractInlineImages] Skipping extraction for very large text:",
+        text.length,
+      );
       return images;
     }
 
@@ -960,7 +1525,7 @@ function extractInlineImages(text: string): { src: string; alt?: string }[] {
     const dataUriRegex = /(data:image\/[^;]+;base64,[A-Za-z0-9+/=]{50,})/g;
     while ((match = dataUriRegex.exec(text)) !== null) {
       // Avoid duplicates from the first regex
-      if (!images.some(img => img.src === match![1])) {
+      if (!images.some((img) => img.src === match![1])) {
         images.push({ src: match[1], alt: "Image" });
       }
     }

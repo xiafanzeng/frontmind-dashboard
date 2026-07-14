@@ -13,7 +13,6 @@ import {
   uploadFile,
   fileToBase64,
   creditEventBus,
-  getApiKeyFingerprint,
   type ContentItem,
   type Message,
   type OutputMessage,
@@ -430,24 +429,6 @@ export function useSendMessage() {
         if (!convId) {
           convId = createConversation();
           conv = null;
-        }
-
-        // ── API Key / Workflow ownership check ──
-        // If the current conversation was created with a different API key,
-        // block the send and force the user to use a new workflow.
-        const currentFingerprint = getApiKeyFingerprint();
-        if (
-          conv &&
-          conv.apiKeyFingerprint &&
-          currentFingerprint &&
-          conv.apiKeyFingerprint !== currentFingerprint
-        ) {
-          toast.error("API Key 已更换，无法在旧内容流程中继续", {
-            description:
-              "请点击左侧「新内容流程」按钮创建新的内容流程后再发送消息",
-            duration: 6000,
-          });
-          return;
         }
 
         const baselineOutputLength = conv?.lastKnownOutputLength || 0;

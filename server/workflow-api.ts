@@ -2,7 +2,13 @@ import { randomUUID } from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import axios from "axios";
-import express, { Router } from "express";
+import express, {
+  Router,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from "express";
 import JSZip from "jszip";
 import type {
   WorkflowStepLoadRequest,
@@ -18,11 +24,24 @@ import {
   workflowManifest,
 } from "./workflow/manifest";
 import { getFrontMindCredentials, toUpstreamAgentProfile } from "./upstream-config";
+import { recordUpstreamResource } from "./auth-service";
+import {
+  assertSafeExternalUrl,
+  safeExternalRequestOptions,
+} from "./_core/safe-external-url";
 
 const router = Router();
 const uploadsRoot = path.resolve(process.cwd(), ".workflow-uploads");
 const uploadIndexName = "index.json";
 const defaultUploadRetentionMs = 24 * 60 * 60 * 1000;
+
+function asyncRoute(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<unknown>,
+): RequestHandler {
+  return (req, res, next) => {
+    void handler(req, res, next).catch(next);
+  };
+}
 
 interface StoredWorkflowUploadedFile extends WorkflowUploadedFile {
   storedName: string;
@@ -49,9 +68,10 @@ function safeDecodeHeader(value: string) {
   }
 }
 
-function getUploadDir(runId: string, stepId: string) {
+function getUploadDir(userId: number, runId: string, stepId: string) {
   return path.join(
     uploadsRoot,
+    String(userId),
     sanitizeSegment(runId, "run"),
     sanitizeSegment(stepId, "step")
   );
@@ -68,8 +88,8 @@ function toPublicUpload(file: StoredWorkflowUploadedFile): WorkflowUploadedFile 
   };
 }
 
-async function readUploadIndex(runId: string, stepId: string) {
-  const indexPath = path.join(getUploadDir(runId, stepId), uploadIndexName);
+async function readUploadIndex(userId: number, runId: string, stepId: string) {
+  const indexPath = path.join(getUploadDir(userId, runId, stepId), uploadIndexName);
   try {
     const raw = await fs.readFile(indexPath, "utf-8");
     const parsed = JSON.parse(raw) as StoredWorkflowUploadedFile[];
@@ -79,8 +99,13 @@ async function readUploadIndex(runId: string, stepId: string) {
   }
 }
 
-async function writeUploadIndex(runId: string, stepId: string, files: StoredWorkflowUploadedFile[]) {
-  const uploadDir = getUploadDir(runId, stepId);
+async function writeUploadIndex(
+  userId: number,
+  runId: string,
+  stepId: string,
+  files: StoredWorkflowUploadedFile[],
+) {
+  const uploadDir = getUploadDir(userId, runId, stepId);
   await fs.mkdir(uploadDir, { recursive: true });
   await fs.writeFile(path.join(uploadDir, uploadIndexName), JSON.stringify(files, null, 2), "utf-8");
 }
@@ -89,23 +114,34 @@ export async function cleanupStaleWorkflowUploads() {
   const retentionMs = Number(process.env.FRONTMIND_WORKFLOW_UPLOAD_TTL_MS || defaultUploadRetentionMs);
   if (!Number.isFinite(retentionMs) || retentionMs <= 0) return;
 
-  let entries;
+  let userEntries;
   try {
-    entries = await fs.readdir(uploadsRoot, { withFileTypes: true });
+    userEntries = await fs.readdir(uploadsRoot, { withFileTypes: true });
   } catch {
     return;
   }
 
   const cutoff = Date.now() - retentionMs;
   await Promise.all(
-    entries
-      .filter((entry) => entry.isDirectory())
-      .map(async (entry) => {
-        const runPath = path.join(uploadsRoot, entry.name);
+    userEntries
+      .filter(entry => entry.isDirectory())
+      .map(async userEntry => {
+        const userPath = path.join(uploadsRoot, userEntry.name);
         try {
-          const stat = await fs.stat(runPath);
-          if (stat.mtimeMs < cutoff) {
-            await fs.rm(runPath, { recursive: true, force: true });
+          const runEntries = await fs.readdir(userPath, { withFileTypes: true });
+          await Promise.all(
+            runEntries
+              .filter(entry => entry.isDirectory())
+              .map(async runEntry => {
+                const runPath = path.join(userPath, runEntry.name);
+                const stat = await fs.stat(runPath);
+                if (stat.mtimeMs < cutoff) {
+                  await fs.rm(runPath, { recursive: true, force: true });
+                }
+              }),
+          );
+          if ((await fs.readdir(userPath)).length === 0) {
+            await fs.rmdir(userPath);
           }
         } catch {
           // Ignore cleanup races.
@@ -114,8 +150,8 @@ export async function cleanupStaleWorkflowUploads() {
   );
 }
 
-async function listPublicUploads(runId: string, stepId: string) {
-  const files = await readUploadIndex(runId, stepId);
+async function listPublicUploads(userId: number, runId: string, stepId: string) {
+  const files = await readUploadIndex(userId, runId, stepId);
   return files.map(toPublicUpload);
 }
 
@@ -211,6 +247,7 @@ function buildCurrentStepGateMarkdown(step: NonNullable<ReturnType<typeof getPri
 }
 
 async function buildExecutionBundle(
+  userId: number,
   step: NonNullable<ReturnType<typeof getPrivateWorkflowStep>>,
   runId: string,
   body: WorkflowStepLoadRequest,
@@ -224,8 +261,8 @@ async function buildExecutionBundle(
   const zip = new JSZip();
   await addPathToZip(zip, workflowRoot, ".");
 
-  const storedUploads = await readUploadIndex(runId, step.id);
-  const uploadDir = getUploadDir(runId, step.id);
+  const storedUploads = await readUploadIndex(userId, runId, step.id);
+  const uploadDir = getUploadDir(userId, runId, step.id);
   for (const upload of storedUploads) {
     const uploadPath = path.join(uploadDir, upload.storedName);
     const buffer = await fs.readFile(uploadPath);
@@ -285,16 +322,21 @@ async function uploadBufferToFrontMind(
     throw new Error("Create file record failed: missing file id or upload url");
   }
 
-  const uploadResponse = await axios.put(fileRecord.upload_url, buffer, {
+  const uploadResponse = await axios.put(
+    assertSafeExternalUrl(fileRecord.upload_url),
+    buffer,
+    {
+    ...safeExternalRequestOptions,
     headers: {
       "Content-Type": contentType,
       "Content-Length": String(buffer.length),
     },
     timeout: 300000,
-    maxBodyLength: Infinity,
-    maxContentLength: Infinity,
+    maxBodyLength: buffer.length,
+    maxContentLength: 1024 * 1024,
     validateStatus: () => true,
-  });
+    },
+  );
 
   if (uploadResponse.status < 200 || uploadResponse.status >= 300) {
     throw new Error(`Upload file failed (${uploadResponse.status})`);
@@ -304,13 +346,14 @@ async function uploadBufferToFrontMind(
 }
 
 async function uploadStoredUserFiles(
+  userId: number,
   baseUrl: string,
   apiKey: string,
   runId: string,
   stepId: string
 ) {
-  const storedUploads = await readUploadIndex(runId, stepId);
-  const uploadDir = getUploadDir(runId, stepId);
+  const storedUploads = await readUploadIndex(userId, runId, stepId);
+  const uploadDir = getUploadDir(userId, runId, stepId);
   const attachments: Array<{ file_id: string; filename: string }> = [];
 
   for (const upload of storedUploads) {
@@ -355,25 +398,38 @@ router.get("/manifest", (_req, res) => {
   res.json(workflowManifest);
 });
 
-router.delete("/runs/:runId", async (req, res) => {
+router.delete("/runs/:runId", asyncRoute(async (req, res) => {
   const runId = sanitizeSegment(String(req.params.runId || ""), "");
   if (!runId) {
     res.status(400).json({ error: "Missing run id" });
     return;
   }
 
-  await fs.rm(path.join(uploadsRoot, runId), { recursive: true, force: true });
+  const userId = req.frontmindUser?.id;
+  if (!userId) {
+    res.status(401).json({ error: "请先登录" });
+    return;
+  }
+  await fs.rm(path.join(uploadsRoot, String(userId), runId), {
+    recursive: true,
+    force: true,
+  });
   res.json({ success: true });
-});
+}));
 
 router.post(
   "/runs/:runId/steps/:stepId/uploads",
   express.raw({ type: "application/octet-stream", limit: "100mb" }),
-  async (req, res) => {
+  asyncRoute(async (req, res) => {
     const runId = sanitizeSegment(String(req.params.runId || ""), `wf_${randomUUID()}`);
     const stepId = String(req.params.stepId || "");
     const step = getPrivateWorkflowStep(stepId);
+    const userId = req.frontmindUser?.id;
 
+    if (!userId) {
+      res.status(401).json({ error: "请先登录" });
+      return;
+    }
     if (!step) {
       res.status(404).json({ error: "Unknown workflow step" });
       return;
@@ -388,7 +444,7 @@ router.post(
     const contentType = String(req.header("x-file-type") || "application/octet-stream");
     const id = randomUUID();
     const storedName = `${id}_${originalName}`;
-    const uploadDir = getUploadDir(runId, step.id);
+    const uploadDir = getUploadDir(userId, runId, step.id);
     await fs.mkdir(uploadDir, { recursive: true });
     await fs.writeFile(path.join(uploadDir, storedName), req.body);
 
@@ -402,9 +458,9 @@ router.post(
       uploadedAt: new Date().toISOString(),
     };
 
-    const index = await readUploadIndex(runId, step.id);
+    const index = await readUploadIndex(userId, runId, step.id);
     index.push(file);
-    await writeUploadIndex(runId, step.id, index);
+    await writeUploadIndex(userId, runId, step.id, index);
 
     const response: WorkflowUploadResponse = {
       runId,
@@ -413,14 +469,19 @@ router.post(
     };
 
     res.json(response);
-  }
+  })
 );
 
-router.post("/steps/:stepId/load", async (req, res) => {
+router.post("/steps/:stepId/load", asyncRoute(async (req, res) => {
   const stepId = String(req.params.stepId || "");
   const body = (req.body || {}) as WorkflowStepLoadRequest;
   const loadedPackage = await loadPrivateSkillPackage(stepId);
+  const userId = req.frontmindUser?.id;
 
+  if (!userId) {
+    res.status(401).json({ error: "请先登录" });
+    return;
+  }
   if (!loadedPackage) {
     res.status(404).json({ error: "Unknown workflow step" });
     return;
@@ -431,7 +492,7 @@ router.post("/steps/:stepId/load", async (req, res) => {
   const hasOperatorNotes =
     typeof body.operatorNotes === "string" && body.operatorNotes.trim().length > 0;
   const loaded = loadedPackage.loaded;
-  const contextUploads = await listPublicUploads(runId, stepId);
+  const contextUploads = await listPublicUploads(userId, runId, stepId);
   const uploadMessages =
     contextUploads.length > 0
       ? [`已纳入 ${contextUploads.length} 个上传文件：${contextUploads.map((file) => file.name).join("、")}。`]
@@ -473,14 +534,19 @@ router.post("/steps/:stepId/load", async (req, res) => {
   };
 
   res.json(response);
-});
+}));
 
-router.post("/steps/:stepId/execute", async (req, res) => {
+router.post("/steps/:stepId/execute", asyncRoute(async (req, res) => {
   const stepId = String(req.params.stepId || "");
   const body = (req.body || {}) as WorkflowStepLoadRequest & { agentProfile?: string };
   const loadedPackage = await loadPrivateSkillPackage(stepId);
   const step = getPrivateWorkflowStep(stepId);
+  const userId = req.frontmindUser?.id;
 
+  if (!userId) {
+    res.status(401).json({ error: "请先登录" });
+    return;
+  }
   if (!loadedPackage || !step) {
     res.status(404).json({ error: "Unknown workflow step" });
     return;
@@ -496,10 +562,16 @@ router.post("/steps/:stepId/execute", async (req, res) => {
   const sessionId = `exec_${stepId}_${randomUUID()}`;
   const hasOperatorNotes =
     typeof body.operatorNotes === "string" && body.operatorNotes.trim().length > 0;
-  const contextUploads = await listPublicUploads(runId, stepId);
+  const contextUploads = await listPublicUploads(userId, runId, stepId);
 
   try {
-    const bundle = await buildExecutionBundle(step, runId, body, contextUploads);
+    const bundle = await buildExecutionBundle(
+      userId,
+      step,
+      runId,
+      body,
+      contextUploads,
+    );
     const bundleFile = await uploadBufferToFrontMind(
       baseUrl,
       apiKey,
@@ -507,11 +579,30 @@ router.post("/steps/:stepId/execute", async (req, res) => {
       bundle,
       "application/zip"
     );
-    const userFileAttachments = await uploadStoredUserFiles(baseUrl, apiKey, runId, stepId);
+    const userFileAttachments = await uploadStoredUserFiles(
+      userId,
+      baseUrl,
+      apiKey,
+      runId,
+      stepId,
+    );
     const attachments = [
       { filename: bundleFile.filename, file_id: bundleFile.fileId },
       ...userFileAttachments,
     ];
+
+    if (!req.frontmindUser || !req.frontmindCredential) {
+      res.status(401).json({ error: "请先登录并配置 API Key" });
+      return;
+    }
+    for (const attachment of attachments) {
+      await recordUpstreamResource({
+        userId: req.frontmindUser.id,
+        apiCredentialId: req.frontmindCredential.id,
+        kind: "file",
+        upstreamId: attachment.file_id,
+      });
+    }
 
     const taskResponse = await axios.post(
       `${baseUrl}/v1/tasks`,
@@ -548,6 +639,12 @@ router.post("/steps/:stepId/execute", async (req, res) => {
       res.status(502).json({ error: "Create task failed: missing task id" });
       return;
     }
+    await recordUpstreamResource({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      kind: "task",
+      upstreamId: String(taskId),
+    });
     const normalizedStatus = taskData.status === "failed" ? "error" : (taskData.status || "running");
     const uploadMessages =
       contextUploads.length > 0
@@ -602,6 +699,6 @@ router.post("/steps/:stepId/execute", async (req, res) => {
     console.error("[Workflow Execute] error:", error.message);
     res.status(500).json({ error: "执行任务失败，请稍后重试" });
   }
-});
+}));
 
 export default router;

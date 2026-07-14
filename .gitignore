@@ -3,3 +3,7 @@ node_modules/
 .astro/
 .vite/
 *.log
+.env
+.env.*
+!.env.example
+.workflow-uploads/

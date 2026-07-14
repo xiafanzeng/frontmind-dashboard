@@ -2,12 +2,980 @@
 import "dotenv/config";
 import express3 from "express";
 import { createServer } from "http";
-import net2 from "net";
+import { sql } from "drizzle-orm";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
+
+// server/admin-router.ts
+import { z as z2 } from "zod";
+
+// server/_core/trpc.ts
+import { initTRPC, TRPCError } from "@trpc/server";
+import superjson from "superjson";
+var t = initTRPC.context().create({
+  transformer: superjson
+});
+var router = t.router;
+var publicProcedure = t.procedure;
+var protectedProcedure = t.procedure.use(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({ code: "UNAUTHORIZED", message: "Please log in" });
+  }
+  return next({ ctx: { ...ctx, user: ctx.user } });
+});
+var adminProcedure = protectedProcedure.use(({ ctx, next }) => {
+  if (ctx.user.role !== "admin") {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "Administrator permission is required"
+    });
+  }
+  return next({ ctx });
+});
+
+// server/auth-service.ts
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+  randomUUID,
+  scrypt as nodeScrypt,
+  timingSafeEqual
+} from "node:crypto";
+import { parse as parseCookieHeader } from "cookie";
+import {
+  and,
+  desc,
+  eq as eq2,
+  gt,
+  isNull,
+  ne
+} from "drizzle-orm";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
 var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
+
+// drizzle/schema.ts
+import {
+  boolean,
+  index,
+  int,
+  json,
+  longtext,
+  mysqlEnum,
+  mysqlTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  varchar
+} from "drizzle-orm/mysql-core";
+var users = mysqlTable(
+  "users",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    openId: varchar("openId", { length: 64 }).unique(),
+    username: varchar("username", { length: 64 }).unique(),
+    passwordHash: varchar("passwordHash", { length: 255 }),
+    displayName: varchar("displayName", { length: 128 }),
+    // Legacy profile fields retained for a safe additive migration.
+    name: text("name"),
+    email: varchar("email", { length: 320 }),
+    loginMethod: varchar("loginMethod", { length: 64 }),
+    role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+    isActive: boolean("isActive").default(true).notNull(),
+    passwordChangedAt: timestamp("passwordChangedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+    lastSignedIn: timestamp("lastSignedIn")
+  },
+  (table) => [index("users_active_role_idx").on(table.isActive, table.role)]
+);
+var sessions = mysqlTable(
+  "sessions",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    tokenHash: varchar("tokenHash", { length: 64 }).notNull().unique(),
+    expiresAt: timestamp("expiresAt").notNull(),
+    lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(),
+    revokedAt: timestamp("revokedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    index("sessions_user_expires_idx").on(table.userId, table.expiresAt),
+    index("sessions_token_active_idx").on(table.tokenHash, table.revokedAt)
+  ]
+);
+var apiCredentials = mysqlTable(
+  "api_credentials",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    version: int("version").notNull(),
+    encryptionVersion: int("encryptionVersion").default(1).notNull(),
+    encryptedKey: text("encryptedKey").notNull(),
+    encryptionIv: varchar("encryptionIv", { length: 32 }).notNull(),
+    encryptionAuthTag: varchar("encryptionAuthTag", { length: 32 }).notNull(),
+    fingerprint: varchar("fingerprint", { length: 32 }).notNull(),
+    status: mysqlEnum("status", ["active", "retired", "deleted"]).default("active").notNull(),
+    validationStatus: mysqlEnum("validationStatus", [
+      "unverified",
+      "verified",
+      "invalid"
+    ]).default("unverified").notNull(),
+    verifiedAt: timestamp("verifiedAt"),
+    retiredAt: timestamp("retiredAt"),
+    deletedAt: timestamp("deletedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("api_credentials_user_version_uq").on(
+      table.userId,
+      table.version
+    ),
+    index("api_credentials_user_status_idx").on(table.userId, table.status)
+  ]
+);
+var apiKeyOwnership = mysqlTable(
+  "api_key_ownership",
+  {
+    fingerprint: varchar("fingerprint", { length: 32 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [index("api_key_ownership_user_idx").on(table.userId)]
+);
+var conversations = mysqlTable(
+  "conversations",
+  {
+    // Client-generated IDs are retained during the one-time local import.
+    id: varchar("id", { length: 191 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).references(
+      () => apiCredentials.id,
+      { onDelete: "set null" }
+    ),
+    title: varchar("title", { length: 255 }).notNull(),
+    status: mysqlEnum("status", [
+      "idle",
+      "running",
+      "pending",
+      "completed",
+      "error",
+      "failed",
+      "archived"
+    ]).default("idle").notNull(),
+    upstreamTaskId: varchar("upstreamTaskId", { length: 255 }),
+    previousResponseId: varchar("previousResponseId", { length: 255 }),
+    taskUrl: text("taskUrl"),
+    lastKnownOutputLength: int("lastKnownOutputLength").default(0).notNull(),
+    deletedMessageIds: json("deletedMessageIds").$type().default([]).notNull(),
+    version: int("version").default(1).notNull(),
+    startedAt: timestamp("startedAt"),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+    deletedAt: timestamp("deletedAt")
+  },
+  (table) => [
+    index("conversations_user_updated_idx").on(table.userId, table.updatedAt),
+    index("conversations_user_status_idx").on(table.userId, table.status),
+    index("conversations_upstream_task_idx").on(table.upstreamTaskId)
+  ]
+);
+var conversationTurns = mysqlTable(
+  "conversation_turns",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    conversationId: varchar("conversationId", { length: 191 }).notNull().references(() => conversations.id, { onDelete: "cascade" }),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).references(
+      () => apiCredentials.id,
+      { onDelete: "set null" }
+    ),
+    clientRequestId: varchar("clientRequestId", { length: 128 }).notNull(),
+    model: varchar("model", { length: 128 }),
+    status: mysqlEnum("status", [
+      "queued",
+      "running",
+      "completed",
+      "failed",
+      "cancelled"
+    ]).default("queued").notNull(),
+    upstreamTaskId: varchar("upstreamTaskId", { length: 255 }),
+    errorCode: varchar("errorCode", { length: 128 }),
+    errorMessage: text("errorMessage"),
+    startedAt: timestamp("startedAt"),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("conversation_turns_client_request_uq").on(
+      table.conversationId,
+      table.clientRequestId
+    ),
+    index("conversation_turns_user_status_idx").on(table.userId, table.status),
+    index("conversation_turns_upstream_task_idx").on(table.upstreamTaskId)
+  ]
+);
+var messages = mysqlTable(
+  "messages",
+  {
+    id: varchar("id", { length: 191 }).primaryKey(),
+    conversationId: varchar("conversationId", { length: 191 }).notNull().references(() => conversations.id, { onDelete: "cascade" }),
+    turnId: varchar("turnId", { length: 36 }).references(
+      () => conversationTurns.id,
+      { onDelete: "set null" }
+    ),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    role: mysqlEnum("role", ["user", "assistant", "system", "tool"]).notNull(),
+    content: longtext("content").notNull(),
+    sequence: int("sequence").notNull(),
+    metadata: json("metadata").$type(),
+    sentAt: timestamp("sentAt").defaultNow().notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+    deletedAt: timestamp("deletedAt")
+  },
+  (table) => [
+    uniqueIndex("messages_conversation_sequence_uq").on(
+      table.conversationId,
+      table.sequence
+    ),
+    index("messages_user_conversation_idx").on(
+      table.userId,
+      table.conversationId
+    ),
+    index("messages_turn_idx").on(table.turnId)
+  ]
+);
+var attachments = mysqlTable(
+  "attachments",
+  {
+    id: varchar("id", { length: 191 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    conversationId: varchar("conversationId", { length: 191 }).notNull().references(() => conversations.id, { onDelete: "cascade" }),
+    messageId: varchar("messageId", { length: 191 }).notNull().references(() => messages.id, { onDelete: "cascade" }),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).references(
+      () => apiCredentials.id,
+      { onDelete: "set null" }
+    ),
+    kind: mysqlEnum("kind", ["file", "image"]).default("file").notNull(),
+    fileName: varchar("fileName", { length: 512 }).notNull(),
+    mimeType: varchar("mimeType", { length: 255 }),
+    sizeBytes: int("sizeBytes", { unsigned: true }),
+    upstreamFileId: varchar("upstreamFileId", { length: 255 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    deletedAt: timestamp("deletedAt")
+  },
+  (table) => [
+    index("attachments_user_file_idx").on(table.userId, table.upstreamFileId),
+    index("attachments_message_idx").on(table.messageId)
+  ]
+);
+var upstreamResources = mysqlTable(
+  "upstream_resources",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).notNull().references(() => apiCredentials.id, { onDelete: "restrict" }),
+    kind: mysqlEnum("kind", ["task", "file"]).notNull(),
+    upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
+    conversationId: varchar("conversationId", { length: 191 }).references(
+      () => conversations.id,
+      { onDelete: "set null" }
+    ),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("upstream_resources_kind_id_uq").on(
+      table.kind,
+      table.upstreamId
+    ),
+    index("upstream_resources_user_kind_id_idx").on(
+      table.userId,
+      table.kind,
+      table.upstreamId
+    )
+  ]
+);
+
+// server/db.ts
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/mysql2";
+
+// server/_core/env.ts
+var ENV = {
+  appId: process.env.VITE_APP_ID ?? "",
+  cookieSecret: process.env.JWT_SECRET ?? "",
+  databaseUrl: process.env.DATABASE_URL ?? "",
+  oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
+  ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
+  isProduction: process.env.NODE_ENV === "production",
+  forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
+  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? ""
+};
+
+// server/db.ts
+var _db = null;
+async function getDb() {
+  if (!_db && process.env.DATABASE_URL) {
+    try {
+      _db = drizzle(process.env.DATABASE_URL);
+    } catch (error) {
+      console.warn("[Database] Failed to connect:", error);
+      _db = null;
+    }
+  }
+  return _db;
+}
+
+// server/upstream-config.ts
+var UPSTREAM_VENDOR = ["ma", "nus"].join("");
+var DEFAULT_UPSTREAM_BASE_URL = `https://api.${UPSTREAM_VENDOR}.im`;
+function getUpstreamBaseUrl(req) {
+  const configured = process.env.FRONTMIND_UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL;
+  return configured.replace(/\/$/, "");
+}
+function getFrontMindApiKey(req) {
+  return req.frontmindCredential?.apiKey ?? "";
+}
+function getFrontMindCredentials(req) {
+  return {
+    apiKey: getFrontMindApiKey(req),
+    baseUrl: getUpstreamBaseUrl(req)
+  };
+}
+function toUpstreamAgentProfile(agentProfile) {
+  switch (agentProfile) {
+    case "frontmind-lite":
+      return `${UPSTREAM_VENDOR}-1.6-lite`;
+    case "frontmind-base":
+      return `${UPSTREAM_VENDOR}-1.6`;
+    case "frontmind-pro":
+    case void 0:
+    case "":
+      return `${UPSTREAM_VENDOR}-1.6-max`;
+    default:
+      return agentProfile;
+  }
+}
+function translateTaskBodyForUpstream(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return body;
+  }
+  const next = { ...body };
+  if (typeof next.agentProfile === "string") {
+    next.agentProfile = toUpstreamAgentProfile(next.agentProfile);
+  }
+  return next;
+}
+
+// server/auth-service.ts
+var SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1e3;
+var SCRYPT_VERSION = "v1";
+var SCRYPT_N = 16384;
+var SCRYPT_R = 8;
+var SCRYPT_P = 1;
+var SCRYPT_KEY_LENGTH = 64;
+var LOGIN_WINDOW_MS = 15 * 60 * 1e3;
+var LOGIN_MAX_FAILURES = 5;
+var DUMMY_PASSWORD_HASH = "scrypt$v1$16384$8$1$RnJvbnRNaW5kRHVtbXkwMQ==$v5gxAmM2/2xmlb6BhcM2tE6ivMw+PG8CtewPcO0jJcY86Ak1/I0770tV9pqMocaZiA4z4hu7Obq9HgC6hFn4qw==";
+var AuthServiceError = class extends Error {
+  constructor(code, message, retryAfterMs) {
+    super(message);
+    this.code = code;
+    this.retryAfterMs = retryAfterMs;
+    this.name = "AuthServiceError";
+  }
+};
+var loginAttempts = /* @__PURE__ */ new Map();
+function toAuthenticatedUser(user) {
+  const username = user.username ?? user.openId ?? `legacy-${user.id}`;
+  return {
+    id: user.id,
+    openId: user.openId,
+    username,
+    displayName: user.displayName ?? user.name ?? username,
+    name: user.name,
+    email: user.email,
+    loginMethod: user.loginMethod,
+    role: user.role,
+    isActive: user.isActive,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+    lastSignedIn: user.lastSignedIn
+  };
+}
+async function requireDb() {
+  const db = await getDb();
+  if (!db) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Database is not configured"
+    );
+  }
+  return db;
+}
+function runScrypt(password, salt) {
+  return new Promise((resolve, reject) => {
+    nodeScrypt(
+      password,
+      salt,
+      SCRYPT_KEY_LENGTH,
+      {
+        N: SCRYPT_N,
+        r: SCRYPT_R,
+        p: SCRYPT_P,
+        maxmem: 64 * 1024 * 1024
+      },
+      (error, derivedKey) => {
+        if (error) reject(error);
+        else resolve(derivedKey);
+      }
+    );
+  });
+}
+function normalizeUsername(username) {
+  return username.normalize("NFKC").trim().toLowerCase();
+}
+async function hashPassword(password) {
+  const salt = randomBytes(16);
+  const derivedKey = await runScrypt(password, salt);
+  return [
+    "scrypt",
+    SCRYPT_VERSION,
+    SCRYPT_N,
+    SCRYPT_R,
+    SCRYPT_P,
+    salt.toString("base64"),
+    derivedKey.toString("base64")
+  ].join("$");
+}
+async function verifyPassword(password, encodedHash) {
+  const parts = encodedHash.split("$");
+  if (parts.length !== 7 || parts[0] !== "scrypt" || parts[1] !== SCRYPT_VERSION) {
+    return false;
+  }
+  const n = Number(parts[2]);
+  const r = Number(parts[3]);
+  const p = Number(parts[4]);
+  if (n !== SCRYPT_N || r !== SCRYPT_R || p !== SCRYPT_P) return false;
+  try {
+    const salt = Buffer.from(parts[5], "base64");
+    const expected = Buffer.from(parts[6], "base64");
+    if (salt.length !== 16 || expected.length !== SCRYPT_KEY_LENGTH) return false;
+    const actual = await runScrypt(password, salt);
+    return timingSafeEqual(actual, expected);
+  } catch {
+    return false;
+  }
+}
+function hashSessionToken(token) {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
+function getSessionTokenFromRequest(req) {
+  try {
+    const cookies = parseCookieHeader(req.headers.cookie ?? "");
+    return cookies[COOKIE_NAME] || null;
+  } catch {
+    return null;
+  }
+}
+async function createSession(userId) {
+  const db = await requireDb();
+  const token = randomBytes(32).toString("base64url");
+  const now = Date.now();
+  const session = {
+    id: randomUUID(),
+    userId,
+    tokenHash: hashSessionToken(token),
+    expiresAt: new Date(now + SESSION_DURATION_MS),
+    lastSeenAt: new Date(now)
+  };
+  await db.insert(sessions).values(session);
+  return { token, session };
+}
+async function authenticateRequest(req) {
+  const token = getSessionTokenFromRequest(req);
+  if (!token) return null;
+  const db = await getDb();
+  if (!db) return null;
+  const tokenHash = hashSessionToken(token);
+  const rows = await db.select({ user: users, lastSeenAt: sessions.lastSeenAt }).from(sessions).innerJoin(users, eq2(sessions.userId, users.id)).where(
+    and(
+      eq2(sessions.tokenHash, tokenHash),
+      isNull(sessions.revokedAt),
+      gt(sessions.expiresAt, /* @__PURE__ */ new Date()),
+      eq2(users.isActive, true)
+    )
+  ).limit(1);
+  const row = rows[0];
+  if (!row) return null;
+  if (Date.now() - row.lastSeenAt.getTime() > 5 * 60 * 1e3) {
+    await db.update(sessions).set({ lastSeenAt: /* @__PURE__ */ new Date() }).where(eq2(sessions.tokenHash, tokenHash));
+  }
+  return toAuthenticatedUser(row.user);
+}
+async function revokeSessionToken(token) {
+  if (!token) return;
+  const db = await getDb();
+  if (!db) return;
+  await db.update(sessions).set({ revokedAt: /* @__PURE__ */ new Date() }).where(
+    and(
+      eq2(sessions.tokenHash, hashSessionToken(token)),
+      isNull(sessions.revokedAt)
+    )
+  );
+}
+async function revokeAllUserSessions(userId, exceptToken) {
+  const db = await requireDb();
+  const conditions = [eq2(sessions.userId, userId), isNull(sessions.revokedAt)];
+  if (exceptToken) {
+    conditions.push(ne(sessions.tokenHash, hashSessionToken(exceptToken)));
+  }
+  await db.update(sessions).set({ revokedAt: /* @__PURE__ */ new Date() }).where(and(...conditions));
+}
+function loginAttemptKey(username, clientAddress) {
+  return `${normalizeUsername(username)}\0${clientAddress}`;
+}
+function assertLoginAllowed(key) {
+  const attempt = loginAttempts.get(key);
+  if (!attempt) return;
+  const now = Date.now();
+  if (now >= attempt.resetAt) {
+    loginAttempts.delete(key);
+    return;
+  }
+  if (attempt.failures >= LOGIN_MAX_FAILURES) {
+    throw new AuthServiceError(
+      "RATE_LIMITED",
+      "Too many login attempts",
+      attempt.resetAt - now
+    );
+  }
+}
+function recordLoginFailure(key) {
+  const now = Date.now();
+  const current = loginAttempts.get(key);
+  if (!current || now >= current.resetAt) {
+    loginAttempts.set(key, { failures: 1, resetAt: now + LOGIN_WINDOW_MS });
+  } else {
+    current.failures += 1;
+  }
+  if (loginAttempts.size > 1e4) {
+    for (const [entryKey, value] of loginAttempts) {
+      if (now >= value.resetAt) loginAttempts.delete(entryKey);
+      if (loginAttempts.size <= 8e3) break;
+    }
+  }
+}
+async function loginWithPassword(username, password, clientAddress) {
+  const normalizedUsername = normalizeUsername(username);
+  const attemptKey = loginAttemptKey(normalizedUsername, clientAddress);
+  assertLoginAllowed(attemptKey);
+  const db = await requireDb();
+  const rows = await db.select().from(users).where(eq2(users.username, normalizedUsername)).limit(1);
+  const user = rows[0];
+  const passwordHash = user?.passwordHash ?? DUMMY_PASSWORD_HASH;
+  const passwordMatches = await verifyPassword(password, passwordHash);
+  if (!user || !passwordMatches) {
+    recordLoginFailure(attemptKey);
+    throw new AuthServiceError("INVALID_PASSWORD", "Invalid username or password");
+  }
+  if (!user.isActive) {
+    recordLoginFailure(attemptKey);
+    throw new AuthServiceError("ACCOUNT_DISABLED", "Account is disabled");
+  }
+  loginAttempts.delete(attemptKey);
+  const lastSignedIn = /* @__PURE__ */ new Date();
+  await db.update(users).set({ lastSignedIn }).where(eq2(users.id, user.id));
+  const created = await createSession(user.id);
+  return {
+    user: toAuthenticatedUser({ ...user, lastSignedIn }),
+    ...created
+  };
+}
+async function changeOwnPassword(userId, currentPassword, newPassword, currentSessionToken) {
+  const db = await requireDb();
+  const rows = await db.select().from(users).where(eq2(users.id, userId)).limit(1);
+  const user = rows[0];
+  if (!user?.passwordHash || !await verifyPassword(currentPassword, user.passwordHash)) {
+    throw new AuthServiceError("INVALID_PASSWORD", "Current password is incorrect");
+  }
+  const passwordHash = await hashPassword(newPassword);
+  await db.update(users).set({ passwordHash, passwordChangedAt: /* @__PURE__ */ new Date() }).where(eq2(users.id, userId));
+  await revokeAllUserSessions(userId, currentSessionToken);
+}
+async function listManagedUsers() {
+  const db = await requireDb();
+  const rows = await db.select().from(users).orderBy(desc(users.createdAt));
+  return rows.map(toAuthenticatedUser);
+}
+async function getManagedUser(userId) {
+  const db = await requireDb();
+  const rows = await db.select().from(users).where(eq2(users.id, userId)).limit(1);
+  return rows[0] ? toAuthenticatedUser(rows[0]) : null;
+}
+async function createManagedUser(input) {
+  const db = await requireDb();
+  const username = normalizeUsername(input.username);
+  const existing = await db.select({ id: users.id }).from(users).where(eq2(users.username, username)).limit(1);
+  if (existing.length > 0) {
+    throw new AuthServiceError("CONFLICT", "Username already exists");
+  }
+  const passwordHash = await hashPassword(input.password);
+  try {
+    await db.insert(users).values({
+      username,
+      passwordHash,
+      displayName: input.displayName?.trim() || null,
+      name: input.displayName?.trim() || null,
+      loginMethod: "password",
+      role: input.role,
+      isActive: true,
+      passwordChangedAt: /* @__PURE__ */ new Date()
+    });
+  } catch (error) {
+    const mysqlError = error;
+    if (mysqlError.code === "ER_DUP_ENTRY") {
+      throw new AuthServiceError("CONFLICT", "Username already exists");
+    }
+    throw error;
+  }
+  const created = await db.select().from(users).where(eq2(users.username, username)).limit(1);
+  if (!created[0]) {
+    throw new AuthServiceError("NOT_FOUND", "Created user could not be loaded");
+  }
+  return toAuthenticatedUser(created[0]);
+}
+async function resetManagedUserPassword(userId, newPassword) {
+  const db = await requireDb();
+  const existing = await db.select({ id: users.id }).from(users).where(eq2(users.id, userId)).limit(1);
+  if (!existing[0]) throw new AuthServiceError("NOT_FOUND", "User not found");
+  const passwordHash = await hashPassword(newPassword);
+  await db.update(users).set({ passwordHash, passwordChangedAt: /* @__PURE__ */ new Date() }).where(eq2(users.id, userId));
+  await revokeAllUserSessions(userId);
+}
+async function setManagedUserActive(userId, isActive) {
+  const db = await requireDb();
+  await db.transaction(async (tx) => {
+    const rows = await tx.select().from(users).where(eq2(users.id, userId)).limit(1).for("update");
+    const user = rows[0];
+    if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+    if (!isActive && user.isActive && user.role === "admin") {
+      const activeAdmins = await tx.select({ id: users.id }).from(users).where(and(eq2(users.role, "admin"), eq2(users.isActive, true))).limit(2).for("update");
+      if (activeAdmins.length <= 1) {
+        throw new AuthServiceError(
+          "LAST_ADMIN",
+          "The last active administrator cannot be disabled"
+        );
+      }
+    }
+    await tx.update(users).set({ isActive }).where(eq2(users.id, userId));
+  });
+  if (!isActive) await revokeAllUserSessions(userId);
+  const updated = await getManagedUser(userId);
+  if (!updated) throw new AuthServiceError("NOT_FOUND", "User not found");
+  return updated;
+}
+function decodeMasterKey(value) {
+  const trimmed = value.trim();
+  let decoded;
+  if (trimmed.startsWith("base64:")) {
+    decoded = Buffer.from(trimmed.slice(7), "base64");
+  } else if (trimmed.startsWith("hex:")) {
+    decoded = Buffer.from(trimmed.slice(4), "hex");
+  } else if (/^[a-f\d]{64}$/i.test(trimmed)) {
+    decoded = Buffer.from(trimmed, "hex");
+  } else {
+    decoded = Buffer.from(trimmed, "base64");
+  }
+  if (decoded.length !== 32) {
+    throw new AuthServiceError(
+      "INVALID_MASTER_KEY",
+      "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY must encode exactly 32 bytes"
+    );
+  }
+  return decoded;
+}
+function getCredentialMasterKey() {
+  const configured = process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY;
+  if (!configured) {
+    throw new AuthServiceError(
+      "INVALID_MASTER_KEY",
+      "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY is not configured"
+    );
+  }
+  return decodeMasterKey(configured);
+}
+function assertCredentialEncryptionConfigured() {
+  getCredentialMasterKey();
+}
+function credentialAad(userId, credentialId) {
+  return Buffer.from(`frontmind-api-credential:v1:${userId}:${credentialId}`, "utf8");
+}
+function getApiKeyFingerprint(apiKey) {
+  return `fp_${createHash("sha256").update(apiKey, "utf8").digest("hex").slice(0, 16)}`;
+}
+function encryptApiKey(userId, credentialId, apiKey) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", getCredentialMasterKey(), iv);
+  cipher.setAAD(credentialAad(userId, credentialId));
+  const encrypted = Buffer.concat([
+    cipher.update(apiKey, "utf8"),
+    cipher.final()
+  ]);
+  return {
+    encryptionVersion: 1,
+    encryptedKey: encrypted.toString("base64"),
+    encryptionIv: iv.toString("base64"),
+    encryptionAuthTag: cipher.getAuthTag().toString("base64")
+  };
+}
+function decryptApiKey(credential) {
+  try {
+    if (credential.encryptionVersion !== 1) {
+      throw new AuthServiceError(
+        "INVALID_CREDENTIAL",
+        "Credential encryption version is not supported"
+      );
+    }
+    const decipher = createDecipheriv(
+      "aes-256-gcm",
+      getCredentialMasterKey(),
+      Buffer.from(credential.encryptionIv, "base64")
+    );
+    decipher.setAAD(credentialAad(credential.userId, credential.id));
+    decipher.setAuthTag(Buffer.from(credential.encryptionAuthTag, "base64"));
+    return Buffer.concat([
+      decipher.update(Buffer.from(credential.encryptedKey, "base64")),
+      decipher.final()
+    ]).toString("utf8");
+  } catch (error) {
+    if (error instanceof AuthServiceError) throw error;
+    throw new AuthServiceError("INVALID_CREDENTIAL", "Credential cannot be decrypted");
+  }
+}
+async function validateUpstreamApiKey(apiKey) {
+  let response;
+  try {
+    response = await fetch(`${getUpstreamBaseUrl()}/v1/tasks?limit=1`, {
+      method: "GET",
+      redirect: "error",
+      headers: {
+        API_KEY: apiKey,
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json"
+      },
+      signal: AbortSignal.timeout(15e3)
+    });
+  } catch {
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "Unable to validate the API credential"
+    );
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "API credential is invalid");
+  }
+  if (!response.ok) {
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "Upstream service could not validate the API credential"
+    );
+  }
+}
+function toCredentialStatus(credential) {
+  const status = credential?.status === "deleted" ? null : credential?.validationStatus === "invalid" ? "invalid" : credential?.status ?? null;
+  return {
+    configured: Boolean(credential && credential.status === "active"),
+    fingerprint: credential?.fingerprint ?? null,
+    status,
+    verifiedAt: credential?.verifiedAt?.getTime() ?? null
+  };
+}
+async function getApiCredentialStatus(userId) {
+  const db = await requireDb();
+  const rows = await db.select().from(apiCredentials).where(
+    and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
+  ).orderBy(desc(apiCredentials.version)).limit(1);
+  return toCredentialStatus(rows[0]);
+}
+async function replaceApiCredential(userId, apiKey, validator = validateUpstreamApiKey) {
+  const db = await requireDb();
+  await validator(apiKey);
+  const fingerprint = getApiKeyFingerprint(apiKey);
+  const credentialId = randomUUID();
+  const encrypted = encryptApiKey(userId, credentialId, apiKey);
+  const now = /* @__PURE__ */ new Date();
+  const credential = await db.transaction(async (tx) => {
+    await tx.insert(apiKeyOwnership).values({ fingerprint, userId }).onDuplicateKeyUpdate({ set: { fingerprint } });
+    const ownership = await tx.select({ userId: apiKeyOwnership.userId }).from(apiKeyOwnership).where(eq2(apiKeyOwnership.fingerprint, fingerprint)).limit(1).for("update");
+    if (!ownership[0] || ownership[0].userId !== userId) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "This API credential is already assigned to another account"
+      );
+    }
+    const latest = await tx.select().from(apiCredentials).where(eq2(apiCredentials.userId, userId)).orderBy(desc(apiCredentials.version)).limit(1);
+    const nextVersion = (latest[0]?.version ?? 0) + 1;
+    await tx.update(apiCredentials).set({ status: "retired", retiredAt: now }).where(
+      and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
+    );
+    const inserted = {
+      id: credentialId,
+      userId,
+      version: nextVersion,
+      ...encrypted,
+      fingerprint,
+      status: "active",
+      validationStatus: "verified",
+      verifiedAt: now,
+      createdAt: now,
+      updatedAt: now,
+      retiredAt: null,
+      deletedAt: null
+    };
+    await tx.insert(apiCredentials).values(inserted);
+    return inserted;
+  });
+  return toCredentialStatus(credential);
+}
+async function deleteActiveApiCredential(userId) {
+  const db = await requireDb();
+  const now = /* @__PURE__ */ new Date();
+  await db.update(apiCredentials).set({
+    status: "deleted",
+    deletedAt: now,
+    encryptedKey: randomBytes(32).toString("base64"),
+    encryptionIv: randomBytes(12).toString("base64"),
+    encryptionAuthTag: randomBytes(16).toString("base64")
+  }).where(
+    and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
+  );
+}
+async function getDecryptedCredentialForUser(userId, credentialId) {
+  const db = await requireDb();
+  const conditions = [
+    eq2(apiCredentials.userId, userId),
+    ne(apiCredentials.status, "deleted")
+  ];
+  if (credentialId) conditions.push(eq2(apiCredentials.id, credentialId));
+  else conditions.push(eq2(apiCredentials.status, "active"));
+  const rows = await db.select().from(apiCredentials).where(and(...conditions)).orderBy(desc(apiCredentials.version)).limit(1);
+  const credential = rows[0];
+  if (!credential || credential.status === "deleted") return null;
+  return {
+    id: credential.id,
+    userId: credential.userId,
+    version: credential.version,
+    apiKey: decryptApiKey(credential),
+    fingerprint: credential.fingerprint,
+    status: credential.status,
+    verifiedAt: credential.verifiedAt
+  };
+}
+async function getCredentialForUpstreamResource(userId, kind, upstreamId) {
+  const db = await requireDb();
+  const rows = await db.select({ resource: upstreamResources, credential: apiCredentials }).from(upstreamResources).innerJoin(
+    apiCredentials,
+    eq2(upstreamResources.apiCredentialId, apiCredentials.id)
+  ).where(
+    and(
+      eq2(upstreamResources.userId, userId),
+      eq2(upstreamResources.kind, kind),
+      eq2(upstreamResources.upstreamId, upstreamId),
+      ne(apiCredentials.status, "deleted")
+    )
+  ).limit(1);
+  const row = rows[0];
+  if (!row || row.credential.status === "deleted") return null;
+  return {
+    id: row.credential.id,
+    userId: row.credential.userId,
+    version: row.credential.version,
+    apiKey: decryptApiKey(row.credential),
+    fingerprint: row.credential.fingerprint,
+    status: row.credential.status,
+    verifiedAt: row.credential.verifiedAt,
+    resource: row.resource
+  };
+}
+async function recordUpstreamResource(input) {
+  const db = await requireDb();
+  const existing = await db.select().from(upstreamResources).where(
+    and(
+      eq2(upstreamResources.kind, input.kind),
+      eq2(upstreamResources.upstreamId, input.upstreamId)
+    )
+  ).limit(1);
+  if (existing[0]) {
+    if (existing[0].userId !== input.userId) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Upstream resource is already owned by another account"
+      );
+    }
+    return existing[0];
+  }
+  const credential = await db.select({ id: apiCredentials.id }).from(apiCredentials).where(
+    and(
+      eq2(apiCredentials.id, input.apiCredentialId),
+      eq2(apiCredentials.userId, input.userId),
+      ne(apiCredentials.status, "deleted")
+    )
+  ).limit(1);
+  if (!credential[0]) {
+    throw new AuthServiceError("NOT_FOUND", "API credential not found");
+  }
+  if (input.conversationId) {
+    const conversation = await db.select({ id: conversations.id }).from(conversations).where(
+      and(
+        eq2(conversations.id, input.conversationId),
+        eq2(conversations.userId, input.userId)
+      )
+    ).limit(1);
+    if (!conversation[0]) {
+      throw new AuthServiceError("NOT_FOUND", "Conversation not found");
+    }
+  }
+  const resource = {
+    id: randomUUID(),
+    userId: input.userId,
+    apiCredentialId: input.apiCredentialId,
+    kind: input.kind,
+    upstreamId: input.upstreamId,
+    conversationId: input.conversationId ?? null,
+    createdAt: /* @__PURE__ */ new Date()
+  };
+  try {
+    await db.insert(upstreamResources).values(resource);
+    return resource;
+  } catch (error) {
+    const mysqlError = error;
+    if (mysqlError.code !== "ER_DUP_ENTRY") throw error;
+    const raced = await db.select().from(upstreamResources).where(
+      and(
+        eq2(upstreamResources.kind, input.kind),
+        eq2(upstreamResources.upstreamId, input.upstreamId),
+        eq2(upstreamResources.userId, input.userId)
+      )
+    ).limit(1);
+    if (raced[0]) return raced[0];
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Upstream resource is already owned by another account"
+    );
+  }
+}
+
+// server/auth-router.ts
+import { TRPCError as TRPCError2 } from "@trpc/server";
+import { z } from "zod";
 
 // server/_core/cookies.ts
 function isSecureRequest(req) {
@@ -22,29 +990,894 @@ function getSessionCookieOptions(req) {
     httpOnly: true,
     path: "/",
     sameSite: "none",
-    secure: isSecureRequest(req)
+    secure: ENV.isProduction || isSecureRequest(req)
   };
 }
 
+// server/auth-router.ts
+var passwordSchema = z.string().min(12, "Password must contain at least 12 characters").max(128, "Password is too long");
+function toTrpcError(error) {
+  if (!(error instanceof AuthServiceError)) {
+    return new TRPCError2({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "The request could not be completed",
+      cause: error
+    });
+  }
+  switch (error.code) {
+    case "INVALID_PASSWORD":
+      return new TRPCError2({ code: "UNAUTHORIZED", message: error.message });
+    case "ACCOUNT_DISABLED":
+      return new TRPCError2({ code: "FORBIDDEN", message: error.message });
+    case "RATE_LIMITED":
+      return new TRPCError2({ code: "TOO_MANY_REQUESTS", message: error.message });
+    case "CONFLICT":
+    case "LAST_ADMIN":
+      return new TRPCError2({ code: "CONFLICT", message: error.message });
+    case "NOT_FOUND":
+      return new TRPCError2({ code: "NOT_FOUND", message: error.message });
+    case "INVALID_CREDENTIAL":
+      return new TRPCError2({ code: "BAD_REQUEST", message: error.message });
+    case "UPSTREAM_UNAVAILABLE":
+      return new TRPCError2({ code: "BAD_GATEWAY", message: error.message });
+    case "DATABASE_UNAVAILABLE":
+    case "INVALID_MASTER_KEY":
+      return new TRPCError2({
+        code: "INTERNAL_SERVER_ERROR",
+        message: "The service is not configured correctly",
+        cause: error
+      });
+  }
+}
+var authRouter = router({
+  me: publicProcedure.query(({ ctx }) => ctx.user),
+  login: publicProcedure.input(
+    z.object({
+      username: z.string().trim().min(1).max(64),
+      password: z.string().min(1).max(128)
+    })
+  ).mutation(async ({ ctx, input }) => {
+    try {
+      const clientAddress = ctx.req.ip || ctx.req.socket?.remoteAddress || "unknown";
+      const result = await loginWithPassword(
+        input.username,
+        input.password,
+        clientAddress
+      );
+      ctx.res.cookie(COOKIE_NAME, result.token, {
+        ...getSessionCookieOptions(ctx.req),
+        sameSite: "lax",
+        maxAge: SESSION_DURATION_MS
+      });
+      return {
+        user: result.user,
+        expiresAt: result.session.expiresAt
+      };
+    } catch (error) {
+      throw toTrpcError(error);
+    }
+  }),
+  logout: publicProcedure.mutation(async ({ ctx }) => {
+    await revokeSessionToken(getSessionTokenFromRequest(ctx.req));
+    ctx.res.clearCookie(COOKIE_NAME, {
+      ...getSessionCookieOptions(ctx.req),
+      sameSite: "lax",
+      maxAge: -1
+    });
+    return { success: true };
+  }),
+  changePassword: protectedProcedure.input(
+    z.object({
+      currentPassword: z.string().min(1).max(128),
+      newPassword: passwordSchema
+    })
+  ).mutation(async ({ ctx, input }) => {
+    try {
+      await changeOwnPassword(
+        ctx.user.id,
+        input.currentPassword,
+        input.newPassword,
+        getSessionTokenFromRequest(ctx.req)
+      );
+      return { success: true };
+    } catch (error) {
+      throw toTrpcError(error);
+    }
+  })
+});
+
+// server/admin-router.ts
+var usernameSchema = z2.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
+  /^[a-zA-Z0-9._-]+$/,
+  "Username may only contain letters, numbers, dots, underscores, and hyphens"
+);
+var adminRouter = router({
+  users: router({
+    list: adminProcedure.query(async () => {
+      try {
+        return { users: await listManagedUsers() };
+      } catch (error) {
+        throw toTrpcError(error);
+      }
+    }),
+    create: adminProcedure.input(
+      z2.object({
+        username: usernameSchema,
+        password: passwordSchema,
+        displayName: z2.string().trim().max(128).optional(),
+        role: z2.enum(["user", "admin"]).default("user")
+      })
+    ).mutation(async ({ input }) => {
+      try {
+        const user = await createManagedUser(input);
+        return { user };
+      } catch (error) {
+        throw toTrpcError(error);
+      }
+    }),
+    resetPassword: adminProcedure.input(
+      z2.object({
+        userId: z2.number().int().positive(),
+        newPassword: passwordSchema
+      })
+    ).mutation(async ({ input }) => {
+      try {
+        await resetManagedUserPassword(input.userId, input.newPassword);
+        return { success: true };
+      } catch (error) {
+        throw toTrpcError(error);
+      }
+    }),
+    setActive: adminProcedure.input(
+      z2.object({
+        userId: z2.number().int().positive(),
+        isActive: z2.boolean()
+      })
+    ).mutation(async ({ input }) => {
+      try {
+        const user = await setManagedUserActive(input.userId, input.isActive);
+        return { user };
+      } catch (error) {
+        throw toTrpcError(error);
+      }
+    })
+  })
+});
+
+// server/conversation-router.ts
+import { TRPCError as TRPCError3 } from "@trpc/server";
+import { and as and2, asc, desc as desc2, eq as eq3, inArray, isNull as isNull2 } from "drizzle-orm";
+import { randomUUID as randomUUID2 } from "node:crypto";
+import { z as z3 } from "zod";
+var attachmentSchema = z3.object({
+  id: z3.string().min(1).max(128),
+  type: z3.enum(["file", "image"]),
+  name: z3.string().min(1).max(512),
+  fileId: z3.string().min(1).max(255).optional()
+});
+var outputFileSchema = z3.object({
+  fileUrl: z3.string().max(4096),
+  fileName: z3.string().max(512),
+  mimeType: z3.string().max(255)
+});
+var inlineImageSchema = z3.object({
+  src: z3.string().max(4096),
+  alt: z3.string().max(512).optional()
+});
+var messageSchema = z3.object({
+  id: z3.string().min(1).max(128),
+  role: z3.enum(["user", "assistant"]),
+  content: z3.string().max(2e6),
+  attachments: z3.array(attachmentSchema).max(100).optional(),
+  timestamp: z3.number().finite().nonnegative(),
+  outputFiles: z3.array(outputFileSchema).max(200).optional(),
+  inlineImages: z3.array(inlineImageSchema).max(200).optional(),
+  elapsedTime: z3.number().finite().nonnegative().optional(),
+  responseStartedAt: z3.number().finite().nonnegative().optional(),
+  intermediateSteps: z3.array(z3.unknown()).max(2e3).optional(),
+  stepGroups: z3.array(z3.unknown()).max(500).optional(),
+  isStepsPlaceholder: z3.boolean().optional(),
+  modelName: z3.string().max(128).optional()
+});
+var conversationSnapshotSchema = z3.object({
+  id: z3.string().min(1).max(128),
+  title: z3.string().min(1).max(255),
+  messages: z3.array(messageSchema).max(5e3),
+  taskId: z3.string().max(255).optional(),
+  previousResponseId: z3.string().max(255).optional(),
+  status: z3.enum(["idle", "running", "pending", "completed", "error", "failed"]),
+  taskUrl: z3.string().max(4096).optional(),
+  createdAt: z3.number().finite().nonnegative(),
+  updatedAt: z3.number().finite().nonnegative(),
+  startedAt: z3.number().finite().nonnegative().optional(),
+  completedAt: z3.number().finite().nonnegative().optional(),
+  lastKnownOutputLength: z3.number().int().nonnegative().optional(),
+  deletedMessageIds: z3.array(z3.string().max(128)).max(5e3).optional()
+});
+var LEGACY_IMPORT_MAX_RESOURCES = 200;
+var LEGACY_IMPORT_VALIDATION_CONCURRENCY = 4;
+var LEGACY_IMPORT_VALIDATION_TIMEOUT_MS = 3e4;
+function upstreamResourceKey(kind, id) {
+  return JSON.stringify([kind, id]);
+}
+function collectSnapshotResourceRefs(snapshots) {
+  const resources = /* @__PURE__ */ new Map();
+  const add = (kind, id) => {
+    if (!id) return;
+    resources.set(upstreamResourceKey(kind, id), { kind, id });
+    if (resources.size > LEGACY_IMPORT_MAX_RESOURCES) {
+      throw new TRPCError3({
+        code: "PAYLOAD_TOO_LARGE",
+        message: `\u5355\u6B21\u6700\u591A\u8FC1\u79FB ${LEGACY_IMPORT_MAX_RESOURCES} \u4E2A\u5386\u53F2\u4EFB\u52A1\u6216\u6587\u4EF6`
+      });
+    }
+  };
+  for (const snapshot of snapshots) {
+    add("task", snapshot.taskId);
+    for (const message of snapshot.messages) {
+      for (const attachment of message.attachments ?? []) {
+        add("file", attachment.fileId);
+      }
+    }
+  }
+  return Array.from(resources.values());
+}
+function storageId(userId, publicId2) {
+  return `u${userId}:${publicId2}`;
+}
+function publicId(userId, persistedId) {
+  const prefix = `u${userId}:`;
+  return persistedId.startsWith(prefix) ? persistedId.slice(prefix.length) : persistedId;
+}
+function asDate(value) {
+  if (value === void 0) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+function requireDb2(db) {
+  if (!db) {
+    throw new TRPCError3({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "\u6570\u636E\u5E93\u6682\u4E0D\u53EF\u7528"
+    });
+  }
+  return db;
+}
+async function getActiveCredentialId(executor, userId) {
+  const rows = await executor.select({ id: apiCredentials.id }).from(apiCredentials).where(
+    and2(
+      eq3(apiCredentials.userId, userId),
+      eq3(apiCredentials.status, "active"),
+      eq3(apiCredentials.validationStatus, "verified"),
+      isNull2(apiCredentials.deletedAt)
+    )
+  ).orderBy(desc2(apiCredentials.version)).limit(1);
+  return rows[0]?.id;
+}
+async function assertResourceOwnership(executor, userId, kind, upstreamId) {
+  const rows = await executor.select({ userId: upstreamResources.userId }).from(upstreamResources).where(
+    and2(
+      eq3(upstreamResources.kind, kind),
+      eq3(upstreamResources.upstreamId, upstreamId)
+    )
+  ).limit(1);
+  if (rows[0] && rows[0].userId !== userId) {
+    throw new TRPCError3({ code: "FORBIDDEN", message: "\u4E0A\u6E38\u8D44\u6E90\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7" });
+  }
+  return rows[0] ?? null;
+}
+async function validateUpstreamResourceAccess(apiKey, kind, upstreamId, request = fetch, signal = AbortSignal.timeout(15e3)) {
+  let response;
+  try {
+    const collection = kind === "task" ? "tasks" : "files";
+    response = await request(
+      `${getUpstreamBaseUrl()}/v1/${collection}/${encodeURIComponent(upstreamId)}`,
+      {
+        method: "GET",
+        redirect: "error",
+        headers: {
+          API_KEY: apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json"
+        },
+        signal
+      }
+    );
+  } catch {
+    throw new TRPCError3({
+      code: "SERVICE_UNAVAILABLE",
+      message: "\u4E0A\u6E38\u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u65E0\u6CD5\u9A8C\u8BC1\u5386\u53F2\u4EFB\u52A1\u6216\u6587\u4EF6\u5F52\u5C5E"
+    });
+  }
+  const { ok, status } = response;
+  await response.body?.cancel().catch(() => void 0);
+  if (status === 401 || status === 403 || status === 404) {
+    throw new TRPCError3({
+      code: "FORBIDDEN",
+      message: "\u5F53\u524D API Key \u65E0\u6CD5\u8BBF\u95EE\u8BE5\u5386\u53F2\u4EFB\u52A1\u6216\u6587\u4EF6"
+    });
+  }
+  if (!ok) {
+    throw new TRPCError3({
+      code: "SERVICE_UNAVAILABLE",
+      message: "\u4E0A\u6E38\u670D\u52A1\u6682\u65F6\u65E0\u6CD5\u9A8C\u8BC1\u5386\u53F2\u4EFB\u52A1\u6216\u6587\u4EF6\u5F52\u5C5E"
+    });
+  }
+}
+async function persistResource(executor, input, validatedResourceKeys) {
+  const existing = await assertResourceOwnership(
+    executor,
+    input.userId,
+    input.kind,
+    input.upstreamId
+  );
+  if (existing) return;
+  if (!validatedResourceKeys?.has(upstreamResourceKey(input.kind, input.upstreamId))) {
+    throw new TRPCError3({
+      code: "FORBIDDEN",
+      message: "\u5386\u53F2\u4EFB\u52A1\u6216\u6587\u4EF6\u5C1A\u672A\u9A8C\u8BC1\uFF0C\u8BF7\u901A\u8FC7\u672C\u5730\u8BB0\u5F55\u8FC1\u79FB\u5165\u53E3\u5BFC\u5165"
+    });
+  }
+  await executor.insert(upstreamResources).values({
+    id: randomUUID2(),
+    userId: input.userId,
+    apiCredentialId: input.apiCredentialId,
+    kind: input.kind,
+    upstreamId: input.upstreamId,
+    conversationId: input.conversationId
+  }).onDuplicateKeyUpdate({
+    // Never mutate an existing owner's row on a duplicate-key race.
+    set: { upstreamId: input.upstreamId }
+  });
+  await assertResourceOwnership(executor, input.userId, input.kind, input.upstreamId);
+}
+function buildMessageMetadata(message) {
+  const metadata = {};
+  if (message.outputFiles) metadata.outputFiles = message.outputFiles;
+  if (message.inlineImages) metadata.inlineImages = message.inlineImages;
+  if (message.elapsedTime !== void 0) metadata.elapsedTime = message.elapsedTime;
+  if (message.responseStartedAt !== void 0) {
+    metadata.responseStartedAt = message.responseStartedAt;
+  }
+  if (message.intermediateSteps) metadata.intermediateSteps = message.intermediateSteps;
+  if (message.stepGroups) metadata.stepGroups = message.stepGroups;
+  if (message.isStepsPlaceholder !== void 0) {
+    metadata.isStepsPlaceholder = message.isStepsPlaceholder;
+  }
+  if (message.modelName) metadata.modelName = message.modelName;
+  return Object.keys(metadata).length > 0 ? metadata : null;
+}
+async function loadPersistedMessages(executor, userId, conversationId) {
+  const messageRows = await executor.select().from(messages).where(
+    and2(
+      eq3(messages.userId, userId),
+      eq3(messages.conversationId, conversationId),
+      isNull2(messages.deletedAt)
+    )
+  ).orderBy(asc(messages.sequence));
+  const messageIds = messageRows.map((row) => row.id);
+  const attachmentRows = messageIds.length === 0 ? [] : await executor.select().from(attachments).where(
+    and2(
+      eq3(attachments.userId, userId),
+      inArray(attachments.messageId, messageIds),
+      isNull2(attachments.deletedAt)
+    )
+  );
+  const attachmentsByMessage = /* @__PURE__ */ new Map();
+  for (const attachment of attachmentRows) {
+    const current = attachmentsByMessage.get(attachment.messageId) ?? [];
+    current.push(attachment);
+    attachmentsByMessage.set(attachment.messageId, current);
+  }
+  return messageRows.map((message) => {
+    const metadata = message.metadata ?? {};
+    return {
+      id: publicId(userId, message.id),
+      role: message.role === "assistant" ? "assistant" : "user",
+      content: message.content,
+      timestamp: message.sentAt.getTime(),
+      attachments: (attachmentsByMessage.get(message.id) ?? []).map(
+        (attachment) => ({
+          id: publicId(userId, attachment.id),
+          type: attachment.kind,
+          name: attachment.fileName,
+          ...attachment.upstreamFileId ? { fileId: attachment.upstreamFileId } : {}
+        })
+      ),
+      ...metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {},
+      ...metadata.inlineImages ? { inlineImages: metadata.inlineImages } : {},
+      ...metadata.elapsedTime !== void 0 ? { elapsedTime: metadata.elapsedTime } : {},
+      ...metadata.responseStartedAt !== void 0 ? { responseStartedAt: metadata.responseStartedAt } : {},
+      ...metadata.intermediateSteps ? { intermediateSteps: metadata.intermediateSteps } : {},
+      ...metadata.stepGroups ? { stepGroups: metadata.stepGroups } : {},
+      ...metadata.isStepsPlaceholder !== void 0 ? { isStepsPlaceholder: metadata.isStepsPlaceholder } : {},
+      ...metadata.modelName ? { modelName: metadata.modelName } : {}
+    };
+  });
+}
+function splitMessageTurns(messagesToSplit) {
+  const prelude = [];
+  const turns = [];
+  let currentTurn = null;
+  for (const message of messagesToSplit) {
+    if (message.role === "user") {
+      currentTurn = { user: message, assistants: [] };
+      turns.push(currentTurn);
+    } else if (currentTurn) {
+      currentTurn.assistants.push(message);
+    } else {
+      prelude.push(message);
+    }
+  }
+  return { prelude, turns };
+}
+function assistantProjectionScore(projected) {
+  const hasConcreteResult = projected.some((message) => !message.isStepsPlaceholder);
+  return projected.reduce((score, message) => {
+    if (message.isStepsPlaceholder) return score + 1;
+    return score + message.content.length + (message.outputFiles?.length ?? 0) * 1e4 + (message.inlineImages?.length ?? 0) * 1e4 + (message.stepGroups?.length ?? 0) * 1e3 + (message.intermediateSteps?.length ?? 0) * 100;
+  }, hasConcreteResult ? 1e9 : 0);
+}
+function mergeConversationMessages(persisted, incoming, deletedMessageIds) {
+  const deleted = new Set(deletedMessageIds);
+  const persistedSplit = splitMessageTurns(persisted);
+  const incomingSplit = splitMessageTurns(incoming);
+  const prelude = /* @__PURE__ */ new Map();
+  for (const message of persistedSplit.prelude) prelude.set(message.id, message);
+  for (const message of incomingSplit.prelude) prelude.set(message.id, message);
+  const turns = /* @__PURE__ */ new Map();
+  for (const turn of persistedSplit.turns) turns.set(turn.user.id, turn);
+  for (const turn of incomingSplit.turns) {
+    const persistedTurn = turns.get(turn.user.id);
+    if (!persistedTurn) {
+      turns.set(turn.user.id, turn);
+      continue;
+    }
+    if (assistantProjectionScore(turn.assistants) > assistantProjectionScore(persistedTurn.assistants)) {
+      turns.set(turn.user.id, {
+        user: persistedTurn.user,
+        assistants: turn.assistants
+      });
+    }
+  }
+  const mergedPrelude = Array.from(prelude.values()).filter((message) => !deleted.has(message.id)).sort((left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id));
+  const mergedTurns = Array.from(turns.values()).filter((turn) => !deleted.has(turn.user.id)).sort(
+    (left, right) => left.user.timestamp - right.user.timestamp || left.user.id.localeCompare(right.user.id)
+  );
+  return [
+    ...mergedPrelude,
+    ...mergedTurns.flatMap((turn) => [
+      turn.user,
+      ...turn.assistants.filter((message) => !deleted.has(message.id))
+    ])
+  ];
+}
+async function persistSnapshot(executor, userId, snapshot, options = {}) {
+  const persistedConversationId = storageId(userId, snapshot.id);
+  const existingRows = await executor.select().from(conversations).where(eq3(conversations.id, persistedConversationId)).limit(1).for("update");
+  const existing = existingRows[0];
+  if (existing && existing.userId !== userId) {
+    throw new TRPCError3({ code: "FORBIDDEN", message: "\u4F1A\u8BDD ID \u5DF2\u5C5E\u4E8E\u5176\u4ED6\u8D26\u53F7" });
+  }
+  if (existing?.deletedAt) {
+    if (options.skipExisting) return "skipped";
+    throw new TRPCError3({ code: "NOT_FOUND", message: "\u4F1A\u8BDD\u5DF2\u5220\u9664" });
+  }
+  if (existing && options.skipExisting) return "skipped";
+  if (existing) {
+    const deletedMessageIds = Array.from(
+      /* @__PURE__ */ new Set([
+        ...existing.deletedMessageIds,
+        ...snapshot.deletedMessageIds ?? []
+      ])
+    );
+    const persistedMessages = await loadPersistedMessages(
+      executor,
+      userId,
+      persistedConversationId
+    );
+    snapshot = {
+      ...snapshot,
+      messages: mergeConversationMessages(
+        persistedMessages,
+        snapshot.messages,
+        deletedMessageIds
+      ),
+      taskId: snapshot.taskId ?? existing.upstreamTaskId ?? void 0,
+      previousResponseId: snapshot.previousResponseId ?? existing.previousResponseId ?? void 0,
+      taskUrl: snapshot.taskUrl ?? existing.taskUrl ?? void 0,
+      startedAt: snapshot.startedAt ?? existing.startedAt?.getTime(),
+      completedAt: snapshot.completedAt ?? existing.completedAt?.getTime(),
+      lastKnownOutputLength: Math.max(
+        snapshot.lastKnownOutputLength ?? 0,
+        existing.lastKnownOutputLength
+      ),
+      deletedMessageIds,
+      createdAt: existing.createdAt.getTime(),
+      // Server arrival order determines scalar-field precedence; message turns
+      // are merged above, so device clock skew cannot erase another turn.
+      updatedAt: Date.now()
+    };
+  }
+  const apiCredentialId = existing?.apiCredentialId ?? options.importCredentialId ?? await getActiveCredentialId(executor, userId) ?? null;
+  const hasUpstreamResources = Boolean(snapshot.taskId) || snapshot.messages.some(
+    (message) => message.attachments?.some((attachment) => Boolean(attachment.fileId))
+  );
+  if (hasUpstreamResources && !apiCredentialId) {
+    throw new TRPCError3({
+      code: "PRECONDITION_FAILED",
+      message: "\u8BF7\u5148\u8FC1\u79FB\u6216\u914D\u7F6E\u8BE5\u4F1A\u8BDD\u539F\u6765\u4F7F\u7528\u7684 API Key\uFF0C\u518D\u5BFC\u5165\u5386\u53F2\u4F1A\u8BDD"
+    });
+  }
+  if (hasUpstreamResources && apiCredentialId) {
+    const credentialRows = await executor.select({ status: apiCredentials.status }).from(apiCredentials).where(
+      and2(
+        eq3(apiCredentials.id, apiCredentialId),
+        eq3(apiCredentials.userId, userId)
+      )
+    ).limit(1);
+    const credential = credentialRows[0];
+    if (!credential || credential.status === "deleted") {
+      throw new TRPCError3({
+        code: "PRECONDITION_FAILED",
+        message: "\u8BE5\u4F1A\u8BDD\u539F\u6765\u4F7F\u7528\u7684 API Key \u5DF2\u4E0D\u53EF\u7528"
+      });
+    }
+  }
+  const conversationValues = {
+    userId,
+    apiCredentialId,
+    title: snapshot.title,
+    status: snapshot.status,
+    upstreamTaskId: snapshot.taskId ?? null,
+    previousResponseId: snapshot.previousResponseId ?? null,
+    taskUrl: snapshot.taskUrl ?? null,
+    lastKnownOutputLength: snapshot.lastKnownOutputLength ?? 0,
+    deletedMessageIds: snapshot.deletedMessageIds ?? [],
+    startedAt: asDate(snapshot.startedAt),
+    completedAt: asDate(snapshot.completedAt),
+    createdAt: asDate(snapshot.createdAt) ?? /* @__PURE__ */ new Date(),
+    updatedAt: asDate(snapshot.updatedAt) ?? /* @__PURE__ */ new Date()
+  };
+  if (existing) {
+    await executor.update(conversations).set({ ...conversationValues, version: existing.version + 1 }).where(
+      and2(
+        eq3(conversations.id, persistedConversationId),
+        eq3(conversations.userId, userId)
+      )
+    );
+  } else {
+    await executor.insert(conversations).values({
+      id: persistedConversationId,
+      ...conversationValues,
+      version: 1
+    });
+  }
+  const incomingMessageIds = snapshot.messages.map((message) => storageId(userId, message.id));
+  if (incomingMessageIds.length > 0) {
+    const collisions = await executor.select({ id: messages.id, conversationId: messages.conversationId, userId: messages.userId }).from(messages).where(inArray(messages.id, incomingMessageIds));
+    if (collisions.some(
+      (row) => row.userId !== userId || row.conversationId !== persistedConversationId
+    )) {
+      throw new TRPCError3({ code: "CONFLICT", message: "\u6D88\u606F ID \u4E0E\u5176\u4ED6\u4F1A\u8BDD\u51B2\u7A81" });
+    }
+  }
+  await executor.delete(messages).where(eq3(messages.conversationId, persistedConversationId));
+  for (let sequence = 0; sequence < snapshot.messages.length; sequence += 1) {
+    const message = snapshot.messages[sequence];
+    const sentAt = asDate(message.timestamp) ?? /* @__PURE__ */ new Date();
+    await executor.insert(messages).values({
+      id: storageId(userId, message.id),
+      conversationId: persistedConversationId,
+      userId,
+      role: message.role,
+      content: message.content,
+      sequence,
+      metadata: buildMessageMetadata(message),
+      sentAt,
+      createdAt: sentAt
+    });
+    for (const attachment of message.attachments ?? []) {
+      await executor.insert(attachments).values({
+        id: storageId(userId, attachment.id),
+        userId,
+        conversationId: persistedConversationId,
+        messageId: storageId(userId, message.id),
+        apiCredentialId,
+        kind: attachment.type,
+        fileName: attachment.name,
+        upstreamFileId: attachment.fileId ?? null
+      });
+      if (attachment.fileId && apiCredentialId) {
+        await persistResource(executor, {
+          userId,
+          apiCredentialId,
+          kind: "file",
+          upstreamId: attachment.fileId,
+          conversationId: persistedConversationId
+        }, options.validatedResourceKeys);
+      }
+    }
+  }
+  if (snapshot.taskId && apiCredentialId) {
+    await persistResource(executor, {
+      userId,
+      apiCredentialId,
+      kind: "task",
+      upstreamId: snapshot.taskId,
+      conversationId: persistedConversationId
+    }, options.validatedResourceKeys);
+  }
+  return existing ? "updated" : "imported";
+}
+async function validateWithBoundedConcurrency(resources, apiKey) {
+  if (resources.length === 0) return;
+  const abortController = new AbortController();
+  const signal = AbortSignal.any([
+    abortController.signal,
+    AbortSignal.timeout(LEGACY_IMPORT_VALIDATION_TIMEOUT_MS)
+  ]);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < resources.length) {
+      const resource = resources[nextIndex];
+      nextIndex += 1;
+      await validateUpstreamResourceAccess(
+        apiKey,
+        resource.kind,
+        resource.id,
+        fetch,
+        signal
+      );
+    }
+  };
+  try {
+    await Promise.all(
+      Array.from(
+        { length: Math.min(LEGACY_IMPORT_VALIDATION_CONCURRENCY, resources.length) },
+        () => worker()
+      )
+    );
+  } catch (error) {
+    abortController.abort();
+    throw error;
+  }
+}
+async function prepareLegacyImport(userId, snapshots) {
+  const db = requireDb2(await getDb());
+  const persistedIds = snapshots.map((snapshot) => storageId(userId, snapshot.id));
+  const existingRows = persistedIds.length === 0 ? [] : await db.select({ id: conversations.id }).from(conversations).where(inArray(conversations.id, persistedIds));
+  const existingIds = new Set(existingRows.map((row) => row.id));
+  const newSnapshots = snapshots.filter(
+    (snapshot) => !existingIds.has(storageId(userId, snapshot.id))
+  );
+  const resources = collectSnapshotResourceRefs(newSnapshots);
+  if (resources.length === 0) {
+    return { credentialId: void 0, validatedResourceKeys: /* @__PURE__ */ new Set() };
+  }
+  const taskIds = resources.filter((item) => item.kind === "task").map((item) => item.id);
+  const fileIds = resources.filter((item) => item.kind === "file").map((item) => item.id);
+  const [knownTasks, knownFiles] = await Promise.all([
+    taskIds.length === 0 ? [] : db.select({
+      kind: upstreamResources.kind,
+      upstreamId: upstreamResources.upstreamId,
+      userId: upstreamResources.userId
+    }).from(upstreamResources).where(
+      and2(
+        eq3(upstreamResources.kind, "task"),
+        inArray(upstreamResources.upstreamId, taskIds)
+      )
+    ),
+    fileIds.length === 0 ? [] : db.select({
+      kind: upstreamResources.kind,
+      upstreamId: upstreamResources.upstreamId,
+      userId: upstreamResources.userId
+    }).from(upstreamResources).where(
+      and2(
+        eq3(upstreamResources.kind, "file"),
+        inArray(upstreamResources.upstreamId, fileIds)
+      )
+    )
+  ]);
+  const known = /* @__PURE__ */ new Set();
+  for (const resource of [...knownTasks, ...knownFiles]) {
+    if (resource.userId !== userId) {
+      throw new TRPCError3({
+        code: "FORBIDDEN",
+        message: "\u5386\u53F2\u4EFB\u52A1\u6216\u6587\u4EF6\u5DF2\u5C5E\u4E8E\u5176\u4ED6\u8D26\u53F7"
+      });
+    }
+    known.add(upstreamResourceKey(resource.kind, resource.upstreamId));
+  }
+  const unknown = resources.filter(
+    (resource) => !known.has(upstreamResourceKey(resource.kind, resource.id))
+  );
+  const credential = await getDecryptedCredentialForUser(userId);
+  if (!credential) {
+    throw new TRPCError3({
+      code: "PRECONDITION_FAILED",
+      message: "\u8BF7\u5148\u8FC1\u79FB\u6216\u914D\u7F6E\u8BE5\u4F1A\u8BDD\u539F\u6765\u4F7F\u7528\u7684 API Key\uFF0C\u518D\u5BFC\u5165\u5386\u53F2\u4F1A\u8BDD"
+    });
+  }
+  await validateWithBoundedConcurrency(unknown, credential.apiKey);
+  return {
+    credentialId: credential.id,
+    validatedResourceKeys: new Set(
+      unknown.map((resource) => upstreamResourceKey(resource.kind, resource.id))
+    )
+  };
+}
+async function listSnapshots(userId) {
+  const db = requireDb2(await getDb());
+  const conversationRows = await db.select().from(conversations).where(and2(eq3(conversations.userId, userId), isNull2(conversations.deletedAt))).orderBy(desc2(conversations.updatedAt));
+  if (conversationRows.length === 0) return [];
+  const ids = conversationRows.map((row) => row.id);
+  const messageRows = await db.select().from(messages).where(
+    and2(
+      eq3(messages.userId, userId),
+      inArray(messages.conversationId, ids),
+      isNull2(messages.deletedAt)
+    )
+  ).orderBy(asc(messages.sequence));
+  const messageIds = messageRows.map((row) => row.id);
+  const attachmentRows = messageIds.length === 0 ? [] : await db.select().from(attachments).where(
+    and2(
+      eq3(attachments.userId, userId),
+      inArray(attachments.messageId, messageIds),
+      isNull2(attachments.deletedAt)
+    )
+  );
+  const attachmentsByMessage = /* @__PURE__ */ new Map();
+  for (const attachment of attachmentRows) {
+    const current = attachmentsByMessage.get(attachment.messageId) ?? [];
+    current.push(attachment);
+    attachmentsByMessage.set(attachment.messageId, current);
+  }
+  const messagesByConversation = /* @__PURE__ */ new Map();
+  for (const message of messageRows) {
+    const current = messagesByConversation.get(message.conversationId) ?? [];
+    current.push(message);
+    messagesByConversation.set(message.conversationId, current);
+  }
+  return conversationRows.map((row) => ({
+    id: publicId(userId, row.id),
+    title: row.title,
+    messages: (messagesByConversation.get(row.id) ?? []).map((message) => {
+      const metadata = message.metadata ?? {};
+      return {
+        id: publicId(userId, message.id),
+        role: message.role === "assistant" ? "assistant" : "user",
+        content: message.content,
+        timestamp: message.sentAt.getTime(),
+        attachments: (attachmentsByMessage.get(message.id) ?? []).map((attachment) => ({
+          id: publicId(userId, attachment.id),
+          type: attachment.kind,
+          name: attachment.fileName,
+          ...attachment.upstreamFileId ? { fileId: attachment.upstreamFileId } : {}
+        })),
+        ...metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {},
+        ...metadata.inlineImages ? { inlineImages: metadata.inlineImages } : {},
+        ...metadata.elapsedTime !== void 0 ? { elapsedTime: metadata.elapsedTime } : {},
+        ...metadata.responseStartedAt !== void 0 ? { responseStartedAt: metadata.responseStartedAt } : {},
+        ...metadata.intermediateSteps ? { intermediateSteps: metadata.intermediateSteps } : {},
+        ...metadata.stepGroups ? { stepGroups: metadata.stepGroups } : {},
+        ...metadata.isStepsPlaceholder !== void 0 ? { isStepsPlaceholder: metadata.isStepsPlaceholder } : {},
+        ...metadata.modelName ? { modelName: metadata.modelName } : {}
+      };
+    }),
+    ...row.upstreamTaskId ? { taskId: row.upstreamTaskId } : {},
+    ...row.previousResponseId ? { previousResponseId: row.previousResponseId } : {},
+    status: row.status === "archived" ? "completed" : row.status,
+    ...row.taskUrl ? { taskUrl: row.taskUrl } : {},
+    createdAt: row.createdAt.getTime(),
+    updatedAt: row.updatedAt.getTime(),
+    ...row.startedAt ? { startedAt: row.startedAt.getTime() } : {},
+    ...row.completedAt ? { completedAt: row.completedAt.getTime() } : {},
+    lastKnownOutputLength: row.lastKnownOutputLength,
+    deletedMessageIds: row.deletedMessageIds
+  }));
+}
+var conversationRouter = router({
+  list: protectedProcedure.query(({ ctx }) => listSnapshots(ctx.user.id)),
+  syncSnapshot: protectedProcedure.input(z3.object({ conversation: conversationSnapshotSchema })).mutation(async ({ ctx, input }) => {
+    const db = requireDb2(await getDb());
+    await db.transaction(async (tx) => {
+      await persistSnapshot(tx, ctx.user.id, input.conversation);
+    });
+    const snapshots = await listSnapshots(ctx.user.id);
+    const persisted = snapshots.find((item) => item.id === input.conversation.id);
+    if (!persisted) {
+      throw new TRPCError3({ code: "INTERNAL_SERVER_ERROR", message: "\u4F1A\u8BDD\u4FDD\u5B58\u5931\u8D25" });
+    }
+    return persisted;
+  }),
+  delete: protectedProcedure.input(z3.object({ id: z3.string().min(1).max(128) })).mutation(async ({ ctx, input }) => {
+    const db = requireDb2(await getDb());
+    const persistedConversationId = storageId(ctx.user.id, input.id);
+    const existing = await db.select({ userId: conversations.userId }).from(conversations).where(eq3(conversations.id, persistedConversationId)).limit(1);
+    if (!existing[0] || existing[0].userId !== ctx.user.id) {
+      throw new TRPCError3({ code: "NOT_FOUND", message: "\u4F1A\u8BDD\u4E0D\u5B58\u5728" });
+    }
+    const now = /* @__PURE__ */ new Date();
+    await db.transaction(async (tx) => {
+      await tx.update(conversations).set({ deletedAt: now, updatedAt: now }).where(
+        and2(
+          eq3(conversations.id, persistedConversationId),
+          eq3(conversations.userId, ctx.user.id)
+        )
+      );
+      await tx.update(messages).set({ deletedAt: now }).where(
+        and2(
+          eq3(messages.conversationId, persistedConversationId),
+          eq3(messages.userId, ctx.user.id)
+        )
+      );
+      await tx.update(attachments).set({ deletedAt: now }).where(
+        and2(
+          eq3(attachments.conversationId, persistedConversationId),
+          eq3(attachments.userId, ctx.user.id)
+        )
+      );
+    });
+    return { success: true };
+  }),
+  importLocal: protectedProcedure.input(z3.object({ conversations: z3.array(conversationSnapshotSchema).max(200) })).mutation(async ({ ctx, input }) => {
+    const db = requireDb2(await getDb());
+    const prepared = await prepareLegacyImport(ctx.user.id, input.conversations);
+    let imported = 0;
+    let skipped = 0;
+    for (const conversation of input.conversations) {
+      const result = await db.transaction(
+        (tx) => persistSnapshot(tx, ctx.user.id, conversation, {
+          skipExisting: true,
+          importCredentialId: prepared.credentialId,
+          validatedResourceKeys: prepared.validatedResourceKeys
+        })
+      );
+      if (result === "imported") imported += 1;
+      else skipped += 1;
+    }
+    return { imported, skipped };
+  })
+});
+
+// server/credential-router.ts
+import { z as z4 } from "zod";
+var apiKeyInput = z4.object({
+  apiKey: z4.string().trim().min(8, "API Key is too short").max(4096)
+});
+async function saveCredential(userId, apiKey) {
+  try {
+    return await replaceApiCredential(userId, apiKey);
+  } catch (error) {
+    throw toTrpcError(error);
+  }
+}
+var credentialRouter = router({
+  status: protectedProcedure.query(async ({ ctx }) => {
+    try {
+      return await getApiCredentialStatus(ctx.user.id);
+    } catch (error) {
+      throw toTrpcError(error);
+    }
+  }),
+  set: protectedProcedure.input(apiKeyInput).mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
+  replace: protectedProcedure.input(apiKeyInput).mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
+  delete: protectedProcedure.mutation(async ({ ctx }) => {
+    try {
+      await deleteActiveApiCredential(ctx.user.id);
+      return { success: true };
+    } catch (error) {
+      throw toTrpcError(error);
+    }
+  })
+});
+
 // server/_core/systemRouter.ts
-import { z } from "zod";
+import { z as z5 } from "zod";
 
 // server/_core/notification.ts
-import { TRPCError } from "@trpc/server";
-
-// server/_core/env.ts
-var ENV = {
-  appId: process.env.VITE_APP_ID ?? "",
-  cookieSecret: process.env.JWT_SECRET ?? "",
-  databaseUrl: process.env.DATABASE_URL ?? "",
-  oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
-  ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
-  isProduction: process.env.NODE_ENV === "production",
-  forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
-  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? ""
-};
-
-// server/_core/notification.ts
+import { TRPCError as TRPCError4 } from "@trpc/server";
 var TITLE_MAX_LENGTH = 1200;
 var CONTENT_MAX_LENGTH = 2e4;
 var trimValue = (value) => value.trim();
@@ -58,13 +1891,13 @@ var buildEndpointUrl = (baseUrl) => {
 };
 var validatePayload = (input) => {
   if (!isNonEmptyString(input.title)) {
-    throw new TRPCError({
+    throw new TRPCError4({
       code: "BAD_REQUEST",
       message: "Notification title is required."
     });
   }
   if (!isNonEmptyString(input.content)) {
-    throw new TRPCError({
+    throw new TRPCError4({
       code: "BAD_REQUEST",
       message: "Notification content is required."
     });
@@ -72,13 +1905,13 @@ var validatePayload = (input) => {
   const title = trimValue(input.title);
   const content = trimValue(input.content);
   if (title.length > TITLE_MAX_LENGTH) {
-    throw new TRPCError({
+    throw new TRPCError4({
       code: "BAD_REQUEST",
       message: `Notification title must be at most ${TITLE_MAX_LENGTH} characters.`
     });
   }
   if (content.length > CONTENT_MAX_LENGTH) {
-    throw new TRPCError({
+    throw new TRPCError4({
       code: "BAD_REQUEST",
       message: `Notification content must be at most ${CONTENT_MAX_LENGTH} characters.`
     });
@@ -88,13 +1921,13 @@ var validatePayload = (input) => {
 async function notifyOwner(payload) {
   const { title, content } = validatePayload(payload);
   if (!ENV.forgeApiUrl) {
-    throw new TRPCError({
+    throw new TRPCError4({
       code: "INTERNAL_SERVER_ERROR",
       message: "Notification service URL is not configured."
     });
   }
   if (!ENV.forgeApiKey) {
-    throw new TRPCError({
+    throw new TRPCError4({
       code: "INTERNAL_SERVER_ERROR",
       message: "Notification service API key is not configured."
     });
@@ -125,30 +1958,19 @@ async function notifyOwner(payload) {
   }
 }
 
-// server/_core/trpc.ts
-import { initTRPC } from "@trpc/server";
-import superjson from "superjson";
-var t = initTRPC.context().create({
-  transformer: superjson
-});
-var router = t.router;
-var publicProcedure = t.procedure;
-var protectedProcedure = t.procedure;
-var adminProcedure = t.procedure;
-
 // server/_core/systemRouter.ts
 var systemRouter = router({
   health: publicProcedure.input(
-    z.object({
-      timestamp: z.number().min(0, "timestamp cannot be negative")
+    z5.object({
+      timestamp: z5.number().min(0, "timestamp cannot be negative")
     })
   ).query(() => ({
     ok: true
   })),
   notifyOwner: adminProcedure.input(
-    z.object({
-      title: z.string().min(1, "title is required"),
-      content: z.string().min(1, "content is required")
+    z5.object({
+      title: z5.string().min(1, "title is required"),
+      content: z5.string().min(1, "content is required")
     })
   ).mutation(async ({ input }) => {
     const delivered = await notifyOwner(input);
@@ -161,26 +1983,19 @@ var systemRouter = router({
 // server/routers.ts
 var appRouter = router({
   system: systemRouter,
-  auth: router({
-    me: publicProcedure.query(() => null),
-    logout: publicProcedure.mutation(({ ctx }) => {
-      ctx.res.clearCookie(COOKIE_NAME, {
-        ...getSessionCookieOptions(ctx.req),
-        maxAge: -1
-      });
-      return {
-        success: true
-      };
-    })
-  })
+  auth: authRouter,
+  admin: adminRouter,
+  credential: credentialRouter,
+  conversation: conversationRouter
 });
 
 // server/_core/context.ts
 async function createContext(opts) {
+  const user = await authenticateRequest(opts.req);
   return {
     req: opts.req,
     res: opts.res,
-    user: null
+    user
   };
 }
 
@@ -415,77 +2230,34 @@ function serveStatic(app) {
 import { Router } from "express";
 import axios from "axios";
 import zlib from "zlib";
-import { randomUUID } from "crypto";
-import net from "net";
+import { randomUUID as randomUUID3 } from "crypto";
 
-// server/upstream-config.ts
-var UPSTREAM_VENDOR = ["ma", "nus"].join("");
-var DEFAULT_UPSTREAM_BASE_URL = `https://api.${UPSTREAM_VENDOR}.im`;
-function getUpstreamBaseUrl(req) {
-  const configured = process.env.FRONTMIND_UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL;
-  const allowClientOverride = process.env.FRONTMIND_ALLOW_CLIENT_BASE_URL === "1";
-  const clientBaseUrl = allowClientOverride && req ? String(req.headers["x-frontmind-base-url"] || "") : "";
-  return (clientBaseUrl || configured).replace(/\/$/, "");
-}
-function getFrontMindApiKey(req) {
-  return String(
-    process.env.FRONTMIND_API_KEY || req.headers["x-frontmind-api-key"] || ""
-  );
-}
-function getFrontMindCredentials(req) {
-  return {
-    apiKey: getFrontMindApiKey(req),
-    baseUrl: getUpstreamBaseUrl(req)
-  };
-}
-function toUpstreamAgentProfile(agentProfile) {
-  switch (agentProfile) {
-    case "frontmind-lite":
-      return `${UPSTREAM_VENDOR}-1.6-lite`;
-    case "frontmind-base":
-      return `${UPSTREAM_VENDOR}-1.6`;
-    case "frontmind-pro":
-    case void 0:
-    case "":
-      return `${UPSTREAM_VENDOR}-1.6-max`;
-    default:
-      return agentProfile;
-  }
-}
-function translateTaskBodyForUpstream(body) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return body;
-  }
-  const next = { ...body };
-  if (typeof next.agentProfile === "string") {
-    next.agentProfile = toUpstreamAgentProfile(next.agentProfile);
-  }
-  return next;
-}
-
-// server/manus-proxy.ts
-var router2 = Router();
-var fileMetaCache = /* @__PURE__ */ new Map();
-var CACHE_TTL = 10 * 60 * 1e3;
-var downloadTokenCache = /* @__PURE__ */ new Map();
-var DOWNLOAD_TOKEN_TTL = 5 * 60 * 1e3;
+// server/_core/safe-external-url.ts
+import dns from "node:dns";
+import http from "node:http";
+import https from "node:https";
+import net from "node:net";
 var ExternalUrlRejectedError = class extends Error {
 };
-function isBlockedExternalHostname(hostname) {
+function isBlockedIpv4(address) {
+  const parts = address.split(".").map((part) => Number(part));
+  const [a, b, c] = parts;
+  return parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255) || a === 0 || a === 10 || a === 127 || a === 100 && b >= 64 && b <= 127 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 192 && b === 0 && c === 0 || a === 198 && (b === 18 || b === 19) || a >= 224;
+}
+function isBlockedNetworkAddress(address) {
+  const normalized = address.toLowerCase().replace(/^\[|\]$/g, "");
+  const family = net.isIP(normalized);
+  if (family === 4) return isBlockedIpv4(normalized);
+  if (family !== 6) return true;
+  const mappedIpv4 = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  if (mappedIpv4) return isBlockedIpv4(mappedIpv4);
+  return normalized === "::" || normalized === "::1" || normalized.startsWith("::") || normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe") || normalized.startsWith("ff");
+}
+function assertSafeHostname(hostname) {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!host) return true;
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host === "host.docker.internal" || host === "metadata.google.internal") {
-    return true;
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host === "host.docker.internal" || host === "metadata.google.internal" || net.isIP(host) > 0 && isBlockedNetworkAddress(host)) {
+    throw new ExternalUrlRejectedError("Blocked external URL host");
   }
-  if (net.isIP(host) === 4) {
-    const parts = host.split(".").map((part) => Number(part));
-    const [a, b] = parts;
-    return a === 0 || a === 10 || a === 127 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 100 && b >= 64 && b <= 127 || a === 198 && (b === 18 || b === 19) || a >= 224;
-  }
-  if (net.isIP(host) === 6) {
-    return host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe8") || host.startsWith("fe9") || host.startsWith("fea") || host.startsWith("feb") || host.startsWith("::ffff:127.") || host.startsWith("::ffff:10.") || host.startsWith("::ffff:192.168.") || host.startsWith("::ffff:169.254.");
-  }
-  return false;
 }
 function assertSafeExternalUrl(value) {
   let parsed;
@@ -497,10 +2269,85 @@ function assertSafeExternalUrl(value) {
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
     throw new ExternalUrlRejectedError("Unsupported external URL protocol");
   }
-  if (parsed.username || parsed.password || isBlockedExternalHostname(parsed.hostname)) {
-    throw new ExternalUrlRejectedError("Blocked external URL host");
+  if (parsed.username || parsed.password) {
+    throw new ExternalUrlRejectedError("Credentials are not allowed in external URLs");
   }
+  assertSafeHostname(parsed.hostname);
   return parsed.toString();
+}
+var safeLookup = ((hostname, options, callback) => {
+  const requestedFamily = typeof options === "number" ? options : options?.family ?? 0;
+  const returnAll = typeof options === "object" && Boolean(options?.all);
+  try {
+    assertSafeHostname(hostname);
+  } catch (error) {
+    callback(error);
+    return;
+  }
+  dns.lookup(hostname, { all: true, verbatim: true }, (error, addresses) => {
+    if (error) {
+      callback(error);
+      return;
+    }
+    if (addresses.length === 0 || addresses.some((result) => isBlockedNetworkAddress(result.address))) {
+      callback(new ExternalUrlRejectedError("External hostname resolved to a blocked address"));
+      return;
+    }
+    const matching = requestedFamily ? addresses.filter((result) => result.family === requestedFamily) : addresses;
+    if (matching.length === 0) {
+      callback(new ExternalUrlRejectedError("External hostname has no usable address"));
+      return;
+    }
+    if (returnAll) callback(null, matching);
+    else callback(null, matching[0].address, matching[0].family);
+  });
+});
+var httpAgent = new http.Agent({ keepAlive: true, lookup: safeLookup });
+var httpsAgent = new https.Agent({ keepAlive: true, lookup: safeLookup });
+function beforeRedirect(options) {
+  const protocol = String(options.protocol ?? "");
+  const hostname = String(options.hostname ?? "");
+  if (protocol !== "http:" && protocol !== "https:") {
+    throw new ExternalUrlRejectedError("Blocked redirect protocol");
+  }
+  if (options.auth) {
+    throw new ExternalUrlRejectedError("Blocked redirect credentials");
+  }
+  assertSafeHostname(hostname);
+}
+var SAFE_EXTERNAL_MAX_BYTES = Math.max(
+  1,
+  Number(process.env.FRONTMIND_EXTERNAL_DOWNLOAD_MAX_BYTES) || 100 * 1024 * 1024
+);
+var safeExternalRequestOptions = {
+  httpAgent,
+  httpsAgent,
+  // Axios otherwise honors HTTP(S)_PROXY. That would move DNS resolution to
+  // the proxy and bypass the private-address checks in safeLookup.
+  proxy: false,
+  maxRedirects: 3,
+  beforeRedirect
+};
+
+// server/manus-proxy.ts
+var router2 = Router();
+var fileMetaCache = /* @__PURE__ */ new Map();
+var CACHE_TTL = 10 * 60 * 1e3;
+var downloadTokenCache = /* @__PURE__ */ new Map();
+var DOWNLOAD_TOKEN_TTL = 5 * 60 * 1e3;
+var PROXY_UPLOAD_MAX_BYTES = Math.max(
+  1,
+  Number(process.env.FRONTMIND_PROXY_UPLOAD_MAX_BYTES) || 100 * 1024 * 1024
+);
+var ProxyUploadTooLargeError = class extends Error {
+};
+function safeUrlForLog(value) {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.origin}${parsed.pathname}`.slice(0, 160);
+  } catch {
+    return "[invalid URL]";
+  }
 }
 function cleanupExpiredDownloadTokens() {
   const now = Date.now();
@@ -649,16 +2496,16 @@ function getSourceBrandTitle() {
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-function sanitizeText(text) {
-  if (!text || typeof text !== "string") return text || "";
+function sanitizeText(text2) {
+  if (!text2 || typeof text2 !== "string") return text2 || "";
   try {
     const sourceLower = getSourceBrandLower();
     const sourceTitle = getSourceBrandTitle();
     const sourceUpper = sourceLower.toUpperCase();
-    return text.replace(new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"), "https://api.frontmind.").replace(new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"), "https://www.frontmind.").replace(new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"), "https://frontmind.").replace(new RegExp(`\\b${escapeRegExp(sourceUpper)}\\b`, "g"), "FrontMind").replace(new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"), "FrontMind").replace(new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"), "frontmind");
+    return text2.replace(new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"), "https://api.frontmind.").replace(new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"), "https://www.frontmind.").replace(new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"), "https://frontmind.").replace(new RegExp(`\\b${escapeRegExp(sourceUpper)}\\b`, "g"), "FrontMind").replace(new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"), "FrontMind").replace(new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"), "frontmind");
   } catch (e) {
     console.error("[sanitizeText] Error:", e);
-    return text;
+    return text2;
   }
 }
 function sanitizeFilename(filename, fallback = "file") {
@@ -752,14 +2599,42 @@ function deepSanitizeJson(value, currentKey, depth = 0) {
   }
   return value;
 }
+function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
+  if (value === null || value === void 0 || depth > 50) return ids;
+  if (typeof value === "string") {
+    if ((currentKey === "file_id" || currentKey === "fileId") && value) {
+      ids.add(value);
+    }
+    if (currentKey === "url" || currentKey === "file_url" || currentKey === "fileUrl" || currentKey === "image_url" || currentKey === "imageUrl") {
+      const match = value.match(/\/v1\/files\/([^/?#]+)/);
+      if (match?.[1]) {
+        try {
+          ids.add(decodeURIComponent(match[1]));
+        } catch {
+        }
+      }
+    }
+    return ids;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectOutputFileIds(item, ids, void 0, depth + 1);
+    return ids;
+  }
+  if (typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      collectOutputFileIds(item, ids, key, depth + 1);
+    }
+  }
+  return ids;
+}
 function sanitizeTextFileBuffer(data, filename, contentType) {
   if (!isTextBasedFile(filename, contentType)) {
     return { buffer: data, wasSanitized: false };
   }
   try {
-    const text = data.toString("utf-8");
-    const sanitized = sanitizeText(text);
-    if (sanitized !== text) {
+    const text2 = data.toString("utf-8");
+    const sanitized = sanitizeText(text2);
+    if (sanitized !== text2) {
       console.log(`[FrontMind Proxy] Sanitized source-brand references in text file: ${filename}`);
       return { buffer: Buffer.from(sanitized, "utf-8"), wasSanitized: true };
     }
@@ -1417,11 +3292,31 @@ router2.put("/proxy-upload", async (req, res) => {
       return res.status(400).json({ error: { message: "Missing target URL" } });
     }
     const target = assertSafeExternalUrl(rawTarget);
-    console.log(`[FrontMind Proxy] Proxy-upload to: ${target.slice(0, 120)}...`);
+    console.log(`[FrontMind Proxy] Proxy-upload to: ${safeUrlForLog(target)}`);
+    const declaredLength = Number(req.headers["content-length"] || 0);
+    if (declaredLength > PROXY_UPLOAD_MAX_BYTES) {
+      throw new ProxyUploadTooLargeError("Upload body is too large");
+    }
     const chunks = [];
     await new Promise((resolve, reject) => {
-      req.on("data", (chunk) => chunks.push(chunk));
-      req.on("end", resolve);
+      if (req.readableEnded) {
+        resolve();
+        return;
+      }
+      let received = 0;
+      let tooLarge = false;
+      req.on("data", (chunk) => {
+        received += chunk.length;
+        if (received > PROXY_UPLOAD_MAX_BYTES) {
+          tooLarge = true;
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("end", () => {
+        if (tooLarge) reject(new ProxyUploadTooLargeError("Upload body is too large"));
+        else resolve();
+      });
       req.on("error", reject);
     });
     let body = Buffer.concat(chunks);
@@ -1435,20 +3330,29 @@ router2.put("/proxy-upload", async (req, res) => {
       }
       console.log(`[FrontMind Proxy] Recovered body from req.body (${body.length} bytes) \u2013 stream was consumed by body-parser`);
     }
+    if (body.length > PROXY_UPLOAD_MAX_BYTES) {
+      throw new ProxyUploadTooLargeError("Upload body is too large");
+    }
     const realContentType = req.headers["x-original-content-type"] || req.headers["content-type"] || "application/octet-stream";
     const response = await axios.put(target, body, {
+      ...safeExternalRequestOptions,
       headers: {
         "Content-Type": realContentType,
         "Content-Length": String(body.length)
       },
       timeout: 3e5,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
+      maxBodyLength: body.length,
+      maxContentLength: 1024 * 1024,
       validateStatus: () => true
     });
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response.status}`);
     res.status(response.status).send(response.data || "");
   } catch (error) {
+    if (error instanceof ProxyUploadTooLargeError) {
+      return res.status(413).json({
+        error: { message: "\u4E0A\u4F20\u6587\u4EF6\u8FC7\u5927", code: "UPLOAD_TOO_LARGE" }
+      });
+    }
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {
@@ -1475,11 +3379,12 @@ router2.get("/proxy-download", async (req, res) => {
       return res.status(400).json({ error: { message: "Missing url parameter" } });
     }
     const targetUrl = assertSafeExternalUrl(rawTargetUrl);
-    console.log(`[FrontMind Proxy] Proxy-download: ${targetUrl.slice(0, 120)}...`);
+    console.log(`[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`);
     const response = await axios.get(targetUrl, {
+      ...safeExternalRequestOptions,
       responseType: "arraybuffer",
       timeout: 12e4,
-      maxContentLength: Infinity,
+      maxContentLength: SAFE_EXTERNAL_MAX_BYTES,
       validateStatus: () => true
     });
     console.log(`[FrontMind Proxy] Proxy-download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`);
@@ -1559,11 +3464,13 @@ async function fetchFileMetadata(baseUrl, fileId, apiKey) {
   return { upload_url: "", filename: data.filename || fileId };
 }
 async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
-  console.log(`[FrontMind Proxy] Downloading from S3: ${s3Url.slice(0, 120)}...`);
-  const response = await axios.get(s3Url, {
+  const safeS3Url = assertSafeExternalUrl(s3Url);
+  console.log(`[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`);
+  const response = await axios.get(safeS3Url, {
+    ...safeExternalRequestOptions,
     responseType: "arraybuffer",
     timeout: 12e4,
-    maxContentLength: Infinity,
+    maxContentLength: SAFE_EXTERNAL_MAX_BYTES,
     validateStatus: () => true
   });
   console.log(`[FrontMind Proxy] S3 download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`);
@@ -1672,8 +3579,17 @@ router2.post("/download-token", async (req, res) => {
     if (!fileId) {
       return res.status(400).json({ error: { message: "Missing fileId", code: "MISSING_FILE_ID" } });
     }
-    const token = randomUUID();
-    downloadTokenCache.set(token, { fileId, apiKey, baseUrl, createdAt: Date.now() });
+    const token = randomUUID3();
+    if (!req.frontmindUser || !req.frontmindCredential) {
+      return res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
+    }
+    downloadTokenCache.set(token, {
+      fileId,
+      userId: req.frontmindUser.id,
+      apiKey,
+      baseUrl,
+      createdAt: Date.now()
+    });
     res.json({ downloadUrl: `/api/frontmind/download/${token}`, expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL });
   } catch (error) {
     console.error("[FrontMind Proxy] Create download token error:", error.message);
@@ -1687,6 +3603,9 @@ router2.get("/download/:token", async (req, res) => {
     const data = downloadTokenCache.get(token);
     if (!data) {
       return res.status(410).json({ error: { message: "Download link expired", code: "DOWNLOAD_LINK_EXPIRED" } });
+    }
+    if (!req.frontmindUser || req.frontmindUser.id !== data.userId) {
+      return res.status(403).json({ error: { message: "\u4E0B\u8F7D\u94FE\u63A5\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7", code: "DOWNLOAD_FORBIDDEN" } });
     }
     downloadTokenCache.delete(token);
     await handleFileDownload(res, data.baseUrl, data.fileId, data.apiKey, "attachment");
@@ -1750,6 +3669,27 @@ router2.all("/*", async (req, res) => {
       axiosConfig.data = translateTaskBodyForUpstream(req.body);
     }
     const response = await axios(axiosConfig);
+    if (response.status >= 200 && response.status < 300 && req.frontmindUser && req.frontmindCredential && response.data && typeof response.data === "object") {
+      const resourceId = String(response.data.id || response.data.task_id || "");
+      const isTaskCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/tasks";
+      const isFileCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/files";
+      if (resourceId && (isTaskCreate || isFileCreate)) {
+        await recordUpstreamResource({
+          userId: req.frontmindUser.id,
+          apiCredentialId: req.frontmindCredential.id,
+          kind: isTaskCreate ? "task" : "file",
+          upstreamId: resourceId
+        });
+      }
+      for (const fileId of collectOutputFileIds(response.data)) {
+        await recordUpstreamResource({
+          userId: req.frontmindUser.id,
+          apiCredentialId: req.frontmindCredential.id,
+          kind: "file",
+          upstreamId: fileId
+        });
+      }
+    }
     if (typeof response.data === "object" && response.data?.output) {
       const outputSummary = response.data.output.map(
         (item, i) => `${i}:${item.type || "message"}${item.id ? "(" + item.id.slice(0, 8) + ")" : ""}`
@@ -1799,11 +3739,13 @@ router2.all("/*", async (req, res) => {
 var manus_proxy_default = router2;
 
 // server/workflow-api.ts
-import { randomUUID as randomUUID2 } from "crypto";
+import { randomUUID as randomUUID4 } from "crypto";
 import fs4 from "fs/promises";
 import path4 from "path";
 import axios2 from "axios";
-import express2, { Router as Router2 } from "express";
+import express2, {
+  Router as Router2
+} from "express";
 import JSZip from "jszip";
 
 // server/workflow/manifest.ts
@@ -2352,6 +4294,11 @@ var router3 = Router2();
 var uploadsRoot = path4.resolve(process.cwd(), ".workflow-uploads");
 var uploadIndexName = "index.json";
 var defaultUploadRetentionMs = 24 * 60 * 60 * 1e3;
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    void handler(req, res, next).catch(next);
+  };
+}
 function sanitizeSegment(value, fallback) {
   const safe = String(value || "").replace(/[\\/\0]/g, "_").replace(/^\.+$/, "").trim().slice(0, 140);
   return safe || fallback;
@@ -2366,9 +4313,10 @@ function safeDecodeHeader(value) {
     return value;
   }
 }
-function getUploadDir(runId, stepId) {
+function getUploadDir(userId, runId, stepId) {
   return path4.join(
     uploadsRoot,
+    String(userId),
     sanitizeSegment(runId, "run"),
     sanitizeSegment(stepId, "step")
   );
@@ -2383,8 +4331,8 @@ function toPublicUpload(file) {
     uploadedAt: file.uploadedAt
   };
 }
-async function readUploadIndex(runId, stepId) {
-  const indexPath = path4.join(getUploadDir(runId, stepId), uploadIndexName);
+async function readUploadIndex(userId, runId, stepId) {
+  const indexPath = path4.join(getUploadDir(userId, runId, stepId), uploadIndexName);
   try {
     const raw = await fs4.readFile(indexPath, "utf-8");
     const parsed = JSON.parse(raw);
@@ -2393,36 +4341,45 @@ async function readUploadIndex(runId, stepId) {
     return [];
   }
 }
-async function writeUploadIndex(runId, stepId, files) {
-  const uploadDir = getUploadDir(runId, stepId);
+async function writeUploadIndex(userId, runId, stepId, files) {
+  const uploadDir = getUploadDir(userId, runId, stepId);
   await fs4.mkdir(uploadDir, { recursive: true });
   await fs4.writeFile(path4.join(uploadDir, uploadIndexName), JSON.stringify(files, null, 2), "utf-8");
 }
 async function cleanupStaleWorkflowUploads() {
   const retentionMs = Number(process.env.FRONTMIND_WORKFLOW_UPLOAD_TTL_MS || defaultUploadRetentionMs);
   if (!Number.isFinite(retentionMs) || retentionMs <= 0) return;
-  let entries;
+  let userEntries;
   try {
-    entries = await fs4.readdir(uploadsRoot, { withFileTypes: true });
+    userEntries = await fs4.readdir(uploadsRoot, { withFileTypes: true });
   } catch {
     return;
   }
   const cutoff = Date.now() - retentionMs;
   await Promise.all(
-    entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
-      const runPath = path4.join(uploadsRoot, entry.name);
+    userEntries.filter((entry) => entry.isDirectory()).map(async (userEntry) => {
+      const userPath = path4.join(uploadsRoot, userEntry.name);
       try {
-        const stat = await fs4.stat(runPath);
-        if (stat.mtimeMs < cutoff) {
-          await fs4.rm(runPath, { recursive: true, force: true });
+        const runEntries = await fs4.readdir(userPath, { withFileTypes: true });
+        await Promise.all(
+          runEntries.filter((entry) => entry.isDirectory()).map(async (runEntry) => {
+            const runPath = path4.join(userPath, runEntry.name);
+            const stat = await fs4.stat(runPath);
+            if (stat.mtimeMs < cutoff) {
+              await fs4.rm(runPath, { recursive: true, force: true });
+            }
+          })
+        );
+        if ((await fs4.readdir(userPath)).length === 0) {
+          await fs4.rmdir(userPath);
         }
       } catch {
       }
     })
   );
 }
-async function listPublicUploads(runId, stepId) {
-  const files = await readUploadIndex(runId, stepId);
+async function listPublicUploads(userId, runId, stepId) {
+  const files = await readUploadIndex(userId, runId, stepId);
   return files.map(toPublicUpload);
 }
 async function addPathToZip(zip, workflowRoot, relativeSource) {
@@ -2499,15 +4456,15 @@ function buildCurrentStepGateMarkdown(step2) {
     ``
   ].join("\n");
 }
-async function buildExecutionBundle(step2, runId, body, uploads) {
+async function buildExecutionBundle(userId, step2, runId, body, uploads) {
   const workflowRoot = await resolveWorkflowRoot();
   if (!workflowRoot) {
     throw new Error("Workflow root not configured");
   }
   const zip = new JSZip();
   await addPathToZip(zip, workflowRoot, ".");
-  const storedUploads = await readUploadIndex(runId, step2.id);
-  const uploadDir = getUploadDir(runId, step2.id);
+  const storedUploads = await readUploadIndex(userId, runId, step2.id);
+  const uploadDir = getUploadDir(userId, runId, step2.id);
   for (const upload of storedUploads) {
     const uploadPath = path4.join(uploadDir, upload.storedName);
     const buffer = await fs4.readFile(uploadPath);
@@ -2555,25 +4512,30 @@ async function uploadBufferToFrontMind(baseUrl, apiKey, filename, buffer, conten
   if (!fileRecord?.id || !fileRecord?.upload_url) {
     throw new Error("Create file record failed: missing file id or upload url");
   }
-  const uploadResponse = await axios2.put(fileRecord.upload_url, buffer, {
-    headers: {
-      "Content-Type": contentType,
-      "Content-Length": String(buffer.length)
-    },
-    timeout: 3e5,
-    maxBodyLength: Infinity,
-    maxContentLength: Infinity,
-    validateStatus: () => true
-  });
+  const uploadResponse = await axios2.put(
+    assertSafeExternalUrl(fileRecord.upload_url),
+    buffer,
+    {
+      ...safeExternalRequestOptions,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(buffer.length)
+      },
+      timeout: 3e5,
+      maxBodyLength: buffer.length,
+      maxContentLength: 1024 * 1024,
+      validateStatus: () => true
+    }
+  );
   if (uploadResponse.status < 200 || uploadResponse.status >= 300) {
     throw new Error(`Upload file failed (${uploadResponse.status})`);
   }
   return { fileId: fileRecord.id, filename };
 }
-async function uploadStoredUserFiles(baseUrl, apiKey, runId, stepId) {
-  const storedUploads = await readUploadIndex(runId, stepId);
-  const uploadDir = getUploadDir(runId, stepId);
-  const attachments = [];
+async function uploadStoredUserFiles(userId, baseUrl, apiKey, runId, stepId) {
+  const storedUploads = await readUploadIndex(userId, runId, stepId);
+  const uploadDir = getUploadDir(userId, runId, stepId);
+  const attachments2 = [];
   for (const upload of storedUploads) {
     const buffer = await fs4.readFile(path4.join(uploadDir, upload.storedName));
     const uploaded = await uploadBufferToFrontMind(
@@ -2583,9 +4545,9 @@ async function uploadStoredUserFiles(baseUrl, apiKey, runId, stepId) {
       buffer,
       upload.type || "application/octet-stream"
     );
-    attachments.push({ file_id: uploaded.fileId, filename: uploaded.filename });
+    attachments2.push({ file_id: uploaded.fileId, filename: uploaded.filename });
   }
-  return attachments;
+  return attachments2;
 }
 function buildAgentPrompt(step2) {
   return [
@@ -2612,22 +4574,35 @@ function buildAgentPrompt(step2) {
 router3.get("/manifest", (_req, res) => {
   res.json(workflowManifest);
 });
-router3.delete("/runs/:runId", async (req, res) => {
+router3.delete("/runs/:runId", asyncRoute(async (req, res) => {
   const runId = sanitizeSegment(String(req.params.runId || ""), "");
   if (!runId) {
     res.status(400).json({ error: "Missing run id" });
     return;
   }
-  await fs4.rm(path4.join(uploadsRoot, runId), { recursive: true, force: true });
+  const userId = req.frontmindUser?.id;
+  if (!userId) {
+    res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55" });
+    return;
+  }
+  await fs4.rm(path4.join(uploadsRoot, String(userId), runId), {
+    recursive: true,
+    force: true
+  });
   res.json({ success: true });
-});
+}));
 router3.post(
   "/runs/:runId/steps/:stepId/uploads",
   express2.raw({ type: "application/octet-stream", limit: "100mb" }),
-  async (req, res) => {
-    const runId = sanitizeSegment(String(req.params.runId || ""), `wf_${randomUUID2()}`);
+  asyncRoute(async (req, res) => {
+    const runId = sanitizeSegment(String(req.params.runId || ""), `wf_${randomUUID4()}`);
     const stepId = String(req.params.stepId || "");
     const step2 = getPrivateWorkflowStep(stepId);
+    const userId = req.frontmindUser?.id;
+    if (!userId) {
+      res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55" });
+      return;
+    }
     if (!step2) {
       res.status(404).json({ error: "Unknown workflow step" });
       return;
@@ -2638,9 +4613,9 @@ router3.post(
     }
     const originalName = sanitizeFileName(safeDecodeHeader(String(req.header("x-file-name") || "upload.bin")));
     const contentType = String(req.header("x-file-type") || "application/octet-stream");
-    const id = randomUUID2();
+    const id = randomUUID4();
     const storedName = `${id}_${originalName}`;
-    const uploadDir = getUploadDir(runId, step2.id);
+    const uploadDir = getUploadDir(userId, runId, step2.id);
     await fs4.mkdir(uploadDir, { recursive: true });
     await fs4.writeFile(path4.join(uploadDir, storedName), req.body);
     const file = {
@@ -2652,30 +4627,35 @@ router3.post(
       stepId: step2.id,
       uploadedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
-    const index = await readUploadIndex(runId, step2.id);
-    index.push(file);
-    await writeUploadIndex(runId, step2.id, index);
+    const index2 = await readUploadIndex(userId, runId, step2.id);
+    index2.push(file);
+    await writeUploadIndex(userId, runId, step2.id, index2);
     const response = {
       runId,
       stepId: step2.id,
       file: toPublicUpload(file)
     };
     res.json(response);
-  }
+  })
 );
-router3.post("/steps/:stepId/load", async (req, res) => {
+router3.post("/steps/:stepId/load", asyncRoute(async (req, res) => {
   const stepId = String(req.params.stepId || "");
   const body = req.body || {};
   const loadedPackage = await loadPrivateSkillPackage(stepId);
+  const userId = req.frontmindUser?.id;
+  if (!userId) {
+    res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55" });
+    return;
+  }
   if (!loadedPackage) {
     res.status(404).json({ error: "Unknown workflow step" });
     return;
   }
-  const runId = body.runId || `wf_${randomUUID2()}`;
-  const sessionId = `exec_${stepId}_${randomUUID2()}`;
+  const runId = body.runId || `wf_${randomUUID4()}`;
+  const sessionId = `exec_${stepId}_${randomUUID4()}`;
   const hasOperatorNotes = typeof body.operatorNotes === "string" && body.operatorNotes.trim().length > 0;
   const loaded = loadedPackage.loaded;
-  const contextUploads = await listPublicUploads(runId, stepId);
+  const contextUploads = await listPublicUploads(userId, runId, stepId);
   const uploadMessages = contextUploads.length > 0 ? [`\u5DF2\u7EB3\u5165 ${contextUploads.length} \u4E2A\u4E0A\u4F20\u6587\u4EF6\uFF1A${contextUploads.map((file) => file.name).join("\u3001")}\u3002`] : [];
   const response = {
     runId,
@@ -2712,12 +4692,17 @@ router3.post("/steps/:stepId/load", async (req, res) => {
     }
   };
   res.json(response);
-});
-router3.post("/steps/:stepId/execute", async (req, res) => {
+}));
+router3.post("/steps/:stepId/execute", asyncRoute(async (req, res) => {
   const stepId = String(req.params.stepId || "");
   const body = req.body || {};
   const loadedPackage = await loadPrivateSkillPackage(stepId);
   const step2 = getPrivateWorkflowStep(stepId);
+  const userId = req.frontmindUser?.id;
+  if (!userId) {
+    res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55" });
+    return;
+  }
   if (!loadedPackage || !step2) {
     res.status(404).json({ error: "Unknown workflow step" });
     return;
@@ -2727,12 +4712,18 @@ router3.post("/steps/:stepId/execute", async (req, res) => {
     res.status(401).json({ error: "Missing API key" });
     return;
   }
-  const runId = body.runId || `wf_${randomUUID2()}`;
-  const sessionId = `exec_${stepId}_${randomUUID2()}`;
+  const runId = body.runId || `wf_${randomUUID4()}`;
+  const sessionId = `exec_${stepId}_${randomUUID4()}`;
   const hasOperatorNotes = typeof body.operatorNotes === "string" && body.operatorNotes.trim().length > 0;
-  const contextUploads = await listPublicUploads(runId, stepId);
+  const contextUploads = await listPublicUploads(userId, runId, stepId);
   try {
-    const bundle = await buildExecutionBundle(step2, runId, body, contextUploads);
+    const bundle = await buildExecutionBundle(
+      userId,
+      step2,
+      runId,
+      body,
+      contextUploads
+    );
     const bundleFile = await uploadBufferToFrontMind(
       baseUrl,
       apiKey,
@@ -2740,18 +4731,36 @@ router3.post("/steps/:stepId/execute", async (req, res) => {
       bundle,
       "application/zip"
     );
-    const userFileAttachments = await uploadStoredUserFiles(baseUrl, apiKey, runId, stepId);
-    const attachments = [
+    const userFileAttachments = await uploadStoredUserFiles(
+      userId,
+      baseUrl,
+      apiKey,
+      runId,
+      stepId
+    );
+    const attachments2 = [
       { filename: bundleFile.filename, file_id: bundleFile.fileId },
       ...userFileAttachments
     ];
+    if (!req.frontmindUser || !req.frontmindCredential) {
+      res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55\u5E76\u914D\u7F6E API Key" });
+      return;
+    }
+    for (const attachment of attachments2) {
+      await recordUpstreamResource({
+        userId: req.frontmindUser.id,
+        apiCredentialId: req.frontmindCredential.id,
+        kind: "file",
+        upstreamId: attachment.file_id
+      });
+    }
     const taskResponse = await axios2.post(
       `${baseUrl}/v1/tasks`,
       {
         prompt: buildAgentPrompt(step2),
         agentProfile: toUpstreamAgentProfile(body.agentProfile),
         taskMode: "agent",
-        attachments
+        attachments: attachments2
       },
       {
         headers: {
@@ -2775,6 +4784,12 @@ router3.post("/steps/:stepId/execute", async (req, res) => {
       res.status(502).json({ error: "Create task failed: missing task id" });
       return;
     }
+    await recordUpstreamResource({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      kind: "task",
+      upstreamId: String(taskId)
+    });
     const normalizedStatus = taskData.status === "failed" ? "error" : taskData.status || "running";
     const uploadMessages = contextUploads.length > 0 ? [`\u5DF2\u7EB3\u5165 ${contextUploads.length} \u4E2A\u4E0A\u4F20\u6587\u4EF6\uFF1A${contextUploads.map((file) => file.name).join("\u3001")}\u3002`] : [];
     const response = {
@@ -2824,7 +4839,7 @@ router3.post("/steps/:stepId/execute", async (req, res) => {
     console.error("[Workflow Execute] error:", error.message);
     res.status(500).json({ error: "\u6267\u884C\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" });
   }
-});
+}));
 var workflow_api_default = router3;
 
 // server/news-release-api.ts
@@ -2835,8 +4850,8 @@ function sanitizeFilename2(value, fallback) {
   const safe = String(value || "").replace(/[\\/\0]/g, "_").replace(/^\.+$/, "").trim().slice(0, 160);
   return safe || fallback;
 }
-function normalizeUserAttachments(attachments) {
-  return (attachments || []).map((attachment) => {
+function normalizeUserAttachments(attachments2) {
+  return (attachments2 || []).map((attachment) => {
     const fileId = attachment.file_id || attachment.fileId || "";
     const filename = sanitizeFilename2(
       attachment.filename || attachment.name || "user_material",
@@ -3173,7 +5188,7 @@ async function createFrontMindTask({
   apiKey,
   prompt,
   agentProfile,
-  attachments
+  attachments: attachments2
 }) {
   const taskResponse = await axios3.post(
     `${baseUrl}/v1/tasks`,
@@ -3181,7 +5196,7 @@ async function createFrontMindTask({
       prompt,
       agentProfile: toUpstreamAgentProfile(agentProfile),
       taskMode: "agent",
-      attachments
+      attachments: attachments2
     },
     {
       headers: {
@@ -3240,6 +5255,16 @@ router4.post("/start", async (req, res) => {
       res.status(created.status).json({ error: "\u521B\u5EFA\u65B0\u95FB\u7A3F\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5 API Key \u6216\u7A0D\u540E\u91CD\u8BD5" });
       return;
     }
+    if (!req.frontmindUser || !req.frontmindCredential) {
+      res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55\u5E76\u914D\u7F6E API Key" });
+      return;
+    }
+    await recordUpstreamResource({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      kind: "task",
+      upstreamId: String(created.task.id)
+    });
     res.json({
       visibleMessage: "\u5F00\u59CB\u5236\u4F5C\u54C1\u724C\u65B0\u95FB\u7A3F\u6837\u4F8B",
       task: created.task,
@@ -3270,8 +5295,8 @@ function sanitizeFilename3(value, fallback) {
   const safe = String(value || "").replace(/[\\/\0]/g, "_").replace(/^\.+$/, "").trim().slice(0, 160);
   return safe || fallback;
 }
-function normalizeUserAttachments2(attachments) {
-  return (attachments || []).map((attachment) => {
+function normalizeUserAttachments2(attachments2) {
+  return (attachments2 || []).map((attachment) => {
     const fileId = attachment.file_id || attachment.fileId || "";
     const filename = sanitizeFilename3(
       attachment.filename || attachment.name || "company_material",
@@ -3316,10 +5341,10 @@ async function buildKnowledgeBasePrompt({
   companyName,
   companyWebsite,
   operatorNotes,
-  attachments
+  attachments: attachments2
 }) {
   const skillInstructions = await readSkillArchive();
-  const attachmentList = attachments.length > 0 ? attachments.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u548C\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
+  const attachmentList = attachments2.length > 0 ? attachments2.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u548C\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
   return [
     "\u4F60\u5FC5\u987B\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u7ED3\u6784\u5316\u77E5\u8BC6\u5E93\u3002",
     "",
@@ -3347,7 +5372,7 @@ async function createFrontMindTask2({
   apiKey,
   prompt,
   agentProfile,
-  attachments
+  attachments: attachments2
 }) {
   const taskResponse = await axios4.post(
     `${baseUrl}/v1/tasks`,
@@ -3355,7 +5380,7 @@ async function createFrontMindTask2({
       prompt,
       agentProfile: toUpstreamAgentProfile(agentProfile),
       taskMode: "agent",
-      attachments
+      attachments: attachments2
     },
     {
       headers: {
@@ -3420,6 +5445,16 @@ router5.post("/start", async (req, res) => {
       res.status(created.status).json({ error: "\u521B\u5EFA\u4F01\u4E1A\u77E5\u8BC6\u5E93\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5 API Key \u6216\u7A0D\u540E\u91CD\u8BD5" });
       return;
     }
+    if (!req.frontmindUser || !req.frontmindCredential) {
+      res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55\u5E76\u914D\u7F6E API Key" });
+      return;
+    }
+    await recordUpstreamResource({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      kind: "task",
+      upstreamId: String(created.task.id)
+    });
     res.json({
       visibleMessage: "\u5F00\u59CB\u6784\u5EFA\u4F01\u4E1A\u77E5\u8BC6\u5E93",
       task: created.task,
@@ -3432,44 +5467,203 @@ router5.post("/start", async (req, res) => {
 });
 var knowledge_base_api_default = router5;
 
-// server/_core/index.ts
-function isPortAvailable(port) {
-  return new Promise((resolve) => {
-    const server = net2.createServer();
-    server.listen(port, () => {
-      server.close(() => resolve(true));
-    });
-    server.on("error", () => resolve(false));
-  });
+// server/_core/express-auth.ts
+function sendAuthError(res, status, message, code) {
+  res.status(status).json({ error: { message, code } });
 }
-async function findAvailablePort(startPort = 3e3) {
-  for (let port = startPort; port < startPort + 20; port++) {
-    if (await isPortAvailable(port)) {
-      return port;
+async function requireExpressAuth(req, res, next) {
+  try {
+    const user = await authenticateRequest(req);
+    if (!user) {
+      sendAuthError(res, 401, "\u8BF7\u5148\u767B\u5F55", "UNAUTHORIZED");
+      return;
+    }
+    req.frontmindUser = user;
+    next();
+  } catch (error) {
+    console.error("[Auth] Express authentication failed", error);
+    sendAuthError(res, 503, "\u767B\u5F55\u670D\u52A1\u6682\u4E0D\u53EF\u7528", "AUTH_UNAVAILABLE");
+  }
+}
+async function attachOptionalActiveCredential(req, res, next) {
+  if (!req.frontmindUser) {
+    sendAuthError(res, 401, "\u8BF7\u5148\u767B\u5F55", "UNAUTHORIZED");
+    return;
+  }
+  try {
+    const credential = await getDecryptedCredentialForUser(req.frontmindUser.id);
+    if (credential) req.frontmindCredential = credential;
+    next();
+  } catch (error) {
+    const invalidKey = error instanceof AuthServiceError && error.code === "INVALID_MASTER_KEY";
+    console.error("[Credential] Failed to load account credential", error);
+    sendAuthError(
+      res,
+      503,
+      invalidKey ? "\u670D\u52A1\u7AEF\u51ED\u636E\u52A0\u5BC6\u914D\u7F6E\u65E0\u6548" : "API Key \u6682\u4E0D\u53EF\u7528",
+      invalidKey ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE" : "CREDENTIAL_UNAVAILABLE"
+    );
+  }
+}
+
+// server/_core/upstream-credential.ts
+function pathWithoutQuery(req) {
+  return req.originalUrl.replace(/^\/api\/frontmind/, "").split("?")[0] || "/";
+}
+function getPrimaryResource(req) {
+  const path6 = pathWithoutQuery(req);
+  const taskMatch = path6.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
+  if (taskMatch) return { kind: "task", id: decodeURIComponent(taskMatch[1]) };
+  const fileMatch = path6.match(/^\/v1\/files\/([^/]+)/);
+  if (fileMatch) return { kind: "file", id: decodeURIComponent(fileMatch[1]) };
+  if (path6 === "/download-token" && typeof req.body?.fileId === "string") {
+    return { kind: "file", id: req.body.fileId };
+  }
+  if (req.method === "POST" && path6 === "/v1/tasks") {
+    const continuationId = req.body?.taskId ?? req.body?.previous_response_id;
+    if (typeof continuationId === "string" && continuationId) {
+      return { kind: "task", id: continuationId };
     }
   }
-  throw new Error(`No available port found starting from ${startPort}`);
+  return null;
+}
+function getAttachmentFileIds(req) {
+  if (req.method !== "POST") return [];
+  if (!Array.isArray(req.body?.attachments)) return [];
+  return req.body.attachments.map(
+    (item) => item && typeof item === "object" ? String(
+      item.file_id ?? item.fileId ?? ""
+    ) : ""
+  ).filter(Boolean);
+}
+function sendCredentialError(res, status, message, code) {
+  res.status(status).json({ error: { message, code } });
+}
+async function resolveUpstreamCredential(req, res, next) {
+  const user = req.frontmindUser;
+  if (!user) {
+    sendCredentialError(res, 401, "\u8BF7\u5148\u767B\u5F55", "UNAUTHORIZED");
+    return;
+  }
+  try {
+    const requestPath = pathWithoutQuery(req);
+    if (requestPath === "/proxy-download" || /^\/download\/[^/]+$/.test(requestPath)) {
+      next();
+      return;
+    }
+    const primaryResource = getPrimaryResource(req);
+    const credential = primaryResource ? await getCredentialForUpstreamResource(
+      user.id,
+      primaryResource.kind,
+      primaryResource.id
+    ) : await getDecryptedCredentialForUser(user.id);
+    if (!credential) {
+      sendCredentialError(
+        res,
+        primaryResource ? 403 : 428,
+        primaryResource ? "\u8BE5\u4EFB\u52A1\u6216\u6587\u4EF6\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7\uFF0C\u6216\u5176\u539F API Key \u5DF2\u5220\u9664" : "\u8BF7\u5148\u5728\u8D26\u53F7\u8BBE\u7F6E\u4E2D\u914D\u7F6E API Key",
+        primaryResource ? "UPSTREAM_RESOURCE_FORBIDDEN" : "API_CREDENTIAL_REQUIRED"
+      );
+      return;
+    }
+    for (const fileId of getAttachmentFileIds(req)) {
+      const ownedFile = await getCredentialForUpstreamResource(user.id, "file", fileId);
+      if (!ownedFile || ownedFile.id !== credential.id) {
+        sendCredentialError(
+          res,
+          403,
+          "\u9644\u4EF6\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7\u6216\u4F7F\u7528\u4E86\u4E0D\u540C\u7684 API Key",
+          "ATTACHMENT_FORBIDDEN"
+        );
+        return;
+      }
+    }
+    req.frontmindCredential = credential;
+    next();
+  } catch (error) {
+    const configurationError = error instanceof AuthServiceError && error.code === "INVALID_MASTER_KEY";
+    console.error("[Credential] Failed to resolve upstream credential", error);
+    sendCredentialError(
+      res,
+      503,
+      configurationError ? "\u670D\u52A1\u7AEF\u51ED\u636E\u52A0\u5BC6\u914D\u7F6E\u65E0\u6548" : "API Key \u6682\u4E0D\u53EF\u7528",
+      configurationError ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE" : "CREDENTIAL_UNAVAILABLE"
+    );
+  }
+}
+
+// server/_core/index.ts
+function assertProductionConfiguration() {
+  if (process.env.NODE_ENV !== "production") return;
+  if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is required in production");
+  }
+  assertCredentialEncryptionConfigured();
 }
 async function startServer() {
+  assertProductionConfiguration();
   const app = express3();
   const server = createServer(app);
   void cleanupStaleWorkflowUploads();
   app.disable("x-powered-by");
+  app.set("trust proxy", 1);
   app.use((_req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    res.setHeader(
+      "Content-Security-Policy",
+      "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    );
+    if (process.env.NODE_ENV === "production") {
+      res.setHeader(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains"
+      );
+    }
     next();
   });
   app.use(express3.json({ limit: "50mb" }));
   app.use(express3.urlencoded({ limit: "50mb", extended: true }));
-  app.use("/api/frontmind", manus_proxy_default);
+  app.get("/healthz", async (_req, res) => {
+    try {
+      const db = await getDb();
+      if (!db) throw new Error("Database is not configured");
+      await db.execute(sql`select 1`);
+      res.json({ status: "ok" });
+    } catch (error) {
+      console.error("[Health] Database readiness check failed", error);
+      res.status(503).json({ status: "unavailable" });
+    }
+  });
+  app.use(
+    "/api/frontmind",
+    requireExpressAuth,
+    resolveUpstreamCredential,
+    manus_proxy_default
+  );
   app.use("/api/manus", (_req, res) => {
     res.status(404).json({ error: { message: "Not found", code: "NOT_FOUND" } });
   });
-  app.use("/api/workflow", workflow_api_default);
-  app.use("/api/news-release", news_release_api_default);
-  app.use("/api/knowledge-base", knowledge_base_api_default);
+  app.use(
+    "/api/workflow",
+    requireExpressAuth,
+    attachOptionalActiveCredential,
+    workflow_api_default
+  );
+  app.use(
+    "/api/news-release",
+    requireExpressAuth,
+    resolveUpstreamCredential,
+    news_release_api_default
+  );
+  app.use(
+    "/api/knowledge-base",
+    requireExpressAuth,
+    resolveUpstreamCredential,
+    knowledge_base_api_default
+  );
   app.use(
     "/api/trpc",
     createExpressMiddleware({
@@ -3490,15 +5684,29 @@ async function startServer() {
       res.status(400).end();
       return;
     }
-    next(err);
+    console.error("[HTTP] Unhandled request error", err);
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const candidateStatus = Number(err?.status ?? err?.statusCode);
+    const status = Number.isInteger(candidateStatus) && candidateStatus >= 400 && candidateStatus < 600 ? candidateStatus : 500;
+    res.status(status).json({
+      error: {
+        message: status === 413 ? "\u8BF7\u6C42\u5185\u5BB9\u8FC7\u5927" : "\u670D\u52A1\u5668\u6682\u65F6\u65E0\u6CD5\u5B8C\u6210\u8BF7\u6C42",
+        code: status === 413 ? "PAYLOAD_TOO_LARGE" : "INTERNAL_SERVER_ERROR"
+      }
+    });
   });
-  const preferredPort = parseInt(process.env.PORT || "3001");
-  const port = await findAvailablePort(preferredPort);
-  if (port !== preferredPort) {
-    console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
+  const port = Number.parseInt(process.env.PORT || "3001", 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("PORT must be an integer between 1 and 65535");
   }
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);
   });
 }
-startServer().catch(console.error);
+startServer().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

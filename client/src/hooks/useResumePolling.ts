@@ -5,7 +5,7 @@
  * after page reload, browser tab switch, or network reconnection.
  *
  * Problem: When the browser tab is backgrounded or the page is refreshed,
- * the polling interval is lost. The conversation state persisted in localStorage
+ * the polling interval is lost. The conversation state persisted in the cloud
  * still shows "running", but no polling is active to detect completion.
  *
  * Solution: This hook monitors for conversations in "running" state that have
@@ -37,7 +37,9 @@ const RESUME_POLL_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours max resume polling
 async function checkAndUpdateTask(
   conv: Conversation,
   updateStatus: ReturnType<typeof useConversation>["updateStatus"],
-  updateAssistantMessages: ReturnType<typeof useConversation>["updateAssistantMessages"]
+  updateAssistantMessages: ReturnType<
+    typeof useConversation
+  >["updateAssistantMessages"],
 ): Promise<boolean> {
   if (!conv.taskId) return false;
 
@@ -50,7 +52,8 @@ async function checkAndUpdateTask(
     const baselineOutputLength = conv.lastKnownOutputLength || 0;
     if (taskData.output && taskData.output.length > 0) {
       const newOutput =
-        baselineOutputLength > 0 && baselineOutputLength < taskData.output.length
+        baselineOutputLength > 0 &&
+        baselineOutputLength < taskData.output.length
           ? taskData.output.slice(baselineOutputLength)
           : taskData.output;
 
@@ -59,7 +62,7 @@ async function checkAndUpdateTask(
           const msgs = parseOutputMessages(
             newOutput,
             conv.startedAt || conv.createdAt,
-            conv.messages?.[conv.messages.length - 1]?.modelName
+            conv.messages?.[conv.messages.length - 1]?.modelName,
           );
           if (msgs.length > 0) {
             // If completed, attach elapsed time to last message
@@ -124,10 +127,13 @@ async function checkAndUpdateTask(
 }
 
 export function useResumePolling() {
-  const { state, updateStatus, updateAssistantMessages } = useConversation();
+  const { state, hydrated, updateStatus, updateAssistantMessages } =
+    useConversation();
   const resumeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const resumeStartedAtRef = useRef<number>(0);
   const isResumingRef = useRef(false);
+  const hydratedRef = useRef(hydrated);
+  hydratedRef.current = hydrated;
 
   // Use refs for latest state to avoid stale closures
   const stateRef = useRef(state);
@@ -146,18 +152,22 @@ export function useResumePolling() {
   }, []);
 
   const startResumePolling = useCallback(() => {
+    // The database is authoritative. Never inspect the initial empty state or
+    // stale state from a previous account before cloud hydration completes.
+    if (!hydratedRef.current) return;
+
     // Don't start if already running
     if (isResumingRef.current) return;
 
     // Find conversations that are stuck in "running" state
     const runningConvs = stateRef.current.conversations.filter(
-      (c) => (c.status === "running" || c.status === "pending") && c.taskId
+      (c) => (c.status === "running" || c.status === "pending") && c.taskId,
     );
 
     if (runningConvs.length === 0) return;
 
     console.log(
-      `[ResumePolling] Found ${runningConvs.length} running conversation(s), resuming polling...`
+      `[ResumePolling] Found ${runningConvs.length} running conversation(s), resuming polling...`,
     );
     toast.info("检测到进行中的任务，正在恢复状态...", { duration: 3000 });
 
@@ -186,7 +196,7 @@ export function useResumePolling() {
       const toRemove: string[] = [];
       for (const convId of stillRunning) {
         const conv = stateRef.current.conversations.find(
-          (c) => c.id === convId
+          (c) => c.id === convId,
         );
         if (!conv || !conv.taskId) {
           toRemove.push(convId);
@@ -196,7 +206,7 @@ export function useResumePolling() {
         const isStillRunning = await checkAndUpdateTask(
           conv,
           updateStatusRef.current,
-          updateAssistantMessagesRef.current
+          updateAssistantMessagesRef.current,
         );
 
         if (!isStillRunning) {
@@ -211,7 +221,9 @@ export function useResumePolling() {
 
       // If all done, stop polling
       if (stillRunning.size === 0) {
-        console.log("[ResumePolling] All running tasks resolved, stopping resume polling");
+        console.log(
+          "[ResumePolling] All running tasks resolved, stopping resume polling",
+        );
         stopResumePolling();
       }
     };
@@ -223,49 +235,65 @@ export function useResumePolling() {
     resumeTimerRef.current = setInterval(pollOnce, RESUME_POLL_INTERVAL);
   }, [stopResumePolling]);
 
-  // On mount: check for stuck conversations
+  // Start only after this account's cloud conversations have hydrated. This
+  // also handles a slow initial request where the old mount-only timer would
+  // have fired too early and never tried again.
   useEffect(() => {
-    // Small delay to let the app fully initialize
+    if (!hydrated) {
+      stopResumePolling();
+      return;
+    }
+
     const timer = setTimeout(() => {
       startResumePolling();
     }, 1000);
     return () => {
       clearTimeout(timer);
-      stopResumePolling();
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [hydrated, startResumePolling, stopResumePolling]);
+
+  useEffect(() => stopResumePolling, [stopResumePolling]);
 
   // On visibility change: resume polling when tab becomes visible
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
+        if (!hydratedRef.current) return;
         // Re-check if any conversations are stuck
         const runningConvs = stateRef.current.conversations.filter(
-          (c) => (c.status === "running" || c.status === "pending") && c.taskId
+          (c) => (c.status === "running" || c.status === "pending") && c.taskId,
         );
         if (runningConvs.length > 0 && !isResumingRef.current) {
-          console.log("[ResumePolling] Tab visible, resuming polling for stuck tasks");
+          console.log(
+            "[ResumePolling] Tab visible, resuming polling for stuck tasks",
+          );
           startResumePolling();
         }
       }
     };
 
     const handleFocus = () => {
+      if (!hydratedRef.current) return;
       const runningConvs = stateRef.current.conversations.filter(
-        (c) => (c.status === "running" || c.status === "pending") && c.taskId
+        (c) => (c.status === "running" || c.status === "pending") && c.taskId,
       );
       if (runningConvs.length > 0 && !isResumingRef.current) {
-        console.log("[ResumePolling] Window focused, resuming polling for stuck tasks");
+        console.log(
+          "[ResumePolling] Window focused, resuming polling for stuck tasks",
+        );
         startResumePolling();
       }
     };
 
     const handleOnline = () => {
+      if (!hydratedRef.current) return;
       const runningConvs = stateRef.current.conversations.filter(
-        (c) => (c.status === "running" || c.status === "pending") && c.taskId
+        (c) => (c.status === "running" || c.status === "pending") && c.taskId,
       );
       if (runningConvs.length > 0 && !isResumingRef.current) {
-        console.log("[ResumePolling] Network reconnected, resuming polling for stuck tasks");
+        console.log(
+          "[ResumePolling] Network reconnected, resuming polling for stuck tasks",
+        );
         startResumePolling();
       }
     };

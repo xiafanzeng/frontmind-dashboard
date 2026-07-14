@@ -70,8 +70,13 @@ import {
   type Attachment,
 } from "@/contexts/ConversationContext";
 import MarkdownRenderer from "@/components/MarkdownRenderer";
-import { getConfig, retrieveTask, type TaskResponse } from "@/lib/frontmind-api";
+import {
+  getConfig,
+  retrieveTask,
+  type TaskResponse,
+} from "@/lib/frontmind-api";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/_core/hooks/useAuth";
 
 const PROGRESS_KEY = "frontmind-workflow-completed-steps-v2";
 const RUN_ID_KEY = "frontmind-workflow-run-id-v2";
@@ -159,9 +164,13 @@ const statusMeta: Record<
   },
 };
 
-function readCompletedSteps() {
+function accountStorageKey(userId: number, key: string) {
+  return `${key}:account:${userId}`;
+}
+
+function readCompletedSteps(userId: number) {
   try {
-    const raw = localStorage.getItem(PROGRESS_KEY);
+    const raw = localStorage.getItem(accountStorageKey(userId, PROGRESS_KEY));
     const parsed = raw ? JSON.parse(raw) : [];
     return new Set(Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : []);
   } catch {
@@ -169,17 +178,20 @@ function readCompletedSteps() {
   }
 }
 
-function readRunId() {
-  const stored = localStorage.getItem(RUN_ID_KEY);
+function readRunId(userId: number) {
+  const key = accountStorageKey(userId, RUN_ID_KEY);
+  const stored = localStorage.getItem(key);
   if (stored) return stored;
   const fresh = `wf_browser_${Date.now()}`;
-  localStorage.setItem(RUN_ID_KEY, fresh);
+  localStorage.setItem(key, fresh);
   return fresh;
 }
 
-function readRunActivities(runId: string): WorkflowRunActivity[] {
+function readRunActivities(userId: number, runId: string): WorkflowRunActivity[] {
   try {
-    const raw = localStorage.getItem(`${ACTIVITY_KEY_PREFIX}${runId}`);
+    const raw = localStorage.getItem(
+      accountStorageKey(userId, `${ACTIVITY_KEY_PREFIX}${runId}`),
+    );
     const parsed = raw ? JSON.parse(raw) : [];
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -187,8 +199,10 @@ function readRunActivities(runId: string): WorkflowRunActivity[] {
   }
 }
 
-function readWorkflowConversationId(runId: string) {
-  return localStorage.getItem(`${CONVERSATION_KEY_PREFIX}${runId}`);
+function readWorkflowConversationId(userId: number, runId: string) {
+  return localStorage.getItem(
+    accountStorageKey(userId, `${CONVERSATION_KEY_PREFIX}${runId}`),
+  );
 }
 
 function normalizeConversationStatus(status?: string): ConversationStatus {
@@ -317,6 +331,8 @@ function buildConversationAttachments(files: WorkflowUploadedFile[]): Attachment
 }
 
 export default function WorkflowBoard() {
+  const { user } = useAuth();
+  const accountId = user!.id;
   const {
     state: conversationState,
     createConversation,
@@ -327,17 +343,19 @@ export default function WorkflowBoard() {
     updateTitle,
   } = useConversation();
   const [manifest, setManifest] = useState<WorkflowManifest | null>(null);
-  const [completedSteps, setCompletedSteps] = useState<Set<string>>(() => readCompletedSteps());
+  const [completedSteps, setCompletedSteps] = useState<Set<string>>(() =>
+    readCompletedSteps(accountId),
+  );
   const [unavailableSteps, setUnavailableSteps] = useState<Set<string>>(() => new Set());
   const [runningStepId, setRunningStepId] = useState<string | null>(null);
   const [executingSteps, setExecutingSteps] = useState<Set<string>>(() => new Set());
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
-  const [runId, setRunId] = useState(() => readRunId());
+  const [runId, setRunId] = useState(() => readRunId(accountId));
   const [runActivities, setRunActivities] = useState<WorkflowRunActivity[]>(() =>
-    readRunActivities(readRunId())
+    readRunActivities(accountId, readRunId(accountId))
   );
   const [workflowConversationId, setWorkflowConversationId] = useState<string | null>(() =>
-    readWorkflowConversationId(readRunId())
+    readWorkflowConversationId(accountId, readRunId(accountId))
   );
   const [operatorNotes, setOperatorNotes] = useState<Record<string, string>>({});
   const [fieldValues, setFieldValues] = useState<Record<string, Record<string, string>>>({});
@@ -366,17 +384,23 @@ export default function WorkflowBoard() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(PROGRESS_KEY, JSON.stringify(Array.from(completedSteps)));
-  }, [completedSteps]);
+    localStorage.setItem(
+      accountStorageKey(accountId, PROGRESS_KEY),
+      JSON.stringify(Array.from(completedSteps)),
+    );
+  }, [accountId, completedSteps]);
 
   useEffect(() => {
-    setRunActivities(readRunActivities(runId));
-    setWorkflowConversationId(readWorkflowConversationId(runId));
-  }, [runId]);
+    setRunActivities(readRunActivities(accountId, runId));
+    setWorkflowConversationId(readWorkflowConversationId(accountId, runId));
+  }, [accountId, runId]);
 
   useEffect(() => {
-    localStorage.setItem(`${ACTIVITY_KEY_PREFIX}${runId}`, JSON.stringify(runActivities));
-  }, [runActivities, runId]);
+    localStorage.setItem(
+      accountStorageKey(accountId, `${ACTIVITY_KEY_PREFIX}${runId}`),
+      JSON.stringify(runActivities),
+    );
+  }, [accountId, runActivities, runId]);
 
   const stepsById = useMemo(() => {
     const map = new Map<string, WorkflowStepPublic>();
@@ -409,7 +433,8 @@ export default function WorkflowBoard() {
   };
 
   const ensureWorkflowConversation = (step: WorkflowStepPublic) => {
-    const storedConversationId = workflowConversationId ?? readWorkflowConversationId(runId);
+    const storedConversationId =
+      workflowConversationId ?? readWorkflowConversationId(accountId, runId);
     const storedConversationExists = storedConversationId
       ? conversationState.conversations.some((conversation) => conversation.id === storedConversationId)
       : false;
@@ -421,7 +446,10 @@ export default function WorkflowBoard() {
 
     const freshConversationId = createConversation();
     setWorkflowConversationId(freshConversationId);
-    localStorage.setItem(`${CONVERSATION_KEY_PREFIX}${runId}`, freshConversationId);
+    localStorage.setItem(
+      accountStorageKey(accountId, `${CONVERSATION_KEY_PREFIX}${runId}`),
+      freshConversationId,
+    );
     updateTitle(freshConversationId, `WF ${step.id}`);
     return freshConversationId;
   };
@@ -482,13 +510,10 @@ export default function WorkflowBoard() {
       return;
     }
 
-    const config = getConfig();
-    if (!config.apiKey) {
-      toast.error("请先在设置中填写 API Key");
-      return;
-    }
-
     setRunningStepId(step.id);
+    // Model selection remains a device preference; credentials are resolved
+    // by the authenticated server and are never attached to this request.
+    const agentProfile = getConfig().agentProfile;
     setUnavailableSteps((current) => {
       const next = new Set(current);
       next.delete(step.id);
@@ -503,14 +528,12 @@ export default function WorkflowBoard() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-FrontMind-API-Key": config.apiKey,
-          "X-FrontMind-Base-URL": config.baseUrl,
         },
         body: JSON.stringify({
           runId,
           operatorNotes: currentNotes,
           fields: currentFields,
-          agentProfile: config.agentProfile,
+          agentProfile,
         }),
       });
 
@@ -568,7 +591,7 @@ export default function WorkflowBoard() {
       }
 
       setRunId(data.runId);
-      localStorage.setItem(RUN_ID_KEY, data.runId);
+      localStorage.setItem(accountStorageKey(accountId, RUN_ID_KEY), data.runId);
       setLoadResults((current) => ({ ...current, [step.id]: data }));
       setRunActivities((current) => {
         const withoutCurrentStep = current.filter((item) => item.stepId !== step.id);
@@ -595,7 +618,7 @@ export default function WorkflowBoard() {
             data.task.id,
             step.id,
             conversationId,
-            config.agentProfile,
+            agentProfile,
             responseStartedAt
           );
         }
@@ -737,8 +760,12 @@ export default function WorkflowBoard() {
 
   const resetRunPool = () => {
     void fetch(`/api/workflow/runs/${encodeURIComponent(runId)}`, { method: "DELETE" });
-    localStorage.removeItem(`${ACTIVITY_KEY_PREFIX}${runId}`);
-    localStorage.removeItem(`${CONVERSATION_KEY_PREFIX}${runId}`);
+    localStorage.removeItem(
+      accountStorageKey(accountId, `${ACTIVITY_KEY_PREFIX}${runId}`),
+    );
+    localStorage.removeItem(
+      accountStorageKey(accountId, `${CONVERSATION_KEY_PREFIX}${runId}`),
+    );
     const freshRunId = `wf_browser_${Date.now()}`;
     setRunId(freshRunId);
     setWorkflowConversationId(null);
@@ -750,8 +777,8 @@ export default function WorkflowBoard() {
     setFieldValues({});
     setUploadedFiles({});
     setRunActivities([]);
-    localStorage.setItem(RUN_ID_KEY, freshRunId);
-    localStorage.removeItem(PROGRESS_KEY);
+    localStorage.setItem(accountStorageKey(accountId, RUN_ID_KEY), freshRunId);
+    localStorage.removeItem(accountStorageKey(accountId, PROGRESS_KEY));
     toast.success("当前任务已重置");
   };
 

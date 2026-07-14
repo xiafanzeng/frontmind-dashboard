@@ -31,6 +31,7 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import type { Conversation } from "@/contexts/ConversationContext";
+import AccountMenu from "@/components/AccountMenu";
 
 const LOGO_ICON = "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
 
@@ -106,6 +107,7 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
               onOpenSettings();
               setOpen(false);
             }}
+            onNavigate={() => setOpen(false)}
             collapsed={false}
             onToggle={() => {}}
             isMobile={true}
@@ -220,6 +222,11 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
           </TooltipTrigger>
           {collapsed && <TooltipContent side="right">设置</TooltipContent>}
         </Tooltip>
+
+        <AccountMenu
+          collapsed={collapsed}
+          onOpenSettings={onOpenSettings}
+        />
 
         <Tooltip>
           <TooltipTrigger asChild>
@@ -396,6 +403,7 @@ interface SidebarInnerProps {
   statusDot: Record<string, string>;
   formatTime: (ts: number) => string;
   onOpenSettings: () => void;
+  onNavigate: () => void;
   collapsed: boolean;
   onToggle: () => void;
   isMobile: boolean;
@@ -410,6 +418,7 @@ function SidebarInner({
   statusDot,
   formatTime,
   onOpenSettings,
+  onNavigate,
   isMobile,
 }: SidebarInnerProps) {
   return (
@@ -490,6 +499,10 @@ function SidebarInner({
           <Settings className="w-4 h-4 flex-shrink-0" />
           <span className="text-xs">设置</span>
         </Button>
+        <AccountMenu
+          onOpenSettings={onOpenSettings}
+          onNavigate={onNavigate}
+        />
       </div>
     </div>
   );
