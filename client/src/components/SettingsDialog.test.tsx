@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -8,9 +8,11 @@ const mocks = vi.hoisted(() => ({
   invalidateStatus: vi.fn(),
   setCredential: vi.fn(),
   replaceCredential: vi.fn(),
+  testCredential: vi.fn(),
   deleteCredential: vi.fn(),
   resetSet: vi.fn(),
   resetReplace: vi.fn(),
+  resetTest: vi.fn(),
   resetDelete: vi.fn(),
 }));
 
@@ -53,6 +55,13 @@ vi.mock("@/lib/trpc", () => ({
           reset: mocks.resetReplace,
         }),
       },
+      test: {
+        useMutation: () => ({
+          mutateAsync: mocks.testCredential,
+          isPending: false,
+          reset: mocks.resetTest,
+        }),
+      },
       delete: {
         useMutation: () => ({
           mutateAsync: mocks.deleteCredential,
@@ -93,7 +102,25 @@ describe("SettingsDialog", () => {
     );
     expect(await screen.findByText("128 积分")).toBeInTheDocument();
     expect(screen.getByText("GEO 品牌洞察")).toBeInTheDocument();
+    expect(screen.getByText("API Key 使用教程")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "测试连接" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("云端凭据状态")).not.toBeInTheDocument();
+    expect(screen.queryByText("Key 指纹")).not.toBeInTheDocument();
     expect(screen.queryByText("检测到旧版本地数据")).not.toBeInTheDocument();
     expect(screen.queryByText("迁移到当前账号")).not.toBeInTheDocument();
+  });
+
+  it("tests the saved credential when the replacement field is empty", async () => {
+    mocks.testCredential.mockResolvedValue({ ok: true });
+    render(<SettingsDialog open onOpenChange={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
+
+    await waitFor(() =>
+      expect(mocks.testCredential).toHaveBeenCalledWith({ apiKey: undefined }),
+    );
+    expect(await screen.findByText(/连接正常/)).toBeInTheDocument();
   });
 });

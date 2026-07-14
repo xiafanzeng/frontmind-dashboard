@@ -1,24 +1,17 @@
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-  type FormEvent,
-} from "react";
-import {
-  CheckCircle2,
   Coins,
   Eye,
   EyeOff,
-  Fingerprint,
   Info,
   Key,
   Loader2,
   RefreshCw,
   Save,
   Settings,
-  ShieldCheck,
   Trash2,
+  Wifi,
+  WifiOff,
   XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -40,7 +33,6 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -60,15 +52,11 @@ interface SettingsDialogProps {
 type CredentialStatus = {
   configured: boolean;
   fingerprint: string | null;
-  status: "active" | "retired" | "invalid" | null;
-  verifiedAt: Date | number | string | null;
 };
 
 const EMPTY_STATUS: CredentialStatus = {
   configured: false,
   fingerprint: null,
-  status: null,
-  verifiedAt: null,
 };
 
 export default function SettingsDialog({
@@ -78,6 +66,10 @@ export default function SettingsDialog({
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [testResult, setTestResult] = useState<"success" | "error" | null>(
+    null,
+  );
+  const [testLatencyMs, setTestLatencyMs] = useState<number | null>(null);
   const [creditLoading, setCreditLoading] = useState(false);
   const [creditTotal, setCreditTotal] = useState<number | null>(null);
   const [creditTasks, setCreditTasks] = useState<CreditUsageTask[]>([]);
@@ -90,6 +82,7 @@ export default function SettingsDialog({
   });
   const setMutation = trpc.credential.set.useMutation();
   const replaceMutation = trpc.credential.replace.useMutation();
+  const testMutation = trpc.credential.test.useMutation();
   const deleteMutation = trpc.credential.delete.useMutation();
 
   const status = (statusQuery.data ?? EMPTY_STATUS) as CredentialStatus;
@@ -120,8 +113,11 @@ export default function SettingsDialog({
       setApiKey("");
       setShowApiKey(false);
       setDeleteOpen(false);
+      setTestResult(null);
+      setTestLatencyMs(null);
       setMutation.reset();
       replaceMutation.reset();
+      testMutation.reset();
       deleteMutation.reset();
     }
   }, [open]);
@@ -152,22 +148,6 @@ export default function SettingsDialog({
     [loadCreditUsage, open, status.configured, status.fingerprint],
   );
 
-  const verifiedLabel = useMemo(() => {
-    if (!status.verifiedAt) return null;
-    const date =
-      status.verifiedAt instanceof Date
-        ? status.verifiedAt
-        : new Date(status.verifiedAt);
-    if (Number.isNaN(date.getTime())) return null;
-    return date.toLocaleString("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  }, [status.verifiedAt]);
-
   const handleSave = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const normalizedKey = apiKey.trim();
@@ -187,6 +167,8 @@ export default function SettingsDialog({
       await utils.credential.status.invalidate();
       setApiKey("");
       setShowApiKey(false);
+      setTestResult("success");
+      setTestLatencyMs(null);
       toast.success(status.configured ? "API Key 已更换" : "API Key 已保存", {
         description: "已通过服务端验证并加密保存",
       });
@@ -194,6 +176,35 @@ export default function SettingsDialog({
       toast.error("API Key 保存失败", {
         description:
           error instanceof Error ? error.message : "请确认 Key 有效后重试",
+      });
+    }
+  };
+
+  const handleTest = async () => {
+    const normalizedKey = apiKey.trim();
+    if (!normalizedKey && !status.configured) {
+      toast.error("请先填写 API Key");
+      return;
+    }
+
+    setTestResult(null);
+    setTestLatencyMs(null);
+    const startedAt = performance.now();
+    try {
+      await testMutation.mutateAsync({
+        apiKey: normalizedKey || undefined,
+      });
+      const latency = Math.max(1, Math.round(performance.now() - startedAt));
+      setTestLatencyMs(latency);
+      setTestResult("success");
+      toast.success("连接成功", {
+        description: `FrontMind API 响应正常 · ${latency}ms`,
+      });
+    } catch (error) {
+      setTestResult("error");
+      toast.error("连接测试失败", {
+        description:
+          error instanceof Error ? error.message : "请检查 API Key 后重试",
       });
     }
   };
@@ -217,7 +228,11 @@ export default function SettingsDialog({
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
-    if (!nextOpen && (saving || deleteMutation.isPending)) return;
+    if (
+      !nextOpen &&
+      (saving || testMutation.isPending || deleteMutation.isPending)
+    )
+      return;
     onOpenChange(nextOpen);
   };
 
@@ -230,72 +245,31 @@ export default function SettingsDialog({
             API Key 设置
           </DialogTitle>
           <DialogDescription className="break-words text-sm text-muted-foreground">
-            Key 由服务端验证并加密保存，积分统计通过安全代理读取。
+            配置并测试 FrontMind API Key，查看当前账号的积分使用情况。
           </DialogDescription>
         </DialogHeader>
 
         <div className="mt-3 min-w-0 space-y-5">
-          <section className="rounded-xl border border-border/60 bg-muted/25 p-4">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                <ShieldCheck className="h-4 w-4 text-primary" />
-                云端凭据状态
-              </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-8 gap-1.5 px-2 text-xs"
-                disabled={statusQuery.isFetching}
-                onClick={() => void statusQuery.refetch()}
-              >
-                <RefreshCw
-                  className={`h-3.5 w-3.5 ${statusQuery.isFetching ? "animate-spin" : ""}`}
-                />
-                刷新
-              </Button>
+          <section className="rounded-xl border border-primary/10 bg-primary/5 p-4">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Info className="h-4 w-4 text-primary" />
+              API Key 使用教程
             </div>
-
-            {statusQuery.isLoading ? (
-              <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                正在读取凭据状态
-              </div>
-            ) : statusQuery.error ? (
-              <div className="flex items-start gap-2 rounded-lg bg-destructive/8 p-3 text-sm text-destructive">
-                <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                <div>
-                  <p className="font-medium">状态读取失败</p>
-                  <p className="mt-0.5 text-xs opacity-80">
-                    {statusQuery.error.message}
-                  </p>
-                </div>
-              </div>
-            ) : status.configured ? (
-              <div className="space-y-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <CredentialBadge status={status.status} />
-                  {verifiedLabel && (
-                    <span className="text-xs text-muted-foreground">
-                      验证于 {verifiedLabel}
-                    </span>
-                  )}
-                </div>
-                <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border/50 bg-background/60 px-3 py-2.5">
-                  <Fingerprint className="h-4 w-4 shrink-0 text-muted-foreground" />
-                  <span className="shrink-0 text-xs text-muted-foreground">
-                    Key 指纹
+            <div className="mt-3 grid gap-2.5 text-xs leading-relaxed text-muted-foreground sm:grid-cols-2">
+              {[
+                "在 FrontMind 服务中心获取 API Key",
+                "将 API Key 粘贴到下方输入框",
+                "点击“测试连接”确认 Key 可用",
+                "验证并保存后，即可跨设备安全使用",
+              ].map((step, index) => (
+                <div key={step} className="flex min-w-0 items-start gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/10 text-[11px] font-semibold text-primary">
+                    {index + 1}
                   </span>
-                  <code className="min-w-0 flex-1 truncate text-right text-xs font-medium text-foreground">
-                    {status.fingerprint || "已安全保存"}
-                  </code>
+                  <span className="min-w-0 break-words">{step}</span>
                 </div>
-              </div>
-            ) : (
-              <div className="flex items-start gap-2 rounded-lg border border-dashed border-border/70 bg-background/40 p-3 text-sm text-muted-foreground">
-                <Info className="mt-0.5 h-4 w-4 shrink-0" />
-                尚未配置 API Key。保存后可在当前账号的所有设备使用。
-              </div>
-            )}
+              ))}
+            </div>
           </section>
 
           <section className="rounded-xl border border-primary/10 bg-primary/5 p-4">
@@ -388,7 +362,11 @@ export default function SettingsDialog({
                 <Input
                   id="frontmind-api-key"
                   value={apiKey}
-                  onChange={(event) => setApiKey(event.target.value)}
+                  onChange={(event) => {
+                    setApiKey(event.target.value);
+                    setTestResult(null);
+                    setTestLatencyMs(null);
+                  }}
                   placeholder={
                     status.configured
                       ? "留空不会更改当前 Key"
@@ -397,7 +375,9 @@ export default function SettingsDialog({
                   type={showApiKey ? "text" : "password"}
                   autoComplete="off"
                   spellCheck={false}
-                  disabled={saving || statusQuery.isLoading}
+                  disabled={
+                    saving || testMutation.isPending || statusQuery.isLoading
+                  }
                   className="min-w-0 border-border/60 bg-muted/20 pr-10 font-mono text-xs"
                 />
                 <button
@@ -414,8 +394,16 @@ export default function SettingsDialog({
                 </button>
               </div>
               <p className="text-[11px] leading-relaxed text-muted-foreground">
-                为保护凭据安全，已保存的 Key 不会再次显示，也不会发送回浏览器。
+                {status.configured
+                  ? "当前账号已配置 Key；留空可直接测试现有连接，填写新 Key 后可验证并更换。"
+                  : "Key 验证通过后会加密保存，登录同一账号即可在其他设备使用。"}
               </p>
+              {statusQuery.error && (
+                <p className="flex items-center gap-1.5 text-[11px] text-destructive">
+                  <XCircle className="h-3.5 w-3.5" />
+                  无法读取当前配置，请刷新页面后重试。
+                </p>
+              )}
             </div>
 
             {status.configured && (
@@ -427,15 +415,71 @@ export default function SettingsDialog({
               </div>
             )}
 
-            <div className="flex flex-col gap-2 sm:flex-row sm:justify-between">
-              {status.configured ? (
+            <div className="grid gap-2 sm:grid-cols-2">
+              <Button
+                type="button"
+                variant="outline"
+                className={
+                  testResult === "success"
+                    ? "gap-2 border-emerald-300 text-emerald-700"
+                    : testResult === "error"
+                      ? "gap-2 border-red-300 text-red-600"
+                      : "gap-2"
+                }
+                disabled={
+                  saving ||
+                  testMutation.isPending ||
+                  (!apiKey.trim() && !status.configured)
+                }
+                onClick={() => void handleTest()}
+              >
+                {testMutation.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : testResult === "error" ? (
+                  <WifiOff className="h-4 w-4" />
+                ) : (
+                  <Wifi className="h-4 w-4" />
+                )}
+                {testMutation.isPending
+                  ? "测试中"
+                  : testResult === "success"
+                    ? `连接正常${testLatencyMs ? ` · ${testLatencyMs}ms` : ""}`
+                    : testResult === "error"
+                      ? "连接失败"
+                      : "测试连接"}
+              </Button>
+
+              <Button
+                type="submit"
+                className="gap-2"
+                disabled={saving || testMutation.isPending || !apiKey.trim()}
+              >
+                {saving ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="h-4 w-4" />
+                )}
+                {saving
+                  ? "正在验证并保存"
+                  : status.configured
+                    ? "验证并更换"
+                    : "验证并保存"}
+              </Button>
+            </div>
+
+            {status.configured && (
+              <div className="flex justify-start">
                 <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
                   <AlertDialogTrigger asChild>
                     <Button
                       type="button"
                       variant="outline"
                       className="gap-2 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                      disabled={saving || deleteMutation.isPending}
+                      disabled={
+                        saving ||
+                        testMutation.isPending ||
+                        deleteMutation.isPending
+                      }
                     >
                       <Trash2 className="h-4 w-4" />
                       删除 Key
@@ -469,62 +513,11 @@ export default function SettingsDialog({
                     </AlertDialogFooter>
                   </AlertDialogContent>
                 </AlertDialog>
-              ) : (
-                <span />
-              )}
-
-              <Button
-                type="submit"
-                className="gap-2"
-                disabled={saving || !apiKey.trim()}
-              >
-                {saving ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Save className="h-4 w-4" />
-                )}
-                {saving
-                  ? "正在验证并保存"
-                  : status.configured
-                    ? "验证并更换"
-                    : "验证并保存"}
-              </Button>
-            </div>
+              </div>
+            )}
           </form>
         </div>
       </DialogContent>
     </Dialog>
-  );
-}
-
-function CredentialBadge({ status }: { status: CredentialStatus["status"] }) {
-  if (status === "active") {
-    return (
-      <Badge
-        variant="outline"
-        className="border-emerald-200 bg-emerald-50 text-emerald-700"
-      >
-        <CheckCircle2 className="mr-1 h-3 w-3" />
-        已验证
-      </Badge>
-    );
-  }
-
-  if (status === "invalid") {
-    return (
-      <Badge
-        variant="outline"
-        className="border-red-200 bg-red-50 text-red-700"
-      >
-        <XCircle className="mr-1 h-3 w-3" />
-        验证失败
-      </Badge>
-    );
-  }
-
-  return (
-    <Badge variant="secondary">
-      {status === "retired" ? "已停用" : "已保存"}
-    </Badge>
   );
 }

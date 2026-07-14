@@ -1882,6 +1882,9 @@ import { z as z4 } from "zod";
 var apiKeyInput = z4.object({
   apiKey: z4.string().trim().min(8, "API Key is too short").max(4096)
 });
+var testApiKeyInput = z4.object({
+  apiKey: z4.string().trim().min(8, "API Key is too short").max(4096).optional()
+});
 async function saveCredential(userId, apiKey) {
   try {
     return await replaceApiCredential(userId, apiKey);
@@ -1899,6 +1902,19 @@ var credentialRouter = router({
   }),
   set: protectedProcedure.input(apiKeyInput).mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
   replace: protectedProcedure.input(apiKeyInput).mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
+  test: protectedProcedure.input(testApiKeyInput).mutation(async ({ ctx, input }) => {
+    try {
+      const savedCredential = input.apiKey ? null : await getDecryptedCredentialForUser(ctx.user.id);
+      const apiKey = input.apiKey ?? savedCredential?.apiKey;
+      if (!apiKey) {
+        throw new AuthServiceError("NOT_FOUND", "\u8BF7\u5148\u586B\u5199\u6216\u4FDD\u5B58 API Key");
+      }
+      await validateUpstreamApiKey(apiKey);
+      return { ok: true };
+    } catch (error) {
+      throw toTrpcError(error);
+    }
+  }),
   delete: protectedProcedure.mutation(async ({ ctx }) => {
     try {
       await deleteActiveApiCredential(ctx.user.id);

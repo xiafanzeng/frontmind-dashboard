@@ -17,8 +17,18 @@ import { useConversation } from "@/contexts/ConversationContext";
 import { useIsMobile } from "@/hooks/useMobile";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   Plus,
   MessageSquare,
@@ -33,7 +43,8 @@ import { cn } from "@/lib/utils";
 import type { Conversation } from "@/contexts/ConversationContext";
 import AccountMenu from "@/components/AccountMenu";
 
-const LOGO_ICON = "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
+const LOGO_ICON =
+  "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
 
 interface SidebarProps {
   collapsed: boolean;
@@ -41,7 +52,11 @@ interface SidebarProps {
   onOpenSettings: () => void;
 }
 
-export default function Sidebar({ collapsed, onToggle, onOpenSettings }: SidebarProps) {
+export default function Sidebar({
+  collapsed,
+  onToggle,
+  onOpenSettings,
+}: SidebarProps) {
   const isMobile = useIsMobile();
   const {
     state,
@@ -64,7 +79,10 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
     const d = new Date(ts);
     const now = new Date();
     if (d.toDateString() === now.toDateString()) {
-      return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+      return d.toLocaleTimeString("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
     }
     return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
   };
@@ -79,12 +97,16 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
           <Button
             variant="ghost"
             size="icon"
-            className="fixed top-3 left-3 z-50 bg-card/90 backdrop-blur-sm border border-border/70 shadow-sm"
+            className="fixed left-[max(0.75rem,env(safe-area-inset-left))] top-[max(0.75rem,env(safe-area-inset-top))] z-50 border border-border/70 bg-card/90 shadow-sm backdrop-blur-sm"
+            aria-label="打开内容流程菜单"
           >
             <Menu className="w-5 h-5" />
           </Button>
         </SheetTrigger>
-        <SheetContent side="left" className="w-[292px] p-0 bg-sidebar [&>button]:hidden">
+        <SheetContent
+          side="left"
+          className="h-dvh w-[min(86vw,292px)] max-w-[292px] gap-0 overflow-hidden border-sidebar-border bg-sidebar p-0 [&>button]:hidden"
+        >
           <SheetHeader className="sr-only">
             <SheetTitle>内容流程列表</SheetTitle>
           </SheetHeader>
@@ -161,7 +183,7 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
               variant="outline"
               className={cn(
                 "w-full border-border/70 bg-card/70 hover:bg-card text-sidebar-foreground hover:text-foreground transition-all duration-200 shadow-sm",
-                collapsed ? "px-0 justify-center" : "justify-start gap-2"
+                collapsed ? "px-0 justify-center" : "justify-start gap-2",
               )}
               size="sm"
             >
@@ -169,7 +191,9 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
               {!collapsed && <span className="text-sm">新内容流程</span>}
             </Button>
           </TooltipTrigger>
-          {collapsed && <TooltipContent side="right">新内容流程</TooltipContent>}
+          {collapsed && (
+            <TooltipContent side="right">新内容流程</TooltipContent>
+          )}
         </Tooltip>
       </div>
 
@@ -197,7 +221,9 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
 
           {state.conversations.length === 0 && !collapsed && (
             <div className="px-3 py-8 text-center">
-              <p className="text-[11px] text-muted-foreground/50">暂无内容流程</p>
+              <p className="text-[11px] text-muted-foreground/50">
+                暂无内容流程
+              </p>
             </div>
           )}
         </div>
@@ -212,7 +238,7 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
               variant="ghost"
               className={cn(
                 "w-full text-muted-foreground hover:text-foreground hover:bg-card/70",
-                collapsed ? "px-0 justify-center" : "justify-start gap-2"
+                collapsed ? "px-0 justify-center" : "justify-start gap-2",
               )}
               size="sm"
             >
@@ -223,10 +249,7 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
           {collapsed && <TooltipContent side="right">设置</TooltipContent>}
         </Tooltip>
 
-        <AccountMenu
-          collapsed={collapsed}
-          onOpenSettings={onOpenSettings}
-        />
+        <AccountMenu collapsed={collapsed} onOpenSettings={onOpenSettings} />
 
         <Tooltip>
           <TooltipTrigger asChild>
@@ -235,7 +258,7 @@ export default function Sidebar({ collapsed, onToggle, onOpenSettings }: Sidebar
               variant="ghost"
               className={cn(
                 "w-full text-muted-foreground/75 hover:text-foreground hover:bg-card/70",
-                collapsed ? "px-0 justify-center" : "justify-start gap-2"
+                collapsed ? "px-0 justify-center" : "justify-start gap-2",
               )}
               size="sm"
             >
@@ -301,13 +324,15 @@ function ConversationItem({
         role="button"
         tabIndex={0}
         onClick={onSelect}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelect(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") onSelect();
+        }}
         className={cn(
           "w-full text-left rounded-lg transition-all duration-200 group relative overflow-hidden",
           collapsed ? "p-2.5 flex justify-center" : "px-3 py-2.5",
           isActive
             ? "bg-card text-foreground shadow-sm ring-1 ring-border/70"
-            : "text-muted-foreground hover:bg-card/60 hover:text-foreground"
+            : "text-muted-foreground hover:bg-card/60 hover:text-foreground",
         )}
       >
         {collapsed ? (
@@ -318,7 +343,7 @@ function ConversationItem({
                 <span
                   className={cn(
                     "absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full",
-                    statusDot[conv.status]
+                    statusDot[conv.status],
                   )}
                 />
               </div>
@@ -343,12 +368,15 @@ function ConversationItem({
         ) : (
           <div className="flex items-start gap-2">
             {/* Icon - fixed width, never shrinks */}
-            <div className="relative mt-0.5 flex-shrink-0 flex-grow-0" style={{ width: '16px' }}>
+            <div
+              className="relative mt-0.5 flex-shrink-0 flex-grow-0"
+              style={{ width: "16px" }}
+            >
               <MessageSquare className="w-4 h-4" />
               <span
                 className={cn(
                   "absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full",
-                  statusDot[conv.status]
+                  statusDot[conv.status],
                 )}
               />
             </div>
@@ -376,9 +404,9 @@ function ConversationItem({
               className={cn(
                 "flex-shrink-0 flex-grow-0 p-1 rounded-md transition-all duration-150",
                 "w-7 h-7 flex items-center justify-center",
-                (isMobile || isActive)
+                isMobile || isActive
                   ? "text-muted-foreground hover:text-red-500 hover:bg-red-500/10 active:text-red-500 active:bg-red-500/10"
-                  : "text-transparent group-hover:text-muted-foreground hover:!text-red-500 hover:!bg-red-500/10"
+                  : "text-transparent group-hover:text-muted-foreground hover:!text-red-500 hover:!bg-red-500/10",
               )}
               title="删除此内容流程"
               aria-label="删除此内容流程"
@@ -422,14 +450,11 @@ function SidebarInner({
   isMobile,
 }: SidebarInnerProps) {
   return (
-    <div
-      className="h-full flex flex-col"
-      style={{
-        background: `linear-gradient(180deg, oklch(0.15 0.025 260) 0%, oklch(0.12 0.02 260) 100%)`,
-      }}
-    >
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-sidebar/95 text-sidebar-foreground backdrop-blur-xl">
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_30%_0%,rgba(120,113,108,0.12),transparent_40%)]" />
+
       {/* Header */}
-      <div className="flex items-center gap-3 px-4 py-4 border-b border-border/70">
+      <div className="relative z-10 flex shrink-0 items-center gap-3 border-b border-border/70 px-4 py-4">
         <img
           src={LOGO_ICON}
           alt="Logo"
@@ -446,11 +471,11 @@ function SidebarInner({
       </div>
 
       {/* New Chat Button */}
-      <div className="px-3 pt-3 pb-1">
+      <div className="relative z-10 shrink-0 px-3 pb-1 pt-3">
         <Button
           onClick={() => createConversation()}
           variant="outline"
-          className="w-full border-border/70 bg-card/60 hover:bg-card text-foreground/80 hover:text-foreground transition-all duration-200 justify-start gap-2"
+          className="w-full justify-start gap-2 border-border/70 bg-card/70 text-sidebar-foreground shadow-sm transition-all duration-200 hover:bg-card hover:text-foreground"
           size="sm"
         >
           <Plus className="w-4 h-4 flex-shrink-0" />
@@ -459,7 +484,7 @@ function SidebarInner({
       </div>
 
       {/* Conversation List */}
-      <ScrollArea className="flex-1 min-h-0 overflow-hidden">
+      <ScrollArea className="relative z-10 min-h-0 flex-1 overflow-hidden">
         <div className="px-2 py-2 space-y-0.5">
           <AnimatePresence>
             {state.conversations.map((conv) => {
@@ -482,14 +507,16 @@ function SidebarInner({
 
           {state.conversations.length === 0 && (
             <div className="px-3 py-8 text-center">
-              <p className="text-[11px] text-muted-foreground/50">暂无内容流程</p>
+              <p className="text-[11px] text-muted-foreground/50">
+                暂无内容流程
+              </p>
             </div>
           )}
         </div>
       </ScrollArea>
 
       {/* Footer */}
-      <div className="px-2 py-2 border-t border-border/70 space-y-0.5 flex-shrink-0">
+      <div className="relative z-10 shrink-0 space-y-0.5 border-t border-border/70 px-2 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
         <Button
           onClick={onOpenSettings}
           variant="ghost"
@@ -499,10 +526,7 @@ function SidebarInner({
           <Settings className="w-4 h-4 flex-shrink-0" />
           <span className="text-xs">设置</span>
         </Button>
-        <AccountMenu
-          onOpenSettings={onOpenSettings}
-          onNavigate={onNavigate}
-        />
+        <AccountMenu onOpenSettings={onOpenSettings} onNavigate={onNavigate} />
       </div>
     </div>
   );
