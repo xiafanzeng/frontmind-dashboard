@@ -9,11 +9,9 @@ const mocks = vi.hoisted(() => ({
   setCredential: vi.fn(),
   replaceCredential: vi.fn(),
   testCredential: vi.fn(),
-  deleteCredential: vi.fn(),
   resetSet: vi.fn(),
   resetReplace: vi.fn(),
   resetTest: vi.fn(),
-  resetDelete: vi.fn(),
 }));
 
 vi.mock("@/lib/frontmind-api", () => ({
@@ -62,13 +60,6 @@ vi.mock("@/lib/trpc", () => ({
           reset: mocks.resetTest,
         }),
       },
-      delete: {
-        useMutation: () => ({
-          mutateAsync: mocks.deleteCredential,
-          isPending: false,
-          reset: mocks.resetDelete,
-        }),
-      },
     },
   },
 }));
@@ -108,6 +99,9 @@ describe("SettingsDialog", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("云端凭据状态")).not.toBeInTheDocument();
     expect(screen.queryByText("Key 指纹")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "删除 Key" }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText("检测到旧版本地数据")).not.toBeInTheDocument();
     expect(screen.queryByText("迁移到当前账号")).not.toBeInTheDocument();
   });

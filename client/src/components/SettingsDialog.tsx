@@ -9,7 +9,6 @@ import {
   RefreshCw,
   Save,
   Settings,
-  Trash2,
   Wifi,
   WifiOff,
   XCircle,
@@ -22,17 +21,6 @@ import {
   type CreditUsageTask,
 } from "@/lib/frontmind-api";
 import { trpc } from "@/lib/trpc";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -65,7 +53,6 @@ export default function SettingsDialog({
 }: SettingsDialogProps) {
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
-  const [deleteOpen, setDeleteOpen] = useState(false);
   const [testResult, setTestResult] = useState<"success" | "error" | null>(
     null,
   );
@@ -83,7 +70,6 @@ export default function SettingsDialog({
   const setMutation = trpc.credential.set.useMutation();
   const replaceMutation = trpc.credential.replace.useMutation();
   const testMutation = trpc.credential.test.useMutation();
-  const deleteMutation = trpc.credential.delete.useMutation();
 
   const status = (statusQuery.data ?? EMPTY_STATUS) as CredentialStatus;
   const saving = setMutation.isPending || replaceMutation.isPending;
@@ -112,13 +98,11 @@ export default function SettingsDialog({
     if (!open) {
       setApiKey("");
       setShowApiKey(false);
-      setDeleteOpen(false);
       setTestResult(null);
       setTestLatencyMs(null);
       setMutation.reset();
       replaceMutation.reset();
       testMutation.reset();
-      deleteMutation.reset();
     }
   }, [open]);
 
@@ -209,30 +193,8 @@ export default function SettingsDialog({
     }
   };
 
-  const handleDelete = async () => {
-    try {
-      await deleteMutation.mutateAsync();
-      await utils.credential.status.invalidate();
-      setApiKey("");
-      setCreditTotal(null);
-      setCreditTasks([]);
-      setDeleteOpen(false);
-      toast.success("API Key 已删除", {
-        description: "历史记录仍可查看，但关联会话可能无法继续运行",
-      });
-    } catch (error) {
-      toast.error("无法删除 API Key", {
-        description: error instanceof Error ? error.message : "请稍后重试",
-      });
-    }
-  };
-
   const handleOpenChange = (nextOpen: boolean) => {
-    if (
-      !nextOpen &&
-      (saving || testMutation.isPending || deleteMutation.isPending)
-    )
-      return;
+    if (!nextOpen && (saving || testMutation.isPending)) return;
     onOpenChange(nextOpen);
   };
 
@@ -466,55 +428,6 @@ export default function SettingsDialog({
                     : "验证并保存"}
               </Button>
             </div>
-
-            {status.configured && (
-              <div className="flex justify-start">
-                <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-                  <AlertDialogTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      className="gap-2 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                      disabled={
-                        saving ||
-                        testMutation.isPending ||
-                        deleteMutation.isPending
-                      }
-                    >
-                      <Trash2 className="h-4 w-4" />
-                      删除 Key
-                    </Button>
-                  </AlertDialogTrigger>
-                  <AlertDialogContent>
-                    <AlertDialogHeader>
-                      <AlertDialogTitle>删除 API Key？</AlertDialogTitle>
-                      <AlertDialogDescription>
-                        删除后，历史记录仍可查看，但依赖该凭据的会话将不能继续运行。此操作不会在浏览器保留
-                        Key 副本。
-                      </AlertDialogDescription>
-                    </AlertDialogHeader>
-                    <AlertDialogFooter>
-                      <AlertDialogCancel disabled={deleteMutation.isPending}>
-                        取消
-                      </AlertDialogCancel>
-                      <AlertDialogAction
-                        className="bg-destructive text-white hover:bg-destructive/90"
-                        disabled={deleteMutation.isPending}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          void handleDelete();
-                        }}
-                      >
-                        {deleteMutation.isPending && (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        )}
-                        确认删除
-                      </AlertDialogAction>
-                    </AlertDialogFooter>
-                  </AlertDialogContent>
-                </AlertDialog>
-              </div>
-            )}
           </form>
         </div>
       </DialogContent>
