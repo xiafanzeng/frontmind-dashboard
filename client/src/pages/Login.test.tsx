@@ -36,6 +36,19 @@ describe("Login", () => {
     window.history.replaceState({}, "", "/login");
   });
 
+  it("uses the FrontMind intelligent workflow positioning", () => {
+    render(<Login />);
+
+    expect(
+      screen.getByRole("heading", { name: "FrontMind 智能体工作流" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "使用 FrontMind 智能体，探索当前最强 AI 工作流的能力边界。",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("submits the normalized username and password", async () => {
     render(<Login />);
 
@@ -48,10 +61,7 @@ describe("Login", () => {
     fireEvent.click(screen.getByRole("button", { name: "登录" }));
 
     await waitFor(() =>
-      expect(authMock.login).toHaveBeenCalledWith(
-        "demo",
-        "a-secure-password"
-      )
+      expect(authMock.login).toHaveBeenCalledWith("demo", "a-secure-password"),
     );
     await waitFor(() => expect(window.location.pathname).toBe("/"));
   });

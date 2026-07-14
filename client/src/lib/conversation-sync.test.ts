@@ -1,8 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  batchLegacyConversationImports,
-  ConversationSyncQueue,
-} from "./conversation-sync";
+import { ConversationSyncQueue } from "./conversation-sync";
 
 type Snapshot = { id: string; value: number };
 
@@ -103,7 +100,7 @@ describe("ConversationSyncQueue", () => {
     const queue = new ConversationSyncQueue<Snapshot>({
       syncSnapshot,
       deleteConversation: vi.fn().mockResolvedValue(undefined),
-      shouldRetry: candidate =>
+      shouldRetry: (candidate) =>
         (candidate as typeof error).data?.code !== "NOT_FOUND",
       onPermanentError,
     });
@@ -113,38 +110,5 @@ describe("ConversationSyncQueue", () => {
 
     expect(syncSnapshot).toHaveBeenCalledTimes(1);
     expect(onPermanentError).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("legacy import batching", () => {
-  it("splits on the resource limit without splitting a conversation", () => {
-    const conversations = [
-      {
-        id: "a",
-        taskId: "task-a",
-        messages: [{ attachments: [{ fileId: "file-a" }] }],
-      },
-      {
-        id: "b",
-        taskId: "task-b",
-        messages: [{ attachments: [{ fileId: "file-b" }] }],
-      },
-    ];
-
-    expect(batchLegacyConversationImports(conversations, 200, 3)).toEqual([
-      [conversations[0]],
-      [conversations[1]],
-    ]);
-  });
-
-  it("counts a repeated resource only once within a batch", () => {
-    const conversations = [
-      { id: "a", taskId: "shared", messages: [] },
-      { id: "b", taskId: "shared", messages: [] },
-    ];
-
-    expect(batchLegacyConversationImports(conversations, 200, 1)).toEqual([
-      conversations,
-    ]);
   });
 });

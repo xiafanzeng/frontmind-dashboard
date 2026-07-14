@@ -1,9 +1,8 @@
 import React from "react";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ConversationProvider,
-  LEGACY_CONVERSATION_STORAGE_KEY,
   prepareConversationForCloud,
   useConversation,
   type Conversation,
@@ -17,7 +16,6 @@ const mocks = vi.hoisted(() => ({
   listRefetch: vi.fn(),
   syncSnapshot: vi.fn(),
   deleteConversation: vi.fn(),
-  importLocal: vi.fn(),
 }));
 
 vi.mock("@/_core/hooks/useAuth", () => ({
@@ -35,9 +33,6 @@ vi.mock("@/lib/trpc", () => ({
       },
       delete: {
         useMutation: () => ({ mutateAsync: mocks.deleteConversation }),
-      },
-      importLocal: {
-        useMutation: () => ({ mutateAsync: mocks.importLocal }),
       },
     },
   },
@@ -66,11 +61,9 @@ describe("ConversationProvider cloud hydration", () => {
     mocks.listRefetch.mockResolvedValue({ data: [conversation("account-1")] });
     mocks.syncSnapshot.mockResolvedValue(conversation("synced"));
     mocks.deleteConversation.mockResolvedValue({ success: true });
-    mocks.importLocal.mockResolvedValue({ imported: 1, skipped: 0 });
-    vi.mocked(localStorage.getItem).mockReturnValue(null);
   });
 
-  it("hydrates from the database without rewriting the legacy local key", async () => {
+  it("hydrates conversations from the database", async () => {
     const { result } = renderHook(() => useConversation(), { wrapper });
 
     expect(result.current.loading).toBe(true);
@@ -78,7 +71,6 @@ describe("ConversationProvider cloud hydration", () => {
     expect(result.current.state.conversations.map((item) => item.id)).toEqual([
       "account-1",
     ]);
-    expect(localStorage.setItem).not.toHaveBeenCalled();
   });
 
   it("clears conversations immediately when the user logs out", async () => {
@@ -120,65 +112,6 @@ describe("ConversationProvider cloud hydration", () => {
     expect(result.current.state.conversations.map((item) => item.id)).toEqual([
       "account-2",
     ]);
-  });
-
-  it("imports legacy history only after an explicit call", async () => {
-    const legacy = {
-      conversations: [
-        {
-          ...conversation("legacy"),
-          apiKeyFingerprint: "sk-secret-fingerprint",
-          messages: [
-            {
-              id: "message",
-              role: "user" as const,
-              content: "hello",
-              timestamp: 100,
-              attachments: [
-                {
-                  id: "attachment",
-                  type: "image" as const,
-                  name: "image.png",
-                  fileId: "file-1",
-                  base64: "data:image/png;base64,secret",
-                  blobUrl: "blob:secret",
-                },
-              ],
-            },
-          ],
-        },
-      ],
-      activeConversationId: "legacy",
-    };
-    vi.mocked(localStorage.getItem).mockImplementation((key) =>
-      key === LEGACY_CONVERSATION_STORAGE_KEY ? JSON.stringify(legacy) : null,
-    );
-    mocks.listRefetch
-      .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: [conversation("legacy")] });
-
-    const { result } = renderHook(() => useConversation(), { wrapper });
-    await waitFor(() => expect(result.current.hydrated).toBe(true));
-
-    expect(result.current.hasLegacyConversations).toBe(true);
-    expect(mocks.importLocal).not.toHaveBeenCalled();
-
-    await act(async () => {
-      await result.current.importLegacyConversations();
-    });
-
-    const uploaded = mocks.importLocal.mock.calls[0][0].conversations[0];
-    expect(uploaded.apiKeyFingerprint).toBeUndefined();
-    expect(uploaded.messages[0].attachments[0]).toEqual({
-      id: "attachment",
-      type: "image",
-      name: "image.png",
-      fileId: "file-1",
-    });
-    expect(localStorage.removeItem).toHaveBeenCalledWith(
-      LEGACY_CONVERSATION_STORAGE_KEY,
-    );
-    expect(result.current.hasLegacyConversations).toBe(false);
   });
 });
 

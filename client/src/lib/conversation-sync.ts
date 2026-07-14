@@ -2,62 +2,6 @@ export type ConversationSyncOperation<T extends { id: string }> =
   | { kind: "snapshot"; conversation: T }
   | { kind: "delete"; id: string };
 
-type ImportableConversation = {
-  taskId?: string;
-  messages: Array<{ attachments?: Array<{ fileId?: string }> }>;
-};
-
-/** Keep browser import batches inside both server-side migration limits. */
-export function batchLegacyConversationImports<T extends ImportableConversation>(
-  conversations: T[],
-  maxConversations = 200,
-  maxResources = 200,
-) {
-  const batches: T[][] = [];
-  let batch: T[] = [];
-  let batchResources = new Set<string>();
-
-  const resourceKeys = (conversation: T) => {
-    const keys = new Set<string>();
-    if (conversation.taskId) keys.add(JSON.stringify(["task", conversation.taskId]));
-    for (const message of conversation.messages) {
-      for (const attachment of message.attachments ?? []) {
-        if (attachment.fileId) {
-          keys.add(JSON.stringify(["file", attachment.fileId]));
-        }
-      }
-    }
-    return keys;
-  };
-
-  const flush = () => {
-    if (batch.length > 0) batches.push(batch);
-    batch = [];
-    batchResources = new Set<string>();
-  };
-
-  for (const conversation of conversations) {
-    const conversationResources = resourceKeys(conversation);
-    if (conversationResources.size > maxResources) {
-      throw new Error(`单个会话包含超过 ${maxResources} 个历史任务或文件，无法自动迁移`);
-    }
-    const combinedResources = new Set([
-      ...batchResources,
-      ...conversationResources,
-    ]);
-    if (
-      batch.length > 0 &&
-      (batch.length >= maxConversations || combinedResources.size > maxResources)
-    ) {
-      flush();
-    }
-    batch.push(conversation);
-    for (const key of conversationResources) batchResources.add(key);
-  }
-  flush();
-  return batches;
-}
-
 type QueueEntry<T extends { id: string }> = {
   pending: ConversationSyncOperation<T> | null;
   running: boolean;

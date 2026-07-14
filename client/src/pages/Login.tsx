@@ -81,13 +81,13 @@ export default function Login() {
           <div className="relative max-w-md space-y-6">
             <div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs text-primary-foreground/75">
               <Sparkles className="h-3.5 w-3.5" />
-              团队内容工作空间
+              AI AGENT WORKFLOWS
             </div>
             <h1 className="text-4xl font-semibold leading-tight tracking-tight">
-              在任意设备，继续你的内容流程
+              FrontMind 智能体工作流
             </h1>
             <p className="text-base leading-7 text-primary-foreground/65">
-              登录后即可安全访问属于你的会话记录与 API 凭据，无需在每台设备重复配置。
+              使用 FrontMind 智能体，探索当前最强 AI 工作流的能力边界。
             </p>
           </div>
 
@@ -112,7 +112,9 @@ export default function Login() {
               <div className="mb-5 flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 text-primary">
                 <LockKeyhole className="h-5 w-5" />
               </div>
-              <h2 className="text-2xl font-semibold tracking-tight">欢迎回来</h2>
+              <h2 className="text-2xl font-semibold tracking-tight">
+                欢迎回来
+              </h2>
               <p className="text-sm text-muted-foreground">
                 使用管理员分配的账号登录工作空间。
               </p>

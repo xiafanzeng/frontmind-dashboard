@@ -4,14 +4,13 @@
  * Layout: Left sidebar (conversation history) + Center chat area
  * Background: Subtle gradient with generated hero image overlay
  */
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback } from "react";
 import Sidebar from "@/components/Sidebar";
 import ChatArea from "@/components/ChatArea";
 import SettingsDialog from "@/components/SettingsDialog";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useConversation } from "@/contexts/ConversationContext";
 import { useIsMobile } from "@/hooks/useMobile";
-import { hasLegacyApiKey } from "@/lib/legacy-migration";
 import { Button } from "@/components/ui/button";
 import { CloudOff, Loader2, RefreshCw, X } from "lucide-react";
 
@@ -20,7 +19,6 @@ export default function Home() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const {
     createConversation,
-    hasLegacyConversations,
     hydrated,
     loading,
     syncError,
@@ -28,14 +26,6 @@ export default function Home() {
     clearSyncError,
   } = useConversation();
   const isMobile = useIsMobile();
-  const migrationPromptShown = useRef(false);
-
-  useEffect(() => {
-    if (migrationPromptShown.current) return;
-    if (!hasLegacyConversations && !hasLegacyApiKey()) return;
-    migrationPromptShown.current = true;
-    setSettingsOpen(true);
-  }, [hasLegacyConversations]);
 
   useKeyboardShortcuts({
     onNewChat: useCallback(() => {
@@ -94,7 +84,9 @@ export default function Home() {
       {syncError && (
         <div className="absolute left-1/2 top-3 z-[70] flex w-[min(92vw,560px)] -translate-x-1/2 items-center gap-2 rounded-xl border border-amber-300/70 bg-amber-50/95 px-3 py-2 text-xs text-amber-950 shadow-lg backdrop-blur">
           <CloudOff className="h-4 w-4 shrink-0" />
-          <span className="min-w-0 flex-1 truncate">会话同步失败：{syncError}</span>
+          <span className="min-w-0 flex-1 truncate">
+            会话同步失败：{syncError}
+          </span>
           <Button
             size="sm"
             variant="ghost"

@@ -33,8 +33,8 @@ export function getModelDisplayName(modelValue: string | undefined): string {
 }
 
 // Non-sensitive, device-local display preference. API credentials are stored
-// only by the server; legacy browser credentials are handled by the explicit
-// one-time migration helper.
+// only by the server; browser-local credentials and conversations are not
+// imported into an account.
 const DEFAULT_CONFIG = {
   agentProfile: "frontmind-pro",
 };
@@ -775,12 +775,12 @@ function getTaskCreditUsage(task: any): number {
  * The displayed total equals the sum of all listed tasks from the last 30 days.
  */
 export async function fetchCreditUsage(
-  options: { force?: boolean } = {},
+  options: { force?: boolean; fingerprint?: string } = {},
 ): Promise<CreditUsageResult> {
   const emptyResult: CreditUsageResult = { totalUsed: 0, recentTasks: [] };
+  const fingerprint = options.fingerprint?.trim() || "account-credential";
 
   try {
-    const fingerprint = "account-credential";
     if (!options.force) {
       const cached = readCreditUsageCache(fingerprint, false);
       if (cached) return cached;
@@ -863,7 +863,6 @@ export async function fetchCreditUsage(
     writeCreditUsageCache(fingerprint, result);
     return result;
   } catch {
-    const fingerprint = "account-credential";
     return readCreditUsageCache(fingerprint, true) || emptyResult;
   }
 }

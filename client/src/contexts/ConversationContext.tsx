@@ -9,7 +9,6 @@ import React, {
 } from "react";
 import { useAuth } from "@/_core/hooks/useAuth";
 import {
-  batchLegacyConversationImports,
   ConversationSyncQueue,
   getErrorMessage,
 } from "@/lib/conversation-sync";
@@ -298,30 +297,10 @@ function conversationReducer(
   }
 }
 
-export const LEGACY_CONVERSATION_STORAGE_KEY = "frontmind-client-conversations";
 const EMPTY_STATE: ConversationState = {
   conversations: [],
   activeConversationId: null,
 };
-
-function readLegacyState(): ConversationState | null {
-  try {
-    const stored = localStorage.getItem(LEGACY_CONVERSATION_STORAGE_KEY);
-    if (stored) {
-      const parsed: unknown = JSON.parse(stored);
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        Array.isArray((parsed as ConversationState).conversations)
-      ) {
-        return parsed as ConversationState;
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
 
 function getTrpcErrorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined;
@@ -420,15 +399,7 @@ interface ConversationTrpcHooks {
   delete: {
     useMutation: () => ConversationMutation<{ id: string }, { success: true }>;
   };
-  importLocal: {
-    useMutation: () => ConversationMutation<
-      { conversations: Conversation[] },
-      { imported: number; skipped: number }
-    >;
-  };
 }
-
-type ImportLocalResult = { imported: number; skipped: number };
 
 interface ConversationContextType {
   state: ConversationState;
@@ -436,9 +407,6 @@ interface ConversationContextType {
   loading: boolean;
   hydrated: boolean;
   syncError: string | null;
-  hasLegacyConversations: boolean;
-  legacyConversationCount: number;
-  importingLegacyConversations: boolean;
   createConversation: () => string;
   setActive: (id: string) => void;
   addMessage: (conversationId: string, message: LocalMessage) => void;
@@ -462,8 +430,6 @@ interface ConversationContextType {
   deleteConversation: (id: string) => void;
   deleteMessage: (conversationId: string, messageId: string) => void;
   refreshConversations: () => Promise<void>;
-  importLegacyConversations: () => Promise<ImportLocalResult>;
-  discardLegacyConversations: () => void;
   clearSyncError: () => void;
 }
 
@@ -487,30 +453,22 @@ export function ConversationProvider({
   });
   const syncSnapshotMutation = conversationApi.syncSnapshot.useMutation();
   const deleteMutation = conversationApi.delete.useMutation();
-  const importLocalMutation = conversationApi.importLocal.useMutation();
 
   const [state, dispatch] = useReducer(conversationReducer, EMPTY_STATE);
   const stateRef = useRef(state);
   const [hydrated, setHydrated] = useState(false);
   const [hydrationLoading, setHydrationLoading] = useState(true);
   const [syncError, setSyncError] = useState<string | null>(null);
-  const [legacyState, setLegacyState] = useState<ConversationState | null>(() =>
-    readLegacyState(),
-  );
-  const [importingLegacyConversations, setImportingLegacyConversations] =
-    useState(false);
   const accountIdRef = useRef<number | null>(null);
   const hydrationGenerationRef = useRef(0);
   const canSyncRef = useRef(false);
   const listRefetchRef = useRef(listQuery.refetch);
   const syncSnapshotRef = useRef(syncSnapshotMutation.mutateAsync);
   const deleteRemoteRef = useRef(deleteMutation.mutateAsync);
-  const importLocalRef = useRef(importLocalMutation.mutateAsync);
 
   listRefetchRef.current = listQuery.refetch;
   syncSnapshotRef.current = syncSnapshotMutation.mutateAsync;
   deleteRemoteRef.current = deleteMutation.mutateAsync;
-  importLocalRef.current = importLocalMutation.mutateAsync;
 
   const syncQueueRef = useRef<ConversationSyncQueue<Conversation> | null>(null);
   if (!syncQueueRef.current) {
@@ -519,7 +477,7 @@ export function ConversationProvider({
       deleteConversation: (id) => deleteRemoteRef.current({ id }),
       onError: (error) => setSyncError(getErrorMessage(error)),
       onSuccess: () => setSyncError(null),
-      shouldRetry: error => {
+      shouldRetry: (error) => {
         const code = getTrpcErrorCode(error);
         return ![
           "BAD_REQUEST",
@@ -786,45 +744,6 @@ export function ConversationProvider({
     await hydrateForUser(expectedUserId, false);
   }, [hydrateForUser, hydrated]);
 
-  const importLegacyConversations = useCallback(async () => {
-    if (!legacyState || accountIdRef.current === null || !hydrated) {
-      throw new Error("请先登录并等待云端对话加载完成");
-    }
-
-    setImportingLegacyConversations(true);
-    setSyncError(null);
-    try {
-      const conversations = legacyState.conversations.map((conversation) =>
-        prepareConversationForCloud(normalizeConversation(conversation)),
-      );
-      const result: ImportLocalResult = { imported: 0, skipped: 0 };
-      // The server caps each request by both conversation and upstream-resource
-      // count. Completed batches are idempotent, while the browser copy remains
-      // until every batch succeeds.
-      for (const batch of batchLegacyConversationImports(conversations)) {
-        const batchResult = await importLocalRef.current({
-          conversations: batch,
-        });
-        result.imported += batchResult.imported;
-        result.skipped += batchResult.skipped;
-      }
-      localStorage.removeItem(LEGACY_CONVERSATION_STORAGE_KEY);
-      setLegacyState(null);
-      await hydrateForUser(accountIdRef.current, false);
-      return result;
-    } catch (error: unknown) {
-      setSyncError(getErrorMessage(error));
-      throw error;
-    } finally {
-      setImportingLegacyConversations(false);
-    }
-  }, [hydrateForUser, hydrated, legacyState]);
-
-  const discardLegacyConversations = useCallback(() => {
-    localStorage.removeItem(LEGACY_CONVERSATION_STORAGE_KEY);
-    setLegacyState(null);
-  }, []);
-
   const clearSyncError = useCallback(() => setSyncError(null), []);
 
   const activeConversation =
@@ -869,9 +788,6 @@ export function ConversationProvider({
         loading: auth.loading || hydrationLoading,
         hydrated,
         syncError,
-        hasLegacyConversations: Boolean(legacyState?.conversations.length),
-        legacyConversationCount: legacyState?.conversations.length ?? 0,
-        importingLegacyConversations,
         createConversation,
         setActive,
         addMessage,
@@ -881,8 +797,6 @@ export function ConversationProvider({
         deleteConversation,
         deleteMessage,
         refreshConversations,
-        importLegacyConversations,
-        discardLegacyConversations,
         clearSyncError,
       }}
     >
