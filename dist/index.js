@@ -43,14 +43,7 @@ import {
   timingSafeEqual
 } from "node:crypto";
 import { parse as parseCookieHeader } from "cookie";
-import {
-  and,
-  desc,
-  eq as eq2,
-  gt,
-  isNull,
-  ne
-} from "drizzle-orm";
+import { and, desc, eq as eq2, gt, isNull, ne } from "drizzle-orm";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -467,7 +460,8 @@ async function verifyPassword(password, encodedHash) {
   try {
     const salt = Buffer.from(parts[5], "base64");
     const expected = Buffer.from(parts[6], "base64");
-    if (salt.length !== 16 || expected.length !== SCRYPT_KEY_LENGTH) return false;
+    if (salt.length !== 16 || expected.length !== SCRYPT_KEY_LENGTH)
+      return false;
     const actual = await runScrypt(password, salt);
     return timingSafeEqual(actual, expected);
   } catch {
@@ -584,7 +578,10 @@ async function loginWithPassword(username, password, clientAddress) {
   const passwordMatches = await verifyPassword(password, passwordHash);
   if (!user || !passwordMatches) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError("INVALID_PASSWORD", "Invalid username or password");
+    throw new AuthServiceError(
+      "INVALID_PASSWORD",
+      "Invalid username or password"
+    );
   }
   if (!user.isActive) {
     recordLoginFailure(attemptKey);
@@ -604,7 +601,10 @@ async function changeOwnPassword(userId, currentPassword, newPassword, currentSe
   const rows = await db.select().from(users).where(eq2(users.id, userId)).limit(1);
   const user = rows[0];
   if (!user?.passwordHash || !await verifyPassword(currentPassword, user.passwordHash)) {
-    throw new AuthServiceError("INVALID_PASSWORD", "Current password is incorrect");
+    throw new AuthServiceError(
+      "INVALID_PASSWORD",
+      "Current password is incorrect"
+    );
   }
   const passwordHash = await hashPassword(newPassword);
   await db.update(users).set({ passwordHash, passwordChangedAt: /* @__PURE__ */ new Date() }).where(eq2(users.id, userId));
@@ -745,7 +745,10 @@ function assertCredentialEncryptionConfigured() {
   getCredentialMasterKey();
 }
 function credentialAad(userId, credentialId) {
-  return Buffer.from(`frontmind-api-credential:v1:${userId}:${credentialId}`, "utf8");
+  return Buffer.from(
+    `frontmind-api-credential:v1:${userId}:${credentialId}`,
+    "utf8"
+  );
 }
 function getApiKeyFingerprint(apiKey) {
   return `fp_${createHash("sha256").update(apiKey, "utf8").digest("hex").slice(0, 16)}`;
@@ -786,7 +789,10 @@ function decryptApiKey(credential) {
     ]).toString("utf8");
   } catch (error) {
     if (error instanceof AuthServiceError) throw error;
-    throw new AuthServiceError("INVALID_CREDENTIAL", "Credential cannot be decrypted");
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "Credential cannot be decrypted"
+    );
   }
 }
 async function validateUpstreamApiKey(apiKey) {
@@ -809,7 +815,10 @@ async function validateUpstreamApiKey(apiKey) {
     );
   }
   if (response.status === 401 || response.status === 403) {
-    throw new AuthServiceError("INVALID_CREDENTIAL", "API credential is invalid");
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "API credential is invalid"
+    );
   }
   if (!response.ok) {
     throw new AuthServiceError(
@@ -830,7 +839,10 @@ function toCredentialStatus(credential) {
 async function getApiCredentialStatus(userId) {
   const db = await requireDb();
   const rows = await db.select().from(apiCredentials).where(
-    and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
+    and(
+      eq2(apiCredentials.userId, userId),
+      eq2(apiCredentials.status, "active")
+    )
   ).orderBy(desc(apiCredentials.version)).limit(1);
   return toCredentialStatus(rows[0]);
 }
@@ -842,18 +854,13 @@ async function replaceApiCredential(userId, apiKey, validator = validateUpstream
   const encrypted = encryptApiKey(userId, credentialId, apiKey);
   const now = /* @__PURE__ */ new Date();
   const credential = await db.transaction(async (tx) => {
-    await tx.insert(apiKeyOwnership).values({ fingerprint, userId }).onDuplicateKeyUpdate({ set: { fingerprint } });
-    const ownership = await tx.select({ userId: apiKeyOwnership.userId }).from(apiKeyOwnership).where(eq2(apiKeyOwnership.fingerprint, fingerprint)).limit(1).for("update");
-    if (!ownership[0] || ownership[0].userId !== userId) {
-      throw new AuthServiceError(
-        "CONFLICT",
-        "This API credential is already assigned to another account"
-      );
-    }
     const latest = await tx.select().from(apiCredentials).where(eq2(apiCredentials.userId, userId)).orderBy(desc(apiCredentials.version)).limit(1);
     const nextVersion = (latest[0]?.version ?? 0) + 1;
     await tx.update(apiCredentials).set({ status: "retired", retiredAt: now }).where(
-      and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
+      and(
+        eq2(apiCredentials.userId, userId),
+        eq2(apiCredentials.status, "active")
+      )
     );
     const inserted = {
       id: credentialId,
@@ -884,7 +891,10 @@ async function deleteActiveApiCredential(userId) {
     encryptionIv: randomBytes(12).toString("base64"),
     encryptionAuthTag: randomBytes(16).toString("base64")
   }).where(
-    and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
+    and(
+      eq2(apiCredentials.userId, userId),
+      eq2(apiCredentials.status, "active")
+    )
   );
 }
 async function getDecryptedCredentialForUser(userId, credentialId) {

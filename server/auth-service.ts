@@ -745,23 +745,6 @@ export async function replaceApiCredential(
   const now = new Date();
 
   const credential = await db.transaction(async tx => {
-    await tx
-      .insert(apiKeyOwnership)
-      .values({ fingerprint, userId })
-      .onDuplicateKeyUpdate({ set: { fingerprint } });
-    const ownership = await tx
-      .select({ userId: apiKeyOwnership.userId })
-      .from(apiKeyOwnership)
-      .where(eq(apiKeyOwnership.fingerprint, fingerprint))
-      .limit(1)
-      .for("update");
-    if (!ownership[0] || ownership[0].userId !== userId) {
-      throw new AuthServiceError(
-        "CONFLICT",
-        "This API credential is already assigned to another account"
-      );
-    }
-
     const latest = await tx
       .select()
       .from(apiCredentials)

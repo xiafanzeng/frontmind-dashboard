@@ -102,9 +102,9 @@ export const apiCredentials = mysqlTable(
 );
 
 /**
- * Permanent ownership claim for an upstream API Key fingerprint. Keeping the
- * claim after credential erasure prevents the same upstream account (and its
- * task history) from being reassigned to a different application user.
+ * Legacy API Key ownership rows retained for migration compatibility.
+ * New credential assignments no longer write to this table because one
+ * upstream API Key may be shared by multiple FrontMind users.
  */
 export const apiKeyOwnership = mysqlTable(
   "api_key_ownership",
