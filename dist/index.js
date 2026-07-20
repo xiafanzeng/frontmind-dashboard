@@ -1,6 +1,6 @@
 // server/_core/index.ts
 import "dotenv/config";
-import express3 from "express";
+import express2 from "express";
 import { createServer } from "http";
 import { sql } from "drizzle-orm";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
@@ -43,7 +43,14 @@ import {
   timingSafeEqual
 } from "node:crypto";
 import { parse as parseCookieHeader } from "cookie";
-import { and, desc, eq as eq2, gt, isNull, ne } from "drizzle-orm";
+import {
+  and,
+  desc,
+  eq as eq2,
+  gt,
+  isNull,
+  ne
+} from "drizzle-orm";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -460,8 +467,7 @@ async function verifyPassword(password, encodedHash) {
   try {
     const salt = Buffer.from(parts[5], "base64");
     const expected = Buffer.from(parts[6], "base64");
-    if (salt.length !== 16 || expected.length !== SCRYPT_KEY_LENGTH)
-      return false;
+    if (salt.length !== 16 || expected.length !== SCRYPT_KEY_LENGTH) return false;
     const actual = await runScrypt(password, salt);
     return timingSafeEqual(actual, expected);
   } catch {
@@ -578,10 +584,7 @@ async function loginWithPassword(username, password, clientAddress) {
   const passwordMatches = await verifyPassword(password, passwordHash);
   if (!user || !passwordMatches) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError(
-      "INVALID_PASSWORD",
-      "Invalid username or password"
-    );
+    throw new AuthServiceError("INVALID_PASSWORD", "Invalid username or password");
   }
   if (!user.isActive) {
     recordLoginFailure(attemptKey);
@@ -601,10 +604,7 @@ async function changeOwnPassword(userId, currentPassword, newPassword, currentSe
   const rows = await db.select().from(users).where(eq2(users.id, userId)).limit(1);
   const user = rows[0];
   if (!user?.passwordHash || !await verifyPassword(currentPassword, user.passwordHash)) {
-    throw new AuthServiceError(
-      "INVALID_PASSWORD",
-      "Current password is incorrect"
-    );
+    throw new AuthServiceError("INVALID_PASSWORD", "Current password is incorrect");
   }
   const passwordHash = await hashPassword(newPassword);
   await db.update(users).set({ passwordHash, passwordChangedAt: /* @__PURE__ */ new Date() }).where(eq2(users.id, userId));
@@ -745,10 +745,7 @@ function assertCredentialEncryptionConfigured() {
   getCredentialMasterKey();
 }
 function credentialAad(userId, credentialId) {
-  return Buffer.from(
-    `frontmind-api-credential:v1:${userId}:${credentialId}`,
-    "utf8"
-  );
+  return Buffer.from(`frontmind-api-credential:v1:${userId}:${credentialId}`, "utf8");
 }
 function getApiKeyFingerprint(apiKey) {
   return `fp_${createHash("sha256").update(apiKey, "utf8").digest("hex").slice(0, 16)}`;
@@ -789,10 +786,7 @@ function decryptApiKey(credential) {
     ]).toString("utf8");
   } catch (error) {
     if (error instanceof AuthServiceError) throw error;
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "Credential cannot be decrypted"
-    );
+    throw new AuthServiceError("INVALID_CREDENTIAL", "Credential cannot be decrypted");
   }
 }
 async function validateUpstreamApiKey(apiKey) {
@@ -815,10 +809,7 @@ async function validateUpstreamApiKey(apiKey) {
     );
   }
   if (response.status === 401 || response.status === 403) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "API credential is invalid"
-    );
+    throw new AuthServiceError("INVALID_CREDENTIAL", "API credential is invalid");
   }
   if (!response.ok) {
     throw new AuthServiceError(
@@ -839,10 +830,7 @@ function toCredentialStatus(credential) {
 async function getApiCredentialStatus(userId) {
   const db = await requireDb();
   const rows = await db.select().from(apiCredentials).where(
-    and(
-      eq2(apiCredentials.userId, userId),
-      eq2(apiCredentials.status, "active")
-    )
+    and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
   ).orderBy(desc(apiCredentials.version)).limit(1);
   return toCredentialStatus(rows[0]);
 }
@@ -857,10 +845,7 @@ async function replaceApiCredential(userId, apiKey, validator = validateUpstream
     const latest = await tx.select().from(apiCredentials).where(eq2(apiCredentials.userId, userId)).orderBy(desc(apiCredentials.version)).limit(1);
     const nextVersion = (latest[0]?.version ?? 0) + 1;
     await tx.update(apiCredentials).set({ status: "retired", retiredAt: now }).where(
-      and(
-        eq2(apiCredentials.userId, userId),
-        eq2(apiCredentials.status, "active")
-      )
+      and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
     );
     const inserted = {
       id: credentialId,
@@ -891,10 +876,7 @@ async function deleteActiveApiCredential(userId) {
     encryptionIv: randomBytes(12).toString("base64"),
     encryptionAuthTag: randomBytes(16).toString("base64")
   }).where(
-    and(
-      eq2(apiCredentials.userId, userId),
-      eq2(apiCredentials.status, "active")
-    )
+    and(eq2(apiCredentials.userId, userId), eq2(apiCredentials.status, "active"))
   );
 }
 async function getDecryptedCredentialForUser(userId, credentialId) {
@@ -2314,7 +2296,7 @@ function serveStatic(app) {
 
 // server/manus-proxy.ts
 import { Router } from "express";
-import axios from "axios";
+import axios2 from "axios";
 import zlib from "zlib";
 import { randomUUID as randomUUID3 } from "crypto";
 
@@ -2401,10 +2383,6 @@ function beforeRedirect(options) {
   }
   assertSafeHostname(hostname);
 }
-var SAFE_EXTERNAL_MAX_BYTES = Math.max(
-  1,
-  Number(process.env.FRONTMIND_EXTERNAL_DOWNLOAD_MAX_BYTES) || 100 * 1024 * 1024
-);
 var safeExternalRequestOptions = {
   httpAgent,
   httpsAgent,
@@ -2415,18 +2393,817 @@ var safeExternalRequestOptions = {
   beforeRedirect
 };
 
+// server/prepared-file-service.ts
+import axios from "axios";
+import { createHash as createHash2 } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
+import fs3 from "node:fs/promises";
+import path3 from "node:path";
+import { Worker } from "node:worker_threads";
+var THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1e3;
+var FIVE_MINUTES_MS = 5 * 60 * 1e3;
+var FIVE_GIB = 5 * 1024 * 1024 * 1024;
+var DISK_CHECK_INTERVAL_BYTES = 64 * 1024 * 1024;
+var DEFAULT_LARGE_PDF_THRESHOLD_BYTES = 64 * 1024 * 1024;
+var PreparedFileError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "PreparedFileError";
+  }
+};
+function normalizeFilename(filename) {
+  const safe = String(filename || "document.pdf").replace(/[\\/\0]/g, "_").trim();
+  const withExtension = safe.toLowerCase().endsWith(".pdf") ? safe : `${safe || "document"}.pdf`;
+  return withExtension || "document.pdf";
+}
+function stableExternalIdentity(url) {
+  const parsed = new URL(url);
+  const ephemeralNames = /* @__PURE__ */ new Set([
+    "accesskeyid",
+    "credential",
+    "expires",
+    "googleaccessid",
+    "key-pair-id",
+    "policy",
+    "security-token",
+    "signature",
+    "token"
+  ]);
+  const stableParameters = [...parsed.searchParams.entries()].filter(([name]) => {
+    const lower = name.toLowerCase();
+    return !ephemeralNames.has(lower) && !lower.startsWith("x-amz-") && !lower.startsWith("x-goog-") && !lower.startsWith("x-oss-");
+  }).sort(
+    ([leftName, leftValue], [rightName, rightValue]) => leftName === rightName ? leftValue.localeCompare(rightValue) : leftName.localeCompare(rightName)
+  );
+  const stableQuery = new URLSearchParams(stableParameters).toString();
+  return `${parsed.protocol}//${parsed.host}${parsed.pathname}${stableQuery ? `?${stableQuery}` : ""}`;
+}
+function createPreparedAssetId(ownerUserId, credentialId, source) {
+  const sourceIdentity = source.kind === "file" ? `file:${source.fileId}` : `external:${stableExternalIdentity(source.url)}`;
+  return createHash2("sha256").update(`frontmind-pdf-v1\0${ownerUserId}\0${credentialId}\0${sourceIdentity}`).digest("hex").slice(0, 40);
+}
+function publicStatus(manifest) {
+  return {
+    assetId: manifest.id,
+    filename: manifest.filename,
+    mimeType: manifest.mimeType,
+    status: manifest.status,
+    phase: manifest.phase,
+    size: manifest.size,
+    sourceBytes: manifest.sourceBytes,
+    pageCount: manifest.pageCount,
+    errorCode: manifest.errorCode,
+    errorMessage: manifest.errorMessage,
+    retryAfterMs: manifest.status === "queued" || manifest.status === "processing" ? 2e3 : void 0,
+    contentUrl: `/api/frontmind/assets/${manifest.id}/content`,
+    downloadTokenUrl: `/api/frontmind/assets/${manifest.id}/download-token`
+  };
+}
+function finitePositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+async function fileExists(filePath) {
+  try {
+    await fs3.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function pathSize(targetPath) {
+  try {
+    const stat = await fs3.stat(targetPath);
+    if (stat.isFile()) return stat.size;
+    if (!stat.isDirectory()) return 0;
+    const entries = await fs3.readdir(targetPath);
+    let total = 0;
+    for (const entry of entries) {
+      total += await pathSize(path3.join(targetPath, entry));
+    }
+    return total;
+  } catch {
+    return 0;
+  }
+}
+async function commandAvailable(command, args) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("exit", (code) => resolve(code === 0));
+  });
+}
+async function hashFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash2("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+var PreparedFileService = class {
+  constructor(rootDir) {
+    this.manifests = /* @__PURE__ */ new Map();
+    this.queue = [];
+    this.queued = /* @__PURE__ */ new Set();
+    this.active = /* @__PURE__ */ new Set();
+    this.manifestWrites = /* @__PURE__ */ new Map();
+    this.initPromise = null;
+    this.processing = 0;
+    this.cleanupTimer = null;
+    this.rootDir = rootDir || process.env.FRONTMIND_PREPARED_FILE_DIR || (process.env.NODE_ENV === "production" ? "/var/lib/frontmind/prepared-files" : path3.resolve(process.cwd(), ".frontmind-prepared-files"));
+    this.workerConcurrency = finitePositiveInteger(
+      process.env.FRONTMIND_PDF_WORKERS,
+      1
+    );
+    this.retentionMs = finitePositiveInteger(
+      process.env.FRONTMIND_PREPARED_FILE_TTL_MS,
+      THIRTY_DAYS_MS
+    );
+    this.largePdfThresholdBytes = finitePositiveInteger(
+      process.env.FRONTMIND_LARGE_PDF_THRESHOLD_BYTES,
+      DEFAULT_LARGE_PDF_THRESHOLD_BYTES
+    );
+  }
+  async initialize() {
+    if (!this.initPromise) {
+      this.initPromise = this.initializeOnce();
+    }
+    return this.initPromise;
+  }
+  async initializeOnce() {
+    await fs3.mkdir(this.rootDir, { recursive: true, mode: 448 });
+    await fs3.chmod(this.rootDir, 448).catch(() => void 0);
+    const tooling = await Promise.all([
+      commandAvailable("pdfinfo", ["-v"]),
+      commandAvailable("pdftotext", ["-v"]),
+      commandAvailable("pdfseparate", ["-v"]),
+      commandAvailable("pdfunite", ["-v"]),
+      commandAvailable("gs", ["--version"])
+    ]);
+    if (tooling.some((available) => !available)) {
+      throw new PreparedFileError(
+        "PDF_TOOLING_UNAVAILABLE",
+        "PDF \u670D\u52A1\u4F9D\u8D56\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u5B89\u88C5 poppler-utils \u4E0E ghostscript"
+      );
+    }
+    const entries = await fs3.readdir(this.rootDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path3.join(this.rootDir, entry.name);
+      if (entry.isDirectory() && (entry.name.endsWith(".work") || entry.name.endsWith(".tmp-work"))) {
+        await fs3.rm(fullPath, { recursive: true, force: true });
+        continue;
+      }
+      if (entry.isFile() && (entry.name.endsWith(".source.tmp") || entry.name.endsWith(".prepared.tmp") || entry.name.endsWith(".json.tmp"))) {
+        await fs3.rm(fullPath, { force: true });
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(
+          await fs3.readFile(fullPath, "utf8")
+        );
+        if (parsed.version !== 1 || !/^[a-f0-9]{40}$/.test(parsed.id) || parsed.id !== entry.name.slice(0, -5)) {
+          continue;
+        }
+        if (parsed.status === "processing") {
+          parsed.status = "queued";
+          parsed.phase = "queued";
+          parsed.updatedAt = Date.now();
+          await this.persistManifest(parsed);
+        }
+        this.manifests.set(parsed.id, parsed);
+        if (parsed.status === "queued") this.enqueue(parsed.id);
+      } catch (error) {
+        console.warn(
+          `[PreparedFiles] Ignoring invalid manifest ${entry.name}`,
+          error
+        );
+      }
+    }
+    await this.cleanup();
+    this.cleanupTimer = setInterval(
+      () => void this.cleanup(),
+      24 * 60 * 60 * 1e3
+    );
+    this.cleanupTimer.unref();
+  }
+  async registerFile(input) {
+    await this.initialize();
+    const source = { kind: "file", fileId: input.fileId };
+    return this.register({
+      id: createPreparedAssetId(
+        input.ownerUserId,
+        input.credentialId,
+        source
+      ),
+      ownerUserId: input.ownerUserId,
+      credentialId: input.credentialId,
+      source,
+      filename: normalizeFilename(input.filename)
+    });
+  }
+  async registerExternal(input) {
+    await this.initialize();
+    const source = {
+      kind: "external",
+      url: assertSafeExternalUrl(input.url)
+    };
+    return this.register({
+      id: createPreparedAssetId(
+        input.ownerUserId,
+        input.credentialId,
+        source
+      ),
+      ownerUserId: input.ownerUserId,
+      credentialId: input.credentialId,
+      source,
+      filename: normalizeFilename(input.filename)
+    });
+  }
+  async register(input) {
+    const now = Date.now();
+    const existing = this.manifests.get(input.id);
+    if (existing) {
+      existing.filename = input.filename;
+      existing.lastAccessedAt = now;
+      if (input.source.kind === "external") {
+        existing.source = input.source;
+      }
+      if (existing.status === "failed" && existing.errorCode === "SOURCE_EXPIRED") {
+        existing.status = "queued";
+        existing.phase = "queued";
+        delete existing.errorCode;
+        delete existing.errorMessage;
+        this.enqueue(existing.id);
+      }
+      await this.persistManifest(existing);
+      return publicStatus(existing);
+    }
+    const manifest = {
+      version: 1,
+      id: input.id,
+      ownerUserId: input.ownerUserId,
+      credentialId: input.credentialId,
+      source: input.source,
+      filename: input.filename,
+      mimeType: "application/pdf",
+      status: "queued",
+      phase: "queued",
+      createdAt: now,
+      updatedAt: now,
+      lastAccessedAt: now
+    };
+    this.manifests.set(manifest.id, manifest);
+    await this.persistManifest(manifest);
+    this.enqueue(manifest.id);
+    return publicStatus(manifest);
+  }
+  async getStatus(assetId, ownerUserId) {
+    const manifest = await this.requireOwned(assetId, ownerUserId);
+    await this.touch(manifest);
+    return publicStatus(manifest);
+  }
+  async getReadyManifest(assetId, ownerUserId) {
+    const manifest = await this.requireOwned(assetId, ownerUserId);
+    await this.touch(manifest);
+    if (manifest.status !== "ready") return manifest;
+    if (!await fileExists(this.pdfPath(assetId))) {
+      manifest.status = "queued";
+      manifest.phase = "queued";
+      delete manifest.size;
+      delete manifest.etag;
+      await this.persistManifest(manifest);
+      this.enqueue(assetId);
+    }
+    return manifest;
+  }
+  async retry(assetId, ownerUserId) {
+    const manifest = await this.requireOwned(assetId, ownerUserId);
+    if (manifest.status === "ready") return publicStatus(manifest);
+    manifest.status = "queued";
+    manifest.phase = "queued";
+    manifest.updatedAt = Date.now();
+    delete manifest.errorCode;
+    delete manifest.errorMessage;
+    await this.persistManifest(manifest);
+    this.enqueue(assetId);
+    return publicStatus(manifest);
+  }
+  contentPath(assetId) {
+    return this.pdfPath(assetId);
+  }
+  beginUse(assetId) {
+    this.active.add(assetId);
+  }
+  endUse(assetId) {
+    this.active.delete(assetId);
+  }
+  async health() {
+    await this.initialize();
+    const stats = await fs3.statfs(this.rootDir);
+    return {
+      cacheDirectory: this.rootDir,
+      availableBytes: stats.bavail * stats.bsize,
+      totalBytes: stats.blocks * stats.bsize,
+      queueLength: this.queue.length,
+      activeWorkers: this.processing
+    };
+  }
+  async requireOwned(assetId, ownerUserId) {
+    await this.initialize();
+    if (!/^[a-f0-9]{40}$/.test(assetId)) {
+      throw new PreparedFileError("ASSET_NOT_FOUND", "\u6587\u4EF6\u4E0D\u5B58\u5728");
+    }
+    const manifest = this.manifests.get(assetId);
+    if (!manifest || manifest.ownerUserId !== ownerUserId) {
+      throw new PreparedFileError("ASSET_NOT_FOUND", "\u6587\u4EF6\u4E0D\u5B58\u5728");
+    }
+    return manifest;
+  }
+  enqueue(assetId) {
+    if (this.queued.has(assetId)) return;
+    this.queued.add(assetId);
+    this.queue.push(assetId);
+    queueMicrotask(() => void this.drainQueue());
+  }
+  async drainQueue() {
+    while (this.processing < this.workerConcurrency && this.queue.length > 0) {
+      const assetId = this.queue.shift();
+      if (!assetId) return;
+      this.queued.delete(assetId);
+      const manifest = this.manifests.get(assetId);
+      if (!manifest || manifest.status !== "queued") continue;
+      this.processing += 1;
+      void this.processAsset(manifest).catch((error) => {
+        console.error(
+          `[PreparedFiles] Unhandled job error for ${manifest.id}`,
+          error
+        );
+      }).finally(() => {
+        this.processing -= 1;
+        void this.drainQueue();
+      });
+    }
+  }
+  async processAsset(manifest) {
+    const sourcePath = this.sourcePath(manifest.id);
+    const preparedTempPath = this.preparedTempPath(manifest.id);
+    const workDir = this.workPath(manifest.id);
+    this.active.add(manifest.id);
+    try {
+      manifest.status = "processing";
+      manifest.phase = "downloading";
+      manifest.updatedAt = Date.now();
+      delete manifest.errorCode;
+      delete manifest.errorMessage;
+      await this.persistManifest(manifest);
+      await this.ensureDiskSpace();
+      const sourceBytes = await this.downloadSource(
+        manifest,
+        sourcePath,
+        async (downloadedBytes) => {
+          manifest.sourceBytes = downloadedBytes;
+          manifest.updatedAt = Date.now();
+          await this.persistManifest(manifest);
+        }
+      );
+      manifest.sourceBytes = sourceBytes;
+      manifest.phase = "sanitizing";
+      manifest.updatedAt = Date.now();
+      await this.persistManifest(manifest);
+      const result = await this.runWorker(
+        manifest,
+        sourcePath,
+        preparedTempPath,
+        workDir
+      );
+      manifest.phase = "optimizing";
+      manifest.updatedAt = Date.now();
+      await this.persistManifest(manifest);
+      const outputStat = await fs3.stat(preparedTempPath);
+      if (outputStat.size < 5) {
+        throw new PreparedFileError(
+          "INVALID_PDF",
+          "\u5904\u7406\u540E\u7684 PDF \u6587\u4EF6\u4E3A\u7A7A"
+        );
+      }
+      const handle = await fs3.open(preparedTempPath, "r");
+      try {
+        const header = Buffer.alloc(5);
+        await handle.read(header, 0, 5, 0);
+        if (header.toString("ascii") !== "%PDF-") {
+          throw new PreparedFileError(
+            "INVALID_PDF",
+            "\u5904\u7406\u7ED3\u679C\u4E0D\u662F\u6709\u6548\u7684 PDF"
+          );
+        }
+      } finally {
+        await handle.close();
+      }
+      const etag = await hashFile(preparedTempPath);
+      await fs3.rename(preparedTempPath, this.pdfPath(manifest.id));
+      await fs3.chmod(this.pdfPath(manifest.id), 384).catch(() => void 0);
+      manifest.status = "ready";
+      manifest.phase = "ready";
+      manifest.size = outputStat.size;
+      manifest.pageCount = result.pageCount;
+      manifest.etag = etag;
+      manifest.updatedAt = Date.now();
+      manifest.lastAccessedAt = Date.now();
+      await this.persistManifest(manifest);
+      await this.cleanup();
+    } catch (error) {
+      const preparedError = error instanceof PreparedFileError ? error : new PreparedFileError(
+        "PDF_PREPARATION_FAILED",
+        error instanceof Error ? error.message : "PDF \u5904\u7406\u5931\u8D25"
+      );
+      manifest.status = "failed";
+      manifest.phase = "failed";
+      manifest.errorCode = preparedError.code;
+      manifest.errorMessage = preparedError.message;
+      manifest.updatedAt = Date.now();
+      await this.persistManifest(manifest);
+      console.error(
+        `[PreparedFiles] Failed to prepare ${manifest.id}: ${preparedError.code} ${preparedError.message}`
+      );
+    } finally {
+      this.active.delete(manifest.id);
+      await fs3.rm(sourcePath, { force: true }).catch(() => void 0);
+      await fs3.rm(preparedTempPath, { force: true }).catch(() => void 0);
+      await fs3.rm(workDir, { recursive: true, force: true }).catch(
+        () => void 0
+      );
+    }
+  }
+  async downloadSource(manifest, destination, persistProgress) {
+    let sourceUrl;
+    let headers;
+    if (manifest.source.kind === "file") {
+      const credential = await getCredentialForUpstreamResource(
+        manifest.ownerUserId,
+        "file",
+        manifest.source.fileId
+      );
+      if (!credential || credential.id !== manifest.credentialId) {
+        throw new PreparedFileError(
+          "SOURCE_FORBIDDEN",
+          "\u6587\u4EF6\u6240\u5C5E API Key \u5DF2\u5220\u9664\u6216\u4E0D\u53EF\u7528"
+        );
+      }
+      const baseUrl = getUpstreamBaseUrl();
+      const metadataResponse = await axios.get(
+        `${baseUrl}/v1/files/${encodeURIComponent(manifest.source.fileId)}`,
+        {
+          headers: {
+            API_KEY: credential.apiKey,
+            Authorization: `Bearer ${credential.apiKey}`
+          },
+          timeout: FIVE_MINUTES_MS,
+          validateStatus: () => true
+        }
+      );
+      if (metadataResponse.status !== 200) {
+        throw new PreparedFileError(
+          metadataResponse.status === 404 ? "SOURCE_NOT_FOUND" : "SOURCE_METADATA_FAILED",
+          `\u83B7\u53D6\u6587\u4EF6\u4FE1\u606F\u5931\u8D25 (${metadataResponse.status})`
+        );
+      }
+      if (metadataResponse.data?.filename) {
+        manifest.filename = normalizeFilename(metadataResponse.data.filename);
+      }
+      if (!metadataResponse.data?.upload_url) {
+        sourceUrl = `${baseUrl}/v1/files/${encodeURIComponent(
+          manifest.source.fileId
+        )}/content`;
+        headers = {
+          API_KEY: credential.apiKey,
+          Authorization: `Bearer ${credential.apiKey}`
+        };
+      } else {
+        sourceUrl = assertSafeExternalUrl(metadataResponse.data.upload_url);
+      }
+    } else {
+      sourceUrl = assertSafeExternalUrl(manifest.source.url);
+    }
+    const controller = new AbortController();
+    let lastProgressAt = Date.now();
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastProgressAt >= FIVE_MINUTES_MS) {
+        controller.abort(
+          new PreparedFileError(
+            "SOURCE_STALLED",
+            "\u6587\u4EF6\u4E0B\u8F7D\u8FDE\u7EED 5 \u5206\u949F\u6CA1\u6709\u8FDB\u5C55"
+          )
+        );
+      }
+    }, 3e4);
+    watchdog.unref();
+    try {
+      const response = await axios.get(sourceUrl, {
+        ...safeExternalRequestOptions,
+        headers,
+        responseType: "stream",
+        timeout: FIVE_MINUTES_MS,
+        maxContentLength: Infinity,
+        signal: controller.signal,
+        validateStatus: () => true
+      });
+      if (response.status !== 200) {
+        throw new PreparedFileError(
+          response.status === 401 || response.status === 403 || response.status === 404 ? "SOURCE_EXPIRED" : "SOURCE_DOWNLOAD_FAILED",
+          `\u4E0A\u6E38\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25 (${response.status})`
+        );
+      }
+      const output = await fs3.open(destination, "w", 384);
+      let total = 0;
+      let nextDiskCheck = DISK_CHECK_INTERVAL_BYTES;
+      let nextPersist = DISK_CHECK_INTERVAL_BYTES;
+      try {
+        for await (const rawChunk of response.data) {
+          const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+          await output.write(chunk);
+          total += chunk.length;
+          lastProgressAt = Date.now();
+          if (total >= nextPersist) {
+            await persistProgress(total);
+            nextPersist = total + DISK_CHECK_INTERVAL_BYTES;
+          }
+          if (total >= nextDiskCheck) {
+            await this.ensureDiskSpace();
+            nextDiskCheck = total + DISK_CHECK_INTERVAL_BYTES;
+          }
+        }
+      } finally {
+        await output.close();
+      }
+      await persistProgress(total);
+      return total;
+    } catch (error) {
+      if (controller.signal.aborted) {
+        const reason = controller.signal.reason;
+        if (reason instanceof PreparedFileError) throw reason;
+        throw new PreparedFileError(
+          "SOURCE_STALLED",
+          "\u6587\u4EF6\u4E0B\u8F7D\u8FDE\u7EED 5 \u5206\u949F\u6CA1\u6709\u8FDB\u5C55"
+        );
+      }
+      if (error instanceof PreparedFileError) throw error;
+      throw new PreparedFileError(
+        "SOURCE_DOWNLOAD_FAILED",
+        error?.message || "\u4E0A\u6E38\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25"
+      );
+    } finally {
+      clearInterval(watchdog);
+    }
+  }
+  async runWorker(manifest, inputPath, outputPath, workDir) {
+    await fs3.mkdir(workDir, { recursive: true, mode: 448 });
+    const production = process.env.NODE_ENV === "production";
+    const workerUrl = new URL(
+      production ? "./pdf-prepare-worker.js" : "./pdf-prepare-worker-bootstrap.mjs",
+      import.meta.url
+    );
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let lastProgressAt = Date.now();
+      let lastProgressPersistedAt = 0;
+      let checkingDisk = false;
+      const worker = new Worker(workerUrl, {
+        workerData: {
+          inputPath,
+          outputPath,
+          workDir,
+          largePdfThresholdBytes: this.largePdfThresholdBytes
+        },
+        execArgv: []
+      });
+      const finish = (callback) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(watchdog);
+        callback();
+      };
+      const watchdog = setInterval(() => {
+        if (Date.now() - lastProgressAt >= FIVE_MINUTES_MS) {
+          void worker.terminate();
+          finish(
+            () => reject(
+              new PreparedFileError(
+                "PDF_PROCESSING_STALLED",
+                "PDF \u5904\u7406\u8FDE\u7EED 5 \u5206\u949F\u6CA1\u6709\u8FDB\u5C55"
+              )
+            )
+          );
+          return;
+        }
+        if (checkingDisk) return;
+        checkingDisk = true;
+        void this.ensureDiskSpace().catch((error) => {
+          void worker.terminate();
+          finish(
+            () => reject(
+              error instanceof PreparedFileError ? error : new PreparedFileError(
+                "INSUFFICIENT_STORAGE",
+                "\u670D\u52A1\u5668\u53EF\u7528\u78C1\u76D8\u7A7A\u95F4\u4E0D\u8DB3\uFF0C\u8BF7\u6E05\u7406\u7F13\u5B58\u540E\u91CD\u8BD5"
+              )
+            )
+          );
+        }).finally(() => {
+          checkingDisk = false;
+        });
+      }, 3e4);
+      watchdog.unref();
+      worker.on("message", (message) => {
+        lastProgressAt = Date.now();
+        if (message.type === "progress") {
+          manifest.phase = message.phase;
+          manifest.updatedAt = Date.now();
+          if (message.pageCount) manifest.pageCount = message.pageCount;
+          if (Date.now() - lastProgressPersistedAt >= 1e3 || message.pageCount && message.page === message.pageCount) {
+            lastProgressPersistedAt = Date.now();
+            void this.persistManifest(manifest);
+          }
+          return;
+        }
+        if (message.type === "complete") {
+          finish(() => resolve(message));
+          return;
+        }
+        finish(
+          () => reject(
+            new PreparedFileError(
+              message.code || "PDF_PREPARATION_FAILED",
+              message.message
+            )
+          )
+        );
+      });
+      worker.on("error", (error) => {
+        finish(
+          () => reject(
+            new PreparedFileError(
+              "PDF_WORKER_FAILED",
+              error.message || "PDF Worker \u542F\u52A8\u5931\u8D25"
+            )
+          )
+        );
+      });
+      worker.on("exit", (code) => {
+        if (code !== 0) {
+          finish(
+            () => reject(
+              new PreparedFileError(
+                "PDF_WORKER_FAILED",
+                `PDF Worker \u5F02\u5E38\u9000\u51FA (${code})`
+              )
+            )
+          );
+        }
+      });
+    });
+  }
+  async touch(manifest) {
+    const now = Date.now();
+    if (now - manifest.lastAccessedAt < 60 * 60 * 1e3) return;
+    manifest.lastAccessedAt = now;
+    await this.persistManifest(manifest);
+  }
+  persistManifest(manifest) {
+    const destination = this.manifestPath(manifest.id);
+    const temporary = `${destination}.tmp`;
+    const snapshot = `${JSON.stringify(manifest)}
+`;
+    const previous = this.manifestWrites.get(manifest.id) || Promise.resolve();
+    const operation = previous.catch(() => void 0).then(async () => {
+      await fs3.writeFile(temporary, snapshot, {
+        encoding: "utf8",
+        mode: 384
+      });
+      await fs3.rename(temporary, destination);
+    });
+    this.manifestWrites.set(manifest.id, operation);
+    return operation.finally(() => {
+      if (this.manifestWrites.get(manifest.id) === operation) {
+        this.manifestWrites.delete(manifest.id);
+      }
+    });
+  }
+  async ensureDiskSpace() {
+    const stats = await fs3.statfs(this.rootDir);
+    const totalBytes = stats.blocks * stats.bsize;
+    const availableBytes = stats.bavail * stats.bsize;
+    const reserveBytes = Math.max(Math.floor(totalBytes * 0.1), FIVE_GIB);
+    const maximumCacheBytes = Math.min(
+      Math.floor(totalBytes * 0.8),
+      Math.max(0, totalBytes - reserveBytes)
+    );
+    const cacheBytes = await this.cacheSize();
+    if (availableBytes >= reserveBytes && cacheBytes <= maximumCacheBytes) {
+      return;
+    }
+    await this.cleanup();
+    const refreshed = await fs3.statfs(this.rootDir);
+    const refreshedAvailable = refreshed.bavail * refreshed.bsize;
+    const refreshedCacheBytes = await this.cacheSize();
+    if (refreshedAvailable < reserveBytes || refreshedCacheBytes > maximumCacheBytes) {
+      throw new PreparedFileError(
+        "INSUFFICIENT_STORAGE",
+        "\u670D\u52A1\u5668\u53EF\u7528\u78C1\u76D8\u7A7A\u95F4\u4E0D\u8DB3\uFF0C\u8BF7\u6E05\u7406\u7F13\u5B58\u540E\u91CD\u8BD5"
+      );
+    }
+  }
+  async cleanup() {
+    await fs3.mkdir(this.rootDir, { recursive: true, mode: 448 });
+    const now = Date.now();
+    const candidates = [...this.manifests.values()].filter((manifest) => !this.active.has(manifest.id)).sort((a, b) => a.lastAccessedAt - b.lastAccessedAt);
+    for (const manifest of candidates) {
+      if (now - manifest.lastAccessedAt <= this.retentionMs) continue;
+      await this.deleteAsset(manifest.id);
+    }
+    const stats = await fs3.statfs(this.rootDir);
+    const totalBytes = stats.blocks * stats.bsize;
+    const reserveBytes = Math.max(Math.floor(totalBytes * 0.1), FIVE_GIB);
+    const maximumCacheBytes = Math.min(
+      Math.floor(totalBytes * 0.8),
+      Math.max(0, totalBytes - reserveBytes)
+    );
+    let cacheBytes = await this.cacheSize();
+    let availableBytes = stats.bavail * stats.bsize;
+    if (cacheBytes <= maximumCacheBytes && availableBytes >= reserveBytes) {
+      return;
+    }
+    for (const manifest of candidates) {
+      if (cacheBytes <= maximumCacheBytes && availableBytes >= reserveBytes) {
+        break;
+      }
+      if (this.active.has(manifest.id) || manifest.status === "processing" || manifest.status === "queued") {
+        continue;
+      }
+      const before = await this.assetSize(manifest.id);
+      await this.deleteAsset(manifest.id);
+      cacheBytes = Math.max(0, cacheBytes - before);
+      const refreshed = await fs3.statfs(this.rootDir);
+      availableBytes = refreshed.bavail * refreshed.bsize;
+    }
+  }
+  async assetSize(assetId) {
+    let size = 0;
+    for (const filePath of [
+      this.manifestPath(assetId),
+      this.pdfPath(assetId),
+      this.sourcePath(assetId),
+      this.preparedTempPath(assetId),
+      this.workPath(assetId)
+    ]) {
+      size += await pathSize(filePath);
+    }
+    return size;
+  }
+  async cacheSize() {
+    return pathSize(this.rootDir);
+  }
+  async deleteAsset(assetId) {
+    if (this.active.has(assetId)) return;
+    this.manifests.delete(assetId);
+    this.queued.delete(assetId);
+    const queueIndex = this.queue.indexOf(assetId);
+    if (queueIndex >= 0) this.queue.splice(queueIndex, 1);
+    await Promise.all([
+      fs3.rm(this.manifestPath(assetId), { force: true }),
+      fs3.rm(this.pdfPath(assetId), { force: true }),
+      fs3.rm(this.sourcePath(assetId), { force: true }),
+      fs3.rm(this.preparedTempPath(assetId), { force: true }),
+      fs3.rm(this.workPath(assetId), { recursive: true, force: true })
+    ]);
+  }
+  manifestPath(assetId) {
+    return path3.join(this.rootDir, `${assetId}.json`);
+  }
+  sourcePath(assetId) {
+    return path3.join(this.rootDir, `${assetId}.source.tmp`);
+  }
+  preparedTempPath(assetId) {
+    return path3.join(this.rootDir, `${assetId}.prepared.tmp`);
+  }
+  pdfPath(assetId) {
+    return path3.join(this.rootDir, `${assetId}.pdf`);
+  }
+  workPath(assetId) {
+    return path3.join(this.rootDir, `${assetId}.work`);
+  }
+};
+var preparedFileService = new PreparedFileService();
+
 // server/manus-proxy.ts
 var router2 = Router();
 var fileMetaCache = /* @__PURE__ */ new Map();
 var CACHE_TTL = 10 * 60 * 1e3;
 var downloadTokenCache = /* @__PURE__ */ new Map();
 var DOWNLOAD_TOKEN_TTL = 5 * 60 * 1e3;
-var PROXY_UPLOAD_MAX_BYTES = Math.max(
-  1,
-  Number(process.env.FRONTMIND_PROXY_UPLOAD_MAX_BYTES) || 100 * 1024 * 1024
-);
-var ProxyUploadTooLargeError = class extends Error {
-};
 function safeUrlForLog(value) {
   try {
     const parsed = new URL(value);
@@ -2713,6 +3490,41 @@ function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey
   }
   return ids;
 }
+function collectOutputPdfDescriptors(value, descriptors = [], depth = 0) {
+  if (!value || depth > 50) return descriptors;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectOutputPdfDescriptors(item, descriptors, depth + 1);
+    }
+    return descriptors;
+  }
+  if (typeof value !== "object") return descriptors;
+  const object = value;
+  const filename = String(
+    object.fileName ?? object.file_name ?? object.filename ?? object.name ?? ""
+  );
+  const mimeType = String(
+    object.mimeType ?? object.mime_type ?? object.content_type ?? ""
+  ).toLowerCase();
+  const type = String(object.type ?? "");
+  const looksLikePdf = filename.toLowerCase().endsWith(".pdf") || mimeType.includes("application/pdf");
+  const looksLikeOutputFile = type === "output_file" || type === "file" || "file_id" in object || "fileId" in object;
+  if (looksLikePdf && looksLikeOutputFile) {
+    const fileId = String(object.file_id ?? object.fileId ?? "");
+    const url = String(
+      object.file_url ?? object.fileUrl ?? object.url ?? ""
+    );
+    descriptors.push({
+      fileId: fileId || void 0,
+      url: url || void 0,
+      filename: filename || "document.pdf"
+    });
+  }
+  for (const child of Object.values(object)) {
+    collectOutputPdfDescriptors(child, descriptors, depth + 1);
+  }
+  return descriptors;
+}
 function sanitizeTextFileBuffer(data, filename, contentType) {
   if (!isTextBasedFile(filename, contentType)) {
     return { buffer: data, wasSanitized: false };
@@ -2833,6 +3645,28 @@ async function sanitizePdfBuffer(pdfBuffer) {
       sourceUpper,
       sourceLower
     ];
+    const replaceSimpleBrandEncodings = (content) => {
+      let sanitized = content;
+      const replacements = [...new Set(targetStrings)].sort(
+        (left, right) => right.length - left.length
+      );
+      for (const sourceText of replacements) {
+        const replacement = "FrontMind";
+        sanitized = sanitized.replace(
+          new RegExp(escapeRegExp(sourceText), "g"),
+          replacement
+        );
+        const sourceHex = Buffer.from(sourceText, "latin1").toString("hex");
+        const replacementHex = Buffer.from(replacement, "latin1").toString(
+          "hex"
+        );
+        sanitized = sanitized.replace(
+          new RegExp(escapeRegExp(sourceHex), "gi"),
+          replacementHex
+        );
+      }
+      return sanitized;
+    };
     const glyphPatterns = [];
     for (const cmap of allCMaps) {
       for (const target of targetStrings) {
@@ -2858,20 +3692,31 @@ async function sanitizePdfBuffer(pdfBuffer) {
     }
     glyphPatterns.sort((a, b) => b.glyphs.length - a.glyphs.length);
     if (glyphPatterns.length === 0) {
-      const rawStr = pdfBuffer.toString("latin1");
-      const sourceTitleAi = `${sourceTitle} AI`;
-      if (rawStr.includes(sourceTitleAi) || rawStr.includes(sourceTitle)) {
-        let newStr = rawStr;
-        newStr = newStr.replace(new RegExp(escapeRegExp(sourceTitleAi), "g"), "FrntMind");
-        newStr = newStr.replace(new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"), "FrntM");
-        if (newStr !== rawStr) {
-          console.log("[FrontMind Proxy] PDF sanitized via ASCII binary replacement");
-          return { buffer: Buffer.from(newStr, "latin1"), wasSanitized: true };
+      let simpleStreamsModified = 0;
+      context.enumerateIndirectObjects().forEach(([ref, obj]) => {
+        if (!obj || obj.constructor.name !== "PDFRawStream") return;
+        try {
+          const decoded = decodePDFRawStream(obj);
+          const streamText = Buffer.from(decoded.decode()).toString("latin1");
+          if (!streamText.includes("Tj") && !streamText.includes("TJ")) return;
+          const sanitized = replaceSimpleBrandEncodings(streamText);
+          if (sanitized === streamText) return;
+          const compressed = zlib.deflateSync(
+            Buffer.from(sanitized, "latin1")
+          );
+          const dict = obj.dict.clone(context);
+          dict.set(PDFName.of("Length"), context.obj(compressed.length));
+          dict.set(PDFName.of("Filter"), PDFName.of("FlateDecode"));
+          context.assign(ref, PDFRawStream.of(dict, compressed));
+          simpleStreamsModified += 1;
+        } catch {
         }
-      }
-      if (pdfMetadataModified) {
+      });
+      if (simpleStreamsModified > 0 || pdfMetadataModified) {
         const savedBytes = await pdfDoc.save();
-        console.log("[FrontMind Proxy] PDF metadata sanitized");
+        console.log(
+          `[FrontMind Proxy] PDF simple streams sanitized: ${simpleStreamsModified}, metadata=${pdfMetadataModified}`
+        );
         return { buffer: Buffer.from(savedBytes), wasSanitized: true };
       }
       return { buffer: pdfBuffer, wasSanitized: false };
@@ -2966,7 +3811,8 @@ async function sanitizePdfBuffer(pdfBuffer) {
         const bytes = decoded.decode();
         const streamText = Buffer.from(bytes).toString("latin1");
         if (!streamText.includes("Tj") && !streamText.includes("TJ")) return;
-        const lines = streamText.split("\n");
+        const simpleSanitizedStream = replaceSimpleBrandEncodings(streamText);
+        const lines = simpleSanitizedStream.split("\n");
         const ctmStack = [
           { sx: 1, sy: 1, tx: 0, ty: 0 }
         ];
@@ -2976,7 +3822,7 @@ async function sanitizePdfBuffer(pdfBuffer) {
         let tdAccumX = 0;
         let tdAccumY = 0;
         const tjInfos = [];
-        let streamModified = false;
+        let streamModified = simpleSanitizedStream !== streamText;
         const getPageIndexForStream = () => {
           const objectPageIndex = streamObjectToPageIndex.get(obj);
           if (objectPageIndex !== void 0) return objectPageIndex;
@@ -3305,7 +4151,7 @@ async function sanitizePdfBuffer(pdfBuffer) {
     return { buffer: pdfBuffer, wasSanitized: false };
   } catch (err) {
     console.error("[FrontMind Proxy] PDF sanitization error:", err.message);
-    return { buffer: pdfBuffer, wasSanitized: false };
+    throw new Error(`PDF sanitization failed: ${err.message}`);
   }
 }
 function isOfficeXmlFile(filename, contentType) {
@@ -3379,66 +4225,27 @@ router2.put("/proxy-upload", async (req, res) => {
     }
     const target = assertSafeExternalUrl(rawTarget);
     console.log(`[FrontMind Proxy] Proxy-upload to: ${safeUrlForLog(target)}`);
-    const declaredLength = Number(req.headers["content-length"] || 0);
-    if (declaredLength > PROXY_UPLOAD_MAX_BYTES) {
-      throw new ProxyUploadTooLargeError("Upload body is too large");
-    }
-    const chunks = [];
-    await new Promise((resolve, reject) => {
-      if (req.readableEnded) {
-        resolve();
-        return;
-      }
-      let received = 0;
-      let tooLarge = false;
-      req.on("data", (chunk) => {
-        received += chunk.length;
-        if (received > PROXY_UPLOAD_MAX_BYTES) {
-          tooLarge = true;
-          return;
-        }
-        chunks.push(chunk);
-      });
-      req.on("end", () => {
-        if (tooLarge) reject(new ProxyUploadTooLargeError("Upload body is too large"));
-        else resolve();
-      });
-      req.on("error", reject);
-    });
-    let body = Buffer.concat(chunks);
-    if (body.length === 0 && req.body != null) {
-      if (Buffer.isBuffer(req.body)) {
-        body = Buffer.from(req.body);
-      } else if (typeof req.body === "string") {
-        body = Buffer.from(req.body, "utf-8");
-      } else if (typeof req.body === "object") {
-        body = Buffer.from(JSON.stringify(req.body), "utf-8");
-      }
-      console.log(`[FrontMind Proxy] Recovered body from req.body (${body.length} bytes) \u2013 stream was consumed by body-parser`);
-    }
-    if (body.length > PROXY_UPLOAD_MAX_BYTES) {
-      throw new ProxyUploadTooLargeError("Upload body is too large");
-    }
     const realContentType = req.headers["x-original-content-type"] || req.headers["content-type"] || "application/octet-stream";
-    const response = await axios.put(target, body, {
+    const uploadHeaders = {
+      "Content-Type": realContentType
+    };
+    if (typeof req.headers["content-length"] === "string") {
+      uploadHeaders["Content-Length"] = req.headers["content-length"];
+    }
+    const controller = new AbortController();
+    req.on("aborted", () => controller.abort());
+    const response = await axios2.put(target, req, {
       ...safeExternalRequestOptions,
-      headers: {
-        "Content-Type": realContentType,
-        "Content-Length": String(body.length)
-      },
+      headers: uploadHeaders,
       timeout: 3e5,
-      maxBodyLength: body.length,
+      maxBodyLength: Infinity,
       maxContentLength: 1024 * 1024,
+      signal: controller.signal,
       validateStatus: () => true
     });
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response.status}`);
     res.status(response.status).send(response.data || "");
   } catch (error) {
-    if (error instanceof ProxyUploadTooLargeError) {
-      return res.status(413).json({
-        error: { message: "\u4E0A\u4F20\u6587\u4EF6\u8FC7\u5927", code: "UPLOAD_TOO_LARGE" }
-      });
-    }
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {
@@ -3465,20 +4272,37 @@ router2.get("/proxy-download", async (req, res) => {
       return res.status(400).json({ error: { message: "Missing url parameter" } });
     }
     const targetUrl = assertSafeExternalUrl(rawTargetUrl);
+    const urlFilenameRaw = targetUrl.split("/").pop()?.split("?")[0] || "file";
+    const candidateFilename = requestedFilename || decodeURIComponent(urlFilenameRaw);
+    if (isPdfFile(candidateFilename) && req.frontmindUser) {
+      const credential = await getDecryptedCredentialForUser(
+        req.frontmindUser.id
+      );
+      const asset = await preparedFileService.registerExternal({
+        ownerUserId: req.frontmindUser.id,
+        credentialId: credential?.id || "external",
+        url: targetUrl,
+        filename: candidateFilename
+      });
+      if (asset.status !== "ready") {
+        return res.status(202).json(asset);
+      }
+      const suffix = disposition === "attachment" ? "?download=1" : "";
+      return res.redirect(307, `${asset.contentUrl}${suffix}`);
+    }
     console.log(`[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`);
-    const response = await axios.get(targetUrl, {
+    const response = await axios2.get(targetUrl, {
       ...safeExternalRequestOptions,
       responseType: "arraybuffer",
       timeout: 12e4,
-      maxContentLength: SAFE_EXTERNAL_MAX_BYTES,
+      maxContentLength: Infinity,
       validateStatus: () => true
     });
     console.log(`[FrontMind Proxy] Proxy-download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`);
     res.status(response.status);
     const rawBuffer = Buffer.from(response.data);
-    const urlFilenameRaw = targetUrl.split("/").pop()?.split("?")[0] || "file";
     const urlFilename = ensureFilenameMatchesContent(
-      requestedFilename || decodeURIComponent(urlFilenameRaw),
+      candidateFilename,
       rawBuffer,
       response.headers["content-type"]
     );
@@ -3528,7 +4352,7 @@ async function fetchFileMetadata(baseUrl, fileId, apiKey) {
   const cleanBaseUrl = baseUrl.replace(/\/$/, "");
   const metadataUrl = `${cleanBaseUrl}/v1/files/${fileId}`;
   console.log(`[FrontMind Proxy] Fetching file metadata: GET ${metadataUrl}`);
-  const response = await axios.get(metadataUrl, {
+  const response = await axios2.get(metadataUrl, {
     headers: {
       API_KEY: apiKey,
       Authorization: `Bearer ${apiKey}`
@@ -3552,11 +4376,11 @@ async function fetchFileMetadata(baseUrl, fileId, apiKey) {
 async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
   const safeS3Url = assertSafeExternalUrl(s3Url);
   console.log(`[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`);
-  const response = await axios.get(safeS3Url, {
+  const response = await axios2.get(safeS3Url, {
     ...safeExternalRequestOptions,
     responseType: "arraybuffer",
     timeout: 12e4,
-    maxContentLength: SAFE_EXTERNAL_MAX_BYTES,
+    maxContentLength: Infinity,
     validateStatus: () => true
   });
   console.log(`[FrontMind Proxy] S3 download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`);
@@ -3589,7 +4413,7 @@ async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
   res.setHeader("content-length", String(sanitizedBuffer.length));
   res.send(sanitizedBuffer);
 }
-async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "inline") {
+async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "inline", ownerUserId, credentialId) {
   const meta = await fetchFileMetadata(baseUrl, fileId, apiKey);
   if (!meta) {
     res.status(404).json({
@@ -3600,12 +4424,27 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
     });
     return;
   }
+  if (isPdfFile(meta.filename) && ownerUserId && credentialId) {
+    const asset = await preparedFileService.registerFile({
+      ownerUserId,
+      credentialId,
+      fileId,
+      filename: meta.filename
+    });
+    if (asset.status !== "ready") {
+      res.status(202).json(asset);
+      return;
+    }
+    const suffix = disposition === "attachment" ? "?download=1" : "";
+    res.redirect(307, `${asset.contentUrl}${suffix}`);
+    return;
+  }
   if (!meta.upload_url) {
     console.warn(`[FrontMind Proxy] No upload_url for file ${fileId}, trying direct API download`);
     const cleanBaseUrl = baseUrl.replace(/\/$/, "");
     const contentUrl = `${cleanBaseUrl}/v1/files/${fileId}/content`;
     try {
-      const response = await axios.get(contentUrl, {
+      const response = await axios2.get(contentUrl, {
         headers: {
           API_KEY: apiKey,
           Authorization: `Bearer ${apiKey}`
@@ -3672,6 +4511,7 @@ router2.post("/download-token", async (req, res) => {
     downloadTokenCache.set(token, {
       fileId,
       userId: req.frontmindUser.id,
+      credentialId: req.frontmindCredential.id,
       apiKey,
       baseUrl,
       createdAt: Date.now()
@@ -3694,7 +4534,15 @@ router2.get("/download/:token", async (req, res) => {
       return res.status(403).json({ error: { message: "\u4E0B\u8F7D\u94FE\u63A5\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7", code: "DOWNLOAD_FORBIDDEN" } });
     }
     downloadTokenCache.delete(token);
-    await handleFileDownload(res, data.baseUrl, data.fileId, data.apiKey, "attachment");
+    await handleFileDownload(
+      res,
+      data.baseUrl,
+      data.fileId,
+      data.apiKey,
+      "attachment",
+      data.userId,
+      data.credentialId
+    );
   } catch (error) {
     console.error("[FrontMind Proxy] Direct token download error:", error.message);
     res.status(500).json({ error: { message: "\u4E0B\u8F7D\u94FE\u63A5\u5DF2\u5931\u6548\u6216\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25", code: "DIRECT_DOWNLOAD_ERROR" } });
@@ -3704,7 +4552,15 @@ router2.get("/v1/files/:fileId", async (req, res) => {
   try {
     const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.params.fileId;
-    await handleFileDownload(res, baseUrl, fileId, apiKey);
+    await handleFileDownload(
+      res,
+      baseUrl,
+      fileId,
+      apiKey,
+      "inline",
+      req.frontmindUser?.id,
+      req.frontmindCredential?.id
+    );
   } catch (error) {
     console.error("[FrontMind Proxy] File download error:", error.message);
     res.status(500).json({
@@ -3719,7 +4575,15 @@ router2.get("/v1/files/:fileId/content", async (req, res) => {
   try {
     const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.params.fileId;
-    await handleFileDownload(res, baseUrl, fileId, apiKey);
+    await handleFileDownload(
+      res,
+      baseUrl,
+      fileId,
+      apiKey,
+      "inline",
+      req.frontmindUser?.id,
+      req.frontmindCredential?.id
+    );
   } catch (error) {
     console.error("[FrontMind Proxy] File content download error:", error.message);
     res.status(500).json({
@@ -3754,7 +4618,7 @@ router2.all("/*", async (req, res) => {
     if (["POST", "PUT", "PATCH"].includes(req.method)) {
       axiosConfig.data = translateTaskBodyForUpstream(req.body);
     }
-    const response = await axios(axiosConfig);
+    const response = await axios2(axiosConfig);
     if (response.status >= 200 && response.status < 300 && req.frontmindUser && req.frontmindCredential && response.data && typeof response.data === "object") {
       const resourceId = String(response.data.id || response.data.task_id || "");
       const isTaskCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/tasks";
@@ -3774,6 +4638,38 @@ router2.all("/*", async (req, res) => {
           kind: "file",
           upstreamId: fileId
         });
+      }
+      for (const descriptor of collectOutputPdfDescriptors(response.data)) {
+        try {
+          if (descriptor.fileId) {
+            await preparedFileService.registerFile({
+              ownerUserId: req.frontmindUser.id,
+              credentialId: req.frontmindCredential.id,
+              fileId: descriptor.fileId,
+              filename: descriptor.filename
+            });
+            continue;
+          }
+          if (!descriptor.url) continue;
+          const match = descriptor.url.match(/\/v1\/files\/([^/?#]+)/);
+          if (match?.[1]) {
+            await preparedFileService.registerFile({
+              ownerUserId: req.frontmindUser.id,
+              credentialId: req.frontmindCredential.id,
+              fileId: decodeURIComponent(match[1]),
+              filename: descriptor.filename
+            });
+          } else {
+            await preparedFileService.registerExternal({
+              ownerUserId: req.frontmindUser.id,
+              credentialId: req.frontmindCredential.id,
+              url: descriptor.url,
+              filename: descriptor.filename
+            });
+          }
+        } catch (error) {
+          console.warn("[PreparedFiles] Auto-registration failed", error);
+        }
       }
     }
     if (typeof response.data === "object" && response.data?.output) {
@@ -3826,17 +4722,20 @@ var manus_proxy_default = router2;
 
 // server/workflow-api.ts
 import { randomUUID as randomUUID4 } from "crypto";
-import fs4 from "fs/promises";
-import path4 from "path";
-import axios2 from "axios";
-import express2, {
+import { createReadStream as createReadStream2, createWriteStream } from "fs";
+import fs5 from "fs/promises";
+import path5 from "path";
+import { Transform } from "stream";
+import { pipeline } from "stream/promises";
+import axios3 from "axios";
+import {
   Router as Router2
 } from "express";
 import JSZip from "jszip";
 
 // server/workflow/manifest.ts
-import fs3 from "fs/promises";
-import path3 from "path";
+import fs4 from "fs/promises";
+import path4 from "path";
 var commonControlSources = [
   "Master_Control/FrontMind_Master_Control.md",
   "00.FrontMind\u603B\u63A7\u8DEF\u7531.skill"
@@ -4230,8 +5129,8 @@ var steps = [
 ];
 var workflowRootCandidates = [
   process.env.FRONTMIND_WORKFLOW_ROOT,
-  path3.resolve(import.meta.dirname, "..", "private-workflows", "FrontMind_Workflow"),
-  path3.resolve(import.meta.dirname, "..", "..", "private-workflows", "FrontMind_Workflow")
+  path4.resolve(import.meta.dirname, "..", "private-workflows", "FrontMind_Workflow"),
+  path4.resolve(import.meta.dirname, "..", "..", "private-workflows", "FrontMind_Workflow")
 ].filter(Boolean);
 var workflowManifest = {
   workflowId: "frontmind-unified-workflow",
@@ -4247,7 +5146,7 @@ function getPrivateWorkflowStep(stepId) {
 async function resolveWorkflowRoot() {
   for (const candidate of workflowRootCandidates) {
     try {
-      const stat = await fs3.stat(candidate);
+      const stat = await fs4.stat(candidate);
       if (stat.isDirectory()) {
         return candidate;
       }
@@ -4257,11 +5156,11 @@ async function resolveWorkflowRoot() {
   return null;
 }
 function isInsideRoot(candidatePath, rootPath) {
-  const relative = path3.relative(rootPath, candidatePath);
-  return relative === "" || !relative.startsWith("..") && !path3.isAbsolute(relative);
+  const relative = path4.relative(rootPath, candidatePath);
+  return relative === "" || !relative.startsWith("..") && !path4.isAbsolute(relative);
 }
 async function readPrivateFileStats(filePath) {
-  const content = await fs3.readFile(filePath);
+  const content = await fs4.readFile(filePath);
   return {
     checkedFiles: 1,
     availableFiles: 1,
@@ -4272,10 +5171,10 @@ async function readPrivateDirectoryStats(dirPath) {
   let checkedFiles = 0;
   let availableFiles = 0;
   let loadedBytes = 0;
-  const entries = await fs3.readdir(dirPath, { withFileTypes: true });
+  const entries = await fs4.readdir(dirPath, { withFileTypes: true });
   const visibleEntries = entries.filter((entry) => !entry.name.startsWith(".")).sort((left, right) => left.name.localeCompare(right.name));
   for (const entry of visibleEntries) {
-    const entryPath = path3.join(dirPath, entry.name);
+    const entryPath = path4.join(dirPath, entry.name);
     if (entry.isDirectory()) {
       const nested = await readPrivateDirectoryStats(entryPath);
       checkedFiles += nested.checkedFiles;
@@ -4297,13 +5196,13 @@ async function readPrivateDirectoryStats(dirPath) {
   return { checkedFiles, availableFiles, loadedBytes };
 }
 async function readPrivateSourceStats(workflowRoot, relativeSource) {
-  const rootPath = path3.resolve(workflowRoot);
-  const fullPath = path3.resolve(rootPath, relativeSource);
+  const rootPath = path4.resolve(workflowRoot);
+  const fullPath = path4.resolve(rootPath, relativeSource);
   if (!isInsideRoot(fullPath, rootPath)) {
     return { checkedFiles: 1, availableFiles: 0, loadedBytes: 0 };
   }
   try {
-    const stat = await fs3.stat(fullPath);
+    const stat = await fs4.stat(fullPath);
     if (stat.isDirectory()) {
       const directoryStats = await readPrivateDirectoryStats(fullPath);
       return directoryStats.checkedFiles > 0 ? directoryStats : { checkedFiles: 1, availableFiles: 0, loadedBytes: 0 };
@@ -4377,7 +5276,7 @@ function buildOperatorMessages(kind, title, inputs, outputs, hasOperatorNotes) {
 
 // server/workflow-api.ts
 var router3 = Router2();
-var uploadsRoot = path4.resolve(process.cwd(), ".workflow-uploads");
+var uploadsRoot = path5.resolve(process.cwd(), ".workflow-uploads");
 var uploadIndexName = "index.json";
 var defaultUploadRetentionMs = 24 * 60 * 60 * 1e3;
 function asyncRoute(handler) {
@@ -4400,7 +5299,7 @@ function safeDecodeHeader(value) {
   }
 }
 function getUploadDir(userId, runId, stepId) {
-  return path4.join(
+  return path5.join(
     uploadsRoot,
     String(userId),
     sanitizeSegment(runId, "run"),
@@ -4418,9 +5317,9 @@ function toPublicUpload(file) {
   };
 }
 async function readUploadIndex(userId, runId, stepId) {
-  const indexPath = path4.join(getUploadDir(userId, runId, stepId), uploadIndexName);
+  const indexPath = path5.join(getUploadDir(userId, runId, stepId), uploadIndexName);
   try {
-    const raw = await fs4.readFile(indexPath, "utf-8");
+    const raw = await fs5.readFile(indexPath, "utf-8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -4429,35 +5328,35 @@ async function readUploadIndex(userId, runId, stepId) {
 }
 async function writeUploadIndex(userId, runId, stepId, files) {
   const uploadDir = getUploadDir(userId, runId, stepId);
-  await fs4.mkdir(uploadDir, { recursive: true });
-  await fs4.writeFile(path4.join(uploadDir, uploadIndexName), JSON.stringify(files, null, 2), "utf-8");
+  await fs5.mkdir(uploadDir, { recursive: true });
+  await fs5.writeFile(path5.join(uploadDir, uploadIndexName), JSON.stringify(files, null, 2), "utf-8");
 }
 async function cleanupStaleWorkflowUploads() {
   const retentionMs = Number(process.env.FRONTMIND_WORKFLOW_UPLOAD_TTL_MS || defaultUploadRetentionMs);
   if (!Number.isFinite(retentionMs) || retentionMs <= 0) return;
   let userEntries;
   try {
-    userEntries = await fs4.readdir(uploadsRoot, { withFileTypes: true });
+    userEntries = await fs5.readdir(uploadsRoot, { withFileTypes: true });
   } catch {
     return;
   }
   const cutoff = Date.now() - retentionMs;
   await Promise.all(
     userEntries.filter((entry) => entry.isDirectory()).map(async (userEntry) => {
-      const userPath = path4.join(uploadsRoot, userEntry.name);
+      const userPath = path5.join(uploadsRoot, userEntry.name);
       try {
-        const runEntries = await fs4.readdir(userPath, { withFileTypes: true });
+        const runEntries = await fs5.readdir(userPath, { withFileTypes: true });
         await Promise.all(
           runEntries.filter((entry) => entry.isDirectory()).map(async (runEntry) => {
-            const runPath = path4.join(userPath, runEntry.name);
-            const stat = await fs4.stat(runPath);
+            const runPath = path5.join(userPath, runEntry.name);
+            const stat = await fs5.stat(runPath);
             if (stat.mtimeMs < cutoff) {
-              await fs4.rm(runPath, { recursive: true, force: true });
+              await fs5.rm(runPath, { recursive: true, force: true });
             }
           })
         );
-        if ((await fs4.readdir(userPath)).length === 0) {
-          await fs4.rmdir(userPath);
+        if ((await fs5.readdir(userPath)).length === 0) {
+          await fs5.rmdir(userPath);
         }
       } catch {
       }
@@ -4469,25 +5368,25 @@ async function listPublicUploads(userId, runId, stepId) {
   return files.map(toPublicUpload);
 }
 async function addPathToZip(zip, workflowRoot, relativeSource) {
-  const rootPath = path4.resolve(workflowRoot);
-  const fullPath = path4.resolve(rootPath, relativeSource);
-  const relativeToRoot = path4.relative(rootPath, fullPath);
-  if (relativeToRoot.startsWith("..") || path4.isAbsolute(relativeToRoot)) {
+  const rootPath = path5.resolve(workflowRoot);
+  const fullPath = path5.resolve(rootPath, relativeSource);
+  const relativeToRoot = path5.relative(rootPath, fullPath);
+  if (relativeToRoot.startsWith("..") || path5.isAbsolute(relativeToRoot)) {
     return;
   }
-  const stat = await fs4.stat(fullPath);
+  const stat = await fs5.stat(fullPath);
   if (stat.isFile()) {
-    const buffer = await fs4.readFile(fullPath);
-    zip.file(path4.posix.join("workflow", relativeToRoot.split(path4.sep).join("/")), buffer);
+    const buffer = await fs5.readFile(fullPath);
+    zip.file(path5.posix.join("workflow", relativeToRoot.split(path5.sep).join("/")), buffer);
     return;
   }
   if (!stat.isDirectory()) {
     return;
   }
-  const entries = await fs4.readdir(fullPath, { withFileTypes: true });
+  const entries = await fs5.readdir(fullPath, { withFileTypes: true });
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
     if (entry.name.startsWith(".")) continue;
-    await addPathToZip(zip, workflowRoot, path4.join(relativeSource, entry.name));
+    await addPathToZip(zip, workflowRoot, path5.join(relativeSource, entry.name));
   }
 }
 function buildRunContextMarkdown(step2, body, uploads) {
@@ -4552,9 +5451,9 @@ async function buildExecutionBundle(userId, step2, runId, body, uploads) {
   const storedUploads = await readUploadIndex(userId, runId, step2.id);
   const uploadDir = getUploadDir(userId, runId, step2.id);
   for (const upload of storedUploads) {
-    const uploadPath = path4.join(uploadDir, upload.storedName);
-    const buffer = await fs4.readFile(uploadPath);
-    zip.file(path4.posix.join("user_uploads", step2.id, upload.name), buffer);
+    const uploadPath = path5.join(uploadDir, upload.storedName);
+    const buffer = await fs5.readFile(uploadPath);
+    zip.file(path5.posix.join("user_uploads", step2.id, upload.name), buffer);
   }
   zip.file("RUN_CONTEXT.md", buildRunContextMarkdown(step2, body, uploads));
   zip.file("CURRENT_STEP_GATE.md", buildCurrentStepGateMarkdown(step2));
@@ -4578,7 +5477,7 @@ async function buildExecutionBundle(userId, step2, runId, body, uploads) {
   });
 }
 async function uploadBufferToFrontMind(baseUrl, apiKey, filename, buffer, contentType = "application/zip") {
-  const fileRecordResponse = await axios2.post(
+  const fileRecordResponse = await axios3.post(
     `${baseUrl}/v1/files`,
     { filename },
     {
@@ -4598,7 +5497,7 @@ async function uploadBufferToFrontMind(baseUrl, apiKey, filename, buffer, conten
   if (!fileRecord?.id || !fileRecord?.upload_url) {
     throw new Error("Create file record failed: missing file id or upload url");
   }
-  const uploadResponse = await axios2.put(
+  const uploadResponse = await axios3.put(
     assertSafeExternalUrl(fileRecord.upload_url),
     buffer,
     {
@@ -4618,17 +5517,58 @@ async function uploadBufferToFrontMind(baseUrl, apiKey, filename, buffer, conten
   }
   return { fileId: fileRecord.id, filename };
 }
+async function uploadFilePathToFrontMind(baseUrl, apiKey, filename, filePath, contentType = "application/octet-stream") {
+  const fileRecordResponse = await axios3.post(
+    `${baseUrl}/v1/files`,
+    { filename },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        API_KEY: apiKey,
+        Authorization: `Bearer ${apiKey}`
+      },
+      timeout: 12e4,
+      validateStatus: () => true
+    }
+  );
+  if (fileRecordResponse.status < 200 || fileRecordResponse.status >= 300) {
+    throw new Error(`Create file record failed (${fileRecordResponse.status})`);
+  }
+  const fileRecord = fileRecordResponse.data;
+  if (!fileRecord?.id || !fileRecord?.upload_url) {
+    throw new Error("Create file record failed: missing file id or upload url");
+  }
+  const stat = await fs5.stat(filePath);
+  const uploadResponse = await axios3.put(
+    assertSafeExternalUrl(fileRecord.upload_url),
+    createReadStream2(filePath),
+    {
+      ...safeExternalRequestOptions,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(stat.size)
+      },
+      timeout: 3e5,
+      maxBodyLength: Infinity,
+      maxContentLength: 1024 * 1024,
+      validateStatus: () => true
+    }
+  );
+  if (uploadResponse.status < 200 || uploadResponse.status >= 300) {
+    throw new Error(`Upload file failed (${uploadResponse.status})`);
+  }
+  return { fileId: fileRecord.id, filename };
+}
 async function uploadStoredUserFiles(userId, baseUrl, apiKey, runId, stepId) {
   const storedUploads = await readUploadIndex(userId, runId, stepId);
   const uploadDir = getUploadDir(userId, runId, stepId);
   const attachments2 = [];
   for (const upload of storedUploads) {
-    const buffer = await fs4.readFile(path4.join(uploadDir, upload.storedName));
-    const uploaded = await uploadBufferToFrontMind(
+    const uploaded = await uploadFilePathToFrontMind(
       baseUrl,
       apiKey,
       upload.name,
-      buffer,
+      path5.join(uploadDir, upload.storedName),
       upload.type || "application/octet-stream"
     );
     attachments2.push({ file_id: uploaded.fileId, filename: uploaded.filename });
@@ -4671,7 +5611,7 @@ router3.delete("/runs/:runId", asyncRoute(async (req, res) => {
     res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55" });
     return;
   }
-  await fs4.rm(path4.join(uploadsRoot, String(userId), runId), {
+  await fs5.rm(path5.join(uploadsRoot, String(userId), runId), {
     recursive: true,
     force: true
   });
@@ -4679,7 +5619,6 @@ router3.delete("/runs/:runId", asyncRoute(async (req, res) => {
 }));
 router3.post(
   "/runs/:runId/steps/:stepId/uploads",
-  express2.raw({ type: "application/octet-stream", limit: "100mb" }),
   asyncRoute(async (req, res) => {
     const runId = sanitizeSegment(String(req.params.runId || ""), `wf_${randomUUID4()}`);
     const stepId = String(req.params.stepId || "");
@@ -4693,23 +5632,43 @@ router3.post(
       res.status(404).json({ error: "Unknown workflow step" });
       return;
     }
-    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
-      res.status(400).json({ error: "Empty upload body" });
-      return;
-    }
     const originalName = sanitizeFileName(safeDecodeHeader(String(req.header("x-file-name") || "upload.bin")));
     const contentType = String(req.header("x-file-type") || "application/octet-stream");
     const id = randomUUID4();
     const storedName = `${id}_${originalName}`;
     const uploadDir = getUploadDir(userId, runId, step2.id);
-    await fs4.mkdir(uploadDir, { recursive: true });
-    await fs4.writeFile(path4.join(uploadDir, storedName), req.body);
+    await fs5.mkdir(uploadDir, { recursive: true });
+    const storedPath = path5.join(uploadDir, storedName);
+    const temporaryPath = `${storedPath}.tmp`;
+    let uploadedBytes = 0;
+    const counter = new Transform({
+      transform(chunk, _encoding, callback) {
+        uploadedBytes += chunk.length;
+        callback(null, chunk);
+      }
+    });
+    try {
+      await pipeline(
+        req,
+        counter,
+        createWriteStream(temporaryPath, { mode: 384 })
+      );
+      if (uploadedBytes === 0) {
+        await fs5.rm(temporaryPath, { force: true });
+        res.status(400).json({ error: "Empty upload body" });
+        return;
+      }
+      await fs5.rename(temporaryPath, storedPath);
+    } catch (error) {
+      await fs5.rm(temporaryPath, { force: true });
+      throw error;
+    }
     const file = {
       id,
       storedName,
       name: originalName,
       type: contentType,
-      size: req.body.length,
+      size: uploadedBytes,
       stepId: step2.id,
       uploadedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
@@ -4840,7 +5799,7 @@ router3.post("/steps/:stepId/execute", asyncRoute(async (req, res) => {
         upstreamId: attachment.file_id
       });
     }
-    const taskResponse = await axios2.post(
+    const taskResponse = await axios3.post(
       `${baseUrl}/v1/tasks`,
       {
         prompt: buildAgentPrompt(step2),
@@ -4929,7 +5888,7 @@ router3.post("/steps/:stepId/execute", asyncRoute(async (req, res) => {
 var workflow_api_default = router3;
 
 // server/news-release-api.ts
-import axios3 from "axios";
+import axios4 from "axios";
 import { Router as Router3 } from "express";
 var router4 = Router3();
 function sanitizeFilename2(value, fallback) {
@@ -5276,7 +6235,7 @@ async function createFrontMindTask({
   agentProfile,
   attachments: attachments2
 }) {
-  const taskResponse = await axios3.post(
+  const taskResponse = await axios4.post(
     `${baseUrl}/v1/tasks`,
     {
       prompt,
@@ -5364,17 +6323,17 @@ router4.post("/start", async (req, res) => {
 var news_release_api_default = router4;
 
 // server/knowledge-base-api.ts
-import axios4 from "axios";
+import axios5 from "axios";
 import { Router as Router4 } from "express";
-import fs5 from "fs/promises";
+import fs6 from "fs/promises";
 import JSZip2 from "jszip";
-import path5 from "path";
+import path6 from "path";
 var router5 = Router4();
 var skillArchiveCandidates = [
   process.env.FRONTMIND_KB_SKILL_PATH,
-  path5.resolve(process.cwd(), "private-workflows", "socratic-kb-builder.skill"),
-  path5.resolve(import.meta.dirname, "..", "private-workflows", "socratic-kb-builder.skill"),
-  path5.resolve(import.meta.dirname, "..", "..", "private-workflows", "socratic-kb-builder.skill")
+  path6.resolve(process.cwd(), "private-workflows", "socratic-kb-builder.skill"),
+  path6.resolve(import.meta.dirname, "..", "private-workflows", "socratic-kb-builder.skill"),
+  path6.resolve(import.meta.dirname, "..", "..", "private-workflows", "socratic-kb-builder.skill")
 ].filter(Boolean);
 var cachedSkillInstructions = null;
 function sanitizeFilename3(value, fallback) {
@@ -5396,7 +6355,7 @@ async function readSkillArchive() {
   let lastError;
   for (const candidate of skillArchiveCandidates) {
     try {
-      const archive = await fs5.readFile(candidate);
+      const archive = await fs6.readFile(candidate);
       const zip = await JSZip2.loadAsync(archive);
       const entries = [
         ["SKILL.md", "Skill"],
@@ -5460,7 +6419,7 @@ async function createFrontMindTask2({
   agentProfile,
   attachments: attachments2
 }) {
-  const taskResponse = await axios4.post(
+  const taskResponse = await axios5.post(
     `${baseUrl}/v1/tasks`,
     {
       prompt,
@@ -5553,6 +6512,371 @@ router5.post("/start", async (req, res) => {
 });
 var knowledge_base_api_default = router5;
 
+// server/prepared-file-router.ts
+import { randomUUID as randomUUID5 } from "node:crypto";
+import { createReadStream as createReadStream3 } from "node:fs";
+import fs7 from "node:fs/promises";
+import { Router as Router5 } from "express";
+var router6 = Router5();
+var DOWNLOAD_TOKEN_TTL_MS = 5 * 60 * 1e3;
+var downloadTokens = /* @__PURE__ */ new Map();
+function parseByteRange(rangeHeader, size) {
+  if (!rangeHeader) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!match || size < 1) return "invalid";
+  const rawStart = match[1];
+  const rawEnd = match[2];
+  if (!rawStart && !rawEnd) return "invalid";
+  if (!rawStart) {
+    const suffixLength = Number(rawEnd);
+    if (!Number.isInteger(suffixLength) || suffixLength <= 0) return "invalid";
+    return {
+      start: Math.max(0, size - suffixLength),
+      end: size - 1
+    };
+  }
+  const start = Number(rawStart);
+  const requestedEnd = rawEnd ? Number(rawEnd) : size - 1;
+  if (!Number.isInteger(start) || !Number.isInteger(requestedEnd) || start < 0 || requestedEnd < start || start >= size) {
+    return "invalid";
+  }
+  return { start, end: Math.min(requestedEnd, size - 1) };
+}
+function sanitizeFilename4(filename) {
+  const source = ["ma", "nus"].join("");
+  const replaced = String(filename || "document.pdf").replace(
+    new RegExp(source, "gi"),
+    "FrontMind"
+  );
+  return replaced.replace(/[\\/\0"]/g, "_").trim() || "document.pdf";
+}
+function contentDisposition(disposition, filename) {
+  const safe = sanitizeFilename4(filename);
+  const encoded = encodeURIComponent(safe);
+  return `${disposition}; filename="${encoded}"; filename*=UTF-8''${encoded}`;
+}
+function sendPreparedError(res, error) {
+  if (error instanceof PreparedFileError) {
+    const status = error.code === "ASSET_NOT_FOUND" ? 404 : error.code === "INSUFFICIENT_STORAGE" ? 507 : error.code === "SOURCE_FORBIDDEN" ? 403 : 400;
+    res.status(status).json({
+      error: { message: error.message, code: error.code }
+    });
+    return;
+  }
+  console.error("[PreparedFiles] Request failed", error);
+  res.status(500).json({
+    error: {
+      message: "\u6587\u4EF6\u51C6\u5907\u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528",
+      code: "PREPARED_FILE_SERVICE_ERROR"
+    }
+  });
+}
+function extractSource(fileUrl) {
+  const parsed = new URL(fileUrl, "http://frontmind.local");
+  const fileMatch = parsed.pathname.match(
+    /(?:\/api\/frontmind)?\/v1\/files\/([^/]+)/
+  );
+  if (fileMatch?.[1]) {
+    return {
+      kind: "file",
+      fileId: decodeURIComponent(fileMatch[1])
+    };
+  }
+  if (parsed.pathname.endsWith("/api/frontmind/proxy-download")) {
+    const externalUrl = parsed.searchParams.get("url");
+    if (externalUrl) {
+      return { kind: "external", url: externalUrl };
+    }
+  }
+  if (/^https?:\/\//i.test(fileUrl)) {
+    return { kind: "external", url: fileUrl };
+  }
+  throw new PreparedFileError(
+    "INVALID_FILE_SOURCE",
+    "\u65E0\u6CD5\u8BC6\u522B PDF \u6587\u4EF6\u6765\u6E90"
+  );
+}
+router6.post("/prepare", async (req, res) => {
+  try {
+    const ownerUserId = req.frontmindUser?.id;
+    if (!ownerUserId) {
+      res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
+      return;
+    }
+    const fileUrl = String(req.body?.fileUrl || "");
+    const filename = sanitizeFilename4(
+      String(req.body?.fileName || "document.pdf")
+    );
+    if (!fileUrl) {
+      res.status(400).json({
+        error: { message: "\u7F3A\u5C11\u6587\u4EF6\u5730\u5740", code: "MISSING_FILE_URL" }
+      });
+      return;
+    }
+    const source = extractSource(fileUrl);
+    if (source.kind === "file") {
+      const credential2 = await getCredentialForUpstreamResource(
+        ownerUserId,
+        "file",
+        source.fileId
+      );
+      if (!credential2) {
+        res.status(403).json({
+          error: {
+            message: "\u8BE5\u6587\u4EF6\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7\uFF0C\u6216\u5176\u539F API Key \u5DF2\u5220\u9664",
+            code: "UPSTREAM_RESOURCE_FORBIDDEN"
+          }
+        });
+        return;
+      }
+      res.json(
+        await preparedFileService.registerFile({
+          ownerUserId,
+          credentialId: credential2.id,
+          fileId: source.fileId,
+          filename
+        })
+      );
+      return;
+    }
+    const credential = await getDecryptedCredentialForUser(ownerUserId);
+    res.json(
+      await preparedFileService.registerExternal({
+        ownerUserId,
+        credentialId: credential?.id || "external",
+        url: source.url,
+        filename
+      })
+    );
+  } catch (error) {
+    sendPreparedError(res, error);
+  }
+});
+router6.get("/:assetId/status", async (req, res) => {
+  try {
+    const ownerUserId = req.frontmindUser?.id;
+    if (!ownerUserId) {
+      res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
+      return;
+    }
+    res.json(
+      await preparedFileService.getStatus(req.params.assetId, ownerUserId)
+    );
+  } catch (error) {
+    sendPreparedError(res, error);
+  }
+});
+router6.post("/:assetId/retry", async (req, res) => {
+  try {
+    const ownerUserId = req.frontmindUser?.id;
+    if (!ownerUserId) {
+      res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
+      return;
+    }
+    res.json(
+      await preparedFileService.retry(req.params.assetId, ownerUserId)
+    );
+  } catch (error) {
+    sendPreparedError(res, error);
+  }
+});
+function cleanupDownloadTokens() {
+  const now = Date.now();
+  for (const [token, value] of downloadTokens) {
+    if (value.expiresAt <= now) downloadTokens.delete(token);
+  }
+}
+router6.post("/:assetId/download-token", async (req, res) => {
+  try {
+    cleanupDownloadTokens();
+    const ownerUserId = req.frontmindUser?.id;
+    if (!ownerUserId) {
+      res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
+      return;
+    }
+    const manifest = await preparedFileService.getReadyManifest(
+      req.params.assetId,
+      ownerUserId
+    );
+    if (manifest.status !== "ready") {
+      res.status(409).json({
+        error: {
+          message: "\u6587\u4EF6\u4ECD\u5728\u51C6\u5907\u4E2D",
+          code: "FILE_NOT_READY",
+          status: manifest.status,
+          phase: manifest.phase
+        }
+      });
+      return;
+    }
+    const token = randomUUID5();
+    const expiresAt = Date.now() + DOWNLOAD_TOKEN_TTL_MS;
+    downloadTokens.set(token, {
+      assetId: manifest.id,
+      ownerUserId,
+      expiresAt
+    });
+    res.json({
+      downloadUrl: `/api/frontmind/assets/download/${token}`,
+      expiresAt
+    });
+  } catch (error) {
+    sendPreparedError(res, error);
+  }
+});
+async function streamPreparedFile(req, res, manifest, disposition) {
+  const filePath = preparedFileService.contentPath(manifest.id);
+  const stat = await fs7.stat(filePath);
+  const range = parseByteRange(
+    typeof req.headers.range === "string" ? req.headers.range : void 0,
+    stat.size
+  );
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Cache-Control", "private, max-age=3600, must-revalidate");
+  res.setHeader(
+    "Content-Disposition",
+    contentDisposition(disposition, manifest.filename)
+  );
+  const etag = manifest.etag ? `"${manifest.etag}"` : void 0;
+  const ifNoneMatch = typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : void 0;
+  if (etag) res.setHeader("ETag", etag);
+  if (etag && !req.headers.range && ifNoneMatch?.split(",").map((value) => value.trim()).includes(etag)) {
+    res.status(304).end();
+    return;
+  }
+  if (range === "invalid") {
+    res.setHeader("Content-Range", `bytes */${stat.size}`);
+    res.status(416).end();
+    return;
+  }
+  const start = range?.start ?? 0;
+  const end = range?.end ?? stat.size - 1;
+  const contentLength = end - start + 1;
+  res.setHeader("Content-Length", String(contentLength));
+  if (range) {
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${stat.size}`);
+  } else {
+    res.status(200);
+  }
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  preparedFileService.beginUse(manifest.id);
+  const stream = createReadStream3(filePath, { start, end });
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    preparedFileService.endUse(manifest.id);
+  };
+  stream.on("error", (error) => {
+    release();
+    if (!res.headersSent) sendPreparedError(res, error);
+    else res.destroy(error);
+  });
+  stream.on("close", release);
+  res.on("close", () => {
+    if (!res.writableEnded) stream.destroy();
+    release();
+  });
+  stream.pipe(res);
+}
+router6.get("/download/:token", async (req, res) => {
+  try {
+    cleanupDownloadTokens();
+    const ownerUserId = req.frontmindUser?.id;
+    const token = downloadTokens.get(req.params.token);
+    if (!ownerUserId || !token || token.expiresAt <= Date.now()) {
+      res.status(410).json({
+        error: {
+          message: "\u4E0B\u8F7D\u94FE\u63A5\u5DF2\u5931\u6548",
+          code: "DOWNLOAD_LINK_EXPIRED"
+        }
+      });
+      return;
+    }
+    if (token.ownerUserId !== ownerUserId) {
+      res.status(403).json({
+        error: {
+          message: "\u4E0B\u8F7D\u94FE\u63A5\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7",
+          code: "DOWNLOAD_FORBIDDEN"
+        }
+      });
+      return;
+    }
+    downloadTokens.delete(req.params.token);
+    const manifest = await preparedFileService.getReadyManifest(
+      token.assetId,
+      ownerUserId
+    );
+    if (manifest.status !== "ready") {
+      res.status(409).json({
+        error: { message: "\u6587\u4EF6\u5C1A\u672A\u51C6\u5907\u5B8C\u6210", code: "FILE_NOT_READY" }
+      });
+      return;
+    }
+    await streamPreparedFile(req, res, manifest, "attachment");
+  } catch (error) {
+    sendPreparedError(res, error);
+  }
+});
+router6.get("/:assetId/content", async (req, res) => {
+  try {
+    const ownerUserId = req.frontmindUser?.id;
+    if (!ownerUserId) {
+      res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
+      return;
+    }
+    const manifest = await preparedFileService.getReadyManifest(
+      req.params.assetId,
+      ownerUserId
+    );
+    if (manifest.status !== "ready") {
+      res.status(202).json({
+        assetId: manifest.id,
+        status: manifest.status,
+        phase: manifest.phase,
+        errorCode: manifest.errorCode,
+        errorMessage: manifest.errorMessage,
+        retryAfterMs: 2e3
+      });
+      return;
+    }
+    await streamPreparedFile(
+      req,
+      res,
+      manifest,
+      req.query.download === "1" ? "attachment" : "inline"
+    );
+  } catch (error) {
+    sendPreparedError(res, error);
+  }
+});
+router6.head("/:assetId/content", async (req, res) => {
+  try {
+    const ownerUserId = req.frontmindUser?.id;
+    if (!ownerUserId) {
+      res.status(401).end();
+      return;
+    }
+    const manifest = await preparedFileService.getReadyManifest(
+      req.params.assetId,
+      ownerUserId
+    );
+    if (manifest.status !== "ready") {
+      res.status(202).end();
+      return;
+    }
+    await streamPreparedFile(req, res, manifest, "inline");
+  } catch (error) {
+    sendPreparedError(res, error);
+  }
+});
+var prepared_file_router_default = router6;
+
 // server/_core/express-auth.ts
 function sendAuthError(res, status, message, code) {
   res.status(status).json({ error: { message, code } });
@@ -5597,15 +6921,15 @@ function pathWithoutQuery(req) {
   return req.originalUrl.replace(/^\/api\/frontmind/, "").split("?")[0] || "/";
 }
 function getPrimaryResource(req) {
-  const path6 = pathWithoutQuery(req);
-  const taskMatch = path6.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
+  const path7 = pathWithoutQuery(req);
+  const taskMatch = path7.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
   if (taskMatch) return { kind: "task", id: decodeURIComponent(taskMatch[1]) };
-  const fileMatch = path6.match(/^\/v1\/files\/([^/]+)/);
+  const fileMatch = path7.match(/^\/v1\/files\/([^/]+)/);
   if (fileMatch) return { kind: "file", id: decodeURIComponent(fileMatch[1]) };
-  if (path6 === "/download-token" && typeof req.body?.fileId === "string") {
+  if (path7 === "/download-token" && typeof req.body?.fileId === "string") {
     return { kind: "file", id: req.body.fileId };
   }
-  if (req.method === "POST" && path6 === "/v1/tasks") {
+  if (req.method === "POST" && path7 === "/v1/tasks") {
     const continuationId = req.body?.taskId ?? req.body?.previous_response_id;
     if (typeof continuationId === "string" && continuationId) {
       return { kind: "task", id: continuationId };
@@ -5688,7 +7012,8 @@ function assertProductionConfiguration() {
 }
 async function startServer() {
   assertProductionConfiguration();
-  const app = express3();
+  await preparedFileService.initialize();
+  const app = express2();
   const server = createServer(app);
   void cleanupStaleWorkflowUploads();
   app.disable("x-powered-by");
@@ -5700,7 +7025,7 @@ async function startServer() {
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     res.setHeader(
       "Content-Security-Policy",
-      "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+      "object-src 'none'; worker-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
     );
     if (process.env.NODE_ENV === "production") {
       res.setHeader(
@@ -5710,19 +7035,33 @@ async function startServer() {
     }
     next();
   });
-  app.use(express3.json({ limit: "50mb" }));
-  app.use(express3.urlencoded({ limit: "50mb", extended: true }));
+  app.use(express2.json({ limit: "50mb" }));
+  app.use(express2.urlencoded({ limit: "50mb", extended: true }));
   app.get("/healthz", async (_req, res) => {
     try {
       const db = await getDb();
       if (!db) throw new Error("Database is not configured");
       await db.execute(sql`select 1`);
-      res.json({ status: "ok" });
+      const preparedFiles = await preparedFileService.health();
+      res.json({
+        status: "ok",
+        preparedFiles: {
+          status: "ok",
+          availableBytes: preparedFiles.availableBytes,
+          queueLength: preparedFiles.queueLength,
+          activeWorkers: preparedFiles.activeWorkers
+        }
+      });
     } catch (error) {
       console.error("[Health] Database readiness check failed", error);
       res.status(503).json({ status: "unavailable" });
     }
   });
+  app.use(
+    "/api/frontmind/assets",
+    requireExpressAuth,
+    prepared_file_router_default
+  );
   app.use(
     "/api/frontmind",
     requireExpressAuth,

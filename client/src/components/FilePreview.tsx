@@ -2,13 +2,14 @@
  * FilePreview Component - Preview and download files
  * Features: File type icon, file info, download button, inline PDF viewer,
  *           HTML file rendering, text file preview.
- *
- * FIX: PDF/HTML/text files now render correctly by:
- * 1. Building file URLs with auth headers via fetch+blob approach
- * 2. Using object URLs for iframe rendering (avoids auth header issues)
- * 3. Supporting multiple file types for inline preview
  */
-import { useCallback, useState, useEffect } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useState,
+  useEffect,
+} from "react";
 import {
   Dialog,
   DialogContent,
@@ -29,6 +30,8 @@ import {
 import { cn } from "@/lib/utils";
 import { sanitizeBrandText } from "@/lib/frontmind-api";
 import type { Attachment } from "@/contexts/ConversationContext";
+
+const PdfDocumentViewer = lazy(() => import("./PdfDocumentViewer"));
 
 interface FilePreviewProps {
   file: Attachment;
@@ -232,11 +235,10 @@ export default function FilePreview({
   const isPdf = isPdfFile(file.file?.type, displayFileName);
   const isPreviewable = isPreviewableFile(file.file?.type, displayFileName);
 
-  // Load blob URL when dialog opens for previewable files
+  // Load a blob URL only for non-PDF iframe previews.
   // Priority: blobUrl (in-memory) > File object > base64 (convert to blob) > API fileId
-  // NOTE: PDF iframe rendering requires blob: URLs, not data: URLs
   useEffect(() => {
-    if (isOpen && isPreviewable) {
+    if (isOpen && isPreviewable && !isPdf) {
       setLoadingPreview(true);
       setPreviewError(null);
 
@@ -249,8 +251,7 @@ export default function FilePreview({
         setBlobUrl(URL.createObjectURL(file.file));
         setLoadingPreview(false);
       } else if (file.base64) {
-        // Convert base64 data URL to blob URL for iframe rendering
-        // (browsers can't render PDF from data: URLs in iframes)
+        // Convert a base64 HTML data URL to a blob URL for sandboxed rendering.
         try {
           const parts = file.base64.split(",");
           const mimeMatch = parts[0]?.match(/:(.*?);/);
@@ -305,9 +306,16 @@ export default function FilePreview({
         URL.revokeObjectURL(blobUrl);
       }
     };
-  }, [isOpen, file.fileId, file.file, file.base64, file.blobUrl, isPreviewable, displayFileName]);
+  }, [isOpen, file.fileId, file.file, file.base64, file.blobUrl, isPreviewable, isPdf, displayFileName]);
 
   const handleDownload = useCallback(async () => {
+    if (isPdf) {
+      // Remote PDFs must finish server-side brand replacement before download.
+      // Opening the shared viewer starts/previews that preparation and exposes
+      // the download action only when the sanitized asset is ready.
+      setIsOpen(true);
+      return;
+    }
     setIsDownloading(true);
     try {
       let downloadName = displayFileName;
@@ -358,7 +366,7 @@ export default function FilePreview({
     } finally {
       setIsDownloading(false);
     }
-  }, [file, displayFileName]);
+  }, [file, displayFileName, isPdf]);
 
   return (
     <>
@@ -416,7 +424,33 @@ export default function FilePreview({
         >
           <DialogTitle className="sr-only">{displayFileName}</DialogTitle>
 
-          {isPreviewable ? (
+          {isPdf ? (
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                  正在启动 PDF 阅读器…
+                </div>
+              }
+            >
+              <PdfDocumentViewer
+                fileName={displayFileName}
+                sourceFile={file.file}
+                sourceUrl={
+                  file.blobUrl ||
+                  file.base64 ||
+                  (file.fileId
+                    ? buildProxyDownloadUrl(file.fileId, displayFileName, false) ||
+                      (file.fileId.startsWith("/") ||
+                      /^https?:\/\//i.test(file.fileId)
+                        ? file.fileId
+                        : `/api/frontmind/v1/files/${encodeURIComponent(file.fileId)}`)
+                    : undefined)
+                }
+                onClose={() => setIsOpen(false)}
+              />
+            </Suspense>
+          ) : isPreviewable ? (
             <>
               {/* Previewable file header */}
               <div className="flex items-center justify-between px-6 py-3 border-b border-border/30 flex-shrink-0">

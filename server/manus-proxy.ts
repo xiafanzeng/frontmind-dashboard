@@ -24,14 +24,18 @@ import { Router, Request, Response } from "express";
 import axios from "axios";
 import zlib from "zlib";
 import { randomUUID } from "crypto";
+import fs from "node:fs/promises";
 import { getFrontMindCredentials, translateTaskBodyForUpstream } from "./upstream-config";
-import { recordUpstreamResource } from "./auth-service";
+import {
+  getDecryptedCredentialForUser,
+  recordUpstreamResource,
+} from "./auth-service";
 import {
   assertSafeExternalUrl,
   ExternalUrlRejectedError,
-  SAFE_EXTERNAL_MAX_BYTES,
   safeExternalRequestOptions,
 } from "./_core/safe-external-url";
+import { preparedFileService } from "./prepared-file-service";
 
 const router = Router();
 
@@ -46,17 +50,12 @@ const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 const downloadTokenCache = new Map<string, {
   fileId: string;
   userId: number;
+  credentialId: string;
   apiKey: string;
   baseUrl: string;
   createdAt: number;
 }>();
 const DOWNLOAD_TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
-const PROXY_UPLOAD_MAX_BYTES = Math.max(
-  1,
-  Number(process.env.FRONTMIND_PROXY_UPLOAD_MAX_BYTES) || 100 * 1024 * 1024,
-);
-
-class ProxyUploadTooLargeError extends Error {}
 
 function safeUrlForLog(value: string) {
   try {
@@ -376,6 +375,65 @@ function collectOutputFileIds(
   return ids;
 }
 
+interface OutputPdfDescriptor {
+  fileId?: string;
+  url?: string;
+  filename: string;
+}
+
+function collectOutputPdfDescriptors(
+  value: unknown,
+  descriptors: OutputPdfDescriptor[] = [],
+  depth = 0,
+) {
+  if (!value || depth > 50) return descriptors;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectOutputPdfDescriptors(item, descriptors, depth + 1);
+    }
+    return descriptors;
+  }
+  if (typeof value !== "object") return descriptors;
+
+  const object = value as Record<string, unknown>;
+  const filename = String(
+    object.fileName ??
+      object.file_name ??
+      object.filename ??
+      object.name ??
+      "",
+  );
+  const mimeType = String(
+    object.mimeType ?? object.mime_type ?? object.content_type ?? "",
+  ).toLowerCase();
+  const type = String(object.type ?? "");
+  const looksLikePdf =
+    filename.toLowerCase().endsWith(".pdf") ||
+    mimeType.includes("application/pdf");
+  const looksLikeOutputFile =
+    type === "output_file" ||
+    type === "file" ||
+    "file_id" in object ||
+    "fileId" in object;
+
+  if (looksLikePdf && looksLikeOutputFile) {
+    const fileId = String(object.file_id ?? object.fileId ?? "");
+    const url = String(
+      object.file_url ?? object.fileUrl ?? object.url ?? "",
+    );
+    descriptors.push({
+      fileId: fileId || undefined,
+      url: url || undefined,
+      filename: filename || "document.pdf",
+    });
+  }
+
+  for (const child of Object.values(object)) {
+    collectOutputPdfDescriptors(child, descriptors, depth + 1);
+  }
+  return descriptors;
+}
+
 /**
  * Process a downloaded text file buffer: sanitize source-brand references.
  * Returns { buffer, wasSanitized }.
@@ -555,6 +613,28 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
       sourceUpper,
       sourceLower,
     ];
+    const replaceSimpleBrandEncodings = (content: string) => {
+      let sanitized = content;
+      const replacements = [...new Set(targetStrings)].sort(
+        (left, right) => right.length - left.length,
+      );
+      for (const sourceText of replacements) {
+        const replacement = "FrontMind";
+        sanitized = sanitized.replace(
+          new RegExp(escapeRegExp(sourceText), "g"),
+          replacement,
+        );
+        const sourceHex = Buffer.from(sourceText, "latin1").toString("hex");
+        const replacementHex = Buffer.from(replacement, "latin1").toString(
+          "hex",
+        );
+        sanitized = sanitized.replace(
+          new RegExp(escapeRegExp(sourceHex), "gi"),
+          replacementHex,
+        );
+      }
+      return sanitized;
+    };
     interface GlyphPattern {
       target: string;
       glyphs: string[];
@@ -587,21 +667,35 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
     glyphPatterns.sort((a, b) => b.glyphs.length - a.glyphs.length);
 
     if (glyphPatterns.length === 0) {
-      // No CMap patterns found - try ASCII fallback for simple PDFs
-      const rawStr = pdfBuffer.toString("latin1");
-      const sourceTitleAi = `${sourceTitle} AI`;
-      if (rawStr.includes(sourceTitleAi) || rawStr.includes(sourceTitle)) {
-        let newStr = rawStr;
-        newStr = newStr.replace(new RegExp(escapeRegExp(sourceTitleAi), "g"), "FrntMind");
-        newStr = newStr.replace(new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"), "FrntM");
-        if (newStr !== rawStr) {
-          console.log("[FrontMind Proxy] PDF sanitized via ASCII binary replacement");
-          return { buffer: Buffer.from(newStr, "latin1"), wasSanitized: true };
+      // Standard PDF fonts may not include a ToUnicode CMap. Decode their
+      // compressed content streams and replace both literal and hex strings.
+      let simpleStreamsModified = 0;
+      context.enumerateIndirectObjects().forEach(([ref, obj]: [any, any]) => {
+        if (!obj || obj.constructor.name !== "PDFRawStream") return;
+        try {
+          const decoded = decodePDFRawStream(obj as any);
+          const streamText = Buffer.from(decoded.decode()).toString("latin1");
+          if (!streamText.includes("Tj") && !streamText.includes("TJ")) return;
+          const sanitized = replaceSimpleBrandEncodings(streamText);
+          if (sanitized === streamText) return;
+          const compressed = zlib.deflateSync(
+            Buffer.from(sanitized, "latin1"),
+          );
+          const dict = (obj as any).dict.clone(context);
+          dict.set(PDFName.of("Length"), context.obj(compressed.length));
+          dict.set(PDFName.of("Filter"), PDFName.of("FlateDecode"));
+          context.assign(ref, PDFRawStream.of(dict, compressed));
+          simpleStreamsModified += 1;
+        } catch {
+          // Skip malformed or unsupported streams; final text validation
+          // prevents an unmodified source brand from being published.
         }
-      }
-      if (pdfMetadataModified) {
+      });
+      if (simpleStreamsModified > 0 || pdfMetadataModified) {
         const savedBytes = await pdfDoc.save();
-        console.log("[FrontMind Proxy] PDF metadata sanitized");
+        console.log(
+          `[FrontMind Proxy] PDF simple streams sanitized: ${simpleStreamsModified}, metadata=${pdfMetadataModified}`,
+        );
         return { buffer: Buffer.from(savedBytes), wasSanitized: true };
       }
       return { buffer: pdfBuffer, wasSanitized: false };
@@ -768,7 +862,8 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
         // Only process content streams (those with Tj/TJ operators)
         if (!streamText.includes("Tj") && !streamText.includes("TJ")) return;
 
-        const lines = streamText.split("\n");
+        const simpleSanitizedStream = replaceSimpleBrandEncodings(streamText);
+        const lines = simpleSanitizedStream.split("\n");
 
         // Track CTM (current transformation matrix) stack
         const ctmStack: { sx: number; sy: number; tx: number; ty: number }[] = [
@@ -782,7 +877,7 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
         let tdAccumY = 0;
 
         const tjInfos: TjInfo[] = [];
-        let streamModified = false;
+        let streamModified = simpleSanitizedStream !== streamText;
 
         const getPageIndexForStream = () => {
           const objectPageIndex = streamObjectToPageIndex.get(obj as object);
@@ -1207,9 +1302,24 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
     return { buffer: pdfBuffer, wasSanitized: false };
   } catch (err: any) {
     console.error("[FrontMind Proxy] PDF sanitization error:", err.message);
-    // On error, return original buffer unchanged
-    return { buffer: pdfBuffer, wasSanitized: false };
+    // Never release an unsanitized original when brand replacement failed.
+    throw new Error(`PDF sanitization failed: ${err.message}`);
   }
+}
+
+/**
+ * Path-based boundary used by the PDF worker. The worker invokes this for a
+ * small document or for one split page at a time, so the HTTP process never
+ * retains a complete large PDF in memory.
+ */
+export async function sanitizePdfFile(
+  inputPath: string,
+  outputPath: string,
+): Promise<{ wasSanitized: boolean }> {
+  const input = await fs.readFile(inputPath);
+  const result = await sanitizePdfBuffer(input);
+  await fs.writeFile(outputPath, result.buffer, { mode: 0o600 });
+  return { wasSanitized: result.wasSanitized };
 }
 
 // ============================================================
@@ -1341,11 +1451,9 @@ async function sanitizeFileBuffer(
 /**
  * Proxy-upload endpoint: forwards raw body to an external presigned S3 URL.
  *
- * IMPORTANT: When the request Content-Type is application/json (e.g. uploading
- * a .json file), the global express.json() middleware will have already consumed
- * the raw body stream and parsed it into req.body.  In that case req.on('data')
- * yields nothing.  We detect this and re-serialise req.body back to a Buffer so
- * the file content is forwarded correctly to S3.
+ * The browser sends application/octet-stream, so the JSON parser leaves this
+ * request untouched. The incoming stream is forwarded with backpressure
+ * instead of buffering the complete file in Node memory.
  */
 router.put("/proxy-upload", async (req: Request, res: Response) => {
   try {
@@ -1357,81 +1465,31 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
 
     console.log(`[FrontMind Proxy] Proxy-upload to: ${safeUrlForLog(target)}`);
 
-    const declaredLength = Number(req.headers["content-length"] || 0);
-    if (declaredLength > PROXY_UPLOAD_MAX_BYTES) {
-      throw new ProxyUploadTooLargeError("Upload body is too large");
-    }
-
-    // Try to collect the raw body from the request stream.
-    const chunks: Buffer[] = [];
-    await new Promise<void>((resolve, reject) => {
-      if (req.readableEnded) {
-        resolve();
-        return;
-      }
-      let received = 0;
-      let tooLarge = false;
-      req.on("data", (chunk: Buffer) => {
-        received += chunk.length;
-        if (received > PROXY_UPLOAD_MAX_BYTES) {
-          tooLarge = true;
-          return;
-        }
-        chunks.push(chunk);
-      });
-      req.on("end", () => {
-        if (tooLarge) reject(new ProxyUploadTooLargeError("Upload body is too large"));
-        else resolve();
-      });
-      req.on("error", reject);
-    });
-    let body = Buffer.concat(chunks);
-
-    // Fallback: if express.json() already consumed the stream (e.g. for
-    // application/json uploads), the raw stream is empty but req.body holds
-    // the parsed object.  Re-serialise it so the original file content is
-    // forwarded to S3.
-    if (body.length === 0 && req.body != null) {
-      if (Buffer.isBuffer(req.body)) {
-        body = Buffer.from(req.body);
-      } else if (typeof req.body === "string") {
-        body = Buffer.from(req.body, "utf-8");
-      } else if (typeof req.body === "object") {
-        body = Buffer.from(JSON.stringify(req.body), "utf-8");
-      }
-      console.log(`[FrontMind Proxy] Recovered body from req.body (${body.length} bytes) – stream was consumed by body-parser`);
-    }
-    if (body.length > PROXY_UPLOAD_MAX_BYTES) {
-      throw new ProxyUploadTooLargeError("Upload body is too large");
-    }
-
-    // Forward to the presigned S3 URL.
-    // The client sends application/octet-stream to avoid express.json() interference,
-    // and passes the real content-type in X-Original-Content-Type.
     const realContentType =
       (req.headers["x-original-content-type"] as string) ||
       req.headers["content-type"] ||
       "application/octet-stream";
-    const response = await axios.put(target, body, {
+    const uploadHeaders: Record<string, string> = {
+      "Content-Type": realContentType,
+    };
+    if (typeof req.headers["content-length"] === "string") {
+      uploadHeaders["Content-Length"] = req.headers["content-length"];
+    }
+    const controller = new AbortController();
+    req.on("aborted", () => controller.abort());
+    const response = await axios.put(target, req, {
       ...safeExternalRequestOptions,
-      headers: {
-        "Content-Type": realContentType,
-        "Content-Length": String(body.length),
-      },
+      headers: uploadHeaders,
       timeout: 300000,
-      maxBodyLength: body.length,
+      maxBodyLength: Infinity,
       maxContentLength: 1024 * 1024,
+      signal: controller.signal,
       validateStatus: () => true,
     });
 
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response.status}`);
     res.status(response.status).send(response.data || "");
   } catch (error: any) {
-    if (error instanceof ProxyUploadTooLargeError) {
-      return res.status(413).json({
-        error: { message: "上传文件过大", code: "UPLOAD_TOO_LARGE" },
-      });
-    }
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {
@@ -1468,6 +1526,28 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
       return res.status(400).json({ error: { message: "Missing url parameter" } });
     }
     const targetUrl = assertSafeExternalUrl(rawTargetUrl);
+    const urlFilenameRaw = targetUrl.split("/").pop()?.split("?")[0] || "file";
+    const candidateFilename =
+      requestedFilename || decodeURIComponent(urlFilenameRaw);
+
+    // Legacy callers may still request a PDF through proxy-download. Route
+    // those requests into the same asynchronous prepared-asset pipeline.
+    if (isPdfFile(candidateFilename) && req.frontmindUser) {
+      const credential = await getDecryptedCredentialForUser(
+        req.frontmindUser.id,
+      );
+      const asset = await preparedFileService.registerExternal({
+        ownerUserId: req.frontmindUser.id,
+        credentialId: credential?.id || "external",
+        url: targetUrl,
+        filename: candidateFilename,
+      });
+      if (asset.status !== "ready") {
+        return res.status(202).json(asset);
+      }
+      const suffix = disposition === "attachment" ? "?download=1" : "";
+      return res.redirect(307, `${asset.contentUrl}${suffix}`);
+    }
 
     console.log(`[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`);
 
@@ -1475,7 +1555,7 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
       ...safeExternalRequestOptions,
       responseType: "arraybuffer",
       timeout: 120000,
-      maxContentLength: SAFE_EXTERNAL_MAX_BYTES,
+      maxContentLength: Infinity,
       validateStatus: () => true,
     });
 
@@ -1488,9 +1568,8 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
     // Try to extract filename from URL or content-disposition. The caller-provided
     // filename wins; otherwise we fall back to the URL tail and repair the extension
     // from magic bytes so UUID-like signed URLs still download as real PDFs.
-    const urlFilenameRaw = targetUrl.split("/").pop()?.split("?")[0] || "file";
     const urlFilename = ensureFilenameMatchesContent(
-      requestedFilename || decodeURIComponent(urlFilenameRaw),
+      candidateFilename,
       rawBuffer,
       response.headers["content-type"]
     );
@@ -1605,7 +1684,7 @@ async function downloadFromS3(
     ...safeExternalRequestOptions,
     responseType: "arraybuffer",
     timeout: 120000,
-    maxContentLength: SAFE_EXTERNAL_MAX_BYTES,
+    maxContentLength: Infinity,
     validateStatus: () => true,
   });
 
@@ -1664,7 +1743,9 @@ async function handleFileDownload(
   baseUrl: string,
   fileId: string,
   apiKey: string,
-  disposition: "inline" | "attachment" = "inline"
+  disposition: "inline" | "attachment" = "inline",
+  ownerUserId?: number,
+  credentialId?: string,
 ): Promise<void> {
   // Step 1: Get file metadata
   const meta = await fetchFileMetadata(baseUrl, fileId, apiKey);
@@ -1676,6 +1757,26 @@ async function handleFileDownload(
         code: "FILE_NOT_FOUND",
       },
     });
+    return;
+  }
+
+  if (
+    isPdfFile(meta.filename) &&
+    ownerUserId &&
+    credentialId
+  ) {
+    const asset = await preparedFileService.registerFile({
+      ownerUserId,
+      credentialId,
+      fileId,
+      filename: meta.filename,
+    });
+    if (asset.status !== "ready") {
+      res.status(202).json(asset);
+      return;
+    }
+    const suffix = disposition === "attachment" ? "?download=1" : "";
+    res.redirect(307, `${asset.contentUrl}${suffix}`);
     return;
   }
 
@@ -1772,6 +1873,7 @@ router.post("/download-token", async (req: Request, res: Response) => {
     downloadTokenCache.set(token, {
       fileId,
       userId: req.frontmindUser.id,
+      credentialId: req.frontmindCredential.id,
       apiKey,
       baseUrl,
       createdAt: Date.now(),
@@ -1802,7 +1904,15 @@ router.get("/download/:token", async (req: Request, res: Response) => {
 
     // One-time use reduces accidental link sharing risk while keeping UX fast.
     downloadTokenCache.delete(token);
-    await handleFileDownload(res, data.baseUrl, data.fileId, data.apiKey, "attachment");
+    await handleFileDownload(
+      res,
+      data.baseUrl,
+      data.fileId,
+      data.apiKey,
+      "attachment",
+      data.userId,
+      data.credentialId,
+    );
   } catch (error: any) {
     console.error("[FrontMind Proxy] Direct token download error:", error.message);
     res.status(500).json({ error: { message: "下载链接已失效或文件下载失败", code: "DIRECT_DOWNLOAD_ERROR" } });
@@ -1821,7 +1931,15 @@ router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
     const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.params.fileId;
 
-    await handleFileDownload(res, baseUrl, fileId, apiKey);
+    await handleFileDownload(
+      res,
+      baseUrl,
+      fileId,
+      apiKey,
+      "inline",
+      req.frontmindUser?.id,
+      req.frontmindCredential?.id,
+    );
   } catch (error: any) {
     console.error("[FrontMind Proxy] File download error:", error.message);
     res.status(500).json({
@@ -1842,7 +1960,15 @@ router.get("/v1/files/:fileId/content", async (req: Request, res: Response) => {
     const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.params.fileId;
 
-    await handleFileDownload(res, baseUrl, fileId, apiKey);
+    await handleFileDownload(
+      res,
+      baseUrl,
+      fileId,
+      apiKey,
+      "inline",
+      req.frontmindUser?.id,
+      req.frontmindCredential?.id,
+    );
   } catch (error: any) {
     console.error("[FrontMind Proxy] File content download error:", error.message);
     res.status(500).json({
@@ -1921,6 +2047,43 @@ router.all("/*", async (req: Request, res: Response) => {
           kind: "file",
           upstreamId: fileId,
         });
+      }
+
+      // Registration is metadata-only. The single background worker downloads
+      // and brand-sanitizes generated PDFs without holding this API request.
+      for (const descriptor of collectOutputPdfDescriptors(response.data)) {
+        try {
+          if (descriptor.fileId) {
+            await preparedFileService.registerFile({
+              ownerUserId: req.frontmindUser.id,
+              credentialId: req.frontmindCredential.id,
+              fileId: descriptor.fileId,
+              filename: descriptor.filename,
+            });
+            continue;
+          }
+          if (!descriptor.url) continue;
+          const match = descriptor.url.match(/\/v1\/files\/([^/?#]+)/);
+          if (match?.[1]) {
+            await preparedFileService.registerFile({
+              ownerUserId: req.frontmindUser.id,
+              credentialId: req.frontmindCredential.id,
+              fileId: decodeURIComponent(match[1]),
+              filename: descriptor.filename,
+            });
+          } else {
+            await preparedFileService.registerExternal({
+              ownerUserId: req.frontmindUser.id,
+              credentialId: req.frontmindCredential.id,
+              url: descriptor.url,
+              filename: descriptor.filename,
+            });
+          }
+        } catch (error) {
+          // Do not block task polling. Opening the PDF retries registration and
+          // surfaces a precise error to the current user.
+          console.warn("[PreparedFiles] Auto-registration failed", error);
+        }
       }
     }
 

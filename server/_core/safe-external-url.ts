@@ -131,11 +131,6 @@ function beforeRedirect(options: Record<string, unknown>) {
   assertSafeHostname(hostname);
 }
 
-export const SAFE_EXTERNAL_MAX_BYTES = Math.max(
-  1,
-  Number(process.env.FRONTMIND_EXTERNAL_DOWNLOAD_MAX_BYTES) || 100 * 1024 * 1024,
-);
-
 /** Axios options that re-check DNS and every redirect before connecting. */
 export const safeExternalRequestOptions = {
   httpAgent,

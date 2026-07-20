@@ -10,6 +10,8 @@ import manusProxy from "../manus-proxy";
 import workflowApi, { cleanupStaleWorkflowUploads } from "../workflow-api";
 import newsReleaseApi from "../news-release-api";
 import knowledgeBaseApi from "../knowledge-base-api";
+import preparedFileRouter from "../prepared-file-router";
+import { preparedFileService } from "../prepared-file-service";
 import {
   attachOptionalActiveCredential,
   requireExpressAuth,
@@ -28,6 +30,7 @@ function assertProductionConfiguration() {
 
 async function startServer() {
   assertProductionConfiguration();
+  await preparedFileService.initialize();
   const app = express();
   const server = createServer(app);
   void cleanupStaleWorkflowUploads();
@@ -41,7 +44,7 @@ async function startServer() {
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     res.setHeader(
       "Content-Security-Policy",
-      "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+      "object-src 'none'; worker-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
     );
     if (process.env.NODE_ENV === "production") {
       res.setHeader(
@@ -51,7 +54,8 @@ async function startServer() {
     }
     next();
   });
-  // Configure body parser with larger size limit for file uploads
+  // JSON/form payloads keep a bounded parser. Binary upload routes use the raw
+  // request stream and are not subject to this application-body limit.
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -60,7 +64,16 @@ async function startServer() {
       const db = await getDb();
       if (!db) throw new Error("Database is not configured");
       await db.execute(sql`select 1`);
-      res.json({ status: "ok" });
+      const preparedFiles = await preparedFileService.health();
+      res.json({
+        status: "ok",
+        preparedFiles: {
+          status: "ok",
+          availableBytes: preparedFiles.availableBytes,
+          queueLength: preparedFiles.queueLength,
+          activeWorkers: preparedFiles.activeWorkers,
+        },
+      });
     } catch (error) {
       console.error("[Health] Database readiness check failed", error);
       res.status(503).json({ status: "unavailable" });
@@ -68,6 +81,11 @@ async function startServer() {
   });
 
   // FrontMind API proxy - avoids CORS issues while keeping upstream details server-side.
+  app.use(
+    "/api/frontmind/assets",
+    requireExpressAuth,
+    preparedFileRouter,
+  );
   app.use(
     "/api/frontmind",
     requireExpressAuth,

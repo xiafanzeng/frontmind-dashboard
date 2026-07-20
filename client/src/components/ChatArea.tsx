@@ -2,11 +2,7 @@
  * ChatArea Component - Main chat interface
  * Design: Glassmorphism cards, fluid animations, spacious layout.
  * Features: Message display, file/image attachments, status indicators,
- *           inline PDF viewer (blob-based for auth), inline Markdown reader,
- *           HTML file preview.
- *
- * FIX: PDF/HTML files now render correctly by fetching with auth headers
- * and creating blob URLs for iframe rendering.
+ *           local PDF.js reader, inline Markdown reader, HTML file preview.
  */
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import { parseOutputMessages, useConversation, type LocalMessage } from "@/contexts/ConversationContext";
@@ -55,6 +51,7 @@ import { Textarea } from "@/components/ui/textarea";
 const EMPTY_STATE_IMG = "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
 
 const REPORT_POLL_INTERVAL = 3000;
+const PdfDocumentViewer = React.lazy(() => import("./PdfDocumentViewer"));
 
 type ReportTaskStatus = "idle" | "running" | "pending" | "completed" | "error" | "failed";
 
@@ -1263,11 +1260,69 @@ function MarkdownFileReader({
   );
 }
 
-/**
- * Inline PDF/HTML Viewer - opens files in an embedded iframe viewer with download support.
- * FIX: Uses blob URLs fetched with auth headers for proper rendering.
- */
 function PdfViewer({
+  fileUrl,
+  fileName,
+  isPdf,
+  isOpen,
+  onClose,
+}: {
+  fileUrl: string;
+  fileName: string;
+  isPdf: boolean;
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  if (isPdf) {
+    return (
+      <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+        <DialogContent
+          showCloseButton={false}
+          className="p-0 flex flex-col overflow-hidden"
+          style={{
+            width: 1100,
+            height: 760,
+            maxWidth: "96vw",
+            maxHeight: "96vh",
+          }}
+        >
+          <DialogTitle className="sr-only">
+            {sanitizeBrandText(fileName)}
+          </DialogTitle>
+          <React.Suspense
+            fallback={
+              <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-5 w-5 animate-spin" />
+                正在启动 PDF 阅读器…
+              </div>
+            }
+          >
+            <PdfDocumentViewer
+              fileName={fileName}
+              sourceUrl={fileUrl}
+              onClose={onClose}
+            />
+          </React.Suspense>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
+  return (
+    <HtmlFileViewer
+      fileUrl={fileUrl}
+      fileName={fileName}
+      isOpen={isOpen}
+      onClose={onClose}
+    />
+  );
+}
+
+/**
+ * HTML remains isolated in a maximally restricted iframe. PDF files use the
+ * PDF.js canvas viewer above and never enter an iframe.
+ */
+function HtmlFileViewer({
   fileUrl,
   fileName,
   isOpen,
@@ -1301,8 +1356,7 @@ function PdfViewer({
         return;
       }
 
-      // If it's a data: URL (base64), convert to blob URL for PDF rendering
-      // (browsers can't render PDF from data: URLs in iframes)
+      // Convert an HTML data URL to a blob URL for sandboxed iframe rendering.
       if (fileUrl.startsWith("data:")) {
         try {
           const parts = fileUrl.split(",");
@@ -1489,7 +1543,11 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
   const [mdReaderOpen, setMdReaderOpen] = useState(false);
   const [mdReaderFile, setMdReaderFile] = useState<{ url: string; name: string } | null>(null);
   const [pdfViewerOpen, setPdfViewerOpen] = useState(false);
-  const [pdfViewerFile, setPdfViewerFile] = useState<{ url: string; name: string } | null>(null);
+  const [pdfViewerFile, setPdfViewerFile] = useState<{
+    url: string;
+    name: string;
+    isPdf: boolean;
+  } | null>(null);
   const [copied, setCopied] = useState(false);
 
   const openMdReader = useCallback((url: string, name: string) => {
@@ -1497,8 +1555,8 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
     setMdReaderOpen(true);
   }, []);
 
-  const openPdfViewer = useCallback((url: string, name: string) => {
-    setPdfViewerFile({ url, name });
+  const openPdfViewer = useCallback((url: string, name: string, isPdf: boolean) => {
+    setPdfViewerFile({ url, name, isPdf });
     setPdfViewerOpen(true);
   }, []);
 
@@ -1684,7 +1742,11 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                             fileViewUrl = `/api/frontmind/v1/files/${att.fileId}`;
                           }
                           if (fileViewUrl) {
-                            openPdfViewer(fileViewUrl, sanitizeBrandText(att.name));
+                            openPdfViewer(
+                              fileViewUrl,
+                              sanitizeBrandText(att.name),
+                              isPdfFile(att.name, att.file?.type),
+                            );
                           }
                         }}
                         className="flex items-center gap-2.5 px-3 py-2.5 rounded-2xl bg-card/80 hover:bg-secondary/70 transition-all group border border-border/70 cursor-pointer shadow-sm"
@@ -1762,7 +1824,11 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                           openMdReader(file.fileUrl, displayOutputFileName);
                         } else if (isPdf || isHtml) {
                           e.preventDefault();
-                          openPdfViewer(file.fileUrl, displayOutputFileName);
+                          openPdfViewer(
+                            file.fileUrl,
+                            displayOutputFileName,
+                            isPdf,
+                          );
                         }
                       }}
                       className="cursor-pointer"
@@ -1907,6 +1973,7 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
         <PdfViewer
           fileUrl={pdfViewerFile.url}
           fileName={pdfViewerFile.name}
+          isPdf={pdfViewerFile.isPdf}
           isOpen={pdfViewerOpen}
           onClose={() => {
             setPdfViewerOpen(false);

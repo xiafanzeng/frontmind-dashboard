@@ -1,8 +1,11 @@
 import { randomUUID } from "crypto";
+import { createReadStream, createWriteStream } from "fs";
 import fs from "fs/promises";
 import path from "path";
+import { Transform } from "stream";
+import { pipeline } from "stream/promises";
 import axios from "axios";
-import express, {
+import {
   Router,
   type NextFunction,
   type Request,
@@ -345,6 +348,56 @@ async function uploadBufferToFrontMind(
   return { fileId: fileRecord.id as string, filename };
 }
 
+async function uploadFilePathToFrontMind(
+  baseUrl: string,
+  apiKey: string,
+  filename: string,
+  filePath: string,
+  contentType = "application/octet-stream",
+) {
+  const fileRecordResponse = await axios.post(
+    `${baseUrl}/v1/files`,
+    { filename },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        API_KEY: apiKey,
+        Authorization: `Bearer ${apiKey}`,
+      },
+      timeout: 120000,
+      validateStatus: () => true,
+    },
+  );
+  if (fileRecordResponse.status < 200 || fileRecordResponse.status >= 300) {
+    throw new Error(`Create file record failed (${fileRecordResponse.status})`);
+  }
+  const fileRecord = fileRecordResponse.data;
+  if (!fileRecord?.id || !fileRecord?.upload_url) {
+    throw new Error("Create file record failed: missing file id or upload url");
+  }
+
+  const stat = await fs.stat(filePath);
+  const uploadResponse = await axios.put(
+    assertSafeExternalUrl(fileRecord.upload_url),
+    createReadStream(filePath),
+    {
+      ...safeExternalRequestOptions,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(stat.size),
+      },
+      timeout: 300000,
+      maxBodyLength: Infinity,
+      maxContentLength: 1024 * 1024,
+      validateStatus: () => true,
+    },
+  );
+  if (uploadResponse.status < 200 || uploadResponse.status >= 300) {
+    throw new Error(`Upload file failed (${uploadResponse.status})`);
+  }
+  return { fileId: fileRecord.id as string, filename };
+}
+
 async function uploadStoredUserFiles(
   userId: number,
   baseUrl: string,
@@ -357,12 +410,11 @@ async function uploadStoredUserFiles(
   const attachments: Array<{ file_id: string; filename: string }> = [];
 
   for (const upload of storedUploads) {
-    const buffer = await fs.readFile(path.join(uploadDir, upload.storedName));
-    const uploaded = await uploadBufferToFrontMind(
+    const uploaded = await uploadFilePathToFrontMind(
       baseUrl,
       apiKey,
       upload.name,
-      buffer,
+      path.join(uploadDir, upload.storedName),
       upload.type || "application/octet-stream"
     );
     attachments.push({ file_id: uploaded.fileId, filename: uploaded.filename });
@@ -419,7 +471,6 @@ router.delete("/runs/:runId", asyncRoute(async (req, res) => {
 
 router.post(
   "/runs/:runId/steps/:stepId/uploads",
-  express.raw({ type: "application/octet-stream", limit: "100mb" }),
   asyncRoute(async (req, res) => {
     const runId = sanitizeSegment(String(req.params.runId || ""), `wf_${randomUUID()}`);
     const stepId = String(req.params.stepId || "");
@@ -435,25 +486,44 @@ router.post(
       return;
     }
 
-    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
-      res.status(400).json({ error: "Empty upload body" });
-      return;
-    }
-
     const originalName = sanitizeFileName(safeDecodeHeader(String(req.header("x-file-name") || "upload.bin")));
     const contentType = String(req.header("x-file-type") || "application/octet-stream");
     const id = randomUUID();
     const storedName = `${id}_${originalName}`;
     const uploadDir = getUploadDir(userId, runId, step.id);
     await fs.mkdir(uploadDir, { recursive: true });
-    await fs.writeFile(path.join(uploadDir, storedName), req.body);
+    const storedPath = path.join(uploadDir, storedName);
+    const temporaryPath = `${storedPath}.tmp`;
+    let uploadedBytes = 0;
+    const counter = new Transform({
+      transform(chunk, _encoding, callback) {
+        uploadedBytes += chunk.length;
+        callback(null, chunk);
+      },
+    });
+    try {
+      await pipeline(
+        req,
+        counter,
+        createWriteStream(temporaryPath, { mode: 0o600 }),
+      );
+      if (uploadedBytes === 0) {
+        await fs.rm(temporaryPath, { force: true });
+        res.status(400).json({ error: "Empty upload body" });
+        return;
+      }
+      await fs.rename(temporaryPath, storedPath);
+    } catch (error) {
+      await fs.rm(temporaryPath, { force: true });
+      throw error;
+    }
 
     const file: StoredWorkflowUploadedFile = {
       id,
       storedName,
       name: originalName,
       type: contentType,
-      size: req.body.length,
+      size: uploadedBytes,
       stepId: step.id,
       uploadedAt: new Date().toISOString(),
     };
