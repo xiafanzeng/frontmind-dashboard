@@ -3000,34 +3000,6 @@ async function run(command, args, onActivity) {
     });
   });
 }
-async function runCapture(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn2(command, args, {
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk).slice(0, 16e3);
-    });
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (code === 0) resolve(stdout);
-      else {
-        reject(
-          new Error(
-            `${command} exited with ${code}: ${stderr.slice(-2e3)}`
-          )
-        );
-      }
-    });
-  });
-}
 async function commandAvailable2(command) {
   try {
     await run(command, ["-v"]);
@@ -3041,33 +3013,84 @@ async function commandAvailable2(command) {
     }
   }
 }
-async function getPageCount(filePath) {
+async function getPdfInfo(filePath) {
+  return new Promise(
+    (resolve, reject) => {
+      const child = spawn2("pdfinfo", [filePath], {
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code !== 0) {
+          reject(new Error(`pdfinfo failed: ${stderr.slice(-2e3)}`));
+          return;
+        }
+        const pages = Number(stdout.match(/^Pages:\s+(\d+)/m)?.[1]);
+        if (!Number.isInteger(pages) || pages < 1) {
+          reject(new Error("pdfinfo did not return a valid page count"));
+          return;
+        }
+        resolve({ pageCount: pages, infoText: stdout });
+      });
+    }
+  );
+}
+async function containsSourceBrand(filePath, onActivity) {
+  const sourceBrand = ["ma", "nus"].join("");
+  const brandPattern = new RegExp(`\\b${sourceBrand}\\b`, "i");
   return new Promise((resolve, reject) => {
-    const child = spawn2("pdfinfo", [filePath], {
+    const child = spawn2("pdftotext", [filePath, "-"], {
       stdio: ["ignore", "pipe", "pipe"]
     });
-    let stdout = "";
     let stderr = "";
+    let tail = "";
+    let found = false;
+    let settled = false;
+    const finish = (callback) => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
+      onActivity?.();
+      const candidate = `${tail}${String(chunk)}`;
+      if (!found && brandPattern.test(candidate)) {
+        found = true;
+        child.kill("SIGTERM");
+      }
+      tail = candidate.slice(-64);
     });
     child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
+      onActivity?.();
+      stderr = `${stderr}${String(chunk)}`.slice(-16e3);
     });
-    child.on("error", reject);
+    child.on("error", (error) => finish(() => reject(error)));
     child.on("exit", (code) => {
-      if (code !== 0) {
-        reject(new Error(`pdfinfo failed: ${stderr.slice(-2e3)}`));
-        return;
+      if (found) {
+        finish(() => resolve(true));
+      } else if (code === 0) {
+        finish(() => resolve(false));
+      } else {
+        finish(
+          () => reject(
+            new Error(
+              `pdftotext exited with ${code}: ${stderr.slice(-2e3)}`
+            )
+          )
+        );
       }
-      const pages = Number(stdout.match(/^Pages:\s+(\d+)/m)?.[1]);
-      if (!Number.isInteger(pages) || pages < 1) {
-        reject(new Error("pdfinfo did not return a valid page count"));
-        return;
-      }
-      resolve(pages);
     });
   });
 }
@@ -3137,10 +3160,27 @@ async function main() {
       { code: "PDF_TOOLING_UNAVAILABLE" }
     );
   }
-  const pageCount = await getPageCount(data.inputPath);
+  const sourceInfo = await getPdfInfo(data.inputPath);
+  const pageCount = sourceInfo.pageCount;
   send({ type: "progress", phase: "sanitizing", page: 0, pageCount });
+  const sourceBrand = ["ma", "nus"].join("");
+  const sourceBrandPattern = new RegExp(`\\b${sourceBrand}\\b`, "i");
+  const sourceTextContainsBrand = await containsSourceBrand(
+    data.inputPath,
+    () => send({
+      type: "progress",
+      phase: "sanitizing",
+      page: 0,
+      pageCount
+    })
+  );
+  const needsSanitization = sourceTextContainsBrand || sourceBrandPattern.test(sourceInfo.infoText);
   let wasSanitized;
-  if (stat.size >= data.largePdfThresholdBytes) {
+  if (!needsSanitization) {
+    await fs3.copyFile(data.inputPath, data.outputPath);
+    wasSanitized = false;
+    send({ type: "progress", phase: "optimizing", pageCount });
+  } else if (stat.size >= data.largePdfThresholdBytes) {
     const [hasPdfSeparate, hasPdfUnite, hasGhostscript] = await Promise.all([
       commandAvailable2("pdfseparate"),
       commandAvailable2("pdfunite"),
@@ -3159,7 +3199,8 @@ async function main() {
     wasSanitized = await sanitizeSinglePdf(data.inputPath, data.outputPath);
     send({ type: "progress", phase: "optimizing", pageCount });
   }
-  const outputPageCount = await getPageCount(data.outputPath);
+  const outputInfo = await getPdfInfo(data.outputPath);
+  const outputPageCount = outputInfo.pageCount;
   if (outputPageCount !== pageCount) {
     throw Object.assign(
       new Error(
@@ -3168,9 +3209,11 @@ async function main() {
       { code: "PDF_PAGE_COUNT_MISMATCH" }
     );
   }
-  const extractedText = await runCapture("pdftotext", [data.outputPath, "-"]);
-  const sourceBrand = ["ma", "nus"].join("");
-  if (new RegExp(`\\b${sourceBrand}\\b`, "i").test(extractedText)) {
+  const outputContainsBrand = needsSanitization ? await containsSourceBrand(
+    data.outputPath,
+    () => send({ type: "progress", phase: "optimizing", pageCount })
+  ) : false;
+  if (outputContainsBrand || sourceBrandPattern.test(outputInfo.infoText)) {
     throw Object.assign(
       new Error("\u54C1\u724C\u66FF\u6362\u6821\u9A8C\u672A\u901A\u8FC7\uFF0C\u5904\u7406\u7ED3\u679C\u672A\u53D1\u5E03"),
       { code: "BRAND_REPLACEMENT_INCOMPLETE" }

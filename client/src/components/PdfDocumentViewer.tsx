@@ -15,7 +15,6 @@ import {
   Minus,
   Plus,
   RotateCcw,
-  Search,
   X,
 } from "lucide-react";
 import {
@@ -67,10 +66,10 @@ interface PdfDocumentViewerProps {
 }
 
 const phaseLabels: Record<PreparedPhase, string> = {
-  queued: "正在排队准备文件…",
-  downloading: "正在安全下载原始文件…",
-  sanitizing: "正在替换品牌内容…",
-  optimizing: "正在优化网页预览…",
+  queued: "正在加载 PDF…",
+  downloading: "正在加载 PDF…",
+  sanitizing: "正在加载 PDF…",
+  optimizing: "正在加载 PDF…",
   ready: "文件已准备完成",
   failed: "文件准备失败",
 };
@@ -310,13 +309,9 @@ export default function PdfDocumentViewer({
   const [fitWidth, setFitWidth] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageInput, setPageInput] = useState("1");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searching, setSearching] = useState(false);
-  const [searchPages, setSearchPages] = useState<number[]>([]);
   const [isDownloading, setIsDownloading] = useState(false);
   const [prepareAttempt, setPrepareAttempt] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const searchRunRef = useRef(0);
 
   const isLocalSource =
     Boolean(sourceFile) ||
@@ -374,7 +369,8 @@ export default function PdfDocumentViewer({
             return;
           }
           const elapsed = Date.now() - startedAt;
-          const delay = elapsed < 30_000 ? 2_000 : 5_000;
+          const delay =
+            elapsed < 10_000 ? 1_000 : elapsed < 30_000 ? 2_000 : 5_000;
           timer = setTimeout(async () => {
             try {
               next = await fetchPreparedStatus(
@@ -459,35 +455,6 @@ export default function PdfDocumentViewer({
     },
     [pdfDocument],
   );
-
-  const runSearch = useCallback(async () => {
-    const query = searchQuery.trim().toLocaleLowerCase();
-    if (!pdfDocument || !query) {
-      setSearchPages([]);
-      return;
-    }
-    const runId = ++searchRunRef.current;
-    setSearching(true);
-    const matches: number[] = [];
-    try {
-      for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
-        if (searchRunRef.current !== runId) return;
-        const page = await pdfDocument.getPage(pageNumber);
-        const textContent = await page.getTextContent();
-        const text = textContent.items
-          .map(item => ("str" in item ? item.str : ""))
-          .join(" ")
-          .toLocaleLowerCase();
-        page.cleanup();
-        if (text.includes(query)) matches.push(pageNumber);
-      }
-      if (searchRunRef.current !== runId) return;
-      setSearchPages(matches);
-      if (matches[0]) goToPage(matches[0]);
-    } finally {
-      if (searchRunRef.current === runId) setSearching(false);
-    }
-  }, [goToPage, pdfDocument, searchQuery]);
 
   const retryPreparation = useCallback(async () => {
     if (!asset) return;
@@ -619,37 +586,6 @@ export default function PdfDocumentViewer({
             >
               <Maximize2 className="h-4 w-4" />
             </Button>
-            <div className="flex items-center gap-1">
-              <Input
-                value={searchQuery}
-                onChange={event => setSearchQuery(event.target.value)}
-                onKeyDown={event => {
-                  if (event.key === "Enter") void runSearch();
-                }}
-                className="h-7 w-28 text-xs"
-                placeholder="搜索"
-                aria-label="搜索 PDF"
-              />
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8"
-                onClick={() => void runSearch()}
-                disabled={searching}
-                aria-label="执行搜索"
-              >
-                {searching ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Search className="h-4 w-4" />
-                )}
-              </Button>
-              {searchPages.length > 0 && (
-                <span className="whitespace-nowrap text-[10px] text-muted-foreground">
-                  {searchPages.length} 页命中
-                </span>
-              )}
-            </div>
           </>
         )}
 
