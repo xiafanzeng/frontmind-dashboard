@@ -5887,10 +5887,20 @@ router3.post("/steps/:stepId/execute", asyncRoute(async (req, res) => {
 }));
 var workflow_api_default = router3;
 
-// server/news-release-api.ts
+// server/knowledge-base-api.ts
 import axios4 from "axios";
 import { Router as Router3 } from "express";
+import fs6 from "fs/promises";
+import JSZip2 from "jszip";
+import path6 from "path";
 var router4 = Router3();
+var skillArchiveCandidates = [
+  process.env.FRONTMIND_KB_SKILL_PATH,
+  path6.resolve(process.cwd(), "private-workflows", "socratic-kb-builder.skill"),
+  path6.resolve(import.meta.dirname, "..", "private-workflows", "socratic-kb-builder.skill"),
+  path6.resolve(import.meta.dirname, "..", "..", "private-workflows", "socratic-kb-builder.skill")
+].filter(Boolean);
+var cachedSkillInstructions = null;
 function sanitizeFilename2(value, fallback) {
   const safe = String(value || "").replace(/[\\/\0]/g, "_").replace(/^\.+$/, "").trim().slice(0, 160);
   return safe || fallback;
@@ -5899,334 +5909,80 @@ function normalizeUserAttachments(attachments2) {
   return (attachments2 || []).map((attachment) => {
     const fileId = attachment.file_id || attachment.fileId || "";
     const filename = sanitizeFilename2(
-      attachment.filename || attachment.name || "user_material",
-      "user_material"
+      attachment.filename || attachment.name || "company_material",
+      "company_material"
     );
     return fileId ? { file_id: fileId, filename } : null;
   }).filter(Boolean);
 }
-function buildPublishedNewsReleasePrompt(companyName, operatorNotes) {
-  const template = `\u4F60\u662F\u4E00\u540D\u8D44\u6DF1\u4F01\u4E1A\u65B0\u95FB\u53D1\u5E03\u4F1A\u7B56\u5212\u4EBA\u3001\u8D22\u7ECF\u79D1\u6280\u5A92\u4F53\u4E3B\u7F16\u3001\u54C1\u724C\u6218\u7565\u987E\u95EE\u3001\u4E8B\u5B9E\u6838\u67E5\u7F16\u8F91\u548C\u89C6\u89C9\u521B\u610F\u603B\u76D1\u3002
-
-\u8BF7\u56F4\u7ED5\u3010{\u4F01\u4E1A\u540D\u79F0}\u3011\u751F\u6210\u4E00\u4EFD\u53EF\u76F4\u63A5\u7528\u4E8E\u6B63\u5F0F\u5BF9\u5916\u53D1\u5E03\u7684\u9AD8\u7AEF\u65B0\u95FB\u53D1\u5E03\u4F1A\u56FE\u6587\u65B0\u95FB\u7A3F\uFF0C\u6700\u7EC8\u8F93\u51FA\u4E3A Markdown \u683C\u5F0F\u3002
-
-\u6700\u7EC8\u7A3F\u5FC5\u987B\u662F\u9762\u5411\u5BA2\u6237\u3001\u5A92\u4F53\u548C\u516C\u4F17\u7684\u6210\u54C1\u65B0\u95FB\u7A3F\uFF0C\u4E0D\u5F97\u8F93\u51FA\u4EFB\u4F55\u4E2D\u95F4\u8FC7\u7A0B\u3001\u5199\u4F5C\u8BF4\u660E\u3001\u56FE\u7247\u751F\u6210 Prompt\u3001\u4E8B\u5B9E\u6838\u9A8C\u8868\u3001\u5BA1\u6821\u6E05\u5355\u3001\u5F85\u529E\u4E8B\u9879\u6216\u6A21\u578B\u81EA\u8BC4\u5185\u5BB9\u3002
-
----
-
-## \u4E00\u3001\u57FA\u7840\u4FE1\u606F
-
-\u4F01\u4E1A\u540D\u79F0\uFF1A{\u4F01\u4E1A\u540D\u79F0}
-
-\u53D1\u5E03\u4E3B\u9898\uFF1A{\u53D1\u5E03\u4E3B\u9898 / \u65B0\u54C1\u53D1\u5E03 / \u6218\u7565\u5347\u7EA7 / \u6280\u672F\u6210\u679C / \u54C1\u724C\u53D1\u5E03 / \u9879\u76EE\u843D\u5730}
-
-\u53D1\u5E03\u65E5\u671F\u4E0E\u5730\u70B9\uFF1A{\u65E5\u671F\u3001\u57CE\u5E02\uFF0C\u5982\u672A\u77E5\u8BF7\u4E0D\u8981\u5728\u6B63\u6587\u4E2D\u5F3A\u884C\u7F16\u9020}
-
-\u76EE\u6807\u53D7\u4F17\uFF1A{\u5A92\u4F53 / \u6295\u8D44\u4EBA / \u5BA2\u6237 / \u653F\u5E9C / \u884C\u4E1A\u4F19\u4F34 / \u516C\u4F17}
-
-\u884C\u4E1A\u9886\u57DF\uFF1A{\u884C\u4E1A}
-
-\u4F01\u4E1A\u5B98\u7F51\u6216\u5B98\u65B9\u8D44\u6599\uFF1A{\u5B98\u7F51\u94FE\u63A5 / \u4E0A\u4F20\u56FE\u518C / \u4EA7\u54C1\u624B\u518C / \u65B0\u95FB\u8D44\u6599\u5305 / \u5B98\u65B9\u516C\u4F17\u53F7 / \u767D\u76AE\u4E66 / \u5E74\u62A5 / \u62DB\u80A1\u4E66}
-
-\u5FC5\u987B\u4F7F\u7528\u7684\u4FE1\u606F\uFF1A{\u5982\u6709\uFF0C\u8BF7\u5217\u51FA}
-
-\u7981\u6B62\u4F7F\u7528\u6216\u907F\u514D\u63D0\u53CA\u7684\u4FE1\u606F\uFF1A{\u5982\u6709\uFF0C\u8BF7\u5217\u51FA}
-
-\u54C1\u724C\u8C03\u6027\uFF1A\u9AD8\u7AEF\u3001\u53EF\u4FE1\u3001\u514B\u5236\u3001\u56FD\u9645\u5316\u3001\u4E13\u4E1A\u3001\u6709\u65B0\u95FB\u4EF7\u503C\uFF0C\u907F\u514D\u7A7A\u6D1E\u8425\u9500\u8154\u3002
-
----
-
-## \u4E8C\u3001\u8D44\u6599\u4E0E\u4E8B\u5B9E\u8981\u6C42
-
-\u8BF7\u4F18\u5148\u4F7F\u7528\u4EE5\u4E0B\u6765\u6E90\u5B8C\u6210\u8D44\u6599\u5224\u65AD\u548C\u4E8B\u5B9E\u6838\u9A8C\uFF1A
-
-1. \u4F01\u4E1A\u5B98\u7F51\u3001\u5B98\u65B9\u516C\u4F17\u53F7\u3001\u4EA7\u54C1\u624B\u518C\u3001\u767D\u76AE\u4E66\u3001\u5E74\u62A5\u3001\u62DB\u80A1\u4E66\u3001\u65B0\u95FB\u7A3F\u3001\u8BA4\u8BC1\u6587\u4EF6\uFF1B
-2. \u7528\u6237\u4E0A\u4F20\u7684\u56FE\u518C\u3001\u4EA7\u54C1\u8D44\u6599\u3001\u5BA3\u4F20\u518C\u3001\u65B0\u95FB\u8D44\u6599\u5305\uFF1B
-3. \u6743\u5A01\u5A92\u4F53\u62A5\u9053\uFF1B
-4. \u653F\u5E9C\u3001\u534F\u4F1A\u3001\u4EA4\u6613\u6240\u3001\u76D1\u7BA1\u673A\u6784\u516C\u5F00\u4FE1\u606F\uFF1B
-5. \u884C\u4E1A\u62A5\u544A\u3001\u5B66\u672F\u8BBA\u6587\u3001\u4E13\u5229\u6570\u636E\u5E93\u3002
-
-\u6240\u6709\u5173\u952E\u4E8B\u5B9E\u5FC5\u987B\u53EF\u6838\u9A8C\u3002\u4E0D\u5F97\u7F16\u9020\u4EE5\u4E0B\u5185\u5BB9\uFF1A
-
-- \u4F01\u4E1A\u8425\u6536\uFF1B
-- \u878D\u8D44\u91D1\u989D\uFF1B
-- \u5E02\u573A\u4EFD\u989D\uFF1B
-- \u5BA2\u6237\u540D\u79F0\uFF1B
-- \u5408\u4F5C\u4F19\u4F34\uFF1B
-- \u8D44\u8D28\u8BA4\u8BC1\uFF1B
-- \u9886\u5BFC\u59D3\u540D\u4E0E\u804C\u52A1\uFF1B
-- \u53D1\u5E03\u4F1A\u5609\u5BBE\uFF1B
-- \u4EA7\u54C1\u53C2\u6570\uFF1B
-- \u4E13\u5229\u6570\u91CF\uFF1B
-- \u5956\u9879\uFF1B
-- \u653F\u5E9C\u80CC\u4E66\uFF1B
-- \u4E0A\u5E02\u8BA1\u5212\uFF1B
-- \u4EA7\u80FD\u6570\u636E\uFF1B
-- \u9500\u552E\u6570\u636E\uFF1B
-- \u7528\u6237\u89C4\u6A21\u3002
-
-\u5982\u8D44\u6599\u4E0D\u8DB3\uFF0C\u8BF7\u5728\u6B63\u6587\u4E2D\u91C7\u7528\u514B\u5236\u3001\u4E2D\u6027\u3001\u53EF\u53D1\u5E03\u7684\u8868\u8FBE\u65B9\u5F0F\uFF0C\u4E0D\u5F97\u4F7F\u7528\u201C\u5F85\u786E\u8BA4\u201D\u201C\u8D44\u6599\u4E0D\u8DB3\u201D\u201C\u65E0\u6CD5\u786E\u8BA4\u201D\u7B49\u7834\u574F\u6210\u7A3F\u611F\u7684\u5B57\u6837\uFF0C\u4E5F\u4E0D\u5F97\u81EA\u884C\u5047\u8BBE\u3002
-
-\u5982\u679C\u516C\u5F00\u8D44\u6599\u5B58\u5728\u51B2\u7A81\uFF0C\u8BF7\u4F18\u5148\u91C7\u7528\u4F01\u4E1A\u5B98\u65B9\u8D44\u6599\u3001\u76D1\u7BA1\u673A\u6784\u8D44\u6599\u6216\u66F4\u6743\u5A01\u3001\u66F4\u8FD1\u671F\u7684\u6765\u6E90\uFF0C\u4E0D\u8981\u5728\u6700\u7EC8\u65B0\u95FB\u7A3F\u4E2D\u66B4\u9732\u8D44\u6599\u51B2\u7A81\u8FC7\u7A0B\u3002
-
----
-
-## \u4E09\u3001\u65B0\u95FB\u7A3F\u5199\u4F5C\u8981\u6C42
-
-\u8BF7\u751F\u6210\u4E00\u7BC7\u8FBE\u5230\u9876\u7EA7\u5546\u4E1A\u5A92\u4F53\u3001\u79D1\u6280\u5A92\u4F53\u3001\u8D22\u7ECF\u5A92\u4F53\u53D1\u5E03\u6807\u51C6\u7684\u65B0\u95FB\u53D1\u5E03\u4F1A\u7A3F\u4EF6\u3002
-
-\u65B0\u95FB\u7A3F\u5FC5\u987B\u5177\u5907\uFF1A
-
-- \u660E\u786E\u65B0\u95FB\u4E8B\u4EF6\uFF1B
-- \u6E05\u6670\u884C\u4E1A\u80CC\u666F\uFF1B
-- \u771F\u5B9E\u4F01\u4E1A\u4FE1\u606F\uFF1B
-- \u53EF\u4FE1\u4EA7\u54C1\u6216\u670D\u52A1\u63CF\u8FF0\uFF1B
-- \u5177\u4F53\u5E94\u7528\u4EF7\u503C\uFF1B
-- \u514B\u5236\u7684\u6218\u7565\u8868\u8FBE\uFF1B
-- \u9AD8\u7AEF\u4F46\u4E0D\u6D6E\u5938\u7684\u8BED\u8A00\uFF1B
-- \u5A92\u4F53\u53EF\u76F4\u63A5\u91C7\u7528\u7684\u6210\u7A3F\u8D28\u611F\u3002
-
-\u6587\u7AE0\u7ED3\u6784\u5305\u62EC\uFF1A
-
-### 1. \u4E3B\u6807\u9898
-
-\u8981\u6C42\uFF1A
-
-- \u5177\u6709\u65B0\u95FB\u4EF7\u503C\uFF1B
-- \u7A81\u51FA\u53D1\u5E03\u4F1A\u6838\u5FC3\u4E8B\u4EF6\uFF1B
-- \u4E0D\u6D6E\u5938\uFF1B
-- \u4E0D\u4F7F\u7528\u201C\u9707\u64BC\u53D1\u5E03\u201D\u201C\u91CD\u78C5\u6765\u88AD\u201D\u201C\u5F15\u9886\u672A\u6765\u201D\u201C\u98A0\u8986\u884C\u4E1A\u201D\u7B49\u7A7A\u6CDB\u8868\u8FBE\u3002
-
-### 2. \u526F\u6807\u9898
-
-\u8981\u6C42\uFF1A
-
-- \u8865\u5145\u6218\u7565\u610F\u4E49\u3001\u4EA7\u54C1\u4EF7\u503C\u3001\u884C\u4E1A\u80CC\u666F\u6216\u5546\u4E1A\u6210\u679C\uFF1B
-- \u4E0E\u4E3B\u6807\u9898\u5F62\u6210\u9012\u8FDB\u5173\u7CFB\uFF1B
-- \u8BED\u8A00\u514B\u5236\u3001\u4E13\u4E1A\u3001\u6709\u5A92\u4F53\u611F\u3002
-
-### 3. \u5BFC\u8BED
-
-\u8981\u6C42\uFF1A
-
-- \u7528\u4E00\u6BB5\u8BDD\u4EA4\u4EE3\u65F6\u95F4\u3001\u5730\u70B9\u3001\u4F01\u4E1A\u3001\u53D1\u5E03\u5185\u5BB9\u548C\u6838\u5FC3\u610F\u4E49\uFF1B
-- \u9075\u5FAA\u65B0\u95FB\u5199\u4F5C 5W1H\uFF1B
-- \u4E0D\u5199\u6210\u5E7F\u544A\u8BED\u6216\u5BA3\u4F20\u7247\u65C1\u767D\u3002
-
-### 4. \u6B63\u6587\u4E3B\u4F53
-
-\u6B63\u6587\u8BF7\u6309\u4EE5\u4E0B\u903B\u8F91\u81EA\u7136\u5C55\u5F00\uFF1A
-
-- \u53D1\u5E03\u4F1A\u6838\u5FC3\u4E8B\u4EF6\uFF1B
-- \u4F01\u4E1A\u80CC\u666F\u4E0E\u4E1A\u52A1\u5B9A\u4F4D\uFF1B
-- \u4EA7\u54C1\u3001\u6280\u672F\u6216\u670D\u52A1\u4EAE\u70B9\uFF1B
-- \u884C\u4E1A\u75DB\u70B9\u4E0E\u89E3\u51B3\u65B9\u6848\uFF1B
-- \u5E94\u7528\u573A\u666F\u6216\u5BA2\u6237\u4EF7\u503C\uFF1B
-- \u4F01\u4E1A\u6218\u7565\u5E03\u5C40\uFF1B
-- \u5BF9\u884C\u4E1A\u3001\u5BA2\u6237\u3001\u751F\u6001\u4F19\u4F34\u7684\u610F\u4E49\uFF1B
-- \u540E\u7EED\u8BA1\u5212\u3002
-
-### 5. \u6570\u636E\u4E0E\u4E8B\u5B9E
-
-- \u6BCF\u4E2A\u5173\u952E\u6570\u636E\u5FC5\u987B\u6709\u53EF\u9760\u6765\u6E90\u652F\u6491\uFF1B
-- \u4E0D\u786E\u5B9A\u6570\u636E\u4E0D\u5F97\u8FDB\u5165\u6B63\u6587\u4E3B\u53D9\u4E8B\uFF1B
-- \u4E0D\u5F97\u4F7F\u7528\u65E0\u6CD5\u8BC1\u5B9E\u7684\u6392\u540D\u3001\u7B2C\u4E00\u3001\u9886\u5148\u3001\u552F\u4E00\u3001\u6700\u5927\u7B49\u7EDD\u5BF9\u5316\u8868\u8FF0\uFF1B
-- \u5982\u9700\u5F15\u7528\u6765\u6E90\uFF0C\u53EF\u5728\u6587\u672B\u4EE5\u201C\u8D44\u6599\u6765\u6E90\u201D\u5F62\u5F0F\u7B80\u6D01\u5217\u51FA\u3002
-
-### 6. \u7ED3\u5C3E
-
-\u7ED3\u5C3E\u5E94\u5305\u62EC\uFF1A
-
-- \u672C\u6B21\u53D1\u5E03\u4F1A\u7684\u603B\u7ED3\u6027\u610F\u4E49\uFF1B
-- \u4F01\u4E1A\u672A\u6765\u65B9\u5411\uFF1B
-- \u201C\u5173\u4E8E{\u4F01\u4E1A\u540D\u79F0}\u201D\u6807\u51C6\u516C\u53F8\u4ECB\u7ECD\uFF1B
-- \u5A92\u4F53\u8054\u7CFB\u65B9\u5F0F\u3002
-
----
-
-## \u56DB\u3001\u56FE\u7247\u4E0E\u89C6\u89C9\u8981\u6C42
-
-\u8BF7\u5728\u6700\u7EC8 Markdown \u65B0\u95FB\u7A3F\u4E2D\u63D2\u5165\u81F3\u5C11 3 \u5F20\u56FE\u7247\u3002\u56FE\u7247\u5FC5\u987B\u670D\u52A1\u4E8E\u65B0\u95FB\u5185\u5BB9\uFF0C\u4E0D\u5F97\u53EA\u662F\u88C5\u9970\u56FE\u3002
-
-\u56FE\u7247\u5E94\u5F53\u4E0E\u4F01\u4E1A\u771F\u5B9E\u4E1A\u52A1\u3001\u4EA7\u54C1\u3001\u670D\u52A1\u3001\u6280\u672F\u3001\u5E94\u7528\u573A\u666F\u6216\u54C1\u724C\u6C14\u8D28\u76F8\u5173\uFF0C\u5E76\u4F18\u5148\u53C2\u8003\u4F01\u4E1A\u5B98\u7F51\u3001\u4E0A\u4F20\u56FE\u518C\u3001\u4EA7\u54C1\u624B\u518C\u3001\u65B0\u95FB\u8D44\u6599\u5305\u6216\u516C\u5F00\u8D44\u6599\u4E2D\u7684\u771F\u5B9E\u5143\u7D20\u3002
-
-\u56FE\u7247\u7C7B\u578B\u81F3\u5C11\u5305\u62EC\uFF1A
-
-### \u56FE 1\uFF1A\u53D1\u5E03\u4F1A\u4E3B\u89C6\u89C9\u56FE
-
-\u7528\u4E8E\u6587\u7AE0\u9876\u90E8\uFF0C\u4F53\u73B0\u53D1\u5E03\u4E3B\u9898\u3001\u4F01\u4E1A\u6C14\u8D28\u3001\u884C\u4E1A\u5C5E\u6027\u548C\u65B0\u95FB\u53D1\u5E03\u573A\u666F\u3002
-
-\u8981\u6C42\uFF1A
-
-- \u9AD8\u7AEF\u3001\u514B\u5236\u3001\u771F\u5B9E\u53EF\u4FE1\uFF1B
-- \u50CF\u771F\u5B9E\u53D1\u5E03\u4F1A\u73B0\u573A\u3001\u4F01\u4E1A\u54C1\u724C\u5927\u7247\u6216\u5A92\u4F53\u5934\u56FE\uFF1B
-- \u907F\u514D\u865A\u5047\u821E\u53F0\u3001\u5938\u5F20\u5149\u6548\u3001\u5EC9\u4EF7\u79D1\u6280\u80CC\u666F\u548C\u65E0\u5173\u89C6\u89C9\u5143\u7D20\uFF1B
-- \u4E0D\u5F97\u865A\u6784\u4E0D\u5B58\u5728\u7684 Logo\u3001\u4F1A\u573A\u3001\u5609\u5BBE\u6216\u4F01\u4E1A\u6807\u8BC6\u3002
-
-### \u56FE 2\uFF1A\u4EA7\u54C1 / \u670D\u52A1 / \u5E94\u7528\u573A\u666F\u56FE
-
-\u7528\u4E8E\u5C55\u793A\u4F01\u4E1A\u5B9E\u9645\u4EA7\u54C1\u3001\u89E3\u51B3\u65B9\u6848\u3001\u5E73\u53F0\u3001\u8BBE\u5907\u3001\u5DE5\u5382\u3001\u95E8\u5E97\u3001\u8F6F\u4EF6\u754C\u9762\u6216\u670D\u52A1\u573A\u666F\u3002
-
-\u8981\u6C42\uFF1A
-
-- \u5FC5\u987B\u4E0E\u4F01\u4E1A\u771F\u5B9E\u4E1A\u52A1\u76F8\u5173\uFF1B
-- \u4F18\u5148\u53C2\u8003\u4E0A\u4F20\u56FE\u518C\u3001\u5B98\u7F51\u4EA7\u54C1\u56FE\u6216\u516C\u5F00\u8D44\u6599\uFF1B
-- \u4E0D\u5F97\u51ED\u7A7A\u521B\u9020\u6838\u5FC3\u4EA7\u54C1\u5916\u89C2\uFF1B
-- \u4E0D\u5F97\u865A\u6784\u5BA2\u6237\u73B0\u573A\u3001\u5408\u4F5C\u4F19\u4F34\u6216\u5177\u4F53\u9879\u76EE\uFF1B
-- \u5982\u65E0\u6CD5\u786E\u8BA4\u771F\u5B9E\u573A\u666F\uFF0C\u5E94\u91C7\u7528\u4E0D\u8BEF\u5BFC\u8BFB\u8005\u7684\u573A\u666F\u5316\u8868\u8FBE\u3002
-
-### \u56FE 3\uFF1A\u4E1A\u52A1\u903B\u8F91\u56FE / \u6280\u672F\u67B6\u6784\u56FE / \u4EA7\u4E1A\u4EF7\u503C\u56FE
-
-\u7528\u4E8E\u89E3\u91CA\u4F01\u4E1A\u5982\u4F55\u521B\u9020\u4EF7\u503C\uFF0C\u5E2E\u52A9\u8BFB\u8005\u7406\u89E3\u4F01\u4E1A\u7684\u4E1A\u52A1\u903B\u8F91\u3001\u6280\u672F\u8DEF\u5F84\u3001\u4EA7\u54C1\u77E9\u9635\u6216\u4EA7\u4E1A\u4F4D\u7F6E\u3002
-
-\u8981\u6C42\uFF1A
-
-- \u4FE1\u606F\u7ED3\u6784\u6E05\u6670\uFF1B
-- \u6A21\u5757\u5173\u7CFB\u51C6\u786E\uFF1B
-- \u89C6\u89C9\u5E72\u51C0\u4E13\u4E1A\uFF1B
-- \u9002\u5408\u5A92\u4F53\u53D1\u5E03\uFF1B
-- \u4E0D\u4F7F\u7528\u590D\u6742\u5C0F\u5B57\uFF1B
-- \u4E0D\u4F7F\u7528\u8D5B\u535A\u670B\u514B\u3001\u9713\u8679\u3001\u5168\u606F\u3001\u5938\u5F20 3D \u6548\u679C\uFF1B
-- \u98CE\u683C\u63A5\u8FD1\u4E13\u4E1A\u8D22\u7ECF\u5A92\u4F53\u3001\u54A8\u8BE2\u62A5\u544A\u6216\u4F01\u4E1A\u62DB\u80A1\u4E66\u4E2D\u7684\u4FE1\u606F\u56FE\u3002
-
----
-
-## \u4E94\u3001\u56FE\u7247\u53BB AI \u5473\u513F\u8981\u6C42
-
-\u6240\u6709\u56FE\u7247\u5FC5\u987B\u907F\u514D\u660E\u663E AI \u751F\u6210\u611F\u3002\u6574\u4F53\u89C6\u89C9\u5E94\u63A5\u8FD1\u771F\u5B9E\u5546\u4E1A\u6444\u5F71\u3001\u65B0\u95FB\u7EAA\u5B9E\u6444\u5F71\u3001\u4F01\u4E1A\u5B98\u7F51\u7EA7\u4EA7\u54C1\u6444\u5F71\u6216\u4E13\u4E1A\u4FE1\u606F\u56FE\u3002
-
-\u56FE\u7247\u5E94\u5177\u5907\uFF1A
-
-- \u771F\u5B9E\u5149\u7EBF\uFF1B
-- \u771F\u5B9E\u6750\u8D28\uFF1B
-- \u771F\u5B9E\u9634\u5F71\uFF1B
-- \u81EA\u7136\u666F\u6DF1\uFF1B
-- \u5408\u7406\u900F\u89C6\uFF1B
-- \u514B\u5236\u6784\u56FE\uFF1B
-- \u5E72\u51C0\u753B\u9762\uFF1B
-- \u5546\u4E1A\u5A92\u4F53\u8D28\u611F\uFF1B
-- \u4F01\u4E1A\u6B63\u5F0F\u5BF9\u5916\u53D1\u5E03\u7D20\u6750\u7684\u53EF\u4FE1\u5EA6\u3002
-
-\u56FE\u7247\u5FC5\u987B\u907F\u514D\uFF1A
-
-- AI \u6D77\u62A5\u611F\uFF1B
-- \u5EC9\u4EF7\u84DD\u8272\u79D1\u6280\u611F\uFF1B
-- \u5851\u6599\u8D28\u611F\uFF1B
-- \u8721\u50CF\u4EBA\u7269\uFF1B
-- \u7578\u5F62\u624B\u6307\uFF1B
-- \u4E0D\u81EA\u7136\u7B11\u5BB9\uFF1B
-- \u8FC7\u5EA6\u78E8\u76AE\uFF1B
-- \u4E71\u7801\u6587\u5B57\uFF1B
-- \u4F2A Logo\uFF1B
-- \u865A\u6784\u5BA2\u6237\u540D\u79F0\uFF1B
-- \u968F\u673A\u53D1\u5149\u7EBF\u6761\uFF1B
-- \u6F02\u6D6E\u56FE\u6807\uFF1B
-- \u5168\u606F\u6295\u5F71\uFF1B
-- \u8D5B\u535A\u670B\u514B\u9713\u8679\uFF1B
-- \u5938\u5F20\u955C\u5934\u5149\u6591\uFF1B
-- \u8FC7\u5EA6\u9510\u5316\uFF1B
-- \u8FC7\u9971\u548C\uFF1B
-- \u5047 HDR\uFF1B
-- \u7D20\u6750\u5E93\u62FC\u8D34\u611F\uFF1B
-- \u6982\u5FF5\u6E32\u67D3\u611F\uFF1B
-- \u4E0D\u771F\u5B9E\u7684\u5DE5\u5382\u3001\u5B9E\u9A8C\u5BA4\u3001\u95E8\u5E97\u3001\u4F1A\u573A\u6216\u4EA7\u54C1\u5916\u89C2\u3002
-
-\u56FE\u7247\u5185\u6587\u5B57\u5E94\u5C3D\u91CF\u5C11\uFF0C\u5982\u5FC5\u987B\u51FA\u73B0\u6587\u5B57\uFF0C\u5E94\u6E05\u6670\u3001\u51C6\u786E\u3001\u65E0\u4E71\u7801\u3002\u4E0D\u5F97\u5728\u56FE\u7247\u4E2D\u52A0\u5165\u672A\u7ECF\u786E\u8BA4\u7684\u4F01\u4E1A\u53E3\u53F7\u3001\u6570\u636E\u3001\u6392\u540D\u3001\u5BA2\u6237\u540D\u79F0\u6216\u5408\u4F5C\u4F19\u4F34\u540D\u79F0\u3002
-
-\u56FE\u7247\u5EFA\u8BAE\u4E3A 4K \u6216\u8FD1 4K \u8D28\u91CF\u3002\u5982\u9700 8K\uFF0C\u53EF\u5728\u56FE\u50CF\u751F\u6210\u540E\u901A\u8FC7\u5916\u90E8\u8D85\u5206\u8FA8\u7387\u5DE5\u5177\u4E8C\u6B21\u653E\u5927\u3002
-
----
-
-## \u516D\u3001\u6700\u7EC8 Markdown \u8F93\u51FA\u683C\u5F0F
-
-\u8BF7\u53EA\u8F93\u51FA\u4EE5\u4E0B\u6210\u54C1\u65B0\u95FB\u7A3F\u7ED3\u6784\uFF0C\u4E0D\u8981\u8F93\u51FA\u4EFB\u4F55\u989D\u5916\u8BF4\u660E\u3002
-
----
-
-# {\u65B0\u95FB\u7A3F\u4E3B\u6807\u9898}
-
-> \u526F\u6807\u9898\uFF1A{\u526F\u6807\u9898}
-
-![\u53D1\u5E03\u4F1A\u4E3B\u89C6\u89C9\u56FE](./images/hero.png)
-*\u56FE 1\uFF1A{\u56FE\u6CE8}*
-
-## \u5BFC\u8BED
-
-{\u65B0\u95FB\u5BFC\u8BED}
-
-## \u4E00\u3001\u53D1\u5E03\u4F1A\u6838\u5FC3\u4FE1\u606F
-
-{\u6B63\u6587\u5185\u5BB9}
-
-## \u4E8C\u3001\u4F01\u4E1A\u80CC\u666F\u4E0E\u4E1A\u52A1\u5B9A\u4F4D
-
-{\u6B63\u6587\u5185\u5BB9}
-
-## \u4E09\u3001\u4EA7\u54C1 / \u6280\u672F / \u670D\u52A1\u4EAE\u70B9
-
-{\u6B63\u6587\u5185\u5BB9}
-
-![\u4EA7\u54C1\u6216\u5E94\u7528\u573A\u666F\u56FE](./images/product-scene.png)
-*\u56FE 2\uFF1A{\u56FE\u6CE8}*
-
-## \u56DB\u3001\u884C\u4E1A\u75DB\u70B9\u4E0E\u89E3\u51B3\u65B9\u6848
-
-{\u6B63\u6587\u5185\u5BB9}
-
-## \u4E94\u3001\u5E94\u7528\u573A\u666F\u4E0E\u5BA2\u6237\u4EF7\u503C
-
-{\u6B63\u6587\u5185\u5BB9}
-
-## \u516D\u3001\u6218\u7565\u5E03\u5C40\u4E0E\u672A\u6765\u8BA1\u5212
-
-{\u6B63\u6587\u5185\u5BB9}
-
-![\u4E1A\u52A1\u903B\u8F91\u56FE](./images/business-logic.png)
-*\u56FE 3\uFF1A{\u56FE\u6CE8}*
-
-## \u4E03\u3001\u5173\u4E8E{\u4F01\u4E1A\u540D\u79F0}
-
-{100 \u81F3 200 \u5B57\u4F01\u4E1A\u4ECB\u7ECD}
-
-## \u516B\u3001\u5A92\u4F53\u8054\u7CFB\u65B9\u5F0F
-
-\u8054\u7CFB\u4EBA\uFF1A{\u8054\u7CFB\u4EBA}
-\u7535\u8BDD\uFF1A{\u7535\u8BDD}
-\u90AE\u7BB1\uFF1A{\u90AE\u7BB1}
-\u5B98\u7F51\uFF1A{\u5B98\u7F51}
-
-## \u8D44\u6599\u6765\u6E90
-
-{\u4EC5\u5217\u51FA\u6B63\u6587\u4E2D\u5B9E\u9645\u4F7F\u7528\u7684\u91CD\u8981\u516C\u5F00\u8D44\u6599\u6765\u6E90\uFF1B\u5982\u4E0D\u9002\u5408\u516C\u5F00\u5C55\u793A\uFF0C\u53EF\u5220\u9664\u672C\u90E8\u5206}
-
----
-
-## \u4E03\u3001\u6700\u7EC8\u8F93\u51FA\u9650\u5236
-
-\u6700\u7EC8\u8F93\u51FA\u5FC5\u987B\u662F\u53EF\u76F4\u63A5\u53D1\u5E03\u7684 Markdown \u65B0\u95FB\u7A3F\u3002
-
-\u4E0D\u5F97\u51FA\u73B0\u4EE5\u4E0B\u5185\u5BB9\uFF1A
-
-- \u5199\u4F5C\u601D\u8DEF\uFF1B
-- \u751F\u6210\u6B65\u9AA4\uFF1B
-- \u56FE\u7247\u751F\u6210 Prompt\uFF1B
-- \u8D1F\u9762 Prompt\uFF1B
-- \u4E8B\u5B9E\u6838\u9A8C\u8868\uFF1B
-- \u53D1\u5E03\u524D\u5BA1\u6821\u6E05\u5355\uFF1B
-- \u7A3F\u4EF6\u8D28\u91CF\u81EA\u8BC4\uFF1B
-- \u5F85\u786E\u8BA4\u4E8B\u9879\u6E05\u5355\uFF1B
-- \u201C\u4F5C\u4E3A AI\u201D\uFF1B
-- \u201C\u6211\u5EFA\u8BAE\u201D\uFF1B
-- \u201C\u4EE5\u4E0B\u662F\u201D\uFF1B
-- \u201C\u9700\u8981\u8FDB\u4E00\u6B65\u786E\u8BA4\u201D\uFF1B
-- \u4EFB\u4F55\u9762\u5411\u5185\u90E8\u5236\u4F5C\u6D41\u7A0B\u7684\u8BF4\u660E\u3002
-
-\u6240\u6709\u4E0D\u786E\u5B9A\u4FE1\u606F\u5FC5\u987B\u5728\u5199\u4F5C\u4E2D\u81EA\u7136\u89C4\u907F\uFF0C\u4E0D\u5F97\u7834\u574F\u65B0\u95FB\u7A3F\u7684\u6B63\u5F0F\u53D1\u5E03\u611F\u3002`;
-  const lines = [template.replaceAll("{\u4F01\u4E1A\u540D\u79F0}", companyName)];
-  if (operatorNotes.trim()) {
-    lines.push("", "\u8865\u5145\u4FE1\u606F\uFF1A", operatorNotes.trim());
+async function readSkillArchive() {
+  if (cachedSkillInstructions) return cachedSkillInstructions;
+  let lastError;
+  for (const candidate of skillArchiveCandidates) {
+    try {
+      const archive = await fs6.readFile(candidate);
+      const zip = await JSZip2.loadAsync(archive);
+      const entries = [
+        ["SKILL.md", "Skill"],
+        ["references/knowledge-tree.md", "Knowledge Tree"],
+        ["references/questioning-strategy.md", "Questioning Strategy"],
+        ["references/output-format.md", "Output Format"]
+      ];
+      const sections = [];
+      for (const [entryName, title] of entries) {
+        const entry = zip.file(entryName);
+        if (!entry) {
+          throw new Error(`Missing ${entryName} in socratic-kb-builder.skill`);
+        }
+        const content = await entry.async("string");
+        sections.push(`# ${title}
+
+${content.trim()}`);
+      }
+      cachedSkillInstructions = sections.join("\n\n---\n\n");
+      return cachedSkillInstructions;
+    } catch (error) {
+      lastError = error;
+    }
   }
-  return lines.join("\n");
+  throw lastError instanceof Error ? lastError : new Error("Could not load socratic-kb-builder.skill");
+}
+async function buildKnowledgeBasePrompt({
+  companyName,
+  companyWebsite,
+  operatorNotes,
+  attachments: attachments2
+}) {
+  const skillInstructions = await readSkillArchive();
+  const attachmentList = attachments2.length > 0 ? attachments2.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u4E0E\u5168\u7F51\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
+  return [
+    "\u4F60\u5FC5\u987B\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u7ED3\u6784\u5316\u77E5\u8BC6\u5E93\u3002",
+    "",
+    "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
+    `\u4F01\u4E1A\u540D\u79F0\uFF1A${companyName}`,
+    `\u4F01\u4E1A\u5B98\u7F51\u5165\u53E3\uFF08\u53EF\u591A\u4E2A\uFF09\uFF1A${companyWebsite || "\u672A\u586B\u5199"}`,
+    "\u7528\u6237\u4E0A\u4F20\u8D44\u6599\uFF1A",
+    attachmentList,
+    operatorNotes ? `\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A
+${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
+    "",
+    "## \u6267\u884C\u8981\u6C42",
+    "1. \u5148\u5B8C\u6574\u8BFB\u53D6\u7528\u6237\u4E0A\u4F20\u8D44\u6599\uFF0C\u5E76\u5BF9\u6BCF\u4E2A\u4F01\u4E1A\u5B98\u7F51\u505A\u6DF1\u5EA6\u5168\u7AD9\u91C7\u96C6\uFF1B\u9012\u5F52\u5904\u7406 sitemap\u3001\u680F\u76EE\u5206\u9875\u3001\u4EA7\u54C1\u8BE6\u60C5\u3001\u6848\u4F8B\u3001\u4E0B\u8F7D\u6587\u4EF6\u3001\u5EF6\u8FDF\u52A0\u8F7D\u56FE\u7247\u548C\u53EF\u89C1\u7684\u5BA2\u6237\u7AEF\u6E32\u67D3\u5185\u5BB9\uFF0C\u5B8C\u6210\u8986\u76D6\u62A5\u544A\u540E\u624D\u80FD\u8FDB\u5165\u786E\u8BA4\u73AF\u8282\u3002\u8986\u76D6\u62A5\u544A\u5FC5\u987B\u91CF\u5316\u5C55\u793A\uFF1A\u53D1\u73B0/\u6210\u529F/\u5931\u8D25\u9875\u9762\u6570\u3001\u6E05\u6D17\u540E\u6B63\u6587\u5B57\u7B26\u6570\u4E0E\u8BCD\u6570\u3001\u53BB\u91CD\u6B63\u6587\u91CF\u3001\u53D1\u73B0/\u6210\u529F\u4E0B\u8F7D/\u5931\u8D25\u56FE\u7247\u6570\u3001\u6309\u5185\u5BB9\u54C8\u5E0C\u53BB\u91CD\u540E\u7684\u56FE\u7247\u6570\u3001\u56FE\u7247\u603B\u5BB9\u91CF\u4E0E\u5206\u8FA8\u7387\u5206\u5E03\u3001\u6587\u6863\u6570\uFF1B\u4E0D\u80FD\u53EA\u62A5\u544A\u9875\u9762\u6570\u91CF\u6216\u56FE\u7247 URL \u6570\u91CF\u3002",
+    "2. \u5B98\u7F51\u91C7\u96C6\u5B8C\u6210\u540E\u5FC5\u987B\u7EE7\u7EED\u6267\u884C\u5168\u7F51\u4F01\u4E1A\u60C5\u62A5\u91C7\u96C6\uFF0C\u800C\u4E0D\u662F\u53EA\u91C7\u5B98\u7F51\uFF1A\u56F4\u7ED5\u4F01\u4E1A\u540D\u79F0\u3001\u522B\u540D\u3001\u57DF\u540D\u3001\u4EA7\u54C1\u4E0E\u578B\u53F7\u3001\u6838\u5FC3\u4EBA\u7269\u3001\u5BA2\u6237\u6848\u4F8B\u3001\u4E13\u5229\u8BA4\u8BC1\u548C\u884C\u4E1A\u672F\u8BED\u8FDB\u884C\u4E2D\u6587\u3001\u82F1\u6587\u53CA\u76EE\u6807\u5E02\u573A\u8BED\u8A00\u68C0\u7D22\uFF0C\u8986\u76D6\u6743\u5A01\u767B\u8BB0/\u4E13\u5229/\u8BA4\u8BC1\u6570\u636E\u5E93\u3001\u65B0\u95FB\u5A92\u4F53\u3001\u5C55\u4F1A\u3001\u884C\u4E1A\u5A92\u4F53\u3001\u7ECF\u9500\u5546\u3001B2B \u76EE\u5F55\u3001\u62DB\u8058\u9875\u3001\u793E\u4EA4\u8D26\u53F7\u548C\u516C\u5F00\u89C6\u9891\u56FE\u6587\u6765\u6E90\u3002",
+    "3. \u5BF9\u5168\u7F51\u6765\u6E90\u6267\u884C\u5B9E\u4F53\u6D88\u6B67\u3001\u8DE8\u6765\u6E90\u53BB\u91CD\u3001\u53D1\u5E03\u65F6\u95F4\u8BB0\u5F55\u548C\u51B2\u7A81\u6838\u9A8C\uFF1B\u5B98\u7F51\u4E0E\u6743\u5A01\u6570\u636E\u5E93\u4F18\u5148\uFF0C\u7B2C\u4E09\u65B9\u4E8B\u5B9E\u548C\u56FE\u7247\u5FC5\u987B\u4FDD\u7559\u539F\u59CB URL\u3001\u6765\u6E90\u7C7B\u578B\u3001\u91C7\u96C6\u65F6\u95F4\u53CA\u6388\u6743/\u6743\u5C5E\u72B6\u6001\uFF0C\u5916\u90E8\u56FE\u7247\u53EA\u80FD\u4F5C\u4E3A\u5F85\u6838\u9A8C\u53C2\u8003\u7D20\u6750\uFF0C\u4E0D\u5F97\u5192\u5145\u4F01\u4E1A\u81EA\u6709\u8D44\u4EA7\u3002",
+    "4. \u77E5\u8BC6\u6811\u56FA\u5B9A\u7684\u662F 7 \u4E2A\u81EA\u9002\u5E94\u4E00\u7EA7\u5206\u652F\uFF0C\u4E0D\u662F 7 \u6216 8 \u4E2A\u95EE\u7B54\u8282\u70B9\uFF1B\u5FC5\u987B\u6839\u636E\u4EA7\u54C1\u7EBF\u3001\u670D\u52A1\u7EBF\u4E0E\u5BA2\u6237\u884C\u4E1A\u5C55\u5F00\u7EA6 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\uFF0C\u5E76\u4EE5\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u603B\u6570\u8BA1\u7B97\u904D\u5386\u8FDB\u5EA6\u3002",
+    "5. \u6309 skill \u8981\u6C42\u5148\u4E3A\u6BCF\u4E2A\u53F6\u5B50\u8282\u70B9\u9884\u586B\u6587\u5B57\u3001\u6570\u636E\u3001\u6765\u6E90\u548C\u76F8\u5173\u4F01\u4E1A\u56FE\u7247\uFF0C\u518D\u4EE5\u82CF\u683C\u62C9\u5E95\u5F0F\u786E\u8BA4\u63A8\u8FDB\uFF0C\u4E0D\u80FD\u8BA9\u7528\u6237\u4ECE\u7A7A\u767D\u95EE\u9898\u5F00\u59CB\u5199\u3002",
+    "6. \u6BCF\u8F6E\u53EA\u80FD\u5448\u73B0\u548C\u5904\u7406\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\u3002\u7528\u6237\u53EF\u786E\u8BA4\u3001\u4FEE\u6B63\uFF0C\u6216\u9009\u62E9\u2018\u8DF3\u8FC7/\u76F4\u63A5\u9884\u586B\u2019\u5F53\u524D\u8282\u70B9\uFF1B\u7981\u6B62\u8DF3\u8FC7\u6574\u4E2A\u5206\u652F\u3001\u6279\u91CF\u786E\u8BA4\u3001\u8DE8\u8282\u70B9\u5408\u5E76\u786E\u8BA4\u6216\u63D0\u524D\u6253\u5305\u3002",
+    "7. \u53EA\u6709\u6240\u6709\u53F6\u5B50\u8282\u70B9\u5747\u5DF2\u9010\u9879\u5904\u7406\u3001\u904D\u5386\u8FDB\u5EA6\u8FBE\u5230 100% \u540E\uFF0C\u624D\u53EF\u81EA\u52A8\u751F\u6210\u6700\u7EC8 Markdown/ZIP\u3002\u7981\u6B62\u51FA\u73B0\u2018\u751F\u6210\u521D\u7248\u6210\u679C\u2019\u3001\u2018\u662F\u5426\u7ACB\u5373\u751F\u6210\u2019\u3001A/B/C \u751F\u6210\u9009\u9879\u6216\u4EFB\u4F55\u63D0\u524D\u4EA4\u4ED8\u63D0\u8BAE\u3002",
+    "8. \u672C\u6D41\u7A0B\u6C38\u8FDC\u4E0D\u751F\u6210\u4EA4\u4E92\u5F0F\u7814\u7A76\u7F51\u9875\u3001HTML \u7F51\u7AD9\u6216\u7F51\u9875\u9884\u89C8\uFF0C\u4E5F\u4E0D\u5F97\u4E3B\u52A8\u63D0\u51FA\u8FD9\u7C7B\u4EA7\u7269\uFF1B\u5373\u4F7F\u7528\u6237\u8981\u6C42\uFF0C\u4E5F\u8981\u7B80\u77ED\u8BF4\u660E\u6B64\u6D41\u7A0B\u53EA\u4EA4\u4ED8 Markdown/ZIP\uFF0C\u7136\u540E\u7EE7\u7EED\u5F53\u524D\u77E5\u8BC6\u8282\u70B9\u3002",
+    "9. \u8FDB\u5EA6\u5FC5\u987B\u4F7F\u7528\u6807\u51C6 Markdown \u6807\u9898\u3001\u8868\u683C\u3001\u5217\u8868\u548C\u72EC\u7ACB\u6BB5\u843D\u5C55\u793A\uFF1B\u7981\u6B62\u4F7F\u7528\u6613\u6324\u538B\u7684 ASCII \u6811\u3001\u6846\u7EBF\u3001\u5B57\u7B26\u8FDB\u5EA6\u6761\u6216\u4EE3\u7801\u5757\u6A21\u62DF\u754C\u9762\u3002",
+    "10. \u5BF9\u6BCF\u4E2A\u4E8B\u5B9E\u6807\u6CE8\u6765\u6E90\uFF1A\u4E0A\u4F20\u8D44\u6599\u3001\u4F01\u4E1A\u5B98\u7F51\u5177\u4F53 URL\u3001\u5168\u7F51\u516C\u5F00\u8D44\u6599\u6216\u884C\u4E1A\u8C03\u7814\uFF1B\u63A8\u65AD\u4E0E\u5F85\u6838\u9A8C\u4FE1\u606F\u5FC5\u987B\u660E\u786E\u6807\u6CE8\uFF0C\u4E0D\u5F97\u4F2A\u9020\u3002",
+    "11. \u5982\u5F53\u524D\u4FE1\u606F\u4E0D\u8DB3\uFF0C\u8BF7\u5C55\u793A\u5DF2\u9884\u586B\u8349\u7A3F\u3001\u5177\u4F53\u7F3A\u53E3\u548C\u53EF\u786E\u8BA4\u95EE\u9898\uFF0C\u7B49\u5F85\u7528\u6237\u786E\u8BA4\u3001\u4FEE\u6B63\u6216\u4EC5\u8DF3\u8FC7\u5F53\u524D\u8282\u70B9\u3002",
+    "12. \u6700\u7EC8\u4EA4\u4ED8\u5E94\u4E25\u683C\u6309 skill \u7684 ZIP/Markdown \u77E5\u8BC6\u5E93\u7ED3\u6784\u7EC4\u7EC7\uFF0C\u5E76\u9644\u5B98\u7F51\u5168\u7AD9\u91C7\u96C6\u8986\u76D6\u62A5\u544A\u3001\u5168\u7F51\u4F01\u4E1A\u60C5\u62A5\u68C0\u7D22\u62A5\u544A\u3001\u56FE\u7247\u8D44\u4EA7\u6E05\u5355\u548C\u672A\u6838\u9A8C\u7F3A\u53E3\u6E05\u5355\u3002",
+    "",
+    "## socratic-kb-builder.skill",
+    skillInstructions
+  ].join("\n");
 }
 async function createFrontMindTask({
   baseUrl,
@@ -6276,6 +6032,7 @@ async function createFrontMindTask({
 router4.post("/start", async (req, res) => {
   const body = req.body || {};
   const companyName = String(body.companyName || "").trim();
+  const companyWebsite = String(body.companyWebsite || "").trim();
   const operatorNotes = String(body.operatorNotes || "").trim();
   if (!companyName) {
     res.status(400).json({ error: "Missing company name" });
@@ -6289,191 +6046,6 @@ router4.post("/start", async (req, res) => {
   try {
     const userAttachments = normalizeUserAttachments(body.attachments);
     const created = await createFrontMindTask({
-      baseUrl,
-      apiKey,
-      prompt: buildPublishedNewsReleasePrompt(companyName, operatorNotes),
-      agentProfile: body.agentProfile,
-      attachments: userAttachments
-    });
-    if (!created.ok) {
-      console.warn("[News Release Start] create task failed:", created.detail);
-      res.status(created.status).json({ error: "\u521B\u5EFA\u65B0\u95FB\u7A3F\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5 API Key \u6216\u7A0D\u540E\u91CD\u8BD5" });
-      return;
-    }
-    if (!req.frontmindUser || !req.frontmindCredential) {
-      res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55\u5E76\u914D\u7F6E API Key" });
-      return;
-    }
-    await recordUpstreamResource({
-      userId: req.frontmindUser.id,
-      apiCredentialId: req.frontmindCredential.id,
-      kind: "task",
-      upstreamId: String(created.task.id)
-    });
-    res.json({
-      visibleMessage: "\u5F00\u59CB\u5236\u4F5C\u54C1\u724C\u65B0\u95FB\u7A3F\u6837\u4F8B",
-      task: created.task,
-      startedAt: Date.now()
-    });
-  } catch (error) {
-    console.error("[News Release Start] error:", error.message);
-    res.status(500).json({ error: "\u542F\u52A8\u65B0\u95FB\u7A3F\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" });
-  }
-});
-var news_release_api_default = router4;
-
-// server/knowledge-base-api.ts
-import axios5 from "axios";
-import { Router as Router4 } from "express";
-import fs6 from "fs/promises";
-import JSZip2 from "jszip";
-import path6 from "path";
-var router5 = Router4();
-var skillArchiveCandidates = [
-  process.env.FRONTMIND_KB_SKILL_PATH,
-  path6.resolve(process.cwd(), "private-workflows", "socratic-kb-builder.skill"),
-  path6.resolve(import.meta.dirname, "..", "private-workflows", "socratic-kb-builder.skill"),
-  path6.resolve(import.meta.dirname, "..", "..", "private-workflows", "socratic-kb-builder.skill")
-].filter(Boolean);
-var cachedSkillInstructions = null;
-function sanitizeFilename3(value, fallback) {
-  const safe = String(value || "").replace(/[\\/\0]/g, "_").replace(/^\.+$/, "").trim().slice(0, 160);
-  return safe || fallback;
-}
-function normalizeUserAttachments2(attachments2) {
-  return (attachments2 || []).map((attachment) => {
-    const fileId = attachment.file_id || attachment.fileId || "";
-    const filename = sanitizeFilename3(
-      attachment.filename || attachment.name || "company_material",
-      "company_material"
-    );
-    return fileId ? { file_id: fileId, filename } : null;
-  }).filter(Boolean);
-}
-async function readSkillArchive() {
-  if (cachedSkillInstructions) return cachedSkillInstructions;
-  let lastError;
-  for (const candidate of skillArchiveCandidates) {
-    try {
-      const archive = await fs6.readFile(candidate);
-      const zip = await JSZip2.loadAsync(archive);
-      const entries = [
-        ["SKILL.md", "Skill"],
-        ["references/knowledge-tree.md", "Knowledge Tree"],
-        ["references/questioning-strategy.md", "Questioning Strategy"],
-        ["references/output-format.md", "Output Format"]
-      ];
-      const sections = [];
-      for (const [entryName, title] of entries) {
-        const entry = zip.file(entryName);
-        if (!entry) {
-          throw new Error(`Missing ${entryName} in socratic-kb-builder.skill`);
-        }
-        const content = await entry.async("string");
-        sections.push(`# ${title}
-
-${content.trim()}`);
-      }
-      cachedSkillInstructions = sections.join("\n\n---\n\n");
-      return cachedSkillInstructions;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error("Could not load socratic-kb-builder.skill");
-}
-async function buildKnowledgeBasePrompt({
-  companyName,
-  companyWebsite,
-  operatorNotes,
-  attachments: attachments2
-}) {
-  const skillInstructions = await readSkillArchive();
-  const attachmentList = attachments2.length > 0 ? attachments2.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u548C\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
-  return [
-    "\u4F60\u5FC5\u987B\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u7ED3\u6784\u5316\u77E5\u8BC6\u5E93\u3002",
-    "",
-    "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
-    `\u4F01\u4E1A\u540D\u79F0\uFF1A${companyName}`,
-    `\u4F01\u4E1A\u5B98\u7F51\uFF1A${companyWebsite || "\u672A\u586B\u5199"}`,
-    "\u7528\u6237\u4E0A\u4F20\u8D44\u6599\uFF1A",
-    attachmentList,
-    operatorNotes ? `\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A
-${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
-    "",
-    "## \u6267\u884C\u8981\u6C42",
-    "1. \u5148\u8BFB\u53D6\u7528\u6237\u4E0A\u4F20\u8D44\u6599\uFF0C\u5E76\u7ED3\u5408\u4F01\u4E1A\u5B98\u7F51\u548C\u516C\u5F00\u8D44\u6599\u505A\u6DF1\u5EA6\u7814\u7A76\u3002",
-    "2. \u6309 skill \u8981\u6C42\u5148\u9884\u586B\u77E5\u8BC6\u6811\uFF0C\u518D\u4EE5\u82CF\u683C\u62C9\u5E95\u5F0F\u786E\u8BA4\u63A8\u8FDB\uFF0C\u4E0D\u80FD\u8BA9\u7528\u6237\u4ECE\u7A7A\u767D\u95EE\u9898\u5F00\u59CB\u5199\u3002",
-    "3. \u5BF9\u6BCF\u4E2A\u4E8B\u5B9E\u6807\u6CE8\u6765\u6E90\uFF1A\u4E0A\u4F20\u8D44\u6599\u3001\u4F01\u4E1A\u5B98\u7F51\u3001\u516C\u5F00\u8D44\u6599\u6216\u884C\u4E1A\u8C03\u7814\u3002",
-    "4. \u5982\u5F53\u524D\u4FE1\u606F\u4E0D\u8DB3\uFF0C\u8BF7\u5C55\u793A\u5DF2\u9884\u586B\u8349\u7A3F\u3001\u7F3A\u53E3\u548C\u53EF\u786E\u8BA4\u95EE\u9898\uFF0C\u7B49\u5F85\u7528\u6237\u786E\u8BA4\u6216\u8865\u5145\u3002",
-    "5. \u6700\u7EC8\u4EA4\u4ED8\u5E94\u6309 skill \u7684 ZIP/Markdown \u77E5\u8BC6\u5E93\u7ED3\u6784\u7EC4\u7EC7\u3002",
-    "",
-    "## socratic-kb-builder.skill",
-    skillInstructions
-  ].join("\n");
-}
-async function createFrontMindTask2({
-  baseUrl,
-  apiKey,
-  prompt,
-  agentProfile,
-  attachments: attachments2
-}) {
-  const taskResponse = await axios5.post(
-    `${baseUrl}/v1/tasks`,
-    {
-      prompt,
-      agentProfile: toUpstreamAgentProfile(agentProfile),
-      taskMode: "agent",
-      attachments: attachments2
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        API_KEY: apiKey,
-        Authorization: `Bearer ${apiKey}`
-      },
-      timeout: 12e4,
-      validateStatus: () => true
-    }
-  );
-  if (taskResponse.status < 200 || taskResponse.status >= 300) {
-    const detail = taskResponse.data?.error?.message || taskResponse.data?.message || `Create task failed (${taskResponse.status})`;
-    return { ok: false, status: taskResponse.status, detail };
-  }
-  const taskData = taskResponse.data || {};
-  const taskId = taskData.id || taskData.task_id;
-  if (!taskId) {
-    return { ok: false, status: 502, detail: "Create task failed: missing task id" };
-  }
-  return {
-    ok: true,
-    task: {
-      id: taskId,
-      status: taskData.status === "failed" ? "error" : taskData.status || "running",
-      taskUrl: taskData.task_url || taskData.metadata?.task_url,
-      title: taskData.task_title || taskData.metadata?.task_title,
-      output: taskData.output || []
-    }
-  };
-}
-router5.post("/start", async (req, res) => {
-  const body = req.body || {};
-  const companyName = String(body.companyName || "").trim();
-  const companyWebsite = String(body.companyWebsite || "").trim();
-  const operatorNotes = String(body.operatorNotes || "").trim();
-  if (!companyName) {
-    res.status(400).json({ error: "Missing company name" });
-    return;
-  }
-  const { apiKey, baseUrl } = getFrontMindCredentials(req);
-  if (!apiKey) {
-    res.status(401).json({ error: "Missing API key" });
-    return;
-  }
-  try {
-    const userAttachments = normalizeUserAttachments2(body.attachments);
-    const created = await createFrontMindTask2({
       baseUrl,
       apiKey,
       prompt: await buildKnowledgeBasePrompt({
@@ -6510,14 +6082,14 @@ router5.post("/start", async (req, res) => {
     res.status(500).json({ error: "\u542F\u52A8\u4F01\u4E1A\u77E5\u8BC6\u5E93\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" });
   }
 });
-var knowledge_base_api_default = router5;
+var knowledge_base_api_default = router4;
 
 // server/prepared-file-router.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
 import { createReadStream as createReadStream3 } from "node:fs";
 import fs7 from "node:fs/promises";
-import { Router as Router5 } from "express";
-var router6 = Router5();
+import { Router as Router4 } from "express";
+var router5 = Router4();
 var DOWNLOAD_TOKEN_TTL_MS = 5 * 60 * 1e3;
 var downloadTokens = /* @__PURE__ */ new Map();
 function parseByteRange(rangeHeader, size) {
@@ -6542,7 +6114,7 @@ function parseByteRange(rangeHeader, size) {
   }
   return { start, end: Math.min(requestedEnd, size - 1) };
 }
-function sanitizeFilename4(filename) {
+function sanitizeFilename3(filename) {
   const source = ["ma", "nus"].join("");
   const replaced = String(filename || "document.pdf").replace(
     new RegExp(source, "gi"),
@@ -6551,7 +6123,7 @@ function sanitizeFilename4(filename) {
   return replaced.replace(/[\\/\0"]/g, "_").trim() || "document.pdf";
 }
 function contentDisposition(disposition, filename) {
-  const safe = sanitizeFilename4(filename);
+  const safe = sanitizeFilename3(filename);
   const encoded = encodeURIComponent(safe);
   return `${disposition}; filename="${encoded}"; filename*=UTF-8''${encoded}`;
 }
@@ -6596,7 +6168,7 @@ function extractSource(fileUrl) {
     "\u65E0\u6CD5\u8BC6\u522B PDF \u6587\u4EF6\u6765\u6E90"
   );
 }
-router6.post("/prepare", async (req, res) => {
+router5.post("/prepare", async (req, res) => {
   try {
     const ownerUserId = req.frontmindUser?.id;
     if (!ownerUserId) {
@@ -6604,7 +6176,7 @@ router6.post("/prepare", async (req, res) => {
       return;
     }
     const fileUrl = String(req.body?.fileUrl || "");
-    const filename = sanitizeFilename4(
+    const filename = sanitizeFilename3(
       String(req.body?.fileName || "document.pdf")
     );
     if (!fileUrl) {
@@ -6652,7 +6224,7 @@ router6.post("/prepare", async (req, res) => {
     sendPreparedError(res, error);
   }
 });
-router6.get("/:assetId/status", async (req, res) => {
+router5.get("/:assetId/status", async (req, res) => {
   try {
     const ownerUserId = req.frontmindUser?.id;
     if (!ownerUserId) {
@@ -6666,7 +6238,7 @@ router6.get("/:assetId/status", async (req, res) => {
     sendPreparedError(res, error);
   }
 });
-router6.post("/:assetId/retry", async (req, res) => {
+router5.post("/:assetId/retry", async (req, res) => {
   try {
     const ownerUserId = req.frontmindUser?.id;
     if (!ownerUserId) {
@@ -6686,7 +6258,7 @@ function cleanupDownloadTokens() {
     if (value.expiresAt <= now) downloadTokens.delete(token);
   }
 }
-router6.post("/:assetId/download-token", async (req, res) => {
+router5.post("/:assetId/download-token", async (req, res) => {
   try {
     cleanupDownloadTokens();
     const ownerUserId = req.frontmindUser?.id;
@@ -6784,7 +6356,7 @@ async function streamPreparedFile(req, res, manifest, disposition) {
   });
   stream.pipe(res);
 }
-router6.get("/download/:token", async (req, res) => {
+router5.get("/download/:token", async (req, res) => {
   try {
     cleanupDownloadTokens();
     const ownerUserId = req.frontmindUser?.id;
@@ -6823,7 +6395,7 @@ router6.get("/download/:token", async (req, res) => {
     sendPreparedError(res, error);
   }
 });
-router6.get("/:assetId/content", async (req, res) => {
+router5.get("/:assetId/content", async (req, res) => {
   try {
     const ownerUserId = req.frontmindUser?.id;
     if (!ownerUserId) {
@@ -6855,7 +6427,7 @@ router6.get("/:assetId/content", async (req, res) => {
     sendPreparedError(res, error);
   }
 });
-router6.head("/:assetId/content", async (req, res) => {
+router5.head("/:assetId/content", async (req, res) => {
   try {
     const ownerUserId = req.frontmindUser?.id;
     if (!ownerUserId) {
@@ -6875,7 +6447,7 @@ router6.head("/:assetId/content", async (req, res) => {
     sendPreparedError(res, error);
   }
 });
-var prepared_file_router_default = router6;
+var prepared_file_router_default = router5;
 
 // server/_core/express-auth.ts
 function sendAuthError(res, status, message, code) {
@@ -7076,12 +6648,6 @@ async function startServer() {
     requireExpressAuth,
     attachOptionalActiveCredential,
     workflow_api_default
-  );
-  app.use(
-    "/api/news-release",
-    requireExpressAuth,
-    resolveUpstreamCredential,
-    news_release_api_default
   );
   app.use(
     "/api/knowledge-base",

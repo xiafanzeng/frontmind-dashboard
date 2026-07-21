@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useAuth } from "@/_core/hooks/useAuth";
 import {
   creditEventBus,
   fetchCreditUsage,
@@ -60,7 +61,9 @@ export default function SettingsDialog({
   const [creditLoading, setCreditLoading] = useState(false);
   const [creditTotal, setCreditTotal] = useState<number | null>(null);
   const [creditTasks, setCreditTasks] = useState<CreditUsageTask[]>([]);
+  const { user } = useAuth();
   const utils = trpc.useUtils();
+  const showCreditUsage = user?.role === "admin" && user.username === "admin";
 
   const statusQuery = trpc.credential.status.useQuery(undefined, {
     enabled: open,
@@ -100,6 +103,8 @@ export default function SettingsDialog({
       setShowApiKey(false);
       setTestResult(null);
       setTestLatencyMs(null);
+      setCreditTotal(null);
+      setCreditTasks([]);
       setMutation.reset();
       replaceMutation.reset();
       testMutation.reset();
@@ -107,6 +112,11 @@ export default function SettingsDialog({
   }, [open]);
 
   useEffect(() => {
+    if (!showCreditUsage) {
+      setCreditTotal(null);
+      setCreditTasks([]);
+      return;
+    }
     if (!open || statusQuery.isLoading) return;
     if (!status.configured) {
       setCreditTotal(null);
@@ -117,20 +127,26 @@ export default function SettingsDialog({
   }, [
     loadCreditUsage,
     open,
+    showCreditUsage,
     status.configured,
     status.fingerprint,
     statusQuery.isLoading,
   ]);
 
-  useEffect(
-    () =>
-      creditEventBus.subscribe(() => {
-        if (open && status.configured) {
-          void loadCreditUsage(true, status.fingerprint);
-        }
-      }),
-    [loadCreditUsage, open, status.configured, status.fingerprint],
-  );
+  useEffect(() => {
+    if (!showCreditUsage) return undefined;
+    return creditEventBus.subscribe(() => {
+      if (open && status.configured) {
+        void loadCreditUsage(true, status.fingerprint);
+      }
+    });
+  }, [
+    loadCreditUsage,
+    open,
+    showCreditUsage,
+    status.configured,
+    status.fingerprint,
+  ]);
 
   const handleSave = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -207,7 +223,9 @@ export default function SettingsDialog({
             API Key 设置
           </DialogTitle>
           <DialogDescription className="break-words text-sm text-muted-foreground">
-            配置并测试 FrontMind API Key，查看当前账号的积分使用情况。
+            {showCreditUsage
+              ? "配置并测试 FrontMind API Key，查看当前账号的积分使用情况。"
+              : "配置并测试 FrontMind API Key，供当前账号安全调用内容智能体。"}
           </DialogDescription>
         </DialogHeader>
 
@@ -234,82 +252,84 @@ export default function SettingsDialog({
             </div>
           </section>
 
-          <section className="rounded-xl border border-primary/10 bg-primary/5 p-4">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                <Coins className="h-4 w-4 text-primary" />近 30 天积分使用
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1.5 px-2.5 text-xs"
-                disabled={!status.configured || creditLoading}
-                onClick={() => void loadCreditUsage(true, status.fingerprint)}
-              >
-                <RefreshCw
-                  className={`h-3.5 w-3.5 ${creditLoading ? "animate-spin" : ""}`}
-                />
-                {creditLoading ? "刷新中" : "刷新积分"}
-              </Button>
-            </div>
-
-            {!status.configured ? (
-              <p className="text-sm text-muted-foreground">
-                配置并验证 API Key 后即可查看积分使用情况。
-              </p>
-            ) : creditLoading && creditTotal === null ? (
-              <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                正在读取积分记录
-              </div>
-            ) : creditTotal !== null ? (
-              <div className="space-y-3">
-                <div className="flex items-end justify-between gap-3 rounded-lg border border-primary/10 bg-background/70 px-3.5 py-3">
-                  <span className="text-sm text-muted-foreground">已使用</span>
-                  <span className="text-xl font-semibold tracking-tight text-primary">
-                    {creditTotal.toLocaleString()} 积分
-                  </span>
+          {showCreditUsage && (
+            <section className="rounded-xl border border-primary/10 bg-primary/5 p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Coins className="h-4 w-4 text-primary" />近 30 天积分使用
                 </div>
-
-                {creditTasks.length > 0 ? (
-                  <div className="space-y-1 border-t border-primary/10 pt-3">
-                    <p className="mb-1.5 text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
-                      最近任务明细
-                    </p>
-                    <div className="custom-scrollbar max-h-[180px] space-y-1 overflow-y-auto">
-                      {creditTasks.map((task) => (
-                        <div
-                          key={task.id}
-                          className="flex min-w-0 items-center justify-between gap-3 rounded-md px-1 py-1 text-[11px]"
-                        >
-                          <span className="min-w-0 flex-1 truncate text-muted-foreground">
-                            {task.title || "未命名任务"}
-                            {task.createdAt && (
-                              <span className="ml-1 text-muted-foreground/50">
-                                {task.createdAt}
-                              </span>
-                            )}
-                          </span>
-                          <span className="shrink-0 font-mono text-foreground/75">
-                            {task.creditUsage}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-xs text-muted-foreground">
-                    最近 30 天暂无已记录的积分消耗。
-                  </p>
-                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 px-2.5 text-xs"
+                  disabled={!status.configured || creditLoading}
+                  onClick={() => void loadCreditUsage(true, status.fingerprint)}
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 ${creditLoading ? "animate-spin" : ""}`}
+                  />
+                  {creditLoading ? "刷新中" : "刷新积分"}
+                </Button>
               </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                暂时无法读取积分记录，请稍后刷新。
-              </p>
-            )}
-          </section>
+
+              {!status.configured ? (
+                <p className="text-sm text-muted-foreground">
+                  配置并验证 API Key 后即可查看积分使用情况。
+                </p>
+              ) : creditLoading && creditTotal === null ? (
+                <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  正在读取积分记录
+                </div>
+              ) : creditTotal !== null ? (
+                <div className="space-y-3">
+                  <div className="flex items-end justify-between gap-3 rounded-lg border border-primary/10 bg-background/70 px-3.5 py-3">
+                    <span className="text-sm text-muted-foreground">已使用</span>
+                    <span className="text-xl font-semibold tracking-tight text-primary">
+                      {creditTotal.toLocaleString()} 积分
+                    </span>
+                  </div>
+
+                  {creditTasks.length > 0 ? (
+                    <div className="space-y-1 border-t border-primary/10 pt-3">
+                      <p className="mb-1.5 text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
+                        最近任务明细
+                      </p>
+                      <div className="custom-scrollbar max-h-[180px] space-y-1 overflow-y-auto">
+                        {creditTasks.map((task) => (
+                          <div
+                            key={task.id}
+                            className="flex min-w-0 items-center justify-between gap-3 rounded-md px-1 py-1 text-[11px]"
+                          >
+                            <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                              {task.title || "未命名任务"}
+                              {task.createdAt && (
+                                <span className="ml-1 text-muted-foreground/50">
+                                  {task.createdAt}
+                                </span>
+                              )}
+                            </span>
+                            <span className="shrink-0 font-mono text-foreground/75">
+                              {task.creditUsage}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      最近 30 天暂无已记录的积分消耗。
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  暂时无法读取积分记录，请稍后刷新。
+                </p>
+              )}
+            </section>
+          )}
 
           <form className="space-y-4" onSubmit={handleSave}>
             <div className="space-y-2">

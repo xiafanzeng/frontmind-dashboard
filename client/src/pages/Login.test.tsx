@@ -36,15 +36,31 @@ describe("Login", () => {
     window.history.replaceState({}, "", "/login");
   });
 
-  it("uses the FrontMind intelligent workflow positioning", () => {
+  it("uses the FrontMind enterprise GEO positioning", () => {
     render(<Login />);
 
     expect(
-      screen.getByRole("heading", { name: "FrontMind 智能体工作流" }),
+      screen.getByText("与 FrontMind 一起，"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("与FrontMind一起，探索当前最强 AI 工作流的能力边界。"),
+      screen.getByText("构筑科研驱动的企业级 GEO 基建"),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByText("体验论文级内容与科研级审美标准"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("香港中文大学（深圳）AI智能决策实验室"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", { name: "香港中文大学（深圳）校徽" }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("presales-login-hint")).toHaveTextContent(
+      "请返回官网完成售前流程，使用售前分配的账号登录。",
+    );
+    expect(screen.getByRole("link", { name: "返回官网" })).toHaveAttribute(
+      "href",
+      "https://www.frontmind.net",
+    );
   });
 
   it("submits the normalized username and password", async () => {

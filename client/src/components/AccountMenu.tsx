@@ -140,7 +140,7 @@ export default function AccountMenu({
                 </p>
               </div>
               <Badge variant="secondary" className="text-[10px]">
-                {user.role === "admin" ? "管理员" : "员工"}
+                {user.role === "admin" ? "管理员" : "用户"}
               </Badge>
             </div>
           </DropdownMenuLabel>

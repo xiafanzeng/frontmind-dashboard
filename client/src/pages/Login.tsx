@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useLocation } from "wouter";
-import { Loader2, LockKeyhole, ShieldCheck, Sparkles } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
@@ -8,8 +8,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-const LOGO_ICON =
-  "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
+const LOGIN_BACKGROUND = "/assets/frontmind-login-background.webp";
+const WORDMARK = "/assets/frontmind-wordmark.svg";
+const CUHKSZ_EMBLEM = "/assets/cuhksz-emblem.png";
 
 export default function Login() {
   const [, setLocation] = useLocation();
@@ -42,87 +43,79 @@ export default function Login() {
   };
 
   return (
-    <main className="relative flex min-h-[100dvh] w-full items-center justify-center overflow-hidden bg-background px-4 py-8 sm:px-6">
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0"
-        style={{
-          background: `radial-gradient(800px circle at 12% 16%, oklch(0.86 0.035 178 / 36%) 0%, transparent 56%),
-                       radial-gradient(720px circle at 92% 84%, oklch(0.92 0.045 58 / 52%) 0%, transparent 55%),
-                       linear-gradient(150deg, oklch(0.99 0.004 83) 0%, oklch(0.955 0.014 83) 100%)`,
-        }}
-      />
-
-      <div className="relative z-10 grid w-full max-w-5xl overflow-hidden rounded-[2rem] border border-border/70 bg-card/80 shadow-[0_32px_90px_oklch(0.22_0.012_255/0.12)] backdrop-blur-xl lg:grid-cols-[1.05fr_0.95fr]">
-        <section className="relative hidden min-h-[620px] overflow-hidden border-r border-border/60 bg-primary px-12 py-12 text-primary-foreground lg:flex lg:flex-col lg:justify-between">
-          <div
-            aria-hidden="true"
-            className="absolute inset-0 opacity-90"
-            style={{
-              background:
-                "radial-gradient(circle at 20% 15%, oklch(0.72 0.07 178 / 35%), transparent 38%), radial-gradient(circle at 85% 85%, oklch(0.62 0.11 58 / 32%), transparent 45%)",
-            }}
+    <main className="relative grid min-h-[100dvh] w-full overflow-hidden bg-[#f4f5f8] lg:grid-cols-[minmax(0,1.75fr)_minmax(420px,0.9fr)]">
+      <section
+        aria-label="FrontMind 智能体工作流"
+        className="relative hidden overflow-hidden bg-[#f5f4f9] lg:block"
+      >
+        <div
+          aria-hidden="true"
+          className="absolute inset-0 translate-y-7 scale-[1.08] bg-cover bg-center bg-no-repeat"
+          style={{ backgroundImage: `url(${LOGIN_BACKGROUND})` }}
+        />
+        <div className="absolute inset-x-8 top-[22%] flex flex-col items-center text-center text-[#31283a]">
+          <img
+            src={WORDMARK}
+            alt="FrontMind"
+            className="h-auto w-[min(50vw,480px)]"
           />
-
-          <div className="relative flex items-center gap-3">
+          <div className="mt-10 h-[3px] w-16 rounded-full bg-[#19bfc5]" />
+          <h1 className="mt-7 tracking-wide">
+            <span className="block text-[34px] font-semibold leading-tight">
+              与 FrontMind 一起，
+            </span>
+            <span className="mt-3 block text-[28px] font-normal leading-tight text-[#31283a]">
+              构筑科研驱动的企业级 GEO 基建
+            </span>
+          </h1>
+          <div className="mt-12 flex items-center gap-3 text-left">
             <img
-              src={LOGO_ICON}
-              alt="FrontMind"
-              className="h-11 w-11 rounded-2xl bg-white/90 shadow-lg ring-1 ring-white/30"
+              src={CUHKSZ_EMBLEM}
+              alt="香港中文大学（深圳）校徽"
+              className="h-12 w-12 shrink-0 rounded-full"
             />
-            <div>
-              <p className="font-semibold tracking-wide">FrontMind Studio</p>
-              <p className="text-xs tracking-[0.18em] text-primary-foreground/60">
-                CONTENT AGENTS
-              </p>
-            </div>
-          </div>
-
-          <div className="relative max-w-md space-y-6">
-            <div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs text-primary-foreground/75">
-              <Sparkles className="h-3.5 w-3.5" />
-              AI AGENT WORKFLOWS
-            </div>
-            <h1 className="text-4xl font-semibold leading-tight tracking-tight">
-              FrontMind 智能体工作流
-            </h1>
-            <p className="text-base leading-7 text-primary-foreground/65">
-              与FrontMind一起，探索当前最强 AI 工作流的能力边界。
+            <p className="text-[17px] font-medium tracking-wide text-[#43384b]">
+              香港中文大学（深圳）AI智能决策实验室
             </p>
           </div>
+        </div>
+      </section>
 
-          <div className="relative flex items-center gap-2 text-xs text-primary-foreground/55">
-            <ShieldCheck className="h-4 w-4" />
-            账号数据与 API Key 均由服务端安全管理
-          </div>
-        </section>
+      <section className="relative flex min-h-[100dvh] items-center justify-center px-5 py-8 sm:px-8 lg:bg-[#f7f7fa]">
+        <div
+          aria-hidden="true"
+          className="absolute inset-0 bg-cover bg-center bg-no-repeat lg:hidden"
+          style={{ backgroundImage: `url(${LOGIN_BACKGROUND})` }}
+        />
+        <div
+          aria-hidden="true"
+          className="absolute inset-0 bg-white/76 backdrop-blur-[3px] lg:hidden"
+        />
 
-        <section className="flex min-h-[540px] items-center px-6 py-10 sm:px-12 lg:min-h-[620px]">
-          <div className="mx-auto w-full max-w-sm">
-            <div className="mb-9 lg:hidden">
-              <img
-                src={LOGO_ICON}
-                alt="FrontMind"
-                className="mb-4 h-11 w-11 rounded-2xl shadow-sm ring-1 ring-border/70"
-              />
-              <p className="text-sm font-semibold">FrontMind Studio</p>
-            </div>
-
-            <div className="mb-8 space-y-2">
-              <div className="mb-5 flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-                <LockKeyhole className="h-5 w-5" />
+        <div className="relative z-10 w-full max-w-[400px] overflow-hidden rounded-lg border border-[#e7e1eb] bg-white shadow-[0_18px_50px_rgb(51_33_61/0.12)]">
+          <header className="bg-[#f4eff8] px-8 pb-6 pt-8 sm:px-9">
+            <img
+              src={WORDMARK}
+              alt="FrontMind"
+              className="h-auto w-[210px] max-w-full"
+            />
+            <div className="mt-5 flex items-end justify-between gap-4">
+              <div>
+                <h2 className="text-base font-medium tracking-wide text-[#31283a]">
+                  账号密码登录
+                </h2>
+                <div className="mt-3 h-0.5 w-7 bg-[#6820a0]" />
               </div>
-              <h2 className="text-2xl font-semibold tracking-tight">
-                欢迎回来
-              </h2>
-              <p className="text-sm text-muted-foreground">
-                使用管理员分配的账号登录工作空间。
-              </p>
+              <p className="pb-3 text-xs text-[#7d7484]">FrontMind 工作空间</p>
             </div>
+          </header>
 
-            <form className="space-y-5" onSubmit={handleSubmit}>
-              <div className="space-y-2">
-                <Label htmlFor="username">用户名</Label>
+          <div className="px-8 pb-7 pt-6 sm:px-9">
+            <form className="space-y-4" onSubmit={handleSubmit}>
+              <div>
+                <Label className="sr-only" htmlFor="username">
+                  用户名
+                </Label>
                 <Input
                   id="username"
                   name="username"
@@ -131,15 +124,17 @@ export default function Login() {
                   autoComplete="username"
                   autoCapitalize="none"
                   spellCheck={false}
-                  placeholder="输入用户名"
+                  placeholder="请输入用户名"
                   disabled={loginPending}
-                  className="h-11 bg-background/70"
+                  className="h-[42px] rounded-[4px] border-[#ddd7e2] bg-white px-3 text-sm shadow-none placeholder:text-[#a9a2ad] focus-visible:border-[#6a2096] focus-visible:ring-[#6a2096]/15"
                   autoFocus
                 />
               </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="password">密码</Label>
+              <div>
+                <Label className="sr-only" htmlFor="password">
+                  密码
+                </Label>
                 <Input
                   id="password"
                   name="password"
@@ -147,15 +142,15 @@ export default function Login() {
                   onChange={(event) => setPassword(event.target.value)}
                   type="password"
                   autoComplete="current-password"
-                  placeholder="输入密码"
+                  placeholder="请输入密码"
                   disabled={loginPending}
-                  className="h-11 bg-background/70"
+                  className="h-[42px] rounded-[4px] border-[#ddd7e2] bg-white px-3 text-sm shadow-none placeholder:text-[#a9a2ad] focus-visible:border-[#6a2096] focus-visible:ring-[#6a2096]/15"
                 />
               </div>
 
               <Button
                 type="submit"
-                className="h-11 w-full gap-2 shadow-sm"
+                className="mt-2 h-[42px] w-full gap-2 rounded-[4px] bg-[#641b96] text-white shadow-none hover:bg-[#511278] focus-visible:ring-[#641b96]/25"
                 disabled={loginPending}
               >
                 {loginPending && <Loader2 className="h-4 w-4 animate-spin" />}
@@ -163,12 +158,22 @@ export default function Login() {
               </Button>
             </form>
 
-            <p className="mt-7 text-center text-xs leading-5 text-muted-foreground/70">
-              无法登录时，请联系管理员重置账号密码。
+            <p
+              data-testid="presales-login-hint"
+              className="mt-5 text-center text-xs leading-6 text-[#8f8795]"
+            >
+              请
+              <a
+                href="https://www.frontmind.net"
+                className="mx-1 inline-flex rounded-[4px] bg-[#641b96] px-2 py-0.5 font-medium text-white transition-colors hover:bg-[#511278] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#641b96]/30"
+              >
+                返回官网
+              </a>
+              完成售前流程，使用售前分配的账号登录。
             </p>
           </div>
-        </section>
-      </div>
+        </div>
+      </section>
     </main>
   );
 }

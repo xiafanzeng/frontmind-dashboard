@@ -75,8 +75,6 @@ interface DeepReportStartInput {
   files: File[];
 }
 
-type OneClickWorkflowMode = "news-release" | "knowledge-base";
-
 function normalizeReportStatus(status: string | undefined): ReportTaskStatus {
   if (status === "failed") return "error";
   if (status === "pending" || status === "completed" || status === "error") return status;
@@ -363,118 +361,6 @@ export default function ChatArea() {
     [addMessage, stopReportPolling, updateAssistantMessages, updateStatus]
   );
 
-  const startNewsRelease = useCallback(
-    async ({ companyName, operatorNotes, agentProfile, files }: DeepReportStartInput) => {
-      if (!activeConversation) return;
-
-      const selectedAgentProfile = agentProfile || "frontmind-pro";
-
-      const conversationId = activeConversation.id;
-      const responseStartedAt = Date.now();
-      stopReportPolling();
-
-      addMessage(conversationId, {
-        id: `msg-news-start-${responseStartedAt}`,
-        role: "user",
-        content: "开始制作品牌新闻稿样例",
-        timestamp: responseStartedAt,
-      });
-      updateTitle(conversationId, "品牌新闻稿样例");
-      updateStatus(conversationId, "running", { startedAt: responseStartedAt });
-
-      try {
-        const uploadedAttachments: Array<{ file_id: string; filename: string }> = [];
-        for (const file of files) {
-          const uploaded = await uploadFile(file);
-          uploadedAttachments.push({
-            file_id: uploaded.fileId,
-            filename: uploaded.filename,
-          });
-        }
-
-        const response = await fetch("/api/news-release/start", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          credentials: "include",
-          body: JSON.stringify({
-            companyName,
-            operatorNotes,
-            agentProfile: selectedAgentProfile,
-            attachments: uploadedAttachments,
-          }),
-        });
-
-        if (!response.ok) {
-          throw new Error(await readErrorMessage(response));
-        }
-
-        const data = (await response.json()) as OneClickTaskStartResponse;
-        if (!data.task?.id) {
-          throw new Error("任务创建失败：未返回任务 ID");
-        }
-
-        const normalizedStatus = normalizeReportStatus(data.task.status);
-        const taskStartedAt = data.startedAt || responseStartedAt;
-        const totalOutputLength = data.task.output?.length || 0;
-
-        updateStatus(conversationId, normalizedStatus, {
-          taskId: data.task.id,
-          taskUrl: data.task.taskUrl,
-          previousResponseId: data.task.id,
-          startedAt: taskStartedAt,
-          lastKnownOutputLength: totalOutputLength,
-        });
-
-        if (data.task.output && data.task.output.length > 0) {
-          const assistantMessages = parseOutputMessages(
-            data.task.output,
-            taskStartedAt,
-            selectedAgentProfile
-          );
-          if (assistantMessages.length > 0) {
-            updateAssistantMessages(conversationId, assistantMessages);
-          }
-        }
-
-        toast.success("已开始制作品牌新闻稿样例", {
-          description: "结果会自动出现在当前内容流程中。",
-          duration: 3200,
-        });
-
-        if (normalizedStatus === "running" || normalizedStatus === "pending") {
-          pollReportTask(conversationId, data.task.id, taskStartedAt, selectedAgentProfile, "品牌新闻稿样例制作完成");
-        } else if (normalizedStatus === "completed") {
-          updateStatus(conversationId, "completed", {
-            completedAt: Date.now(),
-            lastKnownOutputLength: totalOutputLength,
-          });
-          creditEventBus.emit();
-        }
-      } catch (error: any) {
-        const errorMessage = error?.message || "启动失败";
-        updateStatus(conversationId, "error", { completedAt: Date.now() });
-        addMessage(conversationId, {
-          id: `msg-news-start-err-${Date.now()}`,
-          role: "assistant",
-          content: `错误: ${errorMessage}`,
-          timestamp: Date.now(),
-        });
-        toast.error("启动失败", { description: errorMessage });
-      }
-    },
-    [
-      activeConversation,
-      addMessage,
-      pollReportTask,
-      stopReportPolling,
-      updateAssistantMessages,
-      updateStatus,
-      updateTitle,
-    ]
-  );
-
   const startKnowledgeBase = useCallback(
     async ({ companyName, companyWebsite, operatorNotes, agentProfile, files }: DeepReportStartInput) => {
       if (!activeConversation) return;
@@ -613,7 +499,6 @@ export default function ChatArea() {
         <div className="max-w-4xl mx-auto px-3 py-6 space-y-6 sm:px-5 sm:py-8 sm:space-y-7">
           {messages.length === 0 && status === "idle" && (
             <EmptyConversationHint
-              onStartNewsRelease={startNewsRelease}
               onStartKnowledgeBase={startKnowledgeBase}
             />
           )}
@@ -693,15 +578,12 @@ function EmptyState() {
 }
 
 function EmptyConversationHint({
-  onStartNewsRelease,
   onStartKnowledgeBase,
 }: {
-  onStartNewsRelease: (input: DeepReportStartInput) => Promise<void>;
   onStartKnowledgeBase: (input: DeepReportStartInput) => Promise<void>;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [workflowMode, setWorkflowMode] = useState<OneClickWorkflowMode>("news-release");
   const [companyName, setCompanyName] = useState("");
   const [companyWebsite, setCompanyWebsite] = useState("");
   const [agentProfile, setAgentProfile] = useState("frontmind-pro");
@@ -709,12 +591,6 @@ function EmptyConversationHint({
   const [files, setFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
-
-  const isKnowledgeBase = workflowMode === "knowledge-base";
-  const dialogTitle = isKnowledgeBase ? "构建企业知识库" : "制作品牌新闻稿样例";
-  const dialogDescription = isKnowledgeBase
-    ? "填写企业官网、备注并上传企业宣传册，系统会调用知识库构建 skill 开始整理。"
-    : "输入企业名称、备注并上传相关资料，系统会在当前对话中开始制作。";
 
   const addFiles = useCallback((fileList: FileList | File[]) => {
     const incoming = Array.from(fileList);
@@ -749,11 +625,6 @@ function EmptyConversationHint({
     setFiles((current) => current.filter((_, fileIndex) => fileIndex !== index));
   }, []);
 
-  const openWorkflowDialog = useCallback((mode: OneClickWorkflowMode) => {
-    setWorkflowMode(mode);
-    setDialogOpen(true);
-  }, []);
-
   const handleStart = useCallback(async () => {
     const normalizedCompanyName = companyName.trim();
     if (!normalizedCompanyName) {
@@ -770,11 +641,7 @@ function EmptyConversationHint({
         operatorNotes: operatorNotes.trim(),
         files,
       };
-      if (isKnowledgeBase) {
-        await onStartKnowledgeBase(payload);
-      } else {
-        await onStartNewsRelease(payload);
-      }
+      await onStartKnowledgeBase(payload);
       setDialogOpen(false);
       resetDialog();
     } finally {
@@ -785,9 +652,7 @@ function EmptyConversationHint({
     companyName,
     companyWebsite,
     files,
-    isKnowledgeBase,
     onStartKnowledgeBase,
-    onStartNewsRelease,
     operatorNotes,
     resetDialog,
   ]);
@@ -810,16 +675,7 @@ function EmptyConversationHint({
           <div className="flex flex-wrap justify-center gap-3 pt-6">
             <Button
               type="button"
-              onClick={() => openWorkflowDialog("news-release")}
-              className="h-11 rounded-xl px-5 gap-2 shadow-sm"
-            >
-              <Sparkles className="w-4 h-4" />
-              制作品牌新闻稿样例
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => openWorkflowDialog("knowledge-base")}
+              onClick={() => setDialogOpen(true)}
               className="h-11 rounded-xl px-5 gap-2 shadow-sm"
             >
               <BookOpen className="w-4 h-4" />
@@ -845,8 +701,10 @@ function EmptyConversationHint({
         }}
       >
         <DialogContent className="w-[calc(100vw-1rem)] sm:max-w-[560px] max-h-[calc(100dvh-1rem)] overflow-y-auto p-4 sm:p-6">
-          <DialogTitle>{dialogTitle}</DialogTitle>
-          <DialogDescription>{dialogDescription}</DialogDescription>
+          <DialogTitle>构建企业知识库</DialogTitle>
+          <DialogDescription>
+            系统会深度采集官网全站，并检索全网企业情报与图文来源，逐项核验后构建知识库。
+          </DialogDescription>
 
           <div className="space-y-5 py-2">
             <div className="space-y-2">
@@ -865,17 +723,19 @@ function EmptyConversationHint({
               />
             </div>
 
-            {isKnowledgeBase && (
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-foreground/80">企业官网</label>
-                <Input
-                  value={companyWebsite}
-                  onChange={(event) => setCompanyWebsite(event.target.value)}
-                  placeholder="填写企业官网，例如 https://www.example.com"
-                  disabled={isStarting}
-                />
-              </div>
-            )}
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground/80">企业官网入口</label>
+              <Textarea
+                value={companyWebsite}
+                onChange={(event) => setCompanyWebsite(event.target.value)}
+                placeholder="填写一个或多个企业官网，每行一个，例如 https://www.example.com"
+                disabled={isStarting}
+                className="min-h-20 resize-none"
+              />
+              <p className="text-xs leading-5 text-muted-foreground">
+                官网用于全站采集；系统还会自动检索全网公开信息，无需逐个填写外部来源。
+              </p>
+            </div>
 
             <div className="space-y-2">
               <label className="text-sm font-medium text-foreground/80">模型</label>
@@ -914,7 +774,7 @@ function EmptyConversationHint({
               <Textarea
                 value={operatorNotes}
                 onChange={(event) => setOperatorNotes(event.target.value)}
-                placeholder={isKnowledgeBase ? "填写知识库范围、重点产品、目标用途或需要避开的内容" : "填写用户想法、关注点、限制或特别要求"}
+                placeholder="填写知识库范围、重点产品、目标用途或需要避开的内容"
                 disabled={isStarting}
                 className="min-h-24 resize-none"
               />
@@ -922,7 +782,7 @@ function EmptyConversationHint({
 
             <div className="space-y-2">
               <label className="text-sm font-medium text-foreground/80">
-                {isKnowledgeBase ? "企业宣传册" : "资料"}
+                企业宣传册
               </label>
               <div
                 role="button"
@@ -956,10 +816,10 @@ function EmptyConversationHint({
               >
                 <UploadCloud className="mb-3 h-6 w-6 text-primary" />
                 <div className="text-sm font-medium text-foreground/80">
-                  {isKnowledgeBase ? "拖入企业宣传册，或点击选择文件" : "拖入资料，或点击选择文件"}
+                  拖入企业宣传册，或点击选择文件
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
-                  {isKnowledgeBase ? "支持宣传册、产品目录、PPT、图片、PDF、Word 等企业资料" : "支持 PDF、Word、图片、表格等企业资料"}
+                  支持宣传册、产品目录、PPT、图片、PDF、Word 等企业资料
                 </div>
                 <input
                   ref={fileInputRef}
@@ -1026,12 +886,10 @@ function EmptyConversationHint({
             >
               {isStarting ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
-              ) : isKnowledgeBase ? (
-                <BookOpen className="h-4 w-4" />
               ) : (
-                <FileText className="h-4 w-4" />
+                <BookOpen className="h-4 w-4" />
               )}
-              {isKnowledgeBase ? "开始构建" : "开始制作"}
+              开始构建
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -8,7 +8,6 @@ import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 import manusProxy from "../manus-proxy";
 import workflowApi, { cleanupStaleWorkflowUploads } from "../workflow-api";
-import newsReleaseApi from "../news-release-api";
 import knowledgeBaseApi from "../knowledge-base-api";
 import preparedFileRouter from "../prepared-file-router";
 import { preparedFileService } from "../prepared-file-service";
@@ -101,13 +100,6 @@ async function startServer() {
     requireExpressAuth,
     attachOptionalActiveCredential,
     workflowApi,
-  );
-  // One-click homepage news release workflow. Hidden execution prompt is assembled server-side.
-  app.use(
-    "/api/news-release",
-    requireExpressAuth,
-    resolveUpstreamCredential,
-    newsReleaseApi,
   );
   // One-click enterprise knowledge base workflow powered by the Socratic KB skill.
   app.use(

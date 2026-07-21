@@ -170,7 +170,7 @@ export default function AdminUsers() {
                 </h1>
               </div>
               <p className="mt-1 text-sm text-muted-foreground">
-                创建员工账号、重置密码及管理账号生命周期。
+                创建用户账号、重置密码及管理账号生命周期。
               </p>
             </div>
           </div>
@@ -392,7 +392,7 @@ function UserRow({
           {account.role === "admin" ? (
             <ShieldCheck className="mr-1 h-3 w-3" />
           ) : null}
-          {account.role === "admin" ? "管理员" : "员工"}
+          {account.role === "admin" ? "管理员" : "用户"}
         </Badge>
         <Badge variant="outline" className={account.isActive ? "text-emerald-700" : "text-muted-foreground"}>
           {account.isActive ? "已启用" : "已禁用"}
@@ -503,7 +503,7 @@ function CreateUserDialog({
             <Plus className="h-5 w-5 text-primary" />
             创建账号
           </DialogTitle>
-          <DialogDescription>员工首次登录后可以自行修改密码并配置 API Key。</DialogDescription>
+          <DialogDescription>用户首次登录后可以自行修改密码并配置 API Key。</DialogDescription>
         </DialogHeader>
         <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
           <div className="grid gap-4 sm:grid-cols-2">
@@ -552,7 +552,7 @@ function CreateUserDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="user">员工</SelectItem>
+                <SelectItem value="user">用户</SelectItem>
                 <SelectItem value="admin">管理员</SelectItem>
               </SelectContent>
             </Select>

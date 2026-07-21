@@ -2,6 +2,13 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  authUser: {
+    id: 2,
+    username: "regular-user",
+    displayName: "普通用户",
+    role: "user" as "user" | "admin",
+    isActive: true,
+  },
   fetchCreditUsage: vi.fn(),
   subscribe: vi.fn(() => vi.fn()),
   refetchStatus: vi.fn(),
@@ -12,6 +19,10 @@ const mocks = vi.hoisted(() => ({
   resetSet: vi.fn(),
   resetReplace: vi.fn(),
   resetTest: vi.fn(),
+}));
+
+vi.mock("@/_core/hooks/useAuth", () => ({
+  useAuth: () => ({ user: mocks.authUser }),
 }));
 
 vi.mock("@/lib/frontmind-api", () => ({
@@ -69,6 +80,13 @@ import SettingsDialog from "./SettingsDialog";
 describe("SettingsDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.authUser = {
+      id: 2,
+      username: "regular-user",
+      displayName: "普通用户",
+      role: "user",
+      isActive: true,
+    };
     mocks.fetchCreditUsage.mockResolvedValue({
       totalUsed: 128,
       recentTasks: [
@@ -82,18 +100,13 @@ describe("SettingsDialog", () => {
     });
   });
 
-  it("shows account credit usage without exposing a local migration flow", async () => {
+  it("hides usage records for a regular user", () => {
     render(<SettingsDialog open onOpenChange={vi.fn()} />);
 
-    await waitFor(() =>
-      expect(mocks.fetchCreditUsage).toHaveBeenCalledWith({
-        force: false,
-        fingerprint: "key-abcd",
-      }),
-    );
-    expect(await screen.findByText("128 积分")).toBeInTheDocument();
-    expect(screen.getByText("GEO 品牌洞察")).toBeInTheDocument();
     expect(screen.getByText("API Key 使用教程")).toBeInTheDocument();
+    expect(screen.queryByText("近 30 天积分使用")).not.toBeInTheDocument();
+    expect(screen.queryByText("最近任务明细")).not.toBeInTheDocument();
+    expect(mocks.fetchCreditUsage).not.toHaveBeenCalled();
     expect(
       screen.getByRole("button", { name: "测试连接" }),
     ).toBeInTheDocument();
@@ -104,6 +117,44 @@ describe("SettingsDialog", () => {
     ).not.toBeInTheDocument();
     expect(screen.queryByText("检测到旧版本地数据")).not.toBeInTheDocument();
     expect(screen.queryByText("迁移到当前账号")).not.toBeInTheDocument();
+  });
+
+  it("hides usage records for an administrator other than the built-in admin", () => {
+    mocks.authUser = {
+      id: 3,
+      username: "operations-admin",
+      displayName: "运营管理员",
+      role: "admin",
+      isActive: true,
+    };
+
+    render(<SettingsDialog open onOpenChange={vi.fn()} />);
+
+    expect(screen.queryByText("近 30 天积分使用")).not.toBeInTheDocument();
+    expect(screen.queryByText("最近任务明细")).not.toBeInTheDocument();
+    expect(mocks.fetchCreditUsage).not.toHaveBeenCalled();
+  });
+
+  it("shows credit usage and recent tasks only for the built-in admin account", async () => {
+    mocks.authUser = {
+      id: 1,
+      username: "admin",
+      displayName: "系统管理员",
+      role: "admin",
+      isActive: true,
+    };
+
+    render(<SettingsDialog open onOpenChange={vi.fn()} />);
+
+    await waitFor(() =>
+      expect(mocks.fetchCreditUsage).toHaveBeenCalledWith({
+        force: false,
+        fingerprint: "key-abcd",
+      }),
+    );
+    expect(await screen.findByText("128 积分")).toBeInTheDocument();
+    expect(screen.getByText("最近任务明细")).toBeInTheDocument();
+    expect(screen.getByText("GEO 品牌洞察")).toBeInTheDocument();
   });
 
   it("tests the saved credential when the replacement field is empty", async () => {
