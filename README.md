@@ -56,8 +56,8 @@ cp .env.example .env
 
 生产 PDF 运行环境必须从
 [`deploy/1panel-node-pdf/Dockerfile`](./deploy/1panel-node-pdf/Dockerfile)
-构建固定派生镜像，使 Poppler 与 Ghostscript 在容器重建后仍然存在；禁止只在一次性
-运行容器中临时安装系统包。
+构建固定派生镜像，使 Poppler、Ghostscript 与项目声明的精确 pnpm 在容器重建后仍然
+存在；禁止只在一次性运行容器中临时安装系统包或启用包管理器。
 
 本地 `.env` 至少设置 `DATABASE_URL`、`FRONTMIND_CREDENTIAL_ENCRYPTION_KEY`、`FRONTMIND_PRESALES_SERVICE_TOKEN`、`FRONTMIND_PROVISIONING_SERVICE_TOKEN`、`FRONTMIND_MONITOR_API_KEY`、`FRONTMIND_PUBLIC_URL`、`FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET`、`FRONTMIND_ICP_MATERIAL_KEY` 和 `FRONTMIND_ICP_MATERIAL_DIR`。`FRONTMIND_MONITOR_API_KEY` 必须是监控服务专用凭据，生产环境不会回退使用普通售前 Key；`FRONTMIND_PUBLIC_URL` 必须是可供客户浏览器访问的真实 HTTPS 地址，用于生成开户与工作台链接。凭据密钥与 ICP 材料密钥必须分别生成并长期保持不变；两个服务令牌和预检签名密钥都应使用至少 32 位的独立随机值，并只保存在服务端，且不得互相复用。轮换预检签名密钥会使尚未发布的短时预检凭证失效，但不会影响已发布内容。ICP 目录应挂载到第一方私有持久化磁盘，不能由 Web 服务器直接公开。
 

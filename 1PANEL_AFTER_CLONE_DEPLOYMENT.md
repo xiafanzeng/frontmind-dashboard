@@ -52,13 +52,14 @@ Codex 窗口，再把本地文件夹从 `frontmind-agent` 精确改名为：
 | 应用端口        | `3001`                                |
 | 公开域名        | `https://dashboard.frontmind.net`     |
 | Website 域名    | `https://www.frontmind.net`           |
+| MySQL 私有 DNS  | `mysql`（本次生产网络已核验）         |
 | MySQL 数据库    | `frontmind_dashboard`                 |
 | MySQL 用户      | `frontmind_dashboard`                 |
 | Node            | `22.12+`                              |
 | pnpm            | 仓库 `packageManager` 声明的 `10.4.1` |
 
-生产环境的敏感配置只写入 1Panel 运行环境变量界面。不要在服务器创建 `.env`、
-`.env.local` 或 `.env.production`，也不要执行 `cp .env.example .env`。
+生产环境的敏感配置只写入 1Panel 运行环境变量界面。不要在仓库目录或容器 `/app` 创建
+`.env`、`.env.local` 或 `.env.production`，也不要执行 `cp .env.example .env`。
 
 ## 2. 发布前必须具备的代码
 
@@ -112,10 +113,13 @@ private-workflows/response-logic-builder.skill/
 | 旧 DNS | `agent.frontmind.net` 的记录类型、主机记录、记录值和记录 ID |
 | 旧服务器代码 | 规范化后的唯一绝对路径 |
 | 旧数据库 | 数据库实例、精确数据库名 |
-| 旧数据库用户 | 精确用户名和授权来源 |
+| 旧数据库用户 | 完整 `username@host` 主体和 `SHOW GRANTS` 结果 |
 | 旧 prepared-files | 规范化后的唯一绝对路径或卷名 |
 | 旧 dashboard-assets | 规范化后的唯一绝对路径或卷名 |
 | 旧 ICP/其他持久数据 | 每一个规范化绝对路径或卷名，逐项记录 |
+| 旧备份/快照/导出 | 1Panel 任务 ID、快照 ID、规范化导出路径、远端对象及 version ID |
+| 旧自动任务 | 备份、同步、清理和导出的精确计划任务 ID |
+| 旧外部凭据 | 只记录提供方、用途和凭据 ID/名称，不记录或回显真实值 |
 
 清单必须由两人复核，且明确排除 `/frontmind-dashboard`、
 `/srv/frontmind-dashboard/prepared-files`、
@@ -137,9 +141,10 @@ private-workflows/response-logic-builder.skill/
 密码使用独立强随机值。写入 `DATABASE_URL` 时必须进行 URL 编码；例如密码中的 `@`、
 `:`、`/`、`#`、`?`、`%` 不能原样放进 URI。
 
-数据库不映射公网 `3306`。Dashboard 与 MySQL 必须加入同一个私有 Docker 网络，并使用
-1Panel 中实际的 MySQL 服务 DNS 名（下文示例为 `mysql`），不能在 Dashboard 容器中使用
-`127.0.0.1`。
+数据库不映射公网 `3306`。Dashboard 与 MySQL 必须加入同一个私有 Docker 网络。本次已
+在生产私有网络核验 MySQL 服务 DNS 名为固定值 `mysql`，不能在 Dashboard 容器中使用
+`127.0.0.1`。以后若迁移 MySQL 容器，必须先重新核验并同步修订固定参数和数据库目标门，
+不能为通过检查而临时放宽。
 
 ## 5. 创建全新持久目录
 
@@ -249,7 +254,7 @@ DASHBOARD_PDF_IMAGE="frontmind-dashboard-node:22.22.2-pdf-$DASHBOARD_RELEASE_SHA
 docker build \
   --pull=false \
   --build-arg VCS_REF="$DASHBOARD_RELEASE_SHA" \
-  --build-arg IMAGE_VERSION='dashboard-20260728-r1-pdf1' \
+  --build-arg IMAGE_VERSION='dashboard-20260728-r1-pdf2' \
   --tag "$DASHBOARD_PDF_IMAGE" \
   --file /frontmind-dashboard/deploy/1panel-node-pdf/Dockerfile \
   /frontmind-dashboard/deploy/1panel-node-pdf
@@ -267,7 +272,7 @@ test "$(
 test "$(
   docker image inspect "$DASHBOARD_PDF_IMAGE" \
     --format '{{ index .Config.Labels "org.opencontainers.image.version" }}'
-)" = "dashboard-20260728-r1-pdf1"
+)" = "dashboard-20260728-r1-pdf2"
 
 docker image inspect "$DASHBOARD_PDF_IMAGE" \
   --format 'image_id={{.Id}}'
@@ -277,11 +282,14 @@ docker image inspect "$DASHBOARD_PDF_IMAGE" \
 
 ```bash
 docker run --rm \
+  --network none \
   --entrypoint sh \
   "$DASHBOARD_PDF_IMAGE" \
   -lc '
 set -eu
 node --version
+command -v pnpm
+test "$(pnpm --version)" = "10.4.1"
 command -v pdfinfo
 command -v pdftotext
 command -v pdfseparate
@@ -342,20 +350,23 @@ grep -nE '^[[:space:]]*image:' "$DASHBOARD_COMPOSE_FILE"
 ```
 
 在 1Panel 停止 `FrontMind-Dashboard`。使用 1Panel 文件管理器打开上面精确定位的
-`docker-compose.yml`，只把该唯一服务的：
+`docker-compose.yml`。1Panel 当前版本通常把基础镜像写成变量模板：
 
 ```yaml
-image: 1panel/node:22.22.2
+image: 1panel/node:${NODE_VERSION}
 ```
 
-替换为：
+某些版本也可能已经展开为 `image: 1panel/node:22.22.2`。只把实际存在的这一条
+`image:` 替换为：
 
 ```yaml
 image: frontmind-dashboard-node:22.22.2-pdf-<本次40位release SHA>
 ```
 
-不要修改 `run.sh`、1Panel 内部 `.env`、`command`、端口、卷、网络或 `createdBy`
-标签。先只解析镜像名，禁止运行可能展开敏感环境变量的裸 `docker compose config`：
+不要修改 `NODE_VERSION`、`run.sh`、1Panel 内部 `.env`、`command`、端口、卷、网络或
+`createdBy` 标签。这个 1Panel 生成文件可能直接包含生产环境变量和敏感值，禁止复制或
+粘贴完整文件到聊天、工单、日志或截图。先只解析镜像名，禁止运行可能展开敏感环境变量
+的裸 `docker compose config`：
 
 ```bash
 docker compose \
@@ -392,6 +403,16 @@ test "$(
   docker inspect frontmind-dashboard --format '{{.Image}}'
 )" = "$(
   docker image inspect "$DASHBOARD_PDF_IMAGE" --format '{{.Id}}'
+)"
+
+test "$(
+  docker inspect frontmind-dashboard --format '{{.State.Running}}'
+)" = "true"
+test "$(
+  docker inspect frontmind-dashboard --format '{{.State.Restarting}}'
+)" = "false"
+INITIAL_RESTART_COUNT="$(
+  docker inspect frontmind-dashboard --format '{{.RestartCount}}'
 )"
 
 docker exec frontmind-dashboard sh -lc '
@@ -486,8 +507,10 @@ FRONTMIND_RESPONSE_LOGIC_SKILL_PATH=/app/dist/private-workflows/response-logic-b
 ```
 
 这里展示的均为变量名和占位符，不要把真实值粘贴到部署手册、终端共享输出、截图或 Git。
-生产服务器不创建 `.env`、`.env.local` 或 `.env.production`。所有敏感值只保存在
-1Panel 的服务端环境变量配置中。
+用户和应用不得在 `/frontmind-dashboard` 或容器 `/app` 创建 `.env`、`.env.local` 或
+`.env.production`。所有敏感值只通过 1Panel 服务端环境变量界面管理。1Panel 自己可能
+在 `/opt/1panel/runtime/...` 维护内部环境文件并挂载到容器 `/.env`；它不能挂到
+`/app/.env*`，也不得由用户手工读取、编辑、复制或提交。
 
 `FRONTMIND_MONITOR_API_KEY` 是监控专用 Key，只允许出现在 Dashboard 服务端的 1Panel
 环境变量中；禁止写入 Website、前端配置或任何 `VITE_` 变量。两枚 service token 也禁止
@@ -497,32 +520,130 @@ FRONTMIND_RESPONSE_LOGIC_SKILL_PATH=/app/dist/private-workflows/response-logic-b
 代码内已有安全的正式默认地址。只有实际服务提供方要求更换时才配置，且必须是无账号、
 查询参数和 fragment 的 HTTPS URL。
 
+保存并重建后执行无回显运行环境门。它只输出固定成功/错误码，不输出任何环境变量值：
+
+```bash
+docker exec frontmind-dashboard \
+  node /app/scripts/validate-production-runtime.mjs
+```
+
+必须只出现 `RUNTIME_ENV_OK`。任一错误都先修复对应变量名，禁止用 `env`、`printenv`、
+`docker inspect .Config.Env` 或完整 Compose 输出排查。
+
 ## 10. 安装、检查、测试和构建
+
+先确认应用目录没有项目级环境文件，且 1Panel 的内部 `/.env` 没有被挂载到 `/app`。只
+检查路径，不读取文件内容或容器环境：
+
+```bash
+docker exec frontmind-dashboard sh -lc '
+set -eu
+for path in /app/.env*; do
+  if [ "$path" = "/app/.env*" ]; then
+    continue
+  fi
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    echo "PROJECT_ENV_FILE_FORBIDDEN"
+    exit 1
+  fi
+done
+'
+
+if docker inspect frontmind-dashboard \
+  --format '{{range .Mounts}}{{println .Destination}}{{end}}' |
+  grep -Eq '^/app/\.env(?:\.|$)'
+then
+  echo "PROJECT_ENV_MOUNT_FORBIDDEN"
+  exit 1
+fi
+```
+
+1Panel 自己在私有运行目录维护并挂载到 `/.env` 的配置属于面板实现细节，不是项目环境
+文件；不要手工读取、修改或删除它。
 
 在 Dashboard 容器中执行：
 
 ```bash
 docker exec frontmind-dashboard sh -lc \
-  'cd /app && corepack enable && node -v && pnpm -v'
+  'set -eu; cd /app; node -v; test "$(pnpm --version)" = "10.4.1"'
 
-docker exec frontmind-dashboard sh -lc \
-  'cd /app && pnpm install --prod=false --frozen-lockfile'
+docker exec frontmind-dashboard sh -lc '
+set -eu
+cd /app
+env \
+  -u DATABASE_URL \
+  -u FRONTMIND_CREDENTIAL_ENCRYPTION_KEY \
+  -u FRONTMIND_ICP_MATERIAL_KEY \
+  -u FRONTMIND_PRESALES_SERVICE_TOKEN \
+  -u FRONTMIND_PROVISIONING_SERVICE_TOKEN \
+  -u FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET \
+  -u FRONTMIND_MONITOR_API_KEY \
+  pnpm install --prod=false --frozen-lockfile
+'
 
-docker exec frontmind-dashboard sh -lc \
-  'cd /app && pnpm check'
+docker exec frontmind-dashboard sh -lc '
+set -eu
+cd /app
+env \
+  -u DATABASE_URL \
+  -u FRONTMIND_CREDENTIAL_ENCRYPTION_KEY \
+  -u FRONTMIND_ICP_MATERIAL_KEY \
+  -u FRONTMIND_PRESALES_SERVICE_TOKEN \
+  -u FRONTMIND_PROVISIONING_SERVICE_TOKEN \
+  -u FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET \
+  -u FRONTMIND_MONITOR_API_KEY \
+  pnpm check
+'
 
-docker exec frontmind-dashboard sh -lc \
-  'cd /app && pnpm test'
+docker exec frontmind-dashboard sh -lc '
+set -eu
+cd /app
+env \
+  -u DATABASE_URL \
+  -u FRONTMIND_CREDENTIAL_ENCRYPTION_KEY \
+  -u FRONTMIND_ICP_MATERIAL_KEY \
+  -u FRONTMIND_PRESALES_SERVICE_TOKEN \
+  -u FRONTMIND_PROVISIONING_SERVICE_TOKEN \
+  -u FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET \
+  -u FRONTMIND_MONITOR_API_KEY \
+  pnpm test
+'
 
-docker exec frontmind-dashboard sh -lc \
-  'cd /app && FRONTMIND_BUILD_VERSION=dashboard-20260728-r1 pnpm build'
+docker exec frontmind-dashboard sh -lc '
+set -eu
+cd /app
+env \
+  -u DATABASE_URL \
+  -u FRONTMIND_CREDENTIAL_ENCRYPTION_KEY \
+  -u FRONTMIND_ICP_MATERIAL_KEY \
+  -u FRONTMIND_PRESALES_SERVICE_TOKEN \
+  -u FRONTMIND_PROVISIONING_SERVICE_TOKEN \
+  -u FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET \
+  -u FRONTMIND_MONITOR_API_KEY \
+  FRONTMIND_BUILD_VERSION=dashboard-20260728-r1 \
+  pnpm build
+'
 
-docker exec frontmind-dashboard sh -lc \
-  'cd /app && pnpm audit:production'
+docker exec frontmind-dashboard sh -lc '
+set -eu
+cd /app
+env \
+  -u DATABASE_URL \
+  -u FRONTMIND_CREDENTIAL_ENCRYPTION_KEY \
+  -u FRONTMIND_ICP_MATERIAL_KEY \
+  -u FRONTMIND_PRESALES_SERVICE_TOKEN \
+  -u FRONTMIND_PROVISIONING_SERVICE_TOKEN \
+  -u FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET \
+  -u FRONTMIND_MONITOR_API_KEY \
+  pnpm audit:production
+'
 ```
 
 如果 1Panel 实际挂载目录不是 `/app`，以容器中的真实工作目录替换，但 Skill 环境变量也
 必须与生产构建产物绝对路径一致。
+
+这里显式从 `pnpm install`、测试和构建子进程移除所有生产密钥，避免第三方安装脚本、
+测试或前端构建读取真实值；不要删除这些 `env -u`。
 
 验证产物：
 
@@ -535,7 +656,27 @@ test -f /app/dist/public/index.html
 test -f /app/dist/private-workflows/socratic-kb-builder.skill
 test -f /app/dist/private-workflows/brand-question-portfolio.skill/SKILL.md
 test -f /app/dist/private-workflows/response-logic-builder.skill/SKILL.md
+node --check /app/dist/index.js
+node --check /app/dist/pdf-prepare-worker.js
+cmp -s \
+  /app/private-workflows/socratic-kb-builder.skill \
+  /app/dist/private-workflows/socratic-kb-builder.skill
+cmp -s \
+  /app/private-workflows/brand-question-portfolio.skill/SKILL.md \
+  /app/dist/private-workflows/brand-question-portfolio.skill/SKILL.md
+cmp -s \
+  /app/private-workflows/response-logic-builder.skill/SKILL.md \
+  /app/dist/private-workflows/response-logic-builder.skill/SKILL.md
 '
+
+docker exec frontmind-dashboard node -e '
+const value = require("/app/dist/public/__frontmind__/version.json");
+if (value.version !== "dashboard-20260728-r1") process.exit(1);
+console.log("BUILD_VERSION_OK dashboard-20260728-r1");
+'
+
+test -z "$(git -C /frontmind-dashboard status --short)"
+git -C /frontmind-dashboard diff --check
 ```
 
 任何命令失败都不能继续迁移。
@@ -543,7 +684,76 @@ test -f /app/dist/private-workflows/response-logic-builder.skill/SKILL.md
 ## 11. 在空库执行 0000–0034 共 35 个迁移
 
 数据库必须是刚创建且不含旧 Agent 数据的 `frontmind_dashboard`。唯一允许的 schema
-变更命令是：
+变更命令是 `pnpm db:migrate`。
+
+迁移前先核对仓库迁移源：
+
+```bash
+docker exec frontmind-dashboard sh -lc '
+set -eu
+cd /app
+test "$(find drizzle -maxdepth 1 -type f -name "*.sql" | wc -l)" -eq 35
+test -f drizzle/0034_known_scarlet_spider.sql
+'
+
+docker exec frontmind-dashboard node -e '
+const journal = require("/app/drizzle/meta/_journal.json");
+if (journal.entries.length !== 35) process.exit(1);
+if (journal.entries.at(-1)?.tag !== "0034_known_scarlet_spider") process.exit(1);
+console.log("MIGRATION_SOURCE_OK count=35 latest=0034_known_scarlet_spider");
+'
+```
+
+然后通过 Dashboard 容器实际持有的 `DATABASE_URL` 连接数据库，但不打印 URL 或密码。
+必须同时确认数据库名、新用户主体和零表：
+
+```bash
+docker exec frontmind-dashboard node --input-type=module -e '
+import mysql from "mysql2/promise";
+let connection;
+try {
+  const raw = process.env.DATABASE_URL;
+  if (!raw) throw new Error();
+  const target = new URL(raw);
+  if (
+    target.protocol !== "mysql:" ||
+    target.hostname !== "mysql" ||
+    (target.port && target.port !== "3306") ||
+    decodeURIComponent(target.username) !== "frontmind_dashboard" ||
+    target.pathname !== "/frontmind_dashboard" ||
+    target.search ||
+    target.hash ||
+    !target.password
+  ) {
+    throw new Error();
+  }
+  connection = await mysql.createConnection(raw);
+  const [[identity]] = await connection.query(
+    "SELECT DATABASE() AS db, CURRENT_USER() AS principal",
+  );
+  const [[tables]] = await connection.query(
+    "SELECT COUNT(*) AS table_count FROM information_schema.tables WHERE table_schema = DATABASE()",
+  );
+  if (identity.db !== "frontmind_dashboard") {
+    throw new Error();
+  }
+  if (!String(identity.principal).startsWith("frontmind_dashboard@")) {
+    throw new Error();
+  }
+  if (Number(tables.table_count) !== 0) {
+    throw new Error();
+  }
+  console.log(`EMPTY_DATABASE_TARGET_OK ${identity.db} ${identity.principal}`);
+} catch {
+  console.error("EMPTY_DATABASE_CHECK_FAILED");
+  process.exitCode = 1;
+} finally {
+  if (connection) await connection.end().catch(() => {});
+}
+'
+```
+
+只有出现 `MIGRATION_SOURCE_OK` 和 `EMPTY_DATABASE_TARGET_OK` 后才执行：
 
 ```bash
 docker exec -it frontmind-dashboard sh -lc '
@@ -560,24 +770,72 @@ pnpm db:push
 pnpm db:generate
 ```
 
-迁移成功后，在 1Panel 数据库终端核对：
+如果迁移命令非零退出，立即停止，不要直接重跑。MySQL DDL 可能已经部分提交；在仍无新
+业务写入时，只能先审计新库状态，必要时精确重建 Dashboard 自己的新空库后从 `0000`
+重新执行，绝不能使用 `db:push` 或 `db:generate` 修补。
 
-```sql
-SELECT COUNT(*) AS migration_count
-FROM __drizzle_migrations;
+迁移成功后，将数据库账本的 35 行按 `created_at` 与 journal 时间戳、SQL SHA-256
+逐项核对：
 
-SELECT *
-FROM __drizzle_migrations
-ORDER BY id DESC
-LIMIT 5;
-
-SHOW TABLES;
+```bash
+docker exec frontmind-dashboard node --input-type=module -e '
+import mysql from "mysql2/promise";
+import { readMigrationFiles } from "drizzle-orm/migrator";
+let connection;
+try {
+  const expected = readMigrationFiles({ migrationsFolder: "/app/drizzle" });
+  connection = await mysql.createConnection(process.env.DATABASE_URL);
+  const [rows] = await connection.query(
+    "SELECT hash, created_at FROM __drizzle_migrations ORDER BY created_at ASC",
+  );
+  if (expected.length !== 35 || rows.length !== 35) {
+    throw new Error();
+  }
+  for (let index = 0; index < expected.length; index += 1) {
+    if (
+      String(rows[index].hash) !== expected[index].hash ||
+      String(rows[index].created_at) !== String(expected[index].folderMillis)
+    ) {
+      throw new Error();
+    }
+  }
+  console.log(
+    "MIGRATIONS_VERIFIED count=35 latest=0034_known_scarlet_spider",
+  );
+} catch {
+  console.error("MIGRATION_LEDGER_CHECK_FAILED");
+  process.exitCode = 1;
+} finally {
+  if (connection) await connection.end().catch(() => {});
+}
+'
 ```
 
-当前 release 预期 `migration_count = 35`，最新迁移对应 `0034_known_scarlet_spider`。
-空库中除迁移账本外没有任何旧 Agent 客户数据。
+只有出现 `MIGRATIONS_VERIFIED count=35 latest=0034_known_scarlet_spider` 才算完成。
+此时新库已包含新 Dashboard schema，不应再称为“空库”，但不得含任何旧 Agent 客户
+数据。
 
 ## 12. 初始化唯一系统管理员
+
+先确认新库还没有任何用户，防止重复执行初始化：
+
+```bash
+docker exec frontmind-dashboard node --input-type=module -e '
+import mysql from "mysql2/promise";
+let connection;
+try {
+  connection = await mysql.createConnection(process.env.DATABASE_URL);
+  const [[row]] = await connection.query("SELECT COUNT(*) AS count FROM users");
+  if (Number(row.count) !== 0) throw new Error();
+  console.log("ADMIN_INIT_PRECHECK_OK users=0");
+} catch {
+  console.error("ADMIN_INIT_PRECHECK_FAILED");
+  process.exitCode = 1;
+} finally {
+  if (connection) await connection.end().catch(() => {});
+}
+'
+```
 
 在 TTY 中执行，密码不会进入命令历史：
 
@@ -588,59 +846,192 @@ pnpm admin:init -- --username admin --display-name "FrontMind Admin"
 '
 ```
 
-然后核对：
+然后用不返回密码字段的查询断言只有这一名系统管理员：
 
-```sql
-SELECT id, username, displayName, role, adminAccessLevel, isActive
-FROM users
-ORDER BY id;
-```
-
-预期只有刚创建的管理员，且：
-
-```text
-role = admin
-adminAccessLevel = system_admin
-isActive = 1
+```bash
+docker exec frontmind-dashboard node --input-type=module -e '
+import mysql from "mysql2/promise";
+let connection;
+try {
+  connection = await mysql.createConnection(process.env.DATABASE_URL);
+  const [rows] = await connection.query(
+    "SELECT username, role, adminAccessLevel, isActive FROM users ORDER BY id",
+  );
+  if (rows.length !== 1) throw new Error();
+  const [admin] = rows;
+  if (
+    admin.username !== "admin" ||
+    admin.role !== "admin" ||
+    admin.adminAccessLevel !== "system_admin" ||
+    Number(admin.isActive) !== 1
+  ) {
+    throw new Error();
+  }
+  console.log("ADMIN_VERIFIED count=1 role=admin access=system_admin active=1");
+} catch {
+  console.error("ADMIN_VERIFICATION_FAILED");
+  process.exitCode = 1;
+} finally {
+  if (connection) await connection.end().catch(() => {});
+}
+'
 ```
 
 ## 13. 停止旧 Agent，并让 Dashboard 接管 3001
 
 进入维护窗口后先冻结 Website 的支付、开户和所有会写入旧 Agent 的入口。根据第 3 节
 记录的精确运行环境名称，在 1Panel 中停止旧 Agent 并关闭其自动重启；此时只停止，不删除
-任何旧资产。然后确认宿主机 `3001` 已释放：
+任何旧资产。同时停止仍处于 `sleep infinity` 的 `FrontMind-Dashboard`，然后以失败关闭
+方式确认宿主机 `3001` 已释放：
 
 ```bash
-ss -lntp | grep ':3001 ' || true
+if ss -H -lnt 'sport = :3001' | grep -q .; then
+  echo "PORT_3001_STILL_IN_USE"
+  exit 1
+fi
+echo "PORT_3001_RELEASED"
 ```
 
-必须没有监听者。若仍有输出，只根据 1Panel 中核实过的精确容器名称/ID查明来源；不要用
+必须出现 `PORT_3001_RELEASED`。若仍被占用，只根据 1Panel 中核实过的精确容器名称/ID
+查明来源；不要用
 模糊进程匹配或批量停止命令。
 
-在 1Panel 把启动命令从：
+在 1Panel 一次性完成最后的运行参数：
 
-```text
-sleep infinity
-```
+- 启动命令从 `sleep infinity` 改为 `pnpm start`；
+- 宿主机只绑定 `127.0.0.1:3001` 到容器 `3001`，禁止 `0.0.0.0:3001`；
+- 三个 Skill 绝对路径仍指向 `/app/dist/private-workflows/...`；
+- 首次启动不要设置无限自动重启；保留关闭状态或最多使用已有的有界
+  `on-failure:5`，先观察第一次非零退出。
 
-改为：
-
-```text
-pnpm start
-```
-
-启用自动重启策略并重建/重启运行环境。不要另外手工启动第二个 `pnpm start`。
+1Panel 保存环境变量、端口或启动命令时可能重新生成 Compose，并把派生镜像恢复成
+`1panel/node:${NODE_VERSION}`。所以保存后先不要直接启动：重新读取实际 Compose
+标签和文件，按第 7 节再次把唯一 `image:` 改回本次 release SHA 的派生镜像，重新执行
+`config --services`、`config --images`，再只对精确 `node` service 执行
+`up -d --force-recreate --pull never`。不要另外手工启动第二个 `pnpm start`。
 
 检查：
 
 ```bash
-docker logs --tail 200 frontmind-dashboard
-curl -fsS http://127.0.0.1:3001/healthz
+DASHBOARD_RELEASE_SHA="$(git -C /frontmind-dashboard rev-parse HEAD)"
+DASHBOARD_PDF_IMAGE="frontmind-dashboard-node:22.22.2-pdf-$DASHBOARD_RELEASE_SHA"
+
+test "$(
+  docker inspect frontmind-dashboard --format '{{.Image}}'
+)" = "$(
+  docker image inspect "$DASHBOARD_PDF_IMAGE" --format '{{.Id}}'
+)"
+
+docker exec frontmind-dashboard sh -lc '
+set -eu
+test "$(pnpm --version)" = "10.4.1"
+test -d /app/node_modules
+test -f /app/dist/index.js
+test -f /app/dist/pdf-prepare-worker.js
+command -v pdfinfo
+command -v pdftotext
+command -v pdfseparate
+command -v pdfunite
+command -v gs
+'
+
+docker exec frontmind-dashboard \
+  node /app/scripts/validate-production-runtime.mjs
+
+docker inspect frontmind-dashboard --format '{{json .Mounts}}' |
+  docker exec -i frontmind-dashboard node -e '
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => { input += chunk; });
+process.stdin.on("end", () => {
+  const mounts = JSON.parse(input);
+  const expected = new Map([
+    ["/var/lib/frontmind/prepared-files", "/srv/frontmind-dashboard/prepared-files"],
+    ["/var/lib/frontmind/dashboard-assets", "/srv/frontmind-dashboard/dashboard-assets"],
+    ["/var/lib/frontmind/icp-materials", "/srv/frontmind-dashboard/icp-materials"],
+  ]);
+  for (const [destination, source] of expected) {
+    const mount = mounts.find(item => item.Destination === destination);
+    if (!mount || mount.Source !== source || mount.RW !== true) process.exit(1);
+  }
+  console.log("PERSISTENT_MOUNTS_OK");
+});
+'
+
+docker exec frontmind-dashboard sh -lc '
+set -eu
+for directory in \
+  /var/lib/frontmind/prepared-files \
+  /var/lib/frontmind/dashboard-assets \
+  /var/lib/frontmind/icp-materials
+do
+  test -d "$directory"
+  test -w "$directory"
+  probe="$(mktemp "$directory/.frontmind-write-test.XXXXXX")"
+  rm -f -- "$probe"
+done
+echo "PERSISTENT_MOUNTS_WRITABLE"
+'
+
+docker inspect frontmind-dashboard \
+  --format '{{json .NetworkSettings.Networks}}' |
+  docker exec -i frontmind-dashboard node -e '
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => { input += chunk; });
+process.stdin.on("end", () => {
+  const networks = JSON.parse(input);
+  const network = networks["1panel-network"];
+  if (!network || !network.Aliases?.includes("frontmind-dashboard")) {
+    process.exit(1);
+  }
+  console.log("PRIVATE_NETWORK_ALIAS_OK");
+});
+'
+
+docker exec frontmind-dashboard getent hosts mysql >/dev/null
+docker exec frontmind-dashboard getent hosts frontmind-dashboard >/dev/null
+
+test "$(
+  docker port frontmind-dashboard 3001/tcp
+)" = "127.0.0.1:3001"
+
+docker inspect frontmind-dashboard \
+  --format 'status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} restarts={{.RestartCount}}'
+
+READY=false
+for attempt in $(seq 1 60); do
+  if test "$(
+    docker inspect frontmind-dashboard --format '{{.State.Running}}'
+  )" != "true"; then
+    break
+  fi
+  if docker exec frontmind-dashboard node --input-type=module -e '
+const response = await fetch("http://127.0.0.1:3001/healthz");
+const payload = await response.json();
+if (!response.ok || payload?.status !== "ok") process.exit(1);
+' >/dev/null 2>&1
+  then
+    READY=true
+    break
+  fi
+  sleep 1
+done
+test "$READY" = "true"
+test "$(
+  docker inspect frontmind-dashboard --format '{{.RestartCount}}'
+)" = "$INITIAL_RESTART_COUNT"
+echo "LOCAL_DASHBOARD_READY"
 ```
 
 启动日志不得包含数据库密码、API Key 或 service token。
 `pnpm start` 如果初始化失败必须以非零状态退出；1Panel 必须显示启动失败/不健康，禁止用
 `|| true`、守护循环或其他包装吞掉退出码。
+
+如果状态不是持续 `running` 或健康检查失败，只在服务器私有控制台本地检查
+`docker logs --tail 200 frontmind-dashboard`，不要复制原始日志到聊天、工单或截图。健康
+稳定后才能启用最终自动重启策略；该 UI 保存若再次重建 Compose，仍须重复派生镜像、
+pnpm、产物、PDF、端口和健康检查。
 
 ## 14. 配置 dashboard.frontmind.net
 
@@ -668,9 +1059,15 @@ proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 ```
 
-Website 通过私有 Docker DNS 调用内部接口，因此公网代理应拒绝：
+Website 通过私有 Docker DNS 调用内部接口，因此公网代理必须同时拒绝无尾斜杠入口和
+全部子路径。下面两个 `location` 都要放在网站的同一个 `server {}` 内，并与反向代理的
+`location /` 同级，不能嵌套在 `location /` 内：
 
 ```nginx
+location = /api/internal {
+    return 404;
+}
+
 location ^~ /api/internal/ {
     return 404;
 }
@@ -680,11 +1077,22 @@ location ^~ /api/internal/ {
 
 ```bash
 curl -fsS https://dashboard.frontmind.net/healthz
-curl -sS -o /dev/null -w '%{http_code}\n' \
-  https://dashboard.frontmind.net/api/internal/presales/status
+for path in \
+  /api/internal \
+  /api/internal/presales/status \
+  /api/internal/provisioning/payment-receipts/ready \
+  /api/internal/not-public
+do
+  code="$(
+    curl -sS -o /dev/null -w '%{http_code}' \
+      "https://dashboard.frontmind.net$path"
+  )"
+  test "$code" = "404"
+  echo "PUBLIC_INTERNAL_404_OK $path"
+done
 ```
 
-第二条应为 `404`，不能公开内部 service-token 接口。
+四条都必须为 `404`，不能是由应用返回的 `401`、`403` 或上游正文。
 
 ## 15. Dashboard 健康门
 
@@ -707,23 +1115,53 @@ curl -fsS https://dashboard.frontmind.net/healthz | jq -e '
 '
 ```
 
-先在 Dashboard 容器内部验证三条受保护接口；命令中的变量只在容器内展开，不会把 token
-写进宿主机命令历史：
+`/healthz` 不检查管理员录入的售前 API Key。管理员完成第 16 节的“验证并启用”后，
+还必须在 Dashboard 容器内部验证三条受保护接口。以下检查直接由 Node 进程从环境读取
+token，不把真实值放进宿主机命令历史或 `curl` 子进程参数，只输出就绪标记：
 
 ```bash
-docker exec frontmind-dashboard sh -lc '
-set -eu
-curl -fsS \
-  -H "x-frontmind-service-token: $FRONTMIND_PRESALES_SERVICE_TOKEN" \
-  http://127.0.0.1:3001/api/internal/presales/status
-
-curl -fsS \
-  -H "x-frontmind-provisioning-token: $FRONTMIND_PROVISIONING_SERVICE_TOKEN" \
-  http://127.0.0.1:3001/api/internal/provisioning/payment-receipts/ready
-
-curl -fsS \
-  -H "x-frontmind-provisioning-token: $FRONTMIND_PROVISIONING_SERVICE_TOKEN" \
-  http://127.0.0.1:3001/api/internal/provisioning/project-orders/ready
+docker exec frontmind-dashboard node --input-type=module -e '
+const checks = [
+  {
+    name: "PRESALES",
+    url: "http://127.0.0.1:3001/api/internal/presales/status",
+    header: "x-frontmind-service-token",
+    token: process.env.FRONTMIND_PRESALES_SERVICE_TOKEN,
+    valid: p =>
+      p?.ok === true &&
+      p?.credentialConfigured === true &&
+      p?.monitorCredentialConfigured === true &&
+      p?.publicUrlConfigured === true,
+  },
+  {
+    name: "PAYMENT_LEDGER",
+    url: "http://127.0.0.1:3001/api/internal/provisioning/payment-receipts/ready",
+    header: "x-frontmind-provisioning-token",
+    token: process.env.FRONTMIND_PROVISIONING_SERVICE_TOKEN,
+    valid: p => p?.schemaVersion === 1 && p?.ready === true,
+  },
+  {
+    name: "PROJECT_LEDGER",
+    url: "http://127.0.0.1:3001/api/internal/provisioning/project-orders/ready",
+    header: "x-frontmind-provisioning-token",
+    token: process.env.FRONTMIND_PROVISIONING_SERVICE_TOKEN,
+    valid: p => p?.schemaVersion === 1 && p?.ready === true,
+  },
+];
+for (const c of checks) {
+  if (!c.token) throw new Error(`${c.name}_TOKEN_MISSING`);
+  const response = await fetch(c.url, {
+    headers: { [c.header]: c.token },
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {}
+  if (!response.ok || !c.valid(payload)) {
+    throw new Error(`${c.name}_NOT_READY_HTTP_${response.status}`);
+  }
+  console.log(`${c.name}_READY`);
+}
 '
 ```
 
@@ -736,11 +1174,12 @@ curl -fsS \
 5. 测试通过后点击“验证并启用”。
 6. 刷新页面，确认 Key 已由 Dashboard 加密保存到新数据库，界面只显示脱敏状态且不回显
    完整 Key。
-7. 使用非客户、非敏感 canary 内容创建一个 Base 任务，轮询到完成并下载结果。
-8. 用专用监控 Key 发起单平台固定 5 次回答的监控 canary，确认答案、引用和来源可渲染。
-9. 删除 canary 任务，确认不会再次扣费或因重试重复提交。
+7. 执行第 15 节的三条内部就绪检查，确认 `PRESALES_READY`、两个账本就绪标记全部出现。
+8. 继续部署并重新构建 Website；真实 Base 和监控 canary 从 Website 执行，放在恢复正式
+   流量之前。
 
-只完成“连接测试”不代表 API 链路已验收；必须至少完成一次真实任务和一次真实监控。
+只完成“连接测试”不代表 API 链路已验收；最终仍必须至少完成一次真实任务和一次真实
+监控，但 Dashboard 售前页面本身不负责创建 Base。
 
 ## 17. Website 对接值
 
@@ -758,20 +1197,55 @@ VITE_CLIENT_PORTAL_URL=https://dashboard.frontmind.net/login
 `VITE_CLIENT_PORTAL_URL` 是浏览器构建时变量，必须在 Website 构建前存在。service token
 绝不能带 `VITE_` 前缀。
 
-Website 配置并启动后，再从 Website 容器验证真实私有 DNS、网络和两枚 token：
+Website 配置并完成新的生产构建、启动后，先从 1Panel 或 `docker ps` 核对 Website 的
+精确容器名，不要猜大小写。下面用已核实的名称替换 `<Website精确容器名>`，验证真实
+私有 DNS、网络和两枚 token：
 
 ```bash
-docker exec FrontMind-Website sh -lc '
-set -eu
-curl -fsS \
-  -H "x-frontmind-service-token: $FRONTMIND_PRESALES_SERVICE_TOKEN" \
-  http://frontmind-dashboard:3001/api/internal/presales/status
-curl -fsS \
-  -H "x-frontmind-provisioning-token: $FRONTMIND_PROVISIONING_SERVICE_TOKEN" \
-  http://frontmind-dashboard:3001/api/internal/provisioning/payment-receipts/ready
-curl -fsS \
-  -H "x-frontmind-provisioning-token: $FRONTMIND_PROVISIONING_SERVICE_TOKEN" \
-  http://frontmind-dashboard:3001/api/internal/provisioning/project-orders/ready
+docker exec <Website精确容器名> getent hosts frontmind-dashboard
+
+docker exec <Website精确容器名> node --input-type=module -e '
+const checks = [
+  {
+    name: "PRESALES",
+    url: "http://frontmind-dashboard:3001/api/internal/presales/status",
+    header: "x-frontmind-service-token",
+    token: process.env.FRONTMIND_PRESALES_SERVICE_TOKEN,
+    valid: p =>
+      p?.ok === true &&
+      p?.credentialConfigured === true &&
+      p?.monitorCredentialConfigured === true &&
+      p?.publicUrlConfigured === true,
+  },
+  {
+    name: "PAYMENT_LEDGER",
+    url: "http://frontmind-dashboard:3001/api/internal/provisioning/payment-receipts/ready",
+    header: "x-frontmind-provisioning-token",
+    token: process.env.FRONTMIND_PROVISIONING_SERVICE_TOKEN,
+    valid: p => p?.schemaVersion === 1 && p?.ready === true,
+  },
+  {
+    name: "PROJECT_LEDGER",
+    url: "http://frontmind-dashboard:3001/api/internal/provisioning/project-orders/ready",
+    header: "x-frontmind-provisioning-token",
+    token: process.env.FRONTMIND_PROVISIONING_SERVICE_TOKEN,
+    valid: p => p?.schemaVersion === 1 && p?.ready === true,
+  },
+];
+for (const c of checks) {
+  if (!c.token) throw new Error(`${c.name}_TOKEN_MISSING`);
+  const response = await fetch(c.url, {
+    headers: { [c.header]: c.token },
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {}
+  if (!response.ok || !c.valid(payload)) {
+    throw new Error(`${c.name}_NOT_READY_HTTP_${response.status}`);
+  }
+  console.log(`${c.name}_READY`);
+}
 '
 ```
 
@@ -796,11 +1270,18 @@ curl -fsS \
    完成。
 10. Website 容器通过 `frontmind-dashboard:3001` 成功调用内部接口，Website 重新构建并
     部署后，支付、开户和跳转 Dashboard 的完整链路通过。
-11. 为新 `frontmind_dashboard` 和三个新持久目录建立新系统首份备份，并完成可恢复性
-    检查；备份中不得混入旧 Agent 数据。
+11. 从 Website 使用非客户、非敏感 canary 完成 Base ZIP 与 20 题、单平台固定 5 次
+    监控及引用/来源渲染、现状评估与四周预测、支付回执、项目订单、开户、导入和普通
+    用户简略看板；清理 canary 后确认重试没有重复扣费或重复提交。
+12. 为新 `frontmind_dashboard` 和三个新持久目录建立同一恢复点的首份备份；在隔离
+    数据库和隔离临时目录中完成真实恢复演练，绝不能覆盖在线新库或在线目录。确认新的
+    凭据加密密钥和 ICP 密钥可从受控密码管理恢复，否则数据库/ICP 备份不可用。备份中
+    不得混入旧 Agent 数据。
 
 以上结果需记录 release SHA、构建版本、验收时间和验收人。全部通过后才解除 Website
-维护/冻结状态并恢复正式流量。
+维护/冻结状态并恢复正式流量。不要在同一个维护窗口立即删除旧资产；先书面确定稳定
+观察窗口（默认至少 24 小时且覆盖一次真实业务检查），窗口内持续通过全部健康门后再
+进入永久退役。
 
 ## 19. 永久退役旧 Agent
 
@@ -813,22 +1294,31 @@ curl -fsS \
 1. 再次确认旧 Agent 已停止且自动重启关闭，并确认 `3001` 的唯一监听者是
    `FrontMind-Dashboard`。
 2. 在 1Panel 中删除清单所列的旧 Agent 运行环境；删除前逐字比对运行环境名称和容器
-   ID，确认不是 `FrontMind-Dashboard`。
+   ID，确认不是 `FrontMind-Dashboard`。删除弹窗不得勾选含义不明确的级联删除数据、
+   卷或共享镜像选项。
 3. 在 1Panel 中删除 `agent.frontmind.net` 对应的精确网站、反向代理和证书绑定；随后在
    DNS 控制台按清单中的精确记录 ID 删除 `agent.frontmind.net` DNS 记录。不得影响
    `dashboard.frontmind.net` 或 `www.frontmind.net`。
 4. 对旧服务器代码目录执行只读核对：显示其规范化绝对路径、挂载来源和一级内容，并确认
-   路径不等于 `/frontmind-dashboard`、`/srv/frontmind-dashboard`、`/` 或其他父目录。
-   只在 1Panel 文件管理器中选中清单记录的那个精确旧代码目录删除。
-5. 在 1Panel 数据库界面逐字核对数据库实例、旧数据库名和旧数据库用户名；确认
-   Dashboard 当前连接的是 `frontmind_dashboard` 后，先删除旧数据库用户及其授权，再
-   删除旧数据库。不得删除 `frontmind_dashboard` 或其用户。
+   `realpath -e` 结果、`findmnt`、symlink 状态和所有容器 Mount Source；确认路径不等于、
+   不包含且不指向 `/frontmind-dashboard`、`/srv/frontmind-dashboard`、三个新目录、
+   `/` 或其他父目录，并确认没有新容器引用。只在 1Panel 文件管理器中选中清单记录的
+   那个精确旧叶子目录删除。
+5. 在 1Panel 数据库界面逐字核对数据库实例、旧数据库名、完整旧 `username@host` 主体
+   和 `SHOW GRANTS`；确认该主体未被 Website、新 Dashboard 或其他数据库共享，且
+   Dashboard 当前连接的是 `frontmind_dashboard`。先撤销旧库授权并删除该精确旧用户
+   主体，再删除旧数据库。发现共享授权立即停止；不得删除 `frontmind_dashboard` 或其
+   用户。
 6. 分别核对旧 `prepared-files`、旧 `dashboard-assets`、旧 ICP 目录及清单中的其他旧
    持久目录/卷。每个目标都要显示规范化绝对路径或精确卷名，确认不指向三个
-   `/srv/frontmind-dashboard/...` 新目录后，在 1Panel 中逐项删除。
-7. 删除清单所列的旧 Agent 备份、快照和导出副本，确保不能从遗留副本恢复旧客户数据；
-   新 Dashboard 的备份必须保留。
-8. 重新执行 Dashboard、Website 私有接口、公网 `/api/internal/* = 404`、登录和账本
+   `/srv/frontmind-dashboard/...` 新目录后，在 1Panel 中逐项删除。命名卷还必须先
+   `inspect` 并确认没有任何其他容器引用。
+7. 先按精确计划任务 ID 停用旧 Agent 的备份、快照、同步、清理和导出任务；再按任务
+   ID、快照 ID、规范化导出路径、远端 bucket/object/version ID 逐个永久删除旧副本。
+   若远端存储有版本控制或回收站，还要确认永久删除语义。不得删除新 Dashboard 的备份。
+8. 在上游提供方按凭据 ID/名称撤销只属于旧 Agent 的外部 Key 和 token，不读取、不
+   回显真实值；共享情况不清楚时立即停止。
+9. 重新执行 Dashboard、Website 私有接口、公网 `/api/internal/* = 404`、登录和账本
    健康检查，确认退役动作未影响新系统。
 
 禁止使用通配符、变量展开、前缀匹配、批量容器/数据库删除或宽泛 `rm -rf`。本文故意不
@@ -860,21 +1350,12 @@ git -C /frontmind-dashboard status --short --branch
 git -C /frontmind-dashboard pull --ff-only origin main
 ```
 
-然后在容器中：
-
-```bash
-docker exec frontmind-dashboard sh -lc \
-  'cd /app && pnpm install --prod=false --frozen-lockfile'
-docker exec frontmind-dashboard sh -lc 'cd /app && pnpm check'
-docker exec frontmind-dashboard sh -lc 'cd /app && pnpm test'
-docker exec frontmind-dashboard sh -lc \
-  'cd /app && FRONTMIND_BUILD_VERSION=<本次固定Release-ID> pnpm build'
-docker exec frontmind-dashboard sh -lc 'cd /app && pnpm audit:production'
-docker exec frontmind-dashboard sh -lc 'cd /app && pnpm db:migrate'
-```
-
-全部成功后才从 1Panel 重启。schema 变更仍然只允许 `pnpm db:migrate`；禁止
+然后原样执行第 10 节带完整 `env -u` 的安装、检查、测试、固定版本构建、产物验证和
+审计，不能让这些子进程继承生产密钥。确认目标数据库和迁移源后，schema 变更仍然只允许
+`pnpm db:migrate`；禁止
 `pnpm db:push`、`pnpm db:generate`、服务器临时改代码和并行启动第二个 Node 进程。
+全部成功后才从 1Panel 重启；任何 1Panel UI 保存后都要重新确认固定派生镜像没有被
+恢复为基础镜像。
 
 ## 22. 完成标准
 
@@ -888,7 +1369,8 @@ docker exec frontmind-dashboard sh -lc 'cd /app && pnpm db:migrate'
   35 个迁移；未执行 `db:push` 或 `db:generate`。
 - [ ] 三个全新 `/srv/frontmind-dashboard/...` 持久目录正确挂载。
 - [ ] 凭据加密密钥、ICP 密钥和 service token 均为全新值且只存放于 1Panel 服务端
-  环境变量；生产服务器不存在 `.env`、`.env.local` 或 `.env.production`。
+  环境变量；仓库目录和容器 `/app` 不存在 `.env`、`.env.local` 或 `.env.production`，
+  1Panel 内部运行配置未被挂入 `/app`。
 - [ ] 售前 API Key 已由管理员在 Dashboard 售前页面录入并加密保存；
   `FRONTMIND_MONITOR_API_KEY` 只存在于 Dashboard 服务端环境变量。
 - [ ] 五个 PDF 命令均存在，Dashboard `/healthz` 和三个运行时 Skill 全部通过。

@@ -15,7 +15,8 @@
     "db:migrate": "drizzle-kit migrate",
     "db:push": "pnpm db:generate && pnpm db:migrate",
     "db:cleanup-expired": "tsx scripts/cleanup-expired-conversations.ts",
-    "admin:init": "tsx scripts/init-admin.ts"
+    "admin:init": "tsx scripts/init-admin.ts",
+    "runtime:preflight": "node scripts/validate-production-runtime.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1095.0",
