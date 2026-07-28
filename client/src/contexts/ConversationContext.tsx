@@ -182,7 +182,14 @@ function conversationReducer(
                 previousResponseId:
                   action.payload.previousResponseId ?? c.previousResponseId,
                 startedAt: action.payload.startedAt ?? c.startedAt,
-                completedAt: action.payload.completedAt ?? c.completedAt,
+                completedAt:
+                  action.payload.completedAt !== undefined
+                    ? action.payload.completedAt
+                    : (action.payload.status === "running" ||
+                          action.payload.status === "pending") &&
+                        action.payload.startedAt !== undefined
+                      ? undefined
+                      : c.completedAt,
                 lastKnownOutputLength:
                   action.payload.lastKnownOutputLength ??
                   c.lastKnownOutputLength,

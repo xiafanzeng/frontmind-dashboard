@@ -8,9 +8,15 @@ import {
   conversations,
   messages,
   upstreamResources,
+  userUsageOwners,
+  users,
   type MessageMetadata,
 } from "../drizzle/schema";
-import { getDecryptedCredentialForUser } from "./auth-service";
+import {
+  credentialMayServeAccount,
+  getEffectiveDecryptedCredentialForAccount,
+  isUpstreamApiKeyShared,
+} from "./auth-service";
 import { getDb } from "./db";
 import { protectedProcedure, router } from "./_core/trpc";
 import { getUpstreamBaseUrl } from "./upstream-config";
@@ -148,12 +154,26 @@ export async function permanentlyDeleteConversation(
 }
 
 async function getActiveCredentialId(executor: any, userId: number) {
+  const accountRows = await executor
+    .select({ role: users.role })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  let credentialOwnerId = userId;
+  if (accountRows[0]?.role === "user") {
+    const ownerRows = await executor
+      .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
+      .from(userUsageOwners)
+      .where(eq(userUsageOwners.userId, userId))
+      .limit(1);
+    credentialOwnerId = ownerRows[0]?.deliveryAdminId ?? userId;
+  }
   const rows = await executor
     .select({ id: apiCredentials.id })
     .from(apiCredentials)
     .where(
       and(
-        eq(apiCredentials.userId, userId),
+        eq(apiCredentials.userId, credentialOwnerId),
         eq(apiCredentials.status, "active"),
         eq(apiCredentials.validationStatus, "verified"),
         isNull(apiCredentials.deletedAt)
@@ -552,18 +572,13 @@ async function persistSnapshot(
   }
 
   if (hasUpstreamResources && apiCredentialId) {
-    const credentialRows = await executor
-      .select({ status: apiCredentials.status })
-      .from(apiCredentials)
-      .where(
-        and(
-          eq(apiCredentials.id, apiCredentialId),
-          eq(apiCredentials.userId, userId),
-        ),
-      )
-      .limit(1);
-    const credential = credentialRows[0];
-    if (!credential || credential.status === "deleted") {
+    if (
+      !(await credentialMayServeAccount(
+        executor,
+        userId,
+        apiCredentialId,
+      ))
+    ) {
       throw new TRPCError({
         code: "PRECONDITION_FAILED",
         message: "该会话原来使用的 API Key 已不可用",
@@ -787,11 +802,21 @@ async function prepareLegacyImport(
   const unknown = resources.filter(
     resource => !known.has(upstreamResourceKey(resource.kind, resource.id)),
   );
-  const credential = await getDecryptedCredentialForUser(userId);
+  const credential = await getEffectiveDecryptedCredentialForAccount(userId);
   if (!credential) {
     throw new TRPCError({
       code: "PRECONDITION_FAILED",
       message: "请先迁移或配置该会话原来使用的 API Key，再导入历史会话",
+    });
+  }
+  if (
+    unknown.length > 0 &&
+    (await isUpstreamApiKeyShared(userId, credential.fingerprint))
+  ) {
+    throw new TRPCError({
+      code: "PRECONDITION_FAILED",
+      message:
+        "共享 API Key 无法证明未知历史任务或文件的账号归属，请由系统管理员完成迁移",
     });
   }
   await validateWithBoundedConcurrency(unknown, credential.apiKey);

@@ -3,18 +3,8 @@
  * Features: File type icon, file info, download button, inline PDF viewer,
  *           HTML file rendering, text file preview.
  */
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useState,
-  useEffect,
-} from "react";
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { lazy, Suspense, useCallback, useState, useEffect } from "react";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import {
   FileText,
@@ -45,10 +35,28 @@ function getFileIcon(mimeType: string | undefined, fileName: string) {
   if (mimeType?.startsWith("video/")) return File;
   if (mimeType?.startsWith("audio/")) return File;
   if (mimeType?.includes("pdf")) return FileText;
-  if (mimeType?.includes("zip") || mimeType?.includes("tar") || mimeType?.includes("rar")) return FileArchive;
-  if (mimeType?.includes("json") || mimeType?.includes("xml") || mimeType?.includes("html") || mimeType?.includes("css") || mimeType?.includes("javascript")) return FileCode;
-  if (mimeType?.includes("sheet") || mimeType?.includes("excel") || mimeType?.includes("csv")) return FileSpreadsheet;
-  if (mimeType?.includes("word") || mimeType?.includes("document")) return FileText;
+  if (
+    mimeType?.includes("zip") ||
+    mimeType?.includes("tar") ||
+    mimeType?.includes("rar")
+  )
+    return FileArchive;
+  if (
+    mimeType?.includes("json") ||
+    mimeType?.includes("xml") ||
+    mimeType?.includes("html") ||
+    mimeType?.includes("css") ||
+    mimeType?.includes("javascript")
+  )
+    return FileCode;
+  if (
+    mimeType?.includes("sheet") ||
+    mimeType?.includes("excel") ||
+    mimeType?.includes("csv")
+  )
+    return FileSpreadsheet;
+  if (mimeType?.includes("word") || mimeType?.includes("document"))
+    return FileText;
 
   const ext = fileName.split(".").pop()?.toLowerCase();
   switch (ext) {
@@ -95,7 +103,8 @@ function formatFileSize(bytes: number | undefined): string {
   if (!bytes) return "";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
@@ -111,15 +120,23 @@ function isHtmlFile(mimeType: string | undefined, fileName: string): boolean {
   return ext === "html" || ext === "htm";
 }
 
-function isPreviewableFile(mimeType: string | undefined, fileName: string): boolean {
+function isPreviewableFile(
+  mimeType: string | undefined,
+  fileName: string,
+): boolean {
   return isPdfFile(mimeType, fileName) || isHtmlFile(mimeType, fileName);
 }
 
-function buildProxyDownloadUrl(fileUrl: string, fileName?: string, asDownload = false): string | null {
+function buildProxyDownloadUrl(
+  fileUrl: string,
+  fileName?: string,
+  asDownload = false,
+): string | null {
   try {
     const parsed = new URL(fileUrl, window.location.origin);
     if (parsed.pathname.endsWith("/api/frontmind/proxy-download")) {
-      if (fileName) parsed.searchParams.set("filename", sanitizeBrandText(fileName));
+      if (fileName)
+        parsed.searchParams.set("filename", sanitizeBrandText(fileName));
       if (asDownload) parsed.searchParams.set("download", "1");
       return `${parsed.pathname}${parsed.search}`;
     }
@@ -148,17 +165,22 @@ function nativeDownload(url: string, fileName: string) {
 /**
  * Fetch a file from the API with proper auth headers and return a blob URL.
  * This is needed because iframe src can't send custom headers.
- * 
+ *
  * The server proxy at /api/frontmind/v1/files/:id now:
  * 1. Fetches file metadata from FrontMind API
  * 2. Uses the upload_url (S3) to download binary content
  * 3. Returns binary content with correct content-type
- * 
+ *
  * As a safety fallback, if we still get JSON metadata, we extract
  * the upload_url and fetch from S3 via the proxy-download endpoint.
  */
-async function fetchFileAsBlob(fileId: string, fileName?: string): Promise<string> {
-  const url = buildProxyDownloadUrl(fileId, fileName, false) || `/api/frontmind/v1/files/${fileId}`;
+async function fetchFileAsBlob(
+  fileId: string,
+  fileName?: string,
+): Promise<string> {
+  const url =
+    buildProxyDownloadUrl(fileId, fileName, false) ||
+    `/api/frontmind/v1/files/${fileId}`;
 
   const response = await fetch(url, {
     credentials: "include",
@@ -176,7 +198,9 @@ async function fetchFileAsBlob(fileId: string, fileName?: string): Promise<strin
       const data = JSON.parse(text);
       if (data.upload_url) {
         // Got metadata - fetch binary from S3 via proxy
-        const proxyUrl = buildProxyDownloadUrl(data.upload_url, fileName, false) || `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
+        const proxyUrl =
+          buildProxyDownloadUrl(data.upload_url, fileName, false) ||
+          `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
         const s3Response = await fetch(proxyUrl, {
           credentials: "include",
         });
@@ -195,7 +219,6 @@ async function fetchFileAsBlob(fileId: string, fileName?: string): Promise<strin
   const blob = await response.blob();
   return URL.createObjectURL(blob);
 }
-
 
 async function createDirectDownloadUrl(fileId: string): Promise<string> {
   const response = await fetch("/api/frontmind/download-token", {
@@ -269,7 +292,11 @@ export default function FilePreview({
         }
         setLoadingPreview(false);
       } else if (file.fileId) {
-        const proxyUrl = buildProxyDownloadUrl(file.fileId, displayFileName, false);
+        const proxyUrl = buildProxyDownloadUrl(
+          file.fileId,
+          displayFileName,
+          false,
+        );
         if (proxyUrl) {
           fetchFileAsBlob(proxyUrl, displayFileName)
             .then((url) => {
@@ -306,7 +333,16 @@ export default function FilePreview({
         URL.revokeObjectURL(blobUrl);
       }
     };
-  }, [isOpen, file.fileId, file.file, file.base64, file.blobUrl, isPreviewable, isPdf, displayFileName]);
+  }, [
+    isOpen,
+    file.fileId,
+    file.file,
+    file.base64,
+    file.blobUrl,
+    isPreviewable,
+    isPdf,
+    displayFileName,
+  ]);
 
   const handleDownload = useCallback(async () => {
     if (isPdf) {
@@ -342,7 +378,11 @@ export default function FilePreview({
       }
 
       if (file.fileId) {
-        const proxiedExternalUrl = buildProxyDownloadUrl(file.fileId, downloadName, true);
+        const proxiedExternalUrl = buildProxyDownloadUrl(
+          file.fileId,
+          downloadName,
+          true,
+        );
         if (proxiedExternalUrl) {
           nativeDownload(proxiedExternalUrl, downloadName);
           return;
@@ -374,7 +414,7 @@ export default function FilePreview({
         className={cn(
           "flex items-center gap-2.5 px-3 py-2.5 rounded-2xl bg-card/80 border border-border/70 shadow-sm",
           "hover:bg-secondary/70 hover:border-primary/25 transition-all cursor-pointer group",
-          className
+          className,
         )}
         onClick={() => setIsOpen(true)}
         role="button"
@@ -389,9 +429,7 @@ export default function FilePreview({
             {displayFileName}
           </p>
           {fileSize && (
-            <p className="text-[10px] text-muted-foreground/50">
-              {fileSize}
-            </p>
+            <p className="text-xs text-muted-foreground/50">{fileSize}</p>
           )}
         </div>
         {showDownload && (
@@ -418,9 +456,13 @@ export default function FilePreview({
           showCloseButton={false}
           className={cn(
             "p-0 flex flex-col overflow-hidden",
-            isPreviewable ? "sm:max-w-[800px]" : "max-w-md"
+            isPreviewable ? "sm:max-w-[800px]" : "max-w-md",
           )}
-          style={isPreviewable ? { width: 800, height: 640, maxWidth: "95vw", maxHeight: "95vh" } : undefined}
+          style={
+            isPreviewable
+              ? { width: 800, height: 640, maxWidth: "95vw", maxHeight: "95vh" }
+              : undefined
+          }
         >
           <DialogTitle className="sr-only">{displayFileName}</DialogTitle>
 
@@ -440,7 +482,11 @@ export default function FilePreview({
                   file.blobUrl ||
                   file.base64 ||
                   (file.fileId
-                    ? buildProxyDownloadUrl(file.fileId, displayFileName, false) ||
+                    ? buildProxyDownloadUrl(
+                        file.fileId,
+                        displayFileName,
+                        false,
+                      ) ||
                       (file.fileId.startsWith("/") ||
                       /^https?:\/\//i.test(file.fileId)
                         ? file.fileId
@@ -460,7 +506,7 @@ export default function FilePreview({
                     {displayFileName}
                   </span>
                   {fileSize && (
-                    <span className="text-[10px] text-muted-foreground/50 ml-1">
+                    <span className="text-xs text-muted-foreground/50 ml-1">
                       {fileSize}
                     </span>
                   )}
@@ -478,7 +524,12 @@ export default function FilePreview({
                     )}
                     下载
                   </button>
-                  <Button variant="ghost" size="icon" onClick={() => setIsOpen(false)} className="w-8 h-8">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setIsOpen(false)}
+                    className="w-8 h-8"
+                  >
                     <X className="w-4 h-4" />
                   </Button>
                 </div>
@@ -488,14 +539,24 @@ export default function FilePreview({
                 {loadingPreview ? (
                   <div className="flex items-center justify-center h-full">
                     <Loader2 className="w-8 h-8 animate-spin text-primary/50" />
-                    <span className="ml-2 text-sm text-muted-foreground">加载文件中...</span>
+                    <span className="ml-2 text-sm text-muted-foreground">
+                      加载文件中...
+                    </span>
                   </div>
                 ) : previewError ? (
                   <div className="flex flex-col items-center justify-center h-full gap-3">
                     <FileText className="w-12 h-12 text-muted-foreground/30" />
-                    <p className="text-sm text-muted-foreground">文件加载失败</p>
-                    <p className="text-xs text-muted-foreground/60">{previewError}</p>
-                    <Button onClick={handleDownload} variant="outline" size="sm">
+                    <p className="text-sm text-muted-foreground">
+                      文件加载失败
+                    </p>
+                    <p className="text-xs text-muted-foreground/60">
+                      {previewError}
+                    </p>
+                    <Button
+                      onClick={handleDownload}
+                      variant="outline"
+                      size="sm"
+                    >
                       <Download className="w-4 h-4 mr-1" />
                       直接下载
                     </Button>
@@ -523,9 +584,7 @@ export default function FilePreview({
                 {displayFileName}
               </h3>
               {fileSize && (
-                <p className="text-sm text-muted-foreground mb-4">
-                  {fileSize}
-                </p>
+                <p className="text-sm text-muted-foreground mb-4">{fileSize}</p>
               )}
 
               {/* Actions - only download */}

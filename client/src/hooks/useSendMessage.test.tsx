@@ -143,6 +143,32 @@ describe("useSendMessage", () => {
     expect(assistantError?.content).not.toContain("API Key 是否正确");
   });
 
+  it("explains that shared service credentials are valid while attachments remain account-scoped", async () => {
+    mocks.createTask.mockRejectedValueOnce(
+      new Error(
+        "附件不属于当前账号或使用了不同的 API Key，请重新上传该附件",
+      ),
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("continue with attachment", []);
+    });
+
+    const assistantError = mocks.addMessage.mock.calls.find(
+      ([, message]) => message.role === "assistant",
+    )?.[1];
+    expect(assistantError?.content).toContain(
+      "多个账号可以共享服务连接",
+    );
+    expect(assistantError?.content).toContain("附件仍按账号隔离");
+    expect(assistantError?.content).toContain("当前账号重新上传");
+    expect(assistantError?.content).not.toContain(
+      "检查设置中的 API Key 是否正确",
+    );
+  });
+
   it("does not retry createTask or start polling after timeout", async () => {
     mocks.createTask.mockRejectedValueOnce(
       new Error("请求超时 (300s)，API 服务器响应过慢。可尝试重新发送。"),
@@ -159,6 +185,10 @@ describe("useSendMessage", () => {
     expect(mocks.updateStatus).toHaveBeenLastCalledWith(
       "test-conv-id",
       "error",
+      expect.objectContaining({
+        startedAt: expect.any(Number),
+        completedAt: expect.any(Number),
+      }),
     );
   });
 
@@ -219,11 +249,14 @@ describe("useSendMessage", () => {
     expect(mocks.uploadFile.mock.calls[0][0]).toBe(originalImage);
 
     const input = mocks.createTask.mock.calls[0][0][0].content;
-    expect(input).toContainEqual({
-      type: "input_file",
-      file_id: "file-original.png",
-      filename: "original.png",
-    });
+    expect(input).toContainEqual(
+      expect.objectContaining({
+        type: "input_file",
+        file_id: "file-original.png",
+        filename: "original.png",
+        mime_type: "image/png",
+      }),
+    );
     expect(input.some((item: any) => item.type === "input_image")).toBe(false);
   });
 
@@ -263,11 +296,14 @@ describe("useSendMessage", () => {
       type: "input_text",
       text: "附件 ZIP 中包含用户上传的原始参考图片，请解压后读取图片内容作为参考。",
     });
-    expect(input).toContainEqual({
-      type: "input_file",
-      file_id: "file-frontmind-original-images-20260706.zip",
-      filename: "frontmind-original-images-20260706.zip",
-    });
+    expect(input).toContainEqual(
+      expect.objectContaining({
+        type: "input_file",
+        file_id: "file-frontmind-original-images-20260706.zip",
+        filename: "frontmind-original-images-20260706.zip",
+        mime_type: "application/zip",
+      }),
+    );
   });
 
   it("does not create a task when file upload fails", async () => {

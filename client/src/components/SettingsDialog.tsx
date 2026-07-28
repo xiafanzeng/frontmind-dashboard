@@ -17,6 +17,10 @@ import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
 import {
+  isDeliveryAdminAccount,
+  isSystemAdminAccount,
+} from "@/lib/admin-access";
+import {
   creditEventBus,
   fetchCreditUsage,
   type CreditUsageTask,
@@ -63,10 +67,11 @@ export default function SettingsDialog({
   const [creditTasks, setCreditTasks] = useState<CreditUsageTask[]>([]);
   const { user } = useAuth();
   const utils = trpc.useUtils();
-  const showCreditUsage = user?.role === "admin" && user.username === "admin";
+  const showCreditUsage =
+    isSystemAdminAccount(user) || isDeliveryAdminAccount(user);
 
   const statusQuery = trpc.credential.status.useQuery(undefined, {
-    enabled: open,
+    enabled: open && showCreditUsage,
     retry: false,
     refetchOnWindowFocus: false,
   });
@@ -84,6 +89,7 @@ export default function SettingsDialog({
         const result = await fetchCreditUsage({
           force,
           fingerprint: fingerprint || undefined,
+          accountId: user?.id,
         });
         setCreditTotal(result.totalUsed);
         setCreditTasks(result.recentTasks);
@@ -94,7 +100,7 @@ export default function SettingsDialog({
         setCreditLoading(false);
       }
     },
-    [],
+    [user?.id],
   );
 
   useEffect(() => {
@@ -214,6 +220,24 @@ export default function SettingsDialog({
     onOpenChange(nextOpen);
   };
 
+  if (!showCreditUsage) {
+    return (
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className="w-[min(calc(100vw-1rem),460px)] max-w-[calc(100vw-1rem)] border-border/50 p-5 sm:p-6">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 pr-8 text-lg">
+              <Settings className="h-5 w-5 text-primary" />
+              智能服务设置
+            </DialogTitle>
+            <DialogDescription className="text-sm leading-6 text-muted-foreground">
+              智能服务由负责管理员统一维护，您可以直接使用当前套餐已开放的功能。
+            </DialogDescription>
+          </DialogHeader>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-h-[calc(100dvh-1rem)] w-[min(calc(100vw-1rem),560px)] max-w-[calc(100vw-1rem)] overflow-y-auto overflow-x-hidden border-border/50 p-4 sm:p-6">
@@ -223,9 +247,7 @@ export default function SettingsDialog({
             API Key 设置
           </DialogTitle>
           <DialogDescription className="break-words text-sm text-muted-foreground">
-            {showCreditUsage
-              ? "配置并测试 FrontMind API Key，查看当前账号的积分使用情况。"
-              : "配置并测试 FrontMind API Key，供当前账号安全调用内容智能体。"}
+            配置并测试 FrontMind API Key，查看当前账号的积分使用情况。
           </DialogDescription>
         </DialogHeader>
 
@@ -243,7 +265,7 @@ export default function SettingsDialog({
                 "验证并保存后，即可跨设备安全使用",
               ].map((step, index) => (
                 <div key={step} className="flex min-w-0 items-start gap-2">
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/10 text-[11px] font-semibold text-primary">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
                     {index + 1}
                   </span>
                   <span className="min-w-0 break-words">{step}</span>
@@ -256,7 +278,8 @@ export default function SettingsDialog({
             <section className="rounded-xl border border-primary/10 bg-primary/5 p-4">
               <div className="mb-3 flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 text-sm font-medium">
-                  <Coins className="h-4 w-4 text-primary" />近 30 天积分使用
+                  <Coins className="h-4 w-4 text-primary" />
+                  当前 Key 本月总积分
                 </div>
                 <Button
                   type="button"
@@ -284,8 +307,14 @@ export default function SettingsDialog({
                 </div>
               ) : creditTotal !== null ? (
                 <div className="space-y-3">
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    同一 API Key 可供多个账号共享。总积分反映整个 Key
+                    池的消耗，最近任务明细仅显示当前账号创建的任务。
+                  </p>
                   <div className="flex items-end justify-between gap-3 rounded-lg border border-primary/10 bg-background/70 px-3.5 py-3">
-                    <span className="text-sm text-muted-foreground">已使用</span>
+                    <span className="text-sm text-muted-foreground">
+                      已使用
+                    </span>
                     <span className="text-xl font-semibold tracking-tight text-primary">
                       {creditTotal.toLocaleString()} 积分
                     </span>
@@ -293,14 +322,14 @@ export default function SettingsDialog({
 
                   {creditTasks.length > 0 ? (
                     <div className="space-y-1 border-t border-primary/10 pt-3">
-                      <p className="mb-1.5 text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
+                      <p className="mb-1.5 text-xs uppercase tracking-[0.14em] text-muted-foreground/70">
                         最近任务明细
                       </p>
                       <div className="custom-scrollbar max-h-[180px] space-y-1 overflow-y-auto">
                         {creditTasks.map((task) => (
                           <div
                             key={task.id}
-                            className="flex min-w-0 items-center justify-between gap-3 rounded-md px-1 py-1 text-[11px]"
+                            className="flex min-w-0 items-center justify-between gap-3 rounded-md px-1 py-1 text-xs"
                           >
                             <span className="min-w-0 flex-1 truncate text-muted-foreground">
                               {task.title || "未命名任务"}
@@ -319,7 +348,7 @@ export default function SettingsDialog({
                     </div>
                   ) : (
                     <p className="text-xs text-muted-foreground">
-                      最近 30 天暂无已记录的积分消耗。
+                      本月暂无已记录的积分消耗。
                     </p>
                   )}
                 </div>
@@ -375,13 +404,13 @@ export default function SettingsDialog({
                   )}
                 </button>
               </div>
-              <p className="text-[11px] leading-relaxed text-muted-foreground">
+              <p className="text-xs leading-relaxed text-muted-foreground">
                 {status.configured
                   ? "当前账号已配置 Key；留空可直接测试现有连接，填写新 Key 后可验证并更换。"
                   : "Key 验证通过后会加密保存，登录同一账号即可在其他设备使用。"}
               </p>
               {statusQuery.error && (
-                <p className="flex items-center gap-1.5 text-[11px] text-destructive">
+                <p className="flex items-center gap-1.5 text-xs text-destructive">
                   <XCircle className="h-3.5 w-3.5" />
                   无法读取当前配置，请刷新页面后重试。
                 </p>
@@ -391,7 +420,7 @@ export default function SettingsDialog({
             {status.configured && (
               <div className="flex items-start gap-2.5 rounded-xl border border-border/50 bg-muted/20 p-3">
                 <Info className="mt-0.5 h-4 w-4 shrink-0 text-primary/70" />
-                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                <p className="text-xs leading-relaxed text-muted-foreground">
                   更换后，新会话会使用新的 Key；已有会话仍保留原有凭据关联。
                 </p>
               </div>

@@ -14,7 +14,14 @@ import {
   getSessionTokenFromRequest,
   loginWithPassword,
   revokeSessionToken,
+  setupManagedUserPassword,
+  validateManagedAccountSetupToken,
 } from "./auth-service";
+import {
+  PurchaseProvisioningError,
+  setupWebsiteAccountPassword,
+  validateWebsiteAccountSetupToken,
+} from "./provisioning-v2-service";
 
 const passwordSchema = z
   .string()
@@ -39,8 +46,12 @@ export function toTrpcError(error: unknown): TRPCError {
     case "ACCOUNT_DISABLED":
       return new TRPCError({ code: "FORBIDDEN", message: error.message });
     case "RATE_LIMITED":
-      return new TRPCError({ code: "TOO_MANY_REQUESTS", message: error.message });
+      return new TRPCError({
+        code: "TOO_MANY_REQUESTS",
+        message: error.message,
+      });
     case "CONFLICT":
+    case "IDEMPOTENCY_PENDING":
     case "LAST_ADMIN":
       return new TRPCError({ code: "CONFLICT", message: error.message });
     case "NOT_FOUND":
@@ -67,7 +78,7 @@ export const authRouter = router({
       z.object({
         username: z.string().trim().min(1).max(64),
         password: z.string().min(1).max(MAX_PASSWORD_LENGTH),
-      })
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       try {
@@ -76,7 +87,7 @@ export const authRouter = router({
         const result = await loginWithPassword(
           input.username,
           input.password,
-          clientAddress
+          clientAddress,
         );
         ctx.res.cookie(COOKIE_NAME, result.token, {
           ...getSessionCookieOptions(ctx.req),
@@ -88,6 +99,65 @@ export const authRouter = router({
           expiresAt: result.session.expiresAt,
         };
       } catch (error) {
+        throw toTrpcError(error);
+      }
+    }),
+
+  setupAccount: publicProcedure
+    .input(
+      z.object({
+        token: z.string().trim().min(16).max(4096),
+        newPassword: passwordSchema,
+      }),
+    )
+    .mutation(async ({ input }) => {
+      try {
+        return input.token.includes(".")
+          ? await setupWebsiteAccountPassword({
+              token: input.token,
+              password: input.newPassword,
+            })
+          : await setupManagedUserPassword({
+              token: input.token,
+              password: input.newPassword,
+            });
+      } catch (error) {
+        if (error instanceof PurchaseProvisioningError) {
+          throw new TRPCError({
+            code:
+              error.status === 404
+                ? "NOT_FOUND"
+                : error.status === 503
+                  ? "INTERNAL_SERVER_ERROR"
+                  : "BAD_REQUEST",
+            message: error.message,
+            cause: error,
+          });
+        }
+        throw toTrpcError(error);
+      }
+    }),
+
+  validateSetupAccount: publicProcedure
+    .input(z.object({ token: z.string().trim().min(16).max(4096) }))
+    .query(async ({ input }) => {
+      try {
+        return input.token.includes(".")
+          ? await validateWebsiteAccountSetupToken({ token: input.token })
+          : await validateManagedAccountSetupToken({ token: input.token });
+      } catch (error) {
+        if (error instanceof PurchaseProvisioningError) {
+          throw new TRPCError({
+            code:
+              error.status === 404
+                ? "NOT_FOUND"
+                : error.status === 503
+                  ? "INTERNAL_SERVER_ERROR"
+                  : "BAD_REQUEST",
+            message: error.message,
+            cause: error,
+          });
+        }
         throw toTrpcError(error);
       }
     }),
@@ -107,7 +177,7 @@ export const authRouter = router({
       z.object({
         currentPassword: z.string().min(1).max(128),
         newPassword: passwordSchema,
-      })
+      }),
     )
     .mutation(async ({ ctx, input }) => {
       try {
@@ -115,7 +185,7 @@ export const authRouter = router({
           ctx.user.id,
           input.currentPassword,
           input.newPassword,
-          getSessionTokenFromRequest(ctx.req)
+          getSessionTokenFromRequest(ctx.req),
         );
         return { success: true } as const;
       } catch (error) {

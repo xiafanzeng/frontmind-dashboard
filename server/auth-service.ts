@@ -8,22 +8,19 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { parse as parseCookieHeader } from "cookie";
-import {
-  and,
-  desc,
-  eq,
-  gt,
-  isNull,
-  ne,
-} from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne } from "drizzle-orm";
 import type { Request } from "express";
 import { COOKIE_NAME } from "../shared/const";
+import { isExplicitAdminAccessLevel } from "../shared/admin-access";
 import {
   apiCredentials,
   apiKeyOwnership,
   conversations,
+  presalesApiCredentials,
   sessions,
   upstreamResources,
+  userPasswordSetupTokens,
+  userUsageOwners,
   users,
   type ApiCredential,
   type UpstreamResource,
@@ -33,6 +30,7 @@ import { getDb } from "./db";
 import { getUpstreamBaseUrl } from "./upstream-config";
 
 export const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+export const MANAGED_ACCOUNT_SETUP_DURATION_MS = 48 * 60 * 60 * 1000;
 
 const SCRYPT_VERSION = "v1";
 const SCRYPT_N = 16_384;
@@ -49,6 +47,7 @@ export type AuthServiceErrorCode =
   | "CONFLICT"
   | "DATABASE_UNAVAILABLE"
   | "INVALID_CREDENTIAL"
+  | "IDEMPOTENCY_PENDING"
   | "INVALID_MASTER_KEY"
   | "INVALID_PASSWORD"
   | "LAST_ADMIN"
@@ -60,11 +59,49 @@ export class AuthServiceError extends Error {
   constructor(
     public readonly code: AuthServiceErrorCode,
     message: string,
-    public readonly retryAfterMs?: number
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = "AuthServiceError";
   }
+}
+
+export type UsageOwnerAdminMutation =
+  | "change_access_level"
+  | "deactivate"
+  | "delete";
+
+/**
+ * A delivery administrator is the runtime credential and billing parent for
+ * every row in `user_usage_owners`. That relationship must be transferred
+ * explicitly before the administrator account can stop serving that role.
+ */
+export function assertAdminHasNoUsageOwnedUsers(input: {
+  ownedUserCount: number;
+  mutation: UsageOwnerAdminMutation;
+}) {
+  if (input.ownedUserCount <= 0) return;
+
+  const actionLabel =
+    input.mutation === "change_access_level"
+      ? "调整管理员权限"
+      : input.mutation === "deactivate"
+        ? "停用管理员"
+        : "删除管理员";
+  throw new AuthServiceError(
+    "CONFLICT",
+    `该交付管理员仍负责用户，请先转移这些用户的 Key 与积分归属，再${actionLabel}`,
+  );
+}
+
+export function assertAdminHasNoHistoricalCredentialResources(
+  referencedResourceCount: number,
+) {
+  if (referencedResourceCount <= 0) return;
+  throw new AuthServiceError(
+    "CONFLICT",
+    "该管理员的历史 Key 仍关联客户任务或文件，不能永久删除；可以停用账号并保留历史成果",
+  );
 }
 
 export type AuthenticatedUser = Omit<
@@ -87,6 +124,8 @@ export type AuthenticatedUser = Omit<
 > & {
   username: string;
   displayName: string | null;
+  /** Missing or null values never confer administrator access. */
+  adminAccessLevel?: User["adminAccessLevel"];
 };
 
 export type DecryptedCredential = {
@@ -124,6 +163,7 @@ function toAuthenticatedUser(user: User): AuthenticatedUser {
     email: user.email,
     loginMethod: user.loginMethod,
     role: user.role,
+    adminAccessLevel: user.adminAccessLevel,
     isActive: user.isActive,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
@@ -136,7 +176,7 @@ async function requireDb() {
   if (!db) {
     throw new AuthServiceError(
       "DATABASE_UNAVAILABLE",
-      "Database is not configured"
+      "Database is not configured",
     );
   }
   return db;
@@ -157,7 +197,7 @@ function runScrypt(password: string, salt: Buffer): Promise<Buffer> {
       (error, derivedKey) => {
         if (error) reject(error);
         else resolve(derivedKey);
-      }
+      },
     );
   });
 }
@@ -180,24 +220,45 @@ export async function hashPassword(password: string): Promise<string> {
   ].join("$");
 }
 
-export async function verifyPassword(
-  password: string,
-  encodedHash: string
-): Promise<boolean> {
+export function isSupportedPasswordHash(encodedHash: string): boolean {
   const parts = encodedHash.split("$");
-  if (parts.length !== 7 || parts[0] !== "scrypt" || parts[1] !== SCRYPT_VERSION) {
+  if (
+    parts.length !== 7 ||
+    parts[0] !== "scrypt" ||
+    parts[1] !== SCRYPT_VERSION ||
+    Number(parts[2]) !== SCRYPT_N ||
+    Number(parts[3]) !== SCRYPT_R ||
+    Number(parts[4]) !== SCRYPT_P
+  ) {
     return false;
   }
+  try {
+    const canonicalBase64 = (value: string, length: number) => {
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+      const decoded = Buffer.from(value, "base64");
+      return decoded.length === length && decoded.toString("base64") === value;
+    };
+    return (
+      canonicalBase64(parts[5]!, 16) &&
+      canonicalBase64(parts[6]!, SCRYPT_KEY_LENGTH)
+    );
+  } catch {
+    return false;
+  }
+}
 
-  const n = Number(parts[2]);
-  const r = Number(parts[3]);
-  const p = Number(parts[4]);
-  if (n !== SCRYPT_N || r !== SCRYPT_R || p !== SCRYPT_P) return false;
+export async function verifyPassword(
+  password: string,
+  encodedHash: string,
+): Promise<boolean> {
+  if (!isSupportedPasswordHash(encodedHash)) return false;
+  const parts = encodedHash.split("$");
 
   try {
     const salt = Buffer.from(parts[5]!, "base64");
     const expected = Buffer.from(parts[6]!, "base64");
-    if (salt.length !== 16 || expected.length !== SCRYPT_KEY_LENGTH) return false;
+    if (salt.length !== 16 || expected.length !== SCRYPT_KEY_LENGTH)
+      return false;
     const actual = await runScrypt(password, salt);
     return timingSafeEqual(actual, expected);
   } catch {
@@ -235,7 +296,7 @@ export async function createSession(userId: number) {
 }
 
 export async function authenticateRequest(
-  req: Request
+  req: Request,
 ): Promise<AuthenticatedUser | null> {
   const token = getSessionTokenFromRequest(req);
   if (!token) return null;
@@ -253,13 +314,19 @@ export async function authenticateRequest(
         eq(sessions.tokenHash, tokenHash),
         isNull(sessions.revokedAt),
         gt(sessions.expiresAt, new Date()),
-        eq(users.isActive, true)
-      )
+        eq(users.isActive, true),
+      ),
     )
     .limit(1);
 
   const row = rows[0];
   if (!row) return null;
+  if (
+    row.user.role === "admin" &&
+    !isExplicitAdminAccessLevel(row.user.adminAccessLevel)
+  ) {
+    return null;
+  }
 
   if (Date.now() - row.lastSeenAt.getTime() > 5 * 60 * 1000) {
     await db
@@ -281,14 +348,14 @@ export async function revokeSessionToken(token: string | null | undefined) {
     .where(
       and(
         eq(sessions.tokenHash, hashSessionToken(token)),
-        isNull(sessions.revokedAt)
-      )
+        isNull(sessions.revokedAt),
+      ),
     );
 }
 
 export async function revokeAllUserSessions(
   userId: number,
-  exceptToken?: string | null
+  exceptToken?: string | null,
 ) {
   const db = await requireDb();
   const conditions = [eq(sessions.userId, userId), isNull(sessions.revokedAt)];
@@ -317,7 +384,7 @@ function assertLoginAllowed(key: string) {
     throw new AuthServiceError(
       "RATE_LIMITED",
       "Too many login attempts",
-      attempt.resetAt - now
+      attempt.resetAt - now,
     );
   }
 }
@@ -343,7 +410,7 @@ function recordLoginFailure(key: string) {
 export async function loginWithPassword(
   username: string,
   password: string,
-  clientAddress: string
+  clientAddress: string,
 ) {
   const normalizedUsername = normalizeUsername(username);
   const attemptKey = loginAttemptKey(normalizedUsername, clientAddress);
@@ -362,11 +429,24 @@ export async function loginWithPassword(
 
   if (!user || !passwordMatches) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError("INVALID_PASSWORD", "Invalid username or password");
+    throw new AuthServiceError(
+      "INVALID_PASSWORD",
+      "Invalid username or password",
+    );
   }
   if (!user.isActive) {
     recordLoginFailure(attemptKey);
     throw new AuthServiceError("ACCOUNT_DISABLED", "Account is disabled");
+  }
+  if (
+    user.role === "admin" &&
+    !isExplicitAdminAccessLevel(user.adminAccessLevel)
+  ) {
+    recordLoginFailure(attemptKey);
+    throw new AuthServiceError(
+      "ACCOUNT_DISABLED",
+      "Administrator access level is not configured",
+    );
   }
 
   loginAttempts.delete(attemptKey);
@@ -384,13 +464,23 @@ export async function changeOwnPassword(
   userId: number,
   currentPassword: string,
   newPassword: string,
-  currentSessionToken?: string | null
+  currentSessionToken?: string | null,
 ) {
   const db = await requireDb();
-  const rows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  const rows = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
   const user = rows[0];
-  if (!user?.passwordHash || !(await verifyPassword(currentPassword, user.passwordHash))) {
-    throw new AuthServiceError("INVALID_PASSWORD", "Current password is incorrect");
+  if (
+    !user?.passwordHash ||
+    !(await verifyPassword(currentPassword, user.passwordHash))
+  ) {
+    throw new AuthServiceError(
+      "INVALID_PASSWORD",
+      "Current password is incorrect",
+    );
   }
 
   const passwordHash = await hashPassword(newPassword);
@@ -409,17 +499,60 @@ export async function listManagedUsers(): Promise<AuthenticatedUser[]> {
 
 export async function getManagedUser(userId: number) {
   const db = await requireDb();
-  const rows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  const rows = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
   return rows[0] ? toAuthenticatedUser(rows[0]) : null;
 }
 
-export async function createManagedUser(input: {
-  username: string;
-  password: string;
-  displayName?: string | null;
-  role: "user" | "admin";
-}) {
-  const db = await requireDb();
+export async function createManagedUser(
+  input: {
+    username: string;
+    password: string;
+    displayName?: string | null;
+    role: "user" | "admin";
+    adminAccessLevel?: "system_admin" | "delivery_admin";
+  },
+  executor?: any,
+) {
+  const passwordHash = await hashPassword(input.password);
+  return createManagedUserWithPasswordHash(
+    {
+      username: input.username,
+      passwordHash,
+      displayName: input.displayName,
+      role: input.role,
+      adminAccessLevel: input.adminAccessLevel,
+    },
+    executor,
+  );
+}
+
+/**
+ * Creates a login account from a password hash produced by `hashPassword`.
+ * This is intentionally an internal server path so multi-step workflows can
+ * hash a customer password immediately and never persist or replay plaintext.
+ */
+export async function createManagedUserWithPasswordHash(
+  input: {
+    username: string;
+    passwordHash: string;
+    displayName?: string | null;
+    role: "user" | "admin";
+    adminAccessLevel?: "system_admin" | "delivery_admin";
+    now?: Date;
+  },
+  executor?: any,
+) {
+  if (!isSupportedPasswordHash(input.passwordHash)) {
+    throw new AuthServiceError(
+      "INVALID_PASSWORD",
+      "Unsupported password hash format",
+    );
+  }
+  const db = executor ?? (await requireDb());
   const username = normalizeUsername(input.username);
   const existing = await db
     .select({ id: users.id })
@@ -430,17 +563,21 @@ export async function createManagedUser(input: {
     throw new AuthServiceError("CONFLICT", "Username already exists");
   }
 
-  const passwordHash = await hashPassword(input.password);
+  const now = input.now ?? new Date();
   try {
     await db.insert(users).values({
       username,
-      passwordHash,
+      passwordHash: input.passwordHash,
       displayName: input.displayName?.trim() || null,
       name: input.displayName?.trim() || null,
       loginMethod: "password",
       role: input.role,
+      adminAccessLevel:
+        input.role === "admin"
+          ? (input.adminAccessLevel ?? "delivery_admin")
+          : null,
       isActive: true,
-      passwordChangedAt: new Date(),
+      passwordChangedAt: now,
     });
   } catch (error) {
     const mysqlError = error as { code?: string };
@@ -461,9 +598,189 @@ export async function createManagedUser(input: {
   return toAuthenticatedUser(created[0]);
 }
 
+export async function createManagedUserWithSetupToken(
+  input: {
+    username: string;
+    displayName?: string | null;
+    createdByUserId: number;
+    now?: Date;
+    ttlMs?: number;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const now = input.now ?? new Date();
+  const username = normalizeUsername(input.username);
+  const token = randomBytes(32).toString("base64url");
+  const placeholderPassword = randomBytes(48).toString("base64url");
+  const passwordHash = await hashPassword(placeholderPassword);
+  const expiresAt = new Date(
+    now.getTime() + (input.ttlMs ?? MANAGED_ACCOUNT_SETUP_DURATION_MS),
+  );
+
+  const create = async (tx: any) => {
+    const existing = await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.username, username))
+      .limit(1);
+    if (existing.length > 0) {
+      throw new AuthServiceError("CONFLICT", "Username already exists");
+    }
+
+    try {
+      await tx.insert(users).values({
+        username,
+        passwordHash,
+        displayName: input.displayName?.trim() || null,
+        name: input.displayName?.trim() || null,
+        loginMethod: "password",
+        role: "user",
+        isActive: true,
+        passwordChangedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    } catch (error) {
+      if ((error as { code?: string })?.code === "ER_DUP_ENTRY") {
+        throw new AuthServiceError("CONFLICT", "Username already exists");
+      }
+      throw error;
+    }
+
+    const created = await tx
+      .select()
+      .from(users)
+      .where(eq(users.username, username))
+      .limit(1);
+    if (!created[0]) {
+      throw new AuthServiceError(
+        "NOT_FOUND",
+        "Created user could not be loaded",
+      );
+    }
+    await tx.insert(userPasswordSetupTokens).values({
+      id: randomUUID(),
+      userId: created[0].id,
+      tokenHash: hashSessionToken(token),
+      expiresAt,
+      consumedAt: null,
+      createdByUserId: input.createdByUserId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return {
+      user: toAuthenticatedUser(created[0]),
+      setupToken: token,
+      setupExpiresAt: expiresAt,
+    };
+  };
+
+  return typeof db.transaction === "function"
+    ? db.transaction(create)
+    : create(db);
+}
+
+function assertUsableManagedSetupToken(
+  row: typeof userPasswordSetupTokens.$inferSelect | undefined,
+  now: Date,
+) {
+  if (!row || row.consumedAt || row.expiresAt.getTime() <= now.getTime()) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "账号设置链接无效、已过期或已使用",
+    );
+  }
+  return row;
+}
+
+export async function validateManagedAccountSetupToken(input: {
+  token: string;
+  now?: Date;
+}) {
+  const db = await requireDb();
+  const now = input.now ?? new Date();
+  const rows = await db
+    .select()
+    .from(userPasswordSetupTokens)
+    .where(eq(userPasswordSetupTokens.tokenHash, hashSessionToken(input.token)))
+    .limit(1);
+  const setup = assertUsableManagedSetupToken(rows[0], now);
+  const accountRows = await db
+    .select({
+      username: users.username,
+      displayName: users.displayName,
+      role: users.role,
+      isActive: users.isActive,
+    })
+    .from(users)
+    .where(eq(users.id, setup.userId))
+    .limit(1);
+  const account = accountRows[0];
+  if (!account || account.role !== "user" || !account.isActive) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "账号设置链接无效、已过期或已使用",
+    );
+  }
+  return {
+    valid: true as const,
+    username: account.username ?? "",
+    displayName: account.displayName ?? null,
+    expiresAt: setup.expiresAt.getTime(),
+  };
+}
+
+export async function setupManagedUserPassword(input: {
+  token: string;
+  password: string;
+  now?: Date;
+}) {
+  const db = await requireDb();
+  const now = input.now ?? new Date();
+  const passwordHash = await hashPassword(input.password);
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .select()
+      .from(userPasswordSetupTokens)
+      .where(
+        eq(userPasswordSetupTokens.tokenHash, hashSessionToken(input.token)),
+      )
+      .limit(1)
+      .for("update");
+    const setup = assertUsableManagedSetupToken(rows[0], now);
+    const accountRows = await tx
+      .select()
+      .from(users)
+      .where(eq(users.id, setup.userId))
+      .limit(1)
+      .for("update");
+    const account = accountRows[0];
+    if (!account || account.role !== "user" || !account.isActive) {
+      throw new AuthServiceError(
+        "INVALID_CREDENTIAL",
+        "账号设置链接无效、已过期或已使用",
+      );
+    }
+    await tx
+      .update(users)
+      .set({ passwordHash, passwordChangedAt: now, updatedAt: now })
+      .where(eq(users.id, account.id));
+    await tx
+      .update(userPasswordSetupTokens)
+      .set({ consumedAt: now, updatedAt: now })
+      .where(eq(userPasswordSetupTokens.id, setup.id));
+    return {
+      success: true as const,
+      username: account.username ?? "",
+      workspaceUrl: "/login",
+    };
+  });
+}
+
 export async function resetManagedUserPassword(
   userId: number,
-  newPassword: string
+  newPassword: string,
 ) {
   const db = await requireDb();
   const existing = await db
@@ -474,16 +791,28 @@ export async function resetManagedUserPassword(
   if (!existing[0]) throw new AuthServiceError("NOT_FOUND", "User not found");
 
   const passwordHash = await hashPassword(newPassword);
-  await db
-    .update(users)
-    .set({ passwordHash, passwordChangedAt: new Date() })
-    .where(eq(users.id, userId));
+  const now = new Date();
+  await db.transaction(async (tx) => {
+    await tx
+      .update(users)
+      .set({ passwordHash, passwordChangedAt: now })
+      .where(eq(users.id, userId));
+    await tx
+      .update(userPasswordSetupTokens)
+      .set({ consumedAt: now, updatedAt: now })
+      .where(
+        and(
+          eq(userPasswordSetupTokens.userId, userId),
+          isNull(userPasswordSetupTokens.consumedAt),
+        ),
+      );
+  });
   await revokeAllUserSessions(userId);
 }
 
 export async function setManagedUserActive(userId: number, isActive: boolean) {
   const db = await requireDb();
-  await db.transaction(async tx => {
+  await db.transaction(async (tx) => {
     const rows = await tx
       .select()
       .from(users)
@@ -494,6 +823,17 @@ export async function setManagedUserActive(userId: number, isActive: boolean) {
     if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
 
     if (!isActive && user.isActive && user.role === "admin") {
+      const ownedUsers = await tx
+        .select({ userId: userUsageOwners.userId })
+        .from(userUsageOwners)
+        .where(eq(userUsageOwners.deliveryAdminId, userId))
+        .limit(1)
+        .for("update");
+      assertAdminHasNoUsageOwnedUsers({
+        ownedUserCount: ownedUsers.length,
+        mutation: "deactivate",
+      });
+
       const activeAdmins = await tx
         .select({ id: users.id })
         .from(users)
@@ -503,12 +843,24 @@ export async function setManagedUserActive(userId: number, isActive: boolean) {
       if (activeAdmins.length <= 1) {
         throw new AuthServiceError(
           "LAST_ADMIN",
-          "The last active administrator cannot be disabled"
+          "The last active administrator cannot be disabled",
         );
       }
     }
 
     await tx.update(users).set({ isActive }).where(eq(users.id, userId));
+    if (!isActive) {
+      const now = new Date();
+      await tx
+        .update(userPasswordSetupTokens)
+        .set({ consumedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(userPasswordSetupTokens.userId, userId),
+            isNull(userPasswordSetupTokens.consumedAt),
+          ),
+        );
+    }
   });
   if (!isActive) await revokeAllUserSessions(userId);
   const updated = await getManagedUser(userId);
@@ -544,7 +896,7 @@ export async function deleteManagedUser(
   }
 
   const db = await requireDb();
-  await db.transaction(async tx => {
+  await db.transaction(async (tx) => {
     const rows = await tx
       .select()
       .from(users)
@@ -554,18 +906,49 @@ export async function deleteManagedUser(
     const user = rows[0];
     if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
 
-    if (user.role === "admin" && user.isActive) {
-      const activeAdmins = await tx
-        .select({ id: users.id })
-        .from(users)
-        .where(and(eq(users.role, "admin"), eq(users.isActive, true)))
-        .limit(2)
+    if (user.role === "admin") {
+      const ownedUsers = await tx
+        .select({ userId: userUsageOwners.userId })
+        .from(userUsageOwners)
+        .where(eq(userUsageOwners.deliveryAdminId, targetUserId))
+        .limit(1)
         .for("update");
-      if (activeAdmins.length <= 1) {
-        throw new AuthServiceError(
-          "LAST_ADMIN",
-          "The last active administrator cannot be deleted",
-        );
+      assertAdminHasNoUsageOwnedUsers({
+        ownedUserCount: ownedUsers.length,
+        mutation: "delete",
+      });
+      const historicalResources = await tx
+        .select({ id: upstreamResources.id })
+        .from(upstreamResources)
+        .innerJoin(
+          apiCredentials,
+          eq(upstreamResources.apiCredentialId, apiCredentials.id),
+        )
+        .where(
+          and(
+            eq(apiCredentials.userId, targetUserId),
+            ne(upstreamResources.userId, targetUserId),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      assertAdminHasNoHistoricalCredentialResources(
+        historicalResources.length,
+      );
+
+      if (user.isActive) {
+        const activeAdmins = await tx
+          .select({ id: users.id })
+          .from(users)
+          .where(and(eq(users.role, "admin"), eq(users.isActive, true)))
+          .limit(2)
+          .for("update");
+        if (activeAdmins.length <= 1) {
+          throw new AuthServiceError(
+            "LAST_ADMIN",
+            "The last active administrator cannot be deleted",
+          );
+        }
       }
     }
 
@@ -590,7 +973,7 @@ function decodeMasterKey(value: string): Buffer {
   if (decoded.length !== 32) {
     throw new AuthServiceError(
       "INVALID_MASTER_KEY",
-      "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY must encode exactly 32 bytes"
+      "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY must encode exactly 32 bytes",
     );
   }
   return decoded;
@@ -601,7 +984,7 @@ function getCredentialMasterKey() {
   if (!configured) {
     throw new AuthServiceError(
       "INVALID_MASTER_KEY",
-      "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY is not configured"
+      "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY is not configured",
     );
   }
   return decodeMasterKey(configured);
@@ -613,23 +996,19 @@ export function assertCredentialEncryptionConfigured() {
 }
 
 function credentialAad(userId: number, credentialId: string) {
-  return Buffer.from(`frontmind-api-credential:v1:${userId}:${credentialId}`, "utf8");
+  return Buffer.from(
+    `frontmind-api-credential:v1:${userId}:${credentialId}`,
+    "utf8",
+  );
 }
 
-export function getApiKeyFingerprint(apiKey: string) {
-  return `fp_${createHash("sha256").update(apiKey, "utf8").digest("hex").slice(0, 16)}`;
-}
-
-export function encryptApiKey(
-  userId: number,
-  credentialId: string,
-  apiKey: string
-) {
+/** Encrypt a server-side credential with domain-separated authenticated data. */
+export function encryptCredentialSecret(aad: string, secret: string) {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", getCredentialMasterKey(), iv);
-  cipher.setAAD(credentialAad(userId, credentialId));
+  cipher.setAAD(Buffer.from(aad, "utf8"));
   const encrypted = Buffer.concat([
-    cipher.update(apiKey, "utf8"),
+    cipher.update(secret, "utf8"),
     cipher.final(),
   ]);
   return {
@@ -640,28 +1019,27 @@ export function encryptApiKey(
   };
 }
 
-export function decryptApiKey(credential: Pick<
-  ApiCredential,
-  | "id"
-  | "userId"
-  | "encryptionVersion"
-  | "encryptedKey"
-  | "encryptionIv"
-  | "encryptionAuthTag"
->) {
+/** Decrypt a server-side credential previously sealed by encryptCredentialSecret. */
+export function decryptCredentialSecret(
+  aad: string,
+  credential: Pick<
+    ApiCredential,
+    "encryptionVersion" | "encryptedKey" | "encryptionIv" | "encryptionAuthTag"
+  >,
+) {
   try {
     if (credential.encryptionVersion !== 1) {
       throw new AuthServiceError(
         "INVALID_CREDENTIAL",
-        "Credential encryption version is not supported"
+        "Credential encryption version is not supported",
       );
     }
     const decipher = createDecipheriv(
       "aes-256-gcm",
       getCredentialMasterKey(),
-      Buffer.from(credential.encryptionIv, "base64")
+      Buffer.from(credential.encryptionIv, "base64"),
     );
-    decipher.setAAD(credentialAad(credential.userId, credential.id));
+    decipher.setAAD(Buffer.from(aad, "utf8"));
     decipher.setAuthTag(Buffer.from(credential.encryptionAuthTag, "base64"));
     return Buffer.concat([
       decipher.update(Buffer.from(credential.encryptedKey, "base64")),
@@ -669,8 +1047,97 @@ export function decryptApiKey(credential: Pick<
     ]).toString("utf8");
   } catch (error) {
     if (error instanceof AuthServiceError) throw error;
-    throw new AuthServiceError("INVALID_CREDENTIAL", "Credential cannot be decrypted");
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "Credential cannot be decrypted",
+    );
   }
+}
+
+export function getApiKeyFingerprint(apiKey: string) {
+  return `fp_${createHash("sha256").update(apiKey, "utf8").digest("hex").slice(0, 16)}`;
+}
+
+/**
+ * API credentials are stored once per FrontMind account, but the underlying
+ * upstream key may intentionally be shared by several accounts. Resource
+ * ownership remains account-scoped; this helper is only used to decide whether
+ * two credential versions can access the same upstream task or file.
+ */
+export function credentialsUseSameUpstreamApiKey(
+  left: Pick<DecryptedCredential, "apiKey" | "fingerprint">,
+  right: Pick<DecryptedCredential, "apiKey" | "fingerprint">,
+) {
+  if (left.fingerprint !== right.fingerprint) return false;
+  const leftBytes = Buffer.from(left.apiKey, "utf8");
+  const rightBytes = Buffer.from(right.apiKey, "utf8");
+  return (
+    leftBytes.length === rightBytes.length &&
+    timingSafeEqual(leftBytes, rightBytes)
+  );
+}
+
+export async function assertApiKeyScopeAvailable(input: {
+  executor: any;
+  fingerprint: string;
+  targetScope: "managed_account" | "website_frontend";
+}) {
+  const conflicting =
+    input.targetScope === "managed_account"
+      ? await input.executor
+          .select({ id: presalesApiCredentials.id })
+          .from(presalesApiCredentials)
+          .where(
+            and(
+              eq(presalesApiCredentials.fingerprint, input.fingerprint),
+              eq(presalesApiCredentials.status, "active"),
+            ),
+          )
+          .limit(1)
+      : await input.executor
+          .select({ id: apiCredentials.id })
+          .from(apiCredentials)
+          .where(
+            and(
+              eq(apiCredentials.fingerprint, input.fingerprint),
+              eq(apiCredentials.status, "active"),
+            ),
+          )
+          .limit(1);
+  if (conflicting[0]) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "官网前台 API Key 与账号共享 Key 池必须分开配置",
+    );
+  }
+}
+
+export function encryptApiKey(
+  userId: number,
+  credentialId: string,
+  apiKey: string,
+) {
+  return encryptCredentialSecret(
+    credentialAad(userId, credentialId).toString("utf8"),
+    apiKey,
+  );
+}
+
+export function decryptApiKey(
+  credential: Pick<
+    ApiCredential,
+    | "id"
+    | "userId"
+    | "encryptionVersion"
+    | "encryptedKey"
+    | "encryptionIv"
+    | "encryptionAuthTag"
+  >,
+) {
+  return decryptCredentialSecret(
+    credentialAad(credential.userId, credential.id).toString("utf8"),
+    credential,
+  );
 }
 
 export async function validateUpstreamApiKey(apiKey: string) {
@@ -689,28 +1156,33 @@ export async function validateUpstreamApiKey(apiKey: string) {
   } catch {
     throw new AuthServiceError(
       "UPSTREAM_UNAVAILABLE",
-      "Unable to validate the API credential"
+      "Unable to validate the API credential",
     );
   }
 
   if (response.status === 401 || response.status === 403) {
-    throw new AuthServiceError("INVALID_CREDENTIAL", "API credential is invalid");
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "API credential is invalid",
+    );
   }
   if (!response.ok) {
     throw new AuthServiceError(
       "UPSTREAM_UNAVAILABLE",
-      "Upstream service could not validate the API credential"
+      "Upstream service could not validate the API credential",
     );
   }
 }
 
-function toCredentialStatus(credential?: ApiCredential | null): CredentialStatus {
+function toCredentialStatus(
+  credential?: ApiCredential | null,
+): CredentialStatus {
   const status =
     credential?.status === "deleted"
       ? null
       : credential?.validationStatus === "invalid"
         ? "invalid"
-        : credential?.status ?? null;
+        : (credential?.status ?? null);
   return {
     configured: Boolean(credential && credential.status === "active"),
     fingerprint: credential?.fingerprint ?? null,
@@ -725,17 +1197,35 @@ export async function getApiCredentialStatus(userId: number) {
     .select()
     .from(apiCredentials)
     .where(
-      and(eq(apiCredentials.userId, userId), eq(apiCredentials.status, "active"))
+      and(
+        eq(apiCredentials.userId, userId),
+        eq(apiCredentials.status, "active"),
+      ),
     )
     .orderBy(desc(apiCredentials.version))
     .limit(1);
   return toCredentialStatus(rows[0]);
 }
 
+export async function getEffectiveApiCredentialStatus(accountId: number) {
+  const db = await requireDb();
+  const ownerRows = await db
+    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
+    .from(userUsageOwners)
+    .where(eq(userUsageOwners.userId, accountId))
+    .limit(1);
+  const ownerUserId = ownerRows[0]?.deliveryAdminId ?? accountId;
+  return {
+    ...(await getApiCredentialStatus(ownerUserId)),
+    ownerUserId,
+    inherited: ownerUserId !== accountId,
+  };
+}
+
 export async function replaceApiCredential(
   userId: number,
   apiKey: string,
-  validator: (apiKey: string) => Promise<void> = validateUpstreamApiKey
+  validator: (apiKey: string) => Promise<void> = validateUpstreamApiKey,
 ): Promise<CredentialStatus> {
   const db = await requireDb();
   await validator(apiKey);
@@ -744,7 +1234,16 @@ export async function replaceApiCredential(
   const encrypted = encryptApiKey(userId, credentialId, apiKey);
   const now = new Date();
 
-  const credential = await db.transaction(async tx => {
+  const credential = await db.transaction(async (tx) => {
+    const ownerRows = await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+      .for("update");
+    if (!ownerRows[0]) {
+      throw new AuthServiceError("NOT_FOUND", "User not found");
+    }
     const latest = await tx
       .select()
       .from(apiCredentials)
@@ -753,11 +1252,19 @@ export async function replaceApiCredential(
       .limit(1);
     const nextVersion = (latest[0]?.version ?? 0) + 1;
 
+    await assertApiKeyScopeAvailable({
+      executor: tx,
+      fingerprint,
+      targetScope: "managed_account",
+    });
     await tx
       .update(apiCredentials)
       .set({ status: "retired", retiredAt: now })
       .where(
-        and(eq(apiCredentials.userId, userId), eq(apiCredentials.status, "active"))
+        and(
+          eq(apiCredentials.userId, userId),
+          eq(apiCredentials.status, "active"),
+        ),
       );
 
     const inserted = {
@@ -784,23 +1291,28 @@ export async function replaceApiCredential(
 export async function deleteActiveApiCredential(userId: number) {
   const db = await requireDb();
   const now = new Date();
-  await db
-    .update(apiCredentials)
-    .set({
-      status: "deleted",
-      deletedAt: now,
-      encryptedKey: randomBytes(32).toString("base64"),
-      encryptionIv: randomBytes(12).toString("base64"),
-      encryptionAuthTag: randomBytes(16).toString("base64"),
-    })
-    .where(
-      and(eq(apiCredentials.userId, userId), eq(apiCredentials.status, "active"))
-    );
+  await db.transaction(async (tx) => {
+    await tx
+      .update(apiCredentials)
+      .set({
+        status: "deleted",
+        deletedAt: now,
+        encryptedKey: randomBytes(32).toString("base64"),
+        encryptionIv: randomBytes(12).toString("base64"),
+        encryptionAuthTag: randomBytes(16).toString("base64"),
+      })
+      .where(
+        and(
+          eq(apiCredentials.userId, userId),
+          eq(apiCredentials.status, "active"),
+        ),
+      );
+  });
 }
 
 export async function getDecryptedCredentialForUser(
   userId: number,
-  credentialId?: string | null
+  credentialId?: string | null,
 ): Promise<DecryptedCredential | null> {
   const db = await requireDb();
   const conditions = [
@@ -830,10 +1342,65 @@ export async function getDecryptedCredentialForUser(
   };
 }
 
+/**
+ * Returns the active runtime credential for an account. Administrators own
+ * their credential directly; customer accounts inherit the credential of
+ * their single usage owner. Legacy customers without an owner temporarily
+ * fall back to their own active credential until migration is completed.
+ */
+export async function getEffectiveDecryptedCredentialForAccount(
+  accountId: number,
+): Promise<DecryptedCredential | null> {
+  const db = await requireDb();
+  const accountRows = await db
+    .select({ role: users.role })
+    .from(users)
+    .where(eq(users.id, accountId))
+    .limit(1);
+  const account = accountRows[0];
+  if (!account) return null;
+  if (account.role === "admin") {
+    return getDecryptedCredentialForUser(accountId);
+  }
+  const ownerRows = await db
+    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
+    .from(userUsageOwners)
+    .where(eq(userUsageOwners.userId, accountId))
+    .limit(1);
+  const ownerId = ownerRows[0]?.deliveryAdminId;
+  return ownerId
+    ? getDecryptedCredentialForUser(ownerId)
+    : getDecryptedCredentialForUser(accountId);
+}
+
+export async function credentialMayServeAccount(
+  executor: any,
+  accountId: number,
+  credentialId: string,
+) {
+  const credentialRows = await executor
+    .select({
+      ownerUserId: apiCredentials.userId,
+      status: apiCredentials.status,
+    })
+    .from(apiCredentials)
+    .where(eq(apiCredentials.id, credentialId))
+    .limit(1);
+  const credential = credentialRows[0];
+  if (!credential || credential.status === "deleted") return false;
+  if (credential.ownerUserId === accountId) return true;
+  const ownerRows = await executor
+    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
+    .from(userUsageOwners)
+    .where(eq(userUsageOwners.userId, accountId))
+    .limit(1);
+  return ownerRows[0]?.deliveryAdminId === credential.ownerUserId;
+}
+
 export async function getCredentialForUpstreamResource(
   userId: number,
   kind: "task" | "file",
-  upstreamId: string
+  upstreamId: string,
 ): Promise<(DecryptedCredential & { resource: UpstreamResource }) | null> {
   const db = await requireDb();
   const rows = await db
@@ -841,15 +1408,15 @@ export async function getCredentialForUpstreamResource(
     .from(upstreamResources)
     .innerJoin(
       apiCredentials,
-      eq(upstreamResources.apiCredentialId, apiCredentials.id)
+      eq(upstreamResources.apiCredentialId, apiCredentials.id),
     )
     .where(
       and(
         eq(upstreamResources.userId, userId),
         eq(upstreamResources.kind, kind),
         eq(upstreamResources.upstreamId, upstreamId),
-        ne(apiCredentials.status, "deleted")
-      )
+        ne(apiCredentials.status, "deleted"),
+      ),
     )
     .limit(1);
   const row = rows[0];
@@ -867,6 +1434,58 @@ export async function getCredentialForUpstreamResource(
   };
 }
 
+export async function getOwnedUpstreamResourceIds(
+  userId: number,
+  kind: "task" | "file",
+  upstreamIds: string[],
+) {
+  const uniqueIds = [...new Set(upstreamIds.filter(Boolean))];
+  if (uniqueIds.length === 0) return new Set<string>();
+  const db = await requireDb();
+  const rows = await db
+    .select({ upstreamId: upstreamResources.upstreamId })
+    .from(upstreamResources)
+    .where(
+      and(
+        eq(upstreamResources.userId, userId),
+        eq(upstreamResources.kind, kind),
+        inArray(upstreamResources.upstreamId, uniqueIds),
+      ),
+    );
+  return new Set(rows.map((row) => row.upstreamId));
+}
+
+export async function isUpstreamApiKeyShared(
+  userId: number,
+  fingerprint: string,
+) {
+  const db = await requireDb();
+  const [otherAccounts, website] = await Promise.all([
+    db
+      .select({ id: apiCredentials.id })
+      .from(apiCredentials)
+      .where(
+        and(
+          eq(apiCredentials.fingerprint, fingerprint),
+          ne(apiCredentials.userId, userId),
+          ne(apiCredentials.status, "deleted"),
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: presalesApiCredentials.id })
+      .from(presalesApiCredentials)
+      .where(
+        and(
+          eq(presalesApiCredentials.fingerprint, fingerprint),
+          ne(presalesApiCredentials.status, "deleted"),
+        ),
+      )
+      .limit(1),
+  ]);
+  return Boolean(otherAccounts[0] || website[0]);
+}
+
 export async function recordUpstreamResource(input: {
   userId: number;
   apiCredentialId: string;
@@ -881,32 +1500,27 @@ export async function recordUpstreamResource(input: {
     .where(
       and(
         eq(upstreamResources.kind, input.kind),
-        eq(upstreamResources.upstreamId, input.upstreamId)
-      )
+        eq(upstreamResources.upstreamId, input.upstreamId),
+      ),
     )
     .limit(1);
   if (existing[0]) {
     if (existing[0].userId !== input.userId) {
       throw new AuthServiceError(
         "CONFLICT",
-        "Upstream resource is already owned by another account"
+        "Upstream resource is already owned by another account",
       );
     }
     return existing[0];
   }
 
-  const credential = await db
-    .select({ id: apiCredentials.id })
-    .from(apiCredentials)
-    .where(
-      and(
-        eq(apiCredentials.id, input.apiCredentialId),
-        eq(apiCredentials.userId, input.userId),
-        ne(apiCredentials.status, "deleted")
-      )
-    )
-    .limit(1);
-  if (!credential[0]) {
+  if (
+    !(await credentialMayServeAccount(
+      db,
+      input.userId,
+      input.apiCredentialId,
+    ))
+  ) {
     throw new AuthServiceError("NOT_FOUND", "API credential not found");
   }
 
@@ -917,8 +1531,8 @@ export async function recordUpstreamResource(input: {
       .where(
         and(
           eq(conversations.id, input.conversationId),
-          eq(conversations.userId, input.userId)
-        )
+          eq(conversations.userId, input.userId),
+        ),
       )
       .limit(1);
     if (!conversation[0]) {
@@ -947,16 +1561,16 @@ export async function recordUpstreamResource(input: {
       .from(upstreamResources)
       .where(
         and(
-            eq(upstreamResources.kind, input.kind),
-            eq(upstreamResources.upstreamId, input.upstreamId),
-            eq(upstreamResources.userId, input.userId)
-          )
+          eq(upstreamResources.kind, input.kind),
+          eq(upstreamResources.upstreamId, input.upstreamId),
+          eq(upstreamResources.userId, input.userId),
+        ),
       )
       .limit(1);
     if (raced[0]) return raced[0];
     throw new AuthServiceError(
       "CONFLICT",
-      "Upstream resource is already owned by another account"
+      "Upstream resource is already owned by another account",
     );
   }
 }

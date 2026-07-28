@@ -15,7 +15,12 @@ const testRouter = router({
   admin: adminProcedure.query(({ ctx }) => ctx.user.id),
 });
 
-function createUser(role: "user" | "admin"): AuthenticatedUser {
+function createUser(
+  role: "user" | "admin",
+  adminAccessLevel: "system_admin" | "delivery_admin" | null = role === "admin"
+    ? "delivery_admin"
+    : null,
+): AuthenticatedUser {
   const now = new Date();
   return {
     id: 7,
@@ -26,6 +31,7 @@ function createUser(role: "user" | "admin"): AuthenticatedUser {
     email: null,
     loginMethod: "password",
     role,
+    adminAccessLevel,
     isActive: true,
     createdAt: now,
     updatedAt: now,
@@ -56,14 +62,28 @@ describe("tRPC authorization middleware", () => {
   });
 
   it("requires the admin role for admin procedures", async () => {
-    const userCaller = testRouter.createCaller(createContext(createUser("user")));
+    const userCaller = testRouter.createCaller(
+      createContext(createUser("user")),
+    );
     await expect(userCaller.admin()).rejects.toMatchObject<Partial<TRPCError>>({
       code: "FORBIDDEN",
     });
 
     const adminCaller = testRouter.createCaller(
-      createContext(createUser("admin"))
+      createContext(createUser("admin")),
     );
     await expect(adminCaller.admin()).resolves.toBe(7);
+  });
+
+  it("fails closed for an admin username without an explicit access level", async () => {
+    const legacyAdmin = {
+      ...createUser("admin", null),
+      username: "admin",
+    };
+    const caller = testRouter.createCaller(createContext(legacyAdmin));
+
+    await expect(caller.admin()).rejects.toMatchObject<Partial<TRPCError>>({
+      code: "FORBIDDEN",
+    });
   });
 });

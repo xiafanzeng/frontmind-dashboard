@@ -5,7 +5,11 @@
  *           local PDF.js reader, inline Markdown reader, HTML file preview.
  */
 import React, { useRef, useEffect, useState, useCallback } from "react";
-import { parseOutputMessages, useConversation, type LocalMessage } from "@/contexts/ConversationContext";
+import {
+  parseOutputMessages,
+  useConversation,
+  type LocalMessage,
+} from "@/contexts/ConversationContext";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { motion, AnimatePresence } from "framer-motion";
@@ -18,6 +22,7 @@ import {
   AlertCircle,
   Loader2,
   Bot,
+  MessageSquareText,
   User,
   Sparkles,
   Copy,
@@ -28,7 +33,15 @@ import {
   UploadCloud,
 } from "lucide-react";
 import { cn, copyToClipboard } from "@/lib/utils";
-import { creditEventBus, MODEL_OPTIONS, retrieveTask, sanitizeBrandText, uploadFile, type OutputMessage } from "@/lib/frontmind-api";
+import {
+  creditEventBus,
+  getModelDisplayName,
+  retrieveTask,
+  sanitizeBrandText,
+  uploadFile,
+  type OutputMessage,
+  type ResponseLogicTaskContext,
+} from "@/lib/frontmind-api";
 import ChatInput from "./ChatInput";
 import MarkdownRenderer from "./MarkdownRenderer";
 import ImagePreview from "./ImagePreview";
@@ -47,17 +60,28 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { reconcileKnowledgeBaseProgress } from "@/lib/knowledge-progress";
+import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
+import { trpc } from "@/lib/trpc";
 
-const EMPTY_STATE_IMG = "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
+const EMPTY_STATE_IMG =
+  "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
 
 const REPORT_POLL_INTERVAL = 3000;
 const PdfDocumentViewer = React.lazy(() => import("./PdfDocumentViewer"));
 
-type ReportTaskStatus = "idle" | "running" | "pending" | "completed" | "error" | "failed";
+type ReportTaskStatus =
+  | "idle"
+  | "running"
+  | "pending"
+  | "completed"
+  | "error"
+  | "failed";
 
 interface OneClickTaskStartResponse {
   visibleMessage?: string;
   startedAt?: number;
+  progress?: KnowledgeBaseProgressDto;
   task: {
     id: string;
     status: ReportTaskStatus;
@@ -77,20 +101,23 @@ interface DeepReportStartInput {
 
 function normalizeReportStatus(status: string | undefined): ReportTaskStatus {
   if (status === "failed") return "error";
-  if (status === "pending" || status === "completed" || status === "error") return status;
+  if (status === "pending" || status === "completed" || status === "error")
+    return status;
   return "running";
 }
 
 async function readErrorMessage(response: Response) {
   try {
     const data = await response.json();
-    return data.error || data.message || `请求失败 (${response.status})`;
+    return (
+      (typeof data.error === "string" ? data.error : data.error?.message) ||
+      data.message ||
+      `请求失败 (${response.status})`
+    );
   } catch {
     return `请求失败 (${response.status})`;
   }
 }
-
-
 
 /**
  * Filter out "等待用户输入" text from assistant messages (req 8)
@@ -111,17 +138,22 @@ function filterWaitingText(content: string): string {
 /**
  * Fetch a file URL with auth headers and return a blob URL.
  * Works for both /api/frontmind/v1/files/ URLs, proxy-download URLs, and external URLs.
- * 
+ *
  * The server proxy now handles:
  * - /v1/files/:id → fetches metadata, then downloads binary from S3
  * - /proxy-download?url=... → proxies binary from external URLs
  * So this function should receive proper binary content.
  */
-function buildProxyDownloadUrl(fileUrl: string, fileName?: string, asDownload = false): string | null {
+function buildProxyDownloadUrl(
+  fileUrl: string,
+  fileName?: string,
+  asDownload = false,
+): string | null {
   try {
     const parsed = new URL(fileUrl, window.location.origin);
     if (parsed.pathname.endsWith("/api/frontmind/proxy-download")) {
-      if (fileName) parsed.searchParams.set("filename", sanitizeBrandText(fileName));
+      if (fileName)
+        parsed.searchParams.set("filename", sanitizeBrandText(fileName));
       if (asDownload) parsed.searchParams.set("download", "1");
       return `${parsed.pathname}${parsed.search}`;
     }
@@ -152,8 +184,12 @@ function nativeDownload(url: string, fileName: string) {
  * External signed URLs are normalized to the same-origin proxy so file content
  * and response headers can be sanitized before the browser renders or downloads them.
  */
-async function fetchWithAuth(fileUrl: string, fileName?: string): Promise<string> {
-  const normalizedUrl = buildProxyDownloadUrl(fileUrl, fileName, false) || fileUrl;
+async function fetchWithAuth(
+  fileUrl: string,
+  fileName?: string,
+): Promise<string> {
+  const normalizedUrl =
+    buildProxyDownloadUrl(fileUrl, fileName, false) || fileUrl;
 
   const response = await fetch(normalizedUrl, {
     credentials: "include",
@@ -165,18 +201,25 @@ async function fetchWithAuth(fileUrl: string, fileName?: string): Promise<string
 
   // Safety check: if we got JSON instead of binary, it might be metadata
   const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json") && normalizedUrl.includes("/v1/files/")) {
+  if (
+    contentType.includes("application/json") &&
+    normalizedUrl.includes("/v1/files/")
+  ) {
     const text = await response.text();
     try {
       const data = JSON.parse(text);
       if (data.upload_url) {
         // Got metadata instead of binary - fetch from S3 URL via proxy
-        const proxyUrl = buildProxyDownloadUrl(data.upload_url, fileName, false) || `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
+        const proxyUrl =
+          buildProxyDownloadUrl(data.upload_url, fileName, false) ||
+          `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
         const s3Response = await fetch(proxyUrl, {
           credentials: "include",
         });
         if (!s3Response.ok) {
-          throw new Error(`S3 proxy download failed: HTTP ${s3Response.status}`);
+          throw new Error(
+            `S3 proxy download failed: HTTP ${s3Response.status}`,
+          );
         }
         const blob = await s3Response.blob();
         return URL.createObjectURL(blob);
@@ -191,7 +234,17 @@ async function fetchWithAuth(fileUrl: string, fileName?: string): Promise<string
   return URL.createObjectURL(blob);
 }
 
-export default function ChatArea() {
+export default function ChatArea({
+  fixedAgentProfile,
+  syncKnowledgeBaseSnapshot = false,
+  composerPrefill,
+  responseLogicContext,
+}: {
+  fixedAgentProfile?: string;
+  syncKnowledgeBaseSnapshot?: boolean;
+  composerPrefill?: string;
+  responseLogicContext?: ResponseLogicTaskContext;
+}) {
   const {
     activeConversation,
     deleteConversation,
@@ -201,8 +254,16 @@ export default function ChatArea() {
     updateAssistantMessages,
     updateTitle,
   } = useConversation();
+  const dashboardQuery = trpc.workspace.dashboard.useQuery(undefined, {
+    enabled: !responseLogicContext,
+    retry: false,
+    refetchOnWindowFocus: true,
+    staleTime: 30_000,
+  });
   const bottomRef = useRef<HTMLDivElement>(null);
-  const reportPollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reportPollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const reportPollingTokenRef = useRef(0);
 
   const [, setTick] = useState(0);
@@ -221,7 +282,7 @@ export default function ChatArea() {
 
   // Force re-render every second when running to update elapsed time
   useEffect(() => {
-    if (status === "running" && startedAt) {
+    if ((status === "running" || status === "pending") && startedAt) {
       const timer = setInterval(() => setTick((t) => t + 1), 1000);
       return () => clearInterval(timer);
     }
@@ -245,7 +306,8 @@ export default function ChatArea() {
       taskId: string,
       responseStartedAt: number,
       modelName?: string,
-      completionToast = "任务制作完成"
+      completionToast = "任务制作完成",
+      reconcileKnowledgeBase = false,
     ) => {
       stopReportPolling();
       const token = reportPollingTokenRef.current;
@@ -253,12 +315,20 @@ export default function ChatArea() {
       let consecutiveErrors = 0;
       let completionHandled = false;
 
-      const applyOutput = (output: OutputMessage[] | undefined, elapsedSeconds?: number) => {
+      const applyOutput = (
+        output: OutputMessage[] | undefined,
+        elapsedSeconds?: number,
+      ) => {
         if (!output || output.length === 0) return;
         try {
-          const assistantMessages = parseOutputMessages(output, responseStartedAt, modelName);
+          const assistantMessages = parseOutputMessages(
+            output,
+            responseStartedAt,
+            modelName,
+          );
           if (elapsedSeconds != null && assistantMessages.length > 0) {
-            assistantMessages[assistantMessages.length - 1].elapsedTime = elapsedSeconds;
+            assistantMessages[assistantMessages.length - 1].elapsedTime =
+              elapsedSeconds;
           }
           if (assistantMessages.length > 0) {
             updateAssistantMessages(conversationId, assistantMessages);
@@ -269,12 +339,14 @@ export default function ChatArea() {
       };
 
       const pollOnce = async () => {
-        if (token !== reportPollingTokenRef.current || completionHandled) return;
+        if (token !== reportPollingTokenRef.current || completionHandled)
+          return;
 
         try {
           pollCount += 1;
           const updated = await retrieveTask(taskId);
-          if (token !== reportPollingTokenRef.current || completionHandled) return;
+          if (token !== reportPollingTokenRef.current || completionHandled)
+            return;
 
           const normalizedStatus = normalizeReportStatus(updated.status);
           const totalOutputLength = updated.output?.length || 0;
@@ -284,6 +356,21 @@ export default function ChatArea() {
             const completedAt = Date.now();
             const elapsedSeconds = (completedAt - responseStartedAt) / 1000;
             applyOutput(updated.output, elapsedSeconds);
+            if (reconcileKnowledgeBase && updated.output?.length) {
+              try {
+                await reconcileKnowledgeBaseProgress({
+                  conversationId,
+                  taskId: updated.id,
+                });
+              } catch (error) {
+                toast.warning("知识树状态尚未完成校验", {
+                  description:
+                    error instanceof Error
+                      ? error.message
+                      : "请重新生成完整节点清单。",
+                });
+              }
+            }
             updateStatus(conversationId, "completed", {
               taskId: updated.id,
               taskUrl: updated.metadata?.task_url,
@@ -295,6 +382,12 @@ export default function ChatArea() {
               description: "结果已同步到当前内容流程。",
               duration: 3200,
             });
+            if (completionToast === "企业知识库构建完成") {
+              toast.info("知识树研究阶段已完成", {
+                description:
+                  "请从当前节点开始逐项确认；全部节点走完后才可更新知识库展示。",
+              });
+            }
             creditEventBus.emit();
             return;
           }
@@ -352,36 +445,41 @@ export default function ChatArea() {
         }
 
         if (token === reportPollingTokenRef.current && !completionHandled) {
-          reportPollingTimeoutRef.current = setTimeout(pollOnce, REPORT_POLL_INTERVAL);
+          reportPollingTimeoutRef.current = setTimeout(
+            pollOnce,
+            REPORT_POLL_INTERVAL,
+          );
         }
       };
 
-      reportPollingTimeoutRef.current = setTimeout(pollOnce, REPORT_POLL_INTERVAL);
+      reportPollingTimeoutRef.current = setTimeout(
+        pollOnce,
+        REPORT_POLL_INTERVAL,
+      );
     },
-    [addMessage, stopReportPolling, updateAssistantMessages, updateStatus]
+    [addMessage, stopReportPolling, updateAssistantMessages, updateStatus],
   );
 
   const startKnowledgeBase = useCallback(
-    async ({ companyName, companyWebsite, operatorNotes, agentProfile, files }: DeepReportStartInput) => {
+    async ({
+      companyName,
+      companyWebsite,
+      operatorNotes,
+      files,
+    }: DeepReportStartInput) => {
       if (!activeConversation) return;
 
-      const selectedAgentProfile = agentProfile || "frontmind-pro";
+      const selectedAgentProfile = "frontmind-pro";
 
       const conversationId = activeConversation.id;
       const responseStartedAt = Date.now();
       stopReportPolling();
 
-      addMessage(conversationId, {
-        id: `msg-kb-start-${responseStartedAt}`,
-        role: "user",
-        content: "开始构建企业知识库",
-        timestamp: responseStartedAt,
-      });
-      updateTitle(conversationId, "企业知识库构建");
-      updateStatus(conversationId, "running", { startedAt: responseStartedAt });
-
       try {
-        const uploadedAttachments: Array<{ file_id: string; filename: string }> = [];
+        const uploadedAttachments: Array<{
+          file_id: string;
+          filename: string;
+        }> = [];
         for (const file of files) {
           const uploaded = await uploadFile(file);
           uploadedAttachments.push({
@@ -397,6 +495,7 @@ export default function ChatArea() {
           },
           credentials: "include",
           body: JSON.stringify({
+            conversationId,
             companyName,
             companyWebsite,
             operatorNotes,
@@ -414,9 +513,24 @@ export default function ChatArea() {
           throw new Error("任务创建失败：未返回任务 ID");
         }
 
+        addMessage(conversationId, {
+          id: `msg-kb-start-${responseStartedAt}`,
+          role: "user",
+          content: "开始构建企业知识库",
+          timestamp: responseStartedAt,
+        });
+        updateTitle(conversationId, "企业知识库构建");
+
         const normalizedStatus = normalizeReportStatus(data.task.status);
         const taskStartedAt = data.startedAt || responseStartedAt;
         const totalOutputLength = data.task.output?.length || 0;
+        if (data.progress) {
+          window.dispatchEvent(
+            new CustomEvent("frontmind:knowledge-progress-updated", {
+              detail: data.progress,
+            }),
+          );
+        }
 
         updateStatus(conversationId, normalizedStatus, {
           taskId: data.task.id,
@@ -430,7 +544,7 @@ export default function ChatArea() {
           const assistantMessages = parseOutputMessages(
             data.task.output,
             taskStartedAt,
-            selectedAgentProfile
+            selectedAgentProfile,
           );
           if (assistantMessages.length > 0) {
             updateAssistantMessages(conversationId, assistantMessages);
@@ -438,28 +552,47 @@ export default function ChatArea() {
         }
 
         toast.success("已开始构建企业知识库", {
-          description: "结果会自动出现在当前内容流程中。",
+          description:
+            "系统会先完成研究并建立真实知识树，随后按叶子节点逐项确认。",
           duration: 3200,
         });
 
         if (normalizedStatus === "running" || normalizedStatus === "pending") {
-          pollReportTask(conversationId, data.task.id, taskStartedAt, selectedAgentProfile, "企业知识库构建完成");
+          pollReportTask(
+            conversationId,
+            data.task.id,
+            taskStartedAt,
+            selectedAgentProfile,
+            "企业知识库构建完成",
+            true,
+          );
         } else if (normalizedStatus === "completed") {
+          const completedAt = Date.now();
+          const elapsedSec = (completedAt - taskStartedAt) / 1000;
+          if (data.task.output && data.task.output.length > 0) {
+            const finalMessages = parseOutputMessages(
+              data.task.output,
+              taskStartedAt,
+              selectedAgentProfile,
+            );
+            if (finalMessages.length > 0) {
+              finalMessages[finalMessages.length - 1].elapsedTime = elapsedSec;
+              updateAssistantMessages(conversationId, finalMessages);
+            }
+          }
           updateStatus(conversationId, "completed", {
-            completedAt: Date.now(),
+            completedAt,
             lastKnownOutputLength: totalOutputLength,
+          });
+          toast.info("知识树研究阶段已完成", {
+            description:
+              "请从当前节点开始逐项确认；全部节点走完后才可更新知识库展示。",
           });
           creditEventBus.emit();
         }
       } catch (error: any) {
         const errorMessage = error?.message || "启动失败";
-        updateStatus(conversationId, "error", { completedAt: Date.now() });
-        addMessage(conversationId, {
-          id: `msg-kb-start-err-${Date.now()}`,
-          role: "assistant",
-          content: `错误: ${errorMessage}`,
-          timestamp: Date.now(),
-        });
+        updateStatus(conversationId, "idle");
         toast.error("启动失败", { description: errorMessage });
       }
     },
@@ -471,7 +604,7 @@ export default function ChatArea() {
       updateAssistantMessages,
       updateStatus,
       updateTitle,
-    ]
+    ],
   );
 
   if (!activeConversation) {
@@ -480,35 +613,102 @@ export default function ChatArea() {
 
   const { messages } = activeConversation;
 
-  const sanitizedTitle = activeConversation.title ? sanitizeBrandText(activeConversation.title) : activeConversation.title;
+  const sanitizedTitle = activeConversation.title
+    ? sanitizeBrandText(activeConversation.title)
+    : activeConversation.title;
+  const activeTask = status === "running" || status === "pending";
+  const executionDuration =
+    startedAt && (activeTask || completedAt)
+      ? Math.max(
+          0,
+          ((activeTask ? Date.now() : completedAt!) - startedAt) / 1000,
+        )
+      : null;
+  const executionModel =
+    fixedAgentProfile ||
+    [...messages]
+      .reverse()
+      .find((message) => message.role === "assistant" && message.modelName)
+      ?.modelName;
 
   return (
     <div className="flex-1 flex flex-col h-full relative">
       {/* Header bar */}
-      <div className="flex items-center justify-between px-4 py-3.5 sm:px-6 border-b border-border/60 bg-background/85 backdrop-blur-xl">
-        <div className="flex min-w-0 items-center gap-3 pl-10 sm:pl-0">
-          <h2 className="text-sm font-semibold text-foreground/80 truncate max-w-[400px]">
-            {sanitizedTitle}
-          </h2>
-          <StatusBadge status={status || "idle"} />
+      <div className="flex items-center justify-between gap-4 border-b border-border/60 bg-background/85 px-4 py-3 sm:px-6 backdrop-blur-xl">
+        <div className="min-w-0 pl-10 sm:pl-0">
+          <div className="flex min-w-0 items-center gap-3">
+            <h2 className="max-w-[400px] truncate text-sm font-semibold text-foreground/80">
+              {sanitizedTitle}
+            </h2>
+            <StatusBadge status={status || "idle"} />
+          </div>
+          {(executionModel || startedAt) && (
+            <div
+              className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground/70"
+              aria-label="任务执行信息"
+            >
+              {executionModel && (
+                <span className="inline-flex items-center gap-1">
+                  <Bot className="h-3 w-3" />
+                  {getModelDisplayName(executionModel)}
+                </span>
+              )}
+              {startedAt && (
+                <span>
+                  开始{" "}
+                  {new Date(startedAt).toLocaleTimeString("zh-CN", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit",
+                  })}
+                </span>
+              )}
+              {completedAt && !activeTask && (
+                <span>
+                  完成{" "}
+                  {new Date(completedAt).toLocaleTimeString("zh-CN", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit",
+                  })}
+                </span>
+              )}
+              {executionDuration !== null && (
+                <span className="inline-flex items-center gap-1 font-mono">
+                  <Clock className="h-3 w-3" />
+                  {formatExecutionDuration(executionDuration)}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto custom-scrollbar">
         <div className="max-w-4xl mx-auto px-3 py-6 space-y-6 sm:px-5 sm:py-8 sm:space-y-7">
-          {messages.length === 0 && status === "idle" && (
-            <EmptyConversationHint
-              onStartKnowledgeBase={startKnowledgeBase}
-            />
-          )}
+          {messages.length === 0 &&
+            status === "idle" &&
+            (responseLogicContext ? (
+              <ResponseLogicConversationHint
+                question={responseLogicContext.question}
+              />
+            ) : (
+              <EmptyConversationHint
+                onStartKnowledgeBase={startKnowledgeBase}
+                companyName={dashboardQuery.data?.payload.brandName || ""}
+                companyConfigured={Boolean(dashboardQuery.data?.sourceName)}
+                companyLoading={dashboardQuery.isLoading}
+              />
+            ))}
 
           <AnimatePresence initial={false}>
             {messages.map((msg) => (
               <MessageBubble
                 key={msg.id}
                 message={msg}
-                isRunning={status === "running"}
+                isRunning={status === "running" || status === "pending"}
+                suppressKnowledgeArtifacts={syncKnowledgeBaseSnapshot}
                 onDelete={() => {
                   if (activeConversation) {
                     deleteMessage(activeConversation.id, msg.id);
@@ -519,26 +719,37 @@ export default function ChatArea() {
           </AnimatePresence>
 
           {/* Typing indicator when running */}
-          {status === "running" && (() => {
-            let lastUserIdx = -1;
-            for (let i = messages.length - 1; i >= 0; i--) {
-              if (messages[i].role === "user") { lastUserIdx = i; break; }
-            }
-            const recentAssistantMsgs = messages.slice(lastUserIdx + 1).filter(m => m.role === "assistant");
-            const hasStepsOrContent = recentAssistantMsgs.some(
-              m => (m.stepGroups && m.stepGroups.length > 0) || (m.content && m.content.trim() !== "")
-            );
-            return !hasStepsOrContent;
-          })() && (
-            <TypingIndicator />
-          )}
+          {(status === "running" || status === "pending") &&
+            (() => {
+              let lastUserIdx = -1;
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i].role === "user") {
+                  lastUserIdx = i;
+                  break;
+                }
+              }
+              const recentAssistantMsgs = messages
+                .slice(lastUserIdx + 1)
+                .filter((m) => m.role === "assistant");
+              const hasStepsOrContent = recentAssistantMsgs.some(
+                (m) =>
+                  (m.stepGroups && m.stepGroups.length > 0) ||
+                  (m.content && m.content.trim() !== ""),
+              );
+              return !hasStepsOrContent;
+            })() && <TypingIndicator />}
 
           <div ref={bottomRef} />
         </div>
       </div>
 
       {/* Input area */}
-      <ChatInput />
+      <ChatInput
+        fixedAgentProfile={fixedAgentProfile}
+        syncKnowledgeBaseSnapshot={syncKnowledgeBaseSnapshot}
+        composerPrefill={composerPrefill}
+        responseLogicContext={responseLogicContext}
+      />
     </div>
   );
 }
@@ -577,16 +788,43 @@ function EmptyState() {
   );
 }
 
+function ResponseLogicConversationHint({ question }: { question: string }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="mx-auto max-w-xl py-10 text-center"
+    >
+      <span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-primary/10 text-primary">
+        <MessageSquareText className="h-5 w-5" />
+      </span>
+      <h3 className="mt-4 text-lg font-semibold text-foreground/80">
+        当前应答问题
+      </h3>
+      <p className="mt-2 text-sm font-medium leading-7 text-foreground/75">
+        {question}
+      </p>
+      <p className="mx-auto mt-2 max-w-md text-xs leading-6 text-muted-foreground">
+        输入企业口径或上传资料后，智能体会结合最新知识库生成可核验的应答逻辑。
+      </p>
+    </motion.div>
+  );
+}
+
 function EmptyConversationHint({
   onStartKnowledgeBase,
+  companyName,
+  companyConfigured,
+  companyLoading,
 }: {
   onStartKnowledgeBase: (input: DeepReportStartInput) => Promise<void>;
+  companyName: string;
+  companyConfigured: boolean;
+  companyLoading: boolean;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [companyName, setCompanyName] = useState("");
   const [companyWebsite, setCompanyWebsite] = useState("");
-  const [agentProfile, setAgentProfile] = useState("frontmind-pro");
   const [operatorNotes, setOperatorNotes] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -595,7 +833,9 @@ function EmptyConversationHint({
   const addFiles = useCallback((fileList: FileList | File[]) => {
     const incoming = Array.from(fileList);
     setFiles((current) => {
-      const seen = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+      const seen = new Set(
+        current.map((file) => `${file.name}:${file.size}:${file.lastModified}`),
+      );
       const next = [...current];
       for (const file of incoming) {
         const key = `${file.name}:${file.size}:${file.lastModified}`;
@@ -609,9 +849,7 @@ function EmptyConversationHint({
   }, []);
 
   const resetDialog = useCallback(() => {
-    setCompanyName("");
     setCompanyWebsite("");
-    setAgentProfile("frontmind-pro");
     setOperatorNotes("");
     setFiles([]);
     setIsDragging(false);
@@ -622,13 +860,15 @@ function EmptyConversationHint({
   }, []);
 
   const removeFile = useCallback((index: number) => {
-    setFiles((current) => current.filter((_, fileIndex) => fileIndex !== index));
+    setFiles((current) =>
+      current.filter((_, fileIndex) => fileIndex !== index),
+    );
   }, []);
 
   const handleStart = useCallback(async () => {
     const normalizedCompanyName = companyName.trim();
-    if (!normalizedCompanyName) {
-      toast.error("请输入企业名称");
+    if (!companyConfigured || !normalizedCompanyName) {
+      toast.error("请先由管理员配置当前账号的企业名称");
       return;
     }
 
@@ -637,7 +877,7 @@ function EmptyConversationHint({
       const payload = {
         companyName: normalizedCompanyName,
         companyWebsite: companyWebsite.trim(),
-        agentProfile,
+        agentProfile: "frontmind-pro",
         operatorNotes: operatorNotes.trim(),
         files,
       };
@@ -648,8 +888,8 @@ function EmptyConversationHint({
       setIsStarting(false);
     }
   }, [
-    agentProfile,
     companyName,
+    companyConfigured,
     companyWebsite,
     files,
     onStartKnowledgeBase,
@@ -686,9 +926,18 @@ function EmptyConversationHint({
 
         {/* Features highlight */}
         <div className="flex flex-wrap justify-center gap-4 pt-1">
-          <FeatureBadge icon={<FileText className="w-3.5 h-3.5" />} text="资料输入" />
-          <FeatureBadge icon={<Sparkles className="w-3.5 h-3.5" />} text="智能分析" />
-          <FeatureBadge icon={<Download className="w-3.5 h-3.5" />} text="报告交付" />
+          <FeatureBadge
+            icon={<FileText className="w-3.5 h-3.5" />}
+            text="资料输入"
+          />
+          <FeatureBadge
+            icon={<Sparkles className="w-3.5 h-3.5" />}
+            text="智能分析"
+          />
+          <FeatureBadge
+            icon={<Download className="w-3.5 h-3.5" />}
+            text="报告交付"
+          />
         </div>
       </motion.div>
 
@@ -708,23 +957,26 @@ function EmptyConversationHint({
 
           <div className="space-y-5 py-2">
             <div className="space-y-2">
-              <label className="text-sm font-medium text-foreground/80">企业名称</label>
+              <label className="text-sm font-medium text-foreground/80">
+                当前账号绑定企业
+              </label>
               <Input
                 value={companyName}
-                onChange={(event) => setCompanyName(event.target.value)}
-                placeholder="填写企业名称"
-                disabled={isStarting}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    void handleStart();
-                  }
-                }}
+                readOnly
+                placeholder={companyLoading ? "正在读取企业信息…" : "尚未配置"}
+                disabled={isStarting || companyLoading}
               />
+              {!companyLoading && !companyConfigured && (
+                <p className="text-xs leading-5 text-amber-700">
+                  管理员配置企业名称并发布看板后，才能开始构建知识库。
+                </p>
+              )}
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium text-foreground/80">企业官网入口</label>
+              <label className="text-sm font-medium text-foreground/80">
+                企业官网入口
+              </label>
               <Textarea
                 value={companyWebsite}
                 onChange={(event) => setCompanyWebsite(event.target.value)}
@@ -738,39 +990,9 @@ function EmptyConversationHint({
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium text-foreground/80">模型</label>
-              <div className="grid grid-cols-3 rounded-xl border border-border/70 bg-muted/30 p-1">
-                {MODEL_OPTIONS.map((model) => {
-                  const label =
-                    model.value === "frontmind-lite"
-                      ? "Lite"
-                      : model.value === "frontmind-base"
-                        ? "Base"
-                        : "Pro";
-                  const selected = agentProfile === model.value;
-                  return (
-                    <button
-                      key={model.value}
-                      type="button"
-                      disabled={isStarting}
-                      onClick={() => setAgentProfile(model.value)}
-                      className={cn(
-                        "h-9 rounded-lg text-sm font-medium transition-colors",
-                        selected
-                          ? "bg-primary text-primary-foreground shadow-sm"
-                          : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
-                        isStarting && "cursor-not-allowed opacity-60"
-                      )}
-                    >
-                      {label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-foreground/80">备注</label>
+              <label className="text-sm font-medium text-foreground/80">
+                备注
+              </label>
               <Textarea
                 value={operatorNotes}
                 onChange={(event) => setOperatorNotes(event.target.value)}
@@ -811,7 +1033,7 @@ function EmptyConversationHint({
                   isDragging
                     ? "border-primary/70 bg-primary/5"
                     : "border-border hover:border-primary/40 hover:bg-muted/40",
-                  isStarting && "cursor-not-allowed opacity-60"
+                  isStarting && "cursor-not-allowed opacity-60",
                 )}
               >
                 <UploadCloud className="mb-3 h-6 w-6 text-primary" />
@@ -841,7 +1063,9 @@ function EmptyConversationHint({
                       className="flex items-center justify-between gap-3 rounded-lg bg-background/80 px-3 py-2 text-sm"
                     >
                       <div className="min-w-0">
-                        <div className="truncate text-foreground/80">{file.name}</div>
+                        <div className="truncate text-foreground/80">
+                          {file.name}
+                        </div>
                         <div className="text-xs text-muted-foreground">
                           {(file.size / 1024 / 1024).toFixed(2)} MB
                         </div>
@@ -881,7 +1105,12 @@ function EmptyConversationHint({
             <Button
               type="button"
               onClick={() => void handleStart()}
-              disabled={isStarting || !companyName.trim()}
+              disabled={
+                isStarting ||
+                companyLoading ||
+                !companyConfigured ||
+                !companyName.trim()
+              }
               className="gap-2"
             >
               {isStarting ? (
@@ -938,7 +1167,8 @@ function MarkdownFileReader({
 
       // Fetch through the same-origin proxy when the source is an external signed URL.
       const displayName = sanitizeBrandText(fileName);
-      const normalizedUrl = buildProxyDownloadUrl(fileUrl, displayName, false) || fileUrl;
+      const normalizedUrl =
+        buildProxyDownloadUrl(fileUrl, displayName, false) || fileUrl;
 
       fetch(normalizedUrl, { credentials: "include" })
         .then(async (res) => {
@@ -946,15 +1176,20 @@ function MarkdownFileReader({
             throw new Error(`HTTP ${res.status}`);
           }
           const text = await res.text();
-          
+
           // Safety: check if we got JSON metadata instead of markdown content
           const ct = res.headers.get("content-type") || "";
-          if (ct.includes("application/json") && fileUrl.includes("/v1/files/")) {
+          if (
+            ct.includes("application/json") &&
+            fileUrl.includes("/v1/files/")
+          ) {
             try {
               const data = JSON.parse(text);
               if (data.upload_url) {
                 // Fetch actual content from S3 via proxy
-                const proxyUrl = buildProxyDownloadUrl(data.upload_url, displayName, false) || `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
+                const proxyUrl =
+                  buildProxyDownloadUrl(data.upload_url, displayName, false) ||
+                  `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
                 const s3Res = await fetch(proxyUrl, {
                   credentials: "include",
                 });
@@ -964,7 +1199,8 @@ function MarkdownFileReader({
                 return s3Res.text();
               }
             } catch (err) {
-              if ((err as Error)?.message?.includes("download failed")) throw err;
+              if ((err as Error)?.message?.includes("download failed"))
+                throw err;
               // Not valid JSON or no upload_url - use text as-is
             }
           }
@@ -987,7 +1223,9 @@ function MarkdownFileReader({
     try {
       if (content) {
         const downloadName = sanitizeBrandText(fileName);
-        const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+        const blob = new Blob([content], {
+          type: "text/markdown;charset=utf-8",
+        });
         const url = URL.createObjectURL(blob);
         nativeDownload(url, downloadName);
         URL.revokeObjectURL(url);
@@ -1013,15 +1251,26 @@ function MarkdownFileReader({
     (e: React.MouseEvent) => {
       e.preventDefault();
       resizingRef.current = true;
-      startRef.current = { x: e.clientX, y: e.clientY, w: size.width, h: size.height };
+      startRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        w: size.width,
+        h: size.height,
+      };
 
       const onMouseMove = (ev: MouseEvent) => {
         if (!resizingRef.current) return;
         const dw = ev.clientX - startRef.current.x;
         const dh = ev.clientY - startRef.current.y;
         setSize({
-          width: Math.max(400, Math.min(window.innerWidth * 0.95, startRef.current.w + dw)),
-          height: Math.max(300, Math.min(window.innerHeight * 0.95, startRef.current.h + dh)),
+          width: Math.max(
+            400,
+            Math.min(window.innerWidth * 0.95, startRef.current.w + dw),
+          ),
+          height: Math.max(
+            300,
+            Math.min(window.innerHeight * 0.95, startRef.current.h + dh),
+          ),
         });
       };
 
@@ -1034,7 +1283,7 @@ function MarkdownFileReader({
       document.addEventListener("mousemove", onMouseMove);
       document.addEventListener("mouseup", onMouseUp);
     },
-    [size]
+    [size],
   );
 
   return (
@@ -1072,7 +1321,12 @@ function MarkdownFileReader({
               )}
               下载
             </button>
-            <Button variant="ghost" size="icon" onClick={onClose} className="w-8 h-8">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onClose}
+              className="w-8 h-8"
+            >
               <X className="w-4 h-4" />
             </Button>
           </div>
@@ -1083,7 +1337,9 @@ function MarkdownFileReader({
           {loading && (
             <div className="flex items-center justify-center py-12">
               <Loader2 className="w-6 h-6 animate-spin text-primary" />
-              <span className="ml-2 text-sm text-muted-foreground">加载中...</span>
+              <span className="ml-2 text-sm text-muted-foreground">
+                加载中...
+              </span>
             </div>
           )}
           {error && (
@@ -1108,7 +1364,12 @@ function MarkdownFileReader({
           className="absolute bottom-0 right-0 w-4 h-4 cursor-se-resize"
           style={{ touchAction: "none" }}
         >
-          <svg width="16" height="16" viewBox="0 0 16 16" className="text-muted-foreground/40">
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 16 16"
+            className="text-muted-foreground/40"
+          >
             <path d="M14 14L8 14L14 8Z" fill="currentColor" />
             <path d="M14 14L11 14L14 11Z" fill="currentColor" opacity="0.5" />
           </svg>
@@ -1250,7 +1511,11 @@ function HtmlFileViewer({
     }
 
     return () => {
-      if (blobUrl && blobUrl.startsWith("blob:") && !fileUrl.startsWith("blob:")) {
+      if (
+        blobUrl &&
+        blobUrl.startsWith("blob:") &&
+        !fileUrl.startsWith("blob:")
+      ) {
         URL.revokeObjectURL(blobUrl);
       }
     };
@@ -1287,15 +1552,26 @@ function HtmlFileViewer({
     (e: React.MouseEvent) => {
       e.preventDefault();
       resizingRef.current = true;
-      startRef.current = { x: e.clientX, y: e.clientY, w: size.width, h: size.height };
+      startRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        w: size.width,
+        h: size.height,
+      };
 
       const onMouseMove = (ev: MouseEvent) => {
         if (!resizingRef.current) return;
         const dw = ev.clientX - startRef.current.x;
         const dh = ev.clientY - startRef.current.y;
         setSize({
-          width: Math.max(400, Math.min(window.innerWidth * 0.95, startRef.current.w + dw)),
-          height: Math.max(300, Math.min(window.innerHeight * 0.95, startRef.current.h + dh)),
+          width: Math.max(
+            400,
+            Math.min(window.innerWidth * 0.95, startRef.current.w + dw),
+          ),
+          height: Math.max(
+            300,
+            Math.min(window.innerHeight * 0.95, startRef.current.h + dh),
+          ),
         });
       };
 
@@ -1308,7 +1584,7 @@ function HtmlFileViewer({
       document.addEventListener("mousemove", onMouseMove);
       document.addEventListener("mouseup", onMouseUp);
     },
-    [size]
+    [size],
   );
 
   return (
@@ -1346,7 +1622,12 @@ function HtmlFileViewer({
               )}
               下载
             </button>
-            <Button variant="ghost" size="icon" onClick={onClose} className="w-8 h-8">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onClose}
+              className="w-8 h-8"
+            >
               <X className="w-4 h-4" />
             </Button>
           </div>
@@ -1357,7 +1638,9 @@ function HtmlFileViewer({
           {loading ? (
             <div className="flex items-center justify-center h-full">
               <Loader2 className="w-8 h-8 animate-spin text-primary/50" />
-              <span className="ml-2 text-sm text-muted-foreground">加载文件中...</span>
+              <span className="ml-2 text-sm text-muted-foreground">
+                加载文件中...
+              </span>
             </div>
           ) : error ? (
             <div className="flex flex-col items-center justify-center h-full gap-3">
@@ -1386,7 +1669,12 @@ function HtmlFileViewer({
           className="absolute bottom-0 right-0 w-4 h-4 cursor-se-resize"
           style={{ touchAction: "none" }}
         >
-          <svg width="16" height="16" viewBox="0 0 16 16" className="text-muted-foreground/40">
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 16 16"
+            className="text-muted-foreground/40"
+          >
             <path d="M14 14L8 14L14 8Z" fill="currentColor" />
             <path d="M14 14L11 14L14 11Z" fill="currentColor" opacity="0.5" />
           </svg>
@@ -1396,10 +1684,23 @@ function HtmlFileViewer({
   );
 }
 
-function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage; isRunning?: boolean; onDelete?: () => void }) {
+function MessageBubble({
+  message,
+  isRunning,
+  suppressKnowledgeArtifacts,
+  onDelete,
+}: {
+  message: LocalMessage;
+  isRunning?: boolean;
+  suppressKnowledgeArtifacts?: boolean;
+  onDelete?: () => void;
+}) {
   const isUser = message.role === "user";
   const [mdReaderOpen, setMdReaderOpen] = useState(false);
-  const [mdReaderFile, setMdReaderFile] = useState<{ url: string; name: string } | null>(null);
+  const [mdReaderFile, setMdReaderFile] = useState<{
+    url: string;
+    name: string;
+  } | null>(null);
   const [pdfViewerOpen, setPdfViewerOpen] = useState(false);
   const [pdfViewerFile, setPdfViewerFile] = useState<{
     url: string;
@@ -1407,20 +1708,41 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
     isPdf: boolean;
   } | null>(null);
   const [copied, setCopied] = useState(false);
+  const visibleOutputFiles = suppressKnowledgeArtifacts
+    ? message.outputFiles?.filter((file) => {
+        const filename = file.fileName.toLowerCase();
+        const mimeType = file.mimeType.toLowerCase();
+        return (
+          !filename.endsWith(".zip") &&
+          !filename.endsWith(".html") &&
+          !filename.endsWith(".htm") &&
+          !mimeType.includes("zip") &&
+          !mimeType.includes("html")
+        );
+      })
+    : message.outputFiles;
 
   const openMdReader = useCallback((url: string, name: string) => {
     setMdReaderFile({ url, name });
     setMdReaderOpen(true);
   }, []);
 
-  const openPdfViewer = useCallback((url: string, name: string, isPdf: boolean) => {
-    setPdfViewerFile({ url, name, isPdf });
-    setPdfViewerOpen(true);
-  }, []);
+  const openPdfViewer = useCallback(
+    (url: string, name: string, isPdf: boolean) => {
+      setPdfViewerFile({ url, name, isPdf });
+      setPdfViewerOpen(true);
+    },
+    [],
+  );
 
   // Calculate running elapsed time for this specific response
   const getRunningElapsed = () => {
-    if (!isUser && isRunning && message.responseStartedAt && !message.elapsedTime) {
+    if (
+      !isUser &&
+      isRunning &&
+      message.responseStartedAt &&
+      !message.elapsedTime
+    ) {
       const elapsed = (Date.now() - message.responseStartedAt) / 1000;
       if (elapsed >= 0) {
         if (elapsed < 60) return `${elapsed.toFixed(1)}s`;
@@ -1466,24 +1788,34 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
   };
 
   // Filter "等待用户输入" from content (req 8)
-  const displayContent = isUser ? message.content : filterWaitingText(message.content);
+  const displayContent = isUser
+    ? message.content
+    : filterWaitingText(message.content);
 
   // Apply FrontMind brand sanitization for assistant messages
-  const sanitizedContent = !isUser && displayContent ? sanitizeBrandText(displayContent) : displayContent;
+  const sanitizedContent =
+    !isUser && displayContent
+      ? sanitizeBrandText(displayContent)
+      : displayContent;
 
   // Sanitize step groups labels and descriptions
-  const sanitizedStepGroups = !isUser && message.stepGroups
-    ? message.stepGroups.map(group => ({
-        ...group,
-        title: sanitizeBrandText(group.title),
-        description: group.description ? sanitizeBrandText(group.description) : undefined,
-        steps: group.steps.map(step => ({
-          ...step,
-          label: sanitizeBrandText(step.label),
-          description: step.description ? sanitizeBrandText(step.description) : undefined,
-        })),
-      }))
-    : message.stepGroups;
+  const sanitizedStepGroups =
+    !isUser && message.stepGroups
+      ? message.stepGroups.map((group) => ({
+          ...group,
+          title: sanitizeBrandText(group.title),
+          description: group.description
+            ? sanitizeBrandText(group.description)
+            : undefined,
+          steps: group.steps.map((step) => ({
+            ...step,
+            label: sanitizeBrandText(step.label),
+            description: step.description
+              ? sanitizeBrandText(step.description)
+              : undefined,
+          })),
+        }))
+      : message.stepGroups;
 
   // Copy handler - uses sanitizedContent for assistant messages
   const handleCopyMessage = () => {
@@ -1508,48 +1840,58 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
           transition={{ type: "spring", stiffness: 400, damping: 30 }}
           className={cn("flex items-start gap-3", isUser && "flex-row-reverse")}
         >
-          {/* Avatar with model name label for assistant */}
-          <div className={cn("flex flex-col items-center flex-shrink-0 gap-0.5", isUser && "items-center")}>
-            {!isUser && message.modelName && (
-              <span className="text-[10px] text-muted-foreground/60 font-medium leading-tight whitespace-nowrap">
-                {(() => {
-	                  const m = message.modelName;
-	                  if (m === "frontmind-lite") return "Lite";
-	                  if (m === "frontmind-base") return "Base";
-	                  if (m === "frontmind-pro") return "Pro";
-	                  return m;
-                })()}
-              </span>
+          {/* Avatar */}
+          <div
+            className={cn(
+              "flex flex-col items-center flex-shrink-0 gap-0.5",
+              isUser && "items-center",
             )}
+          >
             <div
               className={cn(
                 "w-8 h-8 rounded-full flex items-center justify-center mt-0.5",
                 isUser
                   ? "bg-accent/15 text-accent"
-                  : "bg-primary/10 text-primary"
+                  : "bg-primary/10 text-primary",
               )}
             >
-              {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+              {isUser ? (
+                <User className="w-4 h-4" />
+              ) : (
+                <Bot className="w-4 h-4" />
+              )}
             </div>
           </div>
 
           {/* Message content */}
-          <div className={cn("max-w-[92%] space-y-2 sm:max-w-[80%]", isUser ? "items-end" : "items-start")}>
-            {/* Intermediate steps (assistant only) */}
-            {!isUser && sanitizedStepGroups && sanitizedStepGroups.length > 0 && (
-              <IntermediateSteps
-                stepGroups={sanitizedStepGroups}
-                isRunning={isRunning && !message.elapsedTime}
-              />
+          <div
+            className={cn(
+              "max-w-[92%] space-y-2 sm:max-w-[80%]",
+              isUser ? "items-end" : "items-start",
             )}
+          >
+            {/* Intermediate steps (assistant only) */}
+            {!isUser &&
+              sanitizedStepGroups &&
+              sanitizedStepGroups.length > 0 && (
+                <IntermediateSteps
+                  stepGroups={sanitizedStepGroups}
+                  isRunning={isRunning && !message.elapsedTime}
+                />
+              )}
 
             {/* Attachments (user) - with PDF/HTML inline viewer support */}
             {message.attachments && message.attachments.length > 0 && (
-              <div className={cn("flex flex-wrap gap-2 mb-1", isUser && "justify-end")}>
+              <div
+                className={cn(
+                  "flex flex-wrap gap-2 mb-1",
+                  isUser && "justify-end",
+                )}
+              >
                 {message.attachments.map((att) => (
                   <div key={att.id}>
                     {/* Image attachment: show ImagePreview with proper src */}
-                    {att.type === "image" && (
+                    {att.type === "image" &&
                       (() => {
                         // Determine image src: base64 > file (local object) > fileId (API proxy)
                         let imageSrc = "";
@@ -1569,9 +1911,10 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                             className="max-w-[200px] max-h-[200px]"
                           />
                         );
-                      })()
-                    )}
-                    {att.type !== "image" && (isPdfFile(att.name, att.file?.type) || isHtmlFile(att.name, att.file?.type)) ? (
+                      })()}
+                    {att.type !== "image" &&
+                    (isPdfFile(att.name, att.file?.type) ||
+                      isHtmlFile(att.name, att.file?.type)) ? (
                       <div
                         onClick={() => {
                           // Priority: blobUrl > File > base64 (convert to blob) > fileId
@@ -1585,7 +1928,9 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                             try {
                               const parts = att.base64.split(",");
                               const mimeMatch = parts[0]?.match(/:(.*?);/);
-                              const mime = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+                              const mime = mimeMatch
+                                ? mimeMatch[1]
+                                : "application/octet-stream";
                               const binaryStr = atob(parts[1]);
                               const bytes = new Uint8Array(binaryStr.length);
                               for (let j = 0; j < binaryStr.length; j++) {
@@ -1594,7 +1939,10 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                               const blob = new Blob([bytes], { type: mime });
                               fileViewUrl = URL.createObjectURL(blob);
                             } catch (e) {
-                              console.error("Failed to convert base64 to blob:", e);
+                              console.error(
+                                "Failed to convert base64 to blob:",
+                                e,
+                              );
                             }
                           } else if (att.fileId) {
                             fileViewUrl = `/api/frontmind/v1/files/${att.fileId}`;
@@ -1616,8 +1964,10 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                           <p className="text-xs font-medium text-foreground/70 truncate">
                             {sanitizeBrandText(att.name)}
                           </p>
-                          <p className="text-[10px] text-muted-foreground/50">
-                            {isPdfFile(att.name, att.file?.type) ? "点击查看 PDF" : "点击查看文件"}
+                          <p className="text-xs text-muted-foreground/50">
+                            {isPdfFile(att.name, att.file?.type)
+                              ? "点击查看 PDF"
+                              : "点击查看文件"}
                           </p>
                         </div>
                         <BookOpen className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
@@ -1637,11 +1987,13 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                   "rounded-3xl px-4.5 py-3 text-[14px] leading-relaxed",
                   isUser
                     ? "bg-primary text-primary-foreground rounded-tr-md shadow-sm"
-                    : "bg-card/80 border border-border/70 rounded-tl-md text-foreground shadow-sm"
+                    : "bg-card/80 border border-border/70 rounded-tl-md text-foreground shadow-sm",
                 )}
               >
                 {isUser ? (
-                  <p className="whitespace-pre-wrap break-words">{displayContent}</p>
+                  <p className="whitespace-pre-wrap break-words">
+                    {displayContent}
+                  </p>
                 ) : (
                   <MarkdownRenderer
                     content={sanitizedContent}
@@ -1666,13 +2018,18 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
             )}
 
             {/* Output files (assistant) - with PDF/HTML inline viewer and MD reader */}
-            {message.outputFiles && message.outputFiles.length > 0 && (
+            {visibleOutputFiles && visibleOutputFiles.length > 0 && (
               <div className="space-y-1.5 mt-1">
-                {message.outputFiles.map((file, i) => {
-                  const displayOutputFileName = sanitizeBrandText(file.fileName);
+                {visibleOutputFiles.map((file, i) => {
+                  const displayOutputFileName = sanitizeBrandText(
+                    file.fileName,
+                  );
                   const isMarkdown = isMdFile(displayOutputFileName);
                   const isPdf = isPdfFile(displayOutputFileName, file.mimeType);
-                  const isHtml = isHtmlFile(displayOutputFileName, file.mimeType);
+                  const isHtml = isHtmlFile(
+                    displayOutputFileName,
+                    file.mimeType,
+                  );
                   return (
                     <div
                       key={i}
@@ -1700,7 +2057,7 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                             <p className="text-xs font-medium text-foreground/70 truncate">
                               {displayOutputFileName}
                             </p>
-                            <p className="text-[10px] text-muted-foreground/50">
+                            <p className="text-xs text-muted-foreground/50">
                               点击在页面内阅读
                             </p>
                           </div>
@@ -1715,7 +2072,7 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                             <p className="text-xs font-medium text-foreground/70 truncate">
                               {displayOutputFileName}
                             </p>
-                            <p className="text-[10px] text-muted-foreground/50">
+                            <p className="text-xs text-muted-foreground/50">
                               {isPdf ? "点击查看 PDF" : "点击查看 HTML"}
                             </p>
                           </div>
@@ -1727,12 +2084,19 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                             e.stopPropagation();
                             try {
                               const downloadName = displayOutputFileName;
-                              const proxiedUrl = buildProxyDownloadUrl(file.fileUrl, downloadName, true);
+                              const proxiedUrl = buildProxyDownloadUrl(
+                                file.fileUrl,
+                                downloadName,
+                                true,
+                              );
                               if (proxiedUrl) {
                                 nativeDownload(proxiedUrl, downloadName);
                                 return;
                               }
-                              const blobUrl = await fetchWithAuth(file.fileUrl, downloadName);
+                              const blobUrl = await fetchWithAuth(
+                                file.fileUrl,
+                                downloadName,
+                              );
                               nativeDownload(blobUrl, downloadName);
                               URL.revokeObjectURL(blobUrl);
                             } catch (err) {
@@ -1748,7 +2112,7 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
                             <p className="text-xs font-medium text-foreground/70 truncate">
                               {displayOutputFileName}
                             </p>
-                            <p className="text-[10px] text-muted-foreground/50">
+                            <p className="text-xs text-muted-foreground/50">
                               {file.mimeType}
                             </p>
                           </div>
@@ -1763,51 +2127,51 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
 
             {/* Timestamp, elapsed time, and copy button */}
             {!(message.isStepsPlaceholder && !displayContent?.trim()) && (
-            <div
-              className={cn(
-                "flex items-center gap-2 mt-1 px-1",
-                isUser ? "justify-end" : "justify-start"
-              )}
-            >
-              <p className="text-[10px] text-muted-foreground/40">
-                {new Date(message.timestamp).toLocaleTimeString("zh-CN", {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-              </p>
-              {!isUser && elapsedDisplay && (
-                <span className="text-[10px] font-mono text-muted-foreground/50 flex items-center gap-0.5">
-                  <Clock className="w-2.5 h-2.5" />
-                  {elapsedDisplay}
-                </span>
-              )}
-              {/* Copy button for assistant messages */}
-              {!isUser && displayContent && displayContent.trim() !== "" && (
-                <button
-                  type="button"
-                  onClick={handleCopyMessage}
-                  className={cn(
-                    "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium transition-all duration-200 ml-1",
-                    copied
-                      ? "bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400"
-                      : "bg-muted/60 text-muted-foreground hover:bg-primary/10 hover:text-primary active:scale-95"
-                  )}
-                  title="复制内容"
-                >
-                  {copied ? (
-                    <>
-                      <CheckCircle2 className="w-3 h-3" />
-                      已复制
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-3 h-3" />
-                      复制
-                    </>
-                  )}
-                </button>
-              )}
-            </div>
+              <div
+                className={cn(
+                  "flex items-center gap-2 mt-1 px-1",
+                  isUser ? "justify-end" : "justify-start",
+                )}
+              >
+                <p className="text-xs text-muted-foreground/40">
+                  {new Date(message.timestamp).toLocaleTimeString("zh-CN", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </p>
+                {!isUser && elapsedDisplay && (
+                  <span className="text-xs font-mono text-muted-foreground/50 flex items-center gap-0.5">
+                    <Clock className="w-2.5 h-2.5" />
+                    {elapsedDisplay}
+                  </span>
+                )}
+                {/* Copy button for assistant messages */}
+                {!isUser && displayContent && displayContent.trim() !== "" && (
+                  <button
+                    type="button"
+                    onClick={handleCopyMessage}
+                    className={cn(
+                      "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium transition-all duration-200 ml-1",
+                      copied
+                        ? "bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400"
+                        : "bg-muted/60 text-muted-foreground hover:bg-primary/10 hover:text-primary active:scale-95",
+                    )}
+                    title="复制内容"
+                  >
+                    {copied ? (
+                      <>
+                        <CheckCircle2 className="w-3 h-3" />
+                        已复制
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        复制
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </motion.div>
@@ -1847,7 +2211,10 @@ function MessageBubble({ message, isRunning, onDelete }: { message: LocalMessage
  * StatusBadge — simplified: removed "已完成" icon display per req 4
  */
 function StatusBadge({ status }: { status: string }) {
-  const config: Record<string, { icon: React.ReactNode; label: string; className: string }> = {
+  const config: Record<
+    string,
+    { icon: React.ReactNode; label: string; className: string }
+  > = {
     idle: {
       icon: <Clock className="w-3 h-3" />,
       label: "就绪",
@@ -1859,14 +2226,14 @@ function StatusBadge({ status }: { status: string }) {
       className: "bg-amber-50 text-amber-600 border-amber-200/60",
     },
     pending: {
-      icon: <Clock className="w-3 h-3" />,
-      label: "就绪",
-      className: "bg-muted/60 text-muted-foreground border-border/30",
+      icon: <Loader2 className="w-3 h-3 animate-spin" />,
+      label: "排队中",
+      className: "bg-blue-50 text-blue-600 border-blue-200/60",
     },
     completed: {
-      icon: null,
-      label: "就绪",
-      className: "bg-muted/60 text-muted-foreground border-border/30",
+      icon: <CheckCircle2 className="w-3 h-3" />,
+      label: "已完成",
+      className: "bg-emerald-50 text-emerald-700 border-emerald-200/60",
     },
     error: {
       icon: <AlertCircle className="w-3 h-3" />,
@@ -1883,9 +2250,19 @@ function StatusBadge({ status }: { status: string }) {
   const c = config[status] || config.idle;
 
   return (
-    <Badge variant="outline" className={cn("gap-1 text-[11px] font-medium py-0.5", c.className)}>
+    <Badge
+      variant="outline"
+      className={cn("gap-1 text-xs font-medium py-0.5", c.className)}
+    >
       {c.icon}
       {c.label}
     </Badge>
   );
+}
+
+function formatExecutionDuration(seconds: number) {
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.floor(seconds % 60);
+  return `${minutes}m ${remainingSeconds}s`;
 }

@@ -9,6 +9,8 @@
 import { useCallback, useRef, useState } from "react";
 import {
   createTask,
+  createResponseLogicTask,
+  createKnowledgeBaseTurnTask,
   retrieveTask,
   uploadFile,
   fileToBase64,
@@ -16,6 +18,7 @@ import {
   type ContentItem,
   type Message,
   type OutputMessage,
+  type ResponseLogicTaskContext,
 } from "@/lib/frontmind-api";
 import {
   useConversation,
@@ -29,6 +32,7 @@ import {
   isImageUpload,
   type PreparedUploadFiles,
 } from "@/lib/attachment-files";
+import { reconcileKnowledgeBaseProgress } from "@/lib/knowledge-progress";
 import { toast } from "sonner";
 
 const MAX_RETRIES = 3;
@@ -95,7 +99,7 @@ async function withRetry<T>(
 /**
  * Slice only new output items from the cumulative API output array.
  */
-function sliceNewOutput(
+export function sliceNewOutput(
   output: OutputMessage[],
   baseline: number,
 ): OutputMessage[] {
@@ -108,11 +112,35 @@ function sliceNewOutput(
   return output.slice(baseline);
 }
 
-export type FailureKind = "quota" | "auth" | "busy" | "unknown";
+/**
+ * Knowledge-base tasks may return either a cumulative output array or only the
+ * current turn. Reconciliation is idempotent on the server, so falling back to
+ * the complete response is safer than silently missing a node transition.
+ */
+function outputForKnowledgeProgress(
+  output: OutputMessage[],
+  slicedOutput: OutputMessage[],
+): OutputMessage[] {
+  return slicedOutput.length > 0 ? slicedOutput : output;
+}
+
+export type FailureKind =
+  | "quota"
+  | "attachment"
+  | "auth"
+  | "busy"
+  | "unknown";
 
 export function classifyFailure(errorMsg: string): FailureKind {
   if (/quota|credit|balance|insufficient|积分|额度|余额|点数/i.test(errorMsg)) {
     return "quota";
+  }
+  if (
+    /ATTACHMENT_FORBIDDEN|附件不属于当前账号|上传资料与当前(?:账号|知识库任务|应答逻辑任务)不匹配/i.test(
+      errorMsg,
+    )
+  ) {
+    return "attachment";
   }
   if (
     /401|403|unauthorized|forbidden|authentication|authenticate|api[\s_-]*key|apikey|密钥|鉴权|认证/i.test(
@@ -135,10 +163,13 @@ function getFailureAdvice(errorMsg: string) {
   const failureKind = classifyFailure(errorMsg);
 
   if (failureKind === "quota") {
-    return "当前 Key 的额度可能不足，请更换 API Key 或联系管理员处理。";
+    return "当前服务资源可能不足，请联系负责管理员处理。";
+  }
+  if (failureKind === "attachment") {
+    return "多个账号可以共享服务连接，但附件仍按账号隔离；请在当前账号重新上传该附件。";
   }
   if (failureKind === "auth") {
-    return "请检查设置中的 API Key 是否正确。";
+    return "当前服务连接配置异常，请联系负责管理员处理。";
   }
   if (failureKind === "busy") {
     return "服务暂时繁忙，或本次附件任务较重。请稍后手动重试；如果反复失败，可以把原图手动压缩为 ZIP 后再发送。";
@@ -213,6 +244,7 @@ export function useSendMessage() {
       retryConfig: RetryConfig,
       baselineOutputLength: number,
       modelName?: string,
+      syncKnowledgeBaseSnapshot = false,
     ) => {
       // Stop any existing polling first
       stopPolling();
@@ -320,6 +352,34 @@ export function useSendMessage() {
                   );
                 }
               }
+
+              const knowledgeProgressOutput = outputForKnowledgeProgress(
+                updated.output,
+                newOutput,
+              );
+
+              if (
+                syncKnowledgeBaseSnapshot &&
+                knowledgeProgressOutput.length > 0
+              ) {
+                try {
+                  await reconcileKnowledgeBaseProgress({
+                    conversationId: convId,
+                    taskId: updated.id,
+                  });
+                } catch (error) {
+                  toast.warning("当前节点尚未通过进度校验", {
+                    description:
+                      error instanceof Error
+                        ? error.message
+                        : "请继续在当前节点补充或明确确认。",
+                  });
+                }
+                toast.info("知识库对话已完成", {
+                  description:
+                    "请点击构建流程页面右上角的“更新知识库”同步展示内容。",
+                });
+              }
             }
 
             toast.success("任务已完成", {
@@ -379,7 +439,11 @@ export function useSendMessage() {
 
           if (pollCount > 3 && err.message?.includes("404")) {
             stopPolling();
+            updateStatusRef.current(convId, "error", {
+              completedAt: Date.now(),
+            });
             toast.error("任务不存在或已被删除");
+            creditEventBus.emit();
             return;
           }
 
@@ -409,7 +473,12 @@ export function useSendMessage() {
     async (
       text: string,
       files: File[],
-      options?: { retryConfig?: RetryConfig; agentProfile?: string },
+      options?: {
+        retryConfig?: RetryConfig;
+        agentProfile?: string;
+        syncKnowledgeBaseSnapshot?: boolean;
+        responseLogicContext?: ResponseLogicTaskContext;
+      },
     ) => {
       if (sendInFlightRef.current) {
         toast.info("上一条消息正在发送，请稍候");
@@ -546,6 +615,7 @@ export function useSendMessage() {
               type: "input_file",
               file_id: result.fileId,
               filename: result.filename,
+              mime_type: file.type || "application/octet-stream",
             });
             attachments.push({
               id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -604,9 +674,6 @@ export function useSendMessage() {
           updateTitle(convId, title);
         }
 
-        // Send to API with retry
-        updateStatus(convId, "running");
-
         const responseStartedAt = Date.now();
 
         try {
@@ -643,7 +710,20 @@ export function useSendMessage() {
 
           // Create task exactly once. POST /v1/tasks is non-idempotent, so retrying
           // can create multiple upstream task windows for a single user send.
-          const response = await createTask(input, taskOptions);
+          const response = options?.syncKnowledgeBaseSnapshot
+            ? await createKnowledgeBaseTurnTask(input, {
+                conversationId: convId,
+                taskId: conv?.previousResponseId || "",
+              })
+            : options?.responseLogicContext
+              ? await createResponseLogicTask(input, {
+                  ...options.responseLogicContext,
+                  conversationId: convId,
+                  ...(isMultiTurn && conv?.previousResponseId
+                    ? { taskId: conv.previousResponseId }
+                    : {}),
+                })
+              : await createTask(input, taskOptions);
 
           setRetryCount(0);
           setIsRetrying(false);
@@ -705,6 +785,7 @@ export function useSendMessage() {
               retryConfig,
               baselineOutputLength,
               agentProfile,
+              options?.syncKnowledgeBaseSnapshot,
             );
           }
 
@@ -744,6 +825,34 @@ export function useSendMessage() {
                   );
                 }
               }
+
+              const knowledgeProgressOutput = outputForKnowledgeProgress(
+                response.output,
+                newOutput,
+              );
+
+              if (
+                options?.syncKnowledgeBaseSnapshot &&
+                knowledgeProgressOutput.length > 0
+              ) {
+                try {
+                  await reconcileKnowledgeBaseProgress({
+                    conversationId: convId,
+                    taskId: response.id,
+                  });
+                } catch (error) {
+                  toast.warning("当前节点尚未通过进度校验", {
+                    description:
+                      error instanceof Error
+                        ? error.message
+                        : "请继续在当前节点补充或明确确认。",
+                  });
+                }
+                toast.info("知识库对话已完成", {
+                  description:
+                    "请点击构建流程页面右上角的“更新知识库”同步展示内容。",
+                });
+              }
             }
 
             toast.success("任务已完成", {
@@ -755,7 +864,10 @@ export function useSendMessage() {
             creditEventBus.emit();
           }
         } catch (err: any) {
-          updateStatus(convId, "error");
+          updateStatus(convId, "error", {
+            startedAt: responseStartedAt,
+            completedAt: Date.now(),
+          });
           const errorMsg = err.message || "请求失败";
           const failureAdvice = getFailureAdvice(errorMsg);
           toast.error("发送失败", { description: failureAdvice });

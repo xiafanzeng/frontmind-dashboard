@@ -2,6 +2,8 @@ import { useMemo, useState, type FormEvent } from "react";
 import { useLocation } from "wouter";
 import {
   ArrowLeft,
+  CheckCircle2,
+  Copy,
   KeyRound,
   Loader2,
   Plus,
@@ -20,7 +22,11 @@ import {
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
 } from "@shared/auth-constraints";
+import type { ServicePlanCode } from "@shared/service-portal";
 import { trpc } from "@/lib/trpc";
+import { isSystemAdminAccount } from "@/lib/admin-access";
+import PortalShell from "@/components/PortalShell";
+import { getAdminNav } from "@/pages/AdminDashboard";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   AlertDialog,
@@ -58,12 +64,19 @@ type StatusChange = {
   isActive: boolean;
 };
 
+type AccessLevelChange = {
+  user: AuthUser;
+  adminAccessLevel: "system_admin" | "delivery_admin";
+};
+
 export default function AdminUsers() {
   const [, setLocation] = useLocation();
-  const { user: currentUser } = useAuth();
+  const { user: currentUser, refresh: refreshCurrentUser } = useAuth();
   const [createOpen, setCreateOpen] = useState(false);
   const [resetUser, setResetUser] = useState<AuthUser | null>(null);
   const [statusChange, setStatusChange] = useState<StatusChange | null>(null);
+  const [accessLevelChange, setAccessLevelChange] =
+    useState<AccessLevelChange | null>(null);
   const [deleteUser, setDeleteUser] = useState<AuthUser | null>(null);
 
   const usersQuery = trpc.admin.users.list.useQuery(undefined, {
@@ -77,11 +90,13 @@ export default function AdminUsers() {
   const deleteMutation = trpc.admin.users.delete.useMutation({
     onSuccess: () => utils.admin.users.list.invalidate(),
   });
+  const setAdminAccessLevelMutation =
+    trpc.admin.users.setAdminAccessLevel.useMutation();
 
   const users = (usersQuery.data?.users ?? []) as AuthUser[];
   const activeCount = useMemo(
     () => users.filter((account) => account.isActive).length,
-    [users]
+    [users],
   );
 
   const applyStatusChange = async () => {
@@ -92,7 +107,8 @@ export default function AdminUsers() {
         isActive: statusChange.isActive,
       });
       toast.success(statusChange.isActive ? "账号已启用" : "账号已禁用", {
-        description: statusChange.user.displayName || statusChange.user.username,
+        description:
+          statusChange.user.displayName || statusChange.user.username,
       });
       setStatusChange(null);
     } catch (error) {
@@ -117,7 +133,39 @@ export default function AdminUsers() {
     }
   };
 
-  if (currentUser?.role !== "admin") {
+  const applyAccessLevelChange = async () => {
+    if (!accessLevelChange) return;
+    try {
+      const result = await setAdminAccessLevelMutation.mutateAsync({
+        userId: accessLevelChange.user.id,
+        adminAccessLevel: accessLevelChange.adminAccessLevel,
+      });
+      await utils.admin.users.list.invalidate();
+      if (accessLevelChange.user.id === currentUser?.id) {
+        await refreshCurrentUser();
+      }
+      toast.success(
+        result.changed ? "管理员权限已更新" : "管理员权限未发生变化",
+        {
+          description: `${
+            accessLevelChange.user.displayName ||
+            accessLevelChange.user.username
+          } · ${
+            accessLevelChange.adminAccessLevel === "system_admin"
+              ? "系统管理员"
+              : "交付管理员"
+          }`,
+        },
+      );
+      setAccessLevelChange(null);
+    } catch (error) {
+      toast.error("无法更新管理员权限", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    }
+  };
+
+  if (!isSystemAdminAccount(currentUser)) {
     return (
       <main className="flex min-h-[100dvh] items-center justify-center bg-background p-4">
         <Card className="w-full max-w-md">
@@ -127,9 +175,13 @@ export default function AdminUsers() {
             </div>
             <h1 className="text-xl font-semibold">没有访问权限</h1>
             <p className="mt-2 text-sm text-muted-foreground">
-              账号管理仅对管理员开放。
+              账号管理仅对系统管理员开放。
             </p>
-            <Button className="mt-6" variant="outline" onClick={() => setLocation("/")}>
+            <Button
+              className="mt-6"
+              variant="outline"
+              onClick={() => setLocation("/")}
+            >
               <ArrowLeft className="h-4 w-4" />
               返回工作空间
             </Button>
@@ -140,66 +192,50 @@ export default function AdminUsers() {
   }
 
   return (
-    <main className="relative min-h-[100dvh] overflow-hidden bg-background">
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0"
-        style={{
-          background:
-            "radial-gradient(750px circle at 18% 0%, oklch(0.88 0.03 178 / 34%), transparent 52%), linear-gradient(180deg, oklch(0.988 0.006 83), oklch(0.965 0.011 83))",
-        }}
-      />
+    <PortalShell
+      eyebrow="管理中心 · 系统管理"
+      title="账号与权限"
+      navItems={getAdminNav(true)}
+      toolbar={
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            className="bg-card/80"
+            disabled={usersQuery.isFetching}
+            onClick={() => void usersQuery.refetch()}
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${usersQuery.isFetching ? "animate-spin" : ""}`}
+            />
+            刷新
+          </Button>
+          <Button onClick={() => setCreateOpen(true)}>
+            <Plus className="h-4 w-4" />
+            创建账号
+          </Button>
+        </div>
+      }
+    >
+      <div className="mx-auto w-full max-w-6xl">
+        <p className="mb-5 text-sm text-[#716a80]">
+          创建用户与管理员账号，配置系统管理员/交付管理员权限，并管理账号生命周期。
+        </p>
 
-      <div className="relative z-10 mx-auto w-full max-w-6xl px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
-        <header className="mb-8 flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex min-w-0 items-center gap-3">
-            <Button
-              variant="outline"
-              size="icon"
-              className="shrink-0 bg-card/80"
-              onClick={() => setLocation("/")}
-              aria-label="返回工作空间"
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <Users className="h-5 w-5 shrink-0 text-primary" />
-                <h1 className="truncate text-xl font-semibold tracking-tight sm:text-2xl">
-                  账号管理
-                </h1>
-              </div>
-              <p className="mt-1 text-sm text-muted-foreground">
-                创建用户账号、重置密码及管理账号生命周期。
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              className="bg-card/80"
-              disabled={usersQuery.isFetching}
-              onClick={() => void usersQuery.refetch()}
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${usersQuery.isFetching ? "animate-spin" : ""}`}
-              />
-              刷新
-            </Button>
-            <Button onClick={() => setCreateOpen(true)}>
-              <Plus className="h-4 w-4" />
-              创建账号
-            </Button>
-          </div>
-        </header>
-
-        <section className="mb-5 grid gap-3 sm:grid-cols-3">
+        <section className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <MetricCard label="账号总数" value={users.length} />
           <MetricCard label="已启用" value={activeCount} tone="positive" />
           <MetricCard
             label="管理员"
             value={users.filter((account) => account.role === "admin").length}
+          />
+          <MetricCard
+            label="系统管理员"
+            value={
+              users.filter(
+                (account) =>
+                  account.role === "admin" && isSystemAdminAccount(account),
+              ).length
+            }
           />
         </section>
 
@@ -236,13 +272,21 @@ export default function AdminUsers() {
                   <UserRow
                     key={account.id}
                     account={account}
-                    isCurrent={account.id === currentUser.id}
+                    isCurrent={account.id === currentUser?.id}
                     pending={
                       (setActiveMutation.isPending &&
                         statusChange?.user.id === account.id) ||
-                      (deleteMutation.isPending && deleteUser?.id === account.id)
+                      (deleteMutation.isPending &&
+                        deleteUser?.id === account.id)
+                    }
+                    accessPending={
+                      setAdminAccessLevelMutation.isPending &&
+                      accessLevelChange?.user.id === account.id
                     }
                     onResetPassword={() => setResetUser(account)}
+                    onChangeAccessLevel={(adminAccessLevel) =>
+                      setAccessLevelChange({ user: account, adminAccessLevel })
+                    }
                     onChangeStatus={(isActive) =>
                       setStatusChange({ user: account, isActive })
                     }
@@ -256,11 +300,63 @@ export default function AdminUsers() {
       </div>
 
       <CreateUserDialog open={createOpen} onOpenChange={setCreateOpen} />
-      <ResetPasswordDialog user={resetUser} onOpenChange={(open) => !open && setResetUser(null)} />
+      <ResetPasswordDialog
+        user={resetUser}
+        onOpenChange={(open) => !open && setResetUser(null)}
+      />
+
+      <AlertDialog
+        open={Boolean(accessLevelChange)}
+        onOpenChange={(open) =>
+          !open &&
+          !setAdminAccessLevelMutation.isPending &&
+          setAccessLevelChange(null)
+        }
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {accessLevelChange?.adminAccessLevel === "system_admin"
+                ? "设为系统管理员"
+                : "设为交付管理员"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {accessLevelChange?.adminAccessLevel === "system_admin"
+                ? `${accessLevelChange?.user.displayName || accessLevelChange?.user.username} 将可以管理全部客户、套餐合同、账号权限和官网全局凭据。`
+                : `${
+                    accessLevelChange?.user.displayName ||
+                    accessLevelChange?.user.username
+                  } 将只能管理被分配的客户，并失去账号、商业权益和全局凭据管理权限。系统会拒绝降级最后一名已启用的系统管理员。`}
+              {accessLevelChange?.user.id === currentUser?.id &&
+                accessLevelChange?.adminAccessLevel === "delivery_admin" &&
+                " 这是当前登录账号；确认后会立即退出本页的系统管理权限。"}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={setAdminAccessLevelMutation.isPending}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                void applyAccessLevelChange();
+              }}
+              disabled={setAdminAccessLevelMutation.isPending}
+            >
+              {setAdminAccessLevelMutation.isPending && (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              )}
+              确认调整权限
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog
         open={Boolean(statusChange)}
-        onOpenChange={(open) => !open && !setActiveMutation.isPending && setStatusChange(null)}
+        onOpenChange={(open) =>
+          !open && !setActiveMutation.isPending && setStatusChange(null)
+        }
       >
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -283,9 +379,15 @@ export default function AdminUsers() {
                 void applyStatusChange();
               }}
               disabled={setActiveMutation.isPending}
-              className={statusChange?.isActive ? "" : "bg-destructive text-white hover:bg-destructive/90"}
+              className={
+                statusChange?.isActive
+                  ? ""
+                  : "bg-destructive text-white hover:bg-destructive/90"
+              }
             >
-              {setActiveMutation.isPending && <Loader2 className="animate-spin" />}
+              {setActiveMutation.isPending && (
+                <Loader2 className="animate-spin" />
+              )}
               确认{statusChange?.isActive ? "启用" : "禁用"}
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -303,8 +405,8 @@ export default function AdminUsers() {
             <AlertDialogTitle>永久删除账号</AlertDialogTitle>
             <AlertDialogDescription>
               删除后，{deleteUser?.displayName || deleteUser?.username}
-              的账号、会话、消息、附件、API 凭据及登录会话都会从
-              FrontMind 数据库永久删除，且无法恢复。
+              的账号、会话、消息、附件、API 凭据及登录会话都会从 FrontMind
+              数据库永久删除，且无法恢复。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -319,15 +421,13 @@ export default function AdminUsers() {
               disabled={deleteMutation.isPending}
               className="bg-destructive text-white hover:bg-destructive/90"
             >
-              {deleteMutation.isPending && (
-                <Loader2 className="animate-spin" />
-              )}
+              {deleteMutation.isPending && <Loader2 className="animate-spin" />}
               确认永久删除
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </main>
+    </PortalShell>
   );
 }
 
@@ -344,7 +444,13 @@ function MetricCard({
     <Card className="border-border/70 bg-card/75 shadow-sm backdrop-blur-xl">
       <CardContent className="flex items-center justify-between px-4 py-3.5">
         <span className="text-sm text-muted-foreground">{label}</span>
-        <span className={tone === "positive" ? "text-xl font-semibold text-emerald-600" : "text-xl font-semibold"}>
+        <span
+          className={
+            tone === "positive"
+              ? "text-xl font-semibold text-emerald-600"
+              : "text-xl font-semibold"
+          }
+        >
           {value}
         </span>
       </CardContent>
@@ -356,19 +462,27 @@ function UserRow({
   account,
   isCurrent,
   pending,
+  accessPending,
   onResetPassword,
+  onChangeAccessLevel,
   onChangeStatus,
   onDelete,
 }: {
   account: AuthUser;
   isCurrent: boolean;
   pending: boolean;
+  accessPending: boolean;
   onResetPassword: () => void;
+  onChangeAccessLevel: (
+    adminAccessLevel: "system_admin" | "delivery_admin",
+  ) => void;
   onChangeStatus: (isActive: boolean) => void;
   onDelete: () => void;
 }) {
   const name = account.displayName || account.username;
   const initials = Array.from(name).slice(0, 2).join("").toUpperCase();
+  const busy = pending || accessPending;
+  const systemAdmin = isSystemAdminAccount(account);
 
   return (
     <div className="flex flex-col gap-4 px-4 py-4 sm:flex-row sm:items-center sm:px-5">
@@ -381,9 +495,15 @@ function UserRow({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-1.5">
             <p className="truncate text-sm font-medium">{name}</p>
-            {isCurrent && <Badge variant="outline" className="text-[10px]">当前账号</Badge>}
+            {isCurrent && (
+              <Badge variant="outline" className="text-xs">
+                当前账号
+              </Badge>
+            )}
           </div>
-          <p className="truncate text-xs text-muted-foreground">@{account.username}</p>
+          <p className="truncate text-xs text-muted-foreground">
+            @{account.username}
+          </p>
         </div>
       </div>
 
@@ -392,22 +512,55 @@ function UserRow({
           {account.role === "admin" ? (
             <ShieldCheck className="mr-1 h-3 w-3" />
           ) : null}
-          {account.role === "admin" ? "管理员" : "用户"}
+          {account.role === "admin"
+            ? systemAdmin
+              ? "系统管理员"
+              : "交付管理员"
+            : "用户"}
         </Badge>
-        <Badge variant="outline" className={account.isActive ? "text-emerald-700" : "text-muted-foreground"}>
+        <Badge
+          variant="outline"
+          className={
+            account.isActive ? "text-emerald-700" : "text-muted-foreground"
+          }
+        >
           {account.isActive ? "已启用" : "已禁用"}
         </Badge>
       </div>
 
-      <div className="flex gap-2 pl-[52px] sm:pl-0">
-        <Button size="sm" variant="outline" onClick={onResetPassword}>
+      <div className="flex flex-wrap gap-2 pl-[52px] sm:pl-0">
+        {account.role === "admin" && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() =>
+              onChangeAccessLevel(
+                systemAdmin ? "delivery_admin" : "system_admin",
+              )
+            }
+          >
+            {accessPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <ShieldCheck className="h-3.5 w-3.5" />
+            )}
+            {systemAdmin ? "设为交付管理员" : "设为系统管理员"}
+          </Button>
+        )}
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy}
+          onClick={onResetPassword}
+        >
           <KeyRound className="h-3.5 w-3.5" />
           重置密码
         </Button>
         <Button
           size="sm"
           variant={account.isActive ? "outline" : "default"}
-          disabled={pending || isCurrent}
+          disabled={busy || isCurrent}
           title={isCurrent ? "不能在此处禁用当前账号" : undefined}
           onClick={() => onChangeStatus(!account.isActive)}
         >
@@ -424,7 +577,7 @@ function UserRow({
           size="sm"
           variant="outline"
           className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-          disabled={pending || isCurrent}
+          disabled={busy || isCurrent}
           title={isCurrent ? "不能删除当前登录账号" : undefined}
           onClick={onDelete}
         >
@@ -436,20 +589,38 @@ function UserRow({
   );
 }
 
-function CreateUserDialog({
+export function CreateUserDialog({
   open,
   onOpenChange,
+  userOnly = false,
+  onCreated,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  userOnly?: boolean;
+  onCreated?: (userId: number) => void;
 }) {
   const utils = trpc.useUtils();
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"user" | "admin">("user");
+  const [planCode, setPlanCode] = useState<ServicePlanCode | "">("");
+  const [adminAccessLevel, setAdminAccessLevel] = useState<
+    "system_admin" | "delivery_admin"
+  >("delivery_admin");
+  const [createdSetup, setCreatedSetup] = useState<{
+    username: string;
+    setupUrl: string;
+    setupExpiresAt: number;
+    planCode: ServicePlanCode;
+  } | null>(null);
   const createMutation = trpc.admin.users.create.useMutation({
-    onSuccess: () => utils.admin.users.list.invalidate(),
+    onSuccess: () =>
+      Promise.all([
+        utils.admin.users.list.invalidate(),
+        utils.admin.workspace.list.invalidate(),
+      ]),
   });
 
   const reset = () => {
@@ -457,6 +628,9 @@ function CreateUserDialog({
     setDisplayName("");
     setPassword("");
     setRole("user");
+    setPlanCode("");
+    setAdminAccessLevel("delivery_admin");
+    setCreatedSetup(null);
     createMutation.reset();
   };
 
@@ -469,25 +643,54 @@ function CreateUserDialog({
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const normalizedUsername = username.trim();
-    if (!normalizedUsername || !password) {
-      toast.error("请填写用户名和初始密码");
+    if (!normalizedUsername) {
+      toast.error("请填写用户名");
       return;
     }
-    if (password.length < MIN_PASSWORD_LENGTH) {
+    if (role === "admin" && !password) {
+      toast.error("请填写管理员初始密码");
+      return;
+    }
+    if (role === "admin" && password.length < MIN_PASSWORD_LENGTH) {
       toast.error(`初始密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
+      return;
+    }
+    if (role === "user" && !planCode) {
+      toast.error("请选择客户套餐");
       return;
     }
 
     try {
-      await createMutation.mutateAsync({
-        username: normalizedUsername,
-        displayName: displayName.trim() || undefined,
-        password,
-        role,
+      const result =
+        role === "admin"
+          ? await createMutation.mutateAsync({
+              username: normalizedUsername,
+              displayName: displayName.trim() || undefined,
+              password,
+              role: "admin",
+              adminAccessLevel,
+            })
+          : await createMutation.mutateAsync({
+              username: normalizedUsername,
+              displayName: displayName.trim() || undefined,
+              role: "user",
+              planCode: planCode as ServicePlanCode,
+            });
+      toast.success("账号已创建", {
+        description: displayName.trim() || normalizedUsername,
       });
-      toast.success("账号已创建", { description: displayName.trim() || normalizedUsername });
-      reset();
-      onOpenChange(false);
+      onCreated?.(result.user.id);
+      if (result.setupUrl && result.setupExpiresAt) {
+        setCreatedSetup({
+          username: result.user.username,
+          setupUrl: result.setupUrl,
+          setupExpiresAt: result.setupExpiresAt,
+          planCode: result.contract!.planCode,
+        });
+      } else {
+        reset();
+        onOpenChange(false);
+      }
     } catch (error) {
       toast.error("无法创建账号", {
         description: error instanceof Error ? error.message : "请稍后重试",
@@ -498,75 +701,232 @@ function CreateUserDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="w-[min(calc(100vw-1rem),480px)]">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2 pr-8">
-            <Plus className="h-5 w-5 text-primary" />
-            创建账号
-          </DialogTitle>
-          <DialogDescription>用户首次登录后可以自行修改密码并配置 API Key。</DialogDescription>
-        </DialogHeader>
-        <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="create-username">用户名</Label>
-              <Input
-                id="create-username"
-                value={username}
-                onChange={(event) => setUsername(event.target.value)}
-                autoComplete="off"
-                autoCapitalize="none"
-                spellCheck={false}
-                placeholder="例如 zhangsan"
-                disabled={createMutation.isPending}
-              />
+        {createdSetup ? (
+          <>
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2 pr-8">
+                <CheckCircle2 className="h-5 w-5 text-emerald-600" />
+                用户账号已创建
+              </DialogTitle>
+              <DialogDescription>
+                客户账号和待确认套餐已建立，但尚未生成可用配额。请由系统管理员在客户交付工作台补齐订单、合同和签署证据后再开通权益。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="mt-3 space-y-4">
+              <div className="rounded-xl border border-[#e1d8e8] bg-[#faf8fc] p-4">
+                <p className="text-xs font-semibold text-[#716a80]">用户名</p>
+                <p className="mt-1 text-sm font-medium text-[#221a33]">
+                  {createdSetup.username}
+                </p>
+                <p className="mt-4 text-xs font-semibold text-[#716a80]">
+                  待确认套餐
+                </p>
+                <p className="mt-1 text-sm font-medium text-[#221a33]">
+                  {createdSetup.planCode === "basic"
+                    ? "普通版"
+                    : createdSetup.planCode === "advanced"
+                      ? "进阶版"
+                      : "豪华版"}
+                </p>
+                <p className="mt-4 text-xs font-semibold text-[#716a80]">
+                  一次性设置密码链接
+                </p>
+                <div className="mt-2 flex gap-2">
+                  <Input
+                    readOnly
+                    value={createdSetup.setupUrl}
+                    className="min-w-0 font-mono text-xs"
+                    onFocus={(event) => event.currentTarget.select()}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    aria-label="复制设置密码链接"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(
+                          createdSetup.setupUrl,
+                        );
+                        toast.success("激活链接已复制");
+                      } catch {
+                        toast.error("无法自动复制，请手动复制链接");
+                      }
+                    }}
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </div>
+                <p className="mt-2 text-xs text-[#9a94a8]">
+                  有效期至{" "}
+                  {new Date(createdSetup.setupExpiresAt).toLocaleString(
+                    "zh-CN",
+                  )}
+                  ，使用一次后立即失效。
+                </p>
+              </div>
+              <div className="flex justify-end">
+                <Button type="button" onClick={() => handleOpenChange(false)}>
+                  完成
+                </Button>
+              </div>
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="create-display-name">显示名称（可选）</Label>
-              <Input
-                id="create-display-name"
-                value={displayName}
-                onChange={(event) => setDisplayName(event.target.value)}
-                placeholder="例如 张三"
-                disabled={createMutation.isPending}
-              />
-            </div>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="create-password">初始密码</Label>
-            <Input
-              id="create-password"
-              type="password"
-              autoComplete="new-password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              minLength={MIN_PASSWORD_LENGTH}
-              maxLength={MAX_PASSWORD_LENGTH}
-              placeholder={`至少 ${MIN_PASSWORD_LENGTH} 个字符`}
-              disabled={createMutation.isPending}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label>账号角色</Label>
-            <Select value={role} onValueChange={(value) => setRole(value as "user" | "admin")} disabled={createMutation.isPending}>
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="user">用户</SelectItem>
-                <SelectItem value="admin">管理员</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
-            <Button type="button" variant="outline" onClick={() => handleOpenChange(false)} disabled={createMutation.isPending}>
-              取消
-            </Button>
-            <Button type="submit" disabled={createMutation.isPending}>
-              {createMutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
-              创建账号
-            </Button>
-          </div>
-        </form>
+          </>
+        ) : (
+          <>
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2 pr-8">
+                <Plus className="h-5 w-5 text-primary" />
+                创建账号
+              </DialogTitle>
+              <DialogDescription>
+                {userOnly
+                  ? "创建客户时必须选择套餐；创建后仅建立待确认合同，正式权益需完成商业证据核验后开通。"
+                  : "普通用户必须选择套餐并通过一次性链接设置密码；套餐先进入待确认，管理员账号仍由系统管理员设置初始密码。"}
+              </DialogDescription>
+            </DialogHeader>
+            <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="create-username">用户名</Label>
+                  <Input
+                    id="create-username"
+                    value={username}
+                    onChange={(event) => setUsername(event.target.value)}
+                    autoComplete="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    placeholder="例如 zhangsan"
+                    disabled={createMutation.isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="create-display-name">显示名称（可选）</Label>
+                  <Input
+                    id="create-display-name"
+                    value={displayName}
+                    onChange={(event) => setDisplayName(event.target.value)}
+                    placeholder="例如 张三"
+                    disabled={createMutation.isPending}
+                  />
+                </div>
+              </div>
+              {role === "admin" ? (
+                <div className="space-y-2">
+                  <Label htmlFor="create-password">管理员初始密码</Label>
+                  <Input
+                    id="create-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    minLength={MIN_PASSWORD_LENGTH}
+                    maxLength={MAX_PASSWORD_LENGTH}
+                    placeholder={`至少 ${MIN_PASSWORD_LENGTH} 个字符`}
+                    disabled={createMutation.isPending}
+                  />
+                </div>
+              ) : (
+                <div className="rounded-xl border border-[#e1d8e8] bg-[#faf8fc] px-4 py-3 text-sm leading-6 text-[#716a80]">
+                  创建后会生成 48
+                  小时有效的一次性设置密码链接。数据库仅保存链接凭证的哈希，不保存或展示用户密码。
+                </div>
+              )}
+              {!userOnly && (
+                <div className="space-y-2">
+                  <Label>账号角色</Label>
+                  <Select
+                    value={role}
+                    onValueChange={(value) => {
+                      setRole(value as "user" | "admin");
+                      setPlanCode("");
+                    }}
+                    disabled={createMutation.isPending}
+                  >
+                    <SelectTrigger className="w-full" aria-label="账号角色">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="user">用户</SelectItem>
+                      <SelectItem value="admin">管理员</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+              {role === "user" && (
+                <div className="space-y-2">
+                  <Label>客户套餐</Label>
+                  <Select
+                    value={planCode}
+                    onValueChange={(value) =>
+                      setPlanCode(value as ServicePlanCode)
+                    }
+                    disabled={createMutation.isPending}
+                  >
+                    <SelectTrigger className="w-full" aria-label="客户套餐">
+                      <SelectValue placeholder="请选择普通版、进阶版或豪华版" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="basic">普通版</SelectItem>
+                      <SelectItem value="advanced">进阶版</SelectItem>
+                      <SelectItem value="luxury">豪华版</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    创建时只记录待确认套餐，不生成配额。系统管理员需在客户交付工作台补齐订单、合同编号、签署主体、签署时间与核验依据后才能待生效或生效。
+                  </p>
+                </div>
+              )}
+              {role === "admin" && (
+                <div className="space-y-2">
+                  <Label>管理员权限</Label>
+                  <Select
+                    value={adminAccessLevel}
+                    onValueChange={(value) =>
+                      setAdminAccessLevel(
+                        value as "system_admin" | "delivery_admin",
+                      )
+                    }
+                    disabled={createMutation.isPending}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="delivery_admin">交付管理员</SelectItem>
+                      <SelectItem value="system_admin">系统管理员</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    交付管理员仅管理被分配客户；系统管理员可调整合同权益、
+                    管理账号及官网全局凭据。
+                  </p>
+                </div>
+              )}
+              <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => handleOpenChange(false)}
+                  disabled={createMutation.isPending}
+                >
+                  取消
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={
+                    createMutation.isPending || (role === "user" && !planCode)
+                  }
+                >
+                  {createMutation.isPending && (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  )}
+                  {role === "user" ? "创建客户账号" : "创建管理员"}
+                </Button>
+              </div>
+            </form>
+          </>
+        )}
       </DialogContent>
     </Dialog>
   );
@@ -604,7 +964,10 @@ function ResetPasswordDialog({
     }
 
     try {
-      await resetMutation.mutateAsync({ userId: user.id, newPassword: password });
+      await resetMutation.mutateAsync({
+        userId: user.id,
+        newPassword: password,
+      });
       toast.success("密码已重置", {
         description: `${user.displayName || user.username} 需要使用新密码重新登录`,
       });
@@ -628,7 +991,8 @@ function ResetPasswordDialog({
             重置密码
           </DialogTitle>
           <DialogDescription>
-            为 {user?.displayName || user?.username} 设置新密码，现有登录会话将失效。
+            为 {user?.displayName || user?.username}{" "}
+            设置新密码，现有登录会话将失效。
           </DialogDescription>
         </DialogHeader>
         <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
@@ -659,11 +1023,18 @@ function ResetPasswordDialog({
             />
           </div>
           <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
-            <Button type="button" variant="outline" onClick={close} disabled={resetMutation.isPending}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={close}
+              disabled={resetMutation.isPending}
+            >
               取消
             </Button>
             <Button type="submit" disabled={resetMutation.isPending}>
-              {resetMutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              {resetMutation.isPending && (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              )}
               确认重置
             </Button>
           </div>

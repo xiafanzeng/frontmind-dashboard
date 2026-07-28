@@ -3,9 +3,53 @@ import type { Request } from "express";
 const UPSTREAM_VENDOR = ["ma", "nus"].join("");
 const DEFAULT_UPSTREAM_BASE_URL = `https://api.${UPSTREAM_VENDOR}.im`;
 
-export function getUpstreamBaseUrl(req?: Request) {
-  const configured = process.env.FRONTMIND_UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL;
-  return configured.replace(/\/$/, "");
+export function configuredUpstreamBaseUrl(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const raw =
+    env.FRONTMIND_UPSTREAM_BASE_URL?.trim() || DEFAULT_UPSTREAM_BASE_URL;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+
+  if (
+    parsed.protocol !== "https:" ||
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    /[?#]/.test(raw)
+  ) {
+    return null;
+  }
+
+  return parsed.toString().replace(/\/+$/, "");
+}
+
+export function isUpstreamBaseUrlConfigured(
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  return configuredUpstreamBaseUrl(env) !== null;
+}
+
+export function assertUpstreamBaseUrlConfigured(
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const configured = configuredUpstreamBaseUrl(env);
+  if (!configured) {
+    throw new Error(
+      "FRONTMIND_UPSTREAM_BASE_URL must be an HTTPS URL without credentials, query, or fragment",
+    );
+  }
+  return configured;
+}
+
+export function getUpstreamBaseUrl(_req?: Request) {
+  return assertUpstreamBaseUrlConfigured();
 }
 
 export function getFrontMindApiKey(req: Request) {

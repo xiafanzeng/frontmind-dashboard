@@ -1,8 +1,9 @@
 import type { NextFunction, Response } from "express";
 import {
   AuthServiceError,
+  credentialsUseSameUpstreamApiKey,
+  getEffectiveDecryptedCredentialForAccount,
   getCredentialForUpstreamResource,
-  getDecryptedCredentialForUser,
 } from "../auth-service";
 import type { FrontMindRequest } from "./express-auth";
 
@@ -90,7 +91,7 @@ export async function resolveUpstreamCredential(
           primaryResource.kind,
           primaryResource.id,
         )
-      : await getDecryptedCredentialForUser(user.id);
+      : await getEffectiveDecryptedCredentialForAccount(user.id);
 
     if (!credential) {
       sendCredentialError(
@@ -98,7 +99,7 @@ export async function resolveUpstreamCredential(
         primaryResource ? 403 : 428,
         primaryResource
           ? "该任务或文件不属于当前账号，或其原 API Key 已删除"
-          : "请先在账号设置中配置 API Key",
+          : "当前账号尚未由管理员配置 API Key",
         primaryResource ? "UPSTREAM_RESOURCE_FORBIDDEN" : "API_CREDENTIAL_REQUIRED",
       );
       return;
@@ -106,11 +107,14 @@ export async function resolveUpstreamCredential(
 
     for (const fileId of getAttachmentFileIds(req)) {
       const ownedFile = await getCredentialForUpstreamResource(user.id, "file", fileId);
-      if (!ownedFile || ownedFile.id !== credential.id) {
+      if (
+        !ownedFile ||
+        !credentialsUseSameUpstreamApiKey(ownedFile, credential)
+      ) {
         sendCredentialError(
           res,
           403,
-          "附件不属于当前账号或使用了不同的 API Key",
+          "附件不属于当前账号，或与当前任务使用的 API Key 不一致",
           "ATTACHMENT_FORBIDDEN",
         );
         return;

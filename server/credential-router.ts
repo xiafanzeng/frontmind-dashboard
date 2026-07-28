@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { protectedProcedure, router } from "./_core/trpc";
+import { adminProcedure, router } from "./_core/trpc";
 import {
   AuthServiceError,
   deleteActiveApiCredential,
@@ -27,7 +27,7 @@ async function saveCredential(userId: number, apiKey: string) {
 }
 
 export const credentialRouter = router({
-  status: protectedProcedure.query(async ({ ctx }) => {
+  status: adminProcedure.query(async ({ ctx }) => {
     try {
       return await getApiCredentialStatus(ctx.user.id);
     } catch (error) {
@@ -35,15 +35,15 @@ export const credentialRouter = router({
     }
   }),
 
-  set: protectedProcedure
+  set: adminProcedure
     .input(apiKeyInput)
     .mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
 
-  replace: protectedProcedure
+  replace: adminProcedure
     .input(apiKeyInput)
     .mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
 
-  test: protectedProcedure
+  test: adminProcedure
     .input(testApiKeyInput)
     .mutation(async ({ ctx, input }) => {
       try {
@@ -61,7 +61,7 @@ export const credentialRouter = router({
       }
     }),
 
-  delete: protectedProcedure.mutation(async ({ ctx }) => {
+  delete: adminProcedure.mutation(async ({ ctx }) => {
     try {
       await deleteActiveApiCredential(ctx.user.id);
       return { success: true } as const;

@@ -13,8 +13,25 @@ import { useConversation } from "@/contexts/ConversationContext";
 import { useIsMobile } from "@/hooks/useMobile";
 import { Button } from "@/components/ui/button";
 import { CloudOff, Loader2, RefreshCw, X } from "lucide-react";
+import type { ResponseLogicTaskContext } from "@/lib/frontmind-api";
 
-export default function Home() {
+export default function Home({
+  embedded = false,
+  fixedAgentProfile,
+  syncKnowledgeBaseSnapshot = false,
+  composerPrefill,
+  hideSidebar = false,
+  hidePortalNavigation = false,
+  responseLogicContext,
+}: {
+  embedded?: boolean;
+  fixedAgentProfile?: string;
+  syncKnowledgeBaseSnapshot?: boolean;
+  composerPrefill?: string;
+  hideSidebar?: boolean;
+  hidePortalNavigation?: boolean;
+  responseLogicContext?: ResponseLogicTaskContext;
+} = {}) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const {
@@ -29,17 +46,21 @@ export default function Home() {
 
   useKeyboardShortcuts({
     onNewChat: useCallback(() => {
-      if (hydrated) createConversation();
-    }, [createConversation, hydrated]),
+      if (hydrated && !hideSidebar) createConversation();
+    }, [createConversation, hideSidebar, hydrated]),
     onSettings: useCallback(() => setSettingsOpen(true), []),
     onToggleSidebar: useCallback(() => {
-      if (!isMobile) setSidebarCollapsed((p) => !p);
-    }, [isMobile]),
+      if (!isMobile && !hideSidebar) setSidebarCollapsed((p) => !p);
+    }, [hideSidebar, isMobile]),
   });
 
   if (!hydrated) {
     return (
-      <div className="flex h-[100dvh] w-screen items-center justify-center bg-background p-4">
+      <div
+        className={`flex items-center justify-center bg-background p-4 ${
+          embedded ? "h-full w-full" : "h-[100dvh] w-screen"
+        }`}
+      >
         <div className="glass-card w-full max-w-sm rounded-2xl p-7 text-center">
           {loading ? (
             <Loader2 className="mx-auto h-7 w-7 animate-spin text-primary" />
@@ -70,7 +91,11 @@ export default function Home() {
   }
 
   return (
-    <div className="h-[100dvh] w-screen flex overflow-hidden relative bg-background">
+    <div
+      className={`flex overflow-hidden relative bg-background ${
+        embedded ? "h-full w-full" : "h-[100dvh] w-screen"
+      }`}
+    >
       {/* Premium calm workspace background */}
       <div
         className="absolute inset-0 pointer-events-none"
@@ -107,15 +132,24 @@ export default function Home() {
       )}
 
       {/* Sidebar */}
-      <Sidebar
-        collapsed={sidebarCollapsed}
-        onToggle={() => setSidebarCollapsed((p) => !p)}
-        onOpenSettings={() => setSettingsOpen(true)}
-      />
+      {!hideSidebar && (
+        <Sidebar
+          collapsed={sidebarCollapsed}
+          onToggle={() => setSidebarCollapsed((p) => !p)}
+          onOpenSettings={() => setSettingsOpen(true)}
+          embedded={embedded}
+          hidePortalNavigation={hidePortalNavigation}
+        />
+      )}
 
       {/* Main content */}
       <main className="flex-1 flex flex-col relative z-10">
-        <ChatArea />
+        <ChatArea
+          fixedAgentProfile={fixedAgentProfile}
+          syncKnowledgeBaseSnapshot={syncKnowledgeBaseSnapshot}
+          composerPrefill={composerPrefill}
+          responseLogicContext={responseLogicContext}
+        />
       </main>
 
       {/* Settings dialog */}

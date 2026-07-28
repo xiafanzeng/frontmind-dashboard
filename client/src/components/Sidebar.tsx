@@ -13,6 +13,8 @@
  *    button so it can never be squeezed out.
  */
 import { useState } from "react";
+import { useLocation } from "wouter";
+import { useAuth } from "@/_core/hooks/useAuth";
 import { useConversation } from "@/contexts/ConversationContext";
 import { useIsMobile } from "@/hooks/useMobile";
 import { Button } from "@/components/ui/button";
@@ -37,11 +39,14 @@ import {
   ChevronLeft,
   ChevronRight,
   Menu,
+  BriefcaseBusiness,
+  LayoutDashboard,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import type { Conversation } from "@/contexts/ConversationContext";
 import AccountMenu from "@/components/AccountMenu";
+import { isSystemAdminAccount } from "@/lib/admin-access";
 
 const LOGO_ICON =
   "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
@@ -50,14 +55,21 @@ interface SidebarProps {
   collapsed: boolean;
   onToggle: () => void;
   onOpenSettings: () => void;
+  embedded?: boolean;
+  hidePortalNavigation?: boolean;
 }
 
 export default function Sidebar({
   collapsed,
   onToggle,
   onOpenSettings,
+  embedded = false,
+  hidePortalNavigation = false,
 }: SidebarProps) {
   const isMobile = useIsMobile();
+  const [, setLocation] = useLocation();
+  const { user } = useAuth();
+  const isSystemAdmin = isSystemAdminAccount(user);
   const {
     state,
     activeConversation,
@@ -97,7 +109,9 @@ export default function Sidebar({
           <Button
             variant="ghost"
             size="icon"
-            className="fixed left-[max(0.75rem,env(safe-area-inset-left))] top-[max(0.75rem,env(safe-area-inset-top))] z-50 border border-border/70 bg-card/90 shadow-sm backdrop-blur-sm"
+            className={`left-[max(0.75rem,env(safe-area-inset-left))] top-[max(0.75rem,env(safe-area-inset-top))] z-50 border border-border/70 bg-card/90 shadow-sm backdrop-blur-sm ${
+              embedded ? "absolute" : "fixed"
+            }`}
             aria-label="打开内容流程菜单"
           >
             <Menu className="w-5 h-5" />
@@ -130,6 +144,17 @@ export default function Sidebar({
               setOpen(false);
             }}
             onNavigate={() => setOpen(false)}
+            isAdmin={user?.role === "admin"}
+            isSystemAdmin={isSystemAdmin}
+            hidePortalNavigation={hidePortalNavigation}
+            onOpenAdmin={() => {
+              setLocation("/");
+              setOpen(false);
+            }}
+            onOpenPresales={() => {
+              setLocation("/admin/presales");
+              setOpen(false);
+            }}
             collapsed={false}
             onToggle={() => {}}
             isMobile={true}
@@ -166,7 +191,7 @@ export default function Sidebar({
               <h1 className="text-sm font-semibold text-sidebar-foreground tracking-wide">
                 FrontMind Studio
               </h1>
-              <p className="text-[10px] text-muted-foreground font-mono tracking-wider">
+              <p className="text-xs text-muted-foreground font-mono tracking-wider">
                 CONTENT AGENTS
               </p>
             </motion.div>
@@ -221,9 +246,7 @@ export default function Sidebar({
 
           {state.conversations.length === 0 && !collapsed && (
             <div className="px-3 py-8 text-center">
-              <p className="text-[11px] text-muted-foreground/50">
-                暂无内容流程
-              </p>
+              <p className="text-xs text-muted-foreground/50">暂无内容流程</p>
             </div>
           )}
         </div>
@@ -231,6 +254,50 @@ export default function Sidebar({
 
       {/* Footer */}
       <div className="relative z-10 px-2 py-2 border-t border-border/70 space-y-0.5 flex-shrink-0">
+        {!hidePortalNavigation && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                onClick={() => setLocation("/")}
+                variant="ghost"
+                className={cn(
+                  "w-full text-muted-foreground hover:text-foreground hover:bg-card/70",
+                  collapsed ? "px-0 justify-center" : "justify-start gap-2",
+                )}
+                size="sm"
+              >
+                <LayoutDashboard className="w-4 h-4 flex-shrink-0" />
+                {!collapsed && <span className="text-xs">返回管理中心</span>}
+              </Button>
+            </TooltipTrigger>
+            {collapsed && (
+              <TooltipContent side="right">返回管理中心</TooltipContent>
+            )}
+          </Tooltip>
+        )}
+
+        {!hidePortalNavigation && isSystemAdmin && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                onClick={() => setLocation("/admin/presales")}
+                variant="ghost"
+                className={cn(
+                  "w-full text-muted-foreground hover:text-foreground hover:bg-card/70",
+                  collapsed ? "px-0 justify-center" : "justify-start gap-2",
+                )}
+                size="sm"
+              >
+                <BriefcaseBusiness className="w-4 h-4 flex-shrink-0" />
+                {!collapsed && <span className="text-xs">售前页面</span>}
+              </Button>
+            </TooltipTrigger>
+            {collapsed && (
+              <TooltipContent side="right">售前页面</TooltipContent>
+            )}
+          </Tooltip>
+        )}
+
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -386,7 +453,7 @@ function ConversationItem({
               <p className="text-[13px] font-medium truncate leading-tight">
                 {conv.title}
               </p>
-              <p className="text-[11px] opacity-40 mt-0.5 truncate">
+              <p className="text-xs opacity-40 mt-0.5 truncate">
                 {formatTime(conv.updatedAt)}
                 {conv.messages.length > 0 && (
                   <span className="ml-1.5">· {conv.messages.length} 条</span>
@@ -435,6 +502,11 @@ interface SidebarInnerProps {
   collapsed: boolean;
   onToggle: () => void;
   isMobile: boolean;
+  isAdmin: boolean;
+  isSystemAdmin: boolean;
+  hidePortalNavigation: boolean;
+  onOpenAdmin: () => void;
+  onOpenPresales: () => void;
 }
 
 function SidebarInner({
@@ -448,6 +520,11 @@ function SidebarInner({
   onOpenSettings,
   onNavigate,
   isMobile,
+  isAdmin,
+  isSystemAdmin,
+  hidePortalNavigation,
+  onOpenAdmin,
+  onOpenPresales,
 }: SidebarInnerProps) {
   return (
     <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-sidebar/95 text-sidebar-foreground backdrop-blur-xl">
@@ -464,7 +541,7 @@ function SidebarInner({
           <h1 className="text-sm font-semibold text-sidebar-foreground tracking-wide">
             FrontMind Studio
           </h1>
-          <p className="text-[10px] text-muted-foreground font-mono tracking-wider">
+          <p className="text-xs text-muted-foreground font-mono tracking-wider">
             CONTENT AGENTS
           </p>
         </div>
@@ -507,9 +584,7 @@ function SidebarInner({
 
           {state.conversations.length === 0 && (
             <div className="px-3 py-8 text-center">
-              <p className="text-[11px] text-muted-foreground/50">
-                暂无内容流程
-              </p>
+              <p className="text-xs text-muted-foreground/50">暂无内容流程</p>
             </div>
           )}
         </div>
@@ -517,6 +592,28 @@ function SidebarInner({
 
       {/* Footer */}
       <div className="relative z-10 shrink-0 space-y-0.5 border-t border-border/70 px-2 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+        {!hidePortalNavigation && isAdmin && (
+          <Button
+            onClick={onOpenAdmin}
+            variant="ghost"
+            className="w-full justify-start gap-2 text-muted-foreground hover:bg-card/70 hover:text-foreground"
+            size="sm"
+          >
+            <LayoutDashboard className="h-4 w-4 flex-shrink-0" />
+            <span className="text-xs">返回管理中心</span>
+          </Button>
+        )}
+        {!hidePortalNavigation && isSystemAdmin && (
+          <Button
+            onClick={onOpenPresales}
+            variant="ghost"
+            className="w-full justify-start gap-2 text-muted-foreground hover:bg-card/70 hover:text-foreground"
+            size="sm"
+          >
+            <BriefcaseBusiness className="h-4 w-4 flex-shrink-0" />
+            <span className="text-xs">售前页面</span>
+          </Button>
+        )}
         <Button
           onClick={onOpenSettings}
           variant="ghost"

@@ -1,0 +1,989 @@
+import { createHash, randomUUID } from "node:crypto";
+
+import { and, asc, desc, eq } from "drizzle-orm";
+
+import {
+  knowledgeBaseBuildNodes,
+  knowledgeBaseBuilds,
+  type KnowledgeBaseBuild,
+  type KnowledgeBaseBuildNode,
+} from "../drizzle/schema";
+import type {
+  KnowledgeBaseBuildStatus,
+  KnowledgeBaseProgressDto,
+  KnowledgeBaseProgressLeafDto,
+} from "../shared/knowledge-base-progress";
+import { AuthServiceError } from "./auth-service";
+import { getDb } from "./db";
+import {
+  collectKnowledgeArchiveDescriptors,
+  knowledgeArchiveDescriptorHash,
+} from "./knowledge-base-artifact";
+import {
+  KnowledgeBaseProgressError,
+  applyKnowledgeBaseProgressEnvelope,
+  assertKnowledgeBaseReadyForPackage,
+  canPackageKnowledgeBase,
+  createKnowledgeBaseProgressState,
+  getKnowledgeBaseProgressSummary,
+  parseKnowledgeBaseManifestEnvelope,
+  parseKnowledgeBaseProgressEnvelope,
+  parseKnowledgeBaseReopenEnvelope,
+  type KnowledgeBaseLeafStatus,
+  type KnowledgeBaseProgressState,
+} from "./knowledge-base-progress";
+
+export type KnowledgeBaseUserAction =
+  | "initial"
+  | "confirm"
+  | "direct_prefill"
+  | "revise";
+
+export class KnowledgeBaseBuildError extends Error {
+  constructor(
+    public readonly code:
+      | "BUILD_NOT_FOUND"
+      | "PROGRESS_PROTOCOL_INVALID"
+      | "PUBLISH_BLOCKED",
+    message: string,
+  ) {
+    super(message);
+    this.name = "KnowledgeBaseBuildError";
+  }
+}
+
+async function requireDb() {
+  const db = await getDb();
+  if (!db) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Database is not configured",
+    );
+  }
+  return db;
+}
+
+function normalizeConversationId(value: string) {
+  const normalized = String(value || "").trim();
+  if (!normalized || normalized.length > 191) {
+    throw new KnowledgeBaseBuildError("BUILD_NOT_FOUND", "知识库对话标识无效");
+  }
+  return normalized;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function stringValue(value: unknown) {
+  if (typeof value === "string") return value.trim();
+  if (isRecord(value) && typeof value.value === "string") {
+    return value.value.trim();
+  }
+  return "";
+}
+
+function typedKnowledgeAssistantMessageText(value: unknown) {
+  if (!isRecord(value) || value.role !== "assistant") return "";
+  const type =
+    typeof value.type === "string" ? value.type.trim().toLowerCase() : "";
+  if (
+    type &&
+    !["message", "output_message", "output_text", "text"].includes(type)
+  ) {
+    return "";
+  }
+
+  const parts: string[] = [];
+  for (const candidate of [
+    value.output_text,
+    value.text,
+    typeof value.content === "string" ? value.content : undefined,
+  ]) {
+    const text = stringValue(candidate);
+    if (text && !parts.includes(text)) parts.push(text);
+  }
+  if (Array.isArray(value.content)) {
+    for (const rawContent of value.content) {
+      if (typeof rawContent === "string") {
+        const text = rawContent.trim();
+        if (text && !parts.includes(text)) parts.push(text);
+        continue;
+      }
+      if (!isRecord(rawContent)) continue;
+      const contentType =
+        typeof rawContent.type === "string"
+          ? rawContent.type.trim().toLowerCase()
+          : "";
+      if (!["output_text", "text", "message", ""].includes(contentType)) {
+        continue;
+      }
+      const text = stringValue(
+        rawContent.text ?? rawContent.output_text ?? rawContent.value,
+      );
+      if (text && !parts.includes(text)) parts.push(text);
+    }
+  }
+  return parts.join("\n\n").trim();
+}
+
+/**
+ * Only the final typed assistant message may drive the authoritative knowledge
+ * state machine. User, reasoning, tool and role-less provider records are
+ * deliberately excluded even when they contain a valid-looking envelope.
+ */
+export function extractFinalKnowledgeBaseAssistantText(
+  output: unknown,
+): string {
+  if (!Array.isArray(output)) return "";
+  const messages = output
+    .map(typedKnowledgeAssistantMessageText)
+    .filter((message) => Boolean(message));
+  return (messages[messages.length - 1] || "").slice(-4_000_000);
+}
+
+function reconciliationHash(input: {
+  output: unknown;
+  userText: string;
+  attachmentCount: number;
+}) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        output: input.output,
+        userText: input.userText,
+        attachmentCount: input.attachmentCount,
+      }),
+    )
+    .digest("hex");
+}
+
+function modelOutputAudit(text: string) {
+  const contentMarkdown = text
+    .replace(
+      /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/gi,
+      "",
+    )
+    .trim()
+    .slice(-2_000_000);
+  const sourceUrls = Array.from(
+    new Set(contentMarkdown.match(/https?:\/\/[^\s<>)\]"']+/gi) || []),
+  ).slice(0, 500);
+  const imageUrls = Array.from(
+    new Set(
+      [
+        ...Array.from(
+          contentMarkdown.matchAll(/!\[[^\]]*]\((https?:\/\/[^)\s]+)\)/gi),
+          (match) => match[1],
+        ),
+        ...sourceUrls.filter((url) =>
+          /\.(?:avif|gif|jpe?g|png|svg|webp)(?:[?#].*)?$/i.test(url),
+        ),
+      ].filter(Boolean),
+    ),
+  ).slice(0, 500);
+  return { contentMarkdown, sourceUrls, imageUrls };
+}
+
+function mergeAuditUrls(existing: string[] | null, incoming: string[]) {
+  return Array.from(new Set([...(existing || []), ...incoming])).slice(0, 500);
+}
+
+export function classifyKnowledgeBaseUserAction(
+  userText: string,
+  attachmentCount = 0,
+): KnowledgeBaseUserAction {
+  const normalized = String(userText || "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/[。！!]+$/g, "")
+    .trim()
+    .toLowerCase();
+  if (!normalized && attachmentCount === 0) return "initial";
+  if (/^(确认|确认无误|无误|没问题|可以|通过|采用|ok|okay)$/.test(normalized)) {
+    return "confirm";
+  }
+  if (
+    /^(跳过|直接预填|采用预填|保留预填|按预填继续|使用预填)$/.test(normalized)
+  ) {
+    return "direct_prefill";
+  }
+  return "revise";
+}
+
+function stateFromRows(
+  build: KnowledgeBaseBuild,
+  rows: KnowledgeBaseBuildNode[],
+): KnowledgeBaseProgressState {
+  return {
+    schemaVersion: 1,
+    revision: build.revision,
+    currentLeafId: build.currentLeafId,
+    leaves: rows.map((row) => ({
+      id: row.leafId,
+      title: row.title,
+      branchId: row.branchId,
+      branchTitle: row.branchTitle,
+      status: row.status as KnowledgeBaseLeafStatus,
+    })),
+  };
+}
+
+function buildDto(
+  build: KnowledgeBaseBuild,
+  rows: KnowledgeBaseBuildNode[],
+): KnowledgeBaseProgressDto {
+  const leaves: KnowledgeBaseProgressLeafDto[] = rows.map((row) => ({
+    id: row.leafId,
+    title: row.title,
+    branchId: row.branchId,
+    branchTitle: row.branchTitle,
+    ordinal: row.ordinal,
+    status: row.status,
+  }));
+  const branchMap = new Map<
+    string,
+    KnowledgeBaseProgressDto["branches"][number]
+  >();
+  for (const leaf of leaves) {
+    let branch = branchMap.get(leaf.branchId);
+    if (!branch) {
+      branch = {
+        id: leaf.branchId,
+        title: leaf.branchTitle,
+        total: 0,
+        handled: 0,
+        confirmed: 0,
+        directPrefilled: 0,
+        pending: 0,
+        current: 0,
+        needsVerification: 0,
+        leaves: [],
+      };
+      branchMap.set(leaf.branchId, branch);
+    }
+    branch.total += 1;
+    branch.leaves.push(leaf);
+    if (leaf.status === "confirmed") {
+      branch.confirmed += 1;
+      branch.handled += 1;
+    } else if (leaf.status === "direct_prefilled") {
+      branch.directPrefilled += 1;
+      branch.handled += 1;
+    } else if (leaf.status === "current") {
+      branch.current += 1;
+    } else if (leaf.status === "needs_verification") {
+      branch.needsVerification += 1;
+    } else {
+      branch.pending += 1;
+    }
+  }
+  const confirmed = leaves.filter((leaf) => leaf.status === "confirmed").length;
+  const directPrefilled = leaves.filter(
+    (leaf) => leaf.status === "direct_prefilled",
+  ).length;
+  const pending = leaves.filter((leaf) => leaf.status === "pending").length;
+  const current = leaves.filter((leaf) => leaf.status === "current").length;
+  const needsVerification = leaves.filter(
+    (leaf) => leaf.status === "needs_verification",
+  ).length;
+  const handled = confirmed + directPrefilled;
+  const total = leaves.length;
+  return {
+    build: {
+      id: build.id,
+      conversationId: build.conversationId,
+      companyName: build.companyName,
+      status: build.status as KnowledgeBaseBuildStatus,
+      revision: build.revision,
+      currentLeafId: build.currentLeafId,
+      protocolError: build.protocolError,
+      updatedAt: build.updatedAt.getTime(),
+    },
+    summary: {
+      total,
+      handled,
+      confirmed,
+      directPrefilled,
+      pending,
+      current,
+      needsVerification,
+      overallPercent: total === 0 ? 0 : Math.round((handled / total) * 100),
+    },
+    branches: [...branchMap.values()],
+    packageAllowed:
+      total > 0 &&
+      handled === total &&
+      build.currentLeafId === null &&
+      build.status === "ready_to_publish" &&
+      build.packageRevision === build.revision &&
+      build.packageTaskId === build.upstreamTaskId &&
+      Boolean(build.packageOutputItemId) &&
+      Boolean(build.packageDescriptorHash),
+  };
+}
+
+async function loadBuild(
+  executor: any,
+  userId: number,
+  conversationId: string,
+  lock = false,
+) {
+  let query = executor
+    .select()
+    .from(knowledgeBaseBuilds)
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, userId),
+        eq(knowledgeBaseBuilds.conversationId, conversationId),
+      ),
+    )
+    .limit(1);
+  if (lock) query = query.for("update");
+  const rows = await query;
+  return rows[0] as KnowledgeBaseBuild | undefined;
+}
+
+async function loadNodes(executor: any, buildId: string) {
+  return (await executor
+    .select()
+    .from(knowledgeBaseBuildNodes)
+    .where(eq(knowledgeBaseBuildNodes.buildId, buildId))
+    .orderBy(asc(knowledgeBaseBuildNodes.ordinal))) as KnowledgeBaseBuildNode[];
+}
+
+export async function createKnowledgeBaseBuild(input: {
+  userId: number;
+  conversationId: string;
+  companyName: string;
+  companyWebsite?: string;
+  skillName?: string;
+  skillVersion?: string;
+  skillContentHash?: string;
+}) {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  const companyName = String(input.companyName || "")
+    .trim()
+    .slice(0, 255);
+  if (!companyName) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "企业名称不能为空",
+    );
+  }
+  const build = await db.transaction(async (tx) => {
+    const existing = await loadBuild(tx, input.userId, conversationId, true);
+    if (existing) {
+      await tx
+        .delete(knowledgeBaseBuildNodes)
+        .where(eq(knowledgeBaseBuildNodes.buildId, existing.id));
+      await tx
+        .update(knowledgeBaseBuilds)
+        .set({
+          companyName,
+          companyWebsite: input.companyWebsite?.trim() || null,
+          skillName: input.skillName || "socratic-kb-builder",
+          skillVersion: input.skillVersion || "1",
+          skillContentHash: input.skillContentHash || null,
+          upstreamTaskId: null,
+          status: "researching",
+          revision: 0,
+          currentLeafId: null,
+          totalNodeCount: 0,
+          confirmedCount: 0,
+          directPrefilledCount: 0,
+          needsVerificationCount: 0,
+          lastReconciledHash: null,
+          lastOutputLength: 0,
+          lastOutputItemIds: [],
+          lastTurnUserText: null,
+          lastTurnAttachmentCount: 0,
+          packageRevision: null,
+          packageTaskId: null,
+          packageOutputItemId: null,
+          packageFileId: null,
+          packageFilename: null,
+          packageDescriptorHash: null,
+          protocolError: null,
+          publishedSnapshotId: null,
+          completedAt: null,
+          publishedAt: null,
+        })
+        .where(eq(knowledgeBaseBuilds.id, existing.id));
+      return (await loadBuild(tx, input.userId, conversationId))!;
+    }
+    const id = randomUUID();
+    await tx.insert(knowledgeBaseBuilds).values({
+      id,
+      userId: input.userId,
+      conversationId,
+      companyName,
+      companyWebsite: input.companyWebsite?.trim() || null,
+      skillName: input.skillName || "socratic-kb-builder",
+      skillVersion: input.skillVersion || "1",
+      skillContentHash: input.skillContentHash || null,
+      status: "researching",
+    });
+    return (await loadBuild(tx, input.userId, conversationId))!;
+  });
+  return buildDto(build, []);
+}
+
+export async function attachKnowledgeBaseBuildTask(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+}) {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  await db
+    .update(knowledgeBaseBuilds)
+    .set({ upstreamTaskId: String(input.taskId).slice(0, 255) })
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(knowledgeBaseBuilds.conversationId, conversationId),
+      ),
+    );
+}
+
+export async function recordKnowledgeBaseTurn(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+  userText: string;
+  attachmentCount: number;
+}) {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  const result = await db
+    .update(knowledgeBaseBuilds)
+    .set({
+      upstreamTaskId: String(input.taskId).slice(0, 255),
+      lastTurnUserText: String(input.userText || "").slice(0, 2_000_000),
+      lastTurnAttachmentCount: Math.max(
+        0,
+        Math.trunc(input.attachmentCount || 0),
+      ),
+    })
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(knowledgeBaseBuilds.conversationId, conversationId),
+      ),
+    );
+  if (!result[0]?.affectedRows) {
+    throw new KnowledgeBaseBuildError(
+      "BUILD_NOT_FOUND",
+      "当前对话没有知识库构建记录",
+    );
+  }
+}
+
+export async function assertKnowledgeBaseTaskBinding(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+}) {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  const build = await loadBuild(db, input.userId, conversationId);
+  if (!build) {
+    throw new KnowledgeBaseBuildError(
+      "BUILD_NOT_FOUND",
+      "当前对话没有知识库构建记录",
+    );
+  }
+  if (!build.upstreamTaskId || build.upstreamTaskId !== input.taskId) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "任务与当前知识库构建记录不匹配",
+    );
+  }
+  return build;
+}
+
+export async function getKnowledgeBaseProgress(input: {
+  userId: number;
+  conversationId?: string;
+}): Promise<KnowledgeBaseProgressDto | null> {
+  const db = await requireDb();
+  const buildRows = input.conversationId
+    ? await db
+        .select()
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.userId, input.userId),
+            eq(
+              knowledgeBaseBuilds.conversationId,
+              normalizeConversationId(input.conversationId),
+            ),
+          ),
+        )
+        .limit(1)
+    : await db
+        .select()
+        .from(knowledgeBaseBuilds)
+        .where(eq(knowledgeBaseBuilds.userId, input.userId))
+        .orderBy(desc(knowledgeBaseBuilds.updatedAt))
+        .limit(1);
+  const build = buildRows[0];
+  if (!build) return null;
+  return buildDto(build, await loadNodes(db, build.id));
+}
+
+function assertActionMatchesTransition(
+  action: KnowledgeBaseUserAction,
+  target: "confirmed" | "direct_prefilled" | "needs_verification",
+) {
+  const expected =
+    action === "confirm"
+      ? "confirmed"
+      : action === "direct_prefill"
+        ? "direct_prefilled"
+        : "needs_verification";
+  if (target !== expected) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      action === "revise"
+        ? "当前回复属于补充或修订，节点必须继续停留在对话中等待明确确认"
+        : "智能体返回的节点状态与用户本轮选择不一致，本轮未推进",
+    );
+  }
+}
+
+function friendlyProtocolError(error: unknown) {
+  if (error instanceof KnowledgeBaseBuildError) return error.message;
+  if (error instanceof KnowledgeBaseProgressError) {
+    if (error.code === "INVALID_MANIFEST") {
+      return "知识树信息尚不完整，请在对话中继续补充或重试本轮";
+    }
+    if (error.code === "STALE_REVISION") {
+      return "本轮内容已处理，无需重复更新";
+    }
+    if (error.code === "WRONG_LEAF") {
+      return "请先完成当前节点，再继续处理其他内容";
+    }
+    return "当前节点仍需确认或补充，本轮进度未更新";
+  }
+  return "知识库节点状态校验失败，本轮内容尚未更新";
+}
+
+async function rememberProtocolError(input: {
+  userId: number;
+  conversationId: string;
+  message: string;
+}) {
+  const db = await requireDb();
+  await db
+    .update(knowledgeBaseBuilds)
+    .set({ status: "protocol_error", protocolError: input.message })
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(knowledgeBaseBuilds.conversationId, input.conversationId),
+      ),
+    );
+}
+
+export async function reconcileKnowledgeBaseProgress(input: {
+  userId: number;
+  conversationId: string;
+  taskId?: string;
+  userText?: string;
+  attachmentCount?: number;
+  output: unknown;
+  outputState?: {
+    totalLength: number;
+    itemIds: string[];
+  };
+}) {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  const text = extractFinalKnowledgeBaseAssistantText(input.output);
+  const audit = modelOutputAudit(text);
+  const outputLedger = {
+    lastOutputLength: Math.max(
+      0,
+      Math.trunc(input.outputState?.totalLength || 0),
+    ),
+    lastOutputItemIds: (input.outputState?.itemIds || []).slice(-5_000),
+  };
+
+  try {
+    return await db.transaction(async (tx) => {
+      let build = await loadBuild(tx, input.userId, conversationId, true);
+      if (!build) {
+        throw new KnowledgeBaseBuildError(
+          "BUILD_NOT_FOUND",
+          "当前对话没有知识库构建记录",
+        );
+      }
+      let rows = await loadNodes(tx, build.id);
+      const userText =
+        input.userText !== undefined
+          ? String(input.userText)
+          : String(build.lastTurnUserText || "");
+      const attachmentCount =
+        input.attachmentCount !== undefined
+          ? Math.max(0, Math.trunc(input.attachmentCount || 0))
+          : Math.max(0, build.lastTurnAttachmentCount || 0);
+      const action = classifyKnowledgeBaseUserAction(userText, attachmentCount);
+      const hash = reconciliationHash({
+        output: input.output,
+        userText,
+        attachmentCount,
+      });
+      if (build.lastReconciledHash === hash) {
+        return buildDto(build, rows);
+      }
+
+      if (rows.length === 0) {
+        // The first visible user bubble contains the start command and company
+        // details, so it is intentionally non-empty. A valid signed manifest
+        // is authoritative for initialization and makes a failed first parse
+        // recoverable on the next server-side task check.
+        const manifest = parseKnowledgeBaseManifestEnvelope(text);
+        const state = createKnowledgeBaseProgressState(manifest.leaves);
+        await tx.insert(knowledgeBaseBuildNodes).values(
+          state.leaves.map((leaf, index) => ({
+            id: randomUUID(),
+            buildId: build!.id,
+            leafId: leaf.id,
+            branchId: leaf.branchId!,
+            branchTitle: leaf.branchTitle!,
+            title: leaf.title,
+            ordinal: index,
+            status: leaf.status,
+            ...(index === 0
+              ? {
+                  contentMarkdown: audit.contentMarkdown || null,
+                  lastUserInput: userText || null,
+                  sourceUrls: audit.sourceUrls,
+                  imageUrls: audit.imageUrls,
+                  lastTaskId: input.taskId?.slice(0, 255) || null,
+                  lastResponseAt: new Date(),
+                }
+              : {}),
+          })),
+        );
+        await tx
+          .update(knowledgeBaseBuilds)
+          .set({
+            upstreamTaskId: input.taskId?.slice(0, 255) || build.upstreamTaskId,
+            status: "confirming",
+            revision: state.revision,
+            currentLeafId: state.currentLeafId,
+            totalNodeCount: state.leaves.length,
+            confirmedCount: 0,
+            directPrefilledCount: 0,
+            needsVerificationCount: 0,
+            lastReconciledHash: hash,
+            ...outputLedger,
+            protocolError: null,
+          })
+          .where(eq(knowledgeBaseBuilds.id, build.id));
+        build = (await loadBuild(tx, input.userId, conversationId))!;
+        rows = await loadNodes(tx, build.id);
+        return buildDto(build, rows);
+      }
+
+      if (
+        build.currentLeafId === null &&
+        rows.every(
+          (row) =>
+            row.status === "confirmed" || row.status === "direct_prefilled",
+        )
+      ) {
+        if (action !== "revise") {
+          throw new KnowledgeBaseBuildError(
+            "PROGRESS_PROTOCOL_INVALID",
+            "知识库已完成；如需更新，请直接说明要补充或修改的内容",
+          );
+        }
+        const reopen = parseKnowledgeBaseReopenEnvelope(text);
+        if (reopen.revision !== build.revision) {
+          throw new KnowledgeBaseBuildError(
+            "PROGRESS_PROTOCOL_INVALID",
+            "本轮修订基于旧版本，请重新提交最新内容",
+          );
+        }
+        const target = rows.find((row) => row.leafId === reopen.leafId);
+        if (!target) {
+          throw new KnowledgeBaseBuildError(
+            "PROGRESS_PROTOCOL_INVALID",
+            "本轮内容未匹配到现有知识节点，请补充更具体的修改对象",
+          );
+        }
+        await tx
+          .update(knowledgeBaseBuildNodes)
+          .set({
+            status: "needs_verification",
+            transitionReason:
+              reopen.reason || "根据企业补充内容重新核验当前节点",
+            contentMarkdown: audit.contentMarkdown || target.contentMarkdown,
+            lastUserInput: userText || null,
+            sourceUrls: mergeAuditUrls(target.sourceUrls, audit.sourceUrls),
+            imageUrls: mergeAuditUrls(target.imageUrls, audit.imageUrls),
+            lastTaskId: input.taskId?.slice(0, 255) || build.upstreamTaskId,
+            lastResponseAt: new Date(),
+            confirmedAt: null,
+          })
+          .where(eq(knowledgeBaseBuildNodes.id, target.id));
+        rows = await loadNodes(tx, build.id);
+        const reopenedState = stateFromRows(
+          {
+            ...build,
+            revision: build.revision + 1,
+            currentLeafId: target.leafId,
+          },
+          rows,
+        );
+        const reopenedSummary = getKnowledgeBaseProgressSummary(reopenedState);
+        await tx
+          .update(knowledgeBaseBuilds)
+          .set({
+            upstreamTaskId: input.taskId?.slice(0, 255) || build.upstreamTaskId,
+            status: "confirming",
+            revision: build.revision + 1,
+            currentLeafId: target.leafId,
+            confirmedCount: reopenedSummary.confirmed,
+            directPrefilledCount: reopenedSummary.directPrefilled,
+            needsVerificationCount: reopenedSummary.needsVerification,
+            lastReconciledHash: hash,
+            ...outputLedger,
+            protocolError: null,
+            completedAt: null,
+            packageRevision: null,
+            packageTaskId: null,
+            packageOutputItemId: null,
+            packageFileId: null,
+            packageFilename: null,
+            packageDescriptorHash: null,
+          })
+          .where(eq(knowledgeBaseBuilds.id, build.id));
+        build = (await loadBuild(tx, input.userId, conversationId))!;
+        rows = await loadNodes(tx, build.id);
+        return buildDto(build, rows);
+      }
+
+      if (action === "initial") {
+        throw new KnowledgeBaseBuildError(
+          "PROGRESS_PROTOCOL_INVALID",
+          "节点已开始确认，空白回复不能推进当前节点",
+        );
+      }
+
+      const state = stateFromRows(build, rows);
+      const envelope = parseKnowledgeBaseProgressEnvelope(text);
+      assertActionMatchesTransition(action, envelope.transition.to);
+      const nextState = applyKnowledgeBaseProgressEnvelope(state, envelope);
+      const summary = getKnowledgeBaseProgressSummary(nextState);
+      const packageAllowed = canPackageKnowledgeBase(nextState);
+      const packageDescriptors = packageAllowed
+        ? collectKnowledgeArchiveDescriptors(
+            Array.isArray(input.output) ? input.output : [],
+          )
+        : [];
+      if (packageAllowed && packageDescriptors.length !== 1) {
+        throw new KnowledgeBaseBuildError(
+          "PROGRESS_PROTOCOL_INVALID",
+          packageDescriptors.length === 0
+            ? "所有节点已完成，但本轮尚未生成唯一的最终知识库 ZIP"
+            : "本轮返回了多个知识库 ZIP，无法确认唯一发布版本",
+        );
+      }
+      const packageDescriptor = packageDescriptors[0];
+      const previousCurrentIndex = rows.findIndex(
+        (row) => row.leafId === state.currentLeafId,
+      );
+
+      for (let index = 0; index < rows.length; index += 1) {
+        const previous = rows[index]!;
+        const next = nextState.leaves[index]!;
+        const isCurrentLeaf = previous.leafId === state.currentLeafId;
+        const isNextLeaf =
+          nextState.currentLeafId !== null &&
+          previous.leafId === nextState.currentLeafId;
+        const storesRevisedCurrent = isCurrentLeaf && action === "revise";
+        const storesNextPrefill =
+          isNextLeaf &&
+          nextState.currentLeafId !== state.currentLeafId &&
+          action !== "revise";
+        if (
+          previous.status === next.status &&
+          !isCurrentLeaf &&
+          !storesNextPrefill
+        ) {
+          continue;
+        }
+        await tx
+          .update(knowledgeBaseBuildNodes)
+          .set({
+            status: next.status,
+            transitionReason:
+              index === previousCurrentIndex
+                ? envelope.transition.reason || null
+                : null,
+            ...(storesRevisedCurrent || storesNextPrefill
+              ? {
+                  contentMarkdown:
+                    audit.contentMarkdown || previous.contentMarkdown,
+                  lastUserInput: storesRevisedCurrent
+                    ? userText || null
+                    : previous.lastUserInput,
+                  sourceUrls: mergeAuditUrls(
+                    previous.sourceUrls,
+                    audit.sourceUrls,
+                  ),
+                  imageUrls: mergeAuditUrls(
+                    previous.imageUrls,
+                    audit.imageUrls,
+                  ),
+                  lastTaskId:
+                    input.taskId?.slice(0, 255) || build.upstreamTaskId,
+                  lastResponseAt: new Date(),
+                }
+              : {}),
+            confirmedAt:
+              next.status === "confirmed" || next.status === "direct_prefilled"
+                ? new Date()
+                : null,
+          })
+          .where(eq(knowledgeBaseBuildNodes.id, previous.id));
+      }
+
+      await tx
+        .update(knowledgeBaseBuilds)
+        .set({
+          upstreamTaskId: input.taskId?.slice(0, 255) || build.upstreamTaskId,
+          status: packageAllowed ? "ready_to_publish" : "confirming",
+          revision: nextState.revision,
+          currentLeafId: nextState.currentLeafId,
+          totalNodeCount: summary.total,
+          confirmedCount: summary.confirmed,
+          directPrefilledCount: summary.directPrefilled,
+          needsVerificationCount: summary.needsVerification,
+          lastReconciledHash: hash,
+          ...outputLedger,
+          protocolError: null,
+          completedAt: packageAllowed ? new Date() : null,
+          packageRevision: packageAllowed ? nextState.revision : null,
+          packageTaskId: packageAllowed
+            ? input.taskId?.slice(0, 255) || build.upstreamTaskId
+            : null,
+          packageOutputItemId: packageAllowed
+            ? packageDescriptor!.outputItemId
+            : null,
+          packageFileId: packageAllowed
+            ? packageDescriptor!.fileId || null
+            : null,
+          packageFilename: packageAllowed ? packageDescriptor!.filename : null,
+          packageDescriptorHash: packageAllowed
+            ? knowledgeArchiveDescriptorHash(packageDescriptor!)
+            : null,
+        })
+        .where(eq(knowledgeBaseBuilds.id, build.id));
+
+      build = (await loadBuild(tx, input.userId, conversationId))!;
+      rows = await loadNodes(tx, build.id);
+      return buildDto(build, rows);
+    });
+  } catch (error) {
+    if (
+      error instanceof KnowledgeBaseBuildError &&
+      error.code === "BUILD_NOT_FOUND"
+    ) {
+      throw error;
+    }
+    const message = friendlyProtocolError(error);
+    const db = await requireDb();
+    await db
+      .update(knowledgeBaseBuilds)
+      .set(outputLedger)
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.conversationId, conversationId),
+        ),
+      );
+    await rememberProtocolError({
+      userId: input.userId,
+      conversationId,
+      message,
+    });
+    throw new KnowledgeBaseBuildError("PROGRESS_PROTOCOL_INVALID", message);
+  }
+}
+
+export async function assertKnowledgeBasePublishable(input: {
+  userId: number;
+  conversationId: string;
+}) {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  const build = await loadBuild(db, input.userId, conversationId);
+  if (!build) {
+    throw new KnowledgeBaseBuildError(
+      "BUILD_NOT_FOUND",
+      "当前对话没有知识库构建记录",
+    );
+  }
+  const rows = await loadNodes(db, build.id);
+  if (build.status !== "ready_to_publish") {
+    throw new KnowledgeBaseBuildError(
+      "PUBLISH_BLOCKED",
+      build.status === "published"
+        ? "当前知识库已同步；如需更新，请先在构建流程中补充内容"
+        : "知识库尚未完成全部节点确认",
+    );
+  }
+  try {
+    assertKnowledgeBaseReadyForPackage(stateFromRows(build, rows));
+  } catch {
+    const handled = build.confirmedCount + build.directPrefilledCount;
+    throw new KnowledgeBaseBuildError(
+      "PUBLISH_BLOCKED",
+      `知识库尚未逐项走完，当前完成进度为 ${handled}/${build.totalNodeCount}`,
+    );
+  }
+  if (
+    build.packageRevision !== build.revision ||
+    build.packageTaskId !== build.upstreamTaskId ||
+    !build.packageOutputItemId ||
+    !build.packageDescriptorHash
+  ) {
+    throw new KnowledgeBaseBuildError(
+      "PUBLISH_BLOCKED",
+      "最终知识库文件尚未与当前完成版本绑定",
+    );
+  }
+  return build;
+}
+
+export async function markKnowledgeBasePublished(input: {
+  userId: number;
+  conversationId: string;
+  snapshotId: string;
+}) {
+  const db = await requireDb();
+  await db
+    .update(knowledgeBaseBuilds)
+    .set({
+      status: "published",
+      publishedSnapshotId: input.snapshotId,
+      publishedAt: new Date(),
+      protocolError: null,
+    })
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(
+          knowledgeBaseBuilds.conversationId,
+          normalizeConversationId(input.conversationId),
+        ),
+      ),
+    );
+}

@@ -2,25 +2,162 @@ import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/_core/hooks/useAuth";
+import { lazy, Suspense } from "react";
 import NotFound from "@/pages/NotFound";
 import Login from "@/pages/Login";
-import AdminUsers from "@/pages/AdminUsers";
 import { Loader2, RefreshCw } from "lucide-react";
-import { Route, Switch } from "wouter";
+import { Redirect, Route, Switch, useLocation } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { ConversationProvider } from "./contexts/ConversationContext";
 import { useResumePolling } from "./hooks/useResumePolling";
-import Home from "./pages/Home";
-import WorkflowBoard from "./pages/WorkflowBoard";
+import {
+  ADMIN_WORKSPACE_TAB_IDS,
+  type WorkspaceTab,
+} from "./lib/admin-workspace-tabs";
+import SetupPassword from "./pages/SetupPassword";
+import { isSystemAdminAccount } from "@/lib/admin-access";
+import { hasExplicitAdminRole } from "@shared/admin-access";
+
+const UserDashboard = lazy(() =>
+  import("./pages/UserDashboard").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const AdminDashboard = lazy(() =>
+  import("./pages/AdminDashboard").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const AdminAgent = lazy(() =>
+  import("./pages/AdminAgent").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const AdminWorkspace = lazy(() =>
+  import("./pages/AdminWorkspace").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const AdminCustomerPreview = lazy(() =>
+  import("./pages/AdminCustomerPreview").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const AdminUsers = lazy(() =>
+  import("./pages/AdminUsers").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const AdminPresales = lazy(() =>
+  import("./pages/AdminPresales").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+
+const DevelopmentPreviewRouter = import.meta.env.DEV
+  ? lazy(() => import("./pages/DevelopmentPreviewRouter"))
+  : null;
+
+function RoleLanding() {
+  const { user } = useAuth();
+  return canAccessAdminRoutes(user) ? <AdminDashboard /> : <UserDashboard />;
+}
+
+export function canAccessAdminRoutes(
+  user:
+    | {
+        role: "user" | "admin";
+        adminAccessLevel?: "system_admin" | "delivery_admin" | null;
+      }
+    | null
+    | undefined,
+) {
+  return Boolean(user && hasExplicitAdminRole(user));
+}
+
+function AdminOnly({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  return canAccessAdminRoutes(user) ? children : <Redirect to="/" />;
+}
+
+function SystemAdminOnly({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  return isSystemAdminAccount(user) ? children : <Redirect to="/" />;
+}
+
+function UserOnly({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  return user?.role === "user" ? children : <Redirect to="/" />;
+}
 
 function Router() {
   return (
     <Switch>
-      <Route path={"/"} component={Home} />
-      <Route path={"/login"} component={Home} />
-      <Route path={"/admin/users"} component={AdminUsers} />
-      <Route path={"/workflow"} component={WorkflowBoard} />
+      <Route path={"/"} component={RoleLanding} />
+      <Route path={"/login"} component={RoleLanding} />
+      <Route path={"/agent"}>
+        <AdminOnly>
+          <Redirect to="/admin/agent" />
+        </AdminOnly>
+      </Route>
+      <Route path={"/admin/agent"}>
+        <AdminOnly>
+          <AdminAgent />
+        </AdminOnly>
+      </Route>
+      <Route path={"/knowledge-base"}>
+        <UserOnly>
+          <UserDashboard initialSection="knowledge-agent" />
+        </UserOnly>
+      </Route>
+      <Route path={"/admin/workspace"}>
+        <AdminOnly>
+          <AdminWorkspace />
+        </AdminOnly>
+      </Route>
+      <Route path={"/admin/customers/:userId/preview"}>
+        {(params) => {
+          const userId = Number(params.userId);
+          if (!Number.isInteger(userId) || userId <= 0) return <NotFound />;
+          return (
+            <AdminOnly>
+              <AdminCustomerPreview userId={userId} />
+            </AdminOnly>
+          );
+        }}
+      </Route>
+      <Route path={"/admin/customers/:userId/:tab"}>
+        {(params) => {
+          const userId = Number(params.userId);
+          if (!Number.isInteger(userId) || userId <= 0) return <NotFound />;
+          const allowedTabs: readonly WorkspaceTab[] = ADMIN_WORKSPACE_TAB_IDS;
+          if (!allowedTabs.includes(params.tab as WorkspaceTab)) {
+            return <Redirect to={`/admin/customers/${userId}/service`} />;
+          }
+          const initialTab = params.tab as WorkspaceTab;
+          return (
+            <AdminOnly>
+              <AdminWorkspace initialUserId={userId} initialTab={initialTab} />
+            </AdminOnly>
+          );
+        }}
+      </Route>
+      <Route path={"/admin/users"}>
+        <SystemAdminOnly>
+          <AdminUsers />
+        </SystemAdminOnly>
+      </Route>
+      <Route path={"/admin/presales"}>
+        <SystemAdminOnly>
+          <AdminPresales />
+        </SystemAdminOnly>
+      </Route>
+      <Route path={"/workflow"}>
+        <AdminOnly>
+          <Redirect to="/admin/agent" />
+        </AdminOnly>
+      </Route>
       <Route path={"/404"} component={NotFound} />
       <Route component={NotFound} />
     </Switch>
@@ -38,7 +175,20 @@ function AppShell() {
   useResumePolling();
 
   return (
-    <Router />
+    <Suspense
+      fallback={
+        <div className="flex min-h-[100dvh] items-center justify-center bg-background">
+          <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+              <Loader2 className="h-5 w-5 animate-spin" />
+            </div>
+            正在载入工作空间
+          </div>
+        </div>
+      }
+    >
+      <Router />
+    </Suspense>
   );
 }
 
@@ -66,7 +216,11 @@ export function AuthBoundary() {
           <p className="mt-2 break-words text-sm text-muted-foreground">
             {error.message || "请检查网络连接后重试。"}
           </p>
-          <Button className="mt-5" variant="outline" onClick={() => void refresh()}>
+          <Button
+            className="mt-5"
+            variant="outline"
+            onClick={() => void refresh()}
+          >
             <RefreshCw className="h-4 w-4" />
             重新连接
           </Button>
@@ -85,12 +239,29 @@ export function AuthBoundary() {
 }
 
 function App() {
+  const [location] = useLocation();
+  const previewPage =
+    import.meta.env.DEV &&
+    DevelopmentPreviewRouter &&
+    location.startsWith("/preview/") ? (
+      <Suspense
+        fallback={
+          <div className="flex min-h-[100dvh] items-center justify-center text-sm text-muted-foreground">
+            正在载入验收页面…
+          </div>
+        }
+      >
+        <DevelopmentPreviewRouter location={location} />
+      </Suspense>
+    ) : null;
+  const publicPage = location === "/setup-password" ? <SetupPassword /> : null;
+
   return (
     <ErrorBoundary>
       <ThemeProvider defaultTheme="light">
         <TooltipProvider>
           <Toaster position="top-center" />
-          <AuthBoundary />
+          {previewPage || publicPage || <AuthBoundary />}
         </TooltipProvider>
       </ThemeProvider>
     </ErrorBoundary>

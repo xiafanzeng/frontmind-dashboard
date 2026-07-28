@@ -12,6 +12,7 @@ import {
 import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
+import { isSystemAdminAccount } from "@/lib/admin-access";
 import {
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
@@ -38,7 +39,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 type AccountMenuProps = {
   collapsed?: boolean;
@@ -61,6 +66,7 @@ export default function AccountMenu({
   }, [user]);
 
   if (!user) return null;
+  const isSystemAdmin = isSystemAdminAccount(user);
 
   const handleLogout = async () => {
     try {
@@ -80,12 +86,14 @@ export default function AccountMenu({
       size="sm"
       className={cn(
         "h-auto w-full text-muted-foreground hover:bg-card/70 hover:text-foreground",
-        collapsed ? "justify-center px-0 py-1.5" : "justify-start gap-2 px-2 py-1.5"
+        collapsed
+          ? "justify-center px-0 py-1.5"
+          : "justify-start gap-2 px-2 py-1.5",
       )}
       aria-label="账号菜单"
     >
       <Avatar className="h-7 w-7 border border-border/70">
-        <AvatarFallback className="bg-primary/10 text-[11px] font-semibold text-primary">
+        <AvatarFallback className="bg-primary/10 text-xs font-semibold text-primary">
           {initials}
         </AvatarFallback>
       </Avatar>
@@ -95,7 +103,7 @@ export default function AccountMenu({
             <p className="truncate text-xs font-medium text-foreground">
               {user.displayName || user.username}
             </p>
-            <p className="truncate text-[10px] text-muted-foreground">
+            <p className="truncate text-xs text-muted-foreground">
               @{user.username}
             </p>
           </div>
@@ -139,7 +147,7 @@ export default function AccountMenu({
                   @{user.username}
                 </p>
               </div>
-              <Badge variant="secondary" className="text-[10px]">
+              <Badge variant="secondary" className="text-xs">
                 {user.role === "admin" ? "管理员" : "用户"}
               </Badge>
             </div>
@@ -152,13 +160,13 @@ export default function AccountMenu({
             }}
           >
             <Settings />
-            API Key 设置
+            {user.role === "admin" ? "API Key 与积分" : "智能服务设置"}
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setPasswordOpen(true)}>
             <KeyRound />
             修改密码
           </DropdownMenuItem>
-          {user.role === "admin" && (
+          {isSystemAdmin && (
             <DropdownMenuItem
               onSelect={() => {
                 onNavigate?.();
@@ -184,7 +192,10 @@ export default function AccountMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
+      <ChangePasswordDialog
+        open={passwordOpen}
+        onOpenChange={setPasswordOpen}
+      />
     </>
   );
 }
@@ -258,7 +269,8 @@ function ChangePasswordDialog({
             修改密码
           </DialogTitle>
           <DialogDescription>
-            更新当前账号密码。请使用至少 {MIN_PASSWORD_LENGTH} 个字符的独立密码。
+            更新当前账号密码。请使用至少 {MIN_PASSWORD_LENGTH}{" "}
+            个字符的独立密码。
           </DialogDescription>
         </DialogHeader>
 

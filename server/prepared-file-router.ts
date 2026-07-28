@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import { Router, type Request, type Response } from "express";
 import {
   getCredentialForUpstreamResource,
-  getDecryptedCredentialForUser,
+  getEffectiveDecryptedCredentialForAccount,
 } from "./auth-service";
 import {
   PreparedFileError,
@@ -175,7 +175,8 @@ router.post("/prepare", async (req, res) => {
       return;
     }
 
-    const credential = await getDecryptedCredentialForUser(ownerUserId);
+    const credential =
+      await getEffectiveDecryptedCredentialForAccount(ownerUserId);
     res.json(
       await preparedFileService.registerExternal({
         ownerUserId,

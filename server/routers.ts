@@ -4,6 +4,7 @@ import { conversationRouter } from "./conversation-router";
 import { credentialRouter } from "./credential-router";
 import { systemRouter } from "./_core/systemRouter";
 import { router } from "./_core/trpc";
+import { workspaceRouter } from "./workspace-router";
 
 export const appRouter = router({
   system: systemRouter,
@@ -11,6 +12,7 @@ export const appRouter = router({
   admin: adminRouter,
   credential: credentialRouter,
   conversation: conversationRouter,
+  workspace: workspaceRouter,
 });
 
 export type AppRouter = typeof appRouter;

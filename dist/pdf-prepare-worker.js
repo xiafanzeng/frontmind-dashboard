@@ -14,9 +14,30 @@ import fs2 from "node:fs/promises";
 // server/upstream-config.ts
 var UPSTREAM_VENDOR = ["ma", "nus"].join("");
 var DEFAULT_UPSTREAM_BASE_URL = `https://api.${UPSTREAM_VENDOR}.im`;
-function getUpstreamBaseUrl(req) {
-  const configured = process.env.FRONTMIND_UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL;
-  return configured.replace(/\/$/, "");
+function configuredUpstreamBaseUrl(env = process.env) {
+  const raw = env.FRONTMIND_UPSTREAM_BASE_URL?.trim() || DEFAULT_UPSTREAM_BASE_URL;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || !parsed.hostname || parsed.username || parsed.password || parsed.search || parsed.hash || /[?#]/.test(raw)) {
+    return null;
+  }
+  return parsed.toString().replace(/\/+$/, "");
+}
+function assertUpstreamBaseUrlConfigured(env = process.env) {
+  const configured = configuredUpstreamBaseUrl(env);
+  if (!configured) {
+    throw new Error(
+      "FRONTMIND_UPSTREAM_BASE_URL must be an HTTPS URL without credentials, query, or fragment"
+    );
+  }
+  return configured;
+}
+function getUpstreamBaseUrl(_req) {
+  return assertUpstreamBaseUrlConfigured();
 }
 function getFrontMindApiKey(req) {
   return req.frontmindCredential?.apiKey ?? "";
@@ -63,21 +84,17 @@ import {
   timingSafeEqual
 } from "node:crypto";
 import { parse as parseCookieHeader } from "cookie";
-import {
-  and,
-  desc,
-  eq as eq2,
-  gt,
-  isNull,
-  ne
-} from "drizzle-orm";
+import { and, desc, eq as eq2, gt, inArray, isNull, ne } from "drizzle-orm";
 
 // shared/const.ts
 var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
 
 // drizzle/schema.ts
+import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
+  foreignKey,
   index,
   int,
   json,
@@ -102,6 +119,10 @@ var users = mysqlTable(
     email: varchar("email", { length: 320 }),
     loginMethod: varchar("loginMethod", { length: 64 }),
     role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+    adminAccessLevel: mysqlEnum("adminAccessLevel", [
+      "system_admin",
+      "delivery_admin"
+    ]),
     isActive: boolean("isActive").default(true).notNull(),
     passwordChangedAt: timestamp("passwordChangedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -124,6 +145,31 @@ var sessions = mysqlTable(
   (table) => [
     index("sessions_user_expires_idx").on(table.userId, table.expiresAt),
     index("sessions_token_active_idx").on(table.tokenHash, table.revokedAt)
+  ]
+);
+var userPasswordSetupTokens = mysqlTable(
+  "user_password_setup_tokens",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    tokenHash: varchar("tokenHash", { length: 64 }).notNull().unique(),
+    expiresAt: timestamp("expiresAt").notNull(),
+    consumedAt: timestamp("consumedAt"),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("user_password_setup_tokens_user_expires_idx").on(
+      table.userId,
+      table.expiresAt
+    ),
+    index("user_password_setup_tokens_hash_consumed_idx").on(
+      table.tokenHash,
+      table.consumedAt
+    )
   ]
 );
 var apiCredentials = mysqlTable(
@@ -157,6 +203,1184 @@ var apiCredentials = mysqlTable(
     index("api_credentials_user_status_idx").on(table.userId, table.status)
   ]
 );
+var presalesApiCredentials = mysqlTable(
+  "presales_api_credentials",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    slot: varchar("slot", { length: 32 }).default("website").notNull(),
+    version: int("version").notNull(),
+    encryptionVersion: int("encryptionVersion").default(1).notNull(),
+    encryptedKey: text("encryptedKey").notNull(),
+    encryptionIv: varchar("encryptionIv", { length: 32 }).notNull(),
+    encryptionAuthTag: varchar("encryptionAuthTag", { length: 32 }).notNull(),
+    fingerprint: varchar("fingerprint", { length: 32 }).notNull(),
+    status: mysqlEnum("status", ["active", "retired", "deleted"]).default("active").notNull(),
+    validationStatus: mysqlEnum("validationStatus", [
+      "unverified",
+      "verified",
+      "invalid"
+    ]).default("unverified").notNull(),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    verifiedAt: timestamp("verifiedAt"),
+    retiredAt: timestamp("retiredAt"),
+    deletedAt: timestamp("deletedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("presales_api_credentials_slot_version_uq").on(
+      table.slot,
+      table.version
+    ),
+    index("presales_api_credentials_slot_status_idx").on(
+      table.slot,
+      table.status
+    )
+  ]
+);
+var apiUsagePolicies = mysqlTable(
+  "api_usage_policies",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    policyKey: varchar("policyKey", { length: 96 }).notNull().unique(),
+    scope: mysqlEnum("scope", ["website_frontend", "managed_user"]).notNull(),
+    workspaceUserId: int("workspaceUserId").references(() => users.id, {
+      onDelete: "cascade"
+    }),
+    limit: int("limit", { unsigned: true }).default(23e4).notNull(),
+    warningRatioBasisPoints: int("warningRatioBasisPoints", { unsigned: true }).default(8e3).notNull(),
+    windowDays: int("windowDays", { unsigned: true }).default(30).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("api_usage_policies_scope_user_idx").on(
+      table.scope,
+      table.workspaceUserId
+    )
+  ]
+);
+var apiUsageSnapshots = mysqlTable(
+  "api_usage_snapshots",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    policyId: varchar("policyId", { length: 36 }).notNull().references(() => apiUsagePolicies.id, { onDelete: "cascade" }),
+    credentialFingerprint: varchar("credentialFingerprint", { length: 32 }),
+    /** Whole shared Key pool usage observed upstream for the active period. */
+    used: int("used", { unsigned: true }).default(0).notNull(),
+    /** Usage attributed by the local ownership ledger to this policy's user. */
+    accountUsed: int("accountUsed", { unsigned: true }).default(0).notNull(),
+    windowStartedAt: timestamp("windowStartedAt").notNull(),
+    fetchedAt: timestamp("fetchedAt"),
+    syncStatus: mysqlEnum("syncStatus", [
+      "pending",
+      "ok",
+      "error",
+      "unconfigured"
+    ]).default("pending").notNull(),
+    errorCode: varchar("errorCode", { length: 64 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("api_usage_snapshots_policy_uq").on(table.policyId),
+    index("api_usage_snapshots_status_fetched_idx").on(
+      table.syncStatus,
+      table.fetchedAt
+    )
+  ]
+);
+var presalesUpstreamResources = mysqlTable(
+  "presales_upstream_resources",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).notNull(),
+    kind: mysqlEnum("kind", ["task", "file"]).notNull(),
+    upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
+    parentTaskId: varchar("parentTaskId", { length: 255 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    foreignKey({
+      name: "presales_resources_credential_fk",
+      columns: [table.apiCredentialId],
+      foreignColumns: [presalesApiCredentials.id]
+    }).onDelete("restrict"),
+    uniqueIndex("presales_upstream_resources_kind_id_uq").on(
+      table.kind,
+      table.upstreamId
+    ),
+    index("presales_upstream_resources_parent_task_idx").on(table.parentTaskId)
+  ]
+);
+var presalesOutputUrls = mysqlTable(
+  "presales_output_urls",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).notNull(),
+    parentTaskId: varchar("parentTaskId", { length: 255 }).notNull(),
+    urlHash: varchar("urlHash", { length: 64 }).notNull(),
+    hostname: varchar("hostname", { length: 255 }).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    foreignKey({
+      name: "presales_output_credential_fk",
+      columns: [table.apiCredentialId],
+      foreignColumns: [presalesApiCredentials.id]
+    }).onDelete("restrict"),
+    uniqueIndex("presales_output_urls_task_hash_uq").on(
+      table.parentTaskId,
+      table.urlHash
+    ),
+    index("presales_output_urls_credential_task_idx").on(
+      table.apiCredentialId,
+      table.parentTaskId
+    )
+  ]
+);
+var presalesTaskRequests = mysqlTable(
+  "presales_task_requests",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    projectId: varchar("projectId", { length: 80 }),
+    keyHash: varchar("keyHash", { length: 64 }).notNull(),
+    requestHash: varchar("requestHash", { length: 64 }).notNull(),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).notNull(),
+    credentialVersion: int("credentialVersion").notNull(),
+    status: mysqlEnum("status", ["pending", "completed"]).default("pending").notNull(),
+    attemptId: varchar("attemptId", { length: 36 }).notNull(),
+    leaseExpiresAt: timestamp("leaseExpiresAt").notNull(),
+    upstreamTaskId: varchar("upstreamTaskId", { length: 255 }),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    foreignKey({
+      name: "presales_task_request_credential_fk",
+      columns: [table.apiCredentialId],
+      foreignColumns: [presalesApiCredentials.id]
+    }).onDelete("restrict"),
+    uniqueIndex("presales_task_requests_key_uq").on(table.keyHash),
+    index("presales_task_requests_credential_status_idx").on(
+      table.apiCredentialId,
+      table.status
+    ),
+    index("presales_task_requests_project_idx").on(table.projectId)
+  ]
+);
+var presalesMonitorRuns = mysqlTable(
+  "presales_monitor_runs",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    idempotencyKeyHash: varchar("idempotencyKeyHash", { length: 64 }).notNull().unique(),
+    requestHash: varchar("requestHash", { length: 64 }).notNull(),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).notNull(),
+    credentialVersion: int("credentialVersion").notNull(),
+    question: text("question").notNull(),
+    platforms: json("platforms").$type().notNull(),
+    expectedItems: int("expectedItems").notNull(),
+    status: mysqlEnum("status", [
+      "submission_in_progress",
+      "submission_unknown",
+      "submitted",
+      "polling",
+      "completed",
+      "partial_review_required",
+      "remote_failed",
+      "shape_mismatch"
+    ]).default("submission_in_progress").notNull(),
+    upstreamTaskId: varchar("upstreamTaskId", { length: 128 }),
+    submitTotalItems: int("submitTotalItems"),
+    initialSubtaskIds: json("initialSubtaskIds").$type(),
+    subtaskScopes: json("subtaskScopes").$type(),
+    remoteStatus: varchar("remoteStatus", { length: 64 }),
+    completedItems: int("completedItems").default(0).notNull(),
+    failedItems: int("failedItems").default(0).notNull(),
+    totalItems: int("totalItems"),
+    checkpoint: json("checkpoint").$type(),
+    finalResult: json("finalResult").$type(),
+    shapeMismatch: boolean("shapeMismatch").default(false).notNull(),
+    terminalSnapshotHash: varchar("terminalSnapshotHash", { length: 64 }),
+    terminalStableCount: int("terminalStableCount").default(0).notNull(),
+    lastError: text("lastError"),
+    nextPollAt: timestamp("nextPollAt"),
+    lastPollStartedAt: timestamp("lastPollStartedAt"),
+    pollLeaseId: varchar("pollLeaseId", { length: 36 }),
+    pollLeaseExpiresAt: timestamp("pollLeaseExpiresAt"),
+    submittedAt: timestamp("submittedAt"),
+    completedAt: timestamp("completedAt"),
+    deletedAt: timestamp("deletedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("presales_monitor_credential_status_idx").on(
+      table.apiCredentialId,
+      table.status
+    ),
+    index("presales_monitor_poll_idx").on(table.status, table.nextPollAt)
+  ]
+);
+var websitePaymentReceipts = mysqlTable(
+  "website_payment_receipts",
+  {
+    orderId: varchar("orderId", { length: 128 }).primaryKey(),
+    schemaVersion: int("schemaVersion", { unsigned: true }).default(1).notNull(),
+    tradeNo: varchar("tradeNo", { length: 128 }).notNull().unique(),
+    amountFen: int("amountFen", { unsigned: true }).notNull(),
+    paidAt: timestamp("paidAt", { fsp: 3 }).notNull(),
+    purchaseType: mysqlEnum("purchaseType", [
+      "monitoring",
+      "service"
+    ]).notNull(),
+    scopeHash: varchar("scopeHash", { length: 64 }).notNull(),
+    authorizationDigest: varchar("authorizationDigest", {
+      length: 64
+    }).notNull(),
+    reviewRequired: boolean("reviewRequired").notNull(),
+    createdAt: timestamp("createdAt", { fsp: 3 }).defaultNow().notNull()
+  },
+  (table) => [
+    index("website_payment_receipts_scope_idx").on(
+      table.scopeHash,
+      table.authorizationDigest
+    ),
+    check(
+      "website_payment_receipts_schema_version_ck",
+      sql`${table.schemaVersion} = 1`
+    ),
+    check(
+      "website_payment_receipts_amount_ck",
+      sql`${table.amountFen} > 0 AND ${table.amountFen} <= 10000000`
+    ),
+    check(
+      "website_payment_receipts_scope_hash_ck",
+      sql`${table.scopeHash} REGEXP '^[a-f0-9]{64}$'`
+    ),
+    check(
+      "website_payment_receipts_authorization_digest_ck",
+      sql`${table.authorizationDigest} REGEXP '^[a-f0-9]{64}$'`
+    )
+  ]
+);
+var websiteProjectOrders = mysqlTable(
+  "website_project_orders",
+  {
+    orderId: varchar("orderId", { length: 128 }).primaryKey(),
+    schemaVersion: int("schemaVersion", { unsigned: true }).default(1).notNull(),
+    projectId: varchar("projectId", { length: 80 }).notNull(),
+    purchaseType: mysqlEnum("purchaseType", [
+      "monitoring",
+      "service"
+    ]).notNull(),
+    amountFen: int("amountFen", { unsigned: true }).notNull(),
+    authorizationDigest: varchar("authorizationDigest", {
+      length: 64
+    }).notNull().unique(),
+    state: mysqlEnum("state", [
+      "pending",
+      "paid",
+      "fulfilling",
+      "fulfilled",
+      "review_required",
+      "terminal_failed",
+      "closed"
+    ]).notNull(),
+    checkoutExpiresAt: timestamp("checkoutExpiresAt", { fsp: 3 }).notNull(),
+    paidAt: timestamp("paidAt", { fsp: 3 }),
+    fulfilledAt: timestamp("fulfilledAt", { fsp: 3 }),
+    lastEventAt: timestamp("lastEventAt", { fsp: 3 }).notNull(),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdAt: timestamp("createdAt", { fsp: 3 }).defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt", { fsp: 3 }).defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("website_project_orders_project_state_idx").on(
+      table.projectId,
+      table.state
+    ),
+    check(
+      "website_project_orders_schema_version_ck",
+      sql`${table.schemaVersion} = 1`
+    ),
+    check(
+      "website_project_orders_amount_ck",
+      sql`${table.amountFen} > 0 AND ${table.amountFen} <= 10000000`
+    ),
+    check(
+      "website_project_orders_authorization_digest_ck",
+      sql`${table.authorizationDigest} REGEXP '^[a-f0-9]{64}$'`
+    ),
+    check("website_project_orders_revision_ck", sql`${table.revision} > 0`),
+    check(
+      "website_project_orders_paid_state_ck",
+      sql`${table.state} IN ('pending', 'closed') OR ${table.paidAt} IS NOT NULL`
+    ),
+    check(
+      "website_project_orders_fulfilled_state_ck",
+      sql`(${table.state} = 'fulfilled' AND ${table.fulfilledAt} IS NOT NULL) OR (${table.state} <> 'fulfilled' AND ${table.fulfilledAt} IS NULL)`
+    ),
+    check(
+      "website_project_orders_fulfilled_time_ck",
+      sql`${table.fulfilledAt} IS NULL OR (${table.paidAt} IS NOT NULL AND ${table.fulfilledAt} >= ${table.paidAt})`
+    )
+  ]
+);
+var websiteUserProvisions = mysqlTable(
+  "website_user_provisions",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    schemaVersion: int("schemaVersion", { unsigned: true }).default(1).notNull(),
+    idempotencyKeyHash: varchar("idempotencyKeyHash", { length: 64 }).notNull().unique(),
+    requestHash: varchar("requestHash", { length: 64 }).notNull(),
+    projectId: varchar("projectId", { length: 80 }).notNull(),
+    companyName: varchar("companyName", { length: 200 }).notNull(),
+    orderId: varchar("orderId", { length: 64 }).notNull().unique(),
+    tradeNo: varchar("tradeNo", { length: 128 }).notNull().unique(),
+    amountFen: int("amountFen", { unsigned: true }).notNull(),
+    paidAt: timestamp("paidAt").notNull(),
+    serviceCategory: mysqlEnum("serviceCategory", [
+      "product_scenario",
+      "reputation",
+      "competitor_comparison"
+    ]).notNull(),
+    planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]),
+    questionId: varchar("questionId", { length: 80 }).notNull(),
+    question: text("question").notNull(),
+    contractId: varchar("contractId", { length: 128 }).notNull().unique(),
+    contractTemplateVersion: varchar("contractTemplateVersion", {
+      length: 64
+    }).notNull(),
+    contractDocumentSha256: varchar("contractDocumentSha256", {
+      length: 64
+    }).notNull(),
+    contractEvidence: json("contractEvidence").$type(),
+    contractConfirmationStatus: mysqlEnum("contractConfirmationStatus", [
+      "confirmed",
+      "pending_confirmation",
+      "rejected"
+    ]).default("confirmed").notNull(),
+    contractSignedAt: timestamp("contractSignedAt"),
+    signatoryId: varchar("signatoryId", { length: 128 }),
+    requestedUsername: varchar("requestedUsername", { length: 64 }).notNull(),
+    requestedDisplayName: varchar("requestedDisplayName", {
+      length: 128
+    }).notNull(),
+    accountMode: mysqlEnum("accountMode", ["create", "bind_existing"]).default("create").notNull(),
+    purchaseIntentId: varchar("purchaseIntentId", { length: 36 }).references(
+      () => purchaseIntents.id,
+      { onDelete: "set null" }
+    ),
+    userId: int("userId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    status: mysqlEnum("status", [
+      "pending_confirmation",
+      "pending",
+      "completed",
+      "failed"
+    ]).default("pending").notNull(),
+    accountSetupTokenHash: varchar("accountSetupTokenHash", {
+      length: 64
+    }).unique(),
+    accountSetupTokenExpiresAt: timestamp("accountSetupTokenExpiresAt"),
+    accountSetupTokenConsumedAt: timestamp("accountSetupTokenConsumedAt"),
+    lastError: text("lastError"),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("website_user_provisions_project_idx").on(table.projectId),
+    index("website_user_provisions_user_idx").on(table.userId),
+    index("website_user_provisions_status_idx").on(table.status),
+    index("website_user_provisions_purchase_intent_idx").on(
+      table.purchaseIntentId
+    )
+  ]
+);
+var websiteManualServiceOrders = mysqlTable(
+  "website_manual_service_orders",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    schemaVersion: int("schemaVersion", { unsigned: true }).default(1).notNull(),
+    idempotencyKeyHash: varchar("idempotencyKeyHash", { length: 64 }).notNull().unique(),
+    requestHash: varchar("requestHash", { length: 64 }).notNull(),
+    projectId: varchar("projectId", { length: 80 }).notNull(),
+    companyName: varchar("companyName", { length: 200 }).notNull(),
+    contractProfile: json("contractProfile").$type().notNull(),
+    serviceCategory: mysqlEnum("serviceCategory", [
+      "product_scenario",
+      "reputation",
+      "competitor_comparison"
+    ]).notNull(),
+    planCode: mysqlEnum("planCode", ["basic"]).default("basic").notNull(),
+    serviceDays: int("serviceDays", { unsigned: true }).default(30).notNull(),
+    questionId: varchar("questionId", { length: 80 }).notNull(),
+    question: text("question").notNull(),
+    amountFen: int("amountFen", { unsigned: true }).notNull(),
+    contractTemplateVersion: varchar("contractTemplateVersion", {
+      length: 64
+    }).notNull(),
+    externalContractId: varchar("externalContractId", {
+      length: 128
+    }).unique(),
+    signingUrl: varchar("signingUrl", { length: 2048 }),
+    signedPdfFileId: varchar("signedPdfFileId", { length: 255 }).unique(),
+    signedPdfFilename: varchar("signedPdfFilename", { length: 512 }),
+    signedPdfSha256: varchar("signedPdfSha256", { length: 64 }),
+    evidenceReportFileId: varchar("evidenceReportFileId", {
+      length: 255
+    }),
+    evidenceReportFilename: varchar("evidenceReportFilename", { length: 512 }),
+    evidenceReportSha256: varchar("evidenceReportSha256", { length: 64 }),
+    signedAt: timestamp("signedAt"),
+    signatoryId: varchar("signatoryId", { length: 128 }),
+    signatureNote: text("signatureNote"),
+    paymentIdempotencyKeyHash: varchar("paymentIdempotencyKeyHash", {
+      length: 64
+    }).unique(),
+    paymentRequestHash: varchar("paymentRequestHash", { length: 64 }),
+    paymentOrderId: varchar("paymentOrderId", { length: 64 }).unique(),
+    paymentTradeNo: varchar("paymentTradeNo", { length: 128 }).unique(),
+    paidAt: timestamp("paidAt"),
+    accountSetupIdempotencyKeyHash: varchar("accountSetupIdempotencyKeyHash", {
+      length: 64
+    }).unique(),
+    accountSetupRequestHash: varchar("accountSetupRequestHash", { length: 64 }),
+    accountMode: mysqlEnum("accountMode", ["create", "bind_existing"]),
+    requestedUsername: varchar("requestedUsername", { length: 64 }),
+    requestedDisplayName: varchar("requestedDisplayName", { length: 128 }),
+    requestedPasswordHash: varchar("requestedPasswordHash", { length: 255 }),
+    provisioningReference: varchar("provisioningReference", {
+      length: 128
+    }).unique(),
+    status: mysqlEnum("status", [
+      "pending_admin",
+      "signature_required",
+      "payment_required",
+      "account_setup_required",
+      "activation_required",
+      "active",
+      "rejected",
+      "failed"
+    ]).default("pending_admin").notNull(),
+    preparedByUserId: int("preparedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    signedByUserId: int("signedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    activatedByUserId: int("activatedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    rejectedByUserId: int("rejectedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    preparedAt: timestamp("preparedAt"),
+    accountSetupAt: timestamp("accountSetupAt"),
+    activatedAt: timestamp("activatedAt"),
+    rejectedAt: timestamp("rejectedAt"),
+    lastError: text("lastError"),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("manual_service_orders_project_idx").on(table.projectId),
+    index("manual_service_orders_status_created_idx").on(
+      table.status,
+      table.createdAt
+    ),
+    index("manual_service_orders_payment_idx").on(
+      table.paymentOrderId,
+      table.paymentTradeNo
+    )
+  ]
+);
+var serviceContracts = mysqlTable(
+  "service_contracts",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]).notNull(),
+    planVersion: int("planVersion", { unsigned: true }).default(1).notNull(),
+    status: mysqlEnum("status", [
+      "pending_confirmation",
+      "scheduled",
+      "active",
+      "suspended",
+      "cancelled",
+      "superseded"
+    ]).default("active").notNull(),
+    startsAt: timestamp("startsAt").notNull(),
+    endsAt: timestamp("endsAt").notNull(),
+    source: mysqlEnum("source", ["website", "offline", "admin"]).default("admin").notNull(),
+    amountFen: int("amountFen", { unsigned: true }),
+    currency: varchar("currency", { length: 3 }).default("CNY").notNull(),
+    prepaidMonths: int("prepaidMonths", { unsigned: true }),
+    orderReference: varchar("orderReference", { length: 128 }),
+    externalContractReference: varchar("externalContractReference", {
+      length: 128
+    }),
+    signedAt: timestamp("signedAt"),
+    signatoryId: varchar("signatoryId", { length: 128 }),
+    signingEvidence: json("signingEvidence").$type(),
+    replacesContractIds: json("replacesContractIds").$type().default([]).notNull(),
+    sourceReference: varchar("sourceReference", { length: 191 }),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("service_contracts_user_revision_uq").on(
+      table.userId,
+      table.revision
+    ),
+    index("service_contracts_user_status_ends_idx").on(
+      table.userId,
+      table.status,
+      table.endsAt
+    ),
+    index("service_contracts_source_reference_idx").on(
+      table.source,
+      table.sourceReference
+    ),
+    index("service_contracts_order_reference_idx").on(
+      table.source,
+      table.orderReference
+    )
+  ]
+);
+var serviceQuotaPeriods = mysqlTable(
+  "service_quota_periods",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    contractId: varchar("contractId", { length: 36 }).notNull().references(() => serviceContracts.id, { onDelete: "cascade" }),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    ordinal: int("ordinal", { unsigned: true }).notNull(),
+    startsAt: timestamp("startsAt").notNull(),
+    endsAt: timestamp("endsAt").notNull(),
+    industryLimit: int("industryLimit", { unsigned: true }).default(0).notNull(),
+    competitorComparisonLimit: int("competitorComparisonLimit", {
+      unsigned: true
+    }).default(0).notNull(),
+    reputationLimit: int("reputationLimit", { unsigned: true }).default(0).notNull(),
+    productScenarioLimit: int("productScenarioLimit", { unsigned: true }).default(0).notNull(),
+    totalQuestionLimit: int("totalQuestionLimit", { unsigned: true }).default(0).notNull(),
+    contentAssetPublishLimit: int("contentAssetPublishLimit", {
+      unsigned: true
+    }).default(0).notNull(),
+    websiteContentPublishLimit: int("websiteContentPublishLimit", {
+      unsigned: true
+    }).default(0).notNull(),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("service_quota_periods_contract_ordinal_uq").on(
+      table.contractId,
+      table.ordinal
+    ),
+    index("service_quota_periods_user_window_idx").on(
+      table.userId,
+      table.startsAt,
+      table.endsAt
+    )
+  ]
+);
+var deliveryTickets = mysqlTable(
+  "delivery_tickets",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    contractId: varchar("contractId", { length: 36 }).notNull().references(() => serviceContracts.id, { onDelete: "restrict" }),
+    quotaPeriodId: varchar("quotaPeriodId", { length: 36 }).notNull().references(() => serviceQuotaPeriods.id, { onDelete: "restrict" }),
+    type: mysqlEnum("type", ["content_asset", "website_operation"]).notNull(),
+    quotaPool: mysqlEnum("quotaPool", [
+      "content_asset_publish",
+      "website_content_publish"
+    ]),
+    ordinal: int("ordinal", { unsigned: true }).notNull(),
+    clientRequestId: varchar("clientRequestId", { length: 36 }).notNull(),
+    category: varchar("category", { length: 64 }),
+    topic: varchar("topic", { length: 512 }),
+    title: varchar("title", { length: 512 }),
+    description: text("description"),
+    preferredMedia: varchar("preferredMedia", { length: 32 }),
+    icpProvince: varchar("icpProvince", { length: 64 }),
+    icpDeclarations: json("icpDeclarations").$type(),
+    targetPage: text("targetPage"),
+    technicalDedupeKey: varchar("technicalDedupeKey", { length: 64 }),
+    materialUrls: json("materialUrls").$type().default([]).notNull(),
+    status: mysqlEnum("status", [
+      "submitted",
+      "needs_information",
+      "scheduled",
+      "in_progress",
+      "completed",
+      "rejected",
+      "cancelled"
+    ]).default("submitted").notNull(),
+    quotaState: mysqlEnum("quotaState", ["reserved", "consumed", "released"]).default("reserved").notNull(),
+    internalNote: text("internalNote"),
+    publicSummary: text("publicSummary"),
+    deliveryLinks: json("deliveryLinks").$type().default([]).notNull(),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    updatedByUserId: int("updatedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    resolvedAt: timestamp("resolvedAt"),
+    scheduledAt: timestamp("scheduledAt"),
+    quotaReleasedAt: timestamp("quotaReleasedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_tickets_period_pool_ordinal_uq").on(
+      table.quotaPeriodId,
+      table.quotaPool,
+      table.ordinal
+    ),
+    uniqueIndex("delivery_tickets_user_request_uq").on(
+      table.userId,
+      table.clientRequestId
+    ),
+    uniqueIndex("delivery_tickets_user_technical_dedupe_uq").on(
+      table.userId,
+      table.technicalDedupeKey
+    ),
+    index("delivery_tickets_user_created_idx").on(
+      table.userId,
+      table.createdAt
+    ),
+    index("delivery_tickets_period_pool_state_idx").on(
+      table.quotaPeriodId,
+      table.quotaPool,
+      table.quotaState
+    ),
+    index("delivery_tickets_status_updated_idx").on(
+      table.status,
+      table.updatedAt
+    ),
+    index("delivery_tickets_user_updated_id_idx").on(
+      table.userId,
+      table.updatedAt,
+      table.id
+    ),
+    index("delivery_tickets_user_period_updated_id_idx").on(
+      table.userId,
+      table.quotaPeriodId,
+      table.updatedAt,
+      table.id
+    ),
+    index("delivery_tickets_type_status_updated_id_idx").on(
+      table.type,
+      table.status,
+      table.updatedAt,
+      table.id
+    )
+  ]
+);
+var icpSensitiveMaterials = mysqlTable(
+  "icp_sensitive_materials",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    workspaceUserId: int("workspaceUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    ownerUserId: int("ownerUserId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    storageKey: varchar("storageKey", { length: 255 }).notNull().unique(),
+    encryptionVersion: int("encryptionVersion", { unsigned: true }).default(1).notNull(),
+    encryptionIv: varchar("encryptionIv", { length: 32 }).notNull(),
+    encryptionAuthTag: varchar("encryptionAuthTag", { length: 32 }).notNull(),
+    filename: varchar("filename", { length: 512 }).notNull(),
+    mimeType: varchar("mimeType", { length: 255 }),
+    sizeBytes: int("sizeBytes", { unsigned: true }).notNull(),
+    sha256: varchar("sha256", { length: 64 }).notNull(),
+    category: mysqlEnum("category", [
+      "business_license",
+      "subject_responsible_person_id",
+      "website_responsible_person_id",
+      "authorization_letter",
+      "pre_approval_or_industry_qualification",
+      "enterprise_name_change_proof",
+      "other_provincial_material"
+    ]).notNull(),
+    status: mysqlEnum("status", ["active", "replaced", "withdrawn", "expired"]).default("active").notNull(),
+    replacedByMaterialId: varchar("replacedByMaterialId", { length: 36 }),
+    retentionUntil: timestamp("retentionUntil").notNull(),
+    withdrawnAt: timestamp("withdrawnAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("icp_sensitive_materials_workspace_status_idx").on(
+      table.workspaceUserId,
+      table.status
+    ),
+    index("icp_sensitive_materials_retention_idx").on(
+      table.status,
+      table.retentionUntil
+    )
+  ]
+);
+var deliveryTicketEvents = mysqlTable(
+  "delivery_ticket_events",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    ticketId: varchar("ticketId", { length: 36 }).notNull().references(() => deliveryTickets.id, { onDelete: "cascade" }),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    actorUserId: int("actorUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    actorRole: mysqlEnum("actorRole", ["user", "admin", "system"]).notNull(),
+    kind: mysqlEnum("kind", [
+      "created",
+      "message",
+      "status_change",
+      "attachment",
+      "delivery_result"
+    ]).notNull(),
+    visibility: mysqlEnum("visibility", ["customer", "internal"]).default("customer").notNull(),
+    clientRequestId: varchar("clientRequestId", { length: 36 }),
+    message: text("message"),
+    fromStatus: mysqlEnum("fromStatus", [
+      "submitted",
+      "needs_information",
+      "scheduled",
+      "in_progress",
+      "completed",
+      "rejected",
+      "cancelled"
+    ]),
+    toStatus: mysqlEnum("toStatus", [
+      "submitted",
+      "needs_information",
+      "scheduled",
+      "in_progress",
+      "completed",
+      "rejected",
+      "cancelled"
+    ]),
+    operationResult: json("operationResult").$type(),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_ticket_events_actor_request_uq").on(
+      table.actorUserId,
+      table.clientRequestId
+    ),
+    index("delivery_ticket_events_ticket_created_idx").on(
+      table.ticketId,
+      table.createdAt
+    ),
+    index("delivery_ticket_events_user_created_idx").on(
+      table.userId,
+      table.createdAt
+    )
+  ]
+);
+var deliveryTicketAttachments = mysqlTable(
+  "delivery_ticket_attachments",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    ticketId: varchar("ticketId", { length: 36 }).notNull().references(() => deliveryTickets.id, { onDelete: "cascade" }),
+    eventId: varchar("eventId", { length: 36 }).references(
+      () => deliveryTicketEvents.id,
+      { onDelete: "set null" }
+    ),
+    workspaceUserId: int("workspaceUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    ownerUserId: int("ownerUserId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    kind: mysqlEnum("kind", ["input", "deliverable"]).default("input").notNull(),
+    upstreamFileId: varchar("upstreamFileId", { length: 255 }),
+    protectedMaterialId: varchar("protectedMaterialId", {
+      length: 36
+    }).references(() => icpSensitiveMaterials.id, { onDelete: "restrict" }),
+    sensitivity: mysqlEnum("sensitivity", ["standard", "icp_sensitive"]).default("standard").notNull(),
+    filename: varchar("filename", { length: 512 }).notNull(),
+    mimeType: varchar("mimeType", { length: 255 }),
+    sizeBytes: int("sizeBytes", { unsigned: true }),
+    sha256: varchar("sha256", { length: 64 }),
+    purpose: varchar("purpose", { length: 160 }),
+    authorization: mysqlEnum("authorization", [
+      "owned",
+      "licensed",
+      "public",
+      "authorization_pending"
+    ]),
+    copyrightNote: text("copyrightNote"),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_ticket_attachments_event_file_kind_uq").on(
+      table.eventId,
+      table.upstreamFileId,
+      table.kind
+    ),
+    uniqueIndex("delivery_ticket_attachments_event_protected_kind_uq").on(
+      table.eventId,
+      table.protectedMaterialId,
+      table.kind
+    ),
+    index("delivery_ticket_attachments_ticket_created_idx").on(
+      table.ticketId,
+      table.createdAt
+    ),
+    index("delivery_ticket_attachments_owner_file_idx").on(
+      table.ownerUserId,
+      table.upstreamFileId
+    )
+  ]
+);
+var workspaceSiteProfiles = mysqlTable(
+  "workspace_site_profiles",
+  {
+    userId: int("userId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    domain: varchar("domain", { length: 255 }),
+    siteMode: mysqlEnum("siteMode", ["managed", "external", "unknown"]).default("unknown").notNull(),
+    domainStatus: mysqlEnum("domainStatus", [
+      "not_started",
+      "pending",
+      "completed"
+    ]).default("not_started").notNull(),
+    domainVerifiedAt: timestamp("domainVerifiedAt"),
+    icpProvince: varchar("icpProvince", { length: 64 }),
+    icpNumber: varchar("icpNumber", { length: 128 }),
+    icpStatus: mysqlEnum("icpStatus", [
+      "not_submitted",
+      "preparing",
+      "submitted",
+      "approved",
+      "rejected",
+      "not_required"
+    ]).default("not_submitted").notNull(),
+    icpVerifiedAt: timestamp("icpVerifiedAt"),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    updatedByUserId: int("updatedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("workspace_site_profiles_domain_idx").on(table.domain),
+    index("workspace_site_profiles_workflow_idx").on(
+      table.domainStatus,
+      table.icpStatus
+    )
+  ]
+);
+var workspaceSiteChecks = mysqlTable(
+  "workspace_site_checks",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    key: varchar("key", { length: 64 }).notNull(),
+    label: varchar("label", { length: 160 }).notNull(),
+    status: mysqlEnum("status", [
+      "not_checked",
+      "pending",
+      "passed",
+      "warning",
+      "failed",
+      "not_applicable"
+    ]).default("not_checked").notNull(),
+    summary: text("summary"),
+    evidence: text("evidence"),
+    source: text("source"),
+    checkedAt: timestamp("checkedAt"),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    updatedByUserId: int("updatedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("workspace_site_checks_user_key_uq").on(
+      table.userId,
+      table.key
+    ),
+    index("workspace_site_checks_user_status_idx").on(
+      table.userId,
+      table.status
+    )
+  ]
+);
+var deliveryRedirectPreviews = mysqlTable(
+  "delivery_redirect_previews",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    ownerUserId: int("ownerUserId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    upstreamFileId: varchar("upstreamFileId", { length: 255 }).notNull(),
+    filename: varchar("filename", { length: 512 }).notNull(),
+    fileHash: varchar("fileHash", { length: 64 }).notNull(),
+    rows: json("rows").$type().default([]).notNull(),
+    errors: json("errors").$type().default([]).notNull(),
+    total: int("total", { unsigned: true }).default(0).notNull(),
+    validCount: int("validCount", { unsigned: true }).default(0).notNull(),
+    errorCount: int("errorCount", { unsigned: true }).default(0).notNull(),
+    status: mysqlEnum("status", ["previewed", "applied", "expired"]).default("previewed").notNull(),
+    appliedTicketId: varchar("appliedTicketId", { length: 36 }).references(
+      () => deliveryTickets.id,
+      { onDelete: "set null" }
+    ),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    expiresAt: timestamp("expiresAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    appliedAt: timestamp("appliedAt")
+  },
+  (table) => [
+    uniqueIndex("delivery_redirect_previews_user_hash_uq").on(
+      table.userId,
+      table.fileHash
+    ),
+    index("delivery_redirect_previews_user_created_idx").on(
+      table.userId,
+      table.createdAt
+    ),
+    index("delivery_redirect_previews_status_expires_idx").on(
+      table.status,
+      table.expiresAt
+    )
+  ]
+);
+var serviceProgressReports = mysqlTable(
+  "service_progress_reports",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    contractId: varchar("contractId", { length: 36 }).notNull().references(() => serviceContracts.id, { onDelete: "cascade" }),
+    quotaPeriodId: varchar("quotaPeriodId", { length: 36 }).notNull().references(() => serviceQuotaPeriods.id, { onDelete: "cascade" }),
+    payload: json("payload").$type().notNull(),
+    sourceName: varchar("sourceName", { length: 512 }),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    publishedByUserId: int("publishedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("service_progress_reports_period_revision_uq").on(
+      table.quotaPeriodId,
+      table.revision
+    ),
+    index("service_progress_reports_user_period_created_idx").on(
+      table.userId,
+      table.quotaPeriodId,
+      table.createdAt
+    ),
+    index("service_progress_reports_contract_idx").on(table.contractId)
+  ]
+);
+var workspaceQuestions = mysqlTable(
+  "workspace_questions",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    contractId: varchar("contractId", { length: 36 }).notNull().references(() => serviceContracts.id, { onDelete: "cascade" }),
+    quotaPeriodId: varchar("quotaPeriodId", { length: 36 }).notNull().references(() => serviceQuotaPeriods.id, { onDelete: "cascade" }),
+    externalQuestionId: varchar("externalQuestionId", { length: 191 }),
+    sourceQuestionId: varchar("sourceQuestionId", { length: 36 }),
+    candidateKey: varchar("candidateKey", { length: 191 }),
+    category: mysqlEnum("category", [
+      "industry",
+      "competitor_comparison",
+      "reputation",
+      "product_scenario"
+    ]).notNull(),
+    question: text("question").notNull(),
+    intent: text("intent"),
+    intentRevision: int("intentRevision", { unsigned: true }).default(1).notNull(),
+    intentConfirmedRevision: int("intentConfirmedRevision", {
+      unsigned: true
+    }),
+    intentConfirmedAt: timestamp("intentConfirmedAt"),
+    intentConfirmedByUserId: int("intentConfirmedByUserId").references(
+      () => users.id,
+      { onDelete: "set null" }
+    ),
+    rationale: text("rationale"),
+    evidence: json("evidence").$type().default([]).notNull(),
+    risks: json("risks").$type().default([]).notNull(),
+    source: mysqlEnum("source", [
+      "model",
+      "website",
+      "offline",
+      "admin",
+      "user"
+    ]).default("model").notNull(),
+    status: mysqlEnum("status", ["candidate", "selected", "archived"]).default("candidate").notNull(),
+    selectionApprovalStatus: mysqlEnum("selectionApprovalStatus", [
+      "not_requested",
+      "pending",
+      "approved"
+    ]).default("not_requested").notNull(),
+    selectionRequestedAt: timestamp("selectionRequestedAt"),
+    selectionRequestedByUserId: int("selectionRequestedByUserId").references(
+      () => users.id,
+      { onDelete: "set null" }
+    ),
+    selectionApprovedAt: timestamp("selectionApprovedAt"),
+    selectionApprovedByUserId: int("selectionApprovedByUserId").references(
+      () => users.id,
+      { onDelete: "set null" }
+    ),
+    locked: boolean("locked").default(false).notNull(),
+    sourceTaskId: varchar("sourceTaskId", { length: 255 }),
+    knowledgeSnapshotId: varchar("knowledgeSnapshotId", {
+      length: 36
+    }).references(() => knowledgeBaseSnapshots.id, { onDelete: "set null" }),
+    ordinal: int("ordinal", { unsigned: true }).default(0).notNull(),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    selectedAt: timestamp("selectedAt"),
+    archivedAt: timestamp("archivedAt"),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("workspace_questions_generation_key_uq").on(
+      table.quotaPeriodId,
+      table.sourceTaskId,
+      table.candidateKey
+    ),
+    index("workspace_questions_user_period_status_idx").on(
+      table.userId,
+      table.quotaPeriodId,
+      table.status
+    ),
+    index("workspace_questions_user_category_status_idx").on(
+      table.userId,
+      table.category,
+      table.status
+    ),
+    index("workspace_questions_user_approval_status_idx").on(
+      table.userId,
+      table.selectionApprovalStatus,
+      table.updatedAt
+    ),
+    index("workspace_questions_external_idx").on(
+      table.userId,
+      table.externalQuestionId
+    ),
+    index("workspace_questions_source_question_idx").on(
+      table.userId,
+      table.sourceQuestionId
+    )
+  ]
+);
+var knowledgeImportReceipts = mysqlTable(
+  "knowledge_import_receipts",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    source: mysqlEnum("source", ["website", "offline", "admin"]).default("website").notNull(),
+    projectId: varchar("projectId", { length: 80 }),
+    companyName: varchar("companyName", { length: 200 }),
+    taskId: varchar("taskId", { length: 255 }),
+    fileId: varchar("fileId", { length: 255 }),
+    outputItemId: varchar("outputItemId", { length: 255 }),
+    descriptorHash: varchar("descriptorHash", { length: 64 }),
+    sourceReference: varchar("sourceReference", { length: 191 }),
+    idempotencyKeyHash: varchar("idempotencyKeyHash", { length: 64 }).notNull().unique(),
+    artifactHash: varchar("artifactHash", { length: 64 }).notNull(),
+    sourceFileName: varchar("sourceFileName", { length: 512 }).notNull(),
+    status: mysqlEnum("status", [
+      "pending",
+      "processing",
+      "completed",
+      "failed"
+    ]).default("pending").notNull(),
+    snapshotId: varchar("snapshotId", { length: 36 }).references(
+      () => knowledgeBaseSnapshots.id,
+      { onDelete: "set null" }
+    ),
+    attemptCount: int("attemptCount", { unsigned: true }).default(0).notNull(),
+    errorCode: varchar("errorCode", { length: 128 }),
+    errorMessage: text("errorMessage"),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("knowledge_import_receipts_user_artifact_uq").on(
+      table.userId,
+      table.artifactHash
+    ),
+    uniqueIndex("knowledge_import_receipts_project_descriptor_uq").on(
+      table.projectId,
+      table.taskId,
+      table.outputItemId,
+      table.descriptorHash
+    ),
+    index("knowledge_import_receipts_user_status_idx").on(
+      table.userId,
+      table.status
+    ),
+    index("knowledge_import_receipts_project_task_idx").on(
+      table.projectId,
+      table.taskId
+    )
+  ]
+);
+var purchaseIntents = mysqlTable(
+  "purchase_intents",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    sourceContractId: varchar("sourceContractId", {
+      length: 36
+    }).references(() => serviceContracts.id, { onDelete: "set null" }),
+    resultingContractId: varchar("resultingContractId", {
+      length: 36
+    }).references(() => serviceContracts.id, { onDelete: "set null" }),
+    targetPlanCode: mysqlEnum("targetPlanCode", [
+      "basic",
+      "advanced",
+      "luxury"
+    ]).notNull(),
+    kind: mysqlEnum("kind", [
+      "new_purchase",
+      "repeat_basic",
+      "upgrade",
+      "renewal"
+    ]).notNull(),
+    status: mysqlEnum("status", ["pending", "consumed", "cancelled"]).default("pending").notNull(),
+    tokenHash: varchar("tokenHash", { length: 64 }).notNull().unique(),
+    externalOrderId: varchar("externalOrderId", { length: 128 }),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    expiresAt: timestamp("expiresAt").notNull(),
+    consumedAt: timestamp("consumedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("purchase_intents_user_status_expires_idx").on(
+      table.userId,
+      table.status,
+      table.expiresAt
+    ),
+    index("purchase_intents_external_order_idx").on(table.externalOrderId)
+  ]
+);
 var apiKeyOwnership = mysqlTable(
   "api_key_ownership",
   {
@@ -165,6 +1389,466 @@ var apiKeyOwnership = mysqlTable(
     createdAt: timestamp("createdAt").defaultNow().notNull()
   },
   (table) => [index("api_key_ownership_user_idx").on(table.userId)]
+);
+var userAdminAssignments = mysqlTable(
+  "user_admin_assignments",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    adminId: int("adminId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    assignedByUserId: int("assignedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("user_admin_assignments_user_admin_uq").on(
+      table.userId,
+      table.adminId
+    ),
+    index("user_admin_assignments_admin_idx").on(table.adminId)
+  ]
+);
+var userUsageOwners = mysqlTable(
+  "user_usage_owners",
+  {
+    userId: int("userId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    deliveryAdminId: int("deliveryAdminId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    index("user_usage_owners_delivery_admin_idx").on(table.deliveryAdminId)
+  ]
+);
+var workspaceAuditEvents = mysqlTable(
+  "workspace_audit_events",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    actorUserId: int("actorUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    actorUsername: varchar("actorUsername", { length: 64 }),
+    actorAccessLevel: mysqlEnum("actorAccessLevel", [
+      "system_admin",
+      "delivery_admin"
+    ]),
+    action: varchar("action", { length: 128 }).notNull(),
+    targetType: varchar("targetType", { length: 64 }).notNull(),
+    targetId: varchar("targetId", { length: 191 }).notNull(),
+    workspaceUserId: int("workspaceUserId"),
+    reason: text("reason"),
+    metadata: json("metadata").$type().default({}).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    index("workspace_audit_events_actor_created_idx").on(
+      table.actorUserId,
+      table.createdAt
+    ),
+    index("workspace_audit_events_workspace_created_idx").on(
+      table.workspaceUserId,
+      table.createdAt
+    ),
+    index("workspace_audit_events_action_created_idx").on(
+      table.action,
+      table.createdAt
+    ),
+    index("workspace_audit_events_target_idx").on(
+      table.targetType,
+      table.targetId
+    )
+  ]
+);
+var dashboardImportPreflights = mysqlTable(
+  "dashboard_import_preflights",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    actorUserId: int("actorUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    workspaceUserId: int("workspaceUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    module: varchar("module", { length: 64 }).notNull(),
+    dashboardRevision: int("dashboardRevision", { unsigned: true }).notNull(),
+    fileHash: varchar("fileHash", { length: 64 }).notNull(),
+    sectionId: varchar("sectionId", { length: 80 }),
+    targetBatchKey: varchar("targetBatchKey", { length: 191 }),
+    expiresAt: timestamp("expiresAt").notNull(),
+    consumedAt: timestamp("consumedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    index("dashboard_import_preflights_actor_expires_idx").on(
+      table.actorUserId,
+      table.expiresAt
+    ),
+    index("dashboard_import_preflights_workspace_expires_idx").on(
+      table.workspaceUserId,
+      table.expiresAt
+    ),
+    index("dashboard_import_preflights_consumed_expires_idx").on(
+      table.consumedAt,
+      table.expiresAt
+    )
+  ]
+);
+var userDashboardContents = mysqlTable(
+  "user_dashboard_contents",
+  {
+    userId: int("userId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    payload: json("payload").$type().notNull(),
+    sourceName: varchar("sourceName", { length: 512 }),
+    enterpriseIdentityBoundAt: timestamp("enterpriseIdentityBoundAt"),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    updatedByUserId: int("updatedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [index("user_dashboard_contents_updated_idx").on(table.updatedAt)]
+);
+var workspaceContentRevisions = mysqlTable(
+  "workspace_content_revisions",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    module: varchar("module", { length: 64 }).default("dashboard").notNull(),
+    revision: int("revision", { unsigned: true }).notNull(),
+    payload: json("payload").$type().notNull(),
+    sourceName: varchar("sourceName", { length: 512 }),
+    enterpriseIdentityBoundAt: timestamp("enterpriseIdentityBoundAt"),
+    publicationKind: mysqlEnum("publicationKind", [
+      "publish",
+      "rollback",
+      "migration"
+    ]).default("publish").notNull(),
+    rolledBackFromRevision: int("rolledBackFromRevision", { unsigned: true }),
+    publishedByUserId: int("publishedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    reason: text("reason"),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("workspace_content_revisions_user_module_revision_uq").on(
+      table.userId,
+      table.module,
+      table.revision
+    ),
+    index("workspace_content_revisions_user_module_created_idx").on(
+      table.userId,
+      table.module,
+      table.createdAt
+    ),
+    index("workspace_content_revisions_publisher_idx").on(
+      table.publishedByUserId
+    )
+  ]
+);
+var monitoringBatches = mysqlTable(
+  "monitoring_batches",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    contractId: varchar("contractId", { length: 36 }).references(
+      () => serviceContracts.id,
+      { onDelete: "cascade" }
+    ),
+    quotaPeriodId: varchar("quotaPeriodId", { length: 36 }).references(
+      () => serviceQuotaPeriods.id,
+      { onDelete: "cascade" }
+    ),
+    batchKey: varchar("batchKey", { length: 191 }).notNull(),
+    sourceName: varchar("sourceName", { length: 512 }).notNull(),
+    collectedAt: timestamp("collectedAt").notNull(),
+    sampleCount: int("sampleCount", { unsigned: true }).default(0).notNull(),
+    citationCount: int("citationCount", { unsigned: true }).default(0).notNull(),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    importedByUserId: int("importedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("monitoring_batches_user_period_key_uq").on(
+      table.userId,
+      table.quotaPeriodId,
+      table.batchKey
+    ),
+    index("monitoring_batches_contract_period_idx").on(
+      table.contractId,
+      table.quotaPeriodId
+    ),
+    index("monitoring_batches_user_collected_idx").on(
+      table.userId,
+      table.collectedAt
+    )
+  ]
+);
+var monitoringSamples = mysqlTable(
+  "monitoring_samples",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    batchId: varchar("batchId", { length: 36 }).notNull().references(() => monitoringBatches.id, { onDelete: "cascade" }),
+    sourceRecordId: varchar("sourceRecordId", { length: 191 }).notNull(),
+    questionId: varchar("questionId", { length: 191 }).notNull(),
+    question: text("question").notNull(),
+    platform: varchar("platform", { length: 128 }).notNull(),
+    answerNo: int("answerNo", { unsigned: true }).default(1).notNull(),
+    content: longtext("content").notNull(),
+    citationCount: int("citationCount", { unsigned: true }).default(0).notNull(),
+    monitorRank: int("monitorRank", { unsigned: true }),
+    screenshotUrl: text("screenshotUrl"),
+    collectedAt: timestamp("collectedAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("monitoring_samples_user_batch_source_uq").on(
+      table.userId,
+      table.batchId,
+      table.sourceRecordId
+    ),
+    index("monitoring_samples_user_question_collected_idx").on(
+      table.userId,
+      table.questionId,
+      table.collectedAt
+    ),
+    index("monitoring_samples_user_batch_idx").on(table.userId, table.batchId),
+    index("monitoring_samples_user_platform_idx").on(
+      table.userId,
+      table.platform
+    )
+  ]
+);
+var monitoringCitationRecords = mysqlTable(
+  "monitoring_citation_records",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    batchId: varchar("batchId", { length: 36 }).notNull().references(() => monitoringBatches.id, { onDelete: "cascade" }),
+    sampleId: varchar("sampleId", { length: 36 }).references(
+      () => monitoringSamples.id,
+      { onDelete: "set null" }
+    ),
+    sourceRecordId: varchar("sourceRecordId", { length: 191 }).notNull(),
+    questionId: varchar("questionId", { length: 191 }).notNull(),
+    question: text("question").notNull(),
+    model: varchar("model", { length: 128 }).notNull(),
+    title: text("title").notNull(),
+    url: text("url").notNull(),
+    media: varchar("media", { length: 255 }).notNull(),
+    domain: varchar("domain", { length: 255 }).notNull(),
+    publishedAt: timestamp("publishedAt"),
+    collectedAt: timestamp("collectedAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("monitoring_citations_user_batch_source_uq").on(
+      table.userId,
+      table.batchId,
+      table.sourceRecordId
+    ),
+    index("monitoring_citations_user_question_collected_idx").on(
+      table.userId,
+      table.questionId,
+      table.collectedAt
+    ),
+    index("monitoring_citations_user_batch_idx").on(
+      table.userId,
+      table.batchId
+    ),
+    index("monitoring_citations_user_model_idx").on(table.userId, table.model),
+    index("monitoring_citations_user_media_idx").on(table.userId, table.media),
+    index("monitoring_citations_user_domain_idx").on(
+      table.userId,
+      table.domain
+    ),
+    index("monitoring_citations_sample_idx").on(table.sampleId)
+  ]
+);
+var knowledgeBaseSnapshots = mysqlTable(
+  "knowledge_base_snapshots",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    version: int("version").notNull(),
+    sourceFileName: varchar("sourceFileName", { length: 512 }).notNull(),
+    sourceConversationId: varchar("sourceConversationId", { length: 191 }),
+    sourceBuildId: varchar("sourceBuildId", { length: 36 }),
+    sourceBuildRevision: int("sourceBuildRevision"),
+    sourceTaskId: varchar("sourceTaskId", { length: 255 }),
+    sourceArtifactHash: varchar("sourceArtifactHash", { length: 64 }),
+    archiveHash: varchar("archiveHash", { length: 64 }),
+    documents: json("documents").$type().notNull(),
+    assets: json("assets").$type().notNull(),
+    documentCount: int("documentCount").default(0).notNull(),
+    imageCount: int("imageCount").default(0).notNull(),
+    characterCount: int("characterCount").default(0).notNull(),
+    totalBytes: int("totalBytes", { unsigned: true }).default(0).notNull(),
+    status: mysqlEnum("status", ["active", "archived"]).default("active").notNull(),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("knowledge_base_snapshots_user_version_uq").on(
+      table.userId,
+      table.version
+    ),
+    index("knowledge_base_snapshots_user_status_idx").on(
+      table.userId,
+      table.status
+    ),
+    uniqueIndex("knowledge_base_snapshots_source_artifact_uq").on(
+      table.userId,
+      table.sourceBuildId,
+      table.sourceBuildRevision,
+      table.sourceArtifactHash
+    )
+  ]
+);
+var knowledgeBaseBuilds = mysqlTable(
+  "knowledge_base_builds",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    conversationId: varchar("conversationId", { length: 191 }).notNull(),
+    companyName: varchar("companyName", { length: 255 }).notNull(),
+    companyWebsite: text("companyWebsite"),
+    upstreamTaskId: varchar("upstreamTaskId", { length: 255 }),
+    skillName: varchar("skillName", { length: 128 }).default("socratic-kb-builder").notNull(),
+    skillVersion: varchar("skillVersion", { length: 64 }).default("1").notNull(),
+    skillContentHash: varchar("skillContentHash", { length: 64 }),
+    status: mysqlEnum("status", [
+      "researching",
+      "confirming",
+      "ready_to_publish",
+      "published",
+      "protocol_error",
+      "failed"
+    ]).default("researching").notNull(),
+    revision: int("revision").default(0).notNull(),
+    currentLeafId: varchar("currentLeafId", { length: 191 }),
+    totalNodeCount: int("totalNodeCount").default(0).notNull(),
+    confirmedCount: int("confirmedCount").default(0).notNull(),
+    directPrefilledCount: int("directPrefilledCount").default(0).notNull(),
+    needsVerificationCount: int("needsVerificationCount").default(0).notNull(),
+    lastReconciledHash: varchar("lastReconciledHash", { length: 64 }),
+    lastOutputLength: int("lastOutputLength").default(0).notNull(),
+    lastOutputItemIds: json("lastOutputItemIds").$type().default([]).notNull(),
+    lastTurnUserText: longtext("lastTurnUserText"),
+    lastTurnAttachmentCount: int("lastTurnAttachmentCount").default(0).notNull(),
+    packageRevision: int("packageRevision"),
+    packageTaskId: varchar("packageTaskId", { length: 255 }),
+    packageOutputItemId: varchar("packageOutputItemId", { length: 255 }),
+    packageFileId: varchar("packageFileId", { length: 255 }),
+    packageFilename: varchar("packageFilename", { length: 512 }),
+    packageDescriptorHash: varchar("packageDescriptorHash", { length: 64 }),
+    protocolError: text("protocolError"),
+    publishedSnapshotId: varchar("publishedSnapshotId", {
+      length: 36
+    }).references(() => knowledgeBaseSnapshots.id, { onDelete: "set null" }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+    completedAt: timestamp("completedAt"),
+    publishedAt: timestamp("publishedAt")
+  },
+  (table) => [
+    uniqueIndex("knowledge_base_builds_user_conversation_uq").on(
+      table.userId,
+      table.conversationId
+    ),
+    index("knowledge_base_builds_user_status_idx").on(
+      table.userId,
+      table.status
+    ),
+    index("knowledge_base_builds_task_idx").on(table.upstreamTaskId)
+  ]
+);
+var knowledgeBaseBuildNodes = mysqlTable(
+  "knowledge_base_build_nodes",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    buildId: varchar("buildId", { length: 36 }).notNull().references(() => knowledgeBaseBuilds.id, { onDelete: "cascade" }),
+    leafId: varchar("leafId", { length: 191 }).notNull(),
+    branchId: varchar("branchId", { length: 128 }).notNull(),
+    branchTitle: varchar("branchTitle", { length: 255 }).notNull(),
+    title: varchar("title", { length: 512 }).notNull(),
+    ordinal: int("ordinal").notNull(),
+    status: mysqlEnum("status", [
+      "pending",
+      "current",
+      "confirmed",
+      "direct_prefilled",
+      "needs_verification"
+    ]).default("pending").notNull(),
+    transitionReason: text("transitionReason"),
+    contentMarkdown: longtext("contentMarkdown"),
+    lastUserInput: longtext("lastUserInput"),
+    sourceUrls: json("sourceUrls").$type().default([]).notNull(),
+    imageUrls: json("imageUrls").$type().default([]).notNull(),
+    lastTaskId: varchar("lastTaskId", { length: 255 }),
+    lastResponseAt: timestamp("lastResponseAt"),
+    confirmedAt: timestamp("confirmedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("knowledge_base_build_nodes_leaf_uq").on(
+      table.buildId,
+      table.leafId
+    ),
+    uniqueIndex("knowledge_base_build_nodes_ordinal_uq").on(
+      table.buildId,
+      table.ordinal
+    ),
+    index("knowledge_base_build_nodes_status_idx").on(
+      table.buildId,
+      table.status
+    )
+  ]
+);
+var responseLogicEntries = mysqlTable(
+  "response_logic_entries",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    questionId: varchar("questionId", { length: 191 }).notNull(),
+    groupId: varchar("groupId", { length: 128 }).notNull(),
+    groupTitle: varchar("groupTitle", { length: 255 }).notNull(),
+    question: text("question").notNull(),
+    intent: text("intent").notNull(),
+    summary: text("summary").notNull(),
+    conversationId: varchar("conversationId", { length: 191 }),
+    lastTaskId: varchar("lastTaskId", { length: 255 }),
+    skillName: varchar("skillName", { length: 128 }).default("response-logic-builder").notNull(),
+    skillVersion: varchar("skillVersion", { length: 64 }).default("1").notNull(),
+    skillContentHash: varchar("skillContentHash", { length: 64 }),
+    draft: json("draft").$type().notNull(),
+    confirmed: json("confirmed").$type(),
+    version: int("version").default(0).notNull(),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    status: mysqlEnum("status", ["draft", "confirmed"]).default("draft").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("response_logic_entries_user_question_uq").on(
+      table.userId,
+      table.questionId
+    ),
+    index("response_logic_entries_user_status_idx").on(
+      table.userId,
+      table.status
+    ),
+    uniqueIndex("response_logic_entries_user_conversation_uq").on(
+      table.userId,
+      table.conversationId
+    )
+  ]
 );
 var conversations = mysqlTable(
   "conversations",
@@ -354,6 +2038,7 @@ async function getDb() {
 
 // server/auth-service.ts
 var SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1e3;
+var MANAGED_ACCOUNT_SETUP_DURATION_MS = 48 * 60 * 60 * 1e3;
 var LOGIN_WINDOW_MS = 15 * 60 * 1e3;
 var AuthServiceError = class extends Error {
   constructor(code, message, retryAfterMs) {
@@ -404,9 +2089,12 @@ function getCredentialMasterKey() {
   return decodeMasterKey(configured);
 }
 function credentialAad(userId, credentialId) {
-  return Buffer.from(`frontmind-api-credential:v1:${userId}:${credentialId}`, "utf8");
+  return Buffer.from(
+    `frontmind-api-credential:v1:${userId}:${credentialId}`,
+    "utf8"
+  );
 }
-function decryptApiKey(credential) {
+function decryptCredentialSecret(aad, credential) {
   try {
     if (credential.encryptionVersion !== 1) {
       throw new AuthServiceError(
@@ -419,7 +2107,7 @@ function decryptApiKey(credential) {
       getCredentialMasterKey(),
       Buffer.from(credential.encryptionIv, "base64")
     );
-    decipher.setAAD(credentialAad(credential.userId, credential.id));
+    decipher.setAAD(Buffer.from(aad, "utf8"));
     decipher.setAuthTag(Buffer.from(credential.encryptionAuthTag, "base64"));
     return Buffer.concat([
       decipher.update(Buffer.from(credential.encryptedKey, "base64")),
@@ -427,8 +2115,17 @@ function decryptApiKey(credential) {
     ]).toString("utf8");
   } catch (error) {
     if (error instanceof AuthServiceError) throw error;
-    throw new AuthServiceError("INVALID_CREDENTIAL", "Credential cannot be decrypted");
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "Credential cannot be decrypted"
+    );
   }
+}
+function decryptApiKey(credential) {
+  return decryptCredentialSecret(
+    credentialAad(credential.userId, credential.id).toString("utf8"),
+    credential
+  );
 }
 async function getDecryptedCredentialForUser(userId, credentialId) {
   const db = await requireDb();
@@ -450,6 +2147,29 @@ async function getDecryptedCredentialForUser(userId, credentialId) {
     status: credential.status,
     verifiedAt: credential.verifiedAt
   };
+}
+async function getEffectiveDecryptedCredentialForAccount(accountId) {
+  const db = await requireDb();
+  const accountRows = await db.select({ role: users.role }).from(users).where(eq2(users.id, accountId)).limit(1);
+  const account = accountRows[0];
+  if (!account) return null;
+  if (account.role === "admin") {
+    return getDecryptedCredentialForUser(accountId);
+  }
+  const ownerRows = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq2(userUsageOwners.userId, accountId)).limit(1);
+  const ownerId = ownerRows[0]?.deliveryAdminId;
+  return ownerId ? getDecryptedCredentialForUser(ownerId) : getDecryptedCredentialForUser(accountId);
+}
+async function credentialMayServeAccount(executor, accountId, credentialId) {
+  const credentialRows = await executor.select({
+    ownerUserId: apiCredentials.userId,
+    status: apiCredentials.status
+  }).from(apiCredentials).where(eq2(apiCredentials.id, credentialId)).limit(1);
+  const credential = credentialRows[0];
+  if (!credential || credential.status === "deleted") return false;
+  if (credential.ownerUserId === accountId) return true;
+  const ownerRows = await executor.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq2(userUsageOwners.userId, accountId)).limit(1);
+  return ownerRows[0]?.deliveryAdminId === credential.ownerUserId;
 }
 async function getCredentialForUpstreamResource(userId, kind, upstreamId) {
   const db = await requireDb();
@@ -477,6 +2197,19 @@ async function getCredentialForUpstreamResource(userId, kind, upstreamId) {
     resource: row.resource
   };
 }
+async function getOwnedUpstreamResourceIds(userId, kind, upstreamIds) {
+  const uniqueIds = [...new Set(upstreamIds.filter(Boolean))];
+  if (uniqueIds.length === 0) return /* @__PURE__ */ new Set();
+  const db = await requireDb();
+  const rows = await db.select({ upstreamId: upstreamResources.upstreamId }).from(upstreamResources).where(
+    and(
+      eq2(upstreamResources.userId, userId),
+      eq2(upstreamResources.kind, kind),
+      inArray(upstreamResources.upstreamId, uniqueIds)
+    )
+  );
+  return new Set(rows.map((row) => row.upstreamId));
+}
 async function recordUpstreamResource(input) {
   const db = await requireDb();
   const existing = await db.select().from(upstreamResources).where(
@@ -494,14 +2227,11 @@ async function recordUpstreamResource(input) {
     }
     return existing[0];
   }
-  const credential = await db.select({ id: apiCredentials.id }).from(apiCredentials).where(
-    and(
-      eq2(apiCredentials.id, input.apiCredentialId),
-      eq2(apiCredentials.userId, input.userId),
-      ne(apiCredentials.status, "deleted")
-    )
-  ).limit(1);
-  if (!credential[0]) {
+  if (!await credentialMayServeAccount(
+    db,
+    input.userId,
+    input.apiCredentialId
+  )) {
     throw new AuthServiceError("NOT_FOUND", "API credential not found");
   }
   if (input.conversationId) {
@@ -543,6 +2273,1574 @@ async function recordUpstreamResource(input) {
       "Upstream resource is already owned by another account"
     );
   }
+}
+
+// server/dashboard-service.ts
+import { and as and5, desc as desc5, eq as eq6, inArray as inArray4, lt as lt2 } from "drizzle-orm";
+
+// shared/dashboard.ts
+import { z as z3 } from "zod";
+
+// shared/service-portal.ts
+import { z } from "zod";
+var servicePlanCodeSchema = z.enum(["basic", "advanced", "luxury"]);
+var workspaceQuestionCategorySchema = z.enum([
+  "industry",
+  "competitor_comparison",
+  "reputation",
+  "product_scenario"
+]);
+var serviceContractSourceSchema = z.enum([
+  "website",
+  "offline",
+  "admin"
+]);
+var serviceCapabilityKeySchema = z.enum([
+  "knowledgeBuild",
+  "knowledgeDisplay",
+  "globalKeywords",
+  "questionSelection",
+  "intentOptimization",
+  "responseLogic",
+  "monitoring",
+  "channelDistribution",
+  "progressReport",
+  "contentAssets"
+]);
+var serviceQuotaLimitsSchema = z.object({
+  industryLimit: z.number().int().nonnegative(),
+  competitorComparisonLimit: z.number().int().nonnegative(),
+  reputationLimit: z.number().int().nonnegative(),
+  productScenarioLimit: z.number().int().nonnegative(),
+  totalQuestionLimit: z.number().int().nonnegative()
+});
+var serviceQuotaUsageSchema = z.object({
+  industry: z.number().int().nonnegative(),
+  competitorComparison: z.number().int().nonnegative(),
+  reputation: z.number().int().nonnegative(),
+  productScenario: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative()
+});
+var EMPTY_SERVICE_QUOTA_USAGE = Object.freeze({
+  industry: 0,
+  competitorComparison: 0,
+  reputation: 0,
+  productScenario: 0,
+  total: 0
+});
+var FULL_SERVICE_CAPABILITIES = Object.freeze({
+  knowledgeBuild: true,
+  knowledgeDisplay: true,
+  globalKeywords: true,
+  questionSelection: true,
+  intentOptimization: true,
+  responseLogic: true,
+  monitoring: true,
+  channelDistribution: true,
+  progressReport: true,
+  contentAssets: true
+});
+var SERVICE_PLAN_CATALOG = Object.freeze({
+  basic: {
+    code: "basic",
+    name: "\u57FA\u7840\u7248",
+    description: "30 \u5929\u5185\u4EA4\u4ED8\u4E00\u4E2A\u5DF2\u8D2D\u4E70\u7684\u975E\u884C\u4E1A\u95EE\u9898\u53CA\u77E5\u8BC6\u5E93\u5C55\u793A\u3002",
+    planVersion: 1,
+    contractTerm: { unit: "day", count: 30 },
+    quotaCadence: "contract",
+    prepaidMonths: null,
+    billingLabel: "30 \u5929\u5355\u9898\u670D\u52A1",
+    // Each permitted non-industry category has a ceiling of one, while the
+    // shared total ceiling guarantees that Basic can select only one of them.
+    limits: {
+      industryLimit: 0,
+      competitorComparisonLimit: 1,
+      reputationLimit: 1,
+      productScenarioLimit: 1,
+      totalQuestionLimit: 1
+    },
+    includedCapabilities: {
+      knowledgeBuild: false,
+      knowledgeDisplay: true,
+      globalKeywords: false,
+      questionSelection: false,
+      intentOptimization: true,
+      responseLogic: true,
+      monitoring: true,
+      channelDistribution: true,
+      progressReport: true,
+      contentAssets: true
+    }
+  },
+  advanced: {
+    code: "advanced",
+    name: "\u8FDB\u9636\u7248",
+    description: "\u6309\u5B63\u5EA6\u4EA4\u4ED8\u884C\u4E1A\u3001\u7ADE\u54C1\u3001\u7F8E\u8A89\u4E0E\u4EA7\u54C1\u573A\u666F\u95EE\u9898\u3002",
+    planVersion: 1,
+    contractTerm: { unit: "month", count: 3 },
+    quotaCadence: "quarter",
+    prepaidMonths: 3,
+    billingLabel: "\u5B63\u5EA6\u670D\u52A1",
+    limits: {
+      industryLimit: 1,
+      competitorComparisonLimit: 1,
+      reputationLimit: 1,
+      productScenarioLimit: 5,
+      totalQuestionLimit: 8
+    },
+    includedCapabilities: { ...FULL_SERVICE_CAPABILITIES }
+  },
+  luxury: {
+    code: "luxury",
+    name: "\u8C6A\u534E\u7248",
+    description: "\u63D0\u4F9B\u8C6A\u534E\u7248\u5B8C\u6574\u670D\u52A1\u3002",
+    planVersion: 1,
+    contractTerm: { unit: "month", count: 3 },
+    quotaCadence: "month",
+    prepaidMonths: 3,
+    billingLabel: "\u5B63\u5EA6\u670D\u52A1",
+    limits: {
+      industryLimit: 4,
+      competitorComparisonLimit: 4,
+      reputationLimit: 4,
+      productScenarioLimit: 20,
+      totalQuestionLimit: 32
+    },
+    includedCapabilities: { ...FULL_SERVICE_CAPABILITIES }
+  }
+});
+var effectiveServiceStatusSchema = z.enum([
+  "unconfigured",
+  "pending_confirmation",
+  "scheduled",
+  "active",
+  "suspended",
+  "expired",
+  "cancelled"
+]);
+var serviceCapabilityAccessSchema = z.object({
+  allowed: z.boolean(),
+  effectiveStatus: z.enum([
+    "available",
+    "not_in_plan",
+    "service_unconfigured",
+    "service_pending_confirmation",
+    "service_scheduled",
+    "service_suspended",
+    "service_expired",
+    "service_cancelled"
+  ]),
+  reason: z.string().nullable()
+});
+var serviceCapabilitiesSchema = z.object({
+  knowledgeBuild: serviceCapabilityAccessSchema,
+  knowledgeDisplay: serviceCapabilityAccessSchema,
+  globalKeywords: serviceCapabilityAccessSchema,
+  questionSelection: serviceCapabilityAccessSchema,
+  intentOptimization: serviceCapabilityAccessSchema,
+  responseLogic: serviceCapabilityAccessSchema,
+  monitoring: serviceCapabilityAccessSchema,
+  channelDistribution: serviceCapabilityAccessSchema,
+  progressReport: serviceCapabilityAccessSchema,
+  contentAssets: serviceCapabilityAccessSchema
+});
+var serviceNextActionKindSchema = z.enum([
+  "await_service_configuration",
+  "await_service_confirmation",
+  "await_service_start",
+  "contact_service_support",
+  "renew_service",
+  "await_knowledge_import",
+  "view_knowledge",
+  "resume_knowledge_build",
+  "start_knowledge_build",
+  "await_question_import",
+  "generate_question_candidates",
+  "select_service_questions",
+  "await_question_confirmation",
+  "optimize_service_questions",
+  "build_response_logic",
+  "await_monitoring_data",
+  "await_channel_distribution",
+  "await_progress_report",
+  "view_progress_report"
+]);
+var serviceNextActionSchema = z.object({
+  kind: serviceNextActionKindSchema,
+  label: z.string().min(1),
+  href: z.string().nullable()
+});
+var serviceWorkflowStepSchema = z.object({
+  id: z.enum([
+    "knowledge",
+    "question",
+    "intent_optimization",
+    "response_logic",
+    "monitoring",
+    "channel_distribution",
+    "progress_report"
+  ]),
+  label: z.string().min(1),
+  status: z.enum(["complete", "ready", "locked"]),
+  lockedReason: z.string().nullable(),
+  href: z.string().nullable(),
+  nextAction: serviceNextActionSchema.nullable().default(null)
+});
+var servicePortalQuestionSchema = z.object({
+  id: z.string(),
+  contractId: z.string().nullable(),
+  quotaPeriodId: z.string(),
+  externalQuestionId: z.string().nullable(),
+  sourceQuestionId: z.string().nullable(),
+  category: workspaceQuestionCategorySchema,
+  question: z.string(),
+  intent: z.string().nullable(),
+  intentRevision: z.number().int().positive(),
+  intentConfirmedRevision: z.number().int().positive().nullable(),
+  intentConfirmedAt: z.number().int().nonnegative().nullable(),
+  intentConfirmed: z.boolean(),
+  rationale: z.string().nullable(),
+  evidence: z.array(
+    z.object({
+      documentPath: z.string(),
+      excerpt: z.string(),
+      relevance: z.string()
+    })
+  ),
+  risks: z.array(z.string()),
+  source: z.enum(["model", "website", "offline", "admin", "user"]),
+  status: z.enum(["candidate", "selected", "archived"]),
+  selectionApprovalStatus: z.enum(["not_requested", "pending", "approved"]),
+  selectionRequestedAt: z.number().int().nonnegative().nullable(),
+  selectionApprovedAt: z.number().int().nonnegative().nullable(),
+  locked: z.boolean(),
+  revision: z.number().int().positive()
+});
+var servicePortalQuotaPeriodSchema = z.object({
+  periodId: z.string(),
+  contractId: z.string(),
+  validFrom: z.number().int(),
+  validUntil: z.number().int(),
+  revision: z.number().int().positive(),
+  limits: serviceQuotaLimitsSchema,
+  usage: serviceQuotaUsageSchema,
+  remaining: serviceQuotaUsageSchema
+});
+var servicePortalSchema = z.object({
+  schemaVersion: z.literal(1),
+  revision: z.number().int().nonnegative(),
+  entitlementRollout: z.object({
+    mode: z.enum(["compatibility", "enforced"]),
+    pendingUserCount: z.number().int().nonnegative()
+  }),
+  account: z.object({
+    userId: z.number().int().positive(),
+    username: z.string().nullable(),
+    displayName: z.string().nullable()
+  }).nullable(),
+  service: z.object({
+    contractId: z.string().nullable(),
+    planCode: servicePlanCodeSchema.nullable(),
+    planName: z.string(),
+    status: effectiveServiceStatusSchema,
+    validFrom: z.number().int().nullable(),
+    validUntil: z.number().int().nullable(),
+    billingLabel: z.string(),
+    source: serviceContractSourceSchema.nullable()
+  }),
+  quotas: servicePortalQuotaPeriodSchema.nullable(),
+  quotaPeriods: z.array(servicePortalQuotaPeriodSchema),
+  purchases: z.array(
+    z.object({
+      id: z.string(),
+      planCode: servicePlanCodeSchema,
+      planName: z.string(),
+      purchasedAt: z.number().int(),
+      validFrom: z.number().int(),
+      validUntil: z.number().int(),
+      status: z.enum([
+        "pending_confirmation",
+        "scheduled",
+        "active",
+        "suspended",
+        "expired",
+        "cancelled",
+        "superseded"
+      ]),
+      amountFen: z.number().int().nonnegative().nullable(),
+      currency: z.string().length(3),
+      prepaidMonths: z.number().int().positive().nullable(),
+      orderReference: z.string().nullable(),
+      contractReference: z.string().nullable(),
+      signedAt: z.number().int().nullable(),
+      signatoryId: z.string().nullable(),
+      hasSigningEvidence: z.boolean(),
+      revision: z.number().int().positive()
+    })
+  ),
+  knowledge: z.object({
+    version: z.number().int().positive().nullable(),
+    authenticatedVersion: z.number().int().positive().nullable(),
+    authenticatedForCurrentService: z.boolean(),
+    status: z.enum(["display_ready", "importing", "missing", "failed"]),
+    latestImportStatus: z.enum(["pending", "processing", "completed", "failed"]).nullable()
+  }),
+  purchasedQuestions: z.array(servicePortalQuestionSchema),
+  historicalQuestions: z.array(servicePortalQuestionSchema),
+  capabilities: serviceCapabilitiesSchema,
+  workflowSteps: z.array(serviceWorkflowStepSchema),
+  nextAction: serviceNextActionSchema
+});
+var publicServicePortalQuestionSchema = servicePortalQuestionSchema.omit({
+  contractId: true,
+  quotaPeriodId: true
+});
+var publicServicePortalQuotaPeriodSchema = servicePortalQuotaPeriodSchema.omit({
+  contractId: true
+});
+var publicServicePortalSchema = servicePortalSchema.omit({
+  entitlementRollout: true,
+  quotaPeriods: true,
+  purchases: true
+}).extend({
+  service: servicePortalSchema.shape.service.omit({
+    contractId: true,
+    source: true
+  }),
+  quotas: publicServicePortalQuotaPeriodSchema.nullable(),
+  purchasedQuestions: z.array(publicServicePortalQuestionSchema),
+  historicalQuestions: z.array(publicServicePortalQuestionSchema)
+});
+
+// shared/monitoring.ts
+import { z as z2 } from "zod";
+var identifierSchema = z2.string().trim().min(1).max(191);
+var boundedDateSchema = z2.string().trim().min(1).max(64).refine((value) => Number.isFinite(Date.parse(value)), "\u65E5\u671F\u683C\u5F0F\u65E0\u6548");
+var monitoringSampleImportSchema = z2.object({
+  sourceRecordId: identifierSchema,
+  questionId: identifierSchema,
+  platform: z2.string().trim().min(1).max(128),
+  answerNo: z2.number().int().positive().max(1e4).default(1),
+  content: z2.string().trim().max(2e5).default(""),
+  citationCount: z2.number().int().nonnegative().max(1e5).optional(),
+  monitorRank: z2.number().int().positive().max(1e5).optional(),
+  screenshotUrl: z2.string().trim().max(2048).default(""),
+  collectedAt: boundedDateSchema.optional()
+}).strict();
+var monitoringCitationImportSchema = z2.object({
+  sourceRecordId: identifierSchema,
+  questionId: identifierSchema,
+  sampleSourceRecordId: identifierSchema.optional(),
+  model: z2.string().trim().min(1).max(128),
+  title: z2.string().trim().max(1e3).default(""),
+  url: z2.string().trim().max(2048).default(""),
+  media: z2.string().trim().max(255).default(""),
+  domain: z2.string().trim().max(255).default(""),
+  publishedAt: boundedDateSchema.optional(),
+  collectedAt: boundedDateSchema.optional()
+}).strict();
+var replaceMonitoringBatchSchema = z2.object({
+  userId: z2.number().int().positive(),
+  batchKey: identifierSchema,
+  sourceName: z2.string().trim().min(1).max(512),
+  collectedAt: boundedDateSchema,
+  samples: z2.array(monitoringSampleImportSchema).max(1e5).default([]),
+  citations: z2.array(monitoringCitationImportSchema).max(1e5).default([])
+}).strict().refine(
+  (value) => value.samples.length > 0 || value.citations.length > 0,
+  "\u76D1\u63A7\u6837\u672C\u548C\u5F15\u7528\u8BB0\u5F55\u4E0D\u80FD\u540C\u65F6\u4E3A\u7A7A"
+);
+var listBaseSchema = z2.object({
+  questionId: identifierSchema.optional(),
+  batchKey: identifierSchema.optional(),
+  from: boundedDateSchema.optional(),
+  to: boundedDateSchema.optional(),
+  query: z2.string().trim().max(500).default(""),
+  page: z2.number().int().positive().max(1e6).default(1),
+  pageSize: z2.number().int().positive().max(100).default(25)
+}).strict();
+var listMonitoringSamplesSchema = listBaseSchema.extend({
+  /** @deprecated Use model. Kept for existing clients and imported data. */
+  platform: z2.string().trim().min(1).max(128).optional(),
+  model: z2.string().trim().min(1).max(128).optional(),
+  sortOrder: z2.enum(["asc", "desc"]).default("desc")
+});
+var listMonitoringCitationsSchema = listBaseSchema.extend({
+  sampleId: identifierSchema.optional(),
+  model: z2.string().trim().min(1).max(128).optional(),
+  media: z2.string().trim().min(1).max(255).optional(),
+  domain: z2.string().trim().min(1).max(255).optional(),
+  sortBy: z2.enum(["collectedAt", "publishedAt", "question", "model", "title", "media"]).default("collectedAt"),
+  sortOrder: z2.enum(["asc", "desc"]).default("desc")
+});
+var monitoringCitationSummarySchema = z2.object({
+  batchKey: identifierSchema.optional(),
+  questionId: identifierSchema,
+  model: z2.string().trim().min(1).max(128).optional(),
+  from: boundedDateSchema.optional(),
+  to: boundedDateSchema.optional()
+}).strict().refine(
+  (value) => !value.from || !value.to || new Date(value.from).getTime() <= new Date(value.to).getTime(),
+  {
+    message: "\u76D1\u63A7\u65E5\u671F\u533A\u95F4\u65E0\u6548",
+    path: ["to"]
+  }
+);
+var monitoringFilterOptionsSchema = z2.object({
+  batchKey: identifierSchema.optional(),
+  questionId: identifierSchema.optional()
+}).strict();
+var listMonitoringSampleCitationsSchema = z2.object({
+  batchKey: identifierSchema,
+  questionId: identifierSchema,
+  /** Server-generated monitoring_samples.id. Source record IDs are rejected. */
+  sampleId: z2.string().uuid(),
+  cursor: z2.string().uuid().optional(),
+  limit: z2.number().int().positive().max(100).default(50)
+}).strict();
+
+// shared/dashboard.ts
+var dashboardMetricSchema = z3.object({
+  label: z3.string().trim().min(1).max(80),
+  value: z3.union([z3.string(), z3.number()]),
+  unit: z3.string().trim().max(24).optional(),
+  note: z3.string().trim().max(160).optional()
+});
+var dashboardItemSchema = z3.object({
+  title: z3.string().trim().min(1).max(160),
+  description: z3.string().trim().max(4e3).optional(),
+  meta: z3.string().trim().max(160).optional(),
+  imageUrl: z3.string().trim().max(2048).optional()
+});
+var dashboardTableSchema = z3.object({
+  id: z3.string().trim().min(1).max(80),
+  title: z3.string().trim().min(1).max(160),
+  description: z3.string().trim().max(1e3).optional(),
+  columns: z3.array(z3.string().trim().min(1).max(160)).min(1).max(50),
+  rows: z3.array(z3.array(z3.string().trim().max(8e3)).max(50)).max(1e4).default([])
+});
+var dashboardSectionSchema = z3.object({
+  id: z3.string().trim().min(1).max(80),
+  title: z3.string().trim().min(1).max(160),
+  subtitle: z3.string().trim().max(300).optional(),
+  body: z3.string().trim().max(2e4).optional(),
+  items: z3.array(dashboardItemSchema).max(100).default([]),
+  tables: z3.array(dashboardTableSchema).max(20).default([])
+});
+var dashboardQuestionSchema = z3.object({
+  id: z3.string().trim().min(1).max(191),
+  groupId: z3.string().trim().min(1).max(128),
+  groupTitle: z3.string().trim().min(1).max(255),
+  groupSubtitle: z3.string().trim().max(300).default(""),
+  tone: z3.enum(["plum", "teal", "amber", "blue"]).default("plum"),
+  question: z3.string().trim().min(1).max(2e3),
+  intent: z3.string().trim().max(8e3).default(""),
+  summary: z3.string().trim().max(8e3).default("")
+});
+var dashboardMonitoringCitationSchema = z3.object({
+  id: z3.string().trim().min(1).max(191).optional(),
+  title: z3.string().trim().max(1e3).default(""),
+  url: z3.string().trim().max(2048).default(""),
+  media: z3.string().trim().max(255).default(""),
+  publishedAt: z3.string().trim().max(64).optional()
+});
+var dashboardMonitoringAnswerSchema = z3.object({
+  id: z3.string().trim().min(1).max(191),
+  questionId: z3.string().trim().min(1).max(191),
+  platform: z3.string().trim().min(1).max(128),
+  collectedAt: z3.string().trim().max(64).default(""),
+  answerNo: z3.number().int().positive().max(1e4).default(1),
+  content: z3.string().trim().max(2e5).default(""),
+  citationCount: z3.number().int().nonnegative().max(1e5).optional(),
+  monitorRank: z3.number().positive().max(1e5).optional(),
+  screenshotUrl: z3.string().trim().max(2048).default(""),
+  citations: z3.array(dashboardMonitoringCitationSchema).max(200).default([])
+});
+var dashboardCitationRecordSchema = z3.object({
+  id: z3.string().trim().min(1).max(191),
+  questionId: z3.string().trim().max(191).default(""),
+  model: z3.string().trim().max(128).default(""),
+  question: z3.string().trim().max(2e3).default(""),
+  title: z3.string().trim().max(1e3).default(""),
+  url: z3.string().trim().max(2048).default(""),
+  media: z3.string().trim().max(255).default(""),
+  domain: z3.string().trim().max(255).default(""),
+  date: z3.string().trim().max(64).default("")
+});
+var dashboardContentMediaSchema = z3.object({
+  url: z3.string().trim().min(1).max(2048),
+  alt: z3.string().trim().max(500).default(""),
+  caption: z3.string().trim().max(1e3).default(""),
+  source: z3.string().trim().max(2048).default("")
+});
+var dashboardContentArticleSectionSchema = z3.union([
+  z3.tuple([z3.string().trim().max(500), z3.string().trim().max(3e4)]),
+  z3.object({
+    heading: z3.string().trim().max(500).default(""),
+    body: z3.string().trim().max(3e4).default(""),
+    media: z3.array(dashboardContentMediaSchema).max(50).default([])
+  })
+]);
+var dashboardContentArticleSchema = z3.object({
+  id: z3.string().trim().min(1).max(191),
+  title: z3.string().trim().min(1).max(500),
+  intro: z3.string().trim().max(8e3).default(""),
+  sections: z3.array(dashboardContentArticleSectionSchema).max(100).default([])
+});
+var dashboardContentAssetSchema = z3.object({
+  id: z3.string().trim().min(1).max(80),
+  group: z3.string().trim().max(255).default("\u5185\u5BB9\u8D44\u4EA7"),
+  name: z3.string().trim().min(1).max(255),
+  description: z3.string().trim().max(2e3).default(""),
+  wordRange: z3.string().trim().max(128).default(""),
+  imageCount: z3.number().int().nonnegative().max(1e5).optional(),
+  scene: z3.string().trim().max(1e3).default(""),
+  impact: z3.number().min(0).max(100).optional(),
+  articles: z3.array(dashboardContentArticleSchema).max(500).default([])
+});
+var optimizationKpiSchema = z3.tuple([
+  z3.string(),
+  z3.string(),
+  z3.string(),
+  z3.number(),
+  z3.string()
+]);
+var optimizationPlatformSchema = z3.tuple([
+  z3.string(),
+  z3.string(),
+  z3.string(),
+  z3.string(),
+  z3.string(),
+  z3.string(),
+  z3.string()
+]);
+var optimizationJourneySchema = z3.tuple([
+  z3.string(),
+  z3.string(),
+  z3.string(),
+  z3.string(),
+  z3.string()
+]);
+var optimizationFourColumnSchema = z3.tuple([
+  z3.string(),
+  z3.string(),
+  z3.string(),
+  z3.string()
+]);
+var optimizationRoadmapSchema = z3.tuple([z3.string(), z3.string(), z3.string()]);
+var dashboardOptimizationBaselineSchema = z3.object({
+  id: z3.string().trim().max(191).default(""),
+  questionId: z3.string().trim().max(191).default(""),
+  question: z3.string().trim().max(2e3).default(""),
+  category: z3.string().trim().max(120).default(""),
+  generatedAt: z3.string().trim().max(120).default(""),
+  period: z3.string().trim().max(500).default(""),
+  title: z3.string().trim().min(1).max(500),
+  subtitle: z3.string().trim().max(8e3).default(""),
+  scopeLabel: z3.string().trim().max(1e3).default(""),
+  sample: z3.object({
+    platforms: z3.array(z3.string().trim().min(1).max(120)).max(20).default([]),
+    expectedResponses: z3.number().int().nonnegative().max(1e5),
+    successfulResponses: z3.number().int().nonnegative().max(1e5),
+    failedResponses: z3.number().int().nonnegative().max(1e5)
+  }).optional(),
+  totalScore: z3.number().min(0).max(100).nullable().default(null),
+  rawTotalScore: z3.number().min(0).max(100).nullable().optional(),
+  applicableScore: z3.number().min(0).max(100).nullable().optional(),
+  applicableMaxScore: z3.number().positive().max(100).nullable().optional(),
+  structuralExcludedMaxScore: z3.number().nonnegative().max(100).nullable().optional(),
+  coverage: z3.number().min(0).max(100).nullable().optional(),
+  confidence: z3.enum(["high", "medium", "low"]).nullable().optional(),
+  grade: z3.string().trim().max(20).default(""),
+  summary: z3.string().trim().max(2e4).default(""),
+  dimensions: z3.array(
+    z3.object({
+      id: z3.string().trim().min(1).max(80),
+      label: z3.string().trim().min(1).max(255),
+      score: z3.number().min(0).max(100),
+      maxScore: z3.number().positive().max(100),
+      summary: z3.string().trim().max(4e3).default("")
+    })
+  ).max(20).default([]),
+  platforms: z3.array(
+    z3.object({
+      platform: z3.string().trim().min(1).max(120),
+      responseCount: z3.number().int().nonnegative().max(1e5),
+      mentionRate: z3.string().trim().max(80).nullable().default(null),
+      averageRank: z3.string().trim().max(80).nullable().default(null),
+      factAccuracy: z3.string().trim().max(80).nullable().default(null),
+      propositionHitRate: z3.string().trim().max(80).nullable().default(null),
+      citationCount: z3.number().int().nonnegative().max(1e5),
+      referenceCount: z3.number().int().nonnegative().max(1e5).default(0),
+      verdict: z3.string().trim().max(8e3).default(""),
+      evidenceRefs: z3.array(z3.string().trim().min(1).max(4e3)).max(100).default([])
+    })
+  ).max(100).default([]),
+  findings: z3.array(
+    z3.object({
+      topic: z3.string().trim().min(1).max(500),
+      status: z3.enum(["aligned", "missing", "conflict", "opportunity"]),
+      currentEvidence: z3.string().trim().max(8e3).default(""),
+      gap: z3.string().trim().max(8e3).default(""),
+      action: z3.string().trim().max(8e3).default(""),
+      evidenceRefs: z3.array(z3.string().trim().min(1).max(4e3)).max(100).default([])
+    })
+  ).max(500).default([]),
+  priorityActions: z3.array(
+    z3.object({
+      priority: z3.number().int().positive().max(100),
+      dimension: z3.string().trim().max(255).default(""),
+      action: z3.string().trim().min(1).max(8e3),
+      expectedImpact: z3.string().trim().max(4e3).default(""),
+      evidenceRefs: z3.array(z3.string().trim().min(1).max(4e3)).max(100).default([])
+    })
+  ).max(100).default([]),
+  limitations: z3.array(z3.string().trim().max(4e3)).max(100).default([])
+});
+var dashboardOptimizationAnswerScreenshotSchema = z3.object({
+  id: z3.string().trim().max(191).default(""),
+  url: z3.string().trim().min(1).max(4e3).regex(
+    /^\/api\/dashboard\/report-assets\/[1-9]\d*\/[0-9a-f-]{36}\.(?:png|jpe?g|webp)$/i,
+    "\u7B54\u6848\u622A\u56FE\u5FC5\u987B\u5148\u901A\u8FC7\u7BA1\u7406\u5458\u53D7\u4FDD\u62A4\u4E0A\u4F20\u5165\u53E3\u4E0A\u4F20"
+  ),
+  alt: z3.string().trim().max(500).default("")
+});
+var dashboardOptimizationQuestionSampleSchema = z3.object({
+  platform: z3.string().trim().max(120).default(""),
+  capturedAt: z3.string().trim().max(120).default(""),
+  content: z3.string().trim().max(1e5).default(""),
+  screenshots: z3.array(dashboardOptimizationAnswerScreenshotSchema).max(20).default([])
+});
+var dashboardOptimizationAfterEffectSchema = z3.object({
+  released: z3.boolean().default(false),
+  totalScore: z3.number().min(0).max(100).nullable().default(null),
+  grade: z3.string().trim().max(20).default(""),
+  summary: z3.string().trim().max(2e4).default(""),
+  dimensions: z3.array(
+    z3.object({
+      id: z3.string().trim().min(1).max(80),
+      label: z3.string().trim().min(1).max(255),
+      score: z3.number().min(0).max(100),
+      maxScore: z3.number().positive().max(100),
+      summary: z3.string().trim().max(4e3).default("")
+    })
+  ).max(20).default([]),
+  platforms: z3.array(
+    z3.object({
+      platform: z3.string().trim().min(1).max(120),
+      responseCount: z3.number().int().nonnegative().max(1e5),
+      mentionRate: z3.string().trim().max(80).nullable().default(null),
+      averageRank: z3.string().trim().max(80).nullable().default(null),
+      factAccuracy: z3.string().trim().max(80).nullable().default(null),
+      propositionHitRate: z3.string().trim().max(80).nullable().default(null),
+      citationCount: z3.number().int().nonnegative().max(1e5),
+      referenceCount: z3.number().int().nonnegative().max(1e5).default(0),
+      verdict: z3.string().trim().max(8e3).default("")
+    })
+  ).max(100).default([]),
+  gapFillSummary: z3.string().trim().max(2e4).default(""),
+  gapClosures: z3.array(
+    z3.object({
+      topic: z3.string().trim().min(1).max(500),
+      beforeGap: z3.string().trim().max(8e3).default(""),
+      result: z3.string().trim().max(8e3).default(""),
+      status: z3.enum(["filled", "partial", "open"])
+    })
+  ).max(500).default([])
+}).superRefine((effect, context) => {
+  if (!effect.released) return;
+  if (effect.totalScore === null) {
+    context.addIssue({
+      code: "custom",
+      path: ["totalScore"],
+      message: "\u5F00\u653E\u4F18\u5316\u540E\u6548\u679C\u524D\u5FC5\u987B\u586B\u5199\u4F18\u5316\u540E\u8BED\u4E49\u8D44\u4EA7\u8BC4\u5206"
+    });
+  }
+  if (effect.platforms.length === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["platforms"],
+      message: "\u5F00\u653E\u4F18\u5316\u540E\u6548\u679C\u524D\u5FC5\u987B\u586B\u5199\u81F3\u5C11\u4E00\u4E2A\u5E73\u53F0\u7684\u771F\u5B9E\u590D\u6D4B\u7ED3\u679C"
+    });
+  }
+  if (!effect.gapFillSummary && effect.gapClosures.length === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["gapFillSummary"],
+      message: "\u5F00\u653E\u4F18\u5316\u540E\u6548\u679C\u524D\u5FC5\u987B\u586B\u5199\u77E5\u8BC6\u4E8B\u5B9E\u4E0E\u6A21\u578B\u56DE\u7B54\u5DEE\u8DDD\u7684\u586B\u8865\u7ED3\u679C"
+    });
+  }
+});
+var dashboardOptimizationQuestionReportSchema = z3.object({
+  id: z3.string().trim().min(1).max(191),
+  category: z3.string().trim().max(120).default(""),
+  question: z3.string().trim().min(1).max(2e3),
+  summary: z3.string().trim().max(8e3).default(""),
+  metrics: z3.array(
+    z3.object({
+      label: z3.string().trim().min(1).max(255),
+      before: z3.string().trim().max(120).default(""),
+      after: z3.string().trim().max(120).default(""),
+      change: z3.string().trim().max(120).default(""),
+      note: z3.string().trim().max(1e3).default("")
+    })
+  ).max(50).default([]),
+  before: dashboardOptimizationQuestionSampleSchema.default({
+    platform: "",
+    capturedAt: "",
+    content: "",
+    screenshots: []
+  }),
+  expectedLogic: z3.string().trim().max(2e4).default(""),
+  gaps: z3.array(z3.string().trim().max(8e3)).max(100).default([]),
+  after: dashboardOptimizationQuestionSampleSchema.default({
+    platform: "",
+    capturedAt: "",
+    content: "",
+    screenshots: []
+  }),
+  improvements: z3.array(z3.string().trim().max(8e3)).max(100).default([]),
+  analysis: z3.string().trim().max(2e4).default(""),
+  evidence: z3.array(
+    z3.object({
+      label: z3.string().trim().min(1).max(500),
+      source: z3.string().trim().max(1e3).default(""),
+      url: z3.string().trim().max(4e3).default(""),
+      capturedAt: z3.string().trim().max(120).default(""),
+      isOfficial: z3.boolean().default(false)
+    })
+  ).max(100).default([]),
+  afterEffect: dashboardOptimizationAfterEffectSchema.optional()
+});
+var dashboardOptimizationReportSchema = z3.object({
+  period: z3.string().trim().max(500).default(""),
+  title: z3.string().trim().min(1).max(500),
+  subtitle: z3.string().trim().max(8e3).default(""),
+  executiveSummary: z3.array(z3.string().trim().max(2e4)).max(50).default([]),
+  kpis: z3.array(optimizationKpiSchema).max(100).default([]),
+  platforms: z3.array(optimizationPlatformSchema).max(100).default([]),
+  journeys: z3.array(optimizationJourneySchema).max(100).default([]),
+  competitorTiers: z3.array(optimizationFourColumnSchema).max(100).default([]),
+  sourceMix: z3.array(optimizationFourColumnSchema).max(100).default([]),
+  risks: z3.array(optimizationFourColumnSchema).max(100).default([]),
+  roadmap: z3.array(optimizationRoadmapSchema).max(100).default([]),
+  reportRecords: z3.array(optimizationFourColumnSchema).max(500).default([]),
+  baseline: dashboardOptimizationBaselineSchema.nullable().optional(),
+  questionBaselines: z3.array(dashboardOptimizationBaselineSchema).max(500).optional(),
+  questionReports: z3.array(dashboardOptimizationQuestionReportSchema).max(500).optional()
+}).superRefine((report, context) => {
+  const ensureUnique = (values, path3) => {
+    const seen = /* @__PURE__ */ new Set();
+    values.forEach((value, index2) => {
+      if (!value || !seen.has(value)) {
+        if (value) seen.add(value);
+        return;
+      }
+      context.addIssue({
+        code: "custom",
+        path: [
+          path3,
+          index2,
+          path3 === "questionBaselines" ? "questionId" : "id"
+        ],
+        message: "\u540C\u4E00\u95EE\u9898\u53EA\u80FD\u53D1\u5E03\u4E00\u4EFD\u62A5\u544A"
+      });
+    });
+  };
+  ensureUnique(
+    (report.questionBaselines ?? []).map(
+      (baseline) => baseline.questionId || baseline.id
+    ),
+    "questionBaselines"
+  );
+  ensureUnique(
+    (report.questionReports ?? []).map((question) => question.id),
+    "questionReports"
+  );
+});
+var dashboardTemplateModuleSchema = z3.enum([
+  "profile",
+  "metrics",
+  "sections",
+  "keywords",
+  "questions",
+  "monitoring",
+  "response-logic",
+  "content-assets",
+  "optimization-report"
+]);
+var dashboardAdminImportModuleSchema = z3.enum([
+  "profile",
+  "metrics",
+  "sections",
+  "section-table",
+  "keywords",
+  "questions",
+  "monitoring",
+  "response-logic",
+  "content-assets",
+  "optimization-report"
+]);
+var dashboardModuleTemplateMetadataSchema = z3.object({
+  format: z3.literal("frontmind.dashboard-module-template.v1"),
+  module: dashboardTemplateModuleSchema,
+  templateRevision: z3.number().int().nonnegative(),
+  exportedAt: z3.string().trim().min(1).max(120)
+});
+var dashboardQuestionTemplateRecordSchema = z3.object({
+  id: z3.string().trim().min(1).max(191),
+  revision: z3.number().int().positive(),
+  category: workspaceQuestionCategorySchema,
+  question: z3.string().trim().min(1).max(4e3),
+  intent: z3.string().trim().max(16e3).nullable().default(null),
+  rationale: z3.string().trim().max(16e3).nullable().default(null)
+});
+var dashboardQuestionsTemplateSchema = dashboardModuleTemplateMetadataSchema.extend({
+  module: z3.literal("questions"),
+  questions: z3.array(dashboardQuestionTemplateRecordSchema).max(500)
+}).superRefine((template, context) => {
+  const seen = /* @__PURE__ */ new Set();
+  template.questions.forEach((question, index2) => {
+    if (seen.has(question.id)) {
+      context.addIssue({
+        code: z3.ZodIssueCode.custom,
+        path: ["questions", index2, "id"],
+        message: "\u540C\u4E00\u6B63\u5F0F\u95EE\u9898\u53EA\u80FD\u5728\u6A21\u677F\u4E2D\u51FA\u73B0\u4E00\u6B21"
+      });
+    }
+    seen.add(question.id);
+  });
+});
+var dashboardMonitoringTemplateBatchSchema = z3.object({
+  batchKey: z3.string().trim().min(1).max(191),
+  revision: z3.number().int().positive(),
+  sourceName: z3.string().trim().min(1).max(512),
+  collectedAt: z3.string().datetime(),
+  samples: z3.array(monitoringSampleImportSchema).max(1e5),
+  citations: z3.array(monitoringCitationImportSchema).max(1e5)
+}).refine(
+  (batch) => batch.samples.length > 0 || batch.citations.length > 0,
+  "\u76D1\u63A7\u6279\u6B21\u4E0D\u80FD\u540C\u65F6\u7F3A\u5C11\u7B54\u6848\u548C\u5F15\u7528\u8BB0\u5F55"
+);
+var dashboardMonitoringCurrentTemplateSchema = dashboardModuleTemplateMetadataSchema.extend({
+  module: z3.literal("monitoring"),
+  workspaceUserId: z3.number().int().positive(),
+  batches: z3.array(dashboardMonitoringTemplateBatchSchema).max(100)
+}).superRefine((template, context) => {
+  const batchKeys = /* @__PURE__ */ new Set();
+  template.batches.forEach((batch, batchIndex) => {
+    if (batchKeys.has(batch.batchKey)) {
+      context.addIssue({
+        code: z3.ZodIssueCode.custom,
+        path: ["batches", batchIndex, "batchKey"],
+        message: "\u540C\u4E00\u76D1\u63A7\u6279\u6B21\u53EA\u80FD\u5728\u5F53\u524D\u5185\u5BB9\u6A21\u677F\u4E2D\u51FA\u73B0\u4E00\u6B21"
+      });
+    }
+    batchKeys.add(batch.batchKey);
+    for (const [field, records] of [
+      ["samples", batch.samples],
+      ["citations", batch.citations]
+    ]) {
+      const sourceIds = /* @__PURE__ */ new Set();
+      records.forEach((record, recordIndex) => {
+        if (sourceIds.has(record.sourceRecordId)) {
+          context.addIssue({
+            code: z3.ZodIssueCode.custom,
+            path: ["batches", batchIndex, field, recordIndex, "sourceRecordId"],
+            message: "\u540C\u4E00\u6279\u6B21\u7684\u8BB0\u5F55 ID \u4E0D\u80FD\u91CD\u590D"
+          });
+        }
+        sourceIds.add(record.sourceRecordId);
+      });
+    }
+  });
+});
+var dashboardOptimizationReportTemplateSchema = dashboardModuleTemplateMetadataSchema.extend({
+  module: z3.literal("optimization-report"),
+  optimizationReport: dashboardOptimizationReportSchema
+});
+var dashboardProgressReportVersionSchema = z3.object({
+  id: z3.string().trim().min(1).max(191),
+  revision: z3.number().int().positive(),
+  publishedAt: z3.number().int().nonnegative(),
+  report: dashboardOptimizationReportSchema
+});
+var dashboardPayloadSchema = z3.object({
+  brandName: z3.string().trim().min(1).max(160),
+  headline: z3.string().trim().min(1).max(300),
+  summary: z3.string().trim().max(4e3).default(""),
+  metrics: z3.array(dashboardMetricSchema).max(24).default([]),
+  sections: z3.array(dashboardSectionSchema).max(40).default([]),
+  keywordTables: z3.array(dashboardTableSchema).max(20).default([]),
+  questions: z3.array(dashboardQuestionSchema).max(500).default([]),
+  monitoringAnswers: z3.array(dashboardMonitoringAnswerSchema).max(1e5).default([]),
+  citations: z3.array(dashboardCitationRecordSchema).max(1e5).default([]),
+  contentAssets: z3.array(dashboardContentAssetSchema).max(200).default([]),
+  optimizationReport: dashboardOptimizationReportSchema.nullable().default(null),
+  progressReports: z3.array(dashboardProgressReportVersionSchema).max(100).default([])
+});
+var dashboardImportRecordStatsSchema = z3.object({
+  label: z3.string().trim().min(1).max(120),
+  beforeCount: z3.number().int().nonnegative(),
+  afterCount: z3.number().int().nonnegative(),
+  added: z3.number().int().nonnegative(),
+  updated: z3.number().int().nonnegative(),
+  removed: z3.number().int().nonnegative(),
+  unchanged: z3.number().int().nonnegative()
+});
+var dashboardImportChangedFieldSchema = z3.object({
+  field: z3.string().trim().min(1).max(120),
+  label: z3.string().trim().min(1).max(120),
+  before: z3.string().max(500),
+  after: z3.string().max(500)
+});
+var dashboardImportPreviewMetadataSchema = z3.object({
+  module: dashboardAdminImportModuleSchema,
+  sourceName: z3.string().trim().min(1).max(1e3),
+  fileHash: z3.string().regex(/^[a-f0-9]{64}$/),
+  templateRevision: z3.number().int().nonnegative(),
+  summary: z3.array(z3.string().trim().min(1).max(1e3)).max(30),
+  preflightToken: z3.string().trim().min(1).max(4096).optional(),
+  preflightExpiresAt: z3.string().datetime().optional(),
+  preflightTargetBatchKey: z3.string().trim().min(1).max(191).optional()
+});
+var dashboardModuleImportPreviewSchema = dashboardImportPreviewMetadataSchema.extend({
+  mode: z3.literal("dashboard-module"),
+  sectionId: z3.string().trim().min(1).max(80).optional(),
+  recordStats: z3.array(dashboardImportRecordStatsSchema).max(20),
+  changedFields: z3.array(dashboardImportChangedFieldSchema).max(30).default([])
+});
+
+// server/service-entitlement.ts
+import { and as and3, asc, desc as desc3, eq as eq4, gt as gt2, inArray as inArray2, lte } from "drizzle-orm";
+
+// shared/delivery-ticket.ts
+import { z as z4 } from "zod";
+var deliveryTicketTypeSchema = z4.enum([
+  "content_asset",
+  "website_operation"
+]);
+var deliveryTicketQuotaPoolSchema = z4.enum([
+  "content_asset_publish",
+  "website_content_publish"
+]);
+var websiteOperationCategorySchema = z4.enum([
+  "domain_application",
+  "icp_filing",
+  "company_facts",
+  "product_case_docs",
+  "industry_news",
+  "company_news",
+  "faq_content",
+  // Legacy categories remain parseable for historical records. New ticket
+  // creation is restricted by resolveDeliveryTicketQuotaPool below.
+  "blog_update",
+  "company_blog",
+  "product_page_content",
+  "case_study",
+  "landing_page_content",
+  "content_correction",
+  "domain_https",
+  "privacy_compliance",
+  "metadata_tdk",
+  "structured_data",
+  "image_accessibility",
+  "crawl_directives",
+  "url_governance",
+  "webmaster_indexing",
+  "local_service",
+  "multilingual_region",
+  "verification_code",
+  "bulk_redirect",
+  "technical_diagnosis",
+  "site_rebuild",
+  "prelaunch_review",
+  "llms_txt_experiment"
+]);
+var websiteContentCategorySchema = z4.enum([
+  "company_facts",
+  "product_case_docs",
+  "industry_news",
+  "company_news",
+  "faq_content"
+]);
+var deliveryTicketStatusSchema = z4.enum([
+  "submitted",
+  "needs_information",
+  "scheduled",
+  "in_progress",
+  "completed",
+  "rejected",
+  "cancelled"
+]);
+var deliveryTicketQuotaStateSchema = z4.enum([
+  "reserved",
+  "consumed",
+  "released"
+]);
+var preferredContentMediaSchema = z4.enum([
+  "\u4ECA\u65E5\u5934\u6761",
+  "\u641C\u72D0",
+  "\u7F51\u6613",
+  "\u817E\u8BAF",
+  "\u65B0\u6D6A",
+  "\u767E\u5EA6",
+  "\u4E2D\u534E\u7F51",
+  "\u51E4\u51F0\u7F51",
+  "\u5FAE\u535A"
+]);
+var icpSensitiveMaterialCategorySchema = z4.enum([
+  "business_license",
+  "subject_responsible_person_id",
+  "website_responsible_person_id",
+  "authorization_letter",
+  "pre_approval_or_industry_qualification",
+  "enterprise_name_change_proof",
+  "other_provincial_material"
+]);
+var deliveryTicketAttachmentInputSchema = z4.object({
+  storageKind: z4.enum(["upstream", "icp_protected"]).default("upstream"),
+  fileId: z4.string().trim().min(1).max(255).optional(),
+  protectedMaterialId: z4.string().uuid().optional(),
+  sensitiveCategory: icpSensitiveMaterialCategorySchema.optional(),
+  filename: z4.string().trim().min(1).max(512),
+  mimeType: z4.string().trim().max(255).optional(),
+  sizeBytes: z4.number().int().nonnegative().max(100 * 1024 * 1024).optional(),
+  sha256: z4.string().trim().regex(/^[a-fA-F0-9]{64}$/).optional(),
+  purpose: z4.string().trim().max(160).optional(),
+  authorization: z4.enum(["owned", "licensed", "public", "authorization_pending"]).optional(),
+  copyrightNote: z4.string().trim().max(2e3).optional()
+}).superRefine((value, context) => {
+  if (value.storageKind === "icp_protected") {
+    if (!value.protectedMaterialId) {
+      context.addIssue({
+        code: z4.ZodIssueCode.custom,
+        path: ["protectedMaterialId"],
+        message: "ICP \u654F\u611F\u6750\u6599\u7F3A\u5C11\u53D7\u4FDD\u62A4\u6587\u4EF6\u6807\u8BC6"
+      });
+    }
+    if (!value.sensitiveCategory) {
+      context.addIssue({
+        code: z4.ZodIssueCode.custom,
+        path: ["sensitiveCategory"],
+        message: "\u8BF7\u9009\u62E9 ICP \u654F\u611F\u6750\u6599\u7C7B\u522B"
+      });
+    }
+  } else if (!value.fileId) {
+    context.addIssue({
+      code: z4.ZodIssueCode.custom,
+      path: ["fileId"],
+      message: "\u9644\u4EF6\u7F3A\u5C11\u6587\u4EF6\u6807\u8BC6"
+    });
+  }
+});
+var optionalTrimmedText = (maximum) => z4.string().trim().max(maximum).optional();
+var httpUrlSchema = z4.string().trim().max(2048).url().refine((value) => {
+  const protocol = new URL(value).protocol;
+  return protocol === "http:" || protocol === "https:";
+}, "\u4EC5\u652F\u6301 http \u6216 https \u94FE\u63A5");
+var targetPageSchema = z4.string().trim().max(2048).refine((value) => {
+  if (value.startsWith("/") && !value.startsWith("//")) return true;
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}, "\u76EE\u6807\u9875\u9762\u5FC5\u987B\u662F\u7AD9\u5185\u8DEF\u5F84\u6216\u5B8C\u6574\u7684 http/https \u94FE\u63A5");
+var icpNonSensitiveDeclarationsSchema = z4.object({
+  domainHolderInformation: z4.string().trim().min(1).max(4e3),
+  websiteInformation: z4.string().trim().min(1).max(8e3),
+  aliyunAppVerificationCompleted: z4.literal(true, {
+    error: "\u8BF7\u786E\u8BA4\u5DF2\u5B8C\u6210\u963F\u91CC\u4E91 App \u771F\u5B9E\u6027 / \u4EBA\u8138\u6838\u9A8C"
+  })
+});
+var createDeliveryTicketSchema = z4.object({
+  clientRequestId: z4.string().uuid(),
+  type: deliveryTicketTypeSchema,
+  category: optionalTrimmedText(64),
+  topic: optionalTrimmedText(512),
+  title: optionalTrimmedText(512),
+  description: optionalTrimmedText(5e4),
+  preferredMedia: preferredContentMediaSchema.optional(),
+  icpProvince: optionalTrimmedText(64),
+  icpDeclarations: icpNonSensitiveDeclarationsSchema.optional(),
+  targetPage: targetPageSchema.optional(),
+  materialUrls: z4.array(httpUrlSchema).max(30).default([]),
+  attachments: z4.array(deliveryTicketAttachmentInputSchema).max(30).default([])
+}).refine(
+  (value) => Boolean(
+    value.category?.trim() || value.topic?.trim() || value.title?.trim()
+  ),
+  {
+    message: "\u8BF7\u81F3\u5C11\u586B\u5199\u5185\u5BB9\u7C7B\u578B\u3001\u8BDD\u9898\u65B9\u5411\u6216\u9700\u6C42\u6807\u9898",
+    path: ["topic"]
+  }
+).superRefine((value, context) => {
+  if (value.category === "icp_filing" && !value.icpDeclarations) {
+    context.addIssue({
+      code: z4.ZodIssueCode.custom,
+      path: ["icpDeclarations"],
+      message: "ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
+    });
+  }
+});
+var deliveryTicketDetailInputSchema = z4.object({
+  ticketId: z4.string().uuid()
+});
+var icpMaterialChecklistInputSchema = z4.object({
+  province: z4.string().trim().min(1).max(64)
+});
+var deliveryTicketListInputSchema = z4.object({
+  type: deliveryTicketTypeSchema.optional(),
+  publicStatus: z4.enum(["pending", "completed"]).optional(),
+  limit: z4.number().int().min(1).max(100).default(20),
+  cursor: z4.string().trim().min(1).max(1024).optional(),
+  // tRPC's TanStack infinite-query adapter injects the fetch direction into
+  // the serialized input. It is transport metadata only; list services keep
+  // using the opaque cursor and deterministic server-side sort order.
+  direction: z4.enum(["forward", "backward"]).optional()
+}).strict();
+var adminDeliveryTicketListInputSchema = deliveryTicketListInputSchema.extend({
+  userId: z4.number().int().positive().optional(),
+  assignedAdminId: z4.number().int().positive().optional(),
+  query: z4.string().trim().max(100).optional(),
+  status: deliveryTicketStatusSchema.optional(),
+  quotaPeriodId: z4.string().uuid().optional(),
+  order: z4.enum(["updated_desc", "created_asc"]).default("updated_desc")
+});
+var adjustDeliveryTicketQuotaSchema = z4.object({
+  userId: z4.number().int().positive(),
+  quotaPeriodId: z4.string().uuid(),
+  expectedRevision: z4.number().int().positive(),
+  contentAssetPublishLimit: z4.number().int().nonnegative().max(1e6),
+  websiteContentPublishLimit: z4.number().int().nonnegative().max(1e6),
+  reason: z4.string().trim().min(2).max(2e3)
+});
+var addDeliveryTicketMessageSchema = z4.object({
+  ticketId: z4.string().uuid(),
+  clientRequestId: z4.string().uuid(),
+  message: z4.string().trim().min(1).max(5e4),
+  attachments: z4.array(deliveryTicketAttachmentInputSchema).max(30).default([])
+});
+var updateDeliveryTicketSchema = z4.object({
+  ticketId: z4.string().uuid(),
+  expectedRevision: z4.number().int().positive(),
+  status: z4.literal("completed"),
+  publicMessage: z4.string().trim().max(5e4).optional(),
+  publicSummary: z4.string().trim().max(5e4).nullable().optional(),
+  deliveryLinks: z4.array(
+    z4.object({
+      label: z4.string().trim().min(1).max(160),
+      url: httpUrlSchema
+    })
+  ).max(30).optional(),
+  verifiedDomain: z4.string().trim().max(255).optional(),
+  internalNote: z4.string().trim().max(5e4).nullable().optional()
+});
+var websiteContentTemplateRecordSchema = z4.object({
+  ticketId: z4.string().uuid(),
+  revision: z4.number().int().positive(),
+  category: websiteContentCategorySchema,
+  topic: z4.string().trim().max(512),
+  publicSummary: z4.string().trim().max(5e4),
+  complete: z4.boolean()
+}).strict();
+var websiteContentTemplateSchema = z4.object({
+  format: z4.literal("frontmind.website-content-template.v1"),
+  workspaceUserId: z4.number().int().positive(),
+  exportedAt: z4.string().datetime({ offset: true }),
+  records: z4.array(websiteContentTemplateRecordSchema).max(5e3)
+}).strict().superRefine((value, context) => {
+  const seen = /* @__PURE__ */ new Set();
+  value.records.forEach((record, index2) => {
+    if (seen.has(record.ticketId)) {
+      context.addIssue({
+        code: z4.ZodIssueCode.custom,
+        path: ["records", index2, "ticketId"],
+        message: "\u540C\u4E00\u5DE5\u5355\u5728\u6A21\u677F\u4E2D\u53EA\u80FD\u51FA\u73B0\u4E00\u6B21"
+      });
+    }
+    seen.add(record.ticketId);
+  });
+});
+var adminAddDeliveryTicketMessageSchema = addDeliveryTicketMessageSchema.extend({
+  userId: z4.number().int().positive(),
+  visibility: z4.enum(["customer", "internal"]).default("customer"),
+  attachmentKind: z4.enum(["input", "deliverable"]).default("deliverable")
+});
+var deliverySiteCheckStatusSchema = z4.enum([
+  "not_checked",
+  "pending",
+  "passed",
+  "warning",
+  "failed",
+  "not_applicable"
+]);
+var updateWorkspaceSiteProfileSchema = z4.object({
+  userId: z4.number().int().positive(),
+  expectedRevision: z4.number().int().nonnegative(),
+  domain: z4.string().trim().max(255),
+  siteMode: z4.enum(["managed", "external", "unknown"]),
+  domainStatus: z4.enum(["not_started", "pending", "completed"]).default("not_started"),
+  icpProvince: z4.string().trim().max(64).nullable().optional(),
+  icpNumber: z4.string().trim().max(128).nullable().optional(),
+  icpStatus: z4.enum([
+    "not_submitted",
+    "preparing",
+    "submitted",
+    "approved",
+    "rejected",
+    "not_required"
+  ])
+});
+var upsertWorkspaceSiteCheckSchema = z4.object({
+  userId: z4.number().int().positive(),
+  key: z4.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_-]*$/),
+  label: z4.string().trim().min(1).max(160),
+  status: deliverySiteCheckStatusSchema,
+  summary: z4.string().trim().max(4e3).optional(),
+  evidence: z4.string().trim().max(8e3).optional(),
+  source: z4.string().trim().max(2048).optional(),
+  checkedAt: z4.number().int().nonnegative().nullable().optional(),
+  expectedRevision: z4.number().int().nonnegative()
+});
+var DELIVERY_TICKET_LIMITS = Object.freeze({
+  basic: Object.freeze({
+    content_asset_publish: 1,
+    website_content_publish: 0
+  }),
+  advanced: Object.freeze({
+    content_asset_publish: 5,
+    website_content_publish: 20
+  }),
+  luxury: Object.freeze({
+    content_asset_publish: 20,
+    website_content_publish: 100
+  })
+});
+var WEBSITE_OPERATION_CATEGORIES = new Set(
+  websiteOperationCategorySchema.options
+);
+var ACTIVE_WEBSITE_OPERATION_CATEGORIES = Object.freeze([
+  "domain_application",
+  "icp_filing",
+  "company_facts",
+  "product_case_docs",
+  "industry_news",
+  "company_news",
+  "faq_content"
+]);
+var DELIVERY_TICKET_STATUS_LABELS = Object.freeze({
+  submitted: "\u5DF2\u63D0\u4EA4",
+  needs_information: "\u5F85\u8865\u5145\u8D44\u6599",
+  scheduled: "\u5DF2\u6392\u671F",
+  in_progress: "\u5904\u7406\u4E2D",
+  completed: "\u5DF2\u5B8C\u6210",
+  rejected: "\u672A\u53D7\u7406",
+  cancelled: "\u5DF2\u53D6\u6D88"
+});
+var DELIVERY_TICKET_PUBLIC_STATUS_LABELS = Object.freeze({
+  pending: "\u5F85\u53D7\u7406",
+  completed: "\u5DF2\u5B8C\u6210"
+});
+var publicDeliveryLinkSchema = z4.object({
+  label: z4.string().trim().min(1).max(160),
+  url: httpUrlSchema
+}).strict();
+var publicDeliveryTicketSummaryBaseSchema = z4.object({
+  id: z4.string().uuid(),
+  type: deliveryTicketTypeSchema,
+  category: z4.string().trim().max(64).nullable(),
+  categoryLabel: z4.string().trim().max(160).nullable(),
+  topic: z4.string().trim().max(512).nullable(),
+  publicStatus: z4.enum(["pending", "completed"]),
+  publicStatusLabel: z4.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
+  publicSummary: z4.string().max(5e4).nullable()
+});
+var publicContentAssetTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
+  type: z4.literal("content_asset"),
+  deliveryLinks: z4.array(publicDeliveryLinkSchema).max(30)
+}).strict();
+var publicWebsiteTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
+  type: z4.literal("website_operation")
+}).strict();
+var publicDeliveryTicketSummarySchema = z4.discriminatedUnion("type", [
+  publicContentAssetTicketSummarySchema,
+  publicWebsiteTicketSummarySchema
+]);
+var publicDeliveryTicketEventSchema = z4.object({
+  id: z4.string().uuid(),
+  actorRole: z4.enum(["user", "admin", "system"]),
+  actorLabel: z4.enum(["\u7528\u6237", "\u670D\u52A1\u56E2\u961F"]),
+  message: z4.string().max(5e4).nullable(),
+  createdAt: z4.number().int().nonnegative().nullable()
+}).strict();
+var publicDeliveryTicketAttachmentSchema = z4.object({
+  id: z4.string().uuid(),
+  filename: z4.string().trim().min(1).max(512),
+  mimeType: z4.string().trim().max(255).nullable(),
+  sizeBytes: z4.number().int().nonnegative().nullable(),
+  purpose: z4.string().trim().max(160).nullable(),
+  kind: z4.enum(["input", "deliverable"]).nullable(),
+  createdAt: z4.number().int().nonnegative().nullable(),
+  downloadUrl: z4.string().regex(/^\/api\/delivery-ticket-attachments\/[0-9a-f-]{36}\/content$/)
+}).strict();
+var publicContentAssetTicketDetailSchema = z4.object({
+  ticket: publicContentAssetTicketSummarySchema.extend({
+    preferredMedia: preferredContentMediaSchema.nullable(),
+    revision: z4.number().int().positive(),
+    canReply: z4.boolean()
+  }).strict(),
+  events: z4.array(publicDeliveryTicketEventSchema),
+  attachments: z4.array(publicDeliveryTicketAttachmentSchema).max(100)
+}).strict();
+var publicWebsiteTicketDetailSchema = z4.object({
+  ticket: publicWebsiteTicketSummarySchema
+}).strict();
+var publicDeliveryTicketDetailSchema = z4.union([
+  publicContentAssetTicketDetailSchema,
+  publicWebsiteTicketDetailSchema
+]);
+var publicDeliveryTicketQuotaSchema = z4.object({
+  type: deliveryTicketQuotaPoolSchema,
+  allowed: z4.boolean(),
+  used: z4.number().int().nonnegative(),
+  limit: z4.number().int().nonnegative(),
+  remaining: z4.number().int().nonnegative(),
+  reason: z4.string().nullable()
+}).strict();
+var publicContentAssetCatalogItemSchema = z4.object({
+  id: z4.string().trim().min(1).max(64),
+  code: z4.string().trim().min(1).max(64),
+  group: z4.string().trim().min(1).max(64),
+  type: z4.string().trim().min(1).max(160),
+  label: z4.string().trim().min(1).max(160)
+}).strict();
+var publicWebsiteContentCatalogItemSchema = z4.object({
+  value: z4.enum([
+    "company_facts",
+    "product_case_docs",
+    "industry_news",
+    "company_news",
+    "faq_content"
+  ]),
+  label: z4.string().trim().min(1).max(160)
+}).strict();
+var publicDeliveryTicketWorkspaceMetadataSchema = z4.object({
+  quotas: z4.object({
+    content_asset_publish: publicDeliveryTicketQuotaSchema,
+    website_content_publish: publicDeliveryTicketQuotaSchema
+  }).strict(),
+  contentAssetCatalog: z4.array(publicContentAssetCatalogItemSchema),
+  websiteContentCatalog: z4.array(publicWebsiteContentCatalogItemSchema),
+  preferredMediaOptions: z4.array(preferredContentMediaSchema),
+  websiteWorkflow: z4.object({
+    domainCompleted: z4.boolean(),
+    icpCompleted: z4.boolean(),
+    canSubmitDomain: z4.boolean(),
+    canSubmitIcp: z4.boolean(),
+    canSubmitContent: z4.boolean(),
+    domainLockReason: z4.string().nullable(),
+    icpLockReason: z4.string().nullable(),
+    contentLockReason: z4.string().nullable(),
+    icpProvinceOptions: z4.array(z4.string().trim().min(1).max(64))
+  }).strict()
+}).strict();
+var deliveryOperationResultSchema = z4.object({
+  platform: z4.string().trim().min(1).max(160),
+  targetUrl: httpUrlSchema,
+  executedAt: z4.number().int().nonnegative(),
+  resultStatus: z4.enum(["success", "failed", "pending_confirmation"]),
+  platformMessage: z4.string().trim().max(8e3).optional(),
+  screenshotFileId: z4.string().trim().min(1).max(255).optional()
+});
+var recordDeliveryOperationSchema = z4.object({
+  userId: z4.number().int().positive(),
+  ticketId: z4.string().uuid(),
+  expectedRevision: z4.number().int().positive(),
+  clientRequestId: z4.string().uuid(),
+  result: deliveryOperationResultSchema,
+  attachments: z4.array(deliveryTicketAttachmentInputSchema).max(20).default([])
+});
+var redirectPreviewRowSchema = z4.object({
+  row: z4.number().int().positive(),
+  sourceUrl: z4.string(),
+  targetUrl: z4.string(),
+  statusCode: z4.number().int()
+});
+var previewRedirectWorkbookSchema = z4.object({
+  userId: z4.number().int().positive(),
+  fileId: z4.string().trim().min(1).max(255),
+  filename: z4.string().trim().min(1).max(512)
+});
+var confirmRedirectWorkbookSchema = z4.object({
+  userId: z4.number().int().positive(),
+  ticketId: z4.string().uuid(),
+  previewId: z4.string().uuid(),
+  expectedRevision: z4.number().int().positive()
+});
+
+// server/authenticated-knowledge-service.ts
+import { and as and2, desc as desc2, eq as eq3, gte } from "drizzle-orm";
+
+// server/service-entitlement.ts
+var DAY_MS = 24 * 60 * 60 * 1e3;
+
+// server/admin-control-plane-service.ts
+import { and as and4, desc as desc4, eq as eq5, gte as gte2, inArray as inArray3, isNull as isNull2, lt, or } from "drizzle-orm";
+
+// server/dashboard-service.ts
+var CREDIT_PAGE_LIMIT = 100;
+var CREDIT_MAX_PAGES = 20;
+function parseCreatedAt(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1e12 ? value : value * 1e3;
+  }
+  if (typeof value !== "string" || !value.trim()) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric > 1e12 ? numeric : numeric * 1e3;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function aggregateSharedKeyCreditUsagePage(input) {
+  const recentTasks = [];
+  let totalUsed = 0;
+  let accountUsed = 0;
+  let reachedCutoff = false;
+  for (const task of input.tasks) {
+    const id = String(task?.id ?? task?.task_id ?? "");
+    if (!id || input.seenTaskIds.has(id)) continue;
+    input.seenTaskIds.add(id);
+    const createdAtMs = parseCreatedAt(task?.created_at);
+    if (createdAtMs !== null && createdAtMs < input.cutoff) {
+      reachedCutoff = true;
+      break;
+    }
+    if (createdAtMs !== null && input.endExclusive !== void 0 && createdAtMs >= input.endExclusive) {
+      continue;
+    }
+    const creditUsage = Number(
+      task?.credit_usage ?? task?.metadata?.credit_usage ?? 0
+    );
+    if (!Number.isFinite(creditUsage) || creditUsage <= 0) continue;
+    totalUsed += creditUsage;
+    if (!input.ownedTaskIds.has(id)) continue;
+    accountUsed += creditUsage;
+    recentTasks.push({
+      id,
+      title: String(task?.metadata?.task_title ?? "").trim() || String(task?.instructions ?? "").slice(0, 30) || id.slice(0, 12),
+      creditUsage,
+      createdAt: createdAtMs === null ? void 0 : new Date(createdAtMs).toLocaleDateString("zh-CN", {
+        timeZone: "Asia/Shanghai"
+      })
+    });
+  }
+  return { totalUsed, accountUsed, recentTasks, reachedCutoff };
+}
+function getShanghaiCalendarMonthPeriod(now = Date.now()) {
+  const shanghaiOffsetMs = 8 * 60 * 60 * 1e3;
+  const shanghaiNow = new Date(now + shanghaiOffsetMs);
+  const year = shanghaiNow.getUTCFullYear();
+  const monthIndex = shanghaiNow.getUTCMonth();
+  const startAt = Date.UTC(year, monthIndex, 1, 0, 0, 0, 0) - shanghaiOffsetMs;
+  const endAt = Date.UTC(year, monthIndex + 1, 1, 0, 0, 0, 0) - shanghaiOffsetMs;
+  return {
+    key: `${year}-${String(monthIndex + 1).padStart(2, "0")}`,
+    label: `${year} \u5E74 ${monthIndex + 1} \u6708`,
+    timezone: "Asia/Shanghai",
+    startAt,
+    endAt
+  };
+}
+async function getAccountCreditUsageBetween(userId, input) {
+  const credential = await getEffectiveDecryptedCredentialForAccount(userId);
+  if (!credential)
+    return {
+      totalUsed: 0,
+      accountUsed: 0,
+      recentTasks: [],
+      fetchedAt: Date.now(),
+      fingerprint: null,
+      complete: true,
+      ...input.period ? { period: input.period } : {}
+    };
+  const recentTasks = [];
+  const seen = /* @__PURE__ */ new Set();
+  let totalUsed = 0;
+  let accountUsed = 0;
+  let after;
+  let reachedCutoff = false;
+  let complete = true;
+  for (let pageIndex = 0; pageIndex < CREDIT_MAX_PAGES && !reachedCutoff; pageIndex += 1) {
+    const params = new URLSearchParams({
+      limit: String(CREDIT_PAGE_LIMIT),
+      order: "desc"
+    });
+    if (after) params.set("after", after);
+    const response = await fetch(
+      `${getUpstreamBaseUrl()}/v1/tasks?${params.toString()}`,
+      {
+        headers: {
+          API_KEY: credential.apiKey,
+          Authorization: `Bearer ${credential.apiKey}`,
+          Accept: "application/json"
+        },
+        redirect: "error",
+        signal: AbortSignal.timeout(3e4)
+      }
+    );
+    if (!response.ok) {
+      throw new AuthServiceError(
+        response.status === 401 || response.status === 403 ? "INVALID_CREDENTIAL" : "UPSTREAM_UNAVAILABLE",
+        "\u6682\u65F6\u65E0\u6CD5\u8BFB\u53D6\u8BE5\u7528\u6237\u7684\u79EF\u5206\u4F7F\u7528\u60C5\u51B5"
+      );
+    }
+    const payload = await response.json();
+    const tasks = Array.isArray(payload?.data) ? payload.data : [];
+    if (tasks.length === 0) break;
+    const taskIds = tasks.map((task) => String(task?.id ?? task?.task_id ?? "")).filter(Boolean);
+    const ownedTaskIds = await getOwnedUpstreamResourceIds(
+      userId,
+      "task",
+      taskIds
+    );
+    const pageResult = aggregateSharedKeyCreditUsagePage({
+      tasks,
+      ownedTaskIds,
+      cutoff: input.cutoff,
+      endExclusive: input.endExclusive,
+      seenTaskIds: seen
+    });
+    totalUsed += pageResult.totalUsed;
+    accountUsed += pageResult.accountUsed;
+    recentTasks.push(...pageResult.recentTasks);
+    reachedCutoff = pageResult.reachedCutoff;
+    after = payload?.last_id || tasks[tasks.length - 1]?.id;
+    if (pageIndex === CREDIT_MAX_PAGES - 1 && payload?.has_more && after && !reachedCutoff) {
+      complete = false;
+    }
+    if (!payload?.has_more || !after) break;
+  }
+  return {
+    totalUsed,
+    accountUsed,
+    recentTasks,
+    fetchedAt: Date.now(),
+    fingerprint: credential.fingerprint,
+    complete,
+    ...input.period ? { period: input.period } : {}
+  };
+}
+async function getAccountMonthlyCreditUsage(userId, now = Date.now()) {
+  const period = getShanghaiCalendarMonthPeriod(now);
+  return getAccountCreditUsageBetween(userId, {
+    cutoff: period.startAt,
+    endExclusive: period.endAt,
+    period
+  });
 }
 
 // server/_core/safe-external-url.ts
@@ -637,6 +3935,151 @@ var safeExternalRequestOptions = {
   maxRedirects: 3,
   beforeRedirect
 };
+
+// server/_core/sensitive-data.ts
+var REDACTED = "[REDACTED]";
+var TRUNCATED = "[TRUNCATED]";
+var CIRCULAR = "[CIRCULAR]";
+var UNSUPPORTED = "[UNSUPPORTED]";
+function normalizedSecrets(values) {
+  return Array.from(values ?? []).flatMap((value) => typeof value === "string" ? [value.trim()] : []).filter(Boolean).sort((left, right) => right.length - left.length);
+}
+function normalizedKey(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+function isSensitiveDataKey(value) {
+  const key = normalizedKey(value);
+  return key.includes("apikey") || key.includes("authorization") || key.includes("cookie") || key.includes("token") || key.includes("secret") || key.includes("password") || key.includes("passphrase") || key.includes("credential");
+}
+function redactSensitiveText(value, secrets) {
+  let result = value;
+  for (const secret of normalizedSecrets(secrets)) {
+    result = result.split(secret).join(REDACTED);
+  }
+  return result.replace(/\bBearer\s+[^\s,;"']+/gi, `Bearer ${REDACTED}`).replace(
+    /\b(api[\s_-]*key|authorization|cookie|token|secret|password|passphrase|credential)\b(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+    (_match, key, separator) => `${key}${separator}${REDACTED}`
+  ).replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, REDACTED);
+}
+function redactSensitivePayload(value, options = {}) {
+  const secrets = normalizedSecrets(options.secrets);
+  const maxDepth = options.maxDepth ?? 40;
+  const maxEntries = options.maxEntries ?? 1e4;
+  const seen = /* @__PURE__ */ new WeakSet();
+  let entries = 0;
+  const visit = (current, depth) => {
+    if (depth > maxDepth || entries >= maxEntries) return TRUNCATED;
+    if (current === null || current === void 0 || typeof current === "boolean" || typeof current === "number") {
+      return current;
+    }
+    if (typeof current === "string") {
+      return redactSensitiveText(current, secrets);
+    }
+    if (typeof current === "bigint") return current.toString();
+    if (typeof current !== "object") return UNSUPPORTED;
+    if (current instanceof Date) return current.toISOString();
+    if (Buffer.isBuffer(current)) return "[BINARY REDACTED]";
+    if (seen.has(current)) return CIRCULAR;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      const result = [];
+      for (const item of current) {
+        entries += 1;
+        result.push(visit(item, depth + 1));
+        if (entries >= maxEntries) {
+          result.push(TRUNCATED);
+          break;
+        }
+      }
+      return result;
+    }
+    const output = {};
+    let objectEntries;
+    try {
+      objectEntries = Object.entries(current);
+    } catch {
+      return REDACTED;
+    }
+    for (const [key, child] of objectEntries) {
+      entries += 1;
+      if (isSensitiveDataKey(key)) continue;
+      try {
+        output[key] = visit(child, depth + 1);
+      } catch {
+        output[key] = REDACTED;
+      }
+      if (entries >= maxEntries) {
+        output.__truncated__ = TRUNCATED;
+        break;
+      }
+    }
+    return output;
+  };
+  return visit(value, 0);
+}
+function safeProperty(value, key) {
+  if (!value || typeof value !== "object" && typeof value !== "function") {
+    return void 0;
+  }
+  try {
+    return value[key];
+  } catch {
+    return void 0;
+  }
+}
+function safeLogText(value, secrets, maxLength = 1e3) {
+  if (typeof value !== "string" || !value.trim()) return void 0;
+  return redactSensitiveText(value, secrets).slice(0, maxLength);
+}
+function safeStatus(error) {
+  const direct = safeProperty(error, "status");
+  const response = safeProperty(error, "response");
+  const nested = safeProperty(response, "status");
+  const candidate = typeof direct === "number" ? direct : nested;
+  return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : void 0;
+}
+function safeRequestId(error, secrets) {
+  const response = safeProperty(error, "response");
+  const headers = safeProperty(response, "headers");
+  if (!headers || typeof headers !== "object") return void 0;
+  for (const key of ["x-request-id", "request-id", "trace-id"]) {
+    let candidate;
+    const getter = safeProperty(headers, "get");
+    if (typeof getter === "function") {
+      try {
+        candidate = getter.call(headers, key);
+      } catch {
+        candidate = void 0;
+      }
+    }
+    if (candidate === void 0) {
+      const matchingKey = Object.keys(headers).find(
+        (header) => header.toLowerCase() === key
+      );
+      if (matchingKey) candidate = safeProperty(headers, matchingKey);
+    }
+    const normalized = safeLogText(candidate, secrets, 200);
+    if (normalized) return normalized;
+  }
+  return void 0;
+}
+function safeErrorForLog(error, options = {}) {
+  const secrets = normalizedSecrets(options.secrets);
+  const result = {
+    name: safeLogText(safeProperty(error, "name"), secrets, 120) ?? "Error",
+    message: safeLogText(
+      typeof error === "string" ? error : safeProperty(error, "message"),
+      secrets
+    ) ?? "Request failed"
+  };
+  const code = safeLogText(safeProperty(error, "code"), secrets, 120);
+  const status = safeStatus(error);
+  const requestId = safeRequestId(error, secrets);
+  if (code) result.code = code;
+  if (status !== void 0) result.status = status;
+  if (requestId) result.requestId = requestId;
+  return result;
+}
 
 // server/prepared-file-service.ts
 import axios from "axios";
@@ -1449,6 +4892,11 @@ var fileMetaCache = /* @__PURE__ */ new Map();
 var CACHE_TTL = 10 * 60 * 1e3;
 var downloadTokenCache = /* @__PURE__ */ new Map();
 var DOWNLOAD_TOKEN_TTL = 5 * 60 * 1e3;
+function isPrivateUpstreamCollectionRequest(method, targetPath) {
+  if (!["GET", "HEAD"].includes(method.toUpperCase())) return false;
+  const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
+  return ["/v1/tasks", "/v1/responses", "/v1/files"].includes(pathname);
+}
 function safeUrlForLog(value) {
   try {
     const parsed = new URL(value);
@@ -1588,7 +5036,8 @@ function isTextBasedFile(filename, contentType) {
 function isPdfFile(filename, contentType) {
   const ext = filename.split(".").pop()?.toLowerCase() || "";
   if (ext === "pdf") return true;
-  if (contentType && contentType.toLowerCase().includes("application/pdf")) return true;
+  if (contentType && contentType.toLowerCase().includes("application/pdf"))
+    return true;
   return false;
 }
 function isPdfMagicBytes(data2) {
@@ -1610,7 +5059,25 @@ function sanitizeText(text2) {
     const sourceLower = getSourceBrandLower();
     const sourceTitle = getSourceBrandTitle();
     const sourceUpper = sourceLower.toUpperCase();
-    return text2.replace(new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"), "https://api.frontmind.").replace(new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"), "https://www.frontmind.").replace(new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"), "https://frontmind.").replace(new RegExp(`\\b${escapeRegExp(sourceUpper)}\\b`, "g"), "FrontMind").replace(new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"), "FrontMind").replace(new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"), "frontmind");
+    return text2.replace(
+      new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"),
+      "https://api.frontmind."
+    ).replace(
+      new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"),
+      "https://www.frontmind."
+    ).replace(
+      new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"),
+      "https://frontmind."
+    ).replace(
+      new RegExp(`\\b${escapeRegExp(sourceUpper)}\\b`, "g"),
+      "FrontMind"
+    ).replace(
+      new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"),
+      "FrontMind"
+    ).replace(
+      new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"),
+      "frontmind"
+    );
   } catch (e) {
     console.error("[sanitizeText] Error:", e);
     return text2;
@@ -1623,7 +5090,10 @@ function sanitizeFilename(filename, fallback = "file") {
 function setSafeContentDisposition(res, disposition, filename) {
   const safeFileName = sanitizeFilename(filename);
   const encoded = encodeURIComponent(safeFileName);
-  res.setHeader("content-disposition", `${disposition}; filename="${encoded}"; filename*=UTF-8''${encoded}`);
+  res.setHeader(
+    "content-disposition",
+    `${disposition}; filename="${encoded}"; filename*=UTF-8''${encoded}`
+  );
 }
 function hasUsableExtension(filename) {
   const last = filename.split(/[\/]/).pop() || filename;
@@ -1647,6 +5117,19 @@ function normalizeContentTypeForBuffer(filename, data2, contentType) {
   }
   return contentType || inferMimeType(filename);
 }
+function responseHeaderValue(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const normalized = value.filter(
+      (item) => ["string", "number", "boolean"].includes(typeof item)
+    ).map(String);
+    return normalized.length ? normalized.join(", ") : void 0;
+  }
+  return void 0;
+}
 var SANITIZE_SKIP_KEYS = /* @__PURE__ */ new Set([
   "id",
   "task_id",
@@ -1666,10 +5149,6 @@ var SANITIZE_SKIP_KEYS = /* @__PURE__ */ new Set([
   "src",
   "href",
   "download_url",
-  "api_key",
-  "apiKey",
-  "token",
-  "authorization",
   "base64",
   "data",
   "hash",
@@ -1707,6 +5186,13 @@ function deepSanitizeJson(value, currentKey, depth = 0) {
   }
   return value;
 }
+function publicUpstreamPayload(value, apiKey) {
+  return deepSanitizeJson(
+    redactSensitivePayload(value, {
+      secrets: [apiKey]
+    })
+  );
+}
 function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
   if (value === null || value === void 0 || depth > 50) return ids;
   if (typeof value === "string") {
@@ -1725,11 +5211,14 @@ function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey
     return ids;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectOutputFileIds(item, ids, void 0, depth + 1);
+    for (const item of value)
+      collectOutputFileIds(item, ids, void 0, depth + 1);
     return ids;
   }
   if (typeof value === "object") {
-    for (const [key, item] of Object.entries(value)) {
+    for (const [key, item] of Object.entries(
+      value
+    )) {
       collectOutputFileIds(item, ids, key, depth + 1);
     }
   }
@@ -1756,9 +5245,7 @@ function collectOutputPdfDescriptors(value, descriptors = [], depth = 0) {
   const looksLikeOutputFile = type === "output_file" || type === "file" || "file_id" in object || "fileId" in object;
   if (looksLikePdf && looksLikeOutputFile) {
     const fileId = String(object.file_id ?? object.fileId ?? "");
-    const url = String(
-      object.file_url ?? object.fileUrl ?? object.url ?? ""
-    );
+    const url = String(object.file_url ?? object.fileUrl ?? object.url ?? "");
     descriptors.push({
       fileId: fileId || void 0,
       url: url || void 0,
@@ -1778,7 +5265,9 @@ function sanitizeTextFileBuffer(data2, filename, contentType) {
     const text2 = data2.toString("utf-8");
     const sanitized = sanitizeText(text2);
     if (sanitized !== text2) {
-      console.log(`[FrontMind Proxy] Sanitized source-brand references in text file: ${filename}`);
+      console.log(
+        `[FrontMind Proxy] Sanitized source-brand references in text file: ${filename}`
+      );
       return { buffer: Buffer.from(sanitized, "utf-8"), wasSanitized: true };
     }
     return { buffer: data2, wasSanitized: false };
@@ -1788,8 +5277,18 @@ function sanitizeTextFileBuffer(data2, filename, contentType) {
 }
 async function sanitizePdfBuffer(pdfBuffer) {
   try {
-    const { PDFDocument, PDFName, decodePDFRawStream, PDFRawStream, StandardFonts, rgb, PDFHexString } = await import("pdf-lib");
-    const pdfDoc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+    const {
+      PDFDocument,
+      PDFName,
+      decodePDFRawStream,
+      PDFRawStream,
+      StandardFonts,
+      rgb,
+      PDFHexString
+    } = await import("pdf-lib");
+    const pdfDoc = await PDFDocument.load(pdfBuffer, {
+      ignoreEncryption: true
+    });
     const context = pdfDoc.context;
     let pdfMetadataModified = false;
     const setSanitizedPdfStringMetadata = (getter, setter) => {
@@ -1804,15 +5303,37 @@ async function sanitizePdfBuffer(pdfBuffer) {
       } catch {
       }
     };
-    setSanitizedPdfStringMetadata(() => pdfDoc.getTitle(), (value) => pdfDoc.setTitle(value));
-    setSanitizedPdfStringMetadata(() => pdfDoc.getSubject(), (value) => pdfDoc.setSubject(value));
-    setSanitizedPdfStringMetadata(() => pdfDoc.getAuthor(), (value) => pdfDoc.setAuthor(value));
-    setSanitizedPdfStringMetadata(() => pdfDoc.getCreator(), (value) => pdfDoc.setCreator(value));
-    setSanitizedPdfStringMetadata(() => pdfDoc.getProducer(), (value) => pdfDoc.setProducer(value));
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getTitle(),
+      (value) => pdfDoc.setTitle(value)
+    );
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getSubject(),
+      (value) => pdfDoc.setSubject(value)
+    );
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getAuthor(),
+      (value) => pdfDoc.setAuthor(value)
+    );
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getCreator(),
+      (value) => pdfDoc.setCreator(value)
+    );
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getProducer(),
+      (value) => pdfDoc.setProducer(value)
+    );
     try {
       const infoRef = context.trailerInfo?.Info;
       const infoDict = infoRef ? context.lookup(infoRef) : void 0;
-      const metadataKeys = ["Title", "Subject", "Author", "Creator", "Producer", "Keywords"];
+      const metadataKeys = [
+        "Title",
+        "Subject",
+        "Author",
+        "Creator",
+        "Producer",
+        "Keywords"
+      ];
       if (infoDict && typeof infoDict.lookup === "function" && typeof infoDict.set === "function") {
         for (const key of metadataKeys) {
           const pdfKey = PDFName.of(key);
@@ -1834,7 +5355,8 @@ async function sanitizePdfBuffer(pdfBuffer) {
       try {
         const decoded = decodePDFRawStream(obj);
         const cmapText = Buffer.from(decoded.decode()).toString("latin1");
-        if (!cmapText.includes("beginbfchar") && !cmapText.includes("beginbfrange")) return;
+        if (!cmapText.includes("beginbfchar") && !cmapText.includes("beginbfrange"))
+          return;
         const unicodeToGlyph = /* @__PURE__ */ new Map();
         const glyphToUnicode = /* @__PURE__ */ new Map();
         const charMapRegex = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g;
@@ -1946,9 +5468,7 @@ async function sanitizePdfBuffer(pdfBuffer) {
           if (!streamText.includes("Tj") && !streamText.includes("TJ")) return;
           const sanitized = replaceSimpleBrandEncodings(streamText);
           if (sanitized === streamText) return;
-          const compressed = zlib.deflateSync(
-            Buffer.from(sanitized, "latin1")
-          );
+          const compressed = zlib.deflateSync(Buffer.from(sanitized, "latin1"));
           const dict = obj.dict.clone(context);
           dict.set(PDFName.of("Length"), context.obj(compressed.length));
           dict.set(PDFName.of("Filter"), PDFName.of("FlateDecode"));
@@ -2002,7 +5522,11 @@ async function sanitizePdfBuffer(pdfBuffer) {
         if (!hexToken) continue;
         for (const glyph of hexToken.chunks) {
           if (glyphIndex >= glyphIndexLimit) return advance;
-          advance += estimateGlyphAdvance(glyph.toLowerCase().padStart(4, "0"), pattern.glyphToUnicode, fontSize);
+          advance += estimateGlyphAdvance(
+            glyph.toLowerCase().padStart(4, "0"),
+            pattern.glyphToUnicode,
+            fontSize
+          );
           glyphIndex++;
         }
       }
@@ -2034,7 +5558,10 @@ async function sanitizePdfBuffer(pdfBuffer) {
         streamRefToPageIndex.set(content.toString(), pageIndex);
       }
       if (content.objectNumber !== void 0) {
-        streamRefToPageIndex.set(`${content.objectNumber} ${content.generationNumber} R`, pageIndex);
+        streamRefToPageIndex.set(
+          `${content.objectNumber} ${content.generationNumber} R`,
+          pageIndex
+        );
       }
       if (typeof content.size === "function" && typeof content.get === "function") {
         for (let i = 0; i < content.size(); i++) {
@@ -2077,7 +5604,9 @@ async function sanitizePdfBuffer(pdfBuffer) {
           streamRefToPageIndex.forEach((idx, key) => {
             if (found) return;
             const refObjectNumber = refStr.split(" ")[0];
-            const exactRefPattern = new RegExp(`(^|\\D)${refObjectNumber}\\s+0\\s+R(\\D|$)`);
+            const exactRefPattern = new RegExp(
+              `(^|\\D)${refObjectNumber}\\s+0\\s+R(\\D|$)`
+            );
             if (refStr === key || exactRefPattern.test(key)) {
               pageIndex = idx;
               found = true;
@@ -2126,7 +5655,9 @@ async function sanitizePdfBuffer(pdfBuffer) {
           if (fontMatch) {
             currentFontSize = parseFloat(fontMatch[2]);
           }
-          const tdTjMatch = line.match(/^([\d.eE+-]+)\s+([\d.eE+-]+)\s+Td\s+<([0-9a-fA-F]+)>\s+Tj$/);
+          const tdTjMatch = line.match(
+            /^([\d.eE+-]+)\s+([\d.eE+-]+)\s+Td\s+<([0-9a-fA-F]+)>\s+Tj$/
+          );
           if (tdTjMatch) {
             tdAccumX += parseFloat(tdTjMatch[1]);
             tdAccumY += parseFloat(tdTjMatch[2]);
@@ -2151,94 +5682,114 @@ async function sanitizePdfBuffer(pdfBuffer) {
             const originalLine = lines[i];
             let lineWasModified = false;
             const arrayRegex = /\[([\s\S]*?)\]\s*TJ/g;
-            lines[i] = originalLine.replace(arrayRegex, (fullMatch, body) => {
-              const hexTokens = [];
-              const orderedTokens = [];
-              const glyphs = [];
-              const tokenRegex = /<([0-9a-fA-F]*)>|([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)/g;
-              let tokenMatch;
-              while ((tokenMatch = tokenRegex.exec(body)) !== null) {
-                if (tokenMatch[1] !== void 0) {
-                  const tokenIndex = hexTokens.length;
-                  const chunks = splitGlyphHex(tokenMatch[1]);
-                  hexTokens.push({
-                    start: tokenMatch.index,
-                    end: tokenMatch.index + tokenMatch[0].length,
-                    rawHex: tokenMatch[1],
-                    chunks,
-                    modified: false
-                  });
-                  orderedTokens.push({ kind: "hex", tokenIndex });
-                  chunks.forEach((chunk, chunkIndex) => {
-                    glyphs.push({
-                      glyph: chunk.toLowerCase().padStart(4, "0"),
-                      tokenIndex,
-                      chunkIndex
+            lines[i] = originalLine.replace(
+              arrayRegex,
+              (fullMatch, body) => {
+                const hexTokens = [];
+                const orderedTokens = [];
+                const glyphs = [];
+                const tokenRegex = /<([0-9a-fA-F]*)>|([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)/g;
+                let tokenMatch;
+                while ((tokenMatch = tokenRegex.exec(body)) !== null) {
+                  if (tokenMatch[1] !== void 0) {
+                    const tokenIndex = hexTokens.length;
+                    const chunks = splitGlyphHex(tokenMatch[1]);
+                    hexTokens.push({
+                      start: tokenMatch.index,
+                      end: tokenMatch.index + tokenMatch[0].length,
+                      rawHex: tokenMatch[1],
+                      chunks,
+                      modified: false
                     });
-                  });
-                } else if (tokenMatch[2] !== void 0) {
-                  orderedTokens.push({ kind: "number", value: Number(tokenMatch[2]) });
+                    orderedTokens.push({ kind: "hex", tokenIndex });
+                    chunks.forEach((chunk, chunkIndex) => {
+                      glyphs.push({
+                        glyph: chunk.toLowerCase().padStart(4, "0"),
+                        tokenIndex,
+                        chunkIndex
+                      });
+                    });
+                  } else if (tokenMatch[2] !== void 0) {
+                    orderedTokens.push({
+                      kind: "number",
+                      value: Number(tokenMatch[2])
+                    });
+                  }
                 }
-              }
-              if (glyphs.length === 0) return fullMatch;
-              const replacedGlyphIndexes = /* @__PURE__ */ new Set();
-              let arrayWasModified = false;
-              for (const pattern of glyphPatterns) {
-                const patLen = pattern.glyphs.length;
-                if (patLen === 0 || glyphs.length < patLen) continue;
-                for (let gi = 0; gi <= glyphs.length - patLen; gi++) {
-                  if (replacedGlyphIndexes.has(gi)) continue;
-                  let matches = true;
-                  for (let pj = 0; pj < patLen; pj++) {
-                    if (replacedGlyphIndexes.has(gi + pj) || glyphs[gi + pj].glyph !== pattern.glyphs[pj]) {
-                      matches = false;
-                      break;
+                if (glyphs.length === 0) return fullMatch;
+                const replacedGlyphIndexes = /* @__PURE__ */ new Set();
+                let arrayWasModified = false;
+                for (const pattern of glyphPatterns) {
+                  const patLen = pattern.glyphs.length;
+                  if (patLen === 0 || glyphs.length < patLen) continue;
+                  for (let gi = 0; gi <= glyphs.length - patLen; gi++) {
+                    if (replacedGlyphIndexes.has(gi)) continue;
+                    let matches = true;
+                    for (let pj = 0; pj < patLen; pj++) {
+                      if (replacedGlyphIndexes.has(gi + pj) || glyphs[gi + pj].glyph !== pattern.glyphs[pj]) {
+                        matches = false;
+                        break;
+                      }
+                    }
+                    if (!matches) continue;
+                    for (let pj = 0; pj < patLen; pj++) {
+                      const glyphInfo = glyphs[gi + pj];
+                      const token = hexTokens[glyphInfo.tokenIndex];
+                      const originalChunk = token.chunks[glyphInfo.chunkIndex] || "0000";
+                      token.chunks[glyphInfo.chunkIndex] = pattern.spaceGlyph.toUpperCase().padStart(originalChunk.length, "0");
+                      token.modified = true;
+                      replacedGlyphIndexes.add(gi + pj);
+                    }
+                    arrayWasModified = true;
+                    lineWasModified = true;
+                    if (currentTm) {
+                      const tm = currentTm;
+                      const ctm = currentCtm;
+                      const matchAdvance = calculateTjGlyphAdvance(
+                        orderedTokens,
+                        hexTokens,
+                        gi,
+                        pattern,
+                        currentFontSize
+                      );
+                      const matchWidth = Math.max(
+                        calculateTjGlyphAdvance(
+                          orderedTokens,
+                          hexTokens,
+                          gi + patLen,
+                          pattern,
+                          currentFontSize
+                        ) - matchAdvance,
+                        pattern.glyphs.length * currentFontSize * 0.55
+                      );
+                      const contentX = tm[4] + tdAccumX + matchAdvance;
+                      const contentY = tm[5] + tdAccumY;
+                      const pageX = ctm.sx * contentX + ctm.tx;
+                      const pageY = ctm.sy * contentY + ctm.ty;
+                      const effectiveFontSize = Math.abs(ctm.sx) * currentFontSize;
+                      const pageWidth = Math.abs(ctm.sx) * matchWidth;
+                      const pageIndex = getPageIndexForStream();
+                      overlayPositions.push({
+                        target: pattern.target,
+                        replacementText: replacementTextForTarget(
+                          pattern.target
+                        ),
+                        pageX,
+                        pageY,
+                        pageWidth,
+                        effectiveFontSize,
+                        pageIndex
+                      });
+                      console.log(
+                        `[FrontMind Proxy] PDF TJ overlay: "${pattern.target}" -> "FrontMind" at page=${pageIndex} x=${pageX.toFixed(1)} y=${pageY.toFixed(1)} size=${effectiveFontSize.toFixed(1)}`
+                      );
                     }
                   }
-                  if (!matches) continue;
-                  for (let pj = 0; pj < patLen; pj++) {
-                    const glyphInfo = glyphs[gi + pj];
-                    const token = hexTokens[glyphInfo.tokenIndex];
-                    const originalChunk = token.chunks[glyphInfo.chunkIndex] || "0000";
-                    token.chunks[glyphInfo.chunkIndex] = pattern.spaceGlyph.toUpperCase().padStart(originalChunk.length, "0");
-                    token.modified = true;
-                    replacedGlyphIndexes.add(gi + pj);
-                  }
-                  arrayWasModified = true;
-                  lineWasModified = true;
-                  if (currentTm) {
-                    const tm = currentTm;
-                    const ctm = currentCtm;
-                    const matchAdvance = calculateTjGlyphAdvance(orderedTokens, hexTokens, gi, pattern, currentFontSize);
-                    const matchWidth = Math.max(
-                      calculateTjGlyphAdvance(orderedTokens, hexTokens, gi + patLen, pattern, currentFontSize) - matchAdvance,
-                      pattern.glyphs.length * currentFontSize * 0.55
-                    );
-                    const contentX = tm[4] + tdAccumX + matchAdvance;
-                    const contentY = tm[5] + tdAccumY;
-                    const pageX = ctm.sx * contentX + ctm.tx;
-                    const pageY = ctm.sy * contentY + ctm.ty;
-                    const effectiveFontSize = Math.abs(ctm.sx) * currentFontSize;
-                    const pageWidth = Math.abs(ctm.sx) * matchWidth;
-                    const pageIndex = getPageIndexForStream();
-                    overlayPositions.push({
-                      target: pattern.target,
-                      replacementText: replacementTextForTarget(pattern.target),
-                      pageX,
-                      pageY,
-                      pageWidth,
-                      effectiveFontSize,
-                      pageIndex
-                    });
-                    console.log(
-                      `[FrontMind Proxy] PDF TJ overlay: "${pattern.target}" -> "FrontMind" at page=${pageIndex} x=${pageX.toFixed(1)} y=${pageY.toFixed(1)} size=${effectiveFontSize.toFixed(1)}`
-                    );
-                  }
                 }
+                if (!arrayWasModified) return fullMatch;
+                return `[${rebuildTjArrayBody(body, hexTokens)}] TJ`;
               }
-              if (!arrayWasModified) return fullMatch;
-              return `[${rebuildTjArrayBody(body, hexTokens)}] TJ`;
-            });
+            );
             if (lineWasModified) {
               streamModified = true;
             }
@@ -2311,12 +5862,17 @@ async function sanitizePdfBuffer(pdfBuffer) {
               }
             }
             if (matches) {
-              console.log(`[FrontMind Proxy] FOUND "${pattern.target}" in PDF stream ${ref.toString()}`);
+              console.log(
+                `[FrontMind Proxy] FOUND "${pattern.target}" in PDF stream ${ref.toString()}`
+              );
               for (let j = 0; j < patLen; j++) {
                 const tj = tjInfos[i + j];
                 const oldHex = tj.glyphHexInLine;
                 const newHex = pattern.spaceGlyph.toUpperCase().padStart(oldHex.length, "0");
-                lines[tj.lineIndex] = lines[tj.lineIndex].replace(`<${oldHex}>`, `<${newHex}>`);
+                lines[tj.lineIndex] = lines[tj.lineIndex].replace(
+                  `<${oldHex}>`,
+                  `<${newHex}>`
+                );
                 alreadyReplaced.add(i + j);
               }
               streamModified = true;
@@ -2370,7 +5926,10 @@ async function sanitizePdfBuffer(pdfBuffer) {
       for (const pos of overlayPositions) {
         const page = pages[pos.pageIndex] || pages[0];
         const replacementText = pos.replacementText;
-        const replacementWidth = font.widthOfTextAtSize(replacementText, pos.effectiveFontSize);
+        const replacementWidth = font.widthOfTextAtSize(
+          replacementText,
+          pos.effectiveFontSize
+        );
         page.drawRectangle({
           x: pos.pageX - 1,
           y: pos.pageY - 2,
@@ -2390,7 +5949,9 @@ async function sanitizePdfBuffer(pdfBuffer) {
     }
     if (totalModified > 0 || pdfMetadataModified) {
       const savedBytes = await pdfDoc.save();
-      console.log(`[FrontMind Proxy] PDF sanitized: ${totalModified} stream(s) modified, ${overlayPositions.length} overlay(s) applied, metadata=${pdfMetadataModified}`);
+      console.log(
+        `[FrontMind Proxy] PDF sanitized: ${totalModified} stream(s) modified, ${overlayPositions.length} overlay(s) applied, metadata=${pdfMetadataModified}`
+      );
       return { buffer: Buffer.from(savedBytes), wasSanitized: true };
     }
     return { buffer: pdfBuffer, wasSanitized: false };
@@ -2453,13 +6014,17 @@ async function sanitizeOfficeXmlBuffer(data2) {
     }
     return { buffer: data2, wasSanitized: false };
   } catch (err) {
-    console.error(`[FrontMind Proxy] Office XML sanitization error: ${err.message}`);
+    console.error(
+      `[FrontMind Proxy] Office XML sanitization error: ${err.message}`
+    );
     return { buffer: data2, wasSanitized: false };
   }
 }
 async function sanitizeFileBuffer(data2, filename, contentType) {
   if (isPdfFile(filename, contentType) || isPdfMagicBytes(data2)) {
-    console.log(`[FrontMind Proxy] Detected PDF file: ${filename} (magic=${isPdfMagicBytes(data2)}, ext/ct=${isPdfFile(filename, contentType)})`);
+    console.log(
+      `[FrontMind Proxy] Detected PDF file: ${filename} (magic=${isPdfMagicBytes(data2)}, ext/ct=${isPdfFile(filename, contentType)})`
+    );
     return sanitizePdfBuffer(data2);
   }
   if (isOfficeXmlFile(filename, contentType) || isZipMagicBytes(data2) && !isTextBasedFile(filename, contentType)) {
@@ -2526,7 +6091,7 @@ router.get("/proxy-download", async (req, res) => {
     const urlFilenameRaw = targetUrl.split("/").pop()?.split("?")[0] || "file";
     const candidateFilename = requestedFilename || decodeURIComponent(urlFilenameRaw);
     if (isPdfFile(candidateFilename) && req.frontmindUser) {
-      const credential = await getDecryptedCredentialForUser(
+      const credential = await getEffectiveDecryptedCredentialForAccount(
         req.frontmindUser.id
       );
       const asset = await preparedFileService.registerExternal({
@@ -2541,7 +6106,9 @@ router.get("/proxy-download", async (req, res) => {
       const suffix = disposition === "attachment" ? "?download=1" : "";
       return res.redirect(307, `${asset.contentUrl}${suffix}`);
     }
-    console.log(`[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`);
+    console.log(
+      `[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`
+    );
     const response = await axios2.get(targetUrl, {
       ...safeExternalRequestOptions,
       responseType: "arraybuffer",
@@ -2549,22 +6116,34 @@ router.get("/proxy-download", async (req, res) => {
       maxContentLength: Infinity,
       validateStatus: () => true
     });
-    console.log(`[FrontMind Proxy] Proxy-download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`);
+    console.log(
+      `[FrontMind Proxy] Proxy-download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`
+    );
     res.status(response.status);
     const rawBuffer = Buffer.from(response.data);
+    const upstreamContentType = responseHeaderValue(
+      response.headers["content-type"]
+    );
     const urlFilename = ensureFilenameMatchesContent(
       candidateFilename,
       rawBuffer,
-      response.headers["content-type"]
+      upstreamContentType
     );
-    const finalContentType = normalizeContentTypeForBuffer(urlFilename, rawBuffer, response.headers["content-type"]);
+    const finalContentType = normalizeContentTypeForBuffer(
+      urlFilename,
+      rawBuffer,
+      upstreamContentType
+    );
     for (const header of ["cache-control", "etag", "last-modified"]) {
-      if (response.headers[header]) {
-        res.setHeader(header, response.headers[header]);
-      }
+      const value = responseHeaderValue(response.headers[header]);
+      if (value) res.setHeader(header, value);
     }
     res.setHeader("content-type", finalContentType);
-    setSafeContentDisposition(res, disposition, urlFilename);
+    setSafeContentDisposition(
+      res,
+      disposition,
+      urlFilename
+    );
     const { buffer: sanitizedBuffer, wasSanitized } = await sanitizeFileBuffer(
       rawBuffer,
       urlFilename,
@@ -2572,8 +6151,11 @@ router.get("/proxy-download", async (req, res) => {
     );
     if (wasSanitized) {
       res.setHeader("content-length", String(sanitizedBuffer.length));
-    } else if (response.headers["content-length"]) {
-      res.setHeader("content-length", response.headers["content-length"]);
+    } else {
+      const contentLength = responseHeaderValue(
+        response.headers["content-length"]
+      );
+      if (contentLength) res.setHeader("content-length", contentLength);
     }
     res.send(sanitizedBuffer);
   } catch (error) {
@@ -2612,13 +6194,20 @@ async function fetchFileMetadata(baseUrl, fileId, apiKey) {
     validateStatus: () => true
   });
   if (response.status !== 200) {
-    console.error(`[FrontMind Proxy] File metadata request failed: ${response.status}`);
+    console.error(
+      `[FrontMind Proxy] File metadata request failed: ${response.status}`
+    );
     return null;
   }
   const data2 = response.data;
-  console.log(`[FrontMind Proxy] File metadata: id=${data2.id}, filename=${data2.filename}, status=${data2.status}, has_upload_url=${!!data2.upload_url}`);
+  console.log(
+    `[FrontMind Proxy] File metadata: id=${data2.id}, filename=${data2.filename}, status=${data2.status}, has_upload_url=${!!data2.upload_url}`
+  );
   if (data2.upload_url) {
-    const meta = { upload_url: data2.upload_url, filename: data2.filename || fileId };
+    const meta = {
+      upload_url: data2.upload_url,
+      filename: data2.filename || fileId
+    };
     setCachedMeta(fileId, meta);
     return meta;
   }
@@ -2626,7 +6215,9 @@ async function fetchFileMetadata(baseUrl, fileId, apiKey) {
 }
 async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
   const safeS3Url = assertSafeExternalUrl(s3Url);
-  console.log(`[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`);
+  console.log(
+    `[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`
+  );
   const response = await axios2.get(safeS3Url, {
     ...safeExternalRequestOptions,
     responseType: "arraybuffer",
@@ -2634,7 +6225,9 @@ async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
     maxContentLength: Infinity,
     validateStatus: () => true
   });
-  console.log(`[FrontMind Proxy] S3 download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`);
+  console.log(
+    `[FrontMind Proxy] S3 download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`
+  );
   if (response.status !== 200) {
     res.status(response.status);
     res.json({
@@ -2647,12 +6240,22 @@ async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
   }
   res.status(200);
   const rawBuffer = Buffer.from(response.data);
-  const finalFilename = ensureFilenameMatchesContent(filename, rawBuffer, response.headers["content-type"]);
-  const finalContentType = normalizeContentTypeForBuffer(finalFilename, rawBuffer, response.headers["content-type"]);
+  const upstreamContentType = responseHeaderValue(
+    response.headers["content-type"]
+  );
+  const finalFilename = ensureFilenameMatchesContent(
+    filename,
+    rawBuffer,
+    upstreamContentType
+  );
+  const finalContentType = normalizeContentTypeForBuffer(
+    finalFilename,
+    rawBuffer,
+    upstreamContentType
+  );
   for (const header of ["cache-control", "etag", "last-modified"]) {
-    if (response.headers[header]) {
-      res.setHeader(header, response.headers[header]);
-    }
+    const value = responseHeaderValue(response.headers[header]);
+    if (value) res.setHeader(header, value);
   }
   res.setHeader("content-type", finalContentType);
   setSafeContentDisposition(res, disposition, finalFilename);
@@ -2691,7 +6294,9 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
     return;
   }
   if (!meta.upload_url) {
-    console.warn(`[FrontMind Proxy] No upload_url for file ${fileId}, trying direct API download`);
+    console.warn(
+      `[FrontMind Proxy] No upload_url for file ${fileId}, trying direct API download`
+    );
     const cleanBaseUrl = baseUrl.replace(/\/$/, "");
     const contentUrl = `${cleanBaseUrl}/v1/files/${fileId}/content`;
     try {
@@ -2705,21 +6310,35 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
         maxContentLength: Infinity,
         validateStatus: () => true
       });
-      if (response.status === 200 && response.headers["content-type"] !== "application/json") {
-        console.log(`[FrontMind Proxy] Direct /content download succeeded: ${response.status}`);
+      const upstreamContentType = responseHeaderValue(
+        response.headers["content-type"]
+      );
+      if (response.status === 200 && upstreamContentType !== "application/json") {
+        console.log(
+          `[FrontMind Proxy] Direct /content download succeeded: ${response.status}`
+        );
         res.status(200);
         for (const header of ["content-type", "content-disposition"]) {
-          if (response.headers[header]) {
+          const value = responseHeaderValue(response.headers[header]);
+          if (value) {
             if (header === "content-disposition") {
-              res.setHeader(header, sanitizeText(String(response.headers[header])));
+              res.setHeader(header, sanitizeText(value));
             } else {
-              res.setHeader(header, response.headers[header]);
+              res.setHeader(header, value);
             }
           }
         }
         const rawBuffer = Buffer.from(response.data);
-        const finalFilename = ensureFilenameMatchesContent(meta.filename, rawBuffer, response.headers["content-type"]);
-        const finalContentType = normalizeContentTypeForBuffer(finalFilename, rawBuffer, response.headers["content-type"]);
+        const finalFilename = ensureFilenameMatchesContent(
+          meta.filename,
+          rawBuffer,
+          upstreamContentType
+        );
+        const finalContentType = normalizeContentTypeForBuffer(
+          finalFilename,
+          rawBuffer,
+          upstreamContentType
+        );
         res.setHeader("content-type", finalContentType);
         setSafeContentDisposition(res, disposition, finalFilename);
         const { buffer: sanitizedBuffer } = await sanitizeFileBuffer(
@@ -2732,7 +6351,10 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
         return;
       }
     } catch (e) {
-      console.warn(`[FrontMind Proxy] Direct /content download failed: ${e.message}`);
+      console.warn(
+        "[FrontMind Proxy] Direct /content download failed:",
+        safeErrorForLog(e, { secrets: [apiKey] })
+      );
     }
     res.status(404).json({
       error: {
@@ -2745,15 +6367,19 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
   await downloadFromS3(res, meta.upload_url, meta.filename, disposition);
 }
 router.post("/download-token", async (req, res) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
     cleanupExpiredDownloadTokens();
-    const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.body?.fileId || "";
     if (!apiKey) {
-      return res.status(401).json({ error: { message: "Missing API key", code: "MISSING_API_KEY" } });
+      return res.status(401).json({
+        error: { message: "Missing API key", code: "MISSING_API_KEY" }
+      });
     }
     if (!fileId) {
-      return res.status(400).json({ error: { message: "Missing fileId", code: "MISSING_FILE_ID" } });
+      return res.status(400).json({
+        error: { message: "Missing fileId", code: "MISSING_FILE_ID" }
+      });
     }
     const token = randomUUID2();
     if (!req.frontmindUser || !req.frontmindCredential) {
@@ -2767,22 +6393,45 @@ router.post("/download-token", async (req, res) => {
       baseUrl,
       createdAt: Date.now()
     });
-    res.json({ downloadUrl: `/api/frontmind/download/${token}`, expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL });
+    res.json({
+      downloadUrl: `/api/frontmind/download/${token}`,
+      expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL
+    });
   } catch (error) {
-    console.error("[FrontMind Proxy] Create download token error:", error.message);
-    res.status(500).json({ error: { message: "\u521B\u5EFA\u4E0B\u8F7D\u94FE\u63A5\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5", code: "DOWNLOAD_TOKEN_ERROR" } });
+    console.error(
+      "[FrontMind Proxy] Create download token error:",
+      safeErrorForLog(error, { secrets: [apiKey] })
+    );
+    res.status(500).json({
+      error: {
+        message: "\u521B\u5EFA\u4E0B\u8F7D\u94FE\u63A5\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
+        code: "DOWNLOAD_TOKEN_ERROR"
+      }
+    });
   }
 });
 router.get("/download/:token", async (req, res) => {
+  let logSecret = "";
   try {
     cleanupExpiredDownloadTokens();
     const token = req.params.token;
     const data2 = downloadTokenCache.get(token);
     if (!data2) {
-      return res.status(410).json({ error: { message: "Download link expired", code: "DOWNLOAD_LINK_EXPIRED" } });
+      return res.status(410).json({
+        error: {
+          message: "Download link expired",
+          code: "DOWNLOAD_LINK_EXPIRED"
+        }
+      });
     }
+    logSecret = data2.apiKey;
     if (!req.frontmindUser || req.frontmindUser.id !== data2.userId) {
-      return res.status(403).json({ error: { message: "\u4E0B\u8F7D\u94FE\u63A5\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7", code: "DOWNLOAD_FORBIDDEN" } });
+      return res.status(403).json({
+        error: {
+          message: "\u4E0B\u8F7D\u94FE\u63A5\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7",
+          code: "DOWNLOAD_FORBIDDEN"
+        }
+      });
     }
     downloadTokenCache.delete(token);
     await handleFileDownload(
@@ -2795,13 +6444,21 @@ router.get("/download/:token", async (req, res) => {
       data2.credentialId
     );
   } catch (error) {
-    console.error("[FrontMind Proxy] Direct token download error:", error.message);
-    res.status(500).json({ error: { message: "\u4E0B\u8F7D\u94FE\u63A5\u5DF2\u5931\u6548\u6216\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25", code: "DIRECT_DOWNLOAD_ERROR" } });
+    console.error(
+      "[FrontMind Proxy] Direct token download error:",
+      safeErrorForLog(error, { secrets: [logSecret] })
+    );
+    res.status(500).json({
+      error: {
+        message: "\u4E0B\u8F7D\u94FE\u63A5\u5DF2\u5931\u6548\u6216\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25",
+        code: "DIRECT_DOWNLOAD_ERROR"
+      }
+    });
   }
 });
 router.get("/v1/files/:fileId", async (req, res) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
-    const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.params.fileId;
     await handleFileDownload(
       res,
@@ -2813,7 +6470,10 @@ router.get("/v1/files/:fileId", async (req, res) => {
       req.frontmindCredential?.id
     );
   } catch (error) {
-    console.error("[FrontMind Proxy] File download error:", error.message);
+    console.error(
+      "[FrontMind Proxy] File download error:",
+      safeErrorForLog(error, { secrets: [apiKey] })
+    );
     res.status(500).json({
       error: {
         message: "\u6587\u4EF6\u4E0B\u8F7D\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
@@ -2823,8 +6483,8 @@ router.get("/v1/files/:fileId", async (req, res) => {
   }
 });
 router.get("/v1/files/:fileId/content", async (req, res) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
-    const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.params.fileId;
     await handleFileDownload(
       res,
@@ -2836,7 +6496,10 @@ router.get("/v1/files/:fileId/content", async (req, res) => {
       req.frontmindCredential?.id
     );
   } catch (error) {
-    console.error("[FrontMind Proxy] File content download error:", error.message);
+    console.error(
+      "[FrontMind Proxy] File content download error:",
+      safeErrorForLog(error, { secrets: [apiKey] })
+    );
     res.status(500).json({
       error: {
         message: "\u6587\u4EF6\u5185\u5BB9\u4E0B\u8F7D\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
@@ -2845,13 +6508,95 @@ router.get("/v1/files/:fileId/content", async (req, res) => {
     });
   }
 });
-router.all("/*", async (req, res) => {
+router.get("/account-credit-usage", async (req, res) => {
+  if (!req.frontmindUser) {
+    res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
+    return;
+  }
+  if (req.frontmindUser.role !== "admin") {
+    res.status(403).json({ error: { message: "\u4EC5\u7BA1\u7406\u5458\u53EF\u67E5\u770B\u79EF\u5206", code: "FORBIDDEN" } });
+    return;
+  }
   try {
-    const { apiKey, baseUrl } = getFrontMindCredentials(req);
+    const result = await getAccountMonthlyCreditUsage(req.frontmindUser.id);
+    res.json(result);
+  } catch (error) {
+    console.error(
+      "[FrontMind Proxy] Credit usage error",
+      safeErrorForLog(error, {
+        secrets: [req.frontmindCredential?.apiKey]
+      })
+    );
+    res.status(503).json({
+      error: {
+        message: "\u6682\u65F6\u65E0\u6CD5\u8BFB\u53D6\u5F53\u524D Key \u7684\u79EF\u5206\u4F7F\u7528\u60C5\u51B5",
+        code: "CREDIT_USAGE_UNAVAILABLE"
+      }
+    });
+  }
+});
+router.get("/credential-check", async (req, res) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
+  try {
+    const response = await axios2.get(
+      `${baseUrl.replace(/\/$/, "")}/v1/tasks?limit=1`,
+      {
+        headers: {
+          API_KEY: apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json"
+        },
+        timeout: 15e3,
+        validateStatus: () => true
+      }
+    );
+    if (response.status === 401 || response.status === 403) {
+      res.status(401).json({
+        error: { message: "API Key \u65E0\u6548", code: "INVALID_CREDENTIAL" }
+      });
+      return;
+    }
+    if (response.status < 200 || response.status >= 300) {
+      res.status(503).json({
+        error: {
+          message: "\u4E0A\u6E38\u670D\u52A1\u6682\u65F6\u65E0\u6CD5\u9A8C\u8BC1 API Key",
+          code: "UPSTREAM_UNAVAILABLE"
+        }
+      });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(
+      "[FrontMind Proxy] Credential check error",
+      safeErrorForLog(error, { secrets: [apiKey] })
+    );
+    res.status(503).json({
+      error: {
+        message: "\u4E0A\u6E38\u670D\u52A1\u6682\u65F6\u65E0\u6CD5\u9A8C\u8BC1 API Key",
+        code: "UPSTREAM_UNAVAILABLE"
+      }
+    });
+  }
+});
+router.all("/*", async (req, res) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
+  try {
     if (!apiKey) {
-      return res.status(401).json({ error: { message: "Missing API key", code: "MISSING_API_KEY" } });
+      return res.status(401).json({
+        error: { message: "Missing API key", code: "MISSING_API_KEY" }
+      });
     }
     const targetPath = req.originalUrl.replace(/^\/api\/frontmind/, "");
+    if (isPrivateUpstreamCollectionRequest(req.method, targetPath)) {
+      res.status(403).json({
+        error: {
+          message: "\u4EFB\u52A1\u4E0E\u6587\u4EF6\u76EE\u5F55\u4EC5\u6309\u5F53\u524D\u8D26\u53F7\u7684\u672C\u5730\u8BB0\u5F55\u5C55\u793A",
+          code: "UPSTREAM_COLLECTION_FORBIDDEN"
+        }
+      });
+      return;
+    }
     const targetUrl = `${baseUrl.replace(/\/$/, "")}${targetPath}`;
     console.log(`[FrontMind Proxy] ${req.method} ${targetPath}`);
     const headers = {
@@ -2871,7 +6616,9 @@ router.all("/*", async (req, res) => {
     }
     const response = await axios2(axiosConfig);
     if (response.status >= 200 && response.status < 300 && req.frontmindUser && req.frontmindCredential && response.data && typeof response.data === "object") {
-      const resourceId = String(response.data.id || response.data.task_id || "");
+      const resourceId = String(
+        response.data.id || response.data.task_id || ""
+      );
       const isTaskCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/tasks";
       const isFileCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/files";
       if (resourceId && (isTaskCreate || isFileCreate)) {
@@ -2919,32 +6666,40 @@ router.all("/*", async (req, res) => {
             });
           }
         } catch (error) {
-          console.warn("[PreparedFiles] Auto-registration failed", error);
+          console.warn(
+            "[PreparedFiles] Auto-registration failed",
+            safeErrorForLog(error, { secrets: [apiKey] })
+          );
         }
       }
     }
-    if (typeof response.data === "object" && response.data?.output) {
-      const outputSummary = response.data.output.map(
+    const publicResponse = typeof response.data === "object" ? publicUpstreamPayload(response.data, apiKey) : typeof response.data === "string" ? sanitizeText(redactSensitiveText(response.data, [apiKey])) : response.data;
+    if (publicResponse && typeof publicResponse === "object" && !Array.isArray(publicResponse) && Array.isArray(publicResponse.output)) {
+      const publicRecord = publicResponse;
+      const outputSummary = publicRecord.output.map(
         (item, i) => `${i}:${item.type || "message"}${item.id ? "(" + item.id.slice(0, 8) + ")" : ""}`
       ).join(", ");
-      console.log(`[FrontMind Proxy] Response: ${response.status} id=${response.data.id?.slice(0, 12)} status=${response.data.status} output=[${response.data.output.length} items: ${outputSummary.slice(0, 300)}]`);
+      console.log(
+        `[FrontMind Proxy] Response: ${response.status} id=${String(publicRecord.id || "").slice(0, 12)} status=${String(publicRecord.status || "")} output=[${publicRecord.output.length} items: ${outputSummary.slice(0, 300)}]`
+      );
     } else {
-      console.log(`[FrontMind Proxy] Response: ${response.status}`, typeof response.data === "object" ? JSON.stringify(response.data).slice(0, 200) : "");
+      console.log(`[FrontMind Proxy] Response: ${response.status}`);
     }
     res.status(response.status);
-    if (response.headers["content-type"]) {
-      res.setHeader("content-type", response.headers["content-type"]);
-    }
-    if (typeof response.data === "object") {
-      const sanitized = deepSanitizeJson(response.data);
-      res.json(sanitized);
-    } else if (typeof response.data === "string") {
-      res.send(sanitizeText(response.data));
+    const contentType = responseHeaderValue(response.headers["content-type"]);
+    if (contentType) res.setHeader("content-type", contentType);
+    if (typeof publicResponse === "object") {
+      res.json(publicResponse);
+    } else if (typeof publicResponse === "string") {
+      res.send(publicResponse);
     } else {
-      res.send(response.data);
+      res.send(publicResponse);
     }
   } catch (error) {
-    console.error("[FrontMind Proxy] Error:", error.message);
+    console.error(
+      "[FrontMind Proxy] Error:",
+      safeErrorForLog(error, { secrets: [apiKey] })
+    );
     if (error.code === "ECONNREFUSED" || error.code === "ENOTFOUND") {
       res.status(502).json({
         error: {

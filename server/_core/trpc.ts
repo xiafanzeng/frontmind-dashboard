@@ -1,5 +1,6 @@
 import { initTRPC, TRPCError } from "@trpc/server";
 import superjson from "superjson";
+import { hasExplicitAdminRole } from "../../shared/admin-access";
 import type { TrpcContext } from "./context";
 
 const t = initTRPC.context<TrpcContext>().create({
@@ -15,10 +16,10 @@ export const protectedProcedure = t.procedure.use(({ ctx, next }) => {
   return next({ ctx: { ...ctx, user: ctx.user } });
 });
 export const adminProcedure = protectedProcedure.use(({ ctx, next }) => {
-  if (ctx.user.role !== "admin") {
+  if (!hasExplicitAdminRole(ctx.user)) {
     throw new TRPCError({
       code: "FORBIDDEN",
-      message: "Administrator permission is required",
+      message: "Explicit administrator permission is required",
     });
   }
   return next({ ctx });

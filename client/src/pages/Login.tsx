@@ -10,7 +10,6 @@ import { Label } from "@/components/ui/label";
 
 const LOGIN_BACKGROUND = "/assets/frontmind-login-background.webp";
 const WORDMARK = "/assets/frontmind-wordmark.svg";
-const CUHKSZ_EMBLEM = "/assets/cuhksz-emblem.png";
 
 export default function Login() {
   const [, setLocation] = useLocation();
@@ -68,16 +67,9 @@ export default function Login() {
               构筑科研驱动的企业级 GEO 基建
             </span>
           </h1>
-          <div className="mt-12 flex items-center gap-3 text-left">
-            <img
-              src={CUHKSZ_EMBLEM}
-              alt="香港中文大学（深圳）校徽"
-              className="h-12 w-12 shrink-0 rounded-full"
-            />
-            <p className="text-[17px] font-medium tracking-wide text-[#43384b]">
-              香港中文大学（深圳）AI智能决策实验室
-            </p>
-          </div>
+          <p className="mt-12 text-[17px] font-medium tracking-wide text-[#43384b]">
+            FrontMind 企业级 GEO 服务平台
+          </p>
         </div>
       </section>
 

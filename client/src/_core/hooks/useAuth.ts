@@ -8,6 +8,7 @@ export type AuthUser = {
   username: string;
   displayName: string | null;
   role: "user" | "admin";
+  adminAccessLevel: "system_admin" | "delivery_admin" | null;
   isActive: boolean;
 };
 

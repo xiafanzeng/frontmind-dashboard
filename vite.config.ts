@@ -162,6 +162,49 @@ function vitePluginFrontMindBuildVersion(buildVersion: string): Plugin {
   };
 }
 
+function vitePluginProductionPublicAssets(): Plugin {
+  const allowedAssets = [
+    {
+      source: "frontmind-contract-logo-white.svg",
+      output: "frontmind-contract-logo-white.svg",
+    },
+    {
+      source: "frontmind-sales-wechat.png",
+      output: "frontmind-sales-wechat.png",
+    },
+    {
+      source: "assets/frontmind-login-background.webp",
+      output: "assets/frontmind-login-background.webp",
+    },
+    {
+      source: "assets/frontmind-wordmark.svg",
+      output: "assets/frontmind-wordmark.svg",
+    },
+  ];
+  const publicDirectory = path.resolve(
+    import.meta.dirname,
+    "client/public",
+  );
+  return {
+    name: "frontmind-production-public-assets",
+    generateBundle() {
+      for (const asset of allowedAssets) {
+        const assetPath = path.join(publicDirectory, asset.source);
+        if (!fs.existsSync(assetPath)) {
+          this.error(
+            `Required production public asset is missing: ${asset.source}`,
+          );
+        }
+        this.emitFile({
+          type: "asset",
+          fileName: asset.output,
+          source: fs.readFileSync(assetPath),
+        });
+      }
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const isProduction = mode === "production";
   const buildVersion =
@@ -170,6 +213,7 @@ export default defineConfig(({ mode }) => {
     react(),
     tailwindcss(),
     vitePluginFrontMindBuildVersion(buildVersion),
+    isProduction && vitePluginProductionPublicAssets(),
     !isProduction && jsxLocPlugin(),
     !isProduction && vitePluginFrontMindDebugCollector(),
   ].filter(Boolean) as Plugin[];
@@ -188,7 +232,9 @@ export default defineConfig(({ mode }) => {
     },
     envDir: path.resolve(import.meta.dirname),
     root: path.resolve(import.meta.dirname, "client"),
-    publicDir: path.resolve(import.meta.dirname, "client", "public"),
+    publicDir: isProduction
+      ? false
+      : path.resolve(import.meta.dirname, "client", "public"),
     build: {
       outDir: path.resolve(import.meta.dirname, "dist/public"),
       emptyOutDir: true,

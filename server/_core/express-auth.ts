@@ -2,7 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import {
   AuthServiceError,
   authenticateRequest,
-  getDecryptedCredentialForUser,
+  getEffectiveDecryptedCredentialForAccount,
   type AuthenticatedUser,
   type DecryptedCredential,
 } from "../auth-service";
@@ -46,9 +46,16 @@ export async function attachActiveCredential(
   }
 
   try {
-    const credential = await getDecryptedCredentialForUser(req.frontmindUser.id);
+    const credential = await getEffectiveDecryptedCredentialForAccount(
+      req.frontmindUser.id,
+    );
     if (!credential) {
-      sendAuthError(res, 428, "请先在账号设置中配置 API Key", "API_CREDENTIAL_REQUIRED");
+      sendAuthError(
+        res,
+        428,
+        "当前账号尚未由管理员配置 API Key",
+        "API_CREDENTIAL_REQUIRED",
+      );
       return;
     }
     req.frontmindCredential = credential;
@@ -67,7 +74,7 @@ export async function attachActiveCredential(
 
 /**
  * Loads the active credential when one exists, while allowing authenticated
- * routes that do not call the upstream API (for example workflow manifests)
+ * routes that do not call the upstream API
  * to remain usable before a key is configured.
  */
 export async function attachOptionalActiveCredential(
@@ -81,7 +88,9 @@ export async function attachOptionalActiveCredential(
   }
 
   try {
-    const credential = await getDecryptedCredentialForUser(req.frontmindUser.id);
+    const credential = await getEffectiveDecryptedCredentialForAccount(
+      req.frontmindUser.id,
+    );
     if (credential) req.frontmindCredential = credential;
     next();
   } catch (error) {

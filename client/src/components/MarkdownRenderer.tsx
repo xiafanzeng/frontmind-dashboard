@@ -12,14 +12,18 @@ import type { Components } from "react-markdown";
 import { sanitizeBrandText } from "@/lib/frontmind-api";
 
 // Custom code block component with better styling
-const CodeBlock = ({ className, children, ...props }: React.ComponentProps<"pre">) => {
+const CodeBlock = ({
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"pre">) => {
   const codeRef = React.useRef<HTMLElement>(null);
 
   return (
     <pre
       className={cn(
         "relative overflow-x-auto rounded-lg border border-border/30 bg-muted/50 p-4 my-3 text-[13px] leading-relaxed",
-        className
+        className,
       )}
       {...props}
     >
@@ -51,9 +55,9 @@ const CopyButton = ({ text }: { text: string }) => {
       type="button"
       onClick={handleCopy}
       className={cn(
-        "absolute top-2 right-2 px-2 py-1 text-[10px] rounded-md transition-all",
+        "absolute top-2 right-2 px-2 py-1 text-xs rounded-md transition-all",
         "bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground",
-        copied && "text-green-600 bg-green-50"
+        copied && "text-green-600 bg-green-50",
       )}
     >
       {copied ? "已复制" : "复制"}
@@ -67,7 +71,7 @@ const InlineCode = ({ className, ...props }: React.ComponentProps<"code">) => {
     <code
       className={cn(
         "px-1.5 py-0.5 rounded-md bg-muted/60 text-primary/80 font-mono text-[0.875em]",
-        className
+        className,
       )}
       {...props}
     />
@@ -100,9 +104,16 @@ function buildSafeMarkdownHref(href?: string): string | undefined {
 }
 
 // Custom link component
-const Link = ({ className, href, children, ...props }: React.ComponentProps<"a">) => {
+const Link = ({
+  className,
+  href,
+  children,
+  ...props
+}: React.ComponentProps<"a">) => {
   const safeHref = buildSafeMarkdownHref(href);
-  const isProxiedPdf = Boolean(safeHref?.startsWith("/api/frontmind/proxy-download"));
+  const isProxiedPdf = Boolean(
+    safeHref?.startsWith("/api/frontmind/proxy-download"),
+  );
   const isExternal = safeHref?.startsWith("http");
   return (
     <a
@@ -111,7 +122,7 @@ const Link = ({ className, href, children, ...props }: React.ComponentProps<"a">
       rel={isExternal || isProxiedPdf ? "noopener noreferrer" : undefined}
       className={cn(
         "text-primary underline-offset-2 hover:underline",
-        className
+        className,
       )}
       {...props}
     >
@@ -121,7 +132,12 @@ const Link = ({ className, href, children, ...props }: React.ComponentProps<"a">
 };
 
 // Custom heading components
-const Heading = ({ level, className, children, ...props }: { level: 1 | 2 | 3 | 4 | 5 | 6 } & React.ComponentProps<"h1">) => {
+const Heading = ({
+  level,
+  className,
+  children,
+  ...props
+}: { level: 1 | 2 | 3 | 4 | 5 | 6 } & React.ComponentProps<"h1">) => {
   const Tag = `h${level}` as React.ElementType;
   const sizeClasses: Record<number, string> = {
     1: "text-2xl font-bold",
@@ -151,7 +167,11 @@ const Table = ({ className, ...props }: React.ComponentProps<"table">) => {
 };
 
 // Task list checkbox (GFM)
-const TaskListItem = ({ className, children, ...props }: React.ComponentProps<"li">) => {
+const TaskListItem = ({
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"li">) => {
   return (
     <li className={cn("list-none", className)} {...props}>
       {children}
@@ -189,32 +209,69 @@ const components: Components = {
 
   // Table
   table: Table,
-  thead: ({ className, ...props }) => <thead className={cn("bg-muted/30", className)} {...props} />,
+  thead: ({ className, ...props }) => (
+    <thead className={cn("bg-muted/30", className)} {...props} />
+  ),
   th: ({ className, ...props }) => (
     <th
-      className={cn("px-3 py-2 text-left font-medium text-foreground/80", className)}
+      className={cn(
+        "px-3 py-2 text-left font-medium text-foreground/80",
+        className,
+      )}
       {...props}
     />
   ),
-  td: ({ className, ...props }) => <td className={cn("px-3 py-2 border-t border-border/30", className)} {...props} />,
+  td: ({ className, ...props }) => (
+    <td
+      className={cn("px-3 py-2 border-t border-border/30", className)}
+      {...props}
+    />
+  ),
 
   // Lists - handle task lists specially
   ul: ({ className, children, ...props }) => {
     // Check if this contains task list items (checkboxes)
-    const hasTaskList = String(children).includes("type=\"checkbox\"");
+    const hasTaskList = String(children).includes('type="checkbox"');
     if (hasTaskList) {
-      return <ul className={cn("space-y-1", className)} {...props}>{children}</ul>;
+      return (
+        <ul className={cn("space-y-1", className)} {...props}>
+          {children}
+        </ul>
+      );
     }
-    return <ul className={cn("list-disc list-inside space-y-1", className)} {...props}>{children}</ul>;
+    return (
+      <ul
+        className={cn("list-disc list-inside space-y-1", className)}
+        {...props}
+      >
+        {children}
+      </ul>
+    );
   },
-  ol: ({ className, ...props }) => <ol className={cn("list-decimal list-inside space-y-1", className)} {...props} />,
+  ol: ({ className, ...props }) => (
+    <ol
+      className={cn("list-decimal list-inside space-y-1", className)}
+      {...props}
+    />
+  ),
   li: ({ className, children, ...props }) => {
     // Handle task list items with checkboxes
     const childStr = String(children);
     if (childStr.includes('type="checkbox"')) {
-      return <TaskListItem className={cn("flex items-start gap-2", className)} {...props}>{children}</TaskListItem>;
+      return (
+        <TaskListItem
+          className={cn("flex items-start gap-2", className)}
+          {...props}
+        >
+          {children}
+        </TaskListItem>
+      );
     }
-    return <li className={className} {...props}>{children}</li>;
+    return (
+      <li className={className} {...props}>
+        {children}
+      </li>
+    );
   },
 
   // Blockquote
@@ -222,7 +279,7 @@ const components: Components = {
     <blockquote
       className={cn(
         "border-l-4 border-primary/30 pl-4 my-3 italic text-muted-foreground/80",
-        className
+        className,
       )}
       {...props}
     />
@@ -249,9 +306,7 @@ function MarkdownRendererInner({ content, className }: MarkdownRendererProps) {
     <div className={cn("markdown-content", className)}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[
-          rehypeHighlight,
-        ]}
+        rehypePlugins={[rehypeHighlight]}
         components={components}
       >
         {content}
@@ -291,7 +346,10 @@ class MarkdownErrorBoundary extends React.Component<
   }
 }
 
-export default function MarkdownRenderer({ content, className }: MarkdownRendererProps) {
+export default function MarkdownRenderer({
+  content,
+  className,
+}: MarkdownRendererProps) {
   if (!content || typeof content !== "string") return null;
 
   return (

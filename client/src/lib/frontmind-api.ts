@@ -13,6 +13,8 @@
  * - Updated system prompt to keep upstream identity private
  */
 
+import type { ResponseLogicDraft } from "@shared/response-logic";
+
 /**
  * Model display mapping: public model id -> display name.
  * Upstream model ids are translated on the server and never shipped in the browser bundle.
@@ -94,6 +96,10 @@ export function sanitizeBrandText(text: string): string {
     const source = ["ma", "nus"].join("");
     return text
       .replace(
+        /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/gi,
+        "",
+      )
+      .replace(
         new RegExp(`https?:\\/\\/api\\.${source}\\.`, "gi"),
         "https://api.frontmind.",
       )
@@ -120,11 +126,8 @@ export function sanitizeBrandText(text: string): string {
 // ============================================================
 // Credit Usage Helpers
 // ============================================================
-const CREDIT_USAGE_CACHE_KEY = "frontmind-credit-usage-cache-v2";
+const CREDIT_USAGE_CACHE_KEY = "frontmind-credit-usage-cache-v3";
 const CREDIT_USAGE_CACHE_TTL_MS = 60 * 1000;
-const CREDIT_USAGE_LOOKBACK_DAYS = 30;
-const CREDIT_USAGE_PAGE_LIMIT = 100;
-const CREDIT_USAGE_MAX_PAGES = 20;
 
 // ============================================================
 // Credit Event Bus - for real-time refresh across components
@@ -161,6 +164,8 @@ export interface ContentItem {
   image_url?: string;
   file_id?: string;
   filename?: string;
+  /** Browser-observed MIME type; only the dedicated response-logic route stores it. */
+  mime_type?: string;
 }
 
 export interface Message {
@@ -186,6 +191,16 @@ export interface TaskResponse {
     message?: string;
     code?: string;
   };
+}
+
+export interface ResponseLogicTaskContext {
+  questionId: string;
+  groupId: string;
+  groupTitle: string;
+  question: string;
+  intent: string;
+  summary: string;
+  draft: ResponseLogicDraft;
 }
 
 /**
@@ -320,7 +335,10 @@ function buildPromptText(input: Message[]): string {
  *
  * Per FrontMind API docs: attachments must use { filename: "xxx", file_id: "file-xxx" } format.
  */
-function extractAttachments(input: Message[]): any[] {
+function extractAttachments(
+  input: Message[],
+  includeResponseLogicMetadata = false,
+): any[] {
   const attachments: any[] = [];
 
   for (const msg of input) {
@@ -335,6 +353,9 @@ function extractAttachments(input: Message[]): any[] {
           attachments.push({
             filename: item.filename || "image.png",
             file_id: item.file_id,
+            ...(includeResponseLogicMetadata && item.mime_type
+              ? { mime_type: item.mime_type }
+              : {}),
           });
         }
         // If only image_url (base64), skip - these are fallback cases
@@ -343,6 +364,9 @@ function extractAttachments(input: Message[]): any[] {
         attachments.push({
           filename: item.filename || "file",
           file_id: item.file_id,
+          ...(includeResponseLogicMetadata && item.mime_type
+            ? { mime_type: item.mime_type }
+            : {}),
         });
       }
     }
@@ -441,6 +465,124 @@ export async function createTask(
   }
 
   return data;
+}
+
+/**
+ * Starts a new per-question response-logic task. The private Skill and the
+ * latest published knowledge base are injected on the server, never shipped
+ * to or trusted from the browser.
+ */
+export async function createResponseLogicTask(
+  input: Message[],
+  context: ResponseLogicTaskContext & {
+    conversationId: string;
+    taskId?: string;
+  },
+): Promise<TaskResponse> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    CREATE_TASK_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(
+      context.taskId ? "/api/response-logic/turn" : "/api/response-logic/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        signal: controller.signal,
+        body: JSON.stringify({
+          ...context,
+          userMessage: buildPromptText(input),
+          attachments: extractAttachments(input, true),
+        }),
+      },
+    );
+    if (!response.ok) {
+      let message = `API Error ${response.status}`;
+      try {
+        const payload = await response.json();
+        message = payload?.error?.message || payload?.message || message;
+      } catch {
+        // Keep the status-derived message.
+      }
+      throw new Error(message);
+    }
+    const payload = await response.json();
+    const data = payload?.task || payload;
+    const taskId = data?.id || data?.task_id;
+    if (!taskId) throw new Error("任务创建失败：未返回任务 ID");
+    return {
+      ...data,
+      id: taskId,
+      status: data.status === "failed" ? "error" : data.status || "running",
+      metadata: {
+        ...(data.metadata || {}),
+        task_url: data.task_url || data.metadata?.task_url,
+        task_title: data.task_title || data.metadata?.task_title,
+      },
+      output: data.output || [],
+    };
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Continues a knowledge-base build through its dedicated server-side Skill
+ * route. The server owns the model, current node, revision, and progress
+ * contract; the browser supplies only the visible turn and uploaded file IDs.
+ */
+export async function createKnowledgeBaseTurnTask(
+  input: Message[],
+  context: { conversationId: string; taskId: string },
+): Promise<TaskResponse> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    CREATE_TASK_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch("/api/knowledge-base/turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      signal: controller.signal,
+      body: JSON.stringify({
+        ...context,
+        userMessage: buildPromptText(input),
+        attachments: extractAttachments(input),
+      }),
+    });
+    if (!response.ok) {
+      let message = `API Error ${response.status}`;
+      try {
+        const payload = await response.json();
+        message = payload?.error?.message || payload?.message || message;
+      } catch {
+        // Keep the status-derived message.
+      }
+      throw new Error(message);
+    }
+    const payload = await response.json();
+    const data = payload?.task || payload;
+    const taskId = data?.id || data?.task_id;
+    if (!taskId) throw new Error("任务创建失败：未返回任务 ID");
+    return {
+      ...data,
+      id: taskId,
+      status: data.status === "failed" ? "error" : data.status || "running",
+      metadata: {
+        ...(data.metadata || {}),
+        task_url: data.taskUrl || data.task_url || data.metadata?.task_url,
+        task_title: data.title || data.task_title || data.metadata?.task_title,
+      },
+      output: data.output || [],
+    };
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 }
 
 /**
@@ -695,15 +837,18 @@ export interface CreditUsageResult {
   recentTasks: CreditUsageTask[];
   fetchedAt?: number;
   fromCache?: boolean;
+  complete?: boolean;
 }
 
 interface CreditUsageCacheData extends CreditUsageResult {
   fingerprint: string;
+  accountId: string;
   fetchedAt: number;
 }
 
 function readCreditUsageCache(
   fingerprint: string,
+  accountId: string,
   allowStale: boolean,
 ): CreditUsageCacheData | null {
   try {
@@ -712,6 +857,7 @@ function readCreditUsageCache(
     const data = JSON.parse(stored) as Partial<CreditUsageCacheData>;
     if (
       data.fingerprint !== fingerprint ||
+      data.accountId !== accountId ||
       !Number.isFinite(Number(data.fetchedAt))
     ) {
       return null;
@@ -724,9 +870,11 @@ function readCreditUsageCache(
     }
     return {
       fingerprint,
+      accountId,
       fetchedAt: Number(data.fetchedAt),
       totalUsed: Number(data.totalUsed || 0),
       recentTasks: Array.isArray(data.recentTasks) ? data.recentTasks : [],
+      complete: data.complete !== false,
       fromCache: true,
     };
   } catch {
@@ -734,13 +882,19 @@ function readCreditUsageCache(
   }
 }
 
-function writeCreditUsageCache(fingerprint: string, result: CreditUsageResult) {
+function writeCreditUsageCache(
+  fingerprint: string,
+  accountId: string,
+  result: CreditUsageResult,
+) {
   try {
     const cacheData: CreditUsageCacheData = {
       fingerprint,
+      accountId,
       fetchedAt: result.fetchedAt || Date.now(),
       totalUsed: result.totalUsed,
       recentTasks: result.recentTasks,
+      complete: result.complete !== false,
     };
     localStorage.setItem(CREDIT_USAGE_CACHE_KEY, JSON.stringify(cacheData));
   } catch {
@@ -748,122 +902,67 @@ function writeCreditUsageCache(fingerprint: string, result: CreditUsageResult) {
   }
 }
 
-function parseTaskCreatedAtMs(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value > 1_000_000_000_000 ? value : value * 1000;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const numeric = Number(value);
-    if (Number.isFinite(numeric)) {
-      return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
-    }
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return null;
-}
-
-function getTaskCreditUsage(task: any): number {
-  const usage = Number(task?.credit_usage || task?.metadata?.credit_usage || 0);
-  return Number.isFinite(usage) && usage > 0 ? usage : 0;
-}
-
 /**
  * Fetch credit usage from recent tasks.
  * Uses a short local cache so opening Settings is instant while manual refresh
- * still forces a live request.
- * The displayed total equals the sum of all listed tasks from the last 30 days.
+ * still forces a live request. The total reflects the shared API Key pool,
+ * while recent task details remain scoped to the current FrontMind account.
  */
 export async function fetchCreditUsage(
-  options: { force?: boolean; fingerprint?: string } = {},
+  options: {
+    force?: boolean;
+    fingerprint?: string;
+    accountId?: string | number;
+  } = {},
 ): Promise<CreditUsageResult> {
   const emptyResult: CreditUsageResult = { totalUsed: 0, recentTasks: [] };
   const fingerprint = options.fingerprint?.trim() || "account-credential";
+  const accountId = String(options.accountId ?? "current-account");
 
   try {
     if (!options.force) {
-      const cached = readCreditUsageCache(fingerprint, false);
+      const cached = readCreditUsageCache(fingerprint, accountId, false);
       if (cached) return cached;
     }
 
-    const cutoffMs =
-      Date.now() - CREDIT_USAGE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-    const seenTaskIds = new Set<string>();
-    let totalUsed = 0;
-    const recentTasks: CreditUsageTask[] = [];
-    let after: string | undefined;
-    let reachedCutoff = false;
-
-    for (
-      let page = 0;
-      page < CREDIT_USAGE_MAX_PAGES && !reachedCutoff;
-      page += 1
-    ) {
-      const searchParams = new URLSearchParams({
-        limit: String(CREDIT_USAGE_PAGE_LIMIT),
-        order: "desc",
-      });
-      if (after) searchParams.set("after", after);
-
-      const response = await fetch(
-        `/api/frontmind/v1/tasks?${searchParams.toString()}`,
-        {
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-        },
-      );
-
-      if (!response.ok) {
-        return readCreditUsageCache(fingerprint, true) || emptyResult;
-      }
-
-      const data = await response.json();
-      const tasks = Array.isArray(data.data) ? data.data : [];
-      if (tasks.length === 0) break;
-
-      for (const task of tasks) {
-        const taskId = String(task?.id || "");
-        if (!taskId || seenTaskIds.has(taskId)) continue;
-        seenTaskIds.add(taskId);
-
-        const createdAtMs = parseTaskCreatedAtMs(task?.created_at);
-        if (createdAtMs !== null && createdAtMs < cutoffMs) {
-          reachedCutoff = true;
-          break;
-        }
-
-        const usage = getTaskCreditUsage(task);
-        if (usage <= 0) continue;
-
-        totalUsed += usage;
-        recentTasks.push({
-          id: taskId,
-          title:
-            task.metadata?.task_title ||
-            task.instructions?.slice(0, 30) ||
-            taskId.slice(0, 12),
-          creditUsage: usage,
-          createdAt:
-            createdAtMs !== null
-              ? new Date(createdAtMs).toLocaleDateString("zh-CN")
-              : undefined,
-        });
-      }
-
-      after = data.last_id || tasks[tasks.length - 1]?.id;
-      if (!data.has_more || !after) break;
+    const response = await fetch(
+      "/api/frontmind/account-credit-usage",
+      {
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+      },
+    );
+    if (!response.ok) {
+      return readCreditUsageCache(fingerprint, accountId, true) || emptyResult;
     }
+    const data = await response.json();
 
     const result: CreditUsageResult = {
-      totalUsed,
-      recentTasks,
-      fetchedAt: Date.now(),
+      totalUsed: Math.max(0, Number(data?.totalUsed ?? 0) || 0),
+      complete: data?.complete !== false,
+      recentTasks: Array.isArray(data?.recentTasks)
+        ? data.recentTasks
+            .map((task: any) => ({
+              id: String(task?.id ?? ""),
+              title: String(task?.title ?? "").trim() || undefined,
+              creditUsage: Math.max(
+                0,
+                Number(task?.creditUsage ?? 0) || 0,
+              ),
+              createdAt:
+                typeof task?.createdAt === "string"
+                  ? task.createdAt
+                  : undefined,
+            }))
+            .filter((task: CreditUsageTask) => Boolean(task.id))
+        : [],
+      fetchedAt: Number(data?.fetchedAt ?? Date.now()),
       fromCache: false,
     };
-    writeCreditUsageCache(fingerprint, result);
+    writeCreditUsageCache(fingerprint, accountId, result);
     return result;
   } catch {
-    return readCreditUsageCache(fingerprint, true) || emptyResult;
+    return readCreditUsageCache(fingerprint, accountId, true) || emptyResult;
   }
 }
 
@@ -876,19 +975,16 @@ export async function testConnection(): Promise<{
   taskCount?: number;
 }> {
   try {
-    const url = `/api/frontmind/v1/tasks?limit=1`;
+    const url = `/api/frontmind/credential-check`;
     const response = await fetch(url, {
       headers: { "Content-Type": "application/json" },
       credentials: "include",
     });
 
     if (response.ok) {
-      const data = await response.json();
-      const count = data.data?.length ?? 0;
       return {
         ok: true,
-        message: `连接成功，已有 ${count} 个任务`,
-        taskCount: count,
+        message: "连接成功",
       };
     }
 

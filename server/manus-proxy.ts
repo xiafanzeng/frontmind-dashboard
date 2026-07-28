@@ -25,37 +25,61 @@ import axios from "axios";
 import zlib from "zlib";
 import { randomUUID } from "crypto";
 import fs from "node:fs/promises";
-import { getFrontMindCredentials, translateTaskBodyForUpstream } from "./upstream-config";
 import {
-  getDecryptedCredentialForUser,
+  getFrontMindCredentials,
+  translateTaskBodyForUpstream,
+} from "./upstream-config";
+import {
+  getEffectiveDecryptedCredentialForAccount,
   recordUpstreamResource,
 } from "./auth-service";
+import { getAccountMonthlyCreditUsage } from "./dashboard-service";
 import {
   assertSafeExternalUrl,
   ExternalUrlRejectedError,
   safeExternalRequestOptions,
 } from "./_core/safe-external-url";
+import {
+  redactSensitivePayload,
+  redactSensitiveText,
+  safeErrorForLog,
+} from "./_core/sensitive-data";
 import { preparedFileService } from "./prepared-file-service";
 
 const router = Router();
 
 // In-memory cache for file metadata (fileId -> { upload_url, filename })
 // TTL: 10 minutes
-const fileMetaCache = new Map<string, { upload_url: string; filename: string; cachedAt: number }>();
+const fileMetaCache = new Map<
+  string,
+  { upload_url: string; filename: string; cachedAt: number }
+>();
 const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 // Short-lived direct download token cache. This lets the browser download via a
 // normal same-origin URL, avoiding slow fetch->Blob->ObjectURL downloads and
 // reducing browser "unsafe download" prompts caused by blob/data URLs.
-const downloadTokenCache = new Map<string, {
-  fileId: string;
-  userId: number;
-  credentialId: string;
-  apiKey: string;
-  baseUrl: string;
-  createdAt: number;
-}>();
+const downloadTokenCache = new Map<
+  string,
+  {
+    fileId: string;
+    userId: number;
+    credentialId: string;
+    apiKey: string;
+    baseUrl: string;
+    createdAt: number;
+  }
+>();
 const DOWNLOAD_TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
+
+export function isPrivateUpstreamCollectionRequest(
+  method: string,
+  targetPath: string,
+) {
+  if (!["GET", "HEAD"].includes(method.toUpperCase())) return false;
+  const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
+  return ["/v1/tasks", "/v1/responses", "/v1/files"].includes(pathname);
+}
 
 function safeUrlForLog(value: string) {
   try {
@@ -75,7 +99,9 @@ function cleanupExpiredDownloadTokens() {
   });
 }
 
-function getCachedMeta(fileId: string): { upload_url: string; filename: string } | null {
+function getCachedMeta(
+  fileId: string,
+): { upload_url: string; filename: string } | null {
   const entry = fileMetaCache.get(fileId);
   if (entry && Date.now() - entry.cachedAt < CACHE_TTL) {
     return { upload_url: entry.upload_url, filename: entry.filename };
@@ -84,7 +110,10 @@ function getCachedMeta(fileId: string): { upload_url: string; filename: string }
   return null;
 }
 
-function setCachedMeta(fileId: string, meta: { upload_url: string; filename: string }) {
+function setCachedMeta(
+  fileId: string,
+  meta: { upload_url: string; filename: string },
+) {
   fileMetaCache.set(fileId, { ...meta, cachedAt: Date.now() });
 }
 
@@ -157,19 +186,62 @@ function inferMimeType(filename: string): string {
 function isTextBasedFile(filename: string, contentType?: string): boolean {
   const ext = filename.split(".").pop()?.toLowerCase() || "";
   const textExtensions = [
-    "md", "markdown", "txt", "html", "htm", "json", "xml", "csv",
-    "js", "ts", "jsx", "tsx", "css", "py", "java", "c", "cpp", "h",
-    "svg", "yaml", "yml", "toml", "ini", "cfg", "conf", "log",
-    "sh", "bash", "zsh", "bat", "ps1", "rb", "php", "go", "rs",
-    "swift", "kt", "scala", "r", "sql", "graphql", "proto",
+    "md",
+    "markdown",
+    "txt",
+    "html",
+    "htm",
+    "json",
+    "xml",
+    "csv",
+    "js",
+    "ts",
+    "jsx",
+    "tsx",
+    "css",
+    "py",
+    "java",
+    "c",
+    "cpp",
+    "h",
+    "svg",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "log",
+    "sh",
+    "bash",
+    "zsh",
+    "bat",
+    "ps1",
+    "rb",
+    "php",
+    "go",
+    "rs",
+    "swift",
+    "kt",
+    "scala",
+    "r",
+    "sql",
+    "graphql",
+    "proto",
   ];
   if (textExtensions.includes(ext)) return true;
 
   // Also check content-type header
   if (contentType) {
     const ct = contentType.toLowerCase();
-    if (ct.startsWith("text/") || ct.includes("json") || ct.includes("xml") ||
-        ct.includes("javascript") || ct.includes("markdown") || ct.includes("svg")) {
+    if (
+      ct.startsWith("text/") ||
+      ct.includes("json") ||
+      ct.includes("xml") ||
+      ct.includes("javascript") ||
+      ct.includes("markdown") ||
+      ct.includes("svg")
+    ) {
       return true;
     }
   }
@@ -183,7 +255,8 @@ function isTextBasedFile(filename: string, contentType?: string): boolean {
 function isPdfFile(filename: string, contentType?: string): boolean {
   const ext = filename.split(".").pop()?.toLowerCase() || "";
   if (ext === "pdf") return true;
-  if (contentType && contentType.toLowerCase().includes("application/pdf")) return true;
+  if (contentType && contentType.toLowerCase().includes("application/pdf"))
+    return true;
   return false;
 }
 
@@ -221,27 +294,57 @@ function sanitizeText(text: string): string {
     const sourceTitle = getSourceBrandTitle();
     const sourceUpper = sourceLower.toUpperCase();
     return text
-      .replace(new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"), "https://api.frontmind.")
-      .replace(new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"), "https://www.frontmind.")
-      .replace(new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"), "https://frontmind.")
-      .replace(new RegExp(`\\b${escapeRegExp(sourceUpper)}\\b`, "g"), "FrontMind")
-      .replace(new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"), "FrontMind")
-      .replace(new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"), "frontmind");
+      .replace(
+        new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"),
+        "https://api.frontmind.",
+      )
+      .replace(
+        new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"),
+        "https://www.frontmind.",
+      )
+      .replace(
+        new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"),
+        "https://frontmind.",
+      )
+      .replace(
+        new RegExp(`\\b${escapeRegExp(sourceUpper)}\\b`, "g"),
+        "FrontMind",
+      )
+      .replace(
+        new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"),
+        "FrontMind",
+      )
+      .replace(
+        new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"),
+        "frontmind",
+      );
   } catch (e) {
     console.error("[sanitizeText] Error:", e);
     return text;
   }
 }
 
-function sanitizeFilename(filename: string | undefined, fallback = "file"): string {
-  const sanitized = sanitizeText(filename || fallback).replace(/[\\/\0]/g, "_").trim();
+function sanitizeFilename(
+  filename: string | undefined,
+  fallback = "file",
+): string {
+  const sanitized = sanitizeText(filename || fallback)
+    .replace(/[\\/\0]/g, "_")
+    .trim();
   return sanitized || fallback;
 }
 
-function setSafeContentDisposition(res: Response, disposition: "inline" | "attachment", filename: string) {
+function setSafeContentDisposition(
+  res: Response,
+  disposition: "inline" | "attachment",
+  filename: string,
+) {
   const safeFileName = sanitizeFilename(filename);
   const encoded = encodeURIComponent(safeFileName);
-  res.setHeader("content-disposition", `${disposition}; filename="${encoded}"; filename*=UTF-8''${encoded}`);
+  res.setHeader(
+    "content-disposition",
+    `${disposition}; filename="${encoded}"; filename*=UTF-8''${encoded}`,
+  );
 }
 
 function hasUsableExtension(filename: string): boolean {
@@ -249,44 +352,100 @@ function hasUsableExtension(filename: string): boolean {
   return /\.[A-Za-z0-9]{1,10}$/.test(last);
 }
 
-function ensureFilenameMatchesContent(filename: string, data: Buffer, contentType?: string): string {
+function ensureFilenameMatchesContent(
+  filename: string,
+  data: Buffer,
+  contentType?: string,
+): string {
   const safe = sanitizeFilename(filename);
   const lower = safe.toLowerCase();
 
-  if ((isPdfMagicBytes(data) || isPdfFile(safe, contentType)) && !lower.endsWith(".pdf")) {
-    return hasUsableExtension(safe) ? safe.replace(/\.[^.\/]+$/, ".pdf") : `${safe}.pdf`;
+  if (
+    (isPdfMagicBytes(data) || isPdfFile(safe, contentType)) &&
+    !lower.endsWith(".pdf")
+  ) {
+    return hasUsableExtension(safe)
+      ? safe.replace(/\.[^.\/]+$/, ".pdf")
+      : `${safe}.pdf`;
   }
 
   return safe;
 }
 
-function normalizeContentTypeForBuffer(filename: string, data: Buffer, contentType?: string): string {
-  const ct = typeof contentType === "string" ? contentType.split(";")[0].trim().toLowerCase() : "";
+function normalizeContentTypeForBuffer(
+  filename: string,
+  data: Buffer,
+  contentType?: string,
+): string {
+  const ct =
+    typeof contentType === "string"
+      ? contentType.split(";")[0].trim().toLowerCase()
+      : "";
 
   if (isPdfMagicBytes(data) || isPdfFile(filename, contentType)) {
     return "application/pdf";
   }
 
-  if (!ct || ct === "application/octet-stream" || ct === "binary/octet-stream") {
+  if (
+    !ct ||
+    ct === "application/octet-stream" ||
+    ct === "binary/octet-stream"
+  ) {
     return inferMimeType(filename);
   }
 
   return contentType || inferMimeType(filename);
 }
 
+function responseHeaderValue(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const normalized = value
+      .filter((item): item is string | number | boolean =>
+        ["string", "number", "boolean"].includes(typeof item),
+      )
+      .map(String);
+    return normalized.length ? normalized.join(", ") : undefined;
+  }
+  return undefined;
+}
+
 /**
- * Keys whose string values should NEVER be sanitized because they contain
- * identifiers, URLs, tokens, or encoded data that would break if modified.
+ * Keys whose string values should not be brand-renamed because they contain
+ * identifiers, URLs, or encoded data that would break if modified. Security
+ * redaction runs before this transform and never uses this allowlist.
  */
 const SANITIZE_SKIP_KEYS = new Set([
-  "id", "task_id", "file_id", "call_id", "response_id", "object",
-  "upload_url", "upload_expires_at", "created_at", "updated_at",
-  "url", "file_url", "fileUrl", "image_url", "imageUrl",
-  "src", "href", "download_url",
-  "api_key", "apiKey", "token", "authorization",
-  "base64", "data", "hash", "checksum", "etag",
-  "previous_response_id", "previousResponseId",
-  "task_url", "share_url",
+  "id",
+  "task_id",
+  "file_id",
+  "call_id",
+  "response_id",
+  "object",
+  "upload_url",
+  "upload_expires_at",
+  "created_at",
+  "updated_at",
+  "url",
+  "file_url",
+  "fileUrl",
+  "image_url",
+  "imageUrl",
+  "src",
+  "href",
+  "download_url",
+  "base64",
+  "data",
+  "hash",
+  "checksum",
+  "etag",
+  "previous_response_id",
+  "previousResponseId",
+  "task_url",
+  "share_url",
 ]);
 
 /**
@@ -294,16 +453,21 @@ const SANITIZE_SKIP_KEYS = new Set([
  * This ensures that all API response text (task titles, output messages, file names, etc.)
  * has Manus replaced with FrontMind before reaching the client.
  *
- * IMPORTANT: Skips sanitization for identifier/URL/token fields to avoid data corruption.
+ * IMPORTANT: Skips brand replacement for identifier/URL fields. Authentication
+ * material is removed by publicUpstreamPayload before this function runs.
  */
-function deepSanitizeJson(value: unknown, currentKey?: string, depth: number = 0): unknown {
+function deepSanitizeJson(
+  value: unknown,
+  currentKey?: string,
+  depth: number = 0,
+): unknown {
   if (value === null || value === undefined) return value;
 
   // Prevent infinite recursion on deeply nested objects
   if (depth > 50) return value;
 
   if (typeof value === "string") {
-    // Skip sanitization for identifier/URL/token fields
+    // Skip brand replacement for identifier and URL fields.
     if (currentKey && SANITIZE_SKIP_KEYS.has(currentKey)) {
       return value;
     }
@@ -332,6 +496,14 @@ function deepSanitizeJson(value: unknown, currentKey?: string, depth: number = 0
 
   // numbers, booleans, etc. - pass through
   return value;
+}
+
+export function publicUpstreamPayload(value: unknown, apiKey: string) {
+  return deepSanitizeJson(
+    redactSensitivePayload(value, {
+      secrets: [apiKey],
+    }),
+  );
 }
 
 function collectOutputFileIds(
@@ -364,11 +536,14 @@ function collectOutputFileIds(
     return ids;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectOutputFileIds(item, ids, undefined, depth + 1);
+    for (const item of value)
+      collectOutputFileIds(item, ids, undefined, depth + 1);
     return ids;
   }
   if (typeof value === "object") {
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    for (const [key, item] of Object.entries(
+      value as Record<string, unknown>,
+    )) {
       collectOutputFileIds(item, ids, key, depth + 1);
     }
   }
@@ -397,11 +572,7 @@ function collectOutputPdfDescriptors(
 
   const object = value as Record<string, unknown>;
   const filename = String(
-    object.fileName ??
-      object.file_name ??
-      object.filename ??
-      object.name ??
-      "",
+    object.fileName ?? object.file_name ?? object.filename ?? object.name ?? "",
   );
   const mimeType = String(
     object.mimeType ?? object.mime_type ?? object.content_type ?? "",
@@ -418,9 +589,7 @@ function collectOutputPdfDescriptors(
 
   if (looksLikePdf && looksLikeOutputFile) {
     const fileId = String(object.file_id ?? object.fileId ?? "");
-    const url = String(
-      object.file_url ?? object.fileUrl ?? object.url ?? "",
-    );
+    const url = String(object.file_url ?? object.fileUrl ?? object.url ?? "");
     descriptors.push({
       fileId: fileId || undefined,
       url: url || undefined,
@@ -441,7 +610,7 @@ function collectOutputPdfDescriptors(
 function sanitizeTextFileBuffer(
   data: Buffer,
   filename: string,
-  contentType?: string
+  contentType?: string,
 ): { buffer: Buffer; wasSanitized: boolean } {
   if (!isTextBasedFile(filename, contentType)) {
     return { buffer: data, wasSanitized: false };
@@ -451,7 +620,9 @@ function sanitizeTextFileBuffer(
     const text = data.toString("utf-8");
     const sanitized = sanitizeText(text);
     if (sanitized !== text) {
-      console.log(`[FrontMind Proxy] Sanitized source-brand references in text file: ${filename}`);
+      console.log(
+        `[FrontMind Proxy] Sanitized source-brand references in text file: ${filename}`,
+      );
       return { buffer: Buffer.from(sanitized, "utf-8"), wasSanitized: true };
     }
     return { buffer: data, wasSanitized: false };
@@ -478,18 +649,30 @@ function sanitizeTextFileBuffer(
  * - Nested coordinate transforms (cm operators) common in web-generated PDFs
  * - Both bfchar and bfrange CMap sections
  */
-async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; wasSanitized: boolean }> {
+async function sanitizePdfBuffer(
+  pdfBuffer: Buffer,
+): Promise<{ buffer: Buffer; wasSanitized: boolean }> {
   try {
-    const { PDFDocument, PDFName, decodePDFRawStream, PDFRawStream, StandardFonts, rgb, PDFHexString } = await import("pdf-lib");
+    const {
+      PDFDocument,
+      PDFName,
+      decodePDFRawStream,
+      PDFRawStream,
+      StandardFonts,
+      rgb,
+      PDFHexString,
+    } = await import("pdf-lib");
 
-    const pdfDoc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+    const pdfDoc = await PDFDocument.load(pdfBuffer, {
+      ignoreEncryption: true,
+    });
     const context = pdfDoc.context;
 
     // ── Step 0: Sanitize document metadata shown by PDF viewers ────────
     let pdfMetadataModified = false;
     const setSanitizedPdfStringMetadata = (
       getter: () => string | undefined,
-      setter: (value: string) => void
+      setter: (value: string) => void,
     ) => {
       try {
         const current = getter();
@@ -499,14 +682,31 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
           setter(sanitized);
           pdfMetadataModified = true;
         }
-      } catch { /* skip unsupported metadata fields */ }
+      } catch {
+        /* skip unsupported metadata fields */
+      }
     };
 
-    setSanitizedPdfStringMetadata(() => pdfDoc.getTitle(), (value) => pdfDoc.setTitle(value));
-    setSanitizedPdfStringMetadata(() => pdfDoc.getSubject(), (value) => pdfDoc.setSubject(value));
-    setSanitizedPdfStringMetadata(() => pdfDoc.getAuthor(), (value) => pdfDoc.setAuthor(value));
-    setSanitizedPdfStringMetadata(() => pdfDoc.getCreator(), (value) => pdfDoc.setCreator(value));
-    setSanitizedPdfStringMetadata(() => pdfDoc.getProducer(), (value) => pdfDoc.setProducer(value));
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getTitle(),
+      (value) => pdfDoc.setTitle(value),
+    );
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getSubject(),
+      (value) => pdfDoc.setSubject(value),
+    );
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getAuthor(),
+      (value) => pdfDoc.setAuthor(value),
+    );
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getCreator(),
+      (value) => pdfDoc.setCreator(value),
+    );
+    setSanitizedPdfStringMetadata(
+      () => pdfDoc.getProducer(),
+      (value) => pdfDoc.setProducer(value),
+    );
 
     // pdf-lib getters can miss raw Info dictionary entries in PDFs assembled by
     // other tools. Sanitize the dictionary directly so PDF properties do not leak
@@ -514,8 +714,19 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
     try {
       const infoRef = (context as any).trailerInfo?.Info;
       const infoDict = infoRef ? context.lookup(infoRef) : undefined;
-      const metadataKeys = ["Title", "Subject", "Author", "Creator", "Producer", "Keywords"];
-      if (infoDict && typeof (infoDict as any).lookup === "function" && typeof (infoDict as any).set === "function") {
+      const metadataKeys = [
+        "Title",
+        "Subject",
+        "Author",
+        "Creator",
+        "Producer",
+        "Keywords",
+      ];
+      if (
+        infoDict &&
+        typeof (infoDict as any).lookup === "function" &&
+        typeof (infoDict as any).set === "function"
+      ) {
         for (const key of metadataKeys) {
           const pdfKey = PDFName.of(key);
           const currentValue = (infoDict as any).lookup(pdfKey);
@@ -534,7 +745,9 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
           }
         }
       }
-    } catch { /* skip malformed Info dictionaries */ }
+    } catch {
+      /* skip malformed Info dictionaries */
+    }
 
     // ── Step 1: Parse all ToUnicode CMap streams ──────────────────────
     interface FontCMap {
@@ -551,7 +764,11 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
         const decoded = decodePDFRawStream(obj as any);
         const cmapText = Buffer.from(decoded.decode()).toString("latin1");
 
-        if (!cmapText.includes("beginbfchar") && !cmapText.includes("beginbfrange")) return;
+        if (
+          !cmapText.includes("beginbfchar") &&
+          !cmapText.includes("beginbfrange")
+        )
+          return;
 
         const unicodeToGlyph = new Map<string, string>();
         const glyphToUnicode = new Map<string, string>();
@@ -573,14 +790,17 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
               unicodeToGlyph.set(unicodeChar, glyphHex);
               glyphToUnicode.set(glyphHex, unicodeChar);
             }
-          } catch { /* skip invalid entries */ }
+          } catch {
+            /* skip invalid entries */
+          }
         }
 
         // Parse bfrange mappings: <start> <end> <unicodeStart>
         const bfrangeRegex = /beginbfrange\s*([\s\S]*?)\s*endbfrange/g;
         let rangeMatch;
         while ((rangeMatch = bfrangeRegex.exec(cmapText)) !== null) {
-          const rangeEntryRegex = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g;
+          const rangeEntryRegex =
+            /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g;
           let entry;
           while ((entry = rangeEntryRegex.exec(rangeMatch[1])) !== null) {
             const start = parseInt(entry[1], 16);
@@ -598,7 +818,9 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
         if (unicodeToGlyph.size > 0) {
           allCMaps.push({ unicodeToGlyph, glyphToUnicode });
         }
-      } catch { /* skip streams that can't be decoded */ }
+      } catch {
+        /* skip streams that can't be decoded */
+      }
     });
 
     // ── Step 2: Build glyph patterns for target strings ──────────────
@@ -649,7 +871,10 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
         let canBuild = true;
         for (const char of target) {
           const glyph = cmap.unicodeToGlyph.get(char);
-          if (!glyph) { canBuild = false; break; }
+          if (!glyph) {
+            canBuild = false;
+            break;
+          }
           glyphs.push(glyph);
         }
         if (canBuild) {
@@ -678,9 +903,7 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
           if (!streamText.includes("Tj") && !streamText.includes("TJ")) return;
           const sanitized = replaceSimpleBrandEncodings(streamText);
           if (sanitized === streamText) return;
-          const compressed = zlib.deflateSync(
-            Buffer.from(sanitized, "latin1"),
-          );
+          const compressed = zlib.deflateSync(Buffer.from(sanitized, "latin1"));
           const dict = (obj as any).dict.clone(context);
           dict.set(PDFName.of("Length"), context.obj(compressed.length));
           dict.set(PDFName.of("Filter"), PDFName.of("FlateDecode"));
@@ -728,13 +951,22 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
 
     const replacementTextForTarget = (_target: string) => "FrontMind";
 
-    const estimateGlyphAdvance = (glyph: string, glyphToUnicode: Map<string, string>, fontSize: number): number => {
+    const estimateGlyphAdvance = (
+      glyph: string,
+      glyphToUnicode: Map<string, string>,
+      fontSize: number,
+    ): number => {
       const char = glyphToUnicode.get(glyph);
       if (!char) return fontSize * 0.6;
       if (char === " ") return fontSize * 0.32;
 
       const codePoint = char.codePointAt(0) || 0;
-      if (codePoint > 0x2e80 || codePoint === 0xff1a || codePoint === 0xff08 || codePoint === 0xff09) {
+      if (
+        codePoint > 0x2e80 ||
+        codePoint === 0xff1a ||
+        codePoint === 0xff08 ||
+        codePoint === 0xff09
+      ) {
         return fontSize;
       }
 
@@ -765,7 +997,10 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
 
     const splitGlyphHex = (rawHex: string): string[] => {
       if (!rawHex) return [];
-      const normalized = rawHex.length % 4 === 0 ? rawHex : rawHex.padStart(Math.ceil(rawHex.length / 4) * 4, "0");
+      const normalized =
+        rawHex.length % 4 === 0
+          ? rawHex
+          : rawHex.padStart(Math.ceil(rawHex.length / 4) * 4, "0");
       const chunks: string[] = [];
       for (let i = 0; i < normalized.length; i += 4) {
         chunks.push(normalized.slice(i, i + 4));
@@ -778,7 +1013,7 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
       hexTokens: TjArrayHexToken[],
       glyphIndexLimit: number,
       pattern: GlyphPattern,
-      fontSize: number
+      fontSize: number,
     ): number => {
       let glyphIndex = 0;
       let advance = 0;
@@ -794,7 +1029,11 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
 
         for (const glyph of hexToken.chunks) {
           if (glyphIndex >= glyphIndexLimit) return advance;
-          advance += estimateGlyphAdvance(glyph.toLowerCase().padStart(4, "0"), pattern.glyphToUnicode, fontSize);
+          advance += estimateGlyphAdvance(
+            glyph.toLowerCase().padStart(4, "0"),
+            pattern.glyphToUnicode,
+            fontSize,
+          );
           glyphIndex++;
         }
       }
@@ -802,7 +1041,10 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
       return advance;
     };
 
-    const rebuildTjArrayBody = (body: string, hexTokens: TjArrayHexToken[]): string => {
+    const rebuildTjArrayBody = (
+      body: string,
+      hexTokens: TjArrayHexToken[],
+    ): string => {
       const modifiedTokens = hexTokens.filter((token) => token.modified);
       if (modifiedTokens.length === 0) return body;
 
@@ -834,10 +1076,16 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
       }
 
       if (content.objectNumber !== undefined) {
-        streamRefToPageIndex.set(`${content.objectNumber} ${content.generationNumber} R`, pageIndex);
+        streamRefToPageIndex.set(
+          `${content.objectNumber} ${content.generationNumber} R`,
+          pageIndex,
+        );
       }
 
-      if (typeof content.size === "function" && typeof content.get === "function") {
+      if (
+        typeof content.size === "function" &&
+        typeof content.get === "function"
+      ) {
         for (let i = 0; i < content.size(); i++) {
           registerPageContent(content.get(i), pageIndex);
         }
@@ -848,7 +1096,9 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
       try {
         const contentsRef = (pages[pi] as any).node.Contents();
         registerPageContent(contentsRef, pi);
-      } catch { /* skip */ }
+      } catch {
+        /* skip */
+      }
     }
 
     context.enumerateIndirectObjects().forEach(([ref, obj]: [any, any]) => {
@@ -889,7 +1139,9 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
           streamRefToPageIndex.forEach((idx, key) => {
             if (found) return;
             const refObjectNumber = refStr.split(" ")[0];
-            const exactRefPattern = new RegExp(`(^|\\D)${refObjectNumber}\\s+0\\s+R(\\D|$)`);
+            const exactRefPattern = new RegExp(
+              `(^|\\D)${refObjectNumber}\\s+0\\s+R(\\D|$)`,
+            );
             if (refStr === key || exactRefPattern.test(key)) {
               pageIndex = idx;
               found = true;
@@ -916,7 +1168,7 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
 
           // Track cm (concat matrix) - for diagonal affine transforms [a, b, c, d, e, f]
           const cmMatch = line.match(
-            /^([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+cm$/
+            /^([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+cm$/,
           );
           if (cmMatch) {
             const [a, , , d, e, f] = cmMatch.slice(1, 7).map(Number);
@@ -933,7 +1185,7 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
 
           // Track Tm (text matrix)
           const tmMatch = line.match(
-            /^([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+Tm$/
+            /^([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+Tm$/,
           );
           if (tmMatch) {
             currentTm = tmMatch.slice(1, 7).map(Number);
@@ -954,7 +1206,9 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
           }
 
           // Td + Tj on same line: "16.0 0 Td <002E> Tj"
-          const tdTjMatch = line.match(/^([\d.eE+-]+)\s+([\d.eE+-]+)\s+Td\s+<([0-9a-fA-F]+)>\s+Tj$/);
+          const tdTjMatch = line.match(
+            /^([\d.eE+-]+)\s+([\d.eE+-]+)\s+Td\s+<([0-9a-fA-F]+)>\s+Tj$/,
+          );
           if (tdTjMatch) {
             tdAccumX += parseFloat(tdTjMatch[1]);
             tdAccumY += parseFloat(tdTjMatch[2]);
@@ -986,112 +1240,135 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
             const originalLine = lines[i];
             let lineWasModified = false;
             const arrayRegex = /\[([\s\S]*?)\]\s*TJ/g;
-            lines[i] = originalLine.replace(arrayRegex, (fullMatch, body: string) => {
-              const hexTokens: TjArrayHexToken[] = [];
-              const orderedTokens: TjArrayToken[] = [];
-              const glyphs: TjArrayGlyph[] = [];
-              const tokenRegex = /<([0-9a-fA-F]*)>|([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)/g;
-              let tokenMatch: RegExpExecArray | null;
+            lines[i] = originalLine.replace(
+              arrayRegex,
+              (fullMatch, body: string) => {
+                const hexTokens: TjArrayHexToken[] = [];
+                const orderedTokens: TjArrayToken[] = [];
+                const glyphs: TjArrayGlyph[] = [];
+                const tokenRegex =
+                  /<([0-9a-fA-F]*)>|([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)/g;
+                let tokenMatch: RegExpExecArray | null;
 
-              while ((tokenMatch = tokenRegex.exec(body)) !== null) {
-                if (tokenMatch[1] !== undefined) {
-                  const tokenIndex = hexTokens.length;
-                  const chunks = splitGlyphHex(tokenMatch[1]);
-                  hexTokens.push({
-                    start: tokenMatch.index,
-                    end: tokenMatch.index + tokenMatch[0].length,
-                    rawHex: tokenMatch[1],
-                    chunks,
-                    modified: false,
-                  });
-                  orderedTokens.push({ kind: "hex", tokenIndex });
-
-                  chunks.forEach((chunk, chunkIndex) => {
-                    glyphs.push({
-                      glyph: chunk.toLowerCase().padStart(4, "0"),
-                      tokenIndex,
-                      chunkIndex,
+                while ((tokenMatch = tokenRegex.exec(body)) !== null) {
+                  if (tokenMatch[1] !== undefined) {
+                    const tokenIndex = hexTokens.length;
+                    const chunks = splitGlyphHex(tokenMatch[1]);
+                    hexTokens.push({
+                      start: tokenMatch.index,
+                      end: tokenMatch.index + tokenMatch[0].length,
+                      rawHex: tokenMatch[1],
+                      chunks,
+                      modified: false,
                     });
-                  });
-                } else if (tokenMatch[2] !== undefined) {
-                  orderedTokens.push({ kind: "number", value: Number(tokenMatch[2]) });
+                    orderedTokens.push({ kind: "hex", tokenIndex });
+
+                    chunks.forEach((chunk, chunkIndex) => {
+                      glyphs.push({
+                        glyph: chunk.toLowerCase().padStart(4, "0"),
+                        tokenIndex,
+                        chunkIndex,
+                      });
+                    });
+                  } else if (tokenMatch[2] !== undefined) {
+                    orderedTokens.push({
+                      kind: "number",
+                      value: Number(tokenMatch[2]),
+                    });
+                  }
                 }
-              }
 
-              if (glyphs.length === 0) return fullMatch;
+                if (glyphs.length === 0) return fullMatch;
 
-              const replacedGlyphIndexes = new Set<number>();
-              let arrayWasModified = false;
+                const replacedGlyphIndexes = new Set<number>();
+                let arrayWasModified = false;
 
-              for (const pattern of glyphPatterns) {
-                const patLen = pattern.glyphs.length;
-                if (patLen === 0 || glyphs.length < patLen) continue;
+                for (const pattern of glyphPatterns) {
+                  const patLen = pattern.glyphs.length;
+                  if (patLen === 0 || glyphs.length < patLen) continue;
 
-                for (let gi = 0; gi <= glyphs.length - patLen; gi++) {
-                  if (replacedGlyphIndexes.has(gi)) continue;
+                  for (let gi = 0; gi <= glyphs.length - patLen; gi++) {
+                    if (replacedGlyphIndexes.has(gi)) continue;
 
-                  let matches = true;
-                  for (let pj = 0; pj < patLen; pj++) {
-                    if (
-                      replacedGlyphIndexes.has(gi + pj) ||
-                      glyphs[gi + pj].glyph !== pattern.glyphs[pj]
-                    ) {
-                      matches = false;
-                      break;
+                    let matches = true;
+                    for (let pj = 0; pj < patLen; pj++) {
+                      if (
+                        replacedGlyphIndexes.has(gi + pj) ||
+                        glyphs[gi + pj].glyph !== pattern.glyphs[pj]
+                      ) {
+                        matches = false;
+                        break;
+                      }
+                    }
+                    if (!matches) continue;
+
+                    for (let pj = 0; pj < patLen; pj++) {
+                      const glyphInfo = glyphs[gi + pj];
+                      const token = hexTokens[glyphInfo.tokenIndex];
+                      const originalChunk =
+                        token.chunks[glyphInfo.chunkIndex] || "0000";
+                      token.chunks[glyphInfo.chunkIndex] = pattern.spaceGlyph
+                        .toUpperCase()
+                        .padStart(originalChunk.length, "0");
+                      token.modified = true;
+                      replacedGlyphIndexes.add(gi + pj);
+                    }
+
+                    arrayWasModified = true;
+                    lineWasModified = true;
+
+                    if (currentTm) {
+                      const tm = currentTm;
+                      const ctm = currentCtm;
+                      const matchAdvance = calculateTjGlyphAdvance(
+                        orderedTokens,
+                        hexTokens,
+                        gi,
+                        pattern,
+                        currentFontSize,
+                      );
+                      const matchWidth = Math.max(
+                        calculateTjGlyphAdvance(
+                          orderedTokens,
+                          hexTokens,
+                          gi + patLen,
+                          pattern,
+                          currentFontSize,
+                        ) - matchAdvance,
+                        pattern.glyphs.length * currentFontSize * 0.55,
+                      );
+                      const contentX = tm[4] + tdAccumX + matchAdvance;
+                      const contentY = tm[5] + tdAccumY;
+                      const pageX = ctm.sx * contentX + ctm.tx;
+                      const pageY = ctm.sy * contentY + ctm.ty;
+                      const effectiveFontSize =
+                        Math.abs(ctm.sx) * currentFontSize;
+                      const pageWidth = Math.abs(ctm.sx) * matchWidth;
+                      const pageIndex = getPageIndexForStream();
+
+                      overlayPositions.push({
+                        target: pattern.target,
+                        replacementText: replacementTextForTarget(
+                          pattern.target,
+                        ),
+                        pageX,
+                        pageY,
+                        pageWidth,
+                        effectiveFontSize,
+                        pageIndex,
+                      });
+
+                      console.log(
+                        `[FrontMind Proxy] PDF TJ overlay: "${pattern.target}" -> "FrontMind" at page=${pageIndex} x=${pageX.toFixed(1)} y=${pageY.toFixed(1)} size=${effectiveFontSize.toFixed(1)}`,
+                      );
                     }
                   }
-                  if (!matches) continue;
-
-                  for (let pj = 0; pj < patLen; pj++) {
-                    const glyphInfo = glyphs[gi + pj];
-                    const token = hexTokens[glyphInfo.tokenIndex];
-                    const originalChunk = token.chunks[glyphInfo.chunkIndex] || "0000";
-                    token.chunks[glyphInfo.chunkIndex] = pattern.spaceGlyph
-                      .toUpperCase()
-                      .padStart(originalChunk.length, "0");
-                    token.modified = true;
-                    replacedGlyphIndexes.add(gi + pj);
-                  }
-
-                  arrayWasModified = true;
-                  lineWasModified = true;
-
-                  if (currentTm) {
-                    const tm = currentTm;
-                    const ctm = currentCtm;
-                    const matchAdvance = calculateTjGlyphAdvance(orderedTokens, hexTokens, gi, pattern, currentFontSize);
-                    const matchWidth = Math.max(
-                      calculateTjGlyphAdvance(orderedTokens, hexTokens, gi + patLen, pattern, currentFontSize) - matchAdvance,
-                      pattern.glyphs.length * currentFontSize * 0.55
-                    );
-                    const contentX = tm[4] + tdAccumX + matchAdvance;
-                    const contentY = tm[5] + tdAccumY;
-                    const pageX = ctm.sx * contentX + ctm.tx;
-                    const pageY = ctm.sy * contentY + ctm.ty;
-                    const effectiveFontSize = Math.abs(ctm.sx) * currentFontSize;
-                    const pageWidth = Math.abs(ctm.sx) * matchWidth;
-                    const pageIndex = getPageIndexForStream();
-
-                    overlayPositions.push({
-                      target: pattern.target,
-                      replacementText: replacementTextForTarget(pattern.target),
-                      pageX,
-                      pageY,
-                      pageWidth,
-                      effectiveFontSize,
-                      pageIndex,
-                    });
-
-                    console.log(
-                      `[FrontMind Proxy] PDF TJ overlay: "${pattern.target}" -> "FrontMind" at page=${pageIndex} x=${pageX.toFixed(1)} y=${pageY.toFixed(1)} size=${effectiveFontSize.toFixed(1)}`
-                    );
-                  }
                 }
-              }
 
-              if (!arrayWasModified) return fullMatch;
-              return `[${rebuildTjArrayBody(body, hexTokens)}] TJ`;
-            });
+                if (!arrayWasModified) return fullMatch;
+                return `[${rebuildTjArrayBody(body, hexTokens)}] TJ`;
+              },
+            );
 
             if (lineWasModified) {
               streamModified = true;
@@ -1129,12 +1406,17 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
                   const glyphOffset = matchOffset / 4;
                   const tm = currentTm;
                   const ctm = currentCtm;
-                  const contentX = tm[4] + tdAccumX + glyphOffset * currentFontSize * 0.55;
+                  const contentX =
+                    tm[4] + tdAccumX + glyphOffset * currentFontSize * 0.55;
                   const contentY = tm[5];
                   const pageX = ctm.sx * contentX + ctm.tx;
                   const pageY = ctm.sy * contentY + ctm.ty;
                   const effectiveFontSize = Math.abs(ctm.sx) * currentFontSize;
-                  const pageWidth = Math.abs(ctm.sx) * pattern.glyphs.length * currentFontSize * 0.65;
+                  const pageWidth =
+                    Math.abs(ctm.sx) *
+                    pattern.glyphs.length *
+                    currentFontSize *
+                    0.65;
 
                   const pageIndex = getPageIndexForStream();
 
@@ -1149,7 +1431,7 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
                   });
 
                   console.log(
-                    `[FrontMind Proxy] PDF multi-CID overlay: "${pattern.target}" -> "FrontMind" at page=${pageIndex} x=${pageX.toFixed(1)} y=${pageY.toFixed(1)} size=${effectiveFontSize.toFixed(1)}`
+                    `[FrontMind Proxy] PDF multi-CID overlay: "${pattern.target}" -> "FrontMind" at page=${pageIndex} x=${pageX.toFixed(1)} y=${pageY.toFixed(1)} size=${effectiveFontSize.toFixed(1)}`,
                   );
                 }
                 break;
@@ -1182,21 +1464,31 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
 
             let matches = true;
             for (let j = 0; j < patLen; j++) {
-              if (tjInfos[i + j].glyph !== pattern.glyphs[j] || alreadyReplaced.has(i + j)) {
+              if (
+                tjInfos[i + j].glyph !== pattern.glyphs[j] ||
+                alreadyReplaced.has(i + j)
+              ) {
                 matches = false;
                 break;
               }
             }
 
             if (matches) {
-              console.log(`[FrontMind Proxy] FOUND "${pattern.target}" in PDF stream ${ref.toString()}`);
+              console.log(
+                `[FrontMind Proxy] FOUND "${pattern.target}" in PDF stream ${ref.toString()}`,
+              );
 
               // Replace each glyph with space glyph
               for (let j = 0; j < patLen; j++) {
                 const tj = tjInfos[i + j];
                 const oldHex = tj.glyphHexInLine;
-                const newHex = pattern.spaceGlyph.toUpperCase().padStart(oldHex.length, "0");
-                lines[tj.lineIndex] = lines[tj.lineIndex].replace(`<${oldHex}>`, `<${newHex}>`);
+                const newHex = pattern.spaceGlyph
+                  .toUpperCase()
+                  .padStart(oldHex.length, "0");
+                lines[tj.lineIndex] = lines[tj.lineIndex].replace(
+                  `<${oldHex}>`,
+                  `<${newHex}>`,
+                );
                 alreadyReplaced.add(i + j);
               }
               streamModified = true;
@@ -1242,7 +1534,7 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
                 });
 
                 console.log(
-                  `[FrontMind Proxy] PDF overlay: "${pattern.target}" -> "FrontMind" at page=${pageIndex} x=${pageX.toFixed(1)} y=${pageY.toFixed(1)} size=${effectiveFontSize.toFixed(1)}`
+                  `[FrontMind Proxy] PDF overlay: "${pattern.target}" -> "FrontMind" at page=${pageIndex} x=${pageX.toFixed(1)} y=${pageY.toFixed(1)} size=${effectiveFontSize.toFixed(1)}`,
                 );
               }
             }
@@ -1260,7 +1552,9 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
           context.assign(ref, PDFRawStream.of(dict, compressed));
           totalModified++;
         }
-      } catch { /* skip streams that can't be processed */ }
+      } catch {
+        /* skip streams that can't be processed */
+      }
     });
 
     // ── Step 4: Add overlay text using standard font ─────────────────
@@ -1270,7 +1564,10 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
       for (const pos of overlayPositions) {
         const page = pages[pos.pageIndex] || pages[0];
         const replacementText = pos.replacementText;
-        const replacementWidth = font.widthOfTextAtSize(replacementText, pos.effectiveFontSize);
+        const replacementWidth = font.widthOfTextAtSize(
+          replacementText,
+          pos.effectiveFontSize,
+        );
 
         // Draw white rectangle to cover any visual remnants of the original glyphs
         page.drawRectangle({
@@ -1295,7 +1592,9 @@ async function sanitizePdfBuffer(pdfBuffer: Buffer): Promise<{ buffer: Buffer; w
 
     if (totalModified > 0 || pdfMetadataModified) {
       const savedBytes = await pdfDoc.save();
-      console.log(`[FrontMind Proxy] PDF sanitized: ${totalModified} stream(s) modified, ${overlayPositions.length} overlay(s) applied, metadata=${pdfMetadataModified}`);
+      console.log(
+        `[FrontMind Proxy] PDF sanitized: ${totalModified} stream(s) modified, ${overlayPositions.length} overlay(s) applied, metadata=${pdfMetadataModified}`,
+      );
       return { buffer: Buffer.from(savedBytes), wasSanitized: true };
     }
 
@@ -1339,8 +1638,12 @@ function isOfficeXmlFile(filename: string, contentType?: string): boolean {
   if (officeExtensions.includes(ext)) return true;
   if (contentType) {
     const ct = contentType.toLowerCase();
-    if (ct.includes("officedocument") || ct.includes("msword") ||
-        ct.includes("ms-excel") || ct.includes("ms-powerpoint")) {
+    if (
+      ct.includes("officedocument") ||
+      ct.includes("msword") ||
+      ct.includes("ms-excel") ||
+      ct.includes("ms-powerpoint")
+    ) {
       return true;
     }
   }
@@ -1352,9 +1655,13 @@ function isOfficeXmlFile(filename: string, contentType?: string): boolean {
  * DOCX/XLSX/PPTX are all ZIP-based formats.
  */
 function isZipMagicBytes(data: Buffer): boolean {
-  return data.length >= 4 &&
-    data[0] === 0x50 && data[1] === 0x4B &&
-    data[2] === 0x03 && data[3] === 0x04;
+  return (
+    data.length >= 4 &&
+    data[0] === 0x50 &&
+    data[1] === 0x4b &&
+    data[2] === 0x03 &&
+    data[3] === 0x04
+  );
 }
 
 /**
@@ -1367,7 +1674,9 @@ function isZipMagicBytes(data: Buffer): boolean {
  * XLSX stores text in xl/sharedStrings.xml, xl/worksheets/sheet*.xml
  * PPTX stores text in ppt/slides/slide*.xml
  */
-async function sanitizeOfficeXmlBuffer(data: Buffer): Promise<{ buffer: Buffer; wasSanitized: boolean }> {
+async function sanitizeOfficeXmlBuffer(
+  data: Buffer,
+): Promise<{ buffer: Buffer; wasSanitized: boolean }> {
   try {
     const JSZip = (await import("jszip")).default;
     const zip = await JSZip.loadAsync(data);
@@ -1382,8 +1691,11 @@ async function sanitizeOfficeXmlBuffer(data: Buffer): Promise<{ buffer: Buffer; 
 
       // Only process XML-based files inside the archive
       const lowerName = fname.toLowerCase();
-      if (lowerName.endsWith(".xml") || lowerName.endsWith(".rels") ||
-          lowerName === "[content_types].xml") {
+      if (
+        lowerName.endsWith(".xml") ||
+        lowerName.endsWith(".rels") ||
+        lowerName === "[content_types].xml"
+      ) {
         try {
           const content = await file.async("string");
           const sanitized = sanitizeText(content);
@@ -1409,7 +1721,9 @@ async function sanitizeOfficeXmlBuffer(data: Buffer): Promise<{ buffer: Buffer; 
 
     return { buffer: data, wasSanitized: false };
   } catch (err: any) {
-    console.error(`[FrontMind Proxy] Office XML sanitization error: ${err.message}`);
+    console.error(
+      `[FrontMind Proxy] Office XML sanitization error: ${err.message}`,
+    );
     return { buffer: data, wasSanitized: false };
   }
 }
@@ -1426,16 +1740,21 @@ async function sanitizeOfficeXmlBuffer(data: Buffer): Promise<{ buffer: Buffer; 
 async function sanitizeFileBuffer(
   data: Buffer,
   filename: string,
-  contentType?: string
+  contentType?: string,
 ): Promise<{ buffer: Buffer; wasSanitized: boolean }> {
   // Check if it's a PDF by extension/content-type OR by magic bytes
   if (isPdfFile(filename, contentType) || isPdfMagicBytes(data)) {
-    console.log(`[FrontMind Proxy] Detected PDF file: ${filename} (magic=${isPdfMagicBytes(data)}, ext/ct=${isPdfFile(filename, contentType)})`);
+    console.log(
+      `[FrontMind Proxy] Detected PDF file: ${filename} (magic=${isPdfMagicBytes(data)}, ext/ct=${isPdfFile(filename, contentType)})`,
+    );
     return sanitizePdfBuffer(data);
   }
 
   // Check if it's an Office Open XML file (DOCX/XLSX/PPTX)
-  if (isOfficeXmlFile(filename, contentType) || (isZipMagicBytes(data) && !isTextBasedFile(filename, contentType))) {
+  if (
+    isOfficeXmlFile(filename, contentType) ||
+    (isZipMagicBytes(data) && !isTextBasedFile(filename, contentType))
+  ) {
     console.log(`[FrontMind Proxy] Detected Office XML file: ${filename}`);
     return sanitizeOfficeXmlBuffer(data);
   }
@@ -1520,10 +1839,13 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
 router.get("/proxy-download", async (req: Request, res: Response) => {
   try {
     const rawTargetUrl = req.query.url as string;
-    const requestedFilename = typeof req.query.filename === "string" ? req.query.filename : "";
+    const requestedFilename =
+      typeof req.query.filename === "string" ? req.query.filename : "";
     const disposition = req.query.download === "1" ? "attachment" : "inline";
     if (!rawTargetUrl) {
-      return res.status(400).json({ error: { message: "Missing url parameter" } });
+      return res
+        .status(400)
+        .json({ error: { message: "Missing url parameter" } });
     }
     const targetUrl = assertSafeExternalUrl(rawTargetUrl);
     const urlFilenameRaw = targetUrl.split("/").pop()?.split("?")[0] || "file";
@@ -1533,7 +1855,7 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
     // Legacy callers may still request a PDF through proxy-download. Route
     // those requests into the same asynchronous prepared-asset pipeline.
     if (isPdfFile(candidateFilename) && req.frontmindUser) {
-      const credential = await getDecryptedCredentialForUser(
+      const credential = await getEffectiveDecryptedCredentialForAccount(
         req.frontmindUser.id,
       );
       const asset = await preparedFileService.registerExternal({
@@ -1549,7 +1871,9 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
       return res.redirect(307, `${asset.contentUrl}${suffix}`);
     }
 
-    console.log(`[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`);
+    console.log(
+      `[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`,
+    );
 
     const response = await axios.get(targetUrl, {
       ...safeExternalRequestOptions,
@@ -1559,7 +1883,9 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
       validateStatus: () => true,
     });
 
-    console.log(`[FrontMind Proxy] Proxy-download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`);
+    console.log(
+      `[FrontMind Proxy] Proxy-download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`,
+    );
 
     res.status(response.status);
 
@@ -1568,35 +1894,48 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
     // Try to extract filename from URL or content-disposition. The caller-provided
     // filename wins; otherwise we fall back to the URL tail and repair the extension
     // from magic bytes so UUID-like signed URLs still download as real PDFs.
+    const upstreamContentType = responseHeaderValue(
+      response.headers["content-type"],
+    );
     const urlFilename = ensureFilenameMatchesContent(
       candidateFilename,
       rawBuffer,
-      response.headers["content-type"]
+      upstreamContentType,
     );
-    const finalContentType = normalizeContentTypeForBuffer(urlFilename, rawBuffer, response.headers["content-type"]);
+    const finalContentType = normalizeContentTypeForBuffer(
+      urlFilename,
+      rawBuffer,
+      upstreamContentType,
+    );
 
     // Forward safe cache validators only. Content-Type and Content-Disposition are
     // controlled below so an upstream `attachment` header cannot break iframe preview
     // and an upstream octet-stream response cannot make PDFs download as UUID blobs.
     for (const header of ["cache-control", "etag", "last-modified"]) {
-      if (response.headers[header]) {
-        res.setHeader(header, response.headers[header]);
-      }
+      const value = responseHeaderValue(response.headers[header]);
+      if (value) res.setHeader(header, value);
     }
     res.setHeader("content-type", finalContentType);
-    setSafeContentDisposition(res, disposition as "inline" | "attachment", urlFilename);
+    setSafeContentDisposition(
+      res,
+      disposition as "inline" | "attachment",
+      urlFilename,
+    );
 
     const { buffer: sanitizedBuffer, wasSanitized } = await sanitizeFileBuffer(
       rawBuffer,
       urlFilename,
-      finalContentType
+      finalContentType,
     );
 
     // Update content-length if sanitized (size may have changed)
     if (wasSanitized) {
       res.setHeader("content-length", String(sanitizedBuffer.length));
-    } else if (response.headers["content-length"]) {
-      res.setHeader("content-length", response.headers["content-length"]);
+    } else {
+      const contentLength = responseHeaderValue(
+        response.headers["content-length"],
+      );
+      if (contentLength) res.setHeader("content-length", contentLength);
     }
 
     res.send(sanitizedBuffer);
@@ -1626,7 +1965,7 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
 async function fetchFileMetadata(
   baseUrl: string,
   fileId: string,
-  apiKey: string
+  apiKey: string,
 ): Promise<{ upload_url: string; filename: string } | null> {
   // Check cache first
   const cached = getCachedMeta(fileId);
@@ -1650,15 +1989,22 @@ async function fetchFileMetadata(
   });
 
   if (response.status !== 200) {
-    console.error(`[FrontMind Proxy] File metadata request failed: ${response.status}`);
+    console.error(
+      `[FrontMind Proxy] File metadata request failed: ${response.status}`,
+    );
     return null;
   }
 
   const data = response.data;
-  console.log(`[FrontMind Proxy] File metadata: id=${data.id}, filename=${data.filename}, status=${data.status}, has_upload_url=${!!data.upload_url}`);
+  console.log(
+    `[FrontMind Proxy] File metadata: id=${data.id}, filename=${data.filename}, status=${data.status}, has_upload_url=${!!data.upload_url}`,
+  );
 
   if (data.upload_url) {
-    const meta = { upload_url: data.upload_url, filename: data.filename || fileId };
+    const meta = {
+      upload_url: data.upload_url,
+      filename: data.filename || fileId,
+    };
     setCachedMeta(fileId, meta);
     return meta;
   }
@@ -1675,10 +2021,12 @@ async function downloadFromS3(
   res: Response,
   s3Url: string,
   filename: string,
-  disposition: "inline" | "attachment" = "inline"
+  disposition: "inline" | "attachment" = "inline",
 ): Promise<void> {
   const safeS3Url = assertSafeExternalUrl(s3Url);
-  console.log(`[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`);
+  console.log(
+    `[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`,
+  );
 
   const response = await axios.get(safeS3Url, {
     ...safeExternalRequestOptions,
@@ -1688,7 +2036,9 @@ async function downloadFromS3(
     validateStatus: () => true,
   });
 
-  console.log(`[FrontMind Proxy] S3 download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`);
+  console.log(
+    `[FrontMind Proxy] S3 download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`,
+  );
 
   if (response.status !== 200) {
     res.status(response.status);
@@ -1705,16 +2055,26 @@ async function downloadFromS3(
 
   // Sanitize file content (text files and PDFs - with magic byte detection)
   const rawBuffer = Buffer.from(response.data);
-  const finalFilename = ensureFilenameMatchesContent(filename, rawBuffer, response.headers["content-type"]);
-  const finalContentType = normalizeContentTypeForBuffer(finalFilename, rawBuffer, response.headers["content-type"]);
+  const upstreamContentType = responseHeaderValue(
+    response.headers["content-type"],
+  );
+  const finalFilename = ensureFilenameMatchesContent(
+    filename,
+    rawBuffer,
+    upstreamContentType,
+  );
+  const finalContentType = normalizeContentTypeForBuffer(
+    finalFilename,
+    rawBuffer,
+    upstreamContentType,
+  );
 
   // Forward safe cache validators only. Content-Type and Content-Disposition are
   // controlled locally so PDF previews remain inline even when S3 says attachment,
   // and UUID-like filenames are repaired to include .pdf when magic bytes prove it.
   for (const header of ["cache-control", "etag", "last-modified"]) {
-    if (response.headers[header]) {
-      res.setHeader(header, response.headers[header]);
-    }
+    const value = responseHeaderValue(response.headers[header]);
+    if (value) res.setHeader(header, value);
   }
   res.setHeader("content-type", finalContentType);
   setSafeContentDisposition(res, disposition, finalFilename);
@@ -1722,7 +2082,7 @@ async function downloadFromS3(
   const { buffer: sanitizedBuffer } = await sanitizeFileBuffer(
     rawBuffer,
     finalFilename,
-    finalContentType
+    finalContentType,
   );
 
   // Update content-length after sanitization
@@ -1760,11 +2120,7 @@ async function handleFileDownload(
     return;
   }
 
-  if (
-    isPdfFile(meta.filename) &&
-    ownerUserId &&
-    credentialId
-  ) {
+  if (isPdfFile(meta.filename) && ownerUserId && credentialId) {
     const asset = await preparedFileService.registerFile({
       ownerUserId,
       credentialId,
@@ -1782,7 +2138,9 @@ async function handleFileDownload(
 
   if (!meta.upload_url) {
     // No S3 URL available - try a direct download from the API as last resort
-    console.warn(`[FrontMind Proxy] No upload_url for file ${fileId}, trying direct API download`);
+    console.warn(
+      `[FrontMind Proxy] No upload_url for file ${fileId}, trying direct API download`,
+    );
 
     // Try the /content endpoint as a last resort (some API versions may support it)
     const cleanBaseUrl = baseUrl.replace(/\/$/, "");
@@ -1800,31 +2158,48 @@ async function handleFileDownload(
         validateStatus: () => true,
       });
 
-      if (response.status === 200 && response.headers["content-type"] !== "application/json") {
-        console.log(`[FrontMind Proxy] Direct /content download succeeded: ${response.status}`);
+      const upstreamContentType = responseHeaderValue(
+        response.headers["content-type"],
+      );
+      if (
+        response.status === 200 &&
+        upstreamContentType !== "application/json"
+      ) {
+        console.log(
+          `[FrontMind Proxy] Direct /content download succeeded: ${response.status}`,
+        );
         res.status(200);
 
         for (const header of ["content-type", "content-disposition"]) {
-          if (response.headers[header]) {
+          const value = responseHeaderValue(response.headers[header]);
+          if (value) {
             if (header === "content-disposition") {
-              res.setHeader(header, sanitizeText(String(response.headers[header])));
+              res.setHeader(header, sanitizeText(value));
             } else {
-              res.setHeader(header, response.headers[header]);
+              res.setHeader(header, value);
             }
           }
         }
 
         // Sanitize file content (text files and PDFs - with magic byte detection)
         const rawBuffer = Buffer.from(response.data);
-        const finalFilename = ensureFilenameMatchesContent(meta.filename, rawBuffer, response.headers["content-type"]);
-        const finalContentType = normalizeContentTypeForBuffer(finalFilename, rawBuffer, response.headers["content-type"]);
+        const finalFilename = ensureFilenameMatchesContent(
+          meta.filename,
+          rawBuffer,
+          upstreamContentType,
+        );
+        const finalContentType = normalizeContentTypeForBuffer(
+          finalFilename,
+          rawBuffer,
+          upstreamContentType,
+        );
         res.setHeader("content-type", finalContentType);
         setSafeContentDisposition(res, disposition, finalFilename);
 
         const { buffer: sanitizedBuffer } = await sanitizeFileBuffer(
           rawBuffer,
           finalFilename,
-          finalContentType
+          finalContentType,
         );
 
         res.setHeader("content-length", String(sanitizedBuffer.length));
@@ -1832,7 +2207,10 @@ async function handleFileDownload(
         return;
       }
     } catch (e: any) {
-      console.warn(`[FrontMind Proxy] Direct /content download failed: ${e.message}`);
+      console.warn(
+        "[FrontMind Proxy] Direct /content download failed:",
+        safeErrorForLog(e, { secrets: [apiKey] }),
+      );
     }
 
     res.status(404).json({
@@ -1848,27 +2226,32 @@ async function handleFileDownload(
   await downloadFromS3(res, meta.upload_url, meta.filename, disposition);
 }
 
-
 /**
  * Create a short-lived same-origin direct download URL.
  * The API key stays server-side in memory and is never placed into the URL.
  */
 router.post("/download-token", async (req: Request, res: Response) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
     cleanupExpiredDownloadTokens();
-    const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = (req.body?.fileId as string) || "";
 
     if (!apiKey) {
-      return res.status(401).json({ error: { message: "Missing API key", code: "MISSING_API_KEY" } });
+      return res.status(401).json({
+        error: { message: "Missing API key", code: "MISSING_API_KEY" },
+      });
     }
     if (!fileId) {
-      return res.status(400).json({ error: { message: "Missing fileId", code: "MISSING_FILE_ID" } });
+      return res.status(400).json({
+        error: { message: "Missing fileId", code: "MISSING_FILE_ID" },
+      });
     }
 
     const token = randomUUID();
     if (!req.frontmindUser || !req.frontmindCredential) {
-      return res.status(401).json({ error: { message: "请先登录", code: "UNAUTHORIZED" } });
+      return res
+        .status(401)
+        .json({ error: { message: "请先登录", code: "UNAUTHORIZED" } });
     }
     downloadTokenCache.set(token, {
       fileId,
@@ -1878,10 +2261,21 @@ router.post("/download-token", async (req: Request, res: Response) => {
       baseUrl,
       createdAt: Date.now(),
     });
-    res.json({ downloadUrl: `/api/frontmind/download/${token}`, expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL });
+    res.json({
+      downloadUrl: `/api/frontmind/download/${token}`,
+      expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL,
+    });
   } catch (error: any) {
-    console.error("[FrontMind Proxy] Create download token error:", error.message);
-    res.status(500).json({ error: { message: "创建下载链接失败，请稍后重试", code: "DOWNLOAD_TOKEN_ERROR" } });
+    console.error(
+      "[FrontMind Proxy] Create download token error:",
+      safeErrorForLog(error, { secrets: [apiKey] }),
+    );
+    res.status(500).json({
+      error: {
+        message: "创建下载链接失败，请稍后重试",
+        code: "DOWNLOAD_TOKEN_ERROR",
+      },
+    });
   }
 });
 
@@ -1890,16 +2284,28 @@ router.post("/download-token", async (req: Request, res: Response) => {
  * download manager. It avoids client-side blob generation for AI output files.
  */
 router.get("/download/:token", async (req: Request, res: Response) => {
+  let logSecret = "";
   try {
     cleanupExpiredDownloadTokens();
     const token = req.params.token;
     const data = downloadTokenCache.get(token);
     if (!data) {
-      return res.status(410).json({ error: { message: "Download link expired", code: "DOWNLOAD_LINK_EXPIRED" } });
+      return res.status(410).json({
+        error: {
+          message: "Download link expired",
+          code: "DOWNLOAD_LINK_EXPIRED",
+        },
+      });
     }
+    logSecret = data.apiKey;
 
     if (!req.frontmindUser || req.frontmindUser.id !== data.userId) {
-      return res.status(403).json({ error: { message: "下载链接不属于当前账号", code: "DOWNLOAD_FORBIDDEN" } });
+      return res.status(403).json({
+        error: {
+          message: "下载链接不属于当前账号",
+          code: "DOWNLOAD_FORBIDDEN",
+        },
+      });
     }
 
     // One-time use reduces accidental link sharing risk while keeping UX fast.
@@ -1914,8 +2320,16 @@ router.get("/download/:token", async (req: Request, res: Response) => {
       data.credentialId,
     );
   } catch (error: any) {
-    console.error("[FrontMind Proxy] Direct token download error:", error.message);
-    res.status(500).json({ error: { message: "下载链接已失效或文件下载失败", code: "DIRECT_DOWNLOAD_ERROR" } });
+    console.error(
+      "[FrontMind Proxy] Direct token download error:",
+      safeErrorForLog(error, { secrets: [logSecret] }),
+    );
+    res.status(500).json({
+      error: {
+        message: "下载链接已失效或文件下载失败",
+        code: "DIRECT_DOWNLOAD_ERROR",
+      },
+    });
   }
 });
 
@@ -1927,8 +2341,8 @@ router.get("/download/:token", async (req: Request, res: Response) => {
  * 3. Streaming binary content with correct headers
  */
 router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
-    const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.params.fileId;
 
     await handleFileDownload(
@@ -1941,7 +2355,10 @@ router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
       req.frontmindCredential?.id,
     );
   } catch (error: any) {
-    console.error("[FrontMind Proxy] File download error:", error.message);
+    console.error(
+      "[FrontMind Proxy] File download error:",
+      safeErrorForLog(error, { secrets: [apiKey] }),
+    );
     res.status(500).json({
       error: {
         message: "文件下载失败，请稍后重试",
@@ -1956,8 +2373,8 @@ router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
  * Handles /v1/files/:fileId/content requests.
  */
 router.get("/v1/files/:fileId/content", async (req: Request, res: Response) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
-    const { apiKey, baseUrl } = getFrontMindCredentials(req);
     const fileId = req.params.fileId;
 
     await handleFileDownload(
@@ -1970,7 +2387,10 @@ router.get("/v1/files/:fileId/content", async (req: Request, res: Response) => {
       req.frontmindCredential?.id,
     );
   } catch (error: any) {
-    console.error("[FrontMind Proxy] File content download error:", error.message);
+    console.error(
+      "[FrontMind Proxy] File content download error:",
+      safeErrorForLog(error, { secrets: [apiKey] }),
+    );
     res.status(500).json({
       error: {
         message: "文件内容下载失败，请稍后重试",
@@ -1980,16 +2400,104 @@ router.get("/v1/files/:fileId/content", async (req: Request, res: Response) => {
   }
 });
 
+router.get("/account-credit-usage", async (req: Request, res: Response) => {
+  if (!req.frontmindUser) {
+    res
+      .status(401)
+      .json({ error: { message: "请先登录", code: "UNAUTHORIZED" } });
+    return;
+  }
+  if (req.frontmindUser.role !== "admin") {
+    res
+      .status(403)
+      .json({ error: { message: "仅管理员可查看积分", code: "FORBIDDEN" } });
+    return;
+  }
+  try {
+    const result = await getAccountMonthlyCreditUsage(req.frontmindUser.id);
+    res.json(result);
+  } catch (error) {
+    console.error(
+      "[FrontMind Proxy] Credit usage error",
+      safeErrorForLog(error, {
+        secrets: [req.frontmindCredential?.apiKey],
+      }),
+    );
+    res.status(503).json({
+      error: {
+        message: "暂时无法读取当前 Key 的积分使用情况",
+        code: "CREDIT_USAGE_UNAVAILABLE",
+      },
+    });
+  }
+});
+
+router.get("/credential-check", async (req: Request, res: Response) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
+  try {
+    const response = await axios.get(
+      `${baseUrl.replace(/\/$/, "")}/v1/tasks?limit=1`,
+      {
+        headers: {
+          API_KEY: apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json",
+        },
+        timeout: 15_000,
+        validateStatus: () => true,
+      },
+    );
+    if (response.status === 401 || response.status === 403) {
+      res.status(401).json({
+        error: { message: "API Key 无效", code: "INVALID_CREDENTIAL" },
+      });
+      return;
+    }
+    if (response.status < 200 || response.status >= 300) {
+      res.status(503).json({
+        error: {
+          message: "上游服务暂时无法验证 API Key",
+          code: "UPSTREAM_UNAVAILABLE",
+        },
+      });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(
+      "[FrontMind Proxy] Credential check error",
+      safeErrorForLog(error, { secrets: [apiKey] }),
+    );
+    res.status(503).json({
+      error: {
+        message: "上游服务暂时无法验证 API Key",
+        code: "UPSTREAM_UNAVAILABLE",
+      },
+    });
+  }
+});
+
 // Proxy all other requests under /api/frontmind/*
 router.all("/*", async (req: Request, res: Response) => {
+  const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
-    const { apiKey, baseUrl } = getFrontMindCredentials(req);
     if (!apiKey) {
-      return res.status(401).json({ error: { message: "Missing API key", code: "MISSING_API_KEY" } });
+      return res.status(401).json({
+        error: { message: "Missing API key", code: "MISSING_API_KEY" },
+      });
     }
 
     // Build the target URL - strip public proxy prefix.
     const targetPath = req.originalUrl.replace(/^\/api\/frontmind/, "");
+    if (isPrivateUpstreamCollectionRequest(req.method, targetPath)) {
+      res.status(403).json({
+        error: {
+          message: "任务与文件目录仅按当前账号的本地记录展示",
+          code: "UPSTREAM_COLLECTION_FORBIDDEN",
+        },
+      });
+      return;
+    }
     const targetUrl = `${baseUrl.replace(/\/$/, "")}${targetPath}`;
 
     console.log(`[FrontMind Proxy] ${req.method} ${targetPath}`);
@@ -2024,9 +2532,13 @@ router.all("/*", async (req: Request, res: Response) => {
       response.data &&
       typeof response.data === "object"
     ) {
-      const resourceId = String(response.data.id || response.data.task_id || "");
-      const isTaskCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/tasks";
-      const isFileCreate = req.method === "POST" && targetPath.split("?")[0] === "/v1/files";
+      const resourceId = String(
+        response.data.id || response.data.task_id || "",
+      );
+      const isTaskCreate =
+        req.method === "POST" && targetPath.split("?")[0] === "/v1/tasks";
+      const isFileCreate =
+        req.method === "POST" && targetPath.split("?")[0] === "/v1/files";
       if (resourceId && (isTaskCreate || isFileCreate)) {
         await recordUpstreamResource({
           userId: req.frontmindUser.id,
@@ -2082,42 +2594,62 @@ router.all("/*", async (req: Request, res: Response) => {
         } catch (error) {
           // Do not block task polling. Opening the PDF retries registration and
           // surfaces a precise error to the current user.
-          console.warn("[PreparedFiles] Auto-registration failed", error);
+          console.warn(
+            "[PreparedFiles] Auto-registration failed",
+            safeErrorForLog(error, { secrets: [apiKey] }),
+          );
         }
       }
     }
 
-    // Enhanced logging
-    if (typeof response.data === 'object' && response.data?.output) {
-      const outputSummary = (response.data.output as any[]).map((item: any, i: number) => 
-        `${i}:${item.type || 'message'}${item.id ? '(' + item.id.slice(0, 8) + ')' : ''}`
-      ).join(', ');
-      console.log(`[FrontMind Proxy] Response: ${response.status} id=${response.data.id?.slice(0, 12)} status=${response.data.status} output=[${response.data.output.length} items: ${outputSummary.slice(0, 300)}]`);
+    const publicResponse =
+      typeof response.data === "object"
+        ? publicUpstreamPayload(response.data, apiKey)
+        : typeof response.data === "string"
+          ? sanitizeText(redactSensitiveText(response.data, [apiKey]))
+          : response.data;
+
+    // Log only an allowlisted summary of the already-redacted public payload.
+    if (
+      publicResponse &&
+      typeof publicResponse === "object" &&
+      !Array.isArray(publicResponse) &&
+      Array.isArray((publicResponse as Record<string, unknown>).output)
+    ) {
+      const publicRecord = publicResponse as Record<string, any>;
+      const outputSummary = (publicRecord.output as any[])
+        .map(
+          (item: any, i: number) =>
+            `${i}:${item.type || "message"}${item.id ? "(" + item.id.slice(0, 8) + ")" : ""}`,
+        )
+        .join(", ");
+      console.log(
+        `[FrontMind Proxy] Response: ${response.status} id=${String(publicRecord.id || "").slice(0, 12)} status=${String(publicRecord.status || "")} output=[${publicRecord.output.length} items: ${outputSummary.slice(0, 300)}]`,
+      );
     } else {
-      console.log(`[FrontMind Proxy] Response: ${response.status}`, typeof response.data === 'object' ? JSON.stringify(response.data).slice(0, 200) : '');
+      console.log(`[FrontMind Proxy] Response: ${response.status}`);
     }
 
     // Forward status and response
     res.status(response.status);
 
     // Forward relevant headers
-    if (response.headers["content-type"]) {
-      res.setHeader("content-type", response.headers["content-type"]);
-    }
+    const contentType = responseHeaderValue(response.headers["content-type"]);
+    if (contentType) res.setHeader("content-type", contentType);
 
     // Send the response data - with deep sanitization for JSON responses
-    if (typeof response.data === "object") {
-      // Deep-sanitize all string fields in the JSON response
-      const sanitized = deepSanitizeJson(response.data);
-      res.json(sanitized);
-    } else if (typeof response.data === "string") {
-      // Sanitize plain text responses
-      res.send(sanitizeText(response.data));
+    if (typeof publicResponse === "object") {
+      res.json(publicResponse);
+    } else if (typeof publicResponse === "string") {
+      res.send(publicResponse);
     } else {
-      res.send(response.data);
+      res.send(publicResponse);
     }
   } catch (error: any) {
-    console.error("[FrontMind Proxy] Error:", error.message);
+    console.error(
+      "[FrontMind Proxy] Error:",
+      safeErrorForLog(error, { secrets: [apiKey] }),
+    );
 
     if (error.code === "ECONNREFUSED" || error.code === "ENOTFOUND") {
       res.status(502).json({

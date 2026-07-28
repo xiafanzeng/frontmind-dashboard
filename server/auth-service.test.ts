@@ -7,6 +7,9 @@ import {
 } from "../drizzle/schema";
 import {
   AuthServiceError,
+  assertAdminHasNoHistoricalCredentialResources,
+  assertAdminHasNoUsageOwnedUsers,
+  credentialsUseSameUpstreamApiKey,
   deleteManagedUser,
   decryptApiKey,
   encryptApiKey,
@@ -33,11 +36,13 @@ describe("password authentication primitives", () => {
     expect(first).not.toBe(second);
     expect(first).not.toContain("a sufficiently long password");
     await expect(
-      verifyPassword("a sufficiently long password", first)
+      verifyPassword("a sufficiently long password", first),
     ).resolves.toBe(true);
-    await expect(verifyPassword("the wrong password", first)).resolves.toBe(false);
+    await expect(verifyPassword("the wrong password", first)).resolves.toBe(
+      false,
+    );
     await expect(verifyPassword("anything", "not-a-valid-hash")).resolves.toBe(
-      false
+      false,
     );
   });
 
@@ -69,13 +74,49 @@ describe("managed account deletion", () => {
       code: "CONFLICT",
     });
   });
+
+  it.each([
+    ["deactivate", "停用管理员"],
+    ["delete", "删除管理员"],
+  ] as const)(
+    "requires usage ownership transfer before attempting to %s a delivery administrator",
+    (mutation, actionLabel) => {
+      expect(() =>
+        assertAdminHasNoUsageOwnedUsers({
+          ownedUserCount: 1,
+          mutation,
+        }),
+      ).toThrowError(
+        `该交付管理员仍负责用户，请先转移这些用户的 Key 与积分归属，再${actionLabel}`,
+      );
+    },
+  );
+
+  it("allows administrator lifecycle changes after all usage ownership is transferred", () => {
+    expect(() =>
+      assertAdminHasNoUsageOwnedUsers({
+        ownedUserCount: 0,
+        mutation: "deactivate",
+      }),
+    ).not.toThrow();
+  });
+
+  it("preserves customer task history when an old administrator Key is still referenced", () => {
+    expect(() =>
+      assertAdminHasNoHistoricalCredentialResources(1),
+    ).toThrowError(
+      "该管理员的历史 Key 仍关联客户任务或文件，不能永久删除；可以停用账号并保留历史成果",
+    );
+    expect(() =>
+      assertAdminHasNoHistoricalCredentialResources(0),
+    ).not.toThrow();
+  });
 });
 
 describe("API credential encryption", () => {
   beforeEach(() => {
-    process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY = randomBytes(32).toString(
-      "base64"
-    );
+    process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY =
+      randomBytes(32).toString("base64");
   });
 
   afterEach(() => {
@@ -97,7 +138,7 @@ describe("API credential encryption", () => {
         id: credentialId,
         userId: 42,
         ...encrypted,
-      })
+      }),
     ).toBe(apiKey);
   });
 
@@ -106,10 +147,10 @@ describe("API credential encryption", () => {
     const encrypted = encryptApiKey(42, credentialId, "sk-test-secret");
 
     expect(() =>
-      decryptApiKey({ id: credentialId, userId: 43, ...encrypted })
+      decryptApiKey({ id: credentialId, userId: 43, ...encrypted }),
     ).toThrowError(AuthServiceError);
     expect(() =>
-      decryptApiKey({ id: randomUUID(), userId: 42, ...encrypted })
+      decryptApiKey({ id: randomUUID(), userId: 42, ...encrypted }),
     ).toThrowError(AuthServiceError);
   });
 
@@ -122,15 +163,57 @@ describe("API credential encryption", () => {
     expect(getApiKeyFingerprint(`${apiKey}x`)).not.toBe(fingerprint);
   });
 
+  it("recognizes the same upstream key across separate account credentials", () => {
+    const apiKey = "sk-shared-across-frontmind-accounts";
+    const fingerprint = getApiKeyFingerprint(apiKey);
+    const firstId = randomUUID();
+    const secondId = randomUUID();
+    const firstEncrypted = encryptApiKey(11, firstId, apiKey);
+    const secondEncrypted = encryptApiKey(12, secondId, apiKey);
+    expect(firstEncrypted.encryptedKey).not.toBe(secondEncrypted.encryptedKey);
+    const firstDecrypted = decryptApiKey({
+      id: firstId,
+      userId: 11,
+      ...firstEncrypted,
+    });
+    const secondDecrypted = decryptApiKey({
+      id: secondId,
+      userId: 12,
+      ...secondEncrypted,
+    });
+
+    expect(
+      credentialsUseSameUpstreamApiKey(
+        { apiKey: firstDecrypted, fingerprint },
+        { apiKey: secondDecrypted, fingerprint },
+      ),
+    ).toBe(true);
+    expect(
+      credentialsUseSameUpstreamApiKey(
+        { apiKey, fingerprint },
+        { apiKey: `${apiKey}-different`, fingerprint },
+      ),
+    ).toBe(false);
+    expect(
+      credentialsUseSameUpstreamApiKey(
+        { apiKey, fingerprint },
+        {
+          apiKey: `${apiKey}-different`,
+          fingerprint: getApiKeyFingerprint(`${apiKey}-different`),
+        },
+      ),
+    ).toBe(false);
+  });
+
   it("fails closed when the encryption key is missing or malformed", () => {
     delete process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY;
     expect(() => encryptApiKey(1, randomUUID(), "sk-test-secret")).toThrowError(
-      AuthServiceError
+      AuthServiceError,
     );
 
     process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY = "too-short";
     expect(() => encryptApiKey(1, randomUUID(), "sk-test-secret")).toThrowError(
-      AuthServiceError
+      AuthServiceError,
     );
   });
 });

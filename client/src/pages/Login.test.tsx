@@ -49,11 +49,9 @@ describe("Login", () => {
       screen.queryByText("体验论文级内容与科研级审美标准"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByText("香港中文大学（深圳）AI智能决策实验室"),
+      screen.getByText("FrontMind 企业级 GEO 服务平台"),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("img", { name: "香港中文大学（深圳）校徽" }),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/香港中文大学/)).not.toBeInTheDocument();
     expect(screen.getByTestId("presales-login-hint")).toHaveTextContent(
       "请返回官网完成售前流程，使用售前分配的账号登录。",
     );

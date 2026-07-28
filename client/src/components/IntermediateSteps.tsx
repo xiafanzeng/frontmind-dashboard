@@ -17,7 +17,10 @@ import {
   Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { StepGroup, IntermediateStep } from "@/contexts/ConversationContext";
+import type {
+  StepGroup,
+  IntermediateStep,
+} from "@/contexts/ConversationContext";
 import { getStepIconType } from "@/contexts/ConversationContext";
 
 /**
@@ -69,7 +72,13 @@ function getStepColor(type: string): string {
 /**
  * Single step item display
  */
-function StepItem({ step, isLast }: { step: IntermediateStep; isLast?: boolean }) {
+function StepItem({
+  step,
+  isLast,
+}: {
+  step: IntermediateStep;
+  isLast?: boolean;
+}) {
   const color = getStepColor(step.type);
 
   return (
@@ -82,7 +91,7 @@ function StepItem({ step, isLast }: { step: IntermediateStep; isLast?: boolean }
           {step.label}
         </p>
         {step.description && (
-          <p className="text-[11px] text-muted-foreground/50 mt-0.5 line-clamp-2">
+          <p className="text-xs text-muted-foreground/50 mt-0.5 line-clamp-2">
             {step.description}
           </p>
         )}
@@ -94,7 +103,13 @@ function StepItem({ step, isLast }: { step: IntermediateStep; isLast?: boolean }
 /**
  * A collapsible group of intermediate steps
  */
-function StepGroupItem({ group, isCompleted }: { group: StepGroup; isCompleted: boolean }) {
+function StepGroupItem({
+  group,
+  isCompleted,
+}: {
+  group: StepGroup;
+  isCompleted: boolean;
+}) {
   const [isOpen, setIsOpen] = useState(false);
 
   // Determine the primary icon type from the first step
@@ -115,9 +130,7 @@ function StepGroupItem({ group, isCompleted }: { group: StepGroup; isCompleted: 
         <div
           className={cn(
             "w-[22px] h-[22px] rounded-full flex items-center justify-center flex-shrink-0 border-2 bg-background",
-            isCompleted
-              ? "border-emerald-400"
-              : "border-blue-400"
+            isCompleted ? "border-emerald-400" : "border-blue-400",
           )}
         >
           {isCompleted ? (
@@ -134,13 +147,13 @@ function StepGroupItem({ group, isCompleted }: { group: StepGroup; isCompleted: 
 
         {/* Step count and chevron */}
         <div className="flex items-center gap-1.5 pr-1">
-          <span className="text-[10px] text-muted-foreground/50">
+          <span className="text-xs text-muted-foreground/50">
             {group.steps.length}
           </span>
           <ChevronDown
             className={cn(
               "w-3.5 h-3.5 text-muted-foreground/40 transition-transform duration-200",
-              isOpen && "rotate-180"
+              isOpen && "rotate-180",
             )}
           />
         </div>
@@ -159,7 +172,7 @@ function StepGroupItem({ group, isCompleted }: { group: StepGroup; isCompleted: 
             <div className="ml-[22px] pl-2 border-l border-border/30">
               {/* Description text if available */}
               {group.description && (
-                <p className="text-[11px] text-muted-foreground/60 py-1.5 pl-2 leading-relaxed">
+                <p className="text-xs text-muted-foreground/60 py-1.5 pl-2 leading-relaxed">
                   {group.description}
                 </p>
               )}

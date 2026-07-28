@@ -13,7 +13,12 @@ import {
 } from "@/components/ui/tooltip";
 import { useSendMessage } from "@/hooks/useSendMessage";
 import { useConversation } from "@/contexts/ConversationContext";
-import { MODEL_OPTIONS, getConfig, saveConfig } from "@/lib/frontmind-api";
+import {
+  MODEL_OPTIONS,
+  getConfig,
+  saveConfig,
+  type ResponseLogicTaskContext,
+} from "@/lib/frontmind-api";
 import { Progress } from "@/components/ui/progress";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -32,7 +37,17 @@ interface FilePreview {
   id: string;
 }
 
-export default function ChatInput() {
+export default function ChatInput({
+  fixedAgentProfile,
+  syncKnowledgeBaseSnapshot = false,
+  composerPrefill,
+  responseLogicContext,
+}: {
+  fixedAgentProfile?: string;
+  syncKnowledgeBaseSnapshot?: boolean;
+  composerPrefill?: string;
+  responseLogicContext?: ResponseLogicTaskContext;
+}) {
   const [text, setText] = useState("");
   const [files, setFiles] = useState<FilePreview[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -46,9 +61,18 @@ export default function ChatInput() {
 
   // Per-message model selection - default from config
   const [selectedModel, setSelectedModel] = useState(() => {
+    if (fixedAgentProfile) return fixedAgentProfile;
     const config = getConfig();
     return config.agentProfile || "frontmind-pro";
   });
+
+  useEffect(() => {
+    if (fixedAgentProfile) setSelectedModel(fixedAgentProfile);
+  }, [fixedAgentProfile]);
+
+  useEffect(() => {
+    if (composerPrefill) setText(composerPrefill);
+  }, [composerPrefill]);
 
   const { sendMessage, uploadProgress: rawUploadProgress } = useSendMessage();
   const { activeConversation } = useConversation();
@@ -60,7 +84,11 @@ export default function ChatInput() {
       ? rawUploadProgress
       : null;
 
-  const isRunning = activeConversation?.status === "running";
+  const isRunning =
+    activeConversation?.status === "running" ||
+    activeConversation?.status === "pending";
+  const knowledgeBaseNotStarted =
+    syncKnowledgeBaseSnapshot && !activeConversation?.taskId;
 
   const clearSelectedFiles = useCallback(() => {
     setFiles([]);
@@ -97,7 +125,13 @@ export default function ChatInput() {
   }, []);
 
   const handleSubmit = useCallback(async () => {
-    if ((!text.trim() && files.length === 0) || isSending || isRunning) return;
+    if (
+      (!text.trim() && files.length === 0) ||
+      isSending ||
+      isRunning ||
+      knowledgeBaseNotStarted
+    )
+      return;
 
     // Synchronous lock: immediately block subsequent calls before async state updates
     if (sendLockRef.current) return;
@@ -108,7 +142,11 @@ export default function ChatInput() {
       await sendMessage(
         text,
         files.map((f) => f.file),
-        { agentProfile: selectedModel },
+        {
+          agentProfile: fixedAgentProfile || selectedModel,
+          syncKnowledgeBaseSnapshot,
+          responseLogicContext,
+        },
       );
       setText("");
       clearSelectedFiles();
@@ -122,8 +160,12 @@ export default function ChatInput() {
     files,
     isSending,
     isRunning,
+    knowledgeBaseNotStarted,
     sendMessage,
     selectedModel,
+    fixedAgentProfile,
+    syncKnowledgeBaseSnapshot,
+    responseLogicContext,
     clearSelectedFiles,
   ]);
 
@@ -283,7 +325,9 @@ export default function ChatInput() {
                     size="icon"
                     className="w-9 h-9 rounded-xl text-muted-foreground hover:text-foreground hover:bg-secondary"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={isRunning || isUploading}
+                    disabled={
+                      isRunning || isUploading || knowledgeBaseNotStarted
+                    }
                   >
                     <Paperclip className="w-4 h-4" />
                   </Button>
@@ -303,9 +347,11 @@ export default function ChatInput() {
                   ? `正在上传文件 ${uploadProgress!.overallPercent}%...`
                   : isRunning
                     ? "FrontMind 正在编排内容制作流程..."
-                    : "输入你的内容需求，按 Enter 开始编排..."
+                    : knowledgeBaseNotStarted
+                      ? "请先点击上方“构建企业知识库”完成资料采集设置"
+                      : "输入你的内容需求，按 Enter 开始编排..."
               }
-              disabled={isRunning || isUploading}
+              disabled={isRunning || isUploading || knowledgeBaseNotStarted}
               rows={2}
               className="h-11 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground/55 focus:outline-none"
             />
@@ -314,70 +360,76 @@ export default function ChatInput() {
             <div className="flex items-center gap-1 pb-0.5">
               {/* Model selector dropdown */}
               <div className="relative" ref={modelMenuRef}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      onClick={() => setModelMenuOpen(!modelMenuOpen)}
-                      className={cn(
-                        "flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-[11px] font-medium transition-all",
-                        "bg-secondary/80 text-muted-foreground hover:bg-primary/10 hover:text-primary",
-                        modelMenuOpen && "bg-primary/10 text-primary",
-                      )}
-                    >
-                      <span className="truncate max-w-[76px] sm:max-w-[148px]">
-                        {currentModelInfo.label}
-                      </span>
-                      <ChevronDown
-                        className={cn(
-                          "w-3 h-3 transition-transform",
-                          modelMenuOpen && "rotate-180",
-                        )}
-                      />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent>选择模型</TooltipContent>
-                </Tooltip>
-
-                {/* Dropdown menu */}
-                <AnimatePresence>
-                  {modelMenuOpen && (
-                    <motion.div
-                      initial={{ opacity: 0, y: 4, scale: 0.95 }}
-                      animate={{ opacity: 1, y: 0, scale: 1 }}
-                      exit={{ opacity: 0, y: 4, scale: 0.95 }}
-                      transition={{ duration: 0.15 }}
-                      className="absolute bottom-full mb-1 right-0 w-52 rounded-xl border border-border/40 bg-popover shadow-lg z-50 overflow-hidden"
-                    >
-                      {MODEL_OPTIONS.map((model) => (
+                {fixedAgentProfile ? null : (
+                  <>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
                         <button
-                          key={model.value}
-                          onClick={() => {
-                            setSelectedModel(model.value);
-                            saveConfig({ agentProfile: model.value });
-                            setModelMenuOpen(false);
-                          }}
+                          type="button"
+                          onClick={() => setModelMenuOpen(!modelMenuOpen)}
                           className={cn(
-                            "w-full text-left px-3 py-2.5 flex items-center justify-between transition-colors",
-                            selectedModel === model.value
-                              ? "bg-primary/10 text-primary"
-                              : "hover:bg-muted/60 text-foreground",
+                            "flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-medium transition-all",
+                            "bg-secondary/80 text-muted-foreground hover:bg-primary/10 hover:text-primary",
+                            modelMenuOpen && "bg-primary/10 text-primary",
                           )}
                         >
-                          <div>
-                            <p className="text-sm font-medium">{model.label}</p>
-                            <p className="text-[10px] text-muted-foreground">
-                              {model.description}
-                            </p>
-                          </div>
-                          {selectedModel === model.value && (
-                            <div className="w-2 h-2 rounded-full bg-primary flex-shrink-0" />
-                          )}
+                          <span className="truncate max-w-[76px] sm:max-w-[148px]">
+                            {currentModelInfo.label}
+                          </span>
+                          <ChevronDown
+                            className={cn(
+                              "w-3 h-3 transition-transform",
+                              modelMenuOpen && "rotate-180",
+                            )}
+                          />
                         </button>
-                      ))}
-                    </motion.div>
-                  )}
-                </AnimatePresence>
+                      </TooltipTrigger>
+                      <TooltipContent>选择模型</TooltipContent>
+                    </Tooltip>
+
+                    {/* Dropdown menu */}
+                    <AnimatePresence>
+                      {modelMenuOpen && (
+                        <motion.div
+                          initial={{ opacity: 0, y: 4, scale: 0.95 }}
+                          animate={{ opacity: 1, y: 0, scale: 1 }}
+                          exit={{ opacity: 0, y: 4, scale: 0.95 }}
+                          transition={{ duration: 0.15 }}
+                          className="absolute bottom-full mb-1 right-0 w-52 rounded-xl border border-border/40 bg-popover shadow-lg z-50 overflow-hidden"
+                        >
+                          {MODEL_OPTIONS.map((model) => (
+                            <button
+                              key={model.value}
+                              onClick={() => {
+                                setSelectedModel(model.value);
+                                saveConfig({ agentProfile: model.value });
+                                setModelMenuOpen(false);
+                              }}
+                              className={cn(
+                                "w-full text-left px-3 py-2.5 flex items-center justify-between transition-colors",
+                                selectedModel === model.value
+                                  ? "bg-primary/10 text-primary"
+                                  : "hover:bg-muted/60 text-foreground",
+                              )}
+                            >
+                              <div>
+                                <p className="text-sm font-medium">
+                                  {model.label}
+                                </p>
+                                <p className="text-xs text-muted-foreground">
+                                  {model.description}
+                                </p>
+                              </div>
+                              {selectedModel === model.value && (
+                                <div className="w-2 h-2 rounded-full bg-primary flex-shrink-0" />
+                              )}
+                            </button>
+                          ))}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </>
+                )}
               </div>
 
               {/* Send button */}
@@ -387,7 +439,8 @@ export default function ChatInput() {
                   (!text.trim() && files.length === 0) ||
                   isSending ||
                   isRunning ||
-                  isUploading
+                  isUploading ||
+                  knowledgeBaseNotStarted
                 }
                 size="icon"
                 className={cn(
@@ -408,7 +461,7 @@ export default function ChatInput() {
 
           {/* Hint text */}
           <div className="px-4 pb-2">
-            <p className="text-[10px] text-muted-foreground/40">
+            <p className="text-xs text-muted-foreground/40">
               Enter 发送 · Shift+Enter 换行 · 支持资料、图片与交付文件上传
             </p>
           </div>

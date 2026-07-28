@@ -112,6 +112,7 @@ async function main() {
     password,
     displayName: displayName.trim() || null,
     role: "admin",
+    adminAccessLevel: "system_admin",
   });
   console.log(`管理员已创建：${user.username}（ID ${user.id}）`);
 }

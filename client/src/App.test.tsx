@@ -16,7 +16,31 @@ vi.mock("@/pages/Login", () => ({
   default: () => <div>LOGIN_REQUIRED</div>,
 }));
 
-import { AuthBoundary } from "./App";
+import { AuthBoundary, canAccessAdminRoutes } from "./App";
+
+describe("administrator route access", () => {
+  it("allows both system and delivery administrators into shared admin routes", () => {
+    expect(
+      canAccessAdminRoutes({
+        role: "admin",
+        adminAccessLevel: "system_admin",
+      }),
+    ).toBe(true);
+    expect(
+      canAccessAdminRoutes({
+        role: "admin",
+        adminAccessLevel: "delivery_admin",
+      }),
+    ).toBe(true);
+    expect(
+      canAccessAdminRoutes({
+        role: "admin",
+        adminAccessLevel: null,
+      }),
+    ).toBe(false);
+    expect(canAccessAdminRoutes({ role: "user" })).toBe(false);
+  });
+});
 
 describe("AuthBoundary", () => {
   beforeEach(() => {

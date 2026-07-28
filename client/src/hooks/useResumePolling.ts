@@ -25,6 +25,11 @@ import {
   type Conversation,
 } from "@/contexts/ConversationContext";
 import { retrieveTask, creditEventBus } from "@/lib/frontmind-api";
+import {
+  fetchKnowledgeBaseProgress,
+  reconcileKnowledgeBaseProgress,
+} from "@/lib/knowledge-progress";
+import { sliceNewOutput } from "@/hooks/useSendMessage";
 import { toast } from "sonner";
 
 const RESUME_POLL_INTERVAL = 4000; // 4 seconds between resume polls
@@ -51,11 +56,10 @@ async function checkAndUpdateTask(
     // Parse and update output messages
     const baselineOutputLength = conv.lastKnownOutputLength || 0;
     if (taskData.output && taskData.output.length > 0) {
-      const newOutput =
-        baselineOutputLength > 0 &&
-        baselineOutputLength < taskData.output.length
-          ? taskData.output.slice(baselineOutputLength)
-          : taskData.output;
+      const newOutput = sliceNewOutput(
+        taskData.output,
+        baselineOutputLength,
+      );
 
       if (newOutput.length > 0) {
         try {
@@ -83,6 +87,15 @@ async function checkAndUpdateTask(
     if (normalizedStatus === "completed") {
       const completedAt = Date.now();
       const totalOutputLength = taskData.output?.length || 0;
+      try {
+        await reconcileKnowledgeBaseProgress({
+          conversationId: conv.id,
+          taskId: taskData.id,
+        });
+      } catch {
+        // Most conversations are not knowledge-base builds. The dedicated
+        // endpoint validates the task/build binding before changing progress.
+      }
       updateStatus(conv.id, "completed", {
         completedAt,
         lastKnownOutputLength: totalOutputLength,
@@ -129,7 +142,7 @@ async function checkAndUpdateTask(
 export function useResumePolling() {
   const { state, hydrated, updateStatus, updateAssistantMessages } =
     useConversation();
-  const resumeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const resumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resumeStartedAtRef = useRef<number>(0);
   const isResumingRef = useRef(false);
   const hydratedRef = useRef(hydrated);
@@ -138,14 +151,25 @@ export function useResumePolling() {
   // Use refs for latest state to avoid stale closures
   const stateRef = useRef(state);
   stateRef.current = state;
+  const resumableTaskKey = state.conversations
+    .filter(
+      (conversation) =>
+        (conversation.status === "running" ||
+          conversation.status === "pending") &&
+        conversation.taskId,
+    )
+    .map((conversation) => `${conversation.id}:${conversation.taskId}`)
+    .sort()
+    .join("|");
   const updateStatusRef = useRef(updateStatus);
   updateStatusRef.current = updateStatus;
   const updateAssistantMessagesRef = useRef(updateAssistantMessages);
   updateAssistantMessagesRef.current = updateAssistantMessages;
+  const recoveredCompletedTasksRef = useRef(new Set<string>());
 
   const stopResumePolling = useCallback(() => {
     if (resumeTimerRef.current) {
-      clearInterval(resumeTimerRef.current);
+      clearTimeout(resumeTimerRef.current);
       resumeTimerRef.current = null;
     }
     isResumingRef.current = false;
@@ -219,20 +243,23 @@ export function useResumePolling() {
         stillRunning.delete(id);
       }
 
-      // If all done, stop polling
+      // If all done, stop polling. Otherwise schedule the next check only
+      // after every request in this pass has settled, avoiding overlaps.
       if (stillRunning.size === 0) {
         console.log(
           "[ResumePolling] All running tasks resolved, stopping resume polling",
         );
         stopResumePolling();
+      } else if (isResumingRef.current) {
+        resumeTimerRef.current = setTimeout(
+          pollOnce,
+          RESUME_POLL_INTERVAL,
+        );
       }
     };
 
     // Do an immediate check
-    pollOnce();
-
-    // Then set up interval
-    resumeTimerRef.current = setInterval(pollOnce, RESUME_POLL_INTERVAL);
+    void pollOnce();
   }, [stopResumePolling]);
 
   // Start only after this account's cloud conversations have hydrated. This
@@ -244,15 +271,63 @@ export function useResumePolling() {
       return;
     }
 
+    // A task creation request can be interrupted before an upstream task ID is
+    // persisted. Such a conversation cannot be resumed and must not keep the
+    // customer input locked indefinitely.
+    for (const conversation of stateRef.current.conversations) {
+      if (
+        (conversation.status === "running" ||
+          conversation.status === "pending") &&
+        !conversation.taskId
+      ) {
+        updateStatusRef.current(conversation.id, "error", {
+          completedAt: Date.now(),
+        });
+      }
+    }
+
     const timer = setTimeout(() => {
       startResumePolling();
     }, 1000);
     return () => {
       clearTimeout(timer);
     };
-  }, [hydrated, startResumePolling, stopResumePolling]);
+  }, [
+    hydrated,
+    resumableTaskKey,
+    startResumePolling,
+    stopResumePolling,
+  ]);
 
   useEffect(() => stopResumePolling, [stopResumePolling]);
+
+  // A task may finish while its final progress reconciliation is interrupted.
+  // Completed knowledge-base conversations are checked once after hydration so
+  // the server-side output ledger can safely catch up after a refresh.
+  useEffect(() => {
+    if (!hydrated) {
+      recoveredCompletedTasksRef.current.clear();
+      return;
+    }
+    for (const conversation of state.conversations) {
+      if (conversation.status !== "completed" || !conversation.taskId) continue;
+      const key = `${conversation.id}:${conversation.taskId}`;
+      if (recoveredCompletedTasksRef.current.has(key)) continue;
+      recoveredCompletedTasksRef.current.add(key);
+      void (async () => {
+        try {
+          const progress = await fetchKnowledgeBaseProgress(conversation.id);
+          if (!progress) return;
+          await reconcileKnowledgeBaseProgress({
+            conversationId: conversation.id,
+            taskId: conversation.taskId,
+          });
+        } catch {
+          recoveredCompletedTasksRef.current.delete(key);
+        }
+      })();
+    }
+  }, [hydrated, state.conversations]);
 
   // On visibility change: resume polling when tab becomes visible
   useEffect(() => {
