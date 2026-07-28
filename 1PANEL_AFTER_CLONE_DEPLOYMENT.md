@@ -694,6 +694,12 @@ set -eu
 cd /app
 test "$(find drizzle -maxdepth 1 -type f -name "*.sql" | wc -l)" -eq 35
 test -f drizzle/0034_known_scarlet_spider.sql
+grep -F \
+  "\`createdAt\` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)" \
+  drizzle/0031_payment_receipt_ledger.sql >/dev/null
+grep -F \
+  "\`updatedAt\` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)" \
+  drizzle/0032_project_order_registry.sql >/dev/null
 '
 
 docker exec frontmind-dashboard node -e '
@@ -704,8 +710,14 @@ console.log("MIGRATION_SOURCE_OK count=35 latest=0034_known_scarlet_spider");
 '
 ```
 
+如果已经用较早提交尝试过迁移，即使只完成了 `0000`–`0031`，也不能把这份部分迁移库当成
+最终验收库继续使用。上线前代码已修正 `0031`、`0032` 的 MySQL 8.4 毫秒时间定义，
+已落账的旧 SQL 哈希与最终迁移源不同。确认仍无任何新业务数据后，应在 1Panel 中只对
+精确目标 `frontmind_dashboard` 和它的专用数据库用户执行删除与重建，再从真正零表状态
+一次执行全部 35 个迁移；不得影响任何其他数据库或用户。
+
 然后通过 Dashboard 容器实际持有的 `DATABASE_URL` 连接数据库，但不打印 URL 或密码。
-必须同时确认数据库名、新用户主体和零表：
+必须同时确认数据库名、新用户主体、MySQL 版本、二进制日志策略和零表：
 
 ```bash
 docker exec frontmind-dashboard node --input-type=module -e '
@@ -729,7 +741,13 @@ try {
   }
   connection = await mysql.createConnection(raw);
   const [[identity]] = await connection.query(
-    "SELECT DATABASE() AS db, CURRENT_USER() AS principal",
+    `SELECT
+       DATABASE() AS db,
+       CURRENT_USER() AS principal,
+       VERSION() AS engine_version,
+       @@version_comment AS version_comment,
+       @@GLOBAL.log_bin AS log_bin,
+       @@GLOBAL.log_bin_trust_function_creators AS trigger_trust`,
   );
   const [[tables]] = await connection.query(
     "SELECT COUNT(*) AS table_count FROM information_schema.tables WHERE table_schema = DATABASE()",
@@ -740,10 +758,27 @@ try {
   if (!String(identity.principal).startsWith("frontmind_dashboard@")) {
     throw new Error();
   }
+  const version = String(identity.engine_version).match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (
+    !version ||
+    Number(version[1]) !== 8 ||
+    Number(version[2]) < 4 ||
+    !String(identity.version_comment).includes("MySQL")
+  ) {
+    throw new Error();
+  }
   if (Number(tables.table_count) !== 0) {
     throw new Error();
   }
-  console.log(`EMPTY_DATABASE_TARGET_OK ${identity.db} ${identity.principal}`);
+  console.log(JSON.stringify({
+    status: "EMPTY_DATABASE_TARGET_OK",
+    db: identity.db,
+    principal: identity.principal,
+    engine_version: identity.engine_version,
+    log_bin: Number(identity.log_bin),
+    trigger_trust: Number(identity.trigger_trust),
+    table_count: Number(tables.table_count),
+  }, null, 2));
 } catch {
   console.error("EMPTY_DATABASE_CHECK_FAILED");
   process.exitCode = 1;
@@ -753,7 +788,18 @@ try {
 '
 ```
 
-只有出现 `MIGRATION_SOURCE_OK` 和 `EMPTY_DATABASE_TARGET_OK` 后才执行：
+迁移 `0031_payment_receipt_ledger` 会创建两个不可变账本触发器。如果上述结果同时显示
+`log_bin: 1` 和 `trigger_trust: 0`，Dashboard 专用数据库用户不应被授予 `SUPER` 或
+`SYSTEM_VARIABLES_ADMIN`。改用 1Panel 的 MySQL 管理终端，以数据库管理员身份临时执行：
+
+```sql
+SET GLOBAL log_bin_trust_function_creators = 1;
+SELECT @@GLOBAL.log_bin_trust_function_creators AS trigger_trust;
+```
+
+必须看到 `trigger_trust = 1`。这里只允许 `SET GLOBAL`，禁止 `SET PERSIST`；此窗口只覆盖
+这一次空库迁移。只有出现 `MIGRATION_SOURCE_OK`、`EMPTY_DATABASE_TARGET_OK`，并且
+触发器策略满足 `log_bin = 0` 或 `trigger_trust = 1` 后，才执行唯一一次：
 
 ```bash
 docker exec -it frontmind-dashboard sh -lc '
@@ -770,12 +816,20 @@ pnpm db:push
 pnpm db:generate
 ```
 
-如果迁移命令非零退出，立即停止，不要直接重跑。MySQL DDL 可能已经部分提交；在仍无新
-业务写入时，只能先审计新库状态，必要时精确重建 Dashboard 自己的新空库后从 `0000`
-重新执行，绝不能使用 `db:push` 或 `db:generate` 修补。
+无论迁移成功还是失败，命令返回后第一件事都是回到 1Panel 的 MySQL 管理终端恢复：
+
+```sql
+SET GLOBAL log_bin_trust_function_creators = 0;
+SELECT @@GLOBAL.log_bin_trust_function_creators AS trigger_trust;
+```
+
+必须看到 `trigger_trust = 0`，然后才能继续审计或启动服务。如果迁移命令非零退出，立即
+停止，不要直接重跑。MySQL DDL 可能已经部分提交；在仍无新业务写入时，只能先审计新库
+状态，必要时精确重建 Dashboard 自己的新空库后从 `0000` 重新执行，绝不能使用
+`db:push` 或 `db:generate` 修补。
 
 迁移成功后，将数据库账本的 35 行按 `created_at` 与 journal 时间戳、SQL SHA-256
-逐项核对：
+逐项核对，并确认毫秒精度、自动更新时间和触发器策略都符合最终定义：
 
 ```bash
 docker exec frontmind-dashboard node --input-type=module -e '
@@ -798,6 +852,51 @@ try {
     ) {
       throw new Error();
     }
+  }
+  const [[runtime]] = await connection.query(`
+    SELECT
+      @@GLOBAL.log_bin_trust_function_creators AS trigger_trust,
+      (
+        SELECT COUNT(*)
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+      ) AS table_count,
+      (
+        SELECT COUNT(*)
+        FROM information_schema.TRIGGERS
+        WHERE TRIGGER_SCHEMA = DATABASE()
+          AND TRIGGER_NAME IN (
+            "website_payment_receipts_no_update",
+            "website_payment_receipts_no_delete"
+          )
+      ) AS trigger_count,
+      (
+        SELECT COUNT(*)
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = "website_project_orders"
+          AND COLUMN_NAME IN ("createdAt", "updatedAt")
+          AND DATETIME_PRECISION = 3
+          AND COLUMN_DEFAULT = "current_timestamp(3)"
+      ) AS fractional_default_count,
+      (
+        SELECT EXTRA
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = "website_project_orders"
+          AND COLUMN_NAME = "updatedAt"
+      ) AS updated_at_extra
+  `);
+  if (
+    Number(runtime.trigger_trust) !== 0 ||
+    Number(runtime.table_count) !== 48 ||
+    Number(runtime.trigger_count) !== 2 ||
+    Number(runtime.fractional_default_count) !== 2 ||
+    !String(runtime.updated_at_extra)
+      .toLowerCase()
+      .includes("on update current_timestamp(3)")
+  ) {
+    throw new Error();
   }
   console.log(
     "MIGRATIONS_VERIFIED count=35 latest=0034_known_scarlet_spider",

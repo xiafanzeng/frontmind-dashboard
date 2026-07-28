@@ -1,7 +1,13 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { MySqlDialect } from "drizzle-orm/mysql-core";
 import { describe, expect, it } from "vitest";
+
+import {
+  websitePaymentReceipts,
+  websiteProjectOrders,
+} from "../drizzle/schema";
 
 const drizzleRoot = path.resolve(process.cwd(), "drizzle");
 
@@ -109,6 +115,88 @@ describe("service portal migration chain", () => {
           Buffer.byteLength(match[1], "utf8"),
           `${entry.tag}: ${match[1]}`,
         ).toBeLessThanOrEqual(64);
+      }
+    }
+  });
+
+  it("keeps automatic timestamp precision aligned for MySQL 8.4", async () => {
+    const journal = JSON.parse(
+      await readFile(path.join(drizzleRoot, "meta", "_journal.json"), "utf8"),
+    ) as { entries: Array<{ tag: string }> };
+
+    for (const entry of journal.entries) {
+      const migrationSql = await migration(`${entry.tag}.sql`);
+      for (const definition of migrationSql.matchAll(
+        /`([^`]+)`\s+(?:timestamp|datetime)\((\d)\)[^\n]*/gi,
+      )) {
+        const [, columnName, precision] = definition;
+        for (const automaticValue of definition[0].matchAll(
+          /\b(?:CURRENT_TIMESTAMP|LOCALTIMESTAMP|LOCALTIME|NOW)\s*(?:\(\s*(\d*)\s*\))?/gi,
+        )) {
+          expect(
+            automaticValue[1],
+            `${entry.tag}.${columnName}: ${definition[0]}`,
+          ).toBe(precision);
+        }
+      }
+    }
+  });
+
+  it("keeps the fractional defaults and snapshots aligned with the schema", async () => {
+    const dialect = new MySqlDialect();
+    for (const column of [
+      websitePaymentReceipts.createdAt,
+      websiteProjectOrders.createdAt,
+      websiteProjectOrders.updatedAt,
+    ]) {
+      expect(column.getSQLType()).toBe("timestamp(3)");
+      expect(dialect.sqlToQuery(column.default!).sql).toBe(
+        "CURRENT_TIMESTAMP(3)",
+      );
+    }
+    expect(websiteProjectOrders.updatedAt.hasOnUpdateNow).toBe(true);
+
+    for (const index of [31, 32, 33, 34]) {
+      const snapshot = JSON.parse(
+        await readFile(
+          path.join(
+            drizzleRoot,
+            "meta",
+            `${String(index).padStart(4, "0")}_snapshot.json`,
+          ),
+          "utf8",
+        ),
+      ) as {
+        tables: Record<
+          string,
+          {
+            columns: Record<
+              string,
+              { type: string; default?: string; onUpdate?: boolean }
+            >;
+          }
+        >;
+      };
+      expect(
+        snapshot.tables.website_payment_receipts.columns.createdAt,
+      ).toMatchObject({
+        type: "timestamp(3)",
+        default: "CURRENT_TIMESTAMP(3)",
+      });
+      if (index >= 32) {
+        expect(
+          snapshot.tables.website_project_orders.columns.createdAt,
+        ).toMatchObject({
+          type: "timestamp(3)",
+          default: "CURRENT_TIMESTAMP(3)",
+        });
+        expect(
+          snapshot.tables.website_project_orders.columns.updatedAt,
+        ).toMatchObject({
+          type: "timestamp(3)",
+          default: "CURRENT_TIMESTAMP(3)",
+          onUpdate: true,
+        });
       }
     }
   });
@@ -387,6 +475,9 @@ describe("service portal migration chain", () => {
     expect(receipts).toContain(
       "CONSTRAINT `website_payment_receipts_tradeNo_unique` UNIQUE(`tradeNo`)",
     );
+    expect(receipts).toContain(
+      "`createdAt` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)",
+    );
     expect(receipts).toContain("`tradeNo` varchar(128) NOT NULL");
     expect(receipts).toContain(
       "`purchaseType` enum('monitoring','service') NOT NULL",
@@ -430,6 +521,12 @@ describe("service portal migration chain", () => {
     );
     expect(orders).toContain(
       "CONSTRAINT `website_project_orders_authorizationDigest_unique` UNIQUE(`authorizationDigest`)",
+    );
+    expect(orders).toContain(
+      "`createdAt` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)",
+    );
+    expect(orders).toContain(
+      "`updatedAt` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)",
     );
     expect(orders).toContain(
       "CREATE INDEX `website_project_orders_project_state_idx`",

@@ -8,7 +8,7 @@ CREATE TABLE `website_payment_receipts` (
 	`scopeHash` varchar(64) NOT NULL,
 	`authorizationDigest` varchar(64) NOT NULL,
 	`reviewRequired` boolean NOT NULL,
-	`createdAt` timestamp(3) NOT NULL DEFAULT (now()),
+	`createdAt` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 	CONSTRAINT `website_payment_receipts_orderId` PRIMARY KEY(`orderId`),
 	CONSTRAINT `website_payment_receipts_tradeNo_unique` UNIQUE(`tradeNo`),
 	CONSTRAINT `website_payment_receipts_schema_version_ck` CHECK(`website_payment_receipts`.`schemaVersion` = 1),

@@ -7150,7 +7150,7 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
-          "default": "(now())"
+          "default": "CURRENT_TIMESTAMP(3)"
         }
       },
       "indexes": {
@@ -7294,7 +7294,7 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
-          "default": "(now())"
+          "default": "CURRENT_TIMESTAMP(3)"
         },
         "updatedAt": {
           "name": "updatedAt",
@@ -7303,7 +7303,7 @@
           "notNull": true,
           "autoincrement": false,
           "onUpdate": true,
-          "default": "(now())"
+          "default": "CURRENT_TIMESTAMP(3)"
         }
       },
       "indexes": {

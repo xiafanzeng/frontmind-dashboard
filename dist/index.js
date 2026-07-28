@@ -412,7 +412,7 @@ var websitePaymentReceipts = mysqlTable(
       length: 64
     }).notNull(),
     reviewRequired: boolean("reviewRequired").notNull(),
-    createdAt: timestamp("createdAt", { fsp: 3 }).defaultNow().notNull()
+    createdAt: timestamp("createdAt", { fsp: 3 }).default(sql`CURRENT_TIMESTAMP(3)`).notNull()
   },
   (table) => [
     index("website_payment_receipts_scope_idx").on(
@@ -465,8 +465,10 @@ var websiteProjectOrders = mysqlTable(
     fulfilledAt: timestamp("fulfilledAt", { fsp: 3 }),
     lastEventAt: timestamp("lastEventAt", { fsp: 3 }).notNull(),
     revision: int("revision", { unsigned: true }).default(1).notNull(),
-    createdAt: timestamp("createdAt", { fsp: 3 }).defaultNow().notNull(),
-    updatedAt: timestamp("updatedAt", { fsp: 3 }).defaultNow().onUpdateNow().notNull()
+    // drizzle-kit 0.31 renders onUpdateNow without the column fsp, so migration
+    // 0032 must keep its ON UPDATE clause pinned to CURRENT_TIMESTAMP(3).
+    createdAt: timestamp("createdAt", { fsp: 3 }).default(sql`CURRENT_TIMESTAMP(3)`).notNull(),
+    updatedAt: timestamp("updatedAt", { fsp: 3 }).default(sql`CURRENT_TIMESTAMP(3)`).onUpdateNow().notNull()
   },
   (table) => [
     index("website_project_orders_project_state_idx").on(
