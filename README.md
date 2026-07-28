@@ -54,6 +54,11 @@ cp .env.example .env
 `.env.production`，必须按 [1Panel 部署手册](./1PANEL_AFTER_CLONE_DEPLOYMENT.md)
 只在 1Panel 运行环境变量界面配置。
 
+生产 PDF 运行环境必须从
+[`deploy/1panel-node-pdf/Dockerfile`](./deploy/1panel-node-pdf/Dockerfile)
+构建固定派生镜像，使 Poppler 与 Ghostscript 在容器重建后仍然存在；禁止只在一次性
+运行容器中临时安装系统包。
+
 本地 `.env` 至少设置 `DATABASE_URL`、`FRONTMIND_CREDENTIAL_ENCRYPTION_KEY`、`FRONTMIND_PRESALES_SERVICE_TOKEN`、`FRONTMIND_PROVISIONING_SERVICE_TOKEN`、`FRONTMIND_MONITOR_API_KEY`、`FRONTMIND_PUBLIC_URL`、`FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET`、`FRONTMIND_ICP_MATERIAL_KEY` 和 `FRONTMIND_ICP_MATERIAL_DIR`。`FRONTMIND_MONITOR_API_KEY` 必须是监控服务专用凭据，生产环境不会回退使用普通售前 Key；`FRONTMIND_PUBLIC_URL` 必须是可供客户浏览器访问的真实 HTTPS 地址，用于生成开户与工作台链接。凭据密钥与 ICP 材料密钥必须分别生成并长期保持不变；两个服务令牌和预检签名密钥都应使用至少 32 位的独立随机值，并只保存在服务端，且不得互相复用。轮换预检签名密钥会使尚未发布的短时预检凭证失效，但不会影响已发布内容。ICP 目录应挂载到第一方私有持久化磁盘，不能由 Web 服务器直接公开。
 
 Dashboard 正式环境使用 `FRONTMIND_PUBLIC_URL=https://dashboard.frontmind.net`。页面路由、静态资源和 `/api/*` 均按同源相对路径工作，因此 1Panel 应将该域名的根路径整体反向代理到应用端口，不要部署在 `/dashboard/` 等子路径。`FRONTMIND_WEBSITE_URL=https://www.frontmind.net` 仍指向官网。

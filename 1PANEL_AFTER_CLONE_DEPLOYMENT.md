@@ -47,6 +47,7 @@ Codex 窗口，再把本地文件夹从 `frontmind-agent` 精确改名为：
 | 宿主机仓库目录  | `/frontmind-dashboard`                |
 | 容器内工作目录  | `/app`                                |
 | 1Panel 运行环境 | `FrontMind-Dashboard`                 |
+| Docker 容器     | `frontmind-dashboard`                 |
 | 私有容器 DNS    | `frontmind-dashboard`                 |
 | 应用端口        | `3001`                                |
 | 公开域名        | `https://dashboard.frontmind.net`     |
@@ -171,6 +172,7 @@ install -d -m 700 /srv/frontmind-dashboard/icp-materials
 
 ```text
 名称：FrontMind-Dashboard
+容器名称：frontmind-dashboard
 宿主机代码目录：/frontmind-dashboard
 容器内工作目录：/app
 Node：22.12+ LTS
@@ -181,7 +183,7 @@ Node：22.12+ LTS
 
 不同 1Panel 版本对“代码目录/运行目录”的字段命名不同：宿主机仓库应挂载到容器
 `/app`，后文所有容器命令都以 `/app` 为准。创建后先运行
-`docker exec FrontMind-Dashboard pwd` 和 `ls -la /app/package.json`；若实际挂载点不同，
+`docker exec frontmind-dashboard pwd` 和 `ls -la /app/package.json`；若实际挂载点不同，
 必须先统一运行目录与三个 Skill 绝对路径，不能混用 `/frontmind-dashboard` 和 `/app`。
 
 先用 `sleep infinity` 只为了让容器存在，以便完成依赖、构建、迁移和管理员初始化；
@@ -202,26 +204,219 @@ Node：22.12+ LTS
 
 ## 7. 永久安装 PDF 运行依赖
 
-Dashboard 镜像必须永久包含：
+生产检查已确认当前 `1panel/node:22.22.2`（Debian 12）不包含任何所需 PDF 命令。
+仓库提供固定派生镜像定义：
+
+```text
+deploy/1panel-node-pdf/Dockerfile
+```
+
+它固定使用生产服务器实际核验的完整基础镜像 digest，并永久安装：
 
 ```text
 poppler-utils
 ghostscript
 ```
 
-容器内验证：
+Docker 构建上下文由同目录 `.dockerignore` 限制为 Dockerfile 本身，不能把代码、环境
+文件、Key 或 token 传入镜像构建。Dockerfile 也不得通过 `ARG`、`ENV`、`LABEL` 或
+`COPY` 写入任何敏感值。
+
+先确认服务器代码为已审核 release，且基础镜像仍为文档记录的精确对象：
 
 ```bash
-docker exec FrontMind-Dashboard sh -lc \
-'command -v pdfinfo &&
- command -v pdftotext &&
- command -v pdfseparate &&
- command -v pdfunite &&
- command -v gs'
+docker inspect frontmind-dashboard \
+  --format 'configured_image={{.Config.Image}} image_id={{.Image}}'
+
+docker image inspect 1panel/node:22.22.2 \
+  --format 'user={{json .Config.User}} repo_digests={{json .RepoDigests}}'
 ```
 
-五项都必须返回路径。缺少时应修改 1Panel 使用的固定镜像/构建配置后重建运行环境；
-不要只 `apt install` 到一次性容器中。
+预期基础镜像为 `1panel/node:22.22.2`，RepoDigest 包含：
+
+```text
+1panel/node@sha256:4cb7297e1c72cac9ee17659f28807f4756cefd4a13cf7bc2c0ba7254c616bb28
+```
+
+`user` 必须是 `""` 或 `"root"`。任一结果不同都先停，不覆盖 Dockerfile 中的 digest。
+
+构建固定派生镜像：
+
+```bash
+DASHBOARD_RELEASE_SHA="$(git -C /frontmind-dashboard rev-parse HEAD)"
+DASHBOARD_PDF_IMAGE="frontmind-dashboard-node:22.22.2-pdf-$DASHBOARD_RELEASE_SHA"
+
+docker build \
+  --pull=false \
+  --build-arg VCS_REF="$DASHBOARD_RELEASE_SHA" \
+  --build-arg IMAGE_VERSION='dashboard-20260728-r1-pdf1' \
+  --tag "$DASHBOARD_PDF_IMAGE" \
+  --file /frontmind-dashboard/deploy/1panel-node-pdf/Dockerfile \
+  /frontmind-dashboard/deploy/1panel-node-pdf
+```
+
+构建日志最后必须看到五个 `command -v` 均成功。检查镜像审计标签，防止同名旧镜像被
+误用：
+
+```bash
+test "$(
+  docker image inspect "$DASHBOARD_PDF_IMAGE" \
+    --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+)" = "$DASHBOARD_RELEASE_SHA"
+
+test "$(
+  docker image inspect "$DASHBOARD_PDF_IMAGE" \
+    --format '{{ index .Config.Labels "org.opencontainers.image.version" }}'
+)" = "dashboard-20260728-r1-pdf1"
+
+docker image inspect "$DASHBOARD_PDF_IMAGE" \
+  --format 'image_id={{.Id}}'
+```
+
+随后直接从新镜像验证并记录本次实际安装的软件包版本：
+
+```bash
+docker run --rm \
+  --entrypoint sh \
+  "$DASHBOARD_PDF_IMAGE" \
+  -lc '
+set -eu
+node --version
+command -v pdfinfo
+command -v pdftotext
+command -v pdfseparate
+command -v pdfunite
+command -v gs
+dpkg-query -W -f="\${Package}=\${Version}\n" \
+  ghostscript poppler-utils
+'
+```
+
+基础镜像 digest 已固定；Debian 仓库中的安全更新仍可能随时间变化，因此必须把本次构建
+的最终 image ID、两项软件包版本、release SHA 和构建时间写入发布记录，并把这个已经
+验收的派生镜像纳入新系统镜像备份或受控私有镜像仓库。不能仅假设未来重新运行
+`apt-get` 会得到字节级相同的镜像。
+
+通过现有容器的 Compose 标签定位 1Panel 实际运行目录和项目名，不能猜安装路径：
+
+```bash
+DASHBOARD_RUNTIME_DIR="$(
+  docker inspect frontmind-dashboard \
+    --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}'
+)"
+DASHBOARD_COMPOSE_PROJECT="$(
+  docker inspect frontmind-dashboard \
+    --format '{{ index .Config.Labels "com.docker.compose.project" }}'
+)"
+DASHBOARD_COMPOSE_CONFIG_FILES="$(
+  docker inspect frontmind-dashboard \
+    --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}'
+)"
+DASHBOARD_COMPOSE_SERVICE="$(
+  docker inspect frontmind-dashboard \
+    --format '{{ index .Config.Labels "com.docker.compose.service" }}'
+)"
+
+test -n "$DASHBOARD_RUNTIME_DIR"
+test -n "$DASHBOARD_COMPOSE_PROJECT"
+test -n "$DASHBOARD_COMPOSE_CONFIG_FILES"
+test -n "$DASHBOARD_COMPOSE_SERVICE"
+
+case "$DASHBOARD_COMPOSE_CONFIG_FILES" in
+  *,*)
+    echo "MULTIPLE_COMPOSE_FILES_REVIEW_REQUIRED"
+    exit 1
+    ;;
+  /*)
+    DASHBOARD_COMPOSE_FILE="$DASHBOARD_COMPOSE_CONFIG_FILES"
+    ;;
+  *)
+    echo "COMPOSE_FILE_PATH_NOT_ABSOLUTE"
+    exit 1
+    ;;
+esac
+
+test -f "$DASHBOARD_COMPOSE_FILE"
+test "$(grep -Ec '^[[:space:]]*image:' "$DASHBOARD_COMPOSE_FILE")" -eq 1
+grep -nE '^[[:space:]]*image:' "$DASHBOARD_COMPOSE_FILE"
+```
+
+在 1Panel 停止 `FrontMind-Dashboard`。使用 1Panel 文件管理器打开上面精确定位的
+`docker-compose.yml`，只把该唯一服务的：
+
+```yaml
+image: 1panel/node:22.22.2
+```
+
+替换为：
+
+```yaml
+image: frontmind-dashboard-node:22.22.2-pdf-<本次40位release SHA>
+```
+
+不要修改 `run.sh`、1Panel 内部 `.env`、`command`、端口、卷、网络或 `createdBy`
+标签。先只解析镜像名，禁止运行可能展开敏感环境变量的裸 `docker compose config`：
+
+```bash
+docker compose \
+  --project-name "$DASHBOARD_COMPOSE_PROJECT" \
+  --project-directory "$DASHBOARD_RUNTIME_DIR" \
+  --file "$DASHBOARD_COMPOSE_FILE" \
+  config --services |
+  grep -Fx "$DASHBOARD_COMPOSE_SERVICE"
+
+docker compose \
+  --project-name "$DASHBOARD_COMPOSE_PROJECT" \
+  --project-directory "$DASHBOARD_RUNTIME_DIR" \
+  --file "$DASHBOARD_COMPOSE_FILE" \
+  config --images |
+  grep -Fx "$DASHBOARD_PDF_IMAGE"
+```
+
+两条命令都必须恰好匹配。然后使用原项目名、原配置文件和精确 service 强制重建，不能
+执行 `down -v`，也不能重建同一 Compose 项目中的其他服务：
+
+```bash
+docker compose \
+  --project-name "$DASHBOARD_COMPOSE_PROJECT" \
+  --project-directory "$DASHBOARD_RUNTIME_DIR" \
+  --file "$DASHBOARD_COMPOSE_FILE" \
+  up -d --force-recreate --pull never \
+  "$DASHBOARD_COMPOSE_SERVICE"
+```
+
+同时核对实际镜像 ID、五个命令、工作目录和网络：
+
+```bash
+test "$(
+  docker inspect frontmind-dashboard --format '{{.Image}}'
+)" = "$(
+  docker image inspect "$DASHBOARD_PDF_IMAGE" --format '{{.Id}}'
+)"
+
+docker exec frontmind-dashboard sh -lc '
+set -eu
+test "$(pwd)" = "/app"
+command -v pdfinfo
+command -v pdftotext
+command -v pdfseparate
+command -v pdfunite
+command -v gs
+'
+
+docker inspect frontmind-dashboard \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}'
+```
+
+再次执行同一条限定精确 service 的 `up -d --force-recreate --pull never` 并重复验证，
+证明依赖不是当前容器 writable layer 中的临时安装。每次通过 1Panel 编辑、升级或重建
+运行环境后，都必须重新确认 Compose 的 `image:`、release SHA 标签和容器实际 image ID
+仍指向该固定派生镜像；若被 1Panel 恢复成官方镜像，必须重新应用本节的精确镜像配置后
+才能启动。
+
+绝对不要在运行容器中临时 `apt install`，不要 `docker commit`，不要把派生镜像反向
+标记成 `1panel/node:22.22.2`，也不要执行 `docker compose down -v` 或
+`docker system prune`。
 
 ## 8. 生成新密钥
 
@@ -307,22 +502,22 @@ FRONTMIND_RESPONSE_LOGIC_SKILL_PATH=/app/dist/private-workflows/response-logic-b
 在 Dashboard 容器中执行：
 
 ```bash
-docker exec FrontMind-Dashboard sh -lc \
+docker exec frontmind-dashboard sh -lc \
   'cd /app && corepack enable && node -v && pnpm -v'
 
-docker exec FrontMind-Dashboard sh -lc \
+docker exec frontmind-dashboard sh -lc \
   'cd /app && pnpm install --prod=false --frozen-lockfile'
 
-docker exec FrontMind-Dashboard sh -lc \
+docker exec frontmind-dashboard sh -lc \
   'cd /app && pnpm check'
 
-docker exec FrontMind-Dashboard sh -lc \
+docker exec frontmind-dashboard sh -lc \
   'cd /app && pnpm test'
 
-docker exec FrontMind-Dashboard sh -lc \
+docker exec frontmind-dashboard sh -lc \
   'cd /app && FRONTMIND_BUILD_VERSION=dashboard-20260728-r1 pnpm build'
 
-docker exec FrontMind-Dashboard sh -lc \
+docker exec frontmind-dashboard sh -lc \
   'cd /app && pnpm audit:production'
 ```
 
@@ -332,7 +527,7 @@ docker exec FrontMind-Dashboard sh -lc \
 验证产物：
 
 ```bash
-docker exec FrontMind-Dashboard sh -lc '
+docker exec frontmind-dashboard sh -lc '
 set -eu
 test -f /app/dist/index.js
 test -f /app/dist/pdf-prepare-worker.js
@@ -351,7 +546,7 @@ test -f /app/dist/private-workflows/response-logic-builder.skill/SKILL.md
 变更命令是：
 
 ```bash
-docker exec -it FrontMind-Dashboard sh -lc '
+docker exec -it frontmind-dashboard sh -lc '
 set -eu
 cd /app
 pnpm db:migrate
@@ -387,7 +582,7 @@ SHOW TABLES;
 在 TTY 中执行，密码不会进入命令历史：
 
 ```bash
-docker exec -it FrontMind-Dashboard sh -lc '
+docker exec -it frontmind-dashboard sh -lc '
 cd /app
 pnpm admin:init -- --username admin --display-name "FrontMind Admin"
 '
@@ -439,7 +634,7 @@ pnpm start
 检查：
 
 ```bash
-docker logs --tail 200 FrontMind-Dashboard
+docker logs --tail 200 frontmind-dashboard
 curl -fsS http://127.0.0.1:3001/healthz
 ```
 
@@ -516,7 +711,7 @@ curl -fsS https://dashboard.frontmind.net/healthz | jq -e '
 写进宿主机命令历史：
 
 ```bash
-docker exec FrontMind-Dashboard sh -lc '
+docker exec frontmind-dashboard sh -lc '
 set -eu
 curl -fsS \
   -H "x-frontmind-service-token: $FRONTMIND_PRESALES_SERVICE_TOKEN" \
@@ -668,14 +863,14 @@ git -C /frontmind-dashboard pull --ff-only origin main
 然后在容器中：
 
 ```bash
-docker exec FrontMind-Dashboard sh -lc \
+docker exec frontmind-dashboard sh -lc \
   'cd /app && pnpm install --prod=false --frozen-lockfile'
-docker exec FrontMind-Dashboard sh -lc 'cd /app && pnpm check'
-docker exec FrontMind-Dashboard sh -lc 'cd /app && pnpm test'
-docker exec FrontMind-Dashboard sh -lc \
+docker exec frontmind-dashboard sh -lc 'cd /app && pnpm check'
+docker exec frontmind-dashboard sh -lc 'cd /app && pnpm test'
+docker exec frontmind-dashboard sh -lc \
   'cd /app && FRONTMIND_BUILD_VERSION=<本次固定Release-ID> pnpm build'
-docker exec FrontMind-Dashboard sh -lc 'cd /app && pnpm audit:production'
-docker exec FrontMind-Dashboard sh -lc 'cd /app && pnpm db:migrate'
+docker exec frontmind-dashboard sh -lc 'cd /app && pnpm audit:production'
+docker exec frontmind-dashboard sh -lc 'cd /app && pnpm db:migrate'
 ```
 
 全部成功后才从 1Panel 重启。schema 变更仍然只允许 `pnpm db:migrate`；禁止
