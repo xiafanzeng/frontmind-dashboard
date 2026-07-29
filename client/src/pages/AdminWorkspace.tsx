@@ -331,7 +331,7 @@ export default function AdminWorkspace({
   });
   const [tab, setTab] = useState<WorkspaceTab>(initialTab);
   const [servicePlan, setServicePlan] = useState<
-    "basic" | "knowledge" | "advanced" | "luxury"
+    "basic" | "advanced" | "luxury"
   >("basic");
   const [serviceStatus, setServiceStatus] = useState<
     "pending_confirmation" | "scheduled" | "active" | "suspended" | "cancelled"
@@ -498,7 +498,6 @@ export default function AdminWorkspace({
     const nextPlan = service?.planCode;
     if (
       nextPlan === "basic" ||
-      nextPlan === "knowledge" ||
       nextPlan === "advanced" ||
       nextPlan === "luxury"
     ) {
@@ -728,11 +727,14 @@ export default function AdminWorkspace({
                         ? "进阶版"
                         : account.service?.planCode === "luxury"
                           ? "豪华版"
-                          : account.service?.planCode === "knowledge"
-                            ? "知识库版"
-                            : account.service?.planCode === "basic"
-                              ? "普通版"
-                              : "版本待配置"}
+                          : account.service?.planCode === "basic"
+                            ? "普通版"
+                            : "版本待配置"}
+                    </Badge>
+                    <Badge variant="secondary" className="text-xs">
+                      {account.marketEdition === "overseas"
+                        ? "海外版"
+                        : "海内版"}
                     </Badge>
                     <Badge variant="secondary" className="text-xs">
                       管理员 {account.assignedAdmins.length}
@@ -953,18 +955,13 @@ export default function AdminWorkspace({
                             onChange={(event) => {
                               const nextPlan = event.target.value as
                                 | "basic"
-                                | "knowledge"
                                 | "advanced"
                                 | "luxury";
                               setServicePlan(nextPlan);
-                              if (nextPlan === "knowledge") {
-                                setCarryQuestionIds([]);
-                              }
                             }}
                             className="mt-2 h-10 w-full rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#332842]"
                           >
                             <option value="basic">普通版 · 30 天单题</option>
-                            <option value="knowledge">知识库版</option>
                             <option value="advanced">进阶版</option>
                             <option value="luxury">豪华版</option>
                           </select>
@@ -1020,55 +1017,54 @@ export default function AdminWorkspace({
                             }
                           />
                         </label>
-                        {servicePlan !== "knowledge" &&
-                          (questionPortfolioQuery.data?.questions ?? []).some(
-                            (question: any) => question.status === "selected",
-                          ) && (
-                            <div className="lg:col-span-3 rounded-2xl border border-[#e7dced] bg-[#fbf9fd] p-4">
-                              <p className="text-sm font-semibold text-[#332842]">
-                                升级后继续服务的问题
-                              </p>
-                              <p className="mt-1 text-xs leading-5 text-[#857e91]">
-                                已勾选问题会复制到新套餐并计入对应分类额度；若超额，保存会被服务端拒绝，必须先明确保留项。
-                              </p>
-                              <div className="mt-3 space-y-2">
-                                {(questionPortfolioQuery.data?.questions ?? [])
-                                  .filter(
-                                    (question: any) =>
-                                      question.status === "selected",
-                                  )
-                                  .map((question: any) => (
-                                    <label
-                                      key={question.id}
-                                      className="flex items-start gap-3 rounded-xl bg-white p-3 text-sm text-[#484057]"
-                                    >
-                                      <input
-                                        type="checkbox"
-                                        className="mt-1"
-                                        checked={carryQuestionIds.includes(
-                                          question.id,
-                                        )}
-                                        onChange={(event) =>
-                                          setCarryQuestionIds((current) =>
-                                            event.target.checked
-                                              ? [
-                                                  ...new Set([
-                                                    ...current,
-                                                    question.id,
-                                                  ]),
-                                                ]
-                                              : current.filter(
-                                                  (id) => id !== question.id,
-                                                ),
-                                          )
-                                        }
-                                      />
-                                      <span>{question.question}</span>
-                                    </label>
-                                  ))}
-                              </div>
+                        {(questionPortfolioQuery.data?.questions ?? []).some(
+                          (question: any) => question.status === "selected",
+                        ) && (
+                          <div className="lg:col-span-3 rounded-2xl border border-[#e7dced] bg-[#fbf9fd] p-4">
+                            <p className="text-sm font-semibold text-[#332842]">
+                              升级后继续服务的问题
+                            </p>
+                            <p className="mt-1 text-xs leading-5 text-[#857e91]">
+                              已勾选问题会复制到新套餐并计入对应分类额度；若超额，保存会被服务端拒绝，必须先明确保留项。
+                            </p>
+                            <div className="mt-3 space-y-2">
+                              {(questionPortfolioQuery.data?.questions ?? [])
+                                .filter(
+                                  (question: any) =>
+                                    question.status === "selected",
+                                )
+                                .map((question: any) => (
+                                  <label
+                                    key={question.id}
+                                    className="flex items-start gap-3 rounded-xl bg-white p-3 text-sm text-[#484057]"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      className="mt-1"
+                                      checked={carryQuestionIds.includes(
+                                        question.id,
+                                      )}
+                                      onChange={(event) =>
+                                        setCarryQuestionIds((current) =>
+                                          event.target.checked
+                                            ? [
+                                                ...new Set([
+                                                  ...current,
+                                                  question.id,
+                                                ]),
+                                              ]
+                                            : current.filter(
+                                                (id) => id !== question.id,
+                                              ),
+                                        )
+                                      }
+                                    />
+                                    <span>{question.question}</span>
+                                  </label>
+                                ))}
                             </div>
-                          )}
+                          </div>
+                        )}
 
                         <div className="lg:col-span-3 flex justify-end">
                           <Button
@@ -1407,9 +1403,7 @@ export default function AdminWorkspace({
                     userId={selectedUser.id}
                     workspace={dashboardQuery.data}
                     loading={dashboardQuery.isLoading}
-                    profileOnly={
-                      serviceQuery.data?.service?.planCode === "knowledge"
-                    }
+                    profileOnly={false}
                     authoritativeQuestions={
                       serviceQuery.data?.purchasedQuestions
                     }
@@ -1426,17 +1420,15 @@ export default function AdminWorkspace({
                       ]);
                     }}
                   />
-                  {serviceQuery.data?.service?.planCode !== "knowledge" && (
-                    <DashboardVersionHistory
-                      userId={selectedUser.id}
-                      onWorkspaceChanged={async () => {
-                        await Promise.all([
-                          dashboardQuery.refetch(),
-                          workspaceQuery.refetch(),
-                        ]);
-                      }}
-                    />
-                  )}
+                  <DashboardVersionHistory
+                    userId={selectedUser.id}
+                    onWorkspaceChanged={async () => {
+                      await Promise.all([
+                        dashboardQuery.refetch(),
+                        workspaceQuery.refetch(),
+                      ]);
+                    }}
+                  />
                 </div>
               ))}
 

@@ -158,48 +158,4 @@ describe("admin dashboard structured publication", () => {
       { transaction: "dashboard-write" },
     );
   });
-
-  it("lets a knowledge-only workspace publish enterprise profile fields", async () => {
-    dependencies.getServicePortal.mockResolvedValue({
-      service: { planCode: "knowledge" },
-      capabilities: {
-        contentAssets: { allowed: false },
-        knowledgeBuild: { allowed: true },
-      },
-    });
-    const payload = structuredClone(existingPayload);
-    payload.headline = "知识库版企业简介";
-    payload.summary = "管理员核验后的企业资料。";
-    const caller = adminRouter.createCaller(context());
-
-    await expect(
-      caller.workspace.updateDashboard({
-        userId: 42,
-        expectedRevision: 3,
-        payload,
-      }),
-    ).resolves.toMatchObject({ revision: 4 });
-  });
-
-  it("rejects non-profile publication for a knowledge-only workspace", async () => {
-    dependencies.getServicePortal.mockResolvedValue({
-      service: { planCode: "knowledge" },
-      capabilities: {
-        contentAssets: { allowed: false },
-        knowledgeBuild: { allowed: true },
-      },
-    });
-    const payload = structuredClone(existingPayload);
-    payload.metrics = [{ label: "不可发布指标", value: 99, unit: "项" }];
-    const caller = adminRouter.createCaller(context());
-
-    await expect(
-      caller.workspace.updateDashboard({
-        userId: 42,
-        expectedRevision: 3,
-        payload,
-      }),
-    ).rejects.toMatchObject({ code: "FORBIDDEN" });
-    expect(dependencies.updateDashboardWorkspace).not.toHaveBeenCalled();
-  });
 });

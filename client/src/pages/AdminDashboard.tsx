@@ -710,7 +710,7 @@ export default function AdminDashboard({
               </div>
               <p className="mt-1 text-sm leading-6 text-[#716a80]">
                 {systemAdmin
-                  ? "先选择交付管理员，再查看该管理员的 Key 池、通用 Agent 与名下用户本月消耗。"
+                  ? "先选择交付管理员，再查看该管理员的 Key 池、管理员自用 Agent 积分与名下用户本月消耗。"
                   : "Key 总消耗取自当前共享 Key；管理员本人和名下用户按任务归属独立记账。"}
               </p>
             </div>
@@ -797,7 +797,7 @@ export default function AdminDashboard({
                     {[
                       ["Key 池总消耗", selectedUsageManager.keyPool.totalUsed],
                       [
-                        "管理员通用 Agent",
+                        "管理员自用 Agent 积分",
                         selectedUsageManager.ownAgentMonthUsed,
                       ],
                       ["已归属到本管理员", selectedUsageManager.attributedUsed],

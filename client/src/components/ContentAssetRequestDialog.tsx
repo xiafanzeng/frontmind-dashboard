@@ -7,6 +7,8 @@ import {
 } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import type { DeliveryTicketQuota } from "@shared/delivery-ticket";
+import type { PreferredContentMedia } from "@shared/delivery-ticket";
+import { DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS } from "@shared/delivery-catalog";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -54,20 +56,10 @@ export type ContentAssetRequestPayload = {
   attachmentFiles: File[];
 };
 
-export const CONTENT_ASSET_PREFERRED_MEDIA = [
-  "今日头条",
-  "搜狐",
-  "网易",
-  "腾讯",
-  "新浪",
-  "百度",
-  "中华网",
-  "凤凰网",
-  "微博",
-] as const;
+export const CONTENT_ASSET_PREFERRED_MEDIA =
+  DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS;
 
-export type ContentAssetPreferredMedia =
-  (typeof CONTENT_ASSET_PREFERRED_MEDIA)[number];
+export type ContentAssetPreferredMedia = PreferredContentMedia;
 
 export type ContentAssetRequestDialogProps = {
   open: boolean;
@@ -76,6 +68,7 @@ export type ContentAssetRequestDialogProps = {
   planCode: ContentRequestPlanCode;
   quota?: DeliveryTicketQuota | null;
   submittedCount?: number;
+  preferredMediaOptions?: readonly PreferredContentMedia[];
   onSubmit?: (payload: ContentAssetRequestPayload) => void | Promise<void>;
   onSubmitSuccess?: (payload: ContentAssetRequestPayload) => void;
 };
@@ -113,6 +106,7 @@ export default function ContentAssetRequestDialog({
   onOpenChange,
   assetType,
   quota = null,
+  preferredMediaOptions = CONTENT_ASSET_PREFERRED_MEDIA,
   onSubmit,
   onSubmitSuccess,
 }: ContentAssetRequestDialogProps) {
@@ -329,7 +323,7 @@ export default function ContentAssetRequestDialog({
                 className="h-11 rounded-md border border-[#ded5e5] bg-white px-3 font-normal text-[#372b43]"
               >
                 <option value="">暂不指定</option>
-                {CONTENT_ASSET_PREFERRED_MEDIA.map((media) => (
+                {preferredMediaOptions.map((media) => (
                   <option key={media} value={media}>
                     {media}
                   </option>

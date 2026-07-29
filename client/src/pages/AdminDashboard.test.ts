@@ -171,6 +171,8 @@ describe("administrator channel navigation", () => {
     expect(source).toContain('title="交付总览"');
     expect(source).toContain("打开客户交付工作台");
     expect(source).toContain("创建客户");
+    expect(source).toContain("管理员自用 Agent 积分");
+    expect(source).not.toContain("管理员通用 Agent");
     expect(source).not.toContain("从客户签约到交付验收的统一工作台");
     expect(source).not.toContain(
       "套餐权益、知识库流程、选题、应答逻辑、问题监控",

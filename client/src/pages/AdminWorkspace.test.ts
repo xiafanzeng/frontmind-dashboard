@@ -58,4 +58,12 @@ describe("admin customer workspace", () => {
     expect(source).not.toContain("新增签署或收款核验依据");
     expect(source).not.toContain("serviceEvidenceNote");
   });
+
+  it("does not offer the removed knowledge-only service plan", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+    expect(source).not.toContain('<option value="knowledge">');
+  });
 });

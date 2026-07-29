@@ -11,6 +11,7 @@ import {
 } from "../shared/delivery-ticket";
 import {
   CONTENT_ASSET_CATALOG,
+  contentAssetMediaOptionsForMarketEdition,
   icpMaterialChecklistForProvince,
 } from "../shared/delivery-catalog";
 import {
@@ -65,13 +66,27 @@ describe("delivery ticket contract", () => {
   it("publishes six explained content types without the retired media type", () => {
     expect(CONTENT_ASSET_CATALOG).toHaveLength(6);
     expect(
-      CONTENT_ASSET_CATALOG.some(
-        (item) => item.label === "媒体稿件与权威信源",
-      ),
+      CONTENT_ASSET_CATALOG.some((item) => item.label === "媒体稿件与权威信源"),
     ).toBe(false);
     expect(
       CONTENT_ASSET_CATALOG.every((item) => item.description.length > 0),
     ).toBe(true);
+  });
+
+  it("isolates domestic and overseas content media options", () => {
+    expect(contentAssetMediaOptionsForMarketEdition("domestic")).toContain(
+      "搜狐",
+    );
+    expect(contentAssetMediaOptionsForMarketEdition("domestic")).not.toContain(
+      "美联社",
+    );
+    expect(contentAssetMediaOptionsForMarketEdition("overseas")).toEqual([
+      "美联社",
+      "今日美国",
+      "雅虎",
+      "Business Insider",
+      "Barchart",
+    ]);
   });
 
   it("derives public media links only from successful structured delivery records", () => {
@@ -637,6 +652,7 @@ describe("customer delivery-ticket DTO boundary", () => {
       websiteContentCatalog: [
         { value: "company_facts", label: "企业资料与品牌事实" },
       ],
+      marketEdition: "domestic",
       preferredMediaOptions: ["微博"],
       websiteWorkflow: {
         domainStatus: "completed",

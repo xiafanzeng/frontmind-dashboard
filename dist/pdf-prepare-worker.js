@@ -123,6 +123,7 @@ var users = mysqlTable(
       "system_admin",
       "delivery_admin"
     ]),
+    marketEdition: mysqlEnum("marketEdition", ["domestic", "overseas"]).default("domestic").notNull(),
     isActive: boolean("isActive").default(true).notNull(),
     passwordChangedAt: timestamp("passwordChangedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -709,12 +710,7 @@ var serviceContracts = mysqlTable(
   {
     id: varchar("id", { length: 36 }).primaryKey(),
     userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
-    planCode: mysqlEnum("planCode", [
-      "basic",
-      "knowledge",
-      "advanced",
-      "luxury"
-    ]).notNull(),
+    planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]).notNull(),
     planVersion: int("planVersion", { unsigned: true }).default(1).notNull(),
     status: mysqlEnum("status", [
       "pending_confirmation",
@@ -1361,7 +1357,6 @@ var purchaseIntents = mysqlTable(
     }).references(() => serviceContracts.id, { onDelete: "set null" }),
     targetPlanCode: mysqlEnum("targetPlanCode", [
       "basic",
-      "knowledge",
       "advanced",
       "luxury"
     ]).notNull(),
@@ -2286,12 +2281,7 @@ import { z as z3 } from "zod";
 
 // shared/service-portal.ts
 import { z } from "zod";
-var servicePlanCodeSchema = z.enum([
-  "basic",
-  "knowledge",
-  "advanced",
-  "luxury"
-]);
+var servicePlanCodeSchema = z.enum(["basic", "advanced", "luxury"]);
 var workspaceQuestionCategorySchema = z.enum([
   "industry",
   "competitor_comparison",
@@ -2378,35 +2368,6 @@ var SERVICE_PLAN_CATALOG = Object.freeze({
       channelDistribution: true,
       progressReport: true,
       contentAssets: true
-    }
-  },
-  knowledge: {
-    code: "knowledge",
-    name: "\u77E5\u8BC6\u5E93\u7248",
-    description: "\u63D0\u4F9B\u5B8C\u6574\u7684\u77E5\u8BC6\u5E93\u6784\u5EFA\u3001\u6301\u7EED\u66F4\u65B0\u4E0E\u5C55\u793A\u80FD\u529B\u3002",
-    planVersion: 1,
-    contractTerm: { unit: "month", count: 3 },
-    quotaCadence: "contract",
-    prepaidMonths: 3,
-    billingLabel: "\u5B63\u5EA6\u77E5\u8BC6\u5E93\u670D\u52A1",
-    limits: {
-      industryLimit: 0,
-      competitorComparisonLimit: 0,
-      reputationLimit: 0,
-      productScenarioLimit: 0,
-      totalQuestionLimit: 0
-    },
-    includedCapabilities: {
-      knowledgeBuild: true,
-      knowledgeDisplay: true,
-      globalKeywords: false,
-      questionSelection: false,
-      intentOptimization: false,
-      responseLogic: false,
-      monitoring: false,
-      channelDistribution: false,
-      progressReport: false,
-      contentAssets: false
     }
   },
   advanced: {
@@ -3258,16 +3219,22 @@ var dashboardModuleImportPreviewSchema = dashboardImportPreviewMetadataSchema.ex
 import { and as and3, asc as asc2, desc as desc3, eq as eq4, gt as gt2, inArray as inArray2, lte } from "drizzle-orm";
 
 // shared/delivery-ticket.ts
+import { z as z5 } from "zod";
+
+// shared/account-edition.ts
 import { z as z4 } from "zod";
-var deliveryTicketTypeSchema = z4.enum([
+var accountMarketEditionSchema = z4.enum(["domestic", "overseas"]);
+
+// shared/delivery-ticket.ts
+var deliveryTicketTypeSchema = z5.enum([
   "content_asset",
   "website_operation"
 ]);
-var deliveryTicketQuotaPoolSchema = z4.enum([
+var deliveryTicketQuotaPoolSchema = z5.enum([
   "content_asset_publish",
   "website_content_publish"
 ]);
-var websiteOperationCategorySchema = z4.enum([
+var websiteOperationCategorySchema = z5.enum([
   "domain_application",
   "icp_filing",
   "company_facts",
@@ -3300,14 +3267,14 @@ var websiteOperationCategorySchema = z4.enum([
   "prelaunch_review",
   "llms_txt_experiment"
 ]);
-var websiteContentCategorySchema = z4.enum([
+var websiteContentCategorySchema = z5.enum([
   "company_facts",
   "product_case_docs",
   "industry_news",
   "company_news",
   "faq_content"
 ]);
-var deliveryTicketStatusSchema = z4.enum([
+var deliveryTicketStatusSchema = z5.enum([
   "submitted",
   "needs_information",
   "scheduled",
@@ -3316,12 +3283,12 @@ var deliveryTicketStatusSchema = z4.enum([
   "rejected",
   "cancelled"
 ]);
-var deliveryTicketQuotaStateSchema = z4.enum([
+var deliveryTicketQuotaStateSchema = z5.enum([
   "reserved",
   "consumed",
   "released"
 ]);
-var preferredContentMediaSchema = z4.enum([
+var preferredContentMediaSchema = z5.enum([
   "\u4ECA\u65E5\u5934\u6761",
   "\u641C\u72D0",
   "\u7F51\u6613",
@@ -3330,9 +3297,14 @@ var preferredContentMediaSchema = z4.enum([
   "\u767E\u5EA6",
   "\u4E2D\u534E\u7F51",
   "\u51E4\u51F0\u7F51",
-  "\u5FAE\u535A"
+  "\u5FAE\u535A",
+  "\u7F8E\u8054\u793E",
+  "\u4ECA\u65E5\u7F8E\u56FD",
+  "\u96C5\u864E",
+  "Business Insider",
+  "Barchart"
 ]);
-var icpSensitiveMaterialCategorySchema = z4.enum([
+var icpSensitiveMaterialCategorySchema = z5.enum([
   "business_license",
   "subject_responsible_person_id",
   "website_responsible_person_id",
@@ -3341,48 +3313,48 @@ var icpSensitiveMaterialCategorySchema = z4.enum([
   "enterprise_name_change_proof",
   "other_provincial_material"
 ]);
-var deliveryTicketAttachmentInputSchema = z4.object({
-  storageKind: z4.enum(["upstream", "icp_protected"]).default("upstream"),
-  fileId: z4.string().trim().min(1).max(255).optional(),
-  protectedMaterialId: z4.string().uuid().optional(),
+var deliveryTicketAttachmentInputSchema = z5.object({
+  storageKind: z5.enum(["upstream", "icp_protected"]).default("upstream"),
+  fileId: z5.string().trim().min(1).max(255).optional(),
+  protectedMaterialId: z5.string().uuid().optional(),
   sensitiveCategory: icpSensitiveMaterialCategorySchema.optional(),
-  filename: z4.string().trim().min(1).max(512),
-  mimeType: z4.string().trim().max(255).optional(),
-  sizeBytes: z4.number().int().nonnegative().max(100 * 1024 * 1024).optional(),
-  sha256: z4.string().trim().regex(/^[a-fA-F0-9]{64}$/).optional(),
-  purpose: z4.string().trim().max(160).optional(),
-  authorization: z4.enum(["owned", "licensed", "public", "authorization_pending"]).optional(),
-  copyrightNote: z4.string().trim().max(2e3).optional()
+  filename: z5.string().trim().min(1).max(512),
+  mimeType: z5.string().trim().max(255).optional(),
+  sizeBytes: z5.number().int().nonnegative().max(100 * 1024 * 1024).optional(),
+  sha256: z5.string().trim().regex(/^[a-fA-F0-9]{64}$/).optional(),
+  purpose: z5.string().trim().max(160).optional(),
+  authorization: z5.enum(["owned", "licensed", "public", "authorization_pending"]).optional(),
+  copyrightNote: z5.string().trim().max(2e3).optional()
 }).superRefine((value, context) => {
   if (value.storageKind === "icp_protected") {
     if (!value.protectedMaterialId) {
       context.addIssue({
-        code: z4.ZodIssueCode.custom,
+        code: z5.ZodIssueCode.custom,
         path: ["protectedMaterialId"],
         message: "ICP \u654F\u611F\u6750\u6599\u7F3A\u5C11\u53D7\u4FDD\u62A4\u6587\u4EF6\u6807\u8BC6"
       });
     }
     if (!value.sensitiveCategory) {
       context.addIssue({
-        code: z4.ZodIssueCode.custom,
+        code: z5.ZodIssueCode.custom,
         path: ["sensitiveCategory"],
         message: "\u8BF7\u9009\u62E9 ICP \u654F\u611F\u6750\u6599\u7C7B\u522B"
       });
     }
   } else if (!value.fileId) {
     context.addIssue({
-      code: z4.ZodIssueCode.custom,
+      code: z5.ZodIssueCode.custom,
       path: ["fileId"],
       message: "\u9644\u4EF6\u7F3A\u5C11\u6587\u4EF6\u6807\u8BC6"
     });
   }
 });
-var optionalTrimmedText = (maximum) => z4.string().trim().max(maximum).optional();
-var httpUrlSchema = z4.string().trim().max(2048).url().refine((value) => {
+var optionalTrimmedText = (maximum) => z5.string().trim().max(maximum).optional();
+var httpUrlSchema = z5.string().trim().max(2048).url().refine((value) => {
   const protocol = new URL(value).protocol;
   return protocol === "http:" || protocol === "https:";
 }, "\u4EC5\u652F\u6301 http \u6216 https \u94FE\u63A5");
-var targetPageSchema = z4.string().trim().max(2048).refine((value) => {
+var targetPageSchema = z5.string().trim().max(2048).refine((value) => {
   if (value.startsWith("/") && !value.startsWith("//")) return true;
   try {
     const protocol = new URL(value).protocol;
@@ -3391,15 +3363,15 @@ var targetPageSchema = z4.string().trim().max(2048).refine((value) => {
     return false;
   }
 }, "\u76EE\u6807\u9875\u9762\u5FC5\u987B\u662F\u7AD9\u5185\u8DEF\u5F84\u6216\u5B8C\u6574\u7684 http/https \u94FE\u63A5");
-var icpNonSensitiveDeclarationsSchema = z4.object({
-  domainHolderInformation: z4.string().trim().min(1).max(4e3),
-  websiteInformation: z4.string().trim().min(1).max(8e3),
-  aliyunAppVerificationCompleted: z4.literal(true, {
+var icpNonSensitiveDeclarationsSchema = z5.object({
+  domainHolderInformation: z5.string().trim().min(1).max(4e3),
+  websiteInformation: z5.string().trim().min(1).max(8e3),
+  aliyunAppVerificationCompleted: z5.literal(true, {
     error: "\u8BF7\u786E\u8BA4\u5DF2\u5B8C\u6210\u963F\u91CC\u4E91 App \u771F\u5B9E\u6027 / \u4EBA\u8138\u6838\u9A8C"
   })
 });
-var createDeliveryTicketSchema = z4.object({
-  clientRequestId: z4.string().uuid(),
+var createDeliveryTicketSchema = z5.object({
+  clientRequestId: z5.string().uuid(),
   type: deliveryTicketTypeSchema,
   category: optionalTrimmedText(64),
   topic: optionalTrimmedText(512),
@@ -3409,8 +3381,8 @@ var createDeliveryTicketSchema = z4.object({
   icpProvince: optionalTrimmedText(64),
   icpDeclarations: icpNonSensitiveDeclarationsSchema.optional(),
   targetPage: targetPageSchema.optional(),
-  materialUrls: z4.array(httpUrlSchema).max(30).default([]),
-  attachments: z4.array(deliveryTicketAttachmentInputSchema).max(30).default([])
+  materialUrls: z5.array(httpUrlSchema).max(30).default([]),
+  attachments: z5.array(deliveryTicketAttachmentInputSchema).max(30).default([])
 }).refine(
   (value) => Boolean(
     value.category?.trim() || value.topic?.trim() || value.title?.trim()
@@ -3422,84 +3394,84 @@ var createDeliveryTicketSchema = z4.object({
 ).superRefine((value, context) => {
   if (value.category === "icp_filing" && !value.icpDeclarations) {
     context.addIssue({
-      code: z4.ZodIssueCode.custom,
+      code: z5.ZodIssueCode.custom,
       path: ["icpDeclarations"],
       message: "\u57DF\u540D\u4E0E ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
     });
   }
 });
-var deliveryTicketDetailInputSchema = z4.object({
-  ticketId: z4.string().uuid()
+var deliveryTicketDetailInputSchema = z5.object({
+  ticketId: z5.string().uuid()
 });
-var icpMaterialChecklistInputSchema = z4.object({
-  province: z4.string().trim().min(1).max(64)
+var icpMaterialChecklistInputSchema = z5.object({
+  province: z5.string().trim().min(1).max(64)
 });
-var deliveryTicketListInputSchema = z4.object({
+var deliveryTicketListInputSchema = z5.object({
   type: deliveryTicketTypeSchema.optional(),
-  publicStatus: z4.enum(["pending", "completed"]).optional(),
-  limit: z4.number().int().min(1).max(100).default(20),
-  cursor: z4.string().trim().min(1).max(1024).optional(),
+  publicStatus: z5.enum(["pending", "completed"]).optional(),
+  limit: z5.number().int().min(1).max(100).default(20),
+  cursor: z5.string().trim().min(1).max(1024).optional(),
   // tRPC's TanStack infinite-query adapter injects the fetch direction into
   // the serialized input. It is transport metadata only; list services keep
   // using the opaque cursor and deterministic server-side sort order.
-  direction: z4.enum(["forward", "backward"]).optional()
+  direction: z5.enum(["forward", "backward"]).optional()
 }).strict();
 var adminDeliveryTicketListInputSchema = deliveryTicketListInputSchema.extend({
-  userId: z4.number().int().positive().optional(),
-  assignedAdminId: z4.number().int().positive().optional(),
-  query: z4.string().trim().max(100).optional(),
+  userId: z5.number().int().positive().optional(),
+  assignedAdminId: z5.number().int().positive().optional(),
+  query: z5.string().trim().max(100).optional(),
   status: deliveryTicketStatusSchema.optional(),
-  quotaPeriodId: z4.string().uuid().optional(),
-  order: z4.enum(["updated_desc", "created_asc"]).default("updated_desc")
+  quotaPeriodId: z5.string().uuid().optional(),
+  order: z5.enum(["updated_desc", "created_asc"]).default("updated_desc")
 });
-var adjustDeliveryTicketQuotaSchema = z4.object({
-  userId: z4.number().int().positive(),
-  quotaPeriodId: z4.string().uuid(),
-  expectedRevision: z4.number().int().positive(),
-  contentAssetPublishLimit: z4.number().int().nonnegative().max(1e6),
-  websiteContentPublishLimit: z4.number().int().nonnegative().max(1e6),
-  reason: z4.string().trim().min(2).max(2e3)
+var adjustDeliveryTicketQuotaSchema = z5.object({
+  userId: z5.number().int().positive(),
+  quotaPeriodId: z5.string().uuid(),
+  expectedRevision: z5.number().int().positive(),
+  contentAssetPublishLimit: z5.number().int().nonnegative().max(1e6),
+  websiteContentPublishLimit: z5.number().int().nonnegative().max(1e6),
+  reason: z5.string().trim().min(2).max(2e3)
 });
-var addDeliveryTicketMessageSchema = z4.object({
-  ticketId: z4.string().uuid(),
-  clientRequestId: z4.string().uuid(),
-  message: z4.string().trim().min(1).max(5e4),
-  attachments: z4.array(deliveryTicketAttachmentInputSchema).max(30).default([])
+var addDeliveryTicketMessageSchema = z5.object({
+  ticketId: z5.string().uuid(),
+  clientRequestId: z5.string().uuid(),
+  message: z5.string().trim().min(1).max(5e4),
+  attachments: z5.array(deliveryTicketAttachmentInputSchema).max(30).default([])
 });
-var updateDeliveryTicketSchema = z4.object({
-  ticketId: z4.string().uuid(),
-  expectedRevision: z4.number().int().positive(),
-  status: z4.literal("completed"),
-  publicMessage: z4.string().trim().max(5e4).optional(),
-  publicSummary: z4.string().trim().max(5e4).nullable().optional(),
-  deliveryLinks: z4.array(
-    z4.object({
-      label: z4.string().trim().min(1).max(160),
+var updateDeliveryTicketSchema = z5.object({
+  ticketId: z5.string().uuid(),
+  expectedRevision: z5.number().int().positive(),
+  status: z5.literal("completed"),
+  publicMessage: z5.string().trim().max(5e4).optional(),
+  publicSummary: z5.string().trim().max(5e4).nullable().optional(),
+  deliveryLinks: z5.array(
+    z5.object({
+      label: z5.string().trim().min(1).max(160),
       url: httpUrlSchema
     })
   ).max(30).optional(),
-  verifiedDomain: z4.string().trim().max(255).optional(),
-  internalNote: z4.string().trim().max(5e4).nullable().optional()
+  verifiedDomain: z5.string().trim().max(255).optional(),
+  internalNote: z5.string().trim().max(5e4).nullable().optional()
 });
-var websiteContentTemplateRecordSchema = z4.object({
-  ticketId: z4.string().uuid(),
-  revision: z4.number().int().positive(),
+var websiteContentTemplateRecordSchema = z5.object({
+  ticketId: z5.string().uuid(),
+  revision: z5.number().int().positive(),
   category: websiteContentCategorySchema,
-  topic: z4.string().trim().max(512),
-  publicSummary: z4.string().trim().max(5e4),
-  complete: z4.boolean()
+  topic: z5.string().trim().max(512),
+  publicSummary: z5.string().trim().max(5e4),
+  complete: z5.boolean()
 }).strict();
-var websiteContentTemplateSchema = z4.object({
-  format: z4.literal("frontmind.website-content-template.v1"),
-  workspaceUserId: z4.number().int().positive(),
-  exportedAt: z4.string().datetime({ offset: true }),
-  records: z4.array(websiteContentTemplateRecordSchema).max(5e3)
+var websiteContentTemplateSchema = z5.object({
+  format: z5.literal("frontmind.website-content-template.v1"),
+  workspaceUserId: z5.number().int().positive(),
+  exportedAt: z5.string().datetime({ offset: true }),
+  records: z5.array(websiteContentTemplateRecordSchema).max(5e3)
 }).strict().superRefine((value, context) => {
   const seen = /* @__PURE__ */ new Set();
   value.records.forEach((record, index2) => {
     if (seen.has(record.ticketId)) {
       context.addIssue({
-        code: z4.ZodIssueCode.custom,
+        code: z5.ZodIssueCode.custom,
         path: ["records", index2, "ticketId"],
         message: "\u540C\u4E00\u5DE5\u5355\u5728\u6A21\u677F\u4E2D\u53EA\u80FD\u51FA\u73B0\u4E00\u6B21"
       });
@@ -3508,11 +3480,11 @@ var websiteContentTemplateSchema = z4.object({
   });
 });
 var adminAddDeliveryTicketMessageSchema = addDeliveryTicketMessageSchema.extend({
-  userId: z4.number().int().positive(),
-  visibility: z4.enum(["customer", "internal"]).default("customer"),
-  attachmentKind: z4.enum(["input", "deliverable"]).default("deliverable")
+  userId: z5.number().int().positive(),
+  visibility: z5.enum(["customer", "internal"]).default("customer"),
+  attachmentKind: z5.enum(["input", "deliverable"]).default("deliverable")
 });
-var deliverySiteCheckStatusSchema = z4.enum([
+var deliverySiteCheckStatusSchema = z5.enum([
   "not_checked",
   "pending",
   "passed",
@@ -3520,15 +3492,15 @@ var deliverySiteCheckStatusSchema = z4.enum([
   "failed",
   "not_applicable"
 ]);
-var updateWorkspaceSiteProfileSchema = z4.object({
-  userId: z4.number().int().positive(),
-  expectedRevision: z4.number().int().nonnegative(),
-  domain: z4.string().trim().max(255),
-  siteMode: z4.enum(["managed", "external", "unknown"]),
-  domainStatus: z4.enum(["not_started", "pending", "completed"]).default("not_started"),
-  icpProvince: z4.string().trim().max(64).nullable().optional(),
-  icpNumber: z4.string().trim().max(128).nullable().optional(),
-  icpStatus: z4.enum([
+var updateWorkspaceSiteProfileSchema = z5.object({
+  userId: z5.number().int().positive(),
+  expectedRevision: z5.number().int().nonnegative(),
+  domain: z5.string().trim().max(255),
+  siteMode: z5.enum(["managed", "external", "unknown"]),
+  domainStatus: z5.enum(["not_started", "pending", "completed"]).default("not_started"),
+  icpProvince: z5.string().trim().max(64).nullable().optional(),
+  icpNumber: z5.string().trim().max(128).nullable().optional(),
+  icpStatus: z5.enum([
     "not_submitted",
     "preparing",
     "submitted",
@@ -3537,16 +3509,16 @@ var updateWorkspaceSiteProfileSchema = z4.object({
     "not_required"
   ])
 });
-var upsertWorkspaceSiteCheckSchema = z4.object({
-  userId: z4.number().int().positive(),
-  key: z4.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_-]*$/),
-  label: z4.string().trim().min(1).max(160),
+var upsertWorkspaceSiteCheckSchema = z5.object({
+  userId: z5.number().int().positive(),
+  key: z5.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_-]*$/),
+  label: z5.string().trim().min(1).max(160),
   status: deliverySiteCheckStatusSchema,
-  summary: z4.string().trim().max(4e3).optional(),
-  evidence: z4.string().trim().max(8e3).optional(),
-  source: z4.string().trim().max(2048).optional(),
-  checkedAt: z4.number().int().nonnegative().nullable().optional(),
-  expectedRevision: z4.number().int().nonnegative()
+  summary: z5.string().trim().max(4e3).optional(),
+  evidence: z5.string().trim().max(8e3).optional(),
+  source: z5.string().trim().max(2048).optional(),
+  checkedAt: z5.number().int().nonnegative().nullable().optional(),
+  expectedRevision: z5.number().int().nonnegative()
 });
 var DELIVERY_TICKET_LIMITS = Object.freeze({
   basic: Object.freeze({
@@ -3591,142 +3563,143 @@ var DELIVERY_TICKET_PUBLIC_STATUS_LABELS = Object.freeze({
   pending: "\u5F85\u53D7\u7406",
   completed: "\u5DF2\u5B8C\u6210"
 });
-var publicDeliveryLinkSchema = z4.object({
-  label: z4.string().trim().min(1).max(160),
+var publicDeliveryLinkSchema = z5.object({
+  label: z5.string().trim().min(1).max(160),
   url: httpUrlSchema
 }).strict();
-var publicDeliveryTicketSummaryBaseSchema = z4.object({
-  id: z4.string().uuid(),
+var publicDeliveryTicketSummaryBaseSchema = z5.object({
+  id: z5.string().uuid(),
   type: deliveryTicketTypeSchema,
-  category: z4.string().trim().max(64).nullable(),
-  categoryLabel: z4.string().trim().max(160).nullable(),
-  topic: z4.string().trim().max(512).nullable(),
-  publicStatus: z4.enum(["pending", "completed"]),
-  publicStatusLabel: z4.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
-  publicSummary: z4.string().max(5e4).nullable()
+  category: z5.string().trim().max(64).nullable(),
+  categoryLabel: z5.string().trim().max(160).nullable(),
+  topic: z5.string().trim().max(512).nullable(),
+  publicStatus: z5.enum(["pending", "completed"]),
+  publicStatusLabel: z5.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
+  publicSummary: z5.string().max(5e4).nullable()
 });
 var publicContentAssetTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
-  type: z4.literal("content_asset"),
-  deliveryLinks: z4.array(publicDeliveryLinkSchema).max(30)
+  type: z5.literal("content_asset"),
+  deliveryLinks: z5.array(publicDeliveryLinkSchema).max(30)
 }).strict();
 var publicWebsiteTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
-  type: z4.literal("website_operation")
+  type: z5.literal("website_operation")
 }).strict();
-var publicDeliveryTicketSummarySchema = z4.discriminatedUnion("type", [
+var publicDeliveryTicketSummarySchema = z5.discriminatedUnion("type", [
   publicContentAssetTicketSummarySchema,
   publicWebsiteTicketSummarySchema
 ]);
-var publicDeliveryTicketEventSchema = z4.object({
-  id: z4.string().uuid(),
-  actorRole: z4.enum(["user", "admin", "system"]),
-  actorLabel: z4.enum(["\u7528\u6237", "\u670D\u52A1\u56E2\u961F"]),
-  message: z4.string().max(5e4).nullable(),
-  createdAt: z4.number().int().nonnegative().nullable()
+var publicDeliveryTicketEventSchema = z5.object({
+  id: z5.string().uuid(),
+  actorRole: z5.enum(["user", "admin", "system"]),
+  actorLabel: z5.enum(["\u7528\u6237", "\u670D\u52A1\u56E2\u961F"]),
+  message: z5.string().max(5e4).nullable(),
+  createdAt: z5.number().int().nonnegative().nullable()
 }).strict();
-var publicDeliveryTicketAttachmentSchema = z4.object({
-  id: z4.string().uuid(),
-  filename: z4.string().trim().min(1).max(512),
-  mimeType: z4.string().trim().max(255).nullable(),
-  sizeBytes: z4.number().int().nonnegative().nullable(),
-  purpose: z4.string().trim().max(160).nullable(),
-  kind: z4.enum(["input", "deliverable"]).nullable(),
-  createdAt: z4.number().int().nonnegative().nullable(),
-  downloadUrl: z4.string().regex(/^\/api\/delivery-ticket-attachments\/[0-9a-f-]{36}\/content$/)
+var publicDeliveryTicketAttachmentSchema = z5.object({
+  id: z5.string().uuid(),
+  filename: z5.string().trim().min(1).max(512),
+  mimeType: z5.string().trim().max(255).nullable(),
+  sizeBytes: z5.number().int().nonnegative().nullable(),
+  purpose: z5.string().trim().max(160).nullable(),
+  kind: z5.enum(["input", "deliverable"]).nullable(),
+  createdAt: z5.number().int().nonnegative().nullable(),
+  downloadUrl: z5.string().regex(/^\/api\/delivery-ticket-attachments\/[0-9a-f-]{36}\/content$/)
 }).strict();
-var publicContentAssetTicketDetailSchema = z4.object({
+var publicContentAssetTicketDetailSchema = z5.object({
   ticket: publicContentAssetTicketSummarySchema.extend({
     preferredMedia: preferredContentMediaSchema.nullable(),
-    revision: z4.number().int().positive(),
-    canReply: z4.boolean()
+    revision: z5.number().int().positive(),
+    canReply: z5.boolean()
   }).strict(),
-  events: z4.array(publicDeliveryTicketEventSchema),
-  attachments: z4.array(publicDeliveryTicketAttachmentSchema).max(100)
+  events: z5.array(publicDeliveryTicketEventSchema),
+  attachments: z5.array(publicDeliveryTicketAttachmentSchema).max(100)
 }).strict();
-var publicWebsiteTicketDetailSchema = z4.object({
+var publicWebsiteTicketDetailSchema = z5.object({
   ticket: publicWebsiteTicketSummarySchema
 }).strict();
-var publicDeliveryTicketDetailSchema = z4.union([
+var publicDeliveryTicketDetailSchema = z5.union([
   publicContentAssetTicketDetailSchema,
   publicWebsiteTicketDetailSchema
 ]);
-var publicDeliveryTicketQuotaSchema = z4.object({
+var publicDeliveryTicketQuotaSchema = z5.object({
   type: deliveryTicketQuotaPoolSchema,
-  allowed: z4.boolean(),
-  used: z4.number().int().nonnegative(),
-  limit: z4.number().int().nonnegative(),
-  remaining: z4.number().int().nonnegative(),
-  reason: z4.string().nullable()
+  allowed: z5.boolean(),
+  used: z5.number().int().nonnegative(),
+  limit: z5.number().int().nonnegative(),
+  remaining: z5.number().int().nonnegative(),
+  reason: z5.string().nullable()
 }).strict();
-var publicContentAssetCatalogItemSchema = z4.object({
-  id: z4.string().trim().min(1).max(64),
-  code: z4.string().trim().min(1).max(64),
-  group: z4.string().trim().min(1).max(64),
-  type: z4.string().trim().min(1).max(160),
-  label: z4.string().trim().min(1).max(160),
-  description: z4.string().trim().min(1).max(500).optional()
+var publicContentAssetCatalogItemSchema = z5.object({
+  id: z5.string().trim().min(1).max(64),
+  code: z5.string().trim().min(1).max(64),
+  group: z5.string().trim().min(1).max(64),
+  type: z5.string().trim().min(1).max(160),
+  label: z5.string().trim().min(1).max(160),
+  description: z5.string().trim().min(1).max(500).optional()
 }).strict();
-var publicWebsiteContentCatalogItemSchema = z4.object({
-  value: z4.enum([
+var publicWebsiteContentCatalogItemSchema = z5.object({
+  value: z5.enum([
     "company_facts",
     "product_case_docs",
     "industry_news",
     "company_news",
     "faq_content"
   ]),
-  label: z4.string().trim().min(1).max(160)
+  label: z5.string().trim().min(1).max(160)
 }).strict();
-var publicDeliveryTicketWorkspaceMetadataSchema = z4.object({
-  quotas: z4.object({
+var publicDeliveryTicketWorkspaceMetadataSchema = z5.object({
+  quotas: z5.object({
     content_asset_publish: publicDeliveryTicketQuotaSchema,
     website_content_publish: publicDeliveryTicketQuotaSchema
   }).strict(),
-  contentAssetCatalog: z4.array(publicContentAssetCatalogItemSchema),
-  websiteContentCatalog: z4.array(publicWebsiteContentCatalogItemSchema),
-  preferredMediaOptions: z4.array(preferredContentMediaSchema),
-  websiteWorkflow: z4.object({
-    domainCompleted: z4.boolean(),
-    icpCompleted: z4.boolean(),
-    canSubmitDomain: z4.boolean(),
-    canSubmitIcp: z4.boolean(),
-    canSubmitContent: z4.boolean(),
-    domainLockReason: z4.string().nullable(),
-    icpLockReason: z4.string().nullable(),
-    contentLockReason: z4.string().nullable(),
-    icpProvinceOptions: z4.array(z4.string().trim().min(1).max(64))
+  contentAssetCatalog: z5.array(publicContentAssetCatalogItemSchema),
+  websiteContentCatalog: z5.array(publicWebsiteContentCatalogItemSchema),
+  marketEdition: accountMarketEditionSchema,
+  preferredMediaOptions: z5.array(preferredContentMediaSchema),
+  websiteWorkflow: z5.object({
+    domainCompleted: z5.boolean(),
+    icpCompleted: z5.boolean(),
+    canSubmitDomain: z5.boolean(),
+    canSubmitIcp: z5.boolean(),
+    canSubmitContent: z5.boolean(),
+    domainLockReason: z5.string().nullable(),
+    icpLockReason: z5.string().nullable(),
+    contentLockReason: z5.string().nullable(),
+    icpProvinceOptions: z5.array(z5.string().trim().min(1).max(64))
   }).strict()
 }).strict();
-var deliveryOperationResultSchema = z4.object({
-  platform: z4.string().trim().min(1).max(160),
+var deliveryOperationResultSchema = z5.object({
+  platform: z5.string().trim().min(1).max(160),
   targetUrl: httpUrlSchema,
-  executedAt: z4.number().int().nonnegative(),
-  resultStatus: z4.enum(["success", "failed", "pending_confirmation"]),
-  platformMessage: z4.string().trim().max(8e3).optional(),
-  screenshotFileId: z4.string().trim().min(1).max(255).optional()
+  executedAt: z5.number().int().nonnegative(),
+  resultStatus: z5.enum(["success", "failed", "pending_confirmation"]),
+  platformMessage: z5.string().trim().max(8e3).optional(),
+  screenshotFileId: z5.string().trim().min(1).max(255).optional()
 });
-var recordDeliveryOperationSchema = z4.object({
-  userId: z4.number().int().positive(),
-  ticketId: z4.string().uuid(),
-  expectedRevision: z4.number().int().positive(),
-  clientRequestId: z4.string().uuid(),
+var recordDeliveryOperationSchema = z5.object({
+  userId: z5.number().int().positive(),
+  ticketId: z5.string().uuid(),
+  expectedRevision: z5.number().int().positive(),
+  clientRequestId: z5.string().uuid(),
   result: deliveryOperationResultSchema,
-  attachments: z4.array(deliveryTicketAttachmentInputSchema).max(20).default([])
+  attachments: z5.array(deliveryTicketAttachmentInputSchema).max(20).default([])
 });
-var redirectPreviewRowSchema = z4.object({
-  row: z4.number().int().positive(),
-  sourceUrl: z4.string(),
-  targetUrl: z4.string(),
-  statusCode: z4.number().int()
+var redirectPreviewRowSchema = z5.object({
+  row: z5.number().int().positive(),
+  sourceUrl: z5.string(),
+  targetUrl: z5.string(),
+  statusCode: z5.number().int()
 });
-var previewRedirectWorkbookSchema = z4.object({
-  userId: z4.number().int().positive(),
-  fileId: z4.string().trim().min(1).max(255),
-  filename: z4.string().trim().min(1).max(512)
+var previewRedirectWorkbookSchema = z5.object({
+  userId: z5.number().int().positive(),
+  fileId: z5.string().trim().min(1).max(255),
+  filename: z5.string().trim().min(1).max(512)
 });
-var confirmRedirectWorkbookSchema = z4.object({
-  userId: z4.number().int().positive(),
-  ticketId: z4.string().uuid(),
-  previewId: z4.string().uuid(),
-  expectedRevision: z4.number().int().positive()
+var confirmRedirectWorkbookSchema = z5.object({
+  userId: z5.number().int().positive(),
+  ticketId: z5.string().uuid(),
+  previewId: z5.string().uuid(),
+  expectedRevision: z5.number().int().positive()
 });
 
 // server/authenticated-knowledge-service.ts

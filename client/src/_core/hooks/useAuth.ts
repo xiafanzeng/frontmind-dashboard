@@ -9,6 +9,7 @@ export type AuthUser = {
   displayName: string | null;
   role: "user" | "admin";
   adminAccessLevel: "system_admin" | "delivery_admin" | null;
+  marketEdition: "domestic" | "overseas";
   isActive: boolean;
 };
 
@@ -35,7 +36,7 @@ export function useAuth() {
   const login = useCallback(
     (username: string, password: string) =>
       loginMutation.mutateAsync({ username, password }),
-    [loginMutation]
+    [loginMutation],
   );
 
   const logout = useCallback(async () => {
@@ -70,7 +71,7 @@ export function useAuth() {
       meQuery.isLoading,
       logoutMutation.error,
       logoutMutation.isPending,
-    ]
+    ],
   );
 
   return {

@@ -463,9 +463,7 @@ export function ServiceHome({
   onOpenAccount?: () => void;
 }) {
   const usesInteractiveKnowledgeFlow =
-    portal.plan.code === "knowledge" ||
-    portal.plan.code === "advanced" ||
-    portal.plan.code === "luxury";
+    portal.plan.code === "advanced" || portal.plan.code === "luxury";
   const knowledgeStep = portal.workflowSteps.find(
     (step) => step.id === "knowledge",
   );
@@ -642,8 +640,6 @@ export function ServiceHome({
                       </span>
                     ))}
                   </span>
-                ) : portal.plan.code === "knowledge" ? (
-                  "知识库构建 · 更新 · 展示"
                 ) : (
                   "待服务配置同步"
                 )}
@@ -680,9 +676,7 @@ export function ServiceHome({
               {knowledgeNeedsInteractiveBuild
                 ? portal.knowledgeBase.status === "ready"
                   ? "账号中已有历史知识库可供预填参考；当前套餐仍需在系统内逐节点完成知识库智能体流程并发布知识库。"
-                  : portal.plan.code === "knowledge"
-                    ? "知识库版从知识库智能体开始：在系统内完成资料采集、逐节点确认与发布后，可持续查看和更新企业知识库。"
-                    : "进阶版与豪华版从知识库智能体开始：先在系统内完成资料采集、逐节点确认与知识库发布，再进入品牌全域词库和选题。"
+                  : "进阶版与豪华版从知识库智能体开始：先在系统内完成资料采集、逐节点确认与知识库发布，再进入品牌全域词库和选题。"
                 : usesInteractiveKnowledgeFlow &&
                     portal.knowledgeBase.status === "ready"
                   ? "当前知识库由知识库智能体逐节点确认后发布，可直接查看并继续维护。"
@@ -714,9 +708,7 @@ export function ServiceHome({
             </Button>
           </article>
 
-          {portal.plan.code !== "knowledge" && (
-            <ServiceCycleOverview portal={portal} onNavigate={onNavigate} />
-          )}
+          <ServiceCycleOverview portal={portal} onNavigate={onNavigate} />
         </div>
       </div>
 
@@ -961,7 +953,6 @@ function PreviewSecurityActions() {
 function requiresSalesAdvisor(action: ServiceAction) {
   return (
     action.kind.includes("upgrade") ||
-    action.targetPlan === "knowledge" ||
     action.targetPlan === "advanced" ||
     action.targetPlan === "luxury"
   );
@@ -1050,9 +1041,7 @@ function SalesAdvisorDialog({
       ? "豪华版"
       : targetPlan === "advanced"
         ? "进阶版"
-        : targetPlan === "knowledge"
-          ? "知识库版"
-          : "企业服务";
+        : "企业服务";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

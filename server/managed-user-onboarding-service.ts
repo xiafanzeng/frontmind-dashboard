@@ -12,9 +12,11 @@ import {
 import { DELIVERY_TICKET_LIMITS } from "../shared/delivery-ticket";
 import {
   SERVICE_PLAN_CATALOG,
+  provisionableServicePlanCodeSchema,
   servicePlanCodeSchema,
   type ServicePlanCode,
 } from "../shared/service-portal";
+import type { AccountMarketEdition } from "../shared/account-edition";
 import {
   AuthServiceError,
   createManagedUserWithPasswordHash,
@@ -55,6 +57,7 @@ type ManagedUserOnboardingDependencies = {
       username: string;
       passwordHash: string;
       displayName?: string | null;
+      marketEdition: AccountMarketEdition;
       now: Date;
     },
     executor: unknown,
@@ -114,6 +117,7 @@ export async function createManagedServiceUser(
     password: string;
     displayName?: string | null;
     planCode: ServicePlanCode;
+    marketEdition: AccountMarketEdition;
     deliveryAdminId: number;
     apiKey: string;
   },
@@ -134,7 +138,7 @@ export async function createManagedServiceUser(
       "交付管理员创建的客户必须归属当前账号",
     );
   }
-  const planCode = servicePlanCodeSchema.parse(input.planCode);
+  const planCode = provisionableServicePlanCodeSchema.parse(input.planCode);
   const now = dependencies.now?.() ?? new Date();
   const contractId = dependencies.randomId?.() ?? randomUUID();
   const plan = SERVICE_PLAN_CATALOG[planCode];
@@ -152,6 +156,7 @@ export async function createManagedServiceUser(
           passwordHash: accountInput.passwordHash,
           displayName: accountInput.displayName,
           role: "user",
+          marketEdition: accountInput.marketEdition,
           now: accountInput.now,
         },
         executor,
@@ -220,6 +225,7 @@ export async function createManagedServiceUser(
         username: input.username,
         passwordHash,
         displayName: input.displayName,
+        marketEdition: input.marketEdition,
         now,
       },
       executor,
@@ -296,6 +302,7 @@ export async function createManagedServiceUser(
           role: "user",
           setupRequired: false,
           planCode,
+          marketEdition: input.marketEdition,
           contractId,
           entitlementStatus: "active",
           deliveryAdminId: input.deliveryAdminId,

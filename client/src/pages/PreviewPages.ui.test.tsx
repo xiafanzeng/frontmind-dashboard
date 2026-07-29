@@ -33,7 +33,7 @@ import {
 } from "./PreviewPages";
 
 describe("preview account creation form", () => {
-  it("requires an initial password and one of the four plans for a customer account", () => {
+  it("requires an initial password, plan and market edition for a customer account", () => {
     render(
       <PreviewCreateAccountDialog
         open
@@ -46,6 +46,8 @@ describe("preview account creation form", () => {
     expect(screen.getByRole("option", { name: "普通版" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "进阶版" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "豪华版" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "海内版" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "海外版" })).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "创建客户并开通套餐" }),
     ).toBeDisabled();
@@ -58,6 +60,9 @@ describe("preview account creation form", () => {
     });
     fireEvent.change(screen.getByLabelText("客户套餐"), {
       target: { value: "advanced" },
+    });
+    fireEvent.change(screen.getByLabelText("客户版本"), {
+      target: { value: "overseas" },
     });
     fireEvent.change(screen.getByLabelText("初始密码"), {
       target: { value: "customer-password" },

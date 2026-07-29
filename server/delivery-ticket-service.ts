@@ -54,10 +54,11 @@ import {
   type UpdateDeliveryTicketInput,
 } from "../shared/delivery-ticket";
 import {
+  ALL_CONTENT_ASSET_MEDIA_OPTIONS,
   CONTENT_ASSET_CATALOG,
-  CONTENT_ASSET_MEDIA_OPTIONS,
   ICP_PROVINCES,
   WEBSITE_CONTENT_CATALOG,
+  contentAssetMediaOptionsForMarketEdition,
   icpMaterialChecklistForProvince,
 } from "../shared/delivery-catalog";
 import type { AuthenticatedUser } from "./auth-service";
@@ -1227,7 +1228,12 @@ export async function getDeliveryTicketWorkspace(userId: number) {
 export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
   const db = await requireDb();
   const portal = await getServicePortal(userId);
-  const [siteProfile, quotas, pendingRows] = await Promise.all([
+  const [accountRows, siteProfile, quotas, pendingRows] = await Promise.all([
+    db
+      .select({ marketEdition: users.marketEdition })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1),
     loadSiteProfile(db, userId),
     currentQuota(db, userId, portal),
     db
@@ -1249,13 +1255,16 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
   const icpCompleted =
     siteProfile?.icpStatus === "approved" ||
     siteProfile?.icpStatus === "not_required";
+  const marketEdition = accountRows[0]?.marketEdition ?? "domestic";
   return {
     siteProfile,
     quotas,
     pendingCount: Number(pendingRows[0]?.value ?? 0),
     contentAssetCatalog: CONTENT_ASSET_CATALOG,
     websiteContentCatalog: WEBSITE_CONTENT_CATALOG,
-    preferredMediaOptions: CONTENT_ASSET_MEDIA_OPTIONS,
+    marketEdition,
+    preferredMediaOptions:
+      contentAssetMediaOptionsForMarketEdition(marketEdition),
     websiteWorkflow: {
       domainStatus: siteProfile?.domainStatus ?? "not_started",
       icpStatus: siteProfile?.icpStatus ?? "not_submitted",
@@ -1303,6 +1312,7 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
     },
     contentAssetCatalog: metadata.contentAssetCatalog,
     websiteContentCatalog: metadata.websiteContentCatalog,
+    marketEdition: metadata.marketEdition,
     preferredMediaOptions: metadata.preferredMediaOptions,
     websiteWorkflow: {
       domainCompleted,
@@ -1364,6 +1374,25 @@ export async function createDeliveryTicket(input: {
   value: CreateDeliveryTicketInput;
 }) {
   const db = await requireDb();
+  if (input.value.type === "content_asset" && input.value.preferredMedia) {
+    const accountRows = await db
+      .select({ marketEdition: users.marketEdition })
+      .from(users)
+      .where(eq(users.id, input.userId))
+      .limit(1);
+    const allowedMedia = new Set<string>(
+      contentAssetMediaOptionsForMarketEdition(
+        accountRows[0]?.marketEdition ?? "domestic",
+      ),
+    );
+    if (!allowedMedia.has(input.value.preferredMedia)) {
+      throw new DeliveryTicketError(
+        "PREFERRED_MEDIA_EDITION_INVALID",
+        "所选媒体不属于当前账号版本，请刷新后重新选择。",
+        400,
+      );
+    }
+  }
   const portal = await getServicePortal(input.userId);
   let quotaPool: DeliveryTicketQuotaPool | null;
   try {
@@ -1870,10 +1899,10 @@ export async function getPublicDeliveryTicketDetail(input: {
   ]);
   const preferredMedia =
     ticket.preferredMedia &&
-    CONTENT_ASSET_MEDIA_OPTIONS.includes(
-      ticket.preferredMedia as (typeof CONTENT_ASSET_MEDIA_OPTIONS)[number],
+    ALL_CONTENT_ASSET_MEDIA_OPTIONS.includes(
+      ticket.preferredMedia as (typeof ALL_CONTENT_ASSET_MEDIA_OPTIONS)[number],
     )
-      ? (ticket.preferredMedia as (typeof CONTENT_ASSET_MEDIA_OPTIONS)[number])
+      ? (ticket.preferredMedia as (typeof ALL_CONTENT_ASSET_MEDIA_OPTIONS)[number])
       : null;
   return publicContentAssetTicketDetailSchema.parse({
     ticket: {

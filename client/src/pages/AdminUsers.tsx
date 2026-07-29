@@ -20,7 +20,11 @@ import {
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
 } from "@shared/auth-constraints";
-import type { ServicePlanCode } from "@shared/service-portal";
+import {
+  ACCOUNT_MARKET_EDITION_LABELS,
+  type AccountMarketEdition,
+} from "@shared/account-edition";
+import type { ProvisionableServicePlanCode } from "@shared/service-portal";
 import { trpc } from "@/lib/trpc";
 import {
   isProtectedBuiltinAdminUsername,
@@ -583,6 +587,11 @@ function UserRow({
               : "交付管理员"
             : "用户"}
         </Badge>
+        {account.role === "user" && (
+          <Badge variant="secondary">
+            {ACCOUNT_MARKET_EDITION_LABELS[account.marketEdition || "domestic"]}
+          </Badge>
+        )}
         <Badge
           variant="outline"
           className={
@@ -701,7 +710,12 @@ export function CreateUserDialog({
   const [confirmPassword, setConfirmPassword] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [role, setRole] = useState<"user" | "admin">("user");
-  const [planCode, setPlanCode] = useState<ServicePlanCode | "">("");
+  const [planCode, setPlanCode] = useState<ProvisionableServicePlanCode | "">(
+    "",
+  );
+  const [marketEdition, setMarketEdition] = useState<AccountMarketEdition | "">(
+    "",
+  );
   const [deliveryAdminId, setDeliveryAdminId] = useState("");
   const [adminAccessLevel, setAdminAccessLevel] = useState<
     "system_admin" | "delivery_admin"
@@ -725,6 +739,7 @@ export function CreateUserDialog({
     setApiKey("");
     setRole("user");
     setPlanCode("");
+    setMarketEdition("");
     setDeliveryAdminId("");
     setAdminAccessLevel("delivery_admin");
     createMutation.reset();
@@ -763,6 +778,10 @@ export function CreateUserDialog({
       toast.error("请选择客户套餐");
       return;
     }
+    if (role === "user" && !marketEdition) {
+      toast.error("请选择客户版本");
+      return;
+    }
     if (role === "user" && !apiKey.trim()) {
       toast.error("请填写客户 API Key");
       return;
@@ -787,7 +806,8 @@ export function CreateUserDialog({
               displayName: displayName.trim() || undefined,
               password,
               role: "user",
-              planCode: planCode as ServicePlanCode,
+              planCode: planCode as ProvisionableServicePlanCode,
+              marketEdition: marketEdition as AccountMarketEdition,
               deliveryAdminId: Number(effectiveDeliveryAdminId),
               apiKey: apiKey.trim(),
             });
@@ -923,7 +943,7 @@ export function CreateUserDialog({
                   <Select
                     value={planCode}
                     onValueChange={(value) =>
-                      setPlanCode(value as ServicePlanCode)
+                      setPlanCode(value as ProvisionableServicePlanCode)
                     }
                     disabled={createMutation.isPending}
                   >
@@ -932,11 +952,31 @@ export function CreateUserDialog({
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="basic">普通版</SelectItem>
-                      <SelectItem value="knowledge">知识库版</SelectItem>
                       <SelectItem value="advanced">进阶版</SelectItem>
                       <SelectItem value="luxury">豪华版</SelectItem>
                     </SelectContent>
                   </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label>客户版本</Label>
+                  <Select
+                    value={marketEdition}
+                    onValueChange={(value) =>
+                      setMarketEdition(value as AccountMarketEdition)
+                    }
+                    disabled={createMutation.isPending}
+                  >
+                    <SelectTrigger className="w-full" aria-label="客户版本">
+                      <SelectValue placeholder="请选择海内版或海外版" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="domestic">海内版</SelectItem>
+                      <SelectItem value="overseas">海外版</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    海外版使用独立的内容资产媒体渠道；其他功能暂与海内版保持一致。
+                  </p>
                 </div>
                 {fixedDeliveryAdmin ? (
                   <div className="space-y-2">
@@ -1030,7 +1070,10 @@ export function CreateUserDialog({
                   !password ||
                   password !== confirmPassword ||
                   (role === "user" &&
-                    (!planCode || !apiKey.trim() || !effectiveDeliveryAdminId))
+                    (!planCode ||
+                      !marketEdition ||
+                      !apiKey.trim() ||
+                      !effectiveDeliveryAdminId))
                 }
               >
                 {createMutation.isPending && (

@@ -64,7 +64,7 @@ describe("CreateUserDialog", () => {
     expect(screen.getByText(/账号立即可用/)).toBeInTheDocument();
   });
 
-  it("offers all four production plans and a separate delivery owner selector", () => {
+  it("removes the retired knowledge plan and requires a market edition", () => {
     render(
       <CreateUserDialog
         open
@@ -77,14 +77,18 @@ describe("CreateUserDialog", () => {
     expect(
       screen.getByRole("combobox", { name: "客户主负责人" }),
     ).toBeEnabled();
+    expect(screen.getByRole("combobox", { name: "客户版本" })).toBeEnabled();
     fireEvent.click(screen.getByRole("combobox", { name: "客户套餐" }));
     expect(screen.getByRole("option", { name: "普通版" })).toBeInTheDocument();
-    expect(
-      screen.getByRole("option", { name: "知识库版" }),
-    ).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "知识库版" })).toBeNull();
     expect(screen.getByRole("option", { name: "进阶版" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "豪华版" })).toBeInTheDocument();
-    expect(screen.getAllByRole("option")).toHaveLength(4);
+    expect(screen.getAllByRole("option")).toHaveLength(3);
+
+    fireEvent.click(screen.getByRole("option", { name: "普通版" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "客户版本" }));
+    expect(screen.getByRole("option", { name: "海内版" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "海外版" })).toBeInTheDocument();
   });
 
   it("keeps administrator creation available only in the system-admin variant", () => {

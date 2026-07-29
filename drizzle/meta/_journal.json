@@ -253,6 +253,20 @@
       "when": 1785257474280,
       "tag": "0035_nervous_sauron",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "5",
+      "when": 1785329608867,
+      "tag": "0036_account-market-edition",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "5",
+      "when": 1785330078305,
+      "tag": "0037_remove-knowledge-plan",
+      "breakpoints": true
     }
   ]
 }

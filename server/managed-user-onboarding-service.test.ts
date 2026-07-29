@@ -98,6 +98,7 @@ function harness(options?: {
         username: "new.customer",
         role: "user" as const,
         adminAccessLevel: null,
+        marketEdition: input.marketEdition,
       };
     },
     persistContract: async (value: any, executor: unknown) => {
@@ -136,7 +137,7 @@ function harness(options?: {
 }
 
 describe("managed user onboarding", () => {
-  it.each<ServicePlanCode>(["basic", "knowledge", "advanced", "luxury"])(
+  it.each<ServicePlanCode>(["basic", "advanced", "luxury"])(
     "immediately activates the %s plan, quota, direct Key and delivery-owner assignment",
     async (planCode) => {
       const test = harness();
@@ -147,6 +148,7 @@ describe("managed user onboarding", () => {
           password: "customer-initial-password",
           displayName: "新客户",
           planCode,
+          marketEdition: "domestic",
           deliveryAdminId: 42,
           apiKey: "sk-customer-valid-credential-00000001",
         },
@@ -233,6 +235,7 @@ describe("managed user onboarding", () => {
         username: "system.created.customer",
         password: "customer-initial-password",
         planCode: "advanced",
+        marketEdition: "overseas",
         deliveryAdminId: 42,
         apiKey: "sk-customer-valid-credential-00000002",
       },
@@ -257,6 +260,7 @@ describe("managed user onboarding", () => {
             username: "rollback.customer",
             password: "customer-initial-password",
             planCode: "luxury",
+            marketEdition: "domestic",
             deliveryAdminId: 42,
             apiKey: "sk-customer-valid-credential-00000003",
           },
@@ -286,6 +290,7 @@ describe("managed user onboarding", () => {
           username: "forbidden.customer",
           password: "customer-initial-password",
           planCode: "basic",
+          marketEdition: "domestic",
           deliveryAdminId: 42,
           apiKey: "sk-customer-valid-credential-00000004",
         },
@@ -304,6 +309,7 @@ describe("managed user onboarding", () => {
         username: "delivery.created.customer",
         password: "customer-initial-password",
         planCode: "luxury",
+        marketEdition: "domestic",
         deliveryAdminId: 42,
         apiKey: "sk-customer-valid-credential-00000005",
       },
@@ -330,6 +336,7 @@ describe("managed user onboarding", () => {
           username: "cross-assigned.customer",
           password: "customer-initial-password",
           planCode: "luxury",
+          marketEdition: "domestic",
           deliveryAdminId: 99,
           apiKey: "sk-customer-valid-credential-00000006",
         },
@@ -358,6 +365,7 @@ describe("managed user onboarding", () => {
           username: "invalid-key.customer",
           password: "customer-initial-password",
           planCode: "luxury",
+          marketEdition: "domestic",
           deliveryAdminId: 42,
           apiKey: "sk-customer-invalid-credential-000001",
         },
@@ -373,6 +381,27 @@ describe("managed user onboarding", () => {
       assignments: [],
       audits: [],
     });
+  });
+
+  it("rejects the retired knowledge plan before opening a transaction", async () => {
+    const test = harness();
+    const transaction = vi.spyOn(test.dependencies, "transaction");
+
+    await expect(
+      createManagedServiceUser(
+        {
+          actor: actor("system_admin"),
+          username: "retired-plan.customer",
+          password: "customer-initial-password",
+          planCode: "knowledge",
+          marketEdition: "domestic",
+          deliveryAdminId: 42,
+          apiKey: "sk-customer-retired-plan-credential-00001",
+        },
+        test.dependencies,
+      ),
+    ).rejects.toThrow();
+    expect(transaction).not.toHaveBeenCalled();
   });
 });
 

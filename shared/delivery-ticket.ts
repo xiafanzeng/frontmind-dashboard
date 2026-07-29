@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { accountMarketEditionSchema } from "./account-edition";
 
 export const deliveryTicketTypeSchema = z.enum([
   "content_asset",
@@ -97,6 +98,11 @@ export const preferredContentMediaSchema = z.enum([
   "中华网",
   "凤凰网",
   "微博",
+  "美联社",
+  "今日美国",
+  "雅虎",
+  "Business Insider",
+  "Barchart",
 ]);
 export type PreferredContentMedia = z.infer<typeof preferredContentMediaSchema>;
 
@@ -719,6 +725,7 @@ export const publicDeliveryTicketWorkspaceMetadataSchema = z
       .strict(),
     contentAssetCatalog: z.array(publicContentAssetCatalogItemSchema),
     websiteContentCatalog: z.array(publicWebsiteContentCatalogItemSchema),
+    marketEdition: accountMarketEditionSchema,
     preferredMediaOptions: z.array(preferredContentMediaSchema),
     websiteWorkflow: z
       .object({

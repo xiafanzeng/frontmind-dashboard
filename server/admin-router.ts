@@ -122,12 +122,14 @@ import {
   previewRedirectWorkbook,
 } from "./delivery-redirect-service";
 import {
+  provisionableServicePlanCodeSchema,
   servicePlanCodeSchema,
   toPublicServicePortal,
   toPublicServicePortalQuestion,
   type ServicePortal,
   type ServicePortalQuestion,
 } from "../shared/service-portal";
+import { accountMarketEditionSchema } from "../shared/account-edition";
 import {
   completeManagedServiceUserProvisioning,
   createManagedServiceUser,
@@ -144,18 +146,6 @@ function requireSystemAdmin(user: Parameters<typeof isSystemAdmin>[0]) {
   }
 }
 
-function dashboardNonProfilePayload(
-  payload: z.infer<typeof dashboardPayloadSchema>,
-) {
-  const {
-    brandName: _brandName,
-    headline: _headline,
-    summary: _summary,
-    ...rest
-  } = payload;
-  return rest;
-}
-
 async function assertDashboardUpdateCapability(input: {
   userId: number;
   existing: Awaited<ReturnType<typeof getDashboardWorkspace>>;
@@ -163,25 +153,6 @@ async function assertDashboardUpdateCapability(input: {
 }) {
   const portal = await getServicePortal(input.userId);
   if (portal.capabilities.contentAssets.allowed) return;
-  if (
-    portal.service.planCode === "knowledge" &&
-    portal.capabilities.knowledgeBuild.allowed
-  ) {
-    const existingPayload = dashboardPayloadSchema.parse(
-      input.existing.payload,
-    );
-    if (
-      JSON.stringify(dashboardNonProfilePayload(existingPayload)) !==
-      JSON.stringify(dashboardNonProfilePayload(input.next))
-    ) {
-      throw new ServiceEntitlementError(
-        "CAPABILITY_UPGRADE_REQUIRED",
-        "知识库版仅可在这里维护企业名称、看板标题与企业摘要；其他交付内容未包含在当前套餐。",
-        403,
-      );
-    }
-    return;
-  }
   await assertServiceCapability(input.userId, "contentAssets");
 }
 
@@ -375,6 +346,7 @@ export const adminRouter = router({
                   websiteWorkflow: workspace.websiteWorkflow,
                   contentAssetCatalog: workspace.contentAssetCatalog,
                   websiteContentCatalog: workspace.websiteContentCatalog,
+                  marketEdition: workspace.marketEdition,
                   preferredMediaOptions: workspace.preferredMediaOptions,
                 }
               : {}),
@@ -793,7 +765,7 @@ export const adminRouter = router({
             message:
               input.planCode === "basic"
                 ? "普通版为连续 30 天单题服务，不设置预付月份"
-                : "知识库版、进阶版与豪华版合同均按 3 个月服务周期建立",
+                : "进阶版与豪华版合同均按 3 个月服务周期建立",
           });
         }
         if (
@@ -1528,7 +1500,8 @@ export const adminRouter = router({
             password: passwordSchema,
             displayName: z.string().trim().max(128).optional(),
             role: z.literal("user"),
-            planCode: servicePlanCodeSchema,
+            planCode: provisionableServicePlanCodeSchema,
+            marketEdition: accountMarketEditionSchema,
             deliveryAdminId: z.number().int().positive(),
             apiKey: presalesApiKeySchema,
           }),
@@ -1575,6 +1548,7 @@ export const adminRouter = router({
             password: input.password,
             displayName: input.displayName,
             planCode: input.planCode,
+            marketEdition: input.marketEdition,
             deliveryAdminId: isSystemAdmin(ctx.user)
               ? input.deliveryAdminId
               : ctx.user.id,

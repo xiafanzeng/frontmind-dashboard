@@ -1,12 +1,12 @@
 import { z } from "zod";
 
-export const servicePlanCodeSchema = z.enum([
-  "basic",
-  "knowledge",
-  "advanced",
-  "luxury",
-]);
+export const servicePlanCodeSchema = z.enum(["basic", "advanced", "luxury"]);
 export type ServicePlanCode = z.infer<typeof servicePlanCodeSchema>;
+
+export const provisionableServicePlanCodeSchema = servicePlanCodeSchema;
+export type ProvisionableServicePlanCode = z.infer<
+  typeof provisionableServicePlanCodeSchema
+>;
 
 export const workspaceQuestionCategorySchema = z.enum([
   "industry",
@@ -135,35 +135,6 @@ export const SERVICE_PLAN_CATALOG: Readonly<
       channelDistribution: true,
       progressReport: true,
       contentAssets: true,
-    },
-  },
-  knowledge: {
-    code: "knowledge",
-    name: "知识库版",
-    description: "提供完整的知识库构建、持续更新与展示能力。",
-    planVersion: 1,
-    contractTerm: { unit: "month", count: 3 },
-    quotaCadence: "contract",
-    prepaidMonths: 3,
-    billingLabel: "季度知识库服务",
-    limits: {
-      industryLimit: 0,
-      competitorComparisonLimit: 0,
-      reputationLimit: 0,
-      productScenarioLimit: 0,
-      totalQuestionLimit: 0,
-    },
-    includedCapabilities: {
-      knowledgeBuild: true,
-      knowledgeDisplay: true,
-      globalKeywords: false,
-      questionSelection: false,
-      intentOptimization: false,
-      responseLogic: false,
-      monitoring: false,
-      channelDistribution: false,
-      progressReport: false,
-      contentAssets: false,
     },
   },
   advanced: {

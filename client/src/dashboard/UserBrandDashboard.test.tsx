@@ -72,7 +72,7 @@ function UserBrandDashboard({
   );
 }
 
-function setPreviewPlan(plan: "basic" | "knowledge" | "advanced" | "luxury") {
+function setPreviewPlan(plan: "basic" | "advanced" | "luxury") {
   window.history.replaceState({}, "", `/preview/user?plan=${plan}`);
 }
 
@@ -332,56 +332,6 @@ describe("UserBrandDashboard service experience", () => {
     expect(embeddedKnowledgeBasePanel).toHaveBeenCalledWith(
       expect.objectContaining({ preview: true, page: "display" }),
     );
-  });
-
-  it("keeps the knowledge-only plan focused on knowledge build and display", async () => {
-    setPreviewPlan("knowledge");
-    render(<UserBrandDashboard preview />);
-
-    expect(screen.getByLabelText("当前服务版本：知识库版")).toBeInTheDocument();
-    expect(screen.getByText("知识库构建 · 更新 · 展示")).toBeInTheDocument();
-
-    for (const item of ["知识库智能体", "知识库展示"]) {
-      expect(screen.getByRole("button", { name: item })).not.toHaveAttribute(
-        "title",
-      );
-    }
-    for (const item of [
-      "品牌全域词库",
-      "问题优化",
-      "应答逻辑智能体",
-      "问题监控",
-      "进度报告",
-      "内容资产运营",
-      "AI 友好官网管理",
-    ]) {
-      expect(screen.getByRole("button", { name: item })).toHaveAttribute(
-        "title",
-      );
-    }
-
-    fireEvent.click(screen.getByRole("button", { name: "知识库智能体" }));
-    expect(
-      await screen.findByTestId("embedded-knowledge-base-panel"),
-    ).toHaveTextContent("知识库组件：build");
-    expect(screen.getByTestId("embedded-knowledge-base-panel")).toHaveAttribute(
-      "data-layout-mode",
-      "workspace",
-    );
-    expect(embeddedKnowledgeBasePanel).toHaveBeenCalledWith(
-      expect.objectContaining({ page: "build", mode: "workspace" }),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "应答逻辑智能体" }));
-    expect(
-      screen.getByRole("heading", { name: "应答逻辑智能体" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "升级进阶版" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByTestId("embedded-knowledge-base-panel"),
-    ).not.toBeInTheDocument();
   });
 
   it("keeps the user knowledge builder on one conversation without a switcher", () => {
@@ -677,9 +627,10 @@ describe("UserBrandDashboard service experience", () => {
     });
     const advisorDialog = advisorHeading.closest('[role="dialog"]');
     expect(advisorDialog).toHaveClass("z-[1210]", "bg-white", "shadow-2xl");
-    expect(
-      document.querySelector('[data-slot="dialog-overlay"]'),
-    ).toHaveClass("z-[1200]", "bg-black/35");
+    expect(document.querySelector('[data-slot="dialog-overlay"]')).toHaveClass(
+      "z-[1200]",
+      "bg-black/35",
+    );
     expect(
       screen.queryByRole("heading", { name: "账号与服务" }),
     ).not.toBeInTheDocument();

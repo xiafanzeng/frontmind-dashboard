@@ -41,15 +41,27 @@ describe("administrator acceptance preview integrity", () => {
     };
 
     expect(previewAccountDraftIsValid(base)).toBe(false);
-    expect(previewAccountDraftIsValid({ ...base, planCode: "basic" })).toBe(
-      true,
-    );
-    expect(previewAccountDraftIsValid({ ...base, planCode: "advanced" })).toBe(
-      true,
-    );
-    expect(previewAccountDraftIsValid({ ...base, planCode: "luxury" })).toBe(
-      true,
-    );
+    expect(
+      previewAccountDraftIsValid({
+        ...base,
+        planCode: "basic",
+        marketEdition: "domestic",
+      }),
+    ).toBe(true);
+    expect(
+      previewAccountDraftIsValid({
+        ...base,
+        planCode: "advanced",
+        marketEdition: "overseas",
+      }),
+    ).toBe(true);
+    expect(
+      previewAccountDraftIsValid({
+        ...base,
+        planCode: "luxury",
+        marketEdition: "domestic",
+      }),
+    ).toBe(true);
 
     expect(
       previewAccountDraftIsValid({

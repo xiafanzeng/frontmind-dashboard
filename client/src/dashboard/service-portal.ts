@@ -1,9 +1,4 @@
-export type ServicePlanCode =
-  | "basic"
-  | "knowledge"
-  | "advanced"
-  | "luxury"
-  | "unknown";
+export type ServicePlanCode = "basic" | "advanced" | "luxury" | "unknown";
 
 export type ServiceCapabilityKey =
   | "knowledgeBuild"
@@ -106,10 +101,6 @@ export const SERVICE_PLAN_PRESENTATION = {
   basic: {
     name: "普通版",
     billingLabel: "30 天单题服务",
-  },
-  knowledge: {
-    name: "知识库版",
-    billingLabel: "季度知识库服务",
   },
   advanced: {
     name: "进阶版",
@@ -268,14 +259,6 @@ function normalizePlanCode(value: unknown): ServicePlanCode {
     return "basic";
   }
   if (
-    normalized === "knowledge" ||
-    normalized === "knowledge-base" ||
-    normalized === "knowledge_base" ||
-    normalized === "kb"
-  ) {
-    return "knowledge";
-  }
-  if (
     normalized === "advanced" ||
     normalized === "growth" ||
     normalized === "quarterly"
@@ -428,7 +411,6 @@ function normalizeQuotas(
   rawPortal: Record<string, unknown>,
   planCode: ServicePlanCode,
 ): ServiceQuota[] {
-  if (planCode === "knowledge") return [];
   const quotaValue = firstValue(rawPortal, [
     "quotas",
     "quota",
@@ -729,17 +711,6 @@ function defaultPurchaseActions(planCode: ServicePlanCode): ServiceAction[] {
         kind: "purchase_basic",
         label: "继续购买普通版",
         targetPlan: "basic",
-      },
-      { kind: "upgrade", label: "升级进阶版", targetPlan: "advanced" },
-      { kind: "upgrade", label: "升级豪华版", targetPlan: "luxury" },
-    ];
-  }
-  if (planCode === "knowledge") {
-    return [
-      {
-        kind: "contact_advisor",
-        label: "联系专员续费知识库版",
-        targetPlan: "knowledge",
       },
       { kind: "upgrade", label: "升级进阶版", targetPlan: "advanced" },
       { kind: "upgrade", label: "升级豪华版", targetPlan: "luxury" },

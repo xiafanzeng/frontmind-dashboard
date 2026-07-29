@@ -27,6 +27,33 @@ function contentQuota(used = 0, limit = 5) {
 }
 
 describe("ContentAssetRequestDialog", () => {
+  it("uses the isolated overseas media list when supplied by the account workspace", () => {
+    render(
+      <ContentAssetRequestDialog
+        open
+        onOpenChange={() => undefined}
+        assetType={assetType}
+        planCode="advanced"
+        quota={contentQuota()}
+        preferredMediaOptions={[
+          "美联社",
+          "今日美国",
+          "雅虎",
+          "Business Insider",
+          "Barchart",
+        ]}
+      />,
+    );
+
+    const media = screen.getByLabelText("意向媒体");
+    expect(media).toHaveTextContent("美联社");
+    expect(media).toHaveTextContent("今日美国");
+    expect(media).toHaveTextContent("雅虎");
+    expect(media).toHaveTextContent("Business Insider");
+    expect(media).toHaveTextContent("Barchart");
+    expect(media).not.toHaveTextContent("搜狐");
+  });
+
   it("fails closed without an authoritative content quota", () => {
     render(
       <ContentAssetRequestDialog

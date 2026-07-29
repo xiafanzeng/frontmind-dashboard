@@ -109,6 +109,7 @@ class SharedUsersTableDb {
             email: null,
             loginMethod: values.loginMethod ?? "password",
             role: values.role ?? "user",
+            marketEdition: values.marketEdition ?? "domestic",
             isActive: values.isActive ?? true,
             passwordChangedAt: values.passwordChangedAt ?? now,
             createdAt: now,
@@ -224,6 +225,7 @@ describe("shared Admin and website user creation path", () => {
       displayName: "示例企业·运营负责人",
       role: "user",
       planCode: "advanced",
+      marketEdition: "domestic",
       deliveryAdminId: db.deliveryAdminId,
       apiKey: "sk-admin-created-customer-credential-000001",
     });
@@ -370,6 +372,7 @@ describe("shared Admin and website user creation path", () => {
       displayName: "已分配客户",
       role: "user",
       planCode: "luxury",
+      marketEdition: "overseas",
       deliveryAdminId: 12_345,
       apiKey: "sk-delivery-customer-credential-000001",
     });
@@ -377,7 +380,11 @@ describe("shared Admin and website user creation path", () => {
     expect(result).toMatchObject({
       assignedToCreator: true,
       assignedDeliveryAdminId: db.deliveryAdminId,
-      user: { username: "assigned.customer", role: "user" },
+      user: {
+        username: "assigned.customer",
+        role: "user",
+        marketEdition: "overseas",
+      },
       contract: { planCode: "luxury" },
     });
     expect(

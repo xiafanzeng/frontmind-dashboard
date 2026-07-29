@@ -1112,6 +1112,7 @@ export async function listManagedWorkspaceUsers(actor: AuthenticatedUser) {
             id: users.id,
             username: users.username,
             displayName: users.displayName,
+            marketEdition: users.marketEdition,
             isActive: users.isActive,
             createdAt: users.createdAt,
           })

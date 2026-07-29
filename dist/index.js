@@ -6,7 +6,7 @@ import { sql as sql3 } from "drizzle-orm";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 
 // server/admin-router.ts
-import { z as z8 } from "zod";
+import { z as z9 } from "zod";
 
 // server/_core/trpc.ts
 import { initTRPC, TRPCError } from "@trpc/server";
@@ -132,6 +132,7 @@ var users = mysqlTable(
       "system_admin",
       "delivery_admin"
     ]),
+    marketEdition: mysqlEnum("marketEdition", ["domestic", "overseas"]).default("domestic").notNull(),
     isActive: boolean("isActive").default(true).notNull(),
     passwordChangedAt: timestamp("passwordChangedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -718,12 +719,7 @@ var serviceContracts = mysqlTable(
   {
     id: varchar("id", { length: 36 }).primaryKey(),
     userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
-    planCode: mysqlEnum("planCode", [
-      "basic",
-      "knowledge",
-      "advanced",
-      "luxury"
-    ]).notNull(),
+    planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]).notNull(),
     planVersion: int("planVersion", { unsigned: true }).default(1).notNull(),
     status: mysqlEnum("status", [
       "pending_confirmation",
@@ -1370,7 +1366,6 @@ var purchaseIntents = mysqlTable(
     }).references(() => serviceContracts.id, { onDelete: "set null" }),
     targetPlanCode: mysqlEnum("targetPlanCode", [
       "basic",
-      "knowledge",
       "advanced",
       "luxury"
     ]).notNull(),
@@ -2158,6 +2153,7 @@ function toAuthenticatedUser(user) {
     loginMethod: user.loginMethod,
     role: user.role,
     adminAccessLevel: user.adminAccessLevel,
+    marketEdition: user.marketEdition,
     isActive: user.isActive,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
@@ -2409,7 +2405,8 @@ async function createManagedUser(input, executor) {
       passwordHash,
       displayName: input.displayName,
       role: input.role,
-      adminAccessLevel: input.adminAccessLevel
+      adminAccessLevel: input.adminAccessLevel,
+      marketEdition: input.marketEdition
     },
     executor
   );
@@ -2437,6 +2434,7 @@ async function createManagedUserWithPasswordHash(input, executor) {
       loginMethod: "password",
       role: input.role,
       adminAccessLevel: input.role === "admin" ? input.adminAccessLevel ?? "delivery_admin" : null,
+      marketEdition: input.role === "user" ? input.marketEdition ?? "domestic" : "domestic",
       isActive: true,
       passwordChangedAt: now
     });
@@ -3086,7 +3084,7 @@ async function recordUpstreamResource(input) {
 
 // server/auth-router.ts
 import { TRPCError as TRPCError2 } from "@trpc/server";
-import { z as z6 } from "zod";
+import { z as z7 } from "zod";
 
 // shared/auth-constraints.ts
 var MIN_PASSWORD_LENGTH = 6;
@@ -3124,12 +3122,8 @@ import { z as z3 } from "zod";
 
 // shared/service-portal.ts
 import { z } from "zod";
-var servicePlanCodeSchema = z.enum([
-  "basic",
-  "knowledge",
-  "advanced",
-  "luxury"
-]);
+var servicePlanCodeSchema = z.enum(["basic", "advanced", "luxury"]);
+var provisionableServicePlanCodeSchema = servicePlanCodeSchema;
 var workspaceQuestionCategorySchema = z.enum([
   "industry",
   "competitor_comparison",
@@ -3222,35 +3216,6 @@ var SERVICE_PLAN_CATALOG = Object.freeze({
       channelDistribution: true,
       progressReport: true,
       contentAssets: true
-    }
-  },
-  knowledge: {
-    code: "knowledge",
-    name: "\u77E5\u8BC6\u5E93\u7248",
-    description: "\u63D0\u4F9B\u5B8C\u6574\u7684\u77E5\u8BC6\u5E93\u6784\u5EFA\u3001\u6301\u7EED\u66F4\u65B0\u4E0E\u5C55\u793A\u80FD\u529B\u3002",
-    planVersion: 1,
-    contractTerm: { unit: "month", count: 3 },
-    quotaCadence: "contract",
-    prepaidMonths: 3,
-    billingLabel: "\u5B63\u5EA6\u77E5\u8BC6\u5E93\u670D\u52A1",
-    limits: {
-      industryLimit: 0,
-      competitorComparisonLimit: 0,
-      reputationLimit: 0,
-      productScenarioLimit: 0,
-      totalQuestionLimit: 0
-    },
-    includedCapabilities: {
-      knowledgeBuild: true,
-      knowledgeDisplay: true,
-      globalKeywords: false,
-      questionSelection: false,
-      intentOptimization: false,
-      responseLogic: false,
-      monitoring: false,
-      channelDistribution: false,
-      progressReport: false,
-      contentAssets: false
     }
   },
   advanced: {
@@ -4263,16 +4228,22 @@ import { randomUUID as randomUUID3 } from "node:crypto";
 import { and as and4, desc as desc4, eq as eq5 } from "drizzle-orm";
 
 // shared/delivery-ticket.ts
+import { z as z6 } from "zod";
+
+// shared/account-edition.ts
 import { z as z5 } from "zod";
-var deliveryTicketTypeSchema = z5.enum([
+var accountMarketEditionSchema = z5.enum(["domestic", "overseas"]);
+
+// shared/delivery-ticket.ts
+var deliveryTicketTypeSchema = z6.enum([
   "content_asset",
   "website_operation"
 ]);
-var deliveryTicketQuotaPoolSchema = z5.enum([
+var deliveryTicketQuotaPoolSchema = z6.enum([
   "content_asset_publish",
   "website_content_publish"
 ]);
-var websiteOperationCategorySchema = z5.enum([
+var websiteOperationCategorySchema = z6.enum([
   "domain_application",
   "icp_filing",
   "company_facts",
@@ -4305,14 +4276,14 @@ var websiteOperationCategorySchema = z5.enum([
   "prelaunch_review",
   "llms_txt_experiment"
 ]);
-var websiteContentCategorySchema = z5.enum([
+var websiteContentCategorySchema = z6.enum([
   "company_facts",
   "product_case_docs",
   "industry_news",
   "company_news",
   "faq_content"
 ]);
-var deliveryTicketStatusSchema = z5.enum([
+var deliveryTicketStatusSchema = z6.enum([
   "submitted",
   "needs_information",
   "scheduled",
@@ -4321,12 +4292,12 @@ var deliveryTicketStatusSchema = z5.enum([
   "rejected",
   "cancelled"
 ]);
-var deliveryTicketQuotaStateSchema = z5.enum([
+var deliveryTicketQuotaStateSchema = z6.enum([
   "reserved",
   "consumed",
   "released"
 ]);
-var preferredContentMediaSchema = z5.enum([
+var preferredContentMediaSchema = z6.enum([
   "\u4ECA\u65E5\u5934\u6761",
   "\u641C\u72D0",
   "\u7F51\u6613",
@@ -4335,9 +4306,14 @@ var preferredContentMediaSchema = z5.enum([
   "\u767E\u5EA6",
   "\u4E2D\u534E\u7F51",
   "\u51E4\u51F0\u7F51",
-  "\u5FAE\u535A"
+  "\u5FAE\u535A",
+  "\u7F8E\u8054\u793E",
+  "\u4ECA\u65E5\u7F8E\u56FD",
+  "\u96C5\u864E",
+  "Business Insider",
+  "Barchart"
 ]);
-var icpSensitiveMaterialCategorySchema = z5.enum([
+var icpSensitiveMaterialCategorySchema = z6.enum([
   "business_license",
   "subject_responsible_person_id",
   "website_responsible_person_id",
@@ -4346,48 +4322,48 @@ var icpSensitiveMaterialCategorySchema = z5.enum([
   "enterprise_name_change_proof",
   "other_provincial_material"
 ]);
-var deliveryTicketAttachmentInputSchema = z5.object({
-  storageKind: z5.enum(["upstream", "icp_protected"]).default("upstream"),
-  fileId: z5.string().trim().min(1).max(255).optional(),
-  protectedMaterialId: z5.string().uuid().optional(),
+var deliveryTicketAttachmentInputSchema = z6.object({
+  storageKind: z6.enum(["upstream", "icp_protected"]).default("upstream"),
+  fileId: z6.string().trim().min(1).max(255).optional(),
+  protectedMaterialId: z6.string().uuid().optional(),
   sensitiveCategory: icpSensitiveMaterialCategorySchema.optional(),
-  filename: z5.string().trim().min(1).max(512),
-  mimeType: z5.string().trim().max(255).optional(),
-  sizeBytes: z5.number().int().nonnegative().max(100 * 1024 * 1024).optional(),
-  sha256: z5.string().trim().regex(/^[a-fA-F0-9]{64}$/).optional(),
-  purpose: z5.string().trim().max(160).optional(),
-  authorization: z5.enum(["owned", "licensed", "public", "authorization_pending"]).optional(),
-  copyrightNote: z5.string().trim().max(2e3).optional()
+  filename: z6.string().trim().min(1).max(512),
+  mimeType: z6.string().trim().max(255).optional(),
+  sizeBytes: z6.number().int().nonnegative().max(100 * 1024 * 1024).optional(),
+  sha256: z6.string().trim().regex(/^[a-fA-F0-9]{64}$/).optional(),
+  purpose: z6.string().trim().max(160).optional(),
+  authorization: z6.enum(["owned", "licensed", "public", "authorization_pending"]).optional(),
+  copyrightNote: z6.string().trim().max(2e3).optional()
 }).superRefine((value, context) => {
   if (value.storageKind === "icp_protected") {
     if (!value.protectedMaterialId) {
       context.addIssue({
-        code: z5.ZodIssueCode.custom,
+        code: z6.ZodIssueCode.custom,
         path: ["protectedMaterialId"],
         message: "ICP \u654F\u611F\u6750\u6599\u7F3A\u5C11\u53D7\u4FDD\u62A4\u6587\u4EF6\u6807\u8BC6"
       });
     }
     if (!value.sensitiveCategory) {
       context.addIssue({
-        code: z5.ZodIssueCode.custom,
+        code: z6.ZodIssueCode.custom,
         path: ["sensitiveCategory"],
         message: "\u8BF7\u9009\u62E9 ICP \u654F\u611F\u6750\u6599\u7C7B\u522B"
       });
     }
   } else if (!value.fileId) {
     context.addIssue({
-      code: z5.ZodIssueCode.custom,
+      code: z6.ZodIssueCode.custom,
       path: ["fileId"],
       message: "\u9644\u4EF6\u7F3A\u5C11\u6587\u4EF6\u6807\u8BC6"
     });
   }
 });
-var optionalTrimmedText = (maximum) => z5.string().trim().max(maximum).optional();
-var httpUrlSchema = z5.string().trim().max(2048).url().refine((value) => {
+var optionalTrimmedText = (maximum) => z6.string().trim().max(maximum).optional();
+var httpUrlSchema = z6.string().trim().max(2048).url().refine((value) => {
   const protocol = new URL(value).protocol;
   return protocol === "http:" || protocol === "https:";
 }, "\u4EC5\u652F\u6301 http \u6216 https \u94FE\u63A5");
-var targetPageSchema = z5.string().trim().max(2048).refine((value) => {
+var targetPageSchema = z6.string().trim().max(2048).refine((value) => {
   if (value.startsWith("/") && !value.startsWith("//")) return true;
   try {
     const protocol = new URL(value).protocol;
@@ -4396,15 +4372,15 @@ var targetPageSchema = z5.string().trim().max(2048).refine((value) => {
     return false;
   }
 }, "\u76EE\u6807\u9875\u9762\u5FC5\u987B\u662F\u7AD9\u5185\u8DEF\u5F84\u6216\u5B8C\u6574\u7684 http/https \u94FE\u63A5");
-var icpNonSensitiveDeclarationsSchema = z5.object({
-  domainHolderInformation: z5.string().trim().min(1).max(4e3),
-  websiteInformation: z5.string().trim().min(1).max(8e3),
-  aliyunAppVerificationCompleted: z5.literal(true, {
+var icpNonSensitiveDeclarationsSchema = z6.object({
+  domainHolderInformation: z6.string().trim().min(1).max(4e3),
+  websiteInformation: z6.string().trim().min(1).max(8e3),
+  aliyunAppVerificationCompleted: z6.literal(true, {
     error: "\u8BF7\u786E\u8BA4\u5DF2\u5B8C\u6210\u963F\u91CC\u4E91 App \u771F\u5B9E\u6027 / \u4EBA\u8138\u6838\u9A8C"
   })
 });
-var createDeliveryTicketSchema = z5.object({
-  clientRequestId: z5.string().uuid(),
+var createDeliveryTicketSchema = z6.object({
+  clientRequestId: z6.string().uuid(),
   type: deliveryTicketTypeSchema,
   category: optionalTrimmedText(64),
   topic: optionalTrimmedText(512),
@@ -4414,8 +4390,8 @@ var createDeliveryTicketSchema = z5.object({
   icpProvince: optionalTrimmedText(64),
   icpDeclarations: icpNonSensitiveDeclarationsSchema.optional(),
   targetPage: targetPageSchema.optional(),
-  materialUrls: z5.array(httpUrlSchema).max(30).default([]),
-  attachments: z5.array(deliveryTicketAttachmentInputSchema).max(30).default([])
+  materialUrls: z6.array(httpUrlSchema).max(30).default([]),
+  attachments: z6.array(deliveryTicketAttachmentInputSchema).max(30).default([])
 }).refine(
   (value) => Boolean(
     value.category?.trim() || value.topic?.trim() || value.title?.trim()
@@ -4427,84 +4403,84 @@ var createDeliveryTicketSchema = z5.object({
 ).superRefine((value, context) => {
   if (value.category === "icp_filing" && !value.icpDeclarations) {
     context.addIssue({
-      code: z5.ZodIssueCode.custom,
+      code: z6.ZodIssueCode.custom,
       path: ["icpDeclarations"],
       message: "\u57DF\u540D\u4E0E ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
     });
   }
 });
-var deliveryTicketDetailInputSchema = z5.object({
-  ticketId: z5.string().uuid()
+var deliveryTicketDetailInputSchema = z6.object({
+  ticketId: z6.string().uuid()
 });
-var icpMaterialChecklistInputSchema = z5.object({
-  province: z5.string().trim().min(1).max(64)
+var icpMaterialChecklistInputSchema = z6.object({
+  province: z6.string().trim().min(1).max(64)
 });
-var deliveryTicketListInputSchema = z5.object({
+var deliveryTicketListInputSchema = z6.object({
   type: deliveryTicketTypeSchema.optional(),
-  publicStatus: z5.enum(["pending", "completed"]).optional(),
-  limit: z5.number().int().min(1).max(100).default(20),
-  cursor: z5.string().trim().min(1).max(1024).optional(),
+  publicStatus: z6.enum(["pending", "completed"]).optional(),
+  limit: z6.number().int().min(1).max(100).default(20),
+  cursor: z6.string().trim().min(1).max(1024).optional(),
   // tRPC's TanStack infinite-query adapter injects the fetch direction into
   // the serialized input. It is transport metadata only; list services keep
   // using the opaque cursor and deterministic server-side sort order.
-  direction: z5.enum(["forward", "backward"]).optional()
+  direction: z6.enum(["forward", "backward"]).optional()
 }).strict();
 var adminDeliveryTicketListInputSchema = deliveryTicketListInputSchema.extend({
-  userId: z5.number().int().positive().optional(),
-  assignedAdminId: z5.number().int().positive().optional(),
-  query: z5.string().trim().max(100).optional(),
+  userId: z6.number().int().positive().optional(),
+  assignedAdminId: z6.number().int().positive().optional(),
+  query: z6.string().trim().max(100).optional(),
   status: deliveryTicketStatusSchema.optional(),
-  quotaPeriodId: z5.string().uuid().optional(),
-  order: z5.enum(["updated_desc", "created_asc"]).default("updated_desc")
+  quotaPeriodId: z6.string().uuid().optional(),
+  order: z6.enum(["updated_desc", "created_asc"]).default("updated_desc")
 });
-var adjustDeliveryTicketQuotaSchema = z5.object({
-  userId: z5.number().int().positive(),
-  quotaPeriodId: z5.string().uuid(),
-  expectedRevision: z5.number().int().positive(),
-  contentAssetPublishLimit: z5.number().int().nonnegative().max(1e6),
-  websiteContentPublishLimit: z5.number().int().nonnegative().max(1e6),
-  reason: z5.string().trim().min(2).max(2e3)
+var adjustDeliveryTicketQuotaSchema = z6.object({
+  userId: z6.number().int().positive(),
+  quotaPeriodId: z6.string().uuid(),
+  expectedRevision: z6.number().int().positive(),
+  contentAssetPublishLimit: z6.number().int().nonnegative().max(1e6),
+  websiteContentPublishLimit: z6.number().int().nonnegative().max(1e6),
+  reason: z6.string().trim().min(2).max(2e3)
 });
-var addDeliveryTicketMessageSchema = z5.object({
-  ticketId: z5.string().uuid(),
-  clientRequestId: z5.string().uuid(),
-  message: z5.string().trim().min(1).max(5e4),
-  attachments: z5.array(deliveryTicketAttachmentInputSchema).max(30).default([])
+var addDeliveryTicketMessageSchema = z6.object({
+  ticketId: z6.string().uuid(),
+  clientRequestId: z6.string().uuid(),
+  message: z6.string().trim().min(1).max(5e4),
+  attachments: z6.array(deliveryTicketAttachmentInputSchema).max(30).default([])
 });
-var updateDeliveryTicketSchema = z5.object({
-  ticketId: z5.string().uuid(),
-  expectedRevision: z5.number().int().positive(),
-  status: z5.literal("completed"),
-  publicMessage: z5.string().trim().max(5e4).optional(),
-  publicSummary: z5.string().trim().max(5e4).nullable().optional(),
-  deliveryLinks: z5.array(
-    z5.object({
-      label: z5.string().trim().min(1).max(160),
+var updateDeliveryTicketSchema = z6.object({
+  ticketId: z6.string().uuid(),
+  expectedRevision: z6.number().int().positive(),
+  status: z6.literal("completed"),
+  publicMessage: z6.string().trim().max(5e4).optional(),
+  publicSummary: z6.string().trim().max(5e4).nullable().optional(),
+  deliveryLinks: z6.array(
+    z6.object({
+      label: z6.string().trim().min(1).max(160),
       url: httpUrlSchema
     })
   ).max(30).optional(),
-  verifiedDomain: z5.string().trim().max(255).optional(),
-  internalNote: z5.string().trim().max(5e4).nullable().optional()
+  verifiedDomain: z6.string().trim().max(255).optional(),
+  internalNote: z6.string().trim().max(5e4).nullable().optional()
 });
-var websiteContentTemplateRecordSchema = z5.object({
-  ticketId: z5.string().uuid(),
-  revision: z5.number().int().positive(),
+var websiteContentTemplateRecordSchema = z6.object({
+  ticketId: z6.string().uuid(),
+  revision: z6.number().int().positive(),
   category: websiteContentCategorySchema,
-  topic: z5.string().trim().max(512),
-  publicSummary: z5.string().trim().max(5e4),
-  complete: z5.boolean()
+  topic: z6.string().trim().max(512),
+  publicSummary: z6.string().trim().max(5e4),
+  complete: z6.boolean()
 }).strict();
-var websiteContentTemplateSchema = z5.object({
-  format: z5.literal("frontmind.website-content-template.v1"),
-  workspaceUserId: z5.number().int().positive(),
-  exportedAt: z5.string().datetime({ offset: true }),
-  records: z5.array(websiteContentTemplateRecordSchema).max(5e3)
+var websiteContentTemplateSchema = z6.object({
+  format: z6.literal("frontmind.website-content-template.v1"),
+  workspaceUserId: z6.number().int().positive(),
+  exportedAt: z6.string().datetime({ offset: true }),
+  records: z6.array(websiteContentTemplateRecordSchema).max(5e3)
 }).strict().superRefine((value, context) => {
   const seen = /* @__PURE__ */ new Set();
   value.records.forEach((record, index2) => {
     if (seen.has(record.ticketId)) {
       context.addIssue({
-        code: z5.ZodIssueCode.custom,
+        code: z6.ZodIssueCode.custom,
         path: ["records", index2, "ticketId"],
         message: "\u540C\u4E00\u5DE5\u5355\u5728\u6A21\u677F\u4E2D\u53EA\u80FD\u51FA\u73B0\u4E00\u6B21"
       });
@@ -4513,11 +4489,11 @@ var websiteContentTemplateSchema = z5.object({
   });
 });
 var adminAddDeliveryTicketMessageSchema = addDeliveryTicketMessageSchema.extend({
-  userId: z5.number().int().positive(),
-  visibility: z5.enum(["customer", "internal"]).default("customer"),
-  attachmentKind: z5.enum(["input", "deliverable"]).default("deliverable")
+  userId: z6.number().int().positive(),
+  visibility: z6.enum(["customer", "internal"]).default("customer"),
+  attachmentKind: z6.enum(["input", "deliverable"]).default("deliverable")
 });
-var deliverySiteCheckStatusSchema = z5.enum([
+var deliverySiteCheckStatusSchema = z6.enum([
   "not_checked",
   "pending",
   "passed",
@@ -4525,15 +4501,15 @@ var deliverySiteCheckStatusSchema = z5.enum([
   "failed",
   "not_applicable"
 ]);
-var updateWorkspaceSiteProfileSchema = z5.object({
-  userId: z5.number().int().positive(),
-  expectedRevision: z5.number().int().nonnegative(),
-  domain: z5.string().trim().max(255),
-  siteMode: z5.enum(["managed", "external", "unknown"]),
-  domainStatus: z5.enum(["not_started", "pending", "completed"]).default("not_started"),
-  icpProvince: z5.string().trim().max(64).nullable().optional(),
-  icpNumber: z5.string().trim().max(128).nullable().optional(),
-  icpStatus: z5.enum([
+var updateWorkspaceSiteProfileSchema = z6.object({
+  userId: z6.number().int().positive(),
+  expectedRevision: z6.number().int().nonnegative(),
+  domain: z6.string().trim().max(255),
+  siteMode: z6.enum(["managed", "external", "unknown"]),
+  domainStatus: z6.enum(["not_started", "pending", "completed"]).default("not_started"),
+  icpProvince: z6.string().trim().max(64).nullable().optional(),
+  icpNumber: z6.string().trim().max(128).nullable().optional(),
+  icpStatus: z6.enum([
     "not_submitted",
     "preparing",
     "submitted",
@@ -4542,16 +4518,16 @@ var updateWorkspaceSiteProfileSchema = z5.object({
     "not_required"
   ])
 });
-var upsertWorkspaceSiteCheckSchema = z5.object({
-  userId: z5.number().int().positive(),
-  key: z5.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_-]*$/),
-  label: z5.string().trim().min(1).max(160),
+var upsertWorkspaceSiteCheckSchema = z6.object({
+  userId: z6.number().int().positive(),
+  key: z6.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_-]*$/),
+  label: z6.string().trim().min(1).max(160),
   status: deliverySiteCheckStatusSchema,
-  summary: z5.string().trim().max(4e3).optional(),
-  evidence: z5.string().trim().max(8e3).optional(),
-  source: z5.string().trim().max(2048).optional(),
-  checkedAt: z5.number().int().nonnegative().nullable().optional(),
-  expectedRevision: z5.number().int().nonnegative()
+  summary: z6.string().trim().max(4e3).optional(),
+  evidence: z6.string().trim().max(8e3).optional(),
+  source: z6.string().trim().max(2048).optional(),
+  checkedAt: z6.number().int().nonnegative().nullable().optional(),
+  expectedRevision: z6.number().int().nonnegative()
 });
 var DELIVERY_TICKET_LIMITS = Object.freeze({
   basic: Object.freeze({
@@ -4631,142 +4607,143 @@ var DELIVERY_TICKET_PUBLIC_STATUS_LABELS = Object.freeze({
   pending: "\u5F85\u53D7\u7406",
   completed: "\u5DF2\u5B8C\u6210"
 });
-var publicDeliveryLinkSchema = z5.object({
-  label: z5.string().trim().min(1).max(160),
+var publicDeliveryLinkSchema = z6.object({
+  label: z6.string().trim().min(1).max(160),
   url: httpUrlSchema
 }).strict();
-var publicDeliveryTicketSummaryBaseSchema = z5.object({
-  id: z5.string().uuid(),
+var publicDeliveryTicketSummaryBaseSchema = z6.object({
+  id: z6.string().uuid(),
   type: deliveryTicketTypeSchema,
-  category: z5.string().trim().max(64).nullable(),
-  categoryLabel: z5.string().trim().max(160).nullable(),
-  topic: z5.string().trim().max(512).nullable(),
-  publicStatus: z5.enum(["pending", "completed"]),
-  publicStatusLabel: z5.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
-  publicSummary: z5.string().max(5e4).nullable()
+  category: z6.string().trim().max(64).nullable(),
+  categoryLabel: z6.string().trim().max(160).nullable(),
+  topic: z6.string().trim().max(512).nullable(),
+  publicStatus: z6.enum(["pending", "completed"]),
+  publicStatusLabel: z6.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
+  publicSummary: z6.string().max(5e4).nullable()
 });
 var publicContentAssetTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
-  type: z5.literal("content_asset"),
-  deliveryLinks: z5.array(publicDeliveryLinkSchema).max(30)
+  type: z6.literal("content_asset"),
+  deliveryLinks: z6.array(publicDeliveryLinkSchema).max(30)
 }).strict();
 var publicWebsiteTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
-  type: z5.literal("website_operation")
+  type: z6.literal("website_operation")
 }).strict();
-var publicDeliveryTicketSummarySchema = z5.discriminatedUnion("type", [
+var publicDeliveryTicketSummarySchema = z6.discriminatedUnion("type", [
   publicContentAssetTicketSummarySchema,
   publicWebsiteTicketSummarySchema
 ]);
-var publicDeliveryTicketEventSchema = z5.object({
-  id: z5.string().uuid(),
-  actorRole: z5.enum(["user", "admin", "system"]),
-  actorLabel: z5.enum(["\u7528\u6237", "\u670D\u52A1\u56E2\u961F"]),
-  message: z5.string().max(5e4).nullable(),
-  createdAt: z5.number().int().nonnegative().nullable()
+var publicDeliveryTicketEventSchema = z6.object({
+  id: z6.string().uuid(),
+  actorRole: z6.enum(["user", "admin", "system"]),
+  actorLabel: z6.enum(["\u7528\u6237", "\u670D\u52A1\u56E2\u961F"]),
+  message: z6.string().max(5e4).nullable(),
+  createdAt: z6.number().int().nonnegative().nullable()
 }).strict();
-var publicDeliveryTicketAttachmentSchema = z5.object({
-  id: z5.string().uuid(),
-  filename: z5.string().trim().min(1).max(512),
-  mimeType: z5.string().trim().max(255).nullable(),
-  sizeBytes: z5.number().int().nonnegative().nullable(),
-  purpose: z5.string().trim().max(160).nullable(),
-  kind: z5.enum(["input", "deliverable"]).nullable(),
-  createdAt: z5.number().int().nonnegative().nullable(),
-  downloadUrl: z5.string().regex(/^\/api\/delivery-ticket-attachments\/[0-9a-f-]{36}\/content$/)
+var publicDeliveryTicketAttachmentSchema = z6.object({
+  id: z6.string().uuid(),
+  filename: z6.string().trim().min(1).max(512),
+  mimeType: z6.string().trim().max(255).nullable(),
+  sizeBytes: z6.number().int().nonnegative().nullable(),
+  purpose: z6.string().trim().max(160).nullable(),
+  kind: z6.enum(["input", "deliverable"]).nullable(),
+  createdAt: z6.number().int().nonnegative().nullable(),
+  downloadUrl: z6.string().regex(/^\/api\/delivery-ticket-attachments\/[0-9a-f-]{36}\/content$/)
 }).strict();
-var publicContentAssetTicketDetailSchema = z5.object({
+var publicContentAssetTicketDetailSchema = z6.object({
   ticket: publicContentAssetTicketSummarySchema.extend({
     preferredMedia: preferredContentMediaSchema.nullable(),
-    revision: z5.number().int().positive(),
-    canReply: z5.boolean()
+    revision: z6.number().int().positive(),
+    canReply: z6.boolean()
   }).strict(),
-  events: z5.array(publicDeliveryTicketEventSchema),
-  attachments: z5.array(publicDeliveryTicketAttachmentSchema).max(100)
+  events: z6.array(publicDeliveryTicketEventSchema),
+  attachments: z6.array(publicDeliveryTicketAttachmentSchema).max(100)
 }).strict();
-var publicWebsiteTicketDetailSchema = z5.object({
+var publicWebsiteTicketDetailSchema = z6.object({
   ticket: publicWebsiteTicketSummarySchema
 }).strict();
-var publicDeliveryTicketDetailSchema = z5.union([
+var publicDeliveryTicketDetailSchema = z6.union([
   publicContentAssetTicketDetailSchema,
   publicWebsiteTicketDetailSchema
 ]);
-var publicDeliveryTicketQuotaSchema = z5.object({
+var publicDeliveryTicketQuotaSchema = z6.object({
   type: deliveryTicketQuotaPoolSchema,
-  allowed: z5.boolean(),
-  used: z5.number().int().nonnegative(),
-  limit: z5.number().int().nonnegative(),
-  remaining: z5.number().int().nonnegative(),
-  reason: z5.string().nullable()
+  allowed: z6.boolean(),
+  used: z6.number().int().nonnegative(),
+  limit: z6.number().int().nonnegative(),
+  remaining: z6.number().int().nonnegative(),
+  reason: z6.string().nullable()
 }).strict();
-var publicContentAssetCatalogItemSchema = z5.object({
-  id: z5.string().trim().min(1).max(64),
-  code: z5.string().trim().min(1).max(64),
-  group: z5.string().trim().min(1).max(64),
-  type: z5.string().trim().min(1).max(160),
-  label: z5.string().trim().min(1).max(160),
-  description: z5.string().trim().min(1).max(500).optional()
+var publicContentAssetCatalogItemSchema = z6.object({
+  id: z6.string().trim().min(1).max(64),
+  code: z6.string().trim().min(1).max(64),
+  group: z6.string().trim().min(1).max(64),
+  type: z6.string().trim().min(1).max(160),
+  label: z6.string().trim().min(1).max(160),
+  description: z6.string().trim().min(1).max(500).optional()
 }).strict();
-var publicWebsiteContentCatalogItemSchema = z5.object({
-  value: z5.enum([
+var publicWebsiteContentCatalogItemSchema = z6.object({
+  value: z6.enum([
     "company_facts",
     "product_case_docs",
     "industry_news",
     "company_news",
     "faq_content"
   ]),
-  label: z5.string().trim().min(1).max(160)
+  label: z6.string().trim().min(1).max(160)
 }).strict();
-var publicDeliveryTicketWorkspaceMetadataSchema = z5.object({
-  quotas: z5.object({
+var publicDeliveryTicketWorkspaceMetadataSchema = z6.object({
+  quotas: z6.object({
     content_asset_publish: publicDeliveryTicketQuotaSchema,
     website_content_publish: publicDeliveryTicketQuotaSchema
   }).strict(),
-  contentAssetCatalog: z5.array(publicContentAssetCatalogItemSchema),
-  websiteContentCatalog: z5.array(publicWebsiteContentCatalogItemSchema),
-  preferredMediaOptions: z5.array(preferredContentMediaSchema),
-  websiteWorkflow: z5.object({
-    domainCompleted: z5.boolean(),
-    icpCompleted: z5.boolean(),
-    canSubmitDomain: z5.boolean(),
-    canSubmitIcp: z5.boolean(),
-    canSubmitContent: z5.boolean(),
-    domainLockReason: z5.string().nullable(),
-    icpLockReason: z5.string().nullable(),
-    contentLockReason: z5.string().nullable(),
-    icpProvinceOptions: z5.array(z5.string().trim().min(1).max(64))
+  contentAssetCatalog: z6.array(publicContentAssetCatalogItemSchema),
+  websiteContentCatalog: z6.array(publicWebsiteContentCatalogItemSchema),
+  marketEdition: accountMarketEditionSchema,
+  preferredMediaOptions: z6.array(preferredContentMediaSchema),
+  websiteWorkflow: z6.object({
+    domainCompleted: z6.boolean(),
+    icpCompleted: z6.boolean(),
+    canSubmitDomain: z6.boolean(),
+    canSubmitIcp: z6.boolean(),
+    canSubmitContent: z6.boolean(),
+    domainLockReason: z6.string().nullable(),
+    icpLockReason: z6.string().nullable(),
+    contentLockReason: z6.string().nullable(),
+    icpProvinceOptions: z6.array(z6.string().trim().min(1).max(64))
   }).strict()
 }).strict();
-var deliveryOperationResultSchema = z5.object({
-  platform: z5.string().trim().min(1).max(160),
+var deliveryOperationResultSchema = z6.object({
+  platform: z6.string().trim().min(1).max(160),
   targetUrl: httpUrlSchema,
-  executedAt: z5.number().int().nonnegative(),
-  resultStatus: z5.enum(["success", "failed", "pending_confirmation"]),
-  platformMessage: z5.string().trim().max(8e3).optional(),
-  screenshotFileId: z5.string().trim().min(1).max(255).optional()
+  executedAt: z6.number().int().nonnegative(),
+  resultStatus: z6.enum(["success", "failed", "pending_confirmation"]),
+  platformMessage: z6.string().trim().max(8e3).optional(),
+  screenshotFileId: z6.string().trim().min(1).max(255).optional()
 });
-var recordDeliveryOperationSchema = z5.object({
-  userId: z5.number().int().positive(),
-  ticketId: z5.string().uuid(),
-  expectedRevision: z5.number().int().positive(),
-  clientRequestId: z5.string().uuid(),
+var recordDeliveryOperationSchema = z6.object({
+  userId: z6.number().int().positive(),
+  ticketId: z6.string().uuid(),
+  expectedRevision: z6.number().int().positive(),
+  clientRequestId: z6.string().uuid(),
   result: deliveryOperationResultSchema,
-  attachments: z5.array(deliveryTicketAttachmentInputSchema).max(20).default([])
+  attachments: z6.array(deliveryTicketAttachmentInputSchema).max(20).default([])
 });
-var redirectPreviewRowSchema = z5.object({
-  row: z5.number().int().positive(),
-  sourceUrl: z5.string(),
-  targetUrl: z5.string(),
-  statusCode: z5.number().int()
+var redirectPreviewRowSchema = z6.object({
+  row: z6.number().int().positive(),
+  sourceUrl: z6.string(),
+  targetUrl: z6.string(),
+  statusCode: z6.number().int()
 });
-var previewRedirectWorkbookSchema = z5.object({
-  userId: z5.number().int().positive(),
-  fileId: z5.string().trim().min(1).max(255),
-  filename: z5.string().trim().min(1).max(512)
+var previewRedirectWorkbookSchema = z6.object({
+  userId: z6.number().int().positive(),
+  fileId: z6.string().trim().min(1).max(255),
+  filename: z6.string().trim().min(1).max(512)
 });
-var confirmRedirectWorkbookSchema = z5.object({
-  userId: z5.number().int().positive(),
-  ticketId: z5.string().uuid(),
-  previewId: z5.string().uuid(),
-  expectedRevision: z5.number().int().positive()
+var confirmRedirectWorkbookSchema = z6.object({
+  userId: z6.number().int().positive(),
+  ticketId: z6.string().uuid(),
+  previewId: z6.string().uuid(),
+  expectedRevision: z6.number().int().positive()
 });
 
 // server/service-entitlement.ts
@@ -5451,9 +5428,8 @@ function selectPortalContract(contracts, now = /* @__PURE__ */ new Date()) {
   };
   const planRank = {
     basic: 1,
-    knowledge: 2,
-    advanced: 3,
-    luxury: 4
+    advanced: 2,
+    luxury: 3
   };
   return [...contracts].sort((left, right) => {
     const statusDifference = statusRank[deriveEffectiveServiceStatus(right, now)] - statusRank[deriveEffectiveServiceStatus(left, now)];
@@ -5468,7 +5444,7 @@ function selectCurrentServiceContractIds(contracts, now = /* @__PURE__ */ new Da
   if (!contract) return { contract: null, contractIds: [] };
   const replacedIds = new Set(contract.replacesContractIds ?? []);
   const supplementalBasicIds = contracts.filter(
-    (value) => contract.planCode !== "knowledge" && value.planCode === "basic" && value.id !== contract.id && !replacedIds.has(value.id) && deriveEffectiveServiceStatus(value, now) === "active"
+    (value) => value.planCode === "basic" && value.id !== contract.id && !replacedIds.has(value.id) && deriveEffectiveServiceStatus(value, now) === "active"
   ).map((value) => value.id);
   return {
     contract,
@@ -5606,11 +5582,10 @@ function deriveCapabilities(status, planCode) {
   return output;
 }
 function deriveWorkflowSteps(input) {
-  const knowledgeOnlyReason = input.planCode === "knowledge" ? "\u77E5\u8BC6\u5E93\u7248\u4EC5\u5F00\u653E\u77E5\u8BC6\u5E93\u6784\u5EFA\u3001\u66F4\u65B0\u4E0E\u5C55\u793A\uFF1B\u6B64\u529F\u80FD\u672A\u5305\u542B\u5728\u5F53\u524D\u5957\u9910\u3002" : null;
   const serviceBlock = input.status === "active" ? null : capabilityReason(input.status, false) ?? "\u670D\u52A1\u5F53\u524D\u4E0D\u53EF\u7528\u3002";
   const knowledgeReason = serviceBlock ? serviceBlock : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u8FC1\u79FB\u5B8C\u6210\u3002" : null;
-  const questionReason = serviceBlock ? serviceBlock : knowledgeOnlyReason ? knowledgeOnlyReason : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\uFF0C\u5E76\u8054\u7CFB\u7BA1\u7406\u5458\u5F00\u542F\u54C1\u724C\u5168\u57DF\u8BCD\u5E93\u3002" : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5DF2\u8D2D\u95EE\u9898\u4ECE\u5B98\u7F51\u540C\u6B65\u3002" : null;
-  const responseReason = serviceBlock ? serviceBlock : knowledgeOnlyReason ? knowledgeOnlyReason : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u5E76\u53D1\u5E03\u77E5\u8BC6\u5E93\u3002" : !input.questionSelectionComplete ? "\u8BF7\u5148\u5B8C\u6210\u5F53\u524D\u670D\u52A1\u5468\u671F\u7684\u9009\u9898\u3002" : null;
+  const questionReason = serviceBlock ? serviceBlock : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\uFF0C\u5E76\u8054\u7CFB\u7BA1\u7406\u5458\u5F00\u542F\u54C1\u724C\u5168\u57DF\u8BCD\u5E93\u3002" : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5DF2\u8D2D\u95EE\u9898\u4ECE\u5B98\u7F51\u540C\u6B65\u3002" : null;
+  const responseReason = serviceBlock ? serviceBlock : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u5E76\u53D1\u5E03\u77E5\u8BC6\u5E93\u3002" : !input.questionSelectionComplete ? "\u8BF7\u5148\u5B8C\u6210\u5F53\u524D\u670D\u52A1\u5468\u671F\u7684\u9009\u9898\u3002" : null;
   const monitoringReason = responseReason ?? (!input.responseLogicComplete ? "\u8BF7\u5148\u5728\u5E94\u7B54\u903B\u8F91\u667A\u80FD\u4F53\u9010\u9898\u53D1\u5E03\u786E\u8BA4\u3002" : null);
   const distributionReason = monitoringReason ?? (!input.monitoringComplete ? "\u8BF7\u7B49\u5F85\u771F\u5B9E\u95EE\u9898\u76D1\u63A7\u6570\u636E\u5199\u5165\u3002" : null);
   const reportReason = distributionReason ?? (!input.channelDistributionComplete ? "\u8BF7\u7B49\u5F85\u53EF\u6838\u9A8C\u7684\u6E20\u9053\u5F15\u7528\u6570\u636E\u5199\u5165\u3002" : null);
@@ -5719,13 +5694,6 @@ function deriveNextAction(input) {
     return {
       kind: "start_knowledge_build",
       label: "\u5F00\u59CB\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53",
-      href: "/knowledge-base"
-    };
-  }
-  if (input.planCode === "knowledge") {
-    return {
-      kind: "view_knowledge",
-      label: "\u67E5\u770B\u77E5\u8BC6\u5E93",
       href: "/knowledge-base"
     };
   }
@@ -6390,8 +6358,7 @@ async function upsertServiceContract(input) {
       existingRows,
       input.now ?? startsAt
     );
-    const switchingFromKnowledgeToBasic = planCode === "basic" && primaryContract?.planCode === "knowledge";
-    const shouldReplaceExisting = planCode !== "basic" || input.preserveConcurrentBasic === false || switchingFromKnowledgeToBasic;
+    const shouldReplaceExisting = planCode !== "basic" || input.preserveConcurrentBasic === false;
     const explicitSourceIds = input.sourceContractIds ? [...new Set(input.sourceContractIds)] : null;
     let sourceContracts = [];
     if (shouldReplaceExisting && existingRows.length) {
@@ -6432,13 +6399,7 @@ async function upsertServiceContract(input) {
       ).orderBy(desc3(workspaceQuestions.selectedAt)).for("update");
     }
     const explicitCarryIds = input.carryQuestionIds ? [...new Set(input.carryQuestionIds)] : null;
-    if (planCode === "knowledge" && explicitCarryIds?.length) {
-      throw new ServiceEntitlementError(
-        "UPGRADE_RECONCILIATION_REQUIRED",
-        "\u77E5\u8BC6\u5E93\u7248\u4E0D\u5305\u542B\u95EE\u9898\u670D\u52A1\uFF0C\u4E0D\u80FD\u7EE7\u7EED\u643A\u5E26\u5DF2\u8D2D\u95EE\u9898\u3002"
-      );
-    }
-    const carryoverQuestions = planCode === "knowledge" ? [] : explicitCarryIds ? sourceQuestions.filter(
+    const carryoverQuestions = explicitCarryIds ? sourceQuestions.filter(
       (question) => explicitCarryIds.includes(question.id)
     ) : sourceQuestions;
     if (explicitCarryIds && carryoverQuestions.length !== explicitCarryIds.length) {
@@ -8356,7 +8317,7 @@ async function createServicePurchaseIntent(input) {
 }
 
 // server/auth-router.ts
-var passwordSchema = z6.string().min(
+var passwordSchema = z7.string().min(
   MIN_PASSWORD_LENGTH,
   `Password must contain at least ${MIN_PASSWORD_LENGTH} characters`
 ).max(MAX_PASSWORD_LENGTH, "Password is too long");
@@ -8400,9 +8361,9 @@ function toTrpcError(error) {
 var authRouter = router({
   me: publicProcedure.query(({ ctx }) => ctx.user),
   login: publicProcedure.input(
-    z6.object({
-      username: z6.string().trim().min(1).max(64),
-      password: z6.string().min(1).max(MAX_PASSWORD_LENGTH)
+    z7.object({
+      username: z7.string().trim().min(1).max(64),
+      password: z7.string().min(1).max(MAX_PASSWORD_LENGTH)
     })
   ).mutation(async ({ ctx, input }) => {
     try {
@@ -8426,8 +8387,8 @@ var authRouter = router({
     }
   }),
   setupAccount: publicProcedure.input(
-    z6.object({
-      token: z6.string().trim().min(16).max(4096),
+    z7.object({
+      token: z7.string().trim().min(16).max(4096),
       newPassword: passwordSchema
     })
   ).mutation(async ({ input }) => {
@@ -8450,7 +8411,7 @@ var authRouter = router({
       throw toTrpcError(error);
     }
   }),
-  validateSetupAccount: publicProcedure.input(z6.object({ token: z6.string().trim().min(16).max(4096) })).query(async ({ input }) => {
+  validateSetupAccount: publicProcedure.input(z7.object({ token: z7.string().trim().min(16).max(4096) })).query(async ({ input }) => {
     try {
       return input.token.includes(".") ? await validateWebsiteAccountSetupToken({ token: input.token }) : await validateManagedAccountSetupToken({ token: input.token });
     } catch (error) {
@@ -8474,8 +8435,8 @@ var authRouter = router({
     return { success: true };
   }),
   changePassword: protectedProcedure.input(
-    z6.object({
-      currentPassword: z6.string().min(1).max(128),
+    z7.object({
+      currentPassword: z7.string().min(1).max(128),
       newPassword: passwordSchema
     })
   ).mutation(async ({ ctx, input }) => {
@@ -10260,6 +10221,7 @@ async function listManagedWorkspaceUsers(actor) {
     id: users.id,
     username: users.username,
     displayName: users.displayName,
+    marketEdition: users.marketEdition,
     isActive: users.isActive,
     createdAt: users.createdAt
   }).from(users).where(
@@ -13357,17 +13319,17 @@ import {
 import { desc as desc11, eq as eq12 } from "drizzle-orm";
 
 // shared/manual-service-order.ts
-import { z as z7 } from "zod";
-var serviceCategorySchema2 = z7.enum([
+import { z as z8 } from "zod";
+var serviceCategorySchema2 = z8.enum([
   "product_scenario",
   "reputation",
   "competitor_comparison"
 ]);
-var isoDateTimeSchema2 = z7.string().datetime({ offset: true });
-var sha256Schema2 = z7.string().regex(/^[a-f0-9]{64}$/i);
-var identifierSchema3 = z7.string().trim().min(4).max(128);
-var usernameSchema = z7.string().trim().min(3).max(64).regex(/^[a-zA-Z0-9._-]+$/);
-var manualServiceOrderStatusSchema = z7.enum([
+var isoDateTimeSchema2 = z8.string().datetime({ offset: true });
+var sha256Schema2 = z8.string().regex(/^[a-f0-9]{64}$/i);
+var identifierSchema3 = z8.string().trim().min(4).max(128);
+var usernameSchema = z8.string().trim().min(3).max(64).regex(/^[a-zA-Z0-9._-]+$/);
+var manualServiceOrderStatusSchema = z8.enum([
   "pending_admin",
   "signature_required",
   "payment_required",
@@ -13377,45 +13339,45 @@ var manualServiceOrderStatusSchema = z7.enum([
   "rejected",
   "failed"
 ]);
-var manualServiceContractProfileSchema = z7.object({
-  legalName: z7.string().trim().min(2).max(200),
-  creditCode: z7.string().trim().toUpperCase().regex(/^[0-9A-HJ-NPQRTUWXY]{18}$/),
-  address: z7.string().trim().min(5).max(500),
-  signatoryName: z7.string().trim().min(2).max(128),
-  signatoryTitle: z7.string().trim().min(2).max(128),
-  mobile: z7.string().trim().regex(/^1\d{10}$/),
-  email: z7.string().trim().email().max(320),
-  authorized: z7.literal(true)
+var manualServiceContractProfileSchema = z8.object({
+  legalName: z8.string().trim().min(2).max(200),
+  creditCode: z8.string().trim().toUpperCase().regex(/^[0-9A-HJ-NPQRTUWXY]{18}$/),
+  address: z8.string().trim().min(5).max(500),
+  signatoryName: z8.string().trim().min(2).max(128),
+  signatoryTitle: z8.string().trim().min(2).max(128),
+  mobile: z8.string().trim().regex(/^1\d{10}$/),
+  email: z8.string().trim().email().max(320),
+  authorized: z8.literal(true)
 }).strict();
-var manualServiceAccountTargetSchema = z7.discriminatedUnion("mode", [
-  z7.object({
-    mode: z7.literal("create"),
+var manualServiceAccountTargetSchema = z8.discriminatedUnion("mode", [
+  z8.object({
+    mode: z8.literal("create"),
     username: usernameSchema,
-    displayName: z7.string().trim().min(2).max(128),
-    password: z7.string().min(8, "Password must contain at least 8 characters").max(MAX_PASSWORD_LENGTH, "Password is too long")
+    displayName: z8.string().trim().min(2).max(128),
+    password: z8.string().min(8, "Password must contain at least 8 characters").max(MAX_PASSWORD_LENGTH, "Password is too long")
   }).strict(),
-  z7.object({
-    mode: z7.literal("bind_existing"),
-    purchaseIntent: z7.string().trim().min(16).max(4096)
+  z8.object({
+    mode: z8.literal("bind_existing"),
+    purchaseIntent: z8.string().trim().min(16).max(4096)
   }).strict()
 ]);
-var createManualServiceOrderRequestSchema = z7.object({
-  schemaVersion: z7.literal(1),
-  project: z7.object({
-    id: z7.string().trim().min(8).max(80),
-    companyName: z7.string().trim().min(1).max(200)
+var createManualServiceOrderRequestSchema = z8.object({
+  schemaVersion: z8.literal(1),
+  project: z8.object({
+    id: z8.string().trim().min(8).max(80),
+    companyName: z8.string().trim().min(1).max(200)
   }).strict(),
-  service: z7.object({
-    planCode: z7.literal("basic"),
-    serviceDays: z7.literal(30),
-    purchasedQuestion: z7.object({
-      id: z7.string().trim().min(4).max(80),
+  service: z8.object({
+    planCode: z8.literal("basic"),
+    serviceDays: z8.literal(30),
+    purchasedQuestion: z8.object({
+      id: z8.string().trim().min(4).max(80),
       category: serviceCategorySchema2,
-      question: z7.string().trim().min(4).max(500)
+      question: z8.string().trim().min(4).max(500)
     }).strict()
   }).strict(),
-  contract: z7.object({
-    templateVersion: z7.string().trim().min(1).max(64),
+  contract: z8.object({
+    templateVersion: z8.string().trim().min(1).max(64),
     profile: manualServiceContractProfileSchema
   }).strict()
 }).strict().superRefine((value, context) => {
@@ -13428,66 +13390,66 @@ var createManualServiceOrderRequestSchema = z7.object({
     });
   }
 });
-var manualServicePaymentRequestSchema = z7.object({
-  schemaVersion: z7.literal(1),
-  payment: z7.object({
-    orderId: z7.string().trim().min(8).max(64),
-    tradeNo: z7.string().trim().min(1).max(128),
-    amountFen: z7.number().int().positive().max(1e7),
+var manualServicePaymentRequestSchema = z8.object({
+  schemaVersion: z8.literal(1),
+  payment: z8.object({
+    orderId: z8.string().trim().min(8).max(64),
+    tradeNo: z8.string().trim().min(1).max(128),
+    amountFen: z8.number().int().positive().max(1e7),
     paidAt: isoDateTimeSchema2
   }).strict()
 }).strict();
-var manualServiceAccountSetupRequestSchema = z7.object({
-  schemaVersion: z7.literal(1),
+var manualServiceAccountSetupRequestSchema = z8.object({
+  schemaVersion: z8.literal(1),
   account: manualServiceAccountTargetSchema
 }).strict();
-var prepareManualServiceOrderSchema = z7.object({
+var prepareManualServiceOrderSchema = z8.object({
   reference: identifierSchema3,
   contractId: identifierSchema3,
-  signingUrl: z7.string().url().max(2048).refine((value) => new URL(value).protocol === "https:", {
+  signingUrl: z8.string().url().max(2048).refine((value) => new URL(value).protocol === "https:", {
     message: "signingUrl must use HTTPS"
   })
 }).strict();
-var signedArtifactSchema = z7.object({
-  fileId: z7.string().trim().min(1).max(128),
-  filename: z7.string().trim().min(1).max(500).refine(
+var signedArtifactSchema = z8.object({
+  fileId: z8.string().trim().min(1).max(128),
+  filename: z8.string().trim().min(1).max(500).refine(
     (value) => !value.includes("/") && !value.includes("\\") && !/[\u0000-\u001f\u007f]/.test(value),
     { message: "filename must be a plain file name" }
   ),
   sha256: sha256Schema2
 }).strict();
-var confirmManualServiceOrderSignedSchema = z7.object({
+var confirmManualServiceOrderSignedSchema = z8.object({
   reference: identifierSchema3,
   signedPdf: signedArtifactSchema,
   evidenceReport: signedArtifactSchema.optional(),
-  signedAt: z7.number().int().positive().max(864e13),
-  signatoryId: z7.string().trim().min(1).max(128),
-  note: z7.string().trim().min(8).max(2e3)
+  signedAt: z8.number().int().positive().max(864e13),
+  signatoryId: z8.string().trim().min(1).max(128),
+  note: z8.string().trim().min(8).max(2e3)
 }).strict();
-var activateManualServiceOrderSchema = z7.object({ reference: identifierSchema3 }).strict();
-var rejectManualServiceOrderSchema = z7.object({
+var activateManualServiceOrderSchema = z8.object({ reference: identifierSchema3 }).strict();
+var rejectManualServiceOrderSchema = z8.object({
   reference: identifierSchema3,
-  note: z7.string().trim().min(4).max(2e3)
+  note: z8.string().trim().min(4).max(2e3)
 }).strict();
-var manualServiceOrderResponseSchema = z7.object({
-  schemaVersion: z7.literal(1),
-  order: z7.object({
+var manualServiceOrderResponseSchema = z8.object({
+  schemaVersion: z8.literal(1),
+  order: z8.object({
     reference: identifierSchema3,
-    projectId: z7.string().trim().min(8).max(80),
+    projectId: z8.string().trim().min(8).max(80),
     status: manualServiceOrderStatusSchema,
     contractId: identifierSchema3.optional(),
-    signingUrl: z7.string().url().max(2048).optional(),
+    signingUrl: z8.string().url().max(2048).optional(),
     signedAt: isoDateTimeSchema2.optional(),
     provisioningReference: identifierSchema3.optional(),
-    message: z7.string().trim().min(1).max(1e3).optional(),
-    retryable: z7.boolean().optional(),
+    message: z8.string().trim().min(1).max(1e3).optional(),
+    retryable: z8.boolean().optional(),
     updatedAt: isoDateTimeSchema2
   }).strict(),
-  account: z7.object({
-    username: z7.string().trim().min(1).max(64).optional(),
-    displayName: z7.string().trim().min(1).max(128).optional(),
-    accountSetupUrl: z7.string().url().max(2048).optional(),
-    workspaceUrl: z7.string().url().max(2048).optional()
+  account: z8.object({
+    username: z8.string().trim().min(1).max(64).optional(),
+    displayName: z8.string().trim().min(1).max(128).optional(),
+    accountSetupUrl: z8.string().url().max(2048).optional(),
+    workspaceUrl: z8.string().url().max(2048).optional()
   }).strict().optional()
 }).strict().superRefine((value, context) => {
   if (value.account?.accountSetupUrl && value.order.status !== "active") {
@@ -15005,7 +14967,7 @@ var WEBSITE_CONTENT_CATALOG = Object.freeze([
   { value: "company_news", label: "\u4F01\u4E1A\u65B0\u95FB\u4E0E\u52A8\u6001" },
   { value: "faq_content", label: "FAQ \u4E0E\u95EE\u7B54\u9875\u9762" }
 ]);
-var CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+var DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
   "\u4ECA\u65E5\u5934\u6761",
   "\u641C\u72D0",
   "\u7F51\u6613",
@@ -15016,6 +14978,20 @@ var CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
   "\u51E4\u51F0\u7F51",
   "\u5FAE\u535A"
 ]);
+var OVERSEAS_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+  "\u7F8E\u8054\u793E",
+  "\u4ECA\u65E5\u7F8E\u56FD",
+  "\u96C5\u864E",
+  "Business Insider",
+  "Barchart"
+]);
+var ALL_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+  ...DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS,
+  ...OVERSEAS_CONTENT_ASSET_MEDIA_OPTIONS
+]);
+function contentAssetMediaOptionsForMarketEdition(marketEdition) {
+  return marketEdition === "overseas" ? OVERSEAS_CONTENT_ASSET_MEDIA_OPTIONS : DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS;
+}
 var ICP_PROVINCES = Object.freeze([
   "\u5317\u4EAC",
   "\u5929\u6D25",
@@ -16360,7 +16336,8 @@ async function getDeliveryTicketWorkspace(userId) {
 async function getDeliveryTicketWorkspaceMetadata(userId) {
   const db = await requireDb10();
   const portal = await getServicePortal(userId);
-  const [siteProfile, quotas, pendingRows] = await Promise.all([
+  const [accountRows, siteProfile, quotas, pendingRows] = await Promise.all([
+    db.select({ marketEdition: users.marketEdition }).from(users).where(eq17(users.id, userId)).limit(1),
     loadSiteProfile(db, userId),
     currentQuota(db, userId, portal),
     db.select({ value: count2() }).from(deliveryTickets).where(
@@ -16377,13 +16354,15 @@ async function getDeliveryTicketWorkspaceMetadata(userId) {
   ]);
   const domainCompleted = siteProfile?.domainStatus === "completed";
   const icpCompleted = siteProfile?.icpStatus === "approved" || siteProfile?.icpStatus === "not_required";
+  const marketEdition = accountRows[0]?.marketEdition ?? "domestic";
   return {
     siteProfile,
     quotas,
     pendingCount: Number(pendingRows[0]?.value ?? 0),
     contentAssetCatalog: CONTENT_ASSET_CATALOG,
     websiteContentCatalog: WEBSITE_CONTENT_CATALOG,
-    preferredMediaOptions: CONTENT_ASSET_MEDIA_OPTIONS,
+    marketEdition,
+    preferredMediaOptions: contentAssetMediaOptionsForMarketEdition(marketEdition),
     websiteWorkflow: {
       domainStatus: siteProfile?.domainStatus ?? "not_started",
       icpStatus: siteProfile?.icpStatus ?? "not_submitted",
@@ -16420,6 +16399,7 @@ function toPublicDeliveryTicketWorkspaceMetadata(metadata) {
     },
     contentAssetCatalog: metadata.contentAssetCatalog,
     websiteContentCatalog: metadata.websiteContentCatalog,
+    marketEdition: metadata.marketEdition,
     preferredMediaOptions: metadata.preferredMediaOptions,
     websiteWorkflow: {
       domainCompleted,
@@ -16448,6 +16428,21 @@ async function withSerializedTicketCreation(input) {
 }
 async function createDeliveryTicket(input) {
   const db = await requireDb10();
+  if (input.value.type === "content_asset" && input.value.preferredMedia) {
+    const accountRows = await db.select({ marketEdition: users.marketEdition }).from(users).where(eq17(users.id, input.userId)).limit(1);
+    const allowedMedia = new Set(
+      contentAssetMediaOptionsForMarketEdition(
+        accountRows[0]?.marketEdition ?? "domestic"
+      )
+    );
+    if (!allowedMedia.has(input.value.preferredMedia)) {
+      throw new DeliveryTicketError(
+        "PREFERRED_MEDIA_EDITION_INVALID",
+        "\u6240\u9009\u5A92\u4F53\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7\u7248\u672C\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u65B0\u9009\u62E9\u3002",
+        400
+      );
+    }
+  }
   const portal = await getServicePortal(input.userId);
   let quotaPool;
   try {
@@ -16838,7 +16833,7 @@ async function getPublicDeliveryTicketDetail(input) {
       )
     ).orderBy(asc7(deliveryTicketAttachments.createdAt))
   ]);
-  const preferredMedia = ticket.preferredMedia && CONTENT_ASSET_MEDIA_OPTIONS.includes(
+  const preferredMedia = ticket.preferredMedia && ALL_CONTENT_ASSET_MEDIA_OPTIONS.includes(
     ticket.preferredMedia
   ) ? ticket.preferredMedia : null;
   return publicContentAssetTicketDetailSchema.parse({
@@ -19002,7 +18997,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
       "\u4EA4\u4ED8\u7BA1\u7406\u5458\u521B\u5EFA\u7684\u5BA2\u6237\u5FC5\u987B\u5F52\u5C5E\u5F53\u524D\u8D26\u53F7"
     );
   }
-  const planCode = servicePlanCodeSchema.parse(input.planCode);
+  const planCode = provisionableServicePlanCodeSchema.parse(input.planCode);
   const now = dependencies.now?.() ?? /* @__PURE__ */ new Date();
   const contractId = dependencies.randomId?.() ?? randomUUID16();
   const plan = SERVICE_PLAN_CATALOG[planCode];
@@ -19017,6 +19012,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
       passwordHash: accountInput.passwordHash,
       displayName: accountInput.displayName,
       role: "user",
+      marketEdition: accountInput.marketEdition,
       now: accountInput.now
     },
     executor
@@ -19071,6 +19067,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
         username: input.username,
         passwordHash,
         displayName: input.displayName,
+        marketEdition: input.marketEdition,
         now
       },
       executor
@@ -19144,6 +19141,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
           role: "user",
           setupRequired: false,
           planCode,
+          marketEdition: input.marketEdition,
           contractId,
           entitlementStatus: "active",
           deliveryAdminId: input.deliveryAdminId,
@@ -19329,31 +19327,9 @@ function requireSystemAdmin(user) {
     });
   }
 }
-function dashboardNonProfilePayload(payload) {
-  const {
-    brandName: _brandName,
-    headline: _headline,
-    summary: _summary,
-    ...rest
-  } = payload;
-  return rest;
-}
 async function assertDashboardUpdateCapability(input) {
   const portal = await getServicePortal(input.userId);
   if (portal.capabilities.contentAssets.allowed) return;
-  if (portal.service.planCode === "knowledge" && portal.capabilities.knowledgeBuild.allowed) {
-    const existingPayload = dashboardPayloadSchema.parse(
-      input.existing.payload
-    );
-    if (JSON.stringify(dashboardNonProfilePayload(existingPayload)) !== JSON.stringify(dashboardNonProfilePayload(input.next))) {
-      throw new ServiceEntitlementError(
-        "CAPABILITY_UPGRADE_REQUIRED",
-        "\u77E5\u8BC6\u5E93\u7248\u4EC5\u53EF\u5728\u8FD9\u91CC\u7EF4\u62A4\u4F01\u4E1A\u540D\u79F0\u3001\u770B\u677F\u6807\u9898\u4E0E\u4F01\u4E1A\u6458\u8981\uFF1B\u5176\u4ED6\u4EA4\u4ED8\u5185\u5BB9\u672A\u5305\u542B\u5728\u5F53\u524D\u5957\u9910\u3002",
-        403
-      );
-    }
-    return;
-  }
   await assertServiceCapability(input.userId, "contentAssets");
 }
 function adminWorkspaceServiceValue(actor, portal) {
@@ -19373,30 +19349,30 @@ function throwServiceAdminError(error) {
   }
   throw toTrpcError(error);
 }
-var usernameSchema2 = z8.string().trim().min(3, "\u7528\u6237\u540D\u81F3\u5C11\u9700\u8981 3 \u4E2A\u5B57\u7B26").max(64, "\u7528\u6237\u540D\u4E0D\u80FD\u8D85\u8FC7 64 \u4E2A\u5B57\u7B26").regex(/^[a-zA-Z0-9._-]+$/, "\u7528\u6237\u540D\u53EA\u80FD\u5305\u542B\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u70B9\u3001\u4E0B\u5212\u7EBF\u548C\u8FDE\u5B57\u7B26");
-var presalesApiKeySchema = z8.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26");
-var adminUpdateServiceSchema = z8.object({
-  userId: z8.number().int().positive(),
-  expectedRevision: z8.number().int().nonnegative(),
+var usernameSchema2 = z9.string().trim().min(3, "\u7528\u6237\u540D\u81F3\u5C11\u9700\u8981 3 \u4E2A\u5B57\u7B26").max(64, "\u7528\u6237\u540D\u4E0D\u80FD\u8D85\u8FC7 64 \u4E2A\u5B57\u7B26").regex(/^[a-zA-Z0-9._-]+$/, "\u7528\u6237\u540D\u53EA\u80FD\u5305\u542B\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u70B9\u3001\u4E0B\u5212\u7EBF\u548C\u8FDE\u5B57\u7B26");
+var presalesApiKeySchema = z9.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26");
+var adminUpdateServiceSchema = z9.object({
+  userId: z9.number().int().positive(),
+  expectedRevision: z9.number().int().nonnegative(),
   planCode: servicePlanCodeSchema,
-  startsAt: z8.number().int().optional(),
-  status: z8.enum([
+  startsAt: z9.number().int().optional(),
+  status: z9.enum([
     "pending_confirmation",
     "scheduled",
     "active",
     "suspended",
     "cancelled"
   ]).default("active"),
-  sourceReference: z8.string().trim().max(191).optional(),
-  prepaidMonths: z8.number().int().positive().max(120).nullable().optional(),
-  orderReference: z8.string().trim().max(128).optional(),
-  contractReference: z8.string().trim().max(128).optional(),
-  signedAt: z8.number().int().optional(),
-  signatoryId: z8.string().trim().max(128).optional(),
-  signingEvidence: z8.record(z8.string(), z8.unknown()).optional(),
-  sourceContractIds: z8.array(z8.string().trim().min(1).max(36)).max(100).optional(),
-  carryQuestionIds: z8.array(z8.string().trim().min(1).max(36)).max(100).optional(),
-  reason: z8.string().trim().max(2e3).optional()
+  sourceReference: z9.string().trim().max(191).optional(),
+  prepaidMonths: z9.number().int().positive().max(120).nullable().optional(),
+  orderReference: z9.string().trim().max(128).optional(),
+  contractReference: z9.string().trim().max(128).optional(),
+  signedAt: z9.number().int().optional(),
+  signatoryId: z9.string().trim().max(128).optional(),
+  signingEvidence: z9.record(z9.string(), z9.unknown()).optional(),
+  sourceContractIds: z9.array(z9.string().trim().min(1).max(36)).max(100).optional(),
+  carryQuestionIds: z9.array(z9.string().trim().min(1).max(36)).max(100).optional(),
+  reason: z9.string().trim().max(2e3).optional()
 }).strict();
 function managedMonitoringCitationSummaryValue(input) {
   return {
@@ -19431,11 +19407,11 @@ var adminRouter = router({
       }
     }),
     updatePolicy: adminProcedure.input(
-      z8.object({
-        policyId: z8.string().uuid(),
-        limit: z8.number().int().positive().max(2e9),
-        warningRatio: z8.number().min(0.01).max(1),
-        windowDays: z8.number().int().min(1).max(365)
+      z9.object({
+        policyId: z9.string().uuid(),
+        limit: z9.number().int().positive().max(2e9),
+        warningRatio: z9.number().min(0.01).max(1),
+        windowDays: z9.number().int().min(1).max(365)
       })
     ).mutation(async ({ ctx, input }) => {
       try {
@@ -19480,6 +19456,7 @@ var adminRouter = router({
             websiteWorkflow: workspace.websiteWorkflow,
             contentAssetCatalog: workspace.contentAssetCatalog,
             websiteContentCatalog: workspace.websiteContentCatalog,
+            marketEdition: workspace.marketEdition,
             preferredMediaOptions: workspace.preferredMediaOptions
           } : {}
         };
@@ -19499,7 +19476,7 @@ var adminRouter = router({
     }),
     detail: adminProcedure.input(
       deliveryTicketDetailInputSchema.safeExtend({
-        userId: z8.number().int().positive()
+        userId: z9.number().int().positive()
       })
     ).query(async ({ ctx, input }) => {
       try {
@@ -19515,7 +19492,7 @@ var adminRouter = router({
     }),
     update: adminProcedure.input(
       updateDeliveryTicketSchema.extend({
-        userId: z8.number().int().positive()
+        userId: z9.number().int().positive()
       })
     ).mutation(async ({ ctx, input }) => {
       try {
@@ -19603,12 +19580,12 @@ var adminRouter = router({
       }
     }),
     audit: adminProcedure.input(
-      z8.object({
-        workspaceUserId: z8.number().int().positive().optional(),
-        limit: z8.number().int().min(1).max(100).optional(),
-        cursor: z8.object({
-          createdAt: z8.number().int().nonnegative(),
-          id: z8.string().uuid()
+      z9.object({
+        workspaceUserId: z9.number().int().positive().optional(),
+        limit: z9.number().int().min(1).max(100).optional(),
+        cursor: z9.object({
+          createdAt: z9.number().int().nonnegative(),
+          id: z9.string().uuid()
         }).optional()
       }).optional()
     ).query(async ({ ctx, input }) => {
@@ -19634,10 +19611,10 @@ var adminRouter = router({
     }),
     content: router({
       history: adminProcedure.input(
-        z8.object({
-          userId: z8.number().int().positive(),
-          limit: z8.number().int().min(1).max(100).optional(),
-          beforeRevision: z8.number().int().positive().optional()
+        z9.object({
+          userId: z9.number().int().positive(),
+          limit: z9.number().int().min(1).max(100).optional(),
+          beforeRevision: z9.number().int().positive().optional()
         })
       ).query(async ({ ctx, input }) => {
         try {
@@ -19650,9 +19627,9 @@ var adminRouter = router({
         }
       }),
       version: adminProcedure.input(
-        z8.object({
-          userId: z8.number().int().positive(),
-          revision: z8.number().int().positive()
+        z9.object({
+          userId: z9.number().int().positive(),
+          revision: z9.number().int().positive()
         })
       ).query(async ({ ctx, input }) => {
         try {
@@ -19665,11 +19642,11 @@ var adminRouter = router({
         }
       }),
       rollback: adminProcedure.input(
-        z8.object({
-          userId: z8.number().int().positive(),
-          targetRevision: z8.number().int().positive(),
-          expectedRevision: z8.number().int().positive(),
-          reason: z8.string().trim().max(2e3).optional()
+        z9.object({
+          userId: z9.number().int().positive(),
+          targetRevision: z9.number().int().positive(),
+          expectedRevision: z9.number().int().positive(),
+          reason: z9.string().trim().max(2e3).optional()
         })
       ).mutation(async ({ ctx, input }) => {
         try {
@@ -19686,11 +19663,11 @@ var adminRouter = router({
       })
     }),
     assignments: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        adminIds: z8.array(z8.number().int().positive()).max(100),
-        usageOwnerAdminId: z8.number().int().positive().nullable().optional(),
-        reason: z8.string().trim().max(2e3).optional()
+      z9.object({
+        userId: z9.number().int().positive(),
+        adminIds: z9.array(z9.number().int().positive()).max(100),
+        usageOwnerAdminId: z9.number().int().positive().nullable().optional(),
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       try {
@@ -19705,7 +19682,7 @@ var adminRouter = router({
         throw toTrpcError(error);
       }
     }),
-    dashboard: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    dashboard: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         return await getDashboardWorkspace(input.userId);
@@ -19713,7 +19690,7 @@ var adminRouter = router({
         throw toTrpcError(error);
       }
     }),
-    service: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    service: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         return adminWorkspaceServiceValue(
@@ -19724,7 +19701,7 @@ var adminRouter = router({
         throwServiceAdminError(error);
       }
     }),
-    questionPortfolio: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    questionPortfolio: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         return {
@@ -19739,15 +19716,15 @@ var adminRouter = router({
       }
     }),
     updateQuestion: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        questionId: z8.string().trim().min(1).max(64),
-        expectedRevision: z8.number().int().positive(),
-        question: z8.string().trim().min(1).max(4e3).optional(),
-        intent: z8.string().trim().max(16e3).nullable().optional(),
-        rationale: z8.string().trim().max(16e3).nullable().optional(),
-        locked: z8.boolean().optional(),
-        reason: z8.string().trim().max(2e3).optional()
+      z9.object({
+        userId: z9.number().int().positive(),
+        questionId: z9.string().trim().min(1).max(64),
+        expectedRevision: z9.number().int().positive(),
+        question: z9.string().trim().min(1).max(4e3).optional(),
+        intent: z9.string().trim().max(16e3).nullable().optional(),
+        rationale: z9.string().trim().max(16e3).nullable().optional(),
+        locked: z9.boolean().optional(),
+        reason: z9.string().trim().max(2e3).optional()
       }).refine(
         (value) => value.question !== void 0 || value.intent !== void 0 || value.rationale !== void 0 || value.locked !== void 0,
         "\u6CA1\u6709\u53EF\u66F4\u65B0\u7684\u5019\u9009\u95EE\u9898\u5B57\u6BB5"
@@ -19786,11 +19763,11 @@ var adminRouter = router({
       }
     }),
     confirmQuestionSelection: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        questionId: z8.string().trim().min(1).max(64),
-        expectedRevision: z8.number().int().positive(),
-        reason: z8.string().trim().max(2e3).optional()
+      z9.object({
+        userId: z9.number().int().positive(),
+        questionId: z9.string().trim().min(1).max(64),
+        expectedRevision: z9.number().int().positive(),
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       try {
@@ -19825,7 +19802,7 @@ var adminRouter = router({
       if (input.planCode === "basic" && input.prepaidMonths != null || input.planCode !== "basic" && input.prepaidMonths !== 3) {
         throw new TRPCError3({
           code: "BAD_REQUEST",
-          message: input.planCode === "basic" ? "\u666E\u901A\u7248\u4E3A\u8FDE\u7EED 30 \u5929\u5355\u9898\u670D\u52A1\uFF0C\u4E0D\u8BBE\u7F6E\u9884\u4ED8\u6708\u4EFD" : "\u77E5\u8BC6\u5E93\u7248\u3001\u8FDB\u9636\u7248\u4E0E\u8C6A\u534E\u7248\u5408\u540C\u5747\u6309 3 \u4E2A\u6708\u670D\u52A1\u5468\u671F\u5EFA\u7ACB"
+          message: input.planCode === "basic" ? "\u666E\u901A\u7248\u4E3A\u8FDE\u7EED 30 \u5929\u5355\u9898\u670D\u52A1\uFF0C\u4E0D\u8BBE\u7F6E\u9884\u4ED8\u6708\u4EFD" : "\u8FDB\u9636\u7248\u4E0E\u8C6A\u534E\u7248\u5408\u540C\u5747\u6309 3 \u4E2A\u6708\u670D\u52A1\u5468\u671F\u5EFA\u7ACB"
         });
       }
       if (commerciallyActive && (!input.signatoryId?.trim() || !input.signedAt)) {
@@ -19875,14 +19852,14 @@ var adminRouter = router({
       }
     }),
     bulkConfigureServices: adminProcedure.input(
-      z8.object({
-        assignments: z8.array(
-          z8.object({
-            userId: z8.number().int().positive(),
-            expectedRevision: z8.number().int().nonnegative(),
+      z9.object({
+        assignments: z9.array(
+          z9.object({
+            userId: z9.number().int().positive(),
+            expectedRevision: z9.number().int().nonnegative(),
             planCode: servicePlanCodeSchema,
-            startsAt: z8.number().int().optional(),
-            reason: z8.string().trim().max(2e3).optional()
+            startsAt: z9.number().int().optional(),
+            reason: z9.string().trim().max(2e3).optional()
           })
         ).min(1).max(200)
       })
@@ -19946,11 +19923,11 @@ var adminRouter = router({
       };
     }),
     updateDashboard: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        expectedRevision: z8.number().int().nonnegative(),
+      z9.object({
+        userId: z9.number().int().positive(),
+        expectedRevision: z9.number().int().nonnegative(),
         payload: dashboardPayloadSchema,
-        reason: z8.string().trim().max(2e3).optional()
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       try {
@@ -19998,7 +19975,7 @@ var adminRouter = router({
         throwServiceAdminError(error);
       }
     }),
-    knowledge: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    knowledge: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         return {
@@ -20009,9 +19986,9 @@ var adminRouter = router({
       }
     }),
     progress: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        conversationId: z8.string().trim().min(1).max(191).optional()
+      z9.object({
+        userId: z9.number().int().positive(),
+        conversationId: z9.string().trim().min(1).max(191).optional()
       })
     ).query(async ({ ctx, input }) => {
       try {
@@ -20026,7 +20003,7 @@ var adminRouter = router({
         throw toTrpcError(error);
       }
     }),
-    responseLogic: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    responseLogic: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         return {
@@ -20036,7 +20013,7 @@ var adminRouter = router({
         throw toTrpcError(error);
       }
     }),
-    knowledgeActivity: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    knowledgeActivity: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         return await getManagedKnowledgeActivity(input.userId);
@@ -20044,7 +20021,7 @@ var adminRouter = router({
         throw toTrpcError(error);
       }
     }),
-    taskActivity: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    taskActivity: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         return await getManagedTaskActivity(input.userId);
@@ -20052,7 +20029,7 @@ var adminRouter = router({
         throw toTrpcError(error);
       }
     }),
-    credentialStatus: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    credentialStatus: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         return await getManagedCredentialStatus(ctx.user, input.userId);
       } catch (error) {
@@ -20060,10 +20037,10 @@ var adminRouter = router({
       }
     }),
     completeProvisioning: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        expectedRevision: z8.number().int().positive(),
-        deliveryAdminId: z8.number().int().positive(),
+      z9.object({
+        userId: z9.number().int().positive(),
+        expectedRevision: z9.number().int().positive(),
+        deliveryAdminId: z9.number().int().positive(),
         apiKey: presalesApiKeySchema
       })
     ).mutation(async ({ ctx, input }) => {
@@ -20078,10 +20055,10 @@ var adminRouter = router({
       }
     }),
     replaceCredential: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
+      z9.object({
+        userId: z9.number().int().positive(),
         apiKey: presalesApiKeySchema,
-        reason: z8.string().trim().max(2e3).optional()
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       try {
@@ -20096,9 +20073,9 @@ var adminRouter = router({
       }
     }),
     deleteCredential: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        reason: z8.string().trim().max(2e3).optional()
+      z9.object({
+        userId: z9.number().int().positive(),
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       try {
@@ -20111,7 +20088,7 @@ var adminRouter = router({
         throw toTrpcError(error);
       }
     }),
-    creditUsage: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
+    creditUsage: adminProcedure.input(z9.object({ userId: z9.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         return await getManagedUserCreditUsage(ctx.user, input.userId);
       } catch (error) {
@@ -20121,7 +20098,7 @@ var adminRouter = router({
     monitoring: router({
       filters: adminProcedure.input(
         monitoringFilterOptionsSchema.safeExtend({
-          userId: z8.number().int().positive()
+          userId: z9.number().int().positive()
         })
       ).query(async ({ ctx, input }) => {
         try {
@@ -20138,7 +20115,7 @@ var adminRouter = router({
       }),
       samples: adminProcedure.input(
         listMonitoringSamplesSchema.safeExtend({
-          userId: z8.number().int().positive()
+          userId: z9.number().int().positive()
         })
       ).query(async ({ ctx, input }) => {
         try {
@@ -20157,7 +20134,7 @@ var adminRouter = router({
       }),
       citations: adminProcedure.input(
         listMonitoringCitationsSchema.safeExtend({
-          userId: z8.number().int().positive()
+          userId: z9.number().int().positive()
         })
       ).query(async ({ ctx, input }) => {
         try {
@@ -20176,7 +20153,7 @@ var adminRouter = router({
       }),
       sampleCitations: adminProcedure.input(
         listMonitoringSampleCitationsSchema.safeExtend({
-          userId: z8.number().int().positive()
+          userId: z9.number().int().positive()
         })
       ).query(async ({ ctx, input }) => {
         try {
@@ -20193,7 +20170,7 @@ var adminRouter = router({
       }),
       citationSummary: adminProcedure.input(
         monitoringCitationSummarySchema.safeExtend({
-          userId: z8.number().int().positive()
+          userId: z9.number().int().positive()
         })
       ).query(async ({ ctx, input }) => {
         try {
@@ -20245,12 +20222,12 @@ var adminRouter = router({
       }
     }),
     decide: adminProcedure.input(
-      z8.object({
-        reference: z8.string().trim().min(4).max(128),
-        decision: z8.enum(["confirm", "reject"]),
-        signedAt: z8.number().int().optional(),
-        signatoryId: z8.string().trim().min(1).max(128).optional(),
-        note: z8.string().trim().max(2e3).optional()
+      z9.object({
+        reference: z9.string().trim().min(4).max(128),
+        decision: z9.enum(["confirm", "reject"]),
+        signedAt: z9.number().int().optional(),
+        signatoryId: z9.string().trim().min(1).max(128).optional(),
+        note: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
@@ -20332,9 +20309,9 @@ var adminRouter = router({
       }
     }),
     set: adminProcedure.input(
-      z8.object({
+      z9.object({
         apiKey: presalesApiKeySchema,
-        reason: z8.string().trim().max(2e3).optional()
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
@@ -20360,9 +20337,9 @@ var adminRouter = router({
       }
     }),
     replace: adminProcedure.input(
-      z8.object({
+      z9.object({
         apiKey: presalesApiKeySchema,
-        reason: z8.string().trim().max(2e3).optional()
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
@@ -20387,7 +20364,7 @@ var adminRouter = router({
         throw toTrpcError(error);
       }
     }),
-    test: adminProcedure.input(z8.object({ apiKey: presalesApiKeySchema.optional() })).mutation(async ({ ctx, input }) => {
+    test: adminProcedure.input(z9.object({ apiKey: presalesApiKeySchema.optional() })).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
       try {
         return await testPresalesApiCredential(input.apiKey);
@@ -20396,7 +20373,7 @@ var adminRouter = router({
       }
     }),
     delete: adminProcedure.input(
-      z8.object({ reason: z8.string().trim().max(2e3).optional() }).optional()
+      z9.object({ reason: z9.string().trim().max(2e3).optional() }).optional()
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
       try {
@@ -20414,8 +20391,8 @@ var adminRouter = router({
       }
     }),
     usage: adminProcedure.input(
-      z8.object({
-        windowDays: z8.number().int().min(1).max(365)
+      z9.object({
+        windowDays: z9.number().int().min(1).max(365)
       }).optional()
     ).query(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
@@ -20436,22 +20413,23 @@ var adminRouter = router({
       }
     }),
     create: adminProcedure.input(
-      z8.discriminatedUnion("role", [
-        z8.object({
+      z9.discriminatedUnion("role", [
+        z9.object({
           username: usernameSchema2,
           password: passwordSchema,
-          displayName: z8.string().trim().max(128).optional(),
-          role: z8.literal("user"),
-          planCode: servicePlanCodeSchema,
-          deliveryAdminId: z8.number().int().positive(),
+          displayName: z9.string().trim().max(128).optional(),
+          role: z9.literal("user"),
+          planCode: provisionableServicePlanCodeSchema,
+          marketEdition: accountMarketEditionSchema,
+          deliveryAdminId: z9.number().int().positive(),
           apiKey: presalesApiKeySchema
         }),
-        z8.object({
+        z9.object({
           username: usernameSchema2,
           password: passwordSchema,
-          displayName: z8.string().trim().max(128).optional(),
-          role: z8.literal("admin"),
-          adminAccessLevel: z8.enum(["system_admin", "delivery_admin"]).default("delivery_admin")
+          displayName: z9.string().trim().max(128).optional(),
+          role: z9.literal("admin"),
+          adminAccessLevel: z9.enum(["system_admin", "delivery_admin"]).default("delivery_admin")
         })
       ])
     ).mutation(async ({ ctx, input }) => {
@@ -20486,6 +20464,7 @@ var adminRouter = router({
           password: input.password,
           displayName: input.displayName,
           planCode: input.planCode,
+          marketEdition: input.marketEdition,
           deliveryAdminId: isSystemAdmin(ctx.user) ? input.deliveryAdminId : ctx.user.id,
           apiKey: input.apiKey
         });
@@ -20506,10 +20485,10 @@ var adminRouter = router({
       }
     }),
     resetPassword: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
+      z9.object({
+        userId: z9.number().int().positive(),
         newPassword: passwordSchema,
-        reason: z8.string().trim().max(2e3).optional()
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
@@ -20529,10 +20508,10 @@ var adminRouter = router({
       }
     }),
     setActive: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        isActive: z8.boolean(),
-        reason: z8.string().trim().max(2e3).optional()
+      z9.object({
+        userId: z9.number().int().positive(),
+        isActive: z9.boolean(),
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
@@ -20553,10 +20532,10 @@ var adminRouter = router({
       }
     }),
     setAdminAccessLevel: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        adminAccessLevel: z8.enum(["system_admin", "delivery_admin"]),
-        reason: z8.string().trim().max(2e3).optional()
+      z9.object({
+        userId: z9.number().int().positive(),
+        adminAccessLevel: z9.enum(["system_admin", "delivery_admin"]),
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
@@ -20572,9 +20551,9 @@ var adminRouter = router({
       }
     }),
     delete: adminProcedure.input(
-      z8.object({
-        userId: z8.number().int().positive(),
-        reason: z8.string().trim().max(2e3).optional()
+      z9.object({
+        userId: z9.number().int().positive(),
+        reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
@@ -20605,44 +20584,44 @@ var adminRouter = router({
 import { TRPCError as TRPCError4 } from "@trpc/server";
 import { and as and19, asc as asc8, desc as desc16, eq as eq22, inArray as inArray12, isNull as isNull4 } from "drizzle-orm";
 import { randomUUID as randomUUID17 } from "node:crypto";
-import { z as z9 } from "zod";
-var attachmentSchema = z9.object({
-  id: z9.string().min(1).max(128),
-  type: z9.enum(["file", "image"]),
-  name: z9.string().min(1).max(512),
-  fileId: z9.string().min(1).max(255).optional()
+import { z as z10 } from "zod";
+var attachmentSchema = z10.object({
+  id: z10.string().min(1).max(128),
+  type: z10.enum(["file", "image"]),
+  name: z10.string().min(1).max(512),
+  fileId: z10.string().min(1).max(255).optional()
 });
-var outputFileSchema = z9.object({
-  fileUrl: z9.string().max(4096),
-  fileName: z9.string().max(512),
-  mimeType: z9.string().max(255)
+var outputFileSchema = z10.object({
+  fileUrl: z10.string().max(4096),
+  fileName: z10.string().max(512),
+  mimeType: z10.string().max(255)
 });
-var inlineImageSchema = z9.object({
-  src: z9.string().max(4096),
-  alt: z9.string().max(512).optional()
+var inlineImageSchema = z10.object({
+  src: z10.string().max(4096),
+  alt: z10.string().max(512).optional()
 });
-var messageSchema = z9.object({
-  id: z9.string().min(1).max(128),
-  role: z9.enum(["user", "assistant"]),
-  content: z9.string().max(2e6),
-  attachments: z9.array(attachmentSchema).max(100).optional(),
-  timestamp: z9.number().finite().nonnegative(),
-  outputFiles: z9.array(outputFileSchema).max(200).optional(),
-  inlineImages: z9.array(inlineImageSchema).max(200).optional(),
-  elapsedTime: z9.number().finite().nonnegative().optional(),
-  responseStartedAt: z9.number().finite().nonnegative().optional(),
-  intermediateSteps: z9.array(z9.unknown()).max(2e3).optional(),
-  stepGroups: z9.array(z9.unknown()).max(500).optional(),
-  isStepsPlaceholder: z9.boolean().optional(),
-  modelName: z9.string().max(128).optional()
+var messageSchema = z10.object({
+  id: z10.string().min(1).max(128),
+  role: z10.enum(["user", "assistant"]),
+  content: z10.string().max(2e6),
+  attachments: z10.array(attachmentSchema).max(100).optional(),
+  timestamp: z10.number().finite().nonnegative(),
+  outputFiles: z10.array(outputFileSchema).max(200).optional(),
+  inlineImages: z10.array(inlineImageSchema).max(200).optional(),
+  elapsedTime: z10.number().finite().nonnegative().optional(),
+  responseStartedAt: z10.number().finite().nonnegative().optional(),
+  intermediateSteps: z10.array(z10.unknown()).max(2e3).optional(),
+  stepGroups: z10.array(z10.unknown()).max(500).optional(),
+  isStepsPlaceholder: z10.boolean().optional(),
+  modelName: z10.string().max(128).optional()
 });
-var conversationSnapshotSchema = z9.object({
-  id: z9.string().min(1).max(128),
-  title: z9.string().min(1).max(255),
-  messages: z9.array(messageSchema).max(5e3),
-  taskId: z9.string().max(255).optional(),
-  previousResponseId: z9.string().max(255).optional(),
-  status: z9.enum([
+var conversationSnapshotSchema = z10.object({
+  id: z10.string().min(1).max(128),
+  title: z10.string().min(1).max(255),
+  messages: z10.array(messageSchema).max(5e3),
+  taskId: z10.string().max(255).optional(),
+  previousResponseId: z10.string().max(255).optional(),
+  status: z10.enum([
     "idle",
     "running",
     "pending",
@@ -20650,13 +20629,13 @@ var conversationSnapshotSchema = z9.object({
     "error",
     "failed"
   ]),
-  taskUrl: z9.string().max(4096).optional(),
-  createdAt: z9.number().finite().nonnegative(),
-  updatedAt: z9.number().finite().nonnegative(),
-  startedAt: z9.number().finite().nonnegative().optional(),
-  completedAt: z9.number().finite().nonnegative().optional(),
-  lastKnownOutputLength: z9.number().int().nonnegative().optional(),
-  deletedMessageIds: z9.array(z9.string().max(128)).max(5e3).optional()
+  taskUrl: z10.string().max(4096).optional(),
+  createdAt: z10.number().finite().nonnegative(),
+  updatedAt: z10.number().finite().nonnegative(),
+  startedAt: z10.number().finite().nonnegative().optional(),
+  completedAt: z10.number().finite().nonnegative().optional(),
+  lastKnownOutputLength: z10.number().int().nonnegative().optional(),
+  deletedMessageIds: z10.array(z10.string().max(128)).max(5e3).optional()
 });
 var LEGACY_IMPORT_MAX_RESOURCES = 200;
 var LEGACY_IMPORT_VALIDATION_CONCURRENCY = 4;
@@ -21517,7 +21496,7 @@ async function listSnapshots(userId) {
 }
 var conversationRouter = router({
   list: protectedProcedure.query(({ ctx }) => listSnapshots(ctx.user.id)),
-  syncSnapshot: protectedProcedure.input(z9.object({ conversation: conversationSnapshotSchema })).mutation(async ({ ctx, input }) => {
+  syncSnapshot: protectedProcedure.input(z10.object({ conversation: conversationSnapshotSchema })).mutation(async ({ ctx, input }) => {
     const db = requireDb13(await getDb());
     await db.transaction(async (tx) => {
       await persistSnapshot(tx, ctx.user.id, input.conversation);
@@ -21534,7 +21513,7 @@ var conversationRouter = router({
     }
     return persisted;
   }),
-  delete: protectedProcedure.input(z9.object({ id: z9.string().min(1).max(128) })).mutation(async ({ ctx, input }) => {
+  delete: protectedProcedure.input(z10.object({ id: z10.string().min(1).max(128) })).mutation(async ({ ctx, input }) => {
     const db = requireDb13(await getDb());
     const persistedConversationId = storageId(ctx.user.id, input.id);
     const existing = await db.select({ userId: conversations.userId }).from(conversations).where(eq22(conversations.id, persistedConversationId)).limit(1);
@@ -21549,7 +21528,7 @@ var conversationRouter = router({
     return { success: true };
   }),
   importLocal: protectedProcedure.input(
-    z9.object({ conversations: z9.array(conversationSnapshotSchema).max(200) })
+    z10.object({ conversations: z10.array(conversationSnapshotSchema).max(200) })
   ).mutation(async ({ ctx, input }) => {
     const db = requireDb13(await getDb());
     const prepared = await prepareLegacyImport(
@@ -21574,12 +21553,12 @@ var conversationRouter = router({
 });
 
 // server/credential-router.ts
-import { z as z10 } from "zod";
-var apiKeyInput = z10.object({
-  apiKey: z10.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26")
+import { z as z11 } from "zod";
+var apiKeyInput = z11.object({
+  apiKey: z11.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26")
 });
-var testApiKeyInput = z10.object({
-  apiKey: z10.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26").optional()
+var testApiKeyInput = z11.object({
+  apiKey: z11.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26").optional()
 });
 async function saveCredential(userId, apiKey) {
   try {
@@ -21622,7 +21601,7 @@ var credentialRouter = router({
 });
 
 // server/_core/systemRouter.ts
-import { z as z11 } from "zod";
+import { z as z12 } from "zod";
 
 // server/_core/notification.ts
 import { TRPCError as TRPCError5 } from "@trpc/server";
@@ -21709,16 +21688,16 @@ async function notifyOwner(payload) {
 // server/_core/systemRouter.ts
 var systemRouter = router({
   health: publicProcedure.input(
-    z11.object({
-      timestamp: z11.number().min(0, "timestamp cannot be negative")
+    z12.object({
+      timestamp: z12.number().min(0, "timestamp cannot be negative")
     })
   ).query(() => ({
     ok: true
   })),
   notifyOwner: adminProcedure.input(
-    z11.object({
-      title: z11.string().min(1, "title is required"),
-      content: z11.string().min(1, "content is required")
+    z12.object({
+      title: z12.string().min(1, "title is required"),
+      content: z12.string().min(1, "content is required")
     })
   ).mutation(async ({ input }) => {
     const delivered = await notifyOwner(input);
@@ -21730,41 +21709,41 @@ var systemRouter = router({
 
 // server/workspace-router.ts
 import { TRPCError as TRPCError6 } from "@trpc/server";
-import { z as z14 } from "zod";
+import { z as z15 } from "zod";
 
 // shared/response-logic.ts
-import { z as z12 } from "zod";
-var responseLogicAuthorizationSchema = z12.enum([
+import { z as z13 } from "zod";
+var responseLogicAuthorizationSchema = z13.enum([
   "\u516C\u5F00\u53EF\u7528",
   "\u5DF2\u83B7\u6388\u6743",
   "\u4EC5\u5185\u90E8\u53C2\u8003",
   "\u5F85\u786E\u8BA4"
 ]);
-var responseLogicImageSchema = z12.object({
-  id: z12.string().trim().min(1).max(191),
-  name: z12.string().trim().min(1).max(512),
-  url: z12.string().trim().max(4096),
-  caption: z12.string().max(2e3),
-  source: z12.string().max(4e3),
-  section: z12.string().max(512),
+var responseLogicImageSchema = z13.object({
+  id: z13.string().trim().min(1).max(191),
+  name: z13.string().trim().min(1).max(512),
+  url: z13.string().trim().max(4096),
+  caption: z13.string().max(2e3),
+  source: z13.string().max(4e3),
+  section: z13.string().max(512),
   authorization: responseLogicAuthorizationSchema
 });
-var responseLogicAttachmentSchema = z12.object({
-  fileId: z12.string().trim().min(1).max(255),
-  filename: z12.string().trim().min(1).max(512),
-  mimeType: z12.string().trim().min(1).max(255),
-  kind: z12.enum(["image", "file"]),
-  uploadedAt: z12.string().datetime()
+var responseLogicAttachmentSchema = z13.object({
+  fileId: z13.string().trim().min(1).max(255),
+  filename: z13.string().trim().min(1).max(512),
+  mimeType: z13.string().trim().min(1).max(255),
+  kind: z13.enum(["image", "file"]),
+  uploadedAt: z13.string().datetime()
 });
-var responseLogicDraftSchema = z12.object({
-  concern: z12.string().max(2e5),
-  conclusion: z12.string().max(5e5),
-  facts: z12.string().max(5e5),
-  pending: z12.string().max(3e5),
-  boundaries: z12.string().max(3e5),
-  references: z12.string().max(5e5),
-  images: z12.array(responseLogicImageSchema).max(200),
-  attachments: z12.array(responseLogicAttachmentSchema).max(200).default([])
+var responseLogicDraftSchema = z13.object({
+  concern: z13.string().max(2e5),
+  conclusion: z13.string().max(5e5),
+  facts: z13.string().max(5e5),
+  pending: z13.string().max(3e5),
+  boundaries: z13.string().max(3e5),
+  references: z13.string().max(5e5),
+  images: z13.array(responseLogicImageSchema).max(200),
+  attachments: z13.array(responseLogicAttachmentSchema).max(200).default([])
 });
 var RESPONSE_LOGIC_MODEL_SECTIONS = [
   { heading: "\u7528\u6237\u771F\u5B9E\u5173\u5FC3", field: "concern" },
@@ -21775,14 +21754,14 @@ var RESPONSE_LOGIC_MODEL_SECTIONS = [
   { heading: "\u5F15\u7528\u4E0E\u6838\u9A8C\u89C4\u5219", field: "references" },
   { heading: "\u672C\u8F6E\u786E\u8BA4", field: "roundConfirmation" }
 ];
-var responseLogicStructuredDraftSchema = z12.object({
-  concern: z12.string().trim().min(1).max(2e5),
-  conclusion: z12.string().trim().min(1).max(5e5),
-  facts: z12.string().trim().min(1).max(5e5),
-  pending: z12.string().trim().min(1).max(3e5),
-  boundaries: z12.string().trim().min(1).max(3e5),
-  references: z12.string().trim().min(1).max(5e5),
-  roundConfirmation: z12.string().trim().min(1).max(1e5)
+var responseLogicStructuredDraftSchema = z13.object({
+  concern: z13.string().trim().min(1).max(2e5),
+  conclusion: z13.string().trim().min(1).max(5e5),
+  facts: z13.string().trim().min(1).max(5e5),
+  pending: z13.string().trim().min(1).max(3e5),
+  boundaries: z13.string().trim().min(1).max(3e5),
+  references: z13.string().trim().min(1).max(5e5),
+  roundConfirmation: z13.string().trim().min(1).max(1e5)
 }).strict();
 var ResponseLogicOutputContractError = class extends Error {
   constructor(message) {
@@ -21844,75 +21823,75 @@ function parseResponseLogicStructuredDraft(markdown) {
   return parsed.data;
 }
 var confirmedResponseLogicSchema = responseLogicDraftSchema.extend({
-  version: z12.number().int().positive(),
-  updatedAt: z12.string().datetime()
+  version: z13.number().int().positive(),
+  updatedAt: z13.string().datetime()
 });
-var responseLogicQuestionSchema = z12.object({
-  questionId: z12.string().trim().min(1).max(191),
-  groupId: z12.string().trim().min(1).max(128),
-  groupTitle: z12.string().trim().min(1).max(255),
-  question: z12.string().trim().min(1).max(2e3),
-  intent: z12.string().max(8e3),
-  summary: z12.string().max(8e3)
+var responseLogicQuestionSchema = z13.object({
+  questionId: z13.string().trim().min(1).max(191),
+  groupId: z13.string().trim().min(1).max(128),
+  groupTitle: z13.string().trim().min(1).max(255),
+  question: z13.string().trim().min(1).max(2e3),
+  intent: z13.string().max(8e3),
+  summary: z13.string().max(8e3)
 });
 var saveResponseLogicSchema = responseLogicQuestionSchema.extend({
-  conversationId: z12.string().trim().min(1).max(191).optional(),
+  conversationId: z13.string().trim().min(1).max(191).optional(),
   draft: responseLogicDraftSchema,
-  publish: z12.boolean().default(false)
+  publish: z13.boolean().default(false)
 });
 
 // shared/historical-results.ts
-import { z as z13 } from "zod";
-var historicalResponseLogicResultSchema = z13.object({
-  recordId: z13.string(),
-  questionId: z13.string(),
-  status: z13.enum(["confirmed", "draft"]),
-  version: z13.number().int().nonnegative(),
-  updatedAt: z13.number().int(),
+import { z as z14 } from "zod";
+var historicalResponseLogicResultSchema = z14.object({
+  recordId: z14.string(),
+  questionId: z14.string(),
+  status: z14.enum(["confirmed", "draft"]),
+  version: z14.number().int().nonnegative(),
+  updatedAt: z14.number().int(),
   content: responseLogicDraftSchema
 });
-var historicalMonitoringSampleSchema = z13.object({
-  id: z13.string(),
-  sourceRecordId: z13.string(),
-  questionId: z13.string(),
-  platform: z13.string(),
-  answerNo: z13.number().int().positive(),
-  content: z13.string(),
-  citationCount: z13.number().int().nonnegative(),
-  monitorRank: z13.number().nullable(),
-  screenshotUrl: z13.string().nullable(),
-  collectedAt: z13.number().int(),
-  batchKey: z13.string(),
-  sourceName: z13.string(),
-  batchRevision: z13.number().int().positive()
+var historicalMonitoringSampleSchema = z14.object({
+  id: z14.string(),
+  sourceRecordId: z14.string(),
+  questionId: z14.string(),
+  platform: z14.string(),
+  answerNo: z14.number().int().positive(),
+  content: z14.string(),
+  citationCount: z14.number().int().nonnegative(),
+  monitorRank: z14.number().nullable(),
+  screenshotUrl: z14.string().nullable(),
+  collectedAt: z14.number().int(),
+  batchKey: z14.string(),
+  sourceName: z14.string(),
+  batchRevision: z14.number().int().positive()
 });
-var historicalMonitoringCitationSchema = z13.object({
-  id: z13.string(),
-  sourceRecordId: z13.string(),
-  sampleId: z13.string().nullable(),
-  questionId: z13.string(),
-  question: z13.string(),
-  model: z13.string(),
-  title: z13.string(),
-  url: z13.string(),
-  media: z13.string(),
-  domain: z13.string(),
-  publishedAt: z13.number().int().nullable(),
-  collectedAt: z13.number().int(),
-  batchKey: z13.string(),
-  sourceName: z13.string(),
-  batchRevision: z13.number().int().positive()
+var historicalMonitoringCitationSchema = z14.object({
+  id: z14.string(),
+  sourceRecordId: z14.string(),
+  sampleId: z14.string().nullable(),
+  questionId: z14.string(),
+  question: z14.string(),
+  model: z14.string(),
+  title: z14.string(),
+  url: z14.string(),
+  media: z14.string(),
+  domain: z14.string(),
+  publishedAt: z14.number().int().nullable(),
+  collectedAt: z14.number().int(),
+  batchKey: z14.string(),
+  sourceName: z14.string(),
+  batchRevision: z14.number().int().positive()
 });
-var historicalQuestionResultsSchema = z13.object({
-  readOnly: z13.literal(true),
+var historicalQuestionResultsSchema = z14.object({
+  readOnly: z14.literal(true),
   question: publicServicePortalQuestionSchema,
-  lineageQuestionIds: z13.array(z13.string()).min(1),
-  responseLogic: z13.array(historicalResponseLogicResultSchema).max(100),
-  monitoring: z13.object({
-    samples: z13.array(historicalMonitoringSampleSchema).max(100),
-    sampleTotal: z13.number().int().nonnegative(),
-    citations: z13.array(historicalMonitoringCitationSchema).max(100),
-    citationTotal: z13.number().int().nonnegative()
+  lineageQuestionIds: z14.array(z14.string()).min(1),
+  responseLogic: z14.array(historicalResponseLogicResultSchema).max(100),
+  monitoring: z14.object({
+    samples: z14.array(historicalMonitoringSampleSchema).max(100),
+    sampleTotal: z14.number().int().nonnegative(),
+    citations: z14.array(historicalMonitoringCitationSchema).max(100),
+    citationTotal: z14.number().int().nonnegative()
   })
 });
 
@@ -22152,9 +22131,9 @@ var workspaceRouter = router({
     }
   }),
   purchaseIntent: protectedProcedure.input(
-    z14.object({
-      targetPlanCode: z14.enum(["basic", "advanced", "luxury"]),
-      kind: z14.enum(["repeat_basic", "upgrade", "renewal"])
+    z15.object({
+      targetPlanCode: z15.enum(["basic", "advanced", "luxury"]),
+      kind: z15.enum(["repeat_basic", "upgrade", "renewal"])
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
@@ -22173,9 +22152,9 @@ var workspaceRouter = router({
     }
   }),
   selectQuestion: protectedProcedure.input(
-    z14.object({
-      questionId: z14.string().trim().min(1).max(64),
-      expectedRevision: z14.number().int().positive()
+    z15.object({
+      questionId: z15.string().trim().min(1).max(64),
+      expectedRevision: z15.number().int().positive()
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
@@ -22200,16 +22179,16 @@ var workspaceRouter = router({
     }
   }),
   requestQuestionSelection: protectedProcedure.input(
-    z14.discriminatedUnion("mode", [
-      z14.object({
-        mode: z14.literal("candidate"),
-        questionId: z14.string().trim().min(1).max(64),
-        expectedRevision: z14.number().int().positive()
+    z15.discriminatedUnion("mode", [
+      z15.object({
+        mode: z15.literal("candidate"),
+        questionId: z15.string().trim().min(1).max(64),
+        expectedRevision: z15.number().int().positive()
       }),
-      z14.object({
-        mode: z14.literal("direct"),
-        question: z14.string().trim().min(2, "\u76EE\u6807\u95EE\u9898\u81F3\u5C11\u9700\u8981 2 \u4E2A\u5B57\u7B26").max(4e3, "\u76EE\u6807\u95EE\u9898\u4E0D\u80FD\u8D85\u8FC7 4000 \u4E2A\u5B57\u7B26"),
-        category: z14.enum([
+      z15.object({
+        mode: z15.literal("direct"),
+        question: z15.string().trim().min(2, "\u76EE\u6807\u95EE\u9898\u81F3\u5C11\u9700\u8981 2 \u4E2A\u5B57\u7B26").max(4e3, "\u76EE\u6807\u95EE\u9898\u4E0D\u80FD\u8D85\u8FC7 4000 \u4E2A\u5B57\u7B26"),
+        category: z15.enum([
           "industry",
           "competitor_comparison",
           "reputation",
@@ -22245,10 +22224,10 @@ var workspaceRouter = router({
     }
   }),
   confirmQuestionIntent: protectedProcedure.input(
-    z14.object({
-      questionId: z14.string().trim().min(1).max(64),
-      expectedRevision: z14.number().int().positive(),
-      expectedIntentRevision: z14.number().int().positive()
+    z15.object({
+      questionId: z15.string().trim().min(1).max(64),
+      expectedRevision: z15.number().int().positive(),
+      expectedIntentRevision: z15.number().int().positive()
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
@@ -22298,8 +22277,8 @@ var workspaceRouter = router({
     }
   }),
   knowledgeProgress: protectedProcedure.input(
-    z14.object({
-      conversationId: z14.string().trim().min(1).max(191).optional()
+    z15.object({
+      conversationId: z15.string().trim().min(1).max(191).optional()
     }).optional()
   ).query(async ({ ctx, input }) => {
     try {
@@ -22321,8 +22300,8 @@ var workspaceRouter = router({
     }
   }),
   historicalQuestionResults: protectedProcedure.input(
-    z14.object({
-      questionId: z14.string().trim().min(1).max(191)
+    z15.object({
+      questionId: z15.string().trim().min(1).max(191)
     })
   ).query(async ({ ctx, input }) => {
     try {
@@ -26659,23 +26638,23 @@ import { Router as Router3 } from "express";
 import fs5 from "node:fs/promises";
 import path6 from "node:path";
 import { createHash as createHash13 } from "node:crypto";
-import { z as z15 } from "zod";
+import { z as z16 } from "zod";
 var router4 = Router3();
-var attachmentSchema2 = z15.object({
-  file_id: z15.string().trim().min(1).max(255),
-  filename: z15.string().trim().min(1).max(512),
-  mime_type: z15.string().trim().min(1).max(255).optional()
+var attachmentSchema2 = z16.object({
+  file_id: z16.string().trim().min(1).max(255),
+  filename: z16.string().trim().min(1).max(512),
+  mime_type: z16.string().trim().min(1).max(255).optional()
 });
 var responseLogicStartSchema = responseLogicQuestionSchema.extend({
-  conversationId: z15.string().trim().min(1).max(191),
-  taskId: z15.string().trim().min(1).max(255).optional(),
-  userMessage: z15.string().max(2e5),
+  conversationId: z16.string().trim().min(1).max(191),
+  taskId: z16.string().trim().min(1).max(255).optional(),
+  userMessage: z16.string().max(2e5),
   draft: responseLogicDraftSchema,
-  attachments: z15.array(attachmentSchema2).max(100).default([])
+  attachments: z16.array(attachmentSchema2).max(100).default([])
 });
-var responseLogicTaskStatusQuerySchema = z15.object({
-  questionId: z15.string().trim().min(1).max(191),
-  conversationId: z15.string().trim().min(1).max(191)
+var responseLogicTaskStatusQuerySchema = z16.object({
+  questionId: z16.string().trim().min(1).max(191),
+  conversationId: z16.string().trim().min(1).max(191)
 }).strict();
 var ResponseLogicTaskBindingError = class extends Error {
   constructor(code, message) {
@@ -27553,7 +27532,7 @@ import ExcelJS2 from "exceljs";
 import express2 from "express";
 import JSZip2 from "jszip";
 import sharp from "sharp";
-import { z as z17 } from "zod";
+import { z as z18 } from "zod";
 
 // server/_core/express-auth.ts
 function sendAuthError(res, status, message, code) {
@@ -27604,26 +27583,26 @@ import {
   timingSafeEqual as timingSafeEqual5
 } from "node:crypto";
 import { and as and20, eq as eq23, isNull as isNull5, lt as lt5 } from "drizzle-orm";
-import { z as z16 } from "zod";
+import { z as z17 } from "zod";
 var DEFAULT_TTL_SECONDS = 5 * 60;
 var MIN_SECRET_LENGTH = 32;
 var EPHEMERAL_NON_PRODUCTION_SECRET = randomBytes5(48).toString("base64url");
-var securedImportModuleSchema = z16.union([
+var securedImportModuleSchema = z17.union([
   dashboardAdminImportModuleSchema,
-  z16.literal("website-content")
+  z17.literal("website-content")
 ]);
-var preflightTokenPayloadSchema = z16.object({
-  version: z16.literal(1),
-  nonce: z16.string().uuid(),
-  actorId: z16.number().int().positive(),
-  workspaceUserId: z16.number().int().positive(),
+var preflightTokenPayloadSchema = z17.object({
+  version: z17.literal(1),
+  nonce: z17.string().uuid(),
+  actorId: z17.number().int().positive(),
+  workspaceUserId: z17.number().int().positive(),
   module: securedImportModuleSchema,
-  revision: z16.number().int().nonnegative(),
-  fileHash: z16.string().regex(/^[a-f0-9]{64}$/),
-  sectionId: z16.string().trim().min(1).max(80).optional(),
-  targetBatchKey: z16.string().trim().min(1).max(191).optional(),
-  issuedAt: z16.number().int().positive(),
-  expiresAt: z16.number().int().positive()
+  revision: z17.number().int().nonnegative(),
+  fileHash: z17.string().regex(/^[a-f0-9]{64}$/),
+  sectionId: z17.string().trim().min(1).max(80).optional(),
+  targetBatchKey: z17.string().trim().min(1).max(191).optional(),
+  issuedAt: z17.number().int().positive(),
+  expiresAt: z17.number().int().positive()
 }).strict();
 var DashboardImportPreflightError = class extends Error {
   constructor(code, message) {
@@ -27981,14 +27960,14 @@ var websiteLeadDisplayBranchByDirectory = /* @__PURE__ */ new Map([
   ["07_service", "cooperation"],
   ["08_competitive_advantages", "why-frontmind"]
 ]);
-var packageDocumentKindSchema = z17.enum([
+var packageDocumentKindSchema = z18.enum([
   "overview",
   "leaf",
   "evidence",
   "report",
   "index"
 ]);
-var packageEvidenceStatusSchema = z17.enum([
+var packageEvidenceStatusSchema = z18.enum([
   "verified_first_party",
   "verified_authoritative",
   "supported_third_party",
@@ -27996,18 +27975,18 @@ var packageEvidenceStatusSchema = z17.enum([
   "needs_verification",
   "not_applicable"
 ]);
-var packageAssetOwnershipSchema = z17.literal("first_party");
-var packageContentStatusSchema = z17.enum([
+var packageAssetOwnershipSchema = z18.literal("first_party");
+var packageContentStatusSchema = z18.enum([
   "complete",
   "limited_evidence",
   "needs_verification"
 ]);
-var packageImageSelectionStatusSchema = z17.enum([
+var packageImageSelectionStatusSchema = z18.enum([
   "target_met",
   "source_limited",
   "budget_limited"
 ]);
-var packageAssetTypeSchema = z17.enum([
+var packageAssetTypeSchema = z18.enum([
   "brand_identity",
   "product_ui",
   "product_diagram",
@@ -28018,7 +27997,7 @@ var packageAssetTypeSchema = z17.enum([
   "document_figure",
   "other"
 ]);
-var packageAssetDisplayRoleSchema = z17.enum(["hero", "inline", "badge"]);
+var packageAssetDisplayRoleSchema = z18.enum(["hero", "inline", "badge"]);
 var requiredImageDiscoveryMethods = /* @__PURE__ */ new Set([
   "img",
   "srcset",
@@ -28029,11 +28008,11 @@ var requiredImageDiscoveryMethods = /* @__PURE__ */ new Set([
   "gallery",
   "official_document"
 ]);
-var packageSourceUrlSchema = z17.string().trim().url().max(4e3).refine((value) => {
+var packageSourceUrlSchema = z18.string().trim().url().max(4e3).refine((value) => {
   const parsed = new URL(value);
   return ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password;
 }, "source URL must be credential-free HTTP(S)");
-var websiteV2ImageDiscoveryMethodSchema = z17.enum([
+var websiteV2ImageDiscoveryMethodSchema = z18.enum([
   "img",
   "srcset_or_lazy",
   "picture",
@@ -28042,46 +28021,46 @@ var websiteV2ImageDiscoveryMethodSchema = z17.enum([
   "gallery",
   "official_document"
 ]);
-var websiteV2PackageManifestSchema = z17.object({
-  schemaVersion: z17.literal(2),
-  profile: z17.literal("website-lead-v1"),
-  documents: z17.array(
-    z17.object({
-      id: z17.string().trim().min(1).max(191),
-      path: z17.string().trim().min(1).max(600),
+var websiteV2PackageManifestSchema = z18.object({
+  schemaVersion: z18.literal(2),
+  profile: z18.literal("website-lead-v1"),
+  documents: z18.array(
+    z18.object({
+      id: z18.string().trim().min(1).max(191),
+      path: z18.string().trim().min(1).max(600),
       kind: packageDocumentKindSchema,
-      title: z17.string().trim().min(1).max(512),
-      branchId: z17.string().trim().min(1).max(191).optional(),
-      order: z17.number().int().min(0).max(1e4).optional(),
+      title: z18.string().trim().min(1).max(512),
+      branchId: z18.string().trim().min(1).max(191).optional(),
+      order: z18.number().int().min(0).max(1e4).optional(),
       evidenceStatus: packageEvidenceStatusSchema.optional(),
-      sourceIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
-      assetIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
-      customerVisible: z17.boolean(),
-      evidenceCharacters: z17.number().int().nonnegative().optional(),
-      dynamicMinimumCharacters: z17.number().int().nonnegative().optional(),
-      evidenceDocumentIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
-      productFamilyIds: z17.array(z17.string().trim().min(1).max(191)).max(120).optional()
+      sourceIds: z18.array(z18.string().trim().min(1).max(191)).max(500).optional(),
+      assetIds: z18.array(z18.string().trim().min(1).max(191)).max(500).optional(),
+      customerVisible: z18.boolean(),
+      evidenceCharacters: z18.number().int().nonnegative().optional(),
+      dynamicMinimumCharacters: z18.number().int().nonnegative().optional(),
+      evidenceDocumentIds: z18.array(z18.string().trim().min(1).max(191)).max(500).optional(),
+      productFamilyIds: z18.array(z18.string().trim().min(1).max(191)).max(120).optional()
     }).strict()
   ).min(1).max(1500),
-  assets: z17.array(
-    z17.object({
-      id: z17.string().trim().min(1).max(191),
-      path: z17.string().trim().min(1).max(600),
-      sha256: z17.string().regex(/^[a-f0-9]{64}$/i),
-      mimeType: z17.enum([
+  assets: z18.array(
+    z18.object({
+      id: z18.string().trim().min(1).max(191),
+      path: z18.string().trim().min(1).max(600),
+      sha256: z18.string().regex(/^[a-f0-9]{64}$/i),
+      mimeType: z18.enum([
         "image/avif",
         "image/gif",
         "image/jpeg",
         "image/png",
         "image/webp"
       ]),
-      bytes: z17.number().int().positive().max(MAX_IMAGE_BYTES),
-      width: z17.number().int().positive().max(1e5),
-      height: z17.number().int().positive().max(1e5),
-      caption: z17.string().trim().min(1).max(2e3),
-      alt: z17.string().trim().max(1e3).optional(),
-      branchId: z17.string().trim().min(1).max(191),
-      documentIds: z17.array(z17.string().trim().min(1).max(191)).min(1).max(500),
+      bytes: z18.number().int().positive().max(MAX_IMAGE_BYTES),
+      width: z18.number().int().positive().max(1e5),
+      height: z18.number().int().positive().max(1e5),
+      caption: z18.string().trim().min(1).max(2e3),
+      alt: z18.string().trim().max(1e3).optional(),
+      branchId: z18.string().trim().min(1).max(191),
+      documentIds: z18.array(z18.string().trim().min(1).max(191)).min(1).max(500),
       sourcePageUrl: packageSourceUrlSchema,
       sourceAssetUrl: packageSourceUrlSchema.optional(),
       ownership: packageAssetOwnershipSchema,
@@ -28089,15 +28068,15 @@ var websiteV2PackageManifestSchema = z17.object({
       displayRole: packageAssetDisplayRoleSchema
     }).strict()
   ).max(48),
-  counts: z17.object({
-    totalFiles: z17.number().int().nonnegative().max(2e3),
-    customerVisibleCharacters: z17.number().int().nonnegative().max(4e4),
-    evidenceCharacters: z17.number().int().nonnegative().max(3e5),
-    packagedImages: z17.number().int().nonnegative().max(48)
+  counts: z18.object({
+    totalFiles: z18.number().int().nonnegative().max(2e3),
+    customerVisibleCharacters: z18.number().int().nonnegative().max(4e4),
+    evidenceCharacters: z18.number().int().nonnegative().max(3e5),
+    packagedImages: z18.number().int().nonnegative().max(48)
   }).strict(),
-  branchEvidence: z17.array(
-    z17.object({
-      branchId: z17.enum([
+  branchEvidence: z18.array(
+    z18.object({
+      branchId: z18.enum([
         "company-identity",
         "team",
         "products-services",
@@ -28106,42 +28085,42 @@ var websiteV2PackageManifestSchema = z17.object({
         "cooperation",
         "why-frontmind"
       ]),
-      overviewDocumentId: z17.string().trim().min(1).max(191),
+      overviewDocumentId: z18.string().trim().min(1).max(191),
       contentStatus: packageContentStatusSchema,
-      deduplicatedEvidenceCharacters: z17.number().int().nonnegative(),
-      dynamicOverviewMinimum: z17.number().int().nonnegative().max(5e3),
-      checkedSourceCount: z17.number().int().positive()
+      deduplicatedEvidenceCharacters: z18.number().int().nonnegative(),
+      dynamicOverviewMinimum: z18.number().int().nonnegative().max(5e3),
+      checkedSourceCount: z18.number().int().positive()
     }).strict()
   ).length(7),
-  imageSelection: z17.object({
+  imageSelection: z18.object({
     status: packageImageSelectionStatusSchema,
-    discoveredCandidateImages: z17.number().int().nonnegative(),
-    inspectedCandidateImages: z17.number().int().nonnegative(),
-    eligibleFirstPartyImages: z17.number().int().nonnegative().max(48),
-    rejectedCandidateImages: z17.number().int().nonnegative(),
-    scannedSourcePages: z17.number().int().nonnegative(),
-    discoveryMethods: z17.array(websiteV2ImageDiscoveryMethodSchema).length(7),
-    candidates: z17.array(
-      z17.object({
+    discoveredCandidateImages: z18.number().int().nonnegative(),
+    inspectedCandidateImages: z18.number().int().nonnegative(),
+    eligibleFirstPartyImages: z18.number().int().nonnegative().max(48),
+    rejectedCandidateImages: z18.number().int().nonnegative(),
+    scannedSourcePages: z18.number().int().nonnegative(),
+    discoveryMethods: z18.array(websiteV2ImageDiscoveryMethodSchema).length(7),
+    candidates: z18.array(
+      z18.object({
         url: packageSourceUrlSchema,
         sourcePageUrl: packageSourceUrlSchema,
         method: websiteV2ImageDiscoveryMethodSchema,
-        status: z17.enum(["eligible", "rejected", "uninspected"]),
-        assetId: z17.string().trim().min(1).max(191).optional(),
-        rejectionReason: z17.string().trim().min(8).max(500).optional()
+        status: z18.enum(["eligible", "rejected", "uninspected"]),
+        assetId: z18.string().trim().min(1).max(191).optional(),
+        rejectionReason: z18.string().trim().min(8).max(500).optional()
       }).strict()
     ).max(180),
-    productFamilies: z17.array(
-      z17.object({
-        id: z17.string().trim().min(1).max(191),
-        name: z17.string().trim().min(1).max(500),
-        officialVisualFound: z17.boolean(),
-        checkedSources: z17.number().int().positive(),
-        assetIds: z17.array(z17.string().trim().min(1).max(191)).max(48),
-        gapReason: z17.string().trim().min(8).max(2e3).optional()
+    productFamilies: z18.array(
+      z18.object({
+        id: z18.string().trim().min(1).max(191),
+        name: z18.string().trim().min(1).max(500),
+        officialVisualFound: z18.boolean(),
+        checkedSources: z18.number().int().positive(),
+        assetIds: z18.array(z18.string().trim().min(1).max(191)).max(48),
+        gapReason: z18.string().trim().min(8).max(2e3).optional()
       }).strict()
     ).min(1).max(120),
-    shortfallReason: z17.string().trim().min(8).max(2e3).optional()
+    shortfallReason: z18.string().trim().min(8).max(2e3).optional()
   }).strict()
 }).strict().superRefine((value, context) => {
   if (new Set(value.branchEvidence.map((branch) => branch.branchId)).size !== 7) {
@@ -28210,50 +28189,50 @@ var websiteV2PackageManifestSchema = z17.object({
     });
   }
 });
-var internalPackageManifestSchema = z17.object({
-  schemaVersion: z17.union([z17.literal(1), z17.literal(2)]),
-  profile: z17.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
-  websiteV2Normalized: z17.literal(true).optional(),
-  documents: z17.array(
-    z17.object({
-      id: z17.string().trim().min(1).max(191),
-      path: z17.string().trim().min(1).max(600),
+var internalPackageManifestSchema = z18.object({
+  schemaVersion: z18.union([z18.literal(1), z18.literal(2)]),
+  profile: z18.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
+  websiteV2Normalized: z18.literal(true).optional(),
+  documents: z18.array(
+    z18.object({
+      id: z18.string().trim().min(1).max(191),
+      path: z18.string().trim().min(1).max(600),
       kind: packageDocumentKindSchema,
-      title: z17.string().trim().min(1).max(512),
-      branchId: z17.string().trim().min(1).max(191).optional(),
-      branchTitle: z17.string().trim().min(1).max(255).optional(),
-      order: z17.number().int().min(0).max(1e4).optional(),
+      title: z18.string().trim().min(1).max(512),
+      branchId: z18.string().trim().min(1).max(191).optional(),
+      branchTitle: z18.string().trim().min(1).max(255).optional(),
+      order: z18.number().int().min(0).max(1e4).optional(),
       evidenceStatus: packageEvidenceStatusSchema.optional(),
-      sourceIds: z17.array(z17.string().trim().min(1).max(191)).max(500).default([]),
-      evidenceDocumentIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
-      assetIds: z17.array(z17.string().trim().min(1).max(191)).max(500).default([]),
-      customerVisible: z17.boolean(),
-      evidenceCharacters: z17.number().int().nonnegative().optional(),
-      requiredFormalCharacters: z17.number().int().nonnegative().optional(),
+      sourceIds: z18.array(z18.string().trim().min(1).max(191)).max(500).default([]),
+      evidenceDocumentIds: z18.array(z18.string().trim().min(1).max(191)).max(500).optional(),
+      assetIds: z18.array(z18.string().trim().min(1).max(191)).max(500).default([]),
+      customerVisible: z18.boolean(),
+      evidenceCharacters: z18.number().int().nonnegative().optional(),
+      requiredFormalCharacters: z18.number().int().nonnegative().optional(),
       contentStatus: packageContentStatusSchema.optional(),
-      productFamilyId: z17.string().trim().min(1).max(191).optional(),
-      productFamilyIds: z17.array(z17.string().trim().min(1).max(191)).max(120).optional()
+      productFamilyId: z18.string().trim().min(1).max(191).optional(),
+      productFamilyIds: z18.array(z18.string().trim().min(1).max(191)).max(120).optional()
     }).strict()
   ).min(1).max(1500),
-  assets: z17.array(
-    z17.object({
-      id: z17.string().trim().min(1).max(191),
-      path: z17.string().trim().min(1).max(600),
-      sha256: z17.string().regex(/^[a-f0-9]{64}$/i),
-      mimeType: z17.enum([
+  assets: z18.array(
+    z18.object({
+      id: z18.string().trim().min(1).max(191),
+      path: z18.string().trim().min(1).max(600),
+      sha256: z18.string().regex(/^[a-f0-9]{64}$/i),
+      mimeType: z18.enum([
         "image/avif",
         "image/gif",
         "image/jpeg",
         "image/png",
         "image/webp"
       ]),
-      bytes: z17.number().int().positive().max(MAX_IMAGE_BYTES),
-      width: z17.number().int().positive().max(1e5),
-      height: z17.number().int().positive().max(1e5),
-      caption: z17.string().trim().min(1).max(2e3),
-      alt: z17.string().trim().max(1e3).optional(),
-      branchId: z17.string().trim().min(1).max(191),
-      documentIds: z17.array(z17.string().trim().min(1).max(191)).min(1).max(500),
+      bytes: z18.number().int().positive().max(MAX_IMAGE_BYTES),
+      width: z18.number().int().positive().max(1e5),
+      height: z18.number().int().positive().max(1e5),
+      caption: z18.string().trim().min(1).max(2e3),
+      alt: z18.string().trim().max(1e3).optional(),
+      branchId: z18.string().trim().min(1).max(191),
+      documentIds: z18.array(z18.string().trim().min(1).max(191)).min(1).max(500),
       sourcePageUrl: packageSourceUrlSchema.optional(),
       sourceAssetUrl: packageSourceUrlSchema.optional(),
       ownership: packageAssetOwnershipSchema,
@@ -28261,15 +28240,15 @@ var internalPackageManifestSchema = z17.object({
       displayRole: packageAssetDisplayRoleSchema.optional()
     }).strict()
   ).max(480),
-  counts: z17.object({
-    totalFiles: z17.number().int().nonnegative().max(2e3),
-    customerVisibleCharacters: z17.number().int().nonnegative().max(18e4),
-    evidenceCharacters: z17.number().int().nonnegative().max(3e6),
-    packagedImages: z17.number().int().nonnegative().max(480)
+  counts: z18.object({
+    totalFiles: z18.number().int().nonnegative().max(2e3),
+    customerVisibleCharacters: z18.number().int().nonnegative().max(18e4),
+    evidenceCharacters: z18.number().int().nonnegative().max(3e6),
+    packagedImages: z18.number().int().nonnegative().max(480)
   }).strict(),
-  branchEvidence: z17.array(
-    z17.object({
-      branchId: z17.enum([
+  branchEvidence: z18.array(
+    z18.object({
+      branchId: z18.enum([
         "company-identity",
         "team",
         "products-services",
@@ -28278,50 +28257,50 @@ var internalPackageManifestSchema = z17.object({
         "cooperation",
         "why-frontmind"
       ]),
-      overviewDocumentId: z17.string().trim().min(1).max(191),
+      overviewDocumentId: z18.string().trim().min(1).max(191),
       contentStatus: packageContentStatusSchema,
-      deduplicatedEvidenceCharacters: z17.number().int().nonnegative(),
-      dynamicOverviewMinimum: z17.number().int().nonnegative().max(5e3),
-      checkedSourceCount: z17.number().int().positive()
+      deduplicatedEvidenceCharacters: z18.number().int().nonnegative(),
+      dynamicOverviewMinimum: z18.number().int().nonnegative().max(5e3),
+      checkedSourceCount: z18.number().int().positive()
     }).strict()
   ).length(7).optional(),
-  imageSelection: z17.object({
+  imageSelection: z18.object({
     status: packageImageSelectionStatusSchema.optional(),
-    discoveredCandidateImages: z17.number().int().nonnegative().optional(),
-    inspectedCandidateImages: z17.number().int().nonnegative().optional(),
-    eligibleFirstPartyImages: z17.number().int().nonnegative().max(1e7),
-    rejectedCandidateImages: z17.number().int().nonnegative().optional(),
-    scannedSourcePages: z17.number().int().nonnegative().optional(),
-    discoveryMethods: z17.array(z17.string().trim().min(1).max(100)).max(100).optional(),
-    rejectionReasons: z17.array(
-      z17.object({
-        reason: z17.string().trim().min(1).max(500),
-        count: z17.number().int().nonnegative()
+    discoveredCandidateImages: z18.number().int().nonnegative().optional(),
+    inspectedCandidateImages: z18.number().int().nonnegative().optional(),
+    eligibleFirstPartyImages: z18.number().int().nonnegative().max(1e7),
+    rejectedCandidateImages: z18.number().int().nonnegative().optional(),
+    scannedSourcePages: z18.number().int().nonnegative().optional(),
+    discoveryMethods: z18.array(z18.string().trim().min(1).max(100)).max(100).optional(),
+    rejectionReasons: z18.array(
+      z18.object({
+        reason: z18.string().trim().min(1).max(500),
+        count: z18.number().int().nonnegative()
       }).strict()
     ).max(500).optional(),
-    stopReason: z17.string().trim().min(1).max(2e3).optional(),
-    productFamilyCoverage: z17.array(
-      z17.object({
-        familyId: z17.string().trim().min(1).max(191),
-        familyName: z17.string().trim().min(1).max(500),
-        officialImageAvailable: z17.boolean(),
-        assetIds: z17.array(z17.string().trim().min(1).max(191)).max(500),
-        checkedSources: z17.array(packageSourceUrlSchema).max(500),
-        checkedSourceCount: z17.number().int().positive().optional(),
-        gapReason: z17.string().trim().min(1).max(2e3).optional()
+    stopReason: z18.string().trim().min(1).max(2e3).optional(),
+    productFamilyCoverage: z18.array(
+      z18.object({
+        familyId: z18.string().trim().min(1).max(191),
+        familyName: z18.string().trim().min(1).max(500),
+        officialImageAvailable: z18.boolean(),
+        assetIds: z18.array(z18.string().trim().min(1).max(191)).max(500),
+        checkedSources: z18.array(packageSourceUrlSchema).max(500),
+        checkedSourceCount: z18.number().int().positive().optional(),
+        gapReason: z18.string().trim().min(1).max(2e3).optional()
       }).strict()
     ).max(500).optional(),
-    candidates: z17.array(
-      z17.object({
+    candidates: z18.array(
+      z18.object({
         url: packageSourceUrlSchema,
         sourcePageUrl: packageSourceUrlSchema,
-        method: z17.string().trim().min(1).max(100),
-        status: z17.enum(["eligible", "rejected", "uninspected"]),
-        assetId: z17.string().trim().min(1).max(191).optional(),
-        rejectionReason: z17.string().trim().min(1).max(500).optional()
+        method: z18.string().trim().min(1).max(100),
+        status: z18.enum(["eligible", "rejected", "uninspected"]),
+        assetId: z18.string().trim().min(1).max(191).optional(),
+        rejectionReason: z18.string().trim().min(1).max(500).optional()
       }).strict()
     ).max(1800).optional(),
-    shortfallReason: z17.string().trim().min(1).max(2e3).optional()
+    shortfallReason: z18.string().trim().min(1).max(2e3).optional()
   }).strict()
 }).strict().superRefine((value, context) => {
   const documentById = new Map(
@@ -28489,7 +28468,7 @@ var internalPackageManifestSchema = z17.object({
     }
   });
 });
-var packageManifestSchema = z17.preprocess((input) => {
+var packageManifestSchema = z18.preprocess((input) => {
   const isWebsiteV2 = typeof input === "object" && input !== null && "profile" in input && input.profile === "website-lead-v1" && "schemaVersion" in input && input.schemaVersion === 2;
   if (!isWebsiteV2) return input;
   const value = websiteV2PackageManifestSchema.parse(input);
@@ -28566,9 +28545,9 @@ var packageManifestSchema = z17.preprocess((input) => {
     }
   };
 }, internalPackageManifestSchema);
-var completenessAcquisitionCountSchema = z17.object({
-  completed: z17.number().int().nonnegative(),
-  total: z17.number().int().nonnegative()
+var completenessAcquisitionCountSchema = z18.object({
+  completed: z18.number().int().nonnegative(),
+  total: z18.number().int().nonnegative()
 }).strict().superRefine((value, context) => {
   if (value.completed > value.total) {
     context.addIssue({
@@ -28578,9 +28557,9 @@ var completenessAcquisitionCountSchema = z17.object({
     });
   }
 });
-var completenessAcquisitionSchema = z17.object({
-  counts: z17.record(z17.string(), z17.number().int().nonnegative()).optional(),
-  acquisition: z17.object({
+var completenessAcquisitionSchema = z18.object({
+  counts: z18.record(z18.string(), z18.number().int().nonnegative()).optional(),
+  acquisition: z18.object({
     officialPages: completenessAcquisitionCountSchema.optional(),
     images: completenessAcquisitionCountSchema.optional(),
     documents: completenessAcquisitionCountSchema.optional(),
@@ -30136,8 +30115,8 @@ function dashboardFromCsv(text2, displayName) {
   });
   return dashboardPayloadSchema.parse(payload);
 }
-var dashboardImportModuleSchema = z17.union([
-  z17.literal("full"),
+var dashboardImportModuleSchema = z18.union([
+  z18.literal("full"),
   dashboardAdminImportModuleSchema
 ]);
 function dashboardImportModule(value) {
@@ -30285,48 +30264,48 @@ function dashboardPayloadFromModuleJson(input) {
   const value = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const incoming = { ...input.existing };
   if (input.module === "profile") {
-    const profile = z17.object({
-      brandName: z17.string().trim().min(1).max(160),
-      headline: z17.string().trim().min(1).max(300),
-      summary: z17.string().trim().max(4e3).default("")
+    const profile = z18.object({
+      brandName: z18.string().trim().min(1).max(160),
+      headline: z18.string().trim().min(1).max(300),
+      summary: z18.string().trim().max(4e3).default("")
     }).parse(value.profile ?? raw);
     return dashboardPayloadSchema.parse({ ...incoming, ...profile });
   }
   if (input.module === "metrics") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      metrics: z17.array(dashboardMetricSchema).max(24).parse(value.metrics ?? raw)
+      metrics: z18.array(dashboardMetricSchema).max(24).parse(value.metrics ?? raw)
     });
   }
   if (input.module === "sections") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      sections: z17.array(dashboardSectionSchema).max(40).parse(value.sections ?? raw)
+      sections: z18.array(dashboardSectionSchema).max(40).parse(value.sections ?? raw)
     });
   }
   if (input.module === "keywords") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      keywordTables: z17.array(dashboardTableSchema).max(20).parse(value.keywordTables ?? value.tables ?? raw)
+      keywordTables: z18.array(dashboardTableSchema).max(20).parse(value.keywordTables ?? value.tables ?? raw)
     });
   }
   if (input.module === "questions") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      questions: z17.array(dashboardQuestionSchema).max(500).parse(value.questions ?? raw)
+      questions: z18.array(dashboardQuestionSchema).max(500).parse(value.questions ?? raw)
     });
   }
   if (input.module === "monitoring") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      monitoringAnswers: z17.array(dashboardMonitoringAnswerSchema).max(1e5).parse(value.monitoringAnswers ?? []),
-      citations: z17.array(dashboardCitationRecordSchema).max(1e5).parse(value.citations ?? [])
+      monitoringAnswers: z18.array(dashboardMonitoringAnswerSchema).max(1e5).parse(value.monitoringAnswers ?? []),
+      citations: z18.array(dashboardCitationRecordSchema).max(1e5).parse(value.citations ?? [])
     });
   }
   if (input.module === "content-assets") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      contentAssets: z17.array(dashboardContentAssetSchema).max(200).parse(value.contentAssets ?? raw)
+      contentAssets: z18.array(dashboardContentAssetSchema).max(200).parse(value.contentAssets ?? raw)
     });
   }
   const template = parseOptimizationReportTemplate({
@@ -33240,7 +33219,7 @@ router5.get(
   "/knowledge/assets/:snapshotId/by-id/:assetId",
   async (req, res) => {
     try {
-      const assetId = z17.string().trim().min(1).max(191).parse(req.params.assetId);
+      const assetId = z18.string().trim().min(1).max(191).parse(req.params.assetId);
       const result = await getKnowledgeAssetById({
         snapshotId: req.params.snapshotId,
         assetId
@@ -33286,70 +33265,70 @@ var dashboard_api_default = router5;
 import { createHash as createHash16 } from "node:crypto";
 import axios7 from "axios";
 import { Router as Router4 } from "express";
-import { z as z20 } from "zod";
+import { z as z21 } from "zod";
 
 // shared/brand-question-portfolio.ts
-import { z as z18 } from "zod";
-var brandQuestionCategorySchema = z18.enum([
+import { z as z19 } from "zod";
+var brandQuestionCategorySchema = z19.enum([
   "industry",
   "competitor_comparison",
   "reputation",
   "product_scenario"
 ]);
-var evidenceSchema = z18.object({
-  documentPath: z18.string().trim().min(1).max(1024),
-  excerpt: z18.string().trim().min(1).max(500),
-  relevance: z18.string().trim().min(1).max(1e3)
+var evidenceSchema = z19.object({
+  documentPath: z19.string().trim().min(1).max(1024),
+  excerpt: z19.string().trim().min(1).max(500),
+  relevance: z19.string().trim().min(1).max(1e3)
 }).strict();
-var brandQuestionCandidateSchema = z18.object({
-  candidateId: z18.string().trim().min(1).max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
-  question: z18.string().trim().min(4).max(500),
-  intent: z18.string().trim().min(1).max(1e3),
-  rationale: z18.string().trim().min(1).max(2e3),
-  evidence: z18.array(evidenceSchema).min(1).max(8),
-  risks: z18.array(z18.string().trim().min(1).max(500)).max(12)
+var brandQuestionCandidateSchema = z19.object({
+  candidateId: z19.string().trim().min(1).max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  question: z19.string().trim().min(4).max(500),
+  intent: z19.string().trim().min(1).max(1e3),
+  rationale: z19.string().trim().min(1).max(2e3),
+  evidence: z19.array(evidenceSchema).min(1).max(8),
+  risks: z19.array(z19.string().trim().min(1).max(500)).max(12)
 }).strict();
-var categoryCandidatesSchema = z18.array(brandQuestionCandidateSchema).max(200);
-var candidateTargetsSchema = z18.object({
-  industry: z18.number().int().nonnegative().max(200),
-  competitor_comparison: z18.number().int().nonnegative().max(200),
-  reputation: z18.number().int().nonnegative().max(200),
-  product_scenario: z18.number().int().nonnegative().max(200)
+var categoryCandidatesSchema = z19.array(brandQuestionCandidateSchema).max(200);
+var candidateTargetsSchema = z19.object({
+  industry: z19.number().int().nonnegative().max(200),
+  competitor_comparison: z19.number().int().nonnegative().max(200),
+  reputation: z19.number().int().nonnegative().max(200),
+  product_scenario: z19.number().int().nonnegative().max(200)
 }).strict();
-var brandQuestionPortfolioSchema = z18.object({
-  schemaVersion: z18.literal(1),
-  skill: z18.object({
-    name: z18.literal("brand-question-portfolio"),
-    version: z18.literal("2"),
-    model: z18.literal("frontmind-pro")
+var brandQuestionPortfolioSchema = z19.object({
+  schemaVersion: z19.literal(1),
+  skill: z19.object({
+    name: z19.literal("brand-question-portfolio"),
+    version: z19.literal("2"),
+    model: z19.literal("frontmind-pro")
   }).strict(),
-  knowledgeSnapshot: z18.object({
-    id: z18.string().trim().min(1).max(64),
-    version: z18.number().int().positive(),
-    archiveHash: z18.string().trim().regex(/^[a-f0-9]{64}$/i)
+  knowledgeSnapshot: z19.object({
+    id: z19.string().trim().min(1).max(64),
+    version: z19.number().int().positive(),
+    archiveHash: z19.string().trim().regex(/^[a-f0-9]{64}$/i)
   }).strict(),
-  enterprise: z18.object({
-    identityHash: z18.string().trim().regex(/^[a-f0-9]{64}$/i),
-    canonicalName: z18.string().trim().min(1).max(200)
+  enterprise: z19.object({
+    identityHash: z19.string().trim().regex(/^[a-f0-9]{64}$/i),
+    canonicalName: z19.string().trim().min(1).max(200)
   }).strict(),
-  planCode: z18.enum(["advanced", "luxury"]),
-  quotaPeriodId: z18.string().trim().min(1).max(64),
+  planCode: z19.enum(["advanced", "luxury"]),
+  quotaPeriodId: z19.string().trim().min(1).max(64),
   candidateTargets: candidateTargetsSchema,
-  categories: z18.object({
+  categories: z19.object({
     industry: categoryCandidatesSchema,
     competitor_comparison: categoryCandidatesSchema,
     reputation: categoryCandidatesSchema,
     product_scenario: categoryCandidatesSchema
   }).strict(),
-  shortfalls: z18.array(
-    z18.object({
+  shortfalls: z19.array(
+    z19.object({
       category: brandQuestionCategorySchema,
-      target: z18.number().int().positive().max(200),
-      generated: z18.number().int().nonnegative().max(200),
-      reason: z18.string().trim().min(1).max(500)
+      target: z19.number().int().positive().max(200),
+      generated: z19.number().int().nonnegative().max(200),
+      reason: z19.string().trim().min(1).max(500)
     }).strict()
   ).max(4),
-  risks: z18.array(z18.string().trim().min(1).max(500)).max(30)
+  risks: z19.array(z19.string().trim().min(1).max(500)).max(30)
 }).strict().superRefine((value, context) => {
   const seen = /* @__PURE__ */ new Set();
   for (const [category, candidates] of Object.entries(value.categories)) {
@@ -33676,16 +33655,16 @@ function parseBrandQuestionPortfolioOutput(output, context) {
 
 // server/brand-question-task-context.ts
 import { createHmac as createHmac5, timingSafeEqual as timingSafeEqual6 } from "node:crypto";
-import { z as z19 } from "zod";
-var brandQuestionTaskContextSchema = z19.object({
-  v: z19.literal(1),
-  userId: z19.number().int().positive(),
-  taskId: z19.string().trim().min(1).max(255),
-  snapshotId: z19.string().trim().min(1).max(191),
-  snapshotHash: z19.string().trim().min(1).max(191),
-  quotaPeriodId: z19.string().trim().min(1).max(191),
+import { z as z20 } from "zod";
+var brandQuestionTaskContextSchema = z20.object({
+  v: z20.literal(1),
+  userId: z20.number().int().positive(),
+  taskId: z20.string().trim().min(1).max(255),
+  snapshotId: z20.string().trim().min(1).max(191),
+  snapshotHash: z20.string().trim().min(1).max(191),
+  quotaPeriodId: z20.string().trim().min(1).max(191),
   planCode: servicePlanCodeSchema,
-  exp: z19.number().int().positive()
+  exp: z20.number().int().positive()
 }).strict();
 var BrandQuestionTaskContextError = class extends Error {
   constructor(code, message) {
@@ -33966,9 +33945,9 @@ router6.post("/sync", async (req, res) => {
       });
       return;
     }
-    const { taskId, contextToken } = z20.object({
-      taskId: z20.string().trim().min(1).max(255),
-      contextToken: z20.string().trim().min(1).max(4096)
+    const { taskId, contextToken } = z21.object({
+      taskId: z21.string().trim().min(1).max(255),
+      contextToken: z21.string().trim().min(1).max(4096)
     }).strict().parse(req.body || {});
     requestValidated = true;
     const { context } = await currentContext(user.id);
@@ -34087,7 +34066,7 @@ router6.post("/sync", async (req, res) => {
       risks: portfolio.risks
     });
   } catch (error) {
-    if (error instanceof z20.ZodError) {
+    if (error instanceof z21.ZodError) {
       res.status(requestValidated ? 422 : 400).json({
         error: {
           code: requestValidated ? "BRAND_QUESTION_TASK_OUTPUT_INVALID" : "INVALID_BRAND_QUESTION_SYNC",
@@ -34482,14 +34461,14 @@ import {
   json as json3
 } from "express";
 import axios9 from "axios";
-import { z as z22 } from "zod";
+import { z as z23 } from "zod";
 
 // server/presales-monitor.ts
 import { createHash as createHash17, randomUUID as randomUUID22 } from "node:crypto";
 import axios8 from "axios";
 import { and as and21, eq as eq25, isNull as isNull6 } from "drizzle-orm";
 import { json as json2, Router as Router6 } from "express";
-import { z as z21 } from "zod";
+import { z as z22 } from "zod";
 var MONITOR_PLATFORMS = [
   "doubao",
   "yuanbao",
@@ -34544,12 +34523,12 @@ var POLLABLE_LOCAL_STATUSES = /* @__PURE__ */ new Set([
   "submitted",
   "polling"
 ]);
-var monitorCreateSchema = z21.object({
-  question: z21.string().trim().min(1).max(2e3),
-  platforms: z21.array(z21.enum(MONITOR_PLATFORMS)).min(1).max(MONITOR_PLATFORMS.length).refine((items) => new Set(items).size === items.length, {
+var monitorCreateSchema = z22.object({
+  question: z22.string().trim().min(1).max(2e3),
+  platforms: z22.array(z22.enum(MONITOR_PLATFORMS)).min(1).max(MONITOR_PLATFORMS.length).refine((items) => new Set(items).size === items.length, {
     message: "platforms must not contain duplicates"
   }),
-  idempotencyKey: z21.string().trim().min(16).max(512)
+  idempotencyKey: z22.string().trim().min(16).max(512)
 }).strict();
 var PresalesMonitorError = class extends Error {
   constructor(code, status, message, retryAfterMs) {
@@ -35977,7 +35956,7 @@ var PresalesMonitorService = class {
   }
 };
 function sendMonitorError(res, error) {
-  if (error instanceof z21.ZodError) {
+  if (error instanceof z22.ZodError) {
     res.status(400).json({
       error: {
         code: "INVALID_REQUEST",
@@ -36115,20 +36094,20 @@ var PUBLIC_PLACEHOLDER_MARKERS = [
   "same-random-token",
   "change-me"
 ];
-var fileCreateSchema = z22.object({
-  filename: z22.string().trim().min(1).max(512),
-  mimeType: z22.string().trim().max(255).optional(),
-  sizeBytes: z22.number().int().nonnegative().max(MAX_PROXY_UPLOAD_BYTES).optional()
+var fileCreateSchema = z23.object({
+  filename: z23.string().trim().min(1).max(512),
+  mimeType: z23.string().trim().max(255).optional(),
+  sizeBytes: z23.number().int().nonnegative().max(MAX_PROXY_UPLOAD_BYTES).optional()
 });
-var attachmentSchema3 = z22.object({
-  file_id: z22.string().trim().min(1).max(255),
-  filename: z22.string().trim().min(1).max(512)
+var attachmentSchema3 = z23.object({
+  file_id: z23.string().trim().min(1).max(255),
+  filename: z23.string().trim().min(1).max(512)
 });
-var taskCreateSchema = z22.object({
-  prompt: z22.string().trim().min(1).max(2e6),
-  attachments: z22.array(attachmentSchema3).max(20).optional().default([]),
-  idempotencyKey: z22.string().trim().min(16).max(512).optional(),
-  projectId: z22.string().trim().min(8).max(80).optional()
+var taskCreateSchema = z23.object({
+  prompt: z23.string().trim().min(1).max(2e6),
+  attachments: z23.array(attachmentSchema3).max(20).optional().default([]),
+  idempotencyKey: z23.string().trim().min(16).max(512).optional(),
+  projectId: z23.string().trim().min(8).max(80).optional()
 }).superRefine((value, context) => {
   if (value.projectId && !value.idempotencyKey) {
     context.addIssue({
@@ -36213,7 +36192,7 @@ function forwardedStatus(value, fallback = 502) {
   return Number.isInteger(status) && status >= 400 && status < 600 ? status : fallback;
 }
 function sendKnownError(res, error) {
-  if (error instanceof z22.ZodError) {
+  if (error instanceof z23.ZodError) {
     res.status(400).json({
       error: {
         code: "INVALID_REQUEST",
@@ -36851,57 +36830,57 @@ var presales_proxy_default = router8;
 // server/provisioning-router.ts
 import { createHash as createHash21, timingSafeEqual as timingSafeEqual8 } from "node:crypto";
 import express3 from "express";
-import { z as z27 } from "zod";
+import { z as z28 } from "zod";
 
 // server/provisioning-service.ts
 import { createHash as createHash19, createHmac as createHmac6, randomUUID as randomUUID23 } from "node:crypto";
 import { eq as eq26 } from "drizzle-orm";
-import { z as z23 } from "zod";
-var usernameSchema3 = z23.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
+import { z as z24 } from "zod";
+var usernameSchema3 = z24.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
   /^[a-zA-Z0-9._-]+$/,
   "Username may only contain letters, numbers, dots, underscores, and hyphens"
 );
-var timestampSchema = z23.string().datetime({ offset: true });
-var serviceCategorySchema3 = z23.enum([
+var timestampSchema = z24.string().datetime({ offset: true });
+var serviceCategorySchema3 = z24.enum([
   "product_scenario",
   "reputation",
   "competitor_comparison"
 ]);
-var idempotencyKeySchema = z23.string().trim().min(16, "Idempotency-Key must contain 16 to 512 characters").max(512, "Idempotency-Key must contain 16 to 512 characters");
-var websiteProvisionRequestSchema = z23.object({
-  schemaVersion: z23.literal(1),
-  project: z23.object({
-    id: z23.string().trim().min(8).max(80),
-    companyName: z23.string().trim().min(1).max(200)
+var idempotencyKeySchema = z24.string().trim().min(16, "Idempotency-Key must contain 16 to 512 characters").max(512, "Idempotency-Key must contain 16 to 512 characters");
+var websiteProvisionRequestSchema = z24.object({
+  schemaVersion: z24.literal(1),
+  project: z24.object({
+    id: z24.string().trim().min(8).max(80),
+    companyName: z24.string().trim().min(1).max(200)
   }).strict(),
-  order: z23.object({
-    id: z23.string().trim().min(8).max(64),
-    tradeNo: z23.string().trim().min(1).max(128),
-    status: z23.literal("paid"),
-    amountFen: z23.number().int().positive().max(1e7),
+  order: z24.object({
+    id: z24.string().trim().min(8).max(64),
+    tradeNo: z24.string().trim().min(1).max(128),
+    status: z24.literal("paid"),
+    amountFen: z24.number().int().positive().max(1e7),
     paidAt: timestampSchema,
     serviceCategory: serviceCategorySchema3,
-    questionId: z23.string().trim().min(4).max(80),
-    question: z23.string().trim().min(4).max(500)
+    questionId: z24.string().trim().min(4).max(80),
+    question: z24.string().trim().min(4).max(500)
   }).strict(),
-  contract: z23.object({
-    id: z23.string().trim().min(8).max(128),
-    status: z23.literal("signed"),
-    projectId: z23.string().trim().min(8).max(80),
-    orderId: z23.string().trim().min(8).max(64),
-    questionId: z23.string().trim().min(4).max(80),
-    templateVersion: z23.string().trim().min(1).max(64),
-    documentSha256: z23.string().trim().regex(/^[a-f0-9]{64}$/i, "Contract SHA-256 is invalid"),
+  contract: z24.object({
+    id: z24.string().trim().min(8).max(128),
+    status: z24.literal("signed"),
+    projectId: z24.string().trim().min(8).max(80),
+    orderId: z24.string().trim().min(8).max(64),
+    questionId: z24.string().trim().min(4).max(80),
+    templateVersion: z24.string().trim().min(1).max(64),
+    documentSha256: z24.string().trim().regex(/^[a-f0-9]{64}$/i, "Contract SHA-256 is invalid"),
     signedAt: timestampSchema,
-    signatoryId: z23.string().trim().min(1).max(128)
+    signatoryId: z24.string().trim().min(1).max(128)
   }).strict(),
-  account: z23.object({
+  account: z24.object({
     username: usernameSchema3,
-    password: z23.string().min(
+    password: z24.string().min(
       MIN_PASSWORD_LENGTH,
       `Password must contain at least ${MIN_PASSWORD_LENGTH} characters`
     ).max(MAX_PASSWORD_LENGTH, "Password is too long"),
-    displayName: z23.string().trim().min(1).max(128)
+    displayName: z24.string().trim().min(1).max(128)
   }).strict()
 }).strict().superRefine((value, context) => {
   if (value.contract.projectId !== value.project.id) {
@@ -37226,27 +37205,27 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
 import axios10 from "axios";
 import { createHash as createHash20, randomUUID as randomUUID24 } from "node:crypto";
 import { and as and22, eq as eq27 } from "drizzle-orm";
-import { z as z24 } from "zod";
-var sha256Schema3 = z24.string().trim().regex(/^[a-f0-9]{64}$/i);
-var websiteKnowledgeImportBaseSchema = z24.object({
-  companyName: z24.string().trim().min(1).max(200),
-  taskId: z24.string().trim().min(1).max(255),
-  outputItemId: z24.string().trim().min(1).max(255),
-  fileId: z24.string().trim().min(1).max(255).optional(),
+import { z as z25 } from "zod";
+var sha256Schema3 = z25.string().trim().regex(/^[a-f0-9]{64}$/i);
+var websiteKnowledgeImportBaseSchema = z25.object({
+  companyName: z25.string().trim().min(1).max(200),
+  taskId: z25.string().trim().min(1).max(255),
+  outputItemId: z25.string().trim().min(1).max(255),
+  fileId: z25.string().trim().min(1).max(255).optional(),
   descriptorHash: sha256Schema3,
   artifactSha256: sha256Schema3,
-  filename: z24.string().trim().min(1).max(512)
+  filename: z25.string().trim().min(1).max(512)
 });
-var websiteKnowledgeImportSchema = z24.discriminatedUnion(
+var websiteKnowledgeImportSchema = z25.discriminatedUnion(
   "schemaVersion",
   [
     websiteKnowledgeImportBaseSchema.extend({
-      schemaVersion: z24.literal(2)
+      schemaVersion: z25.literal(2)
     }).strict(),
     websiteKnowledgeImportBaseSchema.extend({
-      schemaVersion: z24.literal(3),
-      archiveContractVersion: z24.union([z24.literal(1), z24.literal(2)]),
-      validationProfile: z24.literal("website-lead-v1"),
+      schemaVersion: z25.literal(3),
+      archiveContractVersion: z25.union([z25.literal(1), z25.literal(2)]),
+      validationProfile: z25.literal("website-lead-v1"),
       packageManifestSha256: sha256Schema3
     }).strict()
   ]
@@ -37686,13 +37665,13 @@ async function importWebsiteKnowledgeArtifact(input) {
 import { and as and23, eq as eq28 } from "drizzle-orm";
 
 // shared/payment-receipt.ts
-import { z as z25 } from "zod";
-var opaqueIdentifierSchema = z25.string().min(8).max(128).regex(
+import { z as z26 } from "zod";
+var opaqueIdentifierSchema = z26.string().min(8).max(128).regex(
   /^[A-Za-z0-9][A-Za-z0-9._:-]*$/,
   "identifier contains unsupported characters"
 );
-var sha256DigestSchema = z25.string().length(64).regex(/^[a-f0-9]{64}$/, "digest must be lowercase SHA-256 hex");
-var paidAtSchema = z25.string().regex(
+var sha256DigestSchema = z26.string().length(64).regex(/^[a-f0-9]{64}$/, "digest must be lowercase SHA-256 hex");
+var paidAtSchema = z26.string().regex(
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
   "paidAt must be a canonical UTC timestamp with millisecond precision"
 ).refine(
@@ -37702,34 +37681,34 @@ var paidAtSchema = z25.string().regex(
   },
   { message: "paidAt must be a valid timestamp" }
 );
-var paymentReceiptSchema = z25.object({
+var paymentReceiptSchema = z26.object({
   orderId: opaqueIdentifierSchema,
   tradeNo: opaqueIdentifierSchema,
-  amountFen: z25.number().int().positive().max(1e7),
+  amountFen: z26.number().int().positive().max(1e7),
   paidAt: paidAtSchema,
-  purchaseType: z25.enum(["monitoring", "service"]),
+  purchaseType: z26.enum(["monitoring", "service"]),
   scopeHash: sha256DigestSchema,
   authorizationDigest: sha256DigestSchema,
-  reviewRequired: z25.boolean()
+  reviewRequired: z26.boolean()
 }).strict();
-var paymentReceiptWriteRequestSchema = z25.object({
-  schemaVersion: z25.literal(1),
+var paymentReceiptWriteRequestSchema = z26.object({
+  schemaVersion: z26.literal(1),
   receipt: paymentReceiptSchema
 }).strict();
-var paymentReceiptReadQuerySchema = z25.object({
+var paymentReceiptReadQuerySchema = z26.object({
   scopeHash: sha256DigestSchema,
   authorizationDigest: sha256DigestSchema
 }).strict();
 var paymentReceiptReadRequestSchema = paymentReceiptReadQuerySchema.extend({
   orderId: opaqueIdentifierSchema
 }).strict();
-var paymentReceiptResponseSchema = z25.object({
-  schemaVersion: z25.literal(1),
+var paymentReceiptResponseSchema = z26.object({
+  schemaVersion: z26.literal(1),
   receipt: paymentReceiptSchema
 }).strict();
-var paymentReceiptReadyResponseSchema = z25.object({
-  schemaVersion: z25.literal(1),
-  ready: z25.literal(true)
+var paymentReceiptReadyResponseSchema = z26.object({
+  schemaVersion: z26.literal(1),
+  ready: z26.literal(true)
 }).strict();
 
 // server/payment-receipt-ledger-service.ts
@@ -37901,17 +37880,17 @@ function createPaymentReceiptLedgerService(options = {}) {
 import { and as and24, eq as eq29, sql as sql2 } from "drizzle-orm";
 
 // shared/project-order-registry.ts
-import { z as z26 } from "zod";
-var opaqueIdentifierSchema2 = z26.string().min(8).max(128).regex(
+import { z as z27 } from "zod";
+var opaqueIdentifierSchema2 = z27.string().min(8).max(128).regex(
   /^[A-Za-z0-9][A-Za-z0-9._:-]*$/,
   "identifier contains unsupported characters"
 );
-var projectOrderProjectIdSchema = z26.string().min(8).max(80).regex(
+var projectOrderProjectIdSchema = z27.string().min(8).max(80).regex(
   /^[A-Za-z0-9][A-Za-z0-9._:-]*$/,
   "projectId contains unsupported characters"
 );
-var sha256DigestSchema2 = z26.string().length(64).regex(/^[a-f0-9]{64}$/, "digest must be lowercase SHA-256 hex");
-var canonicalUtcTimestampSchema = z26.string().regex(
+var sha256DigestSchema2 = z27.string().length(64).regex(/^[a-f0-9]{64}$/, "digest must be lowercase SHA-256 hex");
+var canonicalUtcTimestampSchema = z27.string().regex(
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
   "timestamp must use canonical UTC millisecond precision"
 ).refine(
@@ -37921,7 +37900,7 @@ var canonicalUtcTimestampSchema = z26.string().regex(
   },
   { message: "timestamp must be valid" }
 );
-var projectOrderStateSchema = z26.enum([
+var projectOrderStateSchema = z27.enum([
   "pending",
   "paid",
   "fulfilling",
@@ -37930,11 +37909,11 @@ var projectOrderStateSchema = z26.enum([
   "terminal_failed",
   "closed"
 ]);
-var projectOrderSchema = z26.object({
+var projectOrderSchema = z27.object({
   orderId: opaqueIdentifierSchema2,
   projectId: projectOrderProjectIdSchema,
-  purchaseType: z26.enum(["monitoring", "service"]),
-  amountFen: z26.number().int().positive().max(1e7),
+  purchaseType: z27.enum(["monitoring", "service"]),
+  amountFen: z27.number().int().positive().max(1e7),
   authorizationDigest: sha256DigestSchema2,
   state: projectOrderStateSchema,
   checkoutExpiresAt: canonicalUtcTimestampSchema,
@@ -37978,16 +37957,16 @@ var projectOrderSchema = z26.object({
     });
   }
 });
-var projectOrderWriteRequestSchema = z26.object({
-  schemaVersion: z26.literal(1),
+var projectOrderWriteRequestSchema = z27.object({
+  schemaVersion: z27.literal(1),
   order: projectOrderSchema
 }).strict();
-var projectOrderResponseSchema = z26.object({
-  schemaVersion: z26.literal(1),
+var projectOrderResponseSchema = z27.object({
+  schemaVersion: z27.literal(1),
   order: projectOrderSchema
 }).strict();
-var projectOrderIntentCommitRequestSchema = z26.object({
-  schemaVersion: z26.literal(1),
+var projectOrderIntentCommitRequestSchema = z27.object({
+  schemaVersion: z27.literal(1),
   order: projectOrderSchema
 }).strict().superRefine((value, context) => {
   if (value.order.state !== "pending") {
@@ -37998,8 +37977,8 @@ var projectOrderIntentCommitRequestSchema = z26.object({
     });
   }
 });
-var projectOrderIntentCommitResponseSchema = z26.object({
-  schemaVersion: z26.literal(1),
+var projectOrderIntentCommitResponseSchema = z27.object({
+  schemaVersion: z27.literal(1),
   intent: projectOrderSchema,
   order: projectOrderSchema
 }).strict().superRefine((value, context) => {
@@ -38011,11 +37990,11 @@ var projectOrderIntentCommitResponseSchema = z26.object({
     });
   }
 });
-var projectOrderProjectResponseSchema = z26.object({
-  schemaVersion: z26.literal(1),
+var projectOrderProjectResponseSchema = z27.object({
+  schemaVersion: z27.literal(1),
   projectId: projectOrderProjectIdSchema,
-  blockDeletion: z26.boolean(),
-  orders: z26.array(projectOrderSchema).max(100)
+  blockDeletion: z27.boolean(),
+  orders: z27.array(projectOrderSchema).max(100)
 }).strict().superRefine((value, context) => {
   const expected = value.orders.some(
     (order) => !["fulfilled", "terminal_failed", "closed"].includes(order.state)
@@ -38595,7 +38574,7 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "32kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const idempotencyKey = z27.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const request = websiteProvisionRequestSchema.parse(req.body);
         const result = await provisionUser({ idempotencyKey, request });
         if (result.replayed) res.setHeader("Idempotent-Replayed", "true");
@@ -38613,7 +38592,7 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const idempotencyKey = z27.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const request = createManualServiceOrderRequestSchema.parse(req.body);
         res.status(201).json(
           await manualOrders.create({
@@ -38629,7 +38608,7 @@ function createProvisioningRouter(options = {}) {
   );
   router12.get("/manual-orders/:reference/status", async (req, res) => {
     try {
-      const reference = z27.string().trim().min(4).max(128).parse(req.params.reference);
+      const reference = z28.string().trim().min(4).max(128).parse(req.params.reference);
       res.json(
         await manualOrders.status({
           reference,
@@ -38645,8 +38624,8 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const reference = z27.string().trim().min(4).max(128).parse(req.params.reference);
-        const idempotencyKey = z27.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const reference = z28.string().trim().min(4).max(128).parse(req.params.reference);
+        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const request = manualServicePaymentRequestSchema.parse(req.body);
         const result = await manualOrders.recordPayment({
           reference,
@@ -38665,8 +38644,8 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "32kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const reference = z27.string().trim().min(4).max(128).parse(req.params.reference);
-        const idempotencyKey = z27.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const reference = z28.string().trim().min(4).max(128).parse(req.params.reference);
+        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const request = manualServiceAccountSetupRequestSchema.parse(req.body);
         const result = await manualOrders.setupAccount({
           reference,
@@ -38685,7 +38664,7 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const idempotencyKey = z27.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const result = await submitPurchase({
           idempotencyKey,
           request: req.body,
@@ -38699,7 +38678,7 @@ function createProvisioningRouter(options = {}) {
   );
   router12.get("/purchases/:reference/status", async (req, res) => {
     try {
-      const reference = z27.string().trim().min(4).max(128).parse(req.params.reference);
+      const reference = z28.string().trim().min(4).max(128).parse(req.params.reference);
       res.json(
         await readPurchase({
           reference,
@@ -38715,8 +38694,8 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const projectId = z27.string().trim().min(8).max(80).parse(req.params.projectId);
-        const idempotencyKey = z27.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const projectId = z28.string().trim().min(8).max(80).parse(req.params.projectId);
+        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const value = websiteKnowledgeImportSchema.parse(req.body);
         const result = await importKnowledge({
           projectId,
@@ -38746,7 +38725,7 @@ function createProvisioningRouter(options = {}) {
   return router12;
 }
 function sendProvisioningError(res, error) {
-  if (error instanceof z27.ZodError) {
+  if (error instanceof z28.ZodError) {
     res.status(400).json({
       error: {
         code: "INVALID_REQUEST",

@@ -130,6 +130,7 @@ export type AuthenticatedUser = Omit<
   displayName: string | null;
   /** Missing or null values never confer administrator access. */
   adminAccessLevel?: User["adminAccessLevel"];
+  marketEdition?: User["marketEdition"];
 };
 
 export type DecryptedCredential = {
@@ -168,6 +169,7 @@ function toAuthenticatedUser(user: User): AuthenticatedUser {
     loginMethod: user.loginMethod,
     role: user.role,
     adminAccessLevel: user.adminAccessLevel,
+    marketEdition: user.marketEdition,
     isActive: user.isActive,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
@@ -518,6 +520,7 @@ export async function createManagedUser(
     displayName?: string | null;
     role: "user" | "admin";
     adminAccessLevel?: "system_admin" | "delivery_admin";
+    marketEdition?: "domestic" | "overseas";
   },
   executor?: any,
 ) {
@@ -529,6 +532,7 @@ export async function createManagedUser(
       displayName: input.displayName,
       role: input.role,
       adminAccessLevel: input.adminAccessLevel,
+      marketEdition: input.marketEdition,
     },
     executor,
   );
@@ -546,6 +550,7 @@ export async function createManagedUserWithPasswordHash(
     displayName?: string | null;
     role: "user" | "admin";
     adminAccessLevel?: "system_admin" | "delivery_admin";
+    marketEdition?: "domestic" | "overseas";
     now?: Date;
   },
   executor?: any,
@@ -580,6 +585,10 @@ export async function createManagedUserWithPasswordHash(
         input.role === "admin"
           ? (input.adminAccessLevel ?? "delivery_admin")
           : null,
+      marketEdition:
+        input.role === "user"
+          ? (input.marketEdition ?? "domestic")
+          : "domestic",
       isActive: true,
       passwordChangedAt: now,
     });

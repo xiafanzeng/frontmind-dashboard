@@ -171,7 +171,6 @@ const semanticSubpages = [
 function previewDeliveryQuota(planCode, type, used = 0) {
   const limits = {
     basic: { content_asset_publish: 1, website_content_publish: 0 },
-    knowledge: { content_asset_publish: 0, website_content_publish: 0 },
     advanced: { content_asset_publish: 5, website_content_publish: 20 },
     luxury: { content_asset_publish: 20, website_content_publish: 100 },
     unknown: { content_asset_publish: 0, website_content_publish: 0 },
@@ -572,11 +571,9 @@ type PreviewUserBrandDashboardProps = {
     payload: ContentAssetRequestPayload,
   ) => void | Promise<void>;
   contentRequestUsage?: number;
-  planCode?: "basic" | "knowledge" | "advanced" | "luxury" | "unknown";
+  planCode?: "basic" | "advanced" | "luxury" | "unknown";
   fixtures?: {
-    getServicePortal: (
-      planCode: "basic" | "knowledge" | "advanced" | "luxury",
-    ) => unknown;
+    getServicePortal: (planCode: "basic" | "advanced" | "luxury") => unknown;
     contentAssetCatalog: readonly unknown[];
     overview: { brand: string };
     brandBuilding: unknown;
@@ -1417,6 +1414,9 @@ function UserBrandDashboardContent({
                     publishedAssets={managedPayload?.contentAssets || []}
                     planCode={servicePortal.plan.code}
                     quota={contentAssetQuota}
+                    preferredMediaOptions={
+                      deliveryWorkspace.preferredMediaOptions
+                    }
                     tickets={contentAssetTickets}
                     loading={Boolean(
                       contentTicketList?.loading || deliveryWorkspaceLoading,
@@ -3806,6 +3806,7 @@ function SemanticAssetSystem({
   publishedAssets = [],
   planCode = "unknown",
   quota = null,
+  preferredMediaOptions,
   tickets = [],
   loading = false,
   loadingMore = false,
@@ -3824,9 +3825,7 @@ function SemanticAssetSystem({
   const effectiveSelectedType = selectedType || "";
   const requestsLocked = quota
     ? !quota.allowed
-    : planCode === "basic" ||
-      planCode === "knowledge" ||
-      planCode === "unknown";
+    : planCode === "basic" || planCode === "unknown";
 
   if (!selected) {
     return (
@@ -3894,6 +3893,7 @@ function SemanticAssetSystem({
         }}
         planCode={planCode}
         quota={quota}
+        preferredMediaOptions={preferredMediaOptions}
         onSubmit={onSubmitRequest}
       />
       <PublishedContentAssets assets={publishedAssets} />

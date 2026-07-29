@@ -64,14 +64,6 @@ export default function DevelopmentPreviewRouter({
           fixtures={userPreviewFixtures}
         />
       );
-    case "/preview/user/knowledge":
-      return (
-        <PreviewUserBrandDashboard
-          initialSection="knowledge-agent"
-          planCode="knowledge"
-          fixtures={userPreviewFixtures}
-        />
-      );
     case "/preview/admin/delivery":
     case "/preview/admin":
       return (

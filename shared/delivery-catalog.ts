@@ -62,7 +62,7 @@ export const WEBSITE_CONTENT_CATALOG = Object.freeze([
   { value: "faq_content", label: "FAQ 与问答页面" },
 ] as const);
 
-export const CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+export const DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
   "今日头条",
   "搜狐",
   "网易",
@@ -73,6 +73,30 @@ export const CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
   "凤凰网",
   "微博",
 ] as const);
+
+export const OVERSEAS_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+  "美联社",
+  "今日美国",
+  "雅虎",
+  "Business Insider",
+  "Barchart",
+] as const);
+
+export const ALL_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+  ...DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS,
+  ...OVERSEAS_CONTENT_ASSET_MEDIA_OPTIONS,
+] as const);
+
+/** Backward-compatible alias for existing domestic-edition callers. */
+export const CONTENT_ASSET_MEDIA_OPTIONS = DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS;
+
+export function contentAssetMediaOptionsForMarketEdition(
+  marketEdition: "domestic" | "overseas",
+) {
+  return marketEdition === "overseas"
+    ? OVERSEAS_CONTENT_ASSET_MEDIA_OPTIONS
+    : DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS;
+}
 
 export const ICP_PROVINCES = Object.freeze([
   "北京",
@@ -188,16 +212,14 @@ const ICP_PROVINCE_SPECIFIC_MATERIALS: Readonly<
     label: "北京管局补充材料",
     sensitive: true,
     required: false,
-    note:
-      "政府或事业单位等特殊主体按备案系统要求补充上级部门函件；以当前订单提示为准。",
+    note: "政府或事业单位等特殊主体按备案系统要求补充上级部门函件；以当前订单提示为准。",
   },
   广东: {
     key: "other_provincial_material",
     label: "广东省互联网信息服务备案承诺书及管局补充材料",
     sensitive: true,
     required: true,
-    note:
-      "承诺书需按阿里云备案订单当前模板签字盖章；证件住所非广东时还应按订单要求补充居住、房产或社保证明。",
+    note: "承诺书需按阿里云备案订单当前模板签字盖章；证件住所非广东时还应按订单要求补充居住、房产或社保证明。",
   },
   天津: {
     key: "other_provincial_material",

@@ -48,6 +48,9 @@ export const users = mysqlTable(
       "system_admin",
       "delivery_admin",
     ]),
+    marketEdition: mysqlEnum("marketEdition", ["domestic", "overseas"])
+      .default("domestic")
+      .notNull(),
     isActive: boolean("isActive").default(true).notNull(),
     passwordChangedAt: timestamp("passwordChangedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -788,12 +791,7 @@ export const serviceContracts = mysqlTable(
     userId: int("userId")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    planCode: mysqlEnum("planCode", [
-      "basic",
-      "knowledge",
-      "advanced",
-      "luxury",
-    ]).notNull(),
+    planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]).notNull(),
     planVersion: int("planVersion", { unsigned: true }).default(1).notNull(),
     status: mysqlEnum("status", [
       "pending_confirmation",
@@ -1629,7 +1627,6 @@ export const purchaseIntents = mysqlTable(
     }).references(() => serviceContracts.id, { onDelete: "set null" }),
     targetPlanCode: mysqlEnum("targetPlanCode", [
       "basic",
-      "knowledge",
       "advanced",
       "luxury",
     ]).notNull(),

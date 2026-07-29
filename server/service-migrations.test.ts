@@ -81,6 +81,8 @@ describe("service portal migration chain", () => {
       "0033_huge_toxin",
       "0034_known_scarlet_spider",
       "0035_nervous_sauron",
+      "0036_account-market-edition",
+      "0037_remove-knowledge-plan",
     ]);
   });
 

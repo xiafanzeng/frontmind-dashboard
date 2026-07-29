@@ -508,7 +508,7 @@ export function PreviewAdminUsers({
   });
   const [apiKey, setApiKey] = useState("");
   const [servicePlans, setServicePlans] = useState<
-    Record<number, "basic" | "knowledge" | "advanced" | "luxury">
+    Record<number, "basic" | "advanced" | "luxury">
   >({
     1: "advanced",
     2: "luxury",
@@ -1031,18 +1031,14 @@ function PreviewServiceManager({
   onPlanChange,
 }: {
   userName: string;
-  plan: "basic" | "knowledge" | "advanced" | "luxury";
+  plan: "basic" | "advanced" | "luxury";
   editable: boolean;
-  onPlanChange: (plan: "basic" | "knowledge" | "advanced" | "luxury") => void;
+  onPlanChange: (plan: "basic" | "advanced" | "luxury") => void;
 }) {
   const planMeta = {
     basic: {
       name: "普通版",
       quota: "每个订单 1 个非行业词问题，可在同一账号累加",
-    },
-    knowledge: {
-      name: "知识库版",
-      quota: "完整知识库构建、持续更新与展示；不包含问题和内容工单",
     },
     advanced: {
       name: "进阶版",
@@ -1081,17 +1077,12 @@ function PreviewServiceManager({
                 value={plan}
                 onChange={(event) =>
                   onPlanChange(
-                    event.target.value as
-                      | "basic"
-                      | "knowledge"
-                      | "advanced"
-                      | "luxury",
+                    event.target.value as "basic" | "advanced" | "luxury",
                   )
                 }
                 className="mt-2 h-10 w-full rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#332842]"
               >
                 <option value="basic">普通版 · 30 天单题</option>
-                <option value="knowledge">知识库版</option>
                 <option value="advanced">进阶版</option>
                 <option value="luxury">豪华版</option>
               </select>
@@ -1211,13 +1202,14 @@ function PreviewCredential({
   );
 }
 
-type PreviewPlanCode = "basic" | "knowledge" | "advanced" | "luxury";
+type PreviewPlanCode = "basic" | "advanced" | "luxury";
 type PreviewAccountRole = "管理员" | "用户";
 type PreviewAccountDraft = {
   name: string;
   username: string;
   role: PreviewAccountRole;
   planCode?: PreviewPlanCode;
+  marketEdition?: "domestic" | "overseas";
   adminAccessLevel?: "delivery_admin" | "system_admin";
 };
 
@@ -1226,6 +1218,7 @@ export function previewAccountDraftIsValid(input: {
   username: string;
   role: PreviewAccountRole;
   planCode?: PreviewPlanCode | "";
+  marketEdition?: "domestic" | "overseas" | "";
   password?: string;
   confirmPassword?: string;
 }) {
@@ -1236,7 +1229,10 @@ export function previewAccountDraftIsValid(input: {
   ) {
     return false;
   }
-  return input.role === "管理员" || Boolean(input.planCode);
+  return (
+    input.role === "管理员" ||
+    (Boolean(input.planCode) && Boolean(input.marketEdition))
+  );
 }
 
 export function PreviewCreateAccountDialog({
@@ -1254,6 +1250,9 @@ export function PreviewCreateAccountDialog({
   const [username, setUsername] = useState("");
   const [role, setRole] = useState<PreviewAccountRole>("用户");
   const [planCode, setPlanCode] = useState<PreviewPlanCode | "">("");
+  const [marketEdition, setMarketEdition] = useState<
+    "domestic" | "overseas" | ""
+  >("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [adminAccessLevel, setAdminAccessLevel] = useState<
@@ -1265,6 +1264,7 @@ export function PreviewCreateAccountDialog({
     setUsername("");
     setRole("用户");
     setPlanCode("");
+    setMarketEdition("");
     setPassword("");
     setConfirmPassword("");
     setAdminAccessLevel("delivery_admin");
@@ -1278,6 +1278,7 @@ export function PreviewCreateAccountDialog({
     username,
     role,
     planCode,
+    marketEdition,
     password,
     confirmPassword,
   });
@@ -1354,23 +1355,41 @@ export function PreviewCreateAccountDialog({
             />
           </label>
           {role === "用户" ? (
-            <label className="block text-sm font-medium text-[#484057]">
-              客户套餐
-              <select
-                aria-label="客户套餐"
-                value={planCode}
-                onChange={(event) =>
-                  setPlanCode(event.target.value as PreviewPlanCode | "")
-                }
-                className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-              >
-                <option value="">请选择套餐</option>
-                <option value="basic">普通版</option>
-                <option value="knowledge">知识库版</option>
-                <option value="advanced">进阶版</option>
-                <option value="luxury">豪华版</option>
-              </select>
-            </label>
+            <>
+              <label className="block text-sm font-medium text-[#484057]">
+                客户套餐
+                <select
+                  aria-label="客户套餐"
+                  value={planCode}
+                  onChange={(event) =>
+                    setPlanCode(event.target.value as PreviewPlanCode | "")
+                  }
+                  className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  <option value="">请选择套餐</option>
+                  <option value="basic">普通版</option>
+                  <option value="advanced">进阶版</option>
+                  <option value="luxury">豪华版</option>
+                </select>
+              </label>
+              <label className="block text-sm font-medium text-[#484057]">
+                客户版本
+                <select
+                  aria-label="客户版本"
+                  value={marketEdition}
+                  onChange={(event) =>
+                    setMarketEdition(
+                      event.target.value as "domestic" | "overseas" | "",
+                    )
+                  }
+                  className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  <option value="">请选择海内版或海外版</option>
+                  <option value="domestic">海内版</option>
+                  <option value="overseas">海外版</option>
+                </select>
+              </label>
+            </>
           ) : (
             <>
               <label className="block text-sm font-medium text-[#484057]">
@@ -1400,7 +1419,10 @@ export function PreviewCreateAccountDialog({
                 username: username.trim(),
                 role,
                 ...(role === "用户"
-                  ? { planCode: planCode as PreviewPlanCode }
+                  ? {
+                      planCode: planCode as PreviewPlanCode,
+                      marketEdition: marketEdition as "domestic" | "overseas",
+                    }
                   : { adminAccessLevel }),
               };
               onCreated(draft);
@@ -1427,6 +1449,7 @@ type PreviewAccount = {
   role: PreviewAccountRole;
   active: boolean;
   planCode?: PreviewPlanCode;
+  marketEdition?: "domestic" | "overseas";
   adminAccessLevel?: "delivery_admin" | "system_admin";
 };
 
@@ -1468,14 +1491,6 @@ const initialAccounts: PreviewAccount[] = [
     role: "用户",
     active: false,
     planCode: "basic",
-  },
-  {
-    id: 6,
-    name: "验收企业知识库",
-    username: "acceptance_kb",
-    role: "用户",
-    active: true,
-    planCode: "knowledge",
   },
 ];
 
@@ -1564,11 +1579,9 @@ export function PreviewAdminAccounts() {
                       <p className="mt-1 text-xs text-[#857e91]">
                         {account.planCode === "basic"
                           ? "普通版"
-                          : account.planCode === "knowledge"
-                            ? "知识库版"
-                            : account.planCode === "advanced"
-                              ? "进阶版"
-                              : "豪华版"}
+                          : account.planCode === "advanced"
+                            ? "进阶版"
+                            : "豪华版"}
                       </p>
                     )}
                   </td>

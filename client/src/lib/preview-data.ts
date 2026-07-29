@@ -573,23 +573,10 @@ const previewWorkflowOrder = Object.keys(
 ) as PreviewWorkflowStepId[];
 
 function previewWorkflow(
-  plan: "basic" | "knowledge" | "advanced" | "luxury",
+  plan: "basic" | "advanced" | "luxury",
   currentStep: PreviewWorkflowStepId | null,
   nextAction: ServiceAction,
 ): ServiceWorkflowStep[] {
-  if (plan === "knowledge") {
-    return previewWorkflowOrder.map((id) => ({
-      id,
-      label: previewWorkflowMeta[id].label,
-      status: id === "knowledge" ? "complete" : "locked",
-      lockedReason:
-        id === "knowledge"
-          ? ""
-          : "知识库版仅开放知识库构建、更新与展示；此功能未包含在当前套餐。",
-      href: previewWorkflowMeta[id].href,
-      ...(id === "knowledge" ? {} : { nextAction }),
-    }));
-  }
   const currentIndex =
     currentStep === null
       ? previewWorkflowOrder.length
@@ -710,79 +697,6 @@ export const previewServicePortals = {
         label: "升级豪华版",
         targetPlan: "luxury",
       },
-    ],
-  },
-  knowledge: {
-    schemaVersion: 1,
-    known: true,
-    account: {
-      displayName: "验收企业",
-      username: "acceptance.knowledge",
-    },
-    plan: {
-      code: "knowledge",
-      name: "知识库版",
-      billingLabel: "季度知识库服务",
-      statusLabel: "已生效",
-      validFrom: "2026-07-18",
-      validUntil: "2026-10-17",
-    },
-    quotas: [],
-    purchasedQuestions: [],
-    historicalQuestions: [],
-    workflowSteps: previewWorkflow("knowledge", null, {
-      kind: "view_knowledge",
-      label: "查看知识库",
-      href: "/knowledge-base",
-    }),
-    knowledgeBase: {
-      status: "ready",
-      statusLabel: "可查看",
-      version: "V1",
-      sourceLabel: "知识库智能体发布",
-      updatedAt: "2026-07-24",
-    },
-    capabilities: capabilitySet({
-      knowledgeBuild: available(),
-      knowledgeDisplay: available(),
-      globalKeywords: locked(
-        "知识库版仅开放知识库构建、更新与展示；品牌全域词库未包含在当前套餐。",
-      ),
-      questionSelection: locked(
-        "知识库版仅开放知识库构建、更新与展示；问题选题未包含在当前套餐。",
-      ),
-      intentOptimization: locked(
-        "知识库版仅开放知识库构建、更新与展示；问题优化未包含在当前套餐。",
-      ),
-      responseLogic: locked(
-        "知识库版仅开放知识库构建、更新与展示；应答逻辑未包含在当前套餐。",
-      ),
-      monitoring: locked(
-        "知识库版仅开放知识库构建、更新与展示；问题监控未包含在当前套餐。",
-      ),
-      channelDistribution: locked(
-        "知识库版仅开放知识库构建、更新与展示；渠道分发未包含在当前套餐。",
-      ),
-      progressReport: locked(
-        "知识库版仅开放知识库构建、更新与展示；进度报告未包含在当前套餐。",
-      ),
-      contentAssets: locked(
-        "知识库版仅开放知识库构建、更新与展示；内容资产运营未包含在当前套餐。",
-      ),
-    }),
-    primaryNextAction: {
-      kind: "view_knowledge",
-      label: "查看知识库",
-      href: "/knowledge-base",
-    },
-    purchaseActions: [
-      {
-        kind: "contact_advisor",
-        label: "联系专员续费知识库版",
-        targetPlan: "knowledge",
-      },
-      { kind: "upgrade", label: "升级进阶版", targetPlan: "advanced" },
-      { kind: "upgrade", label: "升级豪华版", targetPlan: "luxury" },
     ],
   },
   advanced: {
@@ -961,10 +875,7 @@ export const previewServicePortals = {
       },
     ],
   },
-} satisfies Record<
-  "basic" | "knowledge" | "advanced" | "luxury",
-  ServicePortalView
->;
+} satisfies Record<"basic" | "advanced" | "luxury", ServicePortalView>;
 
 export function getPreviewServicePortal(
   plan: keyof typeof previewServicePortals,
