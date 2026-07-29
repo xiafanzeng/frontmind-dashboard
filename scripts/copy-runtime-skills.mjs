@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { packageSocraticKnowledgeBaseSkill } from "./package-socratic-kb-skill.mjs";
 
 const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -10,17 +11,20 @@ const sourceRoot = path.join(projectRoot, "private-workflows");
 const outputRoot = path.join(projectRoot, "dist", "private-workflows");
 const skillArtifacts = [
   "socratic-kb-builder.skill",
+  "socratic-kb-builder-v1.skill",
   "brand-question-portfolio.skill",
   "response-logic-builder.skill",
 ];
 const requiredFiles = [
   "socratic-kb-builder.skill",
+  "socratic-kb-builder-v1.skill",
   "brand-question-portfolio.skill/SKILL.md",
   "brand-question-portfolio.skill/references/output-contract.md",
   "response-logic-builder.skill/SKILL.md",
   "response-logic-builder.skill/references/output-contract.md",
 ];
 
+await packageSocraticKnowledgeBaseSkill();
 await fs.rm(outputRoot, { recursive: true, force: true });
 await fs.mkdir(outputRoot, { recursive: true });
 

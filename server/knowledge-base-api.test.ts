@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   KnowledgeBaseEnterpriseIdentityError,
   buildKnowledgeBasePrompt,
+  getKnowledgeBaseSkillDescriptor,
   resolveKnowledgeBaseEnterpriseIdentity,
   selectUnreconciledKnowledgeOutput,
 } from "./knowledge-base-api";
@@ -21,7 +22,7 @@ function expectEnterpriseIdentityError(
 }
 
 describe("knowledge base execution contract", () => {
-  it("requires exhaustive crawling and one-by-one leaf traversal before packaging", async () => {
+  it("requires budgeted deep research, real illustrated prose, and one-by-one traversal", async () => {
     const prompt = await buildKnowledgeBasePrompt({
       companyName: "验收企业",
       companyWebsite:
@@ -31,13 +32,31 @@ describe("knowledge base execution contract", () => {
     });
 
     expect(prompt).toContain("sitemap");
-    expect(prompt).toContain("清洗后正文字符数与词数");
-    expect(prompt).toContain("按内容哈希去重后的图片数");
-    expect(prompt).toContain("图片总容量与分辨率分布");
-    expect(prompt).toContain("全网企业情报采集");
-    expect(prompt).toContain("中文、英文及目标市场语言检索");
-    expect(prompt).toContain("第三方事实和图片");
-    expect(prompt).toContain("全网企业情报检索报告");
+    expect(prompt).toContain("HTML 抓取尝试最多 1,200");
+    expect(prompt).toContain("链接访问最多 1,800");
+    expect(prompt).toContain("打包 360–480 张");
+    expect(prompt).toContain("官网文档最多 120");
+    expect(prompt).toContain("累计用户上传最多 100");
+    expect(prompt).toContain("公开查询最多 120");
+    expect(prompt).toContain("3,000,000");
+    expect(prompt).toContain("目标 120,000");
+    expect(prompt).toContain("ZIP 最多 1,500");
+    expect(prompt).toContain("160 MiB");
+    expect(prompt).toContain("第 330 分钟停止");
+    expect(prompt).toContain("第 360 分钟");
+    expect(prompt).toContain("00_package_manifest.json");
+    expect(prompt).toContain("dashboard-enterprise-v1");
+    expect(prompt).toContain("scripts/validate_archive.py");
+    expect(prompt).toContain("FRONTMIND_FORMAL_CONTENT_START");
+    expect(prompt).not.toContain("Crawl every company website exhaustively");
+    expect(prompt).not.toContain("traversed to exhaustion");
+    expect(prompt).toContain("actual cumulative counters");
+    expect(prompt).toContain("Deduplicate by decoded content hash");
+    expect(prompt).toContain("width");
+    expect(prompt).toContain("height");
+    expect(prompt).toContain("public queries in Chinese, English");
+    expect(prompt).toContain("third-party facts and media");
+    expect(prompt).toContain("00_web_intelligence_report.md");
     expect(prompt).toContain("40-115");
     expect(prompt).toContain("一级分支数量不设固定值");
     expect(prompt).not.toContain("恰好 7 个一级分支");
@@ -56,6 +75,30 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("补充、修订、问题或上传资料");
     expect(prompt).toContain("to 必须为 needs_verification");
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
+  });
+
+  it("pins new builds to v2 while preserving the immutable v1 archive", async () => {
+    const active = await getKnowledgeBaseSkillDescriptor();
+    const legacy = await getKnowledgeBaseSkillDescriptor({ version: "1" });
+
+    expect(active).toMatchObject({
+      name: "socratic-kb-builder",
+      version: "2",
+      contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(legacy).toMatchObject({
+      name: "socratic-kb-builder",
+      version: "1",
+      contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(active.contentHash).not.toBe(legacy.contentHash);
+
+    await expect(
+      getKnowledgeBaseSkillDescriptor({
+        version: "1",
+        contentHash: "0".repeat(64),
+      }),
+    ).rejects.toThrow("content hash does not match");
   });
 
   it("uses the configured workspace enterprise and rejects client identity changes", () => {

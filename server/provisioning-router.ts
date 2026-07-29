@@ -487,7 +487,7 @@ export function createProvisioningRouter(
         const configuredWorkspaceUrl =
           process.env.FRONTMIND_PUBLIC_URL?.trim().replace(/\/$/, "");
         res.status(result.replayed ? 200 : 201).json({
-          schemaVersion: 2,
+          schemaVersion: value.schemaVersion,
           knowledgeImport: {
             id: result.receiptId,
             projectId,

@@ -59,7 +59,10 @@
     "mimeType": "application/zip"
   },
   "knowledgeImport": {
-    "schemaVersion": 2,
+    "schemaVersion": 3,
+    "archiveContractVersion": 1,
+    "validationProfile": "website-lead-v1",
+    "packageManifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "companyName": "跨仓契约示例企业",
     "taskId": "task-knowledge-001",
     "outputItemId": "output-knowledge-001:content:0",

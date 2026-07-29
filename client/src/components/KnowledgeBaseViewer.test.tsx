@@ -52,7 +52,7 @@ describe("KnowledgeBaseViewer", () => {
   it("keeps authoritative snapshot metrics but omits a decorative directory count", () => {
     render(<KnowledgeBaseViewer snapshot={snapshot} />);
 
-    expect(screen.getByText("文档目录")).toBeTruthy();
+    expect(screen.getByText("分支综述与知识叶子")).toBeTruthy();
     expect(screen.queryByText(/文档目录\s*·\s*2/)).toBeNull();
     expect(screen.getByText("2 篇")).toBeTruthy();
     expect(screen.getByText("2 张")).toBeTruthy();
@@ -92,5 +92,102 @@ describe("KnowledgeBaseViewer", () => {
       within(productImages).getByRole("link", { name: "查看图片来源" }),
     ).toHaveAttribute("href", "https://example.com/products");
     expect(screen.queryByRole("region", { name: "相关图片" })).toBeNull();
+  });
+
+  it("defaults to a formal overview and keeps reports in the evidence tab", () => {
+    render(
+      <KnowledgeBaseViewer
+        snapshot={{
+          ...snapshot,
+          documents: [
+            {
+              id: "overview",
+              path: "branches/company/00_overview.md",
+              title: "企业正式综述",
+              content: "## 企业正式综述\n可直接面向客户展示的内容。",
+              kind: "overview",
+              branchId: "company",
+              branchTitle: "企业身份",
+              customerVisible: true,
+            },
+            {
+              id: "leaf",
+              path: "branches/company/identity.md",
+              title: "企业定位",
+              content: "## 企业定位\n正式知识叶子。",
+              kind: "leaf",
+              branchId: "company",
+              branchTitle: "企业身份",
+              customerVisible: true,
+            },
+            {
+              id: "report",
+              path: "00_crawl_coverage_report.md",
+              title: "官网采集报告",
+              content: "## 页面摘录\n仅供证据核验。",
+              kind: "report",
+              customerVisible: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(
+      screen.getAllByRole("heading", { name: "企业正式综述" }).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("仅供证据核验。")).toBeNull();
+
+    fireEvent.click(screen.getByRole("tab", { name: "证据与来源" }));
+    expect(
+      screen.getAllByRole("heading", { name: "官网采集报告" }).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("仅供证据核验。")).toBeTruthy();
+  });
+
+  it("uses one manifest asset on every explicitly linked document", () => {
+    render(
+      <KnowledgeBaseViewer
+        snapshot={{
+          ...snapshot,
+          documents: [
+            {
+              id: "overview",
+              path: "branches/products/00_overview.md",
+              title: "产品综述",
+              content: "## 产品综述\n产品正式综述。",
+              kind: "overview",
+              branchId: "products",
+              customerVisible: true,
+            },
+            {
+              id: "leaf",
+              path: "branches/products/family-a.md",
+              title: "产品族 A",
+              content: "## 产品族 A\n产品族正式知识。",
+              kind: "leaf",
+              branchId: "products",
+              customerVisible: true,
+            },
+          ],
+          assets: [
+            {
+              id: "product-image",
+              key: "product-image",
+              path: "branches/products/images/family-a.webp",
+              mimeType: "image/webp",
+              size: 3_072,
+              url: "/api/dashboard/knowledge/assets/snapshot-1/by-id/product-image",
+              caption: "产品族 A 官方图片",
+              documentIds: ["overview", "leaf"],
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("img", { name: "产品族 A 官方图片" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /产品族 A/ }));
+    expect(screen.getByRole("img", { name: "产品族 A 官方图片" })).toBeTruthy();
   });
 });

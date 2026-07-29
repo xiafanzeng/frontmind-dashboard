@@ -67,7 +67,11 @@ import { trpc } from "@/lib/trpc";
 const EMPTY_STATE_IMG =
   "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
 
-const REPORT_POLL_INTERVAL = 3000;
+export function getReportPollDelay(elapsedMs: number) {
+  if (elapsedMs < 5 * 60 * 1000) return 3_000;
+  if (elapsedMs < 30 * 60 * 1000) return 10_000;
+  return 30_000;
+}
 const PdfDocumentViewer = React.lazy(() => import("./PdfDocumentViewer"));
 
 type ReportTaskStatus =
@@ -315,7 +319,6 @@ export default function ChatArea({
     ) => {
       stopReportPolling();
       const token = reportPollingTokenRef.current;
-      let pollCount = 0;
       let consecutiveErrors = 0;
       let completionHandled = false;
 
@@ -347,7 +350,6 @@ export default function ChatArea({
           return;
 
         try {
-          pollCount += 1;
           const updated = await retrieveTask(taskId);
           if (token !== reportPollingTokenRef.current || completionHandled)
             return;
@@ -427,14 +429,6 @@ export default function ChatArea({
             lastKnownOutputLength: totalOutputLength,
           });
 
-          if (pollCount > 1200) {
-            completionHandled = true;
-            updateStatus(conversationId, "error", { completedAt: Date.now() });
-            toast.warning("轮询超时，请稍后手动刷新查看结果");
-            creditEventBus.emit();
-            return;
-          }
-
           consecutiveErrors = 0;
         } catch (error: any) {
           consecutiveErrors += 1;
@@ -451,14 +445,14 @@ export default function ChatArea({
         if (token === reportPollingTokenRef.current && !completionHandled) {
           reportPollingTimeoutRef.current = setTimeout(
             pollOnce,
-            REPORT_POLL_INTERVAL,
+            getReportPollDelay(Date.now() - responseStartedAt),
           );
         }
       };
 
       reportPollingTimeoutRef.current = setTimeout(
         pollOnce,
-        REPORT_POLL_INTERVAL,
+        getReportPollDelay(Date.now() - responseStartedAt),
       );
     },
     [addMessage, stopReportPolling, updateAssistantMessages, updateStatus],

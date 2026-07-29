@@ -35,8 +35,11 @@ import {
 } from "@/hooks/useSendMessage";
 import { toast } from "sonner";
 
-const RESUME_POLL_INTERVAL = 4000; // 4 seconds between resume polls
-const RESUME_POLL_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours max resume polling
+export function getResumePollDelay(elapsedMs: number) {
+  if (elapsedMs < 5 * 60 * 1000) return 4_000;
+  if (elapsedMs < 30 * 60 * 1000) return 10_000;
+  return 30_000;
+}
 
 /**
  * Check a single conversation's task status and update accordingly.
@@ -215,20 +218,6 @@ export function useResumePolling() {
     const stillRunning = new Set(runningConvs.map((c) => c.id));
 
     const pollOnce = async () => {
-      // Timeout check
-      if (Date.now() - resumeStartedAtRef.current > RESUME_POLL_TIMEOUT) {
-        console.warn("[ResumePolling] Resume polling timed out (2 hours)");
-        // Mark remaining as error
-        for (const convId of stillRunning) {
-          updateStatusRef.current(convId, "error", {
-            completedAt: Date.now(),
-          });
-        }
-        toast.warning("轮询超时（2小时），请手动刷新查看结果");
-        stopResumePolling();
-        return;
-      }
-
       // Check each still-running conversation
       const toRemove: string[] = [];
       for (const convId of stillRunning) {
@@ -264,7 +253,22 @@ export function useResumePolling() {
         );
         stopResumePolling();
       } else if (isResumingRef.current) {
-        resumeTimerRef.current = setTimeout(pollOnce, RESUME_POLL_INTERVAL);
+        const oldestStartedAt = Math.min(
+          ...[...stillRunning].map((conversationId) => {
+            const conversation = stateRef.current.conversations.find(
+              (candidate) => candidate.id === conversationId,
+            );
+            return (
+              conversation?.startedAt ||
+              conversation?.createdAt ||
+              resumeStartedAtRef.current
+            );
+          }),
+        );
+        resumeTimerRef.current = setTimeout(
+          pollOnce,
+          getResumePollDelay(Date.now() - oldestStartedAt),
+        );
       }
     };
 

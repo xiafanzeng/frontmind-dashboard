@@ -7,8 +7,6 @@ import type { KnowledgeAsset, KnowledgeDocument } from "@shared/dashboard";
 
 type KnowledgeDisplayAsset = KnowledgeAsset & {
   sectionHint?: string;
-  caption?: string;
-  alt?: string;
   source?: string;
   title?: string;
   documentPath?: string;
@@ -174,7 +172,8 @@ function contextualAssetScore(input: {
     }
   }
 
-  const source = normalizedMatchValue(asset.source);
+  const sourceValue = asset.sourcePageUrl || asset.source;
+  const source = normalizedMatchValue(sourceValue);
   if (source) {
     if (includesMeaningful(normalizedSection, source)) score += 55;
     else if (
@@ -182,7 +181,7 @@ function contextualAssetScore(input: {
       includesMeaningful(source, normalizedDocument)
     )
       score += 40;
-    for (const term of matchingTerms(asset.source || "")) {
+    for (const term of matchingTerms(sourceValue || "")) {
       if (includesMeaningful(normalizedHeading, term)) score += 28;
       else if (includesMeaningful(normalizedSection, term)) score += 18;
       else if (includesMeaningful(normalizedDocument, term)) score += 12;
@@ -212,6 +211,22 @@ function placeKnowledgeAssets(snapshot: KnowledgeSnapshotView): AssetPlacement {
   const fallbackDocument = snapshot.documents[0];
 
   for (const asset of snapshot.assets.filter((candidate) => candidate.url)) {
+    const explicitDocumentIds = new Set(asset.documentIds || []);
+    const explicitDocuments = documentSections.filter(({ document }) =>
+      document.id ? explicitDocumentIds.has(document.id) : false,
+    );
+    if (explicitDocuments.length > 0) {
+      for (const explicitDocument of explicitDocuments) {
+        const documentMap =
+          bySection.get(explicitDocument.document.path) ||
+          new Map<number, KnowledgeDisplayAsset[]>();
+        const sectionAssets = documentMap.get(0) || [];
+        sectionAssets.push(asset);
+        documentMap.set(0, sectionAssets);
+        bySection.set(explicitDocument.document.path, documentMap);
+      }
+      continue;
+    }
     let best:
       | {
           documentPath: string;
@@ -276,6 +291,10 @@ function isExternalHttpUrl(value: string | undefined) {
   return /^https?:\/\//i.test(value || "");
 }
 
+function assetSource(asset: KnowledgeDisplayAsset) {
+  return asset.sourcePageUrl || asset.source;
+}
+
 function KnowledgeImageGrid({
   assets,
   ariaLabel,
@@ -306,9 +325,9 @@ function KnowledgeImageGrid({
               <span className="block break-words font-medium text-[#51495d]">
                 {displayName}
               </span>
-              {isExternalHttpUrl(asset.source) && (
+              {isExternalHttpUrl(assetSource(asset)) && (
                 <a
-                  href={asset.source}
+                  href={assetSource(asset)}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="mt-0.5 inline-flex text-[#6d3497] hover:underline"
@@ -331,29 +350,65 @@ export default function KnowledgeBaseViewer({
   snapshot?: KnowledgeSnapshotView | null;
   loading?: boolean;
 }) {
+  const [view, setView] = useState<"knowledge" | "evidence" | "assets">(
+    "knowledge",
+  );
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [assetPage, setAssetPage] = useState(0);
+
+  const formalDocuments = useMemo(
+    () =>
+      snapshot?.documents.filter(
+        (document) =>
+          document.customerVisible !== false &&
+          !["evidence", "report", "index"].includes(document.kind || ""),
+      ) || [],
+    [snapshot],
+  );
+  const evidenceDocuments = useMemo(
+    () =>
+      snapshot?.documents.filter(
+        (document) =>
+          document.customerVisible === false ||
+          ["evidence", "report", "index"].includes(document.kind || ""),
+      ) || [],
+    [snapshot],
+  );
 
   useEffect(() => {
-    setSelectedPath(snapshot?.documents[0]?.path ?? null);
+    setView("knowledge");
+    setSelectedPath(
+      formalDocuments.find((document) => document.kind === "overview")?.path ??
+        formalDocuments[0]?.path ??
+        snapshot?.documents[0]?.path ??
+        null,
+    );
+    setAssetPage(0);
   }, [snapshot?.id]);
 
   const filteredDocuments = useMemo(() => {
     if (!snapshot) return [];
+    const documents =
+      view === "evidence"
+        ? evidenceDocuments
+        : formalDocuments.length > 0
+          ? formalDocuments
+          : snapshot.documents;
     const keyword = search.trim().toLowerCase();
-    if (!keyword) return snapshot.documents;
-    return snapshot.documents.filter(
+    if (!keyword) return documents;
+    return documents.filter(
       (document) =>
         document.title.toLowerCase().includes(keyword) ||
         document.path.toLowerCase().includes(keyword) ||
         document.content.toLowerCase().includes(keyword),
     );
-  }, [search, snapshot]);
+  }, [evidenceDocuments, formalDocuments, search, snapshot, view]);
 
   const selectedDocument =
     snapshot?.documents.find((document) => document.path === selectedPath) ||
     filteredDocuments[0] ||
-    snapshot?.documents[0];
+    (view === "knowledge" ? formalDocuments[0] : evidenceDocuments[0]);
   const documentSections = useMemo(
     () =>
       selectedDocument ? splitMarkdownSections(selectedDocument.content) : [],
@@ -369,6 +424,16 @@ export default function KnowledgeBaseViewer({
   const selectedRelatedAssets = selectedDocument
     ? assetPlacement?.relatedByDocument.get(selectedDocument.path) || []
     : [];
+  const assetPageSize = 24;
+  const assetPageCount = Math.max(
+    1,
+    Math.ceil((snapshot?.assets.length || 0) / assetPageSize),
+  );
+  const pagedAssets =
+    snapshot?.assets.slice(
+      assetPage * assetPageSize,
+      assetPage * assetPageSize + assetPageSize,
+    ) || [];
   if (loading) {
     return (
       <div className="grid min-h-[520px] place-items-center rounded-[20px] border border-[#e8e1ee] bg-white/80">
@@ -416,148 +481,276 @@ export default function KnowledgeBaseViewer({
         ))}
       </div>
 
-      <div className="grid min-h-[650px] overflow-hidden rounded-[20px] border border-[#e8e1ee] bg-white shadow-[0_18px_48px_rgba(33,19,58,.07)] lg:grid-cols-[290px_minmax(0,1fr)]">
-        <aside className="border-b border-[#e8e1ee] bg-[#fbf9fd] p-4 lg:border-b-0 lg:border-r">
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a94a8]" />
-            <Input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="搜索全部知识内容"
-              className="border-[#e1d8e8] bg-white pl-9"
-            />
-          </div>
-          <p className="mb-2 mt-5 px-2 text-xs font-semibold uppercase tracking-[0.08em] text-[#9a94a8]">
-            文档目录
-          </p>
-          <div className="max-h-[510px] space-y-1 overflow-y-auto pr-1 custom-scrollbar">
-            {filteredDocuments.map((document) => (
-              <button
-                key={document.path}
-                type="button"
-                onClick={() => setSelectedPath(document.path)}
-                className={`flex w-full items-start gap-2 rounded-xl px-3 py-2.5 text-left transition ${
-                  selectedDocument?.path === document.path
-                    ? "bg-[#5b2a86] text-white"
-                    : "text-[#4f485c] hover:bg-[#eee8f2]"
-                }`}
-              >
-                <FileText className="mt-0.5 h-4 w-4 shrink-0" />
-                <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium">
-                    {document.title}
-                  </span>
-                  <span
-                    className={`mt-0.5 block truncate text-xs ${
-                      selectedDocument?.path === document.path
-                        ? "text-white/60"
-                        : "text-[#9a94a8]"
-                    }`}
-                  >
-                    {document.path}
-                  </span>
-                </span>
-              </button>
-            ))}
-          </div>
-        </aside>
+      <div
+        className="flex flex-wrap gap-2"
+        role="tablist"
+        aria-label="知识库内容视图"
+      >
+        {(
+          [
+            ["knowledge", "正式知识"],
+            ["evidence", "证据与来源"],
+            ["assets", `图片素材 ${snapshot.imageCount}`],
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={view === id}
+            onClick={() => {
+              setView(id);
+              setSearch("");
+              if (id === "knowledge") {
+                setSelectedPath(
+                  formalDocuments.find(
+                    (document) => document.kind === "overview",
+                  )?.path ??
+                    formalDocuments[0]?.path ??
+                    null,
+                );
+              } else if (id === "evidence") {
+                setSelectedPath(evidenceDocuments[0]?.path ?? null);
+              }
+            }}
+            className={`rounded-full border px-4 py-2 text-sm font-medium transition ${
+              view === id
+                ? "border-[#5b2a86] bg-[#5b2a86] text-white"
+                : "border-[#ded5e6] bg-white text-[#5d5569] hover:bg-[#f5f0f8]"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
 
-        <article className="min-w-0 p-5 sm:p-8 lg:p-10">
-          {selectedDocument ? (
-            <>
-              <div className="mb-8 border-b border-[#e8e1ee] pb-5">
-                <p className="text-xs font-semibold text-[#5b2a86]">
-                  知识库文档
-                </p>
-                <h2 className="mt-2 text-2xl font-semibold tracking-tight text-[#171321]">
-                  {selectedDocument.title}
-                </h2>
-                <p className="mt-2 break-all text-xs text-[#9a94a8]">
-                  {selectedDocument.path}
-                </p>
-              </div>
-              <div className="space-y-6">
-                {documentSections.map((section, index) => {
-                  const sectionAssets = selectedSectionAssets?.get(index) || [];
-                  return (
-                    <section
-                      key={`${selectedDocument.path}-${index}`}
-                      className={`overflow-hidden rounded-[22px] border border-[#e8e1ee] bg-[#fbf9fd] ${
-                        sectionAssets.length > 0
-                          ? "grid items-start lg:grid-cols-[minmax(0,1fr)_minmax(280px,.72fr)]"
-                          : ""
-                      }`}
-                    >
-                      <div className="min-w-0 p-5 sm:p-7">
-                        <MarkdownRenderer
-                          content={section}
-                          className="max-w-none text-[15px] leading-7"
-                        />
-                      </div>
-                      {sectionAssets.length > 0 && (
-                        <KnowledgeImageGrid
-                          assets={sectionAssets}
-                          ariaLabel={`${sectionHeading(section) || "知识正文"}配图`}
-                          alternating={index % 2 === 1}
-                        />
-                      )}
-                    </section>
-                  );
-                })}
-                {selectedRelatedAssets.length > 0 && (
-                  <section
-                    aria-label="相关图片"
-                    className="overflow-hidden rounded-[22px] border border-[#e8e1ee] bg-[#fbf9fd]"
-                  >
-                    <div className="flex items-center gap-3 border-b border-[#e8e1ee] px-5 py-4 sm:px-7">
-                      <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#5b2a86]/10 text-[#5b2a86]">
-                        <Images className="h-4 w-4" />
+      {view === "assets" ? (
+        <section className="overflow-hidden rounded-[20px] border border-[#e8e1ee] bg-white shadow-[0_18px_48px_rgba(33,19,58,.07)]">
+          <header className="flex flex-wrap items-center justify-between gap-3 border-b border-[#e8e1ee] px-5 py-4 sm:px-7">
+            <div>
+              <p className="text-xs font-semibold text-[#5b2a86]">
+                第一方图片素材
+              </p>
+              <h2 className="mt-1 text-xl font-semibold text-[#171321]">
+                已验证并随知识库交付的图片
+              </h2>
+            </div>
+            <span className="text-sm text-[#716a80]">
+              第 {assetPage + 1} / {assetPageCount} 页
+            </span>
+          </header>
+          {pagedAssets.length > 0 ? (
+            <div className="grid gap-4 p-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              {pagedAssets.map((asset) => {
+                const displayName = assetDisplayName(asset);
+                return (
+                  <figure key={asset.id || asset.key} className="min-w-0">
+                    <img
+                      src={asset.url}
+                      alt={asset.alt?.trim() || displayName}
+                      loading="lazy"
+                      className="aspect-[4/3] w-full rounded-2xl bg-[#f6f3f8] object-cover"
+                    />
+                    <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
+                      <span className="block break-words font-medium text-[#51495d]">
+                        {displayName}
                       </span>
-                      <h3 className="text-base font-semibold text-[#2e2738]">
-                        相关图片
-                      </h3>
-                    </div>
-                    <div className="grid gap-4 bg-white p-4 sm:grid-cols-2 xl:grid-cols-3">
-                      {selectedRelatedAssets.map((asset) => {
-                        const displayName = assetDisplayName(asset);
-                        return (
-                          <figure key={asset.key} className="min-w-0">
-                            <img
-                              src={asset.url}
-                              alt={asset.alt?.trim() || displayName}
-                              loading="lazy"
-                              className="aspect-[4/3] w-full rounded-2xl bg-[#f6f3f8] object-cover"
-                            />
-                            <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
-                              <span className="block break-words font-medium text-[#51495d]">
-                                {displayName}
-                              </span>
-                              {isExternalHttpUrl(asset.source) && (
-                                <a
-                                  href={asset.source}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="mt-0.5 inline-flex text-[#6d3497] hover:underline"
-                                >
-                                  查看图片来源
-                                </a>
-                              )}
-                            </figcaption>
-                          </figure>
-                        );
-                      })}
-                    </div>
-                  </section>
-                )}
-              </div>
-            </>
+                      {asset.branchId && (
+                        <span className="block text-[#8c8498]">
+                          分支：{asset.branchId}
+                        </span>
+                      )}
+                    </figcaption>
+                  </figure>
+                );
+              })}
+            </div>
           ) : (
-            <div className="grid h-full place-items-center text-sm text-[#716a80]">
-              没有匹配的知识内容
+            <div className="grid min-h-64 place-items-center text-sm text-[#716a80]">
+              当前知识库没有已验证图片
             </div>
           )}
-        </article>
-      </div>
+          {assetPageCount > 1 && (
+            <footer className="flex justify-end gap-2 border-t border-[#e8e1ee] px-5 py-4">
+              <button
+                type="button"
+                disabled={assetPage === 0}
+                onClick={() => setAssetPage((page) => Math.max(0, page - 1))}
+                className="rounded-lg border border-[#ded5e6] px-3 py-1.5 text-sm disabled:opacity-40"
+              >
+                上一页
+              </button>
+              <button
+                type="button"
+                disabled={assetPage >= assetPageCount - 1}
+                onClick={() =>
+                  setAssetPage((page) => Math.min(assetPageCount - 1, page + 1))
+                }
+                className="rounded-lg border border-[#ded5e6] px-3 py-1.5 text-sm disabled:opacity-40"
+              >
+                下一页
+              </button>
+            </footer>
+          )}
+        </section>
+      ) : (
+        <div className="grid min-h-[650px] overflow-hidden rounded-[20px] border border-[#e8e1ee] bg-white shadow-[0_18px_48px_rgba(33,19,58,.07)] lg:grid-cols-[290px_minmax(0,1fr)]">
+          <aside className="border-b border-[#e8e1ee] bg-[#fbf9fd] p-4 lg:border-b-0 lg:border-r">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a94a8]" />
+              <Input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="搜索全部知识内容"
+                className="border-[#e1d8e8] bg-white pl-9"
+              />
+            </div>
+            <p className="mb-2 mt-5 px-2 text-xs font-semibold uppercase tracking-[0.08em] text-[#9a94a8]">
+              {view === "knowledge" ? "分支综述与知识叶子" : "证据与来源目录"}
+            </p>
+            <div className="max-h-[510px] space-y-1 overflow-y-auto pr-1 custom-scrollbar">
+              {filteredDocuments.map((document) => (
+                <button
+                  key={document.path}
+                  type="button"
+                  onClick={() => setSelectedPath(document.path)}
+                  className={`flex w-full items-start gap-2 rounded-xl px-3 py-2.5 text-left transition ${
+                    selectedDocument?.path === document.path
+                      ? "bg-[#5b2a86] text-white"
+                      : "text-[#4f485c] hover:bg-[#eee8f2]"
+                  }`}
+                >
+                  <FileText className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-medium">
+                      {document.title}
+                    </span>
+                    <span
+                      className={`mt-0.5 block truncate text-xs ${
+                        selectedDocument?.path === document.path
+                          ? "text-white/60"
+                          : "text-[#9a94a8]"
+                      }`}
+                    >
+                      {[
+                        document.branchTitle || document.branchId,
+                        document.kind === "overview"
+                          ? "分支综述"
+                          : document.kind === "leaf"
+                            ? "知识叶子"
+                            : document.kind === "report"
+                              ? "采集报告"
+                              : document.kind === "index"
+                                ? "来源索引"
+                                : document.path,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </aside>
+
+          <article className="min-w-0 p-5 sm:p-8 lg:p-10">
+            {selectedDocument ? (
+              <>
+                <div className="mb-8 border-b border-[#e8e1ee] pb-5">
+                  <p className="text-xs font-semibold text-[#5b2a86]">
+                    {view === "knowledge" ? "正式知识" : "证据与来源"}
+                  </p>
+                  <h2 className="mt-2 text-2xl font-semibold tracking-tight text-[#171321]">
+                    {selectedDocument.title}
+                  </h2>
+                  <p className="mt-2 break-all text-xs text-[#9a94a8]">
+                    {selectedDocument.path}
+                  </p>
+                </div>
+                <div className="space-y-6">
+                  {documentSections.map((section, index) => {
+                    const sectionAssets =
+                      selectedSectionAssets?.get(index) || [];
+                    return (
+                      <section
+                        key={`${selectedDocument.path}-${index}`}
+                        className={`overflow-hidden rounded-[22px] border border-[#e8e1ee] bg-[#fbf9fd] ${
+                          sectionAssets.length > 0
+                            ? "grid items-start lg:grid-cols-[minmax(0,1fr)_minmax(280px,.72fr)]"
+                            : ""
+                        }`}
+                      >
+                        <div className="min-w-0 p-5 sm:p-7">
+                          <MarkdownRenderer
+                            content={section}
+                            className="max-w-none text-[15px] leading-7"
+                          />
+                        </div>
+                        {sectionAssets.length > 0 && (
+                          <KnowledgeImageGrid
+                            assets={sectionAssets.slice(0, 3)}
+                            ariaLabel={`${sectionHeading(section) || "知识正文"}配图`}
+                            alternating={index % 2 === 1}
+                          />
+                        )}
+                      </section>
+                    );
+                  })}
+                  {selectedRelatedAssets.length > 0 && (
+                    <section
+                      aria-label="相关图片"
+                      className="overflow-hidden rounded-[22px] border border-[#e8e1ee] bg-[#fbf9fd]"
+                    >
+                      <div className="flex items-center gap-3 border-b border-[#e8e1ee] px-5 py-4 sm:px-7">
+                        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#5b2a86]/10 text-[#5b2a86]">
+                          <Images className="h-4 w-4" />
+                        </span>
+                        <h3 className="text-base font-semibold text-[#2e2738]">
+                          相关图片
+                        </h3>
+                      </div>
+                      <div className="grid gap-4 bg-white p-4 sm:grid-cols-2 xl:grid-cols-3">
+                        {selectedRelatedAssets.slice(0, 3).map((asset) => {
+                          const displayName = assetDisplayName(asset);
+                          return (
+                            <figure key={asset.key} className="min-w-0">
+                              <img
+                                src={asset.url}
+                                alt={asset.alt?.trim() || displayName}
+                                loading="lazy"
+                                className="aspect-[4/3] w-full rounded-2xl bg-[#f6f3f8] object-cover"
+                              />
+                              <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
+                                <span className="block break-words font-medium text-[#51495d]">
+                                  {displayName}
+                                </span>
+                                {isExternalHttpUrl(assetSource(asset)) && (
+                                  <a
+                                    href={assetSource(asset)}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="mt-0.5 inline-flex text-[#6d3497] hover:underline"
+                                  >
+                                    查看图片来源
+                                  </a>
+                                )}
+                              </figcaption>
+                            </figure>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="grid h-full place-items-center text-sm text-[#716a80]">
+                没有匹配的知识内容
+              </div>
+            )}
+          </article>
+        </div>
+      )}
     </div>
   );
 }

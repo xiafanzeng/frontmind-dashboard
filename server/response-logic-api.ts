@@ -351,8 +351,26 @@ export function buildVerifiedResponseLogicAttachments(
 type KnowledgeSnapshotForPrompt = {
   version: number;
   sourceFileName: string;
-  documents: Array<{ path: string; title: string; content: string }>;
-  assets: Array<{ path: string; mimeType: string; size: number }>;
+  documents: Array<{
+    path: string;
+    title: string;
+    content: string;
+    kind?: "overview" | "leaf" | "evidence" | "report" | "index" | "other";
+    branchId?: string;
+    branchTitle?: string;
+    order?: number;
+    customerVisible?: boolean;
+  }>;
+  assets: Array<{
+    path: string;
+    mimeType: string;
+    size: number;
+    caption?: string;
+    alt?: string;
+    branchId?: string;
+    sourcePageUrl?: string;
+    ownership?: "first_party" | "third_party" | "unknown";
+  }>;
 } | null;
 
 const configuredResponseLogicSkillPath =
@@ -447,24 +465,68 @@ function compactKnowledgeSnapshot(snapshot: KnowledgeSnapshotForPrompt) {
   const characterBudget = 60_000;
   let used = 0;
   const documents: string[] = [];
-  for (const document of snapshot.documents) {
+  const formalDocuments = snapshot.documents.filter(
+    (document) =>
+      document.customerVisible !== false &&
+      !["evidence", "report", "index"].includes(document.kind || ""),
+  );
+  const candidates =
+    formalDocuments.length > 0 ? formalDocuments : snapshot.documents;
+  const priority = (document: (typeof candidates)[number]) =>
+    document.kind === "overview" ? 0 : document.kind === "leaf" ? 1 : 2;
+  const byBranch = new Map<string, typeof candidates>();
+  for (const document of [...candidates].sort(
+    (left, right) =>
+      priority(left) - priority(right) ||
+      (left.order ?? Number.MAX_SAFE_INTEGER) -
+        (right.order ?? Number.MAX_SAFE_INTEGER) ||
+      left.path.localeCompare(right.path, "zh-CN"),
+  )) {
+    const branchKey =
+      document.branchId?.trim() || document.branchTitle?.trim() || "未分支";
+    const branchDocuments = byBranch.get(branchKey) || [];
+    branchDocuments.push(document);
+    byBranch.set(branchKey, branchDocuments);
+  }
+  const branchQueues = [...byBranch.values()];
+  const orderedDocuments: typeof candidates = [];
+  while (branchQueues.some((queue) => queue.length > 0)) {
+    for (const queue of branchQueues) {
+      const document = queue.shift();
+      if (document) orderedDocuments.push(document);
+    }
+  }
+  for (const document of orderedDocuments) {
     if (used >= characterBudget) break;
     const remaining = characterBudget - used;
-    const content = document.content.slice(0, remaining);
+    const content = document.content.slice(0, Math.min(remaining, 12_000));
     used += content.length;
     documents.push(
       [
         `### ${document.title || document.path}`,
+        document.branchTitle ? `业务分支：${document.branchTitle}` : "",
         `来源路径：${document.path}`,
         content,
-      ].join("\n"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
     );
   }
   const assets = snapshot.assets
     .slice(0, 200)
     .map(
       (asset) =>
-        `- ${asset.path}｜${asset.mimeType || "未知格式"}｜${asset.size} bytes`,
+        [
+          `- ${asset.caption || asset.alt || asset.path}`,
+          `path=${asset.path}`,
+          `type=${asset.mimeType || "未知格式"}`,
+          `size=${asset.size} bytes`,
+          asset.branchId ? `branch=${asset.branchId}` : "",
+          asset.ownership ? `ownership=${asset.ownership}` : "",
+          asset.sourcePageUrl ? `source=${asset.sourcePageUrl}` : "",
+        ]
+          .filter(Boolean)
+          .join("｜"),
     )
     .join("\n");
 

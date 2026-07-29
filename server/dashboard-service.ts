@@ -888,7 +888,9 @@ function publicSnapshot<
     ...snapshot,
     assets: snapshot.assets.map((asset, index) => ({
       ...asset,
-      url: `/api/dashboard/knowledge/assets/${snapshot.id}/${index}`,
+      url: asset.id
+        ? `/api/dashboard/knowledge/assets/${snapshot.id}/by-id/${encodeURIComponent(asset.id)}`
+        : `/api/dashboard/knowledge/assets/${snapshot.id}/${index}`,
     })),
   };
 }
@@ -928,6 +930,27 @@ export async function getKnowledgeAsset(input: {
   return snapshot && asset ? { snapshot, asset } : null;
 }
 
+export async function getKnowledgeAssetById(input: {
+  snapshotId: string;
+  assetId: string;
+}) {
+  const db = await requireDb();
+  const rows = await db
+    .select({
+      id: knowledgeBaseSnapshots.id,
+      userId: knowledgeBaseSnapshots.userId,
+      assets: knowledgeBaseSnapshots.assets,
+    })
+    .from(knowledgeBaseSnapshots)
+    .where(eq(knowledgeBaseSnapshots.id, input.snapshotId))
+    .limit(1);
+  const snapshot = rows[0];
+  const asset = snapshot?.assets.find(
+    (candidate) => candidate.id === input.assetId,
+  );
+  return snapshot && asset ? { snapshot, asset } : null;
+}
+
 export async function createKnowledgeSnapshot(input: {
   snapshotId?: string;
   userId: number;
@@ -946,7 +969,9 @@ export async function createKnowledgeSnapshot(input: {
   const db = await requireDb();
   const id = input.snapshotId ?? randomUUID();
   const characterCount = input.documents.reduce(
-    (total, document) => total + document.content.length,
+    (total, document) =>
+      total +
+      (document.customerVisible === false ? 0 : document.content.length),
     0,
   );
   await db.transaction(async (tx) => {

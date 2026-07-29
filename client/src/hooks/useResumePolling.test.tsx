@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useResumePolling } from "./useResumePolling";
+import { getResumePollDelay, useResumePolling } from "./useResumePolling";
 
 const mocks = vi.hoisted(() => ({
   hydrated: false,
@@ -50,6 +50,13 @@ describe("useResumePolling hydration gate", () => {
   });
 
   afterEach(() => vi.useRealTimers());
+
+  it("backs off to 30 seconds and has no two-hour terminal delay", () => {
+    expect(getResumePollDelay(0)).toBe(4_000);
+    expect(getResumePollDelay(5 * 60 * 1000)).toBe(10_000);
+    expect(getResumePollDelay(30 * 60 * 1000)).toBe(30_000);
+    expect(getResumePollDelay(12 * 60 * 60 * 1000)).toBe(30_000);
+  });
 
   it("does not resume a cloud task until conversations are hydrated", async () => {
     const { rerender, unmount } = renderHook(() => useResumePolling());
@@ -144,6 +151,32 @@ describe("useResumePolling hydration gate", () => {
       expect.arrayContaining([
         expect.objectContaining({ id: "new-1", content: "new answer" }),
       ]),
+    );
+
+    unmount();
+  });
+
+  it("continues checking a restored task after more than two hours", async () => {
+    vi.setSystemTime(new Date("2026-07-29T00:00:00.000Z"));
+    mocks.hydrated = true;
+    mocks.conversations[0].startedAt =
+      Date.now() - 3 * 60 * 60 * 1000;
+    const { unmount } = renderHook(() => useResumePolling());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(mocks.retrieveTask).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(new Date("2026-07-29T03:00:00.000Z"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(mocks.retrieveTask).toHaveBeenCalledTimes(2);
+    expect(mocks.updateStatus).not.toHaveBeenCalledWith(
+      "running",
+      "error",
+      expect.anything(),
     );
 
     unmount();

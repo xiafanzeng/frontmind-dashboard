@@ -124,6 +124,7 @@ function withoutApprovedBranding(content) {
 
 const requiredSkillFiles = [
   "private-workflows/socratic-kb-builder.skill",
+  "private-workflows/socratic-kb-builder-v1.skill",
   "private-workflows/brand-question-portfolio.skill/SKILL.md",
   "private-workflows/brand-question-portfolio.skill/references/output-contract.md",
   "private-workflows/response-logic-builder.skill/SKILL.md",
@@ -131,18 +132,23 @@ const requiredSkillFiles = [
 ];
 const runtimeSkillRoots = [
   "private-workflows/socratic-kb-builder.skill",
+  "private-workflows/socratic-kb-builder-v1.skill",
   "private-workflows/brand-question-portfolio.skill",
   "private-workflows/response-logic-builder.skill",
 ];
 const requiredKnowledgeBaseEntries = [
   "SKILL.md",
+  "agents/openai.yaml",
   "references/knowledge-tree.md",
   "references/questioning-strategy.md",
   "references/output-format.md",
+  "scripts/validate_archive.py",
 ];
 const allowedKnowledgeBaseArchiveEntries = new Set([
   ...requiredKnowledgeBaseEntries,
+  "agents/",
   "references/",
+  "scripts/",
 ]);
 
 async function collectTextFiles(directory) {

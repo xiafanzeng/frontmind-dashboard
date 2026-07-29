@@ -201,6 +201,83 @@ describe("provisioning service-token boundary", () => {
     });
   });
 
+  it("preserves the v3 schema version and forwards the archive contract unchanged", async () => {
+    const importKnowledge = vi.fn().mockResolvedValue({
+      status: "completed",
+      replayed: false,
+      receiptId: "receipt-knowledge-v3",
+      snapshot: { id: "snapshot-v3", version: 1 },
+    });
+    const url = await startKnowledgeImportApp(importKnowledge);
+    const request = {
+      schemaVersion: 3,
+      archiveContractVersion: 1,
+      validationProfile: "website-lead-v1",
+      packageManifestSha256: "c".repeat(64),
+      companyName: "验收企业",
+      taskId: "task-website-kb-v3",
+      outputItemId: "output-v3",
+      fileId: "file-v3",
+      descriptorHash: "a".repeat(64),
+      artifactSha256: "b".repeat(64),
+      filename: "acceptance_knowledge_base_v3.zip",
+    };
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": "website-kb-project-acceptance-v3",
+        "x-frontmind-provisioning-token": SERVICE_TOKEN,
+      },
+      body: JSON.stringify(request),
+    });
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      schemaVersion: 3,
+      knowledgeImport: {
+        id: "receipt-knowledge-v3",
+        projectId: "project-acceptance-001",
+        status: "ready",
+      },
+    });
+    expect(importKnowledge).toHaveBeenCalledWith({
+      projectId: "project-acceptance-001",
+      idempotencyKey: "website-kb-project-acceptance-v3",
+      value: request,
+    });
+  });
+
+  it("rejects an incomplete v3 contract before invoking the importer", async () => {
+    const importKnowledge = vi.fn();
+    const url = await startKnowledgeImportApp(importKnowledge);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": "website-kb-project-invalid-v3",
+        "x-frontmind-provisioning-token": SERVICE_TOKEN,
+      },
+      body: JSON.stringify({
+        schemaVersion: 3,
+        archiveContractVersion: 1,
+        validationProfile: "website-lead-v1",
+        companyName: "验收企业",
+        taskId: "task-website-kb-v3",
+        outputItemId: "output-v3",
+        descriptorHash: "a".repeat(64),
+        artifactSha256: "b".repeat(64),
+        filename: "acceptance_knowledge_base_v3.zip",
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "INVALID_REQUEST" },
+    });
+    expect(importKnowledge).not.toHaveBeenCalled();
+  });
+
   it("authenticates before parsing JSON or calling the provisioner", async () => {
     const provisionUser = vi.fn();
     const url = await startApp(provisionUser);

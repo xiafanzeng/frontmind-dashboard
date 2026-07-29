@@ -3,6 +3,7 @@ import { renderHook, act } from "@testing-library/react";
 import {
   useSendMessage,
   classifyFailure,
+  getTaskPollDelay,
   sliceNewOutput,
 } from "../hooks/useSendMessage";
 
@@ -108,6 +109,15 @@ describe("sliceNewOutput", () => {
     ]);
 
     expect(result.map((item) => item.id)).toEqual(["new-1"]);
+  });
+});
+
+describe("long-running task polling", () => {
+  it("backs off to 30 seconds without a one-hour terminal cutoff", () => {
+    expect(getTaskPollDelay(0)).toBe(3_000);
+    expect(getTaskPollDelay(5 * 60 * 1000)).toBe(10_000);
+    expect(getTaskPollDelay(30 * 60 * 1000)).toBe(30_000);
+    expect(getTaskPollDelay(8 * 60 * 60 * 1000)).toBe(30_000);
   });
 });
 

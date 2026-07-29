@@ -718,17 +718,43 @@ export function createDashboardOptimizationReportTemplate(input: {
 }
 
 export type KnowledgeDocument = {
+  id?: string;
   path: string;
   title: string;
   content: string;
+  kind?: "overview" | "leaf" | "evidence" | "report" | "index" | "other";
+  branchId?: string;
+  branchTitle?: string;
+  order?: number;
+  evidenceStatus?:
+    | "verified_first_party"
+    | "verified_authoritative"
+    | "supported_third_party"
+    | "inferred"
+    | "needs_verification"
+    | "not_applicable";
+  sourceIds?: string[];
+  assetIds?: string[];
+  customerVisible?: boolean;
 };
 
 export type KnowledgeAsset = {
+  id?: string;
   key: string;
   path: string;
   mimeType: string;
   size: number;
   url?: string;
+  sha256?: string;
+  width?: number;
+  height?: number;
+  caption?: string;
+  alt?: string;
+  branchId?: string;
+  documentIds?: string[];
+  sourcePageUrl?: string;
+  sourceAssetUrl?: string;
+  ownership?: "first_party" | "third_party" | "unknown";
 };
 
 export function createDefaultDashboardPayload(

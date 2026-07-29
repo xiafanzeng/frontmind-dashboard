@@ -38,7 +38,12 @@ import { toast } from "sonner";
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY = 1000; // 1 second
 const MAX_RETRY_DELAY = 10000; // 10 seconds
-const POLL_INTERVAL = 3000; // 3 seconds between polls
+
+export function getTaskPollDelay(elapsedMs: number) {
+  if (elapsedMs < 5 * 60 * 1000) return 3_000;
+  if (elapsedMs < 30 * 60 * 1000) return 10_000;
+  return 30_000;
+}
 
 interface RetryConfig {
   maxRetries: number;
@@ -499,16 +504,6 @@ export function useSendMessage() {
             return;
           }
 
-          // Safety: stop after 60 minutes of polling
-          if (pollCount > 1200) {
-            stopPolling();
-            const completedAt = Date.now();
-            updateStatusRef.current(convId, "error", { completedAt });
-            toast.warning("轮询超时（60分钟），请手动刷新查看结果");
-            creditEventBus.emit();
-            return;
-          }
-
           consecutiveErrors = 0;
         } catch (err: any) {
           console.error("Polling error:", err);
@@ -536,11 +531,17 @@ export function useSendMessage() {
         }
 
         if (pollingActiveRef.current && !completionHandled) {
-          pollingTimeoutRef.current = setTimeout(pollOnce, POLL_INTERVAL);
+          pollingTimeoutRef.current = setTimeout(
+            pollOnce,
+            getTaskPollDelay(Date.now() - responseStartedAt),
+          );
         }
       };
 
-      pollingTimeoutRef.current = setTimeout(pollOnce, POLL_INTERVAL);
+      pollingTimeoutRef.current = setTimeout(
+        pollOnce,
+        getTaskPollDelay(Date.now() - responseStartedAt),
+      );
     },
     [stopPolling],
   );

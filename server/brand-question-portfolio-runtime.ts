@@ -20,7 +20,16 @@ type PortfolioSnapshot = {
   version: number;
   archiveHash: string | null;
   sourceFileName: string;
-  documents: Array<{ path: string; title: string; content: string }>;
+  documents: Array<{
+    path: string;
+    title: string;
+    content: string;
+    kind?: "overview" | "leaf" | "evidence" | "report" | "index" | "other";
+    branchId?: string;
+    branchTitle?: string;
+    order?: number;
+    customerVisible?: boolean;
+  }>;
 };
 
 export type BrandQuestionPortfolioContext = {
@@ -130,17 +139,51 @@ function compactSnapshot(snapshot: PortfolioSnapshot) {
   const characterBudget = 100_000;
   let used = 0;
   const documents: string[] = [];
-  for (const document of snapshot.documents) {
+  const formalDocuments = snapshot.documents.filter(
+    (document) =>
+      document.customerVisible !== false &&
+      !["evidence", "report", "index"].includes(document.kind || ""),
+  );
+  const candidates =
+    formalDocuments.length > 0 ? formalDocuments : snapshot.documents;
+  const priority = (document: (typeof candidates)[number]) =>
+    document.kind === "overview" ? 0 : document.kind === "leaf" ? 1 : 2;
+  const byBranch = new Map<string, typeof candidates>();
+  for (const document of [...candidates].sort(
+    (left, right) =>
+      priority(left) - priority(right) ||
+      (left.order ?? Number.MAX_SAFE_INTEGER) -
+        (right.order ?? Number.MAX_SAFE_INTEGER) ||
+      left.path.localeCompare(right.path, "zh-CN"),
+  )) {
+    const branchKey =
+      document.branchId?.trim() || document.branchTitle?.trim() || "未分支";
+    const branchDocuments = byBranch.get(branchKey) || [];
+    branchDocuments.push(document);
+    byBranch.set(branchKey, branchDocuments);
+  }
+  const branchQueues = [...byBranch.values()];
+  const orderedDocuments: typeof candidates = [];
+  while (branchQueues.some((queue) => queue.length > 0)) {
+    for (const queue of branchQueues) {
+      const document = queue.shift();
+      if (document) orderedDocuments.push(document);
+    }
+  }
+  for (const document of orderedDocuments) {
     if (used >= characterBudget) break;
     const remaining = characterBudget - used;
-    const content = document.content.slice(0, remaining);
+    const content = document.content.slice(0, Math.min(remaining, 20_000));
     used += content.length;
     documents.push(
       [
         `## ${document.title || document.path}`,
+        document.branchTitle ? `branch: ${document.branchTitle}` : "",
         `documentPath: ${document.path}`,
         content,
-      ].join("\n"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
     );
   }
   return documents.join("\n\n") || "当前知识库没有可用正文。";

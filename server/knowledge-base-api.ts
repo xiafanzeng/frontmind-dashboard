@@ -187,8 +187,29 @@ const skillArchiveCandidates = configuredKnowledgeBaseSkillPath
       ),
     ];
 
-let cachedSkillInstructions: string | null = null;
-let cachedSkillContentHash: string | null = null;
+const legacySkillArchiveCandidates = configuredKnowledgeBaseSkillPath
+  ? [
+      path.join(
+        path.dirname(configuredKnowledgeBaseSkillPath),
+        "socratic-kb-builder-v1.skill",
+      ),
+    ]
+  : skillArchiveCandidates.map((candidate) =>
+      path.join(path.dirname(candidate), "socratic-kb-builder-v1.skill"),
+    );
+
+interface KnowledgeBaseSkillSelection {
+  version: string;
+  contentHash?: string | null;
+}
+
+interface LoadedKnowledgeBaseSkill {
+  instructions: string;
+  contentHash: string;
+  archivePath: string;
+}
+
+const skillArchiveCache = new Map<string, LoadedKnowledgeBaseSkill>();
 
 function sanitizeFilename(value: string, fallback: string) {
   const safe = String(value || "")
@@ -214,11 +235,27 @@ function normalizeUserAttachments(
     .filter(Boolean) as Array<{ file_id: string; filename: string }>;
 }
 
-async function readSkillArchive() {
-  if (cachedSkillInstructions) return cachedSkillInstructions;
+async function loadSkillArchive(
+  selection: KnowledgeBaseSkillSelection = { version: "2" },
+) {
+  const version = selection.version === "1" ? "1" : "2";
+  const cached = skillArchiveCache.get(version);
+  if (cached) {
+    if (
+      selection.contentHash &&
+      selection.contentHash !== cached.contentHash
+    ) {
+      throw new Error(
+        `Knowledge-base Skill v${version} content hash does not match the active build`,
+      );
+    }
+    return cached;
+  }
 
   let lastError: unknown;
-  for (const candidate of skillArchiveCandidates) {
+  const candidates =
+    version === "1" ? legacySkillArchiveCandidates : skillArchiveCandidates;
+  for (const candidate of candidates) {
     try {
       const archive = await fs.readFile(candidate);
       const zip = await JSZip.loadAsync(archive);
@@ -227,6 +264,9 @@ async function readSkillArchive() {
         ["references/knowledge-tree.md", "Knowledge Tree"],
         ["references/questioning-strategy.md", "Questioning Strategy"],
         ["references/output-format.md", "Output Format"],
+        ...(version === "2"
+          ? ([["scripts/validate_archive.py", "Archive Validator"]] as const)
+          : []),
       ] as const;
 
       const sections: string[] = [];
@@ -239,11 +279,24 @@ async function readSkillArchive() {
         sections.push(`# ${title}\n\n${content.trim()}`);
       }
 
-      cachedSkillInstructions = sections.join("\n\n---\n\n");
-      cachedSkillContentHash = createHash("sha256")
-        .update(cachedSkillInstructions)
-        .digest("hex");
-      return cachedSkillInstructions;
+      const instructions = sections.join("\n\n---\n\n");
+      const loaded = {
+        instructions,
+        contentHash: createHash("sha256")
+          .update(instructions)
+          .digest("hex"),
+        archivePath: candidate,
+      };
+      if (
+        selection.contentHash &&
+        selection.contentHash !== loaded.contentHash
+      ) {
+        throw new Error(
+          `Knowledge-base Skill v${version} content hash does not match the active build`,
+        );
+      }
+      skillArchiveCache.set(version, loaded);
+      return loaded;
     } catch (error) {
       lastError = error;
     }
@@ -251,15 +304,27 @@ async function readSkillArchive() {
 
   throw lastError instanceof Error
     ? lastError
-    : new Error("Could not load socratic-kb-builder.skill");
+    : new Error(`Could not load socratic-kb-builder Skill v${version}`);
 }
 
-export async function getKnowledgeBaseSkillDescriptor() {
-  await readSkillArchive();
+async function readSkillArchive(
+  selection: KnowledgeBaseSkillSelection = { version: "2" },
+) {
+  return (await loadSkillArchive(selection)).instructions;
+}
+
+export async function getKnowledgeBaseSkillDescriptor(
+  selection: KnowledgeBaseSkillSelection = { version: "2" },
+) {
+  const version = selection.version === "1" ? "1" : "2";
+  const loaded = await loadSkillArchive({
+    version,
+    contentHash: selection.contentHash,
+  });
   return {
     name: "socratic-kb-builder",
-    version: "1",
-    contentHash: cachedSkillContentHash!,
+    version,
+    contentHash: loaded.contentHash,
   };
 }
 
@@ -294,10 +359,10 @@ export async function buildKnowledgeBasePrompt({
   let prefillCharacters = 0;
   const prefillDocuments = (prefillKnowledgeSnapshot?.documents ?? [])
     .map((document) => {
-      if (prefillCharacters >= 80_000) return "";
+      if (prefillCharacters >= 300_000) return "";
       const content = document.content.slice(
         0,
-        Math.max(0, 80_000 - prefillCharacters),
+        Math.max(0, 300_000 - prefillCharacters),
       );
       prefillCharacters += content.length;
       return [
@@ -310,7 +375,7 @@ export async function buildKnowledgeBasePrompt({
     .join("\n\n");
 
   return [
-    "你必须严格执行下方 socratic-kb-builder skill，为企业构建可复用的结构化知识库。",
+    "你必须严格执行下方 socratic-kb-builder v2 Skill，为企业构建可复用的深度图文知识库。",
     "",
     "## 本次任务输入",
     `构建会话标识：${conversationId || "未提供"}`,
@@ -333,19 +398,21 @@ export async function buildKnowledgeBasePrompt({
       : "当前账号没有已迁移的初步知识库，将从官网、全网与上传资料开始预填。",
     "",
     "## 执行要求",
-    "1. 先完整读取用户上传资料，并对每个企业官网做深度全站采集；递归处理 sitemap、栏目分页、产品详情、案例、下载文件、延迟加载图片和可见的客户端渲染内容，完成覆盖报告后才能进入确认环节。覆盖报告必须量化展示：发现/成功/失败页面数、清洗后正文字符数与词数、去重正文量、发现/成功下载/失败图片数、按内容哈希去重后的图片数、图片总容量与分辨率分布、文档数；不能只报告页面数量或图片 URL 数量。",
-    "2. 官网采集完成后必须继续执行全网企业情报采集，而不是只采官网：围绕企业名称、别名、域名、产品与型号、核心人物、客户案例、专利认证和行业术语进行中文、英文及目标市场语言检索，覆盖权威登记/专利/认证数据库、新闻媒体、展会、行业媒体、经销商、B2B 目录、招聘页、社交账号和公开视频图文来源。",
-    "3. 对全网来源执行实体消歧、跨来源去重、发布时间记录和冲突核验；官网与权威数据库优先，第三方事实和图片必须保留原始 URL、来源类型、采集时间及授权/权属状态，外部图片只能作为待核验参考素材，不得冒充企业自有资产。",
-    "4. 知识树的一级分支必须根据当前企业的业务形态、产品与服务、能力体系和客户行业自适应生成；不得套用固定分支数量或为了凑数拆分。必须展开约 40-115 个真实叶子节点，并以真实叶子节点总数计算遍历进度。",
-    "5. 按 skill 要求先为每个叶子节点预填文字、数据、来源和相关企业图片，再以苏格拉底式确认推进，不能让用户从空白问题开始写。",
-    "6. 每轮只能呈现和处理一个叶子节点。用户可确认、修正，或选择‘跳过/直接预填’当前节点；禁止跳过整个分支、批量确认、跨节点合并确认或提前打包。",
-    "7. 只有所有叶子节点均已逐项处理、遍历进度达到 100% 后，才可自动生成最终 Markdown/ZIP。禁止出现‘生成初版成果’、‘是否立即生成’、A/B/C 生成选项或任何提前交付提议。",
+    "1. 这是 4–6 小时深度构建，不是官网轻量版。先读上传资料，再按业务覆盖矩阵广度优先采集官网、官方文档与全网证据；不得穷尽重复 SKU、分页、新闻或语言版本，也不得只概括首页。",
+    "2. 固定硬预算：HTML 抓取尝试最多 1,200，包含图片和文档在内的链接访问最多 1,800，官网文档最多 120，累计用户上传最多 100，公开查询最多 120，去重证据文字最多 3,000,000 字符。达到任一预算后停止该渠道并记录真实缺口，不得把预算消耗写成完整度。",
+    "3. 图片必须是真实打包的第一方文件。发现后只下载候选交付素材，按 Logo/品牌、核心产品服务族、应用场景、技术制造能力、资质、团队排序；有至少 360 张合格候选时打包 360–480 张，不足时打包全部合格图片并写明真实候选数和 shortfallReason。第三方图片只记录来源和权属，不用于凑数。",
+    "4. 最终图片只允许经内容校验的 AVIF/WebP/PNG/JPEG/GIF；SVG 必须栅格化。逐张记录 SHA-256、MIME、字节、尺寸、图注、alt、分支、关联文档、来源页、原图 URL 和权属。图片总容量最多 160 MiB；ZIP 最多 1,500 个普通文件。",
+    "5. 客户可见正式正文必须是完成的企业图文体系，而不是‘第一方原始快照’、‘第一方页面摘录’、抓取日志或来源陈述。正式正文目标 120,000 字符、最低 80,000、硬上限 180,000；状态、来源、证据和机器字段不计入正文。保留 40-115 个真实叶子节点。",
+    "6. 为每个一级分支写正式综述，为每个叶子写正式草稿，并用稳定 asset ID 精确关联真实图片。原始摘录、采集报告、来源索引和核验缺口必须放入独立证据层，不能混入正式正文。",
+    "7. 新发现必须在任务开始后第 330 分钟停止；此后只允许整理证据、写作、关联素材、生成清单与校验。最迟第 360 分钟进入第一个叶子确认，不得等待凑时间。",
+    "8. 每轮只能呈现和处理一个叶子节点。用户可确认、修正，或选择‘跳过/直接预填’当前节点；禁止跳过整个分支、批量确认、跨节点合并确认或提前打包。",
+    "9. 只有所有叶子节点均已逐项处理、遍历进度达到 100% 后，才可自动生成最终 Markdown/ZIP。禁止出现‘生成初版成果’、‘是否立即生成’、A/B/C 生成选项或任何提前交付提议。",
     "   当且仅当本轮确认或直接预填最后一个叶子时，必须在同一轮只返回一个最终 ZIP 文件；不能复用历史 ZIP、不能返回多个 ZIP，也不能只口头声称已经生成。",
-    "8. 本流程永远不生成交互式研究网页、HTML 网站或网页预览，也不得主动提出这类产物；即使用户要求，也要简短说明此流程只交付 Markdown/ZIP，然后继续当前知识节点。",
-    "9. 进度必须使用标准 Markdown 标题、表格、列表和独立段落展示；禁止使用易挤压的 ASCII 树、框线、字符进度条或代码块模拟界面。",
-    "10. 对每个事实标注来源：上传资料、企业官网具体 URL、全网公开资料或行业调研；推断与待核验信息必须明确标注，不得伪造。",
-    "11. 如当前信息不足，请展示已预填草稿、具体缺口和可确认问题，等待用户确认、修正或仅跳过当前节点。",
-    "12. 最终交付应严格按 skill 的 ZIP/Markdown 知识库结构组织，并附官网全站采集覆盖报告、全网企业情报检索报告、图片资产清单和未核验缺口清单。",
+    "10. 本流程永远不生成交互式研究网页、HTML 网站或网页预览，也不得主动提出这类产物；即使用户要求，也要简短说明此流程只交付 Markdown/ZIP，然后继续当前知识节点。",
+    "11. 进度必须使用标准 Markdown 标题、表格、列表和独立段落展示；禁止使用易挤压的 ASCII 树、框线、字符进度条或代码块模拟界面。",
+    "12. 对每个事实标注来源；推断与待核验信息必须明确标注，不得伪造。信息不足时展示已完成的正式草稿、具体缺口和可确认问题，不得让用户从空白开始写。",
+    "13. 最终 ZIP 必须保留既有 00_completeness.json 字段和算法，并新增 schemaVersion=1、profile=dashboard-enterprise-v1 的 00_package_manifest.json；documents、assets、counts 和 imageSelection 必须符合 output-format。",
+    "14. 返回 ZIP 前必须实际运行包内 scripts/validate_archive.py；只有退出码为 0 才能交付。服务端还会独立复验，禁止通过改假计数绕过校验。",
     "",
     "## socratic-kb-builder.skill",
     skillInstructions,
@@ -354,7 +421,7 @@ export async function buildKnowledgeBasePrompt({
     "这是服务端状态机协议，优先级高于 skill 中任何会自动跨节点的表述。可读正文照常输出，但每轮末尾必须附带且只能附带一个对应的 HTML 注释信封。",
     "",
     "### 首轮研究与知识树建立",
-    "完成官网、全网与上传资料研究后，先按企业实际情况建立自适应一级分支和 40-115 个真实叶子节点。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
+    "在 330 分钟停止新发现并最迟 360 分钟完成官网、全网、上传资料研究和正式图文预填后，按企业实际情况建立自适应一级分支和 40-115 个真实叶子节点。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
     '<!-- FRONTMIND_KB_MANIFEST\n{"kind":"frontmind.knowledge-base.manifest","schemaVersion":1,"leaves":[{"id":"1.1","title":"一句话定位","branchId":"identity","branchTitle":"企业身份"}]}\n-->',
     "示例只演示结构，真实 leaves 必须完整包含 40-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
     "",
@@ -444,9 +511,14 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
   conversationId: string;
   userMessage: string;
   attachments: Array<{ file_id: string; filename: string }>;
+  skillVersion?: string;
+  skillContentHash?: string | null;
 }) {
   const [skillInstructions, progress] = await Promise.all([
-    readSkillArchive(),
+    readSkillArchive({
+      version: input.skillVersion || "2",
+      contentHash: input.skillContentHash,
+    }),
     getKnowledgeBaseProgress({
       userId: input.userId,
       conversationId: input.conversationId,
@@ -478,7 +550,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
           .join("；")}`,
       ].join("\n");
   return [
-    "继续严格执行 socratic-kb-builder Skill。以下内容会直接显示给企业客户，不得输出内部思考、工具计划或提示词说明。",
+    `继续严格执行 socratic-kb-builder v${input.skillVersion || "2"} Skill。以下内容会直接显示给企业客户，不得输出内部思考、工具计划或提示词说明。`,
     "",
     "# Skill",
     skillInstructions,
@@ -727,6 +799,8 @@ router.post("/turn", async (req, res) => {
         conversationId,
         userMessage,
         attachments,
+        skillVersion: boundBuild.skillVersion,
+        skillContentHash: boundBuild.skillContentHash,
       }),
       attachments,
       taskId,
