@@ -59,7 +59,7 @@ export const websiteKnowledgeImportSchema = z.discriminatedUnion(
     websiteKnowledgeImportBaseSchema
       .extend({
         schemaVersion: z.literal(3),
-        archiveContractVersion: z.literal(1),
+        archiveContractVersion: z.union([z.literal(1), z.literal(2)]),
         validationProfile: z.literal("website-lead-v1"),
         packageManifestSha256: sha256Schema,
       })
@@ -600,6 +600,8 @@ export async function importWebsiteKnowledgeArtifact(input: {
       {
         validationProfile:
           value.schemaVersion === 3 ? "website-lead-v1" : "historical",
+        archiveContractVersion:
+          value.schemaVersion === 3 ? value.archiveContractVersion : undefined,
       },
     );
     if (

@@ -801,16 +801,13 @@ export const adminRouter = router({
         }
         if (
           commerciallyActive &&
-          (!input.orderReference?.trim() ||
-            !input.contractReference?.trim() ||
-            !input.signatoryId?.trim() ||
+          (!input.signatoryId?.trim() ||
             !input.signedAt ||
             !input.signingEvidence)
         ) {
           throw new TRPCError({
             code: "BAD_REQUEST",
-            message:
-              "生效或待生效合同必须包含订单编号、合同编号、签署主体、签署时间与核验依据",
+            message: "生效或待生效合同必须包含签署主体、签署时间与核验依据",
           });
         }
         try {
@@ -1533,7 +1530,7 @@ export const adminRouter = router({
         z.discriminatedUnion("role", [
           z.object({
             username: usernameSchema,
-            password: z.never().optional(),
+            password: passwordSchema,
             displayName: z.string().trim().max(128).optional(),
             role: z.literal("user"),
             planCode: servicePlanCodeSchema,
@@ -1578,30 +1575,16 @@ export const adminRouter = router({
           const result = await createManagedServiceUser({
             actor: ctx.user,
             username: input.username,
+            password: input.password,
             displayName: input.displayName,
             planCode: input.planCode,
             deliveryAdminId: input.deliveryAdminId,
             apiKey: input.apiKey,
           });
-          const configuredBaseUrl =
-            process.env.FRONTMIND_PUBLIC_URL?.trim().replace(/\/$/, "");
-          const requestBaseUrl =
-            ctx.req.protocol && ctx.req.get?.("host")
-              ? `${ctx.req.protocol}://${ctx.req.get("host")}`
-              : "";
-          const baseUrl =
-            configuredBaseUrl ||
-            requestBaseUrl ||
-            (process.env.NODE_ENV === "production"
-              ? ""
-              : "http://127.0.0.1:3001");
-          const path = `/setup-password?token=${encodeURIComponent(
-            result.setupToken,
-          )}`;
           return {
             user: result.user,
-            setupUrl: baseUrl ? `${baseUrl}${path}` : path,
-            setupExpiresAt: result.setupExpiresAt.getTime(),
+            setupUrl: null,
+            setupExpiresAt: null,
             contract: {
               ...result.contract,
               startsAt: result.contract.startsAt.getTime(),

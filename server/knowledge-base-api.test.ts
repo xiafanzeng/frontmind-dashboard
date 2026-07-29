@@ -34,12 +34,15 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("sitemap");
     expect(prompt).toContain("HTML 抓取尝试最多 1,200");
     expect(prompt).toContain("链接访问最多 1,800");
-    expect(prompt).toContain("打包 360–480 张");
+    expect(prompt).toContain("360–480 张是质量目标而非最低门槛");
     expect(prompt).toContain("官网文档最多 120");
     expect(prompt).toContain("累计用户上传最多 100");
     expect(prompt).toContain("公开查询最多 120");
     expect(prompt).toContain("3,000,000");
-    expect(prompt).toContain("目标 120,000");
+    expect(prompt).toContain("80,000–120,000 字符是质量目标");
+    expect(prompt).toContain("limited_evidence");
+    expect(prompt).toContain("evidenceDocumentIds");
+    expect(prompt).toContain("schemaVersion=2");
     expect(prompt).toContain("ZIP 最多 1,500");
     expect(prompt).toContain("160 MiB");
     expect(prompt).toContain("第 330 分钟停止");

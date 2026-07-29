@@ -72,6 +72,7 @@ describe("system administrator boundary", () => {
       (caller: ReturnType<typeof adminRouter.createCaller>) =>
         caller.users.create({
           username: "new.customer",
+          password: "customer-initial-password-2026",
           displayName: "新客户",
           role: "user",
           planCode: "luxury",

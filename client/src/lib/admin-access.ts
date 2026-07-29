@@ -1,5 +1,8 @@
 import type { AuthUser } from "@/_core/hooks/useAuth";
-export { isProtectedBuiltinAdminUsername } from "@shared/admin-access";
+export {
+  hasDeliveryCapability,
+  isProtectedBuiltinAdminUsername,
+} from "@shared/admin-access";
 export function isSystemAdminAccount(
   user: AuthUser | null | undefined,
 ): boolean {

@@ -663,6 +663,22 @@ export default function KnowledgeBaseViewer({
                   <h2 className="mt-2 text-2xl font-semibold tracking-tight text-[#171321]">
                     {selectedDocument.title}
                   </h2>
+                  {selectedDocument.contentStatus === "limited_evidence" && (
+                    <p
+                      className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-900"
+                      role="status"
+                    >
+                      公开证据有限：本章节已整理当前可核验信息，并保留待企业补充的资料缺口。
+                    </p>
+                  )}
+                  {selectedDocument.contentStatus === "needs_verification" && (
+                    <p
+                      className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm leading-6 text-slate-700"
+                      role="status"
+                    >
+                      暂无可确认公开证据：本章节列出已检查来源与后续需要补充的资料。
+                    </p>
+                  )}
                   <p className="mt-2 break-all text-xs text-[#9a94a8]">
                     {selectedDocument.path}
                   </p>

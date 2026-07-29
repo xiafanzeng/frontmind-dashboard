@@ -169,7 +169,7 @@ describe("managed administrator access levels", () => {
     );
   });
 
-  it("requires usage ownership transfer before promoting a delivery administrator", async () => {
+  it("preserves usage ownership when promoting a delivery administrator", async () => {
     const memory = memoryStore(
       [account(1, "system_admin"), account(2, "delivery_admin")],
       [
@@ -179,24 +179,41 @@ describe("managed administrator access levels", () => {
     );
     const writeAudit = vi.fn(async () => undefined);
 
+    const result = await setManagedAdminAccessLevel(
+      {
+        actor: actor("system_admin"),
+        targetUserId: 2,
+        adminAccessLevel: "system_admin",
+      },
+      { store: memory.store, writeAudit },
+    );
+
+    expect(result).toMatchObject({
+      changed: true,
+      user: { id: 2, adminAccessLevel: "system_admin" },
+    });
+    expect(memory.rows[1]?.adminAccessLevel).toBe("system_admin");
+    expect(writeAudit).toHaveBeenCalledOnce();
+  });
+
+  it("does not allow the built-in admin to be demoted", async () => {
+    const builtin = account(1, "system_admin");
+    builtin.username = "admin";
+    const memory = memoryStore([builtin, account(2, "system_admin")]);
+
     await expect(
       setManagedAdminAccessLevel(
         {
           actor: actor("system_admin"),
-          targetUserId: 2,
-          adminAccessLevel: "system_admin",
+          targetUserId: 1,
+          adminAccessLevel: "delivery_admin",
         },
-        { store: memory.store, writeAudit },
+        { store: memory.store },
       ),
     ).rejects.toMatchObject({
       code: "CONFLICT",
-      message:
-        "该交付管理员仍负责用户，请先转移这些用户的 Key 与积分归属，再调整管理员权限",
+      message: "内置 admin 必须保持为已启用的系统管理员",
     });
-
-    expect(memory.updateAccessLevel).not.toHaveBeenCalled();
-    expect(writeAudit).not.toHaveBeenCalled();
-    expect(memory.rows[1]?.adminAccessLevel).toBe("delivery_admin");
   });
 
   it("allows demotion only when another active system administrator remains", async () => {

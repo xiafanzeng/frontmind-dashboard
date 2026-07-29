@@ -734,8 +734,13 @@ export type KnowledgeDocument = {
     | "needs_verification"
     | "not_applicable";
   sourceIds?: string[];
+  evidenceDocumentIds?: string[];
   assetIds?: string[];
   customerVisible?: boolean;
+  evidenceCharacters?: number;
+  requiredFormalCharacters?: number;
+  contentStatus?: "complete" | "limited_evidence" | "needs_verification";
+  productFamilyId?: string;
 };
 
 export type KnowledgeAsset = {

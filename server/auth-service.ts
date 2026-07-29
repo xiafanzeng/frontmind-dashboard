@@ -8,7 +8,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { parse as parseCookieHeader } from "cookie";
-import { and, desc, eq, gt, inArray, isNull, ne } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, ne } from "drizzle-orm";
 import type { Request } from "express";
 import { COOKIE_NAME } from "../shared/const";
 import {
@@ -76,9 +76,9 @@ export type UsageOwnerAdminMutation =
   | "delete";
 
 /**
- * A delivery administrator is the runtime credential and billing parent for
- * every row in `user_usage_owners`. That relationship must be transferred
- * explicitly before the administrator account can stop serving that role.
+ * An administrator may be the runtime credential and billing parent for rows
+ * in `user_usage_owners`. That relationship must be transferred explicitly
+ * before the administrator account can be disabled or deleted.
  */
 export function assertAdminHasNoUsageOwnedUsers(input: {
   ownedUserCount: number;
@@ -94,7 +94,7 @@ export function assertAdminHasNoUsageOwnedUsers(input: {
         : "删除管理员";
   throw new AuthServiceError(
     "CONFLICT",
-    `该交付管理员仍负责用户，请先转移这些用户的 Key 与积分归属，再${actionLabel}`,
+    `该管理员仍负责用户，请先转移这些用户的 Key 与积分归属，再${actionLabel}`,
   );
 }
 
@@ -825,6 +825,16 @@ export async function setManagedUserActive(userId: number, isActive: boolean) {
       .for("update");
     const user = rows[0];
     if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+    if (
+      !isActive &&
+      user.isActive &&
+      isProtectedBuiltinAdminUsername(user.username)
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "内置 admin 必须保持为已启用的系统管理员",
+      );
+    }
 
     if (!isActive && user.isActive && user.role === "admin") {
       const ownedUsers = await tx
@@ -838,16 +848,28 @@ export async function setManagedUserActive(userId: number, isActive: boolean) {
         mutation: "deactivate",
       });
 
-      const activeAdmins = await tx
-        .select({ id: users.id })
+      const administrators = await tx
+        .select({
+          id: users.id,
+          adminAccessLevel: users.adminAccessLevel,
+          isActive: users.isActive,
+        })
         .from(users)
-        .where(and(eq(users.role, "admin"), eq(users.isActive, true)))
-        .limit(2)
+        .where(eq(users.role, "admin"))
+        .orderBy(asc(users.id))
         .for("update");
-      if (activeAdmins.length <= 1) {
+      const disablingSystemAdmin =
+        user.adminAccessLevel === "system_admin" &&
+        administrators.every(
+          (administrator) =>
+            administrator.id === user.id ||
+            !administrator.isActive ||
+            administrator.adminAccessLevel !== "system_admin",
+        );
+      if (disablingSystemAdmin) {
         throw new AuthServiceError(
           "LAST_ADMIN",
-          "The last active administrator cannot be disabled",
+          "至少需要保留一个已启用的系统管理员",
         );
       }
     }
@@ -915,16 +937,24 @@ export async function deleteManagedUser(
 
     if (user.role === "admin") {
       const protectedAdminRows = await tx
-        .select({ id: users.id })
+        .select({
+          id: users.id,
+          adminAccessLevel: users.adminAccessLevel,
+          isActive: users.isActive,
+        })
         .from(users)
         .where(eq(users.username, "admin"))
         .limit(1)
         .for("update");
       const protectedAdmin = protectedAdminRows[0];
-      if (!protectedAdmin) {
+      if (
+        !protectedAdmin ||
+        protectedAdmin.adminAccessLevel !== "system_admin" ||
+        !protectedAdmin.isActive
+      ) {
         throw new AuthServiceError(
           "CONFLICT",
-          "未找到受保护的内置 admin，无法安全交接客户",
+          "内置 admin 未保持启用的系统管理员状态，无法安全交接客户",
         );
       }
       const ownedUsers = await tx
@@ -958,16 +988,28 @@ export async function deleteManagedUser(
       const retainHistoricalAccount = historicalResources.length > 0;
 
       if (user.isActive) {
-        const activeAdmins = await tx
-          .select({ id: users.id })
+        const administrators = await tx
+          .select({
+            id: users.id,
+            adminAccessLevel: users.adminAccessLevel,
+            isActive: users.isActive,
+          })
           .from(users)
-          .where(and(eq(users.role, "admin"), eq(users.isActive, true)))
-          .limit(2)
+          .where(eq(users.role, "admin"))
+          .orderBy(asc(users.id))
           .for("update");
-        if (activeAdmins.length <= 1) {
+        const deletingLastActiveSystemAdmin =
+          user.adminAccessLevel === "system_admin" &&
+          administrators.every(
+            (administrator) =>
+              administrator.id === user.id ||
+              !administrator.isActive ||
+              administrator.adminAccessLevel !== "system_admin",
+          );
+        if (deletingLastActiveSystemAdmin) {
           throw new AuthServiceError(
             "LAST_ADMIN",
-            "The last active administrator cannot be deleted",
+            "至少需要保留一个已启用的系统管理员",
           );
         }
       }

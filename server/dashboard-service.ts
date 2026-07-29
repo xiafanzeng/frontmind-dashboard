@@ -1312,16 +1312,14 @@ export async function setWorkspaceAssignments(input: {
       throw new AuthServiceError("NOT_FOUND", "Administrator not found");
     }
   }
-  const deliveryAdminIds = validAdmins
-    .filter((admin) => admin.adminAccessLevel === "delivery_admin")
-    .map((admin) => admin.id);
+  const deliveryAdminIds = validAdmins.map((admin) => admin.id);
   if (
     input.usageOwnerAdminId != null &&
     !deliveryAdminIds.includes(input.usageOwnerAdminId)
   ) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "主负责人必须是已选中的有效交付管理员",
+      "主负责人必须是已选中的有效管理员",
     );
   }
   await db.transaction(async (tx) => {
@@ -1348,9 +1346,7 @@ export async function setWorkspaceAssignments(input: {
         "管理员状态已变化，请刷新后重新分配",
       );
     }
-    const lockedDeliveryAdminIds = lockedAdmins
-      .filter((admin) => admin.adminAccessLevel === "delivery_admin")
-      .map((admin) => admin.id);
+    const lockedDeliveryAdminIds = lockedAdmins.map((admin) => admin.id);
     if (
       input.usageOwnerAdminId != null &&
       !lockedDeliveryAdminIds.includes(input.usageOwnerAdminId)

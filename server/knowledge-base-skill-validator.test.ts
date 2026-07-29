@@ -72,7 +72,7 @@ function validDeepArchiveFiles() {
         ? "report"
         : documentPath.includes("index") || documentPath.includes("inventory")
           ? "index"
-          : "evidence",
+          : "index",
       title: documentPath,
       sourceIds: [],
       assetIds: [],
@@ -96,11 +96,32 @@ ${narrative}
 
 - source-official
 `;
-  const overviewCharacters = 80_000 - 40 * 120;
+  const discoveryMethods = [
+    "img",
+    "srcset",
+    "lazy_load",
+    "picture",
+    "css_background",
+    "open_graph",
+    "gallery",
+    "official_document",
+  ];
   const overviewPath = "branches/products/00_overview.md";
+  const overviewEvidencePath = "branches/products/evidence/overview.md";
+  files[`${root}/${overviewEvidencePath}`] = "证".repeat(100);
+  documents.push({
+    id: "evidence-overview-products",
+    path: overviewEvidencePath,
+    kind: "evidence",
+    title: "产品综述证据",
+    branchId: "products",
+    sourceIds: ["source-official"],
+    assetIds: [],
+    customerVisible: false,
+  });
   files[`${root}/${overviewPath}`] = formalDocument(
     "产品与服务综述",
-    "综".repeat(overviewCharacters),
+    "综".repeat(120),
   );
   documents.push({
     id: "overview-products",
@@ -111,14 +132,33 @@ ${narrative}
     order: 0,
     evidenceStatus: "verified_first_party",
     sourceIds: ["source-official"],
+    evidenceDocumentIds: ["evidence-overview-products"],
     assetIds: [],
     customerVisible: true,
+    evidenceCharacters: 100,
+    requiredFormalCharacters: 120,
+    contentStatus: "limited_evidence",
   });
   for (let index = 0; index < 40; index += 1) {
     const leafPath = `branches/products/leaf-${index + 1}.md`;
+    const evidencePath = `branches/products/evidence/leaf-${index + 1}.md`;
+    const sourceId = `source-official-${index + 1}`;
+    files[`${root}/${evidencePath}`] = String.fromCodePoint(
+      0x3400 + index,
+    ).repeat(100);
+    documents.push({
+      id: `evidence-leaf-${index + 1}`,
+      path: evidencePath,
+      kind: "evidence",
+      title: `知识叶子 ${index + 1} 证据`,
+      branchId: "products",
+      sourceIds: [sourceId],
+      assetIds: [],
+      customerVisible: false,
+    });
     files[`${root}/${leafPath}`] = formalDocument(
       `知识叶子 ${index + 1}`,
-      String.fromCodePoint(0x4e00 + index).repeat(120),
+      String.fromCodePoint(0x4e00 + index).repeat(80),
     );
     documents.push({
       id: `leaf-${index + 1}`,
@@ -126,11 +166,16 @@ ${narrative}
       kind: "leaf",
       title: `知识叶子 ${index + 1}`,
       branchId: "products",
+      productFamilyId: "family-a",
       order: index + 1,
       evidenceStatus: "verified_first_party",
-      sourceIds: ["source-official"],
+      sourceIds: [sourceId],
+      evidenceDocumentIds: [`evidence-leaf-${index + 1}`],
       assetIds: [],
       customerVisible: true,
+      evidenceCharacters: 100,
+      requiredFormalCharacters: 80,
+      contentStatus: "limited_evidence",
     });
   }
   files[`${root}/00_completeness.json`] = JSON.stringify({
@@ -153,18 +198,36 @@ ${narrative}
     evaluatedAt: "2026-07-29T00:00:00.000Z",
   });
   files[`${root}/00_package_manifest.json`] = JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     profile: "dashboard-enterprise-v1",
     documents,
     assets: [],
     counts: {
       totalFiles: documents.length + 2,
-      customerVisibleCharacters: 80_000,
-      evidenceCharacters: 0,
+      customerVisibleCharacters: 3_320,
+      evidenceCharacters: 4_100,
       packagedImages: 0,
     },
     imageSelection: {
+      status: "source_limited",
+      discoveredCandidateImages: 0,
+      inspectedCandidateImages: 0,
       eligibleFirstPartyImages: 0,
+      rejectedCandidateImages: 0,
+      scannedSourcePages: 1,
+      discoveryMethods,
+      rejectionReasons: [],
+      stopReason: "已检查所有官方页面和资料",
+      productFamilyCoverage: [
+        {
+          familyId: "family-a",
+          familyName: "产品族 A",
+          officialImageAvailable: false,
+          assetIds: [],
+          checkedSources: ["https://example.com/products"],
+          gapReason: "官方来源未提供可交付图片",
+        },
+      ],
       shortfallReason: "官网没有可用于交付的第一方图片",
     },
   });
@@ -181,6 +244,187 @@ describe("dashboard enterprise Skill archive validator", () => {
       code: 0,
       stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
     });
+  });
+
+  it("accepts evidence-limited prose below the writing target without padding", async () => {
+    const archivePath = await writeArchive(validDeepArchiveFiles());
+
+    const result = await runValidator(archivePath);
+
+    expect(result.code).toBe(0);
+  });
+
+  it("rejects a rich evidence relationship reported as zero characters", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    const overview = manifest.documents.find(
+      (document: { id?: string }) => document.id === "overview-products",
+    );
+    overview.evidenceCharacters = 0;
+    overview.requiredFormalCharacters = 60;
+    overview.contentStatus = "needs_verification";
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "evidenceCharacters must equal validator-recomputed evidence characters 100",
+    );
+  });
+
+  it("rejects a product family omitted from the media coverage audit", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    manifest.imageSelection.productFamilyCoverage = [];
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "productFamilyCoverage IDs must exactly match product/service leaf family IDs",
+    );
+  });
+
+  it("rejects evidence duplicated after normalization", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    const duplicatePath = "branches/products/evidence/copied-overview.md";
+    files[`${root}/${duplicatePath}`] = "证， ".repeat(100);
+    manifest.documents.push({
+      id: "evidence-copied-overview",
+      path: duplicatePath,
+      kind: "evidence",
+      title: "复制产品综述证据",
+      branchId: "products",
+      sourceIds: ["source-official"],
+      assetIds: [],
+      customerVisible: false,
+    });
+    manifest.counts.totalFiles += 1;
+    manifest.counts.evidenceCharacters += 100;
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("duplicate normalized evidence content");
+  });
+
+  it("rejects acquired evidence omitted from every formal document", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    const omittedPath = "branches/products/evidence/omitted.md";
+    files[`${root}/${omittedPath}`] = "未".repeat(100);
+    manifest.documents.push({
+      id: "evidence-omitted",
+      path: omittedPath,
+      kind: "evidence",
+      title: "未整理证据",
+      branchId: "products",
+      sourceIds: ["source-official"],
+      assetIds: [],
+      customerVisible: false,
+    });
+    manifest.counts.totalFiles += 1;
+    manifest.counts.evidenceCharacters += 100;
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "v2 evidence document must be referenced by at least one overview/leaf",
+    );
+  });
+
+  it("rejects referenced evidence without an explicit matching branchId", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    delete manifest.documents.find(
+      (document: { id?: string }) =>
+        document.id === "evidence-overview-products",
+    ).branchId;
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "must explicitly belong to the same branchId",
+    );
+  });
+
+  it("uses productFamilyId instead of title keywords for product branches", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    for (const document of manifest.documents) {
+      if (document.branchId === "products") document.branchId = "catalog-a";
+      if (document.id === "overview-products") document.title = "核心目录";
+    }
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).toBe(0);
+  });
+
+  it("rejects a product branch with a partially declared family", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    delete manifest.documents.find(
+      (document: { id?: string }) => document.id === "leaf-1",
+    ).productFamilyId;
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "product/service branch leaf requires productFamilyId",
+    );
+  });
+
+  it("rejects v2 without any product or service family", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    for (const document of manifest.documents) {
+      delete document.productFamilyId;
+    }
+    manifest.imageSelection.productFamilyCoverage = [];
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "schema v2 must declare at least one product/service family",
+    );
   });
 
   it("rejects a legacy snapshot-shaped archive without the v2 contracts", async () => {
@@ -202,7 +446,7 @@ describe("dashboard enterprise Skill archive validator", () => {
 
   it("rejects a manifest that reports images but packages no image bytes", async () => {
     const manifest = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       profile: "dashboard-enterprise-v1",
       documents: [],
       assets: [],
@@ -213,8 +457,25 @@ describe("dashboard enterprise Skill archive validator", () => {
         packagedImages: 420,
       },
       imageSelection: {
+        status: "target_met",
+        discoveredCandidateImages: 420,
+        inspectedCandidateImages: 420,
         eligibleFirstPartyImages: 420,
-        shortfallReason: null,
+        rejectedCandidateImages: 0,
+        scannedSourcePages: 1,
+        discoveryMethods: [
+          "img",
+          "srcset",
+          "lazy_load",
+          "picture",
+          "css_background",
+          "open_graph",
+          "gallery",
+          "official_document",
+        ],
+        rejectionReasons: [],
+        stopReason: "已检查所有官方页面和资料",
+        productFamilyCoverage: [],
       },
     };
     const archivePath = await writeArchive({
@@ -231,7 +492,7 @@ describe("dashboard enterprise Skill archive validator", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain(
-      "420 eligible images require packaging 360–480",
+      "target_met requires at least 360 eligible and packaged images",
     );
     expect(result.stderr).toContain("manifest.counts.packagedImages must be 0");
   });
@@ -267,7 +528,33 @@ describe("dashboard enterprise Skill archive validator", () => {
     manifest.counts.totalFiles += 1;
     manifest.counts.packagedImages = 1;
     manifest.imageSelection = {
+      status: "source_limited",
+      discoveredCandidateImages: 1,
+      inspectedCandidateImages: 1,
       eligibleFirstPartyImages: 1,
+      rejectedCandidateImages: 0,
+      scannedSourcePages: 1,
+      discoveryMethods: [
+        "img",
+        "srcset",
+        "lazy_load",
+        "picture",
+        "css_background",
+        "open_graph",
+        "gallery",
+        "official_document",
+      ],
+      rejectionReasons: [],
+      stopReason: "已检查所有官方页面和资料",
+      productFamilyCoverage: [
+        {
+          familyId: "family-a",
+          familyName: "产品族 A",
+          officialImageAvailable: true,
+          assetIds: ["asset-header-only"],
+          checkedSources: ["https://example.com/products"],
+        },
+      ],
       shortfallReason: "仅发现一张候选素材",
     };
     files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);

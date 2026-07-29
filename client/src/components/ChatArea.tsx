@@ -244,6 +244,7 @@ export default function ChatArea({
   composerPrefill,
   responseLogicContext,
   showKnowledgeBaseStarter = true,
+  standardWelcomeVariant = "simple",
   reserveOuterMobileNav = false,
 }: {
   fixedAgentProfile?: string;
@@ -251,6 +252,7 @@ export default function ChatArea({
   composerPrefill?: string;
   responseLogicContext?: ResponseLogicTaskContext;
   showKnowledgeBaseStarter?: boolean;
+  standardWelcomeVariant?: "simple" | "workflow";
   reserveOuterMobileNav?: boolean;
 }) {
   const {
@@ -703,7 +705,7 @@ export default function ChatArea({
                 companyLoading={dashboardQuery.isLoading}
               />
             ) : (
-              <StandardConversationHint />
+              <StandardConversationHint variant={standardWelcomeVariant} />
             ))}
 
           <AnimatePresence initial={false}>
@@ -815,7 +817,47 @@ function ResponseLogicConversationHint({ question }: { question: string }) {
   );
 }
 
-function StandardConversationHint() {
+function StandardConversationHint({
+  variant,
+}: {
+  variant: "simple" | "workflow";
+}) {
+  if (variant === "workflow") {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="mx-auto max-w-xl space-y-7 py-10 text-center"
+      >
+        <div>
+          <span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-primary/10 text-primary">
+            <Sparkles className="h-5 w-5" />
+          </span>
+          <h3 className="mt-4 text-lg font-semibold text-foreground/80">
+            内容制作智能体编排工作流
+          </h3>
+          <p className="mx-auto mt-2 max-w-lg text-sm leading-6 text-muted-foreground">
+            以研究、分析与交付为核心的专业内容生产引擎
+          </p>
+        </div>
+        <div className="flex flex-wrap justify-center gap-4">
+          <FeatureBadge
+            icon={<FileText className="h-3.5 w-3.5" />}
+            text="资料输入"
+          />
+          <FeatureBadge
+            icon={<Sparkles className="h-3.5 w-3.5" />}
+            text="智能分析"
+          />
+          <FeatureBadge
+            icon={<Download className="h-3.5 w-3.5" />}
+            text="报告交付"
+          />
+        </div>
+      </motion.div>
+    );
+  }
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}

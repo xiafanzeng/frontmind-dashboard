@@ -207,6 +207,22 @@
   min-width: 0;
   padding: 0 32px 44px;
 }
+.user-brand-dashboard.knowledge-build-workspace {
+  height: 100dvh;
+  overflow: hidden;
+}
+.user-brand-dashboard .knowledge-build-app-shell {
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+.user-brand-dashboard .knowledge-build-main {
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+  background: #fff;
+}
 .user-brand-dashboard .project-ribbon {
   position: sticky;
   top: 0;
@@ -4137,7 +4153,9 @@
   cursor: pointer;
   list-style: none;
 }
-.user-brand-dashboard .published-content-asset > summary::-webkit-details-marker {
+.user-brand-dashboard
+  .published-content-asset
+  > summary::-webkit-details-marker {
   display: none;
 }
 .user-brand-dashboard .published-content-asset > summary span {
@@ -4350,6 +4368,9 @@
   .user-brand-dashboard .dashboard-main {
     padding: 0 20px 32px;
   }
+  .user-brand-dashboard .knowledge-build-main {
+    padding: 0;
+  }
   .user-brand-dashboard .project-ribbon {
     margin: 0 -20px 14px;
     padding: 12px 20px;
@@ -4395,6 +4416,9 @@
   .user-brand-dashboard .dashboard-main {
     padding: 0 14px 24px;
     padding-top: 60px;
+  }
+  .user-brand-dashboard .knowledge-build-main {
+    padding: 0;
   }
   .user-brand-dashboard .project-ribbon {
     margin: 0 -14px 12px;

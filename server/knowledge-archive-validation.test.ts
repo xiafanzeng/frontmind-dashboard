@@ -135,7 +135,7 @@ ${narrative}`;
         ? ("report" as const)
         : relativePath.includes("index") || relativePath.includes("inventory")
           ? ("index" as const)
-          : ("evidence" as const),
+          : ("index" as const),
       title: relativePath,
       sourceIds: [],
       assetIds: [],
@@ -248,6 +248,325 @@ ${narrative}`;
   return zip.generateAsync({ type: "nodebuffer" });
 }
 
+async function websiteV2Archive(
+  options: {
+    leafCount?: number;
+    overviewCount?: number;
+    imageCount?: number;
+    customerCharacters?: number;
+    zeroEvidence?: boolean;
+    imageStatus?: "target_met" | "source_limited" | "budget_limited";
+    uninspectedCandidateCount?: number;
+  } = {},
+) {
+  const leafCount = options.leafCount ?? 40;
+  const overviewCount = options.overviewCount ?? 7;
+  const imageCount = options.imageCount ?? 0;
+  const zeroEvidence = options.zeroEvidence ?? false;
+  const uninspectedCandidateCount = options.uninspectedCandidateCount ?? 0;
+  const root = "示例企业V2_knowledge_base";
+  const zip = new JSZip();
+  const branchDirectories = [
+    "01_company_overview",
+    "02_team",
+    "03_products",
+    "04_technology",
+    "05_manufacturing",
+    "06_industries",
+    "07_service",
+    "08_competitive_advantages",
+  ] as const;
+  const overviewDirectories = branchDirectories.filter(
+    (directory) => directory !== "05_manufacturing",
+  );
+  const supportingDocuments = [
+    ["README.md", "# 示例企业 V2 知识库"],
+    ["00_knowledge_tree.md", "# 知识树"],
+    ["00_crawl_coverage_report.md", "# 官网采集报告"],
+    ["00_web_intelligence_report.md", "# 公开信息报告"],
+    ["00_source_index.md", "# 来源索引"],
+    ["09_media_assets/asset_inventory.md", "# 第一方图片清单"],
+    ["10_reference_assets/reference_asset_inventory.md", "# 第三方素材索引"],
+  ] as const;
+  const documents: Array<Record<string, unknown>> = [];
+  let evidenceCharacters = 0;
+  for (const [relativePath, content] of supportingDocuments) {
+    zip.file(`${root}/${relativePath}`, content);
+    evidenceCharacters += content
+      .replace(/^#\s*/, "")
+      .replace(/\s/g, "").length;
+    documents.push({
+      id: `doc-${relativePath}`,
+      path: relativePath,
+      kind: relativePath.includes("report")
+        ? "report"
+        : relativePath.includes("index") || relativePath.includes("inventory")
+          ? "index"
+          : "index",
+      title: relativePath,
+      sourceIds: [],
+      assetIds: [],
+      customerVisible: false,
+    });
+  }
+  const customerSpecs = [
+    ...overviewDirectories.slice(0, overviewCount).map((branchId, index) => ({
+      id: `overview-${index + 1}`,
+      path: `${branchId}/00_overview.md`,
+      kind: "overview" as const,
+      branchId,
+    })),
+    ...Array.from({ length: leafCount }, (_, index) => {
+      const branchId = branchDirectories[index % branchDirectories.length]!;
+      return {
+        id: `leaf-${index + 1}`,
+        path: `${branchId}/knowledge-${index + 1}.md`,
+        kind: "leaf" as const,
+        branchId,
+      };
+    }),
+  ];
+  const displayBranchByDirectory = new Map<string, string>([
+    ["01_company_overview", "company-identity"],
+    ["02_team", "team"],
+    ["03_products", "products-services"],
+    ["04_technology", "core-capabilities"],
+    ["05_manufacturing", "core-capabilities"],
+    ["06_industries", "customers-industries"],
+    ["07_service", "cooperation"],
+    ["08_competitive_advantages", "why-frontmind"],
+  ]);
+  const branchEvidenceCharacters = new Map<string, number>();
+  for (const spec of customerSpecs) {
+    const displayBranch = displayBranchByDirectory.get(spec.branchId)!;
+    branchEvidenceCharacters.set(
+      displayBranch,
+      (branchEvidenceCharacters.get(displayBranch) || 0) +
+        (zeroEvidence ? 0 : 100),
+    );
+  }
+  const branchMinimum = (displayBranch: string) => {
+    const characters = branchEvidenceCharacters.get(displayBranch) || 0;
+    if (characters === 0) return 40;
+    return Math.min(
+      displayBranch === "products-services" ? 3_000 : 1_500,
+      Math.max(120, Math.ceil(characters * 0.25)),
+    );
+  };
+  const baseNarrativeCharacters = customerSpecs.reduce(
+    (total, spec) =>
+      total +
+      (spec.kind === "overview"
+        ? branchMinimum(displayBranchByDirectory.get(spec.branchId)!)
+        : 120),
+    0,
+  );
+  const requestedCustomerCharacters =
+    options.customerCharacters ?? baseNarrativeCharacters;
+  if (requestedCustomerCharacters < baseNarrativeCharacters) {
+    throw new Error(
+      "customerCharacters is below the fixture's dynamic minimum",
+    );
+  }
+  let customerVisibleCharacters = 0;
+  for (const [index, spec] of customerSpecs.entries()) {
+    const sourceId = `source-${index + 1}`;
+    const evidenceId = `evidence-${spec.id}`;
+    const evidencePath = `evidence/${spec.id}.md`;
+    if (!zeroEvidence) {
+      const evidenceContent = String.fromCodePoint(0x3400 + index).repeat(100);
+      zip.file(`${root}/${evidencePath}`, evidenceContent);
+      evidenceCharacters += 100;
+      documents.push({
+        id: evidenceId,
+        path: evidencePath,
+        kind: "evidence",
+        title: `${spec.id} 证据`,
+        branchId: spec.branchId,
+        sourceIds: [sourceId],
+        assetIds: [],
+        customerVisible: false,
+      });
+    }
+    const displayBranch = displayBranchByDirectory.get(spec.branchId)!;
+    const minimumCharacters =
+      spec.kind === "overview"
+        ? branchMinimum(displayBranch)
+        : zeroEvidence
+          ? 40
+          : 60;
+    const narrativeCharacters =
+      (spec.kind === "overview" ? minimumCharacters : 120) +
+      (index === 0 ? requestedCustomerCharacters - baseNarrativeCharacters : 0);
+    customerVisibleCharacters += narrativeCharacters;
+    const title = `${spec.id} 正式内容`;
+    zip.file(
+      `${root}/${spec.path}`,
+      `# ${title}\n\n> 状态: ${
+        zeroEvidence ? "needs_verification" : "verified_first_party"
+      } | 来源: 企业官网\n\n${String.fromCodePoint(0x4e00 + index).repeat(
+        narrativeCharacters,
+      )}`,
+    );
+    documents.push({
+      ...spec,
+      title,
+      order: index + 1,
+      evidenceStatus: zeroEvidence
+        ? "needs_verification"
+        : "verified_first_party",
+      sourceIds: zeroEvidence ? [] : [sourceId],
+      evidenceDocumentIds: zeroEvidence ? [] : [evidenceId],
+      assetIds:
+        spec.id === "overview-3"
+          ? Array.from(
+              { length: imageCount },
+              (_, assetIndex) => `asset-${assetIndex + 1}`,
+            )
+          : [],
+      customerVisible: true,
+      evidenceCharacters: zeroEvidence ? 0 : 100,
+      dynamicMinimumCharacters: minimumCharacters,
+      ...(spec.kind === "leaf" && spec.branchId === "03_products"
+        ? { productFamilyIds: ["family-products"] }
+        : {}),
+    });
+  }
+  const assets = Array.from({ length: imageCount }, (_, index) => {
+    const assetId = `asset-${index + 1}`;
+    const assetPath = `09_media_assets/product_images/${assetId}.png`;
+    const assetBytes = Buffer.concat([pngBytes, Buffer.from([index])]);
+    zip.file(`${root}/${assetPath}`, assetBytes);
+    return {
+      id: assetId,
+      path: assetPath,
+      sha256: createHash("sha256").update(assetBytes).digest("hex"),
+      mimeType: "image/png",
+      bytes: assetBytes.length,
+      width: 1,
+      height: 1,
+      caption: "核心产品官方图片",
+      branchId: "03_products",
+      documentIds: ["overview-3"],
+      sourcePageUrl: "https://example.com/products",
+      sourceAssetUrl: `https://example.com/assets/${assetId}.png`,
+      ownership: "first_party",
+    };
+  });
+  const imageSelectionStatus =
+    options.imageStatus ??
+    (uninspectedCandidateCount > 0
+      ? "budget_limited"
+      : assets.length >= 36
+        ? "target_met"
+        : "source_limited");
+  zip.file(
+    `${root}/00_completeness.json`,
+    JSON.stringify({
+      counts: {
+        totalLeaves: leafCount,
+        verifiedFirstParty: zeroEvidence ? 0 : leafCount,
+        verifiedAuthoritative: 0,
+        supportedThirdParty: 0,
+        inferred: 0,
+        needsVerification: zeroEvidence ? leafCount : 0,
+        notApplicable: 0,
+      },
+      acquisition: {
+        officialPages: { completed: 0, total: 0 },
+        images: {
+          completed: imageCount,
+          total: imageCount + uninspectedCandidateCount,
+        },
+        documents: { completed: 0, total: 0 },
+        webQueries: { completed: 0, total: 0 },
+      },
+      gaps: ["官网没有可用于交付的第一方图片"],
+      evaluatedAt: "2026-07-29T00:00:00.000Z",
+    }),
+  );
+  zip.file(
+    `${root}/00_package_manifest.json`,
+    JSON.stringify({
+      schemaVersion: 2,
+      profile: "website-lead-v1",
+      documents,
+      assets,
+      counts: {
+        totalFiles: documents.length + assets.length + 2,
+        customerVisibleCharacters,
+        evidenceCharacters,
+        packagedImages: assets.length,
+      },
+      branchEvidence: [
+        ["company-identity", "overview-1"],
+        ["team", "overview-2"],
+        ["products-services", "overview-3"],
+        ["core-capabilities", "overview-4"],
+        ["customers-industries", "overview-5"],
+        ["cooperation", "overview-6"],
+        ["why-frontmind", "overview-7"],
+      ].map(([branchId, overviewDocumentId], index) => ({
+        branchId,
+        overviewDocumentId,
+        contentStatus: zeroEvidence ? "needs_verification" : "limited_evidence",
+        deduplicatedEvidenceCharacters:
+          branchEvidenceCharacters.get(branchId) || 0,
+        dynamicOverviewMinimum: branchMinimum(branchId),
+        checkedSourceCount: index + 1,
+      })),
+      imageSelection: {
+        status: imageSelectionStatus,
+        discoveredCandidateImages: assets.length + uninspectedCandidateCount,
+        inspectedCandidateImages: assets.length,
+        eligibleFirstPartyImages: assets.length,
+        rejectedCandidateImages: 0,
+        scannedSourcePages: 1,
+        discoveryMethods: [
+          "img",
+          "srcset_or_lazy",
+          "picture",
+          "css_background",
+          "open_graph",
+          "gallery",
+          "official_document",
+        ],
+        candidates: [
+          ...assets.map((asset) => ({
+            url: asset.sourceAssetUrl,
+            sourcePageUrl: asset.sourcePageUrl,
+            method: "img",
+            status: "eligible",
+            assetId: asset.id,
+          })),
+          ...Array.from({ length: uninspectedCandidateCount }, (_, index) => ({
+            url: `https://example.com/uninspected-${index + 1}.png`,
+            sourcePageUrl: "https://example.com/products",
+            method: "gallery",
+            status: "uninspected",
+          })),
+        ],
+        productFamilies: [
+          {
+            id: "family-products",
+            name: "核心产品族",
+            officialVisualFound: assets.length > 0,
+            checkedSources: 1,
+            assetIds: assets.map((asset) => asset.id),
+            ...(assets.length === 0
+              ? { gapReason: "官方来源未提供可交付图片" }
+              : {}),
+          },
+        ],
+        ...(imageSelectionStatus === "target_met"
+          ? {}
+          : { shortfallReason: "官网没有可用于交付的第一方图片" }),
+      },
+    }),
+  );
+  return zip.generateAsync({ type: "nodebuffer" });
+}
+
 async function dashboardEnterpriseArchive() {
   const root = "深度企业_knowledge_base";
   const zip = new JSZip();
@@ -271,7 +590,7 @@ async function dashboardEnterpriseArchive() {
           ? "report"
           : relativePath.includes("index") || relativePath.includes("inventory")
             ? "index"
-            : "evidence",
+            : "index",
         title: relativePath,
         sourceIds: [],
         assetIds: [],
@@ -293,10 +612,22 @@ ${narrative}
 
 证据区不应进入客户可见正文。
 `;
+  const evidencePath = "branches/products/evidence/official-products.md";
+  zip.file(`${root}/${evidencePath}`, "证".repeat(100));
+  documents.push({
+    id: "evidence-official-products",
+    path: evidencePath,
+    kind: "evidence",
+    title: "官方产品证据",
+    branchId: "products",
+    sourceIds: ["source-official"],
+    assetIds: [],
+    customerVisible: false,
+  });
   const overviewPath = "branches/products/00_overview.md";
   zip.file(
     `${root}/${overviewPath}`,
-    formalDocument("产品与服务综述", "综".repeat(80_000 - 40 * 120)),
+    formalDocument("产品与服务综述", "综".repeat(120)),
   );
   documents.push({
     id: "overview-products",
@@ -307,8 +638,12 @@ ${narrative}
     order: 0,
     evidenceStatus: "verified_first_party",
     sourceIds: ["source-official"],
+    evidenceDocumentIds: ["evidence-official-products"],
     assetIds: [],
     customerVisible: true,
+    evidenceCharacters: 100,
+    requiredFormalCharacters: 120,
+    contentStatus: "limited_evidence",
   });
   for (let index = 0; index < 40; index += 1) {
     const relativePath = `branches/products/leaf-${index + 1}.md`;
@@ -316,7 +651,7 @@ ${narrative}
       `${root}/${relativePath}`,
       formalDocument(
         `知识叶子 ${index + 1}`,
-        String.fromCodePoint(0x4e00 + index).repeat(120),
+        String.fromCodePoint(0x4e00 + index).repeat(80),
       ),
     );
     documents.push({
@@ -325,11 +660,16 @@ ${narrative}
       kind: "leaf",
       title: `知识叶子 ${index + 1}`,
       branchId: "products",
+      productFamilyId: "family-a",
       order: index + 1,
       evidenceStatus: "verified_first_party",
       sourceIds: ["source-official"],
+      evidenceDocumentIds: ["evidence-official-products"],
       assetIds: [],
       customerVisible: true,
+      evidenceCharacters: 100,
+      requiredFormalCharacters: 80,
+      contentStatus: "limited_evidence",
     });
   }
   zip.file(
@@ -357,18 +697,45 @@ ${narrative}
   zip.file(
     `${root}/00_package_manifest.json`,
     JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       profile: "dashboard-enterprise-v1",
       documents,
       assets: [],
       counts: {
         totalFiles: documents.length + 2,
-        customerVisibleCharacters: 80_000,
-        evidenceCharacters: 0,
+        customerVisibleCharacters: 3_320,
+        evidenceCharacters: 100,
         packagedImages: 0,
       },
       imageSelection: {
+        status: "source_limited",
+        discoveredCandidateImages: 0,
+        inspectedCandidateImages: 0,
         eligibleFirstPartyImages: 0,
+        rejectedCandidateImages: 0,
+        scannedSourcePages: 1,
+        discoveryMethods: [
+          "img",
+          "srcset",
+          "lazy_load",
+          "picture",
+          "css_background",
+          "open_graph",
+          "gallery",
+          "official_document",
+        ],
+        rejectionReasons: [],
+        stopReason: "已检查所有官方页面和资料",
+        productFamilyCoverage: [
+          {
+            familyId: "family-a",
+            familyName: "产品族 A",
+            officialImageAvailable: false,
+            assetIds: [],
+            checkedSources: ["https://example.com/products"],
+            gapReason: "官方来源未提供可交付图片",
+          },
+        ],
         shortfallReason: "官网没有可用于交付的第一方图片",
       },
     }),
@@ -408,6 +775,259 @@ describe("versioned knowledge archive quality gates", () => {
           !document.content.includes("证据区不应进入客户可见正文"),
       ),
     ).toBe(true);
+    expect(customerDocuments[0]).toMatchObject({
+      contentStatus: "limited_evidence",
+      evidenceCharacters: 100,
+    });
+  });
+
+  it("rejects a v2 document that understates its packaged evidence", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const manifestEntry = zip.file(
+      "深度企业_knowledge_base/00_package_manifest.json",
+    )!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    const overview = manifest.documents.find(
+      (document: { id?: string }) => document.id === "overview-products",
+    );
+    overview.evidenceCharacters = 0;
+    overview.requiredFormalCharacters = 60;
+    overview.contentStatus = "needs_verification";
+    zip.file(
+      "深度企业_knowledge_base/00_package_manifest.json",
+      JSON.stringify(manifest),
+    );
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库.zip",
+        "deep-evidence-mismatch",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toMatchObject<Partial<KnowledgeArchiveValidationError>>({
+      category: "content",
+    });
+  });
+
+  it("rejects a v2 media audit that omits a product family", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const manifestEntry = zip.file(
+      "深度企业_knowledge_base/00_package_manifest.json",
+    )!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    manifest.imageSelection.productFamilyCoverage = [];
+    zip.file(
+      "深度企业_knowledge_base/00_package_manifest.json",
+      JSON.stringify(manifest),
+    );
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库.zip",
+        "deep-product-coverage-mismatch",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toMatchObject<Partial<KnowledgeArchiveValidationError>>({
+      category: "media",
+    });
+  });
+
+  it("rejects normalized duplicate evidence documents", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    const duplicatePath = "branches/products/evidence/copied-products.md";
+    zip.file(`${root}/${duplicatePath}`, "证， ".repeat(100));
+    manifest.documents.push({
+      id: "evidence-copied-products",
+      path: duplicatePath,
+      kind: "evidence",
+      title: "复制产品证据",
+      branchId: "products",
+      sourceIds: ["source-official"],
+      assetIds: [],
+      customerVisible: false,
+    });
+    manifest.counts.totalFiles += 1;
+    manifest.counts.evidenceCharacters += 100;
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库.zip",
+        "deep-duplicate-evidence",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("证据文档规范化后内容重复");
+  });
+
+  it("rejects acquired evidence omitted from all formal documents", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    const omittedPath = "branches/products/evidence/omitted.md";
+    zip.file(`${root}/${omittedPath}`, "未".repeat(100));
+    manifest.documents.push({
+      id: "evidence-omitted",
+      path: omittedPath,
+      kind: "evidence",
+      title: "未整理证据",
+      branchId: "products",
+      sourceIds: ["source-official"],
+      assetIds: [],
+      customerVisible: false,
+    });
+    manifest.counts.totalFiles += 1;
+    manifest.counts.evidenceCharacters += 100;
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库.zip",
+        "deep-omitted-evidence",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("都必须被至少一篇正式文档引用");
+  });
+
+  it("rejects evidence without the formal document branch scope", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    const evidence = manifest.documents.find(
+      (document: { id?: string }) =>
+        document.id === "evidence-official-products",
+    );
+    delete evidence.branchId;
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库.zip",
+        "deep-global-evidence",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("显式属于同一分支");
+  });
+
+  it("uses productFamilyId rather than title keywords to identify product branches", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    for (const document of manifest.documents) {
+      if (document.branchId === "products") document.branchId = "catalog-a";
+      if (document.id === "overview-products") document.title = "核心目录";
+    }
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    const result = await readKnowledgeArchive(
+      await zip.generateAsync({ type: "nodebuffer" }),
+      "深度企业知识库.zip",
+      "deep-family-id-branch",
+      {
+        validationProfile: "dashboard-enterprise-v1",
+        archiveContractVersion: 2,
+      },
+    );
+    storedKeys.push(...result.storedAssetKeys);
+    expect(
+      result.documents.filter((document) => document.customerVisible),
+    ).toHaveLength(41);
+  });
+
+  it("does not accept Website productFamilyIds in an enterprise v2 manifest", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    const leaf = manifest.documents.find(
+      (document: { id?: string }) => document.id === "leaf-1",
+    );
+    leaf.productFamilyIds = ["family-a"];
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库.zip",
+        "deep-website-family-field",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("uses productFamilyId");
+  });
+
+  it("rejects a partially declared product-family branch", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    delete manifest.documents.find(
+      (document: { id?: string }) => document.id === "leaf-1",
+    ).productFamilyId;
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库.zip",
+        "deep-partial-family-branch",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("产品分支的每个叶子");
+  });
+
+  it("rejects v2 without any declared product or service family", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    for (const document of manifest.documents) {
+      delete document.productFamilyId;
+    }
+    manifest.imageSelection.productFamilyCoverage = [];
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库.zip",
+        "deep-no-family",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("至少声明一个产品或服务族");
   });
 
   it.each([36, 48])(
@@ -422,6 +1042,318 @@ describe("versioned knowledge archive quality gates", () => {
         result.documents.filter((document) => document.customerVisible),
       ).toHaveLength(40);
       expect(result.documents[0]?.kind).toBeDefined();
+    },
+  );
+
+  it("keeps website v1 compatibility at 40 customer-visible documents", async () => {
+    const result = await parseWebsiteArchive(await websiteArchive());
+    const customerDocuments = result.documents.filter(
+      (document) => document.customerVisible,
+    );
+
+    expect(customerDocuments).toHaveLength(40);
+    expect(
+      customerDocuments.filter((document) => document.kind === "overview"),
+    ).toHaveLength(7);
+    expect(
+      customerDocuments.filter((document) => document.kind === "leaf"),
+    ).toHaveLength(33);
+  });
+
+  it("keeps Website v1 compatibility when a target-sized package retains a shortfall note", async () => {
+    const zip = await JSZip.loadAsync(await websiteArchive({ imageCount: 36 }));
+    const root = "示例企业_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    manifest.imageSelection.shortfallReason = "历史归档保留的素材说明";
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    const result = await parseWebsiteArchive(
+      await zip.generateAsync({ type: "nodebuffer" }),
+    );
+    expect(result.assets).toHaveLength(36);
+  });
+
+  it.each([40, 56])(
+    "accepts website v2 with 7 overviews plus %s true leaves",
+    async (leafCount) => {
+      const result = await readKnowledgeArchive(
+        await websiteV2Archive({ leafCount }),
+        "示例企业V2知识库.zip",
+        `website-v2-${leafCount}`,
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      );
+      storedKeys.push(...result.storedAssetKeys);
+      const customerDocuments = result.documents.filter(
+        (document) => document.customerVisible,
+      );
+      expect(
+        customerDocuments.filter((document) => document.kind === "overview"),
+      ).toHaveLength(7);
+      expect(
+        customerDocuments.filter((document) => document.kind === "leaf"),
+      ).toHaveLength(leafCount);
+    },
+  );
+
+  it("accepts the authentic Website v2 candidate and product-family field shapes", async () => {
+    const result = await readKnowledgeArchive(
+      await websiteV2Archive({ leafCount: 40, imageCount: 1 }),
+      "示例企业V2知识库.zip",
+      "website-v2-authentic-contract",
+      {
+        validationProfile: "website-lead-v1",
+        archiveContractVersion: 2,
+      },
+    );
+    storedKeys.push(...result.storedAssetKeys);
+
+    expect(result.assets).toHaveLength(1);
+    expect(
+      result.documents.filter((document) => document.kind === "leaf"),
+    ).toHaveLength(40);
+  });
+
+  it.each([
+    {
+      label: "target_met with every eligible asset packaged",
+      options: {
+        imageCount: 36 as const,
+        uninspectedCandidateCount: 0 as const,
+      },
+    },
+    {
+      label:
+        "budget_limited with 36 eligible assets and an uninspected candidate",
+      options: {
+        imageCount: 36 as const,
+        uninspectedCandidateCount: 1 as const,
+      },
+    },
+  ])("accepts Website v2 image status: $label", async ({ options }) => {
+    const result = await readKnowledgeArchive(
+      await websiteV2Archive(options),
+      "示例企业V2知识库.zip",
+      `website-v2-image-status-${options.uninspectedCandidateCount || 0}`,
+      {
+        validationProfile: "website-lead-v1",
+        archiveContractVersion: 2,
+      },
+    );
+    storedKeys.push(...result.storedAssetKeys);
+    expect(result.assets).toHaveLength(36);
+  });
+
+  it("rejects target_met when an uninspected Website v2 candidate remains", async () => {
+    await expect(
+      readKnowledgeArchive(
+        await websiteV2Archive({
+          imageCount: 36,
+          imageStatus: "target_met",
+          uninspectedCandidateCount: 1,
+        }),
+        "示例企业V2知识库.zip",
+        "website-v2-invalid-target-status",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toMatchObject<Partial<KnowledgeArchiveValidationError>>({
+      category: "structure",
+    });
+  });
+
+  it.each([18_001, 40_000])(
+    "accepts Website v2 narrative totals up to the 40,000-character contract: %s",
+    async (customerCharacters) => {
+      const result = await readKnowledgeArchive(
+        await websiteV2Archive({ customerCharacters }),
+        "示例企业V2知识库.zip",
+        `website-v2-characters-${customerCharacters}`,
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      );
+      storedKeys.push(...result.storedAssetKeys);
+      expect(
+        result.documents.filter((document) => document.customerVisible),
+      ).toHaveLength(47);
+    },
+  );
+
+  it("rejects Website v2 narrative above 40,000 characters", async () => {
+    await expect(
+      readKnowledgeArchive(
+        await websiteV2Archive({ customerCharacters: 40_001 }),
+        "示例企业V2知识库.zip",
+        "website-v2-characters-40001",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toMatchObject<Partial<KnowledgeArchiveValidationError>>({
+      category: "structure",
+    });
+  });
+
+  it("accepts a Website v2 white-label gap package with no evidence", async () => {
+    const result = await readKnowledgeArchive(
+      await websiteV2Archive({ zeroEvidence: true }),
+      "示例企业V2知识库.zip",
+      "website-v2-white-label",
+      {
+        validationProfile: "website-lead-v1",
+        archiveContractVersion: 2,
+      },
+    );
+    storedKeys.push(...result.storedAssetKeys);
+    expect(
+      result.documents
+        .filter((document) => document.kind === "leaf")
+        .every((document) => document.evidenceStatus === "needs_verification"),
+    ).toBe(true);
+  });
+
+  it("rejects Website v2 same-branch evidence without sourceId overlap", async () => {
+    const zip = await JSZip.loadAsync(await websiteV2Archive());
+    const root = "示例企业V2_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    manifest.documents.find(
+      (document: { id?: string }) => document.id === "evidence-overview-1",
+    ).sourceIds = ["source-evidence-only"];
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "示例企业V2知识库.zip",
+        "website-v2-source-scope",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("没有共同来源");
+  });
+
+  it("rejects Website v2 leaf dynamicMinimumCharacters tampering", async () => {
+    const zip = await JSZip.loadAsync(await websiteV2Archive());
+    const root = "示例企业V2_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    manifest.documents.find(
+      (document: { id?: string }) => document.id === "leaf-1",
+    ).dynamicMinimumCharacters += 1;
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "示例企业V2知识库.zip",
+        "website-v2-leaf-minimum-tamper",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("叶子动态要求不正确");
+  });
+
+  it("rejects Website v2 branchEvidence tampering", async () => {
+    const zip = await JSZip.loadAsync(await websiteV2Archive());
+    const root = "示例企业V2_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    manifest.branchEvidence[0].deduplicatedEvidenceCharacters += 1;
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "示例企业V2知识库.zip",
+        "website-v2-branch-evidence-tamper",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("branchEvidence 动态要求不正确");
+  });
+
+  it("rejects Website v2 candidate URLs that do not match the asset", async () => {
+    const zip = await JSZip.loadAsync(
+      await websiteV2Archive({ imageCount: 1 }),
+    );
+    const root = "示例企业V2_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    manifest.imageSelection.candidates[0].url =
+      "https://example.com/assets/other.png";
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "示例企业V2知识库.zip",
+        "website-v2-candidate-mismatch",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toMatchObject<Partial<KnowledgeArchiveValidationError>>({
+      category: "structure",
+    });
+  });
+
+  it("does not fall back to the internal schema for malformed Website v2", async () => {
+    const zip = await JSZip.loadAsync(await websiteV2Archive());
+    const root = "示例企业V2_knowledge_base";
+    const manifestEntry = zip.file(`${root}/00_package_manifest.json`)!;
+    const manifest = JSON.parse(await manifestEntry.async("string"));
+    delete manifest.branchEvidence;
+    zip.file(`${root}/00_package_manifest.json`, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "示例企业V2知识库.zip",
+        "website-v2-no-fallback",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toMatchObject<Partial<KnowledgeArchiveValidationError>>({
+      category: "structure",
+    });
+  });
+
+  it.each([
+    { leafCount: 39, overviewCount: 7 },
+    { leafCount: 57, overviewCount: 7 },
+    { leafCount: 40, overviewCount: 6 },
+  ])(
+    "rejects website v2 cardinality outside 7 overviews plus 40–56 leaves: %o",
+    async ({ leafCount, overviewCount }) => {
+      await expect(
+        readKnowledgeArchive(
+          await websiteV2Archive({ leafCount, overviewCount }),
+          "示例企业V2知识库.zip",
+          `website-v2-invalid-${leafCount}-${overviewCount}`,
+          {
+            validationProfile: "website-lead-v1",
+            archiveContractVersion: 2,
+          },
+        ),
+      ).rejects.toThrow("7 篇分支综述和 40–56 个知识叶子");
     },
   );
 

@@ -36,6 +36,8 @@ describe("administrator acceptance preview integrity", () => {
       name: "新客户",
       username: "new_customer",
       role: "用户" as const,
+      password: "valid-pass",
+      confirmPassword: "valid-pass",
     };
 
     expect(previewAccountDraftIsValid(base)).toBe(false);
@@ -54,6 +56,8 @@ describe("administrator acceptance preview integrity", () => {
         ...base,
         role: "管理员",
         planCode: "luxury",
+        password: undefined,
+        confirmPassword: undefined,
       }),
     ).toBe(false);
     expect(
@@ -61,6 +65,7 @@ describe("administrator acceptance preview integrity", () => {
         ...base,
         role: "管理员",
         password: "valid-pass",
+        confirmPassword: "valid-pass",
       }),
     ).toBe(true);
   });

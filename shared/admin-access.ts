@@ -15,6 +15,22 @@ export function hasExplicitAdminRole(user: {
   );
 }
 
+/**
+ * System administrators inherit every delivery-administrator capability.
+ * Callers that need the narrower identity (for labels or navigation) should
+ * still inspect `adminAccessLevel` directly.
+ */
+export function hasDeliveryCapability(user: {
+  role: unknown;
+  adminAccessLevel?: unknown;
+}) {
+  return (
+    user.role === "admin" &&
+    (user.adminAccessLevel === "delivery_admin" ||
+      user.adminAccessLevel === "system_admin")
+  );
+}
+
 export function isProtectedBuiltinAdminUsername(value: unknown): boolean {
   return (
     typeof value === "string" &&

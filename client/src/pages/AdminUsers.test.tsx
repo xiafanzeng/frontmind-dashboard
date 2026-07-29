@@ -40,7 +40,7 @@ const deliveryAdmins = [
 ];
 
 describe("CreateUserDialog", () => {
-  it("requires a plan and customer API Key for immediate activation", () => {
+  it("requires an initial password, plan and customer API Key for immediate activation", () => {
     render(
       <CreateUserDialog
         open
@@ -51,15 +51,17 @@ describe("CreateUserDialog", () => {
     );
 
     expect(screen.getByText("客户套餐")).toBeInTheDocument();
-    expect(screen.getByText(/创建客户时必须选择套餐/)).toBeInTheDocument();
+    expect(screen.getByText(/设置客户初始密码/)).toBeInTheDocument();
     expect(screen.queryByText("账号角色")).toBeNull();
-    expect(screen.queryByText("管理员初始密码")).toBeNull();
+    expect(screen.getByText("初始密码")).toBeInTheDocument();
+    expect(screen.getByText("确认初始密码")).toBeInTheDocument();
+    expect(screen.queryByText(/设置密码链接/)).toBeNull();
     expect(screen.getByLabelText("客户 API Key")).toHaveAttribute(
       "type",
       "password",
     );
     expect(screen.getByRole("button", { name: "创建客户账号" })).toBeDisabled();
-    expect(screen.getByText(/套餐与额度立即生效/)).toBeInTheDocument();
+    expect(screen.getByText(/账号立即可用/)).toBeInTheDocument();
   });
 
   it("offers all four production plans and a separate delivery owner selector", () => {

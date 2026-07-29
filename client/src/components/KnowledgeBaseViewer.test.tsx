@@ -109,6 +109,7 @@ describe("KnowledgeBaseViewer", () => {
               branchId: "company",
               branchTitle: "企业身份",
               customerVisible: true,
+              contentStatus: "limited_evidence",
             },
             {
               id: "leaf",
@@ -137,6 +138,9 @@ describe("KnowledgeBaseViewer", () => {
       screen.getAllByRole("heading", { name: "企业正式综述" }).length,
     ).toBeGreaterThan(0);
     expect(screen.queryByText("仅供证据核验。")).toBeNull();
+    expect(
+      screen.getByText(/公开证据有限：本章节已整理当前可核验信息/),
+    ).toBeTruthy();
 
     fireEvent.click(screen.getByRole("tab", { name: "证据与来源" }));
     expect(
@@ -189,5 +193,31 @@ describe("KnowledgeBaseViewer", () => {
     expect(screen.getByRole("img", { name: "产品族 A 官方图片" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /产品族 A/ }));
     expect(screen.getByRole("img", { name: "产品族 A 官方图片" })).toBeTruthy();
+  });
+
+  it("shows sparse public evidence as a valid knowledge state", () => {
+    render(
+      <KnowledgeBaseViewer
+        snapshot={{
+          ...snapshot,
+          documents: [
+            {
+              id: "sparse-overview",
+              path: "branches/company/00_overview.md",
+              title: "企业公开资料综述",
+              content: "## 企业公开资料综述\n当前仅能确认企业名称与官网。",
+              kind: "overview",
+              customerVisible: true,
+              contentStatus: "limited_evidence",
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText(/公开证据有限：本章节已整理当前可核验信息/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("当前仅能确认企业名称与官网。")).toBeTruthy();
   });
 });

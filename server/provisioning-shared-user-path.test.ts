@@ -53,7 +53,7 @@ class SharedUsersTableDb {
                 {
                   id: this.deliveryAdminId,
                   role: "admin",
-                  adminAccessLevel: "delivery_admin",
+                  adminAccessLevel: "system_admin",
                   isActive: true,
                 },
               ];
@@ -220,6 +220,7 @@ describe("shared Admin and website user creation path", () => {
     const adminCaller = adminRouter.createCaller(adminContext());
     const adminResult = await adminCaller.users.create({
       username: "Admin.Created.User",
+      password: "admin-created-password",
       displayName: "示例企业·运营负责人",
       role: "user",
       planCode: "advanced",
@@ -297,14 +298,13 @@ describe("shared Admin and website user creation path", () => {
       displayName: "示例企业·运营负责人",
       role: "user",
     });
-    expect(adminResult.setupUrl).toContain("/setup-password?token=");
+    expect(adminResult).toMatchObject({
+      setupUrl: null,
+      setupExpiresAt: null,
+    });
     expect(
-      db.inserts.find(({ table }) => table === userPasswordSetupTokens)?.values,
-    ).toEqual(
-      expect.objectContaining({
-        tokenHash: expect.stringMatching(/^[a-f0-9]{64}$/),
-      }),
-    );
+      db.inserts.find(({ table }) => table === userPasswordSetupTokens),
+    ).toBeUndefined();
     expect(websiteResult.user).toMatchObject({
       displayName: "验收企业·品牌负责人",
       role: "user",
@@ -367,6 +367,7 @@ describe("shared Admin and website user creation path", () => {
     await expect(
       caller.users.create({
         username: "assigned.customer",
+        password: "delivery-selected-password",
         displayName: "已分配客户",
         role: "user",
         planCode: "luxury",
@@ -378,15 +379,15 @@ describe("shared Admin and website user creation path", () => {
     expect(db.inserts).toEqual([]);
   });
 
-  it("rejects a caller-supplied password for a normal user", async () => {
+  it("requires an initial password for a normal user", async () => {
     const adminCaller = adminRouter.createCaller(adminContext());
     await expect(
       adminCaller.users.create({
-        username: "plaintext.user",
-        password: "must-not-be-accepted",
+        username: "missing-password.user",
         role: "user",
         planCode: "basic",
-        apiKey: "sk-plaintext-customer-credential-000001",
+        deliveryAdminId: db.deliveryAdminId,
+        apiKey: "sk-missing-password-customer-000001",
       } as never),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.inserts).toHaveLength(0);

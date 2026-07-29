@@ -254,6 +254,26 @@ const packageEvidenceStatusSchema = z.enum([
   "not_applicable",
 ]);
 const packageAssetOwnershipSchema = z.literal("first_party");
+const packageContentStatusSchema = z.enum([
+  "complete",
+  "limited_evidence",
+  "needs_verification",
+]);
+const packageImageSelectionStatusSchema = z.enum([
+  "target_met",
+  "source_limited",
+  "budget_limited",
+]);
+const requiredImageDiscoveryMethods = new Set([
+  "img",
+  "srcset",
+  "lazy_load",
+  "picture",
+  "css_background",
+  "open_graph",
+  "gallery",
+  "official_document",
+]);
 const packageSourceUrlSchema = z
   .string()
   .trim()
@@ -267,31 +287,49 @@ const packageSourceUrlSchema = z
       !parsed.password
     );
   }, "source URL must be credential-free HTTP(S)");
-const packageManifestSchema = z
+const websiteV2ImageDiscoveryMethodSchema = z.enum([
+  "img",
+  "srcset_or_lazy",
+  "picture",
+  "css_background",
+  "open_graph",
+  "gallery",
+  "official_document",
+]);
+const websiteV2PackageManifestSchema = z
   .object({
-    schemaVersion: z.literal(1),
-    profile: z.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
+    schemaVersion: z.literal(2),
+    profile: z.literal("website-lead-v1"),
     documents: z
       .array(
         z
           .object({
             id: z.string().trim().min(1).max(191),
-            path: z.string().trim().min(1).max(512),
+            path: z.string().trim().min(1).max(600),
             kind: packageDocumentKindSchema,
             title: z.string().trim().min(1).max(512),
             branchId: z.string().trim().min(1).max(191).optional(),
-            branchTitle: z.string().trim().min(1).max(255).optional(),
             order: z.number().int().min(0).max(10_000).optional(),
             evidenceStatus: packageEvidenceStatusSchema.optional(),
             sourceIds: z
               .array(z.string().trim().min(1).max(191))
               .max(500)
-              .default([]),
+              .optional(),
             assetIds: z
               .array(z.string().trim().min(1).max(191))
               .max(500)
-              .default([]),
+              .optional(),
             customerVisible: z.boolean(),
+            evidenceCharacters: z.number().int().nonnegative().optional(),
+            dynamicMinimumCharacters: z.number().int().nonnegative().optional(),
+            evidenceDocumentIds: z
+              .array(z.string().trim().min(1).max(191))
+              .max(500)
+              .optional(),
+            productFamilyIds: z
+              .array(z.string().trim().min(1).max(191))
+              .max(120)
+              .optional(),
           })
           .strict(),
       )
@@ -302,7 +340,266 @@ const packageManifestSchema = z
         z
           .object({
             id: z.string().trim().min(1).max(191),
-            path: z.string().trim().min(1).max(512),
+            path: z.string().trim().min(1).max(600),
+            sha256: z.string().regex(/^[a-f0-9]{64}$/i),
+            mimeType: z.enum([
+              "image/avif",
+              "image/gif",
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+            ]),
+            bytes: z.number().int().positive().max(MAX_IMAGE_BYTES),
+            width: z.number().int().positive().max(100_000),
+            height: z.number().int().positive().max(100_000),
+            caption: z.string().trim().min(1).max(2_000),
+            alt: z.string().trim().max(1_000).optional(),
+            branchId: z.string().trim().min(1).max(191),
+            documentIds: z
+              .array(z.string().trim().min(1).max(191))
+              .min(1)
+              .max(500),
+            sourcePageUrl: packageSourceUrlSchema,
+            sourceAssetUrl: packageSourceUrlSchema.optional(),
+            ownership: packageAssetOwnershipSchema,
+          })
+          .strict(),
+      )
+      .max(48),
+    counts: z
+      .object({
+        totalFiles: z.number().int().nonnegative().max(2_000),
+        customerVisibleCharacters: z.number().int().nonnegative().max(40_000),
+        evidenceCharacters: z.number().int().nonnegative().max(300_000),
+        packagedImages: z.number().int().nonnegative().max(48),
+      })
+      .strict(),
+    branchEvidence: z
+      .array(
+        z
+          .object({
+            branchId: z.enum([
+              "company-identity",
+              "team",
+              "products-services",
+              "core-capabilities",
+              "customers-industries",
+              "cooperation",
+              "why-frontmind",
+            ]),
+            overviewDocumentId: z.string().trim().min(1).max(191),
+            contentStatus: packageContentStatusSchema,
+            deduplicatedEvidenceCharacters: z.number().int().nonnegative(),
+            dynamicOverviewMinimum: z.number().int().nonnegative().max(5_000),
+            checkedSourceCount: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .length(7),
+    imageSelection: z
+      .object({
+        status: packageImageSelectionStatusSchema,
+        discoveredCandidateImages: z.number().int().nonnegative(),
+        inspectedCandidateImages: z.number().int().nonnegative(),
+        eligibleFirstPartyImages: z.number().int().nonnegative().max(48),
+        rejectedCandidateImages: z.number().int().nonnegative(),
+        scannedSourcePages: z.number().int().positive(),
+        discoveryMethods: z
+          .array(websiteV2ImageDiscoveryMethodSchema)
+          .length(7),
+        candidates: z
+          .array(
+            z
+              .object({
+                url: packageSourceUrlSchema,
+                sourcePageUrl: packageSourceUrlSchema,
+                method: websiteV2ImageDiscoveryMethodSchema,
+                status: z.enum(["eligible", "rejected", "uninspected"]),
+                assetId: z.string().trim().min(1).max(191).optional(),
+                rejectionReason: z.string().trim().min(8).max(500).optional(),
+              })
+              .strict(),
+          )
+          .max(180),
+        productFamilies: z
+          .array(
+            z
+              .object({
+                id: z.string().trim().min(1).max(191),
+                name: z.string().trim().min(1).max(500),
+                officialVisualFound: z.boolean(),
+                checkedSources: z.number().int().positive(),
+                assetIds: z.array(z.string().trim().min(1).max(191)).max(48),
+                gapReason: z.string().trim().min(8).max(2_000).optional(),
+              })
+              .strict(),
+          )
+          .min(1)
+          .max(120),
+        shortfallReason: z.string().trim().min(8).max(2_000).optional(),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      new Set(value.branchEvidence.map((branch) => branch.branchId)).size !== 7
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["branchEvidence"],
+        message: "website v2 branchEvidence must cover seven unique branches",
+      });
+    }
+    const candidates = value.imageSelection.candidates;
+    const eligible = candidates.filter(
+      (candidate) => candidate.status === "eligible",
+    );
+    const rejected = candidates.filter(
+      (candidate) => candidate.status === "rejected",
+    );
+    const uninspected = candidates.filter(
+      (candidate) => candidate.status === "uninspected",
+    );
+    if (
+      new Set(candidates.map((candidate) => candidate.url)).size !==
+        candidates.length ||
+      value.imageSelection.discoveredCandidateImages !== candidates.length ||
+      value.imageSelection.inspectedCandidateImages !==
+        eligible.length + rejected.length ||
+      value.imageSelection.eligibleFirstPartyImages !== eligible.length ||
+      value.imageSelection.rejectedCandidateImages !== rejected.length ||
+      value.imageSelection.discoveredCandidateImages !==
+        value.imageSelection.inspectedCandidateImages + uninspected.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["imageSelection", "candidates"],
+        message: "website v2 candidate ledger arithmetic is inconsistent",
+      });
+    }
+    candidates.forEach((candidate, index) => {
+      const valid =
+        (candidate.status === "eligible" &&
+          Boolean(candidate.assetId) &&
+          candidate.rejectionReason === undefined) ||
+        (candidate.status === "rejected" &&
+          candidate.assetId === undefined &&
+          Boolean(candidate.rejectionReason)) ||
+        (candidate.status === "uninspected" &&
+          candidate.assetId === undefined &&
+          candidate.rejectionReason === undefined);
+      if (!valid) {
+        context.addIssue({
+          code: "custom",
+          path: ["imageSelection", "candidates", index],
+          message:
+            "website v2 candidate fields must match its eligibility status",
+        });
+      }
+    });
+    const assetsById = new Map(value.assets.map((asset) => [asset.id, asset]));
+    eligible.forEach((candidate, index) => {
+      const asset = candidate.assetId
+        ? assetsById.get(candidate.assetId)
+        : undefined;
+      if (
+        !asset ||
+        asset.sourceAssetUrl !== candidate.url ||
+        asset.sourcePageUrl !== candidate.sourcePageUrl
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["imageSelection", "candidates", index],
+          message:
+            "website v2 eligible candidate must match its packaged asset URLs",
+        });
+      }
+    });
+    value.assets.forEach((asset, index) => {
+      if (
+        eligible.filter((candidate) => candidate.assetId === asset.id)
+          .length !== 1
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["assets", index],
+          message:
+            "website v2 packaged asset must appear exactly once in eligible candidates",
+        });
+      }
+    });
+    const status = value.imageSelection.status;
+    const invalidStatus =
+      (status === "target_met" &&
+        (eligible.length < 36 ||
+          uninspected.length > 0 ||
+          value.imageSelection.shortfallReason !== undefined)) ||
+      (status === "source_limited" &&
+        (eligible.length >= 36 ||
+          uninspected.length > 0 ||
+          !value.imageSelection.shortfallReason)) ||
+      (status === "budget_limited" &&
+        (uninspected.length === 0 || !value.imageSelection.shortfallReason));
+    if (invalidStatus) {
+      context.addIssue({
+        code: "custom",
+        path: ["imageSelection", "status"],
+        message:
+          "website v2 image-selection status does not match its candidate ledger",
+      });
+    }
+  });
+
+const internalPackageManifestSchema = z
+  .object({
+    schemaVersion: z.union([z.literal(1), z.literal(2)]),
+    profile: z.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
+    websiteV2Normalized: z.literal(true).optional(),
+    documents: z
+      .array(
+        z
+          .object({
+            id: z.string().trim().min(1).max(191),
+            path: z.string().trim().min(1).max(600),
+            kind: packageDocumentKindSchema,
+            title: z.string().trim().min(1).max(512),
+            branchId: z.string().trim().min(1).max(191).optional(),
+            branchTitle: z.string().trim().min(1).max(255).optional(),
+            order: z.number().int().min(0).max(10_000).optional(),
+            evidenceStatus: packageEvidenceStatusSchema.optional(),
+            sourceIds: z
+              .array(z.string().trim().min(1).max(191))
+              .max(500)
+              .default([]),
+            evidenceDocumentIds: z
+              .array(z.string().trim().min(1).max(191))
+              .max(500)
+              .optional(),
+            assetIds: z
+              .array(z.string().trim().min(1).max(191))
+              .max(500)
+              .default([]),
+            customerVisible: z.boolean(),
+            evidenceCharacters: z.number().int().nonnegative().optional(),
+            requiredFormalCharacters: z.number().int().nonnegative().optional(),
+            contentStatus: packageContentStatusSchema.optional(),
+            productFamilyId: z.string().trim().min(1).max(191).optional(),
+            productFamilyIds: z
+              .array(z.string().trim().min(1).max(191))
+              .max(120)
+              .optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(1_500),
+    assets: z
+      .array(
+        z
+          .object({
+            id: z.string().trim().min(1).max(191),
+            path: z.string().trim().min(1).max(600),
             sha256: z.string().regex(/^[a-f0-9]{64}$/i),
             mimeType: z.enum([
               "image/avif",
@@ -336,13 +633,73 @@ const packageManifestSchema = z
         packagedImages: z.number().int().nonnegative().max(480),
       })
       .strict(),
+    branchEvidence: z
+      .array(
+        z
+          .object({
+            branchId: z.enum([
+              "company-identity",
+              "team",
+              "products-services",
+              "core-capabilities",
+              "customers-industries",
+              "cooperation",
+              "why-frontmind",
+            ]),
+            overviewDocumentId: z.string().trim().min(1).max(191),
+            contentStatus: packageContentStatusSchema,
+            deduplicatedEvidenceCharacters: z.number().int().nonnegative(),
+            dynamicOverviewMinimum: z.number().int().nonnegative().max(5_000),
+            checkedSourceCount: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .length(7)
+      .optional(),
     imageSelection: z
       .object({
+        status: packageImageSelectionStatusSchema.optional(),
+        discoveredCandidateImages: z.number().int().nonnegative().optional(),
+        inspectedCandidateImages: z.number().int().nonnegative().optional(),
         eligibleFirstPartyImages: z
           .number()
           .int()
           .nonnegative()
           .max(10_000_000),
+        rejectedCandidateImages: z.number().int().nonnegative().optional(),
+        scannedSourcePages: z.number().int().nonnegative().optional(),
+        discoveryMethods: z
+          .array(z.string().trim().min(1).max(100))
+          .max(100)
+          .optional(),
+        rejectionReasons: z
+          .array(
+            z
+              .object({
+                reason: z.string().trim().min(1).max(500),
+                count: z.number().int().nonnegative(),
+              })
+              .strict(),
+          )
+          .max(500)
+          .optional(),
+        stopReason: z.string().trim().min(1).max(2_000).optional(),
+        productFamilyCoverage: z
+          .array(
+            z
+              .object({
+                familyId: z.string().trim().min(1).max(191),
+                familyName: z.string().trim().min(1).max(500),
+                officialImageAvailable: z.boolean(),
+                assetIds: z.array(z.string().trim().min(1).max(191)).max(500),
+                checkedSources: z.array(packageSourceUrlSchema).max(500),
+                checkedSourceCount: z.number().int().positive().optional(),
+                gapReason: z.string().trim().min(1).max(2_000).optional(),
+              })
+              .strict(),
+          )
+          .max(500)
+          .optional(),
         shortfallReason: z.string().trim().min(1).max(2_000).optional(),
       })
       .strict(),
@@ -363,6 +720,111 @@ const packageManifestSchema = z
     const assetPaths = new Set(
       value.assets.map((asset) => asset.path.normalize("NFKC").toLowerCase()),
     );
+    if (value.schemaVersion === 2) {
+      if (
+        value.profile === "website-lead-v1" &&
+        value.websiteV2Normalized !== true
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["profile"],
+          message: "website v2 must use the Website-specific manifest contract",
+        });
+      }
+      value.documents.forEach((document, index) => {
+        if (!["overview", "leaf"].includes(document.kind)) return;
+        for (const key of [
+          "evidenceCharacters",
+          "evidenceDocumentIds",
+          "requiredFormalCharacters",
+          "contentStatus",
+        ] as const) {
+          if (document[key] === undefined) {
+            context.addIssue({
+              code: "custom",
+              path: ["documents", index, key],
+              message: `schemaVersion 2 customer content requires ${key}`,
+            });
+          }
+        }
+      });
+      const selection = value.imageSelection;
+      for (const key of [
+        "status",
+        "discoveredCandidateImages",
+        "inspectedCandidateImages",
+        "rejectedCandidateImages",
+        "scannedSourcePages",
+        "discoveryMethods",
+        "rejectionReasons",
+        "stopReason",
+        "productFamilyCoverage",
+      ] as const) {
+        if (selection[key] === undefined) {
+          context.addIssue({
+            code: "custom",
+            path: ["imageSelection", key],
+            message: `schemaVersion 2 image selection requires ${key}`,
+          });
+        }
+      }
+      if (value.profile === "dashboard-enterprise-v1") {
+        if (value.websiteV2Normalized !== undefined) {
+          context.addIssue({
+            code: "custom",
+            path: ["websiteV2Normalized"],
+            message: "dashboard enterprise v2 cannot use Website markers",
+          });
+        }
+        if (value.branchEvidence !== undefined) {
+          context.addIssue({
+            code: "custom",
+            path: ["branchEvidence"],
+            message: "dashboard enterprise v2 does not use branchEvidence",
+          });
+        }
+        value.documents.forEach((document, index) => {
+          if (
+            document.productFamilyIds !== undefined ||
+            document.path.length > 512
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: ["documents", index],
+              message:
+                "dashboard enterprise v2 uses productFamilyId and 512-character document paths",
+            });
+          }
+        });
+        value.assets.forEach((asset, index) => {
+          if (
+            asset.path.length > 512 ||
+            (asset.sourcePageUrl?.length || 0) > 4_000 ||
+            (asset.sourceAssetUrl?.length || 0) > 4_000
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: ["assets", index],
+              message:
+                "dashboard enterprise v2 keeps 512-character paths and 4,000-character source URLs",
+            });
+          }
+        });
+        (selection.productFamilyCoverage || []).forEach((family, index) => {
+          if (
+            family.checkedSources.length === 0 ||
+            family.checkedSourceCount !== undefined
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: ["imageSelection", "productFamilyCoverage", index],
+              message:
+                "dashboard enterprise v2 product families require checkedSources URLs",
+            });
+          }
+        });
+      }
+    }
     if (
       documentIds.size !== value.documents.length ||
       documentPaths.size !== value.documents.length
@@ -443,6 +905,95 @@ const packageManifestSchema = z
       }
     });
   });
+
+const packageManifestSchema = z.preprocess((input) => {
+  const isWebsiteV2 =
+    typeof input === "object" &&
+    input !== null &&
+    "profile" in input &&
+    input.profile === "website-lead-v1" &&
+    "schemaVersion" in input &&
+    input.schemaVersion === 2;
+  if (!isWebsiteV2) return input;
+  const value = websiteV2PackageManifestSchema.parse(input);
+  const statusByDisplayBranch = new Map<
+    string,
+    "complete" | "limited_evidence" | "needs_verification"
+  >(
+    value.branchEvidence.map((branch) => [
+      branch.branchId,
+      branch.contentStatus,
+    ]),
+  );
+  const rejectionCounts = new Map<string, number>();
+  for (const candidate of value.imageSelection.candidates) {
+    if (candidate.status !== "rejected") continue;
+    const reason = candidate.rejectionReason || "未提供拒绝原因";
+    rejectionCounts.set(reason, (rejectionCounts.get(reason) || 0) + 1);
+  }
+  return {
+    schemaVersion: value.schemaVersion,
+    profile: value.profile,
+    websiteV2Normalized: true,
+    documents: value.documents.map((document) => {
+      const displayBranch = document.branchId
+        ? websiteLeadDisplayBranchByDirectory.get(document.branchId)
+        : undefined;
+      return {
+        id: document.id,
+        path: document.path,
+        kind: document.kind,
+        title: document.title,
+        branchId: document.branchId,
+        order: document.order,
+        evidenceStatus: document.evidenceStatus,
+        sourceIds: document.sourceIds || [],
+        evidenceDocumentIds: document.evidenceDocumentIds,
+        assetIds: document.assetIds || [],
+        customerVisible: document.customerVisible,
+        evidenceCharacters: document.evidenceCharacters,
+        requiredFormalCharacters: document.dynamicMinimumCharacters,
+        contentStatus: displayBranch
+          ? statusByDisplayBranch.get(displayBranch)
+          : undefined,
+        productFamilyIds: document.productFamilyIds,
+      };
+    }),
+    assets: value.assets,
+    counts: value.counts,
+    branchEvidence: value.branchEvidence,
+    imageSelection: {
+      status: value.imageSelection.status,
+      discoveredCandidateImages: value.imageSelection.discoveredCandidateImages,
+      inspectedCandidateImages: value.imageSelection.inspectedCandidateImages,
+      eligibleFirstPartyImages: value.imageSelection.eligibleFirstPartyImages,
+      rejectedCandidateImages: value.imageSelection.rejectedCandidateImages,
+      scannedSourcePages: value.imageSelection.scannedSourcePages,
+      discoveryMethods: value.imageSelection.discoveryMethods.flatMap(
+        (method) =>
+          method === "srcset_or_lazy" ? ["srcset", "lazy_load"] : [method],
+      ),
+      rejectionReasons: [...rejectionCounts].map(([reason, count]) => ({
+        reason,
+        count,
+      })),
+      stopReason:
+        value.imageSelection.shortfallReason || "Website v2 图片候选台账已完成",
+      productFamilyCoverage: value.imageSelection.productFamilies.map(
+        (family) => ({
+          familyId: family.id,
+          familyName: family.name,
+          officialImageAvailable: family.officialVisualFound,
+          assetIds: family.assetIds,
+          checkedSources: [],
+          checkedSourceCount: family.checkedSources,
+          gapReason: family.gapReason,
+        }),
+      ),
+      shortfallReason: value.imageSelection.shortfallReason,
+    },
+  };
+}, internalPackageManifestSchema);
 
 const completenessAcquisitionCountSchema = z
   .object({
@@ -996,6 +1547,52 @@ function effectiveCharacterCount(value: string) {
   ).length;
 }
 
+function evidenceProportionalFormalRequirement(input: {
+  kind: "overview" | "leaf";
+  isProductBranch: boolean;
+  evidenceCharacters: number;
+}) {
+  if (input.evidenceCharacters === 0) {
+    return {
+      required: input.kind === "overview" ? 60 : 40,
+      status: "needs_verification" as const,
+    };
+  }
+  if (input.kind === "overview") {
+    const target = input.isProductBranch ? 5_000 : 2_500;
+    const proportional = Math.floor(input.evidenceCharacters * 0.25);
+    return {
+      required: Math.max(120, Math.min(target, proportional)),
+      status:
+        proportional >= target
+          ? ("complete" as const)
+          : ("limited_evidence" as const),
+    };
+  }
+  const proportional = Math.floor(input.evidenceCharacters * 0.2);
+  return {
+    required: Math.max(80, Math.min(500, proportional)),
+    status:
+      proportional >= 500
+        ? ("complete" as const)
+        : ("limited_evidence" as const),
+  };
+}
+
+function websiteV2OverviewRequirement(
+  evidenceCharacters: number,
+  displayBranchId: string,
+) {
+  if (evidenceCharacters === 0) return 40;
+  const target = displayBranchId === "products-services" ? 3_000 : 1_500;
+  return Math.min(target, Math.max(120, Math.ceil(evidenceCharacters * 0.25)));
+}
+
+function websiteV2LeafRequirement(evidenceCharacters: number) {
+  if (evidenceCharacters === 0) return 40;
+  return Math.min(200, Math.max(60, Math.ceil(evidenceCharacters * 0.2)));
+}
+
 function duplicateFormalParagraphs(
   documents: Array<{ path: string; content: string }>,
   profile: Exclude<KnowledgeBaseValidationProfile, "historical">,
@@ -1034,16 +1631,38 @@ function packagedEvidenceCharacters(
 ) {
   return documents
     .filter((document) => document.customerVisible === false)
-    .reduce((total, document) => {
-      const evidence = stripLeadingMarkdownFrontmatter(document.content)
-        .replace(/<!--[\s\S]*?-->/g, "")
-        .replace(/!\[[^\]]*]\([^)]*\)/g, "")
-        .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
-        .replace(/https?:\/\/[^\s)>\]]+/gi, "")
-        .replace(/<[^>]+>/g, "")
-        .replace(/^#{1,6}\s+/gm, "");
-      return total + effectiveCharacterCount(evidence);
-    }, 0);
+    .reduce(
+      (total, document) => total + packagedEvidenceDocumentCharacters(document),
+      0,
+    );
+}
+
+function packagedEvidenceDocumentCharacters(document: { content: string }) {
+  return effectiveCharacterCount(packagedEvidenceDocumentText(document));
+}
+
+function packagedEvidenceDocumentText(document: { content: string }) {
+  return stripLeadingMarkdownFrontmatter(document.content)
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/!\[[^\]]*]\([^)]*\)/g, "")
+    .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
+    .replace(/https?:\/\/[^\s)>\]]+/gi, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/^#{1,6}\s+/gm, "");
+}
+
+function packagedEvidenceDocumentFingerprint(document: { content: string }) {
+  const normalized = packagedEvidenceDocumentText(document)
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\s/g, "")
+    .replace(
+      /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]/g,
+      "",
+    );
+  return normalized
+    ? createHash("sha256").update(normalized).digest("hex")
+    : undefined;
 }
 
 function reportedPackagedImageCount(markdown: string) {
@@ -1085,6 +1704,7 @@ function parsePackageJson<T>(
 
 function validateProfilePackage(input: {
   profile: Exclude<KnowledgeBaseValidationProfile, "historical">;
+  archiveContractVersion?: 1 | 2;
   packagePaths: string[];
   unpackedBytes: number;
   rawTextByRelativePath: Map<string, string>;
@@ -1097,6 +1717,15 @@ function validateProfilePackage(input: {
     packageManifestSchema,
     "00_package_manifest.json",
   );
+  if (
+    input.archiveContractVersion !== undefined &&
+    manifest.schemaVersion !== input.archiveContractVersion
+  ) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      "知识库归档合同版本与 package manifest 不一致",
+    );
+  }
   if (manifest.profile !== input.profile) {
     throw new KnowledgeArchiveValidationError(
       "structure",
@@ -1116,7 +1745,7 @@ function validateProfilePackage(input: {
           images: 48,
           targetImages: 36,
           minCharacters: 8_000,
-          maxCharacters: 18_000,
+          maxCharacters: manifest.schemaVersion === 2 ? 40_000 : 18_000,
           maxEvidenceCharacters: 300_000,
           maxOfficialPages: 120,
           maxDocuments: 22,
@@ -1208,9 +1837,15 @@ function validateProfilePackage(input: {
       order: metadata.order,
       evidenceStatus: metadata.evidenceStatus,
       sourceIds: metadata.sourceIds,
+      evidenceDocumentIds: metadata.evidenceDocumentIds,
       assetIds: metadata.assetIds,
       customerVisible: metadata.customerVisible,
-    } satisfies KnowledgeDocument;
+      evidenceCharacters: metadata.evidenceCharacters,
+      requiredFormalCharacters: metadata.requiredFormalCharacters,
+      contentStatus: metadata.contentStatus,
+      productFamilyId: metadata.productFamilyId,
+      productFamilyIds: metadata.productFamilyIds,
+    };
   });
 
   const manifestAssetPaths = new Set(
@@ -1331,41 +1966,202 @@ function validateProfilePackage(input: {
       "官网采集报告的已保存图片数与实际打包图片数不一致",
     );
   }
-  if (
-    enrichedAssets.length < limits.targetImages &&
-    !manifest.imageSelection.shortfallReason
-  ) {
-    throw new KnowledgeArchiveValidationError(
-      "media",
-      `图片少于 ${limits.targetImages} 张时必须说明第一方素材不足原因`,
+  if (manifest.schemaVersion === 1) {
+    if (
+      enrichedAssets.length < limits.targetImages &&
+      !manifest.imageSelection.shortfallReason
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `图片少于 ${limits.targetImages} 张时必须说明第一方素材不足原因`,
+      );
+    }
+    if (
+      enrichedAssets.length >= limits.targetImages &&
+      manifest.imageSelection.shortfallReason &&
+      input.profile !== "website-lead-v1"
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `达到 ${limits.targetImages} 张图片目标时不得填写素材不足原因`,
+      );
+    }
+    if (
+      manifest.imageSelection.eligibleFirstPartyImages >= limits.targetImages &&
+      enrichedAssets.length < limits.targetImages
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `已有至少 ${limits.targetImages} 张合格第一方素材时必须达到目标图片数`,
+      );
+    }
+    if (
+      manifest.imageSelection.eligibleFirstPartyImages < limits.targetImages &&
+      enrichedAssets.length !== manifest.imageSelection.eligibleFirstPartyImages
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "合格第一方素材不足目标数量时，必须打包全部合格图片",
+      );
+    }
+  } else {
+    const selection = manifest.imageSelection;
+    const discovered = selection.discoveredCandidateImages!;
+    const inspected = selection.inspectedCandidateImages!;
+    const rejected = selection.rejectedCandidateImages!;
+    const methods = new Set(selection.discoveryMethods || []);
+    const rejectionTotal = (selection.rejectionReasons || []).reduce(
+      (sum, reason) => sum + reason.count,
+      0,
     );
-  }
-  if (
-    enrichedAssets.length >= limits.targetImages &&
-    manifest.imageSelection.shortfallReason
-  ) {
-    throw new KnowledgeArchiveValidationError(
-      "media",
-      `达到 ${limits.targetImages} 张图片目标时不得填写素材不足原因`,
+    if (
+      inspected > discovered ||
+      inspected !== selection.eligibleFirstPartyImages + rejected ||
+      rejectionTotal !== rejected
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "图片发现、检查、合格和拒绝候选数不满足可审计算术关系",
+      );
+    }
+    if (
+      [...requiredImageDiscoveryMethods].some((method) => !methods.has(method))
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "图片发现台账未覆盖全部要求的第一方图片发现方式",
+      );
+    }
+    if (
+      completeness.acquisition.images?.total !== discovered ||
+      enrichedAssets.length > selection.eligibleFirstPartyImages
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "图片发现台账与完整度统计或实际打包数量不一致",
+      );
+    }
+    if (selection.status === "target_met") {
+      if (
+        selection.eligibleFirstPartyImages < limits.targetImages ||
+        enrichedAssets.length < limits.targetImages ||
+        selection.shortfallReason
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `target_met 必须至少发现并打包 ${limits.targetImages} 张合格图片`,
+        );
+      }
+    } else {
+      if (
+        (selection.eligibleFirstPartyImages >= limits.targetImages &&
+          !(
+            input.profile === "website-lead-v1" &&
+            selection.status === "budget_limited"
+          )) ||
+        enrichedAssets.length !== selection.eligibleFirstPartyImages ||
+        !selection.shortfallReason
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          "图片目标未达成时必须打包全部合格图片并提供真实缺口原因",
+        );
+      }
+      if (selection.status === "source_limited" && inspected !== discovered) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          "source_limited 必须检查全部已发现候选图片",
+        );
+      }
+      if (selection.status === "budget_limited" && inspected >= discovered) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          "budget_limited 必须存在因预算未检查的已发现候选图片",
+        );
+      }
+    }
+    const productFamilyIdsForDocument = (
+      document: (typeof enrichedDocuments)[number],
+    ) => {
+      if (
+        input.profile === "website-lead-v1" &&
+        document.branchId !== "03_products"
+      ) {
+        return [];
+      }
+      return document.productFamilyIds?.length
+        ? document.productFamilyIds
+        : document.productFamilyId
+          ? [document.productFamilyId]
+          : [];
+    };
+    const productLeafDocuments = enrichedDocuments.filter(
+      (document) =>
+        document.kind === "leaf" &&
+        productFamilyIdsForDocument(document).length > 0,
     );
-  }
-  if (
-    manifest.imageSelection.eligibleFirstPartyImages >= limits.targetImages &&
-    enrichedAssets.length < limits.targetImages
-  ) {
-    throw new KnowledgeArchiveValidationError(
-      "media",
-      `已有至少 ${limits.targetImages} 张合格第一方素材时必须达到目标图片数`,
+    const productBranchIds = new Set(
+      productLeafDocuments.map((document) => document.branchId || ""),
     );
-  }
-  if (
-    manifest.imageSelection.eligibleFirstPartyImages < limits.targetImages &&
-    enrichedAssets.length !== manifest.imageSelection.eligibleFirstPartyImages
-  ) {
-    throw new KnowledgeArchiveValidationError(
-      "media",
-      "合格第一方素材不足目标数量时，必须打包全部合格图片",
+    const productLeafFamilyIds = new Set(
+      productLeafDocuments.flatMap(productFamilyIdsForDocument),
     );
+    if (
+      productLeafFamilyIds.size === 0 ||
+      productBranchIds.has("") ||
+      enrichedDocuments.some(
+        (document) =>
+          document.productFamilyIds !== undefined &&
+          new Set(document.productFamilyIds).size !==
+            document.productFamilyIds.length,
+      ) ||
+      enrichedDocuments.some(
+        (document) =>
+          productFamilyIdsForDocument(document).length > 0 &&
+          document.kind !== "leaf",
+      ) ||
+      enrichedDocuments.some(
+        (document) =>
+          document.kind === "leaf" &&
+          productBranchIds.has(document.branchId || "") &&
+          productFamilyIdsForDocument(document).length === 0,
+      )
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        "v2 必须至少声明一个产品或服务族，且产品分支的每个叶子都必须声明 productFamilyId",
+      );
+    }
+    const coverageIds = new Set(
+      (selection.productFamilyCoverage || []).map((family) => family.familyId),
+    );
+    if (
+      coverageIds.size !== (selection.productFamilyCoverage || []).length ||
+      coverageIds.size !== productLeafFamilyIds.size ||
+      [...coverageIds].some((familyId) => !productLeafFamilyIds.has(familyId))
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "产品族图片覆盖清单必须与产品或服务叶子中的产品族完全一致",
+      );
+    }
+    const enrichedAssetIds = new Set(
+      enrichedAssets.map((asset) => asset.id).filter(Boolean),
+    );
+    for (const family of selection.productFamilyCoverage || []) {
+      if (
+        family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) ||
+        (family.officialImageAvailable && family.assetIds.length === 0) ||
+        (!family.officialImageAvailable && !family.gapReason) ||
+        (input.profile === "dashboard-enterprise-v1" &&
+          family.checkedSources.length === 0)
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `产品族图片覆盖记录不完整：${family.familyName}`,
+        );
+      }
+    }
   }
   if (
     manifest.imageSelection.eligibleFirstPartyImages >= limits.targetImages &&
@@ -1381,10 +2177,16 @@ function validateProfilePackage(input: {
   const customerDocuments = enrichedDocuments.filter(
     (document) => document.customerVisible,
   );
+  const customerOverviewDocuments = customerDocuments.filter(
+    (document) => document.kind === "overview",
+  );
+  const customerLeafDocuments = customerDocuments.filter(
+    (document) => document.kind === "leaf",
+  );
   if (
     customerDocuments.length === 0 ||
-    !customerDocuments.some((document) => document.kind === "overview") ||
-    !customerDocuments.some((document) => document.kind === "leaf")
+    customerOverviewDocuments.length === 0 ||
+    customerLeafDocuments.length === 0
   ) {
     throw new KnowledgeArchiveValidationError(
       "content",
@@ -1393,11 +2195,18 @@ function validateProfilePackage(input: {
   }
   if (
     input.profile === "website-lead-v1" &&
-    (customerDocuments.length < 40 || customerDocuments.length > 56)
+    ((manifest.schemaVersion === 1 &&
+      (customerDocuments.length < 40 || customerDocuments.length > 56)) ||
+      (manifest.schemaVersion === 2 &&
+        (customerOverviewDocuments.length !== 7 ||
+          customerLeafDocuments.length < 40 ||
+          customerLeafDocuments.length > 56)))
   ) {
     throw new KnowledgeArchiveValidationError(
       "content",
-      "官网轻量知识库必须包含 40–56 个客户可见内容文档",
+      manifest.schemaVersion === 1
+        ? "历史官网轻量知识库必须包含 40–56 个客户可见内容文档"
+        : "官网轻量知识库 v2 必须包含 7 篇分支综述和 40–56 个知识叶子",
     );
   }
   if (input.profile === "website-lead-v1") {
@@ -1464,6 +2273,11 @@ function validateProfilePackage(input: {
       }
     }
     const completenessCounts = completeness.counts;
+    // v1 historically counted every customer-visible document as a "leaf".
+    // Contract v2 corrects that legacy ambiguity: overviews are separate and
+    // completeness counts describe true knowledge leaves only.
+    const completenessDocuments =
+      manifest.schemaVersion === 1 ? customerDocuments : customerLeafDocuments;
     const statusCountKeys = {
       verified_first_party: "verifiedFirstParty",
       verified_authoritative: "verifiedAuthoritative",
@@ -1474,7 +2288,7 @@ function validateProfilePackage(input: {
     } as const;
     if (
       !completenessCounts ||
-      completenessCounts.totalLeaves !== customerDocuments.length
+      completenessCounts.totalLeaves !== completenessDocuments.length
     ) {
       throw new KnowledgeArchiveValidationError(
         "structure",
@@ -1484,7 +2298,7 @@ function validateProfilePackage(input: {
     const actualStatusCounts = Object.fromEntries(
       Object.keys(statusCountKeys).map((status) => [status, 0]),
     ) as Record<keyof typeof statusCountKeys, number>;
-    for (const document of customerDocuments) {
+    for (const document of completenessDocuments) {
       actualStatusCounts[
         document.evidenceStatus as keyof typeof statusCountKeys
       ] += 1;
@@ -1503,11 +2317,12 @@ function validateProfilePackage(input: {
       }
     }
     if (
-      actualStatusCounts.not_applicable >= customerDocuments.length ||
-      actualStatusCounts.verified_first_party +
-        actualStatusCounts.verified_authoritative +
-        actualStatusCounts.supported_third_party ===
-        0
+      manifest.schemaVersion === 1 &&
+      (actualStatusCounts.not_applicable >= completenessDocuments.length ||
+        actualStatusCounts.verified_first_party +
+          actualStatusCounts.verified_authoritative +
+          actualStatusCounts.supported_third_party ===
+          0)
     ) {
       throw new KnowledgeArchiveValidationError(
         "content",
@@ -1617,6 +2432,121 @@ function validateProfilePackage(input: {
       }
     }
   }
+  const packageDocumentById = new Map(
+    enrichedDocuments
+      .filter((document) => document.id)
+      .map((document) => [document.id!, document]),
+  );
+  const evidenceCharacterByDocumentId = new Map(
+    enrichedDocuments
+      .filter(
+        (document) =>
+          document.id &&
+          document.kind === "evidence" &&
+          document.customerVisible === false,
+      )
+      .map((document) => [
+        document.id!,
+        packagedEvidenceDocumentCharacters(document),
+      ]),
+  );
+  if (input.profile === "website-lead-v1" && manifest.schemaVersion === 2) {
+    const branchEvidence = manifest.branchEvidence || [];
+    const overviewById = new Map(
+      customerOverviewDocuments
+        .filter((document) => document.id)
+        .map((document) => [document.id!, document]),
+    );
+    for (const branch of branchEvidence) {
+      const overview = overviewById.get(branch.overviewDocumentId);
+      const overviewDisplayBranch = overview?.branchId
+        ? websiteLeadDisplayBranchByDirectory.get(overview.branchId)
+        : undefined;
+      if (!overview || overviewDisplayBranch !== branch.branchId) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `Website v2 branchEvidence 关联了无效综述：${branch.branchId}`,
+        );
+      }
+      const linkedEvidenceIds = new Set(
+        customerDocuments
+          .filter(
+            (document) =>
+              Boolean(document.branchId) &&
+              websiteLeadDisplayBranchByDirectory.get(document.branchId!) ===
+                branch.branchId,
+          )
+          .flatMap((document) => document.evidenceDocumentIds || []),
+      );
+      const actualEvidenceCharacters = [...linkedEvidenceIds].reduce(
+        (total, evidenceId) =>
+          total + (evidenceCharacterByDocumentId.get(evidenceId) || 0),
+        0,
+      );
+      const expectedMinimum = websiteV2OverviewRequirement(
+        actualEvidenceCharacters,
+        branch.branchId,
+      );
+      if (
+        branch.deduplicatedEvidenceCharacters !== actualEvidenceCharacters ||
+        branch.dynamicOverviewMinimum !== expectedMinimum ||
+        overview.requiredFormalCharacters !== expectedMinimum ||
+        overview.contentStatus !== branch.contentStatus ||
+        (actualEvidenceCharacters === 0) !==
+          (branch.contentStatus === "needs_verification")
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `Website v2 branchEvidence 动态要求不正确：${branch.branchId}`,
+        );
+      }
+    }
+  }
+  const evidencePathByFingerprint = new Map<string, string>();
+  const evidenceDocuments = enrichedDocuments.filter(
+    (document) => document.kind === "evidence",
+  );
+  const referencedEvidenceDocumentIds = new Set(
+    customerDocuments.flatMap((document) => document.evidenceDocumentIds || []),
+  );
+  for (const evidenceDocument of evidenceDocuments) {
+    const fingerprint = packagedEvidenceDocumentFingerprint(evidenceDocument);
+    if (!fingerprint) continue;
+    const duplicatePath = evidencePathByFingerprint.get(fingerprint);
+    if (duplicatePath) {
+      throw new KnowledgeArchiveValidationError(
+        "content",
+        `证据文档规范化后内容重复：${duplicatePath} / ${evidenceDocument.path}`,
+      );
+    }
+    evidencePathByFingerprint.set(fingerprint, evidenceDocument.path);
+  }
+  if (manifest.schemaVersion === 2) {
+    const unreferencedEvidence = evidenceDocuments.find(
+      (document) =>
+        !document.id ||
+        document.customerVisible !== false ||
+        !referencedEvidenceDocumentIds.has(document.id),
+    );
+    if (unreferencedEvidence) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        `v2 的每份 evidence 文档都必须被至少一篇正式文档引用：${unreferencedEvidence.path}`,
+      );
+    }
+  }
+  const productBranchIds = new Set(
+    enrichedDocuments
+      .filter(
+        (document) =>
+          document.kind === "leaf" &&
+          (input.profile !== "website-lead-v1" ||
+            document.branchId === "03_products") &&
+          ((document.productFamilyIds?.length || 0) > 0 ||
+            Boolean(document.productFamilyId)),
+      )
+      .map((document) => document.branchId || ""),
+  );
   for (const document of customerDocuments) {
     if (input.profile === "dashboard-enterprise-v1") {
       const markedContent = markedFormalContent(document.content);
@@ -1651,15 +2581,117 @@ function validateProfilePackage(input: {
         `正式正文包含原始快照或页面摘录表述：${document.path}`,
       );
     }
-    const evidenceBacked =
-      document.kind === "leaf" &&
-      document.evidenceStatus !== "needs_verification" &&
-      document.evidenceStatus !== "not_applicable";
-    if (evidenceBacked && effectiveCharacterCount(formal) < 120) {
-      throw new KnowledgeArchiveValidationError(
-        "content",
-        `有证据知识叶子的正式正文少于 120 个有效字符：${document.path}`,
-      );
+    if (
+      manifest.schemaVersion === 2 &&
+      (document.kind === "overview" || document.kind === "leaf")
+    ) {
+      const evidenceDocumentIds = document.evidenceDocumentIds || [];
+      if (new Set(evidenceDocumentIds).size !== evidenceDocumentIds.length) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `证据文档关联不得重复：${document.path}`,
+        );
+      }
+      let actualEvidenceCharacters = 0;
+      for (const evidenceDocumentId of evidenceDocumentIds) {
+        const evidenceDocument = packageDocumentById.get(evidenceDocumentId);
+        if (
+          !evidenceDocument ||
+          evidenceDocument.kind !== "evidence" ||
+          evidenceDocument.customerVisible !== false
+        ) {
+          throw new KnowledgeArchiveValidationError(
+            "structure",
+            `正式文档关联了无效证据文档：${document.path} / ${evidenceDocumentId}`,
+          );
+        }
+        if (
+          !evidenceDocument.branchId ||
+          evidenceDocument.branchId !== document.branchId
+        ) {
+          throw new KnowledgeArchiveValidationError(
+            "structure",
+            `正式文档只能关联显式属于同一分支的证据文档：${document.path} / ${evidenceDocumentId}`,
+          );
+        }
+        if (
+          !(document.sourceIds || []).some((sourceId) =>
+            (evidenceDocument.sourceIds || []).includes(sourceId),
+          )
+        ) {
+          throw new KnowledgeArchiveValidationError(
+            "structure",
+            `正式文档与证据文档没有共同来源：${document.path} / ${evidenceDocumentId}`,
+          );
+        }
+        actualEvidenceCharacters +=
+          evidenceCharacterByDocumentId.get(evidenceDocumentId) || 0;
+      }
+      if (document.evidenceCharacters !== actualEvidenceCharacters) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `证据字符数与服务端复算结果不一致：${document.path}`,
+        );
+      }
+      const expected = evidenceProportionalFormalRequirement({
+        kind: document.kind,
+        isProductBranch: productBranchIds.has(document.branchId || ""),
+        evidenceCharacters: actualEvidenceCharacters,
+      });
+      const requiredFormalCharacters =
+        input.profile === "website-lead-v1"
+          ? document.kind === "leaf"
+            ? websiteV2LeafRequirement(actualEvidenceCharacters)
+            : document.requiredFormalCharacters!
+          : expected.required;
+      if (
+        input.profile === "website-lead-v1" &&
+        document.kind === "leaf" &&
+        document.requiredFormalCharacters !== requiredFormalCharacters
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `Website v2 叶子动态要求不正确：${document.path}`,
+        );
+      }
+      if (
+        input.profile === "dashboard-enterprise-v1" &&
+        (document.requiredFormalCharacters !== expected.required ||
+          document.contentStatus !== expected.status)
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `正文动态要求或内容状态不正确：${document.path}`,
+        );
+      }
+      if (
+        actualEvidenceCharacters === 0 &&
+        !["needs_verification", "not_applicable"].includes(
+          document.evidenceStatus || "",
+        )
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `无证据文档必须明确标记待核验或不适用：${document.path}`,
+        );
+      }
+      if (effectiveCharacterCount(formal) < requiredFormalCharacters) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `正式正文未达到证据自适应要求 ${requiredFormalCharacters} 个有效字符：${document.path}`,
+        );
+      }
+    } else {
+      const evidenceBacked =
+        document.kind === "leaf" &&
+        document.evidenceStatus !== "needs_verification" &&
+        document.evidenceStatus !== "not_applicable";
+      if (evidenceBacked && effectiveCharacterCount(formal) < 120) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `有证据知识叶子的正式正文少于 120 个有效字符：${document.path}`,
+        );
+      }
     }
   }
   const formalCharacters = customerDocuments.reduce(
@@ -1671,12 +2703,14 @@ function validateProfilePackage(input: {
     0,
   );
   if (
-    formalCharacters < limits.minCharacters ||
+    (manifest.schemaVersion === 1 && formalCharacters < limits.minCharacters) ||
     formalCharacters > limits.maxCharacters
   ) {
     throw new KnowledgeArchiveValidationError(
       "content",
-      `正式正文必须在 ${limits.minCharacters}–${limits.maxCharacters} 个有效字符之间`,
+      manifest.schemaVersion === 1
+        ? `正式正文必须在 ${limits.minCharacters}–${limits.maxCharacters} 个有效字符之间`
+        : `正式正文不得超过 ${limits.maxCharacters} 个有效字符`,
     );
   }
   if (manifest.counts.customerVisibleCharacters !== formalCharacters) {
@@ -4336,6 +5370,7 @@ export async function readKnowledgeArchive(
   snapshotId: string,
   options: {
     validationProfile?: KnowledgeBaseValidationProfile;
+    archiveContractVersion?: 1 | 2;
   } = {},
 ) {
   const validationProfile = options.validationProfile ?? "historical";
@@ -4585,6 +5620,7 @@ export async function readKnowledgeArchive(
         ? { documents, assets }
         : validateProfilePackage({
             profile: validationProfile,
+            archiveContractVersion: options.archiveContractVersion,
             packagePaths,
             unpackedBytes,
             rawTextByRelativePath,
@@ -5087,6 +6123,7 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       {
         validationProfile:
           build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
+        archiveContractVersion: build.skillVersion === "1" ? undefined : 2,
       },
     );
     storedAssetKeys = parsed.storedAssetKeys;

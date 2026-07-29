@@ -24,6 +24,7 @@ export default function Home({
   hidePortalNavigation = false,
   showKnowledgeBaseStarter = true,
   showAccountMenu = true,
+  standardWelcomeVariant = "simple",
   responseLogicContext,
 }: {
   embedded?: boolean;
@@ -34,6 +35,7 @@ export default function Home({
   hidePortalNavigation?: boolean;
   showKnowledgeBaseStarter?: boolean;
   showAccountMenu?: boolean;
+  standardWelcomeVariant?: "simple" | "workflow";
   responseLogicContext?: ResponseLogicTaskContext;
 } = {}) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -72,11 +74,19 @@ export default function Home({
             <CloudOff className="mx-auto h-8 w-8 text-destructive" />
           )}
           <h1 className="mt-4 text-lg font-semibold">
-            {loading ? "正在加载云端会话" : "云端会话尚未加载"}
+            {loading
+              ? hideSidebar
+                ? "正在加载知识库工作台"
+                : "正在加载云端会话"
+              : hideSidebar
+                ? "知识库工作台尚未加载"
+                : "云端会话尚未加载"}
           </h1>
           <p className="mt-2 break-words text-sm text-muted-foreground">
             {loading
-              ? "请稍候，加载完成前不会创建仅保存在本机的会话。"
+              ? hideSidebar
+                ? "请稍候，正在恢复当前知识库任务。"
+                : "请稍候，加载完成前不会创建仅保存在本机的会话。"
               : syncError || "请检查网络或数据库连接后重试。"}
           </p>
           {!loading && (
@@ -155,6 +165,7 @@ export default function Home({
           composerPrefill={composerPrefill}
           responseLogicContext={responseLogicContext}
           showKnowledgeBaseStarter={showKnowledgeBaseStarter}
+          standardWelcomeVariant={standardWelcomeVariant}
           reserveOuterMobileNav={!showAccountMenu}
         />
       </main>

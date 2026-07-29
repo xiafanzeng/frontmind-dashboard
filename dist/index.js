@@ -19,6 +19,9 @@ function isExplicitAdminAccessLevel(value) {
 function hasExplicitAdminRole(user) {
   return user.role === "admin" && isExplicitAdminAccessLevel(user.adminAccessLevel);
 }
+function hasDeliveryCapability(user) {
+  return user.role === "admin" && (user.adminAccessLevel === "delivery_admin" || user.adminAccessLevel === "system_admin");
+}
 function isProtectedBuiltinAdminUsername(value) {
   return typeof value === "string" && value.normalize("NFKC").trim().toLowerCase() === "admin";
 }
@@ -56,7 +59,7 @@ import {
   timingSafeEqual
 } from "node:crypto";
 import { parse as parseCookieHeader } from "cookie";
-import { and, desc, eq as eq2, gt, inArray, isNull, ne } from "drizzle-orm";
+import { and, asc, desc, eq as eq2, gt, inArray, isNull, ne } from "drizzle-orm";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -2106,7 +2109,7 @@ function assertAdminHasNoUsageOwnedUsers(input) {
   const actionLabel = input.mutation === "change_access_level" ? "\u8C03\u6574\u7BA1\u7406\u5458\u6743\u9650" : input.mutation === "deactivate" ? "\u505C\u7528\u7BA1\u7406\u5458" : "\u5220\u9664\u7BA1\u7406\u5458";
   throw new AuthServiceError(
     "CONFLICT",
-    `\u8BE5\u4EA4\u4ED8\u7BA1\u7406\u5458\u4ECD\u8D1F\u8D23\u7528\u6237\uFF0C\u8BF7\u5148\u8F6C\u79FB\u8FD9\u4E9B\u7528\u6237\u7684 Key \u4E0E\u79EF\u5206\u5F52\u5C5E\uFF0C\u518D${actionLabel}`
+    `\u8BE5\u7BA1\u7406\u5458\u4ECD\u8D1F\u8D23\u7528\u6237\uFF0C\u8BF7\u5148\u8F6C\u79FB\u8FD9\u4E9B\u7528\u6237\u7684 Key \u4E0E\u79EF\u5206\u5F52\u5C5E\uFF0C\u518D${actionLabel}`
   );
 }
 var loginAttempts = /* @__PURE__ */ new Map();
@@ -2417,65 +2420,6 @@ async function createManagedUserWithPasswordHash(input, executor) {
   }
   return toAuthenticatedUser(created[0]);
 }
-async function createManagedUserWithSetupToken(input, executor) {
-  const db = executor ?? await requireDb();
-  const now = input.now ?? /* @__PURE__ */ new Date();
-  const username = normalizeUsername(input.username);
-  const token = randomBytes(32).toString("base64url");
-  const placeholderPassword = randomBytes(48).toString("base64url");
-  const passwordHash = await hashPassword(placeholderPassword);
-  const expiresAt = new Date(
-    now.getTime() + (input.ttlMs ?? MANAGED_ACCOUNT_SETUP_DURATION_MS)
-  );
-  const create = async (tx) => {
-    const existing = await tx.select({ id: users.id }).from(users).where(eq2(users.username, username)).limit(1);
-    if (existing.length > 0) {
-      throw new AuthServiceError("CONFLICT", "Username already exists");
-    }
-    try {
-      await tx.insert(users).values({
-        username,
-        passwordHash,
-        displayName: input.displayName?.trim() || null,
-        name: input.displayName?.trim() || null,
-        loginMethod: "password",
-        role: "user",
-        isActive: true,
-        passwordChangedAt: null,
-        createdAt: now,
-        updatedAt: now
-      });
-    } catch (error) {
-      if (error?.code === "ER_DUP_ENTRY") {
-        throw new AuthServiceError("CONFLICT", "Username already exists");
-      }
-      throw error;
-    }
-    const created = await tx.select().from(users).where(eq2(users.username, username)).limit(1);
-    if (!created[0]) {
-      throw new AuthServiceError(
-        "NOT_FOUND",
-        "Created user could not be loaded"
-      );
-    }
-    await tx.insert(userPasswordSetupTokens).values({
-      id: randomUUID(),
-      userId: created[0].id,
-      tokenHash: hashSessionToken(token),
-      expiresAt,
-      consumedAt: null,
-      createdByUserId: input.createdByUserId,
-      createdAt: now,
-      updatedAt: now
-    });
-    return {
-      user: toAuthenticatedUser(created[0]),
-      setupToken: token,
-      setupExpiresAt: expiresAt
-    };
-  };
-  return typeof db.transaction === "function" ? db.transaction(create) : create(db);
-}
 function assertUsableManagedSetupToken(row, now) {
   if (!row || row.consumedAt || row.expiresAt.getTime() <= now.getTime()) {
     throw new AuthServiceError(
@@ -2559,17 +2503,30 @@ async function setManagedUserActive(userId, isActive) {
     const rows = await tx.select().from(users).where(eq2(users.id, userId)).limit(1).for("update");
     const user = rows[0];
     if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+    if (!isActive && user.isActive && isProtectedBuiltinAdminUsername(user.username)) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u5185\u7F6E admin \u5FC5\u987B\u4FDD\u6301\u4E3A\u5DF2\u542F\u7528\u7684\u7CFB\u7EDF\u7BA1\u7406\u5458"
+      );
+    }
     if (!isActive && user.isActive && user.role === "admin") {
       const ownedUsers = await tx.select({ userId: userUsageOwners.userId }).from(userUsageOwners).where(eq2(userUsageOwners.deliveryAdminId, userId)).limit(1).for("update");
       assertAdminHasNoUsageOwnedUsers({
         ownedUserCount: ownedUsers.length,
         mutation: "deactivate"
       });
-      const activeAdmins = await tx.select({ id: users.id }).from(users).where(and(eq2(users.role, "admin"), eq2(users.isActive, true))).limit(2).for("update");
-      if (activeAdmins.length <= 1) {
+      const administrators = await tx.select({
+        id: users.id,
+        adminAccessLevel: users.adminAccessLevel,
+        isActive: users.isActive
+      }).from(users).where(eq2(users.role, "admin")).orderBy(asc(users.id)).for("update");
+      const disablingSystemAdmin = user.adminAccessLevel === "system_admin" && administrators.every(
+        (administrator) => administrator.id === user.id || !administrator.isActive || administrator.adminAccessLevel !== "system_admin"
+      );
+      if (disablingSystemAdmin) {
         throw new AuthServiceError(
           "LAST_ADMIN",
-          "The last active administrator cannot be disabled"
+          "\u81F3\u5C11\u9700\u8981\u4FDD\u7559\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u7CFB\u7EDF\u7BA1\u7406\u5458"
         );
       }
     }
@@ -2610,12 +2567,16 @@ async function deleteManagedUser(actorUserId, targetUserId) {
       throw new AuthServiceError("CONFLICT", "\u5185\u7F6E admin \u7CFB\u7EDF\u7BA1\u7406\u5458\u4E0D\u80FD\u88AB\u5220\u9664");
     }
     if (user.role === "admin") {
-      const protectedAdminRows = await tx.select({ id: users.id }).from(users).where(eq2(users.username, "admin")).limit(1).for("update");
+      const protectedAdminRows = await tx.select({
+        id: users.id,
+        adminAccessLevel: users.adminAccessLevel,
+        isActive: users.isActive
+      }).from(users).where(eq2(users.username, "admin")).limit(1).for("update");
       const protectedAdmin = protectedAdminRows[0];
-      if (!protectedAdmin) {
+      if (!protectedAdmin || protectedAdmin.adminAccessLevel !== "system_admin" || !protectedAdmin.isActive) {
         throw new AuthServiceError(
           "CONFLICT",
-          "\u672A\u627E\u5230\u53D7\u4FDD\u62A4\u7684\u5185\u7F6E admin\uFF0C\u65E0\u6CD5\u5B89\u5168\u4EA4\u63A5\u5BA2\u6237"
+          "\u5185\u7F6E admin \u672A\u4FDD\u6301\u542F\u7528\u7684\u7CFB\u7EDF\u7BA1\u7406\u5458\u72B6\u6001\uFF0C\u65E0\u6CD5\u5B89\u5168\u4EA4\u63A5\u5BA2\u6237"
         );
       }
       const ownedUsers = await tx.select({
@@ -2634,11 +2595,18 @@ async function deleteManagedUser(actorUserId, targetUserId) {
       ).limit(1).for("update");
       const retainHistoricalAccount = historicalResources.length > 0;
       if (user.isActive) {
-        const activeAdmins = await tx.select({ id: users.id }).from(users).where(and(eq2(users.role, "admin"), eq2(users.isActive, true))).limit(2).for("update");
-        if (activeAdmins.length <= 1) {
+        const administrators = await tx.select({
+          id: users.id,
+          adminAccessLevel: users.adminAccessLevel,
+          isActive: users.isActive
+        }).from(users).where(eq2(users.role, "admin")).orderBy(asc(users.id)).for("update");
+        const deletingLastActiveSystemAdmin = user.adminAccessLevel === "system_admin" && administrators.every(
+          (administrator) => administrator.id === user.id || !administrator.isActive || administrator.adminAccessLevel !== "system_admin"
+        );
+        if (deletingLastActiveSystemAdmin) {
           throw new AuthServiceError(
             "LAST_ADMIN",
-            "The last active administrator cannot be deleted"
+            "\u81F3\u5C11\u9700\u8981\u4FDD\u7559\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u7CFB\u7EDF\u7BA1\u7406\u5458"
           );
         }
       }
@@ -4763,7 +4731,7 @@ var confirmRedirectWorkbookSchema = z5.object({
 
 // server/service-entitlement.ts
 import { createHash as createHash2, randomUUID as randomUUID2 } from "node:crypto";
-import { and as and3, asc, desc as desc3, eq as eq4, gt as gt2, inArray as inArray2, lte } from "drizzle-orm";
+import { and as and3, asc as asc2, desc as desc3, eq as eq4, gt as gt2, inArray as inArray2, lte } from "drizzle-orm";
 
 // server/authenticated-knowledge-service.ts
 import { and as and2, desc as desc2, eq as eq3, gte } from "drizzle-orm";
@@ -5977,7 +5945,7 @@ function deriveServicePortalState(input) {
       amountFen: purchase.amountFen ?? null,
       currency: purchase.currency ?? "CNY",
       prepaidMonths: purchase.prepaidMonths ?? SERVICE_PLAN_CATALOG[purchase.planCode].prepaidMonths,
-      orderReference: purchase.orderReference ?? purchase.sourceReference ?? null,
+      orderReference: purchase.orderReference ?? null,
       contractReference: purchase.externalContractReference ?? null,
       signedAt: purchase.signedAt ? epoch(purchase.signedAt) : null,
       signatoryId: purchase.signatoryId ?? null,
@@ -6090,8 +6058,8 @@ async function loadPortalStateFromDatabase(userId, now) {
         gt2(serviceQuotaPeriods.endsAt, now)
       )
     ).orderBy(
-      asc(serviceQuotaPeriods.startsAt),
-      asc(serviceQuotaPeriods.ordinal)
+      asc2(serviceQuotaPeriods.startsAt),
+      asc2(serviceQuotaPeriods.ordinal)
     );
     const activePeriodIds = periodRows.map((period) => period.id);
     const [
@@ -6114,7 +6082,7 @@ async function loadPortalStateFromDatabase(userId, now) {
         )
       ).orderBy(
         desc3(workspaceQuestions.selectedAt),
-        asc(workspaceQuestions.ordinal)
+        asc2(workspaceQuestions.ordinal)
       ),
       db.select({
         id: workspaceQuestions.id,
@@ -6758,7 +6726,7 @@ async function replaceGeneratedQuestionCandidates(input) {
         eq4(workspaceQuestions.sourceTaskId, sourceTaskId),
         eq4(workspaceQuestions.source, "model")
       )
-    ).orderBy(asc(workspaceQuestions.ordinal)).for("update");
+    ).orderBy(asc2(workspaceQuestions.ordinal)).for("update");
     if (sameTaskRows.length) {
       const same = sameTaskRows.length === candidates.length && sameTaskRows.every((row, index2) => {
         const candidate = candidates[index2];
@@ -6864,7 +6832,7 @@ async function listWorkspaceQuestions(input) {
   }
   const rows = await db.select().from(workspaceQuestions).where(and3(...predicates)).orderBy(
     desc3(workspaceQuestions.updatedAt),
-    asc(workspaceQuestions.ordinal)
+    asc2(workspaceQuestions.ordinal)
   );
   return rows.map(toPublicWorkspaceQuestion);
 }
@@ -10116,7 +10084,7 @@ function publicSnapshot(snapshot) {
     ...snapshot,
     assets: snapshot.assets.map((asset, index2) => ({
       ...asset,
-      url: `/api/dashboard/knowledge/assets/${snapshot.id}/${index2}`
+      url: asset.id ? `/api/dashboard/knowledge/assets/${snapshot.id}/by-id/${encodeURIComponent(asset.id)}` : `/api/dashboard/knowledge/assets/${snapshot.id}/${index2}`
     }))
   };
 }
@@ -10141,11 +10109,24 @@ async function getKnowledgeAsset(input) {
   const asset = snapshot?.assets[input.assetIndex];
   return snapshot && asset ? { snapshot, asset } : null;
 }
+async function getKnowledgeAssetById(input) {
+  const db = await requireDb4();
+  const rows = await db.select({
+    id: knowledgeBaseSnapshots.id,
+    userId: knowledgeBaseSnapshots.userId,
+    assets: knowledgeBaseSnapshots.assets
+  }).from(knowledgeBaseSnapshots).where(eq9(knowledgeBaseSnapshots.id, input.snapshotId)).limit(1);
+  const snapshot = rows[0];
+  const asset = snapshot?.assets.find(
+    (candidate) => candidate.id === input.assetId
+  );
+  return snapshot && asset ? { snapshot, asset } : null;
+}
 async function createKnowledgeSnapshot(input) {
   const db = await requireDb4();
   const id = input.snapshotId ?? randomUUID7();
   const characterCount = input.documents.reduce(
-    (total, document) => total + document.content.length,
+    (total, document) => total + (document.customerVisible === false ? 0 : document.content.length),
     0
   );
   await db.transaction(async (tx) => {
@@ -10386,11 +10367,11 @@ async function setWorkspaceAssignments(input) {
       throw new AuthServiceError("NOT_FOUND", "Administrator not found");
     }
   }
-  const deliveryAdminIds = validAdmins.filter((admin) => admin.adminAccessLevel === "delivery_admin").map((admin) => admin.id);
+  const deliveryAdminIds = validAdmins.map((admin) => admin.id);
   if (input.usageOwnerAdminId != null && !deliveryAdminIds.includes(input.usageOwnerAdminId)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "\u4E3B\u8D1F\u8D23\u4EBA\u5FC5\u987B\u662F\u5DF2\u9009\u4E2D\u7684\u6709\u6548\u4EA4\u4ED8\u7BA1\u7406\u5458"
+      "\u4E3B\u8D1F\u8D23\u4EBA\u5FC5\u987B\u662F\u5DF2\u9009\u4E2D\u7684\u6709\u6548\u7BA1\u7406\u5458"
     );
   }
   await db.transaction(async (tx) => {
@@ -10410,7 +10391,7 @@ async function setWorkspaceAssignments(input) {
         "\u7BA1\u7406\u5458\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u65B0\u5206\u914D"
       );
     }
-    const lockedDeliveryAdminIds = lockedAdmins.filter((admin) => admin.adminAccessLevel === "delivery_admin").map((admin) => admin.id);
+    const lockedDeliveryAdminIds = lockedAdmins.map((admin) => admin.id);
     if (input.usageOwnerAdminId != null && !lockedDeliveryAdminIds.includes(input.usageOwnerAdminId)) {
       throw new AuthServiceError(
         "CONFLICT",
@@ -10815,7 +10796,7 @@ async function getManagedCredentialStatus(actor, userId) {
 
 // server/knowledge-base-progress-service.ts
 import { createHash as createHash6, randomUUID as randomUUID8 } from "node:crypto";
-import { and as and9, asc as asc2, desc as desc9, eq as eq10 } from "drizzle-orm";
+import { and as and9, asc as asc3, desc as desc9, eq as eq10 } from "drizzle-orm";
 
 // server/knowledge-base-artifact.ts
 import { createHash as createHash5 } from "node:crypto";
@@ -11129,7 +11110,7 @@ async function loadBuild(executor, userId, conversationId, lock = false) {
   return rows[0];
 }
 async function loadNodes(executor, buildId) {
-  return await executor.select().from(knowledgeBaseBuildNodes).where(eq10(knowledgeBaseBuildNodes.buildId, buildId)).orderBy(asc2(knowledgeBaseBuildNodes.ordinal));
+  return await executor.select().from(knowledgeBaseBuildNodes).where(eq10(knowledgeBaseBuildNodes.buildId, buildId)).orderBy(asc3(knowledgeBaseBuildNodes.ordinal));
 }
 async function createKnowledgeBaseBuild(input) {
   const db = await requireDb5();
@@ -11571,7 +11552,7 @@ async function assertKnowledgeBasePublishable(input) {
 import { randomUUID as randomUUID9 } from "node:crypto";
 import {
   and as and10,
-  asc as asc3,
+  asc as asc4,
   count,
   desc as desc10,
   eq as eq11,
@@ -12029,9 +12010,9 @@ async function monitoringCurrentTemplateBatchesFromExecutor(input) {
         inArray6(monitoringSamples.batchId, batchIds)
       )
     ).orderBy(
-      asc3(monitoringSamples.batchId),
-      asc3(monitoringSamples.collectedAt),
-      asc3(monitoringSamples.id)
+      asc4(monitoringSamples.batchId),
+      asc4(monitoringSamples.collectedAt),
+      asc4(monitoringSamples.id)
     ),
     input.executor.select({
       batchId: monitoringCitationRecords.batchId,
@@ -12051,9 +12032,9 @@ async function monitoringCurrentTemplateBatchesFromExecutor(input) {
         inArray6(monitoringCitationRecords.batchId, batchIds)
       )
     ).orderBy(
-      asc3(monitoringCitationRecords.batchId),
-      asc3(monitoringCitationRecords.collectedAt),
-      asc3(monitoringCitationRecords.id)
+      asc4(monitoringCitationRecords.batchId),
+      asc4(monitoringCitationRecords.collectedAt),
+      asc4(monitoringCitationRecords.id)
     )
   ]);
   const sampleRows = rawSampleRows;
@@ -12756,8 +12737,8 @@ async function listMonitoringSamples(input) {
         eq11(monitoringBatches.userId, input.userId)
       )
     ).where(where).orderBy(
-      filters.sortOrder === "asc" ? asc3(monitoringSamples.collectedAt) : desc10(monitoringSamples.collectedAt),
-      asc3(monitoringSamples.id)
+      filters.sortOrder === "asc" ? asc4(monitoringSamples.collectedAt) : desc10(monitoringSamples.collectedAt),
+      asc4(monitoringSamples.id)
     ).limit(filters.pageSize).offset((filters.page - 1) * filters.pageSize)
   ]);
   return {
@@ -12958,8 +12939,8 @@ async function listMonitoringCitations(input) {
         eq11(monitoringBatches.userId, input.userId)
       )
     ).where(where).orderBy(
-      filters.sortOrder === "asc" ? asc3(sortColumn) : desc10(sortColumn),
-      asc3(monitoringCitationRecords.id)
+      filters.sortOrder === "asc" ? asc4(sortColumn) : desc10(sortColumn),
+      asc4(monitoringCitationRecords.id)
     ).limit(filters.pageSize).offset((filters.page - 1) * filters.pageSize)
   ]);
   return {
@@ -13015,7 +12996,7 @@ async function listMonitoringSampleCitations(input) {
         ...baseConditions,
         ...input.value.cursor ? [gt4(monitoringCitationRecords.id, input.value.cursor)] : []
       )
-    ).orderBy(asc3(monitoringCitationRecords.id)).limit(input.value.limit + 1)
+    ).orderBy(asc4(monitoringCitationRecords.id)).limit(input.value.limit + 1)
   ]);
   const hasMore = rows.length > input.value.limit;
   const pageRows = hasMore ? rows.slice(0, input.value.limit) : rows;
@@ -13235,7 +13216,7 @@ async function getMonitoringFilterOptions(userId, quotaPeriodIds, filters = {}) 
         eq11(monitoringSamples.userId, userId),
         inArray6(monitoringSamples.batchId, selectedBatchIds)
       )
-    ).groupBy(monitoringSamples.questionId, monitoringSamples.question).orderBy(asc3(monitoringSamples.question)).limit(500),
+    ).groupBy(monitoringSamples.questionId, monitoringSamples.question).orderBy(asc4(monitoringSamples.question)).limit(500),
     db.select({
       id: monitoringCitationRecords.questionId,
       label: monitoringCitationRecords.question
@@ -13247,13 +13228,13 @@ async function getMonitoringFilterOptions(userId, quotaPeriodIds, filters = {}) 
     ).groupBy(
       monitoringCitationRecords.questionId,
       monitoringCitationRecords.question
-    ).orderBy(asc3(monitoringCitationRecords.question)).limit(500),
-    db.select({ value: monitoringSamples.platform }).from(monitoringSamples).where(sampleScope).groupBy(monitoringSamples.platform).orderBy(asc3(monitoringSamples.platform)).limit(500),
-    db.select({ value: monitoringCitationRecords.model }).from(monitoringCitationRecords).where(citationScope).groupBy(monitoringCitationRecords.model).orderBy(asc3(monitoringCitationRecords.model)).limit(500),
+    ).orderBy(asc4(monitoringCitationRecords.question)).limit(500),
+    db.select({ value: monitoringSamples.platform }).from(monitoringSamples).where(sampleScope).groupBy(monitoringSamples.platform).orderBy(asc4(monitoringSamples.platform)).limit(500),
+    db.select({ value: monitoringCitationRecords.model }).from(monitoringCitationRecords).where(citationScope).groupBy(monitoringCitationRecords.model).orderBy(asc4(monitoringCitationRecords.model)).limit(500),
     db.select({ value: monitoringSamples.collectedAt }).from(monitoringSamples).where(sampleScope).groupBy(monitoringSamples.collectedAt).orderBy(desc10(monitoringSamples.collectedAt)).limit(1e3),
     db.select({ value: monitoringCitationRecords.collectedAt }).from(monitoringCitationRecords).where(citationScope).groupBy(monitoringCitationRecords.collectedAt).orderBy(desc10(monitoringCitationRecords.collectedAt)).limit(1e3),
-    db.select({ value: monitoringCitationRecords.media }).from(monitoringCitationRecords).where(citationScope).groupBy(monitoringCitationRecords.media).orderBy(asc3(monitoringCitationRecords.media)).limit(500),
-    db.select({ value: monitoringCitationRecords.domain }).from(monitoringCitationRecords).where(citationScope).groupBy(monitoringCitationRecords.domain).orderBy(asc3(monitoringCitationRecords.domain)).limit(500)
+    db.select({ value: monitoringCitationRecords.media }).from(monitoringCitationRecords).where(citationScope).groupBy(monitoringCitationRecords.media).orderBy(asc4(monitoringCitationRecords.media)).limit(500),
+    db.select({ value: monitoringCitationRecords.domain }).from(monitoringCitationRecords).where(citationScope).groupBy(monitoringCitationRecords.domain).orderBy(asc4(monitoringCitationRecords.domain)).limit(500)
   ]);
   const questionById = /* @__PURE__ */ new Map();
   for (const question of [...sampleQuestions, ...citationQuestions]) {
@@ -14156,7 +14137,7 @@ import { TRPCError as TRPCError3 } from "@trpc/server";
 
 // server/response-logic-service.ts
 import { randomUUID as randomUUID11 } from "node:crypto";
-import { and as and11, asc as asc4, eq as eq13, inArray as inArray7 } from "drizzle-orm";
+import { and as and11, asc as asc5, eq as eq13, inArray as inArray7 } from "drizzle-orm";
 async function requireDb7() {
   const db = await getDb();
   if (!db) {
@@ -14278,8 +14259,8 @@ function assertResponseLogicTaskSlotAvailable(input) {
 async function listResponseLogicEntries(userId) {
   const db = await requireDb7();
   const rows = await db.select().from(responseLogicEntries).where(eq13(responseLogicEntries.userId, userId)).orderBy(
-    asc4(responseLogicEntries.groupId),
-    asc4(responseLogicEntries.questionId)
+    asc5(responseLogicEntries.groupId),
+    asc5(responseLogicEntries.questionId)
   );
   return rows.map(toDto);
 }
@@ -14293,8 +14274,8 @@ async function listResponseLogicEntriesByQuestionIds(userId, questionIds) {
       inArray7(responseLogicEntries.questionId, uniqueQuestionIds)
     )
   ).orderBy(
-    asc4(responseLogicEntries.groupId),
-    asc4(responseLogicEntries.questionId)
+    asc5(responseLogicEntries.groupId),
+    asc5(responseLogicEntries.questionId)
   );
   return rows.map(toDto);
 }
@@ -14477,8 +14458,8 @@ async function saveResponseLogicEntriesBatch(input) {
         inArray7(responseLogicEntries.questionId, changedQuestionIds)
       )
     ).orderBy(
-      asc4(responseLogicEntries.groupId),
-      asc4(responseLogicEntries.questionId)
+      asc5(responseLogicEntries.groupId),
+      asc5(responseLogicEntries.questionId)
     ) : [];
     const records = savedRows.map(toDto);
     await input.afterWrite?.(tx, records);
@@ -14742,7 +14723,7 @@ async function getManagedTaskActivity(userId) {
 }
 
 // server/admin-access-management-service.ts
-import { asc as asc5, eq as eq15 } from "drizzle-orm";
+import { asc as asc6, eq as eq15 } from "drizzle-orm";
 function effectiveAccessLevel(account) {
   return getEffectiveAdminAccessLevel({
     role: account.role,
@@ -14764,6 +14745,12 @@ function assertAdminAccessLevelTransition(input) {
     throw new AuthServiceError("NOT_FOUND", "\u7BA1\u7406\u5458\u8D26\u53F7\u4E0D\u5B58\u5728");
   }
   const previousAccessLevel = effectiveAccessLevel(target) ?? "delivery_admin";
+  if (isProtectedBuiltinAdminUsername(target.username) && input.nextAccessLevel !== "system_admin") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "\u5185\u7F6E admin \u5FC5\u987B\u4FDD\u6301\u4E3A\u5DF2\u542F\u7528\u7684\u7CFB\u7EDF\u7BA1\u7406\u5458"
+    );
+  }
   if (previousAccessLevel === input.nextAccessLevel) {
     return {
       changed: false,
@@ -14805,9 +14792,9 @@ async function defaultStore() {
       role: users.role,
       adminAccessLevel: users.adminAccessLevel,
       isActive: users.isActive
-    }).from(users).where(eq15(users.role, "admin")).orderBy(asc5(users.id)).for("update"),
+    }).from(users).where(eq15(users.role, "admin")).orderBy(asc6(users.id)).for("update"),
     listUsageOwnedUserIdsForUpdate: async (executor, deliveryAdminId) => {
-      const rows = await executor.select({ userId: userUsageOwners.userId }).from(userUsageOwners).where(eq15(userUsageOwners.deliveryAdminId, deliveryAdminId)).orderBy(asc5(userUsageOwners.userId)).for("update");
+      const rows = await executor.select({ userId: userUsageOwners.userId }).from(userUsageOwners).where(eq15(userUsageOwners.deliveryAdminId, deliveryAdminId)).orderBy(asc6(userUsageOwners.userId)).for("update");
       return rows.map((row) => row.userId);
     },
     updateAccessLevel: async (executor, userId, adminAccessLevel) => {
@@ -14843,14 +14830,6 @@ async function setManagedAdminAccessLevel(input, dependencies = {}) {
     if (!transition.changed) {
       return { changed: false, user };
     }
-    const ownedUserIds = await store.listUsageOwnedUserIdsForUpdate(
-      executor,
-      transition.target.id
-    );
-    assertAdminHasNoUsageOwnedUsers({
-      ownedUserCount: ownedUserIds.length,
-      mutation: "change_access_level"
-    });
     await store.updateAccessLevel(
       executor,
       transition.target.id,
@@ -14879,7 +14858,7 @@ async function setManagedAdminAccessLevel(input, dependencies = {}) {
 import { createHash as createHash9, randomUUID as randomUUID13 } from "node:crypto";
 import {
   and as and14,
-  asc as asc6,
+  asc as asc7,
   count as count2,
   desc as desc13,
   eq as eq17,
@@ -16090,9 +16069,9 @@ async function currentQuota(db, userId, portal) {
       eq17(serviceQuotaPeriods.userId, userId)
     )
   ).orderBy(
-    asc6(serviceQuotaPeriods.endsAt),
-    asc6(serviceQuotaPeriods.startsAt),
-    asc6(serviceQuotaPeriods.id)
+    asc7(serviceQuotaPeriods.endsAt),
+    asc7(serviceQuotaPeriods.startsAt),
+    asc7(serviceQuotaPeriods.id)
   ) : [];
   const activeRows = periods.length ? await db.select({
     quotaPeriodId: deliveryTickets.quotaPeriodId,
@@ -16251,8 +16230,8 @@ async function loadTicketSummaryPage(db, input) {
     enterpriseName: users.displayName
   }).from(deliveryTickets).innerJoin(users, eq17(users.id, deliveryTickets.userId)).where(and14(...conditions));
   const rows = await (order === "created_asc" ? baseQuery.orderBy(
-    asc6(deliveryTickets.createdAt),
-    asc6(deliveryTickets.id)
+    asc7(deliveryTickets.createdAt),
+    asc7(deliveryTickets.id)
   ) : baseQuery.orderBy(
     desc13(deliveryTickets.updatedAt),
     desc13(deliveryTickets.id)
@@ -16416,9 +16395,9 @@ async function createDeliveryTicket(input) {
             eq17(serviceQuotaPeriods.userId, input.userId)
           )
         ).orderBy(
-          asc6(serviceQuotaPeriods.endsAt),
-          asc6(serviceQuotaPeriods.startsAt),
-          asc6(serviceQuotaPeriods.id)
+          asc7(serviceQuotaPeriods.endsAt),
+          asc7(serviceQuotaPeriods.startsAt),
+          asc7(serviceQuotaPeriods.id)
         ).for("update");
         if (!periods.length) {
           throw new DeliveryTicketError(
@@ -16674,7 +16653,7 @@ async function getDeliveryTicketDetail(input) {
         eq17(deliveryTicketEvents.ticketId, ticket.id),
         ...input.includeInternal ? [] : [eq17(deliveryTicketEvents.visibility, "customer")]
       )
-    ).orderBy(asc6(deliveryTicketEvents.createdAt)),
+    ).orderBy(asc7(deliveryTicketEvents.createdAt)),
     db.select({
       attachment: deliveryTicketAttachments,
       eventVisibility: deliveryTicketEvents.visibility
@@ -16684,7 +16663,7 @@ async function getDeliveryTicketDetail(input) {
         eq17(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
         eq17(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId)
       )
-    ).where(eq17(deliveryTicketAttachments.ticketId, ticket.id)).orderBy(asc6(deliveryTicketAttachments.createdAt))
+    ).where(eq17(deliveryTicketAttachments.ticketId, ticket.id)).orderBy(asc7(deliveryTicketAttachments.createdAt))
   ]);
   const attachments2 = attachmentRows2.filter(
     (row) => isDeliveryTicketAttachmentVisible(
@@ -16741,7 +16720,7 @@ async function getPublicDeliveryTicketDetail(input) {
         eq17(deliveryTicketEvents.ticketId, ticket.id),
         eq17(deliveryTicketEvents.visibility, "customer")
       )
-    ).orderBy(asc6(deliveryTicketEvents.createdAt)),
+    ).orderBy(asc7(deliveryTicketEvents.createdAt)),
     db.select({
       id: deliveryTicketAttachments.id,
       filename: deliveryTicketAttachments.filename,
@@ -16762,7 +16741,7 @@ async function getPublicDeliveryTicketDetail(input) {
         eq17(deliveryTicketAttachments.ticketId, ticket.id),
         eq17(deliveryTicketAttachments.sensitivity, "standard")
       )
-    ).orderBy(asc6(deliveryTicketAttachments.createdAt))
+    ).orderBy(asc7(deliveryTicketAttachments.createdAt))
   ]);
   const preferredMedia = ticket.preferredMedia && CONTENT_ASSET_MEDIA_OPTIONS.includes(
     ticket.preferredMedia
@@ -17101,7 +17080,7 @@ async function updateManagedDeliveryTicket(input) {
             eq17(deliveryTicketEvents.kind, "delivery_result"),
             eq17(deliveryTicketEvents.visibility, "customer")
           )
-        ).orderBy(asc6(deliveryTicketEvents.createdAt));
+        ).orderBy(asc7(deliveryTicketEvents.createdAt));
         const derivedLinks = deliveryLinksFromOperationResults(
           deliveryResultRows.map((row) => row.operationResult)
         );
@@ -17522,7 +17501,6 @@ async function accessibleDeliveryAdmins(actor, executor) {
     }).from(users).where(
       and15(
         eq18(users.role, "admin"),
-        eq18(users.adminAccessLevel, "delivery_admin"),
         eq18(users.isActive, true)
       )
     );
@@ -18917,8 +18895,18 @@ async function createManagedServiceUser(input, dependencies = {}) {
   const startsAt = now;
   const endsAt = getServiceContractTermEnd(planCode, startsAt);
   await (dependencies.validateApiKey ?? validateUpstreamApiKey)(input.apiKey);
+  const passwordHash = await hashPassword(input.password);
   const transaction = dependencies.transaction ?? await defaultTransaction();
-  const createAccount = dependencies.createAccount ?? ((accountInput, executor) => createManagedUserWithSetupToken(accountInput, executor));
+  const createAccount = dependencies.createAccount ?? ((accountInput, executor) => createManagedUserWithPasswordHash(
+    {
+      username: accountInput.username,
+      passwordHash: accountInput.passwordHash,
+      displayName: accountInput.displayName,
+      role: "user",
+      now: accountInput.now
+    },
+    executor
+  ));
   const persistContract = dependencies.persistContract ?? (async (value, executor) => {
     const tx = executor;
     await tx.insert(serviceContracts).values(value.contract);
@@ -18955,25 +18943,25 @@ async function createManagedServiceUser(input, dependencies = {}) {
       isActive: users.isActive
     }).from(users).where(eq21(users.id, deliveryAdminId)).limit(1).for("update");
     const admin = rows[0];
-    if (!admin || admin.role !== "admin" || admin.adminAccessLevel !== "delivery_admin" || admin.isActive !== true) {
+    if (!admin || !hasDeliveryCapability(admin) || admin.isActive !== true) {
       throw new AuthServiceError(
         "INVALID_CREDENTIAL",
-        "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u4EA4\u4ED8\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
+        "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
       );
     }
   });
   return transaction(async (executor) => {
     await validateDeliveryAdmin(input.deliveryAdminId, executor);
-    const setup = await createAccount(
+    const user = await createAccount(
       {
         username: input.username,
+        passwordHash,
         displayName: input.displayName,
-        createdByUserId: input.actor.id,
         now
       },
       executor
     );
-    const userId = setup.user.id;
+    const userId = user.id;
     const quotaPeriods = createServiceQuotaWindows(planCode, startsAt).map(
       (window) => ({
         id: dependencies.randomId?.() ?? randomUUID16(),
@@ -19040,7 +19028,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
         workspaceUserId: userId,
         metadata: {
           role: "user",
-          setupRequired: true,
+          setupRequired: false,
           planCode,
           contractId,
           entitlementStatus: "active",
@@ -19051,7 +19039,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
       executor
     );
     return {
-      ...setup,
+      user,
       contract: {
         id: contractId,
         userId,
@@ -19085,10 +19073,10 @@ async function completeManagedServiceUserProvisioning(input, dependencies = {}) 
         isActive: users.isActive
       }).from(users).where(eq21(users.id, deliveryAdminId)).limit(1).for("update");
       const admin = rows[0];
-      if (!admin || admin.role !== "admin" || admin.adminAccessLevel !== "delivery_admin" || admin.isActive !== true) {
+      if (!admin || !hasDeliveryCapability(admin) || admin.isActive !== true) {
         throw new AuthServiceError(
           "INVALID_CREDENTIAL",
-          "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u4EA4\u4ED8\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
+          "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
         );
       }
     });
@@ -19729,10 +19717,10 @@ var adminRouter = router({
           message: input.planCode === "basic" ? "\u666E\u901A\u7248\u4E3A\u8FDE\u7EED 30 \u5929\u5355\u9898\u670D\u52A1\uFF0C\u4E0D\u8BBE\u7F6E\u9884\u4ED8\u6708\u4EFD" : "\u77E5\u8BC6\u5E93\u7248\u3001\u8FDB\u9636\u7248\u4E0E\u8C6A\u534E\u7248\u5408\u540C\u5747\u6309 3 \u4E2A\u6708\u670D\u52A1\u5468\u671F\u5EFA\u7ACB"
         });
       }
-      if (commerciallyActive && (!input.orderReference?.trim() || !input.contractReference?.trim() || !input.signatoryId?.trim() || !input.signedAt || !input.signingEvidence)) {
+      if (commerciallyActive && (!input.signatoryId?.trim() || !input.signedAt || !input.signingEvidence)) {
         throw new TRPCError3({
           code: "BAD_REQUEST",
-          message: "\u751F\u6548\u6216\u5F85\u751F\u6548\u5408\u540C\u5FC5\u987B\u5305\u542B\u8BA2\u5355\u7F16\u53F7\u3001\u5408\u540C\u7F16\u53F7\u3001\u7B7E\u7F72\u4E3B\u4F53\u3001\u7B7E\u7F72\u65F6\u95F4\u4E0E\u6838\u9A8C\u4F9D\u636E"
+          message: "\u751F\u6548\u6216\u5F85\u751F\u6548\u5408\u540C\u5FC5\u987B\u5305\u542B\u7B7E\u7F72\u4E3B\u4F53\u3001\u7B7E\u7F72\u65F6\u95F4\u4E0E\u6838\u9A8C\u4F9D\u636E"
         });
       }
       try {
@@ -20340,7 +20328,7 @@ var adminRouter = router({
       z8.discriminatedUnion("role", [
         z8.object({
           username: usernameSchema2,
-          password: z8.never().optional(),
+          password: passwordSchema,
           displayName: z8.string().trim().max(128).optional(),
           role: z8.literal("user"),
           planCode: servicePlanCodeSchema,
@@ -20382,21 +20370,16 @@ var adminRouter = router({
         const result = await createManagedServiceUser({
           actor: ctx.user,
           username: input.username,
+          password: input.password,
           displayName: input.displayName,
           planCode: input.planCode,
           deliveryAdminId: input.deliveryAdminId,
           apiKey: input.apiKey
         });
-        const configuredBaseUrl = process.env.FRONTMIND_PUBLIC_URL?.trim().replace(/\/$/, "");
-        const requestBaseUrl = ctx.req.protocol && ctx.req.get?.("host") ? `${ctx.req.protocol}://${ctx.req.get("host")}` : "";
-        const baseUrl = configuredBaseUrl || requestBaseUrl || (process.env.NODE_ENV === "production" ? "" : "http://127.0.0.1:3001");
-        const path9 = `/setup-password?token=${encodeURIComponent(
-          result.setupToken
-        )}`;
         return {
           user: result.user,
-          setupUrl: baseUrl ? `${baseUrl}${path9}` : path9,
-          setupExpiresAt: result.setupExpiresAt.getTime(),
+          setupUrl: null,
+          setupExpiresAt: null,
           contract: {
             ...result.contract,
             startsAt: result.contract.startsAt.getTime(),
@@ -20507,7 +20490,7 @@ var adminRouter = router({
 
 // server/conversation-router.ts
 import { TRPCError as TRPCError4 } from "@trpc/server";
-import { and as and19, asc as asc7, desc as desc16, eq as eq22, inArray as inArray12, isNull as isNull4 } from "drizzle-orm";
+import { and as and19, asc as asc8, desc as desc16, eq as eq22, inArray as inArray12, isNull as isNull4 } from "drizzle-orm";
 import { randomUUID as randomUUID17 } from "node:crypto";
 import { z as z9 } from "zod";
 var attachmentSchema = z9.object({
@@ -20947,7 +20930,7 @@ async function loadPersistedMessages(executor, userId, conversationId) {
       eq22(messages.conversationId, conversationId),
       isNull4(messages.deletedAt)
     )
-  ).orderBy(asc7(messages.sequence));
+  ).orderBy(asc8(messages.sequence));
   const messageIds = messageRows.map((row) => row.id);
   const attachmentRows2 = messageIds.length === 0 ? [] : await executor.select().from(attachments).where(
     and19(
@@ -21358,7 +21341,7 @@ async function listSnapshots(userId) {
       inArray12(messages.conversationId, ids),
       isNull4(messages.deletedAt)
     )
-  ).orderBy(asc7(messages.sequence));
+  ).orderBy(asc8(messages.sequence));
   const messageIds = messageRows.map((row) => row.id);
   const attachmentRows2 = messageIds.length === 0 ? [] : await db.select().from(attachments).where(
     and19(
@@ -25853,8 +25836,15 @@ var skillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [configuredKnowl
     "socratic-kb-builder.skill"
   )
 ];
-var cachedSkillInstructions = null;
-var cachedSkillContentHash = null;
+var legacySkillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [
+  path5.join(
+    path5.dirname(configuredKnowledgeBaseSkillPath),
+    "socratic-kb-builder-v1.skill"
+  )
+] : skillArchiveCandidates.map(
+  (candidate) => path5.join(path5.dirname(candidate), "socratic-kb-builder-v1.skill")
+);
+var skillArchiveCache = /* @__PURE__ */ new Map();
 function sanitizeFilename2(value, fallback) {
   const safe = String(value || "").replace(/[\\/\0]/g, "_").replace(/^\.+$/, "").trim().slice(0, 160);
   return safe || fallback;
@@ -25869,10 +25859,20 @@ function normalizeUserAttachments(attachments2) {
     return fileId ? { file_id: fileId, filename } : null;
   }).filter(Boolean);
 }
-async function readSkillArchive() {
-  if (cachedSkillInstructions) return cachedSkillInstructions;
+async function loadSkillArchive(selection = { version: "2" }) {
+  const version = selection.version === "1" ? "1" : "2";
+  const cached = skillArchiveCache.get(version);
+  if (cached) {
+    if (selection.contentHash && selection.contentHash !== cached.contentHash) {
+      throw new Error(
+        `Knowledge-base Skill v${version} content hash does not match the active build`
+      );
+    }
+    return cached;
+  }
   let lastError;
-  for (const candidate of skillArchiveCandidates) {
+  const candidates = version === "1" ? legacySkillArchiveCandidates : skillArchiveCandidates;
+  for (const candidate of candidates) {
     try {
       const archive = await fs4.readFile(candidate);
       const zip = await JSZip.loadAsync(archive);
@@ -25880,7 +25880,8 @@ async function readSkillArchive() {
         ["SKILL.md", "Skill"],
         ["references/knowledge-tree.md", "Knowledge Tree"],
         ["references/questioning-strategy.md", "Questioning Strategy"],
-        ["references/output-format.md", "Output Format"]
+        ["references/output-format.md", "Output Format"],
+        ...version === "2" ? [["scripts/validate_archive.py", "Archive Validator"]] : []
       ];
       const sections = [];
       for (const [entryName, title] of entries) {
@@ -25893,21 +25894,38 @@ async function readSkillArchive() {
 
 ${content.trim()}`);
       }
-      cachedSkillInstructions = sections.join("\n\n---\n\n");
-      cachedSkillContentHash = createHash12("sha256").update(cachedSkillInstructions).digest("hex");
-      return cachedSkillInstructions;
+      const instructions = sections.join("\n\n---\n\n");
+      const loaded = {
+        instructions,
+        contentHash: createHash12("sha256").update(instructions).digest("hex"),
+        archivePath: candidate
+      };
+      if (selection.contentHash && selection.contentHash !== loaded.contentHash) {
+        throw new Error(
+          `Knowledge-base Skill v${version} content hash does not match the active build`
+        );
+      }
+      skillArchiveCache.set(version, loaded);
+      return loaded;
     } catch (error) {
       lastError = error;
     }
   }
-  throw lastError instanceof Error ? lastError : new Error("Could not load socratic-kb-builder.skill");
+  throw lastError instanceof Error ? lastError : new Error(`Could not load socratic-kb-builder Skill v${version}`);
 }
-async function getKnowledgeBaseSkillDescriptor() {
-  await readSkillArchive();
+async function readSkillArchive(selection = { version: "2" }) {
+  return (await loadSkillArchive(selection)).instructions;
+}
+async function getKnowledgeBaseSkillDescriptor(selection = { version: "2" }) {
+  const version = selection.version === "1" ? "1" : "2";
+  const loaded = await loadSkillArchive({
+    version,
+    contentHash: selection.contentHash
+  });
   return {
     name: "socratic-kb-builder",
-    version: "1",
-    contentHash: cachedSkillContentHash
+    version,
+    contentHash: loaded.contentHash
   };
 }
 async function buildKnowledgeBasePrompt({
@@ -25922,10 +25940,10 @@ async function buildKnowledgeBasePrompt({
   const attachmentList = attachments2.length > 0 ? attachments2.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u4E0E\u5168\u7F51\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
   let prefillCharacters = 0;
   const prefillDocuments = (prefillKnowledgeSnapshot?.documents ?? []).map((document) => {
-    if (prefillCharacters >= 8e4) return "";
+    if (prefillCharacters >= 3e5) return "";
     const content = document.content.slice(
       0,
-      Math.max(0, 8e4 - prefillCharacters)
+      Math.max(0, 3e5 - prefillCharacters)
     );
     prefillCharacters += content.length;
     return [
@@ -25935,7 +25953,7 @@ async function buildKnowledgeBasePrompt({
     ].join("\n");
   }).filter(Boolean).join("\n\n");
   return [
-    "\u4F60\u5FC5\u987B\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u7ED3\u6784\u5316\u77E5\u8BC6\u5E93\u3002",
+    "\u4F60\u5FC5\u987B\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder v2 Skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u6DF1\u5EA6\u56FE\u6587\u77E5\u8BC6\u5E93\u3002",
     "",
     "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
     `\u6784\u5EFA\u4F1A\u8BDD\u6807\u8BC6\uFF1A${conversationId || "\u672A\u63D0\u4F9B"}`,
@@ -25957,19 +25975,21 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     ].join("\n") : "\u5F53\u524D\u8D26\u53F7\u6CA1\u6709\u5DF2\u8FC1\u79FB\u7684\u521D\u6B65\u77E5\u8BC6\u5E93\uFF0C\u5C06\u4ECE\u5B98\u7F51\u3001\u5168\u7F51\u4E0E\u4E0A\u4F20\u8D44\u6599\u5F00\u59CB\u9884\u586B\u3002",
     "",
     "## \u6267\u884C\u8981\u6C42",
-    "1. \u5148\u5B8C\u6574\u8BFB\u53D6\u7528\u6237\u4E0A\u4F20\u8D44\u6599\uFF0C\u5E76\u5BF9\u6BCF\u4E2A\u4F01\u4E1A\u5B98\u7F51\u505A\u6DF1\u5EA6\u5168\u7AD9\u91C7\u96C6\uFF1B\u9012\u5F52\u5904\u7406 sitemap\u3001\u680F\u76EE\u5206\u9875\u3001\u4EA7\u54C1\u8BE6\u60C5\u3001\u6848\u4F8B\u3001\u4E0B\u8F7D\u6587\u4EF6\u3001\u5EF6\u8FDF\u52A0\u8F7D\u56FE\u7247\u548C\u53EF\u89C1\u7684\u5BA2\u6237\u7AEF\u6E32\u67D3\u5185\u5BB9\uFF0C\u5B8C\u6210\u8986\u76D6\u62A5\u544A\u540E\u624D\u80FD\u8FDB\u5165\u786E\u8BA4\u73AF\u8282\u3002\u8986\u76D6\u62A5\u544A\u5FC5\u987B\u91CF\u5316\u5C55\u793A\uFF1A\u53D1\u73B0/\u6210\u529F/\u5931\u8D25\u9875\u9762\u6570\u3001\u6E05\u6D17\u540E\u6B63\u6587\u5B57\u7B26\u6570\u4E0E\u8BCD\u6570\u3001\u53BB\u91CD\u6B63\u6587\u91CF\u3001\u53D1\u73B0/\u6210\u529F\u4E0B\u8F7D/\u5931\u8D25\u56FE\u7247\u6570\u3001\u6309\u5185\u5BB9\u54C8\u5E0C\u53BB\u91CD\u540E\u7684\u56FE\u7247\u6570\u3001\u56FE\u7247\u603B\u5BB9\u91CF\u4E0E\u5206\u8FA8\u7387\u5206\u5E03\u3001\u6587\u6863\u6570\uFF1B\u4E0D\u80FD\u53EA\u62A5\u544A\u9875\u9762\u6570\u91CF\u6216\u56FE\u7247 URL \u6570\u91CF\u3002",
-    "2. \u5B98\u7F51\u91C7\u96C6\u5B8C\u6210\u540E\u5FC5\u987B\u7EE7\u7EED\u6267\u884C\u5168\u7F51\u4F01\u4E1A\u60C5\u62A5\u91C7\u96C6\uFF0C\u800C\u4E0D\u662F\u53EA\u91C7\u5B98\u7F51\uFF1A\u56F4\u7ED5\u4F01\u4E1A\u540D\u79F0\u3001\u522B\u540D\u3001\u57DF\u540D\u3001\u4EA7\u54C1\u4E0E\u578B\u53F7\u3001\u6838\u5FC3\u4EBA\u7269\u3001\u5BA2\u6237\u6848\u4F8B\u3001\u4E13\u5229\u8BA4\u8BC1\u548C\u884C\u4E1A\u672F\u8BED\u8FDB\u884C\u4E2D\u6587\u3001\u82F1\u6587\u53CA\u76EE\u6807\u5E02\u573A\u8BED\u8A00\u68C0\u7D22\uFF0C\u8986\u76D6\u6743\u5A01\u767B\u8BB0/\u4E13\u5229/\u8BA4\u8BC1\u6570\u636E\u5E93\u3001\u65B0\u95FB\u5A92\u4F53\u3001\u5C55\u4F1A\u3001\u884C\u4E1A\u5A92\u4F53\u3001\u7ECF\u9500\u5546\u3001B2B \u76EE\u5F55\u3001\u62DB\u8058\u9875\u3001\u793E\u4EA4\u8D26\u53F7\u548C\u516C\u5F00\u89C6\u9891\u56FE\u6587\u6765\u6E90\u3002",
-    "3. \u5BF9\u5168\u7F51\u6765\u6E90\u6267\u884C\u5B9E\u4F53\u6D88\u6B67\u3001\u8DE8\u6765\u6E90\u53BB\u91CD\u3001\u53D1\u5E03\u65F6\u95F4\u8BB0\u5F55\u548C\u51B2\u7A81\u6838\u9A8C\uFF1B\u5B98\u7F51\u4E0E\u6743\u5A01\u6570\u636E\u5E93\u4F18\u5148\uFF0C\u7B2C\u4E09\u65B9\u4E8B\u5B9E\u548C\u56FE\u7247\u5FC5\u987B\u4FDD\u7559\u539F\u59CB URL\u3001\u6765\u6E90\u7C7B\u578B\u3001\u91C7\u96C6\u65F6\u95F4\u53CA\u6388\u6743/\u6743\u5C5E\u72B6\u6001\uFF0C\u5916\u90E8\u56FE\u7247\u53EA\u80FD\u4F5C\u4E3A\u5F85\u6838\u9A8C\u53C2\u8003\u7D20\u6750\uFF0C\u4E0D\u5F97\u5192\u5145\u4F01\u4E1A\u81EA\u6709\u8D44\u4EA7\u3002",
-    "4. \u77E5\u8BC6\u6811\u7684\u4E00\u7EA7\u5206\u652F\u5FC5\u987B\u6839\u636E\u5F53\u524D\u4F01\u4E1A\u7684\u4E1A\u52A1\u5F62\u6001\u3001\u4EA7\u54C1\u4E0E\u670D\u52A1\u3001\u80FD\u529B\u4F53\u7CFB\u548C\u5BA2\u6237\u884C\u4E1A\u81EA\u9002\u5E94\u751F\u6210\uFF1B\u4E0D\u5F97\u5957\u7528\u56FA\u5B9A\u5206\u652F\u6570\u91CF\u6216\u4E3A\u4E86\u51D1\u6570\u62C6\u5206\u3002\u5FC5\u987B\u5C55\u5F00\u7EA6 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\uFF0C\u5E76\u4EE5\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u603B\u6570\u8BA1\u7B97\u904D\u5386\u8FDB\u5EA6\u3002",
-    "5. \u6309 skill \u8981\u6C42\u5148\u4E3A\u6BCF\u4E2A\u53F6\u5B50\u8282\u70B9\u9884\u586B\u6587\u5B57\u3001\u6570\u636E\u3001\u6765\u6E90\u548C\u76F8\u5173\u4F01\u4E1A\u56FE\u7247\uFF0C\u518D\u4EE5\u82CF\u683C\u62C9\u5E95\u5F0F\u786E\u8BA4\u63A8\u8FDB\uFF0C\u4E0D\u80FD\u8BA9\u7528\u6237\u4ECE\u7A7A\u767D\u95EE\u9898\u5F00\u59CB\u5199\u3002",
-    "6. \u6BCF\u8F6E\u53EA\u80FD\u5448\u73B0\u548C\u5904\u7406\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\u3002\u7528\u6237\u53EF\u786E\u8BA4\u3001\u4FEE\u6B63\uFF0C\u6216\u9009\u62E9\u2018\u8DF3\u8FC7/\u76F4\u63A5\u9884\u586B\u2019\u5F53\u524D\u8282\u70B9\uFF1B\u7981\u6B62\u8DF3\u8FC7\u6574\u4E2A\u5206\u652F\u3001\u6279\u91CF\u786E\u8BA4\u3001\u8DE8\u8282\u70B9\u5408\u5E76\u786E\u8BA4\u6216\u63D0\u524D\u6253\u5305\u3002",
-    "7. \u53EA\u6709\u6240\u6709\u53F6\u5B50\u8282\u70B9\u5747\u5DF2\u9010\u9879\u5904\u7406\u3001\u904D\u5386\u8FDB\u5EA6\u8FBE\u5230 100% \u540E\uFF0C\u624D\u53EF\u81EA\u52A8\u751F\u6210\u6700\u7EC8 Markdown/ZIP\u3002\u7981\u6B62\u51FA\u73B0\u2018\u751F\u6210\u521D\u7248\u6210\u679C\u2019\u3001\u2018\u662F\u5426\u7ACB\u5373\u751F\u6210\u2019\u3001A/B/C \u751F\u6210\u9009\u9879\u6216\u4EFB\u4F55\u63D0\u524D\u4EA4\u4ED8\u63D0\u8BAE\u3002",
+    "1. \u8FD9\u662F 4\u20136 \u5C0F\u65F6\u6DF1\u5EA6\u6784\u5EFA\uFF0C\u4E0D\u662F\u5B98\u7F51\u8F7B\u91CF\u7248\u3002\u5148\u8BFB\u4E0A\u4F20\u8D44\u6599\uFF0C\u518D\u6309\u4E1A\u52A1\u8986\u76D6\u77E9\u9635\u5E7F\u5EA6\u4F18\u5148\u91C7\u96C6\u5B98\u7F51\u3001\u5B98\u65B9\u6587\u6863\u4E0E\u5168\u7F51\u8BC1\u636E\uFF1B\u4E0D\u5F97\u7A77\u5C3D\u91CD\u590D SKU\u3001\u5206\u9875\u3001\u65B0\u95FB\u6216\u8BED\u8A00\u7248\u672C\uFF0C\u4E5F\u4E0D\u5F97\u53EA\u6982\u62EC\u9996\u9875\u3002",
+    "2. \u56FA\u5B9A\u786C\u9884\u7B97\uFF1AHTML \u6293\u53D6\u5C1D\u8BD5\u6700\u591A 1,200\uFF0C\u5305\u542B\u56FE\u7247\u548C\u6587\u6863\u5728\u5185\u7684\u94FE\u63A5\u8BBF\u95EE\u6700\u591A 1,800\uFF0C\u5B98\u7F51\u6587\u6863\u6700\u591A 120\uFF0C\u7D2F\u8BA1\u7528\u6237\u4E0A\u4F20\u6700\u591A 100\uFF0C\u516C\u5F00\u67E5\u8BE2\u6700\u591A 120\uFF0C\u53BB\u91CD\u8BC1\u636E\u6587\u5B57\u6700\u591A 3,000,000 \u5B57\u7B26\u3002\u8FBE\u5230\u4EFB\u4E00\u9884\u7B97\u540E\u505C\u6B62\u8BE5\u6E20\u9053\u5E76\u8BB0\u5F55\u771F\u5B9E\u7F3A\u53E3\uFF0C\u4E0D\u5F97\u628A\u9884\u7B97\u6D88\u8017\u5199\u6210\u5B8C\u6574\u5EA6\u3002",
+    "3. \u56FE\u7247\u5FC5\u987B\u662F\u771F\u5B9E\u6253\u5305\u7684\u7B2C\u4E00\u65B9\u6587\u4EF6\u3002360\u2013480 \u5F20\u662F\u8D28\u91CF\u76EE\u6807\u800C\u975E\u6700\u4F4E\u95E8\u69DB\u3002\u68C0\u67E5 img/srcset\u3001\u61D2\u52A0\u8F7D\u3001picture\u3001CSS \u80CC\u666F\u3001OG \u56FE\u3001\u753B\u5ECA\u548C\u5B98\u65B9\u6587\u6863\u56FE\u7247\uFF1B\u4E0D\u8DB3\u65F6\u6253\u5305\u5168\u90E8\u5408\u683C\u56FE\u7247\uFF0C\u5E76\u7528 source_limited \u6216 budget_limited \u8BB0\u5F55\u5B8C\u6574\u5019\u9009\u6F0F\u6597\u3001\u62D2\u7EDD\u539F\u56E0\u548C\u505C\u6B62\u539F\u56E0\u3002\u6BCF\u4E2A\u4EA7\u54C1\u65CF\u5FC5\u987B\u4E0E\u4EA7\u54C1\u53F6\u5B50\u5BF9\u8D26\uFF0C\u6709\u5B98\u65B9\u56FE\u7247\u65F6\u81F3\u5C11\u5173\u8054\u4E00\u5F20\uFF0C\u65E0\u56FE\u65F6\u8BB0\u5F55 checkedSources \u548C gapReason\u3002\u7B2C\u4E09\u65B9\u56FE\u7247\u4E0D\u5F97\u51D1\u6570\u3002",
+    "4. \u6700\u7EC8\u56FE\u7247\u53EA\u5141\u8BB8\u7ECF\u5185\u5BB9\u6821\u9A8C\u7684 AVIF/WebP/PNG/JPEG/GIF\uFF1BSVG \u5FC5\u987B\u6805\u683C\u5316\u3002\u9010\u5F20\u8BB0\u5F55 SHA-256\u3001MIME\u3001\u5B57\u8282\u3001\u5C3A\u5BF8\u3001\u56FE\u6CE8\u3001alt\u3001\u5206\u652F\u3001\u5173\u8054\u6587\u6863\u3001\u6765\u6E90\u9875\u3001\u539F\u56FE URL \u548C\u6743\u5C5E\u3002\u56FE\u7247\u603B\u5BB9\u91CF\u6700\u591A 160 MiB\uFF1BZIP \u6700\u591A 1,500 \u4E2A\u666E\u901A\u6587\u4EF6\u3002",
+    "5. \u5BA2\u6237\u53EF\u89C1\u6B63\u5F0F\u6B63\u6587\u5FC5\u987B\u662F\u5B8C\u6210\u7684\u4F01\u4E1A\u56FE\u6587\u4F53\u7CFB\uFF0C\u800C\u4E0D\u662F\u2018\u7B2C\u4E00\u65B9\u539F\u59CB\u5FEB\u7167\u2019\u3001\u2018\u7B2C\u4E00\u65B9\u9875\u9762\u6458\u5F55\u2019\u3001\u6293\u53D6\u65E5\u5FD7\u6216\u6765\u6E90\u9648\u8FF0\u300280,000\u2013120,000 \u5B57\u7B26\u662F\u8D28\u91CF\u76EE\u6807\uFF0C\u53EA\u6709 180,000 \u662F\u603B\u4F53\u786C\u4E0A\u9650\u3002\u6BCF\u7BC7\u7EFC\u8FF0\u548C\u53F6\u5B50\u5FC5\u987B\u5173\u8054\u5B9E\u9645\u6253\u5305\u7684 evidence \u6587\u6863\uFF0C\u7531\u670D\u52A1\u7AEF\u590D\u7B97\u8BC1\u636E\u5B57\u7B26\u5E76\u6309 25%/20% \u52A8\u6001\u786E\u5B9A\u6B63\u6587\u8981\u6C42\uFF1B\u8D44\u6599\u5C11\u65F6\u4F7F\u7528 limited_evidence\uFF0C\u5B8C\u5168\u65E0\u8BC1\u636E\u65F6\u4F7F\u7528 needs_verification \u548C\u5177\u4F53\u7F3A\u53E3\uFF0C\u4E0D\u5F97\u8865\u5199\u6216\u91CD\u590D\u51D1\u5B57\u3002\u4FDD\u7559 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002",
+    "6. \u4E3A\u6BCF\u4E2A\u4E00\u7EA7\u5206\u652F\u5199\u6B63\u5F0F\u7EFC\u8FF0\uFF0C\u4E3A\u6BCF\u4E2A\u53F6\u5B50\u5199\u6B63\u5F0F\u8349\u7A3F\uFF0C\u5E76\u7528\u7A33\u5B9A asset ID \u7CBE\u786E\u5173\u8054\u771F\u5B9E\u56FE\u7247\u3002\u539F\u59CB\u6458\u5F55\u3001\u91C7\u96C6\u62A5\u544A\u3001\u6765\u6E90\u7D22\u5F15\u548C\u6838\u9A8C\u7F3A\u53E3\u5FC5\u987B\u653E\u5165\u72EC\u7ACB\u8BC1\u636E\u5C42\uFF0C\u4E0D\u80FD\u6DF7\u5165\u6B63\u5F0F\u6B63\u6587\u3002",
+    "7. \u65B0\u53D1\u73B0\u5FC5\u987B\u5728\u4EFB\u52A1\u5F00\u59CB\u540E\u7B2C 330 \u5206\u949F\u505C\u6B62\uFF1B\u6B64\u540E\u53EA\u5141\u8BB8\u6574\u7406\u8BC1\u636E\u3001\u5199\u4F5C\u3001\u5173\u8054\u7D20\u6750\u3001\u751F\u6210\u6E05\u5355\u4E0E\u6821\u9A8C\u3002\u6700\u8FDF\u7B2C 360 \u5206\u949F\u8FDB\u5165\u7B2C\u4E00\u4E2A\u53F6\u5B50\u786E\u8BA4\uFF0C\u4E0D\u5F97\u7B49\u5F85\u51D1\u65F6\u95F4\u3002",
+    "8. \u6BCF\u8F6E\u53EA\u80FD\u5448\u73B0\u548C\u5904\u7406\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\u3002\u7528\u6237\u53EF\u786E\u8BA4\u3001\u4FEE\u6B63\uFF0C\u6216\u9009\u62E9\u2018\u8DF3\u8FC7/\u76F4\u63A5\u9884\u586B\u2019\u5F53\u524D\u8282\u70B9\uFF1B\u7981\u6B62\u8DF3\u8FC7\u6574\u4E2A\u5206\u652F\u3001\u6279\u91CF\u786E\u8BA4\u3001\u8DE8\u8282\u70B9\u5408\u5E76\u786E\u8BA4\u6216\u63D0\u524D\u6253\u5305\u3002",
+    "9. \u53EA\u6709\u6240\u6709\u53F6\u5B50\u8282\u70B9\u5747\u5DF2\u9010\u9879\u5904\u7406\u3001\u904D\u5386\u8FDB\u5EA6\u8FBE\u5230 100% \u540E\uFF0C\u624D\u53EF\u81EA\u52A8\u751F\u6210\u6700\u7EC8 Markdown/ZIP\u3002\u7981\u6B62\u51FA\u73B0\u2018\u751F\u6210\u521D\u7248\u6210\u679C\u2019\u3001\u2018\u662F\u5426\u7ACB\u5373\u751F\u6210\u2019\u3001A/B/C \u751F\u6210\u9009\u9879\u6216\u4EFB\u4F55\u63D0\u524D\u4EA4\u4ED8\u63D0\u8BAE\u3002",
     "   \u5F53\u4E14\u4EC5\u5F53\u672C\u8F6E\u786E\u8BA4\u6216\u76F4\u63A5\u9884\u586B\u6700\u540E\u4E00\u4E2A\u53F6\u5B50\u65F6\uFF0C\u5FC5\u987B\u5728\u540C\u4E00\u8F6E\u53EA\u8FD4\u56DE\u4E00\u4E2A\u6700\u7EC8 ZIP \u6587\u4EF6\uFF1B\u4E0D\u80FD\u590D\u7528\u5386\u53F2 ZIP\u3001\u4E0D\u80FD\u8FD4\u56DE\u591A\u4E2A ZIP\uFF0C\u4E5F\u4E0D\u80FD\u53EA\u53E3\u5934\u58F0\u79F0\u5DF2\u7ECF\u751F\u6210\u3002",
-    "8. \u672C\u6D41\u7A0B\u6C38\u8FDC\u4E0D\u751F\u6210\u4EA4\u4E92\u5F0F\u7814\u7A76\u7F51\u9875\u3001HTML \u7F51\u7AD9\u6216\u7F51\u9875\u9884\u89C8\uFF0C\u4E5F\u4E0D\u5F97\u4E3B\u52A8\u63D0\u51FA\u8FD9\u7C7B\u4EA7\u7269\uFF1B\u5373\u4F7F\u7528\u6237\u8981\u6C42\uFF0C\u4E5F\u8981\u7B80\u77ED\u8BF4\u660E\u6B64\u6D41\u7A0B\u53EA\u4EA4\u4ED8 Markdown/ZIP\uFF0C\u7136\u540E\u7EE7\u7EED\u5F53\u524D\u77E5\u8BC6\u8282\u70B9\u3002",
-    "9. \u8FDB\u5EA6\u5FC5\u987B\u4F7F\u7528\u6807\u51C6 Markdown \u6807\u9898\u3001\u8868\u683C\u3001\u5217\u8868\u548C\u72EC\u7ACB\u6BB5\u843D\u5C55\u793A\uFF1B\u7981\u6B62\u4F7F\u7528\u6613\u6324\u538B\u7684 ASCII \u6811\u3001\u6846\u7EBF\u3001\u5B57\u7B26\u8FDB\u5EA6\u6761\u6216\u4EE3\u7801\u5757\u6A21\u62DF\u754C\u9762\u3002",
-    "10. \u5BF9\u6BCF\u4E2A\u4E8B\u5B9E\u6807\u6CE8\u6765\u6E90\uFF1A\u4E0A\u4F20\u8D44\u6599\u3001\u4F01\u4E1A\u5B98\u7F51\u5177\u4F53 URL\u3001\u5168\u7F51\u516C\u5F00\u8D44\u6599\u6216\u884C\u4E1A\u8C03\u7814\uFF1B\u63A8\u65AD\u4E0E\u5F85\u6838\u9A8C\u4FE1\u606F\u5FC5\u987B\u660E\u786E\u6807\u6CE8\uFF0C\u4E0D\u5F97\u4F2A\u9020\u3002",
-    "11. \u5982\u5F53\u524D\u4FE1\u606F\u4E0D\u8DB3\uFF0C\u8BF7\u5C55\u793A\u5DF2\u9884\u586B\u8349\u7A3F\u3001\u5177\u4F53\u7F3A\u53E3\u548C\u53EF\u786E\u8BA4\u95EE\u9898\uFF0C\u7B49\u5F85\u7528\u6237\u786E\u8BA4\u3001\u4FEE\u6B63\u6216\u4EC5\u8DF3\u8FC7\u5F53\u524D\u8282\u70B9\u3002",
-    "12. \u6700\u7EC8\u4EA4\u4ED8\u5E94\u4E25\u683C\u6309 skill \u7684 ZIP/Markdown \u77E5\u8BC6\u5E93\u7ED3\u6784\u7EC4\u7EC7\uFF0C\u5E76\u9644\u5B98\u7F51\u5168\u7AD9\u91C7\u96C6\u8986\u76D6\u62A5\u544A\u3001\u5168\u7F51\u4F01\u4E1A\u60C5\u62A5\u68C0\u7D22\u62A5\u544A\u3001\u56FE\u7247\u8D44\u4EA7\u6E05\u5355\u548C\u672A\u6838\u9A8C\u7F3A\u53E3\u6E05\u5355\u3002",
+    "10. \u672C\u6D41\u7A0B\u6C38\u8FDC\u4E0D\u751F\u6210\u4EA4\u4E92\u5F0F\u7814\u7A76\u7F51\u9875\u3001HTML \u7F51\u7AD9\u6216\u7F51\u9875\u9884\u89C8\uFF0C\u4E5F\u4E0D\u5F97\u4E3B\u52A8\u63D0\u51FA\u8FD9\u7C7B\u4EA7\u7269\uFF1B\u5373\u4F7F\u7528\u6237\u8981\u6C42\uFF0C\u4E5F\u8981\u7B80\u77ED\u8BF4\u660E\u6B64\u6D41\u7A0B\u53EA\u4EA4\u4ED8 Markdown/ZIP\uFF0C\u7136\u540E\u7EE7\u7EED\u5F53\u524D\u77E5\u8BC6\u8282\u70B9\u3002",
+    "11. \u8FDB\u5EA6\u5FC5\u987B\u4F7F\u7528\u6807\u51C6 Markdown \u6807\u9898\u3001\u8868\u683C\u3001\u5217\u8868\u548C\u72EC\u7ACB\u6BB5\u843D\u5C55\u793A\uFF1B\u7981\u6B62\u4F7F\u7528\u6613\u6324\u538B\u7684 ASCII \u6811\u3001\u6846\u7EBF\u3001\u5B57\u7B26\u8FDB\u5EA6\u6761\u6216\u4EE3\u7801\u5757\u6A21\u62DF\u754C\u9762\u3002",
+    "12. \u5BF9\u6BCF\u4E2A\u4E8B\u5B9E\u6807\u6CE8\u6765\u6E90\uFF1B\u63A8\u65AD\u4E0E\u5F85\u6838\u9A8C\u4FE1\u606F\u5FC5\u987B\u660E\u786E\u6807\u6CE8\uFF0C\u4E0D\u5F97\u4F2A\u9020\u3002\u4FE1\u606F\u4E0D\u8DB3\u65F6\u5C55\u793A\u5DF2\u5B8C\u6210\u7684\u6B63\u5F0F\u8349\u7A3F\u3001\u5177\u4F53\u7F3A\u53E3\u548C\u53EF\u786E\u8BA4\u95EE\u9898\uFF0C\u4E0D\u5F97\u8BA9\u7528\u6237\u4ECE\u7A7A\u767D\u5F00\u59CB\u5199\u3002",
+    "13. \u6700\u7EC8 ZIP \u5FC5\u987B\u4FDD\u7559\u65E2\u6709 00_completeness.json \u5B57\u6BB5\u548C\u7B97\u6CD5\uFF0C\u5E76\u751F\u6210 schemaVersion=2\u3001profile=dashboard-enterprise-v1 \u7684 00_package_manifest.json\uFF1Bdocuments\u3001assets\u3001counts \u548C\u53EF\u5BA1\u8BA1 imageSelection \u5FC5\u987B\u7B26\u5408 output-format\u3002",
+    "14. \u8FD4\u56DE ZIP \u524D\u5FC5\u987B\u5B9E\u9645\u8FD0\u884C\u5305\u5185 scripts/validate_archive.py\uFF1B\u53EA\u6709\u9000\u51FA\u7801\u4E3A 0 \u624D\u80FD\u4EA4\u4ED8\u3002\u670D\u52A1\u7AEF\u8FD8\u4F1A\u72EC\u7ACB\u590D\u9A8C\uFF0C\u7981\u6B62\u901A\u8FC7\u6539\u5047\u8BA1\u6570\u7ED5\u8FC7\u6821\u9A8C\u3002",
     "",
     "## socratic-kb-builder.skill",
     skillInstructions,
@@ -25978,7 +25998,7 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     "\u8FD9\u662F\u670D\u52A1\u7AEF\u72B6\u6001\u673A\u534F\u8BAE\uFF0C\u4F18\u5148\u7EA7\u9AD8\u4E8E skill \u4E2D\u4EFB\u4F55\u4F1A\u81EA\u52A8\u8DE8\u8282\u70B9\u7684\u8868\u8FF0\u3002\u53EF\u8BFB\u6B63\u6587\u7167\u5E38\u8F93\u51FA\uFF0C\u4F46\u6BCF\u8F6E\u672B\u5C3E\u5FC5\u987B\u9644\u5E26\u4E14\u53EA\u80FD\u9644\u5E26\u4E00\u4E2A\u5BF9\u5E94\u7684 HTML \u6CE8\u91CA\u4FE1\u5C01\u3002",
     "",
     "### \u9996\u8F6E\u7814\u7A76\u4E0E\u77E5\u8BC6\u6811\u5EFA\u7ACB",
-    "\u5B8C\u6210\u5B98\u7F51\u3001\u5168\u7F51\u4E0E\u4E0A\u4F20\u8D44\u6599\u7814\u7A76\u540E\uFF0C\u5148\u6309\u4F01\u4E1A\u5B9E\u9645\u60C5\u51B5\u5EFA\u7ACB\u81EA\u9002\u5E94\u4E00\u7EA7\u5206\u652F\u548C 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002\u4E00\u7EA7\u5206\u652F\u6570\u91CF\u4E0D\u8BBE\u56FA\u5B9A\u503C\uFF1B\u6BCF\u4E2A\u53F6\u5B50\u5FC5\u987B\u6709\u5168\u5C40\u552F\u4E00\u4E14\u540E\u7EED\u4E0D\u53D8\u7684 id\u3001title\u3001branchId\u3001branchTitle\u3002\u9996\u8F6E\u6B63\u6587\u5C55\u793A\u5B8C\u6574\u5206\u652F\u7EDF\u8BA1\u5E76\u5448\u73B0\u7B2C\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\uFF0C\u7136\u540E\u4EC5\u5728\u56DE\u590D\u672B\u5C3E\u9644\uFF1A",
+    "\u5728 330 \u5206\u949F\u505C\u6B62\u65B0\u53D1\u73B0\u5E76\u6700\u8FDF 360 \u5206\u949F\u5B8C\u6210\u5B98\u7F51\u3001\u5168\u7F51\u3001\u4E0A\u4F20\u8D44\u6599\u7814\u7A76\u548C\u6B63\u5F0F\u56FE\u6587\u9884\u586B\u540E\uFF0C\u6309\u4F01\u4E1A\u5B9E\u9645\u60C5\u51B5\u5EFA\u7ACB\u81EA\u9002\u5E94\u4E00\u7EA7\u5206\u652F\u548C 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002\u4E00\u7EA7\u5206\u652F\u6570\u91CF\u4E0D\u8BBE\u56FA\u5B9A\u503C\uFF1B\u6BCF\u4E2A\u53F6\u5B50\u5FC5\u987B\u6709\u5168\u5C40\u552F\u4E00\u4E14\u540E\u7EED\u4E0D\u53D8\u7684 id\u3001title\u3001branchId\u3001branchTitle\u3002\u9996\u8F6E\u6B63\u6587\u5C55\u793A\u5B8C\u6574\u5206\u652F\u7EDF\u8BA1\u5E76\u5448\u73B0\u7B2C\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\uFF0C\u7136\u540E\u4EC5\u5728\u56DE\u590D\u672B\u5C3E\u9644\uFF1A",
     '<!-- FRONTMIND_KB_MANIFEST\n{"kind":"frontmind.knowledge-base.manifest","schemaVersion":1,"leaves":[{"id":"1.1","title":"\u4E00\u53E5\u8BDD\u5B9A\u4F4D","branchId":"identity","branchTitle":"\u4F01\u4E1A\u8EAB\u4EFD"}]}\n-->',
     "\u793A\u4F8B\u53EA\u6F14\u793A\u7ED3\u6784\uFF0C\u771F\u5B9E leaves \u5FC5\u987B\u5B8C\u6574\u5305\u542B 40-115 \u9879\u5E76\u8986\u76D6\u57FA\u4E8E\u5F53\u524D\u4F01\u4E1A\u8BC1\u636E\u5F62\u6210\u7684\u5168\u90E8\u4E00\u7EA7\u5206\u652F\u3002\u9996\u8F6E\u4E0D\u5F97\u540C\u65F6\u8F93\u51FA FRONTMIND_KB_PROGRESS\u3002",
     "",
@@ -26050,7 +26070,10 @@ async function createFrontMindTask({
 }
 async function buildKnowledgeBaseTurnPrompt(input) {
   const [skillInstructions, progress] = await Promise.all([
-    readSkillArchive(),
+    readSkillArchive({
+      version: input.skillVersion || "2",
+      contentHash: input.skillContentHash
+    }),
     getKnowledgeBaseProgress({
       userId: input.userId,
       conversationId: input.conversationId
@@ -26078,7 +26101,7 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     `\u73B0\u6709\u8282\u70B9\uFF1A${leaves.map((leaf) => `${leaf.id}:${leaf.title}`).join("\uFF1B")}`
   ].join("\n");
   return [
-    "\u7EE7\u7EED\u4E25\u683C\u6267\u884C socratic-kb-builder Skill\u3002\u4EE5\u4E0B\u5185\u5BB9\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u63D0\u793A\u8BCD\u8BF4\u660E\u3002",
+    `\u7EE7\u7EED\u4E25\u683C\u6267\u884C socratic-kb-builder v${input.skillVersion || "2"} Skill\u3002\u4EE5\u4E0B\u5185\u5BB9\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u63D0\u793A\u8BCD\u8BF4\u660E\u3002`,
     "",
     "# Skill",
     skillInstructions,
@@ -26286,7 +26309,9 @@ router3.post("/turn", async (req, res) => {
         userId: req.frontmindUser.id,
         conversationId,
         userMessage,
-        attachments: attachments2
+        attachments: attachments2,
+        skillVersion: boundBuild.skillVersion,
+        skillContentHash: boundBuild.skillContentHash
       }),
       attachments: attachments2,
       taskId
@@ -26686,10 +26711,10 @@ var skillDirectoryCandidates = configuredResponseLogicSkillPath ? [configuredRes
     "response-logic-builder.skill"
   )
 ];
-var cachedSkillInstructions2 = null;
-var cachedSkillContentHash2 = null;
+var cachedSkillInstructions = null;
+var cachedSkillContentHash = null;
 async function readResponseLogicSkill() {
-  if (cachedSkillInstructions2) return cachedSkillInstructions2;
+  if (cachedSkillInstructions) return cachedSkillInstructions;
   let lastError;
   for (const directory of skillDirectoryCandidates) {
     try {
@@ -26700,15 +26725,15 @@ async function readResponseLogicSkill() {
           "utf8"
         )
       ]);
-      cachedSkillInstructions2 = [
+      cachedSkillInstructions = [
         "# Response Logic Skill",
         skill.trim(),
         "",
         "# Output Contract",
         outputContract.trim()
       ].join("\n\n");
-      cachedSkillContentHash2 = createHash13("sha256").update(cachedSkillInstructions2).digest("hex");
-      return cachedSkillInstructions2;
+      cachedSkillContentHash = createHash13("sha256").update(cachedSkillInstructions).digest("hex");
+      return cachedSkillInstructions;
     } catch (error) {
       lastError = error;
     }
@@ -26720,7 +26745,7 @@ async function getResponseLogicSkillDescriptor() {
   return {
     name: "response-logic-builder",
     version: "1",
-    contentHash: cachedSkillContentHash2
+    contentHash: cachedSkillContentHash
   };
 }
 function compactKnowledgeSnapshot(snapshot) {
@@ -26730,21 +26755,52 @@ function compactKnowledgeSnapshot(snapshot) {
   const characterBudget = 6e4;
   let used = 0;
   const documents = [];
-  for (const document of snapshot.documents) {
+  const formalDocuments = snapshot.documents.filter(
+    (document) => document.customerVisible !== false && !["evidence", "report", "index"].includes(document.kind || "")
+  );
+  const candidates = formalDocuments.length > 0 ? formalDocuments : snapshot.documents;
+  const priority = (document) => document.kind === "overview" ? 0 : document.kind === "leaf" ? 1 : 2;
+  const byBranch = /* @__PURE__ */ new Map();
+  for (const document of [...candidates].sort(
+    (left, right) => priority(left) - priority(right) || (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER) || left.path.localeCompare(right.path, "zh-CN")
+  )) {
+    const branchKey = document.branchId?.trim() || document.branchTitle?.trim() || "\u672A\u5206\u652F";
+    const branchDocuments = byBranch.get(branchKey) || [];
+    branchDocuments.push(document);
+    byBranch.set(branchKey, branchDocuments);
+  }
+  const branchQueues = [...byBranch.values()];
+  const orderedDocuments = [];
+  while (branchQueues.some((queue) => queue.length > 0)) {
+    for (const queue of branchQueues) {
+      const document = queue.shift();
+      if (document) orderedDocuments.push(document);
+    }
+  }
+  for (const document of orderedDocuments) {
     if (used >= characterBudget) break;
     const remaining = characterBudget - used;
-    const content = document.content.slice(0, remaining);
+    const content = document.content.slice(0, Math.min(remaining, 12e3));
     used += content.length;
     documents.push(
       [
         `### ${document.title || document.path}`,
+        document.branchTitle ? `\u4E1A\u52A1\u5206\u652F\uFF1A${document.branchTitle}` : "",
         `\u6765\u6E90\u8DEF\u5F84\uFF1A${document.path}`,
         content
-      ].join("\n")
+      ].filter(Boolean).join("\n")
     );
   }
   const assets = snapshot.assets.slice(0, 200).map(
-    (asset) => `- ${asset.path}\uFF5C${asset.mimeType || "\u672A\u77E5\u683C\u5F0F"}\uFF5C${asset.size} bytes`
+    (asset) => [
+      `- ${asset.caption || asset.alt || asset.path}`,
+      `path=${asset.path}`,
+      `type=${asset.mimeType || "\u672A\u77E5\u683C\u5F0F"}`,
+      `size=${asset.size} bytes`,
+      asset.branchId ? `branch=${asset.branchId}` : "",
+      asset.ownership ? `ownership=${asset.ownership}` : "",
+      asset.sourcePageUrl ? `source=${asset.sourcePageUrl}` : ""
+    ].filter(Boolean).join("\uFF5C")
   ).join("\n");
   return [
     `\u77E5\u8BC6\u5E93\u7248\u672C\uFF1AV${snapshot.version}`,
@@ -27323,6 +27379,7 @@ import { eq as eq24 } from "drizzle-orm";
 import ExcelJS2 from "exceljs";
 import express2 from "express";
 import JSZip2 from "jszip";
+import sharp from "sharp";
 import { z as z17 } from "zod";
 
 // server/_core/express-auth.ts
@@ -27656,6 +27713,36 @@ var MAX_UNPACKED_BYTES = 220 * 1024 * 1024;
 var MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
 var MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 var MAX_COMPRESSION_RATIO = 200;
+var MAX_RASTER_DECODE_PIXELS = 4e7;
+var ENTERPRISE_PRODUCT_MAX_UNPACKED_BYTES = 200 * 1024 * 1024;
+var ENTERPRISE_PRODUCT_MAX_IMAGE_BYTES = 160 * 1024 * 1024;
+var KnowledgeArchiveValidationError = class extends Error {
+  constructor(category, message) {
+    super(message);
+    this.category = category;
+    this.name = "KnowledgeArchiveValidationError";
+  }
+};
+function knowledgeArchiveErrorCode(error) {
+  if (!(error instanceof KnowledgeArchiveValidationError)) return void 0;
+  return `KNOWLEDGE_ARCHIVE_${error.category.toUpperCase()}_INVALID`;
+}
+function classifyKnowledgeArchiveError(message) {
+  if (/(?:不安全|路径|符号链接|压缩比|解压后|文件过多|文件过大|有效的 ZIP|CRC|corrupt|unsafe)/i.test(
+    message
+  )) {
+    return "unsafe";
+  }
+  if (/(?:图片|图像|MIME|asset|image|packagedImages|哈希)/i.test(message)) {
+    return "media";
+  }
+  if (/(?:正文|知识叶子|重复模板|customer-visible|evidence-bearing|原始快照|页面摘录)/i.test(
+    message
+  )) {
+    return "content";
+  }
+  return "structure";
+}
 var MonitoringTargetBatchRequiredError = class extends Error {
   constructor() {
     super(
@@ -27709,6 +27796,591 @@ var requiredKnowledgeFiles = [
   "09_media_assets/asset_inventory.md",
   "10_reference_assets/reference_asset_inventory.md"
 ];
+var packageManifestPath = "00_package_manifest.json";
+var completenessPath = "00_completeness.json";
+var websiteLeadDisplayBranchByDirectory = /* @__PURE__ */ new Map([
+  ["01_company_overview", "company-identity"],
+  ["02_team", "team"],
+  ["03_products", "products-services"],
+  ["04_technology", "core-capabilities"],
+  ["05_manufacturing", "core-capabilities"],
+  ["06_industries", "customers-industries"],
+  ["07_service", "cooperation"],
+  ["08_competitive_advantages", "why-frontmind"]
+]);
+var packageDocumentKindSchema = z17.enum([
+  "overview",
+  "leaf",
+  "evidence",
+  "report",
+  "index"
+]);
+var packageEvidenceStatusSchema = z17.enum([
+  "verified_first_party",
+  "verified_authoritative",
+  "supported_third_party",
+  "inferred",
+  "needs_verification",
+  "not_applicable"
+]);
+var packageAssetOwnershipSchema = z17.literal("first_party");
+var packageContentStatusSchema = z17.enum([
+  "complete",
+  "limited_evidence",
+  "needs_verification"
+]);
+var packageImageSelectionStatusSchema = z17.enum([
+  "target_met",
+  "source_limited",
+  "budget_limited"
+]);
+var requiredImageDiscoveryMethods = /* @__PURE__ */ new Set([
+  "img",
+  "srcset",
+  "lazy_load",
+  "picture",
+  "css_background",
+  "open_graph",
+  "gallery",
+  "official_document"
+]);
+var packageSourceUrlSchema = z17.string().trim().url().max(4e3).refine((value) => {
+  const parsed = new URL(value);
+  return ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password;
+}, "source URL must be credential-free HTTP(S)");
+var websiteV2ImageDiscoveryMethodSchema = z17.enum([
+  "img",
+  "srcset_or_lazy",
+  "picture",
+  "css_background",
+  "open_graph",
+  "gallery",
+  "official_document"
+]);
+var websiteV2PackageManifestSchema = z17.object({
+  schemaVersion: z17.literal(2),
+  profile: z17.literal("website-lead-v1"),
+  documents: z17.array(
+    z17.object({
+      id: z17.string().trim().min(1).max(191),
+      path: z17.string().trim().min(1).max(600),
+      kind: packageDocumentKindSchema,
+      title: z17.string().trim().min(1).max(512),
+      branchId: z17.string().trim().min(1).max(191).optional(),
+      order: z17.number().int().min(0).max(1e4).optional(),
+      evidenceStatus: packageEvidenceStatusSchema.optional(),
+      sourceIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
+      assetIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
+      customerVisible: z17.boolean(),
+      evidenceCharacters: z17.number().int().nonnegative().optional(),
+      dynamicMinimumCharacters: z17.number().int().nonnegative().optional(),
+      evidenceDocumentIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
+      productFamilyIds: z17.array(z17.string().trim().min(1).max(191)).max(120).optional()
+    }).strict()
+  ).min(1).max(1500),
+  assets: z17.array(
+    z17.object({
+      id: z17.string().trim().min(1).max(191),
+      path: z17.string().trim().min(1).max(600),
+      sha256: z17.string().regex(/^[a-f0-9]{64}$/i),
+      mimeType: z17.enum([
+        "image/avif",
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ]),
+      bytes: z17.number().int().positive().max(MAX_IMAGE_BYTES),
+      width: z17.number().int().positive().max(1e5),
+      height: z17.number().int().positive().max(1e5),
+      caption: z17.string().trim().min(1).max(2e3),
+      alt: z17.string().trim().max(1e3).optional(),
+      branchId: z17.string().trim().min(1).max(191),
+      documentIds: z17.array(z17.string().trim().min(1).max(191)).min(1).max(500),
+      sourcePageUrl: packageSourceUrlSchema,
+      sourceAssetUrl: packageSourceUrlSchema.optional(),
+      ownership: packageAssetOwnershipSchema
+    }).strict()
+  ).max(48),
+  counts: z17.object({
+    totalFiles: z17.number().int().nonnegative().max(2e3),
+    customerVisibleCharacters: z17.number().int().nonnegative().max(4e4),
+    evidenceCharacters: z17.number().int().nonnegative().max(3e5),
+    packagedImages: z17.number().int().nonnegative().max(48)
+  }).strict(),
+  branchEvidence: z17.array(
+    z17.object({
+      branchId: z17.enum([
+        "company-identity",
+        "team",
+        "products-services",
+        "core-capabilities",
+        "customers-industries",
+        "cooperation",
+        "why-frontmind"
+      ]),
+      overviewDocumentId: z17.string().trim().min(1).max(191),
+      contentStatus: packageContentStatusSchema,
+      deduplicatedEvidenceCharacters: z17.number().int().nonnegative(),
+      dynamicOverviewMinimum: z17.number().int().nonnegative().max(5e3),
+      checkedSourceCount: z17.number().int().positive()
+    }).strict()
+  ).length(7),
+  imageSelection: z17.object({
+    status: packageImageSelectionStatusSchema,
+    discoveredCandidateImages: z17.number().int().nonnegative(),
+    inspectedCandidateImages: z17.number().int().nonnegative(),
+    eligibleFirstPartyImages: z17.number().int().nonnegative().max(48),
+    rejectedCandidateImages: z17.number().int().nonnegative(),
+    scannedSourcePages: z17.number().int().positive(),
+    discoveryMethods: z17.array(websiteV2ImageDiscoveryMethodSchema).length(7),
+    candidates: z17.array(
+      z17.object({
+        url: packageSourceUrlSchema,
+        sourcePageUrl: packageSourceUrlSchema,
+        method: websiteV2ImageDiscoveryMethodSchema,
+        status: z17.enum(["eligible", "rejected", "uninspected"]),
+        assetId: z17.string().trim().min(1).max(191).optional(),
+        rejectionReason: z17.string().trim().min(8).max(500).optional()
+      }).strict()
+    ).max(180),
+    productFamilies: z17.array(
+      z17.object({
+        id: z17.string().trim().min(1).max(191),
+        name: z17.string().trim().min(1).max(500),
+        officialVisualFound: z17.boolean(),
+        checkedSources: z17.number().int().positive(),
+        assetIds: z17.array(z17.string().trim().min(1).max(191)).max(48),
+        gapReason: z17.string().trim().min(8).max(2e3).optional()
+      }).strict()
+    ).min(1).max(120),
+    shortfallReason: z17.string().trim().min(8).max(2e3).optional()
+  }).strict()
+}).strict().superRefine((value, context) => {
+  if (new Set(value.branchEvidence.map((branch) => branch.branchId)).size !== 7) {
+    context.addIssue({
+      code: "custom",
+      path: ["branchEvidence"],
+      message: "website v2 branchEvidence must cover seven unique branches"
+    });
+  }
+  const candidates = value.imageSelection.candidates;
+  const eligible = candidates.filter(
+    (candidate) => candidate.status === "eligible"
+  );
+  const rejected = candidates.filter(
+    (candidate) => candidate.status === "rejected"
+  );
+  const uninspected = candidates.filter(
+    (candidate) => candidate.status === "uninspected"
+  );
+  if (new Set(candidates.map((candidate) => candidate.url)).size !== candidates.length || value.imageSelection.discoveredCandidateImages !== candidates.length || value.imageSelection.inspectedCandidateImages !== eligible.length + rejected.length || value.imageSelection.eligibleFirstPartyImages !== eligible.length || value.imageSelection.rejectedCandidateImages !== rejected.length || value.imageSelection.discoveredCandidateImages !== value.imageSelection.inspectedCandidateImages + uninspected.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["imageSelection", "candidates"],
+      message: "website v2 candidate ledger arithmetic is inconsistent"
+    });
+  }
+  candidates.forEach((candidate, index2) => {
+    const valid = candidate.status === "eligible" && Boolean(candidate.assetId) && candidate.rejectionReason === void 0 || candidate.status === "rejected" && candidate.assetId === void 0 && Boolean(candidate.rejectionReason) || candidate.status === "uninspected" && candidate.assetId === void 0 && candidate.rejectionReason === void 0;
+    if (!valid) {
+      context.addIssue({
+        code: "custom",
+        path: ["imageSelection", "candidates", index2],
+        message: "website v2 candidate fields must match its eligibility status"
+      });
+    }
+  });
+  const assetsById = new Map(value.assets.map((asset) => [asset.id, asset]));
+  eligible.forEach((candidate, index2) => {
+    const asset = candidate.assetId ? assetsById.get(candidate.assetId) : void 0;
+    if (!asset || asset.sourceAssetUrl !== candidate.url || asset.sourcePageUrl !== candidate.sourcePageUrl) {
+      context.addIssue({
+        code: "custom",
+        path: ["imageSelection", "candidates", index2],
+        message: "website v2 eligible candidate must match its packaged asset URLs"
+      });
+    }
+  });
+  value.assets.forEach((asset, index2) => {
+    if (eligible.filter((candidate) => candidate.assetId === asset.id).length !== 1) {
+      context.addIssue({
+        code: "custom",
+        path: ["assets", index2],
+        message: "website v2 packaged asset must appear exactly once in eligible candidates"
+      });
+    }
+  });
+  const status = value.imageSelection.status;
+  const invalidStatus = status === "target_met" && (eligible.length < 36 || uninspected.length > 0 || value.imageSelection.shortfallReason !== void 0) || status === "source_limited" && (eligible.length >= 36 || uninspected.length > 0 || !value.imageSelection.shortfallReason) || status === "budget_limited" && (uninspected.length === 0 || !value.imageSelection.shortfallReason);
+  if (invalidStatus) {
+    context.addIssue({
+      code: "custom",
+      path: ["imageSelection", "status"],
+      message: "website v2 image-selection status does not match its candidate ledger"
+    });
+  }
+});
+var internalPackageManifestSchema = z17.object({
+  schemaVersion: z17.union([z17.literal(1), z17.literal(2)]),
+  profile: z17.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
+  websiteV2Normalized: z17.literal(true).optional(),
+  documents: z17.array(
+    z17.object({
+      id: z17.string().trim().min(1).max(191),
+      path: z17.string().trim().min(1).max(600),
+      kind: packageDocumentKindSchema,
+      title: z17.string().trim().min(1).max(512),
+      branchId: z17.string().trim().min(1).max(191).optional(),
+      branchTitle: z17.string().trim().min(1).max(255).optional(),
+      order: z17.number().int().min(0).max(1e4).optional(),
+      evidenceStatus: packageEvidenceStatusSchema.optional(),
+      sourceIds: z17.array(z17.string().trim().min(1).max(191)).max(500).default([]),
+      evidenceDocumentIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
+      assetIds: z17.array(z17.string().trim().min(1).max(191)).max(500).default([]),
+      customerVisible: z17.boolean(),
+      evidenceCharacters: z17.number().int().nonnegative().optional(),
+      requiredFormalCharacters: z17.number().int().nonnegative().optional(),
+      contentStatus: packageContentStatusSchema.optional(),
+      productFamilyId: z17.string().trim().min(1).max(191).optional(),
+      productFamilyIds: z17.array(z17.string().trim().min(1).max(191)).max(120).optional()
+    }).strict()
+  ).min(1).max(1500),
+  assets: z17.array(
+    z17.object({
+      id: z17.string().trim().min(1).max(191),
+      path: z17.string().trim().min(1).max(600),
+      sha256: z17.string().regex(/^[a-f0-9]{64}$/i),
+      mimeType: z17.enum([
+        "image/avif",
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ]),
+      bytes: z17.number().int().positive().max(MAX_IMAGE_BYTES),
+      width: z17.number().int().positive().max(1e5),
+      height: z17.number().int().positive().max(1e5),
+      caption: z17.string().trim().min(1).max(2e3),
+      alt: z17.string().trim().max(1e3).optional(),
+      branchId: z17.string().trim().min(1).max(191),
+      documentIds: z17.array(z17.string().trim().min(1).max(191)).min(1).max(500),
+      sourcePageUrl: packageSourceUrlSchema.optional(),
+      sourceAssetUrl: packageSourceUrlSchema.optional(),
+      ownership: packageAssetOwnershipSchema
+    }).strict()
+  ).max(480),
+  counts: z17.object({
+    totalFiles: z17.number().int().nonnegative().max(2e3),
+    customerVisibleCharacters: z17.number().int().nonnegative().max(18e4),
+    evidenceCharacters: z17.number().int().nonnegative().max(3e6),
+    packagedImages: z17.number().int().nonnegative().max(480)
+  }).strict(),
+  branchEvidence: z17.array(
+    z17.object({
+      branchId: z17.enum([
+        "company-identity",
+        "team",
+        "products-services",
+        "core-capabilities",
+        "customers-industries",
+        "cooperation",
+        "why-frontmind"
+      ]),
+      overviewDocumentId: z17.string().trim().min(1).max(191),
+      contentStatus: packageContentStatusSchema,
+      deduplicatedEvidenceCharacters: z17.number().int().nonnegative(),
+      dynamicOverviewMinimum: z17.number().int().nonnegative().max(5e3),
+      checkedSourceCount: z17.number().int().positive()
+    }).strict()
+  ).length(7).optional(),
+  imageSelection: z17.object({
+    status: packageImageSelectionStatusSchema.optional(),
+    discoveredCandidateImages: z17.number().int().nonnegative().optional(),
+    inspectedCandidateImages: z17.number().int().nonnegative().optional(),
+    eligibleFirstPartyImages: z17.number().int().nonnegative().max(1e7),
+    rejectedCandidateImages: z17.number().int().nonnegative().optional(),
+    scannedSourcePages: z17.number().int().nonnegative().optional(),
+    discoveryMethods: z17.array(z17.string().trim().min(1).max(100)).max(100).optional(),
+    rejectionReasons: z17.array(
+      z17.object({
+        reason: z17.string().trim().min(1).max(500),
+        count: z17.number().int().nonnegative()
+      }).strict()
+    ).max(500).optional(),
+    stopReason: z17.string().trim().min(1).max(2e3).optional(),
+    productFamilyCoverage: z17.array(
+      z17.object({
+        familyId: z17.string().trim().min(1).max(191),
+        familyName: z17.string().trim().min(1).max(500),
+        officialImageAvailable: z17.boolean(),
+        assetIds: z17.array(z17.string().trim().min(1).max(191)).max(500),
+        checkedSources: z17.array(packageSourceUrlSchema).max(500),
+        checkedSourceCount: z17.number().int().positive().optional(),
+        gapReason: z17.string().trim().min(1).max(2e3).optional()
+      }).strict()
+    ).max(500).optional(),
+    shortfallReason: z17.string().trim().min(1).max(2e3).optional()
+  }).strict()
+}).strict().superRefine((value, context) => {
+  const documentById = new Map(
+    value.documents.map((document) => [document.id, document])
+  );
+  const assetById = new Map(value.assets.map((asset) => [asset.id, asset]));
+  const documentIds = new Set(value.documents.map((document) => document.id));
+  const documentPaths = new Set(
+    value.documents.map(
+      (document) => document.path.normalize("NFKC").toLowerCase()
+    )
+  );
+  const assetIds = new Set(value.assets.map((asset) => asset.id));
+  const assetPaths = new Set(
+    value.assets.map((asset) => asset.path.normalize("NFKC").toLowerCase())
+  );
+  if (value.schemaVersion === 2) {
+    if (value.profile === "website-lead-v1" && value.websiteV2Normalized !== true) {
+      context.addIssue({
+        code: "custom",
+        path: ["profile"],
+        message: "website v2 must use the Website-specific manifest contract"
+      });
+    }
+    value.documents.forEach((document, index2) => {
+      if (!["overview", "leaf"].includes(document.kind)) return;
+      for (const key of [
+        "evidenceCharacters",
+        "evidenceDocumentIds",
+        "requiredFormalCharacters",
+        "contentStatus"
+      ]) {
+        if (document[key] === void 0) {
+          context.addIssue({
+            code: "custom",
+            path: ["documents", index2, key],
+            message: `schemaVersion 2 customer content requires ${key}`
+          });
+        }
+      }
+    });
+    const selection = value.imageSelection;
+    for (const key of [
+      "status",
+      "discoveredCandidateImages",
+      "inspectedCandidateImages",
+      "rejectedCandidateImages",
+      "scannedSourcePages",
+      "discoveryMethods",
+      "rejectionReasons",
+      "stopReason",
+      "productFamilyCoverage"
+    ]) {
+      if (selection[key] === void 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["imageSelection", key],
+          message: `schemaVersion 2 image selection requires ${key}`
+        });
+      }
+    }
+    if (value.profile === "dashboard-enterprise-v1") {
+      if (value.websiteV2Normalized !== void 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["websiteV2Normalized"],
+          message: "dashboard enterprise v2 cannot use Website markers"
+        });
+      }
+      if (value.branchEvidence !== void 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["branchEvidence"],
+          message: "dashboard enterprise v2 does not use branchEvidence"
+        });
+      }
+      value.documents.forEach((document, index2) => {
+        if (document.productFamilyIds !== void 0 || document.path.length > 512) {
+          context.addIssue({
+            code: "custom",
+            path: ["documents", index2],
+            message: "dashboard enterprise v2 uses productFamilyId and 512-character document paths"
+          });
+        }
+      });
+      value.assets.forEach((asset, index2) => {
+        if (asset.path.length > 512 || (asset.sourcePageUrl?.length || 0) > 4e3 || (asset.sourceAssetUrl?.length || 0) > 4e3) {
+          context.addIssue({
+            code: "custom",
+            path: ["assets", index2],
+            message: "dashboard enterprise v2 keeps 512-character paths and 4,000-character source URLs"
+          });
+        }
+      });
+      (selection.productFamilyCoverage || []).forEach((family, index2) => {
+        if (family.checkedSources.length === 0 || family.checkedSourceCount !== void 0) {
+          context.addIssue({
+            code: "custom",
+            path: ["imageSelection", "productFamilyCoverage", index2],
+            message: "dashboard enterprise v2 product families require checkedSources URLs"
+          });
+        }
+      });
+    }
+  }
+  if (documentIds.size !== value.documents.length || documentPaths.size !== value.documents.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["documents"],
+      message: "package manifest document IDs and paths must be unique"
+    });
+  }
+  if (assetIds.size !== value.assets.length || assetPaths.size !== value.assets.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["assets"],
+      message: "package manifest asset IDs and paths must be unique"
+    });
+  }
+  value.documents.forEach((document, index2) => {
+    if (document.assetIds.some((assetId) => !assetIds.has(assetId))) {
+      context.addIssue({
+        code: "custom",
+        path: ["documents", index2, "assetIds"],
+        message: "document references an unknown packaged asset"
+      });
+    }
+    if (document.assetIds.some(
+      (assetId) => !assetById.get(assetId)?.documentIds.includes(document.id)
+    )) {
+      context.addIssue({
+        code: "custom",
+        path: ["documents", index2, "assetIds"],
+        message: "document and asset links must be bidirectional"
+      });
+    }
+  });
+  value.assets.forEach((asset, index2) => {
+    if (asset.documentIds.some((documentId) => !documentIds.has(documentId))) {
+      context.addIssue({
+        code: "custom",
+        path: ["assets", index2, "documentIds"],
+        message: "asset references an unknown packaged document"
+      });
+    }
+    if (asset.documentIds.some((documentId) => {
+      const document = documentById.get(documentId);
+      return !document?.customerVisible || !document.assetIds.includes(asset.id);
+    })) {
+      context.addIssue({
+        code: "custom",
+        path: ["assets", index2, "documentIds"],
+        message: "asset links must reference customer-visible documents bidirectionally"
+      });
+    }
+    if (!asset.documentIds.some(
+      (documentId) => documentById.get(documentId)?.branchId === asset.branchId
+    )) {
+      context.addIssue({
+        code: "custom",
+        path: ["assets", index2, "branchId"],
+        message: "asset branch must match at least one linked document"
+      });
+    }
+  });
+});
+var packageManifestSchema = z17.preprocess((input) => {
+  const isWebsiteV2 = typeof input === "object" && input !== null && "profile" in input && input.profile === "website-lead-v1" && "schemaVersion" in input && input.schemaVersion === 2;
+  if (!isWebsiteV2) return input;
+  const value = websiteV2PackageManifestSchema.parse(input);
+  const statusByDisplayBranch = new Map(
+    value.branchEvidence.map((branch) => [
+      branch.branchId,
+      branch.contentStatus
+    ])
+  );
+  const rejectionCounts = /* @__PURE__ */ new Map();
+  for (const candidate of value.imageSelection.candidates) {
+    if (candidate.status !== "rejected") continue;
+    const reason = candidate.rejectionReason || "\u672A\u63D0\u4F9B\u62D2\u7EDD\u539F\u56E0";
+    rejectionCounts.set(reason, (rejectionCounts.get(reason) || 0) + 1);
+  }
+  return {
+    schemaVersion: value.schemaVersion,
+    profile: value.profile,
+    websiteV2Normalized: true,
+    documents: value.documents.map((document) => {
+      const displayBranch = document.branchId ? websiteLeadDisplayBranchByDirectory.get(document.branchId) : void 0;
+      return {
+        id: document.id,
+        path: document.path,
+        kind: document.kind,
+        title: document.title,
+        branchId: document.branchId,
+        order: document.order,
+        evidenceStatus: document.evidenceStatus,
+        sourceIds: document.sourceIds || [],
+        evidenceDocumentIds: document.evidenceDocumentIds,
+        assetIds: document.assetIds || [],
+        customerVisible: document.customerVisible,
+        evidenceCharacters: document.evidenceCharacters,
+        requiredFormalCharacters: document.dynamicMinimumCharacters,
+        contentStatus: displayBranch ? statusByDisplayBranch.get(displayBranch) : void 0,
+        productFamilyIds: document.productFamilyIds
+      };
+    }),
+    assets: value.assets,
+    counts: value.counts,
+    branchEvidence: value.branchEvidence,
+    imageSelection: {
+      status: value.imageSelection.status,
+      discoveredCandidateImages: value.imageSelection.discoveredCandidateImages,
+      inspectedCandidateImages: value.imageSelection.inspectedCandidateImages,
+      eligibleFirstPartyImages: value.imageSelection.eligibleFirstPartyImages,
+      rejectedCandidateImages: value.imageSelection.rejectedCandidateImages,
+      scannedSourcePages: value.imageSelection.scannedSourcePages,
+      discoveryMethods: value.imageSelection.discoveryMethods.flatMap(
+        (method) => method === "srcset_or_lazy" ? ["srcset", "lazy_load"] : [method]
+      ),
+      rejectionReasons: [...rejectionCounts].map(([reason, count4]) => ({
+        reason,
+        count: count4
+      })),
+      stopReason: value.imageSelection.shortfallReason || "Website v2 \u56FE\u7247\u5019\u9009\u53F0\u8D26\u5DF2\u5B8C\u6210",
+      productFamilyCoverage: value.imageSelection.productFamilies.map(
+        (family) => ({
+          familyId: family.id,
+          familyName: family.name,
+          officialImageAvailable: family.officialVisualFound,
+          assetIds: family.assetIds,
+          checkedSources: [],
+          checkedSourceCount: family.checkedSources,
+          gapReason: family.gapReason
+        })
+      ),
+      shortfallReason: value.imageSelection.shortfallReason
+    }
+  };
+}, internalPackageManifestSchema);
+var completenessAcquisitionCountSchema = z17.object({
+  completed: z17.number().int().nonnegative(),
+  total: z17.number().int().nonnegative()
+}).strict().superRefine((value, context) => {
+  if (value.completed > value.total) {
+    context.addIssue({
+      code: "custom",
+      path: ["completed"],
+      message: "completed acquisition count cannot exceed total"
+    });
+  }
+});
+var completenessAcquisitionSchema = z17.object({
+  counts: z17.record(z17.string(), z17.number().int().nonnegative()).optional(),
+  acquisition: z17.object({
+    officialPages: completenessAcquisitionCountSchema.optional(),
+    images: completenessAcquisitionCountSchema.optional(),
+    documents: completenessAcquisitionCountSchema.optional(),
+    webQueries: completenessAcquisitionCountSchema.optional()
+  }).passthrough()
+}).passthrough();
 var storageRoot2 = path7.resolve(
   process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path7.join(process.cwd(), ".frontmind-dashboard-assets")
 );
@@ -27743,6 +28415,38 @@ var imageMimeByExtension = {
   ".gif": "image/gif",
   ".avif": "image/avif"
 };
+var versionedArchiveAllowedExtensions = /* @__PURE__ */ new Set([
+  ".avif",
+  ".csv",
+  ".doc",
+  ".docx",
+  ".gif",
+  ".jpeg",
+  ".jpg",
+  ".json",
+  ".md",
+  ".pdf",
+  ".png",
+  ".ppt",
+  ".pptx",
+  ".sha256",
+  ".webp",
+  ".xls",
+  ".xlsx"
+]);
+var executableArchiveExtensions = /* @__PURE__ */ new Set([
+  ".bat",
+  ".cmd",
+  ".com",
+  ".dll",
+  ".dylib",
+  ".exe",
+  ".js",
+  ".mjs",
+  ".py",
+  ".sh",
+  ".so"
+]);
 function decodeHeader(value, fallback) {
   if (!value) return fallback;
   try {
@@ -27777,21 +28481,128 @@ function validateArchiveEntryPath(value) {
 }
 function isSupportedImageBytes(extension, bytes) {
   if (extension === ".png") {
-    return bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    return bytes.length >= 24 && bytes.subarray(0, 8).equals(
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+    ) && bytes.subarray(12, 16).toString("ascii") === "IHDR" && bytes.readUInt32BE(16) > 0 && bytes.readUInt32BE(20) > 0;
   }
   if (extension === ".jpg" || extension === ".jpeg") {
-    return bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+    return bytes.length >= 4 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 && bytes[bytes.length - 2] === 255 && bytes[bytes.length - 1] === 217;
   }
   if (extension === ".gif") {
-    return ["GIF87a", "GIF89a"].includes(
-      bytes.subarray(0, 6).toString("ascii")
-    );
+    return bytes.length >= 10 && ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii")) && bytes.readUInt16LE(6) > 0 && bytes.readUInt16LE(8) > 0;
   }
   if (extension === ".webp") {
-    return bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+    return bytes.length >= 16 && bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP" && bytes.readUInt32LE(4) + 8 <= bytes.length;
   }
   if (extension === ".avif") {
-    return bytes.subarray(4, 8).toString("ascii") === "ftyp" && bytes.subarray(8, 32).includes(Buffer.from("avif"));
+    return bytes.length >= 16 && bytes.subarray(4, 8).toString("ascii") === "ftyp" && /^(?:avif|avis)$/.test(bytes.subarray(8, 12).toString("ascii"));
+  }
+  return false;
+}
+function basicRasterImageDimensions(extension, bytes) {
+  if (extension === ".png" && bytes.length >= 24) {
+    return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+  }
+  if (extension === ".gif" && bytes.length >= 10) {
+    return { width: bytes.readUInt16LE(6), height: bytes.readUInt16LE(8) };
+  }
+  if (extension === ".jpg" || extension === ".jpeg") {
+    let offset = 2;
+    while (offset + 9 < bytes.length) {
+      if (bytes[offset] !== 255) {
+        offset += 1;
+        continue;
+      }
+      const marker = bytes[offset + 1] || 0;
+      if (marker === 216 || marker === 217) {
+        offset += 2;
+        continue;
+      }
+      const segmentLength = bytes.readUInt16BE(offset + 2);
+      if (segmentLength < 2 || offset + 2 + segmentLength > bytes.length) {
+        break;
+      }
+      if (marker >= 192 && marker <= 195 || marker >= 197 && marker <= 199 || marker >= 201 && marker <= 203 || marker >= 205 && marker <= 207) {
+        return {
+          width: bytes.readUInt16BE(offset + 7),
+          height: bytes.readUInt16BE(offset + 5)
+        };
+      }
+      offset += 2 + segmentLength;
+    }
+  }
+  if (extension === ".webp" && bytes.length >= 30) {
+    const chunk = bytes.subarray(12, 16).toString("ascii");
+    if (chunk === "VP8X") {
+      return {
+        width: bytes.readUIntLE(24, 3) + 1,
+        height: bytes.readUIntLE(27, 3) + 1
+      };
+    }
+    if (chunk === "VP8L" && bytes[20] === 47 && bytes.length >= 25) {
+      const packed = bytes.readUInt32LE(21);
+      return {
+        width: (packed & 16383) + 1,
+        height: (packed >>> 14 & 16383) + 1
+      };
+    }
+    if (chunk === "VP8 " && bytes.subarray(23, 26).equals(Buffer.from([157, 1, 42]))) {
+      return {
+        width: bytes.readUInt16LE(26) & 16383,
+        height: bytes.readUInt16LE(28) & 16383
+      };
+    }
+  }
+  if (extension === ".avif") {
+    const typeOffset = bytes.indexOf(Buffer.from("ispe"));
+    if (typeOffset >= 4 && typeOffset + 16 <= bytes.length) {
+      const boxSize = bytes.readUInt32BE(typeOffset - 4);
+      if (boxSize >= 20 && typeOffset - 4 + boxSize <= bytes.length) {
+        return {
+          width: bytes.readUInt32BE(typeOffset + 8),
+          height: bytes.readUInt32BE(typeOffset + 12)
+        };
+      }
+    }
+  }
+  return void 0;
+}
+async function decodedRasterImageDimensions(extension, bytes) {
+  if (!isSupportedImageBytes(extension, bytes)) return void 0;
+  try {
+    const options = {
+      failOn: "warning",
+      limitInputPixels: MAX_RASTER_DECODE_PIXELS,
+      pages: 1,
+      sequentialRead: true
+    };
+    const metadata = await sharp(bytes, options).metadata();
+    const expectedMime = imageMimeByExtension[extension];
+    const height = metadata.pageHeight || metadata.height;
+    if (!expectedMime || metadata.mediaType !== expectedMime || !metadata.width || !height || metadata.width * height > MAX_RASTER_DECODE_PIXELS) {
+      return void 0;
+    }
+    await sharp(bytes, options).stats();
+    return { width: metadata.width, height };
+  } catch {
+    return void 0;
+  }
+}
+function hasSupportedImageSignature(extension, bytes) {
+  if (extension === ".png") {
+    return bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  }
+  if (extension === ".jpg" || extension === ".jpeg") {
+    return bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+  }
+  if (extension === ".webp") {
+    return bytes.length >= 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+  }
+  if (extension === ".gif") {
+    return bytes.length >= 6 && ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii"));
+  }
+  if (extension === ".avif") {
+    return bytes.length >= 16 && bytes.subarray(4, 8).toString("ascii") === "ftyp" && bytes.subarray(8, 32).includes(Buffer.from("avif"));
   }
   return false;
 }
@@ -27801,7 +28612,7 @@ function validateProgressReportScreenshot(input) {
   if (!mimeType || ![".png", ".jpg", ".jpeg", ".webp"].includes(extension)) {
     throw new Error("\u7B54\u6848\u622A\u56FE\u4EC5\u652F\u6301 PNG\u3001JPG \u6216 WEBP");
   }
-  if (!isSupportedImageBytes(extension, input.bytes)) {
+  if (!hasSupportedImageSignature(extension, input.bytes)) {
     throw new Error("\u7B54\u6848\u622A\u56FE\u5185\u5BB9\u4E0E\u6587\u4EF6\u6269\u5C55\u540D\u4E0D\u4E00\u81F4");
   }
   return { extension, mimeType };
@@ -27827,6 +28638,1021 @@ ${JSON.stringify(JSON.parse(content), null, 2)}
     }
   }
   return content.replace(/^\uFEFF/, "").trim();
+}
+function packageRelativePath(value) {
+  return validateArchiveEntryPath(value.normalize("NFKC"));
+}
+function stripLeadingMarkdownFrontmatter(markdown) {
+  return markdown.replace(
+    /^\uFEFF?---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/,
+    ""
+  );
+}
+function customerDisplayMarkdown(markdown) {
+  const retainedLines = [];
+  const lines = stripLeadingMarkdownFrontmatter(markdown).split(/\r?\n/);
+  let excludedSectionDepth;
+  for (const line of lines) {
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const depth = heading[1].length;
+      if (excludedSectionDepth !== void 0 && depth <= excludedSectionDepth) {
+        excludedSectionDepth = void 0;
+      }
+      if (/(?:原始|证据|引用|参考)?来源|素材清单|展示素材|机器清单|证据状态|状态头|sources?|references?|asset inventory/i.test(
+        heading[2] || ""
+      )) {
+        excludedSectionDepth = depth;
+        continue;
+      }
+    }
+    if (excludedSectionDepth !== void 0) continue;
+    if (/^\s*>\s*.*(?:状态|status)\s*[:：].*(?:来源|source)\s*[:：]/i.test(
+      line
+    ) || /^\s*[-*]\s+(?:node_id|path|evidence_status|source_ids|status)\s*[:：]/i.test(
+      line
+    )) {
+      continue;
+    }
+    retainedLines.push(line);
+  }
+  return retainedLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function formalKnowledgeText(content) {
+  const retainedLines = [];
+  const lines = stripLeadingMarkdownFrontmatter(content).split(/\r?\n/);
+  let excludedSectionDepth;
+  for (let index2 = 0; index2 < lines.length; index2 += 1) {
+    const rawLine = lines[index2] || "";
+    const heading = rawLine.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const depth = heading[1].length;
+      if (excludedSectionDepth !== void 0 && depth <= excludedSectionDepth) {
+        excludedSectionDepth = void 0;
+      }
+      if (/(?:原始|证据|引用|参考)?来源|素材清单|展示素材|机器清单|证据状态|状态头|sources?|references?|asset inventory/i.test(
+        heading[2] || ""
+      )) {
+        excludedSectionDepth = depth;
+      }
+      continue;
+    }
+    if (excludedSectionDepth !== void 0) continue;
+    if (/^\s*>\s*.*(?:状态|status)\s*[:：].*(?:来源|source)\s*[:：]/i.test(
+      rawLine
+    ) || /^\s*[-*]\s+(?:node_id|path|evidence_status|source_ids|status)\s*[:：]/i.test(
+      rawLine
+    )) {
+      continue;
+    }
+    if (rawLine.trim().startsWith("|")) {
+      const tableLines = [];
+      let tableIndex = index2;
+      while (tableIndex < lines.length && (lines[tableIndex] || "").trim().startsWith("|")) {
+        tableLines.push(lines[tableIndex] || "");
+        tableIndex += 1;
+      }
+      index2 = tableIndex - 1;
+      const tableText = tableLines.join("\n");
+      if (!/(?:来源|出处|证据链接|source|url)/i.test(tableText)) {
+        retainedLines.push(tableText);
+      }
+      continue;
+    }
+    retainedLines.push(rawLine);
+  }
+  return retainedLines.join("\n").replace(/<!--[\s\S]*?-->/g, "").replace(/!\[[^\]]*]\([^)]*\)/g, "").replace(/\[([^\]]+)]\([^)]*\)/g, "$1").replace(/https?:\/\/[^\s)>\]]+/gi, "").replace(/<[^>]+>/g, "");
+}
+function markedFormalContent(content) {
+  const startMarker = "<!-- FRONTMIND_FORMAL_CONTENT_START -->";
+  const endMarker = "<!-- FRONTMIND_FORMAL_CONTENT_END -->";
+  const start = content.indexOf(startMarker);
+  const end = content.indexOf(endMarker);
+  if (start < 0 || end <= start || content.indexOf(startMarker, start + startMarker.length) >= 0 || content.indexOf(endMarker, end + endMarker.length) >= 0) {
+    return void 0;
+  }
+  return content.slice(start + startMarker.length, end);
+}
+function profileFormalKnowledgeText(content, profile) {
+  return formalKnowledgeText(
+    profile === "dashboard-enterprise-v1" ? markedFormalContent(content) || "" : content
+  );
+}
+function effectiveCharacterCount(value) {
+  return Array.from(
+    value.replace(/\s/g, "").replace(
+      /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]/g,
+      ""
+    )
+  ).length;
+}
+function evidenceProportionalFormalRequirement(input) {
+  if (input.evidenceCharacters === 0) {
+    return {
+      required: input.kind === "overview" ? 60 : 40,
+      status: "needs_verification"
+    };
+  }
+  if (input.kind === "overview") {
+    const target = input.isProductBranch ? 5e3 : 2500;
+    const proportional2 = Math.floor(input.evidenceCharacters * 0.25);
+    return {
+      required: Math.max(120, Math.min(target, proportional2)),
+      status: proportional2 >= target ? "complete" : "limited_evidence"
+    };
+  }
+  const proportional = Math.floor(input.evidenceCharacters * 0.2);
+  return {
+    required: Math.max(80, Math.min(500, proportional)),
+    status: proportional >= 500 ? "complete" : "limited_evidence"
+  };
+}
+function websiteV2OverviewRequirement(evidenceCharacters, displayBranchId) {
+  if (evidenceCharacters === 0) return 40;
+  const target = displayBranchId === "products-services" ? 3e3 : 1500;
+  return Math.min(target, Math.max(120, Math.ceil(evidenceCharacters * 0.25)));
+}
+function websiteV2LeafRequirement(evidenceCharacters) {
+  if (evidenceCharacters === 0) return 40;
+  return Math.min(200, Math.max(60, Math.ceil(evidenceCharacters * 0.2)));
+}
+function duplicateFormalParagraphs(documents, profile) {
+  const pathsByFingerprint = /* @__PURE__ */ new Map();
+  const duplicates = [];
+  for (const document of documents) {
+    const narrative = profileFormalKnowledgeText(document.content, profile);
+    if (effectiveCharacterCount(narrative) < 120) continue;
+    const fingerprints = new Set(
+      [narrative, ...narrative.split(/\n\s*\n/)].map(
+        (paragraph) => paragraph.replace(/\d+/g, "#").replace(/\s+/g, "").trim()
+      ).filter((paragraph) => effectiveCharacterCount(paragraph) >= 120)
+    );
+    for (const fingerprint of fingerprints) {
+      const paths = pathsByFingerprint.get(fingerprint) || [];
+      paths.push(document.path);
+      pathsByFingerprint.set(fingerprint, paths);
+    }
+  }
+  for (const paths of pathsByFingerprint.values()) {
+    if (paths.length >= 3) {
+      duplicates.push({ first: paths[0], second: paths[2] });
+    }
+  }
+  return duplicates;
+}
+function packagedEvidenceCharacters(documents) {
+  return documents.filter((document) => document.customerVisible === false).reduce(
+    (total, document) => total + packagedEvidenceDocumentCharacters(document),
+    0
+  );
+}
+function packagedEvidenceDocumentCharacters(document) {
+  return effectiveCharacterCount(packagedEvidenceDocumentText(document));
+}
+function packagedEvidenceDocumentText(document) {
+  return stripLeadingMarkdownFrontmatter(document.content).replace(/<!--[\s\S]*?-->/g, "").replace(/!\[[^\]]*]\([^)]*\)/g, "").replace(/\[([^\]]+)]\([^)]*\)/g, "$1").replace(/https?:\/\/[^\s)>\]]+/gi, "").replace(/<[^>]+>/g, "").replace(/^#{1,6}\s+/gm, "");
+}
+function packagedEvidenceDocumentFingerprint(document) {
+  const normalized = packagedEvidenceDocumentText(document).normalize("NFKC").toLowerCase().replace(/\s/g, "").replace(
+    /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]/g,
+    ""
+  );
+  return normalized ? createHash14("sha256").update(normalized).digest("hex") : void 0;
+}
+function reportedPackagedImageCount(markdown) {
+  for (const pattern of [
+    /(?:成功下载|已下载|已保存|保存并打包|downloaded|packaged|saved)[^\n|]{0,30}(?:图片|图像|images?|assets?)[^\d]{0,12}([\d,]+)/i,
+    /(?:图片|图像|images?|assets?)[^\n|]{0,30}(?:成功下载|已下载|已保存|保存并打包|downloaded|packaged|saved)[^\d]{0,12}([\d,]+)/i,
+    /第一方图片资源[^\d\n|]{0,20}([\d,]+)/i
+  ]) {
+    const matched = markdown.match(pattern)?.[1];
+    if (matched) return Number.parseInt(matched.replaceAll(",", ""), 10);
+  }
+  return void 0;
+}
+function parsePackageJson(rawTextByRelativePath, relativePath, schema, label) {
+  const raw = rawTextByRelativePath.get(relativePath);
+  if (!raw) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      `\u77E5\u8BC6\u5E93 ZIP \u7F3A\u5C11 ${relativePath}`
+    );
+  }
+  try {
+    return schema.parse(JSON.parse(raw));
+  } catch (error) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      `${label} \u4E0D\u662F\u6709\u6548\u7684\u673A\u5668\u6E05\u5355\uFF1A${error instanceof Error ? error.message : "\u683C\u5F0F\u9519\u8BEF"}`
+    );
+  }
+}
+function validateProfilePackage(input) {
+  const manifest = parsePackageJson(
+    input.rawTextByRelativePath,
+    packageManifestPath,
+    packageManifestSchema,
+    "00_package_manifest.json"
+  );
+  if (input.archiveContractVersion !== void 0 && manifest.schemaVersion !== input.archiveContractVersion) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      "\u77E5\u8BC6\u5E93\u5F52\u6863\u5408\u540C\u7248\u672C\u4E0E package manifest \u4E0D\u4E00\u81F4"
+    );
+  }
+  if (manifest.profile !== input.profile) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      "\u77E5\u8BC6\u5E93\u5F52\u6863\u6863\u4F4D\u4E0E\u670D\u52A1\u7AEF\u4EFB\u52A1\u6863\u4F4D\u4E0D\u4E00\u81F4"
+    );
+  }
+  const completeness = parsePackageJson(
+    input.rawTextByRelativePath,
+    completenessPath,
+    completenessAcquisitionSchema,
+    "00_completeness.json"
+  );
+  const limits = input.profile === "website-lead-v1" ? {
+    files: 150,
+    images: 48,
+    targetImages: 36,
+    minCharacters: 8e3,
+    maxCharacters: manifest.schemaVersion === 2 ? 4e4 : 18e3,
+    maxEvidenceCharacters: 3e5,
+    maxOfficialPages: 120,
+    maxDocuments: 22,
+    maxWebQueries: 12
+  } : {
+    files: 1500,
+    images: 480,
+    targetImages: 360,
+    minCharacters: 8e4,
+    maxCharacters: 18e4,
+    maxEvidenceCharacters: 3e6,
+    maxOfficialPages: 1200,
+    maxDocuments: 220,
+    maxWebQueries: 120
+  };
+  if (input.packagePaths.length > limits.files) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      `\u77E5\u8BC6\u5E93 ZIP \u8D85\u8FC7 ${limits.files} \u4E2A\u4EA7\u54C1\u6587\u4EF6\u4E0A\u9650`
+    );
+  }
+  if (input.profile === "dashboard-enterprise-v1" && input.unpackedBytes > ENTERPRISE_PRODUCT_MAX_UNPACKED_BYTES) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      "\u4F01\u4E1A\u77E5\u8BC6\u5E93\u89E3\u538B\u540E\u8D85\u8FC7 200 MB \u4EA7\u54C1\u4E0A\u9650"
+    );
+  }
+  if (manifest.counts.totalFiles !== input.packagePaths.length) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      "package manifest \u6587\u4EF6\u603B\u6570\u4E0E ZIP \u5B9E\u9645\u6587\u4EF6\u6570\u4E0D\u4E00\u81F4"
+    );
+  }
+  const documentByRelativePath = new Map(
+    input.documents.map((document) => [
+      document.path.split("/").slice(1).join("/"),
+      document
+    ])
+  );
+  const assetByRelativePath = new Map(
+    input.assets.map((asset) => [
+      asset.path.split("/").slice(1).join("/"),
+      asset
+    ])
+  );
+  const allowedUnlistedText = /* @__PURE__ */ new Set([
+    packageManifestPath,
+    completenessPath,
+    "MANIFEST.sha256",
+    "VALIDATION.md"
+  ]);
+  const manifestDocumentPaths = new Set(
+    manifest.documents.map((document) => packageRelativePath(document.path))
+  );
+  for (const relativePath of input.rawTextByRelativePath.keys()) {
+    if (path7.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        `package manifest \u672A\u767B\u8BB0\u6587\u672C\u6587\u4EF6\uFF1A${relativePath}`
+      );
+    }
+  }
+  const enrichedDocuments = manifest.documents.map((metadata) => {
+    const relativePath = packageRelativePath(metadata.path);
+    const document = documentByRelativePath.get(relativePath);
+    if (!document) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        `package manifest \u6587\u6863\u4E0D\u5B58\u5728\uFF1A${relativePath}`
+      );
+    }
+    return {
+      ...document,
+      id: metadata.id,
+      title: metadata.title,
+      kind: metadata.kind,
+      branchId: metadata.branchId,
+      branchTitle: metadata.branchTitle,
+      order: metadata.order,
+      evidenceStatus: metadata.evidenceStatus,
+      sourceIds: metadata.sourceIds,
+      evidenceDocumentIds: metadata.evidenceDocumentIds,
+      assetIds: metadata.assetIds,
+      customerVisible: metadata.customerVisible,
+      evidenceCharacters: metadata.evidenceCharacters,
+      requiredFormalCharacters: metadata.requiredFormalCharacters,
+      contentStatus: metadata.contentStatus,
+      productFamilyId: metadata.productFamilyId,
+      productFamilyIds: metadata.productFamilyIds
+    };
+  });
+  const manifestAssetPaths = new Set(
+    manifest.assets.map((asset) => packageRelativePath(asset.path))
+  );
+  if (manifest.assets.length !== input.assets.length || manifestAssetPaths.size !== input.assets.length) {
+    throw new KnowledgeArchiveValidationError(
+      "media",
+      "package manifest \u56FE\u7247\u6570\u91CF\u4E0E ZIP \u5B9E\u9645\u56FE\u7247\u6570\u91CF\u4E0D\u4E00\u81F4"
+    );
+  }
+  let imageBytes = 0;
+  const enrichedAssets = manifest.assets.map((metadata) => {
+    const relativePath = packageRelativePath(metadata.path);
+    const asset = assetByRelativePath.get(relativePath);
+    if (!asset) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `package manifest \u56FE\u7247\u4E0D\u5B58\u5728\uFF1A${relativePath}`
+      );
+    }
+    if (asset.mimeType !== metadata.mimeType || asset.size !== metadata.bytes || asset.sha256?.toLowerCase() !== metadata.sha256.toLowerCase()) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `\u56FE\u7247\u5B57\u8282\u3001\u7C7B\u578B\u6216\u54C8\u5E0C\u4E0E package manifest \u4E0D\u4E00\u81F4\uFF1A${relativePath}`
+      );
+    }
+    if (asset.width === void 0 || asset.height === void 0) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `\u65E0\u6CD5\u590D\u7B97\u56FE\u7247\u5C3A\u5BF8\uFF1A${relativePath}`
+      );
+    }
+    if (metadata.width !== asset.width || metadata.height !== asset.height) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `\u56FE\u7247\u5C3A\u5BF8\u4E0E package manifest \u4E0D\u4E00\u81F4\uFF1A${relativePath}`
+      );
+    }
+    if (metadata.ownership !== "first_party") {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `\u6253\u5305\u56FE\u7247\u5FC5\u987B\u662F\u7B2C\u4E00\u65B9\u7D20\u6750\uFF1A${relativePath}`
+      );
+    }
+    imageBytes += asset.size;
+    return {
+      ...asset,
+      id: metadata.id,
+      width: metadata.width,
+      height: metadata.height,
+      caption: metadata.caption,
+      alt: metadata.alt,
+      branchId: metadata.branchId,
+      documentIds: metadata.documentIds,
+      sourcePageUrl: metadata.sourcePageUrl,
+      sourceAssetUrl: metadata.sourceAssetUrl,
+      ownership: metadata.ownership
+    };
+  });
+  if (enrichedAssets.length > limits.images) {
+    throw new KnowledgeArchiveValidationError(
+      "media",
+      `\u77E5\u8BC6\u5E93 ZIP \u8D85\u8FC7 ${limits.images} \u5F20\u56FE\u7247\u4E0A\u9650`
+    );
+  }
+  if (new Set(enrichedAssets.map((asset) => asset.sha256?.toLowerCase())).size !== enrichedAssets.length) {
+    throw new KnowledgeArchiveValidationError(
+      "media",
+      "\u77E5\u8BC6\u5E93\u56FE\u7247\u5FC5\u987B\u6309 SHA-256 \u53BB\u91CD\u540E\u518D\u6253\u5305"
+    );
+  }
+  if (input.profile === "dashboard-enterprise-v1" && imageBytes > ENTERPRISE_PRODUCT_MAX_IMAGE_BYTES) {
+    throw new KnowledgeArchiveValidationError(
+      "media",
+      "\u4F01\u4E1A\u77E5\u8BC6\u5E93\u56FE\u7247\u603B\u91CF\u8D85\u8FC7 160 MB"
+    );
+  }
+  if (manifest.counts.packagedImages !== enrichedAssets.length) {
+    throw new KnowledgeArchiveValidationError(
+      "media",
+      "package manifest \u56FE\u7247\u8BA1\u6570\u4E0E ZIP \u5B9E\u9645\u56FE\u7247\u6570\u4E0D\u4E00\u81F4"
+    );
+  }
+  if (completeness.acquisition.images?.completed !== enrichedAssets.length || completeness.acquisition.images && completeness.acquisition.images.completed > completeness.acquisition.images.total) {
+    throw new KnowledgeArchiveValidationError(
+      "media",
+      "00_completeness.json \u7684\u5DF2\u4FDD\u5B58\u56FE\u7247\u6570\u4E0E\u5B9E\u9645\u6253\u5305\u56FE\u7247\u6570\u4E0D\u4E00\u81F4"
+    );
+  }
+  const crawlReportImageCount = reportedPackagedImageCount(
+    input.rawTextByRelativePath.get("00_crawl_coverage_report.md") || ""
+  );
+  if (crawlReportImageCount !== void 0 && crawlReportImageCount !== enrichedAssets.length) {
+    throw new KnowledgeArchiveValidationError(
+      "media",
+      "\u5B98\u7F51\u91C7\u96C6\u62A5\u544A\u7684\u5DF2\u4FDD\u5B58\u56FE\u7247\u6570\u4E0E\u5B9E\u9645\u6253\u5305\u56FE\u7247\u6570\u4E0D\u4E00\u81F4"
+    );
+  }
+  if (manifest.schemaVersion === 1) {
+    if (enrichedAssets.length < limits.targetImages && !manifest.imageSelection.shortfallReason) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `\u56FE\u7247\u5C11\u4E8E ${limits.targetImages} \u5F20\u65F6\u5FC5\u987B\u8BF4\u660E\u7B2C\u4E00\u65B9\u7D20\u6750\u4E0D\u8DB3\u539F\u56E0`
+      );
+    }
+    if (enrichedAssets.length >= limits.targetImages && manifest.imageSelection.shortfallReason && input.profile !== "website-lead-v1") {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `\u8FBE\u5230 ${limits.targetImages} \u5F20\u56FE\u7247\u76EE\u6807\u65F6\u4E0D\u5F97\u586B\u5199\u7D20\u6750\u4E0D\u8DB3\u539F\u56E0`
+      );
+    }
+    if (manifest.imageSelection.eligibleFirstPartyImages >= limits.targetImages && enrichedAssets.length < limits.targetImages) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        `\u5DF2\u6709\u81F3\u5C11 ${limits.targetImages} \u5F20\u5408\u683C\u7B2C\u4E00\u65B9\u7D20\u6750\u65F6\u5FC5\u987B\u8FBE\u5230\u76EE\u6807\u56FE\u7247\u6570`
+      );
+    }
+    if (manifest.imageSelection.eligibleFirstPartyImages < limits.targetImages && enrichedAssets.length !== manifest.imageSelection.eligibleFirstPartyImages) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "\u5408\u683C\u7B2C\u4E00\u65B9\u7D20\u6750\u4E0D\u8DB3\u76EE\u6807\u6570\u91CF\u65F6\uFF0C\u5FC5\u987B\u6253\u5305\u5168\u90E8\u5408\u683C\u56FE\u7247"
+      );
+    }
+  } else {
+    const selection = manifest.imageSelection;
+    const discovered = selection.discoveredCandidateImages;
+    const inspected = selection.inspectedCandidateImages;
+    const rejected = selection.rejectedCandidateImages;
+    const methods = new Set(selection.discoveryMethods || []);
+    const rejectionTotal = (selection.rejectionReasons || []).reduce(
+      (sum, reason) => sum + reason.count,
+      0
+    );
+    if (inspected > discovered || inspected !== selection.eligibleFirstPartyImages + rejected || rejectionTotal !== rejected) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "\u56FE\u7247\u53D1\u73B0\u3001\u68C0\u67E5\u3001\u5408\u683C\u548C\u62D2\u7EDD\u5019\u9009\u6570\u4E0D\u6EE1\u8DB3\u53EF\u5BA1\u8BA1\u7B97\u672F\u5173\u7CFB"
+      );
+    }
+    if ([...requiredImageDiscoveryMethods].some((method) => !methods.has(method))) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "\u56FE\u7247\u53D1\u73B0\u53F0\u8D26\u672A\u8986\u76D6\u5168\u90E8\u8981\u6C42\u7684\u7B2C\u4E00\u65B9\u56FE\u7247\u53D1\u73B0\u65B9\u5F0F"
+      );
+    }
+    if (completeness.acquisition.images?.total !== discovered || enrichedAssets.length > selection.eligibleFirstPartyImages) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "\u56FE\u7247\u53D1\u73B0\u53F0\u8D26\u4E0E\u5B8C\u6574\u5EA6\u7EDF\u8BA1\u6216\u5B9E\u9645\u6253\u5305\u6570\u91CF\u4E0D\u4E00\u81F4"
+      );
+    }
+    if (selection.status === "target_met") {
+      if (selection.eligibleFirstPartyImages < limits.targetImages || enrichedAssets.length < limits.targetImages || selection.shortfallReason) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `target_met \u5FC5\u987B\u81F3\u5C11\u53D1\u73B0\u5E76\u6253\u5305 ${limits.targetImages} \u5F20\u5408\u683C\u56FE\u7247`
+        );
+      }
+    } else {
+      if (selection.eligibleFirstPartyImages >= limits.targetImages && !(input.profile === "website-lead-v1" && selection.status === "budget_limited") || enrichedAssets.length !== selection.eligibleFirstPartyImages || !selection.shortfallReason) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          "\u56FE\u7247\u76EE\u6807\u672A\u8FBE\u6210\u65F6\u5FC5\u987B\u6253\u5305\u5168\u90E8\u5408\u683C\u56FE\u7247\u5E76\u63D0\u4F9B\u771F\u5B9E\u7F3A\u53E3\u539F\u56E0"
+        );
+      }
+      if (selection.status === "source_limited" && inspected !== discovered) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          "source_limited \u5FC5\u987B\u68C0\u67E5\u5168\u90E8\u5DF2\u53D1\u73B0\u5019\u9009\u56FE\u7247"
+        );
+      }
+      if (selection.status === "budget_limited" && inspected >= discovered) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          "budget_limited \u5FC5\u987B\u5B58\u5728\u56E0\u9884\u7B97\u672A\u68C0\u67E5\u7684\u5DF2\u53D1\u73B0\u5019\u9009\u56FE\u7247"
+        );
+      }
+    }
+    const productFamilyIdsForDocument = (document) => {
+      if (input.profile === "website-lead-v1" && document.branchId !== "03_products") {
+        return [];
+      }
+      return document.productFamilyIds?.length ? document.productFamilyIds : document.productFamilyId ? [document.productFamilyId] : [];
+    };
+    const productLeafDocuments = enrichedDocuments.filter(
+      (document) => document.kind === "leaf" && productFamilyIdsForDocument(document).length > 0
+    );
+    const productBranchIds2 = new Set(
+      productLeafDocuments.map((document) => document.branchId || "")
+    );
+    const productLeafFamilyIds = new Set(
+      productLeafDocuments.flatMap(productFamilyIdsForDocument)
+    );
+    if (productLeafFamilyIds.size === 0 || productBranchIds2.has("") || enrichedDocuments.some(
+      (document) => document.productFamilyIds !== void 0 && new Set(document.productFamilyIds).size !== document.productFamilyIds.length
+    ) || enrichedDocuments.some(
+      (document) => productFamilyIdsForDocument(document).length > 0 && document.kind !== "leaf"
+    ) || enrichedDocuments.some(
+      (document) => document.kind === "leaf" && productBranchIds2.has(document.branchId || "") && productFamilyIdsForDocument(document).length === 0
+    )) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        "v2 \u5FC5\u987B\u81F3\u5C11\u58F0\u660E\u4E00\u4E2A\u4EA7\u54C1\u6216\u670D\u52A1\u65CF\uFF0C\u4E14\u4EA7\u54C1\u5206\u652F\u7684\u6BCF\u4E2A\u53F6\u5B50\u90FD\u5FC5\u987B\u58F0\u660E productFamilyId"
+      );
+    }
+    const coverageIds = new Set(
+      (selection.productFamilyCoverage || []).map((family) => family.familyId)
+    );
+    if (coverageIds.size !== (selection.productFamilyCoverage || []).length || coverageIds.size !== productLeafFamilyIds.size || [...coverageIds].some((familyId) => !productLeafFamilyIds.has(familyId))) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "\u4EA7\u54C1\u65CF\u56FE\u7247\u8986\u76D6\u6E05\u5355\u5FC5\u987B\u4E0E\u4EA7\u54C1\u6216\u670D\u52A1\u53F6\u5B50\u4E2D\u7684\u4EA7\u54C1\u65CF\u5B8C\u5168\u4E00\u81F4"
+      );
+    }
+    const enrichedAssetIds = new Set(
+      enrichedAssets.map((asset) => asset.id).filter(Boolean)
+    );
+    for (const family of selection.productFamilyCoverage || []) {
+      if (family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) || family.officialImageAvailable && family.assetIds.length === 0 || !family.officialImageAvailable && !family.gapReason || input.profile === "dashboard-enterprise-v1" && family.checkedSources.length === 0) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `\u4EA7\u54C1\u65CF\u56FE\u7247\u8986\u76D6\u8BB0\u5F55\u4E0D\u5B8C\u6574\uFF1A${family.familyName}`
+        );
+      }
+    }
+  }
+  if (manifest.imageSelection.eligibleFirstPartyImages >= limits.targetImages && enrichedAssets.length > Math.min(manifest.imageSelection.eligibleFirstPartyImages, limits.images)) {
+    throw new KnowledgeArchiveValidationError(
+      "media",
+      "\u5B9E\u9645\u6253\u5305\u56FE\u7247\u6570\u4E0D\u80FD\u8D85\u8FC7\u5408\u683C\u7B2C\u4E00\u65B9\u7D20\u6750\u6570\u6216\u6863\u4F4D\u4E0A\u9650"
+    );
+  }
+  const customerDocuments = enrichedDocuments.filter(
+    (document) => document.customerVisible
+  );
+  const customerOverviewDocuments = customerDocuments.filter(
+    (document) => document.kind === "overview"
+  );
+  const customerLeafDocuments = customerDocuments.filter(
+    (document) => document.kind === "leaf"
+  );
+  if (customerDocuments.length === 0 || customerOverviewDocuments.length === 0 || customerLeafDocuments.length === 0) {
+    throw new KnowledgeArchiveValidationError(
+      "content",
+      "\u77E5\u8BC6\u5E93\u5FC5\u987B\u540C\u65F6\u5305\u542B\u6B63\u5F0F\u5206\u652F\u7EFC\u8FF0\u548C\u77E5\u8BC6\u53F6\u5B50"
+    );
+  }
+  if (input.profile === "website-lead-v1" && (manifest.schemaVersion === 1 && (customerDocuments.length < 40 || customerDocuments.length > 56) || manifest.schemaVersion === 2 && (customerOverviewDocuments.length !== 7 || customerLeafDocuments.length < 40 || customerLeafDocuments.length > 56))) {
+    throw new KnowledgeArchiveValidationError(
+      "content",
+      manifest.schemaVersion === 1 ? "\u5386\u53F2\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u5E93\u5FC5\u987B\u5305\u542B 40\u201356 \u4E2A\u5BA2\u6237\u53EF\u89C1\u5185\u5BB9\u6587\u6863" : "\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u5E93 v2 \u5FC5\u987B\u5305\u542B 7 \u7BC7\u5206\u652F\u7EFC\u8FF0\u548C 40\u201356 \u4E2A\u77E5\u8BC6\u53F6\u5B50"
+    );
+  }
+  if (input.profile === "website-lead-v1") {
+    const manifestDocumentById = new Map(
+      manifest.documents.map((document) => [document.id, document])
+    );
+    const hiddenContentDocument = manifest.documents.find(
+      (document) => websiteLeadDisplayBranchByDirectory.has(
+        document.path.split("/")[0] || ""
+      ) && !document.customerVisible
+    );
+    if (hiddenContentDocument) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        `\u5B98\u7F51\u8F7B\u91CF 01\u201308 \u5185\u5BB9\u6587\u6863\u5FC5\u987B\u6807\u4E3A\u5BA2\u6237\u53EF\u89C1\uFF1A${hiddenContentDocument.path}`
+      );
+    }
+    const overviewCounts = /* @__PURE__ */ new Map();
+    for (const document of customerDocuments) {
+      const manifestDocument = document.id ? manifestDocumentById.get(document.id) : void 0;
+      const directory = manifestDocument?.path.split("/")[0] || "";
+      const displayBranch = websiteLeadDisplayBranchByDirectory.get(directory);
+      if (!displayBranch || document.branchId !== directory || !["overview", "leaf"].includes(document.kind) || !document.evidenceStatus) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u6587\u6863\u7684\u76EE\u5F55\u3001\u5206\u652F\u3001\u7C7B\u578B\u6216\u8BC1\u636E\u72B6\u6001\u65E0\u6548\uFF1A${manifestDocument?.path || document.path}`
+        );
+      }
+      const declaredStatus = document.content.slice(0, 1600).match(
+        /(?:证据\s*)?(?:状态|status)\s*[:：]\s*(?:\*\*|__)?\s*`?\s*(verified_first_party|verified_authoritative|supported_third_party|inferred|needs_verification|not_applicable)\b/i
+      )?.[1]?.toLowerCase();
+      if (declaredStatus !== document.evidenceStatus) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u6587\u6863\u7684\u8BC1\u636E\u72B6\u6001\u4E0E\u6B63\u6587\u4E0D\u4E00\u81F4\uFF1A${manifestDocument?.path || document.path}`
+        );
+      }
+      if (document.kind === "overview") {
+        overviewCounts.set(
+          displayBranch,
+          (overviewCounts.get(displayBranch) || 0) + 1
+        );
+      }
+    }
+    for (const displayBranch of new Set(
+      websiteLeadDisplayBranchByDirectory.values()
+    )) {
+      if (overviewCounts.get(displayBranch) !== 1) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u5206\u652F ${displayBranch} \u5FC5\u987B\u6709\u4E14\u53EA\u6709\u4E00\u7BC7\u6B63\u5F0F\u7EFC\u8FF0`
+        );
+      }
+    }
+    const completenessCounts = completeness.counts;
+    const completenessDocuments = manifest.schemaVersion === 1 ? customerDocuments : customerLeafDocuments;
+    const statusCountKeys = {
+      verified_first_party: "verifiedFirstParty",
+      verified_authoritative: "verifiedAuthoritative",
+      supported_third_party: "supportedThirdParty",
+      inferred: "inferred",
+      needs_verification: "needsVerification",
+      not_applicable: "notApplicable"
+    };
+    if (!completenessCounts || completenessCounts.totalLeaves !== completenessDocuments.length) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        "00_completeness.json \u7684\u77E5\u8BC6\u5185\u5BB9\u603B\u6570\u4E0E\u5B9E\u9645 01\u201308 \u6587\u6863\u6570\u4E0D\u4E00\u81F4"
+      );
+    }
+    const actualStatusCounts = Object.fromEntries(
+      Object.keys(statusCountKeys).map((status) => [status, 0])
+    );
+    for (const document of completenessDocuments) {
+      actualStatusCounts[document.evidenceStatus] += 1;
+    }
+    for (const [status, countKey] of Object.entries(statusCountKeys)) {
+      if (completenessCounts[countKey] !== actualStatusCounts[status]) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `00_completeness.json \u7684 ${countKey} \u4E0E\u5B9E\u9645\u8BC1\u636E\u72B6\u6001\u4E0D\u4E00\u81F4`
+        );
+      }
+    }
+    if (manifest.schemaVersion === 1 && (actualStatusCounts.not_applicable >= completenessDocuments.length || actualStatusCounts.verified_first_party + actualStatusCounts.verified_authoritative + actualStatusCounts.supported_third_party === 0)) {
+      throw new KnowledgeArchiveValidationError(
+        "content",
+        "\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u5E93\u5FC5\u987B\u81F3\u5C11\u5305\u542B\u4E00\u4E2A\u6709\u8BC1\u636E\u652F\u6301\u7684\u9002\u7528\u5185\u5BB9\u6587\u6863"
+      );
+    }
+  }
+  if (input.profile === "dashboard-enterprise-v1") {
+    for (const document of customerDocuments) {
+      if (!["overview", "leaf"].includes(document.kind || "") || !document.branchId || !document.evidenceStatus) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u6587\u6863\u7F3A\u5C11\u5206\u652F\u3001\u7C7B\u578B\u6216\u8BC1\u636E\u72B6\u6001\uFF1A${document.path}`
+        );
+      }
+      if (!["needs_verification", "not_applicable"].includes(
+        document.evidenceStatus
+      ) && (document.sourceIds?.length || 0) === 0) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `\u6709\u8BC1\u636E\u7684\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u6587\u6863\u5FC5\u987B\u5173\u8054\u6765\u6E90\uFF1A${document.path}`
+        );
+      }
+    }
+    const leafDocuments = customerDocuments.filter(
+      (document) => document.kind === "leaf"
+    );
+    if (leafDocuments.length < 40 || leafDocuments.length > 115) {
+      throw new KnowledgeArchiveValidationError(
+        "content",
+        "\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u5E93\u5FC5\u987B\u5305\u542B 40\u2013115 \u4E2A\u77E5\u8BC6\u53F6\u5B50"
+      );
+    }
+    const leafBranches = new Set(
+      leafDocuments.map((document) => document.branchId).filter(Boolean)
+    );
+    for (const branchId of leafBranches) {
+      const overviewCount = customerDocuments.filter(
+        (document) => document.kind === "overview" && document.branchId === branchId
+      ).length;
+      if (overviewCount !== 1) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u5E93\u5206\u652F ${branchId} \u5FC5\u987B\u6709\u4E14\u53EA\u6709\u4E00\u7BC7\u6B63\u5F0F\u7EFC\u8FF0`
+        );
+      }
+    }
+    const overviewBranches = new Set(
+      customerDocuments.filter((document) => document.kind === "overview").map((document) => document.branchId).filter(Boolean)
+    );
+    for (const branchId of overviewBranches) {
+      if (!leafBranches.has(branchId)) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u5E93\u5206\u652F ${branchId} \u6709\u7EFC\u8FF0\u4F46\u6CA1\u6709\u77E5\u8BC6\u53F6\u5B50`
+        );
+      }
+    }
+    const completenessCounts = completeness.counts;
+    const statusCountKeys = {
+      verified_first_party: "verifiedFirstParty",
+      verified_authoritative: "verifiedAuthoritative",
+      supported_third_party: "supportedThirdParty",
+      inferred: "inferred",
+      needs_verification: "needsVerification",
+      not_applicable: "notApplicable"
+    };
+    if (!completenessCounts || completenessCounts.totalLeaves !== leafDocuments.length) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        "00_completeness.json \u7684\u53F6\u5B50\u603B\u6570\u4E0E\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u53F6\u5B50\u4E0D\u4E00\u81F4"
+      );
+    }
+    const actualStatusCounts = Object.fromEntries(
+      Object.keys(statusCountKeys).map((status) => [status, 0])
+    );
+    for (const document of leafDocuments) {
+      actualStatusCounts[document.evidenceStatus] += 1;
+    }
+    for (const [status, countKey] of Object.entries(statusCountKeys)) {
+      if (completenessCounts[countKey] !== actualStatusCounts[status]) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `00_completeness.json \u7684 ${countKey} \u4E0E\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u53F6\u5B50\u4E0D\u4E00\u81F4`
+        );
+      }
+    }
+  }
+  const packageDocumentById = new Map(
+    enrichedDocuments.filter((document) => document.id).map((document) => [document.id, document])
+  );
+  const evidenceCharacterByDocumentId = new Map(
+    enrichedDocuments.filter(
+      (document) => document.id && document.kind === "evidence" && document.customerVisible === false
+    ).map((document) => [
+      document.id,
+      packagedEvidenceDocumentCharacters(document)
+    ])
+  );
+  if (input.profile === "website-lead-v1" && manifest.schemaVersion === 2) {
+    const branchEvidence = manifest.branchEvidence || [];
+    const overviewById = new Map(
+      customerOverviewDocuments.filter((document) => document.id).map((document) => [document.id, document])
+    );
+    for (const branch of branchEvidence) {
+      const overview = overviewById.get(branch.overviewDocumentId);
+      const overviewDisplayBranch = overview?.branchId ? websiteLeadDisplayBranchByDirectory.get(overview.branchId) : void 0;
+      if (!overview || overviewDisplayBranch !== branch.branchId) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `Website v2 branchEvidence \u5173\u8054\u4E86\u65E0\u6548\u7EFC\u8FF0\uFF1A${branch.branchId}`
+        );
+      }
+      const linkedEvidenceIds = new Set(
+        customerDocuments.filter(
+          (document) => Boolean(document.branchId) && websiteLeadDisplayBranchByDirectory.get(document.branchId) === branch.branchId
+        ).flatMap((document) => document.evidenceDocumentIds || [])
+      );
+      const actualEvidenceCharacters = [...linkedEvidenceIds].reduce(
+        (total, evidenceId) => total + (evidenceCharacterByDocumentId.get(evidenceId) || 0),
+        0
+      );
+      const expectedMinimum = websiteV2OverviewRequirement(
+        actualEvidenceCharacters,
+        branch.branchId
+      );
+      if (branch.deduplicatedEvidenceCharacters !== actualEvidenceCharacters || branch.dynamicOverviewMinimum !== expectedMinimum || overview.requiredFormalCharacters !== expectedMinimum || overview.contentStatus !== branch.contentStatus || actualEvidenceCharacters === 0 !== (branch.contentStatus === "needs_verification")) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `Website v2 branchEvidence \u52A8\u6001\u8981\u6C42\u4E0D\u6B63\u786E\uFF1A${branch.branchId}`
+        );
+      }
+    }
+  }
+  const evidencePathByFingerprint = /* @__PURE__ */ new Map();
+  const evidenceDocuments = enrichedDocuments.filter(
+    (document) => document.kind === "evidence"
+  );
+  const referencedEvidenceDocumentIds = new Set(
+    customerDocuments.flatMap((document) => document.evidenceDocumentIds || [])
+  );
+  for (const evidenceDocument of evidenceDocuments) {
+    const fingerprint = packagedEvidenceDocumentFingerprint(evidenceDocument);
+    if (!fingerprint) continue;
+    const duplicatePath = evidencePathByFingerprint.get(fingerprint);
+    if (duplicatePath) {
+      throw new KnowledgeArchiveValidationError(
+        "content",
+        `\u8BC1\u636E\u6587\u6863\u89C4\u8303\u5316\u540E\u5185\u5BB9\u91CD\u590D\uFF1A${duplicatePath} / ${evidenceDocument.path}`
+      );
+    }
+    evidencePathByFingerprint.set(fingerprint, evidenceDocument.path);
+  }
+  if (manifest.schemaVersion === 2) {
+    const unreferencedEvidence = evidenceDocuments.find(
+      (document) => !document.id || document.customerVisible !== false || !referencedEvidenceDocumentIds.has(document.id)
+    );
+    if (unreferencedEvidence) {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        `v2 \u7684\u6BCF\u4EFD evidence \u6587\u6863\u90FD\u5FC5\u987B\u88AB\u81F3\u5C11\u4E00\u7BC7\u6B63\u5F0F\u6587\u6863\u5F15\u7528\uFF1A${unreferencedEvidence.path}`
+      );
+    }
+  }
+  const productBranchIds = new Set(
+    enrichedDocuments.filter(
+      (document) => document.kind === "leaf" && (input.profile !== "website-lead-v1" || document.branchId === "03_products") && ((document.productFamilyIds?.length || 0) > 0 || Boolean(document.productFamilyId))
+    ).map((document) => document.branchId || "")
+  );
+  for (const document of customerDocuments) {
+    if (input.profile === "dashboard-enterprise-v1") {
+      const markedContent = markedFormalContent(document.content);
+      if (markedContent === void 0) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u6B63\u5F0F\u6587\u6863\u7F3A\u5C11\u552F\u4E00\u4E14\u6709\u5E8F\u7684\u6B63\u6587\u6807\u8BB0\uFF1A${document.path}`
+        );
+      }
+      if (/^(?:#{1,6})\s+.*(?:(?:原始|证据|引用|参考)?来源|素材清单|展示素材|机器清单|证据状态|状态头|sources?|references?|asset inventory).*$/im.test(
+        markedContent
+      ) || /^\s*>\s*.*(?:状态|status)\s*[:：].*(?:来源|source)\s*[:：]/im.test(
+        markedContent
+      )) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u6B63\u5F0F\u6B63\u6587\u5757\u4E0D\u5F97\u5305\u542B\u6765\u6E90\u3001\u72B6\u6001\u3001\u7D20\u6750\u6216\u8BC1\u636E\u533A\uFF1A${document.path}`
+        );
+      }
+    }
+    const formal = profileFormalKnowledgeText(document.content, input.profile);
+    if (/第一方原始快照|第一方页面摘录|页面摘录|raw evidence|page excerpt/i.test(
+      formal
+    )) {
+      throw new KnowledgeArchiveValidationError(
+        "content",
+        `\u6B63\u5F0F\u6B63\u6587\u5305\u542B\u539F\u59CB\u5FEB\u7167\u6216\u9875\u9762\u6458\u5F55\u8868\u8FF0\uFF1A${document.path}`
+      );
+    }
+    if (manifest.schemaVersion === 2 && (document.kind === "overview" || document.kind === "leaf")) {
+      const evidenceDocumentIds = document.evidenceDocumentIds || [];
+      if (new Set(evidenceDocumentIds).size !== evidenceDocumentIds.length) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          `\u8BC1\u636E\u6587\u6863\u5173\u8054\u4E0D\u5F97\u91CD\u590D\uFF1A${document.path}`
+        );
+      }
+      let actualEvidenceCharacters = 0;
+      for (const evidenceDocumentId of evidenceDocumentIds) {
+        const evidenceDocument = packageDocumentById.get(evidenceDocumentId);
+        if (!evidenceDocument || evidenceDocument.kind !== "evidence" || evidenceDocument.customerVisible !== false) {
+          throw new KnowledgeArchiveValidationError(
+            "structure",
+            `\u6B63\u5F0F\u6587\u6863\u5173\u8054\u4E86\u65E0\u6548\u8BC1\u636E\u6587\u6863\uFF1A${document.path} / ${evidenceDocumentId}`
+          );
+        }
+        if (!evidenceDocument.branchId || evidenceDocument.branchId !== document.branchId) {
+          throw new KnowledgeArchiveValidationError(
+            "structure",
+            `\u6B63\u5F0F\u6587\u6863\u53EA\u80FD\u5173\u8054\u663E\u5F0F\u5C5E\u4E8E\u540C\u4E00\u5206\u652F\u7684\u8BC1\u636E\u6587\u6863\uFF1A${document.path} / ${evidenceDocumentId}`
+          );
+        }
+        if (!(document.sourceIds || []).some(
+          (sourceId) => (evidenceDocument.sourceIds || []).includes(sourceId)
+        )) {
+          throw new KnowledgeArchiveValidationError(
+            "structure",
+            `\u6B63\u5F0F\u6587\u6863\u4E0E\u8BC1\u636E\u6587\u6863\u6CA1\u6709\u5171\u540C\u6765\u6E90\uFF1A${document.path} / ${evidenceDocumentId}`
+          );
+        }
+        actualEvidenceCharacters += evidenceCharacterByDocumentId.get(evidenceDocumentId) || 0;
+      }
+      if (document.evidenceCharacters !== actualEvidenceCharacters) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u8BC1\u636E\u5B57\u7B26\u6570\u4E0E\u670D\u52A1\u7AEF\u590D\u7B97\u7ED3\u679C\u4E0D\u4E00\u81F4\uFF1A${document.path}`
+        );
+      }
+      const expected = evidenceProportionalFormalRequirement({
+        kind: document.kind,
+        isProductBranch: productBranchIds.has(document.branchId || ""),
+        evidenceCharacters: actualEvidenceCharacters
+      });
+      const requiredFormalCharacters = input.profile === "website-lead-v1" ? document.kind === "leaf" ? websiteV2LeafRequirement(actualEvidenceCharacters) : document.requiredFormalCharacters : expected.required;
+      if (input.profile === "website-lead-v1" && document.kind === "leaf" && document.requiredFormalCharacters !== requiredFormalCharacters) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `Website v2 \u53F6\u5B50\u52A8\u6001\u8981\u6C42\u4E0D\u6B63\u786E\uFF1A${document.path}`
+        );
+      }
+      if (input.profile === "dashboard-enterprise-v1" && (document.requiredFormalCharacters !== expected.required || document.contentStatus !== expected.status)) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u6B63\u6587\u52A8\u6001\u8981\u6C42\u6216\u5185\u5BB9\u72B6\u6001\u4E0D\u6B63\u786E\uFF1A${document.path}`
+        );
+      }
+      if (actualEvidenceCharacters === 0 && !["needs_verification", "not_applicable"].includes(
+        document.evidenceStatus || ""
+      )) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u65E0\u8BC1\u636E\u6587\u6863\u5FC5\u987B\u660E\u786E\u6807\u8BB0\u5F85\u6838\u9A8C\u6216\u4E0D\u9002\u7528\uFF1A${document.path}`
+        );
+      }
+      if (effectiveCharacterCount(formal) < requiredFormalCharacters) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u6B63\u5F0F\u6B63\u6587\u672A\u8FBE\u5230\u8BC1\u636E\u81EA\u9002\u5E94\u8981\u6C42 ${requiredFormalCharacters} \u4E2A\u6709\u6548\u5B57\u7B26\uFF1A${document.path}`
+        );
+      }
+    } else {
+      const evidenceBacked = document.kind === "leaf" && document.evidenceStatus !== "needs_verification" && document.evidenceStatus !== "not_applicable";
+      if (evidenceBacked && effectiveCharacterCount(formal) < 120) {
+        throw new KnowledgeArchiveValidationError(
+          "content",
+          `\u6709\u8BC1\u636E\u77E5\u8BC6\u53F6\u5B50\u7684\u6B63\u5F0F\u6B63\u6587\u5C11\u4E8E 120 \u4E2A\u6709\u6548\u5B57\u7B26\uFF1A${document.path}`
+        );
+      }
+    }
+  }
+  const formalCharacters = customerDocuments.reduce(
+    (total, document) => total + effectiveCharacterCount(
+      profileFormalKnowledgeText(document.content, input.profile)
+    ),
+    0
+  );
+  if (manifest.schemaVersion === 1 && formalCharacters < limits.minCharacters || formalCharacters > limits.maxCharacters) {
+    throw new KnowledgeArchiveValidationError(
+      "content",
+      manifest.schemaVersion === 1 ? `\u6B63\u5F0F\u6B63\u6587\u5FC5\u987B\u5728 ${limits.minCharacters}\u2013${limits.maxCharacters} \u4E2A\u6709\u6548\u5B57\u7B26\u4E4B\u95F4` : `\u6B63\u5F0F\u6B63\u6587\u4E0D\u5F97\u8D85\u8FC7 ${limits.maxCharacters} \u4E2A\u6709\u6548\u5B57\u7B26`
+    );
+  }
+  if (manifest.counts.customerVisibleCharacters !== formalCharacters) {
+    throw new KnowledgeArchiveValidationError(
+      "content",
+      "package manifest \u6B63\u5F0F\u6B63\u6587\u5B57\u6570\u4E0E\u670D\u52A1\u7AEF\u590D\u7B97\u7ED3\u679C\u4E0D\u4E00\u81F4"
+    );
+  }
+  const evidenceCharacters = packagedEvidenceCharacters(enrichedDocuments);
+  if (evidenceCharacters > limits.maxEvidenceCharacters) {
+    throw new KnowledgeArchiveValidationError(
+      "content",
+      `\u8BC1\u636E\u6587\u5B57\u8D85\u8FC7 ${limits.maxEvidenceCharacters} \u4E2A\u6709\u6548\u5B57\u7B26\u4E0A\u9650`
+    );
+  }
+  if (manifest.counts.evidenceCharacters !== evidenceCharacters) {
+    throw new KnowledgeArchiveValidationError(
+      "content",
+      "package manifest \u8BC1\u636E\u6587\u5B57\u6570\u4E0E\u670D\u52A1\u7AEF\u590D\u7B97\u7ED3\u679C\u4E0D\u4E00\u81F4"
+    );
+  }
+  if ((completeness.acquisition.officialPages?.completed ?? 0) > limits.maxOfficialPages) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      `\u6210\u529F\u91C7\u96C6\u5B98\u7F51\u9875\u9762\u8D85\u8FC7 ${limits.maxOfficialPages} \u9875\u6863\u4F4D\u4E0A\u9650`
+    );
+  }
+  if ((completeness.acquisition.documents?.completed ?? 0) > limits.maxDocuments) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      `\u89E3\u6790\u6587\u6863\u8D85\u8FC7 ${limits.maxDocuments} \u4EFD\u6863\u4F4D\u4E0A\u9650`
+    );
+  }
+  if ((completeness.acquisition.webQueries?.completed ?? 0) > limits.maxWebQueries || (completeness.acquisition.webQueries?.total ?? 0) > limits.maxWebQueries) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      `\u516C\u5F00\u67E5\u8BE2\u8D85\u8FC7 ${limits.maxWebQueries} \u6B21\u6863\u4F4D\u4E0A\u9650`
+    );
+  }
+  const duplicates = duplicateFormalParagraphs(
+    customerDocuments,
+    input.profile
+  );
+  if (duplicates.length > 0) {
+    throw new KnowledgeArchiveValidationError(
+      "content",
+      `\u6B63\u5F0F\u6B63\u6587\u5305\u542B\u8DE8\u53F6\u5B50\u91CD\u590D\u6A21\u677F\uFF1A${duplicates[0].first} / ${duplicates[0].second}`
+    );
+  }
+  return {
+    documents: enrichedDocuments.map(
+      (document) => document.customerVisible ? {
+        ...document,
+        content: customerDisplayMarkdown(
+          input.profile === "dashboard-enterprise-v1" ? markedFormalContent(document.content) || "" : document.content
+        )
+      } : document
+    ).sort((left, right) => (left.order ?? 1e4) - (right.order ?? 1e4)),
+    assets: enrichedAssets,
+    manifest
+  };
 }
 function parseCsvRows(text2) {
   const rows = [];
@@ -29693,9 +31519,16 @@ function dashboardImportTransactionHooks(input) {
     }
   };
 }
-async function readKnowledgeArchive(buffer, sourceFileName, snapshotId) {
+async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options = {}) {
+  const validationProfile = options.validationProfile ?? "historical";
   const extension = path7.extname(sourceFileName).toLowerCase();
   if (extension !== ".zip") {
+    if (validationProfile !== "historical") {
+      throw new KnowledgeArchiveValidationError(
+        "structure",
+        "\u65B0\u7248\u77E5\u8BC6\u5E93\u5FC5\u987B\u4EA4\u4ED8 ZIP \u5F52\u6863"
+      );
+    }
     if (!textExtensions.has(extension)) {
       throw new Error("\u77E5\u8BC6\u5E93\u6587\u4EF6\u4EC5\u652F\u6301 ZIP\u3001Markdown\u3001TXT\u3001JSON \u6216 CSV");
     }
@@ -29715,18 +31548,36 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId) {
     };
   }
   if (buffer.length < 4 || buffer.subarray(0, 4).toString("binary") !== "PK" && buffer.subarray(0, 4).toString("binary") !== "PK" && buffer.subarray(0, 4).toString("binary") !== "PK\x07\b") {
-    throw new Error("\u77E5\u8BC6\u5E93\u6587\u4EF6\u4E0D\u662F\u6709\u6548\u7684 ZIP \u538B\u7F29\u5305");
+    const error = new Error("\u77E5\u8BC6\u5E93\u6587\u4EF6\u4E0D\u662F\u6709\u6548\u7684 ZIP \u538B\u7F29\u5305");
+    if (validationProfile !== "historical") {
+      throw new KnowledgeArchiveValidationError("unsafe", error.message);
+    }
+    throw error;
   }
-  const archive = await JSZip2.loadAsync(buffer, { checkCRC32: true });
+  let archive;
+  try {
+    archive = await JSZip2.loadAsync(buffer, { checkCRC32: true });
+  } catch (error) {
+    if (validationProfile !== "historical") {
+      throw new KnowledgeArchiveValidationError(
+        "unsafe",
+        error instanceof Error ? error.message : "\u77E5\u8BC6\u5E93 ZIP \u65E0\u6CD5\u5B89\u5168\u89E3\u538B"
+      );
+    }
+    throw error;
+  }
   const entries = Object.values(archive.files).filter((entry) => !entry.dir);
   if (entries.length > MAX_ARCHIVE_ENTRIES) {
-    throw new Error(
-      `\u77E5\u8BC6\u5E93\u538B\u7F29\u5305\u6587\u4EF6\u8FC7\u591A\uFF0C\u6700\u591A\u652F\u6301 ${MAX_ARCHIVE_ENTRIES} \u4E2A\u6587\u4EF6`
-    );
+    const message = `\u77E5\u8BC6\u5E93\u538B\u7F29\u5305\u6587\u4EF6\u8FC7\u591A\uFF0C\u6700\u591A\u652F\u6301 ${MAX_ARCHIVE_ENTRIES} \u4E2A\u6587\u4EF6`;
+    if (validationProfile !== "historical") {
+      throw new KnowledgeArchiveValidationError("unsafe", message);
+    }
+    throw new Error(message);
   }
   const documents = [];
   const assets = [];
   const storedAssetKeys = [];
+  const rawTextByArchivePath = /* @__PURE__ */ new Map();
   let unpackedBytes = 0;
   let declaredUnpackedBytes = 0;
   await mkdir2(storageRoot2, { recursive: true });
@@ -29746,6 +31597,20 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId) {
       normalizedPaths.add(normalizedKey2);
       packagePaths.push(archivePath);
       const fileExtension = path7.extname(archivePath).toLowerCase();
+      if (validationProfile !== "historical" && [".bmp", ".heic", ".heif", ".ico", ".svg", ".tif", ".tiff"].includes(
+        fileExtension
+      )) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `\u77E5\u8BC6\u5E93\u56FE\u7247\u5FC5\u987B\u8F6C\u4E3A AVIF\u3001WebP\u3001PNG\u3001JPEG \u6216 GIF\uFF1A${archivePath}`
+        );
+      }
+      if (validationProfile !== "historical" && !versionedArchiveAllowedExtensions.has(fileExtension)) {
+        throw new KnowledgeArchiveValidationError(
+          executableArchiveExtensions.has(fileExtension) ? "unsafe" : "structure",
+          `\u65B0\u7248\u77E5\u8BC6\u5E93 ZIP \u5305\u542B\u4E0D\u652F\u6301\u7684\u6587\u4EF6\u7C7B\u578B\uFF1A${archivePath}`
+        );
+      }
       if (fileExtension === ".html" || fileExtension === ".htm") {
         throw new Error("\u77E5\u8BC6\u5E93 ZIP \u4E0D\u5141\u8BB8\u5305\u542B HTML \u6216\u4EA4\u4E92\u5F0F\u7F51\u9875\u6587\u4EF6");
       }
@@ -29781,21 +31646,32 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId) {
         if (bytes.length > MAX_IMAGE_BYTES) {
           throw new Error(`\u77E5\u8BC6\u5E93\u56FE\u7247\u8FC7\u5927\uFF1A${archivePath}`);
         }
-        if (!isSupportedImageBytes(fileExtension, bytes)) {
+        const dimensions = validationProfile === "historical" ? basicRasterImageDimensions(fileExtension, bytes) : await decodedRasterImageDimensions(fileExtension, bytes);
+        const imageIsValid = validationProfile === "historical" ? hasSupportedImageSignature(fileExtension, bytes) : Boolean(dimensions);
+        if (!imageIsValid) {
           throw new Error(`\u77E5\u8BC6\u5E93\u56FE\u7247\u683C\u5F0F\u4E0E\u5185\u5BB9\u4E0D\u5339\u914D\uFF1A${archivePath}`);
         }
         const key = `${randomUUID20()}${fileExtension}`;
         await writeFile2(path7.join(storageRoot2, key), bytes, { flag: "wx" });
         storedAssetKeys.push(key);
-        assets.push({ key, path: archivePath, mimeType, size: bytes.length });
+        assets.push({
+          key,
+          path: archivePath,
+          mimeType,
+          size: bytes.length,
+          sha256: createHash14("sha256").update(bytes).digest("hex"),
+          ...dimensions
+        });
       } else {
         if (bytes.length > MAX_DOCUMENT_BYTES) {
           throw new Error(`\u77E5\u8BC6\u5E93\u6587\u6863\u8FC7\u5927\uFF1A${archivePath}`);
         }
+        const rawText = bytes.toString("utf8").replace(/^\uFEFF/, "");
+        rawTextByArchivePath.set(archivePath, rawText);
         documents.push({
           path: archivePath,
           title: titleFromPath(archivePath),
-          content: normalizeTextDocument(archivePath, bytes.toString("utf8"))
+          content: normalizeTextDocument(archivePath, rawText)
         });
       }
     }
@@ -29815,13 +31691,38 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId) {
     if (missingRequired.length > 0) {
       throw new Error(`\u77E5\u8BC6\u5E93 ZIP \u7F3A\u5C11\u6807\u51C6\u6587\u4EF6\uFF1A${missingRequired.join("\u3001")}`);
     }
+    if (validationProfile !== "historical") {
+      for (const requiredPath of [packageManifestPath, completenessPath]) {
+        if (!lowerPaths.has(`${root}/${requiredPath}`.toLowerCase())) {
+          throw new KnowledgeArchiveValidationError(
+            "structure",
+            `\u77E5\u8BC6\u5E93 ZIP \u7F3A\u5C11 ${requiredPath}`
+          );
+        }
+      }
+    }
     if (documents.length === 0) {
       throw new Error("\u538B\u7F29\u5305\u4E2D\u6CA1\u6709\u53EF\u5C55\u793A\u7684 Markdown\u3001TXT\u3001JSON \u6216 CSV \u6587\u6863");
     }
-    const linkedDocuments = documents.map((document) => {
+    const rawTextByRelativePath = new Map(
+      [...rawTextByArchivePath.entries()].map(([archivePath, rawText]) => [
+        archivePath.slice(root.length + 1),
+        rawText
+      ])
+    );
+    const validated = validationProfile === "historical" ? { documents, assets } : validateProfilePackage({
+      profile: validationProfile,
+      archiveContractVersion: options.archiveContractVersion,
+      packagePaths,
+      unpackedBytes,
+      rawTextByRelativePath,
+      documents,
+      assets
+    });
+    const linkedDocuments = validated.documents.map((document) => {
       let content = document.content;
-      assets.forEach((asset, index2) => {
-        const url = `/api/dashboard/knowledge/assets/${snapshotId}/${index2}`;
+      validated.assets.forEach((asset, index2) => {
+        const url = asset.id ? `/api/dashboard/knowledge/assets/${snapshotId}/by-id/${encodeURIComponent(asset.id)}` : `/api/dashboard/knowledge/assets/${snapshotId}/${index2}`;
         const relativePath = path7.posix.relative(
           path7.posix.dirname(document.path),
           asset.path
@@ -29840,13 +31741,31 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId) {
       });
       return { ...document, content };
     });
-    return { documents: linkedDocuments, assets, storedAssetKeys };
+    return {
+      documents: linkedDocuments,
+      assets: validated.assets,
+      storedAssetKeys,
+      validationProfile,
+      packageManifestSha256: rawTextByRelativePath.has(packageManifestPath) ? createHash14("sha256").update(
+        Buffer.from(
+          rawTextByRelativePath.get(packageManifestPath),
+          "utf8"
+        )
+      ).digest("hex") : void 0
+    };
   } catch (error) {
     await Promise.all(
       storedAssetKeys.map(
         (key) => unlink2(path7.join(storageRoot2, key)).catch(() => void 0)
       )
     );
+    if (validationProfile !== "historical" && !(error instanceof KnowledgeArchiveValidationError)) {
+      const message = error instanceof Error ? error.message : "\u77E5\u8BC6\u5E93\u5F52\u6863\u6821\u9A8C\u5931\u8D25";
+      throw new KnowledgeArchiveValidationError(
+        classifyKnowledgeArchiveError(message),
+        message
+      );
+    }
     throw error;
   }
 }
@@ -30208,7 +32127,11 @@ router5.post("/knowledge/publish", async (req, res) => {
     const parsed = await readKnowledgeArchive(
       downloaded.buffer,
       downloaded.filename,
-      snapshotId
+      snapshotId,
+      {
+        validationProfile: build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
+        archiveContractVersion: build.skillVersion === "1" ? void 0 : 2
+      }
     );
     storedAssetKeys = parsed.storedAssetKeys;
     const workspace = await getDashboardWorkspace(targetUserId);
@@ -30243,7 +32166,7 @@ router5.post("/knowledge/publish", async (req, res) => {
     res.status(error instanceof ServiceEntitlementError ? error.statusCode : 400).json({
       error: {
         message: error instanceof Error ? error.message : "\u65E0\u6CD5\u53D1\u5E03\u77E5\u8BC6\u5E93",
-        code: error instanceof ServiceEntitlementError ? error.code : "KNOWLEDGE_PUBLISH_FAILED"
+        code: error instanceof ServiceEntitlementError ? error.code : knowledgeArchiveErrorCode(error) || "KNOWLEDGE_PUBLISH_FAILED"
       }
     });
   }
@@ -30972,7 +32895,8 @@ router5.put(
       const parsed = await readKnowledgeArchive(
         buffer,
         sourceFileName,
-        snapshotId
+        snapshotId,
+        { validationProfile: "historical" }
       );
       try {
         const workspace = await getDashboardWorkspace(targetUserId);
@@ -31032,9 +32956,30 @@ router5.put(
       ).json({
         error: {
           message: error instanceof Error ? error.message : "\u65E0\u6CD5\u5BFC\u5165\u6587\u4EF6",
-          code: error instanceof ServiceEntitlementError ? error.code : enterpriseMismatch ? "ENTERPRISE_IDENTITY_CONFLICT" : revisionConflict ? "DASHBOARD_REVISION_CONFLICT" : monitoringTargetRequired ? error.code : monitoringPreviewConflict ? error.code : dashboardImportPreviewConflict ? error.code : dashboardImportPreflightConflict ? error.code : responseLogicRevisionConflict ? error.code : "IMPORT_FAILED"
+          code: error instanceof ServiceEntitlementError ? error.code : enterpriseMismatch ? "ENTERPRISE_IDENTITY_CONFLICT" : revisionConflict ? "DASHBOARD_REVISION_CONFLICT" : monitoringTargetRequired ? error.code : monitoringPreviewConflict ? error.code : dashboardImportPreviewConflict ? error.code : dashboardImportPreflightConflict ? error.code : responseLogicRevisionConflict ? error.code : knowledgeArchiveErrorCode(error) || "IMPORT_FAILED"
         }
       });
+    }
+  }
+);
+router5.get(
+  "/knowledge/assets/:snapshotId/by-id/:assetId",
+  async (req, res) => {
+    try {
+      const assetId = z17.string().trim().min(1).max(191).parse(req.params.assetId);
+      const result = await getKnowledgeAssetById({
+        snapshotId: req.params.snapshotId,
+        assetId
+      });
+      if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
+      await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
+      const bytes = await readFile2(path7.join(storageRoot2, result.asset.key));
+      res.setHeader("Content-Type", result.asset.mimeType);
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      res.setHeader("Content-Disposition", "inline");
+      res.send(bytes);
+    } catch {
+      res.status(404).json({ error: { message: "\u8D44\u6E90\u4E0D\u5B58\u5728", code: "NOT_FOUND" } });
     }
   }
 );
@@ -31306,17 +33251,40 @@ function compactSnapshot(snapshot) {
   const characterBudget = 1e5;
   let used = 0;
   const documents = [];
-  for (const document of snapshot.documents) {
+  const formalDocuments = snapshot.documents.filter(
+    (document) => document.customerVisible !== false && !["evidence", "report", "index"].includes(document.kind || "")
+  );
+  const candidates = formalDocuments.length > 0 ? formalDocuments : snapshot.documents;
+  const priority = (document) => document.kind === "overview" ? 0 : document.kind === "leaf" ? 1 : 2;
+  const byBranch = /* @__PURE__ */ new Map();
+  for (const document of [...candidates].sort(
+    (left, right) => priority(left) - priority(right) || (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER) || left.path.localeCompare(right.path, "zh-CN")
+  )) {
+    const branchKey = document.branchId?.trim() || document.branchTitle?.trim() || "\u672A\u5206\u652F";
+    const branchDocuments = byBranch.get(branchKey) || [];
+    branchDocuments.push(document);
+    byBranch.set(branchKey, branchDocuments);
+  }
+  const branchQueues = [...byBranch.values()];
+  const orderedDocuments = [];
+  while (branchQueues.some((queue) => queue.length > 0)) {
+    for (const queue of branchQueues) {
+      const document = queue.shift();
+      if (document) orderedDocuments.push(document);
+    }
+  }
+  for (const document of orderedDocuments) {
     if (used >= characterBudget) break;
     const remaining = characterBudget - used;
-    const content = document.content.slice(0, remaining);
+    const content = document.content.slice(0, Math.min(remaining, 2e4));
     used += content.length;
     documents.push(
       [
         `## ${document.title || document.path}`,
+        document.branchTitle ? `branch: ${document.branchTitle}` : "",
         `documentPath: ${document.path}`,
         content
-      ].join("\n")
+      ].filter(Boolean).join("\n")
     );
   }
   return documents.join("\n\n") || "\u5F53\u524D\u77E5\u8BC6\u5E93\u6CA1\u6709\u53EF\u7528\u6B63\u6587\u3002";
@@ -34986,8 +36954,7 @@ import { createHash as createHash20, randomUUID as randomUUID24 } from "node:cry
 import { and as and22, eq as eq27 } from "drizzle-orm";
 import { z as z24 } from "zod";
 var sha256Schema3 = z24.string().trim().regex(/^[a-f0-9]{64}$/i);
-var websiteKnowledgeImportSchema = z24.object({
-  schemaVersion: z24.literal(2),
+var websiteKnowledgeImportBaseSchema = z24.object({
   companyName: z24.string().trim().min(1).max(200),
   taskId: z24.string().trim().min(1).max(255),
   outputItemId: z24.string().trim().min(1).max(255),
@@ -34995,7 +36962,21 @@ var websiteKnowledgeImportSchema = z24.object({
   descriptorHash: sha256Schema3,
   artifactSha256: sha256Schema3,
   filename: z24.string().trim().min(1).max(512)
-}).strict();
+});
+var websiteKnowledgeImportSchema = z24.discriminatedUnion(
+  "schemaVersion",
+  [
+    websiteKnowledgeImportBaseSchema.extend({
+      schemaVersion: z24.literal(2)
+    }).strict(),
+    websiteKnowledgeImportBaseSchema.extend({
+      schemaVersion: z24.literal(3),
+      archiveContractVersion: z24.union([z24.literal(1), z24.literal(2)]),
+      validationProfile: z24.literal("website-lead-v1"),
+      packageManifestSha256: sha256Schema3
+    }).strict()
+  ]
+);
 var KnowledgeImportError = class extends Error {
   constructor(code, message, status, retryAfterMs) {
     super(message);
@@ -35056,8 +37037,26 @@ function resolveKnowledgeImportProjectOwner(provisions, requestedCompanyName) {
 function idempotencyHash(value) {
   return createHash20("sha256").update(value, "utf8").digest("hex");
 }
-function knowledgeArtifactReceiptMatchesRequest(receipt, input) {
+var websiteKnowledgeImportV3ReferencePrefix = "website-kb:v3";
+function knowledgeImportReceiptSourceReference(input) {
+  if (input.value.schemaVersion === 3) {
+    return [
+      websiteKnowledgeImportV3ReferencePrefix,
+      input.value.archiveContractVersion,
+      input.value.validationProfile,
+      input.value.packageManifestSha256.toLowerCase()
+    ].join(":");
+  }
+  return `${input.projectId}:${input.value.taskId}`.slice(0, 191);
+}
+function knowledgeArtifactReceiptDescriptorMatchesRequest(receipt, input) {
   return receipt.projectId === input.projectId && receipt.taskId === input.value.taskId && receipt.outputItemId === input.value.outputItemId && (receipt.fileId ?? null) === (input.value.fileId ?? null) && receipt.descriptorHash?.toLowerCase() === input.value.descriptorHash.toLowerCase();
+}
+function knowledgeArtifactReceiptMatchesRequest(receipt, input) {
+  if (!knowledgeArtifactReceiptDescriptorMatchesRequest(receipt, input)) {
+    return false;
+  }
+  return input.value.schemaVersion === 2 || receipt.sourceReference === knowledgeImportReceiptSourceReference(input);
 }
 async function requireImportDb() {
   const db = await getDb();
@@ -35077,15 +37076,19 @@ async function reserveReceipt(input) {
     const rows = await tx.select().from(knowledgeImportReceipts).where(eq27(knowledgeImportReceipts.idempotencyKeyHash, keyHash)).limit(1).for("update");
     const existing = rows[0];
     if (existing) {
-      const sameRequest = existing.userId === input.userId && existing.projectId === input.projectId && existing.taskId === input.value.taskId && existing.outputItemId === input.value.outputItemId && (existing.fileId ?? null) === (input.value.fileId ?? null) && existing.descriptorHash?.toLowerCase() === input.value.descriptorHash.toLowerCase() && existing.artifactHash.toLowerCase() === input.value.artifactSha256.toLowerCase();
-      if (!sameRequest) {
+      const sameArtifact2 = existing.userId === input.userId && knowledgeArtifactReceiptDescriptorMatchesRequest(existing, input) && existing.artifactHash.toLowerCase() === input.value.artifactSha256.toLowerCase();
+      if (!sameArtifact2) {
         throw new KnowledgeImportError(
           "IDEMPOTENCY_CONFLICT",
           "\u8BE5\u5E42\u7B49\u952E\u5DF2\u7528\u4E8E\u4E0D\u540C\u7684\u77E5\u8BC6\u5E93\u4EA7\u7269",
           409
         );
       }
-      if (existing.status === "completed" && existing.snapshotId) {
+      const sameRequest = knowledgeArtifactReceiptMatchesRequest(
+        existing,
+        input
+      );
+      if (sameRequest && existing.status === "completed" && existing.snapshotId) {
         return {
           state: "completed",
           receiptId: existing.id,
@@ -35106,6 +37109,7 @@ async function reserveReceipt(input) {
         attemptCount: existing.attemptCount + 1,
         errorCode: null,
         errorMessage: null,
+        sourceReference: knowledgeImportReceiptSourceReference(input),
         updatedAt: input.now
       }).where(eq27(knowledgeImportReceipts.id, existing.id));
       return { state: "acquired", receiptId: existing.id };
@@ -35121,23 +37125,38 @@ async function reserveReceipt(input) {
     ).limit(1).for("update");
     const existingArtifact = artifactRows[0];
     if (existingArtifact) {
-      const sameArtifactRequest = knowledgeArtifactReceiptMatchesRequest(
+      const sameArtifactDescriptor = knowledgeArtifactReceiptDescriptorMatchesRequest(
         existingArtifact,
         input
       );
-      if (!sameArtifactRequest) {
+      if (!sameArtifactDescriptor) {
         throw new KnowledgeImportError(
           "IDEMPOTENCY_CONFLICT",
           "\u76F8\u540C\u77E5\u8BC6\u5E93\u4EA7\u7269\u5DF2\u7531\u53E6\u4E00\u4EFD\u4EFB\u52A1\u63CF\u8FF0\u5BFC\u5165\uFF0C\u4E0D\u80FD\u91CD\u590D\u7ED1\u5B9A",
           409
         );
       }
-      if (existingArtifact.status === "completed" && existingArtifact.snapshotId) {
+      const sameArtifactRequest = knowledgeArtifactReceiptMatchesRequest(
+        existingArtifact,
+        input
+      );
+      if (sameArtifactRequest && existingArtifact.status === "completed" && existingArtifact.snapshotId) {
         return {
           state: "completed",
           receiptId: existingArtifact.id,
           snapshot: await getLatestKnowledgeSnapshot(input.userId)
         };
+      }
+      if (input.value.schemaVersion === 3 && !sameArtifactRequest && existingArtifact.status === "completed" && existingArtifact.snapshotId) {
+        await tx.update(knowledgeImportReceipts).set({
+          status: "processing",
+          attemptCount: existingArtifact.attemptCount + 1,
+          errorCode: null,
+          errorMessage: null,
+          sourceReference: knowledgeImportReceiptSourceReference(input),
+          updatedAt: input.now
+        }).where(eq27(knowledgeImportReceipts.id, existingArtifact.id));
+        return { state: "acquired", receiptId: existingArtifact.id };
       }
       if (existingArtifact.status === "pending" || existingArtifact.status === "processing") {
         throw new KnowledgeImportError(
@@ -35165,10 +37184,7 @@ async function reserveReceipt(input) {
         fileId: input.value.fileId ?? null,
         outputItemId: input.value.outputItemId,
         descriptorHash: input.value.descriptorHash.toLowerCase(),
-        sourceReference: `${input.projectId}:${input.value.taskId}`.slice(
-          0,
-          191
-        ),
+        sourceReference: knowledgeImportReceiptSourceReference(input),
         idempotencyKeyHash: keyHash,
         artifactHash: input.value.artifactSha256.toLowerCase(),
         sourceFileName: input.value.filename,
@@ -35322,8 +37338,19 @@ async function importWebsiteKnowledgeArtifact(input) {
     const parsed = await readKnowledgeArchive(
       downloaded.buffer,
       downloaded.filename,
-      snapshotId
+      snapshotId,
+      {
+        validationProfile: value.schemaVersion === 3 ? "website-lead-v1" : "historical",
+        archiveContractVersion: value.schemaVersion === 3 ? value.archiveContractVersion : void 0
+      }
     );
+    if (value.schemaVersion === 3 && parsed.packageManifestSha256?.toLowerCase() !== value.packageManifestSha256.toLowerCase()) {
+      throw new KnowledgeImportError(
+        "ARTIFACT_HASH_MISMATCH",
+        "\u77E5\u8BC6\u5E93 package manifest \u54C8\u5E0C\u4E0E\u5B98\u7F51\u58F0\u660E\u4E0D\u4E00\u81F4",
+        409
+      );
+    }
     storedAssetKeys = parsed.storedAssetKeys;
     const workspace = await getDashboardWorkspace(provision.userId);
     if (normalizedEnterpriseName3(workspace.payload.brandName) !== normalizedEnterpriseName3(value.companyName)) {
@@ -36427,7 +38454,7 @@ function createProvisioningRouter(options = {}) {
         }
         const configuredWorkspaceUrl = process.env.FRONTMIND_PUBLIC_URL?.trim().replace(/\/$/, "");
         res.status(result.replayed ? 200 : 201).json({
-          schemaVersion: 2,
+          schemaVersion: value.schemaVersion,
           knowledgeImport: {
             id: result.receiptId,
             projectId,
@@ -36982,7 +39009,7 @@ import { ZodError } from "zod";
 
 // server/website-content-template-service.ts
 import { randomUUID as randomUUID25 } from "node:crypto";
-import { and as and26, asc as asc8, eq as eq31, inArray as inArray13 } from "drizzle-orm";
+import { and as and26, asc as asc9, eq as eq31, inArray as inArray13 } from "drizzle-orm";
 var WEBSITE_CONTENT_CATEGORIES2 = WEBSITE_CONTENT_CATALOG.map(
   (item) => item.value
 );
@@ -37051,7 +39078,7 @@ async function loadWebsiteContentTicketRows(executor, workspaceUserId2, lock = f
       eq31(deliveryTickets.type, "website_operation"),
       inArray13(deliveryTickets.category, WEBSITE_CONTENT_CATEGORIES2)
     )
-  ).orderBy(asc8(deliveryTickets.createdAt), asc8(deliveryTickets.id));
+  ).orderBy(asc9(deliveryTickets.createdAt), asc9(deliveryTickets.id));
   if (lock) query = query.for("update");
   return await query;
 }
@@ -37545,6 +39572,7 @@ var website_content_template_api_default = router11;
 // server/_core/index.ts
 var paymentReceiptLedgerReadiness = createPaymentReceiptLedgerService();
 var projectOrderRegistryReadiness = createProjectOrderRegistryService();
+var applicationBuildSha = process.env.FRONTMIND_BUILD_SHA?.trim() || process.env.COMMIT_SHA?.trim() || process.env.RENDER_GIT_COMMIT?.trim() || null;
 function assertProductionConfiguration() {
   if (process.env.NODE_ENV !== "production") return;
   if (!process.env.DATABASE_URL) {
@@ -37620,6 +39648,9 @@ async function startServer() {
       ]);
       res.json({
         status: "ok",
+        build: {
+          sha: applicationBuildSha
+        },
         configuration: {
           monitorCredentialConfigured: isDedicatedMonitorCredentialConfigured(),
           monitorApiBaseUrlConfigured: true,

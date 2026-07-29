@@ -87,19 +87,17 @@ function harness(options?: {
       committed = working;
       return result;
     },
-    createAccount: async (_input: unknown, executor: unknown) => {
+    createAccount: async (input: any, executor: unknown) => {
+      expect(input.passwordHash).toMatch(/^scrypt\$v1\$/);
+      expect(JSON.stringify(input)).not.toContain("customer-initial-password");
       const state = executor as TestState;
       state.accounts.push(501);
       return {
-        user: {
-          ...actor(),
-          id: 501,
-          username: "new.customer",
-          role: "user" as const,
-          adminAccessLevel: null,
-        },
-        setupToken: "one-time-setup-token",
-        setupExpiresAt: new Date("2026-07-30T08:00:00.000Z"),
+        ...actor(),
+        id: 501,
+        username: "new.customer",
+        role: "user" as const,
+        adminAccessLevel: null,
       };
     },
     persistContract: async (value: any, executor: unknown) => {
@@ -146,6 +144,7 @@ describe("managed user onboarding", () => {
         {
           actor: actor("system_admin"),
           username: "new.customer",
+          password: "customer-initial-password",
           displayName: "新客户",
           planCode,
           deliveryAdminId: 42,
@@ -191,7 +190,7 @@ describe("managed user onboarding", () => {
         workspaceUserId: 501,
         metadata: {
           role: "user",
-          setupRequired: true,
+          setupRequired: false,
           planCode,
           contractId: result.contract.id,
           entitlementStatus: "active",
@@ -232,6 +231,7 @@ describe("managed user onboarding", () => {
       {
         actor: actor("system_admin"),
         username: "system.created.customer",
+        password: "customer-initial-password",
         planCode: "advanced",
         deliveryAdminId: 42,
         apiKey: "sk-customer-valid-credential-00000002",
@@ -255,6 +255,7 @@ describe("managed user onboarding", () => {
           {
             actor: actor("system_admin"),
             username: "rollback.customer",
+            password: "customer-initial-password",
             planCode: "luxury",
             deliveryAdminId: 42,
             apiKey: "sk-customer-valid-credential-00000003",
@@ -283,6 +284,7 @@ describe("managed user onboarding", () => {
         {
           actor: userActor,
           username: "forbidden.customer",
+          password: "customer-initial-password",
           planCode: "basic",
           deliveryAdminId: 42,
           apiKey: "sk-customer-valid-credential-00000004",
@@ -302,6 +304,7 @@ describe("managed user onboarding", () => {
         {
           actor: actor("delivery_admin"),
           username: "bypass.customer",
+          password: "customer-initial-password",
           planCode: "luxury",
           deliveryAdminId: 42,
           apiKey: "sk-customer-valid-credential-00000005",
@@ -329,6 +332,7 @@ describe("managed user onboarding", () => {
         {
           actor: actor("system_admin"),
           username: "invalid-key.customer",
+          password: "customer-initial-password",
           planCode: "luxury",
           deliveryAdminId: 42,
           apiKey: "sk-customer-invalid-credential-000001",

@@ -149,4 +149,33 @@ describe("ManagerAssignmentEditor", () => {
       screen.getByRole("checkbox", { name: "交付管理员 2" }),
     ).toBeChecked();
   });
+
+  it("allows a selected system administrator to become the primary owner", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ManagerAssignmentEditor
+        options={[
+          options[0],
+          {
+            id: 99,
+            label: "系统管理员",
+            secondary: "@system_admin",
+            accessLevel: "system_admin",
+          },
+        ]}
+        selectedIds={[1, 99]}
+        usageOwnerId={1}
+        editable
+        onSave={onSave}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑分配" }));
+    fireEvent.change(screen.getByLabelText("主负责人"), {
+      target: { value: "99" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存分配" }));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith([1, 99], 99));
+  });
 });

@@ -17,12 +17,14 @@ import {
 } from "../shared/service-portal";
 import {
   AuthServiceError,
-  createManagedUserWithSetupToken,
+  createManagedUserWithPasswordHash,
   getApiKeyFingerprint,
+  hashPassword,
   replaceApiCredentialInTransaction,
   validateUpstreamApiKey,
   type AuthenticatedUser,
 } from "./auth-service";
+import { hasDeliveryCapability } from "../shared/admin-access";
 import {
   hasSystemAdminAccess,
   writeWorkspaceAuditEvent,
@@ -33,7 +35,9 @@ import {
   getServiceContractTermEnd,
 } from "./service-entitlement";
 
-type SetupAccount = Awaited<ReturnType<typeof createManagedUserWithSetupToken>>;
+type ManagedAccount = Awaited<
+  ReturnType<typeof createManagedUserWithPasswordHash>
+>;
 
 export type InitialManagedServiceContract = {
   id: string;
@@ -49,12 +53,12 @@ type ManagedUserOnboardingDependencies = {
   createAccount?: (
     input: {
       username: string;
+      passwordHash: string;
       displayName?: string | null;
-      createdByUserId: number;
       now: Date;
     },
     executor: unknown,
-  ) => Promise<SetupAccount>;
+  ) => Promise<ManagedAccount>;
   persistContract?: (
     input: {
       contract: typeof serviceContracts.$inferInsert;
@@ -98,14 +102,16 @@ async function defaultTransaction() {
 }
 
 /**
- * Creates a login account, one-time password setup token, direct credential,
- * active contract, quota windows and responsible-admin assignment in one
- * transaction after the credential has been validated upstream.
+ * Creates a password-ready login account, direct credential, active contract,
+ * quota windows and responsible-admin assignment in one transaction after the
+ * credential has been validated upstream. Only the derived password hash is
+ * passed into the transaction.
  */
 export async function createManagedServiceUser(
   input: {
     actor: AuthenticatedUser;
     username: string;
+    password: string;
     displayName?: string | null;
     planCode: ServicePlanCode;
     deliveryAdminId: number;
@@ -126,11 +132,21 @@ export async function createManagedServiceUser(
   const startsAt = now;
   const endsAt = getServiceContractTermEnd(planCode, startsAt);
   await (dependencies.validateApiKey ?? validateUpstreamApiKey)(input.apiKey);
+  const passwordHash = await hashPassword(input.password);
   const transaction = dependencies.transaction ?? (await defaultTransaction());
   const createAccount =
     dependencies.createAccount ??
     ((accountInput, executor) =>
-      createManagedUserWithSetupToken(accountInput, executor));
+      createManagedUserWithPasswordHash(
+        {
+          username: accountInput.username,
+          passwordHash: accountInput.passwordHash,
+          displayName: accountInput.displayName,
+          role: "user",
+          now: accountInput.now,
+        },
+        executor,
+      ));
   const persistContract =
     dependencies.persistContract ??
     (async (value, executor) => {
@@ -180,31 +196,26 @@ export async function createManagedServiceUser(
         .limit(1)
         .for("update");
       const admin = rows[0];
-      if (
-        !admin ||
-        admin.role !== "admin" ||
-        admin.adminAccessLevel !== "delivery_admin" ||
-        admin.isActive !== true
-      ) {
+      if (!admin || !hasDeliveryCapability(admin) || admin.isActive !== true) {
         throw new AuthServiceError(
           "INVALID_CREDENTIAL",
-          "请选择一个已启用的交付管理员作为客户主负责人",
+          "请选择一个已启用的管理员作为客户主负责人",
         );
       }
     });
 
   return transaction(async (executor) => {
     await validateDeliveryAdmin(input.deliveryAdminId, executor);
-    const setup = await createAccount(
+    const user = await createAccount(
       {
         username: input.username,
+        passwordHash,
         displayName: input.displayName,
-        createdByUserId: input.actor.id,
         now,
       },
       executor,
     );
-    const userId = setup.user.id;
+    const userId = user.id;
     const quotaPeriods = createServiceQuotaWindows(planCode, startsAt).map(
       (window) => ({
         id: dependencies.randomId?.() ?? randomUUID(),
@@ -274,7 +285,7 @@ export async function createManagedServiceUser(
         workspaceUserId: userId,
         metadata: {
           role: "user",
-          setupRequired: true,
+          setupRequired: false,
           planCode,
           contractId,
           entitlementStatus: "active",
@@ -286,7 +297,7 @@ export async function createManagedServiceUser(
     );
 
     return {
-      ...setup,
+      user,
       contract: {
         id: contractId,
         userId,
@@ -351,13 +362,12 @@ export async function completeManagedServiceUserProvisioning(
         const admin = rows[0];
         if (
           !admin ||
-          admin.role !== "admin" ||
-          admin.adminAccessLevel !== "delivery_admin" ||
+          !hasDeliveryCapability(admin) ||
           admin.isActive !== true
         ) {
           throw new AuthServiceError(
             "INVALID_CREDENTIAL",
-            "请选择一个已启用的交付管理员作为客户主负责人",
+            "请选择一个已启用的管理员作为客户主负责人",
           );
         }
       });

@@ -10,8 +10,6 @@ const validInternalServiceUpdate = {
   planCode: "advanced" as const,
   status: "active" as const,
   prepaidMonths: 3,
-  orderReference: "sales-order",
-  contractReference: "signed-contract",
   signedAt: Date.now(),
   signatoryId: "enterprise-legal-entity",
   signingEvidence: { verifiedBy: "system-admin" },
@@ -61,7 +59,7 @@ describe("admin service contract input", () => {
   });
 
   it.each(["active", "scheduled"] as const)(
-    "rejects %s activation before order, contract and signing evidence are complete",
+    "rejects %s activation before signing evidence is complete",
     async (status) => {
       const caller = adminRouter.createCaller(systemAdminContext());
       await expect(
@@ -74,8 +72,7 @@ describe("admin service contract input", () => {
         }),
       ).rejects.toMatchObject({
         code: "BAD_REQUEST",
-        message:
-          "生效或待生效合同必须包含订单编号、合同编号、签署主体、签署时间与核验依据",
+        message: "生效或待生效合同必须包含签署主体、签署时间与核验依据",
       });
     },
   );

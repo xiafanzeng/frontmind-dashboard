@@ -33,7 +33,7 @@ import {
 } from "./PreviewPages";
 
 describe("preview account creation form", () => {
-  it("requires one of the three plans for a customer account", () => {
+  it("requires an initial password and one of the four plans for a customer account", () => {
     render(
       <PreviewCreateAccountDialog
         open
@@ -59,6 +59,12 @@ describe("preview account creation form", () => {
     fireEvent.change(screen.getByLabelText("客户套餐"), {
       target: { value: "advanced" },
     });
+    fireEvent.change(screen.getByLabelText("初始密码"), {
+      target: { value: "customer-password" },
+    });
+    fireEvent.change(screen.getByLabelText("确认初始密码"), {
+      target: { value: "customer-password" },
+    });
 
     expect(
       screen.getByRole("button", { name: "创建客户并开通套餐" }),
@@ -79,7 +85,8 @@ describe("preview account creation form", () => {
     });
 
     expect(screen.queryByText("客户套餐")).not.toBeInTheDocument();
-    expect(screen.getByText("管理员初始密码")).toBeInTheDocument();
+    expect(screen.getByText("初始密码")).toBeInTheDocument();
+    expect(screen.getByText("确认初始密码")).toBeInTheDocument();
     expect(screen.getByText("管理员权限")).toBeInTheDocument();
   });
 

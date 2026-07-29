@@ -65,6 +65,11 @@ import { createProjectOrderRegistryService } from "../project-order-registry-ser
 
 const paymentReceiptLedgerReadiness = createPaymentReceiptLedgerService();
 const projectOrderRegistryReadiness = createProjectOrderRegistryService();
+const applicationBuildSha =
+  process.env.FRONTMIND_BUILD_SHA?.trim() ||
+  process.env.COMMIT_SHA?.trim() ||
+  process.env.RENDER_GIT_COMMIT?.trim() ||
+  null;
 
 function assertProductionConfiguration() {
   if (process.env.NODE_ENV !== "production") return;
@@ -152,6 +157,9 @@ async function startServer() {
         ]);
       res.json({
         status: "ok",
+        build: {
+          sha: applicationBuildSha,
+        },
         configuration: {
           monitorCredentialConfigured: isDedicatedMonitorCredentialConfigured(),
           monitorApiBaseUrlConfigured: true,

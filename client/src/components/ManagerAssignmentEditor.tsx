@@ -94,7 +94,9 @@ export default function ManagerAssignmentEditor({
   };
   const selectedDeliveryOptions = options.filter(
     (option) =>
-      draftIds.includes(option.id) && option.accessLevel === "delivery_admin",
+      draftIds.includes(option.id) &&
+      (option.accessLevel === "delivery_admin" ||
+        option.accessLevel === "system_admin"),
   );
   const ownerChanged = (usageOwnerId ?? null) !== draftUsageOwnerId;
 
@@ -205,7 +207,8 @@ export default function ManagerAssignmentEditor({
                           }
                           if (
                             event.target.checked &&
-                            option.accessLevel === "delivery_admin" &&
+                            (option.accessLevel === "delivery_admin" ||
+                              option.accessLevel === "system_admin") &&
                             draftUsageOwnerId == null
                           ) {
                             setDraftUsageOwnerId(option.id);
@@ -246,7 +249,7 @@ export default function ManagerAssignmentEditor({
               htmlFor="usage-owner-admin"
               className="text-xs font-semibold text-[#51465d]"
             >
-              主负责人（交付管理员）
+              主负责人
             </label>
             <select
               id="usage-owner-admin"
@@ -259,7 +262,7 @@ export default function ManagerAssignmentEditor({
               }
               className="mt-2 h-10 w-full rounded-lg border border-[#ddd3e4] bg-white px-3 text-sm text-[#484057]"
             >
-              <option value="">请选择一位交付管理员</option>
+              <option value="">请选择一位管理员</option>
               {selectedDeliveryOptions.map((option) => (
                 <option key={option.id} value={option.id}>
                   {option.label}

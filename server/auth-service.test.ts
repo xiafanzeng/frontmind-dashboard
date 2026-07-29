@@ -87,7 +87,7 @@ describe("managed account deletion", () => {
           mutation,
         }),
       ).toThrowError(
-        `该交付管理员仍负责用户，请先转移这些用户的 Key 与积分归属，再${actionLabel}`,
+        `该管理员仍负责用户，请先转移这些用户的 Key 与积分归属，再${actionLabel}`,
       );
     },
   );

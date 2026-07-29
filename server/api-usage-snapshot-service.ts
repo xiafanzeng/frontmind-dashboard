@@ -101,7 +101,6 @@ async function accessibleDeliveryAdmins(
       .where(
         and(
           eq(users.role, "admin"),
-          eq(users.adminAccessLevel, "delivery_admin"),
           eq(users.isActive, true),
         ),
       );

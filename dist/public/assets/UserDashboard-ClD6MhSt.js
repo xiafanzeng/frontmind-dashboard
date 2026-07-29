@@ -1,1 +1,0 @@
-import{j as o}from"./index-Chf9VPLB.js";import{U as t}from"./UserBrandDashboard-DRZTJZeL.js";import"./Home-V3l9i5Cm.js";import"./index-CSQD9me7.js";import"./badge-CPnxb_WR.js";import"./schemas-rV5xSRk9.js";import"./wifi-BnJWkRUb.js";import"./arrow-left-BUMJ323P.js";function f({initialSection:r="brand"}){return o.jsx(t,{initialSection:r})}export{f as default};

@@ -37,13 +37,23 @@ describe("website knowledge import v2/v3 contract", () => {
     expect(value).not.toHaveProperty("packageManifestSha256");
   });
 
-  it("accepts v3 only with the bounded Website archive contract", () => {
+  it("accepts v3 with Website archive contract v1 or v2", () => {
     const value = websiteKnowledgeImportSchema.parse(knowledgeImportRequest(3));
     expect(value).toMatchObject({
       schemaVersion: 3,
       archiveContractVersion: 1,
       validationProfile: "website-lead-v1",
       packageManifestSha256: "c".repeat(64),
+    });
+    expect(
+      websiteKnowledgeImportSchema.parse({
+        ...knowledgeImportRequest(3),
+        archiveContractVersion: 2,
+      }),
+    ).toMatchObject({
+      schemaVersion: 3,
+      archiveContractVersion: 2,
+      validationProfile: "website-lead-v1",
     });
   });
 
@@ -61,7 +71,7 @@ describe("website knowledge import v2/v3 contract", () => {
     expect(() =>
       websiteKnowledgeImportSchema.parse({
         ...knowledgeImportRequest(3),
-        archiveContractVersion: 2,
+        archiveContractVersion: 9,
       }),
     ).toThrow();
     expect(() =>
@@ -183,6 +193,34 @@ describe("website knowledge import v2/v3 contract", () => {
         input,
       ),
     ).toBe(false);
+  });
+
+  it("binds Website archive contract v2 independently from v1", () => {
+    const v1 = websiteKnowledgeImportSchema.parse(knowledgeImportRequest(3));
+    const v2 = websiteKnowledgeImportSchema.parse({
+      ...knowledgeImportRequest(3),
+      archiveContractVersion: 2,
+    });
+
+    expect(
+      knowledgeImportReceiptSourceReference({
+        projectId: "project-1",
+        value: v2,
+      }),
+    ).toBe(
+      `website-kb:v3:2:website-lead-v1:${v2.packageManifestSha256}`,
+    );
+    expect(
+      knowledgeImportReceiptSourceReference({
+        projectId: "project-1",
+        value: v2,
+      }),
+    ).not.toBe(
+      knowledgeImportReceiptSourceReference({
+        projectId: "project-1",
+        value: v1,
+      }),
+    );
   });
 
   it("allows repeated purchases for one project when they resolve to one account and enterprise", () => {

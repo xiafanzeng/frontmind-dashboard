@@ -29,13 +29,25 @@ MAX_IMAGES = 480
 MIN_TARGET_IMAGES = 360
 MIN_LEAVES = 40
 MAX_LEAVES = 115
-MIN_FORMAL_CHARACTERS = 80_000
+TARGET_FORMAL_CHARACTERS_MIN = 80_000
+TARGET_FORMAL_CHARACTERS_MAX = 120_000
 MAX_FORMAL_CHARACTERS = 180_000
 MAX_EVIDENCE_CHARACTERS = 3_000_000
-MIN_LEAF_FORMAL_CHARACTERS = 120
 MAX_PARSED_DOCUMENTS = 220
 MAX_PUBLIC_QUERIES = 120
 MAX_OFFICIAL_PAGES = 1_200
+CONTENT_STATUSES = {"complete", "limited_evidence", "needs_verification"}
+IMAGE_SELECTION_STATUSES = {"target_met", "source_limited", "budget_limited"}
+REQUIRED_IMAGE_DISCOVERY_METHODS = {
+    "img",
+    "srcset",
+    "lazy_load",
+    "picture",
+    "css_background",
+    "open_graph",
+    "gallery",
+    "official_document",
+}
 
 FORMAL_START = "<!-- FRONTMIND_FORMAL_CONTENT_START -->"
 FORMAL_END = "<!-- FRONTMIND_FORMAL_CONTENT_END -->"
@@ -102,8 +114,13 @@ DOCUMENT_KEYS = {
     "order",
     "evidenceStatus",
     "sourceIds",
+    "evidenceDocumentIds",
     "assetIds",
     "customerVisible",
+    "evidenceCharacters",
+    "requiredFormalCharacters",
+    "contentStatus",
+    "productFamilyId",
 }
 DOCUMENT_REQUIRED_KEYS = {
     "id",
@@ -148,6 +165,19 @@ COUNTS_KEYS = {
     "customerVisibleCharacters",
     "evidenceCharacters",
     "packagedImages",
+}
+IMAGE_SELECTION_KEYS = {
+    "status",
+    "discoveredCandidateImages",
+    "inspectedCandidateImages",
+    "eligibleFirstPartyImages",
+    "rejectedCandidateImages",
+    "scannedSourcePages",
+    "discoveryMethods",
+    "rejectionReasons",
+    "stopReason",
+    "productFamilyCoverage",
+    "shortfallReason",
 }
 
 
@@ -455,6 +485,26 @@ def effective_characters(content: str) -> int:
     return len(value)
 
 
+def formal_requirement(
+    *,
+    kind: str,
+    is_product_branch: bool,
+    evidence_characters: int,
+) -> tuple[int, str]:
+    if evidence_characters <= 0:
+        return (60 if kind == "overview" else 40), "needs_verification"
+    if kind == "overview":
+        target = 5_000 if is_product_branch else 2_500
+        proportional = int(evidence_characters * 0.25)
+        return max(120, min(target, proportional)), (
+            "complete" if proportional >= target else "limited_evidence"
+        )
+    proportional = int(evidence_characters * 0.20)
+    return max(80, min(500, proportional)), (
+        "complete" if proportional >= 500 else "limited_evidence"
+    )
+
+
 def validate_archive(path: Path) -> list[str]:
     validation = Validation()
     if not path.is_file():
@@ -536,8 +586,8 @@ def validate_archive(path: Path) -> list[str]:
             validation=validation,
         )
         validation.require(
-            manifest.get("schemaVersion") == 1,
-            "00_package_manifest.json schemaVersion must be 1",
+            manifest.get("schemaVersion") == 2,
+            "00_package_manifest.json schemaVersion must be 2",
         )
         validation.require(
             manifest.get("profile") == "dashboard-enterprise-v1",
@@ -567,6 +617,14 @@ def validate_archive(path: Path) -> list[str]:
             counts = {}
         if not isinstance(image_selection, dict):
             image_selection = {}
+        product_branch_ids = {
+            str(document.get("branchId", "")).strip()
+            for document in documents_value
+            if isinstance(document, dict)
+            and document.get("kind") == "leaf"
+            and isinstance(document.get("productFamilyId"), str)
+            and bool(document.get("productFamilyId", "").strip())
+        }
         require_exact_keys(
             counts,
             allowed=COUNTS_KEYS,
@@ -585,10 +643,14 @@ def validate_archive(path: Path) -> list[str]:
         branch_overviews: dict[str, int] = {}
         formal_hashes: dict[str, str] = {}
         formal_paragraph_paths: dict[str, list[str]] = {}
+        document_effective_characters: dict[str, int] = {}
+        evidence_paths_by_hash: dict[str, str] = {}
+        product_family_ids: set[str] = set()
         actual_leaf_status_counts = {
             status: 0 for status in ALLOWED_EVIDENCE_STATUSES
         }
 
+        referenced_evidence_ids: set[str] = set()
         for index, raw_document in enumerate(documents_value):
             where = f"manifest.documents[{index}]"
             if not isinstance(raw_document, dict):
@@ -604,7 +666,7 @@ def validate_archive(path: Path) -> list[str]:
             doc_id = require_string(raw_document, "id", where, validation)
             doc_path = require_string(raw_document, "path", where, validation)
             kind = require_string(raw_document, "kind", where, validation)
-            require_string(raw_document, "title", where, validation)
+            title = require_string(raw_document, "title", where, validation)
             source_ids = require_string_list(
                 raw_document, "sourceIds", where, validation
             )
@@ -670,6 +732,19 @@ def validate_archive(path: Path) -> list[str]:
                     f"{sorted(ALLOWED_EVIDENCE_STATUSES)}",
                 )
             if kind in {"overview", "leaf"}:
+                require_exact_keys(
+                    raw_document,
+                    allowed=DOCUMENT_KEYS,
+                    required=DOCUMENT_REQUIRED_KEYS
+                    | {
+                        "evidenceDocumentIds",
+                        "evidenceCharacters",
+                        "requiredFormalCharacters",
+                        "contentStatus",
+                    },
+                    where=where,
+                    validation=validation,
+                )
                 validation.require(
                     customer_visible,
                     f"{where} {kind} must be customerVisible",
@@ -690,6 +765,67 @@ def validate_archive(path: Path) -> list[str]:
                         bool(source_ids),
                         f"{where} evidence-backed content requires sourceIds",
                     )
+                evidence_characters = raw_document.get("evidenceCharacters")
+                evidence_document_ids = require_string_list(
+                    raw_document, "evidenceDocumentIds", where, validation
+                )
+                required_formal_characters = raw_document.get(
+                    "requiredFormalCharacters"
+                )
+                content_status = raw_document.get("contentStatus")
+                validation.require(
+                    isinstance(evidence_characters, int)
+                    and not isinstance(evidence_characters, bool)
+                    and evidence_characters >= 0,
+                    f"{where}.evidenceCharacters must be a non-negative integer",
+                )
+                validation.require(
+                    isinstance(required_formal_characters, int)
+                    and not isinstance(required_formal_characters, bool)
+                    and required_formal_characters >= 0,
+                    f"{where}.requiredFormalCharacters must be a non-negative integer",
+                )
+                validation.require(
+                    content_status in CONTENT_STATUSES,
+                    f"{where}.contentStatus must be one of {sorted(CONTENT_STATUSES)}",
+                )
+                if isinstance(evidence_characters, int) and not isinstance(
+                    evidence_characters, bool
+                ):
+                    expected_required, expected_status = formal_requirement(
+                        kind=kind,
+                        is_product_branch=branch_id in product_branch_ids,
+                        evidence_characters=evidence_characters,
+                    )
+                    validation.require(
+                        required_formal_characters == expected_required,
+                        f"{where}.requiredFormalCharacters must be "
+                        f"{expected_required}, got {required_formal_characters!r}",
+                    )
+                    validation.require(
+                        content_status == expected_status,
+                        f"{where}.contentStatus must be {expected_status}",
+                    )
+                    if evidence_characters == 0:
+                        validation.require(
+                            evidence_status
+                            in {"needs_verification", "not_applicable"},
+                            f"{where} without evidence must use a gap evidenceStatus",
+                        )
+                product_family_id = require_string(
+                    raw_document,
+                    "productFamilyId",
+                    where,
+                    validation,
+                    optional=True,
+                )
+                if kind == "leaf" and product_family_id:
+                    product_family_ids.add(product_family_id)
+                elif product_family_id:
+                    validation.errors.append(
+                        f"{where}.productFamilyId is only allowed on product/service leaves"
+                    )
+                _ = evidence_document_ids
             if kind == "leaf":
                 leaf_count += 1
                 branch_leaf_ids.setdefault(branch_id, []).append(doc_id)
@@ -736,15 +872,17 @@ def validate_archive(path: Path) -> list[str]:
                 )
                 formal_count = effective_characters(countable_formal)
                 formal_total += formal_count
-                if (
-                    kind == "leaf"
-                    and evidence_status
-                    not in {"needs_verification", "not_applicable"}
+                required_formal_characters = raw_document.get(
+                    "requiredFormalCharacters"
+                )
+                if isinstance(required_formal_characters, int) and not isinstance(
+                    required_formal_characters, bool
                 ):
                     validation.require(
-                        formal_count >= MIN_LEAF_FORMAL_CHARACTERS,
+                        formal_count >= required_formal_characters,
                         f"{doc_path} has {formal_count} formal characters; "
-                        f"leaf minimum is {MIN_LEAF_FORMAL_CHARACTERS}",
+                        f"evidence-proportional requirement is "
+                        f"{required_formal_characters}",
                     )
                 normalized_formal_lower = unicodedata.normalize(
                     "NFKC", countable_formal
@@ -786,8 +924,107 @@ def validate_archive(path: Path) -> list[str]:
                     if doc_path not in paths:
                         paths.append(doc_path)
             else:
-                evidence_total += effective_characters(
-                    countable_markdown_text(content, remove_headings=False)
+                countable_evidence = countable_markdown_text(
+                    content, remove_headings=False
+                )
+                evidence_count = effective_characters(countable_evidence)
+                evidence_total += evidence_count
+                if doc_id:
+                    document_effective_characters[doc_id] = evidence_count
+                if kind == "evidence":
+                    normalized_evidence = re.sub(
+                        r"""[\s!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]+""",
+                        "",
+                        unicodedata.normalize("NFKC", countable_evidence).lower(),
+                    )
+                    if normalized_evidence:
+                        digest = hashlib.sha256(
+                            normalized_evidence.encode("utf-8")
+                        ).hexdigest()
+                        previous = evidence_paths_by_hash.get(digest)
+                        validation.require(
+                            previous is None,
+                            f"duplicate normalized evidence content: "
+                            f"{previous} and {doc_path}",
+                        )
+                        evidence_paths_by_hash[digest] = doc_path
+
+        validation.require(
+            bool(product_family_ids),
+            "schema v2 must declare at least one product/service family",
+        )
+        validation.require(
+            "" not in product_branch_ids,
+            "product/service leaves with productFamilyId require branchId",
+        )
+        for index, raw_document in enumerate(documents_value):
+            if (
+                isinstance(raw_document, dict)
+                and raw_document.get("kind") == "leaf"
+                and raw_document.get("branchId") in product_branch_ids
+            ):
+                validation.require(
+                    isinstance(raw_document.get("productFamilyId"), str)
+                    and bool(raw_document.get("productFamilyId", "").strip()),
+                    f"manifest.documents[{index}] product/service branch leaf "
+                    "requires productFamilyId",
+                )
+
+        for index, raw_document in enumerate(documents_value):
+            if not isinstance(raw_document, dict) or raw_document.get("kind") not in {
+                "overview",
+                "leaf",
+            }:
+                continue
+            where = f"manifest.documents[{index}]"
+            related_evidence_ids = require_string_list(
+                raw_document, "evidenceDocumentIds", where, validation
+            )
+            referenced_evidence_ids.update(related_evidence_ids)
+            validation.require(
+                len(set(related_evidence_ids)) == len(related_evidence_ids),
+                f"{where}.evidenceDocumentIds must be unique",
+            )
+            related_source_ids = set(raw_document.get("sourceIds") or [])
+            actual_related_evidence = 0
+            for evidence_id in related_evidence_ids:
+                evidence_document = documents.get(evidence_id)
+                validation.require(
+                    evidence_document is not None
+                    and evidence_document.get("kind") == "evidence"
+                    and evidence_document.get("customerVisible") is False,
+                    f"{where} references a non-evidence document: {evidence_id}",
+                )
+                if evidence_document is None:
+                    continue
+                validation.require(
+                    isinstance(evidence_document.get("branchId"), str)
+                    and bool(evidence_document.get("branchId", "").strip())
+                    and evidence_document.get("branchId")
+                    == raw_document.get("branchId"),
+                    f"{where} evidence document {evidence_id} must explicitly "
+                    "belong to the same branchId",
+                )
+                evidence_sources = set(evidence_document.get("sourceIds") or [])
+                validation.require(
+                    bool(related_source_ids & evidence_sources),
+                    f"{where} evidence document {evidence_id} must share a sourceId",
+                )
+                actual_related_evidence += document_effective_characters.get(
+                    evidence_id, 0
+                )
+            validation.require(
+                raw_document.get("evidenceCharacters") == actual_related_evidence,
+                f"{where}.evidenceCharacters must equal validator-recomputed "
+                f"evidence characters {actual_related_evidence}",
+            )
+        for doc_id, raw_document in documents.items():
+            if raw_document.get("kind") == "evidence":
+                validation.require(
+                    raw_document.get("customerVisible") is False
+                    and doc_id in referenced_evidence_ids,
+                    f"v2 evidence document must be referenced by at least one "
+                    f"overview/leaf: {raw_document.get('path', doc_id)}",
                 )
 
         validation.require(
@@ -1189,49 +1426,210 @@ def validate_archive(path: Path) -> list[str]:
                         f"document relationship is not reciprocal: {doc_id} / {asset_id}",
                     )
 
+        selection_status = image_selection.get("status")
+        discovered = image_selection.get("discoveredCandidateImages")
+        inspected = image_selection.get("inspectedCandidateImages")
         eligible = image_selection.get("eligibleFirstPartyImages")
+        rejected = image_selection.get("rejectedCandidateImages")
+        scanned_pages = image_selection.get("scannedSourcePages")
+        discovery_methods = image_selection.get("discoveryMethods")
+        rejection_reasons = image_selection.get("rejectionReasons")
+        stop_reason = image_selection.get("stopReason")
+        product_families = image_selection.get("productFamilyCoverage")
+        shortfall = image_selection.get("shortfallReason")
         require_exact_keys(
             image_selection,
-            allowed={"eligibleFirstPartyImages", "shortfallReason"},
-            required=(
-                {"eligibleFirstPartyImages"}
-                if isinstance(eligible, int)
-                and not isinstance(eligible, bool)
-                and eligible >= MIN_TARGET_IMAGES
-                else {"eligibleFirstPartyImages", "shortfallReason"}
+            allowed=IMAGE_SELECTION_KEYS,
+            required=IMAGE_SELECTION_KEYS
+            - (
+                set()
+                if selection_status in {"source_limited", "budget_limited"}
+                else {"shortfallReason"}
             ),
             where="manifest.imageSelection",
             validation=validation,
         )
         validation.require(
-            isinstance(eligible, int) and not isinstance(eligible, bool) and eligible >= 0,
-            "imageSelection.eligibleFirstPartyImages must be a non-negative integer",
+            selection_status in IMAGE_SELECTION_STATUSES,
+            "imageSelection.status must be target_met, source_limited, or budget_limited",
         )
-        shortfall = image_selection.get("shortfallReason")
-        if isinstance(eligible, int) and not isinstance(eligible, bool):
+        for key, value in (
+            ("discoveredCandidateImages", discovered),
+            ("inspectedCandidateImages", inspected),
+            ("eligibleFirstPartyImages", eligible),
+            ("rejectedCandidateImages", rejected),
+            ("scannedSourcePages", scanned_pages),
+        ):
+            validation.require(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0,
+                f"imageSelection.{key} must be a non-negative integer",
+            )
+        if all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (discovered, inspected, eligible, rejected)
+        ):
+            validation.require(
+                inspected <= discovered,
+                "inspectedCandidateImages cannot exceed discoveredCandidateImages",
+            )
+            validation.require(
+                inspected == eligible + rejected,
+                "inspectedCandidateImages must equal eligible plus rejected candidates",
+            )
             validation.require(
                 len(asset_paths) <= eligible,
                 "packaged image count cannot exceed eligibleFirstPartyImages",
             )
-            if eligible >= MIN_TARGET_IMAGES:
+        validation.require(
+            isinstance(discovery_methods, list)
+            and all(
+                isinstance(method, str) and bool(method.strip())
+                for method in discovery_methods
+            ),
+            "imageSelection.discoveryMethods must be a string array",
+        )
+        if isinstance(discovery_methods, list):
+            validation.require(
+                REQUIRED_IMAGE_DISCOVERY_METHODS
+                <= {str(method).strip() for method in discovery_methods},
+                "imageSelection.discoveryMethods must record every required "
+                "official-image discovery method",
+            )
+        validation.require(
+            isinstance(stop_reason, str) and bool(stop_reason.strip()),
+            "imageSelection.stopReason must be a non-empty string",
+        )
+        rejection_total = 0
+        validation.require(
+            isinstance(rejection_reasons, list),
+            "imageSelection.rejectionReasons must be an array",
+        )
+        if isinstance(rejection_reasons, list):
+            for index, reason in enumerate(rejection_reasons):
+                where = f"imageSelection.rejectionReasons[{index}]"
                 validation.require(
-                    MIN_TARGET_IMAGES <= len(asset_paths) <= MAX_IMAGES,
-                    f"{eligible} eligible images require packaging {MIN_TARGET_IMAGES}–{MAX_IMAGES}",
+                    isinstance(reason, dict)
+                    and set(reason) == {"reason", "count"}
+                    and isinstance(reason.get("reason"), str)
+                    and bool(reason.get("reason", "").strip())
+                    and isinstance(reason.get("count"), int)
+                    and not isinstance(reason.get("count"), bool)
+                    and reason.get("count", -1) >= 0,
+                    f"{where} must contain a reason and non-negative count",
+                )
+                if isinstance(reason, dict) and isinstance(reason.get("count"), int):
+                    rejection_total += reason["count"]
+        if isinstance(rejected, int) and not isinstance(rejected, bool):
+            validation.require(
+                rejection_total == rejected,
+                "image rejection-reason counts must equal rejectedCandidateImages",
+            )
+        validation.require(
+            isinstance(product_families, list),
+            "imageSelection.productFamilyCoverage must be an array",
+        )
+        if isinstance(product_families, list):
+            family_ids: set[str] = set()
+            for index, family in enumerate(product_families):
+                where = f"imageSelection.productFamilyCoverage[{index}]"
+                if not isinstance(family, dict):
+                    validation.errors.append(f"{where} must be an object")
+                    continue
+                official_available = family.get("officialImageAvailable")
+                required_family_keys = {
+                    "familyId",
+                    "familyName",
+                    "officialImageAvailable",
+                    "assetIds",
+                    "checkedSources",
+                } | (set() if official_available is True else {"gapReason"})
+                require_exact_keys(
+                    family,
+                    allowed=required_family_keys | {"gapReason"},
+                    required=required_family_keys,
+                    where=where,
+                    validation=validation,
+                )
+                family_id = require_string(family, "familyId", where, validation)
+                require_string(family, "familyName", where, validation)
+                family_assets = require_string_list(
+                    family, "assetIds", where, validation
+                )
+                checked_sources = require_string_list(
+                    family, "checkedSources", where, validation
+                )
+                validation.require(
+                    isinstance(official_available, bool),
+                    f"{where}.officialImageAvailable must be boolean",
+                )
+                validation.require(
+                    family_id not in family_ids,
+                    f"duplicate product family id: {family_id}",
+                )
+                family_ids.add(family_id)
+                validation.require(
+                    all(asset_id in assets for asset_id in family_assets),
+                    f"{where}.assetIds contains an unknown packaged image",
+                )
+                validation.require(
+                    bool(checked_sources),
+                    f"{where}.checkedSources must identify inspected official sources",
+                )
+                if official_available is True:
+                    validation.require(
+                        bool(family_assets),
+                        f"{where} with official imagery must link a packaged image",
+                    )
+                else:
+                    require_string(family, "gapReason", where, validation)
+            validation.require(
+                family_ids == product_family_ids,
+                "imageSelection.productFamilyCoverage IDs must exactly match "
+                f"product/service leaf family IDs; coverage={sorted(family_ids)}, "
+                f"leaves={sorted(product_family_ids)}",
+            )
+        if (
+            isinstance(eligible, int)
+            and not isinstance(eligible, bool)
+            and isinstance(discovered, int)
+            and isinstance(inspected, int)
+        ):
+            if selection_status == "target_met":
+                validation.require(
+                    eligible >= MIN_TARGET_IMAGES
+                    and MIN_TARGET_IMAGES <= len(asset_paths) <= MAX_IMAGES,
+                    f"target_met requires at least {MIN_TARGET_IMAGES} eligible "
+                    f"and packaged images",
                 )
                 validation.require(
                     "shortfallReason" not in image_selection,
-                    "imageSelection.shortfallReason must be omitted when "
-                    "at least 360 images are eligible",
+                    "target_met must omit imageSelection.shortfallReason",
                 )
             else:
                 validation.require(
+                    eligible < MIN_TARGET_IMAGES,
+                    "limited image status requires fewer than 360 eligible images",
+                )
+                validation.require(
                     len(asset_paths) == eligible,
-                    "when fewer than 360 images are eligible, package every eligible image",
+                    "below the image target, every eligible image must be packaged",
                 )
                 validation.require(
                     isinstance(shortfall, str) and bool(shortfall.strip()),
-                    "imageSelection.shortfallReason is required below 360 eligible images",
+                    "limited image status requires a concrete shortfallReason",
                 )
+                if selection_status == "source_limited":
+                    validation.require(
+                        inspected == discovered,
+                        "source_limited requires every discovered candidate to be inspected",
+                    )
+                if selection_status == "budget_limited":
+                    validation.require(
+                        inspected < discovered,
+                        "budget_limited requires uninspected discovered candidates",
+                    )
             discovered_images = (
                 completeness_acquisition.get("images", {}).get("total")
                 if isinstance(completeness_acquisition.get("images"), dict)
@@ -1239,8 +1637,8 @@ def validate_archive(path: Path) -> list[str]:
             )
             validation.require(
                 not isinstance(discovered_images, int)
-                or eligible <= discovered_images,
-                "eligibleFirstPartyImages cannot exceed acquisition.images.total",
+                or discovered == discovered_images,
+                "discoveredCandidateImages must equal acquisition.images.total",
             )
 
         packaged_completed = (
@@ -1291,9 +1689,9 @@ def validate_archive(path: Path) -> list[str]:
                 f"manifest.counts.{key} must be {actual}, got {counts.get(key)!r}",
             )
         validation.require(
-            MIN_FORMAL_CHARACTERS <= formal_total <= MAX_FORMAL_CHARACTERS,
+            formal_total <= MAX_FORMAL_CHARACTERS,
             f"customer-visible formal content has {formal_total} characters; "
-            f"expected {MIN_FORMAL_CHARACTERS}–{MAX_FORMAL_CHARACTERS}",
+            f"maximum is {MAX_FORMAL_CHARACTERS}",
         )
         validation.require(
             evidence_total <= MAX_EVIDENCE_CHARACTERS,

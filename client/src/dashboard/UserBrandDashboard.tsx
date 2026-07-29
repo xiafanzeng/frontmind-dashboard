@@ -1179,6 +1179,8 @@ function UserBrandDashboardContent({
     ? getCapability(servicePortal, capabilityKey)
     : null;
   const routeLocked = Boolean(routeAccess && !routeAccess.allowed);
+  const knowledgeBuildWorkspace =
+    route.section === "knowledge-agent" && route.sub !== "display";
   const routeTitle =
     route.section === "knowledge-agent"
       ? route.sub === "display"
@@ -1202,8 +1204,16 @@ function UserBrandDashboardContent({
                   : "内容资产运营"
                 : "服务页面";
   return (
-    <div className="user-brand-dashboard">
-      <div className={`app-shell ${mobileNavOpen ? "nav-open" : ""}`}>
+    <div
+      className={`user-brand-dashboard ${
+        knowledgeBuildWorkspace ? "knowledge-build-workspace" : ""
+      }`}
+    >
+      <div
+        className={`app-shell ${mobileNavOpen ? "nav-open" : ""} ${
+          knowledgeBuildWorkspace ? "knowledge-build-app-shell" : ""
+        }`}
+      >
         {/* 移动端汉堡按钮 */}
         <button
           className="mobile-menu-btn"
@@ -1232,14 +1242,20 @@ function UserBrandDashboardContent({
           accountOpen={accountOpen}
           onAccountOpenChange={setAccountOpen}
         />
-        <main className="dashboard-main">
-          <ProjectRibbon
-            brandName={
-              managedPayload?.brandName ||
-              servicePortal.account.displayName ||
-              (previewMode ? previewBrandName : "企业看板")
-            }
-          />
+        <main
+          className={`dashboard-main ${
+            knowledgeBuildWorkspace ? "knowledge-build-main" : ""
+          }`}
+        >
+          {!knowledgeBuildWorkspace && (
+            <ProjectRibbon
+              brandName={
+                managedPayload?.brandName ||
+                servicePortal.account.displayName ||
+                (previewMode ? previewBrandName : "企业看板")
+              }
+            />
+          )}
           {route.section === "service" ? (
             <>
               <ServiceHome
@@ -1444,6 +1460,7 @@ function UserBrandDashboardContent({
                     previewData={previewKnowledgeData}
                     page={route.sub === "display" ? "display" : "build"}
                     onPageChange={(page) => navigate("knowledge-agent", page)}
+                    mode={route.sub === "display" ? "standard" : "workspace"}
                   />
                 </Suspense>
               )}

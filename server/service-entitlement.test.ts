@@ -184,6 +184,22 @@ describe("service plan catalogue", () => {
 });
 
 describe("service portal derivation", () => {
+  it("does not expose internal onboarding or rollout references as order numbers", () => {
+    for (const sourceReference of [
+      "managed-user-onboarding:contract-1",
+      "rollout:7:1:advanced",
+    ]) {
+      const portal = deriveServicePortalState(
+        state("advanced", {
+          contract: contract("advanced", { sourceReference }),
+          contracts: [contract("advanced", { sourceReference })],
+        }),
+      );
+      expect(portal.purchases[0]?.orderReference).toBeNull();
+      expect(JSON.stringify(portal)).not.toContain(sourceReference);
+    }
+  });
+
   it("projects a user DTO without commercial, contract, or rollout metadata", () => {
     const internal = deriveServicePortalState(
       state("luxury", {

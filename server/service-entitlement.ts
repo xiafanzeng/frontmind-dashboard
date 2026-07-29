@@ -1114,8 +1114,7 @@ export function deriveServicePortalState(
         prepaidMonths:
           purchase.prepaidMonths ??
           SERVICE_PLAN_CATALOG[purchase.planCode].prepaidMonths,
-        orderReference:
-          purchase.orderReference ?? purchase.sourceReference ?? null,
+        orderReference: purchase.orderReference ?? null,
         contractReference: purchase.externalContractReference ?? null,
         signedAt: purchase.signedAt ? epoch(purchase.signedAt) : null,
         signatoryId: purchase.signatoryId ?? null,

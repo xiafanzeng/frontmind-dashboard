@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AuthUser } from "@/_core/hooks/useAuth";
 import {
+  hasDeliveryCapability,
   isDeliveryAdminAccount,
   isProtectedBuiltinAdminUsername,
   isSystemAdminAccount,
@@ -32,6 +33,12 @@ describe("client administrator access", () => {
     expect(isDeliveryAdminAccount(admin("delivery_admin"))).toBe(true);
     expect(isDeliveryAdminAccount(admin("system_admin"))).toBe(false);
     expect(isDeliveryAdminAccount(admin(null))).toBe(false);
+  });
+
+  it("treats system administrators as delivery-capable", () => {
+    expect(hasDeliveryCapability(admin("delivery_admin"))).toBe(true);
+    expect(hasDeliveryCapability(admin("system_admin"))).toBe(true);
+    expect(hasDeliveryCapability(admin(null))).toBe(false);
   });
 
   it("protects only the normalized built-in admin username", () => {

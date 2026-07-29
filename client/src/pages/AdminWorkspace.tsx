@@ -34,6 +34,7 @@ import {
   type WorkspaceTab,
 } from "@/lib/admin-workspace-tabs";
 import { trpc } from "@/lib/trpc";
+import { auditActionLabel, auditEventDetail } from "@/lib/audit-display";
 import { getAdminNav } from "@/pages/AdminDashboard";
 import { CreateUserDialog } from "@/pages/AdminUsers";
 
@@ -334,8 +335,6 @@ export default function AdminWorkspace({
   const [serviceStartsAt, setServiceStartsAt] = useState(
     toDateInput(new Date()),
   );
-  const [serviceOrderReference, setServiceOrderReference] = useState("");
-  const [serviceContractReference, setServiceContractReference] = useState("");
   const [serviceSignedAt, setServiceSignedAt] = useState("");
   const [serviceSignatory, setServiceSignatory] = useState("");
   const [serviceEvidenceNote, setServiceEvidenceNote] = useState("");
@@ -520,8 +519,6 @@ export default function AdminWorkspace({
     const currentPurchase = (serviceQuery.data?.purchases ?? []).find(
       (purchase: any) => purchase.id === service?.contractId,
     );
-    setServiceOrderReference(currentPurchase?.orderReference ?? "");
-    setServiceContractReference(currentPurchase?.contractReference ?? "");
     setServiceSignedAt(toDateTimeLocal(currentPurchase?.signedAt));
     setServiceSignatory(currentPurchase?.signatoryId ?? "");
     setServiceEvidenceNote("");
@@ -636,13 +633,10 @@ export default function AdminWorkspace({
           onOpenChange={setCreateClientOpen}
           userOnly
           deliveryAdmins={(workspaceQuery.data?.admins ?? [])
-            .filter(
-              (admin) =>
-                admin.adminAccessLevel === "delivery_admin" && admin.isActive,
-            )
+            .filter((admin) => admin.isActive)
             .map((admin) => ({
               ...admin,
-              username: admin.username || `delivery-admin-${admin.id}`,
+              username: admin.username || `admin-${admin.id}`,
             }))}
           onCreated={(userId) => {
             setSelectedUserId(userId);
@@ -994,28 +988,6 @@ export default function AdminWorkspace({
                           </select>
                         </label>
                         <label className="text-xs font-semibold text-[#716a80]">
-                          订单 / 付款编号
-                          <Input
-                            className="mt-2"
-                            value={serviceOrderReference}
-                            placeholder="线下收款单或官网订单编号"
-                            onChange={(event) =>
-                              setServiceOrderReference(event.target.value)
-                            }
-                          />
-                        </label>
-                        <label className="text-xs font-semibold text-[#716a80]">
-                          合同编号
-                          <Input
-                            className="mt-2"
-                            value={serviceContractReference}
-                            placeholder="已签合同的唯一编号"
-                            onChange={(event) =>
-                              setServiceContractReference(event.target.value)
-                            }
-                          />
-                        </label>
-                        <label className="text-xs font-semibold text-[#716a80]">
                           签署主体
                           <Input
                             className="mt-2"
@@ -1133,16 +1105,14 @@ export default function AdminWorkspace({
                               );
                               if (
                                 isCommerciallyActive &&
-                                (!serviceOrderReference.trim() ||
-                                  !serviceContractReference.trim() ||
-                                  !serviceSignatory.trim() ||
+                                (!serviceSignatory.trim() ||
                                   !serviceSignedAt ||
                                   (!hasExistingEvidence &&
                                     serviceEvidenceNote.trim().length < 8))
                               ) {
                                 toast.error("请补全商业与签署依据", {
                                   description:
-                                    "生效或待生效合同必须填写订单编号、合同编号、真实签署时间与签署主体；首次确认还需不少于 8 个字的核验依据。",
+                                    "生效或待生效合同必须填写真实签署时间与签署主体；首次确认还需不少于 8 个字的核验依据。",
                                 });
                                 return;
                               }
@@ -1187,17 +1157,8 @@ export default function AdminWorkspace({
                                   planCode: servicePlan,
                                   startsAt,
                                   status: serviceStatus,
-                                  sourceReference:
-                                    serviceOrderReference.trim() ||
-                                    serviceContractReference.trim() ||
-                                    undefined,
                                   prepaidMonths:
                                     servicePlan === "basic" ? null : 3,
-                                  orderReference:
-                                    serviceOrderReference.trim() || undefined,
-                                  contractReference:
-                                    serviceContractReference.trim() ||
-                                    undefined,
                                   signedAt: serviceSignedAt
                                     ? new Date(serviceSignedAt).getTime()
                                     : undefined,
@@ -1841,7 +1802,7 @@ export default function AdminWorkspace({
                       workspaceQuery.data?.isSystemAdmin &&
                       !selectedUser.usageOwner?.adminId && (
                         <p className="text-xs leading-5 text-[#9a6900]">
-                          请先在客户概览中分配一位已启用的交付管理员作为主负责人，再完成历史账号开通。
+                          请先在客户概览中分配一位已启用的管理员作为主负责人，再完成历史账号开通。
                         </p>
                       )}
                   </div>
@@ -2076,14 +2037,14 @@ export default function AdminWorkspace({
                           </div>
                           <div>
                             <p className="text-sm font-medium text-[#484057]">
-                              {event.action}
+                              {auditActionLabel(event.action)}
                             </p>
                             <p className="mt-1 text-xs leading-5 text-[#857e91]">
-                              {event.reason ||
-                                [event.targetType, event.targetId]
-                                  .filter(Boolean)
-                                  .join(" · ") ||
-                                "已记录"}
+                              {auditEventDetail(
+                                event,
+                                selectedUser?.displayName ||
+                                  selectedUser?.username,
+                              )}
                             </p>
                           </div>
                           <time className="text-xs text-[#9a94a8] sm:text-right">

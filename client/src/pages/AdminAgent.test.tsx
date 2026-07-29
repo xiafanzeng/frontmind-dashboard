@@ -59,5 +59,6 @@ describe("AdminAgent preview", () => {
     expect(source).toContain('mode="fullscreen"');
     expect(source).toContain("showKnowledgeBaseStarter={false}");
     expect(source).toContain("showAccountMenu={false}");
+    expect(source).toContain('standardWelcomeVariant="workflow"');
   });
 });

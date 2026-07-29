@@ -1,4 +1,4 @@
 interface:
   display_name: "企业深度知识库构建"
-  short_description: "深度研究并逐叶确认真实图文企业知识体系"
-  default_prompt: "Use $socratic-kb-builder to research my enterprise deeply, prefill a polished illustrated knowledge tree, and confirm it one leaf at a time."
+  short_description: "按真实证据深度研究并逐叶确认图文知识体系"
+  default_prompt: "Use $socratic-kb-builder to research my enterprise deeply, build an evidence-proportional illustrated knowledge tree without padding sparse evidence, and confirm it one leaf at a time."

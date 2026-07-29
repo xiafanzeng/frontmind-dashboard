@@ -51,9 +51,10 @@ not embed raw source URLs here.]
 ```
 
 The validator counts only effective non-whitespace characters inside these
-markers. Customer-visible content must total 80,000–180,000 characters, with a
-120,000-character target. Each evidence-backed leaf must contain at least 120
-effective formal characters. Do not use “第一方原始快照” or
+markers. Customer-visible content targets 80,000–120,000 characters and must
+not exceed 180,000. It has no fixed global minimum: each overview and leaf
+must instead satisfy its evidence-proportional requirement declared in the
+manifest. Do not use “第一方原始快照” or
 “第一方页面摘录”, “原始快照”, “页面摘录”, `raw evidence`, or
 `page excerpt` inside the formal block.
 
@@ -63,7 +64,7 @@ Use this exact top-level contract. Extra fields are forbidden:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "profile": "dashboard-enterprise-v1",
   "documents": [
     {
@@ -75,8 +76,39 @@ Use this exact top-level contract. Extra fields are forbidden:
       "order": 10,
       "evidenceStatus": "verified_first_party",
       "sourceIds": ["source-official-products"],
+      "evidenceDocumentIds": ["evidence-official-products"],
       "assetIds": ["asset-product-family-a"],
-      "customerVisible": true
+      "customerVisible": true,
+      "evidenceCharacters": 24000,
+      "requiredFormalCharacters": 5000,
+      "contentStatus": "complete"
+    },
+    {
+      "id": "leaf-product-family-a",
+      "path": "branches/products/family-a.md",
+      "kind": "leaf",
+      "title": "产品族 A",
+      "branchId": "products",
+      "order": 20,
+      "evidenceStatus": "verified_first_party",
+      "sourceIds": ["source-official-products"],
+      "evidenceDocumentIds": ["evidence-official-products"],
+      "assetIds": ["asset-product-family-a"],
+      "customerVisible": true,
+      "evidenceCharacters": 24000,
+      "requiredFormalCharacters": 500,
+      "contentStatus": "complete",
+      "productFamilyId": "family-a"
+    },
+    {
+      "id": "evidence-official-products",
+      "path": "branches/products/evidence/official-products.md",
+      "kind": "evidence",
+      "title": "产品官方资料摘录",
+      "branchId": "products",
+      "sourceIds": ["source-official-products"],
+      "assetIds": [],
+      "customerVisible": false
     }
   ],
   "assets": [
@@ -104,7 +136,36 @@ Use this exact top-level contract. Extra fields are forbidden:
     "packagedImages": 420
   },
   "imageSelection": {
-    "eligibleFirstPartyImages": 438
+    "status": "target_met",
+    "discoveredCandidateImages": 612,
+    "inspectedCandidateImages": 612,
+    "eligibleFirstPartyImages": 438,
+    "rejectedCandidateImages": 174,
+    "scannedSourcePages": 826,
+    "discoveryMethods": [
+      "img",
+      "srcset",
+      "lazy_load",
+      "picture",
+      "css_background",
+      "open_graph",
+      "gallery",
+      "official_document"
+    ],
+    "rejectionReasons": [
+      { "reason": "重复字节", "count": 92 },
+      { "reason": "装饰性图标或分辨率不足", "count": 82 }
+    ],
+    "stopReason": "已完成全部优先官方栏目和上传资料的图片发现",
+    "productFamilyCoverage": [
+      {
+        "familyId": "family-a",
+        "familyName": "产品族 A",
+        "officialImageAvailable": true,
+        "assetIds": ["asset-product-family-a"],
+        "checkedSources": ["https://official.example/products/a"]
+      }
+    ]
   }
 }
 ```
@@ -113,20 +174,60 @@ Allowed document kinds are `overview`, `leaf`, `evidence`, `report`, and
 `index`. Allowed evidence states are `verified_first_party`,
 `verified_authoritative`, `supported_third_party`, `inferred`,
 `needs_verification`, and `not_applicable`. Every customer-visible overview
-and leaf must declare one of those six states; `00_completeness.json` counts
-the states of the 40–115 true leaf documents. `customerVisible` is true only
-for polished overviews and leaves. Document and asset IDs are stable and
-unique. Every `assetIds` and `documentIds` relationship must resolve in both
-directions.
+and leaf must declare one of those six states plus `evidenceDocumentIds`,
+`evidenceCharacters`, `requiredFormalCharacters`, and `contentStatus`.
+Every evidence document ID must resolve to a packaged `kind: evidence`
+document sharing at least one `sourceId` with the overview/leaf. The evidence
+document must explicitly declare the same `branchId`; global or missing
+evidence branch scope is not implicit. One real evidence document may support
+multiple related leaves in that same branch. Evidence documents must be unique
+after Markdown stripping plus Unicode, case, whitespace, and punctuation
+normalization; copied excerpts cannot increase evidence volume. Every packaged
+`kind: evidence` document must appear in at least one overview/leaf
+`evidenceDocumentIds` list, so acquired evidence cannot be omitted from formal
+organization.
+`evidenceCharacters` must equal the validator-recomputed total effective
+characters from the unique referenced evidence documents. Allowed content
+statuses are `complete`, `limited_evidence`, and `needs_verification`.
+`00_completeness.json` counts the evidence states of the 40–115 true leaf
+documents. `customerVisible` is true only for polished overviews and leaves.
+Document and asset IDs are stable and unique. Every `assetIds` and
+`documentIds` relationship must resolve in both directions.
 
-`imageSelection.eligibleFirstPartyImages` is the measured unique useful
-first-party candidate count. If it is at least 360, package 360–480 images. If
-it is below 360, package every eligible useful image and provide a non-empty
-`shortfallReason`. Omit `shortfallReason` entirely when the eligible count is
-at least 360; never write it as `null`. A measured eligible count of zero is
-valid only when no suitable first-party image exists, the ZIP contains zero
-images, and a concrete reason is recorded. Never reduce this number to make a
-shortfall pass.
+For schema version 2, compute `requiredFormalCharacters` exactly:
+
+- Overview with evidence: `max(120, min(target, floor(evidence * 0.25)))`,
+  where `target` is 5,000 when the overview's branch has leaves declaring
+  `productFamilyId`, and 2,500 for every other branch.
+- Leaf with evidence:
+  `max(80, min(500, floor(evidence * 0.20)))`.
+- Overview with zero evidence: 60; leaf with zero evidence: 40. Both must use
+  `contentStatus: needs_verification` and an evidence status of
+  `needs_verification` or `not_applicable`.
+- Use `complete` only when the computed target is reached by the available
+  evidence; otherwise use `limited_evidence`. Formal content must meet the
+  computed requirement, but must not be padded to reach the target.
+
+`imageSelection` is an auditable discovery funnel. `inspectedCandidateImages`
+equals eligible plus rejected candidates and cannot exceed discovered
+candidates. Rejection-reason counts sum to rejected candidates. List every
+discovery method actually checked and every core product/service family.
+When `officialImageAvailable` is true, `assetIds` must contain at least one
+packaged image; otherwise provide a concrete `gapReason` and non-empty
+`checkedSources`. Every product/service leaf must carry `productFamilyId`;
+v2 uses this field—not title keywords—to identify product/service families and
+their branches. At least one family is required. If one leaf in a branch has
+`productFamilyId`, every leaf in that branch must declare it. The distinct leaf
+family IDs and `productFamilyCoverage` IDs must match exactly.
+
+If at least 360 eligible first-party images exist, use `target_met` and
+package 360–480 images. If fewer exist, package every eligible useful image
+and use `source_limited` after inspecting every discovered candidate, or
+`budget_limited` when a declared time/acquisition ceiling prevented full
+inspection. Both limited statuses require a non-empty `shortfallReason` and
+`stopReason`. A measured eligible count of zero is valid only when no suitable
+first-party image exists, the ZIP contains zero images, and the complete
+funnel explains why. Never reduce a counter to make a shortfall pass.
 
 The manifest counts must match the actual ZIP:
 

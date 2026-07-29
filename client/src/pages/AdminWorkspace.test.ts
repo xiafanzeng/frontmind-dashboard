@@ -44,4 +44,15 @@ describe("admin customer workspace", () => {
     expect(source).not.toContain("人工签约与开通待办");
     expect(source).not.toContain("ManualOrderCard");
   });
+
+  it("does not render or submit order and contract identifiers", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+    expect(source).not.toContain("订单 / 付款编号");
+    expect(source).not.toContain("合同编号");
+    expect(source).not.toContain("serviceOrderReference");
+    expect(source).not.toContain("serviceContractReference");
+  });
 });

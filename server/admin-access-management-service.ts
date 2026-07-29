@@ -6,11 +6,8 @@ import {
   hasSystemAdminAccess,
   writeWorkspaceAuditEvent,
 } from "./admin-control-plane-service";
-import {
-  assertAdminHasNoUsageOwnedUsers,
-  AuthServiceError,
-  type AuthenticatedUser,
-} from "./auth-service";
+import { isProtectedBuiltinAdminUsername } from "../shared/admin-access";
+import { AuthServiceError, type AuthenticatedUser } from "./auth-service";
 import { getDb } from "./db";
 
 export type ManagedAdminAccessLevel = "system_admin" | "delivery_admin";
@@ -77,6 +74,15 @@ export function assertAdminAccessLevelTransition(input: {
   }
 
   const previousAccessLevel = effectiveAccessLevel(target) ?? "delivery_admin";
+  if (
+    isProtectedBuiltinAdminUsername(target.username) &&
+    input.nextAccessLevel !== "system_admin"
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "内置 admin 必须保持为已启用的系统管理员",
+    );
+  }
   if (previousAccessLevel === input.nextAccessLevel) {
     return {
       changed: false as const,
@@ -203,15 +209,6 @@ export async function setManagedAdminAccessLevel(
     if (!transition.changed) {
       return { changed: false as const, user };
     }
-
-    const ownedUserIds = await store.listUsageOwnedUserIdsForUpdate(
-      executor,
-      transition.target.id,
-    );
-    assertAdminHasNoUsageOwnedUsers({
-      ownedUserCount: ownedUserIds.length,
-      mutation: "change_access_level",
-    });
 
     await store.updateAccessLevel(
       executor,

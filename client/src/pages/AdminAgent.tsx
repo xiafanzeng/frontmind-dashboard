@@ -85,6 +85,7 @@ export default function AdminAgent({
             hidePortalNavigation
             showKnowledgeBaseStarter={false}
             showAccountMenu={false}
+            standardWelcomeVariant="workflow"
           />
         )}
       </AgentViewport>

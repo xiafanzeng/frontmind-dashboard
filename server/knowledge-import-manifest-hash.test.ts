@@ -200,7 +200,10 @@ describe("website knowledge import v3 manifest binding", () => {
       buffer,
       "knowledge.zip",
       expect.any(String),
-      { validationProfile: "website-lead-v1" },
+      {
+        validationProfile: "website-lead-v1",
+        archiveContractVersion: 1,
+      },
     );
     expect(mocks.createKnowledgeSnapshot).not.toHaveBeenCalled();
     expect(mocks.removeStoredKnowledgeAssets).toHaveBeenCalledWith([]);
@@ -265,7 +268,10 @@ describe("website knowledge import v3 manifest binding", () => {
       buffer,
       "knowledge.zip",
       expect.any(String),
-      { validationProfile: "website-lead-v1" },
+      {
+        validationProfile: "website-lead-v1",
+        archiveContractVersion: 1,
+      },
     );
     expect(mocks.getLatestKnowledgeSnapshot).not.toHaveBeenCalled();
     expect(database.transactionUpdates).toContainEqual(

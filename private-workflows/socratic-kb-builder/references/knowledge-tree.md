@@ -48,7 +48,12 @@ Create one branch overview plus the associated leaf documents. The overview:
 - Includes the strongest two or three evidence-backed images by asset ID.
 - Points to leaves for detail without copying their full text.
 
-Each evidence-backed leaf contains at least 120 effective formal characters.
+Assign every overview and leaf `complete`, `limited_evidence`, or
+`needs_verification` independently from traversal status. Use the
+evidence-proportional formula in `output-format.md`; do not delete applicable
+business breadth or pad a sparse branch merely to reach a writing target.
+A white-label or early-stage enterprise can legitimately have short prose
+after uploads, official pages, documents, and public sources have been checked.
 Sparse leaves state the verified facts in formal prose and move unresolved
 items to the evidence/gap section. Status labels and source tables never count
 as formal content.

@@ -2,8 +2,6 @@ import { useMemo, useState, type FormEvent } from "react";
 import { useLocation } from "wouter";
 import {
   ArrowLeft,
-  CheckCircle2,
-  Copy,
   KeyRound,
   Loader2,
   Plus,
@@ -306,10 +304,7 @@ export default function AdminUsers() {
         open={createOpen}
         onOpenChange={setCreateOpen}
         deliveryAdmins={users.filter(
-          (account) =>
-            account.role === "admin" &&
-            account.adminAccessLevel === "delivery_admin" &&
-            account.isActive,
+          (account) => account.role === "admin" && account.isActive,
         )}
       />
       <ResetPasswordDialog
@@ -548,7 +543,12 @@ function UserRow({
           <Button
             size="sm"
             variant="outline"
-            disabled={busy}
+            disabled={busy || protectedBuiltinAdmin}
+            title={
+              protectedBuiltinAdmin
+                ? "内置 admin 必须保持为系统管理员"
+                : undefined
+            }
             onClick={() =>
               onChangeAccessLevel(
                 systemAdmin ? "delivery_admin" : "system_admin",
@@ -575,8 +575,14 @@ function UserRow({
         <Button
           size="sm"
           variant={account.isActive ? "outline" : "default"}
-          disabled={busy || isCurrent}
-          title={isCurrent ? "不能在此处禁用当前账号" : undefined}
+          disabled={busy || isCurrent || protectedBuiltinAdmin}
+          title={
+            protectedBuiltinAdmin
+              ? "内置 admin 必须保持启用"
+              : isCurrent
+                ? "不能在此处禁用当前账号"
+                : undefined
+          }
           onClick={() => onChangeStatus(!account.isActive)}
         >
           {pending ? (
@@ -631,6 +637,7 @@ export function CreateUserDialog({
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [role, setRole] = useState<"user" | "admin">("user");
   const [planCode, setPlanCode] = useState<ServicePlanCode | "">("");
@@ -638,12 +645,6 @@ export function CreateUserDialog({
   const [adminAccessLevel, setAdminAccessLevel] = useState<
     "system_admin" | "delivery_admin"
   >("delivery_admin");
-  const [createdSetup, setCreatedSetup] = useState<{
-    username: string;
-    setupUrl: string;
-    setupExpiresAt: number;
-    planCode: ServicePlanCode;
-  } | null>(null);
   const createMutation = trpc.admin.users.create.useMutation({
     onSuccess: () =>
       Promise.all([
@@ -656,12 +657,12 @@ export function CreateUserDialog({
     setUsername("");
     setDisplayName("");
     setPassword("");
+    setConfirmPassword("");
     setApiKey("");
     setRole("user");
     setPlanCode("");
     setDeliveryAdminId("");
     setAdminAccessLevel("delivery_admin");
-    setCreatedSetup(null);
     createMutation.reset();
   };
 
@@ -678,12 +679,20 @@ export function CreateUserDialog({
       toast.error("请填写用户名");
       return;
     }
-    if (role === "admin" && !password) {
-      toast.error("请填写管理员初始密码");
+    if (!password) {
+      toast.error("请填写初始密码");
       return;
     }
-    if (role === "admin" && password.length < MIN_PASSWORD_LENGTH) {
+    if (password.length < MIN_PASSWORD_LENGTH) {
       toast.error(`初始密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
+      return;
+    }
+    if (password.length > MAX_PASSWORD_LENGTH) {
+      toast.error(`初始密码不能超过 ${MAX_PASSWORD_LENGTH} 个字符`);
+      return;
+    }
+    if (password !== confirmPassword) {
+      toast.error("两次输入的初始密码不一致");
       return;
     }
     if (role === "user" && !planCode) {
@@ -712,6 +721,7 @@ export function CreateUserDialog({
           : await createMutation.mutateAsync({
               username: normalizedUsername,
               displayName: displayName.trim() || undefined,
+              password,
               role: "user",
               planCode: planCode as ServicePlanCode,
               deliveryAdminId: Number(deliveryAdminId),
@@ -721,17 +731,8 @@ export function CreateUserDialog({
         description: displayName.trim() || normalizedUsername,
       });
       onCreated?.(result.user.id);
-      if (result.setupUrl && result.setupExpiresAt) {
-        setCreatedSetup({
-          username: result.user.username,
-          setupUrl: result.setupUrl,
-          setupExpiresAt: result.setupExpiresAt,
-          planCode: result.contract!.planCode,
-        });
-      } else {
-        reset();
-        onOpenChange(false);
-      }
+      reset();
+      onOpenChange(false);
     } catch (error) {
       toast.error("无法创建账号", {
         description: error instanceof Error ? error.message : "请稍后重试",
@@ -742,289 +743,221 @@ export function CreateUserDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="w-[min(calc(100vw-1rem),480px)]">
-        {createdSetup ? (
-          <>
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2 pr-8">
-                <CheckCircle2 className="h-5 w-5 text-emerald-600" />
-                用户账号已创建
-              </DialogTitle>
-              <DialogDescription>
-                客户账号、独立 API
-                Key、套餐额度和交付负责人均已配置，客户设置密码后即可使用已购买能力。
-              </DialogDescription>
-            </DialogHeader>
-            <div className="mt-3 space-y-4">
-              <div className="rounded-xl border border-[#e1d8e8] bg-[#faf8fc] p-4">
-                <p className="text-xs font-semibold text-[#716a80]">用户名</p>
-                <p className="mt-1 text-sm font-medium text-[#221a33]">
-                  {createdSetup.username}
-                </p>
-                <p className="mt-4 text-xs font-semibold text-[#716a80]">
-                  已开通套餐
-                </p>
-                <p className="mt-1 text-sm font-medium text-[#221a33]">
-                  {createdSetup.planCode === "basic"
-                    ? "普通版"
-                    : createdSetup.planCode === "knowledge"
-                      ? "知识库版"
-                      : createdSetup.planCode === "advanced"
-                        ? "进阶版"
-                        : "豪华版"}
-                </p>
-                <p className="mt-4 text-xs font-semibold text-[#716a80]">
-                  一次性设置密码链接
-                </p>
-                <div className="mt-2 flex gap-2">
-                  <Input
-                    readOnly
-                    value={createdSetup.setupUrl}
-                    className="min-w-0 font-mono text-xs"
-                    onFocus={(event) => event.currentTarget.select()}
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    aria-label="复制设置密码链接"
-                    onClick={async () => {
-                      try {
-                        await navigator.clipboard.writeText(
-                          createdSetup.setupUrl,
-                        );
-                        toast.success("激活链接已复制");
-                      } catch {
-                        toast.error("无法自动复制，请手动复制链接");
-                      }
-                    }}
-                  >
-                    <Copy className="h-4 w-4" />
-                  </Button>
-                </div>
-                <p className="mt-2 text-xs text-[#9a94a8]">
-                  有效期至{" "}
-                  {new Date(createdSetup.setupExpiresAt).toLocaleString(
-                    "zh-CN",
-                  )}
-                  ，使用一次后立即失效。
-                </p>
+        <>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 pr-8">
+              <Plus className="h-5 w-5 text-primary" />
+              创建账号
+            </DialogTitle>
+            <DialogDescription>
+              {userOnly
+                ? "设置客户初始密码、套餐、主负责人和有效 API Key；创建完成后账号立即可用。"
+                : "普通用户和管理员均由系统管理员设置初始密码；普通用户还需配置套餐、主负责人和有效 API Key。"}
+            </DialogDescription>
+          </DialogHeader>
+          <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="create-username">用户名</Label>
+                <Input
+                  id="create-username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  placeholder="例如 zhangsan"
+                  disabled={createMutation.isPending}
+                />
               </div>
-              <div className="flex justify-end">
-                <Button type="button" onClick={() => handleOpenChange(false)}>
-                  完成
-                </Button>
+              <div className="space-y-2">
+                <Label htmlFor="create-display-name">显示名称（可选）</Label>
+                <Input
+                  id="create-display-name"
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  placeholder="例如 张三"
+                  disabled={createMutation.isPending}
+                />
               </div>
             </div>
-          </>
-        ) : (
-          <>
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2 pr-8">
-                <Plus className="h-5 w-5 text-primary" />
-                创建账号
-              </DialogTitle>
-              <DialogDescription>
-                {userOnly
-                  ? "创建客户时必须选择套餐并填写有效 API Key；创建成功后套餐与额度立即生效。"
-                  : "普通用户必须选择套餐、填写有效 API Key并通过一次性链接设置密码；管理员账号仍由系统管理员设置初始密码。"}
-              </DialogDescription>
-            </DialogHeader>
-            <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="create-username">用户名</Label>
-                  <Input
-                    id="create-username"
-                    value={username}
-                    onChange={(event) => setUsername(event.target.value)}
-                    autoComplete="off"
-                    autoCapitalize="none"
-                    spellCheck={false}
-                    placeholder="例如 zhangsan"
-                    disabled={createMutation.isPending}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="create-display-name">显示名称（可选）</Label>
-                  <Input
-                    id="create-display-name"
-                    value={displayName}
-                    onChange={(event) => setDisplayName(event.target.value)}
-                    placeholder="例如 张三"
-                    disabled={createMutation.isPending}
-                  />
-                </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="create-password">初始密码</Label>
+                <Input
+                  id="create-password"
+                  type="password"
+                  autoComplete="new-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  minLength={MIN_PASSWORD_LENGTH}
+                  maxLength={MAX_PASSWORD_LENGTH}
+                  placeholder={`至少 ${MIN_PASSWORD_LENGTH} 个字符`}
+                  disabled={createMutation.isPending}
+                />
               </div>
-              {role === "admin" ? (
+              <div className="space-y-2">
+                <Label htmlFor="create-confirm-password">确认初始密码</Label>
+                <Input
+                  id="create-confirm-password"
+                  type="password"
+                  autoComplete="new-password"
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  minLength={MIN_PASSWORD_LENGTH}
+                  maxLength={MAX_PASSWORD_LENGTH}
+                  placeholder="再次输入初始密码"
+                  disabled={createMutation.isPending}
+                />
+              </div>
+            </div>
+            {role === "user" && (
+              <div className="space-y-2">
+                <Label htmlFor="create-api-key">客户 API Key</Label>
+                <Input
+                  id="create-api-key"
+                  type="password"
+                  autoComplete="off"
+                  value={apiKey}
+                  onChange={(event) => setApiKey(event.target.value)}
+                  placeholder="创建前会验证 Key，可与其他客户使用相同原始 Key"
+                  disabled={createMutation.isPending}
+                />
+                <p className="text-xs leading-5 text-muted-foreground">
+                  Key 将按客户账号独立加密和版本化。以后替换该客户的 Key
+                  不会影响其他账号。
+                </p>
+              </div>
+            )}
+            {!userOnly && (
+              <div className="space-y-2">
+                <Label>账号角色</Label>
+                <Select
+                  value={role}
+                  onValueChange={(value) => {
+                    setRole(value as "user" | "admin");
+                    setPlanCode("");
+                  }}
+                  disabled={createMutation.isPending}
+                >
+                  <SelectTrigger className="w-full" aria-label="账号角色">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="user">用户</SelectItem>
+                    <SelectItem value="admin">管理员</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            {role === "user" && (
+              <>
                 <div className="space-y-2">
-                  <Label htmlFor="create-password">管理员初始密码</Label>
-                  <Input
-                    id="create-password"
-                    type="password"
-                    autoComplete="new-password"
-                    value={password}
-                    onChange={(event) => setPassword(event.target.value)}
-                    minLength={MIN_PASSWORD_LENGTH}
-                    maxLength={MAX_PASSWORD_LENGTH}
-                    placeholder={`至少 ${MIN_PASSWORD_LENGTH} 个字符`}
-                    disabled={createMutation.isPending}
-                  />
-                </div>
-              ) : (
-                <>
-                  <div className="rounded-xl border border-[#e1d8e8] bg-[#faf8fc] px-4 py-3 text-sm leading-6 text-[#716a80]">
-                    创建后会生成 48
-                    小时有效的一次性设置密码链接。数据库仅保存链接凭证的哈希，不保存或展示用户密码。
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="create-api-key">客户 API Key</Label>
-                    <Input
-                      id="create-api-key"
-                      type="password"
-                      autoComplete="off"
-                      value={apiKey}
-                      onChange={(event) => setApiKey(event.target.value)}
-                      placeholder="创建前会验证 Key，可与其他客户使用相同原始 Key"
-                      disabled={createMutation.isPending}
-                    />
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      Key 将按客户账号独立加密和版本化。以后替换该客户的 Key
-                      不会影响其他账号。
-                    </p>
-                  </div>
-                </>
-              )}
-              {!userOnly && (
-                <div className="space-y-2">
-                  <Label>账号角色</Label>
+                  <Label>客户套餐</Label>
                   <Select
-                    value={role}
-                    onValueChange={(value) => {
-                      setRole(value as "user" | "admin");
-                      setPlanCode("");
-                    }}
-                    disabled={createMutation.isPending}
-                  >
-                    <SelectTrigger className="w-full" aria-label="账号角色">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="user">用户</SelectItem>
-                      <SelectItem value="admin">管理员</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
-              {role === "user" && (
-                <>
-                  <div className="space-y-2">
-                    <Label>客户套餐</Label>
-                    <Select
-                      value={planCode}
-                      onValueChange={(value) =>
-                        setPlanCode(value as ServicePlanCode)
-                      }
-                      disabled={createMutation.isPending}
-                    >
-                      <SelectTrigger className="w-full" aria-label="客户套餐">
-                        <SelectValue placeholder="请选择客户套餐" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="basic">普通版</SelectItem>
-                        <SelectItem value="knowledge">知识库版</SelectItem>
-                        <SelectItem value="advanced">进阶版</SelectItem>
-                        <SelectItem value="luxury">豪华版</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <Label>客户主负责人</Label>
-                    <Select
-                      value={deliveryAdminId}
-                      onValueChange={setDeliveryAdminId}
-                      disabled={
-                        createMutation.isPending || deliveryAdmins.length === 0
-                      }
-                    >
-                      <SelectTrigger
-                        className="w-full"
-                        aria-label="客户主负责人"
-                      >
-                        <SelectValue
-                          placeholder={
-                            deliveryAdmins.length
-                              ? "请选择交付管理员"
-                              : "暂无可用交付管理员"
-                          }
-                        />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {deliveryAdmins.map((admin) => (
-                          <SelectItem key={admin.id} value={String(admin.id)}>
-                            {admin.displayName || admin.username} · @
-                            {admin.username}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      该交付管理员会成为客户主负责人，并承担该客户的任务用量归属。
-                    </p>
-                  </div>
-                </>
-              )}
-              {role === "admin" && (
-                <div className="space-y-2">
-                  <Label>管理员权限</Label>
-                  <Select
-                    value={adminAccessLevel}
+                    value={planCode}
                     onValueChange={(value) =>
-                      setAdminAccessLevel(
-                        value as "system_admin" | "delivery_admin",
-                      )
+                      setPlanCode(value as ServicePlanCode)
                     }
                     disabled={createMutation.isPending}
                   >
-                    <SelectTrigger className="w-full">
-                      <SelectValue />
+                    <SelectTrigger className="w-full" aria-label="客户套餐">
+                      <SelectValue placeholder="请选择客户套餐" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="delivery_admin">交付管理员</SelectItem>
-                      <SelectItem value="system_admin">系统管理员</SelectItem>
+                      <SelectItem value="basic">普通版</SelectItem>
+                      <SelectItem value="knowledge">知识库版</SelectItem>
+                      <SelectItem value="advanced">进阶版</SelectItem>
+                      <SelectItem value="luxury">豪华版</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label>客户主负责人</Label>
+                  <Select
+                    value={deliveryAdminId}
+                    onValueChange={setDeliveryAdminId}
+                    disabled={
+                      createMutation.isPending || deliveryAdmins.length === 0
+                    }
+                  >
+                    <SelectTrigger className="w-full" aria-label="客户主负责人">
+                      <SelectValue
+                        placeholder={
+                          deliveryAdmins.length
+                            ? "请选择主负责人"
+                            : "暂无可用管理员"
+                        }
+                      />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {deliveryAdmins.map((admin) => (
+                        <SelectItem key={admin.id} value={String(admin.id)}>
+                          {admin.displayName || admin.username} · @
+                          {admin.username}
+                        </SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                   <p className="text-xs leading-5 text-muted-foreground">
-                    交付管理员仅管理被分配客户；系统管理员可调整合同权益、
-                    管理账号及官网全局凭据。
+                    系统管理员或交付管理员均可成为客户主负责人，并承担该客户的任务用量归属。
                   </p>
                 </div>
-              )}
-              <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => handleOpenChange(false)}
+              </>
+            )}
+            {role === "admin" && (
+              <div className="space-y-2">
+                <Label>管理员权限</Label>
+                <Select
+                  value={adminAccessLevel}
+                  onValueChange={(value) =>
+                    setAdminAccessLevel(
+                      value as "system_admin" | "delivery_admin",
+                    )
+                  }
                   disabled={createMutation.isPending}
                 >
-                  取消
-                </Button>
-                <Button
-                  type="submit"
-                  disabled={
-                    createMutation.isPending ||
-                    (role === "user" &&
-                      (!planCode || !apiKey.trim() || !deliveryAdminId))
-                  }
-                >
-                  {createMutation.isPending && (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  )}
-                  {role === "user" ? "创建客户账号" : "创建管理员"}
-                </Button>
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="delivery_admin">交付管理员</SelectItem>
+                    <SelectItem value="system_admin">系统管理员</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  交付管理员仅管理被分配客户；系统管理员可调整合同权益、
+                  管理账号及官网全局凭据。
+                </p>
               </div>
-            </form>
-          </>
-        )}
+            )}
+            <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => handleOpenChange(false)}
+                disabled={createMutation.isPending}
+              >
+                取消
+              </Button>
+              <Button
+                type="submit"
+                disabled={
+                  createMutation.isPending ||
+                  !password ||
+                  password !== confirmPassword ||
+                  (role === "user" &&
+                    (!planCode || !apiKey.trim() || !deliveryAdminId))
+                }
+              >
+                {createMutation.isPending && (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                )}
+                {role === "user" ? "创建客户账号" : "创建管理员"}
+              </Button>
+            </div>
+          </form>
+        </>
       </DialogContent>
     </Dialog>
   );

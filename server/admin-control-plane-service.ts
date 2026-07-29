@@ -13,6 +13,7 @@ import {
 } from "../drizzle/schema";
 import { dashboardPayloadSchema } from "../shared/dashboard";
 import {
+  hasDeliveryCapability,
   isExplicitAdminAccessLevel,
   type AdminAccessLevel,
 } from "../shared/admin-access";
@@ -46,6 +47,12 @@ export function hasSystemAdminAccess(
   user: Pick<AuthenticatedUser, "role" | "username" | "adminAccessLevel">,
 ) {
   return getEffectiveAdminAccessLevel(user) === "system_admin";
+}
+
+export function hasDeliveryAdminAccess(
+  user: Pick<AuthenticatedUser, "role" | "adminAccessLevel">,
+) {
+  return hasDeliveryCapability(user);
 }
 
 async function requireDb() {

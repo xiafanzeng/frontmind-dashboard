@@ -5,6 +5,8 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { embeddedKnowledgeBasePanel } = vi.hoisted(() => ({
@@ -12,10 +14,16 @@ const { embeddedKnowledgeBasePanel } = vi.hoisted(() => ({
 }));
 
 vi.mock("@/components/EmbeddedKnowledgeBasePanel", () => ({
-  default: (props: { page: "build" | "display" }) => {
+  default: (props: {
+    page: "build" | "display";
+    mode?: "standard" | "workspace";
+  }) => {
     embeddedKnowledgeBasePanel(props);
     return (
-      <div data-testid="embedded-knowledge-base-panel">
+      <div
+        data-testid="embedded-knowledge-base-panel"
+        data-layout-mode={props.mode}
+      >
         知识库组件：{props.page}
       </div>
     );
@@ -352,6 +360,13 @@ describe("UserBrandDashboard service experience", () => {
     expect(
       await screen.findByTestId("embedded-knowledge-base-panel"),
     ).toHaveTextContent("知识库组件：build");
+    expect(screen.getByTestId("embedded-knowledge-base-panel")).toHaveAttribute(
+      "data-layout-mode",
+      "workspace",
+    );
+    expect(embeddedKnowledgeBasePanel).toHaveBeenCalledWith(
+      expect.objectContaining({ page: "build", mode: "workspace" }),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "应答逻辑智能体" }));
     expect(
@@ -363,6 +378,21 @@ describe("UserBrandDashboard service experience", () => {
     expect(
       screen.queryByTestId("embedded-knowledge-base-panel"),
     ).not.toBeInTheDocument();
+  });
+
+  it("keeps the user knowledge builder on one conversation without a switcher", () => {
+    const source = readFileSync(
+      resolve(
+        process.cwd(),
+        "client/src/components/EmbeddedKnowledgeBasePanel.tsx",
+      ),
+      "utf8",
+    );
+
+    expect(source).toContain("<Home");
+    expect(source).toContain("hideSidebar");
+    expect(source).not.toContain('from "@/components/Sidebar"');
+    expect(source).not.toContain("新建会话");
   });
 
   it("shows only the purchased basic question and never presents an unconfirmed response as a confirmed result", async () => {

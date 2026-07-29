@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { Loader2, RefreshCw, Send, Sparkles } from "lucide-react";
+import {
+  Loader2,
+  PanelRightOpen,
+  RefreshCw,
+  Send,
+  Sparkles,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
@@ -8,6 +14,12 @@ import KnowledgeBaseViewer, {
   type KnowledgeSnapshotView,
 } from "@/components/KnowledgeBaseViewer";
 import { Button } from "@/components/ui/button";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { useConversation } from "@/contexts/ConversationContext";
 import { syncKnowledgeBaseArchiveFromOutput } from "@/lib/knowledge-snapshot";
 import { trpc } from "@/lib/trpc";
@@ -22,6 +34,7 @@ export default function EmbeddedKnowledgeBasePanel({
   previewData,
   page,
   onPageChange,
+  mode = "standard",
 }: {
   preview?: boolean;
   previewData?: {
@@ -30,6 +43,7 @@ export default function EmbeddedKnowledgeBasePanel({
   };
   page: "build" | "display";
   onPageChange: (page: "build" | "display") => void;
+  mode?: "standard" | "workspace";
 }) {
   const previewMode = import.meta.env.DEV && preview && Boolean(previewData);
   const { user } = useAuth();
@@ -46,16 +60,41 @@ export default function EmbeddedKnowledgeBasePanel({
   });
 
   return (
-    <section className="page-shell pb-8">
-      <header className="page-header flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+    <section
+      className={
+        mode === "workspace"
+          ? "flex h-full min-h-0 flex-col overflow-hidden bg-white"
+          : "page-shell pb-8"
+      }
+      data-layout-mode={mode}
+    >
+      <header
+        className={
+          mode === "workspace"
+            ? "flex min-h-16 shrink-0 items-center justify-between gap-4 border-b border-[#e8e1ee] bg-white px-5 py-3 pl-16 min-[769px]:pl-5"
+            : "page-header flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between"
+        }
+      >
         <div>
-          <span className="eyebrow">MindPromise智诺 / 知识库智能体</span>
-          <h2>{page === "build" ? "知识库构建流程" : "知识库展示"}</h2>
-          <p>
-            {page === "build"
-              ? "完成对话更新后，点击“更新知识库”同步展示内容。"
-              : "按知识章节展示关联文本与图片，内容来自最近一次手动更新的知识库。"}
-          </p>
+          {mode === "standard" && (
+            <span className="eyebrow">MindPromise智诺 / 知识库智能体</span>
+          )}
+          <h2
+            className={
+              mode === "workspace"
+                ? "m-0 text-base font-semibold text-[#171321]"
+                : undefined
+            }
+          >
+            {page === "build" ? "知识库智能体" : "知识库展示"}
+          </h2>
+          {mode === "standard" && (
+            <p>
+              {page === "build"
+                ? "完成对话更新后，点击“更新知识库”同步展示内容。"
+                : "按知识章节展示关联文本与图片，内容来自最近一次手动更新的知识库。"}
+            </p>
+          )}
         </div>
         {page === "build" &&
           (previewMode ? (
@@ -88,19 +127,28 @@ export default function EmbeddedKnowledgeBasePanel({
       </header>
 
       {page === "display" ? (
-        <KnowledgeBaseViewer
-          snapshot={
-            previewMode ? previewData?.snapshot : knowledgeQuery.data?.snapshot
+        <div
+          className={
+            mode === "workspace" ? "min-h-0 flex-1 overflow-auto p-5" : ""
           }
-          loading={!previewMode && knowledgeQuery.isLoading}
-        />
+        >
+          <KnowledgeBaseViewer
+            snapshot={
+              previewMode
+                ? previewData?.snapshot
+                : knowledgeQuery.data?.snapshot
+            }
+            loading={!previewMode && knowledgeQuery.isLoading}
+          />
+        </div>
       ) : previewMode && previewProgress ? (
         <PreviewBuildFlow
           progress={previewProgress}
           onProgressChange={setPreviewProgress}
+          mode={mode}
         />
       ) : (
-        <RealBuildFlow />
+        <RealBuildFlow mode={mode} />
       )}
     </section>
   );
@@ -125,8 +173,8 @@ function ManualKnowledgeUpdateButton({
 
   const updateKnowledgeBase = async () => {
     if (!activeConversation?.id) {
-      toast.warning("当前对话还没有可更新的知识库内容", {
-        description: "请先在构建流程中完成一次知识库对话。",
+      toast.warning("当前任务还没有可更新的知识库内容", {
+        description: "请先在构建工作台中完成知识库整理。",
       });
       return;
     }
@@ -148,8 +196,8 @@ function ManualKnowledgeUpdateButton({
       activeConversation.status === "running" ||
       activeConversation.status === "pending"
     ) {
-      toast.warning("知识库对话仍在处理中", {
-        description: "请等待本轮对话完成后再更新。",
+      toast.warning("知识库任务仍在处理中", {
+        description: "请等待本轮构建完成后再更新。",
       });
       return;
     }
@@ -193,7 +241,7 @@ function ManualKnowledgeUpdateButton({
   );
 }
 
-function RealBuildFlow() {
+function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
   const {
     state,
     activeConversation,
@@ -273,9 +321,28 @@ function RealBuildFlow() {
       );
   }, [progressQuery.refetch]);
 
+  const progressPanel = (
+    <KnowledgeBaseProgressPanel
+      progress={progressQuery.data?.progress}
+      loading={progressQuery.isLoading}
+    />
+  );
+
   return (
-    <div className="grid min-h-[680px] gap-5 2xl:grid-cols-[minmax(0,1fr)_390px]">
-      <div className="h-[calc(100dvh-210px)] min-h-[680px] overflow-hidden rounded-[20px] border border-[#e1d8e8] bg-white shadow-[0_18px_48px_rgba(33,19,58,.08)]">
+    <div
+      className={
+        mode === "workspace"
+          ? "relative grid min-h-0 flex-1 grid-cols-1 overflow-hidden xl:grid-cols-[minmax(0,1fr)_390px]"
+          : "grid min-h-[680px] gap-5 2xl:grid-cols-[minmax(0,1fr)_390px]"
+      }
+    >
+      <div
+        className={
+          mode === "workspace"
+            ? "min-h-0 overflow-hidden bg-white"
+            : "h-[calc(100dvh-210px)] min-h-[680px] overflow-hidden rounded-[20px] border border-[#e1d8e8] bg-white shadow-[0_18px_48px_rgba(33,19,58,.08)]"
+        }
+      >
         {scopedConversation ? (
           <Home
             key={scopedConversation.id}
@@ -287,17 +354,55 @@ function RealBuildFlow() {
         ) : (
           <div className="flex h-full items-center justify-center gap-2 text-sm text-[#716a80]">
             <Loader2 className="h-5 w-5 animate-spin text-[#5b2a86]" />
-            正在打开知识库会话…
+            正在打开知识库工作台…
           </div>
         )}
       </div>
-      <div className="max-h-[calc(100dvh-210px)] min-h-[320px] overflow-y-auto custom-scrollbar">
-        <KnowledgeBaseProgressPanel
-          progress={progressQuery.data?.progress}
-          loading={progressQuery.isLoading}
-        />
+      <div
+        className={
+          mode === "workspace"
+            ? "hidden min-h-0 overflow-y-auto border-l border-[#e8e1ee] bg-[#fbf9fd] p-4 custom-scrollbar xl:block"
+            : "max-h-[calc(100dvh-210px)] min-h-[320px] overflow-y-auto custom-scrollbar"
+        }
+      >
+        {progressPanel}
       </div>
+      {mode === "workspace" && (
+        <MobileProgressSheet progressPanel={progressPanel} />
+      )}
     </div>
+  );
+}
+
+function MobileProgressSheet({
+  progressPanel,
+}: {
+  progressPanel: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Sheet open={open} onOpenChange={setOpen}>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => setOpen(true)}
+        className="absolute right-4 top-4 z-30 gap-2 border-[#d8cde3] bg-white/95 text-[#5b2a86] shadow-sm xl:hidden"
+        aria-label="查看知识库构建进度"
+      >
+        <PanelRightOpen className="h-4 w-4" />
+        构建进度
+      </Button>
+      <SheetContent
+        side="right"
+        className="w-[min(92vw,390px)] gap-0 overflow-y-auto bg-[#fbf9fd] p-4 sm:max-w-[390px]"
+      >
+        <SheetHeader className="mb-4 pr-8 text-left">
+          <SheetTitle>知识库构建进度</SheetTitle>
+        </SheetHeader>
+        {progressPanel}
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -387,9 +492,11 @@ function rebuildPreviewProgress(
 function PreviewBuildFlow({
   progress,
   onProgressChange,
+  mode,
 }: {
   progress: KnowledgeBaseProgressDto;
   onProgressChange: (progress: KnowledgeBaseProgressDto) => void;
+  mode: "standard" | "workspace";
 }) {
   const [draft, setDraft] = useState("");
   const currentLeaf = progress.branches
@@ -444,9 +551,23 @@ function PreviewBuildFlow({
     setDraft("");
   };
 
+  const progressPanel = <KnowledgeBaseProgressPanel progress={progress} />;
+
   return (
-    <div className="grid min-h-[680px] gap-5 2xl:grid-cols-[minmax(0,1fr)_390px]">
-      <section className="flex min-h-[680px] flex-col overflow-hidden rounded-[20px] border border-[#e8e1ee] bg-white shadow-[0_18px_48px_rgba(33,19,58,.07)]">
+    <div
+      className={
+        mode === "workspace"
+          ? "relative grid min-h-0 flex-1 grid-cols-1 overflow-hidden xl:grid-cols-[minmax(0,1fr)_390px]"
+          : "grid min-h-[680px] gap-5 2xl:grid-cols-[minmax(0,1fr)_390px]"
+      }
+    >
+      <section
+        className={
+          mode === "workspace"
+            ? "flex min-h-0 flex-col overflow-hidden bg-white"
+            : "flex min-h-[680px] flex-col overflow-hidden rounded-[20px] border border-[#e8e1ee] bg-white shadow-[0_18px_48px_rgba(33,19,58,.07)]"
+        }
+      >
         <div className="flex items-center justify-between gap-3 border-b border-[#e8e1ee] px-5 py-4 sm:px-6">
           <div className="flex items-center gap-3">
             <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#5b2a86] text-white">
@@ -525,9 +646,18 @@ function PreviewBuildFlow({
         </div>
       </section>
 
-      <div className="max-h-[780px] overflow-y-auto custom-scrollbar">
-        <KnowledgeBaseProgressPanel progress={progress} />
+      <div
+        className={
+          mode === "workspace"
+            ? "hidden min-h-0 overflow-y-auto border-l border-[#e8e1ee] bg-[#fbf9fd] p-4 custom-scrollbar xl:block"
+            : "max-h-[780px] overflow-y-auto custom-scrollbar"
+        }
+      >
+        {progressPanel}
       </div>
+      {mode === "workspace" && (
+        <MobileProgressSheet progressPanel={progressPanel} />
+      )}
     </div>
   );
 }

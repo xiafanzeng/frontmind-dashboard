@@ -1108,8 +1108,6 @@ function PreviewServiceManager({
                 <option value="pending">待确认</option>
               </select>
             </label>
-            <Input aria-label="订单编号" placeholder="订单 / 付款编号" />
-            <Input aria-label="合同编号" placeholder="已签合同编号" />
             <Input aria-label="签署主体" placeholder="企业名 / 签署主体" />
             <Input aria-label="签署核验依据" placeholder="签署核验依据" />
           </div>
@@ -1230,11 +1228,16 @@ export function previewAccountDraftIsValid(input: {
   role: PreviewAccountRole;
   planCode?: PreviewPlanCode | "";
   password?: string;
+  confirmPassword?: string;
 }) {
   if (!input.name.trim() || !input.username.trim()) return false;
-  return input.role === "用户"
-    ? Boolean(input.planCode)
-    : (input.password?.length ?? 0) >= 8;
+  if (
+    (input.password?.length ?? 0) < 8 ||
+    input.password !== input.confirmPassword
+  ) {
+    return false;
+  }
+  return input.role === "管理员" || Boolean(input.planCode);
 }
 
 export function PreviewCreateAccountDialog({
@@ -1253,6 +1256,7 @@ export function PreviewCreateAccountDialog({
   const [role, setRole] = useState<PreviewAccountRole>("用户");
   const [planCode, setPlanCode] = useState<PreviewPlanCode | "">("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [adminAccessLevel, setAdminAccessLevel] = useState<
     "delivery_admin" | "system_admin"
   >("delivery_admin");
@@ -1263,6 +1267,7 @@ export function PreviewCreateAccountDialog({
     setRole("用户");
     setPlanCode("");
     setPassword("");
+    setConfirmPassword("");
     setAdminAccessLevel("delivery_admin");
   };
   const handleOpenChange = (nextOpen: boolean) => {
@@ -1275,6 +1280,7 @@ export function PreviewCreateAccountDialog({
     role,
     planCode,
     password,
+    confirmPassword,
   });
 
   return (
@@ -1318,7 +1324,6 @@ export function PreviewCreateAccountDialog({
                 onChange={(event) => {
                   setRole(event.target.value as PreviewAccountRole);
                   setPlanCode("");
-                  setPassword("");
                 }}
                 className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
               >
@@ -1327,6 +1332,28 @@ export function PreviewCreateAccountDialog({
               </select>
             </label>
           )}
+          <label className="block text-sm font-medium text-[#484057]">
+            初始密码
+            <Input
+              aria-label="初始密码"
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              className="mt-2"
+              placeholder="至少 8 个字符"
+            />
+          </label>
+          <label className="block text-sm font-medium text-[#484057]">
+            确认初始密码
+            <Input
+              aria-label="确认初始密码"
+              type="password"
+              value={confirmPassword}
+              onChange={(event) => setConfirmPassword(event.target.value)}
+              className="mt-2"
+              placeholder="再次输入初始密码"
+            />
+          </label>
           {role === "用户" ? (
             <label className="block text-sm font-medium text-[#484057]">
               客户套餐
@@ -1347,16 +1374,6 @@ export function PreviewCreateAccountDialog({
             </label>
           ) : (
             <>
-              <label className="block text-sm font-medium text-[#484057]">
-                管理员初始密码
-                <Input
-                  type="password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  className="mt-2"
-                  placeholder="至少 8 个字符"
-                />
-              </label>
               <label className="block text-sm font-medium text-[#484057]">
                 管理员权限
                 <select

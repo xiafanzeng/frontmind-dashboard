@@ -35,7 +35,7 @@ Treat each value as a hard ceiling unless described as a target:
 | User uploads                                      | cumulative maximum 100; process before linked documents |
 | Public-web queries                                |                                                     120 |
 | Deduplicated retained evidence text               |                                    3,000,000 characters |
-| Customer-visible formal prose                     |               target 120,000; 80,000–180,000 characters |
+| Customer-visible formal prose                     |       target 80,000–120,000; maximum 180,000 characters |
 | Adaptive leaf nodes                               |                                                  40–115 |
 | Ordinary ZIP files                                |                                                   1,500 |
 | Packaged image bytes                              |                                                 160 MiB |
@@ -75,17 +75,28 @@ not evidence of completeness.
    documents, uploads, and queries. Counts must be non-negative and
    monotonically increasing.
 
-## Image selection and validation
+## Image discovery, selection, and validation
 
 Discover broadly, but download only likely delivery assets. Rank: logo and
 brand marks, core product/service families, application scenes,
 technology/manufacturing capability, qualifications, and team.
 
-- If at least 360 unique eligible first-party images exist, package 360–480.
-- If fewer than 360 exist, package every useful eligible image and record the
-  measured candidate count plus a specific `shortfallReason`.
+- Inspect HTML `img`/`srcset`, lazy-load attributes, `picture/source`, CSS
+  backgrounds, Open Graph images, product galleries, and useful images inside
+  official documents. Record the discovery method, source page, candidate
+  result, and rejection reason in the package manifest.
+- Treat 360–480 as a quality target, not a minimum. If at least 360 unique
+  eligible first-party images exist, package 360–480. If fewer exist, package
+  every useful eligible image and declare `source_limited` or `budget_limited`
+  with a specific reason and an arithmetically complete candidate funnel.
 - Associate every core product/service family that has official imagery with
-  at least one asset.
+  at least one asset. For a family without an official image, record the
+  checked sources and a concrete media gap.
+- Assign every product/service leaf a stable `productFamilyId`; do not infer
+  product/service scope from titles. At least one family is required. Once any
+  leaf in a branch has `productFamilyId`, every leaf in that branch must have
+  one. The manifest `productFamilyCoverage` IDs must exactly match the distinct
+  leaf family IDs, so a discovered family cannot be silently omitted.
 - Deduplicate by decoded content hash while retaining all document/source
   relationships.
 - Accept only validated AVIF, WebP, PNG, JPEG, or GIF bytes. Rasterize useful
@@ -95,7 +106,7 @@ technology/manufacturing capability, qualifications, and team.
 - Never count a discovered URL, failed response, HTML error page, or duplicate
   as a packaged image.
 
-## Phase 2: adaptive tree and formal synthesis
+## Phase 2: adaptive tree and evidence-proportional formal synthesis
 
 Read `references/knowledge-tree.md`. Derive an adaptive 40–115 leaf inventory.
 Keep the complete real product/service family breadth; consolidate repetitive
@@ -107,6 +118,43 @@ Before user confirmation, write:
 - One customer-ready draft for every leaf.
 - Exact evidence and source relationships outside the formal prose block.
 - Relevant first-party asset relationships by stable asset ID.
+
+Treat prose sizes as targets. Do not invent or repeat content to reach them.
+For each overview and leaf, record `evidenceDocumentIds`,
+`evidenceCharacters`, `requiredFormalCharacters`, and `contentStatus` in the
+package manifest. `evidenceCharacters` must equal the validator-recomputed
+effective characters in those packaged `kind: evidence` documents; never
+self-report a smaller evidence total to lower the writing requirement.
+Normalize and deduplicate evidence content before packaging: two evidence
+documents that differ only by Markdown, Unicode form, whitespace, case, or
+punctuation invalidate the archive. Every evidence document used by
+`evidenceDocumentIds` must explicitly declare the same `branchId` as the
+overview/leaf. A real evidence document may support multiple related leaves
+in that one branch. Every packaged `kind: evidence` document must be referenced
+by at least one overview or leaf; acquired evidence may not remain hidden and
+unorganized in the archive.
+
+- `complete`: evidence supports the target depth.
+- `limited_evidence`: discovery was performed but the available evidence only
+  supports shorter, factual prose.
+- `needs_verification`: no confirmable evidence exists; write a concise,
+  structured gap note describing checked sources and requested materials.
+
+Calculate the deterministic requirement from deduplicated related evidence:
+
+- Ordinary overview: `min(2500, floor(evidenceCharacters * 0.25))`, with a
+  120-character readable minimum when evidence exists.
+- Overview for a branch whose leaves declare `productFamilyId`: use the same
+  formula with a 5,000-character target.
+- Leaf: `min(500, floor(evidenceCharacters * 0.20))`, with an 80-character
+  readable minimum when evidence exists.
+- With zero evidence, require only a 60-character overview gap note or a
+  40-character leaf gap note and use `needs_verification`.
+
+The 80,000–120,000 overall prose range is a quality target. Only the
+180,000-character ceiling is a hard global gate. A small or white-label
+enterprise may legitimately deliver less formal prose when every short branch
+passes its evidence-proportional requirement.
 
 Use the formal-content markers defined in `references/output-format.md`.
 Formal prose must explain the enterprise in natural, publication-ready
@@ -137,8 +185,9 @@ exactly. The service state is authoritative.
 ## Phase 4: package only at 100%
 
 Read `references/output-format.md`. Preserve the existing
-`00_completeness.json` fields and completeness rules. Add the exact
-`00_package_manifest.json` contract.
+`00_completeness.json` fields and completeness rules. Use schema version 2 of
+the exact `00_package_manifest.json` contract. Historical schema-version-1
+archives remain readable, but every new v2 build must emit schema version 2.
 
 Before returning a ZIP:
 
