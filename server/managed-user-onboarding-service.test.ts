@@ -291,11 +291,35 @@ describe("managed user onboarding", () => {
         },
         test.dependencies,
       ),
-    ).rejects.toThrow("只有系统管理员");
+    ).rejects.toThrow("只有系统管理员或交付管理员");
     expect(transaction).not.toHaveBeenCalled();
   });
 
-  it("rejects a delivery administrator before opening a transaction", async () => {
+  it("allows a delivery administrator to create a customer assigned to the current account", async () => {
+    const test = harness();
+
+    const result = await createManagedServiceUser(
+      {
+        actor: actor("delivery_admin"),
+        username: "delivery.created.customer",
+        password: "customer-initial-password",
+        planCode: "luxury",
+        deliveryAdminId: 42,
+        apiKey: "sk-customer-valid-credential-00000005",
+      },
+      test.dependencies,
+    );
+
+    expect(result.assignedToCreator).toBe(true);
+    expect(result.assignedDeliveryAdminId).toBe(42);
+    expect(test.state().accounts).toEqual([501]);
+    expect(test.state().assignments).toEqual([{ userId: 501, adminId: 42 }]);
+    expect(test.state().audits[0]).toMatchObject({
+      metadata: { deliveryAdminId: 42 },
+    });
+  });
+
+  it("rejects a delivery administrator assigning a new customer to another administrator", async () => {
     const test = harness();
     const transaction = vi.spyOn(test.dependencies, "transaction");
 
@@ -303,15 +327,15 @@ describe("managed user onboarding", () => {
       createManagedServiceUser(
         {
           actor: actor("delivery_admin"),
-          username: "bypass.customer",
+          username: "cross-assigned.customer",
           password: "customer-initial-password",
           planCode: "luxury",
-          deliveryAdminId: 42,
-          apiKey: "sk-customer-valid-credential-00000005",
+          deliveryAdminId: 99,
+          apiKey: "sk-customer-valid-credential-00000006",
         },
         test.dependencies,
       ),
-    ).rejects.toThrow("只有系统管理员");
+    ).rejects.toThrow("必须归属当前账号");
     expect(transaction).not.toHaveBeenCalled();
     expect(test.state()).toEqual({
       accounts: [],

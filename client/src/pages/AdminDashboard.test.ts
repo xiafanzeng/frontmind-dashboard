@@ -98,7 +98,13 @@ describe("administrator channel navigation", () => {
     ).toBe(true);
     expect(
       deliveryAdminNavigation.some((item) => item.href === "/admin/users"),
-    ).toBe(false);
+    ).toBe(true);
+    expect(
+      deliveryAdminNavigation.find((item) => item.href === "/admin/users"),
+    ).toMatchObject({
+      label: "创建客户账号",
+      group: "客户与服务",
+    });
     expect(
       deliveryAdminNavigation.some((item) => item.href === "/admin/presales"),
     ).toBe(false);

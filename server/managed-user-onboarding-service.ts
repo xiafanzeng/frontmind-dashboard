@@ -119,10 +119,19 @@ export async function createManagedServiceUser(
   },
   dependencies: ManagedUserOnboardingDependencies = {},
 ) {
-  if (!hasSystemAdminAccess(input.actor)) {
+  if (!hasDeliveryCapability(input.actor)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "只有系统管理员可以创建客户账号并发起商业开通",
+      "只有系统管理员或交付管理员可以创建客户账号",
+    );
+  }
+  if (
+    !hasSystemAdminAccess(input.actor) &&
+    input.deliveryAdminId !== input.actor.id
+  ) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "交付管理员创建的客户必须归属当前账号",
     );
   }
   const planCode = servicePlanCodeSchema.parse(input.planCode);

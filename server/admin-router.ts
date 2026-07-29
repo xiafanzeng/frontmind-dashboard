@@ -237,10 +237,7 @@ const usernameSchema = z
   .trim()
   .min(3, "用户名至少需要 3 个字符")
   .max(64, "用户名不能超过 64 个字符")
-  .regex(
-    /^[a-zA-Z0-9._-]+$/,
-    "用户名只能包含字母、数字、点、下划线和连字符",
-  );
+  .regex(/^[a-zA-Z0-9._-]+$/, "用户名只能包含字母、数字、点、下划线和连字符");
 
 const presalesApiKeySchema = z
   .string()
@@ -1547,7 +1544,9 @@ export const adminRouter = router({
         ]),
       )
       .mutation(async ({ ctx, input }) => {
-        requireSystemAdmin(ctx.user);
+        if (input.role === "admin") {
+          requireSystemAdmin(ctx.user);
+        }
         try {
           if (input.role === "admin") {
             const user = await createManagedUser(input);
@@ -1576,7 +1575,9 @@ export const adminRouter = router({
             password: input.password,
             displayName: input.displayName,
             planCode: input.planCode,
-            deliveryAdminId: input.deliveryAdminId,
+            deliveryAdminId: isSystemAdmin(ctx.user)
+              ? input.deliveryAdminId
+              : ctx.user.id,
             apiKey: input.apiKey,
           });
           return {

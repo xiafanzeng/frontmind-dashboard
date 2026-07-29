@@ -93,4 +93,20 @@ describe("CreateUserDialog", () => {
     expect(screen.getByText("账号角色")).toBeInTheDocument();
     expect(screen.getByText("客户套餐")).toBeInTheDocument();
   });
+
+  it("automatically fixes a delivery administrator as the new customer's owner", () => {
+    render(
+      <CreateUserDialog
+        open
+        userOnly
+        fixedDeliveryAdmin={deliveryAdmins[0]}
+        onOpenChange={() => undefined}
+      />,
+    );
+
+    expect(screen.queryByRole("combobox", { name: "客户主负责人" })).toBeNull();
+    expect(screen.getByText(/交付负责人/)).toBeInTheDocument();
+    expect(screen.getByText(/自动归属当前账号/)).toBeInTheDocument();
+    expect(screen.getByText(/自动归属当前交付管理员/)).toBeInTheDocument();
+  });
 });

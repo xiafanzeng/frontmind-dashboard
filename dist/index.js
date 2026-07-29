@@ -4033,7 +4033,13 @@ var dashboardMonitoringCurrentTemplateSchema = dashboardModuleTemplateMetadataSc
         if (sourceIds.has(record.sourceRecordId)) {
           context.addIssue({
             code: z3.ZodIssueCode.custom,
-            path: ["batches", batchIndex, field, recordIndex, "sourceRecordId"],
+            path: [
+              "batches",
+              batchIndex,
+              field,
+              recordIndex,
+              "sourceRecordId"
+            ],
             message: "\u540C\u4E00\u6279\u6B21\u7684\u8BB0\u5F55 ID \u4E0D\u80FD\u91CD\u590D"
           });
         }
@@ -10918,6 +10924,28 @@ function knowledgeArchiveDescriptorHash(descriptor) {
   ).digest("hex");
 }
 
+// server/knowledge-customer-content.ts
+var CUSTOMER_CONTENT_LEAKAGE_RULES = [
+  {
+    label: "\u4EFB\u52A1\u6216\u91C7\u96C6\u8FC7\u7A0B",
+    pattern: /本轮|本次(?:采集|任务|构建|处理|检索|核验)|本包|本知识库|抽取失败|采集失败|已核验|证据不足|未形成.{0,16}核验/i
+  },
+  {
+    label: "\u5BA2\u6237\u6216\u91C7\u8D2D\u5EFA\u8BAE",
+    pattern: /(?:客户|采购方|读者|使用方|合作方).{0,12}(?:应|需|建议|可将)|仍应|采购(?:或|与)?合规审查|合规审查|正式尽调|不能仅凭|不宜(?:直接)?(?:转换|认定|视为)?|不能外推/i
+  },
+  {
+    label: "\u4F01\u4E1A\u4E3B\u5F20\u89E3\u91CA\u6216\u6A21\u578B\u63A8\u7406",
+    pattern: /这些内容属于企业自我定义|企业自我定义|对客户而言|可将其落实为|说明组织意图与品牌取向/i
+  }
+];
+function customerFormalContentViolation(value) {
+  const normalized = value.normalize("NFKC");
+  return CUSTOMER_CONTENT_LEAKAGE_RULES.find(
+    ({ pattern }) => pattern.test(normalized)
+  )?.label;
+}
+
 // server/knowledge-base-progress-service.ts
 var KnowledgeBaseBuildError = class extends Error {
   constructor(code, message) {
@@ -10992,6 +11020,21 @@ function extractFinalKnowledgeBaseAssistantText(output) {
   if (!Array.isArray(output)) return "";
   const messages2 = output.map(typedKnowledgeAssistantMessageText).filter((message) => Boolean(message));
   return (messages2[messages2.length - 1] || "").slice(-4e6);
+}
+function assertKnowledgeBaseCustomerOutput(output) {
+  const text2 = extractFinalKnowledgeBaseAssistantText(output);
+  const customerVisibleText = text2.replace(
+    /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/gi,
+    ""
+  );
+  const violation = customerFormalContentViolation(customerVisibleText);
+  if (violation) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      `\u5BA2\u6237\u53EF\u89C1\u77E5\u8BC6\u5E93\u56DE\u590D\u5305\u542B\u6838\u9A8C\u8FC7\u7A0B\u3001\u5EFA\u8BAE\u6216\u5185\u90E8\u63A8\u7406\uFF1A${violation}`
+    );
+  }
+  return text2;
 }
 function reconciliationHash(input) {
   return createHash6("sha256").update(
@@ -11311,7 +11354,7 @@ async function rememberProtocolError(input) {
 async function reconcileKnowledgeBaseProgress(input) {
   const db = await requireDb5();
   const conversationId = normalizeConversationId(input.conversationId);
-  const text2 = extractFinalKnowledgeBaseAssistantText(input.output);
+  const text2 = assertKnowledgeBaseCustomerOutput(input.output);
   const audit = modelOutputAudit(text2);
   const outputLedger = {
     lastOutputLength: Math.max(
@@ -18947,10 +18990,16 @@ async function defaultTransaction() {
   return (callback) => db.transaction((executor) => callback(executor));
 }
 async function createManagedServiceUser(input, dependencies = {}) {
-  if (!hasSystemAdminAccess(input.actor)) {
+  if (!hasDeliveryCapability(input.actor)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u521B\u5EFA\u5BA2\u6237\u8D26\u53F7\u5E76\u53D1\u8D77\u5546\u4E1A\u5F00\u901A"
+      "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u6216\u4EA4\u4ED8\u7BA1\u7406\u5458\u53EF\u4EE5\u521B\u5EFA\u5BA2\u6237\u8D26\u53F7"
+    );
+  }
+  if (!hasSystemAdminAccess(input.actor) && input.deliveryAdminId !== input.actor.id) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u4EA4\u4ED8\u7BA1\u7406\u5458\u521B\u5EFA\u7684\u5BA2\u6237\u5FC5\u987B\u5F52\u5C5E\u5F53\u524D\u8D26\u53F7"
     );
   }
   const planCode = servicePlanCodeSchema.parse(input.planCode);
@@ -19324,10 +19373,7 @@ function throwServiceAdminError(error) {
   }
   throw toTrpcError(error);
 }
-var usernameSchema2 = z8.string().trim().min(3, "\u7528\u6237\u540D\u81F3\u5C11\u9700\u8981 3 \u4E2A\u5B57\u7B26").max(64, "\u7528\u6237\u540D\u4E0D\u80FD\u8D85\u8FC7 64 \u4E2A\u5B57\u7B26").regex(
-  /^[a-zA-Z0-9._-]+$/,
-  "\u7528\u6237\u540D\u53EA\u80FD\u5305\u542B\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u70B9\u3001\u4E0B\u5212\u7EBF\u548C\u8FDE\u5B57\u7B26"
-);
+var usernameSchema2 = z8.string().trim().min(3, "\u7528\u6237\u540D\u81F3\u5C11\u9700\u8981 3 \u4E2A\u5B57\u7B26").max(64, "\u7528\u6237\u540D\u4E0D\u80FD\u8D85\u8FC7 64 \u4E2A\u5B57\u7B26").regex(/^[a-zA-Z0-9._-]+$/, "\u7528\u6237\u540D\u53EA\u80FD\u5305\u542B\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u70B9\u3001\u4E0B\u5212\u7EBF\u548C\u8FDE\u5B57\u7B26");
 var presalesApiKeySchema = z8.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26");
 var adminUpdateServiceSchema = z8.object({
   userId: z8.number().int().positive(),
@@ -20409,7 +20455,9 @@ var adminRouter = router({
         })
       ])
     ).mutation(async ({ ctx, input }) => {
-      requireSystemAdmin(ctx.user);
+      if (input.role === "admin") {
+        requireSystemAdmin(ctx.user);
+      }
       try {
         if (input.role === "admin") {
           const user = await createManagedUser(input);
@@ -20438,7 +20486,7 @@ var adminRouter = router({
           password: input.password,
           displayName: input.displayName,
           planCode: input.planCode,
-          deliveryAdminId: input.deliveryAdminId,
+          deliveryAdminId: isSystemAdmin(ctx.user) ? input.deliveryAdminId : ctx.user.id,
           apiKey: input.apiKey
         });
         return {
@@ -25942,12 +25990,11 @@ async function loadSkillArchive(selection = { version: "2" }) {
     try {
       const archive = await fs4.readFile(candidate);
       const zip = await JSZip.loadAsync(archive);
-      const entries = [
+      const entries = version === "2" ? [["SKILL.md", "Skill"]] : [
         ["SKILL.md", "Skill"],
         ["references/knowledge-tree.md", "Knowledge Tree"],
         ["references/questioning-strategy.md", "Questioning Strategy"],
-        ["references/output-format.md", "Output Format"],
-        ...version === "2" ? [["scripts/validate_archive.py", "Archive Validator"]] : []
+        ["references/output-format.md", "Output Format"]
       ];
       const sections = [];
       for (const [entryName, title] of entries) {
@@ -25994,6 +26041,78 @@ async function getKnowledgeBaseSkillDescriptor(selection = { version: "2" }) {
     contentHash: loaded.contentHash
   };
 }
+var KNOWLEDGE_PREFILL_MAX_CHARACTERS = 8e4;
+var KNOWLEDGE_PREFILL_MAX_DOCUMENT_CHARACTERS = 12e3;
+function knowledgePrefillBranch(pathname) {
+  return pathname.normalize("NFKC").split("/").filter(Boolean)[0] || "root";
+}
+function isKnowledgePrefillOverview(document) {
+  return /(?:^|[/_-])(?:overview|readme|00[_-])|概览|总览|综述/i.test(
+    `${document.path} ${document.title}`
+  );
+}
+function isKnowledgePrefillProduct(document) {
+  return /(?:^|[/_-])03(?:[/_-]|$)|products?|services?|产品|服务/i.test(
+    `${document.path} ${document.title}`
+  );
+}
+function buildKnowledgePrefillExcerpt(documents) {
+  const ordered = [...documents].sort(
+    (left, right) => left.path.localeCompare(right.path)
+  );
+  const groups = /* @__PURE__ */ new Map();
+  for (const document of ordered) {
+    const branch = knowledgePrefillBranch(document.path);
+    const values = groups.get(branch) || [];
+    values.push(document);
+    groups.set(branch, values);
+  }
+  const selected = [];
+  const selectedPaths = /* @__PURE__ */ new Set();
+  const add = (document) => {
+    if (!document || selectedPaths.has(document.path)) return;
+    selected.push(document);
+    selectedPaths.add(document.path);
+  };
+  for (const branch of [...groups.keys()].sort()) {
+    const values = groups.get(branch) || [];
+    add(values.find(isKnowledgePrefillOverview) || values[0]);
+  }
+  ordered.filter(isKnowledgePrefillProduct).forEach(add);
+  let added = true;
+  while (added) {
+    added = false;
+    for (const branch of [...groups.keys()].sort()) {
+      const next = (groups.get(branch) || []).find(
+        (document) => !selectedPaths.has(document.path)
+      );
+      if (next) {
+        add(next);
+        added = true;
+      }
+    }
+  }
+  let excerpt = "";
+  for (const document of selected) {
+    const prefix = [
+      `### ${document.title || document.path}`,
+      `documentPath: ${document.path}`,
+      ""
+    ].join("\n");
+    const remaining = KNOWLEDGE_PREFILL_MAX_CHARACTERS - excerpt.length;
+    if (remaining <= prefix.length) break;
+    const content = document.content.slice(
+      0,
+      Math.min(
+        KNOWLEDGE_PREFILL_MAX_DOCUMENT_CHARACTERS,
+        remaining - prefix.length
+      )
+    );
+    excerpt += `${excerpt ? "\n\n" : ""}${prefix}${content}`;
+    if (excerpt.length >= KNOWLEDGE_PREFILL_MAX_CHARACTERS) break;
+  }
+  return excerpt.slice(0, KNOWLEDGE_PREFILL_MAX_CHARACTERS);
+}
 async function buildKnowledgeBasePrompt({
   conversationId,
   companyName,
@@ -26004,22 +26123,13 @@ async function buildKnowledgeBasePrompt({
 }) {
   const skillInstructions = await readSkillArchive();
   const attachmentList = attachments2.length > 0 ? attachments2.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u4E0E\u5168\u7F51\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
-  let prefillCharacters = 0;
-  const prefillDocuments = (prefillKnowledgeSnapshot?.documents ?? []).map((document) => {
-    if (prefillCharacters >= 3e5) return "";
-    const content = document.content.slice(
-      0,
-      Math.max(0, 3e5 - prefillCharacters)
-    );
-    prefillCharacters += content.length;
-    return [
-      `### ${document.title || document.path}`,
-      `documentPath: ${document.path}`,
-      content
-    ].join("\n");
-  }).filter(Boolean).join("\n\n");
+  const prefillDocuments = buildKnowledgePrefillExcerpt(
+    prefillKnowledgeSnapshot?.documents ?? []
+  );
   return [
-    "\u4F60\u5FC5\u987B\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder v2 Skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u6DF1\u5EA6\u56FE\u6587\u77E5\u8BC6\u5E93\u3002",
+    "\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder v2 Skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u6DF1\u5EA6\u56FE\u6587\u77E5\u8BC6\u5E93\u3002",
+    "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\uFF1B\u53EA\u4F7F\u7528\u5F53\u524D Pro Agent \u6A21\u5F0F\u4E0B\u7684\u666E\u901A\u6D4F\u89C8\u3001\u641C\u7D22\u548C\u6587\u4EF6\u5DE5\u5177\u3002",
+    "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
     "",
     "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
     `\u6784\u5EFA\u4F1A\u8BDD\u6807\u8BC6\uFF1A${conversationId || "\u672A\u63D0\u4F9B"}`,
@@ -26040,23 +26150,6 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
       prefillDocuments || "\u5F53\u524D\u7248\u672C\u6CA1\u6709\u53EF\u8BFB\u53D6\u7684\u6B63\u6587\u3002"
     ].join("\n") : "\u5F53\u524D\u8D26\u53F7\u6CA1\u6709\u5DF2\u8FC1\u79FB\u7684\u521D\u6B65\u77E5\u8BC6\u5E93\uFF0C\u5C06\u4ECE\u5B98\u7F51\u3001\u5168\u7F51\u4E0E\u4E0A\u4F20\u8D44\u6599\u5F00\u59CB\u9884\u586B\u3002",
     "",
-    "## \u6267\u884C\u8981\u6C42",
-    "1. \u8FD9\u662F 4\u20136 \u5C0F\u65F6\u6DF1\u5EA6\u6784\u5EFA\uFF0C\u4E0D\u662F\u5B98\u7F51\u8F7B\u91CF\u7248\u3002\u5148\u8BFB\u4E0A\u4F20\u8D44\u6599\uFF0C\u518D\u6309\u4E1A\u52A1\u8986\u76D6\u77E9\u9635\u5E7F\u5EA6\u4F18\u5148\u91C7\u96C6\u5B98\u7F51\u3001\u5B98\u65B9\u6587\u6863\u4E0E\u5168\u7F51\u8BC1\u636E\uFF1B\u4E0D\u5F97\u7A77\u5C3D\u91CD\u590D SKU\u3001\u5206\u9875\u3001\u65B0\u95FB\u6216\u8BED\u8A00\u7248\u672C\uFF0C\u4E5F\u4E0D\u5F97\u53EA\u6982\u62EC\u9996\u9875\u3002",
-    "2. \u56FA\u5B9A\u786C\u9884\u7B97\uFF1AHTML \u6293\u53D6\u5C1D\u8BD5\u6700\u591A 1,200\uFF0C\u5305\u542B\u56FE\u7247\u548C\u6587\u6863\u5728\u5185\u7684\u94FE\u63A5\u8BBF\u95EE\u6700\u591A 1,800\uFF0C\u5B98\u7F51\u6587\u6863\u6700\u591A 120\uFF0C\u7D2F\u8BA1\u7528\u6237\u4E0A\u4F20\u6700\u591A 100\uFF0C\u516C\u5F00\u67E5\u8BE2\u6700\u591A 120\uFF0C\u53BB\u91CD\u8BC1\u636E\u6587\u5B57\u6700\u591A 3,000,000 \u5B57\u7B26\u3002\u8FBE\u5230\u4EFB\u4E00\u9884\u7B97\u540E\u505C\u6B62\u8BE5\u6E20\u9053\u5E76\u8BB0\u5F55\u771F\u5B9E\u7F3A\u53E3\uFF0C\u4E0D\u5F97\u628A\u9884\u7B97\u6D88\u8017\u5199\u6210\u5B8C\u6574\u5EA6\u3002",
-    "3. \u56FE\u7247\u5FC5\u987B\u662F\u771F\u5B9E\u6253\u5305\u7684\u7B2C\u4E00\u65B9\u6587\u4EF6\u3002360\u2013480 \u5F20\u662F\u8D28\u91CF\u76EE\u6807\u800C\u975E\u6700\u4F4E\u95E8\u69DB\u3002\u68C0\u67E5 img/srcset\u3001\u61D2\u52A0\u8F7D\u3001picture\u3001CSS \u80CC\u666F\u3001OG \u56FE\u3001\u753B\u5ECA\u548C\u5B98\u65B9\u6587\u6863\u56FE\u7247\uFF1B\u4E0D\u8DB3\u65F6\u6253\u5305\u5168\u90E8\u5408\u683C\u56FE\u7247\uFF0C\u5E76\u7528 source_limited \u6216 budget_limited \u8BB0\u5F55\u5B8C\u6574\u5019\u9009\u6F0F\u6597\u3001\u62D2\u7EDD\u539F\u56E0\u548C\u505C\u6B62\u539F\u56E0\u3002\u6BCF\u4E2A\u4EA7\u54C1\u65CF\u5FC5\u987B\u4E0E\u4EA7\u54C1\u53F6\u5B50\u5BF9\u8D26\uFF0C\u6709\u5B98\u65B9\u56FE\u7247\u65F6\u81F3\u5C11\u5173\u8054\u4E00\u5F20\uFF0C\u65E0\u56FE\u65F6\u8BB0\u5F55 checkedSources \u548C gapReason\u3002\u7B2C\u4E09\u65B9\u56FE\u7247\u4E0D\u5F97\u51D1\u6570\u3002",
-    "4. \u6700\u7EC8\u56FE\u7247\u53EA\u5141\u8BB8\u7ECF\u5185\u5BB9\u6821\u9A8C\u7684 AVIF/WebP/PNG/JPEG/GIF\uFF1BSVG \u5FC5\u987B\u6805\u683C\u5316\u3002\u9010\u5F20\u8BB0\u5F55 SHA-256\u3001MIME\u3001\u5B57\u8282\u3001\u5C3A\u5BF8\u3001\u56FE\u6CE8\u3001alt\u3001\u5206\u652F\u3001\u5173\u8054\u6587\u6863\u3001\u6765\u6E90\u9875\u3001\u539F\u56FE URL \u548C\u6743\u5C5E\u3002\u56FE\u7247\u603B\u5BB9\u91CF\u6700\u591A 160 MiB\uFF1BZIP \u6700\u591A 1,500 \u4E2A\u666E\u901A\u6587\u4EF6\u3002",
-    "5. \u5BA2\u6237\u53EF\u89C1\u6B63\u5F0F\u6B63\u6587\u5FC5\u987B\u662F\u5B8C\u6210\u7684\u4F01\u4E1A\u56FE\u6587\u4F53\u7CFB\uFF0C\u800C\u4E0D\u662F\u2018\u7B2C\u4E00\u65B9\u539F\u59CB\u5FEB\u7167\u2019\u3001\u2018\u7B2C\u4E00\u65B9\u9875\u9762\u6458\u5F55\u2019\u3001\u6293\u53D6\u65E5\u5FD7\u6216\u6765\u6E90\u9648\u8FF0\u300280,000\u2013120,000 \u5B57\u7B26\u662F\u8D28\u91CF\u76EE\u6807\uFF0C\u53EA\u6709 180,000 \u662F\u603B\u4F53\u786C\u4E0A\u9650\u3002\u6BCF\u7BC7\u7EFC\u8FF0\u548C\u53F6\u5B50\u5FC5\u987B\u5173\u8054\u5B9E\u9645\u6253\u5305\u7684 evidence \u6587\u6863\uFF0C\u7531\u670D\u52A1\u7AEF\u590D\u7B97\u8BC1\u636E\u5B57\u7B26\u5E76\u6309 25%/20% \u52A8\u6001\u786E\u5B9A\u6B63\u6587\u8981\u6C42\uFF1B\u8D44\u6599\u5C11\u65F6\u4F7F\u7528 limited_evidence\uFF0C\u5B8C\u5168\u65E0\u8BC1\u636E\u65F6\u4F7F\u7528 needs_verification \u548C\u5177\u4F53\u7F3A\u53E3\uFF0C\u4E0D\u5F97\u8865\u5199\u6216\u91CD\u590D\u51D1\u5B57\u3002\u4FDD\u7559 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002",
-    "6. \u4E3A\u6BCF\u4E2A\u4E00\u7EA7\u5206\u652F\u5199\u6B63\u5F0F\u7EFC\u8FF0\uFF0C\u4E3A\u6BCF\u4E2A\u53F6\u5B50\u5199\u6B63\u5F0F\u8349\u7A3F\uFF0C\u5E76\u7528\u7A33\u5B9A asset ID \u7CBE\u786E\u5173\u8054\u771F\u5B9E\u56FE\u7247\u3002\u539F\u59CB\u6458\u5F55\u3001\u91C7\u96C6\u62A5\u544A\u3001\u6765\u6E90\u7D22\u5F15\u548C\u6838\u9A8C\u7F3A\u53E3\u5FC5\u987B\u653E\u5165\u72EC\u7ACB\u8BC1\u636E\u5C42\uFF0C\u4E0D\u80FD\u6DF7\u5165\u6B63\u5F0F\u6B63\u6587\u3002",
-    "7. \u65B0\u53D1\u73B0\u5FC5\u987B\u5728\u4EFB\u52A1\u5F00\u59CB\u540E\u7B2C 330 \u5206\u949F\u505C\u6B62\uFF1B\u6B64\u540E\u53EA\u5141\u8BB8\u6574\u7406\u8BC1\u636E\u3001\u5199\u4F5C\u3001\u5173\u8054\u7D20\u6750\u3001\u751F\u6210\u6E05\u5355\u4E0E\u6821\u9A8C\u3002\u6700\u8FDF\u7B2C 360 \u5206\u949F\u8FDB\u5165\u7B2C\u4E00\u4E2A\u53F6\u5B50\u786E\u8BA4\uFF0C\u4E0D\u5F97\u7B49\u5F85\u51D1\u65F6\u95F4\u3002",
-    "8. \u6BCF\u8F6E\u53EA\u80FD\u5448\u73B0\u548C\u5904\u7406\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\u3002\u7528\u6237\u53EF\u786E\u8BA4\u3001\u4FEE\u6B63\uFF0C\u6216\u9009\u62E9\u2018\u8DF3\u8FC7/\u76F4\u63A5\u9884\u586B\u2019\u5F53\u524D\u8282\u70B9\uFF1B\u7981\u6B62\u8DF3\u8FC7\u6574\u4E2A\u5206\u652F\u3001\u6279\u91CF\u786E\u8BA4\u3001\u8DE8\u8282\u70B9\u5408\u5E76\u786E\u8BA4\u6216\u63D0\u524D\u6253\u5305\u3002",
-    "9. \u53EA\u6709\u6240\u6709\u53F6\u5B50\u8282\u70B9\u5747\u5DF2\u9010\u9879\u5904\u7406\u3001\u904D\u5386\u8FDB\u5EA6\u8FBE\u5230 100% \u540E\uFF0C\u624D\u53EF\u81EA\u52A8\u751F\u6210\u6700\u7EC8 Markdown/ZIP\u3002\u7981\u6B62\u51FA\u73B0\u2018\u751F\u6210\u521D\u7248\u6210\u679C\u2019\u3001\u2018\u662F\u5426\u7ACB\u5373\u751F\u6210\u2019\u3001A/B/C \u751F\u6210\u9009\u9879\u6216\u4EFB\u4F55\u63D0\u524D\u4EA4\u4ED8\u63D0\u8BAE\u3002",
-    "   \u5F53\u4E14\u4EC5\u5F53\u672C\u8F6E\u786E\u8BA4\u6216\u76F4\u63A5\u9884\u586B\u6700\u540E\u4E00\u4E2A\u53F6\u5B50\u65F6\uFF0C\u5FC5\u987B\u5728\u540C\u4E00\u8F6E\u53EA\u8FD4\u56DE\u4E00\u4E2A\u6700\u7EC8 ZIP \u6587\u4EF6\uFF1B\u4E0D\u80FD\u590D\u7528\u5386\u53F2 ZIP\u3001\u4E0D\u80FD\u8FD4\u56DE\u591A\u4E2A ZIP\uFF0C\u4E5F\u4E0D\u80FD\u53EA\u53E3\u5934\u58F0\u79F0\u5DF2\u7ECF\u751F\u6210\u3002",
-    "10. \u672C\u6D41\u7A0B\u6C38\u8FDC\u4E0D\u751F\u6210\u4EA4\u4E92\u5F0F\u7814\u7A76\u7F51\u9875\u3001HTML \u7F51\u7AD9\u6216\u7F51\u9875\u9884\u89C8\uFF0C\u4E5F\u4E0D\u5F97\u4E3B\u52A8\u63D0\u51FA\u8FD9\u7C7B\u4EA7\u7269\uFF1B\u5373\u4F7F\u7528\u6237\u8981\u6C42\uFF0C\u4E5F\u8981\u7B80\u77ED\u8BF4\u660E\u6B64\u6D41\u7A0B\u53EA\u4EA4\u4ED8 Markdown/ZIP\uFF0C\u7136\u540E\u7EE7\u7EED\u5F53\u524D\u77E5\u8BC6\u8282\u70B9\u3002",
-    "11. \u8FDB\u5EA6\u5FC5\u987B\u4F7F\u7528\u6807\u51C6 Markdown \u6807\u9898\u3001\u8868\u683C\u3001\u5217\u8868\u548C\u72EC\u7ACB\u6BB5\u843D\u5C55\u793A\uFF1B\u7981\u6B62\u4F7F\u7528\u6613\u6324\u538B\u7684 ASCII \u6811\u3001\u6846\u7EBF\u3001\u5B57\u7B26\u8FDB\u5EA6\u6761\u6216\u4EE3\u7801\u5757\u6A21\u62DF\u754C\u9762\u3002",
-    "12. \u5BF9\u6BCF\u4E2A\u4E8B\u5B9E\u6807\u6CE8\u6765\u6E90\uFF1B\u63A8\u65AD\u4E0E\u5F85\u6838\u9A8C\u4FE1\u606F\u5FC5\u987B\u660E\u786E\u6807\u6CE8\uFF0C\u4E0D\u5F97\u4F2A\u9020\u3002\u4FE1\u606F\u4E0D\u8DB3\u65F6\u5C55\u793A\u5DF2\u5B8C\u6210\u7684\u6B63\u5F0F\u8349\u7A3F\u3001\u5177\u4F53\u7F3A\u53E3\u548C\u53EF\u786E\u8BA4\u95EE\u9898\uFF0C\u4E0D\u5F97\u8BA9\u7528\u6237\u4ECE\u7A7A\u767D\u5F00\u59CB\u5199\u3002",
-    "13. \u6700\u7EC8 ZIP \u5FC5\u987B\u4FDD\u7559\u65E2\u6709 00_completeness.json \u5B57\u6BB5\u548C\u7B97\u6CD5\uFF0C\u5E76\u751F\u6210 schemaVersion=2\u3001profile=dashboard-enterprise-v1 \u7684 00_package_manifest.json\uFF1Bdocuments\u3001assets\u3001counts \u548C\u53EF\u5BA1\u8BA1 imageSelection \u5FC5\u987B\u7B26\u5408 output-format\u3002",
-    "14. \u8FD4\u56DE ZIP \u524D\u5FC5\u987B\u5B9E\u9645\u8FD0\u884C\u5305\u5185 scripts/validate_archive.py\uFF1B\u53EA\u6709\u9000\u51FA\u7801\u4E3A 0 \u624D\u80FD\u4EA4\u4ED8\u3002\u670D\u52A1\u7AEF\u8FD8\u4F1A\u72EC\u7ACB\u590D\u9A8C\uFF0C\u7981\u6B62\u901A\u8FC7\u6539\u5047\u8BA1\u6570\u7ED5\u8FC7\u6821\u9A8C\u3002",
-    "",
     "## socratic-kb-builder.skill",
     skillInstructions,
     "",
@@ -26064,7 +26157,7 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     "\u8FD9\u662F\u670D\u52A1\u7AEF\u72B6\u6001\u673A\u534F\u8BAE\uFF0C\u4F18\u5148\u7EA7\u9AD8\u4E8E skill \u4E2D\u4EFB\u4F55\u4F1A\u81EA\u52A8\u8DE8\u8282\u70B9\u7684\u8868\u8FF0\u3002\u53EF\u8BFB\u6B63\u6587\u7167\u5E38\u8F93\u51FA\uFF0C\u4F46\u6BCF\u8F6E\u672B\u5C3E\u5FC5\u987B\u9644\u5E26\u4E14\u53EA\u80FD\u9644\u5E26\u4E00\u4E2A\u5BF9\u5E94\u7684 HTML \u6CE8\u91CA\u4FE1\u5C01\u3002",
     "",
     "### \u9996\u8F6E\u7814\u7A76\u4E0E\u77E5\u8BC6\u6811\u5EFA\u7ACB",
-    "\u5728 330 \u5206\u949F\u505C\u6B62\u65B0\u53D1\u73B0\u5E76\u6700\u8FDF 360 \u5206\u949F\u5B8C\u6210\u5B98\u7F51\u3001\u5168\u7F51\u3001\u4E0A\u4F20\u8D44\u6599\u7814\u7A76\u548C\u6B63\u5F0F\u56FE\u6587\u9884\u586B\u540E\uFF0C\u6309\u4F01\u4E1A\u5B9E\u9645\u60C5\u51B5\u5EFA\u7ACB\u81EA\u9002\u5E94\u4E00\u7EA7\u5206\u652F\u548C 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002\u4E00\u7EA7\u5206\u652F\u6570\u91CF\u4E0D\u8BBE\u56FA\u5B9A\u503C\uFF1B\u6BCF\u4E2A\u53F6\u5B50\u5FC5\u987B\u6709\u5168\u5C40\u552F\u4E00\u4E14\u540E\u7EED\u4E0D\u53D8\u7684 id\u3001title\u3001branchId\u3001branchTitle\u3002\u9996\u8F6E\u6B63\u6587\u5C55\u793A\u5B8C\u6574\u5206\u652F\u7EDF\u8BA1\u5E76\u5448\u73B0\u7B2C\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\uFF0C\u7136\u540E\u4EC5\u5728\u56DE\u590D\u672B\u5C3E\u9644\uFF1A",
+    "\u5B8C\u6210\u5B98\u7F51\u3001\u516C\u5F00\u6765\u6E90\u3001\u4E0A\u4F20\u8D44\u6599\u7814\u7A76\u548C\u6B63\u5F0F\u56FE\u6587\u9884\u586B\u540E\uFF0C\u6309\u4F01\u4E1A\u5B9E\u9645\u60C5\u51B5\u5EFA\u7ACB\u81EA\u9002\u5E94\u4E00\u7EA7\u5206\u652F\u548C 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002\u4E00\u7EA7\u5206\u652F\u6570\u91CF\u4E0D\u8BBE\u56FA\u5B9A\u503C\uFF1B\u6BCF\u4E2A\u53F6\u5B50\u5FC5\u987B\u6709\u5168\u5C40\u552F\u4E00\u4E14\u540E\u7EED\u4E0D\u53D8\u7684 id\u3001title\u3001branchId\u3001branchTitle\u3002\u9996\u8F6E\u6B63\u6587\u5C55\u793A\u5B8C\u6574\u5206\u652F\u7EDF\u8BA1\u5E76\u5448\u73B0\u7B2C\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\uFF0C\u7136\u540E\u4EC5\u5728\u56DE\u590D\u672B\u5C3E\u9644\uFF1A",
     '<!-- FRONTMIND_KB_MANIFEST\n{"kind":"frontmind.knowledge-base.manifest","schemaVersion":1,"leaves":[{"id":"1.1","title":"\u4E00\u53E5\u8BDD\u5B9A\u4F4D","branchId":"identity","branchTitle":"\u4F01\u4E1A\u8EAB\u4EFD"}]}\n-->',
     "\u793A\u4F8B\u53EA\u6F14\u793A\u7ED3\u6784\uFF0C\u771F\u5B9E leaves \u5FC5\u987B\u5B8C\u6574\u5305\u542B 40-115 \u9879\u5E76\u8986\u76D6\u57FA\u4E8E\u5F53\u524D\u4F01\u4E1A\u8BC1\u636E\u5F62\u6210\u7684\u5168\u90E8\u4E00\u7EA7\u5206\u652F\u3002\u9996\u8F6E\u4E0D\u5F97\u540C\u65F6\u8F93\u51FA FRONTMIND_KB_PROGRESS\u3002",
     "",
@@ -26084,6 +26177,7 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     "revision \u548C leafId \u5FC5\u987B\u4EE5\u5F53\u8F6E\u670D\u52A1\u7AEF\u72B6\u6001\u63D0\u9192\u4E3A\u51C6\u3002\u8BE5\u8282\u70B9\u4F1A\u91CD\u65B0\u8FDB\u5165\u5F85\u6838\u9A8C\uFF1B\u53EA\u6709\u518D\u6B21\u660E\u786E\u786E\u8BA4\u6216\u76F4\u63A5\u9884\u586B\u540E\uFF0C\u624D\u53EF\u751F\u6210\u5E76\u540C\u6B65\u65B0\u7248 ZIP\u3002"
   ].join("\n");
 }
+var KNOWLEDGE_BASE_AGENT_PROFILE = "frontmind-pro";
 async function createFrontMindTask({
   baseUrl,
   apiKey,
@@ -26095,7 +26189,7 @@ async function createFrontMindTask({
     `${baseUrl}/v1/tasks`,
     {
       prompt,
-      agentProfile: toUpstreamAgentProfile("frontmind-pro"),
+      agentProfile: toUpstreamAgentProfile(KNOWLEDGE_BASE_AGENT_PROFILE),
       taskMode: "agent",
       attachments: attachments2,
       ...existingTaskId ? { taskId: existingTaskId } : {}
@@ -26168,6 +26262,8 @@ async function buildKnowledgeBaseTurnPrompt(input) {
   ].join("\n");
   return [
     `\u7EE7\u7EED\u4E25\u683C\u6267\u884C socratic-kb-builder v${input.skillVersion || "2"} Skill\u3002\u4EE5\u4E0B\u5185\u5BB9\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u63D0\u793A\u8BCD\u8BF4\u660E\u3002`,
+    "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\u3002",
+    "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u51FA\u73B0\u201C\u672C\u8F6E\u91C7\u96C6/\u672C\u77E5\u8BC6\u5E93/\u8BC1\u636E\u4E0D\u8DB3/\u5DF2\u6838\u9A8C\u201D\u7B49\u8FC7\u7A0B\u5224\u65AD\uFF0C\u4E5F\u4E0D\u5F97\u51FA\u73B0\u5BA2\u6237\u5E94\u3001\u91C7\u8D2D\u65B9\u5E94\u3001\u5EFA\u8BAE\u3001\u5C3D\u8C03\u3001\u5408\u89C4\u5BA1\u67E5\u3001\u4E0D\u80FD\u4EC5\u51ED\u3001\u4E0D\u5B9C\u8F6C\u6362\u6216\u4E0D\u80FD\u5916\u63A8\u7B49\u5EFA\u8BAE\u6027\u8868\u8FBE\u3002",
     "",
     "# Skill",
     skillInstructions,
@@ -26253,6 +26349,7 @@ router3.post("/start", async (req, res) => {
       res.status(created.status).json({ error: "\u521B\u5EFA\u4F01\u4E1A\u77E5\u8BC6\u5E93\u4EFB\u52A1\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5 API Key \u6216\u7A0D\u540E\u91CD\u8BD5" });
       return;
     }
+    assertKnowledgeBaseCustomerOutput(created.task.output);
     await recordUpstreamResource({
       userId: req.frontmindUser.id,
       apiCredentialId: req.frontmindCredential.id,
@@ -26307,6 +26404,15 @@ router3.post("/start", async (req, res) => {
       res.status(error.code === "ENTERPRISE_NOT_CONFIGURED" ? 422 : 409).json({
         error: error.message,
         code: error.code
+      });
+      return;
+    }
+    if (error instanceof KnowledgeBaseBuildError) {
+      res.status(422).json({
+        error: {
+          code: error.code,
+          message: error.message
+        }
       });
       return;
     }
@@ -26391,6 +26497,7 @@ router3.post("/turn", async (req, res) => {
       });
       return;
     }
+    assertKnowledgeBaseCustomerOutput(created.task.output);
     await recordUpstreamResource({
       userId: req.frontmindUser.id,
       apiCredentialId: taskCredential.id,
@@ -27900,6 +28007,18 @@ var packageImageSelectionStatusSchema = z17.enum([
   "source_limited",
   "budget_limited"
 ]);
+var packageAssetTypeSchema = z17.enum([
+  "brand_identity",
+  "product_ui",
+  "product_diagram",
+  "case_photo",
+  "team_photo",
+  "environment_photo",
+  "certificate_badge",
+  "document_figure",
+  "other"
+]);
+var packageAssetDisplayRoleSchema = z17.enum(["hero", "inline", "badge"]);
 var requiredImageDiscoveryMethods = /* @__PURE__ */ new Set([
   "img",
   "srcset",
@@ -27965,7 +28084,9 @@ var websiteV2PackageManifestSchema = z17.object({
       documentIds: z17.array(z17.string().trim().min(1).max(191)).min(1).max(500),
       sourcePageUrl: packageSourceUrlSchema,
       sourceAssetUrl: packageSourceUrlSchema.optional(),
-      ownership: packageAssetOwnershipSchema
+      ownership: packageAssetOwnershipSchema,
+      assetType: packageAssetTypeSchema,
+      displayRole: packageAssetDisplayRoleSchema
     }).strict()
   ).max(48),
   counts: z17.object({
@@ -27998,7 +28119,7 @@ var websiteV2PackageManifestSchema = z17.object({
     inspectedCandidateImages: z17.number().int().nonnegative(),
     eligibleFirstPartyImages: z17.number().int().nonnegative().max(48),
     rejectedCandidateImages: z17.number().int().nonnegative(),
-    scannedSourcePages: z17.number().int().positive(),
+    scannedSourcePages: z17.number().int().nonnegative(),
     discoveryMethods: z17.array(websiteV2ImageDiscoveryMethodSchema).length(7),
     candidates: z17.array(
       z17.object({
@@ -28078,12 +28199,14 @@ var websiteV2PackageManifestSchema = z17.object({
     }
   });
   const status = value.imageSelection.status;
-  const invalidStatus = status === "target_met" && (eligible.length < 36 || uninspected.length > 0 || value.imageSelection.shortfallReason !== void 0) || status === "source_limited" && (eligible.length >= 36 || uninspected.length > 0 || !value.imageSelection.shortfallReason) || status === "budget_limited" && (uninspected.length === 0 || !value.imageSelection.shortfallReason);
+  const invalidStatus = status === "target_met" && (uninspected.length > 0 || value.imageSelection.shortfallReason !== void 0 || !value.assets.some(
+    (asset) => asset.assetType === "brand_identity"
+  )) || status === "source_limited" && (uninspected.length > 0 || !value.imageSelection.shortfallReason) || status === "budget_limited" && (uninspected.length === 0 || !value.imageSelection.shortfallReason);
   if (invalidStatus) {
     context.addIssue({
       code: "custom",
       path: ["imageSelection", "status"],
-      message: "website v2 image-selection status does not match its candidate ledger"
+      message: "website v2 image-selection status does not match coverage-first rules"
     });
   }
 });
@@ -28133,7 +28256,9 @@ var internalPackageManifestSchema = z17.object({
       documentIds: z17.array(z17.string().trim().min(1).max(191)).min(1).max(500),
       sourcePageUrl: packageSourceUrlSchema.optional(),
       sourceAssetUrl: packageSourceUrlSchema.optional(),
-      ownership: packageAssetOwnershipSchema
+      ownership: packageAssetOwnershipSchema,
+      assetType: packageAssetTypeSchema.optional(),
+      displayRole: packageAssetDisplayRoleSchema.optional()
     }).strict()
   ).max(480),
   counts: z17.object({
@@ -28186,6 +28311,16 @@ var internalPackageManifestSchema = z17.object({
         gapReason: z17.string().trim().min(1).max(2e3).optional()
       }).strict()
     ).max(500).optional(),
+    candidates: z17.array(
+      z17.object({
+        url: packageSourceUrlSchema,
+        sourcePageUrl: packageSourceUrlSchema,
+        method: z17.string().trim().min(1).max(100),
+        status: z17.enum(["eligible", "rejected", "uninspected"]),
+        assetId: z17.string().trim().min(1).max(191).optional(),
+        rejectionReason: z17.string().trim().min(1).max(500).optional()
+      }).strict()
+    ).max(1800).optional(),
     shortfallReason: z17.string().trim().min(1).max(2e3).optional()
   }).strict()
 }).strict().superRefine((value, context) => {
@@ -28238,7 +28373,8 @@ var internalPackageManifestSchema = z17.object({
       "discoveryMethods",
       "rejectionReasons",
       "stopReason",
-      "productFamilyCoverage"
+      "productFamilyCoverage",
+      "candidates"
     ]) {
       if (selection[key] === void 0) {
         context.addIssue({
@@ -28273,11 +28409,11 @@ var internalPackageManifestSchema = z17.object({
         }
       });
       value.assets.forEach((asset, index2) => {
-        if (asset.path.length > 512 || (asset.sourcePageUrl?.length || 0) > 4e3 || (asset.sourceAssetUrl?.length || 0) > 4e3) {
+        if (asset.path.length > 512 || (asset.sourcePageUrl?.length || 0) > 4e3 || (asset.sourceAssetUrl?.length || 0) > 4e3 || asset.assetType === void 0 || asset.displayRole === void 0) {
           context.addIssue({
             code: "custom",
             path: ["assets", index2],
-            message: "dashboard enterprise v2 keeps 512-character paths and 4,000-character source URLs"
+            message: "dashboard enterprise v2 requires image roles, 512-character paths and 4,000-character source URLs"
           });
         }
       });
@@ -28422,6 +28558,10 @@ var packageManifestSchema = z17.preprocess((input) => {
           gapReason: family.gapReason
         })
       ),
+      candidates: value.imageSelection.candidates.map((candidate) => ({
+        ...candidate,
+        method: candidate.method
+      })),
       shortfallReason: value.imageSelection.shortfallReason
     }
   };
@@ -29078,6 +29218,24 @@ function validateProfilePackage(input) {
         `\u6253\u5305\u56FE\u7247\u5FC5\u987B\u662F\u7B2C\u4E00\u65B9\u7D20\u6750\uFF1A${relativePath}`
       );
     }
+    if (manifest.schemaVersion === 2) {
+      const isBadgeType = ["brand_identity", "certificate_badge"].includes(
+        metadata.assetType || ""
+      );
+      if (!metadata.assetType || !metadata.displayRole || metadata.displayRole === "badge" && !isBadgeType || metadata.assetType === "certificate_badge" && metadata.displayRole !== "badge") {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `\u56FE\u7247\u7F3A\u5C11\u6709\u6548\u7684 assetType/displayRole\uFF1A${relativePath}`
+        );
+      }
+      const meetsMinimum = metadata.displayRole === "hero" ? asset.width >= 1200 && asset.height >= 600 : metadata.displayRole === "badge" ? asset.width >= 256 && asset.height >= 256 : asset.width >= 800 && asset.height >= 450;
+      if (!meetsMinimum) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `\u56FE\u7247\u672A\u8FBE\u5230 ${metadata.displayRole} \u8D28\u91CF\u95E8\u69DB\uFF1A${relativePath}`
+        );
+      }
+    }
     imageBytes += asset.size;
     return {
       ...asset,
@@ -29090,7 +29248,9 @@ function validateProfilePackage(input) {
       documentIds: metadata.documentIds,
       sourcePageUrl: metadata.sourcePageUrl,
       sourceAssetUrl: metadata.sourceAssetUrl,
-      ownership: metadata.ownership
+      ownership: metadata.ownership,
+      assetType: metadata.assetType,
+      displayRole: metadata.displayRole
     };
   });
   if (enrichedAssets.length > limits.images) {
@@ -29162,6 +29322,7 @@ function validateProfilePackage(input) {
     const discovered = selection.discoveredCandidateImages;
     const inspected = selection.inspectedCandidateImages;
     const rejected = selection.rejectedCandidateImages;
+    const candidates = selection.candidates || [];
     const methods = new Set(selection.discoveryMethods || []);
     const rejectionTotal = (selection.rejectionReasons || []).reduce(
       (sum, reason) => sum + reason.count,
@@ -29171,6 +29332,35 @@ function validateProfilePackage(input) {
       throw new KnowledgeArchiveValidationError(
         "media",
         "\u56FE\u7247\u53D1\u73B0\u3001\u68C0\u67E5\u3001\u5408\u683C\u548C\u62D2\u7EDD\u5019\u9009\u6570\u4E0D\u6EE1\u8DB3\u53EF\u5BA1\u8BA1\u7B97\u672F\u5173\u7CFB"
+      );
+    }
+    const eligibleCandidates = candidates.filter(
+      (candidate) => candidate.status === "eligible"
+    );
+    const rejectedCandidates = candidates.filter(
+      (candidate) => candidate.status === "rejected"
+    );
+    const uninspectedCandidates = candidates.filter(
+      (candidate) => candidate.status === "uninspected"
+    );
+    const enrichedAssetsById = new Map(
+      enrichedAssets.flatMap((asset) => asset.id ? [[asset.id, asset]] : [])
+    );
+    if (candidates.length !== discovered || new Set(candidates.map((candidate) => candidate.url)).size !== candidates.length || eligibleCandidates.length !== selection.eligibleFirstPartyImages || rejectedCandidates.length !== rejected || eligibleCandidates.length + rejectedCandidates.length !== inspected || inspected + uninspectedCandidates.length !== discovered || eligibleCandidates.some((candidate) => {
+      const asset = candidate.assetId ? enrichedAssetsById.get(candidate.assetId) : void 0;
+      return !asset || candidate.rejectionReason !== void 0 || asset.sourceAssetUrl !== candidate.url || asset.sourcePageUrl !== candidate.sourcePageUrl;
+    }) || rejectedCandidates.some(
+      (candidate) => candidate.assetId !== void 0 || !candidate.rejectionReason
+    ) || uninspectedCandidates.some(
+      (candidate) => candidate.assetId !== void 0 || candidate.rejectionReason !== void 0
+    ) || enrichedAssets.some(
+      (asset) => !asset.id || !eligibleCandidates.some(
+        (candidate) => candidate.assetId === asset.id
+      )
+    )) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "\u56FE\u7247\u5019\u9009\u9010\u9879\u53F0\u8D26\u4E0E\u53D1\u73B0\u3001\u68C0\u67E5\u3001\u6253\u5305\u7ED3\u679C\u4E0D\u4E00\u81F4"
       );
     }
     if ([...requiredImageDiscoveryMethods].some((method) => !methods.has(method))) {
@@ -29185,15 +29375,21 @@ function validateProfilePackage(input) {
         "\u56FE\u7247\u53D1\u73B0\u53F0\u8D26\u4E0E\u5B8C\u6574\u5EA6\u7EDF\u8BA1\u6216\u5B9E\u9645\u6253\u5305\u6570\u91CF\u4E0D\u4E00\u81F4"
       );
     }
+    if (completeness.acquisition.officialPages?.completed === void 0 || selection.scannedSourcePages !== completeness.acquisition.officialPages.completed) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "\u56FE\u7247\u626B\u63CF\u9875\u6570\u5FC5\u987B\u8986\u76D6\u6240\u6709\u6210\u529F\u89E3\u6790\u7684\u5B98\u7F51\u9875\u9762"
+      );
+    }
     if (selection.status === "target_met") {
-      if (selection.eligibleFirstPartyImages < limits.targetImages || enrichedAssets.length < limits.targetImages || selection.shortfallReason) {
+      if (uninspectedCandidates.length > 0 || selection.shortfallReason || !enrichedAssets.some((asset) => asset.assetType === "brand_identity")) {
         throw new KnowledgeArchiveValidationError(
           "media",
-          `target_met \u5FC5\u987B\u81F3\u5C11\u53D1\u73B0\u5E76\u6253\u5305 ${limits.targetImages} \u5F20\u5408\u683C\u56FE\u7247`
+          "target_met \u5FC5\u987B\u5B8C\u6210\u5019\u9009\u68C0\u67E5\u3001\u5305\u542B\u54C1\u724C\u89C6\u89C9\u4E14\u4E0D\u5B58\u5728\u8986\u76D6\u7F3A\u53E3"
         );
       }
     } else {
-      if (selection.eligibleFirstPartyImages >= limits.targetImages && !(input.profile === "website-lead-v1" && selection.status === "budget_limited") || enrichedAssets.length !== selection.eligibleFirstPartyImages || !selection.shortfallReason) {
+      if (enrichedAssets.length !== selection.eligibleFirstPartyImages || !selection.shortfallReason) {
         throw new KnowledgeArchiveValidationError(
           "media",
           "\u56FE\u7247\u76EE\u6807\u672A\u8FBE\u6210\u65F6\u5FC5\u987B\u6253\u5305\u5168\u90E8\u5408\u683C\u56FE\u7247\u5E76\u63D0\u4F9B\u771F\u5B9E\u7F3A\u53E3\u539F\u56E0"
@@ -29252,7 +29448,12 @@ function validateProfilePackage(input) {
       enrichedAssets.map((asset) => asset.id).filter(Boolean)
     );
     for (const family of selection.productFamilyCoverage || []) {
-      if (family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) || family.officialImageAvailable && family.assetIds.length === 0 || !family.officialImageAvailable && !family.gapReason || input.profile === "dashboard-enterprise-v1" && family.checkedSources.length === 0) {
+      if (family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) || family.officialImageAvailable && family.assetIds.some((assetId) => {
+        const asset = enrichedAssetsById.get(assetId);
+        return !["product_ui", "product_diagram", "case_photo"].includes(
+          asset?.assetType || ""
+        );
+      }) || family.officialImageAvailable && family.assetIds.length === 0 || !family.officialImageAvailable && !family.gapReason || input.profile === "dashboard-enterprise-v1" && family.checkedSources.length === 0) {
         throw new KnowledgeArchiveValidationError(
           "media",
           `\u4EA7\u54C1\u65CF\u56FE\u7247\u8986\u76D6\u8BB0\u5F55\u4E0D\u5B8C\u6574\uFF1A${family.familyName}`
@@ -29260,7 +29461,7 @@ function validateProfilePackage(input) {
       }
     }
   }
-  if (manifest.imageSelection.eligibleFirstPartyImages >= limits.targetImages && enrichedAssets.length > Math.min(manifest.imageSelection.eligibleFirstPartyImages, limits.images)) {
+  if (enrichedAssets.length > Math.min(manifest.imageSelection.eligibleFirstPartyImages, limits.images)) {
     throw new KnowledgeArchiveValidationError(
       "media",
       "\u5B9E\u9645\u6253\u5305\u56FE\u7247\u6570\u4E0D\u80FD\u8D85\u8FC7\u5408\u683C\u7B2C\u4E00\u65B9\u7D20\u6750\u6570\u6216\u6863\u4F4D\u4E0A\u9650"
@@ -29565,6 +29766,13 @@ function validateProfilePackage(input) {
       throw new KnowledgeArchiveValidationError(
         "content",
         `\u6B63\u5F0F\u6B63\u6587\u5305\u542B\u539F\u59CB\u5FEB\u7167\u6216\u9875\u9762\u6458\u5F55\u8868\u8FF0\uFF1A${document.path}`
+      );
+    }
+    const formalViolation = customerFormalContentViolation(formal);
+    if (formalViolation) {
+      throw new KnowledgeArchiveValidationError(
+        "content",
+        `\u6B63\u5F0F\u6B63\u6587\u5305\u542B\u5BA2\u6237\u4E0D\u53EF\u89C1\u7684\u6838\u9A8C\u8FC7\u7A0B\u3001\u5EFA\u8BAE\u6216\u5185\u90E8\u63A8\u7406\uFF08${formalViolation}\uFF09\uFF1A${document.path}`
       );
     }
     if (manifest.schemaVersion === 2 && (document.kind === "overview" || document.kind === "leaf")) {

@@ -145,7 +145,7 @@ function adminContext(
 ): TrpcContext {
   const now = new Date("2026-07-24T08:00:00.000Z");
   const user: AuthenticatedUser = {
-    id: 999,
+    id: access === "system_admin" ? 999 : 777,
     openId: null,
     username: access === "system_admin" ? "admin" : "assigned.manager",
     displayName: "FrontMind 管理员",
@@ -362,21 +362,31 @@ describe("shared Admin and website user creation path", () => {
     );
   });
 
-  it("rejects delivery-administrator customer creation before any account or entitlement write", async () => {
+  it("allows a delivery administrator to create a customer owned by the current account", async () => {
     const caller = adminRouter.createCaller(adminContext("delivery_admin"));
-    await expect(
-      caller.users.create({
-        username: "assigned.customer",
-        password: "delivery-selected-password",
-        displayName: "已分配客户",
-        role: "user",
-        planCode: "luxury",
-        deliveryAdminId: db.deliveryAdminId,
-        apiKey: "sk-delivery-customer-credential-000001",
-      }),
-    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    const result = await caller.users.create({
+      username: "assigned.customer",
+      password: "delivery-selected-password",
+      displayName: "已分配客户",
+      role: "user",
+      planCode: "luxury",
+      deliveryAdminId: 12_345,
+      apiKey: "sk-delivery-customer-credential-000001",
+    });
 
-    expect(db.inserts).toEqual([]);
+    expect(result).toMatchObject({
+      assignedToCreator: true,
+      assignedDeliveryAdminId: db.deliveryAdminId,
+      user: { username: "assigned.customer", role: "user" },
+      contract: { planCode: "luxury" },
+    });
+    expect(
+      db.inserts.find(({ table }) => table === userAdminAssignments)?.values,
+    ).toMatchObject({
+      userId: result.user.id,
+      adminId: db.deliveryAdminId,
+      assignedByUserId: db.deliveryAdminId,
+    });
   });
 
   it("requires an initial password for a normal user", async () => {

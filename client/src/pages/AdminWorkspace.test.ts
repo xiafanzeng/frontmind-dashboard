@@ -10,9 +10,10 @@ import {
 } from "./AdminWorkspace";
 
 describe("admin customer workspace", () => {
-  it("shows customer creation only to a system administrator", () => {
-    expect(canCreateManagedCustomer(true)).toBe(true);
-    expect(canCreateManagedCustomer(false)).toBe(false);
+  it("allows both system and delivery administrators to create customers", () => {
+    expect(canCreateManagedCustomer("system_admin")).toBe(true);
+    expect(canCreateManagedCustomer("delivery_admin")).toBe(true);
+    expect(canCreateManagedCustomer(null)).toBe(false);
     expect(canCreateManagedCustomer(undefined)).toBe(false);
   });
 

@@ -242,10 +242,17 @@ export const adminNav: PortalNavItem[] = [
 export function getAdminNav(systemAdmin: boolean) {
   return systemAdmin
     ? adminNav
-    : adminNav.filter(
-        (item) =>
-          item.href !== "/admin/users" && item.href !== "/admin/presales",
-      );
+    : adminNav
+        .filter((item) => item.href !== "/admin/presales")
+        .map((item) =>
+          item.href === "/admin/users"
+            ? {
+                ...item,
+                label: "创建客户账号",
+                group: "客户与服务",
+              }
+            : item,
+        );
 }
 
 export function getPreviewAdminNav(systemAdmin: boolean) {

@@ -73,6 +73,10 @@ type AccessLevelChange = {
 export default function AdminUsers() {
   const [, setLocation] = useLocation();
   const { user: currentUser, refresh: refreshCurrentUser } = useAuth();
+  const systemAdmin = isSystemAdminAccount(currentUser);
+  const deliveryAdmin =
+    currentUser?.role === "admin" &&
+    currentUser.adminAccessLevel === "delivery_admin";
   const [createOpen, setCreateOpen] = useState(false);
   const [resetUser, setResetUser] = useState<AuthUser | null>(null);
   const [statusChange, setStatusChange] = useState<StatusChange | null>(null);
@@ -81,7 +85,7 @@ export default function AdminUsers() {
   const [deleteUser, setDeleteUser] = useState<AuthUser | null>(null);
 
   const usersQuery = trpc.admin.users.list.useQuery(undefined, {
-    enabled: currentUser?.role === "admin",
+    enabled: systemAdmin,
     retry: false,
   });
   const utils = trpc.useUtils();
@@ -166,7 +170,58 @@ export default function AdminUsers() {
     }
   };
 
-  if (!isSystemAdminAccount(currentUser)) {
+  if (deliveryAdmin) {
+    return (
+      <PortalShell
+        eyebrow="管理中心 · 客户与服务"
+        title="创建客户账号"
+        navItems={getAdminNav(false)}
+        toolbar={
+          <Button onClick={() => setCreateOpen(true)}>
+            <Plus className="h-4 w-4" />
+            创建客户账号
+          </Button>
+        }
+      >
+        <div className="mx-auto w-full max-w-3xl">
+          <Card className="border-border/70 bg-card/85 shadow-sm backdrop-blur-xl">
+            <CardContent className="flex flex-col items-start gap-5 p-6 sm:flex-row sm:items-center sm:p-8">
+              <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                <UserRoundCheck className="h-6 w-6" />
+              </div>
+              <div className="flex-1">
+                <h2 className="text-lg font-semibold">为新客户开通账号</h2>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  设置客户的初始密码、套餐和有效 API
+                  Key。创建成功后，客户会自动归属当前交付管理员，并立即出现在客户交付工作台。
+                </p>
+              </div>
+              <Button onClick={() => setCreateOpen(true)}>
+                <Plus className="h-4 w-4" />
+                开始创建
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+
+        <CreateUserDialog
+          open={createOpen}
+          onOpenChange={setCreateOpen}
+          userOnly
+          fixedDeliveryAdmin={{
+            id: currentUser.id,
+            username: currentUser.username,
+            displayName: currentUser.displayName,
+          }}
+          onCreated={(userId) =>
+            setLocation(`/admin/customers/${userId}/service`)
+          }
+        />
+      </PortalShell>
+    );
+  }
+
+  if (!systemAdmin) {
     return (
       <main className="flex min-h-[100dvh] items-center justify-center bg-background p-4">
         <Card className="w-full max-w-md">
@@ -176,7 +231,7 @@ export default function AdminUsers() {
             </div>
             <h1 className="text-xl font-semibold">没有访问权限</h1>
             <p className="mt-2 text-sm text-muted-foreground">
-              账号管理仅对系统管理员开放。
+              只有系统管理员和交付管理员可以访问此页面。
             </p>
             <Button
               className="mt-6"
@@ -621,6 +676,7 @@ export function CreateUserDialog({
   onOpenChange,
   userOnly = false,
   deliveryAdmins = [],
+  fixedDeliveryAdmin,
   onCreated,
 }: {
   open: boolean;
@@ -631,6 +687,11 @@ export function CreateUserDialog({
     username: string;
     displayName?: string | null;
   }>;
+  fixedDeliveryAdmin?: {
+    id: number;
+    username: string;
+    displayName?: string | null;
+  };
   onCreated?: (userId: number) => void;
 }) {
   const utils = trpc.useUtils();
@@ -645,6 +706,9 @@ export function CreateUserDialog({
   const [adminAccessLevel, setAdminAccessLevel] = useState<
     "system_admin" | "delivery_admin"
   >("delivery_admin");
+  const effectiveDeliveryAdminId = fixedDeliveryAdmin
+    ? String(fixedDeliveryAdmin.id)
+    : deliveryAdminId;
   const createMutation = trpc.admin.users.create.useMutation({
     onSuccess: () =>
       Promise.all([
@@ -703,7 +767,7 @@ export function CreateUserDialog({
       toast.error("请填写客户 API Key");
       return;
     }
-    if (role === "user" && !deliveryAdminId) {
+    if (role === "user" && !effectiveDeliveryAdminId) {
       toast.error("请选择客户主负责人");
       return;
     }
@@ -724,7 +788,7 @@ export function CreateUserDialog({
               password,
               role: "user",
               planCode: planCode as ServicePlanCode,
-              deliveryAdminId: Number(deliveryAdminId),
+              deliveryAdminId: Number(effectiveDeliveryAdminId),
               apiKey: apiKey.trim(),
             });
       toast.success("账号已创建", {
@@ -747,12 +811,14 @@ export function CreateUserDialog({
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 pr-8">
               <Plus className="h-5 w-5 text-primary" />
-              创建账号
+              {userOnly ? "创建客户账号" : "创建账号"}
             </DialogTitle>
             <DialogDescription>
-              {userOnly
-                ? "设置客户初始密码、套餐、主负责人和有效 API Key；创建完成后账号立即可用。"
-                : "普通用户和管理员均由系统管理员设置初始密码；普通用户还需配置套餐、主负责人和有效 API Key。"}
+              {userOnly && fixedDeliveryAdmin
+                ? "设置客户初始密码、套餐和有效 API Key；创建后客户自动归属当前交付管理员，账号立即可用。"
+                : userOnly
+                  ? "设置客户初始密码、套餐、主负责人和有效 API Key；创建完成后账号立即可用。"
+                  : "普通用户和管理员均由系统管理员设置初始密码；普通用户还需配置套餐、主负责人和有效 API Key。"}
             </DialogDescription>
           </DialogHeader>
           <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
@@ -872,37 +938,54 @@ export function CreateUserDialog({
                     </SelectContent>
                   </Select>
                 </div>
-                <div className="space-y-2">
-                  <Label>客户主负责人</Label>
-                  <Select
-                    value={deliveryAdminId}
-                    onValueChange={setDeliveryAdminId}
-                    disabled={
-                      createMutation.isPending || deliveryAdmins.length === 0
-                    }
-                  >
-                    <SelectTrigger className="w-full" aria-label="客户主负责人">
-                      <SelectValue
-                        placeholder={
-                          deliveryAdmins.length
-                            ? "请选择主负责人"
-                            : "暂无可用管理员"
-                        }
-                      />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {deliveryAdmins.map((admin) => (
-                        <SelectItem key={admin.id} value={String(admin.id)}>
-                          {admin.displayName || admin.username} · @
-                          {admin.username}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <p className="text-xs leading-5 text-muted-foreground">
-                    系统管理员或交付管理员均可成为客户主负责人，并承担该客户的任务用量归属。
-                  </p>
-                </div>
+                {fixedDeliveryAdmin ? (
+                  <div className="space-y-2">
+                    <Label>客户主负责人</Label>
+                    <div className="rounded-md border border-border bg-muted/35 px-3 py-2 text-sm">
+                      {fixedDeliveryAdmin.displayName ||
+                        fixedDeliveryAdmin.username}{" "}
+                      · @{fixedDeliveryAdmin.username}
+                    </div>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      交付管理员创建的客户自动归属当前账号，不能分配给其他管理员。
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Label>客户主负责人</Label>
+                    <Select
+                      value={deliveryAdminId}
+                      onValueChange={setDeliveryAdminId}
+                      disabled={
+                        createMutation.isPending || deliveryAdmins.length === 0
+                      }
+                    >
+                      <SelectTrigger
+                        className="w-full"
+                        aria-label="客户主负责人"
+                      >
+                        <SelectValue
+                          placeholder={
+                            deliveryAdmins.length
+                              ? "请选择主负责人"
+                              : "暂无可用管理员"
+                          }
+                        />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {deliveryAdmins.map((admin) => (
+                          <SelectItem key={admin.id} value={String(admin.id)}>
+                            {admin.displayName || admin.username} · @
+                            {admin.username}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      系统管理员或交付管理员均可成为客户主负责人，并承担该客户的任务用量归属。
+                    </p>
+                  </div>
+                )}
               </>
             )}
             {role === "admin" && (
@@ -947,7 +1030,7 @@ export function CreateUserDialog({
                   !password ||
                   password !== confirmPassword ||
                   (role === "user" &&
-                    (!planCode || !apiKey.trim() || !deliveryAdminId))
+                    (!planCode || !apiKey.trim() || !effectiveDeliveryAdminId))
                 }
               >
                 {createMutation.isPending && (

@@ -3183,7 +3183,13 @@ var dashboardMonitoringCurrentTemplateSchema = dashboardModuleTemplateMetadataSc
         if (sourceIds.has(record.sourceRecordId)) {
           context.addIssue({
             code: z3.ZodIssueCode.custom,
-            path: ["batches", batchIndex, field, recordIndex, "sourceRecordId"],
+            path: [
+              "batches",
+              batchIndex,
+              field,
+              recordIndex,
+              "sourceRecordId"
+            ],
             message: "\u540C\u4E00\u6279\u6B21\u7684\u8BB0\u5F55 ID \u4E0D\u80FD\u91CD\u590D"
           });
         }

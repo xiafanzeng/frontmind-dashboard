@@ -41,8 +41,12 @@ import { CreateUserDialog } from "@/pages/AdminUsers";
 export { ADMIN_WORKSPACE_TAB_IDS };
 export type { WorkspaceTab };
 
-export function canCreateManagedCustomer(isSystemAdmin?: boolean) {
-  return isSystemAdmin === true;
+export function canCreateManagedCustomer(
+  adminAccessLevel?: "system_admin" | "delivery_admin" | null,
+) {
+  return (
+    adminAccessLevel === "system_admin" || adminAccessLevel === "delivery_admin"
+  );
 }
 
 export const ADMIN_WORKSPACE_TABS = [
@@ -604,7 +608,7 @@ export default function AdminWorkspace({
       navItems={getAdminNav(Boolean(workspaceQuery.data?.isSystemAdmin))}
       toolbar={
         <div className="flex items-center gap-2">
-          {canCreateManagedCustomer(workspaceQuery.data?.isSystemAdmin) && (
+          {canCreateManagedCustomer(user?.adminAccessLevel) && (
             <Button size="sm" onClick={() => setCreateClientOpen(true)}>
               <Plus className="h-4 w-4" />
               创建客户
@@ -625,11 +629,20 @@ export default function AdminWorkspace({
         </div>
       }
     >
-      {canCreateManagedCustomer(workspaceQuery.data?.isSystemAdmin) && (
+      {canCreateManagedCustomer(user?.adminAccessLevel) && (
         <CreateUserDialog
           open={createClientOpen}
           onOpenChange={setCreateClientOpen}
           userOnly
+          fixedDeliveryAdmin={
+            user?.adminAccessLevel === "delivery_admin"
+              ? {
+                  id: user.id,
+                  username: user.username,
+                  displayName: user.displayName,
+                }
+              : undefined
+          }
           deliveryAdmins={(workspaceQuery.data?.admins ?? [])
             .filter((admin) => admin.isActive)
             .map((admin) => ({
@@ -1071,8 +1084,7 @@ export default function AdminWorkspace({
                                 serviceStatus === "scheduled";
                               if (
                                 isCommerciallyActive &&
-                                (!serviceSignatory.trim() ||
-                                  !serviceSignedAt)
+                                (!serviceSignatory.trim() || !serviceSignedAt)
                               ) {
                                 toast.error("请补全签署信息", {
                                   description:

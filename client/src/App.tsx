@@ -144,9 +144,9 @@ function Router() {
         }}
       </Route>
       <Route path={"/admin/users"}>
-        <SystemAdminOnly>
+        <AdminOnly>
           <AdminUsers />
-        </SystemAdminOnly>
+        </AdminOnly>
       </Route>
       <Route path={"/admin/presales"}>
         <SystemAdminOnly>
