@@ -1,0 +1,342 @@
+{
+  "project": "FrontMind 豪华版功能与操作宣传片",
+  "version": "production-v1",
+  "canvas": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "duration_seconds": 120
+  },
+  "voice": {
+    "engine": "macOS system TTS",
+    "voice": "Reed (中文（中国大陆）)",
+    "rate": 190,
+    "language": "zh-CN"
+  },
+  "shots": [
+    {
+      "id": "S01",
+      "start": 0,
+      "duration": 3,
+      "narration": "官网体验，分为五步。"
+    },
+    {
+      "id": "S02",
+      "start": 3,
+      "duration": 4,
+      "narration": "第一步，企业分析。提交官网与企业资料。"
+    },
+    {
+      "id": "S03",
+      "start": 7,
+      "duration": 5,
+      "narration": "系统构建可核验知识库；进度、日志与结果清晰可见。"
+    },
+    {
+      "id": "S04",
+      "start": 12,
+      "duration": 6,
+      "narration": "第二步，问题推荐。比较候选问题，选择目标并确认。"
+    },
+    {
+      "id": "S05",
+      "start": 18,
+      "duration": 8,
+      "narration": "第三步，问题监控。采集六个平台的回答，并核验实际引用与参考来源。"
+    },
+    {
+      "id": "S06",
+      "start": 26,
+      "duration": 8,
+      "narration": "第四步，现状评估。完成知识对照，识别差距，并形成有条件的提升目标。"
+    },
+    {
+      "id": "S07",
+      "start": 34,
+      "duration": 6,
+      "narration": "第五步，启动服务。围绕目标问题，匹配持续优化方案。"
+    },
+    {
+      "id": "S08",
+      "start": 40,
+      "duration": 7,
+      "narration": "进入豪华版后台。服务首页统一呈现周期、进度、交付与下一步。"
+    },
+    {
+      "id": "S09",
+      "start": 47,
+      "duration": 8,
+      "narration": "知识库智能体通过对话确认企业事实，保留更新记录与版本依据。"
+    },
+    {
+      "id": "S10",
+      "start": 55,
+      "duration": 7,
+      "narration": "知识库展示集中查看已确认内容、节点结构与发布版本。"
+    },
+    {
+      "id": "S11",
+      "start": 62,
+      "duration": 10,
+      "narration": "品牌全域词库按行业、竞品、美誉和产品场景组织问题，支持筛选、查看与选择目标。"
+    },
+    {
+      "id": "S12",
+      "start": 72,
+      "duration": 8,
+      "narration": "问题优化接收词库选题，提交确认，并进入当前周期的优化流程。"
+    },
+    {
+      "id": "S13",
+      "start": 80,
+      "duration": 10,
+      "narration": "应答逻辑智能体逐题协作，确认回答口径、事实依据、表达边界与图文资料。"
+    },
+    {
+      "id": "S14",
+      "start": 90,
+      "duration": 11,
+      "narration": "问题监控汇总跨平台答案，核验信源引用与渠道分发，持续查看真实采集变化。"
+    },
+    {
+      "id": "S15",
+      "start": 101,
+      "duration": 8,
+      "narration": "进度报告按服务周期保留复测记录、主要发现、结论与下一步。"
+    },
+    {
+      "id": "S16",
+      "start": 109,
+      "duration": 5,
+      "narration": "内容资产运营，提交内容制作与权威信源发布需求。"
+    },
+    {
+      "id": "S17",
+      "start": 114,
+      "duration": 6,
+      "narration": "AI 友好官网管理，将域名、备案和内容运营转化为工单。"
+    }
+  ],
+  "segments": [
+    {
+      "id": "S01-A",
+      "shot_id": "S01",
+      "duration": 3,
+      "source": "04-shots/captures/website/website-00-five-step-overview.png",
+      "chapter": "官网体验 · 00:00",
+      "title": "五步完成 GEO 体验",
+      "caption": "官网体验，分为五步。",
+      "motion": "center"
+    },
+    {
+      "id": "S02-A",
+      "shot_id": "S02",
+      "duration": 4,
+      "source": "04-shots/captures/website/website-00a-enterprise-input.png",
+      "chapter": "官网体验 · 01 / 05",
+      "title": "企业分析",
+      "caption": "提交官网与企业资料。",
+      "motion": "right"
+    },
+    {
+      "id": "S03-A",
+      "shot_id": "S03",
+      "duration": 2.7,
+      "source": "04-shots/captures/website/website-01-enterprise-analysis.png",
+      "chapter": "官网体验 · 01 / 05",
+      "title": "企业知识基建",
+      "caption": "系统构建可核验知识库。",
+      "motion": "left"
+    },
+    {
+      "id": "S03-B",
+      "shot_id": "S03",
+      "duration": 2.3,
+      "source": "04-shots/captures/website/website-01b-execution-log.png",
+      "chapter": "官网体验 · 01 / 05",
+      "title": "真实进度与执行日志",
+      "caption": "进度、日志与结果清晰可见。",
+      "motion": "center"
+    },
+    {
+      "id": "S04-A",
+      "shot_id": "S04",
+      "duration": 3,
+      "source": "04-shots/captures/website/website-02-question-recommendation.png",
+      "chapter": "官网体验 · 02 / 05",
+      "title": "问题推荐",
+      "caption": "比较候选问题，选择目标。",
+      "motion": "right"
+    },
+    {
+      "id": "S04-B",
+      "shot_id": "S04",
+      "duration": 3,
+      "source": "04-shots/captures/website/website-02b-question-selected.png",
+      "chapter": "官网体验 · 02 / 05",
+      "title": "确认目标问题",
+      "caption": "确认后进入监控与评估。",
+      "motion": "left"
+    },
+    {
+      "id": "S05-A",
+      "shot_id": "S05",
+      "duration": 8,
+      "source": "04-shots/captures/website/website-03-question-monitoring.png",
+      "chapter": "官网体验 · 03 / 05",
+      "title": "跨平台问题监控",
+      "caption": "采集六个平台回答，核验实际引用与参考来源。",
+      "motion": "center"
+    },
+    {
+      "id": "S06-A",
+      "shot_id": "S06",
+      "duration": 2.7,
+      "source": "04-shots/captures/website/website-04-assessment-overview.png",
+      "chapter": "官网体验 · 04 / 05",
+      "title": "现状评估",
+      "caption": "查看当前评分与五维语义资产现状。",
+      "motion": "right"
+    },
+    {
+      "id": "S06-B",
+      "shot_id": "S06",
+      "duration": 2.7,
+      "source": "04-shots/captures/website/website-04a-knowledge-compare.png",
+      "chapter": "官网体验 · 04 / 05",
+      "title": "知识事实对照",
+      "caption": "逐项对照知识事实与平台回答。",
+      "motion": "left"
+    },
+    {
+      "id": "S06-C",
+      "shot_id": "S06",
+      "duration": 2.6,
+      "source": "04-shots/captures/website/website-04b-optimized-effect.png",
+      "chapter": "官网体验 · 04 / 05",
+      "title": "条件目标区间",
+      "caption": "识别差距，形成有条件的提升目标。",
+      "motion": "center"
+    },
+    {
+      "id": "S07-A",
+      "shot_id": "S07",
+      "duration": 6,
+      "source": "04-shots/captures/website/website-05-start-service.png",
+      "chapter": "官网体验 · 05 / 05",
+      "title": "启动持续优化服务",
+      "caption": "围绕目标问题，匹配持续优化方案。",
+      "motion": "right"
+    },
+    {
+      "id": "S08-A",
+      "shot_id": "S08",
+      "duration": 7,
+      "source": "04-shots/captures/dashboard/dashboard-01-service-home.png",
+      "chapter": "豪华版后台 · 00:40",
+      "title": "服务首页",
+      "caption": "统一呈现周期、进度、交付与下一步。",
+      "motion": "left"
+    },
+    {
+      "id": "S09-A",
+      "shot_id": "S09",
+      "duration": 8,
+      "source": "04-shots/captures/dashboard/dashboard-02-knowledge-agent.png",
+      "chapter": "豪华版后台 · 品牌建设",
+      "title": "知识库智能体",
+      "caption": "通过对话确认企业事实，保留更新记录与版本依据。",
+      "motion": "center"
+    },
+    {
+      "id": "S10-A",
+      "shot_id": "S10",
+      "duration": 7,
+      "source": "04-shots/captures/dashboard/dashboard-03-knowledge-display.png",
+      "chapter": "豪华版后台 · 品牌建设",
+      "title": "知识库展示",
+      "caption": "集中查看已确认内容、节点结构与发布版本。",
+      "motion": "right"
+    },
+    {
+      "id": "S11-A",
+      "shot_id": "S11",
+      "duration": 10,
+      "source": "04-shots/captures/dashboard/dashboard-04-brand-keyword-library.png",
+      "chapter": "豪华版后台 · 品牌建设",
+      "title": "品牌全域词库",
+      "caption": "按行业、竞品、美誉和产品场景组织问题。",
+      "motion": "left"
+    },
+    {
+      "id": "S12-A",
+      "shot_id": "S12",
+      "duration": 8,
+      "source": "04-shots/captures/dashboard/dashboard-05-question-optimization.png",
+      "chapter": "豪华版后台 · 意图优化",
+      "title": "问题优化",
+      "caption": "接收词库选题，提交确认并进入当前周期。",
+      "motion": "center"
+    },
+    {
+      "id": "S13-A",
+      "shot_id": "S13",
+      "duration": 10,
+      "source": "04-shots/captures/dashboard/dashboard-06-response-logic-agent.png",
+      "chapter": "豪华版后台 · 意图优化",
+      "title": "应答逻辑智能体",
+      "caption": "逐题确认回答口径、事实依据、表达边界与图文资料。",
+      "motion": "right"
+    },
+    {
+      "id": "S14-A",
+      "shot_id": "S14",
+      "duration": 11,
+      "source": "04-shots/captures/dashboard/dashboard-07-monitoring.png",
+      "chapter": "豪华版后台 · 进度监控",
+      "title": "问题监控",
+      "caption": "汇总跨平台答案，核验信源引用与渠道分发。",
+      "motion": "left"
+    },
+    {
+      "id": "S15-A",
+      "shot_id": "S15",
+      "duration": 3,
+      "source": "04-shots/captures/dashboard/dashboard-08-progress-report.png",
+      "chapter": "豪华版后台 · 进度监控",
+      "title": "进度报告 · 优化前基准",
+      "caption": "保留每个周期的复测基准。",
+      "motion": "center"
+    },
+    {
+      "id": "S15-B",
+      "shot_id": "S15",
+      "duration": 5,
+      "source": "04-shots/captures/dashboard/dashboard-08b-progress-report-cycle.png",
+      "chapter": "豪华版后台 · 进度监控",
+      "title": "进度报告 · 复测对比",
+      "caption": "对照主要发现、已填补差距与下一步。",
+      "motion": "right"
+    },
+    {
+      "id": "S16-A",
+      "shot_id": "S16",
+      "duration": 5,
+      "source": "04-shots/captures/dashboard/dashboard-09-content-assets.png",
+      "chapter": "豪华版后台 · AI 友好内容资产",
+      "title": "内容资产运营",
+      "caption": "提交内容制作与权威信源发布需求。",
+      "motion": "left"
+    },
+    {
+      "id": "S17-A",
+      "shot_id": "S17",
+      "duration": 6,
+      "source": "04-shots/captures/dashboard/dashboard-10-ai-friendly-website.png",
+      "chapter": "豪华版后台 · AI 友好内容资产",
+      "title": "AI 友好官网管理",
+      "caption": "将域名、备案和内容运营转化为工单。",
+      "motion": "center"
+    }
+  ]
+}

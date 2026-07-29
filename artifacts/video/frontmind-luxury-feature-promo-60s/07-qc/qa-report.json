@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "gate_status": "draft",
+  "reviewer": "",
+  "reviewed_at": "",
+  "master_file": "",
+  "master_sha256": "",
+  "dimensions": [
+    {"name": "factual_accuracy_and_brand_fidelity", "weight": 15, "score": 0, "evidence": [], "notes": ""},
+    {"name": "narrative_strategy_and_pacing", "weight": 15, "score": 0, "evidence": [], "notes": ""},
+    {"name": "visual_direction_and_composition", "weight": 15, "score": 0, "evidence": [], "notes": ""},
+    {"name": "product_ui_authenticity", "weight": 10, "score": 0, "evidence": [], "notes": ""},
+    {"name": "continuity_and_generative_integrity", "weight": 10, "score": 0, "evidence": [], "notes": ""},
+    {"name": "typography_and_information_design", "weight": 10, "score": 0, "evidence": [], "notes": ""},
+    {"name": "voice_music_mix_and_sync", "weight": 10, "score": 0, "evidence": [], "notes": ""},
+    {"name": "rights_consent_and_provenance", "weight": 5, "score": 0, "evidence": [], "notes": ""},
+    {"name": "accessibility_and_localization", "weight": 5, "score": 0, "evidence": [], "notes": ""},
+    {"name": "technical_delivery", "weight": 5, "score": 0, "evidence": [], "notes": ""}
+  ],
+  "weighted_score": 0,
+  "blockers": [],
+  "review_notes": [],
+  "technical_probe": {},
+  "deep_scan": {}
+}

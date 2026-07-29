@@ -1,0 +1,30 @@
+{
+  "version": 5,
+  "gate_status": "pass",
+  "reviewer": "Codex preflight",
+  "reviewed_at": "2026-07-29T15:45:00+08:00",
+  "checks": {
+    "claims_grounded": true,
+    "three_distinct_concepts": true,
+    "selected_concept_justified": true,
+    "narration_timed": true,
+    "shot_plan_complete": true,
+    "styleframes_representative": true,
+    "continuity_locked": true,
+    "rights_and_privacy_routed": true,
+    "tool_and_cost_gates_explicit": true,
+    "adaptation_plan_complete": true
+  },
+  "blockers": [],
+  "notes": [
+    "用户于 2026-07-29 明确指令“正式制作”，Creative Lock 已批准并进入 Produce。",
+    "用户已明确修正：参考录屏仅用于操作样例，最终片必须在官网前台与豪华版后台各功能间直接切换；本版已完全重写为功能全景结构。",
+    "用户进一步确认：官网首页、三大产品与研究社区不需要介绍；官网段改为企业分析、问题推荐、问题监控、现状评估、启动服务五步完整体验。",
+    "用户将主版扩展为 120 秒，并删除 00:56–01:00 品牌 CTA；新版以 78 秒五步体验和 42 秒豪华版后台构成，最后停在真实 AI 友好官网管理界面。",
+    "用户重新分配时长为前台约 40 秒、后台约 80 秒；本版将五步压缩为 7 个镜头，并把豪华版拆为 10 个独立功能镜头。",
+    "所有风格帧来自用户提供的真实操作录屏，仅用于方向确认；正式成片将重新捕获 1920×1080 真实 UI。",
+    "配音、音乐、正式录屏、付费生成与最终渲染均未开始。",
+    "主版先完成 16:9；9:16 与 1:1 仅列为可选衍生版本，不在本轮默认范围内。",
+    "当前版本不包含 CTA、短链或二维码。"
+  ]
+}
