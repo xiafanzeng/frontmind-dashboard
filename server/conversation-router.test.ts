@@ -1,8 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  apiCredentials,
+  upstreamResources,
+  userUsageOwners,
+  users,
+} from "../drizzle/schema";
+import {
   collectSnapshotResourceRefs,
+  getActiveCredentialId,
   mergeConversationMessages,
+  mergeConversationTaskPointers,
   permanentlyDeleteConversation,
+  resolveSnapshotCredentialId,
   validateUpstreamResourceAccess,
   type ConversationSnapshot,
 } from "./conversation-router";
@@ -18,6 +27,29 @@ function message(
   return { id, role, timestamp, content };
 }
 
+function createSelectExecutor(rowsForTable: (table: unknown) => unknown[]) {
+  const selectedTables: unknown[] = [];
+  const select = vi.fn(() => ({
+    from: (table: unknown) => {
+      selectedTables.push(table);
+      const rows = rowsForTable(table);
+      const query: {
+        where: () => typeof query;
+        orderBy: () => typeof query;
+        limit: () => Promise<unknown[]>;
+        then: Promise<unknown[]>["then"];
+      } = {
+        where: () => query,
+        orderBy: () => query,
+        limit: async () => rows,
+        then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
+      };
+      return query;
+    },
+  }));
+  return { executor: { select }, selectedTables };
+}
+
 describe("conversation multi-device merge", () => {
   it("retains independent turns created on two devices", () => {
     const persisted = [
@@ -30,7 +62,7 @@ describe("conversation multi-device merge", () => {
     ];
 
     expect(
-      mergeConversationMessages(persisted, incoming, []).map(item => item.id),
+      mergeConversationMessages(persisted, incoming, []).map((item) => item.id),
     ).toEqual(["user-a", "assistant-a", "user-b", "assistant-b"]);
   });
 
@@ -45,7 +77,7 @@ describe("conversation multi-device merge", () => {
     ];
 
     expect(
-      mergeConversationMessages(persisted, incoming, []).map(item => item.id),
+      mergeConversationMessages(persisted, incoming, []).map((item) => item.id),
     ).toEqual(["user-a", "final"]);
   });
 
@@ -60,7 +92,7 @@ describe("conversation multi-device merge", () => {
     ];
 
     expect(
-      mergeConversationMessages(persisted, incoming, []).map(item => item.id),
+      mergeConversationMessages(persisted, incoming, []).map((item) => item.id),
     ).toEqual(["user-a", "final"]);
   });
 
@@ -72,9 +104,62 @@ describe("conversation multi-device merge", () => {
 
     expect(
       mergeConversationMessages(persisted, [], ["assistant-a"]).map(
-        item => item.id,
+        (item) => item.id,
       ),
     ).toEqual(["user-a"]);
+  });
+
+  it("does not let a stale device roll the task pointer from T2 back to T1", () => {
+    const persisted = [
+      message("user-turn-1", "user", 100),
+      message("assistant-turn-1", "assistant", 110),
+      message("user-turn-2", "user", 200),
+      message("assistant-turn-2", "assistant", 210),
+    ];
+    const stale = [
+      message("user-turn-1", "user", 100),
+      message("assistant-turn-1", "assistant", 110),
+    ];
+
+    expect(
+      mergeConversationTaskPointers({
+        existing: { taskId: "T2", previousResponseId: "T2" },
+        incoming: { taskId: "T1", previousResponseId: "T1" },
+        persistedMessages: persisted,
+        incomingMessages: stale,
+        resourceCreatedAt: new Map([
+          ["T1", 1_000],
+          ["T2", 2_000],
+        ]),
+        existingUpdatedAt: 2_000,
+        // Even a badly skewed client clock cannot defeat ledger ordering.
+        incomingUpdatedAt: 99_000,
+      }),
+    ).toEqual({ taskId: "T2", previousResponseId: "T2" });
+  });
+
+  it("accepts the next task pointer when its user turn is current", () => {
+    const currentMessages = [
+      message("user-turn-1", "user", 100),
+      message("assistant-turn-1", "assistant", 110),
+      message("user-turn-2", "user", 200),
+    ];
+
+    expect(
+      mergeConversationTaskPointers({
+        existing: { taskId: "T1", previousResponseId: "T1" },
+        incoming: { taskId: "T2", previousResponseId: "T2" },
+        persistedMessages: currentMessages,
+        incomingMessages: currentMessages,
+        // MySQL task timestamps can share one-second precision.
+        resourceCreatedAt: new Map([
+          ["T1", 1_000],
+          ["T2", 1_000],
+        ]),
+        existingUpdatedAt: 2_000,
+        incomingUpdatedAt: 2_001,
+      }),
+    ).toEqual({ taskId: "T2", previousResponseId: "T2" });
   });
 });
 
@@ -91,6 +176,91 @@ describe("conversation deletion", () => {
 
     expect(deleteFrom).toHaveBeenCalledTimes(1);
     expect(where).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("conversation credential binding", () => {
+  it("uses the customer's direct key even when a delivery admin is assigned", async () => {
+    const { executor, selectedTables } = createSelectExecutor((table) => {
+      if (table === users) return [{ role: "user" }];
+      if (table === apiCredentials) {
+        return [{ id: "credential-customer" }];
+      }
+      if (table === userUsageOwners) {
+        return [{ deliveryAdminId: 42 }];
+      }
+      return [];
+    });
+
+    await expect(getActiveCredentialId(executor, 7)).resolves.toBe(
+      "credential-customer",
+    );
+    expect(selectedTables).toEqual([users, apiCredentials]);
+    expect(selectedTables).not.toContain(userUsageOwners);
+  });
+
+  it("falls back to the assigned delivery admin only when the customer has no key", async () => {
+    let credentialQueryCount = 0;
+    const { executor, selectedTables } = createSelectExecutor((table) => {
+      if (table === users) return [{ role: "user" }];
+      if (table === userUsageOwners) return [{ deliveryAdminId: 42 }];
+      if (table === apiCredentials) {
+        credentialQueryCount += 1;
+        return credentialQueryCount === 1
+          ? []
+          : [{ id: "credential-delivery-admin" }];
+      }
+      return [];
+    });
+
+    await expect(getActiveCredentialId(executor, 7)).resolves.toBe(
+      "credential-delivery-admin",
+    );
+    expect(selectedTables).toEqual([
+      users,
+      apiCredentials,
+      userUsageOwners,
+      apiCredentials,
+    ]);
+  });
+
+  it("keeps an old task bound to its original credential after manager reassignment", async () => {
+    const snapshot: ConversationSnapshot = {
+      id: "conversation-old-task",
+      title: "历史任务",
+      status: "completed",
+      taskId: "task-before-reassignment",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+    };
+    const { executor, selectedTables } = createSelectExecutor((table) => {
+      if (table === upstreamResources) {
+        return [
+          {
+            userId: 7,
+            kind: "task",
+            upstreamId: "task-before-reassignment",
+            apiCredentialId: "credential-former-manager",
+          },
+        ];
+      }
+      if (table === apiCredentials) return [{ status: "retired" }];
+      if (table === userUsageOwners) {
+        return [{ deliveryAdminId: 99 }];
+      }
+      return [];
+    });
+
+    await expect(
+      resolveSnapshotCredentialId(executor, 7, snapshot, {
+        existingCredentialId: "credential-former-manager",
+      }),
+    ).resolves.toMatchObject({
+      credentialId: "credential-former-manager",
+    });
+    expect(selectedTables).toEqual([upstreamResources, apiCredentials]);
+    expect(selectedTables).not.toContain(userUsageOwners);
   });
 });
 
@@ -168,7 +338,7 @@ describe("legacy upstream resource ownership validation", () => {
 
   it.each([401, 403, 404])(
     "rejects an unprovable resource when upstream returns %s",
-    async status => {
+    async (status) => {
       await expect(
         validateUpstreamResourceAccess(
           "sk-wrong",
@@ -182,14 +352,9 @@ describe("legacy upstream resource ownership validation", () => {
 
   it("does not bind resources when upstream validation is unavailable", async () => {
     await expect(
-      validateUpstreamResourceAccess(
-        "sk-owner",
-        "task",
-        "task-1",
-        async () => {
-          throw new Error("timeout");
-        },
-      ),
+      validateUpstreamResourceAccess("sk-owner", "task", "task-1", async () => {
+        throw new Error("timeout");
+      }),
     ).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE" });
   });
 });

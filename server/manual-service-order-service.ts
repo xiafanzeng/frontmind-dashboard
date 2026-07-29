@@ -229,7 +229,7 @@ function publicMessage(row: ManualOrderRow) {
     case "activation_required":
       return "账号资料已提交，正在自动开通服务";
     case "active":
-      return "服务账号与基础版权益已开通";
+      return "服务账号与普通版权益已开通";
     case "rejected":
       return row.lastError || "该服务订单已被管理员拒绝";
     case "failed":

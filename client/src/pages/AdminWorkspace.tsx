@@ -1,12 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   CreditCard,
   ClipboardList,
   Database,
   Eye,
-  ExternalLink,
   FileArchive,
-  FileCheck2,
   History,
   KeyRound,
   Loader2,
@@ -14,11 +12,7 @@ import {
   PackageCheck,
   Plus,
   RefreshCw,
-  Send,
-  ShieldCheck,
-  UploadCloud,
   UserCog,
-  XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useLocation } from "wouter";
@@ -35,7 +29,6 @@ import PortalShell, { PortalCard } from "@/components/PortalShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { uploadFile } from "@/lib/frontmind-api";
 import {
   ADMIN_WORKSPACE_TAB_IDS,
   type WorkspaceTab,
@@ -56,75 +49,13 @@ export const ADMIN_WORKSPACE_TABS = [
   { value: "knowledge", label: "知识库流程", icon: Database },
   { value: "tickets", label: "工单与官网", icon: ClipboardList },
   { value: "delivery", label: "内容、监控与报告", icon: Database },
-  { value: "credential", label: "共享 Key 与积分", icon: KeyRound },
+  { value: "credential", label: "客户 Key 与积分", icon: KeyRound },
   { value: "activity", label: "操作记录", icon: History },
 ] as const satisfies ReadonlyArray<{
   value: WorkspaceTab;
   label: string;
   icon: typeof PackageCheck;
 }>;
-
-export type ManualOrderStatus =
-  | "pending_admin"
-  | "signature_required"
-  | "payment_required"
-  | "account_setup_required"
-  | "activation_required"
-  | "active";
-
-export type ManualOrderPrimaryAction =
-  | "prepare"
-  | "confirm_signed"
-  | "wait_payment"
-  | "wait_account"
-  | "activate";
-
-type ManualOrder = {
-  reference: string;
-  status: ManualOrderStatus;
-  companyName: string;
-  orderId?: string | null;
-  question?: string | null;
-  category?: string | null;
-  contractId?: string | null;
-  signingUrl?: string | null;
-  createdAt?: number | string | Date | null;
-  updatedAt?: number | string | Date | null;
-  payment?: {
-    orderId?: string | null;
-    tradeNo?: string | null;
-    paidAt?: number | string | Date | null;
-  } | null;
-  paymentOrderId?: string | null;
-  paymentTradeNo?: string | null;
-  paidAt?: number | string | Date | null;
-};
-
-type ManualOrderPreparationDraft = {
-  contractId: string;
-  signingUrl: string;
-};
-
-type ManualOrderSignatureDraft = {
-  signedContract?: File;
-  signingReport?: File;
-  signedAtLocal: string;
-  signatoryId: string;
-  note: string;
-};
-
-type ManualOrderBusyState = {
-  reference: string;
-  action: "prepare" | "confirm_signed" | "activate" | "reject";
-};
-
-type UploadedManualOrderFile = {
-  fileId: string;
-  filename: string;
-  sha256: string;
-};
-
-const MANUAL_ORDER_PDF_MAX_BYTES = 20 * 1024 * 1024;
 
 const QUESTION_CATEGORY_LABELS: Record<string, string> = {
   industry: "行业词",
@@ -133,103 +64,12 @@ const QUESTION_CATEGORY_LABELS: Record<string, string> = {
   product_scenario: "产品场景词",
 };
 
-const MANUAL_ORDER_STATUS_COPY: Record<
-  Exclude<ManualOrderStatus, "active">,
-  { label: string; description: string; tone: string }
-> = {
-  pending_admin: {
-    label: "待管理员发起签署",
-    description: "填写合同编号和第三方签署链接，再通知客户签署。",
-    tone: "bg-violet-50 text-violet-700",
-  },
-  signature_required: {
-    label: "待核验签署",
-    description: "上传已签合同与签署证据，核对实际签署信息。",
-    tone: "bg-blue-50 text-blue-700",
-  },
-  payment_required: {
-    label: "待客户付款",
-    description: "签署已确认，系统正在等待客户完成付款。",
-    tone: "bg-amber-50 text-amber-700",
-  },
-  account_setup_required: {
-    label: "待企业设置账号",
-    description: "付款已确认，等待企业提交登录账号和密码。",
-    tone: "bg-sky-50 text-sky-700",
-  },
-  activation_required: {
-    label: "待确认到账并开通",
-    description: "账号资料已就绪；核对付款记录后再单独开通服务。",
-    tone: "bg-emerald-50 text-emerald-700",
-  },
-};
-
-export function manualOrderPrimaryAction(
-  status: ManualOrderStatus,
-): ManualOrderPrimaryAction | null {
-  if (status === "pending_admin") return "prepare";
-  if (status === "signature_required") return "confirm_signed";
-  if (status === "payment_required") return "wait_payment";
-  if (status === "account_setup_required") return "wait_account";
-  if (status === "activation_required") return "activate";
-  return null;
-}
-
-export function isSecureSigningUrl(value: string) {
-  try {
-    const url = new URL(value.trim());
-    return url.protocol === "https:" && Boolean(url.hostname);
-  } catch {
-    return false;
-  }
-}
-
-export function validateManualOrderPdf(file: File | undefined) {
-  if (!file) return "请选择 PDF 文件。";
-  const pdfFilename = /\.pdf$/i.test(file.name);
-  const pdfMime = !file.type || file.type === "application/pdf";
-  if (!pdfFilename || !pdfMime) return "仅支持 PDF 文件。";
-  if (file.size <= 0) return "PDF 文件为空，请重新选择。";
-  if (file.size > MANUAL_ORDER_PDF_MAX_BYTES) return "PDF 文件不能超过 20 MB。";
-  return "";
-}
-
-export async function sha256ManualOrderFile(file: File) {
-  if (!globalThis.crypto?.subtle) {
-    throw new Error("当前浏览器无法计算文件校验值，请使用最新版浏览器重试。");
-  }
-  const digest = await globalThis.crypto.subtle.digest(
-    "SHA-256",
-    await file.arrayBuffer(),
-  );
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
 function toDateTimeLocal(value?: number | string | Date | null) {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
   return local.toISOString().slice(0, 16);
-}
-
-function displayDateTime(value: number | string | Date | null | undefined) {
-  if (!value) return "待确认";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "待确认";
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function manualOrderError(error: unknown) {
-  return error instanceof Error ? error.message : "请刷新后重试";
 }
 
 function toDateInput(value: number | string | Date | null | undefined) {
@@ -465,394 +305,6 @@ function AdminQuestionRow({
   );
 }
 
-function ManualOrderCard({
-  order,
-  busy,
-  uploadProgress,
-  onPrepare,
-  onConfirmSigned,
-  onActivate,
-  onReject,
-}: {
-  order: ManualOrder;
-  busy?: ManualOrderBusyState;
-  uploadProgress?: { label: string; percent: number };
-  onPrepare: (
-    order: ManualOrder,
-    draft: ManualOrderPreparationDraft,
-  ) => Promise<void>;
-  onConfirmSigned: (
-    order: ManualOrder,
-    draft: ManualOrderSignatureDraft,
-  ) => Promise<void>;
-  onActivate: (order: ManualOrder) => Promise<void>;
-  onReject: (order: ManualOrder, note: string) => Promise<void>;
-}) {
-  const [preparation, setPreparation] = useState<ManualOrderPreparationDraft>({
-    contractId: order.contractId ?? "",
-    signingUrl: order.signingUrl ?? "",
-  });
-  const [signature, setSignature] = useState<ManualOrderSignatureDraft>({
-    signedAtLocal: "",
-    signatoryId: "",
-    note: "",
-  });
-  const [rejectNote, setRejectNote] = useState("");
-  const [fileError, setFileError] = useState("");
-  const statusCopy =
-    order.status === "active" ? null : MANUAL_ORDER_STATUS_COPY[order.status];
-  const action = manualOrderPrimaryAction(order.status);
-  const working = Boolean(busy);
-  const paymentOrderId =
-    order.payment?.orderId ?? order.paymentOrderId ?? order.orderId;
-  const paymentTradeNo = order.payment?.tradeNo ?? order.paymentTradeNo;
-  const paidAt = order.payment?.paidAt ?? order.paidAt;
-
-  useEffect(() => {
-    setPreparation({
-      contractId: order.contractId ?? "",
-      signingUrl: order.signingUrl ?? "",
-    });
-    setSignature({
-      signedAtLocal: "",
-      signatoryId: "",
-      note: "",
-    });
-    setRejectNote("");
-    setFileError("");
-  }, [order.contractId, order.reference, order.signingUrl, order.status]);
-
-  if (!statusCopy || !action) return null;
-
-  const selectPdf = (
-    kind: "signedContract" | "signingReport",
-    file: File | undefined,
-  ) => {
-    if (!file) {
-      setSignature((current) => ({ ...current, [kind]: undefined }));
-      return;
-    }
-    const error = validateManualOrderPdf(file);
-    if (error) {
-      setFileError(error);
-      setSignature((current) => ({ ...current, [kind]: undefined }));
-      return;
-    }
-    setFileError("");
-    setSignature((current) => ({ ...current, [kind]: file }));
-  };
-
-  return (
-    <article className="rounded-2xl border border-[#e5dce9] bg-[#fbf9fd] p-4 sm:p-5">
-      <header className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h4 className="font-semibold text-[#2e243d]">
-              {order.companyName || "待确认企业"}
-            </h4>
-            <Badge className={statusCopy.tone}>{statusCopy.label}</Badge>
-          </div>
-          <p className="mt-2 text-sm leading-6 text-[#61586f]">
-            {order.question || "本次 GEO 服务问题待同步"}
-          </p>
-          <p className="mt-1 text-xs text-[#938b9f]">
-            业务订单 {order.orderId || order.reference} · 创建于{" "}
-            {displayDateTime(order.createdAt)}
-          </p>
-        </div>
-        <p className="max-w-md text-xs leading-5 text-[#716a80]">
-          {statusCopy.description}
-        </p>
-      </header>
-
-      {action === "prepare" && (
-        <div className="mt-4 grid gap-3 border-t border-[#e8e1ee] pt-4 lg:grid-cols-2">
-          <label className="text-xs font-semibold text-[#716a80]">
-            合同编号
-            <Input
-              className="mt-2 bg-white"
-              value={preparation.contractId}
-              maxLength={128}
-              placeholder="填写已生成合同的唯一编号"
-              onChange={(event) =>
-                setPreparation((current) => ({
-                  ...current,
-                  contractId: event.target.value,
-                }))
-              }
-            />
-          </label>
-          <label className="text-xs font-semibold text-[#716a80]">
-            HTTPS 签署链接
-            <Input
-              className="mt-2 bg-white"
-              type="url"
-              inputMode="url"
-              value={preparation.signingUrl}
-              placeholder="https://..."
-              onChange={(event) =>
-                setPreparation((current) => ({
-                  ...current,
-                  signingUrl: event.target.value,
-                }))
-              }
-            />
-          </label>
-          <div className="flex justify-end lg:col-span-2">
-            <Button
-              className="bg-[#5b2a86] hover:bg-[#49216c]"
-              disabled={
-                working ||
-                !preparation.contractId.trim() ||
-                !isSecureSigningUrl(preparation.signingUrl)
-              }
-              onClick={() => void onPrepare(order, preparation)}
-            >
-              {busy?.action === "prepare" ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Send className="h-4 w-4" />
-              )}
-              已发起签署
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {action === "confirm_signed" && (
-        <div className="mt-4 border-t border-[#e8e1ee] pt-4">
-          {order.signingUrl && isSecureSigningUrl(order.signingUrl) && (
-            <a
-              href={order.signingUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="mb-4 inline-flex items-center gap-1.5 text-xs font-semibold text-[#5b2a86]"
-            >
-              打开本单签署页面 <ExternalLink className="h-3.5 w-3.5" />
-            </a>
-          )}
-          <div className="grid gap-3 lg:grid-cols-2">
-            <label className="rounded-xl border border-[#e5dce9] bg-white p-3 text-xs font-semibold text-[#716a80]">
-              已签合同 PDF（必填，最大 20 MB）
-              <input
-                className="mt-2 block w-full text-xs font-normal file:mr-3 file:rounded-lg file:border-0 file:bg-[#f1eaf5] file:px-3 file:py-2 file:font-semibold file:text-[#5b2a86]"
-                type="file"
-                accept=".pdf,application/pdf"
-                disabled={working}
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  selectPdf("signedContract", file);
-                  if (file && validateManualOrderPdf(file))
-                    event.currentTarget.value = "";
-                }}
-              />
-              {signature.signedContract && (
-                <span className="mt-2 block font-normal text-[#484057]">
-                  {signature.signedContract.name} ·{" "}
-                  {(signature.signedContract.size / 1024 / 1024).toFixed(2)} MB
-                </span>
-              )}
-            </label>
-            <label className="rounded-xl border border-[#e5dce9] bg-white p-3 text-xs font-semibold text-[#716a80]">
-              签署报告 PDF（可选，最大 20 MB）
-              <input
-                className="mt-2 block w-full text-xs font-normal file:mr-3 file:rounded-lg file:border-0 file:bg-[#f1eaf5] file:px-3 file:py-2 file:font-semibold file:text-[#5b2a86]"
-                type="file"
-                accept=".pdf,application/pdf"
-                disabled={working}
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  selectPdf("signingReport", file);
-                  if (file && validateManualOrderPdf(file))
-                    event.currentTarget.value = "";
-                }}
-              />
-              {signature.signingReport && (
-                <span className="mt-2 block font-normal text-[#484057]">
-                  {signature.signingReport.name} ·{" "}
-                  {(signature.signingReport.size / 1024 / 1024).toFixed(2)} MB
-                </span>
-              )}
-            </label>
-            <label className="text-xs font-semibold text-[#716a80]">
-              实际签署时间
-              <Input
-                className="mt-2 bg-white"
-                type="datetime-local"
-                value={signature.signedAtLocal}
-                max={toDateTimeLocal(new Date())}
-                onChange={(event) =>
-                  setSignature((current) => ({
-                    ...current,
-                    signedAtLocal: event.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label className="text-xs font-semibold text-[#716a80]">
-              签署主体
-              <Input
-                className="mt-2 bg-white"
-                value={signature.signatoryId}
-                maxLength={128}
-                placeholder="企业全称 / 签署人 / 统一社会信用代码"
-                onChange={(event) =>
-                  setSignature((current) => ({
-                    ...current,
-                    signatoryId: event.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label className="text-xs font-semibold text-[#716a80] lg:col-span-2">
-              核验备注（必填，至少 8 个字）
-              <textarea
-                className="mt-2 min-h-20 w-full rounded-xl border border-input bg-white px-3 py-2 text-sm font-normal leading-6 text-[#332842] outline-none focus:border-[#5b2a86]"
-                value={signature.note}
-                maxLength={2000}
-                placeholder="记录核验渠道、文件差异或其他需要留痕的信息（至少 8 个字）"
-                onChange={(event) =>
-                  setSignature((current) => ({
-                    ...current,
-                    note: event.target.value,
-                  }))
-                }
-              />
-            </label>
-          </div>
-          {fileError && (
-            <p className="mt-3 text-xs font-medium text-[#ba2454]" role="alert">
-              {fileError}
-            </p>
-          )}
-          {uploadProgress && (
-            <p className="mt-3 text-xs text-[#5b2a86]" role="status">
-              {uploadProgress.label} {uploadProgress.percent}%
-            </p>
-          )}
-          <div className="mt-4 flex justify-end">
-            <Button
-              className="bg-[#5b2a86] hover:bg-[#49216c]"
-              disabled={
-                working ||
-                Boolean(validateManualOrderPdf(signature.signedContract)) ||
-                (signature.signingReport
-                  ? Boolean(validateManualOrderPdf(signature.signingReport))
-                  : false) ||
-                !signature.signedAtLocal ||
-                !signature.signatoryId.trim() ||
-                signature.note.trim().length < 8
-              }
-              onClick={() => void onConfirmSigned(order, signature)}
-            >
-              {busy?.action === "confirm_signed" ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <FileCheck2 className="h-4 w-4" />
-              )}
-              确认签署完成
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {action === "wait_payment" && (
-        <div className="mt-4 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50/70 p-4 text-amber-900">
-          <CreditCard className="mt-0.5 h-5 w-5 shrink-0" />
-          <div>
-            <p className="text-sm font-semibold">等待客户付款</p>
-            <p className="mt-1 text-xs leading-5">
-              此阶段只读，不允许提前开通。客户付款成功后，订单会进入“待企业设置账号”。
-            </p>
-          </div>
-        </div>
-      )}
-
-      {action === "wait_account" && (
-        <div className="mt-4 flex items-start gap-3 rounded-xl border border-sky-200 bg-sky-50/70 p-4 text-sky-900">
-          <KeyRound className="mt-0.5 h-5 w-5 shrink-0" />
-          <div>
-            <p className="text-sm font-semibold">等待企业设置登录账号</p>
-            <p className="mt-1 text-xs leading-5">
-              企业会在官网填写账号和密码；完成前不会开放管理员开通操作。
-            </p>
-          </div>
-        </div>
-      )}
-
-      {action === "activate" && (
-        <div className="mt-4 border-t border-[#e8e1ee] pt-4">
-          <dl className="grid gap-3 rounded-xl border border-emerald-200 bg-emerald-50/60 p-4 text-sm sm:grid-cols-3">
-            <div>
-              <dt className="text-xs text-[#716a80]">付款订单</dt>
-              <dd className="mt-1 break-all font-semibold text-[#332842]">
-                {paymentOrderId || "待确认"}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-xs text-[#716a80]">平台交易号</dt>
-              <dd className="mt-1 break-all font-semibold text-[#332842]">
-                {paymentTradeNo || "待确认"}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-xs text-[#716a80]">付款时间</dt>
-              <dd className="mt-1 font-semibold text-[#332842]">
-                {displayDateTime(paidAt)}
-              </dd>
-            </div>
-          </dl>
-          <div className="mt-4 flex justify-end">
-            <Button
-              className="bg-[#16794f] hover:bg-[#12623f]"
-              disabled={working || !paymentOrderId || !paidAt}
-              onClick={() => void onActivate(order)}
-            >
-              {busy?.action === "activate" ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <PackageCheck className="h-4 w-4" />
-              )}
-              确认到账并开通
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {(order.status === "pending_admin" ||
-        order.status === "signature_required") && (
-        <details className="mt-4 border-t border-[#eadfe5] pt-3">
-          <summary className="cursor-pointer text-xs font-semibold text-[#9a4664]">
-            异常处理：拒绝并终止订单
-          </summary>
-          <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-            <Input
-              className="bg-white"
-              value={rejectNote}
-              maxLength={2000}
-              placeholder="填写拒绝原因（至少 8 个字）"
-              onChange={(event) => setRejectNote(event.target.value)}
-            />
-            <Button
-              variant="outline"
-              className="shrink-0 border-[#d9aabb] text-[#a02652] hover:bg-[#fff5f8]"
-              disabled={working || rejectNote.trim().length < 8}
-              onClick={() => void onReject(order, rejectNote.trim())}
-            >
-              {busy?.action === "reject" ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <XCircle className="h-4 w-4" />
-              )}
-              拒绝订单
-            </Button>
-          </div>
-        </details>
-      )}
-    </article>
-  );
-}
-
 export default function AdminWorkspace({
   initialUserId = null,
   initialTab = "service",
@@ -874,7 +326,7 @@ export default function AdminWorkspace({
   });
   const [tab, setTab] = useState<WorkspaceTab>(initialTab);
   const [servicePlan, setServicePlan] = useState<
-    "basic" | "advanced" | "luxury"
+    "basic" | "knowledge" | "advanced" | "luxury"
   >("basic");
   const [serviceStatus, setServiceStatus] = useState<
     "pending_confirmation" | "scheduled" | "active" | "suspended" | "cancelled"
@@ -887,13 +339,8 @@ export default function AdminWorkspace({
   const [serviceSignedAt, setServiceSignedAt] = useState("");
   const [serviceSignatory, setServiceSignatory] = useState("");
   const [serviceEvidenceNote, setServiceEvidenceNote] = useState("");
+  const [customerApiKey, setCustomerApiKey] = useState("");
   const [carryQuestionIds, setCarryQuestionIds] = useState<string[]>([]);
-  const [manualOrderBusy, setManualOrderBusy] =
-    useState<ManualOrderBusyState>();
-  const [manualOrderUploadProgress, setManualOrderUploadProgress] = useState<
-    Record<string, { label: string; percent: number }>
-  >({});
-  const manualOrderLocksRef = useRef(new Set<string>());
   const [uploading, setUploading] = useState<"knowledge" | null>(null);
   const knowledgeFileRef = useRef<HTMLInputElement>(null);
 
@@ -954,11 +401,6 @@ export default function AdminWorkspace({
     enabled: Boolean(selectedUser),
     retry: false,
   });
-  const manualOrdersApi = (trpc.admin as any).manualOrders;
-  const manualOrdersQuery = manualOrdersApi.list.useQuery(undefined, {
-    enabled: Boolean(workspaceQuery.data?.isSystemAdmin),
-    retry: false,
-  });
   const usageQuery = trpc.admin.workspace.creditUsage.useQuery(queryInput, {
     enabled: Boolean(
       canViewSelectedUserUsage && selectedUser?.credential.configured,
@@ -990,6 +432,33 @@ export default function AdminWorkspace({
       toast.success("管理员分配已更新");
     },
   });
+  const replaceCredentialMutation =
+    trpc.admin.workspace.replaceCredential.useMutation({
+      onSuccess: async () => {
+        setCustomerApiKey("");
+        await Promise.all([workspaceQuery.refetch(), usageQuery.refetch()]);
+        toast.success("客户 API Key 已更新");
+      },
+      onError: (error) => toast.error(error.message),
+    });
+  const completeProvisioningMutation =
+    trpc.admin.workspace.completeProvisioning.useMutation({
+      onSuccess: async (result) => {
+        setCustomerApiKey("");
+        await Promise.all([
+          workspaceQuery.refetch(),
+          serviceQuery.refetch(),
+          questionPortfolioQuery.refetch(),
+          usageQuery.refetch(),
+        ]);
+        toast.success(
+          result.idempotent
+            ? "该客户已完成开通"
+            : "套餐、额度与 Key 已完成开通",
+        );
+      },
+      onError: (error) => toast.error(error.message),
+    });
   const updateServiceMutation = (
     trpc.admin.workspace as any
   ).updateService.useMutation({
@@ -1022,29 +491,12 @@ export default function AdminWorkspace({
       toast.success("问题已确认启动并计入额度");
     },
   });
-  const prepareManualOrderMutation = manualOrdersApi.prepare.useMutation();
-  const confirmSignedManualOrderMutation =
-    manualOrdersApi.confirmSigned.useMutation();
-  const activateManualOrderMutation = manualOrdersApi.activate.useMutation();
-  const rejectManualOrderMutation = manualOrdersApi.reject.useMutation();
-
-  const manualOrders = useMemo(() => {
-    const value =
-      manualOrdersQuery.data?.orders ?? manualOrdersQuery.data?.manualOrders;
-    if (!Array.isArray(value)) return [] as ManualOrder[];
-    return (value as ManualOrder[]).filter(
-      (order) =>
-        order &&
-        order.status !== "active" &&
-        manualOrderPrimaryAction(order.status) !== null,
-    );
-  }, [manualOrdersQuery.data?.manualOrders, manualOrdersQuery.data?.orders]);
-
   useEffect(() => {
     const service = serviceQuery.data?.service;
     const nextPlan = service?.planCode;
     if (
       nextPlan === "basic" ||
+      nextPlan === "knowledge" ||
       nextPlan === "advanced" ||
       nextPlan === "luxury"
     ) {
@@ -1150,200 +602,6 @@ export default function AdminWorkspace({
     }
   };
 
-  const refreshManualOrders = async () => {
-    await Promise.all([manualOrdersQuery.refetch(), workspaceQuery.refetch()]);
-  };
-
-  const runManualOrderAction = async (
-    order: ManualOrder,
-    action: ManualOrderBusyState["action"],
-    work: () => Promise<unknown>,
-    successMessage: string,
-  ) => {
-    const lockKey = order.reference;
-    if (manualOrderLocksRef.current.has(lockKey)) return;
-    manualOrderLocksRef.current.add(lockKey);
-    setManualOrderBusy({ reference: order.reference, action });
-    try {
-      await work();
-      await refreshManualOrders();
-      toast.success(successMessage, {
-        description: order.companyName || order.orderId || order.reference,
-      });
-    } catch (error) {
-      toast.error("订单处理失败", {
-        description: manualOrderError(error),
-      });
-    } finally {
-      manualOrderLocksRef.current.delete(lockKey);
-      setManualOrderBusy((current) =>
-        current?.reference === order.reference && current.action === action
-          ? undefined
-          : current,
-      );
-      setManualOrderUploadProgress((current) => {
-        if (!(order.reference in current)) return current;
-        const next = { ...current };
-        delete next[order.reference];
-        return next;
-      });
-    }
-  };
-
-  const handlePrepareManualOrder = async (
-    order: ManualOrder,
-    draft: ManualOrderPreparationDraft,
-  ) => {
-    const contractId = draft.contractId.trim();
-    const signingUrl = draft.signingUrl.trim();
-    if (!contractId) {
-      toast.error("请填写合同编号");
-      return;
-    }
-    if (!isSecureSigningUrl(signingUrl)) {
-      toast.error("签署链接必须是有效的 HTTPS 地址");
-      return;
-    }
-    await runManualOrderAction(
-      order,
-      "prepare",
-      () =>
-        prepareManualOrderMutation.mutateAsync({
-          reference: order.reference,
-          contractId,
-          signingUrl,
-        }),
-      "签署已发起",
-    );
-  };
-
-  const uploadManualOrderPdf = async (
-    order: ManualOrder,
-    file: File,
-    label: string,
-    sha256: string,
-  ): Promise<UploadedManualOrderFile> => {
-    setManualOrderUploadProgress((current) => ({
-      ...current,
-      [order.reference]: { label, percent: 0 },
-    }));
-    const uploaded = await uploadFile(file, (percent) => {
-      setManualOrderUploadProgress((current) => ({
-        ...current,
-        [order.reference]: { label, percent },
-      }));
-    });
-    return {
-      ...uploaded,
-      sha256,
-    };
-  };
-
-  const handleConfirmSignedManualOrder = async (
-    order: ManualOrder,
-    draft: ManualOrderSignatureDraft,
-  ) => {
-    const signedContractError = validateManualOrderPdf(draft.signedContract);
-    if (signedContractError) {
-      toast.error("已签合同不可用", { description: signedContractError });
-      return;
-    }
-    if (draft.signingReport) {
-      const signingReportError = validateManualOrderPdf(draft.signingReport);
-      if (signingReportError) {
-        toast.error("签署报告不可用", { description: signingReportError });
-        return;
-      }
-    }
-    const signedAt = new Date(draft.signedAtLocal).getTime();
-    if (!Number.isFinite(signedAt) || signedAt > Date.now()) {
-      toast.error("请填写真实且不晚于当前时间的签署时间");
-      return;
-    }
-    const signatoryId = draft.signatoryId.trim();
-    if (!signatoryId) {
-      toast.error("请填写签署主体");
-      return;
-    }
-    const note = draft.note.trim();
-    if (note.length < 8) {
-      toast.error("请填写至少 8 个字的核验备注");
-      return;
-    }
-    const signedContract = draft.signedContract!;
-    await runManualOrderAction(
-      order,
-      "confirm_signed",
-      async () => {
-        setManualOrderUploadProgress((current) => ({
-          ...current,
-          [order.reference]: { label: "正在计算文件校验值", percent: 0 },
-        }));
-        const [signedContractSha256, signingReportSha256] = await Promise.all([
-          sha256ManualOrderFile(signedContract),
-          draft.signingReport
-            ? sha256ManualOrderFile(draft.signingReport)
-            : Promise.resolve(undefined),
-        ]);
-        const uploadedSignedContract = await uploadManualOrderPdf(
-          order,
-          signedContract,
-          "正在上传已签合同",
-          signedContractSha256,
-        );
-        const uploadedSigningReport =
-          draft.signingReport && signingReportSha256
-            ? await uploadManualOrderPdf(
-                order,
-                draft.signingReport,
-                "正在上传签署报告",
-                signingReportSha256,
-              )
-            : undefined;
-        return confirmSignedManualOrderMutation.mutateAsync({
-          reference: order.reference,
-          signedPdf: uploadedSignedContract,
-          ...(uploadedSigningReport
-            ? { evidenceReport: uploadedSigningReport }
-            : {}),
-          signedAt,
-          signatoryId,
-          note,
-        });
-      },
-      "签署证据已确认",
-    );
-  };
-
-  const handleActivateManualOrder = async (order: ManualOrder) => {
-    await runManualOrderAction(
-      order,
-      "activate",
-      () =>
-        activateManualOrderMutation.mutateAsync({
-          reference: order.reference,
-        }),
-      "到账已确认，服务正在开通",
-    );
-  };
-
-  const handleRejectManualOrder = async (order: ManualOrder, note: string) => {
-    if (note.trim().length < 8) {
-      toast.error("请填写至少 8 个字的拒绝原因");
-      return;
-    }
-    await runManualOrderAction(
-      order,
-      "reject",
-      () =>
-        rejectManualOrderMutation.mutateAsync({
-          reference: order.reference,
-          note: note.trim(),
-        }),
-      "订单已拒绝",
-    );
-  };
-
   return (
     <PortalShell
       eyebrow="管理中心 · 客户与服务"
@@ -1361,26 +619,11 @@ export default function AdminWorkspace({
             variant="outline"
             size="sm"
             className="border-[#e1d8e8] bg-white"
-            disabled={
-              workspaceQuery.isFetching ||
-              (Boolean(workspaceQuery.data?.isSystemAdmin) &&
-                manualOrdersQuery.isFetching)
-            }
-            onClick={() =>
-              void Promise.all([
-                workspaceQuery.refetch(),
-                ...(workspaceQuery.data?.isSystemAdmin
-                  ? [manualOrdersQuery.refetch()]
-                  : []),
-              ])
-            }
+            disabled={workspaceQuery.isFetching}
+            onClick={() => void workspaceQuery.refetch()}
           >
             <RefreshCw
-              className={`h-4 w-4 ${
-                workspaceQuery.isFetching || manualOrdersQuery.isFetching
-                  ? "animate-spin"
-                  : ""
-              }`}
+              className={`h-4 w-4 ${workspaceQuery.isFetching ? "animate-spin" : ""}`}
             />
             刷新
           </Button>
@@ -1392,6 +635,15 @@ export default function AdminWorkspace({
           open={createClientOpen}
           onOpenChange={setCreateClientOpen}
           userOnly
+          deliveryAdmins={(workspaceQuery.data?.admins ?? [])
+            .filter(
+              (admin) =>
+                admin.adminAccessLevel === "delivery_admin" && admin.isActive,
+            )
+            .map((admin) => ({
+              ...admin,
+              username: admin.username || `delivery-admin-${admin.id}`,
+            }))}
           onCreated={(userId) => {
             setSelectedUserId(userId);
             void workspaceQuery.refetch();
@@ -1404,91 +656,6 @@ export default function AdminWorkspace({
           <p className="mt-1 leading-6">
             {workspaceQuery.error.message || "请检查连接后重试。"}
           </p>
-        </PortalCard>
-      )}
-
-      {workspaceQuery.data?.isSystemAdmin && (
-        <PortalCard className="mb-5 p-5 sm:p-6">
-          <div className="flex flex-col gap-4 border-b border-[#eee8f2] pb-5 lg:flex-row lg:items-start lg:justify-between">
-            <div>
-              <div className="flex items-center gap-2">
-                <ShieldCheck className="h-5 w-5 text-[#5b2a86]" />
-                <h2 className="font-semibold text-[#171321]">
-                  人工签约与开通待办
-                </h2>
-              </div>
-              <p className="mt-2 max-w-3xl text-sm leading-6 text-[#716a80]">
-                严格按“管理员发起签署 → 核验已签文件 → 客户付款 → 企业设置账号 →
-                确认到账并开通”推进。每个状态只开放当前阶段的操作，签署确认不会自动开户。
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-2 text-xs">
-              {(
-                [
-                  ["pending_admin", "待发签"],
-                  ["signature_required", "待核签"],
-                  ["payment_required", "待付款"],
-                  ["account_setup_required", "待设账号"],
-                  ["activation_required", "待开通"],
-                ] as const
-              ).map(([status, label]) => (
-                <span
-                  key={status}
-                  className="rounded-full border border-[#e2d8e8] bg-[#faf7fc] px-3 py-1.5 text-[#716a80]"
-                >
-                  {label}{" "}
-                  <strong className="text-[#332842]">
-                    {
-                      manualOrders.filter((order) => order.status === status)
-                        .length
-                    }
-                  </strong>
-                </span>
-              ))}
-            </div>
-          </div>
-
-          <div className="mt-5 space-y-4">
-            {manualOrdersQuery.isLoading ? (
-              <p className="py-10 text-center text-sm text-[#716a80]">
-                正在读取人工订单…
-              </p>
-            ) : manualOrdersQuery.error ? (
-              <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
-                <p className="font-semibold">人工订单暂时无法读取</p>
-                <p className="mt-1 text-xs">
-                  {manualOrdersQuery.error.message || "请刷新后重试"}
-                </p>
-              </div>
-            ) : manualOrders.length > 0 ? (
-              manualOrders.map((order) => (
-                <ManualOrderCard
-                  key={order.reference}
-                  order={order}
-                  busy={
-                    manualOrderBusy?.reference === order.reference
-                      ? manualOrderBusy
-                      : undefined
-                  }
-                  uploadProgress={manualOrderUploadProgress[order.reference]}
-                  onPrepare={handlePrepareManualOrder}
-                  onConfirmSigned={handleConfirmSignedManualOrder}
-                  onActivate={handleActivateManualOrder}
-                  onReject={handleRejectManualOrder}
-                />
-              ))
-            ) : (
-              <div className="rounded-xl border border-dashed border-[#ded4e5] py-10 text-center">
-                <FileCheck2 className="mx-auto h-6 w-6 text-[#9a94a8]" />
-                <p className="mt-3 text-sm font-medium text-[#484057]">
-                  当前没有人工订单待办
-                </p>
-                <p className="mt-1 text-xs text-[#9a94a8]">
-                  已开通订单不会继续显示在此队列。
-                </p>
-              </div>
-            )}
-          </div>
         </PortalCard>
       )}
 
@@ -1556,9 +723,11 @@ export default function AdminWorkspace({
                         ? "进阶版"
                         : account.service?.planCode === "luxury"
                           ? "豪华版"
-                          : account.service?.planCode === "basic"
-                            ? "基础版"
-                            : "版本待配置"}
+                          : account.service?.planCode === "knowledge"
+                            ? "知识库版"
+                            : account.service?.planCode === "basic"
+                              ? "普通版"
+                              : "版本待配置"}
                     </Badge>
                     <Badge variant="secondary" className="text-xs">
                       管理员 {account.assignedAdmins.length}
@@ -1566,16 +735,16 @@ export default function AdminWorkspace({
                     <Badge
                       variant="secondary"
                       className={`text-xs ${
-                        account.usageOwner && account.credential.configured
+                        account.credential.configured
                           ? "text-[#16794f]"
                           : "text-[#c06f00]"
                       }`}
                     >
-                      {account.usageOwner
-                        ? account.credential.configured
-                          ? "共享 Key 可用"
-                          : "共享 Key 待配置"
-                        : "Key 归属待指定"}
+                      {account.credential.configured
+                        ? account.credential.inherited
+                          ? "历史共享 Key"
+                          : "客户 Key 可用"
+                        : "客户 Key 待配置"}
                     </Badge>
                   </div>
                 </button>
@@ -1779,13 +948,18 @@ export default function AdminWorkspace({
                             onChange={(event) => {
                               const nextPlan = event.target.value as
                                 | "basic"
+                                | "knowledge"
                                 | "advanced"
                                 | "luxury";
                               setServicePlan(nextPlan);
+                              if (nextPlan === "knowledge") {
+                                setCarryQuestionIds([]);
+                              }
                             }}
                             className="mt-2 h-10 w-full rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#332842]"
                           >
-                            <option value="basic">基础版 · 30 天单题</option>
+                            <option value="basic">普通版 · 30 天单题</option>
+                            <option value="knowledge">知识库版</option>
                             <option value="advanced">进阶版</option>
                             <option value="luxury">豪华版</option>
                           </select>
@@ -1883,54 +1057,55 @@ export default function AdminWorkspace({
                           />
                         </label>
 
-                        {(questionPortfolioQuery.data?.questions ?? []).some(
-                          (question: any) => question.status === "selected",
-                        ) && (
-                          <div className="lg:col-span-3 rounded-2xl border border-[#e7dced] bg-[#fbf9fd] p-4">
-                            <p className="text-sm font-semibold text-[#332842]">
-                              升级后继续服务的问题
-                            </p>
-                            <p className="mt-1 text-xs leading-5 text-[#857e91]">
-                              已勾选问题会复制到新套餐并计入对应分类额度；若超额，保存会被服务端拒绝，必须先明确保留项。
-                            </p>
-                            <div className="mt-3 space-y-2">
-                              {(questionPortfolioQuery.data?.questions ?? [])
-                                .filter(
-                                  (question: any) =>
-                                    question.status === "selected",
-                                )
-                                .map((question: any) => (
-                                  <label
-                                    key={question.id}
-                                    className="flex items-start gap-3 rounded-xl bg-white p-3 text-sm text-[#484057]"
-                                  >
-                                    <input
-                                      type="checkbox"
-                                      className="mt-1"
-                                      checked={carryQuestionIds.includes(
-                                        question.id,
-                                      )}
-                                      onChange={(event) =>
-                                        setCarryQuestionIds((current) =>
-                                          event.target.checked
-                                            ? [
-                                                ...new Set([
-                                                  ...current,
-                                                  question.id,
-                                                ]),
-                                              ]
-                                            : current.filter(
-                                                (id) => id !== question.id,
-                                              ),
-                                        )
-                                      }
-                                    />
-                                    <span>{question.question}</span>
-                                  </label>
-                                ))}
+                        {servicePlan !== "knowledge" &&
+                          (questionPortfolioQuery.data?.questions ?? []).some(
+                            (question: any) => question.status === "selected",
+                          ) && (
+                            <div className="lg:col-span-3 rounded-2xl border border-[#e7dced] bg-[#fbf9fd] p-4">
+                              <p className="text-sm font-semibold text-[#332842]">
+                                升级后继续服务的问题
+                              </p>
+                              <p className="mt-1 text-xs leading-5 text-[#857e91]">
+                                已勾选问题会复制到新套餐并计入对应分类额度；若超额，保存会被服务端拒绝，必须先明确保留项。
+                              </p>
+                              <div className="mt-3 space-y-2">
+                                {(questionPortfolioQuery.data?.questions ?? [])
+                                  .filter(
+                                    (question: any) =>
+                                      question.status === "selected",
+                                  )
+                                  .map((question: any) => (
+                                    <label
+                                      key={question.id}
+                                      className="flex items-start gap-3 rounded-xl bg-white p-3 text-sm text-[#484057]"
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        className="mt-1"
+                                        checked={carryQuestionIds.includes(
+                                          question.id,
+                                        )}
+                                        onChange={(event) =>
+                                          setCarryQuestionIds((current) =>
+                                            event.target.checked
+                                              ? [
+                                                  ...new Set([
+                                                    ...current,
+                                                    question.id,
+                                                  ]),
+                                                ]
+                                              : current.filter(
+                                                  (id) => id !== question.id,
+                                                ),
+                                          )
+                                        }
+                                      />
+                                      <span>{question.question}</span>
+                                    </label>
+                                  ))}
+                              </div>
                             </div>
-                          </div>
-                        )}
+                          )}
 
                         <div className="lg:col-span-3 flex justify-end">
                           <Button
@@ -2307,6 +1482,9 @@ export default function AdminWorkspace({
                     userId={selectedUser.id}
                     workspace={dashboardQuery.data}
                     loading={dashboardQuery.isLoading}
+                    profileOnly={
+                      serviceQuery.data?.service?.planCode === "knowledge"
+                    }
                     authoritativeQuestions={
                       serviceQuery.data?.purchasedQuestions
                     }
@@ -2323,15 +1501,17 @@ export default function AdminWorkspace({
                       ]);
                     }}
                   />
-                  <DashboardVersionHistory
-                    userId={selectedUser.id}
-                    onWorkspaceChanged={async () => {
-                      await Promise.all([
-                        dashboardQuery.refetch(),
-                        workspaceQuery.refetch(),
-                      ]);
-                    }}
-                  />
+                  {serviceQuery.data?.service?.planCode !== "knowledge" && (
+                    <DashboardVersionHistory
+                      userId={selectedUser.id}
+                      onWorkspaceChanged={async () => {
+                        await Promise.all([
+                          dashboardQuery.refetch(),
+                          workspaceQuery.refetch(),
+                        ]);
+                      }}
+                    />
+                  )}
                 </div>
               ))}
 
@@ -2551,35 +1731,32 @@ export default function AdminWorkspace({
                   <div className="flex items-center gap-2">
                     <KeyRound className="h-5 w-5 text-[#5b2a86]" />
                     <h3 className="font-semibold text-[#171321]">
-                      共享 Key 归属
+                      客户 API Key
                     </h3>
                   </div>
                   <div className="mt-5 rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-sm text-[#716a80]">
-                        负责交付管理员
-                      </span>
+                      <span className="text-sm text-[#716a80]">主负责人</span>
                       <Badge
                         className={
-                          selectedUser.usageOwner &&
                           selectedUser.credential.configured
                             ? "bg-[#16794f]/10 text-[#16794f]"
                             : "bg-[#c89013]/10 text-[#9a6900]"
                         }
                       >
-                        {selectedUser.usageOwner
-                          ? selectedUser.credential.configured
-                            ? "共享 Key 可用"
-                            : "共享 Key 待配置"
-                          : "待指定"}
+                        {selectedUser.credential.configured
+                          ? selectedUser.credential.inherited
+                            ? "历史共享 Key"
+                            : "客户 Key 可用"
+                          : "客户 Key 待配置"}
                       </Badge>
                     </div>
                     <p className="mt-3 text-base font-semibold text-[#332842]">
                       {selectedUser.usageOwner
                         ? usageOwnerAdmin?.displayName ||
                           usageOwnerAdmin?.username ||
-                          `交付管理员 ${selectedUser.usageOwner.adminId}`
-                        : "尚未指定积分与 Key 归属管理员"}
+                          `管理员 ${selectedUser.usageOwner.adminId}`
+                        : "尚未指定主负责人"}
                     </p>
                     {usageOwnerAdmin?.username && (
                       <p className="mt-1 text-xs text-[#9a94a8]">
@@ -2593,12 +1770,81 @@ export default function AdminWorkspace({
                     )}
                   </div>
                   <p className="mt-4 text-sm leading-6 text-[#716a80]">
-                    {selectedUser.usageOwner
-                      ? "该用户不单独保存 API Key。用户任务与负责管理员自己的 FrontMind Agent 共用同一个 Key；Key 的录入和更换由该管理员在自己的设置中完成。"
-                      : workspaceQuery.data?.isSystemAdmin
-                        ? "请先在上方“负责管理员”中指定一名积分与 Key 归属管理员。系统不会继续为普通用户维护独立 API Key。"
-                        : "该用户尚未完成共享 Key 归属配置，请联系系统管理员指定负责交付管理员。"}
+                    客户 Key 按账号独立加密和版本化；客户自己的有效 Key
+                    始终优先于历史共享 Key。设置或更换主负责人不会废弃该 Key。
                   </p>
+                  <div className="mt-5 space-y-3 border-t border-[#eee8f2] pt-5">
+                    <Input
+                      type="password"
+                      autoComplete="off"
+                      aria-label="客户 API Key"
+                      value={customerApiKey}
+                      onChange={(event) =>
+                        setCustomerApiKey(event.target.value)
+                      }
+                      placeholder={
+                        selectedUser.service?.status === "pending_confirmation"
+                          ? "输入 Key 并完成现有账号开通"
+                          : "输入新的客户 API Key"
+                      }
+                    />
+                    <Button
+                      className="w-full"
+                      disabled={
+                        !customerApiKey.trim() ||
+                        replaceCredentialMutation.isPending ||
+                        completeProvisioningMutation.isPending ||
+                        (selectedUser.service?.status ===
+                          "pending_confirmation" &&
+                          !selectedUser.usageOwner?.adminId) ||
+                        (selectedUser.service?.status ===
+                          "pending_confirmation" &&
+                          !workspaceQuery.data?.isSystemAdmin)
+                      }
+                      onClick={() => {
+                        if (
+                          selectedUser.service?.status ===
+                          "pending_confirmation"
+                        ) {
+                          completeProvisioningMutation.mutate({
+                            userId: selectedUser.id,
+                            expectedRevision: selectedUser.service.revision,
+                            deliveryAdminId: selectedUser.usageOwner!.adminId,
+                            apiKey: customerApiKey.trim(),
+                          });
+                          return;
+                        }
+                        replaceCredentialMutation.mutate({
+                          userId: selectedUser.id,
+                          apiKey: customerApiKey.trim(),
+                          reason: "客户交付工作台更新客户自有 Key",
+                        });
+                      }}
+                    >
+                      {(replaceCredentialMutation.isPending ||
+                        completeProvisioningMutation.isPending) && (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      )}
+                      {selectedUser.service?.status === "pending_confirmation"
+                        ? "完成套餐、额度与 Key 开通"
+                        : selectedUser.credential.inherited
+                          ? "设置客户自有 Key"
+                          : "验证并更新客户 Key"}
+                    </Button>
+                    {selectedUser.service?.status === "pending_confirmation" &&
+                      !workspaceQuery.data?.isSystemAdmin && (
+                        <p className="text-xs leading-5 text-[#9a6900]">
+                          该历史账号需由系统管理员完成一次性开通。
+                        </p>
+                      )}
+                    {selectedUser.service?.status === "pending_confirmation" &&
+                      workspaceQuery.data?.isSystemAdmin &&
+                      !selectedUser.usageOwner?.adminId && (
+                        <p className="text-xs leading-5 text-[#9a6900]">
+                          请先在客户概览中分配一位已启用的交付管理员作为主负责人，再完成历史账号开通。
+                        </p>
+                      )}
+                  </div>
                 </PortalCard>
 
                 <PortalCard className="p-5 sm:p-6">
@@ -2639,7 +1885,7 @@ export default function AdminWorkspace({
                     </div>
                     <div className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
                       <p className="text-xs font-semibold text-[#716a80]">
-                        共享 Key 总消耗
+                        当前 Key 总消耗
                       </p>
                       <p className="mt-2 text-3xl font-semibold text-[#332842]">
                         {(usageQuery.data?.totalUsed ?? 0).toLocaleString(
@@ -2649,20 +1895,20 @@ export default function AdminWorkspace({
                     </div>
                   </div>
                   <p className="mt-3 text-xs leading-5 text-[#9a94a8]">
-                    共享 Key 总消耗来自上游 Key 池，可能还包含负责管理员自己的
-                    FrontMind Agent
-                    任务及其他账号任务，因此不要求与该用户使用量相等。
+                    当前 Key 总消耗来自上游 Key 池；若同一原始 Key
+                    分配给多个账号，可能包含其他账号任务，因此不要求与该用户使用量相等。
                   </p>
                   {usageQuery.data?.complete === false && (
                     <p className="mt-3 rounded-xl border border-[#ead7a5] bg-[#fffaf0] px-3 py-2 text-xs leading-5 text-[#8a6200]">
-                      当前 Key 的本月任务量超过单次同步上限，数据尚未完整，请稍后重试后再据此更换
+                      当前 Key
+                      的本月任务量超过单次同步上限，数据尚未完整，请稍后重试后再据此更换
                       Key。
                     </p>
                   )}
                   <div className="mt-5 max-h-[330px] divide-y divide-[#eee8f2] overflow-y-auto custom-scrollbar">
                     {!selectedUser.credential.configured ? (
                       <p className="py-8 text-center text-sm text-[#716a80]">
-                        负责管理员尚未配置共享 Key
+                        该客户尚未配置可用 Key
                       </p>
                     ) : usageQuery.isLoading ? (
                       <p className="py-8 text-center text-sm text-[#716a80]">
@@ -2703,8 +1949,9 @@ export default function AdminWorkspace({
 
             {tab === "credential" && !canViewSelectedUserUsage && (
               <PortalCard className="p-6 text-sm leading-6 text-[#716a80]">
-                该用户的共享 Key 与积分由其归属交付管理员维护。协作管理员可以继续处理交付内容，但不能查看其他管理员 Key
-                池的积分信息。
+                该用户的客户 Key
+                与积分由主负责人维护。协作管理员可以继续处理交付内容，但不能查看该客户的
+                Key 使用信息。
               </PortalCard>
             )}
 

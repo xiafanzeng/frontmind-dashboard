@@ -74,7 +74,7 @@ function response(
             ? "付款已确认，请设置用于登录服务看板的账号和密码"
             : status === "activation_required"
               ? "账号资料已提交，正在自动开通服务"
-              : "服务账号与基础版权益已开通",
+              : "服务账号与普通版权益已开通",
       updatedAt: "2026-07-26T10:20:00.000Z",
       ...(status === "activation_required" || status === "active"
         ? { provisioningReference: "provision-manual-001" }

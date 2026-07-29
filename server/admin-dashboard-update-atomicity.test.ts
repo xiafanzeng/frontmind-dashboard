@@ -5,6 +5,7 @@ const dependencies = vi.hoisted(() => ({
   getDashboardWorkspace: vi.fn(),
   updateDashboardWorkspace: vi.fn(),
   assertServiceCapability: vi.fn(),
+  getServicePortal: vi.fn(),
   writeWorkspaceAuditEvent: vi.fn(),
 }));
 
@@ -27,6 +28,7 @@ vi.mock("./service-entitlement", async () => {
   return {
     ...actual,
     assertServiceCapability: dependencies.assertServiceCapability,
+    getServicePortal: dependencies.getServicePortal,
   };
 });
 
@@ -44,6 +46,8 @@ import type { TrpcContext } from "./_core/context";
 import { adminRouter } from "./admin-router";
 import type { AuthenticatedUser } from "./auth-service";
 import { createDefaultDashboardPayload } from "../shared/dashboard";
+
+let existingPayload = createDefaultDashboardPayload("正式企业");
 
 const ACTOR: AuthenticatedUser = {
   id: 7,
@@ -71,11 +75,18 @@ function context(): TrpcContext {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  const payload = createDefaultDashboardPayload("正式企业");
+  existingPayload = createDefaultDashboardPayload("正式企业");
   dependencies.getManagedCredentialStatus.mockResolvedValue({});
   dependencies.assertServiceCapability.mockResolvedValue({});
+  dependencies.getServicePortal.mockResolvedValue({
+    service: { planCode: "advanced" },
+    capabilities: {
+      contentAssets: { allowed: true },
+      knowledgeBuild: { allowed: true },
+    },
+  });
   dependencies.getDashboardWorkspace.mockResolvedValue({
-    payload,
+    payload: existingPayload,
     sourceName: "管理员结构化编辑",
     enterpriseIdentityBoundAt: Date.parse("2026-07-01T00:00:00.000Z"),
     revision: 3,
@@ -146,5 +157,49 @@ describe("admin dashboard structured publication", () => {
       }),
       { transaction: "dashboard-write" },
     );
+  });
+
+  it("lets a knowledge-only workspace publish enterprise profile fields", async () => {
+    dependencies.getServicePortal.mockResolvedValue({
+      service: { planCode: "knowledge" },
+      capabilities: {
+        contentAssets: { allowed: false },
+        knowledgeBuild: { allowed: true },
+      },
+    });
+    const payload = structuredClone(existingPayload);
+    payload.headline = "知识库版企业简介";
+    payload.summary = "管理员核验后的企业资料。";
+    const caller = adminRouter.createCaller(context());
+
+    await expect(
+      caller.workspace.updateDashboard({
+        userId: 42,
+        expectedRevision: 3,
+        payload,
+      }),
+    ).resolves.toMatchObject({ revision: 4 });
+  });
+
+  it("rejects non-profile publication for a knowledge-only workspace", async () => {
+    dependencies.getServicePortal.mockResolvedValue({
+      service: { planCode: "knowledge" },
+      capabilities: {
+        contentAssets: { allowed: false },
+        knowledgeBuild: { allowed: true },
+      },
+    });
+    const payload = structuredClone(existingPayload);
+    payload.metrics = [{ label: "不可发布指标", value: 99, unit: "项" }];
+    const caller = adminRouter.createCaller(context());
+
+    await expect(
+      caller.workspace.updateDashboard({
+        userId: 42,
+        expectedRevision: 3,
+        payload,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(dependencies.updateDashboardWorkspace).not.toHaveBeenCalled();
   });
 });

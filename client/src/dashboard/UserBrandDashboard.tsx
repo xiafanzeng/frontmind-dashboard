@@ -171,6 +171,7 @@ const semanticSubpages = [
 function previewDeliveryQuota(planCode, type, used = 0) {
   const limits = {
     basic: { content_asset_publish: 1, website_content_publish: 0 },
+    knowledge: { content_asset_publish: 0, website_content_publish: 0 },
     advanced: { content_asset_publish: 5, website_content_publish: 20 },
     luxury: { content_asset_publish: 20, website_content_publish: 100 },
     unknown: { content_asset_publish: 0, website_content_publish: 0 },
@@ -187,7 +188,7 @@ function previewDeliveryQuota(planCode, type, used = 0) {
     periodId: `preview-${planCode}`,
     validFrom: null,
     validUntil: null,
-    reason: limit > 0 ? null : "基础版暂不包含此项工单服务，历史记录仍可查看。",
+    reason: limit > 0 ? null : "当前版本不包含此项工单服务，历史记录仍可查看。",
   };
 }
 
@@ -588,10 +589,10 @@ type PreviewUserBrandDashboardProps = {
     payload: ContentAssetRequestPayload,
   ) => void | Promise<void>;
   contentRequestUsage?: number;
-  planCode?: "basic" | "advanced" | "luxury" | "unknown";
+  planCode?: "basic" | "knowledge" | "advanced" | "luxury" | "unknown";
   fixtures?: {
     getServicePortal: (
-      planCode: "basic" | "advanced" | "luxury",
+      planCode: "basic" | "knowledge" | "advanced" | "luxury",
     ) => unknown;
     contentAssetCatalog: readonly unknown[];
     overview: { brand: string };
@@ -762,7 +763,11 @@ function PersistentUserBrandDashboard({
       refetchIntervalInBackground: false,
     },
   );
+  const servicePortalView = normalizeServicePortal(servicePortalQuery.data);
+  const deliveryOperationsEnabled =
+    servicePortalView.capabilities.contentAssets.allowed;
   const dashboardQuery = trpc.workspace.dashboard.useQuery(undefined, {
+    enabled: deliveryOperationsEnabled,
     retry: false,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
@@ -773,6 +778,7 @@ function PersistentUserBrandDashboard({
   const deliveryWorkspaceQuery = deliveryTicketApi.workspace.useQuery(
     undefined,
     {
+      enabled: deliveryOperationsEnabled,
       retry: false,
       refetchOnMount: "always",
       refetchOnWindowFocus: true,
@@ -783,7 +789,7 @@ function PersistentUserBrandDashboard({
   const icpChecklistQuery = deliveryTicketApi.icpChecklist.useQuery(
     { province: icpProvince },
     {
-      enabled: Boolean(icpProvince),
+      enabled: deliveryOperationsEnabled && Boolean(icpProvince),
       retry: false,
       refetchOnWindowFocus: false,
     },
@@ -791,6 +797,7 @@ function PersistentUserBrandDashboard({
   const contentDeliveryTicketsQuery = deliveryTicketApi.list.useInfiniteQuery(
     { type: "content_asset", limit: 20 },
     {
+      enabled: deliveryOperationsEnabled,
       retry: false,
       refetchOnMount: "always",
       refetchOnWindowFocus: true,
@@ -802,6 +809,7 @@ function PersistentUserBrandDashboard({
   const websiteDeliveryTicketsQuery = deliveryTicketApi.list.useInfiniteQuery(
     { type: "website_operation", limit: 20 },
     {
+      enabled: deliveryOperationsEnabled,
       retry: false,
       refetchOnMount: "always",
       refetchOnWindowFocus: true,
@@ -817,7 +825,7 @@ function PersistentUserBrandDashboard({
         selectedDeliveryTicketId || "00000000-0000-4000-8000-000000000000",
     },
     {
-      enabled: Boolean(selectedDeliveryTicketId),
+      enabled: deliveryOperationsEnabled && Boolean(selectedDeliveryTicketId),
       retry: false,
       refetchOnWindowFocus: false,
     },
@@ -1166,10 +1174,7 @@ function UserBrandDashboardContent({
       description: "管理员会核验权限、资料与实施范围后更新处理状态。",
     });
   };
-  const capabilityKey =
-    route.section === "semantic"
-      ? null
-      : getRouteCapability(route.section, route.sub);
+  const capabilityKey = getRouteCapability(route.section, route.sub);
   const routeAccess = capabilityKey
     ? getCapability(servicePortal, capabilityKey)
     : null;
@@ -1250,14 +1255,15 @@ function UserBrandDashboardContent({
                 onRefresh={onRefreshServicePortal}
                 onOpenAccount={() => setAccountOpen(true)}
               />
-              {!previewMode && (
-                <ManagedDashboardSection
-                  payload={managedPayload}
-                  loading={dashboardLoading}
-                  error={dashboardError}
-                  embedded
-                />
-              )}
+              {!previewMode &&
+                getCapability(servicePortal, "contentAssets").allowed && (
+                  <ManagedDashboardSection
+                    payload={managedPayload}
+                    loading={dashboardLoading}
+                    error={dashboardError}
+                    embedded
+                  />
+                )}
             </>
           ) : routeLocked ? (
             <ServiceLockedPage
@@ -1289,9 +1295,7 @@ function UserBrandDashboardContent({
                       : undefined
                   }
                   overrideError={
-                    previewMode
-                      ? "未找到该只读历史问题或预览结果。"
-                      : undefined
+                    previewMode ? "未找到该只读历史问题或预览结果。" : undefined
                   }
                 />
               )}
@@ -1722,11 +1726,19 @@ export function ManagedDashboardSection({
       />
     );
   }
-  if (error || !payload) {
+  if (error) {
     return (
       <ManagedModuleEmpty
         title="品牌资料"
         description="当前企业内容暂时无法载入，请稍后刷新。"
+      />
+    );
+  }
+  if (!payload) {
+    return (
+      <ManagedModuleEmpty
+        title="品牌资料"
+        description="管理员尚未发布企业资料。"
       />
     );
   }
@@ -2741,7 +2753,7 @@ function PersistentQuestionIntakePanel(props) {
 }
 
 function QuestionIntakePanel({ preview, ...props }) {
-  if (props.portal.plan.code === "basic") return null;
+  if (!props.portal.capabilities.questionSelection?.allowed) return null;
   return preview ? (
     <PreviewQuestionIntakePanel {...props} />
   ) : (
@@ -2872,21 +2884,19 @@ export function buildPreviewQuestionCitationSummary(
   selectedDateTo: string,
 ) {
   const selectedModelIdentity = previewCitationModelIdentity(selectedModel);
-  const records = rows.filter(
-    (row) => {
-      const date = String(row[5] || "");
-      const rowModelLabel =
-        citationModelLabels[String(row[0] || "").toLowerCase()] || row[0];
-      return (
-        row[1] === selectedQuestion &&
-        (!selectedModelIdentity ||
-          previewCitationModelIdentity(rowModelLabel) ===
-            selectedModelIdentity) &&
-        (!selectedDateFrom || date >= selectedDateFrom) &&
-        (!selectedDateTo || date <= selectedDateTo)
-      );
-    },
-  );
+  const records = rows.filter((row) => {
+    const date = String(row[5] || "");
+    const rowModelLabel =
+      citationModelLabels[String(row[0] || "").toLowerCase()] || row[0];
+    return (
+      row[1] === selectedQuestion &&
+      (!selectedModelIdentity ||
+        previewCitationModelIdentity(rowModelLabel) ===
+          selectedModelIdentity) &&
+      (!selectedDateFrom || date >= selectedDateFrom) &&
+      (!selectedDateTo || date <= selectedDateTo)
+    );
+  });
   if (!selectedQuestion) return null;
 
   const channelCounts = new Map();
@@ -3105,8 +3115,7 @@ function ManagedQuestionMonitoringWorkspace({
           return {
             value: option.dateKey || monitoringDateKey(collectedAt || value),
             collectedAt,
-            dateKey:
-              option.dateKey || monitoringDateKey(collectedAt || value),
+            dateKey: option.dateKey || monitoringDateKey(collectedAt || value),
             label:
               option.label ||
               monitoringBatchDateLabel(collectedAt, String(value || "")),
@@ -3126,7 +3135,9 @@ function ManagedQuestionMonitoringWorkspace({
   }, [baseFiltersQuery.data]);
   const availableDates = useMemo(
     () =>
-      [...new Set(dateOptions.map((option) => option.dateKey).filter(Boolean))].sort(),
+      [
+        ...new Set(dateOptions.map((option) => option.dateKey).filter(Boolean)),
+      ].sort(),
     [dateOptions],
   );
   const activeDateFrom = availableDates.includes(selectedDateFrom)
@@ -3292,13 +3303,8 @@ function ManagedQuestionMonitoringWorkspace({
       citationMode="server"
       onSelectedQuestionIdChange={setSelectedQuestionId}
       distributionContent={distributionContent}
-      monitoringAnswersLoading={
-        baseFiltersQuery.isLoading ||
-        firstPagePending
-      }
-      monitoringAnswersError={
-        Boolean(baseFiltersQuery.error) || answersFailed
-      }
+      monitoringAnswersLoading={baseFiltersQuery.isLoading || firstPagePending}
+      monitoringAnswersError={Boolean(baseFiltersQuery.error) || answersFailed}
       totalAnswerCount={totalAnswerCount}
       hasMoreAnswers={hasMoreAnswers}
       loadingMoreAnswers={samplePage > 1 && sampleQuery.isFetching}
@@ -3817,7 +3823,9 @@ function SemanticAssetSystem({
   const effectiveSelectedType = selectedType || "";
   const requestsLocked = quota
     ? !quota.allowed
-    : planCode === "basic" || planCode === "unknown";
+    : planCode === "basic" ||
+      planCode === "knowledge" ||
+      planCode === "unknown";
 
   if (!selected) {
     return (

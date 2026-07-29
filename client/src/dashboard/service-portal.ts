@@ -1,4 +1,9 @@
-export type ServicePlanCode = "basic" | "advanced" | "luxury" | "unknown";
+export type ServicePlanCode =
+  | "basic"
+  | "knowledge"
+  | "advanced"
+  | "luxury"
+  | "unknown";
 
 export type ServiceCapabilityKey =
   | "knowledgeBuild"
@@ -99,8 +104,12 @@ export type ServicePortalView = {
 
 export const SERVICE_PLAN_PRESENTATION = {
   basic: {
-    name: "基础版",
+    name: "普通版",
     billingLabel: "30 天单题服务",
+  },
+  knowledge: {
+    name: "知识库版",
+    billingLabel: "季度知识库服务",
   },
   advanced: {
     name: "进阶版",
@@ -259,6 +268,14 @@ function normalizePlanCode(value: unknown): ServicePlanCode {
     return "basic";
   }
   if (
+    normalized === "knowledge" ||
+    normalized === "knowledge-base" ||
+    normalized === "knowledge_base" ||
+    normalized === "kb"
+  ) {
+    return "knowledge";
+  }
+  if (
     normalized === "advanced" ||
     normalized === "growth" ||
     normalized === "quarterly"
@@ -411,6 +428,7 @@ function normalizeQuotas(
   rawPortal: Record<string, unknown>,
   planCode: ServicePlanCode,
 ): ServiceQuota[] {
+  if (planCode === "knowledge") return [];
   const quotaValue = firstValue(rawPortal, [
     "quotas",
     "quota",
@@ -709,8 +727,19 @@ function defaultPurchaseActions(planCode: ServicePlanCode): ServiceAction[] {
     return [
       {
         kind: "purchase_basic",
-        label: "继续购买基础版",
+        label: "继续购买普通版",
         targetPlan: "basic",
+      },
+      { kind: "upgrade", label: "升级进阶版", targetPlan: "advanced" },
+      { kind: "upgrade", label: "升级豪华版", targetPlan: "luxury" },
+    ];
+  }
+  if (planCode === "knowledge") {
+    return [
+      {
+        kind: "contact_advisor",
+        label: "联系专员续费知识库版",
+        targetPlan: "knowledge",
       },
       { kind: "upgrade", label: "升级进阶版", targetPlan: "advanced" },
       { kind: "upgrade", label: "升级豪华版", targetPlan: "luxury" },
@@ -860,7 +889,7 @@ export function normalizeServicePortal(raw: unknown): ServicePortalView {
       allowed: false,
       effectiveStatus: "locked",
       reason:
-        "基础版已包含官网生成的初步知识库展示，不包含对话式知识库构建。升级进阶版或豪华版后可解锁。",
+        "普通版已包含官网生成的初步知识库展示，不包含对话式知识库构建。升级进阶版或豪华版后可解锁。",
       nextAction: {
         kind: "upgrade",
         label: "查看升级方案",

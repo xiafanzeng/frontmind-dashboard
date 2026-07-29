@@ -709,7 +709,12 @@ var serviceContracts = mysqlTable(
   {
     id: varchar("id", { length: 36 }).primaryKey(),
     userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
-    planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]).notNull(),
+    planCode: mysqlEnum("planCode", [
+      "basic",
+      "knowledge",
+      "advanced",
+      "luxury"
+    ]).notNull(),
     planVersion: int("planVersion", { unsigned: true }).default(1).notNull(),
     status: mysqlEnum("status", [
       "pending_confirmation",
@@ -1356,6 +1361,7 @@ var purchaseIntents = mysqlTable(
     }).references(() => serviceContracts.id, { onDelete: "set null" }),
     targetPlanCode: mysqlEnum("targetPlanCode", [
       "basic",
+      "knowledge",
       "advanced",
       "luxury"
     ]).notNull(),
@@ -2155,12 +2161,11 @@ async function getEffectiveDecryptedCredentialForAccount(accountId) {
   const accountRows = await db.select({ role: users.role }).from(users).where(eq2(users.id, accountId)).limit(1);
   const account = accountRows[0];
   if (!account) return null;
-  if (account.role === "admin") {
-    return getDecryptedCredentialForUser(accountId);
-  }
+  const directCredential = await getDecryptedCredentialForUser(accountId);
+  if (directCredential || account.role === "admin") return directCredential;
   const ownerRows = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq2(userUsageOwners.userId, accountId)).limit(1);
   const ownerId = ownerRows[0]?.deliveryAdminId;
-  return ownerId ? getDecryptedCredentialForUser(ownerId) : getDecryptedCredentialForUser(accountId);
+  return ownerId ? getDecryptedCredentialForUser(ownerId) : null;
 }
 async function credentialMayServeAccount(executor, accountId, credentialId) {
   const credentialRows = await executor.select({
@@ -2229,11 +2234,7 @@ async function recordUpstreamResource(input) {
     }
     return existing[0];
   }
-  if (!await credentialMayServeAccount(
-    db,
-    input.userId,
-    input.apiCredentialId
-  )) {
+  if (!await credentialMayServeAccount(db, input.userId, input.apiCredentialId)) {
     throw new AuthServiceError("NOT_FOUND", "API credential not found");
   }
   if (input.conversationId) {
@@ -2285,7 +2286,12 @@ import { z as z3 } from "zod";
 
 // shared/service-portal.ts
 import { z } from "zod";
-var servicePlanCodeSchema = z.enum(["basic", "advanced", "luxury"]);
+var servicePlanCodeSchema = z.enum([
+  "basic",
+  "knowledge",
+  "advanced",
+  "luxury"
+]);
 var workspaceQuestionCategorySchema = z.enum([
   "industry",
   "competitor_comparison",
@@ -2345,7 +2351,7 @@ var FULL_SERVICE_CAPABILITIES = Object.freeze({
 var SERVICE_PLAN_CATALOG = Object.freeze({
   basic: {
     code: "basic",
-    name: "\u57FA\u7840\u7248",
+    name: "\u666E\u901A\u7248",
     description: "30 \u5929\u5185\u4EA4\u4ED8\u4E00\u4E2A\u5DF2\u8D2D\u4E70\u7684\u975E\u884C\u4E1A\u95EE\u9898\u53CA\u77E5\u8BC6\u5E93\u5C55\u793A\u3002",
     planVersion: 1,
     contractTerm: { unit: "day", count: 30 },
@@ -2372,6 +2378,35 @@ var SERVICE_PLAN_CATALOG = Object.freeze({
       channelDistribution: true,
       progressReport: true,
       contentAssets: true
+    }
+  },
+  knowledge: {
+    code: "knowledge",
+    name: "\u77E5\u8BC6\u5E93\u7248",
+    description: "\u63D0\u4F9B\u5B8C\u6574\u7684\u77E5\u8BC6\u5E93\u6784\u5EFA\u3001\u6301\u7EED\u66F4\u65B0\u4E0E\u5C55\u793A\u80FD\u529B\u3002",
+    planVersion: 1,
+    contractTerm: { unit: "month", count: 3 },
+    quotaCadence: "contract",
+    prepaidMonths: 3,
+    billingLabel: "\u5B63\u5EA6\u77E5\u8BC6\u5E93\u670D\u52A1",
+    limits: {
+      industryLimit: 0,
+      competitorComparisonLimit: 0,
+      reputationLimit: 0,
+      productScenarioLimit: 0,
+      totalQuestionLimit: 0
+    },
+    includedCapabilities: {
+      knowledgeBuild: true,
+      knowledgeDisplay: true,
+      globalKeywords: false,
+      questionSelection: false,
+      intentOptimization: false,
+      responseLogic: false,
+      monitoring: false,
+      channelDistribution: false,
+      progressReport: false,
+      contentAssets: false
     }
   },
   advanced: {
@@ -3510,6 +3545,10 @@ var upsertWorkspaceSiteCheckSchema = z4.object({
 var DELIVERY_TICKET_LIMITS = Object.freeze({
   basic: Object.freeze({
     content_asset_publish: 1,
+    website_content_publish: 0
+  }),
+  knowledge: Object.freeze({
+    content_asset_publish: 0,
     website_content_publish: 0
   }),
   advanced: Object.freeze({
@@ -4894,6 +4933,15 @@ var fileMetaCache = /* @__PURE__ */ new Map();
 var CACHE_TTL = 10 * 60 * 1e3;
 var downloadTokenCache = /* @__PURE__ */ new Map();
 var DOWNLOAD_TOKEN_TTL = 5 * 60 * 1e3;
+var MAX_EXTERNAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+var ExternalDownloadTooLargeError = class extends Error {
+  constructor(maxBytes = MAX_EXTERNAL_DOWNLOAD_BYTES) {
+    super("External download exceeds the permitted size");
+    this.maxBytes = maxBytes;
+    this.code = "EXTERNAL_DOWNLOAD_TOO_LARGE";
+    this.name = "ExternalDownloadTooLargeError";
+  }
+};
 function isPrivateUpstreamCollectionRequest(method, targetPath) {
   if (!["GET", "HEAD"].includes(method.toUpperCase())) return false;
   const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
@@ -5132,6 +5180,76 @@ function responseHeaderValue(value) {
   }
   return void 0;
 }
+function declaredContentLength(headers) {
+  if (!headers || typeof headers !== "object") return void 0;
+  const raw = responseHeaderValue(
+    headers["content-length"]
+  );
+  if (!raw || !/^\d+$/.test(raw)) return void 0;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : void 0;
+}
+function destroyDownloadStream(value) {
+  if (value && typeof value === "object" && typeof value.destroy === "function") {
+    value.destroy();
+  }
+}
+async function readBoundedExternalDownload(data2, headers, maxBytes = MAX_EXTERNAL_DOWNLOAD_BYTES) {
+  const declared = declaredContentLength(headers);
+  if (declared !== void 0 && declared > maxBytes) {
+    destroyDownloadStream(data2);
+    throw new ExternalDownloadTooLargeError(maxBytes);
+  }
+  if (data2 && typeof data2 === "object" && Symbol.asyncIterator in data2 && typeof data2[Symbol.asyncIterator] === "function") {
+    const chunks = [];
+    let totalBytes = 0;
+    try {
+      for await (const chunk of data2) {
+        const buffer2 = Buffer.isBuffer(chunk) ? chunk : chunk instanceof Uint8Array ? Buffer.from(chunk) : Buffer.from(String(chunk));
+        totalBytes += buffer2.length;
+        if (totalBytes > maxBytes) {
+          throw new ExternalDownloadTooLargeError(maxBytes);
+        }
+        chunks.push(buffer2);
+      }
+    } catch (error) {
+      destroyDownloadStream(data2);
+      throw error;
+    }
+    return Buffer.concat(chunks, totalBytes);
+  }
+  const buffer = Buffer.isBuffer(data2) ? data2 : data2 instanceof Uint8Array ? Buffer.from(data2) : data2 instanceof ArrayBuffer ? Buffer.from(data2) : Buffer.from(String(data2 ?? ""));
+  if (buffer.length > maxBytes) {
+    throw new ExternalDownloadTooLargeError(maxBytes);
+  }
+  return buffer;
+}
+function isExternalDownloadTooLarge(error) {
+  if (error instanceof ExternalDownloadTooLargeError) return true;
+  if (!error || typeof error !== "object") return false;
+  const candidate = error;
+  return candidate.code === "ERR_BAD_RESPONSE" && typeof candidate.message === "string" && candidate.message.includes("maxContentLength");
+}
+function sendExternalDownloadTooLarge(res) {
+  return res.status(413).json({
+    error: {
+      message: "\u6587\u4EF6\u8D85\u8FC7\u5141\u8BB8\u7684\u4E0B\u8F7D\u5927\u5C0F",
+      code: "EXTERNAL_DOWNLOAD_TOO_LARGE"
+    }
+  });
+}
+async function fetchBoundedExternalDownload(url, options) {
+  const response = await axios2.get(url, {
+    ...options,
+    responseType: "stream",
+    maxContentLength: MAX_EXTERNAL_DOWNLOAD_BYTES
+  });
+  const data2 = await readBoundedExternalDownload(
+    response.data,
+    response.headers
+  );
+  return { ...response, data: data2 };
+}
 var SANITIZE_SKIP_KEYS = /* @__PURE__ */ new Set([
   "id",
   "task_id",
@@ -5194,6 +5312,239 @@ function publicUpstreamPayload(value, apiKey) {
       secrets: [apiKey]
     })
   );
+}
+var PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS = [
+  "id",
+  "task_id",
+  "response_id",
+  "object",
+  "status",
+  "model",
+  "created_at",
+  "updated_at",
+  "started_at",
+  "completed_at",
+  "credit_usage",
+  "task_url",
+  "share_url",
+  "task_title",
+  "title"
+];
+var PUBLIC_TASK_OUTPUT_SCALAR_KEYS = [
+  "id",
+  "type",
+  "status",
+  "name",
+  "call_id",
+  "text",
+  "message",
+  "output",
+  "file_id",
+  "fileId",
+  "url",
+  "file_url",
+  "fileUrl",
+  "image_url",
+  "imageUrl",
+  "filename",
+  "fileName",
+  "mime_type",
+  "mimeType"
+];
+var PUBLIC_TASK_CONTENT_SCALAR_KEYS = [
+  "type",
+  "text",
+  "file_id",
+  "fileId",
+  "file_url",
+  "fileUrl",
+  "image_url",
+  "imageUrl",
+  "url",
+  "filename",
+  "fileName",
+  "mime_type",
+  "mimeType"
+];
+var PUBLIC_TASK_METADATA_SCALAR_KEYS = [
+  "credit_usage",
+  "task_url",
+  "share_url",
+  "task_title",
+  "title"
+];
+var PUBLIC_TASK_ERROR_SCALAR_KEYS = [
+  "message",
+  "code",
+  "type",
+  "param",
+  "status"
+];
+var PUBLIC_TASK_ANNOTATION_SCALAR_KEYS = [
+  "type",
+  "url",
+  "title",
+  "start_index",
+  "end_index",
+  "file_id",
+  "fileId",
+  "filename",
+  "fileName",
+  "index",
+  "quote"
+];
+var PUBLIC_TASK_ACTION_SCALAR_KEYS = [
+  "type",
+  "url",
+  "query",
+  "selector",
+  "x",
+  "y"
+];
+var PUBLIC_TASK_TELEMETRY_KEY = /^(?:(?:input|output)_(?:tokens?|credits?|cost|characters|count)(?:_|$)|(?:id|name|label|kind|version|status|stage|step|phase|progress|percent|percentage|current|total|completed|failed|success|successful|count|usage|credit|credits|token|tokens|cost|duration|elapsed|remaining|message|summary|visited|links|pages|characters|images|documents|queries|saved|downloaded|parsed|started|finished|created|updated)(?:_|$))/i;
+function isPublicScalar(value) {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+function pickPublicScalars(value, keys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const source = value;
+  const result = {};
+  for (const key of keys) {
+    if (isPublicScalar(source[key])) {
+      result[key] = source[key];
+    }
+  }
+  return result;
+}
+function publicTaskTelemetry(value, depth = 0) {
+  if (value === null || depth > 8) return void 0;
+  if (isPublicScalar(value)) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => publicTaskTelemetry(item, depth + 1)).filter((item) => item !== void 0);
+  }
+  if (typeof value !== "object") return void 0;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!PUBLIC_TASK_TELEMETRY_KEY.test(key)) continue;
+    const sanitized = publicTaskTelemetry(item, depth + 1);
+    if (sanitized !== void 0) result[key] = sanitized;
+  }
+  return result;
+}
+function publicTaskAnnotations(value) {
+  if (!Array.isArray(value)) return void 0;
+  const annotations = value.map((item) => pickPublicScalars(item, PUBLIC_TASK_ANNOTATION_SCALAR_KEYS)).filter((item) => Object.keys(item).length > 0);
+  return annotations.length > 0 ? annotations : void 0;
+}
+function publicTaskContent(value) {
+  if (!Array.isArray(value)) return [];
+  const content = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const source = item;
+    const type = typeof source.type === "string" ? source.type.toLowerCase() : "";
+    if (type.startsWith("input_") || type.includes("instruction")) continue;
+    const sanitized = pickPublicScalars(
+      source,
+      PUBLIC_TASK_CONTENT_SCALAR_KEYS
+    );
+    const annotations = publicTaskAnnotations(source.annotations);
+    if (annotations) sanitized.annotations = annotations;
+    if (Object.keys(sanitized).length > 0) content.push(sanitized);
+  }
+  return content;
+}
+function publicTaskOutput(value) {
+  if (!Array.isArray(value)) return [];
+  const output = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const source = item;
+    const role = typeof source.role === "string" ? source.role.toLowerCase() : "";
+    const type = typeof source.type === "string" ? source.type.toLowerCase() : "";
+    if (role === "user" || role === "system" || type.startsWith("input_") || type.includes("instruction")) {
+      continue;
+    }
+    const sanitized = pickPublicScalars(
+      source,
+      PUBLIC_TASK_OUTPUT_SCALAR_KEYS
+    );
+    if (role === "assistant") sanitized.role = "assistant";
+    const content = publicTaskContent(source.content);
+    if (content.length > 0) sanitized.content = content;
+    if (Array.isArray(source.summary)) {
+      const summary = source.summary.map((entry) => pickPublicScalars(entry, ["type", "text"])).filter((entry) => Object.keys(entry).length > 0);
+      if (summary.length > 0) sanitized.summary = summary;
+    }
+    if (Array.isArray(source.queries)) {
+      const queries = source.queries.filter(
+        (query) => typeof query === "string"
+      );
+      if (queries.length > 0) sanitized.queries = queries;
+    }
+    const action = pickPublicScalars(
+      source.action,
+      PUBLIC_TASK_ACTION_SCALAR_KEYS
+    );
+    if (Object.keys(action).length > 0) sanitized.action = action;
+    if (Object.keys(sanitized).length > 0) output.push(sanitized);
+  }
+  return output;
+}
+function redactPublicTaskValues(value, apiKey) {
+  if (typeof value === "string") {
+    return redactSensitiveText(value, [apiKey]);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactPublicTaskValues(item, apiKey));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        redactPublicTaskValues(item, apiKey)
+      ])
+    );
+  }
+  return value;
+}
+function publicUpstreamTaskPayload(value, apiKey) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const source = value;
+  const result = pickPublicScalars(
+    source,
+    PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS
+  );
+  const metadata = pickPublicScalars(
+    source.metadata,
+    PUBLIC_TASK_METADATA_SCALAR_KEYS
+  );
+  if (Object.keys(metadata).length > 0) result.metadata = metadata;
+  if (Array.isArray(source.output)) {
+    result.output = publicTaskOutput(source.output);
+  }
+  const error = pickPublicScalars(source.error, PUBLIC_TASK_ERROR_SCALAR_KEYS);
+  if (Object.keys(error).length > 0) result.error = error;
+  const usage = publicTaskTelemetry(source.usage);
+  if (usage !== void 0 && (typeof usage !== "object" || Object.keys(usage).length > 0)) {
+    result.usage = usage;
+  }
+  const progress = publicTaskTelemetry(source.progress);
+  if (progress !== void 0 && (typeof progress !== "object" || Object.keys(progress).length > 0)) {
+    result.progress = progress;
+  }
+  return deepSanitizeJson(redactPublicTaskValues(result, apiKey));
+}
+function isPublicTaskPayloadRequest(method, targetPath) {
+  const path3 = targetPath.split("?")[0].replace(/\/+$/, "");
+  const normalizedMethod = method.toUpperCase();
+  if (normalizedMethod === "POST" && (path3 === "/v1/tasks" || path3 === "/v1/responses")) {
+    return true;
+  }
+  if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
+  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path3);
 }
 function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
   if (value === null || value === void 0 || depth > 50) return ids;
@@ -6111,11 +6462,9 @@ router.get("/proxy-download", async (req, res) => {
     console.log(
       `[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`
     );
-    const response = await axios2.get(targetUrl, {
+    const response = await fetchBoundedExternalDownload(targetUrl, {
       ...safeExternalRequestOptions,
-      responseType: "arraybuffer",
       timeout: 12e4,
-      maxContentLength: Infinity,
       validateStatus: () => true
     });
     console.log(
@@ -6161,6 +6510,9 @@ router.get("/proxy-download", async (req, res) => {
     }
     res.send(sanitizedBuffer);
   } catch (error) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {
@@ -6220,11 +6572,9 @@ async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
   console.log(
     `[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`
   );
-  const response = await axios2.get(safeS3Url, {
+  const response = await fetchBoundedExternalDownload(safeS3Url, {
     ...safeExternalRequestOptions,
-    responseType: "arraybuffer",
     timeout: 12e4,
-    maxContentLength: Infinity,
     validateStatus: () => true
   });
   console.log(
@@ -6302,14 +6652,12 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
     const cleanBaseUrl = baseUrl.replace(/\/$/, "");
     const contentUrl = `${cleanBaseUrl}/v1/files/${fileId}/content`;
     try {
-      const response = await axios2.get(contentUrl, {
+      const response = await fetchBoundedExternalDownload(contentUrl, {
         headers: {
           API_KEY: apiKey,
           Authorization: `Bearer ${apiKey}`
         },
-        responseType: "arraybuffer",
         timeout: 12e4,
-        maxContentLength: Infinity,
         validateStatus: () => true
       });
       const upstreamContentType = responseHeaderValue(
@@ -6353,6 +6701,7 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
         return;
       }
     } catch (e) {
+      if (isExternalDownloadTooLarge(e)) throw e;
       console.warn(
         "[FrontMind Proxy] Direct /content download failed:",
         safeErrorForLog(e, { secrets: [apiKey] })
@@ -6446,6 +6795,9 @@ router.get("/download/:token", async (req, res) => {
       data2.credentialId
     );
   } catch (error) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] Direct token download error:",
       safeErrorForLog(error, { secrets: [logSecret] })
@@ -6472,6 +6824,9 @@ router.get("/v1/files/:fileId", async (req, res) => {
       req.frontmindCredential?.id
     );
   } catch (error) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] File download error:",
       safeErrorForLog(error, { secrets: [apiKey] })
@@ -6498,6 +6853,9 @@ router.get("/v1/files/:fileId/content", async (req, res) => {
       req.frontmindCredential?.id
     );
   } catch (error) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] File content download error:",
       safeErrorForLog(error, { secrets: [apiKey] })
@@ -6675,7 +7033,7 @@ router.all("/*", async (req, res) => {
         }
       }
     }
-    const publicResponse = typeof response.data === "object" ? publicUpstreamPayload(response.data, apiKey) : typeof response.data === "string" ? sanitizeText(redactSensitiveText(response.data, [apiKey])) : response.data;
+    const publicResponse = typeof response.data === "object" ? isPublicTaskPayloadRequest(req.method, targetPath) ? publicUpstreamTaskPayload(response.data, apiKey) : publicUpstreamPayload(response.data, apiKey) : typeof response.data === "string" ? sanitizeText(redactSensitiveText(response.data, [apiKey])) : response.data;
     if (publicResponse && typeof publicResponse === "object" && !Array.isArray(publicResponse) && Array.isArray(publicResponse.output)) {
       const publicRecord = publicResponse;
       const outputSummary = publicRecord.output.map(

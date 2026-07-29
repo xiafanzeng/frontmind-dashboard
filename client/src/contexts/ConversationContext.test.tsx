@@ -3,6 +3,7 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ConversationProvider,
+  parseOutputMessages,
   prepareConversationForCloud,
   useConversation,
   type Conversation,
@@ -156,6 +157,47 @@ describe("prepareConversationForCloud", () => {
     ]);
     expect(clean.messages[0].inlineImages).toEqual([
       { src: "/api/frontmind/v1/files/image" },
+    ]);
+  });
+});
+
+describe("parseOutputMessages file IDs", () => {
+  it("renders snake-case PDF and camel-case image IDs through protected URLs", () => {
+    const messages = parseOutputMessages([
+      {
+        id: "assistant-files",
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_file",
+            file_id: "file/pdf 1",
+            file_name: "report.pdf",
+            mime_type: "application/pdf",
+          },
+          {
+            type: "output_image",
+            fileId: "image/图 1",
+            fileName: "chart.png",
+            mimeType: "image/png",
+          },
+        ],
+      },
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].outputFiles).toEqual([
+      {
+        fileUrl: "/api/frontmind/v1/files/file%2Fpdf%201",
+        fileName: "report.pdf",
+        mimeType: "application/pdf",
+      },
+    ]);
+    expect(messages[0].inlineImages).toEqual([
+      {
+        src: "/api/frontmind/v1/files/image%2F%E5%9B%BE%201",
+        alt: "chart.png",
+      },
     ]);
   });
 });

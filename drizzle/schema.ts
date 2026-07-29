@@ -788,7 +788,12 @@ export const serviceContracts = mysqlTable(
     userId: int("userId")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]).notNull(),
+    planCode: mysqlEnum("planCode", [
+      "basic",
+      "knowledge",
+      "advanced",
+      "luxury",
+    ]).notNull(),
     planVersion: int("planVersion", { unsigned: true }).default(1).notNull(),
     status: mysqlEnum("status", [
       "pending_confirmation",
@@ -1624,6 +1629,7 @@ export const purchaseIntents = mysqlTable(
     }).references(() => serviceContracts.id, { onDelete: "set null" }),
     targetPlanCode: mysqlEnum("targetPlanCode", [
       "basic",
+      "knowledge",
       "advanced",
       "luxury",
     ]).notNull(),
@@ -1697,9 +1703,9 @@ export const userAdminAssignments = mysqlTable(
 );
 
 /**
- * One delivery administrator owns the runtime API Key pool for each customer.
- * The many-to-many assignment table remains the collaboration boundary; this
- * table is the single billing and runtime credential parent.
+ * One administrator is the primary delivery owner for each customer. Customer
+ * accounts normally use their own credential; this relationship remains a
+ * legacy credential fallback for accounts that have not yet been upgraded.
  */
 export const userUsageOwners = mysqlTable(
   "user_usage_owners",

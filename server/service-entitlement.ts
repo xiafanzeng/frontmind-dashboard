@@ -357,8 +357,9 @@ export function selectPortalContract(
   };
   const planRank: Record<ServicePlanCode, number> = {
     basic: 1,
-    advanced: 2,
-    luxury: 3,
+    knowledge: 2,
+    advanced: 3,
+    luxury: 4,
   };
   return (
     [...contracts].sort((left, right) => {
@@ -383,6 +384,7 @@ export function selectCurrentServiceContractIds(
   const supplementalBasicIds = contracts
     .filter(
       (value) =>
+        contract.planCode !== "knowledge" &&
         value.planCode === "basic" &&
         value.id !== contract.id &&
         !replacedIds.has(value.id) &&
@@ -611,6 +613,10 @@ function deriveWorkflowSteps(input: {
   progressReportComplete: boolean;
   nextAction: ServicePortal["nextAction"];
 }): ServicePortal["workflowSteps"] {
+  const knowledgeOnlyReason =
+    input.planCode === "knowledge"
+      ? "知识库版仅开放知识库构建、更新与展示；此功能未包含在当前套餐。"
+      : null;
   const serviceBlock =
     input.status === "active"
       ? null
@@ -622,22 +628,26 @@ function deriveWorkflowSteps(input: {
       : null;
   const questionReason = serviceBlock
     ? serviceBlock
-    : !input.hasKnowledge
-      ? input.planCode === "basic"
-        ? "请先等待官网知识库同步完成。"
-        : "请先通过知识库智能体完成全部节点并发布知识库。"
-      : input.planCode === "basic"
-        ? "正在等待已购问题从官网同步。"
-        : null;
+    : knowledgeOnlyReason
+      ? knowledgeOnlyReason
+      : !input.hasKnowledge
+        ? input.planCode === "basic"
+          ? "请先等待官网知识库同步完成。"
+          : "请先通过知识库智能体完成全部节点并发布知识库。"
+        : input.planCode === "basic"
+          ? "正在等待已购问题从官网同步。"
+          : null;
   const responseReason = serviceBlock
     ? serviceBlock
-    : !input.hasKnowledge
-      ? input.planCode === "basic"
-        ? "请先等待官网知识库同步完成。"
-        : "请先通过知识库智能体完成全部节点并发布知识库。"
-      : !input.questionSelectionComplete
-        ? "请先完成当前服务周期的选题。"
-        : null;
+    : knowledgeOnlyReason
+      ? knowledgeOnlyReason
+      : !input.hasKnowledge
+        ? input.planCode === "basic"
+          ? "请先等待官网知识库同步完成。"
+          : "请先通过知识库智能体完成全部节点并发布知识库。"
+        : !input.questionSelectionComplete
+          ? "请先完成当前服务周期的选题。"
+          : null;
   const monitoringReason =
     responseReason ??
     (!input.responseLogicComplete
@@ -775,6 +785,13 @@ function deriveNextAction(input: {
     return {
       kind: "start_knowledge_build",
       label: "开始知识库智能体",
+      href: "/knowledge-base",
+    };
+  }
+  if (input.planCode === "knowledge") {
+    return {
+      kind: "view_knowledge",
+      label: "查看知识库",
       href: "/knowledge-base",
     };
   }
@@ -1717,8 +1734,19 @@ export async function upsertServiceContract(
         "服务版本已被其他操作更新，请刷新后重试。",
       );
     }
+    const primaryContract = selectPortalContract(
+      existingRows as ServicePortalContractRecord[],
+      input.now ?? startsAt,
+    );
+    // Knowledge is an intentionally self-contained plan. A later Basic
+    // purchase therefore changes the active plan instead of silently merging
+    // paid questions into a workspace where every question workflow is locked.
+    const switchingFromKnowledgeToBasic =
+      planCode === "basic" && primaryContract?.planCode === "knowledge";
     const shouldReplaceExisting =
-      planCode !== "basic" || input.preserveConcurrentBasic === false;
+      planCode !== "basic" ||
+      input.preserveConcurrentBasic === false ||
+      switchingFromKnowledgeToBasic;
     const explicitSourceIds = input.sourceContractIds
       ? [...new Set(input.sourceContractIds)]
       : null;
@@ -1735,10 +1763,7 @@ export async function upsertServiceContract(
           );
         }
       } else {
-        const primary = selectPortalContract(
-          existingRows as ServicePortalContractRecord[],
-          input.now ?? startsAt,
-        );
+        const primary = primaryContract;
         if (primary?.planCode === "basic") {
           const activeBasicContracts = existingRows.filter(
             (contract) =>
@@ -1777,11 +1802,20 @@ export async function upsertServiceContract(
     const explicitCarryIds = input.carryQuestionIds
       ? [...new Set(input.carryQuestionIds)]
       : null;
-    const carryoverQuestions = explicitCarryIds
-      ? sourceQuestions.filter((question) =>
-          explicitCarryIds.includes(question.id),
-        )
-      : sourceQuestions;
+    if (planCode === "knowledge" && explicitCarryIds?.length) {
+      throw new ServiceEntitlementError(
+        "UPGRADE_RECONCILIATION_REQUIRED",
+        "知识库版不包含问题服务，不能继续携带已购问题。",
+      );
+    }
+    const carryoverQuestions =
+      planCode === "knowledge"
+        ? []
+        : explicitCarryIds
+          ? sourceQuestions.filter((question) =>
+              explicitCarryIds.includes(question.id),
+            )
+          : sourceQuestions;
     if (
       explicitCarryIds &&
       carryoverQuestions.length !== explicitCarryIds.length

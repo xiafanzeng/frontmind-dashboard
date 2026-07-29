@@ -713,7 +713,7 @@ export async function decideWebsitePurchase(input: {
       await tx.insert(userDashboardContents).values({
         userId,
         payload: createDefaultDashboardPayload(row.companyName),
-        sourceName: `官网基础版开通 · ${row.projectId}`.slice(0, 512),
+        sourceName: `官网普通版开通 · ${row.projectId}`.slice(0, 512),
         revision: 1,
         updatedByUserId: input.actorUserId,
         createdAt: now,
@@ -933,7 +933,7 @@ export async function createServicePurchaseIntent(input: {
   if (input.kind === "repeat_basic" && targetPlanCode !== "basic") {
     throw new PurchaseProvisioningError(
       "PURCHASE_INTENT_CONFLICT",
-      "基础版复购凭证只能购买基础版",
+      "普通版复购凭证只能购买普通版",
       400,
     );
   }

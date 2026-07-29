@@ -230,8 +230,13 @@ export interface OutputContent {
   type?: string;
   text?: string | null;
   fileUrl?: string;
+  file_url?: string;
+  fileId?: string;
+  file_id?: string;
   fileName?: string;
+  file_name?: string;
   mimeType?: string;
+  mime_type?: string;
   annotations?: unknown;
   logprobs?: unknown;
 }
@@ -291,7 +296,11 @@ async function apiRequest(
           errorMsg += `: ${response.statusText}`;
         }
       }
-      throw new Error(errorMsg);
+      const requestError = new Error(errorMsg) as Error & {
+        status?: number;
+      };
+      requestError.status = response.status;
+      throw requestError;
     }
 
     return response;
@@ -601,8 +610,11 @@ export async function retrieveTask(responseId: string): Promise<TaskResponse> {
     }
     return data;
   } catch (err: any) {
+    if (err?.status !== 404 && err?.status !== 405) {
+      throw err;
+    }
     console.warn(
-      `[retrieveTask] /v1/tasks/ failed (${err.message}), trying /v1/responses/`,
+      `[retrieveTask] /v1/tasks/ is unavailable (${err.status}), trying /v1/responses/`,
     );
     try {
       const response = await apiRequest(`/v1/responses/${responseId}`);
@@ -612,7 +624,7 @@ export async function retrieveTask(responseId: string): Promise<TaskResponse> {
       }
       return data;
     } catch (fallbackErr: any) {
-      throw err;
+      throw fallbackErr;
     }
   }
 }
@@ -720,8 +732,20 @@ export async function uploadFileToUrl(
 export async function uploadFile(
   file: File,
   onProgress?: (percent: number) => void,
+  retryConfig: {
+    maxRetries: number;
+    initialDelay: number;
+    maxDelay: number;
+  } = {
+    maxRetries: 3,
+    initialDelay: 1000,
+    maxDelay: 10000,
+  },
 ): Promise<{ fileId: string; filename: string }> {
   if (onProgress) onProgress(0);
+  // File-record creation is intentionally outside the retry loop. Repeating
+  // POST /v1/files would orphan records and could bind retries to different
+  // credential versions.
   const fileRecord = await createFileRecord(file.name);
 
   if (!fileRecord || !fileRecord.upload_url) {
@@ -739,7 +763,28 @@ export async function uploadFile(
       `Direct S3 upload failed (${directErr.message}), trying server proxy...`,
     );
     if (onProgress) onProgress(10);
-    await uploadFileToUrlViaProxy(fileRecord.upload_url, file, onProgress);
+
+    let lastProxyError: unknown = directErr;
+    for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt += 1) {
+      try {
+        await uploadFileToUrlViaProxy(fileRecord.upload_url, file, onProgress);
+        lastProxyError = undefined;
+        break;
+      } catch (proxyError) {
+        lastProxyError = proxyError;
+        if (attempt >= retryConfig.maxRetries) break;
+        const exponentialDelay =
+          retryConfig.initialDelay * Math.pow(2, attempt);
+        const delay = Math.min(exponentialDelay, retryConfig.maxDelay);
+        if (delay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    if (lastProxyError) {
+      throw lastProxyError;
+    }
   }
 
   return {
@@ -925,13 +970,10 @@ export async function fetchCreditUsage(
       if (cached) return cached;
     }
 
-    const response = await fetch(
-      "/api/frontmind/account-credit-usage",
-      {
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-      },
-    );
+    const response = await fetch("/api/frontmind/account-credit-usage", {
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+    });
     if (!response.ok) {
       return readCreditUsageCache(fingerprint, accountId, true) || emptyResult;
     }
@@ -945,10 +987,7 @@ export async function fetchCreditUsage(
             .map((task: any) => ({
               id: String(task?.id ?? ""),
               title: String(task?.title ?? "").trim() || undefined,
-              creditUsage: Math.max(
-                0,
-                Number(task?.creditUsage ?? 0) || 0,
-              ),
+              creditUsage: Math.max(0, Number(task?.creditUsage ?? 0) || 0),
               createdAt:
                 typeof task?.createdAt === "string"
                   ? task.createdAt

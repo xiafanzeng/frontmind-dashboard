@@ -80,6 +80,7 @@ describe("service portal migration chain", () => {
       "0032_project_order_registry",
       "0033_huge_toxin",
       "0034_known_scarlet_spider",
+      "0035_nervous_sauron",
     ]);
   });
 
@@ -294,18 +295,14 @@ describe("service portal migration chain", () => {
       "`warningRatioBasisPoints` int unsigned NOT NULL DEFAULT 8000",
     );
 
-    const monthlyUsageAndBasicQuota = await migration(
-      "0033_huge_toxin.sql",
-    );
+    const monthlyUsageAndBasicQuota = await migration("0033_huge_toxin.sql");
     expect(monthlyUsageAndBasicQuota).toContain(
       "ALTER TABLE `api_usage_snapshots` ADD `accountUsed`",
     );
     expect(monthlyUsageAndBasicQuota).toContain(
       "`period`.`contentAssetPublishLimit` = 1",
     );
-    expect(monthlyUsageAndBasicQuota).toContain(
-      "'pending_confirmation'",
-    );
+    expect(monthlyUsageAndBasicQuota).toContain("'pending_confirmation'");
     expect(monthlyUsageAndBasicQuota).toContain("'suspended'");
 
     const usageOwner = await migration("0034_known_scarlet_spider.sql");
@@ -313,9 +310,7 @@ describe("service portal migration chain", () => {
     expect(usageOwner).toContain(
       "HAVING COUNT(DISTINCT `assignment`.`adminId`) = 1",
     );
-    expect(usageOwner).toContain(
-      "`credential`.`status` = 'retired'",
-    );
+    expect(usageOwner).toContain("`credential`.`status` = 'retired'");
   });
 
   it("adds a password-safe customer account stage after verified payment", async () => {

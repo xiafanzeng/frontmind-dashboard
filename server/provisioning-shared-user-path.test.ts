@@ -9,10 +9,13 @@ vi.mock("./db", () => ({
 }));
 
 import {
+  apiCredentials,
   serviceContracts,
   serviceQuotaPeriods,
+  userAdminAssignments,
   userDashboardContents,
   userPasswordSetupTokens,
+  userUsageOwners,
   users,
   websiteUserProvisions,
 } from "../drizzle/schema";
@@ -32,10 +35,12 @@ type InsertCall = {
 };
 
 class SharedUsersTableDb {
+  readonly deliveryAdminId = 777;
   inserts: InsertCall[] = [];
   userRows: Array<Record<string, any>> = [];
   provisionRows: Array<Record<string, any>> = [];
   projectedUserSelectCount = 0;
+  pendingInsertedUserLock = false;
 
   select(selection?: Record<string, unknown>) {
     return {
@@ -43,14 +48,26 @@ class SharedUsersTableDb {
         const selectedRows = () => {
           if (table === users) {
             if (!selection) return this.userRows.slice(-1);
+            if ("adminAccessLevel" in selection) {
+              return [
+                {
+                  id: this.deliveryAdminId,
+                  role: "admin",
+                  adminAccessLevel: "delivery_admin",
+                  isActive: true,
+                },
+              ];
+            }
             this.projectedUserSelectCount += 1;
-            // The first two projected user queries are the Admin and website
-            // username uniqueness checks. The third one is the entitlement
-            // row lock for the user that the website path just created.
-            return this.projectedUserSelectCount <= 2
-              ? []
-              : this.userRows.slice(-1).map(({ id }) => ({ id }));
+            if (!this.pendingInsertedUserLock) return [];
+            this.pendingInsertedUserLock = false;
+            return this.userRows
+              .slice(-1)
+              .map(({ id, role }) =>
+                "role" in selection ? { id, role } : { id },
+              );
           }
+          if (table === apiCredentials) return [];
           if (table === websiteUserProvisions) {
             return this.provisionRows.slice(-1);
           }
@@ -98,6 +115,7 @@ class SharedUsersTableDb {
             updatedAt: now,
             lastSignedIn: null,
           });
+          this.pendingInsertedUserLock = true;
         } else if (table === websiteUserProvisions) {
           this.provisionRows.push({ ...values });
         }
@@ -189,6 +207,11 @@ describe("shared Admin and website user creation path", () => {
   let db: SharedUsersTableDb;
 
   beforeEach(() => {
+    process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY =
+      "base64:MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("{}", { status: 200 }),
+    );
     db = new SharedUsersTableDb();
     dbMock.getDb.mockResolvedValue(db);
   });
@@ -200,24 +223,45 @@ describe("shared Admin and website user creation path", () => {
       displayName: "示例企业·运营负责人",
       role: "user",
       planCode: "advanced",
+      deliveryAdminId: db.deliveryAdminId,
+      apiKey: "sk-admin-created-customer-credential-000001",
     });
     expect(adminResult.contract).toMatchObject({
       planCode: "advanced",
-      quotaPeriodCount: 0,
+      quotaPeriodCount: 1,
     });
     expect(
       db.inserts.find(({ table }) => table === serviceContracts)?.values,
     ).toMatchObject({
       userId: adminResult.user.id,
-      status: "pending_confirmation",
+      status: "active",
       orderReference: null,
       externalContractReference: null,
       signedAt: null,
       signingEvidence: null,
     });
     expect(
-      db.inserts.find(({ table }) => table === serviceQuotaPeriods),
-    ).toBeUndefined();
+      db.inserts.find(({ table }) => table === serviceQuotaPeriods)?.values,
+    ).toHaveLength(1);
+    expect(
+      db.inserts.find(({ table }) => table === apiCredentials)?.values,
+    ).toMatchObject({
+      userId: adminResult.user.id,
+      status: "active",
+      version: 1,
+    });
+    expect(
+      db.inserts.find(({ table }) => table === userAdminAssignments)?.values,
+    ).toMatchObject({
+      userId: adminResult.user.id,
+      adminId: db.deliveryAdminId,
+    });
+    expect(
+      db.inserts.find(({ table }) => table === userUsageOwners)?.values,
+    ).toMatchObject({
+      userId: adminResult.user.id,
+      deliveryAdminId: db.deliveryAdminId,
+    });
 
     const request = websiteRequest();
     const websiteResult = await provisionWebsiteUser(
@@ -326,6 +370,8 @@ describe("shared Admin and website user creation path", () => {
         displayName: "已分配客户",
         role: "user",
         planCode: "luxury",
+        deliveryAdminId: db.deliveryAdminId,
+        apiKey: "sk-delivery-customer-credential-000001",
       }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
 
@@ -340,6 +386,7 @@ describe("shared Admin and website user creation path", () => {
         password: "must-not-be-accepted",
         role: "user",
         planCode: "basic",
+        apiKey: "sk-plaintext-customer-credential-000001",
       } as never),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.inserts).toHaveLength(0);

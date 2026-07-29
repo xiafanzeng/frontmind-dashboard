@@ -68,6 +68,29 @@ import {
   listWorkspaceDeliveryTickets,
   toPublicDeliveryTicketCreationResult,
 } from "./delivery-ticket-service";
+import type { DashboardPayload } from "../shared/dashboard";
+
+export function projectUserDashboardPayload(input: {
+  payload: DashboardPayload;
+  configured: boolean;
+  contentAssetsAllowed: boolean;
+}) {
+  if (!input.configured) return null;
+  const payload = toPublicDashboardPayload(input.payload);
+  if (input.contentAssetsAllowed) return payload;
+  return {
+    ...payload,
+    metrics: [],
+    keywordTables: [],
+    questions: [],
+    monitoringAnswers: [],
+    citations: [],
+    contentAssets: [],
+    optimizationReport: null,
+    progressReports: [],
+    sections: [],
+  };
+}
 
 function toServiceError(error: unknown): never {
   if (error instanceof DeliveryTicketError) {
@@ -389,10 +412,19 @@ export const workspaceRouter = router({
 
   dashboard: protectedProcedure.query(async ({ ctx }) => {
     try {
-      const workspace = await getDashboardWorkspace(ctx.user.id);
+      const [workspace, portal] = await Promise.all([
+        getDashboardWorkspace(ctx.user.id),
+        getServicePortal(ctx.user.id),
+      ]);
+      const configured = workspace.revision > 0;
       return {
         ...workspace,
-        payload: toPublicDashboardPayload(workspace.payload),
+        configured,
+        payload: projectUserDashboardPayload({
+          payload: workspace.payload,
+          configured,
+          contentAssetsAllowed: portal.capabilities.contentAssets.allowed,
+        }),
       };
     } catch (error) {
       throw toTrpcError(error);

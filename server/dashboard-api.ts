@@ -679,6 +679,38 @@ export function assertDashboardImportModuleEnabled(
   }
 }
 
+async function assertDashboardImportCapability(
+  userId: number,
+  module: DashboardAdminImportModule,
+) {
+  const capability =
+    module === "monitoring"
+      ? "monitoring"
+      : module === "response-logic"
+        ? "responseLogic"
+        : module === "questions"
+          ? "questionSelection"
+          : module === "keywords"
+            ? "globalKeywords"
+            : module === "optimization-report"
+              ? "progressReport"
+              : "contentAssets";
+  try {
+    return await assertServiceCapability(userId, capability);
+  } catch (error) {
+    if (
+      module !== "profile" ||
+      !(error instanceof ServiceEntitlementError) ||
+      error.code !== "CAPABILITY_UPGRADE_REQUIRED"
+    ) {
+      throw error;
+    }
+    // A knowledge-only customer still needs an administrator-confirmed
+    // enterprise identity before a knowledge archive can be published.
+    return assertServiceCapability(userId, "knowledgeBuild");
+  }
+}
+
 export function assertDashboardImportPublishHash(input: {
   module: DashboardAdminImportModule;
   fileHash: string;
@@ -3634,19 +3666,9 @@ router.put(
                 : req.header("x-import-file-hash"),
           });
         }
-        const servicePortal = await assertServiceCapability(
+        const servicePortal = await assertDashboardImportCapability(
           targetUserId,
-          importModule === "monitoring"
-            ? "monitoring"
-            : importModule === "response-logic"
-              ? "responseLogic"
-              : importModule === "questions"
-                ? "questionSelection"
-                : importModule === "keywords"
-                  ? "globalKeywords"
-                  : importModule === "optimization-report"
-                    ? "progressReport"
-                    : "contentAssets",
+          importModule,
         );
         if (![".csv", ".json", ".xlsx"].includes(extension)) {
           throw new Error("看板板块仅支持 CSV、XLSX 或 JSON");

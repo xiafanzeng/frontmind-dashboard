@@ -356,7 +356,7 @@ export function assertDeliveryTicketServiceEligibility(
     throw new DeliveryTicketError(
       "DELIVERY_TICKET_UPGRADE_REQUIRED",
       ticketType === "website_operation"
-        ? "基础版不包含 AI 友好官网管理，请升级进阶版或豪华版。"
+        ? "普通版不包含 AI 友好官网管理，请升级进阶版或豪华版。"
         : "当前套餐不包含此工单服务，请升级进阶版或豪华版。",
       403,
     );
@@ -984,7 +984,7 @@ async function currentQuota(
         : portal.service.status === "active" &&
             portal.service.planCode === "basic" &&
             pool === "website_content_publish"
-          ? "基础版不包含 AI 友好官网管理。"
+          ? "普通版不包含 AI 友好官网管理。"
           : portal.service.status === "expired" ||
               portal.service.status === "cancelled"
             ? "当前服务已到期，仅可查看历史工单。"

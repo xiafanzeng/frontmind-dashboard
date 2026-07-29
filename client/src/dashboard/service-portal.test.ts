@@ -196,7 +196,7 @@ describe("service portal adapter", () => {
       schemaVersion: 1,
       service: {
         planCode: "basic",
-        planName: "基础版",
+        planName: "普通版",
         status: "active",
       },
       capabilities: availableCapabilities(),

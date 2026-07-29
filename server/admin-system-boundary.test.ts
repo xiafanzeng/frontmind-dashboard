@@ -75,6 +75,8 @@ describe("system administrator boundary", () => {
           displayName: "新客户",
           role: "user",
           planCode: "luxury",
+          deliveryAdminId: 42,
+          apiKey: "sk-boundary-customer-credential-000001",
         }),
     ],
     [

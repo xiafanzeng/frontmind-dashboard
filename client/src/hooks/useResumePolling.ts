@@ -29,7 +29,10 @@ import {
   fetchKnowledgeBaseProgress,
   reconcileKnowledgeBaseProgress,
 } from "@/lib/knowledge-progress";
-import { sliceNewOutput } from "@/hooks/useSendMessage";
+import {
+  collectAssistantOutputIds,
+  sliceNewOutput,
+} from "@/hooks/useSendMessage";
 import { toast } from "sonner";
 
 const RESUME_POLL_INTERVAL = 4000; // 4 seconds between resume polls
@@ -56,9 +59,19 @@ async function checkAndUpdateTask(
     // Parse and update output messages
     const baselineOutputLength = conv.lastKnownOutputLength || 0;
     if (taskData.output && taskData.output.length > 0) {
+      const lastUserIndex = conv.messages.reduce(
+        (latest, message, index) => (message.role === "user" ? index : latest),
+        -1,
+      );
+      const historicalMessages =
+        lastUserIndex >= 0
+          ? conv.messages.slice(0, lastUserIndex)
+          : conv.messages;
+      const historicalOutputIds = collectAssistantOutputIds(historicalMessages);
       const newOutput = sliceNewOutput(
         taskData.output,
         baselineOutputLength,
+        historicalOutputIds,
       );
 
       if (newOutput.length > 0) {
@@ -251,10 +264,7 @@ export function useResumePolling() {
         );
         stopResumePolling();
       } else if (isResumingRef.current) {
-        resumeTimerRef.current = setTimeout(
-          pollOnce,
-          RESUME_POLL_INTERVAL,
-        );
+        resumeTimerRef.current = setTimeout(pollOnce, RESUME_POLL_INTERVAL);
       }
     };
 
@@ -292,12 +302,7 @@ export function useResumePolling() {
     return () => {
       clearTimeout(timer);
     };
-  }, [
-    hydrated,
-    resumableTaskKey,
-    startResumePolling,
-    stopResumePolling,
-  ]);
+  }, [hydrated, resumableTaskKey, startResumePolling, stopResumePolling]);
 
   useEffect(() => stopResumePolling, [stopResumePolling]);
 

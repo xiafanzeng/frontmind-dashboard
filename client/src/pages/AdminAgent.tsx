@@ -61,17 +61,18 @@ export default function AdminAgent({
 
   return (
     <PortalShell
+      mode="fullscreen"
       eyebrow="FrontMind 管理中心 · Agent 与资源"
       title="FrontMind Agent"
       navItems={navItems}
       accountLabel={
         previewMode
-          ? `${previewSystemAdmin ? "系统管理员" : "普通管理员"}验收账号`
+          ? `${previewSystemAdmin ? "系统管理员" : "交付管理员"}验收账号`
           : undefined
       }
       roleLabel={
         previewMode
-          ? `${previewSystemAdmin ? "系统管理员" : "普通管理员"} · 只读验收预览`
+          ? `${previewSystemAdmin ? "系统管理员" : "交付管理员"} · 只读验收预览`
           : undefined
       }
     >
@@ -79,7 +80,12 @@ export default function AdminAgent({
         {previewMode ? (
           <PreviewAgentWorkspace />
         ) : (
-          <Home embedded hidePortalNavigation />
+          <Home
+            embedded
+            hidePortalNavigation
+            showKnowledgeBaseStarter={false}
+            showAccountMenu={false}
+          />
         )}
       </AgentViewport>
     </PortalShell>
@@ -90,7 +96,7 @@ function AgentViewport({ children }: { children: React.ReactNode }) {
   return (
     <section
       aria-label="FrontMind Agent 工作区"
-      className="h-[calc(100dvh-138px)] min-h-[620px] overflow-hidden rounded-[20px] border border-[#ded6e5] bg-white shadow-[0_20px_55px_rgba(33,19,58,.1)]"
+      className="h-full min-h-0 overflow-hidden bg-white"
     >
       {children}
     </section>
@@ -175,7 +181,7 @@ function PreviewAgentWorkspace() {
 
       <main className="relative flex min-w-0 flex-1 flex-col">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(800px_circle_at_45%_4%,rgba(91,42,134,.08),transparent_55%)]" />
-        <header className="relative z-10 flex items-center justify-between gap-3 border-b border-[#e8e2dc] bg-white/75 px-4 py-3 backdrop-blur sm:px-6">
+        <header className="relative z-10 flex items-center justify-between gap-3 border-b border-[#e8e2dc] bg-white/75 py-3 pl-20 pr-4 backdrop-blur sm:px-6">
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold text-[#221a33]">
               {activeConversation.title}

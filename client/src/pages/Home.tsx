@@ -22,6 +22,8 @@ export default function Home({
   composerPrefill,
   hideSidebar = false,
   hidePortalNavigation = false,
+  showKnowledgeBaseStarter = true,
+  showAccountMenu = true,
   responseLogicContext,
 }: {
   embedded?: boolean;
@@ -30,6 +32,8 @@ export default function Home({
   composerPrefill?: string;
   hideSidebar?: boolean;
   hidePortalNavigation?: boolean;
+  showKnowledgeBaseStarter?: boolean;
+  showAccountMenu?: boolean;
   responseLogicContext?: ResponseLogicTaskContext;
 } = {}) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -139,6 +143,7 @@ export default function Home({
           onOpenSettings={() => setSettingsOpen(true)}
           embedded={embedded}
           hidePortalNavigation={hidePortalNavigation}
+          showAccountMenu={showAccountMenu}
         />
       )}
 
@@ -149,6 +154,8 @@ export default function Home({
           syncKnowledgeBaseSnapshot={syncKnowledgeBaseSnapshot}
           composerPrefill={composerPrefill}
           responseLogicContext={responseLogicContext}
+          showKnowledgeBaseStarter={showKnowledgeBaseStarter}
+          reserveOuterMobileNav={!showAccountMenu}
         />
       </main>
 

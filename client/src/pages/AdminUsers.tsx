@@ -24,7 +24,10 @@ import {
 } from "@shared/auth-constraints";
 import type { ServicePlanCode } from "@shared/service-portal";
 import { trpc } from "@/lib/trpc";
-import { isSystemAdminAccount } from "@/lib/admin-access";
+import {
+  isProtectedBuiltinAdminUsername,
+  isSystemAdminAccount,
+} from "@/lib/admin-access";
 import PortalShell from "@/components/PortalShell";
 import { getAdminNav } from "@/pages/AdminDashboard";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -299,7 +302,16 @@ export default function AdminUsers() {
         </Card>
       </div>
 
-      <CreateUserDialog open={createOpen} onOpenChange={setCreateOpen} />
+      <CreateUserDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        deliveryAdmins={users.filter(
+          (account) =>
+            account.role === "admin" &&
+            account.adminAccessLevel === "delivery_admin" &&
+            account.isActive,
+        )}
+      />
       <ResetPasswordDialog
         user={resetUser}
         onOpenChange={(open) => !open && setResetUser(null)}
@@ -483,6 +495,9 @@ function UserRow({
   const initials = Array.from(name).slice(0, 2).join("").toUpperCase();
   const busy = pending || accessPending;
   const systemAdmin = isSystemAdminAccount(account);
+  const protectedBuiltinAdmin = isProtectedBuiltinAdminUsername(
+    account.username,
+  );
 
   return (
     <div className="flex flex-col gap-4 px-4 py-4 sm:flex-row sm:items-center sm:px-5">
@@ -577,8 +592,14 @@ function UserRow({
           size="sm"
           variant="outline"
           className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-          disabled={busy || isCurrent}
-          title={isCurrent ? "不能删除当前登录账号" : undefined}
+          disabled={busy || isCurrent || protectedBuiltinAdmin}
+          title={
+            protectedBuiltinAdmin
+              ? "内置 admin 系统管理员不能被删除"
+              : isCurrent
+                ? "不能删除当前登录账号"
+                : undefined
+          }
           onClick={onDelete}
         >
           <Trash2 className="h-3.5 w-3.5" />
@@ -593,19 +614,27 @@ export function CreateUserDialog({
   open,
   onOpenChange,
   userOnly = false,
+  deliveryAdmins = [],
   onCreated,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   userOnly?: boolean;
+  deliveryAdmins?: Array<{
+    id: number;
+    username: string;
+    displayName?: string | null;
+  }>;
   onCreated?: (userId: number) => void;
 }) {
   const utils = trpc.useUtils();
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
+  const [apiKey, setApiKey] = useState("");
   const [role, setRole] = useState<"user" | "admin">("user");
   const [planCode, setPlanCode] = useState<ServicePlanCode | "">("");
+  const [deliveryAdminId, setDeliveryAdminId] = useState("");
   const [adminAccessLevel, setAdminAccessLevel] = useState<
     "system_admin" | "delivery_admin"
   >("delivery_admin");
@@ -627,8 +656,10 @@ export function CreateUserDialog({
     setUsername("");
     setDisplayName("");
     setPassword("");
+    setApiKey("");
     setRole("user");
     setPlanCode("");
+    setDeliveryAdminId("");
     setAdminAccessLevel("delivery_admin");
     setCreatedSetup(null);
     createMutation.reset();
@@ -659,6 +690,14 @@ export function CreateUserDialog({
       toast.error("请选择客户套餐");
       return;
     }
+    if (role === "user" && !apiKey.trim()) {
+      toast.error("请填写客户 API Key");
+      return;
+    }
+    if (role === "user" && !deliveryAdminId) {
+      toast.error("请选择客户主负责人");
+      return;
+    }
 
     try {
       const result =
@@ -675,6 +714,8 @@ export function CreateUserDialog({
               displayName: displayName.trim() || undefined,
               role: "user",
               planCode: planCode as ServicePlanCode,
+              deliveryAdminId: Number(deliveryAdminId),
+              apiKey: apiKey.trim(),
             });
       toast.success("账号已创建", {
         description: displayName.trim() || normalizedUsername,
@@ -709,7 +750,8 @@ export function CreateUserDialog({
                 用户账号已创建
               </DialogTitle>
               <DialogDescription>
-                客户账号和待确认套餐已建立，但尚未生成可用配额。请由系统管理员在客户交付工作台补齐订单、合同和签署证据后再开通权益。
+                客户账号、独立 API
+                Key、套餐额度和交付负责人均已配置，客户设置密码后即可使用已购买能力。
               </DialogDescription>
             </DialogHeader>
             <div className="mt-3 space-y-4">
@@ -719,14 +761,16 @@ export function CreateUserDialog({
                   {createdSetup.username}
                 </p>
                 <p className="mt-4 text-xs font-semibold text-[#716a80]">
-                  待确认套餐
+                  已开通套餐
                 </p>
                 <p className="mt-1 text-sm font-medium text-[#221a33]">
                   {createdSetup.planCode === "basic"
                     ? "普通版"
-                    : createdSetup.planCode === "advanced"
-                      ? "进阶版"
-                      : "豪华版"}
+                    : createdSetup.planCode === "knowledge"
+                      ? "知识库版"
+                      : createdSetup.planCode === "advanced"
+                        ? "进阶版"
+                        : "豪华版"}
                 </p>
                 <p className="mt-4 text-xs font-semibold text-[#716a80]">
                   一次性设置密码链接
@@ -781,8 +825,8 @@ export function CreateUserDialog({
               </DialogTitle>
               <DialogDescription>
                 {userOnly
-                  ? "创建客户时必须选择套餐；创建后仅建立待确认合同，正式权益需完成商业证据核验后开通。"
-                  : "普通用户必须选择套餐并通过一次性链接设置密码；套餐先进入待确认，管理员账号仍由系统管理员设置初始密码。"}
+                  ? "创建客户时必须选择套餐并填写有效 API Key；创建成功后套餐与额度立即生效。"
+                  : "普通用户必须选择套餐、填写有效 API Key并通过一次性链接设置密码；管理员账号仍由系统管理员设置初始密码。"}
               </DialogDescription>
             </DialogHeader>
             <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
@@ -827,10 +871,28 @@ export function CreateUserDialog({
                   />
                 </div>
               ) : (
-                <div className="rounded-xl border border-[#e1d8e8] bg-[#faf8fc] px-4 py-3 text-sm leading-6 text-[#716a80]">
-                  创建后会生成 48
-                  小时有效的一次性设置密码链接。数据库仅保存链接凭证的哈希，不保存或展示用户密码。
-                </div>
+                <>
+                  <div className="rounded-xl border border-[#e1d8e8] bg-[#faf8fc] px-4 py-3 text-sm leading-6 text-[#716a80]">
+                    创建后会生成 48
+                    小时有效的一次性设置密码链接。数据库仅保存链接凭证的哈希，不保存或展示用户密码。
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="create-api-key">客户 API Key</Label>
+                    <Input
+                      id="create-api-key"
+                      type="password"
+                      autoComplete="off"
+                      value={apiKey}
+                      onChange={(event) => setApiKey(event.target.value)}
+                      placeholder="创建前会验证 Key，可与其他客户使用相同原始 Key"
+                      disabled={createMutation.isPending}
+                    />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      Key 将按客户账号独立加密和版本化。以后替换该客户的 Key
+                      不会影响其他账号。
+                    </p>
+                  </div>
+                </>
               )}
               {!userOnly && (
                 <div className="space-y-2">
@@ -854,28 +916,62 @@ export function CreateUserDialog({
                 </div>
               )}
               {role === "user" && (
-                <div className="space-y-2">
-                  <Label>客户套餐</Label>
-                  <Select
-                    value={planCode}
-                    onValueChange={(value) =>
-                      setPlanCode(value as ServicePlanCode)
-                    }
-                    disabled={createMutation.isPending}
-                  >
-                    <SelectTrigger className="w-full" aria-label="客户套餐">
-                      <SelectValue placeholder="请选择普通版、进阶版或豪华版" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="basic">普通版</SelectItem>
-                      <SelectItem value="advanced">进阶版</SelectItem>
-                      <SelectItem value="luxury">豪华版</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <p className="text-xs leading-5 text-muted-foreground">
-                    创建时只记录待确认套餐，不生成配额。系统管理员需在客户交付工作台补齐订单、合同编号、签署主体、签署时间与核验依据后才能待生效或生效。
-                  </p>
-                </div>
+                <>
+                  <div className="space-y-2">
+                    <Label>客户套餐</Label>
+                    <Select
+                      value={planCode}
+                      onValueChange={(value) =>
+                        setPlanCode(value as ServicePlanCode)
+                      }
+                      disabled={createMutation.isPending}
+                    >
+                      <SelectTrigger className="w-full" aria-label="客户套餐">
+                        <SelectValue placeholder="请选择客户套餐" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="basic">普通版</SelectItem>
+                        <SelectItem value="knowledge">知识库版</SelectItem>
+                        <SelectItem value="advanced">进阶版</SelectItem>
+                        <SelectItem value="luxury">豪华版</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>客户主负责人</Label>
+                    <Select
+                      value={deliveryAdminId}
+                      onValueChange={setDeliveryAdminId}
+                      disabled={
+                        createMutation.isPending || deliveryAdmins.length === 0
+                      }
+                    >
+                      <SelectTrigger
+                        className="w-full"
+                        aria-label="客户主负责人"
+                      >
+                        <SelectValue
+                          placeholder={
+                            deliveryAdmins.length
+                              ? "请选择交付管理员"
+                              : "暂无可用交付管理员"
+                          }
+                        />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {deliveryAdmins.map((admin) => (
+                          <SelectItem key={admin.id} value={String(admin.id)}>
+                            {admin.displayName || admin.username} · @
+                            {admin.username}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      该交付管理员会成为客户主负责人，并承担该客户的任务用量归属。
+                    </p>
+                  </div>
+                </>
               )}
               {role === "admin" && (
                 <div className="space-y-2">
@@ -915,7 +1011,9 @@ export function CreateUserDialog({
                 <Button
                   type="submit"
                   disabled={
-                    createMutation.isPending || (role === "user" && !planCode)
+                    createMutation.isPending ||
+                    (role === "user" &&
+                      (!planCode || !apiKey.trim() || !deliveryAdminId))
                   }
                 >
                   {createMutation.isPending && (

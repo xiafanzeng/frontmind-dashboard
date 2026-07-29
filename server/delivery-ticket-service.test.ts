@@ -657,7 +657,7 @@ describe("delivery ticket quota lifecycle", () => {
         } as any,
         "website_operation",
       ),
-    ).toThrow("基础版不包含 AI 友好官网管理");
+    ).toThrow("普通版不包含 AI 友好官网管理");
   });
 
   it("rejects expired services on the server", () => {

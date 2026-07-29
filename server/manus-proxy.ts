@@ -71,6 +71,16 @@ const downloadTokenCache = new Map<
   }
 >();
 const DOWNLOAD_TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
+export const MAX_EXTERNAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+
+export class ExternalDownloadTooLargeError extends Error {
+  readonly code = "EXTERNAL_DOWNLOAD_TOO_LARGE";
+
+  constructor(readonly maxBytes = MAX_EXTERNAL_DOWNLOAD_BYTES) {
+    super("External download exceeds the permitted size");
+    this.name = "ExternalDownloadTooLargeError";
+  }
+}
 
 export function isPrivateUpstreamCollectionRequest(
   method: string,
@@ -413,6 +423,119 @@ function responseHeaderValue(value: unknown): string | undefined {
   return undefined;
 }
 
+function declaredContentLength(headers: unknown): number | undefined {
+  if (!headers || typeof headers !== "object") return undefined;
+  const raw = responseHeaderValue(
+    (headers as Record<string, unknown>)["content-length"],
+  );
+  if (!raw || !/^\d+$/.test(raw)) return undefined;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+function destroyDownloadStream(value: unknown) {
+  if (
+    value &&
+    typeof value === "object" &&
+    typeof (value as { destroy?: unknown }).destroy === "function"
+  ) {
+    (value as { destroy: () => void }).destroy();
+  }
+}
+
+/**
+ * Buffer a response only after enforcing its declared size, then enforce the
+ * same cap while consuming every chunk. The streaming check is authoritative
+ * for chunked responses and for servers that under-report Content-Length.
+ */
+export async function readBoundedExternalDownload(
+  data: unknown,
+  headers: unknown,
+  maxBytes = MAX_EXTERNAL_DOWNLOAD_BYTES,
+): Promise<Buffer> {
+  const declared = declaredContentLength(headers);
+  if (declared !== undefined && declared > maxBytes) {
+    destroyDownloadStream(data);
+    throw new ExternalDownloadTooLargeError(maxBytes);
+  }
+
+  if (
+    data &&
+    typeof data === "object" &&
+    Symbol.asyncIterator in data &&
+    typeof (data as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function"
+  ) {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    try {
+      for await (const chunk of data as AsyncIterable<unknown>) {
+        const buffer = Buffer.isBuffer(chunk)
+          ? chunk
+          : chunk instanceof Uint8Array
+            ? Buffer.from(chunk)
+            : Buffer.from(String(chunk));
+        totalBytes += buffer.length;
+        if (totalBytes > maxBytes) {
+          throw new ExternalDownloadTooLargeError(maxBytes);
+        }
+        chunks.push(buffer);
+      }
+    } catch (error) {
+      destroyDownloadStream(data);
+      throw error;
+    }
+    return Buffer.concat(chunks, totalBytes);
+  }
+
+  const buffer = Buffer.isBuffer(data)
+    ? data
+    : data instanceof Uint8Array
+      ? Buffer.from(data)
+      : data instanceof ArrayBuffer
+        ? Buffer.from(data)
+        : Buffer.from(String(data ?? ""));
+  if (buffer.length > maxBytes) {
+    throw new ExternalDownloadTooLargeError(maxBytes);
+  }
+  return buffer;
+}
+
+function isExternalDownloadTooLarge(error: unknown): boolean {
+  if (error instanceof ExternalDownloadTooLargeError) return true;
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; message?: unknown };
+  return (
+    candidate.code === "ERR_BAD_RESPONSE" &&
+    typeof candidate.message === "string" &&
+    candidate.message.includes("maxContentLength")
+  );
+}
+
+function sendExternalDownloadTooLarge(res: Response) {
+  return res.status(413).json({
+    error: {
+      message: "文件超过允许的下载大小",
+      code: "EXTERNAL_DOWNLOAD_TOO_LARGE",
+    },
+  });
+}
+
+async function fetchBoundedExternalDownload(
+  url: string,
+  options: Record<string, unknown>,
+) {
+  const response = await axios.get(url, {
+    ...options,
+    responseType: "stream",
+    maxContentLength: MAX_EXTERNAL_DOWNLOAD_BYTES,
+  });
+  const data = await readBoundedExternalDownload(
+    response.data,
+    response.headers,
+  );
+  return { ...response, data };
+}
+
 /**
  * Keys whose string values should not be brand-renamed because they contain
  * identifiers, URLs, or encoded data that would break if modified. Security
@@ -504,6 +627,308 @@ export function publicUpstreamPayload(value: unknown, apiKey: string) {
       secrets: [apiKey],
     }),
   );
+}
+
+const PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS = [
+  "id",
+  "task_id",
+  "response_id",
+  "object",
+  "status",
+  "model",
+  "created_at",
+  "updated_at",
+  "started_at",
+  "completed_at",
+  "credit_usage",
+  "task_url",
+  "share_url",
+  "task_title",
+  "title",
+] as const;
+
+const PUBLIC_TASK_OUTPUT_SCALAR_KEYS = [
+  "id",
+  "type",
+  "status",
+  "name",
+  "call_id",
+  "text",
+  "message",
+  "output",
+  "file_id",
+  "fileId",
+  "url",
+  "file_url",
+  "fileUrl",
+  "image_url",
+  "imageUrl",
+  "filename",
+  "fileName",
+  "mime_type",
+  "mimeType",
+] as const;
+
+const PUBLIC_TASK_CONTENT_SCALAR_KEYS = [
+  "type",
+  "text",
+  "file_id",
+  "fileId",
+  "file_url",
+  "fileUrl",
+  "image_url",
+  "imageUrl",
+  "url",
+  "filename",
+  "fileName",
+  "mime_type",
+  "mimeType",
+] as const;
+
+const PUBLIC_TASK_METADATA_SCALAR_KEYS = [
+  "credit_usage",
+  "task_url",
+  "share_url",
+  "task_title",
+  "title",
+] as const;
+
+const PUBLIC_TASK_ERROR_SCALAR_KEYS = [
+  "message",
+  "code",
+  "type",
+  "param",
+  "status",
+] as const;
+
+const PUBLIC_TASK_ANNOTATION_SCALAR_KEYS = [
+  "type",
+  "url",
+  "title",
+  "start_index",
+  "end_index",
+  "file_id",
+  "fileId",
+  "filename",
+  "fileName",
+  "index",
+  "quote",
+] as const;
+
+const PUBLIC_TASK_ACTION_SCALAR_KEYS = [
+  "type",
+  "url",
+  "query",
+  "selector",
+  "x",
+  "y",
+] as const;
+
+const PUBLIC_TASK_TELEMETRY_KEY =
+  /^(?:(?:input|output)_(?:tokens?|credits?|cost|characters|count)(?:_|$)|(?:id|name|label|kind|version|status|stage|step|phase|progress|percent|percentage|current|total|completed|failed|success|successful|count|usage|credit|credits|token|tokens|cost|duration|elapsed|remaining|message|summary|visited|links|pages|characters|images|documents|queries|saved|downloaded|parsed|started|finished|created|updated)(?:_|$))/i;
+
+function isPublicScalar(value: unknown): value is string | number | boolean {
+  return (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  );
+}
+
+function pickPublicScalars(
+  value: unknown,
+  keys: readonly string[],
+): Record<string, string | number | boolean> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const source = value as Record<string, unknown>;
+  const result: Record<string, string | number | boolean> = {};
+  for (const key of keys) {
+    if (isPublicScalar(source[key])) {
+      result[key] = source[key];
+    }
+  }
+  return result;
+}
+
+function publicTaskTelemetry(value: unknown, depth = 0): unknown {
+  if (value === null || depth > 8) return undefined;
+  if (isPublicScalar(value)) return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => publicTaskTelemetry(item, depth + 1))
+      .filter((item) => item !== undefined);
+  }
+  if (typeof value !== "object") return undefined;
+
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (!PUBLIC_TASK_TELEMETRY_KEY.test(key)) continue;
+    const sanitized = publicTaskTelemetry(item, depth + 1);
+    if (sanitized !== undefined) result[key] = sanitized;
+  }
+  return result;
+}
+
+function publicTaskAnnotations(value: unknown): unknown[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const annotations = value
+    .map((item) => pickPublicScalars(item, PUBLIC_TASK_ANNOTATION_SCALAR_KEYS))
+    .filter((item) => Object.keys(item).length > 0);
+  return annotations.length > 0 ? annotations : undefined;
+}
+
+function publicTaskContent(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  const content: Record<string, unknown>[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const source = item as Record<string, unknown>;
+    const type =
+      typeof source.type === "string" ? source.type.toLowerCase() : "";
+    if (type.startsWith("input_") || type.includes("instruction")) continue;
+
+    const sanitized: Record<string, unknown> = pickPublicScalars(
+      source,
+      PUBLIC_TASK_CONTENT_SCALAR_KEYS,
+    );
+    const annotations = publicTaskAnnotations(source.annotations);
+    if (annotations) sanitized.annotations = annotations;
+    if (Object.keys(sanitized).length > 0) content.push(sanitized);
+  }
+  return content;
+}
+
+function publicTaskOutput(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  const output: Record<string, unknown>[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const source = item as Record<string, unknown>;
+    const role =
+      typeof source.role === "string" ? source.role.toLowerCase() : "";
+    const type =
+      typeof source.type === "string" ? source.type.toLowerCase() : "";
+    if (
+      role === "user" ||
+      role === "system" ||
+      type.startsWith("input_") ||
+      type.includes("instruction")
+    ) {
+      continue;
+    }
+
+    const sanitized: Record<string, unknown> = pickPublicScalars(
+      source,
+      PUBLIC_TASK_OUTPUT_SCALAR_KEYS,
+    );
+    if (role === "assistant") sanitized.role = "assistant";
+
+    const content = publicTaskContent(source.content);
+    if (content.length > 0) sanitized.content = content;
+
+    if (Array.isArray(source.summary)) {
+      const summary = source.summary
+        .map((entry) => pickPublicScalars(entry, ["type", "text"]))
+        .filter((entry) => Object.keys(entry).length > 0);
+      if (summary.length > 0) sanitized.summary = summary;
+    }
+    if (Array.isArray(source.queries)) {
+      const queries = source.queries.filter(
+        (query): query is string => typeof query === "string",
+      );
+      if (queries.length > 0) sanitized.queries = queries;
+    }
+    const action = pickPublicScalars(
+      source.action,
+      PUBLIC_TASK_ACTION_SCALAR_KEYS,
+    );
+    if (Object.keys(action).length > 0) sanitized.action = action;
+
+    if (Object.keys(sanitized).length > 0) output.push(sanitized);
+  }
+  return output;
+}
+
+function redactPublicTaskValues(value: unknown, apiKey: string): unknown {
+  if (typeof value === "string") {
+    return redactSensitiveText(value, [apiKey]);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactPublicTaskValues(item, apiKey));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        redactPublicTaskValues(item, apiKey),
+      ]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Build the only task/response shape that is allowed to cross the generic
+ * browser proxy. Upstream task objects may echo the complete request,
+ * including server-injected Skills and knowledge-base context. A denylist is
+ * not sufficient for that boundary, so request-shaped fields are discarded
+ * by construction and only client-consumed result/status fields survive.
+ */
+export function publicUpstreamTaskPayload(value: unknown, apiKey: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const source = value as Record<string, unknown>;
+  const result: Record<string, unknown> = pickPublicScalars(
+    source,
+    PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS,
+  );
+
+  const metadata = pickPublicScalars(
+    source.metadata,
+    PUBLIC_TASK_METADATA_SCALAR_KEYS,
+  );
+  if (Object.keys(metadata).length > 0) result.metadata = metadata;
+
+  if (Array.isArray(source.output)) {
+    result.output = publicTaskOutput(source.output);
+  }
+
+  const error = pickPublicScalars(source.error, PUBLIC_TASK_ERROR_SCALAR_KEYS);
+  if (Object.keys(error).length > 0) result.error = error;
+
+  const usage = publicTaskTelemetry(source.usage);
+  if (
+    usage !== undefined &&
+    (typeof usage !== "object" || Object.keys(usage as object).length > 0)
+  ) {
+    result.usage = usage;
+  }
+  const progress = publicTaskTelemetry(source.progress);
+  if (
+    progress !== undefined &&
+    (typeof progress !== "object" || Object.keys(progress as object).length > 0)
+  ) {
+    result.progress = progress;
+  }
+
+  return deepSanitizeJson(redactPublicTaskValues(result, apiKey));
+}
+
+export function isPublicTaskPayloadRequest(
+  method: string,
+  targetPath: string,
+): boolean {
+  const path = targetPath.split("?")[0].replace(/\/+$/, "");
+  const normalizedMethod = method.toUpperCase();
+  if (
+    normalizedMethod === "POST" &&
+    (path === "/v1/tasks" || path === "/v1/responses")
+  ) {
+    return true;
+  }
+  if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
+  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path);
 }
 
 function collectOutputFileIds(
@@ -1875,11 +2300,9 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
       `[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`,
     );
 
-    const response = await axios.get(targetUrl, {
+    const response = await fetchBoundedExternalDownload(targetUrl, {
       ...safeExternalRequestOptions,
-      responseType: "arraybuffer",
       timeout: 120000,
-      maxContentLength: Infinity,
       validateStatus: () => true,
     });
 
@@ -1940,6 +2363,9 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
 
     res.send(sanitizedBuffer);
   } catch (error: any) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {
@@ -2028,11 +2454,9 @@ async function downloadFromS3(
     `[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`,
   );
 
-  const response = await axios.get(safeS3Url, {
+  const response = await fetchBoundedExternalDownload(safeS3Url, {
     ...safeExternalRequestOptions,
-    responseType: "arraybuffer",
     timeout: 120000,
-    maxContentLength: Infinity,
     validateStatus: () => true,
   });
 
@@ -2147,14 +2571,12 @@ async function handleFileDownload(
     const contentUrl = `${cleanBaseUrl}/v1/files/${fileId}/content`;
 
     try {
-      const response = await axios.get(contentUrl, {
+      const response = await fetchBoundedExternalDownload(contentUrl, {
         headers: {
           API_KEY: apiKey,
           Authorization: `Bearer ${apiKey}`,
         },
-        responseType: "arraybuffer",
         timeout: 120000,
-        maxContentLength: Infinity,
         validateStatus: () => true,
       });
 
@@ -2207,6 +2629,7 @@ async function handleFileDownload(
         return;
       }
     } catch (e: any) {
+      if (isExternalDownloadTooLarge(e)) throw e;
       console.warn(
         "[FrontMind Proxy] Direct /content download failed:",
         safeErrorForLog(e, { secrets: [apiKey] }),
@@ -2320,6 +2743,9 @@ router.get("/download/:token", async (req: Request, res: Response) => {
       data.credentialId,
     );
   } catch (error: any) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] Direct token download error:",
       safeErrorForLog(error, { secrets: [logSecret] }),
@@ -2355,6 +2781,9 @@ router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
       req.frontmindCredential?.id,
     );
   } catch (error: any) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] File download error:",
       safeErrorForLog(error, { secrets: [apiKey] }),
@@ -2387,6 +2816,9 @@ router.get("/v1/files/:fileId/content", async (req: Request, res: Response) => {
       req.frontmindCredential?.id,
     );
   } catch (error: any) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] File content download error:",
       safeErrorForLog(error, { secrets: [apiKey] }),
@@ -2604,7 +3036,9 @@ router.all("/*", async (req: Request, res: Response) => {
 
     const publicResponse =
       typeof response.data === "object"
-        ? publicUpstreamPayload(response.data, apiKey)
+        ? isPublicTaskPayloadRequest(req.method, targetPath)
+          ? publicUpstreamTaskPayload(response.data, apiKey)
+          : publicUpstreamPayload(response.data, apiKey)
         : typeof response.data === "string"
           ? sanitizeText(redactSensitiveText(response.data, [apiKey]))
           : response.data;

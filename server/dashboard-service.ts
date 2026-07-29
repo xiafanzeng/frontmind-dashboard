@@ -203,32 +203,25 @@ export async function assertWorkspaceAccess(
   throw new AuthServiceError("NOT_FOUND", "User workspace not found");
 }
 
-function withSnapshotMetrics(
-  payload: DashboardPayload,
-  snapshot?: {
-    version: number;
-    documentCount: number;
-    imageCount: number;
-    characterCount: number;
-  },
+export function assertManagedCredentialMutationAccess(
+  actor: Pick<
+    AuthenticatedUser,
+    "id" | "role" | "username" | "adminAccessLevel"
+  >,
+  deliveryAdminId: number | null | undefined,
 ) {
-  if (!snapshot) return payload;
-  const generated = [
-    { label: "知识文档", value: snapshot.documentCount, unit: "篇" },
-    { label: "图片资产", value: snapshot.imageCount, unit: "张" },
-    { label: "内容字数", value: snapshot.characterCount, unit: "字" },
-  ];
-  const reserved = new Set([
-    "知识库版本",
-    ...generated.map((metric) => metric.label),
-  ]);
-  return {
-    ...payload,
-    metrics: [
-      ...generated,
-      ...payload.metrics.filter((metric) => !reserved.has(metric.label)),
-    ].slice(0, 24),
-  };
+  if (isSystemAdmin(actor)) return;
+  if (
+    actor.role === "admin" &&
+    actor.adminAccessLevel === "delivery_admin" &&
+    deliveryAdminId === actor.id
+  ) {
+    return;
+  }
+  throw new AuthServiceError(
+    "INVALID_CREDENTIAL",
+    "只有客户主负责人或系统管理员可以管理客户 Key",
+  );
 }
 
 function toPublicOptimizationReport(
@@ -305,7 +298,10 @@ export async function getDashboardWorkspace(userId: number) {
     displayName,
   });
   return {
-    payload: withSnapshotMetrics(payload, snapshotRows[0]),
+    // Keep the administrator-authored dashboard payload lossless. Knowledge
+    // snapshot counts belong to the knowledge viewer; injecting them here
+    // would be written back by the editor and overwrite real customer metrics.
+    payload,
     sourceName: content?.sourceName ?? null,
     enterpriseIdentityBoundAt:
       content?.enterpriseIdentityBoundAt?.getTime() ?? null,
@@ -1215,9 +1211,10 @@ export async function listManagedWorkspaceUsers(actor: AuthenticatedUser) {
     admins: adminRows,
     users: userRows.map((user) => {
       const usageOwner = usageOwnerByUser.get(user.id);
-      const credential = credentialByUser.get(
-        usageOwner?.deliveryAdminId ?? user.id,
-      );
+      const directCredential = credentialByUser.get(user.id);
+      const credential =
+        directCredential ??
+        credentialByUser.get(usageOwner?.deliveryAdminId ?? user.id);
       const dashboard = dashboardByUser.get(user.id);
       return {
         ...user,
@@ -1245,6 +1242,7 @@ export async function listManagedWorkspaceUsers(actor: AuthenticatedUser) {
           fingerprint: credential?.fingerprint ?? null,
           status: credential?.validationStatus ?? null,
           verifiedAt: credential?.verifiedAt?.getTime() ?? null,
+          inherited: Boolean(!directCredential && usageOwner),
         },
       };
     }),
@@ -1298,7 +1296,7 @@ export async function setWorkspaceAssignments(input: {
   ) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "积分归属管理员必须是已选中的交付管理员",
+      "主负责人必须是已选中的有效交付管理员",
     );
   }
   await db.transaction(async (tx) => {
@@ -1334,7 +1332,7 @@ export async function setWorkspaceAssignments(input: {
     ) {
       throw new AuthServiceError(
         "CONFLICT",
-        "积分归属管理员状态已变化，请刷新后重新分配",
+        "主负责人状态已变化，请刷新后重新分配",
       );
     }
 
@@ -1389,21 +1387,6 @@ export async function setWorkspaceAssignments(input: {
         revision: 1,
       });
     }
-    if (nextUsageOwnerId != null) {
-      await tx
-        .update(apiCredentials)
-        .set({
-          status: "retired",
-          retiredAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(apiCredentials.userId, input.userId),
-            eq(apiCredentials.status, "active"),
-          ),
-        );
-    }
     await writeWorkspaceAuditEvent(
       {
         actor: input.actor,
@@ -1415,8 +1398,7 @@ export async function setWorkspaceAssignments(input: {
         metadata: {
           previousAdminIds: previousAssignments.map((row) => row.adminId),
           adminIds: uniqueAdminIds,
-          previousUsageOwnerAdminId:
-            previousOwner?.deliveryAdminId ?? null,
+          previousUsageOwnerAdminId: previousOwner?.deliveryAdminId ?? null,
           usageOwnerAdminId: nextUsageOwnerId,
         },
       },
@@ -1439,16 +1421,16 @@ export async function replaceManagedUserCredential(input: {
     );
   }
   await assertWorkspaceAccess(input.actor, input.userId);
-  const db = await requireDb();
-  const usageOwners = await db
-    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-    .from(userUsageOwners)
-    .where(eq(userUsageOwners.userId, input.userId))
-    .limit(1);
-  if (usageOwners[0]) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "该用户继承交付管理员的共享 Key，请在交付管理员的 FrontMind Agent 设置中更换",
+  if (!isSystemAdmin(input.actor)) {
+    const db = await requireDb();
+    const owners = await db
+      .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
+      .from(userUsageOwners)
+      .where(eq(userUsageOwners.userId, input.userId))
+      .limit(1);
+    assertManagedCredentialMutationAccess(
+      input.actor,
+      owners[0]?.deliveryAdminId,
     );
   }
   const credential = await replaceApiCredential(input.userId, input.apiKey);
@@ -1479,16 +1461,16 @@ export async function deleteManagedUserCredential(input: {
     );
   }
   await assertWorkspaceAccess(input.actor, input.userId);
-  const db = await requireDb();
-  const usageOwners = await db
-    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-    .from(userUsageOwners)
-    .where(eq(userUsageOwners.userId, input.userId))
-    .limit(1);
-  if (usageOwners[0]) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "该用户使用交付管理员的共享 Key，不能在用户工作区删除",
+  if (!isSystemAdmin(input.actor)) {
+    const db = await requireDb();
+    const owners = await db
+      .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
+      .from(userUsageOwners)
+      .where(eq(userUsageOwners.userId, input.userId))
+      .limit(1);
+    assertManagedCredentialMutationAccess(
+      input.actor,
+      owners[0]?.deliveryAdminId,
     );
   }
   await deleteActiveApiCredential(input.userId);
@@ -1582,8 +1564,7 @@ export function getShanghaiCalendarMonthPeriod(now = Date.now()) {
   const shanghaiNow = new Date(now + shanghaiOffsetMs);
   const year = shanghaiNow.getUTCFullYear();
   const monthIndex = shanghaiNow.getUTCMonth();
-  const startAt =
-    Date.UTC(year, monthIndex, 1, 0, 0, 0, 0) - shanghaiOffsetMs;
+  const startAt = Date.UTC(year, monthIndex, 1, 0, 0, 0, 0) - shanghaiOffsetMs;
   const endAt =
     Date.UTC(year, monthIndex + 1, 1, 0, 0, 0, 0) - shanghaiOffsetMs;
   return {
@@ -1845,10 +1826,7 @@ async function getAccountCreditUsageBetween(
   };
 }
 
-export async function getAccountCreditUsage(
-  userId: number,
-  windowDays = 30,
-) {
+export async function getAccountCreditUsage(userId: number, windowDays = 30) {
   const normalizedWindowDays =
     Number.isInteger(windowDays) && windowDays > 0 && windowDays <= 365
       ? windowDays

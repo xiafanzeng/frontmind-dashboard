@@ -573,10 +573,23 @@ const previewWorkflowOrder = Object.keys(
 ) as PreviewWorkflowStepId[];
 
 function previewWorkflow(
-  plan: "basic" | "advanced" | "luxury",
+  plan: "basic" | "knowledge" | "advanced" | "luxury",
   currentStep: PreviewWorkflowStepId | null,
   nextAction: ServiceAction,
 ): ServiceWorkflowStep[] {
+  if (plan === "knowledge") {
+    return previewWorkflowOrder.map((id) => ({
+      id,
+      label: previewWorkflowMeta[id].label,
+      status: id === "knowledge" ? "complete" : "locked",
+      lockedReason:
+        id === "knowledge"
+          ? ""
+          : "知识库版仅开放知识库构建、更新与展示；此功能未包含在当前套餐。",
+      href: previewWorkflowMeta[id].href,
+      ...(id === "knowledge" ? {} : { nextAction }),
+    }));
+  }
   const currentIndex =
     currentStep === null
       ? previewWorkflowOrder.length
@@ -627,7 +640,7 @@ export const previewServicePortals = {
     },
     plan: {
       code: "basic",
-      name: "基础版",
+      name: "普通版",
       billingLabel: "30 天单题服务",
       statusLabel: "已生效",
       validFrom: "2026-07-18",
@@ -658,15 +671,15 @@ export const previewServicePortals = {
     },
     capabilities: capabilitySet({
       knowledgeBuild: locked(
-        "基础版已包含官网生成的初步知识库展示，不包含对话式知识库构建。升级进阶版或豪华版后可解锁。",
+        "普通版已包含官网生成的初步知识库展示，不包含对话式知识库构建。升级进阶版或豪华版后可解锁。",
       ),
       knowledgeDisplay: available(),
       globalKeywords: locked(
-        "品牌全域词库属于进阶版与豪华版服务范围，基础版只围绕已购的单个问题开展优化。",
+        "品牌全域词库属于进阶版与豪华版服务范围，普通版只围绕已购的单个问题开展优化。",
       ),
       questionSelection: locked(
-        "基础版问题已在官网购买时完成选择，无需再次选择。继续购买基础版可新增一个问题。",
-        "继续购买基础版",
+        "普通版问题已在官网购买时完成选择，无需再次选择。继续购买普通版可新增一个问题。",
+        "继续购买普通版",
       ),
       intentOptimization: available(),
       responseLogic: available(),
@@ -683,7 +696,7 @@ export const previewServicePortals = {
     purchaseActions: [
       {
         kind: "purchase_basic",
-        label: "继续购买基础版",
+        label: "继续购买普通版",
         href: purchaseUrl,
         targetPlan: "basic",
       },
@@ -697,6 +710,79 @@ export const previewServicePortals = {
         label: "升级豪华版",
         targetPlan: "luxury",
       },
+    ],
+  },
+  knowledge: {
+    schemaVersion: 1,
+    known: true,
+    account: {
+      displayName: "验收企业",
+      username: "acceptance.knowledge",
+    },
+    plan: {
+      code: "knowledge",
+      name: "知识库版",
+      billingLabel: "季度知识库服务",
+      statusLabel: "已生效",
+      validFrom: "2026-07-18",
+      validUntil: "2026-10-17",
+    },
+    quotas: [],
+    purchasedQuestions: [],
+    historicalQuestions: [],
+    workflowSteps: previewWorkflow("knowledge", null, {
+      kind: "view_knowledge",
+      label: "查看知识库",
+      href: "/knowledge-base",
+    }),
+    knowledgeBase: {
+      status: "ready",
+      statusLabel: "可查看",
+      version: "V1",
+      sourceLabel: "知识库智能体发布",
+      updatedAt: "2026-07-24",
+    },
+    capabilities: capabilitySet({
+      knowledgeBuild: available(),
+      knowledgeDisplay: available(),
+      globalKeywords: locked(
+        "知识库版仅开放知识库构建、更新与展示；品牌全域词库未包含在当前套餐。",
+      ),
+      questionSelection: locked(
+        "知识库版仅开放知识库构建、更新与展示；问题选题未包含在当前套餐。",
+      ),
+      intentOptimization: locked(
+        "知识库版仅开放知识库构建、更新与展示；问题优化未包含在当前套餐。",
+      ),
+      responseLogic: locked(
+        "知识库版仅开放知识库构建、更新与展示；应答逻辑未包含在当前套餐。",
+      ),
+      monitoring: locked(
+        "知识库版仅开放知识库构建、更新与展示；问题监控未包含在当前套餐。",
+      ),
+      channelDistribution: locked(
+        "知识库版仅开放知识库构建、更新与展示；渠道分发未包含在当前套餐。",
+      ),
+      progressReport: locked(
+        "知识库版仅开放知识库构建、更新与展示；进度报告未包含在当前套餐。",
+      ),
+      contentAssets: locked(
+        "知识库版仅开放知识库构建、更新与展示；内容资产运营未包含在当前套餐。",
+      ),
+    }),
+    primaryNextAction: {
+      kind: "view_knowledge",
+      label: "查看知识库",
+      href: "/knowledge-base",
+    },
+    purchaseActions: [
+      {
+        kind: "contact_advisor",
+        label: "联系专员续费知识库版",
+        targetPlan: "knowledge",
+      },
+      { kind: "upgrade", label: "升级进阶版", targetPlan: "advanced" },
+      { kind: "upgrade", label: "升级豪华版", targetPlan: "luxury" },
     ],
   },
   advanced: {
@@ -875,7 +961,10 @@ export const previewServicePortals = {
       },
     ],
   },
-} satisfies Record<"basic" | "advanced" | "luxury", ServicePortalView>;
+} satisfies Record<
+  "basic" | "knowledge" | "advanced" | "luxury",
+  ServicePortalView
+>;
 
 export function getPreviewServicePortal(
   plan: keyof typeof previewServicePortals,

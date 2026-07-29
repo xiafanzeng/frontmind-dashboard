@@ -64,7 +64,7 @@ function UserBrandDashboard({
   );
 }
 
-function setPreviewPlan(plan: "basic" | "advanced" | "luxury") {
+function setPreviewPlan(plan: "basic" | "knowledge" | "advanced" | "luxury") {
   window.history.replaceState({}, "", `/preview/user?plan=${plan}`);
 }
 
@@ -83,7 +83,7 @@ describe("UserBrandDashboard service experience", () => {
         "系统会根据真实完成状态，一次只引导您处理当前最重要的一步；未到达的页面会说明前置条件。",
       ),
     ).not.toBeInTheDocument();
-    expect(screen.getByLabelText("当前服务版本：基础版")).toBeInTheDocument();
+    expect(screen.getByLabelText("当前服务版本：普通版")).toBeInTheDocument();
     expect(screen.getByText("已生效 · 30 天单题服务")).toBeInTheDocument();
     const packageScope = screen.getByText("套餐范围").closest("div");
     expect(packageScope).toHaveTextContent("已购问题");
@@ -176,7 +176,7 @@ describe("UserBrandDashboard service experience", () => {
     expect(screen.queryByText("当前看板")).not.toBeInTheDocument();
     expect(screen.queryByText("服务中")).not.toBeInTheDocument();
     expect(document.querySelector(".project-ribbon")).not.toHaveTextContent(
-      "基础版",
+      "普通版",
     );
     expect(
       screen.getByRole("heading", { name: "智能服务路径" }),
@@ -257,18 +257,14 @@ describe("UserBrandDashboard service experience", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "内容资产运营" }));
     expect(screen.getByText("剩余额度：1 次内容需求。")).toBeInTheDocument();
-    fireEvent.click(
-      screen.getByRole("button", { name: "选择品牌聚合榜单" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "选择品牌聚合榜单" }));
     expect(
       screen.getByRole("heading", { name: "提交内容需求工单" }),
     ).toBeInTheDocument();
     expect(screen.getByText("剩余 1 次")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    fireEvent.click(
-      screen.getByRole("button", { name: "AI 友好官网管理" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
     expect(
       screen.getByRole("region", { name: "官网运营功能未开放" }),
     ).toBeInTheDocument();
@@ -306,11 +302,11 @@ describe("UserBrandDashboard service experience", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        /基础版已包含官网生成的初步知识库展示，不包含对话式知识库构建/,
+        /普通版已包含官网生成的初步知识库展示，不包含对话式知识库构建/,
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "查看升级方案" }),
+      screen.getByRole("button", { name: "升级进阶版" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByTestId("embedded-knowledge-base-panel"),
@@ -324,6 +320,49 @@ describe("UserBrandDashboard service experience", () => {
     expect(embeddedKnowledgeBasePanel).toHaveBeenCalledWith(
       expect.objectContaining({ preview: true, page: "display" }),
     );
+  });
+
+  it("keeps the knowledge-only plan focused on knowledge build and display", async () => {
+    setPreviewPlan("knowledge");
+    render(<UserBrandDashboard preview />);
+
+    expect(screen.getByLabelText("当前服务版本：知识库版")).toBeInTheDocument();
+    expect(screen.getByText("知识库构建 · 更新 · 展示")).toBeInTheDocument();
+
+    for (const item of ["知识库智能体", "知识库展示"]) {
+      expect(screen.getByRole("button", { name: item })).not.toHaveAttribute(
+        "title",
+      );
+    }
+    for (const item of [
+      "品牌全域词库",
+      "问题优化",
+      "应答逻辑智能体",
+      "问题监控",
+      "进度报告",
+      "内容资产运营",
+      "AI 友好官网管理",
+    ]) {
+      expect(screen.getByRole("button", { name: item })).toHaveAttribute(
+        "title",
+      );
+    }
+
+    fireEvent.click(screen.getByRole("button", { name: "知识库智能体" }));
+    expect(
+      await screen.findByTestId("embedded-knowledge-base-panel"),
+    ).toHaveTextContent("知识库组件：build");
+
+    fireEvent.click(screen.getByRole("button", { name: "应答逻辑智能体" }));
+    expect(
+      screen.getByRole("heading", { name: "应答逻辑智能体" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "升级进阶版" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("embedded-knowledge-base-panel"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows only the purchased basic question and never presents an unconfirmed response as a confirmed result", async () => {
@@ -359,7 +398,7 @@ describe("UserBrandDashboard service experience", () => {
     fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
     expect(
       screen.getByText(
-        /品牌全域词库属于进阶版与豪华版服务范围，基础版只围绕已购的单个问题/,
+        /品牌全域词库属于进阶版与豪华版服务范围，普通版只围绕已购的单个问题/,
       ),
     ).toBeInTheDocument();
   });
@@ -522,7 +561,7 @@ describe("UserBrandDashboard service experience", () => {
       ),
     ).toBeInTheDocument();
     expect(
-      within(accountDialog).getByRole("heading", { name: "基础版" }),
+      within(accountDialog).getByRole("heading", { name: "普通版" }),
     ).toBeInTheDocument();
     expect(within(accountDialog).getByText("已生效")).toBeInTheDocument();
     expect(
@@ -547,9 +586,9 @@ describe("UserBrandDashboard service experience", () => {
     expect(
       within(accountDialog).queryByText("V1 · 可查看"),
     ).not.toBeInTheDocument();
-    expect(screen.queryByText("基础版 · 账号与服务")).not.toBeInTheDocument();
+    expect(screen.queryByText("普通版 · 账号与服务")).not.toBeInTheDocument();
     expect(
-      screen.getByRole("link", { name: "继续购买基础版" }),
+      screen.getByRole("link", { name: "继续购买普通版" }),
     ).toHaveAttribute("href", "https://www.frontmind.net");
     const upgradeAdvanced = screen.getByRole("button", {
       name: "升级进阶版",
@@ -585,7 +624,7 @@ describe("UserBrandDashboard service experience", () => {
 
     expect(
       within(accountDialog).queryByRole("link", {
-        name: "继续购买基础版",
+        name: "继续购买普通版",
       }),
     ).not.toBeInTheDocument();
     const renewLuxury = within(accountDialog).getByRole("button", {

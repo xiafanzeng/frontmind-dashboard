@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { AuthServiceError } from "./auth-service";
+import { AuthServiceError, decryptApiKey, encryptApiKey } from "./auth-service";
 import {
   presalesTaskRequests,
   presalesUpstreamResources,
@@ -53,6 +53,31 @@ describe("presales credential encryption", () => {
     expect(() =>
       decryptPresalesApiKey({ id: randomUUID(), ...encrypted }),
     ).toThrowError(AuthServiceError);
+  });
+
+  it("allows the website credential to independently store an account's raw Key", () => {
+    const apiKey = "sk-shared-between-website-and-account";
+    const websiteCredentialId = randomUUID();
+    const accountCredentialId = randomUUID();
+    const websiteEncrypted = encryptPresalesApiKey(websiteCredentialId, apiKey);
+    const accountEncrypted = encryptApiKey(7, accountCredentialId, apiKey);
+
+    expect(websiteEncrypted.encryptedKey).not.toBe(
+      accountEncrypted.encryptedKey,
+    );
+    expect(
+      decryptPresalesApiKey({
+        id: websiteCredentialId,
+        ...websiteEncrypted,
+      }),
+    ).toBe(apiKey);
+    expect(
+      decryptApiKey({
+        id: accountCredentialId,
+        userId: 7,
+        ...accountEncrypted,
+      }),
+    ).toBe(apiKey);
   });
 });
 

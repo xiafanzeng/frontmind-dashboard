@@ -1241,7 +1241,13 @@ function _parseOutputMessagesInner(
           // Normalize field names: API may return snake_case or camelCase
           const c: any = content;
           const contentType = c.type || "";
-          const fileUrl = c.fileUrl || c.file_url || c.url || "";
+          const fileId = c.fileId || c.file_id || "";
+          const rawFileUrl = c.fileUrl || c.file_url || c.url || "";
+          const fileUrl =
+            rawFileUrl ||
+            (typeof fileId === "string" && fileId.trim()
+              ? `/api/frontmind/v1/files/${encodeURIComponent(fileId.trim())}`
+              : "");
           const fileName = c.fileName || c.file_name || c.name || "file";
           const mimeType = c.mimeType || c.mime_type || c.content_type || "";
           const textValue = c.text ?? c.value ?? null;

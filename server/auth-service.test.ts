@@ -1,10 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  apiKeyOwnership,
-  upstreamResources,
-  users,
-} from "../drizzle/schema";
+import { apiKeyOwnership, upstreamResources, users } from "../drizzle/schema";
 import {
   AuthServiceError,
   assertAdminHasNoHistoricalCredentialResources,
@@ -20,6 +16,10 @@ import {
   permanentlyDeleteManagedUserRows,
   verifyPassword,
 } from "./auth-service";
+import {
+  decryptPresalesApiKey,
+  encryptPresalesApiKey,
+} from "./presales-service";
 
 const originalMasterKey = process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY;
 
@@ -102,9 +102,7 @@ describe("managed account deletion", () => {
   });
 
   it("preserves customer task history when an old administrator Key is still referenced", () => {
-    expect(() =>
-      assertAdminHasNoHistoricalCredentialResources(1),
-    ).toThrowError(
+    expect(() => assertAdminHasNoHistoricalCredentialResources(1)).toThrowError(
       "该管理员的历史 Key 仍关联客户任务或文件，不能永久删除；可以停用账号并保留历史成果",
     );
     expect(() =>
@@ -203,6 +201,31 @@ describe("API credential encryption", () => {
         },
       ),
     ).toBe(false);
+  });
+
+  it("allows an account credential to independently store the website's raw Key", () => {
+    const apiKey = "sk-shared-between-account-and-website";
+    const accountCredentialId = randomUUID();
+    const websiteCredentialId = randomUUID();
+    const accountEncrypted = encryptApiKey(42, accountCredentialId, apiKey);
+    const websiteEncrypted = encryptPresalesApiKey(websiteCredentialId, apiKey);
+
+    expect(accountEncrypted.encryptedKey).not.toBe(
+      websiteEncrypted.encryptedKey,
+    );
+    expect(
+      decryptApiKey({
+        id: accountCredentialId,
+        userId: 42,
+        ...accountEncrypted,
+      }),
+    ).toBe(apiKey);
+    expect(
+      decryptPresalesApiKey({
+        id: websiteCredentialId,
+        ...websiteEncrypted,
+      }),
+    ).toBe(apiKey);
   });
 
   it("fails closed when the encryption key is missing or malformed", () => {

@@ -180,11 +180,12 @@ function vitePluginProductionPublicAssets(): Plugin {
       source: "assets/frontmind-wordmark.svg",
       output: "assets/frontmind-wordmark.svg",
     },
+    {
+      source: "assets/cuhksz-emblem.png",
+      output: "assets/cuhksz-emblem.png",
+    },
   ];
-  const publicDirectory = path.resolve(
-    import.meta.dirname,
-    "client/public",
-  );
+  const publicDirectory = path.resolve(import.meta.dirname, "client/public");
   return {
     name: "frontmind-production-public-assets",
     generateBundle() {

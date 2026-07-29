@@ -239,11 +239,15 @@ export default function ChatArea({
   syncKnowledgeBaseSnapshot = false,
   composerPrefill,
   responseLogicContext,
+  showKnowledgeBaseStarter = true,
+  reserveOuterMobileNav = false,
 }: {
   fixedAgentProfile?: string;
   syncKnowledgeBaseSnapshot?: boolean;
   composerPrefill?: string;
   responseLogicContext?: ResponseLogicTaskContext;
+  showKnowledgeBaseStarter?: boolean;
+  reserveOuterMobileNav?: boolean;
 }) {
   const {
     activeConversation,
@@ -255,7 +259,7 @@ export default function ChatArea({
     updateTitle,
   } = useConversation();
   const dashboardQuery = trpc.workspace.dashboard.useQuery(undefined, {
-    enabled: !responseLogicContext,
+    enabled: !responseLogicContext && showKnowledgeBaseStarter,
     retry: false,
     refetchOnWindowFocus: true,
     staleTime: 30_000,
@@ -635,7 +639,11 @@ export default function ChatArea({
     <div className="flex-1 flex flex-col h-full relative">
       {/* Header bar */}
       <div className="flex items-center justify-between gap-4 border-b border-border/60 bg-background/85 px-4 py-3 sm:px-6 backdrop-blur-xl">
-        <div className="min-w-0 pl-10 sm:pl-0">
+        <div
+          className={`min-w-0 sm:pl-0 ${
+            reserveOuterMobileNav ? "pl-20" : "pl-10"
+          }`}
+        >
           <div className="flex min-w-0 items-center gap-3">
             <h2 className="max-w-[400px] truncate text-sm font-semibold text-foreground/80">
               {sanitizedTitle}
@@ -693,13 +701,15 @@ export default function ChatArea({
               <ResponseLogicConversationHint
                 question={responseLogicContext.question}
               />
-            ) : (
+            ) : showKnowledgeBaseStarter ? (
               <EmptyConversationHint
                 onStartKnowledgeBase={startKnowledgeBase}
-                companyName={dashboardQuery.data?.payload.brandName || ""}
+                companyName={dashboardQuery.data?.payload?.brandName || ""}
                 companyConfigured={Boolean(dashboardQuery.data?.sourceName)}
                 companyLoading={dashboardQuery.isLoading}
               />
+            ) : (
+              <StandardConversationHint />
             ))}
 
           <AnimatePresence initial={false}>
@@ -806,6 +816,26 @@ function ResponseLogicConversationHint({ question }: { question: string }) {
       </p>
       <p className="mx-auto mt-2 max-w-md text-xs leading-6 text-muted-foreground">
         输入企业口径或上传资料后，智能体会结合最新知识库生成可核验的应答逻辑。
+      </p>
+    </motion.div>
+  );
+}
+
+function StandardConversationHint() {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="mx-auto max-w-xl py-14 text-center"
+    >
+      <span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-primary/10 text-primary">
+        <Sparkles className="h-5 w-5" />
+      </span>
+      <h3 className="mt-4 text-lg font-semibold text-foreground/80">
+        有什么需要我协助？
+      </h3>
+      <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-muted-foreground">
+        直接输入任务或上传文件即可开始。
       </p>
     </motion.div>
   );

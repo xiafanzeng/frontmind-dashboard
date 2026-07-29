@@ -117,7 +117,7 @@ export async function provisionBasicEntitlement(
     ),
     category: input.category,
     question: input.question,
-    rationale: "官网基础版已购问题",
+    rationale: "官网普通版已购问题",
     source: "website",
     status: "selected",
     selectionApprovalStatus: "approved",

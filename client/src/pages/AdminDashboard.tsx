@@ -12,7 +12,6 @@ import {
   RefreshCw,
   Search,
   Send,
-  ShieldCheck,
   UserCog,
   Users,
 } from "lucide-react";
@@ -126,8 +125,7 @@ export function normalizeApiKeyUsageAlerts(value: unknown): ApiKeyUsageAlert[] {
       accountUsed: Math.max(
         0,
         Number(
-          item.accountUsed ??
-            (scope === "website_frontend" ? item.used : 0),
+          item.accountUsed ?? (scope === "website_frontend" ? item.used : 0),
         ) || 0,
       ),
       limit,
@@ -136,12 +134,8 @@ export function normalizeApiKeyUsageAlerts(value: unknown): ApiKeyUsageAlert[] {
       fetchedAt:
         (item.fetchedAt as number | string | Date | null | undefined) ?? null,
       periodStartedAt:
-        (item.periodStartedAt as
-          | number
-          | string
-          | Date
-          | null
-          | undefined) ?? null,
+        (item.periodStartedAt as number | string | Date | null | undefined) ??
+        null,
       syncStatus: String(item.syncStatus || "pending"),
     };
   });
@@ -347,9 +341,7 @@ export function normalizeUsageHierarchy(value: unknown): {
   managers: AdminUsageHierarchyManager[];
 } {
   const payload =
-    value && typeof value === "object"
-      ? (value as Record<string, any>)
-      : {};
+    value && typeof value === "object" ? (value as Record<string, any>) : {};
   const managers = Array.isArray(payload.managers)
     ? payload.managers.map((entry: any) => ({
         adminId: Math.max(0, Number(entry?.adminId) || 0),
@@ -370,10 +362,7 @@ export function normalizeUsageHierarchy(value: unknown): {
           fetchedAt: entry?.keyPool?.fetchedAt ?? null,
           severity: String(entry?.keyPool?.severity || "unavailable"),
         },
-        ownAgentMonthUsed: Math.max(
-          0,
-          Number(entry?.ownAgentMonthUsed) || 0,
-        ),
+        ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
         attributedUsed: Math.max(0, Number(entry?.attributedUsed) || 0),
         otherOrUnattributedUsed: Math.max(
           0,
@@ -384,9 +373,7 @@ export function normalizeUsageHierarchy(value: unknown): {
               userId: Math.max(0, Number(customer?.userId) || 0),
               enterpriseName:
                 String(customer?.enterpriseName || "").trim() || "未命名客户",
-              username: customer?.username
-                ? String(customer.username)
-                : null,
+              username: customer?.username ? String(customer.username) : null,
               monthUsed: Math.max(0, Number(customer?.monthUsed) || 0),
               fingerprint: customer?.fingerprint
                 ? String(customer.fingerprint)
@@ -596,8 +583,7 @@ export default function AdminDashboard({
     const ownAgentMonthUsed = 12_600;
     const users = items.map((item) => ({
       userId: item.userId || 0,
-      enterpriseName:
-        item.enterpriseName || `客户 ${item.userId || ""}`,
+      enterpriseName: item.enterpriseName || `客户 ${item.userId || ""}`,
       username: null,
       monthUsed: item.accountUsed,
       fingerprint: item.credentialFingerprint || null,
@@ -651,10 +637,7 @@ export default function AdminDashboard({
     null;
 
   useEffect(() => {
-    if (
-      selectedUsageManagerId == null &&
-      usageManagers[0]?.adminId != null
-    ) {
+    if (selectedUsageManagerId == null && usageManagers[0]?.adminId != null) {
       setSelectedUsageManagerId(usageManagers[0].adminId);
     }
   }, [selectedUsageManagerId, usageManagers]);
@@ -662,77 +645,61 @@ export default function AdminDashboard({
   return (
     <PortalShell
       eyebrow="FrontMind 管理中心"
-      title="交付控制台"
+      title="交付总览"
       navItems={navItems}
+      toolbar={
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            className="border-[#d8cde0] bg-white/85 text-[#4f2b6d]"
+            onClick={() =>
+              setLocation(
+                previewMode
+                  ? getPreviewAdminWorkspaceHref(systemAdmin)
+                  : "/admin/workspace",
+              )
+            }
+          >
+            <BriefcaseBusiness className="h-4 w-4" />
+            <span className="hidden sm:inline">打开客户交付工作台</span>
+            <span className="sm:hidden">客户工作台</span>
+          </Button>
+          {canCreateCustomerFromDashboard(systemAdmin) && (
+            <Button
+              size="sm"
+              onClick={() =>
+                setLocation(
+                  previewMode
+                    ? getPreviewAdminWorkspaceHref(systemAdmin, "action=create")
+                    : "/admin/workspace?action=create",
+                )
+              }
+            >
+              <UserCog className="h-4 w-4" />
+              创建客户
+            </Button>
+          )}
+        </div>
+      }
       accountLabel={
         previewMode
-          ? `${systemAdmin ? "系统管理员" : "普通管理员"}验收账号`
+          ? `${systemAdmin ? "系统管理员" : "交付管理员"}验收账号`
           : undefined
       }
       roleLabel={
         previewMode
-          ? `${systemAdmin ? "系统管理员" : "普通管理员"} · 验收预览`
+          ? `${systemAdmin ? "系统管理员" : "交付管理员"} · 验收预览`
           : undefined
       }
     >
       <div className="space-y-5">
-        <section className="overflow-hidden rounded-[22px] border border-[#dfd4e7] bg-[linear-gradient(135deg,#2e1458,#5b2a86)] p-6 text-white shadow-[0_22px_60px_rgba(45,20,88,.2)] sm:p-8">
-          <p className="fm-eyebrow text-white/55">客户交付控制台</p>
-          <div className="mt-4 flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
-            <div>
-              <h2 className="text-3xl font-semibold tracking-[-0.03em] sm:text-4xl">
-                从客户签约到交付验收的统一工作台
-              </h2>
-              <p className="mt-4 max-w-3xl text-sm leading-7 text-white/65 sm:text-base">
-                套餐权益、知识库流程、选题、应答逻辑、问题监控、进度报告、
-                内容资产与模型用量均按客户工作区管理，并保留权限与操作边界。
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button
-                className="h-11 shrink-0 rounded-xl bg-white px-5 text-[#3e1b69] hover:bg-white/90"
-                onClick={() =>
-                  setLocation(
-                    previewMode
-                      ? getPreviewAdminWorkspaceHref(systemAdmin)
-                      : "/admin/workspace",
-                  )
-                }
-              >
-                <ShieldCheck className="h-4 w-4" />
-                打开客户交付工作台
-              </Button>
-              {canCreateCustomerFromDashboard(systemAdmin) && (
-                <Button
-                  variant="outline"
-                  className="h-11 shrink-0 border-white/35 bg-white/10 px-5 text-white hover:bg-white/20 hover:text-white"
-                  onClick={() =>
-                    setLocation(
-                      previewMode
-                        ? getPreviewAdminWorkspaceHref(
-                            systemAdmin,
-                            "action=create",
-                          )
-                        : "/admin/workspace?action=create",
-                    )
-                  }
-                >
-                  <UserCog className="h-4 w-4" />
-                  创建客户
-                </Button>
-              )}
-            </div>
-          </div>
-        </section>
-
         <PortalCard className="overflow-hidden">
           <div className="flex items-center justify-between gap-4 border-b border-[#eee8f2] px-5 py-4 sm:px-6">
             <div>
               <div className="flex items-center gap-2">
                 <AlertTriangle className="h-5 w-5 text-[#c89013]" />
-                <h2 className="font-semibold text-[#171321]">
-                  交付管理员积分
-                </h2>
+                <h2 className="font-semibold text-[#171321]">交付管理员积分</h2>
               </div>
               <p className="mt-1 text-sm leading-6 text-[#716a80]">
                 {systemAdmin
@@ -746,8 +713,7 @@ export default function AdminDashboard({
                 size="sm"
                 variant="outline"
                 disabled={
-                  usageHierarchyQuery.isFetching ||
-                  usageSyncMutation.isPending
+                  usageHierarchyQuery.isFetching || usageSyncMutation.isPending
                 }
                 onClick={() => usageSyncMutation.mutate()}
               >
@@ -759,8 +725,7 @@ export default function AdminDashboard({
                       : ""
                   }`}
                 />
-                {usageHierarchyQuery.isFetching ||
-                usageSyncMutation.isPending
+                {usageHierarchyQuery.isFetching || usageSyncMutation.isPending
                   ? "同步中"
                   : "刷新用量"}
               </Button>
@@ -786,9 +751,7 @@ export default function AdminDashboard({
                     <button
                       key={manager.adminId}
                       type="button"
-                      onClick={() =>
-                        setSelectedUsageManagerId(manager.adminId)
-                      }
+                      onClick={() => setSelectedUsageManagerId(manager.adminId)}
                       className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
                         selectedUsageManager?.adminId === manager.adminId
                           ? "border-[#7a45a7] bg-[#f6f0fa]"
@@ -825,18 +788,12 @@ export default function AdminDashboard({
 
                   <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                     {[
-                      [
-                        "Key 池总消耗",
-                        selectedUsageManager.keyPool.totalUsed,
-                      ],
+                      ["Key 池总消耗", selectedUsageManager.keyPool.totalUsed],
                       [
                         "管理员通用 Agent",
                         selectedUsageManager.ownAgentMonthUsed,
                       ],
-                      [
-                        "已归属到本管理员",
-                        selectedUsageManager.attributedUsed,
-                      ],
+                      ["已归属到本管理员", selectedUsageManager.attributedUsed],
                       [
                         "其他或未归属",
                         selectedUsageManager.otherOrUnattributedUsed,
@@ -857,7 +814,8 @@ export default function AdminDashboard({
                   </div>
                   {selectedUsageManager.keyPool.syncStatus !== "ok" && (
                     <p className="mt-3 rounded-xl border border-[#ead7a5] bg-[#fffaf0] px-3 py-2 text-xs leading-5 text-[#8a6200]">
-                      当前 Key 的本月用量尚未完整同步，请刷新用量后再据此判断是否更换
+                      当前 Key
+                      的本月用量尚未完整同步，请刷新用量后再据此判断是否更换
                       Key。
                     </p>
                   )}

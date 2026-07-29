@@ -11,7 +11,7 @@ describe("preview service portal fixtures", () => {
     expect(getPreviewServicePortal("basic").purchaseActions).toEqual([
       {
         kind: "purchase_basic",
-        label: "继续购买基础版",
+        label: "继续购买普通版",
         href: "https://www.frontmind.net",
         targetPlan: "basic",
       },

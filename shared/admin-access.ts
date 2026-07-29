@@ -14,3 +14,10 @@ export function hasExplicitAdminRole(user: {
     user.role === "admin" && isExplicitAdminAccessLevel(user.adminAccessLevel)
   );
 }
+
+export function isProtectedBuiltinAdminUsername(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    value.normalize("NFKC").trim().toLowerCase() === "admin"
+  );
+}

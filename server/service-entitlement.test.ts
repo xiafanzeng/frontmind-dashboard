@@ -95,6 +95,30 @@ describe("service plan catalogue", () => {
         totalQuestionLimit: 1,
       },
     });
+    expect(SERVICE_PLAN_CATALOG.knowledge).toMatchObject({
+      contractTerm: { unit: "month", count: 3 },
+      quotaCadence: "contract",
+      prepaidMonths: 3,
+      limits: {
+        industryLimit: 0,
+        competitorComparisonLimit: 0,
+        reputationLimit: 0,
+        productScenarioLimit: 0,
+        totalQuestionLimit: 0,
+      },
+      includedCapabilities: {
+        knowledgeBuild: true,
+        knowledgeDisplay: true,
+        globalKeywords: false,
+        questionSelection: false,
+        intentOptimization: false,
+        responseLogic: false,
+        monitoring: false,
+        channelDistribution: false,
+        progressReport: false,
+        contentAssets: false,
+      },
+    });
     expect(SERVICE_PLAN_CATALOG.advanced).toMatchObject({
       contractTerm: { unit: "month", count: 3 },
       quotaCadence: "quarter",
@@ -142,6 +166,7 @@ describe("service plan catalogue", () => {
       "2026-03-02T05:30:00.000Z",
     );
     expect(createServiceQuotaWindows("basic", start)).toHaveLength(1);
+    expect(createServiceQuotaWindows("knowledge", start)).toHaveLength(1);
     expect(createServiceQuotaWindows("advanced", start)).toHaveLength(1);
 
     const luxury = createServiceQuotaWindows("luxury", start);
@@ -410,6 +435,57 @@ describe("service portal derivation", () => {
     expect(
       portal.purchases.find((purchase) => purchase.id === original.id)?.status,
     ).toBe("superseded");
+  });
+
+  it("never merges supplemental Basic questions into the knowledge-only plan", () => {
+    const knowledge = contract("knowledge", {
+      id: "knowledge-only",
+      revision: 2,
+    });
+    const basic = contract("basic", {
+      id: "basic-supplemental",
+      revision: 3,
+    });
+
+    expect(
+      selectCurrentServiceContractIds([basic, knowledge], NOW),
+    ).toMatchObject({
+      contract: { id: knowledge.id, planCode: "knowledge" },
+      contractIds: [knowledge.id],
+    });
+  });
+
+  it("keeps the knowledge-only workflow inside knowledge build and display", () => {
+    const waiting = deriveServicePortalState(state("knowledge"));
+    expect(waiting.nextAction.kind).toBe("start_knowledge_build");
+    expect(waiting.capabilities.knowledgeBuild.allowed).toBe(true);
+    expect(waiting.capabilities.knowledgeDisplay.allowed).toBe(true);
+    for (const capability of [
+      "globalKeywords",
+      "questionSelection",
+      "intentOptimization",
+      "responseLogic",
+      "monitoring",
+      "channelDistribution",
+      "progressReport",
+      "contentAssets",
+    ] as const) {
+      expect(waiting.capabilities[capability].allowed).toBe(false);
+    }
+
+    expect(
+      deriveServicePortalState(
+        state("knowledge", { hasActiveKnowledgeBuild: true }),
+      ).nextAction.kind,
+    ).toBe("resume_knowledge_build");
+    expect(
+      deriveServicePortalState(
+        state("knowledge", {
+          knowledgeVersion: 2,
+          authenticatedKnowledgeVersion: 2,
+        }),
+      ).nextAction.kind,
+    ).toBe("view_knowledge");
   });
 
   it("returns a safe unconfigured state for historical users", () => {

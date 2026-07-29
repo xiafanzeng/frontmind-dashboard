@@ -21,8 +21,14 @@ const textExtensions = new Set([
 const forbiddenFileNames = new Set([
   "citation-distribution-20260723-171030.b64",
   "citation-distribution-20260727-101630.b64",
-  "cuhksz-emblem.png",
 ]);
+const approvedBrandAssetNames = new Set(["cuhksz-emblem.png"]);
+const approvedBrandText = [
+  "/assets/cuhksz-emblem.png",
+  "cuhksz-emblem.png",
+  "香港中文大学（深圳）校徽",
+  "香港中文大学（深圳）AI智能决策实验室",
+];
 const forbiddenFileNamePatterns = [
   {
     label: "encoded customer monitoring fixture",
@@ -109,6 +115,13 @@ const forbiddenPatterns = [
   },
 ];
 
+function withoutApprovedBranding(content) {
+  return approvedBrandText.reduce(
+    (result, allowedText) => result.replaceAll(allowedText, ""),
+    content,
+  );
+}
+
 const requiredSkillFiles = [
   "private-workflows/socratic-kb-builder.skill",
   "private-workflows/brand-question-portfolio.skill/SKILL.md",
@@ -194,7 +207,7 @@ for (const sourceRoot of ["client", "server"]) {
   for (const file of await collectTestSourceFiles(
     join(projectRoot, sourceRoot),
   )) {
-    const content = await readFile(file, "utf8");
+    const content = withoutApprovedBranding(await readFile(file, "utf8"));
     if (legacyCustomerFixturePattern.test(content)) {
       violations.push({
         file: relative(projectRoot, file),
@@ -246,8 +259,7 @@ for (const relativeRoot of runtimeSkillRoots) {
     sourceRelativeFiles.sort();
     builtRelativeFiles.sort();
     if (
-      JSON.stringify(sourceRelativeFiles) !==
-      JSON.stringify(builtRelativeFiles)
+      JSON.stringify(sourceRelativeFiles) !== JSON.stringify(builtRelativeFiles)
     ) {
       violations.push({
         file: relativeRoot,
@@ -350,6 +362,7 @@ for (const entry of allEntries) {
     });
   }
   if (entry.isFile()) {
+    if (approvedBrandAssetNames.has(entry.name)) continue;
     for (const rule of forbiddenFileNamePatterns) {
       if (rule.pattern.test(entry.name)) {
         violations.push({
@@ -361,7 +374,7 @@ for (const entry of allEntries) {
   }
 }
 for (const file of await collectTextFiles(buildRoot)) {
-  const content = await readFile(file, "utf8");
+  const content = withoutApprovedBranding(await readFile(file, "utf8"));
   for (const rule of forbiddenPatterns) {
     if (rule.pattern.test(content)) {
       violations.push({

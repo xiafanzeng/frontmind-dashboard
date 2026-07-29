@@ -95,10 +95,10 @@ export default function DashboardVersionHistory({
           <div>
             <div className="flex items-center gap-2">
               <History className="h-5 w-5 text-[#5b2a86]" />
-              <h3 className="font-semibold text-[#171321]">内容发布历史</h3>
+              <h3 className="font-semibold text-[#171321]">看板骨架发布历史</h3>
             </div>
             <p className="mt-2 text-sm leading-6 text-[#716a80]">
-              每次结构化发布都会保留不可变快照；恢复历史内容会创建新版本，不会改写或删除旧记录。
+              仅记录企业资料、指标与看板板块的发布快照；问题、应答逻辑和监控记录由各自模块管理。恢复历史内容会创建新版本，不会改写旧记录。
             </p>
           </div>
           {historyQuery.data && (

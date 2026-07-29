@@ -11,7 +11,10 @@ import { parse as parseCookieHeader } from "cookie";
 import { and, desc, eq, gt, inArray, isNull, ne } from "drizzle-orm";
 import type { Request } from "express";
 import { COOKIE_NAME } from "../shared/const";
-import { isExplicitAdminAccessLevel } from "../shared/admin-access";
+import {
+  isExplicitAdminAccessLevel,
+  isProtectedBuiltinAdminUsername,
+} from "../shared/admin-access";
 import {
   apiCredentials,
   apiKeyOwnership,
@@ -19,6 +22,7 @@ import {
   presalesApiCredentials,
   sessions,
   upstreamResources,
+  userAdminAssignments,
   userPasswordSetupTokens,
   userUsageOwners,
   users,
@@ -896,7 +900,7 @@ export async function deleteManagedUser(
   }
 
   const db = await requireDb();
-  await db.transaction(async (tx) => {
+  const result = await db.transaction(async (tx) => {
     const rows = await tx
       .select()
       .from(users)
@@ -905,18 +909,37 @@ export async function deleteManagedUser(
       .for("update");
     const user = rows[0];
     if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+    if (isProtectedBuiltinAdminUsername(user.username)) {
+      throw new AuthServiceError("CONFLICT", "内置 admin 系统管理员不能被删除");
+    }
 
     if (user.role === "admin") {
-      const ownedUsers = await tx
-        .select({ userId: userUsageOwners.userId })
-        .from(userUsageOwners)
-        .where(eq(userUsageOwners.deliveryAdminId, targetUserId))
+      const protectedAdminRows = await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.username, "admin"))
         .limit(1)
         .for("update");
-      assertAdminHasNoUsageOwnedUsers({
-        ownedUserCount: ownedUsers.length,
-        mutation: "delete",
-      });
+      const protectedAdmin = protectedAdminRows[0];
+      if (!protectedAdmin) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "未找到受保护的内置 admin，无法安全交接客户",
+        );
+      }
+      const ownedUsers = await tx
+        .select({
+          userId: userUsageOwners.userId,
+          revision: userUsageOwners.revision,
+        })
+        .from(userUsageOwners)
+        .where(eq(userUsageOwners.deliveryAdminId, targetUserId))
+        .for("update");
+      const assignedUsers = await tx
+        .select({ userId: userAdminAssignments.userId })
+        .from(userAdminAssignments)
+        .where(eq(userAdminAssignments.adminId, targetUserId))
+        .for("update");
       const historicalResources = await tx
         .select({ id: upstreamResources.id })
         .from(upstreamResources)
@@ -932,9 +955,7 @@ export async function deleteManagedUser(
         )
         .limit(1)
         .for("update");
-      assertAdminHasNoHistoricalCredentialResources(
-        historicalResources.length,
-      );
+      const retainHistoricalAccount = historicalResources.length > 0;
 
       if (user.isActive) {
         const activeAdmins = await tx
@@ -950,10 +971,64 @@ export async function deleteManagedUser(
           );
         }
       }
+
+      for (const owner of ownedUsers) {
+        await tx
+          .update(userUsageOwners)
+          .set({
+            deliveryAdminId: protectedAdmin.id,
+            revision: owner.revision + 1,
+            updatedAt: new Date(),
+          })
+          .where(eq(userUsageOwners.userId, owner.userId));
+      }
+      const reassignedUserIds = [
+        ...new Set([
+          ...ownedUsers.map((owner) => owner.userId),
+          ...assignedUsers.map((assignment) => assignment.userId),
+        ]),
+      ];
+      if (reassignedUserIds.length > 0) {
+        await tx
+          .insert(userAdminAssignments)
+          .values(
+            reassignedUserIds.map((userId) => ({
+              userId,
+              adminId: protectedAdmin.id,
+              assignedByUserId: actorUserId,
+            })),
+          )
+          .onDuplicateKeyUpdate({
+            set: { assignedByUserId: actorUserId },
+          });
+      }
+
+      if (retainHistoricalAccount) {
+        const now = new Date();
+        await tx
+          .update(users)
+          .set({ isActive: false, updatedAt: now })
+          .where(eq(users.id, targetUserId));
+        await tx
+          .update(userPasswordSetupTokens)
+          .set({ consumedAt: now, updatedAt: now })
+          .where(
+            and(
+              eq(userPasswordSetupTokens.userId, targetUserId),
+              isNull(userPasswordSetupTokens.consumedAt),
+            ),
+          );
+        return { disposition: "deactivated_for_history" as const };
+      }
     }
 
     await permanentlyDeleteManagedUserRows(tx, targetUserId);
+    return { disposition: "permanently_deleted" as const };
   });
+  if (result.disposition === "deactivated_for_history") {
+    await revokeAllUserSessions(targetUserId);
+  }
+  return result;
 }
 
 function decodeMasterKey(value: string): Buffer {
@@ -1077,41 +1152,6 @@ export function credentialsUseSameUpstreamApiKey(
   );
 }
 
-export async function assertApiKeyScopeAvailable(input: {
-  executor: any;
-  fingerprint: string;
-  targetScope: "managed_account" | "website_frontend";
-}) {
-  const conflicting =
-    input.targetScope === "managed_account"
-      ? await input.executor
-          .select({ id: presalesApiCredentials.id })
-          .from(presalesApiCredentials)
-          .where(
-            and(
-              eq(presalesApiCredentials.fingerprint, input.fingerprint),
-              eq(presalesApiCredentials.status, "active"),
-            ),
-          )
-          .limit(1)
-      : await input.executor
-          .select({ id: apiCredentials.id })
-          .from(apiCredentials)
-          .where(
-            and(
-              eq(apiCredentials.fingerprint, input.fingerprint),
-              eq(apiCredentials.status, "active"),
-            ),
-          )
-          .limit(1);
-  if (conflicting[0]) {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "官网前台 API Key 与账号共享 Key 池必须分开配置",
-    );
-  }
-}
-
 export function encryptApiKey(
   userId: number,
   credentialId: string,
@@ -1209,6 +1249,14 @@ export async function getApiCredentialStatus(userId: number) {
 
 export async function getEffectiveApiCredentialStatus(accountId: number) {
   const db = await requireDb();
+  const directStatus = await getApiCredentialStatus(accountId);
+  if (directStatus.configured) {
+    return {
+      ...directStatus,
+      ownerUserId: accountId,
+      inherited: false,
+    };
+  }
   const ownerRows = await db
     .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
     .from(userUsageOwners)
@@ -1222,6 +1270,64 @@ export async function getEffectiveApiCredentialStatus(accountId: number) {
   };
 }
 
+export async function replaceApiCredentialInTransaction(input: {
+  executor: any;
+  userId: number;
+  apiKey: string;
+  now?: Date;
+  credentialId?: string;
+}): Promise<CredentialStatus> {
+  const fingerprint = getApiKeyFingerprint(input.apiKey);
+  const credentialId = input.credentialId ?? randomUUID();
+  const encrypted = encryptApiKey(input.userId, credentialId, input.apiKey);
+  const now = input.now ?? new Date();
+  const tx = input.executor;
+
+  const ownerRows = await tx
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.id, input.userId))
+    .limit(1)
+    .for("update");
+  if (!ownerRows[0]) {
+    throw new AuthServiceError("NOT_FOUND", "User not found");
+  }
+  const latest = await tx
+    .select()
+    .from(apiCredentials)
+    .where(eq(apiCredentials.userId, input.userId))
+    .orderBy(desc(apiCredentials.version))
+    .limit(1);
+  const nextVersion = (latest[0]?.version ?? 0) + 1;
+
+  await tx
+    .update(apiCredentials)
+    .set({ status: "retired", retiredAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(apiCredentials.userId, input.userId),
+        eq(apiCredentials.status, "active"),
+      ),
+    );
+
+  const inserted = {
+    id: credentialId,
+    userId: input.userId,
+    version: nextVersion,
+    ...encrypted,
+    fingerprint,
+    status: "active" as const,
+    validationStatus: "verified" as const,
+    verifiedAt: now,
+    createdAt: now,
+    updatedAt: now,
+    retiredAt: null,
+    deletedAt: null,
+  };
+  await tx.insert(apiCredentials).values(inserted);
+  return toCredentialStatus(inserted);
+}
+
 export async function replaceApiCredential(
   userId: number,
   apiKey: string,
@@ -1229,63 +1335,13 @@ export async function replaceApiCredential(
 ): Promise<CredentialStatus> {
   const db = await requireDb();
   await validator(apiKey);
-  const fingerprint = getApiKeyFingerprint(apiKey);
-  const credentialId = randomUUID();
-  const encrypted = encryptApiKey(userId, credentialId, apiKey);
-  const now = new Date();
-
-  const credential = await db.transaction(async (tx) => {
-    const ownerRows = await tx
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.id, userId))
-      .limit(1)
-      .for("update");
-    if (!ownerRows[0]) {
-      throw new AuthServiceError("NOT_FOUND", "User not found");
-    }
-    const latest = await tx
-      .select()
-      .from(apiCredentials)
-      .where(eq(apiCredentials.userId, userId))
-      .orderBy(desc(apiCredentials.version))
-      .limit(1);
-    const nextVersion = (latest[0]?.version ?? 0) + 1;
-
-    await assertApiKeyScopeAvailable({
+  return db.transaction((tx) =>
+    replaceApiCredentialInTransaction({
       executor: tx,
-      fingerprint,
-      targetScope: "managed_account",
-    });
-    await tx
-      .update(apiCredentials)
-      .set({ status: "retired", retiredAt: now })
-      .where(
-        and(
-          eq(apiCredentials.userId, userId),
-          eq(apiCredentials.status, "active"),
-        ),
-      );
-
-    const inserted = {
-      id: credentialId,
       userId,
-      version: nextVersion,
-      ...encrypted,
-      fingerprint,
-      status: "active" as const,
-      validationStatus: "verified" as const,
-      verifiedAt: now,
-      createdAt: now,
-      updatedAt: now,
-      retiredAt: null,
-      deletedAt: null,
-    };
-    await tx.insert(apiCredentials).values(inserted);
-    return inserted;
-  });
-
-  return toCredentialStatus(credential);
+      apiKey,
+    }),
+  );
 }
 
 export async function deleteActiveApiCredential(userId: number) {
@@ -1343,10 +1399,9 @@ export async function getDecryptedCredentialForUser(
 }
 
 /**
- * Returns the active runtime credential for an account. Administrators own
- * their credential directly; customer accounts inherit the credential of
- * their single usage owner. Legacy customers without an owner temporarily
- * fall back to their own active credential until migration is completed.
+ * Returns the active runtime credential for an account. A customer-owned
+ * credential always wins. Legacy customers without one may temporarily
+ * inherit the credential of their assigned usage owner.
  */
 export async function getEffectiveDecryptedCredentialForAccount(
   accountId: number,
@@ -1359,18 +1414,15 @@ export async function getEffectiveDecryptedCredentialForAccount(
     .limit(1);
   const account = accountRows[0];
   if (!account) return null;
-  if (account.role === "admin") {
-    return getDecryptedCredentialForUser(accountId);
-  }
+  const directCredential = await getDecryptedCredentialForUser(accountId);
+  if (directCredential || account.role === "admin") return directCredential;
   const ownerRows = await db
     .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
     .from(userUsageOwners)
     .where(eq(userUsageOwners.userId, accountId))
     .limit(1);
   const ownerId = ownerRows[0]?.deliveryAdminId;
-  return ownerId
-    ? getDecryptedCredentialForUser(ownerId)
-    : getDecryptedCredentialForUser(accountId);
+  return ownerId ? getDecryptedCredentialForUser(ownerId) : null;
 }
 
 export async function credentialMayServeAccount(
@@ -1515,11 +1567,7 @@ export async function recordUpstreamResource(input: {
   }
 
   if (
-    !(await credentialMayServeAccount(
-      db,
-      input.userId,
-      input.apiCredentialId,
-    ))
+    !(await credentialMayServeAccount(db, input.userId, input.apiCredentialId))
   ) {
     throw new AuthServiceError("NOT_FOUND", "API credential not found");
   }

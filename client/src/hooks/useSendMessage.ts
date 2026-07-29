@@ -2,7 +2,7 @@
  * Enhanced useSendMessage Hook with retry mechanism and streaming support
  * Features: Safe retry for uploads/polling, streaming responses,
  *           upload progress tracking, race-condition-free sequential polling,
- *           output-length-based deduplication for multi-turn conversations,
+ *           identity-aware output reconciliation for multi-turn conversations,
  *           per-message model override (agentProfile parameter),
  *           credit event bus emission on task completion for real-time refresh.
  */
@@ -96,20 +96,94 @@ async function withRetry<T>(
   throw lastError || new Error("Max retries exceeded");
 }
 
+function stableOutputIdentity(item: OutputMessage): string | undefined {
+  if (typeof item.id === "string" && item.id.trim()) {
+    return `id:${item.id}`;
+  }
+  if (typeof item.call_id === "string" && item.call_id.trim()) {
+    return `call:${item.type || "output"}:${item.call_id}`;
+  }
+  return undefined;
+}
+
+function dedupeStableOutput(output: OutputMessage[]): OutputMessage[] {
+  const seen = new Set<string>();
+  return output.filter((item) => {
+    const identity = stableOutputIdentity(item);
+    if (!identity) return true;
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+export function collectAssistantOutputIds(
+  messages: Array<{ id?: string; role?: string }> | undefined,
+): string[] {
+  if (!messages) return [];
+  return messages.flatMap((message) =>
+    message.role === "assistant" &&
+    typeof message.id === "string" &&
+    message.id.trim()
+      ? [message.id]
+      : [],
+  );
+}
+
 /**
- * Slice only new output items from the cumulative API output array.
+ * Select the current turn's output from APIs that may return either the full
+ * cumulative task history or only the current turn.
+ *
+ * Stable output IDs are the authoritative signal. The length-only fallback is
+ * retained for older payloads, but a shorter response is treated as a
+ * non-cumulative current-turn response instead of being silently discarded.
  */
 export function sliceNewOutput(
   output: OutputMessage[],
   baseline: number,
+  historicalOutputIds: readonly string[] = [],
 ): OutputMessage[] {
   if (baseline <= 0) {
-    return output;
+    return dedupeStableOutput(output);
   }
+
+  const historicalIds = new Set(historicalOutputIds);
+  if (historicalIds.size > 0) {
+    const historicalMatches = output
+      .map((item, index) => ({ id: item.id, index }))
+      .filter(
+        (
+          match,
+        ): match is {
+          id: string;
+          index: number;
+        } => typeof match.id === "string" && historicalIds.has(match.id),
+      );
+
+    if (historicalMatches.length === 0) {
+      return dedupeStableOutput(output);
+    }
+
+    if (output.length < baseline) {
+      return dedupeStableOutput(
+        output.filter(
+          (item) => typeof item.id !== "string" || !historicalIds.has(item.id),
+        ),
+      );
+    }
+
+    const lastHistoricalIndex = Math.max(
+      ...historicalMatches.map((match) => match.index),
+    );
+    return dedupeStableOutput(
+      output.slice(Math.max(baseline, lastHistoricalIndex + 1)),
+    );
+  }
+
   if (baseline >= output.length) {
-    return [];
+    return dedupeStableOutput(output);
   }
-  return output.slice(baseline);
+  return dedupeStableOutput(output.slice(baseline));
 }
 
 /**
@@ -124,12 +198,7 @@ function outputForKnowledgeProgress(
   return slicedOutput.length > 0 ? slicedOutput : output;
 }
 
-export type FailureKind =
-  | "quota"
-  | "attachment"
-  | "auth"
-  | "busy"
-  | "unknown";
+export type FailureKind = "quota" | "attachment" | "auth" | "busy" | "unknown";
 
 export function classifyFailure(errorMsg: string): FailureKind {
   if (/quota|credit|balance|insufficient|积分|额度|余额|点数/i.test(errorMsg)) {
@@ -166,7 +235,7 @@ function getFailureAdvice(errorMsg: string) {
     return "当前服务资源可能不足，请联系负责管理员处理。";
   }
   if (failureKind === "attachment") {
-    return "多个账号可以共享服务连接，但附件仍按账号隔离；请在当前账号重新上传该附件。";
+    return "多个账号可以共享服务连接，但历史任务与附件仍绑定原服务凭证。密钥轮换后无法继续该历史任务，请新建对话；如仍需附件，请在新对话中重新添加。";
   }
   if (failureKind === "auth") {
     return "当前服务连接配置异常，请联系负责管理员处理。";
@@ -175,6 +244,12 @@ function getFailureAdvice(errorMsg: string) {
     return "服务暂时繁忙，或本次附件任务较重。请稍后手动重试；如果反复失败，可以把原图手动压缩为 ZIP 后再发送。";
   }
   return "请求未完成，请稍后手动重试。";
+}
+
+function getFailureDisplayMessage(errorMsg: string) {
+  return classifyFailure(errorMsg) === "attachment"
+    ? "历史任务的附件与当前服务凭证不兼容。"
+    : errorMsg;
 }
 
 /** Upload progress info exposed to UI */
@@ -243,6 +318,7 @@ export function useSendMessage() {
       responseStartedAt: number,
       retryConfig: RetryConfig,
       baselineOutputLength: number,
+      historicalOutputIds: readonly string[],
       modelName?: string,
       syncKnowledgeBaseSnapshot = false,
     ) => {
@@ -274,6 +350,7 @@ export function useSendMessage() {
             const newOutput = sliceNewOutput(
               updated.output,
               baselineOutputLength,
+              historicalOutputIds,
             );
 
             if (newOutput.length > 0) {
@@ -332,6 +409,7 @@ export function useSendMessage() {
               const newOutput = sliceNewOutput(
                 updated.output,
                 baselineOutputLength,
+                historicalOutputIds,
               );
 
               if (newOutput.length > 0) {
@@ -405,13 +483,14 @@ export function useSendMessage() {
             });
             const errorMsg = updated.error?.message || "任务执行出错";
             const failureAdvice = getFailureAdvice(errorMsg);
+            const displayError = getFailureDisplayMessage(errorMsg);
             toast.error("任务执行失败", {
               description: failureAdvice,
             });
             addMessageRef.current(convId, {
               id: `msg-err-${Date.now()}`,
               role: "assistant",
-              content: `❌ 错误: ${errorMsg}\n\n${failureAdvice}`,
+              content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
               timestamp: Date.now(),
             });
 
@@ -501,6 +580,7 @@ export function useSendMessage() {
         }
 
         const baselineOutputLength = conv?.lastKnownOutputLength || 0;
+        const historicalOutputIds = collectAssistantOutputIds(conv?.messages);
         const isMultiTurn = !!conv?.previousResponseId;
 
         if (isMultiTurn) {
@@ -589,20 +669,20 @@ export function useSendMessage() {
               ),
             });
 
-            const result = await withRetry(
-              () =>
-                uploadFile(file, (percent) => {
-                  setUploadProgress({
-                    currentFileIndex: i,
-                    totalFiles,
-                    currentFileName: file.name,
-                    currentFilePercent: percent,
-                    overallPercent: Math.round(
-                      ((i + percent / 100) / totalFiles) * 100,
-                    ),
-                    conversationId: convId,
-                  });
-                }),
+            const result = await uploadFile(
+              file,
+              (percent) => {
+                setUploadProgress({
+                  currentFileIndex: i,
+                  totalFiles,
+                  currentFileName: file.name,
+                  currentFilePercent: percent,
+                  overallPercent: Math.round(
+                    ((i + percent / 100) / totalFiles) * 100,
+                  ),
+                  conversationId: convId,
+                });
+              },
               retryConfig,
             );
 
@@ -746,6 +826,7 @@ export function useSendMessage() {
             const newOutput = sliceNewOutput(
               response.output,
               baselineOutputLength,
+              historicalOutputIds,
             );
 
             console.log(
@@ -784,6 +865,7 @@ export function useSendMessage() {
               responseStartedAt,
               retryConfig,
               baselineOutputLength,
+              historicalOutputIds,
               agentProfile,
               options?.syncKnowledgeBaseSnapshot,
             );
@@ -805,6 +887,7 @@ export function useSendMessage() {
               const newOutput = sliceNewOutput(
                 response.output,
                 baselineOutputLength,
+                historicalOutputIds,
               );
 
               if (newOutput.length > 0) {
@@ -870,11 +953,12 @@ export function useSendMessage() {
           });
           const errorMsg = err.message || "请求失败";
           const failureAdvice = getFailureAdvice(errorMsg);
+          const displayError = getFailureDisplayMessage(errorMsg);
           toast.error("发送失败", { description: failureAdvice });
           addMessage(convId, {
             id: `msg-err-${Date.now()}`,
             role: "assistant",
-            content: `❌ 错误: ${errorMsg}\n\n${failureAdvice}`,
+            content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
             timestamp: Date.now(),
           });
         }

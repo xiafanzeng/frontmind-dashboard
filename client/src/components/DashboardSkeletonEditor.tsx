@@ -64,6 +64,7 @@ type DashboardSkeletonEditorProps = {
   userId: number;
   workspace?: DashboardWorkspaceSnapshot;
   loading?: boolean;
+  profileOnly?: boolean;
   authoritativeQuestions?: readonly AuthoritativeQuestionTemplateSource[];
   authoritativeQuestionsLoading?: boolean;
   authoritativeQuestionsError?: string | null;
@@ -530,6 +531,7 @@ export default function DashboardSkeletonEditor({
   userId,
   workspace,
   loading = false,
+  profileOnly = false,
   authoritativeQuestions,
   authoritativeQuestionsLoading = false,
   authoritativeQuestionsError = null,
@@ -1074,30 +1076,36 @@ export default function DashboardSkeletonEditor({
         </div>
       </PortalCard>
 
-      <MetricEditor
-        metrics={draft.metrics}
-        disabled={busy}
-        onChange={(metrics) => patchDraft({ metrics })}
-      />
+      {!profileOnly && (
+        <>
+          <MetricEditor
+            metrics={draft.metrics}
+            disabled={busy}
+            onChange={(metrics) => patchDraft({ metrics })}
+          />
 
-      <SectionEditor
-        sections={draft.sections}
-        disabled={busy}
-        importingKey={importingKey}
-        tableImportDisabled={!enterpriseIdentityBound}
-        onChange={(sections) => patchDraft({ sections })}
-        onImportTable={(sectionId, file) =>
-          void importModule("section-table", file, sectionId)
-        }
-      />
+          <SectionEditor
+            sections={draft.sections}
+            disabled={busy}
+            importingKey={importingKey}
+            tableImportDisabled={!enterpriseIdentityBound}
+            onChange={(sections) => patchDraft({ sections })}
+            onImportTable={(sectionId, file) =>
+              void importModule("section-table", file, sectionId)
+            }
+          />
 
-      <OptimizationReportEditor
-        userId={userId}
-        report={draft.optimizationReport}
-        questions={draft.questions}
-        disabled={busy}
-        onChange={(optimizationReport) => patchDraft({ optimizationReport })}
-      />
+          <OptimizationReportEditor
+            userId={userId}
+            report={draft.optimizationReport}
+            questions={draft.questions}
+            disabled={busy}
+            onChange={(optimizationReport) =>
+              patchDraft({ optimizationReport })
+            }
+          />
+        </>
+      )}
 
       <PortalCard className="p-5 sm:p-6">
         <div className="mb-5">
@@ -1116,75 +1124,78 @@ export default function DashboardSkeletonEditor({
           )}
         </div>
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {importCards.map((card) => (
-            <ModuleUploadCard
-              key={card.module}
-              definition={card}
-              disabled={
-                busy ||
-                dirty ||
-                (!enterpriseIdentityBound && card.module !== "profile")
-              }
-              importing={importingKey === card.module}
-              onTemplate={() => {
-                if (card.module === "monitoring") {
-                  void downloadMonitoringCurrentTemplate(userId)
-                    .then(() => toast.success("当前问题监控模板已下载"))
-                    .catch((error) =>
-                      toast.error("问题监控模板下载失败", {
-                        description:
-                          error instanceof Error
-                            ? error.message
-                            : "请稍后重试。",
-                      }),
-                    );
-                  return;
+          {importCards
+            .filter((card) => !profileOnly || card.module === "profile")
+            .map((card) => (
+              <ModuleUploadCard
+                key={card.module}
+                definition={card}
+                disabled={
+                  busy ||
+                  dirty ||
+                  (!enterpriseIdentityBound && card.module !== "profile")
                 }
-                if (
-                  (card.module === "questions" ||
-                    card.module === "response-logic") &&
-                  authoritativeQuestionsLoading
-                ) {
-                  toast.warning("正在读取正式问题目录，请稍后再下载。");
-                  return;
-                }
-                if (
-                  (card.module === "questions" ||
-                    card.module === "response-logic") &&
-                  authoritativeQuestionsError
-                ) {
-                  toast.error("正式问题目录暂时无法读取", {
-                    description: authoritativeQuestionsError,
+                importing={importingKey === card.module}
+                onTemplate={() => {
+                  if (card.module === "monitoring") {
+                    void downloadMonitoringCurrentTemplate(userId)
+                      .then(() => toast.success("当前问题监控模板已下载"))
+                      .catch((error) =>
+                        toast.error("问题监控模板下载失败", {
+                          description:
+                            error instanceof Error
+                              ? error.message
+                              : "请稍后重试。",
+                        }),
+                      );
+                    return;
+                  }
+                  if (
+                    (card.module === "questions" ||
+                      card.module === "response-logic") &&
+                    authoritativeQuestionsLoading
+                  ) {
+                    toast.warning("正在读取正式问题目录，请稍后再下载。");
+                    return;
+                  }
+                  if (
+                    (card.module === "questions" ||
+                      card.module === "response-logic") &&
+                    authoritativeQuestionsError
+                  ) {
+                    toast.error("正式问题目录暂时无法读取", {
+                      description: authoritativeQuestionsError,
+                    });
+                    return;
+                  }
+                  if (
+                    card.module === "response-logic" &&
+                    responseLogicQuery.isLoading
+                  ) {
+                    toast.warning("正在读取当前应答逻辑，请稍后再下载。");
+                    return;
+                  }
+                  if (
+                    card.module === "response-logic" &&
+                    responseLogicQuery.error
+                  ) {
+                    toast.error("当前应答逻辑暂时无法读取", {
+                      description: responseLogicQuery.error.message,
+                    });
+                    return;
+                  }
+                  downloadModuleTemplate({
+                    module: card.module,
+                    revision,
+                    payload: workspace?.payload ?? draft,
+                    responseLogicRecords:
+                      responseLogicQuery.data?.records ?? [],
+                    authoritativeQuestions,
                   });
-                  return;
-                }
-                if (
-                  card.module === "response-logic" &&
-                  responseLogicQuery.isLoading
-                ) {
-                  toast.warning("正在读取当前应答逻辑，请稍后再下载。");
-                  return;
-                }
-                if (
-                  card.module === "response-logic" &&
-                  responseLogicQuery.error
-                ) {
-                  toast.error("当前应答逻辑暂时无法读取", {
-                    description: responseLogicQuery.error.message,
-                  });
-                  return;
-                }
-                downloadModuleTemplate({
-                  module: card.module,
-                  revision,
-                  payload: workspace?.payload ?? draft,
-                  responseLogicRecords: responseLogicQuery.data?.records ?? [],
-                  authoritativeQuestions,
-                });
-              }}
-              onFile={(file) => void importModule(card.module, file)}
-            />
-          ))}
+                }}
+                onFile={(file) => void importModule(card.module, file)}
+              />
+            ))}
         </div>
       </PortalCard>
 

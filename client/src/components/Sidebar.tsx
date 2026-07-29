@@ -57,6 +57,7 @@ interface SidebarProps {
   onOpenSettings: () => void;
   embedded?: boolean;
   hidePortalNavigation?: boolean;
+  showAccountMenu?: boolean;
 }
 
 export default function Sidebar({
@@ -65,6 +66,7 @@ export default function Sidebar({
   onOpenSettings,
   embedded = false,
   hidePortalNavigation = false,
+  showAccountMenu = true,
 }: SidebarProps) {
   const isMobile = useIsMobile();
   const [, setLocation] = useLocation();
@@ -109,9 +111,11 @@ export default function Sidebar({
           <Button
             variant="ghost"
             size="icon"
-            className={`left-[max(0.75rem,env(safe-area-inset-left))] top-[max(0.75rem,env(safe-area-inset-top))] z-50 border border-border/70 bg-card/90 shadow-sm backdrop-blur-sm ${
-              embedded ? "absolute" : "fixed"
-            }`}
+            className={`top-[max(0.75rem,env(safe-area-inset-top))] z-50 border border-border/70 bg-card/90 shadow-sm backdrop-blur-sm ${
+              embedded && hidePortalNavigation && !showAccountMenu
+                ? "left-[max(4.25rem,calc(env(safe-area-inset-left)+4.25rem))]"
+                : "left-[max(0.75rem,env(safe-area-inset-left))]"
+            } ${embedded ? "absolute" : "fixed"}`}
             aria-label="打开内容流程菜单"
           >
             <Menu className="w-5 h-5" />
@@ -147,6 +151,7 @@ export default function Sidebar({
             isAdmin={user?.role === "admin"}
             isSystemAdmin={isSystemAdmin}
             hidePortalNavigation={hidePortalNavigation}
+            showAccountMenu={showAccountMenu}
             onOpenAdmin={() => {
               setLocation("/");
               setOpen(false);
@@ -310,13 +315,23 @@ export default function Sidebar({
               size="sm"
             >
               <Settings className="w-4 h-4 flex-shrink-0" />
-              {!collapsed && <span className="text-xs">设置</span>}
+              {!collapsed && (
+                <span className="text-xs">
+                  {showAccountMenu ? "设置" : "API Key 与积分"}
+                </span>
+              )}
             </Button>
           </TooltipTrigger>
-          {collapsed && <TooltipContent side="right">设置</TooltipContent>}
+          {collapsed && (
+            <TooltipContent side="right">
+              {showAccountMenu ? "设置" : "API Key 与积分"}
+            </TooltipContent>
+          )}
         </Tooltip>
 
-        <AccountMenu collapsed={collapsed} onOpenSettings={onOpenSettings} />
+        {showAccountMenu && (
+          <AccountMenu collapsed={collapsed} onOpenSettings={onOpenSettings} />
+        )}
 
         <Tooltip>
           <TooltipTrigger asChild>
@@ -505,6 +520,7 @@ interface SidebarInnerProps {
   isAdmin: boolean;
   isSystemAdmin: boolean;
   hidePortalNavigation: boolean;
+  showAccountMenu: boolean;
   onOpenAdmin: () => void;
   onOpenPresales: () => void;
 }
@@ -523,6 +539,7 @@ function SidebarInner({
   isAdmin,
   isSystemAdmin,
   hidePortalNavigation,
+  showAccountMenu,
   onOpenAdmin,
   onOpenPresales,
 }: SidebarInnerProps) {
@@ -621,9 +638,16 @@ function SidebarInner({
           size="sm"
         >
           <Settings className="w-4 h-4 flex-shrink-0" />
-          <span className="text-xs">设置</span>
+          <span className="text-xs">
+            {showAccountMenu ? "设置" : "API Key 与积分"}
+          </span>
         </Button>
-        <AccountMenu onOpenSettings={onOpenSettings} onNavigate={onNavigate} />
+        {showAccountMenu && (
+          <AccountMenu
+            onOpenSettings={onOpenSettings}
+            onNavigate={onNavigate}
+          />
+        )}
       </div>
     </div>
   );

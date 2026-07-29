@@ -94,8 +94,7 @@ export default function ManagerAssignmentEditor({
   };
   const selectedDeliveryOptions = options.filter(
     (option) =>
-      draftIds.includes(option.id) &&
-      option.accessLevel === "delivery_admin",
+      draftIds.includes(option.id) && option.accessLevel === "delivery_admin",
   );
   const ownerChanged = (usageOwnerId ?? null) !== draftUsageOwnerId;
 
@@ -147,7 +146,7 @@ export default function ManagerAssignmentEditor({
                   <span className="truncate">{option.label}</span>
                   {option.id === usageOwnerId && (
                     <span className="shrink-0 font-semibold text-[#5b2a86]">
-                      · Key 归属
+                      · 主负责人
                     </span>
                   )}
                 </span>
@@ -247,7 +246,7 @@ export default function ManagerAssignmentEditor({
               htmlFor="usage-owner-admin"
               className="text-xs font-semibold text-[#51465d]"
             >
-              积分与 Key 归属管理员
+              主负责人（交付管理员）
             </label>
             <select
               id="usage-owner-admin"
@@ -268,7 +267,7 @@ export default function ManagerAssignmentEditor({
               ))}
             </select>
             <p className="mt-2 text-xs leading-5 text-[#8d8499]">
-              多位管理员仍可协作，但新模型任务只使用这里指定管理员的当前
+              多位管理员仍可协作；主负责人承接交付责任，客户任务优先使用客户自己的
               Key。
             </p>
           </div>

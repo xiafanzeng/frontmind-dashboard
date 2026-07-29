@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
-import { useSendMessage, classifyFailure } from "../hooks/useSendMessage";
+import {
+  useSendMessage,
+  classifyFailure,
+  sliceNewOutput,
+} from "../hooks/useSendMessage";
 
 const mocks = vi.hoisted(() => ({
   createTask: vi.fn(),
@@ -71,6 +75,41 @@ function mockPreparedFiles(files: File[], didZipLargeImages = false) {
       : [],
   });
 }
+
+describe("sliceNewOutput", () => {
+  const output = (id: string) => ({
+    id,
+    type: "message",
+    role: "assistant" as const,
+    content: [{ type: "output_text", text: id }],
+  });
+
+  it("slices a cumulative 5 → 6 response by its stable historical prefix", () => {
+    const historicalIds = ["old-1", "old-2", "old-3", "old-4", "old-5"];
+    const result = sliceNewOutput(
+      [...historicalIds.map(output), output("new-1")],
+      5,
+      historicalIds,
+    );
+
+    expect(result.map((item) => item.id)).toEqual(["new-1"]);
+  });
+
+  it("keeps a non-cumulative 5 → 1 current-turn response", () => {
+    const historicalIds = ["old-1", "old-2", "old-3", "old-4", "old-5"];
+    const result = sliceNewOutput([output("new-1")], 5, historicalIds);
+
+    expect(result.map((item) => item.id)).toEqual(["new-1"]);
+  });
+
+  it("deduplicates repeated items by stable output ID", () => {
+    const result = sliceNewOutput([output("new-1"), output("new-1")], 5, [
+      "old-1",
+    ]);
+
+    expect(result.map((item) => item.id)).toEqual(["new-1"]);
+  });
+});
 
 describe("useSendMessage", () => {
   beforeEach(() => {
@@ -143,11 +182,9 @@ describe("useSendMessage", () => {
     expect(assistantError?.content).not.toContain("API Key 是否正确");
   });
 
-  it("explains that shared service credentials are valid while attachments remain account-scoped", async () => {
+  it("requires a new conversation when rotated credentials cannot continue an attachment task", async () => {
     mocks.createTask.mockRejectedValueOnce(
-      new Error(
-        "附件不属于当前账号或使用了不同的 API Key，请重新上传该附件",
-      ),
+      new Error("附件不属于当前账号或使用了不同的 API Key，请重新上传该附件"),
     );
 
     const { result } = renderHook(() => useSendMessage());
@@ -159,11 +196,11 @@ describe("useSendMessage", () => {
     const assistantError = mocks.addMessage.mock.calls.find(
       ([, message]) => message.role === "assistant",
     )?.[1];
-    expect(assistantError?.content).toContain(
-      "多个账号可以共享服务连接",
-    );
-    expect(assistantError?.content).toContain("附件仍按账号隔离");
-    expect(assistantError?.content).toContain("当前账号重新上传");
+    expect(assistantError?.content).toContain("多个账号可以共享服务连接");
+    expect(assistantError?.content).toContain("历史任务与附件仍绑定原服务凭证");
+    expect(assistantError?.content).toContain("请新建对话");
+    expect(assistantError?.content).not.toContain("当前账号重新上传");
+    expect(assistantError?.content).not.toContain("请重新上传该附件");
     expect(assistantError?.content).not.toContain(
       "检查设置中的 API Key 是否正确",
     );

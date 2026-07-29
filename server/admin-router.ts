@@ -128,7 +128,10 @@ import {
   type ServicePortal,
   type ServicePortalQuestion,
 } from "../shared/service-portal";
-import { createManagedServiceUser } from "./managed-user-onboarding-service";
+import {
+  completeManagedServiceUserProvisioning,
+  createManagedServiceUser,
+} from "./managed-user-onboarding-service";
 
 const manualServiceOrders = createManualServiceOrderService();
 
@@ -139,6 +142,47 @@ function requireSystemAdmin(user: Parameters<typeof isSystemAdmin>[0]) {
       message: "只有系统管理员可以执行此操作",
     });
   }
+}
+
+function dashboardNonProfilePayload(
+  payload: z.infer<typeof dashboardPayloadSchema>,
+) {
+  const {
+    brandName: _brandName,
+    headline: _headline,
+    summary: _summary,
+    ...rest
+  } = payload;
+  return rest;
+}
+
+async function assertDashboardUpdateCapability(input: {
+  userId: number;
+  existing: Awaited<ReturnType<typeof getDashboardWorkspace>>;
+  next: z.infer<typeof dashboardPayloadSchema>;
+}) {
+  const portal = await getServicePortal(input.userId);
+  if (portal.capabilities.contentAssets.allowed) return;
+  if (
+    portal.service.planCode === "knowledge" &&
+    portal.capabilities.knowledgeBuild.allowed
+  ) {
+    const existingPayload = dashboardPayloadSchema.parse(
+      input.existing.payload,
+    );
+    if (
+      JSON.stringify(dashboardNonProfilePayload(existingPayload)) !==
+      JSON.stringify(dashboardNonProfilePayload(input.next))
+    ) {
+      throw new ServiceEntitlementError(
+        "CAPABILITY_UPGRADE_REQUIRED",
+        "知识库版仅可在这里维护企业名称、看板标题与企业摘要；其他交付内容未包含在当前套餐。",
+        403,
+      );
+    }
+    return;
+  }
+  await assertServiceCapability(input.userId, "contentAssets");
 }
 
 export function adminWorkspaceServiceValue(
@@ -751,8 +795,8 @@ export const adminRouter = router({
             code: "BAD_REQUEST",
             message:
               input.planCode === "basic"
-                ? "基础版为连续 30 天单题服务，不设置预付月份"
-                : "进阶版与豪华版合同均按 3 个月服务周期建立",
+                ? "普通版为连续 30 天单题服务，不设置预付月份"
+                : "知识库版、进阶版与豪华版合同均按 3 个月服务周期建立",
           });
         }
         if (
@@ -824,7 +868,7 @@ export const adminRouter = router({
               z.object({
                 userId: z.number().int().positive(),
                 expectedRevision: z.number().int().nonnegative(),
-                planCode: z.enum(["basic", "advanced", "luxury"]),
+                planCode: servicePlanCodeSchema,
                 startsAt: z.number().int().optional(),
                 reason: z.string().trim().max(2_000).optional(),
               }),
@@ -914,8 +958,12 @@ export const adminRouter = router({
       .mutation(async ({ ctx, input }) => {
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
-          await assertServiceCapability(input.userId, "contentAssets");
           const existing = await getDashboardWorkspace(input.userId);
+          await assertDashboardUpdateCapability({
+            userId: input.userId,
+            existing,
+            next: input.payload,
+          });
           assertDashboardEnterpriseIdentity(existing, input.payload);
           const dashboard = await updateDashboardWorkspace({
             userId: input.userId,
@@ -950,7 +998,7 @@ export const adminRouter = router({
           });
           return dashboard;
         } catch (error) {
-          throw toTrpcError(error);
+          throwServiceAdminError(error);
         }
       }),
 
@@ -1028,6 +1076,27 @@ export const adminRouter = router({
       .query(async ({ ctx, input }) => {
         try {
           return await getManagedCredentialStatus(ctx.user, input.userId);
+        } catch (error) {
+          throw toTrpcError(error);
+        }
+      }),
+
+    completeProvisioning: adminProcedure
+      .input(
+        z.object({
+          userId: z.number().int().positive(),
+          expectedRevision: z.number().int().positive(),
+          deliveryAdminId: z.number().int().positive(),
+          apiKey: presalesApiKeySchema,
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await completeManagedServiceUserProvisioning({
+            actor: ctx.user,
+            ...input,
+          });
         } catch (error) {
           throw toTrpcError(error);
         }
@@ -1468,6 +1537,8 @@ export const adminRouter = router({
             displayName: z.string().trim().max(128).optional(),
             role: z.literal("user"),
             planCode: servicePlanCodeSchema,
+            deliveryAdminId: z.number().int().positive(),
+            apiKey: presalesApiKeySchema,
           }),
           z.object({
             username: usernameSchema,
@@ -1509,6 +1580,8 @@ export const adminRouter = router({
             username: input.username,
             displayName: input.displayName,
             planCode: input.planCode,
+            deliveryAdminId: input.deliveryAdminId,
+            apiKey: input.apiKey,
           });
           const configuredBaseUrl =
             process.env.FRONTMIND_PUBLIC_URL?.trim().replace(/\/$/, "");
@@ -1535,6 +1608,7 @@ export const adminRouter = router({
               endsAt: result.contract.endsAt.getTime(),
             },
             assignedToCreator: result.assignedToCreator,
+            assignedDeliveryAdminId: result.assignedDeliveryAdminId,
           };
         } catch (error) {
           throw toTrpcError(error);
@@ -1626,16 +1700,24 @@ export const adminRouter = router({
       .mutation(async ({ ctx, input }) => {
         requireSystemAdmin(ctx.user);
         try {
-          await deleteManagedUser(ctx.user.id, input.userId);
+          const result = await deleteManagedUser(ctx.user.id, input.userId);
+          const retainedForHistory =
+            result.disposition === "deactivated_for_history";
           await writeWorkspaceAuditEvent({
             actor: ctx.user,
-            action: "account.deleted",
+            action: retainedForHistory
+              ? "account.deactivated_for_history"
+              : "account.deleted",
             targetType: "user",
             targetId: input.userId,
             workspaceUserId: input.userId,
             reason: input.reason,
+            metadata: { disposition: result.disposition },
           });
-          return { success: true } as const;
+          return {
+            success: true,
+            disposition: result.disposition,
+          } as const;
         } catch (error) {
           throw toTrpcError(error);
         }

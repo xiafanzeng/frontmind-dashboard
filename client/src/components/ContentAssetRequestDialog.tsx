@@ -22,6 +22,7 @@ import { Textarea } from "@/components/ui/textarea";
 
 export type ContentRequestPlanCode =
   | "basic"
+  | "knowledge"
   | "advanced"
   | "luxury"
   | "unknown";

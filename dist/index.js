@@ -19,6 +19,9 @@ function isExplicitAdminAccessLevel(value) {
 function hasExplicitAdminRole(user) {
   return user.role === "admin" && isExplicitAdminAccessLevel(user.adminAccessLevel);
 }
+function isProtectedBuiltinAdminUsername(value) {
+  return typeof value === "string" && value.normalize("NFKC").trim().toLowerCase() === "admin";
+}
 
 // server/_core/trpc.ts
 var t = initTRPC.context().create({
@@ -679,7 +682,12 @@ var serviceContracts = mysqlTable(
   {
     id: varchar("id", { length: 36 }).primaryKey(),
     userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
-    planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]).notNull(),
+    planCode: mysqlEnum("planCode", [
+      "basic",
+      "knowledge",
+      "advanced",
+      "luxury"
+    ]).notNull(),
     planVersion: int("planVersion", { unsigned: true }).default(1).notNull(),
     status: mysqlEnum("status", [
       "pending_confirmation",
@@ -1326,6 +1334,7 @@ var purchaseIntents = mysqlTable(
     }).references(() => serviceContracts.id, { onDelete: "set null" }),
     targetPlanCode: mysqlEnum("targetPlanCode", [
       "basic",
+      "knowledge",
       "advanced",
       "luxury"
     ]).notNull(),
@@ -2100,13 +2109,6 @@ function assertAdminHasNoUsageOwnedUsers(input) {
     `\u8BE5\u4EA4\u4ED8\u7BA1\u7406\u5458\u4ECD\u8D1F\u8D23\u7528\u6237\uFF0C\u8BF7\u5148\u8F6C\u79FB\u8FD9\u4E9B\u7528\u6237\u7684 Key \u4E0E\u79EF\u5206\u5F52\u5C5E\uFF0C\u518D${actionLabel}`
   );
 }
-function assertAdminHasNoHistoricalCredentialResources(referencedResourceCount) {
-  if (referencedResourceCount <= 0) return;
-  throw new AuthServiceError(
-    "CONFLICT",
-    "\u8BE5\u7BA1\u7406\u5458\u7684\u5386\u53F2 Key \u4ECD\u5173\u8054\u5BA2\u6237\u4EFB\u52A1\u6216\u6587\u4EF6\uFF0C\u4E0D\u80FD\u6C38\u4E45\u5220\u9664\uFF1B\u53EF\u4EE5\u505C\u7528\u8D26\u53F7\u5E76\u4FDD\u7559\u5386\u53F2\u6210\u679C"
-  );
-}
 var loginAttempts = /* @__PURE__ */ new Map();
 function toAuthenticatedUser(user) {
   const username = user.username ?? user.openId ?? `legacy-${user.id}`;
@@ -2600,16 +2602,27 @@ async function deleteManagedUser(actorUserId, targetUserId) {
     );
   }
   const db = await requireDb();
-  await db.transaction(async (tx) => {
+  const result = await db.transaction(async (tx) => {
     const rows = await tx.select().from(users).where(eq2(users.id, targetUserId)).limit(1).for("update");
     const user = rows[0];
     if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+    if (isProtectedBuiltinAdminUsername(user.username)) {
+      throw new AuthServiceError("CONFLICT", "\u5185\u7F6E admin \u7CFB\u7EDF\u7BA1\u7406\u5458\u4E0D\u80FD\u88AB\u5220\u9664");
+    }
     if (user.role === "admin") {
-      const ownedUsers = await tx.select({ userId: userUsageOwners.userId }).from(userUsageOwners).where(eq2(userUsageOwners.deliveryAdminId, targetUserId)).limit(1).for("update");
-      assertAdminHasNoUsageOwnedUsers({
-        ownedUserCount: ownedUsers.length,
-        mutation: "delete"
-      });
+      const protectedAdminRows = await tx.select({ id: users.id }).from(users).where(eq2(users.username, "admin")).limit(1).for("update");
+      const protectedAdmin = protectedAdminRows[0];
+      if (!protectedAdmin) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u672A\u627E\u5230\u53D7\u4FDD\u62A4\u7684\u5185\u7F6E admin\uFF0C\u65E0\u6CD5\u5B89\u5168\u4EA4\u63A5\u5BA2\u6237"
+        );
+      }
+      const ownedUsers = await tx.select({
+        userId: userUsageOwners.userId,
+        revision: userUsageOwners.revision
+      }).from(userUsageOwners).where(eq2(userUsageOwners.deliveryAdminId, targetUserId)).for("update");
+      const assignedUsers = await tx.select({ userId: userAdminAssignments.userId }).from(userAdminAssignments).where(eq2(userAdminAssignments.adminId, targetUserId)).for("update");
       const historicalResources = await tx.select({ id: upstreamResources.id }).from(upstreamResources).innerJoin(
         apiCredentials,
         eq2(upstreamResources.apiCredentialId, apiCredentials.id)
@@ -2619,9 +2632,7 @@ async function deleteManagedUser(actorUserId, targetUserId) {
           ne(upstreamResources.userId, targetUserId)
         )
       ).limit(1).for("update");
-      assertAdminHasNoHistoricalCredentialResources(
-        historicalResources.length
-      );
+      const retainHistoricalAccount = historicalResources.length > 0;
       if (user.isActive) {
         const activeAdmins = await tx.select({ id: users.id }).from(users).where(and(eq2(users.role, "admin"), eq2(users.isActive, true))).limit(2).for("update");
         if (activeAdmins.length <= 1) {
@@ -2631,9 +2642,49 @@ async function deleteManagedUser(actorUserId, targetUserId) {
           );
         }
       }
+      for (const owner of ownedUsers) {
+        await tx.update(userUsageOwners).set({
+          deliveryAdminId: protectedAdmin.id,
+          revision: owner.revision + 1,
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq2(userUsageOwners.userId, owner.userId));
+      }
+      const reassignedUserIds = [
+        .../* @__PURE__ */ new Set([
+          ...ownedUsers.map((owner) => owner.userId),
+          ...assignedUsers.map((assignment) => assignment.userId)
+        ])
+      ];
+      if (reassignedUserIds.length > 0) {
+        await tx.insert(userAdminAssignments).values(
+          reassignedUserIds.map((userId) => ({
+            userId,
+            adminId: protectedAdmin.id,
+            assignedByUserId: actorUserId
+          }))
+        ).onDuplicateKeyUpdate({
+          set: { assignedByUserId: actorUserId }
+        });
+      }
+      if (retainHistoricalAccount) {
+        const now = /* @__PURE__ */ new Date();
+        await tx.update(users).set({ isActive: false, updatedAt: now }).where(eq2(users.id, targetUserId));
+        await tx.update(userPasswordSetupTokens).set({ consumedAt: now, updatedAt: now }).where(
+          and(
+            eq2(userPasswordSetupTokens.userId, targetUserId),
+            isNull(userPasswordSetupTokens.consumedAt)
+          )
+        );
+        return { disposition: "deactivated_for_history" };
+      }
     }
     await permanentlyDeleteManagedUserRows(tx, targetUserId);
+    return { disposition: "permanently_deleted" };
   });
+  if (result.disposition === "deactivated_for_history") {
+    await revokeAllUserSessions(targetUserId);
+  }
+  return result;
 }
 function decodeMasterKey(value) {
   const trimmed = value.trim();
@@ -2725,25 +2776,6 @@ function credentialsUseSameUpstreamApiKey(left, right) {
   const rightBytes = Buffer.from(right.apiKey, "utf8");
   return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }
-async function assertApiKeyScopeAvailable(input) {
-  const conflicting = input.targetScope === "managed_account" ? await input.executor.select({ id: presalesApiCredentials.id }).from(presalesApiCredentials).where(
-    and(
-      eq2(presalesApiCredentials.fingerprint, input.fingerprint),
-      eq2(presalesApiCredentials.status, "active")
-    )
-  ).limit(1) : await input.executor.select({ id: apiCredentials.id }).from(apiCredentials).where(
-    and(
-      eq2(apiCredentials.fingerprint, input.fingerprint),
-      eq2(apiCredentials.status, "active")
-    )
-  ).limit(1);
-  if (conflicting[0]) {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "\u5B98\u7F51\u524D\u53F0 API Key \u4E0E\u8D26\u53F7\u5171\u4EAB Key \u6C60\u5FC5\u987B\u5206\u5F00\u914D\u7F6E"
-    );
-  }
-}
 function encryptApiKey(userId, credentialId, apiKey) {
   return encryptCredentialSecret(
     credentialAad(userId, credentialId).toString("utf8"),
@@ -2809,6 +2841,14 @@ async function getApiCredentialStatus(userId) {
 }
 async function getEffectiveApiCredentialStatus(accountId) {
   const db = await requireDb();
+  const directStatus = await getApiCredentialStatus(accountId);
+  if (directStatus.configured) {
+    return {
+      ...directStatus,
+      ownerUserId: accountId,
+      inherited: false
+    };
+  }
   const ownerRows = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq2(userUsageOwners.userId, accountId)).limit(1);
   const ownerUserId = ownerRows[0]?.deliveryAdminId ?? accountId;
   return {
@@ -2817,49 +2857,51 @@ async function getEffectiveApiCredentialStatus(accountId) {
     inherited: ownerUserId !== accountId
   };
 }
+async function replaceApiCredentialInTransaction(input) {
+  const fingerprint = getApiKeyFingerprint(input.apiKey);
+  const credentialId = input.credentialId ?? randomUUID();
+  const encrypted = encryptApiKey(input.userId, credentialId, input.apiKey);
+  const now = input.now ?? /* @__PURE__ */ new Date();
+  const tx = input.executor;
+  const ownerRows = await tx.select({ id: users.id }).from(users).where(eq2(users.id, input.userId)).limit(1).for("update");
+  if (!ownerRows[0]) {
+    throw new AuthServiceError("NOT_FOUND", "User not found");
+  }
+  const latest = await tx.select().from(apiCredentials).where(eq2(apiCredentials.userId, input.userId)).orderBy(desc(apiCredentials.version)).limit(1);
+  const nextVersion = (latest[0]?.version ?? 0) + 1;
+  await tx.update(apiCredentials).set({ status: "retired", retiredAt: now, updatedAt: now }).where(
+    and(
+      eq2(apiCredentials.userId, input.userId),
+      eq2(apiCredentials.status, "active")
+    )
+  );
+  const inserted = {
+    id: credentialId,
+    userId: input.userId,
+    version: nextVersion,
+    ...encrypted,
+    fingerprint,
+    status: "active",
+    validationStatus: "verified",
+    verifiedAt: now,
+    createdAt: now,
+    updatedAt: now,
+    retiredAt: null,
+    deletedAt: null
+  };
+  await tx.insert(apiCredentials).values(inserted);
+  return toCredentialStatus(inserted);
+}
 async function replaceApiCredential(userId, apiKey, validator = validateUpstreamApiKey) {
   const db = await requireDb();
   await validator(apiKey);
-  const fingerprint = getApiKeyFingerprint(apiKey);
-  const credentialId = randomUUID();
-  const encrypted = encryptApiKey(userId, credentialId, apiKey);
-  const now = /* @__PURE__ */ new Date();
-  const credential = await db.transaction(async (tx) => {
-    const ownerRows = await tx.select({ id: users.id }).from(users).where(eq2(users.id, userId)).limit(1).for("update");
-    if (!ownerRows[0]) {
-      throw new AuthServiceError("NOT_FOUND", "User not found");
-    }
-    const latest = await tx.select().from(apiCredentials).where(eq2(apiCredentials.userId, userId)).orderBy(desc(apiCredentials.version)).limit(1);
-    const nextVersion = (latest[0]?.version ?? 0) + 1;
-    await assertApiKeyScopeAvailable({
+  return db.transaction(
+    (tx) => replaceApiCredentialInTransaction({
       executor: tx,
-      fingerprint,
-      targetScope: "managed_account"
-    });
-    await tx.update(apiCredentials).set({ status: "retired", retiredAt: now }).where(
-      and(
-        eq2(apiCredentials.userId, userId),
-        eq2(apiCredentials.status, "active")
-      )
-    );
-    const inserted = {
-      id: credentialId,
       userId,
-      version: nextVersion,
-      ...encrypted,
-      fingerprint,
-      status: "active",
-      validationStatus: "verified",
-      verifiedAt: now,
-      createdAt: now,
-      updatedAt: now,
-      retiredAt: null,
-      deletedAt: null
-    };
-    await tx.insert(apiCredentials).values(inserted);
-    return inserted;
-  });
-  return toCredentialStatus(credential);
+      apiKey
+    })
+  );
 }
 async function deleteActiveApiCredential(userId) {
   const db = await requireDb();
@@ -2905,12 +2947,11 @@ async function getEffectiveDecryptedCredentialForAccount(accountId) {
   const accountRows = await db.select({ role: users.role }).from(users).where(eq2(users.id, accountId)).limit(1);
   const account = accountRows[0];
   if (!account) return null;
-  if (account.role === "admin") {
-    return getDecryptedCredentialForUser(accountId);
-  }
+  const directCredential = await getDecryptedCredentialForUser(accountId);
+  if (directCredential || account.role === "admin") return directCredential;
   const ownerRows = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq2(userUsageOwners.userId, accountId)).limit(1);
   const ownerId = ownerRows[0]?.deliveryAdminId;
-  return ownerId ? getDecryptedCredentialForUser(ownerId) : getDecryptedCredentialForUser(accountId);
+  return ownerId ? getDecryptedCredentialForUser(ownerId) : null;
 }
 async function credentialMayServeAccount(executor, accountId, credentialId) {
   const credentialRows = await executor.select({
@@ -2998,11 +3039,7 @@ async function recordUpstreamResource(input) {
     }
     return existing[0];
   }
-  if (!await credentialMayServeAccount(
-    db,
-    input.userId,
-    input.apiCredentialId
-  )) {
+  if (!await credentialMayServeAccount(db, input.userId, input.apiCredentialId)) {
     throw new AuthServiceError("NOT_FOUND", "API credential not found");
   }
   if (input.conversationId) {
@@ -3086,7 +3123,12 @@ import { z as z3 } from "zod";
 
 // shared/service-portal.ts
 import { z } from "zod";
-var servicePlanCodeSchema = z.enum(["basic", "advanced", "luxury"]);
+var servicePlanCodeSchema = z.enum([
+  "basic",
+  "knowledge",
+  "advanced",
+  "luxury"
+]);
 var workspaceQuestionCategorySchema = z.enum([
   "industry",
   "competitor_comparison",
@@ -3152,7 +3194,7 @@ var FULL_SERVICE_CAPABILITIES = Object.freeze({
 var SERVICE_PLAN_CATALOG = Object.freeze({
   basic: {
     code: "basic",
-    name: "\u57FA\u7840\u7248",
+    name: "\u666E\u901A\u7248",
     description: "30 \u5929\u5185\u4EA4\u4ED8\u4E00\u4E2A\u5DF2\u8D2D\u4E70\u7684\u975E\u884C\u4E1A\u95EE\u9898\u53CA\u77E5\u8BC6\u5E93\u5C55\u793A\u3002",
     planVersion: 1,
     contractTerm: { unit: "day", count: 30 },
@@ -3179,6 +3221,35 @@ var SERVICE_PLAN_CATALOG = Object.freeze({
       channelDistribution: true,
       progressReport: true,
       contentAssets: true
+    }
+  },
+  knowledge: {
+    code: "knowledge",
+    name: "\u77E5\u8BC6\u5E93\u7248",
+    description: "\u63D0\u4F9B\u5B8C\u6574\u7684\u77E5\u8BC6\u5E93\u6784\u5EFA\u3001\u6301\u7EED\u66F4\u65B0\u4E0E\u5C55\u793A\u80FD\u529B\u3002",
+    planVersion: 1,
+    contractTerm: { unit: "month", count: 3 },
+    quotaCadence: "contract",
+    prepaidMonths: 3,
+    billingLabel: "\u5B63\u5EA6\u77E5\u8BC6\u5E93\u670D\u52A1",
+    limits: {
+      industryLimit: 0,
+      competitorComparisonLimit: 0,
+      reputationLimit: 0,
+      productScenarioLimit: 0,
+      totalQuestionLimit: 0
+    },
+    includedCapabilities: {
+      knowledgeBuild: true,
+      knowledgeDisplay: true,
+      globalKeywords: false,
+      questionSelection: false,
+      intentOptimization: false,
+      responseLogic: false,
+      monitoring: false,
+      channelDistribution: false,
+      progressReport: false,
+      contentAssets: false
     }
   },
   advanced: {
@@ -4480,6 +4551,10 @@ var DELIVERY_TICKET_LIMITS = Object.freeze({
     content_asset_publish: 1,
     website_content_publish: 0
   }),
+  knowledge: Object.freeze({
+    content_asset_publish: 0,
+    website_content_publish: 0
+  }),
   advanced: Object.freeze({
     content_asset_publish: 5,
     website_content_publish: 20
@@ -5368,8 +5443,9 @@ function selectPortalContract(contracts, now = /* @__PURE__ */ new Date()) {
   };
   const planRank = {
     basic: 1,
-    advanced: 2,
-    luxury: 3
+    knowledge: 2,
+    advanced: 3,
+    luxury: 4
   };
   return [...contracts].sort((left, right) => {
     const statusDifference = statusRank[deriveEffectiveServiceStatus(right, now)] - statusRank[deriveEffectiveServiceStatus(left, now)];
@@ -5384,7 +5460,7 @@ function selectCurrentServiceContractIds(contracts, now = /* @__PURE__ */ new Da
   if (!contract) return { contract: null, contractIds: [] };
   const replacedIds = new Set(contract.replacesContractIds ?? []);
   const supplementalBasicIds = contracts.filter(
-    (value) => value.planCode === "basic" && value.id !== contract.id && !replacedIds.has(value.id) && deriveEffectiveServiceStatus(value, now) === "active"
+    (value) => contract.planCode !== "knowledge" && value.planCode === "basic" && value.id !== contract.id && !replacedIds.has(value.id) && deriveEffectiveServiceStatus(value, now) === "active"
   ).map((value) => value.id);
   return {
     contract,
@@ -5522,10 +5598,11 @@ function deriveCapabilities(status, planCode) {
   return output;
 }
 function deriveWorkflowSteps(input) {
+  const knowledgeOnlyReason = input.planCode === "knowledge" ? "\u77E5\u8BC6\u5E93\u7248\u4EC5\u5F00\u653E\u77E5\u8BC6\u5E93\u6784\u5EFA\u3001\u66F4\u65B0\u4E0E\u5C55\u793A\uFF1B\u6B64\u529F\u80FD\u672A\u5305\u542B\u5728\u5F53\u524D\u5957\u9910\u3002" : null;
   const serviceBlock = input.status === "active" ? null : capabilityReason(input.status, false) ?? "\u670D\u52A1\u5F53\u524D\u4E0D\u53EF\u7528\u3002";
   const knowledgeReason = serviceBlock ? serviceBlock : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u8FC1\u79FB\u5B8C\u6210\u3002" : null;
-  const questionReason = serviceBlock ? serviceBlock : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u5E76\u53D1\u5E03\u77E5\u8BC6\u5E93\u3002" : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5DF2\u8D2D\u95EE\u9898\u4ECE\u5B98\u7F51\u540C\u6B65\u3002" : null;
-  const responseReason = serviceBlock ? serviceBlock : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u5E76\u53D1\u5E03\u77E5\u8BC6\u5E93\u3002" : !input.questionSelectionComplete ? "\u8BF7\u5148\u5B8C\u6210\u5F53\u524D\u670D\u52A1\u5468\u671F\u7684\u9009\u9898\u3002" : null;
+  const questionReason = serviceBlock ? serviceBlock : knowledgeOnlyReason ? knowledgeOnlyReason : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u5E76\u53D1\u5E03\u77E5\u8BC6\u5E93\u3002" : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5DF2\u8D2D\u95EE\u9898\u4ECE\u5B98\u7F51\u540C\u6B65\u3002" : null;
+  const responseReason = serviceBlock ? serviceBlock : knowledgeOnlyReason ? knowledgeOnlyReason : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u5E76\u53D1\u5E03\u77E5\u8BC6\u5E93\u3002" : !input.questionSelectionComplete ? "\u8BF7\u5148\u5B8C\u6210\u5F53\u524D\u670D\u52A1\u5468\u671F\u7684\u9009\u9898\u3002" : null;
   const monitoringReason = responseReason ?? (!input.responseLogicComplete ? "\u8BF7\u5148\u5728\u5E94\u7B54\u903B\u8F91\u667A\u80FD\u4F53\u9010\u9898\u53D1\u5E03\u786E\u8BA4\u3002" : null);
   const distributionReason = monitoringReason ?? (!input.monitoringComplete ? "\u8BF7\u7B49\u5F85\u771F\u5B9E\u95EE\u9898\u76D1\u63A7\u6570\u636E\u5199\u5165\u3002" : null);
   const reportReason = distributionReason ?? (!input.channelDistributionComplete ? "\u8BF7\u7B49\u5F85\u53EF\u6838\u9A8C\u7684\u6E20\u9053\u5F15\u7528\u6570\u636E\u5199\u5165\u3002" : null);
@@ -5634,6 +5711,13 @@ function deriveNextAction(input) {
     return {
       kind: "start_knowledge_build",
       label: "\u5F00\u59CB\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53",
+      href: "/knowledge-base"
+    };
+  }
+  if (input.planCode === "knowledge") {
+    return {
+      kind: "view_knowledge",
+      label: "\u67E5\u770B\u77E5\u8BC6\u5E93",
       href: "/knowledge-base"
     };
   }
@@ -6294,7 +6378,12 @@ async function upsertServiceContract(input) {
         "\u670D\u52A1\u7248\u672C\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002"
       );
     }
-    const shouldReplaceExisting = planCode !== "basic" || input.preserveConcurrentBasic === false;
+    const primaryContract = selectPortalContract(
+      existingRows,
+      input.now ?? startsAt
+    );
+    const switchingFromKnowledgeToBasic = planCode === "basic" && primaryContract?.planCode === "knowledge";
+    const shouldReplaceExisting = planCode !== "basic" || input.preserveConcurrentBasic === false || switchingFromKnowledgeToBasic;
     const explicitSourceIds = input.sourceContractIds ? [...new Set(input.sourceContractIds)] : null;
     let sourceContracts = [];
     if (shouldReplaceExisting && existingRows.length) {
@@ -6309,10 +6398,7 @@ async function upsertServiceContract(input) {
           );
         }
       } else {
-        const primary = selectPortalContract(
-          existingRows,
-          input.now ?? startsAt
-        );
+        const primary = primaryContract;
         if (primary?.planCode === "basic") {
           const activeBasicContracts = existingRows.filter(
             (contract) => contract.planCode === "basic" && deriveEffectiveServiceStatus(
@@ -6338,7 +6424,13 @@ async function upsertServiceContract(input) {
       ).orderBy(desc3(workspaceQuestions.selectedAt)).for("update");
     }
     const explicitCarryIds = input.carryQuestionIds ? [...new Set(input.carryQuestionIds)] : null;
-    const carryoverQuestions = explicitCarryIds ? sourceQuestions.filter(
+    if (planCode === "knowledge" && explicitCarryIds?.length) {
+      throw new ServiceEntitlementError(
+        "UPGRADE_RECONCILIATION_REQUIRED",
+        "\u77E5\u8BC6\u5E93\u7248\u4E0D\u5305\u542B\u95EE\u9898\u670D\u52A1\uFF0C\u4E0D\u80FD\u7EE7\u7EED\u643A\u5E26\u5DF2\u8D2D\u95EE\u9898\u3002"
+      );
+    }
+    const carryoverQuestions = planCode === "knowledge" ? [] : explicitCarryIds ? sourceQuestions.filter(
       (question) => explicitCarryIds.includes(question.id)
     ) : sourceQuestions;
     if (explicitCarryIds && carryoverQuestions.length !== explicitCarryIds.length) {
@@ -7563,7 +7655,7 @@ async function provisionBasicEntitlement(tx, input) {
     ),
     category: input.category,
     question: input.question,
-    rationale: "\u5B98\u7F51\u57FA\u7840\u7248\u5DF2\u8D2D\u95EE\u9898",
+    rationale: "\u5B98\u7F51\u666E\u901A\u7248\u5DF2\u8D2D\u95EE\u9898",
     source: "website",
     status: "selected",
     selectionApprovalStatus: "approved",
@@ -8070,7 +8162,7 @@ async function decideWebsitePurchase(input) {
       await tx.insert(userDashboardContents).values({
         userId,
         payload: createDefaultDashboardPayload(row.companyName),
-        sourceName: `\u5B98\u7F51\u57FA\u7840\u7248\u5F00\u901A \xB7 ${row.projectId}`.slice(0, 512),
+        sourceName: `\u5B98\u7F51\u666E\u901A\u7248\u5F00\u901A \xB7 ${row.projectId}`.slice(0, 512),
         revision: 1,
         updatedByUserId: input.actorUserId,
         createdAt: now,
@@ -8210,7 +8302,7 @@ async function createServicePurchaseIntent(input) {
   if (input.kind === "repeat_basic" && targetPlanCode !== "basic") {
     throw new PurchaseProvisioningError(
       "PURCHASE_INTENT_CONFLICT",
-      "\u57FA\u7840\u7248\u590D\u8D2D\u51ED\u8BC1\u53EA\u80FD\u8D2D\u4E70\u57FA\u7840\u7248",
+      "\u666E\u901A\u7248\u590D\u8D2D\u51ED\u8BC1\u53EA\u80FD\u8D2D\u4E70\u666E\u901A\u7248",
       400
     );
   }
@@ -8456,11 +8548,6 @@ async function replacePresalesApiCredential(actorUserId, apiKey, validator = val
   const inserted = await db.transaction(async (tx) => {
     const latest = await tx.select().from(presalesApiCredentials).where(eq7(presalesApiCredentials.slot, PRESALES_CREDENTIAL_SLOT)).orderBy(desc6(presalesApiCredentials.version)).limit(1).for("update");
     const nextVersion = (latest[0]?.version ?? 0) + 1;
-    await assertApiKeyScopeAvailable({
-      executor: tx,
-      fingerprint,
-      targetScope: "website_frontend"
-    });
     await tx.update(presalesApiCredentials).set({ status: "retired", retiredAt: now }).where(
       and6(
         eq7(presalesApiCredentials.slot, PRESALES_CREDENTIAL_SLOT),
@@ -9579,24 +9666,15 @@ async function assertWorkspaceAccess(actor, targetUserId) {
   }
   throw new AuthServiceError("NOT_FOUND", "User workspace not found");
 }
-function withSnapshotMetrics(payload, snapshot) {
-  if (!snapshot) return payload;
-  const generated = [
-    { label: "\u77E5\u8BC6\u6587\u6863", value: snapshot.documentCount, unit: "\u7BC7" },
-    { label: "\u56FE\u7247\u8D44\u4EA7", value: snapshot.imageCount, unit: "\u5F20" },
-    { label: "\u5185\u5BB9\u5B57\u6570", value: snapshot.characterCount, unit: "\u5B57" }
-  ];
-  const reserved = /* @__PURE__ */ new Set([
-    "\u77E5\u8BC6\u5E93\u7248\u672C",
-    ...generated.map((metric) => metric.label)
-  ]);
-  return {
-    ...payload,
-    metrics: [
-      ...generated,
-      ...payload.metrics.filter((metric) => !reserved.has(metric.label))
-    ].slice(0, 24)
-  };
+function assertManagedCredentialMutationAccess(actor, deliveryAdminId) {
+  if (isSystemAdmin(actor)) return;
+  if (actor.role === "admin" && actor.adminAccessLevel === "delivery_admin" && deliveryAdminId === actor.id) {
+    return;
+  }
+  throw new AuthServiceError(
+    "INVALID_CREDENTIAL",
+    "\u53EA\u6709\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA\u6216\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u7BA1\u7406\u5BA2\u6237 Key"
+  );
 }
 function toPublicOptimizationReport(report) {
   if (!report.questionReports) return report;
@@ -9648,7 +9726,10 @@ async function getDashboardWorkspace(userId) {
     displayName
   });
   return {
-    payload: withSnapshotMetrics(payload, snapshotRows[0]),
+    // Keep the administrator-authored dashboard payload lossless. Knowledge
+    // snapshot counts belong to the knowledge viewer; injecting them here
+    // would be written back by the editor and overwrite real customer metrics.
+    payload,
     sourceName: content?.sourceName ?? null,
     enterpriseIdentityBoundAt: content?.enterpriseIdentityBoundAt?.getTime() ?? null,
     revision: content?.revision ?? 0,
@@ -10249,9 +10330,8 @@ async function listManagedWorkspaceUsers(actor) {
     admins: adminRows,
     users: userRows.map((user) => {
       const usageOwner = usageOwnerByUser.get(user.id);
-      const credential = credentialByUser.get(
-        usageOwner?.deliveryAdminId ?? user.id
-      );
+      const directCredential = credentialByUser.get(user.id);
+      const credential = directCredential ?? credentialByUser.get(usageOwner?.deliveryAdminId ?? user.id);
       const dashboard = dashboardByUser.get(user.id);
       return {
         ...user,
@@ -10273,7 +10353,8 @@ async function listManagedWorkspaceUsers(actor) {
           configured: Boolean(credential),
           fingerprint: credential?.fingerprint ?? null,
           status: credential?.validationStatus ?? null,
-          verifiedAt: credential?.verifiedAt?.getTime() ?? null
+          verifiedAt: credential?.verifiedAt?.getTime() ?? null,
+          inherited: Boolean(!directCredential && usageOwner)
         }
       };
     })
@@ -10309,7 +10390,7 @@ async function setWorkspaceAssignments(input) {
   if (input.usageOwnerAdminId != null && !deliveryAdminIds.includes(input.usageOwnerAdminId)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "\u79EF\u5206\u5F52\u5C5E\u7BA1\u7406\u5458\u5FC5\u987B\u662F\u5DF2\u9009\u4E2D\u7684\u4EA4\u4ED8\u7BA1\u7406\u5458"
+      "\u4E3B\u8D1F\u8D23\u4EBA\u5FC5\u987B\u662F\u5DF2\u9009\u4E2D\u7684\u6709\u6548\u4EA4\u4ED8\u7BA1\u7406\u5458"
     );
   }
   await db.transaction(async (tx) => {
@@ -10333,7 +10414,7 @@ async function setWorkspaceAssignments(input) {
     if (input.usageOwnerAdminId != null && !lockedDeliveryAdminIds.includes(input.usageOwnerAdminId)) {
       throw new AuthServiceError(
         "CONFLICT",
-        "\u79EF\u5206\u5F52\u5C5E\u7BA1\u7406\u5458\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u65B0\u5206\u914D"
+        "\u4E3B\u8D1F\u8D23\u4EBA\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u65B0\u5206\u914D"
       );
     }
     const previousAssignments = await tx.select({ adminId: userAdminAssignments.adminId }).from(userAdminAssignments).where(eq9(userAdminAssignments.userId, input.userId));
@@ -10365,18 +10446,6 @@ async function setWorkspaceAssignments(input) {
         revision: 1
       });
     }
-    if (nextUsageOwnerId != null) {
-      await tx.update(apiCredentials).set({
-        status: "retired",
-        retiredAt: /* @__PURE__ */ new Date(),
-        updatedAt: /* @__PURE__ */ new Date()
-      }).where(
-        and8(
-          eq9(apiCredentials.userId, input.userId),
-          eq9(apiCredentials.status, "active")
-        )
-      );
-    }
     await writeWorkspaceAuditEvent(
       {
         actor: input.actor,
@@ -10405,12 +10474,12 @@ async function replaceManagedUserCredential(input) {
     );
   }
   await assertWorkspaceAccess(input.actor, input.userId);
-  const db = await requireDb4();
-  const usageOwners = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq9(userUsageOwners.userId, input.userId)).limit(1);
-  if (usageOwners[0]) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "\u8BE5\u7528\u6237\u7EE7\u627F\u4EA4\u4ED8\u7BA1\u7406\u5458\u7684\u5171\u4EAB Key\uFF0C\u8BF7\u5728\u4EA4\u4ED8\u7BA1\u7406\u5458\u7684 FrontMind Agent \u8BBE\u7F6E\u4E2D\u66F4\u6362"
+  if (!isSystemAdmin(input.actor)) {
+    const db = await requireDb4();
+    const owners = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq9(userUsageOwners.userId, input.userId)).limit(1);
+    assertManagedCredentialMutationAccess(
+      input.actor,
+      owners[0]?.deliveryAdminId
     );
   }
   const credential = await replaceApiCredential(input.userId, input.apiKey);
@@ -10436,12 +10505,12 @@ async function deleteManagedUserCredential(input) {
     );
   }
   await assertWorkspaceAccess(input.actor, input.userId);
-  const db = await requireDb4();
-  const usageOwners = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq9(userUsageOwners.userId, input.userId)).limit(1);
-  if (usageOwners[0]) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "\u8BE5\u7528\u6237\u4F7F\u7528\u4EA4\u4ED8\u7BA1\u7406\u5458\u7684\u5171\u4EAB Key\uFF0C\u4E0D\u80FD\u5728\u7528\u6237\u5DE5\u4F5C\u533A\u5220\u9664"
+  if (!isSystemAdmin(input.actor)) {
+    const db = await requireDb4();
+    const owners = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq9(userUsageOwners.userId, input.userId)).limit(1);
+    assertManagedCredentialMutationAccess(
+      input.actor,
+      owners[0]?.deliveryAdminId
     );
   }
   await deleteActiveApiCredential(input.userId);
@@ -13468,7 +13537,7 @@ function publicMessage(row) {
     case "activation_required":
       return "\u8D26\u53F7\u8D44\u6599\u5DF2\u63D0\u4EA4\uFF0C\u6B63\u5728\u81EA\u52A8\u5F00\u901A\u670D\u52A1";
     case "active":
-      return "\u670D\u52A1\u8D26\u53F7\u4E0E\u57FA\u7840\u7248\u6743\u76CA\u5DF2\u5F00\u901A";
+      return "\u670D\u52A1\u8D26\u53F7\u4E0E\u666E\u901A\u7248\u6743\u76CA\u5DF2\u5F00\u901A";
     case "rejected":
       return row.lastError || "\u8BE5\u670D\u52A1\u8BA2\u5355\u5DF2\u88AB\u7BA1\u7406\u5458\u62D2\u7EDD";
     case "failed":
@@ -15668,7 +15737,7 @@ function assertDeliveryTicketServiceEligibility(portal, ticketType) {
   if (!planAllowsTicket) {
     throw new DeliveryTicketError(
       "DELIVERY_TICKET_UPGRADE_REQUIRED",
-      ticketType === "website_operation" ? "\u57FA\u7840\u7248\u4E0D\u5305\u542B AI \u53CB\u597D\u5B98\u7F51\u7BA1\u7406\uFF0C\u8BF7\u5347\u7EA7\u8FDB\u9636\u7248\u6216\u8C6A\u534E\u7248\u3002" : "\u5F53\u524D\u5957\u9910\u4E0D\u5305\u542B\u6B64\u5DE5\u5355\u670D\u52A1\uFF0C\u8BF7\u5347\u7EA7\u8FDB\u9636\u7248\u6216\u8C6A\u534E\u7248\u3002",
+      ticketType === "website_operation" ? "\u666E\u901A\u7248\u4E0D\u5305\u542B AI \u53CB\u597D\u5B98\u7F51\u7BA1\u7406\uFF0C\u8BF7\u5347\u7EA7\u8FDB\u9636\u7248\u6216\u8C6A\u534E\u7248\u3002" : "\u5F53\u524D\u5957\u9910\u4E0D\u5305\u542B\u6B64\u5DE5\u5355\u670D\u52A1\uFF0C\u8BF7\u5347\u7EA7\u8FDB\u9636\u7248\u6216\u8C6A\u534E\u7248\u3002",
       403
     );
   }
@@ -16068,7 +16137,7 @@ async function currentQuota(db, userId, portal) {
       revision,
       validFrom,
       validUntil,
-      reason: active ? capacity.limit > 0 ? null : "\u5F53\u524D\u5957\u9910\u4E0D\u5305\u542B\u6B64\u53D1\u5E03\u989D\u5EA6\u3002" : portal.service.status === "active" && portal.service.planCode === "basic" && pool === "website_content_publish" ? "\u57FA\u7840\u7248\u4E0D\u5305\u542B AI \u53CB\u597D\u5B98\u7F51\u7BA1\u7406\u3002" : portal.service.status === "expired" || portal.service.status === "cancelled" ? "\u5F53\u524D\u670D\u52A1\u5DF2\u5230\u671F\uFF0C\u4EC5\u53EF\u67E5\u770B\u5386\u53F2\u5DE5\u5355\u3002" : "\u5F53\u524D\u670D\u52A1\u5C1A\u4E0D\u53EF\u63D0\u4EA4\u65B0\u5DE5\u5355\u3002"
+      reason: active ? capacity.limit > 0 ? null : "\u5F53\u524D\u5957\u9910\u4E0D\u5305\u542B\u6B64\u53D1\u5E03\u989D\u5EA6\u3002" : portal.service.status === "active" && portal.service.planCode === "basic" && pool === "website_content_publish" ? "\u666E\u901A\u7248\u4E0D\u5305\u542B AI \u53CB\u597D\u5B98\u7F51\u7BA1\u7406\u3002" : portal.service.status === "expired" || portal.service.status === "cancelled" ? "\u5F53\u524D\u670D\u52A1\u5DF2\u5230\u671F\uFF0C\u4EC5\u53EF\u67E5\u770B\u5386\u53F2\u5DE5\u5355\u3002" : "\u5F53\u524D\u670D\u52A1\u5C1A\u4E0D\u53EF\u63D0\u4EA4\u65B0\u5DE5\u5355\u3002"
     };
   };
   return {
@@ -18823,6 +18892,7 @@ async function confirmRedirectWorkbook(input) {
 
 // server/managed-user-onboarding-service.ts
 import { randomUUID as randomUUID16 } from "node:crypto";
+import { and as and18, desc as desc15, eq as eq21 } from "drizzle-orm";
 async function defaultTransaction() {
   const db = await getDb();
   if (!db) {
@@ -18846,6 +18916,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
   const plan = SERVICE_PLAN_CATALOG[planCode];
   const startsAt = now;
   const endsAt = getServiceContractTermEnd(planCode, startsAt);
+  await (dependencies.validateApiKey ?? validateUpstreamApiKey)(input.apiKey);
   const transaction = dependencies.transaction ?? await defaultTransaction();
   const createAccount = dependencies.createAccount ?? ((accountInput, executor) => createManagedUserWithSetupToken(accountInput, executor));
   const persistContract = dependencies.persistContract ?? (async (value, executor) => {
@@ -18856,7 +18927,43 @@ async function createManagedServiceUser(input, dependencies = {}) {
     }
   });
   const writeAudit = dependencies.writeAudit ?? ((event, executor) => writeWorkspaceAuditEvent(event, executor));
+  const persistCredentialAndAssignment = dependencies.persistCredentialAndAssignment ?? (async (value, executor) => {
+    const tx = executor;
+    await replaceApiCredentialInTransaction({
+      executor: tx,
+      userId: value.userId,
+      apiKey: value.apiKey,
+      now: value.now
+    });
+    await tx.insert(userAdminAssignments).values({
+      userId: value.userId,
+      adminId: value.deliveryAdminId,
+      assignedByUserId: value.actorUserId
+    });
+    await tx.insert(userUsageOwners).values({
+      userId: value.userId,
+      deliveryAdminId: value.deliveryAdminId,
+      revision: 1
+    });
+  });
+  const validateDeliveryAdmin = dependencies.validateDeliveryAdmin ?? (async (deliveryAdminId, executor) => {
+    const tx = executor;
+    const rows = await tx.select({
+      id: users.id,
+      role: users.role,
+      adminAccessLevel: users.adminAccessLevel,
+      isActive: users.isActive
+    }).from(users).where(eq21(users.id, deliveryAdminId)).limit(1).for("update");
+    const admin = rows[0];
+    if (!admin || admin.role !== "admin" || admin.adminAccessLevel !== "delivery_admin" || admin.isActive !== true) {
+      throw new AuthServiceError(
+        "INVALID_CREDENTIAL",
+        "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u4EA4\u4ED8\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
+      );
+    }
+  });
   return transaction(async (executor) => {
+    await validateDeliveryAdmin(input.deliveryAdminId, executor);
     const setup = await createAccount(
       {
         username: input.username,
@@ -18867,12 +18974,28 @@ async function createManagedServiceUser(input, dependencies = {}) {
       executor
     );
     const userId = setup.user.id;
+    const quotaPeriods = createServiceQuotaWindows(planCode, startsAt).map(
+      (window) => ({
+        id: dependencies.randomId?.() ?? randomUUID16(),
+        contractId,
+        userId,
+        ordinal: window.ordinal,
+        startsAt: window.startsAt,
+        endsAt: window.endsAt,
+        ...window.limits,
+        contentAssetPublishLimit: DELIVERY_TICKET_LIMITS[planCode].content_asset_publish,
+        websiteContentPublishLimit: DELIVERY_TICKET_LIMITS[planCode].website_content_publish,
+        revision: 1,
+        createdAt: now,
+        updatedAt: now
+      })
+    );
     const contract = {
       id: contractId,
       userId,
       planCode,
       planVersion: plan.planVersion,
-      status: "pending_confirmation",
+      status: "active",
       startsAt,
       endsAt,
       source: "admin",
@@ -18894,7 +19017,17 @@ async function createManagedServiceUser(input, dependencies = {}) {
     await persistContract(
       {
         contract,
-        quotaPeriods: []
+        quotaPeriods
+      },
+      executor
+    );
+    await persistCredentialAndAssignment(
+      {
+        userId,
+        actorUserId: input.actor.id,
+        deliveryAdminId: input.deliveryAdminId,
+        apiKey: input.apiKey,
+        now
       },
       executor
     );
@@ -18910,8 +19043,9 @@ async function createManagedServiceUser(input, dependencies = {}) {
           setupRequired: true,
           planCode,
           contractId,
-          entitlementStatus: "pending_confirmation",
-          assignedToCreator: false
+          entitlementStatus: "active",
+          deliveryAdminId: input.deliveryAdminId,
+          quotaPeriodCount: quotaPeriods.length
         }
       },
       executor
@@ -18924,9 +19058,161 @@ async function createManagedServiceUser(input, dependencies = {}) {
         planCode,
         startsAt,
         endsAt,
-        quotaPeriodCount: 0
+        quotaPeriodCount: quotaPeriods.length
       },
-      assignedToCreator: false
+      assignedToCreator: input.deliveryAdminId === input.actor.id,
+      assignedDeliveryAdminId: input.deliveryAdminId
+    };
+  });
+}
+async function completeManagedServiceUserProvisioning(input, dependencies = {}) {
+  if (!hasSystemAdminAccess(input.actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u8865\u5168\u5BA2\u6237\u5F00\u901A"
+    );
+  }
+  await (dependencies.validateApiKey ?? validateUpstreamApiKey)(input.apiKey);
+  const transaction = dependencies.transaction ?? await defaultTransaction();
+  const now = dependencies.now?.() ?? /* @__PURE__ */ new Date();
+  const expectedFingerprint = getApiKeyFingerprint(input.apiKey);
+  return transaction(async (tx) => {
+    const validateDeliveryAdmin = dependencies.validateDeliveryAdmin ?? (async (deliveryAdminId, executor) => {
+      const rows = await executor.select({
+        id: users.id,
+        role: users.role,
+        adminAccessLevel: users.adminAccessLevel,
+        isActive: users.isActive
+      }).from(users).where(eq21(users.id, deliveryAdminId)).limit(1).for("update");
+      const admin = rows[0];
+      if (!admin || admin.role !== "admin" || admin.adminAccessLevel !== "delivery_admin" || admin.isActive !== true) {
+        throw new AuthServiceError(
+          "INVALID_CREDENTIAL",
+          "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u4EA4\u4ED8\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
+        );
+      }
+    });
+    await validateDeliveryAdmin(input.deliveryAdminId, tx);
+    const accountRows = await tx.select({ id: users.id, role: users.role }).from(users).where(eq21(users.id, input.userId)).limit(1).for("update");
+    if (!accountRows[0] || accountRows[0].role !== "user") {
+      throw new AuthServiceError("NOT_FOUND", "\u5BA2\u6237\u8D26\u53F7\u4E0D\u5B58\u5728");
+    }
+    const contractRows = await tx.select().from(serviceContracts).where(eq21(serviceContracts.userId, input.userId)).orderBy(desc15(serviceContracts.revision)).limit(1).for("update");
+    const contract = contractRows[0];
+    if (!contract) {
+      throw new AuthServiceError("CONFLICT", "\u5BA2\u6237\u5C1A\u672A\u9009\u62E9\u5957\u9910");
+    }
+    if (contract.revision !== input.expectedRevision) {
+      throw new AuthServiceError("CONFLICT", "\u670D\u52A1\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5");
+    }
+    const existingQuotaRows = await tx.select({ id: serviceQuotaPeriods.id }).from(serviceQuotaPeriods).where(eq21(serviceQuotaPeriods.contractId, contract.id)).for("update");
+    const directCredentials = await tx.select({
+      fingerprint: apiCredentials.fingerprint
+    }).from(apiCredentials).where(
+      and18(
+        eq21(apiCredentials.userId, input.userId),
+        eq21(apiCredentials.status, "active")
+      )
+    ).limit(1).for("update");
+    const ownerRows = await tx.select().from(userUsageOwners).where(eq21(userUsageOwners.userId, input.userId)).limit(1).for("update");
+    if (contract.status === "active") {
+      if (existingQuotaRows.length > 0 && directCredentials[0]?.fingerprint === expectedFingerprint && ownerRows[0]?.deliveryAdminId === input.deliveryAdminId) {
+        return {
+          userId: input.userId,
+          contractId: contract.id,
+          planCode: contract.planCode,
+          quotaPeriodCount: existingQuotaRows.length,
+          assignedToCreator: input.deliveryAdminId === input.actor.id,
+          assignedDeliveryAdminId: input.deliveryAdminId,
+          idempotent: true
+        };
+      }
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u5BA2\u6237\u5DF2\u7ECF\u5F00\u901A\uFF0C\u5F53\u524D Key \u6216\u989D\u5EA6\u72B6\u6001\u4E0E\u672C\u6B21\u8BF7\u6C42\u4E0D\u4E00\u81F4"
+      );
+    }
+    if (contract.status !== "pending_confirmation") {
+      throw new AuthServiceError("CONFLICT", "\u53EA\u6709\u5F85\u786E\u8BA4\u5957\u9910\u53EF\u4EE5\u4F7F\u7528\u8865\u5168\u5F00\u901A");
+    }
+    if (existingQuotaRows.length > 0 || directCredentials[0]) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u5F85\u786E\u8BA4\u8D26\u53F7\u5B58\u5728\u4E0D\u5B8C\u6574\u7684 Key \u6216\u989D\u5EA6\u6570\u636E\uFF0C\u8BF7\u8054\u7CFB\u6280\u672F\u652F\u6301"
+      );
+    }
+    const contractPlanCode = servicePlanCodeSchema.parse(contract.planCode);
+    const quotaRows = createServiceQuotaWindows(
+      contractPlanCode,
+      contract.startsAt
+    ).map((window) => ({
+      id: dependencies.randomId?.() ?? randomUUID16(),
+      contractId: contract.id,
+      userId: input.userId,
+      ordinal: window.ordinal,
+      startsAt: window.startsAt,
+      endsAt: window.endsAt,
+      ...window.limits,
+      contentAssetPublishLimit: DELIVERY_TICKET_LIMITS[contractPlanCode].content_asset_publish,
+      websiteContentPublishLimit: DELIVERY_TICKET_LIMITS[contractPlanCode].website_content_publish,
+      revision: 1,
+      createdAt: now,
+      updatedAt: now
+    }));
+    await tx.insert(serviceQuotaPeriods).values(quotaRows);
+    await tx.update(serviceContracts).set({ status: "active", updatedAt: now }).where(eq21(serviceContracts.id, contract.id));
+    await replaceApiCredentialInTransaction({
+      executor: tx,
+      userId: input.userId,
+      apiKey: input.apiKey,
+      now
+    });
+    await tx.insert(userAdminAssignments).values({
+      userId: input.userId,
+      adminId: input.deliveryAdminId,
+      assignedByUserId: input.actor.id
+    }).onDuplicateKeyUpdate({
+      set: { assignedByUserId: input.actor.id }
+    });
+    if (ownerRows[0]) {
+      await tx.update(userUsageOwners).set({
+        deliveryAdminId: input.deliveryAdminId,
+        revision: ownerRows[0].revision + 1,
+        updatedAt: now
+      }).where(eq21(userUsageOwners.userId, input.userId));
+    } else {
+      await tx.insert(userUsageOwners).values({
+        userId: input.userId,
+        deliveryAdminId: input.deliveryAdminId,
+        revision: 1
+      });
+    }
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "account.provisioning_completed",
+        targetType: "user",
+        targetId: input.userId,
+        workspaceUserId: input.userId,
+        metadata: {
+          contractId: contract.id,
+          planCode: contractPlanCode,
+          expectedRevision: input.expectedRevision,
+          quotaPeriodCount: quotaRows.length,
+          credentialFingerprint: expectedFingerprint,
+          deliveryAdminId: input.deliveryAdminId
+        }
+      },
+      tx
+    );
+    return {
+      userId: input.userId,
+      contractId: contract.id,
+      planCode: contractPlanCode,
+      quotaPeriodCount: quotaRows.length,
+      assignedToCreator: input.deliveryAdminId === input.actor.id,
+      assignedDeliveryAdminId: input.deliveryAdminId,
+      idempotent: false
     };
   });
 }
@@ -18940,6 +19226,33 @@ function requireSystemAdmin(user) {
       message: "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u6267\u884C\u6B64\u64CD\u4F5C"
     });
   }
+}
+function dashboardNonProfilePayload(payload) {
+  const {
+    brandName: _brandName,
+    headline: _headline,
+    summary: _summary,
+    ...rest
+  } = payload;
+  return rest;
+}
+async function assertDashboardUpdateCapability(input) {
+  const portal = await getServicePortal(input.userId);
+  if (portal.capabilities.contentAssets.allowed) return;
+  if (portal.service.planCode === "knowledge" && portal.capabilities.knowledgeBuild.allowed) {
+    const existingPayload = dashboardPayloadSchema.parse(
+      input.existing.payload
+    );
+    if (JSON.stringify(dashboardNonProfilePayload(existingPayload)) !== JSON.stringify(dashboardNonProfilePayload(input.next))) {
+      throw new ServiceEntitlementError(
+        "CAPABILITY_UPGRADE_REQUIRED",
+        "\u77E5\u8BC6\u5E93\u7248\u4EC5\u53EF\u5728\u8FD9\u91CC\u7EF4\u62A4\u4F01\u4E1A\u540D\u79F0\u3001\u770B\u677F\u6807\u9898\u4E0E\u4F01\u4E1A\u6458\u8981\uFF1B\u5176\u4ED6\u4EA4\u4ED8\u5185\u5BB9\u672A\u5305\u542B\u5728\u5F53\u524D\u5957\u9910\u3002",
+        403
+      );
+    }
+    return;
+  }
+  await assertServiceCapability(input.userId, "contentAssets");
 }
 function adminWorkspaceServiceValue(actor, portal) {
   return isSystemAdmin(actor) ? portal : toPublicServicePortal(portal);
@@ -19413,7 +19726,7 @@ var adminRouter = router({
       if (input.planCode === "basic" && input.prepaidMonths != null || input.planCode !== "basic" && input.prepaidMonths !== 3) {
         throw new TRPCError3({
           code: "BAD_REQUEST",
-          message: input.planCode === "basic" ? "\u57FA\u7840\u7248\u4E3A\u8FDE\u7EED 30 \u5929\u5355\u9898\u670D\u52A1\uFF0C\u4E0D\u8BBE\u7F6E\u9884\u4ED8\u6708\u4EFD" : "\u8FDB\u9636\u7248\u4E0E\u8C6A\u534E\u7248\u5408\u540C\u5747\u6309 3 \u4E2A\u6708\u670D\u52A1\u5468\u671F\u5EFA\u7ACB"
+          message: input.planCode === "basic" ? "\u666E\u901A\u7248\u4E3A\u8FDE\u7EED 30 \u5929\u5355\u9898\u670D\u52A1\uFF0C\u4E0D\u8BBE\u7F6E\u9884\u4ED8\u6708\u4EFD" : "\u77E5\u8BC6\u5E93\u7248\u3001\u8FDB\u9636\u7248\u4E0E\u8C6A\u534E\u7248\u5408\u540C\u5747\u6309 3 \u4E2A\u6708\u670D\u52A1\u5468\u671F\u5EFA\u7ACB"
         });
       }
       if (commerciallyActive && (!input.orderReference?.trim() || !input.contractReference?.trim() || !input.signatoryId?.trim() || !input.signedAt || !input.signingEvidence)) {
@@ -19468,7 +19781,7 @@ var adminRouter = router({
           z8.object({
             userId: z8.number().int().positive(),
             expectedRevision: z8.number().int().nonnegative(),
-            planCode: z8.enum(["basic", "advanced", "luxury"]),
+            planCode: servicePlanCodeSchema,
             startsAt: z8.number().int().optional(),
             reason: z8.string().trim().max(2e3).optional()
           })
@@ -19543,8 +19856,12 @@ var adminRouter = router({
     ).mutation(async ({ ctx, input }) => {
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
-        await assertServiceCapability(input.userId, "contentAssets");
         const existing = await getDashboardWorkspace(input.userId);
+        await assertDashboardUpdateCapability({
+          userId: input.userId,
+          existing,
+          next: input.payload
+        });
         assertDashboardEnterpriseIdentity(existing, input.payload);
         const dashboard = await updateDashboardWorkspace({
           userId: input.userId,
@@ -19579,7 +19896,7 @@ var adminRouter = router({
         });
         return dashboard;
       } catch (error) {
-        throw toTrpcError(error);
+        throwServiceAdminError(error);
       }
     }),
     knowledge: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
@@ -19639,6 +19956,24 @@ var adminRouter = router({
     credentialStatus: adminProcedure.input(z8.object({ userId: z8.number().int().positive() })).query(async ({ ctx, input }) => {
       try {
         return await getManagedCredentialStatus(ctx.user, input.userId);
+      } catch (error) {
+        throw toTrpcError(error);
+      }
+    }),
+    completeProvisioning: adminProcedure.input(
+      z8.object({
+        userId: z8.number().int().positive(),
+        expectedRevision: z8.number().int().positive(),
+        deliveryAdminId: z8.number().int().positive(),
+        apiKey: presalesApiKeySchema
+      })
+    ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
+      try {
+        return await completeManagedServiceUserProvisioning({
+          actor: ctx.user,
+          ...input
+        });
       } catch (error) {
         throw toTrpcError(error);
       }
@@ -20008,7 +20343,9 @@ var adminRouter = router({
           password: z8.never().optional(),
           displayName: z8.string().trim().max(128).optional(),
           role: z8.literal("user"),
-          planCode: servicePlanCodeSchema
+          planCode: servicePlanCodeSchema,
+          deliveryAdminId: z8.number().int().positive(),
+          apiKey: presalesApiKeySchema
         }),
         z8.object({
           username: usernameSchema2,
@@ -20046,7 +20383,9 @@ var adminRouter = router({
           actor: ctx.user,
           username: input.username,
           displayName: input.displayName,
-          planCode: input.planCode
+          planCode: input.planCode,
+          deliveryAdminId: input.deliveryAdminId,
+          apiKey: input.apiKey
         });
         const configuredBaseUrl = process.env.FRONTMIND_PUBLIC_URL?.trim().replace(/\/$/, "");
         const requestBaseUrl = ctx.req.protocol && ctx.req.get?.("host") ? `${ctx.req.protocol}://${ctx.req.get("host")}` : "";
@@ -20063,7 +20402,8 @@ var adminRouter = router({
             startsAt: result.contract.startsAt.getTime(),
             endsAt: result.contract.endsAt.getTime()
           },
-          assignedToCreator: result.assignedToCreator
+          assignedToCreator: result.assignedToCreator,
+          assignedDeliveryAdminId: result.assignedDeliveryAdminId
         };
       } catch (error) {
         throw toTrpcError(error);
@@ -20143,16 +20483,21 @@ var adminRouter = router({
     ).mutation(async ({ ctx, input }) => {
       requireSystemAdmin(ctx.user);
       try {
-        await deleteManagedUser(ctx.user.id, input.userId);
+        const result = await deleteManagedUser(ctx.user.id, input.userId);
+        const retainedForHistory = result.disposition === "deactivated_for_history";
         await writeWorkspaceAuditEvent({
           actor: ctx.user,
-          action: "account.deleted",
+          action: retainedForHistory ? "account.deactivated_for_history" : "account.deleted",
           targetType: "user",
           targetId: input.userId,
           workspaceUserId: input.userId,
-          reason: input.reason
+          reason: input.reason,
+          metadata: { disposition: result.disposition }
         });
-        return { success: true };
+        return {
+          success: true,
+          disposition: result.disposition
+        };
       } catch (error) {
         throw toTrpcError(error);
       }
@@ -20162,7 +20507,7 @@ var adminRouter = router({
 
 // server/conversation-router.ts
 import { TRPCError as TRPCError4 } from "@trpc/server";
-import { and as and18, asc as asc7, desc as desc15, eq as eq21, inArray as inArray12, isNull as isNull4 } from "drizzle-orm";
+import { and as and19, asc as asc7, desc as desc16, eq as eq22, inArray as inArray12, isNull as isNull4 } from "drizzle-orm";
 import { randomUUID as randomUUID17 } from "node:crypto";
 import { z as z9 } from "zod";
 var attachmentSchema = z9.object({
@@ -20201,7 +20546,14 @@ var conversationSnapshotSchema = z9.object({
   messages: z9.array(messageSchema).max(5e3),
   taskId: z9.string().max(255).optional(),
   previousResponseId: z9.string().max(255).optional(),
-  status: z9.enum(["idle", "running", "pending", "completed", "error", "failed"]),
+  status: z9.enum([
+    "idle",
+    "running",
+    "pending",
+    "completed",
+    "error",
+    "failed"
+  ]),
   taskUrl: z9.string().max(4096).optional(),
   createdAt: z9.number().finite().nonnegative(),
   updatedAt: z9.number().finite().nonnegative(),
@@ -20216,6 +20568,15 @@ var LEGACY_IMPORT_VALIDATION_TIMEOUT_MS = 3e4;
 function upstreamResourceKey(kind, id) {
   return JSON.stringify([kind, id]);
 }
+function snapshotTaskIds(snapshot) {
+  return Array.from(
+    new Set(
+      [snapshot.taskId, snapshot.previousResponseId].filter(
+        (id) => Boolean(id)
+      )
+    )
+  );
+}
 function collectSnapshotResourceRefs(snapshots) {
   const resources = /* @__PURE__ */ new Map();
   const add = (kind, id) => {
@@ -20229,7 +20590,7 @@ function collectSnapshotResourceRefs(snapshots) {
     }
   };
   for (const snapshot of snapshots) {
-    add("task", snapshot.taskId);
+    for (const taskId of snapshotTaskIds(snapshot)) add("task", taskId);
     for (const message of snapshot.messages) {
       for (const attachment of message.attachments ?? []) {
         add("file", attachment.fileId);
@@ -20261,40 +20622,233 @@ function requireDb13(db) {
 }
 async function permanentlyDeleteConversation(executor, userId, persistedConversationId) {
   await executor.delete(conversations).where(
-    and18(
-      eq21(conversations.id, persistedConversationId),
-      eq21(conversations.userId, userId)
+    and19(
+      eq22(conversations.id, persistedConversationId),
+      eq22(conversations.userId, userId)
     )
   );
 }
-async function getActiveCredentialId(executor, userId) {
-  const accountRows = await executor.select({ role: users.role }).from(users).where(eq21(users.id, userId)).limit(1);
-  let credentialOwnerId = userId;
-  if (accountRows[0]?.role === "user") {
-    const ownerRows = await executor.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq21(userUsageOwners.userId, userId)).limit(1);
-    credentialOwnerId = ownerRows[0]?.deliveryAdminId ?? userId;
-  }
+async function getLatestActiveCredentialIdForUser(executor, userId) {
   const rows = await executor.select({ id: apiCredentials.id }).from(apiCredentials).where(
-    and18(
-      eq21(apiCredentials.userId, credentialOwnerId),
-      eq21(apiCredentials.status, "active"),
-      eq21(apiCredentials.validationStatus, "verified"),
+    and19(
+      eq22(apiCredentials.userId, userId),
+      eq22(apiCredentials.status, "active"),
       isNull4(apiCredentials.deletedAt)
     )
-  ).orderBy(desc15(apiCredentials.version)).limit(1);
+  ).orderBy(desc16(apiCredentials.version)).limit(1);
   return rows[0]?.id;
 }
+async function getActiveCredentialId(executor, userId) {
+  const accountRows = await executor.select({ role: users.role }).from(users).where(eq22(users.id, userId)).limit(1);
+  if (!accountRows[0]) return void 0;
+  const directCredentialId = await getLatestActiveCredentialIdForUser(
+    executor,
+    userId
+  );
+  if (directCredentialId || accountRows[0].role === "admin") {
+    return directCredentialId;
+  }
+  const ownerRows = await executor.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq22(userUsageOwners.userId, userId)).limit(1);
+  const ownerId = ownerRows[0]?.deliveryAdminId;
+  return ownerId ? getLatestActiveCredentialIdForUser(executor, ownerId) : void 0;
+}
 async function assertResourceOwnership(executor, userId, kind, upstreamId) {
-  const rows = await executor.select({ userId: upstreamResources.userId }).from(upstreamResources).where(
-    and18(
-      eq21(upstreamResources.kind, kind),
-      eq21(upstreamResources.upstreamId, upstreamId)
+  const rows = await executor.select({
+    userId: upstreamResources.userId,
+    apiCredentialId: upstreamResources.apiCredentialId
+  }).from(upstreamResources).where(
+    and19(
+      eq22(upstreamResources.kind, kind),
+      eq22(upstreamResources.upstreamId, upstreamId)
     )
   ).limit(1);
   if (rows[0] && rows[0].userId !== userId) {
-    throw new TRPCError4({ code: "FORBIDDEN", message: "\u4E0A\u6E38\u8D44\u6E90\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7" });
+    throw new TRPCError4({
+      code: "FORBIDDEN",
+      message: "\u4E0A\u6E38\u8D44\u6E90\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7"
+    });
   }
   return rows[0] ?? null;
+}
+async function loadSnapshotResourceBindings(executor, userId, snapshot) {
+  const bindings = /* @__PURE__ */ new Map();
+  const taskIds = snapshotTaskIds(snapshot);
+  const fileIds = Array.from(
+    new Set(
+      snapshot.messages.flatMap(
+        (message) => (message.attachments ?? []).map((attachment) => attachment.fileId).filter((id) => Boolean(id))
+      )
+    )
+  );
+  for (const [kind, ids] of [
+    ["task", taskIds],
+    ["file", fileIds]
+  ]) {
+    if (ids.length === 0) continue;
+    const rows = await executor.select({
+      userId: upstreamResources.userId,
+      kind: upstreamResources.kind,
+      upstreamId: upstreamResources.upstreamId,
+      apiCredentialId: upstreamResources.apiCredentialId,
+      createdAt: upstreamResources.createdAt
+    }).from(upstreamResources).where(
+      and19(
+        eq22(upstreamResources.kind, kind),
+        inArray12(upstreamResources.upstreamId, ids)
+      )
+    );
+    for (const row of rows) {
+      if (row.userId !== userId) {
+        throw new TRPCError4({
+          code: "FORBIDDEN",
+          message: "\u4E0A\u6E38\u8D44\u6E90\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7"
+        });
+      }
+      bindings.set(upstreamResourceKey(kind, row.upstreamId), {
+        kind,
+        upstreamId: row.upstreamId,
+        apiCredentialId: row.apiCredentialId,
+        createdAt: row.createdAt
+      });
+    }
+  }
+  return bindings;
+}
+async function credentialIsAvailable(executor, credentialId) {
+  const rows = await executor.select({ status: apiCredentials.status }).from(apiCredentials).where(eq22(apiCredentials.id, credentialId)).limit(1);
+  return Boolean(rows[0] && rows[0].status !== "deleted");
+}
+async function resolveSnapshotCredentialId(executor, userId, snapshot, options = {}) {
+  const bindings = await loadSnapshotResourceBindings(
+    executor,
+    userId,
+    snapshot
+  );
+  const primaryTaskId = snapshot.taskId ?? snapshot.previousResponseId;
+  const taskBinding = primaryTaskId ? bindings.get(upstreamResourceKey("task", primaryTaskId)) : void 0;
+  const firstFileBinding = Array.from(bindings.values()).find(
+    (binding) => binding.kind === "file"
+  );
+  const resourceCredentialId = taskBinding?.apiCredentialId ?? (!primaryTaskId ? firstFileBinding?.apiCredentialId : void 0);
+  const credentialId = resourceCredentialId ?? options.existingCredentialId ?? options.importCredentialId ?? await getActiveCredentialId(executor, userId);
+  const hasUpstreamResources = snapshotTaskIds(snapshot).length > 0 || snapshot.messages.some(
+    (message) => message.attachments?.some((attachment) => Boolean(attachment.fileId))
+  );
+  if (hasUpstreamResources && !credentialId) {
+    throw new TRPCError4({
+      code: "PRECONDITION_FAILED",
+      message: "\u8BF7\u5148\u8FC1\u79FB\u6216\u914D\u7F6E\u8BE5\u4F1A\u8BDD\u539F\u6765\u4F7F\u7528\u7684 API Key\uFF0C\u518D\u5BFC\u5165\u5386\u53F2\u4F1A\u8BDD"
+    });
+  }
+  if (hasUpstreamResources && credentialId) {
+    const isBoundToOwnedResource = Array.from(bindings.values()).some(
+      (binding) => binding.apiCredentialId === credentialId
+    );
+    const mayServe = isBoundToOwnedResource && await credentialIsAvailable(executor, credentialId) || await credentialMayServeAccount(executor, userId, credentialId);
+    if (!mayServe) {
+      throw new TRPCError4({
+        code: "PRECONDITION_FAILED",
+        message: "\u8BE5\u4F1A\u8BDD\u539F\u6765\u4F7F\u7528\u7684 API Key \u5DF2\u4E0D\u53EF\u7528"
+      });
+    }
+  }
+  return { credentialId, bindings };
+}
+function primaryTaskPointer(pair) {
+  return pair.taskId ?? pair.previousResponseId;
+}
+function normalizedTaskPointerPair(pair, fallback) {
+  const primary = primaryTaskPointer(pair) ?? primaryTaskPointer(fallback);
+  if (!primary) return {};
+  return {
+    taskId: pair.taskId ?? fallback.taskId ?? primary,
+    previousResponseId: pair.previousResponseId ?? fallback.previousResponseId ?? primary
+  };
+}
+function mergeConversationTaskPointers(input) {
+  const existingPrimary = primaryTaskPointer(input.existing);
+  const incomingPrimary = primaryTaskPointer(input.incoming);
+  if (!incomingPrimary) return normalizedTaskPointerPair(input.existing, {});
+  if (!existingPrimary) return normalizedTaskPointerPair(input.incoming, {});
+  if (incomingPrimary === existingPrimary) {
+    return normalizedTaskPointerPair(input.incoming, input.existing);
+  }
+  const existingCreatedAt = input.resourceCreatedAt.get(existingPrimary);
+  const incomingCreatedAt = input.resourceCreatedAt.get(incomingPrimary);
+  if (existingCreatedAt !== void 0 && incomingCreatedAt !== void 0 && incomingCreatedAt !== existingCreatedAt) {
+    return incomingCreatedAt > existingCreatedAt ? normalizedTaskPointerPair(input.incoming, input.existing) : normalizedTaskPointerPair(input.existing, {});
+  }
+  if (existingCreatedAt !== void 0 && incomingCreatedAt === void 0) {
+    return normalizedTaskPointerPair(input.existing, {});
+  }
+  const persistedUserIds = new Set(
+    input.persistedMessages.filter((message) => message.role === "user").map((message) => message.id)
+  );
+  const incomingUserIds = new Set(
+    input.incomingMessages.filter((message) => message.role === "user").map((message) => message.id)
+  );
+  const hasNewIncomingTurn = Array.from(incomingUserIds).some(
+    (id) => !persistedUserIds.has(id)
+  );
+  if (hasNewIncomingTurn) {
+    return normalizedTaskPointerPair(input.incoming, input.existing);
+  }
+  const isMissingPersistedTurn = Array.from(persistedUserIds).some(
+    (id) => !incomingUserIds.has(id)
+  );
+  if (isMissingPersistedTurn) {
+    return normalizedTaskPointerPair(input.existing, {});
+  }
+  return input.incomingUpdatedAt > input.existingUpdatedAt ? normalizedTaskPointerPair(input.incoming, input.existing) : normalizedTaskPointerPair(input.existing, {});
+}
+async function resolveTaskPointersForSnapshot(executor, userId, existing, persistedMessages, snapshot) {
+  const taskIds = Array.from(
+    new Set(
+      [
+        existing.upstreamTaskId,
+        existing.previousResponseId,
+        snapshot.taskId,
+        snapshot.previousResponseId
+      ].filter((id) => Boolean(id))
+    )
+  );
+  const resourceCreatedAt = /* @__PURE__ */ new Map();
+  if (taskIds.length > 0) {
+    const rows = await executor.select({
+      userId: upstreamResources.userId,
+      upstreamId: upstreamResources.upstreamId,
+      createdAt: upstreamResources.createdAt
+    }).from(upstreamResources).where(
+      and19(
+        eq22(upstreamResources.kind, "task"),
+        inArray12(upstreamResources.upstreamId, taskIds)
+      )
+    );
+    for (const row of rows) {
+      if (row.userId !== userId) {
+        throw new TRPCError4({
+          code: "FORBIDDEN",
+          message: "\u4E0A\u6E38\u8D44\u6E90\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7"
+        });
+      }
+      resourceCreatedAt.set(row.upstreamId, row.createdAt.getTime());
+    }
+  }
+  return mergeConversationTaskPointers({
+    existing: {
+      taskId: existing.upstreamTaskId ?? void 0,
+      previousResponseId: existing.previousResponseId ?? void 0
+    },
+    incoming: {
+      taskId: snapshot.taskId,
+      previousResponseId: snapshot.previousResponseId
+    },
+    persistedMessages,
+    incomingMessages: snapshot.messages,
+    resourceCreatedAt,
+    existingUpdatedAt: existing.updatedAt.getTime(),
+    incomingUpdatedAt: snapshot.updatedAt
+  });
 }
 async function validateUpstreamResourceAccess(apiKey, kind, upstreamId, request = fetch, signal = AbortSignal.timeout(15e3)) {
   let response2;
@@ -20342,7 +20896,9 @@ async function persistResource(executor, input, validatedResourceKeys) {
     input.upstreamId
   );
   if (existing) return;
-  if (!validatedResourceKeys?.has(upstreamResourceKey(input.kind, input.upstreamId))) {
+  if (!validatedResourceKeys?.has(
+    upstreamResourceKey(input.kind, input.upstreamId)
+  )) {
     throw new TRPCError4({
       code: "FORBIDDEN",
       message: "\u5386\u53F2\u4EFB\u52A1\u6216\u6587\u4EF6\u5C1A\u672A\u9A8C\u8BC1\uFF0C\u8BF7\u901A\u8FC7\u672C\u5730\u8BB0\u5F55\u8FC1\u79FB\u5165\u53E3\u5BFC\u5165"
@@ -20359,17 +20915,24 @@ async function persistResource(executor, input, validatedResourceKeys) {
     // Never mutate an existing owner's row on a duplicate-key race.
     set: { upstreamId: input.upstreamId }
   });
-  await assertResourceOwnership(executor, input.userId, input.kind, input.upstreamId);
+  await assertResourceOwnership(
+    executor,
+    input.userId,
+    input.kind,
+    input.upstreamId
+  );
 }
 function buildMessageMetadata(message) {
   const metadata = {};
   if (message.outputFiles) metadata.outputFiles = message.outputFiles;
   if (message.inlineImages) metadata.inlineImages = message.inlineImages;
-  if (message.elapsedTime !== void 0) metadata.elapsedTime = message.elapsedTime;
+  if (message.elapsedTime !== void 0)
+    metadata.elapsedTime = message.elapsedTime;
   if (message.responseStartedAt !== void 0) {
     metadata.responseStartedAt = message.responseStartedAt;
   }
-  if (message.intermediateSteps) metadata.intermediateSteps = message.intermediateSteps;
+  if (message.intermediateSteps)
+    metadata.intermediateSteps = message.intermediateSteps;
   if (message.stepGroups) metadata.stepGroups = message.stepGroups;
   if (message.isStepsPlaceholder !== void 0) {
     metadata.isStepsPlaceholder = message.isStepsPlaceholder;
@@ -20379,16 +20942,16 @@ function buildMessageMetadata(message) {
 }
 async function loadPersistedMessages(executor, userId, conversationId) {
   const messageRows = await executor.select().from(messages).where(
-    and18(
-      eq21(messages.userId, userId),
-      eq21(messages.conversationId, conversationId),
+    and19(
+      eq22(messages.userId, userId),
+      eq22(messages.conversationId, conversationId),
       isNull4(messages.deletedAt)
     )
   ).orderBy(asc7(messages.sequence));
   const messageIds = messageRows.map((row) => row.id);
   const attachmentRows2 = messageIds.length === 0 ? [] : await executor.select().from(attachments).where(
-    and18(
-      eq21(attachments.userId, userId),
+    and19(
+      eq22(attachments.userId, userId),
       inArray12(attachments.messageId, messageIds),
       isNull4(attachments.deletedAt)
     )
@@ -20442,18 +21005,24 @@ function splitMessageTurns(messagesToSplit) {
   return { prelude, turns };
 }
 function assistantProjectionScore(projected) {
-  const hasConcreteResult = projected.some((message) => !message.isStepsPlaceholder);
-  return projected.reduce((score, message) => {
-    if (message.isStepsPlaceholder) return score + 1;
-    return score + message.content.length + (message.outputFiles?.length ?? 0) * 1e4 + (message.inlineImages?.length ?? 0) * 1e4 + (message.stepGroups?.length ?? 0) * 1e3 + (message.intermediateSteps?.length ?? 0) * 100;
-  }, hasConcreteResult ? 1e9 : 0);
+  const hasConcreteResult = projected.some(
+    (message) => !message.isStepsPlaceholder
+  );
+  return projected.reduce(
+    (score, message) => {
+      if (message.isStepsPlaceholder) return score + 1;
+      return score + message.content.length + (message.outputFiles?.length ?? 0) * 1e4 + (message.inlineImages?.length ?? 0) * 1e4 + (message.stepGroups?.length ?? 0) * 1e3 + (message.intermediateSteps?.length ?? 0) * 100;
+    },
+    hasConcreteResult ? 1e9 : 0
+  );
 }
 function mergeConversationMessages(persisted, incoming, deletedMessageIds) {
   const deleted = new Set(deletedMessageIds);
   const persistedSplit = splitMessageTurns(persisted);
   const incomingSplit = splitMessageTurns(incoming);
   const prelude = /* @__PURE__ */ new Map();
-  for (const message of persistedSplit.prelude) prelude.set(message.id, message);
+  for (const message of persistedSplit.prelude)
+    prelude.set(message.id, message);
   for (const message of incomingSplit.prelude) prelude.set(message.id, message);
   const turns = /* @__PURE__ */ new Map();
   for (const turn of persistedSplit.turns) turns.set(turn.user.id, turn);
@@ -20470,7 +21039,9 @@ function mergeConversationMessages(persisted, incoming, deletedMessageIds) {
       });
     }
   }
-  const mergedPrelude = Array.from(prelude.values()).filter((message) => !deleted.has(message.id)).sort((left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id));
+  const mergedPrelude = Array.from(prelude.values()).filter((message) => !deleted.has(message.id)).sort(
+    (left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id)
+  );
   const mergedTurns = Array.from(turns.values()).filter((turn) => !deleted.has(turn.user.id)).sort(
     (left, right) => left.user.timestamp - right.user.timestamp || left.user.id.localeCompare(right.user.id)
   );
@@ -20484,10 +21055,13 @@ function mergeConversationMessages(persisted, incoming, deletedMessageIds) {
 }
 async function persistSnapshot(executor, userId, snapshot, options = {}) {
   const persistedConversationId = storageId(userId, snapshot.id);
-  const existingRows = await executor.select().from(conversations).where(eq21(conversations.id, persistedConversationId)).limit(1).for("update");
+  const existingRows = await executor.select().from(conversations).where(eq22(conversations.id, persistedConversationId)).limit(1).for("update");
   const existing = existingRows[0];
   if (existing && existing.userId !== userId) {
-    throw new TRPCError4({ code: "FORBIDDEN", message: "\u4F1A\u8BDD ID \u5DF2\u5C5E\u4E8E\u5176\u4ED6\u8D26\u53F7" });
+    throw new TRPCError4({
+      code: "FORBIDDEN",
+      message: "\u4F1A\u8BDD ID \u5DF2\u5C5E\u4E8E\u5176\u4ED6\u8D26\u53F7"
+    });
   }
   if (existing?.deletedAt) {
     if (options.skipExisting) return "skipped";
@@ -20506,6 +21080,13 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       userId,
       persistedConversationId
     );
+    const taskPointers = await resolveTaskPointersForSnapshot(
+      executor,
+      userId,
+      existing,
+      persistedMessages,
+      snapshot
+    );
     snapshot = {
       ...snapshot,
       messages: mergeConversationMessages(
@@ -20513,8 +21094,8 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
         snapshot.messages,
         deletedMessageIds
       ),
-      taskId: snapshot.taskId ?? existing.upstreamTaskId ?? void 0,
-      previousResponseId: snapshot.previousResponseId ?? existing.previousResponseId ?? void 0,
+      taskId: taskPointers.taskId,
+      previousResponseId: taskPointers.previousResponseId,
       taskUrl: snapshot.taskUrl ?? existing.taskUrl ?? void 0,
       startedAt: snapshot.startedAt ?? existing.startedAt?.getTime(),
       completedAt: snapshot.completedAt ?? existing.completedAt?.getTime(),
@@ -20529,28 +21110,11 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       updatedAt: Date.now()
     };
   }
-  const apiCredentialId = existing?.apiCredentialId ?? options.importCredentialId ?? await getActiveCredentialId(executor, userId) ?? null;
-  const hasUpstreamResources = Boolean(snapshot.taskId) || snapshot.messages.some(
-    (message) => message.attachments?.some((attachment) => Boolean(attachment.fileId))
-  );
-  if (hasUpstreamResources && !apiCredentialId) {
-    throw new TRPCError4({
-      code: "PRECONDITION_FAILED",
-      message: "\u8BF7\u5148\u8FC1\u79FB\u6216\u914D\u7F6E\u8BE5\u4F1A\u8BDD\u539F\u6765\u4F7F\u7528\u7684 API Key\uFF0C\u518D\u5BFC\u5165\u5386\u53F2\u4F1A\u8BDD"
-    });
-  }
-  if (hasUpstreamResources && apiCredentialId) {
-    if (!await credentialMayServeAccount(
-      executor,
-      userId,
-      apiCredentialId
-    )) {
-      throw new TRPCError4({
-        code: "PRECONDITION_FAILED",
-        message: "\u8BE5\u4F1A\u8BDD\u539F\u6765\u4F7F\u7528\u7684 API Key \u5DF2\u4E0D\u53EF\u7528"
-      });
-    }
-  }
+  const { credentialId: resolvedCredentialId, bindings } = await resolveSnapshotCredentialId(executor, userId, snapshot, {
+    existingCredentialId: existing?.apiCredentialId,
+    importCredentialId: options.importCredentialId
+  });
+  const apiCredentialId = resolvedCredentialId ?? null;
   const conversationValues = {
     userId,
     apiCredentialId,
@@ -20568,9 +21132,9 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
   };
   if (existing) {
     await executor.update(conversations).set({ ...conversationValues, version: existing.version + 1 }).where(
-      and18(
-        eq21(conversations.id, persistedConversationId),
-        eq21(conversations.userId, userId)
+      and19(
+        eq22(conversations.id, persistedConversationId),
+        eq22(conversations.userId, userId)
       )
     );
   } else {
@@ -20580,16 +21144,25 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       version: 1
     });
   }
-  const incomingMessageIds = snapshot.messages.map((message) => storageId(userId, message.id));
+  const incomingMessageIds = snapshot.messages.map(
+    (message) => storageId(userId, message.id)
+  );
   if (incomingMessageIds.length > 0) {
-    const collisions = await executor.select({ id: messages.id, conversationId: messages.conversationId, userId: messages.userId }).from(messages).where(inArray12(messages.id, incomingMessageIds));
+    const collisions = await executor.select({
+      id: messages.id,
+      conversationId: messages.conversationId,
+      userId: messages.userId
+    }).from(messages).where(inArray12(messages.id, incomingMessageIds));
     if (collisions.some(
       (row) => row.userId !== userId || row.conversationId !== persistedConversationId
     )) {
-      throw new TRPCError4({ code: "CONFLICT", message: "\u6D88\u606F ID \u4E0E\u5176\u4ED6\u4F1A\u8BDD\u51B2\u7A81" });
+      throw new TRPCError4({
+        code: "CONFLICT",
+        message: "\u6D88\u606F ID \u4E0E\u5176\u4ED6\u4F1A\u8BDD\u51B2\u7A81"
+      });
     }
   }
-  await executor.delete(messages).where(eq21(messages.conversationId, persistedConversationId));
+  await executor.delete(messages).where(eq22(messages.conversationId, persistedConversationId));
   for (let sequence = 0; sequence < snapshot.messages.length; sequence += 1) {
     const message = snapshot.messages[sequence];
     const sentAt = asDate2(message.timestamp) ?? /* @__PURE__ */ new Date();
@@ -20605,35 +21178,49 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       createdAt: sentAt
     });
     for (const attachment of message.attachments ?? []) {
+      const attachmentResourceKey = attachment.fileId ? upstreamResourceKey("file", attachment.fileId) : void 0;
+      const attachmentCredentialId = attachmentResourceKey ? bindings.get(attachmentResourceKey)?.apiCredentialId ?? (options.validatedResourceKeys?.has(attachmentResourceKey) ? options.importCredentialId ?? apiCredentialId : apiCredentialId) : apiCredentialId;
       await executor.insert(attachments).values({
         id: storageId(userId, attachment.id),
         userId,
         conversationId: persistedConversationId,
         messageId: storageId(userId, message.id),
-        apiCredentialId,
+        apiCredentialId: attachmentCredentialId,
         kind: attachment.type,
         fileName: attachment.name,
         upstreamFileId: attachment.fileId ?? null
       });
-      if (attachment.fileId && apiCredentialId) {
-        await persistResource(executor, {
-          userId,
-          apiCredentialId,
-          kind: "file",
-          upstreamId: attachment.fileId,
-          conversationId: persistedConversationId
-        }, options.validatedResourceKeys);
+      if (attachment.fileId && attachmentCredentialId) {
+        await persistResource(
+          executor,
+          {
+            userId,
+            apiCredentialId: attachmentCredentialId,
+            kind: "file",
+            upstreamId: attachment.fileId,
+            conversationId: persistedConversationId
+          },
+          options.validatedResourceKeys
+        );
       }
     }
   }
-  if (snapshot.taskId && apiCredentialId) {
-    await persistResource(executor, {
-      userId,
-      apiCredentialId,
-      kind: "task",
-      upstreamId: snapshot.taskId,
-      conversationId: persistedConversationId
-    }, options.validatedResourceKeys);
+  if (apiCredentialId) {
+    for (const taskId of snapshotTaskIds(snapshot)) {
+      const taskResourceKey = upstreamResourceKey("task", taskId);
+      const taskCredentialId = bindings.get(taskResourceKey)?.apiCredentialId ?? (options.validatedResourceKeys?.has(taskResourceKey) ? options.importCredentialId ?? apiCredentialId : apiCredentialId);
+      await persistResource(
+        executor,
+        {
+          userId,
+          apiCredentialId: taskCredentialId,
+          kind: "task",
+          upstreamId: taskId,
+          conversationId: persistedConversationId
+        },
+        options.validatedResourceKeys
+      );
+    }
   }
   return existing ? "updated" : "imported";
 }
@@ -20661,7 +21248,12 @@ async function validateWithBoundedConcurrency(resources, apiKey) {
   try {
     await Promise.all(
       Array.from(
-        { length: Math.min(LEGACY_IMPORT_VALIDATION_CONCURRENCY, resources.length) },
+        {
+          length: Math.min(
+            LEGACY_IMPORT_VALIDATION_CONCURRENCY,
+            resources.length
+          )
+        },
         () => worker()
       )
     );
@@ -20672,7 +21264,9 @@ async function validateWithBoundedConcurrency(resources, apiKey) {
 }
 async function prepareLegacyImport(userId, snapshots) {
   const db = requireDb13(await getDb());
-  const persistedIds = snapshots.map((snapshot) => storageId(userId, snapshot.id));
+  const persistedIds = snapshots.map(
+    (snapshot) => storageId(userId, snapshot.id)
+  );
   const existingRows = persistedIds.length === 0 ? [] : await db.select({ id: conversations.id }).from(conversations).where(inArray12(conversations.id, persistedIds));
   const existingIds = new Set(existingRows.map((row) => row.id));
   const newSnapshots = snapshots.filter(
@@ -20680,7 +21274,10 @@ async function prepareLegacyImport(userId, snapshots) {
   );
   const resources = collectSnapshotResourceRefs(newSnapshots);
   if (resources.length === 0) {
-    return { credentialId: void 0, validatedResourceKeys: /* @__PURE__ */ new Set() };
+    return {
+      credentialId: void 0,
+      validatedResourceKeys: /* @__PURE__ */ new Set()
+    };
   }
   const taskIds = resources.filter((item) => item.kind === "task").map((item) => item.id);
   const fileIds = resources.filter((item) => item.kind === "file").map((item) => item.id);
@@ -20690,8 +21287,8 @@ async function prepareLegacyImport(userId, snapshots) {
       upstreamId: upstreamResources.upstreamId,
       userId: upstreamResources.userId
     }).from(upstreamResources).where(
-      and18(
-        eq21(upstreamResources.kind, "task"),
+      and19(
+        eq22(upstreamResources.kind, "task"),
         inArray12(upstreamResources.upstreamId, taskIds)
       )
     ),
@@ -20700,8 +21297,8 @@ async function prepareLegacyImport(userId, snapshots) {
       upstreamId: upstreamResources.upstreamId,
       userId: upstreamResources.userId
     }).from(upstreamResources).where(
-      and18(
-        eq21(upstreamResources.kind, "file"),
+      and19(
+        eq22(upstreamResources.kind, "file"),
         inArray12(upstreamResources.upstreamId, fileIds)
       )
     )
@@ -20719,6 +21316,12 @@ async function prepareLegacyImport(userId, snapshots) {
   const unknown = resources.filter(
     (resource) => !known.has(upstreamResourceKey(resource.kind, resource.id))
   );
+  if (unknown.length === 0) {
+    return {
+      credentialId: void 0,
+      validatedResourceKeys: /* @__PURE__ */ new Set()
+    };
+  }
   const credential = await getEffectiveDecryptedCredentialForAccount(userId);
   if (!credential) {
     throw new TRPCError4({
@@ -20726,7 +21329,7 @@ async function prepareLegacyImport(userId, snapshots) {
       message: "\u8BF7\u5148\u8FC1\u79FB\u6216\u914D\u7F6E\u8BE5\u4F1A\u8BDD\u539F\u6765\u4F7F\u7528\u7684 API Key\uFF0C\u518D\u5BFC\u5165\u5386\u53F2\u4F1A\u8BDD"
     });
   }
-  if (unknown.length > 0 && await isUpstreamApiKeyShared(userId, credential.fingerprint)) {
+  if (await isUpstreamApiKeyShared(userId, credential.fingerprint)) {
     throw new TRPCError4({
       code: "PRECONDITION_FAILED",
       message: "\u5171\u4EAB API Key \u65E0\u6CD5\u8BC1\u660E\u672A\u77E5\u5386\u53F2\u4EFB\u52A1\u6216\u6587\u4EF6\u7684\u8D26\u53F7\u5F52\u5C5E\uFF0C\u8BF7\u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u5B8C\u6210\u8FC1\u79FB"
@@ -20736,26 +21339,30 @@ async function prepareLegacyImport(userId, snapshots) {
   return {
     credentialId: credential.id,
     validatedResourceKeys: new Set(
-      unknown.map((resource) => upstreamResourceKey(resource.kind, resource.id))
+      unknown.map(
+        (resource) => upstreamResourceKey(resource.kind, resource.id)
+      )
     )
   };
 }
 async function listSnapshots(userId) {
   const db = requireDb13(await getDb());
-  const conversationRows = await db.select().from(conversations).where(and18(eq21(conversations.userId, userId), isNull4(conversations.deletedAt))).orderBy(desc15(conversations.updatedAt));
+  const conversationRows = await db.select().from(conversations).where(
+    and19(eq22(conversations.userId, userId), isNull4(conversations.deletedAt))
+  ).orderBy(desc16(conversations.updatedAt));
   if (conversationRows.length === 0) return [];
   const ids = conversationRows.map((row) => row.id);
   const messageRows = await db.select().from(messages).where(
-    and18(
-      eq21(messages.userId, userId),
+    and19(
+      eq22(messages.userId, userId),
       inArray12(messages.conversationId, ids),
       isNull4(messages.deletedAt)
     )
   ).orderBy(asc7(messages.sequence));
   const messageIds = messageRows.map((row) => row.id);
   const attachmentRows2 = messageIds.length === 0 ? [] : await db.select().from(attachments).where(
-    and18(
-      eq21(attachments.userId, userId),
+    and19(
+      eq22(attachments.userId, userId),
       inArray12(attachments.messageId, messageIds),
       isNull4(attachments.deletedAt)
     )
@@ -20782,12 +21389,14 @@ async function listSnapshots(userId) {
         role: message.role === "assistant" ? "assistant" : "user",
         content: message.content,
         timestamp: message.sentAt.getTime(),
-        attachments: (attachmentsByMessage.get(message.id) ?? []).map((attachment) => ({
-          id: publicId(userId, attachment.id),
-          type: attachment.kind,
-          name: attachment.fileName,
-          ...attachment.upstreamFileId ? { fileId: attachment.upstreamFileId } : {}
-        })),
+        attachments: (attachmentsByMessage.get(message.id) ?? []).map(
+          (attachment) => ({
+            id: publicId(userId, attachment.id),
+            type: attachment.kind,
+            name: attachment.fileName,
+            ...attachment.upstreamFileId ? { fileId: attachment.upstreamFileId } : {}
+          })
+        ),
         ...metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {},
         ...metadata.inlineImages ? { inlineImages: metadata.inlineImages } : {},
         ...metadata.elapsedTime !== void 0 ? { elapsedTime: metadata.elapsedTime } : {},
@@ -20818,16 +21427,21 @@ var conversationRouter = router({
       await persistSnapshot(tx, ctx.user.id, input.conversation);
     });
     const snapshots = await listSnapshots(ctx.user.id);
-    const persisted = snapshots.find((item) => item.id === input.conversation.id);
+    const persisted = snapshots.find(
+      (item) => item.id === input.conversation.id
+    );
     if (!persisted) {
-      throw new TRPCError4({ code: "INTERNAL_SERVER_ERROR", message: "\u4F1A\u8BDD\u4FDD\u5B58\u5931\u8D25" });
+      throw new TRPCError4({
+        code: "INTERNAL_SERVER_ERROR",
+        message: "\u4F1A\u8BDD\u4FDD\u5B58\u5931\u8D25"
+      });
     }
     return persisted;
   }),
   delete: protectedProcedure.input(z9.object({ id: z9.string().min(1).max(128) })).mutation(async ({ ctx, input }) => {
     const db = requireDb13(await getDb());
     const persistedConversationId = storageId(ctx.user.id, input.id);
-    const existing = await db.select({ userId: conversations.userId }).from(conversations).where(eq21(conversations.id, persistedConversationId)).limit(1);
+    const existing = await db.select({ userId: conversations.userId }).from(conversations).where(eq22(conversations.id, persistedConversationId)).limit(1);
     if (!existing[0] || existing[0].userId !== ctx.user.id) {
       throw new TRPCError4({ code: "NOT_FOUND", message: "\u4F1A\u8BDD\u4E0D\u5B58\u5728" });
     }
@@ -20838,9 +21452,14 @@ var conversationRouter = router({
     );
     return { success: true };
   }),
-  importLocal: protectedProcedure.input(z9.object({ conversations: z9.array(conversationSnapshotSchema).max(200) })).mutation(async ({ ctx, input }) => {
+  importLocal: protectedProcedure.input(
+    z9.object({ conversations: z9.array(conversationSnapshotSchema).max(200) })
+  ).mutation(async ({ ctx, input }) => {
     const db = requireDb13(await getDb());
-    const prepared = await prepareLegacyImport(ctx.user.id, input.conversations);
+    const prepared = await prepareLegacyImport(
+      ctx.user.id,
+      input.conversations
+    );
     let imported = 0;
     let skipped = 0;
     for (const conversation of input.conversations) {
@@ -21281,6 +21900,23 @@ async function getHistoricalQuestionResults(input, dependencies = DEFAULT_DEPEND
 }
 
 // server/workspace-router.ts
+function projectUserDashboardPayload(input) {
+  if (!input.configured) return null;
+  const payload = toPublicDashboardPayload(input.payload);
+  if (input.contentAssetsAllowed) return payload;
+  return {
+    ...payload,
+    metrics: [],
+    keywordTables: [],
+    questions: [],
+    monitoringAnswers: [],
+    citations: [],
+    contentAssets: [],
+    optimizationReport: null,
+    progressReports: [],
+    sections: []
+  };
+}
 function toServiceError(error) {
   if (error instanceof DeliveryTicketError) {
     throw new TRPCError6({
@@ -21539,10 +22175,19 @@ var workspaceRouter = router({
   }),
   dashboard: protectedProcedure.query(async ({ ctx }) => {
     try {
-      const workspace = await getDashboardWorkspace(ctx.user.id);
+      const [workspace, portal] = await Promise.all([
+        getDashboardWorkspace(ctx.user.id),
+        getServicePortal(ctx.user.id)
+      ]);
+      const configured = workspace.revision > 0;
       return {
         ...workspace,
-        payload: toPublicDashboardPayload(workspace.payload)
+        configured,
+        payload: projectUserDashboardPayload({
+          payload: workspace.payload,
+          configured,
+          contentAssetsAllowed: portal.capabilities.contentAssets.allowed
+        })
       };
     } catch (error) {
       throw toTrpcError(error);
@@ -21856,12 +22501,13 @@ function vitePluginProductionPublicAssets() {
     {
       source: "assets/frontmind-wordmark.svg",
       output: "assets/frontmind-wordmark.svg"
+    },
+    {
+      source: "assets/cuhksz-emblem.png",
+      output: "assets/cuhksz-emblem.png"
     }
   ];
-  const publicDirectory = path2.resolve(
-    import.meta.dirname,
-    "client/public"
-  );
+  const publicDirectory = path2.resolve(import.meta.dirname, "client/public");
   return {
     name: "frontmind-production-public-assets",
     generateBundle() {
@@ -22961,6 +23607,15 @@ var fileMetaCache = /* @__PURE__ */ new Map();
 var CACHE_TTL = 10 * 60 * 1e3;
 var downloadTokenCache = /* @__PURE__ */ new Map();
 var DOWNLOAD_TOKEN_TTL = 5 * 60 * 1e3;
+var MAX_EXTERNAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+var ExternalDownloadTooLargeError = class extends Error {
+  constructor(maxBytes = MAX_EXTERNAL_DOWNLOAD_BYTES) {
+    super("External download exceeds the permitted size");
+    this.maxBytes = maxBytes;
+    this.code = "EXTERNAL_DOWNLOAD_TOO_LARGE";
+    this.name = "ExternalDownloadTooLargeError";
+  }
+};
 function isPrivateUpstreamCollectionRequest(method, targetPath) {
   if (!["GET", "HEAD"].includes(method.toUpperCase())) return false;
   const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
@@ -23199,6 +23854,76 @@ function responseHeaderValue(value) {
   }
   return void 0;
 }
+function declaredContentLength(headers) {
+  if (!headers || typeof headers !== "object") return void 0;
+  const raw = responseHeaderValue(
+    headers["content-length"]
+  );
+  if (!raw || !/^\d+$/.test(raw)) return void 0;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : void 0;
+}
+function destroyDownloadStream(value) {
+  if (value && typeof value === "object" && typeof value.destroy === "function") {
+    value.destroy();
+  }
+}
+async function readBoundedExternalDownload(data, headers, maxBytes = MAX_EXTERNAL_DOWNLOAD_BYTES) {
+  const declared = declaredContentLength(headers);
+  if (declared !== void 0 && declared > maxBytes) {
+    destroyDownloadStream(data);
+    throw new ExternalDownloadTooLargeError(maxBytes);
+  }
+  if (data && typeof data === "object" && Symbol.asyncIterator in data && typeof data[Symbol.asyncIterator] === "function") {
+    const chunks = [];
+    let totalBytes = 0;
+    try {
+      for await (const chunk of data) {
+        const buffer2 = Buffer.isBuffer(chunk) ? chunk : chunk instanceof Uint8Array ? Buffer.from(chunk) : Buffer.from(String(chunk));
+        totalBytes += buffer2.length;
+        if (totalBytes > maxBytes) {
+          throw new ExternalDownloadTooLargeError(maxBytes);
+        }
+        chunks.push(buffer2);
+      }
+    } catch (error) {
+      destroyDownloadStream(data);
+      throw error;
+    }
+    return Buffer.concat(chunks, totalBytes);
+  }
+  const buffer = Buffer.isBuffer(data) ? data : data instanceof Uint8Array ? Buffer.from(data) : data instanceof ArrayBuffer ? Buffer.from(data) : Buffer.from(String(data ?? ""));
+  if (buffer.length > maxBytes) {
+    throw new ExternalDownloadTooLargeError(maxBytes);
+  }
+  return buffer;
+}
+function isExternalDownloadTooLarge(error) {
+  if (error instanceof ExternalDownloadTooLargeError) return true;
+  if (!error || typeof error !== "object") return false;
+  const candidate = error;
+  return candidate.code === "ERR_BAD_RESPONSE" && typeof candidate.message === "string" && candidate.message.includes("maxContentLength");
+}
+function sendExternalDownloadTooLarge(res) {
+  return res.status(413).json({
+    error: {
+      message: "\u6587\u4EF6\u8D85\u8FC7\u5141\u8BB8\u7684\u4E0B\u8F7D\u5927\u5C0F",
+      code: "EXTERNAL_DOWNLOAD_TOO_LARGE"
+    }
+  });
+}
+async function fetchBoundedExternalDownload(url, options) {
+  const response2 = await axios3.get(url, {
+    ...options,
+    responseType: "stream",
+    maxContentLength: MAX_EXTERNAL_DOWNLOAD_BYTES
+  });
+  const data = await readBoundedExternalDownload(
+    response2.data,
+    response2.headers
+  );
+  return { ...response2, data };
+}
 var SANITIZE_SKIP_KEYS = /* @__PURE__ */ new Set([
   "id",
   "task_id",
@@ -23261,6 +23986,239 @@ function publicUpstreamPayload(value, apiKey) {
       secrets: [apiKey]
     })
   );
+}
+var PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS = [
+  "id",
+  "task_id",
+  "response_id",
+  "object",
+  "status",
+  "model",
+  "created_at",
+  "updated_at",
+  "started_at",
+  "completed_at",
+  "credit_usage",
+  "task_url",
+  "share_url",
+  "task_title",
+  "title"
+];
+var PUBLIC_TASK_OUTPUT_SCALAR_KEYS = [
+  "id",
+  "type",
+  "status",
+  "name",
+  "call_id",
+  "text",
+  "message",
+  "output",
+  "file_id",
+  "fileId",
+  "url",
+  "file_url",
+  "fileUrl",
+  "image_url",
+  "imageUrl",
+  "filename",
+  "fileName",
+  "mime_type",
+  "mimeType"
+];
+var PUBLIC_TASK_CONTENT_SCALAR_KEYS = [
+  "type",
+  "text",
+  "file_id",
+  "fileId",
+  "file_url",
+  "fileUrl",
+  "image_url",
+  "imageUrl",
+  "url",
+  "filename",
+  "fileName",
+  "mime_type",
+  "mimeType"
+];
+var PUBLIC_TASK_METADATA_SCALAR_KEYS = [
+  "credit_usage",
+  "task_url",
+  "share_url",
+  "task_title",
+  "title"
+];
+var PUBLIC_TASK_ERROR_SCALAR_KEYS = [
+  "message",
+  "code",
+  "type",
+  "param",
+  "status"
+];
+var PUBLIC_TASK_ANNOTATION_SCALAR_KEYS = [
+  "type",
+  "url",
+  "title",
+  "start_index",
+  "end_index",
+  "file_id",
+  "fileId",
+  "filename",
+  "fileName",
+  "index",
+  "quote"
+];
+var PUBLIC_TASK_ACTION_SCALAR_KEYS = [
+  "type",
+  "url",
+  "query",
+  "selector",
+  "x",
+  "y"
+];
+var PUBLIC_TASK_TELEMETRY_KEY = /^(?:(?:input|output)_(?:tokens?|credits?|cost|characters|count)(?:_|$)|(?:id|name|label|kind|version|status|stage|step|phase|progress|percent|percentage|current|total|completed|failed|success|successful|count|usage|credit|credits|token|tokens|cost|duration|elapsed|remaining|message|summary|visited|links|pages|characters|images|documents|queries|saved|downloaded|parsed|started|finished|created|updated)(?:_|$))/i;
+function isPublicScalar(value) {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+function pickPublicScalars(value, keys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const source = value;
+  const result = {};
+  for (const key of keys) {
+    if (isPublicScalar(source[key])) {
+      result[key] = source[key];
+    }
+  }
+  return result;
+}
+function publicTaskTelemetry(value, depth = 0) {
+  if (value === null || depth > 8) return void 0;
+  if (isPublicScalar(value)) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => publicTaskTelemetry(item, depth + 1)).filter((item) => item !== void 0);
+  }
+  if (typeof value !== "object") return void 0;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!PUBLIC_TASK_TELEMETRY_KEY.test(key)) continue;
+    const sanitized = publicTaskTelemetry(item, depth + 1);
+    if (sanitized !== void 0) result[key] = sanitized;
+  }
+  return result;
+}
+function publicTaskAnnotations(value) {
+  if (!Array.isArray(value)) return void 0;
+  const annotations = value.map((item) => pickPublicScalars(item, PUBLIC_TASK_ANNOTATION_SCALAR_KEYS)).filter((item) => Object.keys(item).length > 0);
+  return annotations.length > 0 ? annotations : void 0;
+}
+function publicTaskContent(value) {
+  if (!Array.isArray(value)) return [];
+  const content = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const source = item;
+    const type = typeof source.type === "string" ? source.type.toLowerCase() : "";
+    if (type.startsWith("input_") || type.includes("instruction")) continue;
+    const sanitized = pickPublicScalars(
+      source,
+      PUBLIC_TASK_CONTENT_SCALAR_KEYS
+    );
+    const annotations = publicTaskAnnotations(source.annotations);
+    if (annotations) sanitized.annotations = annotations;
+    if (Object.keys(sanitized).length > 0) content.push(sanitized);
+  }
+  return content;
+}
+function publicTaskOutput(value) {
+  if (!Array.isArray(value)) return [];
+  const output = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const source = item;
+    const role = typeof source.role === "string" ? source.role.toLowerCase() : "";
+    const type = typeof source.type === "string" ? source.type.toLowerCase() : "";
+    if (role === "user" || role === "system" || type.startsWith("input_") || type.includes("instruction")) {
+      continue;
+    }
+    const sanitized = pickPublicScalars(
+      source,
+      PUBLIC_TASK_OUTPUT_SCALAR_KEYS
+    );
+    if (role === "assistant") sanitized.role = "assistant";
+    const content = publicTaskContent(source.content);
+    if (content.length > 0) sanitized.content = content;
+    if (Array.isArray(source.summary)) {
+      const summary = source.summary.map((entry) => pickPublicScalars(entry, ["type", "text"])).filter((entry) => Object.keys(entry).length > 0);
+      if (summary.length > 0) sanitized.summary = summary;
+    }
+    if (Array.isArray(source.queries)) {
+      const queries = source.queries.filter(
+        (query) => typeof query === "string"
+      );
+      if (queries.length > 0) sanitized.queries = queries;
+    }
+    const action = pickPublicScalars(
+      source.action,
+      PUBLIC_TASK_ACTION_SCALAR_KEYS
+    );
+    if (Object.keys(action).length > 0) sanitized.action = action;
+    if (Object.keys(sanitized).length > 0) output.push(sanitized);
+  }
+  return output;
+}
+function redactPublicTaskValues(value, apiKey) {
+  if (typeof value === "string") {
+    return redactSensitiveText(value, [apiKey]);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactPublicTaskValues(item, apiKey));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        redactPublicTaskValues(item, apiKey)
+      ])
+    );
+  }
+  return value;
+}
+function publicUpstreamTaskPayload(value, apiKey) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const source = value;
+  const result = pickPublicScalars(
+    source,
+    PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS
+  );
+  const metadata = pickPublicScalars(
+    source.metadata,
+    PUBLIC_TASK_METADATA_SCALAR_KEYS
+  );
+  if (Object.keys(metadata).length > 0) result.metadata = metadata;
+  if (Array.isArray(source.output)) {
+    result.output = publicTaskOutput(source.output);
+  }
+  const error = pickPublicScalars(source.error, PUBLIC_TASK_ERROR_SCALAR_KEYS);
+  if (Object.keys(error).length > 0) result.error = error;
+  const usage = publicTaskTelemetry(source.usage);
+  if (usage !== void 0 && (typeof usage !== "object" || Object.keys(usage).length > 0)) {
+    result.usage = usage;
+  }
+  const progress = publicTaskTelemetry(source.progress);
+  if (progress !== void 0 && (typeof progress !== "object" || Object.keys(progress).length > 0)) {
+    result.progress = progress;
+  }
+  return deepSanitizeJson(redactPublicTaskValues(result, apiKey));
+}
+function isPublicTaskPayloadRequest(method, targetPath) {
+  const path9 = targetPath.split("?")[0].replace(/\/+$/, "");
+  const normalizedMethod = method.toUpperCase();
+  if (normalizedMethod === "POST" && (path9 === "/v1/tasks" || path9 === "/v1/responses")) {
+    return true;
+  }
+  if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
+  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path9);
 }
 function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
   if (value === null || value === void 0 || depth > 50) return ids;
@@ -24172,11 +25130,9 @@ router2.get("/proxy-download", async (req, res) => {
     console.log(
       `[FrontMind Proxy] Proxy-download: ${safeUrlForLog(targetUrl)}`
     );
-    const response2 = await axios3.get(targetUrl, {
+    const response2 = await fetchBoundedExternalDownload(targetUrl, {
       ...safeExternalRequestOptions,
-      responseType: "arraybuffer",
       timeout: 12e4,
-      maxContentLength: Infinity,
       validateStatus: () => true
     });
     console.log(
@@ -24222,6 +25178,9 @@ router2.get("/proxy-download", async (req, res) => {
     }
     res.send(sanitizedBuffer);
   } catch (error) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {
@@ -24281,11 +25240,9 @@ async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
   console.log(
     `[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`
   );
-  const response2 = await axios3.get(safeS3Url, {
+  const response2 = await fetchBoundedExternalDownload(safeS3Url, {
     ...safeExternalRequestOptions,
-    responseType: "arraybuffer",
     timeout: 12e4,
-    maxContentLength: Infinity,
     validateStatus: () => true
   });
   console.log(
@@ -24363,14 +25320,12 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
     const cleanBaseUrl = baseUrl.replace(/\/$/, "");
     const contentUrl = `${cleanBaseUrl}/v1/files/${fileId}/content`;
     try {
-      const response2 = await axios3.get(contentUrl, {
+      const response2 = await fetchBoundedExternalDownload(contentUrl, {
         headers: {
           API_KEY: apiKey,
           Authorization: `Bearer ${apiKey}`
         },
-        responseType: "arraybuffer",
         timeout: 12e4,
-        maxContentLength: Infinity,
         validateStatus: () => true
       });
       const upstreamContentType = responseHeaderValue(
@@ -24414,6 +25369,7 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
         return;
       }
     } catch (e) {
+      if (isExternalDownloadTooLarge(e)) throw e;
       console.warn(
         "[FrontMind Proxy] Direct /content download failed:",
         safeErrorForLog(e, { secrets: [apiKey] })
@@ -24507,6 +25463,9 @@ router2.get("/download/:token", async (req, res) => {
       data.credentialId
     );
   } catch (error) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] Direct token download error:",
       safeErrorForLog(error, { secrets: [logSecret] })
@@ -24533,6 +25492,9 @@ router2.get("/v1/files/:fileId", async (req, res) => {
       req.frontmindCredential?.id
     );
   } catch (error) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] File download error:",
       safeErrorForLog(error, { secrets: [apiKey] })
@@ -24559,6 +25521,9 @@ router2.get("/v1/files/:fileId/content", async (req, res) => {
       req.frontmindCredential?.id
     );
   } catch (error) {
+    if (isExternalDownloadTooLarge(error)) {
+      return sendExternalDownloadTooLarge(res);
+    }
     console.error(
       "[FrontMind Proxy] File content download error:",
       safeErrorForLog(error, { secrets: [apiKey] })
@@ -24736,7 +25701,7 @@ router2.all("/*", async (req, res) => {
         }
       }
     }
-    const publicResponse = typeof response2.data === "object" ? publicUpstreamPayload(response2.data, apiKey) : typeof response2.data === "string" ? sanitizeText(redactSensitiveText(response2.data, [apiKey])) : response2.data;
+    const publicResponse = typeof response2.data === "object" ? isPublicTaskPayloadRequest(req.method, targetPath) ? publicUpstreamTaskPayload(response2.data, apiKey) : publicUpstreamPayload(response2.data, apiKey) : typeof response2.data === "string" ? sanitizeText(redactSensitiveText(response2.data, [apiKey])) : response2.data;
     if (publicResponse && typeof publicResponse === "object" && !Array.isArray(publicResponse) && Array.isArray(publicResponse.output)) {
       const publicRecord = publicResponse;
       const outputSummary = publicRecord.output.map(
@@ -26354,7 +27319,7 @@ import { createHash as createHash14, randomUUID as randomUUID20 } from "node:cry
 import { mkdir as mkdir2, readFile as readFile2, unlink as unlink2, writeFile as writeFile2 } from "node:fs/promises";
 import path7 from "node:path";
 import axios6 from "axios";
-import { eq as eq23 } from "drizzle-orm";
+import { eq as eq24 } from "drizzle-orm";
 import ExcelJS2 from "exceljs";
 import express2 from "express";
 import JSZip2 from "jszip";
@@ -26408,7 +27373,7 @@ import {
   randomUUID as randomUUID19,
   timingSafeEqual as timingSafeEqual5
 } from "node:crypto";
-import { and as and19, eq as eq22, isNull as isNull5, lt as lt5 } from "drizzle-orm";
+import { and as and20, eq as eq23, isNull as isNull5, lt as lt5 } from "drizzle-orm";
 import { z as z16 } from "zod";
 var DEFAULT_TTL_SECONDS = 5 * 60;
 var MIN_SECRET_LENGTH = 32;
@@ -26541,7 +27506,7 @@ function dashboardImportPreflightStoreForExecutor(executor) {
       });
     },
     async consume(binding, now) {
-      const rows = await executor.select().from(dashboardImportPreflights).where(eq22(dashboardImportPreflights.id, binding.nonce)).limit(1).for("update");
+      const rows = await executor.select().from(dashboardImportPreflights).where(eq23(dashboardImportPreflights.id, binding.nonce)).limit(1).for("update");
       const row = rows[0];
       if (!row || row.consumedAt || row.expiresAt.getTime() <= now.getTime()) {
         return null;
@@ -26562,8 +27527,8 @@ function dashboardImportPreflightStoreForExecutor(executor) {
         return null;
       }
       await executor.update(dashboardImportPreflights).set({ consumedAt: now }).where(
-        and19(
-          eq22(dashboardImportPreflights.id, binding.nonce),
+        and20(
+          eq23(dashboardImportPreflights.id, binding.nonce),
           isNull5(dashboardImportPreflights.consumedAt)
         )
       );
@@ -27089,6 +28054,17 @@ function assertDashboardImportRevision(input) {
 function assertDashboardImportModuleEnabled(module) {
   if (module === "full") {
     throw new Error("\u6574\u4EFD\u770B\u677F\u5BFC\u5165\u5DF2\u505C\u7528\u3002\u8BF7\u4E0B\u8F7D\u5E76\u4E0A\u4F20\u5BF9\u5E94\u6A21\u5757\u7684\u5F53\u524D\u5185\u5BB9\u6A21\u677F\u3002");
+  }
+}
+async function assertDashboardImportCapability(userId, module) {
+  const capability = module === "monitoring" ? "monitoring" : module === "response-logic" ? "responseLogic" : module === "questions" ? "questionSelection" : module === "keywords" ? "globalKeywords" : module === "optimization-report" ? "progressReport" : "contentAssets";
+  try {
+    return await assertServiceCapability(userId, capability);
+  } catch (error) {
+    if (module !== "profile" || !(error instanceof ServiceEntitlementError) || error.code !== "CAPABILITY_UPGRADE_REQUIRED") {
+      throw error;
+    }
+    return assertServiceCapability(userId, "knowledgeBuild");
   }
 }
 function assertDashboardImportPublishHash(input) {
@@ -29321,9 +30297,9 @@ router5.put(
             expectedFileHash: importModule === "monitoring" ? req.header("x-monitoring-file-hash") || req.header("x-import-file-hash") : req.header("x-import-file-hash")
           });
         }
-        const servicePortal = await assertServiceCapability(
+        const servicePortal = await assertDashboardImportCapability(
           targetUserId,
-          importModule === "monitoring" ? "monitoring" : importModule === "response-logic" ? "responseLogic" : importModule === "questions" ? "questionSelection" : importModule === "keywords" ? "globalKeywords" : importModule === "optimization-report" ? "progressReport" : "contentAssets"
+          importModule
         );
         if (![".csv", ".json", ".xlsx"].includes(extension)) {
           throw new Error("\u770B\u677F\u677F\u5757\u4EC5\u652F\u6301 CSV\u3001XLSX \u6216 JSON");
@@ -29402,7 +30378,7 @@ router5.put(
               value
             })),
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq23(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq24(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -29497,7 +30473,7 @@ router5.put(
               rationale: question.rationale
             })),
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq23(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq24(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -29584,7 +30560,7 @@ router5.put(
             userId: targetUserId,
             batches: template.batches,
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq23(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq24(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -29845,7 +30821,7 @@ router5.put(
           }
           const transactionHooks = {
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq23(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq24(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -31269,7 +32245,7 @@ import { z as z22 } from "zod";
 // server/presales-monitor.ts
 import { createHash as createHash17, randomUUID as randomUUID22 } from "node:crypto";
 import axios8 from "axios";
-import { and as and20, eq as eq24, isNull as isNull6 } from "drizzle-orm";
+import { and as and21, eq as eq25, isNull as isNull6 } from "drizzle-orm";
 import { json as json2, Router as Router6 } from "express";
 import { z as z21 } from "zod";
 var MONITOR_PLATFORMS = [
@@ -32301,7 +33277,7 @@ var DrizzleMonitorRepository = class {
       if (mysqlError.code !== "ER_DUP_ENTRY") throw error;
     }
     const existing = await db.select().from(presalesMonitorRuns).where(
-      eq24(presalesMonitorRuns.idempotencyKeyHash, input.idempotencyKeyHash)
+      eq25(presalesMonitorRuns.idempotencyKeyHash, input.idempotencyKeyHash)
     ).limit(1);
     const row = existing[0];
     if (!row) {
@@ -32331,8 +33307,8 @@ var DrizzleMonitorRepository = class {
   async get(runId) {
     const db = await requireDb14();
     const rows = await db.select().from(presalesMonitorRuns).where(
-      and20(
-        eq24(presalesMonitorRuns.id, runId),
+      and21(
+        eq25(presalesMonitorRuns.id, runId),
         isNull6(presalesMonitorRuns.deletedAt)
       )
     ).limit(1);
@@ -32362,8 +33338,8 @@ var DrizzleMonitorRepository = class {
     const db = await requireDb14();
     return db.transaction(async (tx) => {
       const rows = await tx.select().from(presalesMonitorRuns).where(
-        and20(
-          eq24(presalesMonitorRuns.id, runId),
+        and21(
+          eq25(presalesMonitorRuns.id, runId),
           isNull6(presalesMonitorRuns.deletedAt)
         )
       ).limit(1).for("update");
@@ -32383,7 +33359,7 @@ var DrizzleMonitorRepository = class {
         pollLeaseId: leaseId,
         pollLeaseExpiresAt,
         updatedAt: now
-      }).where(eq24(presalesMonitorRuns.id, runId));
+      }).where(eq25(presalesMonitorRuns.id, runId));
       return {
         leaseId,
         run: {
@@ -32406,9 +33382,9 @@ var DrizzleMonitorRepository = class {
       pollLeaseExpiresAt: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and20(
-        eq24(presalesMonitorRuns.id, runId),
-        eq24(presalesMonitorRuns.pollLeaseId, leaseId),
+      and21(
+        eq25(presalesMonitorRuns.id, runId),
+        eq25(presalesMonitorRuns.pollLeaseId, leaseId),
         isNull6(presalesMonitorRuns.deletedAt)
       )
     );
@@ -32425,8 +33401,8 @@ var DrizzleMonitorRepository = class {
       pollLeaseExpiresAt: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and20(
-        eq24(presalesMonitorRuns.id, runId),
+      and21(
+        eq25(presalesMonitorRuns.id, runId),
         isNull6(presalesMonitorRuns.deletedAt)
       )
     );
@@ -32434,7 +33410,7 @@ var DrizzleMonitorRepository = class {
   }
   async updateAndRead(runId, patch) {
     const db = await requireDb14();
-    await db.update(presalesMonitorRuns).set(patch).where(eq24(presalesMonitorRuns.id, runId));
+    await db.update(presalesMonitorRuns).set(patch).where(eq25(presalesMonitorRuns.id, runId));
     const run = await this.get(runId);
     if (!run)
       throw new PresalesMonitorError("NOT_FOUND", 404, "\u76D1\u63A7\u4EFB\u52A1\u4E0D\u5B58\u5728");
@@ -33637,7 +34613,7 @@ import { z as z27 } from "zod";
 
 // server/provisioning-service.ts
 import { createHash as createHash19, createHmac as createHmac6, randomUUID as randomUUID23 } from "node:crypto";
-import { eq as eq25 } from "drizzle-orm";
+import { eq as eq26 } from "drizzle-orm";
 import { z as z23 } from "zod";
 var usernameSchema3 = z23.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
   /^[a-zA-Z0-9._-]+$/,
@@ -33915,7 +34891,7 @@ var DrizzleWebsiteProvisioningRepository = class {
         status: "completed",
         completedAt,
         updatedAt: completedAt
-      }).where(eq25(websiteUserProvisions.id, input.id));
+      }).where(eq26(websiteUserProvisions.id, input.id));
       return {
         idempotencyKeyHash: input.idempotencyKeyHash,
         requestHash: input.requestHash,
@@ -33950,7 +34926,7 @@ async function requireProvisioningDb2() {
   return db;
 }
 async function readStoredProvision(executor, idempotencyKeyHash) {
-  const rows = await executor.select().from(websiteUserProvisions).where(eq25(websiteUserProvisions.idempotencyKeyHash, idempotencyKeyHash)).limit(1);
+  const rows = await executor.select().from(websiteUserProvisions).where(eq26(websiteUserProvisions.idempotencyKeyHash, idempotencyKeyHash)).limit(1);
   const provision = rows[0];
   if (!provision) return null;
   if (provision.status !== "completed" || !provision.userId || !provision.completedAt) {
@@ -33974,7 +34950,7 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
     displayName: users.displayName,
     role: users.role,
     isActive: users.isActive
-  }).from(users).where(eq25(users.id, provision.userId)).limit(1);
+  }).from(users).where(eq26(users.id, provision.userId)).limit(1);
   const user = userRows[0];
   if (!user || !user.username || user.role !== "user") {
     throw new ProvisioningError(
@@ -34007,7 +34983,7 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
 // server/knowledge-import-service.ts
 import axios10 from "axios";
 import { createHash as createHash20, randomUUID as randomUUID24 } from "node:crypto";
-import { and as and21, eq as eq26 } from "drizzle-orm";
+import { and as and22, eq as eq27 } from "drizzle-orm";
 import { z as z24 } from "zod";
 var sha256Schema3 = z24.string().trim().regex(/^[a-f0-9]{64}$/i);
 var websiteKnowledgeImportSchema = z24.object({
@@ -34098,7 +35074,7 @@ async function reserveReceipt(input) {
   const db = await requireImportDb();
   const keyHash = idempotencyHash(input.idempotencyKey);
   return db.transaction(async (tx) => {
-    const rows = await tx.select().from(knowledgeImportReceipts).where(eq26(knowledgeImportReceipts.idempotencyKeyHash, keyHash)).limit(1).for("update");
+    const rows = await tx.select().from(knowledgeImportReceipts).where(eq27(knowledgeImportReceipts.idempotencyKeyHash, keyHash)).limit(1).for("update");
     const existing = rows[0];
     if (existing) {
       const sameRequest = existing.userId === input.userId && existing.projectId === input.projectId && existing.taskId === input.value.taskId && existing.outputItemId === input.value.outputItemId && (existing.fileId ?? null) === (input.value.fileId ?? null) && existing.descriptorHash?.toLowerCase() === input.value.descriptorHash.toLowerCase() && existing.artifactHash.toLowerCase() === input.value.artifactSha256.toLowerCase();
@@ -34131,13 +35107,13 @@ async function reserveReceipt(input) {
         errorCode: null,
         errorMessage: null,
         updatedAt: input.now
-      }).where(eq26(knowledgeImportReceipts.id, existing.id));
+      }).where(eq27(knowledgeImportReceipts.id, existing.id));
       return { state: "acquired", receiptId: existing.id };
     }
     const artifactRows = await tx.select().from(knowledgeImportReceipts).where(
-      and21(
-        eq26(knowledgeImportReceipts.userId, input.userId),
-        eq26(
+      and22(
+        eq27(knowledgeImportReceipts.userId, input.userId),
+        eq27(
           knowledgeImportReceipts.artifactHash,
           input.value.artifactSha256.toLowerCase()
         )
@@ -34223,7 +35199,7 @@ async function markReceiptFailed(receiptId, error) {
     errorCode: error instanceof KnowledgeImportError ? error.code : "KNOWLEDGE_IMPORT_FAILED",
     errorMessage: (error instanceof Error ? error.message : "\u77E5\u8BC6\u5E93\u540C\u6B65\u5931\u8D25").slice(0, 2e3),
     updatedAt: /* @__PURE__ */ new Date()
-  }).where(eq26(knowledgeImportReceipts.id, receiptId));
+  }).where(eq27(knowledgeImportReceipts.id, receiptId));
 }
 async function importWebsiteKnowledgeArtifact(input) {
   const value = websiteKnowledgeImportSchema.parse(input.value);
@@ -34232,7 +35208,7 @@ async function importWebsiteKnowledgeArtifact(input) {
     userId: websiteUserProvisions.userId,
     companyName: websiteUserProvisions.companyName,
     status: websiteUserProvisions.status
-  }).from(websiteUserProvisions).where(eq26(websiteUserProvisions.projectId, input.projectId));
+  }).from(websiteUserProvisions).where(eq27(websiteUserProvisions.projectId, input.projectId));
   const provision = resolveKnowledgeImportProjectOwner(
     provisions,
     value.companyName
@@ -34383,9 +35359,9 @@ async function importWebsiteKnowledgeArtifact(input) {
       errorMessage: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and21(
-        eq26(knowledgeImportReceipts.id, reservation.receiptId),
-        eq26(knowledgeImportReceipts.status, "processing")
+      and22(
+        eq27(knowledgeImportReceipts.id, reservation.receiptId),
+        eq27(knowledgeImportReceipts.status, "processing")
       )
     );
     return {
@@ -34406,7 +35382,7 @@ async function importWebsiteKnowledgeArtifact(input) {
 }
 
 // server/payment-receipt-ledger-service.ts
-import { and as and22, eq as eq27 } from "drizzle-orm";
+import { and as and23, eq as eq28 } from "drizzle-orm";
 
 // shared/payment-receipt.ts
 import { z as z25 } from "zod";
@@ -34508,21 +35484,21 @@ async function defaultRepository2() {
   const db = await getDb();
   if (!db) databaseUnavailable();
   const findByOrderId = async (orderId) => {
-    const rows = await db.select().from(websitePaymentReceipts).where(eq27(websitePaymentReceipts.orderId, orderId)).limit(1);
+    const rows = await db.select().from(websitePaymentReceipts).where(eq28(websitePaymentReceipts.orderId, orderId)).limit(1);
     return rows[0];
   };
   return {
     findByOrderId,
     async findByTradeNo(tradeNo) {
-      const rows = await db.select().from(websitePaymentReceipts).where(eq27(websitePaymentReceipts.tradeNo, tradeNo)).limit(1);
+      const rows = await db.select().from(websitePaymentReceipts).where(eq28(websitePaymentReceipts.tradeNo, tradeNo)).limit(1);
       return rows[0];
     },
     async findScoped(input) {
       const rows = await db.select().from(websitePaymentReceipts).where(
-        and22(
-          eq27(websitePaymentReceipts.orderId, input.orderId),
-          eq27(websitePaymentReceipts.scopeHash, input.scopeHash),
-          eq27(
+        and23(
+          eq28(websitePaymentReceipts.orderId, input.orderId),
+          eq28(websitePaymentReceipts.scopeHash, input.scopeHash),
+          eq28(
             websitePaymentReceipts.authorizationDigest,
             input.authorizationDigest
           )
@@ -34621,7 +35597,7 @@ function createPaymentReceiptLedgerService(options = {}) {
 }
 
 // server/project-order-registry-service.ts
-import { and as and23, eq as eq28, sql as sql2 } from "drizzle-orm";
+import { and as and24, eq as eq29, sql as sql2 } from "drizzle-orm";
 
 // shared/project-order-registry.ts
 import { z as z26 } from "zod";
@@ -34854,17 +35830,17 @@ async function defaultRepository3() {
   const db = await getDb();
   if (!db) databaseUnavailable2();
   const findByOrderId = async (orderId) => {
-    const rows = await db.select().from(websiteProjectOrders).where(eq28(websiteProjectOrders.orderId, orderId)).limit(1);
+    const rows = await db.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.orderId, orderId)).limit(1);
     return rows[0];
   };
   return {
     findByOrderId,
     async findByAuthorizationDigest(digest) {
-      const rows = await db.select().from(websiteProjectOrders).where(eq28(websiteProjectOrders.authorizationDigest, digest)).limit(1);
+      const rows = await db.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.authorizationDigest, digest)).limit(1);
       return rows[0];
     },
     async listByProjectId(projectId) {
-      return db.select().from(websiteProjectOrders).where(eq28(websiteProjectOrders.projectId, projectId)).limit(MAX_PROJECT_ORDERS + 1);
+      return db.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.projectId, projectId)).limit(MAX_PROJECT_ORDERS + 1);
     },
     async insert(value) {
       await db.insert(websiteProjectOrders).values(value);
@@ -34877,9 +35853,9 @@ async function defaultRepository3() {
         ...value,
         revision: sql2`${websiteProjectOrders.revision} + 1`
       }).where(
-        and23(
-          eq28(websiteProjectOrders.orderId, orderId),
-          eq28(websiteProjectOrders.revision, expectedRevision)
+        and24(
+          eq29(websiteProjectOrders.orderId, orderId),
+          eq29(websiteProjectOrders.revision, expectedRevision)
         )
       );
       if (!result[0]?.affectedRows) return void 0;
@@ -34893,10 +35869,10 @@ async function defaultRepository3() {
           lastEventAt: closedAt,
           revision: sql2`${websiteProjectOrders.revision} + 1`
         }).where(
-          and23(
-            eq28(websiteProjectOrders.orderId, intentOrderId),
-            eq28(websiteProjectOrders.revision, expectedRevision),
-            eq28(websiteProjectOrders.state, "pending")
+          and24(
+            eq29(websiteProjectOrders.orderId, intentOrderId),
+            eq29(websiteProjectOrders.revision, expectedRevision),
+            eq29(websiteProjectOrders.state, "pending")
           )
         );
         if (!result[0]?.affectedRows) {
@@ -34905,8 +35881,8 @@ async function defaultRepository3() {
           });
         }
         const [intents, orders] = await Promise.all([
-          tx.select().from(websiteProjectOrders).where(eq28(websiteProjectOrders.orderId, intentOrderId)).limit(1),
-          tx.select().from(websiteProjectOrders).where(eq28(websiteProjectOrders.orderId, order.orderId)).limit(1)
+          tx.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.orderId, intentOrderId)).limit(1),
+          tx.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.orderId, order.orderId)).limit(1)
         ]);
         if (!intents[0] || !orders[0]) databaseUnavailable2();
         return { intent: intents[0], order: orders[0] };
@@ -35701,7 +36677,7 @@ var enforceFrontMindProxyAccess = createFrontMindProxyAccessMiddleware();
 
 // server/delivery-ticket-attachment-router.ts
 import axios11 from "axios";
-import { and as and24, eq as eq29 } from "drizzle-orm";
+import { and as and25, eq as eq30 } from "drizzle-orm";
 import { Router as Router8 } from "express";
 var router9 = Router8();
 var MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
@@ -35735,14 +36711,14 @@ async function resolveAuthorizedTicketAttachment(input) {
     eventVisibility: deliveryTicketEvents.visibility
   }).from(deliveryTicketAttachments).innerJoin(
     deliveryTickets,
-    eq29(deliveryTickets.id, deliveryTicketAttachments.ticketId)
+    eq30(deliveryTickets.id, deliveryTicketAttachments.ticketId)
   ).leftJoin(
     deliveryTicketEvents,
-    and24(
-      eq29(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
-      eq29(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId)
+    and25(
+      eq30(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
+      eq30(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId)
     )
-  ).where(eq29(deliveryTicketAttachments.id, input.attachmentId)).limit(1);
+  ).where(eq30(deliveryTicketAttachments.id, input.attachmentId)).limit(1);
   const row = rows[0];
   if (!row) {
     throw new DeliveryTicketError(
@@ -36006,7 +36982,7 @@ import { ZodError } from "zod";
 
 // server/website-content-template-service.ts
 import { randomUUID as randomUUID25 } from "node:crypto";
-import { and as and25, asc as asc8, eq as eq30, inArray as inArray13 } from "drizzle-orm";
+import { and as and26, asc as asc8, eq as eq31, inArray as inArray13 } from "drizzle-orm";
 var WEBSITE_CONTENT_CATEGORIES2 = WEBSITE_CONTENT_CATALOG.map(
   (item) => item.value
 );
@@ -36070,9 +37046,9 @@ async function loadWebsiteContentTicketRows(executor, workspaceUserId2, lock = f
     revision: deliveryTickets.revision,
     scheduledAt: deliveryTickets.scheduledAt
   }).from(deliveryTickets).where(
-    and25(
-      eq30(deliveryTickets.userId, workspaceUserId2),
-      eq30(deliveryTickets.type, "website_operation"),
+    and26(
+      eq31(deliveryTickets.userId, workspaceUserId2),
+      eq31(deliveryTickets.type, "website_operation"),
       inArray13(deliveryTickets.category, WEBSITE_CONTENT_CATEGORIES2)
     )
   ).orderBy(asc8(deliveryTickets.createdAt), asc8(deliveryTickets.id));
@@ -36279,9 +37255,9 @@ async function publishWebsiteContentTemplate(input) {
           updatedByUserId: input.actor.id,
           updatedAt: now
         }).where(
-          and25(
-            eq30(deliveryTickets.id, ticket.id),
-            eq30(deliveryTickets.revision, ticket.revision)
+          and26(
+            eq31(deliveryTickets.id, ticket.id),
+            eq31(deliveryTickets.revision, ticket.revision)
           )
         );
         await tx.insert(deliveryTicketEvents).values({
@@ -36324,9 +37300,9 @@ async function publishWebsiteContentTemplate(input) {
           updatedByUserId: input.actor.id,
           updatedAt: now
         }).where(
-          and25(
-            eq30(deliveryTickets.id, ticket.id),
-            eq30(deliveryTickets.revision, ticket.revision)
+          and26(
+            eq31(deliveryTickets.id, ticket.id),
+            eq31(deliveryTickets.revision, ticket.revision)
           )
         );
         await writeWorkspaceAuditEvent(

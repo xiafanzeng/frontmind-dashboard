@@ -12,7 +12,6 @@ import {
 } from "../drizzle/schema";
 import {
   AuthServiceError,
-  assertApiKeyScopeAvailable,
   decryptCredentialSecret,
   encryptCredentialSecret,
   getApiKeyFingerprint,
@@ -160,11 +159,6 @@ export async function replacePresalesApiCredential(
       .for("update");
     const nextVersion = (latest[0]?.version ?? 0) + 1;
 
-    await assertApiKeyScopeAvailable({
-      executor: tx,
-      fingerprint,
-      targetScope: "website_frontend",
-    });
     await tx
       .update(presalesApiCredentials)
       .set({ status: "retired", retiredAt: now })

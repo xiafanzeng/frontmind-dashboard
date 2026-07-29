@@ -316,7 +316,7 @@ export function PreviewAdminPresales() {
   const [configured, setConfigured] = useState(true);
   const tasks = [
     ["官网知识库采集 · 验收企业 B", "2026/7/27 14:22", "6,820"],
-    ["基础版单题构建 · 验收企业", "2026/7/26 10:08", "3,460"],
+    ["普通版单题构建 · 验收企业", "2026/7/26 10:08", "3,460"],
     ["官网知识库同步 · 验收企业 A", "2026/7/25 16:31", "8,120"],
   ];
 
@@ -348,7 +348,7 @@ export function PreviewAdminPresales() {
                 </h2>
               </div>
               <p className="mt-2 text-sm leading-6 text-[#716a80]">
-                独立管理官网知识库采集与基础版前台流程所消耗的积分。
+                独立管理官网知识库采集与普通版前台流程所消耗的积分。
               </p>
             </div>
             <Badge
@@ -508,7 +508,7 @@ export function PreviewAdminUsers({
   });
   const [apiKey, setApiKey] = useState("");
   const [servicePlans, setServicePlans] = useState<
-    Record<number, "basic" | "advanced" | "luxury">
+    Record<number, "basic" | "knowledge" | "advanced" | "luxury">
   >({
     1: "advanced",
     2: "luxury",
@@ -540,8 +540,8 @@ export function PreviewAdminUsers({
       eyebrow="管理中心 · 客户与服务"
       title="客户交付工作台"
       navItems={getRoleScopedPreviewAdminNav(previewAccessLevel)}
-      accountLabel={`${systemAdmin ? "系统管理员" : "普通管理员"}验收账号`}
-      roleLabel={`${systemAdmin ? "系统管理员" : "普通管理员"} · 验收预览`}
+      accountLabel={`${systemAdmin ? "系统管理员" : "交付管理员"}验收账号`}
+      roleLabel={`${systemAdmin ? "系统管理员" : "交付管理员"} · 验收预览`}
       toolbar={
         <div className="flex items-center gap-2">
           {systemAdmin && (
@@ -906,10 +906,10 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
           <div>
             <div className="flex items-center gap-2">
               <History className="h-5 w-5 text-[#5b2a86]" />
-              <h3 className="font-semibold text-[#171321]">内容发布历史</h3>
+              <h3 className="font-semibold text-[#171321]">看板骨架发布历史</h3>
             </div>
             <p className="mt-2 text-sm text-[#716a80]">
-              查看发布快照；恢复历史时会生成新版本，不会覆盖旧记录。
+              仅记录企业资料、指标与看板板块；其他业务内容由各自模块管理。恢复历史时会生成新版本，不会覆盖旧记录。
             </p>
           </div>
           <Badge className="bg-[#5b2a86]/10 text-[#5b2a86]">
@@ -1031,14 +1031,18 @@ function PreviewServiceManager({
   onPlanChange,
 }: {
   userName: string;
-  plan: "basic" | "advanced" | "luxury";
+  plan: "basic" | "knowledge" | "advanced" | "luxury";
   editable: boolean;
-  onPlanChange: (plan: "basic" | "advanced" | "luxury") => void;
+  onPlanChange: (plan: "basic" | "knowledge" | "advanced" | "luxury") => void;
 }) {
   const planMeta = {
     basic: {
-      name: "基础版",
+      name: "普通版",
       quota: "每个订单 1 个非行业词问题，可在同一账号累加",
+    },
+    knowledge: {
+      name: "知识库版",
+      quota: "完整知识库构建、持续更新与展示；不包含问题和内容工单",
     },
     advanced: {
       name: "进阶版",
@@ -1077,12 +1081,17 @@ function PreviewServiceManager({
                 value={plan}
                 onChange={(event) =>
                   onPlanChange(
-                    event.target.value as "basic" | "advanced" | "luxury",
+                    event.target.value as
+                      | "basic"
+                      | "knowledge"
+                      | "advanced"
+                      | "luxury",
                   )
                 }
                 className="mt-2 h-10 w-full rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#332842]"
               >
-                <option value="basic">基础版 · 30 天单题</option>
+                <option value="basic">普通版 · 30 天单题</option>
+                <option value="knowledge">知识库版</option>
                 <option value="advanced">进阶版</option>
                 <option value="luxury">豪华版</option>
               </select>
@@ -1205,7 +1214,7 @@ function PreviewCredential({
   );
 }
 
-type PreviewPlanCode = "basic" | "advanced" | "luxury";
+type PreviewPlanCode = "basic" | "knowledge" | "advanced" | "luxury";
 type PreviewAccountRole = "管理员" | "用户";
 type PreviewAccountDraft = {
   name: string;
@@ -1331,6 +1340,7 @@ export function PreviewCreateAccountDialog({
               >
                 <option value="">请选择套餐</option>
                 <option value="basic">普通版</option>
+                <option value="knowledge">知识库版</option>
                 <option value="advanced">进阶版</option>
                 <option value="luxury">豪华版</option>
               </select>
@@ -1359,7 +1369,7 @@ export function PreviewCreateAccountDialog({
                   }
                   className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                 >
-                  <option value="delivery_admin">普通管理员</option>
+                  <option value="delivery_admin">交付管理员</option>
                   <option value="system_admin">系统管理员</option>
                 </select>
               </label>
@@ -1414,7 +1424,7 @@ const initialAccounts: PreviewAccount[] = [
   },
   {
     id: 2,
-    name: "普通管理员",
+    name: "交付管理员",
     username: "delivery_admin",
     role: "管理员",
     active: true,
@@ -1442,6 +1452,14 @@ const initialAccounts: PreviewAccount[] = [
     role: "用户",
     active: false,
     planCode: "basic",
+  },
+  {
+    id: 6,
+    name: "验收企业知识库",
+    username: "acceptance_kb",
+    role: "用户",
+    active: true,
+    planCode: "knowledge",
   },
 ];
 
@@ -1530,9 +1548,11 @@ export function PreviewAdminAccounts() {
                       <p className="mt-1 text-xs text-[#857e91]">
                         {account.planCode === "basic"
                           ? "普通版"
-                          : account.planCode === "advanced"
-                            ? "进阶版"
-                            : "豪华版"}
+                          : account.planCode === "knowledge"
+                            ? "知识库版"
+                            : account.planCode === "advanced"
+                              ? "进阶版"
+                              : "豪华版"}
                       </p>
                     )}
                   </td>

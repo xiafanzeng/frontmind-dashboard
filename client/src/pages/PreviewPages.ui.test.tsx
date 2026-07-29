@@ -97,7 +97,7 @@ describe("preview account creation form", () => {
   it("keeps a delivery administrator read-only and inside assigned customers", () => {
     render(<PreviewAdminUsers previewAccessLevel="delivery_admin" />);
 
-    expect(screen.getByText("普通管理员验收账号")).toBeInTheDocument();
+    expect(screen.getByText("交付管理员验收账号")).toBeInTheDocument();
     expect(screen.getAllByText("验收企业")).not.toHaveLength(0);
     expect(screen.getByText("验收企业 B")).toBeInTheDocument();
     expect(screen.queryByText("验收企业 C")).not.toBeInTheDocument();

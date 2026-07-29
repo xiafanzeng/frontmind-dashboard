@@ -36,22 +36,23 @@ describe("Login", () => {
     window.history.replaceState({}, "", "/login");
   });
 
-  it("uses the FrontMind enterprise GEO positioning", () => {
+  it("shows the FrontMind positioning and the approved school laboratory brand", () => {
     render(<Login />);
 
-    expect(
-      screen.getByText("与 FrontMind 一起，"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("与 FrontMind 一起，")).toBeInTheDocument();
     expect(
       screen.getByText("构筑科研驱动的企业级 GEO 基建"),
     ).toBeInTheDocument();
     expect(
       screen.queryByText("体验论文级内容与科研级审美标准"),
     ).not.toBeInTheDocument();
+    expect(screen.getByAltText("香港中文大学（深圳）校徽")).toHaveAttribute(
+      "src",
+      "/assets/cuhksz-emblem.png",
+    );
     expect(
-      screen.getByText("FrontMind 企业级 GEO 服务平台"),
+      screen.getByText("香港中文大学（深圳）AI智能决策实验室"),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/香港中文大学/)).not.toBeInTheDocument();
     expect(screen.getByTestId("presales-login-hint")).toHaveTextContent(
       "请返回官网完成售前流程，使用售前分配的账号登录。",
     );

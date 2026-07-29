@@ -23,6 +23,7 @@ type PortalShellProps = {
   toolbar?: ReactNode;
   accountLabel?: string;
   roleLabel?: string;
+  mode?: "standard" | "fullscreen";
 };
 
 export default function PortalShell({
@@ -33,6 +34,7 @@ export default function PortalShell({
   toolbar,
   accountLabel,
   roleLabel,
+  mode = "standard",
 }: PortalShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [location] = useLocation();
@@ -61,7 +63,11 @@ export default function PortalShell({
     })[0]?.href;
 
   return (
-    <div className="min-h-[100dvh] bg-[#f6f3f8] text-[#221a33] lg:grid lg:grid-cols-[286px_minmax(0,1fr)]">
+    <div
+      className={`bg-[radial-gradient(circle_at_34%_0%,rgba(91,42,134,.09),transparent_34%),radial-gradient(circle_at_92%_18%,rgba(200,144,19,.09),transparent_30%),#f6f3f8] text-[#443a50] lg:grid lg:grid-cols-[286px_minmax(0,1fr)] ${
+        mode === "fullscreen" ? "h-[100dvh] overflow-hidden" : "min-h-[100dvh]"
+      }`}
+    >
       <button
         type="button"
         className="fixed left-4 top-4 z-[90] flex h-10 w-10 items-center justify-center rounded-xl border border-white/15 bg-[#11131b] text-white shadow-xl lg:hidden"
@@ -169,17 +175,33 @@ export default function PortalShell({
         </div>
       </aside>
 
-      <main className="min-w-0">
-        <header className="sticky top-0 z-40 flex min-h-[82px] items-center justify-between gap-4 border-b border-[#e8e1ee]/90 bg-white/80 px-5 pl-16 backdrop-blur-xl sm:px-8 sm:pl-20 lg:px-9 lg:pl-9">
-          <div className="min-w-0 py-3">
-            <p className="fm-eyebrow text-[#5b2a86]">{eyebrow}</p>
-            <h1 className="mt-1 truncate text-xl font-semibold tracking-tight text-[#11101a] sm:text-2xl">
-              {title}
-            </h1>
-          </div>
-          {toolbar && <div className="shrink-0">{toolbar}</div>}
-        </header>
-        <div className="mx-auto w-full max-w-[1520px] px-4 py-6 sm:px-7 lg:px-8 lg:py-8">
+      <main
+        className={
+          mode === "fullscreen"
+            ? "h-[100dvh] min-w-0 overflow-hidden"
+            : "min-w-0"
+        }
+      >
+        {mode === "standard" && (
+          <header className="sticky top-0 z-40 flex min-h-[82px] flex-col items-stretch justify-center gap-2 border-b border-[#e8e1ee]/90 bg-white/82 px-4 py-3 pl-16 backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:px-8 sm:py-0 sm:pl-20 lg:px-9 lg:pl-9">
+            <div className="min-w-0 sm:py-3">
+              <p className="fm-eyebrow text-[#5b2a86]">{eyebrow}</p>
+              <h1 className="mt-1 truncate text-xl font-semibold tracking-tight text-[#251e2d] sm:text-2xl">
+                {title}
+              </h1>
+            </div>
+            {toolbar && (
+              <div className="flex justify-end sm:shrink-0">{toolbar}</div>
+            )}
+          </header>
+        )}
+        <div
+          className={
+            mode === "fullscreen"
+              ? "h-full min-h-0 w-full"
+              : "mx-auto w-full max-w-[1520px] px-4 py-6 sm:px-7 lg:px-8 lg:py-8"
+          }
+        >
           {children}
         </div>
       </main>
@@ -196,7 +218,7 @@ export function PortalCard({
 }) {
   return (
     <section
-      className={`rounded-[18px] border border-[#e8e1ee] bg-white/90 shadow-[0_18px_48px_rgba(33,19,58,.07)] ${className}`}
+      className={`rounded-[18px] border border-[#e8e1ee] bg-white/92 text-[#4f485c] shadow-[0_18px_48px_rgba(33,19,58,.07)] ${className}`}
     >
       {children}
     </section>

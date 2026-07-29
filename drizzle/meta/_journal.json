@@ -246,6 +246,13 @@
       "when": 1785256200000,
       "tag": "0034_known_scarlet_spider",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "5",
+      "when": 1785257474280,
+      "tag": "0035_nervous_sauron",
+      "breakpoints": true
     }
   ]
 }

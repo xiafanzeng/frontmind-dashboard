@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -152,6 +155,20 @@ describe("administrator channel navigation", () => {
   it("allows only the system administrator to create customer accounts", () => {
     expect(canCreateCustomerFromDashboard(false)).toBe(false);
     expect(canCreateCustomerFromDashboard(true)).toBe(true);
+  });
+
+  it("uses a concise delivery overview with toolbar actions and no marketing banner", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminDashboard.tsx"),
+      "utf8",
+    );
+    expect(source).toContain('title="交付总览"');
+    expect(source).toContain("打开客户交付工作台");
+    expect(source).toContain("创建客户");
+    expect(source).not.toContain("从客户签约到交付验收的统一工作台");
+    expect(source).not.toContain(
+      "套餐权益、知识库流程、选题、应答逻辑、问题监控",
+    );
   });
 
   it("normalizes API Key snapshots with independent default policies", () => {

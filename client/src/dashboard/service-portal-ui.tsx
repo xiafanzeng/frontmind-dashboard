@@ -463,7 +463,9 @@ export function ServiceHome({
   onOpenAccount?: () => void;
 }) {
   const usesInteractiveKnowledgeFlow =
-    portal.plan.code === "advanced" || portal.plan.code === "luxury";
+    portal.plan.code === "knowledge" ||
+    portal.plan.code === "advanced" ||
+    portal.plan.code === "luxury";
   const knowledgeStep = portal.workflowSteps.find(
     (step) => step.id === "knowledge",
   );
@@ -640,6 +642,8 @@ export function ServiceHome({
                       </span>
                     ))}
                   </span>
+                ) : portal.plan.code === "knowledge" ? (
+                  "知识库构建 · 更新 · 展示"
                 ) : (
                   "待服务配置同步"
                 )}
@@ -676,7 +680,9 @@ export function ServiceHome({
               {knowledgeNeedsInteractiveBuild
                 ? portal.knowledgeBase.status === "ready"
                   ? "账号中已有历史知识库可供预填参考；当前套餐仍需在系统内逐节点完成知识库智能体流程并发布知识库。"
-                  : "进阶版与豪华版从知识库智能体开始：先在系统内完成资料采集、逐节点确认与知识库发布，再进入品牌全域词库和选题。"
+                  : portal.plan.code === "knowledge"
+                    ? "知识库版从知识库智能体开始：在系统内完成资料采集、逐节点确认与发布后，可持续查看和更新企业知识库。"
+                    : "进阶版与豪华版从知识库智能体开始：先在系统内完成资料采集、逐节点确认与知识库发布，再进入品牌全域词库和选题。"
                 : usesInteractiveKnowledgeFlow &&
                     portal.knowledgeBase.status === "ready"
                   ? "当前知识库由知识库智能体逐节点确认后发布，可直接查看并继续维护。"
@@ -708,7 +714,9 @@ export function ServiceHome({
             </Button>
           </article>
 
-          <ServiceCycleOverview portal={portal} onNavigate={onNavigate} />
+          {portal.plan.code !== "knowledge" && (
+            <ServiceCycleOverview portal={portal} onNavigate={onNavigate} />
+          )}
         </div>
       </div>
 
@@ -846,7 +854,13 @@ export function ServiceLockedPage({
   onNavigate?: (section: string, sub?: string | null) => void;
 }) {
   const pending = access.effectiveStatus === "pending";
-  const nextAction = access.nextAction ?? portal.primaryNextAction;
+  const upgradeAction = portal.purchaseActions.find(
+    (action) => action.kind === "upgrade",
+  );
+  const nextAction =
+    !pending && access.effectiveStatus === "locked" && upgradeAction
+      ? upgradeAction
+      : (access.nextAction ?? portal.primaryNextAction);
   return (
     <section className="page-shell">
       <div className="mx-auto mt-8 max-w-3xl overflow-hidden rounded-[24px] border border-[#e8e1ee] bg-white shadow-[0_18px_48px_rgba(33,19,58,.07)]">
@@ -947,6 +961,7 @@ function PreviewSecurityActions() {
 function requiresSalesAdvisor(action: ServiceAction) {
   return (
     action.kind.includes("upgrade") ||
+    action.targetPlan === "knowledge" ||
     action.targetPlan === "advanced" ||
     action.targetPlan === "luxury"
   );
@@ -1035,7 +1050,9 @@ function SalesAdvisorDialog({
       ? "豪华版"
       : targetPlan === "advanced"
         ? "进阶版"
-        : "企业服务";
+        : targetPlan === "knowledge"
+          ? "知识库版"
+          : "企业服务";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1394,7 +1411,7 @@ export function ServiceAccountDrawer({
                 )
               ) : (
                 <p className="rounded-xl border border-dashed p-3 text-xs leading-5 text-muted-foreground">
-                  购买入口尚未配置。请联系服务顾问继续购买基础版或升级套餐。
+                  购买入口尚未配置。请联系服务顾问继续购买普通版或升级套餐。
                 </p>
               )}
             </section>

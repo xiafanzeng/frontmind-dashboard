@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { AuthUser } from "@/_core/hooks/useAuth";
-import { isDeliveryAdminAccount, isSystemAdminAccount } from "./admin-access";
+import {
+  isDeliveryAdminAccount,
+  isProtectedBuiltinAdminUsername,
+  isSystemAdminAccount,
+} from "./admin-access";
 
 function admin(
   adminAccessLevel: AuthUser["adminAccessLevel"],
@@ -28,5 +32,12 @@ describe("client administrator access", () => {
     expect(isDeliveryAdminAccount(admin("delivery_admin"))).toBe(true);
     expect(isDeliveryAdminAccount(admin("system_admin"))).toBe(false);
     expect(isDeliveryAdminAccount(admin(null))).toBe(false);
+  });
+
+  it("protects only the normalized built-in admin username", () => {
+    expect(isProtectedBuiltinAdminUsername(" admin ")).toBe(true);
+    expect(isProtectedBuiltinAdminUsername("ＡＤＭＩＮ")).toBe(true);
+    expect(isProtectedBuiltinAdminUsername("admin.backup")).toBe(false);
+    expect(isProtectedBuiltinAdminUsername("system-admin")).toBe(false);
   });
 });
