@@ -214,8 +214,9 @@ ${narrative}
       inspectedCandidateImages: 0,
       eligibleFirstPartyImages: 0,
       rejectedCandidateImages: 0,
-      scannedSourcePages: 1,
+      scannedSourcePages: 0,
       discoveryMethods,
+      candidates: [],
       rejectionReasons: [],
       stopReason: "已检查所有官方页面和资料",
       productFamilyCoverage: [
@@ -252,6 +253,39 @@ describe("dashboard enterprise Skill archive validator", () => {
     const result = await runValidator(archivePath);
 
     expect(result.code).toBe(0);
+  });
+
+  it("rejects customer-facing audit language while allowing it in internal gaps", async () => {
+    const files = validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    files[`${root}/branches/products/leaf-1.md`] = `# 知识叶子 1
+
+<!-- FRONTMIND_FORMAL_CONTENT_START -->
+
+## 正式正文
+
+${"这些内容属于企业自我定义，不宜直接转换为已量化达成的影响。对客户而言，可将其落实为可观察行动。".repeat(4)}
+
+<!-- FRONTMIND_FORMAL_CONTENT_END -->
+
+## 证据与核验
+
+- source-official
+`;
+    const completeness = JSON.parse(
+      String(files[`${root}/00_completeness.json`]),
+    );
+    completeness.gaps = [
+      "本轮没有形成可逐项核验的证书名称与有效期，待企业补充。",
+    ];
+    files[`${root}/00_completeness.json`] = JSON.stringify(completeness);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "customer-facing audit language or internal reasoning",
+    );
   });
 
   it("rejects a rich evidence relationship reported as zero characters", async () => {
@@ -491,9 +525,6 @@ describe("dashboard enterprise Skill archive validator", () => {
     const result = await runValidator(archivePath);
 
     expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain(
-      "target_met requires at least 360 eligible and packaged images",
-    );
     expect(result.stderr).toContain("manifest.counts.packagedImages must be 0");
   });
 
@@ -522,7 +553,11 @@ describe("dashboard enterprise Skill archive validator", () => {
         caption: "伪图片",
         branchId: "products",
         documentIds: ["overview-products"],
+        sourcePageUrl: "https://example.com/products",
+        sourceAssetUrl: "https://example.com/assets/header-only.jpg",
         ownership: "first_party",
+        assetType: "product_ui",
+        displayRole: "inline",
       },
     ];
     manifest.counts.totalFiles += 1;
@@ -533,7 +568,7 @@ describe("dashboard enterprise Skill archive validator", () => {
       inspectedCandidateImages: 1,
       eligibleFirstPartyImages: 1,
       rejectedCandidateImages: 0,
-      scannedSourcePages: 1,
+      scannedSourcePages: 0,
       discoveryMethods: [
         "img",
         "srcset",
@@ -543,6 +578,15 @@ describe("dashboard enterprise Skill archive validator", () => {
         "open_graph",
         "gallery",
         "official_document",
+      ],
+      candidates: [
+        {
+          url: "https://example.com/assets/header-only.jpg",
+          sourcePageUrl: "https://example.com/products",
+          method: "img",
+          status: "eligible",
+          assetId: "asset-header-only",
+        },
       ],
       rejectionReasons: [],
       stopReason: "已检查所有官方页面和资料",

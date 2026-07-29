@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   KnowledgeBaseEnterpriseIdentityError,
+  KNOWLEDGE_BASE_AGENT_PROFILE,
   buildKnowledgeBasePrompt,
+  buildKnowledgePrefillExcerpt,
   getKnowledgeBaseSkillDescriptor,
   resolveKnowledgeBaseEnterpriseIdentity,
   selectUnreconciledKnowledgeOutput,
@@ -22,7 +24,11 @@ function expectEnterpriseIdentityError(
 }
 
 describe("knowledge base execution contract", () => {
-  it("requires budgeted deep research, real illustrated prose, and one-by-one traversal", async () => {
+  it("keeps dashboard knowledge-base builds on the Pro model", () => {
+    expect(KNOWLEDGE_BASE_AGENT_PROFILE).toBe("frontmind-pro");
+  });
+
+  it("keeps the Pro prompt compact while preserving depth and one-by-one traversal", async () => {
     const prompt = await buildKnowledgeBasePrompt({
       companyName: "验收企业",
       companyWebsite:
@@ -31,44 +37,37 @@ describe("knowledge base execution contract", () => {
       attachments: [{ file_id: "file-1", filename: "catalog.pdf" }],
     });
 
-    expect(prompt).toContain("sitemap");
-    expect(prompt).toContain("HTML 抓取尝试最多 1,200");
-    expect(prompt).toContain("链接访问最多 1,800");
-    expect(prompt).toContain("360–480 张是质量目标而非最低门槛");
-    expect(prompt).toContain("官网文档最多 120");
-    expect(prompt).toContain("累计用户上传最多 100");
-    expect(prompt).toContain("公开查询最多 120");
+    expect(prompt).toContain(
+      "不得开启、调用、切换或推荐 Wide Research / Deep Research",
+    );
+    expect(prompt).toContain("current Pro Agent");
+    expect(prompt).toContain("1,200 official HTML attempts");
+    expect(prompt).toContain("1,800 visited links");
     expect(prompt).toContain("3,000,000");
-    expect(prompt).toContain("80,000–120,000 字符是质量目标");
     expect(prompt).toContain("limited_evidence");
     expect(prompt).toContain("evidenceDocumentIds");
-    expect(prompt).toContain("schemaVersion=2");
-    expect(prompt).toContain("ZIP 最多 1,500");
+    expect(prompt).toContain("schemaVersion: 2");
+    expect(prompt).toContain("1,500 ZIP files");
     expect(prompt).toContain("160 MiB");
-    expect(prompt).toContain("第 330 分钟停止");
-    expect(prompt).toContain("第 360 分钟");
     expect(prompt).toContain("00_package_manifest.json");
     expect(prompt).toContain("dashboard-enterprise-v1");
-    expect(prompt).toContain("scripts/validate_archive.py");
     expect(prompt).toContain("FRONTMIND_FORMAL_CONTENT_START");
-    expect(prompt).not.toContain("Crawl every company website exhaustively");
-    expect(prompt).not.toContain("traversed to exhaustion");
-    expect(prompt).toContain("actual cumulative counters");
-    expect(prompt).toContain("Deduplicate by decoded content hash");
-    expect(prompt).toContain("width");
-    expect(prompt).toContain("height");
-    expect(prompt).toContain("public queries in Chinese, English");
-    expect(prompt).toContain("third-party facts and media");
+    expect(prompt).toContain("assetType");
+    expect(prompt).toContain("displayRole");
+    expect(prompt).toContain("scannedSourcePages");
+    expect(prompt).toContain("1200×600");
+    expect(prompt).toContain("800×450");
+    expect(prompt).toContain("256×256");
+    expect(prompt).toContain("Customer writing boundary");
+    expect(prompt).toContain("verification_gaps");
     expect(prompt).toContain("00_web_intelligence_report.md");
     expect(prompt).toContain("40-115");
     expect(prompt).toContain("一级分支数量不设固定值");
     expect(prompt).not.toContain("恰好 7 个一级分支");
     expect(prompt).not.toContain("7 universal top-level branches");
-    expect(prompt).toContain("每轮只能呈现和处理一个叶子节点");
-    expect(prompt).toContain("遍历进度达到 100%");
-    expect(prompt).toContain("禁止出现‘生成初版成果’");
-    expect(prompt).toContain("永远不生成交互式研究网页");
-    expect(prompt).toContain("标准 Markdown 标题、表格、列表和独立段落");
+    expect(prompt).toContain("只有服务端遍历达到 100%");
+    expect(prompt).toContain("每次被接受后加 1");
+    expect(prompt).toContain("Never create an interactive");
     expect(prompt).toContain("https://company.example.invalid/");
     expect(prompt).toContain("https://evidence.example.invalid/");
     expect(prompt).toContain("catalog.pdf");
@@ -78,6 +77,60 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("补充、修订、问题或上传资料");
     expect(prompt).toContain("to 必须为 needs_verification");
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(30_000);
+    expect(prompt).not.toContain("# FILE: references/");
+    expect(prompt).not.toContain("# FILE: scripts/validate_archive.py");
+    expect(prompt).not.toContain("def validate_archive");
+    expect(prompt).not.toContain("360–480");
+    expect(prompt).not.toContain("300,000");
+  });
+
+  it("balances historical prefill across branches and caps it at 80,000 characters", () => {
+    const documents = [
+      {
+        path: "01_identity/overview.md",
+        title: "企业概览",
+        content: "甲".repeat(30_000),
+      },
+      {
+        path: "01_identity/history.md",
+        title: "发展历程",
+        content: "乙".repeat(30_000),
+      },
+      {
+        path: "02_team/overview.md",
+        title: "团队概览",
+        content: "丙".repeat(30_000),
+      },
+      {
+        path: "03_products/product-a.md",
+        title: "产品 A",
+        content: "丁".repeat(30_000),
+      },
+      {
+        path: "04_capabilities/overview.md",
+        title: "能力概览",
+        content: "戊".repeat(30_000),
+      },
+      {
+        path: "04_capabilities/lab.md",
+        title: "实验室",
+        content: "己".repeat(30_000),
+      },
+    ];
+
+    const excerpt = buildKnowledgePrefillExcerpt(documents);
+    expect(excerpt.length).toBeLessThanOrEqual(80_000);
+    expect(excerpt).toContain("documentPath: 01_identity/overview.md");
+    expect(excerpt).toContain("documentPath: 02_team/overview.md");
+    expect(excerpt).toContain("documentPath: 03_products/product-a.md");
+    expect(excerpt).toContain("documentPath: 04_capabilities/overview.md");
+    expect(excerpt.indexOf("02_team/overview.md")).toBeLessThan(
+      excerpt.indexOf("01_identity/history.md"),
+    );
+    expect(excerpt.indexOf("03_products/product-a.md")).toBeLessThan(
+      excerpt.indexOf("04_capabilities/lab.md"),
+    );
   });
 
   it("pins new builds to v2 while preserving the immutable v1 archive", async () => {
@@ -113,15 +166,13 @@ describe("knowledge base execution contract", () => {
       }),
     ).toBe("验收企业");
 
-    expectEnterpriseIdentityError(
-      () =>
-        resolveKnowledgeBaseEnterpriseIdentity({
-          sourceName: null,
-          brandName: "企业知识中枢",
-          requestedCompanyName: "验收企业",
-        }),
-      "ENTERPRISE_NOT_CONFIGURED",
-    );
+    expect(
+      resolveKnowledgeBaseEnterpriseIdentity({
+        sourceName: null,
+        brandName: "验收企业",
+        requestedCompanyName: "验收企业",
+      }),
+    ).toBe("验收企业");
 
     expectEnterpriseIdentityError(
       () =>

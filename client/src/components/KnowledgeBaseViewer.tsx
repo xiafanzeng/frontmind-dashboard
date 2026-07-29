@@ -287,6 +287,41 @@ function assetDisplayName(asset: KnowledgeDisplayAsset) {
   );
 }
 
+function knowledgeAssetRoleRank(asset: KnowledgeDisplayAsset) {
+  return asset.displayRole === "hero"
+    ? 0
+    : asset.displayRole === "inline"
+      ? 1
+      : asset.displayRole === "badge"
+        ? 2
+        : 1;
+}
+
+function sortedKnowledgeAssets(assets: KnowledgeDisplayAsset[]) {
+  return [...assets].sort(
+    (left, right) =>
+      knowledgeAssetRoleRank(left) - knowledgeAssetRoleRank(right),
+  );
+}
+
+function knowledgeAssetImageClass(asset: KnowledgeDisplayAsset) {
+  if (asset.displayRole === "badge") {
+    return "aspect-square max-h-40 w-full rounded-2xl bg-white object-contain p-3";
+  }
+  if (
+    [
+      "brand_identity",
+      "product_ui",
+      "product_diagram",
+      "certificate_badge",
+      "document_figure",
+    ].includes(asset.assetType || "")
+  ) {
+    return "aspect-[4/3] w-full rounded-2xl bg-[#f6f3f8] object-contain p-3";
+  }
+  return "aspect-[4/3] w-full rounded-2xl bg-[#f6f3f8] object-cover";
+}
+
 function isExternalHttpUrl(value: string | undefined) {
   return /^https?:\/\//i.test(value || "");
 }
@@ -304,6 +339,42 @@ function KnowledgeImageGrid({
   ariaLabel: string;
   alternating?: boolean;
 }) {
+  const sortedAssets = sortedKnowledgeAssets(assets);
+  const primaryAssets = sortedAssets.filter(
+    (asset) => asset.displayRole !== "badge",
+  );
+  const badgeAssets = sortedAssets.filter(
+    (asset) => asset.displayRole === "badge",
+  );
+  const renderAsset = (asset: KnowledgeDisplayAsset) => {
+    const displayName = assetDisplayName(asset);
+    return (
+      <figure key={asset.key} className="min-w-0">
+        <img
+          src={asset.url}
+          alt={asset.alt?.trim() || displayName}
+          loading="lazy"
+          className={knowledgeAssetImageClass(asset)}
+        />
+        <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
+          <span className="block break-words font-medium text-[#51495d]">
+            {displayName}
+          </span>
+          {isExternalHttpUrl(assetSource(asset)) && (
+            <a
+              href={assetSource(asset)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-0.5 inline-flex text-[#6d3497] hover:underline"
+            >
+              查看图片来源
+            </a>
+          )}
+        </figcaption>
+      </figure>
+    );
+  };
+
   return (
     <div
       aria-label={ariaLabel}
@@ -311,34 +382,15 @@ function KnowledgeImageGrid({
         alternating ? "lg:order-first lg:border-r" : "lg:border-l"
       }`}
     >
-      {assets.map((asset) => {
-        const displayName = assetDisplayName(asset);
-        return (
-          <figure key={asset.key} className="min-w-0">
-            <img
-              src={asset.url}
-              alt={asset.alt?.trim() || displayName}
-              loading="lazy"
-              className="aspect-[4/3] w-full rounded-2xl bg-[#f6f3f8] object-cover"
-            />
-            <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
-              <span className="block break-words font-medium text-[#51495d]">
-                {displayName}
-              </span>
-              {isExternalHttpUrl(assetSource(asset)) && (
-                <a
-                  href={assetSource(asset)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="mt-0.5 inline-flex text-[#6d3497] hover:underline"
-                >
-                  查看图片来源
-                </a>
-              )}
-            </figcaption>
-          </figure>
-        );
-      })}
+      {primaryAssets.map(renderAsset)}
+      {badgeAssets.length > 0 && (
+        <div
+          aria-label={`${ariaLabel}徽章`}
+          className="grid grid-cols-2 gap-3 border-t border-[#eee7f2] pt-3 sm:grid-cols-3"
+        >
+          {badgeAssets.map(renderAsset)}
+        </div>
+      )}
     </div>
   );
 }
@@ -422,18 +474,19 @@ export default function KnowledgeBaseViewer({
     ? assetPlacement?.bySection.get(selectedDocument.path)
     : undefined;
   const selectedRelatedAssets = selectedDocument
-    ? assetPlacement?.relatedByDocument.get(selectedDocument.path) || []
+    ? sortedKnowledgeAssets(
+        assetPlacement?.relatedByDocument.get(selectedDocument.path) || [],
+      )
     : [];
   const assetPageSize = 24;
   const assetPageCount = Math.max(
     1,
     Math.ceil((snapshot?.assets.length || 0) / assetPageSize),
   );
-  const pagedAssets =
-    snapshot?.assets.slice(
-      assetPage * assetPageSize,
-      assetPage * assetPageSize + assetPageSize,
-    ) || [];
+  const pagedAssets = sortedKnowledgeAssets(snapshot?.assets || []).slice(
+    assetPage * assetPageSize,
+    assetPage * assetPageSize + assetPageSize,
+  );
   if (loading) {
     return (
       <div className="grid min-h-[520px] place-items-center rounded-[20px] border border-[#e8e1ee] bg-white/80">
@@ -549,7 +602,7 @@ export default function KnowledgeBaseViewer({
                       src={asset.url}
                       alt={asset.alt?.trim() || displayName}
                       loading="lazy"
-                      className="aspect-[4/3] w-full rounded-2xl bg-[#f6f3f8] object-cover"
+                      className={knowledgeAssetImageClass(asset)}
                     />
                     <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
                       <span className="block break-words font-medium text-[#51495d]">
@@ -725,36 +778,10 @@ export default function KnowledgeBaseViewer({
                           相关图片
                         </h3>
                       </div>
-                      <div className="grid gap-4 bg-white p-4 sm:grid-cols-2 xl:grid-cols-3">
-                        {selectedRelatedAssets.slice(0, 3).map((asset) => {
-                          const displayName = assetDisplayName(asset);
-                          return (
-                            <figure key={asset.key} className="min-w-0">
-                              <img
-                                src={asset.url}
-                                alt={asset.alt?.trim() || displayName}
-                                loading="lazy"
-                                className="aspect-[4/3] w-full rounded-2xl bg-[#f6f3f8] object-cover"
-                              />
-                              <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
-                                <span className="block break-words font-medium text-[#51495d]">
-                                  {displayName}
-                                </span>
-                                {isExternalHttpUrl(assetSource(asset)) && (
-                                  <a
-                                    href={assetSource(asset)}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="mt-0.5 inline-flex text-[#6d3497] hover:underline"
-                                  >
-                                    查看图片来源
-                                  </a>
-                                )}
-                              </figcaption>
-                            </figure>
-                          );
-                        })}
-                      </div>
+                      <KnowledgeImageGrid
+                        assets={selectedRelatedAssets.slice(0, 3)}
+                        ariaLabel="相关图片配图"
+                      />
                     </section>
                   )}
                 </div>

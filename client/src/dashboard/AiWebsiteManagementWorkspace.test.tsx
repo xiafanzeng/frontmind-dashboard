@@ -31,7 +31,7 @@ function websiteQuota(
 }
 
 describe("AiWebsiteManagementWorkspace", () => {
-  it("removes the old technical console and exposes only the three-stage workflow", () => {
+  it("removes the old technical console and exposes the unified two-stage workflow", () => {
     render(
       <AiWebsiteManagementWorkspace
         planCode="advanced"
@@ -49,9 +49,12 @@ describe("AiWebsiteManagementWorkspace", () => {
     expect(
       screen.getByRole("heading", { name: "官网开通进度" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("域名申请")).toBeInTheDocument();
-    expect(screen.getByText("ICP 备案与主体材料")).toBeInTheDocument();
+    expect(
+      screen.getByText("域名申请与 ICP 备案材料"),
+    ).toBeInTheDocument();
     expect(screen.getByText("官网内容运营")).toBeInTheDocument();
+    expect(screen.queryByText("域名申请")).not.toBeInTheDocument();
+    expect(screen.queryByText("ICP 备案与主体材料")).not.toBeInTheDocument();
     for (const removedCopy of [
       "官网运营目录",
       "官网检查项",
@@ -64,8 +67,7 @@ describe("AiWebsiteManagementWorkspace", () => {
     }
   });
 
-  it("submits domain application first and does not consume content quota", async () => {
-    const onSubmit = vi.fn().mockResolvedValue(undefined);
+  it("opens one unified domain and ICP form without consuming content quota", () => {
     render(
       <AiWebsiteManagementWorkspace
         planCode="advanced"
@@ -76,30 +78,18 @@ describe("AiWebsiteManagementWorkspace", () => {
           canSubmitIcp: false,
           canSubmitContent: false,
         }}
-        onSubmit={onSubmit}
+        onSubmit={vi.fn()}
       />,
     );
 
-    expect(screen.getByLabelText("需求类型")).toHaveValue("域名申请");
+    expect(screen.getByLabelText("需求类型")).toHaveValue(
+      "域名申请与 ICP 备案材料",
+    );
     expect(
       screen.queryByText(/当前官网内容发布额度已用完/),
     ).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("话题"), {
-      target: { value: "申请 example.cn" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "提交工单" }));
-
-    await waitFor(() =>
-      expect(onSubmit).toHaveBeenCalledWith({
-        category: "domain_application",
-        topic: "申请 example.cn",
-        description: "",
-        targetPage: "",
-        materialUrls: [],
-        attachmentFiles: [],
-        icpMaterialFiles: [],
-      }),
-    );
+    expect(screen.getByLabelText("备案省份")).toBeInTheDocument();
+    expect(screen.getByLabelText("申请或核验的域名")).toBeInTheDocument();
   });
 
   it("keeps the next stage locked while a domain ticket is pending", () => {
@@ -129,7 +119,11 @@ describe("AiWebsiteManagementWorkspace", () => {
       />,
     );
 
-    expect(screen.getByText(/当前阶段已有待受理工单/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "域名与备案材料已提交，管理员统一核验完成后会自动开放内容运营。",
+      ),
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "提交工单" }),
     ).not.toBeInTheDocument();
@@ -175,8 +169,8 @@ describe("AiWebsiteManagementWorkspace", () => {
 
     expect(screen.getByText("主办单位证件")).toBeInTheDocument();
     expect(screen.getByText("必需 · 敏感材料")).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("话题"), {
-      target: { value: "企业官网首次备案" },
+    fireEvent.change(screen.getByLabelText("申请或核验的域名"), {
+      target: { value: "example.cn" },
     });
     fireEvent.click(screen.getByRole("button", { name: "提交工单" }));
     expect(screen.getByText("请先选择备案省份。")).toBeInTheDocument();
@@ -214,7 +208,7 @@ describe("AiWebsiteManagementWorkspace", () => {
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith({
         category: "icp_filing",
-        topic: "企业官网首次备案",
+        topic: "example.cn",
         description: "",
         targetPage: "",
         materialUrls: [],

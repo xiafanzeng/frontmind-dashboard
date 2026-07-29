@@ -235,18 +235,18 @@ function throwServiceAdminError(error: unknown): never {
 const usernameSchema = z
   .string()
   .trim()
-  .min(3, "Username must contain at least 3 characters")
-  .max(64, "Username is too long")
+  .min(3, "用户名至少需要 3 个字符")
+  .max(64, "用户名不能超过 64 个字符")
   .regex(
     /^[a-zA-Z0-9._-]+$/,
-    "Username may only contain letters, numbers, dots, underscores, and hyphens",
+    "用户名只能包含字母、数字、点、下划线和连字符",
   );
 
 const presalesApiKeySchema = z
   .string()
   .trim()
-  .min(8, "API Key is too short")
-  .max(4096, "API Key is too long");
+  .min(8, "API Key 至少需要 8 个字符")
+  .max(4096, "API Key 不能超过 4096 个字符");
 
 export const adminUpdateServiceSchema = z
   .object({
@@ -801,13 +801,11 @@ export const adminRouter = router({
         }
         if (
           commerciallyActive &&
-          (!input.signatoryId?.trim() ||
-            !input.signedAt ||
-            !input.signingEvidence)
+          (!input.signatoryId?.trim() || !input.signedAt)
         ) {
           throw new TRPCError({
             code: "BAD_REQUEST",
-            message: "生效或待生效合同必须包含签署主体、签署时间与核验依据",
+            message: "生效或待生效合同必须包含签署主体与签署时间",
           });
         }
         try {

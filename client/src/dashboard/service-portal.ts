@@ -1113,7 +1113,10 @@ export function getCapability(
     return {
       allowed: false,
       effectiveStatus: "pending",
-      reason: step.lockedReason || "当前步骤需要完成前置服务后开放。",
+      reason:
+        key === "globalKeywords"
+          ? "请先通过知识库智能体完成全部节点，并联系管理员开启品牌全域词库。"
+          : step.lockedReason || "当前步骤需要完成前置服务后开放。",
       nextAction: step.nextAction ?? portal.primaryNextAction,
     } satisfies ServiceCapability;
   }

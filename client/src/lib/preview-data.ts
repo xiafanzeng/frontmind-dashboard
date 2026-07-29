@@ -619,7 +619,7 @@ function previewWorkflow(
       lockedReason:
         status === "locked"
           ? currentStep === "knowledge"
-            ? "请先通过知识库智能体完成全部节点并发布知识库。"
+            ? "请先通过知识库智能体完成全部节点，并联系管理员开启品牌全域词库。"
             : currentStep === "response_logic"
               ? "请先在应答逻辑智能体逐题发布确认。"
               : "请先完成上一项服务。"

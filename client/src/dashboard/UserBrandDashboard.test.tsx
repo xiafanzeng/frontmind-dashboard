@@ -264,7 +264,9 @@ describe("UserBrandDashboard service experience", () => {
     render(<UserBrandDashboard preview />);
 
     fireEvent.click(screen.getByRole("button", { name: "内容资产运营" }));
-    expect(screen.getByText("剩余额度：1 次内容需求。")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "本周期剩余额度1次内容需求",
+    );
     fireEvent.click(screen.getByRole("button", { name: "选择品牌聚合榜单" }));
     expect(
       screen.getByRole("heading", { name: "提交内容需求工单" }),
@@ -288,8 +290,10 @@ describe("UserBrandDashboard service experience", () => {
       screen.getByRole("heading", { name: "AI 友好官网管理" }),
     ).toBeInTheDocument();
     expect(screen.getByText("官网开通进度")).toBeInTheDocument();
-    expect(screen.getAllByText("域名申请").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("ICP 备案与主体材料").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("域名申请与 ICP 备案材料").length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("ICP 备案与主体材料")).not.toBeInTheDocument();
     expect(screen.getAllByText("官网内容运营").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("heading", { name: "提交官网内容运营工单" }),
@@ -668,9 +672,17 @@ describe("UserBrandDashboard service experience", () => {
     ).not.toBeInTheDocument();
 
     fireEvent.click(renewLuxury);
+    const advisorHeading = await screen.findByRole("heading", {
+      name: "联系服务专员",
+    });
+    const advisorDialog = advisorHeading.closest('[role="dialog"]');
+    expect(advisorDialog).toHaveClass("z-[1210]", "bg-white", "shadow-2xl");
     expect(
-      await screen.findByRole("heading", { name: "联系服务专员" }),
-    ).toBeInTheDocument();
+      document.querySelector('[data-slot="dialog-overlay"]'),
+    ).toHaveClass("z-[1200]", "bg-black/35");
+    expect(
+      screen.queryByRole("heading", { name: "账号与服务" }),
+    ).not.toBeInTheDocument();
     expect(
       screen.getByRole("img", {
         name: "FrontMind 服务专员微信二维码",

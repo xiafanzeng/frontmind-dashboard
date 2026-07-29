@@ -257,7 +257,8 @@ describe("service portal adapter", () => {
     expect(getCapability(portal, "globalKeywords")).toMatchObject({
       allowed: false,
       effectiveStatus: "pending",
-      reason: "请先完成当前高级套餐的认证知识库发布。",
+      reason:
+        "请先通过知识库智能体完成全部节点，并联系管理员开启品牌全域词库。",
     });
     expect(getCapability(portal, "intentOptimization")).toMatchObject({
       allowed: false,

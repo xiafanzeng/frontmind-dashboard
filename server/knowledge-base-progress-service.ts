@@ -19,6 +19,7 @@ import {
   collectKnowledgeArchiveDescriptors,
   knowledgeArchiveDescriptorHash,
 } from "./knowledge-base-artifact";
+import { customerFormalContentViolation } from "./knowledge-customer-content";
 import {
   KnowledgeBaseProgressError,
   applyKnowledgeBaseProgressEnvelope,
@@ -140,6 +141,22 @@ export function extractFinalKnowledgeBaseAssistantText(
     .map(typedKnowledgeAssistantMessageText)
     .filter((message) => Boolean(message));
   return (messages[messages.length - 1] || "").slice(-4_000_000);
+}
+
+export function assertKnowledgeBaseCustomerOutput(output: unknown) {
+  const text = extractFinalKnowledgeBaseAssistantText(output);
+  const customerVisibleText = text.replace(
+    /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/gi,
+    "",
+  );
+  const violation = customerFormalContentViolation(customerVisibleText);
+  if (violation) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      `客户可见知识库回复包含核验过程、建议或内部推理：${violation}`,
+    );
+  }
+  return text;
 }
 
 function reconciliationHash(input: {
@@ -602,7 +619,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
 }) {
   const db = await requireDb();
   const conversationId = normalizeConversationId(input.conversationId);
-  const text = extractFinalKnowledgeBaseAssistantText(input.output);
+  const text = assertKnowledgeBaseCustomerOutput(input.output);
   const audit = modelOutputAudit(text);
   const outputLedger = {
     lastOutputLength: Math.max(

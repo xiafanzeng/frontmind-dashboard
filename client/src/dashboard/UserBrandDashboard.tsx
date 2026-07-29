@@ -164,7 +164,7 @@ const semanticSubpages = [
     id: "website-management",
     section: "semantic",
     label: "AI 友好官网管理",
-    desc: "按域名申请、ICP 备案和官网内容运营顺序提交工单。",
+    desc: "统一提交域名与 ICP 备案材料，审核后持续运营官网内容。",
   },
 ];
 
@@ -216,14 +216,12 @@ function getPreviewDeliveryWorkspace(
         : domainCompleted
           ? "not_started"
           : "locked",
-      canSubmitIcp: domainCompleted && !icpCompleted,
+      canSubmitIcp: !icpCompleted,
       canSubmitContent: icpCompleted,
       icpProvinceOptions: ["浙江省", "广东省"],
-      lockReason: !domainCompleted
-        ? "请先提交并完成域名申请。"
-        : !icpCompleted
-          ? "请先完成 ICP 备案与主体材料核验。"
-          : "",
+      lockReason: !icpCompleted
+        ? "请先统一提交并完成域名与 ICP 备案材料核验。"
+        : "",
       icpMaterialChecklist: [
         {
           key: "business_license",
@@ -296,33 +294,18 @@ function getPreviewDeliveryWorkspace(
           ]
         : []),
       {
-        id: "preview-domain-ticket",
+        id: "preview-domain-icp-ticket",
         type: "website_operation",
-        category: "domain_application",
-        title: "域名申请",
-        topic: "企业官网域名申请",
-        status: domainCompleted ? "completed" : "submitted",
-        publicSummary: domainCompleted ? "域名申请已完成。" : null,
+        category: "icp_filing",
+        title: "域名申请与 ICP 备案材料",
+        topic: "example.com",
+        status: icpCompleted ? "completed" : "submitted",
+        publicSummary: icpCompleted
+          ? "域名申请与 ICP 备案材料已统一核验完成。"
+          : null,
         revision: 1,
         submittedAt: "2026-07-22T10:00:00+08:00",
       },
-      ...(domainCompleted
-        ? [
-            {
-              id: "preview-icp-ticket",
-              type: "website_operation",
-              category: "icp_filing",
-              title: "ICP 备案与主体材料",
-              topic: "企业网站 ICP 备案",
-              status: icpCompleted ? "completed" : "submitted",
-              publicSummary: icpCompleted
-                ? "ICP 备案与主体材料核验已完成。"
-                : null,
-              revision: 1,
-              submittedAt: "2026-07-24T10:00:00+08:00",
-            },
-          ]
-        : []),
     ],
   };
 }
@@ -1272,6 +1255,7 @@ function UserBrandDashboardContent({
                 onOpenAccount={() => setAccountOpen(true)}
               />
               {!previewMode &&
+                managedPayload &&
                 getCapability(servicePortal, "contentAssets").allowed && (
                   <ManagedDashboardSection
                     payload={managedPayload}
@@ -1752,12 +1736,7 @@ export function ManagedDashboardSection({
     );
   }
   if (!payload) {
-    return (
-      <ManagedModuleEmpty
-        title="品牌资料"
-        description="管理员尚未发布企业资料。"
-      />
-    );
+    return null;
   }
 
   return (
@@ -2633,7 +2612,7 @@ function QuestionIntakePanelView({
           type="button"
           className="question-intake-submit"
           disabled={
-            !question.trim() ||
+            question.trim().length < 2 ||
             !quotaAvailable ||
             !selectionAccess.allowed ||
             submitting
@@ -2656,6 +2635,11 @@ function QuestionIntakePanelView({
         </button>
       </div>
 
+      {question.trim().length === 1 && (
+        <p className="question-intake-quota-note" role="status">
+          目标问题至少需要 2 个字符。
+        </p>
+      )}
       {!quotaAvailable && (
         <p className="question-intake-quota-note" role="status">
           当前类别额度已用满，请选择仍有额度的类别，或联系服务管理员调整当前服务问题。
@@ -3858,7 +3842,7 @@ function SemanticAssetSystem({
       <PageHeader
         eyebrow="MindPromise智诺 / AI 友好内容资产"
         title="内容资产运营"
-        desc="在 GEO 服务之外，可根据目的选择内容类型提交制作需求，由管理员审核后协调适合该话题的行业权威信源发布。"
+        desc="在 GEO 服务之外，可根据目的选择内容类型提交制作需求，由管理员审核后安排内容制作与发布。"
       />
 
       {requestsLocked ? (
@@ -3866,8 +3850,13 @@ function SemanticAssetSystem({
           {quota?.reason || "当前账号暂未开放内容资产运营。"}
         </p>
       ) : quota ? (
-        <p className="content-request-access-note">
-          剩余额度：{quota.remaining} 次内容需求。
+        <p
+          className="content-request-access-note content-request-quota"
+          role="status"
+        >
+          <span>本周期剩余额度</span>
+          <strong>{quota.remaining}</strong>
+          <span>次内容需求</span>
         </p>
       ) : null}
 

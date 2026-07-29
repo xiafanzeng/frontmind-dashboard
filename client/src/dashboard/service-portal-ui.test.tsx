@@ -123,7 +123,7 @@ describe("service workflow UI gates", () => {
     expect(
       screen.getByText("请先完成服务端记录的问题优化。"),
     ).toBeInTheDocument();
-    expect(screen.getByText("待前置")).toBeInTheDocument();
+    expect(screen.getByText("待解锁")).toBeInTheDocument();
     expect(screen.queryByText("已购问题优化")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "查看原因" }));

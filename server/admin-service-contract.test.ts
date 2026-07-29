@@ -59,7 +59,7 @@ describe("admin service contract input", () => {
   });
 
   it.each(["active", "scheduled"] as const)(
-    "rejects %s activation before signing evidence is complete",
+    "rejects %s activation before the signatory and signing time are complete",
     async (status) => {
       const caller = adminRouter.createCaller(systemAdminContext());
       await expect(
@@ -72,8 +72,22 @@ describe("admin service contract input", () => {
         }),
       ).rejects.toMatchObject({
         code: "BAD_REQUEST",
-        message: "生效或待生效合同必须包含签署主体、签署时间与核验依据",
+        message: "生效或待生效合同必须包含签署主体与签署时间",
       });
     },
   );
+
+  it("allows activation without a separate signing or payment evidence field", () => {
+    expect(
+      adminUpdateServiceSchema.safeParse({
+        userId: 7,
+        expectedRevision: 1,
+        planCode: "advanced",
+        status: "active",
+        prepaidMonths: 3,
+        signedAt: Date.now(),
+        signatoryId: "enterprise-legal-entity",
+      }).success,
+    ).toBe(true);
+  });
 });

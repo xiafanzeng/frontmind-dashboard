@@ -71,6 +71,7 @@ import {
   knowledgeArchiveFileIdFromUrl,
   type KnowledgeArchiveDescriptor,
 } from "./knowledge-base-artifact";
+import { customerFormalContentViolation } from "./knowledge-customer-content";
 import { assertKnowledgeBasePublishable } from "./knowledge-base-progress-service";
 import {
   assertServiceCapability,
@@ -264,6 +265,18 @@ const packageImageSelectionStatusSchema = z.enum([
   "source_limited",
   "budget_limited",
 ]);
+const packageAssetTypeSchema = z.enum([
+  "brand_identity",
+  "product_ui",
+  "product_diagram",
+  "case_photo",
+  "team_photo",
+  "environment_photo",
+  "certificate_badge",
+  "document_figure",
+  "other",
+]);
+const packageAssetDisplayRoleSchema = z.enum(["hero", "inline", "badge"]);
 const requiredImageDiscoveryMethods = new Set([
   "img",
   "srcset",
@@ -362,6 +375,8 @@ const websiteV2PackageManifestSchema = z
             sourcePageUrl: packageSourceUrlSchema,
             sourceAssetUrl: packageSourceUrlSchema.optional(),
             ownership: packageAssetOwnershipSchema,
+            assetType: packageAssetTypeSchema,
+            displayRole: packageAssetDisplayRoleSchema,
           })
           .strict(),
       )
@@ -403,7 +418,7 @@ const websiteV2PackageManifestSchema = z
         inspectedCandidateImages: z.number().int().nonnegative(),
         eligibleFirstPartyImages: z.number().int().nonnegative().max(48),
         rejectedCandidateImages: z.number().int().nonnegative(),
-        scannedSourcePages: z.number().int().positive(),
+        scannedSourcePages: z.number().int().nonnegative(),
         discoveryMethods: z
           .array(websiteV2ImageDiscoveryMethodSchema)
           .length(7),
@@ -532,13 +547,13 @@ const websiteV2PackageManifestSchema = z
     const status = value.imageSelection.status;
     const invalidStatus =
       (status === "target_met" &&
-        (eligible.length < 36 ||
-          uninspected.length > 0 ||
-          value.imageSelection.shortfallReason !== undefined)) ||
+        (uninspected.length > 0 ||
+          value.imageSelection.shortfallReason !== undefined ||
+          !value.assets.some(
+            (asset) => asset.assetType === "brand_identity",
+          ))) ||
       (status === "source_limited" &&
-        (eligible.length >= 36 ||
-          uninspected.length > 0 ||
-          !value.imageSelection.shortfallReason)) ||
+        (uninspected.length > 0 || !value.imageSelection.shortfallReason)) ||
       (status === "budget_limited" &&
         (uninspected.length === 0 || !value.imageSelection.shortfallReason));
     if (invalidStatus) {
@@ -546,7 +561,7 @@ const websiteV2PackageManifestSchema = z
         code: "custom",
         path: ["imageSelection", "status"],
         message:
-          "website v2 image-selection status does not match its candidate ledger",
+          "website v2 image-selection status does not match coverage-first rules",
       });
     }
   });
@@ -621,6 +636,8 @@ const internalPackageManifestSchema = z
             sourcePageUrl: packageSourceUrlSchema.optional(),
             sourceAssetUrl: packageSourceUrlSchema.optional(),
             ownership: packageAssetOwnershipSchema,
+            assetType: packageAssetTypeSchema.optional(),
+            displayRole: packageAssetDisplayRoleSchema.optional(),
           })
           .strict(),
       )
@@ -700,6 +717,21 @@ const internalPackageManifestSchema = z
           )
           .max(500)
           .optional(),
+        candidates: z
+          .array(
+            z
+              .object({
+                url: packageSourceUrlSchema,
+                sourcePageUrl: packageSourceUrlSchema,
+                method: z.string().trim().min(1).max(100),
+                status: z.enum(["eligible", "rejected", "uninspected"]),
+                assetId: z.string().trim().min(1).max(191).optional(),
+                rejectionReason: z.string().trim().min(1).max(500).optional(),
+              })
+              .strict(),
+          )
+          .max(1_800)
+          .optional(),
         shortfallReason: z.string().trim().min(1).max(2_000).optional(),
       })
       .strict(),
@@ -759,6 +791,7 @@ const internalPackageManifestSchema = z
         "rejectionReasons",
         "stopReason",
         "productFamilyCoverage",
+        "candidates",
       ] as const) {
         if (selection[key] === undefined) {
           context.addIssue({
@@ -800,13 +833,15 @@ const internalPackageManifestSchema = z
           if (
             asset.path.length > 512 ||
             (asset.sourcePageUrl?.length || 0) > 4_000 ||
-            (asset.sourceAssetUrl?.length || 0) > 4_000
+            (asset.sourceAssetUrl?.length || 0) > 4_000 ||
+            asset.assetType === undefined ||
+            asset.displayRole === undefined
           ) {
             context.addIssue({
               code: "custom",
               path: ["assets", index],
               message:
-                "dashboard enterprise v2 keeps 512-character paths and 4,000-character source URLs",
+                "dashboard enterprise v2 requires image roles, 512-character paths and 4,000-character source URLs",
             });
           }
         });
@@ -990,6 +1025,10 @@ const packageManifestSchema = z.preprocess((input) => {
           gapReason: family.gapReason,
         }),
       ),
+      candidates: value.imageSelection.candidates.map((candidate) => ({
+        ...candidate,
+        method: candidate.method,
+      })),
       shortfallReason: value.imageSelection.shortfallReason,
     },
   };
@@ -1525,6 +1564,8 @@ function markedFormalContent(content: string) {
   return content.slice(start + startMarker.length, end);
 }
 
+export { customerFormalContentViolation } from "./knowledge-customer-content";
+
 function profileFormalKnowledgeText(
   content: string,
   profile: Exclude<KnowledgeBaseValidationProfile, "historical">,
@@ -1898,6 +1939,35 @@ function validateProfilePackage(input: {
         `打包图片必须是第一方素材：${relativePath}`,
       );
     }
+    if (manifest.schemaVersion === 2) {
+      const isBadgeType = ["brand_identity", "certificate_badge"].includes(
+        metadata.assetType || "",
+      );
+      if (
+        !metadata.assetType ||
+        !metadata.displayRole ||
+        (metadata.displayRole === "badge" && !isBadgeType) ||
+        (metadata.assetType === "certificate_badge" &&
+          metadata.displayRole !== "badge")
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `图片缺少有效的 assetType/displayRole：${relativePath}`,
+        );
+      }
+      const meetsMinimum =
+        metadata.displayRole === "hero"
+          ? asset.width >= 1_200 && asset.height >= 600
+          : metadata.displayRole === "badge"
+            ? asset.width >= 256 && asset.height >= 256
+            : asset.width >= 800 && asset.height >= 450;
+      if (!meetsMinimum) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `图片未达到 ${metadata.displayRole} 质量门槛：${relativePath}`,
+        );
+      }
+    }
     imageBytes += asset.size;
     return {
       ...asset,
@@ -1911,6 +1981,8 @@ function validateProfilePackage(input: {
       sourcePageUrl: metadata.sourcePageUrl,
       sourceAssetUrl: metadata.sourceAssetUrl,
       ownership: metadata.ownership,
+      assetType: metadata.assetType,
+      displayRole: metadata.displayRole,
     } satisfies KnowledgeAsset;
   });
   if (enrichedAssets.length > limits.images) {
@@ -2009,6 +2081,7 @@ function validateProfilePackage(input: {
     const discovered = selection.discoveredCandidateImages!;
     const inspected = selection.inspectedCandidateImages!;
     const rejected = selection.rejectedCandidateImages!;
+    const candidates = selection.candidates || [];
     const methods = new Set(selection.discoveryMethods || []);
     const rejectionTotal = (selection.rejectionReasons || []).reduce(
       (sum, reason) => sum + reason.count,
@@ -2022,6 +2095,59 @@ function validateProfilePackage(input: {
       throw new KnowledgeArchiveValidationError(
         "media",
         "图片发现、检查、合格和拒绝候选数不满足可审计算术关系",
+      );
+    }
+    const eligibleCandidates = candidates.filter(
+      (candidate) => candidate.status === "eligible",
+    );
+    const rejectedCandidates = candidates.filter(
+      (candidate) => candidate.status === "rejected",
+    );
+    const uninspectedCandidates = candidates.filter(
+      (candidate) => candidate.status === "uninspected",
+    );
+    const enrichedAssetsById = new Map(
+      enrichedAssets.flatMap((asset) => (asset.id ? [[asset.id, asset]] : [])),
+    );
+    if (
+      candidates.length !== discovered ||
+      new Set(candidates.map((candidate) => candidate.url)).size !==
+        candidates.length ||
+      eligibleCandidates.length !== selection.eligibleFirstPartyImages ||
+      rejectedCandidates.length !== rejected ||
+      eligibleCandidates.length + rejectedCandidates.length !== inspected ||
+      inspected + uninspectedCandidates.length !== discovered ||
+      eligibleCandidates.some((candidate) => {
+        const asset = candidate.assetId
+          ? enrichedAssetsById.get(candidate.assetId)
+          : undefined;
+        return (
+          !asset ||
+          candidate.rejectionReason !== undefined ||
+          asset.sourceAssetUrl !== candidate.url ||
+          asset.sourcePageUrl !== candidate.sourcePageUrl
+        );
+      }) ||
+      rejectedCandidates.some(
+        (candidate) =>
+          candidate.assetId !== undefined || !candidate.rejectionReason,
+      ) ||
+      uninspectedCandidates.some(
+        (candidate) =>
+          candidate.assetId !== undefined ||
+          candidate.rejectionReason !== undefined,
+      ) ||
+      enrichedAssets.some(
+        (asset) =>
+          !asset.id ||
+          !eligibleCandidates.some(
+            (candidate) => candidate.assetId === asset.id,
+          ),
+      )
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "图片候选逐项台账与发现、检查、打包结果不一致",
       );
     }
     if (
@@ -2041,24 +2167,29 @@ function validateProfilePackage(input: {
         "图片发现台账与完整度统计或实际打包数量不一致",
       );
     }
+    if (
+      completeness.acquisition.officialPages?.completed === undefined ||
+      selection.scannedSourcePages !==
+        completeness.acquisition.officialPages.completed
+    ) {
+      throw new KnowledgeArchiveValidationError(
+        "media",
+        "图片扫描页数必须覆盖所有成功解析的官网页面",
+      );
+    }
     if (selection.status === "target_met") {
       if (
-        selection.eligibleFirstPartyImages < limits.targetImages ||
-        enrichedAssets.length < limits.targetImages ||
-        selection.shortfallReason
+        uninspectedCandidates.length > 0 ||
+        selection.shortfallReason ||
+        !enrichedAssets.some((asset) => asset.assetType === "brand_identity")
       ) {
         throw new KnowledgeArchiveValidationError(
           "media",
-          `target_met 必须至少发现并打包 ${limits.targetImages} 张合格图片`,
+          "target_met 必须完成候选检查、包含品牌视觉且不存在覆盖缺口",
         );
       }
     } else {
       if (
-        (selection.eligibleFirstPartyImages >= limits.targetImages &&
-          !(
-            input.profile === "website-lead-v1" &&
-            selection.status === "budget_limited"
-          )) ||
         enrichedAssets.length !== selection.eligibleFirstPartyImages ||
         !selection.shortfallReason
       ) {
@@ -2151,6 +2282,13 @@ function validateProfilePackage(input: {
     for (const family of selection.productFamilyCoverage || []) {
       if (
         family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) ||
+        (family.officialImageAvailable &&
+          family.assetIds.some((assetId) => {
+            const asset = enrichedAssetsById.get(assetId);
+            return !["product_ui", "product_diagram", "case_photo"].includes(
+              asset?.assetType || "",
+            );
+          })) ||
         (family.officialImageAvailable && family.assetIds.length === 0) ||
         (!family.officialImageAvailable && !family.gapReason) ||
         (input.profile === "dashboard-enterprise-v1" &&
@@ -2164,9 +2302,8 @@ function validateProfilePackage(input: {
     }
   }
   if (
-    manifest.imageSelection.eligibleFirstPartyImages >= limits.targetImages &&
     enrichedAssets.length >
-      Math.min(manifest.imageSelection.eligibleFirstPartyImages, limits.images)
+    Math.min(manifest.imageSelection.eligibleFirstPartyImages, limits.images)
   ) {
     throw new KnowledgeArchiveValidationError(
       "media",
@@ -2579,6 +2716,13 @@ function validateProfilePackage(input: {
       throw new KnowledgeArchiveValidationError(
         "content",
         `正式正文包含原始快照或页面摘录表述：${document.path}`,
+      );
+    }
+    const formalViolation = customerFormalContentViolation(formal);
+    if (formalViolation) {
+      throw new KnowledgeArchiveValidationError(
+        "content",
+        `正式正文包含客户不可见的核验过程、建议或内部推理（${formalViolation}）：${document.path}`,
       );
     }
     if (
@@ -5698,8 +5842,8 @@ export function assertKnowledgeArchiveEnterpriseIdentity(input: {
   documents: KnowledgeDocument[];
 }) {
   const brandName = normalizedEnterpriseEvidence(input.brandName);
-  if (!input.enterpriseIdentityConfirmed || !brandName) {
-    throw new Error("请先由管理员配置并发布当前账号的企业名称");
+  if (!brandName) {
+    throw new Error("请先由管理员配置当前账号的企业名称");
   }
   const identityDocuments = input.documents.filter((document) => {
     const basename = path.posix.basename(document.path).toLowerCase();

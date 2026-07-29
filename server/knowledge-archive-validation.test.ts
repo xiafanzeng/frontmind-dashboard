@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 
 import JSZip from "jszip";
+import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
   KnowledgeArchiveValidationError,
+  customerFormalContentViolation,
   readKnowledgeArchive,
   removeStoredKnowledgeAssets,
 } from "./dashboard-api";
@@ -289,6 +291,16 @@ async function websiteV2Archive(
     ["10_reference_assets/reference_asset_inventory.md", "# 第三方素材索引"],
   ] as const;
   const documents: Array<Record<string, unknown>> = [];
+  const validInlinePng = await sharp({
+    create: {
+      width: 800,
+      height: 450,
+      channels: 3,
+      background: "#315ad8",
+    },
+  })
+    .png()
+    .toBuffer();
   let evidenceCharacters = 0;
   for (const [relativePath, content] of supportingDocuments) {
     zip.file(`${root}/${relativePath}`, content);
@@ -435,7 +447,7 @@ async function websiteV2Archive(
   const assets = Array.from({ length: imageCount }, (_, index) => {
     const assetId = `asset-${index + 1}`;
     const assetPath = `09_media_assets/product_images/${assetId}.png`;
-    const assetBytes = Buffer.concat([pngBytes, Buffer.from([index])]);
+    const assetBytes = Buffer.concat([validInlinePng, Buffer.from([index])]);
     zip.file(`${root}/${assetPath}`, assetBytes);
     return {
       id: assetId,
@@ -443,21 +455,23 @@ async function websiteV2Archive(
       sha256: createHash("sha256").update(assetBytes).digest("hex"),
       mimeType: "image/png",
       bytes: assetBytes.length,
-      width: 1,
-      height: 1,
+      width: 800,
+      height: 450,
       caption: "核心产品官方图片",
       branchId: "03_products",
       documentIds: ["overview-3"],
       sourcePageUrl: "https://example.com/products",
       sourceAssetUrl: `https://example.com/assets/${assetId}.png`,
       ownership: "first_party",
+      assetType: index === 0 ? "brand_identity" : "product_ui",
+      displayRole: "inline",
     };
   });
   const imageSelectionStatus =
     options.imageStatus ??
     (uninspectedCandidateCount > 0
       ? "budget_limited"
-      : assets.length >= 36
+      : assets.length > 1
         ? "target_met"
         : "source_limited");
   zip.file(
@@ -473,7 +487,7 @@ async function websiteV2Archive(
         notApplicable: 0,
       },
       acquisition: {
-        officialPages: { completed: 0, total: 0 },
+        officialPages: { completed: 1, total: 1 },
         images: {
           completed: imageCount,
           total: imageCount + uninspectedCandidateCount,
@@ -550,10 +564,10 @@ async function websiteV2Archive(
           {
             id: "family-products",
             name: "核心产品族",
-            officialVisualFound: assets.length > 0,
+            officialVisualFound: assets.length > 1,
             checkedSources: 1,
-            assetIds: assets.map((asset) => asset.id),
-            ...(assets.length === 0
+            assetIds: assets.slice(1).map((asset) => asset.id),
+            ...(assets.length <= 1
               ? { gapReason: "官方来源未提供可交付图片" }
               : {}),
           },
@@ -713,7 +727,7 @@ ${narrative}
         inspectedCandidateImages: 0,
         eligibleFirstPartyImages: 0,
         rejectedCandidateImages: 0,
-        scannedSourcePages: 1,
+        scannedSourcePages: 0,
         discoveryMethods: [
           "img",
           "srcset",
@@ -724,6 +738,7 @@ ${narrative}
           "gallery",
           "official_document",
         ],
+        candidates: [],
         rejectionReasons: [],
         stopReason: "已检查所有官方页面和资料",
         productFamilyCoverage: [
@@ -755,6 +770,81 @@ async function parseWebsiteArchive(buffer: Buffer) {
 }
 
 describe("versioned knowledge archive quality gates", () => {
+  it.each([
+    [
+      "其余荣誉图片因本轮没有形成可逐项核验的证书名称与有效期，不在正文中扩写。采购或合规审查仍应向企业索取证书编号，不能仅凭网页图标替代正式查验。",
+      "任务或采集过程",
+    ],
+    [
+      "这些内容属于企业自我定义，适合说明组织意图与品牌取向，不宜直接转换为已经量化达成的社会影响。对客户而言，可将其落实为开放模型生态。",
+      "客户或采购建议",
+    ],
+  ] as const)("detects customer-facing semantic leakage", (text, label) => {
+    expect(customerFormalContentViolation(text)).toBe(label);
+  });
+
+  it("allows neutral negative facts and audit language outside the formal block", async () => {
+    expect(
+      customerFormalContentViolation(
+        "2025 年毛利率为 -24.0%，公司当期仍处于亏损状态。",
+      ),
+    ).toBeUndefined();
+
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const completeness = JSON.parse(
+      await zip.file(`${root}/00_completeness.json`)!.async("string"),
+    );
+    completeness.gaps = [
+      "本轮没有形成可逐项核验的证书名称与有效期，待企业补充。",
+    ];
+    zip.file(`${root}/00_completeness.json`, JSON.stringify(completeness));
+
+    const result = await readKnowledgeArchive(
+      Buffer.from(await zip.generateAsync({ type: "uint8array" })),
+      "内部缺口允许核验措辞.zip",
+      "deep-internal-gap-test",
+      { validationProfile: "dashboard-enterprise-v1" },
+    );
+    storedKeys.push(...result.storedAssetKeys);
+    expect(result.documents).toHaveLength(50);
+  });
+
+  it("rejects audit language inside dashboard customer formal content", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
+    const narrative = "本轮没有形成可逐项核验的证书名称与有效期".padEnd(
+      80,
+      "甲",
+    );
+    zip.file(
+      `${root}/branches/products/leaf-1.md`,
+      `# 知识叶子 1
+
+<!-- FRONTMIND_FORMAL_CONTENT_START -->
+
+## 正式正文
+
+${narrative}
+
+<!-- FRONTMIND_FORMAL_CONTENT_END -->
+
+## 证据与核验
+
+证据区不应进入客户可见正文。
+`,
+    );
+
+    await expect(
+      readKnowledgeArchive(
+        Buffer.from(await zip.generateAsync({ type: "uint8array" })),
+        "客户正文泄漏.zip",
+        "deep-leakage-test",
+        { validationProfile: "dashboard-enterprise-v1" },
+      ),
+    ).rejects.toThrow(/客户不可见的核验过程、建议或内部推理/i);
+  });
+
   it("accepts a deep v2 archive and stores only the marked formal prose", async () => {
     const result = await readKnowledgeArchive(
       await dashboardEnterpriseArchive(),
@@ -1112,24 +1202,97 @@ describe("versioned knowledge archive quality gates", () => {
     storedKeys.push(...result.storedAssetKeys);
 
     expect(result.assets).toHaveLength(1);
+    expect(result.assets[0]).toMatchObject({
+      assetType: "brand_identity",
+      displayRole: "inline",
+      width: 800,
+      height: 450,
+    });
     expect(
       result.documents.filter((document) => document.kind === "leaf"),
     ).toHaveLength(40);
   });
 
+  it("rejects Website v2 when image scanning omits a parsed official page", async () => {
+    const zip = await JSZip.loadAsync(
+      await websiteV2Archive({ imageCount: 1 }),
+    );
+    const root = "示例企业V2_knowledge_base";
+    const manifestPath = `${root}/00_package_manifest.json`;
+    const manifest = JSON.parse(await zip.file(manifestPath)!.async("string"));
+    manifest.imageSelection.scannedSourcePages = 0;
+    zip.file(manifestPath, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "示例企业V2知识库.zip",
+        "website-v2-scan-coverage",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("图片扫描页数必须覆盖所有成功解析的官网页面");
+  });
+
+  it("enforces Website v2 image roles, dimensions and product visual types", async () => {
+    const heroZip = await JSZip.loadAsync(
+      await websiteV2Archive({ imageCount: 2 }),
+    );
+    const root = "示例企业V2_knowledge_base";
+    const manifestPath = `${root}/00_package_manifest.json`;
+    const heroManifest = JSON.parse(
+      await heroZip.file(manifestPath)!.async("string"),
+    );
+    heroManifest.assets[0].displayRole = "hero";
+    heroZip.file(manifestPath, JSON.stringify(heroManifest));
+    await expect(
+      readKnowledgeArchive(
+        await heroZip.generateAsync({ type: "nodebuffer" }),
+        "示例企业V2知识库.zip",
+        "website-v2-small-hero",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("hero 质量门槛");
+
+    const badgeZip = await JSZip.loadAsync(
+      await websiteV2Archive({ imageCount: 2 }),
+    );
+    const badgeManifest = JSON.parse(
+      await badgeZip.file(manifestPath)!.async("string"),
+    );
+    badgeManifest.assets[0].displayRole = "badge";
+    badgeManifest.imageSelection.productFamilies[0].assetIds = ["asset-1"];
+    badgeZip.file(manifestPath, JSON.stringify(badgeManifest));
+    await expect(
+      readKnowledgeArchive(
+        await badgeZip.generateAsync({ type: "nodebuffer" }),
+        "示例企业V2知识库.zip",
+        "website-v2-brand-not-product",
+        {
+          validationProfile: "website-lead-v1",
+          archiveContractVersion: 2,
+        },
+      ),
+    ).rejects.toThrow("产品族图片覆盖记录不完整");
+  });
+
   it.each([
     {
-      label: "target_met with every eligible asset packaged",
+      label: "target_met with brand and product coverage at a low honest count",
       options: {
-        imageCount: 36 as const,
+        imageCount: 2 as const,
         uninspectedCandidateCount: 0 as const,
       },
     },
     {
-      label:
-        "budget_limited with 36 eligible assets and an uninspected candidate",
+      label: "budget_limited with eligible assets and an uninspected candidate",
       options: {
-        imageCount: 36 as const,
+        imageCount: 2 as const,
         uninspectedCandidateCount: 1 as const,
       },
     },
@@ -1144,14 +1307,14 @@ describe("versioned knowledge archive quality gates", () => {
       },
     );
     storedKeys.push(...result.storedAssetKeys);
-    expect(result.assets).toHaveLength(36);
+    expect(result.assets).toHaveLength(options.imageCount);
   });
 
   it("rejects target_met when an uninspected Website v2 candidate remains", async () => {
     await expect(
       readKnowledgeArchive(
         await websiteV2Archive({
-          imageCount: 36,
+          imageCount: 2,
           imageStatus: "target_met",
           uninspectedCandidateCount: 1,
         }),

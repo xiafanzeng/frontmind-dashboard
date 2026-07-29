@@ -74,6 +74,68 @@ describe("KnowledgeBaseViewer", () => {
     expect(screen.queryByText("待关联图片资产")).toBeNull();
   });
 
+  it("sorts image roles and renders badges separately without cropping diagrams", () => {
+    render(
+      <KnowledgeBaseViewer
+        snapshot={{
+          ...snapshot,
+          assets: [
+            {
+              key: "badge",
+              path: "images/certificate.png",
+              mimeType: "image/png",
+              size: 1_024,
+              url: "/badge",
+              alt: "认证徽章",
+              assetType: "certificate_badge",
+              displayRole: "badge",
+            },
+            {
+              key: "inline",
+              path: "images/asset-b.png",
+              mimeType: "image/png",
+              size: 2_048,
+              url: "/inline",
+              alt: "产品界面",
+              assetType: "product_ui",
+              displayRole: "inline",
+            },
+            {
+              key: "hero",
+              path: "images/brand-hero.jpg",
+              mimeType: "image/jpeg",
+              size: 3_072,
+              url: "/hero",
+              alt: "品牌主视觉",
+              assetType: "case_photo",
+              displayRole: "hero",
+            },
+          ],
+          imageCount: 3,
+        }}
+      />,
+    );
+
+    const relatedSection = screen.getByRole("region", { name: "相关图片" });
+    const images = within(relatedSection).getAllByRole("img");
+    expect(images.map((image) => image.getAttribute("alt"))).toEqual([
+      "品牌主视觉",
+      "产品界面",
+      "认证徽章",
+    ]);
+    expect(screen.getByLabelText("相关图片配图徽章")).toBeTruthy();
+    expect(screen.getByRole("img", { name: "品牌主视觉" })).toHaveClass(
+      "object-cover",
+    );
+    expect(screen.getByRole("img", { name: "产品界面" })).toHaveClass(
+      "object-contain",
+    );
+    expect(screen.getByRole("img", { name: "认证徽章" })).toHaveClass(
+      "object-contain",
+      "aspect-square",
+    );
+  });
+
   it("uses image metadata to place an asset beside its matching section", () => {
     render(<KnowledgeBaseViewer snapshot={snapshot} />);
 

@@ -1109,7 +1109,6 @@ function PreviewServiceManager({
               </select>
             </label>
             <Input aria-label="签署主体" placeholder="企业名 / 签署主体" />
-            <Input aria-label="签署核验依据" placeholder="签署核验依据" />
           </div>
         )}
         <div className="mt-5 rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">

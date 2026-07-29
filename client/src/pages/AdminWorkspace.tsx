@@ -337,7 +337,6 @@ export default function AdminWorkspace({
   );
   const [serviceSignedAt, setServiceSignedAt] = useState("");
   const [serviceSignatory, setServiceSignatory] = useState("");
-  const [serviceEvidenceNote, setServiceEvidenceNote] = useState("");
   const [customerApiKey, setCustomerApiKey] = useState("");
   const [carryQuestionIds, setCarryQuestionIds] = useState<string[]>([]);
   const [uploading, setUploading] = useState<"knowledge" | null>(null);
@@ -521,7 +520,6 @@ export default function AdminWorkspace({
     );
     setServiceSignedAt(toDateTimeLocal(currentPurchase?.signedAt));
     setServiceSignatory(currentPurchase?.signatoryId ?? "");
-    setServiceEvidenceNote("");
     const activeBasicIds =
       service?.planCode === "basic"
         ? (serviceQuery.data?.purchases ?? [])
@@ -1009,26 +1007,6 @@ export default function AdminWorkspace({
                             }
                           />
                         </label>
-                        <label className="text-xs font-semibold text-[#716a80] lg:col-span-2">
-                          新增签署或收款核验依据
-                          <Input
-                            className="mt-2"
-                            value={serviceEvidenceNote}
-                            placeholder={
-                              (serviceQuery.data?.purchases ?? []).find(
-                                (purchase: any) =>
-                                  purchase.id ===
-                                  serviceQuery.data?.service?.contractId,
-                              )?.hasSigningEvidence
-                                ? "已有核验依据；仅在补充或更正时填写"
-                                : "例如：已核对盖章合同与银行回单（至少 8 个字）"
-                            }
-                            onChange={(event) =>
-                              setServiceEvidenceNote(event.target.value)
-                            }
-                          />
-                        </label>
-
                         {servicePlan !== "knowledge" &&
                           (questionPortfolioQuery.data?.questions ?? []).some(
                             (question: any) => question.status === "selected",
@@ -1091,28 +1069,14 @@ export default function AdminWorkspace({
                               const isCommerciallyActive =
                                 serviceStatus === "active" ||
                                 serviceStatus === "scheduled";
-                              const currentPurchase = (
-                                serviceQuery.data?.purchases ?? []
-                              ).find(
-                                (purchase: any) =>
-                                  purchase.id ===
-                                  serviceQuery.data?.service?.contractId,
-                              );
-                              const hasExistingEvidence = Boolean(
-                                currentPurchase?.signedAt &&
-                                  currentPurchase?.signatoryId &&
-                                  currentPurchase?.hasSigningEvidence,
-                              );
                               if (
                                 isCommerciallyActive &&
                                 (!serviceSignatory.trim() ||
-                                  !serviceSignedAt ||
-                                  (!hasExistingEvidence &&
-                                    serviceEvidenceNote.trim().length < 8))
+                                  !serviceSignedAt)
                               ) {
-                                toast.error("请补全商业与签署依据", {
+                                toast.error("请补全签署信息", {
                                   description:
-                                    "生效或待生效合同必须填写真实签署时间与签署主体；首次确认还需不少于 8 个字的核验依据。",
+                                    "生效或待生效合同必须填写真实签署时间与签署主体。",
                                 });
                                 return;
                               }
@@ -1164,18 +1128,6 @@ export default function AdminWorkspace({
                                     : undefined,
                                   signatoryId:
                                     serviceSignatory.trim() || undefined,
-                                  signingEvidence: serviceEvidenceNote.trim()
-                                    ? {
-                                        kind: "system_admin_manual_confirmation",
-                                        note: serviceEvidenceNote.trim(),
-                                        confirmedAt: serviceSignedAt
-                                          ? new Date(
-                                              serviceSignedAt,
-                                            ).toISOString()
-                                          : undefined,
-                                        confirmedByUserId: user?.id,
-                                      }
-                                    : undefined,
                                   sourceContractIds,
                                   carryQuestionIds: carryQuestionIds.filter(
                                     (id) => allowedCarryIds.has(id),

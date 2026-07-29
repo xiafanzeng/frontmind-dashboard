@@ -33,6 +33,7 @@ tmp/pdfs/geo_report_review/
 *.api-response.*
 *.response-dump.*
 /*.har
+/artifacts/
 /.secrets/
 *.pem
 *.key

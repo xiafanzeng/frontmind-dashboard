@@ -126,7 +126,9 @@ Use this exact top-level contract. Extra fields are forbidden:
       "documentIds": ["overview-products", "leaf-product-family-a"],
       "sourcePageUrl": "https://official.example/products/a",
       "sourceAssetUrl": "https://official.example/media/a.webp",
-      "ownership": "first_party"
+      "ownership": "first_party",
+      "assetType": "product_ui",
+      "displayRole": "hero"
     }
   ],
   "counts": {
@@ -164,6 +166,15 @@ Use this exact top-level contract. Extra fields are forbidden:
         "officialImageAvailable": true,
         "assetIds": ["asset-product-family-a"],
         "checkedSources": ["https://official.example/products/a"]
+      }
+    ],
+    "candidates": [
+      {
+        "url": "https://official.example/media/a.webp",
+        "sourcePageUrl": "https://official.example/products/a",
+        "method": "img",
+        "status": "eligible",
+        "assetId": "asset-product-family-a"
       }
     ]
   }
@@ -220,14 +231,14 @@ their branches. At least one family is required. If one leaf in a branch has
 `productFamilyId`, every leaf in that branch must declare it. The distinct leaf
 family IDs and `productFamilyCoverage` IDs must match exactly.
 
-If at least 360 eligible first-party images exist, use `target_met` and
-package 360–480 images. If fewer exist, package every eligible useful image
-and use `source_limited` after inspecting every discovered candidate, or
-`budget_limited` when a declared time/acquisition ceiling prevented full
-inspection. Both limited statuses require a non-empty `shortfallReason` and
-`stopReason`. A measured eligible count of zero is valid only when no suitable
-first-party image exists, the ZIP contains zero images, and the complete
-funnel explains why. Never reduce a counter to make a shortfall pass.
+List every discovered candidate with URL, source page, actual method and
+`eligible`, `rejected`, or `uninspected` status. Use `target_met` only when all
+candidates were inspected, brand imagery is packaged and required
+product-family coverage is complete. Use `source_limited` after inspecting
+every candidate when a concrete coverage gap remains, or `budget_limited` when
+real candidates remain uninspected. Both limited statuses require a non-empty
+`shortfallReason` and `stopReason`. Package every eligible useful image up to
+the 480-image ceiling. Never reduce a counter to make a shortfall pass.
 
 The manifest counts must match the actual ZIP:
 
@@ -254,6 +265,12 @@ use or target attainment.
 - Ownership must be exactly `first_party`.
 - Every asset must belong to a branch and at least one customer-visible
   document.
+- Every v2 asset declares `assetType` and `displayRole`. `hero` images are at
+  least 1200×600, `badge` images at least 256×256, and other `inline` images at
+  least 800×450. Product-family coverage uses only `product_ui`,
+  `product_diagram`, or `case_photo`.
+- `imageSelection.scannedSourcePages` must equal successfully parsed official
+  pages.
 
 ## Required reports
 
@@ -263,7 +280,7 @@ and bytes, document parsing, upload processing, and budget stops.
 
 The public-web report records every query, language, result domain,
 selected/rejected source, conflict, and unresolved gap. The media-gap report
-explains image shortfall when fewer than 360 eligible assets exist.
+explains any brand, product-family or inspection coverage gap.
 
 ## `00_completeness.json`
 

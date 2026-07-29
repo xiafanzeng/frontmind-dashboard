@@ -564,7 +564,13 @@ export const dashboardMonitoringCurrentTemplateSchema =
             if (sourceIds.has(record.sourceRecordId)) {
               context.addIssue({
                 code: z.ZodIssueCode.custom,
-                path: ["batches", batchIndex, field, recordIndex, "sourceRecordId"],
+                path: [
+                  "batches",
+                  batchIndex,
+                  field,
+                  recordIndex,
+                  "sourceRecordId",
+                ],
                 message: "同一批次的记录 ID 不能重复",
               });
             }
@@ -760,6 +766,17 @@ export type KnowledgeAsset = {
   sourcePageUrl?: string;
   sourceAssetUrl?: string;
   ownership?: "first_party" | "third_party" | "unknown";
+  assetType?:
+    | "brand_identity"
+    | "product_ui"
+    | "product_diagram"
+    | "case_photo"
+    | "team_photo"
+    | "environment_photo"
+    | "certificate_badge"
+    | "document_figure"
+    | "other";
+  displayRole?: "hero" | "inline" | "badge";
 };
 
 export function createDefaultDashboardPayload(

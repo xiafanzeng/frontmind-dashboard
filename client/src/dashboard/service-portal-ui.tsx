@@ -226,7 +226,7 @@ function WorkflowStatusPill({ step }: { step: ServiceWorkflowStep }) {
   return (
     <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-700">
       <Clock3 className="h-3.5 w-3.5" />
-      待前置
+      待解锁
     </span>
   );
 }
@@ -1056,7 +1056,10 @@ function SalesAdvisorDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[min(calc(100vw-1rem),460px)] overflow-hidden p-0">
+      <DialogContent
+        className="z-[1210] w-[min(calc(100vw-1rem),460px)] overflow-hidden bg-white p-0 shadow-2xl"
+        overlayClassName="z-[1200] bg-black/35"
+      >
         <DialogHeader className="border-b bg-muted/20 px-6 pb-5 pt-6 text-left">
           <DialogTitle className="flex items-center gap-2 pr-8 text-xl">
             <MessageCircle className="h-5 w-5 text-primary" />
@@ -1278,6 +1281,10 @@ export function ServiceAccountDrawer({
   const [advisorAction, setAdvisorAction] = useState<ServiceAction | null>(
     null,
   );
+  const openAdvisor = (action: ServiceAction) => {
+    onOpenChange(false);
+    setAdvisorAction(action);
+  };
   const initials = useMemo(
     () =>
       Array.from(portal.account.displayName || "用户")
@@ -1379,7 +1386,7 @@ export function ServiceAccountDrawer({
                           key={`${action.kind}-${action.label}`}
                           variant="outline"
                           className="w-full justify-between"
-                          onClick={() => setAdvisorAction(action)}
+                          onClick={() => openAdvisor(action)}
                         >
                           <span className="inline-flex items-center gap-2">
                             <MessageCircle className="h-4 w-4" />
@@ -1406,7 +1413,7 @@ export function ServiceAccountDrawer({
                 ) : (
                   <FormalPurchaseActions
                     actions={portal.purchaseActions}
-                    onContactAdvisor={setAdvisorAction}
+                    onContactAdvisor={openAdvisor}
                   />
                 )
               ) : (

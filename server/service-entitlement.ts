@@ -633,7 +633,7 @@ function deriveWorkflowSteps(input: {
       : !input.hasKnowledge
         ? input.planCode === "basic"
           ? "请先等待官网知识库同步完成。"
-          : "请先通过知识库智能体完成全部节点并发布知识库。"
+          : "请先通过知识库智能体完成全部节点，并联系管理员开启品牌全域词库。"
         : input.planCode === "basic"
           ? "正在等待已购问题从官网同步。"
           : null;

@@ -26,7 +26,6 @@ MAX_UNCOMPRESSED_BYTES = 200 * MIB
 MAX_IMAGE_BYTES = 160 * MIB
 MAX_FILES = 1_500
 MAX_IMAGES = 480
-MIN_TARGET_IMAGES = 360
 MIN_LEAVES = 40
 MAX_LEAVES = 115
 TARGET_FORMAL_CHARACTERS_MIN = 80_000
@@ -96,6 +95,45 @@ FORBIDDEN_FORMAL_PHRASES = (
     "raw evidence",
     "page excerpt",
 )
+CUSTOMER_FORMAL_LEAKAGE = (
+    (
+        "task or collection process",
+        re.compile(
+            r"本轮|本次(?:采集|任务|构建|处理|检索|核验)|本包|本知识库|"
+            r"抽取失败|采集失败|已核验|证据不足|未形成.{0,16}核验",
+            re.I,
+        ),
+    ),
+    (
+        "customer or procurement advice",
+        re.compile(
+            r"(?:客户|采购方|读者|使用方|合作方).{0,12}(?:应|需|建议|可将)|"
+            r"仍应|采购(?:或|与)?合规审查|合规审查|正式尽调|不能仅凭|"
+            r"不宜(?:直接)?(?:转换|认定|视为)?|不能外推",
+            re.I,
+        ),
+    ),
+    (
+        "company-claim interpretation or model reasoning",
+        re.compile(
+            r"这些内容属于企业自我定义|企业自我定义|对客户而言|"
+            r"可将其落实为|说明组织意图与品牌取向",
+            re.I,
+        ),
+    ),
+)
+ASSET_TYPES = {
+    "brand_identity",
+    "product_ui",
+    "product_diagram",
+    "case_photo",
+    "team_photo",
+    "environment_photo",
+    "certificate_badge",
+    "document_figure",
+    "other",
+}
+DISPLAY_ROLES = {"hero", "inline", "badge"}
 MANIFEST_KEYS = {
     "schemaVersion",
     "profile",
@@ -146,6 +184,8 @@ ASSET_KEYS = {
     "sourcePageUrl",
     "sourceAssetUrl",
     "ownership",
+    "assetType",
+    "displayRole",
 }
 ASSET_REQUIRED_KEYS = {
     "id",
@@ -159,6 +199,8 @@ ASSET_REQUIRED_KEYS = {
     "branchId",
     "documentIds",
     "ownership",
+    "assetType",
+    "displayRole",
 }
 COUNTS_KEYS = {
     "totalFiles",
@@ -177,6 +219,7 @@ IMAGE_SELECTION_KEYS = {
     "rejectionReasons",
     "stopReason",
     "productFamilyCoverage",
+    "candidates",
     "shortfallReason",
 }
 
@@ -892,6 +935,12 @@ def validate_archive(path: Path) -> list[str]:
                         phrase.lower() not in normalized_formal_lower,
                         f"{doc_path} formal content contains forbidden phrase: {phrase}",
                     )
+                for label, pattern in CUSTOMER_FORMAL_LEAKAGE:
+                    validation.require(
+                        not bool(pattern.search(normalized_formal_lower)),
+                        f"{doc_path} formal content contains customer-facing "
+                        f"audit language or internal reasoning: {label}",
+                    )
                 normalized_formal = re.sub(
                     r"\s+",
                     "",
@@ -1260,12 +1309,35 @@ def validate_archive(path: Path) -> list[str]:
                 optional=True,
             )
             ownership = require_string(raw_asset, "ownership", where, validation)
+            asset_type = require_string(raw_asset, "assetType", where, validation)
+            display_role = require_string(
+                raw_asset, "displayRole", where, validation
+            )
             related_documents = require_string_list(
                 raw_asset, "documentIds", where, validation
             )
             validation.require(
                 ownership == "first_party",
                 f"{where}.ownership must be first_party",
+            )
+            validation.require(
+                asset_type in ASSET_TYPES,
+                f"{where}.assetType is invalid",
+            )
+            validation.require(
+                display_role in DISPLAY_ROLES,
+                f"{where}.displayRole is invalid",
+            )
+            badge_type = asset_type in {"brand_identity", "certificate_badge"}
+            validation.require(
+                not (
+                    (display_role == "badge" and not badge_type)
+                    or (
+                        asset_type == "certificate_badge"
+                        and display_role != "badge"
+                    )
+                ),
+                f"{where} has an invalid assetType/displayRole combination",
             )
             for key, url in (
                 ("sourcePageUrl", source_page_url),
@@ -1346,6 +1418,17 @@ def validate_archive(path: Path) -> list[str]:
                     raw_asset.get("width") == dimensions[0]
                     and raw_asset.get("height") == dimensions[1],
                     f"declared dimensions do not match {asset_path}",
+                )
+                if display_role == "hero":
+                    minimum_met = dimensions[0] >= 1200 and dimensions[1] >= 600
+                elif display_role == "badge":
+                    minimum_met = dimensions[0] >= 256 and dimensions[1] >= 256
+                else:
+                    minimum_met = dimensions[0] >= 800 and dimensions[1] >= 450
+                validation.require(
+                    minimum_met,
+                    f"{asset_path} does not meet the {display_role} image "
+                    "quality minimum",
                 )
             validation.require(
                 actual_digest not in asset_hashes,
@@ -1436,6 +1519,7 @@ def validate_archive(path: Path) -> list[str]:
         rejection_reasons = image_selection.get("rejectionReasons")
         stop_reason = image_selection.get("stopReason")
         product_families = image_selection.get("productFamilyCoverage")
+        candidates = image_selection.get("candidates")
         shortfall = image_selection.get("shortfallReason")
         require_exact_keys(
             image_selection,
@@ -1481,6 +1565,124 @@ def validate_archive(path: Path) -> list[str]:
             validation.require(
                 len(asset_paths) <= eligible,
                 "packaged image count cannot exceed eligibleFirstPartyImages",
+            )
+        validation.require(
+            isinstance(candidates, list),
+            "imageSelection.candidates must be an array",
+        )
+        eligible_candidates: list[dict[str, Any]] = []
+        rejected_candidates: list[dict[str, Any]] = []
+        uninspected_candidates: list[dict[str, Any]] = []
+        candidate_urls: set[str] = set()
+        if isinstance(candidates, list):
+            for index, candidate in enumerate(candidates):
+                where = f"imageSelection.candidates[{index}]"
+                if not isinstance(candidate, dict):
+                    validation.errors.append(f"{where} must be an object")
+                    continue
+                status = candidate.get("status")
+                required_candidate_keys = {
+                    "url",
+                    "sourcePageUrl",
+                    "method",
+                    "status",
+                }
+                if status == "eligible":
+                    required_candidate_keys.add("assetId")
+                elif status == "rejected":
+                    required_candidate_keys.add("rejectionReason")
+                require_exact_keys(
+                    candidate,
+                    allowed=required_candidate_keys
+                    | {"assetId", "rejectionReason"},
+                    required=required_candidate_keys,
+                    where=where,
+                    validation=validation,
+                )
+                url = require_string(candidate, "url", where, validation)
+                source_page = require_string(
+                    candidate, "sourcePageUrl", where, validation
+                )
+                method = require_string(candidate, "method", where, validation)
+                validation.require(
+                    method in REQUIRED_IMAGE_DISCOVERY_METHODS,
+                    f"{where}.method is invalid",
+                )
+                for key, candidate_url in (
+                    ("url", url),
+                    ("sourcePageUrl", source_page),
+                ):
+                    validation.require(
+                        bool(
+                            re.fullmatch(
+                                r"https?://[^/\s:@]+(?::\d+)?(?:/[^@\s]*)?",
+                                candidate_url,
+                                flags=re.IGNORECASE,
+                            )
+                        )
+                        and "@"
+                        not in candidate_url.split("://", 1)[-1].split("/", 1)[0],
+                        f"{where}.{key} must be a credential-free HTTP(S) URL",
+                    )
+                validation.require(
+                    status in {"eligible", "rejected", "uninspected"},
+                    f"{where}.status is invalid",
+                )
+                validation.require(
+                    url not in candidate_urls,
+                    f"duplicate image candidate URL: {url}",
+                )
+                candidate_urls.add(url)
+                if status == "eligible":
+                    eligible_candidates.append(candidate)
+                    asset_id = require_string(
+                        candidate, "assetId", where, validation
+                    )
+                    asset = assets.get(asset_id)
+                    validation.require(
+                        asset is not None
+                        and candidate.get("rejectionReason") is None
+                        and asset.get("sourceAssetUrl") == candidate.get("url")
+                        and asset.get("sourcePageUrl")
+                        == candidate.get("sourcePageUrl"),
+                        f"{where} does not match its packaged asset",
+                    )
+                elif status == "rejected":
+                    rejected_candidates.append(candidate)
+                    validation.require(
+                        candidate.get("assetId") is None
+                        and isinstance(candidate.get("rejectionReason"), str)
+                        and bool(candidate.get("rejectionReason", "").strip()),
+                        f"{where} must contain only a rejectionReason",
+                    )
+                elif status == "uninspected":
+                    uninspected_candidates.append(candidate)
+                    validation.require(
+                        candidate.get("assetId") is None
+                        and candidate.get("rejectionReason") is None,
+                        f"{where} cannot contain a result",
+                    )
+        if all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (discovered, inspected, eligible, rejected)
+        ):
+            validation.require(
+                len(candidate_urls) == discovered
+                and len(eligible_candidates) == eligible
+                and len(rejected_candidates) == rejected
+                and len(eligible_candidates) + len(rejected_candidates)
+                == inspected
+                and inspected + len(uninspected_candidates) == discovered,
+                "image candidate ledger does not match aggregate counts",
+            )
+            validation.require(
+                {
+                    candidate.get("assetId")
+                    for candidate in eligible_candidates
+                    if candidate.get("assetId")
+                }
+                == asset_ids,
+                "every packaged image must appear exactly once as eligible",
             )
         validation.require(
             isinstance(discovery_methods, list)
@@ -1582,6 +1784,15 @@ def validate_archive(path: Path) -> list[str]:
                         bool(family_assets),
                         f"{where} with official imagery must link a packaged image",
                     )
+                    validation.require(
+                        all(
+                            assets.get(asset_id, {}).get("assetType")
+                            in {"product_ui", "product_diagram", "case_photo"}
+                            for asset_id in family_assets
+                        ),
+                        f"{where} product coverage must use product UI, diagram, "
+                        "or case imagery",
+                    )
                 else:
                     require_string(family, "gapReason", where, validation)
             validation.require(
@@ -1596,12 +1807,29 @@ def validate_archive(path: Path) -> list[str]:
             and isinstance(discovered, int)
             and isinstance(inspected, int)
         ):
+            official_completed = (
+                completeness_acquisition.get("officialPages", {}).get(
+                    "completed"
+                )
+                if isinstance(
+                    completeness_acquisition.get("officialPages"), dict
+                )
+                else None
+            )
+            validation.require(
+                isinstance(official_completed, int)
+                and scanned_pages == official_completed,
+                "scannedSourcePages must equal successfully parsed official pages",
+            )
             if selection_status == "target_met":
                 validation.require(
-                    eligible >= MIN_TARGET_IMAGES
-                    and MIN_TARGET_IMAGES <= len(asset_paths) <= MAX_IMAGES,
-                    f"target_met requires at least {MIN_TARGET_IMAGES} eligible "
-                    f"and packaged images",
+                    len(uninspected_candidates) == 0
+                    and any(
+                        asset.get("assetType") == "brand_identity"
+                        for asset in assets.values()
+                    ),
+                    "target_met requires complete candidate inspection and "
+                    "brand imagery",
                 )
                 validation.require(
                     "shortfallReason" not in image_selection,
@@ -1609,12 +1837,8 @@ def validate_archive(path: Path) -> list[str]:
                 )
             else:
                 validation.require(
-                    eligible < MIN_TARGET_IMAGES,
-                    "limited image status requires fewer than 360 eligible images",
-                )
-                validation.require(
                     len(asset_paths) == eligible,
-                    "below the image target, every eligible image must be packaged",
+                    "limited image status must package every eligible image",
                 )
                 validation.require(
                     isinstance(shortfall, str) and bool(shortfall.strip()),

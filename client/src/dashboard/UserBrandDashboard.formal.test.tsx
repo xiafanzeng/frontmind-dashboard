@@ -593,6 +593,9 @@ describe("UserBrandDashboard formal workspace", () => {
 
     expect(screen.getAllByText("品牌聚合榜单").length).toBeGreaterThan(0);
     expect(screen.getAllByText("知乎问答").length).toBeGreaterThan(0);
+    expect(screen.getByText("多品牌介绍与选型指南")).toBeInTheDocument();
+    expect(screen.getByText("专业问答内容")).toBeInTheDocument();
+    expect(screen.queryByText("媒体稿件与权威信源")).not.toBeInTheDocument();
     expect(screen.getByText("首个企业资产")).toBeInTheDocument();
     expect(screen.getByText("管理员发布的文章")).toBeInTheDocument();
     expect(
@@ -845,8 +848,8 @@ describe("UserBrandDashboard formal workspace", () => {
     fireEvent.change(screen.getByLabelText("备案省份"), {
       target: { value: "浙江" },
     });
-    fireEvent.change(screen.getByLabelText("话题"), {
-      target: { value: "企业网站 ICP 备案" },
+    fireEvent.change(screen.getByLabelText("申请或核验的域名"), {
+      target: { value: "example.com" },
     });
     fireEvent.change(screen.getByLabelText("域名实名及持有人信息"), {
       target: { value: "域名已完成企业实名，持有人与营业执照一致" },

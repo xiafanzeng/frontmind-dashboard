@@ -700,8 +700,18 @@ export default function ChatArea({
             ) : showKnowledgeBaseStarter ? (
               <EmptyConversationHint
                 onStartKnowledgeBase={startKnowledgeBase}
-                companyName={dashboardQuery.data?.payload?.brandName || ""}
-                companyConfigured={Boolean(dashboardQuery.data?.sourceName)}
+                companyName={
+                  dashboardQuery.data?.enterpriseName ||
+                  dashboardQuery.data?.payload?.brandName ||
+                  ""
+                }
+                companyConfigured={Boolean(
+                  (
+                    dashboardQuery.data?.enterpriseName ||
+                    dashboardQuery.data?.payload?.brandName ||
+                    ""
+                  ).trim(),
+                )}
                 companyLoading={dashboardQuery.isLoading}
               />
             ) : (
@@ -934,7 +944,7 @@ function EmptyConversationHint({
   const handleStart = useCallback(async () => {
     const normalizedCompanyName = companyName.trim();
     if (!companyConfigured || !normalizedCompanyName) {
-      toast.error("请先由管理员配置当前账号的企业名称");
+      toast.error("请联系管理员配置当前账号的企业名称");
       return;
     }
 
@@ -1034,7 +1044,7 @@ function EmptyConversationHint({
               />
               {!companyLoading && !companyConfigured && (
                 <p className="text-xs leading-5 text-amber-700">
-                  管理员配置企业名称并发布看板后，才能开始构建知识库。
+                  请联系管理员配置当前账号的企业名称后，再开始构建知识库。
                 </p>
               )}
             </div>

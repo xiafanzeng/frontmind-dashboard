@@ -693,14 +693,20 @@ describe("knowledge archive enterprise identity", () => {
     ).not.toThrow();
   });
 
-  it("rejects an unconfigured account or another enterprise's package", () => {
+  it("uses the account enterprise without requiring a published dashboard", () => {
     expect(() =>
       assertKnowledgeArchiveEnterpriseIdentity({
         enterpriseIdentityConfirmed: false,
         brandName: "验收企业",
-        documents: [],
+        documents: [
+          {
+            path: "验收企业知识库/README.md",
+            title: "知识库说明",
+            content: "# 验收企业知识库",
+          },
+        ],
       }),
-    ).toThrow("管理员配置");
+    ).not.toThrow();
 
     expect(() =>
       assertKnowledgeArchiveEnterpriseIdentity({

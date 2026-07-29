@@ -198,7 +198,7 @@ const WEBSITE_CONTENT_CATEGORIES = new Set<string>(
   WEBSITE_CONTENT_CATALOG.map((item) => item.value),
 );
 
-async function assertWebsiteTicketWorkflow(
+export async function assertWebsiteTicketWorkflow(
   executor: any,
   userId: number,
   value: CreateDeliveryTicketInput,
@@ -249,16 +249,20 @@ async function assertWebsiteTicketWorkflow(
     return { profile, domain };
   }
   if (category === "icp_filing") {
-    if (profile?.domainStatus !== "completed") {
+    const domain =
+      profile?.domainStatus === "completed"
+        ? profile.domain
+        : normalizeDomain(value.topic || value.title);
+    if (!domain) {
       throw new DeliveryTicketError(
-        "DOMAIN_PREREQUISITE_REQUIRED",
-        "请先完成域名申请或由管理员核验已有域名。",
-        403,
+        "DOMAIN_REQUIRED",
+        "请填写本次需要申请或核验的域名。",
+        400,
       );
     }
     if (
-      profile.icpStatus === "approved" ||
-      profile.icpStatus === "not_required"
+      profile?.icpStatus === "approved" ||
+      profile?.icpStatus === "not_required"
     ) {
       throw new DeliveryTicketError(
         "ICP_ALREADY_VERIFIED",
@@ -291,7 +295,7 @@ async function assertWebsiteTicketWorkflow(
         400,
       );
     }
-    return { profile, domain: null };
+    return { profile, domain };
   }
   if (WEBSITE_CONTENT_CATEGORIES.has(category)) {
     if (
@@ -300,9 +304,7 @@ async function assertWebsiteTicketWorkflow(
     ) {
       throw new DeliveryTicketError(
         "WEBSITE_PREREQUISITES_REQUIRED",
-        profile?.domainStatus !== "completed"
-          ? "请先完成域名申请。"
-          : "请先完成 ICP 备案与主体材料核验。",
+        "请先统一提交并完成域名与 ICP 备案材料核验。",
         403,
       );
     }
@@ -750,7 +752,7 @@ function publicDeliveryCategoryLabel(ticket: InternalDeliveryTicketDto) {
     );
   }
   if (category === "domain_application") return "域名申请";
-  if (category === "icp_filing") return "ICP 备案与主体材料";
+  if (category === "icp_filing") return "域名申请与 ICP 备案材料";
   return (
     WEBSITE_CONTENT_CATALOG.find((item) => item.value === category)?.label ??
     category
@@ -1260,20 +1262,18 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
       domainCompleted,
       icpCompleted,
       canSubmitDomain: !domainCompleted,
-      canSubmitIcp: domainCompleted && !icpCompleted,
+      canSubmitIcp: !icpCompleted,
       canSubmitContent: domainCompleted && icpCompleted,
       icpProvince: siteProfile?.icpProvince ?? null,
       icpProvinceOptions: ICP_PROVINCES,
       icpMaterialChecklist: siteProfile?.icpProvince
         ? icpMaterialChecklistForProvince(siteProfile.icpProvince)
         : [],
-      icpLockReason: domainCompleted
-        ? null
-        : "请先完成域名申请或由管理员核验已有域名。",
+      icpLockReason: null,
       contentLockReason: !domainCompleted
-        ? "请先完成域名申请。"
+        ? "请先统一提交并完成域名与 ICP 备案材料核验。"
         : !icpCompleted
-          ? "请先完成 ICP 备案与主体材料核验。"
+          ? "请先完成域名与 ICP 备案材料核验。"
           : null,
     },
   };
@@ -1308,22 +1308,21 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
       domainCompleted,
       icpCompleted,
       canSubmitDomain: !domainCompleted && !domainPending,
-      canSubmitIcp: domainCompleted && !icpCompleted && !icpPending,
+      canSubmitIcp: !icpCompleted && !domainPending && !icpPending,
       canSubmitContent: domainCompleted && icpCompleted,
       domainLockReason: domainPending
         ? "域名申请工单待管理员受理。"
         : domainCompleted
           ? null
           : null,
-      icpLockReason: !domainCompleted
-        ? "请先完成域名申请或由管理员核验已有域名。"
-        : icpPending
-          ? "ICP 备案工单待管理员受理。"
+      icpLockReason:
+        domainPending || icpPending
+          ? "域名与 ICP 备案材料工单待管理员受理。"
           : null,
       contentLockReason: !domainCompleted
-        ? "请先完成域名申请。"
+        ? "请先统一提交并完成域名与 ICP 备案材料核验。"
         : !icpCompleted
-          ? "请先完成 ICP 备案与主体材料核验。"
+          ? "请先完成域名与 ICP 备案材料核验。"
           : null,
       icpProvinceOptions: metadata.websiteWorkflow.icpProvinceOptions,
     },
@@ -1614,18 +1613,43 @@ export async function createDeliveryTicket(input: {
                 updatedAt: now,
               });
             }
-          } else if (category === "icp_filing" && websiteWorkflow.profile) {
-            await tx
-              .update(workspaceSiteProfiles)
-              .set({
+          } else if (category === "icp_filing") {
+            if (websiteWorkflow.profile) {
+              await tx
+                .update(workspaceSiteProfiles)
+                .set({
+                  domain:
+                    websiteWorkflow.domain || websiteWorkflow.profile.domain,
+                  domainStatus:
+                    websiteWorkflow.profile.domainStatus === "completed"
+                      ? "completed"
+                      : "pending",
+                  domainVerifiedAt:
+                    websiteWorkflow.profile.domainStatus === "completed"
+                      ? websiteWorkflow.profile.domainVerifiedAt
+                      : null,
+                  icpProvince: input.value.icpProvince?.trim() || null,
+                  icpStatus: "preparing",
+                  icpVerifiedAt: null,
+                  revision: websiteWorkflow.profile.revision + 1,
+                  updatedByUserId: input.userId,
+                  updatedAt: now,
+                })
+                .where(eq(workspaceSiteProfiles.userId, input.userId));
+            } else {
+              await tx.insert(workspaceSiteProfiles).values({
+                userId: input.userId,
+                domain: websiteWorkflow.domain,
+                siteMode: "unknown",
+                domainStatus: "pending",
                 icpProvince: input.value.icpProvince?.trim() || null,
                 icpStatus: "preparing",
-                icpVerifiedAt: null,
-                revision: websiteWorkflow.profile.revision + 1,
+                revision: 1,
                 updatedByUserId: input.userId,
+                createdAt: now,
                 updatedAt: now,
-              })
-              .where(eq(workspaceSiteProfiles.userId, input.userId));
+              });
+            }
           }
         }
         const created = await tx
@@ -2381,15 +2405,31 @@ export async function updateManagedDeliveryTicket(input: {
         .limit(1)
         .for("update");
       const profile = profiles[0];
-      if (!profile || profile.domainStatus !== "completed") {
+      if (!profile) {
         throw new DeliveryTicketError(
-          "DOMAIN_PREREQUISITE_REQUIRED",
-          "域名阶段尚未完成，不能完成 ICP 备案工单。",
+          "SITE_PROFILE_NOT_FOUND",
+          "域名与备案资料不存在，请刷新后重试。",
+        );
+      }
+      const resolvedDomain =
+        profile.domainStatus === "completed"
+          ? normalizeDomain(profile.domain)
+          : normalizeDomain(
+              input.value.verifiedDomain || ticket.topic || ticket.title,
+            );
+      if (!resolvedDomain) {
+        throw new DeliveryTicketError(
+          "VERIFIED_DOMAIN_REQUIRED",
+          "完成工单前必须填写并核验实际域名。",
+          400,
         );
       }
       await tx
         .update(workspaceSiteProfiles)
         .set({
+          domain: resolvedDomain,
+          domainStatus: "completed",
+          domainVerifiedAt: profile.domainVerifiedAt ?? now,
           icpProvince: ticket.icpProvince || profile.icpProvince,
           icpStatus: "approved",
           icpVerifiedAt: now,

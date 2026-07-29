@@ -238,7 +238,7 @@ export const createDeliveryTicketSchema = z
         code: z.ZodIssueCode.custom,
         path: ["icpDeclarations"],
         message:
-          "ICP 备案工单必须填写域名实名信息、网站信息并确认真实性核验状态",
+          "域名与 ICP 备案工单必须填写域名实名信息、网站信息并确认真实性核验状态",
       });
     }
   });
@@ -692,6 +692,7 @@ const publicContentAssetCatalogItemSchema = z
     group: z.string().trim().min(1).max(64),
     type: z.string().trim().min(1).max(160),
     label: z.string().trim().min(1).max(160),
+    description: z.string().trim().min(1).max(500).optional(),
   })
   .strict();
 

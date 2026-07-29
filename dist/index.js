@@ -11,6 +11,7 @@ import { z as z8 } from "zod";
 // server/_core/trpc.ts
 import { initTRPC, TRPCError } from "@trpc/server";
 import superjson from "superjson";
+import { ZodError } from "zod";
 
 // shared/admin-access.ts
 function isExplicitAdminAccessLevel(value) {
@@ -27,14 +28,46 @@ function isProtectedBuiltinAdminUsername(value) {
 }
 
 // server/_core/trpc.ts
+var validationFieldLabels = {
+  question: "\u76EE\u6807\u95EE\u9898",
+  username: "\u7528\u6237\u540D",
+  password: "\u5BC6\u7801",
+  apiKey: "API Key",
+  userId: "\u7528\u6237",
+  category: "\u7C7B\u578B",
+  topic: "\u8BDD\u9898"
+};
+function localizedZodIssue(issue) {
+  if (/[\u3400-\u9fff]/u.test(issue.message)) return issue.message;
+  const rawField = String(issue.path.at(-1) ?? "\u8F93\u5165\u5185\u5BB9");
+  const field = validationFieldLabels[rawField] ?? rawField;
+  const detail = issue;
+  if (detail.code === "too_small" && detail.minimum !== void 0) {
+    return `${field}\u81F3\u5C11\u9700\u8981 ${detail.minimum} \u4E2A\u5B57\u7B26`;
+  }
+  if (detail.code === "too_big" && detail.maximum !== void 0) {
+    return `${field}\u4E0D\u80FD\u8D85\u8FC7 ${detail.maximum} \u4E2A\u5B57\u7B26`;
+  }
+  if (detail.code === "invalid_type") return `${field}\u683C\u5F0F\u4E0D\u6B63\u786E`;
+  if (detail.code === "invalid_format") return `${field}\u683C\u5F0F\u4E0D\u6B63\u786E`;
+  return `${field}\u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u540E\u91CD\u8BD5`;
+}
 var t = initTRPC.context().create({
-  transformer: superjson
+  transformer: superjson,
+  errorFormatter({ shape, error }) {
+    if (!(error.cause instanceof ZodError)) return shape;
+    const issue = error.cause.issues[0];
+    return {
+      ...shape,
+      message: issue ? localizedZodIssue(issue) : "\u63D0\u4EA4\u5185\u5BB9\u6821\u9A8C\u5931\u8D25"
+    };
+  }
 });
 var router = t.router;
 var publicProcedure = t.procedure;
 var protectedProcedure = t.procedure.use(({ ctx, next }) => {
   if (!ctx.user) {
-    throw new TRPCError({ code: "UNAUTHORIZED", message: "Please log in" });
+    throw new TRPCError({ code: "UNAUTHORIZED", message: "\u8BF7\u5148\u767B\u5F55" });
   }
   return next({ ctx: { ...ctx, user: ctx.user } });
 });
@@ -42,7 +75,7 @@ var adminProcedure = protectedProcedure.use(({ ctx, next }) => {
   if (!hasExplicitAdminRole(ctx.user)) {
     throw new TRPCError({
       code: "FORBIDDEN",
-      message: "Explicit administrator permission is required"
+      message: "\u9700\u8981\u660E\u786E\u7684\u7BA1\u7406\u5458\u6743\u9650"
     });
   }
   return next({ ctx });
@@ -4390,7 +4423,7 @@ var createDeliveryTicketSchema = z5.object({
     context.addIssue({
       code: z5.ZodIssueCode.custom,
       path: ["icpDeclarations"],
-      message: "ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
+      message: "\u57DF\u540D\u4E0E ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
     });
   }
 });
@@ -4663,7 +4696,8 @@ var publicContentAssetCatalogItemSchema = z5.object({
   code: z5.string().trim().min(1).max(64),
   group: z5.string().trim().min(1).max(64),
   type: z5.string().trim().min(1).max(160),
-  label: z5.string().trim().min(1).max(160)
+  label: z5.string().trim().min(1).max(160),
+  description: z5.string().trim().min(1).max(500).optional()
 }).strict();
 var publicWebsiteContentCatalogItemSchema = z5.object({
   value: z5.enum([
@@ -5569,7 +5603,7 @@ function deriveWorkflowSteps(input) {
   const knowledgeOnlyReason = input.planCode === "knowledge" ? "\u77E5\u8BC6\u5E93\u7248\u4EC5\u5F00\u653E\u77E5\u8BC6\u5E93\u6784\u5EFA\u3001\u66F4\u65B0\u4E0E\u5C55\u793A\uFF1B\u6B64\u529F\u80FD\u672A\u5305\u542B\u5728\u5F53\u524D\u5957\u9910\u3002" : null;
   const serviceBlock = input.status === "active" ? null : capabilityReason(input.status, false) ?? "\u670D\u52A1\u5F53\u524D\u4E0D\u53EF\u7528\u3002";
   const knowledgeReason = serviceBlock ? serviceBlock : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u8FC1\u79FB\u5B8C\u6210\u3002" : null;
-  const questionReason = serviceBlock ? serviceBlock : knowledgeOnlyReason ? knowledgeOnlyReason : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u5E76\u53D1\u5E03\u77E5\u8BC6\u5E93\u3002" : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5DF2\u8D2D\u95EE\u9898\u4ECE\u5B98\u7F51\u540C\u6B65\u3002" : null;
+  const questionReason = serviceBlock ? serviceBlock : knowledgeOnlyReason ? knowledgeOnlyReason : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\uFF0C\u5E76\u8054\u7CFB\u7BA1\u7406\u5458\u5F00\u542F\u54C1\u724C\u5168\u57DF\u8BCD\u5E93\u3002" : input.planCode === "basic" ? "\u6B63\u5728\u7B49\u5F85\u5DF2\u8D2D\u95EE\u9898\u4ECE\u5B98\u7F51\u540C\u6B65\u3002" : null;
   const responseReason = serviceBlock ? serviceBlock : knowledgeOnlyReason ? knowledgeOnlyReason : !input.hasKnowledge ? input.planCode === "basic" ? "\u8BF7\u5148\u7B49\u5F85\u5B98\u7F51\u77E5\u8BC6\u5E93\u540C\u6B65\u5B8C\u6210\u3002" : "\u8BF7\u5148\u901A\u8FC7\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u5E76\u53D1\u5E03\u77E5\u8BC6\u5E93\u3002" : !input.questionSelectionComplete ? "\u8BF7\u5148\u5B8C\u6210\u5F53\u524D\u670D\u52A1\u5468\u671F\u7684\u9009\u9898\u3002" : null;
   const monitoringReason = responseReason ?? (!input.responseLogicComplete ? "\u8BF7\u5148\u5728\u5E94\u7B54\u903B\u8F91\u667A\u80FD\u4F53\u9010\u9898\u53D1\u5E03\u786E\u8BA4\u3002" : null);
   const distributionReason = monitoringReason ?? (!input.monitoringComplete ? "\u8BF7\u7B49\u5F85\u771F\u5B9E\u95EE\u9898\u76D1\u63A7\u6570\u636E\u5199\u5165\u3002" : null);
@@ -14877,49 +14911,48 @@ var CONTENT_ASSET_CATALOG = Object.freeze([
     code: "A1",
     group: "A",
     type: "\u54C1\u724C\u4E8B\u5B9E\u5185\u5BB9",
-    label: "\u4F01\u4E1A\u8D44\u6599\u4E0E\u54C1\u724C\u4E8B\u5B9E"
+    label: "\u4F01\u4E1A\u8D44\u6599\u4E0E\u54C1\u724C\u4E8B\u5B9E",
+    description: "\u6574\u7406\u4F01\u4E1A\u7B80\u4ECB\u3001\u53D1\u5C55\u5386\u7A0B\u3001\u8D44\u8D28\u8363\u8A89\u7B49\u53EF\u6838\u9A8C\u7684\u54C1\u724C\u4E8B\u5B9E\u3002"
   },
   {
     id: "A2",
     code: "A2",
     group: "A",
     type: "\u6848\u4F8B\u5185\u5BB9",
-    label: "\u7528\u6237\u6848\u4F8B\u4E0E\u6210\u529F\u6545\u4E8B"
+    label: "\u7528\u6237\u6848\u4F8B\u4E0E\u6210\u529F\u6545\u4E8B",
+    description: "\u5C06\u9879\u76EE\u80CC\u666F\u3001\u89E3\u51B3\u65B9\u6848\u4E0E\u91CF\u5316\u6210\u679C\u6574\u7406\u4E3A\u53EF\u4FE1\u5BA2\u6237\u6848\u4F8B\u3002"
   },
   {
     id: "B1",
     code: "B1",
     group: "B",
     type: "\u884C\u4E1A\u5185\u5BB9",
-    label: "\u884C\u4E1A\u89C2\u70B9\u4E0E\u8D8B\u52BF\u89C2\u5BDF"
+    label: "\u884C\u4E1A\u89C2\u70B9\u4E0E\u8D8B\u52BF\u89C2\u5BDF",
+    description: "\u56F4\u7ED5\u884C\u4E1A\u53D8\u5316\u3001\u5173\u952E\u8BAE\u9898\u548C\u4E13\u4E1A\u5224\u65AD\u5F62\u6210\u6DF1\u5EA6\u89C2\u70B9\u5185\u5BB9\u3002"
   },
   {
     id: "B2",
     code: "B2",
     group: "B",
     type: "\u4EA7\u54C1\u5185\u5BB9",
-    label: "\u4EA7\u54C1\u80FD\u529B\u4E0E\u5E94\u7528\u573A\u666F"
+    label: "\u4EA7\u54C1\u80FD\u529B\u4E0E\u5E94\u7528\u573A\u666F",
+    description: "\u6E05\u6670\u8BF4\u660E\u4EA7\u54C1\u80FD\u529B\u3001\u9002\u7528\u573A\u666F\u3001\u4F7F\u7528\u65B9\u5F0F\u4E0E\u9009\u62E9\u4F9D\u636E\u3002"
   },
   {
     id: "C1",
     code: "C1",
     group: "C",
     type: "\u65B0\u95FB\u5185\u5BB9",
-    label: "\u4F01\u4E1A\u65B0\u95FB\u4E0E\u52A8\u6001"
-  },
-  {
-    id: "C2",
-    code: "C2",
-    group: "C",
-    type: "\u5A92\u4F53\u5185\u5BB9",
-    label: "\u5A92\u4F53\u7A3F\u4EF6\u4E0E\u6743\u5A01\u4FE1\u6E90"
+    label: "\u4F01\u4E1A\u65B0\u95FB\u4E0E\u52A8\u6001",
+    description: "\u53D1\u5E03\u4F01\u4E1A\u8FDB\u5C55\u3001\u5408\u4F5C\u52A8\u6001\u3001\u6D3B\u52A8\u4FE1\u606F\u4E0E\u91CD\u8981\u91CC\u7A0B\u7891\u3002"
   },
   {
     id: "D1",
     code: "D1",
     group: "D",
     type: "\u95EE\u7B54\u5185\u5BB9",
-    label: "\u77E5\u4E4E\u95EE\u7B54"
+    label: "\u77E5\u4E4E\u95EE\u7B54",
+    description: "\u56F4\u7ED5\u7528\u6237\u771F\u5B9E\u95EE\u9898\u8F93\u51FA\u4E13\u4E1A\u3001\u81EA\u7136\u4E14\u6709\u4E8B\u5B9E\u652F\u6491\u7684\u56DE\u7B54\u3002"
   }
 ]);
 var WEBSITE_CONTENT_CATALOG = Object.freeze([
@@ -15637,14 +15670,15 @@ async function assertWebsiteTicketWorkflow(executor, userId, value) {
     return { profile, domain };
   }
   if (category === "icp_filing") {
-    if (profile?.domainStatus !== "completed") {
+    const domain = profile?.domainStatus === "completed" ? profile.domain : normalizeDomain(value.topic || value.title);
+    if (!domain) {
       throw new DeliveryTicketError(
-        "DOMAIN_PREREQUISITE_REQUIRED",
-        "\u8BF7\u5148\u5B8C\u6210\u57DF\u540D\u7533\u8BF7\u6216\u7531\u7BA1\u7406\u5458\u6838\u9A8C\u5DF2\u6709\u57DF\u540D\u3002",
-        403
+        "DOMAIN_REQUIRED",
+        "\u8BF7\u586B\u5199\u672C\u6B21\u9700\u8981\u7533\u8BF7\u6216\u6838\u9A8C\u7684\u57DF\u540D\u3002",
+        400
       );
     }
-    if (profile.icpStatus === "approved" || profile.icpStatus === "not_required") {
+    if (profile?.icpStatus === "approved" || profile?.icpStatus === "not_required") {
       throw new DeliveryTicketError(
         "ICP_ALREADY_VERIFIED",
         "\u5F53\u524D\u4F01\u4E1A ICP \u524D\u7F6E\u9636\u6BB5\u5DF2\u5B8C\u6210\uFF0C\u65E0\u9700\u91CD\u590D\u63D0\u4EA4\u3002"
@@ -15674,13 +15708,13 @@ async function assertWebsiteTicketWorkflow(executor, userId, value) {
         400
       );
     }
-    return { profile, domain: null };
+    return { profile, domain };
   }
   if (WEBSITE_CONTENT_CATEGORIES.has(category)) {
     if (profile?.domainStatus !== "completed" || profile.icpStatus !== "approved" && profile.icpStatus !== "not_required") {
       throw new DeliveryTicketError(
         "WEBSITE_PREREQUISITES_REQUIRED",
-        profile?.domainStatus !== "completed" ? "\u8BF7\u5148\u5B8C\u6210\u57DF\u540D\u7533\u8BF7\u3002" : "\u8BF7\u5148\u5B8C\u6210 ICP \u5907\u6848\u4E0E\u4E3B\u4F53\u6750\u6599\u6838\u9A8C\u3002",
+        "\u8BF7\u5148\u7EDF\u4E00\u63D0\u4EA4\u5E76\u5B8C\u6210\u57DF\u540D\u4E0E ICP \u5907\u6848\u6750\u6599\u6838\u9A8C\u3002",
         403
       );
     }
@@ -15979,7 +16013,7 @@ function publicDeliveryCategoryLabel(ticket) {
     return CONTENT_ASSET_CATALOG.find((item) => item.id === category)?.label ?? category;
   }
   if (category === "domain_application") return "\u57DF\u540D\u7533\u8BF7";
-  if (category === "icp_filing") return "ICP \u5907\u6848\u4E0E\u4E3B\u4F53\u6750\u6599";
+  if (category === "icp_filing") return "\u57DF\u540D\u7533\u8BF7\u4E0E ICP \u5907\u6848\u6750\u6599";
   return WEBSITE_CONTENT_CATALOG.find((item) => item.value === category)?.label ?? category;
 }
 function toPublicDeliveryTicketSummary(ticket) {
@@ -16313,13 +16347,13 @@ async function getDeliveryTicketWorkspaceMetadata(userId) {
       domainCompleted,
       icpCompleted,
       canSubmitDomain: !domainCompleted,
-      canSubmitIcp: domainCompleted && !icpCompleted,
+      canSubmitIcp: !icpCompleted,
       canSubmitContent: domainCompleted && icpCompleted,
       icpProvince: siteProfile?.icpProvince ?? null,
       icpProvinceOptions: ICP_PROVINCES,
       icpMaterialChecklist: siteProfile?.icpProvince ? icpMaterialChecklistForProvince(siteProfile.icpProvince) : [],
-      icpLockReason: domainCompleted ? null : "\u8BF7\u5148\u5B8C\u6210\u57DF\u540D\u7533\u8BF7\u6216\u7531\u7BA1\u7406\u5458\u6838\u9A8C\u5DF2\u6709\u57DF\u540D\u3002",
-      contentLockReason: !domainCompleted ? "\u8BF7\u5148\u5B8C\u6210\u57DF\u540D\u7533\u8BF7\u3002" : !icpCompleted ? "\u8BF7\u5148\u5B8C\u6210 ICP \u5907\u6848\u4E0E\u4E3B\u4F53\u6750\u6599\u6838\u9A8C\u3002" : null
+      icpLockReason: null,
+      contentLockReason: !domainCompleted ? "\u8BF7\u5148\u7EDF\u4E00\u63D0\u4EA4\u5E76\u5B8C\u6210\u57DF\u540D\u4E0E ICP \u5907\u6848\u6750\u6599\u6838\u9A8C\u3002" : !icpCompleted ? "\u8BF7\u5148\u5B8C\u6210\u57DF\u540D\u4E0E ICP \u5907\u6848\u6750\u6599\u6838\u9A8C\u3002" : null
     }
   };
 }
@@ -16348,11 +16382,11 @@ function toPublicDeliveryTicketWorkspaceMetadata(metadata) {
       domainCompleted,
       icpCompleted,
       canSubmitDomain: !domainCompleted && !domainPending,
-      canSubmitIcp: domainCompleted && !icpCompleted && !icpPending,
+      canSubmitIcp: !icpCompleted && !domainPending && !icpPending,
       canSubmitContent: domainCompleted && icpCompleted,
       domainLockReason: domainPending ? "\u57DF\u540D\u7533\u8BF7\u5DE5\u5355\u5F85\u7BA1\u7406\u5458\u53D7\u7406\u3002" : domainCompleted ? null : null,
-      icpLockReason: !domainCompleted ? "\u8BF7\u5148\u5B8C\u6210\u57DF\u540D\u7533\u8BF7\u6216\u7531\u7BA1\u7406\u5458\u6838\u9A8C\u5DF2\u6709\u57DF\u540D\u3002" : icpPending ? "ICP \u5907\u6848\u5DE5\u5355\u5F85\u7BA1\u7406\u5458\u53D7\u7406\u3002" : null,
-      contentLockReason: !domainCompleted ? "\u8BF7\u5148\u5B8C\u6210\u57DF\u540D\u7533\u8BF7\u3002" : !icpCompleted ? "\u8BF7\u5148\u5B8C\u6210 ICP \u5907\u6848\u4E0E\u4E3B\u4F53\u6750\u6599\u6838\u9A8C\u3002" : null,
+      icpLockReason: domainPending || icpPending ? "\u57DF\u540D\u4E0E ICP \u5907\u6848\u6750\u6599\u5DE5\u5355\u5F85\u7BA1\u7406\u5458\u53D7\u7406\u3002" : null,
+      contentLockReason: !domainCompleted ? "\u8BF7\u5148\u7EDF\u4E00\u63D0\u4EA4\u5E76\u5B8C\u6210\u57DF\u540D\u4E0E ICP \u5907\u6848\u6750\u6599\u6838\u9A8C\u3002" : !icpCompleted ? "\u8BF7\u5148\u5B8C\u6210\u57DF\u540D\u4E0E ICP \u5907\u6848\u6750\u6599\u6838\u9A8C\u3002" : null,
       icpProvinceOptions: metadata.websiteWorkflow.icpProvinceOptions
     }
   });
@@ -16585,15 +16619,33 @@ async function createDeliveryTicket(input) {
                 updatedAt: now
               });
             }
-          } else if (category === "icp_filing" && websiteWorkflow.profile) {
-            await tx.update(workspaceSiteProfiles).set({
-              icpProvince: input.value.icpProvince?.trim() || null,
-              icpStatus: "preparing",
-              icpVerifiedAt: null,
-              revision: websiteWorkflow.profile.revision + 1,
-              updatedByUserId: input.userId,
-              updatedAt: now
-            }).where(eq17(workspaceSiteProfiles.userId, input.userId));
+          } else if (category === "icp_filing") {
+            if (websiteWorkflow.profile) {
+              await tx.update(workspaceSiteProfiles).set({
+                domain: websiteWorkflow.domain || websiteWorkflow.profile.domain,
+                domainStatus: websiteWorkflow.profile.domainStatus === "completed" ? "completed" : "pending",
+                domainVerifiedAt: websiteWorkflow.profile.domainStatus === "completed" ? websiteWorkflow.profile.domainVerifiedAt : null,
+                icpProvince: input.value.icpProvince?.trim() || null,
+                icpStatus: "preparing",
+                icpVerifiedAt: null,
+                revision: websiteWorkflow.profile.revision + 1,
+                updatedByUserId: input.userId,
+                updatedAt: now
+              }).where(eq17(workspaceSiteProfiles.userId, input.userId));
+            } else {
+              await tx.insert(workspaceSiteProfiles).values({
+                userId: input.userId,
+                domain: websiteWorkflow.domain,
+                siteMode: "unknown",
+                domainStatus: "pending",
+                icpProvince: input.value.icpProvince?.trim() || null,
+                icpStatus: "preparing",
+                revision: 1,
+                updatedByUserId: input.userId,
+                createdAt: now,
+                updatedAt: now
+              });
+            }
           }
         }
         const created = await tx.select().from(deliveryTickets).where(eq17(deliveryTickets.id, ticketId)).limit(1);
@@ -17124,13 +17176,26 @@ async function updateManagedDeliveryTicket(input) {
     if (ticket.type === "website_operation" && ticket.category === "icp_filing") {
       const profiles = await tx.select().from(workspaceSiteProfiles).where(eq17(workspaceSiteProfiles.userId, input.userId)).limit(1).for("update");
       const profile = profiles[0];
-      if (!profile || profile.domainStatus !== "completed") {
+      if (!profile) {
         throw new DeliveryTicketError(
-          "DOMAIN_PREREQUISITE_REQUIRED",
-          "\u57DF\u540D\u9636\u6BB5\u5C1A\u672A\u5B8C\u6210\uFF0C\u4E0D\u80FD\u5B8C\u6210 ICP \u5907\u6848\u5DE5\u5355\u3002"
+          "SITE_PROFILE_NOT_FOUND",
+          "\u57DF\u540D\u4E0E\u5907\u6848\u8D44\u6599\u4E0D\u5B58\u5728\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002"
+        );
+      }
+      const resolvedDomain = profile.domainStatus === "completed" ? normalizeDomain(profile.domain) : normalizeDomain(
+        input.value.verifiedDomain || ticket.topic || ticket.title
+      );
+      if (!resolvedDomain) {
+        throw new DeliveryTicketError(
+          "VERIFIED_DOMAIN_REQUIRED",
+          "\u5B8C\u6210\u5DE5\u5355\u524D\u5FC5\u987B\u586B\u5199\u5E76\u6838\u9A8C\u5B9E\u9645\u57DF\u540D\u3002",
+          400
         );
       }
       await tx.update(workspaceSiteProfiles).set({
+        domain: resolvedDomain,
+        domainStatus: "completed",
+        domainVerifiedAt: profile.domainVerifiedAt ?? now,
         icpProvince: ticket.icpProvince || profile.icpProvince,
         icpStatus: "approved",
         icpVerifiedAt: now,
@@ -19259,11 +19324,11 @@ function throwServiceAdminError(error) {
   }
   throw toTrpcError(error);
 }
-var usernameSchema2 = z8.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
+var usernameSchema2 = z8.string().trim().min(3, "\u7528\u6237\u540D\u81F3\u5C11\u9700\u8981 3 \u4E2A\u5B57\u7B26").max(64, "\u7528\u6237\u540D\u4E0D\u80FD\u8D85\u8FC7 64 \u4E2A\u5B57\u7B26").regex(
   /^[a-zA-Z0-9._-]+$/,
-  "Username may only contain letters, numbers, dots, underscores, and hyphens"
+  "\u7528\u6237\u540D\u53EA\u80FD\u5305\u542B\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u70B9\u3001\u4E0B\u5212\u7EBF\u548C\u8FDE\u5B57\u7B26"
 );
-var presalesApiKeySchema = z8.string().trim().min(8, "API Key is too short").max(4096, "API Key is too long");
+var presalesApiKeySchema = z8.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26");
 var adminUpdateServiceSchema = z8.object({
   userId: z8.number().int().positive(),
   expectedRevision: z8.number().int().nonnegative(),
@@ -19717,10 +19782,10 @@ var adminRouter = router({
           message: input.planCode === "basic" ? "\u666E\u901A\u7248\u4E3A\u8FDE\u7EED 30 \u5929\u5355\u9898\u670D\u52A1\uFF0C\u4E0D\u8BBE\u7F6E\u9884\u4ED8\u6708\u4EFD" : "\u77E5\u8BC6\u5E93\u7248\u3001\u8FDB\u9636\u7248\u4E0E\u8C6A\u534E\u7248\u5408\u540C\u5747\u6309 3 \u4E2A\u6708\u670D\u52A1\u5468\u671F\u5EFA\u7ACB"
         });
       }
-      if (commerciallyActive && (!input.signatoryId?.trim() || !input.signedAt || !input.signingEvidence)) {
+      if (commerciallyActive && (!input.signatoryId?.trim() || !input.signedAt)) {
         throw new TRPCError3({
           code: "BAD_REQUEST",
-          message: "\u751F\u6548\u6216\u5F85\u751F\u6548\u5408\u540C\u5FC5\u987B\u5305\u542B\u7B7E\u7F72\u4E3B\u4F53\u3001\u7B7E\u7F72\u65F6\u95F4\u4E0E\u6838\u9A8C\u4F9D\u636E"
+          message: "\u751F\u6548\u6216\u5F85\u751F\u6548\u5408\u540C\u5FC5\u987B\u5305\u542B\u7B7E\u7F72\u4E3B\u4F53\u4E0E\u7B7E\u7F72\u65F6\u95F4"
         });
       }
       try {
@@ -21463,10 +21528,10 @@ var conversationRouter = router({
 // server/credential-router.ts
 import { z as z10 } from "zod";
 var apiKeyInput = z10.object({
-  apiKey: z10.string().trim().min(8, "API Key is too short").max(4096)
+  apiKey: z10.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26")
 });
 var testApiKeyInput = z10.object({
-  apiKey: z10.string().trim().min(8, "API Key is too short").max(4096).optional()
+  apiKey: z10.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26").optional()
 });
 async function saveCredential(userId, apiKey) {
   try {
@@ -22095,7 +22160,7 @@ var workspaceRouter = router({
       }),
       z14.object({
         mode: z14.literal("direct"),
-        question: z14.string().trim().min(2).max(4e3),
+        question: z14.string().trim().min(2, "\u76EE\u6807\u95EE\u9898\u81F3\u5C11\u9700\u8981 2 \u4E2A\u5B57\u7B26").max(4e3, "\u76EE\u6807\u95EE\u9898\u4E0D\u80FD\u8D85\u8FC7 4000 \u4E2A\u5B57\u7B26"),
         category: z14.enum([
           "industry",
           "competitor_comparison",
@@ -22166,6 +22231,7 @@ var workspaceRouter = router({
       return {
         ...workspace,
         configured,
+        enterpriseName: workspace.payload.brandName,
         payload: projectUserDashboardPayload({
           payload: workspace.payload,
           configured,
@@ -25774,10 +25840,10 @@ function normalizedEnterpriseName2(value) {
 }
 function resolveKnowledgeBaseEnterpriseIdentity(input) {
   const companyName = input.brandName.normalize("NFKC").trim();
-  if (!input.sourceName || !companyName) {
+  if (!companyName) {
     throw new KnowledgeBaseEnterpriseIdentityError(
       "ENTERPRISE_NOT_CONFIGURED",
-      "\u5F53\u524D\u8D26\u53F7\u5C1A\u672A\u7531\u7BA1\u7406\u5458\u914D\u7F6E\u6B63\u5F0F\u4F01\u4E1A\u4FE1\u606F\uFF0C\u65E0\u6CD5\u542F\u52A8\u77E5\u8BC6\u5E93\u6784\u5EFA"
+      "\u5F53\u524D\u8D26\u53F7\u5C1A\u672A\u7531\u7BA1\u7406\u5458\u914D\u7F6E\u4F01\u4E1A\u540D\u79F0\uFF0C\u65E0\u6CD5\u542F\u52A8\u77E5\u8BC6\u5E93\u6784\u5EFA"
     );
   }
   const requestedCompanyName = String(input.requestedCompanyName || "").trim();
@@ -26123,7 +26189,7 @@ router3.post("/start", async (req, res) => {
   const companyWebsite = String(body.companyWebsite || "").trim();
   const operatorNotes = String(body.operatorNotes || "").trim();
   if (!conversationId || conversationId.length > 191) {
-    res.status(400).json({ error: "Missing or invalid conversation id" });
+    res.status(400).json({ error: "\u77E5\u8BC6\u5E93\u5BF9\u8BDD\u6807\u8BC6\u7F3A\u5931\u6216\u65E0\u6548" });
     return;
   }
   if (!req.frontmindUser || !await requireKnowledgeBuildCapability(req.frontmindUser.id, res)) {
@@ -26135,7 +26201,7 @@ router3.post("/start", async (req, res) => {
   }
   const { apiKey, baseUrl } = getFrontMindCredentials(req);
   if (!apiKey) {
-    res.status(401).json({ error: "Missing API key" });
+    res.status(401).json({ error: "\u5F53\u524D\u8D26\u53F7\u5C1A\u672A\u914D\u7F6E\u53EF\u7528\u7684 API Key" });
     return;
   }
   try {
@@ -31774,8 +31840,8 @@ function normalizedEnterpriseEvidence(value) {
 }
 function assertKnowledgeArchiveEnterpriseIdentity(input) {
   const brandName = normalizedEnterpriseEvidence(input.brandName);
-  if (!input.enterpriseIdentityConfirmed || !brandName) {
-    throw new Error("\u8BF7\u5148\u7531\u7BA1\u7406\u5458\u914D\u7F6E\u5E76\u53D1\u5E03\u5F53\u524D\u8D26\u53F7\u7684\u4F01\u4E1A\u540D\u79F0");
+  if (!brandName) {
+    throw new Error("\u8BF7\u5148\u7531\u7BA1\u7406\u5458\u914D\u7F6E\u5F53\u524D\u8D26\u53F7\u7684\u4F01\u4E1A\u540D\u79F0");
   }
   const identityDocuments = input.documents.filter((document) => {
     const basename = path7.posix.basename(document.path).toLowerCase();
@@ -39005,7 +39071,7 @@ var icp_material_router_default = router10;
 // server/website-content-template-api.ts
 import { createHash as createHash22 } from "node:crypto";
 import express5 from "express";
-import { ZodError } from "zod";
+import { ZodError as ZodError2 } from "zod";
 
 // server/website-content-template-service.ts
 import { randomUUID as randomUUID25 } from "node:crypto";
@@ -39471,7 +39537,7 @@ function responseError(error) {
       message: error.code === "NOT_FOUND" ? "\u4F01\u4E1A\u5DE5\u4F5C\u53F0\u4E0D\u5B58\u5728\u6216\u5F53\u524D\u7BA1\u7406\u5458\u65E0\u6743\u8BBF\u95EE\u3002" : error.message
     };
   }
-  if (error instanceof ZodError) {
+  if (error instanceof ZodError2) {
     return {
       status: 400,
       code: "WEBSITE_CONTENT_TEMPLATE_SCHEMA_INVALID",

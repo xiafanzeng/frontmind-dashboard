@@ -3418,7 +3418,7 @@ var createDeliveryTicketSchema = z4.object({
     context.addIssue({
       code: z4.ZodIssueCode.custom,
       path: ["icpDeclarations"],
-      message: "ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
+      message: "\u57DF\u540D\u4E0E ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
     });
   }
 });
@@ -3656,7 +3656,8 @@ var publicContentAssetCatalogItemSchema = z4.object({
   code: z4.string().trim().min(1).max(64),
   group: z4.string().trim().min(1).max(64),
   type: z4.string().trim().min(1).max(160),
-  label: z4.string().trim().min(1).max(160)
+  label: z4.string().trim().min(1).max(160),
+  description: z4.string().trim().min(1).max(500).optional()
 }).strict();
 var publicWebsiteContentCatalogItemSchema = z4.object({
   value: z4.enum([

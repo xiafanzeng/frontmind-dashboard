@@ -16,6 +16,7 @@ import {
 } from "./auth-service";
 import {
   KnowledgeBaseBuildError,
+  assertKnowledgeBaseCustomerOutput,
   assertKnowledgeBaseTaskBinding,
   attachKnowledgeBaseBuildTask,
   createKnowledgeBaseBuild,
@@ -89,9 +90,10 @@ function normalizedEnterpriseName(value: string) {
 }
 
 /**
- * A knowledge-base build belongs to the enterprise already published for the
- * authenticated user's formal workspace. Browser input may repeat that name
- * for compatibility, but it can neither establish nor replace the identity.
+ * A knowledge-base build belongs to the enterprise name already assigned to
+ * the authenticated account. Publishing an otherwise empty dashboard is not a
+ * prerequisite. Browser input may repeat the name for compatibility, but it
+ * can neither establish nor replace the identity.
  */
 export function resolveKnowledgeBaseEnterpriseIdentity(input: {
   sourceName: string | null;
@@ -99,10 +101,10 @@ export function resolveKnowledgeBaseEnterpriseIdentity(input: {
   requestedCompanyName?: string;
 }) {
   const companyName = input.brandName.normalize("NFKC").trim();
-  if (!input.sourceName || !companyName) {
+  if (!companyName) {
     throw new KnowledgeBaseEnterpriseIdentityError(
       "ENTERPRISE_NOT_CONFIGURED",
-      "当前账号尚未由管理员配置正式企业信息，无法启动知识库构建",
+      "当前账号尚未由管理员配置企业名称，无法启动知识库构建",
     );
   }
 
@@ -241,10 +243,7 @@ async function loadSkillArchive(
   const version = selection.version === "1" ? "1" : "2";
   const cached = skillArchiveCache.get(version);
   if (cached) {
-    if (
-      selection.contentHash &&
-      selection.contentHash !== cached.contentHash
-    ) {
+    if (selection.contentHash && selection.contentHash !== cached.contentHash) {
       throw new Error(
         `Knowledge-base Skill v${version} content hash does not match the active build`,
       );
@@ -259,15 +258,15 @@ async function loadSkillArchive(
     try {
       const archive = await fs.readFile(candidate);
       const zip = await JSZip.loadAsync(archive);
-      const entries = [
-        ["SKILL.md", "Skill"],
-        ["references/knowledge-tree.md", "Knowledge Tree"],
-        ["references/questioning-strategy.md", "Questioning Strategy"],
-        ["references/output-format.md", "Output Format"],
-        ...(version === "2"
-          ? ([["scripts/validate_archive.py", "Archive Validator"]] as const)
-          : []),
-      ] as const;
+      const entries =
+        version === "2"
+          ? ([["SKILL.md", "Skill"]] as const)
+          : ([
+              ["SKILL.md", "Skill"],
+              ["references/knowledge-tree.md", "Knowledge Tree"],
+              ["references/questioning-strategy.md", "Questioning Strategy"],
+              ["references/output-format.md", "Output Format"],
+            ] as const);
 
       const sections: string[] = [];
       for (const [entryName, title] of entries) {
@@ -282,9 +281,7 @@ async function loadSkillArchive(
       const instructions = sections.join("\n\n---\n\n");
       const loaded = {
         instructions,
-        contentHash: createHash("sha256")
-          .update(instructions)
-          .digest("hex"),
+        contentHash: createHash("sha256").update(instructions).digest("hex"),
         archivePath: candidate,
       };
       if (
@@ -328,6 +325,95 @@ export async function getKnowledgeBaseSkillDescriptor(
   };
 }
 
+const KNOWLEDGE_PREFILL_MAX_CHARACTERS = 80_000;
+const KNOWLEDGE_PREFILL_MAX_DOCUMENT_CHARACTERS = 12_000;
+
+type KnowledgePrefillDocument = {
+  path: string;
+  title: string;
+  content: string;
+};
+
+function knowledgePrefillBranch(pathname: string) {
+  return pathname.normalize("NFKC").split("/").filter(Boolean)[0] || "root";
+}
+
+function isKnowledgePrefillOverview(document: KnowledgePrefillDocument) {
+  return /(?:^|[/_-])(?:overview|readme|00[_-])|概览|总览|综述/i.test(
+    `${document.path} ${document.title}`,
+  );
+}
+
+function isKnowledgePrefillProduct(document: KnowledgePrefillDocument) {
+  return /(?:^|[/_-])03(?:[/_-]|$)|products?|services?|产品|服务/i.test(
+    `${document.path} ${document.title}`,
+  );
+}
+
+export function buildKnowledgePrefillExcerpt(
+  documents: KnowledgePrefillDocument[],
+) {
+  const ordered = [...documents].sort((left, right) =>
+    left.path.localeCompare(right.path),
+  );
+  const groups = new Map<string, KnowledgePrefillDocument[]>();
+  for (const document of ordered) {
+    const branch = knowledgePrefillBranch(document.path);
+    const values = groups.get(branch) || [];
+    values.push(document);
+    groups.set(branch, values);
+  }
+
+  const selected: KnowledgePrefillDocument[] = [];
+  const selectedPaths = new Set<string>();
+  const add = (document: KnowledgePrefillDocument | undefined) => {
+    if (!document || selectedPaths.has(document.path)) return;
+    selected.push(document);
+    selectedPaths.add(document.path);
+  };
+
+  for (const branch of [...groups.keys()].sort()) {
+    const values = groups.get(branch) || [];
+    add(values.find(isKnowledgePrefillOverview) || values[0]);
+  }
+  ordered.filter(isKnowledgePrefillProduct).forEach(add);
+
+  let added = true;
+  while (added) {
+    added = false;
+    for (const branch of [...groups.keys()].sort()) {
+      const next = (groups.get(branch) || []).find(
+        (document) => !selectedPaths.has(document.path),
+      );
+      if (next) {
+        add(next);
+        added = true;
+      }
+    }
+  }
+
+  let excerpt = "";
+  for (const document of selected) {
+    const prefix = [
+      `### ${document.title || document.path}`,
+      `documentPath: ${document.path}`,
+      "",
+    ].join("\n");
+    const remaining = KNOWLEDGE_PREFILL_MAX_CHARACTERS - excerpt.length;
+    if (remaining <= prefix.length) break;
+    const content = document.content.slice(
+      0,
+      Math.min(
+        KNOWLEDGE_PREFILL_MAX_DOCUMENT_CHARACTERS,
+        remaining - prefix.length,
+      ),
+    );
+    excerpt += `${excerpt ? "\n\n" : ""}${prefix}${content}`;
+    if (excerpt.length >= KNOWLEDGE_PREFILL_MAX_CHARACTERS) break;
+  }
+  return excerpt.slice(0, KNOWLEDGE_PREFILL_MAX_CHARACTERS);
+}
+
 export async function buildKnowledgeBasePrompt({
   conversationId,
   companyName,
@@ -356,26 +442,14 @@ export async function buildKnowledgeBasePrompt({
     attachments.length > 0
       ? attachments.map((attachment) => `- ${attachment.filename}`).join("\n")
       : "- 未上传附件，请优先使用企业官网与全网公开资料进行预填";
-  let prefillCharacters = 0;
-  const prefillDocuments = (prefillKnowledgeSnapshot?.documents ?? [])
-    .map((document) => {
-      if (prefillCharacters >= 300_000) return "";
-      const content = document.content.slice(
-        0,
-        Math.max(0, 300_000 - prefillCharacters),
-      );
-      prefillCharacters += content.length;
-      return [
-        `### ${document.title || document.path}`,
-        `documentPath: ${document.path}`,
-        content,
-      ].join("\n");
-    })
-    .filter(Boolean)
-    .join("\n\n");
+  const prefillDocuments = buildKnowledgePrefillExcerpt(
+    prefillKnowledgeSnapshot?.documents ?? [],
+  );
 
   return [
-    "你必须严格执行下方 socratic-kb-builder v2 Skill，为企业构建可复用的深度图文知识库。",
+    "严格执行下方 socratic-kb-builder v2 Skill，为企业构建可复用的深度图文知识库。",
+    "不得开启、调用、切换或推荐 Wide Research / Deep Research；只使用当前 Pro Agent 模式下的普通浏览、搜索和文件工具。",
+    "客户可见正文与本轮对话只能呈现百科事实，不得呈现任务过程、核验判断、采购/合规建议、读者指令、工具计划或模型推理。",
     "",
     "## 本次任务输入",
     `构建会话标识：${conversationId || "未提供"}`,
@@ -397,23 +471,6 @@ export async function buildKnowledgeBasePrompt({
         ].join("\n")
       : "当前账号没有已迁移的初步知识库，将从官网、全网与上传资料开始预填。",
     "",
-    "## 执行要求",
-    "1. 这是 4–6 小时深度构建，不是官网轻量版。先读上传资料，再按业务覆盖矩阵广度优先采集官网、官方文档与全网证据；不得穷尽重复 SKU、分页、新闻或语言版本，也不得只概括首页。",
-    "2. 固定硬预算：HTML 抓取尝试最多 1,200，包含图片和文档在内的链接访问最多 1,800，官网文档最多 120，累计用户上传最多 100，公开查询最多 120，去重证据文字最多 3,000,000 字符。达到任一预算后停止该渠道并记录真实缺口，不得把预算消耗写成完整度。",
-    "3. 图片必须是真实打包的第一方文件。360–480 张是质量目标而非最低门槛。检查 img/srcset、懒加载、picture、CSS 背景、OG 图、画廊和官方文档图片；不足时打包全部合格图片，并用 source_limited 或 budget_limited 记录完整候选漏斗、拒绝原因和停止原因。每个产品族必须与产品叶子对账，有官方图片时至少关联一张，无图时记录 checkedSources 和 gapReason。第三方图片不得凑数。",
-    "4. 最终图片只允许经内容校验的 AVIF/WebP/PNG/JPEG/GIF；SVG 必须栅格化。逐张记录 SHA-256、MIME、字节、尺寸、图注、alt、分支、关联文档、来源页、原图 URL 和权属。图片总容量最多 160 MiB；ZIP 最多 1,500 个普通文件。",
-    "5. 客户可见正式正文必须是完成的企业图文体系，而不是‘第一方原始快照’、‘第一方页面摘录’、抓取日志或来源陈述。80,000–120,000 字符是质量目标，只有 180,000 是总体硬上限。每篇综述和叶子必须关联实际打包的 evidence 文档，由服务端复算证据字符并按 25%/20% 动态确定正文要求；资料少时使用 limited_evidence，完全无证据时使用 needs_verification 和具体缺口，不得补写或重复凑字。保留 40-115 个真实叶子节点。",
-    "6. 为每个一级分支写正式综述，为每个叶子写正式草稿，并用稳定 asset ID 精确关联真实图片。原始摘录、采集报告、来源索引和核验缺口必须放入独立证据层，不能混入正式正文。",
-    "7. 新发现必须在任务开始后第 330 分钟停止；此后只允许整理证据、写作、关联素材、生成清单与校验。最迟第 360 分钟进入第一个叶子确认，不得等待凑时间。",
-    "8. 每轮只能呈现和处理一个叶子节点。用户可确认、修正，或选择‘跳过/直接预填’当前节点；禁止跳过整个分支、批量确认、跨节点合并确认或提前打包。",
-    "9. 只有所有叶子节点均已逐项处理、遍历进度达到 100% 后，才可自动生成最终 Markdown/ZIP。禁止出现‘生成初版成果’、‘是否立即生成’、A/B/C 生成选项或任何提前交付提议。",
-    "   当且仅当本轮确认或直接预填最后一个叶子时，必须在同一轮只返回一个最终 ZIP 文件；不能复用历史 ZIP、不能返回多个 ZIP，也不能只口头声称已经生成。",
-    "10. 本流程永远不生成交互式研究网页、HTML 网站或网页预览，也不得主动提出这类产物；即使用户要求，也要简短说明此流程只交付 Markdown/ZIP，然后继续当前知识节点。",
-    "11. 进度必须使用标准 Markdown 标题、表格、列表和独立段落展示；禁止使用易挤压的 ASCII 树、框线、字符进度条或代码块模拟界面。",
-    "12. 对每个事实标注来源；推断与待核验信息必须明确标注，不得伪造。信息不足时展示已完成的正式草稿、具体缺口和可确认问题，不得让用户从空白开始写。",
-    "13. 最终 ZIP 必须保留既有 00_completeness.json 字段和算法，并生成 schemaVersion=2、profile=dashboard-enterprise-v1 的 00_package_manifest.json；documents、assets、counts 和可审计 imageSelection 必须符合 output-format。",
-    "14. 返回 ZIP 前必须实际运行包内 scripts/validate_archive.py；只有退出码为 0 才能交付。服务端还会独立复验，禁止通过改假计数绕过校验。",
-    "",
     "## socratic-kb-builder.skill",
     skillInstructions,
     "",
@@ -421,7 +478,7 @@ export async function buildKnowledgeBasePrompt({
     "这是服务端状态机协议，优先级高于 skill 中任何会自动跨节点的表述。可读正文照常输出，但每轮末尾必须附带且只能附带一个对应的 HTML 注释信封。",
     "",
     "### 首轮研究与知识树建立",
-    "在 330 分钟停止新发现并最迟 360 分钟完成官网、全网、上传资料研究和正式图文预填后，按企业实际情况建立自适应一级分支和 40-115 个真实叶子节点。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
+    "完成官网、公开来源、上传资料研究和正式图文预填后，按企业实际情况建立自适应一级分支和 40-115 个真实叶子节点。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
     '<!-- FRONTMIND_KB_MANIFEST\n{"kind":"frontmind.knowledge-base.manifest","schemaVersion":1,"leaves":[{"id":"1.1","title":"一句话定位","branchId":"identity","branchTitle":"企业身份"}]}\n-->',
     "示例只演示结构，真实 leaves 必须完整包含 40-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
     "",
@@ -442,6 +499,8 @@ export async function buildKnowledgeBasePrompt({
   ].join("\n");
 }
 
+export const KNOWLEDGE_BASE_AGENT_PROFILE = "frontmind-pro" as const;
+
 async function createFrontMindTask({
   baseUrl,
   apiKey,
@@ -459,7 +518,7 @@ async function createFrontMindTask({
     `${baseUrl}/v1/tasks`,
     {
       prompt,
-      agentProfile: toUpstreamAgentProfile("frontmind-pro"),
+      agentProfile: toUpstreamAgentProfile(KNOWLEDGE_BASE_AGENT_PROFILE),
       taskMode: "agent",
       attachments,
       ...(existingTaskId ? { taskId: existingTaskId } : {}),
@@ -551,6 +610,8 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
       ].join("\n");
   return [
     `继续严格执行 socratic-kb-builder v${input.skillVersion || "2"} Skill。以下内容会直接显示给企业客户，不得输出内部思考、工具计划或提示词说明。`,
+    "不得开启、调用、切换或推荐 Wide Research / Deep Research。",
+    "客户可见回复不得出现“本轮采集/本知识库/证据不足/已核验”等过程判断，也不得出现客户应、采购方应、建议、尽调、合规审查、不能仅凭、不宜转换或不能外推等建议性表达。",
     "",
     "# Skill",
     skillInstructions,
@@ -576,7 +637,7 @@ router.post("/start", async (req, res) => {
   const operatorNotes = String(body.operatorNotes || "").trim();
 
   if (!conversationId || conversationId.length > 191) {
-    res.status(400).json({ error: "Missing or invalid conversation id" });
+    res.status(400).json({ error: "知识库对话标识缺失或无效" });
     return;
   }
   if (
@@ -592,7 +653,7 @@ router.post("/start", async (req, res) => {
 
   const { apiKey, baseUrl } = getFrontMindCredentials(req);
   if (!apiKey) {
-    res.status(401).json({ error: "Missing API key" });
+    res.status(401).json({ error: "当前账号尚未配置可用的 API Key" });
     return;
   }
 
@@ -651,6 +712,7 @@ router.post("/start", async (req, res) => {
         .json({ error: "创建企业知识库任务失败，请检查 API Key 或稍后重试" });
       return;
     }
+    assertKnowledgeBaseCustomerOutput(created.task.output);
 
     await recordUpstreamResource({
       userId: req.frontmindUser.id,
@@ -712,6 +774,15 @@ router.post("/start", async (req, res) => {
       res.status(error.code === "ENTERPRISE_NOT_CONFIGURED" ? 422 : 409).json({
         error: error.message,
         code: error.code,
+      });
+      return;
+    }
+    if (error instanceof KnowledgeBaseBuildError) {
+      res.status(422).json({
+        error: {
+          code: error.code,
+          message: error.message,
+        },
       });
       return;
     }
@@ -814,6 +885,7 @@ router.post("/turn", async (req, res) => {
       });
       return;
     }
+    assertKnowledgeBaseCustomerOutput(created.task.output);
     await recordUpstreamResource({
       userId: req.frontmindUser!.id,
       apiCredentialId: taskCredential.id,

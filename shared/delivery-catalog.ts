@@ -10,6 +10,7 @@ export const CONTENT_ASSET_CATALOG = Object.freeze([
     group: "A",
     type: "品牌事实内容",
     label: "企业资料与品牌事实",
+    description: "整理企业简介、发展历程、资质荣誉等可核验的品牌事实。",
   },
   {
     id: "A2",
@@ -17,6 +18,7 @@ export const CONTENT_ASSET_CATALOG = Object.freeze([
     group: "A",
     type: "案例内容",
     label: "用户案例与成功故事",
+    description: "将项目背景、解决方案与量化成果整理为可信客户案例。",
   },
   {
     id: "B1",
@@ -24,6 +26,7 @@ export const CONTENT_ASSET_CATALOG = Object.freeze([
     group: "B",
     type: "行业内容",
     label: "行业观点与趋势观察",
+    description: "围绕行业变化、关键议题和专业判断形成深度观点内容。",
   },
   {
     id: "B2",
@@ -31,6 +34,7 @@ export const CONTENT_ASSET_CATALOG = Object.freeze([
     group: "B",
     type: "产品内容",
     label: "产品能力与应用场景",
+    description: "清晰说明产品能力、适用场景、使用方式与选择依据。",
   },
   {
     id: "C1",
@@ -38,13 +42,7 @@ export const CONTENT_ASSET_CATALOG = Object.freeze([
     group: "C",
     type: "新闻内容",
     label: "企业新闻与动态",
-  },
-  {
-    id: "C2",
-    code: "C2",
-    group: "C",
-    type: "媒体内容",
-    label: "媒体稿件与权威信源",
+    description: "发布企业进展、合作动态、活动信息与重要里程碑。",
   },
   {
     id: "D1",
@@ -52,6 +50,7 @@ export const CONTENT_ASSET_CATALOG = Object.freeze([
     group: "D",
     type: "问答内容",
     label: "知乎问答",
+    description: "围绕用户真实问题输出专业、自然且有事实支撑的回答。",
   },
 ] as const);
 

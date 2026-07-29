@@ -1,7 +1,0 @@
-asset_id,path,source,license_or_permission,permitted_use,expires,owner,status
-R001,01-assets/original/reference-operation-recording.mp4,User-provided screen recording,"Provided by the user for this FrontMind project","Creative reference, frame extraction, internal review; final use only after privacy review",,User / FrontMind,approved
-R002,/Users/fanzengxia/Documents/GitHub/frontmind-website,First-party FrontMind website repository,"Project owner supplied the repository in task scope","Capture and reproduce FrontMind public product UI for FrontMind promotional film",,FrontMind,approved
-R003,/Users/fanzengxia/Documents/GitHub/frontmind-dashboard,First-party FrontMind dashboard repository,"Project owner supplied the repository in task scope","Capture and reproduce safe demo user-backend UI for FrontMind promotional film",,FrontMind,approved
-R004,/Users/fanzengxia/Documents/GitHub/frontmind-website/client/public/brand/frontmind-logo.svg,First-party FrontMind brand asset,"First-party project asset","FrontMind identity in titles, UI context and end card; preserve geometry",,FrontMind,approved
-R005,"PingFang SC / system UI fallback",macOS system font,"Use on the licensed production workstation; final output is rasterized video","Chinese subtitles and interface annotation in rendered video",,Apple / production workstation,approved
-R006,TBD Mandarin voice and music assets,TBD,TBD,"Final narration and background score",,Production,pending

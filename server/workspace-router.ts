@@ -341,7 +341,11 @@ export const workspaceRouter = router({
         }),
         z.object({
           mode: z.literal("direct"),
-          question: z.string().trim().min(2).max(4_000),
+          question: z
+            .string()
+            .trim()
+            .min(2, "目标问题至少需要 2 个字符")
+            .max(4_000, "目标问题不能超过 4000 个字符"),
           category: z.enum([
             "industry",
             "competitor_comparison",
@@ -420,6 +424,7 @@ export const workspaceRouter = router({
       return {
         ...workspace,
         configured,
+        enterpriseName: workspace.payload.brandName,
         payload: projectUserDashboardPayload({
           payload: workspace.payload,
           configured,

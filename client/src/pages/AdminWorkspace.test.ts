@@ -54,5 +54,7 @@ describe("admin customer workspace", () => {
     expect(source).not.toContain("合同编号");
     expect(source).not.toContain("serviceOrderReference");
     expect(source).not.toContain("serviceContractReference");
+    expect(source).not.toContain("新增签署或收款核验依据");
+    expect(source).not.toContain("serviceEvidenceNote");
   });
 });

@@ -9,13 +9,17 @@ import {
   publicWebsiteTicketDetailSchema,
   resolveDeliveryTicketQuotaPool,
 } from "../shared/delivery-ticket";
-import { icpMaterialChecklistForProvince } from "../shared/delivery-catalog";
+import {
+  CONTENT_ASSET_CATALOG,
+  icpMaterialChecklistForProvince,
+} from "../shared/delivery-catalog";
 import {
   aggregateDeliveryTicketQuotaCapacity,
   assertExistingDeliveryTicketSettlementScope,
   assertDeliveryTicketServiceEligibility,
   assertDeliveryOperationPolicy,
   assertDeliveryTicketMessagePolicy,
+  assertWebsiteTicketWorkflow,
   decodeDeliveryTicketCursor,
   deliveryLinksFromOperationResults,
   deriveTicketQuotaTransition,
@@ -58,6 +62,18 @@ function settlementExecutor(
 }
 
 describe("delivery ticket contract", () => {
+  it("publishes six explained content types without the retired media type", () => {
+    expect(CONTENT_ASSET_CATALOG).toHaveLength(6);
+    expect(
+      CONTENT_ASSET_CATALOG.some(
+        (item) => item.label === "媒体稿件与权威信源",
+      ),
+    ).toBe(false);
+    expect(
+      CONTENT_ASSET_CATALOG.every((item) => item.description.length > 0),
+    ).toBe(true);
+  });
+
   it("derives public media links only from successful structured delivery records", () => {
     expect(
       deliveryLinksFromOperationResults([
@@ -226,6 +242,59 @@ describe("delivery ticket contract", () => {
         },
       }).icpDeclarations,
     ).toMatchObject({ aliyunAppVerificationCompleted: true });
+  });
+
+  it("accepts one combined domain and ICP submission before a site profile exists", async () => {
+    const value = createDeliveryTicketSchema.parse({
+      clientRequestId: "5f05091b-0e0a-4482-8f11-654c4502b3e1",
+      type: "website_operation",
+      category: "icp_filing",
+      topic: "https://Example.com/path",
+      icpProvince: "浙江",
+      icpDeclarations: {
+        domainHolderInformation: "域名持有人与主办单位一致",
+        websiteInformation: "验收企业官网，展示产品与案例",
+        aliyunAppVerificationCompleted: true,
+      },
+      attachments: [
+        {
+          storageKind: "icp_protected",
+          protectedMaterialId: "00000000-0000-4000-8000-000000000001",
+          sensitiveCategory: "business_license",
+          filename: "营业执照.pdf",
+        },
+        {
+          storageKind: "icp_protected",
+          protectedMaterialId: "00000000-0000-4000-8000-000000000002",
+          sensitiveCategory: "subject_responsible_person_id",
+          filename: "主体负责人证件.pdf",
+        },
+        {
+          storageKind: "icp_protected",
+          protectedMaterialId: "00000000-0000-4000-8000-000000000003",
+          sensitiveCategory: "website_responsible_person_id",
+          filename: "网站负责人证件.pdf",
+        },
+      ],
+    });
+    const executor = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            limit: () => ({
+              for: async () => [],
+            }),
+          }),
+        }),
+      }),
+    };
+
+    await expect(
+      assertWebsiteTicketWorkflow(executor, 42, value),
+    ).resolves.toEqual({
+      profile: null,
+      domain: "example.com",
+    });
   });
 
   it("returns province-specific ICP requirements from the server catalog", () => {

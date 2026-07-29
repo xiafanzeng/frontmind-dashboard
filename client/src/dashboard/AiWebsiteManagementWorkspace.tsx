@@ -191,7 +191,7 @@ const DOMAIN_APPLICATION: WorkOrderTypeDefinition = {
 
 const ICP_FILING: WorkOrderTypeDefinition = {
   id: "icp_filing",
-  label: "ICP 备案与主体材料",
+  label: "域名申请与 ICP 备案材料",
 };
 
 const ICP_BASE_MATERIAL_FIELDS = [
@@ -224,7 +224,7 @@ const VERIFIED_PROFILE_STATUSES = new Set([
   "verified",
 ]);
 
-type WorkflowPhase = "domain" | "icp" | "content";
+type WorkflowPhase = "icp" | "content";
 
 function isHttpUrl(value: string) {
   try {
@@ -346,16 +346,16 @@ function deriveWorkflow({
         domainPending),
     icpCompleted,
     icpPending:
-      domainCompleted &&
       !icpCompleted &&
       (websiteWorkflow?.icpStatus === "pending" ||
+        websiteWorkflow?.icpStatus === "preparing" ||
         workflowState?.icpFiling === "pending" ||
-        icpPending),
+        icpPending ||
+        domainPending),
   };
 }
 
 function phaseDefinition(phase: WorkflowPhase) {
-  if (phase === "domain") return DOMAIN_APPLICATION;
   if (phase === "icp") return ICP_FILING;
   return null;
 }
@@ -417,24 +417,16 @@ export default function AiWebsiteManagementWorkspace({
       }),
     [siteProfile, tickets, websiteWorkflow, workflowState],
   );
-  const phase: WorkflowPhase = !workflow.domainCompleted
-    ? "domain"
-    : !workflow.icpCompleted
-      ? "icp"
-      : "content";
+  const phase: WorkflowPhase = !workflow.icpCompleted ? "icp" : "content";
   const phaseTicketPending =
-    phase === "domain"
-      ? workflow.domainPending
-      : phase === "icp"
-        ? workflow.icpPending
-        : false;
+    phase === "icp" ? workflow.domainPending || workflow.icpPending : false;
   const phaseAllowedByWorkflow =
     !websiteWorkflow ||
-    (phase === "domain"
-      ? websiteWorkflow.canSubmitDomain !== false
-      : phase === "icp"
-        ? websiteWorkflow.canSubmitIcp !== false
-        : websiteWorkflow.canSubmitContent !== false);
+    (phase === "icp"
+      ? websiteWorkflow.canSubmitIcp !== false ||
+        (!workflow.domainCompleted &&
+          websiteWorkflow.canSubmitDomain !== false)
+      : websiteWorkflow.canSubmitContent !== false);
   const workflowLockReason =
     phase === "icp"
       ? websiteWorkflow?.icpLockReason || websiteWorkflow?.lockReason
@@ -625,7 +617,11 @@ export default function AiWebsiteManagementWorkspace({
     }
     if (!normalizedTopic) {
       setSubmitState("error");
-      setSubmitMessage("请填写需要处理的话题。");
+      setSubmitMessage(
+        phase === "icp"
+          ? "请填写需要申请或核验的域名。"
+          : "请填写需要处理的话题。",
+      );
       return;
     }
     if (phase === "icp" && !icpProvince) {
@@ -726,7 +722,7 @@ export default function AiWebsiteManagementWorkspace({
         <p className="ai-website-eyebrow">AI 友好内容资产</p>
         <h1 id="ai-website-title">AI 友好官网管理</h1>
         <p className="ai-website-intro">
-          完成域名申请与 ICP 备案后，即可持续提交企业官网内容运营需求。
+          统一提交域名申请与 ICP 备案材料，审核完成后即可持续提交企业官网内容运营需求。
         </p>
       </header>
 
@@ -737,36 +733,23 @@ export default function AiWebsiteManagementWorkspace({
         <div className="ai-website-section-heading">
           <div>
             <h2 id="ai-website-prerequisites-title">官网开通进度</h2>
-            <p>前一阶段经管理员确认完成后，下一阶段才会开放。</p>
+            <p>域名与备案材料一次提交，管理员统一核验后开放内容运营。</p>
           </div>
         </div>
         <ol className="ai-website-stepper">
           <WorkflowStep
             index={1}
-            label="域名申请"
+            label="域名申请与 ICP 备案材料"
             state={
-              workflow.domainCompleted
+              workflow.icpCompleted
                 ? "completed"
-                : workflow.domainPending
+                : workflow.domainPending || workflow.icpPending
                   ? "pending"
                   : "current"
             }
           />
           <WorkflowStep
             index={2}
-            label="ICP 备案与主体材料"
-            state={
-              workflow.icpCompleted
-                ? "completed"
-                : !workflow.domainCompleted
-                  ? "locked"
-                  : workflow.icpPending
-                    ? "pending"
-                    : "current"
-            }
-          />
-          <WorkflowStep
-            index={3}
             label="官网内容运营"
             state={
               !workflow.icpCompleted
@@ -801,11 +784,9 @@ export default function AiWebsiteManagementWorkspace({
           <div className="ai-website-section-heading">
             <div>
               <h2>
-                {phase === "domain"
-                  ? "提交域名申请工单"
-                  : phase === "icp"
-                    ? "提交 ICP 备案与主体材料"
-                    : "提交官网内容运营工单"}
+                {phase === "icp"
+                  ? "统一提交域名与 ICP 备案材料"
+                  : "提交官网内容运营工单"}
               </h2>
               {phase === "icp" && (
                 <p>
@@ -823,7 +804,7 @@ export default function AiWebsiteManagementWorkspace({
           {phaseTicketPending || !phaseAllowedByWorkflow ? (
             <div className="ai-website-inline-state" role="status">
               {phaseTicketPending
-                ? "当前阶段已有待受理工单。管理员确认完成后，下一阶段会自动开放。"
+                ? "域名与备案材料已提交，管理员统一核验完成后会自动开放内容运营。"
                 : workflowLockReason || "当前阶段暂未开放。"}
             </div>
           ) : (
@@ -1010,19 +991,17 @@ export default function AiWebsiteManagementWorkspace({
               )}
 
               <label className="ai-website-form-field">
-                <span>话题</span>
+                <span>{phase === "icp" ? "申请或核验的域名" : "话题"}</span>
                 <input
                   type="text"
-                  aria-label="话题"
+                  aria-label={phase === "icp" ? "申请或核验的域名" : "话题"}
                   aria-required="true"
                   value={topic}
                   onChange={(event) => setTopic(event.target.value)}
                   placeholder={
-                    phase === "domain"
-                      ? "填写希望申请的域名或命名方向"
-                      : phase === "icp"
-                        ? "填写备案主体与网站用途"
-                        : "填写本次需要更新的官网话题"
+                    phase === "icp"
+                      ? "例如 example.com；如需新申请，也请填写首选域名"
+                      : "填写本次需要更新的官网话题"
                   }
                 />
               </label>
@@ -1128,7 +1107,8 @@ export default function AiWebsiteManagementWorkspace({
         </form>
       )}
 
-      {enableIcpMaterialManagement && workflow.domainCompleted && (
+      {enableIcpMaterialManagement &&
+        (phaseTicketPending || workflow.icpCompleted) && (
         <section
           className="ai-website-icp-material-manager"
           aria-labelledby="ai-website-icp-material-manager-title"

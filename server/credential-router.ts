@@ -11,11 +11,20 @@ import {
 import { toTrpcError } from "./auth-router";
 
 const apiKeyInput = z.object({
-  apiKey: z.string().trim().min(8, "API Key is too short").max(4096),
+  apiKey: z
+    .string()
+    .trim()
+    .min(8, "API Key 至少需要 8 个字符")
+    .max(4096, "API Key 不能超过 4096 个字符"),
 });
 
 const testApiKeyInput = z.object({
-  apiKey: z.string().trim().min(8, "API Key is too short").max(4096).optional(),
+  apiKey: z
+    .string()
+    .trim()
+    .min(8, "API Key 至少需要 8 个字符")
+    .max(4096, "API Key 不能超过 4096 个字符")
+    .optional(),
 });
 
 async function saveCredential(userId: number, apiKey: string) {

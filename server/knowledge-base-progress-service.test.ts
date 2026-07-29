@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  assertKnowledgeBaseCustomerOutput,
   classifyKnowledgeBaseUserAction,
   extractFinalKnowledgeBaseAssistantText,
 } from "./knowledge-base-progress-service";
@@ -78,5 +79,31 @@ describe("knowledge-base model output boundary", () => {
     for (const output of untrustedOutputs) {
       expect(extractFinalKnowledgeBaseAssistantText(output)).toBe("");
     }
+  });
+
+  it.each([
+    "其余荣誉图片因本轮没有形成可逐项核验的证书名称与有效期，不在正文中扩写。采购或合规审查仍应向企业索取证书编号，不能仅凭网页图标替代正式查验。",
+    "这些内容属于企业自我定义，适合说明组织意图与品牌取向，不宜直接转换为已经量化达成的社会影响。对客户而言，可将其落实为开放模型生态。",
+  ])(
+    "rejects audit reasoning before a turn can be shown to customers",
+    (text) => {
+      expect(() =>
+        assertKnowledgeBaseCustomerOutput([
+          { role: "assistant", type: "message", content: text },
+        ]),
+      ).toThrow("客户可见知识库回复包含核验过程、建议或内部推理");
+    },
+  );
+
+  it("allows neutral negative facts in a customer-facing turn", () => {
+    expect(
+      assertKnowledgeBaseCustomerOutput([
+        {
+          role: "assistant",
+          type: "message",
+          content: "2025 年毛利率为 -24.0%，公司当期仍处于亏损状态。",
+        },
+      ]),
+    ).toContain("毛利率");
   });
 });

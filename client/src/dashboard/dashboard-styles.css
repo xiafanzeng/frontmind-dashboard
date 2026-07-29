@@ -4003,6 +4003,23 @@
   line-height: 1.65;
 }
 
+.user-brand-dashboard .content-request-quota {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  border-color: rgba(91, 42, 134, 0.3);
+  background: linear-gradient(135deg, #fbf6ff, #fffaf0);
+  color: #4f3a63;
+  box-shadow: 0 8px 22px rgba(91, 42, 134, 0.08);
+  font-weight: 650;
+}
+
+.user-brand-dashboard .content-request-quota strong {
+  color: #5b2a86;
+  font-size: 1.65rem;
+  line-height: 1;
+}
+
 .user-brand-dashboard .content-request-overview {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(220px, 0.34fr);
