@@ -40,6 +40,10 @@ import type {
 } from "../shared/knowledge-base-progress";
 import { knowledgeBaseBuilds } from "../drizzle/schema";
 import { getDb } from "./db";
+import {
+  assertSafeExternalUrl,
+  safeExternalRequestOptions,
+} from "./_core/safe-external-url";
 
 const router = Router();
 
@@ -553,6 +557,8 @@ interface LoadedKnowledgeBaseSkill {
 }
 
 const skillArchiveCache = new Map<string, LoadedKnowledgeBaseSkill>();
+export const KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME =
+  "socratic-kb-builder.skill.zip";
 
 function sanitizeFilename(value: string, fallback: string) {
   const safe = String(value || "")
@@ -649,6 +655,18 @@ async function readSkillArchive(
   selection: KnowledgeBaseSkillSelection = { version: "2" },
 ) {
   return (await loadSkillArchive(selection)).instructions;
+}
+
+export async function readKnowledgeBaseSkillArchiveAttachment(
+  selection: KnowledgeBaseSkillSelection = { version: "2" },
+) {
+  const loaded = await loadSkillArchive(selection);
+  const bytes = await fs.readFile(loaded.archivePath);
+  return {
+    filename: KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
+    bytes,
+    contentHash: loaded.contentHash,
+  };
 }
 
 export async function getKnowledgeBaseSkillDescriptor(
@@ -778,7 +796,6 @@ export async function buildKnowledgeBasePrompt({
     documents: Array<{ path: string; title: string; content: string }>;
   } | null;
 }) {
-  const skillInstructions = await readSkillArchive();
   const attachmentList =
     attachments.length > 0
       ? attachments.map((attachment) => `- ${attachment.filename}`).join("\n")
@@ -788,7 +805,8 @@ export async function buildKnowledgeBasePrompt({
   );
 
   return [
-    "严格执行下方 socratic-kb-builder v2 Skill，为企业构建可复用的深度图文知识库。",
+    `严格执行随任务附带的 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}。先解压 ZIP 并完整读取根目录 SKILL.md，再开始工作。`,
+    "该 ZIP 是本任务唯一的 socratic-kb-builder v2 工作规约；本段仅提供企业输入和服务端状态约束。",
     "不得开启、调用、切换或推荐 Wide Research / Deep Research；只使用当前 Pro Agent 模式下的普通浏览、搜索和文件工具。",
     "客户可见正文与本轮对话只能呈现百科事实，不得呈现任务过程、核验判断、采购/合规建议、读者指令、工具计划或模型推理。",
     "客户可见正文不得嵌入官网或 CDN 图片外链。图片必须先下载真实字节、解码校验并打入最终 ZIP，再以包内相对路径引用；防盗链、签名、过期或无法下载的地址只能进入内部来源记录，绝不能作为客户图片返回。",
@@ -812,10 +830,6 @@ export async function buildKnowledgeBasePrompt({
           prefillDocuments || "当前版本没有可读取的正文。",
         ].join("\n")
       : "当前账号没有已迁移的初步知识库，将从官网、全网与上传资料开始预填。",
-    "",
-    "## socratic-kb-builder.skill",
-    skillInstructions,
-    "",
     "## 必须执行的机器可验证进度协议",
     "这是服务端状态机协议，优先级高于 skill 中任何会自动跨节点的表述。可读正文照常输出，但每轮末尾必须附带且只能附带一个对应的 HTML 注释信封。",
     "",
@@ -842,6 +856,94 @@ export async function buildKnowledgeBasePrompt({
 }
 
 export const KNOWLEDGE_BASE_AGENT_PROFILE = "frontmind-pro" as const;
+
+export async function uploadKnowledgeBaseSkillArchive({
+  baseUrl,
+  apiKey,
+  skillVersion = "2",
+  skillContentHash,
+}: {
+  baseUrl: string;
+  apiKey: string;
+  skillVersion?: string;
+  skillContentHash?: string | null;
+}) {
+  const archive = await readKnowledgeBaseSkillArchiveAttachment({
+    version: skillVersion,
+    contentHash: skillContentHash,
+  });
+  const headers = {
+    API_KEY: apiKey,
+    Authorization: `Bearer ${apiKey}`,
+  };
+  const created = await axios.post(
+    `${baseUrl}/v1/files`,
+    { filename: archive.filename },
+    {
+      headers: { ...headers, "Content-Type": "application/json" },
+      timeout: 120_000,
+      validateStatus: () => true,
+    },
+  );
+  const fileId = String(created.data?.id || created.data?.file_id || "");
+  if (created.status < 200 || created.status >= 300 || !fileId) {
+    throw new Error("Knowledge-base Skill ZIP file creation failed");
+  }
+
+  const removeOrphan = async () => {
+    await axios
+      .delete(`${baseUrl}/v1/files/${encodeURIComponent(fileId)}`, {
+        headers,
+        timeout: 30_000,
+        validateStatus: () => true,
+      })
+      .catch(() => undefined);
+  };
+
+  try {
+    let uploadUrl = String(created.data?.upload_url || "");
+    if (!uploadUrl) {
+      const metadata = await axios.get(
+        `${baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
+        {
+          headers,
+          timeout: 30_000,
+          validateStatus: () => true,
+        },
+      );
+      if (metadata.status < 200 || metadata.status >= 300) {
+        throw new Error("Knowledge-base Skill ZIP upload URL lookup failed");
+      }
+      uploadUrl = String(metadata.data?.upload_url || "");
+    }
+    const target = assertSafeExternalUrl(uploadUrl);
+    const uploaded = await axios.put(target, archive.bytes, {
+      ...safeExternalRequestOptions,
+      // The SigV4 query signs this exact URL; redirects invalidate it.
+      maxRedirects: 0,
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Length": String(archive.bytes.length),
+      },
+      timeout: 120_000,
+      maxBodyLength: archive.bytes.length,
+      maxContentLength: 1024 * 1024,
+      validateStatus: () => true,
+    });
+    if (uploaded.status < 200 || uploaded.status >= 300) {
+      throw new Error("Knowledge-base Skill ZIP upload failed");
+    }
+    return {
+      attachment: { file_id: fileId, filename: archive.filename },
+      fileId,
+      contentHash: archive.contentHash,
+      removeOrphan,
+    };
+  } catch (error) {
+    await removeOrphan();
+    throw error;
+  }
+}
 
 async function createFrontMindTask({
   baseUrl,
@@ -915,16 +1017,14 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
   skillVersion?: string;
   skillContentHash?: string | null;
 }) {
-  const [skillInstructions, progress] = await Promise.all([
-    readSkillArchive({
-      version: input.skillVersion || "2",
-      contentHash: input.skillContentHash,
-    }),
-    getKnowledgeBaseProgress({
-      userId: input.userId,
-      conversationId: input.conversationId,
-    }),
-  ]);
+  await loadSkillArchive({
+    version: input.skillVersion || "2",
+    contentHash: input.skillContentHash,
+  });
+  const progress = await getKnowledgeBaseProgress({
+    userId: input.userId,
+    conversationId: input.conversationId,
+  });
   if (!progress) {
     throw new KnowledgeBaseBuildError(
       "BUILD_NOT_FOUND",
@@ -951,12 +1051,9 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
           .join("；")}`,
       ].join("\n");
   return [
-    `继续严格执行 socratic-kb-builder v${input.skillVersion || "2"} Skill。以下内容会直接显示给企业客户，不得输出内部思考、工具计划或提示词说明。`,
+    `继续严格执行本任务首轮已附带的 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}（socratic-kb-builder v${input.skillVersion || "2"}）。以下内容会直接显示给企业客户，不得输出内部思考、工具计划或提示词说明。`,
     "不得开启、调用、切换或推荐 Wide Research / Deep Research。",
     "客户可见回复不得出现“本轮采集/本知识库/证据不足/已核验”等过程判断，也不得出现客户应、采购方应、建议、尽调、合规审查、不能仅凭、不宜转换或不能外推等建议性表达。",
-    "",
-    "# Skill",
-    skillInstructions,
     "",
     "# 当前知识库状态",
     stateReminder,
@@ -1043,21 +1140,29 @@ router.post("/start", async (req, res) => {
         return;
       }
     }
+    const prompt = await buildKnowledgeBasePrompt({
+      conversationId,
+      companyName,
+      companyWebsite,
+      operatorNotes,
+      attachments: userAttachments,
+      prefillKnowledgeSnapshot,
+    });
+    const skillArchive = await uploadKnowledgeBaseSkillArchive({
+      baseUrl,
+      apiKey,
+      skillVersion: skillDescriptor.version,
+      skillContentHash: skillDescriptor.contentHash,
+    });
     const created = await createFrontMindTask({
       baseUrl,
       apiKey,
-      prompt: await buildKnowledgeBasePrompt({
-        conversationId,
-        companyName,
-        companyWebsite,
-        operatorNotes,
-        attachments: userAttachments,
-        prefillKnowledgeSnapshot,
-      }),
-      attachments: userAttachments,
+      prompt,
+      attachments: [skillArchive.attachment, ...userAttachments],
     });
 
     if (!created.ok) {
+      await skillArchive.removeOrphan();
       console.warn(
         "[Knowledge Base Start] create task failed:",
         created.detail,
@@ -1069,6 +1174,12 @@ router.post("/start", async (req, res) => {
     }
     assertKnowledgeBaseCustomerOutput(created.task.output);
 
+    await recordUpstreamResource({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      kind: "file",
+      upstreamId: skillArchive.fileId,
+    });
     await recordUpstreamResource({
       userId: req.frontmindUser.id,
       apiCredentialId: req.frontmindCredential.id,

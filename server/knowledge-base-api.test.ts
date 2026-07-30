@@ -1,15 +1,20 @@
-import { describe, expect, it } from "vitest";
+import axios from "axios";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import JSZip from "jszip";
 
 import {
   KnowledgeBaseEnterpriseIdentityError,
   KNOWLEDGE_BASE_AGENT_PROFILE,
+  KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
   buildKnowledgeBasePrompt,
   buildKnowledgePrefillExcerpt,
   deriveKnowledgeBaseInteraction,
   getKnowledgeBaseSkillDescriptor,
+  readKnowledgeBaseSkillArchiveAttachment,
   resolveKnowledgeBaseEnterpriseIdentity,
   selectUnreconciledKnowledgeOutput,
   shouldReconcileKnowledgeOutput,
+  uploadKnowledgeBaseSkillArchive,
 } from "./knowledge-base-api";
 
 function expectEnterpriseIdentityError(
@@ -26,6 +31,10 @@ function expectEnterpriseIdentityError(
 }
 
 describe("knowledge base execution contract", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("keeps dashboard knowledge-base builds on the Pro model", () => {
     expect(KNOWLEDGE_BASE_AGENT_PROFILE).toBe("frontmind-pro");
   });
@@ -42,27 +51,8 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain(
       "不得开启、调用、切换或推荐 Wide Research / Deep Research",
     );
-    expect(prompt).toContain("current Pro Agent");
-    expect(prompt).toContain("1,200 official HTML attempts");
-    expect(prompt).toContain("1,800 visited links");
-    expect(prompt).toContain("3,000,000");
-    expect(prompt).toContain("limited_evidence");
-    expect(prompt).toContain("evidenceDocumentIds");
-    expect(prompt).toContain("schemaVersion: 3");
-    expect(prompt).toContain("1,500 ZIP files");
-    expect(prompt).toContain("160 MiB");
-    expect(prompt).toContain("00_package_manifest.json");
-    expect(prompt).toContain("dashboard-enterprise-v1");
-    expect(prompt).toContain("FRONTMIND_FORMAL_CONTENT_START");
-    expect(prompt).toContain("assetType");
-    expect(prompt).toContain("displayRole");
-    expect(prompt).toContain("scannedSourcePages");
-    expect(prompt).toContain("1200×600");
-    expect(prompt).toContain("800×450");
-    expect(prompt).toContain("256×256");
-    expect(prompt).toContain("Customer writing boundary");
-    expect(prompt).toContain("verification_gaps");
-    expect(prompt).toContain("00_web_intelligence_report.md");
+    expect(prompt).toContain(KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME);
+    expect(prompt).toContain("先解压 ZIP 并完整读取根目录 SKILL.md");
     expect(prompt).toContain("8-115");
     expect(prompt).toContain("不得为数量、字数或图片数填充内容");
     expect(prompt).toContain("一级分支数量不设固定值");
@@ -70,7 +60,6 @@ describe("knowledge base execution contract", () => {
     expect(prompt).not.toContain("7 universal top-level branches");
     expect(prompt).toContain("只有服务端遍历达到 100%");
     expect(prompt).toContain("每次被接受后加 1");
-    expect(prompt).toContain("Never create an interactive");
     expect(prompt).toContain("https://company.example.invalid/");
     expect(prompt).toContain("https://evidence.example.invalid/");
     expect(prompt).toContain("catalog.pdf");
@@ -80,12 +69,46 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("补充、修订、问题或上传资料");
     expect(prompt).toContain("to 必须为 needs_verification");
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
-    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(30_000);
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(10_000);
+    expect(prompt).not.toContain("# Skill");
+    expect(prompt).not.toContain("current Pro Agent");
     expect(prompt).not.toContain("# FILE: references/");
     expect(prompt).not.toContain("# FILE: scripts/validate_archive.py");
     expect(prompt).not.toContain("def validate_archive");
     expect(prompt).not.toContain("360–480");
     expect(prompt).not.toContain("300,000");
+
+    const archive = await readKnowledgeBaseSkillArchiveAttachment();
+    expect(archive.filename).toBe("socratic-kb-builder.skill.zip");
+    expect(archive.bytes.subarray(0, 4).toString("hex")).toBe("504b0304");
+    const zip = await JSZip.loadAsync(archive.bytes);
+    const skill = await zip.file("SKILL.md")?.async("string");
+    for (const invariant of [
+      "current Pro Agent",
+      "1,200 official HTML attempts",
+      "1,800 visited links",
+      "3,000,000",
+      "limited_evidence",
+      "evidenceDocumentIds",
+      "schemaVersion: 3",
+      "1,500 ZIP files",
+      "160 MiB",
+      "00_package_manifest.json",
+      "dashboard-enterprise-v1",
+      "FRONTMIND_FORMAL_CONTENT_START",
+      "assetType",
+      "displayRole",
+      "scannedSourcePages",
+      "1200×600",
+      "800×450",
+      "256×256",
+      "Customer writing boundary",
+      "Never create an interactive",
+      "verification_gaps",
+      "00_web_intelligence_report.md",
+    ]) {
+      expect(skill).toContain(invariant);
+    }
   });
 
   it("balances historical prefill across branches and caps it at 80,000 characters", () => {
@@ -158,6 +181,43 @@ describe("knowledge base execution contract", () => {
         contentHash: "0".repeat(64),
       }),
     ).rejects.toThrow("content hash does not match");
+  });
+
+  it("uploads the Skill ZIP through the exact signed URL without auth headers", async () => {
+    const uploadUrl =
+      "https://uploads.example.test/socratic.skill.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc";
+    vi.spyOn(axios, "post").mockResolvedValue({
+      status: 201,
+      data: {
+        id: "skill-file-1",
+        filename: "socratic-kb-builder.skill.zip",
+        upload_url: uploadUrl,
+      },
+    });
+    const put = vi.spyOn(axios, "put").mockResolvedValue({
+      status: 200,
+      data: "",
+    });
+
+    const uploaded = await uploadKnowledgeBaseSkillArchive({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret-test-key",
+    });
+
+    expect(uploaded.attachment).toEqual({
+      file_id: "skill-file-1",
+      filename: "socratic-kb-builder.skill.zip",
+    });
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(put.mock.calls[0]?.[0]).toBe(uploadUrl);
+    expect(put.mock.calls[0]?.[2]).toMatchObject({
+      maxRedirects: 0,
+      headers: {
+        "Content-Type": "application/zip",
+      },
+    });
+    expect(put.mock.calls[0]?.[2]?.headers).not.toHaveProperty("Authorization");
+    expect(put.mock.calls[0]?.[2]?.headers).not.toHaveProperty("API_KEY");
   });
 
   it("uses the configured workspace enterprise and rejects client identity changes", () => {

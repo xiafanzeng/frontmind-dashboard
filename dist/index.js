@@ -26368,6 +26368,7 @@ var legacySkillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [
   (candidate) => path5.join(path5.dirname(candidate), "socratic-kb-builder-v1.skill")
 );
 var skillArchiveCache = /* @__PURE__ */ new Map();
+var KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME = "socratic-kb-builder.skill.zip";
 function sanitizeFilename2(value, fallback) {
   const safe = String(value || "").replace(/[\\/\0]/g, "_").replace(/^\.+$/, "").trim().slice(0, 160);
   return safe || fallback;
@@ -26435,8 +26436,14 @@ ${content.trim()}`);
   }
   throw lastError instanceof Error ? lastError : new Error(`Could not load socratic-kb-builder Skill v${version}`);
 }
-async function readSkillArchive(selection = { version: "2" }) {
-  return (await loadSkillArchive(selection)).instructions;
+async function readKnowledgeBaseSkillArchiveAttachment(selection = { version: "2" }) {
+  const loaded = await loadSkillArchive(selection);
+  const bytes = await fs4.readFile(loaded.archivePath);
+  return {
+    filename: KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
+    bytes,
+    contentHash: loaded.contentHash
+  };
 }
 async function getKnowledgeBaseSkillDescriptor(selection = { version: "2" }) {
   const version = selection.version === "1" ? "1" : "2";
@@ -26530,13 +26537,13 @@ async function buildKnowledgeBasePrompt({
   attachments: attachments2,
   prefillKnowledgeSnapshot
 }) {
-  const skillInstructions = await readSkillArchive();
   const attachmentList = attachments2.length > 0 ? attachments2.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u4E0E\u5168\u7F51\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
   const prefillDocuments = buildKnowledgePrefillExcerpt(
     prefillKnowledgeSnapshot?.documents ?? []
   );
   return [
-    "\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder v2 Skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u6DF1\u5EA6\u56FE\u6587\u77E5\u8BC6\u5E93\u3002",
+    `\u4E25\u683C\u6267\u884C\u968F\u4EFB\u52A1\u9644\u5E26\u7684 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}\u3002\u5148\u89E3\u538B ZIP \u5E76\u5B8C\u6574\u8BFB\u53D6\u6839\u76EE\u5F55 SKILL.md\uFF0C\u518D\u5F00\u59CB\u5DE5\u4F5C\u3002`,
+    "\u8BE5 ZIP \u662F\u672C\u4EFB\u52A1\u552F\u4E00\u7684 socratic-kb-builder v2 \u5DE5\u4F5C\u89C4\u7EA6\uFF1B\u672C\u6BB5\u4EC5\u63D0\u4F9B\u4F01\u4E1A\u8F93\u5165\u548C\u670D\u52A1\u7AEF\u72B6\u6001\u7EA6\u675F\u3002",
     "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\uFF1B\u53EA\u4F7F\u7528\u5F53\u524D Pro Agent \u6A21\u5F0F\u4E0B\u7684\u666E\u901A\u6D4F\u89C8\u3001\u641C\u7D22\u548C\u6587\u4EF6\u5DE5\u5177\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u5D4C\u5165\u5B98\u7F51\u6216 CDN \u56FE\u7247\u5916\u94FE\u3002\u56FE\u7247\u5FC5\u987B\u5148\u4E0B\u8F7D\u771F\u5B9E\u5B57\u8282\u3001\u89E3\u7801\u6821\u9A8C\u5E76\u6253\u5165\u6700\u7EC8 ZIP\uFF0C\u518D\u4EE5\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u5F15\u7528\uFF1B\u9632\u76D7\u94FE\u3001\u7B7E\u540D\u3001\u8FC7\u671F\u6216\u65E0\u6CD5\u4E0B\u8F7D\u7684\u5730\u5740\u53EA\u80FD\u8FDB\u5165\u5185\u90E8\u6765\u6E90\u8BB0\u5F55\uFF0C\u7EDD\u4E0D\u80FD\u4F5C\u4E3A\u5BA2\u6237\u56FE\u7247\u8FD4\u56DE\u3002",
@@ -26559,10 +26566,6 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
       "\u4EE5\u4E0B\u5185\u5BB9\u662F\u9884\u586B\u8BC1\u636E\uFF0C\u4E0D\u4EE3\u8868\u8282\u70B9\u5DF2\u786E\u8BA4\uFF0C\u4E5F\u4E0D\u5F97\u636E\u6B64\u4F2A\u9020 100% \u5BF9\u8BDD\u8FDB\u5EA6\uFF1A",
       prefillDocuments || "\u5F53\u524D\u7248\u672C\u6CA1\u6709\u53EF\u8BFB\u53D6\u7684\u6B63\u6587\u3002"
     ].join("\n") : "\u5F53\u524D\u8D26\u53F7\u6CA1\u6709\u5DF2\u8FC1\u79FB\u7684\u521D\u6B65\u77E5\u8BC6\u5E93\uFF0C\u5C06\u4ECE\u5B98\u7F51\u3001\u5168\u7F51\u4E0E\u4E0A\u4F20\u8D44\u6599\u5F00\u59CB\u9884\u586B\u3002",
-    "",
-    "## socratic-kb-builder.skill",
-    skillInstructions,
-    "",
     "## \u5FC5\u987B\u6267\u884C\u7684\u673A\u5668\u53EF\u9A8C\u8BC1\u8FDB\u5EA6\u534F\u8BAE",
     "\u8FD9\u662F\u670D\u52A1\u7AEF\u72B6\u6001\u673A\u534F\u8BAE\uFF0C\u4F18\u5148\u7EA7\u9AD8\u4E8E skill \u4E2D\u4EFB\u4F55\u4F1A\u81EA\u52A8\u8DE8\u8282\u70B9\u7684\u8868\u8FF0\u3002\u53EF\u8BFB\u6B63\u6587\u7167\u5E38\u8F93\u51FA\uFF0C\u4F46\u6BCF\u8F6E\u672B\u5C3E\u5FC5\u987B\u9644\u5E26\u4E14\u53EA\u80FD\u9644\u5E26\u4E00\u4E2A\u5BF9\u5E94\u7684 HTML \u6CE8\u91CA\u4FE1\u5C01\u3002",
     "",
@@ -26588,6 +26591,84 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
   ].join("\n");
 }
 var KNOWLEDGE_BASE_AGENT_PROFILE = "frontmind-pro";
+async function uploadKnowledgeBaseSkillArchive({
+  baseUrl,
+  apiKey,
+  skillVersion = "2",
+  skillContentHash
+}) {
+  const archive = await readKnowledgeBaseSkillArchiveAttachment({
+    version: skillVersion,
+    contentHash: skillContentHash
+  });
+  const headers = {
+    API_KEY: apiKey,
+    Authorization: `Bearer ${apiKey}`
+  };
+  const created = await axios4.post(
+    `${baseUrl}/v1/files`,
+    { filename: archive.filename },
+    {
+      headers: { ...headers, "Content-Type": "application/json" },
+      timeout: 12e4,
+      validateStatus: () => true
+    }
+  );
+  const fileId = String(created.data?.id || created.data?.file_id || "");
+  if (created.status < 200 || created.status >= 300 || !fileId) {
+    throw new Error("Knowledge-base Skill ZIP file creation failed");
+  }
+  const removeOrphan = async () => {
+    await axios4.delete(`${baseUrl}/v1/files/${encodeURIComponent(fileId)}`, {
+      headers,
+      timeout: 3e4,
+      validateStatus: () => true
+    }).catch(() => void 0);
+  };
+  try {
+    let uploadUrl = String(created.data?.upload_url || "");
+    if (!uploadUrl) {
+      const metadata = await axios4.get(
+        `${baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
+        {
+          headers,
+          timeout: 3e4,
+          validateStatus: () => true
+        }
+      );
+      if (metadata.status < 200 || metadata.status >= 300) {
+        throw new Error("Knowledge-base Skill ZIP upload URL lookup failed");
+      }
+      uploadUrl = String(metadata.data?.upload_url || "");
+    }
+    const target = assertSafeExternalUrl(uploadUrl);
+    const uploaded = await axios4.put(target, archive.bytes, {
+      ...safeExternalRequestOptions,
+      // The SigV4 query signs this exact URL; redirects invalidate it.
+      maxRedirects: 0,
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Length": String(archive.bytes.length)
+      },
+      timeout: 12e4,
+      maxBodyLength: archive.bytes.length,
+      maxContentLength: 1024 * 1024,
+      validateStatus: () => true
+    });
+    if (uploaded.status < 200 || uploaded.status >= 300) {
+      throw new Error("Knowledge-base Skill ZIP upload failed");
+    }
+    return {
+      attachment: { file_id: fileId, filename: archive.filename },
+      fileId,
+      contentHash: archive.contentHash,
+      removeOrphan
+    };
+  } catch (error) {
+    await removeOrphan();
+    throw error;
+  }
+}
 async function createFrontMindTask({
   baseUrl,
   apiKey,
@@ -26639,16 +26720,14 @@ async function createFrontMindTask({
   };
 }
 async function buildKnowledgeBaseTurnPrompt(input) {
-  const [skillInstructions, progress] = await Promise.all([
-    readSkillArchive({
-      version: input.skillVersion || "2",
-      contentHash: input.skillContentHash
-    }),
-    getKnowledgeBaseProgress({
-      userId: input.userId,
-      conversationId: input.conversationId
-    })
-  ]);
+  await loadSkillArchive({
+    version: input.skillVersion || "2",
+    contentHash: input.skillContentHash
+  });
+  const progress = await getKnowledgeBaseProgress({
+    userId: input.userId,
+    conversationId: input.conversationId
+  });
   if (!progress) {
     throw new KnowledgeBaseBuildError(
       "BUILD_NOT_FOUND",
@@ -26671,12 +26750,9 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     `\u73B0\u6709\u8282\u70B9\uFF1A${leaves.map((leaf) => `${leaf.id}:${leaf.title}`).join("\uFF1B")}`
   ].join("\n");
   return [
-    `\u7EE7\u7EED\u4E25\u683C\u6267\u884C socratic-kb-builder v${input.skillVersion || "2"} Skill\u3002\u4EE5\u4E0B\u5185\u5BB9\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u63D0\u793A\u8BCD\u8BF4\u660E\u3002`,
+    `\u7EE7\u7EED\u4E25\u683C\u6267\u884C\u672C\u4EFB\u52A1\u9996\u8F6E\u5DF2\u9644\u5E26\u7684 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}\uFF08socratic-kb-builder v${input.skillVersion || "2"}\uFF09\u3002\u4EE5\u4E0B\u5185\u5BB9\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u63D0\u793A\u8BCD\u8BF4\u660E\u3002`,
     "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u51FA\u73B0\u201C\u672C\u8F6E\u91C7\u96C6/\u672C\u77E5\u8BC6\u5E93/\u8BC1\u636E\u4E0D\u8DB3/\u5DF2\u6838\u9A8C\u201D\u7B49\u8FC7\u7A0B\u5224\u65AD\uFF0C\u4E5F\u4E0D\u5F97\u51FA\u73B0\u5BA2\u6237\u5E94\u3001\u91C7\u8D2D\u65B9\u5E94\u3001\u5EFA\u8BAE\u3001\u5C3D\u8C03\u3001\u5408\u89C4\u5BA1\u67E5\u3001\u4E0D\u80FD\u4EC5\u51ED\u3001\u4E0D\u5B9C\u8F6C\u6362\u6216\u4E0D\u80FD\u5916\u63A8\u7B49\u5EFA\u8BAE\u6027\u8868\u8FBE\u3002",
-    "",
-    "# Skill",
-    skillInstructions,
     "",
     "# \u5F53\u524D\u77E5\u8BC6\u5E93\u72B6\u6001",
     stateReminder,
@@ -26751,20 +26827,28 @@ router3.post("/start", async (req, res) => {
         return;
       }
     }
+    const prompt = await buildKnowledgeBasePrompt({
+      conversationId,
+      companyName,
+      companyWebsite,
+      operatorNotes,
+      attachments: userAttachments,
+      prefillKnowledgeSnapshot
+    });
+    const skillArchive = await uploadKnowledgeBaseSkillArchive({
+      baseUrl,
+      apiKey,
+      skillVersion: skillDescriptor.version,
+      skillContentHash: skillDescriptor.contentHash
+    });
     const created = await createFrontMindTask({
       baseUrl,
       apiKey,
-      prompt: await buildKnowledgeBasePrompt({
-        conversationId,
-        companyName,
-        companyWebsite,
-        operatorNotes,
-        attachments: userAttachments,
-        prefillKnowledgeSnapshot
-      }),
-      attachments: userAttachments
+      prompt,
+      attachments: [skillArchive.attachment, ...userAttachments]
     });
     if (!created.ok) {
+      await skillArchive.removeOrphan();
       console.warn(
         "[Knowledge Base Start] create task failed:",
         created.detail
@@ -26773,6 +26857,12 @@ router3.post("/start", async (req, res) => {
       return;
     }
     assertKnowledgeBaseCustomerOutput(created.task.output);
+    await recordUpstreamResource({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      kind: "file",
+      upstreamId: skillArchive.fileId
+    });
     await recordUpstreamResource({
       userId: req.frontmindUser.id,
       apiCredentialId: req.frontmindCredential.id,
