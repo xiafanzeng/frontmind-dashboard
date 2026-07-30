@@ -33,6 +33,7 @@ import {
 } from "./express-auth";
 import { resolveUpstreamCredential } from "./upstream-credential";
 import { enforceFrontMindProxyAccess } from "./frontmind-proxy-policy";
+import { processKnowledgeResetCleanupJobs } from "../knowledge-base-reset-service";
 import { assertCredentialEncryptionConfigured } from "../auth-service";
 import { getDb } from "../db";
 import deliveryTicketAttachmentRouter from "../delivery-ticket-attachment-router";
@@ -302,6 +303,14 @@ async function startServer() {
         .catch((error) => {
           console.error("[KnowledgeBaseRecovery] startup_scan_failed", error);
         });
+      const runResetCleanup = () => {
+        void processKnowledgeResetCleanupJobs().catch((error) => {
+          console.error("[KnowledgeBaseReset] cleanup_retry_failed", error);
+        });
+      };
+      runResetCleanup();
+      const resetCleanupTimer = setInterval(runResetCleanup, 15 * 60 * 1000);
+      resetCleanupTimer.unref();
     }
   });
 }

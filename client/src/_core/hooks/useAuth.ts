@@ -7,7 +7,7 @@ export type AuthUser = {
   id: number;
   username: string;
   displayName: string | null;
-  role: "user" | "admin";
+  role: "user" | "admin" | "delivery_member";
   adminAccessLevel: "system_admin" | "delivery_admin" | null;
   marketEdition: "domestic" | "overseas";
   isActive: boolean;

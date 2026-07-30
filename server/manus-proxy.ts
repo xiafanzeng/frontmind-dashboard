@@ -45,6 +45,7 @@ import {
   safeErrorForLog,
 } from "./_core/sensitive-data";
 import { preparedFileService } from "./prepared-file-service";
+import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 
 const router = Router();
 
@@ -657,10 +658,7 @@ export function publicUpstreamFilePayload(value: unknown, apiKey: string) {
   };
 }
 
-export function isPublicFilePayloadRequest(
-  method: string,
-  targetPath: string,
-) {
+export function isPublicFilePayloadRequest(method: string, targetPath: string) {
   const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
   return (
     (method.toUpperCase() === "POST" && pathname === "/v1/files") ||
@@ -3033,6 +3031,25 @@ router.all("/*", async (req: Request, res: Response) => {
           kind: isTaskCreate ? "task" : "file",
           upstreamId: resourceId,
         });
+        if (
+          isTaskCreate &&
+          req.frontmindUser.role === "delivery_member" &&
+          req.frontmindDeliveryRoleContext
+        ) {
+          await writeWorkspaceAuditEvent({
+            actor: req.frontmindUser,
+            action: "delivery_member.agent.task_created",
+            targetType: "upstream_task",
+            targetId: resourceId,
+            workspaceUserId: null,
+            metadata: {
+              roleAssignmentId: req.frontmindDeliveryRoleContext.assignmentId,
+              roleId: req.frontmindDeliveryRoleContext.roleId,
+              roleType: req.frontmindDeliveryRoleContext.roleType,
+              teamName: req.frontmindDeliveryRoleContext.teamName,
+            },
+          });
+        }
       }
 
       // Generated output files are discovered in task responses rather than

@@ -208,6 +208,16 @@ describe("knowledge-base image delivery boundary", () => {
   const blockedHotlink =
     "https://omo-oss-image.thefastimg.com/portal-saas/example/cms/image/example.jpg";
 
+  it("replaces only the retired collection-status sentence", () => {
+    expect(
+      sanitizeKnowledgeBaseCustomerMarkdown(
+        "FrontMind 正在按业务分支进行广度优先、深度受控的资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。\n\n正文保留广度与深度。",
+      ),
+    ).toBe(
+      "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。\n\n正文保留广度与深度。",
+    );
+  });
+
   it("removes remote hotlinks from customer markdown while retaining the caption", () => {
     expect(
       sanitizeKnowledgeBaseCustomerMarkdown(

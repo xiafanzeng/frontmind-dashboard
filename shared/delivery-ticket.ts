@@ -4,6 +4,7 @@ import { accountMarketEditionSchema } from "./account-edition";
 export const deliveryTicketTypeSchema = z.enum([
   "content_asset",
   "website_operation",
+  "knowledge_base",
 ]);
 export type DeliveryTicketType = z.infer<typeof deliveryTicketTypeSchema>;
 
@@ -212,7 +213,7 @@ export type IcpNonSensitiveDeclarations = z.infer<
 export const createDeliveryTicketSchema = z
   .object({
     clientRequestId: z.string().uuid(),
-    type: deliveryTicketTypeSchema,
+    type: z.enum(["content_asset", "website_operation"]),
     category: optionalTrimmedText(64),
     topic: optionalTrimmedText(512),
     title: optionalTrimmedText(512),
@@ -512,6 +513,9 @@ export function resolveDeliveryTicketQuotaPool(input: {
   category?: string | null;
 }): DeliveryTicketQuotaPool | null {
   const category = input.category?.trim() || "";
+  if (input.type === "knowledge_base") {
+    throw new Error("知识库内部工单只能由专用流程创建");
+  }
   if (input.type === "website_operation") {
     if (!WEBSITE_OPERATION_CATEGORIES.has(category)) {
       throw new Error("请选择有效的官网运营类别");
@@ -621,6 +625,13 @@ export const publicWebsiteTicketSummarySchema =
     })
     .strict();
 
+export const publicKnowledgeBaseTicketSummarySchema =
+  publicDeliveryTicketSummaryBaseSchema
+    .extend({
+      type: z.literal("knowledge_base"),
+    })
+    .strict();
+
 /**
  * Customer lists deliberately expose only the request type/topic, the two
  * public states and completed public delivery data. Commercial allocation,
@@ -629,6 +640,7 @@ export const publicWebsiteTicketSummarySchema =
 export const publicDeliveryTicketSummarySchema = z.discriminatedUnion("type", [
   publicContentAssetTicketSummarySchema,
   publicWebsiteTicketSummarySchema,
+  publicKnowledgeBaseTicketSummarySchema,
 ]);
 export type PublicDeliveryTicketSummary = z.infer<
   typeof publicDeliveryTicketSummarySchema
@@ -637,7 +649,7 @@ export type PublicDeliveryTicketSummary = z.infer<
 export const publicDeliveryTicketEventSchema = z
   .object({
     id: z.string().uuid(),
-    actorRole: z.enum(["user", "admin", "system"]),
+    actorRole: z.enum(["user", "admin", "delivery_member", "system"]),
     actorLabel: z.enum(["用户", "服务团队"]),
     message: z.string().max(50_000).nullable(),
     createdAt: z.number().int().nonnegative().nullable(),
@@ -689,9 +701,17 @@ export const publicWebsiteTicketDetailSchema = z
   })
   .strict();
 
+export const publicKnowledgeBaseTicketDetailSchema = z
+  .object({
+    ticket: publicKnowledgeBaseTicketSummarySchema,
+    events: z.array(publicDeliveryTicketEventSchema),
+  })
+  .strict();
+
 export const publicDeliveryTicketDetailSchema = z.union([
   publicContentAssetTicketDetailSchema,
   publicWebsiteTicketDetailSchema,
+  publicKnowledgeBaseTicketDetailSchema,
 ]);
 export type PublicDeliveryTicketDetail = z.infer<
   typeof publicDeliveryTicketDetailSchema
@@ -747,6 +767,14 @@ export const publicDeliveryTicketWorkspaceMetadataSchema = z
     websiteContentCatalog: z.array(publicWebsiteContentCatalogItemSchema),
     marketEdition: accountMarketEditionSchema,
     preferredMediaOptions: z.array(preferredContentMediaSchema),
+    deliveryOwners: z
+      .object({
+        knowledgeBase: z.boolean(),
+        monitoringOptimization: z.boolean(),
+        contentDistribution: z.boolean(),
+        websiteOperations: z.boolean(),
+      })
+      .strict(),
     websiteWorkflow: z
       .object({
         domainCompleted: z.boolean(),

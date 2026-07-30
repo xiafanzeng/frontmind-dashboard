@@ -14,6 +14,7 @@ import {
   Send,
   UserCog,
   Users,
+  UsersRound,
 } from "lucide-react";
 
 import { useAuth } from "@/_core/hooks/useAuth";
@@ -36,6 +37,10 @@ import {
   formatAdminTicketDate,
   normalizeAdminTicketList,
 } from "@/components/AdminDeliveryTicketWorkspace";
+import {
+  DELIVERY_ROLE_LABELS,
+  type DeliveryRoleType,
+} from "@shared/delivery-roles";
 
 type ApiKeyUsageAlert = {
   id: string;
@@ -206,6 +211,18 @@ export const adminNav: PortalNavItem[] = [
     activePrefixes: ["/admin/customers"],
   },
   {
+    label: "角色与团队",
+    href: "/admin/delivery-roles",
+    icon: UsersRound,
+    group: "客户与服务",
+  },
+  {
+    label: "工单调度",
+    href: "/admin/dispatch",
+    icon: ClipboardList,
+    group: "客户与服务",
+  },
+  {
     label: "FrontMind Agent",
     href: "/admin/agent",
     icon: Bot,
@@ -242,19 +259,35 @@ export const adminNav: PortalNavItem[] = [
 ];
 
 export function getAdminNav(systemAdmin: boolean) {
-  return systemAdmin
-    ? adminNav
-    : adminNav
-        .filter((item) => item.href !== "/admin/presales")
-        .map((item) =>
-          item.href === "/admin/users"
-            ? {
-                ...item,
-                label: "创建客户账号",
-                group: "客户与服务",
-              }
-            : item,
-        );
+  if (systemAdmin) return adminNav;
+  return [
+    { label: "交付总览", href: "/", icon: Gauge, group: "交付管理" },
+    {
+      label: "客户管理",
+      href: "/admin/workspace",
+      icon: UserCog,
+      group: "交付管理",
+      activePrefixes: ["/admin/customers", "/admin/users"],
+    },
+    {
+      label: "角色与团队",
+      href: "/admin/delivery-roles",
+      icon: UsersRound,
+      group: "交付管理",
+    },
+    {
+      label: "工单调度",
+      href: "/admin/dispatch",
+      icon: ClipboardList,
+      group: "交付管理",
+    },
+    {
+      label: "API Key 管理",
+      href: "/admin/delivery-roles?view=api-keys",
+      icon: Bot,
+      group: "交付管理",
+    },
+  ];
 }
 
 export function getPreviewAdminNav(systemAdmin: boolean) {
@@ -271,8 +304,8 @@ export function getPreviewAdminWorkspaceHref(systemAdmin: boolean, query = "") {
   return normalizedQuery ? `${href}?${normalizedQuery}` : href;
 }
 
-export function canCreateCustomerFromDashboard(systemAdmin: boolean) {
-  return systemAdmin;
+export function canCreateCustomerFromDashboard(_systemAdmin: boolean) {
+  return true;
 }
 
 export function filterApiKeyUsageForAdmin(
@@ -455,6 +488,14 @@ export default function AdminDashboard({
   ).apiKeyUsageAlerts.sync.useMutation({
     onSuccess: () => usageHierarchyQuery.refetch(),
   });
+  const deliveryRoleOverviewQuery = trpc.delivery.management.overview.useQuery(
+    undefined,
+    {
+      enabled: !previewMode && user?.role === "admin",
+      retry: false,
+      refetchOnWindowFocus: false,
+    },
+  );
   const [ticketKeyword, setTicketKeyword] = useState("");
   const [ticketType, setTicketType] = useState("all");
   const [ticketStatus, setTicketStatus] = useState("all");
@@ -723,6 +764,66 @@ export default function AdminDashboard({
       }
     >
       <div className="space-y-5">
+        {!previewMode && (
+          <PortalCard className="overflow-hidden">
+            <div className="border-b border-[#eee8f2] px-5 py-4 sm:px-6">
+              <h2 className="font-semibold text-[#171321]">四角色交付状态</h2>
+              <p className="mt-1 text-sm text-[#716a80]">
+                逾期按工单超过 72
+                小时未更新统计；待分配工单不能由交付管理员直接执行。
+              </p>
+            </div>
+            {deliveryRoleOverviewQuery.isLoading ? (
+              <div className="p-6 text-sm text-[#716a80]">
+                正在读取角色队列…
+              </div>
+            ) : deliveryRoleOverviewQuery.error ? (
+              <div className="p-6 text-sm text-[#a02652]">
+                角色队列暂时无法读取。
+              </div>
+            ) : (
+              <div className="grid gap-3 p-5 sm:p-6 xl:grid-cols-2">
+                {(Object.keys(DELIVERY_ROLE_LABELS) as DeliveryRoleType[]).map(
+                  (roleType) => {
+                    const stats =
+                      deliveryRoleOverviewQuery.data?.roleStats[roleType];
+                    return (
+                      <div
+                        key={roleType}
+                        className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4"
+                      >
+                        <p className="font-semibold text-[#332842]">
+                          {DELIVERY_ROLE_LABELS[roleType]}
+                        </p>
+                        <div className="mt-3 grid grid-cols-5 gap-2">
+                          {[
+                            ["待分配", stats?.pendingAssignment ?? 0],
+                            ["处理中", stats?.processing ?? 0],
+                            ["等待用户", stats?.waitingUser ?? 0],
+                            ["逾期", stats?.overdue ?? 0],
+                            ["已完成", stats?.completed ?? 0],
+                          ].map(([label, value]) => (
+                            <div
+                              key={String(label)}
+                              className="rounded-xl bg-white px-2 py-3 text-center"
+                            >
+                              <p className="text-lg font-semibold text-[#5b2a86]">
+                                {Number(value)}
+                              </p>
+                              <p className="mt-1 text-[11px] text-[#857e91]">
+                                {label}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  },
+                )}
+              </div>
+            )}
+          </PortalCard>
+        )}
         <PortalCard className="overflow-hidden">
           <div className="flex items-center justify-between gap-4 border-b border-[#eee8f2] px-5 py-4 sm:px-6">
             <div>

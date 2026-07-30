@@ -15,6 +15,14 @@ const websiteFixturePath = path.resolve(
   process.cwd(),
   "../frontmind-website/server/geo/contracts/provisioning-v2.fixture.json",
 );
+const localV4FixturePath = path.resolve(
+  process.cwd(),
+  "shared/contracts/provisioning-v4.fixture.json",
+);
+const websiteV4FixturePath = path.resolve(
+  process.cwd(),
+  "../frontmind-website/server/geo/contracts/provisioning-v4.fixture.json",
+);
 
 async function fixture(filePath: string) {
   return JSON.parse(await readFile(filePath, "utf8")) as Record<
@@ -50,8 +58,28 @@ describe("Agent ↔ Website provisioning v2 shared contract", () => {
   });
 
   it("matches the Website-owned copy when both repositories are checked out", async () => {
-    const agent = await fixture(localFixturePath);
-    const website = await fixture(websiteFixturePath);
+    const [agent, website, agentV4, websiteV4] = await Promise.all([
+      fixture(localFixturePath),
+      fixture(websiteFixturePath),
+      fixture(localV4FixturePath),
+      fixture(websiteV4FixturePath),
+    ]);
     expect(website).toEqual(agent);
+    expect(websiteV4).toEqual(agentV4);
+  });
+
+  it("parses v4 and binds candidate lineage separately from the final file", async () => {
+    const value = await fixture(localV4FixturePath);
+    const knowledgeImport = websiteKnowledgeImportSchema.parse(
+      value.knowledgeImport,
+    );
+    expect(knowledgeImport.schemaVersion).toBe(4);
+    if (knowledgeImport.schemaVersion !== 4) throw new Error("expected v4");
+    expect(
+      knowledgeArchiveDescriptorHash(value.candidateDescriptor as any),
+    ).toBe(knowledgeImport.candidate.descriptorHash);
+    expect(knowledgeImport.finalArtifact.fileId).not.toBe(
+      knowledgeImport.candidate.fileId,
+    );
   });
 });

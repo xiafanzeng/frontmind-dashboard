@@ -6,6 +6,7 @@ import {
   assertServiceWriteAccess,
   ServiceEntitlementError,
 } from "../service-entitlement";
+import { assertDeliveryRoleContext } from "../delivery-role-service";
 
 const ORDINARY_USER_SUPPORT_OPERATIONS = new Set([
   "POST /download-token",
@@ -50,6 +51,7 @@ export function ordinaryUserProxyWriteRequiresActiveService(
 export function createFrontMindProxyAccessMiddleware(
   dependencies: {
     assertWriteAccess: typeof assertServiceWriteAccess;
+    assertRoleContext?: typeof assertDeliveryRoleContext;
   } = { assertWriteAccess: assertServiceWriteAccess },
 ) {
   return async (req: FrontMindRequest, res: Response, next: NextFunction) => {
@@ -71,6 +73,38 @@ export function createFrontMindProxyAccessMiddleware(
           },
         });
       }
+      return;
+    }
+    if (user.role === "delivery_member") {
+      const roleAssignmentId = String(
+        req.headers["x-delivery-role-assignment-id"] || "",
+      ).trim();
+      if (!roleAssignmentId) {
+        res.status(400).json({
+          error: {
+            message: "请先选择当前工作角色",
+            code: "DELIVERY_ROLE_CONTEXT_REQUIRED",
+          },
+        });
+        return;
+      }
+      try {
+        req.frontmindDeliveryRoleContext = await (
+          dependencies.assertRoleContext ?? assertDeliveryRoleContext
+        )({
+          actor: user,
+          roleAssignmentId,
+        });
+      } catch {
+        res.status(403).json({
+          error: {
+            message: "当前工作角色不存在或已停用",
+            code: "DELIVERY_ROLE_CONTEXT_FORBIDDEN",
+          },
+        });
+        return;
+      }
+      next();
       return;
     }
     if (!ordinaryUserMayUseFrontMindProxy(req)) {

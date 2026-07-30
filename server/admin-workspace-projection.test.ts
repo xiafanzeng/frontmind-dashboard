@@ -288,29 +288,44 @@ describe("administrator workspace DTO boundary", () => {
     });
   });
 
-  it("projects delivery-admin question lists and mutation responses", async () => {
-    const caller = adminRouter.createCaller(context("delivery_admin"));
-    const portfolio = await caller.workspace.questionPortfolio({ userId: 7 });
-    const updated = await caller.workspace.updateQuestion({
+  it("keeps delivery-admin question access read-only", async () => {
+    const deliveryCaller = adminRouter.createCaller(context("delivery_admin"));
+    const portfolio = await deliveryCaller.workspace.questionPortfolio({
+      userId: 7,
+    });
+    await expect(
+      deliveryCaller.workspace.updateQuestion({
+        userId: 7,
+        questionId: question.id,
+        expectedRevision: question.revision,
+        question: question.question,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      deliveryCaller.workspace.confirmQuestionSelection({
+        userId: 7,
+        questionId: question.id,
+        expectedRevision: question.revision,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    const systemCaller = adminRouter.createCaller(context("system_admin"));
+    const updated = await systemCaller.workspace.updateQuestion({
       userId: 7,
       questionId: question.id,
       expectedRevision: question.revision,
       question: question.question,
     });
-    const confirmed = await caller.workspace.confirmQuestionSelection({
+    const confirmed = await systemCaller.workspace.confirmQuestionSelection({
       userId: 7,
       questionId: question.id,
       expectedRevision: question.revision,
     });
 
-    for (const value of [
-      portfolio.questions[0],
-      updated.question,
-      confirmed.question,
-    ]) {
-      expect(value).not.toHaveProperty("contractId");
-      expect(value).not.toHaveProperty("quotaPeriodId");
-    }
+    expect(portfolio.questions[0]).not.toHaveProperty("contractId");
+    expect(portfolio.questions[0]).not.toHaveProperty("quotaPeriodId");
+    expect(updated.question).toHaveProperty("contractId");
+    expect(confirmed.question).toHaveProperty("quotaPeriodId");
   });
 
   it("keeps internal question linkage for system-admin operations", async () => {

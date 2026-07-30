@@ -442,6 +442,7 @@ interface ConversationContextType {
   ) => void;
   updateTitle: (conversationId: string, title: string) => void;
   deleteConversation: (id: string) => void;
+  discardConversationLocally: (id: string) => void;
   deleteMessage: (conversationId: string, messageId: string) => void;
   refreshConversations: () => Promise<void>;
   clearSyncError: () => void;
@@ -735,6 +736,17 @@ export function ConversationProvider({
     [commit],
   );
 
+  const discardConversationLocally = useCallback(
+    (id: string) => {
+      const nextState = conversationReducer(stateRef.current, {
+        type: "DELETE_CONVERSATION",
+        payload: id,
+      });
+      replaceState(nextState);
+    },
+    [replaceState],
+  );
+
   const deleteMessage = useCallback(
     (conversationId: string, messageId: string) => {
       commit(
@@ -809,6 +821,7 @@ export function ConversationProvider({
         updateAssistantMessages,
         updateTitle,
         deleteConversation,
+        discardConversationLocally,
         deleteMessage,
         refreshConversations,
         clearSyncError,
@@ -1218,14 +1231,15 @@ export function sanitizeKnowledgeBaseCustomerMarkdown(text: string): string {
   if (!text) return "";
 
   return text
+    .replaceAll(
+      "FrontMind 正在按业务分支进行广度优先、深度受控的资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
+      "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
+    )
     .replace(
       /!\[([^\]\n]*)]\(\s*<?(https?:\/\/[^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/gi,
       (_match, alt: string) => (alt.trim() ? `配图：${alt.trim()}` : ""),
     )
-    .replace(
-      /<img\b[^>]*\bsrc\s*=\s*["']https?:\/\/[^"']+["'][^>]*>/gi,
-      "",
-    )
+    .replace(/<img\b[^>]*\bsrc\s*=\s*["']https?:\/\/[^"']+["'][^>]*>/gi, "")
     .replace(
       /\[([^\]\n]+)]\(\s*<?(https?:\/\/[^)\s>]+\.(?:avif|gif|jpe?g|png|svg|webp)(?:[?#][^)\s>]*)?)>?(?:\s+["'][^"']*["'])?\s*\)/gi,
       "$1",

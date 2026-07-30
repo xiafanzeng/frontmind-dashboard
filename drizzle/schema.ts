@@ -43,7 +43,9 @@ export const users = mysqlTable(
     name: text("name"),
     email: varchar("email", { length: 320 }),
     loginMethod: varchar("loginMethod", { length: 64 }),
-    role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+    role: mysqlEnum("role", ["user", "admin", "delivery_member"])
+      .default("user")
+      .notNull(),
     adminAccessLevel: mysqlEnum("adminAccessLevel", [
       "system_admin",
       "delivery_admin",
@@ -931,7 +933,11 @@ export const deliveryTickets = mysqlTable(
     quotaPeriodId: varchar("quotaPeriodId", { length: 36 })
       .notNull()
       .references(() => serviceQuotaPeriods.id, { onDelete: "restrict" }),
-    type: mysqlEnum("type", ["content_asset", "website_operation"]).notNull(),
+    type: mysqlEnum("type", [
+      "content_asset",
+      "website_operation",
+      "knowledge_base",
+    ]).notNull(),
     quotaPool: mysqlEnum("quotaPool", [
       "content_asset_publish",
       "website_content_publish",
@@ -956,8 +962,32 @@ export const deliveryTickets = mysqlTable(
     >(),
     targetPage: text("targetPage"),
     knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
+    workflowDomain: mysqlEnum("workflowDomain", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer",
+    ]),
+    operation: varchar("operation", { length: 64 }),
+    assignedRoleId: varchar("assignedRoleId", { length: 36 }).references(
+      () => deliveryRoles.id,
+      { onDelete: "set null" },
+    ),
+    assignedMemberId: int("assignedMemberId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    sourceQuestionId: varchar("sourceQuestionId", { length: 191 }),
+    monitoringBatchKey: varchar("monitoringBatchKey", { length: 191 }),
+    responseLogicRevision: int("responseLogicRevision"),
+    contentAssetIds: json("contentAssetIds")
+      .$type<string[]>()
+      .default([])
+      .notNull(),
     technicalDedupeKey: varchar("technicalDedupeKey", { length: 64 }),
     materialUrls: json("materialUrls").$type<string[]>().default([]).notNull(),
+    priority: mysqlEnum("priority", ["low", "normal", "high", "urgent"])
+      .default("normal")
+      .notNull(),
     status: mysqlEnum("status", [
       "submitted",
       "needs_information",
@@ -1035,6 +1065,11 @@ export const deliveryTickets = mysqlTable(
       table.updatedAt,
       table.id,
     ),
+    index("delivery_tickets_role_member_status_idx").on(
+      table.workflowDomain,
+      table.assignedMemberId,
+      table.status,
+    ),
   ],
 );
 
@@ -1107,7 +1142,25 @@ export const deliveryTicketEvents = mysqlTable(
     actorUserId: int("actorUserId").references(() => users.id, {
       onDelete: "set null",
     }),
-    actorRole: mysqlEnum("actorRole", ["user", "admin", "system"]).notNull(),
+    actorRole: mysqlEnum("actorRole", [
+      "user",
+      "admin",
+      "delivery_member",
+      "system",
+    ]).notNull(),
+    actorContext: json("actorContext").$type<{
+      roleAssignmentId: string;
+      roleId: string;
+      roleType:
+        | "knowledge_base_engineer"
+        | "monitoring_optimization_engineer"
+        | "content_distribution_engineer"
+        | "website_operations_engineer";
+      teamName: string;
+      sourceTicketId?: string;
+      assignedRoleId?: string;
+      assignedMemberId?: number;
+    }>(),
     kind: mysqlEnum("kind", [
       "created",
       "message",
@@ -1705,6 +1758,100 @@ export const userAdminAssignments = mysqlTable(
   ],
 );
 
+/** Fixed-domain delivery teams. Permissions come from roleType, never JSON. */
+export const deliveryRoles = mysqlTable(
+  "delivery_roles",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    name: varchar("name", { length: 128 }).notNull(),
+    roleType: mysqlEnum("roleType", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer",
+    ]).notNull(),
+    isActive: boolean("isActive").default(true).notNull(),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("delivery_roles_type_name_uq").on(table.roleType, table.name),
+    index("delivery_roles_type_active_idx").on(table.roleType, table.isActive),
+  ],
+);
+
+/** A delivery-member account may hold several separate fixed-domain roles. */
+export const deliveryRoleMembers = mysqlTable(
+  "delivery_role_members",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    roleId: varchar("roleId", { length: 36 })
+      .notNull()
+      .references(() => deliveryRoles.id, { onDelete: "cascade" }),
+    memberUserId: int("memberUserId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    isActive: boolean("isActive").default(true).notNull(),
+    assignedByUserId: int("assignedByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("delivery_role_members_role_member_uq").on(
+      table.roleId,
+      table.memberUserId,
+    ),
+    index("delivery_role_members_member_active_idx").on(
+      table.memberUserId,
+      table.isActive,
+    ),
+  ],
+);
+
+/** Exactly one active primary delivery owner per customer and role domain. */
+export const deliveryCustomerAssignments = mysqlTable(
+  "delivery_customer_assignments",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    customerUserId: int("customerUserId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    roleType: mysqlEnum("roleType", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer",
+    ]).notNull(),
+    roleId: varchar("roleId", { length: 36 })
+      .notNull()
+      .references(() => deliveryRoles.id, { onDelete: "restrict" }),
+    primaryMemberId: int("primaryMemberId")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    assignedByUserId: int("assignedByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("delivery_customer_assignments_customer_type_uq").on(
+      table.customerUserId,
+      table.roleType,
+    ),
+    index("delivery_customer_assignments_member_type_idx").on(
+      table.primaryMemberId,
+      table.roleType,
+    ),
+  ],
+);
+
 /**
  * One administrator is the primary delivery owner for each customer. Customer
  * accounts normally use their own credential; this relationship remains a
@@ -2254,6 +2401,145 @@ export const knowledgeBaseBuildNodes = mysqlTable(
   ],
 );
 
+/** User-requested, role-approved destructive reset of one workspace KB. */
+export const knowledgeBaseResetRequests = mysqlTable(
+  "knowledge_base_reset_requests",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    ticketId: varchar("ticketId", { length: 36 })
+      .notNull()
+      .references(() => deliveryTickets.id, { onDelete: "restrict" }),
+    userId: int("userId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    assignedRoleId: varchar("assignedRoleId", { length: 36 })
+      .notNull()
+      .references(() => deliveryRoles.id, { onDelete: "restrict" }),
+    assignedMemberId: int("assignedMemberId")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    activeKey: varchar("activeKey", { length: 191 }),
+    reasonCode: mysqlEnum("reasonCode", [
+      "stuck",
+      "upload_error",
+      "build_error",
+      "enterprise_materials",
+      "other",
+    ]).notNull(),
+    reasonNote: text("reasonNote"),
+    status: mysqlEnum("status", ["pending", "approved", "rejected"])
+      .default("pending")
+      .notNull(),
+    decisionNote: text("decisionNote"),
+    decidedByUserId: int("decidedByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    cleanupSummary: json("cleanupSummary").$type<{
+      builds: number;
+      snapshots: number;
+      conversations: number;
+      attachments: number;
+      importReceipts: number;
+    }>(),
+    decidedAt: timestamp("decidedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("knowledge_base_reset_requests_ticket_uq").on(table.ticketId),
+    uniqueIndex("knowledge_base_reset_requests_active_key_uq").on(
+      table.activeKey,
+    ),
+    index("knowledge_base_reset_requests_user_status_idx").on(
+      table.userId,
+      table.status,
+    ),
+    index("knowledge_base_reset_requests_member_status_idx").on(
+      table.assignedMemberId,
+      table.status,
+    ),
+  ],
+);
+
+/** Monotonic KB reset revision used by open browser tabs to discard old state. */
+export const knowledgeBaseResetStates = mysqlTable(
+  "knowledge_base_reset_states",
+  {
+    userId: int("userId")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    revision: int("revision", { unsigned: true }).default(0).notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+);
+
+/** Prevents an asynchronously persisted browser snapshot from resurrecting KB chat. */
+export const knowledgeBaseConversationTombstones = mysqlTable(
+  "knowledge_base_conversation_tombstones",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    publicConversationId: varchar("publicConversationId", {
+      length: 191,
+    }).notNull(),
+    resetRequestId: varchar("resetRequestId", { length: 36 })
+      .notNull()
+      .references(() => knowledgeBaseResetRequests.id, {
+        onDelete: "cascade",
+      }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("kb_conversation_tombstones_user_conversation_uq").on(
+      table.userId,
+      table.publicConversationId,
+    ),
+  ],
+);
+
+/** Retry queue for deletion of KB-only local assets and upstream resources. */
+export const knowledgeBaseResetCleanupJobs = mysqlTable(
+  "knowledge_base_reset_cleanup_jobs",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    resetRequestId: varchar("resetRequestId", { length: 36 })
+      .notNull()
+      .references(() => knowledgeBaseResetRequests.id, {
+        onDelete: "cascade",
+      }),
+    userId: int("userId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).references(
+      () => apiCredentials.id,
+      { onDelete: "set null" },
+    ),
+    kind: mysqlEnum("kind", ["task", "file", "local_asset"]).notNull(),
+    upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
+    status: mysqlEnum("status", ["pending", "completed", "failed"])
+      .default("pending")
+      .notNull(),
+    attemptCount: int("attemptCount", { unsigned: true }).default(0).notNull(),
+    lastError: text("lastError"),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("kb_reset_cleanup_request_resource_uq").on(
+      table.resetRequestId,
+      table.kind,
+      table.upstreamId,
+    ),
+    index("kb_reset_cleanup_status_attempt_idx").on(
+      table.status,
+      table.attemptCount,
+    ),
+  ],
+);
+
 /**
  * One durable draft and latest confirmed version per monitored question.
  * Conversation IDs use the public browser ID because conversation snapshots
@@ -2586,6 +2872,14 @@ export type InsertApiKeyOwnership = typeof apiKeyOwnership.$inferInsert;
 export type UserAdminAssignment = typeof userAdminAssignments.$inferSelect;
 export type InsertUserAdminAssignment =
   typeof userAdminAssignments.$inferInsert;
+export type DeliveryRole = typeof deliveryRoles.$inferSelect;
+export type InsertDeliveryRole = typeof deliveryRoles.$inferInsert;
+export type DeliveryRoleMember = typeof deliveryRoleMembers.$inferSelect;
+export type InsertDeliveryRoleMember = typeof deliveryRoleMembers.$inferInsert;
+export type DeliveryCustomerAssignment =
+  typeof deliveryCustomerAssignments.$inferSelect;
+export type InsertDeliveryCustomerAssignment =
+  typeof deliveryCustomerAssignments.$inferInsert;
 export type UserUsageOwner = typeof userUsageOwners.$inferSelect;
 export type InsertUserUsageOwner = typeof userUsageOwners.$inferInsert;
 export type WorkspaceAuditEvent = typeof workspaceAuditEvents.$inferSelect;
@@ -2611,6 +2905,16 @@ export type KnowledgeBaseBuildNode =
   typeof knowledgeBaseBuildNodes.$inferSelect;
 export type InsertKnowledgeBaseBuildNode =
   typeof knowledgeBaseBuildNodes.$inferInsert;
+export type KnowledgeBaseResetRequest =
+  typeof knowledgeBaseResetRequests.$inferSelect;
+export type InsertKnowledgeBaseResetRequest =
+  typeof knowledgeBaseResetRequests.$inferInsert;
+export type KnowledgeBaseResetState =
+  typeof knowledgeBaseResetStates.$inferSelect;
+export type KnowledgeBaseConversationTombstone =
+  typeof knowledgeBaseConversationTombstones.$inferSelect;
+export type KnowledgeBaseResetCleanupJob =
+  typeof knowledgeBaseResetCleanupJobs.$inferSelect;
 export type ResponseLogicEntry = typeof responseLogicEntries.$inferSelect;
 export type InsertResponseLogicEntry = typeof responseLogicEntries.$inferInsert;
 export type Conversation = typeof conversations.$inferSelect;

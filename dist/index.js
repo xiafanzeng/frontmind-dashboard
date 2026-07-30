@@ -2,7 +2,7 @@
 import "dotenv/config";
 import express5 from "express";
 import { createServer } from "http";
-import { sql as sql3 } from "drizzle-orm";
+import { sql as sql5 } from "drizzle-orm";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 
 // server/admin-router.ts
@@ -127,7 +127,7 @@ var users = mysqlTable(
     name: text("name"),
     email: varchar("email", { length: 320 }),
     loginMethod: varchar("loginMethod", { length: 64 }),
-    role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+    role: mysqlEnum("role", ["user", "admin", "delivery_member"]).default("user").notNull(),
     adminAccessLevel: mysqlEnum("adminAccessLevel", [
       "system_admin",
       "delivery_admin"
@@ -816,7 +816,11 @@ var deliveryTickets = mysqlTable(
     userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
     contractId: varchar("contractId", { length: 36 }).notNull().references(() => serviceContracts.id, { onDelete: "restrict" }),
     quotaPeriodId: varchar("quotaPeriodId", { length: 36 }).notNull().references(() => serviceQuotaPeriods.id, { onDelete: "restrict" }),
-    type: mysqlEnum("type", ["content_asset", "website_operation"]).notNull(),
+    type: mysqlEnum("type", [
+      "content_asset",
+      "website_operation",
+      "knowledge_base"
+    ]).notNull(),
     quotaPool: mysqlEnum("quotaPool", [
       "content_asset_publish",
       "website_content_publish"
@@ -832,8 +836,27 @@ var deliveryTickets = mysqlTable(
     icpDeclarations: json("icpDeclarations").$type(),
     targetPage: text("targetPage"),
     knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
+    workflowDomain: mysqlEnum("workflowDomain", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer"
+    ]),
+    operation: varchar("operation", { length: 64 }),
+    assignedRoleId: varchar("assignedRoleId", { length: 36 }).references(
+      () => deliveryRoles.id,
+      { onDelete: "set null" }
+    ),
+    assignedMemberId: int("assignedMemberId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    sourceQuestionId: varchar("sourceQuestionId", { length: 191 }),
+    monitoringBatchKey: varchar("monitoringBatchKey", { length: 191 }),
+    responseLogicRevision: int("responseLogicRevision"),
+    contentAssetIds: json("contentAssetIds").$type().default([]).notNull(),
     technicalDedupeKey: varchar("technicalDedupeKey", { length: 64 }),
     materialUrls: json("materialUrls").$type().default([]).notNull(),
+    priority: mysqlEnum("priority", ["low", "normal", "high", "urgent"]).default("normal").notNull(),
     status: mysqlEnum("status", [
       "submitted",
       "needs_information",
@@ -903,6 +926,11 @@ var deliveryTickets = mysqlTable(
       table.status,
       table.updatedAt,
       table.id
+    ),
+    index("delivery_tickets_role_member_status_idx").on(
+      table.workflowDomain,
+      table.assignedMemberId,
+      table.status
     )
   ]
 );
@@ -956,7 +984,13 @@ var deliveryTicketEvents = mysqlTable(
     actorUserId: int("actorUserId").references(() => users.id, {
       onDelete: "set null"
     }),
-    actorRole: mysqlEnum("actorRole", ["user", "admin", "system"]).notNull(),
+    actorRole: mysqlEnum("actorRole", [
+      "user",
+      "admin",
+      "delivery_member",
+      "system"
+    ]).notNull(),
+    actorContext: json("actorContext").$type(),
     kind: mysqlEnum("kind", [
       "created",
       "message",
@@ -1422,6 +1456,84 @@ var userAdminAssignments = mysqlTable(
     index("user_admin_assignments_admin_idx").on(table.adminId)
   ]
 );
+var deliveryRoles = mysqlTable(
+  "delivery_roles",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    name: varchar("name", { length: 128 }).notNull(),
+    roleType: mysqlEnum("roleType", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer"
+    ]).notNull(),
+    isActive: boolean("isActive").default(true).notNull(),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_roles_type_name_uq").on(table.roleType, table.name),
+    index("delivery_roles_type_active_idx").on(table.roleType, table.isActive)
+  ]
+);
+var deliveryRoleMembers = mysqlTable(
+  "delivery_role_members",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    roleId: varchar("roleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "cascade" }),
+    memberUserId: int("memberUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    isActive: boolean("isActive").default(true).notNull(),
+    assignedByUserId: int("assignedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_role_members_role_member_uq").on(
+      table.roleId,
+      table.memberUserId
+    ),
+    index("delivery_role_members_member_active_idx").on(
+      table.memberUserId,
+      table.isActive
+    )
+  ]
+);
+var deliveryCustomerAssignments = mysqlTable(
+  "delivery_customer_assignments",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    customerUserId: int("customerUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    roleType: mysqlEnum("roleType", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer"
+    ]).notNull(),
+    roleId: varchar("roleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "restrict" }),
+    primaryMemberId: int("primaryMemberId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    assignedByUserId: int("assignedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_customer_assignments_customer_type_uq").on(
+      table.customerUserId,
+      table.roleType
+    ),
+    index("delivery_customer_assignments_member_type_idx").on(
+      table.primaryMemberId,
+      table.roleType
+    )
+  ]
+);
 var userUsageOwners = mysqlTable(
   "user_usage_owners",
   {
@@ -1823,6 +1935,109 @@ var knowledgeBaseBuildNodes = mysqlTable(
     index("knowledge_base_build_nodes_status_idx").on(
       table.buildId,
       table.status
+    )
+  ]
+);
+var knowledgeBaseResetRequests = mysqlTable(
+  "knowledge_base_reset_requests",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    ticketId: varchar("ticketId", { length: 36 }).notNull().references(() => deliveryTickets.id, { onDelete: "restrict" }),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    assignedRoleId: varchar("assignedRoleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "restrict" }),
+    assignedMemberId: int("assignedMemberId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    activeKey: varchar("activeKey", { length: 191 }),
+    reasonCode: mysqlEnum("reasonCode", [
+      "stuck",
+      "upload_error",
+      "build_error",
+      "enterprise_materials",
+      "other"
+    ]).notNull(),
+    reasonNote: text("reasonNote"),
+    status: mysqlEnum("status", ["pending", "approved", "rejected"]).default("pending").notNull(),
+    decisionNote: text("decisionNote"),
+    decidedByUserId: int("decidedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    cleanupSummary: json("cleanupSummary").$type(),
+    decidedAt: timestamp("decidedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("knowledge_base_reset_requests_ticket_uq").on(table.ticketId),
+    uniqueIndex("knowledge_base_reset_requests_active_key_uq").on(
+      table.activeKey
+    ),
+    index("knowledge_base_reset_requests_user_status_idx").on(
+      table.userId,
+      table.status
+    ),
+    index("knowledge_base_reset_requests_member_status_idx").on(
+      table.assignedMemberId,
+      table.status
+    )
+  ]
+);
+var knowledgeBaseResetStates = mysqlTable(
+  "knowledge_base_reset_states",
+  {
+    userId: int("userId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    revision: int("revision", { unsigned: true }).default(0).notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  }
+);
+var knowledgeBaseConversationTombstones = mysqlTable(
+  "knowledge_base_conversation_tombstones",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    publicConversationId: varchar("publicConversationId", {
+      length: 191
+    }).notNull(),
+    resetRequestId: varchar("resetRequestId", { length: 36 }).notNull().references(() => knowledgeBaseResetRequests.id, {
+      onDelete: "cascade"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("kb_conversation_tombstones_user_conversation_uq").on(
+      table.userId,
+      table.publicConversationId
+    )
+  ]
+);
+var knowledgeBaseResetCleanupJobs = mysqlTable(
+  "knowledge_base_reset_cleanup_jobs",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    resetRequestId: varchar("resetRequestId", { length: 36 }).notNull().references(() => knowledgeBaseResetRequests.id, {
+      onDelete: "cascade"
+    }),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).references(
+      () => apiCredentials.id,
+      { onDelete: "set null" }
+    ),
+    kind: mysqlEnum("kind", ["task", "file", "local_asset"]).notNull(),
+    upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
+    status: mysqlEnum("status", ["pending", "completed", "failed"]).default("pending").notNull(),
+    attemptCount: int("attemptCount", { unsigned: true }).default(0).notNull(),
+    lastError: text("lastError"),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("kb_reset_cleanup_request_resource_uq").on(
+      table.resetRequestId,
+      table.kind,
+      table.upstreamId
+    ),
+    index("kb_reset_cleanup_status_attempt_idx").on(
+      table.status,
+      table.attemptCount
     )
   ]
 );
@@ -3885,7 +4100,7 @@ var dashboardOptimizationReportSchema = z3.object({
   questionBaselines: z3.array(dashboardOptimizationBaselineSchema).max(500).optional(),
   questionReports: z3.array(dashboardOptimizationQuestionReportSchema).max(500).optional()
 }).superRefine((report, context) => {
-  const ensureUnique = (values, path10) => {
+  const ensureUnique = (values, path11) => {
     const seen = /* @__PURE__ */ new Set();
     values.forEach((value, index2) => {
       if (!value || !seen.has(value)) {
@@ -3895,9 +4110,9 @@ var dashboardOptimizationReportSchema = z3.object({
       context.addIssue({
         code: "custom",
         path: [
-          path10,
+          path11,
           index2,
-          path10 === "questionBaselines" ? "questionId" : "id"
+          path11 === "questionBaselines" ? "questionId" : "id"
         ],
         message: "\u540C\u4E00\u95EE\u9898\u53EA\u80FD\u53D1\u5E03\u4E00\u4EFD\u62A5\u544A"
       });
@@ -4190,8 +4405,8 @@ var websitePurchaseRequestV2Schema = z4.object({
       "service startsAt must match order paidAt"
     ]
   ];
-  for (const [valid, path10, message] of checks) {
-    if (!valid) context.addIssue({ code: "custom", path: path10, message });
+  for (const [valid, path11, message] of checks) {
+    if (!valid) context.addIssue({ code: "custom", path: path11, message });
   }
 });
 var purchaseStatusSchema = z4.enum([
@@ -4241,7 +4456,8 @@ var accountMarketEditionSchema = z5.enum(["domestic", "overseas"]);
 // shared/delivery-ticket.ts
 var deliveryTicketTypeSchema = z6.enum([
   "content_asset",
-  "website_operation"
+  "website_operation",
+  "knowledge_base"
 ]);
 var deliveryTicketQuotaPoolSchema = z6.enum([
   "content_asset_publish",
@@ -4382,7 +4598,7 @@ var icpNonSensitiveDeclarationsSchema = z6.object({
 }).strict();
 var createDeliveryTicketSchema = z6.object({
   clientRequestId: z6.string().uuid(),
-  type: deliveryTicketTypeSchema,
+  type: z6.enum(["content_asset", "website_operation"]),
   category: optionalTrimmedText(64),
   topic: optionalTrimmedText(512),
   title: optionalTrimmedText(512),
@@ -4588,6 +4804,9 @@ var ACTIVE_WEBSITE_OPERATION_CATEGORIES = Object.freeze([
 ]);
 function resolveDeliveryTicketQuotaPool(input) {
   const category = input.category?.trim() || "";
+  if (input.type === "knowledge_base") {
+    throw new Error("\u77E5\u8BC6\u5E93\u5185\u90E8\u5DE5\u5355\u53EA\u80FD\u7531\u4E13\u7528\u6D41\u7A0B\u521B\u5EFA");
+  }
   if (input.type === "website_operation") {
     if (!WEBSITE_OPERATION_CATEGORIES.has(category)) {
       throw new Error("\u8BF7\u9009\u62E9\u6709\u6548\u7684\u5B98\u7F51\u8FD0\u8425\u7C7B\u522B");
@@ -4646,13 +4865,17 @@ var publicContentAssetTicketSummarySchema = publicDeliveryTicketSummaryBaseSchem
 var publicWebsiteTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
   type: z6.literal("website_operation")
 }).strict();
+var publicKnowledgeBaseTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
+  type: z6.literal("knowledge_base")
+}).strict();
 var publicDeliveryTicketSummarySchema = z6.discriminatedUnion("type", [
   publicContentAssetTicketSummarySchema,
-  publicWebsiteTicketSummarySchema
+  publicWebsiteTicketSummarySchema,
+  publicKnowledgeBaseTicketSummarySchema
 ]);
 var publicDeliveryTicketEventSchema = z6.object({
   id: z6.string().uuid(),
-  actorRole: z6.enum(["user", "admin", "system"]),
+  actorRole: z6.enum(["user", "admin", "delivery_member", "system"]),
   actorLabel: z6.enum(["\u7528\u6237", "\u670D\u52A1\u56E2\u961F"]),
   message: z6.string().max(5e4).nullable(),
   createdAt: z6.number().int().nonnegative().nullable()
@@ -4679,9 +4902,14 @@ var publicContentAssetTicketDetailSchema = z6.object({
 var publicWebsiteTicketDetailSchema = z6.object({
   ticket: publicWebsiteTicketSummarySchema
 }).strict();
+var publicKnowledgeBaseTicketDetailSchema = z6.object({
+  ticket: publicKnowledgeBaseTicketSummarySchema,
+  events: z6.array(publicDeliveryTicketEventSchema)
+}).strict();
 var publicDeliveryTicketDetailSchema = z6.union([
   publicContentAssetTicketDetailSchema,
-  publicWebsiteTicketDetailSchema
+  publicWebsiteTicketDetailSchema,
+  publicKnowledgeBaseTicketDetailSchema
 ]);
 var publicDeliveryTicketQuotaSchema = z6.object({
   type: deliveryTicketQuotaPoolSchema,
@@ -4718,6 +4946,12 @@ var publicDeliveryTicketWorkspaceMetadataSchema = z6.object({
   websiteContentCatalog: z6.array(publicWebsiteContentCatalogItemSchema),
   marketEdition: accountMarketEditionSchema,
   preferredMediaOptions: z6.array(preferredContentMediaSchema),
+  deliveryOwners: z6.object({
+    knowledgeBase: z6.boolean(),
+    monitoringOptimization: z6.boolean(),
+    contentDistribution: z6.boolean(),
+    websiteOperations: z6.boolean()
+  }).strict(),
   websiteWorkflow: z6.object({
     domainCompleted: z6.boolean(),
     icpCompleted: z6.boolean(),
@@ -9024,18 +9258,40 @@ function taskCreditUsage(task) {
 }
 async function getPresalesCreditUsage(windowDays = CREDIT_USAGE_LOOKBACK_DAYS) {
   const credential = await getActivePresalesCredential();
+  const normalizedWindowDays = Number.isInteger(windowDays) && windowDays > 0 && windowDays <= 365 ? windowDays : CREDIT_USAGE_LOOKBACK_DAYS;
   if (!credential) {
     return {
-      totalUsed: 0,
-      recentTasks: [],
+      windowDays: normalizedWindowDays,
+      keyTotalUsed: 0,
+      websiteUsed: 0,
+      recentWebsiteTasks: [],
       fetchedAt: Date.now()
     };
   }
-  const normalizedWindowDays = Number.isInteger(windowDays) && windowDays > 0 && windowDays <= 365 ? windowDays : CREDIT_USAGE_LOOKBACK_DAYS;
+  const db = await requireDb2();
+  const [resourceRows, ownedRows, monitorRows] = await Promise.all([
+    db.select({ upstreamTaskId: presalesUpstreamResources.upstreamId }).from(presalesUpstreamResources).where(
+      and6(
+        eq7(presalesUpstreamResources.apiCredentialId, credential.id),
+        eq7(presalesUpstreamResources.kind, "task")
+      )
+    ),
+    db.select({ upstreamTaskId: presalesTaskRequests.upstreamTaskId }).from(presalesTaskRequests).where(
+      and6(
+        eq7(presalesTaskRequests.apiCredentialId, credential.id),
+        eq7(presalesTaskRequests.status, "completed")
+      )
+    ),
+    db.select({ upstreamTaskId: presalesMonitorRuns.upstreamTaskId }).from(presalesMonitorRuns).where(eq7(presalesMonitorRuns.apiCredentialId, credential.id))
+  ]);
+  const websiteTaskIds = new Set(
+    [...resourceRows, ...ownedRows, ...monitorRows].map((row) => row.upstreamTaskId?.trim()).filter((id) => Boolean(id))
+  );
   const cutoffMs = Date.now() - normalizedWindowDays * 24 * 60 * 60 * 1e3;
-  const recentTasks = [];
+  const recentWebsiteTasks = [];
   const seen = /* @__PURE__ */ new Set();
-  let totalUsed = 0;
+  let keyTotalUsed = 0;
+  let websiteUsed = 0;
   let after;
   let reachedCutoff = false;
   for (let page = 0; page < CREDIT_USAGE_MAX_PAGES && !reachedCutoff; page += 1) {
@@ -9084,8 +9340,10 @@ async function getPresalesCreditUsage(windowDays = CREDIT_USAGE_LOOKBACK_DAYS) {
       }
       const creditUsage = taskCreditUsage(task);
       if (creditUsage <= 0) continue;
-      totalUsed += creditUsage;
-      recentTasks.push({
+      keyTotalUsed += creditUsage;
+      if (!websiteTaskIds.has(id)) continue;
+      websiteUsed += creditUsage;
+      recentWebsiteTasks.push({
         id,
         title: String(
           task?.metadata?.task_title ?? task?.task_title ?? task?.instructions?.slice?.(0, 40) ?? id.slice(0, 12)
@@ -9097,7 +9355,13 @@ async function getPresalesCreditUsage(windowDays = CREDIT_USAGE_LOOKBACK_DAYS) {
     after = String(payload?.last_id ?? tasks[tasks.length - 1]?.id ?? "") || void 0;
     if (!payload?.has_more || !after) break;
   }
-  return { totalUsed, recentTasks, fetchedAt: Date.now() };
+  return {
+    windowDays: normalizedWindowDays,
+    keyTotalUsed,
+    websiteUsed,
+    recentWebsiteTasks,
+    fetchedAt: Date.now()
+  };
 }
 
 // server/dashboard-service.ts
@@ -15909,6 +16173,9 @@ function deliveryLinksFromOperationResults(values) {
 function publicDeliveryCategoryLabel(ticket) {
   const category = nonEmpty(ticket.category);
   if (!category) return null;
+  if (ticket.type === "knowledge_base") {
+    return category === "knowledge_reset" ? "\u77E5\u8BC6\u5E93\u91CD\u7F6E" : category;
+  }
   if (ticket.type === "content_asset") {
     return CONTENT_ASSET_CATALOG.find((item) => item.id === category)?.label ?? category;
   }
@@ -15935,9 +16202,12 @@ function toPublicDeliveryTicketSummary(ticket) {
       ...base,
       type: "content_asset",
       deliveryLinks: publicStatus2 === "completed" ? publicDeliveryLinks(ticket.deliveryLinks) : []
-    } : {
+    } : ticket.type === "website_operation" ? {
       ...base,
       type: "website_operation"
+    } : {
+      ...base,
+      type: "knowledge_base"
     }
   );
 }
@@ -16219,7 +16489,7 @@ async function getDeliveryTicketWorkspace(userId) {
 async function getDeliveryTicketWorkspaceMetadata(userId) {
   const db = await requireDb10();
   const portal = await getServicePortal(userId);
-  const [accountRows, siteProfile, quotas, pendingRows] = await Promise.all([
+  const [accountRows, siteProfile, quotas, pendingRows, ownerRows] = await Promise.all([
     db.select({ marketEdition: users.marketEdition }).from(users).where(eq17(users.id, userId)).limit(1),
     loadSiteProfile(db, userId),
     currentQuota(db, userId, portal),
@@ -16233,8 +16503,32 @@ async function getDeliveryTicketWorkspaceMetadata(userId) {
           "in_progress"
         ])
       )
+    ),
+    db.select({ roleType: deliveryCustomerAssignments.roleType }).from(deliveryCustomerAssignments).innerJoin(
+      deliveryRoles,
+      eq17(deliveryCustomerAssignments.roleId, deliveryRoles.id)
+    ).innerJoin(
+      deliveryRoleMembers,
+      and14(
+        eq17(deliveryRoleMembers.roleId, deliveryCustomerAssignments.roleId),
+        eq17(
+          deliveryRoleMembers.memberUserId,
+          deliveryCustomerAssignments.primaryMemberId
+        )
+      )
+    ).innerJoin(
+      users,
+      eq17(users.id, deliveryCustomerAssignments.primaryMemberId)
+    ).where(
+      and14(
+        eq17(deliveryCustomerAssignments.customerUserId, userId),
+        eq17(deliveryRoles.isActive, true),
+        eq17(deliveryRoleMembers.isActive, true),
+        eq17(users.isActive, true)
+      )
     )
   ]);
+  const ownerTypes = new Set(ownerRows.map((row) => row.roleType));
   const domainCompleted = siteProfile?.domainStatus === "completed";
   const icpCompleted = siteProfile?.icpStatus === "approved" || siteProfile?.icpStatus === "not_required";
   const marketEdition = accountRows[0]?.marketEdition ?? "domestic";
@@ -16246,6 +16540,14 @@ async function getDeliveryTicketWorkspaceMetadata(userId) {
     websiteContentCatalog: WEBSITE_CONTENT_CATALOG,
     marketEdition,
     preferredMediaOptions: contentAssetMediaOptionsForMarketEdition(marketEdition),
+    deliveryOwners: {
+      knowledgeBase: ownerTypes.has("knowledge_base_engineer"),
+      monitoringOptimization: ownerTypes.has(
+        "monitoring_optimization_engineer"
+      ),
+      contentDistribution: ownerTypes.has("content_distribution_engineer"),
+      websiteOperations: ownerTypes.has("website_operations_engineer")
+    },
     websiteWorkflow: {
       domainStatus: siteProfile?.domainStatus ?? "not_started",
       icpStatus: siteProfile?.icpStatus ?? "not_submitted",
@@ -16263,36 +16565,49 @@ async function getDeliveryTicketWorkspaceMetadata(userId) {
   };
 }
 function toPublicDeliveryTicketWorkspaceMetadata(metadata) {
+  const deliveryOwners = metadata.deliveryOwners ?? {
+    knowledgeBase: true,
+    monitoringOptimization: true,
+    contentDistribution: true,
+    websiteOperations: true
+  };
   const domainPending = metadata.siteProfile?.domainStatus === "pending";
   const icpPending = metadata.siteProfile?.icpStatus === "preparing" || metadata.siteProfile?.icpStatus === "submitted";
   const domainCompleted = metadata.websiteWorkflow.domainCompleted;
   const icpCompleted = metadata.websiteWorkflow.icpCompleted;
-  const quota = (value) => ({
+  const quota = (value, hasOwner) => ({
     type: value.type,
-    allowed: value.allowed,
+    allowed: value.allowed && hasOwner,
     used: value.used,
     limit: value.limit,
     remaining: value.remaining,
-    reason: value.reason
+    reason: hasOwner ? value.reason : "\u8BE5\u4E1A\u52A1\u5C1A\u672A\u914D\u7F6E\u8D1F\u8D23\u4EBA\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458\u3002"
   });
   return publicDeliveryTicketWorkspaceMetadataSchema.parse({
     quotas: {
-      content_asset_publish: quota(metadata.quotas.content_asset_publish),
-      website_content_publish: quota(metadata.quotas.website_content_publish)
+      content_asset_publish: quota(
+        metadata.quotas.content_asset_publish,
+        deliveryOwners.contentDistribution
+      ),
+      website_content_publish: quota(
+        metadata.quotas.website_content_publish,
+        deliveryOwners.websiteOperations
+      )
     },
     contentAssetCatalog: metadata.contentAssetCatalog,
     websiteContentCatalog: metadata.websiteContentCatalog,
     marketEdition: metadata.marketEdition,
     preferredMediaOptions: metadata.preferredMediaOptions,
+    deliveryOwners,
     websiteWorkflow: {
       domainCompleted,
       icpCompleted,
-      canSubmitDomain: !domainCompleted && !domainPending,
-      canSubmitIcp: !icpCompleted && !domainPending && !icpPending,
-      canSubmitContent: domainCompleted && icpCompleted,
-      domainLockReason: domainPending ? "\u57DF\u540D\u7533\u8BF7\u5DE5\u5355\u5F85\u7BA1\u7406\u5458\u53D7\u7406\u3002" : domainCompleted ? null : null,
-      icpLockReason: domainPending || icpPending ? "\u57DF\u540D\u4E0E ICP \u5907\u6848\u7ED3\u679C\u5F85\u7BA1\u7406\u5458\u786E\u8BA4\u3002" : null,
-      contentLockReason: !domainCompleted ? "\u8BF7\u5148\u5728\u963F\u91CC\u4E91\u5B8C\u6210\u57DF\u540D\u6CE8\u518C\u4E0E ICP \u5907\u6848\uFF0C\u5E76\u63D0\u4EA4\u5907\u6848\u7ED3\u679C\u3002" : !icpCompleted ? "\u8BF7\u5148\u63D0\u4EA4\u5E76\u786E\u8BA4\u57DF\u540D\u4E0E ICP \u4E3B\u4F53\u5907\u6848\u53F7\u3002" : null,
+      canSubmitDomain: deliveryOwners.websiteOperations && !domainCompleted && !domainPending,
+      canSubmitIcp: deliveryOwners.websiteOperations && !icpCompleted && !domainPending && !icpPending,
+      canSubmitContent: deliveryOwners.websiteOperations && domainCompleted && icpCompleted,
+      domainLockReason: domainPending ? "\u57DF\u540D\u7533\u8BF7\u5DE5\u5355\u5F85\u7BA1\u7406\u5458\u53D7\u7406\u3002" : !deliveryOwners.websiteOperations ? "\u8BE5\u4E1A\u52A1\u5C1A\u672A\u914D\u7F6E\u8D1F\u8D23\u4EBA\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458\u3002" : domainCompleted ? null : null,
+      icpLockReason: !deliveryOwners.websiteOperations ? "\u8BE5\u4E1A\u52A1\u5C1A\u672A\u914D\u7F6E\u8D1F\u8D23\u4EBA\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458\u3002" : domainPending || icpPending ? "\u57DF\u540D\u4E0E ICP \u5907\u6848\u7ED3\u679C\u5F85\u7BA1\u7406\u5458\u786E\u8BA4\u3002" : null,
+      contentLockReason: !deliveryOwners.websiteOperations ? "\u8BE5\u4E1A\u52A1\u5C1A\u672A\u914D\u7F6E\u8D1F\u8D23\u4EBA\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458\u3002" : !domainCompleted ? "\u8BF7\u5148\u5728\u963F\u91CC\u4E91\u5B8C\u6210\u57DF\u540D\u6CE8\u518C\u4E0E ICP \u5907\u6848\uFF0C\u5E76\u63D0\u4EA4\u5907\u6848\u7ED3\u679C\u3002" : !icpCompleted ? "\u8BF7\u5148\u63D0\u4EA4\u5E76\u786E\u8BA4\u57DF\u540D\u4E0E ICP \u4E3B\u4F53\u5907\u6848\u53F7\u3002" : null,
       icpProvinceOptions: metadata.websiteWorkflow.icpProvinceOptions
     }
   });
@@ -16482,6 +16797,46 @@ async function createDeliveryTicket(input) {
         const now = /* @__PURE__ */ new Date();
         const ticketId = randomUUID13();
         const eventId = randomUUID13();
+        const workflowDomain = input.value.type === "content_asset" ? "content_distribution_engineer" : input.value.category === "knowledge_base_maintenance" ? "knowledge_base_engineer" : "website_operations_engineer";
+        const operation = input.value.type === "content_asset" ? "content_asset_publish" : input.value.category === "knowledge_base_maintenance" ? "knowledge_maintenance" : input.value.category;
+        const ownerRows = await tx.select({
+          roleId: deliveryCustomerAssignments.roleId,
+          memberId: deliveryCustomerAssignments.primaryMemberId
+        }).from(deliveryCustomerAssignments).innerJoin(
+          deliveryRoles,
+          eq17(deliveryCustomerAssignments.roleId, deliveryRoles.id)
+        ).innerJoin(
+          deliveryRoleMembers,
+          and14(
+            eq17(
+              deliveryRoleMembers.roleId,
+              deliveryCustomerAssignments.roleId
+            ),
+            eq17(
+              deliveryRoleMembers.memberUserId,
+              deliveryCustomerAssignments.primaryMemberId
+            )
+          )
+        ).innerJoin(
+          users,
+          eq17(users.id, deliveryCustomerAssignments.primaryMemberId)
+        ).where(
+          and14(
+            eq17(deliveryCustomerAssignments.customerUserId, input.userId),
+            eq17(deliveryCustomerAssignments.roleType, workflowDomain),
+            eq17(deliveryRoles.isActive, true),
+            eq17(deliveryRoleMembers.isActive, true),
+            eq17(users.isActive, true)
+          )
+        ).limit(1).for("update");
+        const owner = ownerRows[0];
+        if (!owner) {
+          throw new DeliveryTicketError(
+            "DELIVERY_OWNER_NOT_ASSIGNED",
+            `\u8BE5\u4E1A\u52A1\u5C1A\u672A\u914D\u7F6E\u8D1F\u8D23\u4EBA\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458\u540E\u518D\u63D0\u4EA4\u3002`,
+            409
+          );
+        }
         await tx.insert(deliveryTickets).values({
           id: ticketId,
           userId: input.userId,
@@ -16501,6 +16856,10 @@ async function createDeliveryTicket(input) {
           icpDeclarations: input.value.icpDeclarations ?? null,
           targetPage: nonEmpty(input.value.targetPage),
           knowledgeSnapshotId: input.value.knowledgeSnapshotId ?? null,
+          workflowDomain,
+          operation,
+          assignedRoleId: owner.roleId,
+          assignedMemberId: owner.memberId,
           technicalDedupeKey: technicalDedupe,
           materialUrls: input.value.materialUrls,
           status: "submitted",
@@ -16694,7 +17053,8 @@ async function getDeliveryTicketDetail(input) {
       eventType: event.kind,
       visibility: event.visibility,
       actorRole: event.actorRole,
-      actorLabel: event.actorRole === "user" ? "\u7528\u6237" : "\u7BA1\u7406\u5458",
+      actorLabel: event.actorRole === "user" ? "\u7528\u6237" : event.actorRole === "delivery_member" ? "\u4EA4\u4ED8\u6210\u5458" : "\u7BA1\u7406\u5458",
+      ...input.includeInternal ? { actorContext: event.actorContext ?? null } : {},
       message: event.message,
       fromStatus: event.fromStatus,
       toStatus: event.toStatus,
@@ -16724,6 +17084,29 @@ async function getPublicDeliveryTicketDetail(input) {
   const summary = toPublicDeliveryTicketSummary(ticketDto(ticket));
   if (summary.type === "website_operation") {
     return publicWebsiteTicketDetailSchema.parse({ ticket: summary });
+  }
+  if (summary.type === "knowledge_base") {
+    const events2 = await db.select({
+      id: deliveryTicketEvents.id,
+      actorRole: deliveryTicketEvents.actorRole,
+      message: deliveryTicketEvents.message,
+      createdAt: deliveryTicketEvents.createdAt
+    }).from(deliveryTicketEvents).where(
+      and14(
+        eq17(deliveryTicketEvents.ticketId, ticket.id),
+        eq17(deliveryTicketEvents.visibility, "customer")
+      )
+    ).orderBy(asc7(deliveryTicketEvents.createdAt));
+    return publicKnowledgeBaseTicketDetailSchema.parse({
+      ticket: summary,
+      events: events2.map((event) => ({
+        id: event.id,
+        actorRole: event.actorRole,
+        actorLabel: event.actorRole === "user" ? "\u7528\u6237" : "\u670D\u52A1\u56E2\u961F",
+        message: event.message,
+        createdAt: epoch3(event.createdAt)
+      }))
+    });
   }
   const [events, attachments2] = await Promise.all([
     db.select({
@@ -17937,7 +18320,8 @@ async function syncApiUsageSnapshots(actor) {
           executor: db,
           policy,
           credentialFingerprint: fingerprints.website,
-          used: usage.totalUsed,
+          used: usage.keyTotalUsed,
+          accountUsed: usage.websiteUsed,
           status: "ok",
           now
         });
@@ -18599,12 +18983,12 @@ async function parseRedirectWorkbook(data) {
   for (const row of rows) {
     if (invalidRows.has(row.row) || globallyVisited.has(row.sourceUrl))
       continue;
-    const path10 = /* @__PURE__ */ new Map();
+    const path11 = /* @__PURE__ */ new Map();
     let current = row;
     while (current && !invalidRows.has(current.row)) {
-      if (path10.has(current.sourceUrl)) {
-        const cycleStart = path10.get(current.sourceUrl);
-        const cycleRows = [...path10.entries()].filter(([, position]) => position >= cycleStart).map(([source]) => nextBySource.get(source)).filter(Boolean);
+      if (path11.has(current.sourceUrl)) {
+        const cycleStart = path11.get(current.sourceUrl);
+        const cycleRows = [...path11.entries()].filter(([, position]) => position >= cycleStart).map(([source]) => nextBySource.get(source)).filter(Boolean);
         for (const cycleRow of cycleRows) invalidRows.add(cycleRow.row);
         errors.push({
           row: current.row,
@@ -18613,10 +18997,10 @@ async function parseRedirectWorkbook(data) {
         break;
       }
       if (globallyVisited.has(current.sourceUrl)) break;
-      path10.set(current.sourceUrl, path10.size);
+      path11.set(current.sourceUrl, path11.size);
       current = nextBySource.get(current.targetUrl);
     }
-    for (const source of path10.keys()) globallyVisited.add(source);
+    for (const source of path11.keys()) globallyVisited.add(source);
   }
   const validRows = rows.filter((row) => !invalidRows.has(row.row));
   return {
@@ -19355,6 +19739,7 @@ var adminRouter = router({
         windowDays: z9.number().int().min(1).max(365)
       })
     ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await updateApiUsagePolicy({
           actor: ctx.user,
@@ -19406,6 +19791,7 @@ var adminRouter = router({
       }
     }),
     adjustQuota: adminProcedure.input(adjustDeliveryTicketQuotaSchema).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await adjustDeliveryTicketQuota({
           actor: ctx.user,
@@ -19436,6 +19822,7 @@ var adminRouter = router({
         userId: z9.number().int().positive()
       })
     ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         const { userId, ...value } = input;
         return await updateManagedDeliveryTicket({
@@ -19462,6 +19849,7 @@ var adminRouter = router({
       }
     }),
     recordDelivery: adminProcedure.input(recordDeliveryOperationSchema).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await recordManagedDeliveryOperation({
           actor: ctx.user,
@@ -19472,6 +19860,7 @@ var adminRouter = router({
       }
     }),
     previewRedirects: adminProcedure.input(previewRedirectWorkbookSchema).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await previewRedirectWorkbook({
           actor: ctx.user,
@@ -19482,6 +19871,7 @@ var adminRouter = router({
       }
     }),
     confirmRedirects: adminProcedure.input(confirmRedirectWorkbookSchema).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await confirmRedirectWorkbook({
           actor: ctx.user,
@@ -19492,6 +19882,7 @@ var adminRouter = router({
       }
     }),
     updateSiteProfile: adminProcedure.input(updateWorkspaceSiteProfileSchema).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await updateWorkspaceSiteProfile({
           actor: ctx.user,
@@ -19502,6 +19893,7 @@ var adminRouter = router({
       }
     }),
     upsertSiteCheck: adminProcedure.input(upsertWorkspaceSiteCheckSchema).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await upsertWorkspaceSiteCheck({
           actor: ctx.user,
@@ -19590,6 +19982,7 @@ var adminRouter = router({
           reason: z9.string().trim().max(2e3).optional()
         })
       ).mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
           await assertServiceCapability(input.userId, "contentAssets");
@@ -19611,6 +20004,7 @@ var adminRouter = router({
         reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await setWorkspaceAssignments({
           actor: ctx.user,
@@ -19671,6 +20065,7 @@ var adminRouter = router({
         "\u6CA1\u6709\u53EF\u66F4\u65B0\u7684\u5019\u9009\u95EE\u9898\u5B57\u6BB5"
       )
     ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         await assertServiceCapability(input.userId, "questionSelection");
@@ -19711,6 +20106,7 @@ var adminRouter = router({
         reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         await assertServiceCapability(input.userId, "questionSelection");
@@ -19871,6 +20267,7 @@ var adminRouter = router({
         reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         await getManagedCredentialStatus(ctx.user, input.userId);
         const existing = await getDashboardWorkspace(input.userId);
@@ -20002,6 +20399,7 @@ var adminRouter = router({
         reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await replaceManagedUserCredential({
           actor: ctx.user,
@@ -20019,6 +20417,7 @@ var adminRouter = router({
         reason: z9.string().trim().max(2e3).optional()
       })
     ).mutation(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await deleteManagedUserCredential({
           actor: ctx.user,
@@ -20128,6 +20527,7 @@ var adminRouter = router({
         }
       }),
       replaceBatch: adminProcedure.input(replaceMonitoringBatchSchema).mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           const batch = await replaceMonitoringBatch({
             actor: ctx.user,
@@ -20637,10 +21037,10 @@ function requireDb13(db) {
   }
   return db;
 }
-async function permanentlyDeleteConversation(executor, userId, persistedConversationId) {
+async function permanentlyDeleteConversation(executor, userId, persistedConversationId2) {
   await executor.delete(conversations).where(
     and19(
-      eq22(conversations.id, persistedConversationId),
+      eq22(conversations.id, persistedConversationId2),
       eq22(conversations.userId, userId)
     )
   );
@@ -21071,8 +21471,43 @@ function mergeConversationMessages(persisted, incoming, deletedMessageIds) {
   ];
 }
 async function persistSnapshot(executor, userId, snapshot, options = {}) {
-  const persistedConversationId = storageId(userId, snapshot.id);
-  const existingRows = await executor.select().from(conversations).where(eq22(conversations.id, persistedConversationId)).limit(1).for("update");
+  const lockedKnowledgeBuilds = await executor.select({ id: knowledgeBaseBuilds.id }).from(knowledgeBaseBuilds).innerJoin(
+    knowledgeBaseResetRequests,
+    and19(
+      eq22(knowledgeBaseResetRequests.userId, knowledgeBaseBuilds.userId),
+      eq22(knowledgeBaseResetRequests.status, "pending")
+    )
+  ).where(
+    and19(
+      eq22(knowledgeBaseBuilds.userId, userId),
+      eq22(knowledgeBaseBuilds.conversationId, snapshot.id)
+    )
+  ).limit(1).for("update");
+  if (lockedKnowledgeBuilds[0]) {
+    if (options.skipExisting) return "skipped";
+    throw new TRPCError4({
+      code: "CONFLICT",
+      message: "\u77E5\u8BC6\u5E93\u91CD\u7F6E\u5DE5\u5355\u6B63\u5728\u5BA1\u6279\uFF0C\u5F53\u524D\u4F1A\u8BDD\u5DF2\u53EA\u8BFB\u9501\u5B9A"
+    });
+  }
+  const tombstones = await executor.select({ id: knowledgeBaseConversationTombstones.id }).from(knowledgeBaseConversationTombstones).where(
+    and19(
+      eq22(knowledgeBaseConversationTombstones.userId, userId),
+      eq22(
+        knowledgeBaseConversationTombstones.publicConversationId,
+        snapshot.id
+      )
+    )
+  ).limit(1).for("update");
+  if (tombstones[0]) {
+    if (options.skipExisting) return "skipped";
+    throw new TRPCError4({
+      code: "CONFLICT",
+      message: "\u8BE5\u77E5\u8BC6\u5E93\u4F1A\u8BDD\u5DF2\u88AB\u91CD\u7F6E\uFF0C\u4E0D\u80FD\u4ECE\u65E7\u9875\u9762\u91CD\u65B0\u540C\u6B65"
+    });
+  }
+  const persistedConversationId2 = storageId(userId, snapshot.id);
+  const existingRows = await executor.select().from(conversations).where(eq22(conversations.id, persistedConversationId2)).limit(1).for("update");
   const existing = existingRows[0];
   if (existing && existing.userId !== userId) {
     throw new TRPCError4({
@@ -21095,7 +21530,7 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
     const persistedMessages = await loadPersistedMessages(
       executor,
       userId,
-      persistedConversationId
+      persistedConversationId2
     );
     const taskPointers = await resolveTaskPointersForSnapshot(
       executor,
@@ -21150,13 +21585,13 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
   if (existing) {
     await executor.update(conversations).set({ ...conversationValues, version: existing.version + 1 }).where(
       and19(
-        eq22(conversations.id, persistedConversationId),
+        eq22(conversations.id, persistedConversationId2),
         eq22(conversations.userId, userId)
       )
     );
   } else {
     await executor.insert(conversations).values({
-      id: persistedConversationId,
+      id: persistedConversationId2,
       ...conversationValues,
       version: 1
     });
@@ -21171,7 +21606,7 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       userId: messages.userId
     }).from(messages).where(inArray12(messages.id, incomingMessageIds));
     if (collisions.some(
-      (row) => row.userId !== userId || row.conversationId !== persistedConversationId
+      (row) => row.userId !== userId || row.conversationId !== persistedConversationId2
     )) {
       throw new TRPCError4({
         code: "CONFLICT",
@@ -21179,13 +21614,13 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       });
     }
   }
-  await executor.delete(messages).where(eq22(messages.conversationId, persistedConversationId));
+  await executor.delete(messages).where(eq22(messages.conversationId, persistedConversationId2));
   for (let sequence = 0; sequence < snapshot.messages.length; sequence += 1) {
     const message = snapshot.messages[sequence];
     const sentAt = asDate2(message.timestamp) ?? /* @__PURE__ */ new Date();
     await executor.insert(messages).values({
       id: storageId(userId, message.id),
-      conversationId: persistedConversationId,
+      conversationId: persistedConversationId2,
       userId,
       role: message.role,
       content: message.content,
@@ -21200,7 +21635,7 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       await executor.insert(attachments).values({
         id: storageId(userId, attachment.id),
         userId,
-        conversationId: persistedConversationId,
+        conversationId: persistedConversationId2,
         messageId: storageId(userId, message.id),
         apiCredentialId: attachmentCredentialId,
         kind: attachment.type,
@@ -21215,7 +21650,7 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
             apiCredentialId: attachmentCredentialId,
             kind: "file",
             upstreamId: attachment.fileId,
-            conversationId: persistedConversationId
+            conversationId: persistedConversationId2
           },
           options.validatedResourceKeys
         );
@@ -21233,7 +21668,7 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
           apiCredentialId: taskCredentialId,
           kind: "task",
           upstreamId: taskId,
-          conversationId: persistedConversationId
+          conversationId: persistedConversationId2
         },
         options.validatedResourceKeys
       );
@@ -21457,15 +21892,15 @@ var conversationRouter = router({
   }),
   delete: protectedProcedure.input(z10.object({ id: z10.string().min(1).max(128) })).mutation(async ({ ctx, input }) => {
     const db = requireDb13(await getDb());
-    const persistedConversationId = storageId(ctx.user.id, input.id);
-    const existing = await db.select({ userId: conversations.userId }).from(conversations).where(eq22(conversations.id, persistedConversationId)).limit(1);
+    const persistedConversationId2 = storageId(ctx.user.id, input.id);
+    const existing = await db.select({ userId: conversations.userId }).from(conversations).where(eq22(conversations.id, persistedConversationId2)).limit(1);
     if (!existing[0] || existing[0].userId !== ctx.user.id) {
       throw new TRPCError4({ code: "NOT_FOUND", message: "\u4F1A\u8BDD\u4E0D\u5B58\u5728" });
     }
     await permanentlyDeleteConversation(
       db,
       ctx.user.id,
-      persistedConversationId
+      persistedConversationId2
     );
     return { success: true };
   }),
@@ -21651,7 +22086,7 @@ var systemRouter = router({
 
 // server/workspace-router.ts
 import { TRPCError as TRPCError6 } from "@trpc/server";
-import { z as z15 } from "zod";
+import { z as z16 } from "zod";
 
 // shared/response-logic.ts
 import { z as z13 } from "zod";
@@ -21916,6 +22351,1964 @@ async function getHistoricalQuestionResults(input, dependencies = DEFAULT_DEPEND
   });
 }
 
+// shared/delivery-roles.ts
+import { z as z15 } from "zod";
+var deliveryRoleTypeSchema = z15.enum([
+  "knowledge_base_engineer",
+  "monitoring_optimization_engineer",
+  "content_distribution_engineer",
+  "website_operations_engineer"
+]);
+var DELIVERY_ROLE_LABELS = {
+  knowledge_base_engineer: "AI \u77E5\u8BC6\u5E93\u5DE5\u7A0B\u5E08",
+  monitoring_optimization_engineer: "AI \u76D1\u63A7\u4E0E\u4F18\u5316\u5DE5\u7A0B\u5E08",
+  content_distribution_engineer: "AI \u5185\u5BB9\u5206\u53D1\u5DE5\u7A0B\u5E08",
+  website_operations_engineer: "AI \u5B98\u7F51\u8FD0\u8425\u5DE5\u7A0B\u5E08"
+};
+var deliveryWorkflowOperationSchema = z15.enum([
+  "build_exception",
+  "knowledge_maintenance",
+  "knowledge_reset",
+  "question_catalog",
+  "initial_monitoring",
+  "monitoring_import",
+  "monitoring_retest",
+  "stage_report",
+  "response_logic",
+  "content_asset_publish",
+  "channel_distribution",
+  "domain_application",
+  "icp_filing",
+  "company_facts",
+  "product_case_docs",
+  "industry_news",
+  "company_news",
+  "faq_content",
+  "site_check"
+]);
+var OPERATIONS_BY_ROLE = {
+  knowledge_base_engineer: [
+    "build_exception",
+    "knowledge_maintenance",
+    "knowledge_reset"
+  ],
+  monitoring_optimization_engineer: [
+    "question_catalog",
+    "initial_monitoring",
+    "monitoring_import",
+    "monitoring_retest",
+    "stage_report"
+  ],
+  content_distribution_engineer: [
+    "response_logic",
+    "content_asset_publish",
+    "channel_distribution"
+  ],
+  website_operations_engineer: [
+    "domain_application",
+    "icp_filing",
+    "company_facts",
+    "product_case_docs",
+    "industry_news",
+    "company_news",
+    "faq_content",
+    "site_check"
+  ]
+};
+function deliveryRoleOwnsOperation(roleType, operation) {
+  return OPERATIONS_BY_ROLE[roleType].includes(operation);
+}
+var knowledgeResetReasonSchema = z15.enum([
+  "stuck",
+  "upload_error",
+  "build_error",
+  "enterprise_materials",
+  "other"
+]);
+
+// server/knowledge-base-reset-service.ts
+import { randomUUID as randomUUID19 } from "node:crypto";
+import { unlink as unlink2 } from "node:fs/promises";
+import path2 from "node:path";
+import { and as and21, desc as desc18, eq as eq24, inArray as inArray14, lt as lt5, or as or4, sql as sql3 } from "drizzle-orm";
+
+// server/delivery-role-service.ts
+import { randomUUID as randomUUID18 } from "node:crypto";
+import { and as and20, desc as desc17, eq as eq23, inArray as inArray13, isNull as isNull5, sql as sql2 } from "drizzle-orm";
+async function requireDb14() {
+  const db = await getDb();
+  if (!db) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Database is not configured"
+    );
+  }
+  return db;
+}
+function requireDeliveryManager(actor) {
+  if (!hasExplicitAdminRole(actor)) {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "\u9700\u8981\u4EA4\u4ED8\u7BA1\u7406\u6743\u9650");
+  }
+}
+async function assertFixedRole(executor, roleId, expectedType) {
+  const rows = await executor.select().from(deliveryRoles).where(and20(eq23(deliveryRoles.id, roleId), eq23(deliveryRoles.isActive, true))).limit(1);
+  const role = rows[0];
+  if (!role || expectedType && role.roleType !== expectedType) {
+    throw new AuthServiceError("NOT_FOUND", "\u4EA4\u4ED8\u56E2\u961F\u4E0D\u5B58\u5728\u6216\u7C7B\u578B\u4E0D\u5339\u914D");
+  }
+  return role;
+}
+async function assertActiveRoleMembership(input) {
+  const rows = await input.executor.select({ id: deliveryRoleMembers.id }).from(deliveryRoleMembers).innerJoin(users, eq23(users.id, deliveryRoleMembers.memberUserId)).where(
+    and20(
+      eq23(deliveryRoleMembers.roleId, input.roleId),
+      eq23(deliveryRoleMembers.memberUserId, input.memberUserId),
+      eq23(deliveryRoleMembers.isActive, true),
+      eq23(users.role, "delivery_member"),
+      eq23(users.isActive, true)
+    )
+  ).limit(1);
+  if (!rows[0]) {
+    throw new AuthServiceError("CONFLICT", "\u8D1F\u8D23\u4EBA\u5C1A\u672A\u52A0\u5165\u8BE5\u4EA4\u4ED8\u56E2\u961F");
+  }
+}
+async function getActiveDeliveryCustomerOwner(executor, customerUserId, roleType) {
+  const rows = await executor.select({
+    roleId: deliveryCustomerAssignments.roleId,
+    primaryMemberId: deliveryCustomerAssignments.primaryMemberId
+  }).from(deliveryCustomerAssignments).innerJoin(
+    deliveryRoles,
+    eq23(deliveryCustomerAssignments.roleId, deliveryRoles.id)
+  ).innerJoin(
+    deliveryRoleMembers,
+    and20(
+      eq23(deliveryRoleMembers.roleId, deliveryCustomerAssignments.roleId),
+      eq23(
+        deliveryRoleMembers.memberUserId,
+        deliveryCustomerAssignments.primaryMemberId
+      )
+    )
+  ).innerJoin(users, eq23(users.id, deliveryCustomerAssignments.primaryMemberId)).where(
+    and20(
+      eq23(deliveryCustomerAssignments.customerUserId, customerUserId),
+      eq23(deliveryCustomerAssignments.roleType, roleType),
+      eq23(deliveryRoles.roleType, roleType),
+      eq23(deliveryRoles.isActive, true),
+      eq23(deliveryRoleMembers.isActive, true),
+      eq23(users.role, "delivery_member"),
+      eq23(users.isActive, true)
+    )
+  ).limit(1);
+  return rows[0] ?? null;
+}
+async function listDeliveryRoleManagement(actor) {
+  requireDeliveryManager(actor);
+  const db = await requireDb14();
+  const [
+    roles,
+    memberships,
+    assignments,
+    members,
+    customers,
+    tickets,
+    contracts,
+    statisticsTickets
+  ] = await Promise.all([
+    db.select().from(deliveryRoles).orderBy(deliveryRoles.roleType, deliveryRoles.name),
+    db.select().from(deliveryRoleMembers),
+    db.select().from(deliveryCustomerAssignments),
+    db.select({
+      id: users.id,
+      username: users.username,
+      displayName: users.displayName,
+      isActive: users.isActive
+    }).from(users).where(eq23(users.role, "delivery_member")).orderBy(desc17(users.createdAt)),
+    db.select({
+      id: users.id,
+      username: users.username,
+      displayName: users.displayName,
+      isActive: users.isActive
+    }).from(users).where(eq23(users.role, "user")).orderBy(desc17(users.createdAt)),
+    db.select().from(deliveryTickets).where(inArray13(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)).orderBy(desc17(deliveryTickets.updatedAt)),
+    db.select({
+      id: serviceContracts.id,
+      userId: serviceContracts.userId,
+      planCode: serviceContracts.planCode,
+      status: serviceContracts.status,
+      endsAt: serviceContracts.endsAt
+    }).from(serviceContracts).where(
+      inArray13(serviceContracts.status, [
+        "pending_confirmation",
+        "scheduled",
+        "active",
+        "suspended"
+      ])
+    ).orderBy(desc17(serviceContracts.endsAt)),
+    db.select({
+      workflowDomain: deliveryTickets.workflowDomain,
+      status: deliveryTickets.status,
+      assignedMemberId: deliveryTickets.assignedMemberId,
+      updatedAt: deliveryTickets.updatedAt
+    }).from(deliveryTickets)
+  ]);
+  const roleStats = Object.fromEntries(
+    [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer"
+    ].map((roleType) => {
+      const rows = statisticsTickets.filter(
+        (ticket) => ticket.workflowDomain === roleType
+      );
+      const activeRows = rows.filter(
+        (ticket) => ACTIVE_DELIVERY_STATUSES.includes(ticket.status)
+      );
+      const overdueCutoff = Date.now() - 72 * 60 * 60 * 1e3;
+      return [
+        roleType,
+        {
+          pendingAssignment: activeRows.filter(
+            (ticket) => ticket.assignedMemberId == null
+          ).length,
+          processing: activeRows.filter(
+            (ticket) => ticket.assignedMemberId != null && ["submitted", "scheduled", "in_progress"].includes(ticket.status)
+          ).length,
+          waitingUser: activeRows.filter(
+            (ticket) => ticket.status === "needs_information"
+          ).length,
+          overdue: activeRows.filter(
+            (ticket) => ticket.updatedAt.getTime() < overdueCutoff
+          ).length,
+          completed: rows.filter((ticket) => ticket.status === "completed").length
+        }
+      ];
+    })
+  );
+  const ticketEvents = tickets.length ? await db.select({
+    id: deliveryTicketEvents.id,
+    ticketId: deliveryTicketEvents.ticketId,
+    actorUserId: deliveryTicketEvents.actorUserId,
+    actorRole: deliveryTicketEvents.actorRole,
+    kind: deliveryTicketEvents.kind,
+    message: deliveryTicketEvents.message,
+    fromStatus: deliveryTicketEvents.fromStatus,
+    toStatus: deliveryTicketEvents.toStatus,
+    createdAt: deliveryTicketEvents.createdAt
+  }).from(deliveryTicketEvents).where(
+    inArray13(
+      deliveryTicketEvents.ticketId,
+      tickets.map((ticket) => ticket.id)
+    )
+  ).orderBy(desc17(deliveryTicketEvents.createdAt)) : [];
+  return {
+    roles,
+    memberships,
+    assignments,
+    members,
+    customers,
+    tickets,
+    ticketEvents,
+    contracts,
+    roleStats
+  };
+}
+var ACTIVE_DELIVERY_STATUSES = [
+  "submitted",
+  "needs_information",
+  "scheduled",
+  "in_progress"
+];
+async function createDeliveryRole(input) {
+  requireDeliveryManager(input.actor);
+  const db = await requireDb14();
+  const row = {
+    id: randomUUID18(),
+    name: input.name.trim(),
+    roleType: input.roleType,
+    isActive: true,
+    createdByUserId: input.actor.id
+  };
+  try {
+    await db.insert(deliveryRoles).values(row);
+  } catch (error) {
+    if (error.code === "ER_DUP_ENTRY") {
+      throw new AuthServiceError("CONFLICT", "\u8BE5\u89D2\u8272\u7C7B\u578B\u4E0B\u5DF2\u5B58\u5728\u540C\u540D\u56E2\u961F");
+    }
+    throw error;
+  }
+  return row;
+}
+async function createDeliveryMember(input) {
+  requireDeliveryManager(input.actor);
+  return createManagedUser({
+    username: input.username,
+    password: input.password,
+    displayName: input.displayName,
+    role: "delivery_member"
+  });
+}
+async function setDeliveryRoleMember(input) {
+  requireDeliveryManager(input.actor);
+  const db = await requireDb14();
+  await assertFixedRole(db, input.roleId);
+  const memberRows = await db.select({ role: users.role, isActive: users.isActive }).from(users).where(eq23(users.id, input.memberUserId)).limit(1);
+  if (memberRows[0]?.role !== "delivery_member" || !memberRows[0]?.isActive) {
+    throw new AuthServiceError("NOT_FOUND", "\u4EA4\u4ED8\u6210\u5458\u8D26\u53F7\u4E0D\u5B58\u5728\u6216\u5DF2\u505C\u7528");
+  }
+  await db.insert(deliveryRoleMembers).values({
+    id: randomUUID18(),
+    roleId: input.roleId,
+    memberUserId: input.memberUserId,
+    isActive: input.active,
+    assignedByUserId: input.actor.id
+  }).onDuplicateKeyUpdate({
+    set: {
+      isActive: input.active,
+      assignedByUserId: input.actor.id,
+      updatedAt: /* @__PURE__ */ new Date()
+    }
+  });
+  return { success: true };
+}
+async function assignDeliveryCustomer(input) {
+  requireDeliveryManager(input.actor);
+  const db = await requireDb14();
+  const role = await assertFixedRole(db, input.roleId, input.roleType);
+  await assertActiveRoleMembership({
+    executor: db,
+    roleId: input.roleId,
+    memberUserId: input.primaryMemberId
+  });
+  const customerRows = await db.select({ role: users.role, isActive: users.isActive }).from(users).where(eq23(users.id, input.customerUserId)).limit(1);
+  if (customerRows[0]?.role !== "user" || !customerRows[0]?.isActive) {
+    throw new AuthServiceError("NOT_FOUND", "\u5BA2\u6237\u8D26\u53F7\u4E0D\u5B58\u5728\u6216\u5DF2\u505C\u7528");
+  }
+  await db.transaction(async (tx) => {
+    await tx.insert(deliveryCustomerAssignments).values({
+      id: randomUUID18(),
+      customerUserId: input.customerUserId,
+      roleType: input.roleType,
+      roleId: role.id,
+      primaryMemberId: input.primaryMemberId,
+      assignedByUserId: input.actor.id
+    }).onDuplicateKeyUpdate({
+      set: {
+        roleId: role.id,
+        primaryMemberId: input.primaryMemberId,
+        assignedByUserId: input.actor.id,
+        revision: sql2`${deliveryCustomerAssignments.revision} + 1`,
+        updatedAt: /* @__PURE__ */ new Date()
+      }
+    });
+    await tx.update(deliveryTickets).set({
+      assignedRoleId: role.id,
+      assignedMemberId: input.primaryMemberId,
+      updatedByUserId: input.actor.id,
+      updatedAt: /* @__PURE__ */ new Date()
+    }).where(
+      and20(
+        eq23(deliveryTickets.userId, input.customerUserId),
+        eq23(deliveryTickets.workflowDomain, input.roleType),
+        inArray13(deliveryTickets.status, [
+          "submitted",
+          "needs_information",
+          "scheduled",
+          "in_progress"
+        ])
+      )
+    );
+    if (input.roleType === "knowledge_base_engineer") {
+      await tx.update(knowledgeBaseResetRequests).set({
+        assignedRoleId: role.id,
+        assignedMemberId: input.primaryMemberId,
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(
+        and20(
+          eq23(knowledgeBaseResetRequests.userId, input.customerUserId),
+          eq23(knowledgeBaseResetRequests.status, "pending")
+        )
+      );
+    }
+  });
+  if (input.roleType === "monitoring_optimization_engineer") {
+    const snapshotRows = await db.select({ id: knowledgeBaseSnapshots.id }).from(knowledgeBaseSnapshots).where(eq23(knowledgeBaseSnapshots.userId, input.customerUserId)).limit(1);
+    if (snapshotRows[0]) {
+      await createKnowledgeMonitoringHandoff({
+        userId: input.customerUserId,
+        actorUserId: input.actor.id
+      });
+    }
+  }
+  return { success: true };
+}
+async function dispatchDeliveryTicket(input) {
+  requireDeliveryManager(input.actor);
+  const db = await requireDb14();
+  return db.transaction(async (tx) => {
+    const ticketRows = await tx.select().from(deliveryTickets).where(eq23(deliveryTickets.id, input.ticketId)).limit(1).for("update");
+    const ticket = ticketRows[0];
+    if (!ticket || !ACTIVE_DELIVERY_STATUSES.includes(ticket.status)) {
+      throw new AuthServiceError("NOT_FOUND", "\u5F85\u8C03\u5EA6\u5DE5\u5355\u4E0D\u5B58\u5728");
+    }
+    if (!ticket.workflowDomain) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u65E7\u7248\u6280\u672F\u5DE5\u5355\u4EC5\u4F9B\u53EA\u8BFB\u67E5\u770B\uFF0C\u4E0D\u80FD\u91CD\u65B0\u8FDB\u5165\u4EA4\u4ED8\u6D41\u7A0B"
+      );
+    }
+    const role = await assertFixedRole(tx, input.roleId, ticket.workflowDomain);
+    await assertActiveRoleMembership({
+      executor: tx,
+      roleId: role.id,
+      memberUserId: input.memberUserId
+    });
+    await tx.update(deliveryTickets).set({
+      assignedRoleId: role.id,
+      assignedMemberId: input.memberUserId,
+      priority: input.priority,
+      revision: sql2`${deliveryTickets.revision} + 1`,
+      updatedByUserId: input.actor.id,
+      updatedAt: /* @__PURE__ */ new Date()
+    }).where(eq23(deliveryTickets.id, ticket.id));
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID18(),
+      ticketId: ticket.id,
+      userId: ticket.userId,
+      actorUserId: input.actor.id,
+      actorRole: "admin",
+      kind: "message",
+      visibility: "internal",
+      message: `\u5DE5\u5355\u8C03\u5EA6\uFF1A\u56E2\u961F ${role.name}\uFF0C\u8D1F\u8D23\u4EBA #${input.memberUserId}\uFF0C\u4F18\u5148\u7EA7 ${input.priority}\u3002`,
+      createdAt: /* @__PURE__ */ new Date()
+    });
+    if (ticket.operation === "knowledge_reset") {
+      await tx.update(knowledgeBaseResetRequests).set({
+        assignedRoleId: role.id,
+        assignedMemberId: input.memberUserId,
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(
+        and20(
+          eq23(knowledgeBaseResetRequests.ticketId, ticket.id),
+          eq23(knowledgeBaseResetRequests.status, "pending")
+        )
+      );
+    }
+    return { success: true };
+  });
+}
+async function urgeDeliveryTicket(input) {
+  requireDeliveryManager(input.actor);
+  const db = await requireDb14();
+  return db.transaction(async (tx) => {
+    const rows = await tx.select().from(deliveryTickets).where(eq23(deliveryTickets.id, input.ticketId)).limit(1).for("update");
+    const ticket = rows[0];
+    if (!ticket || !ticket.workflowDomain || !ACTIVE_DELIVERY_STATUSES.includes(ticket.status)) {
+      throw new AuthServiceError("NOT_FOUND", "\u53EF\u50AC\u529E\u5DE5\u5355\u4E0D\u5B58\u5728");
+    }
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID18(),
+      ticketId: ticket.id,
+      userId: ticket.userId,
+      actorUserId: input.actor.id,
+      actorRole: "admin",
+      kind: "message",
+      visibility: "internal",
+      message: input.message?.trim() || "\u4EA4\u4ED8\u7BA1\u7406\u5458\u5DF2\u50AC\u529E\uFF0C\u8BF7\u5C3D\u5FEB\u5904\u7406\u3002",
+      createdAt: /* @__PURE__ */ new Date()
+    });
+    return { success: true };
+  });
+}
+async function listMyDeliveryRoles(actor) {
+  if (actor.role !== "delivery_member") {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u8BE5\u5DE5\u4F5C\u53F0\u4EC5\u5BF9\u4EA4\u4ED8\u6210\u5458\u5F00\u653E"
+    );
+  }
+  const db = await requireDb14();
+  const rows = await db.select({
+    assignmentId: deliveryRoleMembers.id,
+    roleId: deliveryRoles.id,
+    teamName: deliveryRoles.name,
+    roleType: deliveryRoles.roleType
+  }).from(deliveryRoleMembers).innerJoin(deliveryRoles, eq23(deliveryRoleMembers.roleId, deliveryRoles.id)).innerJoin(users, eq23(users.id, deliveryRoleMembers.memberUserId)).where(
+    and20(
+      eq23(deliveryRoleMembers.memberUserId, actor.id),
+      eq23(deliveryRoleMembers.isActive, true),
+      eq23(deliveryRoles.isActive, true),
+      eq23(users.role, "delivery_member"),
+      eq23(users.isActive, true)
+    )
+  ).orderBy(deliveryRoles.roleType, deliveryRoles.name);
+  return rows.map((row) => ({
+    ...row,
+    label: DELIVERY_ROLE_LABELS[row.roleType]
+  }));
+}
+async function assertDeliveryRoleContext(input) {
+  if (input.actor.role !== "delivery_member") {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "\u9700\u8981\u4EA4\u4ED8\u6210\u5458\u6743\u9650");
+  }
+  const db = input.executor ?? await requireDb14();
+  const rows = await db.select({
+    assignmentId: deliveryRoleMembers.id,
+    roleId: deliveryRoles.id,
+    roleType: deliveryRoles.roleType,
+    teamName: deliveryRoles.name
+  }).from(deliveryRoleMembers).innerJoin(deliveryRoles, eq23(deliveryRoleMembers.roleId, deliveryRoles.id)).innerJoin(users, eq23(users.id, deliveryRoleMembers.memberUserId)).where(
+    and20(
+      eq23(deliveryRoleMembers.id, input.roleAssignmentId),
+      eq23(deliveryRoleMembers.memberUserId, input.actor.id),
+      eq23(deliveryRoleMembers.isActive, true),
+      eq23(deliveryRoles.isActive, true),
+      eq23(users.role, "delivery_member"),
+      eq23(users.isActive, true)
+    )
+  ).limit(1);
+  const role = rows[0];
+  if (!role || input.expectedRoleType && role.roleType !== input.expectedRoleType) {
+    throw new AuthServiceError("NOT_FOUND", "\u5F53\u524D\u5DE5\u4F5C\u89D2\u8272\u4E0D\u5B58\u5728");
+  }
+  if (input.customerUserId !== void 0 && input.requirePrimaryCustomerAssignment !== false) {
+    const assignmentRows = await db.select({ id: deliveryCustomerAssignments.id }).from(deliveryCustomerAssignments).where(
+      and20(
+        eq23(deliveryCustomerAssignments.customerUserId, input.customerUserId),
+        eq23(deliveryCustomerAssignments.roleType, role.roleType),
+        eq23(deliveryCustomerAssignments.roleId, role.roleId),
+        eq23(deliveryCustomerAssignments.primaryMemberId, input.actor.id)
+      )
+    ).limit(1);
+    if (!assignmentRows[0]) {
+      throw new AuthServiceError("NOT_FOUND", "\u5BA2\u6237\u672A\u5206\u914D\u7ED9\u5F53\u524D\u5DE5\u4F5C\u89D2\u8272");
+    }
+  }
+  return role;
+}
+async function getMyDeliveryWorkbench(input) {
+  const role = await assertDeliveryRoleContext(input);
+  const db = await requireDb14();
+  const assignments = await db.select().from(deliveryCustomerAssignments).where(
+    and20(
+      eq23(deliveryCustomerAssignments.roleId, role.roleId),
+      eq23(deliveryCustomerAssignments.primaryMemberId, input.actor.id),
+      eq23(deliveryCustomerAssignments.roleType, role.roleType)
+    )
+  );
+  const tickets = await db.select().from(deliveryTickets).where(
+    and20(
+      eq23(deliveryTickets.workflowDomain, role.roleType),
+      eq23(deliveryTickets.assignedRoleId, role.roleId),
+      eq23(deliveryTickets.assignedMemberId, input.actor.id)
+    )
+  ).orderBy(desc17(deliveryTickets.updatedAt));
+  const customerIds = Array.from(
+    /* @__PURE__ */ new Set([
+      ...assignments.map((row) => row.customerUserId),
+      ...tickets.map((ticket) => ticket.userId)
+    ])
+  );
+  const [
+    customers,
+    builds,
+    snapshots,
+    questions,
+    batches,
+    profiles,
+    checks,
+    dashboards
+  ] = await Promise.all([
+    customerIds.length ? db.select({
+      id: users.id,
+      username: users.username,
+      displayName: users.displayName
+    }).from(users).where(inArray13(users.id, customerIds)) : [],
+    customerIds.length ? db.select({
+      userId: knowledgeBaseBuilds.userId,
+      status: knowledgeBaseBuilds.status,
+      updatedAt: knowledgeBaseBuilds.updatedAt
+    }).from(knowledgeBaseBuilds).where(inArray13(knowledgeBaseBuilds.userId, customerIds)) : [],
+    customerIds.length ? db.select({
+      userId: knowledgeBaseSnapshots.userId,
+      status: knowledgeBaseSnapshots.status
+    }).from(knowledgeBaseSnapshots).where(inArray13(knowledgeBaseSnapshots.userId, customerIds)) : [],
+    customerIds.length ? db.select({
+      userId: workspaceQuestions.userId,
+      status: workspaceQuestions.status
+    }).from(workspaceQuestions).where(inArray13(workspaceQuestions.userId, customerIds)) : [],
+    customerIds.length ? db.select({
+      userId: monitoringBatches.userId,
+      sampleCount: monitoringBatches.sampleCount,
+      citationCount: monitoringBatches.citationCount
+    }).from(monitoringBatches).where(inArray13(monitoringBatches.userId, customerIds)) : [],
+    customerIds.length ? db.select({
+      userId: workspaceSiteProfiles.userId,
+      domain: workspaceSiteProfiles.domain,
+      domainStatus: workspaceSiteProfiles.domainStatus,
+      icpStatus: workspaceSiteProfiles.icpStatus
+    }).from(workspaceSiteProfiles).where(inArray13(workspaceSiteProfiles.userId, customerIds)) : [],
+    customerIds.length ? db.select({
+      userId: workspaceSiteChecks.userId,
+      status: workspaceSiteChecks.status
+    }).from(workspaceSiteChecks).where(inArray13(workspaceSiteChecks.userId, customerIds)) : [],
+    customerIds.length ? db.select({
+      userId: userDashboardContents.userId,
+      revision: userDashboardContents.revision
+    }).from(userDashboardContents).where(inArray13(userDashboardContents.userId, customerIds)) : []
+  ]);
+  const counts = {
+    submitted: 0,
+    in_progress: 0,
+    needs_information: 0,
+    completed: 0
+  };
+  for (const ticket of tickets) {
+    if (ticket.status in counts) {
+      counts[ticket.status] += 1;
+    }
+  }
+  const customersWithDetails = customers.map((customer) => {
+    let details;
+    if (role.roleType === "knowledge_base_engineer") {
+      const customerBuilds = builds.filter((row) => row.userId === customer.id);
+      const latestBuild = [...customerBuilds].sort(
+        (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime()
+      )[0];
+      details = [
+        `\u6784\u5EFA ${customerBuilds.length}`,
+        `\u5C55\u793A\u7248\u672C ${snapshots.filter((row) => row.userId === customer.id).length}`,
+        `\u6700\u65B0\u72B6\u6001 ${latestBuild?.status ?? "\u672A\u6784\u5EFA"}`
+      ];
+    } else if (role.roleType === "monitoring_optimization_engineer") {
+      const customerBatches = batches.filter(
+        (row) => row.userId === customer.id
+      );
+      details = [
+        `\u5DF2\u9009\u95EE\u9898 ${questions.filter(
+          (row) => row.userId === customer.id && row.status === "selected"
+        ).length}`,
+        `\u76D1\u63A7\u7B54\u6848 ${customerBatches.reduce(
+          (sum, row) => sum + row.sampleCount,
+          0
+        )}`,
+        `\u5F15\u7528 ${customerBatches.reduce(
+          (sum, row) => sum + row.citationCount,
+          0
+        )}`
+      ];
+    } else if (role.roleType === "content_distribution_engineer") {
+      const customerTickets = tickets.filter(
+        (row) => row.userId === customer.id
+      );
+      details = [
+        `\u5185\u5BB9\u5DE5\u5355 ${customerTickets.length}`,
+        `\u5DF2\u5B8C\u6210 ${customerTickets.filter((row) => row.status === "completed").length}`,
+        `\u5F85\u5904\u7406 ${customerTickets.filter(
+          (row) => ACTIVE_DELIVERY_STATUSES.includes(row.status)
+        ).length}`
+      ];
+    } else {
+      const profile = profiles.find((row) => row.userId === customer.id);
+      const customerChecks = checks.filter((row) => row.userId === customer.id);
+      details = [
+        `\u57DF\u540D ${profile?.domain || "\u672A\u914D\u7F6E"}`,
+        `\u5907\u6848 ${profile?.icpStatus || "\u672A\u63D0\u4EA4"}`,
+        `\u68C0\u67E5\u901A\u8FC7 ${customerChecks.filter((row) => row.status === "passed").length}/${customerChecks.length}`
+      ];
+    }
+    return { ...customer, details };
+  });
+  const dashboardRevisionByUser = new Map(
+    dashboards.map((dashboard) => [dashboard.userId, dashboard.revision])
+  );
+  return {
+    role,
+    customers: customersWithDetails,
+    tickets: tickets.map((ticket) => ({
+      ...ticket,
+      dashboardRevision: dashboardRevisionByUser.get(ticket.userId) ?? 0
+    })),
+    counts
+  };
+}
+var MEMBER_TICKET_TRANSITIONS = {
+  submitted: ["in_progress", "needs_information", "rejected", "cancelled"],
+  scheduled: ["in_progress", "cancelled"],
+  in_progress: ["needs_information", "completed", "rejected", "cancelled"],
+  needs_information: ["in_progress", "cancelled"]
+};
+async function createMonitoringRetestTicket(input) {
+  if (!input.sourceTicket.sourceQuestionId) return null;
+  const owner = await getActiveDeliveryCustomerOwner(
+    input.executor,
+    input.sourceTicket.userId,
+    "monitoring_optimization_engineer"
+  );
+  if (!owner) return null;
+  const existingRows = await input.executor.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
+    and20(
+      eq23(deliveryTickets.userId, input.sourceTicket.userId),
+      eq23(deliveryTickets.operation, "monitoring_retest"),
+      eq23(
+        deliveryTickets.sourceQuestionId,
+        input.sourceTicket.sourceQuestionId
+      ),
+      inArray13(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)
+    )
+  ).limit(1);
+  if (existingRows[0]) return existingRows[0].id;
+  const periods = await input.executor.select({
+    id: serviceQuotaPeriods.id,
+    contractId: serviceQuotaPeriods.contractId
+  }).from(serviceQuotaPeriods).where(eq23(serviceQuotaPeriods.userId, input.sourceTicket.userId)).orderBy(desc17(serviceQuotaPeriods.endsAt)).limit(1);
+  const period = periods[0];
+  if (!period) return null;
+  const id = randomUUID18();
+  await input.executor.insert(deliveryTickets).values({
+    id,
+    userId: input.sourceTicket.userId,
+    contractId: period.contractId,
+    quotaPeriodId: period.id,
+    type: "website_operation",
+    quotaPool: null,
+    ordinal: 0,
+    clientRequestId: randomUUID18(),
+    category: "monitoring_retest",
+    title: "\u53D1\u5E03\u6548\u679C\u590D\u6D4B",
+    description: "\u5185\u5BB9\u6216\u5B98\u7F51\u9875\u9762\u5DF2\u53D1\u5E03\uFF0C\u8BF7\u6309\u539F\u95EE\u9898\u5B8C\u6210\u6548\u679C\u590D\u6D4B\u3002",
+    workflowDomain: "monitoring_optimization_engineer",
+    operation: "monitoring_retest",
+    assignedRoleId: owner.roleId,
+    assignedMemberId: owner.primaryMemberId,
+    sourceQuestionId: input.sourceTicket.sourceQuestionId,
+    monitoringBatchKey: input.sourceTicket.monitoringBatchKey,
+    responseLogicRevision: input.sourceTicket.responseLogicRevision,
+    contentAssetIds: input.sourceTicket.contentAssetIds,
+    quotaState: "consumed",
+    status: "submitted",
+    createdByUserId: input.actorUserId,
+    updatedByUserId: input.actorUserId
+  });
+  await input.executor.insert(deliveryTicketEvents).values({
+    id: randomUUID18(),
+    ticketId: id,
+    userId: input.sourceTicket.userId,
+    actorUserId: input.actorUserId,
+    actorRole: "system",
+    kind: "created",
+    visibility: "customer",
+    message: "\u53D1\u5E03\u7ED3\u679C\u5DF2\u767B\u8BB0\uFF0C\u7CFB\u7EDF\u81EA\u52A8\u521B\u5EFA\u5BF9\u5E94\u95EE\u9898\u7684\u6548\u679C\u590D\u6D4B\u5DE5\u5355\u3002",
+    toStatus: "submitted",
+    createdAt: /* @__PURE__ */ new Date()
+  });
+  return id;
+}
+async function createAssignedWorkflowTicket(input) {
+  const owner = await getActiveDeliveryCustomerOwner(
+    input.executor,
+    input.sourceTicket.userId,
+    input.workflowDomain
+  );
+  if (!owner) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      `${DELIVERY_ROLE_LABELS[input.workflowDomain]}\u5C1A\u672A\u914D\u7F6E\u4E3B\u8D1F\u8D23\u4EBA\uFF0C\u4E0D\u80FD\u521B\u5EFA\u4E0B\u6E38\u5DE5\u5355`
+    );
+  }
+  const sourceQuestionId = input.sourceQuestionId?.trim() || input.sourceTicket.sourceQuestionId || null;
+  const existingRows = await input.executor.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
+    and20(
+      eq23(deliveryTickets.userId, input.sourceTicket.userId),
+      eq23(deliveryTickets.operation, input.operation),
+      sourceQuestionId ? eq23(deliveryTickets.sourceQuestionId, sourceQuestionId) : isNull5(deliveryTickets.sourceQuestionId),
+      inArray13(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)
+    )
+  ).limit(1);
+  if (existingRows[0]) return existingRows[0].id;
+  const periodRows = await input.executor.select({
+    id: serviceQuotaPeriods.id,
+    contractId: serviceQuotaPeriods.contractId
+  }).from(serviceQuotaPeriods).where(eq23(serviceQuotaPeriods.userId, input.sourceTicket.userId)).orderBy(desc17(serviceQuotaPeriods.endsAt)).limit(1);
+  const period = periodRows[0];
+  if (!period) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "\u5BA2\u6237\u670D\u52A1\u5468\u671F\u5C1A\u672A\u914D\u7F6E\uFF0C\u4E0D\u80FD\u521B\u5EFA\u4E0B\u6E38\u5DE5\u5355"
+    );
+  }
+  const id = randomUUID18();
+  const now = /* @__PURE__ */ new Date();
+  await input.executor.insert(deliveryTickets).values({
+    id,
+    userId: input.sourceTicket.userId,
+    contractId: period.contractId,
+    quotaPeriodId: period.id,
+    type: input.workflowDomain === "content_distribution_engineer" ? "content_asset" : "website_operation",
+    quotaPool: null,
+    ordinal: 0,
+    clientRequestId: randomUUID18(),
+    category: input.operation,
+    title: input.title,
+    description: input.description,
+    workflowDomain: input.workflowDomain,
+    operation: input.operation,
+    assignedRoleId: owner.roleId,
+    assignedMemberId: owner.primaryMemberId,
+    sourceQuestionId,
+    monitoringBatchKey: input.monitoringBatchKey ?? input.sourceTicket.monitoringBatchKey ?? null,
+    responseLogicRevision: input.responseLogicRevision ?? input.sourceTicket.responseLogicRevision ?? null,
+    contentAssetIds: input.contentAssetIds ?? input.sourceTicket.contentAssetIds ?? [],
+    quotaState: "consumed",
+    status: "submitted",
+    createdByUserId: input.actorUserId,
+    updatedByUserId: input.actorUserId,
+    createdAt: now,
+    updatedAt: now
+  });
+  await input.executor.insert(deliveryTicketEvents).values({
+    id: randomUUID18(),
+    ticketId: id,
+    userId: input.sourceTicket.userId,
+    actorUserId: input.actorUserId,
+    actorRole: "delivery_member",
+    kind: "created",
+    visibility: "customer",
+    message: input.description,
+    toStatus: "submitted",
+    actorContext: {
+      roleAssignmentId: input.actorRoleContext.assignmentId,
+      roleId: input.actorRoleContext.roleId,
+      roleType: input.actorRoleContext.roleType,
+      teamName: input.actorRoleContext.teamName,
+      sourceTicketId: input.sourceTicket.id,
+      assignedRoleId: owner.roleId,
+      assignedMemberId: owner.primaryMemberId
+    },
+    createdAt: now
+  });
+  return id;
+}
+async function updateMyDeliveryTicket(input) {
+  const db = await requireDb14();
+  return db.transaction(async (tx) => {
+    const ticketRows = await tx.select().from(deliveryTickets).where(eq23(deliveryTickets.id, input.ticketId)).limit(1).for("update");
+    const ticket = ticketRows[0];
+    if (!ticket || !ticket.workflowDomain || ticket.assignedMemberId !== input.actor.id) {
+      throw new AuthServiceError("NOT_FOUND", "\u5DE5\u5355\u4E0D\u5C5E\u4E8E\u5F53\u524D\u4EA4\u4ED8\u6210\u5458");
+    }
+    const role = await assertDeliveryRoleContext({
+      actor: input.actor,
+      roleAssignmentId: input.roleAssignmentId,
+      customerUserId: ticket.userId,
+      requirePrimaryCustomerAssignment: false,
+      expectedRoleType: ticket.workflowDomain,
+      executor: tx
+    });
+    if (ticket.assignedRoleId !== role.roleId) {
+      throw new AuthServiceError("NOT_FOUND", "\u5DE5\u5355\u4E0D\u5C5E\u4E8E\u5F53\u524D\u5DE5\u4F5C\u89D2\u8272");
+    }
+    const operation = deliveryWorkflowOperationSchema.safeParse(
+      ticket.operation
+    );
+    if (!operation.success || !deliveryRoleOwnsOperation(role.roleType, operation.data)) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u65E7\u7248\u6280\u672F\u5DE5\u5355\u4EC5\u4F9B\u53EA\u8BFB\u67E5\u770B\uFF0C\u4E0D\u80FD\u6267\u884C\u4EA4\u4ED8\u64CD\u4F5C"
+      );
+    }
+    if (ticket.revision !== input.expectedRevision) {
+      throw new AuthServiceError("CONFLICT", "\u5DE5\u5355\u5DF2\u88AB\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5");
+    }
+    if (ticket.operation === "knowledge_reset") {
+      throw new AuthServiceError("CONFLICT", "\u77E5\u8BC6\u5E93\u91CD\u7F6E\u5FC5\u987B\u4F7F\u7528\u4E13\u7528\u5BA1\u6279\u64CD\u4F5C");
+    }
+    if (!(MEMBER_TICKET_TRANSITIONS[ticket.status] ?? []).includes(input.status)) {
+      throw new AuthServiceError("CONFLICT", "\u5F53\u524D\u5DE5\u5355\u72B6\u6001\u4E0D\u80FD\u6267\u884C\u8BE5\u64CD\u4F5C");
+    }
+    const linkRequired = input.status === "completed" && (ticket.operation === "content_asset_publish" || ticket.operation === "channel_distribution" || [
+      "company_facts",
+      "product_case_docs",
+      "industry_news",
+      "company_news",
+      "faq_content"
+    ].includes(ticket.operation || ""));
+    if (linkRequired && !input.publicUrl) {
+      throw new AuthServiceError("CONFLICT", "\u53D1\u5E03\u5B8C\u6210\u65F6\u5FC5\u987B\u767B\u8BB0\u516C\u5F00\u94FE\u63A5");
+    }
+    const now = /* @__PURE__ */ new Date();
+    const deliveryLinks = input.publicUrl ? [{ label: "\u516C\u5F00\u94FE\u63A5", url: input.publicUrl }] : ticket.deliveryLinks;
+    const monitoringBatchKey = input.handoff?.monitoringBatchKey?.trim() || ticket.monitoringBatchKey || null;
+    const responseLogicRevision = input.handoff?.responseLogicRevision ?? ticket.responseLogicRevision ?? null;
+    const contentAssetIds = Array.from(
+      new Set(
+        (input.handoff?.contentAssetIds ?? ticket.contentAssetIds ?? []).map((id) => id.trim()).filter(Boolean)
+      )
+    );
+    const websiteContentOperations = [
+      "company_facts",
+      "product_case_docs",
+      "industry_news",
+      "company_news",
+      "faq_content"
+    ];
+    if (input.status === "completed" && ticket.workflowDomain === "website_operations_engineer" && websiteContentOperations.includes(ticket.operation || "")) {
+      if (!contentAssetIds.length) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B98\u7F51\u5185\u5BB9\u53D1\u5E03\u524D\u5FC5\u987B\u7ED1\u5B9A\u5DF2\u53D1\u5E03\u7684\u5185\u5BB9\u8D44\u4EA7"
+        );
+      }
+      const publishedRows = await tx.select({ contentAssetIds: deliveryTickets.contentAssetIds }).from(deliveryTickets).where(
+        and20(
+          eq23(deliveryTickets.userId, ticket.userId),
+          eq23(deliveryTickets.workflowDomain, "content_distribution_engineer"),
+          eq23(deliveryTickets.operation, "content_asset_publish"),
+          eq23(deliveryTickets.status, "completed")
+        )
+      );
+      const publishedAssetIds = new Set(
+        publishedRows.flatMap((row) => row.contentAssetIds ?? [])
+      );
+      const unverifiedIds = contentAssetIds.filter(
+        (id) => !publishedAssetIds.has(id)
+      );
+      if (unverifiedIds.length) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          `\u4EE5\u4E0B\u5185\u5BB9\u8D44\u4EA7\u5C1A\u672A\u7531\u5185\u5BB9\u5206\u53D1\u5DE5\u7A0B\u5E08\u53D1\u5E03\uFF1A${unverifiedIds.join("\u3001")}`
+        );
+      }
+    }
+    if (input.status === "completed" && ticket.operation === "knowledge_maintenance") {
+      const replacementRows = await tx.select({ id: knowledgeBaseSnapshots.id }).from(knowledgeBaseSnapshots).where(
+        and20(
+          eq23(knowledgeBaseSnapshots.userId, ticket.userId),
+          eq23(knowledgeBaseSnapshots.status, "active"),
+          eq23(knowledgeBaseSnapshots.maintenanceTicketId, ticket.id)
+        )
+      ).limit(1);
+      if (!replacementRows[0]) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u7EF4\u62A4\u5DE5\u5355\u524D\u5FC5\u987B\u5148\u4E0A\u4F20\u5E76\u53D1\u5E03\u901A\u8FC7\u6821\u9A8C\u7684\u65B0\u77E5\u8BC6\u5E93\u7248\u672C"
+        );
+      }
+    }
+    if (input.status === "completed" && ticket.operation === "domain_application") {
+      const domainInput = input.handoff?.domain?.trim() || "";
+      let domain;
+      try {
+        domain = new URL(
+          /^https?:\/\//i.test(domainInput) ? domainInput : `https://${domainInput}`
+        ).hostname.toLowerCase();
+      } catch {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u57DF\u540D\u7533\u8BF7\u524D\u5FC5\u987B\u586B\u5199\u6709\u6548\u57DF\u540D"
+        );
+      }
+      if (!domain) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u57DF\u540D\u7533\u8BF7\u524D\u5FC5\u987B\u586B\u5199\u6709\u6548\u57DF\u540D"
+        );
+      }
+      const profileRows = await tx.select().from(workspaceSiteProfiles).where(eq23(workspaceSiteProfiles.userId, ticket.userId)).limit(1).for("update");
+      const profile = profileRows[0];
+      if (profile) {
+        await tx.update(workspaceSiteProfiles).set({
+          domain,
+          domainStatus: "completed",
+          domainVerifiedAt: profile.domainVerifiedAt ?? now,
+          revision: profile.revision + 1,
+          updatedByUserId: input.actor.id,
+          updatedAt: now
+        }).where(eq23(workspaceSiteProfiles.userId, ticket.userId));
+      } else {
+        await tx.insert(workspaceSiteProfiles).values({
+          userId: ticket.userId,
+          domain,
+          siteMode: "unknown",
+          domainStatus: "completed",
+          domainVerifiedAt: now,
+          icpStatus: "not_submitted",
+          revision: 1,
+          updatedByUserId: input.actor.id,
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+    }
+    if (input.status === "completed" && ticket.operation === "icp_filing") {
+      const profileRows = await tx.select().from(workspaceSiteProfiles).where(eq23(workspaceSiteProfiles.userId, ticket.userId)).limit(1).for("update");
+      const profile = profileRows[0];
+      if (!profile || profile.domainStatus !== "completed") {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5FC5\u987B\u5148\u5B8C\u6210\u57DF\u540D\u6838\u9A8C\uFF0C\u624D\u80FD\u5B8C\u6210 ICP \u5907\u6848\u5DE5\u5355"
+        );
+      }
+      const notRequired = input.handoff?.icpNotRequired === true;
+      const icpNumber = input.handoff?.icpNumber?.trim() || null;
+      if (!notRequired && !icpNumber) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210 ICP \u5907\u6848\u65F6\u5FC5\u987B\u586B\u5199\u5907\u6848\u53F7\uFF0C\u6216\u660E\u786E\u9009\u62E9\u65E0\u9700\u5907\u6848"
+        );
+      }
+      await tx.update(workspaceSiteProfiles).set({
+        icpProvince: input.handoff?.icpProvince?.trim() || profile.icpProvince || null,
+        icpNumber: notRequired ? null : icpNumber,
+        icpStatus: notRequired ? "not_required" : "approved",
+        icpVerifiedAt: now,
+        revision: profile.revision + 1,
+        updatedByUserId: input.actor.id,
+        updatedAt: now
+      }).where(eq23(workspaceSiteProfiles.userId, ticket.userId));
+    }
+    if (input.status === "completed" && ticket.operation === "site_check") {
+      const check2 = input.handoff?.siteCheck;
+      if (!check2) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u7AD9\u70B9\u68C0\u67E5\u524D\u5FC5\u987B\u767B\u8BB0\u68C0\u67E5\u7ED3\u679C"
+        );
+      }
+      const checkRows = await tx.select().from(workspaceSiteChecks).where(
+        and20(
+          eq23(workspaceSiteChecks.userId, ticket.userId),
+          eq23(workspaceSiteChecks.key, check2.key)
+        )
+      ).limit(1).for("update");
+      const current = checkRows[0];
+      const values = {
+        label: check2.label,
+        status: check2.status,
+        summary: check2.summary?.trim() || null,
+        evidence: check2.evidence?.trim() || null,
+        source: check2.source?.trim() || null,
+        checkedAt: now,
+        revision: (current?.revision ?? 0) + 1,
+        updatedByUserId: input.actor.id,
+        updatedAt: now
+      };
+      if (current) {
+        await tx.update(workspaceSiteChecks).set(values).where(eq23(workspaceSiteChecks.id, current.id));
+      } else {
+        await tx.insert(workspaceSiteChecks).values({
+          id: randomUUID18(),
+          userId: ticket.userId,
+          key: check2.key,
+          ...values,
+          createdAt: now
+        });
+      }
+    }
+    await tx.update(deliveryTickets).set({
+      status: input.status,
+      publicSummary: input.message?.trim() || ticket.publicSummary,
+      deliveryLinks,
+      monitoringBatchKey,
+      responseLogicRevision,
+      contentAssetIds,
+      resolvedAt: ["completed", "rejected", "cancelled"].includes(
+        input.status
+      ) ? now : null,
+      revision: sql2`${deliveryTickets.revision} + 1`,
+      updatedByUserId: input.actor.id,
+      updatedAt: now
+    }).where(eq23(deliveryTickets.id, ticket.id));
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID18(),
+      ticketId: ticket.id,
+      userId: ticket.userId,
+      actorUserId: input.actor.id,
+      actorRole: "delivery_member",
+      kind: "status_change",
+      visibility: "customer",
+      message: input.message?.trim() || null,
+      fromStatus: ticket.status,
+      toStatus: input.status,
+      actorContext: {
+        roleAssignmentId: input.roleAssignmentId,
+        roleId: role.roleId,
+        roleType: role.roleType,
+        teamName: role.teamName
+      },
+      createdAt: now
+    });
+    const sourceTicket = {
+      ...ticket,
+      monitoringBatchKey,
+      responseLogicRevision,
+      contentAssetIds
+    };
+    const actorRoleContext = {
+      assignmentId: input.roleAssignmentId,
+      roleId: role.roleId,
+      roleType: role.roleType,
+      teamName: role.teamName
+    };
+    const handoffTicketIds = [];
+    if (input.status === "completed") {
+      if (ticket.operation === "initial_monitoring" || ticket.operation === "monitoring_import") {
+        const questionIds = Array.from(
+          new Set(
+            (input.handoff?.optimizationQuestionIds ?? []).map((id) => id.trim()).filter(Boolean)
+          )
+        );
+        for (const questionId of questionIds) {
+          handoffTicketIds.push(
+            await createAssignedWorkflowTicket({
+              executor: tx,
+              sourceTicket,
+              actorUserId: input.actor.id,
+              actorRoleContext,
+              workflowDomain: "content_distribution_engineer",
+              operation: "response_logic",
+              title: `\u5236\u4F5C\u95EE\u9898 ${questionId} \u7684\u5E94\u7B54\u903B\u8F91`,
+              description: "\u9996\u6B21\u76D1\u63A7\u5DF2\u786E\u8BA4\u8BE5\u95EE\u9898\u9700\u8981\u4F18\u5316\uFF0C\u8BF7\u57FA\u4E8E\u5DF2\u53D1\u5E03\u76D1\u63A7\u6279\u6B21\u5236\u4F5C\u5E94\u7B54\u903B\u8F91\u3002",
+              sourceQuestionId: questionId,
+              monitoringBatchKey,
+              responseLogicRevision: 1
+            })
+          );
+        }
+      } else if (ticket.operation === "response_logic") {
+        handoffTicketIds.push(
+          await createAssignedWorkflowTicket({
+            executor: tx,
+            sourceTicket,
+            actorUserId: input.actor.id,
+            actorRoleContext,
+            workflowDomain: "content_distribution_engineer",
+            operation: "content_asset_publish",
+            title: "\u5236\u4F5C\u5E76\u53D1\u5E03 AI \u53CB\u597D\u5185\u5BB9\u8D44\u4EA7",
+            description: "\u5E94\u7B54\u903B\u8F91\u5DF2\u7ECF\u786E\u8BA4\uFF0C\u8BF7\u636E\u6B64\u751F\u6210\u3001\u6821\u9A8C\u5E76\u53D1\u5E03\u5185\u5BB9\u8D44\u4EA7\u3002",
+            responseLogicRevision: responseLogicRevision ?? (ticket.responseLogicRevision ?? 0) + 1
+          })
+        );
+      } else if (ticket.operation === "content_asset_publish") {
+        const targets = input.handoff?.publishTargets?.length ? Array.from(new Set(input.handoff.publishTargets)) : ["media"];
+        if (targets.includes("media")) {
+          handoffTicketIds.push(
+            await createAssignedWorkflowTicket({
+              executor: tx,
+              sourceTicket,
+              actorUserId: input.actor.id,
+              actorRoleContext,
+              workflowDomain: "content_distribution_engineer",
+              operation: "channel_distribution",
+              title: "\u767B\u8BB0\u5A92\u4F53\u6E20\u9053\u5206\u53D1\u7ED3\u679C",
+              description: "\u5185\u5BB9\u8D44\u4EA7\u5DF2\u53D1\u5E03\uFF0C\u8BF7\u5B8C\u6210\u5A92\u4F53\u6E20\u9053\u5206\u53D1\u5E76\u767B\u8BB0\u516C\u5F00\u94FE\u63A5\u3002",
+              contentAssetIds
+            })
+          );
+        }
+        if (targets.includes("website")) {
+          if (!contentAssetIds.length) {
+            throw new AuthServiceError(
+              "CONFLICT",
+              "\u521B\u5EFA\u5B98\u7F51\u53D1\u5E03\u5DE5\u5355\u524D\u5FC5\u987B\u7ED1\u5B9A\u5DF2\u786E\u8BA4\u7684\u5185\u5BB9\u8D44\u4EA7 ID"
+            );
+          }
+          if (!input.handoff?.websiteOperation) {
+            throw new AuthServiceError("CONFLICT", "\u8BF7\u9009\u62E9\u5B98\u7F51\u5185\u5BB9\u5DE5\u5355\u7C7B\u578B");
+          }
+          handoffTicketIds.push(
+            await createAssignedWorkflowTicket({
+              executor: tx,
+              sourceTicket,
+              actorUserId: input.actor.id,
+              actorRoleContext,
+              workflowDomain: "website_operations_engineer",
+              operation: input.handoff.websiteOperation,
+              title: "\u5C06\u5DF2\u786E\u8BA4\u5185\u5BB9\u53D1\u5E03\u5230\u5BA2\u6237\u5B98\u7F51",
+              description: "\u5185\u5BB9\u8D44\u4EA7\u5DF2\u7ECF\u786E\u8BA4\uFF0C\u8BF7\u6309\u7ED1\u5B9A\u8D44\u4EA7\u53D1\u5E03\u5B98\u7F51\u9875\u9762\u5E76\u767B\u8BB0\u516C\u5F00\u94FE\u63A5\u3002",
+              contentAssetIds
+            })
+          );
+        }
+      } else if (ticket.operation === "monitoring_retest") {
+        handoffTicketIds.push(
+          await createAssignedWorkflowTicket({
+            executor: tx,
+            sourceTicket,
+            actorUserId: input.actor.id,
+            actorRoleContext,
+            workflowDomain: "monitoring_optimization_engineer",
+            operation: "stage_report",
+            title: "\u53D1\u5E03\u9636\u6BB5\u6548\u679C\u62A5\u544A",
+            description: "\u6548\u679C\u590D\u6D4B\u5DF2\u7ECF\u5B8C\u6210\uFF0C\u8BF7\u6C47\u603B\u4F18\u5316\u524D\u540E\u7ED3\u679C\u5E76\u53D1\u5E03\u9636\u6BB5\u62A5\u544A\u3002"
+          })
+        );
+      } else if (ticket.operation === "stage_report" && input.handoff?.needsFurtherOptimization) {
+        if (!sourceTicket.sourceQuestionId) {
+          throw new AuthServiceError(
+            "CONFLICT",
+            "\u7EE7\u7EED\u4F18\u5316\u524D\u5FC5\u987B\u7ED1\u5B9A\u6765\u6E90\u95EE\u9898 ID"
+          );
+        }
+        handoffTicketIds.push(
+          await createAssignedWorkflowTicket({
+            executor: tx,
+            sourceTicket,
+            actorUserId: input.actor.id,
+            actorRoleContext,
+            workflowDomain: "content_distribution_engineer",
+            operation: "response_logic",
+            title: `\u7EE7\u7EED\u4F18\u5316\u95EE\u9898 ${sourceTicket.sourceQuestionId}`,
+            description: "\u9636\u6BB5\u590D\u6D4B\u4ECD\u672A\u8FBE\u5230\u76EE\u6807\uFF0C\u8BF7\u57FA\u4E8E\u6700\u65B0\u76D1\u63A7\u7ED3\u8BBA\u4FEE\u8BA2\u5E94\u7B54\u903B\u8F91\u548C\u5185\u5BB9\u3002",
+            responseLogicRevision: (responseLogicRevision ?? 0) + 1
+          })
+        );
+      } else if (ticket.workflowDomain === "website_operations_engineer" && websiteContentOperations.includes(ticket.operation || "")) {
+        handoffTicketIds.push(
+          await createAssignedWorkflowTicket({
+            executor: tx,
+            sourceTicket,
+            actorUserId: input.actor.id,
+            actorRoleContext,
+            workflowDomain: "website_operations_engineer",
+            operation: "site_check",
+            title: "\u68C0\u67E5\u5DF2\u53D1\u5E03\u5B98\u7F51\u9875\u9762",
+            description: "\u5B98\u7F51\u5185\u5BB9\u5DF2\u7ECF\u53D1\u5E03\uFF0C\u8BF7\u68C0\u67E5\u76EE\u6807\u9875\u9762\u53EF\u8BBF\u95EE\u6027\u3001\u5185\u5BB9\u5448\u73B0\u4E0E\u57FA\u7840\u7AD9\u70B9\u72B6\u6001\u3002",
+            contentAssetIds
+          })
+        );
+      }
+    }
+    let retestTicketId = null;
+    if (input.status === "completed" && input.publicUrl && ticket.workflowDomain !== "monitoring_optimization_engineer") {
+      retestTicketId = await createMonitoringRetestTicket({
+        executor: tx,
+        sourceTicket,
+        actorUserId: input.actor.id
+      });
+    }
+    return {
+      success: true,
+      revision: ticket.revision + 1,
+      retestTicketId,
+      handoffTicketIds
+    };
+  });
+}
+async function createKnowledgeMonitoringHandoff(input) {
+  const db = await requireDb14();
+  return db.transaction(async (tx) => {
+    const owner = await getActiveDeliveryCustomerOwner(
+      tx,
+      input.userId,
+      "monitoring_optimization_engineer"
+    );
+    if (!owner) return { created: [], assigned: false };
+    const periodRows = await tx.select({
+      id: serviceQuotaPeriods.id,
+      contractId: serviceQuotaPeriods.contractId
+    }).from(serviceQuotaPeriods).where(eq23(serviceQuotaPeriods.userId, input.userId)).orderBy(desc17(serviceQuotaPeriods.endsAt)).limit(1);
+    const period = periodRows[0];
+    if (!period) return { created: [], assigned: false };
+    const operations = ["question_catalog", "initial_monitoring"];
+    const existing = await tx.select({ operation: deliveryTickets.operation }).from(deliveryTickets).where(
+      and20(
+        eq23(deliveryTickets.userId, input.userId),
+        inArray13(deliveryTickets.operation, [...operations])
+      )
+    );
+    const existingOperations = new Set(existing.map((row) => row.operation));
+    const created = [];
+    for (const operation of operations) {
+      if (existingOperations.has(operation)) continue;
+      const id = randomUUID18();
+      created.push(id);
+      await tx.insert(deliveryTickets).values({
+        id,
+        userId: input.userId,
+        contractId: period.contractId,
+        quotaPeriodId: period.id,
+        type: "website_operation",
+        quotaPool: null,
+        ordinal: 0,
+        clientRequestId: randomUUID18(),
+        category: operation,
+        title: operation === "question_catalog" ? "\u914D\u7F6E\u54C1\u724C\u95EE\u9898\u76EE\u5F55" : "\u6267\u884C\u9996\u6B21\u95EE\u9898\u76D1\u63A7",
+        workflowDomain: "monitoring_optimization_engineer",
+        operation,
+        assignedRoleId: owner.roleId,
+        assignedMemberId: owner.primaryMemberId,
+        quotaState: "consumed",
+        status: "submitted",
+        createdByUserId: input.actorUserId,
+        updatedByUserId: input.actorUserId
+      });
+      await tx.insert(deliveryTicketEvents).values({
+        id: randomUUID18(),
+        ticketId: id,
+        userId: input.userId,
+        actorUserId: input.actorUserId,
+        actorRole: "system",
+        kind: "created",
+        visibility: "customer",
+        message: operation === "question_catalog" ? "\u77E5\u8BC6\u5E93\u5DF2\u53D1\u5E03\uFF0C\u95EE\u9898\u76EE\u5F55\u914D\u7F6E\u5DE5\u5355\u5DF2\u89E3\u9501\u3002" : "\u77E5\u8BC6\u5E93\u5DF2\u53D1\u5E03\uFF0C\u9996\u6B21\u95EE\u9898\u76D1\u63A7\u5DE5\u5355\u5DF2\u89E3\u9501\u3002",
+        toStatus: "submitted",
+        createdAt: /* @__PURE__ */ new Date()
+      });
+    }
+    return { created, assigned: true };
+  });
+}
+async function setDeliveryMemberCredential(input) {
+  requireDeliveryManager(input.actor);
+  const db = await requireDb14();
+  const rows = await db.select({ role: users.role }).from(users).where(eq23(users.id, input.memberUserId)).limit(1);
+  if (rows[0]?.role !== "delivery_member") {
+    throw new AuthServiceError("NOT_FOUND", "\u4EA4\u4ED8\u6210\u5458\u4E0D\u5B58\u5728");
+  }
+  return replaceApiCredential(input.memberUserId, input.apiKey);
+}
+async function revokeDeliveryMemberCredential(input) {
+  requireDeliveryManager(input.actor);
+  const db = await requireDb14();
+  const rows = await db.select({ role: users.role }).from(users).where(eq23(users.id, input.memberUserId)).limit(1);
+  if (rows[0]?.role !== "delivery_member") {
+    throw new AuthServiceError("NOT_FOUND", "\u4EA4\u4ED8\u6210\u5458\u4E0D\u5B58\u5728");
+  }
+  await deleteActiveApiCredential(input.memberUserId);
+  return { success: true };
+}
+async function getMyDeliveryCredentialStatus(actor) {
+  if (actor.role !== "delivery_member") {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "\u9700\u8981\u4EA4\u4ED8\u6210\u5458\u6743\u9650");
+  }
+  return getApiCredentialStatus(actor.id);
+}
+
+// server/knowledge-base-reset-service.ts
+var dashboardAssetRoot = path2.resolve(
+  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path2.join(process.cwd(), ".frontmind-dashboard-assets")
+);
+async function requireDb15() {
+  const db = await getDb();
+  if (!db) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Database is not configured"
+    );
+  }
+  return db;
+}
+function persistedConversationId(userId, publicId2) {
+  return `u${userId}:${publicId2}`;
+}
+async function getKnowledgeCounts(executor, userId) {
+  const [builds, snapshots, receipts] = await Promise.all([
+    executor.select({
+      id: knowledgeBaseBuilds.id,
+      conversationId: knowledgeBaseBuilds.conversationId,
+      upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId
+    }).from(knowledgeBaseBuilds).where(eq24(knowledgeBaseBuilds.userId, userId)),
+    executor.select({
+      id: knowledgeBaseSnapshots.id,
+      sourceConversationId: knowledgeBaseSnapshots.sourceConversationId,
+      assets: knowledgeBaseSnapshots.assets
+    }).from(knowledgeBaseSnapshots).where(eq24(knowledgeBaseSnapshots.userId, userId)),
+    executor.select({
+      id: knowledgeImportReceipts.id,
+      taskId: knowledgeImportReceipts.taskId,
+      fileId: knowledgeImportReceipts.fileId
+    }).from(knowledgeImportReceipts).where(eq24(knowledgeImportReceipts.userId, userId))
+  ]);
+  return {
+    builds,
+    snapshots,
+    receipts,
+    hasKnowledge: builds.length > 0 || snapshots.length > 0 || receipts.length > 0
+  };
+}
+async function getKnowledgeOwner(executor, userId) {
+  const rows = await executor.select({
+    assignmentId: deliveryCustomerAssignments.id,
+    roleId: deliveryCustomerAssignments.roleId,
+    memberId: deliveryCustomerAssignments.primaryMemberId,
+    memberName: users.displayName,
+    memberUsername: users.username
+  }).from(deliveryCustomerAssignments).innerJoin(
+    deliveryRoles,
+    eq24(deliveryCustomerAssignments.roleId, deliveryRoles.id)
+  ).innerJoin(
+    deliveryRoleMembers,
+    and21(
+      eq24(deliveryRoleMembers.roleId, deliveryCustomerAssignments.roleId),
+      eq24(
+        deliveryRoleMembers.memberUserId,
+        deliveryCustomerAssignments.primaryMemberId
+      )
+    )
+  ).innerJoin(users, eq24(users.id, deliveryCustomerAssignments.primaryMemberId)).where(
+    and21(
+      eq24(deliveryCustomerAssignments.customerUserId, userId),
+      eq24(deliveryCustomerAssignments.roleType, "knowledge_base_engineer"),
+      eq24(deliveryRoles.roleType, "knowledge_base_engineer"),
+      eq24(deliveryRoles.isActive, true),
+      eq24(deliveryRoleMembers.isActive, true),
+      eq24(users.role, "delivery_member"),
+      eq24(users.isActive, true)
+    )
+  ).limit(1);
+  return rows[0] ?? null;
+}
+async function getKnowledgeResetStatus(userId) {
+  const db = await requireDb15();
+  const [counts, owner, resetRows, stateRows] = await Promise.all([
+    getKnowledgeCounts(db, userId),
+    getKnowledgeOwner(db, userId),
+    db.select({
+      id: knowledgeBaseResetRequests.id,
+      ticketId: knowledgeBaseResetRequests.ticketId,
+      status: knowledgeBaseResetRequests.status,
+      reasonCode: knowledgeBaseResetRequests.reasonCode,
+      reasonNote: knowledgeBaseResetRequests.reasonNote,
+      createdAt: knowledgeBaseResetRequests.createdAt,
+      assignedMemberId: knowledgeBaseResetRequests.assignedMemberId
+    }).from(knowledgeBaseResetRequests).where(
+      and21(
+        eq24(knowledgeBaseResetRequests.userId, userId),
+        eq24(knowledgeBaseResetRequests.status, "pending")
+      )
+    ).orderBy(desc18(knowledgeBaseResetRequests.createdAt)).limit(1),
+    db.select({ revision: knowledgeBaseResetStates.revision }).from(knowledgeBaseResetStates).where(eq24(knowledgeBaseResetStates.userId, userId)).limit(1)
+  ]);
+  const pending = resetRows[0] ?? null;
+  let pendingEngineerName = owner?.memberName || owner?.memberUsername || null;
+  if (pending && pending.assignedMemberId !== owner?.memberId) {
+    const assignedRows = await db.select({
+      displayName: users.displayName,
+      username: users.username
+    }).from(users).where(eq24(users.id, pending.assignedMemberId)).limit(1);
+    pendingEngineerName = assignedRows[0]?.displayName || assignedRows[0]?.username || null;
+  }
+  return {
+    revision: stateRows[0]?.revision ?? 0,
+    hasKnowledge: counts.hasKnowledge,
+    locked: Boolean(pending),
+    canRequest: counts.hasKnowledge && Boolean(owner) && !pending,
+    unavailableReason: !owner ? "\u5C1A\u672A\u5206\u914D AI \u77E5\u8BC6\u5E93\u5DE5\u7A0B\u5E08\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458" : pending ? "\u5DF2\u6709\u4E00\u5F20\u77E5\u8BC6\u5E93\u91CD\u7F6E\u5DE5\u5355\u6B63\u5728\u5904\u7406" : !counts.hasKnowledge ? "\u5F53\u524D\u6CA1\u6709\u53EF\u91CD\u7F6E\u7684\u77E5\u8BC6\u5E93\u8BB0\u5F55" : null,
+    engineer: owner ? {
+      id: owner.memberId,
+      name: owner.memberName || owner.memberUsername || `\u6210\u5458 ${owner.memberId}`
+    } : null,
+    pending: pending ? {
+      ...pending,
+      createdAt: pending.createdAt.getTime(),
+      engineerName: pendingEngineerName || `\u6210\u5458 ${pending.assignedMemberId}`
+    } : null
+  };
+}
+async function assertKnowledgeBaseWritable(userId) {
+  const db = await requireDb15();
+  const rows = await db.select({ id: knowledgeBaseResetRequests.id }).from(knowledgeBaseResetRequests).where(
+    and21(
+      eq24(knowledgeBaseResetRequests.userId, userId),
+      eq24(knowledgeBaseResetRequests.status, "pending")
+    )
+  ).limit(1);
+  if (rows[0]) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "\u77E5\u8BC6\u5E93\u91CD\u7F6E\u5DE5\u5355\u6B63\u5728\u5BA1\u6279\uFF0C\u5F53\u524D\u77E5\u8BC6\u5E93\u5DF2\u53EA\u8BFB\u9501\u5B9A"
+    );
+  }
+}
+async function submitKnowledgeReset(input) {
+  if (input.actor.role !== "user") {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "\u53EA\u6709\u5BA2\u6237\u53EF\u4EE5\u7533\u8BF7\u91CD\u7F6E");
+  }
+  if (input.reasonCode === "other" && !input.reasonNote?.trim()) {
+    throw new AuthServiceError("CONFLICT", "\u9009\u62E9\u201C\u5176\u4ED6\u201D\u65F6\u5FC5\u987B\u586B\u5199\u8865\u5145\u8BF4\u660E");
+  }
+  const db = await requireDb15();
+  try {
+    return await db.transaction(async (tx) => {
+      const [counts, owner, existing, periodRows] = await Promise.all([
+        getKnowledgeCounts(tx, input.actor.id),
+        getKnowledgeOwner(tx, input.actor.id),
+        tx.select({ id: knowledgeBaseResetRequests.id }).from(knowledgeBaseResetRequests).where(
+          and21(
+            eq24(knowledgeBaseResetRequests.userId, input.actor.id),
+            eq24(knowledgeBaseResetRequests.status, "pending")
+          )
+        ).limit(1).for("update"),
+        tx.select({
+          id: serviceQuotaPeriods.id,
+          contractId: serviceQuotaPeriods.contractId
+        }).from(serviceQuotaPeriods).where(eq24(serviceQuotaPeriods.userId, input.actor.id)).orderBy(desc18(serviceQuotaPeriods.endsAt)).limit(1)
+      ]);
+      if (!counts.hasKnowledge) {
+        throw new AuthServiceError("CONFLICT", "\u5F53\u524D\u6CA1\u6709\u53EF\u91CD\u7F6E\u7684\u77E5\u8BC6\u5E93\u8BB0\u5F55");
+      }
+      if (!owner) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5C1A\u672A\u5206\u914D AI \u77E5\u8BC6\u5E93\u5DE5\u7A0B\u5E08\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458"
+        );
+      }
+      if (existing[0]) {
+        throw new AuthServiceError("CONFLICT", "\u5DF2\u6709\u4E00\u5F20\u91CD\u7F6E\u5DE5\u5355\u6B63\u5728\u5904\u7406");
+      }
+      const period = periodRows[0];
+      if (!period) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5BA2\u6237\u670D\u52A1\u5468\u671F\u5C1A\u672A\u914D\u7F6E\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458"
+        );
+      }
+      const requestId = randomUUID19();
+      const ticketId = randomUUID19();
+      const now = /* @__PURE__ */ new Date();
+      await tx.insert(deliveryTickets).values({
+        id: ticketId,
+        userId: input.actor.id,
+        contractId: period.contractId,
+        quotaPeriodId: period.id,
+        type: "knowledge_base",
+        quotaPool: null,
+        ordinal: 0,
+        clientRequestId: requestId,
+        category: "knowledge_reset",
+        title: "\u77E5\u8BC6\u5E93\u91CD\u7F6E\u7533\u8BF7",
+        description: input.reasonNote?.trim() || null,
+        workflowDomain: "knowledge_base_engineer",
+        operation: "knowledge_reset",
+        assignedRoleId: owner.roleId,
+        assignedMemberId: owner.memberId,
+        quotaState: "consumed",
+        status: "submitted",
+        createdByUserId: input.actor.id,
+        updatedByUserId: input.actor.id,
+        createdAt: now,
+        updatedAt: now
+      });
+      await tx.insert(knowledgeBaseResetRequests).values({
+        id: requestId,
+        ticketId,
+        userId: input.actor.id,
+        assignedRoleId: owner.roleId,
+        assignedMemberId: owner.memberId,
+        activeKey: `user:${input.actor.id}`,
+        reasonCode: input.reasonCode,
+        reasonNote: input.reasonNote?.trim() || null,
+        status: "pending",
+        createdAt: now,
+        updatedAt: now
+      });
+      await tx.insert(deliveryTicketEvents).values({
+        id: randomUUID19(),
+        ticketId,
+        userId: input.actor.id,
+        actorUserId: input.actor.id,
+        actorRole: "user",
+        kind: "created",
+        visibility: "customer",
+        message: "\u5BA2\u6237\u63D0\u4EA4\u77E5\u8BC6\u5E93\u91CD\u7F6E\u7533\u8BF7\uFF0C\u77E5\u8BC6\u5E93\u5DF2\u8FDB\u5165\u53EA\u8BFB\u9501\u5B9A\u3002",
+        toStatus: "submitted",
+        createdAt: now
+      });
+      return { id: requestId, ticketId };
+    });
+  } catch (error) {
+    if (error.code === "ER_DUP_ENTRY") {
+      throw new AuthServiceError("CONFLICT", "\u5DF2\u6709\u4E00\u5F20\u91CD\u7F6E\u5DE5\u5355\u6B63\u5728\u5904\u7406");
+    }
+    throw error;
+  }
+}
+async function requirePendingRequestForMember(input) {
+  const rows = await input.executor.select({
+    request: knowledgeBaseResetRequests,
+    ticketRevision: deliveryTickets.revision
+  }).from(knowledgeBaseResetRequests).innerJoin(
+    deliveryTickets,
+    eq24(knowledgeBaseResetRequests.ticketId, deliveryTickets.id)
+  ).where(eq24(knowledgeBaseResetRequests.id, input.requestId)).limit(1).for("update");
+  const row = rows[0];
+  if (!row || row.request.status !== "pending" || row.request.assignedMemberId !== input.actor.id) {
+    throw new AuthServiceError("NOT_FOUND", "\u5F85\u5BA1\u6279\u91CD\u7F6E\u5DE5\u5355\u4E0D\u5B58\u5728");
+  }
+  const role = await assertDeliveryRoleContext({
+    actor: input.actor,
+    roleAssignmentId: input.roleAssignmentId,
+    customerUserId: row.request.userId,
+    requirePrimaryCustomerAssignment: false,
+    expectedRoleType: "knowledge_base_engineer",
+    executor: input.executor
+  });
+  if (role.roleId !== row.request.assignedRoleId) {
+    throw new AuthServiceError("NOT_FOUND", "\u5DE5\u5355\u4E0D\u5C5E\u4E8E\u5F53\u524D\u5DE5\u4F5C\u89D2\u8272");
+  }
+  return { ...row, role };
+}
+async function previewKnowledgeReset(input) {
+  const db = await requireDb15();
+  const row = await requirePendingRequestForMember({
+    ...input,
+    executor: db
+  });
+  const counts = await getKnowledgeCounts(db, row.request.userId);
+  const publicConversationIds = Array.from(
+    new Set(
+      [
+        ...counts.builds.map((build) => build.conversationId),
+        ...counts.snapshots.map((snapshot) => snapshot.sourceConversationId)
+      ].filter((id) => Boolean(id))
+    )
+  );
+  const storedIds = publicConversationIds.map(
+    (id) => persistedConversationId(row.request.userId, id)
+  );
+  const [conversationRows, attachmentRows2] = await Promise.all([
+    storedIds.length ? db.select({ id: conversations.id }).from(conversations).where(
+      and21(
+        eq24(conversations.userId, row.request.userId),
+        inArray14(conversations.id, storedIds)
+      )
+    ) : [],
+    storedIds.length ? db.select({ id: attachments.id }).from(attachments).where(
+      and21(
+        eq24(attachments.userId, row.request.userId),
+        inArray14(attachments.conversationId, storedIds)
+      )
+    ) : []
+  ]);
+  return {
+    request: {
+      id: row.request.id,
+      ticketId: row.request.ticketId,
+      userId: row.request.userId,
+      reasonCode: row.request.reasonCode,
+      reasonNote: row.request.reasonNote,
+      createdAt: row.request.createdAt.getTime()
+    },
+    expectedRevision: row.ticketRevision,
+    cleanup: {
+      builds: counts.builds.length,
+      snapshots: counts.snapshots.length,
+      conversations: conversationRows.length,
+      attachments: attachmentRows2.length,
+      importReceipts: counts.receipts.length
+    }
+  };
+}
+async function decideKnowledgeReset(input) {
+  if (input.decision === "reject" && !input.decisionNote?.trim()) {
+    throw new AuthServiceError("CONFLICT", "\u9A73\u56DE\u65F6\u5FC5\u987B\u586B\u5199\u539F\u56E0");
+  }
+  const db = await requireDb15();
+  const result = await db.transaction(async (tx) => {
+    const row = await requirePendingRequestForMember({
+      ...input,
+      executor: tx
+    });
+    if (row.ticketRevision !== input.expectedRevision) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u5DE5\u5355\u5DF2\u88AB\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u6E05\u7406\u9884\u89C8\u540E\u91CD\u8BD5"
+      );
+    }
+    const now = /* @__PURE__ */ new Date();
+    if (input.decision === "reject") {
+      await tx.update(knowledgeBaseResetRequests).set({
+        status: "rejected",
+        activeKey: null,
+        decisionNote: input.decisionNote.trim(),
+        decidedByUserId: input.actor.id,
+        decidedAt: now,
+        updatedAt: now
+      }).where(eq24(knowledgeBaseResetRequests.id, row.request.id));
+      await tx.update(deliveryTickets).set({
+        status: "rejected",
+        publicSummary: input.decisionNote.trim(),
+        resolvedAt: now,
+        revision: sql3`${deliveryTickets.revision} + 1`,
+        updatedByUserId: input.actor.id,
+        updatedAt: now
+      }).where(eq24(deliveryTickets.id, row.request.ticketId));
+      await tx.insert(deliveryTicketEvents).values({
+        id: randomUUID19(),
+        ticketId: row.request.ticketId,
+        userId: row.request.userId,
+        actorUserId: input.actor.id,
+        actorRole: "delivery_member",
+        kind: "status_change",
+        visibility: "customer",
+        message: input.decisionNote.trim(),
+        fromStatus: "submitted",
+        toStatus: "rejected",
+        actorContext: {
+          roleAssignmentId: input.roleAssignmentId,
+          roleId: row.role.roleId,
+          roleType: row.role.roleType,
+          teamName: row.role.teamName
+        },
+        createdAt: now
+      });
+      return { decision: "rejected", cleanup: null };
+    }
+    const counts = await getKnowledgeCounts(tx, row.request.userId);
+    const publicConversationIds = Array.from(
+      new Set(
+        [
+          ...counts.builds.map((build) => build.conversationId),
+          ...counts.snapshots.map((snapshot) => snapshot.sourceConversationId)
+        ].filter((id) => Boolean(id))
+      )
+    );
+    const storedIds = publicConversationIds.map(
+      (id) => persistedConversationId(row.request.userId, id)
+    );
+    const buildTaskIds = counts.builds.map((build) => build.upstreamTaskId).filter((id) => Boolean(id));
+    const receiptTaskIds = counts.receipts.map((receipt) => receipt.taskId).filter((id) => Boolean(id));
+    const receiptFileIds = counts.receipts.map((receipt) => receipt.fileId).filter((id) => Boolean(id));
+    const receiptResourceIds = [...receiptTaskIds, ...receiptFileIds];
+    const localAssetKeys = Array.from(
+      new Set(
+        counts.snapshots.flatMap(
+          (snapshot) => snapshot.assets.map((asset) => asset.key).filter(Boolean)
+        )
+      )
+    );
+    const [conversationRows, attachmentRows2, resourceRows] = await Promise.all([
+      storedIds.length ? tx.select({ id: conversations.id }).from(conversations).where(
+        and21(
+          eq24(conversations.userId, row.request.userId),
+          inArray14(conversations.id, storedIds)
+        )
+      ) : [],
+      storedIds.length ? tx.select({ id: attachments.id }).from(attachments).where(
+        and21(
+          eq24(attachments.userId, row.request.userId),
+          inArray14(attachments.conversationId, storedIds)
+        )
+      ) : [],
+      tx.select({
+        kind: upstreamResources.kind,
+        upstreamId: upstreamResources.upstreamId,
+        apiCredentialId: upstreamResources.apiCredentialId
+      }).from(upstreamResources).where(
+        and21(
+          eq24(upstreamResources.userId, row.request.userId),
+          or4(
+            storedIds.length ? inArray14(upstreamResources.conversationId, storedIds) : sql3`false`,
+            buildTaskIds.length ? inArray14(upstreamResources.upstreamId, buildTaskIds) : sql3`false`,
+            receiptResourceIds.length ? inArray14(upstreamResources.upstreamId, receiptResourceIds) : sql3`false`
+          )
+        )
+      )
+    ]);
+    const cleanup = {
+      builds: counts.builds.length,
+      snapshots: counts.snapshots.length,
+      conversations: conversationRows.length,
+      attachments: attachmentRows2.length,
+      importReceipts: counts.receipts.length
+    };
+    if (publicConversationIds.length) {
+      await tx.insert(knowledgeBaseConversationTombstones).values(
+        publicConversationIds.map((publicId2) => ({
+          id: randomUUID19(),
+          userId: row.request.userId,
+          publicConversationId: publicId2,
+          resetRequestId: row.request.id,
+          createdAt: now
+        }))
+      ).onDuplicateKeyUpdate({ set: { resetRequestId: row.request.id } });
+    }
+    const cleanupResources = /* @__PURE__ */ new Map();
+    for (const resource of resourceRows) {
+      cleanupResources.set(`${resource.kind}:${resource.upstreamId}`, resource);
+    }
+    for (const upstreamId of receiptTaskIds) {
+      const key = `task:${upstreamId}`;
+      if (!cleanupResources.has(key)) {
+        cleanupResources.set(key, {
+          kind: "task",
+          upstreamId,
+          apiCredentialId: null
+        });
+      }
+    }
+    for (const upstreamId of receiptFileIds) {
+      const key = `file:${upstreamId}`;
+      if (!cleanupResources.has(key)) {
+        cleanupResources.set(key, {
+          kind: "file",
+          upstreamId,
+          apiCredentialId: null
+        });
+      }
+    }
+    for (const assetKey of localAssetKeys) {
+      cleanupResources.set(`local_asset:${assetKey}`, {
+        kind: "local_asset",
+        upstreamId: assetKey,
+        apiCredentialId: null
+      });
+    }
+    if (cleanupResources.size) {
+      await tx.insert(knowledgeBaseResetCleanupJobs).values(
+        [...cleanupResources.values()].map((resource) => ({
+          id: randomUUID19(),
+          resetRequestId: row.request.id,
+          userId: row.request.userId,
+          apiCredentialId: resource.apiCredentialId,
+          kind: resource.kind,
+          upstreamId: resource.upstreamId,
+          status: "pending",
+          createdAt: now,
+          updatedAt: now
+        }))
+      ).onDuplicateKeyUpdate({ set: { updatedAt: now } });
+    }
+    await tx.update(knowledgeBaseBuilds).set({ publishedSnapshotId: null }).where(eq24(knowledgeBaseBuilds.userId, row.request.userId));
+    await tx.delete(knowledgeImportReceipts).where(eq24(knowledgeImportReceipts.userId, row.request.userId));
+    await tx.delete(knowledgeBaseSnapshots).where(eq24(knowledgeBaseSnapshots.userId, row.request.userId));
+    await tx.delete(knowledgeBaseBuilds).where(eq24(knowledgeBaseBuilds.userId, row.request.userId));
+    if (storedIds.length) {
+      await tx.delete(conversations).where(
+        and21(
+          eq24(conversations.userId, row.request.userId),
+          inArray14(conversations.id, storedIds)
+        )
+      );
+    }
+    await tx.insert(knowledgeBaseResetStates).values({
+      userId: row.request.userId,
+      revision: 1,
+      updatedAt: now
+    }).onDuplicateKeyUpdate({
+      set: {
+        revision: sql3`${knowledgeBaseResetStates.revision} + 1`,
+        updatedAt: now
+      }
+    });
+    await tx.update(knowledgeBaseResetRequests).set({
+      status: "approved",
+      activeKey: null,
+      decisionNote: input.decisionNote?.trim() || null,
+      decidedByUserId: input.actor.id,
+      cleanupSummary: cleanup,
+      decidedAt: now,
+      updatedAt: now
+    }).where(eq24(knowledgeBaseResetRequests.id, row.request.id));
+    await tx.update(deliveryTickets).set({
+      status: "completed",
+      publicSummary: "\u77E5\u8BC6\u5E93\u5DF2\u6E05\u7A7A\uFF0C\u53EF\u4EE5\u91CD\u65B0\u5F00\u59CB\u9996\u6B21\u6784\u5EFA\u3002",
+      resolvedAt: now,
+      revision: sql3`${deliveryTickets.revision} + 1`,
+      updatedByUserId: input.actor.id,
+      updatedAt: now
+    }).where(eq24(deliveryTickets.id, row.request.ticketId));
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID19(),
+      ticketId: row.request.ticketId,
+      userId: row.request.userId,
+      actorUserId: input.actor.id,
+      actorRole: "delivery_member",
+      kind: "status_change",
+      visibility: "customer",
+      message: "\u77E5\u8BC6\u5E93\u91CD\u7F6E\u5DF2\u6279\u51C6\u5E76\u5B8C\u6210\u6E05\u7406\uFF0C\u53EF\u4EE5\u91CD\u65B0\u5F00\u59CB\u9996\u6B21\u6784\u5EFA\u3002",
+      fromStatus: "submitted",
+      toStatus: "completed",
+      actorContext: {
+        roleAssignmentId: input.roleAssignmentId,
+        roleId: row.role.roleId,
+        roleType: row.role.roleType,
+        teamName: row.role.teamName
+      },
+      createdAt: now
+    });
+    return { decision: "approved", cleanup };
+  });
+  if (result.decision === "approved") {
+    void processKnowledgeResetCleanupJobs();
+  }
+  return result;
+}
+async function processKnowledgeResetCleanupJobs() {
+  const db = await requireDb15();
+  const jobs = await db.select().from(knowledgeBaseResetCleanupJobs).where(
+    and21(
+      inArray14(knowledgeBaseResetCleanupJobs.status, ["pending", "failed"]),
+      lt5(knowledgeBaseResetCleanupJobs.attemptCount, 5)
+    )
+  ).orderBy(knowledgeBaseResetCleanupJobs.createdAt).limit(50);
+  for (const job of jobs) {
+    try {
+      if (job.kind === "local_asset") {
+        const assetPath = path2.resolve(dashboardAssetRoot, job.upstreamId);
+        if (!assetPath.startsWith(`${dashboardAssetRoot}${path2.sep}`)) {
+          throw new Error("\u77E5\u8BC6\u5E93\u672C\u5730\u8D44\u6E90\u8DEF\u5F84\u65E0\u6548");
+        }
+        try {
+          await unlink2(assetPath);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      } else {
+        const credential = await getCredentialForUpstreamResource(
+          job.userId,
+          job.kind,
+          job.upstreamId
+        );
+        if (!credential) throw new Error("\u4E0A\u6E38\u8D44\u6E90\u51ED\u636E\u5DF2\u4E0D\u53EF\u7528");
+        const collection = job.kind === "task" ? "tasks" : "files";
+        const response2 = await fetch(
+          `${getUpstreamBaseUrl()}/v1/${collection}/${encodeURIComponent(job.upstreamId)}`,
+          {
+            method: "DELETE",
+            redirect: "error",
+            headers: {
+              API_KEY: credential.apiKey,
+              Authorization: `Bearer ${credential.apiKey}`
+            },
+            signal: AbortSignal.timeout(3e4)
+          }
+        );
+        if (!response2.ok && response2.status !== 404) {
+          throw new Error(`\u4E0A\u6E38\u5220\u9664\u5931\u8D25\uFF08HTTP ${response2.status}\uFF09`);
+        }
+      }
+      await db.transaction(async (tx) => {
+        await tx.update(knowledgeBaseResetCleanupJobs).set({
+          status: "completed",
+          attemptCount: sql3`${knowledgeBaseResetCleanupJobs.attemptCount} + 1`,
+          lastError: null,
+          completedAt: /* @__PURE__ */ new Date(),
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq24(knowledgeBaseResetCleanupJobs.id, job.id));
+        if (job.kind !== "local_asset") {
+          await tx.delete(upstreamResources).where(
+            and21(
+              eq24(upstreamResources.userId, job.userId),
+              eq24(upstreamResources.kind, job.kind),
+              eq24(upstreamResources.upstreamId, job.upstreamId)
+            )
+          );
+        }
+      });
+    } catch (error) {
+      await db.update(knowledgeBaseResetCleanupJobs).set({
+        status: "failed",
+        attemptCount: sql3`${knowledgeBaseResetCleanupJobs.attemptCount} + 1`,
+        lastError: error instanceof Error ? error.message.slice(0, 2e3) : "\u5220\u9664\u5931\u8D25",
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(eq24(knowledgeBaseResetCleanupJobs.id, job.id));
+    }
+  }
+  return { processed: jobs.length };
+}
+
 // server/workspace-router.ts
 function projectUserDashboardPayload(input) {
   if (!input.configured) return null;
@@ -21959,6 +24352,30 @@ function toServiceError(error) {
   throw toTrpcError(error);
 }
 var workspaceRouter = router({
+  knowledgeReset: router({
+    status: protectedProcedure.query(async ({ ctx }) => {
+      try {
+        return await getKnowledgeResetStatus(ctx.user.id);
+      } catch (error) {
+        toServiceError(error);
+      }
+    }),
+    submit: protectedProcedure.input(
+      z16.object({
+        reasonCode: knowledgeResetReasonSchema,
+        reasonNote: z16.string().trim().max(2e3).optional()
+      })
+    ).mutation(async ({ ctx, input }) => {
+      try {
+        return await submitKnowledgeReset({
+          actor: ctx.user,
+          ...input
+        });
+      } catch (error) {
+        toServiceError(error);
+      }
+    })
+  }),
   portal: protectedProcedure.query(async ({ ctx }) => {
     try {
       const [portal, delivery] = await Promise.all([
@@ -22073,9 +24490,9 @@ var workspaceRouter = router({
     }
   }),
   purchaseIntent: protectedProcedure.input(
-    z15.object({
-      targetPlanCode: z15.enum(["basic", "advanced", "luxury"]),
-      kind: z15.enum(["repeat_basic", "upgrade", "renewal"])
+    z16.object({
+      targetPlanCode: z16.enum(["basic", "advanced", "luxury"]),
+      kind: z16.enum(["repeat_basic", "upgrade", "renewal"])
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
@@ -22094,9 +24511,9 @@ var workspaceRouter = router({
     }
   }),
   selectQuestion: protectedProcedure.input(
-    z15.object({
-      questionId: z15.string().trim().min(1).max(64),
-      expectedRevision: z15.number().int().positive()
+    z16.object({
+      questionId: z16.string().trim().min(1).max(64),
+      expectedRevision: z16.number().int().positive()
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
@@ -22121,16 +24538,16 @@ var workspaceRouter = router({
     }
   }),
   requestQuestionSelection: protectedProcedure.input(
-    z15.discriminatedUnion("mode", [
-      z15.object({
-        mode: z15.literal("candidate"),
-        questionId: z15.string().trim().min(1).max(64),
-        expectedRevision: z15.number().int().positive()
+    z16.discriminatedUnion("mode", [
+      z16.object({
+        mode: z16.literal("candidate"),
+        questionId: z16.string().trim().min(1).max(64),
+        expectedRevision: z16.number().int().positive()
       }),
-      z15.object({
-        mode: z15.literal("direct"),
-        question: z15.string().trim().min(2, "\u76EE\u6807\u95EE\u9898\u81F3\u5C11\u9700\u8981 2 \u4E2A\u5B57\u7B26").max(4e3, "\u76EE\u6807\u95EE\u9898\u4E0D\u80FD\u8D85\u8FC7 4000 \u4E2A\u5B57\u7B26"),
-        category: z15.enum([
+      z16.object({
+        mode: z16.literal("direct"),
+        question: z16.string().trim().min(2, "\u76EE\u6807\u95EE\u9898\u81F3\u5C11\u9700\u8981 2 \u4E2A\u5B57\u7B26").max(4e3, "\u76EE\u6807\u95EE\u9898\u4E0D\u80FD\u8D85\u8FC7 4000 \u4E2A\u5B57\u7B26"),
+        category: z16.enum([
           "industry",
           "competitor_comparison",
           "reputation",
@@ -22166,10 +24583,10 @@ var workspaceRouter = router({
     }
   }),
   confirmQuestionIntent: protectedProcedure.input(
-    z15.object({
-      questionId: z15.string().trim().min(1).max(64),
-      expectedRevision: z15.number().int().positive(),
-      expectedIntentRevision: z15.number().int().positive()
+    z16.object({
+      questionId: z16.string().trim().min(1).max(64),
+      expectedRevision: z16.number().int().positive(),
+      expectedIntentRevision: z16.number().int().positive()
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
@@ -22219,8 +24636,8 @@ var workspaceRouter = router({
     }
   }),
   knowledgeProgress: protectedProcedure.input(
-    z15.object({
-      conversationId: z15.string().trim().min(1).max(191).optional()
+    z16.object({
+      conversationId: z16.string().trim().min(1).max(191).optional()
     }).optional()
   ).query(async ({ ctx, input }) => {
     try {
@@ -22242,8 +24659,8 @@ var workspaceRouter = router({
     }
   }),
   historicalQuestionResults: protectedProcedure.input(
-    z15.object({
-      questionId: z15.string().trim().min(1).max(191)
+    z16.object({
+      questionId: z16.string().trim().min(1).max(191)
     })
   ).query(async ({ ctx, input }) => {
     try {
@@ -22348,6 +24765,179 @@ var workspaceRouter = router({
   })
 });
 
+// server/delivery-role-router.ts
+import { z as z17 } from "zod";
+var usernameSchema3 = z17.string().trim().min(3).max(64).regex(/^[a-zA-Z0-9._-]+$/);
+function serviceCall(callback) {
+  return callback().catch((error) => {
+    throw toTrpcError(error);
+  });
+}
+var deliveryRoleRouter = router({
+  management: router({
+    overview: adminProcedure.query(
+      ({ ctx }) => serviceCall(() => listDeliveryRoleManagement(ctx.user))
+    ),
+    createTeam: adminProcedure.input(
+      z17.object({
+        name: z17.string().trim().min(2).max(128),
+        roleType: deliveryRoleTypeSchema
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(() => createDeliveryRole({ actor: ctx.user, ...input }))
+    ),
+    createMember: adminProcedure.input(
+      z17.object({
+        username: usernameSchema3,
+        password: passwordSchema,
+        displayName: z17.string().trim().max(128).optional()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(() => createDeliveryMember({ actor: ctx.user, ...input }))
+    ),
+    setMember: adminProcedure.input(
+      z17.object({
+        roleId: z17.string().uuid(),
+        memberUserId: z17.number().int().positive(),
+        active: z17.boolean()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(() => setDeliveryRoleMember({ actor: ctx.user, ...input }))
+    ),
+    assignCustomer: adminProcedure.input(
+      z17.object({
+        customerUserId: z17.number().int().positive(),
+        roleType: deliveryRoleTypeSchema,
+        roleId: z17.string().uuid(),
+        primaryMemberId: z17.number().int().positive()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => assignDeliveryCustomer({ actor: ctx.user, ...input })
+      )
+    ),
+    dispatchTicket: adminProcedure.input(
+      z17.object({
+        ticketId: z17.string().uuid(),
+        roleId: z17.string().uuid(),
+        memberUserId: z17.number().int().positive(),
+        priority: z17.enum(["low", "normal", "high", "urgent"])
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => dispatchDeliveryTicket({ actor: ctx.user, ...input })
+      )
+    ),
+    urgeTicket: adminProcedure.input(
+      z17.object({
+        ticketId: z17.string().uuid(),
+        message: z17.string().trim().max(2e3).optional()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(() => urgeDeliveryTicket({ actor: ctx.user, ...input }))
+    ),
+    setMemberApiKey: adminProcedure.input(
+      z17.object({
+        memberUserId: z17.number().int().positive(),
+        apiKey: z17.string().trim().min(8).max(4096)
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => setDeliveryMemberCredential({ actor: ctx.user, ...input })
+      )
+    ),
+    revokeMemberApiKey: adminProcedure.input(z17.object({ memberUserId: z17.number().int().positive() })).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => revokeDeliveryMemberCredential({ actor: ctx.user, ...input })
+      )
+    )
+  }),
+  mine: router({
+    roles: protectedProcedure.query(
+      ({ ctx }) => serviceCall(() => listMyDeliveryRoles(ctx.user))
+    ),
+    workbench: protectedProcedure.input(z17.object({ roleAssignmentId: z17.string().uuid() })).query(
+      ({ ctx, input }) => serviceCall(
+        () => getMyDeliveryWorkbench({ actor: ctx.user, ...input })
+      )
+    ),
+    credentialStatus: protectedProcedure.query(
+      ({ ctx }) => serviceCall(() => getMyDeliveryCredentialStatus(ctx.user))
+    ),
+    knowledgeResetPreview: protectedProcedure.input(
+      z17.object({
+        roleAssignmentId: z17.string().uuid(),
+        requestId: z17.string().uuid()
+      })
+    ).query(
+      ({ ctx, input }) => serviceCall(() => previewKnowledgeReset({ actor: ctx.user, ...input }))
+    ),
+    decideKnowledgeReset: protectedProcedure.input(
+      z17.object({
+        roleAssignmentId: z17.string().uuid(),
+        requestId: z17.string().uuid(),
+        expectedRevision: z17.number().int().positive(),
+        decision: z17.enum(["approve", "reject"]),
+        decisionNote: z17.string().trim().max(2e3).optional()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(() => decideKnowledgeReset({ actor: ctx.user, ...input }))
+    ),
+    updateTicket: protectedProcedure.input(
+      z17.object({
+        roleAssignmentId: z17.string().uuid(),
+        ticketId: z17.string().uuid(),
+        expectedRevision: z17.number().int().positive(),
+        status: z17.enum([
+          "in_progress",
+          "needs_information",
+          "completed",
+          "rejected",
+          "cancelled"
+        ]),
+        message: z17.string().trim().max(8e3).optional(),
+        publicUrl: z17.string().url().max(4096).optional(),
+        handoff: z17.object({
+          monitoringBatchKey: z17.string().trim().max(191).optional(),
+          optimizationQuestionIds: z17.array(z17.string().trim().min(1).max(191)).max(100).optional(),
+          responseLogicRevision: z17.number().int().positive().optional(),
+          contentAssetIds: z17.array(z17.string().trim().min(1).max(191)).max(500).optional(),
+          publishTargets: z17.array(z17.enum(["media", "website"])).max(2).optional(),
+          websiteOperation: z17.enum([
+            "company_facts",
+            "product_case_docs",
+            "industry_news",
+            "company_news",
+            "faq_content"
+          ]).optional(),
+          needsFurtherOptimization: z17.boolean().optional(),
+          domain: z17.string().trim().max(512).optional(),
+          icpProvince: z17.string().trim().max(64).optional(),
+          icpNumber: z17.string().trim().max(128).optional(),
+          icpNotRequired: z17.boolean().optional(),
+          siteCheck: z17.object({
+            key: z17.string().trim().min(1).max(64),
+            label: z17.string().trim().min(1).max(160),
+            status: z17.enum([
+              "passed",
+              "warning",
+              "failed",
+              "not_applicable"
+            ]),
+            summary: z17.string().trim().max(8e3).optional(),
+            evidence: z17.string().trim().max(8e3).optional(),
+            source: z17.string().trim().max(4096).optional()
+          }).optional()
+        }).optional()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => updateMyDeliveryTicket({ actor: ctx.user, ...input })
+      )
+    )
+  })
+});
+
 // server/routers.ts
 var appRouter = router({
   system: systemRouter,
@@ -22355,7 +24945,8 @@ var appRouter = router({
   admin: adminRouter,
   credential: credentialRouter,
   conversation: conversationRouter,
-  workspace: workspaceRouter
+  workspace: workspaceRouter,
+  delivery: deliveryRoleRouter
 });
 
 // server/_core/context.ts
@@ -22372,7 +24963,7 @@ async function createContext(opts) {
 import express from "express";
 import fs2 from "fs";
 import { nanoid } from "nanoid";
-import path3 from "path";
+import path4 from "path";
 import { createServer as createViteServer } from "vite";
 
 // vite.config.ts
@@ -22380,10 +24971,10 @@ import { jsxLocPlugin } from "@builder.io/vite-plugin-jsx-loc";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import fs from "node:fs";
-import path2 from "node:path";
+import path3 from "node:path";
 import { defineConfig } from "vite";
 var PROJECT_ROOT = import.meta.dirname;
-var LOG_DIR = path2.join(PROJECT_ROOT, ".frontmind-logs");
+var LOG_DIR = path3.join(PROJECT_ROOT, ".frontmind-logs");
 var MAX_LOG_SIZE_BYTES = 1 * 1024 * 1024;
 var TRIM_TARGET_BYTES = Math.floor(MAX_LOG_SIZE_BYTES * 0.6);
 function ensureLogDir() {
@@ -22414,7 +25005,7 @@ function trimLogFile(logPath, maxSize) {
 function writeToLogFile(source, entries) {
   if (entries.length === 0) return;
   ensureLogDir();
-  const logPath = path2.join(LOG_DIR, `${source}.log`);
+  const logPath = path3.join(LOG_DIR, `${source}.log`);
   const lines = entries.map((entry) => {
     const ts = (/* @__PURE__ */ new Date()).toISOString();
     return `[${ts}] ${JSON.stringify(entry)}`;
@@ -22525,12 +25116,12 @@ function vitePluginProductionPublicAssets() {
       output: "assets/cuhksz-emblem.png"
     }
   ];
-  const publicDirectory = path2.resolve(import.meta.dirname, "client/public");
+  const publicDirectory = path3.resolve(import.meta.dirname, "client/public");
   return {
     name: "frontmind-production-public-assets",
     generateBundle() {
       for (const asset of allowedAssets) {
-        const assetPath = path2.join(publicDirectory, asset.source);
+        const assetPath = path3.join(publicDirectory, asset.source);
         if (!fs.existsSync(assetPath)) {
           this.error(
             `Required production public asset is missing: ${asset.source}`
@@ -22560,19 +25151,19 @@ var vite_config_default = defineConfig(({ mode }) => {
     plugins,
     resolve: {
       alias: {
-        "@": path2.resolve(import.meta.dirname, "client", "src"),
-        "@shared": path2.resolve(import.meta.dirname, "shared"),
-        "@assets": path2.resolve(import.meta.dirname, "attached_assets")
+        "@": path3.resolve(import.meta.dirname, "client", "src"),
+        "@shared": path3.resolve(import.meta.dirname, "shared"),
+        "@assets": path3.resolve(import.meta.dirname, "attached_assets")
       }
     },
     define: {
       __FRONTMIND_BUILD_VERSION__: JSON.stringify(buildVersion)
     },
-    envDir: path2.resolve(import.meta.dirname),
-    root: path2.resolve(import.meta.dirname, "client"),
-    publicDir: isProduction ? false : path2.resolve(import.meta.dirname, "client", "public"),
+    envDir: path3.resolve(import.meta.dirname),
+    root: path3.resolve(import.meta.dirname, "client"),
+    publicDir: isProduction ? false : path3.resolve(import.meta.dirname, "client", "public"),
     build: {
-      outDir: path2.resolve(import.meta.dirname, "dist/public"),
+      outDir: path3.resolve(import.meta.dirname, "dist/public"),
       emptyOutDir: true
     },
     server: {
@@ -22609,7 +25200,7 @@ async function setupVite(app, server) {
   app.use("*", async (req, res, next) => {
     const url = req.originalUrl;
     try {
-      const clientTemplate = path3.resolve(
+      const clientTemplate = path4.resolve(
         import.meta.dirname,
         "../..",
         "client",
@@ -22629,7 +25220,7 @@ async function setupVite(app, server) {
   });
 }
 function serveStatic(app) {
-  const distPath = process.env.NODE_ENV === "development" ? path3.resolve(import.meta.dirname, "../..", "dist", "public") : path3.resolve(import.meta.dirname, "public");
+  const distPath = process.env.NODE_ENV === "development" ? path4.resolve(import.meta.dirname, "../..", "dist", "public") : path4.resolve(import.meta.dirname, "public");
   if (!fs2.existsSync(distPath)) {
     console.error(
       `Could not find the build directory: ${distPath}, make sure to build the client first`
@@ -22639,11 +25230,11 @@ function serveStatic(app) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-    res.sendFile(path3.resolve(distPath, "__frontmind__", "version.json"));
+    res.sendFile(path4.resolve(distPath, "__frontmind__", "version.json"));
   });
   app.use(
     "/assets",
-    express.static(path3.resolve(distPath, "assets"), {
+    express.static(path4.resolve(distPath, "assets"), {
       maxAge: "1y",
       immutable: true
     })
@@ -22659,7 +25250,7 @@ function serveStatic(app) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-    res.sendFile(path3.resolve(distPath, "index.html"));
+    res.sendFile(path4.resolve(distPath, "index.html"));
   });
 }
 
@@ -22667,7 +25258,7 @@ function serveStatic(app) {
 import { Router } from "express";
 import axios3 from "axios";
 import zlib from "zlib";
-import { randomUUID as randomUUID18 } from "crypto";
+import { randomUUID as randomUUID20 } from "crypto";
 
 // server/_core/sensitive-data.ts
 var REDACTED = "[REDACTED]";
@@ -22820,7 +25411,7 @@ import { createHash as createHash11 } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import fs3 from "node:fs/promises";
-import path4 from "node:path";
+import path5 from "node:path";
 import { Worker } from "node:worker_threads";
 var THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1e3;
 var FIVE_MINUTES_MS = 5 * 60 * 1e3;
@@ -22902,7 +25493,7 @@ async function pathSize(targetPath) {
     const entries = await fs3.readdir(targetPath);
     let total = 0;
     for (const entry of entries) {
-      total += await pathSize(path4.join(targetPath, entry));
+      total += await pathSize(path5.join(targetPath, entry));
     }
     return total;
   } catch {
@@ -22935,7 +25526,7 @@ var PreparedFileService = class {
     this.initPromise = null;
     this.processing = 0;
     this.cleanupTimer = null;
-    this.rootDir = rootDir || process.env.FRONTMIND_PREPARED_FILE_DIR || (process.env.NODE_ENV === "production" ? "/var/lib/frontmind/prepared-files" : path4.resolve(process.cwd(), ".frontmind-prepared-files"));
+    this.rootDir = rootDir || process.env.FRONTMIND_PREPARED_FILE_DIR || (process.env.NODE_ENV === "production" ? "/var/lib/frontmind/prepared-files" : path5.resolve(process.cwd(), ".frontmind-prepared-files"));
     this.workerConcurrency = finitePositiveInteger(
       process.env.FRONTMIND_PDF_WORKERS,
       1
@@ -22973,7 +25564,7 @@ var PreparedFileService = class {
     }
     const entries = await fs3.readdir(this.rootDir, { withFileTypes: true });
     for (const entry of entries) {
-      const fullPath = path4.join(this.rootDir, entry.name);
+      const fullPath = path5.join(this.rootDir, entry.name);
       if (entry.isDirectory() && (entry.name.endsWith(".work") || entry.name.endsWith(".tmp-work"))) {
         await fs3.rm(fullPath, { recursive: true, force: true });
         continue;
@@ -23602,19 +26193,19 @@ var PreparedFileService = class {
     ]);
   }
   manifestPath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.json`);
+    return path5.join(this.rootDir, `${assetId}.json`);
   }
   sourcePath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.source.tmp`);
+    return path5.join(this.rootDir, `${assetId}.source.tmp`);
   }
   preparedTempPath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.prepared.tmp`);
+    return path5.join(this.rootDir, `${assetId}.prepared.tmp`);
   }
   pdfPath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.pdf`);
+    return path5.join(this.rootDir, `${assetId}.pdf`);
   }
   workPath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.work`);
+    return path5.join(this.rootDir, `${assetId}.work`);
   }
 };
 var preparedFileService = new PreparedFileService();
@@ -24246,13 +26837,13 @@ function publicUpstreamTaskPayload(value, apiKey) {
   return deepSanitizeJson(redactPublicTaskValues(result, apiKey));
 }
 function isPublicTaskPayloadRequest(method, targetPath) {
-  const path10 = targetPath.split("?")[0].replace(/\/+$/, "");
+  const path11 = targetPath.split("?")[0].replace(/\/+$/, "");
   const normalizedMethod = method.toUpperCase();
-  if (normalizedMethod === "POST" && (path10 === "/v1/tasks" || path10 === "/v1/responses")) {
+  if (normalizedMethod === "POST" && (path11 === "/v1/tasks" || path11 === "/v1/responses")) {
     return true;
   }
   if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
-  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path10);
+  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path11);
 }
 function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
   if (value === null || value === void 0 || depth > 50) return ids;
@@ -25446,7 +28037,7 @@ router2.post("/download-token", async (req, res) => {
         error: { message: "Missing fileId", code: "MISSING_FILE_ID" }
       });
     }
-    const token = randomUUID18();
+    const token = randomUUID20();
     if (!req.frontmindUser || !req.frontmindCredential) {
       return res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
     }
@@ -25702,6 +28293,21 @@ router2.all("/*", async (req, res) => {
           kind: isTaskCreate ? "task" : "file",
           upstreamId: resourceId
         });
+        if (isTaskCreate && req.frontmindUser.role === "delivery_member" && req.frontmindDeliveryRoleContext) {
+          await writeWorkspaceAuditEvent({
+            actor: req.frontmindUser,
+            action: "delivery_member.agent.task_created",
+            targetType: "upstream_task",
+            targetId: resourceId,
+            workspaceUserId: null,
+            metadata: {
+              roleAssignmentId: req.frontmindDeliveryRoleContext.assignmentId,
+              roleId: req.frontmindDeliveryRoleContext.roleId,
+              roleType: req.frontmindDeliveryRoleContext.roleType,
+              teamName: req.frontmindDeliveryRoleContext.teamName
+            }
+          });
+        }
       }
       for (const fileId of collectOutputFileIds(response2.data)) {
         await recordUpstreamResource({
@@ -25802,11 +28408,11 @@ var manus_proxy_default = router2;
 
 // server/knowledge-base-api.ts
 import axios5 from "axios";
-import { and as and20, eq as eq23, inArray as inArray13, isNotNull, or as or4 } from "drizzle-orm";
+import { and as and22, eq as eq25, inArray as inArray15, isNotNull, or as or5 } from "drizzle-orm";
 import { Router as Router2 } from "express";
 import fs5 from "fs/promises";
 import JSZip2 from "jszip";
-import path6 from "path";
+import path7 from "path";
 import { createHash as createHash13 } from "node:crypto";
 
 // server/upstream-task-attachment.ts
@@ -25889,7 +28495,7 @@ async function uploadUpstreamTaskAttachment(input) {
 // server/task-attachment-package.ts
 import { createHash as createHash12 } from "node:crypto";
 import fs4 from "node:fs/promises";
-import path5 from "node:path";
+import path6 from "node:path";
 import JSZip from "jszip";
 var ARCHIVE_DATE = /* @__PURE__ */ new Date("1980-01-01T00:00:00.000Z");
 function assertSafeArchivePath(relativePath) {
@@ -25960,10 +28566,10 @@ async function buildDirectorySkillArchive(input) {
   for (const directoryCandidate of input.directoryCandidates) {
     try {
       const directory = await fs4.realpath(directoryCandidate);
-      const expectedRoot = `${directory}${path5.sep}`;
+      const expectedRoot = `${directory}${path6.sep}`;
       const files = await Promise.all(
         input.files.map(async (relativePath) => {
-          const resolved = path5.resolve(directory, relativePath);
+          const resolved = path6.resolve(directory, relativePath);
           if (!resolved.startsWith(expectedRoot)) {
             throw new Error(`Unsafe Skill path: ${relativePath}`);
           }
@@ -26220,11 +28826,11 @@ async function recoverOpenKnowledgeBaseTasks(options) {
     lastOutputLength: knowledgeBaseBuilds.lastOutputLength,
     lastOutputItemIds: knowledgeBaseBuilds.lastOutputItemIds
   }).from(knowledgeBaseBuilds).where(
-    and20(
-      inArray13(knowledgeBaseBuilds.status, ["researching", "confirming"]),
+    and22(
+      inArray15(knowledgeBaseBuilds.status, ["researching", "confirming"]),
       isNotNull(knowledgeBaseBuilds.upstreamTaskId),
-      or4(
-        eq23(knowledgeBaseBuilds.status, "researching"),
+      or5(
+        eq25(knowledgeBaseBuilds.status, "researching"),
         isNotNull(knowledgeBaseBuilds.awaitingResponseSince)
       )
     )
@@ -26242,6 +28848,7 @@ async function recoverOpenKnowledgeBaseTasks(options) {
       const build = builds[cursor++];
       const taskId = String(build.upstreamTaskId || "");
       try {
+        await assertKnowledgeBaseWritable(build.userId);
         const credential = await getCredentialForUpstreamResource(
           build.userId,
           "task",
@@ -26323,27 +28930,27 @@ async function recoverOpenKnowledgeBaseTasks(options) {
   return result;
 }
 var configuredKnowledgeBaseSkillPath = process.env.FRONTMIND_KB_SKILL_PATH?.trim();
-if (configuredKnowledgeBaseSkillPath && !path6.isAbsolute(configuredKnowledgeBaseSkillPath)) {
+if (configuredKnowledgeBaseSkillPath && !path7.isAbsolute(configuredKnowledgeBaseSkillPath)) {
   throw new Error("FRONTMIND_KB_SKILL_PATH must be an absolute path");
 }
 var skillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [configuredKnowledgeBaseSkillPath] : [
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     process.cwd(),
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -26352,12 +28959,12 @@ var skillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [configuredKnowl
   )
 ];
 var legacySkillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [
-  path6.join(
-    path6.dirname(configuredKnowledgeBaseSkillPath),
+  path7.join(
+    path7.dirname(configuredKnowledgeBaseSkillPath),
     "socratic-kb-builder-v1.skill"
   )
 ] : skillArchiveCandidates.map(
-  (candidate) => path6.join(path6.dirname(candidate), "socratic-kb-builder-v1.skill")
+  (candidate) => path7.join(path7.dirname(candidate), "socratic-kb-builder-v1.skill")
 );
 var skillArchiveCache = /* @__PURE__ */ new Map();
 var KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME = "socratic-kb-builder.skill.zip";
@@ -26568,6 +29175,7 @@ async function buildKnowledgeBasePrompt({
     "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\uFF1B\u53EA\u4F7F\u7528\u5F53\u524D Pro Agent \u6A21\u5F0F\u4E0B\u7684\u666E\u901A\u6D4F\u89C8\u3001\u641C\u7D22\u548C\u6587\u4EF6\u5DE5\u5177\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u5D4C\u5165\u5B98\u7F51\u6216 CDN \u56FE\u7247\u5916\u94FE\u3002\u56FE\u7247\u5FC5\u987B\u5148\u4E0B\u8F7D\u771F\u5B9E\u5B57\u8282\u3001\u89E3\u7801\u6821\u9A8C\u5E76\u6253\u5165\u6700\u7EC8 ZIP\uFF0C\u518D\u4EE5\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u5F15\u7528\uFF1B\u9632\u76D7\u94FE\u3001\u7B7E\u540D\u3001\u8FC7\u671F\u6216\u65E0\u6CD5\u4E0B\u8F7D\u7684\u5730\u5740\u53EA\u80FD\u8FDB\u5165\u5185\u90E8\u6765\u6E90\u8BB0\u5F55\uFF0C\u7EDD\u4E0D\u80FD\u4F5C\u4E3A\u5BA2\u6237\u56FE\u7247\u8FD4\u56DE\u3002",
+    "\u8D44\u6599\u91C7\u96C6\u9636\u6BB5\u7EDF\u4E00\u5411\u5BA2\u6237\u663E\u793A\uFF1AFrontMind \u6B63\u5728\u6309\u4E1A\u52A1\u5206\u652F\u8FDB\u884C\u8D44\u6599\u91C7\u96C6\u3002\u6B64\u9636\u6BB5\u65E0\u9700\u9010\u9879\u786E\u8BA4\uFF0C\u5B8C\u6210\u540E\u5C06\u76F4\u63A5\u751F\u6210\u53EF\u6838\u9A8C\u77E5\u8BC6\u5E93\u3002",
     "",
     "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
     `\u6784\u5EFA\u4F1A\u8BDD\u6807\u8BC6\uFF1A${conversationId || "\u672A\u63D0\u4F9B"}`,
@@ -26747,6 +29355,7 @@ router3.post("/start", async (req, res) => {
     return;
   }
   try {
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
     const existingBuild = await getKnowledgeBaseProgress({
       userId: req.frontmindUser.id,
       conversationId
@@ -26817,9 +29426,7 @@ router3.post("/start", async (req, res) => {
         );
       } catch (error) {
         await Promise.allSettled(
-          generatedAttachments.map(
-            (attachment) => attachment.removeOrphan()
-          )
+          generatedAttachments.map((attachment) => attachment.removeOrphan())
         );
         throw error;
       }
@@ -26835,9 +29442,7 @@ router3.post("/start", async (req, res) => {
     });
     if (!created.ok) {
       await Promise.allSettled(
-        generatedAttachments.map(
-          (attachment) => attachment.removeOrphan()
-        )
+        generatedAttachments.map((attachment) => attachment.removeOrphan())
       );
       console.warn(
         "[Knowledge Base Start] create task failed:",
@@ -26948,6 +29553,7 @@ router3.post("/turn", async (req, res) => {
     return;
   }
   try {
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
     const boundBuild = await assertKnowledgeBaseTaskBinding({
       userId: req.frontmindUser.id,
       conversationId,
@@ -27108,6 +29714,7 @@ router3.post("/progress/reconcile", async (req, res) => {
     if (!req.frontmindUser || !await requireKnowledgeBuildCapability(req.frontmindUser.id, res)) {
       return;
     }
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
     const boundBuild = await assertKnowledgeBaseTaskBinding({
       userId: req.frontmindUser.id,
       conversationId,
@@ -27191,24 +29798,24 @@ var knowledge_base_api_default = router3;
 // server/response-logic-api.ts
 import axios6 from "axios";
 import { Router as Router3 } from "express";
-import path7 from "node:path";
-import { z as z16 } from "zod";
+import path8 from "node:path";
+import { z as z18 } from "zod";
 var router4 = Router3();
-var attachmentSchema2 = z16.object({
-  file_id: z16.string().trim().min(1).max(255),
-  filename: z16.string().trim().min(1).max(512),
-  mime_type: z16.string().trim().min(1).max(255).optional()
+var attachmentSchema2 = z18.object({
+  file_id: z18.string().trim().min(1).max(255),
+  filename: z18.string().trim().min(1).max(512),
+  mime_type: z18.string().trim().min(1).max(255).optional()
 });
 var responseLogicStartSchema = responseLogicQuestionSchema.extend({
-  conversationId: z16.string().trim().min(1).max(191),
-  taskId: z16.string().trim().min(1).max(255).optional(),
-  userMessage: z16.string().max(2e5),
+  conversationId: z18.string().trim().min(1).max(191),
+  taskId: z18.string().trim().min(1).max(255).optional(),
+  userMessage: z18.string().max(2e5),
   draft: responseLogicDraftSchema,
-  attachments: z16.array(attachmentSchema2).max(100).default([])
+  attachments: z18.array(attachmentSchema2).max(100).default([])
 });
-var responseLogicTaskStatusQuerySchema = z16.object({
-  questionId: z16.string().trim().min(1).max(191),
-  conversationId: z16.string().trim().min(1).max(191)
+var responseLogicTaskStatusQuerySchema = z18.object({
+  questionId: z18.string().trim().min(1).max(191),
+  conversationId: z18.string().trim().min(1).max(191)
 }).strict();
 var ResponseLogicTaskBindingError = class extends Error {
   constructor(code, message) {
@@ -27387,29 +29994,29 @@ function buildVerifiedResponseLogicAttachments(attachments2, uploadedAt = /* @__
   });
 }
 var configuredResponseLogicSkillPath = process.env.FRONTMIND_RESPONSE_LOGIC_SKILL_PATH?.trim();
-if (configuredResponseLogicSkillPath && !path7.isAbsolute(configuredResponseLogicSkillPath)) {
+if (configuredResponseLogicSkillPath && !path8.isAbsolute(configuredResponseLogicSkillPath)) {
   throw new Error(
     "FRONTMIND_RESPONSE_LOGIC_SKILL_PATH must be an absolute path"
   );
 }
 var skillDirectoryCandidates = configuredResponseLogicSkillPath ? [configuredResponseLogicSkillPath] : [
-  path7.resolve(
+  path8.resolve(
     import.meta.dirname,
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path7.resolve(
+  path8.resolve(
     process.cwd(),
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path7.resolve(
+  path8.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path7.resolve(
+  path8.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -28142,16 +30749,16 @@ router4.post(["/start", "/turn"], async (req, res) => {
 var response_logic_api_default = router4;
 
 // server/dashboard-api.ts
-import { createHash as createHash14, randomUUID as randomUUID20 } from "node:crypto";
-import { mkdir as mkdir2, readFile as readFile2, unlink as unlink2, writeFile as writeFile2 } from "node:fs/promises";
-import path8 from "node:path";
+import { createHash as createHash14, randomUUID as randomUUID22 } from "node:crypto";
+import { mkdir as mkdir2, readFile as readFile2, unlink as unlink3, writeFile as writeFile2 } from "node:fs/promises";
+import path9 from "node:path";
 import axios7 from "axios";
-import { eq as eq25 } from "drizzle-orm";
+import { and as and24, eq as eq27, inArray as inArray16 } from "drizzle-orm";
 import ExcelJS2 from "exceljs";
 import express2 from "express";
 import JSZip3 from "jszip";
 import sharp from "sharp";
-import { z as z18 } from "zod";
+import { z as z20 } from "zod";
 
 // server/_core/express-auth.ts
 function sendAuthError(res, status, message, code) {
@@ -28198,30 +30805,30 @@ async function attachOptionalActiveCredential(req, res, next) {
 import {
   createHmac as createHmac4,
   randomBytes as randomBytes5,
-  randomUUID as randomUUID19,
+  randomUUID as randomUUID21,
   timingSafeEqual as timingSafeEqual5
 } from "node:crypto";
-import { and as and21, eq as eq24, isNull as isNull5, lt as lt5 } from "drizzle-orm";
-import { z as z17 } from "zod";
+import { and as and23, eq as eq26, isNull as isNull6, lt as lt6 } from "drizzle-orm";
+import { z as z19 } from "zod";
 var DEFAULT_TTL_SECONDS = 5 * 60;
 var MIN_SECRET_LENGTH = 32;
 var EPHEMERAL_NON_PRODUCTION_SECRET = randomBytes5(48).toString("base64url");
-var securedImportModuleSchema = z17.union([
+var securedImportModuleSchema = z19.union([
   dashboardAdminImportModuleSchema,
-  z17.literal("website-content")
+  z19.literal("website-content")
 ]);
-var preflightTokenPayloadSchema = z17.object({
-  version: z17.literal(1),
-  nonce: z17.string().uuid(),
-  actorId: z17.number().int().positive(),
-  workspaceUserId: z17.number().int().positive(),
+var preflightTokenPayloadSchema = z19.object({
+  version: z19.literal(1),
+  nonce: z19.string().uuid(),
+  actorId: z19.number().int().positive(),
+  workspaceUserId: z19.number().int().positive(),
   module: securedImportModuleSchema,
-  revision: z17.number().int().nonnegative(),
-  fileHash: z17.string().regex(/^[a-f0-9]{64}$/),
-  sectionId: z17.string().trim().min(1).max(80).optional(),
-  targetBatchKey: z17.string().trim().min(1).max(191).optional(),
-  issuedAt: z17.number().int().positive(),
-  expiresAt: z17.number().int().positive()
+  revision: z19.number().int().nonnegative(),
+  fileHash: z19.string().regex(/^[a-f0-9]{64}$/),
+  sectionId: z19.string().trim().min(1).max(80).optional(),
+  targetBatchKey: z19.string().trim().min(1).max(191).optional(),
+  issuedAt: z19.number().int().positive(),
+  expiresAt: z19.number().int().positive()
 }).strict();
 var DashboardImportPreflightError = class extends Error {
   constructor(code, message) {
@@ -28334,7 +30941,7 @@ function dashboardImportPreflightStoreForExecutor(executor) {
       });
     },
     async consume(binding, now) {
-      const rows = await executor.select().from(dashboardImportPreflights).where(eq24(dashboardImportPreflights.id, binding.nonce)).limit(1).for("update");
+      const rows = await executor.select().from(dashboardImportPreflights).where(eq26(dashboardImportPreflights.id, binding.nonce)).limit(1).for("update");
       const row = rows[0];
       if (!row || row.consumedAt || row.expiresAt.getTime() <= now.getTime()) {
         return null;
@@ -28355,9 +30962,9 @@ function dashboardImportPreflightStoreForExecutor(executor) {
         return null;
       }
       await executor.update(dashboardImportPreflights).set({ consumedAt: now }).where(
-        and21(
-          eq24(dashboardImportPreflights.id, binding.nonce),
-          isNull5(dashboardImportPreflights.consumedAt)
+        and23(
+          eq26(dashboardImportPreflights.id, binding.nonce),
+          isNull6(dashboardImportPreflights.consumedAt)
         )
       );
       return { ...stored, consumedAt: now };
@@ -28386,7 +30993,7 @@ async function issueDashboardImportPreflight(input) {
   const now = input.now ?? /* @__PURE__ */ new Date();
   const configuredTtl = input.ttlSeconds ?? ttlSeconds();
   const expiresAt = new Date(now.getTime() + configuredTtl * 1e3);
-  const nonce = randomUUID19();
+  const nonce = randomUUID21();
   const payload = preflightTokenPayloadSchema.parse({
     version: 1,
     nonce,
@@ -28458,7 +31065,7 @@ async function consumeDashboardImportPreflight(input) {
 async function cleanupExpiredDashboardImportPreflights(now = /* @__PURE__ */ new Date()) {
   const db = await getDb();
   if (!db) return 0;
-  const result = await db.delete(dashboardImportPreflights).where(lt5(dashboardImportPreflights.expiresAt, now));
+  const result = await db.delete(dashboardImportPreflights).where(lt6(dashboardImportPreflights.expiresAt, now));
   const metadata = result;
   return metadata.rowsAffected ?? metadata.affectedRows ?? 0;
 }
@@ -28480,6 +31087,113 @@ function startDashboardImportPreflightCleanupScheduler() {
 var router5 = express2.Router();
 var MAX_ARCHIVE_ENTRIES = 2e3;
 var MAX_ARCHIVE_BYTES = 250 * 1024 * 1024;
+function assertNotDeliveryAdministratorExecution(actor) {
+  if (actor.role === "admin" && actor.adminAccessLevel === "delivery_admin") {
+    throw new Error("\u4EA4\u4ED8\u7BA1\u7406\u5458\u53EA\u8D1F\u8D23\u6D41\u7A0B\u8C03\u5EA6\uFF0C\u4E0D\u80FD\u6267\u884C\u4E0A\u4F20\u6216\u53D1\u5E03\u64CD\u4F5C");
+  }
+}
+function deliveryRoleAssignmentId(req) {
+  return String(req.header("x-delivery-role-assignment-id") || "").trim();
+}
+async function assertRoleScopedWorkspaceExecution(input) {
+  const actor = input.req.frontmindUser;
+  if (actor.role === "delivery_member") {
+    const roleAssignmentId = deliveryRoleAssignmentId(input.req);
+    if (!roleAssignmentId) {
+      throw new Error("\u7F3A\u5C11\u5F53\u524D\u4EA4\u4ED8\u5DE5\u4F5C\u89D2\u8272\u6807\u8BC6");
+    }
+    return assertDeliveryRoleContext({
+      actor,
+      roleAssignmentId,
+      customerUserId: input.targetUserId,
+      requirePrimaryCustomerAssignment: input.requirePrimaryCustomerAssignment,
+      expectedRoleType: input.expectedRoleType
+    });
+  }
+  assertNotDeliveryAdministratorExecution(actor);
+  if (actor.role === "user" && (!input.allowCustomerSelf || actor.id !== input.targetUserId)) {
+    throw new Error("\u5F53\u524D\u8D26\u53F7\u4E0D\u80FD\u6267\u884C\u8BE5\u4EA4\u4ED8\u64CD\u4F5C");
+  }
+  await assertWorkspaceAccess(actor, input.targetUserId);
+  return null;
+}
+var DELIVERY_IMPORT_MODULE_ACCESS = {
+  keywords: {
+    roleType: "monitoring_optimization_engineer",
+    operations: ["question_catalog"]
+  },
+  questions: {
+    roleType: "monitoring_optimization_engineer",
+    operations: ["question_catalog"]
+  },
+  monitoring: {
+    roleType: "monitoring_optimization_engineer",
+    operations: [
+      "initial_monitoring",
+      "monitoring_import",
+      "monitoring_retest"
+    ]
+  },
+  metrics: {
+    roleType: "monitoring_optimization_engineer",
+    operations: ["stage_report"]
+  },
+  "optimization-report": {
+    roleType: "monitoring_optimization_engineer",
+    operations: ["stage_report"]
+  },
+  "response-logic": {
+    roleType: "content_distribution_engineer",
+    operations: ["response_logic"]
+  },
+  "content-assets": {
+    roleType: "content_distribution_engineer",
+    operations: ["content_asset_publish"]
+  },
+  sections: {
+    roleType: "content_distribution_engineer",
+    operations: ["content_asset_publish"]
+  }
+};
+async function assertDeliveryModuleImport(input) {
+  const access = DELIVERY_IMPORT_MODULE_ACCESS[input.importModule];
+  if (!access) {
+    throw new Error("\u5F53\u524D\u6A21\u5757\u4E0D\u5C5E\u4E8E\u4EA4\u4ED8\u6210\u5458\u5DE5\u4F5C\u53F0");
+  }
+  const role = await assertRoleScopedWorkspaceExecution({
+    req: input.req,
+    targetUserId: input.targetUserId,
+    expectedRoleType: access.roleType,
+    requirePrimaryCustomerAssignment: false
+  });
+  const ticketId = String(
+    input.req.header("x-delivery-ticket-id") || ""
+  ).trim();
+  if (!ticketId || !role) {
+    throw new Error("\u7F3A\u5C11\u5F53\u524D\u4EA4\u4ED8\u5DE5\u5355\u6807\u8BC6");
+  }
+  const db = await getDb();
+  if (!db) throw new Error("\u6570\u636E\u5E93\u6682\u65F6\u4E0D\u53EF\u7528");
+  const rows = await db.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
+    and24(
+      eq27(deliveryTickets.id, ticketId),
+      eq27(deliveryTickets.userId, input.targetUserId),
+      eq27(deliveryTickets.workflowDomain, role.roleType),
+      eq27(deliveryTickets.assignedRoleId, role.roleId),
+      eq27(deliveryTickets.assignedMemberId, input.req.frontmindUser.id),
+      inArray16(deliveryTickets.operation, access.operations),
+      inArray16(deliveryTickets.status, [
+        "submitted",
+        "needs_information",
+        "scheduled",
+        "in_progress"
+      ])
+    )
+  ).limit(1);
+  if (!rows[0]) {
+    throw new Error("\u5F53\u524D\u5DE5\u5355\u65E0\u6743\u53D1\u5E03\u8BE5\u4E1A\u52A1\u6A21\u5757");
+  }
+}
 var MAX_UNPACKED_BYTES = 220 * 1024 * 1024;
 var MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
 var MAX_IMAGE_BYTES = 32 * 1024 * 1024;
@@ -28579,14 +31293,14 @@ var websiteLeadDisplayBranchByDirectory = /* @__PURE__ */ new Map([
   ["07_service", "cooperation"],
   ["08_competitive_advantages", "why-frontmind"]
 ]);
-var packageDocumentKindSchema = z18.enum([
+var packageDocumentKindSchema = z20.enum([
   "overview",
   "leaf",
   "evidence",
   "report",
   "index"
 ]);
-var packageEvidenceStatusSchema = z18.enum([
+var packageEvidenceStatusSchema = z20.enum([
   "verified_first_party",
   "verified_authoritative",
   "supported_third_party",
@@ -28594,18 +31308,18 @@ var packageEvidenceStatusSchema = z18.enum([
   "needs_verification",
   "not_applicable"
 ]);
-var packageAssetOwnershipSchema = z18.literal("first_party");
-var packageContentStatusSchema = z18.enum([
+var packageAssetOwnershipSchema = z20.literal("first_party");
+var packageContentStatusSchema = z20.enum([
   "complete",
   "limited_evidence",
   "needs_verification"
 ]);
-var packageImageSelectionStatusSchema = z18.enum([
+var packageImageSelectionStatusSchema = z20.enum([
   "target_met",
   "source_limited",
   "budget_limited"
 ]);
-var packageAssetTypeSchema = z18.enum([
+var packageAssetTypeSchema = z20.enum([
   "brand_identity",
   "product_ui",
   "product_diagram",
@@ -28616,7 +31330,7 @@ var packageAssetTypeSchema = z18.enum([
   "document_figure",
   "other"
 ]);
-var packageAssetDisplayRoleSchema = z18.enum(["hero", "inline", "badge"]);
+var packageAssetDisplayRoleSchema = z20.enum(["hero", "inline", "badge"]);
 var requiredImageDiscoveryMethods = /* @__PURE__ */ new Set([
   "img",
   "srcset",
@@ -28627,11 +31341,11 @@ var requiredImageDiscoveryMethods = /* @__PURE__ */ new Set([
   "gallery",
   "official_document"
 ]);
-var packageSourceUrlSchema = z18.string().trim().url().max(4e3).refine((value) => {
+var packageSourceUrlSchema = z20.string().trim().url().max(4e3).refine((value) => {
   const parsed = new URL(value);
   return ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password;
 }, "source URL must be credential-free HTTP(S)");
-var websiteV2ImageDiscoveryMethodSchema = z18.enum([
+var websiteV2ImageDiscoveryMethodSchema = z20.enum([
   "img",
   "srcset_or_lazy",
   "picture",
@@ -28640,64 +31354,64 @@ var websiteV2ImageDiscoveryMethodSchema = z18.enum([
   "gallery",
   "official_document"
 ]);
-var websiteV2PackageManifestSchema = z18.object({
-  schemaVersion: z18.union([z18.literal(2), z18.literal(3)]),
-  profile: z18.literal("website-lead-v1"),
-  documents: z18.array(
-    z18.object({
-      id: z18.string().trim().min(1).max(191),
-      path: z18.string().trim().min(1).max(600),
+var websiteV2PackageManifestSchema = z20.object({
+  schemaVersion: z20.union([z20.literal(2), z20.literal(3)]),
+  profile: z20.literal("website-lead-v1"),
+  documents: z20.array(
+    z20.object({
+      id: z20.string().trim().min(1).max(191),
+      path: z20.string().trim().min(1).max(600),
       kind: packageDocumentKindSchema,
-      title: z18.string().trim().min(1).max(512),
-      branchId: z18.string().trim().min(1).max(191).optional(),
-      order: z18.number().int().min(0).max(1e4).optional(),
+      title: z20.string().trim().min(1).max(512),
+      branchId: z20.string().trim().min(1).max(191).optional(),
+      order: z20.number().int().min(0).max(1e4).optional(),
       evidenceStatus: packageEvidenceStatusSchema.optional(),
-      sourceIds: z18.array(z18.string().trim().min(1).max(191)).max(500).optional(),
-      assetIds: z18.array(z18.string().trim().min(1).max(191)).max(500).optional(),
-      customerVisible: z18.boolean(),
-      evidenceCharacters: z18.number().int().nonnegative().optional(),
-      dynamicMinimumCharacters: z18.number().int().nonnegative().optional(),
-      evidenceDocumentIds: z18.array(z18.string().trim().min(1).max(191)).max(500).optional(),
-      productFamilyIds: z18.array(z18.string().trim().min(1).max(191)).max(120).optional()
+      sourceIds: z20.array(z20.string().trim().min(1).max(191)).max(500).optional(),
+      assetIds: z20.array(z20.string().trim().min(1).max(191)).max(500).optional(),
+      customerVisible: z20.boolean(),
+      evidenceCharacters: z20.number().int().nonnegative().optional(),
+      dynamicMinimumCharacters: z20.number().int().nonnegative().optional(),
+      evidenceDocumentIds: z20.array(z20.string().trim().min(1).max(191)).max(500).optional(),
+      productFamilyIds: z20.array(z20.string().trim().min(1).max(191)).max(120).optional()
     }).strict()
   ).min(1).max(1500),
-  assets: z18.array(
-    z18.object({
-      id: z18.string().trim().min(1).max(191),
-      path: z18.string().trim().min(1).max(600),
-      sha256: z18.string().regex(/^[a-f0-9]{64}$/i),
-      mimeType: z18.enum([
+  assets: z20.array(
+    z20.object({
+      id: z20.string().trim().min(1).max(191),
+      path: z20.string().trim().min(1).max(600),
+      sha256: z20.string().regex(/^[a-f0-9]{64}$/i),
+      mimeType: z20.enum([
         "image/avif",
         "image/gif",
         "image/jpeg",
         "image/png",
         "image/webp"
       ]),
-      bytes: z18.number().int().positive().max(MAX_IMAGE_BYTES),
-      width: z18.number().int().positive().max(1e5),
-      height: z18.number().int().positive().max(1e5),
-      caption: z18.string().trim().min(1).max(2e3),
-      alt: z18.string().trim().max(1e3).optional(),
-      branchId: z18.string().trim().min(1).max(191),
-      documentIds: z18.array(z18.string().trim().min(1).max(191)).min(1).max(500),
+      bytes: z20.number().int().positive().max(MAX_IMAGE_BYTES),
+      width: z20.number().int().positive().max(1e5),
+      height: z20.number().int().positive().max(1e5),
+      caption: z20.string().trim().min(1).max(2e3),
+      alt: z20.string().trim().max(1e3).optional(),
+      branchId: z20.string().trim().min(1).max(191),
+      documentIds: z20.array(z20.string().trim().min(1).max(191)).min(1).max(500),
       sourcePageUrl: packageSourceUrlSchema.optional(),
       sourceAssetUrl: packageSourceUrlSchema.optional(),
-      sourceDocumentPath: z18.string().trim().min(1).max(600).optional(),
-      sourceKind: z18.enum(["official_web", "official_document", "user_upload"]).optional(),
+      sourceDocumentPath: z20.string().trim().min(1).max(600).optional(),
+      sourceKind: z20.enum(["official_web", "official_document", "user_upload"]).optional(),
       ownership: packageAssetOwnershipSchema,
       assetType: packageAssetTypeSchema,
       displayRole: packageAssetDisplayRoleSchema
     }).strict()
   ).max(48),
-  counts: z18.object({
-    totalFiles: z18.number().int().nonnegative().max(2e3),
-    customerVisibleCharacters: z18.number().int().nonnegative().max(4e4),
-    evidenceCharacters: z18.number().int().nonnegative().max(3e5),
-    packagedImages: z18.number().int().nonnegative().max(48)
+  counts: z20.object({
+    totalFiles: z20.number().int().nonnegative().max(2e3),
+    customerVisibleCharacters: z20.number().int().nonnegative().max(4e4),
+    evidenceCharacters: z20.number().int().nonnegative().max(3e5),
+    packagedImages: z20.number().int().nonnegative().max(48)
   }).strict(),
-  branchEvidence: z18.array(
-    z18.object({
-      branchId: z18.enum([
+  branchEvidence: z20.array(
+    z20.object({
+      branchId: z20.enum([
         "company-identity",
         "team",
         "products-services",
@@ -28706,44 +31420,44 @@ var websiteV2PackageManifestSchema = z18.object({
         "cooperation",
         "why-frontmind"
       ]),
-      overviewDocumentId: z18.string().trim().min(1).max(191),
+      overviewDocumentId: z20.string().trim().min(1).max(191),
       contentStatus: packageContentStatusSchema,
-      deduplicatedEvidenceCharacters: z18.number().int().nonnegative(),
-      dynamicOverviewMinimum: z18.number().int().nonnegative().max(5e3),
-      checkedSourceCount: z18.number().int().positive()
+      deduplicatedEvidenceCharacters: z20.number().int().nonnegative(),
+      dynamicOverviewMinimum: z20.number().int().nonnegative().max(5e3),
+      checkedSourceCount: z20.number().int().positive()
     }).strict()
   ).length(7),
-  imageSelection: z18.object({
+  imageSelection: z20.object({
     status: packageImageSelectionStatusSchema,
-    discoveredCandidateImages: z18.number().int().nonnegative(),
-    inspectedCandidateImages: z18.number().int().nonnegative(),
-    eligibleFirstPartyImages: z18.number().int().nonnegative().max(48),
-    rejectedCandidateImages: z18.number().int().nonnegative(),
-    scannedSourcePages: z18.number().int().nonnegative(),
-    discoveryMethods: z18.array(websiteV2ImageDiscoveryMethodSchema).max(7),
-    candidates: z18.array(
-      z18.object({
+    discoveredCandidateImages: z20.number().int().nonnegative(),
+    inspectedCandidateImages: z20.number().int().nonnegative(),
+    eligibleFirstPartyImages: z20.number().int().nonnegative().max(48),
+    rejectedCandidateImages: z20.number().int().nonnegative(),
+    scannedSourcePages: z20.number().int().nonnegative(),
+    discoveryMethods: z20.array(websiteV2ImageDiscoveryMethodSchema).max(7),
+    candidates: z20.array(
+      z20.object({
         url: packageSourceUrlSchema.optional(),
         sourcePageUrl: packageSourceUrlSchema.optional(),
-        sourceDocumentPath: z18.string().trim().min(1).max(600).optional(),
-        sourceKind: z18.enum(["official_web", "official_document", "user_upload"]).optional(),
+        sourceDocumentPath: z20.string().trim().min(1).max(600).optional(),
+        sourceKind: z20.enum(["official_web", "official_document", "user_upload"]).optional(),
         method: websiteV2ImageDiscoveryMethodSchema,
-        status: z18.enum(["eligible", "rejected", "uninspected"]),
-        assetId: z18.string().trim().min(1).max(191).optional(),
-        rejectionReason: z18.string().trim().min(8).max(500).optional()
+        status: z20.enum(["eligible", "rejected", "uninspected"]),
+        assetId: z20.string().trim().min(1).max(191).optional(),
+        rejectionReason: z20.string().trim().min(8).max(500).optional()
       }).strict()
     ).max(1e3),
-    productFamilies: z18.array(
-      z18.object({
-        id: z18.string().trim().min(1).max(191),
-        name: z18.string().trim().min(1).max(500),
-        officialVisualFound: z18.boolean(),
-        checkedSources: z18.number().int().nonnegative(),
-        assetIds: z18.array(z18.string().trim().min(1).max(191)).max(48),
-        gapReason: z18.string().trim().min(8).max(2e3).optional()
+    productFamilies: z20.array(
+      z20.object({
+        id: z20.string().trim().min(1).max(191),
+        name: z20.string().trim().min(1).max(500),
+        officialVisualFound: z20.boolean(),
+        checkedSources: z20.number().int().nonnegative(),
+        assetIds: z20.array(z20.string().trim().min(1).max(191)).max(48),
+        gapReason: z20.string().trim().min(8).max(2e3).optional()
       }).strict()
     ).max(120),
-    shortfallReason: z18.string().trim().min(8).max(2e3).optional()
+    shortfallReason: z20.string().trim().min(8).max(2e3).optional()
   }).strict()
 }).strict().superRefine((value, context) => {
   if (new Set(value.branchEvidence.map((branch) => branch.branchId)).size !== 7) {
@@ -28816,68 +31530,68 @@ var websiteV2PackageManifestSchema = z18.object({
     });
   }
 });
-var internalPackageManifestSchema = z18.object({
-  schemaVersion: z18.union([z18.literal(1), z18.literal(2), z18.literal(3)]),
-  profile: z18.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
-  websiteV2Normalized: z18.literal(true).optional(),
-  documents: z18.array(
-    z18.object({
-      id: z18.string().trim().min(1).max(191),
-      path: z18.string().trim().min(1).max(600),
+var internalPackageManifestSchema = z20.object({
+  schemaVersion: z20.union([z20.literal(1), z20.literal(2), z20.literal(3)]),
+  profile: z20.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
+  websiteV2Normalized: z20.literal(true).optional(),
+  documents: z20.array(
+    z20.object({
+      id: z20.string().trim().min(1).max(191),
+      path: z20.string().trim().min(1).max(600),
       kind: packageDocumentKindSchema,
-      title: z18.string().trim().min(1).max(512),
-      branchId: z18.string().trim().min(1).max(191).optional(),
-      branchTitle: z18.string().trim().min(1).max(255).optional(),
-      order: z18.number().int().min(0).max(1e4).optional(),
+      title: z20.string().trim().min(1).max(512),
+      branchId: z20.string().trim().min(1).max(191).optional(),
+      branchTitle: z20.string().trim().min(1).max(255).optional(),
+      order: z20.number().int().min(0).max(1e4).optional(),
       evidenceStatus: packageEvidenceStatusSchema.optional(),
-      sourceIds: z18.array(z18.string().trim().min(1).max(191)).max(500).default([]),
-      evidenceDocumentIds: z18.array(z18.string().trim().min(1).max(191)).max(500).optional(),
-      assetIds: z18.array(z18.string().trim().min(1).max(191)).max(500).default([]),
-      customerVisible: z18.boolean(),
-      evidenceCharacters: z18.number().int().nonnegative().optional(),
-      requiredFormalCharacters: z18.number().int().nonnegative().optional(),
+      sourceIds: z20.array(z20.string().trim().min(1).max(191)).max(500).default([]),
+      evidenceDocumentIds: z20.array(z20.string().trim().min(1).max(191)).max(500).optional(),
+      assetIds: z20.array(z20.string().trim().min(1).max(191)).max(500).default([]),
+      customerVisible: z20.boolean(),
+      evidenceCharacters: z20.number().int().nonnegative().optional(),
+      requiredFormalCharacters: z20.number().int().nonnegative().optional(),
       contentStatus: packageContentStatusSchema.optional(),
-      productFamilyId: z18.string().trim().min(1).max(191).optional(),
-      productFamilyIds: z18.array(z18.string().trim().min(1).max(191)).max(120).optional()
+      productFamilyId: z20.string().trim().min(1).max(191).optional(),
+      productFamilyIds: z20.array(z20.string().trim().min(1).max(191)).max(120).optional()
     }).strict()
   ).min(1).max(1500),
-  assets: z18.array(
-    z18.object({
-      id: z18.string().trim().min(1).max(191),
-      path: z18.string().trim().min(1).max(600),
-      sha256: z18.string().regex(/^[a-f0-9]{64}$/i),
-      mimeType: z18.enum([
+  assets: z20.array(
+    z20.object({
+      id: z20.string().trim().min(1).max(191),
+      path: z20.string().trim().min(1).max(600),
+      sha256: z20.string().regex(/^[a-f0-9]{64}$/i),
+      mimeType: z20.enum([
         "image/avif",
         "image/gif",
         "image/jpeg",
         "image/png",
         "image/webp"
       ]),
-      bytes: z18.number().int().positive().max(MAX_IMAGE_BYTES),
-      width: z18.number().int().positive().max(1e5),
-      height: z18.number().int().positive().max(1e5),
-      caption: z18.string().trim().min(1).max(2e3),
-      alt: z18.string().trim().max(1e3).optional(),
-      branchId: z18.string().trim().min(1).max(191),
-      documentIds: z18.array(z18.string().trim().min(1).max(191)).min(1).max(500),
+      bytes: z20.number().int().positive().max(MAX_IMAGE_BYTES),
+      width: z20.number().int().positive().max(1e5),
+      height: z20.number().int().positive().max(1e5),
+      caption: z20.string().trim().min(1).max(2e3),
+      alt: z20.string().trim().max(1e3).optional(),
+      branchId: z20.string().trim().min(1).max(191),
+      documentIds: z20.array(z20.string().trim().min(1).max(191)).min(1).max(500),
       sourcePageUrl: packageSourceUrlSchema.optional(),
       sourceAssetUrl: packageSourceUrlSchema.optional(),
-      sourceDocumentPath: z18.string().trim().min(1).max(600).optional(),
-      sourceKind: z18.enum(["official_web", "official_document", "user_upload"]).optional(),
+      sourceDocumentPath: z20.string().trim().min(1).max(600).optional(),
+      sourceKind: z20.enum(["official_web", "official_document", "user_upload"]).optional(),
       ownership: packageAssetOwnershipSchema,
       assetType: packageAssetTypeSchema.optional(),
       displayRole: packageAssetDisplayRoleSchema.optional()
     }).strict()
   ).max(480),
-  counts: z18.object({
-    totalFiles: z18.number().int().nonnegative().max(2e3),
-    customerVisibleCharacters: z18.number().int().nonnegative().max(18e4),
-    evidenceCharacters: z18.number().int().nonnegative().max(3e6),
-    packagedImages: z18.number().int().nonnegative().max(480)
+  counts: z20.object({
+    totalFiles: z20.number().int().nonnegative().max(2e3),
+    customerVisibleCharacters: z20.number().int().nonnegative().max(18e4),
+    evidenceCharacters: z20.number().int().nonnegative().max(3e6),
+    packagedImages: z20.number().int().nonnegative().max(480)
   }).strict(),
-  branchEvidence: z18.array(
-    z18.object({
-      branchId: z18.enum([
+  branchEvidence: z20.array(
+    z20.object({
+      branchId: z20.enum([
         "company-identity",
         "team",
         "products-services",
@@ -28886,52 +31600,52 @@ var internalPackageManifestSchema = z18.object({
         "cooperation",
         "why-frontmind"
       ]),
-      overviewDocumentId: z18.string().trim().min(1).max(191),
+      overviewDocumentId: z20.string().trim().min(1).max(191),
       contentStatus: packageContentStatusSchema,
-      deduplicatedEvidenceCharacters: z18.number().int().nonnegative(),
-      dynamicOverviewMinimum: z18.number().int().nonnegative().max(5e3),
-      checkedSourceCount: z18.number().int().positive()
+      deduplicatedEvidenceCharacters: z20.number().int().nonnegative(),
+      dynamicOverviewMinimum: z20.number().int().nonnegative().max(5e3),
+      checkedSourceCount: z20.number().int().positive()
     }).strict()
   ).length(7).optional(),
-  imageSelection: z18.object({
+  imageSelection: z20.object({
     status: packageImageSelectionStatusSchema.optional(),
-    discoveredCandidateImages: z18.number().int().nonnegative().optional(),
-    inspectedCandidateImages: z18.number().int().nonnegative().optional(),
-    eligibleFirstPartyImages: z18.number().int().nonnegative().max(1e7),
-    rejectedCandidateImages: z18.number().int().nonnegative().optional(),
-    scannedSourcePages: z18.number().int().nonnegative().optional(),
-    discoveryMethods: z18.array(z18.string().trim().min(1).max(100)).max(100).optional(),
-    rejectionReasons: z18.array(
-      z18.object({
-        reason: z18.string().trim().min(1).max(500),
-        count: z18.number().int().nonnegative()
+    discoveredCandidateImages: z20.number().int().nonnegative().optional(),
+    inspectedCandidateImages: z20.number().int().nonnegative().optional(),
+    eligibleFirstPartyImages: z20.number().int().nonnegative().max(1e7),
+    rejectedCandidateImages: z20.number().int().nonnegative().optional(),
+    scannedSourcePages: z20.number().int().nonnegative().optional(),
+    discoveryMethods: z20.array(z20.string().trim().min(1).max(100)).max(100).optional(),
+    rejectionReasons: z20.array(
+      z20.object({
+        reason: z20.string().trim().min(1).max(500),
+        count: z20.number().int().nonnegative()
       }).strict()
     ).max(500).optional(),
-    stopReason: z18.string().trim().min(1).max(2e3).optional(),
-    productFamilyCoverage: z18.array(
-      z18.object({
-        familyId: z18.string().trim().min(1).max(191),
-        familyName: z18.string().trim().min(1).max(500),
-        officialImageAvailable: z18.boolean(),
-        assetIds: z18.array(z18.string().trim().min(1).max(191)).max(500),
-        checkedSources: z18.array(packageSourceUrlSchema).max(500),
-        checkedSourceCount: z18.number().int().positive().optional(),
-        gapReason: z18.string().trim().min(1).max(2e3).optional()
+    stopReason: z20.string().trim().min(1).max(2e3).optional(),
+    productFamilyCoverage: z20.array(
+      z20.object({
+        familyId: z20.string().trim().min(1).max(191),
+        familyName: z20.string().trim().min(1).max(500),
+        officialImageAvailable: z20.boolean(),
+        assetIds: z20.array(z20.string().trim().min(1).max(191)).max(500),
+        checkedSources: z20.array(packageSourceUrlSchema).max(500),
+        checkedSourceCount: z20.number().int().positive().optional(),
+        gapReason: z20.string().trim().min(1).max(2e3).optional()
       }).strict()
     ).max(500).optional(),
-    candidates: z18.array(
-      z18.object({
+    candidates: z20.array(
+      z20.object({
         url: packageSourceUrlSchema.optional(),
         sourcePageUrl: packageSourceUrlSchema.optional(),
-        sourceDocumentPath: z18.string().trim().min(1).max(600).optional(),
-        sourceKind: z18.enum(["official_web", "official_document", "user_upload"]).optional(),
-        method: z18.string().trim().min(1).max(100),
-        status: z18.enum(["eligible", "rejected", "uninspected"]),
-        assetId: z18.string().trim().min(1).max(191).optional(),
-        rejectionReason: z18.string().trim().min(1).max(500).optional()
+        sourceDocumentPath: z20.string().trim().min(1).max(600).optional(),
+        sourceKind: z20.enum(["official_web", "official_document", "user_upload"]).optional(),
+        method: z20.string().trim().min(1).max(100),
+        status: z20.enum(["eligible", "rejected", "uninspected"]),
+        assetId: z20.string().trim().min(1).max(191).optional(),
+        rejectionReason: z20.string().trim().min(1).max(500).optional()
       }).strict()
     ).max(1800).optional(),
-    shortfallReason: z18.string().trim().min(1).max(2e3).optional()
+    shortfallReason: z20.string().trim().min(1).max(2e3).optional()
   }).strict()
 }).strict().superRefine((value, context) => {
   const documentById = new Map(
@@ -29099,7 +31813,7 @@ var internalPackageManifestSchema = z18.object({
     }
   });
 });
-var packageManifestSchema = z18.preprocess((input) => {
+var packageManifestSchema = z20.preprocess((input) => {
   const isWebsiteV2 = typeof input === "object" && input !== null && "profile" in input && input.profile === "website-lead-v1" && "schemaVersion" in input && (input.schemaVersion === 2 || input.schemaVersion === 3);
   if (!isWebsiteV2) return input;
   const value = websiteV2PackageManifestSchema.parse(input);
@@ -29176,9 +31890,9 @@ var packageManifestSchema = z18.preprocess((input) => {
     }
   };
 }, internalPackageManifestSchema);
-var completenessAcquisitionCountSchema = z18.object({
-  completed: z18.number().int().nonnegative(),
-  total: z18.number().int().nonnegative()
+var completenessAcquisitionCountSchema = z20.object({
+  completed: z20.number().int().nonnegative(),
+  total: z20.number().int().nonnegative()
 }).strict().superRefine((value, context) => {
   if (value.completed > value.total) {
     context.addIssue({
@@ -29188,17 +31902,17 @@ var completenessAcquisitionCountSchema = z18.object({
     });
   }
 });
-var completenessAcquisitionSchema = z18.object({
-  counts: z18.record(z18.string(), z18.number().int().nonnegative()).optional(),
-  acquisition: z18.object({
+var completenessAcquisitionSchema = z20.object({
+  counts: z20.record(z20.string(), z20.number().int().nonnegative()).optional(),
+  acquisition: z20.object({
     officialPages: completenessAcquisitionCountSchema.optional(),
     images: completenessAcquisitionCountSchema.optional(),
     documents: completenessAcquisitionCountSchema.optional(),
     webQueries: completenessAcquisitionCountSchema.optional()
   }).passthrough()
 }).passthrough();
-var storageRoot2 = path8.resolve(
-  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path8.join(process.cwd(), ".frontmind-dashboard-assets")
+var storageRoot2 = path9.resolve(
+  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path9.join(process.cwd(), ".frontmind-dashboard-assets")
 );
 function assertDashboardAssetStorageConfigured() {
   if (process.env.NODE_ENV === "production" && !process.env.FRONTMIND_DASHBOARD_ASSET_DIR?.trim()) {
@@ -29210,7 +31924,7 @@ function assertDashboardAssetStorageConfigured() {
 async function removeStoredKnowledgeAssets(keys) {
   await Promise.all(
     keys.map(
-      (key) => unlink2(path8.join(storageRoot2, key)).catch(() => void 0)
+      (key) => unlink3(path9.join(storageRoot2, key)).catch(() => void 0)
     )
   );
 }
@@ -29423,7 +32137,7 @@ function hasSupportedImageSignature(extension, bytes) {
   return false;
 }
 function validateProgressReportScreenshot(input) {
-  const extension = path8.extname(input.filename).toLowerCase();
+  const extension = path9.extname(input.filename).toLowerCase();
   const mimeType = imageMimeByExtension[extension];
   if (!mimeType || ![".png", ".jpg", ".jpeg", ".webp"].includes(extension)) {
     throw new Error("\u7B54\u6848\u622A\u56FE\u4EC5\u652F\u6301 PNG\u3001JPG \u6216 WEBP");
@@ -29434,13 +32148,13 @@ function validateProgressReportScreenshot(input) {
   return { extension, mimeType };
 }
 function titleFromPath(filePath) {
-  return path8.basename(filePath, path8.extname(filePath)).replace(/^\d+[._-]*/, "").replace(/[-_]+/g, " ").trim() || "\u77E5\u8BC6\u6587\u6863";
+  return path9.basename(filePath, path9.extname(filePath)).replace(/^\d+[._-]*/, "").replace(/[-_]+/g, " ").trim() || "\u77E5\u8BC6\u6587\u6863";
 }
 function htmlToMarkdownLikeText(html) {
   return html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi, "# $1\n").replace(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi, "## $1\n").replace(/<h3\b[^>]*>([\s\S]*?)<\/h3>/gi, "### $1\n").replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "- $1\n").replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n\n").replace(/<[^>]+>/g, "").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/\n{3,}/g, "\n\n").trim();
 }
 function normalizeTextDocument(filePath, content) {
-  const extension = path8.extname(filePath).toLowerCase();
+  const extension = path9.extname(filePath).toLowerCase();
   if (extension === ".html" || extension === ".htm") {
     return htmlToMarkdownLikeText(content);
   }
@@ -29789,7 +32503,7 @@ function validateProfilePackage(input) {
     manifest.documents.map((document) => packageRelativePath(document.path))
   );
   for (const relativePath of input.rawTextByRelativePath.keys()) {
-    if (path8.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
+    if (path9.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
       throw new KnowledgeArchiveValidationError(
         "structure",
         `package manifest \u672A\u767B\u8BB0\u6587\u672C\u6587\u4EF6\uFF1A${relativePath}`
@@ -30827,8 +33541,8 @@ function dashboardFromCsv(text2, displayName) {
   });
   return dashboardPayloadSchema.parse(payload);
 }
-var dashboardImportModuleSchema = z18.union([
-  z18.literal("full"),
+var dashboardImportModuleSchema = z20.union([
+  z20.literal("full"),
   dashboardAdminImportModuleSchema
 ]);
 function dashboardImportModule(value) {
@@ -30976,48 +33690,48 @@ function dashboardPayloadFromModuleJson(input) {
   const value = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const incoming = { ...input.existing };
   if (input.module === "profile") {
-    const profile = z18.object({
-      brandName: z18.string().trim().min(1).max(160),
-      headline: z18.string().trim().min(1).max(300),
-      summary: z18.string().trim().max(4e3).default("")
+    const profile = z20.object({
+      brandName: z20.string().trim().min(1).max(160),
+      headline: z20.string().trim().min(1).max(300),
+      summary: z20.string().trim().max(4e3).default("")
     }).parse(value.profile ?? raw);
     return dashboardPayloadSchema.parse({ ...incoming, ...profile });
   }
   if (input.module === "metrics") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      metrics: z18.array(dashboardMetricSchema).max(24).parse(value.metrics ?? raw)
+      metrics: z20.array(dashboardMetricSchema).max(24).parse(value.metrics ?? raw)
     });
   }
   if (input.module === "sections") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      sections: z18.array(dashboardSectionSchema).max(40).parse(value.sections ?? raw)
+      sections: z20.array(dashboardSectionSchema).max(40).parse(value.sections ?? raw)
     });
   }
   if (input.module === "keywords") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      keywordTables: z18.array(dashboardTableSchema).max(20).parse(value.keywordTables ?? value.tables ?? raw)
+      keywordTables: z20.array(dashboardTableSchema).max(20).parse(value.keywordTables ?? value.tables ?? raw)
     });
   }
   if (input.module === "questions") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      questions: z18.array(dashboardQuestionSchema).max(500).parse(value.questions ?? raw)
+      questions: z20.array(dashboardQuestionSchema).max(500).parse(value.questions ?? raw)
     });
   }
   if (input.module === "monitoring") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      monitoringAnswers: z18.array(dashboardMonitoringAnswerSchema).max(1e5).parse(value.monitoringAnswers ?? []),
-      citations: z18.array(dashboardCitationRecordSchema).max(1e5).parse(value.citations ?? [])
+      monitoringAnswers: z20.array(dashboardMonitoringAnswerSchema).max(1e5).parse(value.monitoringAnswers ?? []),
+      citations: z20.array(dashboardCitationRecordSchema).max(1e5).parse(value.citations ?? [])
     });
   }
   if (input.module === "content-assets") {
     return dashboardPayloadSchema.parse({
       ...incoming,
-      contentAssets: z18.array(dashboardContentAssetSchema).max(200).parse(value.contentAssets ?? raw)
+      contentAssets: z20.array(dashboardContentAssetSchema).max(200).parse(value.contentAssets ?? raw)
     });
   }
   const template = parseOptimizationReportTemplate({
@@ -32094,7 +34808,7 @@ function responseLogicImportsFromTabularSources(input) {
   return records;
 }
 async function responseLogicImportsFromFile(input) {
-  const extension = path8.extname(input.sourceFileName).toLowerCase();
+  const extension = path9.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
     const raw = JSON.parse(input.buffer.toString("utf8"));
     const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -32122,7 +34836,7 @@ async function responseLogicImportsFromFile(input) {
   }
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path8.basename(input.sourceFileName, extension),
+      title: path9.basename(input.sourceFileName, extension),
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
       )
@@ -32134,12 +34848,12 @@ async function responseLogicImportsFromFile(input) {
   });
 }
 async function tabularTablesFromFile(input) {
-  const extension = path8.extname(input.sourceFileName).toLowerCase();
+  const extension = path9.extname(input.sourceFileName).toLowerCase();
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path8.basename(
+      title: path9.basename(
         input.sourceFileName,
-        path8.extname(input.sourceFileName)
+        path9.extname(input.sourceFileName)
       ) || "\u6570\u636E\u8868\u683C",
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
@@ -32151,7 +34865,7 @@ async function tabularTablesFromFile(input) {
   ).filter((table) => Boolean(table));
 }
 async function dashboardPayloadFromFile(input) {
-  const extension = path8.extname(input.sourceFileName).toLowerCase();
+  const extension = path9.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
     return dashboardPayloadFromModuleJson({
       text: input.buffer.toString("utf8"),
@@ -32162,7 +34876,7 @@ async function dashboardPayloadFromFile(input) {
   }
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path8.basename(input.sourceFileName, extension),
+      title: path9.basename(input.sourceFileName, extension),
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
       )
@@ -32486,7 +35200,7 @@ function dashboardImportTransactionHooks(input) {
 }
 async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options = {}) {
   const validationProfile = options.validationProfile ?? "historical";
-  const extension = path8.extname(sourceFileName).toLowerCase();
+  const extension = path9.extname(sourceFileName).toLowerCase();
   if (extension !== ".zip") {
     if (validationProfile !== "historical") {
       throw new KnowledgeArchiveValidationError(
@@ -32561,7 +35275,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       }
       normalizedPaths.add(normalizedKey2);
       packagePaths.push(archivePath);
-      const fileExtension = path8.extname(archivePath).toLowerCase();
+      const fileExtension = path9.extname(archivePath).toLowerCase();
       if (validationProfile !== "historical" && [".bmp", ".heic", ".heif", ".ico", ".svg", ".tif", ".tiff"].includes(
         fileExtension
       )) {
@@ -32616,8 +35330,8 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
         if (!imageIsValid) {
           throw new Error(`\u77E5\u8BC6\u5E93\u56FE\u7247\u683C\u5F0F\u4E0E\u5185\u5BB9\u4E0D\u5339\u914D\uFF1A${archivePath}`);
         }
-        const key = `${randomUUID20()}${fileExtension}`;
-        await writeFile2(path8.join(storageRoot2, key), bytes, { flag: "wx" });
+        const key = `${randomUUID22()}${fileExtension}`;
+        await writeFile2(path9.join(storageRoot2, key), bytes, { flag: "wx" });
         storedAssetKeys.push(key);
         assets.push({
           key,
@@ -32689,8 +35403,8 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       let content = document.content;
       validated.assets.forEach((asset, index2) => {
         const url = asset.id ? `/api/dashboard/knowledge/assets/${snapshotId}/by-id/${encodeURIComponent(asset.id)}` : `/api/dashboard/knowledge/assets/${snapshotId}/${index2}`;
-        const relativePath = path8.posix.relative(
-          path8.posix.dirname(document.path),
+        const relativePath = path9.posix.relative(
+          path9.posix.dirname(document.path),
           asset.path
         );
         const candidates = [
@@ -32698,7 +35412,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
           encodeURI(asset.path),
           relativePath,
           encodeURI(relativePath),
-          path8.basename(asset.path)
+          path9.basename(asset.path)
         ];
         for (const candidate of candidates) {
           content = content.replaceAll(`(${candidate})`, `(${url})`);
@@ -32722,7 +35436,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
   } catch (error) {
     await Promise.all(
       storedAssetKeys.map(
-        (key) => unlink2(path8.join(storageRoot2, key)).catch(() => void 0)
+        (key) => unlink3(path9.join(storageRoot2, key)).catch(() => void 0)
       )
     );
     if (validationProfile !== "historical" && !(error instanceof KnowledgeArchiveValidationError)) {
@@ -32744,7 +35458,7 @@ function assertKnowledgeArchiveEnterpriseIdentity(input) {
     throw new Error("\u8BF7\u5148\u7531\u7BA1\u7406\u5458\u914D\u7F6E\u5F53\u524D\u8D26\u53F7\u7684\u4F01\u4E1A\u540D\u79F0");
   }
   const identityDocuments = input.documents.filter((document) => {
-    const basename = path8.posix.basename(document.path).toLowerCase();
+    const basename = path9.posix.basename(document.path).toLowerCase();
     return basename === "readme.md" || basename === "00_knowledge_tree.md" || basename === "00_source_index.md";
   });
   const candidates = identityDocuments.length > 0 ? identityDocuments : input.documents;
@@ -32867,7 +35581,7 @@ async function downloadArchiveBytes(input) {
     throw new Error("\u77E5\u8BC6\u5E93 ZIP \u8D85\u8FC7 250 MB");
   }
   if (!filename.toLowerCase().endsWith(".zip")) {
-    filename = `${path8.basename(filename, path8.extname(filename)) || "knowledge-base"}.zip`;
+    filename = `${path9.basename(filename, path9.extname(filename)) || "knowledge-base"}.zip`;
   }
   return { buffer, filename };
 }
@@ -32927,13 +35641,14 @@ router5.put(
     const actor = req.frontmindUser;
     const targetUserId = Number(req.params.userId);
     try {
-      if (actor.role !== "admin") {
-        throw new Error("\u53EA\u6709\u7BA1\u7406\u5458\u53EF\u4EE5\u4E0A\u4F20\u8FDB\u5EA6\u62A5\u544A\u622A\u56FE");
-      }
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
         throw new Error("\u7528\u6237 ID \u65E0\u6548");
       }
-      await assertWorkspaceAccess(actor, targetUserId);
+      await assertRoleScopedWorkspaceExecution({
+        req,
+        targetUserId,
+        expectedRoleType: "monitoring_optimization_engineer"
+      });
       const bytes = bodyBuffer(req);
       if (bytes.length === 0) throw new Error("\u7B54\u6848\u622A\u56FE\u6587\u4EF6\u4E3A\u7A7A");
       const filename = decodeHeader(
@@ -32944,14 +35659,14 @@ router5.put(
         filename,
         bytes
       });
-      const assetName = `${randomUUID20()}${extension}`;
-      const relativeKey = path8.join(
+      const assetName = `${randomUUID22()}${extension}`;
+      const relativeKey = path9.join(
         "progress-report-screenshots",
         String(targetUserId),
         assetName
       );
-      const absolutePath = path8.join(storageRoot2, relativeKey);
-      await mkdir2(path8.dirname(absolutePath), { recursive: true });
+      const absolutePath = path9.join(storageRoot2, relativeKey);
+      await mkdir2(path9.dirname(absolutePath), { recursive: true });
       await writeFile2(absolutePath, bytes, { flag: "wx" });
       const url = `/api/dashboard/report-assets/${targetUserId}/${assetName}`;
       await writeWorkspaceAuditEvent({
@@ -32993,11 +35708,11 @@ router5.get(
         throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       }
       await assertWorkspaceAccess(req.frontmindUser, targetUserId);
-      const extension = path8.extname(assetName).toLowerCase();
+      const extension = path9.extname(assetName).toLowerCase();
       const mimeType = imageMimeByExtension[extension];
       if (!mimeType) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       const bytes = await readFile2(
-        path8.join(
+        path9.join(
           storageRoot2,
           "progress-report-screenshots",
           String(targetUserId),
@@ -33032,8 +35747,14 @@ router5.post("/knowledge/publish", async (req, res) => {
   }
   let storedAssetKeys = [];
   try {
-    await assertWorkspaceAccess(actor, targetUserId);
+    await assertRoleScopedWorkspaceExecution({
+      req,
+      targetUserId,
+      expectedRoleType: "knowledge_base_engineer",
+      allowCustomerSelf: true
+    });
     await assertServiceCapability(targetUserId, "knowledgeBuild");
+    await assertKnowledgeBaseWritable(targetUserId);
     const build = await assertKnowledgeBasePublishable({
       userId: targetUserId,
       conversationId
@@ -33098,7 +35819,7 @@ router5.post("/knowledge/publish", async (req, res) => {
       baseUrl
     });
     const archiveHash = createHash14("sha256").update(downloaded.buffer).digest("hex");
-    const snapshotId = randomUUID20();
+    const snapshotId = randomUUID22();
     const parsed = await readKnowledgeArchive(
       downloaded.buffer,
       downloaded.filename,
@@ -33130,11 +35851,15 @@ router5.post("/knowledge/publish", async (req, res) => {
       assets: parsed.assets,
       totalBytes: downloaded.buffer.length
     });
+    await createKnowledgeMonitoringHandoff({
+      userId: targetUserId,
+      actorUserId: actor.id
+    });
     res.json({ kind: "knowledge", snapshot });
   } catch (error) {
     await Promise.all(
       storedAssetKeys.map(
-        (key) => unlink2(path8.join(storageRoot2, key)).catch(() => void 0)
+        (key) => unlink3(path9.join(storageRoot2, key)).catch(() => void 0)
       )
     );
     const publishedBuild = await assertKnowledgeBasePublishable({
@@ -33171,7 +35896,10 @@ router5.put(
       return;
     }
     try {
-      await assertWorkspaceAccess(actor, targetUserId);
+      assertNotDeliveryAdministratorExecution(actor);
+      if (actor.role !== "delivery_member") {
+        await assertWorkspaceAccess(actor, targetUserId);
+      }
       const buffer = bodyBuffer(req);
       if (buffer.length === 0) throw new Error("\u4E0A\u4F20\u6587\u4EF6\u4E3A\u7A7A");
       const sourceFileName = decodeHeader(
@@ -33184,19 +35912,29 @@ router5.put(
       const expectedRevision = dashboardRevisionHeader(
         req.header("x-dashboard-revision")
       );
-      const extension = path8.extname(sourceFileName).toLowerCase();
+      const extension = path9.extname(sourceFileName).toLowerCase();
       const mode = req.header("x-import-mode") || "auto";
-      const mayEditDashboard = actor.role === "admin";
       if (mode === "dashboard" || mode === "auto" && [".csv", ".json", ".xlsx"].includes(extension)) {
-        if (!mayEditDashboard) throw new Error("\u7528\u6237\u8D26\u53F7\u4E0D\u80FD\u76F4\u63A5\u53D1\u5E03\u770B\u677F\u6570\u636E");
+        const importModule = dashboardImportModule(
+          req.header("x-dashboard-module")
+        );
+        if (actor.role === "delivery_member") {
+          if (importModule === "full") {
+            throw new Error("\u4EA4\u4ED8\u6210\u5458\u4E0D\u80FD\u6267\u884C\u6574\u5408\u770B\u677F\u5BFC\u5165");
+          }
+          await assertDeliveryModuleImport({
+            req,
+            targetUserId,
+            importModule
+          });
+        } else if (actor.role !== "admin") {
+          throw new Error("\u7528\u6237\u8D26\u53F7\u4E0D\u80FD\u76F4\u63A5\u53D1\u5E03\u770B\u677F\u6570\u636E");
+        }
         const existing = await getDashboardWorkspace(targetUserId);
         assertDashboardImportRevision({
           expectedRevision,
           currentRevision: existing.revision
         });
-        const importModule = dashboardImportModule(
-          req.header("x-dashboard-module")
-        );
         assertDashboardImportModuleEnabled(importModule);
         const sectionIdHeader = importModule === "section-table" ? String(req.header("x-dashboard-section-id") || "").trim() : void 0;
         const targetBatchKeyHeader = importModule === "monitoring" ? String(
@@ -33290,7 +36028,7 @@ router5.put(
               value
             })),
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq25(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq27(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -33385,7 +36123,7 @@ router5.put(
               rationale: question.rationale
             })),
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq25(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq27(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -33472,7 +36210,7 @@ router5.put(
             userId: targetUserId,
             batches: template.batches,
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq25(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq27(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -33733,7 +36471,7 @@ router5.put(
           }
           const transactionHooks = {
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq25(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq27(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -33878,6 +36616,12 @@ router5.put(
           "\u7528\u6237\u77E5\u8BC6\u5E93\u53EA\u80FD\u901A\u8FC7\u201C\u66F4\u65B0\u77E5\u8BC6\u5E93\u201D\u53D1\u5E03\u5DF2\u7ED1\u5B9A\u4EFB\u52A1\u7684\u6700\u7EC8\u7248\u672C"
         );
       }
+      await assertRoleScopedWorkspaceExecution({
+        req,
+        targetUserId,
+        expectedRoleType: "knowledge_base_engineer"
+      });
+      await assertKnowledgeBaseWritable(targetUserId);
       await assertServiceCapability(targetUserId, "knowledgeDisplay");
       const maintenanceTicketId = req.header("x-maintenance-ticket-id")?.trim() || void 0;
       const existingSnapshot = await getLatestKnowledgeSnapshot(targetUserId);
@@ -33894,7 +36638,7 @@ router5.put(
         });
       }
       let sourceBuildId;
-      const snapshotId = randomUUID20();
+      const snapshotId = randomUUID22();
       const parsed = await readKnowledgeArchive(
         buffer,
         sourceFileName,
@@ -33925,6 +36669,10 @@ router5.put(
           assets: parsed.assets,
           totalBytes: buffer.length
         });
+        await createKnowledgeMonitoringHandoff({
+          userId: targetUserId,
+          actorUserId: actor.id
+        });
         await writeWorkspaceAuditEvent({
           actor,
           action: "workspace.knowledge.published",
@@ -33945,7 +36693,7 @@ router5.put(
       } catch (error) {
         await Promise.all(
           parsed.storedAssetKeys.map(
-            (key) => unlink2(path8.join(storageRoot2, key)).catch(() => void 0)
+            (key) => unlink3(path9.join(storageRoot2, key)).catch(() => void 0)
           )
         );
         throw error;
@@ -33974,14 +36722,14 @@ router5.get(
   "/knowledge/assets/:snapshotId/by-id/:assetId",
   async (req, res) => {
     try {
-      const assetId = z18.string().trim().min(1).max(191).parse(req.params.assetId);
+      const assetId = z20.string().trim().min(1).max(191).parse(req.params.assetId);
       const result = await getKnowledgeAssetById({
         snapshotId: req.params.snapshotId,
         assetId
       });
       if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
-      const bytes = await readFile2(path8.join(storageRoot2, result.asset.key));
+      const bytes = await readFile2(path9.join(storageRoot2, result.asset.key));
       res.setHeader("Content-Type", result.asset.mimeType);
       res.setHeader("Cache-Control", "private, max-age=3600");
       res.setHeader("Content-Disposition", "inline");
@@ -34004,7 +36752,7 @@ router5.get(
       });
       if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
-      const bytes = await readFile2(path8.join(storageRoot2, result.asset.key));
+      const bytes = await readFile2(path9.join(storageRoot2, result.asset.key));
       res.setHeader("Content-Type", result.asset.mimeType);
       res.setHeader("Cache-Control", "private, max-age=3600");
       res.setHeader("Content-Disposition", "inline");
@@ -34020,70 +36768,70 @@ var dashboard_api_default = router5;
 import { createHash as createHash15 } from "node:crypto";
 import axios8 from "axios";
 import { Router as Router4 } from "express";
-import { z as z21 } from "zod";
+import { z as z23 } from "zod";
 
 // shared/brand-question-portfolio.ts
-import { z as z19 } from "zod";
-var brandQuestionCategorySchema = z19.enum([
+import { z as z21 } from "zod";
+var brandQuestionCategorySchema = z21.enum([
   "industry",
   "competitor_comparison",
   "reputation",
   "product_scenario"
 ]);
-var evidenceSchema = z19.object({
-  documentPath: z19.string().trim().min(1).max(1024),
-  excerpt: z19.string().trim().min(1).max(500),
-  relevance: z19.string().trim().min(1).max(1e3)
+var evidenceSchema = z21.object({
+  documentPath: z21.string().trim().min(1).max(1024),
+  excerpt: z21.string().trim().min(1).max(500),
+  relevance: z21.string().trim().min(1).max(1e3)
 }).strict();
-var brandQuestionCandidateSchema = z19.object({
-  candidateId: z19.string().trim().min(1).max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
-  question: z19.string().trim().min(4).max(500),
-  intent: z19.string().trim().min(1).max(1e3),
-  rationale: z19.string().trim().min(1).max(2e3),
-  evidence: z19.array(evidenceSchema).min(1).max(8),
-  risks: z19.array(z19.string().trim().min(1).max(500)).max(12)
+var brandQuestionCandidateSchema = z21.object({
+  candidateId: z21.string().trim().min(1).max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  question: z21.string().trim().min(4).max(500),
+  intent: z21.string().trim().min(1).max(1e3),
+  rationale: z21.string().trim().min(1).max(2e3),
+  evidence: z21.array(evidenceSchema).min(1).max(8),
+  risks: z21.array(z21.string().trim().min(1).max(500)).max(12)
 }).strict();
-var categoryCandidatesSchema = z19.array(brandQuestionCandidateSchema).max(200);
-var candidateTargetsSchema = z19.object({
-  industry: z19.number().int().nonnegative().max(200),
-  competitor_comparison: z19.number().int().nonnegative().max(200),
-  reputation: z19.number().int().nonnegative().max(200),
-  product_scenario: z19.number().int().nonnegative().max(200)
+var categoryCandidatesSchema = z21.array(brandQuestionCandidateSchema).max(200);
+var candidateTargetsSchema = z21.object({
+  industry: z21.number().int().nonnegative().max(200),
+  competitor_comparison: z21.number().int().nonnegative().max(200),
+  reputation: z21.number().int().nonnegative().max(200),
+  product_scenario: z21.number().int().nonnegative().max(200)
 }).strict();
-var brandQuestionPortfolioSchema = z19.object({
-  schemaVersion: z19.literal(1),
-  skill: z19.object({
-    name: z19.literal("brand-question-portfolio"),
-    version: z19.literal("2"),
-    model: z19.literal("frontmind-pro")
+var brandQuestionPortfolioSchema = z21.object({
+  schemaVersion: z21.literal(1),
+  skill: z21.object({
+    name: z21.literal("brand-question-portfolio"),
+    version: z21.literal("2"),
+    model: z21.literal("frontmind-pro")
   }).strict(),
-  knowledgeSnapshot: z19.object({
-    id: z19.string().trim().min(1).max(64),
-    version: z19.number().int().positive(),
-    archiveHash: z19.string().trim().regex(/^[a-f0-9]{64}$/i)
+  knowledgeSnapshot: z21.object({
+    id: z21.string().trim().min(1).max(64),
+    version: z21.number().int().positive(),
+    archiveHash: z21.string().trim().regex(/^[a-f0-9]{64}$/i)
   }).strict(),
-  enterprise: z19.object({
-    identityHash: z19.string().trim().regex(/^[a-f0-9]{64}$/i),
-    canonicalName: z19.string().trim().min(1).max(200)
+  enterprise: z21.object({
+    identityHash: z21.string().trim().regex(/^[a-f0-9]{64}$/i),
+    canonicalName: z21.string().trim().min(1).max(200)
   }).strict(),
-  planCode: z19.enum(["advanced", "luxury"]),
-  quotaPeriodId: z19.string().trim().min(1).max(64),
+  planCode: z21.enum(["advanced", "luxury"]),
+  quotaPeriodId: z21.string().trim().min(1).max(64),
   candidateTargets: candidateTargetsSchema,
-  categories: z19.object({
+  categories: z21.object({
     industry: categoryCandidatesSchema,
     competitor_comparison: categoryCandidatesSchema,
     reputation: categoryCandidatesSchema,
     product_scenario: categoryCandidatesSchema
   }).strict(),
-  shortfalls: z19.array(
-    z19.object({
+  shortfalls: z21.array(
+    z21.object({
       category: brandQuestionCategorySchema,
-      target: z19.number().int().positive().max(200),
-      generated: z19.number().int().nonnegative().max(200),
-      reason: z19.string().trim().min(1).max(500)
+      target: z21.number().int().positive().max(200),
+      generated: z21.number().int().nonnegative().max(200),
+      reason: z21.string().trim().min(1).max(500)
     }).strict()
   ).max(4),
-  risks: z19.array(z19.string().trim().min(1).max(500)).max(30)
+  risks: z21.array(z21.string().trim().min(1).max(500)).max(30)
 }).strict().superRefine((value, context) => {
   const seen = /* @__PURE__ */ new Set();
   for (const [category, candidates] of Object.entries(value.categories)) {
@@ -34175,7 +36923,7 @@ function assertBrandQuestionPortfolioContext(portfolio, expected) {
 }
 
 // server/brand-question-portfolio-runtime.ts
-import path9 from "node:path";
+import path10 from "node:path";
 function candidateTargets(context) {
   return {
     industry: context.quota.industry * 3,
@@ -34185,29 +36933,29 @@ function candidateTargets(context) {
   };
 }
 var configuredBrandQuestionSkillPath = process.env.FRONTMIND_BRAND_QUESTION_SKILL_PATH?.trim();
-if (configuredBrandQuestionSkillPath && !path9.isAbsolute(configuredBrandQuestionSkillPath)) {
+if (configuredBrandQuestionSkillPath && !path10.isAbsolute(configuredBrandQuestionSkillPath)) {
   throw new Error(
     "FRONTMIND_BRAND_QUESTION_SKILL_PATH must be an absolute path"
   );
 }
 var skillDirectoryCandidates2 = configuredBrandQuestionSkillPath ? [configuredBrandQuestionSkillPath] : [
-  path9.resolve(
+  path10.resolve(
     import.meta.dirname,
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path9.resolve(
+  path10.resolve(
     process.cwd(),
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path9.resolve(
+  path10.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path9.resolve(
+  path10.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -34416,16 +37164,16 @@ function parseBrandQuestionPortfolioOutput(output, context) {
 
 // server/brand-question-task-context.ts
 import { createHmac as createHmac5, timingSafeEqual as timingSafeEqual6 } from "node:crypto";
-import { z as z20 } from "zod";
-var brandQuestionTaskContextSchema = z20.object({
-  v: z20.literal(1),
-  userId: z20.number().int().positive(),
-  taskId: z20.string().trim().min(1).max(255),
-  snapshotId: z20.string().trim().min(1).max(191),
-  snapshotHash: z20.string().trim().min(1).max(191),
-  quotaPeriodId: z20.string().trim().min(1).max(191),
+import { z as z22 } from "zod";
+var brandQuestionTaskContextSchema = z22.object({
+  v: z22.literal(1),
+  userId: z22.number().int().positive(),
+  taskId: z22.string().trim().min(1).max(255),
+  snapshotId: z22.string().trim().min(1).max(191),
+  snapshotHash: z22.string().trim().min(1).max(191),
+  quotaPeriodId: z22.string().trim().min(1).max(191),
   planCode: servicePlanCodeSchema,
-  exp: z20.number().int().positive()
+  exp: z22.number().int().positive()
 }).strict();
 var BrandQuestionTaskContextError = class extends Error {
   constructor(code, message) {
@@ -34774,9 +37522,9 @@ router6.post("/sync", async (req, res) => {
       });
       return;
     }
-    const { taskId, contextToken } = z21.object({
-      taskId: z21.string().trim().min(1).max(255),
-      contextToken: z21.string().trim().min(1).max(4096)
+    const { taskId, contextToken } = z23.object({
+      taskId: z23.string().trim().min(1).max(255),
+      contextToken: z23.string().trim().min(1).max(4096)
     }).strict().parse(req.body || {});
     requestValidated = true;
     const { context } = await currentContext(user.id);
@@ -34895,7 +37643,7 @@ router6.post("/sync", async (req, res) => {
       risks: portfolio.risks
     });
   } catch (error) {
-    if (error instanceof z21.ZodError) {
+    if (error instanceof z23.ZodError) {
       res.status(requestValidated ? 422 : 400).json({
         error: {
           code: requestValidated ? "BRAND_QUESTION_TASK_OUTPUT_INVALID" : "INVALID_BRAND_QUESTION_SYNC",
@@ -34918,7 +37666,7 @@ router6.post("/sync", async (req, res) => {
 var brand_question_portfolio_api_default = router6;
 
 // server/prepared-file-router.ts
-import { randomUUID as randomUUID21 } from "node:crypto";
+import { randomUUID as randomUUID23 } from "node:crypto";
 import { createReadStream as createReadStream2 } from "node:fs";
 import fs6 from "node:fs/promises";
 import { Router as Router5 } from "express";
@@ -35114,7 +37862,7 @@ router7.post("/:assetId/download-token", async (req, res) => {
       });
       return;
     }
-    const token = randomUUID21();
+    const token = randomUUID23();
     const expiresAt = Date.now() + DOWNLOAD_TOKEN_TTL_MS;
     downloadTokens.set(token, {
       assetId: manifest.id,
@@ -35290,14 +38038,14 @@ import {
   json as json3
 } from "express";
 import axios10 from "axios";
-import { z as z23 } from "zod";
+import { z as z25 } from "zod";
 
 // server/presales-monitor.ts
-import { createHash as createHash16, randomUUID as randomUUID22 } from "node:crypto";
+import { createHash as createHash16, randomUUID as randomUUID24 } from "node:crypto";
 import axios9 from "axios";
-import { and as and22, eq as eq26, isNull as isNull6 } from "drizzle-orm";
+import { and as and25, eq as eq28, isNull as isNull7 } from "drizzle-orm";
 import { json as json2, Router as Router6 } from "express";
-import { z as z22 } from "zod";
+import { z as z24 } from "zod";
 var MONITOR_PLATFORMS = [
   "doubao",
   "yuanbao",
@@ -35352,12 +38100,12 @@ var POLLABLE_LOCAL_STATUSES = /* @__PURE__ */ new Set([
   "submitted",
   "polling"
 ]);
-var monitorCreateSchema = z22.object({
-  question: z22.string().trim().min(1).max(2e3),
-  platforms: z22.array(z22.enum(MONITOR_PLATFORMS)).min(1).max(MONITOR_PLATFORMS.length).refine((items) => new Set(items).size === items.length, {
+var monitorCreateSchema = z24.object({
+  question: z24.string().trim().min(1).max(2e3),
+  platforms: z24.array(z24.enum(MONITOR_PLATFORMS)).min(1).max(MONITOR_PLATFORMS.length).refine((items) => new Set(items).size === items.length, {
     message: "platforms must not contain duplicates"
   }),
-  idempotencyKey: z22.string().trim().min(16).max(512)
+  idempotencyKey: z24.string().trim().min(16).max(512)
 }).strict();
 var PresalesMonitorError = class extends Error {
   constructor(code, status, message, retryAfterMs) {
@@ -36286,7 +39034,7 @@ function statusData(payload, run) {
   }
   return { totalItems, completedItems, failedItems, remoteStatus };
 }
-async function requireDb14() {
+async function requireDb16() {
   const db = await getDb();
   if (!db) {
     throw new PresalesMonitorError(
@@ -36299,9 +39047,9 @@ async function requireDb14() {
 }
 var DrizzleMonitorRepository = class {
   async reserve(input) {
-    const db = await requireDb14();
+    const db = await requireDb16();
     const run = {
-      id: randomUUID22(),
+      id: randomUUID24(),
       idempotencyKeyHash: input.idempotencyKeyHash,
       requestHash: input.requestHash,
       apiCredentialId: input.credential.id,
@@ -36327,7 +39075,7 @@ var DrizzleMonitorRepository = class {
       if (mysqlError.code !== "ER_DUP_ENTRY") throw error;
     }
     const existing = await db.select().from(presalesMonitorRuns).where(
-      eq26(presalesMonitorRuns.idempotencyKeyHash, input.idempotencyKeyHash)
+      eq28(presalesMonitorRuns.idempotencyKeyHash, input.idempotencyKeyHash)
     ).limit(1);
     const row = existing[0];
     if (!row) {
@@ -36355,11 +39103,11 @@ var DrizzleMonitorRepository = class {
     return { state: "replay", run: row };
   }
   async get(runId) {
-    const db = await requireDb14();
+    const db = await requireDb16();
     const rows = await db.select().from(presalesMonitorRuns).where(
-      and22(
-        eq26(presalesMonitorRuns.id, runId),
-        isNull6(presalesMonitorRuns.deletedAt)
+      and25(
+        eq28(presalesMonitorRuns.id, runId),
+        isNull7(presalesMonitorRuns.deletedAt)
       )
     ).limit(1);
     return rows[0] ?? null;
@@ -36385,19 +39133,19 @@ var DrizzleMonitorRepository = class {
     });
   }
   async acquirePoll(runId, now) {
-    const db = await requireDb14();
+    const db = await requireDb16();
     return db.transaction(async (tx) => {
       const rows = await tx.select().from(presalesMonitorRuns).where(
-        and22(
-          eq26(presalesMonitorRuns.id, runId),
-          isNull6(presalesMonitorRuns.deletedAt)
+        and25(
+          eq28(presalesMonitorRuns.id, runId),
+          isNull7(presalesMonitorRuns.deletedAt)
         )
       ).limit(1).for("update");
       const run = rows[0];
       if (!run || !POLLABLE_LOCAL_STATUSES.has(run.status) || !run.upstreamTaskId || run.nextPollAt && run.nextPollAt.getTime() > now.getTime() || run.pollLeaseId && run.pollLeaseExpiresAt && run.pollLeaseExpiresAt.getTime() > now.getTime()) {
         return null;
       }
-      const leaseId = randomUUID22();
+      const leaseId = randomUUID24();
       const nextPollAt = new Date(now.getTime() + MONITOR_POLL_INTERVAL_MS);
       const pollLeaseExpiresAt = new Date(
         now.getTime() + MONITOR_POLL_LEASE_MS
@@ -36409,7 +39157,7 @@ var DrizzleMonitorRepository = class {
         pollLeaseId: leaseId,
         pollLeaseExpiresAt,
         updatedAt: now
-      }).where(eq26(presalesMonitorRuns.id, runId));
+      }).where(eq28(presalesMonitorRuns.id, runId));
       return {
         leaseId,
         run: {
@@ -36425,17 +39173,17 @@ var DrizzleMonitorRepository = class {
     });
   }
   async finishPoll(runId, leaseId, patch) {
-    const db = await requireDb14();
+    const db = await requireDb16();
     await db.update(presalesMonitorRuns).set({
       ...patch,
       pollLeaseId: null,
       pollLeaseExpiresAt: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and22(
-        eq26(presalesMonitorRuns.id, runId),
-        eq26(presalesMonitorRuns.pollLeaseId, leaseId),
-        isNull6(presalesMonitorRuns.deletedAt)
+      and25(
+        eq28(presalesMonitorRuns.id, runId),
+        eq28(presalesMonitorRuns.pollLeaseId, leaseId),
+        isNull7(presalesMonitorRuns.deletedAt)
       )
     );
     const run = await this.get(runId);
@@ -36444,23 +39192,23 @@ var DrizzleMonitorRepository = class {
     return run;
   }
   async remove(runId) {
-    const db = await requireDb14();
+    const db = await requireDb16();
     await db.update(presalesMonitorRuns).set({
       deletedAt: /* @__PURE__ */ new Date(),
       pollLeaseId: null,
       pollLeaseExpiresAt: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and22(
-        eq26(presalesMonitorRuns.id, runId),
-        isNull6(presalesMonitorRuns.deletedAt)
+      and25(
+        eq28(presalesMonitorRuns.id, runId),
+        isNull7(presalesMonitorRuns.deletedAt)
       )
     );
     return true;
   }
   async updateAndRead(runId, patch) {
-    const db = await requireDb14();
-    await db.update(presalesMonitorRuns).set(patch).where(eq26(presalesMonitorRuns.id, runId));
+    const db = await requireDb16();
+    await db.update(presalesMonitorRuns).set(patch).where(eq28(presalesMonitorRuns.id, runId));
     const run = await this.get(runId);
     if (!run)
       throw new PresalesMonitorError("NOT_FOUND", 404, "\u76D1\u63A7\u4EFB\u52A1\u4E0D\u5B58\u5728");
@@ -36489,8 +39237,8 @@ function monitorBaseUrl(env = process.env) {
   }
   return parsed.toString().replace(/\/+$/, "");
 }
-function buildMonitorRequestUrl(path10, env = process.env) {
-  const normalizedPath = path10.replace(/^\/+/, "");
+function buildMonitorRequestUrl(path11, env = process.env) {
+  const normalizedPath = path11.replace(/^\/+/, "");
   if (!normalizedPath || /[?#\\]/.test(normalizedPath)) {
     throw new PresalesMonitorError(
       "MONITOR_NOT_CONFIGURED",
@@ -36501,12 +39249,12 @@ function buildMonitorRequestUrl(path10, env = process.env) {
   return new URL(normalizedPath, `${monitorBaseUrl(env)}/`).toString();
 }
 var AxiosMonitorTransport = class {
-  async request(method, path10, credential, payload) {
+  async request(method, path11, credential, payload) {
     let response2;
     try {
       response2 = await axios9.request({
         method,
-        url: buildMonitorRequestUrl(path10),
+        url: buildMonitorRequestUrl(path11),
         data: payload,
         headers: {
           Authorization: `Bearer ${credential.apiKey}`,
@@ -36785,7 +39533,7 @@ var PresalesMonitorService = class {
   }
 };
 function sendMonitorError(res, error) {
-  if (error instanceof z22.ZodError) {
+  if (error instanceof z24.ZodError) {
     res.status(400).json({
       error: {
         code: "INVALID_REQUEST",
@@ -36925,20 +39673,20 @@ var PUBLIC_PLACEHOLDER_MARKERS = [
   "same-random-token",
   "change-me"
 ];
-var fileCreateSchema = z23.object({
-  filename: z23.string().trim().min(1).max(512),
-  mimeType: z23.string().trim().max(255).optional(),
-  sizeBytes: z23.number().int().nonnegative().max(MAX_PROXY_UPLOAD_BYTES).optional()
+var fileCreateSchema = z25.object({
+  filename: z25.string().trim().min(1).max(512),
+  mimeType: z25.string().trim().max(255).optional(),
+  sizeBytes: z25.number().int().nonnegative().max(MAX_PROXY_UPLOAD_BYTES).optional()
 });
-var attachmentSchema3 = z23.object({
-  file_id: z23.string().trim().min(1).max(255),
-  filename: z23.string().trim().min(1).max(512)
+var attachmentSchema3 = z25.object({
+  file_id: z25.string().trim().min(1).max(255),
+  filename: z25.string().trim().min(1).max(512)
 });
-var taskCreateSchema = z23.object({
-  prompt: z23.string().trim().min(1).max(2e6),
-  attachments: z23.array(attachmentSchema3).max(20).optional().default([]),
-  idempotencyKey: z23.string().trim().min(16).max(512).optional(),
-  projectId: z23.string().trim().min(8).max(80).optional()
+var taskCreateSchema = z25.object({
+  prompt: z25.string().trim().min(1).max(2e6),
+  attachments: z25.array(attachmentSchema3).max(20).optional().default([]),
+  idempotencyKey: z25.string().trim().min(16).max(512).optional(),
+  projectId: z25.string().trim().min(8).max(80).optional()
 }).superRefine((value, context) => {
   if (value.projectId && !value.idempotencyKey) {
     context.addIssue({
@@ -37092,7 +39840,7 @@ function forwardedStatus(value, fallback = 502) {
   return Number.isInteger(status) && status >= 400 && status < 600 ? status : fallback;
 }
 function sendKnownError(res, error) {
-  if (error instanceof z23.ZodError) {
+  if (error instanceof z25.ZodError) {
     res.status(400).json({
       error: {
         code: "INVALID_REQUEST",
@@ -37745,57 +40493,57 @@ var presales_proxy_default = router8;
 // server/provisioning-router.ts
 import { createHash as createHash20, timingSafeEqual as timingSafeEqual8 } from "node:crypto";
 import express3 from "express";
-import { z as z28 } from "zod";
+import { z as z30 } from "zod";
 
 // server/provisioning-service.ts
-import { createHash as createHash18, createHmac as createHmac7, randomUUID as randomUUID23 } from "node:crypto";
-import { eq as eq27 } from "drizzle-orm";
-import { z as z24 } from "zod";
-var usernameSchema3 = z24.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
+import { createHash as createHash18, createHmac as createHmac7, randomUUID as randomUUID25 } from "node:crypto";
+import { eq as eq29 } from "drizzle-orm";
+import { z as z26 } from "zod";
+var usernameSchema4 = z26.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
   /^[a-zA-Z0-9._-]+$/,
   "Username may only contain letters, numbers, dots, underscores, and hyphens"
 );
-var timestampSchema = z24.string().datetime({ offset: true });
-var serviceCategorySchema3 = z24.enum([
+var timestampSchema = z26.string().datetime({ offset: true });
+var serviceCategorySchema3 = z26.enum([
   "product_scenario",
   "reputation",
   "competitor_comparison"
 ]);
-var idempotencyKeySchema = z24.string().trim().min(16, "Idempotency-Key must contain 16 to 512 characters").max(512, "Idempotency-Key must contain 16 to 512 characters");
-var websiteProvisionRequestSchema = z24.object({
-  schemaVersion: z24.literal(1),
-  project: z24.object({
-    id: z24.string().trim().min(8).max(80),
-    companyName: z24.string().trim().min(1).max(200)
+var idempotencyKeySchema = z26.string().trim().min(16, "Idempotency-Key must contain 16 to 512 characters").max(512, "Idempotency-Key must contain 16 to 512 characters");
+var websiteProvisionRequestSchema = z26.object({
+  schemaVersion: z26.literal(1),
+  project: z26.object({
+    id: z26.string().trim().min(8).max(80),
+    companyName: z26.string().trim().min(1).max(200)
   }).strict(),
-  order: z24.object({
-    id: z24.string().trim().min(8).max(64),
-    tradeNo: z24.string().trim().min(1).max(128),
-    status: z24.literal("paid"),
-    amountFen: z24.number().int().positive().max(1e7),
+  order: z26.object({
+    id: z26.string().trim().min(8).max(64),
+    tradeNo: z26.string().trim().min(1).max(128),
+    status: z26.literal("paid"),
+    amountFen: z26.number().int().positive().max(1e7),
     paidAt: timestampSchema,
     serviceCategory: serviceCategorySchema3,
-    questionId: z24.string().trim().min(4).max(80),
-    question: z24.string().trim().min(4).max(500)
+    questionId: z26.string().trim().min(4).max(80),
+    question: z26.string().trim().min(4).max(500)
   }).strict(),
-  contract: z24.object({
-    id: z24.string().trim().min(8).max(128),
-    status: z24.literal("signed"),
-    projectId: z24.string().trim().min(8).max(80),
-    orderId: z24.string().trim().min(8).max(64),
-    questionId: z24.string().trim().min(4).max(80),
-    templateVersion: z24.string().trim().min(1).max(64),
-    documentSha256: z24.string().trim().regex(/^[a-f0-9]{64}$/i, "Contract SHA-256 is invalid"),
+  contract: z26.object({
+    id: z26.string().trim().min(8).max(128),
+    status: z26.literal("signed"),
+    projectId: z26.string().trim().min(8).max(80),
+    orderId: z26.string().trim().min(8).max(64),
+    questionId: z26.string().trim().min(4).max(80),
+    templateVersion: z26.string().trim().min(1).max(64),
+    documentSha256: z26.string().trim().regex(/^[a-f0-9]{64}$/i, "Contract SHA-256 is invalid"),
     signedAt: timestampSchema,
-    signatoryId: z24.string().trim().min(1).max(128)
+    signatoryId: z26.string().trim().min(1).max(128)
   }).strict(),
-  account: z24.object({
-    username: usernameSchema3,
-    password: z24.string().min(
+  account: z26.object({
+    username: usernameSchema4,
+    password: z26.string().min(
       MIN_PASSWORD_LENGTH,
       `Password must contain at least ${MIN_PASSWORD_LENGTH} characters`
     ).max(MAX_PASSWORD_LENGTH, "Password is too long"),
-    displayName: z24.string().trim().min(1).max(128)
+    displayName: z26.string().trim().min(1).max(128)
   }).strict()
 }).strict().superRefine((value, context) => {
   if (value.contract.projectId !== value.project.id) {
@@ -37908,7 +40656,7 @@ async function provisionWebsiteUser(input, options = {}) {
   if (existing) return resolveReplay(existing, requestHash3);
   try {
     const stored = await repository.createAtomically({
-      id: randomUUID23(),
+      id: randomUUID25(),
       idempotencyKeyHash,
       requestHash: requestHash3,
       request,
@@ -38027,7 +40775,7 @@ var DrizzleWebsiteProvisioningRepository = class {
         status: "completed",
         completedAt,
         updatedAt: completedAt
-      }).where(eq27(websiteUserProvisions.id, input.id));
+      }).where(eq29(websiteUserProvisions.id, input.id));
       return {
         idempotencyKeyHash: input.idempotencyKeyHash,
         requestHash: input.requestHash,
@@ -38062,7 +40810,7 @@ async function requireProvisioningDb2() {
   return db;
 }
 async function readStoredProvision(executor, idempotencyKeyHash) {
-  const rows = await executor.select().from(websiteUserProvisions).where(eq27(websiteUserProvisions.idempotencyKeyHash, idempotencyKeyHash)).limit(1);
+  const rows = await executor.select().from(websiteUserProvisions).where(eq29(websiteUserProvisions.idempotencyKeyHash, idempotencyKeyHash)).limit(1);
   const provision = rows[0];
   if (!provision) return null;
   if (provision.status !== "completed" || !provision.userId || !provision.completedAt) {
@@ -38086,7 +40834,7 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
     displayName: users.displayName,
     role: users.role,
     isActive: users.isActive
-  }).from(users).where(eq27(users.id, provision.userId)).limit(1);
+  }).from(users).where(eq29(users.id, provision.userId)).limit(1);
   const user = userRows[0];
   if (!user || !user.username || user.role !== "user") {
     throw new ProvisioningError(
@@ -38118,30 +40866,52 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
 
 // server/knowledge-import-service.ts
 import axios11 from "axios";
-import { createHash as createHash19, randomUUID as randomUUID24 } from "node:crypto";
-import { and as and23, eq as eq28 } from "drizzle-orm";
-import { z as z25 } from "zod";
-var sha256Schema3 = z25.string().trim().regex(/^[a-f0-9]{64}$/i);
-var websiteKnowledgeImportBaseSchema = z25.object({
-  companyName: z25.string().trim().min(1).max(200),
-  taskId: z25.string().trim().min(1).max(255),
-  outputItemId: z25.string().trim().min(1).max(255),
-  fileId: z25.string().trim().min(1).max(255).optional(),
+import { createHash as createHash19, randomUUID as randomUUID26 } from "node:crypto";
+import { and as and26, eq as eq30 } from "drizzle-orm";
+import { z as z27 } from "zod";
+var sha256Schema3 = z27.string().trim().regex(/^[a-f0-9]{64}$/i);
+var websiteKnowledgeImportBaseSchema = z27.object({
+  companyName: z27.string().trim().min(1).max(200),
+  taskId: z27.string().trim().min(1).max(255),
+  outputItemId: z27.string().trim().min(1).max(255),
+  fileId: z27.string().trim().min(1).max(255).optional(),
   descriptorHash: sha256Schema3,
   artifactSha256: sha256Schema3,
-  filename: z25.string().trim().min(1).max(512)
+  filename: z27.string().trim().min(1).max(512)
 });
-var websiteKnowledgeImportSchema = z25.discriminatedUnion(
+var websiteKnowledgeImportCandidateSchema = z27.object({
+  taskId: z27.string().trim().min(1).max(255),
+  outputItemId: z27.string().trim().min(1).max(255),
+  fileId: z27.string().trim().min(1).max(255).optional(),
+  descriptorHash: sha256Schema3,
+  sha256: sha256Schema3
+}).strict();
+var websiteKnowledgeImportFinalArtifactSchema = z27.object({
+  fileId: z27.string().trim().min(1).max(255),
+  filename: z27.string().trim().min(1).max(512),
+  sha256: sha256Schema3,
+  archiveContractVersion: z27.literal(3),
+  validationProfile: z27.literal("website-lead-v1"),
+  packageManifestSha256: sha256Schema3,
+  finalizerVersion: z27.literal("website-kb-finalizer-v1")
+}).strict();
+var websiteKnowledgeImportSchema = z27.discriminatedUnion(
   "schemaVersion",
   [
     websiteKnowledgeImportBaseSchema.extend({
-      schemaVersion: z25.literal(2)
+      schemaVersion: z27.literal(2)
     }).strict(),
     websiteKnowledgeImportBaseSchema.extend({
-      schemaVersion: z25.literal(3),
-      archiveContractVersion: z25.union([z25.literal(1), z25.literal(2)]),
-      validationProfile: z25.literal("website-lead-v1"),
+      schemaVersion: z27.literal(3),
+      archiveContractVersion: z27.union([z27.literal(1), z27.literal(2)]),
+      validationProfile: z27.literal("website-lead-v1"),
       packageManifestSha256: sha256Schema3
+    }).strict(),
+    z27.object({
+      schemaVersion: z27.literal(4),
+      companyName: z27.string().trim().min(1).max(200),
+      candidate: websiteKnowledgeImportCandidateSchema,
+      finalArtifact: websiteKnowledgeImportFinalArtifactSchema
     }).strict()
   ]
 );
@@ -38156,6 +40926,33 @@ var KnowledgeImportError = class extends Error {
 };
 function normalizedEnterpriseName3(value) {
   return value.normalize("NFKC").trim().replace(/\s+/g, "").toLowerCase();
+}
+function knowledgeImportTaskId(value) {
+  return value.schemaVersion === 4 ? value.candidate.taskId : value.taskId;
+}
+function knowledgeImportOutputItemId(value) {
+  return value.schemaVersion === 4 ? value.candidate.outputItemId : value.outputItemId;
+}
+function knowledgeImportCandidateFileId(value) {
+  return value.schemaVersion === 4 ? value.candidate.fileId : value.fileId;
+}
+function knowledgeImportReceiptFileId(value) {
+  return value.schemaVersion === 4 ? value.finalArtifact.fileId : value.fileId;
+}
+function knowledgeImportDescriptorHash(value) {
+  return value.schemaVersion === 4 ? value.candidate.descriptorHash : value.descriptorHash;
+}
+function knowledgeImportArtifactSha256(value) {
+  return value.schemaVersion === 4 ? value.finalArtifact.sha256 : value.artifactSha256;
+}
+function knowledgeImportFilename(value) {
+  return value.schemaVersion === 4 ? value.finalArtifact.filename : value.filename;
+}
+function knowledgeImportPackageManifestSha256(value) {
+  return value.schemaVersion === 4 ? value.finalArtifact.packageManifestSha256 : value.schemaVersion === 3 ? value.packageManifestSha256 : void 0;
+}
+function knowledgeImportArchiveContractVersion(value) {
+  return value.schemaVersion === 4 ? value.finalArtifact.archiveContractVersion : value.schemaVersion === 3 ? value.archiveContractVersion : void 0;
 }
 function resolveKnowledgeImportProjectOwner(provisions, requestedCompanyName) {
   const completed = provisions.filter(
@@ -38206,7 +41003,21 @@ function idempotencyHash(value) {
   return createHash19("sha256").update(value, "utf8").digest("hex");
 }
 var websiteKnowledgeImportV3ReferencePrefix = "website-kb:v3";
+var websiteKnowledgeImportV4ReferencePrefix = "website-kb:v4";
 function knowledgeImportReceiptSourceReference(input) {
+  if (input.value.schemaVersion === 4) {
+    return [
+      websiteKnowledgeImportV4ReferencePrefix,
+      input.value.finalArtifact.finalizerVersion,
+      idempotencyHash(
+        [
+          input.value.candidate.sha256.toLowerCase(),
+          input.value.finalArtifact.sha256.toLowerCase(),
+          input.value.finalArtifact.packageManifestSha256.toLowerCase()
+        ].join(":")
+      )
+    ].join(":");
+  }
   if (input.value.schemaVersion === 3) {
     return [
       websiteKnowledgeImportV3ReferencePrefix,
@@ -38218,7 +41029,7 @@ function knowledgeImportReceiptSourceReference(input) {
   return `${input.projectId}:${input.value.taskId}`.slice(0, 191);
 }
 function knowledgeArtifactReceiptDescriptorMatchesRequest(receipt, input) {
-  return receipt.projectId === input.projectId && receipt.taskId === input.value.taskId && receipt.outputItemId === input.value.outputItemId && (receipt.fileId ?? null) === (input.value.fileId ?? null) && receipt.descriptorHash?.toLowerCase() === input.value.descriptorHash.toLowerCase();
+  return receipt.projectId === input.projectId && receipt.taskId === knowledgeImportTaskId(input.value) && receipt.outputItemId === knowledgeImportOutputItemId(input.value) && (receipt.fileId ?? null) === (knowledgeImportReceiptFileId(input.value) ?? null) && receipt.descriptorHash?.toLowerCase() === knowledgeImportDescriptorHash(input.value).toLowerCase();
 }
 function knowledgeArtifactReceiptMatchesRequest(receipt, input) {
   if (!knowledgeArtifactReceiptDescriptorMatchesRequest(receipt, input)) {
@@ -38241,10 +41052,10 @@ async function reserveReceipt(input) {
   const db = await requireImportDb();
   const keyHash = idempotencyHash(input.idempotencyKey);
   return db.transaction(async (tx) => {
-    const rows = await tx.select().from(knowledgeImportReceipts).where(eq28(knowledgeImportReceipts.idempotencyKeyHash, keyHash)).limit(1).for("update");
+    const rows = await tx.select().from(knowledgeImportReceipts).where(eq30(knowledgeImportReceipts.idempotencyKeyHash, keyHash)).limit(1).for("update");
     const existing = rows[0];
     if (existing) {
-      const sameArtifact2 = existing.userId === input.userId && knowledgeArtifactReceiptDescriptorMatchesRequest(existing, input) && existing.artifactHash.toLowerCase() === input.value.artifactSha256.toLowerCase();
+      const sameArtifact2 = existing.userId === input.userId && knowledgeArtifactReceiptDescriptorMatchesRequest(existing, input) && existing.artifactHash.toLowerCase() === knowledgeImportArtifactSha256(input.value).toLowerCase();
       if (!sameArtifact2) {
         throw new KnowledgeImportError(
           "IDEMPOTENCY_CONFLICT",
@@ -38279,15 +41090,15 @@ async function reserveReceipt(input) {
         errorMessage: null,
         sourceReference: knowledgeImportReceiptSourceReference(input),
         updatedAt: input.now
-      }).where(eq28(knowledgeImportReceipts.id, existing.id));
+      }).where(eq30(knowledgeImportReceipts.id, existing.id));
       return { state: "acquired", receiptId: existing.id };
     }
     const artifactRows = await tx.select().from(knowledgeImportReceipts).where(
-      and23(
-        eq28(knowledgeImportReceipts.userId, input.userId),
-        eq28(
+      and26(
+        eq30(knowledgeImportReceipts.userId, input.userId),
+        eq30(
           knowledgeImportReceipts.artifactHash,
-          input.value.artifactSha256.toLowerCase()
+          knowledgeImportArtifactSha256(input.value).toLowerCase()
         )
       )
     ).limit(1).for("update");
@@ -38315,7 +41126,7 @@ async function reserveReceipt(input) {
           snapshot: await getLatestKnowledgeSnapshot(input.userId)
         };
       }
-      if (input.value.schemaVersion === 3 && !sameArtifactRequest && existingArtifact.status === "completed" && existingArtifact.snapshotId) {
+      if (input.value.schemaVersion >= 3 && !sameArtifactRequest && existingArtifact.status === "completed" && existingArtifact.snapshotId) {
         await tx.update(knowledgeImportReceipts).set({
           status: "processing",
           attemptCount: existingArtifact.attemptCount + 1,
@@ -38323,7 +41134,7 @@ async function reserveReceipt(input) {
           errorMessage: null,
           sourceReference: knowledgeImportReceiptSourceReference(input),
           updatedAt: input.now
-        }).where(eq28(knowledgeImportReceipts.id, existingArtifact.id));
+        }).where(eq30(knowledgeImportReceipts.id, existingArtifact.id));
         return { state: "acquired", receiptId: existingArtifact.id };
       }
       if (existingArtifact.status === "pending" || existingArtifact.status === "processing") {
@@ -38340,7 +41151,7 @@ async function reserveReceipt(input) {
         409
       );
     }
-    const receiptId = randomUUID24();
+    const receiptId = randomUUID26();
     try {
       await tx.insert(knowledgeImportReceipts).values({
         id: receiptId,
@@ -38348,14 +41159,16 @@ async function reserveReceipt(input) {
         source: "website",
         projectId: input.projectId,
         companyName: input.value.companyName,
-        taskId: input.value.taskId,
-        fileId: input.value.fileId ?? null,
-        outputItemId: input.value.outputItemId,
-        descriptorHash: input.value.descriptorHash.toLowerCase(),
+        taskId: knowledgeImportTaskId(input.value),
+        fileId: knowledgeImportReceiptFileId(input.value) ?? null,
+        outputItemId: knowledgeImportOutputItemId(input.value),
+        descriptorHash: knowledgeImportDescriptorHash(
+          input.value
+        ).toLowerCase(),
         sourceReference: knowledgeImportReceiptSourceReference(input),
         idempotencyKeyHash: keyHash,
-        artifactHash: input.value.artifactSha256.toLowerCase(),
-        sourceFileName: input.value.filename,
+        artifactHash: knowledgeImportArtifactSha256(input.value).toLowerCase(),
+        sourceFileName: knowledgeImportFilename(input.value),
         status: "processing",
         attemptCount: 1,
         revision: 1,
@@ -38383,7 +41196,7 @@ async function markReceiptFailed(receiptId, error) {
     errorCode: error instanceof KnowledgeImportError ? error.code : "KNOWLEDGE_IMPORT_FAILED",
     errorMessage: (error instanceof Error ? error.message : "\u77E5\u8BC6\u5E93\u540C\u6B65\u5931\u8D25").slice(0, 2e3),
     updatedAt: /* @__PURE__ */ new Date()
-  }).where(eq28(knowledgeImportReceipts.id, receiptId));
+  }).where(eq30(knowledgeImportReceipts.id, receiptId));
 }
 async function importWebsiteKnowledgeArtifact(input) {
   const value = websiteKnowledgeImportSchema.parse(input.value);
@@ -38392,12 +41205,13 @@ async function importWebsiteKnowledgeArtifact(input) {
     userId: websiteUserProvisions.userId,
     companyName: websiteUserProvisions.companyName,
     status: websiteUserProvisions.status
-  }).from(websiteUserProvisions).where(eq28(websiteUserProvisions.projectId, input.projectId));
+  }).from(websiteUserProvisions).where(eq30(websiteUserProvisions.projectId, input.projectId));
   const provision = resolveKnowledgeImportProjectOwner(
     provisions,
     value.companyName
   );
-  const binding = await getPresalesTaskProjectBinding(value.taskId);
+  const taskId = knowledgeImportTaskId(value);
+  const binding = await getPresalesTaskProjectBinding(taskId);
   if (!binding || binding.projectId !== input.projectId) {
     throw new KnowledgeImportError(
       "TASK_PROJECT_MISMATCH",
@@ -38422,6 +41236,7 @@ async function importWebsiteKnowledgeArtifact(input) {
   }
   let storedAssetKeys = [];
   try {
+    await assertKnowledgeBaseWritable(provision.userId);
     try {
       await assertServiceCapability(provision.userId, "knowledgeDisplay");
     } catch (error) {
@@ -38434,10 +41249,7 @@ async function importWebsiteKnowledgeArtifact(input) {
       }
       throw error;
     }
-    const credential = await getPresalesCredentialForResource(
-      "task",
-      value.taskId
-    );
+    const credential = await getPresalesCredentialForResource("task", taskId);
     if (!credential || credential.id !== binding.apiCredentialId || credential.version !== binding.credentialVersion) {
       throw new KnowledgeImportError(
         "TASK_PROJECT_MISMATCH",
@@ -38446,7 +41258,7 @@ async function importWebsiteKnowledgeArtifact(input) {
       );
     }
     const taskResponse = await axios11.get(
-      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(value.taskId)}`,
+      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
       {
         headers: {
           API_KEY: credential.apiKey,
@@ -38465,7 +41277,7 @@ async function importWebsiteKnowledgeArtifact(input) {
     }
     const task = taskResponse.data?.task || taskResponse.data || {};
     const returnedTaskId = String(task.id || task.task_id || "");
-    if (returnedTaskId !== value.taskId) {
+    if (returnedTaskId !== taskId) {
       throw new KnowledgeImportError(
         "TASK_PROJECT_MISMATCH",
         "\u8BFB\u53D6\u5230\u7684\u77E5\u8BC6\u5E93\u4EFB\u52A1\u6807\u8BC6\u4E0D\u5339\u914D",
@@ -38480,7 +41292,7 @@ async function importWebsiteKnowledgeArtifact(input) {
       );
     }
     const matches = collectKnowledgeArchiveDescriptors(task.output).filter(
-      (descriptor) => descriptor.outputItemId === value.outputItemId && (!value.fileId || descriptor.fileId === value.fileId) && knowledgeArchiveDescriptorHash(descriptor) === value.descriptorHash.toLowerCase()
+      (descriptor) => descriptor.outputItemId === knowledgeImportOutputItemId(value) && (!knowledgeImportCandidateFileId(value) || descriptor.fileId === knowledgeImportCandidateFileId(value)) && knowledgeArchiveDescriptorHash(descriptor) === knowledgeImportDescriptorHash(value).toLowerCase()
     );
     if (matches.length !== 1) {
       throw new KnowledgeImportError(
@@ -38489,30 +41301,37 @@ async function importWebsiteKnowledgeArtifact(input) {
         409
       );
     }
+    const finalDescriptor = value.schemaVersion === 4 ? {
+      outputItemId: value.candidate.outputItemId,
+      fileId: value.finalArtifact.fileId,
+      filename: value.finalArtifact.filename,
+      mimeType: "application/zip"
+    } : matches[0];
     const downloaded = await downloadArchiveBytes({
-      descriptor: matches[0],
+      descriptor: finalDescriptor,
       apiKey: credential.apiKey,
       baseUrl: getUpstreamBaseUrl()
     });
     const archiveHash = createHash19("sha256").update(downloaded.buffer).digest("hex");
-    if (archiveHash !== value.artifactSha256.toLowerCase()) {
+    if (archiveHash !== knowledgeImportArtifactSha256(value).toLowerCase()) {
       throw new KnowledgeImportError(
         "ARTIFACT_HASH_MISMATCH",
         "\u77E5\u8BC6\u5E93 ZIP \u54C8\u5E0C\u4E0E\u5B98\u7F51\u58F0\u660E\u4E0D\u4E00\u81F4",
         409
       );
     }
-    const snapshotId = randomUUID24();
+    const snapshotId = randomUUID26();
     const parsed = await readKnowledgeArchive(
       downloaded.buffer,
       downloaded.filename,
       snapshotId,
       {
-        validationProfile: value.schemaVersion === 3 ? "website-lead-v1" : "historical",
-        archiveContractVersion: value.schemaVersion === 3 ? value.archiveContractVersion : void 0
+        validationProfile: value.schemaVersion >= 3 ? "website-lead-v1" : "historical",
+        archiveContractVersion: knowledgeImportArchiveContractVersion(value)
       }
     );
-    if (value.schemaVersion === 3 && parsed.packageManifestSha256?.toLowerCase() !== value.packageManifestSha256.toLowerCase()) {
+    const packageManifestSha256 = knowledgeImportPackageManifestSha256(value);
+    if (packageManifestSha256 && parsed.packageManifestSha256?.toLowerCase() !== packageManifestSha256.toLowerCase()) {
       throw new KnowledgeImportError(
         "ARTIFACT_HASH_MISMATCH",
         "\u77E5\u8BC6\u5E93 package manifest \u54C8\u5E0C\u4E0E\u5B98\u7F51\u58F0\u660E\u4E0D\u4E00\u81F4",
@@ -38538,8 +41357,8 @@ async function importWebsiteKnowledgeArtifact(input) {
       userId: provision.userId,
       actorUserId: provision.userId,
       sourceFileName: downloaded.filename,
-      sourceTaskId: value.taskId,
-      sourceArtifactHash: value.descriptorHash.toLowerCase(),
+      sourceTaskId: taskId,
+      sourceArtifactHash: knowledgeImportDescriptorHash(value).toLowerCase(),
       archiveHash,
       documents: parsed.documents,
       assets: parsed.assets,
@@ -38554,11 +41373,15 @@ async function importWebsiteKnowledgeArtifact(input) {
       errorMessage: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and23(
-        eq28(knowledgeImportReceipts.id, reservation.receiptId),
-        eq28(knowledgeImportReceipts.status, "processing")
+      and26(
+        eq30(knowledgeImportReceipts.id, reservation.receiptId),
+        eq30(knowledgeImportReceipts.status, "processing")
       )
     );
+    await createKnowledgeMonitoringHandoff({
+      userId: provision.userId,
+      actorUserId: provision.userId
+    });
     return {
       status: "completed",
       replayed: false,
@@ -38577,16 +41400,16 @@ async function importWebsiteKnowledgeArtifact(input) {
 }
 
 // server/payment-receipt-ledger-service.ts
-import { and as and24, eq as eq29 } from "drizzle-orm";
+import { and as and27, eq as eq31 } from "drizzle-orm";
 
 // shared/payment-receipt.ts
-import { z as z26 } from "zod";
-var opaqueIdentifierSchema = z26.string().min(8).max(128).regex(
+import { z as z28 } from "zod";
+var opaqueIdentifierSchema = z28.string().min(8).max(128).regex(
   /^[A-Za-z0-9][A-Za-z0-9._:-]*$/,
   "identifier contains unsupported characters"
 );
-var sha256DigestSchema = z26.string().length(64).regex(/^[a-f0-9]{64}$/, "digest must be lowercase SHA-256 hex");
-var paidAtSchema = z26.string().regex(
+var sha256DigestSchema = z28.string().length(64).regex(/^[a-f0-9]{64}$/, "digest must be lowercase SHA-256 hex");
+var paidAtSchema = z28.string().regex(
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
   "paidAt must be a canonical UTC timestamp with millisecond precision"
 ).refine(
@@ -38596,34 +41419,34 @@ var paidAtSchema = z26.string().regex(
   },
   { message: "paidAt must be a valid timestamp" }
 );
-var paymentReceiptSchema = z26.object({
+var paymentReceiptSchema = z28.object({
   orderId: opaqueIdentifierSchema,
   tradeNo: opaqueIdentifierSchema,
-  amountFen: z26.number().int().positive().max(1e7),
+  amountFen: z28.number().int().positive().max(1e7),
   paidAt: paidAtSchema,
-  purchaseType: z26.enum(["monitoring", "service"]),
+  purchaseType: z28.enum(["monitoring", "service"]),
   scopeHash: sha256DigestSchema,
   authorizationDigest: sha256DigestSchema,
-  reviewRequired: z26.boolean()
+  reviewRequired: z28.boolean()
 }).strict();
-var paymentReceiptWriteRequestSchema = z26.object({
-  schemaVersion: z26.literal(1),
+var paymentReceiptWriteRequestSchema = z28.object({
+  schemaVersion: z28.literal(1),
   receipt: paymentReceiptSchema
 }).strict();
-var paymentReceiptReadQuerySchema = z26.object({
+var paymentReceiptReadQuerySchema = z28.object({
   scopeHash: sha256DigestSchema,
   authorizationDigest: sha256DigestSchema
 }).strict();
 var paymentReceiptReadRequestSchema = paymentReceiptReadQuerySchema.extend({
   orderId: opaqueIdentifierSchema
 }).strict();
-var paymentReceiptResponseSchema = z26.object({
-  schemaVersion: z26.literal(1),
+var paymentReceiptResponseSchema = z28.object({
+  schemaVersion: z28.literal(1),
   receipt: paymentReceiptSchema
 }).strict();
-var paymentReceiptReadyResponseSchema = z26.object({
-  schemaVersion: z26.literal(1),
-  ready: z26.literal(true)
+var paymentReceiptReadyResponseSchema = z28.object({
+  schemaVersion: z28.literal(1),
+  ready: z28.literal(true)
 }).strict();
 
 // server/payment-receipt-ledger-service.ts
@@ -38679,21 +41502,21 @@ async function defaultRepository2() {
   const db = await getDb();
   if (!db) databaseUnavailable();
   const findByOrderId = async (orderId) => {
-    const rows = await db.select().from(websitePaymentReceipts).where(eq29(websitePaymentReceipts.orderId, orderId)).limit(1);
+    const rows = await db.select().from(websitePaymentReceipts).where(eq31(websitePaymentReceipts.orderId, orderId)).limit(1);
     return rows[0];
   };
   return {
     findByOrderId,
     async findByTradeNo(tradeNo) {
-      const rows = await db.select().from(websitePaymentReceipts).where(eq29(websitePaymentReceipts.tradeNo, tradeNo)).limit(1);
+      const rows = await db.select().from(websitePaymentReceipts).where(eq31(websitePaymentReceipts.tradeNo, tradeNo)).limit(1);
       return rows[0];
     },
     async findScoped(input) {
       const rows = await db.select().from(websitePaymentReceipts).where(
-        and24(
-          eq29(websitePaymentReceipts.orderId, input.orderId),
-          eq29(websitePaymentReceipts.scopeHash, input.scopeHash),
-          eq29(
+        and27(
+          eq31(websitePaymentReceipts.orderId, input.orderId),
+          eq31(websitePaymentReceipts.scopeHash, input.scopeHash),
+          eq31(
             websitePaymentReceipts.authorizationDigest,
             input.authorizationDigest
           )
@@ -38792,20 +41615,20 @@ function createPaymentReceiptLedgerService(options = {}) {
 }
 
 // server/project-order-registry-service.ts
-import { and as and25, eq as eq30, sql as sql2 } from "drizzle-orm";
+import { and as and28, eq as eq32, sql as sql4 } from "drizzle-orm";
 
 // shared/project-order-registry.ts
-import { z as z27 } from "zod";
-var opaqueIdentifierSchema2 = z27.string().min(8).max(128).regex(
+import { z as z29 } from "zod";
+var opaqueIdentifierSchema2 = z29.string().min(8).max(128).regex(
   /^[A-Za-z0-9][A-Za-z0-9._:-]*$/,
   "identifier contains unsupported characters"
 );
-var projectOrderProjectIdSchema = z27.string().min(8).max(80).regex(
+var projectOrderProjectIdSchema = z29.string().min(8).max(80).regex(
   /^[A-Za-z0-9][A-Za-z0-9._:-]*$/,
   "projectId contains unsupported characters"
 );
-var sha256DigestSchema2 = z27.string().length(64).regex(/^[a-f0-9]{64}$/, "digest must be lowercase SHA-256 hex");
-var canonicalUtcTimestampSchema = z27.string().regex(
+var sha256DigestSchema2 = z29.string().length(64).regex(/^[a-f0-9]{64}$/, "digest must be lowercase SHA-256 hex");
+var canonicalUtcTimestampSchema = z29.string().regex(
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
   "timestamp must use canonical UTC millisecond precision"
 ).refine(
@@ -38815,7 +41638,7 @@ var canonicalUtcTimestampSchema = z27.string().regex(
   },
   { message: "timestamp must be valid" }
 );
-var projectOrderStateSchema = z27.enum([
+var projectOrderStateSchema = z29.enum([
   "pending",
   "paid",
   "fulfilling",
@@ -38824,11 +41647,11 @@ var projectOrderStateSchema = z27.enum([
   "terminal_failed",
   "closed"
 ]);
-var projectOrderSchema = z27.object({
+var projectOrderSchema = z29.object({
   orderId: opaqueIdentifierSchema2,
   projectId: projectOrderProjectIdSchema,
-  purchaseType: z27.enum(["monitoring", "service"]),
-  amountFen: z27.number().int().positive().max(1e7),
+  purchaseType: z29.enum(["monitoring", "service"]),
+  amountFen: z29.number().int().positive().max(1e7),
   authorizationDigest: sha256DigestSchema2,
   state: projectOrderStateSchema,
   checkoutExpiresAt: canonicalUtcTimestampSchema,
@@ -38872,16 +41695,16 @@ var projectOrderSchema = z27.object({
     });
   }
 });
-var projectOrderWriteRequestSchema = z27.object({
-  schemaVersion: z27.literal(1),
+var projectOrderWriteRequestSchema = z29.object({
+  schemaVersion: z29.literal(1),
   order: projectOrderSchema
 }).strict();
-var projectOrderResponseSchema = z27.object({
-  schemaVersion: z27.literal(1),
+var projectOrderResponseSchema = z29.object({
+  schemaVersion: z29.literal(1),
   order: projectOrderSchema
 }).strict();
-var projectOrderIntentCommitRequestSchema = z27.object({
-  schemaVersion: z27.literal(1),
+var projectOrderIntentCommitRequestSchema = z29.object({
+  schemaVersion: z29.literal(1),
   order: projectOrderSchema
 }).strict().superRefine((value, context) => {
   if (value.order.state !== "pending") {
@@ -38892,8 +41715,8 @@ var projectOrderIntentCommitRequestSchema = z27.object({
     });
   }
 });
-var projectOrderIntentCommitResponseSchema = z27.object({
-  schemaVersion: z27.literal(1),
+var projectOrderIntentCommitResponseSchema = z29.object({
+  schemaVersion: z29.literal(1),
   intent: projectOrderSchema,
   order: projectOrderSchema
 }).strict().superRefine((value, context) => {
@@ -38905,11 +41728,11 @@ var projectOrderIntentCommitResponseSchema = z27.object({
     });
   }
 });
-var projectOrderProjectResponseSchema = z27.object({
-  schemaVersion: z27.literal(1),
+var projectOrderProjectResponseSchema = z29.object({
+  schemaVersion: z29.literal(1),
   projectId: projectOrderProjectIdSchema,
-  blockDeletion: z27.boolean(),
-  orders: z27.array(projectOrderSchema).max(100)
+  blockDeletion: z29.boolean(),
+  orders: z29.array(projectOrderSchema).max(100)
 }).strict().superRefine((value, context) => {
   const expected = value.orders.some(
     (order) => !["fulfilled", "terminal_failed", "closed"].includes(order.state)
@@ -39025,17 +41848,17 @@ async function defaultRepository3() {
   const db = await getDb();
   if (!db) databaseUnavailable2();
   const findByOrderId = async (orderId) => {
-    const rows = await db.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.orderId, orderId)).limit(1);
+    const rows = await db.select().from(websiteProjectOrders).where(eq32(websiteProjectOrders.orderId, orderId)).limit(1);
     return rows[0];
   };
   return {
     findByOrderId,
     async findByAuthorizationDigest(digest) {
-      const rows = await db.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.authorizationDigest, digest)).limit(1);
+      const rows = await db.select().from(websiteProjectOrders).where(eq32(websiteProjectOrders.authorizationDigest, digest)).limit(1);
       return rows[0];
     },
     async listByProjectId(projectId) {
-      return db.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.projectId, projectId)).limit(MAX_PROJECT_ORDERS + 1);
+      return db.select().from(websiteProjectOrders).where(eq32(websiteProjectOrders.projectId, projectId)).limit(MAX_PROJECT_ORDERS + 1);
     },
     async insert(value) {
       await db.insert(websiteProjectOrders).values(value);
@@ -39046,11 +41869,11 @@ async function defaultRepository3() {
     async update(orderId, expectedRevision, value) {
       const result = await db.update(websiteProjectOrders).set({
         ...value,
-        revision: sql2`${websiteProjectOrders.revision} + 1`
+        revision: sql4`${websiteProjectOrders.revision} + 1`
       }).where(
-        and25(
-          eq30(websiteProjectOrders.orderId, orderId),
-          eq30(websiteProjectOrders.revision, expectedRevision)
+        and28(
+          eq32(websiteProjectOrders.orderId, orderId),
+          eq32(websiteProjectOrders.revision, expectedRevision)
         )
       );
       if (!result[0]?.affectedRows) return void 0;
@@ -39062,12 +41885,12 @@ async function defaultRepository3() {
         const result = await tx.update(websiteProjectOrders).set({
           state: "closed",
           lastEventAt: closedAt,
-          revision: sql2`${websiteProjectOrders.revision} + 1`
+          revision: sql4`${websiteProjectOrders.revision} + 1`
         }).where(
-          and25(
-            eq30(websiteProjectOrders.orderId, intentOrderId),
-            eq30(websiteProjectOrders.revision, expectedRevision),
-            eq30(websiteProjectOrders.state, "pending")
+          and28(
+            eq32(websiteProjectOrders.orderId, intentOrderId),
+            eq32(websiteProjectOrders.revision, expectedRevision),
+            eq32(websiteProjectOrders.state, "pending")
           )
         );
         if (!result[0]?.affectedRows) {
@@ -39076,8 +41899,8 @@ async function defaultRepository3() {
           });
         }
         const [intents, orders] = await Promise.all([
-          tx.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.orderId, intentOrderId)).limit(1),
-          tx.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.orderId, order.orderId)).limit(1)
+          tx.select().from(websiteProjectOrders).where(eq32(websiteProjectOrders.orderId, intentOrderId)).limit(1),
+          tx.select().from(websiteProjectOrders).where(eq32(websiteProjectOrders.orderId, order.orderId)).limit(1)
         ]);
         if (!intents[0] || !orders[0]) databaseUnavailable2();
         return { intent: intents[0], order: orders[0] };
@@ -39489,7 +42312,7 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "32kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const idempotencyKey = z30.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const request = websiteProvisionRequestSchema.parse(req.body);
         const result = await provisionUser({ idempotencyKey, request });
         if (result.replayed) res.setHeader("Idempotent-Replayed", "true");
@@ -39507,7 +42330,7 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const idempotencyKey = z30.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const request = createManualServiceOrderRequestSchema.parse(req.body);
         res.status(201).json(
           await manualOrders.create({
@@ -39523,7 +42346,7 @@ function createProvisioningRouter(options = {}) {
   );
   router12.get("/manual-orders/:reference/status", async (req, res) => {
     try {
-      const reference = z28.string().trim().min(4).max(128).parse(req.params.reference);
+      const reference = z30.string().trim().min(4).max(128).parse(req.params.reference);
       res.json(
         await manualOrders.status({
           reference,
@@ -39539,8 +42362,8 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const reference = z28.string().trim().min(4).max(128).parse(req.params.reference);
-        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const reference = z30.string().trim().min(4).max(128).parse(req.params.reference);
+        const idempotencyKey = z30.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const request = manualServicePaymentRequestSchema.parse(req.body);
         const result = await manualOrders.recordPayment({
           reference,
@@ -39559,8 +42382,8 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "32kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const reference = z28.string().trim().min(4).max(128).parse(req.params.reference);
-        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const reference = z30.string().trim().min(4).max(128).parse(req.params.reference);
+        const idempotencyKey = z30.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const request = manualServiceAccountSetupRequestSchema.parse(req.body);
         const result = await manualOrders.setupAccount({
           reference,
@@ -39579,7 +42402,7 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const idempotencyKey = z30.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const result = await submitPurchase({
           idempotencyKey,
           request: req.body,
@@ -39593,7 +42416,7 @@ function createProvisioningRouter(options = {}) {
   );
   router12.get("/purchases/:reference/status", async (req, res) => {
     try {
-      const reference = z28.string().trim().min(4).max(128).parse(req.params.reference);
+      const reference = z30.string().trim().min(4).max(128).parse(req.params.reference);
       res.json(
         await readPurchase({
           reference,
@@ -39609,8 +42432,8 @@ function createProvisioningRouter(options = {}) {
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
       try {
-        const projectId = z28.string().trim().min(8).max(80).parse(req.params.projectId);
-        const idempotencyKey = z28.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
+        const projectId = z30.string().trim().min(8).max(80).parse(req.params.projectId);
+        const idempotencyKey = z30.string().trim().min(16).max(512).parse(requestHeader(req, "idempotency-key"));
         const value = websiteKnowledgeImportSchema.parse(req.body);
         const result = await importKnowledge({
           projectId,
@@ -39640,7 +42463,7 @@ function createProvisioningRouter(options = {}) {
   return router12;
 }
 function sendProvisioningError(res, error) {
-  if (error instanceof z28.ZodError) {
+  if (error instanceof z30.ZodError) {
     res.status(400).json({
       error: {
         code: "INVALID_REQUEST",
@@ -39715,15 +42538,15 @@ function pathWithoutQuery(req) {
   return req.originalUrl.replace(/^\/api\/frontmind/, "").split("?")[0] || "/";
 }
 function getPrimaryResource(req) {
-  const path10 = pathWithoutQuery(req);
-  const taskMatch = path10.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
+  const path11 = pathWithoutQuery(req);
+  const taskMatch = path11.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
   if (taskMatch) return { kind: "task", id: decodeURIComponent(taskMatch[1]) };
-  const fileMatch = path10.match(/^\/v1\/files\/([^/]+)/);
+  const fileMatch = path11.match(/^\/v1\/files\/([^/]+)/);
   if (fileMatch) return { kind: "file", id: decodeURIComponent(fileMatch[1]) };
-  if (path10 === "/download-token" && typeof req.body?.fileId === "string") {
+  if (path11 === "/download-token" && typeof req.body?.fileId === "string") {
     return { kind: "file", id: req.body.fileId };
   }
-  if (req.method === "POST" && path10 === "/v1/tasks") {
+  if (req.method === "POST" && path11 === "/v1/tasks") {
     const continuationId = req.body?.taskId ?? req.body?.previous_response_id;
     if (typeof continuationId === "string" && continuationId) {
       return { kind: "task", id: continuationId };
@@ -39843,6 +42666,36 @@ function createFrontMindProxyAccessMiddleware(dependencies = { assertWriteAccess
       }
       return;
     }
+    if (user.role === "delivery_member") {
+      const roleAssignmentId = String(
+        req.headers["x-delivery-role-assignment-id"] || ""
+      ).trim();
+      if (!roleAssignmentId) {
+        res.status(400).json({
+          error: {
+            message: "\u8BF7\u5148\u9009\u62E9\u5F53\u524D\u5DE5\u4F5C\u89D2\u8272",
+            code: "DELIVERY_ROLE_CONTEXT_REQUIRED"
+          }
+        });
+        return;
+      }
+      try {
+        req.frontmindDeliveryRoleContext = await (dependencies.assertRoleContext ?? assertDeliveryRoleContext)({
+          actor: user,
+          roleAssignmentId
+        });
+      } catch {
+        res.status(403).json({
+          error: {
+            message: "\u5F53\u524D\u5DE5\u4F5C\u89D2\u8272\u4E0D\u5B58\u5728\u6216\u5DF2\u505C\u7528",
+            code: "DELIVERY_ROLE_CONTEXT_FORBIDDEN"
+          }
+        });
+        return;
+      }
+      next();
+      return;
+    }
     if (!ordinaryUserMayUseFrontMindProxy(req)) {
       res.status(403).json({
         error: {
@@ -39872,7 +42725,7 @@ var enforceFrontMindProxyAccess = createFrontMindProxyAccessMiddleware();
 
 // server/delivery-ticket-attachment-router.ts
 import axios12 from "axios";
-import { and as and26, eq as eq31 } from "drizzle-orm";
+import { and as and29, eq as eq33 } from "drizzle-orm";
 import { Router as Router8 } from "express";
 var router9 = Router8();
 var MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
@@ -39887,7 +42740,7 @@ function contentDisposition2(filename) {
 function canCustomerDownloadTicketAttachment(input) {
   return input.actorUserId === input.ticketUserId && isDeliveryTicketAttachmentVisible(false, input.eventVisibility);
 }
-async function requireDb15() {
+async function requireDb17() {
   const db = await getDb();
   if (!db) {
     throw new DeliveryTicketError(
@@ -39899,21 +42752,21 @@ async function requireDb15() {
   return db;
 }
 async function resolveAuthorizedTicketAttachment(input) {
-  const db = await requireDb15();
+  const db = await requireDb17();
   const rows = await db.select({
     attachment: deliveryTicketAttachments,
     ticketUserId: deliveryTickets.userId,
     eventVisibility: deliveryTicketEvents.visibility
   }).from(deliveryTicketAttachments).innerJoin(
     deliveryTickets,
-    eq31(deliveryTickets.id, deliveryTicketAttachments.ticketId)
+    eq33(deliveryTickets.id, deliveryTicketAttachments.ticketId)
   ).leftJoin(
     deliveryTicketEvents,
-    and26(
-      eq31(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
-      eq31(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId)
+    and29(
+      eq33(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
+      eq33(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId)
     )
-  ).where(eq31(deliveryTicketAttachments.id, input.attachmentId)).limit(1);
+  ).where(eq33(deliveryTicketAttachments.id, input.attachmentId)).limit(1);
   const row = rows[0];
   if (!row) {
     throw new DeliveryTicketError(
@@ -40145,8 +42998,8 @@ import express4 from "express";
 import { ZodError as ZodError2 } from "zod";
 
 // server/website-content-template-service.ts
-import { randomUUID as randomUUID25 } from "node:crypto";
-import { and as and27, asc as asc9, eq as eq32, inArray as inArray14 } from "drizzle-orm";
+import { randomUUID as randomUUID27 } from "node:crypto";
+import { and as and30, asc as asc9, eq as eq34, inArray as inArray17 } from "drizzle-orm";
 var WEBSITE_CONTENT_CATEGORIES2 = WEBSITE_CONTENT_CATALOG.map(
   (item) => item.value
 );
@@ -40171,7 +43024,7 @@ function ticketComplete(row) {
 function categoryLabel(category) {
   return WEBSITE_CONTENT_CATALOG.find((item) => item.value === category)?.label ?? category;
 }
-function requireDb16() {
+function requireDb18() {
   return getDb().then((db) => {
     if (!db) {
       throw new WebsiteContentTemplateError(
@@ -40210,10 +43063,10 @@ async function loadWebsiteContentTicketRows(executor, workspaceUserId2, lock = f
     revision: deliveryTickets.revision,
     scheduledAt: deliveryTickets.scheduledAt
   }).from(deliveryTickets).where(
-    and27(
-      eq32(deliveryTickets.userId, workspaceUserId2),
-      eq32(deliveryTickets.type, "website_operation"),
-      inArray14(deliveryTickets.category, WEBSITE_CONTENT_CATEGORIES2)
+    and30(
+      eq34(deliveryTickets.userId, workspaceUserId2),
+      eq34(deliveryTickets.type, "website_operation"),
+      inArray17(deliveryTickets.category, WEBSITE_CONTENT_CATEGORIES2)
     )
   ).orderBy(asc9(deliveryTickets.createdAt), asc9(deliveryTickets.id));
   if (lock) query = query.for("update");
@@ -40329,7 +43182,7 @@ function buildWebsiteContentTemplateDiff(input) {
 }
 async function downloadWebsiteContentTemplate(input) {
   await assertAdministratorWorkspaceAccess2(input.actor, input.workspaceUserId);
-  const db = await requireDb16();
+  const db = await requireDb18();
   const rows = await loadWebsiteContentTicketRows(db, input.workspaceUserId);
   return createWebsiteContentTemplate({
     workspaceUserId: input.workspaceUserId,
@@ -40339,7 +43192,7 @@ async function downloadWebsiteContentTemplate(input) {
 }
 async function previewWebsiteContentTemplate(input) {
   await assertAdministratorWorkspaceAccess2(input.actor, input.workspaceUserId);
-  const db = await requireDb16();
+  const db = await requireDb18();
   const rows = await loadWebsiteContentTicketRows(db, input.workspaceUserId);
   const preview = buildWebsiteContentTemplateDiff({
     workspaceUserId: input.workspaceUserId,
@@ -40361,7 +43214,7 @@ async function previewWebsiteContentTemplate(input) {
 }
 async function publishWebsiteContentTemplate(input) {
   await assertAdministratorWorkspaceAccess2(input.actor, input.workspaceUserId);
-  const db = await requireDb16();
+  const db = await requireDb18();
   return db.transaction(async (tx) => {
     const rows = await loadWebsiteContentTicketRows(
       tx,
@@ -40419,13 +43272,13 @@ async function publishWebsiteContentTemplate(input) {
           updatedByUserId: input.actor.id,
           updatedAt: now
         }).where(
-          and27(
-            eq32(deliveryTickets.id, ticket.id),
-            eq32(deliveryTickets.revision, ticket.revision)
+          and30(
+            eq34(deliveryTickets.id, ticket.id),
+            eq34(deliveryTickets.revision, ticket.revision)
           )
         );
         await tx.insert(deliveryTicketEvents).values({
-          id: randomUUID25(),
+          id: randomUUID27(),
           ticketId: ticket.id,
           userId: input.workspaceUserId,
           actorUserId: input.actor.id,
@@ -40464,9 +43317,9 @@ async function publishWebsiteContentTemplate(input) {
           updatedByUserId: input.actor.id,
           updatedAt: now
         }).where(
-          and27(
-            eq32(deliveryTickets.id, ticket.id),
-            eq32(deliveryTickets.revision, ticket.revision)
+          and30(
+            eq34(deliveryTickets.id, ticket.id),
+            eq34(deliveryTickets.revision, ticket.revision)
           )
         );
         await writeWorkspaceAuditEvent(
@@ -40539,6 +43392,14 @@ function workspaceUserId(value) {
     );
   }
   return parsed;
+}
+function assertWebsiteTemplateExecutionActor(actor) {
+  if (actor.role === "admin" && actor.adminAccessLevel === "delivery_admin") {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u4EA4\u4ED8\u7BA1\u7406\u5458\u53EA\u80FD\u8C03\u5EA6\u5B98\u7F51\u5DE5\u5355\uFF0C\u4E0D\u80FD\u4E0A\u4F20\u6216\u53D1\u5E03\u5B98\u7F51\u5185\u5BB9"
+    );
+  }
 }
 function requestBytes(req) {
   if (Buffer.isBuffer(req.body)) return req.body;
@@ -40648,6 +43509,7 @@ router11.put(
   async (req, res) => {
     try {
       const targetUserId = workspaceUserId(req.params.userId);
+      assertWebsiteTemplateExecutionActor(req.frontmindUser);
       const bytes = requestBytes(req);
       if (bytes.length === 0) {
         throw new WebsiteContentTemplateApiError(
@@ -40776,7 +43638,7 @@ async function startServer() {
       monitorBaseUrl();
       const db = await getDb();
       if (!db) throw new Error("Database is not configured");
-      await db.execute(sql3`select 1`);
+      await db.execute(sql5`select 1`);
       const [preparedFiles, skills, paymentReceipts, projectOrders] = await Promise.all([
         preparedFileService.health(),
         getRuntimeSkillReadiness(),
@@ -40903,6 +43765,14 @@ async function startServer() {
       }).catch((error) => {
         console.error("[KnowledgeBaseRecovery] startup_scan_failed", error);
       });
+      const runResetCleanup = () => {
+        void processKnowledgeResetCleanupJobs().catch((error) => {
+          console.error("[KnowledgeBaseReset] cleanup_retry_failed", error);
+        });
+      };
+      runResetCleanup();
+      const resetCleanupTimer = setInterval(runResetCleanup, 15 * 60 * 1e3);
+      resetCleanupTimer.unref();
     }
   });
 }

@@ -518,7 +518,7 @@ export async function createManagedUser(
     username: string;
     password: string;
     displayName?: string | null;
-    role: "user" | "admin";
+    role: "user" | "admin" | "delivery_member";
     adminAccessLevel?: "system_admin" | "delivery_admin";
     marketEdition?: "domestic" | "overseas";
   },
@@ -548,7 +548,7 @@ export async function createManagedUserWithPasswordHash(
     username: string;
     passwordHash: string;
     displayName?: string | null;
-    role: "user" | "admin";
+    role: "user" | "admin" | "delivery_member";
     adminAccessLevel?: "system_admin" | "delivery_admin";
     marketEdition?: "domestic" | "overseas";
     now?: Date;

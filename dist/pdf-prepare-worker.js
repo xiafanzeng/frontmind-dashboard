@@ -8,7 +8,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { Router } from "express";
 import axios2 from "axios";
 import zlib from "zlib";
-import { randomUUID as randomUUID2 } from "crypto";
+import { randomUUID as randomUUID3 } from "crypto";
 import fs2 from "node:fs/promises";
 
 // server/upstream-config.ts
@@ -89,6 +89,11 @@ import { and, asc, desc, eq as eq2, gt, inArray, isNull, ne } from "drizzle-orm"
 // shared/const.ts
 var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
 
+// shared/admin-access.ts
+function isExplicitAdminAccessLevel(value) {
+  return value === "system_admin" || value === "delivery_admin";
+}
+
 // drizzle/schema.ts
 import { sql } from "drizzle-orm";
 import {
@@ -118,7 +123,7 @@ var users = mysqlTable(
     name: text("name"),
     email: varchar("email", { length: 320 }),
     loginMethod: varchar("loginMethod", { length: 64 }),
-    role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+    role: mysqlEnum("role", ["user", "admin", "delivery_member"]).default("user").notNull(),
     adminAccessLevel: mysqlEnum("adminAccessLevel", [
       "system_admin",
       "delivery_admin"
@@ -807,7 +812,11 @@ var deliveryTickets = mysqlTable(
     userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
     contractId: varchar("contractId", { length: 36 }).notNull().references(() => serviceContracts.id, { onDelete: "restrict" }),
     quotaPeriodId: varchar("quotaPeriodId", { length: 36 }).notNull().references(() => serviceQuotaPeriods.id, { onDelete: "restrict" }),
-    type: mysqlEnum("type", ["content_asset", "website_operation"]).notNull(),
+    type: mysqlEnum("type", [
+      "content_asset",
+      "website_operation",
+      "knowledge_base"
+    ]).notNull(),
     quotaPool: mysqlEnum("quotaPool", [
       "content_asset_publish",
       "website_content_publish"
@@ -823,8 +832,27 @@ var deliveryTickets = mysqlTable(
     icpDeclarations: json("icpDeclarations").$type(),
     targetPage: text("targetPage"),
     knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
+    workflowDomain: mysqlEnum("workflowDomain", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer"
+    ]),
+    operation: varchar("operation", { length: 64 }),
+    assignedRoleId: varchar("assignedRoleId", { length: 36 }).references(
+      () => deliveryRoles.id,
+      { onDelete: "set null" }
+    ),
+    assignedMemberId: int("assignedMemberId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    sourceQuestionId: varchar("sourceQuestionId", { length: 191 }),
+    monitoringBatchKey: varchar("monitoringBatchKey", { length: 191 }),
+    responseLogicRevision: int("responseLogicRevision"),
+    contentAssetIds: json("contentAssetIds").$type().default([]).notNull(),
     technicalDedupeKey: varchar("technicalDedupeKey", { length: 64 }),
     materialUrls: json("materialUrls").$type().default([]).notNull(),
+    priority: mysqlEnum("priority", ["low", "normal", "high", "urgent"]).default("normal").notNull(),
     status: mysqlEnum("status", [
       "submitted",
       "needs_information",
@@ -894,6 +922,11 @@ var deliveryTickets = mysqlTable(
       table.status,
       table.updatedAt,
       table.id
+    ),
+    index("delivery_tickets_role_member_status_idx").on(
+      table.workflowDomain,
+      table.assignedMemberId,
+      table.status
     )
   ]
 );
@@ -947,7 +980,13 @@ var deliveryTicketEvents = mysqlTable(
     actorUserId: int("actorUserId").references(() => users.id, {
       onDelete: "set null"
     }),
-    actorRole: mysqlEnum("actorRole", ["user", "admin", "system"]).notNull(),
+    actorRole: mysqlEnum("actorRole", [
+      "user",
+      "admin",
+      "delivery_member",
+      "system"
+    ]).notNull(),
+    actorContext: json("actorContext").$type(),
     kind: mysqlEnum("kind", [
       "created",
       "message",
@@ -1413,6 +1452,84 @@ var userAdminAssignments = mysqlTable(
     index("user_admin_assignments_admin_idx").on(table.adminId)
   ]
 );
+var deliveryRoles = mysqlTable(
+  "delivery_roles",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    name: varchar("name", { length: 128 }).notNull(),
+    roleType: mysqlEnum("roleType", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer"
+    ]).notNull(),
+    isActive: boolean("isActive").default(true).notNull(),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_roles_type_name_uq").on(table.roleType, table.name),
+    index("delivery_roles_type_active_idx").on(table.roleType, table.isActive)
+  ]
+);
+var deliveryRoleMembers = mysqlTable(
+  "delivery_role_members",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    roleId: varchar("roleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "cascade" }),
+    memberUserId: int("memberUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    isActive: boolean("isActive").default(true).notNull(),
+    assignedByUserId: int("assignedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_role_members_role_member_uq").on(
+      table.roleId,
+      table.memberUserId
+    ),
+    index("delivery_role_members_member_active_idx").on(
+      table.memberUserId,
+      table.isActive
+    )
+  ]
+);
+var deliveryCustomerAssignments = mysqlTable(
+  "delivery_customer_assignments",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    customerUserId: int("customerUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    roleType: mysqlEnum("roleType", [
+      "knowledge_base_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+      "website_operations_engineer"
+    ]).notNull(),
+    roleId: varchar("roleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "restrict" }),
+    primaryMemberId: int("primaryMemberId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    assignedByUserId: int("assignedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("delivery_customer_assignments_customer_type_uq").on(
+      table.customerUserId,
+      table.roleType
+    ),
+    index("delivery_customer_assignments_member_type_idx").on(
+      table.primaryMemberId,
+      table.roleType
+    )
+  ]
+);
 var userUsageOwners = mysqlTable(
   "user_usage_owners",
   {
@@ -1814,6 +1931,109 @@ var knowledgeBaseBuildNodes = mysqlTable(
     index("knowledge_base_build_nodes_status_idx").on(
       table.buildId,
       table.status
+    )
+  ]
+);
+var knowledgeBaseResetRequests = mysqlTable(
+  "knowledge_base_reset_requests",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    ticketId: varchar("ticketId", { length: 36 }).notNull().references(() => deliveryTickets.id, { onDelete: "restrict" }),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    assignedRoleId: varchar("assignedRoleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "restrict" }),
+    assignedMemberId: int("assignedMemberId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    activeKey: varchar("activeKey", { length: 191 }),
+    reasonCode: mysqlEnum("reasonCode", [
+      "stuck",
+      "upload_error",
+      "build_error",
+      "enterprise_materials",
+      "other"
+    ]).notNull(),
+    reasonNote: text("reasonNote"),
+    status: mysqlEnum("status", ["pending", "approved", "rejected"]).default("pending").notNull(),
+    decisionNote: text("decisionNote"),
+    decidedByUserId: int("decidedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    cleanupSummary: json("cleanupSummary").$type(),
+    decidedAt: timestamp("decidedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("knowledge_base_reset_requests_ticket_uq").on(table.ticketId),
+    uniqueIndex("knowledge_base_reset_requests_active_key_uq").on(
+      table.activeKey
+    ),
+    index("knowledge_base_reset_requests_user_status_idx").on(
+      table.userId,
+      table.status
+    ),
+    index("knowledge_base_reset_requests_member_status_idx").on(
+      table.assignedMemberId,
+      table.status
+    )
+  ]
+);
+var knowledgeBaseResetStates = mysqlTable(
+  "knowledge_base_reset_states",
+  {
+    userId: int("userId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    revision: int("revision", { unsigned: true }).default(0).notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  }
+);
+var knowledgeBaseConversationTombstones = mysqlTable(
+  "knowledge_base_conversation_tombstones",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    publicConversationId: varchar("publicConversationId", {
+      length: 191
+    }).notNull(),
+    resetRequestId: varchar("resetRequestId", { length: 36 }).notNull().references(() => knowledgeBaseResetRequests.id, {
+      onDelete: "cascade"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("kb_conversation_tombstones_user_conversation_uq").on(
+      table.userId,
+      table.publicConversationId
+    )
+  ]
+);
+var knowledgeBaseResetCleanupJobs = mysqlTable(
+  "knowledge_base_reset_cleanup_jobs",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    resetRequestId: varchar("resetRequestId", { length: 36 }).notNull().references(() => knowledgeBaseResetRequests.id, {
+      onDelete: "cascade"
+    }),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }).references(
+      () => apiCredentials.id,
+      { onDelete: "set null" }
+    ),
+    kind: mysqlEnum("kind", ["task", "file", "local_asset"]).notNull(),
+    upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
+    status: mysqlEnum("status", ["pending", "completed", "failed"]).default("pending").notNull(),
+    attemptCount: int("attemptCount", { unsigned: true }).default(0).notNull(),
+    lastError: text("lastError"),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("kb_reset_cleanup_request_resource_uq").on(
+      table.resetRequestId,
+      table.kind,
+      table.upstreamId
+    ),
+    index("kb_reset_cleanup_status_attempt_idx").on(
+      table.status,
+      table.attemptCount
     )
   ]
 );
@@ -3232,7 +3452,8 @@ var accountMarketEditionSchema = z4.enum(["domestic", "overseas"]);
 // shared/delivery-ticket.ts
 var deliveryTicketTypeSchema = z5.enum([
   "content_asset",
-  "website_operation"
+  "website_operation",
+  "knowledge_base"
 ]);
 var deliveryTicketQuotaPoolSchema = z5.enum([
   "content_asset_publish",
@@ -3373,7 +3594,7 @@ var icpNonSensitiveDeclarationsSchema = z5.object({
 }).strict();
 var createDeliveryTicketSchema = z5.object({
   clientRequestId: z5.string().uuid(),
-  type: deliveryTicketTypeSchema,
+  type: z5.enum(["content_asset", "website_operation"]),
   category: optionalTrimmedText(64),
   topic: optionalTrimmedText(512),
   title: optionalTrimmedText(512),
@@ -3601,13 +3822,17 @@ var publicContentAssetTicketSummarySchema = publicDeliveryTicketSummaryBaseSchem
 var publicWebsiteTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
   type: z5.literal("website_operation")
 }).strict();
+var publicKnowledgeBaseTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
+  type: z5.literal("knowledge_base")
+}).strict();
 var publicDeliveryTicketSummarySchema = z5.discriminatedUnion("type", [
   publicContentAssetTicketSummarySchema,
-  publicWebsiteTicketSummarySchema
+  publicWebsiteTicketSummarySchema,
+  publicKnowledgeBaseTicketSummarySchema
 ]);
 var publicDeliveryTicketEventSchema = z5.object({
   id: z5.string().uuid(),
-  actorRole: z5.enum(["user", "admin", "system"]),
+  actorRole: z5.enum(["user", "admin", "delivery_member", "system"]),
   actorLabel: z5.enum(["\u7528\u6237", "\u670D\u52A1\u56E2\u961F"]),
   message: z5.string().max(5e4).nullable(),
   createdAt: z5.number().int().nonnegative().nullable()
@@ -3634,9 +3859,14 @@ var publicContentAssetTicketDetailSchema = z5.object({
 var publicWebsiteTicketDetailSchema = z5.object({
   ticket: publicWebsiteTicketSummarySchema
 }).strict();
+var publicKnowledgeBaseTicketDetailSchema = z5.object({
+  ticket: publicKnowledgeBaseTicketSummarySchema,
+  events: z5.array(publicDeliveryTicketEventSchema)
+}).strict();
 var publicDeliveryTicketDetailSchema = z5.union([
   publicContentAssetTicketDetailSchema,
-  publicWebsiteTicketDetailSchema
+  publicWebsiteTicketDetailSchema,
+  publicKnowledgeBaseTicketDetailSchema
 ]);
 var publicDeliveryTicketQuotaSchema = z5.object({
   type: deliveryTicketQuotaPoolSchema,
@@ -3673,6 +3903,12 @@ var publicDeliveryTicketWorkspaceMetadataSchema = z5.object({
   websiteContentCatalog: z5.array(publicWebsiteContentCatalogItemSchema),
   marketEdition: accountMarketEditionSchema,
   preferredMediaOptions: z5.array(preferredContentMediaSchema),
+  deliveryOwners: z5.object({
+    knowledgeBase: z5.boolean(),
+    monitoringOptimization: z5.boolean(),
+    contentDistribution: z5.boolean(),
+    websiteOperations: z5.boolean()
+  }).strict(),
   websiteWorkflow: z5.object({
     domainCompleted: z5.boolean(),
     icpCompleted: z5.boolean(),
@@ -3726,7 +3962,66 @@ import { and as and2, desc as desc2, eq as eq3, gte } from "drizzle-orm";
 var DAY_MS = 24 * 60 * 60 * 1e3;
 
 // server/admin-control-plane-service.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
 import { and as and4, desc as desc4, eq as eq5, gte as gte2, inArray as inArray3, isNull as isNull2, lt, or } from "drizzle-orm";
+function getEffectiveAdminAccessLevel(user) {
+  if (user.role !== "admin") return null;
+  return isExplicitAdminAccessLevel(user.adminAccessLevel) ? user.adminAccessLevel : null;
+}
+async function requireDb2() {
+  const db = await getDb();
+  if (!db) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Database is not configured"
+    );
+  }
+  return db;
+}
+var SENSITIVE_AUDIT_KEY = /(?:^|[_-])(password|passphrase|secret|token|authorization|cookie|encrypted[_-]?key|encryption[_-]?(?:iv|auth[_-]?tag)|api[_-]?key)(?:$|[_-])|(?:password|passphrase|secret|token|apiKey|authorization|cookie|encryptedKey|encryptionIv|encryptionAuthTag|authTag)$/i;
+function sanitizeAuditValue(value, depth) {
+  if (depth > 6) return "[TRUNCATED]";
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    return value;
+  }
+  if (typeof value === "string") {
+    return value.length > 4e3 ? `${value.slice(0, 4e3)}\u2026` : value;
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) {
+    return value.slice(0, 100).map((item) => sanitizeAuditValue(item, depth + 1));
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value).slice(0, 100).map(([key, item]) => [
+      key,
+      SENSITIVE_AUDIT_KEY.test(key) ? "[REDACTED]" : sanitizeAuditValue(item, depth + 1)
+    ]);
+    return Object.fromEntries(entries);
+  }
+  return String(value);
+}
+function sanitizeAuditMetadata(metadata) {
+  return sanitizeAuditValue(metadata ?? {}, 0) ?? {};
+}
+async function writeWorkspaceAuditEvent(input, executor) {
+  const db = executor ?? await requireDb2();
+  const event = {
+    id: randomUUID2(),
+    actorUserId: input.actor.id,
+    actorUsername: input.actor.username.slice(0, 64),
+    actorAccessLevel: getEffectiveAdminAccessLevel(input.actor),
+    action: input.action.slice(0, 128),
+    targetType: input.targetType.slice(0, 64),
+    targetId: String(input.targetId).slice(0, 191),
+    workspaceUserId: input.workspaceUserId ?? null,
+    reason: input.reason?.trim() || null,
+    metadata: sanitizeAuditMetadata(input.metadata),
+    createdAt: input.now ?? /* @__PURE__ */ new Date()
+  };
+  await db.insert(workspaceAuditEvents).values(event);
+  return event;
+}
 
 // server/dashboard-service.ts
 var CREDIT_PAGE_LIMIT = 100;
@@ -6757,7 +7052,7 @@ router.post("/download-token", async (req, res) => {
         error: { message: "Missing fileId", code: "MISSING_FILE_ID" }
       });
     }
-    const token = randomUUID2();
+    const token = randomUUID3();
     if (!req.frontmindUser || !req.frontmindCredential) {
       return res.status(401).json({ error: { message: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHORIZED" } });
     }
@@ -7013,6 +7308,21 @@ router.all("/*", async (req, res) => {
           kind: isTaskCreate ? "task" : "file",
           upstreamId: resourceId
         });
+        if (isTaskCreate && req.frontmindUser.role === "delivery_member" && req.frontmindDeliveryRoleContext) {
+          await writeWorkspaceAuditEvent({
+            actor: req.frontmindUser,
+            action: "delivery_member.agent.task_created",
+            targetType: "upstream_task",
+            targetId: resourceId,
+            workspaceUserId: null,
+            metadata: {
+              roleAssignmentId: req.frontmindDeliveryRoleContext.assignmentId,
+              roleId: req.frontmindDeliveryRoleContext.roleId,
+              roleType: req.frontmindDeliveryRoleContext.roleType,
+              teamName: req.frontmindDeliveryRoleContext.teamName
+            }
+          });
+        }
       }
       for (const fileId of collectOutputFileIds(response.data)) {
         await recordUpstreamResource({

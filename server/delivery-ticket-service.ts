@@ -17,6 +17,9 @@ import {
 
 import {
   deliveryTicketAttachments,
+  deliveryCustomerAssignments,
+  deliveryRoleMembers,
+  deliveryRoles,
   deliveryTicketEvents,
   deliveryTickets,
   icpSensitiveMaterials,
@@ -37,6 +40,7 @@ import {
   deliveryTicketPublicStatus,
   icpNonSensitiveDeclarationsSchema,
   publicContentAssetTicketDetailSchema,
+  publicKnowledgeBaseTicketDetailSchema,
   publicDeliveryTicketSummarySchema,
   publicDeliveryTicketWorkspaceMetadataSchema,
   publicWebsiteTicketDetailSchema,
@@ -685,6 +689,9 @@ export function deliveryLinksFromOperationResults(values: unknown[]) {
 function publicDeliveryCategoryLabel(ticket: InternalDeliveryTicketDto) {
   const category = nonEmpty(ticket.category);
   if (!category) return null;
+  if (ticket.type === "knowledge_base") {
+    return category === "knowledge_reset" ? "知识库重置" : category;
+  }
   if (ticket.type === "content_asset") {
     return (
       CONTENT_ASSET_CATALOG.find((item) => item.id === category)?.label ??
@@ -734,10 +741,15 @@ export function toPublicDeliveryTicketSummary(
               ? publicDeliveryLinks(ticket.deliveryLinks)
               : [],
         }
-      : {
-          ...base,
-          type: "website_operation",
-        },
+      : ticket.type === "website_operation"
+        ? {
+            ...base,
+            type: "website_operation",
+          }
+        : {
+            ...base,
+            type: "knowledge_base",
+          },
   );
 }
 
@@ -1169,29 +1181,60 @@ export async function getDeliveryTicketWorkspace(userId: number) {
 export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
   const db = await requireDb();
   const portal = await getServicePortal(userId);
-  const [accountRows, siteProfile, quotas, pendingRows] = await Promise.all([
-    db
-      .select({ marketEdition: users.marketEdition })
-      .from(users)
-      .where(eq(users.id, userId))
-      .limit(1),
-    loadSiteProfile(db, userId),
-    currentQuota(db, userId, portal),
-    db
-      .select({ value: count() })
-      .from(deliveryTickets)
-      .where(
-        and(
-          eq(deliveryTickets.userId, userId),
-          inArray(deliveryTickets.status, [
-            "submitted",
-            "needs_information",
-            "scheduled",
-            "in_progress",
-          ]),
+  const [accountRows, siteProfile, quotas, pendingRows, ownerRows] =
+    await Promise.all([
+      db
+        .select({ marketEdition: users.marketEdition })
+        .from(users)
+        .where(eq(users.id, userId))
+        .limit(1),
+      loadSiteProfile(db, userId),
+      currentQuota(db, userId, portal),
+      db
+        .select({ value: count() })
+        .from(deliveryTickets)
+        .where(
+          and(
+            eq(deliveryTickets.userId, userId),
+            inArray(deliveryTickets.status, [
+              "submitted",
+              "needs_information",
+              "scheduled",
+              "in_progress",
+            ]),
+          ),
         ),
-      ),
-  ]);
+      db
+        .select({ roleType: deliveryCustomerAssignments.roleType })
+        .from(deliveryCustomerAssignments)
+        .innerJoin(
+          deliveryRoles,
+          eq(deliveryCustomerAssignments.roleId, deliveryRoles.id),
+        )
+        .innerJoin(
+          deliveryRoleMembers,
+          and(
+            eq(deliveryRoleMembers.roleId, deliveryCustomerAssignments.roleId),
+            eq(
+              deliveryRoleMembers.memberUserId,
+              deliveryCustomerAssignments.primaryMemberId,
+            ),
+          ),
+        )
+        .innerJoin(
+          users,
+          eq(users.id, deliveryCustomerAssignments.primaryMemberId),
+        )
+        .where(
+          and(
+            eq(deliveryCustomerAssignments.customerUserId, userId),
+            eq(deliveryRoles.isActive, true),
+            eq(deliveryRoleMembers.isActive, true),
+            eq(users.isActive, true),
+          ),
+        ),
+    ]);
+  const ownerTypes = new Set(ownerRows.map((row) => row.roleType));
   const domainCompleted = siteProfile?.domainStatus === "completed";
   const icpCompleted =
     siteProfile?.icpStatus === "approved" ||
@@ -1206,6 +1249,14 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
     marketEdition,
     preferredMediaOptions:
       contentAssetMediaOptionsForMarketEdition(marketEdition),
+    deliveryOwners: {
+      knowledgeBase: ownerTypes.has("knowledge_base_engineer"),
+      monitoringOptimization: ownerTypes.has(
+        "monitoring_optimization_engineer",
+      ),
+      contentDistribution: ownerTypes.has("content_distribution_engineer"),
+      websiteOperations: ownerTypes.has("website_operations_engineer"),
+    },
     websiteWorkflow: {
       domainStatus: siteProfile?.domainStatus ?? "not_started",
       icpStatus: siteProfile?.icpStatus ?? "not_submitted",
@@ -1232,49 +1283,75 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
 export function toPublicDeliveryTicketWorkspaceMetadata(
   metadata: Awaited<ReturnType<typeof getDeliveryTicketWorkspaceMetadata>>,
 ): PublicDeliveryTicketWorkspaceMetadata {
+  const deliveryOwners = metadata.deliveryOwners ?? {
+    knowledgeBase: true,
+    monitoringOptimization: true,
+    contentDistribution: true,
+    websiteOperations: true,
+  };
   const domainPending = metadata.siteProfile?.domainStatus === "pending";
   const icpPending =
     metadata.siteProfile?.icpStatus === "preparing" ||
     metadata.siteProfile?.icpStatus === "submitted";
   const domainCompleted = metadata.websiteWorkflow.domainCompleted;
   const icpCompleted = metadata.websiteWorkflow.icpCompleted;
-  const quota = (value: DeliveryTicketQuota) => ({
+  const quota = (value: DeliveryTicketQuota, hasOwner: boolean) => ({
     type: value.type,
-    allowed: value.allowed,
+    allowed: value.allowed && hasOwner,
     used: value.used,
     limit: value.limit,
     remaining: value.remaining,
-    reason: value.reason,
+    reason: hasOwner
+      ? value.reason
+      : "该业务尚未配置负责人，请联系交付管理员。",
   });
   return publicDeliveryTicketWorkspaceMetadataSchema.parse({
     quotas: {
-      content_asset_publish: quota(metadata.quotas.content_asset_publish),
-      website_content_publish: quota(metadata.quotas.website_content_publish),
+      content_asset_publish: quota(
+        metadata.quotas.content_asset_publish,
+        deliveryOwners.contentDistribution,
+      ),
+      website_content_publish: quota(
+        metadata.quotas.website_content_publish,
+        deliveryOwners.websiteOperations,
+      ),
     },
     contentAssetCatalog: metadata.contentAssetCatalog,
     websiteContentCatalog: metadata.websiteContentCatalog,
     marketEdition: metadata.marketEdition,
     preferredMediaOptions: metadata.preferredMediaOptions,
+    deliveryOwners,
     websiteWorkflow: {
       domainCompleted,
       icpCompleted,
-      canSubmitDomain: !domainCompleted && !domainPending,
-      canSubmitIcp: !icpCompleted && !domainPending && !icpPending,
-      canSubmitContent: domainCompleted && icpCompleted,
+      canSubmitDomain:
+        deliveryOwners.websiteOperations && !domainCompleted && !domainPending,
+      canSubmitIcp:
+        deliveryOwners.websiteOperations &&
+        !icpCompleted &&
+        !domainPending &&
+        !icpPending,
+      canSubmitContent:
+        deliveryOwners.websiteOperations && domainCompleted && icpCompleted,
       domainLockReason: domainPending
         ? "域名申请工单待管理员受理。"
-        : domainCompleted
-          ? null
-          : null,
-      icpLockReason:
-        domainPending || icpPending
+        : !deliveryOwners.websiteOperations
+          ? "该业务尚未配置负责人，请联系交付管理员。"
+          : domainCompleted
+            ? null
+            : null,
+      icpLockReason: !deliveryOwners.websiteOperations
+        ? "该业务尚未配置负责人，请联系交付管理员。"
+        : domainPending || icpPending
           ? "域名与 ICP 备案结果待管理员确认。"
           : null,
-      contentLockReason: !domainCompleted
-        ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
-        : !icpCompleted
-          ? "请先提交并确认域名与 ICP 主体备案号。"
-          : null,
+      contentLockReason: !deliveryOwners.websiteOperations
+        ? "该业务尚未配置负责人，请联系交付管理员。"
+        : !domainCompleted
+          ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
+          : !icpCompleted
+            ? "请先提交并确认域名与 ICP 主体备案号。"
+            : null,
       icpProvinceOptions: metadata.websiteWorkflow.icpProvinceOptions,
     },
   });
@@ -1530,6 +1607,64 @@ export async function createDeliveryTicket(input: {
         const now = new Date();
         const ticketId = randomUUID();
         const eventId = randomUUID();
+        const workflowDomain =
+          input.value.type === "content_asset"
+            ? ("content_distribution_engineer" as const)
+            : input.value.category === "knowledge_base_maintenance"
+              ? ("knowledge_base_engineer" as const)
+              : ("website_operations_engineer" as const);
+        const operation =
+          input.value.type === "content_asset"
+            ? "content_asset_publish"
+            : input.value.category === "knowledge_base_maintenance"
+              ? "knowledge_maintenance"
+              : input.value.category;
+        const ownerRows = await tx
+          .select({
+            roleId: deliveryCustomerAssignments.roleId,
+            memberId: deliveryCustomerAssignments.primaryMemberId,
+          })
+          .from(deliveryCustomerAssignments)
+          .innerJoin(
+            deliveryRoles,
+            eq(deliveryCustomerAssignments.roleId, deliveryRoles.id),
+          )
+          .innerJoin(
+            deliveryRoleMembers,
+            and(
+              eq(
+                deliveryRoleMembers.roleId,
+                deliveryCustomerAssignments.roleId,
+              ),
+              eq(
+                deliveryRoleMembers.memberUserId,
+                deliveryCustomerAssignments.primaryMemberId,
+              ),
+            ),
+          )
+          .innerJoin(
+            users,
+            eq(users.id, deliveryCustomerAssignments.primaryMemberId),
+          )
+          .where(
+            and(
+              eq(deliveryCustomerAssignments.customerUserId, input.userId),
+              eq(deliveryCustomerAssignments.roleType, workflowDomain),
+              eq(deliveryRoles.isActive, true),
+              eq(deliveryRoleMembers.isActive, true),
+              eq(users.isActive, true),
+            ),
+          )
+          .limit(1)
+          .for("update");
+        const owner = ownerRows[0];
+        if (!owner) {
+          throw new DeliveryTicketError(
+            "DELIVERY_OWNER_NOT_ASSIGNED",
+            `该业务尚未配置负责人，请联系交付管理员后再提交。`,
+            409,
+          );
+        }
         await tx.insert(deliveryTickets).values({
           id: ticketId,
           userId: input.userId,
@@ -1549,6 +1684,10 @@ export async function createDeliveryTicket(input: {
           icpDeclarations: input.value.icpDeclarations ?? null,
           targetPage: nonEmpty(input.value.targetPage),
           knowledgeSnapshotId: input.value.knowledgeSnapshotId ?? null,
+          workflowDomain,
+          operation,
+          assignedRoleId: owner.roleId,
+          assignedMemberId: owner.memberId,
           technicalDedupeKey: technicalDedupe,
           materialUrls: input.value.materialUrls,
           status: "submitted",
@@ -1818,7 +1957,15 @@ export async function getDeliveryTicketDetail(input: {
       eventType: event.kind,
       visibility: event.visibility,
       actorRole: event.actorRole,
-      actorLabel: event.actorRole === "user" ? "用户" : "管理员",
+      actorLabel:
+        event.actorRole === "user"
+          ? "用户"
+          : event.actorRole === "delivery_member"
+            ? "交付成员"
+            : "管理员",
+      ...(input.includeInternal
+        ? { actorContext: event.actorContext ?? null }
+        : {}),
       message: event.message,
       fromStatus: event.fromStatus,
       toStatus: event.toStatus,
@@ -1856,6 +2003,34 @@ export async function getPublicDeliveryTicketDetail(input: {
   const summary = toPublicDeliveryTicketSummary(ticketDto(ticket));
   if (summary.type === "website_operation") {
     return publicWebsiteTicketDetailSchema.parse({ ticket: summary });
+  }
+
+  if (summary.type === "knowledge_base") {
+    const events = await db
+      .select({
+        id: deliveryTicketEvents.id,
+        actorRole: deliveryTicketEvents.actorRole,
+        message: deliveryTicketEvents.message,
+        createdAt: deliveryTicketEvents.createdAt,
+      })
+      .from(deliveryTicketEvents)
+      .where(
+        and(
+          eq(deliveryTicketEvents.ticketId, ticket.id),
+          eq(deliveryTicketEvents.visibility, "customer"),
+        ),
+      )
+      .orderBy(asc(deliveryTicketEvents.createdAt));
+    return publicKnowledgeBaseTicketDetailSchema.parse({
+      ticket: summary,
+      events: events.map((event) => ({
+        id: event.id,
+        actorRole: event.actorRole,
+        actorLabel: event.actorRole === "user" ? "用户" : "服务团队",
+        message: event.message,
+        createdAt: epoch(event.createdAt),
+      })),
+    });
   }
 
   const [events, attachments] = await Promise.all([

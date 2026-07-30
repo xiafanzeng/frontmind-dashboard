@@ -655,7 +655,8 @@ export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
           executor: db,
           policy,
           credentialFingerprint: fingerprints.website,
-          used: usage.totalUsed,
+          used: usage.keyTotalUsed,
+          accountUsed: usage.websiteUsed,
           status: "ok",
           now,
         });

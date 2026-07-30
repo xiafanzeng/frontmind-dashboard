@@ -299,6 +299,7 @@ export const adminRouter = router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await updateApiUsagePolicy({
             actor: ctx.user,
@@ -358,6 +359,7 @@ export const adminRouter = router({
     adjustQuota: adminProcedure
       .input(adjustDeliveryTicketQuotaSchema)
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await adjustDeliveryTicketQuota({
             actor: ctx.user,
@@ -392,6 +394,7 @@ export const adminRouter = router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           const { userId, ...value } = input;
           return await updateManagedDeliveryTicket({
@@ -422,6 +425,7 @@ export const adminRouter = router({
     recordDelivery: adminProcedure
       .input(recordDeliveryOperationSchema)
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await recordManagedDeliveryOperation({
             actor: ctx.user,
@@ -434,6 +438,7 @@ export const adminRouter = router({
     previewRedirects: adminProcedure
       .input(previewRedirectWorkbookSchema)
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await previewRedirectWorkbook({
             actor: ctx.user,
@@ -446,6 +451,7 @@ export const adminRouter = router({
     confirmRedirects: adminProcedure
       .input(confirmRedirectWorkbookSchema)
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await confirmRedirectWorkbook({
             actor: ctx.user,
@@ -458,6 +464,7 @@ export const adminRouter = router({
     updateSiteProfile: adminProcedure
       .input(updateWorkspaceSiteProfileSchema)
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await updateWorkspaceSiteProfile({
             actor: ctx.user,
@@ -470,6 +477,7 @@ export const adminRouter = router({
     upsertSiteCheck: adminProcedure
       .input(upsertWorkspaceSiteCheckSchema)
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await upsertWorkspaceSiteCheck({
             actor: ctx.user,
@@ -576,6 +584,7 @@ export const adminRouter = router({
           }),
         )
         .mutation(async ({ ctx, input }) => {
+          requireSystemAdmin(ctx.user);
           try {
             await getManagedCredentialStatus(ctx.user, input.userId);
             await assertServiceCapability(input.userId, "contentAssets");
@@ -600,6 +609,7 @@ export const adminRouter = router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await setWorkspaceAssignments({
             actor: ctx.user,
@@ -680,6 +690,7 @@ export const adminRouter = router({
           ),
       )
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
           await assertServiceCapability(input.userId, "questionSelection");
@@ -723,6 +734,7 @@ export const adminRouter = router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
           await assertServiceCapability(input.userId, "questionSelection");
@@ -920,6 +932,7 @@ export const adminRouter = router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
           const existing = await getDashboardWorkspace(input.userId);
@@ -1075,6 +1088,7 @@ export const adminRouter = router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await replaceManagedUserCredential({
             actor: ctx.user,
@@ -1095,6 +1109,7 @@ export const adminRouter = router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await deleteManagedUserCredential({
             actor: ctx.user,
@@ -1225,6 +1240,7 @@ export const adminRouter = router({
       replaceBatch: adminProcedure
         .input(replaceMonitoringBatchSchema)
         .mutation(async ({ ctx, input }) => {
+          requireSystemAdmin(ctx.user);
           try {
             const batch = await replaceMonitoringBatch({
               actor: ctx.user,

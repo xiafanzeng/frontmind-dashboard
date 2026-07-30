@@ -10,6 +10,7 @@ import {
 import {
   collectKnowledgeArchiveDescriptors,
   knowledgeArchiveDescriptorHash,
+  type KnowledgeArchiveDescriptor,
 } from "./knowledge-base-artifact";
 import {
   assertKnowledgeArchiveEnterpriseIdentity,
@@ -22,6 +23,8 @@ import {
   getDashboardWorkspace,
   getLatestKnowledgeSnapshot,
 } from "./dashboard-service";
+import { createKnowledgeMonitoringHandoff } from "./delivery-role-service";
+import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import {
   getPresalesCredentialForResource,
   getPresalesTaskProjectBinding,
@@ -48,6 +51,28 @@ const websiteKnowledgeImportBaseSchema = z.object({
   filename: z.string().trim().min(1).max(512),
 });
 
+const websiteKnowledgeImportCandidateSchema = z
+  .object({
+    taskId: z.string().trim().min(1).max(255),
+    outputItemId: z.string().trim().min(1).max(255),
+    fileId: z.string().trim().min(1).max(255).optional(),
+    descriptorHash: sha256Schema,
+    sha256: sha256Schema,
+  })
+  .strict();
+
+const websiteKnowledgeImportFinalArtifactSchema = z
+  .object({
+    fileId: z.string().trim().min(1).max(255),
+    filename: z.string().trim().min(1).max(512),
+    sha256: sha256Schema,
+    archiveContractVersion: z.literal(3),
+    validationProfile: z.literal("website-lead-v1"),
+    packageManifestSha256: sha256Schema,
+    finalizerVersion: z.literal("website-kb-finalizer-v1"),
+  })
+  .strict();
+
 export const websiteKnowledgeImportSchema = z.discriminatedUnion(
   "schemaVersion",
   [
@@ -62,6 +87,14 @@ export const websiteKnowledgeImportSchema = z.discriminatedUnion(
         archiveContractVersion: z.union([z.literal(1), z.literal(2)]),
         validationProfile: z.literal("website-lead-v1"),
         packageManifestSha256: sha256Schema,
+      })
+      .strict(),
+    z
+      .object({
+        schemaVersion: z.literal(4),
+        companyName: z.string().trim().min(1).max(200),
+        candidate: websiteKnowledgeImportCandidateSchema,
+        finalArtifact: websiteKnowledgeImportFinalArtifactSchema,
       })
       .strict(),
   ],
@@ -100,6 +133,58 @@ export class KnowledgeImportError extends Error {
 
 function normalizedEnterpriseName(value: string) {
   return value.normalize("NFKC").trim().replace(/\s+/g, "").toLowerCase();
+}
+
+function knowledgeImportTaskId(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4 ? value.candidate.taskId : value.taskId;
+}
+
+function knowledgeImportOutputItemId(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4
+    ? value.candidate.outputItemId
+    : value.outputItemId;
+}
+
+function knowledgeImportCandidateFileId(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4 ? value.candidate.fileId : value.fileId;
+}
+
+function knowledgeImportReceiptFileId(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4 ? value.finalArtifact.fileId : value.fileId;
+}
+
+function knowledgeImportDescriptorHash(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4
+    ? value.candidate.descriptorHash
+    : value.descriptorHash;
+}
+
+function knowledgeImportArtifactSha256(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4
+    ? value.finalArtifact.sha256
+    : value.artifactSha256;
+}
+
+function knowledgeImportFilename(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4
+    ? value.finalArtifact.filename
+    : value.filename;
+}
+
+function knowledgeImportPackageManifestSha256(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4
+    ? value.finalArtifact.packageManifestSha256
+    : value.schemaVersion === 3
+      ? value.packageManifestSha256
+      : undefined;
+}
+
+function knowledgeImportArchiveContractVersion(value: WebsiteKnowledgeImport) {
+  return value.schemaVersion === 4
+    ? value.finalArtifact.archiveContractVersion
+    : value.schemaVersion === 3
+      ? value.archiveContractVersion
+      : undefined;
 }
 
 export function resolveKnowledgeImportProjectOwner(
@@ -166,11 +251,25 @@ function idempotencyHash(value: string) {
 }
 
 const websiteKnowledgeImportV3ReferencePrefix = "website-kb:v3";
+const websiteKnowledgeImportV4ReferencePrefix = "website-kb:v4";
 
 export function knowledgeImportReceiptSourceReference(input: {
   projectId: string;
   value: WebsiteKnowledgeImport;
 }) {
+  if (input.value.schemaVersion === 4) {
+    return [
+      websiteKnowledgeImportV4ReferencePrefix,
+      input.value.finalArtifact.finalizerVersion,
+      idempotencyHash(
+        [
+          input.value.candidate.sha256.toLowerCase(),
+          input.value.finalArtifact.sha256.toLowerCase(),
+          input.value.finalArtifact.packageManifestSha256.toLowerCase(),
+        ].join(":"),
+      ),
+    ].join(":");
+  }
   if (input.value.schemaVersion === 3) {
     return [
       websiteKnowledgeImportV3ReferencePrefix,
@@ -197,11 +296,12 @@ function knowledgeArtifactReceiptDescriptorMatchesRequest(
 ) {
   return (
     receipt.projectId === input.projectId &&
-    receipt.taskId === input.value.taskId &&
-    receipt.outputItemId === input.value.outputItemId &&
-    (receipt.fileId ?? null) === (input.value.fileId ?? null) &&
+    receipt.taskId === knowledgeImportTaskId(input.value) &&
+    receipt.outputItemId === knowledgeImportOutputItemId(input.value) &&
+    (receipt.fileId ?? null) ===
+      (knowledgeImportReceiptFileId(input.value) ?? null) &&
     receipt.descriptorHash?.toLowerCase() ===
-      input.value.descriptorHash.toLowerCase()
+      knowledgeImportDescriptorHash(input.value).toLowerCase()
   );
 }
 
@@ -270,7 +370,7 @@ async function reserveReceipt(input: {
         existing.userId === input.userId &&
         knowledgeArtifactReceiptDescriptorMatchesRequest(existing, input) &&
         existing.artifactHash.toLowerCase() ===
-          input.value.artifactSha256.toLowerCase();
+          knowledgeImportArtifactSha256(input.value).toLowerCase();
       if (!sameArtifact) {
         throw new KnowledgeImportError(
           "IDEMPOTENCY_CONFLICT",
@@ -327,7 +427,7 @@ async function reserveReceipt(input: {
           eq(knowledgeImportReceipts.userId, input.userId),
           eq(
             knowledgeImportReceipts.artifactHash,
-            input.value.artifactSha256.toLowerCase(),
+            knowledgeImportArtifactSha256(input.value).toLowerCase(),
           ),
         ),
       )
@@ -363,7 +463,7 @@ async function reserveReceipt(input: {
         };
       }
       if (
-        input.value.schemaVersion === 3 &&
+        input.value.schemaVersion >= 3 &&
         !sameArtifactRequest &&
         existingArtifact.status === "completed" &&
         existingArtifact.snapshotId
@@ -407,14 +507,16 @@ async function reserveReceipt(input: {
         source: "website",
         projectId: input.projectId,
         companyName: input.value.companyName,
-        taskId: input.value.taskId,
-        fileId: input.value.fileId ?? null,
-        outputItemId: input.value.outputItemId,
-        descriptorHash: input.value.descriptorHash.toLowerCase(),
+        taskId: knowledgeImportTaskId(input.value),
+        fileId: knowledgeImportReceiptFileId(input.value) ?? null,
+        outputItemId: knowledgeImportOutputItemId(input.value),
+        descriptorHash: knowledgeImportDescriptorHash(
+          input.value,
+        ).toLowerCase(),
         sourceReference: knowledgeImportReceiptSourceReference(input),
         idempotencyKeyHash: keyHash,
-        artifactHash: input.value.artifactSha256.toLowerCase(),
-        sourceFileName: input.value.filename,
+        artifactHash: knowledgeImportArtifactSha256(input.value).toLowerCase(),
+        sourceFileName: knowledgeImportFilename(input.value),
         status: "processing",
         attemptCount: 1,
         revision: 1,
@@ -475,7 +577,8 @@ export async function importWebsiteKnowledgeArtifact(input: {
     provisions,
     value.companyName,
   );
-  const binding = await getPresalesTaskProjectBinding(value.taskId);
+  const taskId = knowledgeImportTaskId(value);
+  const binding = await getPresalesTaskProjectBinding(taskId);
   if (!binding || binding.projectId !== input.projectId) {
     throw new KnowledgeImportError(
       "TASK_PROJECT_MISMATCH",
@@ -502,6 +605,7 @@ export async function importWebsiteKnowledgeArtifact(input: {
 
   let storedAssetKeys: string[] = [];
   try {
+    await assertKnowledgeBaseWritable(provision.userId);
     try {
       await assertServiceCapability(provision.userId, "knowledgeDisplay");
     } catch (error) {
@@ -514,10 +618,7 @@ export async function importWebsiteKnowledgeArtifact(input: {
       }
       throw error;
     }
-    const credential = await getPresalesCredentialForResource(
-      "task",
-      value.taskId,
-    );
+    const credential = await getPresalesCredentialForResource("task", taskId);
     if (
       !credential ||
       credential.id !== binding.apiCredentialId ||
@@ -530,7 +631,7 @@ export async function importWebsiteKnowledgeArtifact(input: {
       );
     }
     const taskResponse = await axios.get(
-      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(value.taskId)}`,
+      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
       {
         headers: {
           API_KEY: credential.apiKey,
@@ -549,7 +650,7 @@ export async function importWebsiteKnowledgeArtifact(input: {
     }
     const task = taskResponse.data?.task || taskResponse.data || {};
     const returnedTaskId = String(task.id || task.task_id || "");
-    if (returnedTaskId !== value.taskId) {
+    if (returnedTaskId !== taskId) {
       throw new KnowledgeImportError(
         "TASK_PROJECT_MISMATCH",
         "读取到的知识库任务标识不匹配",
@@ -565,10 +666,11 @@ export async function importWebsiteKnowledgeArtifact(input: {
     }
     const matches = collectKnowledgeArchiveDescriptors(task.output).filter(
       (descriptor) =>
-        descriptor.outputItemId === value.outputItemId &&
-        (!value.fileId || descriptor.fileId === value.fileId) &&
+        descriptor.outputItemId === knowledgeImportOutputItemId(value) &&
+        (!knowledgeImportCandidateFileId(value) ||
+          descriptor.fileId === knowledgeImportCandidateFileId(value)) &&
         knowledgeArchiveDescriptorHash(descriptor) ===
-          value.descriptorHash.toLowerCase(),
+          knowledgeImportDescriptorHash(value).toLowerCase(),
     );
     if (matches.length !== 1) {
       throw new KnowledgeImportError(
@@ -577,15 +679,24 @@ export async function importWebsiteKnowledgeArtifact(input: {
         409,
       );
     }
+    const finalDescriptor: KnowledgeArchiveDescriptor =
+      value.schemaVersion === 4
+        ? {
+            outputItemId: value.candidate.outputItemId,
+            fileId: value.finalArtifact.fileId,
+            filename: value.finalArtifact.filename,
+            mimeType: "application/zip",
+          }
+        : matches[0]!;
     const downloaded = await downloadArchiveBytes({
-      descriptor: matches[0]!,
+      descriptor: finalDescriptor,
       apiKey: credential.apiKey,
       baseUrl: getUpstreamBaseUrl(),
     });
     const archiveHash = createHash("sha256")
       .update(downloaded.buffer)
       .digest("hex");
-    if (archiveHash !== value.artifactSha256.toLowerCase()) {
+    if (archiveHash !== knowledgeImportArtifactSha256(value).toLowerCase()) {
       throw new KnowledgeImportError(
         "ARTIFACT_HASH_MISMATCH",
         "知识库 ZIP 哈希与官网声明不一致",
@@ -599,15 +710,15 @@ export async function importWebsiteKnowledgeArtifact(input: {
       snapshotId,
       {
         validationProfile:
-          value.schemaVersion === 3 ? "website-lead-v1" : "historical",
-        archiveContractVersion:
-          value.schemaVersion === 3 ? value.archiveContractVersion : undefined,
+          value.schemaVersion >= 3 ? "website-lead-v1" : "historical",
+        archiveContractVersion: knowledgeImportArchiveContractVersion(value),
       },
     );
+    const packageManifestSha256 = knowledgeImportPackageManifestSha256(value);
     if (
-      value.schemaVersion === 3 &&
+      packageManifestSha256 &&
       parsed.packageManifestSha256?.toLowerCase() !==
-        value.packageManifestSha256.toLowerCase()
+        packageManifestSha256.toLowerCase()
     ) {
       throw new KnowledgeImportError(
         "ARTIFACT_HASH_MISMATCH",
@@ -637,8 +748,8 @@ export async function importWebsiteKnowledgeArtifact(input: {
       userId: provision.userId,
       actorUserId: provision.userId,
       sourceFileName: downloaded.filename,
-      sourceTaskId: value.taskId,
-      sourceArtifactHash: value.descriptorHash.toLowerCase(),
+      sourceTaskId: taskId,
+      sourceArtifactHash: knowledgeImportDescriptorHash(value).toLowerCase(),
       archiveHash,
       documents: parsed.documents,
       assets: parsed.assets,
@@ -661,6 +772,10 @@ export async function importWebsiteKnowledgeArtifact(input: {
           eq(knowledgeImportReceipts.status, "processing"),
         ),
       );
+    await createKnowledgeMonitoringHandoff({
+      userId: provision.userId,
+      actorUserId: provision.userId,
+    });
     return {
       status: "completed" as const,
       replayed: false,

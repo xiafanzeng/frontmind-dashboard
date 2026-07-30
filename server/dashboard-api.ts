@@ -2,14 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import axios from "axios";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import ExcelJS from "exceljs";
 import express from "express";
 import JSZip from "jszip";
 import sharp from "sharp";
 import { z } from "zod";
 
-import { userDashboardContents } from "../drizzle/schema";
+import { deliveryTickets, userDashboardContents } from "../drizzle/schema";
 import {
   dashboardContentAssetSchema,
   dashboardAdminImportModuleSchema,
@@ -75,6 +75,7 @@ import {
 } from "./knowledge-base-artifact";
 import { customerFormalContentViolation } from "./knowledge-customer-content";
 import { assertKnowledgeBasePublishable } from "./knowledge-base-progress-service";
+import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import {
   assertServiceCapability,
   ServiceEntitlementError,
@@ -96,8 +97,14 @@ import {
   saveResponseLogicEntriesBatch,
 } from "./response-logic-service";
 import { getUpstreamBaseUrl } from "./upstream-config";
+import { getDb } from "./db";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { assertKnowledgeMaintenanceTicketForUpload } from "./delivery-ticket-service";
+import {
+  assertDeliveryRoleContext,
+  createKnowledgeMonitoringHandoff,
+} from "./delivery-role-service";
+import type { DeliveryRoleType } from "../shared/delivery-roles";
 import {
   consumeDashboardImportPreflight,
   dashboardImportPreflightStoreForExecutor,
@@ -108,6 +115,140 @@ import {
 const router = express.Router();
 const MAX_ARCHIVE_ENTRIES = 2_000;
 const MAX_ARCHIVE_BYTES = 250 * 1024 * 1024;
+
+function assertNotDeliveryAdministratorExecution(actor: AuthenticatedUser) {
+  if (actor.role === "admin" && actor.adminAccessLevel === "delivery_admin") {
+    throw new Error("交付管理员只负责流程调度，不能执行上传或发布操作");
+  }
+}
+
+function deliveryRoleAssignmentId(req: express.Request) {
+  return String(req.header("x-delivery-role-assignment-id") || "").trim();
+}
+
+async function assertRoleScopedWorkspaceExecution(input: {
+  req: FrontMindRequest;
+  targetUserId: number;
+  expectedRoleType: DeliveryRoleType;
+  allowCustomerSelf?: boolean;
+  requirePrimaryCustomerAssignment?: boolean;
+}) {
+  const actor = input.req.frontmindUser!;
+  if (actor.role === "delivery_member") {
+    const roleAssignmentId = deliveryRoleAssignmentId(input.req);
+    if (!roleAssignmentId) {
+      throw new Error("缺少当前交付工作角色标识");
+    }
+    return assertDeliveryRoleContext({
+      actor,
+      roleAssignmentId,
+      customerUserId: input.targetUserId,
+      requirePrimaryCustomerAssignment: input.requirePrimaryCustomerAssignment,
+      expectedRoleType: input.expectedRoleType,
+    });
+  }
+  assertNotDeliveryAdministratorExecution(actor);
+  if (
+    actor.role === "user" &&
+    (!input.allowCustomerSelf || actor.id !== input.targetUserId)
+  ) {
+    throw new Error("当前账号不能执行该交付操作");
+  }
+  await assertWorkspaceAccess(actor, input.targetUserId);
+  return null;
+}
+
+const DELIVERY_IMPORT_MODULE_ACCESS: Partial<
+  Record<
+    DashboardAdminImportModule,
+    { roleType: DeliveryRoleType; operations: string[] }
+  >
+> = {
+  keywords: {
+    roleType: "monitoring_optimization_engineer",
+    operations: ["question_catalog"],
+  },
+  questions: {
+    roleType: "monitoring_optimization_engineer",
+    operations: ["question_catalog"],
+  },
+  monitoring: {
+    roleType: "monitoring_optimization_engineer",
+    operations: [
+      "initial_monitoring",
+      "monitoring_import",
+      "monitoring_retest",
+    ],
+  },
+  metrics: {
+    roleType: "monitoring_optimization_engineer",
+    operations: ["stage_report"],
+  },
+  "optimization-report": {
+    roleType: "monitoring_optimization_engineer",
+    operations: ["stage_report"],
+  },
+  "response-logic": {
+    roleType: "content_distribution_engineer",
+    operations: ["response_logic"],
+  },
+  "content-assets": {
+    roleType: "content_distribution_engineer",
+    operations: ["content_asset_publish"],
+  },
+  sections: {
+    roleType: "content_distribution_engineer",
+    operations: ["content_asset_publish"],
+  },
+};
+
+async function assertDeliveryModuleImport(input: {
+  req: FrontMindRequest;
+  targetUserId: number;
+  importModule: DashboardAdminImportModule;
+}) {
+  const access = DELIVERY_IMPORT_MODULE_ACCESS[input.importModule];
+  if (!access) {
+    throw new Error("当前模块不属于交付成员工作台");
+  }
+  const role = await assertRoleScopedWorkspaceExecution({
+    req: input.req,
+    targetUserId: input.targetUserId,
+    expectedRoleType: access.roleType,
+    requirePrimaryCustomerAssignment: false,
+  });
+  const ticketId = String(
+    input.req.header("x-delivery-ticket-id") || "",
+  ).trim();
+  if (!ticketId || !role) {
+    throw new Error("缺少当前交付工单标识");
+  }
+  const db = await getDb();
+  if (!db) throw new Error("数据库暂时不可用");
+  const rows = await db
+    .select({ id: deliveryTickets.id })
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.id, ticketId),
+        eq(deliveryTickets.userId, input.targetUserId),
+        eq(deliveryTickets.workflowDomain, role.roleType),
+        eq(deliveryTickets.assignedRoleId, role.roleId),
+        eq(deliveryTickets.assignedMemberId, input.req.frontmindUser!.id),
+        inArray(deliveryTickets.operation, access.operations),
+        inArray(deliveryTickets.status, [
+          "submitted",
+          "needs_information",
+          "scheduled",
+          "in_progress",
+        ]),
+      ),
+    )
+    .limit(1);
+  if (!rows[0]) {
+    throw new Error("当前工单无权发布该业务模块");
+  }
+}
 const MAX_UNPACKED_BYTES = 220 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
@@ -6208,13 +6349,14 @@ router.put(
     const actor = req.frontmindUser!;
     const targetUserId = Number(req.params.userId);
     try {
-      if (actor.role !== "admin") {
-        throw new Error("只有管理员可以上传进度报告截图");
-      }
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
         throw new Error("用户 ID 无效");
       }
-      await assertWorkspaceAccess(actor, targetUserId);
+      await assertRoleScopedWorkspaceExecution({
+        req,
+        targetUserId,
+        expectedRoleType: "monitoring_optimization_engineer",
+      });
       const bytes = bodyBuffer(req);
       if (bytes.length === 0) throw new Error("答案截图文件为空");
       const filename = decodeHeader(
@@ -6325,8 +6467,14 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
 
   let storedAssetKeys: string[] = [];
   try {
-    await assertWorkspaceAccess(actor, targetUserId);
+    await assertRoleScopedWorkspaceExecution({
+      req,
+      targetUserId,
+      expectedRoleType: "knowledge_base_engineer",
+      allowCustomerSelf: true,
+    });
     await assertServiceCapability(targetUserId, "knowledgeBuild");
+    await assertKnowledgeBaseWritable(targetUserId);
     const build = await assertKnowledgeBasePublishable({
       userId: targetUserId,
       conversationId,
@@ -6439,6 +6587,10 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       assets: parsed.assets,
       totalBytes: downloaded.buffer.length,
     });
+    await createKnowledgeMonitoringHandoff({
+      userId: targetUserId,
+      actorUserId: actor.id,
+    });
     res.json({ kind: "knowledge", snapshot });
   } catch (error) {
     await Promise.all(
@@ -6492,7 +6644,10 @@ router.put(
       return;
     }
     try {
-      await assertWorkspaceAccess(actor, targetUserId);
+      assertNotDeliveryAdministratorExecution(actor);
+      if (actor.role !== "delivery_member") {
+        await assertWorkspaceAccess(actor, targetUserId);
+      }
       const buffer = bodyBuffer(req);
       if (buffer.length === 0) throw new Error("上传文件为空");
       const sourceFileName = decodeHeader(
@@ -6509,20 +6664,30 @@ router.put(
       );
       const extension = path.extname(sourceFileName).toLowerCase();
       const mode = req.header("x-import-mode") || "auto";
-      const mayEditDashboard = actor.role === "admin";
       if (
         mode === "dashboard" ||
         (mode === "auto" && [".csv", ".json", ".xlsx"].includes(extension))
       ) {
-        if (!mayEditDashboard) throw new Error("用户账号不能直接发布看板数据");
+        const importModule = dashboardImportModule(
+          req.header("x-dashboard-module"),
+        );
+        if (actor.role === "delivery_member") {
+          if (importModule === "full") {
+            throw new Error("交付成员不能执行整合看板导入");
+          }
+          await assertDeliveryModuleImport({
+            req,
+            targetUserId,
+            importModule,
+          });
+        } else if (actor.role !== "admin") {
+          throw new Error("用户账号不能直接发布看板数据");
+        }
         const existing = await getDashboardWorkspace(targetUserId);
         assertDashboardImportRevision({
           expectedRevision,
           currentRevision: existing.revision,
         });
-        const importModule = dashboardImportModule(
-          req.header("x-dashboard-module"),
-        );
         assertDashboardImportModuleEnabled(importModule);
         const sectionIdHeader =
           importModule === "section-table"
@@ -7279,6 +7444,12 @@ router.put(
           "用户知识库只能通过“更新知识库”发布已绑定任务的最终版本",
         );
       }
+      await assertRoleScopedWorkspaceExecution({
+        req,
+        targetUserId,
+        expectedRoleType: "knowledge_base_engineer",
+      });
+      await assertKnowledgeBaseWritable(targetUserId);
       await assertServiceCapability(targetUserId, "knowledgeDisplay");
       const maintenanceTicketId =
         req.header("x-maintenance-ticket-id")?.trim() || undefined;
@@ -7330,6 +7501,10 @@ router.put(
           documents: parsed.documents,
           assets: parsed.assets,
           totalBytes: buffer.length,
+        });
+        await createKnowledgeMonitoringHandoff({
+          userId: targetUserId,
+          actorUserId: actor.id,
         });
         await writeWorkspaceAuditEvent({
           actor,

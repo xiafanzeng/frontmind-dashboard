@@ -368,6 +368,20 @@ export default function AdminWorkspace({
     setSelectedUserId(initialUserId);
     setTab(initialTab);
   }, [initialTab, initialUserId]);
+  useEffect(() => {
+    if (
+      workspaceQuery.data &&
+      !workspaceQuery.data.isSystemAdmin &&
+      !["service", "activity"].includes(tab)
+    ) {
+      setTab("service");
+      if (selectedUserId) {
+        setLocation(`/admin/customers/${selectedUserId}/service`, {
+          replace: true,
+        });
+      }
+    }
+  }, [selectedUserId, setLocation, tab, workspaceQuery.data]);
 
   const queryInput = { userId: selectedUserId || 1 };
   const dashboardQuery = trpc.admin.workspace.dashboard.useQuery(queryInput, {
@@ -872,7 +886,9 @@ export default function AdminWorkspace({
               <div className="mt-6 flex flex-wrap gap-2 border-t border-[#eee8f2] pt-4">
                 {ADMIN_WORKSPACE_TABS.filter(
                   ({ value }) =>
-                    value !== "credential" || canViewSelectedUserUsage,
+                    (workspaceQuery.data?.isSystemAdmin ||
+                      ["service", "activity"].includes(value)) &&
+                    (value !== "credential" || canViewSelectedUserUsage),
                 ).map(({ value, label, icon: Icon }) => (
                   <button
                     key={value}

@@ -5,6 +5,7 @@ import {
   RefreshCw,
   Send,
   Sparkles,
+  Trash2,
   Wrench,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -67,6 +68,35 @@ export default function EmbeddedKnowledgeBasePanel({
     refetchInterval: 30_000,
     refetchIntervalInBackground: false,
   });
+  const resetQuery = trpc.workspace.knowledgeReset.status.useQuery(undefined, {
+    enabled: !previewMode && user?.role === "user",
+    retry: false,
+    refetchOnMount: "always",
+    refetchInterval: (query) => (query.state.data?.locked ? 5_000 : 30_000),
+  });
+  const { activeConversation, discardConversationLocally } = useConversation();
+  const [observedResetRevision, setObservedResetRevision] = useState<
+    number | null
+  >(null);
+  useEffect(() => {
+    const revision = resetQuery.data?.revision;
+    if (revision === undefined) return;
+    if (
+      observedResetRevision !== null &&
+      revision > observedResetRevision &&
+      activeConversation
+    ) {
+      discardConversationLocally(activeConversation.id);
+      void knowledgeQuery.refetch();
+    }
+    setObservedResetRevision(revision);
+  }, [
+    activeConversation,
+    discardConversationLocally,
+    knowledgeQuery,
+    observedResetRevision,
+    resetQuery.data?.revision,
+  ]);
 
   return (
     <section
@@ -141,6 +171,12 @@ export default function EmbeddedKnowledgeBasePanel({
               snapshotId={knowledgeQuery.data.snapshot.id}
             />
           )}
+        {!previewMode && resetQuery.data?.hasKnowledge && (
+          <KnowledgeResetButton
+            status={resetQuery.data}
+            onSubmitted={() => resetQuery.refetch()}
+          />
+        )}
       </header>
 
       {page === "display" ? (
@@ -164,10 +200,139 @@ export default function EmbeddedKnowledgeBasePanel({
           onProgressChange={setPreviewProgress}
           mode={mode}
         />
+      ) : resetQuery.data?.locked ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+          <div className="max-w-lg rounded-2xl border bg-muted/30 p-7 text-center">
+            <Loader2 className="mx-auto h-7 w-7 animate-spin text-primary" />
+            <p className="mt-4 font-medium">知识库重置申请正在审批</p>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">
+              工单 {resetQuery.data.pending?.ticketId} 已由
+              {resetQuery.data.pending?.engineerName}{" "}
+              负责。审批期间不能继续回复、上传、发布或启动新构建。
+            </p>
+          </div>
+        </div>
       ) : (
         <RealBuildFlow mode={mode} />
       )}
     </section>
+  );
+}
+
+const RESET_REASONS = [
+  ["stuck", "构建长时间卡住"],
+  ["upload_error", "文件上传错误"],
+  ["build_error", "构建内容错误"],
+  ["enterprise_materials", "企业资料需要重新整理"],
+  ["other", "其他"],
+] as const;
+
+function KnowledgeResetButton({
+  status,
+  onSubmitted,
+}: {
+  status: {
+    locked: boolean;
+    canRequest: boolean;
+    unavailableReason: string | null;
+    pending: { ticketId: string } | null;
+  };
+  onSubmitted: () => Promise<unknown>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [reasonCode, setReasonCode] =
+    useState<(typeof RESET_REASONS)[number][0]>("stuck");
+  const [reasonNote, setReasonNote] = useState("");
+  const submitMutation = trpc.workspace.knowledgeReset.submit.useMutation();
+  const submit = async () => {
+    if (reasonCode === "other" && !reasonNote.trim()) {
+      toast.warning("请填写补充说明");
+      return;
+    }
+    try {
+      await submitMutation.mutateAsync({
+        reasonCode,
+        reasonNote: reasonNote.trim() || undefined,
+      });
+      await onSubmitted();
+      setOpen(false);
+      toast.success("知识库重置申请已提交", {
+        description: "知识库已进入只读锁定，等待负责工程师确认。",
+      });
+    } catch (error) {
+      toast.error("重置申请提交失败", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    }
+  };
+  return (
+    <>
+      <Button
+        variant="outline"
+        className="w-fit shrink-0 text-destructive"
+        disabled={!status.canRequest}
+        title={status.unavailableReason || undefined}
+        onClick={() => setOpen(true)}
+      >
+        <Trash2 className="h-4 w-4" />
+        {status.locked ? "重置申请审批中" : "申请重置知识库"}
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>申请重置知识库</DialogTitle>
+            <DialogDescription>
+              提交后知识库会立即只读锁定。负责该客户的 AI
+              知识库工程师确认后，将清空全部知识库构建、版本、专属对话和附件；其他业务内容不会受影响。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-2">
+            <label className="grid gap-2 text-sm">
+              重置原因
+              <select
+                className="h-10 rounded-md border bg-background px-3"
+                value={reasonCode}
+                onChange={(event) =>
+                  setReasonCode(
+                    event.target.value as (typeof RESET_REASONS)[number][0],
+                  )
+                }
+              >
+                {RESET_REASONS.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="grid gap-2 text-sm">
+              补充说明{reasonCode === "other" ? "（必填）" : "（可选）"}
+              <textarea
+                className="min-h-28 rounded-md border bg-background p-3"
+                maxLength={2_000}
+                value={reasonNote}
+                onChange={(event) => setReasonNote(event.target.value)}
+              />
+            </label>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void submit()}
+              disabled={submitMutation.isPending}
+            >
+              {submitMutation.isPending && (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              )}
+              提交并锁定知识库
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

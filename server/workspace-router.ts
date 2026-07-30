@@ -69,6 +69,11 @@ import {
   toPublicDeliveryTicketCreationResult,
 } from "./delivery-ticket-service";
 import type { DashboardPayload } from "../shared/dashboard";
+import { knowledgeResetReasonSchema } from "../shared/delivery-roles";
+import {
+  getKnowledgeResetStatus,
+  submitKnowledgeReset,
+} from "./knowledge-base-reset-service";
 
 export function projectUserDashboardPayload(input: {
   payload: DashboardPayload;
@@ -145,6 +150,32 @@ function toServiceError(error: unknown): never {
 }
 
 export const workspaceRouter = router({
+  knowledgeReset: router({
+    status: protectedProcedure.query(async ({ ctx }) => {
+      try {
+        return await getKnowledgeResetStatus(ctx.user.id);
+      } catch (error) {
+        toServiceError(error);
+      }
+    }),
+    submit: protectedProcedure
+      .input(
+        z.object({
+          reasonCode: knowledgeResetReasonSchema,
+          reasonNote: z.string().trim().max(2_000).optional(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        try {
+          return await submitKnowledgeReset({
+            actor: ctx.user,
+            ...input,
+          });
+        } catch (error) {
+          toServiceError(error);
+        }
+      }),
+  }),
   portal: protectedProcedure.query(async ({ ctx }) => {
     try {
       const [portal, delivery] = await Promise.all([

@@ -42,6 +42,7 @@ import { knowledgeBaseBuilds } from "../drizzle/schema";
 import { getDb } from "./db";
 import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
 import { buildDeterministicTaskAttachmentArchive } from "./task-attachment-package";
+import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 
 const router = Router();
 
@@ -415,6 +416,7 @@ export async function recoverOpenKnowledgeBaseTasks(options?: {
       const build = builds[cursor++];
       const taskId = String(build.upstreamTaskId || "");
       try {
+        await assertKnowledgeBaseWritable(build.userId);
         const credential = await getCredentialForUpstreamResource(
           build.userId,
           "task",
@@ -844,6 +846,7 @@ export async function buildKnowledgeBasePrompt({
     "不得开启、调用、切换或推荐 Wide Research / Deep Research；只使用当前 Pro Agent 模式下的普通浏览、搜索和文件工具。",
     "客户可见正文与本轮对话只能呈现百科事实，不得呈现任务过程、核验判断、采购/合规建议、读者指令、工具计划或模型推理。",
     "客户可见正文不得嵌入官网或 CDN 图片外链。图片必须先下载真实字节、解码校验并打入最终 ZIP，再以包内相对路径引用；防盗链、签名、过期或无法下载的地址只能进入内部来源记录，绝不能作为客户图片返回。",
+    "资料采集阶段统一向客户显示：FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
     "",
     "## 本次任务输入",
     `构建会话标识：${conversationId || "未提供"}`,
@@ -1066,6 +1069,7 @@ router.post("/start", async (req, res) => {
   }
 
   try {
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
     const existingBuild = await getKnowledgeBaseProgress({
       userId: req.frontmindUser.id,
       conversationId,
@@ -1130,10 +1134,9 @@ router.post("/start", async (req, res) => {
     }> = [skillArchive];
     if (prefillKnowledgeSnapshot) {
       try {
-        const prefillArchive =
-          await buildKnowledgeBasePrefillEvidenceArchive(
-            prefillKnowledgeSnapshot,
-          );
+        const prefillArchive = await buildKnowledgeBasePrefillEvidenceArchive(
+          prefillKnowledgeSnapshot,
+        );
         generatedAttachments.push(
           await uploadUpstreamTaskAttachment({
             baseUrl,
@@ -1144,9 +1147,7 @@ router.post("/start", async (req, res) => {
         );
       } catch (error) {
         await Promise.allSettled(
-          generatedAttachments.map((attachment) =>
-            attachment.removeOrphan(),
-          ),
+          generatedAttachments.map((attachment) => attachment.removeOrphan()),
         );
         throw error;
       }
@@ -1163,9 +1164,7 @@ router.post("/start", async (req, res) => {
 
     if (!created.ok) {
       await Promise.allSettled(
-        generatedAttachments.map((attachment) =>
-          attachment.removeOrphan(),
-        ),
+        generatedAttachments.map((attachment) => attachment.removeOrphan()),
       );
       console.warn(
         "[Knowledge Base Start] create task failed:",
@@ -1296,6 +1295,7 @@ router.post("/turn", async (req, res) => {
   }
 
   try {
+    await assertKnowledgeBaseWritable(req.frontmindUser!.id);
     const boundBuild = await assertKnowledgeBaseTaskBinding({
       userId: req.frontmindUser!.id,
       conversationId,
@@ -1483,6 +1483,7 @@ router.post("/progress/reconcile", async (req, res) => {
     ) {
       return;
     }
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
     const boundBuild = await assertKnowledgeBaseTaskBinding({
       userId: req.frontmindUser!.id,
       conversationId,

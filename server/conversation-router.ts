@@ -6,6 +6,9 @@ import {
   apiCredentials,
   attachments,
   conversations,
+  knowledgeBaseBuilds,
+  knowledgeBaseConversationTombstones,
+  knowledgeBaseResetRequests,
   messages,
   upstreamResources,
   userUsageOwners,
@@ -859,6 +862,52 @@ async function persistSnapshot(
     validatedResourceKeys?: ReadonlySet<string>;
   } = {},
 ): Promise<"imported" | "skipped" | "updated"> {
+  const lockedKnowledgeBuilds = await executor
+    .select({ id: knowledgeBaseBuilds.id })
+    .from(knowledgeBaseBuilds)
+    .innerJoin(
+      knowledgeBaseResetRequests,
+      and(
+        eq(knowledgeBaseResetRequests.userId, knowledgeBaseBuilds.userId),
+        eq(knowledgeBaseResetRequests.status, "pending"),
+      ),
+    )
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, userId),
+        eq(knowledgeBaseBuilds.conversationId, snapshot.id),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  if (lockedKnowledgeBuilds[0]) {
+    if (options.skipExisting) return "skipped";
+    throw new TRPCError({
+      code: "CONFLICT",
+      message: "知识库重置工单正在审批，当前会话已只读锁定",
+    });
+  }
+  const tombstones = await executor
+    .select({ id: knowledgeBaseConversationTombstones.id })
+    .from(knowledgeBaseConversationTombstones)
+    .where(
+      and(
+        eq(knowledgeBaseConversationTombstones.userId, userId),
+        eq(
+          knowledgeBaseConversationTombstones.publicConversationId,
+          snapshot.id,
+        ),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  if (tombstones[0]) {
+    if (options.skipExisting) return "skipped";
+    throw new TRPCError({
+      code: "CONFLICT",
+      message: "该知识库会话已被重置，不能从旧页面重新同步",
+    });
+  }
   const persistedConversationId = storageId(userId, snapshot.id);
   const existingRows = await executor
     .select()

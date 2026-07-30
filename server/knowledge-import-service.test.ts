@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -7,7 +8,31 @@ import {
   websiteKnowledgeImportSchema,
 } from "./knowledge-import-service";
 
-function knowledgeImportRequest(schemaVersion: 2 | 3): Record<string, unknown> {
+function knowledgeImportRequest(
+  schemaVersion: 2 | 3 | 4,
+): Record<string, unknown> {
+  if (schemaVersion === 4) {
+    return {
+      schemaVersion,
+      companyName: "示例企业",
+      candidate: {
+        taskId: "task-website-kb-1",
+        outputItemId: "output-1",
+        fileId: "candidate-file-1",
+        descriptorHash: "a".repeat(64),
+        sha256: "b".repeat(64),
+      },
+      finalArtifact: {
+        fileId: "final-file-1",
+        filename: "示例企业_knowledge_base.zip",
+        sha256: "c".repeat(64),
+        archiveContractVersion: 3,
+        validationProfile: "website-lead-v1",
+        packageManifestSha256: "d".repeat(64),
+        finalizerVersion: "website-kb-finalizer-v1",
+      },
+    };
+  }
   return {
     schemaVersion,
     companyName: "示例企业",
@@ -55,6 +80,50 @@ describe("website knowledge import v2/v3 contract", () => {
       archiveContractVersion: 2,
       validationProfile: "website-lead-v1",
     });
+  });
+
+  it("accepts v4 with separate candidate lineage and finalized artifact", () => {
+    const value = websiteKnowledgeImportSchema.parse(knowledgeImportRequest(4));
+    expect(value).toMatchObject({
+      schemaVersion: 4,
+      candidate: {
+        taskId: "task-website-kb-1",
+        outputItemId: "output-1",
+        fileId: "candidate-file-1",
+        descriptorHash: "a".repeat(64),
+        sha256: "b".repeat(64),
+      },
+      finalArtifact: {
+        fileId: "final-file-1",
+        sha256: "c".repeat(64),
+        archiveContractVersion: 3,
+        validationProfile: "website-lead-v1",
+        packageManifestSha256: "d".repeat(64),
+        finalizerVersion: "website-kb-finalizer-v1",
+      },
+    });
+  });
+
+  it("rejects v4 with an unsupported archive contract or finalizer", () => {
+    const request = knowledgeImportRequest(4) as any;
+    expect(() =>
+      websiteKnowledgeImportSchema.parse({
+        ...request,
+        finalArtifact: {
+          ...request.finalArtifact,
+          archiveContractVersion: 2,
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      websiteKnowledgeImportSchema.parse({
+        ...request,
+        finalArtifact: {
+          ...request.finalArtifact,
+          finalizerVersion: "unknown-finalizer",
+        },
+      }),
+    ).toThrow();
   });
 
   it.each([
@@ -207,9 +276,7 @@ describe("website knowledge import v2/v3 contract", () => {
         projectId: "project-1",
         value: v2,
       }),
-    ).toBe(
-      `website-kb:v3:2:website-lead-v1:${v2.packageManifestSha256}`,
-    );
+    ).toBe(`website-kb:v3:2:website-lead-v1:${v2.packageManifestSha256}`);
     expect(
       knowledgeImportReceiptSourceReference({
         projectId: "project-1",
@@ -221,6 +288,39 @@ describe("website knowledge import v2/v3 contract", () => {
         value: v1,
       }),
     );
+  });
+
+  it("binds v4 receipts to candidate, final artifact, manifest, and finalizer", () => {
+    const value = websiteKnowledgeImportSchema.parse(knowledgeImportRequest(4));
+    const input = { projectId: "project-1", value };
+    expect(knowledgeImportReceiptSourceReference(input)).toBe(
+      [
+        "website-kb:v4",
+        value.finalArtifact.finalizerVersion,
+        createHash("sha256")
+          .update(
+            [
+              value.candidate.sha256,
+              value.finalArtifact.sha256,
+              value.finalArtifact.packageManifestSha256,
+            ].join(":"),
+          )
+          .digest("hex"),
+      ].join(":"),
+    );
+    expect(
+      knowledgeArtifactReceiptMatchesRequest(
+        {
+          projectId: "project-1",
+          taskId: value.candidate.taskId,
+          outputItemId: value.candidate.outputItemId,
+          fileId: value.finalArtifact.fileId,
+          descriptorHash: value.candidate.descriptorHash,
+          sourceReference: knowledgeImportReceiptSourceReference(input),
+        },
+        input,
+      ),
+    ).toBe(true);
   });
 
   it("allows repeated purchases for one project when they resolve to one account and enterprise", () => {

@@ -44,6 +44,21 @@ const DEFAULT_CONFIG = {
 const DEVICE_PREFERENCES_STORAGE_KEY = "frontmind-client-preferences";
 
 export const CREATE_TASK_TIMEOUT_MS = 300_000;
+export const DELIVERY_ROLE_STORAGE_KEY = "frontmind.delivery.roleAssignmentId";
+
+function deliveryRoleHeaders(
+  headers: Record<string, string> = {},
+): Record<string, string> {
+  const roleAssignmentId = localStorage
+    .getItem(DELIVERY_ROLE_STORAGE_KEY)
+    ?.trim();
+  return {
+    ...headers,
+    ...(roleAssignmentId
+      ? { "x-delivery-role-assignment-id": roleAssignmentId }
+      : {}),
+  };
+}
 
 function normalizePublicAgentProfile(value: string | undefined): string {
   if (value === "frontmind-lite") return "frontmind-lite";
@@ -263,10 +278,10 @@ async function apiRequest(
 ): Promise<Response> {
   const url = `/api/frontmind${endpoint}`;
 
-  const headers: Record<string, string> = {
+  const headers = deliveryRoleHeaders({
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string>),
-  };
+  });
 
   const isPost =
     options.method?.toUpperCase() === "POST" ||
@@ -856,9 +871,7 @@ async function uploadFileToUrlViaProxy(
               : "文件上传失败，请稍后重试"),
         ) as Error & { status?: number };
         error.status = xhr.status;
-        reject(
-          error,
-        );
+        reject(error);
       }
     });
 
@@ -993,7 +1006,7 @@ export async function fetchCreditUsage(
     }
 
     const response = await fetch("/api/frontmind/account-credit-usage", {
-      headers: { "Content-Type": "application/json" },
+      headers: deliveryRoleHeaders({ "Content-Type": "application/json" }),
       credentials: "include",
     });
     if (!response.ok) {
@@ -1038,7 +1051,7 @@ export async function testConnection(): Promise<{
   try {
     const url = `/api/frontmind/credential-check`;
     const response = await fetch(url, {
-      headers: { "Content-Type": "application/json" },
+      headers: deliveryRoleHeaders({ "Content-Type": "application/json" }),
       credentials: "include",
     });
 

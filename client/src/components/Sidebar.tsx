@@ -58,6 +58,7 @@ interface SidebarProps {
   embedded?: boolean;
   hidePortalNavigation?: boolean;
   showAccountMenu?: boolean;
+  showSettings?: boolean;
 }
 
 export default function Sidebar({
@@ -67,6 +68,7 @@ export default function Sidebar({
   embedded = false,
   hidePortalNavigation = false,
   showAccountMenu = true,
+  showSettings = true,
 }: SidebarProps) {
   const isMobile = useIsMobile();
   const [, setLocation] = useLocation();
@@ -152,6 +154,7 @@ export default function Sidebar({
             isSystemAdmin={isSystemAdmin}
             hidePortalNavigation={hidePortalNavigation}
             showAccountMenu={showAccountMenu}
+            showSettings={showSettings}
             onOpenAdmin={() => {
               setLocation("/");
               setOpen(false);
@@ -206,25 +209,27 @@ export default function Sidebar({
 
       {/* New Chat Button */}
       <div className="relative z-10 px-3 pt-3 pb-1 flex-shrink-0">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              onClick={() => createConversation()}
-              variant="outline"
-              className={cn(
-                "w-full border-border/70 bg-card/70 hover:bg-card text-sidebar-foreground hover:text-foreground transition-all duration-200 shadow-sm",
-                collapsed ? "px-0 justify-center" : "justify-start gap-2",
-              )}
-              size="sm"
-            >
-              <Plus className="w-4 h-4 flex-shrink-0" />
-              {!collapsed && <span className="text-sm">新内容流程</span>}
-            </Button>
-          </TooltipTrigger>
-          {collapsed && (
-            <TooltipContent side="right">新内容流程</TooltipContent>
-          )}
-        </Tooltip>
+        {showSettings && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                onClick={() => createConversation()}
+                variant="outline"
+                className={cn(
+                  "w-full border-border/70 bg-card/70 hover:bg-card text-sidebar-foreground hover:text-foreground transition-all duration-200 shadow-sm",
+                  collapsed ? "px-0 justify-center" : "justify-start gap-2",
+                )}
+                size="sm"
+              >
+                <Plus className="w-4 h-4 flex-shrink-0" />
+                {!collapsed && <span className="text-sm">新内容流程</span>}
+              </Button>
+            </TooltipTrigger>
+            {collapsed && (
+              <TooltipContent side="right">新内容流程</TooltipContent>
+            )}
+          </Tooltip>
+        )}
       </div>
 
       {/* Conversation List */}
@@ -521,6 +526,7 @@ interface SidebarInnerProps {
   isSystemAdmin: boolean;
   hidePortalNavigation: boolean;
   showAccountMenu: boolean;
+  showSettings: boolean;
   onOpenAdmin: () => void;
   onOpenPresales: () => void;
 }
@@ -540,6 +546,7 @@ function SidebarInner({
   isSystemAdmin,
   hidePortalNavigation,
   showAccountMenu,
+  showSettings,
   onOpenAdmin,
   onOpenPresales,
 }: SidebarInnerProps) {
@@ -566,15 +573,17 @@ function SidebarInner({
 
       {/* New Chat Button */}
       <div className="relative z-10 shrink-0 px-3 pb-1 pt-3">
-        <Button
-          onClick={() => createConversation()}
-          variant="outline"
-          className="w-full justify-start gap-2 border-border/70 bg-card/70 text-sidebar-foreground shadow-sm transition-all duration-200 hover:bg-card hover:text-foreground"
-          size="sm"
-        >
-          <Plus className="w-4 h-4 flex-shrink-0" />
-          <span className="text-sm">新内容流程</span>
-        </Button>
+        {showSettings && (
+          <Button
+            onClick={() => createConversation()}
+            variant="outline"
+            className="w-full justify-start gap-2 border-border/70 bg-card/70 text-sidebar-foreground shadow-sm transition-all duration-200 hover:bg-card hover:text-foreground"
+            size="sm"
+          >
+            <Plus className="w-4 h-4 flex-shrink-0" />
+            <span className="text-sm">新内容流程</span>
+          </Button>
+        )}
       </div>
 
       {/* Conversation List */}

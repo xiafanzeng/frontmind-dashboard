@@ -24,6 +24,7 @@ export default function Home({
   hidePortalNavigation = false,
   showKnowledgeBaseStarter = true,
   showAccountMenu = true,
+  showSettings = true,
   standardWelcomeVariant = "simple",
   responseLogicContext,
 }: {
@@ -35,6 +36,7 @@ export default function Home({
   hidePortalNavigation?: boolean;
   showKnowledgeBaseStarter?: boolean;
   showAccountMenu?: boolean;
+  showSettings?: boolean;
   standardWelcomeVariant?: "simple" | "workflow";
   responseLogicContext?: ResponseLogicTaskContext;
 } = {}) {
@@ -154,6 +156,7 @@ export default function Home({
           embedded={embedded}
           hidePortalNavigation={hidePortalNavigation}
           showAccountMenu={showAccountMenu}
+          showSettings={showSettings}
         />
       )}
 
@@ -171,7 +174,9 @@ export default function Home({
       </main>
 
       {/* Settings dialog */}
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      {showSettings && (
+        <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      )}
     </div>
   );
 }

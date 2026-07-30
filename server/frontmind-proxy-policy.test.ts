@@ -11,7 +11,7 @@ import type { AuthenticatedUser } from "./auth-service";
 import { ServiceEntitlementError } from "./service-entitlement";
 
 function actor(
-  role: "user" | "admin",
+  role: "user" | "admin" | "delivery_member",
   adminAccessLevel: "system_admin" | "delivery_admin" | null = role === "admin"
     ? "delivery_admin"
     : null,
@@ -41,6 +41,40 @@ function response() {
 }
 
 describe("ordinary-user FrontMind proxy policy", () => {
+  it("allows a delivery member to use the assigned-key general agent", async () => {
+    const assertRoleContext = vi.fn(async () => ({
+      assignmentId: "assignment-1",
+      roleId: "role-1",
+      roleType: "knowledge_base_engineer" as const,
+      teamName: "知识库一组",
+    }));
+    const middleware = createFrontMindProxyAccessMiddleware({
+      assertWriteAccess: vi.fn(),
+      assertRoleContext,
+    });
+    const req = {
+      method: "POST",
+      originalUrl: "/api/frontmind/v1/tasks",
+      frontmindUser: actor("delivery_member"),
+      headers: { "x-delivery-role-assignment-id": "assignment-1" },
+    } as FrontMindRequest;
+    const res = response();
+    const next = vi.fn();
+
+    await middleware(req, res as never, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    expect(assertRoleContext).toHaveBeenCalledWith({
+      actor: expect.objectContaining({ role: "delivery_member" }),
+      roleAssignmentId: "assignment-1",
+    });
+    expect(req.frontmindDeliveryRoleContext).toMatchObject({
+      assignmentId: "assignment-1",
+      roleId: "role-1",
+    });
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["GET", "/api/frontmind/v1/tasks/task-1"],
     ["HEAD", "/api/frontmind/v1/files/file-1"],

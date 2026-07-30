@@ -54,6 +54,26 @@ const AdminPresales = lazy(() =>
     default: component,
   })),
 );
+const AdminDeliveryRoles = lazy(() =>
+  import("./pages/AdminDeliveryRoles").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const DeliveryMemberDashboard = lazy(() =>
+  import("./pages/DeliveryMemberDashboard").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const DeliveryMemberAgent = lazy(() =>
+  import("./pages/DeliveryMemberAgent").then(({ default: component }) => ({
+    default: component,
+  })),
+);
+const AdminDeliveryDispatch = lazy(() =>
+  import("./pages/AdminDeliveryDispatch").then(({ default: component }) => ({
+    default: component,
+  })),
+);
 
 const DevelopmentPreviewRouter = import.meta.env.DEV
   ? lazy(() => import("./pages/DevelopmentPreviewRouter"))
@@ -61,13 +81,15 @@ const DevelopmentPreviewRouter = import.meta.env.DEV
 
 function RoleLanding() {
   const { user } = useAuth();
-  return canAccessAdminRoutes(user) ? <AdminDashboard /> : <UserDashboard />;
+  if (canAccessAdminRoutes(user)) return <AdminDashboard />;
+  if (user?.role === "delivery_member") return <DeliveryMemberDashboard />;
+  return <UserDashboard />;
 }
 
 export function canAccessAdminRoutes(
   user:
     | {
-        role: "user" | "admin";
+        role: "user" | "admin" | "delivery_member";
         adminAccessLevel?: "system_admin" | "delivery_admin" | null;
       }
     | null
@@ -91,20 +113,25 @@ function UserOnly({ children }: { children: React.ReactNode }) {
   return user?.role === "user" ? children : <Redirect to="/" />;
 }
 
+function DeliveryMemberOnly({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  return user?.role === "delivery_member" ? children : <Redirect to="/" />;
+}
+
 function Router() {
   return (
     <Switch>
       <Route path={"/"} component={RoleLanding} />
       <Route path={"/login"} component={RoleLanding} />
       <Route path={"/agent"}>
-        <AdminOnly>
+        <SystemAdminOnly>
           <Redirect to="/admin/agent" />
-        </AdminOnly>
+        </SystemAdminOnly>
       </Route>
       <Route path={"/admin/agent"}>
-        <AdminOnly>
+        <SystemAdminOnly>
           <AdminAgent />
-        </AdminOnly>
+        </SystemAdminOnly>
       </Route>
       <Route path={"/knowledge-base"}>
         <UserOnly>
@@ -153,10 +180,30 @@ function Router() {
           <AdminPresales />
         </SystemAdminOnly>
       </Route>
-      <Route path={"/workflow"}>
+      <Route path={"/admin/delivery-roles"}>
         <AdminOnly>
-          <Redirect to="/admin/agent" />
+          <AdminDeliveryRoles />
         </AdminOnly>
+      </Route>
+      <Route path={"/admin/dispatch"}>
+        <AdminOnly>
+          <AdminDeliveryDispatch />
+        </AdminOnly>
+      </Route>
+      <Route path={"/delivery/agent"}>
+        <DeliveryMemberOnly>
+          <DeliveryMemberAgent />
+        </DeliveryMemberOnly>
+      </Route>
+      <Route path={"/delivery/tasks"}>
+        <DeliveryMemberOnly>
+          <DeliveryMemberDashboard taskHistory />
+        </DeliveryMemberOnly>
+      </Route>
+      <Route path={"/workflow"}>
+        <SystemAdminOnly>
+          <Redirect to="/admin/agent" />
+        </SystemAdminOnly>
       </Route>
       <Route path={"/404"} component={NotFound} />
       <Route component={NotFound} />

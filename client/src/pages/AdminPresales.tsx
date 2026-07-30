@@ -101,10 +101,7 @@ export default function AdminPresales() {
       items.find((item: any) => item?.scope === "website_frontend") ?? null
     );
   }, [policyOverviewQuery.data]);
-  const usageWindowDays = Math.max(
-    1,
-    Number(websitePolicy?.windowDays) || 30,
-  );
+  const usageWindowDays = Math.max(1, Number(websitePolicy?.windowDays) || 30);
   const usageQuery = trpc.admin.presales.usage.useQuery(
     { windowDays: usageWindowDays },
     {
@@ -242,11 +239,7 @@ export default function AdminPresales() {
       toast.error("预警比例必须在 1% 到 100% 之间");
       return;
     }
-    if (
-      !Number.isInteger(windowDays) ||
-      windowDays < 1 ||
-      windowDays > 365
-    ) {
+    if (!Number.isInteger(windowDays) || windowDays < 1 || windowDays > 365) {
       toast.error("统计周期必须是 1 到 365 天");
       return;
     }
@@ -295,8 +288,9 @@ export default function AdminPresales() {
     );
   }
 
-  const recentTasks = usageQuery.data?.recentTasks ?? [];
-  const totalUsed = usageQuery.data?.totalUsed ?? 0;
+  const recentWebsiteTasks = usageQuery.data?.recentWebsiteTasks ?? [];
+  const keyTotalUsed = usageQuery.data?.keyTotalUsed ?? 0;
+  const websiteUsed = usageQuery.data?.websiteUsed ?? 0;
   const usageLimit = Math.max(
     1,
     Number(websitePolicy?.limit) || DEFAULT_API_KEY_USAGE_LIMIT,
@@ -308,11 +302,11 @@ export default function AdminPresales() {
       Number(websitePolicy?.warningRatio) || DEFAULT_API_KEY_WARNING_RATIO,
     ),
   );
-  const usagePercentage = Math.round((totalUsed / usageLimit) * 1000) / 10;
+  const usagePercentage = Math.round((keyTotalUsed / usageLimit) * 1000) / 10;
   const usageTone =
-    totalUsed >= usageLimit
+    keyTotalUsed >= usageLimit
       ? "critical"
-      : totalUsed >= usageLimit * warningRatio
+      : keyTotalUsed >= usageLimit * warningRatio
         ? "warning"
         : "normal";
 
@@ -525,8 +519,8 @@ export default function AdminPresales() {
             <Card className="overflow-hidden border-border/70 bg-card/88 shadow-sm backdrop-blur-xl">
               <CardHeader className="border-b border-border/60 pb-5">
                 <CardTitle className="flex items-center gap-2 text-lg">
-                  <Coins className="h-5 w-5 text-primary" />近{" "}
-                  {usageWindowDays} 天积分使用
+                  <Coins className="h-5 w-5 text-primary" />近 {usageWindowDays}{" "}
+                  天积分使用
                 </CardTitle>
                 <p className="text-sm text-muted-foreground">
                   统计当前售前 API Key 下的全部上游任务消耗。
@@ -579,7 +573,7 @@ export default function AdminPresales() {
                     >
                       <div className="flex items-center justify-between gap-3">
                         <p className="fm-eyebrow text-muted-foreground">
-                          已使用 / 上限
+                          当前 Key 总积分使用 / 上限
                         </p>
                         <Badge
                           variant="outline"
@@ -600,7 +594,7 @@ export default function AdminPresales() {
                       </div>
                       <div className="mt-2 flex items-end justify-between gap-3">
                         <p className="text-3xl font-semibold tracking-tight text-primary">
-                          {totalUsed.toLocaleString()}
+                          {keyTotalUsed.toLocaleString()}
                           <span className="ml-1 text-sm font-normal text-muted-foreground">
                             / {usageLimit.toLocaleString()}
                           </span>
@@ -625,18 +619,27 @@ export default function AdminPresales() {
                       </div>
                     </div>
 
+                    <div className="rounded-xl border border-border/60 bg-background/55 px-4 py-3">
+                      <p className="text-xs text-muted-foreground">
+                        其中官网前台任务使用
+                      </p>
+                      <p className="mt-1 text-2xl font-semibold text-foreground">
+                        {websiteUsed.toLocaleString()}
+                      </p>
+                    </div>
+
                     <div>
                       <div className="mb-2 flex items-center justify-between gap-3">
                         <p className="text-xs font-medium text-muted-foreground">
-                          最近任务
+                          最近官网任务
                         </p>
                         <Badge variant="outline" className="font-mono text-xs">
-                          {recentTasks.length} 条
+                          {recentWebsiteTasks.length} 条
                         </Badge>
                       </div>
-                      {recentTasks.length > 0 ? (
+                      {recentWebsiteTasks.length > 0 ? (
                         <div className="custom-scrollbar max-h-[260px] divide-y divide-border/50 overflow-y-auto rounded-xl border border-border/60 bg-background/55 px-3">
-                          {recentTasks.map((task) => (
+                          {recentWebsiteTasks.map((task) => (
                             <div
                               key={task.id}
                               className="flex min-w-0 items-center gap-3 py-3"
@@ -661,7 +664,7 @@ export default function AdminPresales() {
                         </div>
                       ) : (
                         <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center text-xs text-muted-foreground">
-                          最近 {usageWindowDays} 天暂无积分消耗
+                          最近 {usageWindowDays} 天暂无官网任务积分消耗
                         </div>
                       )}
                     </div>

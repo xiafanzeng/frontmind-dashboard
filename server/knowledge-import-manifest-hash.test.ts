@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   getPresalesCredentialForResource: vi.fn(),
   getPresalesTaskProjectBinding: vi.fn(),
   assertServiceCapability: vi.fn(),
+  assertKnowledgeBaseWritable: vi.fn(),
+  createKnowledgeMonitoringHandoff: vi.fn(),
 }));
 
 vi.mock("axios", () => ({
@@ -64,6 +66,14 @@ vi.mock("./service-entitlement", () => {
     ServiceEntitlementError,
   };
 });
+
+vi.mock("./knowledge-base-reset-service", () => ({
+  assertKnowledgeBaseWritable: mocks.assertKnowledgeBaseWritable,
+}));
+
+vi.mock("./delivery-role-service", () => ({
+  createKnowledgeMonitoringHandoff: mocks.createKnowledgeMonitoringHandoff,
+}));
 
 import { importWebsiteKnowledgeArtifact } from "./knowledge-import-service";
 
@@ -127,6 +137,11 @@ describe("website knowledge import v3 manifest binding", () => {
       apiKey: "sk-test-credential",
     });
     mocks.assertServiceCapability.mockResolvedValue(undefined);
+    mocks.assertKnowledgeBaseWritable.mockResolvedValue(undefined);
+    mocks.createKnowledgeMonitoringHandoff.mockResolvedValue({
+      created: [],
+      assigned: false,
+    });
     mocks.axiosGet.mockResolvedValue({
       status: 200,
       data: {
@@ -280,6 +295,11 @@ describe("website knowledge import v3 manifest binding", () => {
         sourceReference: `website-kb:v3:1:website-lead-v1:${"c".repeat(64)}`,
       }),
     );
+    expect(mocks.assertKnowledgeBaseWritable).toHaveBeenCalledWith(7);
+    expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledWith({
+      userId: 7,
+      actorUserId: 7,
+    });
   });
 
   it("keeps an identical completed v3 receipt idempotent without revalidation", async () => {
@@ -334,5 +354,78 @@ describe("website knowledge import v3 manifest binding", () => {
 
     expect(mocks.axiosGet).not.toHaveBeenCalled();
     expect(mocks.readKnowledgeArchive).not.toHaveBeenCalled();
+  });
+
+  it("uses the finalized file for v4 while binding lineage to the candidate task", async () => {
+    const buffer = Buffer.from("finalized v4 archive bytes");
+    const finalSha256 = createHash("sha256").update(buffer).digest("hex");
+    mocks.downloadArchiveBytes.mockResolvedValue({
+      buffer,
+      filename: "示例企业_knowledge_base.zip",
+    });
+    mocks.readKnowledgeArchive.mockResolvedValue({
+      packageManifestSha256: "d".repeat(64),
+      storedAssetKeys: [],
+      documents: [],
+      assets: [],
+    });
+
+    await expect(
+      importWebsiteKnowledgeArtifact({
+        projectId: "project-acceptance-001",
+        idempotencyKey: "website-kb-project-acceptance-v4",
+        value: {
+          schemaVersion: 4,
+          companyName: "示例企业",
+          candidate: {
+            taskId: "task-website-kb-v3",
+            outputItemId: "output-v3",
+            fileId: "file-v3",
+            descriptorHash: "a".repeat(64),
+            sha256: "b".repeat(64),
+          },
+          finalArtifact: {
+            fileId: "final-file-v4",
+            filename: "示例企业_knowledge_base.zip",
+            sha256: finalSha256,
+            archiveContractVersion: 3,
+            validationProfile: "website-lead-v1",
+            packageManifestSha256: "d".repeat(64),
+            finalizerVersion: "website-kb-finalizer-v1",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      replayed: false,
+      snapshot: { id: "snapshot-new" },
+    });
+
+    expect(mocks.downloadArchiveBytes).toHaveBeenCalledWith({
+      descriptor: {
+        outputItemId: "output-v3",
+        fileId: "final-file-v4",
+        filename: "示例企业_knowledge_base.zip",
+        mimeType: "application/zip",
+      },
+      apiKey: "sk-test-credential",
+      baseUrl: "https://api.example.test",
+    });
+    expect(mocks.readKnowledgeArchive).toHaveBeenCalledWith(
+      buffer,
+      "示例企业_knowledge_base.zip",
+      expect.any(String),
+      {
+        validationProfile: "website-lead-v1",
+        archiveContractVersion: 3,
+      },
+    );
+    expect(mocks.createKnowledgeSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceTaskId: "task-website-kb-v3",
+        sourceArtifactHash: "a".repeat(64),
+        archiveHash: finalSha256,
+      }),
+    );
   });
 });

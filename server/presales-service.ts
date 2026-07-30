@@ -4,6 +4,7 @@ import { and, desc, eq, inArray, ne } from "drizzle-orm";
 import {
   presalesApiCredentials,
   presalesOutputUrls,
+  presalesMonitorRuns,
   presalesTaskRequests,
   presalesUpstreamResources,
   type PresalesApiCredential,
@@ -50,6 +51,14 @@ export type PresalesCreditUsageTask = {
   title: string;
   creditUsage: number;
   createdAt: number | null;
+};
+
+export type WebsiteApiKeyUsage = {
+  windowDays: number;
+  keyTotalUsed: number;
+  websiteUsed: number;
+  recentWebsiteTasks: PresalesCreditUsageTask[];
+  fetchedAt: number;
 };
 
 export type PresalesTaskReservation =
@@ -883,24 +892,57 @@ function taskCreditUsage(task: any) {
 
 export async function getPresalesCreditUsage(
   windowDays = CREDIT_USAGE_LOOKBACK_DAYS,
-) {
+): Promise<WebsiteApiKeyUsage> {
   const credential = await getActivePresalesCredential();
-  if (!credential) {
-    return {
-      totalUsed: 0,
-      recentTasks: [] as PresalesCreditUsageTask[],
-      fetchedAt: Date.now(),
-    };
-  }
-
   const normalizedWindowDays =
     Number.isInteger(windowDays) && windowDays > 0 && windowDays <= 365
       ? windowDays
       : CREDIT_USAGE_LOOKBACK_DAYS;
+  if (!credential) {
+    return {
+      windowDays: normalizedWindowDays,
+      keyTotalUsed: 0,
+      websiteUsed: 0,
+      recentWebsiteTasks: [] as PresalesCreditUsageTask[],
+      fetchedAt: Date.now(),
+    };
+  }
+
+  const db = await requireDb();
+  const [resourceRows, ownedRows, monitorRows] = await Promise.all([
+    db
+      .select({ upstreamTaskId: presalesUpstreamResources.upstreamId })
+      .from(presalesUpstreamResources)
+      .where(
+        and(
+          eq(presalesUpstreamResources.apiCredentialId, credential.id),
+          eq(presalesUpstreamResources.kind, "task"),
+        ),
+      ),
+    db
+      .select({ upstreamTaskId: presalesTaskRequests.upstreamTaskId })
+      .from(presalesTaskRequests)
+      .where(
+        and(
+          eq(presalesTaskRequests.apiCredentialId, credential.id),
+          eq(presalesTaskRequests.status, "completed"),
+        ),
+      ),
+    db
+      .select({ upstreamTaskId: presalesMonitorRuns.upstreamTaskId })
+      .from(presalesMonitorRuns)
+      .where(eq(presalesMonitorRuns.apiCredentialId, credential.id)),
+  ]);
+  const websiteTaskIds = new Set(
+    [...resourceRows, ...ownedRows, ...monitorRows]
+      .map((row) => row.upstreamTaskId?.trim())
+      .filter((id): id is string => Boolean(id)),
+  );
   const cutoffMs = Date.now() - normalizedWindowDays * 24 * 60 * 60 * 1000;
-  const recentTasks: PresalesCreditUsageTask[] = [];
+  const recentWebsiteTasks: PresalesCreditUsageTask[] = [];
   const seen = new Set<string>();
-  let totalUsed = 0;
+  let keyTotalUsed = 0;
+  let websiteUsed = 0;
   let after: string | undefined;
   let reachedCutoff = false;
 
@@ -958,8 +1000,10 @@ export async function getPresalesCreditUsage(
       }
       const creditUsage = taskCreditUsage(task);
       if (creditUsage <= 0) continue;
-      totalUsed += creditUsage;
-      recentTasks.push({
+      keyTotalUsed += creditUsage;
+      if (!websiteTaskIds.has(id)) continue;
+      websiteUsed += creditUsage;
+      recentWebsiteTasks.push({
         id,
         title: String(
           task?.metadata?.task_title ??
@@ -978,5 +1022,11 @@ export async function getPresalesCreditUsage(
     if (!payload?.has_more || !after) break;
   }
 
-  return { totalUsed, recentTasks, fetchedAt: Date.now() };
+  return {
+    windowDays: normalizedWindowDays,
+    keyTotalUsed,
+    websiteUsed,
+    recentWebsiteTasks,
+    fetchedAt: Date.now(),
+  };
 }

@@ -47,6 +47,17 @@ function workspaceUserId(value: string) {
   return parsed;
 }
 
+function assertWebsiteTemplateExecutionActor(
+  actor: NonNullable<FrontMindRequest["frontmindUser"]>,
+) {
+  if (actor.role === "admin" && actor.adminAccessLevel === "delivery_admin") {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "交付管理员只能调度官网工单，不能上传或发布官网内容",
+    );
+  }
+}
+
 function requestBytes(req: express.Request) {
   if (Buffer.isBuffer(req.body)) return req.body;
   if (typeof req.body === "string") return Buffer.from(req.body, "utf8");
@@ -173,6 +184,7 @@ router.put(
   async (req: FrontMindRequest, res) => {
     try {
       const targetUserId = workspaceUserId(req.params.userId);
+      assertWebsiteTemplateExecutionActor(req.frontmindUser!);
       const bytes = requestBytes(req);
       if (bytes.length === 0) {
         throw new WebsiteContentTemplateApiError(

@@ -248,6 +248,60 @@ describe("provisioning service-token boundary", () => {
     });
   });
 
+  it("preserves the v4 candidate lineage and finalized artifact", async () => {
+    const importKnowledge = vi.fn().mockResolvedValue({
+      status: "completed",
+      replayed: false,
+      receiptId: "receipt-knowledge-v4",
+      snapshot: { id: "snapshot-v4", version: 1 },
+    });
+    const url = await startKnowledgeImportApp(importKnowledge);
+    const request = {
+      schemaVersion: 4,
+      companyName: "验收企业",
+      candidate: {
+        taskId: "task-website-kb-v4",
+        outputItemId: "output-v4",
+        fileId: "candidate-file-v4",
+        descriptorHash: "a".repeat(64),
+        sha256: "b".repeat(64),
+      },
+      finalArtifact: {
+        fileId: "final-file-v4",
+        filename: "acceptance_knowledge_base_v4.zip",
+        sha256: "c".repeat(64),
+        archiveContractVersion: 3,
+        validationProfile: "website-lead-v1",
+        packageManifestSha256: "d".repeat(64),
+        finalizerVersion: "website-kb-finalizer-v1",
+      },
+    };
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": "website-kb-project-acceptance-v4",
+        "x-frontmind-provisioning-token": SERVICE_TOKEN,
+      },
+      body: JSON.stringify(request),
+    });
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      schemaVersion: 4,
+      knowledgeImport: {
+        id: "receipt-knowledge-v4",
+        projectId: "project-acceptance-001",
+        status: "ready",
+      },
+    });
+    expect(importKnowledge).toHaveBeenCalledWith({
+      projectId: "project-acceptance-001",
+      idempotencyKey: "website-kb-project-acceptance-v4",
+      value: request,
+    });
+  });
+
   it("rejects an incomplete v3 contract before invoking the importer", async () => {
     const importKnowledge = vi.fn();
     const url = await startKnowledgeImportApp(importKnowledge);

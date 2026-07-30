@@ -29,6 +29,7 @@ describe("administrator channel navigation", () => {
       expect(navigation.map((item) => item.label)).toEqual([
         "交付总览",
         "客户交付工作台",
+        ...(_name === "real" ? ["角色与团队", "工单调度"] : []),
         "FrontMind Agent",
         "官网任务与积分",
         "账号与权限",
@@ -90,23 +91,22 @@ describe("administrator channel navigation", () => {
     },
   );
 
-  it("keeps FrontMind Agent available to delivery administrators", () => {
+  it("keeps delivery administrators on the five management modules", () => {
     const deliveryAdminNavigation = getAdminNav(false);
 
-    expect(
-      deliveryAdminNavigation.some((item) => item.href === "/admin/agent"),
-    ).toBe(true);
-    expect(
-      deliveryAdminNavigation.some((item) => item.href === "/admin/users"),
-    ).toBe(true);
-    expect(
-      deliveryAdminNavigation.find((item) => item.href === "/admin/users"),
-    ).toMatchObject({
-      label: "创建客户账号",
-      group: "客户与服务",
-    });
+    expect(deliveryAdminNavigation.map((item) => item.label)).toEqual([
+      "交付总览",
+      "客户管理",
+      "角色与团队",
+      "工单调度",
+      "API Key 管理",
+    ]);
     expect(
       deliveryAdminNavigation.some((item) => item.href === "/admin/presales"),
+    ).toBe(false);
+    expect(deliveryAdminNavigation.some((item) => item.external)).toBe(false);
+    expect(
+      deliveryAdminNavigation.some((item) => item.href === "/admin/agent"),
     ).toBe(false);
   });
 
@@ -158,8 +158,8 @@ describe("administrator channel navigation", () => {
     );
   });
 
-  it("allows only the system administrator to create customer accounts", () => {
-    expect(canCreateCustomerFromDashboard(false)).toBe(false);
+  it("allows system and delivery administrators to create customer accounts", () => {
+    expect(canCreateCustomerFromDashboard(false)).toBe(true);
     expect(canCreateCustomerFromDashboard(true)).toBe(true);
   });
 

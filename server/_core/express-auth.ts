@@ -6,13 +6,25 @@ import {
   type AuthenticatedUser,
   type DecryptedCredential,
 } from "../auth-service";
+import type { DeliveryRoleType } from "../../shared/delivery-roles";
 
 export type FrontMindRequest = Request & {
   frontmindUser?: AuthenticatedUser;
   frontmindCredential?: DecryptedCredential;
+  frontmindDeliveryRoleContext?: {
+    assignmentId: string;
+    roleId: string;
+    roleType: DeliveryRoleType;
+    teamName: string;
+  };
 };
 
-function sendAuthError(res: Response, status: number, message: string, code: string) {
+function sendAuthError(
+  res: Response,
+  status: number,
+  message: string,
+  code: string,
+) {
   res.status(status).json({ error: { message, code } });
 }
 
@@ -61,13 +73,16 @@ export async function attachActiveCredential(
     req.frontmindCredential = credential;
     next();
   } catch (error) {
-    const invalidKey = error instanceof AuthServiceError && error.code === "INVALID_MASTER_KEY";
+    const invalidKey =
+      error instanceof AuthServiceError && error.code === "INVALID_MASTER_KEY";
     console.error("[Credential] Failed to load account credential", error);
     sendAuthError(
       res,
       503,
       invalidKey ? "服务端凭据加密配置无效" : "API Key 暂不可用",
-      invalidKey ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE" : "CREDENTIAL_UNAVAILABLE",
+      invalidKey
+        ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE"
+        : "CREDENTIAL_UNAVAILABLE",
     );
   }
 }
@@ -94,13 +109,16 @@ export async function attachOptionalActiveCredential(
     if (credential) req.frontmindCredential = credential;
     next();
   } catch (error) {
-    const invalidKey = error instanceof AuthServiceError && error.code === "INVALID_MASTER_KEY";
+    const invalidKey =
+      error instanceof AuthServiceError && error.code === "INVALID_MASTER_KEY";
     console.error("[Credential] Failed to load account credential", error);
     sendAuthError(
       res,
       503,
       invalidKey ? "服务端凭据加密配置无效" : "API Key 暂不可用",
-      invalidKey ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE" : "CREDENTIAL_UNAVAILABLE",
+      invalidKey
+        ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE"
+        : "CREDENTIAL_UNAVAILABLE",
     );
   }
 }
