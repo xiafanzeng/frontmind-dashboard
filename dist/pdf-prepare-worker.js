@@ -3369,12 +3369,8 @@ var targetPageSchema = z5.string().trim().max(2048).refine((value) => {
   }
 }, "\u76EE\u6807\u9875\u9762\u5FC5\u987B\u662F\u7AD9\u5185\u8DEF\u5F84\u6216\u5B8C\u6574\u7684 http/https \u94FE\u63A5");
 var icpNonSensitiveDeclarationsSchema = z5.object({
-  domainHolderInformation: z5.string().trim().min(1).max(4e3),
-  websiteInformation: z5.string().trim().min(1).max(8e3),
-  aliyunAppVerificationCompleted: z5.literal(true, {
-    error: "\u8BF7\u786E\u8BA4\u5DF2\u5B8C\u6210\u963F\u91CC\u4E91 App \u771F\u5B9E\u6027 / \u4EBA\u8138\u6838\u9A8C"
-  })
-});
+  icpNumber: z5.string().trim().min(1, "\u8BF7\u586B\u5199 ICP \u4E3B\u4F53\u5907\u6848\u53F7").max(128)
+}).strict();
 var createDeliveryTicketSchema = z5.object({
   clientRequestId: z5.string().uuid(),
   type: deliveryTicketTypeSchema,
@@ -3402,7 +3398,14 @@ var createDeliveryTicketSchema = z5.object({
     context.addIssue({
       code: z5.ZodIssueCode.custom,
       path: ["icpDeclarations"],
-      message: "\u57DF\u540D\u4E0E ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
+      message: "\u8BF7\u5728\u963F\u91CC\u4E91\u5B8C\u6210\u5907\u6848\u540E\u586B\u5199 ICP \u4E3B\u4F53\u5907\u6848\u53F7"
+    });
+  }
+  if (value.category === "icp_filing" && value.attachments.length > 0) {
+    context.addIssue({
+      code: z5.ZodIssueCode.custom,
+      path: ["attachments"],
+      message: "\u57DF\u540D\u4E0E ICP \u5907\u6848\u7ED3\u679C\u4E0D\u63A5\u6536\u9644\u4EF6\uFF0C\u8BF7\u4EC5\u586B\u5199\u5DF2\u5907\u6848\u57DF\u540D\u548C ICP \u4E3B\u4F53\u5907\u6848\u53F7"
     });
   }
   if (value.category === "knowledge_base_maintenance" && !value.knowledgeSnapshotId) {

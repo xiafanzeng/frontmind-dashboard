@@ -260,61 +260,49 @@ describe("delivery ticket contract", () => {
     });
   });
 
-  it("requires all structured ICP declarations on an ICP filing request", () => {
+  it("requires the ICP subject number on a completed filing result", () => {
     const common = {
       clientRequestId: "5f05091b-0e0a-4482-8f11-654c4502b3e1",
       type: "website_operation",
       category: "icp_filing",
       topic: "企业网站备案",
-      icpProvince: "广东",
     } as const;
     expect(() => createDeliveryTicketSchema.parse(common)).toThrow(
-      "域名实名信息",
+      "ICP 主体备案号",
     );
     expect(
       createDeliveryTicketSchema.parse({
         ...common,
         icpDeclarations: {
-          domainHolderInformation: "域名已完成企业实名，持有人与营业执照一致",
-          websiteInformation: "企业官网、品牌与产品资料、负责人联系方式已填写",
-          aliyunAppVerificationCompleted: true,
+          icpNumber: "粤ICP备12345678号",
         },
       }).icpDeclarations,
-    ).toMatchObject({ aliyunAppVerificationCompleted: true });
+    ).toMatchObject({ icpNumber: "粤ICP备12345678号" });
+    expect(() =>
+      createDeliveryTicketSchema.parse({
+        ...common,
+        icpDeclarations: {
+          icpNumber: "粤ICP备12345678号",
+        },
+        attachments: [
+          {
+            fileId: "should-not-upload",
+            filename: "营业执照.pdf",
+          },
+        ],
+      }),
+    ).toThrow("不接收附件");
   });
 
-  it("accepts one combined domain and ICP submission before a site profile exists", async () => {
+  it("accepts one completed domain and ICP result before a site profile exists", async () => {
     const value = createDeliveryTicketSchema.parse({
       clientRequestId: "5f05091b-0e0a-4482-8f11-654c4502b3e1",
       type: "website_operation",
       category: "icp_filing",
       topic: "https://Example.com/path",
-      icpProvince: "浙江",
       icpDeclarations: {
-        domainHolderInformation: "域名持有人与主办单位一致",
-        websiteInformation: "验收企业官网，展示产品与案例",
-        aliyunAppVerificationCompleted: true,
+        icpNumber: "浙ICP备12345678号",
       },
-      attachments: [
-        {
-          storageKind: "icp_protected",
-          protectedMaterialId: "00000000-0000-4000-8000-000000000001",
-          sensitiveCategory: "business_license",
-          filename: "营业执照.pdf",
-        },
-        {
-          storageKind: "icp_protected",
-          protectedMaterialId: "00000000-0000-4000-8000-000000000002",
-          sensitiveCategory: "subject_responsible_person_id",
-          filename: "主体负责人证件.pdf",
-        },
-        {
-          storageKind: "icp_protected",
-          protectedMaterialId: "00000000-0000-4000-8000-000000000003",
-          sensitiveCategory: "website_responsible_person_id",
-          filename: "网站负责人证件.pdf",
-        },
-      ],
     });
     const executor = {
       select: () => ({
@@ -889,36 +877,17 @@ describe("delivery ticket quota lifecycle", () => {
     expect(isDeliveryTicketAttachmentVisible(true, null)).toBe(true);
   });
 
-  it("blocks ICP completion when active files or declarations are missing", () => {
-    const completeDeclarations = {
-      domainHolderInformation: "域名持有人信息",
-      websiteInformation: "网站名称、服务内容和联系方式",
-      aliyunAppVerificationCompleted: true,
-    };
+  it("blocks ICP completion when the subject filing number is missing", () => {
     expect(
       missingIcpCompletionRequirements({
-        activeSensitiveCategories: [
-          "business_license",
-          "subject_responsible_person_id",
-          "website_responsible_person_id",
-        ],
-        declarations: completeDeclarations,
+        declarations: { icpNumber: "粤ICP备12345678号" },
       }),
     ).toEqual([]);
     expect(
       missingIcpCompletionRequirements({
-        activeSensitiveCategories: ["business_license"],
         declarations: null,
       }),
-    ).toEqual(
-      expect.arrayContaining([
-        "subject_responsible_person_id",
-        "website_responsible_person_id",
-        "domain_holder_information",
-        "website_information",
-        "aliyun_app_verification",
-      ]),
-    );
+    ).toEqual(["icp_number"]);
   });
 
   it("reserves at submission and consumes only when scheduled", () => {

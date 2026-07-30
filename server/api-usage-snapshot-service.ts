@@ -14,7 +14,6 @@ import {
 import type { AuthenticatedUser } from "./auth-service";
 import { AuthServiceError } from "./auth-service";
 import {
-  getManagedUserCreditUsage,
   getShanghaiCalendarMonthPeriod,
   getSharedKeyMonthlyCreditUsageForAccounts,
   isSystemAdmin,
@@ -98,17 +97,9 @@ async function accessibleDeliveryAdmins(
         username: users.username,
       })
       .from(users)
-      .where(
-        and(
-          eq(users.role, "admin"),
-          eq(users.isActive, true),
-        ),
-      );
+      .where(and(eq(users.role, "admin"), eq(users.isActive, true)));
   }
-  if (
-    actor.role !== "admin" ||
-    actor.adminAccessLevel !== "delivery_admin"
-  ) {
+  if (actor.role !== "admin" || actor.adminAccessLevel !== "delivery_admin") {
     return [];
   }
   return [
@@ -152,6 +143,40 @@ async function ensureUsagePolicy(input: {
   return created[0];
 }
 
+export function resolveEffectiveUsageCredentials(input: {
+  userIds: number[];
+  credentialRows: Array<{ userId: number; fingerprint: string }>;
+  ownerRows: Array<{ userId: number; deliveryAdminId: number }>;
+}) {
+  const ownerByUser = new Map<number, number>(
+    input.ownerRows.map((owner) => [
+      Number(owner.userId),
+      Number(owner.deliveryAdminId),
+    ]),
+  );
+  const activeByOwner = new Map<number, string>();
+  for (const row of input.credentialRows) {
+    if (!activeByOwner.has(Number(row.userId))) {
+      activeByOwner.set(Number(row.userId), row.fingerprint);
+    }
+  }
+  const byUser = new Map<number, string>();
+  const credentialOwnerByUser = new Map<number, number>();
+  for (const userId of input.userIds) {
+    // New managed customers own their credential directly. Only legacy
+    // customers without a direct credential inherit their usage owner's Key.
+    const credentialOwnerId = activeByOwner.has(userId)
+      ? userId
+      : (ownerByUser.get(userId) ?? userId);
+    const fingerprint = activeByOwner.get(credentialOwnerId);
+    if (fingerprint) {
+      byUser.set(userId, fingerprint);
+      credentialOwnerByUser.set(userId, credentialOwnerId);
+    }
+  }
+  return { byUser, credentialOwnerByUser };
+}
+
 async function usageCredentialFingerprints(input: {
   executor: any;
   userIds: number[];
@@ -175,24 +200,11 @@ async function usageCredentialFingerprints(input: {
           })
           .from(userUsageOwners)
           .where(inArray(userUsageOwners.userId, input.userIds));
-  const ownerByUser = new Map<number, number>(
-    ownerRows.map((owner: any) => [
-      Number(owner.userId),
-      Number(owner.deliveryAdminId),
-    ]),
-  );
-  const activeByOwner = new Map<number, string>();
-  for (const row of credentialRows) {
-    if (!activeByOwner.has(Number(row.userId))) {
-      activeByOwner.set(Number(row.userId), row.fingerprint);
-    }
-  }
-  const byUser = new Map<number, string>();
-  for (const userId of input.userIds) {
-    const credentialOwnerId = ownerByUser.get(userId) ?? userId;
-    const fingerprint = activeByOwner.get(credentialOwnerId);
-    if (fingerprint) byUser.set(userId, fingerprint);
-  }
+  const effective = resolveEffectiveUsageCredentials({
+    userIds: input.userIds,
+    credentialRows,
+    ownerRows,
+  });
   const websiteRows = await input.executor
     .select({ fingerprint: presalesApiCredentials.fingerprint })
     .from(presalesApiCredentials)
@@ -206,7 +218,7 @@ async function usageCredentialFingerprints(input: {
     .limit(1);
   const website = websiteRows[0]?.fingerprint ?? null;
   return {
-    byUser,
+    ...effective,
     website,
   };
 }
@@ -418,6 +430,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
       Number(policy?.warningRatioBasisPoints ?? 8_000) / 10_000;
     return {
       fingerprint,
+      credentialOwnerId: fingerprints.credentialOwnerByUser.get(userId) ?? null,
       used,
       accountUsed,
       limit,
@@ -440,17 +453,22 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
     period,
     managers: managers.map((manager: any) => {
       const managerUsage = usageFor(Number(manager.id));
-      const managedCustomers = ownerships
+      const managedCustomerRecords = ownerships
         .filter(
-          (ownership: any) =>
-            Number(ownership.adminId) === Number(manager.id),
+          (ownership: any) => Number(ownership.adminId) === Number(manager.id),
         )
-        .map((ownership: any) =>
-          customerById.get(Number(ownership.userId)),
-        )
+        .map((ownership: any) => customerById.get(Number(ownership.userId)))
         .filter(Boolean)
         .map((customer: any) => {
           const usage = usageFor(Number(customer.id));
+          return {
+            customer,
+            usage,
+          };
+        });
+      const managedCustomers = managedCustomerRecords.map(
+        ({ customer, usage }) => {
+          const usesManagerKey = usage.credentialOwnerId === Number(manager.id);
           return {
             userId: Number(customer.id),
             enterpriseName:
@@ -460,18 +478,52 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
             username: customer.username,
             monthUsed: usage.accountUsed,
             fingerprint: usage.fingerprint,
-            usesManagerKey:
-              Boolean(managerUsage.fingerprint) &&
-              usage.fingerprint === managerUsage.fingerprint,
+            usesManagerKey,
+            credentialSource: !usage.fingerprint
+              ? ("unconfigured" as const)
+              : usesManagerKey
+                ? ("manager" as const)
+                : ("customer" as const),
             syncStatus: usage.syncStatus,
             fetchedAt: usage.fetchedAt,
           };
-        });
+        },
+      );
+      const keyPools = new Map<string, ReturnType<typeof usageFor>>();
+      for (const usage of [
+        managerUsage,
+        ...managedCustomerRecords.map((record) => record.usage),
+      ]) {
+        if (usage.fingerprint && !keyPools.has(usage.fingerprint)) {
+          keyPools.set(usage.fingerprint, usage);
+        }
+      }
+      const poolUsages = [...keyPools.values()];
+      const keyPoolTotalUsed = poolUsages.reduce(
+        (sum, usage) => sum + usage.used,
+        0,
+      );
+      const keyPoolLimit = Math.max(
+        1,
+        poolUsages.reduce((sum, usage) => sum + usage.limit, 0) ||
+          managerUsage.limit,
+      );
+      const keyPoolWarningRatio =
+        poolUsages[0]?.warningRatio ?? managerUsage.warningRatio;
+      const keyPoolSyncStatus =
+        poolUsages.length === 0
+          ? "unconfigured"
+          : poolUsages.some((usage) => usage.syncStatus === "error")
+            ? "error"
+            : poolUsages.some((usage) => usage.syncStatus !== "ok")
+              ? "pending"
+              : "ok";
+      const fetchedTimes = poolUsages
+        .map((usage) => usage.fetchedAt)
+        .filter((value): value is number => value !== null);
       const attributedUsed =
         managerUsage.accountUsed +
-        managedCustomers
-          .filter((customer) => customer.usesManagerKey)
-          .reduce((sum, customer) => sum + customer.monthUsed, 0);
+        managedCustomers.reduce((sum, customer) => sum + customer.monthUsed, 0);
       return {
         adminId: Number(manager.id),
         displayName:
@@ -480,20 +532,25 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
           `交付管理员 ${manager.id}`,
         username: manager.username,
         keyPool: {
-          fingerprint: managerUsage.fingerprint,
-          totalUsed: managerUsage.used,
-          limit: managerUsage.limit,
-          warningRatio: managerUsage.warningRatio,
-          syncStatus: managerUsage.syncStatus,
-          fetchedAt: managerUsage.fetchedAt,
-          severity: managerUsage.severity,
+          fingerprint:
+            managerUsage.fingerprint ??
+            (poolUsages.length === 1 ? poolUsages[0]!.fingerprint : null),
+          credentialCount: keyPools.size,
+          totalUsed: keyPoolTotalUsed,
+          limit: keyPoolLimit,
+          warningRatio: keyPoolWarningRatio,
+          syncStatus: keyPoolSyncStatus,
+          fetchedAt: fetchedTimes.length > 0 ? Math.min(...fetchedTimes) : null,
+          severity: apiUsageSeverity({
+            used: keyPoolTotalUsed,
+            limit: keyPoolLimit,
+            warningRatio: keyPoolWarningRatio,
+            syncStatus: keyPoolSyncStatus,
+          }),
         },
         ownAgentMonthUsed: managerUsage.accountUsed,
         attributedUsed,
-        otherOrUnattributedUsed: Math.max(
-          0,
-          managerUsage.used - attributedUsed,
-        ),
+        otherOrUnattributedUsed: Math.max(0, keyPoolTotalUsed - attributedUsed),
         users: managedCustomers,
       };
     }),
@@ -523,8 +580,7 @@ async function upsertSnapshot(input: {
     windowStartedAt:
       input.windowStartedAt ??
       new Date(
-        input.now.getTime() -
-          input.policy.windowDays * 24 * 60 * 60 * 1_000,
+        input.now.getTime() - input.policy.windowDays * 24 * 60 * 60 * 1_000,
       ),
     fetchedAt: input.status === "ok" ? input.now : null,
     syncStatus: input.status,
@@ -618,10 +674,10 @@ export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
       }
     }
   }
-  const deliveryAdminIds = deliveryAdmins.map((admin: any) =>
+  const deliveryAdminIds: number[] = deliveryAdmins.map((admin: any) =>
     Number(admin.id),
   );
-  const workspaceUserIds = workspaceUsers.map((user: any) =>
+  const workspaceUserIds: number[] = workspaceUsers.map((user: any) =>
     Number(user.id),
   );
   const allWorkspaceOwnershipRows =
@@ -634,148 +690,104 @@ export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
           })
           .from(userUsageOwners)
           .where(inArray(userUsageOwners.userId, workspaceUserIds));
-  const ownershipRows = allWorkspaceOwnershipRows.filter((owner: any) =>
-    deliveryAdminIds.includes(Number(owner.deliveryAdminId)),
+  const ownerByWorkspaceUser = new Map(
+    allWorkspaceOwnershipRows.map((owner: any) => [
+      Number(owner.userId),
+      Number(owner.deliveryAdminId),
+    ]),
   );
-  const pooledUserIds = new Set(
-    allWorkspaceOwnershipRows.map((owner: any) => Number(owner.userId)),
-  );
-  await mapWithConcurrency(deliveryAdmins, 3, async (admin: any) => {
-    const childUserIds = ownershipRows
-      .filter(
-        (owner: any) =>
-          Number(owner.deliveryAdminId) === Number(admin.id),
-      )
-      .map((owner: any) => Number(owner.userId));
-    const accountIds = [Number(admin.id), ...childUserIds];
-    const policies = await Promise.all(
-      accountIds.map((accountId) =>
-        ensureUsagePolicy({
-          executor: db,
-          scope: "managed_user",
-          workspaceUserId: accountId,
-        }),
-      ),
-    );
-    const fingerprint = fingerprints.byUser.get(admin.id) ?? null;
-    const monthPeriod = getShanghaiCalendarMonthPeriod(now.getTime());
-    if (!fingerprint) {
-      await Promise.all(
-        policies.map((policy) =>
-          upsertSnapshot({
-            executor: db,
-            policy,
-            credentialFingerprint: null,
-            used: 0,
-            accountUsed: 0,
-            status: "unconfigured",
-            windowStartedAt: new Date(monthPeriod.startAt),
-            now,
-          }),
-        ),
-      );
-      return;
-    }
-    try {
-      const usage = await getSharedKeyMonthlyCreditUsageForAccounts({
-        credentialOwnerId: admin.id,
-        accountIds,
-        now: now.getTime(),
-      });
-      await Promise.all(
-        policies.map((policy, index) =>
-          upsertSnapshot({
-            executor: db,
-            policy,
-            credentialFingerprint: fingerprint,
-            used: usage.totalUsed,
-            accountUsed:
-              usage.accounts.get(accountIds[index]!)?.accountUsed ?? 0,
-            status: usage.complete ? "ok" : "error",
-            errorCode: usage.complete ? null : "PARTIAL_TASK_SCAN",
-            windowStartedAt: new Date(monthPeriod.startAt),
-            now,
-          }),
-        ),
-      );
-      synced += 1;
-      if (!usage.complete) failed += 1;
-    } catch (error) {
-      await Promise.all(
-        policies.map((policy) =>
-          upsertSnapshot({
-            executor: db,
-            policy,
-            credentialFingerprint: fingerprint,
-            used: 0,
-            accountUsed: 0,
-            status: "error",
-            errorCode: error instanceof Error ? error.name : "SYNC_FAILED",
-            windowStartedAt: new Date(monthPeriod.startAt),
-            now,
-          }),
-        ),
-      );
-      failed += 1;
-    }
+  const syncableWorkspaceUserIds = workspaceUserIds.filter((userId) => {
+    const ownerId = ownerByWorkspaceUser.get(userId);
+    return ownerId === undefined || deliveryAdminIds.includes(ownerId);
   });
-  await mapWithConcurrency(
-    workspaceUsers.filter(
-      (user: any) => !pooledUserIds.has(Number(user.id)),
-    ),
-    3,
-    async (user: any) => {
-    const policy = await ensureUsagePolicy({
-      executor: db,
-      scope: "managed_user",
-      workspaceUserId: user.id,
-    });
-    const fingerprint = fingerprints.byUser.get(user.id) ?? null;
-    const monthPeriod = getShanghaiCalendarMonthPeriod(now.getTime());
-    if (!fingerprint) {
-      await upsertSnapshot({
+  const accountIds = [
+    ...new Set([...deliveryAdminIds, ...syncableWorkspaceUserIds]),
+  ];
+  const policyEntries = await Promise.all(
+    accountIds.map(async (accountId) => ({
+      accountId,
+      policy: await ensureUsagePolicy({
         executor: db,
-        policy,
+        scope: "managed_user",
+        workspaceUserId: accountId,
+      }),
+    })),
+  );
+  const policyByAccount = new Map(
+    policyEntries.map((entry) => [entry.accountId, entry.policy]),
+  );
+  const accountIdsByFingerprint = new Map<string, number[]>();
+  const unconfiguredAccountIds: number[] = [];
+  for (const accountId of accountIds) {
+    const fingerprint = fingerprints.byUser.get(accountId);
+    if (!fingerprint) {
+      unconfiguredAccountIds.push(accountId);
+      continue;
+    }
+    const grouped = accountIdsByFingerprint.get(fingerprint) ?? [];
+    grouped.push(accountId);
+    accountIdsByFingerprint.set(fingerprint, grouped);
+  }
+  const monthPeriod = getShanghaiCalendarMonthPeriod(now.getTime());
+  await Promise.all(
+    unconfiguredAccountIds.map((accountId) =>
+      upsertSnapshot({
+        executor: db,
+        policy: policyByAccount.get(accountId)!,
         credentialFingerprint: null,
         used: 0,
         accountUsed: 0,
         status: "unconfigured",
         windowStartedAt: new Date(monthPeriod.startAt),
         now,
-      });
-      return;
-    }
-    try {
-      const usage = await getManagedUserCreditUsage(
-        actor,
-        user.id,
-        policy.windowDays,
-      );
-      await upsertSnapshot({
-        executor: db,
-        policy,
-        credentialFingerprint: fingerprint,
-        used: usage.totalUsed,
-        accountUsed: usage.accountUsed,
-        status: "ok",
-        windowStartedAt: new Date(monthPeriod.startAt),
-        now,
-      });
-      synced += 1;
-    } catch (error) {
-      await upsertSnapshot({
-        executor: db,
-        policy,
-        credentialFingerprint: fingerprint,
-        used: 0,
-        accountUsed: 0,
-        status: "error",
-        errorCode: error instanceof Error ? error.name : "SYNC_FAILED",
-        windowStartedAt: new Date(monthPeriod.startAt),
-        now,
-      });
-      failed += 1;
-    }
+      }),
+    ),
+  );
+  await mapWithConcurrency(
+    [...accountIdsByFingerprint.entries()],
+    3,
+    async ([fingerprint, groupedAccountIds]) => {
+      try {
+        const usage = await getSharedKeyMonthlyCreditUsageForAccounts({
+          credentialOwnerId: groupedAccountIds[0]!,
+          accountIds: groupedAccountIds,
+          now: now.getTime(),
+        });
+        await Promise.all(
+          groupedAccountIds.map((accountId) =>
+            upsertSnapshot({
+              executor: db,
+              policy: policyByAccount.get(accountId)!,
+              credentialFingerprint: fingerprint,
+              used: usage.totalUsed,
+              accountUsed: usage.accounts.get(accountId)?.accountUsed ?? 0,
+              status: usage.complete ? "ok" : "error",
+              errorCode: usage.complete ? null : "PARTIAL_TASK_SCAN",
+              windowStartedAt: new Date(monthPeriod.startAt),
+              now,
+            }),
+          ),
+        );
+        synced += 1;
+        if (!usage.complete) failed += 1;
+      } catch (error) {
+        await Promise.all(
+          groupedAccountIds.map((accountId) =>
+            upsertSnapshot({
+              executor: db,
+              policy: policyByAccount.get(accountId)!,
+              credentialFingerprint: fingerprint,
+              used: 0,
+              accountUsed: 0,
+              status: "error",
+              errorCode: error instanceof Error ? error.name : "SYNC_FAILED",
+              windowStartedAt: new Date(monthPeriod.startAt),
+              now,
+            }),
+          ),
+        );
+        failed += 1;
+      }
     },
   );
   return { synced, failed, finishedAt: Date.now() };

@@ -130,15 +130,14 @@ async function startServer() {
     }
     next();
   });
-  // Authenticate the private website gateway before any large global body
-  // parser runs. Its JSON routes use small route-specific limits, while the
-  // upload route consumes the authenticated raw request stream.
+  // Authenticate private service routes before the global JSON parser.
+  // The legacy ICP route is retained only for historical material access;
+  // new ICP material uploads return HTTP 410.
   app.use("/api/internal/presales", presalesProxy);
   app.use("/api/internal/provisioning", provisioningRouter);
   app.use("/api/icp-materials", requireExpressAuth, icpMaterialRouter);
 
-  // JSON/form payloads keep a bounded parser. Binary upload routes use the raw
-  // request stream and are not subject to this application-body limit.
+  // JSON/form payloads keep a bounded parser.
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 

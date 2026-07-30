@@ -164,7 +164,7 @@ const semanticSubpages = [
     id: "website-management",
     section: "semantic",
     label: "AI 友好官网管理",
-    desc: "统一提交域名与 ICP 备案材料，审核后持续运营官网内容。",
+    desc: "前往阿里云完成域名注册与 ICP 备案，通过后提交备案结果。",
   },
 ];
 
@@ -217,30 +217,9 @@ function getPreviewDeliveryWorkspace(
           : "locked",
       canSubmitIcp: !icpCompleted,
       canSubmitContent: icpCompleted,
-      icpProvinceOptions: ["浙江省", "广东省"],
       lockReason: !icpCompleted
-        ? "请先统一提交并完成域名与 ICP 备案材料核验。"
+        ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
         : "",
-      icpMaterialChecklist: [
-        {
-          key: "business_license",
-          label: "主办单位营业执照",
-          required: true,
-          sensitive: true,
-        },
-        {
-          key: "subject_responsible_person_id",
-          label: "主体负责人有效身份证件",
-          required: true,
-          sensitive: true,
-        },
-        {
-          key: "website_responsible_person_id",
-          label: "网站负责人有效身份证件",
-          required: true,
-          sensitive: true,
-        },
-      ],
     },
     quotas: {
       content_asset_publish: previewDeliveryQuota(
@@ -296,12 +275,10 @@ function getPreviewDeliveryWorkspace(
         id: "preview-domain-icp-ticket",
         type: "website_operation",
         category: "icp_filing",
-        title: "域名申请与 ICP 备案材料",
+        title: "域名注册与 ICP 备案结果",
         topic: "example.com",
         status: icpCompleted ? "completed" : "submitted",
-        publicSummary: icpCompleted
-          ? "域名申请与 ICP 备案材料已统一核验完成。"
-          : null,
+        publicSummary: icpCompleted ? "域名与 ICP 主体备案号已确认。" : null,
         revision: 1,
         submittedAt: "2026-07-22T10:00:00+08:00",
       },
@@ -356,29 +333,6 @@ async function uploadDeliveryFiles(files, metadata = {}) {
       };
     }),
   );
-}
-
-async function uploadProtectedIcpMaterial({ category, file }) {
-  const response = await fetch("/api/icp-materials/upload", {
-    method: "PUT",
-    credentials: "same-origin",
-    headers: {
-      "content-type": "application/octet-stream",
-      "x-file-name": encodeURIComponent(file.name),
-      "x-file-content-type": encodeURIComponent(
-        file.type || "application/octet-stream",
-      ),
-      "x-icp-material-category": category,
-    },
-    body: file,
-  });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(
-      result?.error?.message || "ICP 敏感材料暂时无法上传，请稍后重试。",
-    );
-  }
-  return result;
 }
 
 function flattenDeliveryTicketPages(data) {
@@ -730,7 +684,6 @@ function PersistentUserBrandDashboard({
 }) {
   const [selectedDeliveryTicketId, setSelectedDeliveryTicketId] =
     useState(null);
-  const [icpProvince, setIcpProvince] = useState("");
   // Keep this adapter isolated until the generated AppRouter type includes
   // workspace.portal. The server remains authoritative for every entitlement.
   const servicePortalQuery = (trpc.workspace as any).portal.useQuery(
@@ -764,14 +717,6 @@ function PersistentUserBrandDashboard({
       refetchOnWindowFocus: true,
       refetchInterval: FORMAL_QUERY_REFRESH_INTERVAL_MS,
       refetchIntervalInBackground: false,
-    },
-  );
-  const icpChecklistQuery = deliveryTicketApi.icpChecklist.useQuery(
-    { province: icpProvince },
-    {
-      enabled: deliveryOperationsEnabled && Boolean(icpProvince),
-      retry: false,
-      refetchOnWindowFocus: false,
     },
   );
   const contentDeliveryTicketsQuery = deliveryTicketApi.list.useInfiniteQuery(
@@ -820,14 +765,6 @@ function PersistentUserBrandDashboard({
     () => flattenDeliveryTicketPages(websiteDeliveryTicketsQuery.data),
     [websiteDeliveryTicketsQuery.data],
   );
-  useEffect(() => {
-    const configuredProvince =
-      deliveryWorkspaceQuery.data?.websiteWorkflow?.icpProvince;
-    if (!icpProvince && configuredProvince) {
-      setIcpProvince(configuredProvince);
-    }
-  }, [deliveryWorkspaceQuery.data?.websiteWorkflow?.icpProvince, icpProvince]);
-
   async function refreshDeliveryWorkspaceAndLists() {
     await Promise.all([
       deliveryWorkspaceQuery.refetch(),
@@ -857,16 +794,7 @@ function PersistentUserBrandDashboard({
       dashboardLoading={dashboardQuery.isLoading}
       dashboardError={dashboardQuery.isError}
       onSubmitContentRequest={onSubmitContentRequest}
-      deliveryWorkspacePayload={{
-        ...(deliveryWorkspaceQuery.data || {}),
-        websiteWorkflow: {
-          ...(deliveryWorkspaceQuery.data?.websiteWorkflow || {}),
-          ...(icpProvince ? { icpProvince } : {}),
-          ...(icpChecklistQuery.data?.items
-            ? { icpMaterialChecklist: icpChecklistQuery.data.items }
-            : {}),
-        },
-      }}
+      deliveryWorkspacePayload={deliveryWorkspaceQuery.data}
       deliveryWorkspaceLoading={deliveryWorkspaceQuery.isLoading}
       deliveryWorkspaceError={
         deliveryWorkspaceQuery.error?.message ||
@@ -901,7 +829,6 @@ function PersistentUserBrandDashboard({
         },
       }}
       onRefreshDeliveryWorkspace={refreshDeliveryWorkspaceAndLists}
-      onIcpProvinceChange={setIcpProvince}
       onCreateDeliveryTicket={(input) =>
         createDeliveryTicketMutation.mutateAsync(input)
       }
@@ -951,7 +878,6 @@ function UserBrandDashboardContent({
   deliveryWorkspaceError = null,
   deliveryTicketLists = null,
   onRefreshDeliveryWorkspace,
-  onIcpProvinceChange,
   onCreateDeliveryTicket,
   selectedDeliveryTicketId = null,
   onOpenDeliveryTicket,
@@ -1126,17 +1052,12 @@ function UserBrandDashboardContent({
     if (!onCreateDeliveryTicket) {
       throw new Error("官网运营工单接口尚未连接，请稍后重试。");
     }
-    const [regularAttachments, protectedAttachments] = await Promise.all([
-      uploadDeliveryFiles(payload.attachmentFiles, {
-        purpose:
-          payload.category === "icp_filing"
-            ? "ICP 备案非敏感补充资料"
-            : "官网运营需求资料",
-      }),
-      Promise.all(
-        (payload.icpMaterialFiles || []).map(uploadProtectedIcpMaterial),
-      ),
-    ]);
+    const regularAttachments = await uploadDeliveryFiles(
+      payload.attachmentFiles,
+      {
+        purpose: "官网运营需求资料",
+      },
+    );
     await onCreateDeliveryTicket({
       clientRequestId: createClientRequestId(),
       type: "website_operation",
@@ -1144,10 +1065,9 @@ function UserBrandDashboardContent({
       topic: payload.topic,
       title: undefined,
       description: payload.description || undefined,
-      icpProvince: payload.icpProvince || undefined,
       icpDeclarations: payload.icpDeclarations || undefined,
       materialUrls: payload.materialUrls,
-      attachments: [...regularAttachments, ...protectedAttachments],
+      attachments: regularAttachments,
     });
     await onRefreshDeliveryWorkspace?.();
     toast.success("官网运营工单已提交", {
@@ -1400,11 +1320,9 @@ function UserBrandDashboardContent({
                     hasMore={websiteTicketList?.hasMore ?? false}
                     error={websiteTicketList?.error || deliveryWorkspaceError}
                     onSubmit={submitWebsiteOperationRequest}
-                    onIcpProvinceChange={onIcpProvinceChange}
                     onRefresh={onRefreshDeliveryWorkspace}
                     onLoadMore={websiteTicketList?.onLoadMore}
                     onUpgrade={() => setAccountOpen(true)}
-                    enableIcpMaterialManagement={!previewMode}
                   />
                 ) : (
                   <SemanticAssetSystem

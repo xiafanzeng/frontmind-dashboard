@@ -282,29 +282,10 @@ export async function assertWebsiteTicketWorkflow(
         "当前企业 ICP 前置阶段已完成，无需重复提交。",
       );
     }
-    const province = value.icpProvince?.trim() ?? "";
-    if (!ICP_PROVINCES.includes(province as (typeof ICP_PROVINCES)[number])) {
+    if (protectedAttachments.length) {
       throw new DeliveryTicketError(
-        "ICP_PROVINCE_REQUIRED",
-        "请先选择备案省份，以载入对应材料清单。",
-        400,
-      );
-    }
-    const submittedCategories = new Set(
-      protectedAttachments.map((attachment) => attachment.sensitiveCategory),
-    );
-    const requiredSensitiveCategories = icpMaterialChecklistForProvince(
-      province,
-    )
-      .filter((item) => item.required && item.sensitive)
-      .map((item) => item.key);
-    const missingBaseMaterials = requiredSensitiveCategories.filter(
-      (categoryKey) => !submittedCategories.has(categoryKey as any),
-    );
-    if (missingBaseMaterials.length) {
-      throw new DeliveryTicketError(
-        "ICP_BASE_MATERIALS_REQUIRED",
-        "请上传备案省份材料清单中的全部必需敏感材料。",
+        "ICP_MATERIAL_SCOPE_INVALID",
+        "本站不接收 ICP 备案材料，请仅填写已备案域名和 ICP 主体备案号。",
         400,
       );
     }
@@ -317,7 +298,7 @@ export async function assertWebsiteTicketWorkflow(
     ) {
       throw new DeliveryTicketError(
         "WEBSITE_PREREQUISITES_REQUIRED",
-        "请先统一提交并完成域名与 ICP 备案材料核验。",
+        "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。",
         403,
       );
     }
@@ -590,80 +571,23 @@ function attachmentRows(input: {
 }
 
 export function missingIcpCompletionRequirements(input: {
-  activeSensitiveCategories: readonly string[];
   declarations: unknown;
-  requiredSensitiveCategories?: readonly string[];
 }) {
-  const categories = new Set(input.activeSensitiveCategories);
-  const requiredSensitiveCategories = input.requiredSensitiveCategories?.length
-    ? input.requiredSensitiveCategories
-    : [
-        "business_license",
-        "subject_responsible_person_id",
-        "website_responsible_person_id",
-      ];
-  const missing = requiredSensitiveCategories.filter(
-    (category) => !categories.has(category),
-  );
-  if (
-    !icpNonSensitiveDeclarationsSchema.safeParse(input.declarations).success
-  ) {
-    missing.push(
-      "domain_holder_information",
-      "website_information",
-      "aliyun_app_verification",
-    );
-  }
-  return missing;
+  return icpNonSensitiveDeclarationsSchema.safeParse(input.declarations).success
+    ? []
+    : ["icp_number"];
 }
 
 async function assertIcpTicketReadyForCompletion(input: {
-  tx: any;
   ticket: typeof deliveryTickets.$inferSelect;
-  userId: number;
 }) {
-  const linkedAttachments = await input.tx
-    .select({
-      protectedMaterialId: deliveryTicketAttachments.protectedMaterialId,
-    })
-    .from(deliveryTicketAttachments)
-    .where(eq(deliveryTicketAttachments.ticketId, input.ticket.id));
-  const protectedIds = linkedAttachments
-    .map(
-      (attachment: { protectedMaterialId: string | null }) =>
-        attachment.protectedMaterialId,
-    )
-    .filter((value: string | null): value is string => Boolean(value));
-  const activeMaterials = protectedIds.length
-    ? await input.tx
-        .select({
-          id: icpSensitiveMaterials.id,
-          category: icpSensitiveMaterials.category,
-        })
-        .from(icpSensitiveMaterials)
-        .where(
-          and(
-            eq(icpSensitiveMaterials.workspaceUserId, input.userId),
-            eq(icpSensitiveMaterials.status, "active"),
-            inArray(icpSensitiveMaterials.id, protectedIds),
-          ),
-        )
-    : [];
   const missing = missingIcpCompletionRequirements({
-    activeSensitiveCategories: activeMaterials.map(
-      (material: { category: string }) => material.category,
-    ),
     declarations: input.ticket.icpDeclarations,
-    requiredSensitiveCategories: icpMaterialChecklistForProvince(
-      input.ticket.icpProvince ?? "",
-    )
-      .filter((item) => item.required && item.sensitive)
-      .map((item) => item.key),
   });
   if (missing.length) {
     throw new DeliveryTicketError(
-      "ICP_MATERIALS_INCOMPLETE",
-      "备案材料已撤回、缺失或尚未完成真实性核验，请补齐后再完成工单。",
+      "ICP_RESULT_INCOMPLETE",
+      "缺少 ICP 主体备案号，请让用户在阿里云备案通过后补充。",
       400,
     );
   }
@@ -768,7 +692,7 @@ function publicDeliveryCategoryLabel(ticket: InternalDeliveryTicketDto) {
     );
   }
   if (category === "domain_application") return "域名申请";
-  if (category === "icp_filing") return "域名申请与 ICP 备案材料";
+  if (category === "icp_filing") return "域名注册与 ICP 备案结果";
   if (category === "knowledge_base_maintenance") return "知识库维护";
   return (
     WEBSITE_CONTENT_CATALOG.find((item) => item.value === category)?.label ??
@@ -1297,9 +1221,9 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
         : [],
       icpLockReason: null,
       contentLockReason: !domainCompleted
-        ? "请先统一提交并完成域名与 ICP 备案材料核验。"
+        ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
         : !icpCompleted
-          ? "请先完成域名与 ICP 备案材料核验。"
+          ? "请先提交并确认域名与 ICP 主体备案号。"
           : null,
     },
   };
@@ -1344,12 +1268,12 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
           : null,
       icpLockReason:
         domainPending || icpPending
-          ? "域名与 ICP 备案材料工单待管理员受理。"
+          ? "域名与 ICP 备案结果待管理员确认。"
           : null,
       contentLockReason: !domainCompleted
-        ? "请先统一提交并完成域名与 ICP 备案材料核验。"
+        ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
         : !icpCompleted
-          ? "请先完成域名与 ICP 备案材料核验。"
+          ? "请先提交并确认域名与 ICP 主体备案号。"
           : null,
       icpProvinceOptions: metadata.websiteWorkflow.icpProvinceOptions,
     },
@@ -1700,8 +1624,8 @@ export async function createDeliveryTicket(input: {
                     websiteWorkflow.profile.domainStatus === "completed"
                       ? websiteWorkflow.profile.domainVerifiedAt
                       : null,
-                  icpProvince: input.value.icpProvince?.trim() || null,
-                  icpStatus: "preparing",
+                  icpNumber: input.value.icpDeclarations?.icpNumber || null,
+                  icpStatus: "submitted",
                   icpVerifiedAt: null,
                   revision: websiteWorkflow.profile.revision + 1,
                   updatedByUserId: input.userId,
@@ -1714,8 +1638,8 @@ export async function createDeliveryTicket(input: {
                 domain: websiteWorkflow.domain,
                 siteMode: "unknown",
                 domainStatus: "pending",
-                icpProvince: input.value.icpProvince?.trim() || null,
-                icpStatus: "preparing",
+                icpNumber: input.value.icpDeclarations?.icpNumber || null,
+                icpStatus: "submitted",
                 revision: 1,
                 updatedByUserId: input.userId,
                 createdAt: now,
@@ -2410,9 +2334,7 @@ export async function updateManagedDeliveryTicket(input: {
       ticket.category === "icp_filing"
     ) {
       await assertIcpTicketReadyForCompletion({
-        tx,
         ticket,
-        userId: input.userId,
       });
     }
     if (
@@ -2544,7 +2466,7 @@ export async function updateManagedDeliveryTicket(input: {
       if (!profile) {
         throw new DeliveryTicketError(
           "SITE_PROFILE_NOT_FOUND",
-          "域名与备案资料不存在，请刷新后重试。",
+          "域名与备案结果不存在，请刷新后重试。",
         );
       }
       const resolvedDomain =
@@ -2566,7 +2488,10 @@ export async function updateManagedDeliveryTicket(input: {
           domain: resolvedDomain,
           domainStatus: "completed",
           domainVerifiedAt: profile.domainVerifiedAt ?? now,
-          icpProvince: ticket.icpProvince || profile.icpProvince,
+          icpNumber:
+            ticket.icpDeclarations && "icpNumber" in ticket.icpDeclarations
+              ? ticket.icpDeclarations.icpNumber
+              : profile.icpNumber,
           icpStatus: "approved",
           icpVerifiedAt: now,
           revision: profile.revision + 1,

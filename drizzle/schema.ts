@@ -944,11 +944,16 @@ export const deliveryTickets = mysqlTable(
     description: text("description"),
     preferredMedia: varchar("preferredMedia", { length: 32 }),
     icpProvince: varchar("icpProvince", { length: 64 }),
-    icpDeclarations: json("icpDeclarations").$type<{
-      domainHolderInformation: string;
-      websiteInformation: string;
-      aliyunAppVerificationCompleted: true;
-    }>(),
+    icpDeclarations: json("icpDeclarations").$type<
+      | {
+          icpNumber: string;
+        }
+      | {
+          domainHolderInformation: string;
+          websiteInformation: string;
+          aliyunAppVerificationCompleted: true;
+        }
+    >(),
     targetPage: text("targetPage"),
     knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
     technicalDedupeKey: varchar("technicalDedupeKey", { length: 64 }),

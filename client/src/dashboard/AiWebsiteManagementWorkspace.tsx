@@ -9,6 +9,7 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  ExternalLink,
   FileText,
   LockKeyhole,
   Paperclip,
@@ -17,13 +18,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import {
-  type ChangeEvent,
-  type FormEvent,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
+import { type ChangeEvent, type FormEvent, useMemo, useState } from "react";
 import type { ServicePlanCode } from "./service-portal";
 import "./ai-website-management-workspace.css";
 
@@ -97,15 +92,8 @@ export type AiWebsiteWorkOrderSubmission = {
   targetPage: string;
   materialUrls: string[];
   attachmentFiles: File[];
-  icpMaterialFiles: Array<{
-    category: string;
-    file: File;
-  }>;
-  icpProvince?: string;
   icpDeclarations?: {
-    domainHolderInformation: string;
-    websiteInformation: string;
-    aliyunAppVerificationCompleted: true;
+    icpNumber: string;
   };
 };
 
@@ -126,19 +114,6 @@ export type AiWebsiteWorkflowMetadata = {
   lockReason?: string | null;
   icpLockReason?: string | null;
   contentLockReason?: string | null;
-  icpProvince?: string | null;
-  icpProvinceOptions?: readonly string[];
-  icpMaterialChecklist?: ReadonlyArray<
-    | string
-    | {
-        id?: string;
-        key?: string;
-        label: string;
-        required?: boolean;
-        sensitive?: boolean;
-        note?: string;
-      }
-  >;
 };
 
 export type AiWebsiteManagementWorkspaceProps = {
@@ -159,24 +134,11 @@ export type AiWebsiteManagementWorkspaceProps = {
   hasMore?: boolean;
   error?: string | null;
   onSubmit?: (input: AiWebsiteWorkOrderSubmission) => Promise<void> | void;
-  onIcpProvinceChange?: (province: string) => Promise<void> | void;
   /** Deprecated for this page. Website history details are summary-only in place. */
   onOpenTicket?: (ticketId: string) => void;
   onRefresh?: () => Promise<void> | void;
   onLoadMore?: () => Promise<void> | void;
   onUpgrade?: () => void;
-  enableIcpMaterialManagement?: boolean;
-};
-
-type IcpMaterialSummary = {
-  id: string;
-  category: string;
-  filename: string;
-  mimeType?: string | null;
-  sizeBytes: number;
-  retentionUntil: number;
-  createdAt: number;
-  downloadUrl: string;
 };
 
 type WorkOrderTypeDefinition = {
@@ -191,23 +153,17 @@ const DOMAIN_APPLICATION: WorkOrderTypeDefinition = {
 
 const ICP_FILING: WorkOrderTypeDefinition = {
   id: "icp_filing",
-  label: "域名申请与 ICP 备案材料",
+  label: "域名注册与 ICP 备案结果",
 };
 
-const ICP_BASE_MATERIAL_FIELDS = [
-  {
-    category: "business_license",
-    fallbackLabel: "营业执照",
-  },
-  {
-    category: "subject_responsible_person_id",
-    fallbackLabel: "主体负责人身份证件",
-  },
-  {
-    category: "website_responsible_person_id",
-    fallbackLabel: "网站负责人身份证件",
-  },
-] as const;
+const ALIYUN_DOMAIN_URL = "https://wanwang.aliyun.com/";
+const ALIYUN_DOMAIN_GUIDE_URL =
+  "https://help.aliyun.com/zh/dws/getting-started/quickly-register-a-new-domain-name";
+const ALIYUN_ICP_URL = "https://beian.aliyun.com/";
+const ALIYUN_ICP_GUIDE_URL =
+  "https://help.aliyun.com/zh/icp-filing/basic-icp-service/user-guide/icp-filing-application-overview";
+const ALIYUN_IDENTITY_GUIDE_URL =
+  "https://help.aliyun.com/zh/icp-filing/basic-icp-service/user-guide/upload-data-and-authenticity-verification/";
 
 const CLOSED_TICKET_STATUSES = new Set<DeliveryTicketStatus>([
   "completed",
@@ -255,9 +211,7 @@ function parseReferenceLinks(value: string) {
 
 function ticketIsCompleted(ticket: AiWebsiteTicket) {
   if (ticket.publicStatus) return ticket.publicStatus === "completed";
-  return Boolean(
-    ticket.status && CLOSED_TICKET_STATUSES.has(ticket.status),
-  );
+  return Boolean(ticket.status && CLOSED_TICKET_STATUSES.has(ticket.status));
 }
 
 function ticketSummary(ticket: AiWebsiteTicket) {
@@ -291,9 +245,7 @@ function activeTicketFor(
   category: AiWebsiteWorkOrderCategory,
 ) {
   return tickets.find(
-    (ticket) =>
-      ticket.category === category &&
-      !ticketIsCompleted(ticket),
+    (ticket) => ticket.category === category && !ticketIsCompleted(ticket),
   );
 }
 
@@ -309,9 +261,7 @@ function deriveWorkflow({
   tickets: AiWebsiteTicket[];
 }) {
   const completedCategories = new Set(
-    tickets
-      .filter(ticketIsCompleted)
-      .map((ticket) => ticket.category),
+    tickets.filter(ticketIsCompleted).map((ticket) => ticket.category),
   );
   const domainPending = Boolean(activeTicketFor(tickets, "domain_application"));
   const icpPending = Boolean(activeTicketFor(tickets, "icp_filing"));
@@ -372,40 +322,22 @@ export default function AiWebsiteManagementWorkspace({
   hasMore = false,
   error = null,
   onSubmit,
-  onIcpProvinceChange,
   onRefresh,
   onLoadMore,
   onUpgrade,
-  enableIcpMaterialManagement = false,
 }: AiWebsiteManagementWorkspaceProps) {
   const [selectedType, setSelectedType] =
     useState<AiWebsiteWorkOrderCategory | null>(null);
   const [topic, setTopic] = useState("");
+  const [icpNumber, setIcpNumber] = useState("");
   const [details, setDetails] = useState("");
   const [referenceLinks, setReferenceLinks] = useState("");
-  const [icpProvince, setIcpProvince] = useState(
-    websiteWorkflow?.icpProvince ?? "",
-  );
   const [attachments, setAttachments] = useState<File[]>([]);
-  const [icpMaterialFiles, setIcpMaterialFiles] = useState<
-    Record<string, File>
-  >({});
-  const [domainHolderInformation, setDomainHolderInformation] = useState("");
-  const [websiteInformation, setWebsiteInformation] = useState("");
-  const [aliyunAppVerificationCompleted, setAliyunAppVerificationCompleted] =
-    useState(false);
   const [expandedTicketId, setExpandedTicketId] = useState<string | null>(null);
   const [submitState, setSubmitState] = useState<
     "idle" | "submitting" | "success" | "error"
   >("idle");
   const [submitMessage, setSubmitMessage] = useState("");
-  const [storedIcpMaterials, setStoredIcpMaterials] = useState<
-    IcpMaterialSummary[]
-  >([]);
-  const [icpMaterialState, setIcpMaterialState] = useState<
-    "idle" | "loading" | "updating" | "error"
-  >("idle");
-  const [icpMaterialMessage, setIcpMaterialMessage] = useState("");
 
   const workflow = useMemo(
     () =>
@@ -424,8 +356,7 @@ export default function AiWebsiteManagementWorkspace({
     !websiteWorkflow ||
     (phase === "icp"
       ? websiteWorkflow.canSubmitIcp !== false ||
-        (!workflow.domainCompleted &&
-          websiteWorkflow.canSubmitDomain !== false)
+        (!workflow.domainCompleted && websiteWorkflow.canSubmitDomain !== false)
       : websiteWorkflow.canSubmitContent !== false);
   const workflowLockReason =
     phase === "icp"
@@ -442,46 +373,6 @@ export default function AiWebsiteManagementWorkspace({
       })),
     [contentCatalog],
   );
-  const icpSensitiveMaterialFields = useMemo(() => {
-    const baseFields = ICP_BASE_MATERIAL_FIELDS.map((field) => {
-      const checklistItem = websiteWorkflow?.icpMaterialChecklist?.find(
-        (item) =>
-          typeof item !== "string" &&
-          (item.key === field.category || item.id === field.category),
-      );
-      return {
-        category: field.category,
-        label:
-          checklistItem && typeof checklistItem !== "string"
-            ? checklistItem.label
-            : field.fallbackLabel,
-        required: true,
-      };
-    });
-    const baseCategories = new Set(baseFields.map((field) => field.category));
-    const additionalFields = (
-      websiteWorkflow?.icpMaterialChecklist ?? []
-    ).flatMap((item) => {
-      if (
-        typeof item === "string" ||
-        !item.sensitive ||
-        !item.key ||
-        baseCategories.has(
-          item.key as (typeof ICP_BASE_MATERIAL_FIELDS)[number]["category"],
-        )
-      ) {
-        return [];
-      }
-      return [
-        {
-          category: item.key,
-          label: item.label,
-          required: item.required !== false,
-        },
-      ];
-    });
-    return [...baseFields, ...additionalFields];
-  }, [websiteWorkflow?.icpMaterialChecklist]);
   const effectiveType = fixedPhaseType?.id ?? selectedType;
   const serviceAllowed = Boolean(quota?.allowed);
   const quotaExhausted =
@@ -496,115 +387,10 @@ export default function AiWebsiteManagementWorkspace({
     !serviceAllowed ||
     !onSubmit;
 
-  async function loadStoredIcpMaterials() {
-    if (!enableIcpMaterialManagement) return;
-    setIcpMaterialState("loading");
-    setIcpMaterialMessage("");
-    try {
-      const response = await fetch("/api/icp-materials", {
-        credentials: "same-origin",
-        cache: "no-store",
-      });
-      const result = await response.json().catch(() => null);
-      if (!response.ok) {
-        throw new Error(
-          result?.error?.message || "备案材料暂时无法载入。",
-        );
-      }
-      setStoredIcpMaterials(
-        Array.isArray(result?.materials) ? result.materials : [],
-      );
-      setIcpMaterialState("idle");
-    } catch (error) {
-      setIcpMaterialState("error");
-      setIcpMaterialMessage(
-        error instanceof Error ? error.message : "备案材料暂时无法载入。",
-      );
-    }
-  }
-
-  useEffect(() => {
-    if (!enableIcpMaterialManagement) return;
-    void loadStoredIcpMaterials();
-  }, [enableIcpMaterialManagement]);
-
-  async function replaceStoredIcpMaterial(
-    material: IcpMaterialSummary,
-    file: File,
-  ) {
-    setIcpMaterialState("updating");
-    setIcpMaterialMessage("");
-    try {
-      const response = await fetch("/api/icp-materials/upload", {
-        method: "PUT",
-        credentials: "same-origin",
-        headers: {
-          "content-type": "application/octet-stream",
-          "x-file-name": encodeURIComponent(file.name),
-          "x-file-content-type": encodeURIComponent(
-            file.type || "application/octet-stream",
-          ),
-          "x-icp-material-category": material.category,
-          "x-replaces-material-id": material.id,
-        },
-        body: file,
-      });
-      const result = await response.json().catch(() => null);
-      if (!response.ok) {
-        throw new Error(
-          result?.error?.message || "备案材料替换失败。",
-        );
-      }
-      await loadStoredIcpMaterials();
-      setIcpMaterialMessage("备案材料已替换，原工单关联已同步更新。");
-    } catch (error) {
-      setIcpMaterialState("error");
-      setIcpMaterialMessage(
-        error instanceof Error ? error.message : "备案材料替换失败。",
-      );
-    }
-  }
-
-  async function withdrawStoredIcpMaterial(material: IcpMaterialSummary) {
-    setIcpMaterialState("updating");
-    setIcpMaterialMessage("");
-    try {
-      const response = await fetch(
-        `/api/icp-materials/${encodeURIComponent(material.id)}`,
-        {
-          method: "DELETE",
-          credentials: "same-origin",
-        },
-      );
-      const result = await response.json().catch(() => null);
-      if (!response.ok) {
-        throw new Error(
-          result?.error?.message || "备案材料撤回失败。",
-        );
-      }
-      await loadStoredIcpMaterials();
-      setIcpMaterialMessage("备案材料已撤回并从受保护存储删除。");
-    } catch (error) {
-      setIcpMaterialState("error");
-      setIcpMaterialMessage(
-        error instanceof Error ? error.message : "备案材料撤回失败。",
-      );
-    }
-  }
-
   function handleFiles(event: ChangeEvent<HTMLInputElement>) {
     const nextFiles = Array.from(event.target.files ?? []);
     setAttachments((current) => [...current, ...nextFiles]);
     event.target.value = "";
-  }
-
-  function handleIcpMaterialFile(
-    category: string,
-    event: ChangeEvent<HTMLInputElement>,
-  ) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    setIcpMaterialFiles((current) => ({ ...current, [category]: file }));
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -618,39 +404,14 @@ export default function AiWebsiteManagementWorkspace({
     if (!normalizedTopic) {
       setSubmitState("error");
       setSubmitMessage(
-        phase === "icp"
-          ? "请填写需要申请或核验的域名。"
-          : "请填写需要处理的话题。",
+        phase === "icp" ? "请填写已完成备案的域名。" : "请填写需要处理的话题。",
       );
       return;
     }
-    if (phase === "icp" && !icpProvince) {
+    if (phase === "icp" && !icpNumber.trim()) {
       setSubmitState("error");
-      setSubmitMessage("请先选择备案省份。");
+      setSubmitMessage("请填写阿里云备案通过后获得的 ICP 主体备案号。");
       return;
-    }
-    if (phase === "icp") {
-      const missingMaterials = icpSensitiveMaterialFields.filter(
-        (field) => field.required && !icpMaterialFiles[field.category],
-      );
-      if (missingMaterials.length > 0) {
-        setSubmitState("error");
-        setSubmitMessage(
-          `请上传${missingMaterials.map((field) => field.label).join("、")}。`,
-        );
-        return;
-      }
-      if (
-        !domainHolderInformation.trim() ||
-        !websiteInformation.trim() ||
-        !aliyunAppVerificationCompleted
-      ) {
-        setSubmitState("error");
-        setSubmitMessage(
-          "请填写域名实名及持有人信息、网站信息，并确认已完成阿里云 App 真实性 / 人脸核验。",
-        );
-        return;
-      }
     }
     if (submitDisabled || !onSubmit) return;
 
@@ -669,40 +430,28 @@ export default function AiWebsiteManagementWorkspace({
       await onSubmit({
         category: effectiveType,
         topic: normalizedTopic,
-        description: details.trim(),
+        description: phase === "content" ? details.trim() : "",
         targetPage: "",
-        materialUrls: parsedLinks.urls,
-        attachmentFiles: attachments,
-        icpMaterialFiles:
-          phase === "icp"
-            ? icpSensitiveMaterialFields.flatMap((field) => {
-                const file = icpMaterialFiles[field.category];
-                return file ? [{ category: field.category, file }] : [];
-              })
-            : [],
-        ...(phase === "icp" ? { icpProvince } : {}),
+        materialUrls: phase === "content" ? parsedLinks.urls : [],
+        attachmentFiles: phase === "content" ? attachments : [],
         ...(phase === "icp"
           ? {
               icpDeclarations: {
-                domainHolderInformation: domainHolderInformation.trim(),
-                websiteInformation: websiteInformation.trim(),
-                aliyunAppVerificationCompleted: true as const,
+                icpNumber: icpNumber.trim(),
               },
             }
           : {}),
       });
       setTopic("");
+      setIcpNumber("");
       setDetails("");
       setReferenceLinks("");
-      setIcpProvince("");
       setAttachments([]);
-      setIcpMaterialFiles({});
-      setDomainHolderInformation("");
-      setWebsiteInformation("");
-      setAliyunAppVerificationCompleted(false);
       setSelectedType(null);
       setSubmitState("success");
-      setSubmitMessage("工单已提交。");
+      setSubmitMessage(
+        phase === "icp" ? "备案结果已提交，等待平台确认。" : "工单已提交。",
+      );
     } catch (submissionError) {
       setSubmitState("error");
       setSubmitMessage(
@@ -722,7 +471,8 @@ export default function AiWebsiteManagementWorkspace({
         <p className="ai-website-eyebrow">AI 友好内容资产</p>
         <h1 id="ai-website-title">AI 友好官网管理</h1>
         <p className="ai-website-intro">
-          统一提交域名申请与 ICP 备案材料，审核完成后即可持续提交企业官网内容运营需求。
+          域名注册、备案材料提交和人脸核验均在阿里云完成。FrontMind
+          只提供操作指引，并在备案通过后记录域名与 ICP 主体备案号。
         </p>
       </header>
 
@@ -733,13 +483,13 @@ export default function AiWebsiteManagementWorkspace({
         <div className="ai-website-section-heading">
           <div>
             <h2 id="ai-website-prerequisites-title">官网开通进度</h2>
-            <p>域名与备案材料一次提交，管理员统一核验后开放内容运营。</p>
+            <p>先在阿里云完成注册与备案，再提交最终备案结果。</p>
           </div>
         </div>
         <ol className="ai-website-stepper">
           <WorkflowStep
             index={1}
-            label="域名申请与 ICP 备案材料"
+            label="阿里云域名注册与 ICP 备案"
             state={
               workflow.icpCompleted
                 ? "completed"
@@ -785,12 +535,12 @@ export default function AiWebsiteManagementWorkspace({
             <div>
               <h2>
                 {phase === "icp"
-                  ? "统一提交域名与 ICP 备案材料"
+                  ? "前往阿里云完成域名注册与 ICP 备案"
                   : "提交官网内容运营工单"}
               </h2>
               {phase === "icp" && (
                 <p>
-                  身份证、营业执照和授权书属于敏感材料，仅通过受保护的备案材料通道提交。
+                  本站不接收营业执照、身份证、授权书、负责人照片或人脸核验信息。
                 </p>
               )}
             </div>
@@ -804,21 +554,14 @@ export default function AiWebsiteManagementWorkspace({
           {phaseTicketPending || !phaseAllowedByWorkflow ? (
             <div className="ai-website-inline-state" role="status">
               {phaseTicketPending
-                ? "域名与备案材料已提交，管理员统一核验完成后会自动开放内容运营。"
+                ? "域名与 ICP 备案结果已提交，平台确认后会自动开放内容运营。"
                 : workflowLockReason || "当前阶段暂未开放。"}
             </div>
           ) : (
             <>
-              <label className="ai-website-form-field">
-                <span>需求类型</span>
-                {fixedPhaseType ? (
-                  <input
-                    aria-label="需求类型"
-                    type="text"
-                    value={fixedPhaseType.label}
-                    readOnly
-                  />
-                ) : (
+              {phase === "content" && (
+                <label className="ai-website-form-field">
+                  <span>需求类型</span>
                   <select
                     aria-label="需求类型"
                     aria-required="true"
@@ -837,242 +580,225 @@ export default function AiWebsiteManagementWorkspace({
                       </option>
                     ))}
                   </select>
-                )}
-              </label>
+                </label>
+              )}
 
               {phase === "icp" && (
                 <>
-                  <label className="ai-website-form-field">
-                    <span>备案省份</span>
-                    <select
-                      aria-label="备案省份"
-                      aria-required="true"
-                      value={icpProvince}
-                      onChange={(event) => {
-                        const nextProvince = event.target.value;
-                        setIcpProvince(nextProvince);
-                        void onIcpProvinceChange?.(nextProvince);
-                      }}
-                    >
-                      <option value="">请选择备案省份</option>
-                      {(websiteWorkflow?.icpProvinceOptions ?? []).map(
-                        (province) => (
-                          <option value={province} key={province}>
-                            {province}
-                          </option>
-                        ),
-                      )}
-                    </select>
-                  </label>
-                  <div className="ai-website-material-checklist">
-                    <strong>备案材料清单</strong>
-                    {websiteWorkflow?.icpMaterialChecklist?.length ? (
-                      <ul>
-                        {websiteWorkflow.icpMaterialChecklist.map(
-                          (material, index) => {
-                            const item =
-                              typeof material === "string"
-                                ? {
-                                    label: material,
-                                    required: true,
-                                    sensitive: false,
-                                  }
-                                : material;
-                            return (
-                              <li
-                                key={
-                                  item.id ||
-                                  item.key ||
-                                  `${item.label}-${index}`
-                                }
-                              >
-                                <span>
-                                  {item.label}
-                                  {item.note ? <em>{item.note}</em> : null}
-                                </span>
-                                <small>
-                                  {item.required === false ? "按需" : "必需"}
-                                  {item.sensitive ? " · 敏感材料" : ""}
-                                </small>
-                              </li>
-                            );
-                          },
-                        )}
-                      </ul>
-                    ) : (
+                  <section
+                    className="ai-website-aliyun-guide"
+                    aria-labelledby="ai-website-aliyun-guide-title"
+                  >
+                    <div className="ai-website-guide-notice">
+                      <LockKeyhole size={18} aria-hidden="true" />
                       <p>
-                        {icpProvince
-                          ? "该省份的材料清单正在从服务端载入。"
-                          : "选择备案省份后，将按所在地规则显示材料清单。"}
+                        <strong id="ai-website-aliyun-guide-title">
+                          所有证件与人脸核验都留在阿里云
+                        </strong>
+                        FrontMind
+                        不提供材料上传入口，也不会保存备案证件或人脸信息。
                       </p>
-                    )}
+                    </div>
+                    <ol className="ai-website-guide-steps">
+                      <li>
+                        <span>1</span>
+                        <div>
+                          <strong>注册并实名认证阿里云中国站账号</strong>
+                          <p>
+                            使用企业主体信息完成账号实名认证；后续域名持有人与备案主办单位信息应保持一致。
+                          </p>
+                          <a
+                            href={ALIYUN_DOMAIN_GUIDE_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            查看域名注册教程
+                            <ExternalLink size={14} aria-hidden="true" />
+                          </a>
+                        </div>
+                      </li>
+                      <li>
+                        <span>2</span>
+                        <div>
+                          <strong>查询、购买并完成域名实名认证</strong>
+                          <p>
+                            在阿里云万网查询可用域名，选择已通过实名认证的持有者信息模板，支付后等待域名状态变为正常。
+                          </p>
+                          <a
+                            href={ALIYUN_DOMAIN_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            去阿里云注册域名
+                            <ExternalLink size={14} aria-hidden="true" />
+                          </a>
+                        </div>
+                      </li>
+                      <li>
+                        <span>3</span>
+                        <div>
+                          <strong>在阿里云发起 ICP 备案</strong>
+                          <p>
+                            确认网站使用阿里云中国内地节点，进入备案系统并按提示填写主办者、网站与接入信息。
+                          </p>
+                          <a
+                            href={ALIYUN_ICP_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            去阿里云开始备案
+                            <ExternalLink size={14} aria-hidden="true" />
+                          </a>
+                        </div>
+                      </li>
+                      <li>
+                        <span>4</span>
+                        <div>
+                          <strong>仅在阿里云上传材料并完成人脸核验</strong>
+                          <p>
+                            按当地管局与备案订单提示，在阿里云 App
+                            上传所需原件照片，并由负责人在阿里云完成真实性 /
+                            人脸核验。
+                          </p>
+                          <a
+                            href={ALIYUN_IDENTITY_GUIDE_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            查看材料与人脸核验说明
+                            <ExternalLink size={14} aria-hidden="true" />
+                          </a>
+                        </div>
+                      </li>
+                      <li>
+                        <span>5</span>
+                        <div>
+                          <strong>完成审核并取得备案号</strong>
+                          <p>
+                            依次完成阿里云初审、工信部短信核验和管局审核；备案通过后，在阿里云备案系统查看
+                            ICP 主体备案号。
+                          </p>
+                          <a
+                            href={ALIYUN_ICP_GUIDE_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            查看 ICP 备案全流程
+                            <ExternalLink size={14} aria-hidden="true" />
+                          </a>
+                        </div>
+                      </li>
+                    </ol>
+                  </section>
+                  <div className="ai-website-result-heading">
+                    <strong>备案通过后，仅回填以下两项</strong>
+                    <p>
+                      请确认阿里云备案状态已显示通过，再提交域名与 ICP
+                      主体备案号供平台确认。
+                    </p>
                   </div>
-                  <fieldset className="ai-website-sensitive-materials">
-                    <legend>受保护备案材料</legend>
-                    <p>
-                      以下材料为备案必需项，将通过受保护存储单独上传，不进入普通附件或大模型服务。
-                    </p>
-                    <div>
-                      {icpSensitiveMaterialFields.map((field) => {
-                        const selectedFile =
-                          icpMaterialFiles[field.category] ?? null;
-                        return (
-                          <label key={field.category}>
-                            <span>
-                              {field.label}
-                              {!field.required ? "（按需）" : ""}
-                            </span>
-                            <input
-                              type="file"
-                              accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg"
-                              aria-label={`上传${field.label}`}
-                              onChange={(event) =>
-                                handleIcpMaterialFile(field.category, event)
-                              }
-                            />
-                            <small>
-                              {selectedFile
-                                ? selectedFile.name
-                                : "请选择 PDF、PNG 或 JPG 文件"}
-                            </small>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  </fieldset>
-                  <fieldset className="ai-website-sensitive-materials">
-                    <legend>备案主体与核验状态</legend>
-                    <p>
-                      以下信息用于备案材料完整性校验，不会在官网历史列表中展示。
-                    </p>
-                    <div>
-                      <label>
-                        <span>域名实名及持有人信息</span>
-                        <textarea
-                          rows={3}
-                          aria-label="域名实名及持有人信息"
-                          value={domainHolderInformation}
-                          onChange={(event) =>
-                            setDomainHolderInformation(event.target.value)
-                          }
-                          placeholder="说明域名实名主体、持有人及其与主办单位的关系"
-                        />
-                      </label>
-                      <label>
-                        <span>网站名称、服务内容和联系方式</span>
-                        <textarea
-                          rows={4}
-                          aria-label="网站名称、服务内容和联系方式"
-                          value={websiteInformation}
-                          onChange={(event) =>
-                            setWebsiteInformation(event.target.value)
-                          }
-                          placeholder="填写网站名称、主要服务内容及备案联系人信息"
-                        />
-                      </label>
-                      <label>
-                        <span>
-                          <input
-                            type="checkbox"
-                            aria-label="已完成阿里云 App 真实性或人脸核验"
-                            checked={aliyunAppVerificationCompleted}
-                            onChange={(event) =>
-                              setAliyunAppVerificationCompleted(
-                                event.target.checked,
-                              )
-                            }
-                          />
-                          已完成阿里云 App 真实性 / 人脸核验
-                        </span>
-                      </label>
-                    </div>
-                  </fieldset>
                 </>
               )}
 
               <label className="ai-website-form-field">
-                <span>{phase === "icp" ? "申请或核验的域名" : "话题"}</span>
+                <span>{phase === "icp" ? "已备案域名" : "话题"}</span>
                 <input
                   type="text"
-                  aria-label={phase === "icp" ? "申请或核验的域名" : "话题"}
+                  aria-label={phase === "icp" ? "已备案域名" : "话题"}
                   aria-required="true"
                   value={topic}
                   onChange={(event) => setTopic(event.target.value)}
                   placeholder={
                     phase === "icp"
-                      ? "例如 example.com；如需新申请，也请填写首选域名"
+                      ? "例如 example.com"
                       : "填写本次需要更新的官网话题"
                   }
                 />
               </label>
 
-              <label className="ai-website-form-field">
-                <span>内容说明（选填）</span>
-                <textarea
-                  rows={5}
-                  value={details}
-                  onChange={(event) => setDetails(event.target.value)}
-                  placeholder="补充本次需求的背景、范围和需要管理员关注的事项"
-                />
-              </label>
-
-              <label className="ai-website-form-field">
-                <span>参考资料（选填）</span>
-                <textarea
-                  rows={3}
-                  value={referenceLinks}
-                  onChange={(event) => setReferenceLinks(event.target.value)}
-                  placeholder="每行一个公开参考链接"
-                />
-              </label>
-
-              <div className="ai-website-upload">
-                <div>
-                  <strong>
-                    {phase === "icp"
-                      ? "其他非敏感附件（选填）"
-                      : "附件（选填）"}
-                  </strong>
-                  <span>
-                    {phase === "icp"
-                      ? "请勿在这里上传身份证、营业执照、授权书等敏感备案材料。"
-                      : "可上传与本次需求有关的资料。"}
-                  </span>
-                </div>
-                <label className="ai-website-upload-button">
-                  <Upload size={17} aria-hidden="true" />
-                  选择文件
+              {phase === "icp" ? (
+                <label className="ai-website-form-field">
+                  <span>ICP 主体备案号</span>
                   <input
-                    type="file"
-                    multiple
-                    onChange={handleFiles}
-                    aria-label="上传官网工单附件"
+                    type="text"
+                    aria-label="ICP 主体备案号"
+                    aria-required="true"
+                    value={icpNumber}
+                    onChange={(event) => setIcpNumber(event.target.value)}
+                    placeholder="例如 京ICP备12345678号"
                   />
+                  <small className="ai-website-field-help">
+                    请填写备案主体编号，不要填写密码、证件号码、负责人照片或其他备案材料。
+                  </small>
                 </label>
-              </div>
+              ) : (
+                <>
+                  <label className="ai-website-form-field">
+                    <span>内容说明（选填）</span>
+                    <textarea
+                      rows={5}
+                      value={details}
+                      onChange={(event) => setDetails(event.target.value)}
+                      placeholder="补充本次需求的背景、范围和需要管理员关注的事项"
+                    />
+                  </label>
 
-              {attachments.length > 0 && (
-                <ul className="ai-website-file-list" aria-label="待上传文件">
-                  {attachments.map((file, index) => (
-                    <li key={`${file.name}-${file.size}-${index}`}>
-                      <Paperclip size={15} aria-hidden="true" />
-                      <span>{file.name}</span>
-                      <button
-                        type="button"
-                        aria-label={`移除 ${file.name}`}
-                        onClick={() =>
-                          setAttachments((current) =>
-                            current.filter(
-                              (_, fileIndex) => fileIndex !== index,
-                            ),
-                          )
-                        }
-                      >
-                        <X size={15} aria-hidden="true" />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+                  <label className="ai-website-form-field">
+                    <span>参考资料（选填）</span>
+                    <textarea
+                      rows={3}
+                      value={referenceLinks}
+                      onChange={(event) =>
+                        setReferenceLinks(event.target.value)
+                      }
+                      placeholder="每行一个公开参考链接"
+                    />
+                  </label>
+
+                  <div className="ai-website-upload">
+                    <div>
+                      <strong>附件（选填）</strong>
+                      <span>可上传与本次官网内容需求有关的资料。</span>
+                    </div>
+                    <label className="ai-website-upload-button">
+                      <Upload size={17} aria-hidden="true" />
+                      选择文件
+                      <input
+                        type="file"
+                        multiple
+                        onChange={handleFiles}
+                        aria-label="上传官网工单附件"
+                      />
+                    </label>
+                  </div>
+
+                  {attachments.length > 0 && (
+                    <ul
+                      className="ai-website-file-list"
+                      aria-label="待上传文件"
+                    >
+                      {attachments.map((file, index) => (
+                        <li key={`${file.name}-${file.size}-${index}`}>
+                          <Paperclip size={15} aria-hidden="true" />
+                          <span>{file.name}</span>
+                          <button
+                            type="button"
+                            aria-label={`移除 ${file.name}`}
+                            onClick={() =>
+                              setAttachments((current) =>
+                                current.filter(
+                                  (_, fileIndex) => fileIndex !== index,
+                                ),
+                              )
+                            }
+                          >
+                            <X size={15} aria-hidden="true" />
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
               )}
 
               {quotaExhausted && (
@@ -1099,114 +825,16 @@ export default function AiWebsiteManagementWorkspace({
                   disabled={submitDisabled}
                 >
                   <Send size={17} aria-hidden="true" />
-                  {submitting ? "正在提交…" : "提交工单"}
+                  {submitting
+                    ? "正在提交…"
+                    : phase === "icp"
+                      ? "提交备案结果"
+                      : "提交工单"}
                 </button>
               </div>
             </>
           )}
         </form>
-      )}
-
-      {enableIcpMaterialManagement &&
-        (phaseTicketPending || workflow.icpCompleted) && (
-        <section
-          className="ai-website-icp-material-manager"
-          aria-labelledby="ai-website-icp-material-manager-title"
-        >
-          <div className="ai-website-section-heading">
-            <div>
-              <h2 id="ai-website-icp-material-manager-title">
-                已提交备案材料
-              </h2>
-              <p>
-                材料保存在受保护存储中；待受理备案工单使用中的材料请直接替换。
-              </p>
-            </div>
-            <button
-              type="button"
-              className="ai-website-secondary-button"
-              onClick={() => void loadStoredIcpMaterials()}
-              disabled={
-                icpMaterialState === "loading" ||
-                icpMaterialState === "updating"
-              }
-            >
-              <RefreshCw size={16} aria-hidden="true" />
-              刷新
-            </button>
-          </div>
-          {icpMaterialState === "loading" ? (
-            <div className="ai-website-inline-state" role="status">
-              正在载入备案材料…
-            </div>
-          ) : storedIcpMaterials.length === 0 ? (
-            <div className="ai-website-inline-state">
-              暂无已上传的备案敏感材料。
-            </div>
-          ) : (
-            <div className="ai-website-icp-material-list">
-              {storedIcpMaterials.map((material) => {
-                const definition = icpSensitiveMaterialFields.find(
-                  (field) => field.category === material.category,
-                );
-                return (
-                  <article key={material.id}>
-                    <div>
-                      <strong>
-                        {definition?.label || "备案补充材料"}
-                      </strong>
-                      <span>
-                        {(material.sizeBytes / 1024 / 1024).toFixed(2)} MB
-                      </span>
-                    </div>
-                    <div>
-                      <a
-                        className="ai-website-secondary-button"
-                        href={material.downloadUrl}
-                      >
-                        下载
-                      </a>
-                      <label className="ai-website-secondary-button">
-                        替换
-                        <input
-                          type="file"
-                          accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg"
-                          aria-label={`替换${definition?.label || "备案材料"}`}
-                          disabled={icpMaterialState === "updating"}
-                          onChange={(event) => {
-                            const file = event.target.files?.[0];
-                            if (file) {
-                              void replaceStoredIcpMaterial(material, file);
-                            }
-                            event.target.value = "";
-                          }}
-                        />
-                      </label>
-                      <button
-                        type="button"
-                        className="ai-website-secondary-button"
-                        disabled={icpMaterialState === "updating"}
-                        onClick={() => void withdrawStoredIcpMaterial(material)}
-                      >
-                        撤回
-                      </button>
-                    </div>
-                  </article>
-                );
-              })}
-            </div>
-          )}
-          {icpMaterialMessage && (
-            <p
-              className={`ai-website-submit-message ${
-                icpMaterialState === "error" ? "error" : "success"
-              }`}
-              role={icpMaterialState === "error" ? "alert" : "status"}
-            >
-              {icpMaterialMessage}
-            </p>
-          )}
-        </section>
       )}
 
       <section
@@ -1216,7 +844,7 @@ export default function AiWebsiteManagementWorkspace({
         <div className="ai-website-section-heading">
           <div>
             <h2 id="ai-website-orders-title">官网历史与交付记录</h2>
-            <p>域名、备案与官网内容工单统一显示在这里。</p>
+            <p>备案结果确认与官网内容工单统一显示在这里。</p>
           </div>
           {onRefresh && (
             <button

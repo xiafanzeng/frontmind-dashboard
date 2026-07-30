@@ -291,7 +291,7 @@ describe("UserBrandDashboard service experience", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("官网开通进度")).toBeInTheDocument();
     expect(
-      screen.getAllByText("域名申请与 ICP 备案材料").length,
+      screen.getAllByText("阿里云域名注册与 ICP 备案").length,
     ).toBeGreaterThan(0);
     expect(screen.queryByText("ICP 备案与主体材料")).not.toBeInTheDocument();
     expect(screen.getAllByText("官网内容运营").length).toBeGreaterThan(0);

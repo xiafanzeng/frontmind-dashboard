@@ -56,9 +56,7 @@ export type AdminDeliveryTicket = {
   publicStatusLabel?: string | null;
   preferredMedia?: string | null;
   icpDeclarations?: {
-    domainHolderInformation?: string | null;
-    websiteInformation?: string | null;
-    aliyunAppVerificationCompleted?: boolean;
+    icpNumber?: string | null;
   } | null;
   publicSummary?: string | null;
   deliveryLinks?: Array<{ label: string; url: string }>;
@@ -1736,21 +1734,8 @@ export default function AdminDeliveryTicketWorkspace({
                   detail.ticket.icpDeclarations && (
                     <div className="admin-ticket-icp-declarations">
                       <p>
-                        <strong>域名实名及持有人信息：</strong>
-                        {detail.ticket.icpDeclarations
-                          .domainHolderInformation || "未填写"}
-                      </p>
-                      <p>
-                        <strong>网站名称、服务内容和联系方式：</strong>
-                        {detail.ticket.icpDeclarations.websiteInformation ||
-                          "未填写"}
-                      </p>
-                      <p>
-                        <strong>阿里云 App 真实性 / 人脸核验：</strong>
-                        {detail.ticket.icpDeclarations
-                          .aliyunAppVerificationCompleted
-                          ? "用户已确认完成"
-                          : "尚未确认"}
+                        <strong>ICP 主体备案号：</strong>
+                        {detail.ticket.icpDeclarations.icpNumber || "未填写"}
                       </p>
                     </div>
                   )}

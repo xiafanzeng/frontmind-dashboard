@@ -746,7 +746,7 @@ describe("UserBrandDashboard formal workspace", () => {
     );
   });
 
-  it("uploads classified ICP identity materials only through protected storage", async () => {
+  it("submits only the completed domain and ICP subject number", async () => {
     deliveryWorkspaceUseQuery.mockReturnValue({
       data: {
         contentAssetCatalog: [],
@@ -756,27 +756,6 @@ describe("UserBrandDashboard formal workspace", () => {
           icpStatus: "not_started",
           canSubmitIcp: true,
           canSubmitContent: false,
-          icpProvinceOptions: ["浙江"],
-          icpMaterialChecklist: [
-            {
-              key: "business_license",
-              label: "营业执照",
-              required: true,
-              sensitive: true,
-            },
-            {
-              key: "subject_responsible_person_id",
-              label: "主体负责人身份证件",
-              required: true,
-              sensitive: true,
-            },
-            {
-              key: "website_responsible_person_id",
-              label: "网站负责人身份证件",
-              required: true,
-              sensitive: true,
-            },
-          ],
         },
         quotas: {
           content_asset_publish: {
@@ -813,100 +792,30 @@ describe("UserBrandDashboard formal workspace", () => {
       error: null,
       refetch: vi.fn(),
     });
-    const protectedUpload = vi.fn(async (_url: string, init?: RequestInit) => {
-      if (!init?.method || init.method === "GET") {
-        return {
-          ok: true,
-          json: async () => ({ materials: [] }),
-        };
-      }
-      const headers = init.headers as Record<string, string>;
-      const category = headers["x-icp-material-category"];
-      return {
-        ok: true,
-        json: async () => ({
-          protectedMaterialId:
-            category === "business_license"
-              ? "00000000-0000-4000-8000-000000000001"
-              : category === "subject_responsible_person_id"
-                ? "00000000-0000-4000-8000-000000000002"
-                : "00000000-0000-4000-8000-000000000003",
-          storageKind: "icp_protected",
-          filename: "ICP 敏感材料",
-          mimeType: "image/png",
-          sizeBytes: 3,
-          sha256: "a".repeat(64),
-          sensitiveCategory: category,
-        }),
-      };
-    });
-    vi.stubGlobal("fetch", protectedUpload);
     deliveryCreateMutateAsync.mockResolvedValue({ id: "icp-ticket-1" });
 
     render(<UserBrandDashboard />);
     fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
-    fireEvent.change(screen.getByLabelText("备案省份"), {
-      target: { value: "浙江" },
-    });
-    fireEvent.change(screen.getByLabelText("申请或核验的域名"), {
+    fireEvent.change(screen.getByLabelText("已备案域名"), {
       target: { value: "example.com" },
     });
-    fireEvent.change(screen.getByLabelText("域名实名及持有人信息"), {
-      target: { value: "域名已完成企业实名，持有人与营业执照一致" },
+    fireEvent.change(screen.getByLabelText("ICP 主体备案号"), {
+      target: { value: "浙ICP备12345678号" },
     });
-    fireEvent.change(screen.getByLabelText("网站名称、服务内容和联系方式"), {
-      target: {
-        value: "验收企业官网，展示品牌与方案资料，联系人已登记",
-      },
-    });
-    fireEvent.click(screen.getByLabelText("已完成阿里云 App 真实性或人脸核验"));
-    for (const [label, filename] of [
-      ["上传营业执照", "license.png"],
-      ["上传主体负责人身份证件", "subject.png"],
-      ["上传网站负责人身份证件", "website.png"],
-    ]) {
-      fireEvent.change(screen.getByLabelText(label), {
-        target: {
-          files: [new File(["png"], filename, { type: "image/png" })],
-        },
-      });
-    }
-    fireEvent.click(screen.getByRole("button", { name: "提交工单" }));
+    expect(screen.queryByLabelText(/上传营业执照/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "提交备案结果" }));
 
-    await waitFor(() =>
-      expect(
-        protectedUpload.mock.calls.filter(
-          ([, init]) => (init as RequestInit | undefined)?.method === "PUT",
-        ),
-      ).toHaveLength(3),
-    );
     expect(uploadFileMock).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(deliveryCreateMutateAsync).toHaveBeenCalledWith(
         expect.objectContaining({
           type: "website_operation",
           category: "icp_filing",
-          icpProvince: "浙江",
+          topic: "example.com",
           icpDeclarations: {
-            domainHolderInformation: "域名已完成企业实名，持有人与营业执照一致",
-            websiteInformation:
-              "验收企业官网，展示品牌与方案资料，联系人已登记",
-            aliyunAppVerificationCompleted: true,
+            icpNumber: "浙ICP备12345678号",
           },
-          attachments: expect.arrayContaining([
-            expect.objectContaining({
-              storageKind: "icp_protected",
-              sensitiveCategory: "business_license",
-            }),
-            expect.objectContaining({
-              storageKind: "icp_protected",
-              sensitiveCategory: "subject_responsible_person_id",
-            }),
-            expect.objectContaining({
-              storageKind: "icp_protected",
-              sensitiveCategory: "website_responsible_person_id",
-            }),
-          ]),
+          attachments: [],
         }),
       ),
     );

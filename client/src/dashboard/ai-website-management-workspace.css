@@ -40,60 +40,11 @@
 .ai-website-header,
 .ai-website-prerequisites,
 .ai-website-form,
-.ai-website-icp-material-manager,
 .ai-website-orders {
   border: 1px solid var(--website-line);
   border-radius: 20px;
   background: #fff;
   box-shadow: 0 10px 28px rgba(33, 19, 58, 0.045);
-}
-
-.ai-website-icp-material-manager {
-  padding: 22px;
-}
-
-.ai-website-icp-material-list {
-  display: grid;
-  gap: 10px;
-  margin-top: 14px;
-}
-
-.ai-website-icp-material-list article {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--website-line);
-  border-radius: 12px;
-  background: #fbf9fd;
-}
-
-.ai-website-icp-material-list article > div {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 9px;
-}
-
-.ai-website-icp-material-list article span {
-  color: var(--website-muted);
-  font-size: var(--fm-text-caption, 12px);
-}
-
-.ai-website-icp-material-list .ai-website-secondary-button {
-  position: relative;
-  min-height: 34px;
-  padding: 0 10px;
-  overflow: hidden;
-  text-decoration: none;
-}
-
-.ai-website-icp-material-list input[type="file"] {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
 }
 
 .ai-website-header {
@@ -311,6 +262,127 @@
   color: #9b94a5;
 }
 
+.ai-website-field-help {
+  color: var(--website-muted);
+  font-size: var(--fm-text-caption, 12px);
+}
+
+.ai-website-aliyun-guide {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid #d9c9e5;
+  border-radius: 14px;
+  background: linear-gradient(145deg, #fcf9fe, #fff);
+}
+
+.ai-website-guide-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid #d8e9df;
+  border-radius: 11px;
+  background: #f2faf6;
+  color: #285743;
+}
+
+.ai-website-guide-notice > svg {
+  flex: 0 0 auto;
+  margin-top: 3px;
+  color: var(--website-green);
+}
+
+.ai-website-guide-notice p {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+}
+
+.ai-website-guide-notice strong {
+  color: #174d36;
+}
+
+.ai-website-guide-steps {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ai-website-guide-steps li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 11px;
+  padding: 6px 0 15px;
+}
+
+.ai-website-guide-steps li:not(:last-child)::before {
+  position: absolute;
+  top: 36px;
+  bottom: 0;
+  left: 15px;
+  width: 1px;
+  background: #d9cfe1;
+  content: "";
+}
+
+.ai-website-guide-steps li > span {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid #cdb9dc;
+  border-radius: 999px;
+  background: #f3ebf8;
+  color: var(--website-purple);
+  font-weight: var(--fm-weight-semibold, 600);
+}
+
+.ai-website-guide-steps li > div {
+  min-width: 0;
+  padding-top: 3px;
+}
+
+.ai-website-guide-steps strong {
+  color: var(--website-ink);
+}
+
+.ai-website-guide-steps p {
+  margin: 3px 0 7px;
+  color: var(--website-muted);
+  font-size: var(--fm-text-body-sm, 13px);
+}
+
+.ai-website-guide-steps a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--website-purple);
+  font-size: var(--fm-text-body-sm, 13px);
+  font-weight: var(--fm-weight-semibold, 600);
+  text-underline-offset: 3px;
+}
+
+.ai-website-result-heading {
+  padding-top: 2px;
+}
+
+.ai-website-result-heading strong {
+  color: var(--website-ink);
+  font-size: var(--fm-text-card-title, 16px);
+}
+
+.ai-website-result-heading p {
+  margin: 3px 0 0;
+  color: var(--website-muted);
+  font-size: var(--fm-text-body-sm, 13px);
+}
+
 .ai-website-upload {
   display: flex;
   align-items: center;
@@ -413,108 +485,6 @@
   border-color: #ead9b3;
   background: #fff9ec;
   color: #76520c;
-}
-
-.ai-website-material-checklist {
-  padding: 14px;
-  border: 1px solid var(--website-line);
-  border-radius: 12px;
-  background: #fbf9fd;
-}
-
-.ai-website-material-checklist > strong {
-  color: var(--website-ink);
-}
-
-.ai-website-material-checklist > p {
-  margin: 5px 0 0;
-  color: var(--website-muted);
-}
-
-.ai-website-material-checklist ul {
-  display: grid;
-  gap: 7px;
-  margin: 10px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.ai-website-material-checklist li {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.ai-website-material-checklist li small {
-  flex: 0 0 auto;
-  color: var(--website-muted);
-}
-
-.ai-website-material-checklist li em {
-  display: block;
-  margin-top: 2px;
-  color: var(--website-muted);
-  font-size: var(--fm-text-caption, 12px);
-  font-style: normal;
-}
-
-.ai-website-sensitive-materials {
-  min-width: 0;
-  margin: 0;
-  padding: 14px;
-  border: 1px solid #d9c9e5;
-  border-radius: 12px;
-  background: #faf7fc;
-}
-
-.ai-website-sensitive-materials legend {
-  padding: 0 5px;
-  color: var(--website-ink);
-  font-weight: var(--fm-weight-semibold, 600);
-}
-
-.ai-website-sensitive-materials > p {
-  margin: 0 0 12px;
-  color: var(--website-muted);
-  font-size: var(--fm-text-body-sm, 13px);
-}
-
-.ai-website-sensitive-materials > div {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.ai-website-sensitive-materials label {
-  display: grid;
-  min-width: 0;
-  gap: 7px;
-  padding: 12px;
-  border: 1px solid var(--website-line);
-  border-radius: 10px;
-  background: #fff;
-}
-
-.ai-website-sensitive-materials label > span {
-  color: var(--website-ink);
-  font-size: var(--fm-text-body-sm, 13px);
-  font-weight: var(--fm-weight-semibold, 600);
-}
-
-.ai-website-sensitive-materials input[type="file"] {
-  width: 100%;
-  color: var(--website-muted);
-  font-size: var(--fm-text-caption, 12px);
-}
-
-.ai-website-sensitive-materials small {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--website-muted);
-  font-size: var(--fm-text-caption, 12px);
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .ai-website-form-actions {
@@ -707,7 +677,6 @@
   .ai-website-header,
   .ai-website-prerequisites,
   .ai-website-form,
-  .ai-website-icp-material-manager,
   .ai-website-orders {
     padding: 17px;
     border-radius: 16px;
@@ -745,10 +714,6 @@
     flex-direction: column;
   }
 
-  .ai-website-sensitive-materials > div {
-    grid-template-columns: 1fr;
-  }
-
   .ai-website-upload-button,
   .ai-website-form-actions .ai-website-primary-button {
     width: 100%;
@@ -765,14 +730,5 @@
   .ai-website-order-main strong {
     overflow: visible;
     white-space: normal;
-  }
-
-  .ai-website-icp-material-list article {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .ai-website-icp-material-list article > div:last-child {
-    flex-wrap: wrap;
   }
 }

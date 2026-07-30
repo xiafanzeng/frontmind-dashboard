@@ -59,6 +59,7 @@ type AdminUsageHierarchyManager = {
   username: string | null;
   keyPool: {
     fingerprint: string | null;
+    credentialCount: number;
     totalUsed: number;
     limit: number;
     warningRatio: number;
@@ -76,6 +77,7 @@ type AdminUsageHierarchyManager = {
     monthUsed: number;
     fingerprint: string | null;
     usesManagerKey: boolean;
+    credentialSource: "manager" | "customer" | "unconfigured";
     syncStatus: string;
     fetchedAt: number | string | Date | null;
   }>;
@@ -359,6 +361,11 @@ export function normalizeUsageHierarchy(value: unknown): {
           fingerprint: entry?.keyPool?.fingerprint
             ? String(entry.keyPool.fingerprint)
             : null,
+          credentialCount: Math.max(
+            0,
+            Number(entry?.keyPool?.credentialCount) ||
+              (entry?.keyPool?.fingerprint ? 1 : 0),
+          ),
           totalUsed: Math.max(0, Number(entry?.keyPool?.totalUsed) || 0),
           limit: Math.max(1, Number(entry?.keyPool?.limit) || 230_000),
           warningRatio: Math.min(
@@ -386,6 +393,15 @@ export function normalizeUsageHierarchy(value: unknown): {
                 ? String(customer.fingerprint)
                 : null,
               usesManagerKey: customer?.usesManagerKey === true,
+              credentialSource:
+                customer?.credentialSource === "manager" ||
+                customer?.credentialSource === "customer"
+                  ? customer.credentialSource
+                  : customer?.usesManagerKey === true
+                    ? "manager"
+                    : customer?.fingerprint
+                      ? "customer"
+                      : "unconfigured",
               syncStatus: String(customer?.syncStatus || "pending"),
               fetchedAt: customer?.fetchedAt ?? null,
             }))
@@ -597,14 +613,19 @@ export default function AdminDashboard({
       usesManagerKey:
         Boolean(pool?.fingerprint) &&
         item.credentialFingerprint === pool?.fingerprint,
+      credentialSource:
+        Boolean(pool?.fingerprint) &&
+        item.credentialFingerprint === pool?.fingerprint
+          ? ("manager" as const)
+          : item.credentialFingerprint
+            ? ("customer" as const)
+            : ("unconfigured" as const),
       syncStatus: item.syncStatus,
       fetchedAt: item.fetchedAt ?? null,
     }));
     const attributedUsed =
       ownAgentMonthUsed +
-      users
-        .filter((customer) => customer.usesManagerKey)
-        .reduce((sum, customer) => sum + customer.monthUsed, 0);
+      users.reduce((sum, customer) => sum + customer.monthUsed, 0);
     return {
       period: { label: "2026 年 7 月" },
       managers: [
@@ -614,6 +635,7 @@ export default function AdminDashboard({
           username: "delivery.admin",
           keyPool: {
             fingerprint: pool?.fingerprint || "9f17b2d4a631c809",
+            credentialCount: pool?.fingerprint ? 1 : 0,
             totalUsed: pool?.used || 84_200,
             limit: pool?.limit || 230_000,
             warningRatio: pool?.warningRatio || 0.8,
@@ -710,8 +732,8 @@ export default function AdminDashboard({
               </div>
               <p className="mt-1 text-sm leading-6 text-[#716a80]">
                 {systemAdmin
-                  ? "先选择交付管理员，再查看该管理员的 Key 池、管理员自用 Agent 积分与名下用户本月消耗。"
-                  : "Key 总消耗取自当前共享 Key；管理员本人和名下用户按任务归属独立记账。"}
+                  ? "先选择交付管理员，再查看该管理员名下的 Key 池、管理员自用 Agent 积分与用户本月消耗。"
+                  : "名下各 Key 池总消耗取自上游；管理员本人和名下用户按任务归属独立记账。"}
               </p>
             </div>
             {!previewMode && (
@@ -784,8 +806,12 @@ export default function AdminDashboard({
                         {selectedUsageManager.displayName}
                       </h3>
                       <p className="mt-1 font-mono text-xs text-[#857e91]">
-                        {selectedUsageManager.keyPool.fingerprint ||
-                          "尚未配置 Key"}
+                        {selectedUsageManager.keyPool.credentialCount === 0
+                          ? "尚未配置有效 Key"
+                          : selectedUsageManager.keyPool.credentialCount === 1
+                            ? selectedUsageManager.keyPool.fingerprint ||
+                              "1 个有效 Key"
+                            : `${selectedUsageManager.keyPool.credentialCount} 个有效 Key`}
                       </p>
                     </div>
                     <p className="text-xs text-[#857e91]">
@@ -795,7 +821,10 @@ export default function AdminDashboard({
 
                   <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                     {[
-                      ["Key 池总消耗", selectedUsageManager.keyPool.totalUsed],
+                      [
+                        "名下 Key 池总消耗",
+                        selectedUsageManager.keyPool.totalUsed,
+                      ],
                       [
                         "管理员自用 Agent 积分",
                         selectedUsageManager.ownAgentMonthUsed,
@@ -821,8 +850,8 @@ export default function AdminDashboard({
                   </div>
                   {selectedUsageManager.keyPool.syncStatus !== "ok" && (
                     <p className="mt-3 rounded-xl border border-[#ead7a5] bg-[#fffaf0] px-3 py-2 text-xs leading-5 text-[#8a6200]">
-                      当前 Key
-                      的本月用量尚未完整同步，请刷新用量后再据此判断是否更换
+                      名下 Key
+                      池的本月用量尚未完整同步，请刷新用量后再据此判断是否更换
                       Key。
                     </p>
                   )}
@@ -867,14 +896,16 @@ export default function AdminDashboard({
                           </p>
                           <p
                             className={`text-xs sm:text-right ${
-                              customer.usesManagerKey
+                              customer.credentialSource !== "unconfigured"
                                 ? "text-[#16794f]"
                                 : "text-[#a02652]"
                             }`}
                           >
                             {customer.usesManagerKey
                               ? "使用管理员 Key"
-                              : "Key 未关联"}
+                              : customer.credentialSource === "customer"
+                                ? "客户独立 Key"
+                                : "Key 未配置"}
                           </p>
                         </button>
                       ))

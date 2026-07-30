@@ -259,7 +259,15 @@ describe("administrator channel navigation", () => {
           ownAgentMonthUsed: 120,
           attributedUsed: 420,
           otherOrUnattributedUsed: 580,
-          users: [{ userId: 101, enterpriseName: "甲公司", monthUsed: 300 }],
+          users: [
+            {
+              userId: 101,
+              enterpriseName: "甲公司",
+              monthUsed: 300,
+              fingerprint: "fp_customer",
+              credentialSource: "customer",
+            },
+          ],
         },
         {
           adminId: 12,
@@ -278,6 +286,8 @@ describe("administrator channel navigation", () => {
       11, 12,
     ]);
     expect(hierarchy.managers[0]?.users[0]?.monthUsed).toBe(300);
+    expect(hierarchy.managers[0]?.users[0]?.credentialSource).toBe("customer");
+    expect(hierarchy.managers[0]?.users[0]?.usesManagerKey).toBe(false);
     expect(hierarchy.managers[1]?.users[0]?.monthUsed).toBe(200);
     expect(
       hierarchy.managers.map((manager) => manager.keyPool.totalUsed),

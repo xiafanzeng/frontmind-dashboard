@@ -200,13 +200,11 @@ const targetPageSchema = z
     }
   }, "目标页面必须是站内路径或完整的 http/https 链接");
 
-export const icpNonSensitiveDeclarationsSchema = z.object({
-  domainHolderInformation: z.string().trim().min(1).max(4_000),
-  websiteInformation: z.string().trim().min(1).max(8_000),
-  aliyunAppVerificationCompleted: z.literal(true, {
-    error: "请确认已完成阿里云 App 真实性 / 人脸核验",
-  }),
-});
+export const icpNonSensitiveDeclarationsSchema = z
+  .object({
+    icpNumber: z.string().trim().min(1, "请填写 ICP 主体备案号").max(128),
+  })
+  .strict();
 export type IcpNonSensitiveDeclarations = z.infer<
   typeof icpNonSensitiveDeclarationsSchema
 >;
@@ -245,8 +243,15 @@ export const createDeliveryTicketSchema = z
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["icpDeclarations"],
+        message: "请在阿里云完成备案后填写 ICP 主体备案号",
+      });
+    }
+    if (value.category === "icp_filing" && value.attachments.length > 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["attachments"],
         message:
-          "域名与 ICP 备案工单必须填写域名实名信息、网站信息并确认真实性核验状态",
+          "域名与 ICP 备案结果不接收附件，请仅填写已备案域名和 ICP 主体备案号",
       });
     }
     if (
