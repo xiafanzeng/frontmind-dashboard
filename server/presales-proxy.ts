@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Transform } from "node:stream";
 import {
   Router,
@@ -41,6 +41,8 @@ const SERVICE_TOKEN_HEADER = "x-frontmind-service-token";
 const MAX_PROXY_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_TRUSTED_TASK_ARTIFACTS = 32;
 const UPSTREAM_TIMEOUT_MS = 300_000;
+const UPLOAD_TICKET_DEFAULT_TTL_MS = 5 * 60 * 1000;
+const UPLOAD_TICKET_MAX_TTL_MS = 10 * 60 * 1000;
 const fileJsonParser = json({ limit: "16kb" });
 const taskJsonParser = json({ limit: "4mb" });
 const PUBLIC_PLACEHOLDER_SERVICE_TOKENS = new Set([
@@ -71,20 +73,22 @@ const attachmentSchema = z.object({
   filename: z.string().trim().min(1).max(512),
 });
 
-const taskCreateSchema = z.object({
-  prompt: z.string().trim().min(1).max(2_000_000),
-  attachments: z.array(attachmentSchema).max(20).optional().default([]),
-  idempotencyKey: z.string().trim().min(16).max(512).optional(),
-  projectId: z.string().trim().min(8).max(80).optional(),
-}).superRefine((value, context) => {
-  if (value.projectId && !value.idempotencyKey) {
-    context.addIssue({
-      code: "custom",
-      path: ["idempotencyKey"],
-      message: "Project-bound tasks require an idempotency key",
-    });
-  }
-});
+const taskCreateSchema = z
+  .object({
+    prompt: z.string().trim().min(1).max(2_000_000),
+    attachments: z.array(attachmentSchema).max(20).optional().default([]),
+    idempotencyKey: z.string().trim().min(16).max(512).optional(),
+    projectId: z.string().trim().min(8).max(80).optional(),
+  })
+  .superRefine((value, context) => {
+    if (value.projectId && !value.idempotencyKey) {
+      context.addIssue({
+        code: "custom",
+        path: ["idempotencyKey"],
+        message: "Project-bound tasks require an idempotency key",
+      });
+    }
+  });
 
 export function buildPresalesTaskBody(input: {
   prompt: string;
@@ -100,6 +104,128 @@ export function buildPresalesTaskBody(input: {
 
 function tokenDigest(value: string) {
   return createHash("sha256").update(value, "utf8").digest();
+}
+
+type PresalesUploadTicketPayload = {
+  fileId: string;
+  target: string;
+  expiresAt: number;
+};
+
+function uploadTicketSignature(encodedPayload: string, secret: string) {
+  return createHmac("sha256", secret)
+    .update(`frontmind-presales-upload:v1.${encodedPayload}`, "utf8")
+    .digest();
+}
+
+function uploadTicketExpiry(value: unknown, now: number) {
+  let parsed = Number.NaN;
+  if (typeof value === "number") {
+    parsed = value < 1_000_000_000_000 ? value * 1000 : value;
+  } else if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    parsed = Number.isFinite(numeric)
+      ? numeric < 1_000_000_000_000
+        ? numeric * 1000
+        : numeric
+      : Date.parse(value);
+  }
+  const upstreamExpiry =
+    Number.isFinite(parsed) && parsed > now
+      ? parsed
+      : now + UPLOAD_TICKET_DEFAULT_TTL_MS;
+  return Math.min(upstreamExpiry, now + UPLOAD_TICKET_MAX_TTL_MS);
+}
+
+/**
+ * Preserve the create-file upload capability without trusting a later
+ * caller-supplied URL. The upstream only guarantees upload_url on creation;
+ * its file-detail response may omit that short-lived capability.
+ */
+export function createPresalesUploadTicket(
+  input: { fileId: string; target: string; upstreamExpiresAt?: unknown },
+  secret = process.env.FRONTMIND_PRESALES_SERVICE_TOKEN ?? "",
+  now = Date.now(),
+) {
+  const fileId = input.fileId.trim();
+  if (
+    !isUsablePresalesServiceToken(secret) ||
+    !fileId ||
+    fileId.length > 255 ||
+    input.target.length > 4096
+  ) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  const payload: PresalesUploadTicketPayload = {
+    fileId,
+    target: assertSafeExternalUrl(input.target),
+    expiresAt: uploadTicketExpiry(input.upstreamExpiresAt, now),
+  };
+  const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString(
+    "base64url",
+  );
+  const signature = uploadTicketSignature(encodedPayload, secret).toString(
+    "base64url",
+  );
+  return `v1.${encodedPayload}.${signature}`;
+}
+
+export function openPresalesUploadTicket(
+  ticket: string,
+  expectedFileId: string,
+  secret = process.env.FRONTMIND_PRESALES_SERVICE_TOKEN ?? "",
+  now = Date.now(),
+) {
+  if (
+    !isUsablePresalesServiceToken(secret) ||
+    !ticket ||
+    ticket.length > 12_000
+  ) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  const [version, encodedPayload, encodedSignature, extra] = ticket.split(".");
+  if (version !== "v1" || !encodedPayload || !encodedSignature || extra) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  const expectedSignature = uploadTicketSignature(encodedPayload, secret);
+  let suppliedSignature: Buffer;
+  try {
+    suppliedSignature = Buffer.from(encodedSignature, "base64url");
+  } catch {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  if (
+    suppliedSignature.toString("base64url") !== encodedSignature ||
+    suppliedSignature.length !== expectedSignature.length ||
+    !timingSafeEqual(suppliedSignature, expectedSignature)
+  ) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  let payload: PresalesUploadTicketPayload;
+  try {
+    const payloadBytes = Buffer.from(encodedPayload, "base64url");
+    if (payloadBytes.toString("base64url") !== encodedPayload) {
+      throw new Error("Non-canonical upload capability");
+    }
+    const parsed = JSON.parse(payloadBytes.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Invalid upload capability payload");
+    }
+    payload = parsed as PresalesUploadTicketPayload;
+  } catch {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  if (
+    payload.fileId !== expectedFileId ||
+    !Number.isSafeInteger(payload.expiresAt) ||
+    payload.expiresAt <= now ||
+    payload.expiresAt > now + UPLOAD_TICKET_MAX_TTL_MS ||
+    typeof payload.target !== "string" ||
+    payload.target.length > 4096
+  ) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  return assertSafeExternalUrl(payload.target);
 }
 
 /** Constant-time service-token validation, including unequal-length inputs. */
@@ -518,10 +644,20 @@ router.post("/files", fileJsonParser, async (req, res) => {
     const payload = redactUpstreamPayload(response.data, credential.apiKey) as
       | Record<string, unknown>
       | undefined;
+    const uploadUrl =
+      typeof payload?.upload_url === "string" ? payload.upload_url : "";
+    const proxyUploadTicket = uploadUrl
+      ? createPresalesUploadTicket({
+          fileId: id,
+          target: uploadUrl,
+          upstreamExpiresAt: payload?.upload_expires_at,
+        })
+      : undefined;
     res.status(201).json({
       ...(payload ?? {}),
       id,
       filename: payload?.filename ?? input.filename,
+      ...(proxyUploadTicket ? { proxy_upload_ticket: proxyUploadTicket } : {}),
     });
   } catch (error) {
     sendKnownError(res, error);
@@ -595,8 +731,17 @@ router.put("/files/:fileId/content", async (req, res) => {
         error: { code: "FILE_TOO_LARGE", message: "File exceeds 100 MB" },
       });
     }
-    const metadata = await fetchFileMetadata(fileId, credential);
-    const target = assertSafeExternalUrl(String(metadata.upload_url ?? ""));
+    const ticketHeader = req.headers["x-frontmind-upload-ticket"];
+    const uploadTicket = Array.isArray(ticketHeader)
+      ? ticketHeader[0]
+      : ticketHeader;
+    const target = uploadTicket
+      ? openPresalesUploadTicket(uploadTicket, fileId)
+      : assertSafeExternalUrl(
+          String(
+            (await fetchFileMetadata(fileId, credential)).upload_url ?? "",
+          ),
+        );
     let received = 0;
     const limiter = new Transform({
       transform(chunk, _encoding, callback) {

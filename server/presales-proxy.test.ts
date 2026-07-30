@@ -9,7 +9,9 @@ import presalesProxy, {
   buildPresalesTaskBody,
   buildProxyUploadSuccess,
   collectTaskArtifacts,
+  createPresalesUploadTicket,
   isValidPresalesServiceToken,
+  openPresalesUploadTicket,
   redactUpstreamPayload,
 } from "./presales-proxy";
 
@@ -119,6 +121,51 @@ describe("presales service-token boundary", () => {
         server.close((error) => (error ? reject(error) : resolve())),
       );
     }
+  });
+});
+
+describe("presales upload capability", () => {
+  const serviceToken = "a-secure-service-token-with-more-than-32-characters";
+  const now = Date.parse("2026-07-30T04:00:00.000Z");
+  const target =
+    "https://uploads.example.test/catalog.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abcdef";
+
+  it("binds the create-file URL to the exact file and expiry", () => {
+    const ticket = createPresalesUploadTicket(
+      {
+        fileId: "file-1",
+        target,
+        upstreamExpiresAt: now + 180_000,
+      },
+      serviceToken,
+      now,
+    );
+
+    expect(
+      openPresalesUploadTicket(ticket, "file-1", serviceToken, now + 1_000),
+    ).toBe(target);
+    expect(() =>
+      openPresalesUploadTicket(ticket, "file-2", serviceToken, now + 1_000),
+    ).toThrow();
+    expect(() =>
+      openPresalesUploadTicket(ticket, "file-1", serviceToken, now + 180_001),
+    ).toThrow();
+  });
+
+  it("rejects a modified capability", () => {
+    const ticket = createPresalesUploadTicket(
+      { fileId: "file-1", target },
+      serviceToken,
+      now,
+    );
+    expect(() =>
+      openPresalesUploadTicket(
+        `${ticket.slice(0, -1)}x`,
+        "file-1",
+        serviceToken,
+        now + 1_000,
+      ),
+    ).toThrow();
   });
 });
 

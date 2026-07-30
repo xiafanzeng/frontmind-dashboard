@@ -3885,7 +3885,7 @@ var dashboardOptimizationReportSchema = z3.object({
   questionBaselines: z3.array(dashboardOptimizationBaselineSchema).max(500).optional(),
   questionReports: z3.array(dashboardOptimizationQuestionReportSchema).max(500).optional()
 }).superRefine((report, context) => {
-  const ensureUnique = (values, path9) => {
+  const ensureUnique = (values, path10) => {
     const seen = /* @__PURE__ */ new Set();
     values.forEach((value, index2) => {
       if (!value || !seen.has(value)) {
@@ -3895,9 +3895,9 @@ var dashboardOptimizationReportSchema = z3.object({
       context.addIssue({
         code: "custom",
         path: [
-          path9,
+          path10,
           index2,
-          path9 === "questionBaselines" ? "questionId" : "id"
+          path10 === "questionBaselines" ? "questionId" : "id"
         ],
         message: "\u540C\u4E00\u95EE\u9898\u53EA\u80FD\u53D1\u5E03\u4E00\u4EFD\u62A5\u544A"
       });
@@ -4190,8 +4190,8 @@ var websitePurchaseRequestV2Schema = z4.object({
       "service startsAt must match order paidAt"
     ]
   ];
-  for (const [valid, path9, message] of checks) {
-    if (!valid) context.addIssue({ code: "custom", path: path9, message });
+  for (const [valid, path10, message] of checks) {
+    if (!valid) context.addIssue({ code: "custom", path: path10, message });
   }
 });
 var purchaseStatusSchema = z4.enum([
@@ -18599,12 +18599,12 @@ async function parseRedirectWorkbook(data) {
   for (const row of rows) {
     if (invalidRows.has(row.row) || globallyVisited.has(row.sourceUrl))
       continue;
-    const path9 = /* @__PURE__ */ new Map();
+    const path10 = /* @__PURE__ */ new Map();
     let current = row;
     while (current && !invalidRows.has(current.row)) {
-      if (path9.has(current.sourceUrl)) {
-        const cycleStart = path9.get(current.sourceUrl);
-        const cycleRows = [...path9.entries()].filter(([, position]) => position >= cycleStart).map(([source]) => nextBySource.get(source)).filter(Boolean);
+      if (path10.has(current.sourceUrl)) {
+        const cycleStart = path10.get(current.sourceUrl);
+        const cycleRows = [...path10.entries()].filter(([, position]) => position >= cycleStart).map(([source]) => nextBySource.get(source)).filter(Boolean);
         for (const cycleRow of cycleRows) invalidRows.add(cycleRow.row);
         errors.push({
           row: current.row,
@@ -18613,10 +18613,10 @@ async function parseRedirectWorkbook(data) {
         break;
       }
       if (globallyVisited.has(current.sourceUrl)) break;
-      path9.set(current.sourceUrl, path9.size);
+      path10.set(current.sourceUrl, path10.size);
       current = nextBySource.get(current.targetUrl);
     }
-    for (const source of path9.keys()) globallyVisited.add(source);
+    for (const source of path10.keys()) globallyVisited.add(source);
   }
   const validRows = rows.filter((row) => !invalidRows.has(row.row));
   return {
@@ -24246,13 +24246,13 @@ function publicUpstreamTaskPayload(value, apiKey) {
   return deepSanitizeJson(redactPublicTaskValues(result, apiKey));
 }
 function isPublicTaskPayloadRequest(method, targetPath) {
-  const path9 = targetPath.split("?")[0].replace(/\/+$/, "");
+  const path10 = targetPath.split("?")[0].replace(/\/+$/, "");
   const normalizedMethod = method.toUpperCase();
-  if (normalizedMethod === "POST" && (path9 === "/v1/tasks" || path9 === "/v1/responses")) {
+  if (normalizedMethod === "POST" && (path10 === "/v1/tasks" || path10 === "/v1/responses")) {
     return true;
   }
   if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
-  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path9);
+  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path10);
 }
 function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
   if (value === null || value === void 0 || depth > 50) return ids;
@@ -25038,8 +25038,8 @@ function isZipMagicBytes(data) {
 }
 async function sanitizeOfficeXmlBuffer(data) {
   try {
-    const JSZip3 = (await import("jszip")).default;
-    const zip = await JSZip3.loadAsync(data);
+    const JSZip4 = (await import("jszip")).default;
+    const zip = await JSZip4.loadAsync(data);
     let modified = false;
     const fileNames = Object.keys(zip.files);
     for (const fname of fileNames) {
@@ -25801,13 +25801,197 @@ router2.all("/*", async (req, res) => {
 var manus_proxy_default = router2;
 
 // server/knowledge-base-api.ts
-import axios4 from "axios";
+import axios5 from "axios";
 import { and as and20, eq as eq23, inArray as inArray13, isNotNull, or as or4 } from "drizzle-orm";
 import { Router as Router2 } from "express";
-import fs4 from "fs/promises";
-import JSZip from "jszip";
-import path5 from "path";
+import fs5 from "fs/promises";
+import JSZip2 from "jszip";
+import path6 from "path";
+import { createHash as createHash13 } from "node:crypto";
+
+// server/upstream-task-attachment.ts
+import axios4 from "axios";
+async function uploadUpstreamTaskAttachment(input) {
+  const mimeType = input.mimeType || "application/zip";
+  const authHeaders = {
+    API_KEY: input.apiKey,
+    Authorization: `Bearer ${input.apiKey}`
+  };
+  const created = await axios4.post(
+    `${input.baseUrl}/v1/files`,
+    { filename: input.filename },
+    {
+      headers: { ...authHeaders, "Content-Type": "application/json" },
+      timeout: 12e4,
+      validateStatus: () => true
+    }
+  );
+  const fileId = String(created.data?.id || created.data?.file_id || "");
+  if (created.status < 200 || created.status >= 300 || !fileId) {
+    throw new Error(`Task attachment creation failed: ${input.filename}`);
+  }
+  const removeOrphan = async () => {
+    await axios4.delete(
+      `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
+      {
+        headers: authHeaders,
+        timeout: 3e4,
+        validateStatus: () => true
+      }
+    ).catch(() => void 0);
+  };
+  try {
+    let uploadUrl = String(created.data?.upload_url || "");
+    if (!uploadUrl) {
+      const metadata = await axios4.get(
+        `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
+        {
+          headers: authHeaders,
+          timeout: 3e4,
+          validateStatus: () => true
+        }
+      );
+      if (metadata.status < 200 || metadata.status >= 300) {
+        throw new Error(
+          `Task attachment upload URL lookup failed: ${input.filename}`
+        );
+      }
+      uploadUrl = String(metadata.data?.upload_url || "");
+    }
+    const target = assertSafeExternalUrl(uploadUrl);
+    const uploaded = await axios4.put(target, input.bytes, {
+      ...safeExternalRequestOptions,
+      // Query-signed uploads must use the exact URL and cannot carry API auth.
+      maxRedirects: 0,
+      headers: {
+        "Content-Type": mimeType,
+        "Content-Length": String(input.bytes.length)
+      },
+      timeout: 12e4,
+      maxBodyLength: input.bytes.length,
+      maxContentLength: 1024 * 1024,
+      validateStatus: () => true
+    });
+    if (uploaded.status < 200 || uploaded.status >= 300) {
+      throw new Error(`Task attachment upload failed: ${input.filename}`);
+    }
+    return {
+      attachment: { file_id: fileId, filename: input.filename },
+      fileId,
+      removeOrphan
+    };
+  } catch (error) {
+    await removeOrphan();
+    throw error;
+  }
+}
+
+// server/task-attachment-package.ts
 import { createHash as createHash12 } from "node:crypto";
+import fs4 from "node:fs/promises";
+import path5 from "node:path";
+import JSZip from "jszip";
+var ARCHIVE_DATE = /* @__PURE__ */ new Date("1980-01-01T00:00:00.000Z");
+function assertSafeArchivePath(relativePath) {
+  const normalized = relativePath.replaceAll("\\", "/");
+  if (!normalized || normalized.startsWith("/") || normalized.split("/").includes("..")) {
+    throw new Error(`Unsafe task attachment path: ${relativePath}`);
+  }
+  return normalized;
+}
+async function buildDeterministicTaskAttachmentArchive(input) {
+  const files = input.files.map((file) => ({
+    path: assertSafeArchivePath(file.path),
+    content: Buffer.isBuffer(file.content) ? file.content : Buffer.from(file.content, "utf8")
+  })).sort((left, right) => left.path.localeCompare(right.path, "en"));
+  if (!files.some((file) => file.path === input.entrypoint)) {
+    throw new Error(
+      `Task attachment ${input.name} is missing ${input.entrypoint}`
+    );
+  }
+  if (new Set(files.map((file) => file.path)).size !== files.length) {
+    throw new Error(`Task attachment ${input.name} contains duplicate paths`);
+  }
+  const fileManifest = files.map((file) => ({
+    path: file.path,
+    bytes: file.content.byteLength,
+    sha256: createHash12("sha256").update(file.content).digest("hex")
+  }));
+  const contentHash = createHash12("sha256").update(JSON.stringify(fileManifest)).digest("hex");
+  const zip = new JSZip();
+  for (const file of files) {
+    zip.file(file.path, file.content, {
+      date: ARCHIVE_DATE,
+      unixPermissions: 33188,
+      createFolders: false
+    });
+  }
+  zip.file(
+    "MANIFEST.json",
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        name: input.name,
+        entrypoint: input.entrypoint,
+        contentHash,
+        files: fileManifest,
+        ...input.metadata ? { metadata: input.metadata } : {}
+      },
+      null,
+      2
+    )}
+`,
+    {
+      date: ARCHIVE_DATE,
+      unixPermissions: 33188,
+      createFolders: false
+    }
+  );
+  const bytes = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 9 },
+    platform: "UNIX"
+  });
+  return { bytes, contentHash };
+}
+async function buildDirectorySkillArchive(input) {
+  let lastError;
+  for (const directoryCandidate of input.directoryCandidates) {
+    try {
+      const directory = await fs4.realpath(directoryCandidate);
+      const expectedRoot = `${directory}${path5.sep}`;
+      const files = await Promise.all(
+        input.files.map(async (relativePath) => {
+          const resolved = path5.resolve(directory, relativePath);
+          if (!resolved.startsWith(expectedRoot)) {
+            throw new Error(`Unsafe Skill path: ${relativePath}`);
+          }
+          const canonical = await fs4.realpath(resolved);
+          if (!canonical.startsWith(expectedRoot)) {
+            throw new Error(`Unsafe Skill symlink: ${relativePath}`);
+          }
+          return {
+            path: relativePath,
+            content: await fs4.readFile(canonical)
+          };
+        })
+      );
+      const archive = await buildDeterministicTaskAttachmentArchive({
+        name: input.name,
+        entrypoint: "SKILL.md",
+        files,
+        metadata: { version: input.version }
+      });
+      return { ...archive, version: input.version };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`Could not load Skill ${input.name}`);
+}
+
+// server/knowledge-base-api.ts
 var router3 = Router2();
 async function requireKnowledgeBuildCapability(userId, res) {
   try {
@@ -26071,7 +26255,7 @@ async function recoverOpenKnowledgeBaseTasks(options) {
           );
           continue;
         }
-        const taskResponse = await axios4.get(
+        const taskResponse = await axios5.get(
           `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
           {
             headers: {
@@ -26139,27 +26323,27 @@ async function recoverOpenKnowledgeBaseTasks(options) {
   return result;
 }
 var configuredKnowledgeBaseSkillPath = process.env.FRONTMIND_KB_SKILL_PATH?.trim();
-if (configuredKnowledgeBaseSkillPath && !path5.isAbsolute(configuredKnowledgeBaseSkillPath)) {
+if (configuredKnowledgeBaseSkillPath && !path6.isAbsolute(configuredKnowledgeBaseSkillPath)) {
   throw new Error("FRONTMIND_KB_SKILL_PATH must be an absolute path");
 }
 var skillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [configuredKnowledgeBaseSkillPath] : [
-  path5.resolve(
+  path6.resolve(
     import.meta.dirname,
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path5.resolve(
+  path6.resolve(
     process.cwd(),
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path5.resolve(
+  path6.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path5.resolve(
+  path6.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -26168,12 +26352,12 @@ var skillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [configuredKnowl
   )
 ];
 var legacySkillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [
-  path5.join(
-    path5.dirname(configuredKnowledgeBaseSkillPath),
+  path6.join(
+    path6.dirname(configuredKnowledgeBaseSkillPath),
     "socratic-kb-builder-v1.skill"
   )
 ] : skillArchiveCandidates.map(
-  (candidate) => path5.join(path5.dirname(candidate), "socratic-kb-builder-v1.skill")
+  (candidate) => path6.join(path6.dirname(candidate), "socratic-kb-builder-v1.skill")
 );
 var skillArchiveCache = /* @__PURE__ */ new Map();
 var KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME = "socratic-kb-builder.skill.zip";
@@ -26206,8 +26390,8 @@ async function loadSkillArchive(selection = { version: "2" }) {
   const candidates = version === "1" ? legacySkillArchiveCandidates : skillArchiveCandidates;
   for (const candidate of candidates) {
     try {
-      const archive = await fs4.readFile(candidate);
-      const zip = await JSZip.loadAsync(archive);
+      const archive = await fs5.readFile(candidate);
+      const zip = await JSZip2.loadAsync(archive);
       const entries = version === "2" ? [["SKILL.md", "Skill"]] : [
         ["SKILL.md", "Skill"],
         ["references/knowledge-tree.md", "Knowledge Tree"],
@@ -26228,7 +26412,7 @@ ${content.trim()}`);
       const instructions = sections.join("\n\n---\n\n");
       const loaded = {
         instructions,
-        contentHash: createHash12("sha256").update(instructions).digest("hex"),
+        contentHash: createHash13("sha256").update(instructions).digest("hex"),
         archivePath: candidate
       };
       if (selection.contentHash && selection.contentHash !== loaded.contentHash) {
@@ -26246,7 +26430,7 @@ ${content.trim()}`);
 }
 async function readKnowledgeBaseSkillArchiveAttachment(selection = { version: "2" }) {
   const loaded = await loadSkillArchive(selection);
-  const bytes = await fs4.readFile(loaded.archivePath);
+  const bytes = await fs5.readFile(loaded.archivePath);
   return {
     filename: KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
     bytes,
@@ -26267,6 +26451,7 @@ async function getKnowledgeBaseSkillDescriptor(selection = { version: "2" }) {
 }
 var KNOWLEDGE_PREFILL_MAX_CHARACTERS = 8e4;
 var KNOWLEDGE_PREFILL_MAX_DOCUMENT_CHARACTERS = 12e3;
+var KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME = "knowledge-base-prefill-evidence.zip";
 function knowledgePrefillBranch(pathname) {
   return pathname.normalize("NFKC").split("/").filter(Boolean)[0] || "root";
 }
@@ -26337,6 +26522,37 @@ function buildKnowledgePrefillExcerpt(documents) {
   }
   return excerpt.slice(0, KNOWLEDGE_PREFILL_MAX_CHARACTERS);
 }
+async function buildKnowledgeBasePrefillEvidenceArchive(snapshot) {
+  return buildDeterministicTaskAttachmentArchive({
+    name: "knowledge-base-prefill-evidence",
+    entrypoint: "knowledge.md",
+    files: [
+      {
+        path: "context.json",
+        content: `${JSON.stringify(
+          {
+            schemaVersion: 1,
+            knowledgeSnapshot: {
+              version: snapshot.version,
+              sourceFileName: snapshot.sourceFileName,
+              archiveHash: snapshot.archiveHash,
+              documentCount: snapshot.documentCount,
+              imageCount: snapshot.imageCount,
+              characterCount: snapshot.characterCount
+            }
+          },
+          null,
+          2
+        )}
+`
+      },
+      {
+        path: "knowledge.md",
+        content: buildKnowledgePrefillExcerpt(snapshot.documents) || "\u5F53\u524D\u7248\u672C\u6CA1\u6709\u53EF\u8BFB\u53D6\u7684\u6B63\u6587\u3002"
+      }
+    ]
+  });
+}
 async function buildKnowledgeBasePrompt({
   conversationId,
   companyName,
@@ -26346,9 +26562,6 @@ async function buildKnowledgeBasePrompt({
   prefillKnowledgeSnapshot
 }) {
   const attachmentList = attachments2.length > 0 ? attachments2.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672A\u4E0A\u4F20\u9644\u4EF6\uFF0C\u8BF7\u4F18\u5148\u4F7F\u7528\u4F01\u4E1A\u5B98\u7F51\u4E0E\u5168\u7F51\u516C\u5F00\u8D44\u6599\u8FDB\u884C\u9884\u586B";
-  const prefillDocuments = buildKnowledgePrefillExcerpt(
-    prefillKnowledgeSnapshot?.documents ?? []
-  );
   return [
     `\u4E25\u683C\u6267\u884C\u968F\u4EFB\u52A1\u9644\u5E26\u7684 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}\u3002\u5148\u89E3\u538B ZIP \u5E76\u5B8C\u6574\u8BFB\u53D6\u6839\u76EE\u5F55 SKILL.md\uFF0C\u518D\u5F00\u59CB\u5DE5\u4F5C\u3002`,
     "\u8BE5 ZIP \u662F\u672C\u4EFB\u52A1\u552F\u4E00\u7684 socratic-kb-builder v2 \u5DE5\u4F5C\u89C4\u7EA6\uFF1B\u672C\u6BB5\u4EC5\u63D0\u4F9B\u4F01\u4E1A\u8F93\u5165\u548C\u670D\u52A1\u7AEF\u72B6\u6001\u7EA6\u675F\u3002",
@@ -26371,8 +26584,7 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
       `\u6765\u6E90\u6587\u4EF6\uFF1A${prefillKnowledgeSnapshot.sourceFileName}`,
       `\u4EA7\u7269\u54C8\u5E0C\uFF1A${prefillKnowledgeSnapshot.archiveHash || "\u672A\u8BB0\u5F55"}`,
       `\u5DF2\u89E3\u6790\u6587\u6863\uFF1A${prefillKnowledgeSnapshot.documentCount}\uFF1B\u56FE\u7247\uFF1A${prefillKnowledgeSnapshot.imageCount}\uFF1B\u5B57\u7B26\uFF1A${prefillKnowledgeSnapshot.characterCount}`,
-      "\u4EE5\u4E0B\u5185\u5BB9\u662F\u9884\u586B\u8BC1\u636E\uFF0C\u4E0D\u4EE3\u8868\u8282\u70B9\u5DF2\u786E\u8BA4\uFF0C\u4E5F\u4E0D\u5F97\u636E\u6B64\u4F2A\u9020 100% \u5BF9\u8BDD\u8FDB\u5EA6\uFF1A",
-      prefillDocuments || "\u5F53\u524D\u7248\u672C\u6CA1\u6709\u53EF\u8BFB\u53D6\u7684\u6B63\u6587\u3002"
+      `\u5B8C\u6574\u9884\u586B\u8BC1\u636E\u89C1\u4EFB\u52A1\u9644\u4EF6 ${KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME}\u3002\u5148\u89E3\u538B\u5E76\u8BFB\u53D6 knowledge.md \u4E0E context.json\uFF1B\u8FD9\u4E9B\u8BC1\u636E\u4E0D\u4EE3\u8868\u8282\u70B9\u5DF2\u786E\u8BA4\uFF0C\u4E5F\u4E0D\u5F97\u636E\u6B64\u4F2A\u9020 100% \u5BF9\u8BDD\u8FDB\u5EA6\u3002`
     ].join("\n") : "\u5F53\u524D\u8D26\u53F7\u6CA1\u6709\u5DF2\u8FC1\u79FB\u7684\u521D\u6B65\u77E5\u8BC6\u5E93\uFF0C\u5C06\u4ECE\u5B98\u7F51\u3001\u5168\u7F51\u4E0E\u4E0A\u4F20\u8D44\u6599\u5F00\u59CB\u9884\u586B\u3002",
     "## \u5FC5\u987B\u6267\u884C\u7684\u673A\u5668\u53EF\u9A8C\u8BC1\u8FDB\u5EA6\u534F\u8BAE",
     "\u8FD9\u662F\u670D\u52A1\u7AEF\u72B6\u6001\u673A\u534F\u8BAE\uFF0C\u4F18\u5148\u7EA7\u9AD8\u4E8E skill \u4E2D\u4EFB\u4F55\u4F1A\u81EA\u52A8\u8DE8\u8282\u70B9\u7684\u8868\u8FF0\u3002\u53EF\u8BFB\u6B63\u6587\u7167\u5E38\u8F93\u51FA\uFF0C\u4F46\u6BCF\u8F6E\u672B\u5C3E\u5FC5\u987B\u9644\u5E26\u4E14\u53EA\u80FD\u9644\u5E26\u4E00\u4E2A\u5BF9\u5E94\u7684 HTML \u6CE8\u91CA\u4FE1\u5C01\u3002",
@@ -26409,73 +26621,13 @@ async function uploadKnowledgeBaseSkillArchive({
     version: skillVersion,
     contentHash: skillContentHash
   });
-  const headers = {
-    API_KEY: apiKey,
-    Authorization: `Bearer ${apiKey}`
-  };
-  const created = await axios4.post(
-    `${baseUrl}/v1/files`,
-    { filename: archive.filename },
-    {
-      headers: { ...headers, "Content-Type": "application/json" },
-      timeout: 12e4,
-      validateStatus: () => true
-    }
-  );
-  const fileId = String(created.data?.id || created.data?.file_id || "");
-  if (created.status < 200 || created.status >= 300 || !fileId) {
-    throw new Error("Knowledge-base Skill ZIP file creation failed");
-  }
-  const removeOrphan = async () => {
-    await axios4.delete(`${baseUrl}/v1/files/${encodeURIComponent(fileId)}`, {
-      headers,
-      timeout: 3e4,
-      validateStatus: () => true
-    }).catch(() => void 0);
-  };
-  try {
-    let uploadUrl = String(created.data?.upload_url || "");
-    if (!uploadUrl) {
-      const metadata = await axios4.get(
-        `${baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
-        {
-          headers,
-          timeout: 3e4,
-          validateStatus: () => true
-        }
-      );
-      if (metadata.status < 200 || metadata.status >= 300) {
-        throw new Error("Knowledge-base Skill ZIP upload URL lookup failed");
-      }
-      uploadUrl = String(metadata.data?.upload_url || "");
-    }
-    const target = assertSafeExternalUrl(uploadUrl);
-    const uploaded = await axios4.put(target, archive.bytes, {
-      ...safeExternalRequestOptions,
-      // The SigV4 query signs this exact URL; redirects invalidate it.
-      maxRedirects: 0,
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Length": String(archive.bytes.length)
-      },
-      timeout: 12e4,
-      maxBodyLength: archive.bytes.length,
-      maxContentLength: 1024 * 1024,
-      validateStatus: () => true
-    });
-    if (uploaded.status < 200 || uploaded.status >= 300) {
-      throw new Error("Knowledge-base Skill ZIP upload failed");
-    }
-    return {
-      attachment: { file_id: fileId, filename: archive.filename },
-      fileId,
-      contentHash: archive.contentHash,
-      removeOrphan
-    };
-  } catch (error) {
-    await removeOrphan();
-    throw error;
-  }
+  const uploaded = await uploadUpstreamTaskAttachment({
+    baseUrl,
+    apiKey,
+    filename: archive.filename,
+    bytes: archive.bytes
+  });
+  return { ...uploaded, contentHash: archive.contentHash };
 }
 async function createFrontMindTask({
   baseUrl,
@@ -26484,7 +26636,7 @@ async function createFrontMindTask({
   attachments: attachments2,
   taskId: existingTaskId
 }) {
-  const taskResponse = await axios4.post(
+  const taskResponse = await axios5.post(
     `${baseUrl}/v1/tasks`,
     {
       prompt,
@@ -26649,14 +26801,44 @@ router3.post("/start", async (req, res) => {
       skillVersion: skillDescriptor.version,
       skillContentHash: skillDescriptor.contentHash
     });
+    const generatedAttachments = [skillArchive];
+    if (prefillKnowledgeSnapshot) {
+      try {
+        const prefillArchive = await buildKnowledgeBasePrefillEvidenceArchive(
+          prefillKnowledgeSnapshot
+        );
+        generatedAttachments.push(
+          await uploadUpstreamTaskAttachment({
+            baseUrl,
+            apiKey,
+            filename: KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
+            bytes: prefillArchive.bytes
+          })
+        );
+      } catch (error) {
+        await Promise.allSettled(
+          generatedAttachments.map(
+            (attachment) => attachment.removeOrphan()
+          )
+        );
+        throw error;
+      }
+    }
     const created = await createFrontMindTask({
       baseUrl,
       apiKey,
       prompt,
-      attachments: [skillArchive.attachment, ...userAttachments]
+      attachments: [
+        ...generatedAttachments.map((item) => item.attachment),
+        ...userAttachments
+      ]
     });
     if (!created.ok) {
-      await skillArchive.removeOrphan();
+      await Promise.allSettled(
+        generatedAttachments.map(
+          (attachment) => attachment.removeOrphan()
+        )
+      );
       console.warn(
         "[Knowledge Base Start] create task failed:",
         created.detail
@@ -26665,12 +26847,14 @@ router3.post("/start", async (req, res) => {
       return;
     }
     assertKnowledgeBaseCustomerOutput(created.task.output);
-    await recordUpstreamResource({
-      userId: req.frontmindUser.id,
-      apiCredentialId: req.frontmindCredential.id,
-      kind: "file",
-      upstreamId: skillArchive.fileId
-    });
+    for (const attachment of generatedAttachments) {
+      await recordUpstreamResource({
+        userId: req.frontmindUser.id,
+        apiCredentialId: req.frontmindCredential.id,
+        kind: "file",
+        upstreamId: attachment.fileId
+      });
+    }
     await recordUpstreamResource({
       userId: req.frontmindUser.id,
       apiCredentialId: req.frontmindCredential.id,
@@ -26954,7 +27138,7 @@ router3.post("/progress/reconcile", async (req, res) => {
       });
       return;
     }
-    const taskResponse = await axios4.get(
+    const taskResponse = await axios5.get(
       `${getUpstreamBaseUrl(req)}/v1/tasks/${encodeURIComponent(taskId)}`,
       {
         headers: {
@@ -27005,11 +27189,9 @@ router3.post("/progress/reconcile", async (req, res) => {
 var knowledge_base_api_default = router3;
 
 // server/response-logic-api.ts
-import axios5 from "axios";
+import axios6 from "axios";
 import { Router as Router3 } from "express";
-import fs5 from "node:fs/promises";
-import path6 from "node:path";
-import { createHash as createHash13 } from "node:crypto";
+import path7 from "node:path";
 import { z as z16 } from "zod";
 var router4 = Router3();
 var attachmentSchema2 = z16.object({
@@ -27205,29 +27387,29 @@ function buildVerifiedResponseLogicAttachments(attachments2, uploadedAt = /* @__
   });
 }
 var configuredResponseLogicSkillPath = process.env.FRONTMIND_RESPONSE_LOGIC_SKILL_PATH?.trim();
-if (configuredResponseLogicSkillPath && !path6.isAbsolute(configuredResponseLogicSkillPath)) {
+if (configuredResponseLogicSkillPath && !path7.isAbsolute(configuredResponseLogicSkillPath)) {
   throw new Error(
     "FRONTMIND_RESPONSE_LOGIC_SKILL_PATH must be an absolute path"
   );
 }
 var skillDirectoryCandidates = configuredResponseLogicSkillPath ? [configuredResponseLogicSkillPath] : [
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     process.cwd(),
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -27235,41 +27417,29 @@ var skillDirectoryCandidates = configuredResponseLogicSkillPath ? [configuredRes
     "response-logic-builder.skill"
   )
 ];
-var cachedSkillInstructions = null;
-var cachedSkillContentHash = null;
-async function readResponseLogicSkill() {
-  if (cachedSkillInstructions) return cachedSkillInstructions;
-  let lastError;
-  for (const directory of skillDirectoryCandidates) {
-    try {
-      const [skill, outputContract] = await Promise.all([
-        fs5.readFile(path6.join(directory, "SKILL.md"), "utf8"),
-        fs5.readFile(
-          path6.join(directory, "references", "output-contract.md"),
-          "utf8"
-        )
-      ]);
-      cachedSkillInstructions = [
-        "# Response Logic Skill",
-        skill.trim(),
-        "",
-        "# Output Contract",
-        outputContract.trim()
-      ].join("\n\n");
-      cachedSkillContentHash = createHash13("sha256").update(cachedSkillInstructions).digest("hex");
-      return cachedSkillInstructions;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error("Could not load response-logic-builder.skill");
+var RESPONSE_LOGIC_SKILL_FILES = [
+  "SKILL.md",
+  "references/output-contract.md"
+];
+var RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME = "response-logic-builder.skill.zip";
+var RESPONSE_LOGIC_EVIDENCE_ATTACHMENT_FILENAME = "response-logic-evidence.zip";
+var cachedResponseLogicSkillArchive = null;
+async function buildResponseLogicSkillArchive() {
+  if (cachedResponseLogicSkillArchive) return cachedResponseLogicSkillArchive;
+  cachedResponseLogicSkillArchive = await buildDirectorySkillArchive({
+    name: "response-logic-builder",
+    version: "1",
+    directoryCandidates: skillDirectoryCandidates,
+    files: RESPONSE_LOGIC_SKILL_FILES
+  });
+  return cachedResponseLogicSkillArchive;
 }
 async function getResponseLogicSkillDescriptor() {
-  await readResponseLogicSkill();
+  const archive = await buildResponseLogicSkillArchive();
   return {
     name: "response-logic-builder",
     version: "1",
-    contentHash: cachedSkillContentHash
+    contentHash: archive.contentHash
   };
 }
 function compactKnowledgeSnapshot(snapshot) {
@@ -27337,13 +27507,34 @@ function compactKnowledgeSnapshot(snapshot) {
     assets || "\u65E0\u53EF\u7528\u8D44\u4EA7"
   ].join("\n");
 }
+async function buildResponseLogicEvidenceArchive(snapshot) {
+  return buildDeterministicTaskAttachmentArchive({
+    name: "response-logic-evidence",
+    entrypoint: "knowledge.md",
+    files: [
+      {
+        path: "context.json",
+        content: `${JSON.stringify(
+          {
+            schemaVersion: 1,
+            knowledgeSnapshot: {
+              version: snapshot.version,
+              sourceFileName: snapshot.sourceFileName
+            }
+          },
+          null,
+          2
+        )}
+`
+      },
+      { path: "knowledge.md", content: compactKnowledgeSnapshot(snapshot) }
+    ]
+  });
+}
 async function buildResponseLogicPrompt(input) {
-  const skillInstructions = await readResponseLogicSkill();
   const attachments2 = input.value.attachments.length > 0 ? input.value.attachments.map((attachment) => `- ${attachment.filename}`).join("\n") : "- \u672C\u8F6E\u672A\u4E0A\u4F20\u65B0\u8D44\u6599";
   return [
-    "\u4E25\u683C\u6267\u884C\u4E0B\u65B9 response-logic-builder skill\u3002\u8F93\u51FA\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u8DEF\u7531\u8BF4\u660E\u3001\u63D0\u793A\u8BCD\u590D\u8FF0\u6216\u5DE5\u5177\u8BA1\u5212\u3002",
-    "",
-    skillInstructions,
+    `\u4E25\u683C\u6267\u884C\u9996\u6B21\u4EFB\u52A1\u9644\u5E26\u7684 ${RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME}\u3002\u5148\u89E3\u538B\u5E76\u5B8C\u6574\u8BFB\u53D6\u6839\u76EE\u5F55 SKILL.md \u4E0E references/output-contract.md\uFF1B\u540E\u7EED\u8F6E\u6B21\u7EE7\u7EED\u6CBF\u7528\u540C\u4E00\u4EFB\u52A1\u4E2D\u5DF2\u8BFB\u53D6\u7684 response-logic-builder Skill\u3002\u8F93\u51FA\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u8DEF\u7531\u8BF4\u660E\u3001\u63D0\u793A\u8BCD\u590D\u8FF0\u6216\u5DE5\u5177\u8BA1\u5212\u3002`,
     "",
     "# \u5F53\u524D\u95EE\u9898",
     `\u95EE\u9898 ID\uFF1A${input.value.questionId}`,
@@ -27356,7 +27547,12 @@ async function buildResponseLogicPrompt(input) {
     JSON.stringify(input.value.draft, null, 2),
     "",
     "# \u5DF2\u53D1\u5E03\u4F01\u4E1A\u77E5\u8BC6\u5E93",
-    compactKnowledgeSnapshot(input.knowledgeSnapshot),
+    input.knowledgeSnapshot ? [
+      `\u5B8C\u6574\u8BC1\u636E\u89C1\u9996\u6B21\u4EFB\u52A1\u9644\u4EF6 ${RESPONSE_LOGIC_EVIDENCE_ATTACHMENT_FILENAME}\uFF0C\u5148\u89E3\u538B\u5E76\u8BFB\u53D6 knowledge.md \u4E0E context.json\u3002`,
+      `\u77E5\u8BC6\u5E93\u7248\u672C\uFF1AV${input.knowledgeSnapshot.version}`,
+      `\u6765\u6E90\u6587\u4EF6\uFF1A${input.knowledgeSnapshot.sourceFileName}`,
+      "\u53EA\u80FD\u5F15\u7528\u8BE5 evidence ZIP \u4E2D\u51FA\u73B0\u7684\u4F01\u4E1A\u4E8B\u5B9E\u548C\u8D44\u4EA7\u8DEF\u5F84\u3002"
+    ].join("\n") : "\u5C1A\u672A\u53D1\u5E03\u4F01\u4E1A\u77E5\u8BC6\u5E93\u7248\u672C\u3002\u53EA\u53EF\u4F7F\u7528\u672C\u8F6E\u4E0A\u4F20\u8D44\u6599\u4E0E\u7528\u6237\u660E\u786E\u786E\u8BA4\u7684\u4E8B\u5B9E\uFF1B\u5176\u4ED6\u4F01\u4E1A\u4E8B\u5B9E\u5FC5\u987B\u5217\u4E3A\u5F85\u786E\u8BA4\u3002",
     "",
     "# \u672C\u8F6E\u4E0A\u4F20\u8D44\u6599",
     attachments2,
@@ -27370,7 +27566,7 @@ async function buildResponseLogicPrompt(input) {
   ].join("\n");
 }
 async function createResponseLogicTask(input) {
-  const response2 = await axios5.post(
+  const response2 = await axios6.post(
     `${input.baseUrl}/v1/tasks`,
     {
       prompt: input.prompt,
@@ -27440,7 +27636,7 @@ function publicResponseLogicTask(payload, taskId, apiKey) {
 }
 async function cancelOrphanedResponseLogicTask(input) {
   try {
-    await axios5.delete(
+    await axios6.delete(
       `${input.baseUrl}/v1/tasks/${encodeURIComponent(input.taskId)}`,
       {
         headers: {
@@ -27513,7 +27709,7 @@ router4.get("/tasks/:taskId/status", async (req, res) => {
       );
     }
     logSecret = credential.apiKey;
-    const upstream = await axios5.get(
+    const upstream = await axios6.get(
       `${getUpstreamBaseUrl(req)}/v1/tasks/${encodeURIComponent(taskId)}`,
       {
         headers: {
@@ -27802,6 +27998,38 @@ router4.post(["/start", "/turn"], async (req, res) => {
     const knowledgeSnapshot = await getLatestKnowledgeSnapshot(
       req.frontmindUser.id
     );
+    const generatedAttachments = [];
+    if (!value.taskId) {
+      const skillArchive = await buildResponseLogicSkillArchive();
+      generatedAttachments.push(
+        await uploadUpstreamTaskAttachment({
+          baseUrl: getUpstreamBaseUrl(req),
+          apiKey: taskApiKey,
+          filename: RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME,
+          bytes: skillArchive.bytes
+        })
+      );
+      if (knowledgeSnapshot) {
+        try {
+          const evidenceArchive = await buildResponseLogicEvidenceArchive(knowledgeSnapshot);
+          generatedAttachments.push(
+            await uploadUpstreamTaskAttachment({
+              baseUrl: getUpstreamBaseUrl(req),
+              apiKey: taskApiKey,
+              filename: RESPONSE_LOGIC_EVIDENCE_ATTACHMENT_FILENAME,
+              bytes: evidenceArchive.bytes
+            })
+          );
+        } catch (error) {
+          await Promise.allSettled(
+            generatedAttachments.map(
+              (attachment) => attachment.removeOrphan()
+            )
+          );
+          throw error;
+        }
+      }
+    }
     const created = await createResponseLogicTask({
       baseUrl: getUpstreamBaseUrl(req),
       apiKey: taskApiKey,
@@ -27809,10 +28037,16 @@ router4.post(["/start", "/turn"], async (req, res) => {
         value,
         knowledgeSnapshot
       }),
-      attachments: value.attachments,
+      attachments: [
+        ...generatedAttachments.map((item) => item.attachment),
+        ...value.attachments
+      ],
       taskId: value.taskId
     });
     if (!created.ok) {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan())
+      );
       console.warn(
         "[Response Logic Start] create task failed:",
         redactSensitiveText(created.detail, [logSecret])
@@ -27826,6 +28060,14 @@ router4.post(["/start", "/turn"], async (req, res) => {
       return;
     }
     try {
+      for (const attachment of generatedAttachments) {
+        await recordUpstreamResource({
+          userId: req.frontmindUser.id,
+          apiCredentialId: taskCredential.id,
+          kind: "file",
+          upstreamId: attachment.fileId
+        });
+      }
       await recordResponseLogicTaskStart({
         userId: req.frontmindUser.id,
         apiCredentialId: taskCredential.id,
@@ -27852,6 +28094,11 @@ router4.post(["/start", "/turn"], async (req, res) => {
           apiKey: taskApiKey,
           taskId: String(created.task.id)
         });
+        await Promise.allSettled(
+          generatedAttachments.map(
+            (attachment) => attachment.removeOrphan()
+          )
+        );
       }
       throw persistenceError;
     }
@@ -27897,12 +28144,12 @@ var response_logic_api_default = router4;
 // server/dashboard-api.ts
 import { createHash as createHash14, randomUUID as randomUUID20 } from "node:crypto";
 import { mkdir as mkdir2, readFile as readFile2, unlink as unlink2, writeFile as writeFile2 } from "node:fs/promises";
-import path7 from "node:path";
-import axios6 from "axios";
+import path8 from "node:path";
+import axios7 from "axios";
 import { eq as eq25 } from "drizzle-orm";
 import ExcelJS2 from "exceljs";
 import express2 from "express";
-import JSZip2 from "jszip";
+import JSZip3 from "jszip";
 import sharp from "sharp";
 import { z as z18 } from "zod";
 
@@ -28950,8 +29197,8 @@ var completenessAcquisitionSchema = z18.object({
     webQueries: completenessAcquisitionCountSchema.optional()
   }).passthrough()
 }).passthrough();
-var storageRoot2 = path7.resolve(
-  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path7.join(process.cwd(), ".frontmind-dashboard-assets")
+var storageRoot2 = path8.resolve(
+  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path8.join(process.cwd(), ".frontmind-dashboard-assets")
 );
 function assertDashboardAssetStorageConfigured() {
   if (process.env.NODE_ENV === "production" && !process.env.FRONTMIND_DASHBOARD_ASSET_DIR?.trim()) {
@@ -28963,7 +29210,7 @@ function assertDashboardAssetStorageConfigured() {
 async function removeStoredKnowledgeAssets(keys) {
   await Promise.all(
     keys.map(
-      (key) => unlink2(path7.join(storageRoot2, key)).catch(() => void 0)
+      (key) => unlink2(path8.join(storageRoot2, key)).catch(() => void 0)
     )
   );
 }
@@ -29176,7 +29423,7 @@ function hasSupportedImageSignature(extension, bytes) {
   return false;
 }
 function validateProgressReportScreenshot(input) {
-  const extension = path7.extname(input.filename).toLowerCase();
+  const extension = path8.extname(input.filename).toLowerCase();
   const mimeType = imageMimeByExtension[extension];
   if (!mimeType || ![".png", ".jpg", ".jpeg", ".webp"].includes(extension)) {
     throw new Error("\u7B54\u6848\u622A\u56FE\u4EC5\u652F\u6301 PNG\u3001JPG \u6216 WEBP");
@@ -29187,13 +29434,13 @@ function validateProgressReportScreenshot(input) {
   return { extension, mimeType };
 }
 function titleFromPath(filePath) {
-  return path7.basename(filePath, path7.extname(filePath)).replace(/^\d+[._-]*/, "").replace(/[-_]+/g, " ").trim() || "\u77E5\u8BC6\u6587\u6863";
+  return path8.basename(filePath, path8.extname(filePath)).replace(/^\d+[._-]*/, "").replace(/[-_]+/g, " ").trim() || "\u77E5\u8BC6\u6587\u6863";
 }
 function htmlToMarkdownLikeText(html) {
   return html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi, "# $1\n").replace(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi, "## $1\n").replace(/<h3\b[^>]*>([\s\S]*?)<\/h3>/gi, "### $1\n").replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "- $1\n").replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n\n").replace(/<[^>]+>/g, "").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/\n{3,}/g, "\n\n").trim();
 }
 function normalizeTextDocument(filePath, content) {
-  const extension = path7.extname(filePath).toLowerCase();
+  const extension = path8.extname(filePath).toLowerCase();
   if (extension === ".html" || extension === ".htm") {
     return htmlToMarkdownLikeText(content);
   }
@@ -29542,7 +29789,7 @@ function validateProfilePackage(input) {
     manifest.documents.map((document) => packageRelativePath(document.path))
   );
   for (const relativePath of input.rawTextByRelativePath.keys()) {
-    if (path7.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
+    if (path8.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
       throw new KnowledgeArchiveValidationError(
         "structure",
         `package manifest \u672A\u767B\u8BB0\u6587\u672C\u6587\u4EF6\uFF1A${relativePath}`
@@ -31847,7 +32094,7 @@ function responseLogicImportsFromTabularSources(input) {
   return records;
 }
 async function responseLogicImportsFromFile(input) {
-  const extension = path7.extname(input.sourceFileName).toLowerCase();
+  const extension = path8.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
     const raw = JSON.parse(input.buffer.toString("utf8"));
     const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -31875,7 +32122,7 @@ async function responseLogicImportsFromFile(input) {
   }
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path7.basename(input.sourceFileName, extension),
+      title: path8.basename(input.sourceFileName, extension),
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
       )
@@ -31887,12 +32134,12 @@ async function responseLogicImportsFromFile(input) {
   });
 }
 async function tabularTablesFromFile(input) {
-  const extension = path7.extname(input.sourceFileName).toLowerCase();
+  const extension = path8.extname(input.sourceFileName).toLowerCase();
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path7.basename(
+      title: path8.basename(
         input.sourceFileName,
-        path7.extname(input.sourceFileName)
+        path8.extname(input.sourceFileName)
       ) || "\u6570\u636E\u8868\u683C",
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
@@ -31904,7 +32151,7 @@ async function tabularTablesFromFile(input) {
   ).filter((table) => Boolean(table));
 }
 async function dashboardPayloadFromFile(input) {
-  const extension = path7.extname(input.sourceFileName).toLowerCase();
+  const extension = path8.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
     return dashboardPayloadFromModuleJson({
       text: input.buffer.toString("utf8"),
@@ -31915,7 +32162,7 @@ async function dashboardPayloadFromFile(input) {
   }
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path7.basename(input.sourceFileName, extension),
+      title: path8.basename(input.sourceFileName, extension),
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
       )
@@ -32239,7 +32486,7 @@ function dashboardImportTransactionHooks(input) {
 }
 async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options = {}) {
   const validationProfile = options.validationProfile ?? "historical";
-  const extension = path7.extname(sourceFileName).toLowerCase();
+  const extension = path8.extname(sourceFileName).toLowerCase();
   if (extension !== ".zip") {
     if (validationProfile !== "historical") {
       throw new KnowledgeArchiveValidationError(
@@ -32274,7 +32521,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
   }
   let archive;
   try {
-    archive = await JSZip2.loadAsync(buffer, { checkCRC32: true });
+    archive = await JSZip3.loadAsync(buffer, { checkCRC32: true });
   } catch (error) {
     if (validationProfile !== "historical") {
       throw new KnowledgeArchiveValidationError(
@@ -32314,7 +32561,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       }
       normalizedPaths.add(normalizedKey2);
       packagePaths.push(archivePath);
-      const fileExtension = path7.extname(archivePath).toLowerCase();
+      const fileExtension = path8.extname(archivePath).toLowerCase();
       if (validationProfile !== "historical" && [".bmp", ".heic", ".heif", ".ico", ".svg", ".tif", ".tiff"].includes(
         fileExtension
       )) {
@@ -32370,7 +32617,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
           throw new Error(`\u77E5\u8BC6\u5E93\u56FE\u7247\u683C\u5F0F\u4E0E\u5185\u5BB9\u4E0D\u5339\u914D\uFF1A${archivePath}`);
         }
         const key = `${randomUUID20()}${fileExtension}`;
-        await writeFile2(path7.join(storageRoot2, key), bytes, { flag: "wx" });
+        await writeFile2(path8.join(storageRoot2, key), bytes, { flag: "wx" });
         storedAssetKeys.push(key);
         assets.push({
           key,
@@ -32442,8 +32689,8 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       let content = document.content;
       validated.assets.forEach((asset, index2) => {
         const url = asset.id ? `/api/dashboard/knowledge/assets/${snapshotId}/by-id/${encodeURIComponent(asset.id)}` : `/api/dashboard/knowledge/assets/${snapshotId}/${index2}`;
-        const relativePath = path7.posix.relative(
-          path7.posix.dirname(document.path),
+        const relativePath = path8.posix.relative(
+          path8.posix.dirname(document.path),
           asset.path
         );
         const candidates = [
@@ -32451,7 +32698,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
           encodeURI(asset.path),
           relativePath,
           encodeURI(relativePath),
-          path7.basename(asset.path)
+          path8.basename(asset.path)
         ];
         for (const candidate of candidates) {
           content = content.replaceAll(`(${candidate})`, `(${url})`);
@@ -32475,7 +32722,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
   } catch (error) {
     await Promise.all(
       storedAssetKeys.map(
-        (key) => unlink2(path7.join(storageRoot2, key)).catch(() => void 0)
+        (key) => unlink2(path8.join(storageRoot2, key)).catch(() => void 0)
       )
     );
     if (validationProfile !== "historical" && !(error instanceof KnowledgeArchiveValidationError)) {
@@ -32497,7 +32744,7 @@ function assertKnowledgeArchiveEnterpriseIdentity(input) {
     throw new Error("\u8BF7\u5148\u7531\u7BA1\u7406\u5458\u914D\u7F6E\u5F53\u524D\u8D26\u53F7\u7684\u4F01\u4E1A\u540D\u79F0");
   }
   const identityDocuments = input.documents.filter((document) => {
-    const basename = path7.posix.basename(document.path).toLowerCase();
+    const basename = path8.posix.basename(document.path).toLowerCase();
     return basename === "readme.md" || basename === "00_knowledge_tree.md" || basename === "00_source_index.md";
   });
   const candidates = identityDocuments.length > 0 ? identityDocuments : input.documents;
@@ -32525,7 +32772,7 @@ async function downloadArchiveBytes(input) {
   let headers;
   const fileId = input.descriptor.fileId || (input.descriptor.url ? knowledgeArchiveFileIdFromUrl(input.descriptor.url) : void 0);
   if (fileId) {
-    const metadataResponse = await axios6.get(
+    const metadataResponse = await axios7.get(
       `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
       {
         headers: upstreamHeaders(input.apiKey),
@@ -32560,7 +32807,7 @@ async function downloadArchiveBytes(input) {
   }
   if (!downloadUrl) throw new Error("\u77E5\u8BC6\u5E93\u6587\u4EF6\u6CA1\u6709\u53EF\u9A8C\u8BC1\u7684\u4E0B\u8F7D\u5730\u5740");
   const controller = new AbortController();
-  let response2 = await axios6.get(downloadUrl, {
+  let response2 = await axios7.get(downloadUrl, {
     ...headers ? { maxRedirects: 0, proxy: false } : safeExternalRequestOptions,
     headers,
     responseType: "stream",
@@ -32573,7 +32820,7 @@ async function downloadArchiveBytes(input) {
     const redirectUrl = assertSafeExternalUrl(
       new URL(String(response2.headers.location), downloadUrl).toString()
     );
-    response2 = await axios6.get(redirectUrl, {
+    response2 = await axios7.get(redirectUrl, {
       ...safeExternalRequestOptions,
       responseType: "stream",
       timeout: 12e4,
@@ -32620,7 +32867,7 @@ async function downloadArchiveBytes(input) {
     throw new Error("\u77E5\u8BC6\u5E93 ZIP \u8D85\u8FC7 250 MB");
   }
   if (!filename.toLowerCase().endsWith(".zip")) {
-    filename = `${path7.basename(filename, path7.extname(filename)) || "knowledge-base"}.zip`;
+    filename = `${path8.basename(filename, path8.extname(filename)) || "knowledge-base"}.zip`;
   }
   return { buffer, filename };
 }
@@ -32698,13 +32945,13 @@ router5.put(
         bytes
       });
       const assetName = `${randomUUID20()}${extension}`;
-      const relativeKey = path7.join(
+      const relativeKey = path8.join(
         "progress-report-screenshots",
         String(targetUserId),
         assetName
       );
-      const absolutePath = path7.join(storageRoot2, relativeKey);
-      await mkdir2(path7.dirname(absolutePath), { recursive: true });
+      const absolutePath = path8.join(storageRoot2, relativeKey);
+      await mkdir2(path8.dirname(absolutePath), { recursive: true });
       await writeFile2(absolutePath, bytes, { flag: "wx" });
       const url = `/api/dashboard/report-assets/${targetUserId}/${assetName}`;
       await writeWorkspaceAuditEvent({
@@ -32746,11 +32993,11 @@ router5.get(
         throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       }
       await assertWorkspaceAccess(req.frontmindUser, targetUserId);
-      const extension = path7.extname(assetName).toLowerCase();
+      const extension = path8.extname(assetName).toLowerCase();
       const mimeType = imageMimeByExtension[extension];
       if (!mimeType) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       const bytes = await readFile2(
-        path7.join(
+        path8.join(
           storageRoot2,
           "progress-report-screenshots",
           String(targetUserId),
@@ -32814,7 +33061,7 @@ router5.post("/knowledge/publish", async (req, res) => {
     if (!credential)
       throw new Error("\u77E5\u8BC6\u5E93\u4EFB\u52A1\u4E0D\u5C5E\u4E8E\u5F53\u524D\u7528\u6237\u6216 API Key \u5DF2\u5931\u6548");
     const baseUrl = getUpstreamBaseUrl(req);
-    const taskResponse = await axios6.get(
+    const taskResponse = await axios7.get(
       `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
       {
         headers: upstreamHeaders(credential.apiKey),
@@ -32887,7 +33134,7 @@ router5.post("/knowledge/publish", async (req, res) => {
   } catch (error) {
     await Promise.all(
       storedAssetKeys.map(
-        (key) => unlink2(path7.join(storageRoot2, key)).catch(() => void 0)
+        (key) => unlink2(path8.join(storageRoot2, key)).catch(() => void 0)
       )
     );
     const publishedBuild = await assertKnowledgeBasePublishable({
@@ -32937,7 +33184,7 @@ router5.put(
       const expectedRevision = dashboardRevisionHeader(
         req.header("x-dashboard-revision")
       );
-      const extension = path7.extname(sourceFileName).toLowerCase();
+      const extension = path8.extname(sourceFileName).toLowerCase();
       const mode = req.header("x-import-mode") || "auto";
       const mayEditDashboard = actor.role === "admin";
       if (mode === "dashboard" || mode === "auto" && [".csv", ".json", ".xlsx"].includes(extension)) {
@@ -33698,7 +33945,7 @@ router5.put(
       } catch (error) {
         await Promise.all(
           parsed.storedAssetKeys.map(
-            (key) => unlink2(path7.join(storageRoot2, key)).catch(() => void 0)
+            (key) => unlink2(path8.join(storageRoot2, key)).catch(() => void 0)
           )
         );
         throw error;
@@ -33734,7 +33981,7 @@ router5.get(
       });
       if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
-      const bytes = await readFile2(path7.join(storageRoot2, result.asset.key));
+      const bytes = await readFile2(path8.join(storageRoot2, result.asset.key));
       res.setHeader("Content-Type", result.asset.mimeType);
       res.setHeader("Cache-Control", "private, max-age=3600");
       res.setHeader("Content-Disposition", "inline");
@@ -33757,7 +34004,7 @@ router5.get(
       });
       if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
-      const bytes = await readFile2(path7.join(storageRoot2, result.asset.key));
+      const bytes = await readFile2(path8.join(storageRoot2, result.asset.key));
       res.setHeader("Content-Type", result.asset.mimeType);
       res.setHeader("Cache-Control", "private, max-age=3600");
       res.setHeader("Content-Disposition", "inline");
@@ -33770,8 +34017,8 @@ router5.get(
 var dashboard_api_default = router5;
 
 // server/brand-question-portfolio-api.ts
-import { createHash as createHash16 } from "node:crypto";
-import axios7 from "axios";
+import { createHash as createHash15 } from "node:crypto";
+import axios8 from "axios";
 import { Router as Router4 } from "express";
 import { z as z21 } from "zod";
 
@@ -33928,9 +34175,7 @@ function assertBrandQuestionPortfolioContext(portfolio, expected) {
 }
 
 // server/brand-question-portfolio-runtime.ts
-import { createHash as createHash15 } from "node:crypto";
-import fs6 from "node:fs/promises";
-import path8 from "node:path";
+import path9 from "node:path";
 function candidateTargets(context) {
   return {
     industry: context.quota.industry * 3,
@@ -33940,29 +34185,29 @@ function candidateTargets(context) {
   };
 }
 var configuredBrandQuestionSkillPath = process.env.FRONTMIND_BRAND_QUESTION_SKILL_PATH?.trim();
-if (configuredBrandQuestionSkillPath && !path8.isAbsolute(configuredBrandQuestionSkillPath)) {
+if (configuredBrandQuestionSkillPath && !path9.isAbsolute(configuredBrandQuestionSkillPath)) {
   throw new Error(
     "FRONTMIND_BRAND_QUESTION_SKILL_PATH must be an absolute path"
   );
 }
 var skillDirectoryCandidates2 = configuredBrandQuestionSkillPath ? [configuredBrandQuestionSkillPath] : [
-  path8.resolve(
+  path9.resolve(
     import.meta.dirname,
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path8.resolve(
+  path9.resolve(
     process.cwd(),
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path8.resolve(
+  path9.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path8.resolve(
+  path9.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -33970,43 +34215,57 @@ var skillDirectoryCandidates2 = configuredBrandQuestionSkillPath ? [configuredBr
     "brand-question-portfolio.skill"
   )
 ];
-var cachedInstructions = null;
-var cachedContentHash = null;
-async function readBrandQuestionPortfolioSkill() {
-  if (cachedInstructions) return cachedInstructions;
-  let lastError;
-  for (const directory of skillDirectoryCandidates2) {
-    try {
-      const [skill, contract] = await Promise.all([
-        fs6.readFile(path8.join(directory, "SKILL.md"), "utf8"),
-        fs6.readFile(
-          path8.join(directory, "references", "output-contract.md"),
-          "utf8"
-        )
-      ]);
-      cachedInstructions = [
-        "# Brand Question Portfolio Skill",
-        skill.trim(),
-        "",
-        "# Strict Output Contract",
-        contract.trim()
-      ].join("\n\n");
-      cachedContentHash = createHash15("sha256").update(cachedInstructions).digest("hex");
-      return cachedInstructions;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error("Could not load brand-question-portfolio.skill");
+var BRAND_QUESTION_SKILL_FILES = [
+  "SKILL.md",
+  "references/output-contract.md"
+];
+var BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME = "brand-question-portfolio.skill.zip";
+var BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME = "brand-question-portfolio-evidence.zip";
+var cachedBrandQuestionSkillArchive = null;
+async function buildBrandQuestionPortfolioSkillArchive() {
+  if (cachedBrandQuestionSkillArchive) return cachedBrandQuestionSkillArchive;
+  cachedBrandQuestionSkillArchive = await buildDirectorySkillArchive({
+    name: "brand-question-portfolio",
+    version: "2",
+    directoryCandidates: skillDirectoryCandidates2,
+    files: BRAND_QUESTION_SKILL_FILES
+  });
+  return cachedBrandQuestionSkillArchive;
 }
 async function getBrandQuestionPortfolioSkillDescriptor() {
-  await readBrandQuestionPortfolioSkill();
+  const archive = await buildBrandQuestionPortfolioSkillArchive();
   return {
     name: "brand-question-portfolio",
     version: "2",
     model: "frontmind-pro",
-    contentHash: cachedContentHash
+    contentHash: archive.contentHash
   };
+}
+async function buildBrandQuestionPortfolioEvidenceArchive(context) {
+  return buildDeterministicTaskAttachmentArchive({
+    name: "brand-question-portfolio-evidence",
+    entrypoint: "knowledge.md",
+    files: [
+      {
+        path: "context.json",
+        content: `${JSON.stringify(
+          {
+            schemaVersion: 1,
+            knowledgeSnapshot: {
+              id: context.snapshot.id,
+              version: context.snapshot.version,
+              archiveHash: context.snapshot.archiveHash,
+              sourceFileName: context.snapshot.sourceFileName
+            }
+          },
+          null,
+          2
+        )}
+`
+      },
+      { path: "knowledge.md", content: compactSnapshot(context.snapshot) }
+    ]
+  });
 }
 function compactSnapshot(snapshot) {
   const characterBudget = 1e5;
@@ -34054,11 +34313,8 @@ async function buildBrandQuestionPortfolioPrompt(context) {
   if (!context.snapshot.archiveHash) {
     throw new Error("\u5F53\u524D\u77E5\u8BC6\u5E93\u7F3A\u5C11\u53EF\u9A8C\u8BC1\u7684\u4EA7\u7269\u54C8\u5E0C\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u77E5\u8BC6\u5E93");
   }
-  const skill = await readBrandQuestionPortfolioSkill();
   return [
-    "\u4E25\u683C\u6267\u884C\u4EE5\u4E0B brand-question-portfolio Skill\u3002\u53EA\u8FD4\u56DE\u4E25\u683C JSON\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u8BA1\u5212\u3001\u63D0\u793A\u8BCD\u8BF4\u660E\u6216 Markdown \u56F4\u680F\u3002",
-    "",
-    skill,
+    `\u4E25\u683C\u6267\u884C\u968F\u4EFB\u52A1\u9644\u5E26\u7684 ${BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME}\u3002\u5148\u89E3\u538B\u5E76\u5B8C\u6574\u8BFB\u53D6\u6839\u76EE\u5F55 SKILL.md \u4E0E references/output-contract.md\uFF1B\u518D\u89E3\u538B ${BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME} \u5E76\u8BFB\u53D6 knowledge.md \u4E0E context.json\u3002\u53EA\u8FD4\u56DE\u4E25\u683C JSON\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u8BA1\u5212\u3001\u63D0\u793A\u8BCD\u8BF4\u660E\u6216 Markdown \u56F4\u680F\u3002`,
     "",
     "# \u670D\u52A1\u7AEF\u6743\u5A01\u4E0A\u4E0B\u6587",
     JSON.stringify(
@@ -34080,10 +34336,7 @@ async function buildBrandQuestionPortfolioPrompt(context) {
       2
     ),
     "",
-    "# \u5DF2\u53D1\u5E03\u4F01\u4E1A\u77E5\u8BC6\u5E93",
-    compactSnapshot(context.snapshot),
-    "",
-    "\u53EA\u5141\u8BB8\u5F15\u7528\u4E0A\u9762\u51FA\u73B0\u7684 documentPath\u3002\u5FC5\u987B\u539F\u6837\u56DE\u663E\u670D\u52A1\u7AEF\u7ED9\u51FA\u7684\u77E5\u8BC6\u5E93\u6807\u8BC6\u3001\u7248\u672C\u3001\u54C8\u5E0C\u3001\u5957\u9910\u548C\u989D\u5EA6\u5468\u671F\u3002"
+    "\u53EA\u5141\u8BB8\u5F15\u7528 evidence ZIP \u7684 knowledge.md \u4E2D\u51FA\u73B0\u7684 documentPath\u3002\u5FC5\u987B\u539F\u6837\u56DE\u663E\u670D\u52A1\u7AEF\u7ED9\u51FA\u7684\u77E5\u8BC6\u5E93\u6807\u8BC6\u3001\u7248\u672C\u3001\u54C8\u5E0C\u3001\u5957\u9910\u548C\u989D\u5EA6\u5468\u671F\u3002"
   ].join("\n");
 }
 function isRecord2(value) {
@@ -34328,7 +34581,7 @@ async function currentContext(userId) {
     planCode: portal.service.planCode,
     quotaPeriodId: portal.quotas.periodId,
     enterprise: {
-      identityHash: createHash16("sha256").update(
+      identityHash: createHash15("sha256").update(
         `${userId}\0${workspace.payload.brandName.normalize("NFKC").trim().toLowerCase()}`
       ).digest("hex"),
       canonicalName: workspace.payload.brandName.trim()
@@ -34371,25 +34624,60 @@ router6.post("/start", async (req, res) => {
       });
       return;
     }
-    const response2 = await axios7.post(
-      `${getUpstreamBaseUrl(req)}/v1/tasks`,
+    const baseUrl = getUpstreamBaseUrl(req);
+    const apiKey = req.frontmindCredential.apiKey;
+    const generatedAttachments = [];
+    try {
+      const [skillArchive, evidenceArchive] = await Promise.all([
+        buildBrandQuestionPortfolioSkillArchive(),
+        buildBrandQuestionPortfolioEvidenceArchive(context)
+      ]);
+      for (const attachment of [
+        {
+          filename: BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME,
+          bytes: skillArchive.bytes
+        },
+        {
+          filename: BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME,
+          bytes: evidenceArchive.bytes
+        }
+      ]) {
+        generatedAttachments.push(
+          await uploadUpstreamTaskAttachment({
+            baseUrl,
+            apiKey,
+            ...attachment
+          })
+        );
+      }
+    } catch (error) {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan())
+      );
+      throw error;
+    }
+    const response2 = await axios8.post(
+      `${baseUrl}/v1/tasks`,
       {
         prompt: await buildBrandQuestionPortfolioPrompt(context),
         agentProfile: toUpstreamAgentProfile("frontmind-pro"),
         taskMode: "agent",
-        attachments: []
+        attachments: generatedAttachments.map((item) => item.attachment)
       },
       {
         headers: {
           "Content-Type": "application/json",
-          API_KEY: req.frontmindCredential.apiKey,
-          Authorization: `Bearer ${req.frontmindCredential.apiKey}`
+          API_KEY: apiKey,
+          Authorization: `Bearer ${apiKey}`
         },
         timeout: 12e4,
         validateStatus: () => true
       }
     );
     if (response2.status < 200 || response2.status >= 300) {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan())
+      );
       res.status(response2.status).json({
         error: {
           code: "BRAND_QUESTION_TASK_FAILED",
@@ -34400,8 +34688,16 @@ router6.post("/start", async (req, res) => {
     }
     const task = response2.data || {};
     const taskId = String(task.id || task.task_id || "");
-    if (!taskId) throw new Error("\u5019\u9009\u8BCD\u4EFB\u52A1\u672A\u8FD4\u56DE\u4EFB\u52A1\u6807\u8BC6");
+    if (!taskId) {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan())
+      );
+      throw new Error("\u5019\u9009\u8BCD\u4EFB\u52A1\u672A\u8FD4\u56DE\u4EFB\u52A1\u6807\u8BC6");
+    }
     if (classifyBrandQuestionTaskStatus(task.status) === "failed") {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan())
+      );
       res.status(502).json({
         error: {
           code: "BRAND_QUESTION_TASK_FAILED",
@@ -34410,12 +34706,37 @@ router6.post("/start", async (req, res) => {
       });
       return;
     }
-    await recordUpstreamResource({
-      userId: user.id,
-      apiCredentialId: req.frontmindCredential.id,
-      kind: "task",
-      upstreamId: taskId
-    });
+    try {
+      for (const attachment of generatedAttachments) {
+        await recordUpstreamResource({
+          userId: user.id,
+          apiCredentialId: req.frontmindCredential.id,
+          kind: "file",
+          upstreamId: attachment.fileId
+        });
+      }
+      await recordUpstreamResource({
+        userId: user.id,
+        apiCredentialId: req.frontmindCredential.id,
+        kind: "task",
+        upstreamId: taskId
+      });
+    } catch (error) {
+      await Promise.allSettled([
+        axios8.delete(`${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`, {
+          headers: {
+            API_KEY: apiKey,
+            Authorization: `Bearer ${apiKey}`
+          },
+          timeout: 3e4,
+          validateStatus: () => true
+        }),
+        ...generatedAttachments.map(
+          (attachment) => attachment.removeOrphan()
+        )
+      ]);
+      throw error;
+    }
     const contextToken = createBrandQuestionTaskContextToken({
       userId: user.id,
       taskId,
@@ -34486,7 +34807,7 @@ router6.post("/sync", async (req, res) => {
         planCode: context.planCode
       }
     });
-    const response2 = await axios7.get(
+    const response2 = await axios8.get(
       `${getUpstreamBaseUrl(req)}/v1/tasks/${encodeURIComponent(taskId)}`,
       {
         headers: {
@@ -34599,7 +34920,7 @@ var brand_question_portfolio_api_default = router6;
 // server/prepared-file-router.ts
 import { randomUUID as randomUUID21 } from "node:crypto";
 import { createReadStream as createReadStream2 } from "node:fs";
-import fs7 from "node:fs/promises";
+import fs6 from "node:fs/promises";
 import { Router as Router5 } from "express";
 var router7 = Router5();
 var DOWNLOAD_TOKEN_TTL_MS = 5 * 60 * 1e3;
@@ -34810,7 +35131,7 @@ router7.post("/:assetId/download-token", async (req, res) => {
 });
 async function streamPreparedFile(req, res, manifest, disposition) {
   const filePath = preparedFileService.contentPath(manifest.id);
-  const stat = await fs7.stat(filePath);
+  const stat = await fs6.stat(filePath);
   const range = parseByteRange(
     typeof req.headers.range === "string" ? req.headers.range : void 0,
     stat.size
@@ -34962,18 +35283,18 @@ router7.head("/:assetId/content", async (req, res) => {
 var prepared_file_router_default = router7;
 
 // server/presales-proxy.ts
-import { createHash as createHash18, timingSafeEqual as timingSafeEqual7 } from "node:crypto";
+import { createHash as createHash17, createHmac as createHmac6, timingSafeEqual as timingSafeEqual7 } from "node:crypto";
 import { Transform } from "node:stream";
 import {
   Router as Router7,
   json as json3
 } from "express";
-import axios9 from "axios";
+import axios10 from "axios";
 import { z as z23 } from "zod";
 
 // server/presales-monitor.ts
-import { createHash as createHash17, randomUUID as randomUUID22 } from "node:crypto";
-import axios8 from "axios";
+import { createHash as createHash16, randomUUID as randomUUID22 } from "node:crypto";
+import axios9 from "axios";
 import { and as and22, eq as eq26, isNull as isNull6 } from "drizzle-orm";
 import { json as json2, Router as Router6 } from "express";
 import { z as z22 } from "zod";
@@ -35065,7 +35386,7 @@ function canonicalJson4(value) {
   return `{${Object.keys(record).filter((key) => record[key] !== void 0).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson4(record[key])}`).join(",")}}`;
 }
 function sha2563(value) {
-  return createHash17("sha256").update(value, "utf8").digest("hex");
+  return createHash16("sha256").update(value, "utf8").digest("hex");
 }
 function monitorCredentialFromEnv(env = process.env) {
   const apiKey = env.FRONTMIND_MONITOR_API_KEY?.trim();
@@ -36168,8 +36489,8 @@ function monitorBaseUrl(env = process.env) {
   }
   return parsed.toString().replace(/\/+$/, "");
 }
-function buildMonitorRequestUrl(path9, env = process.env) {
-  const normalizedPath = path9.replace(/^\/+/, "");
+function buildMonitorRequestUrl(path10, env = process.env) {
+  const normalizedPath = path10.replace(/^\/+/, "");
   if (!normalizedPath || /[?#\\]/.test(normalizedPath)) {
     throw new PresalesMonitorError(
       "MONITOR_NOT_CONFIGURED",
@@ -36180,12 +36501,12 @@ function buildMonitorRequestUrl(path9, env = process.env) {
   return new URL(normalizedPath, `${monitorBaseUrl(env)}/`).toString();
 }
 var AxiosMonitorTransport = class {
-  async request(method, path9, credential, payload) {
+  async request(method, path10, credential, payload) {
     let response2;
     try {
-      response2 = await axios8.request({
+      response2 = await axios9.request({
         method,
-        url: buildMonitorRequestUrl(path9),
+        url: buildMonitorRequestUrl(path10),
         data: payload,
         headers: {
           Authorization: `Bearer ${credential.apiKey}`,
@@ -36589,6 +36910,8 @@ var SERVICE_TOKEN_HEADER = "x-frontmind-service-token";
 var MAX_PROXY_UPLOAD_BYTES = 100 * 1024 * 1024;
 var MAX_TRUSTED_TASK_ARTIFACTS = 32;
 var UPSTREAM_TIMEOUT_MS = 3e5;
+var UPLOAD_TICKET_DEFAULT_TTL_MS = 5 * 60 * 1e3;
+var UPLOAD_TICKET_MAX_TTL_MS = 10 * 60 * 1e3;
 var fileJsonParser = json3({ limit: "16kb" });
 var taskJsonParser = json3({ limit: "4mb" });
 var PUBLIC_PLACEHOLDER_SERVICE_TOKENS = /* @__PURE__ */ new Set([
@@ -36634,7 +36957,76 @@ function buildPresalesTaskBody(input) {
   };
 }
 function tokenDigest(value) {
-  return createHash18("sha256").update(value, "utf8").digest();
+  return createHash17("sha256").update(value, "utf8").digest();
+}
+function uploadTicketSignature(encodedPayload, secret) {
+  return createHmac6("sha256", secret).update(`frontmind-presales-upload:v1.${encodedPayload}`, "utf8").digest();
+}
+function uploadTicketExpiry(value, now) {
+  let parsed = Number.NaN;
+  if (typeof value === "number") {
+    parsed = value < 1e12 ? value * 1e3 : value;
+  } else if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    parsed = Number.isFinite(numeric) ? numeric < 1e12 ? numeric * 1e3 : numeric : Date.parse(value);
+  }
+  const upstreamExpiry = Number.isFinite(parsed) && parsed > now ? parsed : now + UPLOAD_TICKET_DEFAULT_TTL_MS;
+  return Math.min(upstreamExpiry, now + UPLOAD_TICKET_MAX_TTL_MS);
+}
+function createPresalesUploadTicket(input, secret = process.env.FRONTMIND_PRESALES_SERVICE_TOKEN ?? "", now = Date.now()) {
+  const fileId = input.fileId.trim();
+  if (!isUsablePresalesServiceToken(secret) || !fileId || fileId.length > 255 || input.target.length > 4096) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  const payload = {
+    fileId,
+    target: assertSafeExternalUrl(input.target),
+    expiresAt: uploadTicketExpiry(input.upstreamExpiresAt, now)
+  };
+  const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString(
+    "base64url"
+  );
+  const signature3 = uploadTicketSignature(encodedPayload, secret).toString(
+    "base64url"
+  );
+  return `v1.${encodedPayload}.${signature3}`;
+}
+function openPresalesUploadTicket(ticket, expectedFileId, secret = process.env.FRONTMIND_PRESALES_SERVICE_TOKEN ?? "", now = Date.now()) {
+  if (!isUsablePresalesServiceToken(secret) || !ticket || ticket.length > 12e3) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  const [version, encodedPayload, encodedSignature, extra] = ticket.split(".");
+  if (version !== "v1" || !encodedPayload || !encodedSignature || extra) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  const expectedSignature = uploadTicketSignature(encodedPayload, secret);
+  let suppliedSignature;
+  try {
+    suppliedSignature = Buffer.from(encodedSignature, "base64url");
+  } catch {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  if (suppliedSignature.toString("base64url") !== encodedSignature || suppliedSignature.length !== expectedSignature.length || !timingSafeEqual7(suppliedSignature, expectedSignature)) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  let payload;
+  try {
+    const payloadBytes = Buffer.from(encodedPayload, "base64url");
+    if (payloadBytes.toString("base64url") !== encodedPayload) {
+      throw new Error("Non-canonical upload capability");
+    }
+    const parsed = JSON.parse(payloadBytes.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Invalid upload capability payload");
+    }
+    payload = parsed;
+  } catch {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  if (payload.fileId !== expectedFileId || !Number.isSafeInteger(payload.expiresAt) || payload.expiresAt <= now || payload.expiresAt > now + UPLOAD_TICKET_MAX_TTL_MS || typeof payload.target !== "string" || payload.target.length > 4096) {
+    throw new ExternalUrlRejectedError("Invalid presales upload capability");
+  }
+  return assertSafeExternalUrl(payload.target);
 }
 function isValidPresalesServiceToken(provided, configured = process.env.FRONTMIND_PRESALES_SERVICE_TOKEN) {
   const expected = configured ?? "";
@@ -36852,7 +37244,7 @@ function collectTaskArtifacts(value) {
   return result;
 }
 async function retrieveTask(taskId, credential) {
-  const response2 = await axios9.get(
+  const response2 = await axios10.get(
     `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
     {
       headers: upstreamHeaders2(credential.apiKey),
@@ -36918,7 +37310,7 @@ router8.post("/files", fileJsonParser, async (req, res) => {
   try {
     const input = fileCreateSchema.parse(req.body ?? {});
     const credential = await requireActiveCredential();
-    const response2 = await axios9.post(
+    const response2 = await axios10.post(
       `${getUpstreamBaseUrl()}/v1/files`,
       { filename: input.filename },
       {
@@ -36955,17 +37347,24 @@ router8.post("/files", fileJsonParser, async (req, res) => {
       upstreamId: id
     });
     const payload = redactUpstreamPayload(response2.data, credential.apiKey);
+    const uploadUrl = typeof payload?.upload_url === "string" ? payload.upload_url : "";
+    const proxyUploadTicket = uploadUrl ? createPresalesUploadTicket({
+      fileId: id,
+      target: uploadUrl,
+      upstreamExpiresAt: payload?.upload_expires_at
+    }) : void 0;
     res.status(201).json({
       ...payload ?? {},
       id,
-      filename: payload?.filename ?? input.filename
+      filename: payload?.filename ?? input.filename,
+      ...proxyUploadTicket ? { proxy_upload_ticket: proxyUploadTicket } : {}
     });
   } catch (error) {
     sendKnownError(res, error);
   }
 });
 async function fetchFileMetadata2(fileId, credential) {
-  const response2 = await axios9.get(
+  const response2 = await axios10.get(
     `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
     {
       headers: upstreamHeaders2(credential.apiKey),
@@ -37013,8 +37412,13 @@ router8.put("/files/:fileId/content", async (req, res) => {
         error: { code: "FILE_TOO_LARGE", message: "File exceeds 100 MB" }
       });
     }
-    const metadata = await fetchFileMetadata2(fileId, credential);
-    const target = assertSafeExternalUrl(String(metadata.upload_url ?? ""));
+    const ticketHeader = req.headers["x-frontmind-upload-ticket"];
+    const uploadTicket = Array.isArray(ticketHeader) ? ticketHeader[0] : ticketHeader;
+    const target = uploadTicket ? openPresalesUploadTicket(uploadTicket, fileId) : assertSafeExternalUrl(
+      String(
+        (await fetchFileMetadata2(fileId, credential)).upload_url ?? ""
+      )
+    );
     let received = 0;
     const limiter = new Transform({
       transform(chunk, _encoding, callback) {
@@ -37027,7 +37431,7 @@ router8.put("/files/:fileId/content", async (req, res) => {
       }
     });
     req.pipe(limiter);
-    const response2 = await axios9.put(target, limiter, {
+    const response2 = await axios10.put(target, limiter, {
       ...safeExternalRequestOptions,
       // SigV4 authenticates the exact request URL; following a redirect would
       // invalidate the signature and surface as a misleading storage error.
@@ -37068,7 +37472,7 @@ router8.delete("/files/:fileId", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
     const credential = await requireResourceCredential("file", fileId);
-    const response2 = await axios9.delete(
+    const response2 = await axios10.delete(
       `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
       {
         headers: upstreamHeaders2(credential.apiKey),
@@ -37129,7 +37533,7 @@ router8.post("/tasks", taskJsonParser, async (req, res) => {
       }
       reservation = acquired;
     }
-    const response2 = await axios9.post(
+    const response2 = await axios10.post(
       `${getUpstreamBaseUrl()}/v1/tasks`,
       taskBody,
       {
@@ -37200,7 +37604,7 @@ router8.delete("/tasks/:taskId", async (req, res) => {
   try {
     const taskId = String(req.params.taskId || "");
     const credential = await requireResourceCredential("task", taskId);
-    const response2 = await axios9.delete(
+    const response2 = await axios10.delete(
       `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
       {
         headers: upstreamHeaders2(credential.apiKey),
@@ -37226,7 +37630,7 @@ router8.delete("/tasks/:taskId", async (req, res) => {
   }
 });
 async function streamExternalOutput(res, target, filename) {
-  const response2 = await axios9.get(assertSafeExternalUrl(target), {
+  const response2 = await axios10.get(assertSafeExternalUrl(target), {
     ...safeExternalRequestOptions,
     responseType: "stream",
     timeout: UPSTREAM_TIMEOUT_MS,
@@ -37267,7 +37671,7 @@ router8.get("/files/:fileId/content", async (req, res) => {
       await streamExternalOutput(res, String(metadata.upload_url), filename);
       return;
     }
-    const response2 = await axios9.get(
+    const response2 = await axios10.get(
       `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}/content`,
       {
         headers: upstreamHeaders2(credential.apiKey),
@@ -37339,12 +37743,12 @@ router8.use((_req, res) => {
 var presales_proxy_default = router8;
 
 // server/provisioning-router.ts
-import { createHash as createHash21, timingSafeEqual as timingSafeEqual8 } from "node:crypto";
+import { createHash as createHash20, timingSafeEqual as timingSafeEqual8 } from "node:crypto";
 import express3 from "express";
 import { z as z28 } from "zod";
 
 // server/provisioning-service.ts
-import { createHash as createHash19, createHmac as createHmac6, randomUUID as randomUUID23 } from "node:crypto";
+import { createHash as createHash18, createHmac as createHmac7, randomUUID as randomUUID23 } from "node:crypto";
 import { eq as eq27 } from "drizzle-orm";
 import { z as z24 } from "zod";
 var usernameSchema3 = z24.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
@@ -37441,10 +37845,10 @@ function canonicalJson5(value) {
   return `{${Object.keys(record).filter((key) => record[key] !== void 0).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson5(record[key])}`).join(",")}}`;
 }
 function hashProvisioningIdempotencyKey(value) {
-  return createHash19("sha256").update(value, "utf8").digest("hex");
+  return createHash18("sha256").update(value, "utf8").digest("hex");
 }
 function hashProvisioningRequest(request, secret) {
-  return createHmac6("sha256", secret).update(canonicalJson5(request), "utf8").digest("hex");
+  return createHmac7("sha256", secret).update(canonicalJson5(request), "utf8").digest("hex");
 }
 function isDuplicateEntry(error) {
   return Boolean(error) && typeof error === "object" && error.code === "ER_DUP_ENTRY";
@@ -37713,8 +38117,8 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
 }
 
 // server/knowledge-import-service.ts
-import axios10 from "axios";
-import { createHash as createHash20, randomUUID as randomUUID24 } from "node:crypto";
+import axios11 from "axios";
+import { createHash as createHash19, randomUUID as randomUUID24 } from "node:crypto";
 import { and as and23, eq as eq28 } from "drizzle-orm";
 import { z as z25 } from "zod";
 var sha256Schema3 = z25.string().trim().regex(/^[a-f0-9]{64}$/i);
@@ -37799,7 +38203,7 @@ function resolveKnowledgeImportProjectOwner(provisions, requestedCompanyName) {
   };
 }
 function idempotencyHash(value) {
-  return createHash20("sha256").update(value, "utf8").digest("hex");
+  return createHash19("sha256").update(value, "utf8").digest("hex");
 }
 var websiteKnowledgeImportV3ReferencePrefix = "website-kb:v3";
 function knowledgeImportReceiptSourceReference(input) {
@@ -38041,7 +38445,7 @@ async function importWebsiteKnowledgeArtifact(input) {
         403
       );
     }
-    const taskResponse = await axios10.get(
+    const taskResponse = await axios11.get(
       `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(value.taskId)}`,
       {
         headers: {
@@ -38090,7 +38494,7 @@ async function importWebsiteKnowledgeArtifact(input) {
       apiKey: credential.apiKey,
       baseUrl: getUpstreamBaseUrl()
     });
-    const archiveHash = createHash20("sha256").update(downloaded.buffer).digest("hex");
+    const archiveHash = createHash19("sha256").update(downloaded.buffer).digest("hex");
     if (archiveHash !== value.artifactSha256.toLowerCase()) {
       throw new KnowledgeImportError(
         "ARTIFACT_HASH_MISMATCH",
@@ -38930,7 +39334,7 @@ var PUBLIC_PLACEHOLDER_MARKERS2 = [
   "your_token"
 ];
 function tokenDigest2(value) {
-  return createHash21("sha256").update(value, "utf8").digest();
+  return createHash20("sha256").update(value, "utf8").digest();
 }
 function isUsableProvisioningServiceToken(value) {
   const normalized = value?.trim() ?? "";
@@ -39311,15 +39715,15 @@ function pathWithoutQuery(req) {
   return req.originalUrl.replace(/^\/api\/frontmind/, "").split("?")[0] || "/";
 }
 function getPrimaryResource(req) {
-  const path9 = pathWithoutQuery(req);
-  const taskMatch = path9.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
+  const path10 = pathWithoutQuery(req);
+  const taskMatch = path10.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
   if (taskMatch) return { kind: "task", id: decodeURIComponent(taskMatch[1]) };
-  const fileMatch = path9.match(/^\/v1\/files\/([^/]+)/);
+  const fileMatch = path10.match(/^\/v1\/files\/([^/]+)/);
   if (fileMatch) return { kind: "file", id: decodeURIComponent(fileMatch[1]) };
-  if (path9 === "/download-token" && typeof req.body?.fileId === "string") {
+  if (path10 === "/download-token" && typeof req.body?.fileId === "string") {
     return { kind: "file", id: req.body.fileId };
   }
-  if (req.method === "POST" && path9 === "/v1/tasks") {
+  if (req.method === "POST" && path10 === "/v1/tasks") {
     const continuationId = req.body?.taskId ?? req.body?.previous_response_id;
     if (typeof continuationId === "string" && continuationId) {
       return { kind: "task", id: continuationId };
@@ -39467,7 +39871,7 @@ function createFrontMindProxyAccessMiddleware(dependencies = { assertWriteAccess
 var enforceFrontMindProxyAccess = createFrontMindProxyAccessMiddleware();
 
 // server/delivery-ticket-attachment-router.ts
-import axios11 from "axios";
+import axios12 from "axios";
 import { and as and26, eq as eq31 } from "drizzle-orm";
 import { Router as Router8 } from "express";
 var router9 = Router8();
@@ -39568,7 +39972,7 @@ async function downloadAttachment(attachment) {
     API_KEY: attachment.credential.apiKey,
     Authorization: `Bearer ${attachment.credential.apiKey}`
   };
-  const metadataResponse = await axios11.get(
+  const metadataResponse = await axios12.get(
     `${baseUrl}/v1/files/${encodeURIComponent(
       upstreamFileId
     )}`,
@@ -39591,7 +39995,7 @@ async function downloadAttachment(attachment) {
   const contentUrl = uploadUrl ?? `${baseUrl}/v1/files/${encodeURIComponent(
     upstreamFileId
   )}/content`;
-  const response2 = await axios11.get(contentUrl, {
+  const response2 = await axios12.get(contentUrl, {
     ...uploadUrl ? safeExternalRequestOptions : { headers, maxRedirects: 0 },
     responseType: "arraybuffer",
     timeout: 12e4,
@@ -39736,7 +40140,7 @@ router10.delete("/:materialId", async (req, res) => {
 var icp_material_router_default = router10;
 
 // server/website-content-template-api.ts
-import { createHash as createHash22 } from "node:crypto";
+import { createHash as createHash21 } from "node:crypto";
 import express4 from "express";
 import { ZodError as ZodError2 } from "zod";
 
@@ -40142,7 +40546,7 @@ function requestBytes(req) {
   return Buffer.alloc(0);
 }
 function websiteContentTemplateFileHash(bytes) {
-  return createHash22("sha256").update(bytes).digest("hex");
+  return createHash21("sha256").update(bytes).digest("hex");
 }
 function assertWebsiteContentTemplatePublishHash(value, actual) {
   const expected = value?.trim().toLowerCase() || "";

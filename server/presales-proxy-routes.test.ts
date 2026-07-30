@@ -15,6 +15,7 @@ vi.mock("./presales-service", async () => {
     completePresalesTaskReservation: vi.fn(),
     getActivePresalesCredential: vi.fn(),
     getPresalesCredentialForResource: vi.fn(),
+    recordPresalesUpstreamResource: vi.fn(),
     releasePresalesTaskReservation: vi.fn(),
     resolvePresalesTaskCredentialForFiles: vi.fn(),
   };
@@ -27,6 +28,7 @@ import {
   completePresalesTaskReservation,
   getActivePresalesCredential,
   getPresalesCredentialForResource,
+  recordPresalesUpstreamResource,
   releasePresalesTaskReservation,
   resolvePresalesTaskCredentialForFiles,
 } from "./presales-service";
@@ -101,6 +103,106 @@ describe("presales readiness status", () => {
         process.env.FRONTMIND_MONITOR_API_KEY,
       );
     });
+  });
+});
+
+describe("presales create-time upload capability", () => {
+  beforeEach(() => {
+    process.env.FRONTMIND_PRESALES_SERVICE_TOKEN = token;
+    vi.mocked(getActivePresalesCredential).mockResolvedValue({
+      id: "credential-1",
+      version: 1,
+      apiKey: "sk-upload-file",
+      fingerprint: "fingerprint",
+      status: "active",
+      verifiedAt: new Date(),
+    });
+    vi.mocked(getPresalesCredentialForResource).mockResolvedValue({
+      id: "credential-1",
+      version: 1,
+      apiKey: "sk-upload-file",
+      fingerprint: "fingerprint",
+      status: "active",
+      verifiedAt: new Date(),
+      resource: {
+        id: "resource-1",
+        apiCredentialId: "credential-1",
+        kind: "file",
+        upstreamId: "file-1",
+        parentTaskId: null,
+        createdAt: new Date(),
+      },
+    });
+    vi.mocked(recordPresalesUpstreamResource).mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.mocked(getActivePresalesCredential).mockReset();
+    vi.mocked(getPresalesCredentialForResource).mockReset();
+    vi.mocked(recordPresalesUpstreamResource).mockReset();
+    if (originalServiceToken === undefined) {
+      delete process.env.FRONTMIND_PRESALES_SERVICE_TOKEN;
+    } else {
+      process.env.FRONTMIND_PRESALES_SERVICE_TOKEN = originalServiceToken;
+    }
+  });
+
+  it("uploads with the signed URL returned by file creation even when details omit it", async () => {
+    const signedUrl =
+      "https://uploads.example.test/catalog.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abcdef0123456789";
+    vi.spyOn(axios, "post").mockResolvedValue({
+      status: 201,
+      data: {
+        id: "file-1",
+        filename: "catalog.pdf",
+        upload_url: signedUrl,
+        upload_expires_at: new Date(Date.now() + 180_000).toISOString(),
+      },
+    });
+    const metadataLookup = vi.spyOn(axios, "get");
+    const put = vi.spyOn(axios, "put").mockResolvedValue({
+      status: 204,
+      data: "",
+    });
+
+    await withServer(async (baseUrl) => {
+      const created = await fetch(`${baseUrl}/files`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-frontmind-service-token": token,
+        },
+        body: JSON.stringify({
+          filename: "catalog.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 3,
+        }),
+      });
+      expect(created.status).toBe(201);
+      const file = (await created.json()) as Record<string, string>;
+      expect(file.proxy_upload_ticket).toMatch(/^v1\./);
+
+      const uploaded = await fetch(`${baseUrl}/files/file-1/content`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": "3",
+          "x-original-content-type": "application/pdf",
+          "x-frontmind-service-token": token,
+          "x-frontmind-upload-ticket": file.proxy_upload_ticket,
+        },
+        body: Buffer.from("pdf"),
+      });
+      expect(uploaded.status).toBe(200);
+    });
+
+    expect(metadataLookup).not.toHaveBeenCalled();
+    expect(put).toHaveBeenCalledWith(
+      signedUrl,
+      expect.anything(),
+      expect.objectContaining({ maxRedirects: 0 }),
+    );
   });
 });
 
