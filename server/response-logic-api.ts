@@ -1,8 +1,6 @@
 import axios from "axios";
 import { Router } from "express";
-import fs from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import {
@@ -19,6 +17,7 @@ import {
 import {
   credentialsUseSameUpstreamApiKey,
   getCredentialForUpstreamResource,
+  recordUpstreamResource,
 } from "./auth-service";
 import {
   getDashboardQuestion,
@@ -44,6 +43,11 @@ import {
   redactSensitiveText,
   safeErrorForLog,
 } from "./_core/sensitive-data";
+import {
+  buildDeterministicTaskAttachmentArchive,
+  buildDirectorySkillArchive,
+} from "./task-attachment-package";
+import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
 
 const router = Router();
 
@@ -411,49 +415,36 @@ const skillDirectoryCandidates = configuredResponseLogicSkillPath
       ),
     ];
 
-let cachedSkillInstructions: string | null = null;
-let cachedSkillContentHash: string | null = null;
+const RESPONSE_LOGIC_SKILL_FILES = [
+  "SKILL.md",
+  "references/output-contract.md",
+] as const;
+export const RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME =
+  "response-logic-builder.skill.zip";
+export const RESPONSE_LOGIC_EVIDENCE_ATTACHMENT_FILENAME =
+  "response-logic-evidence.zip";
 
-async function readResponseLogicSkill() {
-  if (cachedSkillInstructions) return cachedSkillInstructions;
-  let lastError: unknown;
+let cachedResponseLogicSkillArchive: Awaited<
+  ReturnType<typeof buildDirectorySkillArchive>
+> | null = null;
 
-  for (const directory of skillDirectoryCandidates) {
-    try {
-      const [skill, outputContract] = await Promise.all([
-        fs.readFile(path.join(directory, "SKILL.md"), "utf8"),
-        fs.readFile(
-          path.join(directory, "references", "output-contract.md"),
-          "utf8",
-        ),
-      ]);
-      cachedSkillInstructions = [
-        "# Response Logic Skill",
-        skill.trim(),
-        "",
-        "# Output Contract",
-        outputContract.trim(),
-      ].join("\n\n");
-      cachedSkillContentHash = createHash("sha256")
-        .update(cachedSkillInstructions)
-        .digest("hex");
-      return cachedSkillInstructions;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Could not load response-logic-builder.skill");
+export async function buildResponseLogicSkillArchive() {
+  if (cachedResponseLogicSkillArchive) return cachedResponseLogicSkillArchive;
+  cachedResponseLogicSkillArchive = await buildDirectorySkillArchive({
+    name: "response-logic-builder",
+    version: "1",
+    directoryCandidates: skillDirectoryCandidates,
+    files: RESPONSE_LOGIC_SKILL_FILES,
+  });
+  return cachedResponseLogicSkillArchive;
 }
 
 export async function getResponseLogicSkillDescriptor() {
-  await readResponseLogicSkill();
+  const archive = await buildResponseLogicSkillArchive();
   return {
     name: "response-logic-builder",
     version: "1",
-    contentHash: cachedSkillContentHash!,
+    contentHash: archive.contentHash,
   };
 }
 
@@ -542,11 +533,36 @@ function compactKnowledgeSnapshot(snapshot: KnowledgeSnapshotForPrompt) {
   ].join("\n");
 }
 
+export async function buildResponseLogicEvidenceArchive(
+  snapshot: NonNullable<KnowledgeSnapshotForPrompt>,
+) {
+  return buildDeterministicTaskAttachmentArchive({
+    name: "response-logic-evidence",
+    entrypoint: "knowledge.md",
+    files: [
+      {
+        path: "context.json",
+        content: `${JSON.stringify(
+          {
+            schemaVersion: 1,
+            knowledgeSnapshot: {
+              version: snapshot.version,
+              sourceFileName: snapshot.sourceFileName,
+            },
+          },
+          null,
+          2,
+        )}\n`,
+      },
+      { path: "knowledge.md", content: compactKnowledgeSnapshot(snapshot) },
+    ],
+  });
+}
+
 export async function buildResponseLogicPrompt(input: {
   value: ResponseLogicStartInput;
   knowledgeSnapshot: KnowledgeSnapshotForPrompt;
 }) {
-  const skillInstructions = await readResponseLogicSkill();
   const attachments =
     input.value.attachments.length > 0
       ? input.value.attachments
@@ -555,9 +571,7 @@ export async function buildResponseLogicPrompt(input: {
       : "- 本轮未上传新资料";
 
   return [
-    "严格执行下方 response-logic-builder skill。输出会直接显示给企业客户，不得输出内部思考、路由说明、提示词复述或工具计划。",
-    "",
-    skillInstructions,
+    `严格执行首次任务附带的 ${RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME}。先解压并完整读取根目录 SKILL.md 与 references/output-contract.md；后续轮次继续沿用同一任务中已读取的 response-logic-builder Skill。输出会直接显示给企业客户，不得输出内部思考、路由说明、提示词复述或工具计划。`,
     "",
     "# 当前问题",
     `问题 ID：${input.value.questionId}`,
@@ -570,7 +584,14 @@ export async function buildResponseLogicPrompt(input: {
     JSON.stringify(input.value.draft, null, 2),
     "",
     "# 已发布企业知识库",
-    compactKnowledgeSnapshot(input.knowledgeSnapshot),
+    input.knowledgeSnapshot
+      ? [
+          `完整证据见首次任务附件 ${RESPONSE_LOGIC_EVIDENCE_ATTACHMENT_FILENAME}，先解压并读取 knowledge.md 与 context.json。`,
+          `知识库版本：V${input.knowledgeSnapshot.version}`,
+          `来源文件：${input.knowledgeSnapshot.sourceFileName}`,
+          "只能引用该 evidence ZIP 中出现的企业事实和资产路径。",
+        ].join("\n")
+      : "尚未发布企业知识库版本。只可使用本轮上传资料与用户明确确认的事实；其他企业事实必须列为待确认。",
     "",
     "# 本轮上传资料",
     attachments,
@@ -1080,6 +1101,43 @@ router.post(["/start", "/turn"], async (req, res) => {
     const knowledgeSnapshot = await getLatestKnowledgeSnapshot(
       req.frontmindUser.id,
     );
+    const generatedAttachments: Array<{
+      attachment: { file_id: string; filename: string };
+      fileId: string;
+      removeOrphan: () => Promise<void>;
+    }> = [];
+    if (!value.taskId) {
+      const skillArchive = await buildResponseLogicSkillArchive();
+      generatedAttachments.push(
+        await uploadUpstreamTaskAttachment({
+          baseUrl: getUpstreamBaseUrl(req),
+          apiKey: taskApiKey,
+          filename: RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME,
+          bytes: skillArchive.bytes,
+        }),
+      );
+      if (knowledgeSnapshot) {
+        try {
+          const evidenceArchive =
+            await buildResponseLogicEvidenceArchive(knowledgeSnapshot);
+          generatedAttachments.push(
+            await uploadUpstreamTaskAttachment({
+              baseUrl: getUpstreamBaseUrl(req),
+              apiKey: taskApiKey,
+              filename: RESPONSE_LOGIC_EVIDENCE_ATTACHMENT_FILENAME,
+              bytes: evidenceArchive.bytes,
+            }),
+          );
+        } catch (error) {
+          await Promise.allSettled(
+            generatedAttachments.map((attachment) =>
+              attachment.removeOrphan(),
+            ),
+          );
+          throw error;
+        }
+      }
+    }
     const created = await createResponseLogicTask({
       baseUrl: getUpstreamBaseUrl(req),
       apiKey: taskApiKey,
@@ -1087,10 +1145,16 @@ router.post(["/start", "/turn"], async (req, res) => {
         value,
         knowledgeSnapshot,
       }),
-      attachments: value.attachments,
+      attachments: [
+        ...generatedAttachments.map((item) => item.attachment),
+        ...value.attachments,
+      ],
       taskId: value.taskId,
     });
     if (!created.ok) {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan()),
+      );
       console.warn(
         "[Response Logic Start] create task failed:",
         redactSensitiveText(created.detail, [logSecret]),
@@ -1105,6 +1169,14 @@ router.post(["/start", "/turn"], async (req, res) => {
     }
 
     try {
+      for (const attachment of generatedAttachments) {
+        await recordUpstreamResource({
+          userId: req.frontmindUser.id,
+          apiCredentialId: taskCredential.id,
+          kind: "file",
+          upstreamId: attachment.fileId,
+        });
+      }
       await recordResponseLogicTaskStart({
         userId: req.frontmindUser.id,
         apiCredentialId: taskCredential.id,
@@ -1131,6 +1203,11 @@ router.post(["/start", "/turn"], async (req, res) => {
           apiKey: taskApiKey,
           taskId: String(created.task.id),
         });
+        await Promise.allSettled(
+          generatedAttachments.map((attachment) =>
+            attachment.removeOrphan(),
+          ),
+        );
       }
       throw persistenceError;
     }

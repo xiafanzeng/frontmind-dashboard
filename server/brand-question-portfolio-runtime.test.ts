@@ -1,7 +1,12 @@
+import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
 
 import {
+  BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME,
+  BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME,
+  buildBrandQuestionPortfolioEvidenceArchive,
   buildBrandQuestionPortfolioPrompt,
+  buildBrandQuestionPortfolioSkillArchive,
   parseBrandQuestionPortfolioOutput,
   type BrandQuestionPortfolioContext,
 } from "./brand-question-portfolio-runtime";
@@ -97,10 +102,30 @@ describe("brand question portfolio runtime", () => {
     const prompt = await buildBrandQuestionPortfolioPrompt(context);
     expect(prompt).toContain('"planCode": "advanced"');
     expect(prompt).toContain('"quotaPeriodId": "period-1"');
-    expect(prompt).toContain("frontmind-pro");
-    expect(prompt).toContain("documentPath: README.md");
+    expect(prompt).toContain(BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME);
+    expect(prompt).toContain(BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME);
+    expect(prompt).not.toContain("documentPath: README.md");
     expect(prompt).toContain('"canonicalName": "示例企业"');
     expect(prompt).toContain('"industry": 3');
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThan(4 * 1024);
+
+    const [skillArchive, evidenceArchive] = await Promise.all([
+      buildBrandQuestionPortfolioSkillArchive(),
+      buildBrandQuestionPortfolioEvidenceArchive(context),
+    ]);
+    const skillZip = await JSZip.loadAsync(skillArchive.bytes);
+    const evidenceZip = await JSZip.loadAsync(evidenceArchive.bytes);
+    expect(Object.keys(skillZip.files).sort()).toEqual([
+      "MANIFEST.json",
+      "SKILL.md",
+      "references/output-contract.md",
+    ]);
+    expect(await skillZip.file("SKILL.md")!.async("string")).toContain(
+      "Use the Pro model profile fixed by the application",
+    );
+    expect(await evidenceZip.file("knowledge.md")!.async("string")).toContain(
+      "documentPath: README.md",
+    );
   });
 
   it("parses only a result bound to the current snapshot", () => {

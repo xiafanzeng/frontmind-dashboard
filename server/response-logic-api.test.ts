@@ -1,9 +1,14 @@
+import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
 
 import {
   ResponseLogicTaskBindingError,
+  RESPONSE_LOGIC_EVIDENCE_ATTACHMENT_FILENAME,
+  RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME,
   assertResponseLogicTaskBinding,
   buildResponseLogicPrompt,
+  buildResponseLogicEvidenceArchive,
+  buildResponseLogicSkillArchive,
   buildVerifiedResponseLogicAttachments,
   extractFinalResponseLogicAssistantReply,
   normalizeResponseLogicTaskStatus,
@@ -131,11 +136,41 @@ describe("response logic execution contract", () => {
     expect(prompt).toContain("response-logic-builder");
     expect(prompt).toContain("企业官网怎样成为 AI 可引用的权威信源");
     expect(prompt).toContain("知识库版本：V3");
-    expect(prompt).toContain("这里是已经确认的企业事实");
+    expect(prompt).toContain(RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME);
+    expect(prompt).toContain(RESPONSE_LOGIC_EVIDENCE_ATTACHMENT_FILENAME);
+    expect(prompt).not.toContain("这里是已经确认的企业事实");
     expect(prompt).toContain("企业事实确认表.pdf");
     expect(prompt).toContain("## 核心结论/执行口径");
     expect(prompt).toContain("## 回答边界/禁止表达");
     expect(prompt).toContain("不得输出内部思考");
+
+    const [skillArchive, evidenceArchive] = await Promise.all([
+      buildResponseLogicSkillArchive(),
+      buildResponseLogicEvidenceArchive({
+        version: 3,
+        sourceFileName: "企业知识库_V3.zip",
+        documents: [
+          {
+            path: "01_company/profile.md",
+            title: "企业简介",
+            content: "这里是已经确认的企业事实。",
+          },
+        ],
+        assets: [
+          { path: "images/company.webp", mimeType: "image/webp", size: 2048 },
+        ],
+      }),
+    ]);
+    const skillZip = await JSZip.loadAsync(skillArchive.bytes);
+    const evidenceZip = await JSZip.loadAsync(evidenceArchive.bytes);
+    expect(Object.keys(skillZip.files).sort()).toEqual([
+      "MANIFEST.json",
+      "SKILL.md",
+      "references/output-contract.md",
+    ]);
+    expect(await evidenceZip.file("knowledge.md")!.async("string")).toContain(
+      "这里是已经确认的企业事实",
+    );
   });
 
   it("accepts only a completed Pro assistant reply with all seven ordered sections", () => {

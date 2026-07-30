@@ -5,8 +5,10 @@ import JSZip from "jszip";
 import {
   KnowledgeBaseEnterpriseIdentityError,
   KNOWLEDGE_BASE_AGENT_PROFILE,
+  KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
   KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
   buildKnowledgeBasePrompt,
+  buildKnowledgeBasePrefillEvidenceArchive,
   buildKnowledgePrefillExcerpt,
   deriveKnowledgeBaseInteraction,
   getKnowledgeBaseSkillDescriptor,
@@ -156,6 +158,44 @@ describe("knowledge base execution contract", () => {
     );
     expect(excerpt.indexOf("03_products/product-a.md")).toBeLessThan(
       excerpt.indexOf("04_capabilities/lab.md"),
+    );
+  });
+
+  it("moves migrated knowledge prefill into a separate evidence ZIP", async () => {
+    const snapshot = {
+      version: 4,
+      sourceFileName: "website-kb-v4.zip",
+      archiveHash: "a".repeat(64),
+      documentCount: 1,
+      imageCount: 0,
+      characterCount: 12,
+      documents: [
+        {
+          path: "01_identity/profile.md",
+          title: "企业简介",
+          content: "只应存在于证据包内的企业事实。",
+        },
+      ],
+    };
+    const prompt = await buildKnowledgeBasePrompt({
+      companyName: "验收企业",
+      companyWebsite: "",
+      operatorNotes: "",
+      attachments: [],
+      prefillKnowledgeSnapshot: snapshot,
+    });
+    expect(prompt).toContain(KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME);
+    expect(prompt).not.toContain("只应存在于证据包内的企业事实");
+
+    const archive = await buildKnowledgeBasePrefillEvidenceArchive(snapshot);
+    const zip = await JSZip.loadAsync(archive.bytes);
+    expect(Object.keys(zip.files).sort()).toEqual([
+      "MANIFEST.json",
+      "context.json",
+      "knowledge.md",
+    ]);
+    expect(await zip.file("knowledge.md")!.async("string")).toContain(
+      "只应存在于证据包内的企业事实",
     );
   });
 

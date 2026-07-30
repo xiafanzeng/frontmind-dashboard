@@ -10,7 +10,11 @@ import {
   recordUpstreamResource,
 } from "./auth-service";
 import {
+  BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME,
+  BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME,
+  buildBrandQuestionPortfolioEvidenceArchive,
   buildBrandQuestionPortfolioPrompt,
+  buildBrandQuestionPortfolioSkillArchive,
   parseBrandQuestionPortfolioOutput,
   type BrandQuestionPortfolioContext,
 } from "./brand-question-portfolio-runtime";
@@ -32,6 +36,7 @@ import {
   safeErrorForLog,
 } from "./_core/sensitive-data";
 import { getUpstreamBaseUrl, toUpstreamAgentProfile } from "./upstream-config";
+import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
 
 const router = Router();
 
@@ -168,25 +173,62 @@ router.post("/start", async (req, res) => {
       });
       return;
     }
+    const baseUrl = getUpstreamBaseUrl(req);
+    const apiKey = req.frontmindCredential.apiKey;
+    const generatedAttachments: Array<
+      Awaited<ReturnType<typeof uploadUpstreamTaskAttachment>>
+    > = [];
+    try {
+      const [skillArchive, evidenceArchive] = await Promise.all([
+        buildBrandQuestionPortfolioSkillArchive(),
+        buildBrandQuestionPortfolioEvidenceArchive(context),
+      ]);
+      for (const attachment of [
+        {
+          filename: BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME,
+          bytes: skillArchive.bytes,
+        },
+        {
+          filename: BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME,
+          bytes: evidenceArchive.bytes,
+        },
+      ]) {
+        generatedAttachments.push(
+          await uploadUpstreamTaskAttachment({
+            baseUrl,
+            apiKey,
+            ...attachment,
+          }),
+        );
+      }
+    } catch (error) {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan()),
+      );
+      throw error;
+    }
     const response = await axios.post(
-      `${getUpstreamBaseUrl(req)}/v1/tasks`,
+      `${baseUrl}/v1/tasks`,
       {
         prompt: await buildBrandQuestionPortfolioPrompt(context),
         agentProfile: toUpstreamAgentProfile("frontmind-pro"),
         taskMode: "agent",
-        attachments: [],
+        attachments: generatedAttachments.map((item) => item.attachment),
       },
       {
         headers: {
           "Content-Type": "application/json",
-          API_KEY: req.frontmindCredential.apiKey,
-          Authorization: `Bearer ${req.frontmindCredential.apiKey}`,
+          API_KEY: apiKey,
+          Authorization: `Bearer ${apiKey}`,
         },
         timeout: 120_000,
         validateStatus: () => true,
       },
     );
     if (response.status < 200 || response.status >= 300) {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan()),
+      );
       res.status(response.status).json({
         error: {
           code: "BRAND_QUESTION_TASK_FAILED",
@@ -197,8 +239,16 @@ router.post("/start", async (req, res) => {
     }
     const task = response.data || {};
     const taskId = String(task.id || task.task_id || "");
-    if (!taskId) throw new Error("候选词任务未返回任务标识");
+    if (!taskId) {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan()),
+      );
+      throw new Error("候选词任务未返回任务标识");
+    }
     if (classifyBrandQuestionTaskStatus(task.status) === "failed") {
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan()),
+      );
       res.status(502).json({
         error: {
           code: "BRAND_QUESTION_TASK_FAILED",
@@ -207,12 +257,37 @@ router.post("/start", async (req, res) => {
       });
       return;
     }
-    await recordUpstreamResource({
-      userId: user.id,
-      apiCredentialId: req.frontmindCredential.id,
-      kind: "task",
-      upstreamId: taskId,
-    });
+    try {
+      for (const attachment of generatedAttachments) {
+        await recordUpstreamResource({
+          userId: user.id,
+          apiCredentialId: req.frontmindCredential.id,
+          kind: "file",
+          upstreamId: attachment.fileId,
+        });
+      }
+      await recordUpstreamResource({
+        userId: user.id,
+        apiCredentialId: req.frontmindCredential.id,
+        kind: "task",
+        upstreamId: taskId,
+      });
+    } catch (error) {
+      await Promise.allSettled([
+        axios.delete(`${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`, {
+          headers: {
+            API_KEY: apiKey,
+            Authorization: `Bearer ${apiKey}`,
+          },
+          timeout: 30_000,
+          validateStatus: () => true,
+        }),
+        ...generatedAttachments.map((attachment) =>
+          attachment.removeOrphan(),
+        ),
+      ]);
+      throw error;
+    }
     const contextToken = createBrandQuestionTaskContextToken({
       userId: user.id,
       taskId,

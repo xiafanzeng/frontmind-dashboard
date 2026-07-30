@@ -40,10 +40,8 @@ import type {
 } from "../shared/knowledge-base-progress";
 import { knowledgeBaseBuilds } from "../drizzle/schema";
 import { getDb } from "./db";
-import {
-  assertSafeExternalUrl,
-  safeExternalRequestOptions,
-} from "./_core/safe-external-url";
+import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
+import { buildDeterministicTaskAttachmentArchive } from "./task-attachment-package";
 
 const router = Router();
 
@@ -693,6 +691,19 @@ type KnowledgePrefillDocument = {
   content: string;
 };
 
+type KnowledgePrefillSnapshot = {
+  version: number;
+  sourceFileName: string;
+  archiveHash: string | null;
+  documentCount: number;
+  imageCount: number;
+  characterCount: number;
+  documents: KnowledgePrefillDocument[];
+};
+
+export const KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME =
+  "knowledge-base-prefill-evidence.zip";
+
 function knowledgePrefillBranch(pathname: string) {
   return pathname.normalize("NFKC").split("/").filter(Boolean)[0] || "root";
 }
@@ -773,6 +784,41 @@ export function buildKnowledgePrefillExcerpt(
   return excerpt.slice(0, KNOWLEDGE_PREFILL_MAX_CHARACTERS);
 }
 
+export async function buildKnowledgeBasePrefillEvidenceArchive(
+  snapshot: KnowledgePrefillSnapshot,
+) {
+  return buildDeterministicTaskAttachmentArchive({
+    name: "knowledge-base-prefill-evidence",
+    entrypoint: "knowledge.md",
+    files: [
+      {
+        path: "context.json",
+        content: `${JSON.stringify(
+          {
+            schemaVersion: 1,
+            knowledgeSnapshot: {
+              version: snapshot.version,
+              sourceFileName: snapshot.sourceFileName,
+              archiveHash: snapshot.archiveHash,
+              documentCount: snapshot.documentCount,
+              imageCount: snapshot.imageCount,
+              characterCount: snapshot.characterCount,
+            },
+          },
+          null,
+          2,
+        )}\n`,
+      },
+      {
+        path: "knowledge.md",
+        content:
+          buildKnowledgePrefillExcerpt(snapshot.documents) ||
+          "当前版本没有可读取的正文。",
+      },
+    ],
+  });
+}
+
 export async function buildKnowledgeBasePrompt({
   conversationId,
   companyName,
@@ -786,24 +832,12 @@ export async function buildKnowledgeBasePrompt({
   companyWebsite: string;
   operatorNotes: string;
   attachments: Array<{ file_id: string; filename: string }>;
-  prefillKnowledgeSnapshot?: {
-    version: number;
-    sourceFileName: string;
-    archiveHash: string | null;
-    documentCount: number;
-    imageCount: number;
-    characterCount: number;
-    documents: Array<{ path: string; title: string; content: string }>;
-  } | null;
+  prefillKnowledgeSnapshot?: KnowledgePrefillSnapshot | null;
 }) {
   const attachmentList =
     attachments.length > 0
       ? attachments.map((attachment) => `- ${attachment.filename}`).join("\n")
       : "- 未上传附件，请优先使用企业官网与全网公开资料进行预填";
-  const prefillDocuments = buildKnowledgePrefillExcerpt(
-    prefillKnowledgeSnapshot?.documents ?? [],
-  );
-
   return [
     `严格执行随任务附带的 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}。先解压 ZIP 并完整读取根目录 SKILL.md，再开始工作。`,
     "该 ZIP 是本任务唯一的 socratic-kb-builder v2 工作规约；本段仅提供企业输入和服务端状态约束。",
@@ -826,8 +860,7 @@ export async function buildKnowledgeBasePrompt({
           `来源文件：${prefillKnowledgeSnapshot.sourceFileName}`,
           `产物哈希：${prefillKnowledgeSnapshot.archiveHash || "未记录"}`,
           `已解析文档：${prefillKnowledgeSnapshot.documentCount}；图片：${prefillKnowledgeSnapshot.imageCount}；字符：${prefillKnowledgeSnapshot.characterCount}`,
-          "以下内容是预填证据，不代表节点已确认，也不得据此伪造 100% 对话进度：",
-          prefillDocuments || "当前版本没有可读取的正文。",
+          `完整预填证据见任务附件 ${KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME}。先解压并读取 knowledge.md 与 context.json；这些证据不代表节点已确认，也不得据此伪造 100% 对话进度。`,
         ].join("\n")
       : "当前账号没有已迁移的初步知识库，将从官网、全网与上传资料开始预填。",
     "## 必须执行的机器可验证进度协议",
@@ -872,77 +905,13 @@ export async function uploadKnowledgeBaseSkillArchive({
     version: skillVersion,
     contentHash: skillContentHash,
   });
-  const headers = {
-    API_KEY: apiKey,
-    Authorization: `Bearer ${apiKey}`,
-  };
-  const created = await axios.post(
-    `${baseUrl}/v1/files`,
-    { filename: archive.filename },
-    {
-      headers: { ...headers, "Content-Type": "application/json" },
-      timeout: 120_000,
-      validateStatus: () => true,
-    },
-  );
-  const fileId = String(created.data?.id || created.data?.file_id || "");
-  if (created.status < 200 || created.status >= 300 || !fileId) {
-    throw new Error("Knowledge-base Skill ZIP file creation failed");
-  }
-
-  const removeOrphan = async () => {
-    await axios
-      .delete(`${baseUrl}/v1/files/${encodeURIComponent(fileId)}`, {
-        headers,
-        timeout: 30_000,
-        validateStatus: () => true,
-      })
-      .catch(() => undefined);
-  };
-
-  try {
-    let uploadUrl = String(created.data?.upload_url || "");
-    if (!uploadUrl) {
-      const metadata = await axios.get(
-        `${baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
-        {
-          headers,
-          timeout: 30_000,
-          validateStatus: () => true,
-        },
-      );
-      if (metadata.status < 200 || metadata.status >= 300) {
-        throw new Error("Knowledge-base Skill ZIP upload URL lookup failed");
-      }
-      uploadUrl = String(metadata.data?.upload_url || "");
-    }
-    const target = assertSafeExternalUrl(uploadUrl);
-    const uploaded = await axios.put(target, archive.bytes, {
-      ...safeExternalRequestOptions,
-      // The SigV4 query signs this exact URL; redirects invalidate it.
-      maxRedirects: 0,
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Length": String(archive.bytes.length),
-      },
-      timeout: 120_000,
-      maxBodyLength: archive.bytes.length,
-      maxContentLength: 1024 * 1024,
-      validateStatus: () => true,
-    });
-    if (uploaded.status < 200 || uploaded.status >= 300) {
-      throw new Error("Knowledge-base Skill ZIP upload failed");
-    }
-    return {
-      attachment: { file_id: fileId, filename: archive.filename },
-      fileId,
-      contentHash: archive.contentHash,
-      removeOrphan,
-    };
-  } catch (error) {
-    await removeOrphan();
-    throw error;
-  }
+  const uploaded = await uploadUpstreamTaskAttachment({
+    baseUrl,
+    apiKey,
+    filename: archive.filename,
+    bytes: archive.bytes,
+  });
+  return { ...uploaded, contentHash: archive.contentHash };
 }
 
 async function createFrontMindTask({
@@ -1154,15 +1123,50 @@ router.post("/start", async (req, res) => {
       skillVersion: skillDescriptor.version,
       skillContentHash: skillDescriptor.contentHash,
     });
+    const generatedAttachments: Array<{
+      attachment: { file_id: string; filename: string };
+      fileId: string;
+      removeOrphan: () => Promise<void>;
+    }> = [skillArchive];
+    if (prefillKnowledgeSnapshot) {
+      try {
+        const prefillArchive =
+          await buildKnowledgeBasePrefillEvidenceArchive(
+            prefillKnowledgeSnapshot,
+          );
+        generatedAttachments.push(
+          await uploadUpstreamTaskAttachment({
+            baseUrl,
+            apiKey,
+            filename: KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
+            bytes: prefillArchive.bytes,
+          }),
+        );
+      } catch (error) {
+        await Promise.allSettled(
+          generatedAttachments.map((attachment) =>
+            attachment.removeOrphan(),
+          ),
+        );
+        throw error;
+      }
+    }
     const created = await createFrontMindTask({
       baseUrl,
       apiKey,
       prompt,
-      attachments: [skillArchive.attachment, ...userAttachments],
+      attachments: [
+        ...generatedAttachments.map((item) => item.attachment),
+        ...userAttachments,
+      ],
     });
 
     if (!created.ok) {
-      await skillArchive.removeOrphan();
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) =>
+          attachment.removeOrphan(),
+        ),
+      );
       console.warn(
         "[Knowledge Base Start] create task failed:",
         created.detail,
@@ -1174,12 +1178,14 @@ router.post("/start", async (req, res) => {
     }
     assertKnowledgeBaseCustomerOutput(created.task.output);
 
-    await recordUpstreamResource({
-      userId: req.frontmindUser.id,
-      apiCredentialId: req.frontmindCredential.id,
-      kind: "file",
-      upstreamId: skillArchive.fileId,
-    });
+    for (const attachment of generatedAttachments) {
+      await recordUpstreamResource({
+        userId: req.frontmindUser.id,
+        apiCredentialId: req.frontmindCredential.id,
+        kind: "file",
+        upstreamId: attachment.fileId,
+      });
+    }
     await recordUpstreamResource({
       userId: req.frontmindUser.id,
       apiCredentialId: req.frontmindCredential.id,

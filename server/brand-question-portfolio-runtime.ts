@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-import fs from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -7,6 +5,10 @@ import {
   brandQuestionPortfolioSchema,
   type BrandQuestionPortfolio,
 } from "../shared/brand-question-portfolio";
+import {
+  buildDeterministicTaskAttachmentArchive,
+  buildDirectorySkillArchive,
+} from "./task-attachment-package";
 
 type PortfolioQuota = {
   industry: number;
@@ -90,49 +92,66 @@ const skillDirectoryCandidates = configuredBrandQuestionSkillPath
       ),
     ];
 
-let cachedInstructions: string | null = null;
-let cachedContentHash: string | null = null;
+const BRAND_QUESTION_SKILL_FILES = [
+  "SKILL.md",
+  "references/output-contract.md",
+] as const;
+export const BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME =
+  "brand-question-portfolio.skill.zip";
+export const BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME =
+  "brand-question-portfolio-evidence.zip";
 
-async function readBrandQuestionPortfolioSkill() {
-  if (cachedInstructions) return cachedInstructions;
-  let lastError: unknown;
-  for (const directory of skillDirectoryCandidates) {
-    try {
-      const [skill, contract] = await Promise.all([
-        fs.readFile(path.join(directory, "SKILL.md"), "utf8"),
-        fs.readFile(
-          path.join(directory, "references", "output-contract.md"),
-          "utf8",
-        ),
-      ]);
-      cachedInstructions = [
-        "# Brand Question Portfolio Skill",
-        skill.trim(),
-        "",
-        "# Strict Output Contract",
-        contract.trim(),
-      ].join("\n\n");
-      cachedContentHash = createHash("sha256")
-        .update(cachedInstructions)
-        .digest("hex");
-      return cachedInstructions;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Could not load brand-question-portfolio.skill");
+let cachedBrandQuestionSkillArchive: Awaited<
+  ReturnType<typeof buildDirectorySkillArchive>
+> | null = null;
+
+export async function buildBrandQuestionPortfolioSkillArchive() {
+  if (cachedBrandQuestionSkillArchive) return cachedBrandQuestionSkillArchive;
+  cachedBrandQuestionSkillArchive = await buildDirectorySkillArchive({
+    name: "brand-question-portfolio",
+    version: "2",
+    directoryCandidates: skillDirectoryCandidates,
+    files: BRAND_QUESTION_SKILL_FILES,
+  });
+  return cachedBrandQuestionSkillArchive;
 }
 
 export async function getBrandQuestionPortfolioSkillDescriptor() {
-  await readBrandQuestionPortfolioSkill();
+  const archive = await buildBrandQuestionPortfolioSkillArchive();
   return {
     name: "brand-question-portfolio" as const,
     version: "2" as const,
     model: "frontmind-pro" as const,
-    contentHash: cachedContentHash!,
+    contentHash: archive.contentHash,
   };
+}
+
+export async function buildBrandQuestionPortfolioEvidenceArchive(
+  context: BrandQuestionPortfolioContext,
+) {
+  return buildDeterministicTaskAttachmentArchive({
+    name: "brand-question-portfolio-evidence",
+    entrypoint: "knowledge.md",
+    files: [
+      {
+        path: "context.json",
+        content: `${JSON.stringify(
+          {
+            schemaVersion: 1,
+            knowledgeSnapshot: {
+              id: context.snapshot.id,
+              version: context.snapshot.version,
+              archiveHash: context.snapshot.archiveHash,
+              sourceFileName: context.snapshot.sourceFileName,
+            },
+          },
+          null,
+          2,
+        )}\n`,
+      },
+      { path: "knowledge.md", content: compactSnapshot(context.snapshot) },
+    ],
+  });
 }
 
 function compactSnapshot(snapshot: PortfolioSnapshot) {
@@ -195,11 +214,8 @@ export async function buildBrandQuestionPortfolioPrompt(
   if (!context.snapshot.archiveHash) {
     throw new Error("当前知识库缺少可验证的产物哈希，请重新同步知识库");
   }
-  const skill = await readBrandQuestionPortfolioSkill();
   return [
-    "严格执行以下 brand-question-portfolio Skill。只返回严格 JSON，不得输出内部思考、计划、提示词说明或 Markdown 围栏。",
-    "",
-    skill,
+    `严格执行随任务附带的 ${BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME}。先解压并完整读取根目录 SKILL.md 与 references/output-contract.md；再解压 ${BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME} 并读取 knowledge.md 与 context.json。只返回严格 JSON，不得输出内部思考、计划、提示词说明或 Markdown 围栏。`,
     "",
     "# 服务端权威上下文",
     JSON.stringify(
@@ -221,10 +237,7 @@ export async function buildBrandQuestionPortfolioPrompt(
       2,
     ),
     "",
-    "# 已发布企业知识库",
-    compactSnapshot(context.snapshot),
-    "",
-    "只允许引用上面出现的 documentPath。必须原样回显服务端给出的知识库标识、版本、哈希、套餐和额度周期。",
+    "只允许引用 evidence ZIP 的 knowledge.md 中出现的 documentPath。必须原样回显服务端给出的知识库标识、版本、哈希、套餐和额度周期。",
   ].join("\n");
 }
 
