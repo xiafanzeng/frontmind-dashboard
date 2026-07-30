@@ -62,6 +62,9 @@ describe("CreateUserDialog", () => {
     );
     expect(screen.getByRole("button", { name: "创建客户账号" })).toBeDisabled();
     expect(screen.getByText(/账号立即可用/)).toBeInTheDocument();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toContain("100dvh");
+    expect(dialog.querySelector(".overflow-y-auto")).not.toBeNull();
   });
 
   it("removes the retired knowledge plan and requires a market edition", () => {

@@ -629,6 +629,46 @@ export function publicUpstreamPayload(value: unknown, apiKey: string) {
   );
 }
 
+/**
+ * A presigned upload URL is an intentional, short-lived capability returned
+ * only to the authenticated owner of a newly created/scoped file. Generic
+ * secret redaction must not rewrite its X-Amz-* query parameters or the
+ * resulting URL becomes unusable before the browser can upload the bytes.
+ */
+export function publicUpstreamFilePayload(value: unknown, apiKey: string) {
+  const sanitized = publicUpstreamPayload(value, apiKey);
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !sanitized ||
+    typeof sanitized !== "object" ||
+    Array.isArray(sanitized)
+  ) {
+    return sanitized;
+  }
+
+  const rawUploadUrl = (value as Record<string, unknown>).upload_url;
+  if (typeof rawUploadUrl !== "string") return sanitized;
+
+  return {
+    ...(sanitized as Record<string, unknown>),
+    upload_url: assertSafeExternalUrl(rawUploadUrl),
+  };
+}
+
+export function isPublicFilePayloadRequest(
+  method: string,
+  targetPath: string,
+) {
+  const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
+  return (
+    (method.toUpperCase() === "POST" && pathname === "/v1/files") ||
+    (["GET", "HEAD"].includes(method.toUpperCase()) &&
+      /^\/v1\/files\/[^/]+$/.test(pathname))
+  );
+}
+
 const PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS = [
   "id",
   "task_id",
@@ -2225,6 +2265,9 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
       ...safeExternalRequestOptions,
       headers: uploadHeaders,
       timeout: 300000,
+      // Redirecting a SigV4 URL changes the signed request target and produces
+      // a misleading authentication failure. Presigned uploads must be exact.
+      maxRedirects: 0,
       maxBodyLength: Infinity,
       maxContentLength: 1024 * 1024,
       signal: controller.signal,
@@ -2232,7 +2275,19 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
     });
 
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response.status}`);
-    res.status(response.status).send(response.data || "");
+    if (response.status >= 200 && response.status < 300) {
+      res.status(response.status).send("");
+      return;
+    }
+    res.status(response.status).json({
+      error: {
+        message:
+          response.status >= 400 && response.status < 500
+            ? "上传地址无效或已失效，请重新选择文件后重试"
+            : "文件存储服务暂时不可用，请稍后重试",
+        code: "UPSTREAM_UPLOAD_REJECTED",
+      },
+    });
   } catch (error: any) {
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
@@ -3038,7 +3093,9 @@ router.all("/*", async (req: Request, res: Response) => {
       typeof response.data === "object"
         ? isPublicTaskPayloadRequest(req.method, targetPath)
           ? publicUpstreamTaskPayload(response.data, apiKey)
-          : publicUpstreamPayload(response.data, apiKey)
+          : isPublicFilePayloadRequest(req.method, targetPath)
+            ? publicUpstreamFilePayload(response.data, apiKey)
+            : publicUpstreamPayload(response.data, apiKey)
         : typeof response.data === "string"
           ? sanitizeText(redactSensitiveText(response.data, [apiKey]))
           : response.data;

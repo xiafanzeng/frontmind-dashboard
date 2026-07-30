@@ -50,6 +50,7 @@ export type AdminDeliveryTicket = {
   description?: string | null;
   targetUrl?: string | null;
   targetPage?: string | null;
+  knowledgeSnapshotId?: string | null;
   status: DeliveryTicketStatus;
   publicStatus?: "pending" | "completed" | null;
   publicStatusLabel?: string | null;
@@ -767,8 +768,10 @@ export default function AdminDeliveryTicketWorkspace({
   const [deliveryPlatformMessage, setDeliveryPlatformMessage] = useState("");
   const [deliveryFiles, setDeliveryFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [maintenanceUploading, setMaintenanceUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const deliveryFileInputRef = useRef<HTMLInputElement>(null);
+  const maintenanceFileInputRef = useRef<HTMLInputElement>(null);
   const websiteTemplateFileInputRef = useRef<HTMLInputElement>(null);
   const [websiteTemplateBusy, setWebsiteTemplateBusy] = useState<
     "" | "download" | "preview" | "publish"
@@ -1095,6 +1098,54 @@ export default function AdminDeliveryTicketWorkspace({
       toast.error("状态更新失败", {
         description: error instanceof Error ? error.message : "请刷新后重试。",
       });
+    }
+  };
+
+  const uploadKnowledgeMaintenanceArchive = async (file: File) => {
+    if (
+      !detail?.ticket ||
+      detail.ticket.category !== "knowledge_base_maintenance"
+    ) {
+      return;
+    }
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      toast.error("知识库维护只接受 ZIP 文件");
+      return;
+    }
+    setMaintenanceUploading(true);
+    try {
+      const response = await fetch(`/api/dashboard/import/${userId}`, {
+        method: "PUT",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "x-file-name": encodeURIComponent(file.name),
+          "x-import-mode": "knowledge",
+          "x-maintenance-ticket-id": detail.ticket.id,
+        },
+        body: file,
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(
+          payload?.error?.message ||
+            payload?.message ||
+            `上传失败 (${response.status})`,
+        );
+      }
+      await refresh();
+      toast.success("新知识库版本已通过校验并发布", {
+        description: "现在可以填写公开总结并完成维护工单。",
+      });
+    } catch (error) {
+      toast.error("知识库维护版本上传失败", {
+        description: error instanceof Error ? error.message : "请稍后重试。",
+      });
+    } finally {
+      setMaintenanceUploading(false);
+      if (maintenanceFileInputRef.current) {
+        maintenanceFileInputRef.current.value = "";
+      }
     }
   };
 
@@ -1987,6 +2038,50 @@ export default function AdminDeliveryTicketWorkspace({
                         保存交付记录
                       </Button>
                     </div>
+                  </div>
+                </section>
+              )}
+
+              {detail.ticket.category === "knowledge_base_maintenance" && (
+                <section className="admin-ticket-delivery-card">
+                  <div className="admin-ticket-section-heading">
+                    <div>
+                      <span>知识库替换版本</span>
+                      <h3>上传并发布通过校验的新知识库 ZIP</h3>
+                      <p>
+                        新版本会直接替换客户当前展示知识库，并与本维护工单绑定；发布成功后才能完成工单。
+                      </p>
+                    </div>
+                    <UploadCloud className="h-5 w-5" />
+                  </div>
+                  <input
+                    ref={maintenanceFileInputRef}
+                    className="hidden"
+                    type="file"
+                    accept=".zip,application/zip"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) void uploadKnowledgeMaintenanceArchive(file);
+                    }}
+                  />
+                  <div className="admin-ticket-status-action">
+                    <Button
+                      className="bg-[#5b2a86] hover:bg-[#49216c]"
+                      disabled={
+                        maintenanceUploading ||
+                        !OPEN_TICKET_STATUSES.has(detail.ticket.status)
+                      }
+                      onClick={() => maintenanceFileInputRef.current?.click()}
+                    >
+                      {maintenanceUploading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <UploadCloud className="h-4 w-4" />
+                      )}
+                      {maintenanceUploading
+                        ? "正在校验并发布"
+                        : "上传知识库 ZIP"}
+                    </Button>
                   </div>
                 </section>
               )}

@@ -21,6 +21,18 @@ export const knowledgeBaseBuildStatuses = [
 export type KnowledgeBaseBuildStatus =
   (typeof knowledgeBaseBuildStatuses)[number];
 
+export const knowledgeBaseInteractionStates = [
+  "queued",
+  "executing",
+  "awaiting_input",
+  "ready_to_publish",
+  "published",
+  "failed",
+] as const;
+
+export type KnowledgeBaseInteractionState =
+  (typeof knowledgeBaseInteractionStates)[number];
+
 export interface KnowledgeBaseProgressLeafDto {
   id: string;
   title: string;
@@ -63,9 +75,23 @@ export interface KnowledgeBaseProgressDto {
     revision: number;
     currentLeafId: string | null;
     protocolError: string | null;
+    awaitingResponseSince?: number | null;
     updatedAt: number;
   };
   summary: KnowledgeBaseProgressSummaryDto;
   branches: KnowledgeBaseProgressBranchDto[];
   packageAllowed: boolean;
+}
+
+/**
+ * Customer interaction state is intentionally separate from the upstream task
+ * execution status. A long-running task can already be waiting for the next
+ * customer confirmation while the provider still reports pending/running.
+ */
+export interface KnowledgeBaseInteractionDto {
+  progress: KnowledgeBaseProgressDto | null;
+  interactionState: KnowledgeBaseInteractionState;
+  canReply: boolean;
+  canPublish: boolean;
+  lockReason: string | null;
 }

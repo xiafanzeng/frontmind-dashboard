@@ -267,6 +267,13 @@
       "when": 1785330078305,
       "tag": "0037_remove-knowledge-plan",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "5",
+      "when": 1785343323293,
+      "tag": "0038_fine_loners",
+      "breakpoints": true
     }
   ]
 }

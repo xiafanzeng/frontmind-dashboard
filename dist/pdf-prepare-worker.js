@@ -822,6 +822,7 @@ var deliveryTickets = mysqlTable(
     icpProvince: varchar("icpProvince", { length: 64 }),
     icpDeclarations: json("icpDeclarations").$type(),
     targetPage: text("targetPage"),
+    knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
     technicalDedupeKey: varchar("technicalDedupeKey", { length: 64 }),
     materialUrls: json("materialUrls").$type().default([]).notNull(),
     status: mysqlEnum("status", [
@@ -1684,6 +1685,7 @@ var knowledgeBaseSnapshots = mysqlTable(
     sourceTaskId: varchar("sourceTaskId", { length: 255 }),
     sourceArtifactHash: varchar("sourceArtifactHash", { length: 64 }),
     archiveHash: varchar("archiveHash", { length: 64 }),
+    maintenanceTicketId: varchar("maintenanceTicketId", { length: 36 }),
     documents: json("documents").$type().notNull(),
     assets: json("assets").$type().notNull(),
     documentCount: int("documentCount").default(0).notNull(),
@@ -1744,6 +1746,7 @@ var knowledgeBaseBuilds = mysqlTable(
     lastOutputItemIds: json("lastOutputItemIds").$type().default([]).notNull(),
     lastTurnUserText: longtext("lastTurnUserText"),
     lastTurnAttachmentCount: int("lastTurnAttachmentCount").default(0).notNull(),
+    awaitingResponseSince: timestamp("awaitingResponseSince"),
     packageRevision: int("packageRevision"),
     packageTaskId: varchar("packageTaskId", { length: 255 }),
     packageOutputItemId: varchar("packageOutputItemId", { length: 255 }),
@@ -1868,6 +1871,7 @@ var conversations = mysqlTable(
       "idle",
       "running",
       "pending",
+      "awaiting_input",
       "completed",
       "error",
       "failed",
@@ -3242,6 +3246,7 @@ var websiteOperationCategorySchema = z5.enum([
   "industry_news",
   "company_news",
   "faq_content",
+  "knowledge_base_maintenance",
   // Legacy categories remain parseable for historical records. New ticket
   // creation is restricted by resolveDeliveryTicketQuotaPool below.
   "blog_update",
@@ -3382,6 +3387,7 @@ var createDeliveryTicketSchema = z5.object({
   icpDeclarations: icpNonSensitiveDeclarationsSchema.optional(),
   targetPage: targetPageSchema.optional(),
   materialUrls: z5.array(httpUrlSchema).max(30).default([]),
+  knowledgeSnapshotId: z5.string().uuid().optional(),
   attachments: z5.array(deliveryTicketAttachmentInputSchema).max(30).default([])
 }).refine(
   (value) => Boolean(
@@ -3397,6 +3403,13 @@ var createDeliveryTicketSchema = z5.object({
       code: z5.ZodIssueCode.custom,
       path: ["icpDeclarations"],
       message: "\u57DF\u540D\u4E0E ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
+    });
+  }
+  if (value.category === "knowledge_base_maintenance" && !value.knowledgeSnapshotId) {
+    context.addIssue({
+      code: z5.ZodIssueCode.custom,
+      path: ["knowledgeSnapshotId"],
+      message: "\u7EF4\u62A4\u5DE5\u5355\u5FC5\u987B\u5173\u8054\u5F53\u524D\u5DF2\u53D1\u5E03\u77E5\u8BC6\u5E93"
     });
   }
 });
@@ -3575,7 +3588,8 @@ var publicDeliveryTicketSummaryBaseSchema = z5.object({
   topic: z5.string().trim().max(512).nullable(),
   publicStatus: z5.enum(["pending", "completed"]),
   publicStatusLabel: z5.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
-  publicSummary: z5.string().max(5e4).nullable()
+  publicSummary: z5.string().max(5e4).nullable(),
+  knowledgeSnapshotId: z5.string().uuid().nullable().optional()
 });
 var publicContentAssetTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
   type: z5.literal("content_asset"),
@@ -5293,6 +5307,22 @@ function publicUpstreamPayload(value, apiKey) {
     })
   );
 }
+function publicUpstreamFilePayload(value, apiKey) {
+  const sanitized = publicUpstreamPayload(value, apiKey);
+  if (!value || typeof value !== "object" || Array.isArray(value) || !sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) {
+    return sanitized;
+  }
+  const rawUploadUrl = value.upload_url;
+  if (typeof rawUploadUrl !== "string") return sanitized;
+  return {
+    ...sanitized,
+    upload_url: assertSafeExternalUrl(rawUploadUrl)
+  };
+}
+function isPublicFilePayloadRequest(method, targetPath) {
+  const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
+  return method.toUpperCase() === "POST" && pathname === "/v1/files" || ["GET", "HEAD"].includes(method.toUpperCase()) && /^\/v1\/files\/[^/]+$/.test(pathname);
+}
 var PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS = [
   "id",
   "task_id",
@@ -6387,13 +6417,25 @@ router.put("/proxy-upload", async (req, res) => {
       ...safeExternalRequestOptions,
       headers: uploadHeaders,
       timeout: 3e5,
+      // Redirecting a SigV4 URL changes the signed request target and produces
+      // a misleading authentication failure. Presigned uploads must be exact.
+      maxRedirects: 0,
       maxBodyLength: Infinity,
       maxContentLength: 1024 * 1024,
       signal: controller.signal,
       validateStatus: () => true
     });
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response.status}`);
-    res.status(response.status).send(response.data || "");
+    if (response.status >= 200 && response.status < 300) {
+      res.status(response.status).send("");
+      return;
+    }
+    res.status(response.status).json({
+      error: {
+        message: response.status >= 400 && response.status < 500 ? "\u4E0A\u4F20\u5730\u5740\u65E0\u6548\u6216\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u6587\u4EF6\u540E\u91CD\u8BD5" : "\u6587\u4EF6\u5B58\u50A8\u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
+        code: "UPSTREAM_UPLOAD_REJECTED"
+      }
+    });
   } catch (error) {
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
@@ -7013,7 +7055,7 @@ router.all("/*", async (req, res) => {
         }
       }
     }
-    const publicResponse = typeof response.data === "object" ? isPublicTaskPayloadRequest(req.method, targetPath) ? publicUpstreamTaskPayload(response.data, apiKey) : publicUpstreamPayload(response.data, apiKey) : typeof response.data === "string" ? sanitizeText(redactSensitiveText(response.data, [apiKey])) : response.data;
+    const publicResponse = typeof response.data === "object" ? isPublicTaskPayloadRequest(req.method, targetPath) ? publicUpstreamTaskPayload(response.data, apiKey) : isPublicFilePayloadRequest(req.method, targetPath) ? publicUpstreamFilePayload(response.data, apiKey) : publicUpstreamPayload(response.data, apiKey) : typeof response.data === "string" ? sanitizeText(redactSensitiveText(response.data, [apiKey])) : response.data;
     if (publicResponse && typeof publicResponse === "object" && !Array.isArray(publicResponse) && Array.isArray(publicResponse.output)) {
       const publicRecord = publicResponse;
       const outputSummary = publicRecord.output.map(

@@ -144,13 +144,15 @@ describe("retrieveTask", () => {
 
 describe("uploadFile", () => {
   it("creates one file record and reuses its URL across transient PUT retries", async () => {
+    const signedUrl =
+      "https://uploads.example/signed-one?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Signature=abcdef0123456789";
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       json: async () => ({
         id: "file-one",
         filename: "report.pdf",
-        upload_url: "https://uploads.example/signed-one",
+        upload_url: signedUrl,
       }),
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -210,15 +212,64 @@ describe("uploadFile", () => {
       expect.objectContaining({ method: "POST" }),
     );
     expect(requests).toEqual([
-      { method: "PUT", url: "https://uploads.example/signed-one" },
+      { method: "PUT", url: signedUrl },
       {
         method: "PUT",
-        url: "/api/frontmind/proxy-upload?target=https%3A%2F%2Fuploads.example%2Fsigned-one",
+        url: `/api/frontmind/proxy-upload?target=${encodeURIComponent(signedUrl)}`,
       },
       {
         method: "PUT",
-        url: "/api/frontmind/proxy-upload?target=https%3A%2F%2Fuploads.example%2Fsigned-one",
+        url: `/api/frontmind/proxy-upload?target=${encodeURIComponent(signedUrl)}`,
       },
     ]);
+  });
+
+  it("does not retry or expose raw storage XML after a permanent proxy rejection", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: "file-two",
+        filename: "Logo.png",
+        upload_url:
+          "https://uploads.example/logo.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abcdef",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    let requestCount = 0;
+    class MockXMLHttpRequest {
+      status = 0;
+      statusText = "";
+      responseText = "";
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        requestCount += 1;
+        if (requestCount === 1) {
+          queueMicrotask(() => this.listeners.get("error")?.());
+          return;
+        }
+        this.status = 400;
+        this.responseText = JSON.stringify({
+          error: {
+            message: "上传地址无效或已失效，请重新选择文件后重试",
+          },
+        });
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadFile(new File(["png"], "Logo.png", { type: "image/png" })),
+    ).rejects.toThrow("上传地址无效或已失效");
+    expect(requestCount).toBe(2);
   });
 });

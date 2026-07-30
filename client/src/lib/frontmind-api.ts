@@ -14,6 +14,7 @@
  */
 
 import type { ResponseLogicDraft } from "@shared/response-logic";
+import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progress";
 
 /**
  * Model display mapping: public model id -> display name.
@@ -191,6 +192,7 @@ export interface TaskResponse {
     message?: string;
     code?: string;
   };
+  knowledgeInteraction?: KnowledgeBaseInteractionDto;
 }
 
 export interface ResponseLogicTaskContext {
@@ -532,6 +534,7 @@ export async function createResponseLogicTask(
         task_title: data.task_title || data.metadata?.task_title,
       },
       output: data.output || [],
+      knowledgeInteraction: payload?.interaction,
     };
   } finally {
     window.clearTimeout(timeoutId);
@@ -772,6 +775,10 @@ export async function uploadFile(
         break;
       } catch (proxyError) {
         lastProxyError = proxyError;
+        const proxyStatus = Number(
+          (proxyError as { status?: unknown } | null)?.status,
+        );
+        if (proxyStatus >= 400 && proxyStatus < 500) break;
         if (attempt >= retryConfig.maxRetries) break;
         const exponentialDelay =
           retryConfig.initialDelay * Math.pow(2, attempt);
@@ -830,12 +837,27 @@ async function uploadFileToUrlViaProxy(
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve();
       } else {
+        const upstreamMessage = (() => {
+          try {
+            const payload = JSON.parse(xhr.responseText || "{}") as {
+              error?: { message?: unknown };
+            };
+            return typeof payload.error?.message === "string"
+              ? payload.error.message
+              : "";
+          } catch {
+            return "";
+          }
+        })();
+        const error = new Error(
+          upstreamMessage ||
+            (xhr.status >= 400 && xhr.status < 500
+              ? "上传地址无效或已失效，请重新选择文件后重试"
+              : "文件上传失败，请稍后重试"),
+        ) as Error & { status?: number };
+        error.status = xhr.status;
         reject(
-          new Error(
-            `Proxy upload failed (${xhr.status}): ${
-              xhr.responseText?.slice(0, 200) || xhr.statusText
-            }`,
-          ),
+          error,
         );
       }
     });

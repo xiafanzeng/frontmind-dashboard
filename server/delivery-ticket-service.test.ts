@@ -179,6 +179,12 @@ describe("delivery ticket contract", () => {
         category: "domain_application",
       }),
     ).toBeNull();
+    expect(
+      resolveDeliveryTicketQuotaPool({
+        type: "website_operation",
+        category: "knowledge_base_maintenance",
+      }),
+    ).toBeNull();
     expect(() =>
       resolveDeliveryTicketQuotaPool({
         type: "website_operation",
@@ -213,6 +219,24 @@ describe("delivery ticket contract", () => {
         type: "content_asset",
       }),
     ).toThrow();
+  });
+
+  it("requires a published snapshot for knowledge-base maintenance", () => {
+    const base = {
+      clientRequestId: "5f05091b-0e0a-4482-8f11-654c4502b3e1",
+      type: "website_operation",
+      category: "knowledge_base_maintenance",
+      description: "更新产品参数",
+    } as const;
+    expect(() => createDeliveryTicketSchema.parse(base)).toThrow(
+      "必须关联当前已发布知识库",
+    );
+    expect(
+      createDeliveryTicketSchema.parse({
+        ...base,
+        knowledgeSnapshotId: "970b87d8-d4f4-45db-8f11-44c45f52ade9",
+      }).knowledgeSnapshotId,
+    ).toBe("970b87d8-d4f4-45db-8f11-44c45f52ade9");
   });
 
   it("keeps attachment rights metadata in the validated contract", () => {
@@ -743,6 +767,21 @@ describe("delivery ticket quota lifecycle", () => {
         "website_operation",
       ),
     ).toThrow("普通版不包含 AI 友好官网管理");
+    expect(
+      assertDeliveryTicketServiceEligibility(
+        {
+          service: {
+            status: "active",
+            planCode: "basic",
+            contractId: "contract-basic",
+          },
+          quotas: { periodId: "period-basic" },
+          quotaPeriods: [],
+        } as any,
+        "website_operation",
+        "knowledge_base_maintenance",
+      ),
+    ).toMatchObject({ quotaPeriodId: "period-basic" });
   });
 
   it("rejects expired services on the server", () => {

@@ -22,6 +22,7 @@ import { useEffect, useRef, useCallback } from "react";
 import {
   useConversation,
   parseOutputMessages,
+  sanitizeKnowledgeBaseOutputMessages,
   type Conversation,
 } from "@/contexts/ConversationContext";
 import { retrieveTask, creditEventBus } from "@/lib/frontmind-api";
@@ -58,6 +59,15 @@ async function checkAndUpdateTask(
     const taskData = await retrieveTask(conv.taskId);
     const normalizedStatus =
       taskData.status === "failed" ? "error" : taskData.status;
+    let existingProgress: Awaited<
+      ReturnType<typeof fetchKnowledgeBaseProgress>
+    > = null;
+    try {
+      existingProgress = await fetchKnowledgeBaseProgress(conv.id);
+    } catch {
+      // Non-knowledge conversations do not have a build row.
+    }
+    const isKnowledgeBaseConversation = Boolean(existingProgress);
 
     // Parse and update output messages
     const baselineOutputLength = conv.lastKnownOutputLength || 0;
@@ -79,11 +89,14 @@ async function checkAndUpdateTask(
 
       if (newOutput.length > 0) {
         try {
-          const msgs = parseOutputMessages(
+          const parsedMessages = parseOutputMessages(
             newOutput,
             conv.startedAt || conv.createdAt,
             conv.messages?.[conv.messages.length - 1]?.modelName,
           );
+          const msgs = isKnowledgeBaseConversation
+            ? sanitizeKnowledgeBaseOutputMessages(parsedMessages)
+            : parsedMessages;
           if (msgs.length > 0) {
             // If completed, attach elapsed time to last message
             if (normalizedStatus === "completed") {
@@ -98,6 +111,55 @@ async function checkAndUpdateTask(
           console.error("[ResumePolling] Error parsing output:", parseErr);
         }
       }
+    }
+
+    try {
+      if (existingProgress) {
+        const interaction = await reconcileKnowledgeBaseProgress({
+          conversationId: conv.id,
+          taskId: taskData.id,
+        });
+        if (interaction.interactionState === "awaiting_input") {
+          updateStatus(conv.id, "awaiting_input", {
+            taskId: taskData.id,
+            taskUrl: taskData.metadata?.task_url,
+            previousResponseId: taskData.id,
+            lastKnownOutputLength: taskData.output?.length || 0,
+          });
+          return false;
+        }
+        if (
+          interaction.interactionState === "ready_to_publish" ||
+          interaction.interactionState === "published"
+        ) {
+          updateStatus(conv.id, "completed", {
+            taskId: taskData.id,
+            completedAt: Date.now(),
+            lastKnownOutputLength: taskData.output?.length || 0,
+          });
+          return false;
+        }
+        if (interaction.interactionState === "failed") {
+          updateStatus(conv.id, "error", {
+            taskId: taskData.id,
+            completedAt: Date.now(),
+            lastKnownOutputLength: taskData.output?.length || 0,
+          });
+          return false;
+        }
+      }
+    } catch {
+      // A partial running response is allowed to remain unreconciled. The
+      // next visibility/focus poll will retry with the completed envelope.
+    }
+
+    if (isKnowledgeBaseConversation && normalizedStatus === "completed") {
+      updateStatus(conv.id, "error", {
+        completedAt: Date.now(),
+        lastKnownOutputLength: taskData.output?.length || 0,
+      });
+      toast.error("任务已结束，但未返回完整的知识节点状态");
+      return false;
     }
 
     if (normalizedStatus === "completed") {
@@ -327,10 +389,19 @@ export function useResumePolling() {
         try {
           const progress = await fetchKnowledgeBaseProgress(conversation.id);
           if (!progress) return;
-          await reconcileKnowledgeBaseProgress({
+          const interaction = await reconcileKnowledgeBaseProgress({
             conversationId: conversation.id,
             taskId: conversation.taskId,
           });
+          if (interaction.interactionState === "awaiting_input") {
+            updateStatusRef.current(conversation.id, "awaiting_input", {
+              taskId: conversation.taskId,
+            });
+          } else if (interaction.interactionState === "failed") {
+            updateStatusRef.current(conversation.id, "error", {
+              completedAt: Date.now(),
+            });
+          }
         } catch {
           recoveredCompletedTasksRef.current.delete(key);
         }

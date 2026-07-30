@@ -69,7 +69,7 @@ describe("knowledge base leaf manifest validation", () => {
     ]);
   });
 
-  it("enforces 40–115 leaves without fixing the top-level branch count", () => {
+  it("enforces 8–115 leaves without fixing the top-level branch count", () => {
     const createManifest = (count: number, branchCount: number) =>
       Array.from({ length: count }, (_, index) => ({
         id: `leaf-${index + 1}`,

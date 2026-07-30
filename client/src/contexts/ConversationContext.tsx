@@ -80,7 +80,14 @@ export interface Conversation {
   messages: LocalMessage[];
   taskId?: string; // Upstream task ID
   previousResponseId?: string;
-  status: "idle" | "running" | "pending" | "completed" | "error" | "failed";
+  status:
+    | "idle"
+    | "running"
+    | "pending"
+    | "awaiting_input"
+    | "completed"
+    | "error"
+    | "failed";
   taskUrl?: string;
   createdAt: number;
   updatedAt: number;
@@ -1160,6 +1167,73 @@ export function parseOutputMessages(
       },
     ];
   }
+}
+
+export function sanitizeKnowledgeBaseOutputMessages(
+  messages: LocalMessage[],
+): LocalMessage[] {
+  return messages
+    .map(
+      ({
+        intermediateSteps: _intermediateSteps,
+        stepGroups: _stepGroups,
+        isStepsPlaceholder: _isStepsPlaceholder,
+        ...message
+      }) => ({
+        ...message,
+        content: sanitizeKnowledgeBaseCustomerMarkdown(message.content),
+        inlineImages: message.inlineImages?.filter((image) =>
+          isManagedKnowledgeBaseImageSource(image.src),
+        ),
+      }),
+    )
+    .filter(
+      (message) =>
+        Boolean(message.content.trim()) ||
+        Boolean(message.outputFiles?.length) ||
+        Boolean(message.inlineImages?.length),
+    );
+}
+
+const EXTERNAL_IMAGE_ASSET_URL =
+  /https?:\/\/[^\s<>"')\]]+\.(?:avif|gif|jpe?g|png|svg|webp)(?:[?#][^\s<>"')\]]*)?/gi;
+
+function isManagedKnowledgeBaseImageSource(src: string): boolean {
+  const normalized = String(src || "").trim();
+  return (
+    /^data:image\/[a-z0-9.+-]+;base64,/i.test(normalized) ||
+    normalized.startsWith("/api/frontmind/") ||
+    normalized.startsWith("/api/dashboard/knowledge/assets/") ||
+    normalized.startsWith("/api/knowledge-base/")
+  );
+}
+
+/**
+ * Knowledge-base drafts must not hotlink origin/CDN images. Such URLs can be
+ * protected by Referer rules, expire, or be revoked after the crawl. The
+ * customer-facing archive only renders validated bytes stored in the ZIP and
+ * served by our authenticated asset route.
+ */
+export function sanitizeKnowledgeBaseCustomerMarkdown(text: string): string {
+  if (!text) return "";
+
+  return text
+    .replace(
+      /!\[([^\]\n]*)]\(\s*<?(https?:\/\/[^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/gi,
+      (_match, alt: string) => (alt.trim() ? `配图：${alt.trim()}` : ""),
+    )
+    .replace(
+      /<img\b[^>]*\bsrc\s*=\s*["']https?:\/\/[^"']+["'][^>]*>/gi,
+      "",
+    )
+    .replace(
+      /\[([^\]\n]+)]\(\s*<?(https?:\/\/[^)\s>]+\.(?:avif|gif|jpe?g|png|svg|webp)(?:[?#][^)\s>]*)?)>?(?:\s+["'][^"']*["'])?\s*\)/gi,
+      "$1",
+    )
+    .replace(EXTERNAL_IMAGE_ASSET_URL, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function _parseOutputMessagesInner(

@@ -5,9 +5,11 @@ import {
   KNOWLEDGE_BASE_AGENT_PROFILE,
   buildKnowledgeBasePrompt,
   buildKnowledgePrefillExcerpt,
+  deriveKnowledgeBaseInteraction,
   getKnowledgeBaseSkillDescriptor,
   resolveKnowledgeBaseEnterpriseIdentity,
   selectUnreconciledKnowledgeOutput,
+  shouldReconcileKnowledgeOutput,
 } from "./knowledge-base-api";
 
 function expectEnterpriseIdentityError(
@@ -46,7 +48,7 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("3,000,000");
     expect(prompt).toContain("limited_evidence");
     expect(prompt).toContain("evidenceDocumentIds");
-    expect(prompt).toContain("schemaVersion: 2");
+    expect(prompt).toContain("schemaVersion: 3");
     expect(prompt).toContain("1,500 ZIP files");
     expect(prompt).toContain("160 MiB");
     expect(prompt).toContain("00_package_manifest.json");
@@ -61,7 +63,8 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("Customer writing boundary");
     expect(prompt).toContain("verification_gaps");
     expect(prompt).toContain("00_web_intelligence_report.md");
-    expect(prompt).toContain("40-115");
+    expect(prompt).toContain("8-115");
+    expect(prompt).toContain("不得为数量、字数或图片数填充内容");
     expect(prompt).toContain("一级分支数量不设固定值");
     expect(prompt).not.toContain("恰好 7 个一级分支");
     expect(prompt).not.toContain("7 universal top-level branches");
@@ -215,5 +218,69 @@ describe("knowledge base execution contract", () => {
         lastOutputItemIds: ["out-1", "out-8"],
       }),
     ).toEqual(currentTurn);
+
+    expect(
+      selectUnreconciledKnowledgeOutput(cumulative, {
+        lastOutputLength: cumulative.length,
+        lastOutputItemIds: ["out-1", "out-2"],
+      }),
+    ).toEqual([]);
+  });
+
+  it("reconciles closed envelopes while ignoring partial waiting output", () => {
+    const partial = [
+      {
+        id: "partial",
+        role: "assistant",
+        content: '<!-- FRONTMIND_KB_MANIFEST\n{"kind":',
+      },
+    ];
+    const closedInvalid = [
+      {
+        id: "closed",
+        role: "assistant",
+        content: "<!-- FRONTMIND_KB_UNKNOWN\n{} \n-->",
+      },
+    ];
+
+    expect(shouldReconcileKnowledgeOutput(partial, "awaiting_user")).toBe(
+      false,
+    );
+    expect(shouldReconcileKnowledgeOutput(closedInvalid, "running")).toBe(true);
+    expect(shouldReconcileKnowledgeOutput(partial, "completed")).toBe(true);
+  });
+
+  it("lets an authoritative confirming build override a still-running upstream task", () => {
+    const progress = {
+      build: {
+        id: "build-1",
+        conversationId: "conversation-1",
+        companyName: "验收企业",
+        status: "confirming",
+        revision: 0,
+        currentLeafId: "identity.name",
+        protocolError: null,
+        awaitingResponseSince: null,
+        updatedAt: Date.now(),
+      },
+      summary: {
+        total: 8,
+        handled: 0,
+        confirmed: 0,
+        directPrefilled: 0,
+        pending: 7,
+        current: 1,
+        needsVerification: 0,
+        overallPercent: 0,
+      },
+      branches: [],
+      packageAllowed: false,
+    } as const;
+
+    expect(deriveKnowledgeBaseInteraction(progress, "running")).toMatchObject({
+      interactionState: "awaiting_input",
+      canReply: true,
+      canPublish: false,
+    });
   });
 });

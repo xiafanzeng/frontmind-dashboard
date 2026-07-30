@@ -62,6 +62,8 @@ import {
   getDashboardWorkspace,
   getKnowledgeAsset,
   getKnowledgeAssetById,
+  getLatestKnowledgeSnapshot,
+  getKnowledgeSnapshotById,
   updateDashboardWorkspace,
   type DashboardWorkspaceWriteHook,
 } from "./dashboard-service";
@@ -95,6 +97,7 @@ import {
 } from "./response-logic-service";
 import { getUpstreamBaseUrl } from "./upstream-config";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
+import { assertKnowledgeMaintenanceTicketForUpload } from "./delivery-ticket-service";
 import {
   consumeDashboardImportPreflight,
   dashboardImportPreflightStoreForExecutor,
@@ -311,7 +314,7 @@ const websiteV2ImageDiscoveryMethodSchema = z.enum([
 ]);
 const websiteV2PackageManifestSchema = z
   .object({
-    schemaVersion: z.literal(2),
+    schemaVersion: z.union([z.literal(2), z.literal(3)]),
     profile: z.literal("website-lead-v1"),
     documents: z
       .array(
@@ -372,8 +375,12 @@ const websiteV2PackageManifestSchema = z
               .array(z.string().trim().min(1).max(191))
               .min(1)
               .max(500),
-            sourcePageUrl: packageSourceUrlSchema,
+            sourcePageUrl: packageSourceUrlSchema.optional(),
             sourceAssetUrl: packageSourceUrlSchema.optional(),
+            sourceDocumentPath: z.string().trim().min(1).max(600).optional(),
+            sourceKind: z
+              .enum(["official_web", "official_document", "user_upload"])
+              .optional(),
             ownership: packageAssetOwnershipSchema,
             assetType: packageAssetTypeSchema,
             displayRole: packageAssetDisplayRoleSchema,
@@ -419,15 +426,22 @@ const websiteV2PackageManifestSchema = z
         eligibleFirstPartyImages: z.number().int().nonnegative().max(48),
         rejectedCandidateImages: z.number().int().nonnegative(),
         scannedSourcePages: z.number().int().nonnegative(),
-        discoveryMethods: z
-          .array(websiteV2ImageDiscoveryMethodSchema)
-          .length(7),
+        discoveryMethods: z.array(websiteV2ImageDiscoveryMethodSchema).max(7),
         candidates: z
           .array(
             z
               .object({
-                url: packageSourceUrlSchema,
-                sourcePageUrl: packageSourceUrlSchema,
+                url: packageSourceUrlSchema.optional(),
+                sourcePageUrl: packageSourceUrlSchema.optional(),
+                sourceDocumentPath: z
+                  .string()
+                  .trim()
+                  .min(1)
+                  .max(600)
+                  .optional(),
+                sourceKind: z
+                  .enum(["official_web", "official_document", "user_upload"])
+                  .optional(),
                 method: websiteV2ImageDiscoveryMethodSchema,
                 status: z.enum(["eligible", "rejected", "uninspected"]),
                 assetId: z.string().trim().min(1).max(191).optional(),
@@ -435,7 +449,7 @@ const websiteV2PackageManifestSchema = z
               })
               .strict(),
           )
-          .max(180),
+          .max(1_000),
         productFamilies: z
           .array(
             z
@@ -443,13 +457,12 @@ const websiteV2PackageManifestSchema = z
                 id: z.string().trim().min(1).max(191),
                 name: z.string().trim().min(1).max(500),
                 officialVisualFound: z.boolean(),
-                checkedSources: z.number().int().positive(),
+                checkedSources: z.number().int().nonnegative(),
                 assetIds: z.array(z.string().trim().min(1).max(191)).max(48),
                 gapReason: z.string().trim().min(8).max(2_000).optional(),
               })
               .strict(),
           )
-          .min(1)
           .max(120),
         shortfallReason: z.string().trim().min(8).max(2_000).optional(),
       })
@@ -477,8 +490,12 @@ const websiteV2PackageManifestSchema = z
       (candidate) => candidate.status === "uninspected",
     );
     if (
-      new Set(candidates.map((candidate) => candidate.url)).size !==
-        candidates.length ||
+      new Set(
+        candidates.map(
+          (candidate) =>
+            candidate.url || `document:${candidate.sourceDocumentPath || ""}`,
+        ),
+      ).size !== candidates.length ||
       value.imageSelection.discoveredCandidateImages !== candidates.length ||
       value.imageSelection.inspectedCandidateImages !==
         eligible.length + rejected.length ||
@@ -521,7 +538,8 @@ const websiteV2PackageManifestSchema = z
       if (
         !asset ||
         asset.sourceAssetUrl !== candidate.url ||
-        asset.sourcePageUrl !== candidate.sourcePageUrl
+        asset.sourcePageUrl !== candidate.sourcePageUrl ||
+        asset.sourceDocumentPath !== candidate.sourceDocumentPath
       ) {
         context.addIssue({
           code: "custom",
@@ -568,7 +586,7 @@ const websiteV2PackageManifestSchema = z
 
 const internalPackageManifestSchema = z
   .object({
-    schemaVersion: z.union([z.literal(1), z.literal(2)]),
+    schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
     profile: z.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
     websiteV2Normalized: z.literal(true).optional(),
     documents: z
@@ -635,6 +653,10 @@ const internalPackageManifestSchema = z
               .max(500),
             sourcePageUrl: packageSourceUrlSchema.optional(),
             sourceAssetUrl: packageSourceUrlSchema.optional(),
+            sourceDocumentPath: z.string().trim().min(1).max(600).optional(),
+            sourceKind: z
+              .enum(["official_web", "official_document", "user_upload"])
+              .optional(),
             ownership: packageAssetOwnershipSchema,
             assetType: packageAssetTypeSchema.optional(),
             displayRole: packageAssetDisplayRoleSchema.optional(),
@@ -721,8 +743,17 @@ const internalPackageManifestSchema = z
           .array(
             z
               .object({
-                url: packageSourceUrlSchema,
-                sourcePageUrl: packageSourceUrlSchema,
+                url: packageSourceUrlSchema.optional(),
+                sourcePageUrl: packageSourceUrlSchema.optional(),
+                sourceDocumentPath: z
+                  .string()
+                  .trim()
+                  .min(1)
+                  .max(600)
+                  .optional(),
+                sourceKind: z
+                  .enum(["official_web", "official_document", "user_upload"])
+                  .optional(),
                 method: z.string().trim().min(1).max(100),
                 status: z.enum(["eligible", "rejected", "uninspected"]),
                 assetId: z.string().trim().min(1).max(191).optional(),
@@ -752,7 +783,7 @@ const internalPackageManifestSchema = z
     const assetPaths = new Set(
       value.assets.map((asset) => asset.path.normalize("NFKC").toLowerCase()),
     );
-    if (value.schemaVersion === 2) {
+    if (value.schemaVersion !== 1) {
       if (
         value.profile === "website-lead-v1" &&
         value.websiteV2Normalized !== true
@@ -948,7 +979,7 @@ const packageManifestSchema = z.preprocess((input) => {
     "profile" in input &&
     input.profile === "website-lead-v1" &&
     "schemaVersion" in input &&
-    input.schemaVersion === 2;
+    (input.schemaVersion === 2 || input.schemaVersion === 3);
   if (!isWebsiteV2) return input;
   const value = websiteV2PackageManifestSchema.parse(input);
   const statusByDisplayBranch = new Map<
@@ -1640,8 +1671,12 @@ function duplicateFormalParagraphs(
 ) {
   const pathsByFingerprint = new Map<string, string[]>();
   const duplicates: Array<{ first: string; second: string }> = [];
+  const samples: Array<{ path: string; text: string }> = [];
   for (const document of documents) {
     const narrative = profileFormalKnowledgeText(document.content, profile);
+    if (effectiveCharacterCount(narrative) >= 80) {
+      samples.push({ path: document.path, text: narrative });
+    }
     if (effectiveCharacterCount(narrative) < 120) continue;
     const fingerprints = new Set(
       [narrative, ...narrative.split(/\n\s*\n/)]
@@ -1661,7 +1696,47 @@ function duplicateFormalParagraphs(
       duplicates.push({ first: paths[0]!, second: paths[2]! });
     }
   }
+  for (let leftIndex = 0; leftIndex < samples.length; leftIndex += 1) {
+    for (
+      let rightIndex = leftIndex + 1;
+      rightIndex < samples.length;
+      rightIndex += 1
+    ) {
+      const left = samples[leftIndex]!;
+      const right = samples[rightIndex]!;
+      if (normalizedFormalSimilarity(left.text, right.text) >= 0.82) {
+        duplicates.push({ first: left.path, second: right.path });
+      }
+    }
+  }
   return duplicates;
+}
+
+function normalizedFormalSimilarity(left: string, right: string) {
+  const shingles = (value: string) => {
+    const normalized = value
+      .normalize("NFKC")
+      .toLowerCase()
+      .replace(/\d+/g, "#")
+      .replace(/\s+/g, "")
+      .replace(
+        /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]/g,
+        "",
+      );
+    const values = new Set<string>();
+    for (let index = 0; index <= normalized.length - 5; index += 1) {
+      values.add(normalized.slice(index, index + 5));
+    }
+    return values;
+  };
+  const leftShingles = shingles(left);
+  const rightShingles = shingles(right);
+  if (!leftShingles.size || !rightShingles.size) return 0;
+  let intersection = 0;
+  leftShingles.forEach((value) => {
+    if (rightShingles.has(value)) intersection += 1;
+  });
+  return intersection / (leftShingles.size + rightShingles.size - intersection);
 }
 
 function packagedEvidenceCharacters(
@@ -1745,7 +1820,8 @@ function parsePackageJson<T>(
 
 function validateProfilePackage(input: {
   profile: Exclude<KnowledgeBaseValidationProfile, "historical">;
-  archiveContractVersion?: 1 | 2;
+  archiveContractVersion?: 1 | 2 | 3;
+  archiveContractVersions?: readonly (1 | 2 | 3)[];
   packagePaths: string[];
   unpackedBytes: number;
   rawTextByRelativePath: Map<string, string>;
@@ -1767,6 +1843,15 @@ function validateProfilePackage(input: {
       "知识库归档合同版本与 package manifest 不一致",
     );
   }
+  if (
+    input.archiveContractVersions !== undefined &&
+    !input.archiveContractVersions.includes(manifest.schemaVersion)
+  ) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      "知识库归档合同版本不在当前任务允许的兼容范围内",
+    );
+  }
   if (manifest.profile !== input.profile) {
     throw new KnowledgeArchiveValidationError(
       "structure",
@@ -1786,7 +1871,7 @@ function validateProfilePackage(input: {
           images: 48,
           targetImages: 36,
           minCharacters: 8_000,
-          maxCharacters: manifest.schemaVersion === 2 ? 40_000 : 18_000,
+          maxCharacters: manifest.schemaVersion !== 1 ? 40_000 : 18_000,
           maxEvidenceCharacters: 300_000,
           maxOfficialPages: 120,
           maxDocuments: 22,
@@ -1939,7 +2024,7 @@ function validateProfilePackage(input: {
         `打包图片必须是第一方素材：${relativePath}`,
       );
     }
-    if (manifest.schemaVersion === 2) {
+    if (manifest.schemaVersion !== 1) {
       const isBadgeType = ["brand_identity", "certificate_badge"].includes(
         metadata.assetType || "",
       );
@@ -1980,6 +2065,8 @@ function validateProfilePackage(input: {
       documentIds: metadata.documentIds,
       sourcePageUrl: metadata.sourcePageUrl,
       sourceAssetUrl: metadata.sourceAssetUrl,
+      sourceDocumentPath: metadata.sourceDocumentPath,
+      sourceKind: metadata.sourceKind,
       ownership: metadata.ownership,
       assetType: metadata.assetType,
       displayRole: metadata.displayRole,
@@ -2008,6 +2095,43 @@ function validateProfilePackage(input: {
       "media",
       "企业知识库图片总量超过 160 MB",
     );
+  }
+  if (input.profile === "dashboard-enterprise-v1") {
+    const packagedDocumentPaths = new Set(
+      input.documents.map((document) => packageRelativePath(document.path)),
+    );
+    for (const asset of enrichedAssets) {
+      if (!asset.sourcePageUrl && !asset.sourceDocumentPath) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `图片缺少可追溯的官网页面或打包来源文档：${asset.path}`,
+        );
+      }
+      if (
+        asset.sourceDocumentPath &&
+        !packagedDocumentPaths.has(
+          packageRelativePath(asset.sourceDocumentPath),
+        )
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `图片来源文档未打包：${asset.sourceDocumentPath}`,
+        );
+      }
+      if (
+        ["product_ui", "product_diagram", "case_photo"].includes(
+          asset.assetType || "",
+        ) &&
+        /(?:sprite|icon(?:s|font)?|favicon|logo[\s_-]*(?:wall|sheet|grid|collage)|装饰|背景图|图标集|标志墙|logo墙)/i.test(
+          `${asset.path} ${asset.caption || ""} ${asset.alt || ""}`,
+        )
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `装饰图、图标集或 Logo 拼贴不得作为产品视觉：${asset.path}`,
+        );
+      }
+    }
   }
   if (manifest.counts.packagedImages !== enrichedAssets.length) {
     throw new KnowledgeArchiveValidationError(
@@ -2111,8 +2235,18 @@ function validateProfilePackage(input: {
     );
     if (
       candidates.length !== discovered ||
-      new Set(candidates.map((candidate) => candidate.url)).size !==
-        candidates.length ||
+      new Set(
+        candidates.map(
+          (candidate) =>
+            candidate.url ||
+            `${candidate.sourceDocumentPath || "unknown"}:${candidate.assetId || candidate.rejectionReason || candidate.status}`,
+        ),
+      ).size !== candidates.length ||
+      candidates.some(
+        (candidate) =>
+          (!candidate.url && !candidate.sourceDocumentPath) ||
+          (!candidate.sourcePageUrl && !candidate.sourceDocumentPath),
+      ) ||
       eligibleCandidates.length !== selection.eligibleFirstPartyImages ||
       rejectedCandidates.length !== rejected ||
       eligibleCandidates.length + rejectedCandidates.length !== inspected ||
@@ -2125,7 +2259,8 @@ function validateProfilePackage(input: {
           !asset ||
           candidate.rejectionReason !== undefined ||
           asset.sourceAssetUrl !== candidate.url ||
-          asset.sourcePageUrl !== candidate.sourcePageUrl
+          asset.sourcePageUrl !== candidate.sourcePageUrl ||
+          asset.sourceDocumentPath !== candidate.sourceDocumentPath
         );
       }) ||
       rejectedCandidates.some(
@@ -2334,16 +2469,16 @@ function validateProfilePackage(input: {
     input.profile === "website-lead-v1" &&
     ((manifest.schemaVersion === 1 &&
       (customerDocuments.length < 40 || customerDocuments.length > 56)) ||
-      (manifest.schemaVersion === 2 &&
+      (manifest.schemaVersion !== 1 &&
         (customerOverviewDocuments.length !== 7 ||
-          customerLeafDocuments.length < 40 ||
+          customerLeafDocuments.length < 8 ||
           customerLeafDocuments.length > 56)))
   ) {
     throw new KnowledgeArchiveValidationError(
       "content",
       manifest.schemaVersion === 1
         ? "历史官网轻量知识库必须包含 40–56 个客户可见内容文档"
-        : "官网轻量知识库 v2 必须包含 7 篇分支综述和 40–56 个知识叶子",
+        : "官网轻量知识库 v2 必须包含 7 篇分支综述和 8–56 个知识叶子",
     );
   }
   if (input.profile === "website-lead-v1") {
@@ -2494,10 +2629,10 @@ function validateProfilePackage(input: {
     const leafDocuments = customerDocuments.filter(
       (document) => document.kind === "leaf",
     );
-    if (leafDocuments.length < 40 || leafDocuments.length > 115) {
+    if (leafDocuments.length < 8 || leafDocuments.length > 115) {
       throw new KnowledgeArchiveValidationError(
         "content",
-        "企业深度知识库必须包含 40–115 个知识叶子",
+        "企业深度知识库必须包含 8–115 个知识叶子",
       );
     }
     const leafBranches = new Set(
@@ -2587,7 +2722,7 @@ function validateProfilePackage(input: {
         packagedEvidenceDocumentCharacters(document),
       ]),
   );
-  if (input.profile === "website-lead-v1" && manifest.schemaVersion === 2) {
+  if (input.profile === "website-lead-v1" && manifest.schemaVersion !== 1) {
     const branchEvidence = manifest.branchEvidence || [];
     const overviewById = new Map(
       customerOverviewDocuments
@@ -2658,7 +2793,7 @@ function validateProfilePackage(input: {
     }
     evidencePathByFingerprint.set(fingerprint, evidenceDocument.path);
   }
-  if (manifest.schemaVersion === 2) {
+  if (manifest.schemaVersion !== 1) {
     const unreferencedEvidence = evidenceDocuments.find(
       (document) =>
         !document.id ||
@@ -2726,7 +2861,7 @@ function validateProfilePackage(input: {
       );
     }
     if (
-      manifest.schemaVersion === 2 &&
+      manifest.schemaVersion !== 1 &&
       (document.kind === "overview" || document.kind === "leaf")
     ) {
       const evidenceDocumentIds = document.evidenceDocumentIds || [];
@@ -2787,7 +2922,7 @@ function validateProfilePackage(input: {
           ? document.kind === "leaf"
             ? websiteV2LeafRequirement(actualEvidenceCharacters)
             : document.requiredFormalCharacters!
-          : expected.required;
+          : document.requiredFormalCharacters!;
       if (
         input.profile === "website-lead-v1" &&
         document.kind === "leaf" &&
@@ -2800,12 +2935,14 @@ function validateProfilePackage(input: {
       }
       if (
         input.profile === "dashboard-enterprise-v1" &&
-        (document.requiredFormalCharacters !== expected.required ||
+        (!new Set([0, expected.required]).has(
+          document.requiredFormalCharacters!,
+        ) ||
           document.contentStatus !== expected.status)
       ) {
         throw new KnowledgeArchiveValidationError(
           "content",
-          `正文动态要求或内容状态不正确：${document.path}`,
+          `正文要求或内容状态不正确：${document.path}`,
         );
       }
       if (
@@ -5514,7 +5651,8 @@ export async function readKnowledgeArchive(
   snapshotId: string,
   options: {
     validationProfile?: KnowledgeBaseValidationProfile;
-    archiveContractVersion?: 1 | 2;
+    archiveContractVersion?: 1 | 2 | 3;
+    archiveContractVersions?: readonly (1 | 2 | 3)[];
   } = {},
 ) {
   const validationProfile = options.validationProfile ?? "historical";
@@ -5765,6 +5903,7 @@ export async function readKnowledgeArchive(
         : validateProfilePackage({
             profile: validationProfile,
             archiveContractVersion: options.archiveContractVersion,
+            archiveContractVersions: options.archiveContractVersions,
             packagePaths,
             unpackedBytes,
             rawTextByRelativePath,
@@ -6192,6 +6331,17 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       userId: targetUserId,
       conversationId,
     });
+    if (build.status === "published" && build.publishedSnapshotId) {
+      const snapshot = await getKnowledgeSnapshotById({
+        userId: targetUserId,
+        snapshotId: build.publishedSnapshotId,
+      });
+      if (!snapshot) {
+        throw new Error("已发布知识库记录不完整，请联系管理员");
+      }
+      res.json({ kind: "knowledge", snapshot, idempotent: true });
+      return;
+    }
     const taskId = String(build.packageTaskId || "");
     if (
       !taskId ||
@@ -6229,12 +6379,8 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
     if (returnedTaskId !== taskId) {
       throw new Error("读取到的知识库任务与当前完成版本不匹配");
     }
-    if (task.status !== "completed") {
-      throw new Error(
-        task.status === "failed" || task.status === "error"
-          ? "知识库任务执行失败，无法发布"
-          : "知识库任务仍在处理中",
-      );
+    if (task.status === "failed" || task.status === "error") {
+      throw new Error("知识库任务执行失败，无法发布");
     }
     const output = Array.isArray(task.output) ? task.output : [];
     const matchingDescriptors = collectKnowledgeArchiveDescriptors(
@@ -6267,7 +6413,8 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       {
         validationProfile:
           build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
-        archiveContractVersion: build.skillVersion === "1" ? undefined : 2,
+        archiveContractVersions:
+          build.skillVersion === "1" ? undefined : [2, 3],
       },
     );
     storedAssetKeys = parsed.storedAssetKeys;
@@ -6299,6 +6446,23 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
         unlink(path.join(storageRoot, key)).catch(() => undefined),
       ),
     );
+    const publishedBuild = await assertKnowledgeBasePublishable({
+      userId: targetUserId,
+      conversationId,
+    }).catch(() => null);
+    if (
+      publishedBuild?.status === "published" &&
+      publishedBuild.publishedSnapshotId
+    ) {
+      const snapshot = await getKnowledgeSnapshotById({
+        userId: targetUserId,
+        snapshotId: publishedBuild.publishedSnapshotId,
+      }).catch(() => null);
+      if (snapshot) {
+        res.json({ kind: "knowledge", snapshot, idempotent: true });
+        return;
+      }
+    }
     console.error("[Dashboard] Knowledge publish failed", error);
     res
       .status(error instanceof ServiceEntitlementError ? error.statusCode : 400)
@@ -7116,6 +7280,21 @@ router.put(
         );
       }
       await assertServiceCapability(targetUserId, "knowledgeDisplay");
+      const maintenanceTicketId =
+        req.header("x-maintenance-ticket-id")?.trim() || undefined;
+      const existingSnapshot = await getLatestKnowledgeSnapshot(targetUserId);
+      if (existingSnapshot && !maintenanceTicketId) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          "已发布知识库只能通过开放的维护工单替换",
+        );
+      }
+      if (maintenanceTicketId) {
+        await assertKnowledgeMaintenanceTicketForUpload({
+          userId: targetUserId,
+          ticketId: maintenanceTicketId,
+        });
+      }
 
       let sourceBuildId: string | undefined;
 
@@ -7124,7 +7303,12 @@ router.put(
         buffer,
         sourceFileName,
         snapshotId,
-        { validationProfile: "historical" },
+        maintenanceTicketId
+          ? {
+              validationProfile: "dashboard-enterprise-v1",
+              archiveContractVersions: [2, 3],
+            }
+          : { validationProfile: "historical" },
       );
       try {
         const workspace = await getDashboardWorkspace(targetUserId);
@@ -7142,6 +7326,7 @@ router.put(
           sourceFileName,
           sourceConversationId,
           sourceBuildId,
+          maintenanceTicketId,
           documents: parsed.documents,
           assets: parsed.assets,
           totalBytes: buffer.length,
@@ -7156,6 +7341,7 @@ router.put(
             sourceName: sourceFileName,
             sourceConversationId,
             sourceBuildId,
+            maintenanceTicketId,
             documentCount: snapshot?.documentCount ?? parsed.documents.length,
             imageCount: snapshot?.imageCount ?? parsed.assets.length,
             totalBytes: snapshot?.totalBytes ?? buffer.length,

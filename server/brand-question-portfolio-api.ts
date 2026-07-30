@@ -105,7 +105,7 @@ async function currentContext(userId: number) {
   if (!snapshot) {
     throw new ServiceEntitlementError(
       "KNOWLEDGE_SNAPSHOT_NOT_FOUND",
-      "请先在知识库智能体中逐项完成 40–115 个节点并发布当前套餐使用的认证知识库，再生成品牌全域候选词。",
+      "请先在知识库智能体中逐项完成 8–115 个节点并发布当前套餐使用的认证知识库，再生成品牌全域候选词。",
       409,
     );
   }

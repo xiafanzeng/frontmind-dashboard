@@ -9,6 +9,7 @@ import { serveStatic, setupVite } from "./vite";
 import manusProxy from "../manus-proxy";
 import knowledgeBaseApi, {
   getKnowledgeBaseSkillDescriptor,
+  recoverOpenKnowledgeBaseTasks,
 } from "../knowledge-base-api";
 import responseLogicApi, {
   getResponseLogicSkillDescriptor,
@@ -291,6 +292,18 @@ async function startServer() {
   startDashboardImportPreflightCleanupScheduler();
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);
+    if (process.env.NODE_ENV === "production") {
+      void recoverOpenKnowledgeBaseTasks()
+        .then((result) => {
+          console.info(
+            "[KnowledgeBaseRecovery] startup_scan_complete",
+            JSON.stringify(result),
+          );
+        })
+        .catch((error) => {
+          console.error("[KnowledgeBaseRecovery] startup_scan_failed", error);
+        });
+    }
   });
 }
 

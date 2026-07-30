@@ -26,7 +26,7 @@ MAX_UNCOMPRESSED_BYTES = 200 * MIB
 MAX_IMAGE_BYTES = 160 * MIB
 MAX_FILES = 1_500
 MAX_IMAGES = 480
-MIN_LEAVES = 40
+MIN_LEAVES = 8
 MAX_LEAVES = 115
 TARGET_FORMAL_CHARACTERS_MIN = 80_000
 TARGET_FORMAL_CHARACTERS_MAX = 120_000
@@ -96,6 +96,10 @@ FORBIDDEN_FORMAL_PHRASES = (
     "page excerpt",
 )
 CUSTOMER_FORMAL_LEAKAGE = (
+    (
+        "intermediate or bulk filler wording",
+        re.compile(r"补充说明|第\s*[一二三四五六七八九十百\d]+\s*个内容节点|本轮整理结果", re.I),
+    ),
     (
         "task or collection process",
         re.compile(
@@ -183,6 +187,8 @@ ASSET_KEYS = {
     "documentIds",
     "sourcePageUrl",
     "sourceAssetUrl",
+    "sourceDocumentPath",
+    "sourceKind",
     "ownership",
     "assetType",
     "displayRole",
@@ -527,6 +533,26 @@ def effective_characters(content: str) -> int:
     )
     return len(value)
 
+def normalized_formal_shingles(content: str) -> set[str]:
+    value = unicodedata.normalize("NFKC", content).lower()
+    value = re.sub(r"\d+", "#", value)
+    value = re.sub(
+        r"""[\s!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]+""",
+        "",
+        value,
+    )
+    return {value[index : index + 5] for index in range(max(0, len(value) - 4))}
+
+
+def normalized_formal_similarity(left: str, right: str) -> float:
+    left_shingles = normalized_formal_shingles(left)
+    right_shingles = normalized_formal_shingles(right)
+    if not left_shingles or not right_shingles:
+        return 0.0
+    return len(left_shingles & right_shingles) / len(
+        left_shingles | right_shingles
+    )
+
 
 def formal_requirement(
     *,
@@ -629,8 +655,8 @@ def validate_archive(path: Path) -> list[str]:
             validation=validation,
         )
         validation.require(
-            manifest.get("schemaVersion") == 2,
-            "00_package_manifest.json schemaVersion must be 2",
+            manifest.get("schemaVersion") == 3,
+            "00_package_manifest.json schemaVersion must be 3",
         )
         validation.require(
             manifest.get("profile") == "dashboard-enterprise-v1",
@@ -686,6 +712,7 @@ def validate_archive(path: Path) -> list[str]:
         branch_overviews: dict[str, int] = {}
         formal_hashes: dict[str, str] = {}
         formal_paragraph_paths: dict[str, list[str]] = {}
+        formal_samples: list[tuple[str, str]] = []
         document_effective_characters: dict[str, int] = {}
         evidence_paths_by_hash: dict[str, str] = {}
         product_family_ids: set[str] = set()
@@ -841,9 +868,10 @@ def validate_archive(path: Path) -> list[str]:
                         evidence_characters=evidence_characters,
                     )
                     validation.require(
-                        required_formal_characters == expected_required,
+                        required_formal_characters in {0, expected_required},
                         f"{where}.requiredFormalCharacters must be "
-                        f"{expected_required}, got {required_formal_characters!r}",
+                        f"0 or legacy value {expected_required}, got "
+                        f"{required_formal_characters!r}",
                     )
                     validation.require(
                         content_status == expected_status,
@@ -915,6 +943,8 @@ def validate_archive(path: Path) -> list[str]:
                 )
                 formal_count = effective_characters(countable_formal)
                 formal_total += formal_count
+                if formal_count >= 80:
+                    formal_samples.append((doc_path, countable_formal))
                 required_formal_characters = raw_document.get(
                     "requiredFormalCharacters"
                 )
@@ -1103,6 +1133,19 @@ def validate_archive(path: Path) -> list[str]:
             "formal content repeats the same template paragraph across "
             f"{repeated_template or []}",
         )
+        repeated_pair = next(
+            (
+                (left_path, right_path)
+                for left_index, (left_path, left_text) in enumerate(formal_samples)
+                for right_path, right_text in formal_samples[left_index + 1 :]
+                if normalized_formal_similarity(left_text, right_text) >= 0.82
+            ),
+            None,
+        )
+        validation.require(
+            repeated_pair is None,
+            f"formal content is substantially duplicated across {repeated_pair}",
+        )
 
         markdown_paths = {
             name for name in entries if PurePosixPath(name).suffix.lower() == ".md"
@@ -1260,12 +1303,12 @@ def validate_archive(path: Path) -> list[str]:
                 isinstance(evaluated_at, str)
                 and bool(
                     re.fullmatch(
-                        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-                        r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+                        r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}"
+                        r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?",
                         evaluated_at,
                     )
                 ),
-                "00_completeness.json.evaluatedAt must be ISO 8601",
+                "00_completeness.json.evaluatedAt must be RFC3339 or YYYY-MM-DD",
             )
 
         asset_ids: set[str] = set()
@@ -1308,6 +1351,20 @@ def validate_archive(path: Path) -> list[str]:
                 validation,
                 optional=True,
             )
+            source_document_path = require_string(
+                raw_asset,
+                "sourceDocumentPath",
+                where,
+                validation,
+                optional=True,
+            )
+            source_kind = require_string(
+                raw_asset,
+                "sourceKind",
+                where,
+                validation,
+                optional=True,
+            )
             ownership = require_string(raw_asset, "ownership", where, validation)
             asset_type = require_string(raw_asset, "assetType", where, validation)
             display_role = require_string(
@@ -1320,6 +1377,20 @@ def validate_archive(path: Path) -> list[str]:
                 ownership == "first_party",
                 f"{where}.ownership must be first_party",
             )
+            validation.require(
+                bool(source_page_url)
+                or (
+                    bool(source_document_path)
+                    and source_document_path in entries
+                ),
+                f"{where} requires a public source page or packaged source document",
+            )
+            if source_kind:
+                validation.require(
+                    source_kind
+                    in {"official_web", "official_document", "user_upload"},
+                    f"{where}.sourceKind is invalid",
+                )
             validation.require(
                 asset_type in ASSET_TYPES,
                 f"{where}.assetType is invalid",
@@ -1573,7 +1644,7 @@ def validate_archive(path: Path) -> list[str]:
         eligible_candidates: list[dict[str, Any]] = []
         rejected_candidates: list[dict[str, Any]] = []
         uninspected_candidates: list[dict[str, Any]] = []
-        candidate_urls: set[str] = set()
+        candidate_keys: set[str] = set()
         if isinstance(candidates, list):
             for index, candidate in enumerate(candidates):
                 where = f"imageSelection.candidates[{index}]"
@@ -1581,12 +1652,7 @@ def validate_archive(path: Path) -> list[str]:
                     validation.errors.append(f"{where} must be an object")
                     continue
                 status = candidate.get("status")
-                required_candidate_keys = {
-                    "url",
-                    "sourcePageUrl",
-                    "method",
-                    "status",
-                }
+                required_candidate_keys = {"method", "status"}
                 if status == "eligible":
                     required_candidate_keys.add("assetId")
                 elif status == "rejected":
@@ -1594,14 +1660,34 @@ def validate_archive(path: Path) -> list[str]:
                 require_exact_keys(
                     candidate,
                     allowed=required_candidate_keys
-                    | {"assetId", "rejectionReason"},
+                    | {
+                        "url",
+                        "sourcePageUrl",
+                        "sourceDocumentPath",
+                        "sourceKind",
+                        "assetId",
+                        "rejectionReason",
+                    },
                     required=required_candidate_keys,
                     where=where,
                     validation=validation,
                 )
-                url = require_string(candidate, "url", where, validation)
+                url = require_string(
+                    candidate, "url", where, validation, optional=True
+                )
                 source_page = require_string(
-                    candidate, "sourcePageUrl", where, validation
+                    candidate,
+                    "sourcePageUrl",
+                    where,
+                    validation,
+                    optional=True,
+                )
+                source_document = require_string(
+                    candidate,
+                    "sourceDocumentPath",
+                    where,
+                    validation,
+                    optional=True,
                 )
                 method = require_string(candidate, "method", where, validation)
                 validation.require(
@@ -1612,6 +1698,8 @@ def validate_archive(path: Path) -> list[str]:
                     ("url", url),
                     ("sourcePageUrl", source_page),
                 ):
+                    if not candidate_url:
+                        continue
                     validation.require(
                         bool(
                             re.fullmatch(
@@ -1625,14 +1713,26 @@ def validate_archive(path: Path) -> list[str]:
                         f"{where}.{key} must be a credential-free HTTP(S) URL",
                     )
                 validation.require(
+                    bool(url)
+                    or (
+                        bool(source_document)
+                        and source_document in entries
+                    ),
+                    f"{where} requires a source URL or packaged source document",
+                )
+                validation.require(
                     status in {"eligible", "rejected", "uninspected"},
                     f"{where}.status is invalid",
                 )
-                validation.require(
-                    url not in candidate_urls,
-                    f"duplicate image candidate URL: {url}",
+                candidate_key = (
+                    url
+                    or f"{source_document}:{candidate.get('assetId') or candidate.get('rejectionReason') or status}"
                 )
-                candidate_urls.add(url)
+                validation.require(
+                    candidate_key not in candidate_keys,
+                    f"duplicate image candidate: {candidate_key}",
+                )
+                candidate_keys.add(candidate_key)
                 if status == "eligible":
                     eligible_candidates.append(candidate)
                     asset_id = require_string(
@@ -1644,7 +1744,9 @@ def validate_archive(path: Path) -> list[str]:
                         and candidate.get("rejectionReason") is None
                         and asset.get("sourceAssetUrl") == candidate.get("url")
                         and asset.get("sourcePageUrl")
-                        == candidate.get("sourcePageUrl"),
+                        == candidate.get("sourcePageUrl")
+                        and asset.get("sourceDocumentPath")
+                        == candidate.get("sourceDocumentPath"),
                         f"{where} does not match its packaged asset",
                     )
                 elif status == "rejected":
@@ -1667,7 +1769,7 @@ def validate_archive(path: Path) -> list[str]:
             for value in (discovered, inspected, eligible, rejected)
         ):
             validation.require(
-                len(candidate_urls) == discovered
+                len(candidate_keys) == discovered
                 and len(eligible_candidates) == eligible
                 and len(rejected_candidates) == rejected
                 and len(eligible_candidates) + len(rejected_candidates)

@@ -1,4 +1,7 @@
-import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
+import type {
+  KnowledgeBaseInteractionDto,
+  KnowledgeBaseProgressDto,
+} from "@shared/knowledge-base-progress";
 
 async function readErrorMessage(response: Response) {
   try {
@@ -27,10 +30,23 @@ export async function fetchKnowledgeBaseProgress(
   return (payload?.progress as KnowledgeBaseProgressDto | null) ?? null;
 }
 
+export async function fetchKnowledgeBaseInteraction(
+  conversationId: string,
+): Promise<KnowledgeBaseInteractionDto | null> {
+  if (!conversationId) return null;
+  const response = await fetch(
+    `/api/knowledge-base/progress/${encodeURIComponent(conversationId)}`,
+    { credentials: "include" },
+  );
+  if (!response.ok) throw new Error(await readErrorMessage(response));
+  const payload = await response.json();
+  return (payload?.interaction as KnowledgeBaseInteractionDto | null) ?? null;
+}
+
 export async function reconcileKnowledgeBaseProgress(input: {
   conversationId: string;
   taskId?: string;
-}): Promise<KnowledgeBaseProgressDto> {
+}): Promise<KnowledgeBaseInteractionDto> {
   const response = await fetch("/api/knowledge-base/progress/reconcile", {
     method: "POST",
     credentials: "include",
@@ -44,7 +60,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
       detail: payload.progress,
     }),
   );
-  return payload.progress as KnowledgeBaseProgressDto;
+  return payload.interaction as KnowledgeBaseInteractionDto;
 }
 
 /**

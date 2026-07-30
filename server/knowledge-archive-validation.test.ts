@@ -871,6 +871,28 @@ ${narrative}
     });
   });
 
+  it("accepts a v3 archive while retaining v2 compatibility", async () => {
+    const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const manifestPath = "深度企业_knowledge_base/00_package_manifest.json";
+    const manifest = JSON.parse(await zip.file(manifestPath)!.async("string"));
+    manifest.schemaVersion = 3;
+    zip.file(manifestPath, JSON.stringify(manifest));
+
+    const result = await readKnowledgeArchive(
+      await zip.generateAsync({ type: "nodebuffer" }),
+      "深度企业知识库-v3.zip",
+      "deep-v3-snapshot-test",
+      {
+        validationProfile: "dashboard-enterprise-v1",
+        archiveContractVersions: [2, 3],
+      },
+    );
+    storedKeys.push(...result.storedAssetKeys);
+    expect(
+      result.documents.filter((document) => document.customerVisible),
+    ).toHaveLength(41);
+  });
+
   it("rejects a v2 document that understates its packaged evidence", async () => {
     const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
     const manifestEntry = zip.file(
@@ -1500,11 +1522,11 @@ ${narrative}
   });
 
   it.each([
-    { leafCount: 39, overviewCount: 7 },
+    { leafCount: 7, overviewCount: 7 },
     { leafCount: 57, overviewCount: 7 },
-    { leafCount: 40, overviewCount: 6 },
+    { leafCount: 8, overviewCount: 6 },
   ])(
-    "rejects website v2 cardinality outside 7 overviews plus 40–56 leaves: %o",
+    "rejects website v2 cardinality outside 7 overviews plus 8–56 leaves: %o",
     async ({ leafCount, overviewCount }) => {
       await expect(
         readKnowledgeArchive(
@@ -1516,7 +1538,7 @@ ${narrative}
             archiveContractVersion: 2,
           },
         ),
-      ).rejects.toThrow("7 篇分支综述和 40–56 个知识叶子");
+      ).rejects.toThrow("7 篇分支综述和 8–56 个知识叶子");
     },
   );
 

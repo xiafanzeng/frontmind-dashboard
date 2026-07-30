@@ -83,6 +83,7 @@ describe("service portal migration chain", () => {
       "0035_nervous_sauron",
       "0036_account-market-edition",
       "0037_remove-knowledge-plan",
+      "0038_fine_loners",
     ]);
   });
 

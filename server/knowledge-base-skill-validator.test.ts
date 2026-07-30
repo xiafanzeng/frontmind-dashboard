@@ -198,7 +198,7 @@ ${narrative}
     evaluatedAt: "2026-07-29T00:00:00.000Z",
   });
   files[`${root}/00_package_manifest.json`] = JSON.stringify({
-    schemaVersion: 2,
+    schemaVersion: 3,
     profile: "dashboard-enterprise-v1",
     documents,
     assets: [],

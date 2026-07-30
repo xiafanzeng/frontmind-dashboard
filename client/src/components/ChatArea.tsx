@@ -7,6 +7,7 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import {
   parseOutputMessages,
+  sanitizeKnowledgeBaseOutputMessages,
   useConversation,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
@@ -61,8 +62,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { reconcileKnowledgeBaseProgress } from "@/lib/knowledge-progress";
-import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
+import type {
+  KnowledgeBaseInteractionDto,
+  KnowledgeBaseProgressDto,
+} from "@shared/knowledge-base-progress";
 import { trpc } from "@/lib/trpc";
+
+export const KNOWLEDGE_BASE_FOUNDATION_COPY =
+  "企业知识库是品牌事实与产品信息的统一底稿，也是构建 AI 专用友好官网、生成内容与准确回答客户问题的基础。";
 
 const EMPTY_STATE_IMG =
   "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
@@ -86,6 +93,7 @@ interface OneClickTaskStartResponse {
   visibleMessage?: string;
   startedAt?: number;
   progress?: KnowledgeBaseProgressDto;
+  interaction?: KnowledgeBaseInteractionDto;
   task: {
     id: string;
     status: ReportTaskStatus;
@@ -330,11 +338,11 @@ export default function ChatArea({
       ) => {
         if (!output || output.length === 0) return;
         try {
-          const assistantMessages = parseOutputMessages(
-            output,
-            responseStartedAt,
-            modelName,
-          );
+          const assistantMessages = (
+            reconcileKnowledgeBase
+              ? sanitizeKnowledgeBaseOutputMessages
+              : (messages: LocalMessage[]) => messages
+          )(parseOutputMessages(output, responseStartedAt, modelName));
           if (elapsedSeconds != null && assistantMessages.length > 0) {
             assistantMessages[assistantMessages.length - 1].elapsedTime =
               elapsedSeconds;
@@ -359,26 +367,100 @@ export default function ChatArea({
           const normalizedStatus = normalizeReportStatus(updated.status);
           const totalOutputLength = updated.output?.length || 0;
 
+          applyOutput(updated.output);
+          if (reconcileKnowledgeBase) {
+            try {
+              const interaction = await reconcileKnowledgeBaseProgress({
+                conversationId,
+                taskId: updated.id,
+              });
+              if (interaction.interactionState === "awaiting_input") {
+                completionHandled = true;
+                const completedAt = Date.now();
+                applyOutput(
+                  updated.output,
+                  (completedAt - responseStartedAt) / 1000,
+                );
+                updateStatus(conversationId, "awaiting_input", {
+                  taskId: updated.id,
+                  taskUrl: updated.metadata?.task_url,
+                  previousResponseId: updated.id,
+                  lastKnownOutputLength: totalOutputLength,
+                });
+                toast.info("知识树研究阶段已完成", {
+                  description:
+                    "首个知识节点已就绪，请确认、修改或补充当前内容。",
+                });
+                creditEventBus.emit();
+                return;
+              }
+              if (
+                interaction.interactionState === "ready_to_publish" ||
+                interaction.interactionState === "published"
+              ) {
+                completionHandled = true;
+                updateStatus(conversationId, "completed", {
+                  taskId: updated.id,
+                  taskUrl: updated.metadata?.task_url,
+                  previousResponseId: updated.id,
+                  completedAt: Date.now(),
+                  lastKnownOutputLength: totalOutputLength,
+                });
+                toast.info("知识库内容已完成", {
+                  description:
+                    interaction.interactionState === "ready_to_publish"
+                      ? "最终成品已通过校验，可执行唯一一次直接更新。"
+                      : "知识库已发布；后续修改请提交维护工单。",
+                });
+                creditEventBus.emit();
+                return;
+              }
+              if (interaction.interactionState === "failed") {
+                completionHandled = true;
+                updateStatus(conversationId, "error", {
+                  taskId: updated.id,
+                  completedAt: Date.now(),
+                  lastKnownOutputLength: totalOutputLength,
+                });
+                toast.error(interaction.lockReason || "知识树状态未通过校验");
+                return;
+              }
+              if (normalizedStatus === "completed") {
+                completionHandled = true;
+                updateStatus(conversationId, "error", {
+                  taskId: updated.id,
+                  completedAt: Date.now(),
+                  lastKnownOutputLength: totalOutputLength,
+                });
+                toast.error("任务已结束，但未返回完整的知识节点状态");
+                return;
+              }
+            } catch (error) {
+              if (normalizedStatus === "completed") {
+                completionHandled = true;
+                updateStatus(conversationId, "error", {
+                  taskId: updated.id,
+                  completedAt: Date.now(),
+                  lastKnownOutputLength: totalOutputLength,
+                });
+                toast.error("知识树状态未通过校验", {
+                  description:
+                    error instanceof Error
+                      ? error.message
+                      : "请重新同步任务状态。",
+                });
+                return;
+              }
+              // A running response can still be partially streamed. Keep
+              // polling until a complete protocol envelope is available.
+            }
+          }
+
           if (normalizedStatus === "completed") {
             completionHandled = true;
             const completedAt = Date.now();
             const elapsedSeconds = (completedAt - responseStartedAt) / 1000;
             applyOutput(updated.output, elapsedSeconds);
-            if (reconcileKnowledgeBase && updated.output?.length) {
-              try {
-                await reconcileKnowledgeBaseProgress({
-                  conversationId,
-                  taskId: updated.id,
-                });
-              } catch (error) {
-                toast.warning("知识树状态尚未完成校验", {
-                  description:
-                    error instanceof Error
-                      ? error.message
-                      : "请重新生成完整节点清单。",
-                });
-              }
-            }
             updateStatus(conversationId, "completed", {
               taskId: updated.id,
               taskUrl: updated.metadata?.task_url,
@@ -423,7 +505,6 @@ export default function ChatArea({
             return;
           }
 
-          applyOutput(updated.output);
           updateStatus(conversationId, normalizedStatus, {
             taskId: updated.id,
             taskUrl: updated.metadata?.task_url,
@@ -522,6 +603,19 @@ export default function ChatArea({
         updateTitle(conversationId, "企业知识库构建");
 
         const normalizedStatus = normalizeReportStatus(data.task.status);
+        const initialStatus =
+          data.interaction?.interactionState === "awaiting_input"
+            ? "awaiting_input"
+            : data.interaction?.interactionState === "ready_to_publish" ||
+                data.interaction?.interactionState === "published"
+              ? "completed"
+              : data.interaction?.interactionState === "failed"
+                ? "error"
+                : data.interaction?.interactionState === "queued"
+                  ? "pending"
+                  : normalizedStatus === "completed"
+                    ? "error"
+                    : normalizedStatus;
         const taskStartedAt = data.startedAt || responseStartedAt;
         const totalOutputLength = data.task.output?.length || 0;
         if (data.progress) {
@@ -532,7 +626,7 @@ export default function ChatArea({
           );
         }
 
-        updateStatus(conversationId, normalizedStatus, {
+        updateStatus(conversationId, initialStatus, {
           taskId: data.task.id,
           taskUrl: data.task.taskUrl,
           previousResponseId: data.task.id,
@@ -541,10 +635,12 @@ export default function ChatArea({
         });
 
         if (data.task.output && data.task.output.length > 0) {
-          const assistantMessages = parseOutputMessages(
-            data.task.output,
-            taskStartedAt,
-            selectedAgentProfile,
+          const assistantMessages = sanitizeKnowledgeBaseOutputMessages(
+            parseOutputMessages(
+              data.task.output,
+              taskStartedAt,
+              selectedAgentProfile,
+            ),
           );
           if (assistantMessages.length > 0) {
             updateAssistantMessages(conversationId, assistantMessages);
@@ -557,7 +653,7 @@ export default function ChatArea({
           duration: 3200,
         });
 
-        if (normalizedStatus === "running" || normalizedStatus === "pending") {
+        if (initialStatus === "running" || initialStatus === "pending") {
           pollReportTask(
             conversationId,
             data.task.id,
@@ -566,14 +662,21 @@ export default function ChatArea({
             "企业知识库构建完成",
             true,
           );
-        } else if (normalizedStatus === "completed") {
+        } else if (initialStatus === "awaiting_input") {
+          toast.info("知识树研究阶段已完成", {
+            description: "首个知识节点已就绪，请确认、修改或补充当前内容。",
+          });
+          creditEventBus.emit();
+        } else if (initialStatus === "completed") {
           const completedAt = Date.now();
           const elapsedSec = (completedAt - taskStartedAt) / 1000;
           if (data.task.output && data.task.output.length > 0) {
-            const finalMessages = parseOutputMessages(
-              data.task.output,
-              taskStartedAt,
-              selectedAgentProfile,
+            const finalMessages = sanitizeKnowledgeBaseOutputMessages(
+              parseOutputMessages(
+                data.task.output,
+                taskStartedAt,
+                selectedAgentProfile,
+              ),
             );
             if (finalMessages.length > 0) {
               finalMessages[finalMessages.length - 1].elapsedTime = elapsedSec;
@@ -987,6 +1090,9 @@ function EmptyConversationHint({
           </h3>
           <p className="text-sm text-muted-foreground leading-relaxed max-w-lg mx-auto">
             以研究、分析与交付为核心的专业内容生产引擎
+          </p>
+          <p className="mx-auto mt-3 max-w-xl text-sm leading-6 text-foreground/70">
+            {KNOWLEDGE_BASE_FOUNDATION_COPY}
           </p>
           <div className="flex flex-wrap justify-center gap-3 pt-6">
             <Button
@@ -2227,10 +2333,10 @@ function MessageBubble({
                     type="button"
                     onClick={handleCopyMessage}
                     className={cn(
-                      "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium transition-all duration-200 ml-1",
+                      "ml-1 inline-flex items-center gap-1 rounded-md bg-transparent px-2 py-0.5 text-xs font-medium transition-all duration-200 hover:bg-transparent active:scale-95",
                       copied
-                        ? "bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400"
-                        : "bg-muted/60 text-muted-foreground hover:bg-primary/10 hover:text-primary active:scale-95",
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : "text-muted-foreground hover:text-primary",
                     )}
                     title="复制内容"
                   >
@@ -2305,6 +2411,11 @@ function StatusBadge({ status }: { status: string }) {
       icon: <Loader2 className="w-3 h-3 animate-spin" />,
       label: "排队中",
       className: "bg-blue-50 text-blue-600 border-blue-200/60",
+    },
+    awaiting_input: {
+      icon: <Clock className="w-3 h-3" />,
+      label: "等待回复",
+      className: "bg-violet-50 text-violet-700 border-violet-200/60",
     },
     completed: {
       icon: <CheckCircle2 className="w-3 h-3" />,

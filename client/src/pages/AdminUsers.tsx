@@ -826,9 +826,9 @@ export function CreateUserDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="w-[min(calc(100vw-1rem),480px)]">
+      <DialogContent className="flex max-h-[calc(100dvh-1rem)] w-[min(calc(100vw-1rem),720px)] flex-col overflow-hidden p-0 sm:max-h-[calc(100dvh-2rem)]">
         <>
-          <DialogHeader>
+          <DialogHeader className="shrink-0 border-b border-border/60 px-6 pb-4 pt-6">
             <DialogTitle className="flex items-center gap-2 pr-8">
               <Plus className="h-5 w-5 text-primary" />
               {userOnly ? "创建客户账号" : "创建账号"}
@@ -841,220 +841,226 @@ export function CreateUserDialog({
                   : "普通用户和管理员均由系统管理员设置初始密码；普通用户还需配置套餐、主负责人和有效 API Key。"}
             </DialogDescription>
           </DialogHeader>
-          <form className="mt-2 space-y-4" onSubmit={handleSubmit}>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label htmlFor="create-username">用户名</Label>
-                <Input
-                  id="create-username"
-                  value={username}
-                  onChange={(event) => setUsername(event.target.value)}
-                  autoComplete="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                  placeholder="例如 zhangsan"
-                  disabled={createMutation.isPending}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="create-display-name">显示名称（可选）</Label>
-                <Input
-                  id="create-display-name"
-                  value={displayName}
-                  onChange={(event) => setDisplayName(event.target.value)}
-                  placeholder="例如 张三"
-                  disabled={createMutation.isPending}
-                />
-              </div>
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label htmlFor="create-password">初始密码</Label>
-                <Input
-                  id="create-password"
-                  type="password"
-                  autoComplete="new-password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  minLength={MIN_PASSWORD_LENGTH}
-                  maxLength={MAX_PASSWORD_LENGTH}
-                  placeholder={`至少 ${MIN_PASSWORD_LENGTH} 个字符`}
-                  disabled={createMutation.isPending}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="create-confirm-password">确认初始密码</Label>
-                <Input
-                  id="create-confirm-password"
-                  type="password"
-                  autoComplete="new-password"
-                  value={confirmPassword}
-                  onChange={(event) => setConfirmPassword(event.target.value)}
-                  minLength={MIN_PASSWORD_LENGTH}
-                  maxLength={MAX_PASSWORD_LENGTH}
-                  placeholder="再次输入初始密码"
-                  disabled={createMutation.isPending}
-                />
-              </div>
-            </div>
-            {role === "user" && (
-              <div className="space-y-2">
-                <Label htmlFor="create-api-key">客户 API Key</Label>
-                <Input
-                  id="create-api-key"
-                  type="password"
-                  autoComplete="off"
-                  value={apiKey}
-                  onChange={(event) => setApiKey(event.target.value)}
-                  placeholder="创建前会验证 Key，可与其他客户使用相同原始 Key"
-                  disabled={createMutation.isPending}
-                />
-                <p className="text-xs leading-5 text-muted-foreground">
-                  Key 将按客户账号独立加密和版本化。以后替换该客户的 Key
-                  不会影响其他账号。
-                </p>
-              </div>
-            )}
-            {!userOnly && (
-              <div className="space-y-2">
-                <Label>账号角色</Label>
-                <Select
-                  value={role}
-                  onValueChange={(value) => {
-                    setRole(value as "user" | "admin");
-                    setPlanCode("");
-                  }}
-                  disabled={createMutation.isPending}
-                >
-                  <SelectTrigger className="w-full" aria-label="账号角色">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="user">用户</SelectItem>
-                    <SelectItem value="admin">管理员</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
-            {role === "user" && (
-              <>
+          <form
+            className="flex min-h-0 flex-1 flex-col"
+            onSubmit={handleSubmit}
+          >
+            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-5">
+              <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
-                  <Label>客户套餐</Label>
-                  <Select
-                    value={planCode}
-                    onValueChange={(value) =>
-                      setPlanCode(value as ProvisionableServicePlanCode)
-                    }
+                  <Label htmlFor="create-username">用户名</Label>
+                  <Input
+                    id="create-username"
+                    value={username}
+                    onChange={(event) => setUsername(event.target.value)}
+                    autoComplete="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    placeholder="例如 zhangsan"
                     disabled={createMutation.isPending}
-                  >
-                    <SelectTrigger className="w-full" aria-label="客户套餐">
-                      <SelectValue placeholder="请选择客户套餐" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="basic">普通版</SelectItem>
-                      <SelectItem value="advanced">进阶版</SelectItem>
-                      <SelectItem value="luxury">豪华版</SelectItem>
-                    </SelectContent>
-                  </Select>
+                  />
                 </div>
                 <div className="space-y-2">
-                  <Label>客户版本</Label>
-                  <Select
-                    value={marketEdition}
-                    onValueChange={(value) =>
-                      setMarketEdition(value as AccountMarketEdition)
-                    }
+                  <Label htmlFor="create-display-name">显示名称（可选）</Label>
+                  <Input
+                    id="create-display-name"
+                    value={displayName}
+                    onChange={(event) => setDisplayName(event.target.value)}
+                    placeholder="例如 张三"
                     disabled={createMutation.isPending}
-                  >
-                    <SelectTrigger className="w-full" aria-label="客户版本">
-                      <SelectValue placeholder="请选择海内版或海外版" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="domestic">海内版</SelectItem>
-                      <SelectItem value="overseas">海外版</SelectItem>
-                    </SelectContent>
-                  </Select>
+                  />
+                </div>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="create-password">初始密码</Label>
+                  <Input
+                    id="create-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    minLength={MIN_PASSWORD_LENGTH}
+                    maxLength={MAX_PASSWORD_LENGTH}
+                    placeholder={`至少 ${MIN_PASSWORD_LENGTH} 个字符`}
+                    disabled={createMutation.isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="create-confirm-password">确认初始密码</Label>
+                  <Input
+                    id="create-confirm-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={confirmPassword}
+                    onChange={(event) => setConfirmPassword(event.target.value)}
+                    minLength={MIN_PASSWORD_LENGTH}
+                    maxLength={MAX_PASSWORD_LENGTH}
+                    placeholder="再次输入初始密码"
+                    disabled={createMutation.isPending}
+                  />
+                </div>
+              </div>
+              {role === "user" && (
+                <div className="space-y-2">
+                  <Label htmlFor="create-api-key">客户 API Key</Label>
+                  <Input
+                    id="create-api-key"
+                    type="password"
+                    autoComplete="off"
+                    value={apiKey}
+                    onChange={(event) => setApiKey(event.target.value)}
+                    placeholder="创建前会验证 Key，可与其他客户使用相同原始 Key"
+                    disabled={createMutation.isPending}
+                  />
                   <p className="text-xs leading-5 text-muted-foreground">
-                    海外版使用独立的内容资产媒体渠道；其他功能暂与海内版保持一致。
+                    Key 将按客户账号独立加密和版本化。以后替换该客户的 Key
+                    不会影响其他账号。
                   </p>
                 </div>
-                {fixedDeliveryAdmin ? (
+              )}
+              {!userOnly && (
+                <div className="space-y-2">
+                  <Label>账号角色</Label>
+                  <Select
+                    value={role}
+                    onValueChange={(value) => {
+                      setRole(value as "user" | "admin");
+                      setPlanCode("");
+                    }}
+                    disabled={createMutation.isPending}
+                  >
+                    <SelectTrigger className="w-full" aria-label="账号角色">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="user">用户</SelectItem>
+                      <SelectItem value="admin">管理员</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+              {role === "user" && (
+                <>
                   <div className="space-y-2">
-                    <Label>客户主负责人</Label>
-                    <div className="rounded-md border border-border bg-muted/35 px-3 py-2 text-sm">
-                      {fixedDeliveryAdmin.displayName ||
-                        fixedDeliveryAdmin.username}{" "}
-                      · @{fixedDeliveryAdmin.username}
-                    </div>
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      交付管理员创建的客户自动归属当前账号，不能分配给其他管理员。
-                    </p>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <Label>客户主负责人</Label>
+                    <Label>客户套餐</Label>
                     <Select
-                      value={deliveryAdminId}
-                      onValueChange={setDeliveryAdminId}
-                      disabled={
-                        createMutation.isPending || deliveryAdmins.length === 0
+                      value={planCode}
+                      onValueChange={(value) =>
+                        setPlanCode(value as ProvisionableServicePlanCode)
                       }
+                      disabled={createMutation.isPending}
                     >
-                      <SelectTrigger
-                        className="w-full"
-                        aria-label="客户主负责人"
-                      >
-                        <SelectValue
-                          placeholder={
-                            deliveryAdmins.length
-                              ? "请选择主负责人"
-                              : "暂无可用管理员"
-                          }
-                        />
+                      <SelectTrigger className="w-full" aria-label="客户套餐">
+                        <SelectValue placeholder="请选择客户套餐" />
                       </SelectTrigger>
                       <SelectContent>
-                        {deliveryAdmins.map((admin) => (
-                          <SelectItem key={admin.id} value={String(admin.id)}>
-                            {admin.displayName || admin.username} · @
-                            {admin.username}
-                          </SelectItem>
-                        ))}
+                        <SelectItem value="basic">普通版</SelectItem>
+                        <SelectItem value="advanced">进阶版</SelectItem>
+                        <SelectItem value="luxury">豪华版</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>客户版本</Label>
+                    <Select
+                      value={marketEdition}
+                      onValueChange={(value) =>
+                        setMarketEdition(value as AccountMarketEdition)
+                      }
+                      disabled={createMutation.isPending}
+                    >
+                      <SelectTrigger className="w-full" aria-label="客户版本">
+                        <SelectValue placeholder="请选择海内版或海外版" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="domestic">海内版</SelectItem>
+                        <SelectItem value="overseas">海外版</SelectItem>
                       </SelectContent>
                     </Select>
                     <p className="text-xs leading-5 text-muted-foreground">
-                      系统管理员或交付管理员均可成为客户主负责人，并承担该客户的任务用量归属。
+                      海外版使用独立的内容资产媒体渠道；其他功能暂与海内版保持一致。
                     </p>
                   </div>
-                )}
-              </>
-            )}
-            {role === "admin" && (
-              <div className="space-y-2">
-                <Label>管理员权限</Label>
-                <Select
-                  value={adminAccessLevel}
-                  onValueChange={(value) =>
-                    setAdminAccessLevel(
-                      value as "system_admin" | "delivery_admin",
-                    )
-                  }
-                  disabled={createMutation.isPending}
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="delivery_admin">交付管理员</SelectItem>
-                    <SelectItem value="system_admin">系统管理员</SelectItem>
-                  </SelectContent>
-                </Select>
-                <p className="text-xs leading-5 text-muted-foreground">
-                  交付管理员仅管理被分配客户；系统管理员可调整合同权益、
-                  管理账号及官网全局凭据。
-                </p>
-              </div>
-            )}
-            <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
+                  {fixedDeliveryAdmin ? (
+                    <div className="space-y-2">
+                      <Label>客户主负责人</Label>
+                      <div className="rounded-md border border-border bg-muted/35 px-3 py-2 text-sm">
+                        {fixedDeliveryAdmin.displayName ||
+                          fixedDeliveryAdmin.username}{" "}
+                        · @{fixedDeliveryAdmin.username}
+                      </div>
+                      <p className="text-xs leading-5 text-muted-foreground">
+                        交付管理员创建的客户自动归属当前账号，不能分配给其他管理员。
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <Label>客户主负责人</Label>
+                      <Select
+                        value={deliveryAdminId}
+                        onValueChange={setDeliveryAdminId}
+                        disabled={
+                          createMutation.isPending ||
+                          deliveryAdmins.length === 0
+                        }
+                      >
+                        <SelectTrigger
+                          className="w-full"
+                          aria-label="客户主负责人"
+                        >
+                          <SelectValue
+                            placeholder={
+                              deliveryAdmins.length
+                                ? "请选择主负责人"
+                                : "暂无可用管理员"
+                            }
+                          />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {deliveryAdmins.map((admin) => (
+                            <SelectItem key={admin.id} value={String(admin.id)}>
+                              {admin.displayName || admin.username} · @
+                              {admin.username}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs leading-5 text-muted-foreground">
+                        系统管理员或交付管理员均可成为客户主负责人，并承担该客户的任务用量归属。
+                      </p>
+                    </div>
+                  )}
+                </>
+              )}
+              {role === "admin" && (
+                <div className="space-y-2">
+                  <Label>管理员权限</Label>
+                  <Select
+                    value={adminAccessLevel}
+                    onValueChange={(value) =>
+                      setAdminAccessLevel(
+                        value as "system_admin" | "delivery_admin",
+                      )
+                    }
+                    disabled={createMutation.isPending}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="delivery_admin">交付管理员</SelectItem>
+                      <SelectItem value="system_admin">系统管理员</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    交付管理员仅管理被分配客户；系统管理员可调整合同权益、
+                    管理账号及官网全局凭据。
+                  </p>
+                </div>
+              )}
+            </div>
+            <div className="flex shrink-0 flex-col-reverse gap-2 border-t border-border/60 px-6 py-4 sm:flex-row sm:justify-end">
               <Button
                 type="button"
                 variant="outline"

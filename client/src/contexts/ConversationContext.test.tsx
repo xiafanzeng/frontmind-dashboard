@@ -5,6 +5,8 @@ import {
   ConversationProvider,
   parseOutputMessages,
   prepareConversationForCloud,
+  sanitizeKnowledgeBaseCustomerMarkdown,
+  sanitizeKnowledgeBaseOutputMessages,
   useConversation,
   type Conversation,
 } from "./ConversationContext";
@@ -197,6 +199,53 @@ describe("parseOutputMessages file IDs", () => {
       {
         src: "/api/frontmind/v1/files/image%2F%E5%9B%BE%201",
         alt: "chart.png",
+      },
+    ]);
+  });
+});
+
+describe("knowledge-base image delivery boundary", () => {
+  const blockedHotlink =
+    "https://omo-oss-image.thefastimg.com/portal-saas/example/cms/image/example.jpg";
+
+  it("removes remote hotlinks from customer markdown while retaining the caption", () => {
+    expect(
+      sanitizeKnowledgeBaseCustomerMarkdown(
+        `产品如下：\n\n![产品界面](${blockedHotlink})\n\n原图：${blockedHotlink}`,
+      ),
+    ).toBe("产品如下：\n\n配图：产品界面\n\n原图：");
+  });
+
+  it("keeps only controlled image sources in knowledge-base messages", () => {
+    const [message] = sanitizeKnowledgeBaseOutputMessages([
+      {
+        id: "knowledge-images",
+        role: "assistant",
+        content: `![官网热链](${blockedHotlink})`,
+        timestamp: 1,
+        inlineImages: [
+          { src: blockedHotlink, alt: "hotlink" },
+          {
+            src: "/api/frontmind/v1/files/image-id",
+            alt: "managed output",
+          },
+          {
+            src: "/api/dashboard/knowledge/assets/snapshot/logo.webp",
+            alt: "packaged asset",
+          },
+        ],
+      },
+    ]);
+
+    expect(message.content).toBe("配图：官网热链");
+    expect(message.inlineImages).toEqual([
+      {
+        src: "/api/frontmind/v1/files/image-id",
+        alt: "managed output",
+      },
+      {
+        src: "/api/dashboard/knowledge/assets/snapshot/logo.webp",
+        alt: "packaged asset",
       },
     ]);
   });

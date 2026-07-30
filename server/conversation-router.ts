@@ -65,6 +65,7 @@ export const conversationSnapshotSchema = z.object({
     "idle",
     "running",
     "pending",
+    "awaiting_input",
     "completed",
     "error",
     "failed",

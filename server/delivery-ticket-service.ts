@@ -11,6 +11,7 @@ import {
   like,
   lt,
   max,
+  ne,
   or,
 } from "drizzle-orm";
 
@@ -20,6 +21,7 @@ import {
   deliveryTickets,
   icpSensitiveMaterials,
   knowledgeBaseBuilds,
+  knowledgeBaseSnapshots,
   serviceContracts,
   serviceQuotaPeriods,
   upstreamResources,
@@ -218,6 +220,16 @@ export async function assertWebsiteTicketWorkflow(
     return { profile: null, domain: null };
   }
   const category = value.category?.trim() ?? "";
+  if (category === "knowledge_base_maintenance") {
+    if (protectedAttachments.length) {
+      throw new DeliveryTicketError(
+        "KNOWLEDGE_MAINTENANCE_ATTACHMENT_INVALID",
+        "知识库维护工单不能附带 ICP 敏感材料。",
+        400,
+      );
+    }
+    return { profile: null, domain: null };
+  }
   const profiles = await executor
     .select()
     .from(workspaceSiteProfiles)
@@ -339,6 +351,7 @@ export function technicalTicketDedupeKey(input: {
 export function assertDeliveryTicketServiceEligibility(
   portal: Awaited<ReturnType<typeof getServicePortal>>,
   ticketType?: DeliveryTicketType,
+  category?: string | null,
 ) {
   if (portal.service.status !== "active") {
     throw new DeliveryTicketError(
@@ -351,6 +364,7 @@ export function assertDeliveryTicketServiceEligibility(
     );
   }
   const planAllowsTicket =
+    category === "knowledge_base_maintenance" ||
     portal.service.planCode === "advanced" ||
     portal.service.planCode === "luxury" ||
     (portal.service.planCode === "basic" &&
@@ -683,6 +697,7 @@ function ticketDto(
     icpProvince: row.icpProvince,
     icpDeclarations: row.icpDeclarations,
     targetPage: row.targetPage,
+    knowledgeSnapshotId: row.knowledgeSnapshotId,
     materialUrls: row.materialUrls,
     status: row.status,
     statusLabel: DELIVERY_TICKET_STATUS_LABELS[row.status],
@@ -754,6 +769,7 @@ function publicDeliveryCategoryLabel(ticket: InternalDeliveryTicketDto) {
   }
   if (category === "domain_application") return "域名申请";
   if (category === "icp_filing") return "域名申请与 ICP 备案材料";
+  if (category === "knowledge_base_maintenance") return "知识库维护";
   return (
     WEBSITE_CONTENT_CATALOG.find((item) => item.value === category)?.label ??
     category
@@ -782,6 +798,7 @@ export function toPublicDeliveryTicketSummary(
     publicStatusLabel: DELIVERY_TICKET_PUBLIC_STATUS_LABELS[publicStatus],
     publicSummary:
       publicStatus === "completed" ? nonEmpty(ticket.publicSummary) : null,
+    knowledgeSnapshotId: ticket.knowledgeSnapshotId,
   };
   return publicDeliveryTicketSummarySchema.parse(
     ticket.type === "content_asset"
@@ -1407,6 +1424,7 @@ export async function createDeliveryTicket(input: {
   const scope = assertDeliveryTicketServiceEligibility(
     portal,
     input.value.type,
+    input.value.category,
   );
   return db.transaction(async (tx) =>
     withSerializedTicketCreation({
@@ -1481,6 +1499,27 @@ export async function createDeliveryTicket(input: {
           input.userId,
           input.value,
         );
+        if (input.value.category === "knowledge_base_maintenance") {
+          const snapshots = await tx
+            .select({ id: knowledgeBaseSnapshots.id })
+            .from(knowledgeBaseSnapshots)
+            .where(
+              and(
+                eq(knowledgeBaseSnapshots.id, input.value.knowledgeSnapshotId!),
+                eq(knowledgeBaseSnapshots.userId, input.userId),
+                eq(knowledgeBaseSnapshots.status, "active"),
+              ),
+            )
+            .limit(1)
+            .for("update");
+          if (!snapshots[0]) {
+            throw new DeliveryTicketError(
+              "KNOWLEDGE_SNAPSHOT_NOT_CURRENT",
+              "关联知识库已变化，请刷新后重新提交维护工单。",
+              409,
+            );
+          }
+        }
         await verifyOwnedAttachments(
           tx,
           input.userId,
@@ -1539,7 +1578,10 @@ export async function createDeliveryTicket(input: {
           quotaPool === null
             ? technicalTicketDedupeKey({
                 category: input.value.category,
-                targetPage: input.value.targetPage,
+                targetPage:
+                  input.value.category === "knowledge_base_maintenance"
+                    ? `snapshot:${input.value.knowledgeSnapshotId}`
+                    : input.value.targetPage,
               })
             : null;
         if (technicalDedupe) {
@@ -1582,6 +1624,7 @@ export async function createDeliveryTicket(input: {
           icpProvince: nonEmpty(input.value.icpProvince),
           icpDeclarations: input.value.icpDeclarations ?? null,
           targetPage: nonEmpty(input.value.targetPage),
+          knowledgeSnapshotId: input.value.knowledgeSnapshotId ?? null,
           technicalDedupeKey: technicalDedupe,
           materialUrls: input.value.materialUrls,
           status: "submitted",
@@ -1690,6 +1733,43 @@ export async function createDeliveryTicket(input: {
       },
     }),
   );
+}
+
+export async function assertKnowledgeMaintenanceTicketForUpload(input: {
+  userId: number;
+  ticketId: string;
+}) {
+  const db = await requireDb();
+  const rows = await db
+    .select()
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.id, input.ticketId),
+        eq(deliveryTickets.userId, input.userId),
+      ),
+    )
+    .limit(1);
+  const ticket = rows[0];
+  if (
+    !ticket ||
+    ticket.type !== "website_operation" ||
+    ticket.category !== "knowledge_base_maintenance"
+  ) {
+    throw new DeliveryTicketError(
+      "KNOWLEDGE_MAINTENANCE_TICKET_INVALID",
+      "该工单不是当前客户的知识库维护工单。",
+      400,
+    );
+  }
+  if (TERMINAL_STATUSES.has(ticket.status)) {
+    throw new DeliveryTicketError(
+      "TICKET_CLOSED",
+      "已结束的维护工单不能再上传知识库。",
+      409,
+    );
+  }
+  return ticket;
 }
 
 async function requireOwnedTicket(
@@ -2334,6 +2414,33 @@ export async function updateManagedDeliveryTicket(input: {
         ticket,
         userId: input.userId,
       });
+    }
+    if (
+      ticket.type === "website_operation" &&
+      ticket.category === "knowledge_base_maintenance"
+    ) {
+      const replacementSnapshots = await tx
+        .select({ id: knowledgeBaseSnapshots.id })
+        .from(knowledgeBaseSnapshots)
+        .where(
+          and(
+            eq(knowledgeBaseSnapshots.userId, input.userId),
+            eq(knowledgeBaseSnapshots.status, "active"),
+            eq(knowledgeBaseSnapshots.maintenanceTicketId, ticket.id),
+            ticket.knowledgeSnapshotId
+              ? ne(knowledgeBaseSnapshots.id, ticket.knowledgeSnapshotId)
+              : undefined,
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!replacementSnapshots[0]) {
+        throw new DeliveryTicketError(
+          "KNOWLEDGE_MAINTENANCE_NOT_PUBLISHED",
+          "完成维护工单前，必须先上传并发布通过校验的新知识库版本。",
+          409,
+        );
+      }
     }
     const nextQuotaState = deriveTicketQuotaTransition({
       currentState: ticket.quotaState,

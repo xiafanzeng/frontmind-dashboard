@@ -1563,7 +1563,7 @@ export async function assertServiceCapability(
   ) {
     throw new ServiceEntitlementError(
       "KNOWLEDGE_SNAPSHOT_NOT_FOUND",
-      "请先在知识库智能体中逐项完成 40–115 个节点，并发布当前套餐使用的认证知识库。",
+      "请先在知识库智能体中逐项完成 8–115 个节点，并发布当前套餐使用的认证知识库。",
       409,
     );
   }

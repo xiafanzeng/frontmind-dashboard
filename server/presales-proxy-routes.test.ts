@@ -183,6 +183,47 @@ describe("presales deletion routes", () => {
     });
   });
 
+  it("uploads website attachments to the exact SigV4 URL without redirects", async () => {
+    const signedUrl =
+      "https://uploads.example.test/catalog.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Signature=abcdef0123456789";
+    vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      data: { id: "file-1", filename: "catalog.pdf", upload_url: signedUrl },
+    });
+    const put = vi.spyOn(axios, "put").mockResolvedValue({
+      status: 204,
+      data: "",
+    });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/files/file-1/content`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-original-content-type": "application/pdf",
+          "x-frontmind-service-token": token,
+        },
+        body: Buffer.from("pdf"),
+      });
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        ok: true,
+        status: "uploaded",
+      });
+    });
+
+    expect(put).toHaveBeenCalledWith(
+      signedUrl,
+      expect.anything(),
+      expect.objectContaining({
+        maxRedirects: 0,
+        headers: expect.objectContaining({
+          "Content-Type": "application/pdf",
+        }),
+      }),
+    );
+  });
+
   it("returns 204 when the upstream task is already absent", async () => {
     const deleteMock = vi
       .spyOn(axios, "delete")

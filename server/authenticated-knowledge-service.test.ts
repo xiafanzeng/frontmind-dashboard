@@ -68,7 +68,7 @@ describe("authenticated advanced knowledge publication", () => {
     ).toBe(false);
   });
 
-  it("rejects old-contract, short-tree and incomplete publications", () => {
+  it("rejects old-contract, below-minimum and incomplete publications", () => {
     expect(
       isAuthenticatedAdvancedKnowledgePublication(
         publication({
@@ -82,9 +82,9 @@ describe("authenticated advanced knowledge publication", () => {
       isAuthenticatedAdvancedKnowledgePublication(
         publication({
           build: {
-            totalNodeCount: 39,
-            confirmedCount: 29,
-            directPrefilledCount: 10,
+            totalNodeCount: 7,
+            confirmedCount: 5,
+            directPrefilledCount: 2,
           },
         }),
       ),

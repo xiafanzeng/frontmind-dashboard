@@ -23,6 +23,7 @@ import {
 import {
   useConversation,
   parseOutputMessages,
+  sanitizeKnowledgeBaseOutputMessages,
   type Attachment,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
@@ -360,11 +361,19 @@ export function useSendMessage() {
 
             if (newOutput.length > 0) {
               try {
-                const assistantMsgs = parseOutputMessages(
-                  newOutput,
-                  responseStartedAt,
-                  modelName,
-                );
+                const assistantMsgs = syncKnowledgeBaseSnapshot
+                  ? sanitizeKnowledgeBaseOutputMessages(
+                      parseOutputMessages(
+                        newOutput,
+                        responseStartedAt,
+                        modelName,
+                      ),
+                    )
+                  : parseOutputMessages(
+                      newOutput,
+                      responseStartedAt,
+                      modelName,
+                    );
                 if (assistantMsgs.length > 0) {
                   updateAssistantMessagesRef.current(convId, assistantMsgs);
                 }
@@ -388,12 +397,98 @@ export function useSendMessage() {
           const normalizedStatus =
             updated.status === "failed" ? "error" : updated.status;
 
+          if (syncKnowledgeBaseSnapshot) {
+            try {
+              const interaction = await reconcileKnowledgeBaseProgress({
+                conversationId: convId,
+                taskId: updated.id,
+              });
+              if (interaction.interactionState === "awaiting_input") {
+                completionHandled = true;
+                stopPolling();
+                updateStatusRef.current(convId, "awaiting_input", {
+                  taskId: updated.id,
+                  taskUrl: updated.metadata?.task_url,
+                  previousResponseId: updated.id,
+                  lastKnownOutputLength: updated.output?.length || 0,
+                });
+                toast.info("当前知识节点已就绪", {
+                  description: "请确认、修改或补充当前内容。",
+                });
+                creditEventBus.emit();
+                return;
+              }
+              if (
+                interaction.interactionState === "ready_to_publish" ||
+                interaction.interactionState === "published"
+              ) {
+                completionHandled = true;
+                stopPolling();
+                updateStatusRef.current(convId, "completed", {
+                  taskId: updated.id,
+                  completedAt: Date.now(),
+                  lastKnownOutputLength: updated.output?.length || 0,
+                });
+                toast.info("知识库内容已完成", {
+                  description:
+                    interaction.interactionState === "ready_to_publish"
+                      ? "最终成品已通过校验，可执行唯一一次直接更新。"
+                      : "知识库已发布；后续修改请提交维护工单。",
+                });
+                creditEventBus.emit();
+                return;
+              }
+              if (interaction.interactionState === "failed") {
+                completionHandled = true;
+                stopPolling();
+                updateStatusRef.current(convId, "error", {
+                  taskId: updated.id,
+                  completedAt: Date.now(),
+                  lastKnownOutputLength: updated.output?.length || 0,
+                });
+                toast.error(interaction.lockReason || "当前知识节点未通过校验");
+                return;
+              }
+              if (normalizedStatus === "completed") {
+                completionHandled = true;
+                stopPolling();
+                updateStatusRef.current(convId, "error", {
+                  taskId: updated.id,
+                  completedAt: Date.now(),
+                  lastKnownOutputLength: updated.output?.length || 0,
+                });
+                toast.error("任务已结束，但未返回完整的知识节点状态");
+                return;
+              }
+            } catch (error) {
+              if (normalizedStatus === "completed") {
+                completionHandled = true;
+                stopPolling();
+                updateStatusRef.current(convId, "error", {
+                  taskId: updated.id,
+                  completedAt: Date.now(),
+                });
+                toast.error("当前知识节点未通过校验", {
+                  description:
+                    error instanceof Error
+                      ? error.message
+                      : "请重新同步任务状态。",
+                });
+                return;
+              }
+            }
+          }
+
           updateStatusRef.current(convId, normalizedStatus as any, {
             taskId: updated.id,
             taskUrl: updated.metadata?.task_url,
           });
 
-          if (normalizedStatus === "completed" && !completionHandled) {
+          if (
+            !syncKnowledgeBaseSnapshot &&
+            normalizedStatus === "completed" &&
+            !completionHandled
+          ) {
             completionHandled = true;
             stopPolling();
             const completedAt = Date.now();
@@ -419,11 +514,19 @@ export function useSendMessage() {
 
               if (newOutput.length > 0) {
                 try {
-                  const finalMsgs = parseOutputMessages(
-                    newOutput,
-                    responseStartedAt,
-                    modelName,
-                  );
+                  const finalMsgs = syncKnowledgeBaseSnapshot
+                    ? sanitizeKnowledgeBaseOutputMessages(
+                        parseOutputMessages(
+                          newOutput,
+                          responseStartedAt,
+                          modelName,
+                        ),
+                      )
+                    : parseOutputMessages(
+                        newOutput,
+                        responseStartedAt,
+                        modelName,
+                      );
                   if (finalMsgs.length > 0) {
                     finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
                     updateAssistantMessagesRef.current(convId, finalMsgs);
@@ -809,7 +912,25 @@ export function useSendMessage() {
           setRetryCount(0);
           setIsRetrying(false);
 
-          updateStatus(convId, response.status as any, {
+          const knowledgeInteraction = response.knowledgeInteraction;
+          const effectiveStatus =
+            options?.syncKnowledgeBaseSnapshot && knowledgeInteraction
+              ? knowledgeInteraction.interactionState === "awaiting_input"
+                ? "awaiting_input"
+                : knowledgeInteraction.interactionState ===
+                      "ready_to_publish" ||
+                    knowledgeInteraction.interactionState === "published"
+                  ? "completed"
+                  : knowledgeInteraction.interactionState === "failed"
+                    ? "error"
+                    : knowledgeInteraction.interactionState === "queued"
+                      ? "pending"
+                      : response.status === "completed"
+                        ? "error"
+                        : "running"
+              : response.status;
+
+          updateStatus(convId, effectiveStatus as any, {
             taskId: response.id,
             taskUrl: response.metadata?.task_url,
             previousResponseId: response.id,
@@ -837,11 +958,19 @@ export function useSendMessage() {
 
             if (newOutput.length > 0) {
               try {
-                const assistantMsgs = parseOutputMessages(
-                  newOutput,
-                  responseStartedAt,
-                  agentProfile,
-                );
+                const assistantMsgs = options?.syncKnowledgeBaseSnapshot
+                  ? sanitizeKnowledgeBaseOutputMessages(
+                      parseOutputMessages(
+                        newOutput,
+                        responseStartedAt,
+                        agentProfile,
+                      ),
+                    )
+                  : parseOutputMessages(
+                      newOutput,
+                      responseStartedAt,
+                      agentProfile,
+                    );
                 if (assistantMsgs.length > 0) {
                   updateAssistantMessages(convId, assistantMsgs);
                 }
@@ -852,14 +981,14 @@ export function useSendMessage() {
                 );
               }
             }
-          } else if (isMultiTurn && response.status === "completed") {
+          } else if (isMultiTurn && effectiveStatus === "completed") {
             updateStatus(convId, "completed", {
               lastKnownOutputLength: baselineOutputLength,
             });
           }
 
           // Start sequential polling if task is running or pending
-          if (response.status === "running" || response.status === "pending") {
+          if (effectiveStatus === "running" || effectiveStatus === "pending") {
             startPolling(
               response.id,
               convId,
@@ -872,7 +1001,24 @@ export function useSendMessage() {
             );
           }
 
-          if (response.status === "completed") {
+          if (effectiveStatus === "awaiting_input") {
+            toast.info("当前知识节点已就绪", {
+              description: "请确认、修改或补充当前内容。",
+            });
+            creditEventBus.emit();
+          }
+
+          if (
+            effectiveStatus === "error" &&
+            options?.syncKnowledgeBaseSnapshot
+          ) {
+            toast.error(
+              knowledgeInteraction?.lockReason ||
+                "任务未返回完整的知识节点状态",
+            );
+          }
+
+          if (effectiveStatus === "completed") {
             const completedAt = Date.now();
             const elapsedSec = (completedAt - responseStartedAt) / 1000;
 
@@ -893,11 +1039,19 @@ export function useSendMessage() {
 
               if (newOutput.length > 0) {
                 try {
-                  const finalMsgs = parseOutputMessages(
-                    newOutput,
-                    responseStartedAt,
-                    agentProfile,
-                  );
+                  const finalMsgs = options?.syncKnowledgeBaseSnapshot
+                    ? sanitizeKnowledgeBaseOutputMessages(
+                        parseOutputMessages(
+                          newOutput,
+                          responseStartedAt,
+                          agentProfile,
+                        ),
+                      )
+                    : parseOutputMessages(
+                        newOutput,
+                        responseStartedAt,
+                        agentProfile,
+                      );
                   if (finalMsgs.length > 0) {
                     finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
                     updateAssistantMessages(convId, finalMsgs);

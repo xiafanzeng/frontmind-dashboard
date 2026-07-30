@@ -911,6 +911,24 @@ export async function getLatestKnowledgeSnapshot(userId: number) {
   return rows[0] ? publicSnapshot(rows[0]) : null;
 }
 
+export async function getKnowledgeSnapshotById(input: {
+  userId: number;
+  snapshotId: string;
+}) {
+  const db = await requireDb();
+  const rows = await db
+    .select()
+    .from(knowledgeBaseSnapshots)
+    .where(
+      and(
+        eq(knowledgeBaseSnapshots.id, input.snapshotId),
+        eq(knowledgeBaseSnapshots.userId, input.userId),
+      ),
+    )
+    .limit(1);
+  return rows[0] ? publicSnapshot(rows[0]) : null;
+}
+
 export async function getKnowledgeAsset(input: {
   snapshotId: string;
   assetIndex: number;
@@ -962,6 +980,7 @@ export async function createKnowledgeSnapshot(input: {
   sourceTaskId?: string;
   sourceArtifactHash?: string;
   archiveHash?: string;
+  maintenanceTicketId?: string;
   documents: KnowledgeDocumentRecord[];
   assets: KnowledgeAssetRecord[];
   totalBytes: number;
@@ -1051,6 +1070,7 @@ export async function createKnowledgeSnapshot(input: {
       sourceTaskId: input.sourceTaskId,
       sourceArtifactHash: input.sourceArtifactHash,
       archiveHash: input.archiveHash,
+      maintenanceTicketId: input.maintenanceTicketId,
       documents: input.documents,
       assets: input.assets,
       documentCount: input.documents.length,

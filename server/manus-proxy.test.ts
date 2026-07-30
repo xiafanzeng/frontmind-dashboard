@@ -8,7 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import manusProxy, {
   MAX_EXTERNAL_DOWNLOAD_BYTES,
   isPrivateUpstreamCollectionRequest,
+  isPublicFilePayloadRequest,
   isPublicTaskPayloadRequest,
+  publicUpstreamFilePayload,
   publicUpstreamPayload,
   publicUpstreamTaskPayload,
   readBoundedExternalDownload,
@@ -96,6 +98,69 @@ describe("publicUpstreamPayload", () => {
     expect(serialized.toLowerCase()).not.toContain("cookie");
     expect(serialized.toLowerCase()).not.toContain("token");
     expect(serialized.toLowerCase()).not.toContain("api_key");
+  });
+
+  it("preserves every SigV4 query parameter only for a scoped file payload", () => {
+    const signedUrl =
+      "https://uploads.example.test/object.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Date=20260730T010203Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abcdef0123456789";
+    const result = publicUpstreamFilePayload(
+      {
+        id: "file-safe",
+        filename: "Logo.png",
+        upload_url: signedUrl,
+        Authorization: "Bearer must-not-leak",
+      },
+      "current-api-key",
+    ) as Record<string, unknown>;
+
+    expect(result.upload_url).toBe(signedUrl);
+    expect(result).not.toHaveProperty("Authorization");
+    expect(isPublicFilePayloadRequest("POST", "/v1/files")).toBe(true);
+    expect(
+      isPublicFilePayloadRequest("GET", "/v1/files/file-safe"),
+    ).toBe(true);
+    expect(isPublicFilePayloadRequest("GET", "/v1/files")).toBe(false);
+  });
+});
+
+describe("proxy upload", () => {
+  it("forwards the complete signed URL and never exposes upstream XML errors", async () => {
+    const signedUrl =
+      "https://uploads.example.test/object.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Signature=abcdef0123456789";
+    const put = vi.spyOn(axios, "put").mockResolvedValue({
+      status: 400,
+      data: '<?xml version="1.0"?><Error><Code>AuthorizationQueryParametersError</Code></Error>',
+    });
+
+    await withManusProxyServer(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/proxy-upload?target=${encodeURIComponent(signedUrl)}`,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Original-Content-Type": "image/png",
+          },
+          body: new Uint8Array([1, 2, 3]),
+        },
+      );
+      const responseText = await response.text();
+
+      expect(response.status).toBe(400);
+      expect(responseText).toContain("上传地址无效或已失效");
+      expect(responseText).not.toContain(
+        "AuthorizationQueryParametersError",
+      );
+    });
+
+    expect(put).toHaveBeenCalledWith(
+      signedUrl,
+      expect.anything(),
+      expect.objectContaining({
+        maxRedirects: 0,
+        headers: expect.objectContaining({ "Content-Type": "image/png" }),
+      }),
+    );
   });
 });
 

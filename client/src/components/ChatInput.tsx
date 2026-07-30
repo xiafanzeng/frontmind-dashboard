@@ -89,6 +89,11 @@ export default function ChatInput({
     activeConversation?.status === "pending";
   const knowledgeBaseNotStarted =
     syncKnowledgeBaseSnapshot && !activeConversation?.taskId;
+  const knowledgeInteractionLocked =
+    syncKnowledgeBaseSnapshot &&
+    Boolean(activeConversation?.taskId) &&
+    activeConversation?.status !== "awaiting_input";
+  const inputLocked = isRunning || knowledgeInteractionLocked;
 
   const clearSelectedFiles = useCallback(() => {
     setFiles([]);
@@ -128,7 +133,7 @@ export default function ChatInput({
     if (
       (!text.trim() && files.length === 0) ||
       isSending ||
-      isRunning ||
+      inputLocked ||
       knowledgeBaseNotStarted
     )
       return;
@@ -159,7 +164,7 @@ export default function ChatInput({
     text,
     files,
     isSending,
-    isRunning,
+    inputLocked,
     knowledgeBaseNotStarted,
     sendMessage,
     selectedModel,
@@ -326,7 +331,7 @@ export default function ChatInput({
                     className="w-9 h-9 rounded-xl text-muted-foreground hover:text-foreground hover:bg-secondary"
                     onClick={() => fileInputRef.current?.click()}
                     disabled={
-                      isRunning || isUploading || knowledgeBaseNotStarted
+                      inputLocked || isUploading || knowledgeBaseNotStarted
                     }
                   >
                     <Paperclip className="w-4 h-4" />
@@ -345,13 +350,15 @@ export default function ChatInput({
               placeholder={
                 isUploading
                   ? `正在上传文件 ${uploadProgress!.overallPercent}%...`
-                  : isRunning
-                    ? "FrontMind 正在编排内容制作流程..."
+                  : inputLocked
+                    ? syncKnowledgeBaseSnapshot
+                      ? "当前知识库正在处理或已锁定"
+                      : "FrontMind 正在编排内容制作流程..."
                     : knowledgeBaseNotStarted
                       ? "请先点击上方“构建企业知识库”完成资料采集设置"
                       : "输入你的内容需求，按 Enter 开始编排..."
               }
-              disabled={isRunning || isUploading || knowledgeBaseNotStarted}
+              disabled={inputLocked || isUploading || knowledgeBaseNotStarted}
               rows={2}
               className="h-11 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground/55 focus:outline-none"
             />
@@ -438,7 +445,7 @@ export default function ChatInput({
                 disabled={
                   (!text.trim() && files.length === 0) ||
                   isSending ||
-                  isRunning ||
+                  inputLocked ||
                   isUploading ||
                   knowledgeBaseNotStarted
                 }

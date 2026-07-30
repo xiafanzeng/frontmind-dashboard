@@ -765,6 +765,8 @@ export type KnowledgeAsset = {
   documentIds?: string[];
   sourcePageUrl?: string;
   sourceAssetUrl?: string;
+  sourceDocumentPath?: string;
+  sourceKind?: "official_web" | "official_document" | "user_upload";
   ownership?: "first_party" | "third_party" | "unknown";
   assetType?:
     | "brand_identity"

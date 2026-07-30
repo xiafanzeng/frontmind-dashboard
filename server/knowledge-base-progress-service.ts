@@ -315,6 +315,7 @@ function buildDto(
       revision: build.revision,
       currentLeafId: build.currentLeafId,
       protocolError: build.protocolError,
+      awaitingResponseSince: build.awaitingResponseSince?.getTime() ?? null,
       updatedAt: build.updatedAt.getTime(),
     },
     summary: {
@@ -416,6 +417,7 @@ export async function createKnowledgeBaseBuild(input: {
           lastOutputItemIds: [],
           lastTurnUserText: null,
           lastTurnAttachmentCount: 0,
+          awaitingResponseSince: new Date(),
           packageRevision: null,
           packageTaskId: null,
           packageOutputItemId: null,
@@ -441,6 +443,7 @@ export async function createKnowledgeBaseBuild(input: {
       skillVersion: input.skillVersion || "1",
       skillContentHash: input.skillContentHash || null,
       status: "researching",
+      awaitingResponseSince: new Date(),
     });
     return (await loadBuild(tx, input.userId, conversationId))!;
   });
@@ -483,6 +486,7 @@ export async function recordKnowledgeBaseTurn(input: {
         0,
         Math.trunc(input.attachmentCount || 0),
       ),
+      awaitingResponseSince: new Date(),
     })
     .where(
       and(
@@ -588,6 +592,21 @@ function friendlyProtocolError(error: unknown) {
   return "知识库节点状态校验失败，本轮内容尚未更新";
 }
 
+function recordKnowledgeInputUnlock(
+  build: typeof knowledgeBaseBuilds.$inferSelect,
+) {
+  if (!build.awaitingResponseSince) return;
+  console.info(
+    "[KnowledgeBaseInteraction] input_unlocked",
+    JSON.stringify({
+      buildId: build.id,
+      conversationId: build.conversationId,
+      revision: build.revision,
+      waitMs: Math.max(0, Date.now() - build.awaitingResponseSince.getTime()),
+    }),
+  );
+}
+
 async function rememberProtocolError(input: {
   userId: number;
   conversationId: string;
@@ -596,7 +615,11 @@ async function rememberProtocolError(input: {
   const db = await requireDb();
   await db
     .update(knowledgeBaseBuilds)
-    .set({ status: "protocol_error", protocolError: input.message })
+    .set({
+      status: "protocol_error",
+      protocolError: input.message,
+      awaitingResponseSince: null,
+    })
     .where(
       and(
         eq(knowledgeBaseBuilds.userId, input.userId),
@@ -700,8 +723,10 @@ export async function reconcileKnowledgeBaseProgress(input: {
             lastReconciledHash: hash,
             ...outputLedger,
             protocolError: null,
+            awaitingResponseSince: null,
           })
           .where(eq(knowledgeBaseBuilds.id, build.id));
+        recordKnowledgeInputUnlock(build);
         build = (await loadBuild(tx, input.userId, conversationId))!;
         rows = await loadNodes(tx, build.id);
         return buildDto(build, rows);
@@ -772,6 +797,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
             lastReconciledHash: hash,
             ...outputLedger,
             protocolError: null,
+            awaitingResponseSince: null,
             completedAt: null,
             packageRevision: null,
             packageTaskId: null,
@@ -781,6 +807,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
             packageDescriptorHash: null,
           })
           .where(eq(knowledgeBaseBuilds.id, build.id));
+        recordKnowledgeInputUnlock(build);
         build = (await loadBuild(tx, input.userId, conversationId))!;
         rows = await loadNodes(tx, build.id);
         return buildDto(build, rows);
@@ -886,6 +913,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
           lastReconciledHash: hash,
           ...outputLedger,
           protocolError: null,
+          awaitingResponseSince: null,
           completedAt: packageAllowed ? new Date() : null,
           packageRevision: packageAllowed ? nextState.revision : null,
           packageTaskId: packageAllowed
@@ -904,6 +932,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
         })
         .where(eq(knowledgeBaseBuilds.id, build.id));
 
+      recordKnowledgeInputUnlock(build);
       build = (await loadBuild(tx, input.userId, conversationId))!;
       rows = await loadNodes(tx, build.id);
       return buildDto(build, rows);
@@ -949,12 +978,13 @@ export async function assertKnowledgeBasePublishable(input: {
     );
   }
   const rows = await loadNodes(db, build.id);
+  if (build.status === "published" && build.publishedSnapshotId) {
+    return build;
+  }
   if (build.status !== "ready_to_publish") {
     throw new KnowledgeBaseBuildError(
       "PUBLISH_BLOCKED",
-      build.status === "published"
-        ? "当前知识库已同步；如需更新，请先在构建流程中补充内容"
-        : "知识库尚未完成全部节点确认",
+      "知识库尚未完成全部节点确认",
     );
   }
   try {

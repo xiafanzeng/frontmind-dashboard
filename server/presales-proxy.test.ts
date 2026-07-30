@@ -277,4 +277,21 @@ describe("presales upstream contract", () => {
       nested: { message: "unexpected echo: [redacted]" },
     });
   });
+
+  it("preserves a storage SigV4 URL while still removing the Agent API key", () => {
+    const apiKey = "sk-private-presales-key";
+    const signedUrl =
+      "https://uploads.example.test/catalog.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Signature=abcdef0123456789";
+    const redacted = redactUpstreamPayload(
+      {
+        id: "file-1",
+        upload_url: signedUrl,
+        api_key: apiKey,
+      },
+      apiKey,
+    ) as Record<string, unknown>;
+
+    expect(redacted.upload_url).toBe(signedUrl);
+    expect(redacted).not.toHaveProperty("api_key");
+  });
 });

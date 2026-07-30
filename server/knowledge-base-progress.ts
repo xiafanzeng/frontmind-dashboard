@@ -1,4 +1,4 @@
-export const KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES = 40;
+export const KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES = 8;
 export const KNOWLEDGE_BASE_MANIFEST_MAX_LEAVES = 115;
 export const KNOWLEDGE_BASE_PROGRESS_KIND = "frontmind.knowledge-base.progress";
 export const KNOWLEDGE_BASE_MANIFEST_KIND = "frontmind.knowledge-base.manifest";
@@ -208,7 +208,7 @@ function normalizeManifestEntry(
 }
 
 /**
- * Validates and normalizes a manifest without imposing the production 40–115
+ * Validates and normalizes a manifest without imposing the production 8–115
  * size requirement. This keeps the state machine independently testable with
  * small manifests.
  */
@@ -233,7 +233,7 @@ export function validateKnowledgeBaseLeafManifest(
 
 /**
  * Applies the production contract separately from state creation: a real
- * knowledge-base run must contain 40–115 unique leaves.
+ * knowledge-base run must contain 8–115 unique leaves.
  */
 export function validateProductionKnowledgeBaseLeafManifest(
   manifest: readonly KnowledgeBaseLeafManifestEntry[],
@@ -341,7 +341,9 @@ export function formatKnowledgeBaseManifestEnvelope(
   return `<!-- ${KNOWLEDGE_BASE_MANIFEST_MARKER}\n${JSON.stringify(parsed)}\n-->`;
 }
 
-function parseReopenEnvelopeObject(input: unknown): KnowledgeBaseReopenEnvelope {
+function parseReopenEnvelopeObject(
+  input: unknown,
+): KnowledgeBaseReopenEnvelope {
   if (!isPlainObject(input)) {
     fail("INVALID_ENVELOPE", "Reopen envelope must be an object");
   }

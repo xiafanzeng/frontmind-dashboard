@@ -22,7 +22,7 @@ report.
 
 ## Leaf inventory
 
-Build 40–115 stable leaves before confirmation:
+Build 8–115 stable leaves before confirmation:
 
 | Enterprise scope                      | Typical leaves |
 | ------------------------------------- | -------------: |

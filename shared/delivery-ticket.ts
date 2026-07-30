@@ -23,6 +23,7 @@ export const websiteOperationCategorySchema = z.enum([
   "industry_news",
   "company_news",
   "faq_content",
+  "knowledge_base_maintenance",
   // Legacy categories remain parseable for historical records. New ticket
   // creation is restricted by resolveDeliveryTicketQuotaPool below.
   "blog_update",
@@ -223,6 +224,7 @@ export const createDeliveryTicketSchema = z
     icpDeclarations: icpNonSensitiveDeclarationsSchema.optional(),
     targetPage: targetPageSchema.optional(),
     materialUrls: z.array(httpUrlSchema).max(30).default([]),
+    knowledgeSnapshotId: z.string().uuid().optional(),
     attachments: z
       .array(deliveryTicketAttachmentInputSchema)
       .max(30)
@@ -245,6 +247,16 @@ export const createDeliveryTicketSchema = z
         path: ["icpDeclarations"],
         message:
           "域名与 ICP 备案工单必须填写域名实名信息、网站信息并确认真实性核验状态",
+      });
+    }
+    if (
+      value.category === "knowledge_base_maintenance" &&
+      !value.knowledgeSnapshotId
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["knowledgeSnapshotId"],
+        message: "维护工单必须关联当前已发布知识库",
       });
     }
   });
@@ -501,10 +513,12 @@ export function resolveDeliveryTicketQuotaPool(input: {
     }
     if (
       !WEBSITE_CONTENT_PUBLISH_CATEGORIES.has(category) &&
-      !WEBSITE_PREREQUISITE_CATEGORIES.has(category)
+      !WEBSITE_PREREQUISITE_CATEGORIES.has(category) &&
+      category !== "knowledge_base_maintenance"
     ) {
       throw new Error("该旧版官网技术类别已停止接受新工单");
     }
+    if (category === "knowledge_base_maintenance") return null;
     if (WEBSITE_CONTENT_PUBLISH_CATEGORIES.has(category)) {
       return "website_content_publish";
     }
@@ -584,6 +598,7 @@ const publicDeliveryTicketSummaryBaseSchema = z.object({
   publicStatus: z.enum(["pending", "completed"]),
   publicStatusLabel: z.enum(["待受理", "已完成"]),
   publicSummary: z.string().max(50_000).nullable(),
+  knowledgeSnapshotId: z.string().uuid().nullable().optional(),
 });
 
 export const publicContentAssetTicketSummarySchema =

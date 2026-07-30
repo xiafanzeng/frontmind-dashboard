@@ -1,4 +1,5 @@
 import axios from "axios";
+import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
 import { Router } from "express";
 import fs from "fs/promises";
 import JSZip from "jszip";
@@ -20,6 +21,7 @@ import {
   assertKnowledgeBaseTaskBinding,
   attachKnowledgeBaseBuildTask,
   createKnowledgeBaseBuild,
+  extractFinalKnowledgeBaseAssistantText,
   getKnowledgeBaseProgress,
   recordKnowledgeBaseTurn,
   reconcileKnowledgeBaseProgress,
@@ -32,6 +34,12 @@ import {
   assertServiceCapability,
   ServiceEntitlementError,
 } from "./service-entitlement";
+import type {
+  KnowledgeBaseInteractionDto,
+  KnowledgeBaseProgressDto,
+} from "../shared/knowledge-base-progress";
+import { knowledgeBaseBuilds } from "../drizzle/schema";
+import { getDb } from "./db";
 
 const router = Router();
 
@@ -147,10 +155,343 @@ export function selectUnreconciledKnowledgeOutput(
     return Boolean(id) && !previousIds.has(id);
   });
   if (unseenById.length > 0) return unseenById;
+  const currentIds = outputItemIds(output);
+  if (currentIds.length > 0 && currentIds.every((id) => previousIds.has(id))) {
+    return [];
+  }
   // Some upstream task continuations return only the current turn rather than
   // a cumulative array. Returning the full current payload avoids losing it;
   // the reconciliation hash keeps repeated checks idempotent.
   return output;
+}
+
+const COMPLETE_KNOWLEDGE_PROTOCOL_ENVELOPE =
+  /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/i;
+const COMPLETE_KNOWLEDGE_PROTOCOL_COMMENT =
+  /<!--\s*FRONTMIND_KB_[A-Z_]+\b[\s\S]*?-->/i;
+
+function normalizedUpstreamTaskStatus(status: unknown) {
+  const value = String(status || "running")
+    .trim()
+    .toLowerCase();
+  return value === "failed" ? "error" : value;
+}
+
+const knowledgeInteractionAlertAt = new Map<string, number>();
+
+function observeKnowledgeInteraction(
+  progress: KnowledgeBaseProgressDto | null,
+  upstreamStatus: unknown,
+) {
+  const normalized = normalizedUpstreamTaskStatus(upstreamStatus);
+  const now = Date.now();
+  const knownStatuses = new Set([
+    "created",
+    "queued",
+    "pending",
+    "running",
+    "in_progress",
+    "awaiting_input",
+    "awaiting_user",
+    "awaiting_user_input",
+    "waiting",
+    "paused",
+    "requires_action",
+    "input_required",
+    "completed",
+    "error",
+  ]);
+  const alert = (kind: string, metadata: Record<string, unknown>) => {
+    const key = `${progress?.build.id || "unbound"}:${kind}:${normalized}`;
+    if ((knowledgeInteractionAlertAt.get(key) || 0) > now - 10 * 60_000) {
+      return;
+    }
+    knowledgeInteractionAlertAt.set(key, now);
+    console.warn(
+      `[KnowledgeBaseInteraction] ${kind}`,
+      JSON.stringify(metadata),
+    );
+  };
+  if (!knownStatuses.has(normalized)) {
+    alert("unknown_upstream_status", {
+      buildId: progress?.build.id || null,
+      upstreamStatus: normalized,
+    });
+  }
+  const awaitingSince = progress?.build.awaitingResponseSince;
+  if (
+    typeof awaitingSince === "number" &&
+    now - awaitingSince > 2 * 60 * 60_000
+  ) {
+    alert("execution_timeout", {
+      buildId: progress?.build.id || null,
+      upstreamStatus: normalized,
+      waitMs: now - awaitingSince,
+    });
+  }
+  if (knowledgeInteractionAlertAt.size > 1_000) {
+    const expiry = now - 60 * 60_000;
+    knowledgeInteractionAlertAt.forEach((lastSeen, key) => {
+      if (lastSeen < expiry) knowledgeInteractionAlertAt.delete(key);
+    });
+  }
+}
+
+function upstreamTaskFailed(status: unknown) {
+  const normalized = normalizedUpstreamTaskStatus(status);
+  return normalized === "error" || normalized === "failed";
+}
+
+function upstreamTaskTerminal(status: unknown) {
+  return (
+    upstreamTaskFailed(status) ||
+    normalizedUpstreamTaskStatus(status) === "completed"
+  );
+}
+
+export function shouldReconcileKnowledgeOutput(
+  output: unknown[],
+  status: unknown,
+) {
+  const text = extractFinalKnowledgeBaseAssistantText(output);
+  if (!text) return false;
+  if (
+    COMPLETE_KNOWLEDGE_PROTOCOL_ENVELOPE.test(text) ||
+    COMPLETE_KNOWLEDGE_PROTOCOL_COMMENT.test(text)
+  ) {
+    return true;
+  }
+  // A terminal provider response without a complete protocol envelope is a
+  // protocol failure. Waiting/running output may still be a partial stream, so
+  // it must never poison the build or unlock input until a closed envelope is
+  // present.
+  return upstreamTaskTerminal(status);
+}
+
+export function deriveKnowledgeBaseInteraction(
+  progress: KnowledgeBaseProgressDto | null,
+  upstreamStatus: unknown,
+): KnowledgeBaseInteractionDto {
+  observeKnowledgeInteraction(progress, upstreamStatus);
+  if (progress?.build.status === "published") {
+    return {
+      progress,
+      interactionState: "published",
+      canReply: false,
+      canPublish: false,
+      lockReason: "知识库已发布；后续修改请提交维护工单",
+    };
+  }
+  if (
+    progress?.packageAllowed &&
+    progress.build.status === "ready_to_publish"
+  ) {
+    return {
+      progress,
+      interactionState: "ready_to_publish",
+      canReply: false,
+      canPublish: true,
+      lockReason: "知识库已完成，请执行唯一一次直接更新",
+    };
+  }
+  if (
+    progress?.build.status === "protocol_error" ||
+    progress?.build.status === "failed" ||
+    upstreamTaskFailed(upstreamStatus)
+  ) {
+    return {
+      progress,
+      interactionState: "failed",
+      canReply: false,
+      canPublish: false,
+      lockReason:
+        progress?.build.protocolError || "知识库任务执行失败，请重新同步状态",
+    };
+  }
+  if (
+    progress?.build.status === "confirming" &&
+    progress.build.currentLeafId &&
+    progress.build.awaitingResponseSince === null
+  ) {
+    return {
+      progress,
+      interactionState: "awaiting_input",
+      canReply: true,
+      canPublish: false,
+      lockReason: null,
+    };
+  }
+  const interactionState =
+    normalizedUpstreamTaskStatus(upstreamStatus) === "pending"
+      ? "queued"
+      : "executing";
+  return {
+    progress,
+    interactionState,
+    canReply: false,
+    canPublish: false,
+    lockReason: "FrontMind 正在整理当前知识节点",
+  };
+}
+
+async function reconcileAvailableKnowledgeOutput(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+  output: unknown[];
+  upstreamStatus: unknown;
+  ledger: { lastOutputLength: number; lastOutputItemIds: string[] };
+}) {
+  let progress = await getKnowledgeBaseProgress({
+    userId: input.userId,
+    conversationId: input.conversationId,
+  });
+  const unreconciled = selectUnreconciledKnowledgeOutput(
+    input.output,
+    input.ledger,
+  );
+  if (shouldReconcileKnowledgeOutput(unreconciled, input.upstreamStatus)) {
+    progress = await reconcileKnowledgeBaseProgress({
+      userId: input.userId,
+      conversationId: input.conversationId,
+      taskId: input.taskId,
+      output: unreconciled,
+      outputState: {
+        totalLength: input.output.length,
+        itemIds: outputItemIds(input.output),
+      },
+    });
+  }
+  return progress;
+}
+
+export async function recoverOpenKnowledgeBaseTasks(options?: {
+  limit?: number;
+  concurrency?: number;
+}) {
+  const db = await getDb();
+  if (!db) {
+    return { scanned: 0, reconciled: 0, skipped: 0, failed: 0 };
+  }
+  const limit = Math.min(500, Math.max(1, Math.trunc(options?.limit ?? 100)));
+  const concurrency = Math.min(
+    8,
+    Math.max(1, Math.trunc(options?.concurrency ?? 3)),
+  );
+  const builds = await db
+    .select({
+      id: knowledgeBaseBuilds.id,
+      userId: knowledgeBaseBuilds.userId,
+      conversationId: knowledgeBaseBuilds.conversationId,
+      upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+      lastOutputLength: knowledgeBaseBuilds.lastOutputLength,
+      lastOutputItemIds: knowledgeBaseBuilds.lastOutputItemIds,
+    })
+    .from(knowledgeBaseBuilds)
+    .where(
+      and(
+        inArray(knowledgeBaseBuilds.status, ["researching", "confirming"]),
+        isNotNull(knowledgeBaseBuilds.upstreamTaskId),
+        or(
+          eq(knowledgeBaseBuilds.status, "researching"),
+          isNotNull(knowledgeBaseBuilds.awaitingResponseSince),
+        ),
+      ),
+    )
+    .limit(limit);
+
+  const result = {
+    scanned: builds.length,
+    reconciled: 0,
+    skipped: 0,
+    failed: 0,
+  };
+  let cursor = 0;
+  const baseUrl = getUpstreamBaseUrl();
+  const worker = async () => {
+    while (cursor < builds.length) {
+      const build = builds[cursor++];
+      const taskId = String(build.upstreamTaskId || "");
+      try {
+        const credential = await getCredentialForUpstreamResource(
+          build.userId,
+          "task",
+          taskId,
+        );
+        if (!credential) {
+          result.skipped += 1;
+          console.warn(
+            "[KnowledgeBaseRecovery] credential_unavailable",
+            JSON.stringify({ buildId: build.id, taskId }),
+          );
+          continue;
+        }
+        const taskResponse = await axios.get(
+          `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
+          {
+            headers: {
+              API_KEY: credential.apiKey,
+              Authorization: `Bearer ${credential.apiKey}`,
+            },
+            timeout: 120000,
+            validateStatus: () => true,
+          },
+        );
+        if (taskResponse.status < 200 || taskResponse.status >= 300) {
+          result.failed += 1;
+          console.warn(
+            "[KnowledgeBaseRecovery] task_read_failed",
+            JSON.stringify({
+              buildId: build.id,
+              taskId,
+              status: taskResponse.status,
+            }),
+          );
+          continue;
+        }
+        const taskData = taskResponse.data || {};
+        const output = Array.isArray(taskData.output) ? taskData.output : [];
+        const taskStatus = normalizedUpstreamTaskStatus(taskData.status);
+        if (!shouldReconcileKnowledgeOutput(output, taskStatus)) {
+          observeKnowledgeInteraction(
+            await getKnowledgeBaseProgress({
+              userId: build.userId,
+              conversationId: build.conversationId,
+            }),
+            taskStatus,
+          );
+          result.skipped += 1;
+          continue;
+        }
+        await reconcileAvailableKnowledgeOutput({
+          userId: build.userId,
+          conversationId: build.conversationId,
+          taskId,
+          output,
+          upstreamStatus: taskStatus,
+          ledger: {
+            lastOutputLength: build.lastOutputLength,
+            lastOutputItemIds: build.lastOutputItemIds,
+          },
+        });
+        result.reconciled += 1;
+      } catch (error) {
+        result.failed += 1;
+        console.warn(
+          "[KnowledgeBaseRecovery] reconcile_failed",
+          JSON.stringify({
+            buildId: build.id,
+            taskId,
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, builds.length) }, worker),
+  );
+  return result;
 }
 
 const configuredKnowledgeBaseSkillPath =
@@ -450,6 +791,7 @@ export async function buildKnowledgeBasePrompt({
     "严格执行下方 socratic-kb-builder v2 Skill，为企业构建可复用的深度图文知识库。",
     "不得开启、调用、切换或推荐 Wide Research / Deep Research；只使用当前 Pro Agent 模式下的普通浏览、搜索和文件工具。",
     "客户可见正文与本轮对话只能呈现百科事实，不得呈现任务过程、核验判断、采购/合规建议、读者指令、工具计划或模型推理。",
+    "客户可见正文不得嵌入官网或 CDN 图片外链。图片必须先下载真实字节、解码校验并打入最终 ZIP，再以包内相对路径引用；防盗链、签名、过期或无法下载的地址只能进入内部来源记录，绝不能作为客户图片返回。",
     "",
     "## 本次任务输入",
     `构建会话标识：${conversationId || "未提供"}`,
@@ -478,9 +820,9 @@ export async function buildKnowledgeBasePrompt({
     "这是服务端状态机协议，优先级高于 skill 中任何会自动跨节点的表述。可读正文照常输出，但每轮末尾必须附带且只能附带一个对应的 HTML 注释信封。",
     "",
     "### 首轮研究与知识树建立",
-    "完成官网、公开来源、上传资料研究和正式图文预填后，按企业实际情况建立自适应一级分支和 40-115 个真实叶子节点。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
+    "完成官网、公开来源、上传资料研究和正式图文预填后，按企业实际资料量建立自适应一级分支和 8-115 个真实叶子节点。白牌企业或只有宣传单时只保留有事实价值或明确缺口的必要叶子，不得为数量、字数或图片数填充内容。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
     '<!-- FRONTMIND_KB_MANIFEST\n{"kind":"frontmind.knowledge-base.manifest","schemaVersion":1,"leaves":[{"id":"1.1","title":"一句话定位","branchId":"identity","branchTitle":"企业身份"}]}\n-->',
-    "示例只演示结构，真实 leaves 必须完整包含 40-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
+    "示例只演示结构，真实 leaves 必须完整包含 8-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
     "",
     "### 后续每轮单节点状态",
     "服务端从 revision=0、清单第一个叶子为 current 开始。后续每轮末尾必须附一个且仅一个状态信封：",
@@ -658,6 +1000,19 @@ router.post("/start", async (req, res) => {
   }
 
   try {
+    const existingBuild = await getKnowledgeBaseProgress({
+      userId: req.frontmindUser.id,
+      conversationId,
+    });
+    if (existingBuild?.build.status === "published") {
+      res.status(409).json({
+        error: {
+          code: "KNOWLEDGE_BASE_LOCKED",
+          message: "知识库已发布；后续修改请提交维护工单",
+        },
+      });
+      return;
+    }
     const [workspace, prefillKnowledgeSnapshot] = await Promise.all([
       getDashboardWorkspace(req.frontmindUser.id),
       getLatestKnowledgeSnapshot(req.frontmindUser.id),
@@ -734,22 +1089,20 @@ router.post("/start", async (req, res) => {
       conversationId,
       taskId: String(created.task.id),
     });
-    if (
-      created.task.status === "completed" &&
-      Array.isArray(created.task.output) &&
-      created.task.output.length > 0
-    ) {
+    if (Array.isArray(created.task.output) && created.task.output.length > 0) {
       try {
-        progress = await reconcileKnowledgeBaseProgress({
-          userId: req.frontmindUser.id,
-          conversationId,
-          taskId: String(created.task.id),
-          output: created.task.output,
-          outputState: {
-            totalLength: created.task.output.length,
-            itemIds: outputItemIds(created.task.output),
-          },
-        });
+        progress =
+          (await reconcileAvailableKnowledgeOutput({
+            userId: req.frontmindUser.id,
+            conversationId,
+            taskId: String(created.task.id),
+            output: created.task.output,
+            upstreamStatus: created.task.status,
+            ledger: {
+              lastOutputLength: 0,
+              lastOutputItemIds: [],
+            },
+          })) || progress;
       } catch (error) {
         console.warn(
           "[Knowledge Base Start] initial progress was not accepted:",
@@ -767,6 +1120,10 @@ router.post("/start", async (req, res) => {
       visibleMessage: "开始构建企业知识库",
       task: created.task,
       progress,
+      interaction: deriveKnowledgeBaseInteraction(
+        progress,
+        created.task.status,
+      ),
       startedAt: Date.now(),
     });
   } catch (error: any) {
@@ -827,6 +1184,28 @@ router.post("/turn", async (req, res) => {
       conversationId,
       taskId,
     });
+    if (boundBuild.status === "published") {
+      res.status(409).json({
+        error: {
+          code: "KNOWLEDGE_BASE_LOCKED",
+          message: "知识库已发布；后续修改请提交维护工单",
+        },
+      });
+      return;
+    }
+    if (
+      boundBuild.status !== "confirming" ||
+      !boundBuild.currentLeafId ||
+      boundBuild.awaitingResponseSince
+    ) {
+      res.status(409).json({
+        error: {
+          code: "KNOWLEDGE_BASE_NOT_AWAITING_INPUT",
+          message: "当前知识节点尚未进入可回复状态，请先重新同步任务状态",
+        },
+      });
+      return;
+    }
     const taskCredential = await getCredentialForUpstreamResource(
       req.frontmindUser!.id,
       "task",
@@ -903,29 +1282,27 @@ router.post("/turn", async (req, res) => {
       userId: req.frontmindUser!.id,
       conversationId,
     });
-    if (
-      created.task.status === "completed" &&
-      Array.isArray(created.task.output) &&
-      created.task.output.length > 0
-    ) {
-      const newOutput = selectUnreconciledKnowledgeOutput(created.task.output, {
-        lastOutputLength: boundBuild.lastOutputLength,
-        lastOutputItemIds: boundBuild.lastOutputItemIds,
-      });
-      progress = await reconcileKnowledgeBaseProgress({
-        userId: req.frontmindUser!.id,
-        conversationId,
-        taskId: String(created.task.id),
-        output: newOutput,
-        outputState: {
-          totalLength: created.task.output.length,
-          itemIds: outputItemIds(created.task.output),
-        },
-      });
+    if (Array.isArray(created.task.output) && created.task.output.length > 0) {
+      progress =
+        (await reconcileAvailableKnowledgeOutput({
+          userId: req.frontmindUser!.id,
+          conversationId,
+          taskId: String(created.task.id),
+          output: created.task.output,
+          upstreamStatus: created.task.status,
+          ledger: {
+            lastOutputLength: boundBuild.lastOutputLength,
+            lastOutputItemIds: boundBuild.lastOutputItemIds,
+          },
+        })) || progress;
     }
     res.json({
       task: created.task,
       progress,
+      interaction: deriveKnowledgeBaseInteraction(
+        progress,
+        created.task.status,
+      ),
       startedAt: Date.now(),
     });
   } catch (error) {
@@ -955,7 +1332,10 @@ router.get("/progress/:conversationId", async (req, res) => {
       userId: req.frontmindUser!.id,
       conversationId: req.params.conversationId,
     });
-    res.json({ progress });
+    res.json({
+      progress,
+      interaction: deriveKnowledgeBaseInteraction(progress, "running"),
+    });
   } catch (error) {
     res.status(400).json({
       error: error instanceof Error ? error.message : "读取知识库进度失败",
@@ -991,6 +1371,17 @@ router.post("/progress/reconcile", async (req, res) => {
       conversationId,
       taskId,
     });
+    if (boundBuild.status === "published") {
+      const progress = await getKnowledgeBaseProgress({
+        userId: req.frontmindUser!.id,
+        conversationId,
+      });
+      res.json({
+        progress,
+        interaction: deriveKnowledgeBaseInteraction(progress, "completed"),
+      });
+      return;
+    }
     const credential = await getCredentialForUpstreamResource(
       req.frontmindUser!.id,
       "task",
@@ -1026,31 +1417,23 @@ router.post("/progress/reconcile", async (req, res) => {
       return;
     }
     const taskData = taskResponse.data || {};
-    const taskStatus = taskData.status === "failed" ? "error" : taskData.status;
-    if (taskStatus === "running" || taskStatus === "pending") {
-      res.status(409).json({
-        error: {
-          code: "TASK_NOT_COMPLETED",
-          message: "知识库任务仍在处理中",
-        },
-      });
-      return;
-    }
+    const taskStatus = normalizedUpstreamTaskStatus(taskData.status);
     const fullOutput = Array.isArray(taskData.output) ? taskData.output : [];
-    const progress = await reconcileKnowledgeBaseProgress({
+    const progress = await reconcileAvailableKnowledgeOutput({
       userId: req.frontmindUser!.id,
       conversationId,
       taskId,
-      output: selectUnreconciledKnowledgeOutput(fullOutput, {
+      output: fullOutput,
+      upstreamStatus: taskStatus,
+      ledger: {
         lastOutputLength: boundBuild.lastOutputLength,
         lastOutputItemIds: boundBuild.lastOutputItemIds,
-      }),
-      outputState: {
-        totalLength: fullOutput.length,
-        itemIds: outputItemIds(fullOutput),
       },
     });
-    res.json({ progress });
+    res.json({
+      progress,
+      interaction: deriveKnowledgeBaseInteraction(progress, taskStatus),
+    });
   } catch (error) {
     const status =
       error instanceof KnowledgeBaseBuildError &&

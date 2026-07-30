@@ -64,7 +64,7 @@ Use this exact top-level contract. Extra fields are forbidden:
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "profile": "dashboard-enterprise-v1",
   "documents": [
     {
@@ -200,7 +200,7 @@ organization.
 `evidenceCharacters` must equal the validator-recomputed total effective
 characters from the unique referenced evidence documents. Allowed content
 statuses are `complete`, `limited_evidence`, and `needs_verification`.
-`00_completeness.json` counts the evidence states of the 40–115 true leaf
+`00_completeness.json` counts the evidence states of the 8–115 true leaf
 documents. `customerVisible` is true only for polished overviews and leaves.
 Document and asset IDs are stable and unique. Every `assetIds` and
 `documentIds` relationship must resolve in both directions.
@@ -309,7 +309,7 @@ Keep the established object shape unchanged and use no extra fields:
 ```
 
 Replace every uppercase token with the current run's actual value.
-`totalLeaves` is the 40–115 true leaf count,
+`totalLeaves` is the 8–115 true leaf count,
 not the overview count. The six evidence-state counts must be non-negative,
 sum to `totalLeaves`, and match the leaf manifests. `images.completed` must
 equal the actual deduplicated packaged image count. Each acquisition

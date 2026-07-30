@@ -5,6 +5,7 @@ import {
   RefreshCw,
   Send,
   Sparkles,
+  Wrench,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -14,6 +15,14 @@ import KnowledgeBaseViewer, {
   type KnowledgeSnapshotView,
 } from "@/components/KnowledgeBaseViewer";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Sheet,
   SheetContent,
@@ -118,12 +127,20 @@ export default function EmbeddedKnowledgeBasePanel({
             </Button>
           ) : (
             <ManualKnowledgeUpdateButton
+              publishedSnapshotId={knowledgeQuery.data?.snapshot?.id}
               onUpdated={async () => {
                 await knowledgeQuery.refetch();
                 onPageChange("display");
               }}
             />
           ))}
+        {page === "display" &&
+          !previewMode &&
+          knowledgeQuery.data?.snapshot?.id && (
+            <KnowledgeMaintenanceTicketButton
+              snapshotId={knowledgeQuery.data.snapshot.id}
+            />
+          )}
       </header>
 
       {page === "display" ? (
@@ -156,10 +173,12 @@ export default function EmbeddedKnowledgeBasePanel({
 
 function ManualKnowledgeUpdateButton({
   onUpdated,
+  publishedSnapshotId,
 }: {
   onUpdated: () => Promise<void>;
+  publishedSnapshotId?: string;
 }) {
-  const { activeConversation } = useConversation();
+  const { activeConversation, updateStatus } = useConversation();
   const [updating, setUpdating] = useState(false);
   const progressQuery = trpc.workspace.knowledgeProgress.useQuery(
     activeConversation?.id
@@ -201,6 +220,13 @@ function ManualKnowledgeUpdateButton({
       });
       return;
     }
+    if (
+      !window.confirm(
+        "这是唯一一次直接更新。更新成功后当前会话和更新入口将永久锁定；后续修改需要提交维护工单。确认现在更新吗？",
+      )
+    ) {
+      return;
+    }
 
     setUpdating(true);
     try {
@@ -215,6 +241,9 @@ function ManualKnowledgeUpdateButton({
       }
       await onUpdated();
       await progressQuery.refetch();
+      updateStatus(activeConversation.id, "completed", {
+        completedAt: Date.now(),
+      });
       toast.success("知识库展示已更新");
     } catch (error) {
       toast.error("知识库更新失败", {
@@ -225,19 +254,123 @@ function ManualKnowledgeUpdateButton({
     }
   };
 
+  const progress = progressQuery.data?.progress;
+  if (progress?.build.status === "published") {
+    return publishedSnapshotId ? (
+      <KnowledgeMaintenanceTicketButton snapshotId={publishedSnapshotId} />
+    ) : null;
+  }
+  if (!progress?.packageAllowed) {
+    return publishedSnapshotId ? (
+      <KnowledgeMaintenanceTicketButton snapshotId={publishedSnapshotId} />
+    ) : null;
+  }
+
   return (
-    <Button
-      className="w-fit shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
-      disabled={updating}
-      onClick={() => void updateKnowledgeBase()}
-    >
-      {updating ? (
-        <Loader2 className="h-4 w-4 animate-spin" />
-      ) : (
-        <RefreshCw className="h-4 w-4" />
-      )}
-      {updating ? "正在更新" : "更新知识库"}
-    </Button>
+    <div className="flex max-w-xl flex-col items-start gap-2">
+      <p className="text-xs leading-5 text-amber-700">
+        知识库已达到
+        100%：这是唯一一次直接更新；更新成功后当前会话和入口将锁定，后续修改需提交维护工单。
+      </p>
+      <Button
+        className="w-fit shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
+        disabled={updating}
+        onClick={() => void updateKnowledgeBase()}
+      >
+        {updating ? (
+          <Loader2 className="h-4 w-4 animate-spin" />
+        ) : (
+          <RefreshCw className="h-4 w-4" />
+        )}
+        {updating ? "正在更新" : "更新知识库"}
+      </Button>
+    </div>
+  );
+}
+
+function KnowledgeMaintenanceTicketButton({
+  snapshotId,
+}: {
+  snapshotId: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [description, setDescription] = useState("");
+  const deliveryTicketApi = (trpc.workspace as any).deliveryTickets;
+  const createMutation = deliveryTicketApi.create.useMutation();
+
+  const submit = async () => {
+    const request = description.trim();
+    if (!request) {
+      toast.warning("请填写需要维护或更新的知识库内容");
+      return;
+    }
+    try {
+      await createMutation.mutateAsync({
+        clientRequestId: crypto.randomUUID(),
+        type: "website_operation",
+        category: "knowledge_base_maintenance",
+        topic: "已发布知识库维护",
+        title: "知识库维护工单",
+        description: request,
+        knowledgeSnapshotId: snapshotId,
+        materialUrls: [],
+        attachments: [],
+      });
+      setDescription("");
+      setOpen(false);
+      toast.success("知识库维护工单已提交", {
+        description: "服务团队会在工单中处理后续知识库更新。",
+      });
+    } catch (error) {
+      toast.error("维护工单提交失败", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    }
+  };
+
+  return (
+    <>
+      <Button
+        className="w-fit shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
+        onClick={() => setOpen(true)}
+      >
+        <Wrench className="h-4 w-4" />
+        提交维护工单
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>提交知识库维护工单</DialogTitle>
+            <DialogDescription>
+              当前知识库已锁定。请说明需要补充、修订或替换的内容，服务团队将基于已发布版本处理。
+            </DialogDescription>
+          </DialogHeader>
+          <textarea
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            rows={8}
+            maxLength={50_000}
+            className="min-h-40 w-full resize-y rounded-xl border border-[#ddd3e5] bg-white px-3 py-2 text-sm outline-none focus:border-[#5b2a86]"
+            placeholder="例如：更新产品参数、补充新案例、替换已过期资质……"
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              取消
+            </Button>
+            <Button
+              className="bg-[#5b2a86] hover:bg-[#49216c]"
+              disabled={createMutation.isPending}
+              onClick={() => void submit()}
+            >
+              {createMutation.isPending && (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              )}
+              提交工单
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

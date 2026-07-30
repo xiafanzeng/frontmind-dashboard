@@ -611,6 +611,9 @@ router.put("/files/:fileId/content", async (req, res) => {
     req.pipe(limiter);
     const response = await axios.put(target, limiter, {
       ...safeExternalRequestOptions,
+      // SigV4 authenticates the exact request URL; following a redirect would
+      // invalidate the signature and surface as a misleading storage error.
+      maxRedirects: 0,
       headers: {
         "Content-Type":
           String(req.headers["x-original-content-type"] ?? "") ||

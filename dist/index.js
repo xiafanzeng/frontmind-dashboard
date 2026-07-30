@@ -831,6 +831,7 @@ var deliveryTickets = mysqlTable(
     icpProvince: varchar("icpProvince", { length: 64 }),
     icpDeclarations: json("icpDeclarations").$type(),
     targetPage: text("targetPage"),
+    knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
     technicalDedupeKey: varchar("technicalDedupeKey", { length: 64 }),
     materialUrls: json("materialUrls").$type().default([]).notNull(),
     status: mysqlEnum("status", [
@@ -1693,6 +1694,7 @@ var knowledgeBaseSnapshots = mysqlTable(
     sourceTaskId: varchar("sourceTaskId", { length: 255 }),
     sourceArtifactHash: varchar("sourceArtifactHash", { length: 64 }),
     archiveHash: varchar("archiveHash", { length: 64 }),
+    maintenanceTicketId: varchar("maintenanceTicketId", { length: 36 }),
     documents: json("documents").$type().notNull(),
     assets: json("assets").$type().notNull(),
     documentCount: int("documentCount").default(0).notNull(),
@@ -1753,6 +1755,7 @@ var knowledgeBaseBuilds = mysqlTable(
     lastOutputItemIds: json("lastOutputItemIds").$type().default([]).notNull(),
     lastTurnUserText: longtext("lastTurnUserText"),
     lastTurnAttachmentCount: int("lastTurnAttachmentCount").default(0).notNull(),
+    awaitingResponseSince: timestamp("awaitingResponseSince"),
     packageRevision: int("packageRevision"),
     packageTaskId: varchar("packageTaskId", { length: 255 }),
     packageOutputItemId: varchar("packageOutputItemId", { length: 255 }),
@@ -1877,6 +1880,7 @@ var conversations = mysqlTable(
       "idle",
       "running",
       "pending",
+      "awaiting_input",
       "completed",
       "error",
       "failed",
@@ -4251,6 +4255,7 @@ var websiteOperationCategorySchema = z6.enum([
   "industry_news",
   "company_news",
   "faq_content",
+  "knowledge_base_maintenance",
   // Legacy categories remain parseable for historical records. New ticket
   // creation is restricted by resolveDeliveryTicketQuotaPool below.
   "blog_update",
@@ -4391,6 +4396,7 @@ var createDeliveryTicketSchema = z6.object({
   icpDeclarations: icpNonSensitiveDeclarationsSchema.optional(),
   targetPage: targetPageSchema.optional(),
   materialUrls: z6.array(httpUrlSchema).max(30).default([]),
+  knowledgeSnapshotId: z6.string().uuid().optional(),
   attachments: z6.array(deliveryTicketAttachmentInputSchema).max(30).default([])
 }).refine(
   (value) => Boolean(
@@ -4406,6 +4412,13 @@ var createDeliveryTicketSchema = z6.object({
       code: z6.ZodIssueCode.custom,
       path: ["icpDeclarations"],
       message: "\u57DF\u540D\u4E0E ICP \u5907\u6848\u5DE5\u5355\u5FC5\u987B\u586B\u5199\u57DF\u540D\u5B9E\u540D\u4FE1\u606F\u3001\u7F51\u7AD9\u4FE1\u606F\u5E76\u786E\u8BA4\u771F\u5B9E\u6027\u6838\u9A8C\u72B6\u6001"
+    });
+  }
+  if (value.category === "knowledge_base_maintenance" && !value.knowledgeSnapshotId) {
+    context.addIssue({
+      code: z6.ZodIssueCode.custom,
+      path: ["knowledgeSnapshotId"],
+      message: "\u7EF4\u62A4\u5DE5\u5355\u5FC5\u987B\u5173\u8054\u5F53\u524D\u5DF2\u53D1\u5E03\u77E5\u8BC6\u5E93"
     });
   }
 });
@@ -4576,9 +4589,10 @@ function resolveDeliveryTicketQuotaPool(input) {
     if (!WEBSITE_OPERATION_CATEGORIES.has(category)) {
       throw new Error("\u8BF7\u9009\u62E9\u6709\u6548\u7684\u5B98\u7F51\u8FD0\u8425\u7C7B\u522B");
     }
-    if (!WEBSITE_CONTENT_PUBLISH_CATEGORIES.has(category) && !WEBSITE_PREREQUISITE_CATEGORIES.has(category)) {
+    if (!WEBSITE_CONTENT_PUBLISH_CATEGORIES.has(category) && !WEBSITE_PREREQUISITE_CATEGORIES.has(category) && category !== "knowledge_base_maintenance") {
       throw new Error("\u8BE5\u65E7\u7248\u5B98\u7F51\u6280\u672F\u7C7B\u522B\u5DF2\u505C\u6B62\u63A5\u53D7\u65B0\u5DE5\u5355");
     }
+    if (category === "knowledge_base_maintenance") return null;
     if (WEBSITE_CONTENT_PUBLISH_CATEGORIES.has(category)) {
       return "website_content_publish";
     }
@@ -4619,7 +4633,8 @@ var publicDeliveryTicketSummaryBaseSchema = z6.object({
   topic: z6.string().trim().max(512).nullable(),
   publicStatus: z6.enum(["pending", "completed"]),
   publicStatusLabel: z6.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
-  publicSummary: z6.string().max(5e4).nullable()
+  publicSummary: z6.string().max(5e4).nullable(),
+  knowledgeSnapshotId: z6.string().uuid().nullable().optional()
 });
 var publicContentAssetTicketSummarySchema = publicDeliveryTicketSummaryBaseSchema.extend({
   type: z6.literal("content_asset"),
@@ -4754,7 +4769,7 @@ import { and as and3, asc as asc2, desc as desc3, eq as eq4, gt as gt2, inArray 
 import { and as and2, desc as desc2, eq as eq3, gte } from "drizzle-orm";
 
 // server/knowledge-base-progress.ts
-var KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES = 40;
+var KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES = 8;
 var KNOWLEDGE_BASE_MANIFEST_MAX_LEAVES = 115;
 var KNOWLEDGE_BASE_PROGRESS_KIND = "frontmind.knowledge-base.progress";
 var KNOWLEDGE_BASE_MANIFEST_KIND = "frontmind.knowledge-base.manifest";
@@ -6264,7 +6279,7 @@ async function assertServiceCapability(userId, capability, options = {}) {
   if ((capability === "globalKeywords" || capability === "questionSelection") && (portal.service.planCode === "advanced" || portal.service.planCode === "luxury") && !portal.knowledge.authenticatedForCurrentService) {
     throw new ServiceEntitlementError(
       "KNOWLEDGE_SNAPSHOT_NOT_FOUND",
-      "\u8BF7\u5148\u5728\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u4E2D\u9010\u9879\u5B8C\u6210 40\u2013115 \u4E2A\u8282\u70B9\uFF0C\u5E76\u53D1\u5E03\u5F53\u524D\u5957\u9910\u4F7F\u7528\u7684\u8BA4\u8BC1\u77E5\u8BC6\u5E93\u3002",
+      "\u8BF7\u5148\u5728\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u4E2D\u9010\u9879\u5B8C\u6210 8\u2013115 \u4E2A\u8282\u70B9\uFF0C\u5E76\u53D1\u5E03\u5F53\u524D\u5957\u9910\u4F7F\u7528\u7684\u8BA4\u8BC1\u77E5\u8BC6\u5E93\u3002",
       409
     );
   }
@@ -10099,6 +10114,16 @@ async function getLatestKnowledgeSnapshot(userId) {
   ).orderBy(desc8(knowledgeBaseSnapshots.version)).limit(1);
   return rows[0] ? publicSnapshot(rows[0]) : null;
 }
+async function getKnowledgeSnapshotById(input) {
+  const db = await requireDb4();
+  const rows = await db.select().from(knowledgeBaseSnapshots).where(
+    and8(
+      eq9(knowledgeBaseSnapshots.id, input.snapshotId),
+      eq9(knowledgeBaseSnapshots.userId, input.userId)
+    )
+  ).limit(1);
+  return rows[0] ? publicSnapshot(rows[0]) : null;
+}
 async function getKnowledgeAsset(input) {
   const db = await requireDb4();
   const rows = await db.select({
@@ -10177,6 +10202,7 @@ async function createKnowledgeSnapshot(input) {
       sourceTaskId: input.sourceTaskId,
       sourceArtifactHash: input.sourceArtifactHash,
       archiveHash: input.archiveHash,
+      maintenanceTicketId: input.maintenanceTicketId,
       documents: input.documents,
       assets: input.assets,
       documentCount: input.documents.length,
@@ -10889,6 +10915,10 @@ function knowledgeArchiveDescriptorHash(descriptor) {
 // server/knowledge-customer-content.ts
 var CUSTOMER_CONTENT_LEAKAGE_RULES = [
   {
+    label: "\u8FC7\u7A0B\u6027\u6216\u6279\u91CF\u586B\u5145\u8868\u8FBE",
+    pattern: /补充说明|第\s*[一二三四五六七八九十百\d]+\s*个内容节点|本轮整理结果/i
+  },
+  {
     label: "\u4EFB\u52A1\u6216\u91C7\u96C6\u8FC7\u7A0B",
     pattern: /本轮|本次(?:采集|任务|构建|处理|检索|核验)|本包|本知识库|抽取失败|采集失败|已核验|证据不足|未形成.{0,16}核验/i
   },
@@ -11121,6 +11151,7 @@ function buildDto(build, rows) {
       revision: build.revision,
       currentLeafId: build.currentLeafId,
       protocolError: build.protocolError,
+      awaitingResponseSince: build.awaitingResponseSince?.getTime() ?? null,
       updatedAt: build.updatedAt.getTime()
     },
     summary: {
@@ -11184,6 +11215,7 @@ async function createKnowledgeBaseBuild(input) {
         lastOutputItemIds: [],
         lastTurnUserText: null,
         lastTurnAttachmentCount: 0,
+        awaitingResponseSince: /* @__PURE__ */ new Date(),
         packageRevision: null,
         packageTaskId: null,
         packageOutputItemId: null,
@@ -11207,7 +11239,8 @@ async function createKnowledgeBaseBuild(input) {
       skillName: input.skillName || "socratic-kb-builder",
       skillVersion: input.skillVersion || "1",
       skillContentHash: input.skillContentHash || null,
-      status: "researching"
+      status: "researching",
+      awaitingResponseSince: /* @__PURE__ */ new Date()
     });
     return await loadBuild(tx, input.userId, conversationId);
   });
@@ -11232,7 +11265,8 @@ async function recordKnowledgeBaseTurn(input) {
     lastTurnAttachmentCount: Math.max(
       0,
       Math.trunc(input.attachmentCount || 0)
-    )
+    ),
+    awaitingResponseSince: /* @__PURE__ */ new Date()
   }).where(
     and9(
       eq10(knowledgeBaseBuilds.userId, input.userId),
@@ -11304,9 +11338,25 @@ function friendlyProtocolError(error) {
   }
   return "\u77E5\u8BC6\u5E93\u8282\u70B9\u72B6\u6001\u6821\u9A8C\u5931\u8D25\uFF0C\u672C\u8F6E\u5185\u5BB9\u5C1A\u672A\u66F4\u65B0";
 }
+function recordKnowledgeInputUnlock(build) {
+  if (!build.awaitingResponseSince) return;
+  console.info(
+    "[KnowledgeBaseInteraction] input_unlocked",
+    JSON.stringify({
+      buildId: build.id,
+      conversationId: build.conversationId,
+      revision: build.revision,
+      waitMs: Math.max(0, Date.now() - build.awaitingResponseSince.getTime())
+    })
+  );
+}
 async function rememberProtocolError(input) {
   const db = await requireDb5();
-  await db.update(knowledgeBaseBuilds).set({ status: "protocol_error", protocolError: input.message }).where(
+  await db.update(knowledgeBaseBuilds).set({
+    status: "protocol_error",
+    protocolError: input.message,
+    awaitingResponseSince: null
+  }).where(
     and9(
       eq10(knowledgeBaseBuilds.userId, input.userId),
       eq10(knowledgeBaseBuilds.conversationId, input.conversationId)
@@ -11380,8 +11430,10 @@ async function reconcileKnowledgeBaseProgress(input) {
           needsVerificationCount: 0,
           lastReconciledHash: hash,
           ...outputLedger,
-          protocolError: null
+          protocolError: null,
+          awaitingResponseSince: null
         }).where(eq10(knowledgeBaseBuilds.id, build.id));
+        recordKnowledgeInputUnlock(build);
         build = await loadBuild(tx, input.userId, conversationId);
         rows = await loadNodes(tx, build.id);
         return buildDto(build, rows);
@@ -11441,6 +11493,7 @@ async function reconcileKnowledgeBaseProgress(input) {
           lastReconciledHash: hash,
           ...outputLedger,
           protocolError: null,
+          awaitingResponseSince: null,
           completedAt: null,
           packageRevision: null,
           packageTaskId: null,
@@ -11449,6 +11502,7 @@ async function reconcileKnowledgeBaseProgress(input) {
           packageFilename: null,
           packageDescriptorHash: null
         }).where(eq10(knowledgeBaseBuilds.id, build.id));
+        recordKnowledgeInputUnlock(build);
         build = await loadBuild(tx, input.userId, conversationId);
         rows = await loadNodes(tx, build.id);
         return buildDto(build, rows);
@@ -11520,6 +11574,7 @@ async function reconcileKnowledgeBaseProgress(input) {
         lastReconciledHash: hash,
         ...outputLedger,
         protocolError: null,
+        awaitingResponseSince: null,
         completedAt: packageAllowed ? /* @__PURE__ */ new Date() : null,
         packageRevision: packageAllowed ? nextState.revision : null,
         packageTaskId: packageAllowed ? input.taskId?.slice(0, 255) || build.upstreamTaskId : null,
@@ -11528,6 +11583,7 @@ async function reconcileKnowledgeBaseProgress(input) {
         packageFilename: packageAllowed ? packageDescriptor.filename : null,
         packageDescriptorHash: packageAllowed ? knowledgeArchiveDescriptorHash(packageDescriptor) : null
       }).where(eq10(knowledgeBaseBuilds.id, build.id));
+      recordKnowledgeInputUnlock(build);
       build = await loadBuild(tx, input.userId, conversationId);
       rows = await loadNodes(tx, build.id);
       return buildDto(build, rows);
@@ -11563,10 +11619,13 @@ async function assertKnowledgeBasePublishable(input) {
     );
   }
   const rows = await loadNodes(db, build.id);
+  if (build.status === "published" && build.publishedSnapshotId) {
+    return build;
+  }
   if (build.status !== "ready_to_publish") {
     throw new KnowledgeBaseBuildError(
       "PUBLISH_BLOCKED",
-      build.status === "published" ? "\u5F53\u524D\u77E5\u8BC6\u5E93\u5DF2\u540C\u6B65\uFF1B\u5982\u9700\u66F4\u65B0\uFF0C\u8BF7\u5148\u5728\u6784\u5EFA\u6D41\u7A0B\u4E2D\u8865\u5145\u5185\u5BB9" : "\u77E5\u8BC6\u5E93\u5C1A\u672A\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u786E\u8BA4"
+      "\u77E5\u8BC6\u5E93\u5C1A\u672A\u5B8C\u6210\u5168\u90E8\u8282\u70B9\u786E\u8BA4"
     );
   }
   try {
@@ -14906,6 +14965,7 @@ import {
   like as like2,
   lt as lt4,
   max,
+  ne as ne3,
   or as or3
 } from "drizzle-orm";
 
@@ -15662,6 +15722,16 @@ async function assertWebsiteTicketWorkflow(executor, userId, value) {
     return { profile: null, domain: null };
   }
   const category = value.category?.trim() ?? "";
+  if (category === "knowledge_base_maintenance") {
+    if (protectedAttachments.length) {
+      throw new DeliveryTicketError(
+        "KNOWLEDGE_MAINTENANCE_ATTACHMENT_INVALID",
+        "\u77E5\u8BC6\u5E93\u7EF4\u62A4\u5DE5\u5355\u4E0D\u80FD\u9644\u5E26 ICP \u654F\u611F\u6750\u6599\u3002",
+        400
+      );
+    }
+    return { profile: null, domain: null };
+  }
   const profiles = await executor.select().from(workspaceSiteProfiles).where(eq17(workspaceSiteProfiles.userId, userId)).limit(1).for("update");
   const profile = profiles[0] ?? null;
   if (category === "domain_application") {
@@ -15757,7 +15827,7 @@ function technicalTicketDedupeKey(input) {
     `${nonEmpty(input.category) ?? "general_request"}\0${normalizeTargetPage(input.targetPage)}`
   ).digest("hex");
 }
-function assertDeliveryTicketServiceEligibility(portal, ticketType) {
+function assertDeliveryTicketServiceEligibility(portal, ticketType, category) {
   if (portal.service.status !== "active") {
     throw new DeliveryTicketError(
       "SERVICE_NOT_WRITABLE",
@@ -15765,7 +15835,7 @@ function assertDeliveryTicketServiceEligibility(portal, ticketType) {
       403
     );
   }
-  const planAllowsTicket = portal.service.planCode === "advanced" || portal.service.planCode === "luxury" || portal.service.planCode === "basic" && (ticketType === void 0 || ticketType === "content_asset");
+  const planAllowsTicket = category === "knowledge_base_maintenance" || portal.service.planCode === "advanced" || portal.service.planCode === "luxury" || portal.service.planCode === "basic" && (ticketType === void 0 || ticketType === "content_asset");
   if (!planAllowsTicket) {
     throw new DeliveryTicketError(
       "DELIVERY_TICKET_UPGRADE_REQUIRED",
@@ -15975,6 +16045,7 @@ function ticketDto(row, extra) {
     icpProvince: row.icpProvince,
     icpDeclarations: row.icpDeclarations,
     targetPage: row.targetPage,
+    knowledgeSnapshotId: row.knowledgeSnapshotId,
     materialUrls: row.materialUrls,
     status: row.status,
     statusLabel: DELIVERY_TICKET_STATUS_LABELS[row.status],
@@ -16033,6 +16104,7 @@ function publicDeliveryCategoryLabel(ticket) {
   }
   if (category === "domain_application") return "\u57DF\u540D\u7533\u8BF7";
   if (category === "icp_filing") return "\u57DF\u540D\u7533\u8BF7\u4E0E ICP \u5907\u6848\u6750\u6599";
+  if (category === "knowledge_base_maintenance") return "\u77E5\u8BC6\u5E93\u7EF4\u62A4";
   return WEBSITE_CONTENT_CATALOG.find((item) => item.value === category)?.label ?? category;
 }
 function toPublicDeliveryTicketSummary(ticket) {
@@ -16045,7 +16117,8 @@ function toPublicDeliveryTicketSummary(ticket) {
     topic: nonEmpty(ticket.topic) ?? nonEmpty(ticket.title) ?? nonEmpty(ticket.category),
     publicStatus: publicStatus2,
     publicStatusLabel: DELIVERY_TICKET_PUBLIC_STATUS_LABELS[publicStatus2],
-    publicSummary: publicStatus2 === "completed" ? nonEmpty(ticket.publicSummary) : null
+    publicSummary: publicStatus2 === "completed" ? nonEmpty(ticket.publicSummary) : null,
+    knowledgeSnapshotId: ticket.knowledgeSnapshotId
   };
   return publicDeliveryTicketSummarySchema.parse(
     ticket.type === "content_asset" ? {
@@ -16456,7 +16529,8 @@ async function createDeliveryTicket(input) {
   }
   const scope = assertDeliveryTicketServiceEligibility(
     portal,
-    input.value.type
+    input.value.type,
+    input.value.category
   );
   return db.transaction(
     async (tx) => withSerializedTicketCreation({
@@ -16514,6 +16588,22 @@ async function createDeliveryTicket(input) {
           input.userId,
           input.value
         );
+        if (input.value.category === "knowledge_base_maintenance") {
+          const snapshots = await tx.select({ id: knowledgeBaseSnapshots.id }).from(knowledgeBaseSnapshots).where(
+            and14(
+              eq17(knowledgeBaseSnapshots.id, input.value.knowledgeSnapshotId),
+              eq17(knowledgeBaseSnapshots.userId, input.userId),
+              eq17(knowledgeBaseSnapshots.status, "active")
+            )
+          ).limit(1).for("update");
+          if (!snapshots[0]) {
+            throw new DeliveryTicketError(
+              "KNOWLEDGE_SNAPSHOT_NOT_CURRENT",
+              "\u5173\u8054\u77E5\u8BC6\u5E93\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u65B0\u63D0\u4EA4\u7EF4\u62A4\u5DE5\u5355\u3002",
+              409
+            );
+          }
+        }
         await verifyOwnedAttachments(
           tx,
           input.userId,
@@ -16563,7 +16653,7 @@ async function createDeliveryTicket(input) {
         }
         const technicalDedupe = quotaPool === null ? technicalTicketDedupeKey({
           category: input.value.category,
-          targetPage: input.value.targetPage
+          targetPage: input.value.category === "knowledge_base_maintenance" ? `snapshot:${input.value.knowledgeSnapshotId}` : input.value.targetPage
         }) : null;
         if (technicalDedupe) {
           const open = await tx.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
@@ -16600,6 +16690,7 @@ async function createDeliveryTicket(input) {
           icpProvince: nonEmpty(input.value.icpProvince),
           icpDeclarations: input.value.icpDeclarations ?? null,
           targetPage: nonEmpty(input.value.targetPage),
+          knowledgeSnapshotId: input.value.knowledgeSnapshotId ?? null,
           technicalDedupeKey: technicalDedupe,
           materialUrls: input.value.materialUrls,
           status: "submitted",
@@ -16691,6 +16782,31 @@ async function createDeliveryTicket(input) {
       }
     })
   );
+}
+async function assertKnowledgeMaintenanceTicketForUpload(input) {
+  const db = await requireDb10();
+  const rows = await db.select().from(deliveryTickets).where(
+    and14(
+      eq17(deliveryTickets.id, input.ticketId),
+      eq17(deliveryTickets.userId, input.userId)
+    )
+  ).limit(1);
+  const ticket = rows[0];
+  if (!ticket || ticket.type !== "website_operation" || ticket.category !== "knowledge_base_maintenance") {
+    throw new DeliveryTicketError(
+      "KNOWLEDGE_MAINTENANCE_TICKET_INVALID",
+      "\u8BE5\u5DE5\u5355\u4E0D\u662F\u5F53\u524D\u5BA2\u6237\u7684\u77E5\u8BC6\u5E93\u7EF4\u62A4\u5DE5\u5355\u3002",
+      400
+    );
+  }
+  if (TERMINAL_STATUSES.has(ticket.status)) {
+    throw new DeliveryTicketError(
+      "TICKET_CLOSED",
+      "\u5DF2\u7ED3\u675F\u7684\u7EF4\u62A4\u5DE5\u5355\u4E0D\u80FD\u518D\u4E0A\u4F20\u77E5\u8BC6\u5E93\u3002",
+      409
+    );
+  }
+  return ticket;
 }
 async function requireOwnedTicket(executor, userId, ticketId, lock = false) {
   let query = executor.select().from(deliveryTickets).where(
@@ -17148,6 +17264,23 @@ async function updateManagedDeliveryTicket(input) {
         ticket,
         userId: input.userId
       });
+    }
+    if (ticket.type === "website_operation" && ticket.category === "knowledge_base_maintenance") {
+      const replacementSnapshots = await tx.select({ id: knowledgeBaseSnapshots.id }).from(knowledgeBaseSnapshots).where(
+        and14(
+          eq17(knowledgeBaseSnapshots.userId, input.userId),
+          eq17(knowledgeBaseSnapshots.status, "active"),
+          eq17(knowledgeBaseSnapshots.maintenanceTicketId, ticket.id),
+          ticket.knowledgeSnapshotId ? ne3(knowledgeBaseSnapshots.id, ticket.knowledgeSnapshotId) : void 0
+        )
+      ).limit(1).for("update");
+      if (!replacementSnapshots[0]) {
+        throw new DeliveryTicketError(
+          "KNOWLEDGE_MAINTENANCE_NOT_PUBLISHED",
+          "\u5B8C\u6210\u7EF4\u62A4\u5DE5\u5355\u524D\uFF0C\u5FC5\u987B\u5148\u4E0A\u4F20\u5E76\u53D1\u5E03\u901A\u8FC7\u6821\u9A8C\u7684\u65B0\u77E5\u8BC6\u5E93\u7248\u672C\u3002",
+          409
+        );
+      }
     }
     const nextQuotaState = deriveTicketQuotaTransition({
       currentState: ticket.quotaState,
@@ -20625,6 +20758,7 @@ var conversationSnapshotSchema = z10.object({
     "idle",
     "running",
     "pending",
+    "awaiting_input",
     "completed",
     "error",
     "failed"
@@ -24063,6 +24197,22 @@ function publicUpstreamPayload(value, apiKey) {
     })
   );
 }
+function publicUpstreamFilePayload(value, apiKey) {
+  const sanitized = publicUpstreamPayload(value, apiKey);
+  if (!value || typeof value !== "object" || Array.isArray(value) || !sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) {
+    return sanitized;
+  }
+  const rawUploadUrl = value.upload_url;
+  if (typeof rawUploadUrl !== "string") return sanitized;
+  return {
+    ...sanitized,
+    upload_url: assertSafeExternalUrl(rawUploadUrl)
+  };
+}
+function isPublicFilePayloadRequest(method, targetPath) {
+  const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
+  return method.toUpperCase() === "POST" && pathname === "/v1/files" || ["GET", "HEAD"].includes(method.toUpperCase()) && /^\/v1\/files\/[^/]+$/.test(pathname);
+}
 var PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS = [
   "id",
   "task_id",
@@ -25151,13 +25301,25 @@ router2.put("/proxy-upload", async (req, res) => {
       ...safeExternalRequestOptions,
       headers: uploadHeaders,
       timeout: 3e5,
+      // Redirecting a SigV4 URL changes the signed request target and produces
+      // a misleading authentication failure. Presigned uploads must be exact.
+      maxRedirects: 0,
       maxBodyLength: Infinity,
       maxContentLength: 1024 * 1024,
       signal: controller.signal,
       validateStatus: () => true
     });
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response2.status}`);
-    res.status(response2.status).send(response2.data || "");
+    if (response2.status >= 200 && response2.status < 300) {
+      res.status(response2.status).send("");
+      return;
+    }
+    res.status(response2.status).json({
+      error: {
+        message: response2.status >= 400 && response2.status < 500 ? "\u4E0A\u4F20\u5730\u5740\u65E0\u6548\u6216\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u6587\u4EF6\u540E\u91CD\u8BD5" : "\u6587\u4EF6\u5B58\u50A8\u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
+        code: "UPSTREAM_UPLOAD_REJECTED"
+      }
+    });
   } catch (error) {
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
@@ -25777,7 +25939,7 @@ router2.all("/*", async (req, res) => {
         }
       }
     }
-    const publicResponse = typeof response2.data === "object" ? isPublicTaskPayloadRequest(req.method, targetPath) ? publicUpstreamTaskPayload(response2.data, apiKey) : publicUpstreamPayload(response2.data, apiKey) : typeof response2.data === "string" ? sanitizeText(redactSensitiveText(response2.data, [apiKey])) : response2.data;
+    const publicResponse = typeof response2.data === "object" ? isPublicTaskPayloadRequest(req.method, targetPath) ? publicUpstreamTaskPayload(response2.data, apiKey) : isPublicFilePayloadRequest(req.method, targetPath) ? publicUpstreamFilePayload(response2.data, apiKey) : publicUpstreamPayload(response2.data, apiKey) : typeof response2.data === "string" ? sanitizeText(redactSensitiveText(response2.data, [apiKey])) : response2.data;
     if (publicResponse && typeof publicResponse === "object" && !Array.isArray(publicResponse) && Array.isArray(publicResponse.output)) {
       const publicRecord = publicResponse;
       const outputSummary = publicRecord.output.map(
@@ -25832,6 +25994,7 @@ var manus_proxy_default = router2;
 
 // server/knowledge-base-api.ts
 import axios4 from "axios";
+import { and as and20, eq as eq23, inArray as inArray13, isNotNull, or as or4 } from "drizzle-orm";
 import { Router as Router2 } from "express";
 import fs4 from "fs/promises";
 import JSZip from "jszip";
@@ -25898,7 +26061,274 @@ function selectUnreconciledKnowledgeOutput(output, ledger) {
     return Boolean(id) && !previousIds.has(id);
   });
   if (unseenById.length > 0) return unseenById;
+  const currentIds = outputItemIds(output);
+  if (currentIds.length > 0 && currentIds.every((id) => previousIds.has(id))) {
+    return [];
+  }
   return output;
+}
+var COMPLETE_KNOWLEDGE_PROTOCOL_ENVELOPE = /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/i;
+var COMPLETE_KNOWLEDGE_PROTOCOL_COMMENT = /<!--\s*FRONTMIND_KB_[A-Z_]+\b[\s\S]*?-->/i;
+function normalizedUpstreamTaskStatus(status) {
+  const value = String(status || "running").trim().toLowerCase();
+  return value === "failed" ? "error" : value;
+}
+var knowledgeInteractionAlertAt = /* @__PURE__ */ new Map();
+function observeKnowledgeInteraction(progress, upstreamStatus) {
+  const normalized = normalizedUpstreamTaskStatus(upstreamStatus);
+  const now = Date.now();
+  const knownStatuses = /* @__PURE__ */ new Set([
+    "created",
+    "queued",
+    "pending",
+    "running",
+    "in_progress",
+    "awaiting_input",
+    "awaiting_user",
+    "awaiting_user_input",
+    "waiting",
+    "paused",
+    "requires_action",
+    "input_required",
+    "completed",
+    "error"
+  ]);
+  const alert = (kind, metadata) => {
+    const key = `${progress?.build.id || "unbound"}:${kind}:${normalized}`;
+    if ((knowledgeInteractionAlertAt.get(key) || 0) > now - 10 * 6e4) {
+      return;
+    }
+    knowledgeInteractionAlertAt.set(key, now);
+    console.warn(
+      `[KnowledgeBaseInteraction] ${kind}`,
+      JSON.stringify(metadata)
+    );
+  };
+  if (!knownStatuses.has(normalized)) {
+    alert("unknown_upstream_status", {
+      buildId: progress?.build.id || null,
+      upstreamStatus: normalized
+    });
+  }
+  const awaitingSince = progress?.build.awaitingResponseSince;
+  if (typeof awaitingSince === "number" && now - awaitingSince > 2 * 60 * 6e4) {
+    alert("execution_timeout", {
+      buildId: progress?.build.id || null,
+      upstreamStatus: normalized,
+      waitMs: now - awaitingSince
+    });
+  }
+  if (knowledgeInteractionAlertAt.size > 1e3) {
+    const expiry = now - 60 * 6e4;
+    knowledgeInteractionAlertAt.forEach((lastSeen, key) => {
+      if (lastSeen < expiry) knowledgeInteractionAlertAt.delete(key);
+    });
+  }
+}
+function upstreamTaskFailed(status) {
+  const normalized = normalizedUpstreamTaskStatus(status);
+  return normalized === "error" || normalized === "failed";
+}
+function upstreamTaskTerminal(status) {
+  return upstreamTaskFailed(status) || normalizedUpstreamTaskStatus(status) === "completed";
+}
+function shouldReconcileKnowledgeOutput(output, status) {
+  const text2 = extractFinalKnowledgeBaseAssistantText(output);
+  if (!text2) return false;
+  if (COMPLETE_KNOWLEDGE_PROTOCOL_ENVELOPE.test(text2) || COMPLETE_KNOWLEDGE_PROTOCOL_COMMENT.test(text2)) {
+    return true;
+  }
+  return upstreamTaskTerminal(status);
+}
+function deriveKnowledgeBaseInteraction(progress, upstreamStatus) {
+  observeKnowledgeInteraction(progress, upstreamStatus);
+  if (progress?.build.status === "published") {
+    return {
+      progress,
+      interactionState: "published",
+      canReply: false,
+      canPublish: false,
+      lockReason: "\u77E5\u8BC6\u5E93\u5DF2\u53D1\u5E03\uFF1B\u540E\u7EED\u4FEE\u6539\u8BF7\u63D0\u4EA4\u7EF4\u62A4\u5DE5\u5355"
+    };
+  }
+  if (progress?.packageAllowed && progress.build.status === "ready_to_publish") {
+    return {
+      progress,
+      interactionState: "ready_to_publish",
+      canReply: false,
+      canPublish: true,
+      lockReason: "\u77E5\u8BC6\u5E93\u5DF2\u5B8C\u6210\uFF0C\u8BF7\u6267\u884C\u552F\u4E00\u4E00\u6B21\u76F4\u63A5\u66F4\u65B0"
+    };
+  }
+  if (progress?.build.status === "protocol_error" || progress?.build.status === "failed" || upstreamTaskFailed(upstreamStatus)) {
+    return {
+      progress,
+      interactionState: "failed",
+      canReply: false,
+      canPublish: false,
+      lockReason: progress?.build.protocolError || "\u77E5\u8BC6\u5E93\u4EFB\u52A1\u6267\u884C\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u72B6\u6001"
+    };
+  }
+  if (progress?.build.status === "confirming" && progress.build.currentLeafId && progress.build.awaitingResponseSince === null) {
+    return {
+      progress,
+      interactionState: "awaiting_input",
+      canReply: true,
+      canPublish: false,
+      lockReason: null
+    };
+  }
+  const interactionState = normalizedUpstreamTaskStatus(upstreamStatus) === "pending" ? "queued" : "executing";
+  return {
+    progress,
+    interactionState,
+    canReply: false,
+    canPublish: false,
+    lockReason: "FrontMind \u6B63\u5728\u6574\u7406\u5F53\u524D\u77E5\u8BC6\u8282\u70B9"
+  };
+}
+async function reconcileAvailableKnowledgeOutput(input) {
+  let progress = await getKnowledgeBaseProgress({
+    userId: input.userId,
+    conversationId: input.conversationId
+  });
+  const unreconciled = selectUnreconciledKnowledgeOutput(
+    input.output,
+    input.ledger
+  );
+  if (shouldReconcileKnowledgeOutput(unreconciled, input.upstreamStatus)) {
+    progress = await reconcileKnowledgeBaseProgress({
+      userId: input.userId,
+      conversationId: input.conversationId,
+      taskId: input.taskId,
+      output: unreconciled,
+      outputState: {
+        totalLength: input.output.length,
+        itemIds: outputItemIds(input.output)
+      }
+    });
+  }
+  return progress;
+}
+async function recoverOpenKnowledgeBaseTasks(options) {
+  const db = await getDb();
+  if (!db) {
+    return { scanned: 0, reconciled: 0, skipped: 0, failed: 0 };
+  }
+  const limit = Math.min(500, Math.max(1, Math.trunc(options?.limit ?? 100)));
+  const concurrency = Math.min(
+    8,
+    Math.max(1, Math.trunc(options?.concurrency ?? 3))
+  );
+  const builds = await db.select({
+    id: knowledgeBaseBuilds.id,
+    userId: knowledgeBaseBuilds.userId,
+    conversationId: knowledgeBaseBuilds.conversationId,
+    upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+    lastOutputLength: knowledgeBaseBuilds.lastOutputLength,
+    lastOutputItemIds: knowledgeBaseBuilds.lastOutputItemIds
+  }).from(knowledgeBaseBuilds).where(
+    and20(
+      inArray13(knowledgeBaseBuilds.status, ["researching", "confirming"]),
+      isNotNull(knowledgeBaseBuilds.upstreamTaskId),
+      or4(
+        eq23(knowledgeBaseBuilds.status, "researching"),
+        isNotNull(knowledgeBaseBuilds.awaitingResponseSince)
+      )
+    )
+  ).limit(limit);
+  const result = {
+    scanned: builds.length,
+    reconciled: 0,
+    skipped: 0,
+    failed: 0
+  };
+  let cursor = 0;
+  const baseUrl = getUpstreamBaseUrl();
+  const worker = async () => {
+    while (cursor < builds.length) {
+      const build = builds[cursor++];
+      const taskId = String(build.upstreamTaskId || "");
+      try {
+        const credential = await getCredentialForUpstreamResource(
+          build.userId,
+          "task",
+          taskId
+        );
+        if (!credential) {
+          result.skipped += 1;
+          console.warn(
+            "[KnowledgeBaseRecovery] credential_unavailable",
+            JSON.stringify({ buildId: build.id, taskId })
+          );
+          continue;
+        }
+        const taskResponse = await axios4.get(
+          `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
+          {
+            headers: {
+              API_KEY: credential.apiKey,
+              Authorization: `Bearer ${credential.apiKey}`
+            },
+            timeout: 12e4,
+            validateStatus: () => true
+          }
+        );
+        if (taskResponse.status < 200 || taskResponse.status >= 300) {
+          result.failed += 1;
+          console.warn(
+            "[KnowledgeBaseRecovery] task_read_failed",
+            JSON.stringify({
+              buildId: build.id,
+              taskId,
+              status: taskResponse.status
+            })
+          );
+          continue;
+        }
+        const taskData = taskResponse.data || {};
+        const output = Array.isArray(taskData.output) ? taskData.output : [];
+        const taskStatus = normalizedUpstreamTaskStatus(taskData.status);
+        if (!shouldReconcileKnowledgeOutput(output, taskStatus)) {
+          observeKnowledgeInteraction(
+            await getKnowledgeBaseProgress({
+              userId: build.userId,
+              conversationId: build.conversationId
+            }),
+            taskStatus
+          );
+          result.skipped += 1;
+          continue;
+        }
+        await reconcileAvailableKnowledgeOutput({
+          userId: build.userId,
+          conversationId: build.conversationId,
+          taskId,
+          output,
+          upstreamStatus: taskStatus,
+          ledger: {
+            lastOutputLength: build.lastOutputLength,
+            lastOutputItemIds: build.lastOutputItemIds
+          }
+        });
+        result.reconciled += 1;
+      } catch (error) {
+        result.failed += 1;
+        console.warn(
+          "[KnowledgeBaseRecovery] reconcile_failed",
+          JSON.stringify({
+            buildId: build.id,
+            taskId,
+            message: error instanceof Error ? error.message : String(error)
+          })
+        );
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, builds.length) }, worker)
+  );
+  return result;
 }
 var configuredKnowledgeBaseSkillPath = process.env.FRONTMIND_KB_SKILL_PATH?.trim();
 if (configuredKnowledgeBaseSkillPath && !path5.isAbsolute(configuredKnowledgeBaseSkillPath)) {
@@ -26109,6 +26539,7 @@ async function buildKnowledgeBasePrompt({
     "\u4E25\u683C\u6267\u884C\u4E0B\u65B9 socratic-kb-builder v2 Skill\uFF0C\u4E3A\u4F01\u4E1A\u6784\u5EFA\u53EF\u590D\u7528\u7684\u6DF1\u5EA6\u56FE\u6587\u77E5\u8BC6\u5E93\u3002",
     "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\uFF1B\u53EA\u4F7F\u7528\u5F53\u524D Pro Agent \u6A21\u5F0F\u4E0B\u7684\u666E\u901A\u6D4F\u89C8\u3001\u641C\u7D22\u548C\u6587\u4EF6\u5DE5\u5177\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
+    "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u5D4C\u5165\u5B98\u7F51\u6216 CDN \u56FE\u7247\u5916\u94FE\u3002\u56FE\u7247\u5FC5\u987B\u5148\u4E0B\u8F7D\u771F\u5B9E\u5B57\u8282\u3001\u89E3\u7801\u6821\u9A8C\u5E76\u6253\u5165\u6700\u7EC8 ZIP\uFF0C\u518D\u4EE5\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u5F15\u7528\uFF1B\u9632\u76D7\u94FE\u3001\u7B7E\u540D\u3001\u8FC7\u671F\u6216\u65E0\u6CD5\u4E0B\u8F7D\u7684\u5730\u5740\u53EA\u80FD\u8FDB\u5165\u5185\u90E8\u6765\u6E90\u8BB0\u5F55\uFF0C\u7EDD\u4E0D\u80FD\u4F5C\u4E3A\u5BA2\u6237\u56FE\u7247\u8FD4\u56DE\u3002",
     "",
     "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
     `\u6784\u5EFA\u4F1A\u8BDD\u6807\u8BC6\uFF1A${conversationId || "\u672A\u63D0\u4F9B"}`,
@@ -26136,9 +26567,9 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     "\u8FD9\u662F\u670D\u52A1\u7AEF\u72B6\u6001\u673A\u534F\u8BAE\uFF0C\u4F18\u5148\u7EA7\u9AD8\u4E8E skill \u4E2D\u4EFB\u4F55\u4F1A\u81EA\u52A8\u8DE8\u8282\u70B9\u7684\u8868\u8FF0\u3002\u53EF\u8BFB\u6B63\u6587\u7167\u5E38\u8F93\u51FA\uFF0C\u4F46\u6BCF\u8F6E\u672B\u5C3E\u5FC5\u987B\u9644\u5E26\u4E14\u53EA\u80FD\u9644\u5E26\u4E00\u4E2A\u5BF9\u5E94\u7684 HTML \u6CE8\u91CA\u4FE1\u5C01\u3002",
     "",
     "### \u9996\u8F6E\u7814\u7A76\u4E0E\u77E5\u8BC6\u6811\u5EFA\u7ACB",
-    "\u5B8C\u6210\u5B98\u7F51\u3001\u516C\u5F00\u6765\u6E90\u3001\u4E0A\u4F20\u8D44\u6599\u7814\u7A76\u548C\u6B63\u5F0F\u56FE\u6587\u9884\u586B\u540E\uFF0C\u6309\u4F01\u4E1A\u5B9E\u9645\u60C5\u51B5\u5EFA\u7ACB\u81EA\u9002\u5E94\u4E00\u7EA7\u5206\u652F\u548C 40-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002\u4E00\u7EA7\u5206\u652F\u6570\u91CF\u4E0D\u8BBE\u56FA\u5B9A\u503C\uFF1B\u6BCF\u4E2A\u53F6\u5B50\u5FC5\u987B\u6709\u5168\u5C40\u552F\u4E00\u4E14\u540E\u7EED\u4E0D\u53D8\u7684 id\u3001title\u3001branchId\u3001branchTitle\u3002\u9996\u8F6E\u6B63\u6587\u5C55\u793A\u5B8C\u6574\u5206\u652F\u7EDF\u8BA1\u5E76\u5448\u73B0\u7B2C\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\uFF0C\u7136\u540E\u4EC5\u5728\u56DE\u590D\u672B\u5C3E\u9644\uFF1A",
+    "\u5B8C\u6210\u5B98\u7F51\u3001\u516C\u5F00\u6765\u6E90\u3001\u4E0A\u4F20\u8D44\u6599\u7814\u7A76\u548C\u6B63\u5F0F\u56FE\u6587\u9884\u586B\u540E\uFF0C\u6309\u4F01\u4E1A\u5B9E\u9645\u8D44\u6599\u91CF\u5EFA\u7ACB\u81EA\u9002\u5E94\u4E00\u7EA7\u5206\u652F\u548C 8-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002\u767D\u724C\u4F01\u4E1A\u6216\u53EA\u6709\u5BA3\u4F20\u5355\u65F6\u53EA\u4FDD\u7559\u6709\u4E8B\u5B9E\u4EF7\u503C\u6216\u660E\u786E\u7F3A\u53E3\u7684\u5FC5\u8981\u53F6\u5B50\uFF0C\u4E0D\u5F97\u4E3A\u6570\u91CF\u3001\u5B57\u6570\u6216\u56FE\u7247\u6570\u586B\u5145\u5185\u5BB9\u3002\u4E00\u7EA7\u5206\u652F\u6570\u91CF\u4E0D\u8BBE\u56FA\u5B9A\u503C\uFF1B\u6BCF\u4E2A\u53F6\u5B50\u5FC5\u987B\u6709\u5168\u5C40\u552F\u4E00\u4E14\u540E\u7EED\u4E0D\u53D8\u7684 id\u3001title\u3001branchId\u3001branchTitle\u3002\u9996\u8F6E\u6B63\u6587\u5C55\u793A\u5B8C\u6574\u5206\u652F\u7EDF\u8BA1\u5E76\u5448\u73B0\u7B2C\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\uFF0C\u7136\u540E\u4EC5\u5728\u56DE\u590D\u672B\u5C3E\u9644\uFF1A",
     '<!-- FRONTMIND_KB_MANIFEST\n{"kind":"frontmind.knowledge-base.manifest","schemaVersion":1,"leaves":[{"id":"1.1","title":"\u4E00\u53E5\u8BDD\u5B9A\u4F4D","branchId":"identity","branchTitle":"\u4F01\u4E1A\u8EAB\u4EFD"}]}\n-->',
-    "\u793A\u4F8B\u53EA\u6F14\u793A\u7ED3\u6784\uFF0C\u771F\u5B9E leaves \u5FC5\u987B\u5B8C\u6574\u5305\u542B 40-115 \u9879\u5E76\u8986\u76D6\u57FA\u4E8E\u5F53\u524D\u4F01\u4E1A\u8BC1\u636E\u5F62\u6210\u7684\u5168\u90E8\u4E00\u7EA7\u5206\u652F\u3002\u9996\u8F6E\u4E0D\u5F97\u540C\u65F6\u8F93\u51FA FRONTMIND_KB_PROGRESS\u3002",
+    "\u793A\u4F8B\u53EA\u6F14\u793A\u7ED3\u6784\uFF0C\u771F\u5B9E leaves \u5FC5\u987B\u5B8C\u6574\u5305\u542B 8-115 \u9879\u5E76\u8986\u76D6\u57FA\u4E8E\u5F53\u524D\u4F01\u4E1A\u8BC1\u636E\u5F62\u6210\u7684\u5168\u90E8\u4E00\u7EA7\u5206\u652F\u3002\u9996\u8F6E\u4E0D\u5F97\u540C\u65F6\u8F93\u51FA FRONTMIND_KB_PROGRESS\u3002",
     "",
     "### \u540E\u7EED\u6BCF\u8F6E\u5355\u8282\u70B9\u72B6\u6001",
     "\u670D\u52A1\u7AEF\u4ECE revision=0\u3001\u6E05\u5355\u7B2C\u4E00\u4E2A\u53F6\u5B50\u4E3A current \u5F00\u59CB\u3002\u540E\u7EED\u6BCF\u8F6E\u672B\u5C3E\u5FC5\u987B\u9644\u4E00\u4E2A\u4E14\u4EC5\u4E00\u4E2A\u72B6\u6001\u4FE1\u5C01\uFF1A",
@@ -26280,6 +26711,19 @@ router3.post("/start", async (req, res) => {
     return;
   }
   try {
+    const existingBuild = await getKnowledgeBaseProgress({
+      userId: req.frontmindUser.id,
+      conversationId
+    });
+    if (existingBuild?.build.status === "published") {
+      res.status(409).json({
+        error: {
+          code: "KNOWLEDGE_BASE_LOCKED",
+          message: "\u77E5\u8BC6\u5E93\u5DF2\u53D1\u5E03\uFF1B\u540E\u7EED\u4FEE\u6539\u8BF7\u63D0\u4EA4\u7EF4\u62A4\u5DE5\u5355"
+        }
+      });
+      return;
+    }
     const [workspace, prefillKnowledgeSnapshot] = await Promise.all([
       getDashboardWorkspace(req.frontmindUser.id),
       getLatestKnowledgeSnapshot(req.frontmindUser.id)
@@ -26349,18 +26793,19 @@ router3.post("/start", async (req, res) => {
       conversationId,
       taskId: String(created.task.id)
     });
-    if (created.task.status === "completed" && Array.isArray(created.task.output) && created.task.output.length > 0) {
+    if (Array.isArray(created.task.output) && created.task.output.length > 0) {
       try {
-        progress = await reconcileKnowledgeBaseProgress({
+        progress = await reconcileAvailableKnowledgeOutput({
           userId: req.frontmindUser.id,
           conversationId,
           taskId: String(created.task.id),
           output: created.task.output,
-          outputState: {
-            totalLength: created.task.output.length,
-            itemIds: outputItemIds(created.task.output)
+          upstreamStatus: created.task.status,
+          ledger: {
+            lastOutputLength: 0,
+            lastOutputItemIds: []
           }
-        });
+        }) || progress;
       } catch (error) {
         console.warn(
           "[Knowledge Base Start] initial progress was not accepted:",
@@ -26376,6 +26821,10 @@ router3.post("/start", async (req, res) => {
       visibleMessage: "\u5F00\u59CB\u6784\u5EFA\u4F01\u4E1A\u77E5\u8BC6\u5E93",
       task: created.task,
       progress,
+      interaction: deriveKnowledgeBaseInteraction(
+        progress,
+        created.task.status
+      ),
       startedAt: Date.now()
     });
   } catch (error) {
@@ -26422,6 +26871,24 @@ router3.post("/turn", async (req, res) => {
       conversationId,
       taskId
     });
+    if (boundBuild.status === "published") {
+      res.status(409).json({
+        error: {
+          code: "KNOWLEDGE_BASE_LOCKED",
+          message: "\u77E5\u8BC6\u5E93\u5DF2\u53D1\u5E03\uFF1B\u540E\u7EED\u4FEE\u6539\u8BF7\u63D0\u4EA4\u7EF4\u62A4\u5DE5\u5355"
+        }
+      });
+      return;
+    }
+    if (boundBuild.status !== "confirming" || !boundBuild.currentLeafId || boundBuild.awaitingResponseSince) {
+      res.status(409).json({
+        error: {
+          code: "KNOWLEDGE_BASE_NOT_AWAITING_INPUT",
+          message: "\u5F53\u524D\u77E5\u8BC6\u8282\u70B9\u5C1A\u672A\u8FDB\u5165\u53EF\u56DE\u590D\u72B6\u6001\uFF0C\u8BF7\u5148\u91CD\u65B0\u540C\u6B65\u4EFB\u52A1\u72B6\u6001"
+        }
+      });
+      return;
+    }
     const taskCredential = await getCredentialForUpstreamResource(
       req.frontmindUser.id,
       "task",
@@ -26494,25 +26961,26 @@ router3.post("/turn", async (req, res) => {
       userId: req.frontmindUser.id,
       conversationId
     });
-    if (created.task.status === "completed" && Array.isArray(created.task.output) && created.task.output.length > 0) {
-      const newOutput = selectUnreconciledKnowledgeOutput(created.task.output, {
-        lastOutputLength: boundBuild.lastOutputLength,
-        lastOutputItemIds: boundBuild.lastOutputItemIds
-      });
-      progress = await reconcileKnowledgeBaseProgress({
+    if (Array.isArray(created.task.output) && created.task.output.length > 0) {
+      progress = await reconcileAvailableKnowledgeOutput({
         userId: req.frontmindUser.id,
         conversationId,
         taskId: String(created.task.id),
-        output: newOutput,
-        outputState: {
-          totalLength: created.task.output.length,
-          itemIds: outputItemIds(created.task.output)
+        output: created.task.output,
+        upstreamStatus: created.task.status,
+        ledger: {
+          lastOutputLength: boundBuild.lastOutputLength,
+          lastOutputItemIds: boundBuild.lastOutputItemIds
         }
-      });
+      }) || progress;
     }
     res.json({
       task: created.task,
       progress,
+      interaction: deriveKnowledgeBaseInteraction(
+        progress,
+        created.task.status
+      ),
       startedAt: Date.now()
     });
   } catch (error) {
@@ -26531,7 +26999,10 @@ router3.get("/progress/:conversationId", async (req, res) => {
       userId: req.frontmindUser.id,
       conversationId: req.params.conversationId
     });
-    res.json({ progress });
+    res.json({
+      progress,
+      interaction: deriveKnowledgeBaseInteraction(progress, "running")
+    });
   } catch (error) {
     res.status(400).json({
       error: error instanceof Error ? error.message : "\u8BFB\u53D6\u77E5\u8BC6\u5E93\u8FDB\u5EA6\u5931\u8D25"
@@ -26560,6 +27031,17 @@ router3.post("/progress/reconcile", async (req, res) => {
       conversationId,
       taskId
     });
+    if (boundBuild.status === "published") {
+      const progress2 = await getKnowledgeBaseProgress({
+        userId: req.frontmindUser.id,
+        conversationId
+      });
+      res.json({
+        progress: progress2,
+        interaction: deriveKnowledgeBaseInteraction(progress2, "completed")
+      });
+      return;
+    }
     const credential = await getCredentialForUpstreamResource(
       req.frontmindUser.id,
       "task",
@@ -26595,31 +27077,23 @@ router3.post("/progress/reconcile", async (req, res) => {
       return;
     }
     const taskData = taskResponse.data || {};
-    const taskStatus = taskData.status === "failed" ? "error" : taskData.status;
-    if (taskStatus === "running" || taskStatus === "pending") {
-      res.status(409).json({
-        error: {
-          code: "TASK_NOT_COMPLETED",
-          message: "\u77E5\u8BC6\u5E93\u4EFB\u52A1\u4ECD\u5728\u5904\u7406\u4E2D"
-        }
-      });
-      return;
-    }
+    const taskStatus = normalizedUpstreamTaskStatus(taskData.status);
     const fullOutput = Array.isArray(taskData.output) ? taskData.output : [];
-    const progress = await reconcileKnowledgeBaseProgress({
+    const progress = await reconcileAvailableKnowledgeOutput({
       userId: req.frontmindUser.id,
       conversationId,
       taskId,
-      output: selectUnreconciledKnowledgeOutput(fullOutput, {
+      output: fullOutput,
+      upstreamStatus: taskStatus,
+      ledger: {
         lastOutputLength: boundBuild.lastOutputLength,
         lastOutputItemIds: boundBuild.lastOutputItemIds
-      }),
-      outputState: {
-        totalLength: fullOutput.length,
-        itemIds: outputItemIds(fullOutput)
       }
     });
-    res.json({ progress });
+    res.json({
+      progress,
+      interaction: deriveKnowledgeBaseInteraction(progress, taskStatus)
+    });
   } catch (error) {
     const status = error instanceof KnowledgeBaseBuildError && error.code === "BUILD_NOT_FOUND" ? 404 : 422;
     res.status(status).json({
@@ -27527,7 +28001,7 @@ import { createHash as createHash14, randomUUID as randomUUID20 } from "node:cry
 import { mkdir as mkdir2, readFile as readFile2, unlink as unlink2, writeFile as writeFile2 } from "node:fs/promises";
 import path7 from "node:path";
 import axios6 from "axios";
-import { eq as eq24 } from "drizzle-orm";
+import { eq as eq25 } from "drizzle-orm";
 import ExcelJS2 from "exceljs";
 import express2 from "express";
 import JSZip2 from "jszip";
@@ -27582,7 +28056,7 @@ import {
   randomUUID as randomUUID19,
   timingSafeEqual as timingSafeEqual5
 } from "node:crypto";
-import { and as and20, eq as eq23, isNull as isNull5, lt as lt5 } from "drizzle-orm";
+import { and as and21, eq as eq24, isNull as isNull5, lt as lt5 } from "drizzle-orm";
 import { z as z17 } from "zod";
 var DEFAULT_TTL_SECONDS = 5 * 60;
 var MIN_SECRET_LENGTH = 32;
@@ -27715,7 +28189,7 @@ function dashboardImportPreflightStoreForExecutor(executor) {
       });
     },
     async consume(binding, now) {
-      const rows = await executor.select().from(dashboardImportPreflights).where(eq23(dashboardImportPreflights.id, binding.nonce)).limit(1).for("update");
+      const rows = await executor.select().from(dashboardImportPreflights).where(eq24(dashboardImportPreflights.id, binding.nonce)).limit(1).for("update");
       const row = rows[0];
       if (!row || row.consumedAt || row.expiresAt.getTime() <= now.getTime()) {
         return null;
@@ -27736,8 +28210,8 @@ function dashboardImportPreflightStoreForExecutor(executor) {
         return null;
       }
       await executor.update(dashboardImportPreflights).set({ consumedAt: now }).where(
-        and20(
-          eq23(dashboardImportPreflights.id, binding.nonce),
+        and21(
+          eq24(dashboardImportPreflights.id, binding.nonce),
           isNull5(dashboardImportPreflights.consumedAt)
         )
       );
@@ -28022,7 +28496,7 @@ var websiteV2ImageDiscoveryMethodSchema = z18.enum([
   "official_document"
 ]);
 var websiteV2PackageManifestSchema = z18.object({
-  schemaVersion: z18.literal(2),
+  schemaVersion: z18.union([z18.literal(2), z18.literal(3)]),
   profile: z18.literal("website-lead-v1"),
   documents: z18.array(
     z18.object({
@@ -28061,8 +28535,10 @@ var websiteV2PackageManifestSchema = z18.object({
       alt: z18.string().trim().max(1e3).optional(),
       branchId: z18.string().trim().min(1).max(191),
       documentIds: z18.array(z18.string().trim().min(1).max(191)).min(1).max(500),
-      sourcePageUrl: packageSourceUrlSchema,
+      sourcePageUrl: packageSourceUrlSchema.optional(),
       sourceAssetUrl: packageSourceUrlSchema.optional(),
+      sourceDocumentPath: z18.string().trim().min(1).max(600).optional(),
+      sourceKind: z18.enum(["official_web", "official_document", "user_upload"]).optional(),
       ownership: packageAssetOwnershipSchema,
       assetType: packageAssetTypeSchema,
       displayRole: packageAssetDisplayRoleSchema
@@ -28099,27 +28575,29 @@ var websiteV2PackageManifestSchema = z18.object({
     eligibleFirstPartyImages: z18.number().int().nonnegative().max(48),
     rejectedCandidateImages: z18.number().int().nonnegative(),
     scannedSourcePages: z18.number().int().nonnegative(),
-    discoveryMethods: z18.array(websiteV2ImageDiscoveryMethodSchema).length(7),
+    discoveryMethods: z18.array(websiteV2ImageDiscoveryMethodSchema).max(7),
     candidates: z18.array(
       z18.object({
-        url: packageSourceUrlSchema,
-        sourcePageUrl: packageSourceUrlSchema,
+        url: packageSourceUrlSchema.optional(),
+        sourcePageUrl: packageSourceUrlSchema.optional(),
+        sourceDocumentPath: z18.string().trim().min(1).max(600).optional(),
+        sourceKind: z18.enum(["official_web", "official_document", "user_upload"]).optional(),
         method: websiteV2ImageDiscoveryMethodSchema,
         status: z18.enum(["eligible", "rejected", "uninspected"]),
         assetId: z18.string().trim().min(1).max(191).optional(),
         rejectionReason: z18.string().trim().min(8).max(500).optional()
       }).strict()
-    ).max(180),
+    ).max(1e3),
     productFamilies: z18.array(
       z18.object({
         id: z18.string().trim().min(1).max(191),
         name: z18.string().trim().min(1).max(500),
         officialVisualFound: z18.boolean(),
-        checkedSources: z18.number().int().positive(),
+        checkedSources: z18.number().int().nonnegative(),
         assetIds: z18.array(z18.string().trim().min(1).max(191)).max(48),
         gapReason: z18.string().trim().min(8).max(2e3).optional()
       }).strict()
-    ).min(1).max(120),
+    ).max(120),
     shortfallReason: z18.string().trim().min(8).max(2e3).optional()
   }).strict()
 }).strict().superRefine((value, context) => {
@@ -28140,7 +28618,11 @@ var websiteV2PackageManifestSchema = z18.object({
   const uninspected = candidates.filter(
     (candidate) => candidate.status === "uninspected"
   );
-  if (new Set(candidates.map((candidate) => candidate.url)).size !== candidates.length || value.imageSelection.discoveredCandidateImages !== candidates.length || value.imageSelection.inspectedCandidateImages !== eligible.length + rejected.length || value.imageSelection.eligibleFirstPartyImages !== eligible.length || value.imageSelection.rejectedCandidateImages !== rejected.length || value.imageSelection.discoveredCandidateImages !== value.imageSelection.inspectedCandidateImages + uninspected.length) {
+  if (new Set(
+    candidates.map(
+      (candidate) => candidate.url || `document:${candidate.sourceDocumentPath || ""}`
+    )
+  ).size !== candidates.length || value.imageSelection.discoveredCandidateImages !== candidates.length || value.imageSelection.inspectedCandidateImages !== eligible.length + rejected.length || value.imageSelection.eligibleFirstPartyImages !== eligible.length || value.imageSelection.rejectedCandidateImages !== rejected.length || value.imageSelection.discoveredCandidateImages !== value.imageSelection.inspectedCandidateImages + uninspected.length) {
     context.addIssue({
       code: "custom",
       path: ["imageSelection", "candidates"],
@@ -28160,7 +28642,7 @@ var websiteV2PackageManifestSchema = z18.object({
   const assetsById = new Map(value.assets.map((asset) => [asset.id, asset]));
   eligible.forEach((candidate, index2) => {
     const asset = candidate.assetId ? assetsById.get(candidate.assetId) : void 0;
-    if (!asset || asset.sourceAssetUrl !== candidate.url || asset.sourcePageUrl !== candidate.sourcePageUrl) {
+    if (!asset || asset.sourceAssetUrl !== candidate.url || asset.sourcePageUrl !== candidate.sourcePageUrl || asset.sourceDocumentPath !== candidate.sourceDocumentPath) {
       context.addIssue({
         code: "custom",
         path: ["imageSelection", "candidates", index2],
@@ -28190,7 +28672,7 @@ var websiteV2PackageManifestSchema = z18.object({
   }
 });
 var internalPackageManifestSchema = z18.object({
-  schemaVersion: z18.union([z18.literal(1), z18.literal(2)]),
+  schemaVersion: z18.union([z18.literal(1), z18.literal(2), z18.literal(3)]),
   profile: z18.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
   websiteV2Normalized: z18.literal(true).optional(),
   documents: z18.array(
@@ -28235,6 +28717,8 @@ var internalPackageManifestSchema = z18.object({
       documentIds: z18.array(z18.string().trim().min(1).max(191)).min(1).max(500),
       sourcePageUrl: packageSourceUrlSchema.optional(),
       sourceAssetUrl: packageSourceUrlSchema.optional(),
+      sourceDocumentPath: z18.string().trim().min(1).max(600).optional(),
+      sourceKind: z18.enum(["official_web", "official_document", "user_upload"]).optional(),
       ownership: packageAssetOwnershipSchema,
       assetType: packageAssetTypeSchema.optional(),
       displayRole: packageAssetDisplayRoleSchema.optional()
@@ -28292,8 +28776,10 @@ var internalPackageManifestSchema = z18.object({
     ).max(500).optional(),
     candidates: z18.array(
       z18.object({
-        url: packageSourceUrlSchema,
-        sourcePageUrl: packageSourceUrlSchema,
+        url: packageSourceUrlSchema.optional(),
+        sourcePageUrl: packageSourceUrlSchema.optional(),
+        sourceDocumentPath: z18.string().trim().min(1).max(600).optional(),
+        sourceKind: z18.enum(["official_web", "official_document", "user_upload"]).optional(),
         method: z18.string().trim().min(1).max(100),
         status: z18.enum(["eligible", "rejected", "uninspected"]),
         assetId: z18.string().trim().min(1).max(191).optional(),
@@ -28317,7 +28803,7 @@ var internalPackageManifestSchema = z18.object({
   const assetPaths = new Set(
     value.assets.map((asset) => asset.path.normalize("NFKC").toLowerCase())
   );
-  if (value.schemaVersion === 2) {
+  if (value.schemaVersion !== 1) {
     if (value.profile === "website-lead-v1" && value.websiteV2Normalized !== true) {
       context.addIssue({
         code: "custom",
@@ -28469,7 +28955,7 @@ var internalPackageManifestSchema = z18.object({
   });
 });
 var packageManifestSchema = z18.preprocess((input) => {
-  const isWebsiteV2 = typeof input === "object" && input !== null && "profile" in input && input.profile === "website-lead-v1" && "schemaVersion" in input && input.schemaVersion === 2;
+  const isWebsiteV2 = typeof input === "object" && input !== null && "profile" in input && input.profile === "website-lead-v1" && "schemaVersion" in input && (input.schemaVersion === 2 || input.schemaVersion === 3);
   if (!isWebsiteV2) return input;
   const value = websiteV2PackageManifestSchema.parse(input);
   const statusByDisplayBranch = new Map(
@@ -28964,8 +29450,12 @@ function websiteV2LeafRequirement(evidenceCharacters) {
 function duplicateFormalParagraphs(documents, profile) {
   const pathsByFingerprint = /* @__PURE__ */ new Map();
   const duplicates = [];
+  const samples = [];
   for (const document of documents) {
     const narrative = profileFormalKnowledgeText(document.content, profile);
+    if (effectiveCharacterCount(narrative) >= 80) {
+      samples.push({ path: document.path, text: narrative });
+    }
     if (effectiveCharacterCount(narrative) < 120) continue;
     const fingerprints = new Set(
       [narrative, ...narrative.split(/\n\s*\n/)].map(
@@ -28983,7 +29473,37 @@ function duplicateFormalParagraphs(documents, profile) {
       duplicates.push({ first: paths[0], second: paths[2] });
     }
   }
+  for (let leftIndex = 0; leftIndex < samples.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < samples.length; rightIndex += 1) {
+      const left = samples[leftIndex];
+      const right = samples[rightIndex];
+      if (normalizedFormalSimilarity(left.text, right.text) >= 0.82) {
+        duplicates.push({ first: left.path, second: right.path });
+      }
+    }
+  }
   return duplicates;
+}
+function normalizedFormalSimilarity(left, right) {
+  const shingles = (value) => {
+    const normalized = value.normalize("NFKC").toLowerCase().replace(/\d+/g, "#").replace(/\s+/g, "").replace(
+      /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]/g,
+      ""
+    );
+    const values = /* @__PURE__ */ new Set();
+    for (let index2 = 0; index2 <= normalized.length - 5; index2 += 1) {
+      values.add(normalized.slice(index2, index2 + 5));
+    }
+    return values;
+  };
+  const leftShingles = shingles(left);
+  const rightShingles = shingles(right);
+  if (!leftShingles.size || !rightShingles.size) return 0;
+  let intersection = 0;
+  leftShingles.forEach((value) => {
+    if (rightShingles.has(value)) intersection += 1;
+  });
+  return intersection / (leftShingles.size + rightShingles.size - intersection);
 }
 function packagedEvidenceCharacters(documents) {
   return documents.filter((document) => document.customerVisible === false).reduce(
@@ -29045,6 +29565,12 @@ function validateProfilePackage(input) {
       "\u77E5\u8BC6\u5E93\u5F52\u6863\u5408\u540C\u7248\u672C\u4E0E package manifest \u4E0D\u4E00\u81F4"
     );
   }
+  if (input.archiveContractVersions !== void 0 && !input.archiveContractVersions.includes(manifest.schemaVersion)) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      "\u77E5\u8BC6\u5E93\u5F52\u6863\u5408\u540C\u7248\u672C\u4E0D\u5728\u5F53\u524D\u4EFB\u52A1\u5141\u8BB8\u7684\u517C\u5BB9\u8303\u56F4\u5185"
+    );
+  }
   if (manifest.profile !== input.profile) {
     throw new KnowledgeArchiveValidationError(
       "structure",
@@ -29062,7 +29588,7 @@ function validateProfilePackage(input) {
     images: 48,
     targetImages: 36,
     minCharacters: 8e3,
-    maxCharacters: manifest.schemaVersion === 2 ? 4e4 : 18e3,
+    maxCharacters: manifest.schemaVersion !== 1 ? 4e4 : 18e3,
     maxEvidenceCharacters: 3e5,
     maxOfficialPages: 120,
     maxDocuments: 22,
@@ -29197,7 +29723,7 @@ function validateProfilePackage(input) {
         `\u6253\u5305\u56FE\u7247\u5FC5\u987B\u662F\u7B2C\u4E00\u65B9\u7D20\u6750\uFF1A${relativePath}`
       );
     }
-    if (manifest.schemaVersion === 2) {
+    if (manifest.schemaVersion !== 1) {
       const isBadgeType = ["brand_identity", "certificate_badge"].includes(
         metadata.assetType || ""
       );
@@ -29227,6 +29753,8 @@ function validateProfilePackage(input) {
       documentIds: metadata.documentIds,
       sourcePageUrl: metadata.sourcePageUrl,
       sourceAssetUrl: metadata.sourceAssetUrl,
+      sourceDocumentPath: metadata.sourceDocumentPath,
+      sourceKind: metadata.sourceKind,
       ownership: metadata.ownership,
       assetType: metadata.assetType,
       displayRole: metadata.displayRole
@@ -29249,6 +29777,37 @@ function validateProfilePackage(input) {
       "media",
       "\u4F01\u4E1A\u77E5\u8BC6\u5E93\u56FE\u7247\u603B\u91CF\u8D85\u8FC7 160 MB"
     );
+  }
+  if (input.profile === "dashboard-enterprise-v1") {
+    const packagedDocumentPaths = new Set(
+      input.documents.map((document) => packageRelativePath(document.path))
+    );
+    for (const asset of enrichedAssets) {
+      if (!asset.sourcePageUrl && !asset.sourceDocumentPath) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `\u56FE\u7247\u7F3A\u5C11\u53EF\u8FFD\u6EAF\u7684\u5B98\u7F51\u9875\u9762\u6216\u6253\u5305\u6765\u6E90\u6587\u6863\uFF1A${asset.path}`
+        );
+      }
+      if (asset.sourceDocumentPath && !packagedDocumentPaths.has(
+        packageRelativePath(asset.sourceDocumentPath)
+      )) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `\u56FE\u7247\u6765\u6E90\u6587\u6863\u672A\u6253\u5305\uFF1A${asset.sourceDocumentPath}`
+        );
+      }
+      if (["product_ui", "product_diagram", "case_photo"].includes(
+        asset.assetType || ""
+      ) && /(?:sprite|icon(?:s|font)?|favicon|logo[\s_-]*(?:wall|sheet|grid|collage)|装饰|背景图|图标集|标志墙|logo墙)/i.test(
+        `${asset.path} ${asset.caption || ""} ${asset.alt || ""}`
+      )) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          `\u88C5\u9970\u56FE\u3001\u56FE\u6807\u96C6\u6216 Logo \u62FC\u8D34\u4E0D\u5F97\u4F5C\u4E3A\u4EA7\u54C1\u89C6\u89C9\uFF1A${asset.path}`
+        );
+      }
+    }
   }
   if (manifest.counts.packagedImages !== enrichedAssets.length) {
     throw new KnowledgeArchiveValidationError(
@@ -29325,9 +29884,15 @@ function validateProfilePackage(input) {
     const enrichedAssetsById = new Map(
       enrichedAssets.flatMap((asset) => asset.id ? [[asset.id, asset]] : [])
     );
-    if (candidates.length !== discovered || new Set(candidates.map((candidate) => candidate.url)).size !== candidates.length || eligibleCandidates.length !== selection.eligibleFirstPartyImages || rejectedCandidates.length !== rejected || eligibleCandidates.length + rejectedCandidates.length !== inspected || inspected + uninspectedCandidates.length !== discovered || eligibleCandidates.some((candidate) => {
+    if (candidates.length !== discovered || new Set(
+      candidates.map(
+        (candidate) => candidate.url || `${candidate.sourceDocumentPath || "unknown"}:${candidate.assetId || candidate.rejectionReason || candidate.status}`
+      )
+    ).size !== candidates.length || candidates.some(
+      (candidate) => !candidate.url && !candidate.sourceDocumentPath || !candidate.sourcePageUrl && !candidate.sourceDocumentPath
+    ) || eligibleCandidates.length !== selection.eligibleFirstPartyImages || rejectedCandidates.length !== rejected || eligibleCandidates.length + rejectedCandidates.length !== inspected || inspected + uninspectedCandidates.length !== discovered || eligibleCandidates.some((candidate) => {
       const asset = candidate.assetId ? enrichedAssetsById.get(candidate.assetId) : void 0;
-      return !asset || candidate.rejectionReason !== void 0 || asset.sourceAssetUrl !== candidate.url || asset.sourcePageUrl !== candidate.sourcePageUrl;
+      return !asset || candidate.rejectionReason !== void 0 || asset.sourceAssetUrl !== candidate.url || asset.sourcePageUrl !== candidate.sourcePageUrl || asset.sourceDocumentPath !== candidate.sourceDocumentPath;
     }) || rejectedCandidates.some(
       (candidate) => candidate.assetId !== void 0 || !candidate.rejectionReason
     ) || uninspectedCandidates.some(
@@ -29461,10 +30026,10 @@ function validateProfilePackage(input) {
       "\u77E5\u8BC6\u5E93\u5FC5\u987B\u540C\u65F6\u5305\u542B\u6B63\u5F0F\u5206\u652F\u7EFC\u8FF0\u548C\u77E5\u8BC6\u53F6\u5B50"
     );
   }
-  if (input.profile === "website-lead-v1" && (manifest.schemaVersion === 1 && (customerDocuments.length < 40 || customerDocuments.length > 56) || manifest.schemaVersion === 2 && (customerOverviewDocuments.length !== 7 || customerLeafDocuments.length < 40 || customerLeafDocuments.length > 56))) {
+  if (input.profile === "website-lead-v1" && (manifest.schemaVersion === 1 && (customerDocuments.length < 40 || customerDocuments.length > 56) || manifest.schemaVersion !== 1 && (customerOverviewDocuments.length !== 7 || customerLeafDocuments.length < 8 || customerLeafDocuments.length > 56))) {
     throw new KnowledgeArchiveValidationError(
       "content",
-      manifest.schemaVersion === 1 ? "\u5386\u53F2\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u5E93\u5FC5\u987B\u5305\u542B 40\u201356 \u4E2A\u5BA2\u6237\u53EF\u89C1\u5185\u5BB9\u6587\u6863" : "\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u5E93 v2 \u5FC5\u987B\u5305\u542B 7 \u7BC7\u5206\u652F\u7EFC\u8FF0\u548C 40\u201356 \u4E2A\u77E5\u8BC6\u53F6\u5B50"
+      manifest.schemaVersion === 1 ? "\u5386\u53F2\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u5E93\u5FC5\u987B\u5305\u542B 40\u201356 \u4E2A\u5BA2\u6237\u53EF\u89C1\u5185\u5BB9\u6587\u6863" : "\u5B98\u7F51\u8F7B\u91CF\u77E5\u8BC6\u5E93 v2 \u5FC5\u987B\u5305\u542B 7 \u7BC7\u5206\u652F\u7EFC\u8FF0\u548C 8\u201356 \u4E2A\u77E5\u8BC6\u53F6\u5B50"
     );
   }
   if (input.profile === "website-lead-v1") {
@@ -29576,10 +30141,10 @@ function validateProfilePackage(input) {
     const leafDocuments = customerDocuments.filter(
       (document) => document.kind === "leaf"
     );
-    if (leafDocuments.length < 40 || leafDocuments.length > 115) {
+    if (leafDocuments.length < 8 || leafDocuments.length > 115) {
       throw new KnowledgeArchiveValidationError(
         "content",
-        "\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u5E93\u5FC5\u987B\u5305\u542B 40\u2013115 \u4E2A\u77E5\u8BC6\u53F6\u5B50"
+        "\u4F01\u4E1A\u6DF1\u5EA6\u77E5\u8BC6\u5E93\u5FC5\u987B\u5305\u542B 8\u2013115 \u4E2A\u77E5\u8BC6\u53F6\u5B50"
       );
     }
     const leafBranches = new Set(
@@ -29648,7 +30213,7 @@ function validateProfilePackage(input) {
       packagedEvidenceDocumentCharacters(document)
     ])
   );
-  if (input.profile === "website-lead-v1" && manifest.schemaVersion === 2) {
+  if (input.profile === "website-lead-v1" && manifest.schemaVersion !== 1) {
     const branchEvidence = manifest.branchEvidence || [];
     const overviewById = new Map(
       customerOverviewDocuments.filter((document) => document.id).map((document) => [document.id, document])
@@ -29702,7 +30267,7 @@ function validateProfilePackage(input) {
     }
     evidencePathByFingerprint.set(fingerprint, evidenceDocument.path);
   }
-  if (manifest.schemaVersion === 2) {
+  if (manifest.schemaVersion !== 1) {
     const unreferencedEvidence = evidenceDocuments.find(
       (document) => !document.id || document.customerVisible !== false || !referencedEvidenceDocumentIds.has(document.id)
     );
@@ -29754,7 +30319,7 @@ function validateProfilePackage(input) {
         `\u6B63\u5F0F\u6B63\u6587\u5305\u542B\u5BA2\u6237\u4E0D\u53EF\u89C1\u7684\u6838\u9A8C\u8FC7\u7A0B\u3001\u5EFA\u8BAE\u6216\u5185\u90E8\u63A8\u7406\uFF08${formalViolation}\uFF09\uFF1A${document.path}`
       );
     }
-    if (manifest.schemaVersion === 2 && (document.kind === "overview" || document.kind === "leaf")) {
+    if (manifest.schemaVersion !== 1 && (document.kind === "overview" || document.kind === "leaf")) {
       const evidenceDocumentIds = document.evidenceDocumentIds || [];
       if (new Set(evidenceDocumentIds).size !== evidenceDocumentIds.length) {
         throw new KnowledgeArchiveValidationError(
@@ -29798,17 +30363,19 @@ function validateProfilePackage(input) {
         isProductBranch: productBranchIds.has(document.branchId || ""),
         evidenceCharacters: actualEvidenceCharacters
       });
-      const requiredFormalCharacters = input.profile === "website-lead-v1" ? document.kind === "leaf" ? websiteV2LeafRequirement(actualEvidenceCharacters) : document.requiredFormalCharacters : expected.required;
+      const requiredFormalCharacters = input.profile === "website-lead-v1" ? document.kind === "leaf" ? websiteV2LeafRequirement(actualEvidenceCharacters) : document.requiredFormalCharacters : document.requiredFormalCharacters;
       if (input.profile === "website-lead-v1" && document.kind === "leaf" && document.requiredFormalCharacters !== requiredFormalCharacters) {
         throw new KnowledgeArchiveValidationError(
           "content",
           `Website v2 \u53F6\u5B50\u52A8\u6001\u8981\u6C42\u4E0D\u6B63\u786E\uFF1A${document.path}`
         );
       }
-      if (input.profile === "dashboard-enterprise-v1" && (document.requiredFormalCharacters !== expected.required || document.contentStatus !== expected.status)) {
+      if (input.profile === "dashboard-enterprise-v1" && (!(/* @__PURE__ */ new Set([0, expected.required])).has(
+        document.requiredFormalCharacters
+      ) || document.contentStatus !== expected.status)) {
         throw new KnowledgeArchiveValidationError(
           "content",
-          `\u6B63\u6587\u52A8\u6001\u8981\u6C42\u6216\u5185\u5BB9\u72B6\u6001\u4E0D\u6B63\u786E\uFF1A${document.path}`
+          `\u6B63\u6587\u8981\u6C42\u6216\u5185\u5BB9\u72B6\u6001\u4E0D\u6B63\u786E\uFF1A${document.path}`
         );
       }
       if (actualEvidenceCharacters === 0 && !["needs_verification", "not_applicable"].includes(
@@ -31966,6 +32533,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
     const validated = validationProfile === "historical" ? { documents, assets } : validateProfilePackage({
       profile: validationProfile,
       archiveContractVersion: options.archiveContractVersion,
+      archiveContractVersions: options.archiveContractVersions,
       packagePaths,
       unpackedBytes,
       rawTextByRelativePath,
@@ -32325,6 +32893,17 @@ router5.post("/knowledge/publish", async (req, res) => {
       userId: targetUserId,
       conversationId
     });
+    if (build.status === "published" && build.publishedSnapshotId) {
+      const snapshot2 = await getKnowledgeSnapshotById({
+        userId: targetUserId,
+        snapshotId: build.publishedSnapshotId
+      });
+      if (!snapshot2) {
+        throw new Error("\u5DF2\u53D1\u5E03\u77E5\u8BC6\u5E93\u8BB0\u5F55\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458");
+      }
+      res.json({ kind: "knowledge", snapshot: snapshot2, idempotent: true });
+      return;
+    }
     const taskId = String(build.packageTaskId || "");
     if (!taskId || taskId !== build.upstreamTaskId || build.packageRevision !== build.revision || !build.packageOutputItemId || !build.packageDescriptorHash) {
       throw new Error("\u6700\u7EC8\u77E5\u8BC6\u5E93\u6587\u4EF6\u5C1A\u672A\u4E0E\u5F53\u524D\u5B8C\u6210\u7248\u672C\u7ED1\u5B9A");
@@ -32355,10 +32934,8 @@ router5.post("/knowledge/publish", async (req, res) => {
     if (returnedTaskId !== taskId) {
       throw new Error("\u8BFB\u53D6\u5230\u7684\u77E5\u8BC6\u5E93\u4EFB\u52A1\u4E0E\u5F53\u524D\u5B8C\u6210\u7248\u672C\u4E0D\u5339\u914D");
     }
-    if (task.status !== "completed") {
-      throw new Error(
-        task.status === "failed" || task.status === "error" ? "\u77E5\u8BC6\u5E93\u4EFB\u52A1\u6267\u884C\u5931\u8D25\uFF0C\u65E0\u6CD5\u53D1\u5E03" : "\u77E5\u8BC6\u5E93\u4EFB\u52A1\u4ECD\u5728\u5904\u7406\u4E2D"
-      );
+    if (task.status === "failed" || task.status === "error") {
+      throw new Error("\u77E5\u8BC6\u5E93\u4EFB\u52A1\u6267\u884C\u5931\u8D25\uFF0C\u65E0\u6CD5\u53D1\u5E03");
     }
     const output = Array.isArray(task.output) ? task.output : [];
     const matchingDescriptors = collectKnowledgeArchiveDescriptors(
@@ -32383,7 +32960,7 @@ router5.post("/knowledge/publish", async (req, res) => {
       snapshotId,
       {
         validationProfile: build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
-        archiveContractVersion: build.skillVersion === "1" ? void 0 : 2
+        archiveContractVersions: build.skillVersion === "1" ? void 0 : [2, 3]
       }
     );
     storedAssetKeys = parsed.storedAssetKeys;
@@ -32415,6 +32992,20 @@ router5.post("/knowledge/publish", async (req, res) => {
         (key) => unlink2(path7.join(storageRoot2, key)).catch(() => void 0)
       )
     );
+    const publishedBuild = await assertKnowledgeBasePublishable({
+      userId: targetUserId,
+      conversationId
+    }).catch(() => null);
+    if (publishedBuild?.status === "published" && publishedBuild.publishedSnapshotId) {
+      const snapshot = await getKnowledgeSnapshotById({
+        userId: targetUserId,
+        snapshotId: publishedBuild.publishedSnapshotId
+      }).catch(() => null);
+      if (snapshot) {
+        res.json({ kind: "knowledge", snapshot, idempotent: true });
+        return;
+      }
+    }
     console.error("[Dashboard] Knowledge publish failed", error);
     res.status(error instanceof ServiceEntitlementError ? error.statusCode : 400).json({
       error: {
@@ -32554,7 +33145,7 @@ router5.put(
               value
             })),
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq24(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq25(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -32649,7 +33240,7 @@ router5.put(
               rationale: question.rationale
             })),
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq24(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq25(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -32736,7 +33327,7 @@ router5.put(
             userId: targetUserId,
             batches: template.batches,
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq24(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq25(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -32997,7 +33588,7 @@ router5.put(
           }
           const transactionHooks = {
             beforeWrite: async (tx) => {
-              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq24(userDashboardContents.userId, targetUserId)).limit(1).for("update");
+              const dashboardRows = await tx.select({ revision: userDashboardContents.revision }).from(userDashboardContents).where(eq25(userDashboardContents.userId, targetUserId)).limit(1).for("update");
               assertDashboardImportRevision({
                 expectedRevision,
                 currentRevision: dashboardRows[0]?.revision ?? 0
@@ -33143,13 +33734,30 @@ router5.put(
         );
       }
       await assertServiceCapability(targetUserId, "knowledgeDisplay");
+      const maintenanceTicketId = req.header("x-maintenance-ticket-id")?.trim() || void 0;
+      const existingSnapshot = await getLatestKnowledgeSnapshot(targetUserId);
+      if (existingSnapshot && !maintenanceTicketId) {
+        throw new KnowledgeArchiveValidationError(
+          "structure",
+          "\u5DF2\u53D1\u5E03\u77E5\u8BC6\u5E93\u53EA\u80FD\u901A\u8FC7\u5F00\u653E\u7684\u7EF4\u62A4\u5DE5\u5355\u66FF\u6362"
+        );
+      }
+      if (maintenanceTicketId) {
+        await assertKnowledgeMaintenanceTicketForUpload({
+          userId: targetUserId,
+          ticketId: maintenanceTicketId
+        });
+      }
       let sourceBuildId;
       const snapshotId = randomUUID20();
       const parsed = await readKnowledgeArchive(
         buffer,
         sourceFileName,
         snapshotId,
-        { validationProfile: "historical" }
+        maintenanceTicketId ? {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersions: [2, 3]
+        } : { validationProfile: "historical" }
       );
       try {
         const workspace = await getDashboardWorkspace(targetUserId);
@@ -33167,6 +33775,7 @@ router5.put(
           sourceFileName,
           sourceConversationId,
           sourceBuildId,
+          maintenanceTicketId,
           documents: parsed.documents,
           assets: parsed.assets,
           totalBytes: buffer.length
@@ -33181,6 +33790,7 @@ router5.put(
             sourceName: sourceFileName,
             sourceConversationId,
             sourceBuildId,
+            maintenanceTicketId,
             documentCount: snapshot?.documentCount ?? parsed.documents.length,
             imageCount: snapshot?.imageCount ?? parsed.assets.length,
             totalBytes: snapshot?.totalBytes ?? buffer.length
@@ -33812,7 +34422,7 @@ async function currentContext(userId) {
   if (!snapshot) {
     throw new ServiceEntitlementError(
       "KNOWLEDGE_SNAPSHOT_NOT_FOUND",
-      "\u8BF7\u5148\u5728\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u4E2D\u9010\u9879\u5B8C\u6210 40\u2013115 \u4E2A\u8282\u70B9\u5E76\u53D1\u5E03\u5F53\u524D\u5957\u9910\u4F7F\u7528\u7684\u8BA4\u8BC1\u77E5\u8BC6\u5E93\uFF0C\u518D\u751F\u6210\u54C1\u724C\u5168\u57DF\u5019\u9009\u8BCD\u3002",
+      "\u8BF7\u5148\u5728\u77E5\u8BC6\u5E93\u667A\u80FD\u4F53\u4E2D\u9010\u9879\u5B8C\u6210 8\u2013115 \u4E2A\u8282\u70B9\u5E76\u53D1\u5E03\u5F53\u524D\u5957\u9910\u4F7F\u7528\u7684\u8BA4\u8BC1\u77E5\u8BC6\u5E93\uFF0C\u518D\u751F\u6210\u54C1\u724C\u5168\u57DF\u5019\u9009\u8BCD\u3002",
       409
     );
   }
@@ -34466,7 +35076,7 @@ import { z as z23 } from "zod";
 // server/presales-monitor.ts
 import { createHash as createHash17, randomUUID as randomUUID22 } from "node:crypto";
 import axios8 from "axios";
-import { and as and21, eq as eq25, isNull as isNull6 } from "drizzle-orm";
+import { and as and22, eq as eq26, isNull as isNull6 } from "drizzle-orm";
 import { json as json2, Router as Router6 } from "express";
 import { z as z22 } from "zod";
 var MONITOR_PLATFORMS = [
@@ -35498,7 +36108,7 @@ var DrizzleMonitorRepository = class {
       if (mysqlError.code !== "ER_DUP_ENTRY") throw error;
     }
     const existing = await db.select().from(presalesMonitorRuns).where(
-      eq25(presalesMonitorRuns.idempotencyKeyHash, input.idempotencyKeyHash)
+      eq26(presalesMonitorRuns.idempotencyKeyHash, input.idempotencyKeyHash)
     ).limit(1);
     const row = existing[0];
     if (!row) {
@@ -35528,8 +36138,8 @@ var DrizzleMonitorRepository = class {
   async get(runId) {
     const db = await requireDb14();
     const rows = await db.select().from(presalesMonitorRuns).where(
-      and21(
-        eq25(presalesMonitorRuns.id, runId),
+      and22(
+        eq26(presalesMonitorRuns.id, runId),
         isNull6(presalesMonitorRuns.deletedAt)
       )
     ).limit(1);
@@ -35559,8 +36169,8 @@ var DrizzleMonitorRepository = class {
     const db = await requireDb14();
     return db.transaction(async (tx) => {
       const rows = await tx.select().from(presalesMonitorRuns).where(
-        and21(
-          eq25(presalesMonitorRuns.id, runId),
+        and22(
+          eq26(presalesMonitorRuns.id, runId),
           isNull6(presalesMonitorRuns.deletedAt)
         )
       ).limit(1).for("update");
@@ -35580,7 +36190,7 @@ var DrizzleMonitorRepository = class {
         pollLeaseId: leaseId,
         pollLeaseExpiresAt,
         updatedAt: now
-      }).where(eq25(presalesMonitorRuns.id, runId));
+      }).where(eq26(presalesMonitorRuns.id, runId));
       return {
         leaseId,
         run: {
@@ -35603,9 +36213,9 @@ var DrizzleMonitorRepository = class {
       pollLeaseExpiresAt: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and21(
-        eq25(presalesMonitorRuns.id, runId),
-        eq25(presalesMonitorRuns.pollLeaseId, leaseId),
+      and22(
+        eq26(presalesMonitorRuns.id, runId),
+        eq26(presalesMonitorRuns.pollLeaseId, leaseId),
         isNull6(presalesMonitorRuns.deletedAt)
       )
     );
@@ -35622,8 +36232,8 @@ var DrizzleMonitorRepository = class {
       pollLeaseExpiresAt: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and21(
-        eq25(presalesMonitorRuns.id, runId),
+      and22(
+        eq26(presalesMonitorRuns.id, runId),
         isNull6(presalesMonitorRuns.deletedAt)
       )
     );
@@ -35631,7 +36241,7 @@ var DrizzleMonitorRepository = class {
   }
   async updateAndRead(runId, patch) {
     const db = await requireDb14();
-    await db.update(presalesMonitorRuns).set(patch).where(eq25(presalesMonitorRuns.id, runId));
+    await db.update(presalesMonitorRuns).set(patch).where(eq26(presalesMonitorRuns.id, runId));
     const run = await this.get(runId);
     if (!run)
       throw new PresalesMonitorError("NOT_FOUND", 404, "\u76D1\u63A7\u4EFB\u52A1\u4E0D\u5B58\u5728");
@@ -36521,6 +37131,9 @@ router8.put("/files/:fileId/content", async (req, res) => {
     req.pipe(limiter);
     const response2 = await axios9.put(target, limiter, {
       ...safeExternalRequestOptions,
+      // SigV4 authenticates the exact request URL; following a redirect would
+      // invalidate the signature and surface as a misleading storage error.
+      maxRedirects: 0,
       headers: {
         "Content-Type": String(req.headers["x-original-content-type"] ?? "") || req.headers["content-type"] || "application/octet-stream",
         ...contentLength > 0 ? { "Content-Length": String(contentLength) } : {}
@@ -36834,7 +37447,7 @@ import { z as z28 } from "zod";
 
 // server/provisioning-service.ts
 import { createHash as createHash19, createHmac as createHmac6, randomUUID as randomUUID23 } from "node:crypto";
-import { eq as eq26 } from "drizzle-orm";
+import { eq as eq27 } from "drizzle-orm";
 import { z as z24 } from "zod";
 var usernameSchema3 = z24.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
   /^[a-zA-Z0-9._-]+$/,
@@ -37112,7 +37725,7 @@ var DrizzleWebsiteProvisioningRepository = class {
         status: "completed",
         completedAt,
         updatedAt: completedAt
-      }).where(eq26(websiteUserProvisions.id, input.id));
+      }).where(eq27(websiteUserProvisions.id, input.id));
       return {
         idempotencyKeyHash: input.idempotencyKeyHash,
         requestHash: input.requestHash,
@@ -37147,7 +37760,7 @@ async function requireProvisioningDb2() {
   return db;
 }
 async function readStoredProvision(executor, idempotencyKeyHash) {
-  const rows = await executor.select().from(websiteUserProvisions).where(eq26(websiteUserProvisions.idempotencyKeyHash, idempotencyKeyHash)).limit(1);
+  const rows = await executor.select().from(websiteUserProvisions).where(eq27(websiteUserProvisions.idempotencyKeyHash, idempotencyKeyHash)).limit(1);
   const provision = rows[0];
   if (!provision) return null;
   if (provision.status !== "completed" || !provision.userId || !provision.completedAt) {
@@ -37171,7 +37784,7 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
     displayName: users.displayName,
     role: users.role,
     isActive: users.isActive
-  }).from(users).where(eq26(users.id, provision.userId)).limit(1);
+  }).from(users).where(eq27(users.id, provision.userId)).limit(1);
   const user = userRows[0];
   if (!user || !user.username || user.role !== "user") {
     throw new ProvisioningError(
@@ -37204,7 +37817,7 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
 // server/knowledge-import-service.ts
 import axios10 from "axios";
 import { createHash as createHash20, randomUUID as randomUUID24 } from "node:crypto";
-import { and as and22, eq as eq27 } from "drizzle-orm";
+import { and as and23, eq as eq28 } from "drizzle-orm";
 import { z as z25 } from "zod";
 var sha256Schema3 = z25.string().trim().regex(/^[a-f0-9]{64}$/i);
 var websiteKnowledgeImportBaseSchema = z25.object({
@@ -37326,7 +37939,7 @@ async function reserveReceipt(input) {
   const db = await requireImportDb();
   const keyHash = idempotencyHash(input.idempotencyKey);
   return db.transaction(async (tx) => {
-    const rows = await tx.select().from(knowledgeImportReceipts).where(eq27(knowledgeImportReceipts.idempotencyKeyHash, keyHash)).limit(1).for("update");
+    const rows = await tx.select().from(knowledgeImportReceipts).where(eq28(knowledgeImportReceipts.idempotencyKeyHash, keyHash)).limit(1).for("update");
     const existing = rows[0];
     if (existing) {
       const sameArtifact2 = existing.userId === input.userId && knowledgeArtifactReceiptDescriptorMatchesRequest(existing, input) && existing.artifactHash.toLowerCase() === input.value.artifactSha256.toLowerCase();
@@ -37364,13 +37977,13 @@ async function reserveReceipt(input) {
         errorMessage: null,
         sourceReference: knowledgeImportReceiptSourceReference(input),
         updatedAt: input.now
-      }).where(eq27(knowledgeImportReceipts.id, existing.id));
+      }).where(eq28(knowledgeImportReceipts.id, existing.id));
       return { state: "acquired", receiptId: existing.id };
     }
     const artifactRows = await tx.select().from(knowledgeImportReceipts).where(
-      and22(
-        eq27(knowledgeImportReceipts.userId, input.userId),
-        eq27(
+      and23(
+        eq28(knowledgeImportReceipts.userId, input.userId),
+        eq28(
           knowledgeImportReceipts.artifactHash,
           input.value.artifactSha256.toLowerCase()
         )
@@ -37408,7 +38021,7 @@ async function reserveReceipt(input) {
           errorMessage: null,
           sourceReference: knowledgeImportReceiptSourceReference(input),
           updatedAt: input.now
-        }).where(eq27(knowledgeImportReceipts.id, existingArtifact.id));
+        }).where(eq28(knowledgeImportReceipts.id, existingArtifact.id));
         return { state: "acquired", receiptId: existingArtifact.id };
       }
       if (existingArtifact.status === "pending" || existingArtifact.status === "processing") {
@@ -37468,7 +38081,7 @@ async function markReceiptFailed(receiptId, error) {
     errorCode: error instanceof KnowledgeImportError ? error.code : "KNOWLEDGE_IMPORT_FAILED",
     errorMessage: (error instanceof Error ? error.message : "\u77E5\u8BC6\u5E93\u540C\u6B65\u5931\u8D25").slice(0, 2e3),
     updatedAt: /* @__PURE__ */ new Date()
-  }).where(eq27(knowledgeImportReceipts.id, receiptId));
+  }).where(eq28(knowledgeImportReceipts.id, receiptId));
 }
 async function importWebsiteKnowledgeArtifact(input) {
   const value = websiteKnowledgeImportSchema.parse(input.value);
@@ -37477,7 +38090,7 @@ async function importWebsiteKnowledgeArtifact(input) {
     userId: websiteUserProvisions.userId,
     companyName: websiteUserProvisions.companyName,
     status: websiteUserProvisions.status
-  }).from(websiteUserProvisions).where(eq27(websiteUserProvisions.projectId, input.projectId));
+  }).from(websiteUserProvisions).where(eq28(websiteUserProvisions.projectId, input.projectId));
   const provision = resolveKnowledgeImportProjectOwner(
     provisions,
     value.companyName
@@ -37639,9 +38252,9 @@ async function importWebsiteKnowledgeArtifact(input) {
       errorMessage: null,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(
-      and22(
-        eq27(knowledgeImportReceipts.id, reservation.receiptId),
-        eq27(knowledgeImportReceipts.status, "processing")
+      and23(
+        eq28(knowledgeImportReceipts.id, reservation.receiptId),
+        eq28(knowledgeImportReceipts.status, "processing")
       )
     );
     return {
@@ -37662,7 +38275,7 @@ async function importWebsiteKnowledgeArtifact(input) {
 }
 
 // server/payment-receipt-ledger-service.ts
-import { and as and23, eq as eq28 } from "drizzle-orm";
+import { and as and24, eq as eq29 } from "drizzle-orm";
 
 // shared/payment-receipt.ts
 import { z as z26 } from "zod";
@@ -37764,21 +38377,21 @@ async function defaultRepository2() {
   const db = await getDb();
   if (!db) databaseUnavailable();
   const findByOrderId = async (orderId) => {
-    const rows = await db.select().from(websitePaymentReceipts).where(eq28(websitePaymentReceipts.orderId, orderId)).limit(1);
+    const rows = await db.select().from(websitePaymentReceipts).where(eq29(websitePaymentReceipts.orderId, orderId)).limit(1);
     return rows[0];
   };
   return {
     findByOrderId,
     async findByTradeNo(tradeNo) {
-      const rows = await db.select().from(websitePaymentReceipts).where(eq28(websitePaymentReceipts.tradeNo, tradeNo)).limit(1);
+      const rows = await db.select().from(websitePaymentReceipts).where(eq29(websitePaymentReceipts.tradeNo, tradeNo)).limit(1);
       return rows[0];
     },
     async findScoped(input) {
       const rows = await db.select().from(websitePaymentReceipts).where(
-        and23(
-          eq28(websitePaymentReceipts.orderId, input.orderId),
-          eq28(websitePaymentReceipts.scopeHash, input.scopeHash),
-          eq28(
+        and24(
+          eq29(websitePaymentReceipts.orderId, input.orderId),
+          eq29(websitePaymentReceipts.scopeHash, input.scopeHash),
+          eq29(
             websitePaymentReceipts.authorizationDigest,
             input.authorizationDigest
           )
@@ -37877,7 +38490,7 @@ function createPaymentReceiptLedgerService(options = {}) {
 }
 
 // server/project-order-registry-service.ts
-import { and as and24, eq as eq29, sql as sql2 } from "drizzle-orm";
+import { and as and25, eq as eq30, sql as sql2 } from "drizzle-orm";
 
 // shared/project-order-registry.ts
 import { z as z27 } from "zod";
@@ -38110,17 +38723,17 @@ async function defaultRepository3() {
   const db = await getDb();
   if (!db) databaseUnavailable2();
   const findByOrderId = async (orderId) => {
-    const rows = await db.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.orderId, orderId)).limit(1);
+    const rows = await db.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.orderId, orderId)).limit(1);
     return rows[0];
   };
   return {
     findByOrderId,
     async findByAuthorizationDigest(digest) {
-      const rows = await db.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.authorizationDigest, digest)).limit(1);
+      const rows = await db.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.authorizationDigest, digest)).limit(1);
       return rows[0];
     },
     async listByProjectId(projectId) {
-      return db.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.projectId, projectId)).limit(MAX_PROJECT_ORDERS + 1);
+      return db.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.projectId, projectId)).limit(MAX_PROJECT_ORDERS + 1);
     },
     async insert(value) {
       await db.insert(websiteProjectOrders).values(value);
@@ -38133,9 +38746,9 @@ async function defaultRepository3() {
         ...value,
         revision: sql2`${websiteProjectOrders.revision} + 1`
       }).where(
-        and24(
-          eq29(websiteProjectOrders.orderId, orderId),
-          eq29(websiteProjectOrders.revision, expectedRevision)
+        and25(
+          eq30(websiteProjectOrders.orderId, orderId),
+          eq30(websiteProjectOrders.revision, expectedRevision)
         )
       );
       if (!result[0]?.affectedRows) return void 0;
@@ -38149,10 +38762,10 @@ async function defaultRepository3() {
           lastEventAt: closedAt,
           revision: sql2`${websiteProjectOrders.revision} + 1`
         }).where(
-          and24(
-            eq29(websiteProjectOrders.orderId, intentOrderId),
-            eq29(websiteProjectOrders.revision, expectedRevision),
-            eq29(websiteProjectOrders.state, "pending")
+          and25(
+            eq30(websiteProjectOrders.orderId, intentOrderId),
+            eq30(websiteProjectOrders.revision, expectedRevision),
+            eq30(websiteProjectOrders.state, "pending")
           )
         );
         if (!result[0]?.affectedRows) {
@@ -38161,8 +38774,8 @@ async function defaultRepository3() {
           });
         }
         const [intents, orders] = await Promise.all([
-          tx.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.orderId, intentOrderId)).limit(1),
-          tx.select().from(websiteProjectOrders).where(eq29(websiteProjectOrders.orderId, order.orderId)).limit(1)
+          tx.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.orderId, intentOrderId)).limit(1),
+          tx.select().from(websiteProjectOrders).where(eq30(websiteProjectOrders.orderId, order.orderId)).limit(1)
         ]);
         if (!intents[0] || !orders[0]) databaseUnavailable2();
         return { intent: intents[0], order: orders[0] };
@@ -38957,7 +39570,7 @@ var enforceFrontMindProxyAccess = createFrontMindProxyAccessMiddleware();
 
 // server/delivery-ticket-attachment-router.ts
 import axios11 from "axios";
-import { and as and25, eq as eq30 } from "drizzle-orm";
+import { and as and26, eq as eq31 } from "drizzle-orm";
 import { Router as Router8 } from "express";
 var router9 = Router8();
 var MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
@@ -38991,14 +39604,14 @@ async function resolveAuthorizedTicketAttachment(input) {
     eventVisibility: deliveryTicketEvents.visibility
   }).from(deliveryTicketAttachments).innerJoin(
     deliveryTickets,
-    eq30(deliveryTickets.id, deliveryTicketAttachments.ticketId)
+    eq31(deliveryTickets.id, deliveryTicketAttachments.ticketId)
   ).leftJoin(
     deliveryTicketEvents,
-    and25(
-      eq30(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
-      eq30(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId)
+    and26(
+      eq31(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
+      eq31(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId)
     )
-  ).where(eq30(deliveryTicketAttachments.id, input.attachmentId)).limit(1);
+  ).where(eq31(deliveryTicketAttachments.id, input.attachmentId)).limit(1);
   const row = rows[0];
   if (!row) {
     throw new DeliveryTicketError(
@@ -39262,7 +39875,7 @@ import { ZodError as ZodError2 } from "zod";
 
 // server/website-content-template-service.ts
 import { randomUUID as randomUUID25 } from "node:crypto";
-import { and as and26, asc as asc9, eq as eq31, inArray as inArray13 } from "drizzle-orm";
+import { and as and27, asc as asc9, eq as eq32, inArray as inArray14 } from "drizzle-orm";
 var WEBSITE_CONTENT_CATEGORIES2 = WEBSITE_CONTENT_CATALOG.map(
   (item) => item.value
 );
@@ -39326,10 +39939,10 @@ async function loadWebsiteContentTicketRows(executor, workspaceUserId2, lock = f
     revision: deliveryTickets.revision,
     scheduledAt: deliveryTickets.scheduledAt
   }).from(deliveryTickets).where(
-    and26(
-      eq31(deliveryTickets.userId, workspaceUserId2),
-      eq31(deliveryTickets.type, "website_operation"),
-      inArray13(deliveryTickets.category, WEBSITE_CONTENT_CATEGORIES2)
+    and27(
+      eq32(deliveryTickets.userId, workspaceUserId2),
+      eq32(deliveryTickets.type, "website_operation"),
+      inArray14(deliveryTickets.category, WEBSITE_CONTENT_CATEGORIES2)
     )
   ).orderBy(asc9(deliveryTickets.createdAt), asc9(deliveryTickets.id));
   if (lock) query = query.for("update");
@@ -39535,9 +40148,9 @@ async function publishWebsiteContentTemplate(input) {
           updatedByUserId: input.actor.id,
           updatedAt: now
         }).where(
-          and26(
-            eq31(deliveryTickets.id, ticket.id),
-            eq31(deliveryTickets.revision, ticket.revision)
+          and27(
+            eq32(deliveryTickets.id, ticket.id),
+            eq32(deliveryTickets.revision, ticket.revision)
           )
         );
         await tx.insert(deliveryTicketEvents).values({
@@ -39580,9 +40193,9 @@ async function publishWebsiteContentTemplate(input) {
           updatedByUserId: input.actor.id,
           updatedAt: now
         }).where(
-          and26(
-            eq31(deliveryTickets.id, ticket.id),
-            eq31(deliveryTickets.revision, ticket.revision)
+          and27(
+            eq32(deliveryTickets.id, ticket.id),
+            eq32(deliveryTickets.revision, ticket.revision)
           )
         );
         await writeWorkspaceAuditEvent(
@@ -40010,6 +40623,16 @@ async function startServer() {
   startDashboardImportPreflightCleanupScheduler();
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);
+    if (process.env.NODE_ENV === "production") {
+      void recoverOpenKnowledgeBaseTasks().then((result) => {
+        console.info(
+          "[KnowledgeBaseRecovery] startup_scan_complete",
+          JSON.stringify(result)
+        );
+      }).catch((error) => {
+        console.error("[KnowledgeBaseRecovery] startup_scan_failed", error);
+      });
+    }
   });
 }
 startServer().catch((error) => {

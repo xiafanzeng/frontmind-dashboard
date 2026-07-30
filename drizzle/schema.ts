@@ -950,6 +950,7 @@ export const deliveryTickets = mysqlTable(
       aliyunAppVerificationCompleted: true;
     }>(),
     targetPage: text("targetPage"),
+    knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
     technicalDedupeKey: varchar("technicalDedupeKey", { length: 64 }),
     materialUrls: json("materialUrls").$type<string[]>().default([]).notNull(),
     status: mysqlEnum("status", [
@@ -2065,6 +2066,8 @@ export type KnowledgeAssetRecord = {
   documentIds?: string[];
   sourcePageUrl?: string;
   sourceAssetUrl?: string;
+  sourceDocumentPath?: string;
+  sourceKind?: "official_web" | "official_document" | "user_upload";
   ownership?: "first_party" | "third_party" | "unknown";
 };
 
@@ -2084,6 +2087,7 @@ export const knowledgeBaseSnapshots = mysqlTable(
     sourceTaskId: varchar("sourceTaskId", { length: 255 }),
     sourceArtifactHash: varchar("sourceArtifactHash", { length: 64 }),
     archiveHash: varchar("archiveHash", { length: 64 }),
+    maintenanceTicketId: varchar("maintenanceTicketId", { length: 36 }),
     documents: json("documents").$type<KnowledgeDocumentRecord[]>().notNull(),
     assets: json("assets").$type<KnowledgeAssetRecord[]>().notNull(),
     documentCount: int("documentCount").default(0).notNull(),
@@ -2167,6 +2171,7 @@ export const knowledgeBaseBuilds = mysqlTable(
     lastTurnAttachmentCount: int("lastTurnAttachmentCount")
       .default(0)
       .notNull(),
+    awaitingResponseSince: timestamp("awaitingResponseSince"),
     packageRevision: int("packageRevision"),
     packageTaskId: varchar("packageTaskId", { length: 255 }),
     packageOutputItemId: varchar("packageOutputItemId", { length: 255 }),
@@ -2314,6 +2319,7 @@ export const conversations = mysqlTable(
       "idle",
       "running",
       "pending",
+      "awaiting_input",
       "completed",
       "error",
       "failed",

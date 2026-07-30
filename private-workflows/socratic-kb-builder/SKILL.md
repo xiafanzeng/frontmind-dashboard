@@ -21,17 +21,20 @@ real first-party images and one-leaf-at-a-time confirmation.
 
 Hard ceilings: 1,200 official HTML attempts, 1,800 visited links, 120 useful
 official documents, 100 cumulative uploads, 120 public queries, 3,000,000
-retained evidence characters, 180,000 customer-visible characters, 40–115
+retained evidence characters, 180,000 customer-visible characters, 8–115
 leaves, 1,500 ZIP files, 480 images and 160 MiB of image bytes. Stop duplicate
 SKUs, pagination, translated copies and low-value news before they displace
 uncovered business dimensions.
 
 ## Knowledge and evidence layers
 
-Create an adaptive 40–115 leaf tree covering enterprise identity, team,
+Create an adaptive 8–115 leaf tree covering enterprise identity, team,
 products/services, capabilities, industries/cases, differentiation and
 cooperation/support. Preserve every material product/service family while
-consolidating repeated models.
+consolidating repeated models. A white-label company or a company represented
+only by a brochure may use a compact tree: keep only evidence-backed facts and
+necessary explicit gaps. Never invent or repeat content to satisfy leaf, word
+or image counts.
 
 Before confirmation, write one formal overview for every top-level branch and a
 complete draft for every leaf. Use exactly one formal block in each
@@ -61,6 +64,8 @@ Never put any of the following in formal prose or in the customer-facing turn:
 - task or collection process, including “本轮”“本次采集”“本包”“本知识库”,
   extraction failures, evidence sufficiency, verification status or source
   selection;
+- filler or intermediate wording, including “补充说明”“第 N 个内容节点” and
+  “本轮整理结果”;
 - reader, customer, buyer or compliance advice, including “客户应”“采购方应”,
   “仍应”“建议”“尽调”“合规审查”“不能仅凭”“不宜直接转换”“不能外推”;
 - reasoning about how company claims should be interpreted, converted,
@@ -72,14 +77,11 @@ Use neutral availability wording when facts are absent, for example
 internal `verification_gaps` instead of the formal block. Do not repeat a
 generic gap or disclaimer across leaves.
 
-Evidence-adaptive minimums remain machine-calculated:
-
-- overview with evidence: max 120, capped at 2,500 characters, or 5,000 for a
-  product branch, based on 25% of linked evidence;
-- leaf with evidence: max 80, capped at 500 characters, based on 20% of linked
-  evidence;
-- zero evidence: 60 formal characters for an overview or 40 for a leaf, using
-  neutral availability wording and `needs_verification`.
+Do not target a global minimum character count. A concise supported fact or
+clear `needs_verification` gap is preferable to padding. Record actual evidence
+and formal character counts so the service-side finalizer can verify them. For
+new adaptive documents set `requiredFormalCharacters` to `0`; older archives
+that carry the legacy evidence-proportional value remain readable.
 
 ## Image discovery, quality and coverage
 
@@ -100,6 +102,13 @@ Only package validated first-party AVIF, WebP, PNG, JPEG or GIF bytes. Rasterize
 useful SVGs, deduplicate decoded content, and never upscale a small raster to
 pass a quality gate.
 
+Never embed or expose an origin/CDN image URL in customer-visible Markdown.
+Hotlink-protected, signed and expiring URLs are source evidence only. Download
+the actual eligible bytes while the source is accessible, validate them, and
+package them under `09_media_assets/`; customer documents reference only the
+packaged relative asset path. If the bytes cannot be downloaded and decoded,
+reject the candidate instead of returning a broken image link.
+
 Every v2 asset includes:
 
 - `assetType`: `brand_identity | product_ui | product_diagram | case_photo |
@@ -112,11 +121,13 @@ Minimum dimensions:
 - a `brand_identity` or `certificate_badge` badge: 256×256;
 - every other inline photo, UI, diagram or figure: 800×450.
 
-Record every discovered candidate with URL, source page, method and
+Record every discovered candidate with a public source page or packaged
+official/user-uploaded document, method and
 `eligible|rejected|uninspected`. Eligible entries link to packaged assets;
 rejected entries include a concrete reason. Also maintain arithmetically
-consistent aggregate counts and rejection reasons. Package all eligible assets
-up to the hard ceiling.
+consistent aggregate counts and rejection reasons. There is no minimum image
+count. Reject sprites, icon sheets, decorative backgrounds, mostly transparent
+media and logo collages masquerading as product visuals.
 
 `target_met` means all candidates were inspected and required brand/product
 coverage was met. `source_limited` requires all candidates inspected plus a
@@ -144,7 +155,7 @@ Use normal Markdown, not ASCII trees or simulated interfaces.
 
 ## Final ZIP
 
-At 100% traversal, create a new ZIP with `schemaVersion: 2` and
+At 100% traversal, create a new candidate ZIP with `schemaVersion: 3` and
 `profile: "dashboard-enterprise-v1"`. Preserve the existing
 `00_completeness.json` raw-count contract. Include:
 
@@ -158,7 +169,10 @@ At 100% traversal, create a new ZIP with `schemaVersion: 2` and
 - validated image files and complete document/asset, evidence, candidate and
   product-family relationships.
 
-Recompute all counts, hashes, dimensions and links from the final files. Run the
-repository-provided `scripts/validate_archive.py`; fix every failure and return
-exactly one new ZIP only after it prints `VALID`. Never create an interactive
-research webpage or HTML deliverable.
+Return one candidate ZIP after an internal consistency pass. Schema v2
+archives remain readable for already-running and historical builds, but every
+new candidate uses v3. Do not claim to
+run repository-local validation code that is unavailable in the remote task
+environment. The service-side finalizer is authoritative for counts, hashes,
+dimensions, format and customer quality. Never create an interactive research
+webpage or HTML deliverable.

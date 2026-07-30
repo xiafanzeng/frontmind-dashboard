@@ -25,7 +25,7 @@ confirmation. Respect the 1,200 HTML, 1,800 total-link, 480-image,
 The first customer-visible answer must:
 
 - Summarize measured research coverage and remaining gaps.
-- Display branch counts and the true 40–115 leaf total.
+- Display branch counts and the true 8–115 leaf total.
 - Present the first leaf as polished formal content.
 - Show only images whose bytes were downloaded, validated, and assigned stable
   asset IDs.
