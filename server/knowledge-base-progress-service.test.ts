@@ -6,6 +6,7 @@ import {
   extractFinalKnowledgeBaseAssistantText,
   isAmbiguousKnowledgeBaseAdvance,
 } from "./knowledge-base-progress-service";
+import { stripKnowledgeBaseReferenceAppendix } from "../shared/knowledge-base-output";
 
 describe("knowledge-base user action classification", () => {
   it("only advances on an explicit confirmation", () => {
@@ -36,6 +37,26 @@ describe("knowledge-base user action classification", () => {
 });
 
 describe("knowledge-base model output boundary", () => {
+  it("keeps source appendices out of the customer-visible node body", () => {
+    const output = [
+      {
+        role: "assistant",
+        type: "message",
+        content: [
+          "节点正文",
+          "",
+          "**参考资料**",
+          "[1] https://siliconflow.cn/",
+          '<!-- FRONTMIND_KB_PROGRESS {"revision":0} -->',
+        ].join("\n"),
+      },
+    ];
+
+    const raw = assertKnowledgeBaseCustomerOutput(output);
+    expect(raw).toContain("FRONTMIND_KB_PROGRESS");
+    expect(stripKnowledgeBaseReferenceAppendix(raw)).toBe("节点正文");
+  });
+
   it("uses only the final typed assistant message", () => {
     expect(
       extractFinalKnowledgeBaseAssistantText([

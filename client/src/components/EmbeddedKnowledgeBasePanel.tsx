@@ -74,9 +74,27 @@ export default function EmbeddedKnowledgeBasePanel({
     enabled: !previewMode && user?.role === "user",
     retry: false,
     refetchOnMount: "always",
-    refetchInterval: (query) => (query.state.data?.locked ? 5_000 : 30_000),
+    refetchInterval: (query) =>
+      query.state.data?.locked || !query.state.data?.hasKnowledge
+        ? 5_000
+        : 30_000,
   });
   const { activeConversation, discardConversationLocally } = useConversation();
+  useEffect(() => {
+    if (previewMode) return;
+    const refreshResetStatus = () => {
+      void resetQuery.refetch();
+    };
+    window.addEventListener(
+      "frontmind:knowledge-progress-updated",
+      refreshResetStatus,
+    );
+    return () =>
+      window.removeEventListener(
+        "frontmind:knowledge-progress-updated",
+        refreshResetStatus,
+      );
+  }, [previewMode, resetQuery.refetch]);
   const [observedResetRevision, setObservedResetRevision] = useState<
     number | null
   >(null);
@@ -177,7 +195,7 @@ export default function EmbeddedKnowledgeBasePanel({
               unavailableReason={resetQuery.data?.unavailableReason ?? null}
             />
           )}
-        {!previewMode && resetQuery.data?.hasKnowledge && (
+        {!previewMode && resetQuery.data && (
           <KnowledgeResetButton
             status={resetQuery.data}
             onSubmitted={() => resetQuery.refetch()}
@@ -288,7 +306,8 @@ function KnowledgeResetButton({
           <DialogHeader>
             <DialogTitle>申请重置知识库</DialogTitle>
             <DialogDescription>
-              提交后知识库会立即只读锁定。负责该客户的 AI
+              无需等到构建完成，处理中也可以提交。提交后知识库会立即只读锁定。负责该客户的
+              AI
               运维工程师确认后，将清空全部知识库构建、版本、专属对话和附件；其他业务内容不会受影响。
             </DialogDescription>
           </DialogHeader>

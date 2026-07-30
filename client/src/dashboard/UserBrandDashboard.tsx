@@ -1668,7 +1668,7 @@ export function ManagedDashboardSection({
       }`}
     >
       <PageHeader
-        eyebrow={embedded ? "企业数据骨架" : "MindPromise智诺 / 品牌建设"}
+        eyebrow={embedded ? "客户看板预览" : "MindPromise智诺 / 品牌建设"}
         title={payload.headline}
         desc={payload.summary}
       />

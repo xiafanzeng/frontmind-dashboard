@@ -110,7 +110,10 @@ describe("knowledge-base ChatInput actions", () => {
 
     expect(screen.getByText("当前待确认")).toBeInTheDocument();
     expect(screen.getByText(/法定主体与成立时间/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "确认并进入下一项" }));
+    expect(
+      screen.queryByRole("button", { name: /直接预填/ }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认当前内容" }));
 
     await waitFor(() =>
       expect(mocks.sendMessage).toHaveBeenCalledWith(
@@ -133,10 +136,7 @@ describe("knowledge-base ChatInput actions", () => {
     const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: "成立日期改为 8 月 30 日" } });
     expect(
-      screen.getByRole("button", { name: "确认并进入下一项" }),
-    ).toBeDisabled();
-    expect(
-      screen.getByRole("button", { name: "直接预填并进入下一项" }),
+      screen.getByRole("button", { name: "确认当前内容" }),
     ).toBeDisabled();
 
     fireEvent.change(textarea, { target: { value: "" } });
@@ -153,7 +153,7 @@ describe("knowledge-base ChatInput actions", () => {
     expect(screen.getByText("企业资料.pdf")).toBeInTheDocument();
     expect(screen.getByText("5 B")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "确认并进入下一项" }),
+      screen.getByRole("button", { name: "确认当前内容" }),
     ).toBeDisabled();
   });
 

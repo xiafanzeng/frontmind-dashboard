@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildAdminTicketListInput,
+  buildWebsiteContentOverview,
   deliveryTicketPublicStatus,
   flattenAdminTicketPages,
   formatAdminTicketDate,
@@ -61,6 +62,53 @@ describe("administrator delivery ticket workspace contract", () => {
         publicStatus: "completed",
       }),
     ).toBe("completed");
+  });
+
+  it("builds the five customer website rows from the latest ticket in each category", () => {
+    const overview = buildWebsiteContentOverview([
+      {
+        id: "company-old",
+        type: "website_operation",
+        category: "company_facts",
+        status: "completed",
+        revision: 1,
+        updatedAt: "2026-07-01T00:00:00Z",
+      },
+      {
+        id: "company-current",
+        type: "website_operation",
+        category: "company_facts",
+        status: "in_progress",
+        revision: 2,
+        updatedAt: "2026-07-02T00:00:00Z",
+      },
+      {
+        id: "faq-completed",
+        type: "website_operation",
+        category: "faq_content",
+        status: "completed",
+        revision: 1,
+        publicSummary: "FAQ 页面已发布。",
+        updatedAt: "2026-07-03T00:00:00Z",
+      },
+    ]);
+
+    expect(overview).toHaveLength(5);
+    expect(overview.find((item) => item.category === "company_facts")).toEqual(
+      expect.objectContaining({
+        status: "in_progress",
+        ticket: expect.objectContaining({ id: "company-current" }),
+      }),
+    );
+    expect(overview.find((item) => item.category === "faq_content")).toEqual(
+      expect.objectContaining({
+        status: "completed",
+        ticket: expect.objectContaining({ publicSummary: "FAQ 页面已发布。" }),
+      }),
+    );
+    expect(overview.find((item) => item.category === "industry_news")).toEqual(
+      expect.objectContaining({ status: "not_started", ticket: null }),
+    );
   });
 
   it("flattens cursor pages while retaining first-page workspace metadata", () => {

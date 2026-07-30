@@ -165,15 +165,15 @@ describe("AdminDeliveryTicketWorkspace website current-content template UI", () 
     vi.stubGlobal("fetch", fetchMock);
 
     render(
-      <AdminDeliveryTicketWorkspace
-        userId={42}
-        enterpriseName="测试企业"
-      />,
+      <AdminDeliveryTicketWorkspace userId={42} enterpriseName="测试企业" />,
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "下载当前内容模板" }),
-    );
+    expect(screen.getByText("客户官网内容进度")).toBeInTheDocument();
+    expect(screen.getByText("企业资料与品牌事实")).toBeInTheDocument();
+    expect(screen.getAllByText("尚未提交")).toHaveLength(5);
+
+    fireEvent.click(screen.getByText("批量更新官网内容（高级工具）"));
+    fireEvent.click(screen.getByRole("button", { name: "下载当前内容模板" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(fetchMock.mock.calls[0]).toEqual([
       "/api/website-content-template/42",
@@ -181,7 +181,9 @@ describe("AdminDeliveryTicketWorkspace website current-content template UI", () 
     ]);
     expect(HTMLAnchorElement.prototype.click).toHaveBeenCalledOnce();
 
-    const card = screen.getByText("官网内容当前模板").closest("section");
+    const card = screen
+      .getByText("批量更新官网内容（高级工具）")
+      .closest("details");
     expect(card).not.toBeNull();
     const file = new File(
       [
@@ -199,7 +201,9 @@ describe("AdminDeliveryTicketWorkspace website current-content template UI", () 
     );
 
     expect(await screen.findByText("发布前差异确认")).toBeInTheDocument();
-    expect(screen.getByText("已完成企业品牌事实页面更新。")).toBeInTheDocument();
+    expect(
+      screen.getByText("已完成企业品牌事实页面更新。"),
+    ).toBeInTheDocument();
     expect(mocks.listRefetch).not.toHaveBeenCalled();
 
     const previewOptions = fetchMock.mock.calls[1]![1] as RequestInit;
@@ -225,7 +229,7 @@ describe("AdminDeliveryTicketWorkspace website current-content template UI", () 
     expect(
       (publishOptions.headers as Record<string, string>)["X-Import-Preview"],
     ).toBeUndefined();
-    await waitFor(() => expect(mocks.listRefetch).toHaveBeenCalledOnce());
+    await waitFor(() => expect(mocks.listRefetch).toHaveBeenCalledTimes(2));
     expect(mocks.toastSuccess).toHaveBeenCalledWith(
       "官网内容已发布",
       expect.objectContaining({

@@ -640,15 +640,21 @@ export function PreviewAdminUsers({
 
         <div className="min-w-0 space-y-5">
           <PortalCard className="p-5 sm:p-6">
-            <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
-              <div>
+            <div className="grid gap-5 lg:grid-cols-[minmax(240px,1fr)_minmax(0,2fr)] lg:items-start">
+              <div className="min-w-0">
                 <p className="text-xs font-semibold text-[#5b2a86]">
                   用户工作空间
                 </p>
-                <h2 className="mt-1 text-2xl font-semibold text-[#171321]">
+                <h2
+                  className="mt-1 truncate text-2xl font-semibold text-[#171321]"
+                  title={selectedUser.name}
+                >
                   {selectedUser.name}
                 </h2>
-                <p className="mt-2 text-sm text-[#716a80]">
+                <p
+                  className="mt-2 truncate text-sm text-[#716a80]"
+                  title={`@${selectedUser.username}`}
+                >
                   @{selectedUser.username}
                 </p>
               </div>
@@ -666,7 +672,7 @@ export function PreviewAdminUsers({
                   ["service", "套餐与问题", PackageCheck],
                   ["knowledge", "知识库流程", Database],
                   ["tickets", "工单与官网", ClipboardList],
-                  ["delivery", "内容、监控与报告", FileText],
+                  ["delivery", "客户看板展示", FileText],
                   ["credential", "API Key 与积分", KeyRound],
                   ["activity", "操作记录", History],
                 ] as const
@@ -848,7 +854,7 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
       <PortalCard className="overflow-hidden">
         <div className="flex flex-col gap-4 border-b border-[#e8e1ee] bg-[linear-gradient(135deg,#fbf8fd,#f4edf8)] p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
           <div>
-            <p className="text-xs font-semibold text-[#5b2a86]">企业数据骨架</p>
+            <p className="text-xs font-semibold text-[#5b2a86]">客户看板预览</p>
             <h3 className="mt-1 font-semibold text-[#171321]">{userName}</h3>
             <p className="mt-2 text-sm leading-6 text-[#716a80]">
               上传或编辑后先预览，再发布到该用户的固定看板结构。

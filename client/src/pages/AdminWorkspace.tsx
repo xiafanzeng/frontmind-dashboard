@@ -53,7 +53,7 @@ export const ADMIN_WORKSPACE_TABS = [
   { value: "service", label: "套餐与问题", icon: PackageCheck },
   { value: "knowledge", label: "知识库流程", icon: Database },
   { value: "tickets", label: "工单与官网", icon: ClipboardList },
-  { value: "delivery", label: "内容、监控与报告", icon: Database },
+  { value: "delivery", label: "客户看板展示", icon: Database },
   { value: "credential", label: "客户 Key 与积分", icon: KeyRound },
   { value: "activity", label: "操作记录", icon: History },
 ] as const satisfies ReadonlyArray<{
@@ -659,7 +659,9 @@ export default function AdminWorkspace({
           deliveryAdmins={(workspaceQuery.data?.admins ?? [])
             .filter(
               (admin) =>
-                admin.isActive && admin.adminAccessLevel === "delivery_admin",
+                admin.isActive &&
+                (admin.adminAccessLevel === "system_admin" ||
+                  admin.adminAccessLevel === "delivery_admin"),
             )
             .map((admin) => ({
               ...admin,
@@ -788,17 +790,28 @@ export default function AdminWorkspace({
         ) : (
           <div className="min-w-0 space-y-5">
             <PortalCard className="p-5 sm:p-6">
-              <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
-                <div>
+              <div className="grid gap-5 lg:grid-cols-[minmax(240px,1fr)_minmax(0,2fr)] lg:items-start">
+                <div className="min-w-0">
                   <p className="text-xs font-semibold text-[#5b2a86]">
                     用户工作空间
                   </p>
-                  <h2 className="mt-1 text-2xl font-semibold text-[#171321]">
+                  <h2
+                    className="mt-1 truncate text-2xl font-semibold text-[#171321]"
+                    title={
+                      selectedUser.enterpriseName ||
+                      selectedUser.displayName ||
+                      selectedUser.username ||
+                      undefined
+                    }
+                  >
                     {selectedUser.enterpriseName ||
                       selectedUser.displayName ||
                       selectedUser.username}
                   </h2>
-                  <p className="mt-2 text-sm text-[#716a80]">
+                  <p
+                    className="mt-2 truncate text-sm text-[#716a80]"
+                    title={`@${selectedUser.username}`}
+                  >
                     @{selectedUser.username}
                   </p>
                 </div>

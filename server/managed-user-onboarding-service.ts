@@ -26,7 +26,10 @@ import {
   validateUpstreamApiKey,
   type AuthenticatedUser,
 } from "./auth-service";
-import { hasDeliveryCapability } from "../shared/admin-access";
+import {
+  hasDeliveryCapability,
+  isExplicitAdminAccessLevel,
+} from "../shared/admin-access";
 import {
   hasSystemAdminAccess,
   writeWorkspaceAuditEvent,
@@ -213,12 +216,12 @@ export async function createManagedServiceUser(
       if (
         !admin ||
         admin.role !== "admin" ||
-        admin.adminAccessLevel !== "delivery_admin" ||
+        !isExplicitAdminAccessLevel(admin.adminAccessLevel) ||
         admin.isActive !== true
       ) {
         throw new AuthServiceError(
           "INVALID_CREDENTIAL",
-          "请选择一个已启用的交付管理员作为客户主负责人",
+          "请选择一个已启用的 Admin 或交付管理员作为客户主负责人",
         );
       }
     });
@@ -384,12 +387,12 @@ export async function completeManagedServiceUserProvisioning(
         if (
           !admin ||
           admin.role !== "admin" ||
-          admin.adminAccessLevel !== "delivery_admin" ||
+          !isExplicitAdminAccessLevel(admin.adminAccessLevel) ||
           admin.isActive !== true
         ) {
           throw new AuthServiceError(
             "INVALID_CREDENTIAL",
-            "请选择一个已启用的交付管理员作为客户主负责人",
+            "请选择一个已启用的 Admin 或交付管理员作为客户主负责人",
           );
         }
       });

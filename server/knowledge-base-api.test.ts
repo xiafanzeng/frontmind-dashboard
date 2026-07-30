@@ -72,6 +72,8 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("补充、修订、问题或上传资料");
     expect(prompt).toContain("to 必须为 needs_verification");
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
+    expect(prompt).toContain("不得输出参考资料、参考来源");
+    expect(prompt).toContain("可见正文结束后直接附机器信封");
     expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(10_000);
     expect(prompt).not.toContain("# Skill");
     expect(prompt).not.toContain("current Pro Agent");
@@ -200,10 +202,16 @@ describe("knowledge base execution contract", () => {
     );
   });
 
-  it("pins new builds to v3 while preserving immutable v1/v2 archives", async () => {
+  it("pins new builds to v3 while preserving immutable prior archives", async () => {
     const active = await getKnowledgeBaseSkillDescriptor();
     const legacy = await getKnowledgeBaseSkillDescriptor({ version: "1" });
     const previous = await getKnowledgeBaseSkillDescriptor({ version: "2" });
+    const priorV3Hash =
+      "ee62269164a46a54b33dbf71ff492b1d08b3974ab314d11aaa97e885dff96f27";
+    const priorV3 = await getKnowledgeBaseSkillDescriptor({
+      version: "3",
+      contentHash: priorV3Hash,
+    });
 
     expect(active).toMatchObject({
       name: "socratic-kb-builder",
@@ -222,6 +230,8 @@ describe("knowledge base execution contract", () => {
     });
     expect(active.contentHash).not.toBe(legacy.contentHash);
     expect(active.contentHash).not.toBe(previous.contentHash);
+    expect(active.contentHash).not.toBe(priorV3Hash);
+    expect(priorV3.contentHash).toBe(priorV3Hash);
 
     await expect(
       getKnowledgeBaseSkillDescriptor({

@@ -71,6 +71,14 @@ Never put any of the following in formal prose or in the customer-facing turn:
 - reasoning about how company claims should be interpreted, converted,
   observed, audited or verified;
 - internal thought, tool plans, prompt descriptions or writing decisions.
+- source/reference lists, numbered citation markers, external citation links,
+  unresolved-item appendices, confirmation questions or action instructions.
+
+End the visible turn immediately after the actual leaf body and any validated
+managed images. Never emit a customer-visible `参考资料`, `参考来源`,
+`References` or `Sources` section. Keep all source URLs and verification notes
+only in internal evidence/report documents. Machine protocol envelopes follow
+the visible body and remain the only allowed content after it.
 
 Use neutral availability wording when facts are absent, for example
 “公开资料暂未披露该项信息”. Put the exact checked scope and requested evidence in
@@ -147,7 +155,9 @@ When the service supplies `FRONTMIND_KB_MANIFEST`, `FRONTMIND_KB_PROGRESS`,
    complete presentation of B. Never leave A as the body after advancing.
 3. Only explicit confirmation becomes `confirmed`.
 4. Only explicit “跳过/直接预填/采用预填/保留预填” becomes
-   `direct_prefilled`.
+   `direct_prefilled` for protocol compatibility. Do not proactively offer
+   direct prefill or skip as a customer-facing action; the normal choice is to
+   confirm, or to submit corrections/uploads and confirm the revised draft.
 5. Corrections, supplements, questions and uploads remain
    `needs_verification`; update and re-present the same leaf. Any turn with an
    attachment is a supplement even if its text says “确认”.
@@ -158,6 +168,9 @@ When the service supplies `FRONTMIND_KB_MANIFEST`, `FRONTMIND_KB_PROGRESS`,
    revision is the post-transition revision and its `leafId` is the leaf
    actually shown in the body. Use `null` after the last leaf is completed.
 8. After 100%, later corrections reopen only the most relevant existing leaf.
+9. The visible body contains only the actual presented leaf (plus first-turn
+   tree statistics when required). Do not append sources, unresolved items,
+   verification notes, action guidance or a confirmation question.
 
 Use normal Markdown, not ASCII trees or simulated interfaces.
 

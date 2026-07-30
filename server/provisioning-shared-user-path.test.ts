@@ -36,6 +36,7 @@ type InsertCall = {
 
 class SharedUsersTableDb {
   readonly deliveryAdminId = 777;
+  ownerAdminAccessLevel: "system_admin" | "delivery_admin" = "delivery_admin";
   inserts: InsertCall[] = [];
   userRows: Array<Record<string, any>> = [];
   provisionRows: Array<Record<string, any>> = [];
@@ -53,7 +54,7 @@ class SharedUsersTableDb {
                 {
                   id: this.deliveryAdminId,
                   role: "admin",
-                  adminAccessLevel: "delivery_admin",
+                  adminAccessLevel: this.ownerAdminAccessLevel,
                   isActive: true,
                 },
               ];
@@ -340,6 +341,30 @@ describe("shared Admin and website user creation path", () => {
     expect(JSON.stringify(websiteResult)).not.toContain(
       request.account.password,
     );
+  });
+
+  it("allows an active system Admin to be the new customer's primary owner", async () => {
+    db.ownerAdminAccessLevel = "system_admin";
+    const adminCaller = adminRouter.createCaller(adminContext());
+
+    const result = await adminCaller.users.create({
+      username: "Admin.Owned.Customer",
+      password: "admin-owned-customer-password",
+      displayName: "Admin 负责客户",
+      role: "user",
+      planCode: "basic",
+      marketEdition: "domestic",
+      deliveryAdminId: db.deliveryAdminId,
+      apiKey: "sk-admin-owned-customer-credential-000001",
+    });
+
+    expect(result.assignedDeliveryAdminId).toBe(db.deliveryAdminId);
+    expect(
+      db.inserts.find(({ table }) => table === userUsageOwners)?.values,
+    ).toMatchObject({
+      userId: result.user.id,
+      deliveryAdminId: db.deliveryAdminId,
+    });
   });
 
   it("keeps administrator passwords on the existing managed-account path", async () => {

@@ -70,7 +70,7 @@ const ROLE_PANELS: Record<DeliveryRoleType, string[]> = {
   content_distribution_engineer: [
     "应答逻辑",
     "AI 友好内容资产",
-    "内容板块与卡片",
+    "客户看板内容区",
     "媒体发布与分发结果",
   ],
 };

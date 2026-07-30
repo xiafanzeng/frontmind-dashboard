@@ -30,7 +30,7 @@ describe("admin customer workspace", () => {
       "套餐与问题",
       "知识库流程",
       "工单与官网",
-      "内容、监控与报告",
+      "客户看板展示",
       "客户 Key 与积分",
       "操作记录",
     ]);
@@ -65,5 +65,20 @@ describe("admin customer workspace", () => {
       "utf8",
     );
     expect(source).not.toContain('<option value="knowledge">');
+  });
+
+  it("keeps customer identity readable beside the assignment editor", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+
+    expect(source).toContain("lg:grid-cols-[minmax(240px,1fr)_minmax(0,2fr)]");
+    expect(source).toContain(
+      'className="mt-1 truncate text-2xl font-semibold text-[#171321]"',
+    );
+    expect(source).toContain(
+      'className="mt-2 truncate text-sm text-[#716a80]"',
+    );
   });
 });

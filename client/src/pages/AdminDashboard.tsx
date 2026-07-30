@@ -166,6 +166,143 @@ export const channelDistributionUrl = "https://i.kol.cn/";
 
 type AssignedTicketManager = { id: string; name: string };
 
+type DeliveryEngineerStatusSource = {
+  engineers?: Array<{
+    id: number;
+    username?: string | null;
+    displayName?: string | null;
+    isActive?: boolean | number | null;
+    engineerRoleType?: DeliveryRoleType | null;
+    apiKeyConfigured?: boolean | null;
+  }>;
+  assignments?: Array<{
+    customerUserId: number;
+    engineerUserId?: number | null;
+  }>;
+  projects?: Array<{
+    id: number;
+    username?: string | null;
+    displayName?: string | null;
+  }>;
+  tickets?: Array<{
+    assignedMemberId?: number | null;
+    status?: string | null;
+  }>;
+};
+
+export type DeliveryEngineerStatusRow = {
+  id: number;
+  username: string;
+  displayName: string;
+  roleType: DeliveryRoleType | null;
+  projectNames: string[];
+  projectCount: number;
+  activeTicketCount: number;
+  workStatus:
+    | "processing"
+    | "waiting_customer"
+    | "available"
+    | "unassigned"
+    | "disabled";
+  workStatusLabel: string;
+  isActive: boolean;
+  apiKeyConfigured: boolean;
+};
+
+export function buildDeliveryEngineerStatusRows(
+  source?: DeliveryEngineerStatusSource | null,
+): DeliveryEngineerStatusRow[] {
+  const projectsById = new Map(
+    (source?.projects ?? []).map((project) => [
+      project.id,
+      String(
+        project.displayName || project.username || `客户 ${project.id}`,
+      ).trim(),
+    ]),
+  );
+  const assignments = source?.assignments ?? [];
+  const tickets = source?.tickets ?? [];
+  const statusPriority: Record<
+    DeliveryEngineerStatusRow["workStatus"],
+    number
+  > = {
+    processing: 0,
+    waiting_customer: 1,
+    available: 2,
+    unassigned: 3,
+    disabled: 4,
+  };
+
+  return (source?.engineers ?? [])
+    .map((engineer): DeliveryEngineerStatusRow => {
+      const engineerAssignments = assignments.filter(
+        (assignment) => assignment.engineerUserId === engineer.id,
+      );
+      const projectNames = Array.from(
+        new Set(
+          engineerAssignments.map(
+            (assignment) =>
+              projectsById.get(assignment.customerUserId) ||
+              `客户 ${assignment.customerUserId}`,
+          ),
+        ),
+      );
+      const engineerTickets = tickets.filter(
+        (ticket) => ticket.assignedMemberId === engineer.id,
+      );
+      const processingTicketCount = engineerTickets.filter((ticket) =>
+        ["submitted", "scheduled", "in_progress"].includes(
+          String(ticket.status || ""),
+        ),
+      ).length;
+      const waitingTicketCount = engineerTickets.filter(
+        (ticket) => ticket.status === "needs_information",
+      ).length;
+      const isActive = Boolean(engineer.isActive);
+      let workStatus: DeliveryEngineerStatusRow["workStatus"];
+      let workStatusLabel: string;
+
+      if (!isActive) {
+        workStatus = "disabled";
+        workStatusLabel = "账号已停用";
+      } else if (processingTicketCount > 0) {
+        workStatus = "processing";
+        workStatusLabel = `处理中 · ${processingTicketCount} 单`;
+      } else if (waitingTicketCount > 0) {
+        workStatus = "waiting_customer";
+        workStatusLabel = `等待客户 · ${waitingTicketCount} 单`;
+      } else if (projectNames.length === 0) {
+        workStatus = "unassigned";
+        workStatusLabel = "未分配项目";
+      } else {
+        workStatus = "available";
+        workStatusLabel = "当前空闲";
+      }
+
+      return {
+        id: engineer.id,
+        username: String(engineer.username || `engineer-${engineer.id}`),
+        displayName: String(
+          engineer.displayName || engineer.username || `工程师 ${engineer.id}`,
+        ),
+        roleType: engineer.engineerRoleType ?? null,
+        projectNames,
+        projectCount: projectNames.length,
+        activeTicketCount: engineerTickets.length,
+        workStatus,
+        workStatusLabel,
+        isActive,
+        apiKeyConfigured: Boolean(engineer.apiKeyConfigured),
+      };
+    })
+    .sort((left, right) => {
+      const statusDifference =
+        statusPriority[left.workStatus] - statusPriority[right.workStatus];
+      if (statusDifference !== 0) return statusDifference;
+      return left.displayName.localeCompare(right.displayName, "zh-CN");
+    });
+}
+
 function assignedManagersForTicket(ticket: any): AssignedTicketManager[] {
   if (Array.isArray(ticket?.assignedAdmins) && ticket.assignedAdmins.length) {
     return ticket.assignedAdmins
@@ -711,6 +848,9 @@ export default function AdminDashboard({
     ) ||
     usageManagers[0] ||
     null;
+  const deliveryEngineerStatusRows = buildDeliveryEngineerStatusRows(
+    deliveryRoleOverviewQuery.data,
+  );
 
   useEffect(() => {
     if (selectedUsageManagerId == null && usageManagers[0]?.adminId != null) {
@@ -773,59 +913,107 @@ export default function AdminDashboard({
         {!previewMode && (
           <PortalCard className="overflow-hidden">
             <div className="border-b border-[#eee8f2] px-5 py-4 sm:px-6">
-              <h2 className="font-semibold text-[#171321]">四角色交付状态</h2>
+              <h2 className="font-semibold text-[#171321]">工程师状态</h2>
               <p className="mt-1 text-sm text-[#716a80]">
-                逾期按工单超过 72
-                小时未更新统计；待分配工单不能由交付管理员直接执行。
+                按人员查看专业岗位、负责项目和当前工作状态；项目岗位缺员请前往客户项目团队处理。
               </p>
             </div>
             {deliveryRoleOverviewQuery.isLoading ? (
               <div className="p-6 text-sm text-[#716a80]">
-                正在读取角色队列…
+                正在读取工程师状态…
               </div>
             ) : deliveryRoleOverviewQuery.error ? (
               <div className="p-6 text-sm text-[#a02652]">
-                角色队列暂时无法读取。
+                工程师状态暂时无法读取。
+              </div>
+            ) : deliveryEngineerStatusRows.length === 0 ? (
+              <div className="p-6 text-sm text-[#716a80]">
+                当前权限范围内暂无工程师账号。
               </div>
             ) : (
-              <div className="grid gap-3 p-5 sm:p-6 xl:grid-cols-2">
-                {(Object.keys(DELIVERY_ROLE_LABELS) as DeliveryRoleType[]).map(
-                  (roleType) => {
-                    const stats =
-                      deliveryRoleOverviewQuery.data?.roleStats[roleType];
+              <div className="overflow-x-auto">
+                <div className="min-w-[760px]">
+                  <div className="grid grid-cols-[minmax(180px,1.2fr)_minmax(170px,1.1fr)_minmax(190px,1.3fr)_150px_140px] gap-4 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 text-xs font-medium text-[#716a80] sm:px-6">
+                    <span>工程师</span>
+                    <span>专业岗位</span>
+                    <span>负责项目</span>
+                    <span>当前状态</span>
+                    <span>账号与 Key</span>
+                  </div>
+                  {deliveryEngineerStatusRows.map((engineer) => {
+                    const statusTone =
+                      engineer.workStatus === "processing"
+                        ? "bg-[#f1e8f8] text-[#6a338f]"
+                        : engineer.workStatus === "waiting_customer"
+                          ? "bg-[#fff7e7] text-[#946800]"
+                          : engineer.workStatus === "available"
+                            ? "bg-[#eaf7f0] text-[#16794f]"
+                            : engineer.workStatus === "disabled"
+                              ? "bg-[#f2eff4] text-[#716a80]"
+                              : "bg-[#fff1f4] text-[#a02652]";
                     return (
                       <div
-                        key={roleType}
-                        className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4"
+                        key={engineer.id}
+                        className="grid grid-cols-[minmax(180px,1.2fr)_minmax(170px,1.1fr)_minmax(190px,1.3fr)_150px_140px] items-center gap-4 border-b border-[#eee8f2] px-5 py-4 last:border-b-0 sm:px-6"
                       >
-                        <p className="font-semibold text-[#332842]">
-                          {DELIVERY_ROLE_LABELS[roleType]}
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-[#332842]">
+                            {engineer.displayName}
+                          </p>
+                          <p className="mt-1 truncate text-xs text-[#857e91]">
+                            {engineer.username}
+                          </p>
+                        </div>
+                        <p className="text-sm text-[#484057]">
+                          {engineer.roleType
+                            ? DELIVERY_ROLE_LABELS[engineer.roleType]
+                            : "岗位未设置"}
                         </p>
-                        <div className="mt-3 grid grid-cols-5 gap-2">
-                          {[
-                            ["待分配", stats?.pendingAssignment ?? 0],
-                            ["处理中", stats?.processing ?? 0],
-                            ["等待用户", stats?.waitingUser ?? 0],
-                            ["逾期", stats?.overdue ?? 0],
-                            ["已完成", stats?.completed ?? 0],
-                          ].map(([label, value]) => (
-                            <div
-                              key={String(label)}
-                              className="rounded-xl bg-white px-2 py-3 text-center"
-                            >
-                              <p className="text-lg font-semibold text-[#5b2a86]">
-                                {Number(value)}
-                              </p>
-                              <p className="mt-1 text-[11px] text-[#857e91]">
-                                {label}
-                              </p>
-                            </div>
-                          ))}
+                        <div className="min-w-0">
+                          <p className="truncate text-sm text-[#484057]">
+                            {engineer.projectNames.length > 0
+                              ? engineer.projectNames.join("、")
+                              : "尚未负责客户项目"}
+                          </p>
+                          {engineer.projectCount > 1 && (
+                            <p className="mt-1 text-xs text-[#857e91]">
+                              共 {engineer.projectCount} 个项目
+                            </p>
+                          )}
+                        </div>
+                        <div>
+                          <span
+                            className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${statusTone}`}
+                          >
+                            {engineer.workStatusLabel}
+                          </span>
+                        </div>
+                        <div className="space-y-1 text-xs">
+                          <p
+                            className={
+                              engineer.isActive
+                                ? "text-[#16794f]"
+                                : "text-[#857e91]"
+                            }
+                          >
+                            {engineer.isActive ? "账号启用" : "账号停用"}
+                          </p>
+                          <p
+                            className={
+                              engineer.apiKeyConfigured
+                                ? "text-[#16794f]"
+                                : "text-[#a02652]"
+                            }
+                          >
+                            {engineer.apiKeyConfigured
+                              ? "Key 已配置"
+                              : "Key 未配置"}
+                          </p>
                         </div>
                       </div>
                     );
-                  },
-                )}
+                  })}
+                </div>
               </div>
             )}
           </PortalCard>

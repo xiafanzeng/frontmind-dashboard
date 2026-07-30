@@ -57,6 +57,11 @@ const deliveryAdmins = [
     username: "delivery.owner",
     displayName: "交付负责人",
   },
+  {
+    id: 1,
+    username: "admin",
+    displayName: "Admin",
+  },
 ];
 
 describe("CreateUserDialog", () => {
@@ -116,6 +121,27 @@ describe("CreateUserDialog", () => {
     fireEvent.click(screen.getByRole("combobox", { name: "客户版本" }));
     expect(screen.getByRole("option", { name: "海内版" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "海外版" })).toBeInTheDocument();
+  });
+
+  it("offers both Admin and delivery administrators as customer owners", () => {
+    render(
+      <CreateUserDialog
+        open
+        userOnly
+        deliveryAdmins={deliveryAdmins}
+        onOpenChange={() => undefined}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("combobox", { name: "客户主负责人" }),
+    );
+    expect(
+      screen.getByRole("option", { name: "交付负责人 · @delivery.owner" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: "Admin · @admin" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps administrator creation available only in the system-admin variant", () => {

@@ -92,13 +92,15 @@ export default function ManagerAssignmentEditor({
       // The owning workspace reports the service error and keeps the draft open.
     }
   };
-  const selectedDeliveryOptions = options.filter(
+  const selectedOwnerOptions = options.filter(
     (option) =>
-      draftIds.includes(option.id) && option.accessLevel === "delivery_admin",
+      draftIds.includes(option.id) &&
+      (option.accessLevel === "system_admin" ||
+        option.accessLevel === "delivery_admin"),
   );
   const hasValidUsageOwner =
     draftUsageOwnerId != null &&
-    selectedDeliveryOptions.some((option) => option.id === draftUsageOwnerId);
+    selectedOwnerOptions.some((option) => option.id === draftUsageOwnerId);
   const ownerChanged = (usageOwnerId ?? null) !== draftUsageOwnerId;
 
   return (
@@ -208,7 +210,8 @@ export default function ManagerAssignmentEditor({
                           }
                           if (
                             event.target.checked &&
-                            option.accessLevel === "delivery_admin" &&
+                            (option.accessLevel === "system_admin" ||
+                              option.accessLevel === "delivery_admin") &&
                             !hasValidUsageOwner
                           ) {
                             setDraftUsageOwnerId(option.id);
@@ -254,7 +257,7 @@ export default function ManagerAssignmentEditor({
             <select
               id="usage-owner-admin"
               value={draftUsageOwnerId ?? ""}
-              disabled={saving || selectedDeliveryOptions.length === 0}
+              disabled={saving || selectedOwnerOptions.length === 0}
               onChange={(event) =>
                 setDraftUsageOwnerId(
                   event.target.value ? Number(event.target.value) : null,
@@ -263,14 +266,14 @@ export default function ManagerAssignmentEditor({
               className="mt-2 h-10 w-full rounded-lg border border-[#ddd3e4] bg-white px-3 text-sm text-[#484057]"
             >
               <option value="">请选择一位管理员</option>
-              {selectedDeliveryOptions.map((option) => (
+              {selectedOwnerOptions.map((option) => (
                 <option key={option.id} value={option.id}>
                   {option.label}
                 </option>
               ))}
             </select>
             <p className="mt-2 text-xs leading-5 text-[#8d8499]">
-              主负责人必须选择交付管理员；系统管理员可保留为协作管理员，但不能承接客户主负责人职责。
+              主负责人可以选择 Admin 或交付管理员。
             </p>
           </div>
 

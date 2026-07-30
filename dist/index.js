@@ -10801,8 +10801,8 @@ async function setWorkspaceAssignments(input) {
       throw new AuthServiceError("NOT_FOUND", "Administrator not found");
     }
   }
-  const deliveryAdminIds = validAdmins.filter((admin) => admin.adminAccessLevel === "delivery_admin").map((admin) => admin.id);
-  if (input.usageOwnerAdminId != null && !deliveryAdminIds.includes(input.usageOwnerAdminId)) {
+  const eligibleOwnerAdminIds = validAdmins.filter((admin) => isExplicitAdminAccessLevel(admin.adminAccessLevel)).map((admin) => admin.id);
+  if (input.usageOwnerAdminId != null && !eligibleOwnerAdminIds.includes(input.usageOwnerAdminId)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
       "\u4E3B\u8D1F\u8D23\u4EBA\u5FC5\u987B\u662F\u5DF2\u9009\u4E2D\u7684\u6709\u6548\u7BA1\u7406\u5458"
@@ -10832,8 +10832,8 @@ async function setWorkspaceAssignments(input) {
         "\u7BA1\u7406\u5458\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u65B0\u5206\u914D"
       );
     }
-    const lockedDeliveryAdminIds = lockedAdmins.filter((admin) => admin.adminAccessLevel === "delivery_admin").map((admin) => admin.id);
-    if (input.usageOwnerAdminId != null && !lockedDeliveryAdminIds.includes(input.usageOwnerAdminId)) {
+    const lockedEligibleOwnerAdminIds = lockedAdmins.filter((admin) => isExplicitAdminAccessLevel(admin.adminAccessLevel)).map((admin) => admin.id);
+    if (input.usageOwnerAdminId != null && !lockedEligibleOwnerAdminIds.includes(input.usageOwnerAdminId)) {
       throw new AuthServiceError(
         "CONFLICT",
         "\u4E3B\u8D1F\u8D23\u4EBA\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u65B0\u5206\u914D"
@@ -10842,7 +10842,7 @@ async function setWorkspaceAssignments(input) {
     const previousAssignments = await tx.select({ adminId: userAdminAssignments.adminId }).from(userAdminAssignments).where(eq9(userAdminAssignments.userId, input.userId));
     const previousOwners = await tx.select().from(userUsageOwners).where(eq9(userUsageOwners.userId, input.userId)).limit(1).for("update");
     const previousOwner = previousOwners[0] ?? null;
-    const nextUsageOwnerId = input.usageOwnerAdminId !== void 0 ? input.usageOwnerAdminId : previousOwner && lockedDeliveryAdminIds.includes(previousOwner.deliveryAdminId) ? previousOwner.deliveryAdminId : lockedDeliveryAdminIds.length === 1 ? lockedDeliveryAdminIds[0] : null;
+    const nextUsageOwnerId = input.usageOwnerAdminId !== void 0 ? input.usageOwnerAdminId : previousOwner && lockedEligibleOwnerAdminIds.includes(previousOwner.deliveryAdminId) ? previousOwner.deliveryAdminId : lockedEligibleOwnerAdminIds.length === 1 ? lockedEligibleOwnerAdminIds[0] : null;
     await tx.delete(userAdminAssignments).where(eq9(userAdminAssignments.userId, input.userId));
     if (uniqueAdminIds.length > 0) {
       await tx.insert(userAdminAssignments).values(
@@ -11239,6 +11239,14 @@ async function getManagedCredentialStatus(actor, userId) {
 import { createHash as createHash6, randomUUID as randomUUID8 } from "node:crypto";
 import { and as and9, asc as asc3, desc as desc9, eq as eq10, isNotNull as isNotNull2, isNull as isNull3 } from "drizzle-orm";
 
+// shared/knowledge-base-output.ts
+var KNOWLEDGE_BASE_REFERENCE_APPENDIX_HEADER = /(?:^|\r?\n)[\t ]*(?:#{1,6}[\t ]*)?(?:\*\*|__)?(?:参考资料|参考来源|引用来源|references?|sources?)(?:\*\*|__)?[\t ]*(?:(?:[:：])[\t ]*[^\r\n]*)?[\t ]*(?=\r?$)/im;
+function stripKnowledgeBaseReferenceAppendix(text2) {
+  const normalized = String(text2 || "");
+  const match = KNOWLEDGE_BASE_REFERENCE_APPENDIX_HEADER.exec(normalized);
+  return (match ? normalized.slice(0, match.index) : normalized).trim();
+}
+
 // server/knowledge-base-artifact.ts
 import { createHash as createHash5 } from "node:crypto";
 var MAX_ARCHIVE_CANDIDATES = 32;
@@ -11428,9 +11436,11 @@ function extractFinalKnowledgeBaseAssistantText(output) {
 }
 function assertKnowledgeBaseCustomerOutput(output) {
   const text2 = extractFinalKnowledgeBaseAssistantText(output);
-  const customerVisibleText = text2.replace(
-    /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
-    ""
+  const customerVisibleText = stripKnowledgeBaseReferenceAppendix(
+    text2.replace(
+      /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
+      ""
+    )
   );
   const violation = customerFormalContentViolation(customerVisibleText);
   if (violation) {
@@ -11451,18 +11461,19 @@ function reconciliationHash(input) {
   ).digest("hex");
 }
 function modelOutputAudit(text2) {
-  const contentMarkdown = text2.replace(
+  const auditMarkdown = text2.replace(
     /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
     ""
   ).trim().slice(-2e6);
+  const contentMarkdown = stripKnowledgeBaseReferenceAppendix(auditMarkdown).slice(-2e6);
   const sourceUrls = Array.from(
-    new Set(contentMarkdown.match(/https?:\/\/[^\s<>)\]"']+/gi) || [])
+    new Set(auditMarkdown.match(/https?:\/\/[^\s<>)\]"']+/gi) || [])
   ).slice(0, 500);
   const imageUrls = Array.from(
     new Set(
       [
         ...Array.from(
-          contentMarkdown.matchAll(/!\[[^\]]*]\((https?:\/\/[^)\s]+)\)/gi),
+          auditMarkdown.matchAll(/!\[[^\]]*]\((https?:\/\/[^)\s]+)\)/gi),
           (match) => match[1]
         ),
         ...sourceUrls.filter(
@@ -20605,10 +20616,10 @@ async function createManagedServiceUser(input, dependencies = {}) {
       isActive: users.isActive
     }).from(users).where(eq21(users.id, deliveryAdminId)).limit(1).for("update");
     const admin = rows[0];
-    if (!admin || admin.role !== "admin" || admin.adminAccessLevel !== "delivery_admin" || admin.isActive !== true) {
+    if (!admin || admin.role !== "admin" || !isExplicitAdminAccessLevel(admin.adminAccessLevel) || admin.isActive !== true) {
       throw new AuthServiceError(
         "INVALID_CREDENTIAL",
-        "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u4EA4\u4ED8\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
+        "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684 Admin \u6216\u4EA4\u4ED8\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
       );
     }
   });
@@ -20737,10 +20748,10 @@ async function completeManagedServiceUserProvisioning(input, dependencies = {}) 
         isActive: users.isActive
       }).from(users).where(eq21(users.id, deliveryAdminId)).limit(1).for("update");
       const admin = rows[0];
-      if (!admin || admin.role !== "admin" || admin.adminAccessLevel !== "delivery_admin" || admin.isActive !== true) {
+      if (!admin || admin.role !== "admin" || !isExplicitAdminAccessLevel(admin.adminAccessLevel) || admin.isActive !== true) {
         throw new AuthServiceError(
           "INVALID_CREDENTIAL",
-          "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684\u4EA4\u4ED8\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
+          "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u542F\u7528\u7684 Admin \u6216\u4EA4\u4ED8\u7BA1\u7406\u5458\u4F5C\u4E3A\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA"
         );
       }
     });
@@ -23820,7 +23831,7 @@ async function getKnowledgeResetStatus(userId) {
     revision: stateRows[0]?.revision ?? 0,
     hasKnowledge: counts.hasKnowledge,
     locked: Boolean(pending),
-    canRequest: counts.hasKnowledge && Boolean(owner) && !pending,
+    canRequest: aiOperationsIncluded && counts.hasKnowledge && Boolean(owner) && !pending,
     unavailableReason: !aiOperationsIncluded ? "\u5F53\u524D\u5957\u9910\u4E0D\u542B\u4EBA\u5DE5\u77E5\u8BC6\u5E93\u8FD0\u7EF4" : !owner ? "\u5C1A\u672A\u5206\u914D AI \u8FD0\u7EF4\u5DE5\u7A0B\u5E08\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458" : pending ? "\u5DF2\u6709\u4E00\u5F20\u77E5\u8BC6\u5E93\u91CD\u7F6E\u5DE5\u5355\u6B63\u5728\u5904\u7406" : !counts.hasKnowledge ? "\u5F53\u524D\u6CA1\u6709\u53EF\u91CD\u7F6E\u7684\u77E5\u8BC6\u5E93\u8BB0\u5F55" : null,
     engineer: owner ? {
       id: owner.memberId,
@@ -29036,7 +29047,8 @@ function normalizeUserAttachments(attachments2) {
 }
 async function loadSkillArchive(selection = { version: "3" }) {
   const version = selection.version === "1" ? "1" : selection.version === "2" ? "2" : "3";
-  const cached = skillArchiveCache.get(version);
+  const cacheKey = `${version}:${selection.contentHash || "latest"}`;
+  const cached = skillArchiveCache.get(cacheKey);
   if (cached) {
     if (selection.contentHash && selection.contentHash !== cached.contentHash) {
       throw new Error(
@@ -29046,7 +29058,16 @@ async function loadSkillArchive(selection = { version: "3" }) {
     return cached;
   }
   let lastError;
-  const candidates = version === "1" ? legacySkillArchiveCandidates : version === "2" ? skillArchiveCandidates : currentSkillArchiveCandidates;
+  let contentHashMismatchError = null;
+  const candidates = version === "1" ? legacySkillArchiveCandidates : version === "2" ? skillArchiveCandidates : [
+    ...selection.contentHash ? currentSkillArchiveCandidates.map(
+      (candidate) => path6.join(
+        path6.dirname(candidate),
+        `socratic-kb-builder-v3-${selection.contentHash}.skill`
+      )
+    ) : [],
+    ...currentSkillArchiveCandidates
+  ];
   for (const candidate of candidates) {
     try {
       const archive = await fs5.readFile(candidate);
@@ -29075,15 +29096,19 @@ ${content.trim()}`);
         archivePath: candidate
       };
       if (selection.contentHash && selection.contentHash !== loaded.contentHash) {
-        throw new Error(
+        contentHashMismatchError = new Error(
           `Knowledge-base Skill v${version} content hash does not match the active build`
         );
+        continue;
       }
-      skillArchiveCache.set(version, loaded);
+      skillArchiveCache.set(cacheKey, loaded);
       return loaded;
     } catch (error) {
       lastError = error;
     }
+  }
+  if (contentHashMismatchError) {
+    throw contentHashMismatchError;
   }
   throw lastError instanceof Error ? lastError : new Error(`Could not load socratic-kb-builder Skill v${version}`);
 }
@@ -29226,6 +29251,7 @@ async function buildKnowledgeBasePrompt({
     "\u8BE5 ZIP \u662F\u672C\u4EFB\u52A1\u552F\u4E00\u7684 socratic-kb-builder v3 \u5DE5\u4F5C\u89C4\u7EA6\uFF1B\u672C\u6BB5\u4EC5\u63D0\u4F9B\u4F01\u4E1A\u8F93\u5165\u548C\u670D\u52A1\u7AEF\u72B6\u6001\u7EA6\u675F\u3002",
     "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\uFF1B\u53EA\u4F7F\u7528\u5F53\u524D Pro Agent \u6A21\u5F0F\u4E0B\u7684\u666E\u901A\u6D4F\u89C8\u3001\u641C\u7D22\u548C\u6587\u4EF6\u5DE5\u5177\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
+    "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u77E5\u8BC6\u6811\u7EDF\u8BA1\uFF08\u4EC5\u9996\u8F6E\u9700\u8981\uFF09\u548C\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\u3002\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\uFF1B\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\u3002\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u5D4C\u5165\u5B98\u7F51\u6216 CDN \u56FE\u7247\u5916\u94FE\u3002\u56FE\u7247\u5FC5\u987B\u5148\u4E0B\u8F7D\u771F\u5B9E\u5B57\u8282\u3001\u89E3\u7801\u6821\u9A8C\u5E76\u6253\u5165\u6700\u7EC8 ZIP\uFF0C\u518D\u4EE5\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u5F15\u7528\uFF1B\u9632\u76D7\u94FE\u3001\u7B7E\u540D\u3001\u8FC7\u671F\u6216\u65E0\u6CD5\u4E0B\u8F7D\u7684\u5730\u5740\u53EA\u80FD\u8FDB\u5165\u5185\u90E8\u6765\u6E90\u8BB0\u5F55\uFF0C\u7EDD\u4E0D\u80FD\u4F5C\u4E3A\u5BA2\u6237\u56FE\u7247\u8FD4\u56DE\u3002",
     `\u8D44\u6599\u91C7\u96C6\u9636\u6BB5\u7EDF\u4E00\u5411\u5BA2\u6237\u663E\u793A\uFF1A${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
     "",
@@ -29262,6 +29288,7 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     "FRONTMIND_KB_PROGRESS \u58F0\u660E\u672C\u8F6E\u5904\u7406\u7684\u65E7\u8282\u70B9\uFF1BFRONTMIND_KB_PRESENTATION \u58F0\u660E\u56DE\u590D\u6B63\u6587\u5B9E\u9645\u5C55\u793A\u7684\u65B0\u72B6\u6001\u3002\u5C55\u793A\u4FE1\u5C01 revision \u5FC5\u987B\u7B49\u4E8E\u63D0\u4EA4\u540E\u7684 revision\uFF0CleafId \u5FC5\u987B\u7B49\u4E8E\u63D0\u4EA4\u540E\u670D\u52A1\u7AEF\u7684 currentLeafId\uFF1B\u5168\u90E8\u5B8C\u6210\u65F6 leafId \u4E3A null\u3002",
     "\u53EA\u6709\u7528\u6237\u672C\u8F6E\u56DE\u590D\u6070\u597D\u8868\u8FBE\u201C\u786E\u8BA4/\u786E\u8BA4\u65E0\u8BEF/OK/\u6CA1\u95EE\u9898/\u901A\u8FC7\u201D\u7B49\u660E\u786E\u786E\u8BA4\u65F6\uFF0Cto \u624D\u80FD\u4E3A confirmed\uFF0C\u5E76\u53EA\u524D\u8FDB\u4E00\u4E2A\u53F6\u5B50\u3002",
     "\u53EA\u6709\u7528\u6237\u672C\u8F6E\u660E\u786E\u56DE\u590D\u201C\u8DF3\u8FC7/\u76F4\u63A5\u9884\u586B/\u91C7\u7528\u9884\u586B/\u4FDD\u7559\u9884\u586B\u201D\u7B49\u65F6\uFF0Cto \u624D\u80FD\u4E3A direct_prefilled\uFF0C\u5E76\u53EA\u524D\u8FDB\u4E00\u4E2A\u53F6\u5B50\u3002",
+    "direct_prefilled \u53EA\u7528\u4E8E\u517C\u5BB9\u7528\u6237\u4E3B\u52A8\u8F93\u5165\u7684\u65E7\u534F\u8BAE\u52A8\u4F5C\uFF1B\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\u3002\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
     "\u7528\u6237\u8F93\u5165\u4EFB\u4F55\u8865\u5145\u3001\u4FEE\u8BA2\u3001\u95EE\u9898\u6216\u4E0A\u4F20\u8D44\u6599\u65F6\uFF0Cto \u5FC5\u987B\u4E3A needs_verification\uFF1B\u66F4\u65B0\u5E76\u91CD\u65B0\u5448\u73B0\u540C\u4E00\u53F6\u5B50\uFF0C\u7EE7\u7EED\u7B49\u5F85\u7528\u6237\u660E\u786E\u786E\u8BA4\u6216\u76F4\u63A5\u9884\u586B\uFF0C\u7EDD\u5BF9\u4E0D\u80FD\u81EA\u52A8\u524D\u8FDB\u3002",
     "\u786E\u8BA4\u6216\u76F4\u63A5\u9884\u586B\u8282\u70B9 A \u540E\uFF0C\u53EA\u7528\u4E00\u53E5\u8BDD\u7B80\u77ED\u786E\u8BA4 A\uFF0C\u5BA2\u6237\u53EF\u89C1\u4E3B\u4F53\u5FC5\u987B\u76F4\u63A5\u5B8C\u6574\u5C55\u793A\u4E0B\u4E00\u4E2A\u5F85\u5904\u7406\u8282\u70B9 B\uFF1B\u4FEE\u8BA2\u65F6\u4E3B\u4F53\u7EE7\u7EED\u5B8C\u6574\u5C55\u793A A\u3002\u56DE\u590D\u6B63\u6587\u5FC5\u987B\u4FDD\u5B58\u7ED9\u5B9E\u9645\u5C55\u793A\u7684\u8282\u70B9\uFF0C\u800C\u4E0D\u662F\u521A\u5B8C\u6210\u7684\u65E7\u8282\u70B9\u3002",
     "\u4E0D\u5F97\u63D0\u4EA4\u591A\u4E2A transition\u3001\u4E0D\u5F97\u6539\u5199\u5386\u53F2\u72B6\u6001\u3001\u4E0D\u5F97\u76F8\u4FE1\u6B63\u6587\u4E2D\u7684\u767E\u5206\u6BD4\u3002\u771F\u5B9E\u8FDB\u5EA6\u53EA\u7531\u670D\u52A1\u7AEF\u6309 (confirmed + direct_prefilled) / total \u8BA1\u7B97\u3002",
@@ -29388,6 +29415,8 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     `\u7EE7\u7EED\u4E25\u683C\u6267\u884C\u672C\u4EFB\u52A1\u9996\u8F6E\u5DF2\u9644\u5E26\u7684 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}\uFF08socratic-kb-builder v${input.skillVersion || "3"}\uFF09\u3002\u4EE5\u4E0B\u5185\u5BB9\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u63D0\u793A\u8BCD\u8BF4\u660E\u3002`,
     "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u51FA\u73B0\u201C\u672C\u8F6E\u91C7\u96C6/\u672C\u77E5\u8BC6\u5E93/\u8BC1\u636E\u4E0D\u8DB3/\u5DF2\u6838\u9A8C\u201D\u7B49\u8FC7\u7A0B\u5224\u65AD\uFF0C\u4E5F\u4E0D\u5F97\u51FA\u73B0\u5BA2\u6237\u5E94\u3001\u91C7\u8D2D\u65B9\u5E94\u3001\u5EFA\u8BAE\u3001\u5C3D\u8C03\u3001\u5408\u89C4\u5BA1\u67E5\u3001\u4E0D\u80FD\u4EC5\u51ED\u3001\u4E0D\u5B9C\u8F6C\u6362\u6216\u4E0D\u80FD\u5916\u63A8\u7B49\u5EFA\u8BAE\u6027\u8868\u8FBE\u3002",
+    "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\uFF1B\u7528\u6237\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\u5F53\u524D\u5185\u5BB9\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
+    "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\uFF0C\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\u3002\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\uFF1B\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "",
     "# \u5F53\u524D\u77E5\u8BC6\u5E93\u72B6\u6001",
     stateReminder,
@@ -29629,7 +29658,7 @@ router3.post("/turn", async (req, res) => {
     res.status(422).json({
       error: {
         code: "AMBIGUOUS_KNOWLEDGE_BASE_ACTION",
-        message: "\u201C\u7EE7\u7EED/\u4E0B\u4E00\u6B65\u201D\u4E0D\u4F1A\u63A8\u8FDB\u77E5\u8BC6\u8282\u70B9\u3002\u8BF7\u9009\u62E9\u201C\u786E\u8BA4\u5E76\u8FDB\u5165\u4E0B\u4E00\u9879\u201D\u6216\u201C\u76F4\u63A5\u9884\u586B\u5E76\u8FDB\u5165\u4E0B\u4E00\u9879\u201D\uFF0C\u4E5F\u53EF\u4EE5\u8F93\u5165\u4FEE\u6539\u5185\u5BB9\u6216\u4E0A\u4F20\u8D44\u6599\u3002"
+        message: "\u201C\u7EE7\u7EED/\u4E0B\u4E00\u6B65\u201D\u4E0D\u4F1A\u63A8\u8FDB\u77E5\u8BC6\u8282\u70B9\u3002\u8BF7\u70B9\u51FB\u201C\u786E\u8BA4\u5F53\u524D\u5185\u5BB9\u201D\uFF1B\u5982\u9700\u4FEE\u6539\uFF0C\u8BF7\u76F4\u63A5\u8F93\u5165\u610F\u89C1\u6216\u4E0A\u4F20\u8D44\u6599\u3002"
       }
     });
     return;

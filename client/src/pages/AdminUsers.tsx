@@ -494,7 +494,8 @@ export default function AdminUsers() {
         deliveryAdmins={users.filter(
           (account) =>
             account.role === "admin" &&
-            account.adminAccessLevel === "delivery_admin" &&
+            (account.adminAccessLevel === "system_admin" ||
+              account.adminAccessLevel === "delivery_admin") &&
             account.isActive,
         )}
       />
@@ -1233,7 +1234,7 @@ export function CreateUserDialog({
                         </SelectContent>
                       </Select>
                       <p className="text-xs leading-5 text-muted-foreground">
-                        客户主负责人必须是交付管理员，并承担该客户的交付与任务用量归属。
+                        客户主负责人可以是 Admin 或交付管理员，并承担该客户的交付与任务用量归属。
                       </p>
                     </div>
                   )}

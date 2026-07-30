@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   adminNav,
+  buildDeliveryEngineerStatusRows,
   canCreateCustomerFromDashboard,
   channelDistributionUrl,
   filterApiKeyUsageForAdmin,
@@ -186,6 +187,105 @@ describe("administrator channel navigation", () => {
     expect(source).not.toContain(
       "套餐权益、知识库流程、选题、应答逻辑、问题监控",
     );
+    expect(source).toContain("工程师状态");
+    expect(source).not.toContain("四角色交付状态");
+    expect(source).not.toContain("stats?.pendingAssignment");
+  });
+
+  it("presents delivery workload as one status row per engineer", () => {
+    const rows = buildDeliveryEngineerStatusRows({
+      engineers: [
+        {
+          id: 11,
+          username: "engineer.busy",
+          displayName: "忙碌工程师",
+          isActive: true,
+          engineerRoleType: "ai_operations_engineer",
+          apiKeyConfigured: true,
+        },
+        {
+          id: 12,
+          username: "engineer.waiting",
+          displayName: "等待工程师",
+          isActive: true,
+          engineerRoleType: "monitoring_optimization_engineer",
+          apiKeyConfigured: false,
+        },
+        {
+          id: 13,
+          username: "engineer.free",
+          displayName: "空闲工程师",
+          isActive: true,
+          engineerRoleType: "content_distribution_engineer",
+          apiKeyConfigured: true,
+        },
+      ],
+      projects: [
+        { id: 101, displayName: "甲公司" },
+        { id: 102, displayName: "乙公司" },
+      ],
+      assignments: [
+        { customerUserId: 101, engineerUserId: 11 },
+        { customerUserId: 102, engineerUserId: 11 },
+        { customerUserId: 102, engineerUserId: 12 },
+      ],
+      tickets: [
+        { assignedMemberId: 11, status: "in_progress" },
+        { assignedMemberId: 11, status: "needs_information" },
+        { assignedMemberId: 12, status: "needs_information" },
+      ],
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([11, 12, 13]);
+    expect(rows[0]).toMatchObject({
+      projectNames: ["甲公司", "乙公司"],
+      projectCount: 2,
+      activeTicketCount: 2,
+      workStatus: "processing",
+      workStatusLabel: "处理中 · 1 单",
+      apiKeyConfigured: true,
+    });
+    expect(rows[1]).toMatchObject({
+      projectNames: ["乙公司"],
+      workStatus: "waiting_customer",
+      workStatusLabel: "等待客户 · 1 单",
+      apiKeyConfigured: false,
+    });
+    expect(rows[2]).toMatchObject({
+      projectNames: [],
+      workStatus: "unassigned",
+      workStatusLabel: "未分配项目",
+    });
+  });
+
+  it("puts disabled engineer accounts after active engineers", () => {
+    const rows = buildDeliveryEngineerStatusRows({
+      engineers: [
+        {
+          id: 21,
+          username: "disabled",
+          isActive: false,
+          engineerRoleType: "ai_operations_engineer",
+        },
+        {
+          id: 22,
+          username: "available",
+          isActive: true,
+          engineerRoleType: "ai_operations_engineer",
+        },
+      ],
+      projects: [{ id: 201, displayName: "示例客户" }],
+      assignments: [{ customerUserId: 201, engineerUserId: 22 }],
+      tickets: [],
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([22, 21]);
+    expect(rows[0]?.workStatus).toBe("available");
+    expect(rows[1]).toMatchObject({
+      workStatus: "disabled",
+      workStatusLabel: "账号已停用",
+      isActive: false,
+    });
   });
 
   it("normalizes API Key snapshots with independent default policies", () => {

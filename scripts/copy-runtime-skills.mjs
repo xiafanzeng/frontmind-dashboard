@@ -16,6 +16,10 @@ const skillArtifacts = [
   "brand-question-portfolio.skill",
   "response-logic-builder.skill",
 ];
+const compatibilitySkillArtifacts = (await fs.readdir(sourceRoot)).filter(
+  (name) => /^socratic-kb-builder-v3-[a-f0-9]{64}\.skill$/.test(name),
+);
+skillArtifacts.push(...compatibilitySkillArtifacts);
 const requiredFiles = [
   "socratic-kb-builder.skill",
   "socratic-kb-builder-v1.skill",

@@ -8,6 +8,7 @@ import {
   ExternalLink,
   FileJson2,
   FileText,
+  Globe2,
   History,
   Inbox,
   Link2,
@@ -34,6 +35,7 @@ import {
   DELIVERY_TICKET_STATUS_LABELS,
   type DeliveryTicketStatus,
 } from "@shared/delivery-ticket";
+import { WEBSITE_CONTENT_CATALOG } from "@shared/delivery-catalog";
 
 import "./admin-delivery-ticket-workspace.css";
 
@@ -404,6 +406,47 @@ export function deliveryTicketPublicStatus(
     : "completed";
 }
 
+export type WebsiteContentOverviewItem = {
+  category: (typeof WEBSITE_CONTENT_CATALOG)[number]["value"];
+  label: string;
+  status: "not_started" | "in_progress" | "completed";
+  ticket: AdminDeliveryTicket | null;
+};
+
+function ticketUpdatedAt(ticket: AdminDeliveryTicket) {
+  const timestamp = new Date(
+    ticket.updatedAt || ticket.createdAt || 0,
+  ).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+export function buildWebsiteContentOverview(
+  tickets: readonly AdminDeliveryTicket[],
+): WebsiteContentOverviewItem[] {
+  return WEBSITE_CONTENT_CATALOG.map((category) => {
+    const ticket =
+      tickets
+        .filter(
+          (candidate) =>
+            candidate.type === "website_operation" &&
+            candidate.category === category.value,
+        )
+        .sort(
+          (left, right) => ticketUpdatedAt(right) - ticketUpdatedAt(left),
+        )[0] ?? null;
+    return {
+      category: category.value,
+      label: category.label,
+      status: !ticket
+        ? "not_started"
+        : deliveryTicketPublicStatus(ticket) === "completed"
+          ? "completed"
+          : "in_progress",
+      ticket,
+    };
+  });
+}
+
 export function normalizeTicketDetail(
   value: unknown,
   fallback?: AdminDeliveryTicket,
@@ -653,6 +696,19 @@ export default function AdminDeliveryTicketWorkspace({
     retry: false,
     getNextPageParam: (lastPage: any) => lastPage?.nextCursor || undefined,
   });
+  const websiteOverviewQuery = api.list.useInfiniteQuery(
+    buildAdminTicketListInput({
+      userId,
+      type: "website_operation",
+      limit: 100,
+      order: "updated_desc",
+    }),
+    {
+      enabled: !previewMode && userId > 0,
+      retry: false,
+      getNextPageParam: (lastPage: any) => lastPage?.nextCursor || undefined,
+    },
+  );
   const adjustQuotaMutation = api.adjustQuota.useMutation();
   const previewListData = {
     tickets: previewFixtures?.tickets ?? [],
@@ -713,16 +769,36 @@ export default function AdminDeliveryTicketWorkspace({
         : flattenAdminTicketPages(listPages),
     [listPages, previewMode],
   );
+  const websiteOverviewTickets = useMemo(
+    () =>
+      previewMode
+        ? normalizeAdminTicketList(previewListData).filter(
+            (ticket) => ticket.type === "website_operation",
+          )
+        : flattenAdminTicketPages(websiteOverviewQuery.data?.pages || []),
+    [previewListData, previewMode, websiteOverviewQuery.data?.pages],
+  );
+  const websiteContentOverview = useMemo(
+    () => buildWebsiteContentOverview(websiteOverviewTickets),
+    [websiteOverviewTickets],
+  );
+  const knownTickets = useMemo(() => {
+    const byId = new Map<string, AdminDeliveryTicket>();
+    [...tickets, ...websiteOverviewTickets].forEach((ticket) =>
+      byId.set(ticket.id, ticket),
+    );
+    return [...byId.values()];
+  }, [tickets, websiteOverviewTickets]);
 
   useEffect(() => {
     if (
       selectedTicketId &&
-      tickets.some((ticket) => ticket.id === selectedTicketId)
+      knownTickets.some((ticket) => ticket.id === selectedTicketId)
     ) {
       return;
     }
-    setSelectedTicketId(tickets[0]?.id || "");
-  }, [selectedTicketId, tickets]);
+    setSelectedTicketId(tickets[0]?.id || websiteOverviewTickets[0]?.id || "");
+  }, [knownTickets, selectedTicketId, tickets, websiteOverviewTickets]);
 
   useEffect(() => {
     if (quotaEditing) return;
@@ -731,7 +807,7 @@ export default function AdminDeliveryTicketWorkspace({
   }, [contentQuota.limit, quotaEditing, websiteQuota.limit]);
 
   const selectedTicket =
-    tickets.find((ticket) => ticket.id === selectedTicketId) || null;
+    knownTickets.find((ticket) => ticket.id === selectedTicketId) || null;
   const detailQuery = api.detail.useQuery(
     {
       userId,
@@ -776,6 +852,7 @@ export default function AdminDeliveryTicketWorkspace({
   >("");
   const [pendingWebsiteTemplate, setPendingWebsiteTemplate] =
     useState<PendingWebsiteContentTemplate | null>(null);
+  const [websiteBulkOpen, setWebsiteBulkOpen] = useState(false);
 
   useEffect(() => {
     setPublicReply("");
@@ -798,6 +875,7 @@ export default function AdminDeliveryTicketWorkspace({
   useEffect(() => {
     setPendingWebsiteTemplate(null);
     setWebsiteTemplateBusy("");
+    setWebsiteBulkOpen(false);
   }, [userId]);
 
   const filteredTickets = useMemo(() => {
@@ -828,6 +906,7 @@ export default function AdminDeliveryTicketWorkspace({
     if (previewMode) return;
     await Promise.all([
       listQuery.refetch(),
+      websiteOverviewQuery.refetch(),
       selectedTicketId ? detailQuery.refetch() : Promise.resolve(),
     ]);
   };
@@ -916,6 +995,7 @@ export default function AdminDeliveryTicketWorkspace({
         throw new Error("预检结果与当前客户不一致");
       }
       setPendingWebsiteTemplate({ file, preview });
+      setWebsiteBulkOpen(true);
       if (preview.totals.changed === 0) {
         toast.info("模板与当前官网内容一致");
       } else {
@@ -1287,17 +1367,114 @@ export default function AdminDeliveryTicketWorkspace({
           </span>
         </div>
       </div>
-      <section className="admin-website-template-card">
-        <div className="admin-website-template-heading">
+      <section className="admin-website-overview-card">
+        <div className="admin-website-overview-heading">
+          <div>
+            <span className="admin-website-overview-icon">
+              <Globe2 className="h-5 w-5" />
+            </span>
+            <div>
+              <strong>客户官网内容进度</strong>
+              <span>
+                与客户看板中的五类官网内容一一对应。点击已有内容可直接打开工单更新状态和客户可见总结。
+              </span>
+            </div>
+          </div>
+          <div className="admin-website-overview-total">
+            <strong>
+              {
+                websiteContentOverview.filter(
+                  (item) => item.status === "completed",
+                ).length
+              }
+              /{websiteContentOverview.length}
+            </strong>
+            <span>内容已完成</span>
+          </div>
+        </div>
+        {websiteOverviewQuery.error && !previewMode ? (
+          <div className="admin-website-overview-error">
+            <AlertCircle className="h-4 w-4" />
+            官网内容状态暂时无法读取，请刷新后重试。
+          </div>
+        ) : websiteOverviewQuery.isLoading && !previewMode ? (
+          <div className="admin-website-overview-loading">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            正在读取客户官网内容…
+          </div>
+        ) : (
+          <div className="admin-website-overview-grid">
+            {websiteContentOverview.map((item) => (
+              <button
+                key={item.category}
+                type="button"
+                className={`is-${item.status}`}
+                disabled={!item.ticket}
+                onClick={() => {
+                  if (!item.ticket) return;
+                  setTypeFilter("website_operation");
+                  setStatusFilter("all");
+                  setKeyword("");
+                  selectTicket(item.ticket.id);
+                }}
+              >
+                <header>
+                  <strong>{item.label}</strong>
+                  <span>
+                    {item.status === "completed"
+                      ? "已完成"
+                      : item.status === "in_progress"
+                        ? "处理中"
+                        : "尚未提交"}
+                  </span>
+                </header>
+                <p>
+                  {item.ticket?.publicSummary ||
+                    item.ticket?.topic ||
+                    item.ticket?.title ||
+                    (item.status === "not_started"
+                      ? "客户尚未提交此类官网内容需求。"
+                      : "打开工单补充客户可见的内容总结。")}
+                </p>
+                <footer>
+                  <span>
+                    {item.ticket
+                      ? `最近更新 ${formatAdminTicketDate(item.ticket.updatedAt)}`
+                      : "等待客户提交"}
+                  </span>
+                  {item.ticket && <ChevronRight className="h-4 w-4" />}
+                </footer>
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+      <details
+        className="admin-website-template-card"
+        open={websiteBulkOpen}
+        onToggle={(event) => setWebsiteBulkOpen(event.currentTarget.open)}
+      >
+        <summary className="admin-website-template-summary">
           <div className="admin-website-template-title">
             <FileJson2 className="h-5 w-5" />
             <div>
-              <strong>官网内容当前模板</strong>
+              <strong>批量更新官网内容（高级工具）</strong>
               <span>
-                仅处理五类官网内容工单的内容总结与完成状态；域名申请、ICP
-                备案和旧技术检查不会进入模板。
+                日常更新请直接使用上方内容卡片和工单；这里只用于一次批量发布多条完成状态与客户可见总结。
               </span>
             </div>
+          </div>
+          <span className="admin-website-template-expand">
+            {websiteBulkOpen ? "收起" : "展开"}
+          </span>
+        </summary>
+        <div className="admin-website-template-tools">
+          <div>
+            <strong>JSON 批量文件</strong>
+            <span>
+              下载当前数据后修改，再上传预检；不会处理域名、ICP
+              备案或旧技术检查。
+            </span>
           </div>
           <div className="admin-website-template-actions">
             <Button
@@ -1450,7 +1627,7 @@ export default function AdminDeliveryTicketWorkspace({
             </div>
           </div>
         )}
-      </section>
+      </details>
       {(Object.keys(contentQuota).length > 0 ||
         Object.keys(websiteQuota).length > 0) && (
         <div className="admin-delivery-quota-panel">

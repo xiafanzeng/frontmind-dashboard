@@ -13,6 +13,7 @@ import type {
   KnowledgeBaseProgressDto,
   KnowledgeBaseProgressLeafDto,
 } from "../shared/knowledge-base-progress";
+import { stripKnowledgeBaseReferenceAppendix } from "../shared/knowledge-base-output";
 import { AuthServiceError } from "./auth-service";
 import { getDb } from "./db";
 import {
@@ -146,9 +147,11 @@ export function extractFinalKnowledgeBaseAssistantText(
 
 export function assertKnowledgeBaseCustomerOutput(output: unknown) {
   const text = extractFinalKnowledgeBaseAssistantText(output);
-  const customerVisibleText = text.replace(
-    /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
-    "",
+  const customerVisibleText = stripKnowledgeBaseReferenceAppendix(
+    text.replace(
+      /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
+      "",
+    ),
   );
   const violation = customerFormalContentViolation(customerVisibleText);
   if (violation) {
@@ -177,21 +180,23 @@ function reconciliationHash(input: {
 }
 
 function modelOutputAudit(text: string) {
-  const contentMarkdown = text
+  const auditMarkdown = text
     .replace(
       /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
       "",
     )
     .trim()
     .slice(-2_000_000);
+  const contentMarkdown =
+    stripKnowledgeBaseReferenceAppendix(auditMarkdown).slice(-2_000_000);
   const sourceUrls = Array.from(
-    new Set(contentMarkdown.match(/https?:\/\/[^\s<>)\]"']+/gi) || []),
+    new Set(auditMarkdown.match(/https?:\/\/[^\s<>)\]"']+/gi) || []),
   ).slice(0, 500);
   const imageUrls = Array.from(
     new Set(
       [
         ...Array.from(
-          contentMarkdown.matchAll(/!\[[^\]]*]\((https?:\/\/[^)\s]+)\)/gi),
+          auditMarkdown.matchAll(/!\[[^\]]*]\((https?:\/\/[^)\s]+)\)/gi),
           (match) => match[1],
         ),
         ...sourceUrls.filter((url) =>

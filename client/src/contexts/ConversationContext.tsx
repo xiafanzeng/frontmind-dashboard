@@ -22,6 +22,7 @@ import {
   KNOWLEDGE_COLLECTION_STATUS_COPY,
   LEGACY_KNOWLEDGE_COLLECTION_STATUS_COPY,
 } from "@shared/knowledge-base-copy";
+import { stripKnowledgeBaseReferenceAppendix } from "@shared/knowledge-base-output";
 
 // Types for local conversation management
 export interface Attachment {
@@ -1256,7 +1257,7 @@ function isManagedKnowledgeBaseImageSource(src: string): boolean {
 export function sanitizeKnowledgeBaseCustomerMarkdown(text: string): string {
   if (!text) return "";
 
-  return text
+  return stripKnowledgeBaseReferenceAppendix(text)
     .replaceAll(
       LEGACY_KNOWLEDGE_COLLECTION_STATUS_COPY,
       KNOWLEDGE_COLLECTION_STATUS_COPY,

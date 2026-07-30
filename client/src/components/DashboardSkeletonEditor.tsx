@@ -343,24 +343,24 @@ async function downloadMonitoringCurrentTemplate(userId: number) {
 const importCards: ImportCardDefinition[] = [
   {
     module: "profile",
-    title: "企业基础资料",
-    description: "首次绑定企业名称；后续更新看板标题与摘要，不修改其他模块。",
+    title: "首页标题与简介",
+    description: "更新客户看板顶部显示的企业名称、主标题和简介。",
     accept: ".json,application/json",
     format: "JSON 当前模板",
     icon: Building2,
   },
   {
     module: "metrics",
-    title: "看板指标",
-    description: "批量维护指标名称、数值、单位和数据口径说明。",
+    title: "首页数据概览",
+    description: "批量更新客户看板首页的数据卡片、单位和口径说明。",
     accept: ".json,application/json",
     format: "JSON 当前模板",
     icon: BarChart3,
   },
   {
     module: "sections",
-    title: "内容板块与卡片",
-    description: "批量维护看板内容板块、正文、卡片及板块内结构化表格。",
+    title: "客户看板内容区",
+    description: "批量更新客户看到的内容区域、正文、卡片和数据表格。",
     accept: ".json,application/json",
     format: "JSON 当前模板",
     icon: LayoutTemplate,
@@ -418,6 +418,13 @@ const importCards: ImportCardDefinition[] = [
 
 function clonePayload(payload: DashboardPayload) {
   return JSON.parse(JSON.stringify(payload)) as DashboardPayload;
+}
+
+export function dashboardEditorDisplayText(value: string) {
+  return value
+    .replaceAll("企业数据骨架", "客户看板展示")
+    .replaceAll("看板指标", "首页数据概览")
+    .replaceAll("内容板块与卡片", "客户看板内容区");
 }
 
 function nextSectionId(sections: DashboardPayload["sections"]) {
@@ -615,7 +622,7 @@ export default function DashboardSkeletonEditor({
       setDirty(false);
       setPublishReason("");
       await onWorkspaceChanged?.();
-      toast.success("用户看板骨架已发布", {
+      toast.success("客户看板展示已更新", {
         description: `当前版本 R${updated.revision ?? revision + 1}`,
       });
     } catch (error) {
@@ -945,7 +952,7 @@ export default function DashboardSkeletonEditor({
       <PortalCard className="grid min-h-[420px] place-items-center p-8 text-sm text-[#716a80]">
         <div className="flex items-center gap-2">
           <Loader2 className="h-4 w-4 animate-spin" />
-          正在载入企业数据骨架…
+          正在载入客户看板…
         </div>
       </PortalCard>
     );
@@ -958,10 +965,10 @@ export default function DashboardSkeletonEditor({
           <div>
             <div className="flex items-center gap-2 text-[#5b2a86]">
               <LayoutTemplate className="h-5 w-5" />
-              <h3 className="font-semibold">企业数据骨架编辑器</h3>
+              <h3 className="font-semibold">客户看板展示</h3>
             </div>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-[#716a80]">
-              用户端保持固定看板结构；管理员在这里维护企业资料与展示内容，发布后按当前账号重新渲染。
+              下方就是客户实际看到的品牌展示页。修改展示数据后可先在这里核对，发布后同步到客户账号。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -982,7 +989,7 @@ export default function DashboardSkeletonEditor({
               onClick={() => setPreviewOpen(true)}
             >
               <Eye className="h-4 w-4" />
-              预览
+              放大查看
             </Button>
             <Button
               className="bg-[#5b2a86] hover:bg-[#49216c]"
@@ -999,11 +1006,45 @@ export default function DashboardSkeletonEditor({
           </div>
         </div>
 
+        <div className="border-b border-[#e8e1ee] bg-[#f7f3f9] p-4 sm:p-6">
+          <div className="overflow-hidden rounded-2xl border border-[#ded3e6] bg-white shadow-[0_18px_45px_rgba(55,32,76,0.08)]">
+            <div className="flex flex-col gap-2 border-b border-[#e8e1ee] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <strong className="text-sm text-[#332842]">
+                  客户视角实时预览
+                </strong>
+                <p className="mt-1 text-xs leading-5 text-[#81778a]">
+                  下方编辑内容会立即出现在这里；只有点击“发布修改”后客户才会看到。
+                </p>
+              </div>
+              <span
+                className={`w-fit rounded-full px-3 py-1 text-xs font-semibold ${
+                  dirty
+                    ? "bg-[#fff2d6] text-[#855f08]"
+                    : "bg-[#eaf7f0] text-[#236647]"
+                }`}
+              >
+                {dirty ? "有未发布修改" : `客户当前版本 R${revision}`}
+              </span>
+            </div>
+            <div className="max-h-[560px] overflow-y-auto bg-[#f6f3f8] p-3 sm:p-5">
+              <ManagedDashboardSection
+                payload={draft}
+                loading={false}
+                error={null}
+                embedded
+              />
+            </div>
+          </div>
+        </div>
+
         <div className="grid gap-5 p-5 sm:p-6 xl:grid-cols-[minmax(0,1fr)_320px]">
           <div className="space-y-4">
             <div className="flex items-center gap-2">
               <Building2 className="h-4 w-4 text-[#5b2a86]" />
-              <h4 className="font-semibold text-[#221a33]">企业资料</h4>
+              <h4 className="font-semibold text-[#221a33]">
+                更新首页标题与简介
+              </h4>
             </div>
             <div className="grid gap-4 md:grid-cols-2">
               <EditorField label="企业名称">
@@ -1022,9 +1063,9 @@ export default function DashboardSkeletonEditor({
                   </span>
                 )}
               </EditorField>
-              <EditorField label="看板标题">
+              <EditorField label="客户看到的主标题">
                 <Input
-                  aria-label="看板标题"
+                  aria-label="客户看到的主标题"
                   value={draft.headline}
                   maxLength={300}
                   disabled={busy}
@@ -1034,7 +1075,7 @@ export default function DashboardSkeletonEditor({
                 />
               </EditorField>
             </div>
-            <EditorField label="企业摘要">
+            <EditorField label="客户看到的企业简介">
               <Textarea
                 value={draft.summary}
                 rows={4}
@@ -1049,11 +1090,13 @@ export default function DashboardSkeletonEditor({
           </div>
 
           <div className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
-            <strong className="text-sm text-[#484057]">发布规则</strong>
+            <strong className="text-sm text-[#484057]">
+              修改如何同步给客户
+            </strong>
             <ul className="mt-3 space-y-2 text-xs leading-5 text-[#716a80]">
               <li>首次发布会绑定企业名称，之后不能在同一账号切换企业。</li>
-              <li>直接编辑需点击“发布修改”后才会同步。</li>
-              <li>独立模块上传只替换对应板块。</li>
+              <li>编辑时只更新上方预览，点击“发布修改”才会同步给客户。</li>
+              <li>下方批量更新工具只替换所选展示数据。</li>
               <li>版本冲突时不会覆盖其他管理员的更新。</li>
             </ul>
             <label className="mt-4 block text-xs font-semibold text-[#716a80]">
@@ -1069,7 +1112,7 @@ export default function DashboardSkeletonEditor({
             </label>
             {dirty && (
               <p className="mt-4 rounded-xl bg-[#fff5dc] px-3 py-2 text-xs text-[#8b6500]">
-                当前有尚未发布的修改，请先保存再上传模块文件。
+                当前有尚未发布的修改，请发布或刷新后再使用批量更新工具。
               </p>
             )}
           </div>
@@ -1107,96 +1150,110 @@ export default function DashboardSkeletonEditor({
         </>
       )}
 
-      <PortalCard className="p-5 sm:p-6">
-        <div className="mb-5">
-          <div className="flex items-center gap-2">
-            <UploadCloud className="h-5 w-5 text-[#5b2a86]" />
-            <h3 className="font-semibold text-[#171321]">按模块上传内容</h3>
-          </div>
-          <p className="mt-2 text-sm leading-6 text-[#716a80]">
-            各模块独立校验和发布。上传前请确保问题 ID、资产 ID
-            等关联字段保持稳定。
-          </p>
-          {!enterpriseIdentityBound && (
-            <p className="mt-3 rounded-xl bg-[#fff5dc] px-3 py-2 text-xs leading-5 text-[#8b6500]">
-              请先确认企业名称并点击“发布修改”，或先上传“企业资料”；身份确认后才可上传其他板块。
+      <PortalCard className="overflow-hidden">
+        <details>
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-4 p-5 sm:p-6">
+            <div>
+              <div className="flex items-center gap-2">
+                <UploadCloud className="h-5 w-5 text-[#5b2a86]" />
+                <h3 className="font-semibold text-[#171321]">
+                  批量更新客户看板（高级工具）
+                </h3>
+              </div>
+              <p className="mt-2 text-sm leading-6 text-[#716a80]">
+                适合一次更新大量数据；日常调整直接使用上方表单即可。
+              </p>
+            </div>
+            <span className="shrink-0 rounded-lg border border-[#ded3e6] bg-white px-3 py-2 text-xs font-semibold text-[#5b2a86]">
+              查看工具
+            </span>
+          </summary>
+          <div className="border-t border-[#e8e1ee] p-5 sm:p-6">
+            <p className="mb-5 text-sm leading-6 text-[#716a80]">
+              每类数据会单独校验和发布。上传前请保持问题 ID、资产 ID
+              等关联字段不变。
             </p>
-          )}
-        </div>
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {importCards
-            .filter((card) => !profileOnly || card.module === "profile")
-            .map((card) => (
-              <ModuleUploadCard
-                key={card.module}
-                definition={card}
-                disabled={
-                  busy ||
-                  dirty ||
-                  (!enterpriseIdentityBound && card.module !== "profile")
-                }
-                importing={importingKey === card.module}
-                onTemplate={() => {
-                  if (card.module === "monitoring") {
-                    void downloadMonitoringCurrentTemplate(userId)
-                      .then(() => toast.success("当前问题监控模板已下载"))
-                      .catch((error) =>
-                        toast.error("问题监控模板下载失败", {
-                          description:
-                            error instanceof Error
-                              ? error.message
-                              : "请稍后重试。",
-                        }),
-                      );
-                    return;
-                  }
-                  if (
-                    (card.module === "questions" ||
-                      card.module === "response-logic") &&
-                    authoritativeQuestionsLoading
-                  ) {
-                    toast.warning("正在读取正式问题目录，请稍后再下载。");
-                    return;
-                  }
-                  if (
-                    (card.module === "questions" ||
-                      card.module === "response-logic") &&
-                    authoritativeQuestionsError
-                  ) {
-                    toast.error("正式问题目录暂时无法读取", {
-                      description: authoritativeQuestionsError,
-                    });
-                    return;
-                  }
-                  if (
-                    card.module === "response-logic" &&
-                    responseLogicQuery.isLoading
-                  ) {
-                    toast.warning("正在读取当前应答逻辑，请稍后再下载。");
-                    return;
-                  }
-                  if (
-                    card.module === "response-logic" &&
-                    responseLogicQuery.error
-                  ) {
-                    toast.error("当前应答逻辑暂时无法读取", {
-                      description: responseLogicQuery.error.message,
-                    });
-                    return;
-                  }
-                  downloadModuleTemplate({
-                    module: card.module,
-                    revision,
-                    payload: workspace?.payload ?? draft,
-                    responseLogicRecords:
-                      responseLogicQuery.data?.records ?? [],
-                    authoritativeQuestions,
-                  });
-                }}
-                onFile={(file) => void importModule(card.module, file)}
-              />
-            ))}
-        </div>
+            {!enterpriseIdentityBound && (
+              <p className="mb-5 rounded-xl bg-[#fff5dc] px-3 py-2 text-xs leading-5 text-[#8b6500]">
+                请先确认企业名称并点击“发布修改”，或先上传“首页标题与简介”；企业身份确认后才可上传其他数据。
+              </p>
+            )}
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {importCards
+                .filter((card) => !profileOnly || card.module === "profile")
+                .map((card) => (
+                  <ModuleUploadCard
+                    key={card.module}
+                    definition={card}
+                    disabled={
+                      busy ||
+                      dirty ||
+                      (!enterpriseIdentityBound && card.module !== "profile")
+                    }
+                    importing={importingKey === card.module}
+                    onTemplate={() => {
+                      if (card.module === "monitoring") {
+                        void downloadMonitoringCurrentTemplate(userId)
+                          .then(() => toast.success("当前问题监控模板已下载"))
+                          .catch((error) =>
+                            toast.error("问题监控模板下载失败", {
+                              description:
+                                error instanceof Error
+                                  ? error.message
+                                  : "请稍后重试。",
+                            }),
+                          );
+                        return;
+                      }
+                      if (
+                        (card.module === "questions" ||
+                          card.module === "response-logic") &&
+                        authoritativeQuestionsLoading
+                      ) {
+                        toast.warning("正在读取正式问题目录，请稍后再下载。");
+                        return;
+                      }
+                      if (
+                        (card.module === "questions" ||
+                          card.module === "response-logic") &&
+                        authoritativeQuestionsError
+                      ) {
+                        toast.error("正式问题目录暂时无法读取", {
+                          description: authoritativeQuestionsError,
+                        });
+                        return;
+                      }
+                      if (
+                        card.module === "response-logic" &&
+                        responseLogicQuery.isLoading
+                      ) {
+                        toast.warning("正在读取当前应答逻辑，请稍后再下载。");
+                        return;
+                      }
+                      if (
+                        card.module === "response-logic" &&
+                        responseLogicQuery.error
+                      ) {
+                        toast.error("当前应答逻辑暂时无法读取", {
+                          description: responseLogicQuery.error.message,
+                        });
+                        return;
+                      }
+                      downloadModuleTemplate({
+                        module: card.module,
+                        revision,
+                        payload: workspace?.payload ?? draft,
+                        responseLogicRecords:
+                          responseLogicQuery.data?.records ?? [],
+                        authoritativeQuestions,
+                      });
+                    }}
+                    onFile={(file) => void importModule(card.module, file)}
+                  />
+                ))}
+            </div>
+          </div>
+        </details>
       </PortalCard>
 
       <Dialog
@@ -1246,7 +1303,9 @@ export default function DashboardSkeletonEditor({
                 <ul className="mt-3 space-y-2 text-sm leading-6 text-[#716a80]">
                   {pendingDashboardModuleImport.preview.summary.map(
                     (summary, index) => (
-                      <li key={`${summary}-${index}`}>{summary}</li>
+                      <li key={`${summary}-${index}`}>
+                        {dashboardEditorDisplayText(summary)}
+                      </li>
                     ),
                   )}
                 </ul>
@@ -1261,7 +1320,7 @@ export default function DashboardSkeletonEditor({
                         className="rounded-2xl border border-[#e5ddea] bg-white p-4"
                       >
                         <strong className="text-sm text-[#332842]">
-                          {stats.label}
+                          {dashboardEditorDisplayText(stats.label)}
                         </strong>
                         <p className="mt-2 text-xs leading-5 text-[#716a80]">
                           现有 {stats.beforeCount} 条 → 导入后{" "}
@@ -1752,10 +1811,10 @@ function MetricEditor({
         <div>
           <div className="flex items-center gap-2">
             <BarChart3 className="h-5 w-5 text-[#5b2a86]" />
-            <h3 className="font-semibold text-[#171321]">看板指标</h3>
+            <h3 className="font-semibold text-[#171321]">首页数据概览</h3>
           </div>
           <p className="mt-1 text-xs leading-5 text-[#716a80]">
-            文档、图片和字数等知识库指标由发布版本自动校准；其他业务指标可在这里维护。
+            对应客户看板顶部的数据卡片。文档、图片和字数由发布版本自动校准，其他展示数据可直接维护。
           </p>
         </div>
         <Button
@@ -1769,7 +1828,7 @@ function MetricEditor({
           }
         >
           <Plus className="h-4 w-4" />
-          添加指标
+          添加数据项
         </Button>
       </div>
       <div className="mt-5 space-y-3">
@@ -1779,17 +1838,17 @@ function MetricEditor({
             className="grid gap-3 rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4 md:grid-cols-[1fr_1fr_100px_1.2fr_auto]"
           >
             <Input
-              aria-label={`指标 ${index + 1} 名称`}
+              aria-label={`数据项 ${index + 1} 名称`}
               value={metric.label}
               maxLength={80}
               disabled={disabled}
-              placeholder="指标名称"
+              placeholder="展示名称"
               onChange={(event) =>
                 patchMetric(index, { label: event.target.value })
               }
             />
             <Input
-              aria-label={`指标 ${index + 1} 数值`}
+              aria-label={`数据项 ${index + 1} 数值`}
               value={String(metric.value)}
               disabled={disabled}
               placeholder="数值"
@@ -1798,7 +1857,7 @@ function MetricEditor({
               }
             />
             <Input
-              aria-label={`指标 ${index + 1} 单位`}
+              aria-label={`数据项 ${index + 1} 单位`}
               value={metric.unit || ""}
               maxLength={24}
               disabled={disabled}
@@ -1808,7 +1867,7 @@ function MetricEditor({
               }
             />
             <Input
-              aria-label={`指标 ${index + 1} 备注`}
+              aria-label={`数据项 ${index + 1} 说明`}
               value={metric.note || ""}
               maxLength={160}
               disabled={disabled}
@@ -1821,7 +1880,7 @@ function MetricEditor({
               type="button"
               variant="ghost"
               size="icon"
-              aria-label={`删除指标 ${metric.label}`}
+              aria-label={`删除数据项 ${metric.label}`}
               disabled={disabled}
               onClick={() =>
                 onChange(
@@ -1870,10 +1929,10 @@ function SectionEditor({
         <div>
           <div className="flex items-center gap-2">
             <LayoutTemplate className="h-5 w-5 text-[#5b2a86]" />
-            <h3 className="font-semibold text-[#171321]">内容板块与卡片</h3>
+            <h3 className="font-semibold text-[#171321]">客户看板内容区</h3>
           </div>
           <p className="mt-1 text-xs leading-5 text-[#716a80]">
-            每个板块可包含说明正文、图文卡片和一张或多张数据表格。
+            对应上方预览中的每一块内容。可填写说明正文、图文内容和数据表格。
           </p>
         </div>
         <Button
@@ -1884,7 +1943,7 @@ function SectionEditor({
               ...sections,
               {
                 id: nextSectionId(sections),
-                title: "新内容板块",
+                title: "新展示区域",
                 subtitle: "",
                 body: "",
                 items: [],
@@ -1894,7 +1953,7 @@ function SectionEditor({
           }
         >
           <Plus className="h-4 w-4" />
-          添加板块
+          添加内容区域
         </Button>
       </div>
 
@@ -1910,14 +1969,14 @@ function SectionEditor({
                   {section.id}
                 </span>
                 <p className="mt-2 text-xs text-[#9a94a8]">
-                  {section.items.length} 个卡片 ·{" "}
+                  {section.items.length} 条图文内容 ·{" "}
                   {(section.tables || []).length} 张表格
                 </p>
               </div>
               <Button
                 variant="ghost"
                 size="icon"
-                aria-label={`删除板块 ${section.title}`}
+                aria-label={`删除内容区域 ${section.title}`}
                 disabled={disabled}
                 onClick={() =>
                   onChange(
@@ -1930,7 +1989,7 @@ function SectionEditor({
             </div>
 
             <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <EditorField label="板块 ID">
+              <EditorField label="区域标识（用于数据关联）">
                 <Input
                   value={section.id}
                   maxLength={80}
@@ -1940,7 +1999,7 @@ function SectionEditor({
                   }
                 />
               </EditorField>
-              <EditorField label="板块标题">
+              <EditorField label="客户看到的区域标题">
                 <Input
                   value={section.title}
                   maxLength={160}
@@ -1952,7 +2011,7 @@ function SectionEditor({
               </EditorField>
             </div>
             <div className="mt-3">
-              <EditorField label="副标题">
+              <EditorField label="区域副标题">
                 <Input
                   value={section.subtitle || ""}
                   maxLength={300}
@@ -1966,7 +2025,7 @@ function SectionEditor({
               </EditorField>
             </div>
             <div className="mt-3">
-              <EditorField label="板块正文（支持 Markdown）">
+              <EditorField label="区域正文（支持 Markdown）">
                 <Textarea
                   value={section.body || ""}
                   rows={4}
@@ -1981,7 +2040,7 @@ function SectionEditor({
             </div>
 
             <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-[#eee8f2] pt-4">
-              <strong className="text-xs text-[#716a80]">板块卡片</strong>
+              <strong className="text-xs text-[#716a80]">区域图文内容</strong>
               <div className="flex flex-wrap gap-2">
                 <SectionTableUploadButton
                   sectionId={section.id}
@@ -2008,7 +2067,7 @@ function SectionEditor({
                   }
                 >
                   <Plus className="h-3.5 w-3.5" />
-                  添加卡片
+                  添加图文内容
                 </Button>
               </div>
             </div>

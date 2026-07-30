@@ -30,7 +30,6 @@ import {
   Upload,
   ChevronDown,
   Check,
-  FastForward,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -168,7 +167,7 @@ export default function ChatInput({
       ) {
         toast.info("“继续/下一步”不会推进知识节点", {
           description:
-            "请选择“确认并进入下一项”或“直接预填并进入下一项”，也可以输入修改内容或上传资料。",
+            "请点击“确认当前内容”；如需修改，请直接输入意见或上传资料。",
         });
         return;
       }
@@ -216,10 +215,10 @@ export default function ChatInput({
     [files, submitContent, text],
   );
 
-  const handleQuickAction = useCallback(
-    async (action: "确认" | "直接预填") => {
+  const confirmCurrentContent = useCallback(
+    async () => {
       if (text.trim() || files.length > 0) return;
-      await submitContent(action, []);
+      await submitContent("确认", []);
     },
     [files.length, submitContent, text],
   );
@@ -349,33 +348,21 @@ export default function ChatInput({
                         可直接确认，也可以输入修改意见或上传资料。
                       </p>
                     </div>
-                    <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+                    <div className="shrink-0">
                       <Button
                         type="button"
                         size="sm"
-                        onClick={() => void handleQuickAction("确认")}
+                        onClick={() => void confirmCurrentContent()}
                         disabled={quickActionsDisabled}
                         className="rounded-xl"
                       >
                         <Check className="h-4 w-4" />
-                        确认并进入下一项
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        onClick={() => void handleQuickAction("直接预填")}
-                        disabled={quickActionsDisabled}
-                        className="rounded-xl border-violet-200 bg-white"
-                      >
-                        <FastForward className="h-4 w-4" />
-                        直接预填并进入下一项
+                        确认当前内容
                       </Button>
                     </div>
                   </div>
                   <p className="mt-2 text-xs text-violet-700/75">
-                    直接预填会计入完成进度，但不会显示“企业已确认”对号。
-                    输入文字或选择文件后，两个快捷按钮会自动禁用。
+                    如需修改，请在下方输入意见或上传资料。系统返回修订稿后，再确认当前内容。
                   </p>
                 </>
               )}

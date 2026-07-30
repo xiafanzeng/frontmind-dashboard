@@ -22,6 +22,7 @@ import {
   dashboardPayloadSchema,
   type DashboardPayload,
 } from "../shared/dashboard";
+import { isExplicitAdminAccessLevel } from "../shared/admin-access";
 import type { ServicePortal } from "../shared/service-portal";
 import {
   AuthServiceError,
@@ -1333,12 +1334,12 @@ export async function setWorkspaceAssignments(input: {
       throw new AuthServiceError("NOT_FOUND", "Administrator not found");
     }
   }
-  const deliveryAdminIds = validAdmins
-    .filter((admin) => admin.adminAccessLevel === "delivery_admin")
+  const eligibleOwnerAdminIds = validAdmins
+    .filter((admin) => isExplicitAdminAccessLevel(admin.adminAccessLevel))
     .map((admin) => admin.id);
   if (
     input.usageOwnerAdminId != null &&
-    !deliveryAdminIds.includes(input.usageOwnerAdminId)
+    !eligibleOwnerAdminIds.includes(input.usageOwnerAdminId)
   ) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
@@ -1381,12 +1382,12 @@ export async function setWorkspaceAssignments(input: {
         "管理员状态已变化，请刷新后重新分配",
       );
     }
-    const lockedDeliveryAdminIds = lockedAdmins
-      .filter((admin) => admin.adminAccessLevel === "delivery_admin")
+    const lockedEligibleOwnerAdminIds = lockedAdmins
+      .filter((admin) => isExplicitAdminAccessLevel(admin.adminAccessLevel))
       .map((admin) => admin.id);
     if (
       input.usageOwnerAdminId != null &&
-      !lockedDeliveryAdminIds.includes(input.usageOwnerAdminId)
+      !lockedEligibleOwnerAdminIds.includes(input.usageOwnerAdminId)
     ) {
       throw new AuthServiceError(
         "CONFLICT",
@@ -1409,10 +1410,10 @@ export async function setWorkspaceAssignments(input: {
       input.usageOwnerAdminId !== undefined
         ? input.usageOwnerAdminId
         : previousOwner &&
-            lockedDeliveryAdminIds.includes(previousOwner.deliveryAdminId)
+            lockedEligibleOwnerAdminIds.includes(previousOwner.deliveryAdminId)
           ? previousOwner.deliveryAdminId
-          : lockedDeliveryAdminIds.length === 1
-            ? lockedDeliveryAdminIds[0]!
+          : lockedEligibleOwnerAdminIds.length === 1
+            ? lockedEligibleOwnerAdminIds[0]!
             : null;
     await tx
       .delete(userAdminAssignments)

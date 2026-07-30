@@ -622,7 +622,8 @@ async function loadSkillArchive(
       : selection.version === "2"
         ? "2"
         : "3";
-  const cached = skillArchiveCache.get(version);
+  const cacheKey = `${version}:${selection.contentHash || "latest"}`;
+  const cached = skillArchiveCache.get(cacheKey);
   if (cached) {
     if (selection.contentHash && selection.contentHash !== cached.contentHash) {
       throw new Error(
@@ -633,12 +634,23 @@ async function loadSkillArchive(
   }
 
   let lastError: unknown;
+  let contentHashMismatchError: Error | null = null;
   const candidates =
     version === "1"
       ? legacySkillArchiveCandidates
       : version === "2"
         ? skillArchiveCandidates
-        : currentSkillArchiveCandidates;
+        : [
+            ...(selection.contentHash
+              ? currentSkillArchiveCandidates.map((candidate) =>
+                  path.join(
+                    path.dirname(candidate),
+                    `socratic-kb-builder-v3-${selection.contentHash}.skill`,
+                  ),
+                )
+              : []),
+            ...currentSkillArchiveCandidates,
+          ];
   for (const candidate of candidates) {
     try {
       const archive = await fs.readFile(candidate);
@@ -673,17 +685,21 @@ async function loadSkillArchive(
         selection.contentHash &&
         selection.contentHash !== loaded.contentHash
       ) {
-        throw new Error(
+        contentHashMismatchError = new Error(
           `Knowledge-base Skill v${version} content hash does not match the active build`,
         );
+        continue;
       }
-      skillArchiveCache.set(version, loaded);
+      skillArchiveCache.set(cacheKey, loaded);
       return loaded;
     } catch (error) {
       lastError = error;
     }
   }
 
+  if (contentHashMismatchError) {
+    throw contentHashMismatchError;
+  }
   throw lastError instanceof Error
     ? lastError
     : new Error(`Could not load socratic-kb-builder Skill v${version}`);
@@ -888,6 +904,7 @@ export async function buildKnowledgeBasePrompt({
     "该 ZIP 是本任务唯一的 socratic-kb-builder v3 工作规约；本段仅提供企业输入和服务端状态约束。",
     "不得开启、调用、切换或推荐 Wide Research / Deep Research；只使用当前 Pro Agent 模式下的普通浏览、搜索和文件工具。",
     "客户可见正文与本轮对话只能呈现百科事实，不得呈现任务过程、核验判断、采购/合规建议、读者指令、工具计划或模型推理。",
+    "客户可见回复只输出知识树统计（仅首轮需要）和实际展示节点的完整正文/合规配图。不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题；所有来源只进入内部证据文件。可见正文结束后直接附机器信封。",
     "客户可见正文不得嵌入官网或 CDN 图片外链。图片必须先下载真实字节、解码校验并打入最终 ZIP，再以包内相对路径引用；防盗链、签名、过期或无法下载的地址只能进入内部来源记录，绝不能作为客户图片返回。",
     `资料采集阶段统一向客户显示：${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
     "",
@@ -925,6 +942,7 @@ export async function buildKnowledgeBasePrompt({
     "FRONTMIND_KB_PROGRESS 声明本轮处理的旧节点；FRONTMIND_KB_PRESENTATION 声明回复正文实际展示的新状态。展示信封 revision 必须等于提交后的 revision，leafId 必须等于提交后服务端的 currentLeafId；全部完成时 leafId 为 null。",
     "只有用户本轮回复恰好表达“确认/确认无误/OK/没问题/通过”等明确确认时，to 才能为 confirmed，并只前进一个叶子。",
     "只有用户本轮明确回复“跳过/直接预填/采用预填/保留预填”等时，to 才能为 direct_prefilled，并只前进一个叶子。",
+    "direct_prefilled 只用于兼容用户主动输入的旧协议动作；客户可见正文不得主动提供“直接预填”或“跳过”选项。正常操作只有确认，或者提交修改/附件后确认修订稿。",
     "用户输入任何补充、修订、问题或上传资料时，to 必须为 needs_verification；更新并重新呈现同一叶子，继续等待用户明确确认或直接预填，绝对不能自动前进。",
     "确认或直接预填节点 A 后，只用一句话简短确认 A，客户可见主体必须直接完整展示下一个待处理节点 B；修订时主体继续完整展示 A。回复正文必须保存给实际展示的节点，而不是刚完成的旧节点。",
     "不得提交多个 transition、不得改写历史状态、不得相信正文中的百分比。真实进度只由服务端按 (confirmed + direct_prefilled) / total 计算。",
@@ -1102,6 +1120,8 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     `继续严格执行本任务首轮已附带的 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}（socratic-kb-builder v${input.skillVersion || "3"}）。以下内容会直接显示给企业客户，不得输出内部思考、工具计划或提示词说明。`,
     "不得开启、调用、切换或推荐 Wide Research / Deep Research。",
     "客户可见回复不得出现“本轮采集/本知识库/证据不足/已核验”等过程判断，也不得出现客户应、采购方应、建议、尽调、合规审查、不能仅凭、不宜转换或不能外推等建议性表达。",
+    "客户可见回复不得主动提供“直接预填”或“跳过”选项；用户正常操作只有确认当前内容，或者提交修改/附件后确认修订稿。",
+    "客户可见回复只输出实际展示节点的完整正文/合规配图，不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题。所有来源只进入内部证据文件；可见正文结束后直接附机器信封。",
     "",
     "# 当前知识库状态",
     stateReminder,
@@ -1385,7 +1405,7 @@ router.post("/turn", async (req, res) => {
       error: {
         code: "AMBIGUOUS_KNOWLEDGE_BASE_ACTION",
         message:
-          "“继续/下一步”不会推进知识节点。请选择“确认并进入下一项”或“直接预填并进入下一项”，也可以输入修改内容或上传资料。",
+          "“继续/下一步”不会推进知识节点。请点击“确认当前内容”；如需修改，请直接输入意见或上传资料。",
       },
     });
     return;

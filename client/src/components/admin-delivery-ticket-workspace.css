@@ -44,6 +44,191 @@
   line-height: 1.7;
 }
 
+.admin-website-overview-card {
+  display: grid;
+  gap: 16px;
+  border: 1px solid #ded3e6;
+  border-radius: 18px;
+  padding: 20px;
+  background:
+    radial-gradient(
+      circle at 96% 0%,
+      rgba(124, 75, 156, 0.12),
+      transparent 34%
+    ),
+    rgba(255, 255, 255, 0.96);
+  box-shadow: 0 18px 48px rgba(33, 19, 58, 0.07);
+}
+
+.admin-website-overview-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.admin-website-overview-heading > div:first-child {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.admin-website-overview-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border-radius: 13px;
+  color: #5b2a86;
+  background: #f1e8f6;
+}
+
+.admin-website-overview-heading > div:first-child > div {
+  display: grid;
+  gap: 5px;
+}
+
+.admin-website-overview-heading strong {
+  color: #332842;
+  font-size: 15px;
+}
+
+.admin-website-overview-heading > div:first-child span {
+  max-width: 760px;
+  color: #716a80;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.admin-website-overview-total {
+  display: grid;
+  flex: 0 0 auto;
+  min-width: 116px;
+  justify-items: end;
+}
+
+.admin-website-overview-total strong {
+  color: #5b2a86;
+  font-size: 22px;
+}
+
+.admin-website-overview-total span {
+  color: #857e91;
+  font-size: 11px;
+}
+
+.admin-website-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.admin-website-overview-grid > button {
+  display: grid;
+  min-width: 0;
+  min-height: 154px;
+  grid-template-rows: auto 1fr auto;
+  gap: 11px;
+  border: 1px solid #e6deeb;
+  border-radius: 15px;
+  padding: 14px;
+  text-align: left;
+  background: #fff;
+  transition:
+    border-color 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
+}
+
+.admin-website-overview-grid > button:not(:disabled):hover {
+  border-color: #bfa4d0;
+  box-shadow: 0 12px 26px rgba(55, 32, 76, 0.1);
+  transform: translateY(-1px);
+}
+
+.admin-website-overview-grid > button:disabled {
+  cursor: default;
+  background: #faf8fb;
+}
+
+.admin-website-overview-grid header,
+.admin-website-overview-grid footer {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.admin-website-overview-grid header strong {
+  min-width: 0;
+  color: #332842;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.admin-website-overview-grid header span {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: #857e91;
+  background: #f0edf2;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.admin-website-overview-grid > button.is-in_progress header span {
+  color: #805b08;
+  background: #fff2cf;
+}
+
+.admin-website-overview-grid > button.is-completed header span {
+  color: #236647;
+  background: #e6f5ed;
+}
+
+.admin-website-overview-grid p {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  color: #716a80;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.admin-website-overview-grid footer {
+  align-items: center;
+  color: #9a94a8;
+  font-size: 10px;
+}
+
+.admin-website-overview-grid footer span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-website-overview-loading,
+.admin-website-overview-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 110px;
+  border-radius: 14px;
+  color: #716a80;
+  background: #faf8fb;
+  font-size: 12px;
+}
+
+.admin-website-overview-error {
+  color: #a02652;
+  background: #fff8fa;
+}
+
 .admin-website-template-card {
   display: grid;
   gap: 14px;
@@ -52,6 +237,55 @@
   padding: 18px 20px;
   background: rgba(255, 255, 255, 0.94);
   box-shadow: 0 18px 48px rgba(33, 19, 58, 0.06);
+}
+
+.admin-website-template-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.admin-website-template-summary::-webkit-details-marker {
+  display: none;
+}
+
+.admin-website-template-expand {
+  flex: 0 0 auto;
+  border: 1px solid #ded3e6;
+  border-radius: 9px;
+  padding: 6px 10px;
+  color: #5b2a86;
+  background: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.admin-website-template-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-top: 1px solid #ece5f0;
+  padding-top: 14px;
+}
+
+.admin-website-template-tools > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.admin-website-template-tools > div:first-child strong {
+  color: #484057;
+  font-size: 12px;
+}
+
+.admin-website-template-tools > div:first-child span {
+  color: #857e91;
+  font-size: 11px;
+  line-height: 1.55;
 }
 
 .admin-website-template-heading,
@@ -1418,6 +1652,10 @@
 }
 
 @media (max-width: 1180px) {
+  .admin-website-overview-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .admin-ticket-master-detail {
     grid-template-columns: 310px minmax(0, 1fr);
   }
@@ -1435,7 +1673,8 @@
   }
 
   .admin-website-template-heading,
-  .admin-website-template-confirm {
+  .admin-website-template-confirm,
+  .admin-website-template-tools {
     align-items: stretch;
     flex-direction: column;
   }
@@ -1443,6 +1682,10 @@
   .admin-website-template-actions,
   .admin-website-template-confirm > div {
     align-self: flex-start;
+  }
+
+  .admin-website-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .admin-website-template-metrics {
@@ -1508,11 +1751,29 @@
   }
 
   .admin-delivery-toolbar,
+  .admin-website-overview-card,
   .admin-website-template-card,
   .admin-site-profile-card,
   .admin-site-check-card,
   .admin-ticket-detail-panel {
     padding: 18px;
+  }
+
+  .admin-website-overview-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .admin-website-overview-total {
+    justify-items: start;
+  }
+
+  .admin-website-overview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-website-template-summary {
+    align-items: flex-start;
   }
 
   .admin-website-template-actions,

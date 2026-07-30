@@ -258,6 +258,28 @@ describe("knowledge-base image delivery boundary", () => {
     ).toBe("产品如下：\n\n配图：产品界面\n\n原图：");
   });
 
+  it("shows only the node body when the model appends references and protocol data", () => {
+    expect(
+      sanitizeKnowledgeBaseCustomerMarkdown(
+        [
+          "## 中文名称、英文品牌与视觉识别",
+          "",
+          "硅基流动的英文品牌名称为 SiliconFlow。",
+          "",
+          "**参考资料**",
+          "[1] https://siliconflow.cn/",
+          '<!-- FRONTMIND_KB_PROGRESS {"revision":0} -->',
+        ].join("\n"),
+      ),
+    ).toBe(
+      [
+        "## 中文名称、英文品牌与视觉识别",
+        "",
+        "硅基流动的英文品牌名称为 SiliconFlow。",
+      ].join("\n"),
+    );
+  });
+
   it("keeps only controlled image sources in knowledge-base messages", () => {
     const [message] = sanitizeKnowledgeBaseOutputMessages([
       {

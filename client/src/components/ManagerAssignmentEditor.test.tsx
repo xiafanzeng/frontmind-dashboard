@@ -150,7 +150,7 @@ describe("ManagerAssignmentEditor", () => {
     ).toBeChecked();
   });
 
-  it("keeps system administrators as collaborators and limits the owner to delivery administrators", async () => {
+  it("allows a system administrator to be the customer owner", async () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     render(
       <ManagerAssignmentEditor
@@ -174,14 +174,14 @@ describe("ManagerAssignmentEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "编辑分配" }));
     const ownerSelect = screen.getByLabelText("主负责人");
     expect(
-      within(ownerSelect).queryByRole("option", { name: "系统管理员" }),
-    ).toBeNull();
+      within(ownerSelect).getByRole("option", { name: "系统管理员" }),
+    ).toBeInTheDocument();
     expect(
       within(ownerSelect).getByRole("option", { name: "交付管理员 1" }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("checkbox", { name: "交付管理员 2" }));
+    fireEvent.change(ownerSelect, { target: { value: "99" } });
     fireEvent.click(screen.getByRole("button", { name: "保存分配" }));
 
-    await waitFor(() => expect(onSave).toHaveBeenCalledWith([1, 2, 99], 1));
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith([1, 99], 99));
   });
 });

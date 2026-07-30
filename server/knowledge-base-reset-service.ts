@@ -198,7 +198,8 @@ export async function getKnowledgeResetStatus(userId: number) {
     revision: stateRows[0]?.revision ?? 0,
     hasKnowledge: counts.hasKnowledge,
     locked: Boolean(pending),
-    canRequest: counts.hasKnowledge && Boolean(owner) && !pending,
+    canRequest:
+      aiOperationsIncluded && counts.hasKnowledge && Boolean(owner) && !pending,
     unavailableReason: !aiOperationsIncluded
       ? "当前套餐不含人工知识库运维"
       : !owner

@@ -37,6 +37,17 @@ async function readRequiredSource(relativePath) {
   return content;
 }
 
+async function skillInstructionHash(archive) {
+  const zip = await JSZip.loadAsync(archive);
+  const skill = await zip.file("SKILL.md")?.async("string");
+  if (!skill) {
+    throw new Error("Existing v3 Skill archive is missing SKILL.md");
+  }
+  return createHash("sha256")
+    .update(`# Skill\n\n${skill.trim()}`)
+    .digest("hex");
+}
+
 export async function packageSocraticKnowledgeBaseSkill() {
   const zip = new JSZip();
   for (const relativePath of [...socraticKnowledgeBaseSkillEntries].sort()) {
@@ -61,6 +72,16 @@ export async function packageSocraticKnowledgeBaseSkill() {
     if (error?.code !== "ENOENT") throw error;
   }
   if (!existing?.equals(archive)) {
+    if (existing) {
+      const previousHash = await skillInstructionHash(existing);
+      await fs.writeFile(
+        path.join(
+          path.dirname(outputPath),
+          `socratic-kb-builder-v3-${previousHash}.skill`,
+        ),
+        existing,
+      );
+    }
     await fs.writeFile(outputPath, archive);
   }
   return {

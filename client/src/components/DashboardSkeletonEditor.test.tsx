@@ -53,6 +53,7 @@ vi.mock("sonner", () => ({
 
 import DashboardSkeletonEditor, {
   currentModuleTemplate,
+  dashboardEditorDisplayText,
   monitoringImportPublishedDescription,
 } from "./DashboardSkeletonEditor";
 
@@ -80,6 +81,12 @@ describe("DashboardSkeletonEditor", () => {
     intent: "",
     summary: "",
   };
+
+  it("maps legacy technical labels to customer-facing dashboard language", () => {
+    expect(
+      dashboardEditorDisplayText("企业数据骨架 / 看板指标 / 内容板块与卡片"),
+    ).toBe("客户看板展示 / 首页数据概览 / 客户看板内容区");
+  });
 
   it("describes answer-only and question-only monitoring publishes truthfully", () => {
     expect(
@@ -311,10 +318,11 @@ describe("DashboardSkeletonEditor", () => {
       />,
     );
 
+    expect(screen.getByText("客户视角实时预览")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("企业名称"), {
       target: { value: "验收企业有限公司" },
     });
-    fireEvent.change(screen.getByLabelText("看板标题"), {
+    fireEvent.change(screen.getByLabelText("客户看到的主标题"), {
       target: { value: "数控机床企业知识中枢" },
     });
     fireEvent.click(screen.getByRole("button", { name: "发布修改" }));
@@ -333,7 +341,7 @@ describe("DashboardSkeletonEditor", () => {
     );
     await waitFor(() => expect(onWorkspaceChanged).toHaveBeenCalledOnce());
     expect(mocks.toastSuccess).toHaveBeenCalledWith(
-      "用户看板骨架已发布",
+      "客户看板展示已更新",
       expect.objectContaining({ description: "当前版本 R4" }),
     );
   });
@@ -362,8 +370,10 @@ describe("DashboardSkeletonEditor", () => {
       />,
     );
 
-    expect(screen.getByText(/身份确认后才可上传其他板块/)).toBeInTheDocument();
-    const profileCard = screen.getByText("企业基础资料").closest("article");
+    expect(
+      screen.getByText(/企业身份确认后才可上传其他数据/),
+    ).toBeInTheDocument();
+    const profileCard = screen.getByText("首页标题与简介").closest("article");
     const keywordCard = screen.getByText("品牌全域词库").closest("article");
     expect(profileCard).not.toBeNull();
     expect(keywordCard).not.toBeNull();
@@ -656,7 +666,7 @@ describe("DashboardSkeletonEditor", () => {
   it.each([
     {
       module: "profile",
-      title: "企业基础资料",
+      title: "首页标题与简介",
       recordLabel: "企业资料字段",
     },
     {
@@ -923,7 +933,7 @@ describe("DashboardSkeletonEditor", () => {
     );
 
     const card = screen
-      .getByText("看板指标", { selector: "strong" })
+      .getByText("首页数据概览", { selector: "strong" })
       .closest("article");
     const fileInput =
       card!.querySelector<HTMLInputElement>('input[type="file"]');

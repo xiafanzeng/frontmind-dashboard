@@ -24,11 +24,12 @@ confirmation. Respect the 1,200 HTML, 1,800 total-link, 480-image,
 
 The first customer-visible answer must:
 
-- Summarize measured research coverage and remaining gaps.
 - Display branch counts and the true 8–115 leaf total.
 - Present the first leaf as polished formal content.
 - Show only images whose bytes were downloaded, validated, and assigned stable
   asset IDs.
+- End the visible body after the first leaf. Do not add citations, source
+  lists, unresolved items, action guidance or a confirmation question.
 - End with exactly one valid `FRONTMIND_KB_MANIFEST` envelope when the
   application requires it.
 
@@ -36,12 +37,16 @@ Do not dump raw snapshots, page excerpts, crawl logs, or internal planning.
 
 ## One leaf per turn
 
-For the current leaf, show:
+For the current leaf, show only:
 
 1. The publication-ready draft.
 2. Up to three directly relevant first-party images.
-3. A concise source list and explicit unresolved items.
-4. The allowed action: confirm, correct/upload, or direct-prefill.
+
+Do not add a `参考资料`, `参考来源`, `References` or `Sources` section. Do not
+use numbered citation markers or external citation links in the visible body.
+Do not append unresolved items, verification notes, action guidance or a
+confirmation question. Keep sources and gaps in internal evidence/report
+documents. After the visible body, emit only the required machine envelopes.
 
 Interpret user input narrowly:
 
@@ -63,8 +68,8 @@ branch, infer bulk approval, or package early.
 ## Sparse or conflicting evidence
 
 Write verified facts as coherent formal prose. Put unknown parameters,
-conflicts, benchmarks, and requests for evidence after the formal block. Ask a
-specific confirmation question; never ask the user to write from a blank page.
+conflicts, benchmarks, and requests for evidence only in internal
+evidence/report documents. Do not append them to the customer-visible turn.
 
 Industry benchmarks may structure a draft but must remain labelled as
 benchmarks until confirmed. An absence of evidence is not a negative claim.
