@@ -18,6 +18,10 @@ import {
   type TaskResponse,
   type OutputMessage,
 } from "@/lib/frontmind-api";
+import {
+  KNOWLEDGE_COLLECTION_STATUS_COPY,
+  LEGACY_KNOWLEDGE_COLLECTION_STATUS_COPY,
+} from "@shared/knowledge-base-copy";
 
 // Types for local conversation management
 export interface Attachment {
@@ -391,7 +395,7 @@ interface ConversationMutation<TInput, TOutput> {
 interface ConversationTrpcHooks {
   list: {
     useQuery: (
-      input: undefined,
+      input: { projectAssignmentId?: string },
       options: {
         enabled: boolean;
         retry: boolean;
@@ -406,12 +410,15 @@ interface ConversationTrpcHooks {
   };
   syncSnapshot: {
     useMutation: () => ConversationMutation<
-      { conversation: Conversation },
+      { conversation: Conversation; projectAssignmentId?: string },
       Conversation
     >;
   };
   delete: {
-    useMutation: () => ConversationMutation<{ id: string }, { success: true }>;
+    useMutation: () => ConversationMutation<
+      { id: string; projectAssignmentId?: string },
+      { success: true }
+    >;
   };
 }
 
@@ -452,8 +459,10 @@ const ConversationContext = createContext<ConversationContextType | null>(null);
 
 export function ConversationProvider({
   children,
+  projectAssignmentId,
 }: {
   children: React.ReactNode;
+  projectAssignmentId?: string;
 }) {
   const auth = useAuth();
   const authenticatedUser = auth.user as { id: number } | null;
@@ -461,11 +470,14 @@ export function ConversationProvider({
   const conversationApi = (
     trpc as unknown as { conversation: ConversationTrpcHooks }
   ).conversation;
-  const listQuery = conversationApi.list.useQuery(undefined, {
-    enabled: false,
-    retry: false,
-    refetchOnWindowFocus: false,
-  });
+  const listQuery = conversationApi.list.useQuery(
+    projectAssignmentId ? { projectAssignmentId } : {},
+    {
+      enabled: false,
+      retry: false,
+      refetchOnWindowFocus: false,
+    },
+  );
   const syncSnapshotMutation = conversationApi.syncSnapshot.useMutation();
   const deleteMutation = conversationApi.delete.useMutation();
 
@@ -480,16 +492,30 @@ export function ConversationProvider({
   const listRefetchRef = useRef(listQuery.refetch);
   const syncSnapshotRef = useRef(syncSnapshotMutation.mutateAsync);
   const deleteRemoteRef = useRef(deleteMutation.mutateAsync);
+  const projectAssignmentIdRef = useRef(projectAssignmentId);
 
   listRefetchRef.current = listQuery.refetch;
   syncSnapshotRef.current = syncSnapshotMutation.mutateAsync;
   deleteRemoteRef.current = deleteMutation.mutateAsync;
+  projectAssignmentIdRef.current = projectAssignmentId;
 
   const syncQueueRef = useRef<ConversationSyncQueue<Conversation> | null>(null);
   if (!syncQueueRef.current) {
     syncQueueRef.current = new ConversationSyncQueue<Conversation>({
-      syncSnapshot: (conversation) => syncSnapshotRef.current({ conversation }),
-      deleteConversation: (id) => deleteRemoteRef.current({ id }),
+      syncSnapshot: (conversation) =>
+        syncSnapshotRef.current({
+          conversation,
+          ...(projectAssignmentIdRef.current
+            ? { projectAssignmentId: projectAssignmentIdRef.current }
+            : {}),
+        }),
+      deleteConversation: (id) =>
+        deleteRemoteRef.current({
+          id,
+          ...(projectAssignmentIdRef.current
+            ? { projectAssignmentId: projectAssignmentIdRef.current }
+            : {}),
+        }),
       onError: (error) => setSyncError(getErrorMessage(error)),
       onSuccess: () => setSyncError(null),
       shouldRetry: (error) => {
@@ -636,7 +662,7 @@ export function ConversationProvider({
 
     setHydrationLoading(true);
     void hydrateForUser(userId, true);
-  }, [auth.loading, hydrateForUser, replaceState, userId]);
+  }, [auth.loading, hydrateForUser, projectAssignmentId, replaceState, userId]);
 
   useEffect(() => {
     canSyncRef.current = hydrated && userId !== null;
@@ -1232,8 +1258,8 @@ export function sanitizeKnowledgeBaseCustomerMarkdown(text: string): string {
 
   return text
     .replaceAll(
-      "FrontMind 正在按业务分支进行广度优先、深度受控的资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
-      "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
+      LEGACY_KNOWLEDGE_COLLECTION_STATUS_COPY,
+      KNOWLEDGE_COLLECTION_STATUS_COPY,
     )
     .replace(
       /!\[([^\]\n]*)]\(\s*<?(https?:\/\/[^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/gi,

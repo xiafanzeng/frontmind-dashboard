@@ -12,12 +12,14 @@ const outputRoot = path.join(projectRoot, "dist", "private-workflows");
 const skillArtifacts = [
   "socratic-kb-builder.skill",
   "socratic-kb-builder-v1.skill",
+  "socratic-kb-builder-v3.skill",
   "brand-question-portfolio.skill",
   "response-logic-builder.skill",
 ];
 const requiredFiles = [
   "socratic-kb-builder.skill",
   "socratic-kb-builder-v1.skill",
+  "socratic-kb-builder-v3.skill",
   "brand-question-portfolio.skill/SKILL.md",
   "brand-question-portfolio.skill/references/output-contract.md",
   "response-logic-builder.skill/SKILL.md",

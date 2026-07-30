@@ -32,6 +32,7 @@ export interface PreparedFileManifest {
   id: string;
   ownerUserId: number;
   credentialId: string;
+  projectAssignmentId?: string | null;
   source: PreparedFileSource;
   filename: string;
   mimeType: "application/pdf";
@@ -67,6 +68,7 @@ export interface PreparedFilePublicStatus {
 interface RegisterFileInput {
   ownerUserId: number;
   credentialId: string;
+  projectAssignmentId?: string | null;
   fileId: string;
   filename: string;
 }
@@ -74,6 +76,7 @@ interface RegisterFileInput {
 interface RegisterExternalInput {
   ownerUserId: number;
   credentialId: string;
+  projectAssignmentId?: string | null;
   url: string;
   filename: string;
 }
@@ -163,18 +166,25 @@ export function createPreparedAssetId(
   ownerUserId: number,
   credentialId: string,
   source: PreparedFileSource,
+  projectAssignmentId?: string | null,
 ) {
   const sourceIdentity =
     source.kind === "file"
       ? `file:${source.fileId}`
       : `external:${stableExternalIdentity(source.url)}`;
   return createHash("sha256")
-    .update(`frontmind-pdf-v1\0${ownerUserId}\0${credentialId}\0${sourceIdentity}`)
+    .update(
+      `frontmind-pdf-v1\0${ownerUserId}\0${credentialId}\0${sourceIdentity}${
+        projectAssignmentId ? `\0project-assignment:${projectAssignmentId}` : ""
+      }`,
+    )
     .digest("hex")
     .slice(0, 40);
 }
 
-function publicStatus(manifest: PreparedFileManifest): PreparedFilePublicStatus {
+function publicStatus(
+  manifest: PreparedFileManifest,
+): PreparedFilePublicStatus {
   return {
     assetId: manifest.id,
     filename: manifest.filename,
@@ -226,10 +236,10 @@ async function pathSize(targetPath: string): Promise<number> {
 }
 
 async function commandAvailable(command: string, args: string[]) {
-  return new Promise<boolean>(resolve => {
+  return new Promise<boolean>((resolve) => {
     const child = spawn(command, args, { stdio: "ignore" });
     child.on("error", () => resolve(false));
-    child.on("exit", code => resolve(code === 0));
+    child.on("exit", (code) => resolve(code === 0));
   });
 }
 
@@ -237,7 +247,7 @@ async function hashFile(filePath: string) {
   return new Promise<string>((resolve, reject) => {
     const hash = createHash("sha256");
     const stream = createReadStream(filePath);
-    stream.on("data", chunk => hash.update(chunk));
+    stream.on("data", (chunk) => hash.update(chunk));
     stream.on("error", reject);
     stream.on("end", () => resolve(hash.digest("hex")));
   });
@@ -296,7 +306,7 @@ export class PreparedFileService {
       commandAvailable("pdfunite", ["-v"]),
       commandAvailable("gs", ["--version"]),
     ]);
-    if (tooling.some(available => !available)) {
+    if (tooling.some((available) => !available)) {
       throw new PreparedFileError(
         "PDF_TOOLING_UNAVAILABLE",
         "PDF 服务依赖不完整，请安装 poppler-utils 与 ghostscript",
@@ -367,9 +377,11 @@ export class PreparedFileService {
         input.ownerUserId,
         input.credentialId,
         source,
+        input.projectAssignmentId,
       ),
       ownerUserId: input.ownerUserId,
       credentialId: input.credentialId,
+      projectAssignmentId: input.projectAssignmentId ?? null,
       source,
       filename: normalizeFilename(input.filename),
     });
@@ -386,9 +398,11 @@ export class PreparedFileService {
         input.ownerUserId,
         input.credentialId,
         source,
+        input.projectAssignmentId,
       ),
       ownerUserId: input.ownerUserId,
       credentialId: input.credentialId,
+      projectAssignmentId: input.projectAssignmentId ?? null,
       source,
       filename: normalizeFilename(input.filename),
     });
@@ -398,19 +412,31 @@ export class PreparedFileService {
     id: string;
     ownerUserId: number;
     credentialId: string;
+    projectAssignmentId: string | null;
     source: PreparedFileSource;
     filename: string;
   }) {
     const now = Date.now();
     const existing = this.manifests.get(input.id);
     if (existing) {
+      if (
+        (existing.projectAssignmentId ?? null) !== input.projectAssignmentId
+      ) {
+        throw new PreparedFileError(
+          "SOURCE_FORBIDDEN",
+          "文件不属于当前客户项目",
+        );
+      }
       existing.filename = input.filename;
       existing.lastAccessedAt = now;
       if (input.source.kind === "external") {
         // Refresh an expiring signed URL without changing the stable asset id.
         existing.source = input.source;
       }
-      if (existing.status === "failed" && existing.errorCode === "SOURCE_EXPIRED") {
+      if (
+        existing.status === "failed" &&
+        existing.errorCode === "SOURCE_EXPIRED"
+      ) {
         existing.status = "queued";
         existing.phase = "queued";
         delete existing.errorCode;
@@ -426,6 +452,7 @@ export class PreparedFileService {
       id: input.id,
       ownerUserId: input.ownerUserId,
       credentialId: input.credentialId,
+      projectAssignmentId: input.projectAssignmentId,
       source: input.source,
       filename: input.filename,
       mimeType: "application/pdf",
@@ -441,14 +468,30 @@ export class PreparedFileService {
     return publicStatus(manifest);
   }
 
-  async getStatus(assetId: string, ownerUserId: number) {
-    const manifest = await this.requireOwned(assetId, ownerUserId);
+  async getStatus(
+    assetId: string,
+    ownerUserId: number,
+    projectAssignmentId?: string | null,
+  ) {
+    const manifest = await this.requireOwned(
+      assetId,
+      ownerUserId,
+      projectAssignmentId,
+    );
     await this.touch(manifest);
     return publicStatus(manifest);
   }
 
-  async getReadyManifest(assetId: string, ownerUserId: number) {
-    const manifest = await this.requireOwned(assetId, ownerUserId);
+  async getReadyManifest(
+    assetId: string,
+    ownerUserId: number,
+    projectAssignmentId?: string | null,
+  ) {
+    const manifest = await this.requireOwned(
+      assetId,
+      ownerUserId,
+      projectAssignmentId,
+    );
     await this.touch(manifest);
     if (manifest.status !== "ready") return manifest;
     if (!(await fileExists(this.pdfPath(assetId)))) {
@@ -462,8 +505,16 @@ export class PreparedFileService {
     return manifest;
   }
 
-  async retry(assetId: string, ownerUserId: number) {
-    const manifest = await this.requireOwned(assetId, ownerUserId);
+  async retry(
+    assetId: string,
+    ownerUserId: number,
+    projectAssignmentId?: string | null,
+  ) {
+    const manifest = await this.requireOwned(
+      assetId,
+      ownerUserId,
+      projectAssignmentId,
+    );
     if (manifest.status === "ready") return publicStatus(manifest);
     manifest.status = "queued";
     manifest.phase = "queued";
@@ -499,13 +550,21 @@ export class PreparedFileService {
     };
   }
 
-  private async requireOwned(assetId: string, ownerUserId: number) {
+  private async requireOwned(
+    assetId: string,
+    ownerUserId: number,
+    projectAssignmentId?: string | null,
+  ) {
     await this.initialize();
     if (!/^[a-f0-9]{40}$/.test(assetId)) {
       throw new PreparedFileError("ASSET_NOT_FOUND", "文件不存在");
     }
     const manifest = this.manifests.get(assetId);
-    if (!manifest || manifest.ownerUserId !== ownerUserId) {
+    const owned = projectAssignmentId
+      ? manifest?.projectAssignmentId === projectAssignmentId
+      : manifest?.ownerUserId === ownerUserId &&
+        (manifest.projectAssignmentId ?? null) === null;
+    if (!manifest || !owned) {
       throw new PreparedFileError("ASSET_NOT_FOUND", "文件不存在");
     }
     return manifest;
@@ -519,10 +578,7 @@ export class PreparedFileService {
   }
 
   private async drainQueue() {
-    while (
-      this.processing < this.workerConcurrency &&
-      this.queue.length > 0
-    ) {
+    while (this.processing < this.workerConcurrency && this.queue.length > 0) {
       const assetId = this.queue.shift();
       if (!assetId) return;
       this.queued.delete(assetId);
@@ -530,7 +586,7 @@ export class PreparedFileService {
       if (!manifest || manifest.status !== "queued") continue;
       this.processing += 1;
       void this.processAsset(manifest)
-        .catch(error => {
+        .catch((error) => {
           console.error(
             `[PreparedFiles] Unhandled job error for ${manifest.id}`,
             error,
@@ -561,7 +617,7 @@ export class PreparedFileService {
       const sourceBytes = await this.downloadSource(
         manifest,
         sourcePath,
-        async downloadedBytes => {
+        async (downloadedBytes) => {
           manifest.sourceBytes = downloadedBytes;
           manifest.updatedAt = Date.now();
           await this.persistManifest(manifest);
@@ -584,20 +640,14 @@ export class PreparedFileService {
 
       const outputStat = await fs.stat(preparedTempPath);
       if (outputStat.size < 5) {
-        throw new PreparedFileError(
-          "INVALID_PDF",
-          "处理后的 PDF 文件为空",
-        );
+        throw new PreparedFileError("INVALID_PDF", "处理后的 PDF 文件为空");
       }
       const handle = await fs.open(preparedTempPath, "r");
       try {
         const header = Buffer.alloc(5);
         await handle.read(header, 0, 5, 0);
         if (header.toString("ascii") !== "%PDF-") {
-          throw new PreparedFileError(
-            "INVALID_PDF",
-            "处理结果不是有效的 PDF",
-          );
+          throw new PreparedFileError("INVALID_PDF", "处理结果不是有效的 PDF");
         }
       } finally {
         await handle.close();
@@ -637,9 +687,9 @@ export class PreparedFileService {
       this.active.delete(manifest.id);
       await fs.rm(sourcePath, { force: true }).catch(() => undefined);
       await fs.rm(preparedTempPath, { force: true }).catch(() => undefined);
-      await fs.rm(workDir, { recursive: true, force: true }).catch(
-        () => undefined,
-      );
+      await fs
+        .rm(workDir, { recursive: true, force: true })
+        .catch(() => undefined);
     }
   }
 
@@ -656,6 +706,7 @@ export class PreparedFileService {
         manifest.ownerUserId,
         "file",
         manifest.source.fileId,
+        manifest.projectAssignmentId ?? undefined,
       );
       if (!credential || credential.id !== manifest.credentialId) {
         throw new PreparedFileError(
@@ -728,8 +779,8 @@ export class PreparedFileService {
       if (response.status !== 200) {
         throw new PreparedFileError(
           response.status === 401 ||
-            response.status === 403 ||
-            response.status === 404
+          response.status === 403 ||
+          response.status === 404
             ? "SOURCE_EXPIRED"
             : "SOURCE_DOWNLOAD_FAILED",
           `上游文件下载失败 (${response.status})`,
@@ -834,7 +885,7 @@ export class PreparedFileService {
         if (checkingDisk) return;
         checkingDisk = true;
         void this.ensureDiskSpace()
-          .catch(error => {
+          .catch((error) => {
             void worker.terminate();
             finish(() =>
               reject(
@@ -881,7 +932,7 @@ export class PreparedFileService {
           ),
         );
       });
-      worker.on("error", error => {
+      worker.on("error", (error) => {
         finish(() =>
           reject(
             new PreparedFileError(
@@ -891,7 +942,7 @@ export class PreparedFileService {
           ),
         );
       });
-      worker.on("exit", code => {
+      worker.on("exit", (code) => {
         if (code !== 0) {
           finish(() =>
             reject(
@@ -917,8 +968,7 @@ export class PreparedFileService {
     const destination = this.manifestPath(manifest.id);
     const temporary = `${destination}.tmp`;
     const snapshot = `${JSON.stringify(manifest)}\n`;
-    const previous =
-      this.manifestWrites.get(manifest.id) || Promise.resolve();
+    const previous = this.manifestWrites.get(manifest.id) || Promise.resolve();
     const operation = previous
       .catch(() => undefined)
       .then(async () => {
@@ -946,10 +996,7 @@ export class PreparedFileService {
       Math.max(0, totalBytes - reserveBytes),
     );
     const cacheBytes = await this.cacheSize();
-    if (
-      availableBytes >= reserveBytes &&
-      cacheBytes <= maximumCacheBytes
-    ) {
+    if (availableBytes >= reserveBytes && cacheBytes <= maximumCacheBytes) {
       return;
     }
     await this.cleanup();
@@ -971,7 +1018,7 @@ export class PreparedFileService {
     await fs.mkdir(this.rootDir, { recursive: true, mode: 0o700 });
     const now = Date.now();
     const candidates = [...this.manifests.values()]
-      .filter(manifest => !this.active.has(manifest.id))
+      .filter((manifest) => !this.active.has(manifest.id))
       .sort((a, b) => a.lastAccessedAt - b.lastAccessedAt);
 
     for (const manifest of candidates) {
@@ -988,18 +1035,12 @@ export class PreparedFileService {
     );
     let cacheBytes = await this.cacheSize();
     let availableBytes = stats.bavail * stats.bsize;
-    if (
-      cacheBytes <= maximumCacheBytes &&
-      availableBytes >= reserveBytes
-    ) {
+    if (cacheBytes <= maximumCacheBytes && availableBytes >= reserveBytes) {
       return;
     }
 
     for (const manifest of candidates) {
-      if (
-        cacheBytes <= maximumCacheBytes &&
-        availableBytes >= reserveBytes
-      ) {
+      if (cacheBytes <= maximumCacheBytes && availableBytes >= reserveBytes) {
         break;
       }
       if (

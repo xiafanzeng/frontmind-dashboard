@@ -42,21 +42,21 @@ function response() {
 
 describe("ordinary-user FrontMind proxy policy", () => {
   it("allows a delivery member to use the assigned-key general agent", async () => {
-    const assertRoleContext = vi.fn(async () => ({
-      assignmentId: "assignment-1",
-      roleId: "role-1",
-      roleType: "knowledge_base_engineer" as const,
-      teamName: "知识库一组",
+    const assertProjectContext = vi.fn(async () => ({
+      projectAssignmentId: "assignment-1",
+      customerUserId: 42,
+      roleType: "ai_operations_engineer" as const,
+      customerName: "示例客户",
     }));
     const middleware = createFrontMindProxyAccessMiddleware({
       assertWriteAccess: vi.fn(),
-      assertRoleContext,
+      assertProjectContext,
     });
     const req = {
       method: "POST",
       originalUrl: "/api/frontmind/v1/tasks",
       frontmindUser: actor("delivery_member"),
-      headers: { "x-delivery-role-assignment-id": "assignment-1" },
+      headers: { "x-delivery-project-assignment-id": "assignment-1" },
     } as FrontMindRequest;
     const res = response();
     const next = vi.fn();
@@ -64,13 +64,13 @@ describe("ordinary-user FrontMind proxy policy", () => {
     await middleware(req, res as never, next);
 
     expect(next).toHaveBeenCalledOnce();
-    expect(assertRoleContext).toHaveBeenCalledWith({
+    expect(assertProjectContext).toHaveBeenCalledWith({
       actor: expect.objectContaining({ role: "delivery_member" }),
-      roleAssignmentId: "assignment-1",
+      projectAssignmentId: "assignment-1",
     });
-    expect(req.frontmindDeliveryRoleContext).toMatchObject({
-      assignmentId: "assignment-1",
-      roleId: "role-1",
+    expect(req.frontmindDeliveryProjectContext).toMatchObject({
+      projectAssignmentId: "assignment-1",
+      customerUserId: 42,
     });
     expect(res.status).not.toHaveBeenCalled();
   });

@@ -59,7 +59,7 @@ cp .env.example .env
 构建固定派生镜像，使 Poppler、Ghostscript 与项目声明的精确 pnpm 在容器重建后仍然
 存在；禁止只在一次性运行容器中临时安装系统包或启用包管理器。
 
-本地 `.env` 至少设置 `DATABASE_URL`、`FRONTMIND_CREDENTIAL_ENCRYPTION_KEY`、`FRONTMIND_PRESALES_SERVICE_TOKEN`、`FRONTMIND_PROVISIONING_SERVICE_TOKEN`、`FRONTMIND_MONITOR_API_KEY`、`FRONTMIND_PUBLIC_URL`、`FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET`、`FRONTMIND_ICP_MATERIAL_KEY` 和 `FRONTMIND_ICP_MATERIAL_DIR`。`FRONTMIND_MONITOR_API_KEY` 必须是监控服务专用凭据，生产环境不会回退使用普通售前 Key；`FRONTMIND_PUBLIC_URL` 必须是可供客户浏览器访问的真实 HTTPS 地址，用于生成开户与工作台链接。凭据密钥与 ICP 材料密钥必须分别生成并长期保持不变；两个服务令牌和预检签名密钥都应使用至少 32 位的独立随机值，并只保存在服务端，且不得互相复用。轮换预检签名密钥会使尚未发布的短时预检凭证失效，但不会影响已发布内容。ICP 目录应挂载到第一方私有持久化磁盘，不能由 Web 服务器直接公开。
+本地 `.env` 至少设置 `DATABASE_URL`、`FRONTMIND_CREDENTIAL_ENCRYPTION_KEY`、`FRONTMIND_PRESALES_SERVICE_TOKEN`、`FRONTMIND_PROVISIONING_SERVICE_TOKEN`、`FRONTMIND_MONITOR_API_KEY`、`FRONTMIND_PUBLIC_URL` 和 `FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET`。`FRONTMIND_MONITOR_API_KEY` 必须是监控服务专用凭据，生产环境不会回退使用普通售前 Key；`FRONTMIND_PUBLIC_URL` 必须是可供客户浏览器访问的真实 HTTPS 地址，用于生成开户与工作台链接。凭据密钥、两个服务令牌和预检签名密钥都应使用至少 32 位的独立随机值，并只保存在服务端，且不得互相复用。轮换预检签名密钥会使尚未发布的短时预检凭证失效，但不会影响已发布内容。
 
 Dashboard 正式环境使用 `FRONTMIND_PUBLIC_URL=https://dashboard.frontmind.net`。页面路由、静态资源和 `/api/*` 均按同源相对路径工作，因此 1Panel 应将该域名的根路径整体反向代理到应用端口，不要部署在 `/dashboard/` 等子路径。`FRONTMIND_WEBSITE_URL=https://www.frontmind.net` 仍指向官网。
 
@@ -82,7 +82,7 @@ pnpm dev
 7. 普通用户登录后进入企业看板与“知识库智能体”；知识库构建固定使用 Pro，最终 ZIP 会自动形成可检索的文档与图片展示版本。
 8. 管理员登录后进入管理工作台。内置 `admin` 账号可把一个用户分配给多个管理员；被分配的管理员可维护该用户的看板、知识库与 API Key，并查看近 30 天积分消耗。
 9. 生产环境应把 `FRONTMIND_DASHBOARD_ASSET_DIR` 配置为持久化目录，用于保存知识库 ZIP 中解析出的图片。图片仍需通过登录和用户归属校验后访问。
-10. 新的域名注册与 ICP 备案流程只引导用户前往阿里云操作，Dashboard 仅接收备案通过后的域名和 ICP 主体备案号，不接收证件或人脸核验材料。`FRONTMIND_ICP_MATERIAL_DIR` 仅用于兼容历史加密材料的受控读取与清理。
+10. 域名注册与 ICP 备案流程只引导用户前往阿里云操作，Dashboard 仅登记已备案域名、ICP 主体备案号、备案状态及可选备案省份，不接收、上传或存储证件及人脸核验材料。
 11. 管理员上传看板模块或官网内容当前模板必须先取得服务端签发的短时预检凭证；凭证绑定管理员、客户、模块、修订号和文件哈希，并通过数据库 nonce 原子消费防止重放。官网内容模板还会逐工单校验修订号、类别和话题快照，任一冲突会整体回滚。生产环境必须配置 `FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET`。
 
 同一个 API Key 可以由多个 FrontMind 账号共同使用。账号之间的会话、任务和文件权限仍按账号隔离；积分总数反映该 Key 池的整体消耗，最近任务明细只展示当前账号创建的任务。共享 Key 下不会透传上游任务或文件目录，未知历史资源需由系统管理员完成迁移。
@@ -99,6 +99,22 @@ pnpm db:migrate
 # 永久清理超过 30 天未更新的会话（供 1Panel 计划任务调用）
 pnpm db:cleanup-expired
 ```
+
+升级到三类工程师版本前必须先冻结写入并运行只读预检。若旧环境曾启用 ICP 材料存储，
+还要先对旧私有目录执行清理预演；确认清单无误后才能使用永久删除参数。清理命令只删除
+数据库中精确 `storageKey` 对应的文件，拒绝相对路径、越界路径和未登记目录项。
+
+```bash
+pnpm db:preflight-three-engineer-roles
+pnpm db:purge-icp-materials -- --storage-root=/旧ICP私有目录
+pnpm db:purge-icp-materials -- \
+  --storage-root=/旧ICP私有目录 \
+  --confirm-permanent-delete
+pnpm db:migrate
+```
+
+永久删除不会为 ICP 文件创建新备份，且不可恢复。生产备份中已有的历史材料仍按原备份
+保留周期清除；全新部署没有旧材料目录时无需运行材料清理命令。
 
 不要在发布服务器上用 schema push 替代版本化迁移。数据库备份、1Panel 应用配置、反向代理和正式发布属于部署阶段，需在检查目标面板后单独执行。
 

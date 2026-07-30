@@ -12,8 +12,6 @@ const exactValues = {
   FRONTMIND_PREPARED_FILE_DIR: "/var/lib/frontmind/prepared-files",
   FRONTMIND_PREPARED_FILE_TTL_MS: "2592000000",
   FRONTMIND_DASHBOARD_ASSET_DIR: "/var/lib/frontmind/dashboard-assets",
-  FRONTMIND_ICP_MATERIAL_DIR: "/var/lib/frontmind/icp-materials",
-  FRONTMIND_ICP_RETENTION_DAYS: "365",
   FRONTMIND_PDF_WORKERS: "1",
   FRONTMIND_CONVERSATION_RETENTION_DAYS: "30",
   FRONTMIND_SERVICE_ENTITLEMENT_ENFORCEMENT: "auto",
@@ -27,7 +25,6 @@ const exactValues = {
 
 const secretNames = [
   "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY",
-  "FRONTMIND_ICP_MATERIAL_KEY",
   "FRONTMIND_PRESALES_SERVICE_TOKEN",
   "FRONTMIND_PROVISIONING_SERVICE_TOKEN",
   "FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET",
@@ -78,9 +75,7 @@ try {
   }
 
   decodeBase64Key("FRONTMIND_CREDENTIAL_ENCRYPTION_KEY");
-  decodeBase64Key("FRONTMIND_ICP_MATERIAL_KEY");
-
-  for (const name of secretNames.slice(2)) {
+  for (const name of secretNames.slice(1)) {
     const value = process.env[name] || "";
     if (
       value.length < 32 ||

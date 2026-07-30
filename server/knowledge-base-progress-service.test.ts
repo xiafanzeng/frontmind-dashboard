@@ -4,6 +4,7 @@ import {
   assertKnowledgeBaseCustomerOutput,
   classifyKnowledgeBaseUserAction,
   extractFinalKnowledgeBaseAssistantText,
+  isAmbiguousKnowledgeBaseAdvance,
 } from "./knowledge-base-progress-service";
 
 describe("knowledge-base user action classification", () => {
@@ -22,7 +23,15 @@ describe("knowledge-base user action classification", () => {
     expect(classifyKnowledgeBaseUserAction("直接预填")).toBe("direct_prefill");
     expect(classifyKnowledgeBaseUserAction("跳过。")).toBe("direct_prefill");
     expect(classifyKnowledgeBaseUserAction("", 1)).toBe("revise");
+    expect(classifyKnowledgeBaseUserAction("确认", 1)).toBe("revise");
     expect(classifyKnowledgeBaseUserAction("", 0)).toBe("initial");
+  });
+
+  it("does not interpret an ambiguous standalone continuation as confirmation", () => {
+    expect(isAmbiguousKnowledgeBaseAdvance("继续")).toBe(true);
+    expect(isAmbiguousKnowledgeBaseAdvance("下一步！")).toBe(true);
+    expect(isAmbiguousKnowledgeBaseAdvance("补充后继续")).toBe(false);
+    expect(classifyKnowledgeBaseUserAction("继续")).toBe("revise");
   });
 });
 

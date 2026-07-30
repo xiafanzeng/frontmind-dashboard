@@ -29,24 +29,39 @@ import {
   Loader2,
   Upload,
   ChevronDown,
+  Check,
+  FastForward,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
+import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 
 interface FilePreview {
   file: File;
   id: string;
 }
 
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const AMBIGUOUS_ADVANCE_PATTERN =
+  /^(继续|下一步|下一个|继续吧|请继续|next)[。！!]*$/i;
+
 export default function ChatInput({
   fixedAgentProfile,
   syncKnowledgeBaseSnapshot = false,
   composerPrefill,
   responseLogicContext,
+  knowledgeBaseProgress,
 }: {
   fixedAgentProfile?: string;
   syncKnowledgeBaseSnapshot?: boolean;
   composerPrefill?: string;
   responseLogicContext?: ResponseLogicTaskContext;
+  knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
 }) {
   const [text, setText] = useState("");
   const [files, setFiles] = useState<FilePreview[]>([]);
@@ -94,6 +109,13 @@ export default function ChatInput({
     Boolean(activeConversation?.taskId) &&
     activeConversation?.status !== "awaiting_input";
   const inputLocked = isRunning || knowledgeInteractionLocked;
+  const currentKnowledgeLeaf = knowledgeBaseProgress?.branches
+    .flatMap((branch) => branch.leaves)
+    .find((leaf) => leaf.id === knowledgeBaseProgress.build.currentLeafId);
+  const knowledgeBaseComplete =
+    syncKnowledgeBaseSnapshot &&
+    Boolean(knowledgeBaseProgress?.packageAllowed) &&
+    !currentKnowledgeLeaf;
 
   const clearSelectedFiles = useCallback(() => {
     setFiles([]);
@@ -129,50 +151,78 @@ export default function ChatInput({
     setFiles((prev) => prev.filter((f) => f.id !== id));
   }, []);
 
-  const handleSubmit = useCallback(async () => {
-    if (
-      (!text.trim() && files.length === 0) ||
-      isSending ||
-      inputLocked ||
-      knowledgeBaseNotStarted
-    )
-      return;
+  const submitContent = useCallback(
+    async (message: string, selectedFiles: FilePreview[]) => {
+      if (
+        (!message.trim() && selectedFiles.length === 0) ||
+        isSending ||
+        inputLocked ||
+        knowledgeBaseNotStarted
+      ) {
+        return;
+      }
+      if (
+        syncKnowledgeBaseSnapshot &&
+        selectedFiles.length === 0 &&
+        AMBIGUOUS_ADVANCE_PATTERN.test(message.trim())
+      ) {
+        toast.info("“继续/下一步”不会推进知识节点", {
+          description:
+            "请选择“确认并进入下一项”或“直接预填并进入下一项”，也可以输入修改内容或上传资料。",
+        });
+        return;
+      }
 
-    // Synchronous lock: immediately block subsequent calls before async state updates
-    if (sendLockRef.current) return;
-    sendLockRef.current = true;
+      // Synchronous lock: immediately block subsequent calls before async state updates.
+      if (sendLockRef.current) return;
+      sendLockRef.current = true;
 
-    setIsSending(true);
-    try {
-      await sendMessage(
-        text,
-        files.map((f) => f.file),
-        {
-          agentProfile: fixedAgentProfile || selectedModel,
-          syncKnowledgeBaseSnapshot,
-          responseLogicContext,
-        },
-      );
-      setText("");
-      clearSelectedFiles();
-      textareaRef.current?.focus();
-    } finally {
-      setIsSending(false);
-      sendLockRef.current = false;
-    }
-  }, [
-    text,
-    files,
-    isSending,
-    inputLocked,
-    knowledgeBaseNotStarted,
-    sendMessage,
-    selectedModel,
-    fixedAgentProfile,
-    syncKnowledgeBaseSnapshot,
-    responseLogicContext,
-    clearSelectedFiles,
-  ]);
+      setIsSending(true);
+      try {
+        const sent = await sendMessage(
+          message,
+          selectedFiles.map((file) => file.file),
+          {
+            agentProfile: fixedAgentProfile || selectedModel,
+            syncKnowledgeBaseSnapshot,
+            responseLogicContext,
+          },
+        );
+        if (sent) {
+          setText("");
+          clearSelectedFiles();
+          textareaRef.current?.focus();
+        }
+      } finally {
+        setIsSending(false);
+        sendLockRef.current = false;
+      }
+    },
+    [
+      clearSelectedFiles,
+      fixedAgentProfile,
+      inputLocked,
+      isSending,
+      knowledgeBaseNotStarted,
+      responseLogicContext,
+      selectedModel,
+      sendMessage,
+      syncKnowledgeBaseSnapshot,
+    ],
+  );
+
+  const handleSubmit = useCallback(
+    async () => submitContent(text, files),
+    [files, submitContent, text],
+  );
+
+  const handleQuickAction = useCallback(
+    async (action: "确认" | "直接预填") => {
+      if (text.trim() || files.length > 0) return;
+      await submitContent(action, []);
+    },
+    [files.length, submitContent, text],
+  );
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -183,6 +233,8 @@ export default function ChatInput({
     },
     [handleSubmit],
   );
+
+  const isUploading = uploadProgress !== null;
 
   // Drag and drop handlers
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -199,12 +251,21 @@ export default function ChatInput({
     (e: React.DragEvent) => {
       e.preventDefault();
       setIsDragging(false);
+      if (inputLocked || isSending || isUploading || knowledgeBaseNotStarted) {
+        return;
+      }
       const droppedFiles = Array.from(e.dataTransfer.files);
       if (droppedFiles.length > 0) {
         addFiles(droppedFiles);
       }
     },
-    [addFiles],
+    [
+      addFiles,
+      inputLocked,
+      isSending,
+      isUploading,
+      knowledgeBaseNotStarted,
+    ],
   );
 
   const handleTextChange = useCallback(
@@ -214,7 +275,13 @@ export default function ChatInput({
     [],
   );
 
-  const isUploading = uploadProgress !== null;
+  const quickActionsDisabled =
+    Boolean(text.trim()) ||
+    files.length > 0 ||
+    isSending ||
+    inputLocked ||
+    isUploading ||
+    knowledgeBaseNotStarted;
 
   // Get current model display info
   const currentModelInfo =
@@ -247,6 +314,74 @@ export default function ChatInput({
       </AnimatePresence>
 
       <div className="max-w-4xl mx-auto">
+        {syncKnowledgeBaseSnapshot &&
+          (currentKnowledgeLeaf || knowledgeBaseComplete) && (
+            <div
+              className={cn(
+                "mb-3 rounded-2xl border px-4 py-3 shadow-sm",
+                knowledgeBaseComplete
+                  ? "border-emerald-200 bg-emerald-50/90"
+                  : "border-violet-200 bg-violet-50/90",
+              )}
+              data-testid="knowledge-node-action-card"
+            >
+              {knowledgeBaseComplete ? (
+                <div>
+                  <p className="text-sm font-semibold text-emerald-900">
+                    全部节点已完成
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-emerald-800">
+                    请点击右上角“更新知识库”，同步最终知识库内容。
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold tracking-wide text-violet-700">
+                        当前待确认
+                      </p>
+                      <p className="mt-1 truncate text-sm font-semibold text-violet-950">
+                        {currentKnowledgeLeaf!.branchTitle} /{" "}
+                        {currentKnowledgeLeaf!.title}
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-violet-800/80">
+                        可直接确认，也可以输入修改意见或上传资料。
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => void handleQuickAction("确认")}
+                        disabled={quickActionsDisabled}
+                        className="rounded-xl"
+                      >
+                        <Check className="h-4 w-4" />
+                        确认并进入下一项
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleQuickAction("直接预填")}
+                        disabled={quickActionsDisabled}
+                        className="rounded-xl border-violet-200 bg-white"
+                      >
+                        <FastForward className="h-4 w-4" />
+                        直接预填并进入下一项
+                      </Button>
+                    </div>
+                  </div>
+                  <p className="mt-2 text-xs text-violet-700/75">
+                    直接预填会计入完成进度，但不会显示“企业已确认”对号。
+                    输入文字或选择文件后，两个快捷按钮会自动禁用。
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+
         {/* Upload progress indicator */}
         <AnimatePresence>
           {isUploading && uploadProgress && (
@@ -296,8 +431,11 @@ export default function ChatInput({
                 >
                   <div className="flex items-center gap-2 px-3 py-2 rounded-xl border border-border/40 bg-muted/30 shadow-sm max-w-[180px]">
                     <FileText className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-                    <span className="text-xs text-muted-foreground truncate">
-                      {fp.file.name}
+                    <span className="min-w-0 text-xs text-muted-foreground">
+                      <span className="block truncate">{fp.file.name}</span>
+                      <span className="block text-[10px] opacity-70">
+                        {formatFileSize(fp.file.size)}
+                      </span>
                     </span>
                   </div>
                   <button
@@ -331,7 +469,10 @@ export default function ChatInput({
                     className="w-9 h-9 rounded-xl text-muted-foreground hover:text-foreground hover:bg-secondary"
                     onClick={() => fileInputRef.current?.click()}
                     disabled={
-                      inputLocked || isUploading || knowledgeBaseNotStarted
+                      inputLocked ||
+                      isSending ||
+                      isUploading ||
+                      knowledgeBaseNotStarted
                     }
                   >
                     <Paperclip className="w-4 h-4" />
@@ -352,13 +493,20 @@ export default function ChatInput({
                   ? `正在上传文件 ${uploadProgress!.overallPercent}%...`
                   : inputLocked
                     ? syncKnowledgeBaseSnapshot
-                      ? "当前知识库正在处理或已锁定"
+                      ? "正在根据你的补充资料更新当前节点…"
                       : "FrontMind 正在编排内容制作流程..."
                     : knowledgeBaseNotStarted
                       ? "请先点击上方“构建企业知识库”完成资料采集设置"
-                      : "输入你的内容需求，按 Enter 开始编排..."
+                      : syncKnowledgeBaseSnapshot
+                        ? "输入修改意见，或上传资料；提交后仍停留当前节点"
+                        : "输入你的内容需求，按 Enter 开始编排..."
               }
-              disabled={inputLocked || isUploading || knowledgeBaseNotStarted}
+              disabled={
+                inputLocked ||
+                isSending ||
+                isUploading ||
+                knowledgeBaseNotStarted
+              }
               rows={2}
               className="h-11 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground/55 focus:outline-none"
             />
@@ -469,7 +617,9 @@ export default function ChatInput({
           {/* Hint text */}
           <div className="px-4 pb-2">
             <p className="text-xs text-muted-foreground/40">
-              Enter 发送 · Shift+Enter 换行 · 支持资料、图片与交付文件上传
+              {syncKnowledgeBaseSnapshot
+                ? "Enter 提交修订 · Shift+Enter 换行 · 支持多文件选择与拖拽上传"
+                : "Enter 发送 · Shift+Enter 换行 · 支持资料、图片与交付文件上传"}
             </p>
           </div>
         </div>
@@ -480,6 +630,9 @@ export default function ChatInput({
         ref={fileInputRef}
         type="file"
         multiple
+        disabled={
+          inputLocked || isSending || isUploading || knowledgeBaseNotStarted
+        }
         className="hidden"
         onChange={(e) => {
           const selected = Array.from(e.target.files || []);

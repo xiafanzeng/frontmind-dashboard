@@ -36,6 +36,7 @@ import {
 import { cn, copyToClipboard } from "@/lib/utils";
 import {
   creditEventBus,
+  deliveryProjectHeaders,
   getModelDisplayName,
   retrieveTask,
   sanitizeBrandText,
@@ -44,6 +45,7 @@ import {
   type ResponseLogicTaskContext,
 } from "@/lib/frontmind-api";
 import ChatInput from "./ChatInput";
+import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import MarkdownRenderer from "./MarkdownRenderer";
 import ImagePreview from "./ImagePreview";
 import FilePreview from "./FilePreview";
@@ -64,7 +66,6 @@ import { Textarea } from "@/components/ui/textarea";
 import { reconcileKnowledgeBaseProgress } from "@/lib/knowledge-progress";
 import type {
   KnowledgeBaseInteractionDto,
-  KnowledgeBaseProgressDto,
 } from "@shared/knowledge-base-progress";
 import { trpc } from "@/lib/trpc";
 
@@ -205,6 +206,7 @@ async function fetchWithAuth(
 
   const response = await fetch(normalizedUrl, {
     credentials: "include",
+    headers: deliveryProjectHeaders(),
   });
 
   if (!response.ok) {
@@ -227,6 +229,7 @@ async function fetchWithAuth(
           `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
         const s3Response = await fetch(proxyUrl, {
           credentials: "include",
+          headers: deliveryProjectHeaders(),
         });
         if (!s3Response.ok) {
           throw new Error(
@@ -254,6 +257,7 @@ export default function ChatArea({
   showKnowledgeBaseStarter = true,
   standardWelcomeVariant = "simple",
   reserveOuterMobileNav = false,
+  knowledgeBaseProgress,
 }: {
   fixedAgentProfile?: string;
   syncKnowledgeBaseSnapshot?: boolean;
@@ -262,6 +266,7 @@ export default function ChatArea({
   showKnowledgeBaseStarter?: boolean;
   standardWelcomeVariant?: "simple" | "workflow";
   reserveOuterMobileNav?: boolean;
+  knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
 }) {
   const {
     activeConversation,
@@ -367,7 +372,9 @@ export default function ChatArea({
           const normalizedStatus = normalizeReportStatus(updated.status);
           const totalOutputLength = updated.output?.length || 0;
 
-          applyOutput(updated.output);
+          if (!reconcileKnowledgeBase) {
+            applyOutput(updated.output);
+          }
           if (reconcileKnowledgeBase) {
             try {
               const interaction = await reconcileKnowledgeBaseProgress({
@@ -399,6 +406,10 @@ export default function ChatArea({
                 interaction.interactionState === "published"
               ) {
                 completionHandled = true;
+                applyOutput(
+                  updated.output,
+                  (Date.now() - responseStartedAt) / 1000,
+                );
                 updateStatus(conversationId, "completed", {
                   taskId: updated.id,
                   taskUrl: updated.metadata?.task_url,
@@ -486,7 +497,9 @@ export default function ChatArea({
             completionHandled = true;
             const completedAt = Date.now();
             const errorMessage = updated.error?.message || "任务执行出错";
-            applyOutput(updated.output);
+            if (!reconcileKnowledgeBase) {
+              applyOutput(updated.output);
+            }
             updateStatus(conversationId, "error", {
               taskId: updated.id,
               taskUrl: updated.metadata?.task_url,
@@ -634,7 +647,11 @@ export default function ChatArea({
           lastKnownOutputLength: totalOutputLength,
         });
 
-        if (data.task.output && data.task.output.length > 0) {
+        if (
+          data.task.output &&
+          data.task.output.length > 0 &&
+          (initialStatus === "awaiting_input" || initialStatus === "completed")
+        ) {
           const assistantMessages = sanitizeKnowledgeBaseOutputMessages(
             parseOutputMessages(
               data.task.output,
@@ -868,6 +885,7 @@ export default function ChatArea({
         syncKnowledgeBaseSnapshot={syncKnowledgeBaseSnapshot}
         composerPrefill={composerPrefill}
         responseLogicContext={responseLogicContext}
+        knowledgeBaseProgress={knowledgeBaseProgress}
       />
     </div>
   );
@@ -1352,7 +1370,10 @@ function MarkdownFileReader({
       const normalizedUrl =
         buildProxyDownloadUrl(fileUrl, displayName, false) || fileUrl;
 
-      fetch(normalizedUrl, { credentials: "include" })
+      fetch(normalizedUrl, {
+        credentials: "include",
+        headers: deliveryProjectHeaders(),
+      })
         .then(async (res) => {
           if (!res.ok) {
             throw new Error(`HTTP ${res.status}`);
@@ -1374,6 +1395,7 @@ function MarkdownFileReader({
                   `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
                 const s3Res = await fetch(proxyUrl, {
                   credentials: "include",
+                  headers: deliveryProjectHeaders(),
                 });
                 if (!s3Res.ok) {
                   throw new Error(`S3 download failed: HTTP ${s3Res.status}`);
@@ -1415,7 +1437,9 @@ function MarkdownFileReader({
         const downloadName = sanitizeBrandText(fileName);
         const proxiedUrl = buildProxyDownloadUrl(fileUrl, downloadName, true);
         if (proxiedUrl) {
-          nativeDownload(proxiedUrl, downloadName);
+          const blobUrl = await fetchWithAuth(proxiedUrl, downloadName);
+          nativeDownload(blobUrl, downloadName);
+          URL.revokeObjectURL(blobUrl);
           return;
         }
         const blobUrl = await fetchWithAuth(fileUrl, downloadName);

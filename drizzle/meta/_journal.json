@@ -281,6 +281,34 @@
       "when": 1785398400000,
       "tag": "0039_delivery_roles_and_knowledge_reset",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "5",
+      "when": 1785402000000,
+      "tag": "0040_flaky_the_executioner",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "5",
+      "when": 1785405600000,
+      "tag": "0041_lovely_harry_osborn",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "5",
+      "when": 1785409200000,
+      "tag": "0042_heavy_xorn",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "5",
+      "when": 1785412800000,
+      "tag": "0043_clumsy_lilandra",
+      "breakpoints": true
     }
   ]
 }

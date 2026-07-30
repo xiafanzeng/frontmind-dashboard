@@ -45,11 +45,17 @@ For the current leaf, show:
 
 Interpret user input narrowly:
 
-- “确认 / 确认无误 / OK / 没问题 / 通过” → `confirmed`.
+- “确认 / 确认无误 / OK / 没问题 / 通过” → `confirmed`; briefly acknowledge
+  the old leaf, then fully present the next leaf as the body.
 - “跳过 / 直接预填 / 采用预填 / 保留预填” →
   `direct_prefilled`.
 - Any correction, supplement, question, or upload →
-  `needs_verification`; update and re-present the same leaf.
+  `needs_verification`; update and re-present the same leaf. A turn containing
+  a file never advances, even when its text contains confirmation language.
+- On every non-initial turn, append one progress/reopen envelope and one
+  `FRONTMIND_KB_PRESENTATION` envelope. The latter uses the post-transition
+  revision and the leaf actually displayed; use `leafId: null` only when the
+  final leaf has completed.
 
 A correction is not confirmation. Never advance multiple leaves, skip a
 branch, infer bulk approval, or package early.

@@ -17,7 +17,6 @@ pnpm-debug.log*
 !.env.example
 .workflow-uploads/
 .frontmind-prepared-files/
-.frontmind-icp-materials/
 client/public/citation-distribution-*.b64
 client/src/dev-assets/local-customer/
 client/src/dev-assets/hongxu-monitoring-fixture.ts

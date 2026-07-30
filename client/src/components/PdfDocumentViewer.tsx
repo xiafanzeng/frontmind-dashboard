@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -29,7 +23,7 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "pdfjs-dist/web/pdf_viewer.css";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { sanitizeBrandText } from "@/lib/frontmind-api";
+import { deliveryProjectHeaders, sanitizeBrandText } from "@/lib/frontmind-api";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -105,7 +99,7 @@ async function prepareRemotePdf(
   const response = await fetch("/api/frontmind/assets/prepare", {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ fileUrl, fileName }),
     signal,
   });
@@ -116,7 +110,12 @@ async function prepareRemotePdf(
 async function fetchPreparedStatus(assetId: string, signal?: AbortSignal) {
   const response = await fetch(
     `/api/frontmind/assets/${encodeURIComponent(assetId)}/status`,
-    { credentials: "include", cache: "no-store", signal },
+    {
+      credentials: "include",
+      cache: "no-store",
+      signal,
+      headers: deliveryProjectHeaders(),
+    },
   );
   if (!response.ok) throw new Error(await readApiError(response));
   return (await response.json()) as PreparedPdfAsset;
@@ -149,7 +148,7 @@ function PageCanvas({
     const root = scrollRoot.current;
     if (!container || !root) return;
     const renderObserver = new IntersectionObserver(
-      entries => {
+      (entries) => {
         const entry = entries[0];
         if (!entry) return;
         setIsNearViewport(entry.isIntersecting);
@@ -157,7 +156,7 @@ function PageCanvas({
       { root, rootMargin: "900px 0px", threshold: 0 },
     );
     const visibleObserver = new IntersectionObserver(
-      entries => {
+      (entries) => {
         const entry = entries[0];
         if (entry?.isIntersecting && entry.intersectionRatio >= 0.25) {
           onVisible(pageNumber);
@@ -176,7 +175,7 @@ function PageCanvas({
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const resizeObserver = new ResizeObserver(entries => {
+    const resizeObserver = new ResizeObserver((entries) => {
       const width = entries[0]?.contentRect.width;
       if (width && width > 0) setContainerWidth(width);
     });
@@ -203,7 +202,7 @@ function PageCanvas({
 
     void document
       .getPage(pageNumber)
-      .then(async loadedPage => {
+      .then(async (loadedPage) => {
         if (cancelled) return;
         page = loadedPage;
         const baseViewport = loadedPage.getViewport({ scale: 1 });
@@ -211,7 +210,10 @@ function PageCanvas({
         const targetScale = fitWidth
           ? Math.max(
               0.25,
-              Math.min(3, (Math.max(containerWidth, 320) - 32) / baseViewport.width),
+              Math.min(
+                3,
+                (Math.max(containerWidth, 320) - 32) / baseViewport.width,
+              ),
             )
           : scale;
         const viewport = loadedPage.getViewport({ scale: targetScale });
@@ -245,7 +247,7 @@ function PageCanvas({
         });
         await textLayer.render();
       })
-      .catch(error => {
+      .catch((error) => {
         if (
           !cancelled &&
           error?.name !== "RenderingCancelledException" &&
@@ -373,10 +375,7 @@ export default function PdfDocumentViewer({
             elapsed < 10_000 ? 1_000 : elapsed < 30_000 ? 2_000 : 5_000;
           timer = setTimeout(async () => {
             try {
-              next = await fetchPreparedStatus(
-                next.assetId,
-                controller.signal,
-              );
+              next = await fetchPreparedStatus(next.assetId, controller.signal);
               if (cancelled) return;
               setAsset(next);
               await poll();
@@ -413,11 +412,12 @@ export default function PdfDocumentViewer({
     const loadingTask = getDocument({
       url: documentUrl,
       withCredentials: true,
+      httpHeaders: deliveryProjectHeaders(),
       rangeChunkSize: 256 * 1024,
     });
     let cancelled = false;
     void loadingTask.promise
-      .then(document => {
+      .then((document) => {
         if (cancelled) {
           void document.destroy();
           return;
@@ -426,7 +426,7 @@ export default function PdfDocumentViewer({
         setCurrentPage(1);
         setPageInput("1");
       })
-      .catch(error => {
+      .catch((error) => {
         if (!cancelled) {
           setLoadingError(error?.message || "PDF 解析失败");
         }
@@ -461,7 +461,11 @@ export default function PdfDocumentViewer({
     setLoadingError(null);
     const response = await fetch(
       `/api/frontmind/assets/${encodeURIComponent(asset.assetId)}/retry`,
-      { method: "POST", credentials: "include" },
+      {
+        method: "POST",
+        credentials: "include",
+        headers: deliveryProjectHeaders(),
+      },
     );
     if (!response.ok) {
       setLoadingError(await readApiError(response));
@@ -469,7 +473,7 @@ export default function PdfDocumentViewer({
     }
     const next = (await response.json()) as PreparedPdfAsset;
     setAsset(next);
-    setPrepareAttempt(value => value + 1);
+    setPrepareAttempt((value) => value + 1);
   }, [asset]);
 
   const handleDownload = useCallback(async () => {
@@ -487,15 +491,14 @@ export default function PdfDocumentViewer({
       const response = await fetch(asset.downloadTokenUrl, {
         method: "POST",
         credentials: "include",
+        headers: deliveryProjectHeaders(),
       });
       if (!response.ok) throw new Error(await readApiError(response));
       const value = await response.json();
       if (!value.downloadUrl) throw new Error("下载链接无效");
       nativeDownload(value.downloadUrl, displayName);
     } catch (error) {
-      setLoadingError(
-        error instanceof Error ? error.message : "文件下载失败",
-      );
+      setLoadingError(error instanceof Error ? error.message : "文件下载失败");
     } finally {
       setIsDownloading(false);
     }
@@ -534,8 +537,8 @@ export default function PdfDocumentViewer({
             <div className="flex items-center gap-1 text-xs text-muted-foreground">
               <Input
                 value={pageInput}
-                onChange={event => setPageInput(event.target.value)}
-                onKeyDown={event => {
+                onChange={(event) => setPageInput(event.target.value)}
+                onKeyDown={(event) => {
                   if (event.key === "Enter") goToPage(Number(pageInput));
                 }}
                 className="h-7 w-12 px-1 text-center text-xs"
@@ -559,7 +562,7 @@ export default function PdfDocumentViewer({
               className="h-8 w-8"
               onClick={() => {
                 setFitWidth(false);
-                setScale(value => Math.max(0.4, value - 0.15));
+                setScale((value) => Math.max(0.4, value - 0.15));
               }}
               aria-label="缩小"
             >
@@ -571,7 +574,7 @@ export default function PdfDocumentViewer({
               className="h-8 w-8"
               onClick={() => {
                 setFitWidth(false);
-                setScale(value => Math.min(3, value + 0.15));
+                setScale((value) => Math.min(3, value + 0.15));
               }}
               aria-label="放大"
             >
@@ -581,7 +584,7 @@ export default function PdfDocumentViewer({
               variant={fitWidth ? "secondary" : "ghost"}
               size="icon"
               className="h-8 w-8"
-              onClick={() => setFitWidth(value => !value)}
+              onClick={() => setFitWidth((value) => !value)}
               aria-label="适应宽度"
             >
               <Maximize2 className="h-4 w-4" />
@@ -649,7 +652,7 @@ export default function PdfDocumentViewer({
           </div>
         ) : (
           <div className="mx-auto w-full max-w-[1500px]">
-            {pageNumbers.map(pageNumber => (
+            {pageNumbers.map((pageNumber) => (
               <PageCanvas
                 key={pageNumber}
                 document={pdfDocument}

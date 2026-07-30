@@ -130,6 +130,8 @@ import {
   type ServicePortalQuestion,
 } from "../shared/service-portal";
 import { accountMarketEditionSchema } from "../shared/account-edition";
+import { deliveryRoleTypeSchema } from "../shared/delivery-roles";
+import { createDeliveryEngineer } from "./delivery-role-service";
 import {
   completeManagedServiceUserProvisioning,
   createManagedServiceUser,
@@ -1530,6 +1532,14 @@ export const adminRouter = router({
               .enum(["system_admin", "delivery_admin"])
               .default("delivery_admin"),
           }),
+          z.object({
+            username: usernameSchema,
+            password: passwordSchema,
+            displayName: z.string().trim().max(128).optional(),
+            role: z.literal("delivery_member"),
+            engineerRoleType: deliveryRoleTypeSchema,
+            apiKey: presalesApiKeySchema.optional(),
+          }),
         ]),
       )
       .mutation(async ({ ctx, input }) => {
@@ -1549,6 +1559,23 @@ export const adminRouter = router({
                 role: user.role,
                 adminAccessLevel: user.adminAccessLevel ?? null,
               },
+            });
+            return {
+              user,
+              setupUrl: null,
+              setupExpiresAt: null,
+              contract: null,
+              assignedToCreator: false,
+            };
+          }
+          if (input.role === "delivery_member") {
+            const user = await createDeliveryEngineer({
+              actor: ctx.user,
+              username: input.username,
+              password: input.password,
+              displayName: input.displayName,
+              engineerRoleType: input.engineerRoleType,
+              apiKey: input.apiKey,
             });
             return {
               user,

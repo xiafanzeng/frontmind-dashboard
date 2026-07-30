@@ -1,9 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type {
-  AuthenticatedUser,
-  DecryptedCredential,
-} from "../auth-service";
+import type { AuthenticatedUser, DecryptedCredential } from "../auth-service";
 import type { FrontMindRequest } from "./express-auth";
 
 const authMocks = vi.hoisted(() => ({
@@ -13,8 +10,7 @@ const authMocks = vi.hoisted(() => ({
 
 vi.mock("../auth-service", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../auth-service")>()),
-  getCredentialForUpstreamResource:
-    authMocks.getCredentialForUpstreamResource,
+  getCredentialForUpstreamResource: authMocks.getCredentialForUpstreamResource,
   getDecryptedCredentialForUser: authMocks.getDecryptedCredentialForUser,
 }));
 
@@ -134,6 +130,7 @@ describe("resolveUpstreamCredential attachment API Key policy", () => {
       7,
       "file",
       "file-shared-key",
+      undefined,
     );
   });
 
@@ -210,7 +207,7 @@ describe("resolveUpstreamCredential attachment API Key policy", () => {
     authMocks.getCredentialForUpstreamResource.mockImplementation(
       async (accountId: number, kind: string, upstreamId: string) =>
         resources.find(
-          resource =>
+          (resource) =>
             resource.accountId === accountId &&
             resource.kind === kind &&
             resource.upstreamId === upstreamId,
@@ -225,16 +222,17 @@ describe("resolveUpstreamCredential attachment API Key policy", () => {
 
     expect(next).not.toHaveBeenCalled();
     expect(
-      resources.find(resource => resource.upstreamId === "file-account-8")
+      resources.find((resource) => resource.upstreamId === "file-account-8")
         ?.credential.apiKey,
     ).toBe(
-      resources.find(resource => resource.upstreamId === "task-current")
+      resources.find((resource) => resource.upstreamId === "task-current")
         ?.credential.apiKey,
     );
     expect(authMocks.getCredentialForUpstreamResource).toHaveBeenCalledWith(
       7,
       "file",
       "file-account-8",
+      undefined,
     );
     expect(res.status).toHaveBeenCalledWith(403);
     expect(res.json).toHaveBeenCalledWith({

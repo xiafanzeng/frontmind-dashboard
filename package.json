@@ -14,7 +14,11 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "pnpm db:generate && pnpm db:migrate",
+    "db:preflight-project-teams": "tsx scripts/preflight-project-team-migration.ts",
+    "db:preflight-three-engineer-roles": "tsx scripts/preflight-three-engineer-roles.ts",
+    "db:purge-icp-materials": "tsx scripts/purge-icp-materials.ts",
     "db:cleanup-expired": "tsx scripts/cleanup-expired-conversations.ts",
+    "kb:reset:siliconflow": "tsx scripts/reset-siliconflow-knowledge-base.ts",
     "admin:init": "tsx scripts/init-admin.ts",
     "runtime:preflight": "node scripts/validate-production-runtime.mjs"
   },

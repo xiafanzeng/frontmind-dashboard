@@ -1,8 +1,10 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  mutateAsync: vi.fn(),
+  createUser: vi.fn(),
+  setEngineerApiKey: vi.fn(),
+  revokeEngineerApiKey: vi.fn(),
   invalidateUsers: vi.fn(),
   invalidateWorkspace: vi.fn(),
 }));
@@ -19,7 +21,25 @@ vi.mock("@/lib/trpc", () => ({
       users: {
         create: {
           useMutation: () => ({
-            mutateAsync: mocks.mutateAsync,
+            mutateAsync: mocks.createUser,
+            isPending: false,
+            reset: vi.fn(),
+          }),
+        },
+      },
+    },
+    delivery: {
+      management: {
+        setEngineerApiKey: {
+          useMutation: () => ({
+            mutateAsync: mocks.setEngineerApiKey,
+            isPending: false,
+            reset: vi.fn(),
+          }),
+        },
+        revokeEngineerApiKey: {
+          useMutation: () => ({
+            mutateAsync: mocks.revokeEngineerApiKey,
             isPending: false,
             reset: vi.fn(),
           }),
@@ -29,7 +49,7 @@ vi.mock("@/lib/trpc", () => ({
   },
 }));
 
-import { CreateUserDialog } from "./AdminUsers";
+import { CreateUserDialog, EngineerApiKeyDialog, UserRow } from "./AdminUsers";
 
 const deliveryAdmins = [
   {
@@ -40,6 +60,10 @@ const deliveryAdmins = [
 ];
 
 describe("CreateUserDialog", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("requires an initial password, plan and customer API Key for immediate activation", () => {
     render(
       <CreateUserDialog
@@ -99,6 +123,11 @@ describe("CreateUserDialog", () => {
 
     expect(screen.getByText("账号角色")).toBeInTheDocument();
     expect(screen.getByText("客户套餐")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("combobox", { name: "账号角色" }));
+    expect(screen.getByRole("option", { name: "客户" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "管理员" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "工程师" })).toBeInTheDocument();
   });
 
   it("automatically fixes a delivery administrator as the new customer's owner", () => {
@@ -115,5 +144,134 @@ describe("CreateUserDialog", () => {
     expect(screen.getByText(/交付负责人/)).toBeInTheDocument();
     expect(screen.getByText(/自动归属当前账号/)).toBeInTheDocument();
     expect(screen.getByText(/自动归属当前交付管理员/)).toBeInTheDocument();
+  });
+
+  it("lets delivery administrators create customers or engineers, but not administrators", () => {
+    render(
+      <CreateUserDialog
+        open
+        userOnly
+        allowEngineer
+        fixedDeliveryAdmin={deliveryAdmins[0]}
+        onOpenChange={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("combobox", { name: "账号角色" }));
+    expect(screen.getByRole("option", { name: "客户" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "工程师" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "管理员" })).toBeNull();
+  });
+
+  it("requires one fixed engineer role and keeps the engineer API Key optional", async () => {
+    mocks.createUser.mockResolvedValue({ user: { id: 88 } });
+    render(<CreateUserDialog open onOpenChange={() => undefined} />);
+
+    fireEvent.click(screen.getByRole("combobox", { name: "账号角色" }));
+    fireEvent.click(screen.getByRole("option", { name: "工程师" }));
+
+    expect(screen.getByText("工程师 API Key（可选）")).toBeInTheDocument();
+    expect(screen.getByLabelText("工程师 API Key（可选）")).toHaveAttribute(
+      "type",
+      "password",
+    );
+    expect(
+      screen.getByRole("button", { name: "创建工程师账号" }),
+    ).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("combobox", { name: "工程师岗位" }));
+    expect(
+      screen.getByRole("option", { name: "AI 运维工程师" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: "AI 监控与优化工程师" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: "AI 内容分发工程师" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "AI 运维工程师" }));
+
+    fireEvent.change(screen.getByLabelText("用户名"), {
+      target: { value: "engineer.one" },
+    });
+    fireEvent.change(screen.getByLabelText("初始密码"), {
+      target: { value: "secret1" },
+    });
+    fireEvent.change(screen.getByLabelText("确认初始密码"), {
+      target: { value: "secret1" },
+    });
+    const submit = screen.getByRole("button", { name: "创建工程师账号" });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(mocks.createUser).toHaveBeenCalledWith({
+        username: "engineer.one",
+        displayName: undefined,
+        password: "secret1",
+        role: "delivery_member",
+        engineerRoleType: "ai_operations_engineer",
+        apiKey: undefined,
+      }),
+    );
+  });
+});
+
+describe("engineer account management", () => {
+  const engineer = {
+    id: 88,
+    username: "engineer.one",
+    displayName: "工程师一号",
+    role: "delivery_member" as const,
+    adminAccessLevel: null,
+    engineerRoleType: "ai_operations_engineer" as const,
+    engineerApiKeyConfigured: false,
+    marketEdition: "domestic" as const,
+    isActive: true,
+  };
+
+  it("shows the fixed role, Key warning and Key management action in the account list", () => {
+    render(
+      <UserRow
+        account={engineer}
+        isCurrent={false}
+        pending={false}
+        accessPending={false}
+        onResetPassword={() => undefined}
+        onChangeAccessLevel={() => undefined}
+        onChangeStatus={() => undefined}
+        onManageApiKey={() => undefined}
+        onDelete={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("工程师")).toBeInTheDocument();
+    expect(screen.getByText("AI 运维工程师")).toBeInTheDocument();
+    expect(screen.getByText("Key 未配置")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "管理 Key" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps raw engineer Keys hidden and allows configuration from the account page", async () => {
+    mocks.setEngineerApiKey.mockResolvedValue({});
+    render(
+      <EngineerApiKeyDialog user={engineer} onOpenChange={() => undefined} />,
+    );
+
+    const input = screen.getByLabelText("API Key");
+    expect(input).toHaveAttribute("type", "password");
+    expect(screen.getByText("当前状态：")).toHaveTextContent("未配置");
+    expect(screen.getByRole("button", { name: "撤销 Key" })).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: "sk-engineer-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "验证并配置" }));
+
+    await waitFor(() =>
+      expect(mocks.setEngineerApiKey).toHaveBeenCalledWith({
+        engineerUserId: 88,
+        apiKey: "sk-engineer-secret",
+      }),
+    );
   });
 });

@@ -10,6 +10,8 @@ import {
   Users,
   Loader2,
   Trash2,
+  AlertTriangle,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -26,7 +28,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { trpc } from "@/lib/trpc";
-import { DELIVERY_ROLE_STORAGE_KEY } from "@/lib/frontmind-api";
+import { DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY } from "@/lib/frontmind-api";
 import {
   channelDistributionUrl,
   issueMonitorUrl,
@@ -53,11 +55,11 @@ export const deliveryMemberNav: PortalNavItem[] = [
 ];
 
 const ROLE_PANELS: Record<DeliveryRoleType, string[]> = {
-  knowledge_base_engineer: [
-    "企业资料摘要",
-    "知识库构建进度",
-    "知识库对话与节点",
-    "知识库展示版本",
+  ai_operations_engineer: [
+    "知识库构建与异常",
+    "知识库版本与重置",
+    "域名与 ICP 结果",
+    "官网内容发布与站点检查",
   ],
   monitoring_optimization_engineer: [
     "品牌全域词库与问题目录",
@@ -70,12 +72,6 @@ const ROLE_PANELS: Record<DeliveryRoleType, string[]> = {
     "AI 友好内容资产",
     "内容板块与卡片",
     "媒体发布与分发结果",
-  ],
-  website_operations_engineer: [
-    "域名与 ICP 备案",
-    "官网资料和内容模板",
-    "站点检查",
-    "目标页面与发布链接",
   ],
 };
 
@@ -134,31 +130,39 @@ export default function DeliveryMemberDashboard({
 }: {
   taskHistory?: boolean;
 }) {
-  const rolesQuery = trpc.delivery.mine.roles.useQuery();
-  const [roleAssignmentId, setRoleAssignmentId] = useState(() =>
+  const assignmentsQuery = trpc.delivery.mine.assignments.useQuery();
+  const [projectAssignmentId, setProjectAssignmentId] = useState(() =>
     typeof window === "undefined"
       ? ""
-      : localStorage.getItem(DELIVERY_ROLE_STORAGE_KEY) || "",
+      : sessionStorage.getItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY) || "",
+  );
+  const currentAssignment = assignmentsQuery.data?.find(
+    (assignment) => assignment.projectAssignmentId === projectAssignmentId,
   );
   useEffect(() => {
+    if (!assignmentsQuery.data) return;
+    if (!assignmentsQuery.data.length) {
+      sessionStorage.removeItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY);
+      setProjectAssignmentId("");
+      return;
+    }
     if (
-      rolesQuery.data?.length &&
-      !rolesQuery.data.some((role) => role.assignmentId === roleAssignmentId)
+      !assignmentsQuery.data.some(
+        (assignment) => assignment.projectAssignmentId === projectAssignmentId,
+      )
     ) {
-      setRoleAssignmentId(rolesQuery.data[0]!.assignmentId);
+      const nextProjectAssignmentId =
+        assignmentsQuery.data[0]!.projectAssignmentId;
+      sessionStorage.setItem(
+        DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+        nextProjectAssignmentId,
+      );
+      setProjectAssignmentId(nextProjectAssignmentId);
     }
-  }, [roleAssignmentId, rolesQuery.data]);
-  useEffect(() => {
-    if (roleAssignmentId) {
-      localStorage.setItem(DELIVERY_ROLE_STORAGE_KEY, roleAssignmentId);
-    }
-  }, [roleAssignmentId]);
+  }, [assignmentsQuery.data, projectAssignmentId]);
   const workbench = trpc.delivery.mine.workbench.useQuery(
-    { roleAssignmentId },
-    { enabled: Boolean(roleAssignmentId) },
-  );
-  const currentRole = rolesQuery.data?.find(
-    (role) => role.assignmentId === roleAssignmentId,
+    { projectAssignmentId },
+    { enabled: Boolean(currentAssignment) },
   );
   const tickets = useMemo(
     () =>
@@ -170,26 +174,137 @@ export default function DeliveryMemberDashboard({
     [taskHistory, workbench.data?.tickets],
   );
   const external =
-    currentRole?.roleType === "monitoring_optimization_engineer"
+    currentAssignment?.roleType === "monitoring_optimization_engineer"
       ? { label: "打开问题监控", href: issueMonitorUrl, icon: Activity }
-      : currentRole?.roleType === "content_distribution_engineer"
+      : currentAssignment?.roleType === "content_distribution_engineer"
         ? { label: "打开渠道分发", href: channelDistributionUrl, icon: Send }
         : null;
+  const projectToolbar = assignmentsQuery.data?.length ? (
+    <div className="flex items-center gap-2">
+      <select
+        aria-label="当前客户项目"
+        className="h-10 rounded-md border bg-card px-3 text-sm"
+        value={projectAssignmentId}
+        onChange={(event) => {
+          sessionStorage.setItem(
+            DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+            event.target.value,
+          );
+          setProjectAssignmentId(event.target.value);
+        }}
+      >
+        {assignmentsQuery.data.map((assignment) => (
+          <option
+            key={assignment.projectAssignmentId}
+            value={assignment.projectAssignmentId}
+          >
+            {assignment.customerName || assignment.customerUsername} ·{" "}
+            {DELIVERY_ROLE_LABELS[assignment.roleType]}
+          </option>
+        ))}
+      </select>
+      {external && (
+        <a
+          href={external.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
+        >
+          <external.icon className="h-4 w-4" />
+          {external.label}
+        </a>
+      )}
+    </div>
+  ) : undefined;
 
-  if (!rolesQuery.isLoading && !rolesQuery.data?.length) {
+  if (assignmentsQuery.error) {
     return (
       <PortalShell
-        eyebrow="交付成员"
+        eyebrow="工程师"
+        title={taskHistory ? "我的任务记录" : "我的工作台"}
+        navItems={deliveryMemberNav}
+      >
+        <Card className="mx-auto max-w-xl">
+          <CardContent className="py-14 text-center">
+            <AlertTriangle className="mx-auto h-8 w-8 text-destructive" />
+            <p className="mt-4 font-medium">客户项目读取失败</p>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {assignmentsQuery.error.message || "请检查网络连接后重试。"}
+            </p>
+            <Button
+              className="mt-5"
+              variant="outline"
+              onClick={() => void assignmentsQuery.refetch()}
+            >
+              <RefreshCw className="h-4 w-4" />
+              重试
+            </Button>
+          </CardContent>
+        </Card>
+      </PortalShell>
+    );
+  }
+
+  if (assignmentsQuery.isLoading) {
+    return (
+      <PortalShell
+        eyebrow="工程师"
+        title={taskHistory ? "我的任务记录" : "我的工作台"}
+        navItems={deliveryMemberNav}
+      >
+        <Card className="mx-auto max-w-xl">
+          <CardContent className="py-14 text-center text-sm text-muted-foreground">
+            <Loader2 className="mx-auto mb-3 h-7 w-7 animate-spin" />
+            正在载入客户项目
+          </CardContent>
+        </Card>
+      </PortalShell>
+    );
+  }
+
+  if (!assignmentsQuery.isLoading && !assignmentsQuery.data?.length) {
+    return (
+      <PortalShell
+        eyebrow="工程师"
         title="我的工作台"
         navItems={deliveryMemberNav}
       >
         <Card className="mx-auto max-w-xl">
           <CardContent className="py-14 text-center">
             <Users className="mx-auto h-8 w-8 text-muted-foreground" />
-            <p className="mt-4 font-medium">尚未分配工作角色</p>
-            <p className="mt-2 text-sm text-muted-foreground">
-              请联系交付管理员，将你的账号加入固定角色团队。
+            <p className="mt-4 font-medium">
+              尚未分配客户项目，请联系交付管理员
             </p>
+          </CardContent>
+        </Card>
+      </PortalShell>
+    );
+  }
+
+  if (currentAssignment && workbench.error) {
+    return (
+      <PortalShell
+        eyebrow="工程师 · 客户项目工作台"
+        title={taskHistory ? "我的任务记录" : "我的工作台"}
+        navItems={deliveryMemberNav}
+        roleLabel={`${currentAssignment.customerName || currentAssignment.customerUsername} · ${DELIVERY_ROLE_LABELS[currentAssignment.roleType]}`}
+        toolbar={projectToolbar}
+      >
+        <Card className="mx-auto max-w-xl">
+          <CardContent className="py-14 text-center">
+            <AlertTriangle className="mx-auto h-8 w-8 text-destructive" />
+            <p className="mt-4 font-medium">项目工作台读取失败</p>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {workbench.error.message || "请检查网络连接后重试。"}
+            </p>
+            <Button
+              className="mt-5"
+              variant="outline"
+              onClick={() => void workbench.refetch()}
+            >
+              <RefreshCw className="h-4 w-4" />
+              重试
+            </Button>
           </CardContent>
         </Card>
       </PortalShell>
@@ -198,45 +313,19 @@ export default function DeliveryMemberDashboard({
 
   return (
     <PortalShell
-      eyebrow="交付成员 · 角色隔离工作台"
+      eyebrow="工程师 · 客户项目工作台"
       title={taskHistory ? "我的任务记录" : "我的工作台"}
       navItems={deliveryMemberNav}
       roleLabel={
-        currentRole
-          ? `${DELIVERY_ROLE_LABELS[currentRole.roleType]} · ${currentRole.teamName}`
+        currentAssignment
+          ? `${currentAssignment.customerName || currentAssignment.customerUsername} · ${DELIVERY_ROLE_LABELS[currentAssignment.roleType]}`
           : undefined
       }
-      toolbar={
-        <div className="flex items-center gap-2">
-          <select
-            aria-label="当前工作角色"
-            className="h-10 rounded-md border bg-card px-3 text-sm"
-            value={roleAssignmentId}
-            onChange={(event) => setRoleAssignmentId(event.target.value)}
-          >
-            {(rolesQuery.data ?? []).map((role) => (
-              <option key={role.assignmentId} value={role.assignmentId}>
-                {DELIVERY_ROLE_LABELS[role.roleType]} · {role.teamName}
-              </option>
-            ))}
-          </select>
-          {external && (
-            <a
-              href={external.href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
-            >
-              <external.icon className="h-4 w-4" />
-              {external.label}
-            </a>
-          )}
-        </div>
-      }
+      toolbar={projectToolbar}
     >
-      {currentRole && !taskHistory && (
+      {currentAssignment && !taskHistory && (
         <div className="mb-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-          {ROLE_PANELS[currentRole.roleType].map((panel) => (
+          {ROLE_PANELS[currentAssignment.roleType].map((panel) => (
             <Card key={panel}>
               <CardContent className="flex min-h-24 items-center p-5 font-medium">
                 {panel}
@@ -249,7 +338,7 @@ export default function DeliveryMemberDashboard({
       <div className="grid gap-5 xl:grid-cols-[0.75fr_1.25fr]">
         <Card>
           <CardHeader>
-            <CardTitle>我的客户</CardTitle>
+            <CardTitle>当前客户项目</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2">
             {(workbench.data?.customers ?? []).map((customer) => (
@@ -278,7 +367,7 @@ export default function DeliveryMemberDashboard({
             ))}
             {!workbench.data?.customers.length && (
               <p className="py-8 text-center text-sm text-muted-foreground">
-                当前角色尚未分配客户
+                当前客户项目暂无可用资料
               </p>
             )}
           </CardContent>
@@ -305,7 +394,7 @@ export default function DeliveryMemberDashboard({
                 {ticket.operation === "knowledge_reset" &&
                   ticket.status === "submitted" && (
                     <KnowledgeResetDecision
-                      roleAssignmentId={roleAssignmentId}
+                      projectAssignmentId={projectAssignmentId}
                       requestId={ticket.clientRequestId}
                       onDone={() => workbench.refetch()}
                     />
@@ -313,7 +402,7 @@ export default function DeliveryMemberDashboard({
                 {ticket.operation !== "knowledge_reset" &&
                   ticket.status !== "completed" && (
                     <DeliveryTicketActions
-                      roleAssignmentId={roleAssignmentId}
+                      projectAssignmentId={projectAssignmentId}
                       ticket={ticket}
                       onDone={() => workbench.refetch()}
                     />
@@ -334,11 +423,11 @@ export default function DeliveryMemberDashboard({
 }
 
 function DeliveryTicketActions({
-  roleAssignmentId,
+  projectAssignmentId,
   ticket,
   onDone,
 }: {
-  roleAssignmentId: string;
+  projectAssignmentId: string;
   ticket: any;
   onDone: () => Promise<unknown>;
 }) {
@@ -357,7 +446,7 @@ function DeliveryTicketActions({
           "x-file-name": encodeURIComponent(file.name),
           "x-import-mode": "knowledge",
           "x-maintenance-ticket-id": ticket.id,
-          "x-delivery-role-assignment-id": roleAssignmentId,
+          "x-delivery-project-assignment-id": projectAssignmentId,
         },
         body: file,
       });
@@ -393,7 +482,7 @@ function DeliveryTicketActions({
           "x-import-mode": "dashboard",
           "x-dashboard-module": moduleImport.module,
           "x-dashboard-revision": String(ticket.dashboardRevision),
-          "x-delivery-role-assignment-id": roleAssignmentId,
+          "x-delivery-project-assignment-id": projectAssignmentId,
           "x-delivery-ticket-id": ticket.id,
         };
         if (input.preview) headers["x-import-preview"] = "true";
@@ -706,7 +795,7 @@ function DeliveryTicketActions({
     }
     try {
       await update.mutateAsync({
-        roleAssignmentId,
+        projectAssignmentId,
         ticketId: ticket.id,
         expectedRevision: ticket.revision,
         status,
@@ -790,11 +879,11 @@ function DeliveryTicketActions({
 }
 
 function KnowledgeResetDecision({
-  roleAssignmentId,
+  projectAssignmentId,
   requestId,
   onDone,
 }: {
-  roleAssignmentId: string;
+  projectAssignmentId: string;
   requestId: string;
   onDone: () => Promise<unknown>;
 }) {
@@ -802,7 +891,7 @@ function KnowledgeResetDecision({
   const [confirmed, setConfirmed] = useState(false);
   const [decisionNote, setDecisionNote] = useState("");
   const preview = trpc.delivery.mine.knowledgeResetPreview.useQuery(
-    { roleAssignmentId, requestId },
+    { projectAssignmentId, requestId },
     { enabled: open },
   );
   const decide = trpc.delivery.mine.decideKnowledgeReset.useMutation();
@@ -818,7 +907,7 @@ function KnowledgeResetDecision({
     }
     try {
       await decide.mutateAsync({
-        roleAssignmentId,
+        projectAssignmentId,
         requestId,
         expectedRevision: preview.data.expectedRevision,
         decision,
@@ -851,7 +940,7 @@ function KnowledgeResetDecision({
           <DialogHeader>
             <DialogTitle>知识库重置审批</DialogTitle>
             <DialogDescription>
-              只有该客户当前负责的 AI 知识库工程师可以执行。批准后正文、
+              只有该客户当前负责的 AI 运维工程师可以执行。批准后正文、
               历史快照和上传文件内容不会保留。
             </DialogDescription>
           </DialogHeader>

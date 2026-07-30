@@ -255,8 +255,8 @@ describe("useSendMessage", () => {
     mocks.createTask.mockReturnValueOnce(pendingTask);
 
     const { result } = renderHook(() => useSendMessage());
-    let firstSend!: Promise<void>;
-    let secondSend!: Promise<void>;
+    let firstSend!: Promise<boolean>;
+    let secondSend!: Promise<boolean>;
 
     await act(async () => {
       firstSend = result.current.sendMessage("first", []);

@@ -136,27 +136,37 @@ Badges do not satisfy product-family visual coverage.
 
 ## Confirmation state
 
-When the service supplies `FRONTMIND_KB_MANIFEST`, `FRONTMIND_KB_PROGRESS` or
-`FRONTMIND_KB_REOPEN`, follow it exactly.
+When the service supplies `FRONTMIND_KB_MANIFEST`, `FRONTMIND_KB_PROGRESS`,
+`FRONTMIND_KB_PRESENTATION` or `FRONTMIND_KB_REOPEN`, follow it exactly.
 
 1. The first turn researches, builds the full tree and all prefilled formal
    drafts, then presents only the first leaf and one manifest envelope.
-2. Later turns present and process exactly the service-designated current leaf.
+2. A later turn processes the pre-turn current leaf but presents the
+   post-transition current leaf. After confirming or directly prefilling A,
+   acknowledge A in one short sentence and make the customer-visible body a
+   complete presentation of B. Never leave A as the body after advancing.
 3. Only explicit confirmation becomes `confirmed`.
 4. Only explicit “跳过/直接预填/采用预填/保留预填” becomes
    `direct_prefilled`.
 5. Corrections, supplements, questions and uploads remain
-   `needs_verification`; update and re-present the same leaf.
+   `needs_verification`; update and re-present the same leaf. Any turn with an
+   attachment is a supplement even if its text says “确认”.
 6. Never bulk-confirm, skip a branch, fabricate progress or offer early
    packaging. Progress is `(confirmed + direct_prefilled) / total`.
-7. After 100%, later corrections reopen only the most relevant existing leaf.
+7. Every non-initial turn emits exactly one progress/reopen envelope followed
+   by exactly one `FRONTMIND_KB_PRESENTATION` envelope. The presentation
+   revision is the post-transition revision and its `leafId` is the leaf
+   actually shown in the body. Use `null` after the last leaf is completed.
+8. After 100%, later corrections reopen only the most relevant existing leaf.
 
 Use normal Markdown, not ASCII trees or simulated interfaces.
 
 ## Final ZIP
 
-At 100% traversal, create a new candidate ZIP with `schemaVersion: 3` and
-`profile: "dashboard-enterprise-v1"`. Preserve the existing
+When processing the final leaf and the accepted transition will bring traversal
+to 100%, create and return the one new candidate ZIP in that same turn with
+`schemaVersion: 3` and `profile: "dashboard-enterprise-v1"`. Never wait for a
+later turn to package. Preserve the existing
 `00_completeness.json` raw-count contract. Include:
 
 - `README.md`, `00_knowledge_tree.md`, `00_completeness.json`,

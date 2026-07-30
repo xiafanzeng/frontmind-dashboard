@@ -16,10 +16,12 @@ import {
   type MessageMetadata,
 } from "../drizzle/schema";
 import {
+  type AuthenticatedUser,
   credentialMayServeAccount,
   getEffectiveDecryptedCredentialForAccount,
   isUpstreamApiKeyShared,
 } from "./auth-service";
+import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getDb } from "./db";
 import { protectedProcedure, router } from "./_core/trpc";
 import { getUpstreamBaseUrl } from "./upstream-config";
@@ -129,15 +131,63 @@ export function collectSnapshotResourceRefs(
   return Array.from(resources.values());
 }
 
-function storageId(userId: number, publicId: string) {
-  return `u${userId}:${publicId}`;
+function conversationStoragePrefix(
+  userId: number,
+  projectAssignmentId: string | null,
+) {
+  return projectAssignmentId ? `p${projectAssignmentId}:` : `u${userId}:`;
 }
 
-function publicId(userId: number, persistedId: string) {
-  const prefix = `u${userId}:`;
+function storageId(
+  userId: number,
+  publicId: string,
+  projectAssignmentId: string | null = null,
+) {
+  return `${conversationStoragePrefix(userId, projectAssignmentId)}${publicId}`;
+}
+
+function publicId(
+  userId: number,
+  persistedId: string,
+  projectAssignmentId: string | null = null,
+) {
+  const prefix = conversationStoragePrefix(userId, projectAssignmentId);
   return persistedId.startsWith(prefix)
     ? persistedId.slice(prefix.length)
     : persistedId;
+}
+
+async function resolveConversationProjectAssignment(
+  user: AuthenticatedUser,
+  projectAssignmentId: string | undefined,
+) {
+  if (user.role !== "delivery_member") {
+    if (projectAssignmentId) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: "当前账号不能使用工程师项目上下文",
+      });
+    }
+    return null;
+  }
+  if (!projectAssignmentId) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "请先选择当前客户项目",
+    });
+  }
+  try {
+    await assertDeliveryProjectContext({
+      actor: user,
+      projectAssignmentId,
+    });
+  } catch {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "当前客户项目岗位不存在或已停用",
+    });
+  }
+  return projectAssignmentId;
 }
 
 function asDate(value: number | undefined): Date | null {
@@ -165,13 +215,19 @@ export async function permanentlyDeleteConversation(
   executor: any,
   userId: number,
   persistedConversationId: string,
+  projectAssignmentId: string | null = null,
 ) {
   await executor
     .delete(conversations)
     .where(
       and(
         eq(conversations.id, persistedConversationId),
-        eq(conversations.userId, userId),
+        projectAssignmentId
+          ? eq(conversations.projectAssignmentId, projectAssignmentId)
+          : and(
+              eq(conversations.userId, userId),
+              isNull(conversations.projectAssignmentId),
+            ),
       ),
     );
 }
@@ -230,12 +286,14 @@ export async function getActiveCredentialId(executor: any, userId: number) {
 async function assertResourceOwnership(
   executor: any,
   userId: number,
+  projectAssignmentId: string | null,
   kind: "task" | "file",
   upstreamId: string,
 ) {
   const rows = await executor
     .select({
       userId: upstreamResources.userId,
+      projectAssignmentId: upstreamResources.projectAssignmentId,
       apiCredentialId: upstreamResources.apiCredentialId,
     })
     .from(upstreamResources)
@@ -246,7 +304,10 @@ async function assertResourceOwnership(
       ),
     )
     .limit(1);
-  if (rows[0] && rows[0].userId !== userId) {
+  const owned = projectAssignmentId
+    ? rows[0]?.projectAssignmentId === projectAssignmentId
+    : rows[0]?.userId === userId && rows[0]?.projectAssignmentId == null;
+  if (rows[0] && !owned) {
     throw new TRPCError({
       code: "FORBIDDEN",
       message: "上游资源不属于当前账号",
@@ -259,12 +320,14 @@ type SnapshotResourceBinding = {
   kind: "task" | "file";
   upstreamId: string;
   apiCredentialId: string;
+  projectAssignmentId: string | null;
   createdAt?: Date;
 };
 
 async function loadSnapshotResourceBindings(
   executor: any,
   userId: number,
+  projectAssignmentId: string | null,
   snapshot: ConversationSnapshot,
 ) {
   const bindings = new Map<string, SnapshotResourceBinding>();
@@ -287,6 +350,7 @@ async function loadSnapshotResourceBindings(
     const rows = await executor
       .select({
         userId: upstreamResources.userId,
+        projectAssignmentId: upstreamResources.projectAssignmentId,
         kind: upstreamResources.kind,
         upstreamId: upstreamResources.upstreamId,
         apiCredentialId: upstreamResources.apiCredentialId,
@@ -300,7 +364,10 @@ async function loadSnapshotResourceBindings(
         ),
       );
     for (const row of rows) {
-      if (row.userId !== userId) {
+      const owned = projectAssignmentId
+        ? row.projectAssignmentId === projectAssignmentId
+        : row.userId === userId && row.projectAssignmentId == null;
+      if (!owned) {
         throw new TRPCError({
           code: "FORBIDDEN",
           message: "上游资源不属于当前账号",
@@ -310,6 +377,7 @@ async function loadSnapshotResourceBindings(
         kind,
         upstreamId: row.upstreamId,
         apiCredentialId: row.apiCredentialId,
+        projectAssignmentId: row.projectAssignmentId,
         createdAt: row.createdAt,
       });
     }
@@ -339,11 +407,14 @@ export async function resolveSnapshotCredentialId(
   options: {
     existingCredentialId?: string | null;
     importCredentialId?: string;
+    projectAssignmentId?: string | null;
   } = {},
 ) {
+  const projectAssignmentId = options.projectAssignmentId ?? null;
   const bindings = await loadSnapshotResourceBindings(
     executor,
     userId,
+    projectAssignmentId,
     snapshot,
   );
   const primaryTaskId = snapshot.taskId ?? snapshot.previousResponseId;
@@ -488,6 +559,7 @@ export function mergeConversationTaskPointers(
 async function resolveTaskPointersForSnapshot(
   executor: any,
   userId: number,
+  projectAssignmentId: string | null,
   existing: {
     upstreamTaskId: string | null;
     previousResponseId: string | null;
@@ -511,6 +583,7 @@ async function resolveTaskPointersForSnapshot(
     const rows = await executor
       .select({
         userId: upstreamResources.userId,
+        projectAssignmentId: upstreamResources.projectAssignmentId,
         upstreamId: upstreamResources.upstreamId,
         createdAt: upstreamResources.createdAt,
       })
@@ -522,7 +595,10 @@ async function resolveTaskPointersForSnapshot(
         ),
       );
     for (const row of rows) {
-      if (row.userId !== userId) {
+      const owned = projectAssignmentId
+        ? row.projectAssignmentId === projectAssignmentId
+        : row.userId === userId && row.projectAssignmentId == null;
+      if (!owned) {
         throw new TRPCError({
           code: "FORBIDDEN",
           message: "上游资源不属于当前账号",
@@ -605,6 +681,7 @@ async function persistResource(
   input: {
     userId: number;
     apiCredentialId: string;
+    projectAssignmentId: string | null;
     kind: "task" | "file";
     upstreamId: string;
     conversationId: string;
@@ -614,6 +691,7 @@ async function persistResource(
   const existing = await assertResourceOwnership(
     executor,
     input.userId,
+    input.projectAssignmentId,
     input.kind,
     input.upstreamId,
   );
@@ -634,6 +712,7 @@ async function persistResource(
       id: randomUUID(),
       userId: input.userId,
       apiCredentialId: input.apiCredentialId,
+      projectAssignmentId: input.projectAssignmentId,
       kind: input.kind,
       upstreamId: input.upstreamId,
       conversationId: input.conversationId,
@@ -645,6 +724,7 @@ async function persistResource(
   await assertResourceOwnership(
     executor,
     input.userId,
+    input.projectAssignmentId,
     input.kind,
     input.upstreamId,
   );
@@ -675,13 +755,14 @@ async function loadPersistedMessages(
   executor: any,
   userId: number,
   conversationId: string,
+  projectAssignmentId: string | null,
 ): Promise<ConversationSnapshot["messages"]> {
   const messageRows = await executor
     .select()
     .from(messages)
     .where(
       and(
-        eq(messages.userId, userId),
+        projectAssignmentId ? undefined : eq(messages.userId, userId),
         eq(messages.conversationId, conversationId),
         isNull(messages.deletedAt),
       ),
@@ -696,7 +777,7 @@ async function loadPersistedMessages(
           .from(attachments)
           .where(
             and(
-              eq(attachments.userId, userId),
+              projectAssignmentId ? undefined : eq(attachments.userId, userId),
               inArray(attachments.messageId, messageIds),
               isNull(attachments.deletedAt),
             ),
@@ -711,7 +792,7 @@ async function loadPersistedMessages(
   return messageRows.map((message: typeof messages.$inferSelect) => {
     const metadata = (message.metadata ?? {}) as MessageMetadata;
     return {
-      id: publicId(userId, message.id),
+      id: publicId(userId, message.id, projectAssignmentId),
       role:
         message.role === "assistant"
           ? ("assistant" as const)
@@ -720,7 +801,7 @@ async function loadPersistedMessages(
       timestamp: message.sentAt.getTime(),
       attachments: (attachmentsByMessage.get(message.id) ?? []).map(
         (attachment: typeof attachments.$inferSelect) => ({
-          id: publicId(userId, attachment.id),
+          id: publicId(userId, attachment.id, projectAssignmentId),
           type: attachment.kind,
           name: attachment.fileName,
           ...(attachment.upstreamFileId
@@ -860,8 +941,10 @@ async function persistSnapshot(
     skipExisting?: boolean;
     importCredentialId?: string;
     validatedResourceKeys?: ReadonlySet<string>;
+    projectAssignmentId?: string | null;
   } = {},
 ): Promise<"imported" | "skipped" | "updated"> {
+  const projectAssignmentId = options.projectAssignmentId ?? null;
   const lockedKnowledgeBuilds = await executor
     .select({ id: knowledgeBaseBuilds.id })
     .from(knowledgeBaseBuilds)
@@ -908,7 +991,11 @@ async function persistSnapshot(
       message: "该知识库会话已被重置，不能从旧页面重新同步",
     });
   }
-  const persistedConversationId = storageId(userId, snapshot.id);
+  const persistedConversationId = storageId(
+    userId,
+    snapshot.id,
+    projectAssignmentId,
+  );
   const existingRows = await executor
     .select()
     .from(conversations)
@@ -920,7 +1007,10 @@ async function persistSnapshot(
     .for("update");
   const existing = existingRows[0];
 
-  if (existing && existing.userId !== userId) {
+  const existingOwned = projectAssignmentId
+    ? existing?.projectAssignmentId === projectAssignmentId
+    : existing?.userId === userId && existing?.projectAssignmentId == null;
+  if (existing && !existingOwned) {
     throw new TRPCError({
       code: "FORBIDDEN",
       message: "会话 ID 已属于其他账号",
@@ -943,10 +1033,12 @@ async function persistSnapshot(
       executor,
       userId,
       persistedConversationId,
+      projectAssignmentId,
     );
     const taskPointers = await resolveTaskPointersForSnapshot(
       executor,
       userId,
+      projectAssignmentId,
       existing,
       persistedMessages,
       snapshot,
@@ -979,12 +1071,14 @@ async function persistSnapshot(
     await resolveSnapshotCredentialId(executor, userId, snapshot, {
       existingCredentialId: existing?.apiCredentialId,
       importCredentialId: options.importCredentialId,
+      projectAssignmentId,
     });
   const apiCredentialId = resolvedCredentialId ?? null;
 
   const conversationValues = {
     userId,
     apiCredentialId,
+    projectAssignmentId,
     title: snapshot.title,
     status: snapshot.status,
     upstreamTaskId: snapshot.taskId ?? null,
@@ -1005,7 +1099,12 @@ async function persistSnapshot(
       .where(
         and(
           eq(conversations.id, persistedConversationId),
-          eq(conversations.userId, userId),
+          projectAssignmentId
+            ? eq(conversations.projectAssignmentId, projectAssignmentId)
+            : and(
+                eq(conversations.userId, userId),
+                isNull(conversations.projectAssignmentId),
+              ),
         ),
       );
   } else {
@@ -1017,7 +1116,7 @@ async function persistSnapshot(
   }
 
   const incomingMessageIds = snapshot.messages.map((message) =>
-    storageId(userId, message.id),
+    storageId(userId, message.id, projectAssignmentId),
   );
   if (incomingMessageIds.length > 0) {
     const collisions = await executor
@@ -1031,7 +1130,7 @@ async function persistSnapshot(
     if (
       collisions.some(
         (row: { conversationId: string; userId: number }) =>
-          row.userId !== userId ||
+          (!projectAssignmentId && row.userId !== userId) ||
           row.conversationId !== persistedConversationId,
       )
     ) {
@@ -1053,7 +1152,7 @@ async function persistSnapshot(
     const message = snapshot.messages[sequence];
     const sentAt = asDate(message.timestamp) ?? new Date();
     await executor.insert(messages).values({
-      id: storageId(userId, message.id),
+      id: storageId(userId, message.id, projectAssignmentId),
       conversationId: persistedConversationId,
       userId,
       role: message.role,
@@ -1075,10 +1174,10 @@ async function persistSnapshot(
             : apiCredentialId))
         : apiCredentialId;
       await executor.insert(attachments).values({
-        id: storageId(userId, attachment.id),
+        id: storageId(userId, attachment.id, projectAssignmentId),
         userId,
         conversationId: persistedConversationId,
-        messageId: storageId(userId, message.id),
+        messageId: storageId(userId, message.id, projectAssignmentId),
         apiCredentialId: attachmentCredentialId,
         kind: attachment.type,
         fileName: attachment.name,
@@ -1090,6 +1189,7 @@ async function persistSnapshot(
           {
             userId,
             apiCredentialId: attachmentCredentialId,
+            projectAssignmentId,
             kind: "file",
             upstreamId: attachment.fileId,
             conversationId: persistedConversationId,
@@ -1113,6 +1213,7 @@ async function persistSnapshot(
         {
           userId,
           apiCredentialId: taskCredentialId,
+          projectAssignmentId,
           kind: "task",
           upstreamId: taskId,
           conversationId: persistedConversationId,
@@ -1170,11 +1271,12 @@ async function validateWithBoundedConcurrency(
 
 async function prepareLegacyImport(
   userId: number,
+  projectAssignmentId: string | null,
   snapshots: ConversationSnapshot[],
 ) {
   const db = requireDb(await getDb());
   const persistedIds = snapshots.map((snapshot) =>
-    storageId(userId, snapshot.id),
+    storageId(userId, snapshot.id, projectAssignmentId),
   );
   const existingRows =
     persistedIds.length === 0
@@ -1185,7 +1287,8 @@ async function prepareLegacyImport(
           .where(inArray(conversations.id, persistedIds));
   const existingIds = new Set(existingRows.map((row) => row.id));
   const newSnapshots = snapshots.filter(
-    (snapshot) => !existingIds.has(storageId(userId, snapshot.id)),
+    (snapshot) =>
+      !existingIds.has(storageId(userId, snapshot.id, projectAssignmentId)),
   );
   const resources = collectSnapshotResourceRefs(newSnapshots);
   if (resources.length === 0) {
@@ -1209,6 +1312,7 @@ async function prepareLegacyImport(
             kind: upstreamResources.kind,
             upstreamId: upstreamResources.upstreamId,
             userId: upstreamResources.userId,
+            projectAssignmentId: upstreamResources.projectAssignmentId,
           })
           .from(upstreamResources)
           .where(
@@ -1224,6 +1328,7 @@ async function prepareLegacyImport(
             kind: upstreamResources.kind,
             upstreamId: upstreamResources.upstreamId,
             userId: upstreamResources.userId,
+            projectAssignmentId: upstreamResources.projectAssignmentId,
           })
           .from(upstreamResources)
           .where(
@@ -1235,7 +1340,10 @@ async function prepareLegacyImport(
   ]);
   const known = new Set<string>();
   for (const resource of [...knownTasks, ...knownFiles]) {
-    if (resource.userId !== userId) {
+    const owned = projectAssignmentId
+      ? resource.projectAssignmentId === projectAssignmentId
+      : resource.userId === userId && resource.projectAssignmentId == null;
+    if (!owned) {
       throw new TRPCError({
         code: "FORBIDDEN",
         message: "历史任务或文件已属于其他账号",
@@ -1278,13 +1386,24 @@ async function prepareLegacyImport(
   };
 }
 
-async function listSnapshots(userId: number): Promise<ConversationSnapshot[]> {
+async function listSnapshots(
+  userId: number,
+  projectAssignmentId: string | null = null,
+): Promise<ConversationSnapshot[]> {
   const db = requireDb(await getDb());
   const conversationRows = await db
     .select()
     .from(conversations)
     .where(
-      and(eq(conversations.userId, userId), isNull(conversations.deletedAt)),
+      and(
+        projectAssignmentId
+          ? eq(conversations.projectAssignmentId, projectAssignmentId)
+          : and(
+              eq(conversations.userId, userId),
+              isNull(conversations.projectAssignmentId),
+            ),
+        isNull(conversations.deletedAt),
+      ),
     )
     .orderBy(desc(conversations.updatedAt));
   if (conversationRows.length === 0) return [];
@@ -1295,7 +1414,7 @@ async function listSnapshots(userId: number): Promise<ConversationSnapshot[]> {
     .from(messages)
     .where(
       and(
-        eq(messages.userId, userId),
+        projectAssignmentId ? undefined : eq(messages.userId, userId),
         inArray(messages.conversationId, ids),
         isNull(messages.deletedAt),
       ),
@@ -1310,7 +1429,7 @@ async function listSnapshots(userId: number): Promise<ConversationSnapshot[]> {
           .from(attachments)
           .where(
             and(
-              eq(attachments.userId, userId),
+              projectAssignmentId ? undefined : eq(attachments.userId, userId),
               inArray(attachments.messageId, messageIds),
               isNull(attachments.deletedAt),
             ),
@@ -1331,12 +1450,12 @@ async function listSnapshots(userId: number): Promise<ConversationSnapshot[]> {
   }
 
   return conversationRows.map((row) => ({
-    id: publicId(userId, row.id),
+    id: publicId(userId, row.id, projectAssignmentId),
     title: row.title,
     messages: (messagesByConversation.get(row.id) ?? []).map((message) => {
       const metadata = (message.metadata ?? {}) as MessageMetadata;
       return {
-        id: publicId(userId, message.id),
+        id: publicId(userId, message.id, projectAssignmentId),
         role:
           message.role === "assistant"
             ? ("assistant" as const)
@@ -1345,7 +1464,7 @@ async function listSnapshots(userId: number): Promise<ConversationSnapshot[]> {
         timestamp: message.sentAt.getTime(),
         attachments: (attachmentsByMessage.get(message.id) ?? []).map(
           (attachment) => ({
-            id: publicId(userId, attachment.id),
+            id: publicId(userId, attachment.id, projectAssignmentId),
             type: attachment.kind,
             name: attachment.fileName,
             ...(attachment.upstreamFileId
@@ -1389,16 +1508,39 @@ async function listSnapshots(userId: number): Promise<ConversationSnapshot[]> {
 }
 
 export const conversationRouter = router({
-  list: protectedProcedure.query(({ ctx }) => listSnapshots(ctx.user.id)),
+  list: protectedProcedure
+    .input(
+      z
+        .object({ projectAssignmentId: z.string().uuid().optional() })
+        .optional(),
+    )
+    .query(async ({ ctx, input }) => {
+      const projectAssignmentId = await resolveConversationProjectAssignment(
+        ctx.user,
+        input?.projectAssignmentId,
+      );
+      return listSnapshots(ctx.user.id, projectAssignmentId);
+    }),
 
   syncSnapshot: protectedProcedure
-    .input(z.object({ conversation: conversationSnapshotSchema }))
+    .input(
+      z.object({
+        conversation: conversationSnapshotSchema,
+        projectAssignmentId: z.string().uuid().optional(),
+      }),
+    )
     .mutation(async ({ ctx, input }) => {
+      const projectAssignmentId = await resolveConversationProjectAssignment(
+        ctx.user,
+        input.projectAssignmentId,
+      );
       const db = requireDb(await getDb());
       await db.transaction(async (tx) => {
-        await persistSnapshot(tx, ctx.user.id, input.conversation);
+        await persistSnapshot(tx, ctx.user.id, input.conversation, {
+          projectAssignmentId,
+        });
       });
-      const snapshots = await listSnapshots(ctx.user.id);
+      const snapshots = await listSnapshots(ctx.user.id, projectAssignmentId);
       const persisted = snapshots.find(
         (item) => item.id === input.conversation.id,
       );
@@ -1412,36 +1554,65 @@ export const conversationRouter = router({
     }),
 
   delete: protectedProcedure
-    .input(z.object({ id: z.string().min(1).max(128) }))
+    .input(
+      z.object({
+        id: z.string().min(1).max(128),
+        projectAssignmentId: z.string().uuid().optional(),
+      }),
+    )
     .mutation(async ({ ctx, input }) => {
+      const projectAssignmentId = await resolveConversationProjectAssignment(
+        ctx.user,
+        input.projectAssignmentId,
+      );
       const db = requireDb(await getDb());
-      const persistedConversationId = storageId(ctx.user.id, input.id);
+      const persistedConversationId = storageId(
+        ctx.user.id,
+        input.id,
+        projectAssignmentId,
+      );
       const existing = await db
-        .select({ userId: conversations.userId })
+        .select({
+          userId: conversations.userId,
+          projectAssignmentId: conversations.projectAssignmentId,
+        })
         .from(conversations)
         .where(eq(conversations.id, persistedConversationId))
         .limit(1);
-      if (!existing[0] || existing[0].userId !== ctx.user.id) {
+      const owned = projectAssignmentId
+        ? existing[0]?.projectAssignmentId === projectAssignmentId
+        : existing[0]?.userId === ctx.user.id &&
+          existing[0]?.projectAssignmentId == null;
+      if (!existing[0] || !owned) {
         throw new TRPCError({ code: "NOT_FOUND", message: "会话不存在" });
       }
       await permanentlyDeleteConversation(
         db,
         ctx.user.id,
         persistedConversationId,
+        projectAssignmentId,
       );
       return { success: true } as const;
     }),
 
   importLocal: protectedProcedure
     .input(
-      z.object({ conversations: z.array(conversationSnapshotSchema).max(200) }),
+      z.object({
+        conversations: z.array(conversationSnapshotSchema).max(200),
+        projectAssignmentId: z.string().uuid().optional(),
+      }),
     )
     .mutation(async ({ ctx, input }) => {
+      const projectAssignmentId = await resolveConversationProjectAssignment(
+        ctx.user,
+        input.projectAssignmentId,
+      );
       const db = requireDb(await getDb());
       // Upstream ownership proof happens before any transaction or row lock.
       // Normal sync never creates ledger rows from client-supplied IDs.
       const prepared = await prepareLegacyImport(
         ctx.user.id,
+        projectAssignmentId,
         input.conversations,
       );
       let imported = 0;
@@ -1452,6 +1623,7 @@ export const conversationRouter = router({
             skipExisting: true,
             importCredentialId: prepared.credentialId,
             validatedResourceKeys: prepared.validatedResourceKeys,
+            projectAssignmentId,
           }),
         );
         if (result === "imported") imported += 1;

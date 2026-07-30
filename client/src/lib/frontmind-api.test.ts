@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createResponseLogicTask,
+  DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
   retrieveTask,
   sanitizeBrandText,
   uploadFile,
 } from "./frontmind-api";
 
 afterEach(() => {
+  localStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -91,6 +93,43 @@ describe("createResponseLogicTask", () => {
 });
 
 describe("retrieveTask", () => {
+  it("sends the selected customer project assignment in the delivery header", async () => {
+    vi.stubGlobal("sessionStorage", {
+      getItem: vi.fn((key: string) =>
+        key === DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY
+          ? "project-assignment-1"
+          : null,
+      ),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+      clear: vi.fn(),
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: "task-project",
+        status: "completed",
+        output: [],
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await retrieveTask("task-project");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/frontmind/v1/tasks/task-project",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "x-delivery-project-assignment-id": "project-assignment-1",
+        }),
+      }),
+    );
+    expect(fetchMock.mock.calls[0][1].headers).not.toHaveProperty(
+      "x-delivery-role-assignment-id",
+    );
+  });
+
   it("preserves a structured authorization error without trying the legacy endpoint", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,

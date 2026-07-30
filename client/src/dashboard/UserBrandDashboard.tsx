@@ -1363,6 +1363,10 @@ function UserBrandDashboardContent({
                     page={route.sub === "display" ? "display" : "build"}
                     onPageChange={(page) => navigate("knowledge-agent", page)}
                     mode={route.sub === "display" ? "standard" : "workspace"}
+                    knowledgeEngineerAssigned={
+                      previewMode ||
+                      deliveryWorkspace.deliveryOwners?.aiOperations !== false
+                    }
                   />
                 </Suspense>
               )}

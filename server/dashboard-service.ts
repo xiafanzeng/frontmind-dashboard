@@ -1333,7 +1333,9 @@ export async function setWorkspaceAssignments(input: {
       throw new AuthServiceError("NOT_FOUND", "Administrator not found");
     }
   }
-  const deliveryAdminIds = validAdmins.map((admin) => admin.id);
+  const deliveryAdminIds = validAdmins
+    .filter((admin) => admin.adminAccessLevel === "delivery_admin")
+    .map((admin) => admin.id);
   if (
     input.usageOwnerAdminId != null &&
     !deliveryAdminIds.includes(input.usageOwnerAdminId)
@@ -1344,6 +1346,18 @@ export async function setWorkspaceAssignments(input: {
     );
   }
   await db.transaction(async (tx) => {
+    const lockedTargetUsers = await tx
+      .select({ id: users.id, role: users.role })
+      .from(users)
+      .where(eq(users.id, input.userId))
+      .limit(1)
+      .for("update");
+    if (lockedTargetUsers[0]?.role !== "user") {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "客户账号状态已变化，请刷新后重新分配",
+      );
+    }
     const lockedAdmins =
       uniqueAdminIds.length > 0
         ? await tx
@@ -1367,7 +1381,9 @@ export async function setWorkspaceAssignments(input: {
         "管理员状态已变化，请刷新后重新分配",
       );
     }
-    const lockedDeliveryAdminIds = lockedAdmins.map((admin) => admin.id);
+    const lockedDeliveryAdminIds = lockedAdmins
+      .filter((admin) => admin.adminAccessLevel === "delivery_admin")
+      .map((admin) => admin.id);
     if (
       input.usageOwnerAdminId != null &&
       !lockedDeliveryAdminIds.includes(input.usageOwnerAdminId)
@@ -1386,7 +1402,8 @@ export async function setWorkspaceAssignments(input: {
       .select()
       .from(userUsageOwners)
       .where(eq(userUsageOwners.userId, input.userId))
-      .limit(1);
+      .limit(1)
+      .for("update");
     const previousOwner = previousOwners[0] ?? null;
     const nextUsageOwnerId =
       input.usageOwnerAdminId !== undefined

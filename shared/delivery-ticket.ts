@@ -108,25 +108,9 @@ export const preferredContentMediaSchema = z.enum([
 ]);
 export type PreferredContentMedia = z.infer<typeof preferredContentMediaSchema>;
 
-export const icpSensitiveMaterialCategorySchema = z.enum([
-  "business_license",
-  "subject_responsible_person_id",
-  "website_responsible_person_id",
-  "authorization_letter",
-  "pre_approval_or_industry_qualification",
-  "enterprise_name_change_proof",
-  "other_provincial_material",
-]);
-export type IcpSensitiveMaterialCategory = z.infer<
-  typeof icpSensitiveMaterialCategorySchema
->;
-
 export const deliveryTicketAttachmentInputSchema = z
   .object({
-    storageKind: z.enum(["upstream", "icp_protected"]).default("upstream"),
-    fileId: z.string().trim().min(1).max(255).optional(),
-    protectedMaterialId: z.string().uuid().optional(),
-    sensitiveCategory: icpSensitiveMaterialCategorySchema.optional(),
+    fileId: z.string().trim().min(1).max(255),
     filename: z.string().trim().min(1).max(512),
     mimeType: z.string().trim().max(255).optional(),
     sizeBytes: z
@@ -146,30 +130,7 @@ export const deliveryTicketAttachmentInputSchema = z
       .optional(),
     copyrightNote: z.string().trim().max(2_000).optional(),
   })
-  .superRefine((value, context) => {
-    if (value.storageKind === "icp_protected") {
-      if (!value.protectedMaterialId) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["protectedMaterialId"],
-          message: "ICP 敏感材料缺少受保护文件标识",
-        });
-      }
-      if (!value.sensitiveCategory) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["sensitiveCategory"],
-          message: "请选择 ICP 敏感材料类别",
-        });
-      }
-    } else if (!value.fileId) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["fileId"],
-        message: "附件缺少文件标识",
-      });
-    }
-  });
+  .strict();
 export type DeliveryTicketAttachmentInput = z.infer<
   typeof deliveryTicketAttachmentInputSchema
 >;
@@ -272,10 +233,6 @@ export type CreateDeliveryTicketInput = z.infer<
 
 export const deliveryTicketDetailInputSchema = z.object({
   ticketId: z.string().uuid(),
-});
-
-export const icpMaterialChecklistInputSchema = z.object({
-  province: z.string().trim().min(1).max(64),
 });
 
 /**
@@ -769,10 +726,9 @@ export const publicDeliveryTicketWorkspaceMetadataSchema = z
     preferredMediaOptions: z.array(preferredContentMediaSchema),
     deliveryOwners: z
       .object({
-        knowledgeBase: z.boolean(),
+        aiOperations: z.boolean(),
         monitoringOptimization: z.boolean(),
         contentDistribution: z.boolean(),
-        websiteOperations: z.boolean(),
       })
       .strict(),
     websiteWorkflow: z

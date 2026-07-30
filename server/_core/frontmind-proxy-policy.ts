@@ -6,7 +6,7 @@ import {
   assertServiceWriteAccess,
   ServiceEntitlementError,
 } from "../service-entitlement";
-import { assertDeliveryRoleContext } from "../delivery-role-service";
+import { assertDeliveryProjectContext } from "../delivery-role-service";
 
 const ORDINARY_USER_SUPPORT_OPERATIONS = new Set([
   "POST /download-token",
@@ -51,7 +51,7 @@ export function ordinaryUserProxyWriteRequiresActiveService(
 export function createFrontMindProxyAccessMiddleware(
   dependencies: {
     assertWriteAccess: typeof assertServiceWriteAccess;
-    assertRoleContext?: typeof assertDeliveryRoleContext;
+    assertProjectContext?: typeof assertDeliveryProjectContext;
   } = { assertWriteAccess: assertServiceWriteAccess },
 ) {
   return async (req: FrontMindRequest, res: Response, next: NextFunction) => {
@@ -76,36 +76,9 @@ export function createFrontMindProxyAccessMiddleware(
       return;
     }
     if (user.role === "delivery_member") {
-      const roleAssignmentId = String(
-        req.headers["x-delivery-role-assignment-id"] || "",
-      ).trim();
-      if (!roleAssignmentId) {
-        res.status(400).json({
-          error: {
-            message: "请先选择当前工作角色",
-            code: "DELIVERY_ROLE_CONTEXT_REQUIRED",
-          },
-        });
-        return;
-      }
-      try {
-        req.frontmindDeliveryRoleContext = await (
-          dependencies.assertRoleContext ?? assertDeliveryRoleContext
-        )({
-          actor: user,
-          roleAssignmentId,
-        });
-      } catch {
-        res.status(403).json({
-          error: {
-            message: "当前工作角色不存在或已停用",
-            code: "DELIVERY_ROLE_CONTEXT_FORBIDDEN",
-          },
-        });
-        return;
-      }
-      next();
-      return;
+      return createDeliveryProjectContextMiddleware({
+        assertProjectContext: dependencies.assertProjectContext,
+      })(req, res, next);
     }
     if (!ordinaryUserMayUseFrontMindProxy(req)) {
       res.status(403).json({
@@ -136,3 +109,60 @@ export function createFrontMindProxyAccessMiddleware(
 
 export const enforceFrontMindProxyAccess =
   createFrontMindProxyAccessMiddleware();
+
+function isDirectDownloadTokenRequest(req: FrontMindRequest) {
+  if (req.method.toUpperCase() !== "GET") return false;
+  return /^\/(?:assets\/)?download\/[^/]+$/.test(proxyPath(req));
+}
+
+export function createDeliveryProjectContextMiddleware(
+  dependencies: {
+    assertProjectContext?: typeof assertDeliveryProjectContext;
+  } = {},
+) {
+  return async (req: FrontMindRequest, res: Response, next: NextFunction) => {
+    const user = req.frontmindUser;
+    if (!user || user.role !== "delivery_member") {
+      next();
+      return;
+    }
+    // Native browser downloads cannot attach a custom header. Their one-time
+    // token carries the project assignment and is revalidated by the route.
+    if (isDirectDownloadTokenRequest(req)) {
+      next();
+      return;
+    }
+    const projectAssignmentId = String(
+      req.headers["x-delivery-project-assignment-id"] || "",
+    ).trim();
+    if (!projectAssignmentId) {
+      res.status(400).json({
+        error: {
+          message: "请先选择当前客户项目",
+          code: "DELIVERY_PROJECT_CONTEXT_REQUIRED",
+        },
+      });
+      return;
+    }
+    try {
+      req.frontmindDeliveryProjectContext = await (
+        dependencies.assertProjectContext ?? assertDeliveryProjectContext
+      )({
+        actor: user,
+        projectAssignmentId,
+      });
+    } catch {
+      res.status(403).json({
+        error: {
+          message: "当前客户项目岗位不存在或已停用",
+          code: "DELIVERY_PROJECT_CONTEXT_FORBIDDEN",
+        },
+      });
+      return;
+    }
+    next();
+  };
+}
+
+export const enforceDeliveryProjectContext =
+  createDeliveryProjectContextMiddleware();

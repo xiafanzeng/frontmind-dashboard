@@ -51,13 +51,8 @@ import {
   addDeliveryTicketMessageSchema,
   createDeliveryTicketSchema,
   deliveryTicketDetailInputSchema,
-  icpMaterialChecklistInputSchema,
   deliveryTicketListInputSchema,
 } from "../shared/delivery-ticket";
-import {
-  ICP_PROVINCES,
-  icpMaterialChecklistForProvince,
-} from "../shared/delivery-catalog";
 import {
   addDeliveryTicketMessage,
   createDeliveryTicket,
@@ -192,24 +187,6 @@ export const workspaceRouter = router({
   }),
 
   deliveryTickets: router({
-    icpChecklist: protectedProcedure
-      .input(icpMaterialChecklistInputSchema)
-      .query(({ input }) => {
-        if (
-          !ICP_PROVINCES.includes(
-            input.province as (typeof ICP_PROVINCES)[number],
-          )
-        ) {
-          throw new TRPCError({
-            code: "BAD_REQUEST",
-            message: "备案省份无效。",
-          });
-        }
-        return {
-          province: input.province,
-          items: icpMaterialChecklistForProvince(input.province),
-        };
-      }),
     workspace: protectedProcedure.query(async ({ ctx }) => {
       try {
         return await getDeliveryTicketWorkspace(ctx.user.id);

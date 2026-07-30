@@ -71,6 +71,7 @@ export interface KnowledgeBaseProgressDto {
     id: string;
     conversationId: string;
     companyName: string;
+    skillVersion?: string;
     status: KnowledgeBaseBuildStatus;
     revision: number;
     currentLeafId: string | null;

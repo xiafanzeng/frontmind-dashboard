@@ -17,12 +17,9 @@ import {
 
 import {
   deliveryTicketAttachments,
-  deliveryCustomerAssignments,
-  deliveryRoleMembers,
-  deliveryRoles,
+  deliveryProjectAssignments,
   deliveryTicketEvents,
   deliveryTickets,
-  icpSensitiveMaterials,
   knowledgeBaseBuilds,
   knowledgeBaseSnapshots,
   serviceContracts,
@@ -65,14 +62,12 @@ import {
   ICP_PROVINCES,
   WEBSITE_CONTENT_CATALOG,
   contentAssetMediaOptionsForMarketEdition,
-  icpMaterialChecklistForProvince,
 } from "../shared/delivery-catalog";
 import type { AuthenticatedUser } from "./auth-service";
 import { getDb } from "./db";
 import { assertWorkspaceAccess, isSystemAdmin } from "./dashboard-service";
 import { getServicePortal } from "./service-entitlement";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
-import { createIcpMaterialDownloadUrl } from "./icp-material-service";
 import { DeliveryTicketError } from "./delivery-ticket-error";
 export { DeliveryTicketError } from "./delivery-ticket-error";
 
@@ -210,28 +205,11 @@ export async function assertWebsiteTicketWorkflow(
   userId: number,
   value: CreateDeliveryTicketInput,
 ) {
-  const protectedAttachments = value.attachments.filter(
-    (attachment) => attachment.storageKind === "icp_protected",
-  );
   if (value.type !== "website_operation") {
-    if (protectedAttachments.length) {
-      throw new DeliveryTicketError(
-        "ICP_MATERIAL_SCOPE_INVALID",
-        "ICP 敏感材料只能用于 ICP 备案工单。",
-        400,
-      );
-    }
     return { profile: null, domain: null };
   }
   const category = value.category?.trim() ?? "";
   if (category === "knowledge_base_maintenance") {
-    if (protectedAttachments.length) {
-      throw new DeliveryTicketError(
-        "KNOWLEDGE_MAINTENANCE_ATTACHMENT_INVALID",
-        "知识库维护工单不能附带 ICP 敏感材料。",
-        400,
-      );
-    }
     return { profile: null, domain: null };
   }
   const profiles = await executor
@@ -254,13 +232,6 @@ export async function assertWebsiteTicketWorkflow(
       throw new DeliveryTicketError(
         "DOMAIN_ALREADY_VERIFIED",
         "当前企业域名已由管理员确认，无需重复申请。",
-      );
-    }
-    if (protectedAttachments.length) {
-      throw new DeliveryTicketError(
-        "ICP_MATERIAL_SCOPE_INVALID",
-        "域名申请工单不能附带 ICP 身份材料。",
-        400,
       );
     }
     return { profile, domain };
@@ -286,13 +257,6 @@ export async function assertWebsiteTicketWorkflow(
         "当前企业 ICP 前置阶段已完成，无需重复提交。",
       );
     }
-    if (protectedAttachments.length) {
-      throw new DeliveryTicketError(
-        "ICP_MATERIAL_SCOPE_INVALID",
-        "本站不接收 ICP 备案材料，请仅填写已备案域名和 ICP 主体备案号。",
-        400,
-      );
-    }
     return { profile, domain };
   }
   if (WEBSITE_CONTENT_CATEGORIES.has(category)) {
@@ -304,13 +268,6 @@ export async function assertWebsiteTicketWorkflow(
         "WEBSITE_PREREQUISITES_REQUIRED",
         "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。",
         403,
-      );
-    }
-    if (protectedAttachments.length) {
-      throw new DeliveryTicketError(
-        "ICP_MATERIAL_SCOPE_INVALID",
-        "官网内容工单不能附带 ICP 身份材料。",
-        400,
       );
     }
     return { profile, domain: null };
@@ -469,17 +426,9 @@ export function missingOwnedAttachmentIds(
 async function verifyOwnedAttachments(
   executor: any,
   ownerUserId: number,
-  workspaceUserId: number,
   attachments: DeliveryTicketAttachmentInput[],
 ) {
-  const fileIds = [
-    ...new Set(
-      attachments
-        .filter((item) => item.storageKind !== "icp_protected")
-        .map((item) => item.fileId)
-        .filter((value): value is string => Boolean(value)),
-    ),
-  ];
+  const fileIds = [...new Set(attachments.map((item) => item.fileId))];
   if (fileIds.length) {
     const rows = await executor
       .select({ upstreamId: upstreamResources.upstreamId })
@@ -501,38 +450,6 @@ async function verifyOwnedAttachments(
       );
     }
   }
-  const protectedIds = [
-    ...new Set(
-      attachments
-        .filter((item) => item.storageKind === "icp_protected")
-        .map((item) => item.protectedMaterialId)
-        .filter((value): value is string => Boolean(value)),
-    ),
-  ];
-  if (!protectedIds.length) return;
-  const protectedRows = await executor
-    .select({ id: icpSensitiveMaterials.id })
-    .from(icpSensitiveMaterials)
-    .where(
-      and(
-        eq(icpSensitiveMaterials.ownerUserId, ownerUserId),
-        eq(icpSensitiveMaterials.workspaceUserId, workspaceUserId),
-        eq(icpSensitiveMaterials.status, "active"),
-        inArray(icpSensitiveMaterials.id, protectedIds),
-      ),
-    );
-  const ownedProtectedIds = protectedRows.map((row: { id: string }) => row.id);
-  const missingProtectedIds = missingOwnedAttachmentIds(
-    protectedIds,
-    ownedProtectedIds,
-  );
-  if (missingProtectedIds.length) {
-    throw new DeliveryTicketError(
-      "ATTACHMENT_FORBIDDEN",
-      "ICP 材料不存在、已撤回或不属于当前企业。",
-      403,
-    );
-  }
 }
 
 function attachmentRows(input: {
@@ -551,18 +468,7 @@ function attachmentRows(input: {
     workspaceUserId: input.workspaceUserId,
     ownerUserId: input.ownerUserId,
     kind: input.kind,
-    upstreamFileId:
-      attachment.storageKind === "icp_protected"
-        ? null
-        : (attachment.fileId ?? null),
-    protectedMaterialId:
-      attachment.storageKind === "icp_protected"
-        ? (attachment.protectedMaterialId ?? null)
-        : null,
-    sensitivity:
-      attachment.storageKind === "icp_protected"
-        ? ("icp_sensitive" as const)
-        : ("standard" as const),
+    upstreamFileId: attachment.fileId,
     filename: attachment.filename,
     mimeType: nonEmpty(attachment.mimeType),
     sizeBytes: attachment.sizeBytes ?? null,
@@ -1205,31 +1111,17 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
           ),
         ),
       db
-        .select({ roleType: deliveryCustomerAssignments.roleType })
-        .from(deliveryCustomerAssignments)
-        .innerJoin(
-          deliveryRoles,
-          eq(deliveryCustomerAssignments.roleId, deliveryRoles.id),
-        )
-        .innerJoin(
-          deliveryRoleMembers,
-          and(
-            eq(deliveryRoleMembers.roleId, deliveryCustomerAssignments.roleId),
-            eq(
-              deliveryRoleMembers.memberUserId,
-              deliveryCustomerAssignments.primaryMemberId,
-            ),
-          ),
-        )
+        .select({ roleType: deliveryProjectAssignments.roleType })
+        .from(deliveryProjectAssignments)
         .innerJoin(
           users,
-          eq(users.id, deliveryCustomerAssignments.primaryMemberId),
+          eq(users.id, deliveryProjectAssignments.engineerUserId),
         )
         .where(
           and(
-            eq(deliveryCustomerAssignments.customerUserId, userId),
-            eq(deliveryRoles.isActive, true),
-            eq(deliveryRoleMembers.isActive, true),
+            eq(deliveryProjectAssignments.customerUserId, userId),
+            eq(users.role, "delivery_member"),
+            eq(users.engineerRoleType, deliveryProjectAssignments.roleType),
             eq(users.isActive, true),
           ),
         ),
@@ -1250,12 +1142,11 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
     preferredMediaOptions:
       contentAssetMediaOptionsForMarketEdition(marketEdition),
     deliveryOwners: {
-      knowledgeBase: ownerTypes.has("knowledge_base_engineer"),
+      aiOperations: ownerTypes.has("ai_operations_engineer"),
       monitoringOptimization: ownerTypes.has(
         "monitoring_optimization_engineer",
       ),
       contentDistribution: ownerTypes.has("content_distribution_engineer"),
-      websiteOperations: ownerTypes.has("website_operations_engineer"),
     },
     websiteWorkflow: {
       domainStatus: siteProfile?.domainStatus ?? "not_started",
@@ -1267,9 +1158,6 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
       canSubmitContent: domainCompleted && icpCompleted,
       icpProvince: siteProfile?.icpProvince ?? null,
       icpProvinceOptions: ICP_PROVINCES,
-      icpMaterialChecklist: siteProfile?.icpProvince
-        ? icpMaterialChecklistForProvince(siteProfile.icpProvince)
-        : [],
       icpLockReason: null,
       contentLockReason: !domainCompleted
         ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
@@ -1284,10 +1172,9 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
   metadata: Awaited<ReturnType<typeof getDeliveryTicketWorkspaceMetadata>>,
 ): PublicDeliveryTicketWorkspaceMetadata {
   const deliveryOwners = metadata.deliveryOwners ?? {
-    knowledgeBase: true,
+    aiOperations: true,
     monitoringOptimization: true,
     contentDistribution: true,
-    websiteOperations: true,
   };
   const domainPending = metadata.siteProfile?.domainStatus === "pending";
   const icpPending =
@@ -1295,15 +1182,18 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
     metadata.siteProfile?.icpStatus === "submitted";
   const domainCompleted = metadata.websiteWorkflow.domainCompleted;
   const icpCompleted = metadata.websiteWorkflow.icpCompleted;
+  const aiOperationsUnavailableReason =
+    metadata.quotas.website_content_publish.reason ||
+    "尚未分配 AI 运维工程师，请联系交付管理员。";
   const quota = (value: DeliveryTicketQuota, hasOwner: boolean) => ({
     type: value.type,
     allowed: value.allowed && hasOwner,
     used: value.used,
     limit: value.limit,
     remaining: value.remaining,
-    reason: hasOwner
-      ? value.reason
-      : "该业务尚未配置负责人，请联系交付管理员。",
+    reason:
+      value.reason ||
+      (hasOwner ? null : "该业务尚未配置负责人，请联系交付管理员。"),
   });
   return publicDeliveryTicketWorkspaceMetadataSchema.parse({
     quotas: {
@@ -1313,7 +1203,7 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
       ),
       website_content_publish: quota(
         metadata.quotas.website_content_publish,
-        deliveryOwners.websiteOperations,
+        deliveryOwners.aiOperations,
       ),
     },
     contentAssetCatalog: metadata.contentAssetCatalog,
@@ -1325,28 +1215,28 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
       domainCompleted,
       icpCompleted,
       canSubmitDomain:
-        deliveryOwners.websiteOperations && !domainCompleted && !domainPending,
+        deliveryOwners.aiOperations && !domainCompleted && !domainPending,
       canSubmitIcp:
-        deliveryOwners.websiteOperations &&
+        deliveryOwners.aiOperations &&
         !icpCompleted &&
         !domainPending &&
         !icpPending,
       canSubmitContent:
-        deliveryOwners.websiteOperations && domainCompleted && icpCompleted,
+        deliveryOwners.aiOperations && domainCompleted && icpCompleted,
       domainLockReason: domainPending
         ? "域名申请工单待管理员受理。"
-        : !deliveryOwners.websiteOperations
-          ? "该业务尚未配置负责人，请联系交付管理员。"
+        : !deliveryOwners.aiOperations
+          ? aiOperationsUnavailableReason
           : domainCompleted
             ? null
             : null,
-      icpLockReason: !deliveryOwners.websiteOperations
-        ? "该业务尚未配置负责人，请联系交付管理员。"
+      icpLockReason: !deliveryOwners.aiOperations
+        ? aiOperationsUnavailableReason
         : domainPending || icpPending
           ? "域名与 ICP 备案结果待管理员确认。"
           : null,
-      contentLockReason: !deliveryOwners.websiteOperations
-        ? "该业务尚未配置负责人，请联系交付管理员。"
+      contentLockReason: !deliveryOwners.aiOperations
+        ? aiOperationsUnavailableReason
         : !domainCompleted
           ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
           : !icpCompleted
@@ -1521,12 +1411,7 @@ export async function createDeliveryTicket(input: {
             );
           }
         }
-        await verifyOwnedAttachments(
-          tx,
-          input.userId,
-          input.userId,
-          input.value.attachments,
-        );
+        await verifyOwnedAttachments(tx, input.userId, input.value.attachments);
         let period = periods[0];
         let ordinal = 1;
         if (quotaPool) {
@@ -1610,9 +1495,7 @@ export async function createDeliveryTicket(input: {
         const workflowDomain =
           input.value.type === "content_asset"
             ? ("content_distribution_engineer" as const)
-            : input.value.category === "knowledge_base_maintenance"
-              ? ("knowledge_base_engineer" as const)
-              : ("website_operations_engineer" as const);
+            : ("ai_operations_engineer" as const);
         const operation =
           input.value.type === "content_asset"
             ? "content_asset_publish"
@@ -1621,37 +1504,20 @@ export async function createDeliveryTicket(input: {
               : input.value.category;
         const ownerRows = await tx
           .select({
-            roleId: deliveryCustomerAssignments.roleId,
-            memberId: deliveryCustomerAssignments.primaryMemberId,
+            projectAssignmentId: deliveryProjectAssignments.id,
+            memberId: deliveryProjectAssignments.engineerUserId,
           })
-          .from(deliveryCustomerAssignments)
-          .innerJoin(
-            deliveryRoles,
-            eq(deliveryCustomerAssignments.roleId, deliveryRoles.id),
-          )
-          .innerJoin(
-            deliveryRoleMembers,
-            and(
-              eq(
-                deliveryRoleMembers.roleId,
-                deliveryCustomerAssignments.roleId,
-              ),
-              eq(
-                deliveryRoleMembers.memberUserId,
-                deliveryCustomerAssignments.primaryMemberId,
-              ),
-            ),
-          )
+          .from(deliveryProjectAssignments)
           .innerJoin(
             users,
-            eq(users.id, deliveryCustomerAssignments.primaryMemberId),
+            eq(users.id, deliveryProjectAssignments.engineerUserId),
           )
           .where(
             and(
-              eq(deliveryCustomerAssignments.customerUserId, input.userId),
-              eq(deliveryCustomerAssignments.roleType, workflowDomain),
-              eq(deliveryRoles.isActive, true),
-              eq(deliveryRoleMembers.isActive, true),
+              eq(deliveryProjectAssignments.customerUserId, input.userId),
+              eq(deliveryProjectAssignments.roleType, workflowDomain),
+              eq(users.role, "delivery_member"),
+              eq(users.engineerRoleType, workflowDomain),
               eq(users.isActive, true),
             ),
           )
@@ -1686,7 +1552,7 @@ export async function createDeliveryTicket(input: {
           knowledgeSnapshotId: input.value.knowledgeSnapshotId ?? null,
           workflowDomain,
           operation,
-          assignedRoleId: owner.roleId,
+          assignedProjectAssignmentId: owner.projectAssignmentId,
           assignedMemberId: owner.memberId,
           technicalDedupeKey: technicalDedupe,
           materialUrls: input.value.materialUrls,
@@ -1974,7 +1840,7 @@ export async function getDeliveryTicketDetail(input: {
     })),
     attachments: attachments.map((attachment) => ({
       id: attachment.id,
-      fileId: attachment.upstreamFileId ?? attachment.protectedMaterialId ?? "",
+      fileId: attachment.upstreamFileId ?? "",
       filename: attachment.filename,
       mimeType: attachment.mimeType,
       sizeBytes: attachment.sizeBytes,
@@ -1983,13 +1849,8 @@ export async function getDeliveryTicketDetail(input: {
       authorization: attachment.authorization,
       copyrightNote: attachment.copyrightNote,
       kind: attachment.kind,
-      sensitivity: attachment.sensitivity,
       createdAt: epoch(attachment.createdAt),
-      downloadUrl:
-        attachment.sensitivity === "icp_sensitive" &&
-        attachment.protectedMaterialId
-          ? createIcpMaterialDownloadUrl(attachment.protectedMaterialId)
-          : `/api/delivery-ticket-attachments/${attachment.id}/content`,
+      downloadUrl: `/api/delivery-ticket-attachments/${attachment.id}/content`,
     })),
   };
 }
@@ -2068,12 +1929,7 @@ export async function getPublicDeliveryTicketDetail(input: {
           eq(deliveryTicketEvents.visibility, "customer"),
         ),
       )
-      .where(
-        and(
-          eq(deliveryTicketAttachments.ticketId, ticket.id),
-          eq(deliveryTicketAttachments.sensitivity, "standard"),
-        ),
-      )
+      .where(eq(deliveryTicketAttachments.ticketId, ticket.id))
       .orderBy(asc(deliveryTicketAttachments.createdAt)),
   ]);
   const preferredMedia =
@@ -2199,12 +2055,7 @@ export async function addDeliveryTicketMessage(input: {
         "该工单已结束，不能继续补充消息。",
       );
     }
-    await verifyOwnedAttachments(
-      tx,
-      input.actor.id,
-      input.workspaceUserId,
-      input.value.attachments,
-    );
+    await verifyOwnedAttachments(tx, input.actor.id, input.value.attachments);
     const now = new Date();
     const eventId = randomUUID();
     await tx.insert(deliveryTicketEvents).values({
@@ -2774,12 +2625,7 @@ export async function recordManagedDeliveryOperation(input: {
       );
     }
     assertDeliveryOperationPolicy(ticket.type);
-    await verifyOwnedAttachments(
-      tx,
-      input.actor.id,
-      input.userId,
-      input.attachments,
-    );
+    await verifyOwnedAttachments(tx, input.actor.id, input.attachments);
     const operationAttachments = [...input.attachments];
     if (
       input.result.screenshotFileId &&
@@ -2787,16 +2633,14 @@ export async function recordManagedDeliveryOperation(input: {
         (attachment) => attachment.fileId === input.result.screenshotFileId,
       )
     ) {
-      await verifyOwnedAttachments(tx, input.actor.id, input.userId, [
+      await verifyOwnedAttachments(tx, input.actor.id, [
         {
-          storageKind: "upstream",
           fileId: input.result.screenshotFileId,
           filename: "执行截图",
           purpose: "执行结果凭证",
         },
       ]);
       operationAttachments.push({
-        storageKind: "upstream",
         fileId: input.result.screenshotFileId,
         filename: "执行截图",
         purpose: "执行结果凭证",

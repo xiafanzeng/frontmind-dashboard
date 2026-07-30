@@ -1,24 +1,26 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
-  KeyRound,
-  Plus,
+  AlertTriangle,
+  BriefcaseBusiness,
+  CheckCircle2,
   RefreshCw,
+  Search,
   ShieldAlert,
-  ShieldCheck,
+  UserCog,
   UsersRound,
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useAuth } from "@/_core/hooks/useAuth";
 import PortalShell from "@/components/PortalShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { trpc } from "@/lib/trpc";
 import { isSystemAdminAccount } from "@/lib/admin-access";
+import { cn } from "@/lib/utils";
+import { trpc } from "@/lib/trpc";
 import { getAdminNav } from "@/pages/AdminDashboard";
-import { useAuth } from "@/_core/hooks/useAuth";
 import {
   DELIVERY_ROLE_LABELS,
   type DeliveryRoleType,
@@ -26,113 +28,269 @@ import {
 
 const ROLE_TYPES = Object.keys(DELIVERY_ROLE_LABELS) as DeliveryRoleType[];
 
+type ProjectTeamProject = {
+  id: number;
+  username: string | null;
+  displayName: string | null;
+  isActive: boolean;
+  planCode: string | null;
+  contractStatus: string | null;
+  contractStartsAt: Date | string | number | null;
+  contractEndsAt: Date | string | number | null;
+  managerId: number | null;
+  managerUsername: string | null;
+  managerDisplayName: string | null;
+  requiredRoleTypes: DeliveryRoleType[];
+};
+
+type ProjectTeamAssignment = {
+  id: string;
+  customerUserId: number;
+  roleType: DeliveryRoleType;
+  engineerUserId: number | null;
+  revision: number;
+  engineerUsername: string | null;
+  engineerDisplayName: string | null;
+  engineerApiKeyConfigured: boolean;
+};
+
+type ProjectTeamEngineer = {
+  id: number;
+  username: string | null;
+  displayName: string | null;
+  isActive: boolean;
+  engineerRoleType: DeliveryRoleType | null;
+  apiKeyConfigured: boolean;
+};
+
+type ProjectTicket = {
+  id: string;
+  userId: number;
+  workflowDomain: DeliveryRoleType | null;
+  assignedProjectAssignmentId?: string | null;
+  assignedMemberId: number | null;
+};
+
+type ProjectTeamOverview = {
+  projects: ProjectTeamProject[];
+  assignments: ProjectTeamAssignment[];
+  engineers: ProjectTeamEngineer[];
+  tickets: ProjectTicket[];
+};
+
+type TeamStatusFilter = "all" | "complete" | "incomplete";
+
+export function getMissingProjectRoleTypes(
+  project: Pick<ProjectTeamProject, "id" | "requiredRoleTypes">,
+  assignments: Array<
+    Pick<
+      ProjectTeamAssignment,
+      "customerUserId" | "roleType" | "engineerUserId"
+    >
+  >,
+) {
+  const assignedRoleTypes = new Set(
+    assignments
+      .filter(
+        (assignment) =>
+          assignment.customerUserId === project.id &&
+          assignment.engineerUserId != null,
+      )
+      .map((assignment) => assignment.roleType),
+  );
+  return project.requiredRoleTypes.filter(
+    (roleType) => !assignedRoleTypes.has(roleType),
+  );
+}
+
+export function summarizeProjectTeams(
+  projects: Array<
+    Pick<ProjectTeamProject, "id" | "managerId" | "requiredRoleTypes">
+  >,
+  assignments: Array<
+    Pick<
+      ProjectTeamAssignment,
+      "customerUserId" | "roleType" | "engineerUserId"
+    >
+  >,
+  tickets: Array<Pick<ProjectTicket, "workflowDomain" | "assignedMemberId">>,
+) {
+  const missingByProject = projects.map((project) => ({
+    managerMissing: project.managerId == null,
+    roleTypes: getMissingProjectRoleTypes(project, assignments),
+  }));
+  return {
+    projectCount: projects.length,
+    incompleteProjectCount: missingByProject.filter(
+      ({ managerMissing, roleTypes }) => managerMissing || roleTypes.length > 0,
+    ).length,
+    missingRoleCount: missingByProject.reduce(
+      (total, { roleTypes }) => total + roleTypes.length,
+      0,
+    ),
+    pendingTicketCount: tickets.filter(
+      (ticket) => ticket.workflowDomain && ticket.assignedMemberId == null,
+    ).length,
+  };
+}
+
+export function filterProjectTeams(
+  projects: ProjectTeamProject[],
+  assignments: ProjectTeamAssignment[],
+  filters: {
+    query: string;
+    planCode: string;
+    managerId: string;
+    teamStatus: TeamStatusFilter;
+  },
+) {
+  const normalizedQuery = filters.query.trim().toLocaleLowerCase("zh-CN");
+  return projects.filter((project) => {
+    if (
+      normalizedQuery &&
+      ![project.displayName, project.username, String(project.id)].some(
+        (value) =>
+          String(value ?? "")
+            .toLocaleLowerCase("zh-CN")
+            .includes(normalizedQuery),
+      )
+    ) {
+      return false;
+    }
+    if (filters.planCode !== "all" && project.planCode !== filters.planCode) {
+      return false;
+    }
+    if (
+      filters.managerId !== "all" &&
+      String(project.managerId ?? "") !== filters.managerId
+    ) {
+      return false;
+    }
+    const isComplete =
+      project.managerId != null &&
+      getMissingProjectRoleTypes(project, assignments).length === 0;
+    if (filters.teamStatus === "complete" && !isComplete) return false;
+    if (filters.teamStatus === "incomplete" && isComplete) return false;
+    return true;
+  });
+}
+
+function getInitialProjectSelection() {
+  if (typeof window === "undefined") return null;
+  const value = Number(
+    new URLSearchParams(window.location.search).get("customer"),
+  );
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function getInitialHighlightedRole() {
+  if (typeof window === "undefined") return null;
+  const value = new URLSearchParams(window.location.search).get("role");
+  return ROLE_TYPES.includes(value as DeliveryRoleType)
+    ? (value as DeliveryRoleType)
+    : null;
+}
+
 export default function AdminDeliveryRoles() {
   const { user } = useAuth();
   const utils = trpc.useUtils();
   const overview = trpc.delivery.management.overview.useQuery();
-  const createTeam = trpc.delivery.management.createTeam.useMutation();
-  const createMember = trpc.delivery.management.createMember.useMutation();
-  const setMember = trpc.delivery.management.setMember.useMutation();
-  const assignCustomer = trpc.delivery.management.assignCustomer.useMutation();
-  const setApiKey = trpc.delivery.management.setMemberApiKey.useMutation();
-  const revokeApiKey =
-    trpc.delivery.management.revokeMemberApiKey.useMutation();
-  const [teamName, setTeamName] = useState("");
-  const [roleType, setRoleType] = useState<DeliveryRoleType>(
-    "knowledge_base_engineer",
+  const setProjectEngineer =
+    trpc.delivery.management.setProjectEngineer.useMutation();
+  const [query, setQuery] = useState("");
+  const [planCode, setPlanCode] = useState("all");
+  const [managerId, setManagerId] = useState("all");
+  const [teamStatus, setTeamStatus] = useState<TeamStatusFilter>("all");
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(
+    getInitialProjectSelection,
   );
-  const [username, setUsername] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [password, setPassword] = useState("");
-  const [membershipRoleId, setMembershipRoleId] = useState("");
-  const [membershipMemberId, setMembershipMemberId] = useState("");
-  const [customerId, setCustomerId] = useState("");
-  const [assignmentRoleId, setAssignmentRoleId] = useState("");
-  const [assignmentMemberId, setAssignmentMemberId] = useState("");
-  const [memberApiKey, setMemberApiKey] = useState("");
-  const [apiMemberId, setApiMemberId] = useState("");
+  const [highlightedRole, setHighlightedRole] =
+    useState<DeliveryRoleType | null>(getInitialHighlightedRole);
 
-  const data = overview.data;
-  const roles = data?.roles ?? [];
-  const members = data?.members ?? [];
-  const customers = data?.customers ?? [];
-  const selectedAssignmentRole = roles.find(
-    (role) => role.id === assignmentRoleId,
-  );
-  const eligibleMembers = useMemo(() => {
-    if (!assignmentRoleId) return members;
-    const ids = new Set(
-      (data?.memberships ?? [])
-        .filter((row) => row.roleId === assignmentRoleId && row.isActive)
-        .map((row) => row.memberUserId),
-    );
-    return members.filter((member) => ids.has(member.id));
-  }, [assignmentRoleId, data?.memberships, members]);
-  const migrationGaps = useMemo(() => {
-    if (!data) return [];
-    const latestContractByCustomer = new Map<
+  const data = overview.data as unknown as ProjectTeamOverview | undefined;
+  const projects = data?.projects ?? [];
+  const assignments = data?.assignments ?? [];
+  const engineers = data?.engineers ?? [];
+  const tickets = data?.tickets ?? [];
+
+  const managers = useMemo(() => {
+    const unique = new Map<
       number,
-      (typeof data.contracts)[number]
+      { id: number; username: string | null; displayName: string | null }
     >();
-    for (const contract of data.contracts) {
-      if (!latestContractByCustomer.has(contract.userId)) {
-        latestContractByCustomer.set(contract.userId, contract);
-      }
-    }
-    const assigned = new Set(
-      data.assignments.map(
-        (assignment) => `${assignment.customerUserId}:${assignment.roleType}`,
-      ),
-    );
-    return data.customers
-      .filter((customer) => customer.isActive)
-      .flatMap((customer) => {
-        const contract = latestContractByCustomer.get(customer.id);
-        if (!contract) return [];
-        const required: DeliveryRoleType[] = [
-          "knowledge_base_engineer",
-          "monitoring_optimization_engineer",
-          "content_distribution_engineer",
-          ...(contract.planCode === "basic"
-            ? []
-            : (["website_operations_engineer"] as DeliveryRoleType[])),
-        ];
-        return required
-          .filter((type) => !assigned.has(`${customer.id}:${type}`))
-          .map((type) => ({
-            customerId: customer.id,
-            customerName:
-              customer.displayName ||
-              customer.username ||
-              `客户 ${customer.id}`,
-            roleType: type,
-            planCode: contract.planCode,
-          }));
+    for (const project of projects) {
+      if (project.managerId == null) continue;
+      unique.set(project.managerId, {
+        id: project.managerId,
+        username: project.managerUsername,
+        displayName: project.managerDisplayName,
       });
-  }, [data]);
+    }
+    return [...unique.values()].sort((left, right) =>
+      engineerName(left).localeCompare(engineerName(right), "zh-CN"),
+    );
+  }, [projects]);
+
+  const filteredProjects = useMemo(
+    () =>
+      filterProjectTeams(projects, assignments, {
+        query,
+        planCode,
+        managerId,
+        teamStatus,
+      }),
+    [assignments, managerId, planCode, projects, query, teamStatus],
+  );
+  const summary = useMemo(
+    () => summarizeProjectTeams(projects, assignments, tickets),
+    [assignments, projects, tickets],
+  );
+  const selectedProject =
+    projects.find((project) => project.id === selectedProjectId) ?? null;
+  const firstPendingTicket = tickets.find(
+    (ticket) => ticket.workflowDomain && ticket.assignedMemberId == null,
+  );
+
+  useEffect(() => {
+    if (!data) return;
+    if (!filteredProjects.length) {
+      setSelectedProjectId(null);
+      return;
+    }
+    if (!filteredProjects.some((project) => project.id === selectedProjectId)) {
+      setSelectedProjectId(filteredProjects[0].id);
+      setHighlightedRole(null);
+    }
+  }, [data, filteredProjects, selectedProjectId]);
 
   const refresh = async () => {
     await utils.delivery.management.overview.invalidate();
   };
-  const submit = async (
-    action: () => Promise<unknown>,
-    success: string,
-    reset?: () => void,
-  ) => {
+
+  const updateEngineer = async (input: {
+    customerUserId: number;
+    roleType: DeliveryRoleType;
+    engineerUserId: number | null;
+    expectedRevision: number;
+  }) => {
     try {
-      await action();
-      reset?.();
+      await setProjectEngineer.mutateAsync(input);
       await refresh();
-      toast.success(success);
+      toast.success(
+        input.engineerUserId == null
+          ? "项目岗位已解除分配"
+          : "项目工程师已更新，未结束任务已同步转交",
+      );
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "操作失败");
+      await refresh();
+      toast.error(error instanceof Error ? error.message : "岗位分配失败");
     }
   };
 
   return (
     <PortalShell
-      eyebrow="交付管理 · 固定角色"
-      title="角色与团队"
+      eyebrow="交付管理 · 客户项目"
+      title="客户项目团队"
       navItems={getAdminNav(isSystemAdminAccount(user))}
       toolbar={
         <Button
@@ -146,404 +304,656 @@ export default function AdminDeliveryRoles() {
       }
     >
       <div className="mx-auto grid w-full max-w-7xl gap-5">
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <SummaryCard
+            label="客户项目"
+            value={summary.projectCount}
+            icon={<BriefcaseBusiness className="h-5 w-5" />}
+          />
+          <SummaryCard
+            label="待完善项目"
+            value={summary.incompleteProjectCount}
+            tone={summary.incompleteProjectCount ? "warning" : "success"}
+            icon={<ShieldAlert className="h-5 w-5" />}
+          />
+          <SummaryCard
+            label="缺少工程师岗位"
+            value={summary.missingRoleCount}
+            tone={summary.missingRoleCount ? "warning" : "success"}
+            icon={<UsersRound className="h-5 w-5" />}
+          />
+          <SummaryCard
+            label="待分配工单"
+            value={summary.pendingTicketCount}
+            tone={summary.pendingTicketCount ? "warning" : "success"}
+            icon={<AlertTriangle className="h-5 w-5" />}
+            onClick={
+              firstPendingTicket?.workflowDomain
+                ? () => {
+                    setSelectedProjectId(firstPendingTicket.userId);
+                    setHighlightedRole(firstPendingTicket.workflowDomain);
+                    window.setTimeout(
+                      () =>
+                        document
+                          .getElementById("project-team-details")
+                          ?.scrollIntoView({
+                            behavior: "smooth",
+                            block: "start",
+                          }),
+                      0,
+                    );
+                  }
+                : undefined
+            }
+          />
+        </div>
+
         <Card>
           <CardHeader>
-            <CardTitle>固定交付团队</CardTitle>
+            <CardTitle>筛选客户项目</CardTitle>
           </CardHeader>
-          <CardContent>
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-              {ROLE_TYPES.map((type) => {
-                const teams = roles.filter((role) => role.roleType === type);
-                return (
-                  <div key={type} className="rounded-xl border p-4">
-                    <p className="font-medium">{DELIVERY_ROLE_LABELS[type]}</p>
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {teams.length ? (
-                        teams.map((team) => (
-                          <Badge key={team.id} variant="secondary">
-                            {team.name}
-                          </Badge>
-                        ))
-                      ) : (
-                        <span className="text-xs text-muted-foreground">
-                          尚未创建团队
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            <form
-              className="mt-5 grid gap-3 md:grid-cols-[1fr_1fr_auto]"
-              onSubmit={(event: FormEvent) => {
-                event.preventDefault();
-                void submit(
-                  () => createTeam.mutateAsync({ name: teamName, roleType }),
-                  "团队已创建",
-                  () => setTeamName(""),
-                );
-              }}
-            >
-              <select
-                className="h-10 rounded-md border bg-background px-3 text-sm"
-                value={roleType}
-                onChange={(event) =>
-                  setRoleType(event.target.value as DeliveryRoleType)
-                }
-              >
-                {ROLE_TYPES.map((type) => (
-                  <option key={type} value={type}>
-                    {DELIVERY_ROLE_LABELS[type]}
-                  </option>
-                ))}
-              </select>
+          <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <div className="relative">
+              <Search className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
               <Input
-                value={teamName}
-                onChange={(event) => setTeamName(event.target.value)}
-                placeholder="例如：国内知识库一组"
-                required
+                className="pl-9"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="搜索客户名称或账号"
               />
-              <Button type="submit" disabled={createTeam.isPending}>
-                <Plus /> 创建团队
-              </Button>
-            </form>
+            </div>
+            <NativeSelect
+              value={planCode}
+              onChange={setPlanCode}
+              options={[
+                { value: "all", label: "全部套餐" },
+                { value: "basic", label: "普通版" },
+                { value: "advanced", label: "进阶版" },
+                { value: "luxury", label: "豪华版" },
+              ]}
+            />
+            <NativeSelect
+              value={managerId}
+              onChange={setManagerId}
+              options={[
+                { value: "all", label: "全部交付管理员" },
+                ...managers.map((manager) => ({
+                  value: String(manager.id),
+                  label: engineerName(manager),
+                })),
+              ]}
+            />
+            <NativeSelect
+              value={teamStatus}
+              onChange={(value) => setTeamStatus(value as TeamStatusFilter)}
+              options={[
+                { value: "all", label: "全部团队状态" },
+                { value: "complete", label: "岗位已配齐" },
+                { value: "incomplete", label: "岗位待完善" },
+              ]}
+            />
           </CardContent>
         </Card>
 
-        <Card
-          className={
-            migrationGaps.length
-              ? "border-amber-300 bg-amber-50/40"
-              : "border-emerald-200 bg-emerald-50/30"
-          }
-        >
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              {migrationGaps.length ? (
-                <ShieldAlert className="h-5 w-5 text-amber-600" />
-              ) : (
-                <ShieldCheck className="h-5 w-5 text-emerald-600" />
-              )}
-              正式启用前迁移检查
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            {migrationGaps.length ? (
-              <>
-                <p className="text-sm text-muted-foreground">
-                  仍有 {migrationGaps.length} 项在用套餐角色未配置主负责人。
-                  未配置完成前，对应客户提交入口会保持禁用。
-                </p>
-                <div className="mt-4 grid gap-2 md:grid-cols-2">
-                  {migrationGaps.slice(0, 20).map((gap) => (
-                    <div
-                      key={`${gap.customerId}:${gap.roleType}`}
-                      className="rounded-lg border border-amber-200 bg-white/80 px-3 py-2 text-sm"
+        {overview.isLoading ? (
+          <Card>
+            <CardContent className="py-14 text-center text-sm text-muted-foreground">
+              正在读取客户项目团队…
+            </CardContent>
+          </Card>
+        ) : overview.error ? (
+          <Card className="border-destructive/30">
+            <CardContent className="py-14 text-center text-sm text-destructive">
+              客户项目团队暂时无法读取，请刷新后重试。
+            </CardContent>
+          </Card>
+        ) : (
+          <div className="grid gap-5 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.35fr)]">
+            <Card className="h-fit">
+              <CardHeader>
+                <CardTitle>项目列表（{filteredProjects.length}）</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {filteredProjects.map((project) => {
+                  const projectAssignments = assignments.filter(
+                    (assignment) => assignment.customerUserId === project.id,
+                  );
+                  const requiredAssignmentCount =
+                    project.requiredRoleTypes.filter((roleType) =>
+                      projectAssignments.some(
+                        (assignment) => assignment.roleType === roleType,
+                      ),
+                    ).length;
+                  const missing = getMissingProjectRoleTypes(
+                    project,
+                    assignments,
+                  );
+                  const managerMissing = project.managerId == null;
+                  const pendingTicketRows = tickets.filter(
+                    (ticket) =>
+                      ticket.userId === project.id &&
+                      ticket.workflowDomain &&
+                      ticket.assignedMemberId == null,
+                  );
+                  const pendingTickets = pendingTicketRows.length;
+                  const roleToHighlight =
+                    pendingTicketRows[0]?.workflowDomain ?? missing[0] ?? null;
+                  return (
+                    <button
+                      key={project.id}
+                      type="button"
+                      className={cn(
+                        "w-full rounded-xl border p-4 text-left transition-colors hover:border-primary/50 hover:bg-muted/25",
+                        selectedProjectId === project.id &&
+                          "border-primary bg-primary/[0.035]",
+                      )}
+                      onClick={() => {
+                        setSelectedProjectId(project.id);
+                        setHighlightedRole(roleToHighlight);
+                        window.setTimeout(
+                          () =>
+                            document
+                              .getElementById("project-team-details")
+                              ?.scrollIntoView({
+                                behavior: "smooth",
+                                block: "start",
+                              }),
+                          0,
+                        );
+                      }}
                     >
-                      <span className="font-medium">{gap.customerName}</span>
-                      <span className="ml-2 text-muted-foreground">
-                        缺少 {DELIVERY_ROLE_LABELS[gap.roleType]}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-                {migrationGaps.length > 20 && (
-                  <p className="mt-3 text-xs text-muted-foreground">
-                    另有 {migrationGaps.length - 20}{" "}
-                    项，请继续完成下方客户负责人配置。
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate font-medium">
+                            {projectName(project)}
+                          </p>
+                          <p className="mt-1 truncate text-xs text-muted-foreground">
+                            {project.username || `客户 #${project.id}`}
+                          </p>
+                        </div>
+                        <Badge
+                          variant={
+                            managerMissing || missing.length
+                              ? "outline"
+                              : "secondary"
+                          }
+                          className={
+                            managerMissing || missing.length
+                              ? "border-amber-300 text-amber-700"
+                              : "text-emerald-700"
+                          }
+                        >
+                          {managerMissing
+                            ? "缺少交付管理员"
+                            : missing.length
+                              ? `缺少 ${missing.length} 岗`
+                              : "已配齐"}
+                        </Badge>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <Badge variant="outline">
+                          {planLabel(project.planCode)}
+                        </Badge>
+                        <Badge variant="outline">
+                          {contractStatusLabel(project.contractStatus)}
+                        </Badge>
+                        {!project.isActive && (
+                          <Badge variant="destructive">账号已停用</Badge>
+                        )}
+                      </div>
+                      <div className="mt-3 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                        <span className="truncate">
+                          交付管理员：
+                          {project.managerDisplayName ||
+                            project.managerUsername ||
+                            "未设置"}
+                        </span>
+                        <span>
+                          {requiredAssignmentCount}/
+                          {project.requiredRoleTypes.length} 岗
+                        </span>
+                      </div>
+                      {pendingTickets > 0 && (
+                        <p className="mt-3 flex items-center gap-1.5 border-t pt-3 text-xs font-medium text-amber-700">
+                          <AlertTriangle className="h-3.5 w-3.5" />
+                          {pendingTickets} 个待分配工单，点击配置缺失岗位
+                        </p>
+                      )}
+                    </button>
+                  );
+                })}
+                {!filteredProjects.length && (
+                  <p className="py-12 text-center text-sm text-muted-foreground">
+                    没有符合当前筛选条件的客户项目
                   </p>
                 )}
-              </>
-            ) : (
-              <p className="text-sm text-emerald-800">
-                当前所有在用套餐需要的固定业务角色均已配置主负责人。
-              </p>
-            )}
-          </CardContent>
-        </Card>
+              </CardContent>
+            </Card>
 
-        <div className="grid gap-5 xl:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <UsersRound className="h-5 w-5" /> 创建交付成员
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <form
-                className="grid gap-3"
-                onSubmit={(event: FormEvent) => {
-                  event.preventDefault();
-                  void submit(
-                    () =>
-                      createMember.mutateAsync({
-                        username,
-                        password,
-                        displayName: displayName || undefined,
-                      }),
-                    "交付成员已创建",
-                    () => {
-                      setUsername("");
-                      setDisplayName("");
-                      setPassword("");
-                    },
-                  );
-                }}
-              >
-                <Input
-                  value={username}
-                  onChange={(event) => setUsername(event.target.value)}
-                  placeholder="登录用户名"
-                  required
-                />
-                <Input
-                  value={displayName}
-                  onChange={(event) => setDisplayName(event.target.value)}
-                  placeholder="成员姓名"
-                />
-                <Input
-                  type="password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  placeholder="初始密码"
-                  required
-                />
-                <Button type="submit" disabled={createMember.isPending}>
-                  创建账号
-                </Button>
-              </form>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>成员加入团队</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <form
-                className="grid gap-3"
-                onSubmit={(event: FormEvent) => {
-                  event.preventDefault();
-                  void submit(
-                    () =>
-                      setMember.mutateAsync({
-                        roleId: membershipRoleId,
-                        memberUserId: Number(membershipMemberId),
-                        active: true,
-                      }),
-                    "成员角色已更新",
-                  );
-                }}
-              >
-                <NativeSelect
-                  value={membershipRoleId}
-                  onChange={setMembershipRoleId}
-                  placeholder="选择固定角色团队"
-                  options={roles.map((role) => ({
-                    value: role.id,
-                    label: `${DELIVERY_ROLE_LABELS[role.roleType]} · ${role.name}`,
-                  }))}
-                />
-                <NativeSelect
-                  value={membershipMemberId}
-                  onChange={setMembershipMemberId}
-                  placeholder="选择交付成员"
-                  options={members.map((member) => ({
-                    value: String(member.id),
-                    label:
-                      member.displayName ||
-                      member.username ||
-                      String(member.id),
-                  }))}
-                />
-                <Button
-                  type="submit"
-                  disabled={
-                    setMember.isPending ||
-                    !membershipRoleId ||
-                    !membershipMemberId
-                  }
-                >
-                  加入团队
-                </Button>
-              </form>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>客户主负责人</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <form
-                className="grid gap-3"
-                onSubmit={(event: FormEvent) => {
-                  event.preventDefault();
-                  if (!selectedAssignmentRole) return;
-                  void submit(
-                    () =>
-                      assignCustomer.mutateAsync({
-                        customerUserId: Number(customerId),
-                        roleType: selectedAssignmentRole.roleType,
-                        roleId: selectedAssignmentRole.id,
-                        primaryMemberId: Number(assignmentMemberId),
-                      }),
-                    "客户负责人已配置，未完成工单已同步转派",
-                  );
-                }}
-              >
-                <NativeSelect
-                  value={customerId}
-                  onChange={setCustomerId}
-                  placeholder="选择客户"
-                  options={customers.map((customer) => ({
-                    value: String(customer.id),
-                    label:
-                      customer.displayName ||
-                      customer.username ||
-                      String(customer.id),
-                  }))}
-                />
-                <NativeSelect
-                  value={assignmentRoleId}
-                  onChange={(value) => {
-                    setAssignmentRoleId(value);
-                    setAssignmentMemberId("");
-                  }}
-                  placeholder="选择业务角色与团队"
-                  options={roles.map((role) => ({
-                    value: role.id,
-                    label: `${DELIVERY_ROLE_LABELS[role.roleType]} · ${role.name}`,
-                  }))}
-                />
-                <NativeSelect
-                  value={assignmentMemberId}
-                  onChange={setAssignmentMemberId}
-                  placeholder="选择该团队成员"
-                  options={eligibleMembers.map((member) => ({
-                    value: String(member.id),
-                    label:
-                      member.displayName ||
-                      member.username ||
-                      String(member.id),
-                  }))}
-                />
-                <Button
-                  type="submit"
-                  disabled={
-                    assignCustomer.isPending ||
-                    !customerId ||
-                    !assignmentRoleId ||
-                    !assignmentMemberId
-                  }
-                >
-                  设置主负责人
-                </Button>
-              </form>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <KeyRound className="h-5 w-5" /> 成员通用智能体 Key
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="mb-4 text-sm text-muted-foreground">
-                Key 仅在服务端加密保存，交付成员只能看到是否已配置。
-              </p>
-              <form
-                className="grid gap-3"
-                onSubmit={(event: FormEvent) => {
-                  event.preventDefault();
-                  void submit(
-                    () =>
-                      setApiKey.mutateAsync({
-                        memberUserId: Number(apiMemberId),
-                        apiKey: memberApiKey,
-                      }),
-                    "成员 API Key 已验证并更新",
-                    () => setMemberApiKey(""),
-                  );
-                }}
-              >
-                <NativeSelect
-                  value={apiMemberId}
-                  onChange={setApiMemberId}
-                  placeholder="选择交付成员"
-                  options={members.map((member) => ({
-                    value: String(member.id),
-                    label:
-                      member.displayName ||
-                      member.username ||
-                      String(member.id),
-                  }))}
-                />
-                <Label htmlFor="member-api-key">API Key</Label>
-                <Input
-                  id="member-api-key"
-                  type="password"
-                  autoComplete="off"
-                  value={memberApiKey}
-                  onChange={(event) => setMemberApiKey(event.target.value)}
-                  required
-                />
-                <Button
-                  type="submit"
-                  disabled={
-                    setApiKey.isPending || !apiMemberId || !memberApiKey
-                  }
-                >
-                  验证并分配
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="text-destructive"
-                  disabled={revokeApiKey.isPending || !apiMemberId}
-                  onClick={() => {
-                    if (!window.confirm("确认撤销该成员当前 API Key？")) return;
-                    void submit(
-                      () =>
-                        revokeApiKey.mutateAsync({
-                          memberUserId: Number(apiMemberId),
-                        }),
-                      "成员 API Key 已撤销",
-                    );
-                  }}
-                >
-                  撤销当前 Key
-                </Button>
-              </form>
-            </CardContent>
-          </Card>
-        </div>
+            <Card id="project-team-details" className="scroll-mt-5">
+              <CardHeader>
+                <CardTitle>项目团队详情</CardTitle>
+              </CardHeader>
+              <CardContent>
+                {selectedProject ? (
+                  <ProjectDetails
+                    project={selectedProject}
+                    assignments={assignments}
+                    engineers={engineers}
+                    tickets={tickets}
+                    highlightedRole={highlightedRole}
+                    mutationPending={setProjectEngineer.isPending}
+                    onUpdateEngineer={updateEngineer}
+                  />
+                ) : (
+                  <p className="py-16 text-center text-sm text-muted-foreground">
+                    请选择一个客户项目查看团队配置
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        )}
       </div>
     </PortalShell>
   );
 }
 
-function NativeSelect(props: {
+function ProjectDetails({
+  project,
+  assignments,
+  engineers,
+  tickets,
+  highlightedRole,
+  mutationPending,
+  onUpdateEngineer,
+}: {
+  project: ProjectTeamProject;
+  assignments: ProjectTeamAssignment[];
+  engineers: ProjectTeamEngineer[];
+  tickets: ProjectTicket[];
+  highlightedRole: DeliveryRoleType | null;
+  mutationPending: boolean;
+  onUpdateEngineer: (input: {
+    customerUserId: number;
+    roleType: DeliveryRoleType;
+    engineerUserId: number | null;
+    expectedRevision: number;
+  }) => Promise<void>;
+}) {
+  const projectAssignments = assignments.filter(
+    (assignment) => assignment.customerUserId === project.id,
+  );
+  const missing = getMissingProjectRoleTypes(project, assignments);
+  const managerMissing = project.managerId == null;
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="text-lg font-semibold">{projectName(project)}</h2>
+          <Badge variant="outline">{planLabel(project.planCode)}</Badge>
+          <Badge
+            variant={managerMissing || missing.length ? "outline" : "secondary"}
+            className={
+              managerMissing || missing.length
+                ? "text-amber-700"
+                : "text-emerald-700"
+            }
+          >
+            {managerMissing
+              ? "待设置交付管理员"
+              : missing.length
+                ? `待补齐 ${missing.length} 个岗位`
+                : "团队已配齐"}
+          </Badge>
+        </div>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {project.username || `客户 #${project.id}`} · 服务期{" "}
+          {formatDate(project.contractStartsAt)} 至{" "}
+          {formatDate(project.contractEndsAt)}
+        </p>
+      </div>
+
+      <div className="rounded-xl border bg-muted/20 p-4">
+        <div className="flex items-center gap-2">
+          <UserCog className="h-5 w-5 text-primary" />
+          <p className="font-medium">交付管理员负责人</p>
+          <Badge variant="outline">只读</Badge>
+        </div>
+        <p className="mt-2 text-sm">
+          {project.managerDisplayName ||
+            project.managerUsername ||
+            "尚未设置交付管理员"}
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {project.managerId
+            ? `账号：${project.managerUsername || `#${project.managerId}`}`
+            : "请在客户交付工作台设置该项目的交付管理员。"}
+        </p>
+      </div>
+
+      <div className="grid gap-3">
+        {ROLE_TYPES.map((roleType) => {
+          const assignment = projectAssignments.find(
+            (row) => row.roleType === roleType,
+          );
+          const roleTickets = tickets.filter(
+            (ticket) =>
+              ticket.userId === project.id &&
+              ticket.workflowDomain === roleType,
+          );
+          return (
+            <ProjectRoleCard
+              key={roleType}
+              project={project}
+              roleType={roleType}
+              assignment={assignment}
+              engineers={engineers}
+              activeTicketCount={roleTickets.length}
+              highlighted={highlightedRole === roleType}
+              mutationPending={mutationPending}
+              onUpdateEngineer={onUpdateEngineer}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ProjectRoleCard({
+  project,
+  roleType,
+  assignment,
+  engineers,
+  activeTicketCount,
+  highlighted,
+  mutationPending,
+  onUpdateEngineer,
+}: {
+  project: ProjectTeamProject;
+  roleType: DeliveryRoleType;
+  assignment?: ProjectTeamAssignment;
+  engineers: ProjectTeamEngineer[];
+  activeTicketCount: number;
+  highlighted: boolean;
+  mutationPending: boolean;
+  onUpdateEngineer: (input: {
+    customerUserId: number;
+    roleType: DeliveryRoleType;
+    engineerUserId: number | null;
+    expectedRevision: number;
+  }) => Promise<void>;
+}) {
+  const enabled = project.requiredRoleTypes.includes(roleType);
+  const matchingEngineers = engineers.filter(
+    (engineer) => engineer.isActive && engineer.engineerRoleType === roleType,
+  );
+  const currentEngineer = engineers.find(
+    (engineer) => engineer.id === assignment?.engineerUserId,
+  );
+  const apiKeyConfigured =
+    assignment?.engineerApiKeyConfigured ??
+    currentEngineer?.apiKeyConfigured ??
+    false;
+  const assigned = assignment?.engineerUserId != null;
+  const disabledRoleWithAssignment = !enabled && assigned;
+  const currentEngineerLabel = currentEngineer
+    ? engineerName(currentEngineer)
+    : assigned
+      ? assignment.engineerDisplayName ||
+        assignment.engineerUsername ||
+        `工程师 #${assignment.engineerUserId}`
+      : "";
+
+  const handleChange = async (rawValue: string) => {
+    const engineerUserId = rawValue ? Number(rawValue) : null;
+    if (engineerUserId === (assignment?.engineerUserId ?? null)) return;
+    if (engineerUserId == null && activeTicketCount > 0) {
+      toast.error(
+        `该岗位还有 ${activeTicketCount} 个未结束工单，只能更换负责人，不能解除分配。`,
+      );
+      return;
+    }
+    if (assignment) {
+      const confirmed = window.confirm(
+        engineerUserId == null
+          ? disabledRoleWithAssignment
+            ? `确认解除已停用岗位 ${DELIVERY_ROLE_LABELS[roleType]} 的遗留负责人？`
+            : `确认解除 ${DELIVERY_ROLE_LABELS[roleType]}？`
+          : `确认更换 ${DELIVERY_ROLE_LABELS[roleType]}？系统将同步转交 ${activeTicketCount} 个未结束工单及待处理知识库重置请求。`,
+      );
+      if (!confirmed) return;
+    }
+    await onUpdateEngineer({
+      customerUserId: project.id,
+      roleType,
+      engineerUserId,
+      expectedRevision: assignment?.revision ?? 0,
+    });
+  };
+
+  return (
+    <div
+      className={cn(
+        "rounded-xl border p-4 transition-shadow",
+        !enabled && "bg-muted/25 opacity-75",
+        highlighted && enabled && "border-amber-400 ring-2 ring-amber-200",
+      )}
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="font-medium">{DELIVERY_ROLE_LABELS[roleType]}</p>
+            {!enabled ? (
+              <>
+                <Badge variant="outline">当前套餐未启用</Badge>
+                {assigned && (
+                  <Badge
+                    variant="outline"
+                    className="border-amber-300 text-amber-700"
+                  >
+                    遗留负责人
+                  </Badge>
+                )}
+              </>
+            ) : assigned ? (
+              <Badge variant="secondary" className="text-emerald-700">
+                <CheckCircle2 className="mr-1 h-3 w-3" />
+                已分配
+              </Badge>
+            ) : (
+              <Badge
+                variant="outline"
+                className="border-amber-300 text-amber-700"
+              >
+                待分配
+              </Badge>
+            )}
+          </div>
+          {(enabled || assigned) && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              {!enabled
+                ? activeTicketCount
+                  ? `该岗位有 ${activeTicketCount} 个未结束工单，需先完成后才能解除遗留负责人。`
+                  : `当前负责人：${currentEngineerLabel}。该岗位已随套餐停用，可以解除遗留负责人。`
+                : activeTicketCount
+                  ? `${activeTicketCount} 个未结束工单将随负责人同步转交`
+                  : "当前没有未结束工单"}
+            </p>
+          )}
+        </div>
+        {assigned && (
+          <Badge
+            variant="outline"
+            className={
+              apiKeyConfigured
+                ? "border-emerald-300 text-emerald-700"
+                : "border-amber-300 text-amber-700"
+            }
+          >
+            {apiKeyConfigured ? "Key 已配置" : "Key 未配置"}
+          </Badge>
+        )}
+      </div>
+
+      {(enabled || assigned) && (
+        <select
+          className="mt-3 h-10 w-full rounded-md border bg-background px-3 text-sm"
+          aria-label={`${DELIVERY_ROLE_LABELS[roleType]}负责人`}
+          value={assigned ? String(assignment.engineerUserId) : ""}
+          disabled={mutationPending || (!enabled && activeTicketCount > 0)}
+          onChange={(event) => void handleChange(event.target.value)}
+        >
+          <option value="">
+            {disabledRoleWithAssignment
+              ? "解除已停用岗位"
+              : assigned
+                ? "解除岗位分配"
+                : "选择匹配岗位的工程师"}
+          </option>
+          {assigned &&
+            (!enabled ||
+              !currentEngineer ||
+              !matchingEngineers.some(
+                (engineer) => engineer.id === assignment.engineerUserId,
+              )) && (
+              <option value={assignment.engineerUserId!}>
+                {currentEngineerLabel}
+                {enabled ? "（账号已停用）" : "（当前负责人）"}
+              </option>
+            )}
+          {enabled &&
+            matchingEngineers.map((engineer) => (
+              <option key={engineer.id} value={engineer.id}>
+                {engineerName(engineer)}
+                {engineer.apiKeyConfigured ? "" : "（Key 未配置）"}
+              </option>
+            ))}
+        </select>
+      )}
+      {enabled && !matchingEngineers.length && !assigned && (
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-amber-700">
+          <AlertTriangle className="h-3.5 w-3.5" />
+          暂无可分配的同岗位工程师，请先到“账号与权限”创建工程师账号。
+        </p>
+      )}
+    </div>
+  );
+}
+
+function SummaryCard({
+  label,
+  value,
+  icon,
+  tone = "default",
+  onClick,
+}: {
+  label: string;
+  value: number;
+  icon: React.ReactNode;
+  tone?: "default" | "warning" | "success";
+  onClick?: () => void;
+}) {
+  const card = (
+    <Card>
+      <CardContent className="flex items-center justify-between gap-3 p-5">
+        <div>
+          <p className="text-sm text-muted-foreground">{label}</p>
+          <p
+            className={cn(
+              "mt-1 text-2xl font-semibold",
+              tone === "warning" && "text-amber-700",
+              tone === "success" && "text-emerald-700",
+            )}
+          >
+            {value}
+          </p>
+        </div>
+        <div
+          className={cn(
+            "rounded-xl bg-muted p-3 text-muted-foreground",
+            tone === "warning" && "bg-amber-50 text-amber-700",
+            tone === "success" && "bg-emerald-50 text-emerald-700",
+          )}
+        >
+          {icon}
+        </div>
+      </CardContent>
+    </Card>
+  );
+  return onClick ? (
+    <button
+      type="button"
+      className="rounded-xl text-left transition-transform hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      onClick={onClick}
+      aria-label={`${label} ${value} 个，打开首个待处理项目`}
+    >
+      {card}
+    </button>
+  ) : (
+    card
+  );
+}
+
+function NativeSelect({
+  value,
+  onChange,
+  options,
+}: {
   value: string;
   onChange: (value: string) => void;
-  placeholder: string;
   options: Array<{ value: string; label: string }>;
 }) {
   return (
     <select
       className="h-10 rounded-md border bg-background px-3 text-sm"
-      value={props.value}
-      onChange={(event) => props.onChange(event.target.value)}
-      required
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
     >
-      <option value="">{props.placeholder}</option>
-      {props.options.map((option) => (
+      {options.map((option) => (
         <option key={option.value} value={option.value}>
           {option.label}
         </option>
       ))}
     </select>
   );
+}
+
+function projectName(
+  project: Pick<ProjectTeamProject, "id" | "displayName" | "username">,
+) {
+  return project.displayName || project.username || `客户 ${project.id}`;
+}
+
+function engineerName(engineer: {
+  id: number;
+  displayName: string | null;
+  username: string | null;
+}) {
+  return engineer.displayName || engineer.username || `账号 ${engineer.id}`;
+}
+
+function planLabel(planCode: string | null) {
+  if (planCode === "basic") return "普通版";
+  if (planCode === "advanced") return "进阶版";
+  if (planCode === "luxury") return "豪华版";
+  return "套餐未配置";
+}
+
+function contractStatusLabel(status: string | null) {
+  if (status === "pending_confirmation") return "待确认";
+  if (status === "scheduled") return "待生效";
+  if (status === "active") return "服务中";
+  if (status === "suspended") return "已暂停";
+  if (status === "expired") return "已到期";
+  if (status === "cancelled") return "已取消";
+  return "服务未配置";
+}
+
+function formatDate(value: Date | string | number | null) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleDateString("zh-CN");
 }

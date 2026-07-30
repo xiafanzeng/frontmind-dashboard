@@ -94,10 +94,11 @@ export default function ManagerAssignmentEditor({
   };
   const selectedDeliveryOptions = options.filter(
     (option) =>
-      draftIds.includes(option.id) &&
-      (option.accessLevel === "delivery_admin" ||
-        option.accessLevel === "system_admin"),
+      draftIds.includes(option.id) && option.accessLevel === "delivery_admin",
   );
+  const hasValidUsageOwner =
+    draftUsageOwnerId != null &&
+    selectedDeliveryOptions.some((option) => option.id === draftUsageOwnerId);
   const ownerChanged = (usageOwnerId ?? null) !== draftUsageOwnerId;
 
   return (
@@ -207,9 +208,8 @@ export default function ManagerAssignmentEditor({
                           }
                           if (
                             event.target.checked &&
-                            (option.accessLevel === "delivery_admin" ||
-                              option.accessLevel === "system_admin") &&
-                            draftUsageOwnerId == null
+                            option.accessLevel === "delivery_admin" &&
+                            !hasValidUsageOwner
                           ) {
                             setDraftUsageOwnerId(option.id);
                           }
@@ -270,8 +270,7 @@ export default function ManagerAssignmentEditor({
               ))}
             </select>
             <p className="mt-2 text-xs leading-5 text-[#8d8499]">
-              多位管理员仍可协作；主负责人承接交付责任，客户任务优先使用客户自己的
-              Key。
+              主负责人必须选择交付管理员；系统管理员可保留为协作管理员，但不能承接客户主负责人职责。
             </p>
           </div>
 
@@ -296,8 +295,7 @@ export default function ManagerAssignmentEditor({
                 size="sm"
                 disabled={
                   saving ||
-                  (selectedDeliveryOptions.length > 0 &&
-                    draftUsageOwnerId == null) ||
+                  (draftIds.length > 0 && !hasValidUsageOwner) ||
                   (sameIds(draftIds, selectedIds) && !ownerChanged)
                 }
                 onClick={() => void saveAssignments()}

@@ -124,14 +124,14 @@ function Router() {
       <Route path={"/"} component={RoleLanding} />
       <Route path={"/login"} component={RoleLanding} />
       <Route path={"/agent"}>
-        <SystemAdminOnly>
+        <AdminOnly>
           <Redirect to="/admin/agent" />
-        </SystemAdminOnly>
+        </AdminOnly>
       </Route>
       <Route path={"/admin/agent"}>
-        <SystemAdminOnly>
+        <AdminOnly>
           <AdminAgent />
-        </SystemAdminOnly>
+        </AdminOnly>
       </Route>
       <Route path={"/knowledge-base"}>
         <UserOnly>
@@ -217,26 +217,32 @@ function Router() {
  * "running" state after page reload / tab switch are automatically
  * recovered.
  */
-function AppShell() {
+function AppShell({ resumePolling = true }: { resumePolling?: boolean }) {
   // CRITICAL FIX: Resume polling for stuck "running" conversations
-  useResumePolling();
-
   return (
-    <Suspense
-      fallback={
-        <div className="flex min-h-[100dvh] items-center justify-center bg-background">
-          <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
-            <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-              <Loader2 className="h-5 w-5 animate-spin" />
+    <>
+      {resumePolling && <ConversationResumePolling />}
+      <Suspense
+        fallback={
+          <div className="flex min-h-[100dvh] items-center justify-center bg-background">
+            <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
+              <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                <Loader2 className="h-5 w-5 animate-spin" />
+              </div>
+              正在载入工作空间
             </div>
-            正在载入工作空间
           </div>
-        </div>
-      }
-    >
-      <Router />
-    </Suspense>
+        }
+      >
+        <Router />
+      </Suspense>
+    </>
   );
+}
+
+function ConversationResumePolling() {
+  useResumePolling();
+  return null;
 }
 
 export function AuthBoundary() {
@@ -277,6 +283,10 @@ export function AuthBoundary() {
   }
 
   if (!user) return <Login />;
+
+  if (user.role === "delivery_member") {
+    return <AppShell resumePolling={false} />;
+  }
 
   return (
     <ConversationProvider>

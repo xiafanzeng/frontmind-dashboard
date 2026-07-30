@@ -12,7 +12,6 @@ import {
 import {
   CONTENT_ASSET_CATALOG,
   contentAssetMediaOptionsForMarketEdition,
-  icpMaterialChecklistForProvince,
 } from "../shared/delivery-catalog";
 import {
   aggregateDeliveryTicketQuotaCapacity,
@@ -294,6 +293,26 @@ describe("delivery ticket contract", () => {
     ).toThrow("不接收附件");
   });
 
+  it("rejects the retired protected ICP attachment protocol", () => {
+    expect(() =>
+      createDeliveryTicketSchema.parse({
+        clientRequestId: "837f5ac0-5a0e-4dc4-a42e-73509a7ca2e4",
+        type: "website_operation",
+        category: "icp_filing",
+        topic: "example.com",
+        icpDeclarations: { icpNumber: "京ICP备12345678号" },
+        attachments: [
+          {
+            storageKind: "icp_protected",
+            protectedMaterialId: "d589416d-ee19-4998-ac2c-b760448f80a3",
+            sensitiveCategory: "business_license",
+            filename: "营业执照",
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
   it("accepts one completed domain and ICP result before a site profile exists", async () => {
     const value = createDeliveryTicketSchema.parse({
       clientRequestId: "5f05091b-0e0a-4482-8f11-654c4502b3e1",
@@ -322,17 +341,6 @@ describe("delivery ticket contract", () => {
       profile: null,
       domain: "example.com",
     });
-  });
-
-  it("returns province-specific ICP requirements from the server catalog", () => {
-    const guangdong = icpMaterialChecklistForProvince("广东");
-    const zhejiang = icpMaterialChecklistForProvince("浙江");
-    expect(
-      guangdong.find((item) => item.key === "other_provincial_material"),
-    ).toMatchObject({ required: true });
-    expect(
-      zhejiang.find((item) => item.key === "other_provincial_material"),
-    ).toMatchObject({ required: false });
   });
 
   it("validates bounded user and administrator list filters", () => {
@@ -676,7 +684,6 @@ describe("customer delivery-ticket DTO boundary", () => {
         canSubmitContent: true,
         icpProvince: "广东",
         icpProvinceOptions: ["广东"],
-        icpMaterialChecklist: [{ key: "business_license" }],
         icpLockReason: null,
         contentLockReason: null,
       },
@@ -696,7 +703,6 @@ describe("customer delivery-ticket DTO boundary", () => {
       icpProvinceOptions: ["广东"],
     });
     expect(metadata.websiteWorkflow).not.toHaveProperty("icpProvince");
-    expect(metadata.websiteWorkflow).not.toHaveProperty("icpMaterialChecklist");
     expect(metadata.quotas.content_asset_publish).toEqual({
       type: "content_asset_publish",
       allowed: true,

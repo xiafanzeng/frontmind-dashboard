@@ -211,7 +211,7 @@ export const adminNav: PortalNavItem[] = [
     activePrefixes: ["/admin/customers"],
   },
   {
-    label: "角色与团队",
+    label: "客户项目团队",
     href: "/admin/delivery-roles",
     icon: UsersRound,
     group: "客户与服务",
@@ -267,10 +267,10 @@ export function getAdminNav(systemAdmin: boolean) {
       href: "/admin/workspace",
       icon: UserCog,
       group: "交付管理",
-      activePrefixes: ["/admin/customers", "/admin/users"],
+      activePrefixes: ["/admin/customers"],
     },
     {
-      label: "角色与团队",
+      label: "客户项目团队",
       href: "/admin/delivery-roles",
       icon: UsersRound,
       group: "交付管理",
@@ -282,9 +282,15 @@ export function getAdminNav(systemAdmin: boolean) {
       group: "交付管理",
     },
     {
-      label: "API Key 管理",
-      href: "/admin/delivery-roles?view=api-keys",
+      label: "FrontMind Agent",
+      href: "/admin/agent",
       icon: Bot,
+      group: "Agent 与资源",
+    },
+    {
+      label: "账号与权限",
+      href: "/admin/users",
+      icon: Users,
       group: "交付管理",
     },
   ];

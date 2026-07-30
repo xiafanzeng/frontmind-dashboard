@@ -61,4 +61,17 @@ describe("AdminAgent preview", () => {
     expect(source).toContain("showAccountMenu={false}");
     expect(source).toContain('standardWelcomeVariant="workflow"');
   });
+
+  it("keeps the live Agent route available to delivery administrators", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/App.tsx"),
+      "utf8",
+    );
+    expect(source).toContain(
+      '<Route path={"/admin/agent"}>\n        <AdminOnly>',
+    );
+    expect(source).not.toContain(
+      '<Route path={"/admin/agent"}>\n        <SystemAdminOnly>',
+    );
+  });
 });

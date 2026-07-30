@@ -16,7 +16,7 @@ const sourceRoot = path.join(
 const outputPath = path.join(
   projectRoot,
   "private-workflows",
-  "socratic-kb-builder.skill",
+  "socratic-kb-builder-v3.skill",
 );
 const fixedDate = new Date("2000-01-01T00:00:00.000Z");
 

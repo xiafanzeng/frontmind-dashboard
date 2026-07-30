@@ -32,16 +32,14 @@ import {
   requireExpressAuth,
 } from "./express-auth";
 import { resolveUpstreamCredential } from "./upstream-credential";
-import { enforceFrontMindProxyAccess } from "./frontmind-proxy-policy";
+import {
+  enforceDeliveryProjectContext,
+  enforceFrontMindProxyAccess,
+} from "./frontmind-proxy-policy";
 import { processKnowledgeResetCleanupJobs } from "../knowledge-base-reset-service";
 import { assertCredentialEncryptionConfigured } from "../auth-service";
 import { getDb } from "../db";
 import deliveryTicketAttachmentRouter from "../delivery-ticket-attachment-router";
-import icpMaterialRouter from "../icp-material-router";
-import {
-  assertIcpMaterialStorageConfigured,
-  startIcpMaterialRetentionScheduler,
-} from "../icp-material-service";
 import { startApiUsageSnapshotScheduler } from "../api-usage-snapshot-service";
 import {
   assertDedicatedMonitorCredentialConfigured,
@@ -81,7 +79,6 @@ function assertProductionConfiguration() {
   assertCredentialEncryptionConfigured();
   assertPresalesProxyConfigured();
   assertProvisioningConfigured();
-  assertIcpMaterialStorageConfigured();
   assertDedicatedMonitorCredentialConfigured();
   monitorBaseUrl();
   assertFrontMindPublicUrlConfigured();
@@ -132,11 +129,8 @@ async function startServer() {
     next();
   });
   // Authenticate private service routes before the global JSON parser.
-  // The legacy ICP route is retained only for historical material access;
-  // new ICP material uploads return HTTP 410.
   app.use("/api/internal/presales", presalesProxy);
   app.use("/api/internal/provisioning", provisioningRouter);
-  app.use("/api/icp-materials", requireExpressAuth, icpMaterialRouter);
 
   // JSON/form payloads keep a bounded parser.
   app.use(express.json({ limit: "50mb" }));
@@ -193,9 +187,15 @@ async function startServer() {
   app.use(
     "/api/delivery-ticket-attachments",
     requireExpressAuth,
+    enforceDeliveryProjectContext,
     deliveryTicketAttachmentRouter,
   );
-  app.use("/api/frontmind/assets", requireExpressAuth, preparedFileRouter);
+  app.use(
+    "/api/frontmind/assets",
+    requireExpressAuth,
+    enforceDeliveryProjectContext,
+    preparedFileRouter,
+  );
   app.use(
     "/api/frontmind",
     requireExpressAuth,
@@ -288,7 +288,6 @@ async function startServer() {
   }
 
   await startApiUsageSnapshotScheduler();
-  startIcpMaterialRetentionScheduler();
   startDashboardImportPreflightCleanupScheduler();
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);

@@ -29,7 +29,7 @@ describe("administrator channel navigation", () => {
       expect(navigation.map((item) => item.label)).toEqual([
         "交付总览",
         "客户交付工作台",
-        ...(_name === "real" ? ["角色与团队", "工单调度"] : []),
+        ...(_name === "real" ? ["客户项目团队", "工单调度"] : []),
         "FrontMind Agent",
         "官网任务与积分",
         "账号与权限",
@@ -91,15 +91,16 @@ describe("administrator channel navigation", () => {
     },
   );
 
-  it("keeps delivery administrators on the five management modules", () => {
+  it("keeps delivery administrators on the management modules and generic Agent", () => {
     const deliveryAdminNavigation = getAdminNav(false);
 
     expect(deliveryAdminNavigation.map((item) => item.label)).toEqual([
       "交付总览",
       "客户管理",
-      "角色与团队",
+      "客户项目团队",
       "工单调度",
-      "API Key 管理",
+      "FrontMind Agent",
+      "账号与权限",
     ]);
     expect(
       deliveryAdminNavigation.some((item) => item.href === "/admin/presales"),
@@ -107,6 +108,14 @@ describe("administrator channel navigation", () => {
     expect(deliveryAdminNavigation.some((item) => item.external)).toBe(false);
     expect(
       deliveryAdminNavigation.some((item) => item.href === "/admin/agent"),
+    ).toBe(true);
+    expect(
+      deliveryAdminNavigation.find((item) => item.label === "账号与权限"),
+    ).toMatchObject({ href: "/admin/users" });
+    expect(
+      deliveryAdminNavigation.some((item) =>
+        item.href.includes("view=api-keys"),
+      ),
     ).toBe(false);
   });
 

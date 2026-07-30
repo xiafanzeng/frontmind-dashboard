@@ -53,7 +53,7 @@ class SharedUsersTableDb {
                 {
                   id: this.deliveryAdminId,
                   role: "admin",
-                  adminAccessLevel: "system_admin",
+                  adminAccessLevel: "delivery_admin",
                   isActive: true,
                 },
               ];

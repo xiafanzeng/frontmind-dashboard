@@ -50,7 +50,12 @@ function getAttachmentFileIds(req: FrontMindRequest) {
     .filter(Boolean);
 }
 
-function sendCredentialError(res: Response, status: number, message: string, code: string) {
+function sendCredentialError(
+  res: Response,
+  status: number,
+  message: string,
+  code: string,
+) {
   res.status(status).json({ error: { message, code } });
 }
 
@@ -85,11 +90,16 @@ export async function resolveUpstreamCredential(
     }
 
     const primaryResource = getPrimaryResource(req);
+    const projectAssignmentId =
+      user.role === "delivery_member"
+        ? req.frontmindDeliveryProjectContext?.projectAssignmentId
+        : undefined;
     const credential = primaryResource
       ? await getCredentialForUpstreamResource(
           user.id,
           primaryResource.kind,
           primaryResource.id,
+          projectAssignmentId,
         )
       : await getEffectiveDecryptedCredentialForAccount(user.id);
 
@@ -100,13 +110,20 @@ export async function resolveUpstreamCredential(
         primaryResource
           ? "该任务或文件不属于当前账号，或其原 API Key 已删除"
           : "当前账号尚未由管理员配置 API Key",
-        primaryResource ? "UPSTREAM_RESOURCE_FORBIDDEN" : "API_CREDENTIAL_REQUIRED",
+        primaryResource
+          ? "UPSTREAM_RESOURCE_FORBIDDEN"
+          : "API_CREDENTIAL_REQUIRED",
       );
       return;
     }
 
     for (const fileId of getAttachmentFileIds(req)) {
-      const ownedFile = await getCredentialForUpstreamResource(user.id, "file", fileId);
+      const ownedFile = await getCredentialForUpstreamResource(
+        user.id,
+        "file",
+        fileId,
+        projectAssignmentId,
+      );
       if (
         !ownedFile ||
         !credentialsUseSameUpstreamApiKey(ownedFile, credential)
@@ -131,7 +148,9 @@ export async function resolveUpstreamCredential(
       res,
       503,
       configurationError ? "服务端凭据加密配置无效" : "API Key 暂不可用",
-      configurationError ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE" : "CREDENTIAL_UNAVAILABLE",
+      configurationError
+        ? "CREDENTIAL_ENCRYPTION_UNAVAILABLE"
+        : "CREDENTIAL_UNAVAILABLE",
     );
   }
 }

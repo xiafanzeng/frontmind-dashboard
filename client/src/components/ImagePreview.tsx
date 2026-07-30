@@ -1,26 +1,16 @@
 /**
  * ImagePreview Component - Full-screen image viewer with zoom and pan
  * Features: Click to open fullscreen modal, zoom controls, download
- * 
+ *
  * FIX: Now properly handles API URLs with auth headers for download/preview.
  * Supports both /api/frontmind/v1/files/ URLs and /api/frontmind/proxy-download URLs.
  */
 import { useState, useCallback, useEffect } from "react";
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import {
-  ZoomIn,
-  ZoomOut,
-  RotateCw,
-  Download,
-  X,
-  Loader2,
-} from "lucide-react";
+import { ZoomIn, ZoomOut, RotateCw, Download, X, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { deliveryProjectHeaders } from "@/lib/frontmind-api";
 
 interface ImagePreviewProps {
   src: string;
@@ -42,6 +32,7 @@ function needsAuthHeaders(url: string): boolean {
 async function fetchImageWithAuth(url: string): Promise<string> {
   const response = await fetch(url, {
     credentials: "include",
+    headers: deliveryProjectHeaders(),
   });
 
   if (!response.ok) {
@@ -49,7 +40,7 @@ async function fetchImageWithAuth(url: string): Promise<string> {
   }
 
   const contentType = response.headers.get("content-type") || "";
-  
+
   // Check if we accidentally got JSON instead of binary (metadata fallback)
   if (contentType.includes("application/json")) {
     const text = await response.text();
@@ -60,9 +51,12 @@ async function fetchImageWithAuth(url: string): Promise<string> {
         const proxyUrl = `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
         const proxyResponse = await fetch(proxyUrl, {
           credentials: "include",
+          headers: deliveryProjectHeaders(),
         });
         if (!proxyResponse.ok) {
-          throw new Error(`Failed to fetch from proxy: HTTP ${proxyResponse.status}`);
+          throw new Error(
+            `Failed to fetch from proxy: HTTP ${proxyResponse.status}`,
+          );
         }
         const blob = await proxyResponse.blob();
         return URL.createObjectURL(blob);
@@ -200,7 +194,7 @@ export default function ImagePreview({
         className={cn(
           "cursor-pointer overflow-hidden rounded-xl border border-border/30 shadow-sm",
           "hover:border-primary/30 transition-all duration-200 hover:shadow-md",
-          className
+          className,
         )}
         onClick={() => setIsOpen(true)}
         role="button"
@@ -216,7 +210,10 @@ export default function ImagePreview({
             <p className="text-xs text-muted-foreground/60">图片加载失败</p>
             {showDownload && (
               <button
-                onClick={(e) => { e.stopPropagation(); handleDownload(); }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDownload();
+                }}
                 className="mt-2 text-xs text-primary hover:underline"
               >
                 点击下载
@@ -235,7 +232,10 @@ export default function ImagePreview({
       </div>
 
       <Dialog open={isOpen} onOpenChange={setIsOpen}>
-        <DialogContent showCloseButton={false} className="max-w-[90vw] max-h-[90vh] p-0 bg-black/95 border-none">
+        <DialogContent
+          showCloseButton={false}
+          className="max-w-[90vw] max-h-[90vh] p-0 bg-black/95 border-none"
+        >
           <DialogTitle className="sr-only">{alt}</DialogTitle>
 
           {/* Controls bar */}

@@ -6,9 +6,7 @@ import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import {
   attachments,
   conversations,
-  deliveryCustomerAssignments,
-  deliveryRoleMembers,
-  deliveryRoles,
+  deliveryProjectAssignments,
   deliveryTicketEvents,
   deliveryTickets,
   knowledgeBaseBuilds,
@@ -29,7 +27,8 @@ import {
   type AuthenticatedUser,
 } from "./auth-service";
 import { getDb } from "./db";
-import { assertDeliveryRoleContext } from "./delivery-role-service";
+import { assertDeliveryProjectContext } from "./delivery-role-service";
+import { getServicePortal } from "./service-entitlement";
 import { getUpstreamBaseUrl } from "./upstream-config";
 
 const ACTIVE_TICKET_STATUSES = [
@@ -116,49 +115,37 @@ async function getKnowledgeCounts(
   };
 }
 
-async function getKnowledgeOwner(executor: any, userId: number) {
-  const rows = await executor
+async function getKnowledgeOwner(
+  executor: any,
+  userId: number,
+  options: { forUpdate?: boolean } = {},
+) {
+  const query = executor
     .select({
-      assignmentId: deliveryCustomerAssignments.id,
-      roleId: deliveryCustomerAssignments.roleId,
-      memberId: deliveryCustomerAssignments.primaryMemberId,
+      projectAssignmentId: deliveryProjectAssignments.id,
+      memberId: deliveryProjectAssignments.engineerUserId,
       memberName: users.displayName,
       memberUsername: users.username,
     })
-    .from(deliveryCustomerAssignments)
-    .innerJoin(
-      deliveryRoles,
-      eq(deliveryCustomerAssignments.roleId, deliveryRoles.id),
-    )
-    .innerJoin(
-      deliveryRoleMembers,
-      and(
-        eq(deliveryRoleMembers.roleId, deliveryCustomerAssignments.roleId),
-        eq(
-          deliveryRoleMembers.memberUserId,
-          deliveryCustomerAssignments.primaryMemberId,
-        ),
-      ),
-    )
-    .innerJoin(users, eq(users.id, deliveryCustomerAssignments.primaryMemberId))
+    .from(deliveryProjectAssignments)
+    .innerJoin(users, eq(users.id, deliveryProjectAssignments.engineerUserId))
     .where(
       and(
-        eq(deliveryCustomerAssignments.customerUserId, userId),
-        eq(deliveryCustomerAssignments.roleType, "knowledge_base_engineer"),
-        eq(deliveryRoles.roleType, "knowledge_base_engineer"),
-        eq(deliveryRoles.isActive, true),
-        eq(deliveryRoleMembers.isActive, true),
+        eq(deliveryProjectAssignments.customerUserId, userId),
+        eq(deliveryProjectAssignments.roleType, "ai_operations_engineer"),
         eq(users.role, "delivery_member"),
+        eq(users.engineerRoleType, "ai_operations_engineer"),
         eq(users.isActive, true),
       ),
     )
     .limit(1);
+  const rows = options.forUpdate ? await query.for("update") : await query;
   return rows[0] ?? null;
 }
 
 export async function getKnowledgeResetStatus(userId: number) {
   const db = await requireDb();
-  const [counts, owner, resetRows, stateRows] = await Promise.all([
+  const [counts, owner, resetRows, stateRows, portal] = await Promise.all([
     getKnowledgeCounts(db, userId),
     getKnowledgeOwner(db, userId),
     db
@@ -185,10 +172,17 @@ export async function getKnowledgeResetStatus(userId: number) {
       .from(knowledgeBaseResetStates)
       .where(eq(knowledgeBaseResetStates.userId, userId))
       .limit(1),
+    getServicePortal(userId),
   ]);
+  const aiOperationsIncluded =
+    portal.service.planCode === "advanced" ||
+    portal.service.planCode === "luxury";
   const pending = resetRows[0] ?? null;
   let pendingEngineerName = owner?.memberName || owner?.memberUsername || null;
-  if (pending && pending.assignedMemberId !== owner?.memberId) {
+  if (
+    pending?.assignedMemberId != null &&
+    pending.assignedMemberId !== owner?.memberId
+  ) {
     const assignedRows = await db
       .select({
         displayName: users.displayName,
@@ -205,13 +199,15 @@ export async function getKnowledgeResetStatus(userId: number) {
     hasKnowledge: counts.hasKnowledge,
     locked: Boolean(pending),
     canRequest: counts.hasKnowledge && Boolean(owner) && !pending,
-    unavailableReason: !owner
-      ? "尚未分配 AI 知识库工程师，请联系交付管理员"
-      : pending
-        ? "已有一张知识库重置工单正在处理"
-        : !counts.hasKnowledge
-          ? "当前没有可重置的知识库记录"
-          : null,
+    unavailableReason: !aiOperationsIncluded
+      ? "当前套餐不含人工知识库运维"
+      : !owner
+        ? "尚未分配 AI 运维工程师，请联系交付管理员"
+        : pending
+          ? "已有一张知识库重置工单正在处理"
+          : !counts.hasKnowledge
+            ? "当前没有可重置的知识库记录"
+            : null,
     engineer: owner
       ? {
           id: owner.memberId,
@@ -226,7 +222,10 @@ export async function getKnowledgeResetStatus(userId: number) {
           ...pending,
           createdAt: pending.createdAt.getTime(),
           engineerName:
-            pendingEngineerName || `成员 ${pending.assignedMemberId}`,
+            pendingEngineerName ||
+            (pending.assignedMemberId
+              ? `工程师 ${pending.assignedMemberId}`
+              : "原工程师账号已删除"),
         }
       : null,
   };
@@ -263,12 +262,19 @@ export async function submitKnowledgeReset(input: {
   if (input.reasonCode === "other" && !input.reasonNote?.trim()) {
     throw new AuthServiceError("CONFLICT", "选择“其他”时必须填写补充说明");
   }
+  const portal = await getServicePortal(input.actor.id);
+  if (
+    portal.service.planCode !== "advanced" &&
+    portal.service.planCode !== "luxury"
+  ) {
+    throw new AuthServiceError("CONFLICT", "当前套餐不含人工知识库运维");
+  }
   const db = await requireDb();
   try {
     return await db.transaction(async (tx) => {
       const [counts, owner, existing, periodRows] = await Promise.all([
         getKnowledgeCounts(tx, input.actor.id),
-        getKnowledgeOwner(tx, input.actor.id),
+        getKnowledgeOwner(tx, input.actor.id, { forUpdate: true }),
         tx
           .select({ id: knowledgeBaseResetRequests.id })
           .from(knowledgeBaseResetRequests)
@@ -296,7 +302,7 @@ export async function submitKnowledgeReset(input: {
       if (!owner) {
         throw new AuthServiceError(
           "CONFLICT",
-          "尚未分配 AI 知识库工程师，请联系交付管理员",
+          "尚未分配 AI 运维工程师，请联系交付管理员",
         );
       }
       if (existing[0]) {
@@ -324,9 +330,9 @@ export async function submitKnowledgeReset(input: {
         category: "knowledge_reset",
         title: "知识库重置申请",
         description: input.reasonNote?.trim() || null,
-        workflowDomain: "knowledge_base_engineer",
+        workflowDomain: "ai_operations_engineer",
         operation: "knowledge_reset",
-        assignedRoleId: owner.roleId,
+        assignedProjectAssignmentId: owner.projectAssignmentId,
         assignedMemberId: owner.memberId,
         quotaState: "consumed",
         status: "submitted",
@@ -339,7 +345,7 @@ export async function submitKnowledgeReset(input: {
         id: requestId,
         ticketId,
         userId: input.actor.id,
-        assignedRoleId: owner.roleId,
+        assignedProjectAssignmentId: owner.projectAssignmentId,
         assignedMemberId: owner.memberId,
         activeKey: `user:${input.actor.id}`,
         reasonCode: input.reasonCode,
@@ -372,7 +378,7 @@ export async function submitKnowledgeReset(input: {
 
 async function requirePendingRequestForMember(input: {
   actor: AuthenticatedUser;
-  roleAssignmentId: string;
+  projectAssignmentId: string;
   requestId: string;
   executor: any;
 }) {
@@ -397,23 +403,22 @@ async function requirePendingRequestForMember(input: {
   ) {
     throw new AuthServiceError("NOT_FOUND", "待审批重置工单不存在");
   }
-  const role = await assertDeliveryRoleContext({
+  const role = await assertDeliveryProjectContext({
     actor: input.actor,
-    roleAssignmentId: input.roleAssignmentId,
+    projectAssignmentId: input.projectAssignmentId,
     customerUserId: row.request.userId,
-    requirePrimaryCustomerAssignment: false,
-    expectedRoleType: "knowledge_base_engineer",
+    expectedRoleType: "ai_operations_engineer",
     executor: input.executor,
   });
-  if (role.roleId !== row.request.assignedRoleId) {
-    throw new AuthServiceError("NOT_FOUND", "工单不属于当前工作角色");
+  if (role.projectAssignmentId !== row.request.assignedProjectAssignmentId) {
+    throw new AuthServiceError("NOT_FOUND", "工单不属于当前客户项目岗位");
   }
   return { ...row, role };
 }
 
 export async function previewKnowledgeReset(input: {
   actor: AuthenticatedUser;
-  roleAssignmentId: string;
+  projectAssignmentId: string;
   requestId: string;
 }) {
   const db = await requireDb();
@@ -479,7 +484,7 @@ export async function previewKnowledgeReset(input: {
 
 export async function decideKnowledgeReset(input: {
   actor: AuthenticatedUser;
-  roleAssignmentId: string;
+  projectAssignmentId: string;
   requestId: string;
   expectedRevision: number;
   decision: "approve" | "reject";
@@ -536,10 +541,9 @@ export async function decideKnowledgeReset(input: {
         fromStatus: "submitted",
         toStatus: "rejected",
         actorContext: {
-          roleAssignmentId: input.roleAssignmentId,
-          roleId: row.role.roleId,
+          projectAssignmentId: input.projectAssignmentId,
+          customerUserId: row.role.customerUserId,
           roleType: row.role.roleType,
-          teamName: row.role.teamName,
         },
         createdAt: now,
       });
@@ -771,10 +775,9 @@ export async function decideKnowledgeReset(input: {
       fromStatus: "submitted",
       toStatus: "completed",
       actorContext: {
-        roleAssignmentId: input.roleAssignmentId,
-        roleId: row.role.roleId,
+        projectAssignmentId: input.projectAssignmentId,
+        customerUserId: row.role.customerUserId,
         roleType: row.role.roleType,
-        teamName: row.role.teamName,
       },
       createdAt: now,
     });

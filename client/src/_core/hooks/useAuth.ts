@@ -9,6 +9,12 @@ export type AuthUser = {
   displayName: string | null;
   role: "user" | "admin" | "delivery_member";
   adminAccessLevel: "system_admin" | "delivery_admin" | null;
+  engineerRoleType:
+    | "ai_operations_engineer"
+    | "monitoring_optimization_engineer"
+    | "content_distribution_engineer"
+    | null;
+  engineerApiKeyConfigured?: boolean;
   marketEdition: "domestic" | "overseas";
   isActive: boolean;
 };

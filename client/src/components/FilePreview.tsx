@@ -18,7 +18,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { sanitizeBrandText } from "@/lib/frontmind-api";
+import { deliveryProjectHeaders, sanitizeBrandText } from "@/lib/frontmind-api";
 import type { Attachment } from "@/contexts/ConversationContext";
 
 const PdfDocumentViewer = lazy(() => import("./PdfDocumentViewer"));
@@ -184,6 +184,7 @@ async function fetchFileAsBlob(
 
   const response = await fetch(url, {
     credentials: "include",
+    headers: deliveryProjectHeaders(),
   });
 
   if (!response.ok) {
@@ -203,6 +204,7 @@ async function fetchFileAsBlob(
           `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
         const s3Response = await fetch(proxyUrl, {
           credentials: "include",
+          headers: deliveryProjectHeaders(),
         });
         if (!s3Response.ok) {
           throw new Error(`S3 download failed: HTTP ${s3Response.status}`);
@@ -223,9 +225,9 @@ async function fetchFileAsBlob(
 async function createDirectDownloadUrl(fileId: string): Promise<string> {
   const response = await fetch("/api/frontmind/download-token", {
     method: "POST",
-    headers: {
+    headers: deliveryProjectHeaders({
       "Content-Type": "application/json",
-    },
+    }),
     credentials: "include",
     body: JSON.stringify({ fileId }),
   });
@@ -384,7 +386,12 @@ export default function FilePreview({
           true,
         );
         if (proxiedExternalUrl) {
-          nativeDownload(proxiedExternalUrl, downloadName);
+          const blobUrl = await fetchFileAsBlob(
+            proxiedExternalUrl,
+            downloadName,
+          );
+          nativeDownload(blobUrl, downloadName);
+          URL.revokeObjectURL(blobUrl);
           return;
         }
 

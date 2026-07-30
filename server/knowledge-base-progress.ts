@@ -3,10 +3,14 @@ export const KNOWLEDGE_BASE_MANIFEST_MAX_LEAVES = 115;
 export const KNOWLEDGE_BASE_PROGRESS_KIND = "frontmind.knowledge-base.progress";
 export const KNOWLEDGE_BASE_MANIFEST_KIND = "frontmind.knowledge-base.manifest";
 export const KNOWLEDGE_BASE_REOPEN_KIND = "frontmind.knowledge-base.reopen";
+export const KNOWLEDGE_BASE_PRESENTATION_KIND =
+  "frontmind.knowledge-base.presentation";
 export const KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION = 1;
 export const KNOWLEDGE_BASE_PROGRESS_MARKER = "FRONTMIND_KB_PROGRESS";
 export const KNOWLEDGE_BASE_MANIFEST_MARKER = "FRONTMIND_KB_MANIFEST";
 export const KNOWLEDGE_BASE_REOPEN_MARKER = "FRONTMIND_KB_REOPEN";
+export const KNOWLEDGE_BASE_PRESENTATION_MARKER =
+  "FRONTMIND_KB_PRESENTATION";
 
 export const knowledgeBaseLeafStatuses = [
   "pending",
@@ -72,6 +76,15 @@ export interface KnowledgeBaseReopenEnvelope {
   revision: number;
   leafId: string;
   reason?: string;
+}
+
+export interface KnowledgeBasePresentationEnvelope {
+  kind: typeof KNOWLEDGE_BASE_PRESENTATION_KIND;
+  schemaVersion: typeof KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION;
+  /** The authoritative revision after the progress transition is applied. */
+  revision: number;
+  /** The leaf rendered for the next customer action, or null at completion. */
+  leafId: string | null;
 }
 
 export interface KnowledgeBaseProgressSummary {
@@ -410,6 +423,106 @@ export function formatKnowledgeBaseReopenEnvelope(
 ) {
   const parsed = parseReopenEnvelopeObject(envelope);
   return `<!-- ${KNOWLEDGE_BASE_REOPEN_MARKER}\n${JSON.stringify(parsed)}\n-->`;
+}
+
+function parsePresentationEnvelopeObject(
+  input: unknown,
+): KnowledgeBasePresentationEnvelope {
+  if (!isPlainObject(input)) {
+    fail("INVALID_ENVELOPE", "Presentation envelope must be an object");
+  }
+  assertOnlyKeys(
+    input,
+    ["kind", "schemaVersion", "revision", "leafId"],
+    "Presentation envelope",
+  );
+  if (input.kind !== KNOWLEDGE_BASE_PRESENTATION_KIND) {
+    fail("INVALID_ENVELOPE", "Presentation envelope kind is invalid");
+  }
+  if (input.schemaVersion !== KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION) {
+    fail(
+      "INVALID_ENVELOPE",
+      "Presentation envelope schema version is invalid",
+    );
+  }
+  if (!Number.isSafeInteger(input.revision) || Number(input.revision) < 0) {
+    fail(
+      "INVALID_ENVELOPE",
+      "Presentation envelope revision must be a non-negative integer",
+    );
+  }
+  if (input.leafId !== null && typeof input.leafId !== "string") {
+    fail(
+      "INVALID_ENVELOPE",
+      "Presentation envelope leafId must be a string or null",
+    );
+  }
+  const leafId =
+    typeof input.leafId === "string" ? input.leafId.trim() : input.leafId;
+  if (typeof input.leafId === "string" && !leafId) {
+    fail("INVALID_ENVELOPE", "Presentation envelope leafId cannot be empty");
+  }
+  return {
+    kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
+    schemaVersion: KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION,
+    revision: Number(input.revision),
+    leafId: leafId as string | null,
+  };
+}
+
+export function parseKnowledgeBasePresentationEnvelope(
+  input: unknown,
+): KnowledgeBasePresentationEnvelope {
+  if (typeof input !== "string") {
+    return parsePresentationEnvelopeObject(input);
+  }
+  const markerPattern = new RegExp(
+    `<!--\\s*${KNOWLEDGE_BASE_PRESENTATION_MARKER}\\s*([\\s\\S]*?)-->`,
+    "g",
+  );
+  const matches = [...input.matchAll(markerPattern)];
+  if (matches.length !== 1) {
+    fail(
+      "INVALID_ENVELOPE",
+      `Model output must contain exactly one ${KNOWLEDGE_BASE_PRESENTATION_MARKER} envelope`,
+    );
+  }
+  try {
+    return parsePresentationEnvelopeObject(JSON.parse(matches[0][1].trim()));
+  } catch (error) {
+    if (error instanceof KnowledgeBaseProgressError) throw error;
+    fail("INVALID_ENVELOPE", "Presentation envelope contains invalid JSON");
+  }
+}
+
+export function formatKnowledgeBasePresentationEnvelope(
+  envelope: KnowledgeBasePresentationEnvelope,
+) {
+  const parsed = parsePresentationEnvelopeObject(envelope);
+  return `<!-- ${KNOWLEDGE_BASE_PRESENTATION_MARKER}\n${JSON.stringify(parsed)}\n-->`;
+}
+
+export function assertKnowledgeBasePresentationMatchesState(
+  state: KnowledgeBaseProgressState,
+  input: unknown,
+): KnowledgeBasePresentationEnvelope {
+  assertValidKnowledgeBaseProgressState(state);
+  const envelope = parseKnowledgeBasePresentationEnvelope(input);
+  if (envelope.revision !== state.revision) {
+    fail(
+      "STALE_REVISION",
+      `Expected presentation revision ${state.revision}, received ${envelope.revision}`,
+    );
+  }
+  if (envelope.leafId !== state.currentLeafId) {
+    fail(
+      "WRONG_LEAF",
+      state.currentLeafId
+        ? `Customer reply must present current leaf ${state.currentLeafId}`
+        : "Completed knowledge base must present leafId null",
+    );
+  }
+  return envelope;
 }
 
 export function createKnowledgeBaseProgressState(

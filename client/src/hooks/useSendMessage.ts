@@ -337,6 +337,35 @@ export function useSendMessage() {
       let completionHandled = false;
       let consecutiveErrors = 0;
       const MAX_CONSECUTIVE_ERRORS = 10;
+      const applyValidatedKnowledgeOutput = (
+        output: OutputMessage[] | undefined,
+        elapsedSeconds?: number,
+      ) => {
+        if (!output || output.length === 0) return;
+        const newOutput = sliceNewOutput(
+          output,
+          baselineOutputLength,
+          historicalOutputIds,
+        );
+        if (newOutput.length === 0) return;
+        try {
+          const assistantMsgs = sanitizeKnowledgeBaseOutputMessages(
+            parseOutputMessages(newOutput, responseStartedAt, modelName),
+          );
+          if (elapsedSeconds != null && assistantMsgs.length > 0) {
+            assistantMsgs[assistantMsgs.length - 1].elapsedTime =
+              elapsedSeconds;
+          }
+          if (assistantMsgs.length > 0) {
+            updateAssistantMessagesRef.current(convId, assistantMsgs);
+          }
+        } catch (parseErr) {
+          console.error(
+            "[Polling] Error parsing validated knowledge output:",
+            parseErr,
+          );
+        }
+      };
 
       const pollOnce = async () => {
         if (!pollingActiveRef.current || completionHandled) return;
@@ -359,21 +388,13 @@ export function useSendMessage() {
               historicalOutputIds,
             );
 
-            if (newOutput.length > 0) {
+            if (newOutput.length > 0 && !syncKnowledgeBaseSnapshot) {
               try {
-                const assistantMsgs = syncKnowledgeBaseSnapshot
-                  ? sanitizeKnowledgeBaseOutputMessages(
-                      parseOutputMessages(
-                        newOutput,
-                        responseStartedAt,
-                        modelName,
-                      ),
-                    )
-                  : parseOutputMessages(
-                      newOutput,
-                      responseStartedAt,
-                      modelName,
-                    );
+                const assistantMsgs = parseOutputMessages(
+                  newOutput,
+                  responseStartedAt,
+                  modelName,
+                );
                 if (assistantMsgs.length > 0) {
                   updateAssistantMessagesRef.current(convId, assistantMsgs);
                 }
@@ -406,6 +427,10 @@ export function useSendMessage() {
               if (interaction.interactionState === "awaiting_input") {
                 completionHandled = true;
                 stopPolling();
+                applyValidatedKnowledgeOutput(
+                  updated.output,
+                  (Date.now() - responseStartedAt) / 1000,
+                );
                 updateStatusRef.current(convId, "awaiting_input", {
                   taskId: updated.id,
                   taskUrl: updated.metadata?.task_url,
@@ -424,6 +449,10 @@ export function useSendMessage() {
               ) {
                 completionHandled = true;
                 stopPolling();
+                applyValidatedKnowledgeOutput(
+                  updated.output,
+                  (Date.now() - responseStartedAt) / 1000,
+                );
                 updateStatusRef.current(convId, "completed", {
                   taskId: updated.id,
                   completedAt: Date.now(),
@@ -665,7 +694,7 @@ export function useSendMessage() {
     ) => {
       if (sendInFlightRef.current) {
         toast.info("上一条消息正在发送，请稍候");
-        return;
+        return false;
       }
 
       sendInFlightRef.current = true;
@@ -711,7 +740,7 @@ export function useSendMessage() {
             description:
               err?.message || "请手动将原图压缩为 ZIP 后通过上传文件发送。",
           });
-          return;
+          return false;
         }
 
         if (preparedUploads.didZipLargeImages) {
@@ -818,7 +847,7 @@ export function useSendMessage() {
             toast.error(`文件 "${file.name}" 上传失败`, {
               description: uploadErr?.message || "请稍后重试。",
             });
-            return;
+            return false;
           }
 
           setUploadProgress({
@@ -834,7 +863,7 @@ export function useSendMessage() {
         // Clear upload progress
         setUploadProgress(null);
 
-        if (contentItems.length === 0) return;
+        if (contentItems.length === 0) return false;
 
         // Add user message to conversation
         const userMessage: LocalMessage = {
@@ -944,7 +973,13 @@ export function useSendMessage() {
           });
 
           // Parse initial output if available — only new items
-          if (response.output && response.output.length > 0) {
+          if (
+            response.output &&
+            response.output.length > 0 &&
+            (!options?.syncKnowledgeBaseSnapshot ||
+              effectiveStatus === "awaiting_input" ||
+              effectiveStatus === "completed")
+          ) {
             const newOutput = sliceNewOutput(
               response.output,
               baselineOutputLength,
@@ -1116,7 +1151,9 @@ export function useSendMessage() {
             content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
             timestamp: Date.now(),
           });
+          return false;
         }
+        return true;
       } finally {
         setUploadProgress(null);
         sendInFlightRef.current = false;

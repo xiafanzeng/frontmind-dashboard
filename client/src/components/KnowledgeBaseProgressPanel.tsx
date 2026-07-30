@@ -32,8 +32,8 @@ const MAX_PERCENT = 100;
 const leafStatusLabels: Record<KnowledgeBaseLeafStatus, string> = {
   confirmed: "企业已确认",
   direct_prefilled: "直接预填",
-  current: "当前节点",
-  needs_verification: "待核验",
+  current: "等待确认",
+  needs_verification: "待再次确认",
   pending: "待处理",
 };
 
@@ -203,9 +203,9 @@ export default function KnowledgeBaseProgressPanel({
           >
             <SummaryMetric label="确认" value={confirmed} tone="emerald" />
             <SummaryMetric label="预填" value={directPrefilled} tone="sky" />
-            <SummaryMetric label="当前" value={current} tone="violet" />
+            <SummaryMetric label="等待确认" value={current} tone="violet" />
             <SummaryMetric
-              label="待核验"
+              label="待再次确认"
               value={needsVerification}
               tone="amber"
             />
@@ -230,7 +230,7 @@ export default function KnowledgeBaseProgressPanel({
           <CircleDot className="mt-0.5 h-4 w-4 shrink-0 text-[#6b3494]" />
           <div className="min-w-0">
             <span className="block text-xs font-bold tracking-[.08em] text-[#76508f]">
-              当前只处理这一节点
+              当前唯一待确认节点
             </span>
             <strong className="mt-0.5 block text-xs leading-5 text-[#392347]">
               {currentLeaf.branchTitle} / {currentLeaf.title}
@@ -350,7 +350,7 @@ function BranchProgress({
             预填 {clampCount(branch.directPrefilled, total)}
           </span>
           <span className="rounded-md bg-amber-50 px-2 py-1 text-amber-800">
-            待核验 {clampCount(branch.needsVerification, total)}
+            待再次确认 {clampCount(branch.needsVerification, total)}
           </span>
           <span className="rounded-md bg-slate-100 px-2 py-1 text-slate-600">
             待处理 {clampCount(branch.pending, total)}

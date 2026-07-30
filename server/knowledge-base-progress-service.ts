@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull } from "drizzle-orm";
 
 import {
   knowledgeBaseBuildNodes,
@@ -23,6 +23,7 @@ import { customerFormalContentViolation } from "./knowledge-customer-content";
 import {
   KnowledgeBaseProgressError,
   applyKnowledgeBaseProgressEnvelope,
+  assertKnowledgeBasePresentationMatchesState,
   assertKnowledgeBaseReadyForPackage,
   canPackageKnowledgeBase,
   createKnowledgeBaseProgressState,
@@ -146,7 +147,7 @@ export function extractFinalKnowledgeBaseAssistantText(
 export function assertKnowledgeBaseCustomerOutput(output: unknown) {
   const text = extractFinalKnowledgeBaseAssistantText(output);
   const customerVisibleText = text.replace(
-    /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/gi,
+    /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
     "",
   );
   const violation = customerFormalContentViolation(customerVisibleText);
@@ -178,7 +179,7 @@ function reconciliationHash(input: {
 function modelOutputAudit(text: string) {
   const contentMarkdown = text
     .replace(
-      /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/gi,
+      /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
       "",
     )
     .trim()
@@ -216,7 +217,8 @@ export function classifyKnowledgeBaseUserAction(
     .replace(/[。！!]+$/g, "")
     .trim()
     .toLowerCase();
-  if (!normalized && attachmentCount === 0) return "initial";
+  if (attachmentCount > 0) return "revise";
+  if (!normalized) return "initial";
   if (/^(确认|确认无误|无误|没问题|可以|通过|采用|ok|okay)$/.test(normalized)) {
     return "confirm";
   }
@@ -226,6 +228,16 @@ export function classifyKnowledgeBaseUserAction(
     return "direct_prefill";
   }
   return "revise";
+}
+
+export function isAmbiguousKnowledgeBaseAdvance(userText: string) {
+  const normalized = String(userText || "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/[。！!]+$/g, "")
+    .trim()
+    .toLowerCase();
+  return /^(继续|下一步|下一个|继续吧|请继续|next)$/.test(normalized);
 }
 
 function stateFromRows(
@@ -311,6 +323,7 @@ function buildDto(
       id: build.id,
       conversationId: build.conversationId,
       companyName: build.companyName,
+      skillVersion: build.skillVersion,
       status: build.status as KnowledgeBaseBuildStatus,
       revision: build.revision,
       currentLeafId: build.currentLeafId,
@@ -500,6 +513,74 @@ export async function recordKnowledgeBaseTurn(input: {
       "当前对话没有知识库构建记录",
     );
   }
+}
+
+/**
+ * Atomically locks one customer turn before the non-idempotent upstream task
+ * call. This closes the server-side double-click race in addition to the UI
+ * lock.
+ */
+export async function claimKnowledgeBaseTurn(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+  userText: string;
+  attachmentCount: number;
+}) {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  const result = await db
+    .update(knowledgeBaseBuilds)
+    .set({
+      lastTurnUserText: String(input.userText || "").slice(0, 2_000_000),
+      lastTurnAttachmentCount: Math.max(
+        0,
+        Math.trunc(input.attachmentCount || 0),
+      ),
+      awaitingResponseSince: new Date(),
+    })
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(knowledgeBaseBuilds.conversationId, conversationId),
+        eq(knowledgeBaseBuilds.upstreamTaskId, input.taskId),
+        eq(knowledgeBaseBuilds.status, "confirming"),
+        isNotNull(knowledgeBaseBuilds.currentLeafId),
+        isNull(knowledgeBaseBuilds.awaitingResponseSince),
+      ),
+    );
+  if (!result[0]?.affectedRows) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "当前节点已提交或尚未进入可回复状态，请等待本轮处理完成",
+    );
+  }
+}
+
+export async function releaseKnowledgeBaseTurnClaim(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+}) {
+  const db = await requireDb();
+  await db
+    .update(knowledgeBaseBuilds)
+    .set({
+      awaitingResponseSince: null,
+      lastTurnUserText: null,
+      lastTurnAttachmentCount: 0,
+    })
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(
+          knowledgeBaseBuilds.conversationId,
+          normalizeConversationId(input.conversationId),
+        ),
+        eq(knowledgeBaseBuilds.upstreamTaskId, input.taskId),
+        isNotNull(knowledgeBaseBuilds.awaitingResponseSince),
+      ),
+    );
 }
 
 export async function assertKnowledgeBaseTaskBinding(input: {
@@ -759,6 +840,25 @@ export async function reconcileKnowledgeBaseProgress(input: {
             "本轮内容未匹配到现有知识节点，请补充更具体的修改对象",
           );
         }
+        if (build.skillVersion === "3") {
+          const reopenedRows = rows.map((row) =>
+            row.id === target.id
+              ? { ...row, status: "needs_verification" as const }
+              : row,
+          );
+          const expectedReopenedState = stateFromRows(
+            {
+              ...build,
+              revision: build.revision + 1,
+              currentLeafId: target.leafId,
+            },
+            reopenedRows,
+          );
+          assertKnowledgeBasePresentationMatchesState(
+            expectedReopenedState,
+            text,
+          );
+        }
         await tx
           .update(knowledgeBaseBuildNodes)
           .set({
@@ -824,6 +924,9 @@ export async function reconcileKnowledgeBaseProgress(input: {
       const envelope = parseKnowledgeBaseProgressEnvelope(text);
       assertActionMatchesTransition(action, envelope.transition.to);
       const nextState = applyKnowledgeBaseProgressEnvelope(state, envelope);
+      if (build.skillVersion === "3") {
+        assertKnowledgeBasePresentationMatchesState(nextState, text);
+      }
       const summary = getKnowledgeBaseProgressSummary(nextState);
       const packageAllowed = canPackageKnowledgeBase(nextState);
       const packageDescriptors = packageAllowed

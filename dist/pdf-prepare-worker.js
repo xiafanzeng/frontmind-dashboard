@@ -84,7 +84,17 @@ import {
   timingSafeEqual
 } from "node:crypto";
 import { parse as parseCookieHeader } from "cookie";
-import { and, asc, desc, eq as eq2, gt, inArray, isNull, ne } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq as eq2,
+  gt,
+  inArray,
+  isNotNull,
+  isNull,
+  ne
+} from "drizzle-orm";
 
 // shared/const.ts
 var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
@@ -128,6 +138,11 @@ var users = mysqlTable(
       "system_admin",
       "delivery_admin"
     ]),
+    engineerRoleType: mysqlEnum("engineerRoleType", [
+      "ai_operations_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer"
+    ]),
     marketEdition: mysqlEnum("marketEdition", ["domestic", "overseas"]).default("domestic").notNull(),
     isActive: boolean("isActive").default(true).notNull(),
     passwordChangedAt: timestamp("passwordChangedAt"),
@@ -135,7 +150,17 @@ var users = mysqlTable(
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
     lastSignedIn: timestamp("lastSignedIn")
   },
-  (table) => [index("users_active_role_idx").on(table.isActive, table.role)]
+  (table) => [
+    index("users_active_role_idx").on(table.isActive, table.role),
+    check(
+      "users_engineer_role_consistency_ck",
+      sql`(
+        (${table.role} = 'delivery_member' AND ${table.engineerRoleType} IS NOT NULL)
+        OR
+        (${table.role} <> 'delivery_member' AND ${table.engineerRoleType} IS NULL)
+      )`
+    )
+  ]
 );
 var sessions = mysqlTable(
   "sessions",
@@ -833,16 +858,14 @@ var deliveryTickets = mysqlTable(
     targetPage: text("targetPage"),
     knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
     workflowDomain: mysqlEnum("workflowDomain", [
-      "knowledge_base_engineer",
+      "ai_operations_engineer",
       "monitoring_optimization_engineer",
-      "content_distribution_engineer",
-      "website_operations_engineer"
+      "content_distribution_engineer"
     ]),
     operation: varchar("operation", { length: 64 }),
-    assignedRoleId: varchar("assignedRoleId", { length: 36 }).references(
-      () => deliveryRoles.id,
-      { onDelete: "set null" }
-    ),
+    assignedProjectAssignmentId: varchar("assignedProjectAssignmentId", {
+      length: 36
+    }),
     assignedMemberId: int("assignedMemberId").references(() => users.id, {
       onDelete: "set null"
     }),
@@ -927,48 +950,12 @@ var deliveryTickets = mysqlTable(
       table.workflowDomain,
       table.assignedMemberId,
       table.status
-    )
-  ]
-);
-var icpSensitiveMaterials = mysqlTable(
-  "icp_sensitive_materials",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    workspaceUserId: int("workspaceUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
-    ownerUserId: int("ownerUserId").notNull().references(() => users.id, { onDelete: "restrict" }),
-    storageKey: varchar("storageKey", { length: 255 }).notNull().unique(),
-    encryptionVersion: int("encryptionVersion", { unsigned: true }).default(1).notNull(),
-    encryptionIv: varchar("encryptionIv", { length: 32 }).notNull(),
-    encryptionAuthTag: varchar("encryptionAuthTag", { length: 32 }).notNull(),
-    filename: varchar("filename", { length: 512 }).notNull(),
-    mimeType: varchar("mimeType", { length: 255 }),
-    sizeBytes: int("sizeBytes", { unsigned: true }).notNull(),
-    sha256: varchar("sha256", { length: 64 }).notNull(),
-    category: mysqlEnum("category", [
-      "business_license",
-      "subject_responsible_person_id",
-      "website_responsible_person_id",
-      "authorization_letter",
-      "pre_approval_or_industry_qualification",
-      "enterprise_name_change_proof",
-      "other_provincial_material"
-    ]).notNull(),
-    status: mysqlEnum("status", ["active", "replaced", "withdrawn", "expired"]).default("active").notNull(),
-    replacedByMaterialId: varchar("replacedByMaterialId", { length: 36 }),
-    retentionUntil: timestamp("retentionUntil").notNull(),
-    withdrawnAt: timestamp("withdrawnAt"),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
-  },
-  (table) => [
-    index("icp_sensitive_materials_workspace_status_idx").on(
-      table.workspaceUserId,
-      table.status
     ),
-    index("icp_sensitive_materials_retention_idx").on(
-      table.status,
-      table.retentionUntil
-    )
+    foreignKey({
+      name: "delivery_tickets_project_assignment_fk",
+      columns: [table.assignedProjectAssignmentId],
+      foreignColumns: [deliveryProjectAssignments.id]
+    }).onDelete("set null")
   ]
 );
 var deliveryTicketEvents = mysqlTable(
@@ -1046,10 +1033,6 @@ var deliveryTicketAttachments = mysqlTable(
     ownerUserId: int("ownerUserId").notNull().references(() => users.id, { onDelete: "restrict" }),
     kind: mysqlEnum("kind", ["input", "deliverable"]).default("input").notNull(),
     upstreamFileId: varchar("upstreamFileId", { length: 255 }),
-    protectedMaterialId: varchar("protectedMaterialId", {
-      length: 36
-    }).references(() => icpSensitiveMaterials.id, { onDelete: "restrict" }),
-    sensitivity: mysqlEnum("sensitivity", ["standard", "icp_sensitive"]).default("standard").notNull(),
     filename: varchar("filename", { length: 512 }).notNull(),
     mimeType: varchar("mimeType", { length: 255 }),
     sizeBytes: int("sizeBytes", { unsigned: true }),
@@ -1068,11 +1051,6 @@ var deliveryTicketAttachments = mysqlTable(
     uniqueIndex("delivery_ticket_attachments_event_file_kind_uq").on(
       table.eventId,
       table.upstreamFileId,
-      table.kind
-    ),
-    uniqueIndex("delivery_ticket_attachments_event_protected_kind_uq").on(
-      table.eventId,
-      table.protectedMaterialId,
       table.kind
     ),
     index("delivery_ticket_attachments_ticket_created_idx").on(
@@ -1452,66 +1430,19 @@ var userAdminAssignments = mysqlTable(
     index("user_admin_assignments_admin_idx").on(table.adminId)
   ]
 );
-var deliveryRoles = mysqlTable(
-  "delivery_roles",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    name: varchar("name", { length: 128 }).notNull(),
-    roleType: mysqlEnum("roleType", [
-      "knowledge_base_engineer",
-      "monitoring_optimization_engineer",
-      "content_distribution_engineer",
-      "website_operations_engineer"
-    ]).notNull(),
-    isActive: boolean("isActive").default(true).notNull(),
-    createdByUserId: int("createdByUserId").references(() => users.id, {
-      onDelete: "set null"
-    }),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
-  },
-  (table) => [
-    uniqueIndex("delivery_roles_type_name_uq").on(table.roleType, table.name),
-    index("delivery_roles_type_active_idx").on(table.roleType, table.isActive)
-  ]
-);
-var deliveryRoleMembers = mysqlTable(
-  "delivery_role_members",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    roleId: varchar("roleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "cascade" }),
-    memberUserId: int("memberUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
-    isActive: boolean("isActive").default(true).notNull(),
-    assignedByUserId: int("assignedByUserId").references(() => users.id, {
-      onDelete: "set null"
-    }),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
-  },
-  (table) => [
-    uniqueIndex("delivery_role_members_role_member_uq").on(
-      table.roleId,
-      table.memberUserId
-    ),
-    index("delivery_role_members_member_active_idx").on(
-      table.memberUserId,
-      table.isActive
-    )
-  ]
-);
-var deliveryCustomerAssignments = mysqlTable(
-  "delivery_customer_assignments",
+var deliveryProjectAssignments = mysqlTable(
+  "delivery_project_assignments",
   {
     id: varchar("id", { length: 36 }).primaryKey(),
     customerUserId: int("customerUserId").notNull().references(() => users.id, { onDelete: "cascade" }),
     roleType: mysqlEnum("roleType", [
-      "knowledge_base_engineer",
+      "ai_operations_engineer",
       "monitoring_optimization_engineer",
-      "content_distribution_engineer",
-      "website_operations_engineer"
+      "content_distribution_engineer"
     ]).notNull(),
-    roleId: varchar("roleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "restrict" }),
-    primaryMemberId: int("primaryMemberId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    engineerUserId: int("engineerUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
     revision: int("revision", { unsigned: true }).default(1).notNull(),
     assignedByUserId: int("assignedByUserId").references(() => users.id, {
       onDelete: "set null"
@@ -1520,12 +1451,12 @@ var deliveryCustomerAssignments = mysqlTable(
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
   },
   (table) => [
-    uniqueIndex("delivery_customer_assignments_customer_type_uq").on(
+    uniqueIndex("delivery_project_assignments_customer_type_uq").on(
       table.customerUserId,
       table.roleType
     ),
-    index("delivery_customer_assignments_member_type_idx").on(
-      table.primaryMemberId,
+    index("delivery_project_assignments_engineer_type_idx").on(
+      table.engineerUserId,
       table.roleType
     )
   ]
@@ -1940,8 +1871,12 @@ var knowledgeBaseResetRequests = mysqlTable(
     id: varchar("id", { length: 36 }).primaryKey(),
     ticketId: varchar("ticketId", { length: 36 }).notNull().references(() => deliveryTickets.id, { onDelete: "restrict" }),
     userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
-    assignedRoleId: varchar("assignedRoleId", { length: 36 }).notNull().references(() => deliveryRoles.id, { onDelete: "restrict" }),
-    assignedMemberId: int("assignedMemberId").notNull().references(() => users.id, { onDelete: "restrict" }),
+    assignedProjectAssignmentId: varchar("assignedProjectAssignmentId", {
+      length: 36
+    }),
+    assignedMemberId: int("assignedMemberId").references(() => users.id, {
+      onDelete: "set null"
+    }),
     activeKey: varchar("activeKey", { length: 191 }),
     reasonCode: mysqlEnum("reasonCode", [
       "stuck",
@@ -1973,7 +1908,12 @@ var knowledgeBaseResetRequests = mysqlTable(
     index("knowledge_base_reset_requests_member_status_idx").on(
       table.assignedMemberId,
       table.status
-    )
+    ),
+    foreignKey({
+      name: "kb_reset_project_assignment_fk",
+      columns: [table.assignedProjectAssignmentId],
+      foreignColumns: [deliveryProjectAssignments.id]
+    }).onDelete("set null")
   ]
 );
 var knowledgeBaseResetStates = mysqlTable(
@@ -2086,6 +2026,7 @@ var conversations = mysqlTable(
       () => apiCredentials.id,
       { onDelete: "set null" }
     ),
+    projectAssignmentId: varchar("projectAssignmentId", { length: 36 }),
     title: varchar("title", { length: 255 }).notNull(),
     status: mysqlEnum("status", [
       "idle",
@@ -2112,7 +2053,17 @@ var conversations = mysqlTable(
   (table) => [
     index("conversations_user_updated_idx").on(table.userId, table.updatedAt),
     index("conversations_user_status_idx").on(table.userId, table.status),
-    index("conversations_upstream_task_idx").on(table.upstreamTaskId)
+    index("conversations_user_project_updated_idx").on(
+      table.userId,
+      table.projectAssignmentId,
+      table.updatedAt
+    ),
+    index("conversations_upstream_task_idx").on(table.upstreamTaskId),
+    foreignKey({
+      name: "conversations_project_assignment_fk",
+      columns: [table.projectAssignmentId],
+      foreignColumns: [deliveryProjectAssignments.id]
+    }).onDelete("cascade")
   ]
 );
 var conversationTurns = mysqlTable(
@@ -2212,6 +2163,7 @@ var upstreamResources = mysqlTable(
     id: varchar("id", { length: 36 }).primaryKey(),
     userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
     apiCredentialId: varchar("apiCredentialId", { length: 36 }).notNull().references(() => apiCredentials.id, { onDelete: "restrict" }),
+    projectAssignmentId: varchar("projectAssignmentId", { length: 36 }),
     kind: mysqlEnum("kind", ["task", "file"]).notNull(),
     upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
     conversationId: varchar("conversationId", { length: 191 }).references(
@@ -2229,7 +2181,16 @@ var upstreamResources = mysqlTable(
       table.userId,
       table.kind,
       table.upstreamId
-    )
+    ),
+    index("upstream_resources_user_project_idx").on(
+      table.userId,
+      table.projectAssignmentId
+    ),
+    foreignKey({
+      name: "upstream_resources_project_assignment_fk",
+      columns: [table.projectAssignmentId],
+      foreignColumns: [deliveryProjectAssignments.id]
+    }).onDelete("cascade")
   ]
 );
 
@@ -2397,14 +2358,17 @@ async function credentialMayServeAccount(executor, accountId, credentialId) {
   const ownerRows = await executor.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq2(userUsageOwners.userId, accountId)).limit(1);
   return ownerRows[0]?.deliveryAdminId === credential.ownerUserId;
 }
-async function getCredentialForUpstreamResource(userId, kind, upstreamId) {
+async function getCredentialForUpstreamResource(userId, kind, upstreamId, projectAssignmentId) {
   const db = await requireDb();
   const rows = await db.select({ resource: upstreamResources, credential: apiCredentials }).from(upstreamResources).innerJoin(
     apiCredentials,
     eq2(upstreamResources.apiCredentialId, apiCredentials.id)
   ).where(
     and(
-      eq2(upstreamResources.userId, userId),
+      projectAssignmentId ? eq2(upstreamResources.projectAssignmentId, projectAssignmentId) : and(
+        eq2(upstreamResources.userId, userId),
+        isNull(upstreamResources.projectAssignmentId)
+      ),
       eq2(upstreamResources.kind, kind),
       eq2(upstreamResources.upstreamId, upstreamId),
       ne(apiCredentials.status, "deleted")
@@ -2423,13 +2387,16 @@ async function getCredentialForUpstreamResource(userId, kind, upstreamId) {
     resource: row.resource
   };
 }
-async function getOwnedUpstreamResourceIds(userId, kind, upstreamIds) {
+async function getOwnedUpstreamResourceIds(userId, kind, upstreamIds, projectAssignmentId) {
   const uniqueIds = [...new Set(upstreamIds.filter(Boolean))];
   if (uniqueIds.length === 0) return /* @__PURE__ */ new Set();
   const db = await requireDb();
   const rows = await db.select({ upstreamId: upstreamResources.upstreamId }).from(upstreamResources).where(
     and(
-      eq2(upstreamResources.userId, userId),
+      projectAssignmentId ? eq2(upstreamResources.projectAssignmentId, projectAssignmentId) : and(
+        eq2(upstreamResources.userId, userId),
+        isNull(upstreamResources.projectAssignmentId)
+      ),
       eq2(upstreamResources.kind, kind),
       inArray(upstreamResources.upstreamId, uniqueIds)
     )
@@ -2438,6 +2405,7 @@ async function getOwnedUpstreamResourceIds(userId, kind, upstreamIds) {
 }
 async function recordUpstreamResource(input) {
   const db = await requireDb();
+  const projectAssignmentId = input.projectAssignmentId ?? null;
   const existing = await db.select().from(upstreamResources).where(
     and(
       eq2(upstreamResources.kind, input.kind),
@@ -2445,22 +2413,55 @@ async function recordUpstreamResource(input) {
     )
   ).limit(1);
   if (existing[0]) {
-    if (existing[0].userId !== input.userId) {
+    const ownedByRequestedScope = projectAssignmentId ? existing[0].projectAssignmentId === projectAssignmentId : existing[0].userId === input.userId && existing[0].projectAssignmentId == null;
+    if (!ownedByRequestedScope) {
       throw new AuthServiceError(
         "CONFLICT",
-        "Upstream resource is already owned by another account"
+        "Upstream resource is already owned by another account or project"
       );
     }
     return existing[0];
   }
-  if (!await credentialMayServeAccount(db, input.userId, input.apiCredentialId)) {
+  if (projectAssignmentId) {
+    const assignmentRows = await db.select({ id: deliveryProjectAssignments.id }).from(deliveryProjectAssignments).where(
+      and(
+        eq2(deliveryProjectAssignments.id, projectAssignmentId),
+        eq2(deliveryProjectAssignments.engineerUserId, input.userId)
+      )
+    ).limit(1);
+    if (!assignmentRows[0]) {
+      throw new AuthServiceError(
+        "NOT_FOUND",
+        "Customer project assignment not found"
+      );
+    }
+  }
+  const credentialMayServeCurrentEngineer = await credentialMayServeAccount(
+    db,
+    input.userId,
+    input.apiCredentialId
+  );
+  const credentialAlreadyBoundToProject = projectAssignmentId && !credentialMayServeCurrentEngineer ? await db.select({ id: upstreamResources.id }).from(upstreamResources).innerJoin(
+    apiCredentials,
+    eq2(upstreamResources.apiCredentialId, apiCredentials.id)
+  ).where(
+    and(
+      eq2(upstreamResources.projectAssignmentId, projectAssignmentId),
+      eq2(upstreamResources.apiCredentialId, input.apiCredentialId),
+      ne(apiCredentials.status, "deleted")
+    )
+  ).limit(1) : [];
+  if (!credentialMayServeCurrentEngineer && !credentialAlreadyBoundToProject[0]) {
     throw new AuthServiceError("NOT_FOUND", "API credential not found");
   }
   if (input.conversationId) {
     const conversation = await db.select({ id: conversations.id }).from(conversations).where(
       and(
         eq2(conversations.id, input.conversationId),
-        eq2(conversations.userId, input.userId)
+        projectAssignmentId ? eq2(conversations.projectAssignmentId, projectAssignmentId) : and(
+          eq2(conversations.userId, input.userId),
+          isNull(conversations.projectAssignmentId)
+        )
       )
     ).limit(1);
     if (!conversation[0]) {
@@ -2471,6 +2472,7 @@ async function recordUpstreamResource(input) {
     id: randomUUID(),
     userId: input.userId,
     apiCredentialId: input.apiCredentialId,
+    projectAssignmentId,
     kind: input.kind,
     upstreamId: input.upstreamId,
     conversationId: input.conversationId ?? null,
@@ -2486,13 +2488,16 @@ async function recordUpstreamResource(input) {
       and(
         eq2(upstreamResources.kind, input.kind),
         eq2(upstreamResources.upstreamId, input.upstreamId),
-        eq2(upstreamResources.userId, input.userId)
+        projectAssignmentId ? eq2(upstreamResources.projectAssignmentId, projectAssignmentId) : and(
+          eq2(upstreamResources.userId, input.userId),
+          isNull(upstreamResources.projectAssignmentId)
+        )
       )
     ).limit(1);
     if (raced[0]) return raced[0];
     throw new AuthServiceError(
       "CONFLICT",
-      "Upstream resource is already owned by another account"
+      "Upstream resource is already owned by another account or project"
     );
   }
 }
@@ -3530,20 +3535,8 @@ var preferredContentMediaSchema = z5.enum([
   "Business Insider",
   "Barchart"
 ]);
-var icpSensitiveMaterialCategorySchema = z5.enum([
-  "business_license",
-  "subject_responsible_person_id",
-  "website_responsible_person_id",
-  "authorization_letter",
-  "pre_approval_or_industry_qualification",
-  "enterprise_name_change_proof",
-  "other_provincial_material"
-]);
 var deliveryTicketAttachmentInputSchema = z5.object({
-  storageKind: z5.enum(["upstream", "icp_protected"]).default("upstream"),
-  fileId: z5.string().trim().min(1).max(255).optional(),
-  protectedMaterialId: z5.string().uuid().optional(),
-  sensitiveCategory: icpSensitiveMaterialCategorySchema.optional(),
+  fileId: z5.string().trim().min(1).max(255),
   filename: z5.string().trim().min(1).max(512),
   mimeType: z5.string().trim().max(255).optional(),
   sizeBytes: z5.number().int().nonnegative().max(100 * 1024 * 1024).optional(),
@@ -3551,30 +3544,7 @@ var deliveryTicketAttachmentInputSchema = z5.object({
   purpose: z5.string().trim().max(160).optional(),
   authorization: z5.enum(["owned", "licensed", "public", "authorization_pending"]).optional(),
   copyrightNote: z5.string().trim().max(2e3).optional()
-}).superRefine((value, context) => {
-  if (value.storageKind === "icp_protected") {
-    if (!value.protectedMaterialId) {
-      context.addIssue({
-        code: z5.ZodIssueCode.custom,
-        path: ["protectedMaterialId"],
-        message: "ICP \u654F\u611F\u6750\u6599\u7F3A\u5C11\u53D7\u4FDD\u62A4\u6587\u4EF6\u6807\u8BC6"
-      });
-    }
-    if (!value.sensitiveCategory) {
-      context.addIssue({
-        code: z5.ZodIssueCode.custom,
-        path: ["sensitiveCategory"],
-        message: "\u8BF7\u9009\u62E9 ICP \u654F\u611F\u6750\u6599\u7C7B\u522B"
-      });
-    }
-  } else if (!value.fileId) {
-    context.addIssue({
-      code: z5.ZodIssueCode.custom,
-      path: ["fileId"],
-      message: "\u9644\u4EF6\u7F3A\u5C11\u6587\u4EF6\u6807\u8BC6"
-    });
-  }
-});
+}).strict();
 var optionalTrimmedText = (maximum) => z5.string().trim().max(maximum).optional();
 var httpUrlSchema = z5.string().trim().max(2048).url().refine((value) => {
   const protocol = new URL(value).protocol;
@@ -3639,9 +3609,6 @@ var createDeliveryTicketSchema = z5.object({
 });
 var deliveryTicketDetailInputSchema = z5.object({
   ticketId: z5.string().uuid()
-});
-var icpMaterialChecklistInputSchema = z5.object({
-  province: z5.string().trim().min(1).max(64)
 });
 var deliveryTicketListInputSchema = z5.object({
   type: deliveryTicketTypeSchema.optional(),
@@ -3904,10 +3871,9 @@ var publicDeliveryTicketWorkspaceMetadataSchema = z5.object({
   marketEdition: accountMarketEditionSchema,
   preferredMediaOptions: z5.array(preferredContentMediaSchema),
   deliveryOwners: z5.object({
-    knowledgeBase: z5.boolean(),
+    aiOperations: z5.boolean(),
     monitoringOptimization: z5.boolean(),
-    contentDistribution: z5.boolean(),
-    websiteOperations: z5.boolean()
+    contentDistribution: z5.boolean()
   }).strict(),
   websiteWorkflow: z5.object({
     domainCompleted: z5.boolean(),
@@ -3960,6 +3926,52 @@ import { and as and2, desc as desc2, eq as eq3, gte } from "drizzle-orm";
 
 // server/service-entitlement.ts
 var DAY_MS = 24 * 60 * 60 * 1e3;
+function asDate(value) {
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    throw new TypeError("Invalid service date");
+  }
+  return date;
+}
+function epoch(value) {
+  return asDate(value).getTime();
+}
+function deriveEffectiveServiceStatus(contract, now = /* @__PURE__ */ new Date()) {
+  if (!contract) return "unconfigured";
+  if (contract.status === "cancelled" || contract.status === "superseded") {
+    return "cancelled";
+  }
+  if (epoch(contract.endsAt) <= epoch(now)) return "expired";
+  if (contract.status === "pending_confirmation") {
+    return "pending_confirmation";
+  }
+  if (contract.status === "suspended") return "suspended";
+  if (epoch(contract.startsAt) > epoch(now)) return "scheduled";
+  return "active";
+}
+function selectPortalContract(contracts, now = /* @__PURE__ */ new Date()) {
+  const statusRank = {
+    active: 6,
+    pending_confirmation: 5,
+    scheduled: 4,
+    suspended: 3,
+    expired: 2,
+    cancelled: 1,
+    unconfigured: 0
+  };
+  const planRank = {
+    basic: 1,
+    advanced: 2,
+    luxury: 3
+  };
+  return [...contracts].sort((left, right) => {
+    const statusDifference = statusRank[deriveEffectiveServiceStatus(right, now)] - statusRank[deriveEffectiveServiceStatus(left, now)];
+    if (statusDifference) return statusDifference;
+    const planDifference = planRank[right.planCode] - planRank[left.planCode];
+    if (planDifference) return planDifference;
+    return right.revision - left.revision;
+  })[0] ?? null;
+}
 
 // server/admin-control-plane-service.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
@@ -4461,9 +4473,11 @@ function stableExternalIdentity(url) {
   const stableQuery = new URLSearchParams(stableParameters).toString();
   return `${parsed.protocol}//${parsed.host}${parsed.pathname}${stableQuery ? `?${stableQuery}` : ""}`;
 }
-function createPreparedAssetId(ownerUserId, credentialId, source) {
+function createPreparedAssetId(ownerUserId, credentialId, source, projectAssignmentId) {
   const sourceIdentity = source.kind === "file" ? `file:${source.fileId}` : `external:${stableExternalIdentity(source.url)}`;
-  return createHash2("sha256").update(`frontmind-pdf-v1\0${ownerUserId}\0${credentialId}\0${sourceIdentity}`).digest("hex").slice(0, 40);
+  return createHash2("sha256").update(
+    `frontmind-pdf-v1\0${ownerUserId}\0${credentialId}\0${sourceIdentity}${projectAssignmentId ? `\0project-assignment:${projectAssignmentId}` : ""}`
+  ).digest("hex").slice(0, 40);
 }
 function publicStatus(manifest) {
   return {
@@ -4619,10 +4633,12 @@ var PreparedFileService = class {
       id: createPreparedAssetId(
         input.ownerUserId,
         input.credentialId,
-        source
+        source,
+        input.projectAssignmentId
       ),
       ownerUserId: input.ownerUserId,
       credentialId: input.credentialId,
+      projectAssignmentId: input.projectAssignmentId ?? null,
       source,
       filename: normalizeFilename(input.filename)
     });
@@ -4637,10 +4653,12 @@ var PreparedFileService = class {
       id: createPreparedAssetId(
         input.ownerUserId,
         input.credentialId,
-        source
+        source,
+        input.projectAssignmentId
       ),
       ownerUserId: input.ownerUserId,
       credentialId: input.credentialId,
+      projectAssignmentId: input.projectAssignmentId ?? null,
       source,
       filename: normalizeFilename(input.filename)
     });
@@ -4649,6 +4667,12 @@ var PreparedFileService = class {
     const now = Date.now();
     const existing = this.manifests.get(input.id);
     if (existing) {
+      if ((existing.projectAssignmentId ?? null) !== input.projectAssignmentId) {
+        throw new PreparedFileError(
+          "SOURCE_FORBIDDEN",
+          "\u6587\u4EF6\u4E0D\u5C5E\u4E8E\u5F53\u524D\u5BA2\u6237\u9879\u76EE"
+        );
+      }
       existing.filename = input.filename;
       existing.lastAccessedAt = now;
       if (input.source.kind === "external") {
@@ -4669,6 +4693,7 @@ var PreparedFileService = class {
       id: input.id,
       ownerUserId: input.ownerUserId,
       credentialId: input.credentialId,
+      projectAssignmentId: input.projectAssignmentId,
       source: input.source,
       filename: input.filename,
       mimeType: "application/pdf",
@@ -4683,13 +4708,21 @@ var PreparedFileService = class {
     this.enqueue(manifest.id);
     return publicStatus(manifest);
   }
-  async getStatus(assetId, ownerUserId) {
-    const manifest = await this.requireOwned(assetId, ownerUserId);
+  async getStatus(assetId, ownerUserId, projectAssignmentId) {
+    const manifest = await this.requireOwned(
+      assetId,
+      ownerUserId,
+      projectAssignmentId
+    );
     await this.touch(manifest);
     return publicStatus(manifest);
   }
-  async getReadyManifest(assetId, ownerUserId) {
-    const manifest = await this.requireOwned(assetId, ownerUserId);
+  async getReadyManifest(assetId, ownerUserId, projectAssignmentId) {
+    const manifest = await this.requireOwned(
+      assetId,
+      ownerUserId,
+      projectAssignmentId
+    );
     await this.touch(manifest);
     if (manifest.status !== "ready") return manifest;
     if (!await fileExists(this.pdfPath(assetId))) {
@@ -4702,8 +4735,12 @@ var PreparedFileService = class {
     }
     return manifest;
   }
-  async retry(assetId, ownerUserId) {
-    const manifest = await this.requireOwned(assetId, ownerUserId);
+  async retry(assetId, ownerUserId, projectAssignmentId) {
+    const manifest = await this.requireOwned(
+      assetId,
+      ownerUserId,
+      projectAssignmentId
+    );
     if (manifest.status === "ready") return publicStatus(manifest);
     manifest.status = "queued";
     manifest.phase = "queued";
@@ -4734,13 +4771,14 @@ var PreparedFileService = class {
       activeWorkers: this.processing
     };
   }
-  async requireOwned(assetId, ownerUserId) {
+  async requireOwned(assetId, ownerUserId, projectAssignmentId) {
     await this.initialize();
     if (!/^[a-f0-9]{40}$/.test(assetId)) {
       throw new PreparedFileError("ASSET_NOT_FOUND", "\u6587\u4EF6\u4E0D\u5B58\u5728");
     }
     const manifest = this.manifests.get(assetId);
-    if (!manifest || manifest.ownerUserId !== ownerUserId) {
+    const owned = projectAssignmentId ? manifest?.projectAssignmentId === projectAssignmentId : manifest?.ownerUserId === ownerUserId && (manifest.projectAssignmentId ?? null) === null;
+    if (!manifest || !owned) {
       throw new PreparedFileError("ASSET_NOT_FOUND", "\u6587\u4EF6\u4E0D\u5B58\u5728");
     }
     return manifest;
@@ -4807,20 +4845,14 @@ var PreparedFileService = class {
       await this.persistManifest(manifest);
       const outputStat = await fs.stat(preparedTempPath);
       if (outputStat.size < 5) {
-        throw new PreparedFileError(
-          "INVALID_PDF",
-          "\u5904\u7406\u540E\u7684 PDF \u6587\u4EF6\u4E3A\u7A7A"
-        );
+        throw new PreparedFileError("INVALID_PDF", "\u5904\u7406\u540E\u7684 PDF \u6587\u4EF6\u4E3A\u7A7A");
       }
       const handle = await fs.open(preparedTempPath, "r");
       try {
         const header = Buffer.alloc(5);
         await handle.read(header, 0, 5, 0);
         if (header.toString("ascii") !== "%PDF-") {
-          throw new PreparedFileError(
-            "INVALID_PDF",
-            "\u5904\u7406\u7ED3\u679C\u4E0D\u662F\u6709\u6548\u7684 PDF"
-          );
+          throw new PreparedFileError("INVALID_PDF", "\u5904\u7406\u7ED3\u679C\u4E0D\u662F\u6709\u6548\u7684 PDF");
         }
       } finally {
         await handle.close();
@@ -4855,9 +4887,7 @@ var PreparedFileService = class {
       this.active.delete(manifest.id);
       await fs.rm(sourcePath, { force: true }).catch(() => void 0);
       await fs.rm(preparedTempPath, { force: true }).catch(() => void 0);
-      await fs.rm(workDir, { recursive: true, force: true }).catch(
-        () => void 0
-      );
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => void 0);
     }
   }
   async downloadSource(manifest, destination, persistProgress) {
@@ -4867,7 +4897,8 @@ var PreparedFileService = class {
       const credential = await getCredentialForUpstreamResource(
         manifest.ownerUserId,
         "file",
-        manifest.source.fileId
+        manifest.source.fileId,
+        manifest.projectAssignmentId ?? void 0
       );
       if (!credential || credential.id !== manifest.credentialId) {
         throw new PreparedFileError(
@@ -5218,6 +5249,122 @@ var PreparedFileService = class {
   }
 };
 var preparedFileService = new PreparedFileService();
+
+// server/delivery-role-service.ts
+import { and as and6, desc as desc6, eq as eq7, inArray as inArray5, isNull as isNull3, sql as sql2 } from "drizzle-orm";
+
+// shared/delivery-roles.ts
+import { z as z6 } from "zod";
+var deliveryRoleTypeSchema = z6.enum([
+  "ai_operations_engineer",
+  "monitoring_optimization_engineer",
+  "content_distribution_engineer"
+]);
+var deliveryWorkflowOperationSchema = z6.enum([
+  "build_exception",
+  "knowledge_maintenance",
+  "knowledge_reset",
+  "question_catalog",
+  "initial_monitoring",
+  "monitoring_import",
+  "monitoring_retest",
+  "stage_report",
+  "response_logic",
+  "content_asset_publish",
+  "channel_distribution",
+  "domain_application",
+  "icp_filing",
+  "company_facts",
+  "product_case_docs",
+  "industry_news",
+  "company_news",
+  "faq_content",
+  "site_check"
+]);
+var knowledgeResetReasonSchema = z6.enum([
+  "stuck",
+  "upload_error",
+  "build_error",
+  "enterprise_materials",
+  "other"
+]);
+
+// server/delivery-role-service.ts
+async function requireDb3() {
+  const db = await getDb();
+  if (!db) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Database is not configured"
+    );
+  }
+  return db;
+}
+function requiredRolesForPlan(planCode) {
+  const roles = [
+    "monitoring_optimization_engineer",
+    "content_distribution_engineer"
+  ];
+  if (planCode === "advanced" || planCode === "luxury") {
+    roles.unshift("ai_operations_engineer");
+  }
+  return roles;
+}
+var ACTIVE_DELIVERY_STATUSES = [
+  "submitted",
+  "needs_information",
+  "scheduled",
+  "in_progress"
+];
+async function assertDeliveryProjectContext(input) {
+  if (input.actor.role !== "delivery_member") {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "\u9700\u8981\u4EA4\u4ED8\u6210\u5458\u6743\u9650");
+  }
+  const db = input.executor ?? await requireDb3();
+  const rows = await db.select({
+    projectAssignmentId: deliveryProjectAssignments.id,
+    customerUserId: deliveryProjectAssignments.customerUserId,
+    roleType: deliveryProjectAssignments.roleType,
+    customerUsername: users.username,
+    customerName: users.displayName
+  }).from(deliveryProjectAssignments).innerJoin(users, eq7(users.id, deliveryProjectAssignments.customerUserId)).where(
+    and6(
+      eq7(deliveryProjectAssignments.id, input.projectAssignmentId),
+      eq7(deliveryProjectAssignments.engineerUserId, input.actor.id),
+      eq7(users.role, "user"),
+      eq7(users.isActive, true)
+    )
+  ).limit(1);
+  const role = rows[0];
+  if (!role || role.roleType !== input.actor.engineerRoleType || input.expectedRoleType && role.roleType !== input.expectedRoleType) {
+    throw new AuthServiceError("NOT_FOUND", "\u5F53\u524D\u5BA2\u6237\u9879\u76EE\u5C97\u4F4D\u4E0D\u5B58\u5728");
+  }
+  if (input.customerUserId !== void 0 && input.customerUserId !== role.customerUserId) {
+    throw new AuthServiceError("NOT_FOUND", "\u5BA2\u6237\u672A\u5206\u914D\u7ED9\u5F53\u524D\u5DE5\u7A0B\u5E08");
+  }
+  const contractRows = await db.select().from(serviceContracts).where(eq7(serviceContracts.userId, role.customerUserId));
+  const currentContract = selectPortalContract(
+    contractRows
+  );
+  if (!requiredRolesForPlan(currentContract?.planCode).includes(role.roleType)) {
+    const activeTicketRows = await db.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
+      and6(
+        eq7(
+          deliveryTickets.assignedProjectAssignmentId,
+          role.projectAssignmentId
+        ),
+        inArray5(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)
+      )
+    ).limit(1);
+    if (!activeTicketRows[0]) {
+      throw new AuthServiceError("NOT_FOUND", "\u5F53\u524D\u5957\u9910\u672A\u542F\u7528\u8BE5\u5DE5\u7A0B\u5E08\u5C97\u4F4D");
+    }
+  }
+  return {
+    ...role,
+    customerName: role.customerName || role.customerUsername || `\u5BA2\u6237 ${role.customerUserId}`
+  };
+}
 
 // server/manus-proxy.ts
 var router = Router();
@@ -6770,6 +6917,7 @@ router.get("/proxy-download", async (req, res) => {
       const asset = await preparedFileService.registerExternal({
         ownerUserId: req.frontmindUser.id,
         credentialId: credential?.id || "external",
+        projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
         url: targetUrl,
         filename: candidateFilename
       });
@@ -6939,7 +7087,7 @@ async function downloadFromS3(res, s3Url, filename, disposition = "inline") {
   res.setHeader("content-length", String(sanitizedBuffer.length));
   res.send(sanitizedBuffer);
 }
-async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "inline", ownerUserId, credentialId) {
+async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "inline", ownerUserId, credentialId, projectAssignmentId) {
   const meta = await fetchFileMetadata(baseUrl, fileId, apiKey);
   if (!meta) {
     res.status(404).json({
@@ -6954,6 +7102,7 @@ async function handleFileDownload(res, baseUrl, fileId, apiKey, disposition = "i
     const asset = await preparedFileService.registerFile({
       ownerUserId,
       credentialId,
+      projectAssignmentId,
       fileId,
       filename: meta.filename
     });
@@ -7060,6 +7209,7 @@ router.post("/download-token", async (req, res) => {
       fileId,
       userId: req.frontmindUser.id,
       credentialId: req.frontmindCredential.id,
+      projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
       apiKey,
       baseUrl,
       createdAt: Date.now()
@@ -7104,6 +7254,20 @@ router.get("/download/:token", async (req, res) => {
         }
       });
     }
+    if (req.frontmindUser.role === "delivery_member") {
+      if (!data2.projectAssignmentId) {
+        return res.status(403).json({
+          error: {
+            message: "\u4E0B\u8F7D\u94FE\u63A5\u7F3A\u5C11\u5BA2\u6237\u9879\u76EE\u4E0A\u4E0B\u6587",
+            code: "DELIVERY_PROJECT_CONTEXT_FORBIDDEN"
+          }
+        });
+      }
+      await assertDeliveryProjectContext({
+        actor: req.frontmindUser,
+        projectAssignmentId: data2.projectAssignmentId
+      });
+    }
     downloadTokenCache.delete(token);
     await handleFileDownload(
       res,
@@ -7112,7 +7276,8 @@ router.get("/download/:token", async (req, res) => {
       data2.apiKey,
       "attachment",
       data2.userId,
-      data2.credentialId
+      data2.credentialId,
+      data2.projectAssignmentId
     );
   } catch (error) {
     if (isExternalDownloadTooLarge(error)) {
@@ -7141,7 +7306,8 @@ router.get("/v1/files/:fileId", async (req, res) => {
       apiKey,
       "inline",
       req.frontmindUser?.id,
-      req.frontmindCredential?.id
+      req.frontmindCredential?.id,
+      req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null
     );
   } catch (error) {
     if (isExternalDownloadTooLarge(error)) {
@@ -7170,7 +7336,8 @@ router.get("/v1/files/:fileId/content", async (req, res) => {
       apiKey,
       "inline",
       req.frontmindUser?.id,
-      req.frontmindCredential?.id
+      req.frontmindCredential?.id,
+      req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null
     );
   } catch (error) {
     if (isExternalDownloadTooLarge(error)) {
@@ -7306,9 +7473,10 @@ router.all("/*", async (req, res) => {
           userId: req.frontmindUser.id,
           apiCredentialId: req.frontmindCredential.id,
           kind: isTaskCreate ? "task" : "file",
-          upstreamId: resourceId
+          upstreamId: resourceId,
+          projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null
         });
-        if (isTaskCreate && req.frontmindUser.role === "delivery_member" && req.frontmindDeliveryRoleContext) {
+        if (isTaskCreate && req.frontmindUser.role === "delivery_member" && req.frontmindDeliveryProjectContext) {
           await writeWorkspaceAuditEvent({
             actor: req.frontmindUser,
             action: "delivery_member.agent.task_created",
@@ -7316,10 +7484,10 @@ router.all("/*", async (req, res) => {
             targetId: resourceId,
             workspaceUserId: null,
             metadata: {
-              roleAssignmentId: req.frontmindDeliveryRoleContext.assignmentId,
-              roleId: req.frontmindDeliveryRoleContext.roleId,
-              roleType: req.frontmindDeliveryRoleContext.roleType,
-              teamName: req.frontmindDeliveryRoleContext.teamName
+              projectAssignmentId: req.frontmindDeliveryProjectContext.projectAssignmentId,
+              customerUserId: req.frontmindDeliveryProjectContext.customerUserId,
+              roleType: req.frontmindDeliveryProjectContext.roleType,
+              customerName: req.frontmindDeliveryProjectContext.customerName
             }
           });
         }
@@ -7329,7 +7497,8 @@ router.all("/*", async (req, res) => {
           userId: req.frontmindUser.id,
           apiCredentialId: req.frontmindCredential.id,
           kind: "file",
-          upstreamId: fileId
+          upstreamId: fileId,
+          projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null
         });
       }
       for (const descriptor of collectOutputPdfDescriptors(response.data)) {
@@ -7338,6 +7507,7 @@ router.all("/*", async (req, res) => {
             await preparedFileService.registerFile({
               ownerUserId: req.frontmindUser.id,
               credentialId: req.frontmindCredential.id,
+              projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
               fileId: descriptor.fileId,
               filename: descriptor.filename
             });
@@ -7349,6 +7519,7 @@ router.all("/*", async (req, res) => {
             await preparedFileService.registerFile({
               ownerUserId: req.frontmindUser.id,
               credentialId: req.frontmindCredential.id,
+              projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
               fileId: decodeURIComponent(match[1]),
               filename: descriptor.filename
             });
@@ -7356,6 +7527,7 @@ router.all("/*", async (req, res) => {
             await preparedFileService.registerExternal({
               ownerUserId: req.frontmindUser.id,
               credentialId: req.frontmindCredential.id,
+              projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
               url: descriptor.url,
               filename: descriptor.filename
             });

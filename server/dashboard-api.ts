@@ -101,7 +101,7 @@ import { getDb } from "./db";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { assertKnowledgeMaintenanceTicketForUpload } from "./delivery-ticket-service";
 import {
-  assertDeliveryRoleContext,
+  assertDeliveryProjectContext,
   createKnowledgeMonitoringHandoff,
 } from "./delivery-role-service";
 import type { DeliveryRoleType } from "../shared/delivery-roles";
@@ -122,8 +122,8 @@ function assertNotDeliveryAdministratorExecution(actor: AuthenticatedUser) {
   }
 }
 
-function deliveryRoleAssignmentId(req: express.Request) {
-  return String(req.header("x-delivery-role-assignment-id") || "").trim();
+function deliveryProjectAssignmentId(req: express.Request) {
+  return String(req.header("x-delivery-project-assignment-id") || "").trim();
 }
 
 async function assertRoleScopedWorkspaceExecution(input: {
@@ -135,15 +135,14 @@ async function assertRoleScopedWorkspaceExecution(input: {
 }) {
   const actor = input.req.frontmindUser!;
   if (actor.role === "delivery_member") {
-    const roleAssignmentId = deliveryRoleAssignmentId(input.req);
-    if (!roleAssignmentId) {
-      throw new Error("缺少当前交付工作角色标识");
+    const projectAssignmentId = deliveryProjectAssignmentId(input.req);
+    if (!projectAssignmentId) {
+      throw new Error("缺少当前客户项目岗位标识");
     }
-    return assertDeliveryRoleContext({
+    return assertDeliveryProjectContext({
       actor,
-      roleAssignmentId,
+      projectAssignmentId,
       customerUserId: input.targetUserId,
-      requirePrimaryCustomerAssignment: input.requirePrimaryCustomerAssignment,
       expectedRoleType: input.expectedRoleType,
     });
   }
@@ -233,7 +232,10 @@ async function assertDeliveryModuleImport(input: {
         eq(deliveryTickets.id, ticketId),
         eq(deliveryTickets.userId, input.targetUserId),
         eq(deliveryTickets.workflowDomain, role.roleType),
-        eq(deliveryTickets.assignedRoleId, role.roleId),
+        eq(
+          deliveryTickets.assignedProjectAssignmentId,
+          role.projectAssignmentId,
+        ),
         eq(deliveryTickets.assignedMemberId, input.req.frontmindUser!.id),
         inArray(deliveryTickets.operation, access.operations),
         inArray(deliveryTickets.status, [
@@ -6470,7 +6472,7 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
     await assertRoleScopedWorkspaceExecution({
       req,
       targetUserId,
-      expectedRoleType: "knowledge_base_engineer",
+      expectedRoleType: "ai_operations_engineer",
       allowCustomerSelf: true,
     });
     await assertServiceCapability(targetUserId, "knowledgeBuild");
@@ -7447,7 +7449,7 @@ router.put(
       await assertRoleScopedWorkspaceExecution({
         req,
         targetUserId,
-        expectedRoleType: "knowledge_base_engineer",
+        expectedRoleType: "ai_operations_engineer",
       });
       await assertKnowledgeBaseWritable(targetUserId);
       await assertServiceCapability(targetUserId, "knowledgeDisplay");

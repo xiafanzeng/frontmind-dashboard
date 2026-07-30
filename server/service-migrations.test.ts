@@ -85,7 +85,195 @@ describe("service portal migration chain", () => {
       "0037_remove-knowledge-plan",
       "0038_fine_loners",
       "0039_delivery_roles_and_knowledge_reset",
+      "0040_flaky_the_executioner",
+      "0041_lovely_harry_osborn",
+      "0042_heavy_xorn",
+      "0043_clumsy_lilandra",
     ]);
+  });
+
+  it("drops the delivery-role foreign keys by their executable migration names", async () => {
+    const previousMigration = await migration(
+      "0039_delivery_roles_and_knowledge_reset.sql",
+    );
+    const projectTeamMigration = await migration(
+      "0040_flaky_the_executioner.sql",
+    );
+
+    for (const foreignKeyName of [
+      "delivery_tickets_assigned_role_fk",
+      "knowledge_base_reset_requests_role_fk",
+    ]) {
+      expect(previousMigration).toContain(`CONSTRAINT \`${foreignKeyName}\``);
+      expect(projectTeamMigration).toContain(
+        `DROP FOREIGN KEY \`${foreignKeyName}\``,
+      );
+    }
+  });
+
+  it("updates the reset-request member foreign key by its executable name", async () => {
+    const originalResetMigration = await migration(
+      "0039_delivery_roles_and_knowledge_reset.sql",
+    );
+    const projectIsolationMigration = await migration("0042_heavy_xorn.sql");
+
+    expect(originalResetMigration).toContain(
+      "CONSTRAINT `knowledge_base_reset_requests_member_fk`",
+    );
+    expect(projectIsolationMigration).toContain(
+      "DROP FOREIGN KEY `knowledge_base_reset_requests_member_fk`",
+    );
+  });
+
+  it("cascades project-owned conversations and resources with the customer project", async () => {
+    const migrationSql = await migration("0042_heavy_xorn.sql");
+    for (const foreignKeyName of [
+      "conversations_project_assignment_fk",
+      "upstream_resources_project_assignment_fk",
+    ]) {
+      expect(migrationSql).toMatch(
+        new RegExp(
+          `CONSTRAINT \`${foreignKeyName}\`[^;]*ON DELETE cascade ON UPDATE no action`,
+        ),
+      );
+    }
+    expect(
+      migrationSql.match(/ON DELETE cascade ON UPDATE no action/g),
+    ).toHaveLength(2);
+  });
+
+  it("keeps role slots nullable while preserving project ownership boundaries", async () => {
+    const projectIsolationMigration = await migration("0042_heavy_xorn.sql");
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0042_snapshot.json"),
+        "utf8",
+      ),
+    ) as {
+      tables: Record<
+        string,
+        {
+          columns: Record<string, { notNull: boolean; type: string }>;
+          foreignKeys: Record<
+            string,
+            {
+              columnsFrom: string[];
+              tableTo: string;
+              onDelete?: string;
+            }
+          >;
+        }
+      >;
+    };
+
+    for (const statement of [
+      "MODIFY COLUMN `engineerUserId` int;",
+      "MODIFY COLUMN `assignedProjectAssignmentId` varchar(36);",
+      "MODIFY COLUMN `assignedMemberId` int;",
+      "ALTER TABLE `conversations` ADD `projectAssignmentId` varchar(36);",
+      "ALTER TABLE `upstream_resources` ADD `projectAssignmentId` varchar(36);",
+    ]) {
+      expect(projectIsolationMigration).toContain(statement);
+    }
+    for (const foreignKeyName of [
+      "delivery_project_assignments_engineerUserId_users_id_fk",
+      "knowledge_base_reset_requests_assignedMemberId_users_id_fk",
+      "kb_reset_project_assignment_fk",
+    ]) {
+      expect(projectIsolationMigration).toMatch(
+        new RegExp(`CONSTRAINT \`${foreignKeyName}\`[^;]*ON DELETE set null`),
+      );
+    }
+
+    expect(
+      snapshot.tables.delivery_project_assignments.columns.engineerUserId,
+    ).toMatchObject({ type: "int", notNull: false });
+    expect(
+      snapshot.tables.knowledge_base_reset_requests.columns
+        .assignedProjectAssignmentId,
+    ).toMatchObject({ type: "varchar(36)", notNull: false });
+    expect(
+      snapshot.tables.knowledge_base_reset_requests.columns.assignedMemberId,
+    ).toMatchObject({ type: "int", notNull: false });
+    expect(
+      snapshot.tables.conversations.columns.projectAssignmentId,
+    ).toMatchObject({ type: "varchar(36)", notNull: false });
+    expect(
+      snapshot.tables.upstream_resources.columns.projectAssignmentId,
+    ).toMatchObject({ type: "varchar(36)", notNull: false });
+
+    for (const [tableName, foreignKeyName] of [
+      [
+        "delivery_project_assignments",
+        "delivery_project_assignments_engineerUserId_users_id_fk",
+      ],
+      [
+        "knowledge_base_reset_requests",
+        "knowledge_base_reset_requests_assignedMemberId_users_id_fk",
+      ],
+      ["knowledge_base_reset_requests", "kb_reset_project_assignment_fk"],
+    ] as const) {
+      expect(
+        snapshot.tables[tableName].foreignKeys[foreignKeyName],
+      ).toMatchObject({ onDelete: "set null" });
+    }
+    for (const [tableName, foreignKeyName] of [
+      ["conversations", "conversations_project_assignment_fk"],
+      ["upstream_resources", "upstream_resources_project_assignment_fk"],
+    ] as const) {
+      expect(
+        snapshot.tables[tableName].foreignKeys[foreignKeyName],
+      ).toMatchObject({ onDelete: "cascade" });
+    }
+  });
+
+  it("merges delivery roles and removes protected ICP storage", async () => {
+    const migrationSql = await migration("0043_clumsy_lilandra.sql");
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0043_snapshot.json"),
+        "utf8",
+      ),
+    ) as {
+      tables: Record<
+        string,
+        {
+          columns: Record<string, { type: string }>;
+          foreignKeys: Record<string, unknown>;
+          indexes: Record<string, unknown>;
+        }
+      >;
+    };
+
+    expect(migrationSql).toContain(
+      "CONSTRAINT `_frontmind_three_roles_preflight_empty`",
+    );
+    expect(migrationSql).toContain(
+      "CONSTRAINT `_frontmind_icp_purge_preflight_empty`",
+    );
+    expect(migrationSql).toContain(
+      "SET `workflowDomain` = 'ai_operations_engineer'",
+    );
+    expect(migrationSql).toContain(
+      "DROP FOREIGN KEY `ticket_attachments_protected_material_fk`",
+    );
+    expect(migrationSql).toContain("DROP TABLE `icp_sensitive_materials`");
+
+    expect(snapshot.tables).not.toHaveProperty("icp_sensitive_materials");
+    expect(
+      snapshot.tables.delivery_ticket_attachments.columns,
+    ).not.toHaveProperty("protectedMaterialId");
+    expect(
+      snapshot.tables.delivery_ticket_attachments.columns,
+    ).not.toHaveProperty("sensitivity");
+    expect(snapshot.tables.users.columns.engineerRoleType.type).toBe(
+      "enum('ai_operations_engineer','monitoring_optimization_engineer','content_distribution_engineer')",
+    );
+    expect(
+      snapshot.tables.delivery_project_assignments.columns.roleType.type,
+    ).toBe(
+      "enum('ai_operations_engineer','monitoring_optimization_engineer','content_distribution_engineer')",
+    );
   });
 
   it("keeps journal indexes and migration timestamps strictly increasing", async () => {

@@ -10,7 +10,12 @@ import {
   Send,
   Upload,
 } from "lucide-react";
-import { FormEvent, useEffect, useState } from "react";
+import {
+  FormEvent,
+  type MouseEvent as ReactMouseEvent,
+  useEffect,
+  useState,
+} from "react";
 import {
   type DeliveryTicketAttachmentInput,
   type DeliveryTicketStatus,
@@ -26,7 +31,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { uploadFile } from "@/lib/frontmind-api";
+import { deliveryProjectHeaders, uploadFile } from "@/lib/frontmind-api";
 
 import "./delivery-ticket-detail-dialog.css";
 
@@ -227,6 +232,10 @@ export default function DeliveryTicketDetailDialog({
   const [formError, setFormError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [attachmentDownloadError, setAttachmentDownloadError] = useState("");
+  const [downloadingAttachmentId, setDownloadingAttachmentId] = useState<
+    string | null
+  >(null);
   const ticket = detail?.ticket;
   const effectiveTicketId = ticketId || ticket?.id || null;
   const events = customerVisibleTicketEvents(detail?.events);
@@ -236,9 +245,7 @@ export default function DeliveryTicketDetailDialog({
       )
     : [];
   const mutationAllowed = canMutate ?? Boolean(onAddMessage || onSubmitMessage);
-  const terminal = ticket
-    ? ticketPublicStatus(ticket) === "completed"
-    : true;
+  const terminal = ticket ? ticketPublicStatus(ticket) === "completed" : true;
   const websiteSummaryOnly = ticket?.type === "website_operation";
   const canReply = Boolean(
     mutationAllowed &&
@@ -257,7 +264,47 @@ export default function DeliveryTicketDetailDialog({
     setFormError("");
     setUploading(false);
     setUploadProgress(null);
+    setAttachmentDownloadError("");
+    setDownloadingAttachmentId(null);
   }, [open, ticket?.id]);
+
+  async function downloadProjectAttachment(
+    event: ReactMouseEvent<HTMLAnchorElement>,
+    attachment: NonNullable<TicketDetail["attachments"]>[number],
+    downloadUrl: string,
+  ) {
+    const headers = deliveryProjectHeaders();
+    if (!headers["x-delivery-project-assignment-id"]) return;
+
+    event.preventDefault();
+    if (downloadingAttachmentId) return;
+    setAttachmentDownloadError("");
+    setDownloadingAttachmentId(attachment.id);
+    try {
+      const response = await fetch(downloadUrl, {
+        credentials: "include",
+        headers,
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error?.message || "附件下载失败");
+      }
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = attachment.filename;
+      anchor.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (downloadError) {
+      setAttachmentDownloadError(
+        downloadError instanceof Error
+          ? downloadError.message
+          : "附件下载失败，请稍后重试。",
+      );
+    } finally {
+      setDownloadingAttachmentId(null);
+    }
+  }
 
   async function submitMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -289,7 +336,6 @@ export default function DeliveryTicketDetailDialog({
             });
             return {
               ...uploaded,
-              storageKind: "upstream" as const,
               mimeType: file.type || undefined,
               sizeBytes: file.size,
             };
@@ -598,6 +644,14 @@ export default function DeliveryTicketDetailDialog({
                       </div>
                     ) : (
                       <div className="grid gap-2">
+                        {attachmentDownloadError && (
+                          <p
+                            className="m-0 rounded-xl bg-[#fff1f3] px-4 py-3 text-sm text-[#a1264f]"
+                            role="alert"
+                          >
+                            {attachmentDownloadError}
+                          </p>
+                        )}
                         {attachments.map((attachment) => {
                           const safeDownloadUrl = safeDeliveryAttachmentUrl(
                             attachment.downloadUrl,
@@ -638,9 +692,12 @@ export default function DeliveryTicketDetailDialog({
                                   </small>
                                 )}
                               </span>
-                              {safeDownloadUrl && (
-                                <ExternalLink className="h-4 w-4 shrink-0" />
-                              )}
+                              {safeDownloadUrl &&
+                                (downloadingAttachmentId === attachment.id ? (
+                                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                                ) : (
+                                  <ExternalLink className="h-4 w-4 shrink-0" />
+                                ))}
                             </>
                           );
                           return safeDownloadUrl ? (
@@ -649,6 +706,13 @@ export default function DeliveryTicketDetailDialog({
                               href={safeDownloadUrl}
                               target="_blank"
                               rel="noopener noreferrer"
+                              onClick={(event) =>
+                                downloadProjectAttachment(
+                                  event,
+                                  attachment,
+                                  safeDownloadUrl,
+                                )
+                              }
                               className="delivery-ticket-safe-attachment flex items-center gap-3 rounded-xl border border-[#e7dfed] bg-white p-3 text-[#5b2a86] no-underline"
                             >
                               {body}

@@ -17,6 +17,7 @@ import {
   DeliveryTicketError,
   isDeliveryTicketAttachmentVisible,
 } from "./delivery-ticket-service";
+import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getDb } from "./db";
 import {
   assertSafeExternalUrl,
@@ -68,12 +69,16 @@ async function requireDb() {
 export async function resolveAuthorizedTicketAttachment(input: {
   actor: AuthenticatedUser;
   attachmentId: string;
+  projectAssignmentId?: string | null;
 }) {
   const db = await requireDb();
   const rows = await db
     .select({
       attachment: deliveryTicketAttachments,
       ticketUserId: deliveryTickets.userId,
+      ticketStatus: deliveryTickets.status,
+      assignedProjectAssignmentId: deliveryTickets.assignedProjectAssignmentId,
+      assignedMemberId: deliveryTickets.assignedMemberId,
       eventVisibility: deliveryTicketEvents.visibility,
     })
     .from(deliveryTicketAttachments)
@@ -112,24 +117,69 @@ export async function resolveAuthorizedTicketAttachment(input: {
         404,
       );
     }
+  } else if (input.actor.role === "delivery_member") {
+    if (
+      !input.projectAssignmentId ||
+      row.assignedProjectAssignmentId !== input.projectAssignmentId
+    ) {
+      throw new DeliveryTicketError(
+        "ATTACHMENT_NOT_FOUND",
+        "工单附件不存在。",
+        404,
+      );
+    }
+    await assertDeliveryProjectContext({
+      actor: input.actor,
+      projectAssignmentId: input.projectAssignmentId,
+      customerUserId: row.ticketUserId,
+    });
+    if (
+      ["submitted", "needs_information", "scheduled", "in_progress"].includes(
+        row.ticketStatus,
+      ) &&
+      row.assignedMemberId !== input.actor.id
+    ) {
+      throw new DeliveryTicketError(
+        "ATTACHMENT_NOT_FOUND",
+        "工单附件不存在。",
+        404,
+      );
+    }
   } else {
     await assertWorkspaceAccess(input.actor, row.ticketUserId);
   }
-  if (
-    row.attachment.sensitivity !== "standard" ||
-    !row.attachment.upstreamFileId
-  ) {
+  if (!row.attachment.upstreamFileId) {
     throw new DeliveryTicketError(
       "ATTACHMENT_UNAVAILABLE",
-      "该敏感材料必须通过受保护材料入口下载。",
+      "附件文件不可用。",
       410,
     );
   }
-  const credential = await getCredentialForUpstreamResource(
-    row.attachment.ownerUserId,
-    "file",
-    row.attachment.upstreamFileId,
-  );
+  const projectCredential =
+    input.actor.role === "delivery_member" && input.projectAssignmentId
+      ? await getCredentialForUpstreamResource(
+          input.actor.id,
+          "file",
+          row.attachment.upstreamFileId,
+          input.projectAssignmentId,
+        )
+      : null;
+  const customerCredential =
+    !projectCredential && row.attachment.ownerUserId === row.ticketUserId
+      ? await getCredentialForUpstreamResource(
+          row.ticketUserId,
+          "file",
+          row.attachment.upstreamFileId,
+        )
+      : null;
+  const credential =
+    input.actor.role === "delivery_member"
+      ? (projectCredential ?? customerCredential)
+      : await getCredentialForUpstreamResource(
+          row.attachment.ownerUserId,
+          "file",
+          row.attachment.upstreamFileId,
+        );
   if (!credential) {
     throw new DeliveryTicketError(
       "ATTACHMENT_UNAVAILABLE",
@@ -157,9 +207,7 @@ async function downloadAttachment(
     Authorization: `Bearer ${attachment.credential.apiKey}`,
   };
   const metadataResponse = await axios.get(
-    `${baseUrl}/v1/files/${encodeURIComponent(
-      upstreamFileId,
-    )}`,
+    `${baseUrl}/v1/files/${encodeURIComponent(upstreamFileId)}`,
     {
       headers,
       timeout: 30_000,
@@ -182,9 +230,7 @@ async function downloadAttachment(
       : null;
   const contentUrl =
     uploadUrl ??
-    `${baseUrl}/v1/files/${encodeURIComponent(
-      upstreamFileId,
-    )}/content`;
+    `${baseUrl}/v1/files/${encodeURIComponent(upstreamFileId)}/content`;
   const response = await axios.get<ArrayBuffer>(contentUrl, {
     ...(uploadUrl ? safeExternalRequestOptions : { headers, maxRedirects: 0 }),
     responseType: "arraybuffer",
@@ -250,6 +296,8 @@ router.get("/:attachmentId/content", async (req: FrontMindRequest, res) => {
     const attachment = await resolveAuthorizedTicketAttachment({
       actor,
       attachmentId: req.params.attachmentId,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId,
     });
     const result = await downloadAttachment(attachment);
     res.setHeader("Cache-Control", "private, no-store");

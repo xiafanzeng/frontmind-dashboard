@@ -46,6 +46,7 @@ import {
 } from "./_core/sensitive-data";
 import { preparedFileService } from "./prepared-file-service";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
+import { assertDeliveryProjectContext } from "./delivery-role-service";
 
 const router = Router();
 
@@ -66,6 +67,7 @@ const downloadTokenCache = new Map<
     fileId: string;
     userId: number;
     credentialId: string;
+    projectAssignmentId: string | null;
     apiKey: string;
     baseUrl: string;
     createdAt: number;
@@ -2339,6 +2341,8 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
       const asset = await preparedFileService.registerExternal({
         ownerUserId: req.frontmindUser.id,
         credentialId: credential?.id || "external",
+        projectAssignmentId:
+          req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
         url: targetUrl,
         filename: candidateFilename,
       });
@@ -2583,6 +2587,7 @@ async function handleFileDownload(
   disposition: "inline" | "attachment" = "inline",
   ownerUserId?: number,
   credentialId?: string,
+  projectAssignmentId?: string | null,
 ): Promise<void> {
   // Step 1: Get file metadata
   const meta = await fetchFileMetadata(baseUrl, fileId, apiKey);
@@ -2601,6 +2606,7 @@ async function handleFileDownload(
     const asset = await preparedFileService.registerFile({
       ownerUserId,
       credentialId,
+      projectAssignmentId,
       fileId,
       filename: meta.filename,
     });
@@ -2733,6 +2739,8 @@ router.post("/download-token", async (req: Request, res: Response) => {
       fileId,
       userId: req.frontmindUser.id,
       credentialId: req.frontmindCredential.id,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
       apiKey,
       baseUrl,
       createdAt: Date.now(),
@@ -2783,6 +2791,20 @@ router.get("/download/:token", async (req: Request, res: Response) => {
         },
       });
     }
+    if (req.frontmindUser.role === "delivery_member") {
+      if (!data.projectAssignmentId) {
+        return res.status(403).json({
+          error: {
+            message: "下载链接缺少客户项目上下文",
+            code: "DELIVERY_PROJECT_CONTEXT_FORBIDDEN",
+          },
+        });
+      }
+      await assertDeliveryProjectContext({
+        actor: req.frontmindUser,
+        projectAssignmentId: data.projectAssignmentId,
+      });
+    }
 
     // One-time use reduces accidental link sharing risk while keeping UX fast.
     downloadTokenCache.delete(token);
@@ -2794,6 +2816,7 @@ router.get("/download/:token", async (req: Request, res: Response) => {
       "attachment",
       data.userId,
       data.credentialId,
+      data.projectAssignmentId,
     );
   } catch (error: any) {
     if (isExternalDownloadTooLarge(error)) {
@@ -2832,6 +2855,7 @@ router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
       "inline",
       req.frontmindUser?.id,
       req.frontmindCredential?.id,
+      req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
     );
   } catch (error: any) {
     if (isExternalDownloadTooLarge(error)) {
@@ -2867,6 +2891,7 @@ router.get("/v1/files/:fileId/content", async (req: Request, res: Response) => {
       "inline",
       req.frontmindUser?.id,
       req.frontmindCredential?.id,
+      req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
     );
   } catch (error: any) {
     if (isExternalDownloadTooLarge(error)) {
@@ -3030,11 +3055,13 @@ router.all("/*", async (req: Request, res: Response) => {
           apiCredentialId: req.frontmindCredential.id,
           kind: isTaskCreate ? "task" : "file",
           upstreamId: resourceId,
+          projectAssignmentId:
+            req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
         });
         if (
           isTaskCreate &&
           req.frontmindUser.role === "delivery_member" &&
-          req.frontmindDeliveryRoleContext
+          req.frontmindDeliveryProjectContext
         ) {
           await writeWorkspaceAuditEvent({
             actor: req.frontmindUser,
@@ -3043,10 +3070,12 @@ router.all("/*", async (req: Request, res: Response) => {
             targetId: resourceId,
             workspaceUserId: null,
             metadata: {
-              roleAssignmentId: req.frontmindDeliveryRoleContext.assignmentId,
-              roleId: req.frontmindDeliveryRoleContext.roleId,
-              roleType: req.frontmindDeliveryRoleContext.roleType,
-              teamName: req.frontmindDeliveryRoleContext.teamName,
+              projectAssignmentId:
+                req.frontmindDeliveryProjectContext.projectAssignmentId,
+              customerUserId:
+                req.frontmindDeliveryProjectContext.customerUserId,
+              roleType: req.frontmindDeliveryProjectContext.roleType,
+              customerName: req.frontmindDeliveryProjectContext.customerName,
             },
           });
         }
@@ -3062,6 +3091,8 @@ router.all("/*", async (req: Request, res: Response) => {
           apiCredentialId: req.frontmindCredential.id,
           kind: "file",
           upstreamId: fileId,
+          projectAssignmentId:
+            req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
         });
       }
 
@@ -3073,6 +3104,9 @@ router.all("/*", async (req: Request, res: Response) => {
             await preparedFileService.registerFile({
               ownerUserId: req.frontmindUser.id,
               credentialId: req.frontmindCredential.id,
+              projectAssignmentId:
+                req.frontmindDeliveryProjectContext?.projectAssignmentId ??
+                null,
               fileId: descriptor.fileId,
               filename: descriptor.filename,
             });
@@ -3084,6 +3118,9 @@ router.all("/*", async (req: Request, res: Response) => {
             await preparedFileService.registerFile({
               ownerUserId: req.frontmindUser.id,
               credentialId: req.frontmindCredential.id,
+              projectAssignmentId:
+                req.frontmindDeliveryProjectContext?.projectAssignmentId ??
+                null,
               fileId: decodeURIComponent(match[1]),
               filename: descriptor.filename,
             });
@@ -3091,6 +3128,9 @@ router.all("/*", async (req: Request, res: Response) => {
             await preparedFileService.registerExternal({
               ownerUserId: req.frontmindUser.id,
               credentialId: req.frontmindCredential.id,
+              projectAssignmentId:
+                req.frontmindDeliveryProjectContext?.projectAssignmentId ??
+                null,
               url: descriptor.url,
               filename: descriptor.filename,
             });

@@ -60,13 +60,14 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("一级分支数量不设固定值");
     expect(prompt).not.toContain("恰好 7 个一级分支");
     expect(prompt).not.toContain("7 universal top-level branches");
-    expect(prompt).toContain("只有服务端遍历达到 100%");
+    expect(prompt).toContain("处理最后节点且本轮状态提交后将达到 100%");
     expect(prompt).toContain("每次被接受后加 1");
     expect(prompt).toContain("https://company.example.invalid/");
     expect(prompt).toContain("https://evidence.example.invalid/");
     expect(prompt).toContain("catalog.pdf");
     expect(prompt).toContain("FRONTMIND_KB_MANIFEST");
     expect(prompt).toContain("FRONTMIND_KB_PROGRESS");
+    expect(prompt).toContain("FRONTMIND_KB_PRESENTATION");
     expect(prompt).toContain("FRONTMIND_KB_REOPEN");
     expect(prompt).toContain("补充、修订、问题或上传资料");
     expect(prompt).toContain("to 必须为 needs_verification");
@@ -199,13 +200,14 @@ describe("knowledge base execution contract", () => {
     );
   });
 
-  it("pins new builds to v2 while preserving the immutable v1 archive", async () => {
+  it("pins new builds to v3 while preserving immutable v1/v2 archives", async () => {
     const active = await getKnowledgeBaseSkillDescriptor();
     const legacy = await getKnowledgeBaseSkillDescriptor({ version: "1" });
+    const previous = await getKnowledgeBaseSkillDescriptor({ version: "2" });
 
     expect(active).toMatchObject({
       name: "socratic-kb-builder",
-      version: "2",
+      version: "3",
       contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(legacy).toMatchObject({
@@ -213,7 +215,13 @@ describe("knowledge base execution contract", () => {
       version: "1",
       contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
+    expect(previous).toMatchObject({
+      name: "socratic-kb-builder",
+      version: "2",
+      contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
     expect(active.contentHash).not.toBe(legacy.contentHash);
+    expect(active.contentHash).not.toBe(previous.contentHash);
 
     await expect(
       getKnowledgeBaseSkillDescriptor({
@@ -348,6 +356,42 @@ describe("knowledge base execution contract", () => {
     );
     expect(shouldReconcileKnowledgeOutput(closedInvalid, "running")).toBe(true);
     expect(shouldReconcileKnowledgeOutput(partial, "completed")).toBe(true);
+  });
+
+  it("waits for both v3 transition and presentation envelopes", () => {
+    const transitionOnly = [
+      {
+        id: "transition",
+        role: "assistant",
+        content:
+          '<!-- FRONTMIND_KB_PROGRESS\n{"kind":"frontmind.knowledge-base.progress"}\n-->',
+      },
+    ];
+    const complete = [
+      {
+        id: "complete",
+        role: "assistant",
+        content:
+          transitionOnly[0].content +
+          '\n<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation"}\n-->',
+      },
+    ];
+
+    expect(
+      shouldReconcileKnowledgeOutput(transitionOnly, "running", {
+        requirePresentation: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldReconcileKnowledgeOutput(complete, "running", {
+        requirePresentation: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldReconcileKnowledgeOutput(transitionOnly, "completed", {
+        requirePresentation: true,
+      }),
+    ).toBe(true);
   });
 
   it("lets an authoritative confirming build override a still-running upstream task", () => {

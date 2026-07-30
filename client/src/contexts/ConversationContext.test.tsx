@@ -1,5 +1,5 @@
 import React from "react";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ConversationProvider,
@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
     user: { id: 1 },
     loading: false,
   } as { user: { id: number } | null; loading: boolean },
+  listInput: vi.fn(),
   listRefetch: vi.fn(),
   syncSnapshot: vi.fn(),
   deleteConversation: vi.fn(),
@@ -29,7 +30,10 @@ vi.mock("@/lib/trpc", () => ({
   trpc: {
     conversation: {
       list: {
-        useQuery: () => ({ refetch: mocks.listRefetch }),
+        useQuery: (input: unknown) => {
+          mocks.listInput(input);
+          return { refetch: mocks.listRefetch };
+        },
       },
       syncSnapshot: {
         useMutation: () => ({ mutateAsync: mocks.syncSnapshot }),
@@ -115,6 +119,34 @@ describe("ConversationProvider cloud hydration", () => {
     expect(result.current.state.conversations.map((item) => item.id)).toEqual([
       "account-2",
     ]);
+  });
+
+  it("scopes engineer conversation reads and writes to the project assignment", async () => {
+    const projectWrapper = ({ children }: { children: React.ReactNode }) => (
+      <ConversationProvider projectAssignmentId="project-assignment-1">
+        {children}
+      </ConversationProvider>
+    );
+    const { result } = renderHook(() => useConversation(), {
+      wrapper: projectWrapper,
+    });
+
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+    expect(mocks.listInput).toHaveBeenCalledWith({
+      projectAssignmentId: "project-assignment-1",
+    });
+
+    act(() => {
+      result.current.createConversation();
+    });
+    await waitFor(() =>
+      expect(mocks.syncSnapshot).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectAssignmentId: "project-assignment-1",
+          conversation: expect.any(Object),
+        }),
+      ),
+    );
   });
 });
 

@@ -657,7 +657,10 @@ export default function AdminWorkspace({
               : undefined
           }
           deliveryAdmins={(workspaceQuery.data?.admins ?? [])
-            .filter((admin) => admin.isActive)
+            .filter(
+              (admin) =>
+                admin.isActive && admin.adminAccessLevel === "delivery_admin",
+            )
             .map((admin) => ({
               ...admin,
               username: admin.username || `admin-${admin.id}`,

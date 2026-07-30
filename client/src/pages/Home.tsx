@@ -14,6 +14,7 @@ import { useIsMobile } from "@/hooks/useMobile";
 import { Button } from "@/components/ui/button";
 import { CloudOff, Loader2, RefreshCw, X } from "lucide-react";
 import type { ResponseLogicTaskContext } from "@/lib/frontmind-api";
+import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 
 export default function Home({
   embedded = false,
@@ -27,6 +28,7 @@ export default function Home({
   showSettings = true,
   standardWelcomeVariant = "simple",
   responseLogicContext,
+  knowledgeBaseProgress,
 }: {
   embedded?: boolean;
   fixedAgentProfile?: string;
@@ -39,6 +41,7 @@ export default function Home({
   showSettings?: boolean;
   standardWelcomeVariant?: "simple" | "workflow";
   responseLogicContext?: ResponseLogicTaskContext;
+  knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
 } = {}) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -167,6 +170,7 @@ export default function Home({
           syncKnowledgeBaseSnapshot={syncKnowledgeBaseSnapshot}
           composerPrefill={composerPrefill}
           responseLogicContext={responseLogicContext}
+          knowledgeBaseProgress={knowledgeBaseProgress}
           showKnowledgeBaseStarter={showKnowledgeBaseStarter}
           standardWelcomeVariant={standardWelcomeVariant}
           reserveOuterMobileNav={!showAccountMenu}

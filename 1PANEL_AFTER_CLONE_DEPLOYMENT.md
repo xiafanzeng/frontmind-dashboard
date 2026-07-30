@@ -3,15 +3,15 @@
 本文只记录 2026-07-28 已经实际跑通的首次生产部署路径，不保留试错命令、临时绕行方案
 或互相竞争的部署方式。固定发布对象为：
 
-| 项目 | 最终值 |
-| --- | --- |
-| Dashboard GitHub | `xiafanzeng/frontmind-dashboard`（Private） |
-| Dashboard SHA | `62810d58b4d892f4302f387849e4ff9e2116f489` |
-| Dashboard build version | `dashboard-20260728-r1` |
-| Dashboard PDF image | `frontmind-dashboard-node:22.22.2-pdf-62810d58b4d892f4302f387849e4ff9e2116f489` |
-| Website GitHub | `xiafanzeng/frontmind-website` |
-| Website SHA | `eefe6234b23351b066295c0941ca6cff5ce9ea69` |
-| 私有 Docker 网络 | `1panel-network` |
+| 项目                    | 最终值                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------- |
+| Dashboard GitHub        | `xiafanzeng/frontmind-dashboard`（Private）                                     |
+| Dashboard SHA           | `62810d58b4d892f4302f387849e4ff9e2116f489`                                      |
+| Dashboard build version | `dashboard-20260728-r1`                                                         |
+| Dashboard PDF image     | `frontmind-dashboard-node:22.22.2-pdf-62810d58b4d892f4302f387849e4ff9e2116f489` |
+| Website GitHub          | `xiafanzeng/frontmind-website`                                                  |
+| Website SHA             | `eefe6234b23351b066295c0941ca6cff5ce9ea69`                                      |
+| 私有 Docker 网络        | `1panel-network`                                                                |
 
 整体替换顺序：
 
@@ -47,14 +47,14 @@
 
 阶段导航：
 
-| 阶段 | 章节 | 完成结果 |
-| --- | --- | --- |
-| 固定发布源 | 0–2 | 两个仓库均为已审核固定 SHA，工作树 clean |
-| 准备新 Dashboard | 3–9 | 旧资产清单、新库、新目录、运行环境、PDF 镜像和密钥就绪 |
+| 阶段                 | 章节  | 完成结果                                                        |
+| -------------------- | ----- | --------------------------------------------------------------- |
+| 固定发布源           | 0–2   | 两个仓库均为已审核固定 SHA，工作树 clean                        |
+| 准备新 Dashboard     | 3–9   | 旧资产清单、新库、新目录、运行环境、PDF 镜像和密钥就绪          |
 | 验证并启动 Dashboard | 10–16 | check/test/build/audit、35 迁移、管理员、3001、HTTPS 和凭据就绪 |
-| 验证并部署 Website | 17 | Website 固定 release、8888、五个 Skill 和三条内部链路就绪 |
-| 业务切换与退役 | 18–22 | canary、备份恢复、24 小时观察、旧 Agent 精确退役和回滚边界 |
-| 日后维护 | 23–24 | 增量更新规则与最终完成清单 |
+| 验证并部署 Website   | 17    | Website 固定 release、8888、五个 Skill 和三条内部链路就绪       |
+| 业务切换与退役       | 18–22 | canary、备份恢复、24 小时观察、旧 Agent 精确退役和回滚边界      |
+| 日后维护             | 23–24 | 增量更新规则与最终完成清单                                      |
 
 ## 0. 一次性迁移到新的私有仓库
 
@@ -235,25 +235,24 @@ private-workflows/response-logic-builder.skill/
 
 开始部署前，从 1Panel 和 DNS 控制台只读盘点并记录以下精确值：
 
-| 退役对象 | 必须记录的精确标识 |
-| --- | --- |
-| 旧运行环境 | 1Panel 运行环境名称、容器名称/ID |
-| 旧网站 | `agent.frontmind.net` 对应的 1Panel 网站名称和配置目录 |
-| 旧 DNS | `agent.frontmind.net` 的记录类型、主机记录、记录值和记录 ID |
-| 旧服务器代码 | 规范化后的唯一绝对路径 |
-| 旧数据库 | 数据库实例、精确数据库名 |
-| 旧数据库用户 | 完整 `username@host` 主体和 `SHOW GRANTS` 结果 |
-| 旧 prepared-files | 规范化后的唯一绝对路径或卷名 |
-| 旧 dashboard-assets | 规范化后的唯一绝对路径或卷名 |
-| 旧 ICP/其他持久数据 | 每一个规范化绝对路径或卷名，逐项记录 |
-| 旧备份/快照/导出 | 1Panel 任务 ID、快照 ID、规范化导出路径、远端对象及 version ID |
-| 旧自动任务 | 备份、同步、清理和导出的精确计划任务 ID |
-| 旧外部凭据 | 只记录提供方、用途和凭据 ID/名称，不记录或回显真实值 |
+| 退役对象            | 必须记录的精确标识                                             |
+| ------------------- | -------------------------------------------------------------- |
+| 旧运行环境          | 1Panel 运行环境名称、容器名称/ID                               |
+| 旧网站              | `agent.frontmind.net` 对应的 1Panel 网站名称和配置目录         |
+| 旧 DNS              | `agent.frontmind.net` 的记录类型、主机记录、记录值和记录 ID    |
+| 旧服务器代码        | 规范化后的唯一绝对路径                                         |
+| 旧数据库            | 数据库实例、精确数据库名                                       |
+| 旧数据库用户        | 完整 `username@host` 主体和 `SHOW GRANTS` 结果                 |
+| 旧 prepared-files   | 规范化后的唯一绝对路径或卷名                                   |
+| 旧 dashboard-assets | 规范化后的唯一绝对路径或卷名                                   |
+| 旧 ICP/其他持久数据 | 每一个规范化绝对路径或卷名，逐项记录                           |
+| 旧备份/快照/导出    | 1Panel 任务 ID、快照 ID、规范化导出路径、远端对象及 version ID |
+| 旧自动任务          | 备份、同步、清理和导出的精确计划任务 ID                        |
+| 旧外部凭据          | 只记录提供方、用途和凭据 ID/名称，不记录或回显真实值           |
 
 清单必须由两人复核，且明确排除 `/frontmind-dashboard`、
 `/srv/frontmind-dashboard/prepared-files`、
-`/srv/frontmind-dashboard/dashboard-assets`、
-`/srv/frontmind-dashboard/icp-materials` 和 `frontmind_dashboard`。任何旧目标不明确时，
+`/srv/frontmind-dashboard/dashboard-assets` 和 `frontmind_dashboard`。任何旧目标不明确时，
 停止退役，不猜测、不使用通配符。
 
 ## 4. 新建空数据库
@@ -277,14 +276,13 @@ private-workflows/response-logic-builder.skill/
 
 ## 5. 创建全新持久目录
 
-在宿主机创建三个全新目录，并限制权限：
+在宿主机创建两个全新目录，并限制权限：
 
 ```bash
 set -euo pipefail
 
 install -d -m 700 /srv/frontmind-dashboard/prepared-files
 install -d -m 700 /srv/frontmind-dashboard/dashboard-assets
-install -d -m 700 /srv/frontmind-dashboard/icp-materials
 ```
 
 在 1Panel 运行环境中挂载：
@@ -295,15 +293,10 @@ install -d -m 700 /srv/frontmind-dashboard/icp-materials
 
 /srv/frontmind-dashboard/dashboard-assets
 → /var/lib/frontmind/dashboard-assets
-
-/srv/frontmind-dashboard/icp-materials
-→ /var/lib/frontmind/icp-materials
 ```
 
 这里的 `→` 只表示“左侧宿主机目录映射到右侧容器目录”，不是 Shell 命令。请在 1Panel
-运行环境的“挂载”页逐行添加这三组映射。
-
-`icp-materials` 不能被 OpenResty/Nginx 作为静态目录公开。
+运行环境的“挂载”页逐行添加这两组映射。
 
 ## 6. 创建 FrontMind-Dashboard 运行环境
 
@@ -640,7 +633,6 @@ docker inspect frontmind-dashboard \
 set -euo pipefail
 
 openssl rand -base64 32
-openssl rand -base64 32
 openssl rand -base64 48
 openssl rand -base64 48
 openssl rand -base64 48
@@ -649,12 +641,11 @@ openssl rand -base64 48
 依次用于：
 
 1. `FRONTMIND_CREDENTIAL_ENCRYPTION_KEY`，值前加 `base64:`；
-2. `FRONTMIND_ICP_MATERIAL_KEY`，值前加 `base64:`；
-3. `FRONTMIND_PRESALES_SERVICE_TOKEN`；
-4. `FRONTMIND_PROVISIONING_SERVICE_TOKEN`；
-5. `FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET`。
+2. `FRONTMIND_PRESALES_SERVICE_TOKEN`；
+3. `FRONTMIND_PROVISIONING_SERVICE_TOKEN`；
+4. `FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET`。
 
-五项必须彼此不同。两枚 service token 还要原样配置到 Website；其余三项只属于
+四项必须彼此不同。两枚 service token 还要原样配置到 Website；其余两项只属于
 Dashboard。
 
 一旦 Dashboard 已保存加密凭据或 Website 已配置 service token，就不能为了重复验证
@@ -680,7 +671,6 @@ PORT=3001
 DATABASE_URL=mysql://frontmind_dashboard:<URL编码密码>@mysql:3306/frontmind_dashboard
 
 FRONTMIND_CREDENTIAL_ENCRYPTION_KEY=base64:<新32字节base64>
-FRONTMIND_ICP_MATERIAL_KEY=base64:<另一把新32字节base64>
 FRONTMIND_PRESALES_SERVICE_TOKEN=<新随机值，至少32字符>
 FRONTMIND_PROVISIONING_SERVICE_TOKEN=<另一新随机值，至少32字符>
 FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET=<第三个独立随机值>
@@ -694,8 +684,6 @@ FRONTMIND_WEBSITE_URL=https://www.frontmind.net
 FRONTMIND_PREPARED_FILE_DIR=/var/lib/frontmind/prepared-files
 FRONTMIND_PREPARED_FILE_TTL_MS=2592000000
 FRONTMIND_DASHBOARD_ASSET_DIR=/var/lib/frontmind/dashboard-assets
-FRONTMIND_ICP_MATERIAL_DIR=/var/lib/frontmind/icp-materials
-FRONTMIND_ICP_RETENTION_DAYS=365
 FRONTMIND_PDF_WORKERS=1
 FRONTMIND_CONVERSATION_RETENTION_DAYS=30
 FRONTMIND_SERVICE_ENTITLEMENT_ENFORCEMENT=auto
@@ -1576,7 +1564,6 @@ process.stdin.on("end", () => {
   const expected = new Map([
     ["/var/lib/frontmind/prepared-files", "/srv/frontmind-dashboard/prepared-files"],
     ["/var/lib/frontmind/dashboard-assets", "/srv/frontmind-dashboard/dashboard-assets"],
-    ["/var/lib/frontmind/icp-materials", "/srv/frontmind-dashboard/icp-materials"],
   ]);
   for (const [destination, source] of expected) {
     const mount = mounts.find(item => item.Destination === destination);
@@ -1590,8 +1577,7 @@ docker exec frontmind-dashboard sh -lc '
 set -eu
 for directory in \
   /var/lib/frontmind/prepared-files \
-  /var/lib/frontmind/dashboard-assets \
-  /var/lib/frontmind/icp-materials
+  /var/lib/frontmind/dashboard-assets
 do
   test -d "$directory"
   test -w "$directory"
@@ -1909,16 +1895,16 @@ for (const c of checks) {
 Dashboard 的公网健康、内部接口和售前凭据全部就绪后，才能部署 Website。Website 的
 固定对象是：
 
-| 项目 | 固定值 |
-| --- | --- |
-| release SHA | `eefe6234b23351b066295c0941ca6cff5ce9ea69` |
-| 服务器代码目录 | `/frontmind-website` |
-| 1Panel 运行环境 | `FrontMind-Website` |
-| 容器 | `FrontMind-Website` |
-| 工作目录 | `/app` |
-| 应用端口 | `8888` |
-| 宿主机映射 | `127.0.0.1:8888:8888` |
-| 公网域名 | `https://www.frontmind.net` |
+| 项目            | 固定值                                     |
+| --------------- | ------------------------------------------ |
+| release SHA     | `eefe6234b23351b066295c0941ca6cff5ce9ea69` |
+| 服务器代码目录  | `/frontmind-website`                       |
+| 1Panel 运行环境 | `FrontMind-Website`                        |
+| 容器            | `FrontMind-Website`                        |
+| 工作目录        | `/app`                                     |
+| 应用端口        | `8888`                                     |
+| 宿主机映射      | `127.0.0.1:8888:8888`                      |
+| 公网域名        | `https://www.frontmind.net`                |
 
 ### 17.1 固定 Website 源码
 
@@ -2400,7 +2386,6 @@ Website 绝不能配置或读取以下 Dashboard 专属值：
 
 ```text
 FRONTMIND_CREDENTIAL_ENCRYPTION_KEY
-FRONTMIND_ICP_MATERIAL_KEY
 FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET
 FRONTMIND_MONITOR_API_KEY
 售前 API Key
@@ -2582,7 +2567,6 @@ if (unresolved(trustProxy)) process.exit(1);
 
 const dashboardOnly = [
   "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY",
-  "FRONTMIND_ICP_MATERIAL_KEY",
   "FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET",
   "FRONTMIND_MONITOR_API_KEY",
 ];
@@ -2903,7 +2887,7 @@ echo "WEBSITE_UNAUTHENTICATED_BOUNDARY_OK"
 9. 完成一次测试支付或支付沙箱回调，核对支付回执账本只产生一条有效记录；重复回调
    不得重复入账。
 10. 完成项目订单创建、签约确认、开户和知识导入，核对项目订单账本的幂等键和最终状态；
-   重试不得重复开户、重复扣费或重复提交。
+    重试不得重复开户、重复扣费或重复提交。
 11. 在普通用户 Dashboard 检查 Base、20 题、监控、引用、评估和预测结果；桌面端及
     390px 宽度下的简略看板都必须可用。
 12. 从 Website 的导航和购买后流程进入
@@ -2936,12 +2920,11 @@ canary 通过后仍保持 Website 写入冻结。以同一恢复点建立首份�
    trigger；
 2. `/srv/frontmind-dashboard/prepared-files`；
 3. `/srv/frontmind-dashboard/dashboard-assets`；
-4. `/srv/frontmind-dashboard/icp-materials`；
-5. `/srv/frontmind-website/visitor-stats.json`（文件尚未产生时记录“零文件”）；
-6. 固定 Dashboard PDF image、image ID、基础镜像 digest 和包版本；
-7. `/srv/frontmind-website-build-artifacts/20260728-<Website SHA>`；
-8. Dashboard/Website 两个 SHA、build version、1Panel 运行参数和 Nginx 配置；
-9. 密码管理器中本次新系统的密钥条目 ID、恢复权限和保管责任人。发布记录只写条目 ID，
+4. `/srv/frontmind-website/visitor-stats.json`（文件尚未产生时记录“零文件”）；
+5. 固定 Dashboard PDF image、image ID、基础镜像 digest 和包版本；
+6. `/srv/frontmind-website-build-artifacts/20260728-<Website SHA>`；
+7. Dashboard/Website 两个 SHA、build version、1Panel 运行参数和 Nginx 配置；
+8. 密码管理器中本次新系统的密钥条目 ID、恢复权限和保管责任人。发布记录只写条目 ID，
    不写真实值。
 
 使用 1Panel 备份功能或已批准的备份系统建立同一恢复点。每一个对象都记录：
@@ -3000,14 +2983,14 @@ ISOLATED_RESTORE_DRILL_PASSED
 
 至少在以下时间点执行并保存一份不含敏感值的健康记录：
 
-| 时间点 | 必查内容 |
-| --- | --- |
+| 时间点         | 必查内容                                                                 |
+| -------------- | ------------------------------------------------------------------------ |
 | 恢复流量后立即 | 两个公网 health、三条私有 READY、公网 internal 404、端口与 restart count |
-| 15 分钟 | 5xx、容器状态、数据库连接、支付/订单队列、磁盘和持久目录 |
-| 1 小时 | 登录、普通用户简略看板、Website 邀请会话、账本幂等状态 |
-| 4 小时 | 上游任务、监控、引用、prepared-files 清理和日志脱敏 |
-| 12 小时 | 两个容器 restart count、备份任务、磁盘增长、异常告警 |
-| 24 小时 | 重跑全部技术健康门，并完成至少一次真实业务抽查 |
+| 15 分钟        | 5xx、容器状态、数据库连接、支付/订单队列、磁盘和持久目录                 |
+| 1 小时         | 登录、普通用户简略看板、Website 邀请会话、账本幂等状态                   |
+| 4 小时         | 上游任务、监控、引用、prepared-files 清理和日志脱敏                      |
+| 12 小时        | 两个容器 restart count、备份任务、磁盘增长、异常告警                     |
+| 24 小时        | 重跑全部技术健康门，并完成至少一次真实业务抽查                           |
 
 观察期间若发生非预期重启、5xx 持续增长、账本不一致、敏感日志、内部接口公网暴露或
 数据无法解密，立即重新冻结写入并进入第 22 节的新系统回滚/前向修复流程。不能启动旧
@@ -3106,16 +3089,16 @@ committed `dist`，再 push 到 `frontmind-website`；服务器不是开发或�
 
 ### 23.2 先判断这次更新属于哪一类
 
-| 变更 | 必须动作 |
-| --- | --- |
-| 仅 Dashboard 应用代码/UI | fetch 后合并固定 SHA、隔离测试、build/audit、重启 Dashboard、健康门 |
-| `pnpm-lock.yaml` 或依赖变化 | 额外执行 frozen install，并重新完成依赖和 bundle 审计 |
-| 新增 Drizzle SQL/journal 条目 | 先备份并冻结写入，只执行 pending migrations，再启动新应用 |
-| PDF Dockerfile、基础 digest、系统包变化 | 重新构建和审计固定派生镜像 |
-| 环境变量契约变化 | 在 1Panel 协调更新所有消费者，执行无回显环境门后重建容器 |
-| Presales/Provisioning/支付/订单契约变化 | Dashboard 与 Website 必须作为同一兼容 release 验证和部署 |
-| 仅 Website 内容或前端 | 运行 Website 隔离验证、审计 committed `dist`，只重建 Website |
-| 密钥轮换 | 使用独立轮换计划，不和普通代码发布混在一起 |
+| 变更                                    | 必须动作                                                            |
+| --------------------------------------- | ------------------------------------------------------------------- |
+| 仅 Dashboard 应用代码/UI                | fetch 后合并固定 SHA、隔离测试、build/audit、重启 Dashboard、健康门 |
+| `pnpm-lock.yaml` 或依赖变化             | 额外执行 frozen install，并重新完成依赖和 bundle 审计               |
+| 新增 Drizzle SQL/journal 条目           | 先备份并冻结写入，只执行 pending migrations，再启动新应用           |
+| PDF Dockerfile、基础 digest、系统包变化 | 重新构建和审计固定派生镜像                                          |
+| 环境变量契约变化                        | 在 1Panel 协调更新所有消费者，执行无回显环境门后重建容器            |
+| Presales/Provisioning/支付/订单契约变化 | Dashboard 与 Website 必须作为同一兼容 release 验证和部署            |
+| 仅 Website 内容或前端                   | 运行 Website 隔离验证、审计 committed `dist`，只重建 Website        |
+| 密钥轮换                                | 使用独立轮换计划，不和普通代码发布混在一起                          |
 
 ### 23.3 Dashboard 服务器更新顺序
 
@@ -3196,35 +3179,35 @@ token；也不重新创建数据库、持久目录、管理员、网站和 DNS�
 ## 24. 完成标准
 
 - [ ] 本次代码只推送到新 Private Repo `xiafanzeng/frontmind-dashboard`，旧
-  `frontmind-agent` 仓库未接收 push。
+      `frontmind-agent` 仓库未接收 push。
 - [ ] 本地文件夹最终命名为 `frontmind-dashboard`；服务器代码目录为
-  `/frontmind-dashboard`，容器工作目录为 `/app`。
+      `/frontmind-dashboard`，容器工作目录为 `/app`。
 - [ ] 新 Dashboard 是 `3001` 的唯一监听应用，公开域名为
-  `https://dashboard.frontmind.net`。
+      `https://dashboard.frontmind.net`。
 - [ ] 全新创建且不含旧 Agent 数据的 `frontmind_dashboard` 已通过
-  `pnpm db:migrate` 完成 `0000`–`0034` 共 35 个迁移；迁移后为 48 张表、2 个
-  trigger，未执行 `db:push` 或 `db:generate`。
+      `pnpm db:migrate` 完成 `0000`–`0034` 共 35 个迁移；迁移后为 48 张表、2 个
+      trigger，未执行 `db:push` 或 `db:generate`。
 - [ ] 三个全新 `/srv/frontmind-dashboard/...` 持久目录正确挂载。
 - [ ] 凭据加密密钥、ICP 密钥和 service token 均为全新值且只存放于 1Panel 服务端
-  环境变量；仓库目录和容器 `/app` 除已跟踪的 `.env.example` 外不存在任何真实
-  `.env*`，1Panel 内部运行配置未被挂入 `/app`。
+      环境变量；仓库目录和容器 `/app` 除已跟踪的 `.env.example` 外不存在任何真实
+      `.env*`，1Panel 内部运行配置未被挂入 `/app`。
 - [ ] 售前 API Key 已由管理员在 Dashboard 售前页面录入并加密保存；
-  `FRONTMIND_MONITOR_API_KEY` 只存在于 Dashboard 服务端环境变量。
+      `FRONTMIND_MONITOR_API_KEY` 只存在于 Dashboard 服务端环境变量。
 - [ ] 五个 PDF 命令均存在，Dashboard `/healthz` 和三个运行时 Skill 全部通过。
 - [ ] 支付回执账本、项目订单账本、Presales、Provisioning 和简略看板接口契约全部通过。
 - [ ] Website 通过 `frontmind-dashboard:3001` 调用内部接口，任何 service token 都没有
-  `VITE_` 前缀。
+      `VITE_` 前缀。
 - [ ] Website 固定 SHA 已通过 290 个服务端测试、168 个客户端测试、Linux 等价构建和
-  production bundle audit；正式服务器工作树使用已审计 committed `dist` 且保持 clean。
+      production bundle audit；正式服务器工作树使用已审计 committed `dist` 且保持 clean。
 - [ ] Website 只监听 `127.0.0.1:8888`，五个运行时 Skill、本机/公网 health 和未登录
-  JSON `401/INVITE_REQUIRED` 全部通过。
+      JSON `401/INVITE_REQUIRED` 全部通过。
 - [ ] 公网 `/api/internal/*` 返回 `404`。
 - [ ] 普通用户看不到 Key、积分或管理员信息；API/Axios 错误、日志和构建产物不含敏感值。
 - [ ] 新数据库、三个 Dashboard 目录、Website 访问统计、固定镜像和发布产物已在同一
-  恢复点备份，并通过隔离恢复演练。
+      恢复点备份，并通过隔离恢复演练。
 - [ ] 恢复正式流量后已连续稳定至少 24 小时，并覆盖一次真实业务检查。
 - [ ] 24 小时观察及再次签字后，旧 Agent 运行环境、`agent.frontmind.net` 网站与 DNS、
-  旧服务器代码目录、旧数据库与用户、旧 prepared-files、旧 dashboard-assets、旧
-  ICP/其他持久目录均已按精确目标永久删除。
+      旧服务器代码目录、旧数据库与用户、旧 prepared-files、旧 dashboard-assets、旧
+      ICP/其他持久目录均已按精确目标永久删除。
 - [ ] 回滚方案只使用新 Dashboard 空库重建或新系统自身备份，永不使用旧 Agent 数据库
-  或旧持久目录。
+      或旧持久目录。

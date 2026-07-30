@@ -24,6 +24,15 @@ const localStorageMock = {
 };
 vi.stubGlobal("localStorage", localStorageMock);
 
+// Per-tab delivery project context must not leak across browser tabs.
+const sessionStorageMock = {
+  getItem: vi.fn(),
+  setItem: vi.fn(),
+  removeItem: vi.fn(),
+  clear: vi.fn(),
+};
+vi.stubGlobal("sessionStorage", sessionStorageMock);
+
 // Mock toast from sonner
 vi.mock("sonner", () => ({
   toast: {

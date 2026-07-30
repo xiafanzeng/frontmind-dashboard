@@ -9,7 +9,6 @@ import rehypeHighlight from "rehype-highlight";
 import { cn, copyToClipboard } from "@/lib/utils";
 import { toast } from "sonner";
 import type { Components } from "react-markdown";
-import { sanitizeBrandText } from "@/lib/frontmind-api";
 
 // Custom code block component with better styling
 const CodeBlock = ({
@@ -78,28 +77,31 @@ const InlineCode = ({ className, ...props }: React.ComponentProps<"code">) => {
   );
 };
 
-function buildSafeMarkdownHref(href?: string): string | undefined {
+export function buildSafeMarkdownHref(href?: string): string | undefined {
   if (!href) return href;
-  if (href.startsWith("/api/frontmind/proxy-download")) return href;
+  const normalized = href.trim();
 
   try {
-    const parsed = new URL(href, window.location.origin);
-    const pathname = decodeURIComponent(parsed.pathname);
-    const isPdf = pathname.toLowerCase().endsWith(".pdf");
-    const isExternal = /^https?:\/\//i.test(href);
-
-    if (!isExternal || !isPdf) {
-      return href;
+    const origin =
+      typeof window === "undefined"
+        ? "https://frontmind.invalid"
+        : window.location.origin;
+    const parsed = new URL(normalized, origin);
+    if (parsed.pathname === "/api/frontmind/proxy-download") {
+      const original = parsed.searchParams.get("url");
+      if (!original) return undefined;
+      const originalUrl = new URL(original);
+      return originalUrl.protocol === "http:" ||
+        originalUrl.protocol === "https:"
+        ? original
+        : undefined;
     }
-
-    const filename = sanitizeBrandText(pathname.split("/").pop() || "file.pdf");
-    const params = new URLSearchParams({
-      url: href,
-      filename,
-    });
-    return `/api/frontmind/proxy-download?${params.toString()}`;
+    if (/^https?:\/\//i.test(normalized)) return normalized;
+    if (/^(?:mailto:|tel:)/i.test(normalized)) return normalized;
+    if (/^(?:[./]|#)/.test(normalized)) return normalized;
+    return /^[a-z][a-z\d+.-]*:/i.test(normalized) ? undefined : normalized;
   } catch {
-    return href;
+    return undefined;
   }
 }
 
@@ -111,15 +113,12 @@ const Link = ({
   ...props
 }: React.ComponentProps<"a">) => {
   const safeHref = buildSafeMarkdownHref(href);
-  const isProxiedPdf = Boolean(
-    safeHref?.startsWith("/api/frontmind/proxy-download"),
-  );
-  const isExternal = safeHref?.startsWith("http");
+  const isExternal = /^https?:\/\//i.test(safeHref || "");
   return (
     <a
       href={safeHref}
-      target={isExternal || isProxiedPdf ? "_blank" : undefined}
-      rel={isExternal || isProxiedPdf ? "noopener noreferrer" : undefined}
+      target={isExternal ? "_blank" : undefined}
+      rel={isExternal ? "noopener noreferrer" : undefined}
       className={cn(
         "text-primary underline-offset-2 hover:underline",
         className,

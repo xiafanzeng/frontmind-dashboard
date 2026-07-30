@@ -7,12 +7,15 @@ import {
   KNOWLEDGE_BASE_PROGRESS_KIND,
   KnowledgeBaseProgressError,
   applyKnowledgeBaseProgressEnvelope,
+  assertKnowledgeBasePresentationMatchesState,
   assertKnowledgeBaseReadyForPackage,
   canPackageKnowledgeBase,
   createKnowledgeBaseProgressState,
   formatKnowledgeBaseProgressEnvelope,
+  formatKnowledgeBasePresentationEnvelope,
   getKnowledgeBaseProgressSummary,
   parseKnowledgeBaseProgressEnvelope,
+  parseKnowledgeBasePresentationEnvelope,
   formatKnowledgeBaseManifestEnvelope,
   parseKnowledgeBaseManifestEnvelope,
   shouldShowKnowledgeBaseCheckmark,
@@ -292,6 +295,128 @@ describe("model progress envelope boundary", () => {
           },
         }),
       "INVALID_TRANSITION",
+    );
+  });
+
+  it("requires the presentation envelope to identify the post-transition leaf", () => {
+    const initial = createKnowledgeBaseProgressState(manifest);
+    const next = applyKnowledgeBaseProgressEnvelope(
+      initial,
+      envelope(0, "identity.name", "current", "confirmed"),
+    );
+    const presentation = formatKnowledgeBasePresentationEnvelope({
+      kind: "frontmind.knowledge-base.presentation",
+      schemaVersion: 1,
+      revision: 1,
+      leafId: "identity.position",
+    });
+
+    expect(parseKnowledgeBasePresentationEnvelope(presentation)).toMatchObject({
+      revision: 1,
+      leafId: "identity.position",
+    });
+    expect(() =>
+      assertKnowledgeBasePresentationMatchesState(next, presentation),
+    ).not.toThrow();
+  });
+
+  it("keeps a revised leaf as the presentation target", () => {
+    const initial = createKnowledgeBaseProgressState(manifest);
+    const revised = applyKnowledgeBaseProgressEnvelope(
+      initial,
+      envelope(0, "identity.name", "current", "needs_verification"),
+    );
+    const presentation = formatKnowledgeBasePresentationEnvelope({
+      kind: "frontmind.knowledge-base.presentation",
+      schemaVersion: 1,
+      revision: 1,
+      leafId: "identity.name",
+    });
+
+    expect(() =>
+      assertKnowledgeBasePresentationMatchesState(revised, presentation),
+    ).not.toThrow();
+  });
+
+  it("uses a null presentation only after the final leaf", () => {
+    const one = applyKnowledgeBaseProgressEnvelope(
+      createKnowledgeBaseProgressState(manifest),
+      envelope(0, "identity.name", "current", "confirmed"),
+    );
+    const two = applyKnowledgeBaseProgressEnvelope(
+      one,
+      envelope(1, "identity.position", "current", "confirmed"),
+    );
+    const completed = applyKnowledgeBaseProgressEnvelope(
+      two,
+      envelope(2, "product.primary", "current", "confirmed"),
+    );
+    const presentation = formatKnowledgeBasePresentationEnvelope({
+      kind: "frontmind.knowledge-base.presentation",
+      schemaVersion: 1,
+      revision: 3,
+      leafId: null,
+    });
+
+    expect(() =>
+      assertKnowledgeBasePresentationMatchesState(completed, presentation),
+    ).not.toThrow();
+    expectProgressError(
+      () =>
+        assertKnowledgeBasePresentationMatchesState(
+          completed,
+          formatKnowledgeBasePresentationEnvelope({
+            kind: "frontmind.knowledge-base.presentation",
+            schemaVersion: 1,
+            revision: 3,
+            leafId: "product.primary",
+          }),
+        ),
+      "WRONG_LEAF",
+    );
+  });
+
+  it("rejects stale, wrong, missing and duplicate presentation envelopes", () => {
+    const next = applyKnowledgeBaseProgressEnvelope(
+      createKnowledgeBaseProgressState(manifest),
+      envelope(0, "identity.name", "current", "confirmed"),
+    );
+    const stale = formatKnowledgeBasePresentationEnvelope({
+      kind: "frontmind.knowledge-base.presentation",
+      schemaVersion: 1,
+      revision: 0,
+      leafId: "identity.position",
+    });
+    const wrong = formatKnowledgeBasePresentationEnvelope({
+      kind: "frontmind.knowledge-base.presentation",
+      schemaVersion: 1,
+      revision: 1,
+      leafId: "product.primary",
+    });
+
+    expectProgressError(
+      () => assertKnowledgeBasePresentationMatchesState(next, stale),
+      "STALE_REVISION",
+    );
+    expectProgressError(
+      () => assertKnowledgeBasePresentationMatchesState(next, wrong),
+      "WRONG_LEAF",
+    );
+    expectProgressError(
+      () => assertKnowledgeBasePresentationMatchesState(next, "正文"),
+      "INVALID_ENVELOPE",
+    );
+    expectProgressError(
+      () =>
+        parseKnowledgeBasePresentationEnvelope(
+          `${wrong}\n${formatKnowledgeBasePresentationEnvelope({
+            kind: "frontmind.knowledge-base.presentation",
+            schemaVersion: 1,
+            revision: 1,
+            leafId: "identity.position",
+          })}`,
+        ),
+      "INVALID_ENVELOPE",
     );
   });
 });

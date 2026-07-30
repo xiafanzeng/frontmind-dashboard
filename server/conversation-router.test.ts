@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { MySqlDialect } from "drizzle-orm/mysql-core";
 import {
   apiCredentials,
+  conversations,
   upstreamResources,
   userUsageOwners,
   users,
@@ -176,6 +178,65 @@ describe("conversation deletion", () => {
 
     expect(deleteFrom).toHaveBeenCalledTimes(1);
     expect(where).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses id plus project scope so a replacement engineer can delete project history without crossing A/B", async () => {
+    const rows = [
+      {
+        id: "pproject-a:conversation-1",
+        userId: 7,
+        projectAssignmentId: "project-a",
+      },
+    ];
+    const predicates: Array<{ sql: string; params: unknown[] }> = [];
+    const deleteFrom = vi.fn((table: unknown) => {
+      expect(table).toBe(conversations);
+      return {
+        where: async (expression: unknown) => {
+          const query = new MySqlDialect().sqlToQuery(expression as any);
+          predicates.push(query);
+          const [id, projectAssignmentId] = query.params;
+          const index = rows.findIndex(
+            (row) =>
+              row.id === id && row.projectAssignmentId === projectAssignmentId,
+          );
+          if (index >= 0) rows.splice(index, 1);
+        },
+      };
+    });
+
+    await permanentlyDeleteConversation(
+      { delete: deleteFrom },
+      99,
+      "pproject-a:conversation-1",
+      "project-b",
+    );
+    expect(rows).toHaveLength(1);
+
+    await permanentlyDeleteConversation(
+      { delete: deleteFrom },
+      99,
+      "pproject-a:conversation-1",
+      "project-a",
+    );
+    expect(rows).toEqual([]);
+
+    expect(predicates).toHaveLength(2);
+    for (const predicate of predicates) {
+      expect(predicate.sql).toContain("`conversations`.`id` = ?");
+      expect(predicate.sql).toContain(
+        "`conversations`.`projectAssignmentId` = ?",
+      );
+      expect(predicate.sql).not.toContain("`conversations`.`userId`");
+    }
+    expect(predicates[0]?.params).toEqual([
+      "pproject-a:conversation-1",
+      "project-b",
+    ]);
+    expect(predicates[1]?.params).toEqual([
+      "pproject-a:conversation-1",
+      "project-a",
+    ]);
   });
 });
 

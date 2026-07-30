@@ -210,10 +210,15 @@ export async function createManagedServiceUser(
         .limit(1)
         .for("update");
       const admin = rows[0];
-      if (!admin || !hasDeliveryCapability(admin) || admin.isActive !== true) {
+      if (
+        !admin ||
+        admin.role !== "admin" ||
+        admin.adminAccessLevel !== "delivery_admin" ||
+        admin.isActive !== true
+      ) {
         throw new AuthServiceError(
           "INVALID_CREDENTIAL",
-          "请选择一个已启用的管理员作为客户主负责人",
+          "请选择一个已启用的交付管理员作为客户主负责人",
         );
       }
     });
@@ -378,12 +383,13 @@ export async function completeManagedServiceUserProvisioning(
         const admin = rows[0];
         if (
           !admin ||
-          !hasDeliveryCapability(admin) ||
+          admin.role !== "admin" ||
+          admin.adminAccessLevel !== "delivery_admin" ||
           admin.isActive !== true
         ) {
           throw new AuthServiceError(
             "INVALID_CREDENTIAL",
-            "请选择一个已启用的管理员作为客户主负责人",
+            "请选择一个已启用的交付管理员作为客户主负责人",
           );
         }
       });

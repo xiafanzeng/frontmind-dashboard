@@ -11,14 +11,24 @@ import {
   preparedFileService,
   type PreparedFileManifest,
 } from "./prepared-file-service";
+import { assertDeliveryProjectContext } from "./delivery-role-service";
 
 const router = Router();
 const DOWNLOAD_TOKEN_TTL_MS = 5 * 60 * 1000;
 
 const downloadTokens = new Map<
   string,
-  { assetId: string; ownerUserId: number; expiresAt: number }
+  {
+    assetId: string;
+    ownerUserId: number;
+    projectAssignmentId: string | null;
+    expiresAt: number;
+  }
 >();
+
+function requestProjectAssignmentId(req: Request) {
+  return req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null;
+}
 
 export interface ByteRange {
   start: number;
@@ -122,10 +132,7 @@ function extractSource(fileUrl: string) {
   if (/^https?:\/\//i.test(fileUrl)) {
     return { kind: "external" as const, url: fileUrl };
   }
-  throw new PreparedFileError(
-    "INVALID_FILE_SOURCE",
-    "无法识别 PDF 文件来源",
-  );
+  throw new PreparedFileError("INVALID_FILE_SOURCE", "无法识别 PDF 文件来源");
 }
 
 router.post("/prepare", async (req, res) => {
@@ -154,6 +161,7 @@ router.post("/prepare", async (req, res) => {
         ownerUserId,
         "file",
         source.fileId,
+        requestProjectAssignmentId(req) ?? undefined,
       );
       if (!credential) {
         res.status(403).json({
@@ -168,6 +176,7 @@ router.post("/prepare", async (req, res) => {
         await preparedFileService.registerFile({
           ownerUserId,
           credentialId: credential.id,
+          projectAssignmentId: requestProjectAssignmentId(req),
           fileId: source.fileId,
           filename,
         }),
@@ -181,6 +190,7 @@ router.post("/prepare", async (req, res) => {
       await preparedFileService.registerExternal({
         ownerUserId,
         credentialId: credential?.id || "external",
+        projectAssignmentId: requestProjectAssignmentId(req),
         url: source.url,
         filename,
       }),
@@ -200,7 +210,11 @@ router.get("/:assetId/status", async (req, res) => {
       return;
     }
     res.json(
-      await preparedFileService.getStatus(req.params.assetId, ownerUserId),
+      await preparedFileService.getStatus(
+        req.params.assetId,
+        ownerUserId,
+        requestProjectAssignmentId(req),
+      ),
     );
   } catch (error) {
     sendPreparedError(res, error);
@@ -217,7 +231,11 @@ router.post("/:assetId/retry", async (req, res) => {
       return;
     }
     res.json(
-      await preparedFileService.retry(req.params.assetId, ownerUserId),
+      await preparedFileService.retry(
+        req.params.assetId,
+        ownerUserId,
+        requestProjectAssignmentId(req),
+      ),
     );
   } catch (error) {
     sendPreparedError(res, error);
@@ -244,6 +262,7 @@ router.post("/:assetId/download-token", async (req, res) => {
     const manifest = await preparedFileService.getReadyManifest(
       req.params.assetId,
       ownerUserId,
+      requestProjectAssignmentId(req),
     );
     if (manifest.status !== "ready") {
       res.status(409).json({
@@ -261,6 +280,7 @@ router.post("/:assetId/download-token", async (req, res) => {
     downloadTokens.set(token, {
       assetId: manifest.id,
       ownerUserId,
+      projectAssignmentId: requestProjectAssignmentId(req),
       expiresAt,
     });
     res.json({
@@ -303,7 +323,7 @@ async function streamPreparedFile(
     !req.headers.range &&
     ifNoneMatch
       ?.split(",")
-      .map(value => value.trim())
+      .map((value) => value.trim())
       .includes(etag)
   ) {
     res.status(304).end();
@@ -340,7 +360,7 @@ async function streamPreparedFile(
     released = true;
     preparedFileService.endUse(manifest.id);
   };
-  stream.on("error", error => {
+  stream.on("error", (error) => {
     release();
     if (!res.headersSent) sendPreparedError(res, error);
     else res.destroy(error);
@@ -376,10 +396,26 @@ router.get("/download/:token", async (req, res) => {
       });
       return;
     }
+    if (req.frontmindUser?.role === "delivery_member") {
+      if (!token.projectAssignmentId) {
+        res.status(403).json({
+          error: {
+            message: "下载链接缺少客户项目上下文",
+            code: "DELIVERY_PROJECT_CONTEXT_FORBIDDEN",
+          },
+        });
+        return;
+      }
+      await assertDeliveryProjectContext({
+        actor: req.frontmindUser,
+        projectAssignmentId: token.projectAssignmentId,
+      });
+    }
     downloadTokens.delete(req.params.token);
     const manifest = await preparedFileService.getReadyManifest(
       token.assetId,
       ownerUserId,
+      token.projectAssignmentId,
     );
     if (manifest.status !== "ready") {
       res.status(409).json({
@@ -405,6 +441,7 @@ router.get("/:assetId/content", async (req, res) => {
     const manifest = await preparedFileService.getReadyManifest(
       req.params.assetId,
       ownerUserId,
+      requestProjectAssignmentId(req),
     );
     if (manifest.status !== "ready") {
       res.status(202).json({
@@ -438,6 +475,7 @@ router.head("/:assetId/content", async (req, res) => {
     const manifest = await preparedFileService.getReadyManifest(
       req.params.assetId,
       ownerUserId,
+      requestProjectAssignmentId(req),
     );
     if (manifest.status !== "ready") {
       res.status(202).end();

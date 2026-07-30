@@ -125,6 +125,7 @@ function withoutApprovedBranding(content) {
 const requiredSkillFiles = [
   "private-workflows/socratic-kb-builder.skill",
   "private-workflows/socratic-kb-builder-v1.skill",
+  "private-workflows/socratic-kb-builder-v3.skill",
   "private-workflows/brand-question-portfolio.skill/SKILL.md",
   "private-workflows/brand-question-portfolio.skill/references/output-contract.md",
   "private-workflows/response-logic-builder.skill/SKILL.md",
@@ -133,6 +134,7 @@ const requiredSkillFiles = [
 const runtimeSkillRoots = [
   "private-workflows/socratic-kb-builder.skill",
   "private-workflows/socratic-kb-builder-v1.skill",
+  "private-workflows/socratic-kb-builder-v3.skill",
   "private-workflows/brand-question-portfolio.skill",
   "private-workflows/response-logic-builder.skill",
 ];
@@ -304,7 +306,7 @@ try {
   const archivePath = join(
     buildRoot,
     "private-workflows",
-    "socratic-kb-builder.skill",
+    "socratic-kb-builder-v3.skill",
   );
   const archive = await JSZip.loadAsync(await readFile(archivePath));
   for (const [entryName, entry] of Object.entries(archive.files)) {
@@ -351,7 +353,7 @@ try {
   }
 } catch {
   violations.push({
-    file: "private-workflows/socratic-kb-builder.skill",
+    file: "private-workflows/socratic-kb-builder-v3.skill",
     label: "invalid runtime Skill archive",
   });
 }

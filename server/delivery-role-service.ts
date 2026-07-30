@@ -2,9 +2,8 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import {
-  deliveryCustomerAssignments,
-  deliveryRoleMembers,
-  deliveryRoles,
+  apiCredentials,
+  deliveryProjectAssignments,
   deliveryTicketEvents,
   deliveryTickets,
   knowledgeBaseResetRequests,
@@ -13,7 +12,9 @@ import {
   monitoringBatches,
   serviceContracts,
   serviceQuotaPeriods,
+  userAdminAssignments,
   userDashboardContents,
+  userUsageOwners,
   users,
   workspaceQuestions,
   workspaceSiteChecks,
@@ -32,9 +33,17 @@ import {
   deleteActiveApiCredential,
   getApiCredentialStatus,
   replaceApiCredential,
+  replaceApiCredentialInTransaction,
+  validateUpstreamApiKey,
   type AuthenticatedUser,
 } from "./auth-service";
+import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { getDb } from "./db";
+import {
+  deriveEffectiveServiceStatus,
+  selectPortalContract,
+  type ServicePortalContractRecord,
+} from "./service-entitlement";
 
 async function requireDb() {
   const db = await getDb();
@@ -53,117 +62,79 @@ function requireDeliveryManager(actor: AuthenticatedUser) {
   }
 }
 
-async function assertFixedRole(
-  executor: any,
-  roleId: string,
-  expectedType?: DeliveryRoleType,
-) {
-  const rows = await executor
-    .select()
-    .from(deliveryRoles)
-    .where(and(eq(deliveryRoles.id, roleId), eq(deliveryRoles.isActive, true)))
-    .limit(1);
-  const role = rows[0];
-  if (!role || (expectedType && role.roleType !== expectedType)) {
-    throw new AuthServiceError("NOT_FOUND", "交付团队不存在或类型不匹配");
-  }
-  return role;
-}
-
-async function assertActiveRoleMembership(input: {
-  executor: any;
-  roleId: string;
-  memberUserId: number;
-}) {
-  const rows = await input.executor
-    .select({ id: deliveryRoleMembers.id })
-    .from(deliveryRoleMembers)
-    .innerJoin(users, eq(users.id, deliveryRoleMembers.memberUserId))
-    .where(
-      and(
-        eq(deliveryRoleMembers.roleId, input.roleId),
-        eq(deliveryRoleMembers.memberUserId, input.memberUserId),
-        eq(deliveryRoleMembers.isActive, true),
-        eq(users.role, "delivery_member"),
-        eq(users.isActive, true),
-      ),
-    )
-    .limit(1);
-  if (!rows[0]) {
-    throw new AuthServiceError("CONFLICT", "负责人尚未加入该交付团队");
-  }
-}
-
-async function getActiveDeliveryCustomerOwner(
+async function getActiveDeliveryProjectOwner(
   executor: any,
   customerUserId: number,
   roleType: DeliveryRoleType,
 ) {
   const rows = await executor
     .select({
-      roleId: deliveryCustomerAssignments.roleId,
-      primaryMemberId: deliveryCustomerAssignments.primaryMemberId,
+      projectAssignmentId: deliveryProjectAssignments.id,
+      engineerUserId: deliveryProjectAssignments.engineerUserId,
     })
-    .from(deliveryCustomerAssignments)
-    .innerJoin(
-      deliveryRoles,
-      eq(deliveryCustomerAssignments.roleId, deliveryRoles.id),
-    )
-    .innerJoin(
-      deliveryRoleMembers,
-      and(
-        eq(deliveryRoleMembers.roleId, deliveryCustomerAssignments.roleId),
-        eq(
-          deliveryRoleMembers.memberUserId,
-          deliveryCustomerAssignments.primaryMemberId,
-        ),
-      ),
-    )
-    .innerJoin(users, eq(users.id, deliveryCustomerAssignments.primaryMemberId))
+    .from(deliveryProjectAssignments)
+    .innerJoin(users, eq(users.id, deliveryProjectAssignments.engineerUserId))
     .where(
       and(
-        eq(deliveryCustomerAssignments.customerUserId, customerUserId),
-        eq(deliveryCustomerAssignments.roleType, roleType),
-        eq(deliveryRoles.roleType, roleType),
-        eq(deliveryRoles.isActive, true),
-        eq(deliveryRoleMembers.isActive, true),
+        eq(deliveryProjectAssignments.customerUserId, customerUserId),
+        eq(deliveryProjectAssignments.roleType, roleType),
         eq(users.role, "delivery_member"),
+        eq(users.engineerRoleType, roleType),
         eq(users.isActive, true),
       ),
     )
-    .limit(1);
+    .limit(1)
+    .for("update");
   return rows[0] ?? null;
+}
+
+function requiredRolesForPlan(planCode: string | null | undefined) {
+  const roles: DeliveryRoleType[] = [
+    "monitoring_optimization_engineer",
+    "content_distribution_engineer",
+  ];
+  if (planCode === "advanced" || planCode === "luxury") {
+    roles.unshift("ai_operations_engineer");
+  }
+  return roles;
+}
+
+async function assertCanManageProject(input: {
+  executor: any;
+  actor: AuthenticatedUser;
+  customerUserId: number;
+}) {
+  if (input.actor.adminAccessLevel === "system_admin") return;
+  const ownerRows = await input.executor
+    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
+    .from(userUsageOwners)
+    .where(
+      and(
+        eq(userUsageOwners.userId, input.customerUserId),
+        eq(userUsageOwners.deliveryAdminId, input.actor.id),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  if (!ownerRows[0]) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "只能管理由当前交付管理员负责的客户项目",
+    );
+  }
 }
 
 export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
   requireDeliveryManager(actor);
   const db = await requireDb();
   const [
-    roles,
-    memberships,
-    assignments,
-    members,
-    customers,
-    tickets,
+    allCustomers,
     contracts,
-    statisticsTickets,
+    ownerRows,
+    adminRows,
+    engineers,
+    credentials,
   ] = await Promise.all([
-    db
-      .select()
-      .from(deliveryRoles)
-      .orderBy(deliveryRoles.roleType, deliveryRoles.name),
-    db.select().from(deliveryRoleMembers),
-    db.select().from(deliveryCustomerAssignments),
-    db
-      .select({
-        id: users.id,
-        username: users.username,
-        displayName: users.displayName,
-        isActive: users.isActive,
-      })
-      .from(users)
-      .where(eq(users.role, "delivery_member"))
-      .orderBy(desc(users.createdAt)),
     db
       .select({
         id: users.id,
@@ -174,45 +145,146 @@ export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
       .from(users)
       .where(eq(users.role, "user"))
       .orderBy(desc(users.createdAt)),
-    db
-      .select()
-      .from(deliveryTickets)
-      .where(inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES))
-      .orderBy(desc(deliveryTickets.updatedAt)),
+    db.select().from(serviceContracts).orderBy(desc(serviceContracts.revision)),
+    db.select().from(userUsageOwners),
     db
       .select({
-        id: serviceContracts.id,
-        userId: serviceContracts.userId,
-        planCode: serviceContracts.planCode,
-        status: serviceContracts.status,
-        endsAt: serviceContracts.endsAt,
+        id: users.id,
+        username: users.username,
+        displayName: users.displayName,
+        adminAccessLevel: users.adminAccessLevel,
+        isActive: users.isActive,
       })
-      .from(serviceContracts)
-      .where(
-        inArray(serviceContracts.status, [
-          "pending_confirmation",
-          "scheduled",
-          "active",
-          "suspended",
-        ]),
-      )
-      .orderBy(desc(serviceContracts.endsAt)),
+      .from(users)
+      .where(eq(users.role, "admin")),
     db
       .select({
-        workflowDomain: deliveryTickets.workflowDomain,
-        status: deliveryTickets.status,
-        assignedMemberId: deliveryTickets.assignedMemberId,
-        updatedAt: deliveryTickets.updatedAt,
+        id: users.id,
+        username: users.username,
+        displayName: users.displayName,
+        isActive: users.isActive,
+        engineerRoleType: users.engineerRoleType,
       })
-      .from(deliveryTickets),
+      .from(users)
+      .where(eq(users.role, "delivery_member"))
+      .orderBy(desc(users.createdAt)),
+    db
+      .select({ userId: apiCredentials.userId })
+      .from(apiCredentials)
+      .where(eq(apiCredentials.status, "active")),
   ]);
+  const visibleCustomers =
+    actor.adminAccessLevel === "system_admin"
+      ? allCustomers
+      : allCustomers.filter((customer) =>
+          ownerRows.some(
+            (owner) =>
+              owner.userId === customer.id &&
+              owner.deliveryAdminId === actor.id,
+          ),
+        );
+  const customerIds = visibleCustomers.map((customer) => customer.id);
+  const [assignmentRows, statisticsTickets] = customerIds.length
+    ? await Promise.all([
+        db
+          .select()
+          .from(deliveryProjectAssignments)
+          .where(
+            inArray(deliveryProjectAssignments.customerUserId, customerIds),
+          ),
+        db
+          .select()
+          .from(deliveryTickets)
+          .where(inArray(deliveryTickets.userId, customerIds))
+          .orderBy(desc(deliveryTickets.updatedAt)),
+      ])
+    : [[], []];
+  const activeTickets = statisticsTickets.filter((ticket) =>
+    ACTIVE_DELIVERY_STATUSES.includes(ticket.status as any),
+  );
+  const ticketEvents = activeTickets.length
+    ? await db
+        .select({
+          id: deliveryTicketEvents.id,
+          ticketId: deliveryTicketEvents.ticketId,
+          actorUserId: deliveryTicketEvents.actorUserId,
+          actorRole: deliveryTicketEvents.actorRole,
+          kind: deliveryTicketEvents.kind,
+          message: deliveryTicketEvents.message,
+          fromStatus: deliveryTicketEvents.fromStatus,
+          toStatus: deliveryTicketEvents.toStatus,
+          createdAt: deliveryTicketEvents.createdAt,
+        })
+        .from(deliveryTicketEvents)
+        .where(
+          inArray(
+            deliveryTicketEvents.ticketId,
+            activeTickets.map((ticket) => ticket.id),
+          ),
+        )
+        .orderBy(desc(deliveryTicketEvents.createdAt))
+    : [];
+  const adminById = new Map(adminRows.map((admin) => [admin.id, admin]));
+  const contractByCustomer = new Map<number, (typeof contracts)[number]>();
+  for (const customer of visibleCustomers) {
+    const contract = selectPortalContract(
+      contracts.filter(
+        (candidate) => candidate.userId === customer.id,
+      ) as ServicePortalContractRecord[],
+    );
+    if (contract) {
+      contractByCustomer.set(
+        customer.id,
+        contract as (typeof contracts)[number],
+      );
+    }
+  }
+  const configuredEngineerIds = new Set(
+    credentials.map((credential) => credential.userId),
+  );
+  const engineerById = new Map(
+    engineers.map((engineer) => [engineer.id, engineer]),
+  );
+  const projects = visibleCustomers.map((customer) => {
+    const contract = contractByCustomer.get(customer.id);
+    const owner = ownerRows.find((row) => row.userId === customer.id);
+    const manager = owner ? adminById.get(owner.deliveryAdminId) : null;
+    return {
+      ...customer,
+      planCode: contract?.planCode ?? null,
+      contractStatus: deriveEffectiveServiceStatus(contract),
+      contractStartsAt: contract?.startsAt?.getTime() ?? null,
+      contractEndsAt: contract?.endsAt?.getTime() ?? null,
+      managerId: manager?.id ?? null,
+      managerUsername: manager?.username ?? null,
+      managerDisplayName: manager?.displayName ?? null,
+      requiredRoleTypes: requiredRolesForPlan(contract?.planCode),
+    };
+  });
+  const assignments = assignmentRows.map((assignment) => {
+    const engineer =
+      assignment.engineerUserId == null
+        ? null
+        : engineerById.get(assignment.engineerUserId);
+    return {
+      ...assignment,
+      engineerUsername: engineer?.username ?? null,
+      engineerDisplayName: engineer?.displayName ?? null,
+      engineerApiKeyConfigured:
+        assignment.engineerUserId != null &&
+        configuredEngineerIds.has(assignment.engineerUserId),
+    };
+  });
+  const enrichedEngineers = engineers.map((engineer) => ({
+    ...engineer,
+    apiKeyConfigured: configuredEngineerIds.has(engineer.id),
+  }));
   const roleStats = Object.fromEntries(
     (
       [
-        "knowledge_base_engineer",
+        "ai_operations_engineer",
         "monitoring_optimization_engineer",
         "content_distribution_engineer",
-        "website_operations_engineer",
       ] as const
     ).map((roleType) => {
       const rows = statisticsTickets.filter(
@@ -254,37 +326,12 @@ export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
       completed: number;
     }
   >;
-  const ticketEvents = tickets.length
-    ? await db
-        .select({
-          id: deliveryTicketEvents.id,
-          ticketId: deliveryTicketEvents.ticketId,
-          actorUserId: deliveryTicketEvents.actorUserId,
-          actorRole: deliveryTicketEvents.actorRole,
-          kind: deliveryTicketEvents.kind,
-          message: deliveryTicketEvents.message,
-          fromStatus: deliveryTicketEvents.fromStatus,
-          toStatus: deliveryTicketEvents.toStatus,
-          createdAt: deliveryTicketEvents.createdAt,
-        })
-        .from(deliveryTicketEvents)
-        .where(
-          inArray(
-            deliveryTicketEvents.ticketId,
-            tickets.map((ticket) => ticket.id),
-          ),
-        )
-        .orderBy(desc(deliveryTicketEvents.createdAt))
-    : [];
   return {
-    roles,
-    memberships,
+    projects,
     assignments,
-    members,
-    customers,
-    tickets,
+    engineers: enrichedEngineers,
+    tickets: activeTickets,
     ticketEvents,
-    contracts,
     roleStats,
   };
 }
@@ -296,161 +343,295 @@ const ACTIVE_DELIVERY_STATUSES = [
   "in_progress",
 ] as const;
 
-export async function createDeliveryRole(input: {
-  actor: AuthenticatedUser;
-  name: string;
-  roleType: DeliveryRoleType;
-}) {
-  requireDeliveryManager(input.actor);
-  const db = await requireDb();
-  const row = {
-    id: randomUUID(),
-    name: input.name.trim(),
-    roleType: input.roleType,
-    isActive: true,
-    createdByUserId: input.actor.id,
-  };
-  try {
-    await db.insert(deliveryRoles).values(row);
-  } catch (error) {
-    if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
-      throw new AuthServiceError("CONFLICT", "该角色类型下已存在同名团队");
-    }
-    throw error;
-  }
-  return row;
-}
-
-export async function createDeliveryMember(input: {
+export async function createDeliveryEngineer(input: {
   actor: AuthenticatedUser;
   username: string;
   password: string;
   displayName?: string;
+  engineerRoleType: DeliveryRoleType;
+  apiKey?: string;
 }) {
   requireDeliveryManager(input.actor);
-  return createManagedUser({
-    username: input.username,
-    password: input.password,
-    displayName: input.displayName,
-    role: "delivery_member",
+  const apiKey = input.apiKey?.trim() || null;
+  if (apiKey) await validateUpstreamApiKey(apiKey);
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const user = await createManagedUser(
+      {
+        username: input.username,
+        password: input.password,
+        displayName: input.displayName,
+        role: "delivery_member",
+        engineerRoleType: input.engineerRoleType,
+      },
+      tx,
+    );
+    if (apiKey) {
+      await replaceApiCredentialInTransaction({
+        executor: tx,
+        userId: user.id,
+        apiKey,
+      });
+    }
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "account.created",
+        targetType: "user",
+        targetId: user.id,
+        workspaceUserId: null,
+        metadata: {
+          role: "delivery_member",
+          engineerRoleType: input.engineerRoleType,
+          apiKeyConfigured: Boolean(apiKey),
+        },
+      },
+      tx,
+    );
+    return user;
   });
 }
 
-export async function setDeliveryRoleMember(input: {
-  actor: AuthenticatedUser;
-  roleId: string;
-  memberUserId: number;
-  active: boolean;
-}) {
-  requireDeliveryManager(input.actor);
-  const db = await requireDb();
-  await assertFixedRole(db, input.roleId);
-  const memberRows = await db
-    .select({ role: users.role, isActive: users.isActive })
-    .from(users)
-    .where(eq(users.id, input.memberUserId))
-    .limit(1);
-  if (memberRows[0]?.role !== "delivery_member" || !memberRows[0]?.isActive) {
-    throw new AuthServiceError("NOT_FOUND", "交付成员账号不存在或已停用");
-  }
-  await db
-    .insert(deliveryRoleMembers)
-    .values({
-      id: randomUUID(),
-      roleId: input.roleId,
-      memberUserId: input.memberUserId,
-      isActive: input.active,
-      assignedByUserId: input.actor.id,
-    })
-    .onDuplicateKeyUpdate({
-      set: {
-        isActive: input.active,
-        assignedByUserId: input.actor.id,
-        updatedAt: new Date(),
-      },
-    });
-  return { success: true as const };
-}
-
-export async function assignDeliveryCustomer(input: {
+export async function setProjectEngineer(input: {
   actor: AuthenticatedUser;
   customerUserId: number;
   roleType: DeliveryRoleType;
-  roleId: string;
-  primaryMemberId: number;
+  engineerUserId: number | null;
+  expectedRevision: number;
 }) {
   requireDeliveryManager(input.actor);
   const db = await requireDb();
-  const role = await assertFixedRole(db, input.roleId, input.roleType);
-  await assertActiveRoleMembership({
-    executor: db,
-    roleId: input.roleId,
-    memberUserId: input.primaryMemberId,
-  });
-  const customerRows = await db
-    .select({ role: users.role, isActive: users.isActive })
-    .from(users)
-    .where(eq(users.id, input.customerUserId))
-    .limit(1);
-  if (customerRows[0]?.role !== "user" || !customerRows[0]?.isActive) {
-    throw new AuthServiceError("NOT_FOUND", "客户账号不存在或已停用");
-  }
-  await db.transaction(async (tx) => {
-    await tx
-      .insert(deliveryCustomerAssignments)
-      .values({
-        id: randomUUID(),
+  let result;
+  try {
+    result = await db.transaction(async (tx) => {
+      const customerRows = await tx
+        .select({ role: users.role, isActive: users.isActive })
+        .from(users)
+        .where(eq(users.id, input.customerUserId))
+        .limit(1)
+        .for("update");
+      if (customerRows[0]?.role !== "user" || !customerRows[0]?.isActive) {
+        throw new AuthServiceError("NOT_FOUND", "客户项目不存在或已停用");
+      }
+      await assertCanManageProject({
+        executor: tx,
+        actor: input.actor,
         customerUserId: input.customerUserId,
-        roleType: input.roleType,
-        roleId: role.id,
-        primaryMemberId: input.primaryMemberId,
-        assignedByUserId: input.actor.id,
-      })
-      .onDuplicateKeyUpdate({
-        set: {
-          roleId: role.id,
-          primaryMemberId: input.primaryMemberId,
-          assignedByUserId: input.actor.id,
-          revision: sql`${deliveryCustomerAssignments.revision} + 1`,
-          updatedAt: new Date(),
-        },
       });
-    await tx
-      .update(deliveryTickets)
-      .set({
-        assignedRoleId: role.id,
-        assignedMemberId: input.primaryMemberId,
-        updatedByUserId: input.actor.id,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(deliveryTickets.userId, input.customerUserId),
-          eq(deliveryTickets.workflowDomain, input.roleType),
-          inArray(deliveryTickets.status, [
-            "submitted",
-            "needs_information",
-            "scheduled",
-            "in_progress",
-          ]),
-        ),
+      const contractRows = await tx
+        .select()
+        .from(serviceContracts)
+        .where(eq(serviceContracts.userId, input.customerUserId));
+      const currentContract = selectPortalContract(
+        contractRows as ServicePortalContractRecord[],
       );
-    if (input.roleType === "knowledge_base_engineer") {
+      if (
+        input.engineerUserId != null &&
+        !requiredRolesForPlan(currentContract?.planCode).includes(
+          input.roleType,
+        )
+      ) {
+        throw new AuthServiceError("CONFLICT", "当前套餐未启用该工程师岗位");
+      }
+      if (input.engineerUserId != null) {
+        const engineerRows = await tx
+          .select({
+            role: users.role,
+            isActive: users.isActive,
+            engineerRoleType: users.engineerRoleType,
+          })
+          .from(users)
+          .where(eq(users.id, input.engineerUserId))
+          .limit(1)
+          .for("update");
+        const engineer = engineerRows[0];
+        if (
+          engineer?.role !== "delivery_member" ||
+          !engineer.isActive ||
+          engineer.engineerRoleType !== input.roleType
+        ) {
+          throw new AuthServiceError(
+            "CONFLICT",
+            "请选择岗位匹配且已启用的工程师账号",
+          );
+        }
+      }
+      const existingRows = await tx
+        .select()
+        .from(deliveryProjectAssignments)
+        .where(
+          and(
+            eq(deliveryProjectAssignments.customerUserId, input.customerUserId),
+            eq(deliveryProjectAssignments.roleType, input.roleType),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const existing = existingRows[0] ?? null;
+      if ((existing?.revision ?? 0) !== input.expectedRevision) {
+        throw new AuthServiceError("CONFLICT", "项目团队已变化，请刷新后重试");
+      }
+      if (input.engineerUserId == null) {
+        if (!existing) return { success: true as const, assignment: null };
+        const [ticketRows, resetRows] = await Promise.all([
+          tx
+            .select({ id: deliveryTickets.id })
+            .from(deliveryTickets)
+            .where(
+              and(
+                eq(deliveryTickets.userId, input.customerUserId),
+                eq(deliveryTickets.workflowDomain, input.roleType),
+                inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+              ),
+            )
+            .limit(1),
+          input.roleType === "ai_operations_engineer"
+            ? tx
+                .select({ id: knowledgeBaseResetRequests.id })
+                .from(knowledgeBaseResetRequests)
+                .where(
+                  and(
+                    eq(knowledgeBaseResetRequests.userId, input.customerUserId),
+                    eq(knowledgeBaseResetRequests.status, "pending"),
+                  ),
+                )
+                .limit(1)
+            : Promise.resolve([]),
+        ]);
+        if (ticketRows[0] || resetRows[0]) {
+          throw new AuthServiceError(
+            "CONFLICT",
+            "该岗位仍有未结束任务，不能解除负责人，请直接更换工程师",
+          );
+        }
+        const nextRevision = existing.revision + 1;
+        await tx
+          .update(deliveryProjectAssignments)
+          .set({
+            engineerUserId: null,
+            assignedByUserId: input.actor.id,
+            revision: nextRevision,
+            updatedAt: new Date(),
+          })
+          .where(eq(deliveryProjectAssignments.id, existing.id));
+        await writeWorkspaceAuditEvent(
+          {
+            actor: input.actor,
+            action: "delivery.project_engineer.unassigned",
+            targetType: "workspace",
+            targetId: input.customerUserId,
+            workspaceUserId: input.customerUserId,
+            metadata: {
+              roleType: input.roleType,
+              previousEngineerUserId: existing.engineerUserId,
+            },
+          },
+          tx,
+        );
+        return {
+          success: true as const,
+          assignment: { id: existing.id, revision: nextRevision },
+        };
+      }
+      const assignmentId = existing?.id ?? randomUUID();
+      if (existing) {
+        await tx
+          .update(deliveryProjectAssignments)
+          .set({
+            engineerUserId: input.engineerUserId,
+            assignedByUserId: input.actor.id,
+            revision: existing.revision + 1,
+            updatedAt: new Date(),
+          })
+          .where(eq(deliveryProjectAssignments.id, existing.id));
+      } else {
+        await tx.insert(deliveryProjectAssignments).values({
+          id: assignmentId,
+          customerUserId: input.customerUserId,
+          roleType: input.roleType,
+          engineerUserId: input.engineerUserId,
+          assignedByUserId: input.actor.id,
+        });
+      }
       await tx
-        .update(knowledgeBaseResetRequests)
+        .update(deliveryTickets)
         .set({
-          assignedRoleId: role.id,
-          assignedMemberId: input.primaryMemberId,
+          assignedProjectAssignmentId: assignmentId,
+          assignedMemberId: input.engineerUserId,
+          updatedByUserId: input.actor.id,
           updatedAt: new Date(),
         })
         .where(
           and(
-            eq(knowledgeBaseResetRequests.userId, input.customerUserId),
-            eq(knowledgeBaseResetRequests.status, "pending"),
+            eq(deliveryTickets.userId, input.customerUserId),
+            eq(deliveryTickets.workflowDomain, input.roleType),
+            inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
           ),
         );
+      if (input.roleType === "ai_operations_engineer") {
+        await tx
+          .update(knowledgeBaseResetRequests)
+          .set({
+            assignedProjectAssignmentId: assignmentId,
+            assignedMemberId: input.engineerUserId,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(knowledgeBaseResetRequests.userId, input.customerUserId),
+              eq(knowledgeBaseResetRequests.status, "pending"),
+            ),
+          );
+      }
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "delivery.project_engineer.assigned",
+          targetType: "workspace",
+          targetId: input.customerUserId,
+          workspaceUserId: input.customerUserId,
+          metadata: {
+            roleType: input.roleType,
+            previousEngineerUserId: existing?.engineerUserId ?? null,
+            engineerUserId: input.engineerUserId,
+            projectAssignmentId: assignmentId,
+          },
+        },
+        tx,
+      );
+      return {
+        success: true as const,
+        assignment: {
+          id: assignmentId,
+          revision: existing ? existing.revision + 1 : 1,
+        },
+      };
+    });
+  } catch (error) {
+    if ((error as { code?: string } | null)?.code === "ER_DUP_ENTRY") {
+      throw new AuthServiceError("CONFLICT", "项目团队已变化，请刷新后重试");
     }
-  });
+    throw error;
+  }
+  if (
+    input.engineerUserId != null &&
+    input.roleType === "monitoring_optimization_engineer"
+  ) {
+    await createProjectMonitoringHandoffIfReady({
+      customerUserId: input.customerUserId,
+      roleType: input.roleType,
+      actorUserId: input.actor.id,
+    });
+  }
+  return result;
+}
+
+export async function createProjectMonitoringHandoffIfReady(input: {
+  customerUserId: number;
+  roleType: DeliveryRoleType;
+  actorUserId: number;
+}) {
+  const db = await requireDb();
   if (input.roleType === "monitoring_optimization_engineer") {
     const snapshotRows = await db
       .select({ id: knowledgeBaseSnapshots.id })
@@ -460,18 +641,15 @@ export async function assignDeliveryCustomer(input: {
     if (snapshotRows[0]) {
       await createKnowledgeMonitoringHandoff({
         userId: input.customerUserId,
-        actorUserId: input.actor.id,
+        actorUserId: input.actorUserId,
       });
     }
   }
-  return { success: true as const };
 }
 
 export async function dispatchDeliveryTicket(input: {
   actor: AuthenticatedUser;
   ticketId: string;
-  roleId: string;
-  memberUserId: number;
   priority: "low" | "normal" | "high" | "urgent";
 }) {
   requireDeliveryManager(input.actor);
@@ -493,17 +671,14 @@ export async function dispatchDeliveryTicket(input: {
         "旧版技术工单仅供只读查看，不能重新进入交付流程",
       );
     }
-    const role = await assertFixedRole(tx, input.roleId, ticket.workflowDomain);
-    await assertActiveRoleMembership({
+    await assertCanManageProject({
       executor: tx,
-      roleId: role.id,
-      memberUserId: input.memberUserId,
+      actor: input.actor,
+      customerUserId: ticket.userId,
     });
     await tx
       .update(deliveryTickets)
       .set({
-        assignedRoleId: role.id,
-        assignedMemberId: input.memberUserId,
         priority: input.priority,
         revision: sql`${deliveryTickets.revision} + 1`,
         updatedByUserId: input.actor.id,
@@ -518,24 +693,9 @@ export async function dispatchDeliveryTicket(input: {
       actorRole: "admin",
       kind: "message",
       visibility: "internal",
-      message: `工单调度：团队 ${role.name}，负责人 #${input.memberUserId}，优先级 ${input.priority}。`,
+      message: `工单优先级已调整为 ${input.priority}。`,
       createdAt: new Date(),
     });
-    if (ticket.operation === "knowledge_reset") {
-      await tx
-        .update(knowledgeBaseResetRequests)
-        .set({
-          assignedRoleId: role.id,
-          assignedMemberId: input.memberUserId,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(knowledgeBaseResetRequests.ticketId, ticket.id),
-            eq(knowledgeBaseResetRequests.status, "pending"),
-          ),
-        );
-    }
     return { success: true as const };
   });
 }
@@ -562,6 +722,11 @@ export async function urgeDeliveryTicket(input: {
     ) {
       throw new AuthServiceError("NOT_FOUND", "可催办工单不存在");
     }
+    await assertCanManageProject({
+      executor: tx,
+      actor: input.actor,
+      customerUserId: ticket.userId,
+    });
     await tx.insert(deliveryTicketEvents).values({
       id: randomUUID(),
       ticketId: ticket.id,
@@ -577,45 +742,91 @@ export async function urgeDeliveryTicket(input: {
   });
 }
 
-export async function listMyDeliveryRoles(actor: AuthenticatedUser) {
+export async function listMyProjectAssignments(actor: AuthenticatedUser) {
   if (actor.role !== "delivery_member") {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "该工作台仅对交付成员开放",
-    );
+    throw new AuthServiceError("INVALID_CREDENTIAL", "该工作台仅对工程师开放");
   }
   const db = await requireDb();
   const rows = await db
     .select({
-      assignmentId: deliveryRoleMembers.id,
-      roleId: deliveryRoles.id,
-      teamName: deliveryRoles.name,
-      roleType: deliveryRoles.roleType,
+      projectAssignmentId: deliveryProjectAssignments.id,
+      customerUserId: deliveryProjectAssignments.customerUserId,
+      customerUsername: users.username,
+      customerName: users.displayName,
+      roleType: deliveryProjectAssignments.roleType,
     })
-    .from(deliveryRoleMembers)
-    .innerJoin(deliveryRoles, eq(deliveryRoleMembers.roleId, deliveryRoles.id))
-    .innerJoin(users, eq(users.id, deliveryRoleMembers.memberUserId))
+    .from(deliveryProjectAssignments)
+    .innerJoin(users, eq(users.id, deliveryProjectAssignments.customerUserId))
     .where(
       and(
-        eq(deliveryRoleMembers.memberUserId, actor.id),
-        eq(deliveryRoleMembers.isActive, true),
-        eq(deliveryRoles.isActive, true),
-        eq(users.role, "delivery_member"),
+        eq(deliveryProjectAssignments.engineerUserId, actor.id),
+        actor.engineerRoleType
+          ? eq(deliveryProjectAssignments.roleType, actor.engineerRoleType)
+          : sql`false`,
+        eq(users.role, "user"),
         eq(users.isActive, true),
       ),
     )
-    .orderBy(deliveryRoles.roleType, deliveryRoles.name);
-  return rows.map((row) => ({
-    ...row,
-    label: DELIVERY_ROLE_LABELS[row.roleType],
-  }));
+    .orderBy(users.displayName, users.username);
+  const [contracts, activeTickets] = rows.length
+    ? await Promise.all([
+        db
+          .select()
+          .from(serviceContracts)
+          .where(
+            inArray(serviceContracts.userId, [
+              ...new Set(rows.map((row) => row.customerUserId)),
+            ]),
+          ),
+        db
+          .select({
+            assignedProjectAssignmentId:
+              deliveryTickets.assignedProjectAssignmentId,
+          })
+          .from(deliveryTickets)
+          .where(
+            and(
+              inArray(
+                deliveryTickets.assignedProjectAssignmentId,
+                rows.map((row) => row.projectAssignmentId),
+              ),
+              inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+            ),
+          ),
+      ])
+    : [[], []];
+  const activeAssignmentIds = new Set(
+    activeTickets
+      .map((ticket) => ticket.assignedProjectAssignmentId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  return rows
+    .filter((row) => {
+      const currentContract = selectPortalContract(
+        contracts.filter(
+          (contract) => contract.userId === row.customerUserId,
+        ) as ServicePortalContractRecord[],
+      );
+      return (
+        requiredRolesForPlan(currentContract?.planCode).includes(
+          row.roleType,
+        ) || activeAssignmentIds.has(row.projectAssignmentId)
+      );
+    })
+    .map((row) => ({
+      ...row,
+      customerName:
+        row.customerName ||
+        row.customerUsername ||
+        `客户 ${row.customerUserId}`,
+      roleLabel: DELIVERY_ROLE_LABELS[row.roleType],
+    }));
 }
 
-export async function assertDeliveryRoleContext(input: {
+export async function assertDeliveryProjectContext(input: {
   actor: AuthenticatedUser;
-  roleAssignmentId: string;
+  projectAssignmentId: string;
   customerUserId?: number;
-  requirePrimaryCustomerAssignment?: boolean;
   expectedRoleType?: DeliveryRoleType;
   executor?: any;
 }) {
@@ -625,21 +836,19 @@ export async function assertDeliveryRoleContext(input: {
   const db = input.executor ?? (await requireDb());
   const rows = await db
     .select({
-      assignmentId: deliveryRoleMembers.id,
-      roleId: deliveryRoles.id,
-      roleType: deliveryRoles.roleType,
-      teamName: deliveryRoles.name,
+      projectAssignmentId: deliveryProjectAssignments.id,
+      customerUserId: deliveryProjectAssignments.customerUserId,
+      roleType: deliveryProjectAssignments.roleType,
+      customerUsername: users.username,
+      customerName: users.displayName,
     })
-    .from(deliveryRoleMembers)
-    .innerJoin(deliveryRoles, eq(deliveryRoleMembers.roleId, deliveryRoles.id))
-    .innerJoin(users, eq(users.id, deliveryRoleMembers.memberUserId))
+    .from(deliveryProjectAssignments)
+    .innerJoin(users, eq(users.id, deliveryProjectAssignments.customerUserId))
     .where(
       and(
-        eq(deliveryRoleMembers.id, input.roleAssignmentId),
-        eq(deliveryRoleMembers.memberUserId, input.actor.id),
-        eq(deliveryRoleMembers.isActive, true),
-        eq(deliveryRoles.isActive, true),
-        eq(users.role, "delivery_member"),
+        eq(deliveryProjectAssignments.id, input.projectAssignmentId),
+        eq(deliveryProjectAssignments.engineerUserId, input.actor.id),
+        eq(users.role, "user"),
         eq(users.isActive, true),
       ),
     )
@@ -647,66 +856,73 @@ export async function assertDeliveryRoleContext(input: {
   const role = rows[0];
   if (
     !role ||
+    role.roleType !== input.actor.engineerRoleType ||
     (input.expectedRoleType && role.roleType !== input.expectedRoleType)
   ) {
-    throw new AuthServiceError("NOT_FOUND", "当前工作角色不存在");
+    throw new AuthServiceError("NOT_FOUND", "当前客户项目岗位不存在");
   }
   if (
     input.customerUserId !== undefined &&
-    input.requirePrimaryCustomerAssignment !== false
+    input.customerUserId !== role.customerUserId
   ) {
-    const assignmentRows = await db
-      .select({ id: deliveryCustomerAssignments.id })
-      .from(deliveryCustomerAssignments)
+    throw new AuthServiceError("NOT_FOUND", "客户未分配给当前工程师");
+  }
+  const contractRows = await db
+    .select()
+    .from(serviceContracts)
+    .where(eq(serviceContracts.userId, role.customerUserId));
+  const currentContract = selectPortalContract(
+    contractRows as ServicePortalContractRecord[],
+  );
+  if (
+    !requiredRolesForPlan(currentContract?.planCode).includes(role.roleType)
+  ) {
+    const activeTicketRows = await db
+      .select({ id: deliveryTickets.id })
+      .from(deliveryTickets)
       .where(
         and(
-          eq(deliveryCustomerAssignments.customerUserId, input.customerUserId),
-          eq(deliveryCustomerAssignments.roleType, role.roleType),
-          eq(deliveryCustomerAssignments.roleId, role.roleId),
-          eq(deliveryCustomerAssignments.primaryMemberId, input.actor.id),
+          eq(
+            deliveryTickets.assignedProjectAssignmentId,
+            role.projectAssignmentId,
+          ),
+          inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
         ),
       )
       .limit(1);
-    if (!assignmentRows[0]) {
-      throw new AuthServiceError("NOT_FOUND", "客户未分配给当前工作角色");
+    if (!activeTicketRows[0]) {
+      throw new AuthServiceError("NOT_FOUND", "当前套餐未启用该工程师岗位");
     }
   }
-  return role;
+  return {
+    ...role,
+    customerName:
+      role.customerName ||
+      role.customerUsername ||
+      `客户 ${role.customerUserId}`,
+  };
 }
 
 export async function getMyDeliveryWorkbench(input: {
   actor: AuthenticatedUser;
-  roleAssignmentId: string;
+  projectAssignmentId: string;
 }) {
-  const role = await assertDeliveryRoleContext(input);
+  const role = await assertDeliveryProjectContext(input);
   const db = await requireDb();
-  const assignments = await db
-    .select()
-    .from(deliveryCustomerAssignments)
-    .where(
-      and(
-        eq(deliveryCustomerAssignments.roleId, role.roleId),
-        eq(deliveryCustomerAssignments.primaryMemberId, input.actor.id),
-        eq(deliveryCustomerAssignments.roleType, role.roleType),
-      ),
-    );
   const tickets = await db
     .select()
     .from(deliveryTickets)
     .where(
       and(
         eq(deliveryTickets.workflowDomain, role.roleType),
-        eq(deliveryTickets.assignedRoleId, role.roleId),
-        eq(deliveryTickets.assignedMemberId, input.actor.id),
+        eq(
+          deliveryTickets.assignedProjectAssignmentId,
+          role.projectAssignmentId,
+        ),
       ),
     )
     .orderBy(desc(deliveryTickets.updatedAt));
-  const customerIds = Array.from(
-    new Set([
-      ...assignments.map((row) => row.customerUserId),
-      ...tickets.map((ticket) => ticket.userId),
-    ]),
-  );
+  const customerIds = [role.customerUserId];
   const [
     customers,
     builds,
@@ -808,15 +1024,22 @@ export async function getMyDeliveryWorkbench(input: {
   }
   const customersWithDetails = customers.map((customer) => {
     let details: string[];
-    if (role.roleType === "knowledge_base_engineer") {
+    if (role.roleType === "ai_operations_engineer") {
       const customerBuilds = builds.filter((row) => row.userId === customer.id);
       const latestBuild = [...customerBuilds].sort(
         (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
       )[0];
+      const profile = profiles.find((row) => row.userId === customer.id);
+      const customerChecks = checks.filter((row) => row.userId === customer.id);
       details = [
         `构建 ${customerBuilds.length}`,
         `展示版本 ${snapshots.filter((row) => row.userId === customer.id).length}`,
         `最新状态 ${latestBuild?.status ?? "未构建"}`,
+        `域名 ${profile?.domain || "未配置"}`,
+        `备案 ${profile?.icpStatus || "未提交"}`,
+        `检查通过 ${
+          customerChecks.filter((row) => row.status === "passed").length
+        }/${customerChecks.length}`,
       ];
     } else if (role.roleType === "monitoring_optimization_engineer") {
       const customerBatches = batches.filter(
@@ -852,24 +1075,14 @@ export async function getMyDeliveryWorkbench(input: {
           ).length
         }`,
       ];
-    } else {
-      const profile = profiles.find((row) => row.userId === customer.id);
-      const customerChecks = checks.filter((row) => row.userId === customer.id);
-      details = [
-        `域名 ${profile?.domain || "未配置"}`,
-        `备案 ${profile?.icpStatus || "未提交"}`,
-        `检查通过 ${
-          customerChecks.filter((row) => row.status === "passed").length
-        }/${customerChecks.length}`,
-      ];
-    }
+    } else details = [];
     return { ...customer, details };
   });
   const dashboardRevisionByUser = new Map(
     dashboards.map((dashboard) => [dashboard.userId, dashboard.revision]),
   );
   return {
-    role,
+    assignment: role,
     customers: customersWithDetails,
     tickets: tickets.map((ticket) => ({
       ...ticket,
@@ -892,7 +1105,7 @@ async function createMonitoringRetestTicket(input: {
   actorUserId: number;
 }) {
   if (!input.sourceTicket.sourceQuestionId) return null;
-  const owner = await getActiveDeliveryCustomerOwner(
+  const owner = await getActiveDeliveryProjectOwner(
     input.executor,
     input.sourceTicket.userId,
     "monitoring_optimization_engineer",
@@ -940,8 +1153,8 @@ async function createMonitoringRetestTicket(input: {
     description: "内容或官网页面已发布，请按原问题完成效果复测。",
     workflowDomain: "monitoring_optimization_engineer",
     operation: "monitoring_retest",
-    assignedRoleId: owner.roleId,
-    assignedMemberId: owner.primaryMemberId,
+    assignedProjectAssignmentId: owner.projectAssignmentId,
+    assignedMemberId: owner.engineerUserId,
     sourceQuestionId: input.sourceTicket.sourceQuestionId,
     monitoringBatchKey: input.sourceTicket.monitoringBatchKey,
     responseLogicRevision: input.sourceTicket.responseLogicRevision,
@@ -998,10 +1211,9 @@ async function createAssignedWorkflowTicket(input: {
   sourceTicket: typeof deliveryTickets.$inferSelect;
   actorUserId: number;
   actorRoleContext: {
-    assignmentId: string;
-    roleId: string;
+    projectAssignmentId: string;
+    customerUserId: number;
     roleType: DeliveryRoleType;
-    teamName: string;
   };
   workflowDomain: DeliveryRoleType;
   operation:
@@ -1022,7 +1234,7 @@ async function createAssignedWorkflowTicket(input: {
   responseLogicRevision?: number | null;
   contentAssetIds?: string[];
 }) {
-  const owner = await getActiveDeliveryCustomerOwner(
+  const owner = await getActiveDeliveryProjectOwner(
     input.executor,
     input.sourceTicket.userId,
     input.workflowDomain,
@@ -1089,8 +1301,8 @@ async function createAssignedWorkflowTicket(input: {
     description: input.description,
     workflowDomain: input.workflowDomain,
     operation: input.operation,
-    assignedRoleId: owner.roleId,
-    assignedMemberId: owner.primaryMemberId,
+    assignedProjectAssignmentId: owner.projectAssignmentId,
+    assignedMemberId: owner.engineerUserId,
     sourceQuestionId,
     monitoringBatchKey:
       input.monitoringBatchKey ?? input.sourceTicket.monitoringBatchKey ?? null,
@@ -1118,13 +1330,12 @@ async function createAssignedWorkflowTicket(input: {
     message: input.description,
     toStatus: "submitted",
     actorContext: {
-      roleAssignmentId: input.actorRoleContext.assignmentId,
-      roleId: input.actorRoleContext.roleId,
+      projectAssignmentId: input.actorRoleContext.projectAssignmentId,
+      customerUserId: input.actorRoleContext.customerUserId,
       roleType: input.actorRoleContext.roleType,
-      teamName: input.actorRoleContext.teamName,
       sourceTicketId: input.sourceTicket.id,
-      assignedRoleId: owner.roleId,
-      assignedMemberId: owner.primaryMemberId,
+      assignedProjectAssignmentId: owner.projectAssignmentId,
+      assignedMemberId: owner.engineerUserId,
     },
     createdAt: now,
   });
@@ -1133,7 +1344,7 @@ async function createAssignedWorkflowTicket(input: {
 
 export async function updateMyDeliveryTicket(input: {
   actor: AuthenticatedUser;
-  roleAssignmentId: string;
+  projectAssignmentId: string;
   ticketId: string;
   expectedRevision: number;
   status:
@@ -1162,16 +1373,15 @@ export async function updateMyDeliveryTicket(input: {
     ) {
       throw new AuthServiceError("NOT_FOUND", "工单不属于当前交付成员");
     }
-    const role = await assertDeliveryRoleContext({
+    const role = await assertDeliveryProjectContext({
       actor: input.actor,
-      roleAssignmentId: input.roleAssignmentId,
+      projectAssignmentId: input.projectAssignmentId,
       customerUserId: ticket.userId,
-      requirePrimaryCustomerAssignment: false,
       expectedRoleType: ticket.workflowDomain,
       executor: tx,
     });
-    if (ticket.assignedRoleId !== role.roleId) {
-      throw new AuthServiceError("NOT_FOUND", "工单不属于当前工作角色");
+    if (ticket.assignedProjectAssignmentId !== role.projectAssignmentId) {
+      throw new AuthServiceError("NOT_FOUND", "工单不属于当前客户项目岗位");
     }
     const operation = deliveryWorkflowOperationSchema.safeParse(
       ticket.operation,
@@ -1238,7 +1448,7 @@ export async function updateMyDeliveryTicket(input: {
     ];
     if (
       input.status === "completed" &&
-      ticket.workflowDomain === "website_operations_engineer" &&
+      ticket.workflowDomain === "ai_operations_engineer" &&
       websiteContentOperations.includes(ticket.operation || "")
     ) {
       if (!contentAssetIds.length) {
@@ -1464,10 +1674,9 @@ export async function updateMyDeliveryTicket(input: {
       fromStatus: ticket.status,
       toStatus: input.status,
       actorContext: {
-        roleAssignmentId: input.roleAssignmentId,
-        roleId: role.roleId,
+        projectAssignmentId: input.projectAssignmentId,
+        customerUserId: role.customerUserId,
         roleType: role.roleType,
-        teamName: role.teamName,
       },
       createdAt: now,
     });
@@ -1478,10 +1687,9 @@ export async function updateMyDeliveryTicket(input: {
       contentAssetIds,
     };
     const actorRoleContext = {
-      assignmentId: input.roleAssignmentId,
-      roleId: role.roleId,
+      projectAssignmentId: input.projectAssignmentId,
+      customerUserId: role.customerUserId,
       roleType: role.roleType,
-      teamName: role.teamName,
     };
     const handoffTicketIds: string[] = [];
     if (input.status === "completed") {
@@ -1565,7 +1773,7 @@ export async function updateMyDeliveryTicket(input: {
               sourceTicket,
               actorUserId: input.actor.id,
               actorRoleContext,
-              workflowDomain: "website_operations_engineer",
+              workflowDomain: "ai_operations_engineer",
               operation: input.handoff.websiteOperation,
               title: "将已确认内容发布到客户官网",
               description:
@@ -1612,7 +1820,7 @@ export async function updateMyDeliveryTicket(input: {
           }),
         );
       } else if (
-        ticket.workflowDomain === "website_operations_engineer" &&
+        ticket.workflowDomain === "ai_operations_engineer" &&
         websiteContentOperations.includes(ticket.operation || "")
       ) {
         handoffTicketIds.push(
@@ -1621,7 +1829,7 @@ export async function updateMyDeliveryTicket(input: {
             sourceTicket,
             actorUserId: input.actor.id,
             actorRoleContext,
-            workflowDomain: "website_operations_engineer",
+            workflowDomain: "ai_operations_engineer",
             operation: "site_check",
             title: "检查已发布官网页面",
             description:
@@ -1658,7 +1866,7 @@ export async function createKnowledgeMonitoringHandoff(input: {
 }) {
   const db = await requireDb();
   return db.transaction(async (tx) => {
-    const owner = await getActiveDeliveryCustomerOwner(
+    const owner = await getActiveDeliveryProjectOwner(
       tx,
       input.userId,
       "monitoring_optimization_engineer",
@@ -1707,8 +1915,8 @@ export async function createKnowledgeMonitoringHandoff(input: {
             : "执行首次问题监控",
         workflowDomain: "monitoring_optimization_engineer",
         operation,
-        assignedRoleId: owner.roleId,
-        assignedMemberId: owner.primaryMemberId,
+        assignedProjectAssignmentId: owner.projectAssignmentId,
+        assignedMemberId: owner.engineerUserId,
         quotaState: "consumed",
         status: "submitted",
         createdByUserId: input.actorUserId,
@@ -1740,6 +1948,12 @@ export async function setDeliveryMemberCredential(input: {
   apiKey: string;
 }) {
   requireDeliveryManager(input.actor);
+  if (input.actor.adminAccessLevel !== "system_admin") {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "只有系统管理员可以维护工程师 API Key",
+    );
+  }
   const db = await requireDb();
   const rows = await db
     .select({ role: users.role })
@@ -1747,9 +1961,25 @@ export async function setDeliveryMemberCredential(input: {
     .where(eq(users.id, input.memberUserId))
     .limit(1);
   if (rows[0]?.role !== "delivery_member") {
-    throw new AuthServiceError("NOT_FOUND", "交付成员不存在");
+    throw new AuthServiceError("NOT_FOUND", "工程师不存在");
   }
-  return replaceApiCredential(input.memberUserId, input.apiKey);
+  const previous = await getApiCredentialStatus(input.memberUserId);
+  const credential = await replaceApiCredential(
+    input.memberUserId,
+    input.apiKey,
+  );
+  await writeWorkspaceAuditEvent({
+    actor: input.actor,
+    action: "delivery.engineer_credential.replaced",
+    targetType: "user",
+    targetId: input.memberUserId,
+    workspaceUserId: null,
+    metadata: {
+      previouslyConfigured: previous.configured,
+      configured: credential.configured,
+    },
+  });
+  return credential;
 }
 
 export async function revokeDeliveryMemberCredential(input: {
@@ -1757,6 +1987,12 @@ export async function revokeDeliveryMemberCredential(input: {
   memberUserId: number;
 }) {
   requireDeliveryManager(input.actor);
+  if (input.actor.adminAccessLevel !== "system_admin") {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "只有系统管理员可以维护工程师 API Key",
+    );
+  }
   const db = await requireDb();
   const rows = await db
     .select({ role: users.role })
@@ -1764,9 +2000,21 @@ export async function revokeDeliveryMemberCredential(input: {
     .where(eq(users.id, input.memberUserId))
     .limit(1);
   if (rows[0]?.role !== "delivery_member") {
-    throw new AuthServiceError("NOT_FOUND", "交付成员不存在");
+    throw new AuthServiceError("NOT_FOUND", "工程师不存在");
   }
+  const previous = await getApiCredentialStatus(input.memberUserId);
   await deleteActiveApiCredential(input.memberUserId);
+  await writeWorkspaceAuditEvent({
+    actor: input.actor,
+    action: "delivery.engineer_credential.revoked",
+    targetType: "user",
+    targetId: input.memberUserId,
+    workspaceUserId: null,
+    metadata: {
+      previouslyConfigured: previous.configured,
+      configured: false,
+    },
+  });
   return { success: true as const };
 }
 

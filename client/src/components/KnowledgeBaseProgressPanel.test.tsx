@@ -110,8 +110,8 @@ describe("KnowledgeBaseProgressPanel", () => {
     expect(confirmed?.querySelector(".lucide-check")).toBeTruthy();
     expect(directPrefilled?.querySelector(".lucide-check")).toBeNull();
     expect(directPrefilled?.querySelector(".lucide-fast-forward")).toBeTruthy();
-    expect(current?.textContent).toContain("当前节点");
-    expect(needsVerification?.textContent).toContain("待核验");
+    expect(current?.textContent).toContain("等待确认");
+    expect(needsVerification?.textContent).toContain("待再次确认");
     expect(pending?.textContent).toContain("待处理");
   });
 

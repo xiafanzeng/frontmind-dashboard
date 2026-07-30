@@ -1,19 +1,16 @@
 import { z } from "zod";
 
 import { deliveryRoleTypeSchema } from "../shared/delivery-roles";
-import { passwordSchema, toTrpcError } from "./auth-router";
+import { toTrpcError } from "./auth-router";
 import {
-  assignDeliveryCustomer,
-  createDeliveryMember,
-  createDeliveryRole,
   dispatchDeliveryTicket,
   getMyDeliveryCredentialStatus,
   getMyDeliveryWorkbench,
   listDeliveryRoleManagement,
-  listMyDeliveryRoles,
+  listMyProjectAssignments,
   setDeliveryMemberCredential,
   revokeDeliveryMemberCredential,
-  setDeliveryRoleMember,
+  setProjectEngineer,
   updateMyDeliveryTicket,
   urgeDeliveryTicket,
 } from "./delivery-role-service";
@@ -22,13 +19,6 @@ import {
   decideKnowledgeReset,
   previewKnowledgeReset,
 } from "./knowledge-base-reset-service";
-
-const usernameSchema = z
-  .string()
-  .trim()
-  .min(3)
-  .max(64)
-  .regex(/^[a-zA-Z0-9._-]+$/);
 
 function serviceCall<T>(callback: () => Promise<T>) {
   return callback().catch((error) => {
@@ -41,58 +31,22 @@ export const deliveryRoleRouter = router({
     overview: adminProcedure.query(({ ctx }) =>
       serviceCall(() => listDeliveryRoleManagement(ctx.user)),
     ),
-    createTeam: adminProcedure
-      .input(
-        z.object({
-          name: z.string().trim().min(2).max(128),
-          roleType: deliveryRoleTypeSchema,
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() => createDeliveryRole({ actor: ctx.user, ...input })),
-      ),
-    createMember: adminProcedure
-      .input(
-        z.object({
-          username: usernameSchema,
-          password: passwordSchema,
-          displayName: z.string().trim().max(128).optional(),
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() => createDeliveryMember({ actor: ctx.user, ...input })),
-      ),
-    setMember: adminProcedure
-      .input(
-        z.object({
-          roleId: z.string().uuid(),
-          memberUserId: z.number().int().positive(),
-          active: z.boolean(),
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() => setDeliveryRoleMember({ actor: ctx.user, ...input })),
-      ),
-    assignCustomer: adminProcedure
+    setProjectEngineer: adminProcedure
       .input(
         z.object({
           customerUserId: z.number().int().positive(),
           roleType: deliveryRoleTypeSchema,
-          roleId: z.string().uuid(),
-          primaryMemberId: z.number().int().positive(),
+          engineerUserId: z.number().int().positive().nullable(),
+          expectedRevision: z.number().int().nonnegative(),
         }),
       )
       .mutation(({ ctx, input }) =>
-        serviceCall(() =>
-          assignDeliveryCustomer({ actor: ctx.user, ...input }),
-        ),
+        serviceCall(() => setProjectEngineer({ actor: ctx.user, ...input })),
       ),
     dispatchTicket: adminProcedure
       .input(
         z.object({
           ticketId: z.string().uuid(),
-          roleId: z.string().uuid(),
-          memberUserId: z.number().int().positive(),
           priority: z.enum(["low", "normal", "high", "urgent"]),
         }),
       )
@@ -111,32 +65,39 @@ export const deliveryRoleRouter = router({
       .mutation(({ ctx, input }) =>
         serviceCall(() => urgeDeliveryTicket({ actor: ctx.user, ...input })),
       ),
-    setMemberApiKey: adminProcedure
+    setEngineerApiKey: adminProcedure
       .input(
         z.object({
-          memberUserId: z.number().int().positive(),
+          engineerUserId: z.number().int().positive(),
           apiKey: z.string().trim().min(8).max(4096),
         }),
       )
       .mutation(({ ctx, input }) =>
         serviceCall(() =>
-          setDeliveryMemberCredential({ actor: ctx.user, ...input }),
+          setDeliveryMemberCredential({
+            actor: ctx.user,
+            memberUserId: input.engineerUserId,
+            apiKey: input.apiKey,
+          }),
         ),
       ),
-    revokeMemberApiKey: adminProcedure
-      .input(z.object({ memberUserId: z.number().int().positive() }))
+    revokeEngineerApiKey: adminProcedure
+      .input(z.object({ engineerUserId: z.number().int().positive() }))
       .mutation(({ ctx, input }) =>
         serviceCall(() =>
-          revokeDeliveryMemberCredential({ actor: ctx.user, ...input }),
+          revokeDeliveryMemberCredential({
+            actor: ctx.user,
+            memberUserId: input.engineerUserId,
+          }),
         ),
       ),
   }),
   mine: router({
-    roles: protectedProcedure.query(({ ctx }) =>
-      serviceCall(() => listMyDeliveryRoles(ctx.user)),
+    assignments: protectedProcedure.query(({ ctx }) =>
+      serviceCall(() => listMyProjectAssignments(ctx.user)),
     ),
     workbench: protectedProcedure
-      .input(z.object({ roleAssignmentId: z.string().uuid() }))
+      .input(z.object({ projectAssignmentId: z.string().uuid() }))
       .query(({ ctx, input }) =>
         serviceCall(() =>
           getMyDeliveryWorkbench({ actor: ctx.user, ...input }),
@@ -148,7 +109,7 @@ export const deliveryRoleRouter = router({
     knowledgeResetPreview: protectedProcedure
       .input(
         z.object({
-          roleAssignmentId: z.string().uuid(),
+          projectAssignmentId: z.string().uuid(),
           requestId: z.string().uuid(),
         }),
       )
@@ -158,7 +119,7 @@ export const deliveryRoleRouter = router({
     decideKnowledgeReset: protectedProcedure
       .input(
         z.object({
-          roleAssignmentId: z.string().uuid(),
+          projectAssignmentId: z.string().uuid(),
           requestId: z.string().uuid(),
           expectedRevision: z.number().int().positive(),
           decision: z.enum(["approve", "reject"]),
@@ -171,7 +132,7 @@ export const deliveryRoleRouter = router({
     updateTicket: protectedProcedure
       .input(
         z.object({
-          roleAssignmentId: z.string().uuid(),
+          projectAssignmentId: z.string().uuid(),
           ticketId: z.string().uuid(),
           expectedRevision: z.number().int().positive(),
           status: z.enum([

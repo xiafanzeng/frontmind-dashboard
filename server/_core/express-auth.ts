@@ -11,11 +11,11 @@ import type { DeliveryRoleType } from "../../shared/delivery-roles";
 export type FrontMindRequest = Request & {
   frontmindUser?: AuthenticatedUser;
   frontmindCredential?: DecryptedCredential;
-  frontmindDeliveryRoleContext?: {
-    assignmentId: string;
-    roleId: string;
+  frontmindDeliveryProjectContext?: {
+    projectAssignmentId: string;
+    customerUserId: number;
     roleType: DeliveryRoleType;
-    teamName: string;
+    customerName: string;
   };
 };
 

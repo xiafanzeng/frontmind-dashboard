@@ -45,6 +45,7 @@ export default function EmbeddedKnowledgeBasePanel({
   page,
   onPageChange,
   mode = "standard",
+  knowledgeEngineerAssigned = true,
 }: {
   preview?: boolean;
   previewData?: {
@@ -54,6 +55,7 @@ export default function EmbeddedKnowledgeBasePanel({
   page: "build" | "display";
   onPageChange: (page: "build" | "display") => void;
   mode?: "standard" | "workspace";
+  knowledgeEngineerAssigned?: boolean;
 }) {
   const previewMode = import.meta.env.DEV && preview && Boolean(previewData);
   const { user } = useAuth();
@@ -158,6 +160,8 @@ export default function EmbeddedKnowledgeBasePanel({
           ) : (
             <ManualKnowledgeUpdateButton
               publishedSnapshotId={knowledgeQuery.data?.snapshot?.id}
+              knowledgeEngineerAssigned={knowledgeEngineerAssigned}
+              unavailableReason={resetQuery.data?.unavailableReason ?? null}
               onUpdated={async () => {
                 await knowledgeQuery.refetch();
                 onPageChange("display");
@@ -169,6 +173,8 @@ export default function EmbeddedKnowledgeBasePanel({
           knowledgeQuery.data?.snapshot?.id && (
             <KnowledgeMaintenanceTicketButton
               snapshotId={knowledgeQuery.data.snapshot.id}
+              enabled={knowledgeEngineerAssigned}
+              unavailableReason={resetQuery.data?.unavailableReason ?? null}
             />
           )}
         {!previewMode && resetQuery.data?.hasKnowledge && (
@@ -283,7 +289,7 @@ function KnowledgeResetButton({
             <DialogTitle>申请重置知识库</DialogTitle>
             <DialogDescription>
               提交后知识库会立即只读锁定。负责该客户的 AI
-              知识库工程师确认后，将清空全部知识库构建、版本、专属对话和附件；其他业务内容不会受影响。
+              运维工程师确认后，将清空全部知识库构建、版本、专属对话和附件；其他业务内容不会受影响。
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-4 py-2">
@@ -339,9 +345,13 @@ function KnowledgeResetButton({
 function ManualKnowledgeUpdateButton({
   onUpdated,
   publishedSnapshotId,
+  knowledgeEngineerAssigned,
+  unavailableReason,
 }: {
   onUpdated: () => Promise<void>;
   publishedSnapshotId?: string;
+  knowledgeEngineerAssigned: boolean;
+  unavailableReason: string | null;
 }) {
   const { activeConversation, updateStatus } = useConversation();
   const [updating, setUpdating] = useState(false);
@@ -422,12 +432,20 @@ function ManualKnowledgeUpdateButton({
   const progress = progressQuery.data?.progress;
   if (progress?.build.status === "published") {
     return publishedSnapshotId ? (
-      <KnowledgeMaintenanceTicketButton snapshotId={publishedSnapshotId} />
+      <KnowledgeMaintenanceTicketButton
+        snapshotId={publishedSnapshotId}
+        enabled={knowledgeEngineerAssigned}
+        unavailableReason={unavailableReason}
+      />
     ) : null;
   }
   if (!progress?.packageAllowed) {
     return publishedSnapshotId ? (
-      <KnowledgeMaintenanceTicketButton snapshotId={publishedSnapshotId} />
+      <KnowledgeMaintenanceTicketButton
+        snapshotId={publishedSnapshotId}
+        enabled={knowledgeEngineerAssigned}
+        unavailableReason={unavailableReason}
+      />
     ) : null;
   }
 
@@ -455,8 +473,12 @@ function ManualKnowledgeUpdateButton({
 
 function KnowledgeMaintenanceTicketButton({
   snapshotId,
+  enabled = true,
+  unavailableReason = null,
 }: {
   snapshotId: string;
+  enabled?: boolean;
+  unavailableReason?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const [description, setDescription] = useState("");
@@ -464,6 +486,7 @@ function KnowledgeMaintenanceTicketButton({
   const createMutation = deliveryTicketApi.create.useMutation();
 
   const submit = async () => {
+    if (!enabled) return;
     const request = description.trim();
     if (!request) {
       toast.warning("请填写需要维护或更新的知识库内容");
@@ -495,14 +518,25 @@ function KnowledgeMaintenanceTicketButton({
 
   return (
     <>
-      <Button
-        className="w-fit shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
-        onClick={() => setOpen(true)}
+      <div className="flex max-w-sm flex-col items-start gap-1.5">
+        <Button
+          className="w-fit shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
+          disabled={!enabled}
+          onClick={() => enabled && setOpen(true)}
+        >
+          <Wrench className="h-4 w-4" />
+          提交维护工单
+        </Button>
+        {!enabled && (
+          <p className="text-xs leading-5 text-amber-700">
+            {unavailableReason || "尚未分配 AI 运维工程师，请联系交付管理员。"}
+          </p>
+        )}
+      </div>
+      <Dialog
+        open={enabled && open}
+        onOpenChange={(nextOpen) => enabled && setOpen(nextOpen)}
       >
-        <Wrench className="h-4 w-4" />
-        提交维护工单
-      </Button>
-      <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>提交知识库维护工单</DialogTitle>
@@ -549,6 +583,7 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
     updateTitle,
   } = useConversation();
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const trpcUtils = trpc.useUtils();
   const latestProgressQuery = trpc.workspace.knowledgeProgress.useQuery(
     undefined,
     {
@@ -608,20 +643,44 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
       retry: false,
     },
   );
+  const [liveProgress, setLiveProgress] =
+    useState<KnowledgeBaseProgressDto | null>(null);
 
   useEffect(() => {
-    const refresh = () => void progressQuery.refetch();
+    if (progressQuery.data?.progress !== undefined) {
+      setLiveProgress(progressQuery.data.progress);
+    }
+  }, [progressQuery.data?.progress]);
+
+  useEffect(() => {
+    const refresh = (event: Event) => {
+      const detail = (event as CustomEvent<KnowledgeBaseProgressDto | null>)
+        .detail;
+      if (
+        detail &&
+        (!conversationId || detail.build.conversationId === conversationId)
+      ) {
+        setLiveProgress(detail);
+        if (conversationId) {
+          trpcUtils.workspace.knowledgeProgress.setData(
+            { conversationId },
+            (current) => (current ? { ...current, progress: detail } : current),
+          );
+        }
+      }
+      void progressQuery.refetch();
+    };
     window.addEventListener("frontmind:knowledge-progress-updated", refresh);
     return () =>
       window.removeEventListener(
         "frontmind:knowledge-progress-updated",
         refresh,
       );
-  }, [progressQuery.refetch]);
+  }, [conversationId, progressQuery.refetch, trpcUtils]);
 
   const progressPanel = (
     <KnowledgeBaseProgressPanel
-      progress={progressQuery.data?.progress}
+      progress={liveProgress ?? progressQuery.data?.progress}
       loading={progressQuery.isLoading}
     />
   );
@@ -648,6 +707,9 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
             hideSidebar
             fixedAgentProfile="frontmind-pro"
             syncKnowledgeBaseSnapshot
+            knowledgeBaseProgress={
+              liveProgress ?? progressQuery.data?.progress ?? null
+            }
           />
         ) : (
           <div className="flex h-full items-center justify-center gap-2 text-sm text-[#716a80]">

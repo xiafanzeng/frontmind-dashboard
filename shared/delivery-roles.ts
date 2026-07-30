@@ -1,18 +1,16 @@
 import { z } from "zod";
 
 export const deliveryRoleTypeSchema = z.enum([
-  "knowledge_base_engineer",
+  "ai_operations_engineer",
   "monitoring_optimization_engineer",
   "content_distribution_engineer",
-  "website_operations_engineer",
 ]);
 export type DeliveryRoleType = z.infer<typeof deliveryRoleTypeSchema>;
 
 export const DELIVERY_ROLE_LABELS: Record<DeliveryRoleType, string> = {
-  knowledge_base_engineer: "AI 知识库工程师",
+  ai_operations_engineer: "AI 运维工程师",
   monitoring_optimization_engineer: "AI 监控与优化工程师",
   content_distribution_engineer: "AI 内容分发工程师",
-  website_operations_engineer: "AI 官网运营工程师",
 };
 
 export const deliveryWorkflowOperationSchema = z.enum([
@@ -44,10 +42,18 @@ const OPERATIONS_BY_ROLE: Record<
   DeliveryRoleType,
   readonly DeliveryWorkflowOperation[]
 > = {
-  knowledge_base_engineer: [
+  ai_operations_engineer: [
     "build_exception",
     "knowledge_maintenance",
     "knowledge_reset",
+    "domain_application",
+    "icp_filing",
+    "company_facts",
+    "product_case_docs",
+    "industry_news",
+    "company_news",
+    "faq_content",
+    "site_check",
   ],
   monitoring_optimization_engineer: [
     "question_catalog",
@@ -60,16 +66,6 @@ const OPERATIONS_BY_ROLE: Record<
     "response_logic",
     "content_asset_publish",
     "channel_distribution",
-  ],
-  website_operations_engineer: [
-    "domain_application",
-    "icp_filing",
-    "company_facts",
-    "product_case_docs",
-    "industry_news",
-    "company_news",
-    "faq_content",
-    "site_check",
   ],
 };
 

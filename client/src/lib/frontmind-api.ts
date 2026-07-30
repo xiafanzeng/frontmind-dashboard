@@ -44,18 +44,19 @@ const DEFAULT_CONFIG = {
 const DEVICE_PREFERENCES_STORAGE_KEY = "frontmind-client-preferences";
 
 export const CREATE_TASK_TIMEOUT_MS = 300_000;
-export const DELIVERY_ROLE_STORAGE_KEY = "frontmind.delivery.roleAssignmentId";
+export const DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY =
+  "frontmind.delivery.projectAssignmentId";
 
-function deliveryRoleHeaders(
+export function deliveryProjectHeaders(
   headers: Record<string, string> = {},
 ): Record<string, string> {
-  const roleAssignmentId = localStorage
-    .getItem(DELIVERY_ROLE_STORAGE_KEY)
+  const projectAssignmentId = sessionStorage
+    .getItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY)
     ?.trim();
   return {
     ...headers,
-    ...(roleAssignmentId
-      ? { "x-delivery-role-assignment-id": roleAssignmentId }
+    ...(projectAssignmentId
+      ? { "x-delivery-project-assignment-id": projectAssignmentId }
       : {}),
   };
 }
@@ -112,7 +113,7 @@ export function sanitizeBrandText(text: string): string {
     const source = ["ma", "nus"].join("");
     return text
       .replace(
-        /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN)\b[\s\S]*?-->/gi,
+        /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
         "",
       )
       .replace(
@@ -278,7 +279,7 @@ async function apiRequest(
 ): Promise<Response> {
   const url = `/api/frontmind${endpoint}`;
 
-  const headers = deliveryRoleHeaders({
+  const headers = deliveryProjectHeaders({
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string>),
   });
@@ -549,7 +550,6 @@ export async function createResponseLogicTask(
         task_title: data.task_title || data.metadata?.task_title,
       },
       output: data.output || [],
-      knowledgeInteraction: payload?.interaction,
     };
   } finally {
     window.clearTimeout(timeoutId);
@@ -596,6 +596,13 @@ export async function createKnowledgeBaseTurnTask(
     const data = payload?.task || payload;
     const taskId = data?.id || data?.task_id;
     if (!taskId) throw new Error("任务创建失败：未返回任务 ID");
+    if (payload?.progress) {
+      window.dispatchEvent(
+        new CustomEvent("frontmind:knowledge-progress-updated", {
+          detail: payload.progress,
+        }),
+      );
+    }
     return {
       ...data,
       id: taskId,
@@ -606,6 +613,7 @@ export async function createKnowledgeBaseTurnTask(
         task_title: data.title || data.task_title || data.metadata?.task_title,
       },
       output: data.output || [],
+      knowledgeInteraction: payload?.interaction,
     };
   } finally {
     window.clearTimeout(timeoutId);
@@ -838,6 +846,15 @@ async function uploadFileToUrlViaProxy(
       "X-Original-Content-Type",
       file.type || "application/octet-stream",
     );
+    const projectAssignmentId = sessionStorage
+      .getItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY)
+      ?.trim();
+    if (projectAssignmentId) {
+      xhr.setRequestHeader(
+        "x-delivery-project-assignment-id",
+        projectAssignmentId,
+      );
+    }
 
     if (onProgress) {
       xhr.upload.addEventListener("progress", (event) => {
@@ -1006,7 +1023,7 @@ export async function fetchCreditUsage(
     }
 
     const response = await fetch("/api/frontmind/account-credit-usage", {
-      headers: deliveryRoleHeaders({ "Content-Type": "application/json" }),
+      headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
       credentials: "include",
     });
     if (!response.ok) {
@@ -1051,7 +1068,7 @@ export async function testConnection(): Promise<{
   try {
     const url = `/api/frontmind/credential-check`;
     const response = await fetch(url, {
-      headers: deliveryRoleHeaders({ "Content-Type": "application/json" }),
+      headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
       credentials: "include",
     });
 

@@ -8,7 +8,17 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { parse as parseCookieHeader } from "cookie";
-import { and, asc, desc, eq, gt, inArray, isNull, ne } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNotNull,
+  isNull,
+  ne,
+} from "drizzle-orm";
 import type { Request } from "express";
 import { COOKIE_NAME } from "../shared/const";
 import {
@@ -19,6 +29,8 @@ import {
   apiCredentials,
   apiKeyOwnership,
   conversations,
+  deliveryProjectAssignments,
+  deliveryTickets,
   presalesApiCredentials,
   sessions,
   upstreamResources,
@@ -130,6 +142,7 @@ export type AuthenticatedUser = Omit<
   displayName: string | null;
   /** Missing or null values never confer administrator access. */
   adminAccessLevel?: User["adminAccessLevel"];
+  engineerRoleType?: User["engineerRoleType"];
   marketEdition?: User["marketEdition"];
 };
 
@@ -169,6 +182,7 @@ function toAuthenticatedUser(user: User): AuthenticatedUser {
     loginMethod: user.loginMethod,
     role: user.role,
     adminAccessLevel: user.adminAccessLevel,
+    engineerRoleType: user.engineerRoleType,
     marketEdition: user.marketEdition,
     isActive: user.isActive,
     createdAt: user.createdAt,
@@ -497,10 +511,23 @@ export async function changeOwnPassword(
   await revokeAllUserSessions(userId, currentSessionToken);
 }
 
-export async function listManagedUsers(): Promise<AuthenticatedUser[]> {
+export async function listManagedUsers(): Promise<
+  Array<AuthenticatedUser & { engineerApiKeyConfigured: boolean }>
+> {
   const db = await requireDb();
-  const rows = await db.select().from(users).orderBy(desc(users.createdAt));
-  return rows.map(toAuthenticatedUser);
+  const [rows, credentialRows] = await Promise.all([
+    db.select().from(users).orderBy(desc(users.createdAt)),
+    db
+      .select({ userId: apiCredentials.userId })
+      .from(apiCredentials)
+      .where(eq(apiCredentials.status, "active")),
+  ]);
+  const configuredUserIds = new Set(credentialRows.map((row) => row.userId));
+  return rows.map((row) => ({
+    ...toAuthenticatedUser(row),
+    engineerApiKeyConfigured:
+      row.role === "delivery_member" && configuredUserIds.has(row.id),
+  }));
 }
 
 export async function getManagedUser(userId: number) {
@@ -520,6 +547,7 @@ export async function createManagedUser(
     displayName?: string | null;
     role: "user" | "admin" | "delivery_member";
     adminAccessLevel?: "system_admin" | "delivery_admin";
+    engineerRoleType?: User["engineerRoleType"];
     marketEdition?: "domestic" | "overseas";
   },
   executor?: any,
@@ -532,6 +560,7 @@ export async function createManagedUser(
       displayName: input.displayName,
       role: input.role,
       adminAccessLevel: input.adminAccessLevel,
+      engineerRoleType: input.engineerRoleType,
       marketEdition: input.marketEdition,
     },
     executor,
@@ -550,6 +579,7 @@ export async function createManagedUserWithPasswordHash(
     displayName?: string | null;
     role: "user" | "admin" | "delivery_member";
     adminAccessLevel?: "system_admin" | "delivery_admin";
+    engineerRoleType?: User["engineerRoleType"];
     marketEdition?: "domestic" | "overseas";
     now?: Date;
   },
@@ -562,6 +592,15 @@ export async function createManagedUserWithPasswordHash(
     );
   }
   const db = executor ?? (await requireDb());
+  if (input.role === "delivery_member" && !input.engineerRoleType) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "创建工程师账号时必须选择工程师岗位",
+    );
+  }
+  if (input.role !== "delivery_member" && input.engineerRoleType) {
+    throw new AuthServiceError("CONFLICT", "只有工程师账号可以设置工程师岗位");
+  }
   const username = normalizeUsername(input.username);
   const existing = await db
     .select({ id: users.id })
@@ -585,6 +624,8 @@ export async function createManagedUserWithPasswordHash(
         input.role === "admin"
           ? (input.adminAccessLevel ?? "delivery_admin")
           : null,
+      engineerRoleType:
+        input.role === "delivery_member" ? input.engineerRoleType : null,
       marketEdition:
         input.role === "user"
           ? (input.marketEdition ?? "domestic")
@@ -882,6 +923,38 @@ export async function setManagedUserActive(userId: number, isActive: boolean) {
         );
       }
     }
+    if (!isActive && user.isActive && user.role === "delivery_member") {
+      const [assignmentRows, ticketRows] = await Promise.all([
+        tx
+          .select({ id: deliveryProjectAssignments.id })
+          .from(deliveryProjectAssignments)
+          .where(eq(deliveryProjectAssignments.engineerUserId, userId))
+          .limit(1)
+          .for("update"),
+        tx
+          .select({ id: deliveryTickets.id })
+          .from(deliveryTickets)
+          .where(
+            and(
+              eq(deliveryTickets.assignedMemberId, userId),
+              inArray(deliveryTickets.status, [
+                "submitted",
+                "needs_information",
+                "scheduled",
+                "in_progress",
+              ]),
+            ),
+          )
+          .limit(1)
+          .for("update"),
+      ]);
+      if (assignmentRows[0] || ticketRows[0]) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "该工程师仍负责客户项目或未结束工单，请先完成转交",
+        );
+      }
+    }
 
     await tx.update(users).set({ isActive }).where(eq(users.id, userId));
     if (!isActive) {
@@ -942,6 +1015,82 @@ export async function deleteManagedUser(
     if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
     if (isProtectedBuiltinAdminUsername(user.username)) {
       throw new AuthServiceError("CONFLICT", "内置 admin 系统管理员不能被删除");
+    }
+    if (user.role === "delivery_member") {
+      const [
+        assignmentRows,
+        ticketRows,
+        projectResourceRows,
+        projectConversationRows,
+      ] = await Promise.all([
+        tx
+          .select({ id: deliveryProjectAssignments.id })
+          .from(deliveryProjectAssignments)
+          .where(eq(deliveryProjectAssignments.engineerUserId, targetUserId))
+          .limit(1)
+          .for("update"),
+        tx
+          .select({ id: deliveryTickets.id })
+          .from(deliveryTickets)
+          .where(
+            and(
+              eq(deliveryTickets.assignedMemberId, targetUserId),
+              inArray(deliveryTickets.status, [
+                "submitted",
+                "needs_information",
+                "scheduled",
+                "in_progress",
+              ]),
+            ),
+          )
+          .limit(1)
+          .for("update"),
+        tx
+          .select({ id: upstreamResources.id })
+          .from(upstreamResources)
+          .where(
+            and(
+              eq(upstreamResources.userId, targetUserId),
+              isNotNull(upstreamResources.projectAssignmentId),
+            ),
+          )
+          .limit(1)
+          .for("update"),
+        tx
+          .select({ id: conversations.id })
+          .from(conversations)
+          .where(
+            and(
+              eq(conversations.userId, targetUserId),
+              isNotNull(conversations.projectAssignmentId),
+            ),
+          )
+          .limit(1)
+          .for("update"),
+      ]);
+      if (assignmentRows[0] || ticketRows[0]) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "该工程师仍负责客户项目或未结束工单，请先完成转交",
+        );
+      }
+      if (projectResourceRows[0] || projectConversationRows[0]) {
+        const now = new Date();
+        await tx
+          .update(users)
+          .set({ isActive: false, updatedAt: now })
+          .where(eq(users.id, targetUserId));
+        await tx
+          .update(userPasswordSetupTokens)
+          .set({ consumedAt: now, updatedAt: now })
+          .where(
+            and(
+              eq(userPasswordSetupTokens.userId, targetUserId),
+              isNull(userPasswordSetupTokens.consumedAt),
+            ),
+          );
+        return { disposition: "deactivated_for_history" as const };
+      }
     }
 
     if (user.role === "admin") {
@@ -1504,6 +1653,7 @@ export async function getCredentialForUpstreamResource(
   userId: number,
   kind: "task" | "file",
   upstreamId: string,
+  projectAssignmentId?: string,
 ): Promise<(DecryptedCredential & { resource: UpstreamResource }) | null> {
   const db = await requireDb();
   const rows = await db
@@ -1515,7 +1665,12 @@ export async function getCredentialForUpstreamResource(
     )
     .where(
       and(
-        eq(upstreamResources.userId, userId),
+        projectAssignmentId
+          ? eq(upstreamResources.projectAssignmentId, projectAssignmentId)
+          : and(
+              eq(upstreamResources.userId, userId),
+              isNull(upstreamResources.projectAssignmentId),
+            ),
         eq(upstreamResources.kind, kind),
         eq(upstreamResources.upstreamId, upstreamId),
         ne(apiCredentials.status, "deleted"),
@@ -1541,6 +1696,7 @@ export async function getOwnedUpstreamResourceIds(
   userId: number,
   kind: "task" | "file",
   upstreamIds: string[],
+  projectAssignmentId?: string,
 ) {
   const uniqueIds = [...new Set(upstreamIds.filter(Boolean))];
   if (uniqueIds.length === 0) return new Set<string>();
@@ -1550,7 +1706,12 @@ export async function getOwnedUpstreamResourceIds(
     .from(upstreamResources)
     .where(
       and(
-        eq(upstreamResources.userId, userId),
+        projectAssignmentId
+          ? eq(upstreamResources.projectAssignmentId, projectAssignmentId)
+          : and(
+              eq(upstreamResources.userId, userId),
+              isNull(upstreamResources.projectAssignmentId),
+            ),
         eq(upstreamResources.kind, kind),
         inArray(upstreamResources.upstreamId, uniqueIds),
       ),
@@ -1595,8 +1756,10 @@ export async function recordUpstreamResource(input: {
   kind: "task" | "file";
   upstreamId: string;
   conversationId?: string | null;
+  projectAssignmentId?: string | null;
 }): Promise<UpstreamResource> {
   const db = await requireDb();
+  const projectAssignmentId = input.projectAssignmentId ?? null;
   const existing = await db
     .select()
     .from(upstreamResources)
@@ -1608,17 +1771,64 @@ export async function recordUpstreamResource(input: {
     )
     .limit(1);
   if (existing[0]) {
-    if (existing[0].userId !== input.userId) {
+    const ownedByRequestedScope = projectAssignmentId
+      ? existing[0].projectAssignmentId === projectAssignmentId
+      : existing[0].userId === input.userId &&
+        existing[0].projectAssignmentId == null;
+    if (!ownedByRequestedScope) {
       throw new AuthServiceError(
         "CONFLICT",
-        "Upstream resource is already owned by another account",
+        "Upstream resource is already owned by another account or project",
       );
     }
     return existing[0];
   }
 
+  if (projectAssignmentId) {
+    const assignmentRows = await db
+      .select({ id: deliveryProjectAssignments.id })
+      .from(deliveryProjectAssignments)
+      .where(
+        and(
+          eq(deliveryProjectAssignments.id, projectAssignmentId),
+          eq(deliveryProjectAssignments.engineerUserId, input.userId),
+        ),
+      )
+      .limit(1);
+    if (!assignmentRows[0]) {
+      throw new AuthServiceError(
+        "NOT_FOUND",
+        "Customer project assignment not found",
+      );
+    }
+  }
+
+  const credentialMayServeCurrentEngineer = await credentialMayServeAccount(
+    db,
+    input.userId,
+    input.apiCredentialId,
+  );
+  const credentialAlreadyBoundToProject =
+    projectAssignmentId && !credentialMayServeCurrentEngineer
+      ? await db
+          .select({ id: upstreamResources.id })
+          .from(upstreamResources)
+          .innerJoin(
+            apiCredentials,
+            eq(upstreamResources.apiCredentialId, apiCredentials.id),
+          )
+          .where(
+            and(
+              eq(upstreamResources.projectAssignmentId, projectAssignmentId),
+              eq(upstreamResources.apiCredentialId, input.apiCredentialId),
+              ne(apiCredentials.status, "deleted"),
+            ),
+          )
+          .limit(1)
+      : [];
   if (
-    !(await credentialMayServeAccount(db, input.userId, input.apiCredentialId))
+    !credentialMayServeCurrentEngineer &&
+    !credentialAlreadyBoundToProject[0]
   ) {
     throw new AuthServiceError("NOT_FOUND", "API credential not found");
   }
@@ -1630,7 +1840,12 @@ export async function recordUpstreamResource(input: {
       .where(
         and(
           eq(conversations.id, input.conversationId),
-          eq(conversations.userId, input.userId),
+          projectAssignmentId
+            ? eq(conversations.projectAssignmentId, projectAssignmentId)
+            : and(
+                eq(conversations.userId, input.userId),
+                isNull(conversations.projectAssignmentId),
+              ),
         ),
       )
       .limit(1);
@@ -1643,6 +1858,7 @@ export async function recordUpstreamResource(input: {
     id: randomUUID(),
     userId: input.userId,
     apiCredentialId: input.apiCredentialId,
+    projectAssignmentId,
     kind: input.kind,
     upstreamId: input.upstreamId,
     conversationId: input.conversationId ?? null,
@@ -1662,14 +1878,19 @@ export async function recordUpstreamResource(input: {
         and(
           eq(upstreamResources.kind, input.kind),
           eq(upstreamResources.upstreamId, input.upstreamId),
-          eq(upstreamResources.userId, input.userId),
+          projectAssignmentId
+            ? eq(upstreamResources.projectAssignmentId, projectAssignmentId)
+            : and(
+                eq(upstreamResources.userId, input.userId),
+                isNull(upstreamResources.projectAssignmentId),
+              ),
         ),
       )
       .limit(1);
     if (raced[0]) return raced[0];
     throw new AuthServiceError(
       "CONFLICT",
-      "Upstream resource is already owned by another account",
+      "Upstream resource is already owned by another account or project",
     );
   }
 }

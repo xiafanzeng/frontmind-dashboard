@@ -50,6 +50,11 @@ export const users = mysqlTable(
       "system_admin",
       "delivery_admin",
     ]),
+    engineerRoleType: mysqlEnum("engineerRoleType", [
+      "ai_operations_engineer",
+      "monitoring_optimization_engineer",
+      "content_distribution_engineer",
+    ]),
     marketEdition: mysqlEnum("marketEdition", ["domestic", "overseas"])
       .default("domestic")
       .notNull(),
@@ -59,7 +64,17 @@ export const users = mysqlTable(
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
     lastSignedIn: timestamp("lastSignedIn"),
   },
-  (table) => [index("users_active_role_idx").on(table.isActive, table.role)],
+  (table) => [
+    index("users_active_role_idx").on(table.isActive, table.role),
+    check(
+      "users_engineer_role_consistency_ck",
+      sql`(
+        (${table.role} = 'delivery_member' AND ${table.engineerRoleType} IS NOT NULL)
+        OR
+        (${table.role} <> 'delivery_member' AND ${table.engineerRoleType} IS NULL)
+      )`,
+    ),
+  ],
 );
 
 /** Only a SHA-256 hash of the opaque browser token is persisted. */
@@ -963,16 +978,14 @@ export const deliveryTickets = mysqlTable(
     targetPage: text("targetPage"),
     knowledgeSnapshotId: varchar("knowledgeSnapshotId", { length: 36 }),
     workflowDomain: mysqlEnum("workflowDomain", [
-      "knowledge_base_engineer",
+      "ai_operations_engineer",
       "monitoring_optimization_engineer",
       "content_distribution_engineer",
-      "website_operations_engineer",
     ]),
     operation: varchar("operation", { length: 64 }),
-    assignedRoleId: varchar("assignedRoleId", { length: 36 }).references(
-      () => deliveryRoles.id,
-      { onDelete: "set null" },
-    ),
+    assignedProjectAssignmentId: varchar("assignedProjectAssignmentId", {
+      length: 36,
+    }),
     assignedMemberId: int("assignedMemberId").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -1070,61 +1083,11 @@ export const deliveryTickets = mysqlTable(
       table.assignedMemberId,
       table.status,
     ),
-  ],
-);
-
-/**
- * ICP identity materials never enter an upstream AI/file API. Bytes are
- * encrypted by the application and stored under a dedicated first-party
- * storage root; this table contains only encrypted-blob metadata.
- */
-export const icpSensitiveMaterials = mysqlTable(
-  "icp_sensitive_materials",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    workspaceUserId: int("workspaceUserId")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    ownerUserId: int("ownerUserId")
-      .notNull()
-      .references(() => users.id, { onDelete: "restrict" }),
-    storageKey: varchar("storageKey", { length: 255 }).notNull().unique(),
-    encryptionVersion: int("encryptionVersion", { unsigned: true })
-      .default(1)
-      .notNull(),
-    encryptionIv: varchar("encryptionIv", { length: 32 }).notNull(),
-    encryptionAuthTag: varchar("encryptionAuthTag", { length: 32 }).notNull(),
-    filename: varchar("filename", { length: 512 }).notNull(),
-    mimeType: varchar("mimeType", { length: 255 }),
-    sizeBytes: int("sizeBytes", { unsigned: true }).notNull(),
-    sha256: varchar("sha256", { length: 64 }).notNull(),
-    category: mysqlEnum("category", [
-      "business_license",
-      "subject_responsible_person_id",
-      "website_responsible_person_id",
-      "authorization_letter",
-      "pre_approval_or_industry_qualification",
-      "enterprise_name_change_proof",
-      "other_provincial_material",
-    ]).notNull(),
-    status: mysqlEnum("status", ["active", "replaced", "withdrawn", "expired"])
-      .default("active")
-      .notNull(),
-    replacedByMaterialId: varchar("replacedByMaterialId", { length: 36 }),
-    retentionUntil: timestamp("retentionUntil").notNull(),
-    withdrawnAt: timestamp("withdrawnAt"),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-  },
-  (table) => [
-    index("icp_sensitive_materials_workspace_status_idx").on(
-      table.workspaceUserId,
-      table.status,
-    ),
-    index("icp_sensitive_materials_retention_idx").on(
-      table.status,
-      table.retentionUntil,
-    ),
+    foreignKey({
+      name: "delivery_tickets_project_assignment_fk",
+      columns: [table.assignedProjectAssignmentId],
+      foreignColumns: [deliveryProjectAssignments.id],
+    }).onDelete("set null"),
   ],
 );
 
@@ -1149,16 +1112,16 @@ export const deliveryTicketEvents = mysqlTable(
       "system",
     ]).notNull(),
     actorContext: json("actorContext").$type<{
-      roleAssignmentId: string;
-      roleId: string;
+      projectAssignmentId: string;
+      customerUserId: number;
       roleType:
-        | "knowledge_base_engineer"
+        | "ai_operations_engineer"
         | "monitoring_optimization_engineer"
         | "content_distribution_engineer"
+        | "knowledge_base_engineer"
         | "website_operations_engineer";
-      teamName: string;
       sourceTicketId?: string;
-      assignedRoleId?: string;
+      assignedProjectAssignmentId?: string;
       assignedMemberId?: number;
     }>(),
     kind: mysqlEnum("kind", [
@@ -1239,12 +1202,6 @@ export const deliveryTicketAttachments = mysqlTable(
       .default("input")
       .notNull(),
     upstreamFileId: varchar("upstreamFileId", { length: 255 }),
-    protectedMaterialId: varchar("protectedMaterialId", {
-      length: 36,
-    }).references(() => icpSensitiveMaterials.id, { onDelete: "restrict" }),
-    sensitivity: mysqlEnum("sensitivity", ["standard", "icp_sensitive"])
-      .default("standard")
-      .notNull(),
     filename: varchar("filename", { length: 512 }).notNull(),
     mimeType: varchar("mimeType", { length: 255 }),
     sizeBytes: int("sizeBytes", { unsigned: true }),
@@ -1263,11 +1220,6 @@ export const deliveryTicketAttachments = mysqlTable(
     uniqueIndex("delivery_ticket_attachments_event_file_kind_uq").on(
       table.eventId,
       table.upstreamFileId,
-      table.kind,
-    ),
-    uniqueIndex("delivery_ticket_attachments_event_protected_kind_uq").on(
-      table.eventId,
-      table.protectedMaterialId,
       table.kind,
     ),
     index("delivery_ticket_attachments_ticket_created_idx").on(
@@ -1758,81 +1710,22 @@ export const userAdminAssignments = mysqlTable(
   ],
 );
 
-/** Fixed-domain delivery teams. Permissions come from roleType, never JSON. */
-export const deliveryRoles = mysqlTable(
-  "delivery_roles",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    name: varchar("name", { length: 128 }).notNull(),
-    roleType: mysqlEnum("roleType", [
-      "knowledge_base_engineer",
-      "monitoring_optimization_engineer",
-      "content_distribution_engineer",
-      "website_operations_engineer",
-    ]).notNull(),
-    isActive: boolean("isActive").default(true).notNull(),
-    createdByUserId: int("createdByUserId").references(() => users.id, {
-      onDelete: "set null",
-    }),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-  },
-  (table) => [
-    uniqueIndex("delivery_roles_type_name_uq").on(table.roleType, table.name),
-    index("delivery_roles_type_active_idx").on(table.roleType, table.isActive),
-  ],
-);
-
-/** A delivery-member account may hold several separate fixed-domain roles. */
-export const deliveryRoleMembers = mysqlTable(
-  "delivery_role_members",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    roleId: varchar("roleId", { length: 36 })
-      .notNull()
-      .references(() => deliveryRoles.id, { onDelete: "cascade" }),
-    memberUserId: int("memberUserId")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    isActive: boolean("isActive").default(true).notNull(),
-    assignedByUserId: int("assignedByUserId").references(() => users.id, {
-      onDelete: "set null",
-    }),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-  },
-  (table) => [
-    uniqueIndex("delivery_role_members_role_member_uq").on(
-      table.roleId,
-      table.memberUserId,
-    ),
-    index("delivery_role_members_member_active_idx").on(
-      table.memberUserId,
-      table.isActive,
-    ),
-  ],
-);
-
-/** Exactly one active primary delivery owner per customer and role domain. */
-export const deliveryCustomerAssignments = mysqlTable(
-  "delivery_customer_assignments",
+/** Exactly one project engineer per customer workspace and role domain. */
+export const deliveryProjectAssignments = mysqlTable(
+  "delivery_project_assignments",
   {
     id: varchar("id", { length: 36 }).primaryKey(),
     customerUserId: int("customerUserId")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     roleType: mysqlEnum("roleType", [
-      "knowledge_base_engineer",
+      "ai_operations_engineer",
       "monitoring_optimization_engineer",
       "content_distribution_engineer",
-      "website_operations_engineer",
     ]).notNull(),
-    roleId: varchar("roleId", { length: 36 })
-      .notNull()
-      .references(() => deliveryRoles.id, { onDelete: "restrict" }),
-    primaryMemberId: int("primaryMemberId")
-      .notNull()
-      .references(() => users.id, { onDelete: "restrict" }),
+    engineerUserId: int("engineerUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
     revision: int("revision", { unsigned: true }).default(1).notNull(),
     assignedByUserId: int("assignedByUserId").references(() => users.id, {
       onDelete: "set null",
@@ -1841,12 +1734,12 @@ export const deliveryCustomerAssignments = mysqlTable(
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [
-    uniqueIndex("delivery_customer_assignments_customer_type_uq").on(
+    uniqueIndex("delivery_project_assignments_customer_type_uq").on(
       table.customerUserId,
       table.roleType,
     ),
-    index("delivery_customer_assignments_member_type_idx").on(
-      table.primaryMemberId,
+    index("delivery_project_assignments_engineer_type_idx").on(
+      table.engineerUserId,
       table.roleType,
     ),
   ],
@@ -2412,12 +2305,12 @@ export const knowledgeBaseResetRequests = mysqlTable(
     userId: int("userId")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    assignedRoleId: varchar("assignedRoleId", { length: 36 })
-      .notNull()
-      .references(() => deliveryRoles.id, { onDelete: "restrict" }),
-    assignedMemberId: int("assignedMemberId")
-      .notNull()
-      .references(() => users.id, { onDelete: "restrict" }),
+    assignedProjectAssignmentId: varchar("assignedProjectAssignmentId", {
+      length: 36,
+    }),
+    assignedMemberId: int("assignedMemberId").references(() => users.id, {
+      onDelete: "set null",
+    }),
     activeKey: varchar("activeKey", { length: 191 }),
     reasonCode: mysqlEnum("reasonCode", [
       "stuck",
@@ -2458,6 +2351,11 @@ export const knowledgeBaseResetRequests = mysqlTable(
       table.assignedMemberId,
       table.status,
     ),
+    foreignKey({
+      name: "kb_reset_project_assignment_fk",
+      columns: [table.assignedProjectAssignmentId],
+      foreignColumns: [deliveryProjectAssignments.id],
+    }).onDelete("set null"),
   ],
 );
 
@@ -2605,6 +2503,7 @@ export const conversations = mysqlTable(
       () => apiCredentials.id,
       { onDelete: "set null" },
     ),
+    projectAssignmentId: varchar("projectAssignmentId", { length: 36 }),
     title: varchar("title", { length: 255 }).notNull(),
     status: mysqlEnum("status", [
       "idle",
@@ -2636,7 +2535,17 @@ export const conversations = mysqlTable(
   (table) => [
     index("conversations_user_updated_idx").on(table.userId, table.updatedAt),
     index("conversations_user_status_idx").on(table.userId, table.status),
+    index("conversations_user_project_updated_idx").on(
+      table.userId,
+      table.projectAssignmentId,
+      table.updatedAt,
+    ),
     index("conversations_upstream_task_idx").on(table.upstreamTaskId),
+    foreignKey({
+      name: "conversations_project_assignment_fk",
+      columns: [table.projectAssignmentId],
+      foreignColumns: [deliveryProjectAssignments.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -2773,6 +2682,7 @@ export const upstreamResources = mysqlTable(
     apiCredentialId: varchar("apiCredentialId", { length: 36 })
       .notNull()
       .references(() => apiCredentials.id, { onDelete: "restrict" }),
+    projectAssignmentId: varchar("projectAssignmentId", { length: 36 }),
     kind: mysqlEnum("kind", ["task", "file"]).notNull(),
     upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
     conversationId: varchar("conversationId", { length: 191 }).references(
@@ -2791,6 +2701,15 @@ export const upstreamResources = mysqlTable(
       table.kind,
       table.upstreamId,
     ),
+    index("upstream_resources_user_project_idx").on(
+      table.userId,
+      table.projectAssignmentId,
+    ),
+    foreignKey({
+      name: "upstream_resources_project_assignment_fk",
+      columns: [table.projectAssignmentId],
+      foreignColumns: [deliveryProjectAssignments.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -2844,9 +2763,6 @@ export type DeliveryTicketAttachment =
   typeof deliveryTicketAttachments.$inferSelect;
 export type InsertDeliveryTicketAttachment =
   typeof deliveryTicketAttachments.$inferInsert;
-export type IcpSensitiveMaterial = typeof icpSensitiveMaterials.$inferSelect;
-export type InsertIcpSensitiveMaterial =
-  typeof icpSensitiveMaterials.$inferInsert;
 export type WorkspaceSiteProfile = typeof workspaceSiteProfiles.$inferSelect;
 export type InsertWorkspaceSiteProfile =
   typeof workspaceSiteProfiles.$inferInsert;
@@ -2872,14 +2788,10 @@ export type InsertApiKeyOwnership = typeof apiKeyOwnership.$inferInsert;
 export type UserAdminAssignment = typeof userAdminAssignments.$inferSelect;
 export type InsertUserAdminAssignment =
   typeof userAdminAssignments.$inferInsert;
-export type DeliveryRole = typeof deliveryRoles.$inferSelect;
-export type InsertDeliveryRole = typeof deliveryRoles.$inferInsert;
-export type DeliveryRoleMember = typeof deliveryRoleMembers.$inferSelect;
-export type InsertDeliveryRoleMember = typeof deliveryRoleMembers.$inferInsert;
-export type DeliveryCustomerAssignment =
-  typeof deliveryCustomerAssignments.$inferSelect;
-export type InsertDeliveryCustomerAssignment =
-  typeof deliveryCustomerAssignments.$inferInsert;
+export type DeliveryProjectAssignment =
+  typeof deliveryProjectAssignments.$inferSelect;
+export type InsertDeliveryProjectAssignment =
+  typeof deliveryProjectAssignments.$inferInsert;
 export type UserUsageOwner = typeof userUsageOwners.$inferSelect;
 export type InsertUserUsageOwner = typeof userUsageOwners.$inferInsert;
 export type WorkspaceAuditEvent = typeof workspaceAuditEvents.$inferSelect;
