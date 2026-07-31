@@ -131,6 +131,11 @@ const requiredSkillFiles = [
   "private-workflows/response-logic-builder.skill/SKILL.md",
   "private-workflows/response-logic-builder.skill/references/output-contract.md",
 ];
+const requiredRuntimeFiles = [
+  "index.js",
+  "pdf-prepare-worker.js",
+  "verify-presales-file-roundtrip.js",
+];
 const runtimeSkillRoots = [
   "private-workflows/socratic-kb-builder.skill",
   "private-workflows/socratic-kb-builder-v1.skill",
@@ -258,6 +263,20 @@ for (const relativePath of requiredSkillFiles) {
     violations.push({
       file: relativePath,
       label: "missing runtime Skill artifact",
+    });
+  }
+}
+
+for (const relativePath of requiredRuntimeFiles) {
+  try {
+    const artifact = await stat(join(buildRoot, relativePath));
+    if (!artifact.isFile() || artifact.size === 0) {
+      throw new Error("not a non-empty file");
+    }
+  } catch {
+    violations.push({
+      file: relativePath,
+      label: "missing production runtime file",
     });
   }
 }

@@ -1,5 +1,8 @@
 import { createServer } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Readable } from "node:stream";
 import express from "express";
 import axios from "axios";
@@ -43,6 +46,8 @@ const token = "4UT1aQh7tFzS0I8NDkcM8Gv7r5d9ZLr0shF9xXfPjYg";
 const originalServiceToken = process.env.FRONTMIND_PRESALES_SERVICE_TOKEN;
 const originalMonitorKey = process.env.FRONTMIND_MONITOR_API_KEY;
 const originalPublicUrl = process.env.FRONTMIND_PUBLIC_URL;
+const originalDashboardAssetDir = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+let dashboardAssetDir = "";
 
 async function withServer(run: (baseUrl: string) => Promise<void>) {
   const app = express();
@@ -113,7 +118,11 @@ describe("presales readiness status", () => {
 });
 
 describe("presales create-time upload capability", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    dashboardAssetDir = await mkdtemp(
+      path.join(tmpdir(), "frontmind-presales-files-test-"),
+    );
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR = dashboardAssetDir;
     process.env.FRONTMIND_PRESALES_SERVICE_TOKEN = token;
     vi.mocked(getActivePresalesCredential).mockResolvedValue({
       id: "credential-1",
@@ -144,7 +153,7 @@ describe("presales create-time upload capability", () => {
     vi.mocked(syncPresalesOutputUrlGrants).mockResolvedValue(undefined);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
     vi.mocked(getActivePresalesCredential).mockReset();
     vi.mocked(getPresalesCredentialForResource).mockReset();
@@ -156,6 +165,12 @@ describe("presales create-time upload capability", () => {
     } else {
       process.env.FRONTMIND_PRESALES_SERVICE_TOKEN = originalServiceToken;
     }
+    if (originalDashboardAssetDir === undefined) {
+      delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+    } else {
+      process.env.FRONTMIND_DASHBOARD_ASSET_DIR = originalDashboardAssetDir;
+    }
+    await rm(dashboardAssetDir, { recursive: true, force: true });
   });
 
   it("uploads with the signed URL returned by file creation even when details omit it", async () => {
@@ -215,7 +230,7 @@ describe("presales create-time upload capability", () => {
     );
   });
 
-  it("round-trips Website Broker bytes through the canonical content endpoint without GETting its upload URL", async () => {
+  it("round-trips Website Broker bytes through durable local storage without calling an upstream download endpoint", async () => {
     const bytes = Buffer.from("zip");
     let storedBytes = Buffer.alloc(0);
     const signedUploadUrl =
@@ -269,14 +284,64 @@ describe("presales create-time upload capability", () => {
       expect(downloaded.status).toBe(200);
       expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(bytes);
       expect(downloaded.headers.get("content-disposition")).toContain(
-        "website-final.zip",
+        "final.zip",
       );
     });
 
     expect(storedBytes).toEqual(bytes);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("does not publish a local file when the upstream upload was rejected", async () => {
+    const signedUploadUrl =
+      "https://uploads.example.test/rejected.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=rejected";
+    vi.spyOn(axios, "post").mockResolvedValue({
+      status: 201,
+      data: {
+        id: "file-1",
+        filename: "rejected.zip",
+        upload_url: signedUploadUrl,
+        upload_expires_at: new Date(Date.now() + 180_000).toISOString(),
+      },
+    });
+    vi.spyOn(axios, "put").mockResolvedValue({
+      status: 403,
+      data: { message: "rejected" },
+    });
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
+      status: 404,
+      headers: {},
+      data: Readable.from([]),
+    });
+
+    await withServer(async (baseUrl) => {
+      const broker = new HttpGeoPresalesBroker({
+        baseUrl,
+        serviceToken: token,
+        fetchImpl: (input, init) =>
+          fetch(input, { ...init, signal: undefined }),
+      });
+      const file = await broker.createFile({
+        filename: "rejected.zip",
+        mimeType: "application/zip",
+        sizeBytes: 3,
+      });
+      await expect(
+        broker.uploadFile(
+          file.id,
+          Buffer.from("zip"),
+          "application/zip",
+          file.proxy_upload_ticket,
+        ),
+      ).rejects.toThrow("rejected");
+
+      const downloaded = await fetch(`${baseUrl}/files/file-1/content`, {
+        headers: { "x-frontmind-service-token": token },
+      });
+      expect(downloaded.status).toBe(404);
+    });
+
     expect(get).toHaveBeenCalledOnce();
-    expect(get.mock.calls[0]![0]).toContain("/v1/files/file-1/content");
-    expect(get.mock.calls[0]![0]).not.toBe(signedUploadUrl);
   });
 
   it.each([403, 404, 503])(

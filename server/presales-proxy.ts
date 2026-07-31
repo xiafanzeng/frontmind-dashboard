@@ -1,6 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
-import { Transform } from "node:stream";
 import {
   Router,
   json,
@@ -36,6 +35,13 @@ import {
   presalesMonitorRouter,
 } from "./presales-monitor";
 import { isFrontMindPublicUrlConfigured } from "./public-url";
+import {
+  readStoredPresalesFile,
+  recordPresalesFileDescriptor,
+  removeStoredPresalesFile,
+  stagePresalesFileContent,
+  type StoredPresalesFile,
+} from "./presales-file-store";
 
 const router = Router();
 const SERVICE_TOKEN_HEADER = "x-frontmind-service-token";
@@ -660,6 +666,12 @@ router.post("/files", fileJsonParser, async (req, res) => {
       kind: "file",
       upstreamId: id,
     });
+    await recordPresalesFileDescriptor({
+      fileId: id,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes,
+    });
     const payload = redactUpstreamPayload(response.data, credential.apiKey) as
       | Record<string, unknown>
       | undefined;
@@ -761,38 +773,43 @@ router.put("/files/:fileId/content", async (req, res) => {
             (await fetchFileMetadata(fileId, credential)).upload_url ?? "",
           ),
         );
-    let received = 0;
-    const limiter = new Transform({
-      transform(chunk, _encoding, callback) {
-        received += Buffer.byteLength(chunk);
-        if (received > MAX_PROXY_UPLOAD_BYTES) {
-          callback(new Error("FILE_TOO_LARGE"));
-          return;
-        }
-        callback(null, chunk);
-      },
+    const staged = await stagePresalesFileContent({
+      fileId,
+      stream: req,
+      maxBytes: MAX_PROXY_UPLOAD_BYTES,
     });
-    req.pipe(limiter);
-    const response = await axios.put(target, limiter, {
-      ...safeExternalRequestOptions,
-      // SigV4 authenticates the exact request URL; following a redirect would
-      // invalidate the signature and surface as a misleading storage error.
-      maxRedirects: 0,
-      headers: {
-        "Content-Type":
-          String(req.headers["x-original-content-type"] ?? "") ||
-          req.headers["content-type"] ||
-          "application/octet-stream",
-        ...(contentLength > 0
-          ? { "Content-Length": String(contentLength) }
-          : {}),
-      },
-      timeout: UPSTREAM_TIMEOUT_MS,
-      maxBodyLength: MAX_PROXY_UPLOAD_BYTES,
-      maxContentLength: 1024 * 1024,
-      validateStatus: () => true,
-    });
+    if (staged.sizeBytes === 0) {
+      await staged.discard();
+      return res.status(400).json({
+        error: { code: "FILE_EMPTY", message: "File content is empty" },
+      });
+    }
+    const originalContentType =
+      String(req.headers["x-original-content-type"] ?? "") ||
+      String(req.headers["content-type"] ?? "") ||
+      "application/octet-stream";
+    let response;
+    try {
+      response = await axios.put(target, staged.createReadStream(), {
+        ...safeExternalRequestOptions,
+        // SigV4 authenticates the exact request URL; following a redirect would
+        // invalidate the signature and surface as a misleading storage error.
+        maxRedirects: 0,
+        headers: {
+          "Content-Type": originalContentType,
+          "Content-Length": String(staged.sizeBytes),
+        },
+        timeout: UPSTREAM_TIMEOUT_MS,
+        maxBodyLength: MAX_PROXY_UPLOAD_BYTES,
+        maxContentLength: 1024 * 1024,
+        validateStatus: () => true,
+      });
+    } catch (error) {
+      await staged.discard();
+      throw error;
+    }
     if (response.status < 200 || response.status >= 300) {
+      await staged.discard();
       return res.status(forwardedStatus(response.status)).json({
         error: {
           code: "UPSTREAM_FILE_UPLOAD_FAILED",
@@ -804,6 +821,7 @@ router.put("/files/:fileId/content", async (req, res) => {
         },
       });
     }
+    await staged.commit({ mimeType: originalContentType });
     res.status(200).json(buildProxyUploadSuccess(response.status));
   } catch (error) {
     if (error instanceof Error && error.message === "FILE_TOO_LARGE") {
@@ -834,6 +852,7 @@ router.delete("/files/:fileId", async (req, res) => {
       credential.apiKey,
     );
     if (outcome.ok) {
+      await removeStoredPresalesFile(fileId);
       res.status(outcome.status).end();
       return;
     }
@@ -1043,7 +1062,8 @@ function sendFileContentDownloadFailure(
       | "UPSTREAM_FILE_CONTENT_FAILED"
       | "UPSTREAM_FILE_CONTENT_EMPTY"
       | "UPSTREAM_FILE_CONTENT_TOO_LARGE"
-      | "UPSTREAM_FILE_CONTENT_STREAM_FAILED";
+      | "UPSTREAM_FILE_CONTENT_STREAM_FAILED"
+      | "LOCAL_FILE_CONTENT_FAILED";
   },
 ) {
   console.warn("[Presales Proxy] File content download failed", {
@@ -1070,10 +1090,46 @@ function sendFileContentDownloadFailure(
     });
 }
 
+async function streamStoredPresalesFile(
+  res: Response,
+  fileId: string,
+  stored: StoredPresalesFile,
+) {
+  let streamedBytes = 0;
+  try {
+    res.status(200);
+    res.setHeader("Content-Type", stored.mimeType);
+    res.setHeader("Content-Length", String(stored.sizeBytes));
+    const encoded = encodeURIComponent(stored.filename || fileId);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`,
+    );
+    for await (const value of stored.createReadStream()) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      if (!chunk.length) continue;
+      streamedBytes += chunk.length;
+      if (!res.write(chunk)) await once(res, "drain");
+    }
+    if (streamedBytes !== stored.sizeBytes) throw new Error("SHORT_READ");
+    res.end();
+  } catch {
+    sendFileContentDownloadFailure(res, {
+      fileId,
+      errorCode: "LOCAL_FILE_CONTENT_FAILED",
+    });
+  }
+}
+
 router.get("/files/:fileId/content", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
     const credential = await requireResourceCredential("file", fileId);
+    const stored = await readStoredPresalesFile(fileId);
+    if (stored) {
+      await streamStoredPresalesFile(res, fileId, stored);
+      return;
+    }
     const response = await axios.get(
       `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}/content`,
       {
