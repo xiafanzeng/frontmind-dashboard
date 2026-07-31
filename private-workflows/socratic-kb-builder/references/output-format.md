@@ -135,15 +135,15 @@ Use this exact top-level contract. Extra fields are forbidden:
     "totalFiles": 400,
     "customerVisibleCharacters": 120000,
     "evidenceCharacters": 1800000,
-    "packagedImages": 420
+    "packagedImages": 3
   },
   "imageSelection": {
     "status": "target_met",
-    "discoveredCandidateImages": 612,
-    "inspectedCandidateImages": 612,
-    "eligibleFirstPartyImages": 438,
-    "rejectedCandidateImages": 174,
-    "scannedSourcePages": 826,
+    "discoveredCandidateImages": 4,
+    "inspectedCandidateImages": 4,
+    "eligibleFirstPartyImages": 3,
+    "rejectedCandidateImages": 1,
+    "scannedSourcePages": 3,
     "discoveryMethods": [
       "img",
       "srcset",
@@ -155,10 +155,9 @@ Use this exact top-level contract. Extra fields are forbidden:
       "official_document"
     ],
     "rejectionReasons": [
-      { "reason": "重复字节", "count": 92 },
-      { "reason": "装饰性图标或分辨率不足", "count": 82 }
+      { "reason": "重复字节", "count": 1 }
     ],
-    "stopReason": "已完成全部优先官方栏目和上传资料的图片发现",
+    "stopReason": "已取得三张互不重复的经典企业图片，停止图片发现",
     "productFamilyCoverage": [
       {
         "familyId": "family-a",
@@ -207,17 +206,13 @@ Document and asset IDs are stable and unique. Every `assetIds` and
 
 ## Conversational presentation assets
 
-The final archive relationship is not enough for an interactive confirmation
-turn. Whenever a leaf is presented, return up to three eligible assets from
-that leaf's `assetIds` as actual response image/file attachments using the
-validated local bytes. Do not return source hotlinks or only write a relative
-Markdown path. The Dashboard must be able to render the attachment before the
-user is allowed to confirm that leaf. When no eligible asset is related to the
-leaf, return no attachment and keep the asset gap in the internal reports.
-The `FRONTMIND_KB_PRESENTATION` envelope must report the same delivery with
-`imageState`, `assetIds` and `imageCount`. Use `attached` for 1–3 real
-attachments, `no_eligible_asset` for a presented leaf with none, and
-`not_applicable` only when `leafId` is null after completion.
+Associate the archive's maximum three classic assets only with the manifest's
+first leaf. Return their validated local bytes as actual response image/file
+attachments on the initial first-leaf turn. Do not return source hotlinks or
+only write a relative Markdown path. Every later turn is text-only. Each
+non-null `FRONTMIND_KB_PRESENTATION` envelope therefore uses
+`imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`;
+`not_applicable` is reserved for `leafId: null` after completion.
 
 For schema version 2, compute `requiredFormalCharacters` exactly:
 
@@ -245,14 +240,15 @@ their branches. At least one family is required. If one leaf in a branch has
 `productFamilyId`, every leaf in that branch must declare it. The distinct leaf
 family IDs and `productFamilyCoverage` IDs must match exactly.
 
-List every discovered candidate with URL, source page, actual method and
+List every inspected candidate with URL, source page, actual method and
 `eligible`, `rejected`, or `uninspected` status. Use `target_met` only when all
-candidates were inspected, brand imagery is packaged and required
-product-family coverage is complete. Use `source_limited` after inspecting
+candidates were inspected and the three classic image roles are filled. Use
+`source_limited` after inspecting
 every candidate when a concrete coverage gap remains, or `budget_limited` when
 real candidates remain uninspected. Both limited statuses require a non-empty
-`shortfallReason` and `stopReason`. Package every eligible useful image up to
-the 480-image ceiling. Never reduce a counter to make a shortfall pass.
+`shortfallReason` and `stopReason`. Stop image discovery immediately after
+three distinct eligible classic assets. Never reduce a counter to make a
+shortfall pass.
 
 The manifest counts must match the actual ZIP:
 
@@ -260,7 +256,7 @@ The manifest counts must match the actual ZIP:
 - `customerVisibleCharacters`: validator-counted formal characters.
 - `evidenceCharacters`: retained deduplicated evidence characters, maximum
   3,000,000.
-- `packagedImages`: unique validated first-party image files, maximum 480.
+- `packagedImages`: unique validated first-party image files, maximum 3.
 
 Keep all existing `00_completeness.json` fields, evidence statuses, and
 completeness calculations unchanged. Do not derive completeness from resource
@@ -274,7 +270,7 @@ use or target attainment.
   files, and set width and height from the decoded image rather than trusting
   metadata supplied by the task.
 - Deduplicate by content hash.
-- Keep total packaged image bytes at or below 160 MiB.
+- Keep total packaged image bytes at or below 30 MiB.
 - Rasterize useful SVG to PNG/WebP; raw SVG does not count as an asset.
 - Ownership must be exactly `first_party`.
 - Every asset must belong to a branch and at least one customer-visible
@@ -283,8 +279,9 @@ use or target attainment.
   least 1200×600, `badge` images at least 256×256, and other `inline` images at
   least 800×450. Product-family coverage uses only `product_ui`,
   `product_diagram`, or `case_photo`.
-- `imageSelection.scannedSourcePages` must equal successfully parsed official
-  pages.
+- `imageSelection.scannedSourcePages` must not exceed successfully parsed
+  official pages; only pages actually inspected for the three classic assets
+  count here.
 
 ## Required reports
 

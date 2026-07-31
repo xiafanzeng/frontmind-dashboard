@@ -22,7 +22,7 @@ real first-party images and one-leaf-at-a-time confirmation.
 Hard ceilings: 1,200 official HTML attempts, 1,800 visited links, 120 useful
 official documents, 100 cumulative uploads, 120 public queries, 3,000,000
 retained evidence characters, 180,000 customer-visible characters, 8–115
-leaves, 1,500 ZIP files, 480 images and 160 MiB of image bytes. Stop duplicate
+leaves, 1,500 ZIP files, 3 images and 30 MiB of image bytes. Stop duplicate
 SKUs, pagination, translated copies and low-value news before they displace
 uncovered business dimensions.
 
@@ -111,18 +111,20 @@ that carry the legacy evidence-proportional value remain readable.
 
 ## Image discovery, quality and coverage
 
-Scan images on every successfully parsed official HTML page. Inspect `img`,
-`srcset`, lazy attributes, `picture`, CSS backgrounds, Open Graph, galleries and
-official documents. `imageSelection.scannedSourcePages` must equal
-`00_completeness.json.acquisition.officialPages.completed`.
+Acquire at most three distinct classic enterprise images for the entire build.
+Inspect only the minimum first-party pages or uploads needed to fill these
+ordered slots, and stop all image discovery as soon as three eligible assets
+have been validated:
 
-Prioritize coverage, not count:
+1. the primary logo or brand identity asset;
+2. one official brand hero or representative enterprise visual;
+3. one representative product UI, product diagram, architecture figure or
+   typical official product image.
 
-- inspect homepage/about/brand pages for a logo or brand hero;
-- give every core product/service family a product UI, product diagram or case
-  photo when eligible official imagery exists;
-- add useful case, capability, team and environment imagery;
-- never pad the package with repeated badges, icons or decorative assets.
+If an eligible slot does not exist, package fewer than three images. Never fill
+a slot with a duplicate crop, alternate encoding, translated copy, badge, icon,
+decorative background or unrelated stock image. Deduplicate by decoded content
+and visual identity, not URL or filename alone.
 
 Only package validated first-party AVIF, WebP, PNG, JPEG or GIF bytes. Rasterize
 useful SVGs, deduplicate decoded content, and never upscale a small raster to
@@ -147,39 +149,36 @@ Minimum dimensions:
 - a `brand_identity` or `certificate_badge` badge: 256×256;
 - every other inline photo, UI, diagram or figure: 800×450.
 
-Record every discovered candidate with a public source page or packaged
+Record every inspected candidate with a public source page or packaged
 official/user-uploaded document, method and
 `eligible|rejected|uninspected`. Eligible entries link to packaged assets;
 rejected entries include a concrete reason. Also maintain arithmetically
-consistent aggregate counts and rejection reasons. There is no minimum image
-count. Reject sprites, icon sheets, decorative backgrounds, mostly transparent
-media and logo collages masquerading as product visuals.
+consistent aggregate counts and rejection reasons. Reject sprites, icon sheets,
+decorative backgrounds, mostly transparent media and logo collages
+masquerading as product visuals.
+`imageSelection.scannedSourcePages` is the actual number of pages inspected for
+these three roles and may be lower than the total successfully parsed pages.
 
-### Per-node image delivery
+### First-leaf-only image delivery
 
-Image packaging and conversational image delivery are both required. On every
-turn that presents a leaf:
+Associate all validated classic assets only with the manifest's first leaf
+(normally `1.1 一句话定位`). On the initial turn, return its one to three exact
+validated local image bytes as real response image/file attachments below the
+first-leaf body. Use stable asset IDs, packaged filenames and meaningful alt or
+caption metadata. Never substitute Markdown-only paths, origin/CDN URLs, source
+links or textual placeholders.
 
-- inspect that leaf's `assetIds` and choose at most three genuinely relevant
-  eligible assets;
-- return the exact validated local image bytes as real response image/file
-  attachments in the same turn, so the Dashboard can render them below the
-  leaf body;
-- use the packaged filename and meaningful alt/caption metadata;
-- never substitute a Markdown-only relative path, an origin/CDN URL, a source
-  link, or a textual “配图” placeholder for the actual attachment;
-- do not wait for the final ZIP to expose an already available current-leaf
-  image.
+Every later turn is text-only, including revisions and reopened leaves. Do not
+search for, return, repeat or reattach images after the initial first-leaf
+presentation. Later leaves have empty `assetIds`; their presentation envelope
+uses `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`.
+Response attachments on the first turn are delivery copies of the same bytes
+included in the final ZIP.
 
-If the current leaf has no eligible related asset, return no image rather than
-inventing one. A text-only turn is valid only in that case. Response attachments
-are delivery copies of the same bytes tracked by the stable asset records and
-do not replace their inclusion in the final ZIP.
-
-`target_met` means all candidates were inspected and required brand/product
-coverage was met. `source_limited` requires all candidates inspected plus a
-concrete coverage gap. `budget_limited` requires real uninspected candidates.
-Badges do not satisfy product-family visual coverage.
+`target_met` means all recorded candidates were inspected and the three classic
+asset roles were met. `source_limited` requires all recorded candidates
+inspected plus a concrete missing classic-asset role. `budget_limited` requires
+real uninspected candidates. Badges do not satisfy any classic-asset role.
 
 ## Confirmation state
 
@@ -223,18 +222,17 @@ complete manifest.
 7. Every non-initial turn emits exactly one progress/reopen envelope followed
    by exactly one `FRONTMIND_KB_PRESENTATION` envelope. The presentation
    revision is the post-transition revision and its `leafId` is the leaf
-   actually shown in the body. It also declares `imageState`, `assetIds` and
-   `imageCount`: use `attached` with the exact 1–3 attached stable asset IDs,
-   or `no_eligible_asset` with an empty list and zero. Use `leafId: null`,
-   `imageState: not_applicable`, an empty list and zero after the last leaf is
-   completed.
+   actually shown in the body. Because images are delivered only on the
+   initial first-leaf turn, every non-null later presentation uses
+   `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`. Use
+   `leafId: null`, `imageState: not_applicable`, an empty list and zero after
+   the last leaf is completed.
 8. After 100%, later corrections reopen only the most relevant existing leaf.
 9. The visible body contains only the actual presented leaf (plus first-turn
    tree statistics when required). Do not append sources, unresolved items,
    verification notes, action guidance or a confirmation question.
-10. Every presented leaf also follows **Per-node image delivery**. Returning
-    only image captions or package-relative Markdown when eligible related
-    bytes already exist is a protocol failure.
+10. Only the initial first-leaf presentation follows **First-leaf-only image
+    delivery**. Any later response image attachment is a protocol failure.
 
 Use normal Markdown, not ASCII trees or simulated interfaces.
 

@@ -132,11 +132,9 @@ describe("knowledge-base ChatInput actions", () => {
     );
 
     expect(
-      screen.getByText("正在恢复当前节点正文与图片，内容显示完整后才可确认。"),
+      screen.getByText("正在恢复当前节点内容，显示完整后才可确认。"),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "确认当前内容" }),
-    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
   });
 
   it("shows the authoritative current node and sends strict quick actions", async () => {
@@ -150,6 +148,9 @@ describe("knowledge-base ChatInput actions", () => {
 
     expect(screen.getByText("当前待确认")).toBeInTheDocument();
     expect(screen.getByText(/法定主体与成立时间/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/建议尽量上传与当前部分相关的补充图片/),
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /直接预填/ }),
     ).not.toBeInTheDocument();
@@ -204,10 +205,10 @@ describe("knowledge-base ChatInput actions", () => {
     );
 
     const textarea = screen.getByRole("textbox");
-    fireEvent.change(textarea, { target: { value: "成立日期改为 8 月 30 日" } });
-    expect(
-      screen.getByRole("button", { name: "确认当前内容" }),
-    ).toBeDisabled();
+    fireEvent.change(textarea, {
+      target: { value: "成立日期改为 8 月 30 日" },
+    });
+    expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
 
     fireEvent.change(textarea, { target: { value: "" } });
     const input = container.querySelector('input[type="file"]')!;
@@ -222,9 +223,7 @@ describe("knowledge-base ChatInput actions", () => {
     });
     expect(screen.getByText("企业资料.pdf")).toBeInTheDocument();
     expect(screen.getByText("5 B")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "确认当前内容" }),
-    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
   });
 
   it("intercepts a standalone ambiguous continuation", async () => {

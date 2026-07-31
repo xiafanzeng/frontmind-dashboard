@@ -35,6 +35,7 @@ import {
 import {
   collectAssistantOutputIds,
   projectTaskOutputMessages,
+  type KnowledgeBasePresentationTarget,
 } from "@/lib/task-output-projection";
 import { toast } from "sonner";
 
@@ -79,7 +80,10 @@ async function checkAndUpdateTask(
     }
     const isKnowledgeBaseConversation = Boolean(existingProgress);
 
-    const applyRetrievedOutput = (knowledgeBase: boolean) => {
+    const applyRetrievedOutput = (
+      knowledgeBase: boolean,
+      knowledgeBasePresentation?: KnowledgeBasePresentationTarget,
+    ) => {
       if (!taskData.output || taskData.output.length === 0) return;
       const baselineOutputLength = conv.lastKnownOutputLength || 0;
       const lastUserIndex = conv.messages.reduce(
@@ -99,9 +103,11 @@ async function checkAndUpdateTask(
           responseStartedAt: conv.startedAt || conv.createdAt,
           modelName: [...conv.messages]
             .reverse()
-            .find((message) => message.role === "assistant" && message.modelName)
-            ?.modelName,
+            .find(
+              (message) => message.role === "assistant" && message.modelName,
+            )?.modelName,
           knowledgeBase,
+          knowledgeBasePresentation,
         });
         if (msgs.length > 0) {
           // If completed, attach elapsed time to last message
@@ -129,10 +135,10 @@ async function checkAndUpdateTask(
       });
     };
 
-    // Text visibility is independent from protocol reconciliation. The
-    // conversation remains locked while the authoritative interaction state
-    // is running or queued.
-    applyRetrievedOutput(isKnowledgeBaseConversation);
+    // Ordinary tasks can stream partial text. Knowledge-base tasks must wait
+    // for server reconciliation, otherwise a provider's stale cumulative item
+    // can briefly replace the current node before the new envelope arrives.
+    if (!isKnowledgeBaseConversation) applyRetrievedOutput(false);
 
     let reconciliationError: unknown;
     try {
@@ -141,6 +147,17 @@ async function checkAndUpdateTask(
           conversationId: conv.id,
           taskId: taskData.id,
         });
+        if (
+          interaction.progress &&
+          (interaction.interactionState === "awaiting_input" ||
+            interaction.interactionState === "ready_to_publish" ||
+            interaction.interactionState === "published")
+        ) {
+          applyRetrievedOutput(true, {
+            revision: interaction.progress.build.revision,
+            leafId: interaction.progress.build.currentLeafId,
+          });
+        }
         if (interaction.interactionState === "awaiting_input") {
           updateStatus(conv.id, "awaiting_input", {
             taskId: taskData.id,
@@ -162,8 +179,7 @@ async function checkAndUpdateTask(
           return false;
         }
         if (interaction.interactionState === "failed") {
-          const errorMessage =
-            interaction.lockReason || "知识树状态未通过校验";
+          const errorMessage = interaction.lockReason || "知识树状态未通过校验";
           updateStatus(conv.id, "error", {
             taskId: taskData.id,
             completedAt: Date.now(),
@@ -253,13 +269,8 @@ async function checkAndUpdateTask(
 }
 
 export function useResumePolling() {
-  const {
-    state,
-    hydrated,
-    updateStatus,
-    updateAssistantMessages,
-    addMessage,
-  } = useConversation();
+  const { state, hydrated, updateStatus, updateAssistantMessages, addMessage } =
+    useConversation();
   const resumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resumeStartedAtRef = useRef<number>(0);
   const isResumingRef = useRef(false);

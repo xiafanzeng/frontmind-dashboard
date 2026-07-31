@@ -75,8 +75,10 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
     expect(prompt).toContain("不得输出参考资料、参考来源");
     expect(prompt).toContain("可见正文结束后直接附机器信封");
-    expect(prompt).toContain("以 output_image 或 image MIME 的 output_file");
-    expect(prompt).toContain("不得只写包内相对路径");
+    expect(prompt).toContain("主 Logo、品牌主视觉、典型产品/UI/架构图");
+    expect(prompt).toContain("取得三张后立即停止图片发现");
+    expect(prompt).toContain("后续所有节点、修订与重开轮次一律纯文字");
+    expect(prompt).toContain("imageState=no_eligible_asset");
     expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(10_000);
     expect(prompt).not.toContain("# Skill");
     expect(prompt).not.toContain("current Pro Agent");
@@ -100,7 +102,7 @@ describe("knowledge base execution contract", () => {
       "evidenceDocumentIds",
       "schemaVersion: 3",
       "1,500 ZIP files",
-      "160 MiB",
+      "30 MiB",
       "00_package_manifest.json",
       "dashboard-enterprise-v1",
       "FRONTMIND_FORMAL_CONTENT_START",
@@ -114,7 +116,7 @@ describe("knowledge base execution contract", () => {
       "Never create an interactive",
       "verification_gaps",
       "00_web_intelligence_report.md",
-      "Per-node image delivery",
+      "First-leaf-only image delivery",
       "real response image/file",
     ]) {
       expect(skill).toContain(invariant);

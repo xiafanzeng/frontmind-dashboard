@@ -40,9 +40,6 @@ import {
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
 
-export const KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH =
-  "e84d5200b4bffa2ac6ff95f6a74d3d9a2875fa7b04f766e5df407ae5b833bdf6";
-
 export type KnowledgeBaseUserAction =
   | "initial"
   | "confirm"
@@ -149,16 +146,9 @@ function latestKnowledgeBasePresentationOutput(output: unknown) {
 }
 
 export function assertKnowledgeBaseNodeImageDelivery(input: {
-  skillContentHash: string | null;
   presentation: KnowledgeBasePresentationEnvelope;
   output: unknown;
 }) {
-  if (
-    input.skillContentHash !==
-    KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH
-  ) {
-    return;
-  }
   const { presentation } = input;
   if (
     presentation.imageState === undefined ||
@@ -189,19 +179,6 @@ export function assertKnowledgeBaseNodeImageDelivery(input: {
     return;
   }
 
-  if (presentation.imageState === "attached") {
-    if (
-      presentation.assetIds.length === 0 ||
-      presentation.assetIds.length !== presentation.imageCount ||
-      presentation.imageCount !== actualImageCount
-    ) {
-      throw new KnowledgeBaseBuildError(
-        "PROGRESS_PROTOCOL_INVALID",
-        "当前节点图片附件与资产声明不一致，本轮未推进",
-      );
-    }
-    return;
-  }
   if (
     presentation.imageState !== "no_eligible_asset" ||
     presentation.assetIds.length !== 0 ||
@@ -210,7 +187,19 @@ export function assertKnowledgeBaseNodeImageDelivery(input: {
   ) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
-      "当前节点无可交付图片时必须明确声明 no_eligible_asset",
+      "图片只允许在首轮第一个节点展示；后续节点必须声明 no_eligible_asset 且不得返回图片附件",
+    );
+  }
+}
+
+export function assertKnowledgeBaseInitialImageDelivery(output: unknown) {
+  const imageCount = collectKnowledgeBaseOutputImageKeys(
+    latestKnowledgeBasePresentationOutput(output),
+  ).size;
+  if (imageCount > 3) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "首个知识节点最多只能展示三张互不重复的经典企业图片",
     );
   }
 }
@@ -910,6 +899,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
         // is authoritative for initialization and makes a failed first parse
         // recoverable on the next server-side task check.
         const manifest = parseKnowledgeBaseManifestEnvelope(text);
+        assertKnowledgeBaseInitialImageDelivery(input.output);
         const state = createKnowledgeBaseProgressState(manifest.leaves);
         await tx.insert(knowledgeBaseBuildNodes).values(
           state.leaves.map((leaf, index) => ({
@@ -1002,7 +992,6 @@ export async function reconcileKnowledgeBaseProgress(input: {
             text,
           );
           assertKnowledgeBaseNodeImageDelivery({
-            skillContentHash: build.skillContentHash,
             presentation,
             output: input.output,
           });
@@ -1078,7 +1067,6 @@ export async function reconcileKnowledgeBaseProgress(input: {
           text,
         );
         assertKnowledgeBaseNodeImageDelivery({
-          skillContentHash: build.skillContentHash,
           presentation,
           output: input.output,
         });

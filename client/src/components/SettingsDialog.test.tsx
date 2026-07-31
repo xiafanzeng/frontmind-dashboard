@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({
     id: 2,
     username: "regular-user",
     displayName: "普通用户",
-    role: "user" as "user" | "admin",
+    role: "user" as "user" | "admin" | "delivery_member",
     adminAccessLevel: null as "system_admin" | "delivery_admin" | null,
     isActive: true,
   },
@@ -142,6 +142,27 @@ describe("SettingsDialog", () => {
     expect(screen.getByText(/由系统管理员统一维护/)).toBeInTheDocument();
     expect(screen.queryByText("当前 Key 本月总积分")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("输入新的 API Key")).not.toBeInTheDocument();
+    expect(mocks.fetchCreditUsage).not.toHaveBeenCalled();
+  });
+
+  it("hides Key controls from an engineer", () => {
+    mocks.authUser = {
+      id: 4,
+      username: "engineer",
+      displayName: "交付工程师",
+      role: "delivery_member",
+      adminAccessLevel: null,
+      isActive: true,
+    };
+
+    render(<SettingsDialog open onOpenChange={vi.fn()} />);
+
+    expect(screen.getByText("智能服务设置")).toBeInTheDocument();
+    expect(screen.getByText(/由系统管理员统一维护/)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/API Key/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "测试连接" }),
+    ).not.toBeInTheDocument();
     expect(mocks.fetchCreditUsage).not.toHaveBeenCalled();
   });
 

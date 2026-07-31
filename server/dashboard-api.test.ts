@@ -1,4 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { Readable } from "node:stream";
+import axios from "axios";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildDashboardMonitoringImport,
@@ -16,6 +21,7 @@ import {
   dashboardFromCsv,
   dashboardPayloadWithServiceQuestionCatalog,
   dashboardQuestionCatalogFromService,
+  downloadArchiveBytes,
   importDashboardPayload,
   mergeDashboardModule,
   monitoringPayloadFromTabularSources,
@@ -27,6 +33,10 @@ import {
   responseLogicImportsFromTabularSources,
   validateProgressReportScreenshot,
 } from "./dashboard-api";
+import {
+  recordPresalesFileDescriptor,
+  stagePresalesFileContent,
+} from "./presales-file-store";
 import {
   collectKnowledgeArchiveDescriptors,
   knowledgeArchiveDescriptorHash,
@@ -43,6 +53,10 @@ import {
   DashboardEnterpriseMismatchError,
   DashboardRevisionConflictError,
 } from "./dashboard-service";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("dashboard enterprise identity", () => {
   const nextPayload = createDefaultDashboardPayload("验收企业");
@@ -2021,5 +2035,108 @@ describe("knowledge archive selection", () => {
       fileId: "file-new",
       filename: "revision-2.zip",
     });
+  });
+});
+
+describe("knowledge archive byte download", () => {
+  it("reads a Website formal ZIP from the durable Dashboard copy without requesting its PUT-only upload URL", async () => {
+    const assetRoot = await mkdtemp(
+      path.join(tmpdir(), "frontmind-dashboard-kb-download-"),
+    );
+    const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
+    const fileId = "file-formal-zip-local";
+    const bytes = Buffer.from("durable-website-formal-zip", "utf8");
+    try {
+      await recordPresalesFileDescriptor({
+        fileId,
+        filename: "website-lead-v3.zip",
+        mimeType: "application/zip",
+        sizeBytes: bytes.length,
+      });
+      const staged = await stagePresalesFileContent({
+        fileId,
+        stream: Readable.from([bytes]),
+        maxBytes: 1024,
+      });
+      await staged.commit({});
+      const get = vi.spyOn(axios, "get");
+
+      const downloaded = await downloadArchiveBytes({
+        descriptor: {
+          outputItemId: "output-local",
+          fileId,
+          filename: "descriptor-name.zip",
+          mimeType: "application/zip",
+        },
+        apiKey: "secret-test-key",
+        baseUrl: "https://api.example.test",
+      });
+
+      expect(downloaded).toEqual({
+        buffer: bytes,
+        filename: "website-lead-v3.zip",
+      });
+      expect(get).not.toHaveBeenCalled();
+    } finally {
+      if (previousAssetRoot === undefined) {
+        delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+      } else {
+        process.env.FRONTMIND_DASHBOARD_ASSET_DIR = previousAssetRoot;
+      }
+      await rm(assetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("uses only the authenticated content endpoint when no durable copy exists", async () => {
+    const assetRoot = await mkdtemp(
+      path.join(tmpdir(), "frontmind-dashboard-kb-fallback-"),
+    );
+    const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
+    const bytes = Buffer.from("upstream-output-zip", "utf8");
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: {
+        "content-length": String(bytes.length),
+        "content-disposition":
+          "attachment; filename*=UTF-8''authoritative-output.zip",
+      },
+      data: Readable.from([bytes]),
+    });
+    try {
+      const downloaded = await downloadArchiveBytes({
+        descriptor: {
+          outputItemId: "output-upstream",
+          fileId: "file-output-only",
+          filename: "descriptor-name.zip",
+          mimeType: "application/zip",
+        },
+        apiKey: "secret-test-key",
+        baseUrl: "https://api.example.test",
+      });
+
+      expect(downloaded).toEqual({
+        buffer: bytes,
+        filename: "authoritative-output.zip",
+      });
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(get.mock.calls[0]?.[0]).toBe(
+        "https://api.example.test/v1/files/file-output-only/content",
+      );
+      expect(get.mock.calls[0]?.[1]).toMatchObject({
+        headers: {
+          API_KEY: "secret-test-key",
+          Authorization: "Bearer secret-test-key",
+        },
+      });
+    } finally {
+      if (previousAssetRoot === undefined) {
+        delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+      } else {
+        process.env.FRONTMIND_DASHBOARD_ASSET_DIR = previousAssetRoot;
+      }
+      await rm(assetRoot, { recursive: true, force: true });
+    }
   });
 });

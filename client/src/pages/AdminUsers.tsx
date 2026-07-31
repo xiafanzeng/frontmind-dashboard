@@ -242,10 +242,9 @@ export default function AdminUsers() {
             <CardContent className="p-6">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <h2 className="font-semibold">工程师账号与岗位</h2>
+                  <h2 className="font-semibold">已创建的工程师账号与岗位</h2>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    工程师 Key
-                    由系统管理员统一配置；交付管理员只安排岗位、客户项目和交付工作。
+                    在这里查看工程师账号及所属岗位，并安排客户项目和交付工作。
                   </p>
                 </div>
                 <Button

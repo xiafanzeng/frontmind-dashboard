@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH,
+  assertKnowledgeBaseInitialImageDelivery,
   assertKnowledgeBaseNodeImageDelivery,
   assertKnowledgeBaseCustomerOutput,
   classifyKnowledgeBaseUserAction,
@@ -141,7 +141,7 @@ describe("knowledge-base model output boundary", () => {
   });
 });
 
-describe("knowledge-base per-node image delivery", () => {
+describe("knowledge-base first-leaf-only image delivery", () => {
   const presentation = {
     kind: "frontmind.knowledge-base.presentation" as const,
     schemaVersion: 1 as const,
@@ -175,10 +175,9 @@ describe("knowledge-base per-node image delivery", () => {
     ).toEqual(new Set(["image-1", "image-2"]));
   });
 
-  it("accepts a declared image only when a real output attachment exists", () => {
+  it("rejects image attachments on every non-initial node turn", () => {
     expect(() =>
       assertKnowledgeBaseNodeImageDelivery({
-        skillContentHash: KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH,
         presentation,
         output: [
           {
@@ -188,21 +187,12 @@ describe("knowledge-base per-node image delivery", () => {
           },
         ],
       }),
-    ).not.toThrow();
-
-    expect(() =>
-      assertKnowledgeBaseNodeImageDelivery({
-        skillContentHash: KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH,
-        presentation,
-        output: [],
-      }),
-    ).toThrow("当前节点图片附件与资产声明不一致");
+    ).toThrow("图片只允许在首轮第一个节点展示");
   });
 
-  it("keeps historical v3 task envelopes backward compatible", () => {
+  it("requires an explicit zero-image declaration on later turns", () => {
     expect(() =>
       assertKnowledgeBaseNodeImageDelivery({
-        skillContentHash: "historical-skill-hash",
         presentation: {
           kind: "frontmind.knowledge-base.presentation",
           schemaVersion: 1,
@@ -211,13 +201,37 @@ describe("knowledge-base per-node image delivery", () => {
         },
         output: [],
       }),
+    ).toThrow("缺少图片交付声明");
+  });
+
+  it("allows no more than three distinct first-turn image outputs", () => {
+    const image = (id: string) => ({
+      type: "output_image",
+      file_id: id,
+      file_name: `${id}.webp`,
+    });
+    expect(() =>
+      assertKnowledgeBaseInitialImageDelivery([
+        { role: "assistant", type: "message", content: "1.1 正文" },
+        image("logo"),
+        image("hero"),
+        image("product"),
+      ]),
     ).not.toThrow();
+    expect(() =>
+      assertKnowledgeBaseInitialImageDelivery([
+        { role: "assistant", type: "message", content: "1.1 正文" },
+        image("logo"),
+        image("hero"),
+        image("product"),
+        image("duplicate-or-extra"),
+      ]),
+    ).toThrow("最多只能展示三张");
   });
 
   it("does not count an earlier turn's image in the current presentation", () => {
     expect(() =>
       assertKnowledgeBaseNodeImageDelivery({
-        skillContentHash: KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH,
         presentation: {
           kind: "frontmind.knowledge-base.presentation",
           schemaVersion: 1,

@@ -9,7 +9,6 @@ import {
   Download,
   Gauge,
   History,
-  KeyRound,
   MessageSquareText,
   PackageCheck,
   PanelsTopLeft,
@@ -307,7 +306,7 @@ function KnowledgeTabs({
 }
 
 export function PreviewAdminAgent({
-  previewAccessLevel = "system_admin",
+  previewAccessLevel = "delivery_admin",
 }: {
   previewAccessLevel?: PreviewAdminAccessLevel;
 }) {
@@ -325,7 +324,7 @@ export function PreviewAdminPresales() {
 
   return (
     <PortalShell
-      eyebrow="管理中心 · Agent 与资源"
+      eyebrow="管理中心 · 客户与服务"
       title="官网任务与积分"
       navItems={getRoleScopedPreviewAdminNav("system_admin")}
       accountLabel="系统管理员验收账号"
@@ -429,19 +428,18 @@ export function PreviewAdminPresales() {
   );
 }
 
-type PreviewWorkspaceTab = "service" | "tickets" | "credential";
+type PreviewWorkspaceTab = "service" | "tickets";
 
 type PreviewManagedUser = {
   id: number;
   name: string;
   username: string;
-  configured: boolean;
 };
 
 const managedUsers: PreviewManagedUser[] = [
-  { id: 1, name: "验收企业", username: "acceptance", configured: true },
-  { id: 2, name: "验收企业 B", username: "acceptance_b", configured: true },
-  { id: 3, name: "验收企业 C", username: "acceptance_c", configured: false },
+  { id: 1, name: "验收企业", username: "acceptance" },
+  { id: 2, name: "验收企业 B", username: "acceptance_b" },
+  { id: 3, name: "验收企业 C", username: "acceptance_c" },
 ];
 
 const managerOptions = [
@@ -492,11 +490,10 @@ export function PreviewAdminUsers({
   const [tab, setTab] = useState<PreviewWorkspaceTab>(() => {
     if (typeof window === "undefined") return "service";
     const requested = new URLSearchParams(window.location.search).get("tab");
-    return ["service", "tickets", "credential"].includes(requested || "")
+    return ["service", "tickets"].includes(requested || "")
       ? (requested as PreviewWorkspaceTab)
       : "service";
   });
-  const [apiKey, setApiKey] = useState("");
   const [servicePlans, setServicePlans] = useState<
     Record<number, "basic" | "advanced" | "luxury">
   >({
@@ -565,7 +562,6 @@ export function PreviewAdminUsers({
                 id,
                 name: draft.name,
                 username: draft.username,
-                configured: false,
               },
             ]);
             setAssignments((current) => ({ ...current, [id]: [101] }));
@@ -594,10 +590,7 @@ export function PreviewAdminUsers({
               <button
                 key={account.id}
                 type="button"
-                onClick={() => {
-                  setSelectedId(account.id);
-                  setApiKey("");
-                }}
+                onClick={() => setSelectedId(account.id)}
                 className={`w-full p-4 text-left transition ${
                   selectedId === account.id
                     ? "bg-[#5b2a86]/8"
@@ -618,9 +611,6 @@ export function PreviewAdminUsers({
                 <div className="mt-3 flex gap-1.5">
                   <Badge variant="secondary" className="text-xs">
                     管理员 {assignments[account.id]?.length || 0}
-                  </Badge>
-                  <Badge variant="secondary" className="text-xs text-[#16794f]">
-                    {account.configured ? "API Key 已配置" : "API Key 待配置"}
                   </Badge>
                 </div>
               </button>
@@ -661,7 +651,6 @@ export function PreviewAdminUsers({
                 [
                   ["service", "用户流程", PackageCheck],
                   ["tickets", "工单", ClipboardList],
-                  ["credential", "API Key 与积分", KeyRound],
                 ] as const
               ).map(([value, label, Icon]) => (
                 <button
@@ -706,13 +695,6 @@ export function PreviewAdminUsers({
               canExecuteDelivery={systemAdmin}
               preview
               previewFixtures={adminDeliveryTicketPreviewFixtures}
-            />
-          )}
-          {tab === "credential" && (
-            <PreviewCredential
-              configured={selectedUser.configured}
-              apiKey={apiKey}
-              onApiKeyChange={setApiKey}
             />
           )}
         </div>
@@ -1157,81 +1139,6 @@ function PreviewServiceManager({
             </Button>
           </div>
         )}
-      </PortalCard>
-    </div>
-  );
-}
-
-function PreviewCredential({
-  configured,
-  apiKey,
-  onApiKeyChange,
-}: {
-  configured: boolean;
-  apiKey: string;
-  onApiKeyChange: (value: string) => void;
-}) {
-  const tasks = [
-    ["知识库全量更新", "今天 10:24", "12,680"],
-    ["全网图片与文本采集", "昨天 16:08", "8,420"],
-    ["产品事实交叉核验", "07-19 11:32", "3,280"],
-  ];
-  return (
-    <div className="grid gap-5 lg:grid-cols-[minmax(0,.8fr)_minmax(0,1.2fr)]">
-      <PortalCard className="p-5 sm:p-6">
-        <div className="flex items-center gap-2">
-          <KeyRound className="h-5 w-5 text-[#5b2a86]" />
-          <h3 className="font-semibold text-[#171321]">用户 API Key</h3>
-        </div>
-        <div className="mt-5 flex items-center justify-between rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
-          <span className="text-sm text-[#716a80]">当前状态</span>
-          <Badge className="border-0 bg-[#16794f]/10 text-[#16794f]">
-            {configured ? "已配置 · fm_••••7A9C" : "未配置"}
-          </Badge>
-        </div>
-        <label className="mt-5 block text-sm font-medium text-[#484057]">
-          更换新 API Key
-        </label>
-        <Input
-          type="password"
-          value={apiKey}
-          onChange={(event) => onApiKeyChange(event.target.value)}
-          placeholder="输入用户的 FrontMind API Key"
-          className="mt-2"
-        />
-        <Button
-          className="mt-3 w-full bg-[#5b2a86] hover:bg-[#49216c]"
-          disabled={apiKey.trim().length < 8}
-          onClick={() => {
-            toast.success("样例 API Key 已验证并安全保存");
-            onApiKeyChange("");
-          }}
-        >
-          验证并安全保存
-        </Button>
-        <p className="mt-3 text-xs leading-5 text-[#9a94a8]">
-          浏览器仅显示 API Key 指纹，不返回明文。
-        </p>
-      </PortalCard>
-      <PortalCard className="p-5 sm:p-6">
-        <p className="text-sm text-[#716a80]">近 30 天积分消耗</p>
-        <p className="mt-2 text-4xl font-semibold text-[#5b2a86]">24,380</p>
-        <div className="mt-5 divide-y divide-[#eee8f2]">
-          {tasks.map(([title, time, value]) => (
-            <div
-              key={title}
-              className="flex items-center justify-between gap-4 py-3"
-            >
-              <div>
-                <p className="text-sm font-medium text-[#484057]">{title}</p>
-                <p className="mt-1 text-xs text-[#9a94a8]">{time}</p>
-              </div>
-              <span className="text-sm font-semibold text-[#5b2a86]">
-                {value}
-              </span>
-            </div>
-          ))}
-        </div>
       </PortalCard>
     </div>
   );

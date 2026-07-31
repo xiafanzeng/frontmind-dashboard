@@ -30,7 +30,6 @@ describe("administrator channel navigation", () => {
         "交付总览",
         "客户交付工作台",
         ...(_name === "real" ? ["客户项目团队", "工单调度"] : []),
-        "FrontMind Agent",
         "官网任务与积分",
         "账号与权限",
         "问题监控",
@@ -70,24 +69,23 @@ describe("administrator channel navigation", () => {
   );
 
   it.each([
-    ["real", adminNav, "/admin/agent"],
-    ["preview", previewAdminNav, "/preview/admin/agent"],
+    ["real", adminNav],
+    ["preview", previewAdminNav],
   ])(
-    "uses one FrontMind Agent entry and no fixed workflow entry in %s navigation",
-    (_name, navigation, agentHref) => {
-      expect(
-        navigation.filter((item) => item.label === "FrontMind Agent"),
-      ).toEqual([
-        expect.objectContaining({
-          href: agentHref,
-        }),
-      ]);
+    "removes FrontMind Agent from %s system navigation",
+    (_name, navigation) => {
+      expect(navigation.some((item) => item.label === "FrontMind Agent")).toBe(
+        false,
+      );
       expect(
         navigation.some(
           (item) =>
-            item.label.includes("流程编排") || item.href.includes("workflow"),
+            item.group === "Agent 与资源" || item.href.includes("workflow"),
         ),
       ).toBe(false);
+      expect(
+        navigation.find((item) => item.label === "官网任务与积分"),
+      ).toMatchObject({ group: "客户与服务" });
     },
   );
 
@@ -146,6 +144,9 @@ describe("administrator channel navigation", () => {
       ),
     ).toBe(true);
     expect(
+      systemNavigation.some((item) => item.label === "FrontMind Agent"),
+    ).toBe(false);
+    expect(
       systemNavigation.some(
         (item) => item.href === "/preview/admin/system/workspace",
       ),
@@ -175,7 +176,11 @@ describe("administrator channel navigation", () => {
     expect(source).toContain('title="交付总览"');
     expect(source).not.toContain("打开客户交付工作台");
     expect(source).not.toContain(">创建客户<");
-    expect(source).toContain("管理员自用 Agent 积分");
+    expect(source).not.toContain("交付管理员积分");
+    expect(source).not.toContain(
+      "先选择交付管理员，再查看该管理员名下的 Key 池",
+    );
+    expect(source).not.toContain("管理员自用 Agent 积分");
     expect(source).toContain("统一 API Key 管理");
     expect(source).toContain("客户、交付管理员和工程师使用同一套管理入口");
     expect(source).toContain("Key 总额");

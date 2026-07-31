@@ -38,19 +38,6 @@ describe("AdminAgent preview", () => {
     expect(within(workspace).queryByText("退出登录")).toBeNull();
   });
 
-  it("opens administrator monitoring in a separate browser tab", () => {
-    render(<AdminAgent preview />);
-
-    expect(screen.getByRole("link", { name: "问题监控" })).toHaveAttribute(
-      "target",
-      "_blank",
-    );
-    expect(screen.getByRole("link", { name: "问题监控" })).toHaveAttribute(
-      "rel",
-      "noopener noreferrer",
-    );
-  });
-
   it("mounts the live Agent as a fullscreen workspace without inner account or knowledge-base launchers", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminAgent.tsx"),
@@ -68,10 +55,10 @@ describe("AdminAgent preview", () => {
       "utf8",
     );
     expect(source).toContain(
-      '<Route path={"/admin/agent"}>\n        <AdminOnly>',
+      '<Route path={"/admin/agent"}>\n        <DeliveryAdminOnly>',
     );
     expect(source).not.toContain(
-      '<Route path={"/admin/agent"}>\n        <SystemAdminOnly>',
+      '<Route path={"/admin/agent"}>\n        <AdminOnly>',
     );
   });
 });

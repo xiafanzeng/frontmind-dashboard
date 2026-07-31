@@ -639,11 +639,7 @@ async function loadSkillArchive(
   selection: KnowledgeBaseSkillSelection = { version: "3" },
 ) {
   const version =
-    selection.version === "1"
-      ? "1"
-      : selection.version === "2"
-        ? "2"
-        : "3";
+    selection.version === "1" ? "1" : selection.version === "2" ? "2" : "3";
   const cacheKey = `${version}:${selection.contentHash || "latest"}`;
   const cached = skillArchiveCache.get(cacheKey);
   if (cached) {
@@ -749,11 +745,7 @@ export async function getKnowledgeBaseSkillDescriptor(
   selection: KnowledgeBaseSkillSelection = { version: "3" },
 ) {
   const version =
-    selection.version === "1"
-      ? "1"
-      : selection.version === "2"
-        ? "2"
-        : "3";
+    selection.version === "1" ? "1" : selection.version === "2" ? "2" : "3";
   const loaded = await loadSkillArchive({
     version,
     contentHash: selection.contentHash,
@@ -928,7 +920,7 @@ export async function buildKnowledgeBasePrompt({
     "客户可见正文与本轮对话只能呈现百科事实，不得呈现任务过程、核验判断、采购/合规建议、读者指令、工具计划或模型推理。",
     "客户可见回复只输出知识树统计（仅首轮需要）和实际展示节点的完整正文/合规配图。不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题；所有来源只进入内部证据文件。可见正文结束后直接附机器信封。",
     "客户可见正文不得嵌入官网或 CDN 图片外链。图片必须先下载真实字节、解码校验并打入最终 ZIP，再以包内相对路径引用；防盗链、签名、过期或无法下载的地址只能进入内部来源记录，绝不能作为客户图片返回。",
-    "逐节点确认还必须交付真实图片附件：展示节点存在合格 related assetIds 时，从已下载并验证的本地字节中选择最多三张，以 output_image 或 image MIME 的 output_file 作为同一回复的真实附件返回。不得只写包内相对路径、图片标题或“配图”占位；当前节点没有合格关联素材时才允许纯文字返回。逐轮附件与最终 ZIP 必须使用同一资产字节。",
+    "全任务只采集最多三张互不重复的经典企业图片：主 Logo、品牌主视觉、典型产品/UI/架构图各最多一张；取得三张后立即停止图片发现。只有首轮清单第一个叶子（通常为 1.1 一句话定位）可把已下载验证的本地字节作为 output_image 或 image MIME output_file 返回。后续所有节点、修订与重开轮次一律纯文字，不得重复或新增图片附件。首轮附件与最终 ZIP 必须使用同一资产字节。",
     `资料采集阶段统一向客户显示：${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
     "",
     "## 本次任务输入",
@@ -964,7 +956,7 @@ export async function buildKnowledgeBasePrompt({
     '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
     "revision 必须等于当前服务端 revision；每次被接受后加 1。leafId 只能是当前叶子，from 只能是 current 或 needs_verification。",
     "FRONTMIND_KB_PROGRESS 声明本轮处理的旧节点；FRONTMIND_KB_PRESENTATION 声明回复正文实际展示的新状态。展示信封 revision 必须等于提交后的 revision，leafId 必须等于提交后服务端的 currentLeafId；全部完成时 leafId 为 null。",
-    "FRONTMIND_KB_PRESENTATION 还必须声明实际图片交付：有 1-3 张真实附件时 imageState=attached、assetIds 为对应稳定资产 ID 且 imageCount 等于附件数；当前节点确无合格图片时使用 no_eligible_asset、空数组和 0；leafId=null 时只能使用 not_applicable、空数组和 0。声明与真实附件不一致时服务端拒绝推进。",
+    "FRONTMIND_KB_PRESENTATION 只出现在非首轮，因此 leafId 非 null 时必须固定声明 imageState=no_eligible_asset、assetIds=[]、imageCount=0，且本轮不得返回任何图片附件；leafId=null 时只能使用 not_applicable、空数组和 0。声明与真实附件不一致时服务端拒绝推进。",
     "只有用户本轮回复恰好表达“确认/确认无误/OK/没问题/通过”等明确确认时，to 才能为 confirmed，并只前进一个叶子。",
     "只有用户本轮明确回复“跳过/直接预填/采用预填/保留预填”等时，to 才能为 direct_prefilled，并只前进一个叶子。",
     "direct_prefilled 只用于兼容用户主动输入的旧协议动作；客户可见正文不得主动提供“直接预填”或“跳过”选项。正常操作只有确认，或者提交修改/附件后确认修订稿。",
@@ -1128,14 +1120,14 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
               action === "confirm" || action === "direct_prefill"
                 ? nextPending?.id || "null"
                 : current.id
-            }。同时严格声明 imageState、assetIds、imageCount：实际返回 1-3 张图片附件时使用 attached 和对应稳定资产 ID；当前节点确无合格图片时使用 no_eligible_asset、空数组和 0；leafId=null 时使用 not_applicable、空数组和 0。`
+            }。这是非首轮：leafId 非 null 时必须固定声明 imageState=no_eligible_asset、assetIds=[]、imageCount=0，且不得返回任何图片附件；leafId=null 时使用 not_applicable、空数组和 0。`
           : "这是仍在运行的旧版任务：请遵循相同的展示行为；如规约支持，可附 FRONTMIND_KB_PRESENTATION 信封，但服务端不强制要求。",
       ].join("\n")
     : [
         `当前知识库已完成，revision=${progress.build.revision}。`,
         "本轮如有补充或修改，只能从现有节点中选择一个最相关节点重新核验，并附一个 FRONTMIND_KB_REOPEN 信封；不得重建知识树或复用旧包。",
         isV3
-          ? `同时附一个 FRONTMIND_KB_PRESENTATION 信封，revision=${postRevision}，leafId 必须等于 FRONTMIND_KB_REOPEN 选中的节点。`
+          ? `同时附一个 FRONTMIND_KB_PRESENTATION 信封，revision=${postRevision}，leafId 必须等于 FRONTMIND_KB_REOPEN 选中的节点；固定声明 imageState=no_eligible_asset、assetIds=[]、imageCount=0，且不得返回图片附件。`
           : "这是仍在运行的旧版任务；展示行为保持兼容。",
         `现有节点：${leaves
           .map((leaf) => `${leaf.id}:${leaf.title}`)
@@ -1146,9 +1138,9 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     "不得开启、调用、切换或推荐 Wide Research / Deep Research。",
     "客户可见回复不得出现“本轮采集/本知识库/证据不足/已核验”等过程判断，也不得出现客户应、采购方应、建议、尽调、合规审查、不能仅凭、不宜转换或不能外推等建议性表达。",
     "客户可见回复不得主动提供“直接预填”或“跳过”选项；用户正常操作只有确认当前内容，或者提交修改/附件后确认修订稿。",
-    "客户可见回复只输出实际展示节点的完整正文/合规配图，不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题。所有来源只进入内部证据文件；可见正文结束后直接附机器信封。",
+    "客户可见回复只输出实际展示节点的完整正文，不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题。所有来源只进入内部证据文件；可见正文结束后直接附机器信封。",
     "机器信封必须保留完整的 `<!-- FRONTMIND_KB_...` 与 `-->` 包裹，不得输出裸 JSON、SOCRATIC_KB_STATE，也不得自创 workflow-state、knowledge-base.message 或其他状态对象。",
-    "实际展示节点如有合格 related assetIds，必须把最多三张已下载验证的本地图片作为同一回复的 output_image 或 image MIME output_file 附件返回；不能只输出包内路径、图片标题、文字占位或官网/CDN 热链。只有该节点确实没有合格关联素材时才可纯文字返回。",
+    "这是非首轮知识节点回复，必须纯文字返回：不得继续搜索图片，不得返回、重复或重新附加任何 output_image、image MIME output_file、包内图片路径或官网/CDN 热链。最多三张经典企业图片只允许在首轮第一个叶子展示。",
     "",
     "# 当前知识库状态",
     stateReminder,

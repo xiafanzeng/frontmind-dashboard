@@ -6,7 +6,6 @@ import { describe, expect, it } from "vitest";
 import {
   ADMIN_WORKSPACE_TAB_IDS,
   ADMIN_WORKSPACE_TABS,
-  adminWorkspaceTabsForAccess,
   canCreateManagedCustomer,
 } from "./AdminWorkspace";
 
@@ -19,39 +18,24 @@ describe("admin customer workspace", () => {
   });
 
   it("keeps knowledge-base work inside the unified user-flow tab", () => {
-    expect(ADMIN_WORKSPACE_TAB_IDS).toEqual([
-      "service",
-      "tickets",
-      "credential",
-    ]);
+    expect(ADMIN_WORKSPACE_TAB_IDS).toEqual(["service", "tickets"]);
     expect(ADMIN_WORKSPACE_TABS.map((item) => item.label)).toEqual([
       "用户流程",
       "工单",
-      "客户 Key 与积分",
     ]);
   });
 
-  it("keeps delivery-admin coordination routes reachable without exposing execution tabs", () => {
-    expect(
-      adminWorkspaceTabsForAccess({
-        isSystemAdmin: false,
-        canViewSelectedUserUsage: false,
-      }).map((tab) => tab.value),
-    ).toEqual(["service", "tickets"]);
+  it("removes per-customer Key and credit management for every administrator", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
 
-    expect(
-      adminWorkspaceTabsForAccess({
-        isSystemAdmin: false,
-        canViewSelectedUserUsage: true,
-      }).map((tab) => tab.value),
-    ).toEqual(["service", "tickets"]);
-
-    expect(
-      adminWorkspaceTabsForAccess({
-        isSystemAdmin: true,
-        canViewSelectedUserUsage: true,
-      }).map((tab) => tab.value),
-    ).toEqual(["service", "tickets", "credential"]);
+    expect(source).not.toContain("客户 Key 与积分");
+    expect(source).not.toContain("客户 API Key");
+    expect(source).not.toContain("本月积分使用");
+    expect(source).not.toContain("creditUsage.useQuery");
+    expect(source).not.toContain("replaceCredential.useMutation");
   });
 
   it("folds delivery content into service and removes the workspace audit tab", () => {
@@ -63,10 +47,11 @@ describe("admin customer workspace", () => {
     expect(source).toContain('{tab === "service" &&');
     expect(source).toContain("<DashboardSkeletonEditor");
     expect(source).toContain("<CustomerDashboardMirror");
-    expect(source).toContain('heading="客户实际页面"');
-    expect(source).toContain(
-      'description="这里与客户账号看到的完整看板一致。"',
-    );
+    expect(source).toContain("servicePortal={serviceQuery.data}");
+    expect(source).toContain("servicePortalLoading={serviceQuery.isLoading}");
+    expect(source).not.toContain('heading="客户实际页面"');
+    expect(source).not.toContain("这里与客户账号看到的完整看板一致。");
+    expect(source).not.toContain("正式版本 R");
     expect(source).toContain("websiteWorkspace={websiteWorkspacePreview}");
     expect(source).toContain("knowledgePreview={{");
     expect(source).toContain("activity: knowledgeActivityQuery.data");
@@ -89,17 +74,16 @@ describe("admin customer workspace", () => {
     expect(source).not.toContain("ManualOrderCard");
   });
 
-  it("keeps question review with the monitoring engineer and system-admin fallback", () => {
+  it("removes the duplicate workflow, quota, and question-library panels", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
       "utf8",
     );
 
-    expect(source).toContain("editable={isSystemAdmin}");
-    expect(source).toContain("canConfirm={isSystemAdmin}");
-    expect(source).toContain("等待监控工程师确认");
-    expect(source).toContain("系统管理员异常接管");
-    expect(source).not.toContain("等待管理员确认");
+    expect(source).not.toContain("智能交付路径");
+    expect(source).not.toContain("当前服务周期配额");
+    expect(source).not.toContain("企业问题库");
+    expect(source).not.toContain("AdminQuestionRow");
   });
 
   it("does not render or submit order and contract identifiers", () => {

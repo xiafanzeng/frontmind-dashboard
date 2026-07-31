@@ -1,8 +1,6 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { useLocation } from "wouter";
+import { useMemo, useState, type FormEvent } from "react";
 import {
   Activity,
-  AlertTriangle,
   Bot,
   BriefcaseBusiness,
   ClipboardList,
@@ -415,16 +413,10 @@ export const adminNav: PortalNavItem[] = [
     group: "客户与服务",
   },
   {
-    label: "FrontMind Agent",
-    href: "/admin/agent",
-    icon: Bot,
-    group: "Agent 与资源",
-  },
-  {
     label: "官网任务与积分",
     href: "/admin/presales",
     icon: BriefcaseBusiness,
-    group: "Agent 与资源",
+    group: "客户与服务",
   },
   {
     label: "账号与权限",
@@ -973,7 +965,6 @@ export default function AdminDashboard({
   };
 }) {
   const previewMode = import.meta.env.DEV && preview;
-  const [, setLocation] = useLocation();
   const { user } = useAuth();
   const systemAdmin = previewMode
     ? previewAccessLevel === "system_admin"
@@ -1002,9 +993,6 @@ export default function AdminDashboard({
       refetchOnWindowFocus: false,
     },
   );
-  const [selectedUsageManagerId, setSelectedUsageManagerId] = useState<
-    number | null
-  >(null);
   const [apiKeyTarget, setApiKeyTarget] = useState<OverviewApiKeyTarget | null>(
     null,
   );
@@ -1081,12 +1069,6 @@ export default function AdminDashboard({
     ? previewUsageHierarchy
     : normalizeUsageHierarchy(usageHierarchyQuery.data);
   const usageManagers = usageHierarchy.managers;
-  const selectedUsageManager =
-    usageManagers.find(
-      (manager) => manager.adminId === selectedUsageManagerId,
-    ) ||
-    usageManagers[0] ||
-    null;
   const engineerUsageById = new Map(
     usageHierarchy.engineers.map((engineer) => [engineer.engineerId, engineer]),
   );
@@ -1175,12 +1157,6 @@ export default function AdminDashboard({
   const missingKeyCount = keyManagementRows.filter(
     (row) => !row.configured,
   ).length;
-
-  useEffect(() => {
-    if (selectedUsageManagerId == null && usageManagers[0]?.adminId != null) {
-      setSelectedUsageManagerId(usageManagers[0].adminId);
-    }
-  }, [selectedUsageManagerId, usageManagers]);
 
   return (
     <PortalShell
@@ -1529,208 +1505,6 @@ export default function AdminDashboard({
                     );
                   })}
                 </div>
-              </div>
-            )}
-          </PortalCard>
-        )}
-        {systemAdmin && (
-          <PortalCard className="overflow-hidden">
-            <div className="border-b border-[#eee8f2] px-5 py-4 sm:px-6">
-              <div>
-                <div className="flex items-center gap-2">
-                  <AlertTriangle className="h-5 w-5 text-[#c89013]" />
-                  <h2 className="font-semibold text-[#171321]">
-                    交付管理员积分
-                  </h2>
-                </div>
-                <p className="mt-1 text-sm leading-6 text-[#716a80]">
-                  先选择交付管理员，再查看该管理员名下的 Key 池、管理员自用
-                  Agent 积分与用户本月消耗。
-                </p>
-              </div>
-            </div>
-            {!previewMode && usageHierarchyQuery.isLoading ? (
-              <div className="p-6 text-sm text-[#716a80]">
-                正在读取用量快照…
-              </div>
-            ) : !previewMode && usageHierarchyQuery.error ? (
-              <div className="p-6 text-sm text-[#a02652]">
-                用量暂时无法读取。
-              </div>
-            ) : usageManagers.length === 0 ? (
-              <div className="p-6 text-sm text-[#716a80]">
-                当前权限范围内暂无交付管理员用量记录。
-              </div>
-            ) : (
-              <div
-                className={`grid gap-5 p-5 sm:p-6 ${
-                  systemAdmin ? "lg:grid-cols-[250px_minmax(0,1fr)]" : ""
-                }`}
-              >
-                {systemAdmin && (
-                  <aside className="space-y-2">
-                    {usageManagers.map((manager) => (
-                      <button
-                        key={manager.adminId}
-                        type="button"
-                        onClick={() =>
-                          setSelectedUsageManagerId(manager.adminId)
-                        }
-                        className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
-                          selectedUsageManager?.adminId === manager.adminId
-                            ? "border-[#7a45a7] bg-[#f6f0fa]"
-                            : "border-[#e8e1ee] bg-white hover:border-[#cdb9dc]"
-                        }`}
-                      >
-                        <p className="truncate text-sm font-semibold text-[#332842]">
-                          {manager.displayName}
-                        </p>
-                        <p className="mt-1 truncate text-xs text-[#857e91]">
-                          {manager.users.length} 个受管用户
-                        </p>
-                      </button>
-                    ))}
-                  </aside>
-                )}
-
-                {selectedUsageManager && (
-                  <section className="min-w-0">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <h3 className="text-lg font-semibold text-[#221a33]">
-                          {selectedUsageManager.displayName}
-                        </h3>
-                        <p
-                          className={`mt-1 text-xs font-medium ${
-                            selectedUsageManager.apiKeyConfigured
-                              ? "text-[#16794f]"
-                              : "text-[#a02652]"
-                          }`}
-                        >
-                          管理员自用 Key：
-                          {selectedUsageManager.apiKeyConfigured
-                            ? "已配置"
-                            : "未配置"}
-                        </p>
-                        <p className="mt-1 font-mono text-xs text-[#857e91]">
-                          名下 Key 池：
-                          {selectedUsageManager.keyPool.credentialCount === 0
-                            ? "尚无有效 Key"
-                            : selectedUsageManager.keyPool.credentialCount === 1
-                              ? selectedUsageManager.keyPool.fingerprint ||
-                                "1 个有效 Key"
-                              : `${selectedUsageManager.keyPool.credentialCount} 个有效 Key`}
-                        </p>
-                      </div>
-                      <div className="flex flex-col items-end gap-2">
-                        <p className="text-xs text-[#857e91]">
-                          {usageHierarchy.period.label} · 北京时间自然月
-                        </p>
-                        {systemAdmin && !previewMode && (
-                          <p className="text-xs text-[#6a338f]">
-                            Key 请在上方统一管理区配置
-                          </p>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                      {[
-                        [
-                          "名下 Key 池总消耗",
-                          selectedUsageManager.keyPool.totalUsed,
-                        ],
-                        [
-                          "管理员自用 Agent 积分",
-                          selectedUsageManager.ownAgentMonthUsed,
-                        ],
-                        [
-                          "已归属到本管理员",
-                          selectedUsageManager.attributedUsed,
-                        ],
-                        [
-                          "其他或未归属",
-                          selectedUsageManager.otherOrUnattributedUsed,
-                        ],
-                      ].map(([label, value]) => (
-                        <div
-                          key={String(label)}
-                          className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4"
-                        >
-                          <p className="text-xs font-medium text-[#716a80]">
-                            {label}
-                          </p>
-                          <p className="mt-2 text-2xl font-semibold text-[#5b2a86]">
-                            {Number(value).toLocaleString()}
-                          </p>
-                        </div>
-                      ))}
-                    </div>
-                    {selectedUsageManager.keyPool.syncStatus !== "ok" && (
-                      <p className="mt-3 rounded-xl border border-[#ead7a5] bg-[#fffaf0] px-3 py-2 text-xs leading-5 text-[#8a6200]">
-                        名下 Key
-                        池的本月用量尚未完整同步，请刷新用量后再据此判断是否更换
-                        Key。
-                      </p>
-                    )}
-
-                    <div className="mt-5 flex flex-wrap items-center justify-between gap-2">
-                      <h4 className="text-sm font-semibold text-[#332842]">
-                        名下用户本月消耗
-                      </h4>
-                      <p className="text-xs text-[#857e91]">
-                        用户端不展示积分信息
-                      </p>
-                    </div>
-                    <div className="mt-3 overflow-hidden rounded-2xl border border-[#e8e1ee]">
-                      {selectedUsageManager.users.length === 0 ? (
-                        <p className="px-4 py-8 text-center text-sm text-[#716a80]">
-                          该管理员暂未分配用户。
-                        </p>
-                      ) : (
-                        selectedUsageManager.users.map((customer) => (
-                          <button
-                            key={customer.userId}
-                            type="button"
-                            onClick={() =>
-                              setLocation(
-                                previewMode
-                                  ? `${getPreviewAdminWorkspaceHref(systemAdmin)}?user=${customer.userId}&tab=credential`
-                                  : `/admin/workspace?user=${customer.userId}&tab=credential`,
-                              )
-                            }
-                            className="grid w-full gap-2 border-b border-[#eee8f2] px-4 py-3 text-left last:border-b-0 hover:bg-[#fbf9fd] sm:grid-cols-[minmax(0,1fr)_150px_120px] sm:items-center"
-                          >
-                            <div className="min-w-0">
-                              <p className="truncate text-sm font-semibold text-[#332842]">
-                                {customer.enterpriseName}
-                              </p>
-                              <p className="mt-1 truncate text-xs text-[#857e91]">
-                                {customer.username || `用户 ${customer.userId}`}
-                              </p>
-                            </div>
-                            <p className="text-sm font-semibold text-[#5b2a86]">
-                              {customer.monthUsed.toLocaleString()}
-                            </p>
-                            <p
-                              className={`text-xs sm:text-right ${
-                                customer.credentialSource !== "unconfigured"
-                                  ? "text-[#16794f]"
-                                  : "text-[#a02652]"
-                              }`}
-                            >
-                              {customer.usesManagerKey
-                                ? "使用管理员 Key"
-                                : customer.credentialSource === "customer"
-                                  ? "客户独立 Key"
-                                  : "Key 未配置"}
-                            </p>
-                          </button>
-                        ))
-                      )}
-                    </div>
-                  </section>
-                )}
               </div>
             )}
           </PortalCard>

@@ -134,7 +134,7 @@ describe("outputForKnowledgePresentation", () => {
       content: [
         {
           type: "output_text",
-          text: "节点 2.3\n<!-- FRONTMIND_KB_PRESENTATION {\"leafId\":\"2.3\"} -->",
+          text: '节点 2.3\n<!-- FRONTMIND_KB_PRESENTATION {"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":3,"leafId":"2.3"} -->',
         },
       ],
     };
@@ -143,7 +143,7 @@ describe("outputForKnowledgePresentation", () => {
       content: [
         {
           type: "output_text",
-          text: "节点 2.4\n<!-- FRONTMIND_KB_PRESENTATION {\"leafId\":\"2.4\"} -->",
+          text: '节点 2.4\n<!-- FRONTMIND_KB_PRESENTATION {"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":4,"leafId":"2.4"} -->',
         },
       ],
     };
@@ -154,7 +154,10 @@ describe("outputForKnowledgePresentation", () => {
     };
 
     expect(
-      outputForKnowledgePresentation([old, current, image], []),
+      outputForKnowledgePresentation([old, current, image], [], {
+        revision: 4,
+        leafId: "2.4",
+      }),
     ).toEqual([current, image]);
   });
 });
@@ -229,7 +232,7 @@ describe("useSendMessage", () => {
     expect(result.current.uploadProgress).toBeNull();
   });
 
-  it("shows initial running knowledge text and leaves polling to the global owner", async () => {
+  it("suppresses unvalidated running knowledge text and leaves polling to the global owner", async () => {
     vi.useFakeTimers();
     mocks.createKnowledgeBaseTurnTask.mockResolvedValueOnce({
       id: "test-kb-task-id",
@@ -276,14 +279,7 @@ describe("useSendMessage", () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
 
-    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
-      "test-conv-id",
-      expect.arrayContaining([
-        expect.objectContaining({
-          content: "FrontMind 正在按业务分支进行资料采集。",
-        }),
-      ]),
-    );
+    expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
     expect(mocks.retrieveTask).not.toHaveBeenCalled();
     expect(mocks.updateStatus).toHaveBeenCalledWith(
       "test-conv-id",

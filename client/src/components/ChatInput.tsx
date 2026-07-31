@@ -244,13 +244,10 @@ export default function ChatInput({
     [files, submitContent, text],
   );
 
-  const confirmCurrentContent = useCallback(
-    async () => {
-      if (text.trim() || files.length > 0) return;
-      await submitContent("确认", []);
-    },
-    [files.length, submitContent, text],
-  );
+  const confirmCurrentContent = useCallback(async () => {
+    if (text.trim() || files.length > 0) return;
+    await submitContent("确认", []);
+  }, [files.length, submitContent, text]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -287,13 +284,7 @@ export default function ChatInput({
         addFiles(droppedFiles);
       }
     },
-    [
-      addFiles,
-      inputLocked,
-      isSending,
-      isUploading,
-      knowledgeBaseNotStarted,
-    ],
+    [addFiles, inputLocked, isSending, isUploading, knowledgeBaseNotStarted],
   );
 
   const handleTextChange = useCallback(
@@ -378,8 +369,8 @@ export default function ChatInput({
                       </p>
                       <p className="mt-1 text-xs leading-5 text-violet-800/80">
                         {currentNodePresentationReady
-                          ? "可直接确认，也可以输入修改意见或上传资料。"
-                          : "正在恢复当前节点正文与图片，内容显示完整后才可确认。"}
+                          ? "可直接确认，也可以输入修改意见或上传补充资料。"
+                          : "正在恢复当前节点内容，显示完整后才可确认。"}
                       </p>
                     </div>
                     <div className="shrink-0">
@@ -396,7 +387,7 @@ export default function ChatInput({
                     </div>
                   </div>
                   <p className="mt-2 text-xs text-violet-700/75">
-                    如需修改，请在下方输入意见或上传资料。系统返回修订稿后，再确认当前内容。
+                    如需修改，请在下方输入意见或上传资料；建议尽量上传与当前部分相关的补充图片，以丰富知识库内容。系统返回修订稿后，再确认当前内容。
                   </p>
                 </>
               )}

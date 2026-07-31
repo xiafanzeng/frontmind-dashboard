@@ -14,6 +14,18 @@ function assistantOutput(id: string, text: string): OutputMessage {
   };
 }
 
+function presentation(revision: number, leafId: string | null) {
+  return `<!-- FRONTMIND_KB_PRESENTATION ${JSON.stringify({
+    kind: "frontmind.knowledge-base.presentation",
+    schemaVersion: 1,
+    revision,
+    leafId,
+    imageState: leafId === null ? "not_applicable" : "no_eligible_asset",
+    assetIds: [],
+    imageCount: 0,
+  })} -->`;
+}
+
 describe("task output projection", () => {
   it("uses the latest same-ID replacement when the output length is unchanged", () => {
     const latest = assistantOutput(
@@ -23,6 +35,7 @@ describe("task output projection", () => {
         "![外部图片](https://cdn.example.com/image.png)",
         "## References",
         "- https://example.com/source",
+        presentation(2, "1.3"),
       ].join("\n\n"),
     );
 
@@ -33,6 +46,7 @@ describe("task output projection", () => {
       responseStartedAt: 1,
       modelName: "frontmind-pro",
       knowledgeBase: true,
+      knowledgeBasePresentation: { revision: 2, leafId: "1.3" },
     });
 
     expect(messages).toHaveLength(1);
@@ -43,35 +57,59 @@ describe("task output projection", () => {
   });
 
   it("selects the latest assistant item and its following resources", () => {
-    const old = assistantOutput("reused-output", "旧回复");
-    const current = assistantOutput("reused-output", "新回复");
+    const old = assistantOutput(
+      "reused-output",
+      `旧回复\n${presentation(1, "1.2")}`,
+    );
+    const current = assistantOutput(
+      "reused-output",
+      `新回复\n${presentation(2, "1.3")}`,
+    );
     const image: OutputMessage = {
       id: "leaf-image",
       type: "output_image",
       image_url: "/api/knowledge-base/assets/leaf-image",
     };
+    const duplicateImage: OutputMessage = {
+      ...image,
+      id: "leaf-image-copy",
+    };
 
     expect(
-      outputForKnowledgePresentation([old, current, image], []),
-    ).toEqual([current, image]);
+      outputForKnowledgePresentation(
+        [old, current, image, duplicateImage],
+        [],
+        {
+          revision: 2,
+          leafId: "1.3",
+        },
+      ),
+    ).toEqual([current, duplicateImage]);
   });
 
   it("keeps the newest content when a cumulative response repeats an ID", () => {
-    const old = assistantOutput("reused-output", "旧回复");
-    const current = assistantOutput("reused-output", "新回复");
+    const old = assistantOutput(
+      "reused-output",
+      `旧回复\n${presentation(1, "1.2")}`,
+    );
+    const current = assistantOutput(
+      "reused-output",
+      `新回复\n${presentation(2, "1.3")}`,
+    );
 
     const messages = projectTaskOutputMessages({
       output: [old, current],
       baselineOutputLength: 0,
       responseStartedAt: 1,
       knowledgeBase: true,
+      knowledgeBasePresentation: { revision: 2, leafId: "1.3" },
     });
 
     expect(messages).toHaveLength(1);
     expect(messages[0]?.content).toBe("新回复");
   });
 
-  it("removes tools and incomplete machine envelopes from running knowledge output", () => {
+  it("does not render running knowledge output before its envelope is complete", () => {
     const output: OutputMessage[] = [
       {
         id: "search-call",
@@ -82,7 +120,7 @@ describe("task output projection", () => {
         "running-copy",
         [
           "已完成第一轮资料采集。",
-          "<!-- FRONTMIND_KB_PROGRESS {\"revision\":1",
+          '<!-- FRONTMIND_KB_PROGRESS {"revision":1',
         ].join("\n"),
       ),
     ];
@@ -94,9 +132,50 @@ describe("task output projection", () => {
       knowledgeBase: true,
     });
 
+    expect(messages).toEqual([]);
+  });
+
+  it("suppresses a stale previous node until the authoritative next node arrives", () => {
+    const stale = assistantOutput(
+      "reused-output",
+      `1.3 使命、愿景与价值观\n旧正文\n${presentation(1, "1.3")}`,
+    );
+    const partialCurrent = assistantOutput(
+      "reused-output",
+      "1.3「使命、愿景与价值观」已确认。\n\n1.4 Token 供应平台业务边界",
+    );
+
+    expect(
+      projectTaskOutputMessages({
+        output: [stale, partialCurrent],
+        baselineOutputLength: 1,
+        historicalOutputIds: ["reused-output"],
+        responseStartedAt: 2,
+        knowledgeBase: true,
+        knowledgeBasePresentation: { revision: 2, leafId: "1.4" },
+      }),
+    ).toEqual([]);
+
+    const completedCurrent = assistantOutput(
+      "reused-output",
+      [
+        "1.3「使命、愿景与价值观」已确认。",
+        "1.4 Token 供应平台业务边界",
+        "新正文",
+        presentation(2, "1.4"),
+      ].join("\n\n"),
+    );
+    const messages = projectTaskOutputMessages({
+      output: [stale, completedCurrent],
+      baselineOutputLength: 1,
+      historicalOutputIds: ["reused-output"],
+      responseStartedAt: 2,
+      knowledgeBase: true,
+      knowledgeBasePresentation: { revision: 2, leafId: "1.4" },
+    });
+
     expect(messages).toHaveLength(1);
-    expect(messages[0]?.content).toBe("已完成第一轮资料采集。");
-    expect(messages[0]?.intermediateSteps).toBeUndefined();
-    expect(messages[0]?.content).not.toContain("FRONTMIND_KB_PROGRESS");
+    expect(messages[0]?.content).toContain("1.4 Token 供应平台业务边界");
+    expect(messages[0]?.content).not.toContain("旧正文");
   });
 });

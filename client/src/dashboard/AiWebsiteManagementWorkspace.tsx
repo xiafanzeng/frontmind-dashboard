@@ -851,6 +851,7 @@ export default function AiWebsiteManagementWorkspace({
                 <>
                   <AliyunIcpGuide
                     currentPhase={phase}
+                    marketEdition={marketEdition}
                     onContactAdvisor={onContactAdvisor}
                     scenario={guideScenario}
                     onScenarioChange={setGuideScenario}
@@ -920,124 +921,160 @@ export default function AiWebsiteManagementWorkspace({
                         </div>
                       ) : undefined
                     }
+                    filingSubmissionContent={
+                      phase === "icp" ? (
+                        <div
+                          className="ai-website-guide-stage-submission"
+                          id="ai-website-result-form"
+                          tabIndex={-1}
+                        >
+                          <div className="ai-website-result-heading">
+                            <strong>提交备案信息工单</strong>
+                            <p>
+                              请确认阿里云备案状态已显示通过，仅填写已备案域名与
+                              ICP 主体备案号。提交后会创建工单供平台确认。
+                            </p>
+                          </div>
+
+                          <label className="ai-website-form-field">
+                            <span>已备案域名</span>
+                            <input
+                              type="text"
+                              aria-label="已备案域名"
+                              aria-required="true"
+                              value={topic}
+                              onChange={(event) => setTopic(event.target.value)}
+                              placeholder="例如 example.com"
+                            />
+                          </label>
+
+                          <label className="ai-website-form-field">
+                            <span>ICP 主体备案号</span>
+                            <input
+                              type="text"
+                              aria-label="ICP 主体备案号"
+                              aria-required="true"
+                              value={icpNumber}
+                              onChange={(event) =>
+                                setIcpNumber(event.target.value)
+                              }
+                              placeholder="例如 京ICP备12345678号"
+                            />
+                            <small className="ai-website-field-help">
+                              请填写备案主体编号，不要填写密码、证件号码、负责人照片或其他备案材料。
+                            </small>
+                          </label>
+
+                          {!onSubmit && (
+                            <div
+                              className="ai-website-inline-state"
+                              role="status"
+                            >
+                              工单提交服务暂时不可用。
+                            </div>
+                          )}
+
+                          <div className="ai-website-form-actions">
+                            <p
+                              className={`ai-website-submit-message ${submitState}`}
+                              aria-live="polite"
+                            >
+                              {submitMessage}
+                            </p>
+                            <button
+                              type="submit"
+                              className="ai-website-primary-button"
+                              disabled={submitDisabled}
+                            >
+                              <Send size={17} aria-hidden="true" />
+                              {submitting ? "正在提交…" : "提交备案结果"}
+                            </button>
+                          </div>
+                        </div>
+                      ) : undefined
+                    }
                   />
-                  {phase === "icp" && (
-                    <div
-                      className="ai-website-result-heading"
-                      id="ai-website-result-form"
-                      tabIndex={-1}
-                    >
-                      <strong>备案通过后，仅回填以下两项</strong>
-                      <p>
-                        请确认阿里云备案状态已显示通过，再提交域名与 ICP
-                        主体备案号供平台确认。
-                      </p>
-                    </div>
-                  )}
                 </>
               )}
 
-              {phase !== "domain" && (
+              {phase === "content" && (
                 <>
                   <label className="ai-website-form-field">
-                    <span>{phase === "icp" ? "已备案域名" : "话题"}</span>
+                    <span>话题</span>
                     <input
                       type="text"
-                      aria-label={phase === "icp" ? "已备案域名" : "话题"}
+                      aria-label="话题"
                       aria-required="true"
                       value={topic}
                       onChange={(event) => setTopic(event.target.value)}
-                      placeholder={
-                        phase === "icp"
-                          ? "例如 example.com"
-                          : "填写本次需要更新的官网话题"
-                      }
+                      placeholder="填写本次需要更新的官网话题"
                     />
                   </label>
 
-                  {phase === "icp" ? (
-                    <label className="ai-website-form-field">
-                      <span>ICP 主体备案号</span>
+                  <label className="ai-website-form-field">
+                    <span>内容说明（选填）</span>
+                    <textarea
+                      rows={5}
+                      value={details}
+                      onChange={(event) => setDetails(event.target.value)}
+                      placeholder="补充本次需求的背景、范围和需要管理员关注的事项"
+                    />
+                  </label>
+
+                  <label className="ai-website-form-field">
+                    <span>参考资料（选填）</span>
+                    <textarea
+                      rows={3}
+                      value={referenceLinks}
+                      onChange={(event) =>
+                        setReferenceLinks(event.target.value)
+                      }
+                      placeholder="每行一个公开参考链接"
+                    />
+                  </label>
+
+                  <div className="ai-website-upload">
+                    <div>
+                      <strong>附件（选填）</strong>
+                      <span>可上传与本次官网内容需求有关的资料。</span>
+                    </div>
+                    <label className="ai-website-upload-button">
+                      <Upload size={17} aria-hidden="true" />
+                      选择文件
                       <input
-                        type="text"
-                        aria-label="ICP 主体备案号"
-                        aria-required="true"
-                        value={icpNumber}
-                        onChange={(event) => setIcpNumber(event.target.value)}
-                        placeholder="例如 京ICP备12345678号"
+                        type="file"
+                        multiple
+                        onChange={handleFiles}
+                        aria-label="上传官网工单附件"
                       />
-                      <small className="ai-website-field-help">
-                        请填写备案主体编号，不要填写密码、证件号码、负责人照片或其他备案材料。
-                      </small>
                     </label>
-                  ) : (
-                    <>
-                      <label className="ai-website-form-field">
-                        <span>内容说明（选填）</span>
-                        <textarea
-                          rows={5}
-                          value={details}
-                          onChange={(event) => setDetails(event.target.value)}
-                          placeholder="补充本次需求的背景、范围和需要管理员关注的事项"
-                        />
-                      </label>
+                  </div>
 
-                      <label className="ai-website-form-field">
-                        <span>参考资料（选填）</span>
-                        <textarea
-                          rows={3}
-                          value={referenceLinks}
-                          onChange={(event) =>
-                            setReferenceLinks(event.target.value)
-                          }
-                          placeholder="每行一个公开参考链接"
-                        />
-                      </label>
-
-                      <div className="ai-website-upload">
-                        <div>
-                          <strong>附件（选填）</strong>
-                          <span>可上传与本次官网内容需求有关的资料。</span>
-                        </div>
-                        <label className="ai-website-upload-button">
-                          <Upload size={17} aria-hidden="true" />
-                          选择文件
-                          <input
-                            type="file"
-                            multiple
-                            onChange={handleFiles}
-                            aria-label="上传官网工单附件"
-                          />
-                        </label>
-                      </div>
-
-                      {attachments.length > 0 && (
-                        <ul
-                          className="ai-website-file-list"
-                          aria-label="待上传文件"
-                        >
-                          {attachments.map((file, index) => (
-                            <li key={`${file.name}-${file.size}-${index}`}>
-                              <Paperclip size={15} aria-hidden="true" />
-                              <span>{file.name}</span>
-                              <button
-                                type="button"
-                                aria-label={`移除 ${file.name}`}
-                                onClick={() =>
-                                  setAttachments((current) =>
-                                    current.filter(
-                                      (_, fileIndex) => fileIndex !== index,
-                                    ),
-                                  )
-                                }
-                              >
-                                <X size={15} aria-hidden="true" />
-                              </button>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </>
+                  {attachments.length > 0 && (
+                    <ul
+                      className="ai-website-file-list"
+                      aria-label="待上传文件"
+                    >
+                      {attachments.map((file, index) => (
+                        <li key={`${file.name}-${file.size}-${index}`}>
+                          <Paperclip size={15} aria-hidden="true" />
+                          <span>{file.name}</span>
+                          <button
+                            type="button"
+                            aria-label={`移除 ${file.name}`}
+                            onClick={() =>
+                              setAttachments((current) =>
+                                current.filter(
+                                  (_, fileIndex) => fileIndex !== index,
+                                ),
+                              )
+                            }
+                          >
+                            <X size={15} aria-hidden="true" />
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
                   )}
 
                   {quotaExhausted && (
@@ -1067,11 +1104,7 @@ export default function AiWebsiteManagementWorkspace({
                       disabled={submitDisabled}
                     >
                       <Send size={17} aria-hidden="true" />
-                      {submitting
-                        ? "正在提交…"
-                        : phase === "icp"
-                          ? "提交备案结果"
-                          : "提交工单"}
+                      {submitting ? "正在提交…" : "提交工单"}
                     </button>
                   </div>
                 </>

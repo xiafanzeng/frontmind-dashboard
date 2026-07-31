@@ -8,6 +8,7 @@ import {
 } from "@/lib/development-preview-fixtures";
 import {
   previewAdminPageHref,
+  previewAdminRootHref,
   previewAdminWorkspaceHref,
 } from "@/lib/preview-navigation";
 import AdminDashboard from "@/pages/AdminDashboard";
@@ -83,15 +84,15 @@ export default function DevelopmentPreviewRouter({
     case previewAdminPageHref("delivery_admin", "agent"):
       return <PreviewAdminAgent previewAccessLevel="delivery_admin" />;
     case previewAdminPageHref("system_admin", "agent"):
-      return <PreviewAdminAgent previewAccessLevel="system_admin" />;
+      return <Redirect to={previewAdminRootHref("system_admin")} />;
     case previewAdminPageHref("system_admin", "presales"):
       return <PreviewAdminPresales />;
     case previewAdminPageHref("system_admin", "accounts"):
       return <PreviewAdminAccounts />;
     case "/preview/admin/agent":
-      return <Redirect to={previewAdminPageHref("system_admin", "agent")} />;
+      return <Redirect to={previewAdminRootHref("system_admin")} />;
     case "/preview/admin/workflow":
-      return <Redirect to={previewAdminPageHref("system_admin", "agent")} />;
+      return <Redirect to={previewAdminRootHref("system_admin")} />;
     case "/preview/admin/presales":
       return <Redirect to={previewAdminPageHref("system_admin", "presales")} />;
     case "/preview/admin/users":

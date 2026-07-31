@@ -134,5 +134,8 @@ describe("preview account creation form", () => {
     expect(
       screen.getByRole("button", { name: "编辑分配" }),
     ).toBeInTheDocument();
+    expect(screen.queryByText("API Key 与积分")).not.toBeInTheDocument();
+    expect(screen.queryByText(/API Key 已配置/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/API Key 待配置/)).not.toBeInTheDocument();
   });
 });

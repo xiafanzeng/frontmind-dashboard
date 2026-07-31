@@ -4,8 +4,119 @@ import {
   type LocalMessage,
 } from "@/contexts/ConversationContext";
 import type { OutputMessage } from "@/lib/frontmind-api";
+import { extractKnowledgeBaseProtocolObjects } from "@shared/knowledge-base-output";
+
+export interface KnowledgeBasePresentationTarget {
+  revision: number;
+  leafId: string | null;
+}
+
+function outputMessageText(item: OutputMessage): string {
+  const parts: string[] = [];
+  const append = (value: unknown) => {
+    if (typeof value === "string" && value.trim()) parts.push(value);
+    else if (
+      value &&
+      typeof value === "object" &&
+      typeof (value as { value?: unknown }).value === "string"
+    ) {
+      parts.push((value as { value: string }).value);
+    }
+  };
+
+  append(item.output_text);
+  append(item.text);
+  if (typeof item.content === "string") {
+    append(item.content);
+  } else if (Array.isArray(item.content)) {
+    item.content.forEach((part) => append(part?.text));
+  }
+  return parts.join("\n");
+}
+
+function knowledgeBaseProtocolTarget(
+  item: OutputMessage,
+): KnowledgeBasePresentationTarget | null {
+  const objects = extractKnowledgeBaseProtocolObjects(outputMessageText(item));
+  const presentation = [...objects]
+    .reverse()
+    .find(
+      (value) =>
+        value.kind === "frontmind.knowledge-base.presentation" &&
+        value.schemaVersion === 1 &&
+        Number.isSafeInteger(value.revision) &&
+        Number(value.revision) >= 0 &&
+        (value.leafId === null ||
+          (typeof value.leafId === "string" && value.leafId.trim())),
+    );
+  if (presentation) {
+    return {
+      revision: Number(presentation.revision),
+      leafId:
+        presentation.leafId === null
+          ? null
+          : String(presentation.leafId).trim(),
+    };
+  }
+
+  const manifest = [...objects]
+    .reverse()
+    .find(
+      (value) =>
+        value.kind === "frontmind.knowledge-base.manifest" &&
+        value.schemaVersion === 1 &&
+        Array.isArray(value.leaves) &&
+        value.leaves.length > 0,
+    );
+  const firstLeaf = Array.isArray(manifest?.leaves) ? manifest.leaves[0] : null;
+  if (
+    firstLeaf &&
+    typeof firstLeaf === "object" &&
+    typeof (firstLeaf as { id?: unknown }).id === "string" &&
+    (firstLeaf as { id: string }).id.trim()
+  ) {
+    return {
+      revision: 0,
+      leafId: (firstLeaf as { id: string }).id.trim(),
+    };
+  }
+  return null;
+}
 
 function stableOutputIdentity(item: OutputMessage): string | undefined {
+  const resourceTypes = new Set([
+    "output_image",
+    "image",
+    "output_file",
+    "file",
+  ]);
+  if (resourceTypes.has(item.type || "")) {
+    const directCandidates = [
+      item.file_id,
+      item.fileId,
+      item.image_url,
+      item.imageUrl,
+      item.file_url,
+      item.fileUrl,
+      item.url,
+    ];
+    const contentCandidates = Array.isArray(item.content)
+      ? item.content.flatMap((part) => [
+          part.file_id,
+          part.fileId,
+          part.image_url,
+          part.imageUrl,
+          part.file_url,
+          part.fileUrl,
+          part.url,
+        ])
+      : [];
+    const resourceIdentity = [...directCandidates, ...contentCandidates].find(
+      (value): value is string =>
+        typeof value === "string" && Boolean(value.trim()),
+    );
+    if (resourceIdentity) return `resource:${resourceIdentity.trim()}`;
+  }
   if (typeof item.id === "string" && item.id.trim()) {
     return `id:${item.id}`;
   }
@@ -112,25 +223,34 @@ export function outputForKnowledgeProgress(
 }
 
 /**
- * A provider can reuse an output ID or replace a same-length cumulative array
- * while a response is still running. In that case the length cursor cannot
- * identify the update, so render the latest assistant item and any resources
- * attached immediately after it.
+ * A provider can reuse an output ID or replace a same-length cumulative array.
+ * Render only the protocol message matching the server-approved revision and
+ * leaf, plus its following resources. This prevents a stale previous turn from
+ * flashing before the current envelope is complete.
  */
 export function outputForKnowledgePresentation(
   output: OutputMessage[],
-  slicedOutput: OutputMessage[],
+  _slicedOutput: OutputMessage[],
+  expected?: KnowledgeBasePresentationTarget,
 ): OutputMessage[] {
-  if (slicedOutput.length > 0) return slicedOutput;
+  const protocolMessages = output.flatMap((item, index) => {
+    if (item.role !== "assistant" && item.type !== "message" && item.type) {
+      return [];
+    }
+    const target = knowledgeBaseProtocolTarget(item);
+    return target ? [{ index, target }] : [];
+  });
+  const authoritative = expected
+    ? [...protocolMessages]
+        .reverse()
+        .find(
+          ({ target }) =>
+            target.revision === expected.revision &&
+            target.leafId === expected.leafId,
+        )
+    : protocolMessages[protocolMessages.length - 1];
+  if (!authoritative) return [];
 
-  const messageIndexes = output.flatMap((item, index) =>
-    item.role === "assistant" || item.type === "message" || !item.type
-      ? [index]
-      : [],
-  );
-  if (messageIndexes.length === 0) return [];
-
-  const latestMessageIndex = messageIndexes[messageIndexes.length - 1]!;
   const resourceTypes = new Set([
     "output_image",
     "image",
@@ -138,11 +258,13 @@ export function outputForKnowledgePresentation(
     "file",
   ]);
 
-  return output
-    .slice(latestMessageIndex)
-    .filter(
-      (item, offset) => offset === 0 || resourceTypes.has(item.type || ""),
-    );
+  return dedupeStableOutput(
+    output
+      .slice(authoritative.index)
+      .filter(
+        (item, offset) => offset === 0 || resourceTypes.has(item.type || ""),
+      ),
+  );
 }
 
 export function projectTaskOutputMessages({
@@ -152,6 +274,7 @@ export function projectTaskOutputMessages({
   responseStartedAt,
   modelName,
   knowledgeBase,
+  knowledgeBasePresentation,
 }: {
   output: OutputMessage[] | undefined;
   baselineOutputLength: number;
@@ -159,6 +282,7 @@ export function projectTaskOutputMessages({
   responseStartedAt?: number;
   modelName?: string;
   knowledgeBase: boolean;
+  knowledgeBasePresentation?: KnowledgeBasePresentationTarget;
 }): LocalMessage[] {
   if (!output?.length) return [];
 
@@ -168,7 +292,11 @@ export function projectTaskOutputMessages({
     historicalOutputIds,
   );
   const presentationOutput = knowledgeBase
-    ? outputForKnowledgePresentation(output, slicedOutput)
+    ? outputForKnowledgePresentation(
+        output,
+        slicedOutput,
+        knowledgeBasePresentation,
+      )
     : slicedOutput;
   if (presentationOutput.length === 0) return [];
 
@@ -177,7 +305,5 @@ export function projectTaskOutputMessages({
     responseStartedAt,
     modelName,
   );
-  return knowledgeBase
-    ? sanitizeKnowledgeBaseOutputMessages(parsed)
-    : parsed;
+  return knowledgeBase ? sanitizeKnowledgeBaseOutputMessages(parsed) : parsed;
 }

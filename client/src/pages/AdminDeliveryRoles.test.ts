@@ -225,4 +225,15 @@ describe("customer project team helpers", () => {
     expect(source).not.toContain("engineer.apiKeyManageable !== false");
     expect(source).toContain("Key 由系统管理员维护");
   });
+
+  it("does not highlight a role card with a yellow outer frame", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminDeliveryRoles.tsx"),
+      "utf8",
+    );
+
+    expect(source).not.toContain("highlightedRole");
+    expect(source).not.toContain("getInitialHighlightedRole");
+    expect(source).not.toContain("border-amber-400 ring-2 ring-amber-200");
+  });
 });

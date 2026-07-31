@@ -37,16 +37,10 @@ export const previewAdminNav: PortalNavItem[] = [
     group: "客户与服务",
   },
   {
-    label: "FrontMind Agent",
-    href: "/preview/admin/agent",
-    icon: Bot,
-    group: "Agent 与资源",
-  },
-  {
     label: "官网任务与积分",
     href: "/preview/admin/presales",
     icon: BriefcaseBusiness,
-    group: "Agent 与资源",
+    group: "客户与服务",
   },
   {
     label: "账号与权限",
@@ -69,6 +63,17 @@ export const previewAdminNav: PortalNavItem[] = [
     group: "外部系统",
     external: true,
     newWindow: true,
+  },
+];
+
+const previewDeliveryAdminNav: PortalNavItem[] = [
+  previewAdminNav[0],
+  previewAdminNav[1],
+  {
+    label: "FrontMind Agent",
+    href: "/preview/admin/agent",
+    icon: Bot,
+    group: "Agent 与资源",
   },
 ];
 
@@ -105,6 +110,7 @@ export function getRoleScopedPreviewAdminNav(
   accessLevel: PreviewAdminAccessLevel,
 ): PortalNavItem[] {
   const systemAdmin = accessLevel === "system_admin";
+  const sourceNav = systemAdmin ? previewAdminNav : previewDeliveryAdminNav;
   const root = previewAdminRootHref(accessLevel);
   const internalHrefMap: Record<string, string> = {
     "/preview/admin": root,
@@ -114,15 +120,8 @@ export function getRoleScopedPreviewAdminNav(
     "/preview/admin/accounts": previewAdminPageHref(accessLevel, "accounts"),
   };
 
-  return previewAdminNav
-    .filter(
-      (item) =>
-        systemAdmin ||
-        (item.href !== "/preview/admin/accounts" &&
-          item.href !== "/preview/admin/presales"),
-    )
-    .map((item) => ({
-      ...item,
-      href: internalHrefMap[item.href] ?? item.href,
-    }));
+  return sourceNav.map((item) => ({
+    ...item,
+    href: internalHrefMap[item.href] ?? item.href,
+  }));
 }

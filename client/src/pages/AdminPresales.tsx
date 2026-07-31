@@ -312,7 +312,7 @@ export default function AdminPresales() {
 
   return (
     <PortalShell
-      eyebrow="管理中心 · Agent 与资源"
+      eyebrow="管理中心 · 客户与服务"
       title="官网任务与积分"
       navItems={getAdminNav(true)}
       toolbar={

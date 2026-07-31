@@ -380,6 +380,16 @@ export default function ChatArea({
           initialStatus === "awaiting_input" ||
           initialStatus === "completed" ||
           initialStatus === "error";
+        const authoritativeKnowledgePresentation =
+          data.progress &&
+          (data.interaction?.interactionState === "awaiting_input" ||
+            data.interaction?.interactionState === "ready_to_publish" ||
+            data.interaction?.interactionState === "published")
+            ? {
+                revision: data.progress.build.revision,
+                leafId: data.progress.build.currentLeafId,
+              }
+            : undefined;
         if (data.progress) {
           window.dispatchEvent(
             new CustomEvent("frontmind:knowledge-progress-updated", {
@@ -398,17 +408,21 @@ export default function ChatArea({
             : {}),
         });
 
-        if (data.task.output && data.task.output.length > 0) {
+        if (
+          data.task.output &&
+          data.task.output.length > 0 &&
+          authoritativeKnowledgePresentation
+        ) {
           const assistantMessages = projectTaskOutputMessages({
             output: data.task.output,
-            baselineOutputLength:
-              activeConversation.lastKnownOutputLength || 0,
+            baselineOutputLength: activeConversation.lastKnownOutputLength || 0,
             historicalOutputIds: collectAssistantOutputIds(
               activeConversation.messages,
             ),
             responseStartedAt: taskStartedAt,
             modelName: selectedAgentProfile,
             knowledgeBase: true,
+            knowledgeBasePresentation: authoritativeKnowledgePresentation,
           });
           if (initialStatus === "completed" && assistantMessages.length > 0) {
             assistantMessages[assistantMessages.length - 1].elapsedTime =
@@ -443,8 +457,7 @@ export default function ChatArea({
           creditEventBus.emit();
         } else if (initialStatus === "error") {
           const errorMessage = sanitizeBrandText(
-            data.interaction?.lockReason ||
-              "任务未返回完整的知识节点状态",
+            data.interaction?.lockReason || "任务未返回完整的知识节点状态",
           );
           addMessage(conversationId, {
             id: `msg-kb-error-${data.task.id.slice(-72)}`,

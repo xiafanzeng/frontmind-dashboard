@@ -1,10 +1,7 @@
 import { useEffect, useState } from "react";
 import {
-  CreditCard,
   ClipboardList,
-  KeyRound,
   Loader2,
-  LockKeyhole,
   PackageCheck,
   Plus,
   RefreshCw,
@@ -45,31 +42,15 @@ export function canCreateManagedCustomer(
 export const ADMIN_WORKSPACE_TABS = [
   { value: "service", label: "用户流程", icon: PackageCheck },
   { value: "tickets", label: "工单", icon: ClipboardList },
-  { value: "credential", label: "客户 Key 与积分", icon: KeyRound },
 ] as const satisfies ReadonlyArray<{
   value: WorkspaceTab;
   label: string;
   icon: typeof PackageCheck;
 }>;
 
-export function adminWorkspaceTabsForAccess(input: {
-  isSystemAdmin: boolean;
-  canViewSelectedUserUsage: boolean;
-}) {
-  return ADMIN_WORKSPACE_TABS.filter(({ value }) => {
-    if (input.isSystemAdmin) {
-      return value !== "credential" || input.canViewSelectedUserUsage;
-    }
-    return value === "service" || value === "tickets";
-  });
+export function adminWorkspaceTabsForAccess() {
+  return ADMIN_WORKSPACE_TABS;
 }
-
-const QUESTION_CATEGORY_LABELS: Record<string, string> = {
-  industry: "行业词",
-  competitor_comparison: "竞品对比词",
-  reputation: "美誉舆情词",
-  product_scenario: "产品场景词",
-};
 
 function toDateTimeLocal(value?: number | string | Date | null) {
   if (!value) return "";
@@ -126,187 +107,6 @@ async function uploadWorkspaceFile(input: {
   return response.json();
 }
 
-function AdminQuestionRow({
-  question,
-  editable,
-  saving,
-  canConfirm,
-  confirming,
-  onSave,
-  onConfirm,
-}: {
-  question: {
-    id: string;
-    question: string;
-    rationale?: string | null;
-    category?: string;
-    quotaPeriodId?: string;
-    evidence?: Array<{
-      documentPath: string;
-      excerpt: string;
-      relevance: string;
-    }>;
-    status: "candidate" | "selected" | "archived";
-    selectionApprovalStatus: "not_requested" | "pending" | "approved";
-    locked: boolean;
-    revision: number;
-  };
-  editable: boolean;
-  saving: boolean;
-  canConfirm: boolean;
-  confirming: boolean;
-  onSave: (value: {
-    question: string;
-    rationale: string | null;
-    locked: boolean;
-  }) => Promise<void>;
-  onConfirm: () => Promise<void>;
-}) {
-  const [text, setText] = useState(question.question);
-  const [rationale, setRationale] = useState(question.rationale ?? "");
-  const [locked, setLocked] = useState(question.locked);
-
-  useEffect(() => {
-    setText(question.question);
-    setRationale(question.rationale ?? "");
-    setLocked(question.locked);
-  }, [
-    question.id,
-    question.locked,
-    question.question,
-    question.rationale,
-    question.revision,
-  ]);
-
-  return (
-    <div className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          {question.category && (
-            <span className="rounded-full bg-[#eee7f3] px-2.5 py-1 text-xs font-semibold text-[#5b2a86]">
-              {QUESTION_CATEGORY_LABELS[question.category] || question.category}
-            </span>
-          )}
-          <span className="text-xs font-semibold text-[#5b2a86]">
-            {question.status === "selected"
-              ? "已启动 · 已锁定"
-              : question.selectionApprovalStatus === "pending"
-                ? "用户申请启动"
-                : "候选问题"}
-          </span>
-        </div>
-        {editable && question.selectionApprovalStatus !== "pending" ? (
-          <label className="flex items-center gap-2 text-xs text-[#716a80]">
-            <input
-              type="checkbox"
-              checked={locked}
-              onChange={(event) => setLocked(event.target.checked)}
-            />
-            锁定，不被后续生成替换
-          </label>
-        ) : question.locked ? (
-          <span className="flex items-center gap-1 text-xs text-[#716a80]">
-            <LockKeyhole className="h-3.5 w-3.5" />
-            已锁定
-          </span>
-        ) : null}
-      </div>
-      {editable ? (
-        <>
-          <textarea
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            className="min-h-20 w-full rounded-xl border border-[#ddd3e4] bg-white px-3 py-2 text-sm leading-6 text-[#332842] outline-none focus:border-[#5b2a86]"
-          />
-          <textarea
-            value={rationale}
-            onChange={(event) => setRationale(event.target.value)}
-            placeholder="推荐依据与管理员说明"
-            className="mt-2 min-h-16 w-full rounded-xl border border-[#ddd3e4] bg-white px-3 py-2 text-xs leading-5 text-[#716a80] outline-none focus:border-[#5b2a86]"
-          />
-          <Button
-            size="sm"
-            variant="outline"
-            className="mt-3"
-            disabled={!text.trim() || saving}
-            onClick={() =>
-              void onSave({
-                question: text.trim(),
-                rationale: rationale.trim() || null,
-                locked,
-              })
-            }
-          >
-            {saving && <Loader2 className="h-4 w-4 animate-spin" />}
-            保存调整
-          </Button>
-        </>
-      ) : (
-        <>
-          <p className="text-sm font-semibold leading-6 text-[#332842]">
-            {question.question}
-          </p>
-          {question.rationale && (
-            <p className="mt-2 text-xs leading-5 text-[#716a80]">
-              {question.rationale}
-            </p>
-          )}
-        </>
-      )}
-      {question.selectionApprovalStatus === "pending" && (
-        <div className="mt-3 flex flex-col gap-2 border-t border-[#e8e1ee] pt-3 sm:flex-row sm:items-center sm:justify-between">
-          <p className="m-0 text-xs leading-5 text-[#716a80]">
-            确认后将锁定该问题，并占用当前服务周期对应类别额度。
-          </p>
-          {canConfirm ? (
-            <Button
-              size="sm"
-              className="bg-[#5b2a86] hover:bg-[#49216c]"
-              disabled={confirming}
-              onClick={() => void onConfirm()}
-            >
-              {confirming && <Loader2 className="h-4 w-4 animate-spin" />}
-              系统管理员异常接管
-            </Button>
-          ) : (
-            <Badge variant="outline">等待监控工程师确认</Badge>
-          )}
-        </div>
-      )}
-      {(question.evidence?.length || question.quotaPeriodId) && (
-        <details className="mt-3 border-t border-[#e8e1ee] pt-3">
-          <summary className="cursor-pointer text-xs font-semibold text-[#716a80]">
-            配额周期与知识库证据
-          </summary>
-          {question.quotaPeriodId && (
-            <p className="mt-3 break-all font-mono text-xs text-[#9a94a8]">
-              {question.quotaPeriodId}
-            </p>
-          )}
-          {(question.evidence ?? []).map((evidence, index) => (
-            <div
-              key={`${evidence.documentPath}-${index}`}
-              className="mt-2 rounded-xl border border-[#e8e1ee] bg-white p-3"
-            >
-              <p className="break-all text-xs font-semibold text-[#484057]">
-                {evidence.documentPath}
-              </p>
-              <p className="mt-1 text-xs leading-5 text-[#716a80]">
-                {evidence.excerpt}
-              </p>
-              {evidence.relevance && (
-                <p className="mt-1 text-xs text-[#9a94a8]">
-                  {evidence.relevance}
-                </p>
-              )}
-            </div>
-          ))}
-        </details>
-      )}
-    </div>
-  );
-}
-
 export default function AdminWorkspace({
   initialUserId = null,
   initialTab = "service",
@@ -338,7 +138,6 @@ export default function AdminWorkspace({
   );
   const [serviceSignedAt, setServiceSignedAt] = useState("");
   const [serviceSignatory, setServiceSignatory] = useState("");
-  const [customerApiKey, setCustomerApiKey] = useState("");
   const [carryQuestionIds, setCarryQuestionIds] = useState<string[]>([]);
   const [uploading, setUploading] = useState<"knowledge" | null>(null);
 
@@ -349,46 +148,13 @@ export default function AdminWorkspace({
   const selectedUser = workspaceQuery.data?.users.find(
     (item) => item.id === selectedUserId,
   );
-  const usageOwnerAdmin = selectedUser?.usageOwner
-    ? workspaceQuery.data?.admins.find(
-        (admin) => admin.id === selectedUser.usageOwner?.adminId,
-      )
-    : null;
-  const canViewSelectedUserUsage = Boolean(
-    selectedUser && workspaceQuery.data?.isSystemAdmin,
-  );
   const isSystemAdmin = Boolean(workspaceQuery.data?.isSystemAdmin);
-  const availableTabs = adminWorkspaceTabsForAccess({
-    isSystemAdmin,
-    canViewSelectedUserUsage,
-  });
+  const availableTabs = adminWorkspaceTabsForAccess();
 
   useEffect(() => {
     setSelectedUserId(initialUserId);
     setTab(initialTab);
   }, [initialTab, initialUserId]);
-  useEffect(() => {
-    if (
-      workspaceQuery.data &&
-      !adminWorkspaceTabsForAccess({
-        isSystemAdmin: workspaceQuery.data.isSystemAdmin,
-        canViewSelectedUserUsage,
-      }).some(({ value }) => value === tab)
-    ) {
-      setTab("service");
-      if (selectedUserId) {
-        setLocation(`/admin/customers/${selectedUserId}/service`, {
-          replace: true,
-        });
-      }
-    }
-  }, [
-    canViewSelectedUserUsage,
-    selectedUserId,
-    setLocation,
-    tab,
-    workspaceQuery.data,
-  ]);
 
   const queryInput = { userId: selectedUserId || 1 };
   const dashboardQuery = trpc.admin.workspace.dashboard.useQuery(queryInput, {
@@ -456,46 +222,12 @@ export default function AdminWorkspace({
     enabled: Boolean(selectedUser),
     retry: false,
   });
-  const usageQuery = trpc.admin.workspace.creditUsage.useQuery(queryInput, {
-    enabled: Boolean(
-      canViewSelectedUserUsage && selectedUser?.credential.configured,
-    ),
-    retry: false,
-    staleTime: 60_000,
-  });
   const assignmentMutation = trpc.admin.workspace.assignments.useMutation({
     onSuccess: (data) => {
       utils.admin.workspace.list.setData(undefined, data);
       toast.success("管理员分配已更新");
     },
   });
-  const replaceCredentialMutation =
-    trpc.admin.workspace.replaceCredential.useMutation({
-      onSuccess: async () => {
-        setCustomerApiKey("");
-        await Promise.all([workspaceQuery.refetch(), usageQuery.refetch()]);
-        toast.success("客户 API Key 已更新");
-      },
-      onError: (error) => toast.error(error.message),
-    });
-  const completeProvisioningMutation =
-    trpc.admin.workspace.completeProvisioning.useMutation({
-      onSuccess: async (result) => {
-        setCustomerApiKey("");
-        await Promise.all([
-          workspaceQuery.refetch(),
-          serviceQuery.refetch(),
-          questionPortfolioQuery.refetch(),
-          usageQuery.refetch(),
-        ]);
-        toast.success(
-          result.idempotent
-            ? "该客户已完成开通"
-            : "套餐、额度与 Key 已完成开通",
-        );
-      },
-      onError: (error) => toast.error(error.message),
-    });
   const updateServiceMutation = (
     trpc.admin.workspace as any
   ).updateService.useMutation({
@@ -506,26 +238,6 @@ export default function AdminWorkspace({
         workspaceQuery.refetch(),
       ]);
       toast.success("服务版本已更新");
-    },
-  });
-  const updateQuestionMutation = (
-    trpc.admin.workspace as any
-  ).updateQuestion.useMutation({
-    onSuccess: async () => {
-      await questionPortfolioQuery.refetch();
-      toast.success("候选问题已更新");
-    },
-  });
-  const confirmQuestionSelectionMutation = (
-    trpc.admin.workspace as any
-  ).confirmQuestionSelection.useMutation({
-    onSuccess: async () => {
-      await Promise.all([
-        questionPortfolioQuery.refetch(),
-        serviceQuery.refetch(),
-        workspaceQuery.refetch(),
-      ]);
-      toast.success("问题已确认启动并计入额度");
     },
   });
   useEffect(() => {
@@ -778,20 +490,6 @@ export default function AdminWorkspace({
                     </Badge>
                     <Badge variant="secondary" className="text-xs">
                       管理员 {account.assignedAdmins.length}
-                    </Badge>
-                    <Badge
-                      variant="secondary"
-                      className={`text-xs ${
-                        account.credential.configured
-                          ? "text-[#16794f]"
-                          : "text-[#c06f00]"
-                      }`}
-                    >
-                      {account.credential.configured
-                        ? account.credential.inherited
-                          ? "历史共享 Key"
-                          : "客户 Key 可用"
-                        : "客户 Key 待配置"}
                     </Badge>
                   </div>
                 </button>
@@ -1200,229 +898,6 @@ export default function AdminWorkspace({
                       </div>
                     )}
                 </PortalCard>
-
-                <PortalCard className="p-5 sm:p-6">
-                  <div className="flex items-center justify-between gap-4">
-                    <div>
-                      <h3 className="font-semibold text-[#171321]">
-                        智能交付路径
-                      </h3>
-                      <p className="mt-1 text-sm text-[#716a80]">
-                        状态和前置条件由服务端统一计算；未完成步骤不会显示虚构进度。
-                      </p>
-                    </div>
-                    {serviceQuery.data?.nextAction?.label && (
-                      <Badge className="bg-[#5b2a86]/10 text-[#5b2a86]">
-                        {serviceQuery.data.nextAction.label}
-                      </Badge>
-                    )}
-                  </div>
-                  <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                    {serviceQuery.error ? (
-                      <div className="rounded-xl border border-[#ebc8d4] bg-[#fff8fa] p-4 text-sm text-[#a02652] sm:col-span-2 xl:col-span-3">
-                        无法读取交付步骤：
-                        {serviceQuery.error.message || "请刷新后重试。"}
-                      </div>
-                    ) : serviceQuery.isLoading ? (
-                      <div className="p-4 text-sm text-[#716a80]">
-                        正在读取交付步骤…
-                      </div>
-                    ) : (
-                      (serviceQuery.data?.workflowSteps ?? []).map(
-                        (step: any) => (
-                          <button
-                            type="button"
-                            key={step.id}
-                            disabled={step.status === "locked"}
-                            className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4 text-left transition enabled:hover:border-[#cdb9db] enabled:hover:bg-white disabled:cursor-not-allowed disabled:opacity-75"
-                            onClick={() => {
-                              setTab("service");
-                              setLocation(
-                                `/admin/customers/${selectedUser.id}/service`,
-                              );
-                            }}
-                          >
-                            <div className="flex items-center justify-between gap-3">
-                              <span className="font-semibold text-[#332842]">
-                                {step.label}
-                              </span>
-                              <span
-                                className={`rounded-full px-2 py-1 text-xs font-semibold ${
-                                  step.status === "complete"
-                                    ? "bg-[#16794f]/10 text-[#16794f]"
-                                    : step.status === "ready"
-                                      ? "bg-[#5b2a86]/10 text-[#5b2a86]"
-                                      : "bg-[#eee9f1] text-[#857e91]"
-                                }`}
-                              >
-                                {step.status === "complete"
-                                  ? "已完成"
-                                  : step.status === "ready"
-                                    ? "可处理"
-                                    : "未解锁"}
-                              </span>
-                            </div>
-                            {step.lockedReason && (
-                              <p className="mt-3 text-xs leading-5 text-[#857e91]">
-                                {step.lockedReason}
-                              </p>
-                            )}
-                          </button>
-                        ),
-                      )
-                    )}
-                  </div>
-                </PortalCard>
-
-                <PortalCard className="p-5 sm:p-6">
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-                    <div>
-                      <h3 className="font-semibold text-[#171321]">
-                        当前服务周期配额
-                      </h3>
-                      <p className="mt-1 text-sm text-[#716a80]">
-                        {serviceQuery.data?.quotas
-                          ? `${displayDate(
-                              serviceQuery.data.quotas.validFrom,
-                            )} 至 ${displayDate(
-                              serviceQuery.data.quotas.validUntil,
-                            )}`
-                          : serviceQuery.isLoading
-                            ? "正在读取配额…"
-                            : serviceQuery.error
-                              ? "配额暂时无法读取"
-                              : "当前没有生效的配额周期"}
-                      </p>
-                    </div>
-                    {serviceQuery.data?.quotas && (
-                      <span className="text-sm font-semibold text-[#5b2a86]">
-                        总计 {serviceQuery.data.quotas.usage.total}/
-                        {serviceQuery.data.quotas.limits.totalQuestionLimit}
-                      </span>
-                    )}
-                  </div>
-                  {serviceQuery.data?.quotas && (
-                    <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                      {[
-                        [
-                          "行业词",
-                          serviceQuery.data.quotas.usage.industry,
-                          serviceQuery.data.quotas.limits.industryLimit,
-                        ],
-                        [
-                          "竞品对比词",
-                          serviceQuery.data.quotas.usage.competitorComparison,
-                          serviceQuery.data.quotas.limits
-                            .competitorComparisonLimit,
-                        ],
-                        [
-                          "美誉舆情词",
-                          serviceQuery.data.quotas.usage.reputation,
-                          serviceQuery.data.quotas.limits.reputationLimit,
-                        ],
-                        [
-                          "产品场景词",
-                          serviceQuery.data.quotas.usage.productScenario,
-                          serviceQuery.data.quotas.limits.productScenarioLimit,
-                        ],
-                      ].map(([label, used, limit]) => (
-                        <div
-                          key={String(label)}
-                          className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4"
-                        >
-                          <p className="text-xs font-semibold text-[#716a80]">
-                            {String(label)}
-                          </p>
-                          <p className="mt-2 text-2xl font-semibold text-[#332842]">
-                            {Number(used)}/{Number(limit)}
-                          </p>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </PortalCard>
-
-                <PortalCard className="p-5 sm:p-6">
-                  <div>
-                    <h3 className="font-semibold text-[#171321]">企业问题库</h3>
-                    <p className="mt-1 text-sm leading-6 text-[#716a80]">
-                      展示模型候选、已购问题与当前选题。
-                      {isSystemAdmin
-                        ? "系统管理员仅在异常接管时调整或确认；正常流程由监控与优化工程师审核。"
-                        : "交付管理员在这里查看和协调，正常审核由监控与优化工程师完成。"}
-                    </p>
-                  </div>
-                  <div className="mt-5 grid gap-3">
-                    {questionPortfolioQuery.isLoading ? (
-                      <div className="flex items-center justify-center gap-2 py-10 text-sm text-[#716a80]">
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        读取问题库中…
-                      </div>
-                    ) : questionPortfolioQuery.error ? (
-                      <div className="rounded-xl border border-[#ebc8d4] bg-[#fff8fa] p-4 text-sm text-[#a02652]">
-                        问题库读取失败：
-                        {questionPortfolioQuery.error.message ||
-                          "请刷新后重试。"}
-                      </div>
-                    ) : questionPortfolioQuery.data?.questions?.length ? (
-                      questionPortfolioQuery.data.questions.map(
-                        (question: any) => (
-                          <AdminQuestionRow
-                            key={question.id}
-                            question={question}
-                            editable={isSystemAdmin}
-                            saving={updateQuestionMutation.isPending}
-                            canConfirm={isSystemAdmin}
-                            confirming={
-                              confirmQuestionSelectionMutation.isPending
-                            }
-                            onSave={async (value) => {
-                              if (!selectedUserId) return;
-                              try {
-                                await updateQuestionMutation.mutateAsync({
-                                  userId: selectedUserId,
-                                  questionId: question.id,
-                                  expectedRevision: question.revision,
-                                  ...value,
-                                });
-                              } catch (error) {
-                                toast.error("候选问题更新失败", {
-                                  description:
-                                    error instanceof Error
-                                      ? error.message
-                                      : "请刷新后重试",
-                                });
-                              }
-                            }}
-                            onConfirm={async () => {
-                              if (!selectedUserId) return;
-                              try {
-                                await confirmQuestionSelectionMutation.mutateAsync(
-                                  {
-                                    userId: selectedUserId,
-                                    questionId: question.id,
-                                    expectedRevision: question.revision,
-                                  },
-                                );
-                              } catch (error) {
-                                toast.error("问题确认启动失败", {
-                                  description:
-                                    error instanceof Error
-                                      ? error.message
-                                      : "请刷新后重试",
-                                });
-                              }
-                            }}
-                          />
-                        ),
-                      )
-                    ) : (
-                      <p className="py-10 text-center text-sm text-[#716a80]">
-                        当前账号尚无已购或已生成的问题。
-                      </p>
-                    )}
-                  </div>
-                </PortalCard>
               </div>
             )}
 
@@ -1456,6 +931,10 @@ export default function AdminWorkspace({
                           snapshotError: knowledgeQuery.error?.message ?? null,
                         }}
                         websiteWorkspace={websiteWorkspacePreview}
+                        servicePortal={serviceQuery.data}
+                        servicePortalLoading={serviceQuery.isLoading}
+                        servicePortalError={serviceQuery.isError}
+                        onRefreshServicePortal={() => serviceQuery.refetch()}
                         knowledgeUploading={uploading === "knowledge"}
                         onUploadKnowledge={handleUpload}
                         onOpenWebsiteWorkspace={() => {
@@ -1500,6 +979,10 @@ export default function AdminWorkspace({
                     <CustomerDashboardMirror
                       payload={dashboardQuery.data.payload}
                       websiteWorkspace={websiteWorkspacePreview}
+                      servicePortal={serviceQuery.data}
+                      servicePortalLoading={serviceQuery.isLoading}
+                      servicePortalError={serviceQuery.isError}
+                      onRefreshServicePortal={() => serviceQuery.refetch()}
                       knowledgePreview={{
                         progress: knowledgeProgressQuery.data?.progress,
                         snapshot: knowledgeQuery.data?.snapshot,
@@ -1513,9 +996,6 @@ export default function AdminWorkspace({
                         snapshotLoading: knowledgeQuery.isLoading,
                         snapshotError: knowledgeQuery.error?.message ?? null,
                       }}
-                      heading="客户实际页面"
-                      description="这里与客户账号看到的完整看板一致。"
-                      statusLabel={`正式版本 R${dashboardQuery.data.revision ?? 0}`}
                     />
                   ) : (
                     <PortalCard className="p-8 text-center text-sm text-[#716a80]">
@@ -1539,236 +1019,6 @@ export default function AdminWorkspace({
                 canAdjustQuota={isSystemAdmin}
                 canExecuteDelivery={isSystemAdmin}
               />
-            )}
-
-            {tab === "credential" && canViewSelectedUserUsage && (
-              <div className="grid gap-5 lg:grid-cols-[minmax(0,.8fr)_minmax(0,1.2fr)]">
-                <PortalCard className="p-5 sm:p-6">
-                  <div className="flex items-center gap-2">
-                    <KeyRound className="h-5 w-5 text-[#5b2a86]" />
-                    <h3 className="font-semibold text-[#171321]">
-                      客户 API Key
-                    </h3>
-                  </div>
-                  <div className="mt-5 rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-sm text-[#716a80]">主负责人</span>
-                      <Badge
-                        className={
-                          selectedUser.credential.configured
-                            ? "bg-[#16794f]/10 text-[#16794f]"
-                            : "bg-[#c89013]/10 text-[#9a6900]"
-                        }
-                      >
-                        {selectedUser.credential.configured
-                          ? selectedUser.credential.inherited
-                            ? "历史共享 Key"
-                            : "客户 Key 可用"
-                          : "客户 Key 待配置"}
-                      </Badge>
-                    </div>
-                    <p className="mt-3 text-base font-semibold text-[#332842]">
-                      {selectedUser.usageOwner
-                        ? usageOwnerAdmin?.displayName ||
-                          usageOwnerAdmin?.username ||
-                          `管理员 ${selectedUser.usageOwner.adminId}`
-                        : "尚未指定主负责人"}
-                    </p>
-                    {usageOwnerAdmin?.username && (
-                      <p className="mt-1 text-xs text-[#9a94a8]">
-                        @{usageOwnerAdmin.username}
-                      </p>
-                    )}
-                    {selectedUser.credential.fingerprint && (
-                      <p className="mt-4 break-all rounded-xl border border-[#e8e1ee] bg-white px-3 py-2 font-mono text-xs text-[#716a80]">
-                        {selectedUser.credential.fingerprint}
-                      </p>
-                    )}
-                  </div>
-                  <p className="mt-4 text-sm leading-6 text-[#716a80]">
-                    客户 Key 按账号独立加密和版本化；客户自己的有效 Key
-                    始终优先于历史共享 Key。设置或更换主负责人不会废弃该 Key。
-                  </p>
-                  <div className="mt-5 space-y-3 border-t border-[#eee8f2] pt-5">
-                    <Input
-                      type="password"
-                      autoComplete="off"
-                      aria-label="客户 API Key"
-                      value={customerApiKey}
-                      onChange={(event) =>
-                        setCustomerApiKey(event.target.value)
-                      }
-                      placeholder={
-                        selectedUser.service?.status === "pending_confirmation"
-                          ? "输入 Key 并完成现有账号开通"
-                          : "输入新的客户 API Key"
-                      }
-                    />
-                    <Button
-                      className="w-full"
-                      disabled={
-                        !customerApiKey.trim() ||
-                        replaceCredentialMutation.isPending ||
-                        completeProvisioningMutation.isPending ||
-                        (selectedUser.service?.status ===
-                          "pending_confirmation" &&
-                          !selectedUser.usageOwner?.adminId) ||
-                        (selectedUser.service?.status ===
-                          "pending_confirmation" &&
-                          !workspaceQuery.data?.isSystemAdmin)
-                      }
-                      onClick={() => {
-                        if (
-                          selectedUser.service?.status ===
-                          "pending_confirmation"
-                        ) {
-                          completeProvisioningMutation.mutate({
-                            userId: selectedUser.id,
-                            expectedRevision: selectedUser.service.revision,
-                            deliveryAdminId: selectedUser.usageOwner!.adminId,
-                            apiKey: customerApiKey.trim(),
-                          });
-                          return;
-                        }
-                        replaceCredentialMutation.mutate({
-                          userId: selectedUser.id,
-                          apiKey: customerApiKey.trim(),
-                          reason: "客户交付工作台更新客户自有 Key",
-                        });
-                      }}
-                    >
-                      {(replaceCredentialMutation.isPending ||
-                        completeProvisioningMutation.isPending) && (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      )}
-                      {selectedUser.service?.status === "pending_confirmation"
-                        ? "完成套餐、额度与 Key 开通"
-                        : selectedUser.credential.inherited
-                          ? "设置客户自有 Key"
-                          : "验证并更新客户 Key"}
-                    </Button>
-                    {selectedUser.service?.status === "pending_confirmation" &&
-                      !workspaceQuery.data?.isSystemAdmin && (
-                        <p className="text-xs leading-5 text-[#9a6900]">
-                          该历史账号需由系统管理员完成一次性开通。
-                        </p>
-                      )}
-                    {selectedUser.service?.status === "pending_confirmation" &&
-                      workspaceQuery.data?.isSystemAdmin &&
-                      !selectedUser.usageOwner?.adminId && (
-                        <p className="text-xs leading-5 text-[#9a6900]">
-                          请先在客户概览中分配一位已启用的管理员作为主负责人，再完成历史账号开通。
-                        </p>
-                      )}
-                  </div>
-                </PortalCard>
-
-                <PortalCard className="p-5 sm:p-6">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <h3 className="font-semibold text-[#171321]">
-                        本月积分使用
-                      </h3>
-                      <p className="mt-1 text-xs text-[#9a94a8]">
-                        {usageQuery.data?.period?.label ?? "当前自然月"} ·
-                        按北京时间自然月统计
-                      </p>
-                    </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={
-                        !selectedUser.credential.configured ||
-                        usageQuery.isFetching
-                      }
-                      onClick={() => void usageQuery.refetch()}
-                    >
-                      <RefreshCw
-                        className={`h-4 w-4 ${usageQuery.isFetching ? "animate-spin" : ""}`}
-                      />
-                    </Button>
-                  </div>
-                  <div className="mt-6 grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-2xl bg-[#f5eef9] p-4">
-                      <p className="text-xs font-semibold text-[#716a80]">
-                        该用户任务使用
-                      </p>
-                      <p className="mt-2 text-3xl font-semibold text-[#5b2a86]">
-                        {(usageQuery.data?.accountUsed ?? 0).toLocaleString(
-                          "zh-CN",
-                        )}
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
-                      <p className="text-xs font-semibold text-[#716a80]">
-                        当前 Key 总消耗
-                      </p>
-                      <p className="mt-2 text-3xl font-semibold text-[#332842]">
-                        {(usageQuery.data?.totalUsed ?? 0).toLocaleString(
-                          "zh-CN",
-                        )}
-                      </p>
-                    </div>
-                  </div>
-                  <p className="mt-3 text-xs leading-5 text-[#9a94a8]">
-                    当前 Key 总消耗来自上游 Key 池；若同一原始 Key
-                    分配给多个账号，可能包含其他账号任务，因此不要求与该用户使用量相等。
-                  </p>
-                  {usageQuery.data?.complete === false && (
-                    <p className="mt-3 rounded-xl border border-[#ead7a5] bg-[#fffaf0] px-3 py-2 text-xs leading-5 text-[#8a6200]">
-                      当前 Key
-                      的本月任务量超过单次同步上限，数据尚未完整，请稍后重试后再据此更换
-                      Key。
-                    </p>
-                  )}
-                  <div className="mt-5 max-h-[330px] divide-y divide-[#eee8f2] overflow-y-auto custom-scrollbar">
-                    {!selectedUser.credential.configured ? (
-                      <p className="py-8 text-center text-sm text-[#716a80]">
-                        该客户尚未配置可用 Key
-                      </p>
-                    ) : usageQuery.isLoading ? (
-                      <p className="py-8 text-center text-sm text-[#716a80]">
-                        读取使用记录中…
-                      </p>
-                    ) : usageQuery.error ? (
-                      <p className="py-8 text-center text-sm text-[#ba2454]">
-                        {usageQuery.error.message}
-                      </p>
-                    ) : usageQuery.data?.recentTasks.length === 0 ? (
-                      <p className="py-8 text-center text-sm text-[#716a80]">
-                        本月暂无该用户的积分记录
-                      </p>
-                    ) : (
-                      usageQuery.data?.recentTasks.map((task) => (
-                        <div
-                          key={task.id}
-                          className="flex items-center justify-between gap-4 py-3"
-                        >
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-medium text-[#484057]">
-                              {task.title}
-                            </p>
-                            <p className="mt-1 text-xs text-[#9a94a8]">
-                              {task.createdAt || task.id}
-                            </p>
-                          </div>
-                          <span className="shrink-0 text-sm font-semibold text-[#5b2a86]">
-                            {task.creditUsage.toLocaleString("zh-CN")}
-                          </span>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </PortalCard>
-              </div>
-            )}
-
-            {tab === "credential" && !canViewSelectedUserUsage && (
-              <PortalCard className="p-6 text-sm leading-6 text-[#716a80]">
-                该用户的客户 Key
-                与积分由主负责人维护。协作管理员可以继续处理交付内容，但不能查看该客户的
-                Key 使用信息。
-              </PortalCard>
             )}
           </div>
         )}

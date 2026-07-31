@@ -50,7 +50,7 @@ const previewConversations = [
  */
 export default function AdminAgent({
   preview = false,
-  previewAccessLevel = "system_admin",
+  previewAccessLevel = "delivery_admin",
 }: AdminAgentProps) {
   const previewMode = import.meta.env.DEV && preview;
   const { user } = useAuth();

@@ -355,7 +355,7 @@ describe("AiWebsiteManagementWorkspace", () => {
     ).toBeInTheDocument();
   });
 
-  it("switches among first filing, existing filing, and overseas tutorials", () => {
+  it("shows only the two domestic tutorials for domestic accounts", () => {
     render(
       <AiWebsiteManagementWorkspace
         planCode="advanced"
@@ -377,10 +377,12 @@ describe("AiWebsiteManagementWorkspace", () => {
     const existingTab = screen.getByRole("tab", {
       name: "国内版 · 已有 ICP 备案",
     });
-    const overseasTab = screen.getByRole("tab", {
-      name: "海外版 · 香港/海外节点",
-    });
     expect(firstTab).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.queryByRole("tab", {
+        name: "海外版 · 香港/海外节点",
+      }),
+    ).not.toBeInTheDocument();
 
     fireEvent.keyDown(firstTab, { key: "ArrowRight" });
     expect(existingTab).toHaveAttribute("aria-selected", "true");
@@ -428,17 +430,6 @@ describe("AiWebsiteManagementWorkspace", () => {
       "src",
       "/assets/aliyun-icp-guide/14-existing-sponsor-mobile.webp",
     );
-
-    fireEvent.click(overseasTab);
-    expect(overseasTab).toHaveAttribute("aria-selected", "true");
-    expect(
-      screen.getByText("海外版：中国香港或海外节点无需工信部 ICP 备案"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", {
-        name: /确认使用中国香港或海外节点/,
-      }),
-    ).toHaveAttribute("aria-expanded", "true");
   });
 
   it("defaults overseas accounts to the overseas tutorial and submits that scene", async () => {
@@ -464,6 +455,16 @@ describe("AiWebsiteManagementWorkspace", () => {
         name: "海外版 · 香港/海外节点",
       }),
     ).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.queryByRole("tab", {
+        name: "国内版 · 企业首次备案",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("tab", {
+        name: "国内版 · 已有 ICP 备案",
+      }),
+    ).not.toBeInTheDocument();
     fireEvent.click(
       screen.getByRole("button", {
         name: /回到 FrontMind 按海外版提交域名/,
@@ -515,6 +516,23 @@ describe("AiWebsiteManagementWorkspace", () => {
         onSubmit={onSubmit}
       />,
     );
+
+    fireEvent.click(
+      screen.getByRole("tab", { name: "国内版 · 已有 ICP 备案" }),
+    );
+    const lastTutorialStage = screen.getByRole("button", {
+      name: /完成审核并回填备案结果/,
+    });
+    const filingTicket = screen.getByText("提交备案信息工单");
+    const securityNotice = screen.getByText(/不会索要阿里云密码/);
+    expect(
+      lastTutorialStage.compareDocumentPosition(filingTicket) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      filingTicket.compareDocumentPosition(securityNotice) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
 
     fireEvent.change(screen.getByLabelText("已备案域名"), {
       target: { value: "example.cn" },

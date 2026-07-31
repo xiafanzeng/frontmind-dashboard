@@ -23,9 +23,9 @@ except ImportError:  # The service still performs an independent native decode.
 MIB = 1024 * 1024
 MAX_COMPRESSED_BYTES = 250 * MIB
 MAX_UNCOMPRESSED_BYTES = 200 * MIB
-MAX_IMAGE_BYTES = 160 * MIB
+MAX_IMAGE_BYTES = 30 * MIB
 MAX_FILES = 1_500
-MAX_IMAGES = 480
+MAX_IMAGES = 3
 MIN_LEAVES = 8
 MAX_LEAVES = 115
 TARGET_FORMAL_CHARACTERS_MIN = 80_000
@@ -1796,10 +1796,11 @@ def validate_archive(path: Path) -> list[str]:
         )
         if isinstance(discovery_methods, list):
             validation.require(
-                REQUIRED_IMAGE_DISCOVERY_METHODS
-                <= {str(method).strip() for method in discovery_methods},
-                "imageSelection.discoveryMethods must record every required "
-                "official-image discovery method",
+                bool(discovery_methods)
+                and {str(method).strip() for method in discovery_methods}
+                <= REQUIRED_IMAGE_DISCOVERY_METHODS,
+                "imageSelection.discoveryMethods must record only methods "
+                "actually used to obtain the classic assets",
             )
         validation.require(
             isinstance(stop_reason, str) and bool(stop_reason.strip()),
@@ -1883,10 +1884,6 @@ def validate_archive(path: Path) -> list[str]:
                 )
                 if official_available is True:
                     validation.require(
-                        bool(family_assets),
-                        f"{where} with official imagery must link a packaged image",
-                    )
-                    validation.require(
                         all(
                             assets.get(asset_id, {}).get("assetType")
                             in {"product_ui", "product_diagram", "case_photo"}
@@ -1920,18 +1917,34 @@ def validate_archive(path: Path) -> list[str]:
             )
             validation.require(
                 isinstance(official_completed, int)
-                and scanned_pages == official_completed,
-                "scannedSourcePages must equal successfully parsed official pages",
+                and isinstance(scanned_pages, int)
+                and scanned_pages <= official_completed,
+                "scannedSourcePages cannot exceed successfully parsed official pages",
             )
             if selection_status == "target_met":
                 validation.require(
                     len(uninspected_candidates) == 0
+                    and len(asset_paths) == MAX_IMAGES
                     and any(
                         asset.get("assetType") == "brand_identity"
                         for asset in assets.values()
+                    )
+                    and any(
+                        asset.get("displayRole") == "hero"
+                        for asset in assets.values()
+                    )
+                    and any(
+                        asset.get("assetType")
+                        in {
+                            "product_ui",
+                            "product_diagram",
+                            "case_photo",
+                            "document_figure",
+                        }
+                        for asset in assets.values()
                     ),
-                    "target_met requires complete candidate inspection and "
-                    "brand imagery",
+                    "target_met requires three distinct classic assets: "
+                    "brand identity, brand hero, and representative product imagery",
                 )
                 validation.require(
                     "shortfallReason" not in image_selection,

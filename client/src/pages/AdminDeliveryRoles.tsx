@@ -185,14 +185,6 @@ function getInitialProjectSelection() {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 
-function getInitialHighlightedRole() {
-  if (typeof window === "undefined") return null;
-  const value = new URLSearchParams(window.location.search).get("role");
-  return ROLE_TYPES.includes(value as DeliveryRoleType)
-    ? (value as DeliveryRoleType)
-    : null;
-}
-
 export default function AdminDeliveryRoles() {
   const { user } = useAuth();
   const utils = trpc.useUtils();
@@ -206,8 +198,6 @@ export default function AdminDeliveryRoles() {
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(
     getInitialProjectSelection,
   );
-  const [highlightedRole, setHighlightedRole] =
-    useState<DeliveryRoleType | null>(getInitialHighlightedRole);
 
   const data = overview.data as unknown as ProjectTeamOverview | undefined;
   const projects = data?.projects ?? [];
@@ -261,7 +251,6 @@ export default function AdminDeliveryRoles() {
     }
     if (!filteredProjects.some((project) => project.id === selectedProjectId)) {
       setSelectedProjectId(filteredProjects[0].id);
-      setHighlightedRole(null);
     }
   }, [data, filteredProjects, selectedProjectId]);
 
@@ -333,7 +322,6 @@ export default function AdminDeliveryRoles() {
               firstPendingTicket?.workflowDomain
                 ? () => {
                     setSelectedProjectId(firstPendingTicket.userId);
-                    setHighlightedRole(firstPendingTicket.workflowDomain);
                     window.setTimeout(
                       () =>
                         document
@@ -438,8 +426,6 @@ export default function AdminDeliveryRoles() {
                       ticket.assignedMemberId == null,
                   );
                   const pendingTickets = pendingTicketRows.length;
-                  const roleToHighlight =
-                    pendingTicketRows[0]?.workflowDomain ?? missing[0] ?? null;
                   return (
                     <button
                       key={project.id}
@@ -451,7 +437,6 @@ export default function AdminDeliveryRoles() {
                       )}
                       onClick={() => {
                         setSelectedProjectId(project.id);
-                        setHighlightedRole(roleToHighlight);
                         window.setTimeout(
                           () =>
                             document
@@ -543,7 +528,6 @@ export default function AdminDeliveryRoles() {
                     assignments={assignments}
                     engineers={engineers}
                     tickets={tickets}
-                    highlightedRole={highlightedRole}
                     mutationPending={setProjectEngineer.isPending}
                     onUpdateEngineer={updateEngineer}
                   />
@@ -566,7 +550,6 @@ function ProjectDetails({
   assignments,
   engineers,
   tickets,
-  highlightedRole,
   mutationPending,
   onUpdateEngineer,
 }: {
@@ -574,7 +557,6 @@ function ProjectDetails({
   assignments: ProjectTeamAssignment[];
   engineers: ProjectTeamEngineer[];
   tickets: ProjectTicket[];
-  highlightedRole: DeliveryRoleType | null;
   mutationPending: boolean;
   onUpdateEngineer: (input: {
     customerUserId: number;
@@ -653,7 +635,6 @@ function ProjectDetails({
               assignment={assignment}
               engineers={engineers}
               activeTicketCount={roleTickets.length}
-              highlighted={highlightedRole === roleType}
               mutationPending={mutationPending}
               onUpdateEngineer={onUpdateEngineer}
             />
@@ -670,7 +651,6 @@ function ProjectRoleCard({
   assignment,
   engineers,
   activeTicketCount,
-  highlighted,
   mutationPending,
   onUpdateEngineer,
 }: {
@@ -679,7 +659,6 @@ function ProjectRoleCard({
   assignment?: ProjectTeamAssignment;
   engineers: ProjectTeamEngineer[];
   activeTicketCount: number;
-  highlighted: boolean;
   mutationPending: boolean;
   onUpdateEngineer: (input: {
     customerUserId: number;
@@ -741,7 +720,6 @@ function ProjectRoleCard({
       className={cn(
         "rounded-xl border p-4 transition-shadow",
         !enabled && "bg-muted/25 opacity-75",
-        highlighted && enabled && "border-amber-400 ring-2 ring-amber-200",
       )}
     >
       <div className="flex flex-wrap items-start justify-between gap-3">

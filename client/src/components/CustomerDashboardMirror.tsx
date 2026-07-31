@@ -9,6 +9,7 @@ import {
   House,
   LibraryBig,
   ListChecks,
+  LockKeyhole,
   Menu,
   Newspaper,
   Shield,
@@ -24,6 +25,13 @@ import MarkdownRenderer from "@/components/MarkdownRenderer";
 import AiWebsiteManagementWorkspace from "@/dashboard/AiWebsiteManagementWorkspace";
 import ProgressReportWorkspace from "@/dashboard/ProgressReportWorkspace";
 import QuestionMonitoringWorkspace from "@/dashboard/QuestionMonitoringWorkspace";
+import { ServiceHome, ServiceLockedPage } from "@/dashboard/service-portal-ui";
+import {
+  getCapability,
+  normalizeServicePortal,
+  type ServiceCapabilityKey,
+  type ServicePortalView,
+} from "@/dashboard/service-portal";
 import {
   ManagedDashboardSection,
   ManagedKeywordTables,
@@ -110,6 +118,101 @@ const ALL_CUSTOMER_DASHBOARD_SECTIONS = CUSTOMER_DASHBOARD_GROUPS.flatMap(
   (group) => group.items.map((item) => item.value),
 );
 
+function mirrorSectionCapability(
+  section: CustomerDashboardMirrorSection,
+): ServiceCapabilityKey | null {
+  switch (section) {
+    case "knowledge-build":
+      return "knowledgeBuild";
+    case "knowledge":
+      return "knowledgeDisplay";
+    case "keywords":
+      return "globalKeywords";
+    case "questions":
+      return "intentOptimization";
+    case "response-logic":
+      return "responseLogic";
+    case "monitoring":
+      return "monitoring";
+    case "report":
+      return "progressReport";
+    case "content":
+    case "website":
+      return "contentAssets";
+    default:
+      return null;
+  }
+}
+
+function mirrorSectionTitle(section: CustomerDashboardMirrorSection) {
+  return (
+    CUSTOMER_DASHBOARD_GROUPS.flatMap((group) => group.items).find(
+      (item) => item.value === section,
+    )?.label ?? "客户看板"
+  );
+}
+
+function mirrorSectionForCustomerRoute(
+  section: string,
+  sub?: string | null,
+): CustomerDashboardMirrorSection {
+  if (section === "knowledge-agent") {
+    return sub === "display" ? "knowledge" : "knowledge-build";
+  }
+  if (section === "brand") return "keywords";
+  if (section === "intent") return "questions";
+  if (section === "response-logic") return "response-logic";
+  if (section === "progress") {
+    return sub === "monitor" || sub === "distribution"
+      ? "monitoring"
+      : "report";
+  }
+  if (section === "semantic") {
+    return sub === "website-management" ? "website" : "content";
+  }
+  return "home";
+}
+
+function CustomerMirrorNavButton({
+  item,
+  active,
+  portal,
+  onSelect,
+}: {
+  item: CustomerDashboardNavigationItem;
+  active: boolean;
+  portal: ServicePortalView | null;
+  onSelect: (section: CustomerDashboardMirrorSection) => void;
+}) {
+  const capabilityKey = mirrorSectionCapability(item.value);
+  const access =
+    portal && capabilityKey ? getCapability(portal, capabilityKey) : null;
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      className={active ? "active" : ""}
+      onClick={() => onSelect(item.value)}
+      title={!access?.allowed ? access?.reason : undefined}
+      style={
+        access && !access.allowed
+          ? { gridTemplateColumns: "minmax(0, 1fr) auto" }
+          : undefined
+      }
+    >
+      <span>{item.label}</span>
+      {access && !access.allowed && (
+        <LockKeyhole
+          aria-hidden="true"
+          size={12}
+          className="ml-auto opacity-60"
+        />
+      )}
+    </button>
+  );
+}
+
 type CustomerDashboardMirrorProps = {
   payload: DashboardPayload;
   websiteWorkspace?:
@@ -118,6 +221,10 @@ type CustomerDashboardMirrorProps = {
       })
     | null;
   knowledgePreview?: CustomerKnowledgePreview | null;
+  servicePortal?: unknown;
+  servicePortalLoading?: boolean;
+  servicePortalError?: boolean;
+  onRefreshServicePortal?: () => void;
   initialSection?: CustomerDashboardMirrorSection;
   allowedSections?: readonly CustomerDashboardMirrorSection[];
   heading?: string;
@@ -165,6 +272,10 @@ export default function CustomerDashboardMirror({
   payload,
   websiteWorkspace = null,
   knowledgePreview = null,
+  servicePortal,
+  servicePortalLoading = false,
+  servicePortalError = false,
+  onRefreshServicePortal,
   initialSection = "home",
   allowedSections,
   heading,
@@ -187,6 +298,16 @@ export default function CustomerDashboardMirror({
         : (visibleSections[0] ?? "home"),
     );
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const normalizedServicePortal = useMemo(
+    () => normalizeServicePortal(servicePortal),
+    [servicePortal],
+  );
+  const usesServicePortal = Boolean(
+    servicePortal !== undefined ||
+      servicePortalLoading ||
+      servicePortalError ||
+      onRefreshServicePortal,
+  );
 
   useEffect(() => {
     if (visibleSections.includes(initialSection)) {
@@ -199,6 +320,9 @@ export default function CustomerDashboardMirror({
   const selectSection = (section: CustomerDashboardMirrorSection) => {
     setActiveSection(section);
     setMobileNavOpen(false);
+  };
+  const navigateCustomerRoute = (section: string, sub?: string | null) => {
+    selectSection(mirrorSectionForCustomerRoute(section, sub));
   };
   const sectionActions = renderSectionActions?.(activeSection);
   const showEditorBar = Boolean(
@@ -271,16 +395,15 @@ export default function CustomerDashboardMirror({
                   </div>
                   <div className="sub-nav">
                     {items.map((item) => (
-                      <button
+                      <CustomerMirrorNavButton
                         key={item.value}
-                        type="button"
-                        role="tab"
-                        aria-selected={activeSection === item.value}
-                        className={activeSection === item.value ? "active" : ""}
-                        onClick={() => selectSection(item.value)}
-                      >
-                        <span>{item.label}</span>
-                      </button>
+                        item={item}
+                        active={activeSection === item.value}
+                        portal={
+                          usesServicePortal ? normalizedServicePortal : null
+                        }
+                        onSelect={selectSection}
+                      />
                     ))}
                   </div>
                 </div>
@@ -326,6 +449,11 @@ export default function CustomerDashboardMirror({
             payload={payload}
             websiteWorkspace={websiteWorkspace}
             knowledgePreview={knowledgePreview}
+            servicePortal={usesServicePortal ? normalizedServicePortal : null}
+            servicePortalLoading={servicePortalLoading}
+            servicePortalError={servicePortalError}
+            onRefreshServicePortal={onRefreshServicePortal}
+            onNavigate={navigateCustomerRoute}
           />
         </main>
       </div>
@@ -338,11 +466,21 @@ function CustomerDashboardSection({
   payload,
   websiteWorkspace,
   knowledgePreview,
+  servicePortal,
+  servicePortalLoading,
+  servicePortalError,
+  onRefreshServicePortal,
+  onNavigate,
 }: {
   section: CustomerDashboardMirrorSection;
   payload: DashboardPayload;
   websiteWorkspace: CustomerDashboardMirrorProps["websiteWorkspace"];
   knowledgePreview: CustomerDashboardMirrorProps["knowledgePreview"];
+  servicePortal: ServicePortalView | null;
+  servicePortalLoading: boolean;
+  servicePortalError: boolean;
+  onRefreshServicePortal?: () => void;
+  onNavigate: (section: string, sub?: string | null) => void;
 }) {
   const questionGroups = useMemo(() => {
     const groups = new Map<
@@ -380,15 +518,41 @@ function CustomerDashboardSection({
   }, [payload.questions]);
 
   if (section === "home") {
-    return (
+    return servicePortal ? (
+      <ServiceHome
+        portal={servicePortal}
+        companyName={payload.brandName}
+        loading={servicePortalLoading}
+        error={servicePortalError}
+        onNavigate={onNavigate}
+        onRefresh={onRefreshServicePortal}
+      />
+    ) : (
       <ManagedDashboardSection payload={payload} loading={false} error={null} />
+    );
+  }
+
+  const capabilityKey = mirrorSectionCapability(section);
+  const access =
+    servicePortal && capabilityKey
+      ? getCapability(servicePortal, capabilityKey)
+      : null;
+  if (servicePortal && access && !access.allowed) {
+    return (
+      <ServiceLockedPage
+        title={mirrorSectionTitle(section)}
+        access={access}
+        portal={servicePortal}
+        onRefresh={onRefreshServicePortal}
+        onNavigate={onNavigate}
+      />
     );
   }
 
   if (section === "website") {
     return websiteWorkspace ? (
       <AiWebsiteManagementWorkspace
-        planCode="advanced"
+        planCode={servicePortal?.plan.code ?? "advanced"}
         marketEdition={websiteWorkspace.marketEdition}
         websiteWorkflow={websiteWorkspace.websiteWorkflow}
         contentCatalog={websiteWorkspace.websiteContentCatalog}

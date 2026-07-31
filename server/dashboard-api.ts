@@ -111,6 +111,7 @@ import {
   DashboardImportPreflightError,
   issueDashboardImportPreflight,
 } from "./dashboard-import-preflight-service";
+import { readStoredPresalesFile } from "./presales-file-store";
 
 const router = express.Router();
 const MAX_ARCHIVE_ENTRIES = 2_000;
@@ -6171,36 +6172,40 @@ export async function downloadArchiveBytes(input: {
       : undefined);
 
   if (fileId) {
-    const metadataResponse = await axios.get(
-      `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
-      {
-        headers: upstreamHeaders(input.apiKey),
-        proxy: false,
-        timeout: 120_000,
-        maxContentLength: 2 * 1024 * 1024,
-        validateStatus: () => true,
-      },
-    );
-    if (metadataResponse.status !== 200) {
-      throw new Error(`读取知识库文件信息失败 (${metadataResponse.status})`);
+    const stored = await readStoredPresalesFile(fileId);
+    if (stored) {
+      if (stored.sizeBytes > MAX_ARCHIVE_BYTES) {
+        throw new Error("知识库 ZIP 超过 250 MB");
+      }
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      const hash = createHash("sha256");
+      for await (const rawChunk of stored.createReadStream()) {
+        const chunk = Buffer.isBuffer(rawChunk)
+          ? rawChunk
+          : Buffer.from(rawChunk);
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_ARCHIVE_BYTES) {
+          throw new Error("知识库 ZIP 超过 250 MB");
+        }
+        chunks.push(chunk);
+        hash.update(chunk);
+      }
+      if (totalBytes === 0 || totalBytes !== stored.sizeBytes) {
+        throw new Error("知识库 ZIP 本地持久副本不完整");
+      }
+      if (stored.sha256 && hash.digest("hex") !== stored.sha256) {
+        throw new Error("知识库 ZIP 本地持久副本校验失败");
+      }
+      const buffer = Buffer.concat(chunks, totalBytes);
+      filename = stored.filename || filename;
+      if (!filename.toLowerCase().endsWith(".zip")) {
+        filename = `${path.basename(filename, path.extname(filename)) || "knowledge-base"}.zip`;
+      }
+      return { buffer, filename };
     }
-    const returnedFileId = String(
-      metadataResponse.data?.id || metadataResponse.data?.file_id || "",
-    );
-    if (returnedFileId && returnedFileId !== fileId) {
-      throw new Error("读取到的知识库文件与最终版本不匹配");
-    }
-    if (metadataResponse.data?.filename) {
-      filename = String(metadataResponse.data.filename);
-    }
-    if (metadataResponse.data?.upload_url) {
-      downloadUrl = assertSafeExternalUrl(
-        String(metadataResponse.data.upload_url),
-      );
-    } else {
-      downloadUrl = `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`;
-      headers = upstreamHeaders(input.apiKey);
-    }
+    downloadUrl = `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`;
+    headers = upstreamHeaders(input.apiKey);
   } else if (input.descriptor.url) {
     downloadUrl = assertSafeExternalUrl(input.descriptor.url);
   }
@@ -6239,6 +6244,17 @@ export async function downloadArchiveBytes(input: {
   if (response.status !== 200) {
     response.data?.destroy?.();
     throw new Error(`下载知识库 ZIP 失败 (${response.status})`);
+  }
+  const disposition = String(response.headers["content-disposition"] || "");
+  const encodedFilename = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const plainFilename = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+  const responseFilename = encodedFilename || plainFilename;
+  if (responseFilename) {
+    try {
+      filename = path.basename(decodeURIComponent(responseFilename.trim()));
+    } catch {
+      filename = path.basename(responseFilename.trim());
+    }
   }
   const declaredLength = Number(response.headers["content-length"] || 0);
   if (Number.isFinite(declaredLength) && declaredLength > MAX_ARCHIVE_BYTES) {

@@ -72,6 +72,10 @@ type DashboardSkeletonEditorProps = {
   workspace?: DashboardWorkspaceSnapshot;
   loading?: boolean;
   knowledgePreview?: CustomerKnowledgePreview | null;
+  servicePortal?: unknown;
+  servicePortalLoading?: boolean;
+  servicePortalError?: boolean;
+  onRefreshServicePortal?: () => void;
   websiteWorkspace?:
     | (PublicDeliveryTicketWorkspaceMetadata & {
         tickets: PublicDeliveryTicketSummary[];
@@ -554,6 +558,10 @@ export default function DashboardSkeletonEditor({
   workspace,
   loading = false,
   knowledgePreview = null,
+  servicePortal,
+  servicePortalLoading = false,
+  servicePortalError = false,
+  onRefreshServicePortal,
   websiteWorkspace = null,
   knowledgeUploading = false,
   onUploadKnowledge,
@@ -1028,10 +1036,11 @@ export default function DashboardSkeletonEditor({
       <CustomerDashboardMirror
         payload={draft}
         knowledgePreview={knowledgePreview}
+        servicePortal={servicePortal}
+        servicePortalLoading={servicePortalLoading}
+        servicePortalError={servicePortalError}
+        onRefreshServicePortal={onRefreshServicePortal}
         websiteWorkspace={websiteWorkspace}
-        heading="客户实际页面"
-        description="当前打开的就是客户看板本体；切换左侧分区，在原位置下载当前数据或上传修改。"
-        statusLabel={`正式版本 R${revision}`}
         editActions={
           <Button
             size="sm"

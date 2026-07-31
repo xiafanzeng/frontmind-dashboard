@@ -708,8 +708,7 @@ export function useSendMessage() {
           const effectiveStatus = options?.syncKnowledgeBaseSnapshot
             ? knowledgeInteraction?.interactionState === "awaiting_input"
               ? "awaiting_input"
-              : knowledgeInteraction?.interactionState ===
-                    "ready_to_publish" ||
+              : knowledgeInteraction?.interactionState === "ready_to_publish" ||
                   knowledgeInteraction?.interactionState === "published"
                 ? "completed"
                 : knowledgeInteraction?.interactionState === "failed" ||
@@ -727,6 +726,17 @@ export function useSendMessage() {
             effectiveStatus === "awaiting_input" ||
             effectiveStatus === "completed" ||
             effectiveStatus === "error";
+          const authoritativeKnowledgePresentation =
+            options?.syncKnowledgeBaseSnapshot &&
+            knowledgeInteraction?.progress &&
+            (knowledgeInteraction.interactionState === "awaiting_input" ||
+              knowledgeInteraction.interactionState === "ready_to_publish" ||
+              knowledgeInteraction.interactionState === "published")
+              ? {
+                  revision: knowledgeInteraction.progress.build.revision,
+                  leafId: knowledgeInteraction.progress.build.currentLeafId,
+                }
+              : undefined;
 
           updateStatus(convId, effectiveStatus as any, {
             taskId: response.id,
@@ -744,10 +754,14 @@ export function useSendMessage() {
             duration: 3200,
           });
 
-          // Visible output is independent from knowledge-base protocol state.
-          // Running knowledge text is projected immediately, while only the
-          // server interaction envelope can unlock input or publishing.
-          if (response.output && response.output.length > 0) {
+          // Ordinary tasks may render running output. Knowledge-base text is
+          // shown only after the server validates the exact revision/leaf pair.
+          if (
+            response.output &&
+            response.output.length > 0 &&
+            (!options?.syncKnowledgeBaseSnapshot ||
+              authoritativeKnowledgePresentation)
+          ) {
             const newOutput = sliceNewOutput(
               response.output,
               baselineOutputLength,
@@ -767,6 +781,7 @@ export function useSendMessage() {
                 responseStartedAt,
                 modelName: agentProfile,
                 knowledgeBase: Boolean(options?.syncKnowledgeBaseSnapshot),
+                knowledgeBasePresentation: authoritativeKnowledgePresentation,
               });
               if (assistantMsgs.length > 0) {
                 updateAssistantMessages(convId, assistantMsgs);
@@ -851,6 +866,7 @@ export function useSendMessage() {
                   responseStartedAt,
                   modelName: agentProfile,
                   knowledgeBase: Boolean(options?.syncKnowledgeBaseSnapshot),
+                  knowledgeBasePresentation: authoritativeKnowledgePresentation,
                 });
                 if (finalMsgs.length > 0) {
                   finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;

@@ -16,7 +16,10 @@ import {
   type WorkspaceTab,
 } from "./lib/admin-workspace-tabs";
 import SetupPassword from "./pages/SetupPassword";
-import { isSystemAdminAccount } from "@/lib/admin-access";
+import {
+  isDeliveryAdminAccount,
+  isSystemAdminAccount,
+} from "@/lib/admin-access";
 import { hasExplicitAdminRole } from "@shared/admin-access";
 import { userFacingErrorMessage } from "@/lib/user-facing-error";
 
@@ -104,6 +107,11 @@ function SystemAdminOnly({ children }: { children: React.ReactNode }) {
   return isSystemAdminAccount(user) ? children : <Redirect to="/" />;
 }
 
+function DeliveryAdminOnly({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  return isDeliveryAdminAccount(user) ? children : <Redirect to="/" />;
+}
+
 function UserOnly({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
   return user?.role === "user" ? children : <Redirect to="/" />;
@@ -120,14 +128,14 @@ function Router() {
       <Route path={"/"} component={RoleLanding} />
       <Route path={"/login"} component={RoleLanding} />
       <Route path={"/agent"}>
-        <AdminOnly>
+        <DeliveryAdminOnly>
           <Redirect to="/admin/agent" />
-        </AdminOnly>
+        </DeliveryAdminOnly>
       </Route>
       <Route path={"/admin/agent"}>
-        <AdminOnly>
+        <DeliveryAdminOnly>
           <AdminAgent />
-        </AdminOnly>
+        </DeliveryAdminOnly>
       </Route>
       <Route path={"/knowledge-base"}>
         <UserOnly>
@@ -186,9 +194,7 @@ function Router() {
         </DeliveryMemberOnly>
       </Route>
       <Route path={"/workflow"}>
-        <SystemAdminOnly>
-          <Redirect to="/admin/agent" />
-        </SystemAdminOnly>
+        <Redirect to="/" />
       </Route>
       <Route path={"/404"} component={NotFound} />
       <Route component={NotFound} />

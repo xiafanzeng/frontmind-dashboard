@@ -177,7 +177,7 @@ describe("useResumePolling hydration gate", () => {
     unmount();
   });
 
-  it("renders running knowledge-base text without unlocking the conversation", async () => {
+  it("does not render unvalidated running knowledge-base text", async () => {
     mocks.hydrated = true;
     mocks.conversations = [
       {
@@ -244,14 +244,7 @@ describe("useResumePolling hydration gate", () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
 
-    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
-      "kb-running",
-      expect.arrayContaining([
-        expect.objectContaining({
-          content: "FrontMind 正在按业务分支进行资料采集。",
-        }),
-      ]),
-    );
+    expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
     expect(mocks.updateStatus).toHaveBeenCalledWith(
       "kb-running",
       "running",
@@ -266,7 +259,7 @@ describe("useResumePolling hydration gate", () => {
     unmount();
   });
 
-  it("keeps safe text and persists an error when terminal knowledge protocol validation fails", async () => {
+  it("does not render terminal knowledge text when protocol validation fails", async () => {
     mocks.hydrated = true;
     mocks.conversations = [
       {
@@ -321,12 +314,7 @@ describe("useResumePolling hydration gate", () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
 
-    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
-      "kb-invalid",
-      expect.arrayContaining([
-        expect.objectContaining({ content: "最后一条安全正文" }),
-      ]),
-    );
+    expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
     expect(mocks.addMessage).toHaveBeenCalledWith(
       "kb-invalid",
       expect.objectContaining({
@@ -346,8 +334,7 @@ describe("useResumePolling hydration gate", () => {
   it("continues checking a restored task after more than two hours", async () => {
     vi.setSystemTime(new Date("2026-07-29T00:00:00.000Z"));
     mocks.hydrated = true;
-    mocks.conversations[0].startedAt =
-      Date.now() - 3 * 60 * 60 * 1000;
+    mocks.conversations[0].startedAt = Date.now() - 3 * 60 * 60 * 1000;
     const { unmount } = renderHook(() => useResumePolling());
 
     await act(async () => {
@@ -375,9 +362,7 @@ describe("useResumePolling hydration gate", () => {
       {
         id: "kb-error",
         title: "Knowledge",
-        messages: [
-          { id: "user", role: "user", content: "确认", timestamp: 1 },
-        ],
+        messages: [{ id: "user", role: "user", content: "确认", timestamp: 1 }],
         status: "error",
         taskId: "task-kb",
         createdAt: 1,
@@ -393,7 +378,7 @@ describe("useResumePolling hydration gate", () => {
         content: [
           {
             type: "output_text",
-            text: "5.6 正文\n<!-- FRONTMIND_KB_PRESENTATION {\"revision\":46,\"leafId\":\"5.6\"} -->",
+            text: '5.6 正文\n<!-- FRONTMIND_KB_PRESENTATION {"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":46,"leafId":"5.6","imageState":"no_eligible_asset","assetIds":[],"imageCount":0} -->',
           },
         ],
       },
@@ -408,7 +393,12 @@ describe("useResumePolling hydration gate", () => {
     });
     mocks.reconcileKnowledgeBaseProgress.mockResolvedValue({
       progress: {
-        build: { id: "build", conversationId: "kb-error" },
+        build: {
+          id: "build",
+          conversationId: "kb-error",
+          revision: 46,
+          currentLeafId: "5.6",
+        },
       },
       interactionState: "awaiting_input",
       canReply: true,

@@ -60,15 +60,35 @@ type GuideStage = {
 export type AliyunIcpGuideProps = {
   onContactAdvisor?: () => void;
   currentPhase?: "domain" | "icp";
+  marketEdition?: "domestic" | "overseas";
   scenario?: AliyunGuideScenario;
   onScenarioChange?: (scenario: AliyunGuideScenario) => void;
   stageThreeContent?: ReactNode;
+  filingSubmissionContent?: ReactNode;
 };
 
 export type AliyunGuideScenario =
   | "first_filing"
   | "existing_filing"
   | "overseas";
+
+const GUIDE_SCENARIO_OPTIONS = [
+  {
+    value: "first_filing" as const,
+    label: "国内版 · 企业首次备案",
+    marketEdition: "domestic" as const,
+  },
+  {
+    value: "existing_filing" as const,
+    label: "国内版 · 已有 ICP 备案",
+    marketEdition: "domestic" as const,
+  },
+  {
+    value: "overseas" as const,
+    label: "海外版 · 香港/海外节点",
+    marketEdition: "overseas" as const,
+  },
+];
 
 const IMAGE_ROOT = "/assets/aliyun-icp-guide";
 const SCREENSHOT_SOURCE =
@@ -987,9 +1007,11 @@ function GuideFigure({
 export default function AliyunIcpGuide({
   onContactAdvisor,
   currentPhase = "domain",
+  marketEdition = "domestic",
   scenario,
   onScenarioChange,
   stageThreeContent,
+  filingSubmissionContent,
 }: AliyunIcpGuideProps) {
   const [internalScenario, setInternalScenario] =
     useState<AliyunGuideScenario>("first_filing");
@@ -997,7 +1019,16 @@ export default function AliyunIcpGuide({
   const [selectedImage, setSelectedImage] = useState<GuideImage | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const returnFocusRef = useRef<HTMLButtonElement | null>(null);
-  const activeScenario = scenario ?? internalScenario;
+  const requestedScenario = scenario ?? internalScenario;
+  const activeScenario =
+    marketEdition === "overseas"
+      ? "overseas"
+      : requestedScenario === "overseas"
+        ? "first_filing"
+        : requestedScenario;
+  const scenarioOptions = GUIDE_SCENARIO_OPTIONS.filter(
+    (option) => option.marketEdition === marketEdition,
+  );
   const activeStages =
     activeScenario === "existing_filing"
       ? existingFilingStages
@@ -1010,9 +1041,9 @@ export default function AliyunIcpGuide({
       title: "企业首次备案：照着下面 7 个阶段一步一步做",
       description:
         "适用于主体和网站都没有办理过 ICP 备案的国内版客户。先注册企业实名域名，再按下面的阶段逐步办理。",
-      routingTitle: "已有备案或使用海外节点？请切换教程",
+      routingTitle: "企业已有备案？请切换教程",
       routingDescription:
-        "企业已有 ICP 主体备案、需要为新域名新增网站时，请切换到“已有 ICP 备案”；中国香港或海外节点请切换到海外版。",
+        "企业已有 ICP 主体备案、需要为新域名新增网站时，请切换到“已有 ICP 备案”。",
       advisorLabel: "不确定场景，联系服务专员",
       checklistTitle: "注册域名前，把这 5 样放在手边",
       checklistItems: [
@@ -1109,6 +1140,8 @@ export default function AliyunIcpGuide({
   }
 
   function selectScenario(nextScenario: AliyunGuideScenario) {
+    if (!scenarioOptions.some((option) => option.value === nextScenario))
+      return;
     if (scenario === undefined) setInternalScenario(nextScenario);
     onScenarioChange?.(nextScenario);
     setOpenStages(new Set([1]));
@@ -1118,11 +1151,7 @@ export default function AliyunIcpGuide({
     event: ReactKeyboardEvent<HTMLButtonElement>,
     currentScenario: AliyunGuideScenario,
   ) {
-    const order: AliyunGuideScenario[] = [
-      "first_filing",
-      "existing_filing",
-      "overseas",
-    ];
+    const order = scenarioOptions.map((option) => option.value);
     const currentIndex = order.indexOf(currentScenario);
     let nextIndex: number | null = null;
     if (event.key === "ArrowRight" || event.key === "ArrowDown") {
@@ -1157,20 +1186,7 @@ export default function AliyunIcpGuide({
         role="tablist"
         aria-label="选择域名与备案教程"
       >
-        {[
-          {
-            value: "first_filing" as const,
-            label: "国内版 · 企业首次备案",
-          },
-          {
-            value: "existing_filing" as const,
-            label: "国内版 · 已有 ICP 备案",
-          },
-          {
-            value: "overseas" as const,
-            label: "海外版 · 香港/海外节点",
-          },
-        ].map((item) => (
+        {scenarioOptions.map((item) => (
           <button
             type="button"
             role="tab"
@@ -1371,18 +1387,21 @@ export default function AliyunIcpGuide({
           })}
         </ol>
 
-        {currentPhase === "icp" && (
-          <div className="ai-website-guide-finish">
-            <CheckCircle2 size={22} aria-hidden="true" />
-            <div>
-              <strong>阿里云已显示备案通过？</strong>
-              <p>
-                请从已完成订单详情中复制 ICP
-                主体备案号，然后只在下方回填域名和备案号。
-              </p>
+        {currentPhase === "icp" && marketEdition === "domestic" && (
+          <>
+            <div className="ai-website-guide-finish">
+              <CheckCircle2 size={22} aria-hidden="true" />
+              <div>
+                <strong>阿里云已显示备案通过？</strong>
+                <p>
+                  请从已完成订单详情中复制 ICP
+                  主体备案号，然后只在下方回填域名和备案号。
+                </p>
+              </div>
+              <a href="#ai-website-result-form">我已取得备案号，去填写结果</a>
             </div>
-            <a href="#ai-website-result-form">我已取得备案号，去填写结果</a>
-          </div>
+            {filingSubmissionContent}
+          </>
         )}
 
         <div className="ai-website-guide-security">
