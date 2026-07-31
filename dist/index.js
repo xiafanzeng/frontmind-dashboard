@@ -11698,7 +11698,6 @@ function customerFormalContentViolation(value) {
 }
 
 // server/knowledge-base-progress-service.ts
-var KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH = "e84d5200b4bffa2ac6ff95f6a74d3d9a2875fa7b04f766e5df407ae5b833bdf6";
 var KnowledgeBaseBuildError = class extends Error {
   constructor(code, message) {
     super(message);
@@ -11771,9 +11770,6 @@ function latestKnowledgeBasePresentationOutput(output) {
   return output.slice(presentationIndex);
 }
 function assertKnowledgeBaseNodeImageDelivery(input) {
-  if (input.skillContentHash !== KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH) {
-    return;
-  }
   const { presentation } = input;
   if (presentation.imageState === void 0 || presentation.assetIds === void 0 || presentation.imageCount === void 0) {
     throw new KnowledgeBaseBuildError(
@@ -11793,19 +11789,21 @@ function assertKnowledgeBaseNodeImageDelivery(input) {
     }
     return;
   }
-  if (presentation.imageState === "attached") {
-    if (presentation.assetIds.length === 0 || presentation.assetIds.length !== presentation.imageCount || presentation.imageCount !== actualImageCount) {
-      throw new KnowledgeBaseBuildError(
-        "PROGRESS_PROTOCOL_INVALID",
-        "\u5F53\u524D\u8282\u70B9\u56FE\u7247\u9644\u4EF6\u4E0E\u8D44\u4EA7\u58F0\u660E\u4E0D\u4E00\u81F4\uFF0C\u672C\u8F6E\u672A\u63A8\u8FDB"
-      );
-    }
-    return;
-  }
   if (presentation.imageState !== "no_eligible_asset" || presentation.assetIds.length !== 0 || presentation.imageCount !== 0 || actualImageCount !== 0) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
-      "\u5F53\u524D\u8282\u70B9\u65E0\u53EF\u4EA4\u4ED8\u56FE\u7247\u65F6\u5FC5\u987B\u660E\u786E\u58F0\u660E no_eligible_asset"
+      "\u56FE\u7247\u53EA\u5141\u8BB8\u5728\u9996\u8F6E\u7B2C\u4E00\u4E2A\u8282\u70B9\u5C55\u793A\uFF1B\u540E\u7EED\u8282\u70B9\u5FC5\u987B\u58F0\u660E no_eligible_asset \u4E14\u4E0D\u5F97\u8FD4\u56DE\u56FE\u7247\u9644\u4EF6"
+    );
+  }
+}
+function assertKnowledgeBaseInitialImageDelivery(output) {
+  const imageCount = collectKnowledgeBaseOutputImageKeys(
+    latestKnowledgeBasePresentationOutput(output)
+  ).size;
+  if (imageCount > 3) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "\u9996\u4E2A\u77E5\u8BC6\u8282\u70B9\u6700\u591A\u53EA\u80FD\u5C55\u793A\u4E09\u5F20\u4E92\u4E0D\u91CD\u590D\u7684\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247"
     );
   }
 }
@@ -12291,6 +12289,7 @@ async function reconcileKnowledgeBaseProgress(input) {
       }
       if (rows.length === 0) {
         const manifest = parseKnowledgeBaseManifestEnvelope(text2);
+        assertKnowledgeBaseInitialImageDelivery(input.output);
         const state2 = createKnowledgeBaseProgressState(manifest.leaves);
         await tx.insert(knowledgeBaseBuildNodes).values(
           state2.leaves.map((leaf, index2) => ({
@@ -12371,7 +12370,6 @@ async function reconcileKnowledgeBaseProgress(input) {
             text2
           );
           assertKnowledgeBaseNodeImageDelivery({
-            skillContentHash: build.skillContentHash,
             presentation,
             output: input.output
           });
@@ -12438,7 +12436,6 @@ async function reconcileKnowledgeBaseProgress(input) {
           text2
         );
         assertKnowledgeBaseNodeImageDelivery({
-          skillContentHash: build.skillContentHash,
           presentation,
           output: input.output
         });
@@ -31441,7 +31438,7 @@ async function buildKnowledgeBasePrompt({
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u77E5\u8BC6\u6811\u7EDF\u8BA1\uFF08\u4EC5\u9996\u8F6E\u9700\u8981\uFF09\u548C\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\u3002\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\uFF1B\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\u3002\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u5D4C\u5165\u5B98\u7F51\u6216 CDN \u56FE\u7247\u5916\u94FE\u3002\u56FE\u7247\u5FC5\u987B\u5148\u4E0B\u8F7D\u771F\u5B9E\u5B57\u8282\u3001\u89E3\u7801\u6821\u9A8C\u5E76\u6253\u5165\u6700\u7EC8 ZIP\uFF0C\u518D\u4EE5\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u5F15\u7528\uFF1B\u9632\u76D7\u94FE\u3001\u7B7E\u540D\u3001\u8FC7\u671F\u6216\u65E0\u6CD5\u4E0B\u8F7D\u7684\u5730\u5740\u53EA\u80FD\u8FDB\u5165\u5185\u90E8\u6765\u6E90\u8BB0\u5F55\uFF0C\u7EDD\u4E0D\u80FD\u4F5C\u4E3A\u5BA2\u6237\u56FE\u7247\u8FD4\u56DE\u3002",
-    "\u9010\u8282\u70B9\u786E\u8BA4\u8FD8\u5FC5\u987B\u4EA4\u4ED8\u771F\u5B9E\u56FE\u7247\u9644\u4EF6\uFF1A\u5C55\u793A\u8282\u70B9\u5B58\u5728\u5408\u683C related assetIds \u65F6\uFF0C\u4ECE\u5DF2\u4E0B\u8F7D\u5E76\u9A8C\u8BC1\u7684\u672C\u5730\u5B57\u8282\u4E2D\u9009\u62E9\u6700\u591A\u4E09\u5F20\uFF0C\u4EE5 output_image \u6216 image MIME \u7684 output_file \u4F5C\u4E3A\u540C\u4E00\u56DE\u590D\u7684\u771F\u5B9E\u9644\u4EF6\u8FD4\u56DE\u3002\u4E0D\u5F97\u53EA\u5199\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u3001\u56FE\u7247\u6807\u9898\u6216\u201C\u914D\u56FE\u201D\u5360\u4F4D\uFF1B\u5F53\u524D\u8282\u70B9\u6CA1\u6709\u5408\u683C\u5173\u8054\u7D20\u6750\u65F6\u624D\u5141\u8BB8\u7EAF\u6587\u5B57\u8FD4\u56DE\u3002\u9010\u8F6E\u9644\u4EF6\u4E0E\u6700\u7EC8 ZIP \u5FC5\u987B\u4F7F\u7528\u540C\u4E00\u8D44\u4EA7\u5B57\u8282\u3002",
+    "\u5168\u4EFB\u52A1\u53EA\u91C7\u96C6\u6700\u591A\u4E09\u5F20\u4E92\u4E0D\u91CD\u590D\u7684\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\uFF1A\u4E3B Logo\u3001\u54C1\u724C\u4E3B\u89C6\u89C9\u3001\u5178\u578B\u4EA7\u54C1/UI/\u67B6\u6784\u56FE\u5404\u6700\u591A\u4E00\u5F20\uFF1B\u53D6\u5F97\u4E09\u5F20\u540E\u7ACB\u5373\u505C\u6B62\u56FE\u7247\u53D1\u73B0\u3002\u53EA\u6709\u9996\u8F6E\u6E05\u5355\u7B2C\u4E00\u4E2A\u53F6\u5B50\uFF08\u901A\u5E38\u4E3A 1.1 \u4E00\u53E5\u8BDD\u5B9A\u4F4D\uFF09\u53EF\u628A\u5DF2\u4E0B\u8F7D\u9A8C\u8BC1\u7684\u672C\u5730\u5B57\u8282\u4F5C\u4E3A output_image \u6216 image MIME output_file \u8FD4\u56DE\u3002\u540E\u7EED\u6240\u6709\u8282\u70B9\u3001\u4FEE\u8BA2\u4E0E\u91CD\u5F00\u8F6E\u6B21\u4E00\u5F8B\u7EAF\u6587\u5B57\uFF0C\u4E0D\u5F97\u91CD\u590D\u6216\u65B0\u589E\u56FE\u7247\u9644\u4EF6\u3002\u9996\u8F6E\u9644\u4EF6\u4E0E\u6700\u7EC8 ZIP \u5FC5\u987B\u4F7F\u7528\u540C\u4E00\u8D44\u4EA7\u5B57\u8282\u3002",
     `\u8D44\u6599\u91C7\u96C6\u9636\u6BB5\u7EDF\u4E00\u5411\u5BA2\u6237\u663E\u793A\uFF1A${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
     "",
     "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
@@ -31476,7 +31473,7 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
     "revision \u5FC5\u987B\u7B49\u4E8E\u5F53\u524D\u670D\u52A1\u7AEF revision\uFF1B\u6BCF\u6B21\u88AB\u63A5\u53D7\u540E\u52A0 1\u3002leafId \u53EA\u80FD\u662F\u5F53\u524D\u53F6\u5B50\uFF0Cfrom \u53EA\u80FD\u662F current \u6216 needs_verification\u3002",
     "FRONTMIND_KB_PROGRESS \u58F0\u660E\u672C\u8F6E\u5904\u7406\u7684\u65E7\u8282\u70B9\uFF1BFRONTMIND_KB_PRESENTATION \u58F0\u660E\u56DE\u590D\u6B63\u6587\u5B9E\u9645\u5C55\u793A\u7684\u65B0\u72B6\u6001\u3002\u5C55\u793A\u4FE1\u5C01 revision \u5FC5\u987B\u7B49\u4E8E\u63D0\u4EA4\u540E\u7684 revision\uFF0CleafId \u5FC5\u987B\u7B49\u4E8E\u63D0\u4EA4\u540E\u670D\u52A1\u7AEF\u7684 currentLeafId\uFF1B\u5168\u90E8\u5B8C\u6210\u65F6 leafId \u4E3A null\u3002",
-    "FRONTMIND_KB_PRESENTATION \u8FD8\u5FC5\u987B\u58F0\u660E\u5B9E\u9645\u56FE\u7247\u4EA4\u4ED8\uFF1A\u6709 1-3 \u5F20\u771F\u5B9E\u9644\u4EF6\u65F6 imageState=attached\u3001assetIds \u4E3A\u5BF9\u5E94\u7A33\u5B9A\u8D44\u4EA7 ID \u4E14 imageCount \u7B49\u4E8E\u9644\u4EF6\u6570\uFF1B\u5F53\u524D\u8282\u70B9\u786E\u65E0\u5408\u683C\u56FE\u7247\u65F6\u4F7F\u7528 no_eligible_asset\u3001\u7A7A\u6570\u7EC4\u548C 0\uFF1BleafId=null \u65F6\u53EA\u80FD\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002\u58F0\u660E\u4E0E\u771F\u5B9E\u9644\u4EF6\u4E0D\u4E00\u81F4\u65F6\u670D\u52A1\u7AEF\u62D2\u7EDD\u63A8\u8FDB\u3002",
+    "FRONTMIND_KB_PRESENTATION \u53EA\u51FA\u73B0\u5728\u975E\u9996\u8F6E\uFF0C\u56E0\u6B64 leafId \u975E null \u65F6\u5FC5\u987B\u56FA\u5B9A\u58F0\u660E imageState=no_eligible_asset\u3001assetIds=[]\u3001imageCount=0\uFF0C\u4E14\u672C\u8F6E\u4E0D\u5F97\u8FD4\u56DE\u4EFB\u4F55\u56FE\u7247\u9644\u4EF6\uFF1BleafId=null \u65F6\u53EA\u80FD\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002\u58F0\u660E\u4E0E\u771F\u5B9E\u9644\u4EF6\u4E0D\u4E00\u81F4\u65F6\u670D\u52A1\u7AEF\u62D2\u7EDD\u63A8\u8FDB\u3002",
     "\u53EA\u6709\u7528\u6237\u672C\u8F6E\u56DE\u590D\u6070\u597D\u8868\u8FBE\u201C\u786E\u8BA4/\u786E\u8BA4\u65E0\u8BEF/OK/\u6CA1\u95EE\u9898/\u901A\u8FC7\u201D\u7B49\u660E\u786E\u786E\u8BA4\u65F6\uFF0Cto \u624D\u80FD\u4E3A confirmed\uFF0C\u5E76\u53EA\u524D\u8FDB\u4E00\u4E2A\u53F6\u5B50\u3002",
     "\u53EA\u6709\u7528\u6237\u672C\u8F6E\u660E\u786E\u56DE\u590D\u201C\u8DF3\u8FC7/\u76F4\u63A5\u9884\u586B/\u91C7\u7528\u9884\u586B/\u4FDD\u7559\u9884\u586B\u201D\u7B49\u65F6\uFF0Cto \u624D\u80FD\u4E3A direct_prefilled\uFF0C\u5E76\u53EA\u524D\u8FDB\u4E00\u4E2A\u53F6\u5B50\u3002",
     "direct_prefilled \u53EA\u7528\u4E8E\u517C\u5BB9\u7528\u6237\u4E3B\u52A8\u8F93\u5165\u7684\u65E7\u534F\u8BAE\u52A8\u4F5C\uFF1B\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\u3002\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
@@ -31595,11 +31592,11 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     "\u53EA\u8981\u672C\u8F6E\u5305\u542B\u9644\u4EF6\uFF0C\u65E0\u8BBA\u6587\u5B57\u662F\u5426\u5305\u542B\u201C\u786E\u8BA4\u201D\uFF0C\u90FD\u5FC5\u987B\u6309\u8865\u5145/\u4FEE\u8BA2\u5904\u7406\uFF0C\u4FDD\u6301 needs_verification\u3002",
     "\u56DE\u590D\u672B\u5C3E\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PROGRESS \u4FE1\u5C01\uFF1BHTML \u6CE8\u91CA\u5F00\u5934\u548C\u7ED3\u5C3E\u662F\u4FE1\u5C01\u7684\u4E00\u90E8\u5206\uFF0C\u4E0D\u5F97\u7701\u7565\u6216\u6539\u6210\u88F8 JSON\u3002",
     action === "confirm" || action === "direct_prefill" ? nextPending ? `\u5148\u7B80\u77ED\u786E\u8BA4\u5DF2\u5904\u7406 ${current.id}\uFF0C\u6B63\u6587\u4E3B\u4F53\u968F\u540E\u5B8C\u6574\u5C55\u793A\u4E0B\u4E00\u8282\u70B9 ${nextPending.id}\uFF5C${nextPending.branchTitle} / ${nextPending.title}\u3002\u4E0D\u5F97\u518D\u6B21\u628A ${current.id} \u4F5C\u4E3A\u4E3B\u4F53\u3002` : `\u8FD9\u662F\u6700\u540E\u4E00\u4E2A\u8282\u70B9\u3002\u7B80\u77ED\u786E\u8BA4 ${current.id} \u540E\u76F4\u63A5\u751F\u6210\u552F\u4E00\u6700\u7EC8 ZIP\uFF0C\u4E0D\u518D\u5C55\u793A\u8282\u70B9\u6B63\u6587\u3002` : `\u66F4\u65B0\u5E76\u5B8C\u6574\u91CD\u65B0\u5C55\u793A\u5F53\u524D\u8282\u70B9 ${current.id}\uFF1B\u4E0D\u5F97\u5C55\u793A\u6216\u63A8\u8FDB\u5230\u540E\u7EED\u8282\u70B9\u3002`,
-    isV3 ? `\u56DE\u590D\u672B\u5C3E\u8FD8\u5FC5\u987B\u9644\u4E14\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF1Arevision=${postRevision}\uFF0CleafId=${action === "confirm" || action === "direct_prefill" ? nextPending?.id || "null" : current.id}\u3002\u540C\u65F6\u4E25\u683C\u58F0\u660E imageState\u3001assetIds\u3001imageCount\uFF1A\u5B9E\u9645\u8FD4\u56DE 1-3 \u5F20\u56FE\u7247\u9644\u4EF6\u65F6\u4F7F\u7528 attached \u548C\u5BF9\u5E94\u7A33\u5B9A\u8D44\u4EA7 ID\uFF1B\u5F53\u524D\u8282\u70B9\u786E\u65E0\u5408\u683C\u56FE\u7247\u65F6\u4F7F\u7528 no_eligible_asset\u3001\u7A7A\u6570\u7EC4\u548C 0\uFF1BleafId=null \u65F6\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1A\u8BF7\u9075\u5FAA\u76F8\u540C\u7684\u5C55\u793A\u884C\u4E3A\uFF1B\u5982\u89C4\u7EA6\u652F\u6301\uFF0C\u53EF\u9644 FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0C\u4F46\u670D\u52A1\u7AEF\u4E0D\u5F3A\u5236\u8981\u6C42\u3002"
+    isV3 ? `\u56DE\u590D\u672B\u5C3E\u8FD8\u5FC5\u987B\u9644\u4E14\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF1Arevision=${postRevision}\uFF0CleafId=${action === "confirm" || action === "direct_prefill" ? nextPending?.id || "null" : current.id}\u3002\u8FD9\u662F\u975E\u9996\u8F6E\uFF1AleafId \u975E null \u65F6\u5FC5\u987B\u56FA\u5B9A\u58F0\u660E imageState=no_eligible_asset\u3001assetIds=[]\u3001imageCount=0\uFF0C\u4E14\u4E0D\u5F97\u8FD4\u56DE\u4EFB\u4F55\u56FE\u7247\u9644\u4EF6\uFF1BleafId=null \u65F6\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1A\u8BF7\u9075\u5FAA\u76F8\u540C\u7684\u5C55\u793A\u884C\u4E3A\uFF1B\u5982\u89C4\u7EA6\u652F\u6301\uFF0C\u53EF\u9644 FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0C\u4F46\u670D\u52A1\u7AEF\u4E0D\u5F3A\u5236\u8981\u6C42\u3002"
   ].join("\n") : [
     `\u5F53\u524D\u77E5\u8BC6\u5E93\u5DF2\u5B8C\u6210\uFF0Crevision=${progress.build.revision}\u3002`,
     "\u672C\u8F6E\u5982\u6709\u8865\u5145\u6216\u4FEE\u6539\uFF0C\u53EA\u80FD\u4ECE\u73B0\u6709\u8282\u70B9\u4E2D\u9009\u62E9\u4E00\u4E2A\u6700\u76F8\u5173\u8282\u70B9\u91CD\u65B0\u6838\u9A8C\uFF0C\u5E76\u9644\u4E00\u4E2A FRONTMIND_KB_REOPEN \u4FE1\u5C01\uFF1B\u4E0D\u5F97\u91CD\u5EFA\u77E5\u8BC6\u6811\u6216\u590D\u7528\u65E7\u5305\u3002",
-    isV3 ? `\u540C\u65F6\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0Crevision=${postRevision}\uFF0CleafId \u5FC5\u987B\u7B49\u4E8E FRONTMIND_KB_REOPEN \u9009\u4E2D\u7684\u8282\u70B9\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1B\u5C55\u793A\u884C\u4E3A\u4FDD\u6301\u517C\u5BB9\u3002",
+    isV3 ? `\u540C\u65F6\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0Crevision=${postRevision}\uFF0CleafId \u5FC5\u987B\u7B49\u4E8E FRONTMIND_KB_REOPEN \u9009\u4E2D\u7684\u8282\u70B9\uFF1B\u56FA\u5B9A\u58F0\u660E imageState=no_eligible_asset\u3001assetIds=[]\u3001imageCount=0\uFF0C\u4E14\u4E0D\u5F97\u8FD4\u56DE\u56FE\u7247\u9644\u4EF6\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1B\u5C55\u793A\u884C\u4E3A\u4FDD\u6301\u517C\u5BB9\u3002",
     `\u73B0\u6709\u8282\u70B9\uFF1A${leaves.map((leaf) => `${leaf.id}:${leaf.title}`).join("\uFF1B")}`
   ].join("\n");
   return [
@@ -31607,9 +31604,9 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u51FA\u73B0\u201C\u672C\u8F6E\u91C7\u96C6/\u672C\u77E5\u8BC6\u5E93/\u8BC1\u636E\u4E0D\u8DB3/\u5DF2\u6838\u9A8C\u201D\u7B49\u8FC7\u7A0B\u5224\u65AD\uFF0C\u4E5F\u4E0D\u5F97\u51FA\u73B0\u5BA2\u6237\u5E94\u3001\u91C7\u8D2D\u65B9\u5E94\u3001\u5EFA\u8BAE\u3001\u5C3D\u8C03\u3001\u5408\u89C4\u5BA1\u67E5\u3001\u4E0D\u80FD\u4EC5\u51ED\u3001\u4E0D\u5B9C\u8F6C\u6362\u6216\u4E0D\u80FD\u5916\u63A8\u7B49\u5EFA\u8BAE\u6027\u8868\u8FBE\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\uFF1B\u7528\u6237\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\u5F53\u524D\u5185\u5BB9\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
-    "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\uFF0C\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\u3002\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\uFF1B\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
+    "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587\uFF0C\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\u3002\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\uFF1B\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "\u673A\u5668\u4FE1\u5C01\u5FC5\u987B\u4FDD\u7559\u5B8C\u6574\u7684 `<!-- FRONTMIND_KB_...` \u4E0E `-->` \u5305\u88F9\uFF0C\u4E0D\u5F97\u8F93\u51FA\u88F8 JSON\u3001SOCRATIC_KB_STATE\uFF0C\u4E5F\u4E0D\u5F97\u81EA\u521B workflow-state\u3001knowledge-base.message \u6216\u5176\u4ED6\u72B6\u6001\u5BF9\u8C61\u3002",
-    "\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u5982\u6709\u5408\u683C related assetIds\uFF0C\u5FC5\u987B\u628A\u6700\u591A\u4E09\u5F20\u5DF2\u4E0B\u8F7D\u9A8C\u8BC1\u7684\u672C\u5730\u56FE\u7247\u4F5C\u4E3A\u540C\u4E00\u56DE\u590D\u7684 output_image \u6216 image MIME output_file \u9644\u4EF6\u8FD4\u56DE\uFF1B\u4E0D\u80FD\u53EA\u8F93\u51FA\u5305\u5185\u8DEF\u5F84\u3001\u56FE\u7247\u6807\u9898\u3001\u6587\u5B57\u5360\u4F4D\u6216\u5B98\u7F51/CDN \u70ED\u94FE\u3002\u53EA\u6709\u8BE5\u8282\u70B9\u786E\u5B9E\u6CA1\u6709\u5408\u683C\u5173\u8054\u7D20\u6750\u65F6\u624D\u53EF\u7EAF\u6587\u5B57\u8FD4\u56DE\u3002",
+    "\u8FD9\u662F\u975E\u9996\u8F6E\u77E5\u8BC6\u8282\u70B9\u56DE\u590D\uFF0C\u5FC5\u987B\u7EAF\u6587\u5B57\u8FD4\u56DE\uFF1A\u4E0D\u5F97\u7EE7\u7EED\u641C\u7D22\u56FE\u7247\uFF0C\u4E0D\u5F97\u8FD4\u56DE\u3001\u91CD\u590D\u6216\u91CD\u65B0\u9644\u52A0\u4EFB\u4F55 output_image\u3001image MIME output_file\u3001\u5305\u5185\u56FE\u7247\u8DEF\u5F84\u6216\u5B98\u7F51/CDN \u70ED\u94FE\u3002\u6700\u591A\u4E09\u5F20\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\u53EA\u5141\u8BB8\u5728\u9996\u8F6E\u7B2C\u4E00\u4E2A\u53F6\u5B50\u5C55\u793A\u3002",
     "",
     "# \u5F53\u524D\u77E5\u8BC6\u5E93\u72B6\u6001",
     stateReminder,
@@ -33093,9 +33090,9 @@ router4.post(["/start", "/turn"], async (req, res) => {
 var response_logic_api_default = router4;
 
 // server/dashboard-api.ts
-import { createHash as createHash13, randomUUID as randomUUID21 } from "node:crypto";
-import { mkdir, readFile, unlink as unlink2, writeFile } from "node:fs/promises";
-import path8 from "node:path";
+import { createHash as createHash14, randomUUID as randomUUID22 } from "node:crypto";
+import { mkdir as mkdir2, readFile as readFile2, unlink as unlink2, writeFile as writeFile2 } from "node:fs/promises";
+import path9 from "node:path";
 import axios7 from "axios";
 import { and as and23, eq as eq26, inArray as inArray15 } from "drizzle-orm";
 import ExcelJS2 from "exceljs";
@@ -33425,6 +33422,188 @@ function startDashboardImportPreflightCleanupScheduler() {
     clearTimeout(initial);
     clearInterval(interval);
   };
+}
+
+// server/presales-file-store.ts
+import { createHash as createHash13, randomUUID as randomUUID21 } from "node:crypto";
+import {
+  createReadStream as createReadStream2,
+  createWriteStream
+} from "node:fs";
+import * as fs6 from "node:fs/promises";
+import path8 from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+function storageRoot() {
+  const assetRoot = path8.resolve(
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path8.join(process.cwd(), ".frontmind-dashboard-assets")
+  );
+  return path8.join(assetRoot, "presales-files");
+}
+function storageKey(fileId) {
+  return createHash13("sha256").update(fileId, "utf8").digest("hex");
+}
+function pathsFor(fileId) {
+  const root = storageRoot();
+  const key = storageKey(fileId);
+  return {
+    root,
+    content: path8.join(root, `${key}.content`),
+    manifest: path8.join(root, `${key}.json`)
+  };
+}
+function cleanFilename(value, fallback) {
+  const normalized = String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").replace(/[\\/]/g, "_").trim();
+  return normalized ? normalized.slice(0, 512) : fallback;
+}
+function cleanMimeType(value) {
+  const normalized = String(value || "").replace(/[\r\n]/g, "").trim();
+  return normalized && normalized.length <= 255 ? normalized : "application/octet-stream";
+}
+async function readManifest(fileId) {
+  const { manifest } = pathsFor(fileId);
+  try {
+    const parsed = JSON.parse(
+      await fs6.readFile(manifest, "utf8")
+    );
+    if (parsed.schemaVersion !== 1 || parsed.fileId !== fileId) return null;
+    return parsed;
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+async function writeManifest(fileId, value) {
+  const { root, manifest } = pathsFor(fileId);
+  await fs6.mkdir(root, { recursive: true, mode: 448 });
+  await fs6.chmod(root, 448).catch(() => void 0);
+  const temporary = `${manifest}.${randomUUID21()}.tmp`;
+  try {
+    await fs6.writeFile(temporary, `${JSON.stringify(value)}
+`, {
+      encoding: "utf8",
+      mode: 384,
+      flag: "wx"
+    });
+    await fs6.rename(temporary, manifest);
+  } finally {
+    await fs6.rm(temporary, { force: true }).catch(() => void 0);
+  }
+}
+async function recordPresalesFileDescriptor(input) {
+  await writeManifest(input.fileId, {
+    schemaVersion: 1,
+    fileId: input.fileId,
+    filename: cleanFilename(input.filename, input.fileId),
+    mimeType: cleanMimeType(input.mimeType),
+    sizeBytes: Number.isSafeInteger(input.sizeBytes) && Number(input.sizeBytes) >= 0 ? Number(input.sizeBytes) : null,
+    sha256: null,
+    state: "pending",
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+async function stagePresalesFileContent(input) {
+  const paths = pathsFor(input.fileId);
+  await fs6.mkdir(paths.root, { recursive: true, mode: 448 });
+  await fs6.chmod(paths.root, 448).catch(() => void 0);
+  const temporary = path8.join(
+    paths.root,
+    `${storageKey(input.fileId)}.${randomUUID21()}.upload.tmp`
+  );
+  let sizeBytes = 0;
+  const hash = createHash13("sha256");
+  const limiter = new Transform({
+    transform(chunk, _encoding, callback) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      sizeBytes += bytes.length;
+      if (sizeBytes > input.maxBytes) {
+        callback(new Error("FILE_TOO_LARGE"));
+        return;
+      }
+      hash.update(bytes);
+      callback(null, bytes);
+    }
+  });
+  try {
+    await pipeline(
+      input.stream,
+      limiter,
+      createWriteStream(temporary, { flags: "wx", mode: 384 })
+    );
+  } catch (error) {
+    await fs6.rm(temporary, { force: true }).catch(() => void 0);
+    throw error;
+  }
+  const sha2564 = hash.digest("hex");
+  let consumed = false;
+  const discard = async () => {
+    if (consumed) return;
+    consumed = true;
+    await fs6.rm(temporary, { force: true }).catch(() => void 0);
+  };
+  return {
+    sizeBytes,
+    sha256: sha2564,
+    createReadStream: () => createReadStream2(temporary),
+    discard,
+    commit: async ({ filename, mimeType }) => {
+      if (consumed) throw new Error("STAGED_FILE_ALREADY_CONSUMED");
+      const previous = await readManifest(input.fileId);
+      const manifest = {
+        schemaVersion: 1,
+        fileId: input.fileId,
+        filename: cleanFilename(filename ?? previous?.filename, input.fileId),
+        mimeType: cleanMimeType(mimeType ?? previous?.mimeType),
+        sizeBytes,
+        sha256: sha2564,
+        state: "stored",
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      try {
+        await fs6.rename(temporary, paths.content);
+        consumed = true;
+        await writeManifest(input.fileId, manifest);
+      } catch (error) {
+        consumed = true;
+        await Promise.all([
+          fs6.rm(temporary, { force: true }).catch(() => void 0),
+          fs6.rm(paths.content, { force: true }).catch(() => void 0)
+        ]);
+        throw error;
+      }
+    }
+  };
+}
+async function readStoredPresalesFile(fileId) {
+  const paths = pathsFor(fileId);
+  let stats;
+  try {
+    stats = await fs6.stat(paths.content);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stats.isFile() || stats.size <= 0) {
+    throw new Error("LOCAL_FILE_CONTENT_INVALID");
+  }
+  const manifest = await readManifest(fileId);
+  if (manifest?.state === "stored" && Number.isSafeInteger(manifest.sizeBytes) && manifest.sizeBytes !== stats.size) {
+    throw new Error("LOCAL_FILE_CONTENT_SIZE_MISMATCH");
+  }
+  return {
+    filename: cleanFilename(manifest?.filename, fileId),
+    mimeType: cleanMimeType(manifest?.mimeType),
+    sizeBytes: stats.size,
+    sha256: typeof manifest?.sha256 === "string" ? manifest.sha256 : null,
+    createReadStream: () => createReadStream2(paths.content)
+  };
+}
+async function removeStoredPresalesFile(fileId) {
+  const paths = pathsFor(fileId);
+  await Promise.all([
+    fs6.rm(paths.content, { force: true }),
+    fs6.rm(paths.manifest, { force: true })
+  ]);
 }
 
 // server/dashboard-api.ts
@@ -34257,8 +34436,8 @@ var completenessAcquisitionSchema = z20.object({
     webQueries: completenessAcquisitionCountSchema.optional()
   }).passthrough()
 }).passthrough();
-var storageRoot = path8.resolve(
-  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path8.join(process.cwd(), ".frontmind-dashboard-assets")
+var storageRoot2 = path9.resolve(
+  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path9.join(process.cwd(), ".frontmind-dashboard-assets")
 );
 function assertDashboardAssetStorageConfigured() {
   if (process.env.NODE_ENV === "production" && !process.env.FRONTMIND_DASHBOARD_ASSET_DIR?.trim()) {
@@ -34270,7 +34449,7 @@ function assertDashboardAssetStorageConfigured() {
 async function removeStoredKnowledgeAssets(keys) {
   await Promise.all(
     keys.map(
-      (key) => unlink2(path8.join(storageRoot, key)).catch(() => void 0)
+      (key) => unlink2(path9.join(storageRoot2, key)).catch(() => void 0)
     )
   );
 }
@@ -34483,7 +34662,7 @@ function hasSupportedImageSignature(extension, bytes) {
   return false;
 }
 function validateProgressReportScreenshot(input) {
-  const extension = path8.extname(input.filename).toLowerCase();
+  const extension = path9.extname(input.filename).toLowerCase();
   const mimeType = imageMimeByExtension[extension];
   if (!mimeType || ![".png", ".jpg", ".jpeg", ".webp"].includes(extension)) {
     throw new Error("\u7B54\u6848\u622A\u56FE\u4EC5\u652F\u6301 PNG\u3001JPG \u6216 WEBP");
@@ -34494,13 +34673,13 @@ function validateProgressReportScreenshot(input) {
   return { extension, mimeType };
 }
 function titleFromPath(filePath) {
-  return path8.basename(filePath, path8.extname(filePath)).replace(/^\d+[._-]*/, "").replace(/[-_]+/g, " ").trim() || "\u77E5\u8BC6\u6587\u6863";
+  return path9.basename(filePath, path9.extname(filePath)).replace(/^\d+[._-]*/, "").replace(/[-_]+/g, " ").trim() || "\u77E5\u8BC6\u6587\u6863";
 }
 function htmlToMarkdownLikeText(html) {
   return html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi, "# $1\n").replace(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi, "## $1\n").replace(/<h3\b[^>]*>([\s\S]*?)<\/h3>/gi, "### $1\n").replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "- $1\n").replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n\n").replace(/<[^>]+>/g, "").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/\n{3,}/g, "\n\n").trim();
 }
 function normalizeTextDocument(filePath, content) {
-  const extension = path8.extname(filePath).toLowerCase();
+  const extension = path9.extname(filePath).toLowerCase();
   if (extension === ".html" || extension === ".htm") {
     return htmlToMarkdownLikeText(content);
   }
@@ -34727,7 +34906,7 @@ function packagedEvidenceDocumentFingerprint(document) {
     /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]/g,
     ""
   );
-  return normalized ? createHash13("sha256").update(normalized).digest("hex") : void 0;
+  return normalized ? createHash14("sha256").update(normalized).digest("hex") : void 0;
 }
 function reportedPackagedImageCount(markdown) {
   for (const pattern of [
@@ -34849,7 +35028,7 @@ function validateProfilePackage(input) {
     manifest.documents.map((document) => packageRelativePath(document.path))
   );
   for (const relativePath of input.rawTextByRelativePath.keys()) {
-    if (path8.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
+    if (path9.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
       throw new KnowledgeArchiveValidationError(
         "structure",
         `package manifest \u672A\u767B\u8BB0\u6587\u672C\u6587\u4EF6\uFF1A${relativePath}`
@@ -36124,7 +36303,7 @@ function parseOptimizationReportTemplate(input) {
   return parsed.data;
 }
 function recordFingerprint(value) {
-  return createHash13("sha256").update(JSON.stringify(value)).digest("hex");
+  return createHash14("sha256").update(JSON.stringify(value)).digest("hex");
 }
 function recordDiffByKey(before, after, recordKey) {
   const keyed = (items) => {
@@ -36775,7 +36954,7 @@ function monitoringPayloadFromTabularSources(input) {
             );
           }
           const answerNo = answerOffset + 1;
-          const digest = createHash13("sha1").update(
+          const digest = createHash14("sha1").update(
             [source.title, model, questionId, date, answerNo, content].join(
               ""
             )
@@ -36984,7 +37163,7 @@ function monitoringPayloadFromTabularSources(input) {
       }
       const model = String(row[modelIndex] || "").trim();
       if (date) requireImportDate(date, sourceRow);
-      const digest = createHash13("sha1").update(
+      const digest = createHash14("sha1").update(
         [
           source.title,
           rowIndex,
@@ -37154,7 +37333,7 @@ function responseLogicImportsFromTabularSources(input) {
   return records;
 }
 async function responseLogicImportsFromFile(input) {
-  const extension = path8.extname(input.sourceFileName).toLowerCase();
+  const extension = path9.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
     const raw = JSON.parse(input.buffer.toString("utf8"));
     const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -37182,7 +37361,7 @@ async function responseLogicImportsFromFile(input) {
   }
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path8.basename(input.sourceFileName, extension),
+      title: path9.basename(input.sourceFileName, extension),
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
       )
@@ -37194,12 +37373,12 @@ async function responseLogicImportsFromFile(input) {
   });
 }
 async function tabularTablesFromFile(input) {
-  const extension = path8.extname(input.sourceFileName).toLowerCase();
+  const extension = path9.extname(input.sourceFileName).toLowerCase();
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path8.basename(
+      title: path9.basename(
         input.sourceFileName,
-        path8.extname(input.sourceFileName)
+        path9.extname(input.sourceFileName)
       ) || "\u6570\u636E\u8868\u683C",
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
@@ -37211,7 +37390,7 @@ async function tabularTablesFromFile(input) {
   ).filter((table) => Boolean(table));
 }
 async function dashboardPayloadFromFile(input) {
-  const extension = path8.extname(input.sourceFileName).toLowerCase();
+  const extension = path9.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
     return dashboardPayloadFromModuleJson({
       text: input.buffer.toString("utf8"),
@@ -37222,7 +37401,7 @@ async function dashboardPayloadFromFile(input) {
   }
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path8.basename(input.sourceFileName, extension),
+      title: path9.basename(input.sourceFileName, extension),
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
       )
@@ -37252,11 +37431,11 @@ function validIsoDate(value) {
   return Number.isFinite(date.getTime()) ? date.toISOString() : void 0;
 }
 function stableMonitoringBatchKey(input) {
-  const digest = input.sourceHash?.toLowerCase().match(/^[a-f0-9]{64}$/)?.[0] ?? createHash13("sha256").update(JSON.stringify(input.monitoringContent)).digest("hex");
+  const digest = input.sourceHash?.toLowerCase().match(/^[a-f0-9]{64}$/)?.[0] ?? createHash14("sha256").update(JSON.stringify(input.monitoringContent)).digest("hex");
   return `dashboard-import:sha256:${digest}`;
 }
 function embeddedCitationSourceId(input) {
-  const digest = createHash13("sha256").update(
+  const digest = createHash14("sha256").update(
     JSON.stringify([
       input.answerId,
       input.index,
@@ -37392,7 +37571,7 @@ function buildDashboardMonitoringImport(input) {
   });
 }
 function monitoringImportFileHash(buffer) {
-  return createHash13("sha256").update(buffer).digest("hex");
+  return createHash14("sha256").update(buffer).digest("hex");
 }
 function buildMonitoringImportPreview(input) {
   const { batch } = input;
@@ -37546,7 +37725,7 @@ function dashboardImportTransactionHooks(input) {
 }
 async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options = {}) {
   const validationProfile = options.validationProfile ?? "historical";
-  const extension = path8.extname(sourceFileName).toLowerCase();
+  const extension = path9.extname(sourceFileName).toLowerCase();
   if (extension !== ".zip") {
     if (validationProfile !== "historical") {
       throw new KnowledgeArchiveValidationError(
@@ -37605,7 +37784,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
   const rawTextByArchivePath = /* @__PURE__ */ new Map();
   let unpackedBytes = 0;
   let declaredUnpackedBytes = 0;
-  await mkdir(storageRoot, { recursive: true });
+  await mkdir2(storageRoot2, { recursive: true });
   try {
     const normalizedPaths = /* @__PURE__ */ new Set();
     const packagePaths = [];
@@ -37621,7 +37800,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       }
       normalizedPaths.add(normalizedKey2);
       packagePaths.push(archivePath);
-      const fileExtension = path8.extname(archivePath).toLowerCase();
+      const fileExtension = path9.extname(archivePath).toLowerCase();
       if (validationProfile !== "historical" && [".bmp", ".heic", ".heif", ".ico", ".svg", ".tif", ".tiff"].includes(
         fileExtension
       )) {
@@ -37676,15 +37855,15 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
         if (!imageIsValid) {
           throw new Error(`\u77E5\u8BC6\u5E93\u56FE\u7247\u683C\u5F0F\u4E0E\u5185\u5BB9\u4E0D\u5339\u914D\uFF1A${archivePath}`);
         }
-        const key = `${randomUUID21()}${fileExtension}`;
-        await writeFile(path8.join(storageRoot, key), bytes, { flag: "wx" });
+        const key = `${randomUUID22()}${fileExtension}`;
+        await writeFile2(path9.join(storageRoot2, key), bytes, { flag: "wx" });
         storedAssetKeys.push(key);
         assets.push({
           key,
           path: archivePath,
           mimeType,
           size: bytes.length,
-          sha256: createHash13("sha256").update(bytes).digest("hex"),
+          sha256: createHash14("sha256").update(bytes).digest("hex"),
           ...dimensions
         });
       } else {
@@ -37749,8 +37928,8 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       let content = document.content;
       validated.assets.forEach((asset, index2) => {
         const url = asset.id ? `/api/dashboard/knowledge/assets/${snapshotId}/by-id/${encodeURIComponent(asset.id)}` : `/api/dashboard/knowledge/assets/${snapshotId}/${index2}`;
-        const relativePath = path8.posix.relative(
-          path8.posix.dirname(document.path),
+        const relativePath = path9.posix.relative(
+          path9.posix.dirname(document.path),
           asset.path
         );
         const candidates = [
@@ -37758,7 +37937,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
           encodeURI(asset.path),
           relativePath,
           encodeURI(relativePath),
-          path8.basename(asset.path)
+          path9.basename(asset.path)
         ];
         for (const candidate of candidates) {
           content = content.replaceAll(`(${candidate})`, `(${url})`);
@@ -37772,7 +37951,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       assets: validated.assets,
       storedAssetKeys,
       validationProfile,
-      packageManifestSha256: rawTextByRelativePath.has(packageManifestPath) ? createHash13("sha256").update(
+      packageManifestSha256: rawTextByRelativePath.has(packageManifestPath) ? createHash14("sha256").update(
         Buffer.from(
           rawTextByRelativePath.get(packageManifestPath),
           "utf8"
@@ -37782,7 +37961,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
   } catch (error) {
     await Promise.all(
       storedAssetKeys.map(
-        (key) => unlink2(path8.join(storageRoot, key)).catch(() => void 0)
+        (key) => unlink2(path9.join(storageRoot2, key)).catch(() => void 0)
       )
     );
     if (validationProfile !== "historical" && !(error instanceof KnowledgeArchiveValidationError)) {
@@ -37804,7 +37983,7 @@ function assertKnowledgeArchiveEnterpriseIdentity(input) {
     throw new Error("\u8BF7\u5148\u7531\u7BA1\u7406\u5458\u914D\u7F6E\u5F53\u524D\u8D26\u53F7\u7684\u4F01\u4E1A\u540D\u79F0");
   }
   const identityDocuments = input.documents.filter((document) => {
-    const basename = path8.posix.basename(document.path).toLowerCase();
+    const basename = path9.posix.basename(document.path).toLowerCase();
     return basename === "readme.md" || basename === "00_knowledge_tree.md" || basename === "00_source_index.md";
   });
   const candidates = identityDocuments.length > 0 ? identityDocuments : input.documents;
@@ -37832,36 +38011,38 @@ async function downloadArchiveBytes(input) {
   let headers;
   const fileId = input.descriptor.fileId || (input.descriptor.url ? knowledgeArchiveFileIdFromUrl(input.descriptor.url) : void 0);
   if (fileId) {
-    const metadataResponse = await axios7.get(
-      `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
-      {
-        headers: upstreamHeaders(input.apiKey),
-        proxy: false,
-        timeout: 12e4,
-        maxContentLength: 2 * 1024 * 1024,
-        validateStatus: () => true
+    const stored = await readStoredPresalesFile(fileId);
+    if (stored) {
+      if (stored.sizeBytes > MAX_ARCHIVE_BYTES) {
+        throw new Error("\u77E5\u8BC6\u5E93 ZIP \u8D85\u8FC7 250 MB");
       }
-    );
-    if (metadataResponse.status !== 200) {
-      throw new Error(`\u8BFB\u53D6\u77E5\u8BC6\u5E93\u6587\u4EF6\u4FE1\u606F\u5931\u8D25 (${metadataResponse.status})`);
+      const chunks2 = [];
+      let totalBytes2 = 0;
+      const hash = createHash14("sha256");
+      for await (const rawChunk of stored.createReadStream()) {
+        const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+        totalBytes2 += chunk.length;
+        if (totalBytes2 > MAX_ARCHIVE_BYTES) {
+          throw new Error("\u77E5\u8BC6\u5E93 ZIP \u8D85\u8FC7 250 MB");
+        }
+        chunks2.push(chunk);
+        hash.update(chunk);
+      }
+      if (totalBytes2 === 0 || totalBytes2 !== stored.sizeBytes) {
+        throw new Error("\u77E5\u8BC6\u5E93 ZIP \u672C\u5730\u6301\u4E45\u526F\u672C\u4E0D\u5B8C\u6574");
+      }
+      if (stored.sha256 && hash.digest("hex") !== stored.sha256) {
+        throw new Error("\u77E5\u8BC6\u5E93 ZIP \u672C\u5730\u6301\u4E45\u526F\u672C\u6821\u9A8C\u5931\u8D25");
+      }
+      const buffer2 = Buffer.concat(chunks2, totalBytes2);
+      filename = stored.filename || filename;
+      if (!filename.toLowerCase().endsWith(".zip")) {
+        filename = `${path9.basename(filename, path9.extname(filename)) || "knowledge-base"}.zip`;
+      }
+      return { buffer: buffer2, filename };
     }
-    const returnedFileId = String(
-      metadataResponse.data?.id || metadataResponse.data?.file_id || ""
-    );
-    if (returnedFileId && returnedFileId !== fileId) {
-      throw new Error("\u8BFB\u53D6\u5230\u7684\u77E5\u8BC6\u5E93\u6587\u4EF6\u4E0E\u6700\u7EC8\u7248\u672C\u4E0D\u5339\u914D");
-    }
-    if (metadataResponse.data?.filename) {
-      filename = String(metadataResponse.data.filename);
-    }
-    if (metadataResponse.data?.upload_url) {
-      downloadUrl = assertSafeExternalUrl(
-        String(metadataResponse.data.upload_url)
-      );
-    } else {
-      downloadUrl = `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`;
-      headers = upstreamHeaders(input.apiKey);
-    }
+    downloadUrl = `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`;
+    headers = upstreamHeaders(input.apiKey);
   } else if (input.descriptor.url) {
     downloadUrl = assertSafeExternalUrl(input.descriptor.url);
   }
@@ -37892,6 +38073,17 @@ async function downloadArchiveBytes(input) {
   if (response2.status !== 200) {
     response2.data?.destroy?.();
     throw new Error(`\u4E0B\u8F7D\u77E5\u8BC6\u5E93 ZIP \u5931\u8D25 (${response2.status})`);
+  }
+  const disposition = String(response2.headers["content-disposition"] || "");
+  const encodedFilename = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const plainFilename = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+  const responseFilename = encodedFilename || plainFilename;
+  if (responseFilename) {
+    try {
+      filename = path9.basename(decodeURIComponent(responseFilename.trim()));
+    } catch {
+      filename = path9.basename(responseFilename.trim());
+    }
   }
   const declaredLength = Number(response2.headers["content-length"] || 0);
   if (Number.isFinite(declaredLength) && declaredLength > MAX_ARCHIVE_BYTES) {
@@ -37927,7 +38119,7 @@ async function downloadArchiveBytes(input) {
     throw new Error("\u77E5\u8BC6\u5E93 ZIP \u8D85\u8FC7 250 MB");
   }
   if (!filename.toLowerCase().endsWith(".zip")) {
-    filename = `${path8.basename(filename, path8.extname(filename)) || "knowledge-base"}.zip`;
+    filename = `${path9.basename(filename, path9.extname(filename)) || "knowledge-base"}.zip`;
   }
   return { buffer, filename };
 }
@@ -38005,15 +38197,15 @@ router5.put(
         filename,
         bytes
       });
-      const assetName = `${randomUUID21()}${extension}`;
-      const relativeKey = path8.join(
+      const assetName = `${randomUUID22()}${extension}`;
+      const relativeKey = path9.join(
         "progress-report-screenshots",
         String(targetUserId),
         assetName
       );
-      const absolutePath = path8.join(storageRoot, relativeKey);
-      await mkdir(path8.dirname(absolutePath), { recursive: true });
-      await writeFile(absolutePath, bytes, { flag: "wx" });
+      const absolutePath = path9.join(storageRoot2, relativeKey);
+      await mkdir2(path9.dirname(absolutePath), { recursive: true });
+      await writeFile2(absolutePath, bytes, { flag: "wx" });
       const url = `/api/dashboard/report-assets/${targetUserId}/${assetName}`;
       await writeWorkspaceAuditEvent({
         actor,
@@ -38054,12 +38246,12 @@ router5.get(
         throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       }
       await assertWorkspaceAccess(req.frontmindUser, targetUserId);
-      const extension = path8.extname(assetName).toLowerCase();
+      const extension = path9.extname(assetName).toLowerCase();
       const mimeType = imageMimeByExtension[extension];
       if (!mimeType) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
-      const bytes = await readFile(
-        path8.join(
-          storageRoot,
+      const bytes = await readFile2(
+        path9.join(
+          storageRoot2,
           "progress-report-screenshots",
           String(targetUserId),
           assetName
@@ -38164,8 +38356,8 @@ router5.post("/knowledge/publish", async (req, res) => {
       apiKey: credential.apiKey,
       baseUrl
     });
-    const archiveHash = createHash13("sha256").update(downloaded.buffer).digest("hex");
-    const snapshotId = randomUUID21();
+    const archiveHash = createHash14("sha256").update(downloaded.buffer).digest("hex");
+    const snapshotId = randomUUID22();
     const parsed = await readKnowledgeArchive(
       downloaded.buffer,
       downloaded.filename,
@@ -38206,7 +38398,7 @@ router5.post("/knowledge/publish", async (req, res) => {
   } catch (error) {
     await Promise.all(
       storedAssetKeys.map(
-        (key) => unlink2(path8.join(storageRoot, key)).catch(() => void 0)
+        (key) => unlink2(path9.join(storageRoot2, key)).catch(() => void 0)
       )
     );
     const publishedBuild = await assertKnowledgeBasePublishable({
@@ -38259,7 +38451,7 @@ router5.put(
       const expectedRevision = dashboardRevisionHeader(
         req.header("x-dashboard-revision")
       );
-      const extension = path8.extname(sourceFileName).toLowerCase();
+      const extension = path9.extname(sourceFileName).toLowerCase();
       const mode = req.header("x-import-mode") || "auto";
       if (mode === "dashboard" || mode === "auto" && [".csv", ".json", ".xlsx"].includes(extension)) {
         const importModule = dashboardImportModule(
@@ -38985,7 +39177,7 @@ router5.put(
         });
       }
       let sourceBuildId;
-      const snapshotId = randomUUID21();
+      const snapshotId = randomUUID22();
       const parsed = await readKnowledgeArchive(
         buffer,
         sourceFileName,
@@ -39041,7 +39233,7 @@ router5.put(
       } catch (error) {
         await Promise.all(
           parsed.storedAssetKeys.map(
-            (key) => unlink2(path8.join(storageRoot, key)).catch(() => void 0)
+            (key) => unlink2(path9.join(storageRoot2, key)).catch(() => void 0)
           )
         );
         throw error;
@@ -39077,7 +39269,7 @@ router5.get(
       });
       if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
-      const bytes = await readFile(path8.join(storageRoot, result.asset.key));
+      const bytes = await readFile2(path9.join(storageRoot2, result.asset.key));
       res.setHeader("Content-Type", result.asset.mimeType);
       res.setHeader("Cache-Control", "private, max-age=3600");
       res.setHeader("Content-Disposition", "inline");
@@ -39100,7 +39292,7 @@ router5.get(
       });
       if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
-      const bytes = await readFile(path8.join(storageRoot, result.asset.key));
+      const bytes = await readFile2(path9.join(storageRoot2, result.asset.key));
       res.setHeader("Content-Type", result.asset.mimeType);
       res.setHeader("Cache-Control", "private, max-age=3600");
       res.setHeader("Content-Disposition", "inline");
@@ -39113,7 +39305,7 @@ router5.get(
 var dashboard_api_default = router5;
 
 // server/brand-question-portfolio-api.ts
-import { createHash as createHash14 } from "node:crypto";
+import { createHash as createHash15 } from "node:crypto";
 import axios8 from "axios";
 import { Router as Router4 } from "express";
 import { z as z23 } from "zod";
@@ -39271,7 +39463,7 @@ function assertBrandQuestionPortfolioContext(portfolio, expected) {
 }
 
 // server/brand-question-portfolio-runtime.ts
-import path9 from "node:path";
+import path10 from "node:path";
 function candidateTargets(context) {
   return {
     industry: context.quota.industry * 3,
@@ -39281,29 +39473,29 @@ function candidateTargets(context) {
   };
 }
 var configuredBrandQuestionSkillPath = process.env.FRONTMIND_BRAND_QUESTION_SKILL_PATH?.trim();
-if (configuredBrandQuestionSkillPath && !path9.isAbsolute(configuredBrandQuestionSkillPath)) {
+if (configuredBrandQuestionSkillPath && !path10.isAbsolute(configuredBrandQuestionSkillPath)) {
   throw new Error(
     "FRONTMIND_BRAND_QUESTION_SKILL_PATH must be an absolute path"
   );
 }
 var skillDirectoryCandidates2 = configuredBrandQuestionSkillPath ? [configuredBrandQuestionSkillPath] : [
-  path9.resolve(
+  path10.resolve(
     import.meta.dirname,
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path9.resolve(
+  path10.resolve(
     process.cwd(),
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path9.resolve(
+  path10.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path9.resolve(
+  path10.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -39677,7 +39869,7 @@ async function currentContext(userId) {
     planCode: portal.service.planCode,
     quotaPeriodId: portal.quotas.periodId,
     enterprise: {
-      identityHash: createHash14("sha256").update(
+      identityHash: createHash15("sha256").update(
         `${userId}\0${workspace.payload.brandName.normalize("NFKC").trim().toLowerCase()}`
       ).digest("hex"),
       canonicalName: workspace.payload.brandName.trim()
@@ -40014,9 +40206,9 @@ router6.post("/sync", async (req, res) => {
 var brand_question_portfolio_api_default = router6;
 
 // server/prepared-file-router.ts
-import { randomUUID as randomUUID22 } from "node:crypto";
-import { createReadStream as createReadStream2 } from "node:fs";
-import fs6 from "node:fs/promises";
+import { randomUUID as randomUUID23 } from "node:crypto";
+import { createReadStream as createReadStream3 } from "node:fs";
+import fs7 from "node:fs/promises";
 import { Router as Router5 } from "express";
 var router7 = Router5();
 var DOWNLOAD_TOKEN_TTL_MS = 5 * 60 * 1e3;
@@ -40222,7 +40414,7 @@ router7.post("/:assetId/download-token", async (req, res) => {
       });
       return;
     }
-    const token = randomUUID22();
+    const token = randomUUID23();
     const expiresAt = Date.now() + DOWNLOAD_TOKEN_TTL_MS;
     downloadTokens.set(token, {
       assetId: manifest.id,
@@ -40240,7 +40432,7 @@ router7.post("/:assetId/download-token", async (req, res) => {
 });
 async function streamPreparedFile(req, res, manifest, disposition) {
   const filePath = preparedFileService.contentPath(manifest.id);
-  const stat2 = await fs6.stat(filePath);
+  const stat2 = await fs7.stat(filePath);
   const range = parseByteRange(
     typeof req.headers.range === "string" ? req.headers.range : void 0,
     stat2.size
@@ -40279,7 +40471,7 @@ async function streamPreparedFile(req, res, manifest, disposition) {
     return;
   }
   preparedFileService.beginUse(manifest.id);
-  const stream = createReadStream2(filePath, { start, end });
+  const stream = createReadStream3(filePath, { start, end });
   let released = false;
   const release = () => {
     if (released) return;
@@ -40420,7 +40612,7 @@ import axios10 from "axios";
 import { z as z25 } from "zod";
 
 // server/presales-monitor.ts
-import { createHash as createHash15, randomUUID as randomUUID23 } from "node:crypto";
+import { createHash as createHash16, randomUUID as randomUUID24 } from "node:crypto";
 import axios9 from "axios";
 import { and as and24, eq as eq27, isNull as isNull8 } from "drizzle-orm";
 import { json as json2, Router as Router6 } from "express";
@@ -40513,7 +40705,7 @@ function canonicalJson4(value) {
   return `{${Object.keys(record).filter((key) => record[key] !== void 0).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson4(record[key])}`).join(",")}}`;
 }
 function sha2563(value) {
-  return createHash15("sha256").update(value, "utf8").digest("hex");
+  return createHash16("sha256").update(value, "utf8").digest("hex");
 }
 function monitorCredentialFromEnv(env = process.env) {
   const apiKey = env.FRONTMIND_MONITOR_API_KEY?.trim();
@@ -41428,7 +41620,7 @@ var DrizzleMonitorRepository = class {
   async reserve(input) {
     const db = await requireDb15();
     const run = {
-      id: randomUUID23(),
+      id: randomUUID24(),
       idempotencyKeyHash: input.idempotencyKeyHash,
       requestHash: input.requestHash,
       apiCredentialId: input.credential.id,
@@ -41524,7 +41716,7 @@ var DrizzleMonitorRepository = class {
       if (!run || !POLLABLE_LOCAL_STATUSES.has(run.status) || !run.upstreamTaskId || run.nextPollAt && run.nextPollAt.getTime() > now.getTime() || run.pollLeaseId && run.pollLeaseExpiresAt && run.pollLeaseExpiresAt.getTime() > now.getTime()) {
         return null;
       }
-      const leaseId = randomUUID23();
+      const leaseId = randomUUID24();
       const nextPollAt = new Date(now.getTime() + MONITOR_POLL_INTERVAL_MS);
       const pollLeaseExpiresAt = new Date(
         now.getTime() + MONITOR_POLL_LEASE_MS
@@ -42029,188 +42221,6 @@ function assertFrontMindPublicUrlConfigured(env = process.env) {
     );
   }
   return configured;
-}
-
-// server/presales-file-store.ts
-import { createHash as createHash16, randomUUID as randomUUID24 } from "node:crypto";
-import {
-  createReadStream as createReadStream3,
-  createWriteStream
-} from "node:fs";
-import * as fs7 from "node:fs/promises";
-import path10 from "node:path";
-import { Transform } from "node:stream";
-import { pipeline } from "node:stream/promises";
-function storageRoot2() {
-  const assetRoot = path10.resolve(
-    process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path10.join(process.cwd(), ".frontmind-dashboard-assets")
-  );
-  return path10.join(assetRoot, "presales-files");
-}
-function storageKey(fileId) {
-  return createHash16("sha256").update(fileId, "utf8").digest("hex");
-}
-function pathsFor(fileId) {
-  const root = storageRoot2();
-  const key = storageKey(fileId);
-  return {
-    root,
-    content: path10.join(root, `${key}.content`),
-    manifest: path10.join(root, `${key}.json`)
-  };
-}
-function cleanFilename(value, fallback) {
-  const normalized = String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").replace(/[\\/]/g, "_").trim();
-  return normalized ? normalized.slice(0, 512) : fallback;
-}
-function cleanMimeType(value) {
-  const normalized = String(value || "").replace(/[\r\n]/g, "").trim();
-  return normalized && normalized.length <= 255 ? normalized : "application/octet-stream";
-}
-async function readManifest(fileId) {
-  const { manifest } = pathsFor(fileId);
-  try {
-    const parsed = JSON.parse(
-      await fs7.readFile(manifest, "utf8")
-    );
-    if (parsed.schemaVersion !== 1 || parsed.fileId !== fileId) return null;
-    return parsed;
-  } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  }
-}
-async function writeManifest(fileId, value) {
-  const { root, manifest } = pathsFor(fileId);
-  await fs7.mkdir(root, { recursive: true, mode: 448 });
-  await fs7.chmod(root, 448).catch(() => void 0);
-  const temporary = `${manifest}.${randomUUID24()}.tmp`;
-  try {
-    await fs7.writeFile(temporary, `${JSON.stringify(value)}
-`, {
-      encoding: "utf8",
-      mode: 384,
-      flag: "wx"
-    });
-    await fs7.rename(temporary, manifest);
-  } finally {
-    await fs7.rm(temporary, { force: true }).catch(() => void 0);
-  }
-}
-async function recordPresalesFileDescriptor(input) {
-  await writeManifest(input.fileId, {
-    schemaVersion: 1,
-    fileId: input.fileId,
-    filename: cleanFilename(input.filename, input.fileId),
-    mimeType: cleanMimeType(input.mimeType),
-    sizeBytes: Number.isSafeInteger(input.sizeBytes) && Number(input.sizeBytes) >= 0 ? Number(input.sizeBytes) : null,
-    sha256: null,
-    state: "pending",
-    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-  });
-}
-async function stagePresalesFileContent(input) {
-  const paths = pathsFor(input.fileId);
-  await fs7.mkdir(paths.root, { recursive: true, mode: 448 });
-  await fs7.chmod(paths.root, 448).catch(() => void 0);
-  const temporary = path10.join(
-    paths.root,
-    `${storageKey(input.fileId)}.${randomUUID24()}.upload.tmp`
-  );
-  let sizeBytes = 0;
-  const hash = createHash16("sha256");
-  const limiter = new Transform({
-    transform(chunk, _encoding, callback) {
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      sizeBytes += bytes.length;
-      if (sizeBytes > input.maxBytes) {
-        callback(new Error("FILE_TOO_LARGE"));
-        return;
-      }
-      hash.update(bytes);
-      callback(null, bytes);
-    }
-  });
-  try {
-    await pipeline(
-      input.stream,
-      limiter,
-      createWriteStream(temporary, { flags: "wx", mode: 384 })
-    );
-  } catch (error) {
-    await fs7.rm(temporary, { force: true }).catch(() => void 0);
-    throw error;
-  }
-  const sha2564 = hash.digest("hex");
-  let consumed = false;
-  const discard = async () => {
-    if (consumed) return;
-    consumed = true;
-    await fs7.rm(temporary, { force: true }).catch(() => void 0);
-  };
-  return {
-    sizeBytes,
-    sha256: sha2564,
-    createReadStream: () => createReadStream3(temporary),
-    discard,
-    commit: async ({ filename, mimeType }) => {
-      if (consumed) throw new Error("STAGED_FILE_ALREADY_CONSUMED");
-      const previous = await readManifest(input.fileId);
-      const manifest = {
-        schemaVersion: 1,
-        fileId: input.fileId,
-        filename: cleanFilename(filename ?? previous?.filename, input.fileId),
-        mimeType: cleanMimeType(mimeType ?? previous?.mimeType),
-        sizeBytes,
-        sha256: sha2564,
-        state: "stored",
-        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-      };
-      try {
-        await fs7.rename(temporary, paths.content);
-        consumed = true;
-        await writeManifest(input.fileId, manifest);
-      } catch (error) {
-        consumed = true;
-        await Promise.all([
-          fs7.rm(temporary, { force: true }).catch(() => void 0),
-          fs7.rm(paths.content, { force: true }).catch(() => void 0)
-        ]);
-        throw error;
-      }
-    }
-  };
-}
-async function readStoredPresalesFile(fileId) {
-  const paths = pathsFor(fileId);
-  let stats;
-  try {
-    stats = await fs7.stat(paths.content);
-  } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  }
-  if (!stats.isFile() || stats.size <= 0) {
-    throw new Error("LOCAL_FILE_CONTENT_INVALID");
-  }
-  const manifest = await readManifest(fileId);
-  if (manifest?.state === "stored" && Number.isSafeInteger(manifest.sizeBytes) && manifest.sizeBytes !== stats.size) {
-    throw new Error("LOCAL_FILE_CONTENT_SIZE_MISMATCH");
-  }
-  return {
-    filename: cleanFilename(manifest?.filename, fileId),
-    mimeType: cleanMimeType(manifest?.mimeType),
-    sizeBytes: stats.size,
-    sha256: typeof manifest?.sha256 === "string" ? manifest.sha256 : null,
-    createReadStream: () => createReadStream3(paths.content)
-  };
-}
-async function removeStoredPresalesFile(fileId) {
-  const paths = pathsFor(fileId);
-  await Promise.all([
-    fs7.rm(paths.content, { force: true }),
-    fs7.rm(paths.manifest, { force: true })
-  ]);
 }
 
 // server/presales-proxy.ts
