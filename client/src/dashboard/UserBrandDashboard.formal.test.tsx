@@ -21,6 +21,8 @@ const {
   deliveryListFetchNextPage,
   deliveryCreateUseMutation,
   deliveryCreateMutateAsync,
+  deliverySelectWebsiteStyleUseMutation,
+  deliveryRequestWebsiteStyleRevisionUseMutation,
   deliveryDetailUseQuery,
   deliveryAddMessageUseMutation,
   deliveryAddMessageMutateAsync,
@@ -47,6 +49,12 @@ const {
   deliveryListFetchNextPage: vi.fn(),
   deliveryCreateUseMutation: vi.fn(),
   deliveryCreateMutateAsync: vi.fn(),
+  deliverySelectWebsiteStyleUseMutation: vi.fn(() => ({
+    mutateAsync: vi.fn(),
+  })),
+  deliveryRequestWebsiteStyleRevisionUseMutation: vi.fn(() => ({
+    mutateAsync: vi.fn(),
+  })),
   deliveryDetailUseQuery: vi.fn(),
   deliveryAddMessageUseMutation: vi.fn(),
   deliveryAddMessageMutateAsync: vi.fn(),
@@ -108,6 +116,12 @@ vi.mock("@/lib/trpc", () => ({
         },
         create: {
           useMutation: deliveryCreateUseMutation,
+        },
+        selectWebsiteStyle: {
+          useMutation: deliverySelectWebsiteStyleUseMutation,
+        },
+        requestWebsiteStyleRevision: {
+          useMutation: deliveryRequestWebsiteStyleRevisionUseMutation,
         },
         detail: {
           useQuery: deliveryDetailUseQuery,
@@ -821,6 +835,71 @@ describe("UserBrandDashboard formal workspace", () => {
     );
   });
 
+  it("opens the existing service-advisor dialog from the ICP service-code guide", async () => {
+    deliveryWorkspaceUseQuery.mockReturnValue({
+      data: {
+        contentAssetCatalog: [],
+        websiteContentCatalog: [],
+        websiteWorkflow: {
+          domainStatus: "not_started",
+          icpStatus: "locked",
+          canSubmitIcp: false,
+          canSubmitContent: false,
+        },
+        quotas: {
+          content_asset_publish: {
+            type: "content_asset_publish",
+            allowed: true,
+            used: 0,
+            reserved: 0,
+            consumed: 0,
+            limit: 20,
+            remaining: 20,
+            periodId: "formal-period",
+            validFrom: null,
+            validUntil: null,
+            reason: null,
+          },
+          website_content_publish: {
+            type: "website_content_publish",
+            allowed: true,
+            used: 0,
+            reserved: 0,
+            consumed: 0,
+            limit: 100,
+            remaining: 100,
+            periodId: "formal-period",
+            validFrom: null,
+            validUntil: null,
+            reason: null,
+          },
+        },
+        tickets: [],
+      },
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: vi.fn(),
+    });
+
+    render(<UserBrandDashboard />);
+    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "不确定场景，联系服务专员",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "联系服务专员" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", {
+        name: "FrontMind 服务专员微信二维码",
+      }),
+    ).toHaveAttribute("src", "/frontmind-sales-wechat.png");
+  });
+
   it("does not expose the retired content-system entry", () => {
     render(<UserBrandDashboard />);
 
@@ -1126,7 +1205,7 @@ describe("UserBrandDashboard formal workspace", () => {
     expect(screen.getByRole("textbox", { name: "目标问题" })).toHaveValue(
       "新企业的产品适合哪些业务场景？",
     );
-    fireEvent.click(screen.getByRole("button", { name: "提醒管理员确认" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交专业审核" }));
 
     await waitFor(() =>
       expect(requestQuestionSelectionMutateAsync).toHaveBeenCalledWith({
@@ -1151,7 +1230,7 @@ describe("UserBrandDashboard formal workspace", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "目标问题" }), {
       target: { value: "新企业如何验证产品交付能力？" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "提醒管理员确认" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交专业审核" }));
 
     await waitFor(() =>
       expect(requestQuestionSelectionMutateAsync).toHaveBeenCalledWith({

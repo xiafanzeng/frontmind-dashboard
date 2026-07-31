@@ -13,6 +13,7 @@ import {
   mergeConversationMessages,
   mergeConversationTaskPointers,
   permanentlyDeleteConversation,
+  repairSnapshotMessageIds,
   resolveSnapshotCredentialId,
   validateUpstreamResourceAccess,
   type ConversationSnapshot,
@@ -53,6 +54,48 @@ function createSelectExecutor(rowsForTable: (table: unknown) => unknown[]) {
 }
 
 describe("conversation multi-device merge", () => {
+  it("repairs a provider assistant ID reused across two confirmed turns", () => {
+    const repaired = repairSnapshotMessageIds([
+      message("confirm-1", "user", 100, "确认"),
+      message("provider-output", "assistant", 110, "节点 2.3"),
+      message("confirm-2", "user", 120, "确认"),
+      message("provider-output", "assistant", 130, "节点 2.4"),
+    ]);
+
+    expect(repaired.map((item) => item.id)).toEqual([
+      "confirm-1",
+      "provider-output",
+      "confirm-2",
+      "provider-output~2",
+    ]);
+    expect(repaired.map((item) => item.content)).toEqual([
+      "确认",
+      "节点 2.3",
+      "确认",
+      "节点 2.4",
+    ]);
+  });
+
+  it("repairs duplicate attachment IDs without dropping either message", () => {
+    const repaired = repairSnapshotMessageIds([
+      {
+        ...message("assistant-1", "assistant", 100),
+        attachments: [
+          { id: "asset", type: "image", name: "one.webp", fileId: "file-1" },
+        ],
+      },
+      {
+        ...message("assistant-2", "assistant", 110),
+        attachments: [
+          { id: "asset", type: "image", name: "two.webp", fileId: "file-2" },
+        ],
+      },
+    ]);
+
+    expect(repaired.flatMap((item) => item.attachments ?? []).map((item) => item.id))
+      .toEqual(["asset", "asset~2"]);
+  });
+
   it("retains independent turns created on two devices", () => {
     const persisted = [
       message("user-a", "user", 100),

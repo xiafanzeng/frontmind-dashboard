@@ -4,11 +4,8 @@ import {
   CalendarClock,
   CheckCircle2,
   ChevronRight,
-  Download,
   ExternalLink,
-  FileJson2,
   FileText,
-  Globe2,
   History,
   Inbox,
   Link2,
@@ -35,7 +32,11 @@ import {
   DELIVERY_TICKET_STATUS_LABELS,
   type DeliveryTicketStatus,
 } from "@shared/delivery-ticket";
-import { WEBSITE_CONTENT_CATALOG } from "@shared/delivery-catalog";
+import {
+  DELIVERY_ROLE_LABELS,
+  type DeliveryRoleType,
+  type DeliveryWorkflowOperation,
+} from "@shared/delivery-roles";
 
 import "./admin-delivery-ticket-workspace.css";
 
@@ -45,8 +46,15 @@ export type AdminDeliveryTicket = {
   enterpriseName?: string | null;
   assignedAdminId?: number | null;
   assignedAdminName?: string | null;
-  type: "content_asset" | "website_operation";
+  type: "content_asset" | "website_operation" | "knowledge_base";
   category?: string | null;
+  categoryLabel?: string | null;
+  workflowDomain?: DeliveryRoleType | null;
+  operation?: DeliveryWorkflowOperation | null;
+  assignedProjectAssignmentId?: string | null;
+  assignedMemberId?: number | null;
+  assignedMemberName?: string | null;
+  priority?: "low" | "normal" | "high" | "urgent" | null;
   title?: string | null;
   topic?: string | null;
   description?: string | null;
@@ -103,39 +111,6 @@ type TicketDetailPayload = {
   }>;
 };
 
-type WebsiteContentTemplatePreviewRow = {
-  ticketId: string;
-  revision: number;
-  category: string;
-  categoryLabel: string;
-  topic: string;
-  currentComplete: boolean;
-  incomingComplete: boolean;
-  currentPublicSummary: string;
-  incomingPublicSummary: string;
-  change: "unchanged" | "complete" | "summary";
-};
-
-type WebsiteContentTemplatePreview = {
-  fileHash: string;
-  workspaceUserId: number;
-  totals: {
-    records: number;
-    changed: number;
-    completing: number;
-    summariesUpdated: number;
-    unchanged: number;
-  };
-  changes: WebsiteContentTemplatePreviewRow[];
-  preflightToken?: string;
-  preflightExpiresAt?: string;
-};
-
-type PendingWebsiteContentTemplate = {
-  file: File;
-  preview: WebsiteContentTemplatePreview;
-};
-
 export type AdminDeliveryTicketPreviewFixtures = {
   tickets: AdminDeliveryTicket[];
   events: AdminDeliveryTicketEvent[];
@@ -178,86 +153,6 @@ function asRecord(value: unknown): Record<string, any> {
     : {};
 }
 
-export function websiteContentTemplatePreflightUsable(
-  preview: Pick<
-    WebsiteContentTemplatePreview,
-    "preflightToken" | "preflightExpiresAt"
-  >,
-  now = Date.now(),
-) {
-  if (!preview.preflightToken?.trim()) return false;
-  if (!preview.preflightExpiresAt) return true;
-  const expiresAt = Date.parse(preview.preflightExpiresAt);
-  return Number.isFinite(expiresAt) && expiresAt - now > 5_000;
-}
-
-function normalizeWebsiteContentTemplatePreview(
-  value: unknown,
-): WebsiteContentTemplatePreview {
-  const payload = asRecord(asRecord(value).preview || value);
-  const totals = asRecord(payload.totals);
-  if (
-    !/^[a-f0-9]{64}$/i.test(String(payload.fileHash || "")) ||
-    !Number.isInteger(Number(payload.workspaceUserId)) ||
-    !Array.isArray(payload.changes)
-  ) {
-    throw new Error("服务端返回的官网内容预检结果无效");
-  }
-  const changes = payload.changes.map((item: unknown) => {
-    const row = asRecord(item);
-    const change = String(row.change || "");
-    if (
-      !["unchanged", "complete", "summary"].includes(change) ||
-      !String(row.ticketId || "")
-    ) {
-      throw new Error("官网内容预检差异记录无效");
-    }
-    return {
-      ticketId: String(row.ticketId),
-      revision: Number(row.revision || 0),
-      category: String(row.category || ""),
-      categoryLabel: String(row.categoryLabel || row.category || ""),
-      topic: String(row.topic || ""),
-      currentComplete: Boolean(row.currentComplete),
-      incomingComplete: Boolean(row.incomingComplete),
-      currentPublicSummary: String(row.currentPublicSummary || ""),
-      incomingPublicSummary: String(row.incomingPublicSummary || ""),
-      change: change as WebsiteContentTemplatePreviewRow["change"],
-    };
-  });
-  return {
-    fileHash: String(payload.fileHash).toLowerCase(),
-    workspaceUserId: Number(payload.workspaceUserId),
-    totals: {
-      records: Number(totals.records || 0),
-      changed: Number(totals.changed || 0),
-      completing: Number(totals.completing || 0),
-      summariesUpdated: Number(totals.summariesUpdated || 0),
-      unchanged: Number(totals.unchanged || 0),
-    },
-    changes,
-    ...(payload.preflightToken
-      ? { preflightToken: String(payload.preflightToken) }
-      : {}),
-    ...(payload.preflightExpiresAt
-      ? { preflightExpiresAt: String(payload.preflightExpiresAt) }
-      : {}),
-  };
-}
-
-async function readWebsiteContentTemplateError(response: Response) {
-  try {
-    const payload = await response.json();
-    return (
-      payload?.error?.message ||
-      payload?.message ||
-      `官网内容模板处理失败 (${response.status})`
-    );
-  } catch {
-    return `官网内容模板处理失败 (${response.status})`;
-  }
-}
-
 export function safeAdminDeliveryUrl(
   value: string | null | undefined,
   origin = typeof window === "undefined"
@@ -294,8 +189,8 @@ export function normalizeAdminTicketList(
         ? ticket.status
         : "submitted";
       const type =
-        ticket.type === "website_operation"
-          ? "website_operation"
+        ticket.type === "website_operation" || ticket.type === "knowledge_base"
+          ? ticket.type
           : "content_asset";
       return {
         ...ticket,
@@ -373,7 +268,11 @@ export function buildAdminTicketListInput(input: {
   }
   const query = input.query?.trim();
   if (query) result.query = query.slice(0, 100);
-  if (input.type === "content_asset" || input.type === "website_operation") {
+  if (
+    input.type === "content_asset" ||
+    input.type === "website_operation" ||
+    input.type === "knowledge_base"
+  ) {
     result.type = input.type;
   }
   if (
@@ -404,47 +303,6 @@ export function deliveryTicketPublicStatus(
   return OPEN_TICKET_STATUSES.has(ticket?.status || "submitted")
     ? "pending"
     : "completed";
-}
-
-export type WebsiteContentOverviewItem = {
-  category: (typeof WEBSITE_CONTENT_CATALOG)[number]["value"];
-  label: string;
-  status: "not_started" | "in_progress" | "completed";
-  ticket: AdminDeliveryTicket | null;
-};
-
-function ticketUpdatedAt(ticket: AdminDeliveryTicket) {
-  const timestamp = new Date(
-    ticket.updatedAt || ticket.createdAt || 0,
-  ).getTime();
-  return Number.isFinite(timestamp) ? timestamp : 0;
-}
-
-export function buildWebsiteContentOverview(
-  tickets: readonly AdminDeliveryTicket[],
-): WebsiteContentOverviewItem[] {
-  return WEBSITE_CONTENT_CATALOG.map((category) => {
-    const ticket =
-      tickets
-        .filter(
-          (candidate) =>
-            candidate.type === "website_operation" &&
-            candidate.category === category.value,
-        )
-        .sort(
-          (left, right) => ticketUpdatedAt(right) - ticketUpdatedAt(left),
-        )[0] ?? null;
-    return {
-      category: category.value,
-      label: category.label,
-      status: !ticket
-        ? "not_started"
-        : deliveryTicketPublicStatus(ticket) === "completed"
-          ? "completed"
-          : "in_progress",
-      ticket,
-    };
-  });
 }
 
 export function normalizeTicketDetail(
@@ -524,7 +382,8 @@ function ticketTitle(ticket: AdminDeliveryTicket) {
   return ticket.title || ticket.topic || "未命名工单";
 }
 
-function ticketTypeLabel(type: AdminDeliveryTicket["type"]) {
+export function ticketTypeLabel(type: AdminDeliveryTicket["type"]) {
+  if (type === "knowledge_base") return "品牌知识库";
   return type === "website_operation" ? "官网运营" : "内容资产";
 }
 
@@ -533,10 +392,10 @@ function StatusPill({
 }: {
   ticket: Pick<AdminDeliveryTicket, "status" | "publicStatus">;
 }) {
-  const status = deliveryTicketPublicStatus(ticket);
+  const status = ticket.status;
   return (
     <span className={`admin-ticket-status is-${status}`}>
-      {status === "completed" ? "已完成" : "待受理"}
+      {DELIVERY_TICKET_STATUS_LABELS[status]}
     </span>
   );
 }
@@ -639,17 +498,21 @@ function Timeline({
 export default function AdminDeliveryTicketWorkspace({
   userId,
   enterpriseName,
+  customerUsername,
   servicePlanCode,
   serviceStatus,
   canAdjustQuota = false,
+  canExecuteDelivery = false,
   preview = false,
   previewFixtures,
 }: {
   userId: number;
   enterpriseName?: string | null;
+  customerUsername?: string | null;
   servicePlanCode?: string | null;
   serviceStatus?: string | null;
   canAdjustQuota?: boolean;
+  canExecuteDelivery?: boolean;
   preview?: boolean;
   previewFixtures?: AdminDeliveryTicketPreviewFixtures;
 }) {
@@ -686,7 +549,7 @@ export default function AdminDeliveryTicketWorkspace({
         userId,
         query: debouncedKeyword,
         type: typeFilter,
-        publicStatus: statusFilter,
+        status: statusFilter,
         limit: 20,
       }),
     [debouncedKeyword, statusFilter, typeFilter, userId],
@@ -696,19 +559,6 @@ export default function AdminDeliveryTicketWorkspace({
     retry: false,
     getNextPageParam: (lastPage: any) => lastPage?.nextCursor || undefined,
   });
-  const websiteOverviewQuery = api.list.useInfiniteQuery(
-    buildAdminTicketListInput({
-      userId,
-      type: "website_operation",
-      limit: 100,
-      order: "updated_desc",
-    }),
-    {
-      enabled: !previewMode && userId > 0,
-      retry: false,
-      getNextPageParam: (lastPage: any) => lastPage?.nextCursor || undefined,
-    },
-  );
   const adjustQuotaMutation = api.adjustQuota.useMutation();
   const previewListData = {
     tickets: previewFixtures?.tickets ?? [],
@@ -769,36 +619,15 @@ export default function AdminDeliveryTicketWorkspace({
         : flattenAdminTicketPages(listPages),
     [listPages, previewMode],
   );
-  const websiteOverviewTickets = useMemo(
-    () =>
-      previewMode
-        ? normalizeAdminTicketList(previewListData).filter(
-            (ticket) => ticket.type === "website_operation",
-          )
-        : flattenAdminTicketPages(websiteOverviewQuery.data?.pages || []),
-    [previewListData, previewMode, websiteOverviewQuery.data?.pages],
-  );
-  const websiteContentOverview = useMemo(
-    () => buildWebsiteContentOverview(websiteOverviewTickets),
-    [websiteOverviewTickets],
-  );
-  const knownTickets = useMemo(() => {
-    const byId = new Map<string, AdminDeliveryTicket>();
-    [...tickets, ...websiteOverviewTickets].forEach((ticket) =>
-      byId.set(ticket.id, ticket),
-    );
-    return [...byId.values()];
-  }, [tickets, websiteOverviewTickets]);
-
   useEffect(() => {
     if (
       selectedTicketId &&
-      knownTickets.some((ticket) => ticket.id === selectedTicketId)
+      tickets.some((ticket) => ticket.id === selectedTicketId)
     ) {
       return;
     }
-    setSelectedTicketId(tickets[0]?.id || websiteOverviewTickets[0]?.id || "");
-  }, [knownTickets, selectedTicketId, tickets, websiteOverviewTickets]);
+    setSelectedTicketId(tickets[0]?.id || "");
+  }, [selectedTicketId, tickets]);
 
   useEffect(() => {
     if (quotaEditing) return;
@@ -807,7 +636,7 @@ export default function AdminDeliveryTicketWorkspace({
   }, [contentQuota.limit, quotaEditing, websiteQuota.limit]);
 
   const selectedTicket =
-    knownTickets.find((ticket) => ticket.id === selectedTicketId) || null;
+    tickets.find((ticket) => ticket.id === selectedTicketId) || null;
   const detailQuery = api.detail.useQuery(
     {
       userId,
@@ -826,6 +655,7 @@ export default function AdminDeliveryTicketWorkspace({
         }
       : null
     : normalizeTicketDetail(detailQuery.data, selectedTicket || undefined);
+  const isDomainApplication = detail?.ticket.category === "domain_application";
   const updateMutation = api.update.useMutation();
   const addMessageMutation = api.addMessage.useMutation();
   const recordDeliveryMutation = api.recordDelivery.useMutation();
@@ -846,13 +676,6 @@ export default function AdminDeliveryTicketWorkspace({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const deliveryFileInputRef = useRef<HTMLInputElement>(null);
   const maintenanceFileInputRef = useRef<HTMLInputElement>(null);
-  const websiteTemplateFileInputRef = useRef<HTMLInputElement>(null);
-  const [websiteTemplateBusy, setWebsiteTemplateBusy] = useState<
-    "" | "download" | "preview" | "publish"
-  >("");
-  const [pendingWebsiteTemplate, setPendingWebsiteTemplate] =
-    useState<PendingWebsiteContentTemplate | null>(null);
-  const [websiteBulkOpen, setWebsiteBulkOpen] = useState(false);
 
   useEffect(() => {
     setPublicReply("");
@@ -866,26 +689,18 @@ export default function AdminDeliveryTicketWorkspace({
     setDeliveryPlatformMessage("");
     setDeliveryFiles([]);
   }, [
-    detail?.ticket.deliveryLinks,
+    detail?.ticket.deliveryLinks?.[0]?.label,
+    detail?.ticket.deliveryLinks?.[0]?.url,
     detail?.ticket.id,
     detail?.ticket.publicSummary,
     detail?.ticket.status,
   ]);
 
-  useEffect(() => {
-    setPendingWebsiteTemplate(null);
-    setWebsiteTemplateBusy("");
-    setWebsiteBulkOpen(false);
-  }, [userId]);
-
   const filteredTickets = useMemo(() => {
     if (!previewMode) return tickets;
     return tickets.filter((ticket) => {
       if (typeFilter !== "all" && ticket.type !== typeFilter) return false;
-      if (
-        statusFilter !== "all" &&
-        deliveryTicketPublicStatus(ticket) !== statusFilter
-      )
+      if (statusFilter !== "all" && ticket.status !== statusFilter)
         return false;
       const query = keyword.trim().toLocaleLowerCase("zh-CN");
       if (!query) return true;
@@ -906,166 +721,8 @@ export default function AdminDeliveryTicketWorkspace({
     if (previewMode) return;
     await Promise.all([
       listQuery.refetch(),
-      websiteOverviewQuery.refetch(),
       selectedTicketId ? detailQuery.refetch() : Promise.resolve(),
     ]);
-  };
-
-  const requestWebsiteContentTemplate = async (input: {
-    file: File;
-    preview?: boolean;
-    expectedFileHash?: string;
-    preflightToken?: string;
-  }) => {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/octet-stream",
-      "X-File-Name": encodeURIComponent(input.file.name),
-    };
-    if (input.preview) headers["X-Import-Preview"] = "true";
-    if (input.expectedFileHash) {
-      headers["X-Import-File-Hash"] = input.expectedFileHash;
-    }
-    if (input.preflightToken) {
-      headers["X-Import-Preflight-Token"] = input.preflightToken;
-    }
-    const response = await fetch(`/api/website-content-template/${userId}`, {
-      method: "PUT",
-      credentials: "include",
-      headers,
-      body: input.file,
-    });
-    if (!response.ok) {
-      throw new Error(await readWebsiteContentTemplateError(response));
-    }
-    return response.json();
-  };
-
-  const downloadCurrentWebsiteContentTemplate = async () => {
-    if (previewMode) {
-      toast.info("验收预览不读取客户数据库", {
-        description: "真实客户工作台会下载该客户当前工单及逐条修订号。",
-      });
-      return;
-    }
-    setWebsiteTemplateBusy("download");
-    try {
-      const response = await fetch(`/api/website-content-template/${userId}`, {
-        credentials: "include",
-      });
-      if (!response.ok) {
-        throw new Error(await readWebsiteContentTemplateError(response));
-      }
-      const blob = await response.blob();
-      const disposition = response.headers.get("Content-Disposition") || "";
-      const filename =
-        disposition.match(/filename="?([^";]+)"?/i)?.[1] ||
-        `frontmind-website-content-current-${userId}.json`;
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = filename;
-      anchor.click();
-      URL.revokeObjectURL(url);
-      toast.success("当前官网内容模板已下载");
-    } catch (error) {
-      toast.error("模板下载失败", {
-        description: error instanceof Error ? error.message : "请稍后重试。",
-      });
-    } finally {
-      setWebsiteTemplateBusy("");
-    }
-  };
-
-  const preflightWebsiteContentTemplate = async (file: File) => {
-    if (previewMode) {
-      toast.info("验收预览不上传工单模板", {
-        description: "正式工作台会先逐条校验修订号并展示真实差异。",
-      });
-      return;
-    }
-    setWebsiteTemplateBusy("preview");
-    setPendingWebsiteTemplate(null);
-    try {
-      const result = await requestWebsiteContentTemplate({
-        file,
-        preview: true,
-      });
-      const preview = normalizeWebsiteContentTemplatePreview(result);
-      if (preview.workspaceUserId !== userId) {
-        throw new Error("预检结果与当前客户不一致");
-      }
-      setPendingWebsiteTemplate({ file, preview });
-      setWebsiteBulkOpen(true);
-      if (preview.totals.changed === 0) {
-        toast.info("模板与当前官网内容一致");
-      } else {
-        toast.success("官网内容模板预检通过", {
-          description: `发现 ${preview.totals.changed} 条待发布变更。`,
-        });
-      }
-    } catch (error) {
-      toast.error(
-        /版本|revision|过期|当前内容模板/i.test(
-          error instanceof Error ? error.message : "",
-        )
-          ? "官网内容模板已过期"
-          : "官网内容模板预检失败",
-        {
-          description:
-            error instanceof Error ? error.message : "请检查模板后重试。",
-        },
-      );
-    } finally {
-      setWebsiteTemplateBusy("");
-    }
-  };
-
-  const publishWebsiteContentTemplate = async () => {
-    if (!pendingWebsiteTemplate || previewMode) return;
-    const { file } = pendingWebsiteTemplate;
-    let preview = pendingWebsiteTemplate.preview;
-    setWebsiteTemplateBusy("publish");
-    try {
-      if (!websiteContentTemplatePreflightUsable(preview)) {
-        const refreshed = await requestWebsiteContentTemplate({
-          file,
-          preview: true,
-        });
-        preview = normalizeWebsiteContentTemplatePreview(refreshed);
-        setPendingWebsiteTemplate({ file, preview });
-      }
-      if (
-        preview.workspaceUserId !== userId ||
-        preview.totals.changed === 0 ||
-        !websiteContentTemplatePreflightUsable(preview)
-      ) {
-        throw new Error("模板没有可发布变更或预检凭证已失效");
-      }
-      const result = await requestWebsiteContentTemplate({
-        file,
-        expectedFileHash: preview.fileHash,
-        preflightToken: preview.preflightToken,
-      });
-      const changed = Number(result?.result?.changed || preview.totals.changed);
-      setPendingWebsiteTemplate(null);
-      await refresh();
-      toast.success("官网内容已发布", {
-        description: `${changed} 条工单在同一事务中完成更新。`,
-      });
-    } catch (error) {
-      toast.error(
-        /版本|revision|过期|预检|凭证|文件内容/i.test(
-          error instanceof Error ? error.message : "",
-        )
-          ? "请重新下载或预检官网内容模板"
-          : "官网内容发布失败",
-        {
-          description: error instanceof Error ? error.message : "请稍后重试。",
-        },
-      );
-    } finally {
-      setWebsiteTemplateBusy("");
-    }
   };
 
   const saveQuotaLimits = async () => {
@@ -1133,7 +790,11 @@ export default function AdminDeliveryTicketWorkspace({
     const platform = contentAssetTicket ? deliveryPlatform.trim() : "";
     const targetUrl = contentAssetTicket ? deliveryTargetUrl.trim() : "";
     if (!summary) {
-      toast.error("完成工单前请填写公开内容总结");
+      toast.error(
+        isDomainApplication
+          ? "完成域名工单前请填写要返回给客户的备案服务码"
+          : "完成工单前请填写公开内容总结",
+      );
       return;
     }
     if ((platform && !targetUrl) || (!platform && targetUrl)) {
@@ -1355,279 +1016,36 @@ export default function AdminDeliveryTicketWorkspace({
   const internalEvents = (detail?.events || []).filter(
     (event) => event.visibility === "internal",
   );
+  const isKnowledgeTicket = detail?.ticket.type === "knowledge_base";
+  const isKnowledgeReset = detail?.ticket.category === "knowledge_reset";
+  const selectedWorkflowDomain =
+    detail?.ticket.workflowDomain ?? selectedTicket?.workflowDomain ?? null;
+  const canExecuteSelectedTicket =
+    canExecuteDelivery && !selectedWorkflowDomain;
 
   return (
     <div className="admin-delivery-workspace">
       <div className="admin-delivery-toolbar">
         <div>
-          <p>工单与官网</p>
-          <h2>{enterpriseName || "客户"}交付协作</h2>
+          <p>客户工单</p>
+          <h2>{enterpriseName || "客户"}工单记录</h2>
           <span>
-            受理内容与官网需求，记录公开交流、内部判断和最终内容总结。
+            {canExecuteSelectedTicket
+              ? "当前为旧版无岗位工单兜底：可以处理并留存准确的客户交付记录。"
+              : "按真实内部状态查看、沟通和催办；实际执行与交付由对应岗位工程师完成。"}
           </span>
         </div>
       </div>
-      <section className="admin-website-overview-card">
-        <div className="admin-website-overview-heading">
-          <div>
-            <span className="admin-website-overview-icon">
-              <Globe2 className="h-5 w-5" />
-            </span>
-            <div>
-              <strong>客户官网内容进度</strong>
-              <span>
-                与客户看板中的五类官网内容一一对应。点击已有内容可直接打开工单更新状态和客户可见总结。
-              </span>
-            </div>
-          </div>
-          <div className="admin-website-overview-total">
-            <strong>
-              {
-                websiteContentOverview.filter(
-                  (item) => item.status === "completed",
-                ).length
-              }
-              /{websiteContentOverview.length}
-            </strong>
-            <span>内容已完成</span>
-          </div>
-        </div>
-        {websiteOverviewQuery.error && !previewMode ? (
-          <div className="admin-website-overview-error">
-            <AlertCircle className="h-4 w-4" />
-            官网内容状态暂时无法读取，请刷新后重试。
-          </div>
-        ) : websiteOverviewQuery.isLoading && !previewMode ? (
-          <div className="admin-website-overview-loading">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            正在读取客户官网内容…
-          </div>
-        ) : (
-          <div className="admin-website-overview-grid">
-            {websiteContentOverview.map((item) => (
-              <button
-                key={item.category}
-                type="button"
-                className={`is-${item.status}`}
-                disabled={!item.ticket}
-                onClick={() => {
-                  if (!item.ticket) return;
-                  setTypeFilter("website_operation");
-                  setStatusFilter("all");
-                  setKeyword("");
-                  selectTicket(item.ticket.id);
-                }}
-              >
-                <header>
-                  <strong>{item.label}</strong>
-                  <span>
-                    {item.status === "completed"
-                      ? "已完成"
-                      : item.status === "in_progress"
-                        ? "处理中"
-                        : "尚未提交"}
-                  </span>
-                </header>
-                <p>
-                  {item.ticket?.publicSummary ||
-                    item.ticket?.topic ||
-                    item.ticket?.title ||
-                    (item.status === "not_started"
-                      ? "客户尚未提交此类官网内容需求。"
-                      : "打开工单补充客户可见的内容总结。")}
-                </p>
-                <footer>
-                  <span>
-                    {item.ticket
-                      ? `最近更新 ${formatAdminTicketDate(item.ticket.updatedAt)}`
-                      : "等待客户提交"}
-                  </span>
-                  {item.ticket && <ChevronRight className="h-4 w-4" />}
-                </footer>
-              </button>
-            ))}
-          </div>
-        )}
-      </section>
-      <details
-        className="admin-website-template-card"
-        open={websiteBulkOpen}
-        onToggle={(event) => setWebsiteBulkOpen(event.currentTarget.open)}
-      >
-        <summary className="admin-website-template-summary">
-          <div className="admin-website-template-title">
-            <FileJson2 className="h-5 w-5" />
-            <div>
-              <strong>批量更新官网内容（高级工具）</strong>
-              <span>
-                日常更新请直接使用上方内容卡片和工单；这里只用于一次批量发布多条完成状态与客户可见总结。
-              </span>
-            </div>
-          </div>
-          <span className="admin-website-template-expand">
-            {websiteBulkOpen ? "收起" : "展开"}
+      {!canExecuteSelectedTicket && (
+        <div className="admin-ticket-closed-notice">
+          <LockKeyhole className="h-4 w-4" />
+          <span>
+            {selectedWorkflowDomain
+              ? `当前为交付协调模式：该工单由${DELIVERY_ROLE_LABELS[selectedWorkflowDomain]}执行。管理员可以查看、回复客户、记录内部备注和催办，但不能代替工程师发布成果或完成工单。`
+              : "当前为交付协调模式：可以查看完整工单、回复客户和记录内部备注，但不能代替工程师发布成果、上传知识库或完成工单。"}
           </span>
-        </summary>
-        <div className="admin-website-template-tools">
-          <div>
-            <strong>JSON 批量文件</strong>
-            <span>
-              下载当前数据后修改，再上传预检；不会处理域名、ICP
-              备案或旧技术检查。
-            </span>
-          </div>
-          <div className="admin-website-template-actions">
-            <Button
-              type="button"
-              variant="outline"
-              disabled={Boolean(websiteTemplateBusy)}
-              onClick={() => void downloadCurrentWebsiteContentTemplate()}
-            >
-              {websiteTemplateBusy === "download" ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Download className="h-4 w-4" />
-              )}
-              下载当前内容模板
-            </Button>
-            <input
-              ref={websiteTemplateFileInputRef}
-              type="file"
-              className="hidden"
-              accept=".json,application/json"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                event.target.value = "";
-                if (file) void preflightWebsiteContentTemplate(file);
-              }}
-            />
-            <Button
-              type="button"
-              className="bg-[#5b2a86] hover:bg-[#49216c]"
-              disabled={Boolean(websiteTemplateBusy)}
-              onClick={() => websiteTemplateFileInputRef.current?.click()}
-            >
-              {websiteTemplateBusy === "preview" ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <UploadCloud className="h-4 w-4" />
-              )}
-              上传并预检
-            </Button>
-          </div>
         </div>
-
-        {pendingWebsiteTemplate && (
-          <div className="admin-website-template-preview">
-            <div className="admin-website-template-preview-header">
-              <div>
-                <strong>发布前差异确认</strong>
-                <span>{pendingWebsiteTemplate.file.name}</span>
-              </div>
-              <span>
-                文件哈希 {pendingWebsiteTemplate.preview.fileHash.slice(0, 12)}…
-              </span>
-            </div>
-            <div className="admin-website-template-metrics">
-              <div>
-                <span>模板记录</span>
-                <strong>{pendingWebsiteTemplate.preview.totals.records}</strong>
-              </div>
-              <div>
-                <span>待变更</span>
-                <strong>{pendingWebsiteTemplate.preview.totals.changed}</strong>
-              </div>
-              <div>
-                <span>将完成</span>
-                <strong>
-                  {pendingWebsiteTemplate.preview.totals.completing}
-                </strong>
-              </div>
-              <div>
-                <span>总结更新</span>
-                <strong>
-                  {pendingWebsiteTemplate.preview.totals.summariesUpdated}
-                </strong>
-              </div>
-            </div>
-            {pendingWebsiteTemplate.preview.totals.changed > 0 ? (
-              <div className="admin-website-template-diff-list">
-                {pendingWebsiteTemplate.preview.changes
-                  .filter((change) => change.change !== "unchanged")
-                  .map((change) => (
-                    <article key={change.ticketId}>
-                      <header>
-                        <div>
-                          <strong>{change.categoryLabel}</strong>
-                          <span>{change.topic || "未填写话题"}</span>
-                        </div>
-                        <span className={`is-${change.change}`}>
-                          {change.change === "complete"
-                            ? "完成工单"
-                            : "修正内容总结"}
-                        </span>
-                      </header>
-                      <div>
-                        <section>
-                          <span>当前内容总结</span>
-                          <p>
-                            {change.currentPublicSummary ||
-                              (change.currentComplete
-                                ? "尚未填写"
-                                : "待完成后发布")}
-                          </p>
-                        </section>
-                        <section>
-                          <span>发布后内容总结</span>
-                          <p>{change.incomingPublicSummary}</p>
-                        </section>
-                      </div>
-                      <footer>
-                        工单 {change.ticketId} · 当前修订 R{change.revision}
-                      </footer>
-                    </article>
-                  ))}
-              </div>
-            ) : (
-              <p className="admin-website-template-no-change">
-                模板与当前工单内容一致，没有需要发布的变更。
-              </p>
-            )}
-            <div className="admin-website-template-confirm">
-              <span>
-                {pendingWebsiteTemplate.preview.totals.unchanged} 条保持不变；
-                发布时会再次校验每条修订号，任一冲突都会整体回滚。
-              </span>
-              <div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  disabled={websiteTemplateBusy === "publish"}
-                  onClick={() => setPendingWebsiteTemplate(null)}
-                >
-                  取消
-                </Button>
-                <Button
-                  type="button"
-                  className="bg-[#5b2a86] hover:bg-[#49216c]"
-                  disabled={
-                    websiteTemplateBusy === "publish" ||
-                    pendingWebsiteTemplate.preview.totals.changed === 0
-                  }
-                  onClick={() => void publishWebsiteContentTemplate()}
-                >
-                  {websiteTemplateBusy === "publish" ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <CheckCircle2 className="h-4 w-4" />
-                  )}
-                  确认发布
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
-      </details>
+      )}
       {(Object.keys(contentQuota).length > 0 ||
         Object.keys(websiteQuota).length > 0) && (
         <div className="admin-delivery-quota-panel">
@@ -1769,6 +1187,7 @@ export default function AdminDeliveryTicketWorkspace({
                 aria-label="筛选工单类型"
               >
                 <option value="all">全部类型</option>
+                <option value="knowledge_base">品牌知识库</option>
                 <option value="content_asset">内容资产</option>
                 <option value="website_operation">官网运营</option>
               </select>
@@ -1778,8 +1197,13 @@ export default function AdminDeliveryTicketWorkspace({
                 aria-label="筛选工单状态"
               >
                 <option value="all">全部状态</option>
-                <option value="pending">待受理</option>
+                <option value="submitted">已提交</option>
+                <option value="needs_information">待补充资料</option>
+                <option value="scheduled">已排期</option>
+                <option value="in_progress">处理中</option>
                 <option value="completed">已完成</option>
+                <option value="rejected">未受理</option>
+                <option value="cancelled">已取消</option>
               </select>
             </div>
           </div>
@@ -1878,11 +1302,52 @@ export default function AdminDeliveryTicketWorkspace({
                   更新于 {formatAdminTicketDate(detail.ticket.updatedAt)}
                 </div>
               </header>
+              <section className="admin-ticket-customer-card">
+                <div>
+                  <span>客户</span>
+                  <strong>{enterpriseName || "客户名称未设置"}</strong>
+                </div>
+                <div>
+                  <span>客户账号</span>
+                  <strong>
+                    {customerUsername ? `@${customerUsername}` : "未记录"}
+                  </strong>
+                </div>
+                <div>
+                  <span>客户编号</span>
+                  <strong>#{userId}</strong>
+                </div>
+                <div>
+                  <span>提交时间</span>
+                  <strong>
+                    {formatAdminTicketDate(detail.ticket.createdAt)}
+                  </strong>
+                </div>
+                <div>
+                  <span>执行岗位</span>
+                  <strong>
+                    {detail.ticket.workflowDomain
+                      ? DELIVERY_ROLE_LABELS[detail.ticket.workflowDomain]
+                      : "旧版工单"}
+                  </strong>
+                </div>
+                <div>
+                  <span>工程师分配</span>
+                  <strong>
+                    {detail.ticket.assignedMemberId
+                      ? detail.ticket.assignedMemberName ||
+                        `工程师 #${detail.ticket.assignedMemberId}`
+                      : detail.ticket.workflowDomain
+                        ? "待分配"
+                        : "无岗位"}
+                  </strong>
+                </div>
+              </section>
               {!OPEN_TICKET_STATUSES.has(detail.ticket.status) && (
                 <div className="admin-ticket-closed-notice">
                   <LockKeyhole className="h-4 w-4" />
                   <span>
-                    该工单已结束，需求、交流、交付记录与附件仅供查看。
+                    该工单已结束，当前仅展示与该需求直接相关的处理记录。
                   </span>
                 </div>
               )}
@@ -1890,15 +1355,27 @@ export default function AdminDeliveryTicketWorkspace({
               <section className="admin-ticket-request-card">
                 <div className="admin-ticket-section-heading">
                   <div>
-                    <span>客户需求</span>
-                    <h3>需求正文与提交资料</h3>
+                    <span>{isKnowledgeTicket ? "知识库事项" : "客户需求"}</span>
+                    <h3>
+                      {isKnowledgeReset
+                        ? "知识库重置申请"
+                        : isKnowledgeTicket
+                          ? "品牌全域知识库交付"
+                          : "需求正文与提交资料"}
+                    </h3>
                   </div>
                   <FileText className="h-5 w-5" />
                 </div>
                 {detail.ticket.description ? (
                   <p>{detail.ticket.description}</p>
                 ) : (
-                  <p className="is-empty">客户未填写补充说明。</p>
+                  <p className="is-empty">
+                    {isKnowledgeReset
+                      ? "客户未填写重置原因。"
+                      : isKnowledgeTicket
+                        ? "该记录由知识库发布流程自动生成。"
+                        : "客户未填写补充说明。"}
+                  </p>
                 )}
                 {detail.ticket.type === "content_asset" && (
                   <p>
@@ -1952,103 +1429,114 @@ export default function AdminDeliveryTicketWorkspace({
                 ) : null}
               </section>
 
-              <div className="admin-ticket-timelines">
-                {detail.ticket.type === "content_asset" && (
+              <div
+                className={`admin-ticket-timelines${isKnowledgeTicket ? " is-single" : ""}`}
+              >
+                {(detail.ticket.type === "content_asset" ||
+                  isKnowledgeTicket) && (
                   <Timeline
-                    title="客户可见交流"
-                    description="此处内容与交付结果会同步给客户。"
+                    title={isKnowledgeTicket ? "处理记录" : "客户可见交流"}
+                    description={
+                      isKnowledgeTicket
+                        ? "仅保留该知识库事项的提交、审批与交付结果。"
+                        : "此处内容与交付结果会同步给客户。"
+                    }
                     events={publicEvents}
                   />
                 )}
-                <Timeline
-                  title="管理员内部记录"
-                  description="仅管理员可见，绝不返回用户端。"
-                  events={internalEvents}
-                  internal
-                />
+                {!isKnowledgeTicket && (
+                  <Timeline
+                    title="管理员内部记录"
+                    description="仅管理员可见，绝不返回用户端。"
+                    events={internalEvents}
+                    internal
+                  />
+                )}
               </div>
 
-              <div className="admin-ticket-compose-grid">
-                {detail.ticket.type === "content_asset" && (
-                  <section className="admin-ticket-compose">
+              {!isKnowledgeTicket && (
+                <div className="admin-ticket-compose-grid">
+                  {detail.ticket.type === "content_asset" && (
+                    <section className="admin-ticket-compose">
+                      <div>
+                        <MessageSquare className="h-4 w-4" />
+                        <strong>回复客户与回传成果</strong>
+                      </div>
+                      <Textarea
+                        value={publicReply}
+                        onChange={(event) => setPublicReply(event.target.value)}
+                        placeholder="填写客户可见回复或交付说明"
+                      />
+                      <input
+                        ref={fileInputRef}
+                        className="hidden"
+                        type="file"
+                        multiple
+                        onChange={(event) =>
+                          setPublicFiles(Array.from(event.target.files || []))
+                        }
+                      />
+                      <div className="admin-ticket-file-row">
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                        >
+                          <UploadCloud className="h-4 w-4" />
+                          选择交付文件
+                        </button>
+                        <span>
+                          {publicFiles.length
+                            ? `已选择 ${publicFiles.length} 个文件`
+                            : "可上传报告、截图或成果文件"}
+                        </span>
+                      </div>
+                      <Button
+                        variant="outline"
+                        disabled={
+                          uploading ||
+                          addMessageMutation.isPending ||
+                          !OPEN_TICKET_STATUSES.has(detail.ticket.status)
+                        }
+                        onClick={() => void sendMessage("customer")}
+                      >
+                        {uploading || addMessageMutation.isPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Send className="h-4 w-4" />
+                        )}
+                        发送客户可见回复
+                      </Button>
+                    </section>
+                  )}
+
+                  <section className="admin-ticket-compose is-internal">
                     <div>
-                      <MessageSquare className="h-4 w-4" />
-                      <strong>回复客户与回传成果</strong>
+                      <LockKeyhole className="h-4 w-4" />
+                      <strong>内部备注</strong>
                     </div>
                     <Textarea
-                      value={publicReply}
-                      onChange={(event) => setPublicReply(event.target.value)}
-                      placeholder="填写客户可见回复或交付说明"
+                      value={internalNote}
+                      onChange={(event) => setInternalNote(event.target.value)}
+                      placeholder="记录内部判断、协作人或风险边界"
                     />
-                    <input
-                      ref={fileInputRef}
-                      className="hidden"
-                      type="file"
-                      multiple
-                      onChange={(event) =>
-                        setPublicFiles(Array.from(event.target.files || []))
-                      }
-                    />
-                    <div className="admin-ticket-file-row">
-                      <button
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                      >
-                        <UploadCloud className="h-4 w-4" />
-                        选择交付文件
-                      </button>
-                      <span>
-                        {publicFiles.length
-                          ? `已选择 ${publicFiles.length} 个文件`
-                          : "可上传报告、截图或成果文件"}
-                      </span>
+                    <div className="admin-ticket-notice">
+                      <LockKeyhole className="h-4 w-4" />
+                      <span>内部备注不会出现在用户看板或客户接口中。</span>
                     </div>
                     <Button
                       variant="outline"
                       disabled={
-                        uploading ||
                         addMessageMutation.isPending ||
                         !OPEN_TICKET_STATUSES.has(detail.ticket.status)
                       }
-                      onClick={() => void sendMessage("customer")}
+                      onClick={() => void sendMessage("internal")}
                     >
-                      {uploading || addMessageMutation.isPending ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Send className="h-4 w-4" />
-                      )}
-                      发送客户可见回复
+                      <Save className="h-4 w-4" />
+                      保存内部备注
                     </Button>
                   </section>
-                )}
-
-                <section className="admin-ticket-compose is-internal">
-                  <div>
-                    <LockKeyhole className="h-4 w-4" />
-                    <strong>内部备注</strong>
-                  </div>
-                  <Textarea
-                    value={internalNote}
-                    onChange={(event) => setInternalNote(event.target.value)}
-                    placeholder="记录内部判断、协作人或风险边界"
-                  />
-                  <div className="admin-ticket-notice">
-                    <LockKeyhole className="h-4 w-4" />
-                    <span>内部备注不会出现在用户看板或客户接口中。</span>
-                  </div>
-                  <Button
-                    variant="outline"
-                    disabled={
-                      addMessageMutation.isPending ||
-                      !OPEN_TICKET_STATUSES.has(detail.ticket.status)
-                    }
-                    onClick={() => void sendMessage("internal")}
-                  >
-                    <Save className="h-4 w-4" />
-                    保存内部备注
-                  </Button>
-                </section>
-              </div>
+                </div>
+              )}
 
               {detail.ticket.type === "content_asset" && (
                 <section className="admin-ticket-delivery-card">
@@ -2103,192 +1591,236 @@ export default function AdminDeliveryTicketWorkspace({
                       暂无结构化发布、推送或复检记录。
                     </p>
                   )}
-                  <div className="admin-delivery-record-form">
-                    <label>
-                      <span>操作平台</span>
-                      <Input
-                        value={deliveryPlatform}
+                  {canExecuteSelectedTicket && (
+                    <div className="admin-delivery-record-form">
+                      <label>
+                        <span>操作平台</span>
+                        <Input
+                          value={deliveryPlatform}
+                          onChange={(event) =>
+                            setDeliveryPlatform(event.target.value)
+                          }
+                          placeholder="行业媒体、百度站长平台等"
+                        />
+                      </label>
+                      <label>
+                        <span>目标 URL</span>
+                        <Input
+                          value={deliveryTargetUrl}
+                          onChange={(event) =>
+                            setDeliveryTargetUrl(event.target.value)
+                          }
+                          placeholder="https://..."
+                        />
+                      </label>
+                      <label>
+                        <span>执行时间</span>
+                        <Input
+                          type="datetime-local"
+                          value={deliveryExecutedAt}
+                          onChange={(event) =>
+                            setDeliveryExecutedAt(event.target.value)
+                          }
+                        />
+                      </label>
+                      <label>
+                        <span>执行结果</span>
+                        <select
+                          value={deliveryResultStatus}
+                          onChange={(event) =>
+                            setDeliveryResultStatus(
+                              event.target.value as typeof deliveryResultStatus,
+                            )
+                          }
+                        >
+                          <option value="pending_confirmation">待确认</option>
+                          <option value="success">成功</option>
+                          <option value="failed">失败</option>
+                        </select>
+                      </label>
+                      <label className="is-wide">
+                        <span>平台返回信息</span>
+                        <Textarea
+                          value={deliveryPlatformMessage}
+                          onChange={(event) =>
+                            setDeliveryPlatformMessage(event.target.value)
+                          }
+                          placeholder="记录平台响应、失败原因或复检结论"
+                        />
+                      </label>
+                      <input
+                        ref={deliveryFileInputRef}
+                        className="hidden"
+                        type="file"
+                        multiple
                         onChange={(event) =>
-                          setDeliveryPlatform(event.target.value)
+                          setDeliveryFiles(Array.from(event.target.files || []))
                         }
-                        placeholder="行业媒体、百度站长平台等"
                       />
-                    </label>
-                    <label>
-                      <span>目标 URL</span>
-                      <Input
-                        value={deliveryTargetUrl}
-                        onChange={(event) =>
-                          setDeliveryTargetUrl(event.target.value)
-                        }
-                        placeholder="https://..."
-                      />
-                    </label>
-                    <label>
-                      <span>执行时间</span>
-                      <Input
-                        type="datetime-local"
-                        value={deliveryExecutedAt}
-                        onChange={(event) =>
-                          setDeliveryExecutedAt(event.target.value)
-                        }
-                      />
-                    </label>
-                    <label>
-                      <span>执行结果</span>
-                      <select
-                        value={deliveryResultStatus}
-                        onChange={(event) =>
-                          setDeliveryResultStatus(
-                            event.target.value as typeof deliveryResultStatus,
-                          )
-                        }
-                      >
-                        <option value="pending_confirmation">待确认</option>
-                        <option value="success">成功</option>
-                        <option value="failed">失败</option>
-                      </select>
-                    </label>
-                    <label className="is-wide">
-                      <span>平台返回信息</span>
-                      <Textarea
-                        value={deliveryPlatformMessage}
-                        onChange={(event) =>
-                          setDeliveryPlatformMessage(event.target.value)
-                        }
-                        placeholder="记录平台响应、失败原因或复检结论"
-                      />
-                    </label>
-                    <input
-                      ref={deliveryFileInputRef}
-                      className="hidden"
-                      type="file"
-                      multiple
-                      onChange={(event) =>
-                        setDeliveryFiles(Array.from(event.target.files || []))
-                      }
-                    />
-                    <div className="admin-ticket-file-row is-wide">
-                      <button
-                        type="button"
-                        onClick={() => deliveryFileInputRef.current?.click()}
-                      >
-                        <UploadCloud className="h-4 w-4" />
-                        上传截图或复检材料
-                      </button>
-                      <span>
-                        {deliveryFiles.length
-                          ? `已选择 ${deliveryFiles.length} 个文件`
-                          : "可选"}
-                      </span>
+                      <div className="admin-ticket-file-row is-wide">
+                        <button
+                          type="button"
+                          onClick={() => deliveryFileInputRef.current?.click()}
+                        >
+                          <UploadCloud className="h-4 w-4" />
+                          上传截图或复检材料
+                        </button>
+                        <span>
+                          {deliveryFiles.length
+                            ? `已选择 ${deliveryFiles.length} 个文件`
+                            : "可选"}
+                        </span>
+                      </div>
+                      <div className="admin-ticket-form-actions is-wide">
+                        <Button
+                          className="bg-[#5b2a86] hover:bg-[#49216c]"
+                          disabled={
+                            recordDeliveryMutation.isPending ||
+                            uploading ||
+                            !OPEN_TICKET_STATUSES.has(detail.ticket.status)
+                          }
+                          onClick={() => void saveDeliveryRecord()}
+                        >
+                          {recordDeliveryMutation.isPending || uploading ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Save className="h-4 w-4" />
+                          )}
+                          保存交付记录
+                        </Button>
+                      </div>
                     </div>
-                    <div className="admin-ticket-form-actions is-wide">
-                      <Button
-                        className="bg-[#5b2a86] hover:bg-[#49216c]"
-                        disabled={
-                          recordDeliveryMutation.isPending ||
-                          uploading ||
-                          !OPEN_TICKET_STATUSES.has(detail.ticket.status)
-                        }
-                        onClick={() => void saveDeliveryRecord()}
-                      >
-                        {recordDeliveryMutation.isPending || uploading ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Save className="h-4 w-4" />
-                        )}
-                        保存交付记录
-                      </Button>
-                    </div>
-                  </div>
+                  )}
                 </section>
               )}
 
-              {detail.ticket.category === "knowledge_base_maintenance" && (
-                <section className="admin-ticket-delivery-card">
+              {canExecuteSelectedTicket &&
+                detail.ticket.category === "knowledge_base_maintenance" && (
+                  <section className="admin-ticket-delivery-card">
+                    <div className="admin-ticket-section-heading">
+                      <div>
+                        <span>知识库替换版本</span>
+                        <h3>上传并发布通过校验的新知识库 ZIP</h3>
+                        <p>
+                          新版本会直接替换客户当前展示知识库，并与本维护工单绑定；发布成功后才能完成工单。
+                        </p>
+                      </div>
+                      <UploadCloud className="h-5 w-5" />
+                    </div>
+                    <input
+                      ref={maintenanceFileInputRef}
+                      className="hidden"
+                      type="file"
+                      accept=".zip,application/zip"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) void uploadKnowledgeMaintenanceArchive(file);
+                      }}
+                    />
+                    <div className="admin-ticket-status-action">
+                      <Button
+                        className="bg-[#5b2a86] hover:bg-[#49216c]"
+                        disabled={
+                          maintenanceUploading ||
+                          !OPEN_TICKET_STATUSES.has(detail.ticket.status)
+                        }
+                        onClick={() => maintenanceFileInputRef.current?.click()}
+                      >
+                        {maintenanceUploading ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <UploadCloud className="h-4 w-4" />
+                        )}
+                        {maintenanceUploading
+                          ? "正在校验并发布"
+                          : "上传知识库 ZIP"}
+                      </Button>
+                    </div>
+                  </section>
+                )}
+
+              {isKnowledgeTicket && (
+                <section className="admin-ticket-status-card">
                   <div className="admin-ticket-section-heading">
                     <div>
-                      <span>知识库替换版本</span>
-                      <h3>上传并发布通过校验的新知识库 ZIP</h3>
+                      <span>处理结果</span>
+                      <h3>
+                        {isKnowledgeReset
+                          ? "重置处理结果"
+                          : "品牌全域知识库交付结果"}
+                      </h3>
                       <p>
-                        新版本会直接替换客户当前展示知识库，并与本维护工单绑定；发布成功后才能完成工单。
+                        {detail.ticket.publicSummary ||
+                          (OPEN_TICKET_STATUSES.has(detail.ticket.status)
+                            ? "该事项正在由专用知识库流程处理。"
+                            : "该事项已结束。")}
                       </p>
                     </div>
-                    <UploadCloud className="h-5 w-5" />
+                    <CheckCircle2 className="h-5 w-5" />
                   </div>
-                  <input
-                    ref={maintenanceFileInputRef}
-                    className="hidden"
-                    type="file"
-                    accept=".zip,application/zip"
-                    onChange={(event) => {
-                      const file = event.target.files?.[0];
-                      if (file) void uploadKnowledgeMaintenanceArchive(file);
-                    }}
-                  />
+                  {detail.ticket.knowledgeSnapshotId && (
+                    <p className="mt-4 break-all text-xs text-[#716a80]">
+                      知识库版本标识：{detail.ticket.knowledgeSnapshotId}
+                    </p>
+                  )}
+                </section>
+              )}
+
+              {!isKnowledgeTicket && canExecuteSelectedTicket && (
+                <section className="admin-ticket-status-card">
+                  <div className="admin-ticket-section-heading">
+                    <div>
+                      <span>处理状态</span>
+                      <h3>
+                        {isDomainApplication
+                          ? "完成域名工单并返回备案服务码"
+                          : "完成工单并发布内容总结"}
+                      </h3>
+                      <p>
+                        {isDomainApplication
+                          ? "请确认域名状态正常，再将备案服务码写入下方处理结果；客户会在已完成工单中领取。"
+                          : "用户列表只显示待受理或已完成；完成摘要会进入用户历史记录。"}
+                      </p>
+                    </div>
+                    <History className="h-5 w-5" />
+                  </div>
+                  <label className="mt-4 block">
+                    <span className="text-sm font-semibold text-[#484057]">
+                      {isDomainApplication
+                        ? "备案服务码处理结果"
+                        : "公开内容总结"}
+                    </span>
+                    <Textarea
+                      className="mt-2 min-h-28"
+                      value={publicSummary}
+                      onChange={(event) => setPublicSummary(event.target.value)}
+                      placeholder={
+                        isDomainApplication
+                          ? "例如：备案服务码：XXXXXXXX（请复制核对无误后再完成工单）"
+                          : "完成工单时必填，简要说明实际完成的内容与结果"
+                      }
+                    />
+                  </label>
                   <div className="admin-ticket-status-action">
                     <Button
                       className="bg-[#5b2a86] hover:bg-[#49216c]"
                       disabled={
-                        maintenanceUploading ||
+                        updateMutation.isPending ||
+                        !publicSummary.trim() ||
                         !OPEN_TICKET_STATUSES.has(detail.ticket.status)
                       }
-                      onClick={() => maintenanceFileInputRef.current?.click()}
+                      onClick={() => void updateStatus()}
                     >
-                      {maintenanceUploading ? (
+                      {updateMutation.isPending ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
                       ) : (
-                        <UploadCloud className="h-4 w-4" />
+                        <CheckCircle2 className="h-4 w-4" />
                       )}
-                      {maintenanceUploading
-                        ? "正在校验并发布"
-                        : "上传知识库 ZIP"}
+                      完成工单
                     </Button>
                   </div>
                 </section>
               )}
-
-              <section className="admin-ticket-status-card">
-                <div className="admin-ticket-section-heading">
-                  <div>
-                    <span>处理状态</span>
-                    <h3>完成工单并发布内容总结</h3>
-                    <p>
-                      用户列表只显示待受理或已完成；完成摘要会进入用户历史记录。
-                    </p>
-                  </div>
-                  <History className="h-5 w-5" />
-                </div>
-                <label className="mt-4 block">
-                  <span className="text-sm font-semibold text-[#484057]">
-                    公开内容总结
-                  </span>
-                  <Textarea
-                    className="mt-2 min-h-28"
-                    value={publicSummary}
-                    onChange={(event) => setPublicSummary(event.target.value)}
-                    placeholder="完成工单时必填，简要说明实际完成的内容与结果"
-                  />
-                </label>
-                <div className="admin-ticket-status-action">
-                  <Button
-                    className="bg-[#5b2a86] hover:bg-[#49216c]"
-                    disabled={
-                      updateMutation.isPending ||
-                      !publicSummary.trim() ||
-                      !OPEN_TICKET_STATUSES.has(detail.ticket.status)
-                    }
-                    onClick={() => void updateStatus()}
-                  >
-                    {updateMutation.isPending ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <CheckCircle2 className="h-4 w-4" />
-                    )}
-                    完成工单
-                  </Button>
-                </div>
-              </section>
             </>
           ) : null}
         </main>

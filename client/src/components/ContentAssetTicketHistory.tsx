@@ -11,6 +11,14 @@ export type ContentAssetTicket = {
   status?: DeliveryTicketStatus;
   statusLabel?: string | null;
   publicStatus?: "pending" | "completed" | null;
+  publicStage?:
+    | "awaiting_service"
+    | "processing"
+    | "action_required"
+    | "completed"
+    | "closed"
+    | null;
+  publicStageLabel?: string | null;
   submittedAt?: string | number | Date | null;
   updatedAt?: string | number | Date | null;
   resolvedAt?: string | number | Date | null;
@@ -116,8 +124,14 @@ function TicketList({
                 )}
             </div>
             <div className="content-ticket-status">
-              <span data-status={completed ? "completed" : "pending"}>
-                {completed ? "已完成" : "待受理"}
+              <span
+                data-status={
+                  ticket.publicStage ||
+                  (completed ? "completed" : "awaiting_service")
+                }
+              >
+                {ticket.publicStageLabel ||
+                  (completed ? "已完成" : "已提交")}
               </span>
             </div>
           </>

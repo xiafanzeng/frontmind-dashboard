@@ -34,6 +34,7 @@ import {
   type PreparedUploadFiles,
 } from "@/lib/attachment-files";
 import { reconcileKnowledgeBaseProgress } from "@/lib/knowledge-progress";
+import { requireCurrentFrontMindBuild } from "@/lib/build-version";
 import { toast } from "sonner";
 
 const MAX_RETRIES = 3;
@@ -124,14 +125,21 @@ function dedupeStableOutput(output: OutputMessage[]): OutputMessage[] {
 }
 
 export function collectAssistantOutputIds(
-  messages: Array<{ id?: string; role?: string }> | undefined,
+  messages:
+    | Array<{ id?: string; upstreamOutputId?: string; role?: string }>
+    | undefined,
 ): string[] {
   if (!messages) return [];
   return messages.flatMap((message) =>
-    message.role === "assistant" &&
-    typeof message.id === "string" &&
-    message.id.trim()
-      ? [message.id]
+    message.role === "assistant"
+      ? [
+          typeof message.upstreamOutputId === "string" &&
+          message.upstreamOutputId.trim()
+            ? message.upstreamOutputId
+            : typeof message.id === "string"
+              ? message.id
+              : "",
+        ].filter(Boolean)
       : [],
   );
 }
@@ -202,6 +210,63 @@ function outputForKnowledgeProgress(
   slicedOutput: OutputMessage[],
 ): OutputMessage[] {
   return slicedOutput.length > 0 ? slicedOutput : output;
+}
+
+function outputItemText(item: OutputMessage) {
+  const content = item.content as unknown;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) =>
+      typeof part === "string"
+        ? part
+        : part && typeof part === "object" && "text" in part
+          ? String((part as { text?: unknown }).text ?? "")
+          : "",
+    )
+    .join("\n");
+}
+
+/**
+ * A provider can reuse output IDs or return a same-length cumulative array.
+ * Progress reconciliation already falls back to the full output in that case;
+ * select the latest protocol-bearing assistant turn for rendering as well.
+ */
+export function outputForKnowledgePresentation(
+  output: OutputMessage[],
+  slicedOutput: OutputMessage[],
+): OutputMessage[] {
+  if (slicedOutput.length > 0) return slicedOutput;
+
+  const messageIndexes = output.flatMap((item, index) =>
+    item.role === "assistant" || item.type === "message" || !item.type
+      ? [index]
+      : [],
+  );
+  if (messageIndexes.length === 0) return [];
+
+  const protocolIndex =
+    [...messageIndexes]
+      .reverse()
+      .find((index) =>
+        /FRONTMIND_KB_(?:MANIFEST|PRESENTATION|PROGRESS|REOPEN)/.test(
+          outputItemText(output[index]!),
+        ),
+      ) ?? messageIndexes[messageIndexes.length - 1]!;
+  const resourceTypes = new Set([
+    "output_image",
+    "image",
+    "output_file",
+    "file",
+  ]);
+
+  return output
+    .slice(protocolIndex)
+    .filter(
+      (item, offset) =>
+        offset === 0 ||
+        resourceTypes.has(item.type || ""),
+    );
 }
 
 export type FailureKind = "quota" | "attachment" | "auth" | "busy" | "unknown";
@@ -347,10 +412,18 @@ export function useSendMessage() {
           baselineOutputLength,
           historicalOutputIds,
         );
-        if (newOutput.length === 0) return;
+        const presentationOutput = outputForKnowledgePresentation(
+          output,
+          newOutput,
+        );
+        if (presentationOutput.length === 0) return;
         try {
           const assistantMsgs = sanitizeKnowledgeBaseOutputMessages(
-            parseOutputMessages(newOutput, responseStartedAt, modelName),
+            parseOutputMessages(
+              presentationOutput,
+              responseStartedAt,
+              modelName,
+            ),
           );
           if (elapsedSeconds != null && assistantMsgs.length > 0) {
             assistantMsgs[assistantMsgs.length - 1].elapsedTime =
@@ -689,6 +762,8 @@ export function useSendMessage() {
         retryConfig?: RetryConfig;
         agentProfile?: string;
         syncKnowledgeBaseSnapshot?: boolean;
+        knowledgeBaseExpectedRevision?: number;
+        knowledgeBaseExpectedLeafId?: string;
         responseLogicContext?: ResponseLogicTaskContext;
       },
     ) => {
@@ -700,6 +775,10 @@ export function useSendMessage() {
       sendInFlightRef.current = true;
 
       try {
+        if (!(await requireCurrentFrontMindBuild(text))) {
+          toast.info("检测到新版本，正在刷新后继续");
+          return false;
+        }
         const retryConfig = options?.retryConfig || defaultRetryConfig;
         const agentProfile = options?.agentProfile;
 
@@ -927,6 +1006,8 @@ export function useSendMessage() {
             ? await createKnowledgeBaseTurnTask(input, {
                 conversationId: convId,
                 taskId: conv?.previousResponseId || "",
+                expectedRevision: options.knowledgeBaseExpectedRevision,
+                expectedLeafId: options.knowledgeBaseExpectedLeafId,
               })
             : options?.responseLogicContext
               ? await createResponseLogicTask(input, {
@@ -991,18 +1072,22 @@ export function useSendMessage() {
                 `baseline=${baselineOutputLength}, new=${newOutput.length}, status=${response.status}`,
             );
 
-            if (newOutput.length > 0) {
+            const presentationOutput = options?.syncKnowledgeBaseSnapshot
+              ? outputForKnowledgePresentation(response.output, newOutput)
+              : newOutput;
+
+            if (presentationOutput.length > 0) {
               try {
                 const assistantMsgs = options?.syncKnowledgeBaseSnapshot
                   ? sanitizeKnowledgeBaseOutputMessages(
                       parseOutputMessages(
-                        newOutput,
+                        presentationOutput,
                         responseStartedAt,
                         agentProfile,
                       ),
                     )
                   : parseOutputMessages(
-                      newOutput,
+                      presentationOutput,
                       responseStartedAt,
                       agentProfile,
                     );
@@ -1072,18 +1157,22 @@ export function useSendMessage() {
                 historicalOutputIds,
               );
 
-              if (newOutput.length > 0) {
+              const presentationOutput = options?.syncKnowledgeBaseSnapshot
+                ? outputForKnowledgePresentation(response.output, newOutput)
+                : newOutput;
+
+              if (presentationOutput.length > 0) {
                 try {
                   const finalMsgs = options?.syncKnowledgeBaseSnapshot
                     ? sanitizeKnowledgeBaseOutputMessages(
                         parseOutputMessages(
-                          newOutput,
+                          presentationOutput,
                           responseStartedAt,
                           agentProfile,
                         ),
                       )
                     : parseOutputMessages(
-                        newOutput,
+                        presentationOutput,
                         responseStartedAt,
                         agentProfile,
                       );

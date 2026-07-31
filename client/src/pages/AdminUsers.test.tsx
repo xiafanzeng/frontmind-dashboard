@@ -297,6 +297,7 @@ describe("engineer account management", () => {
       expect(mocks.setEngineerApiKey).toHaveBeenCalledWith({
         engineerUserId: 88,
         apiKey: "sk-engineer-secret",
+        expectedVersion: 0,
       }),
     );
   });

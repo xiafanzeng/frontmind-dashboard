@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DELIVERY_ROLE_LABELS,
+  deliveryOperationTriggersMonitoringRetest,
   deliveryRoleOwnsOperation,
   deliveryRoleTypeSchema,
 } from "../shared/delivery-roles";
@@ -49,5 +50,18 @@ describe("delivery engineer roles", () => {
         deliveryRoleOwnsOperation("content_distribution_engineer", operation),
       ).toBe(false);
     }
+  });
+
+  it("starts monitoring only after public distribution or site verification", () => {
+    expect(
+      deliveryOperationTriggersMonitoringRetest("content_asset_publish"),
+    ).toBe(false);
+    expect(deliveryOperationTriggersMonitoringRetest("company_facts")).toBe(
+      false,
+    );
+    expect(
+      deliveryOperationTriggersMonitoringRetest("channel_distribution"),
+    ).toBe(true);
+    expect(deliveryOperationTriggersMonitoringRetest("site_check")).toBe(true);
   });
 });

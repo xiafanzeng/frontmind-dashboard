@@ -376,7 +376,7 @@ export function buildAdminControlPlaneOverview(input: {
         description: "尚未发布可校验的企业看板内容。",
         status: "unconfigured",
         updatedAt: user.createdAt.getTime(),
-        href: `/admin/customers/${user.id}/delivery`,
+        href: `/admin/customers/${user.id}/service`,
       });
     }
     if (user.isActive && (serviceStatus !== "active" || serviceExpiringSoon)) {
@@ -472,7 +472,7 @@ export function buildAdminControlPlaneOverview(input: {
         description: "存在失败的智能体执行记录，请进入客户工作区检查并重试。",
         status: "failed",
         updatedAt: row.updatedAt?.getTime() ?? null,
-        href: `/admin/customers/${row.userId}/activity`,
+        href: `/admin/customers/${row.userId}/knowledge`,
       });
     }
   }

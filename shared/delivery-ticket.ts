@@ -547,6 +547,34 @@ export const DELIVERY_TICKET_PUBLIC_STATUS_LABELS: Record<
   completed: "已完成",
 });
 
+export type DeliveryTicketPublicStage =
+  | "awaiting_service"
+  | "processing"
+  | "action_required"
+  | "completed"
+  | "closed";
+
+export function deliveryTicketPublicStage(
+  status: DeliveryTicketStatus,
+): DeliveryTicketPublicStage {
+  if (status === "in_progress") return "processing";
+  if (status === "needs_information") return "action_required";
+  if (status === "completed") return "completed";
+  if (status === "rejected" || status === "cancelled") return "closed";
+  return "awaiting_service";
+}
+
+export const DELIVERY_TICKET_PUBLIC_STAGE_LABELS: Record<
+  DeliveryTicketPublicStage,
+  string
+> = Object.freeze({
+  awaiting_service: "已提交",
+  processing: "处理中",
+  action_required: "待您补充",
+  completed: "已完成",
+  closed: "已结束",
+});
+
 export const publicDeliveryLinkSchema = z
   .object({
     label: z.string().trim().min(1).max(160),
@@ -563,6 +591,20 @@ const publicDeliveryTicketSummaryBaseSchema = z.object({
   topic: z.string().trim().max(512).nullable(),
   publicStatus: z.enum(["pending", "completed"]),
   publicStatusLabel: z.enum(["待受理", "已完成"]),
+  publicStage: z.enum([
+    "awaiting_service",
+    "processing",
+    "action_required",
+    "completed",
+    "closed",
+  ]),
+  publicStageLabel: z.enum([
+    "已提交",
+    "处理中",
+    "待您补充",
+    "已完成",
+    "已结束",
+  ]),
   publicSummary: z.string().max(50_000).nullable(),
   knowledgeSnapshotId: z.string().uuid().nullable().optional(),
 });
@@ -648,13 +690,17 @@ export const publicContentAssetTicketDetailSchema = z
   })
   .strict();
 
-/**
- * Website history is summary-only. In particular, this shape has no events,
- * attachments, download URLs, external delivery links or site-profile data.
- */
 export const publicWebsiteTicketDetailSchema = z
   .object({
-    ticket: publicWebsiteTicketSummarySchema,
+    ticket: publicWebsiteTicketSummarySchema
+      .extend({
+        revision: z.number().int().positive(),
+        canReply: z.boolean(),
+        canAttach: z.boolean(),
+      })
+      .strict(),
+    events: z.array(publicDeliveryTicketEventSchema),
+    attachments: z.array(publicDeliveryTicketAttachmentSchema).max(100),
   })
   .strict();
 
@@ -735,6 +781,50 @@ export const publicDeliveryTicketWorkspaceMetadataSchema = z
       .object({
         domainCompleted: z.boolean(),
         icpCompleted: z.boolean(),
+        styleState: z.enum([
+          "locked",
+          "waiting_samples",
+          "awaiting_selection",
+          "revision_requested",
+          "confirmed",
+          "legacy_confirmed",
+        ]),
+        styleRevision: z.number().int().nonnegative(),
+        styleBatch: z
+          .object({
+            id: z.string().uuid(),
+            ordinal: z.number().int().positive(),
+            status: z.enum([
+              "published",
+              "revision_requested",
+              "selected",
+              "superseded",
+            ]),
+            engineerNote: z.string().nullable(),
+            publishedAt: z.number().int().nonnegative().nullable(),
+            samples: z
+              .array(
+                z
+                  .object({
+                    id: z.string().uuid(),
+                    label: z.string().trim().min(1).max(160),
+                    note: z.string().nullable(),
+                    sortOrder: z.number().int().positive(),
+                    attachmentId: z.string().uuid(),
+                    filename: z.string().trim().min(1).max(512),
+                    mimeType: z.string().nullable(),
+                    imageUrl: z.string().trim().min(1),
+                  })
+                  .strict(),
+              )
+              .length(3),
+          })
+          .strict()
+          .nullable(),
+        selectedStyleSampleId: z.string().uuid().nullable(),
+        styleConfirmed: z.boolean(),
+        canSelectStyle: z.boolean(),
+        canRequestStyleRevision: z.boolean(),
         canSubmitDomain: z.boolean(),
         canSubmitIcp: z.boolean(),
         canSubmitContent: z.boolean(),

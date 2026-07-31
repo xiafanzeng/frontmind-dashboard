@@ -15,6 +15,7 @@ import {
 } from "../shared/delivery-catalog";
 import {
   aggregateDeliveryTicketQuotaCapacity,
+  assertManagedTicketCanBeExecutedByAdmin,
   assertExistingDeliveryTicketSettlementScope,
   assertDeliveryTicketServiceEligibility,
   assertDeliveryOperationPolicy,
@@ -22,6 +23,7 @@ import {
   assertWebsiteTicketWorkflow,
   decodeDeliveryTicketCursor,
   deliveryLinksFromOperationResults,
+  deliveryTicketStatusAfterCustomerMessage,
   deriveTicketQuotaTransition,
   encodeDeliveryTicketCursor,
   isDeliveryTicketAttachmentVisible,
@@ -62,6 +64,17 @@ function settlementExecutor(
 }
 
 describe("delivery ticket contract", () => {
+  it("keeps role-owned ticket execution inside the assigned engineer workbench", () => {
+    expect(() =>
+      assertManagedTicketCanBeExecutedByAdmin({
+        workflowDomain: "ai_operations_engineer",
+      }),
+    ).toThrow(/AI 运维工程师/);
+    expect(() =>
+      assertManagedTicketCanBeExecutedByAdmin({ workflowDomain: null }),
+    ).not.toThrow();
+  });
+
   it("publishes six explained content types without the retired media type", () => {
     expect(CONTENT_ASSET_CATALOG).toHaveLength(6);
     expect(
@@ -119,32 +132,59 @@ describe("delivery ticket contract", () => {
     ]);
   });
 
-  it("enforces summary-only website communication at the service boundary", () => {
+  it("allows website dialogue while keeping sensitive website attachments out", () => {
     expect(() =>
       assertDeliveryTicketMessagePolicy({
         ticketType: "website_operation",
+        ticketCategory: "domain_application",
         actorRole: "user",
         visibility: "customer",
+        attachmentCount: 0,
       }),
-    ).toThrow("官网工单不提供公开交流");
+    ).not.toThrow();
     expect(() =>
       assertDeliveryTicketMessagePolicy({
         ticketType: "website_operation",
-        actorRole: "admin",
+        ticketCategory: "icp_filing",
+        actorRole: "user",
         visibility: "customer",
+        attachmentCount: 1,
       }),
-    ).toThrow("官网工单不提供公开交流");
+    ).toThrow("只接收文字补充");
     expect(() =>
       assertDeliveryTicketMessagePolicy({
         ticketType: "website_operation",
-        actorRole: "admin",
-        visibility: "internal",
+        ticketCategory: "company_news",
+        actorRole: "user",
+        visibility: "customer",
+        attachmentCount: 1,
       }),
     ).not.toThrow();
     expect(() => assertDeliveryOperationPolicy("website_operation")).toThrow(
       "官网工单不回传",
     );
     expect(() => assertDeliveryOperationPolicy("content_asset")).not.toThrow();
+  });
+
+  it("returns a customer reply to the assigned engineer queue", () => {
+    expect(
+      deliveryTicketStatusAfterCustomerMessage({
+        actorRole: "user",
+        currentStatus: "needs_information",
+      }),
+    ).toBe("submitted");
+    expect(
+      deliveryTicketStatusAfterCustomerMessage({
+        actorRole: "user",
+        currentStatus: "in_progress",
+      }),
+    ).toBe("in_progress");
+    expect(
+      deliveryTicketStatusAfterCustomerMessage({
+        actorRole: "delivery_member",
+        currentStatus: "needs_information",
+      }),
+    ).toBe("needs_information");
   });
 
   it("keeps the canonical status set stable", () => {
@@ -475,9 +515,15 @@ describe("customer delivery-ticket DTO boundary", () => {
     assignedAdmins: [{ id: 7, name: "内部管理员" }],
     assignedAdminId: 7,
     assignedAdminName: "内部管理员",
+    workflowDomain: "content_distribution_engineer",
+    operation: "content_asset_publish",
+    assignedProjectAssignmentId: "61c5ea73-ab85-44a2-bbd6-bfc90a6251b0",
+    assignedMemberId: 19,
+    assignedMemberName: "内部工程师",
+    priority: "urgent",
   } as const;
 
-  it("projects content history to the two-state public contract only", () => {
+  it("keeps the compatible two-state filter while exposing a useful customer stage", () => {
     const value = toPublicDeliveryTicketSummary(internalTicket as any);
 
     expect(value).toEqual({
@@ -488,6 +534,8 @@ describe("customer delivery-ticket DTO boundary", () => {
       topic: "如何核验品牌事实",
       publicStatus: "completed",
       publicStatusLabel: "已完成",
+      publicStage: "completed",
+      publicStageLabel: "已完成",
       publicSummary: "已完成问答内容整理。",
       deliveryLinks: [
         {
@@ -506,6 +554,12 @@ describe("customer delivery-ticket DTO boundary", () => {
       "updatedAt",
       "resolvedAt",
       "attachmentCount",
+      "workflowDomain",
+      "operation",
+      "assignedProjectAssignmentId",
+      "assignedMemberId",
+      "assignedMemberName",
+      "priority",
     ]) {
       expect(value).not.toHaveProperty(forbidden);
     }
@@ -531,6 +585,8 @@ describe("customer delivery-ticket DTO boundary", () => {
       topic: "如何核验品牌事实",
       publicStatus: "completed",
       publicStatusLabel: "已完成",
+      publicStage: "completed",
+      publicStageLabel: "已完成",
       publicSummary: "已完成问答内容整理。",
     });
     expect(value).not.toHaveProperty("deliveryLinks");
@@ -538,7 +594,60 @@ describe("customer delivery-ticket DTO boundary", () => {
     expect(created).not.toHaveProperty("contractId");
   });
 
-  it("keeps website detail summary-only and content detail dialogue-only", () => {
+  it("does not present a rejected request to the customer as delivered", () => {
+    const value = toPublicDeliveryTicketSummary({
+      ...internalTicket,
+      status: "rejected",
+      statusLabel: "未受理",
+      publicSummary: "当前资料不足，本次需求未受理。",
+    } as any);
+
+    expect(value).toMatchObject({
+      publicStatus: "completed",
+      publicStage: "closed",
+      publicStageLabel: "已结束",
+      publicSummary: "当前资料不足，本次需求未受理。",
+    });
+  });
+
+  it("exposes the engineer supplement request only while customer action is required", () => {
+    const actionRequired = toPublicDeliveryTicketSummary({
+      ...internalTicket,
+      status: "needs_information",
+      publicSummary: "请补充产品参数生效日期。",
+    } as any);
+    const processing = toPublicDeliveryTicketSummary({
+      ...internalTicket,
+      status: "submitted",
+      publicSummary: "旧的补充要求不应继续展示。",
+    } as any);
+
+    expect(actionRequired).toMatchObject({
+      publicStage: "action_required",
+      publicStageLabel: "待您补充",
+      publicSummary: "请补充产品参数生效日期。",
+    });
+    expect(processing.publicSummary).toBeNull();
+  });
+
+  it("labels the automatic brand knowledge delivery record precisely", () => {
+    const value = toPublicDeliveryTicketSummary({
+      ...internalTicket,
+      type: "knowledge_base",
+      category: "knowledge_delivery",
+      knowledgeSnapshotId: "4a67e445-37bb-45ed-9268-4ca9437e4d70",
+    } as any);
+
+    expect(value).toMatchObject({
+      type: "knowledge_base",
+      category: "knowledge_delivery",
+      categoryLabel: "品牌全域知识库",
+      knowledgeSnapshotId: "4a67e445-37bb-45ed-9268-4ca9437e4d70",
+    });
+    expect(value).not.toHaveProperty("deliveryLinks");
+  });
+
+  it("validates public dialogue details for website and content tickets", () => {
     const websiteTicket = toPublicDeliveryTicketSummary({
       ...internalTicket,
       type: "website_operation",
@@ -546,14 +655,57 @@ describe("customer delivery-ticket DTO boundary", () => {
     } as any);
     expect(
       publicWebsiteTicketDetailSchema.safeParse({
-        ticket: websiteTicket,
+        ticket: {
+          ...websiteTicket,
+          revision: 4,
+          canReply: true,
+          canAttach: true,
+        },
+        events: [
+          {
+            id: "7e39705a-ae06-4e7b-8d45-6284903ee86f",
+            actorRole: "delivery_member",
+            actorLabel: "服务团队",
+            message: "请补充新闻发布时间。",
+            createdAt: 1_774_646_400_000,
+          },
+        ],
+        attachments: [
+          {
+            id: "4a67e445-37bb-45ed-9268-4ca9437e4d70",
+            filename: "新闻资料.pdf",
+            mimeType: "application/pdf",
+            sizeBytes: 1024,
+            purpose: "新闻资料",
+            kind: "input",
+            createdAt: 1_774_646_400_000,
+            downloadUrl:
+              "/api/delivery-ticket-attachments/4a67e445-37bb-45ed-9268-4ca9437e4d70/content",
+          },
+        ],
       }).success,
     ).toBe(true);
     expect(
       publicWebsiteTicketDetailSchema.safeParse({
-        ticket: websiteTicket,
-        events: [{ id: "internal-event" }],
-        attachments: [{ downloadUrl: "/api/private" }],
+        ticket: {
+          ...websiteTicket,
+          revision: 4,
+          canReply: true,
+          canAttach: true,
+        },
+        events: [],
+        attachments: [
+          {
+            id: "4a67e445-37bb-45ed-9268-4ca9437e4d70",
+            filename: "内部文件.pdf",
+            mimeType: "application/pdf",
+            sizeBytes: 1024,
+            purpose: null,
+            kind: "input",
+            createdAt: 1_774_646_400_000,
+            downloadUrl: "/api/private",
+          },
+        ],
       }).success,
     ).toBe(false);
 
@@ -679,6 +831,13 @@ describe("customer delivery-ticket DTO boundary", () => {
         icpStatus: "approved",
         domainCompleted: true,
         icpCompleted: true,
+        styleState: "confirmed",
+        styleRevision: 2,
+        styleBatch: null,
+        selectedStyleSampleId: null,
+        styleConfirmed: true,
+        canSelectStyle: false,
+        canRequestStyleRevision: false,
         canSubmitDomain: false,
         canSubmitIcp: false,
         canSubmitContent: true,
@@ -694,6 +853,13 @@ describe("customer delivery-ticket DTO boundary", () => {
     expect(metadata.websiteWorkflow).toEqual({
       domainCompleted: true,
       icpCompleted: true,
+      styleState: "confirmed",
+      styleRevision: 2,
+      styleBatch: null,
+      selectedStyleSampleId: null,
+      styleConfirmed: true,
+      canSelectStyle: false,
+      canRequestStyleRevision: false,
       canSubmitDomain: false,
       canSubmitIcp: false,
       canSubmitContent: true,

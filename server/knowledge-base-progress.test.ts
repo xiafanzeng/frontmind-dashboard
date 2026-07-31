@@ -309,11 +309,17 @@ describe("model progress envelope boundary", () => {
       schemaVersion: 1,
       revision: 1,
       leafId: "identity.position",
+      imageState: "attached",
+      assetIds: ["asset-identity-position"],
+      imageCount: 1,
     });
 
     expect(parseKnowledgeBasePresentationEnvelope(presentation)).toMatchObject({
       revision: 1,
       leafId: "identity.position",
+      imageState: "attached",
+      assetIds: ["asset-identity-position"],
+      imageCount: 1,
     });
     expect(() =>
       assertKnowledgeBasePresentationMatchesState(next, presentation),

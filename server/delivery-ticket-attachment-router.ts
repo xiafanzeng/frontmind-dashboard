@@ -118,27 +118,27 @@ export async function resolveAuthorizedTicketAttachment(input: {
       );
     }
   } else if (input.actor.role === "delivery_member") {
-    if (
-      !input.projectAssignmentId ||
-      row.assignedProjectAssignmentId !== input.projectAssignmentId
-    ) {
-      throw new DeliveryTicketError(
-        "ATTACHMENT_NOT_FOUND",
-        "工单附件不存在。",
-        404,
-      );
+    const terminal = ["completed", "rejected", "cancelled"].includes(
+      row.ticketStatus,
+    );
+    if (!terminal) {
+      if (
+        !input.projectAssignmentId ||
+        row.assignedProjectAssignmentId !== input.projectAssignmentId
+      ) {
+        throw new DeliveryTicketError(
+          "ATTACHMENT_NOT_FOUND",
+          "工单附件不存在。",
+          404,
+        );
+      }
+      await assertDeliveryProjectContext({
+        actor: input.actor,
+        projectAssignmentId: input.projectAssignmentId,
+        customerUserId: row.ticketUserId,
+      });
     }
-    await assertDeliveryProjectContext({
-      actor: input.actor,
-      projectAssignmentId: input.projectAssignmentId,
-      customerUserId: row.ticketUserId,
-    });
-    if (
-      ["submitted", "needs_information", "scheduled", "in_progress"].includes(
-        row.ticketStatus,
-      ) &&
-      row.assignedMemberId !== input.actor.id
-    ) {
+    if (row.assignedMemberId !== input.actor.id) {
       throw new DeliveryTicketError(
         "ATTACHMENT_NOT_FOUND",
         "工单附件不存在。",
@@ -155,13 +155,17 @@ export async function resolveAuthorizedTicketAttachment(input: {
       410,
     );
   }
+  const credentialProjectAssignmentId =
+    input.actor.role === "delivery_member"
+      ? row.assignedProjectAssignmentId || input.projectAssignmentId
+      : null;
   const projectCredential =
-    input.actor.role === "delivery_member" && input.projectAssignmentId
+    input.actor.role === "delivery_member" && credentialProjectAssignmentId
       ? await getCredentialForUpstreamResource(
           input.actor.id,
           "file",
           row.attachment.upstreamFileId,
-          input.projectAssignmentId,
+          credentialProjectAssignmentId,
         )
       : null;
   const customerCredential =

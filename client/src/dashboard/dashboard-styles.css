@@ -5543,9 +5543,25 @@ button.content-ticket-row:hover {
   color: #16794f;
 }
 
-.content-ticket-status > span[data-status="pending"] {
+.content-ticket-status > span[data-status="pending"],
+.content-ticket-status > span[data-status="awaiting_service"] {
   background: #f1edf4;
   color: #5b2a86;
+}
+
+.content-ticket-status > span[data-status="processing"] {
+  background: #eaf2fb;
+  color: #1d4e89;
+}
+
+.content-ticket-status > span[data-status="action_required"] {
+  background: #fff3d8;
+  color: #855f08;
+}
+
+.content-ticket-status > span[data-status="closed"] {
+  background: #f2f0f3;
+  color: #71687c;
 }
 
 .content-ticket-links {

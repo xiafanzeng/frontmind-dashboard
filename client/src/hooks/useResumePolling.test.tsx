@@ -8,6 +8,9 @@ const mocks = vi.hoisted(() => ({
   updateStatus: vi.fn(),
   updateAssistantMessages: vi.fn(),
   parseOutputMessages: vi.fn((..._args: any[]): any[] => []),
+  sanitizeKnowledgeBaseOutputMessages: vi.fn((messages: any[]) => messages),
+  fetchKnowledgeBaseProgress: vi.fn(),
+  reconcileKnowledgeBaseProgress: vi.fn(),
   conversations: [] as any[],
 }));
 
@@ -19,11 +22,18 @@ vi.mock("@/contexts/ConversationContext", () => ({
     updateAssistantMessages: mocks.updateAssistantMessages,
   }),
   parseOutputMessages: mocks.parseOutputMessages,
+  sanitizeKnowledgeBaseOutputMessages:
+    mocks.sanitizeKnowledgeBaseOutputMessages,
 }));
 
 vi.mock("@/lib/frontmind-api", () => ({
   retrieveTask: mocks.retrieveTask,
   creditEventBus: { emit: vi.fn() },
+}));
+
+vi.mock("@/lib/knowledge-progress", () => ({
+  fetchKnowledgeBaseProgress: mocks.fetchKnowledgeBaseProgress,
+  reconcileKnowledgeBaseProgress: mocks.reconcileKnowledgeBaseProgress,
 }));
 
 describe("useResumePolling hydration gate", () => {
@@ -46,6 +56,14 @@ describe("useResumePolling hydration gate", () => {
       id: "task-1",
       status: "running",
       output: [],
+    });
+    mocks.fetchKnowledgeBaseProgress.mockResolvedValue(null);
+    mocks.reconcileKnowledgeBaseProgress.mockResolvedValue({
+      progress: null,
+      interactionState: "executing",
+      canReply: false,
+      canPublish: false,
+      lockReason: null,
     });
   });
 
@@ -177,6 +195,85 @@ describe("useResumePolling hydration gate", () => {
       "running",
       "error",
       expect.anything(),
+    );
+
+    unmount();
+  });
+
+  it("self-heals an error task when terminal output reused its provider ID", async () => {
+    mocks.hydrated = true;
+    mocks.conversations = [
+      {
+        id: "kb-error",
+        title: "Knowledge",
+        messages: [
+          { id: "user", role: "user", content: "确认", timestamp: 1 },
+        ],
+        status: "error",
+        taskId: "task-kb",
+        createdAt: 1,
+        updatedAt: 1,
+        lastKnownOutputLength: 1,
+      },
+    ];
+    const terminalOutput = [
+      {
+        id: "reused-output",
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "5.6 正文\n<!-- FRONTMIND_KB_PRESENTATION {\"revision\":46,\"leafId\":\"5.6\"} -->",
+          },
+        ],
+      },
+    ];
+    mocks.retrieveTask.mockResolvedValue({
+      id: "task-kb",
+      status: "completed",
+      output: terminalOutput,
+    });
+    mocks.fetchKnowledgeBaseProgress.mockResolvedValue({
+      build: { id: "build", conversationId: "kb-error" },
+    });
+    mocks.reconcileKnowledgeBaseProgress.mockResolvedValue({
+      progress: {
+        build: { id: "build", conversationId: "kb-error" },
+      },
+      interactionState: "awaiting_input",
+      canReply: true,
+      canPublish: false,
+      lockReason: null,
+    });
+    mocks.parseOutputMessages.mockReturnValue([
+      {
+        id: "reused-output",
+        role: "assistant",
+        content: "5.6 正文",
+        timestamp: 2,
+      },
+    ]);
+
+    const { unmount } = renderHook(() => useResumePolling());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(mocks.reconcileKnowledgeBaseProgress).toHaveBeenCalledWith({
+      conversationId: "kb-error",
+      taskId: "task-kb",
+    });
+    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
+      "kb-error",
+      expect.arrayContaining([
+        expect.objectContaining({ content: "5.6 正文" }),
+      ]),
+    );
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "kb-error",
+      "awaiting_input",
+      expect.objectContaining({ taskId: "task-kb" }),
     );
 
     unmount();

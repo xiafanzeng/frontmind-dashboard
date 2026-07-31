@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createKnowledgeBaseTurnTask,
   createResponseLogicTask,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
   retrieveTask,
@@ -89,6 +90,37 @@ describe("createResponseLogicTask", () => {
         mime_type: "image/png",
       },
     ]);
+  });
+});
+
+describe("createKnowledgeBaseTurnTask", () => {
+  it("fences a confirmation to the visible revision and leaf", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        task: { id: "task-next", status: "running", output: [] },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createKnowledgeBaseTurnTask(
+      [{ role: "user", content: [{ type: "input_text", text: "确认" }] }],
+      {
+        conversationId: "conv-kb",
+        taskId: "task-current",
+        expectedRevision: 45,
+        expectedLeafId: "5.5",
+      },
+    );
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).toMatchObject({
+      conversationId: "conv-kb",
+      taskId: "task-current",
+      userMessage: "确认",
+      expectedRevision: 45,
+      expectedLeafId: "5.5",
+    });
   });
 });
 

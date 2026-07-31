@@ -85,7 +85,7 @@ describe("DashboardSkeletonEditor", () => {
   it("maps legacy technical labels to customer-facing dashboard language", () => {
     expect(
       dashboardEditorDisplayText("企业数据骨架 / 看板指标 / 内容板块与卡片"),
-    ).toBe("客户看板展示 / 首页数据概览 / 客户看板内容区");
+    ).toBe("交付内容与进度 / 首页数据概览 / 交付内容区");
   });
 
   it("describes answer-only and question-only monitoring publishes truthfully", () => {
@@ -318,7 +318,7 @@ describe("DashboardSkeletonEditor", () => {
       />,
     );
 
-    expect(screen.getByText("客户视角实时预览")).toBeInTheDocument();
+    expect(screen.getByText("用户完整看板实时预览")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("企业名称"), {
       target: { value: "验收企业有限公司" },
     });
@@ -341,7 +341,7 @@ describe("DashboardSkeletonEditor", () => {
     );
     await waitFor(() => expect(onWorkspaceChanged).toHaveBeenCalledOnce());
     expect(mocks.toastSuccess).toHaveBeenCalledWith(
-      "客户看板展示已更新",
+      "交付内容与进度已更新",
       expect.objectContaining({ description: "当前版本 R4" }),
     );
   });
@@ -374,17 +374,19 @@ describe("DashboardSkeletonEditor", () => {
       screen.getByText(/企业身份确认后才可上传其他数据/),
     ).toBeInTheDocument();
     const profileCard = screen.getByText("首页标题与简介").closest("article");
-    const keywordCard = screen.getByText("品牌全域词库").closest("article");
+    const keywordCard = screen
+      .getByText("品牌全域词库", { selector: "strong" })
+      .closest("article");
     expect(profileCard).not.toBeNull();
     expect(keywordCard).not.toBeNull();
     expect(
       within(profileCard as HTMLElement).getByRole("button", {
-        name: "上传",
+        name: "上传并预览",
       }),
     ).not.toBeDisabled();
     expect(
       within(keywordCard as HTMLElement).getByRole("button", {
-        name: "上传",
+        name: "上传并预览",
       }),
     ).toBeDisabled();
   });
@@ -615,7 +617,9 @@ describe("DashboardSkeletonEditor", () => {
       />,
     );
 
-    const card = screen.getByText("品牌全域词库").closest("article");
+    const card = screen
+      .getByText("品牌全域词库", { selector: "strong" })
+      .closest("article");
     expect(card).not.toBeNull();
     const fileInput =
       card!.querySelector<HTMLInputElement>('input[type="file"]');

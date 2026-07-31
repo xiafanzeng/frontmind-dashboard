@@ -28,7 +28,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { ManagedDashboardSection } from "@/dashboard/UserBrandDashboard";
+import CustomerDashboardMirror, {
+  type CustomerDashboardMirrorSection,
+} from "@/components/CustomerDashboardMirror";
 import { trpc } from "@/lib/trpc";
 import {
   createDashboardModuleTemplateMetadata,
@@ -359,8 +361,8 @@ const importCards: ImportCardDefinition[] = [
   },
   {
     module: "sections",
-    title: "客户看板内容区",
-    description: "批量更新客户看到的内容区域、正文、卡片和数据表格。",
+    title: "品牌建设内容区",
+    description: "更新客户品牌建设页面中的正文、图片、卡片和数据表格。",
     accept: ".json,application/json",
     format: "JSON 当前模板",
     icon: LayoutTemplate,
@@ -422,9 +424,9 @@ function clonePayload(payload: DashboardPayload) {
 
 export function dashboardEditorDisplayText(value: string) {
   return value
-    .replaceAll("企业数据骨架", "客户看板展示")
+    .replaceAll("企业数据骨架", "交付内容与进度")
     .replaceAll("看板指标", "首页数据概览")
-    .replaceAll("内容板块与卡片", "客户看板内容区");
+    .replaceAll("内容板块与卡片", "交付内容区");
 }
 
 function nextSectionId(sections: DashboardPayload["sections"]) {
@@ -550,6 +552,8 @@ export default function DashboardSkeletonEditor({
   const [dirty, setDirty] = useState(false);
   const [publishReason, setPublishReason] = useState("");
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewSection, setPreviewSection] =
+    useState<CustomerDashboardMirrorSection>("brand");
   const [importingKey, setImportingKey] = useState("");
   const [pendingMonitoringImport, setPendingMonitoringImport] =
     useState<PendingMonitoringImport | null>(null);
@@ -622,7 +626,7 @@ export default function DashboardSkeletonEditor({
       setDirty(false);
       setPublishReason("");
       await onWorkspaceChanged?.();
-      toast.success("客户看板展示已更新", {
+      toast.success("交付内容与进度已更新", {
         description: `当前版本 R${updated.revision ?? revision + 1}`,
       });
     } catch (error) {
@@ -952,7 +956,7 @@ export default function DashboardSkeletonEditor({
       <PortalCard className="grid min-h-[420px] place-items-center p-8 text-sm text-[#716a80]">
         <div className="flex items-center gap-2">
           <Loader2 className="h-4 w-4 animate-spin" />
-          正在载入客户看板…
+          正在载入交付内容…
         </div>
       </PortalCard>
     );
@@ -965,10 +969,10 @@ export default function DashboardSkeletonEditor({
           <div>
             <div className="flex items-center gap-2 text-[#5b2a86]">
               <LayoutTemplate className="h-5 w-5" />
-              <h3 className="font-semibold">客户看板展示</h3>
+              <h3 className="font-semibold">用户流程内容管理</h3>
             </div>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-[#716a80]">
-              下方就是客户实际看到的品牌展示页。修改展示数据后可先在这里核对，发布后同步到客户账号。
+              直接维护客户真实看板的每个分区；上传、预检并发布后，客户账号读取同一份内容。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1011,7 +1015,7 @@ export default function DashboardSkeletonEditor({
             <div className="flex flex-col gap-2 border-b border-[#e8e1ee] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <strong className="text-sm text-[#332842]">
-                  客户视角实时预览
+                  用户完整看板实时预览
                 </strong>
                 <p className="mt-1 text-xs leading-5 text-[#81778a]">
                   下方编辑内容会立即出现在这里；只有点击“发布修改”后客户才会看到。
@@ -1028,11 +1032,11 @@ export default function DashboardSkeletonEditor({
               </span>
             </div>
             <div className="max-h-[560px] overflow-y-auto bg-[#f6f3f8] p-3 sm:p-5">
-              <ManagedDashboardSection
+              <CustomerDashboardMirror
                 payload={draft}
-                loading={false}
-                error={null}
-                embedded
+                initialSection={previewSection}
+                heading="用户当前所见"
+                description="品牌建设、词库、问题、监控、报告与内容资产均使用同一份客户数据。"
               />
             </div>
           </div>
@@ -1096,7 +1100,7 @@ export default function DashboardSkeletonEditor({
             <ul className="mt-3 space-y-2 text-xs leading-5 text-[#716a80]">
               <li>首次发布会绑定企业名称，之后不能在同一账号切换企业。</li>
               <li>编辑时只更新上方预览，点击“发布修改”才会同步给客户。</li>
-              <li>下方批量更新工具只替换所选展示数据。</li>
+              <li>下方每个用户页面分区都可单独下载、预览和上传。</li>
               <li>版本冲突时不会覆盖其他管理员的更新。</li>
             </ul>
             <label className="mt-4 block text-xs font-semibold text-[#716a80]">
@@ -1151,109 +1155,106 @@ export default function DashboardSkeletonEditor({
       )}
 
       <PortalCard className="overflow-hidden">
-        <details>
-          <summary className="flex cursor-pointer list-none items-center justify-between gap-4 p-5 sm:p-6">
-            <div>
-              <div className="flex items-center gap-2">
-                <UploadCloud className="h-5 w-5 text-[#5b2a86]" />
-                <h3 className="font-semibold text-[#171321]">
-                  批量更新客户看板（高级工具）
-                </h3>
-              </div>
-              <p className="mt-2 text-sm leading-6 text-[#716a80]">
-                适合一次更新大量数据；日常调整直接使用上方表单即可。
-              </p>
-            </div>
-            <span className="shrink-0 rounded-lg border border-[#ded3e6] bg-white px-3 py-2 text-xs font-semibold text-[#5b2a86]">
-              查看工具
-            </span>
-          </summary>
-          <div className="border-t border-[#e8e1ee] p-5 sm:p-6">
-            <p className="mb-5 text-sm leading-6 text-[#716a80]">
-              每类数据会单独校验和发布。上传前请保持问题 ID、资产 ID
-              等关联字段不变。
+        <div className="flex items-center gap-2 border-b border-[#e8e1ee] p-5 sm:p-6">
+          <UploadCloud className="h-5 w-5 text-[#5b2a86]" />
+          <div>
+            <h3 className="font-semibold text-[#171321]">用户页面分区更新</h3>
+            <p className="mt-1 text-sm leading-6 text-[#716a80]">
+              每个分区都可先预览用户所见，再下载当前内容或上传更新文件。
             </p>
-            {!enterpriseIdentityBound && (
-              <p className="mb-5 rounded-xl bg-[#fff5dc] px-3 py-2 text-xs leading-5 text-[#8b6500]">
-                请先确认企业名称并点击“发布修改”，或先上传“首页标题与简介”；企业身份确认后才可上传其他数据。
-              </p>
-            )}
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-              {importCards
-                .filter((card) => !profileOnly || card.module === "profile")
-                .map((card) => (
-                  <ModuleUploadCard
-                    key={card.module}
-                    definition={card}
-                    disabled={
-                      busy ||
-                      dirty ||
-                      (!enterpriseIdentityBound && card.module !== "profile")
-                    }
-                    importing={importingKey === card.module}
-                    onTemplate={() => {
-                      if (card.module === "monitoring") {
-                        void downloadMonitoringCurrentTemplate(userId)
-                          .then(() => toast.success("当前问题监控模板已下载"))
-                          .catch((error) =>
-                            toast.error("问题监控模板下载失败", {
-                              description:
-                                error instanceof Error
-                                  ? error.message
-                                  : "请稍后重试。",
-                            }),
-                          );
-                        return;
-                      }
-                      if (
-                        (card.module === "questions" ||
-                          card.module === "response-logic") &&
-                        authoritativeQuestionsLoading
-                      ) {
-                        toast.warning("正在读取正式问题目录，请稍后再下载。");
-                        return;
-                      }
-                      if (
-                        (card.module === "questions" ||
-                          card.module === "response-logic") &&
-                        authoritativeQuestionsError
-                      ) {
-                        toast.error("正式问题目录暂时无法读取", {
-                          description: authoritativeQuestionsError,
-                        });
-                        return;
-                      }
-                      if (
-                        card.module === "response-logic" &&
-                        responseLogicQuery.isLoading
-                      ) {
-                        toast.warning("正在读取当前应答逻辑，请稍后再下载。");
-                        return;
-                      }
-                      if (
-                        card.module === "response-logic" &&
-                        responseLogicQuery.error
-                      ) {
-                        toast.error("当前应答逻辑暂时无法读取", {
-                          description: responseLogicQuery.error.message,
-                        });
-                        return;
-                      }
-                      downloadModuleTemplate({
-                        module: card.module,
-                        revision,
-                        payload: workspace?.payload ?? draft,
-                        responseLogicRecords:
-                          responseLogicQuery.data?.records ?? [],
-                        authoritativeQuestions,
-                      });
-                    }}
-                    onFile={(file) => void importModule(card.module, file)}
-                  />
-                ))}
-            </div>
           </div>
-        </details>
+        </div>
+        <div className="p-5 sm:p-6">
+          <p className="mb-5 text-sm leading-6 text-[#716a80]">
+            每类数据会单独校验和发布。上传前请保持问题 ID、资产 ID
+            等关联字段不变。
+          </p>
+          {!enterpriseIdentityBound && (
+            <p className="mb-5 rounded-xl bg-[#fff5dc] px-3 py-2 text-xs leading-5 text-[#8b6500]">
+              请先确认企业名称并点击“发布修改”，或先上传“首页标题与简介”；企业身份确认后才可上传其他数据。
+            </p>
+          )}
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {importCards
+              .filter((card) => !profileOnly || card.module === "profile")
+              .map((card) => (
+                <ModuleUploadCard
+                  key={card.module}
+                  definition={card}
+                  disabled={
+                    busy ||
+                    dirty ||
+                    (!enterpriseIdentityBound && card.module !== "profile")
+                  }
+                  importing={importingKey === card.module}
+                  onPreview={() => {
+                    setPreviewSection(
+                      dashboardModulePreviewSection(card.module),
+                    );
+                    setPreviewOpen(true);
+                  }}
+                  onTemplate={() => {
+                    if (card.module === "monitoring") {
+                      void downloadMonitoringCurrentTemplate(userId)
+                        .then(() => toast.success("当前问题监控模板已下载"))
+                        .catch((error) =>
+                          toast.error("问题监控模板下载失败", {
+                            description:
+                              error instanceof Error
+                                ? error.message
+                                : "请稍后重试。",
+                          }),
+                        );
+                      return;
+                    }
+                    if (
+                      (card.module === "questions" ||
+                        card.module === "response-logic") &&
+                      authoritativeQuestionsLoading
+                    ) {
+                      toast.warning("正在读取正式问题目录，请稍后再下载。");
+                      return;
+                    }
+                    if (
+                      (card.module === "questions" ||
+                        card.module === "response-logic") &&
+                      authoritativeQuestionsError
+                    ) {
+                      toast.error("正式问题目录暂时无法读取", {
+                        description: authoritativeQuestionsError,
+                      });
+                      return;
+                    }
+                    if (
+                      card.module === "response-logic" &&
+                      responseLogicQuery.isLoading
+                    ) {
+                      toast.warning("正在读取当前应答逻辑，请稍后再下载。");
+                      return;
+                    }
+                    if (
+                      card.module === "response-logic" &&
+                      responseLogicQuery.error
+                    ) {
+                      toast.error("当前应答逻辑暂时无法读取", {
+                        description: responseLogicQuery.error.message,
+                      });
+                      return;
+                    }
+                    downloadModuleTemplate({
+                      module: card.module,
+                      revision,
+                      payload: workspace?.payload ?? draft,
+                      responseLogicRecords:
+                        responseLogicQuery.data?.records ?? [],
+                      authoritativeQuestions,
+                    });
+                  }}
+                  onFile={(file) => void importModule(card.module, file)}
+                />
+              ))}
+          </div>
+        </div>
       </PortalCard>
 
       <Dialog
@@ -1737,11 +1738,11 @@ export default function DashboardSkeletonEditor({
             </DialogDescription>
           </DialogHeader>
           <div className="max-h-[calc(92vh-104px)] overflow-y-auto bg-[#f6f3f8] p-4 sm:p-6">
-            <ManagedDashboardSection
+            <CustomerDashboardMirror
               payload={draft}
-              loading={false}
-              error={null}
-              embedded
+              initialSection={previewSection}
+              heading="用户完整看板"
+              description="此预览与用户端读取同一份草稿数据；发布后才会替换客户当前版本。"
             />
           </div>
         </DialogContent>
@@ -1929,7 +1930,7 @@ function SectionEditor({
         <div>
           <div className="flex items-center gap-2">
             <LayoutTemplate className="h-5 w-5 text-[#5b2a86]" />
-            <h3 className="font-semibold text-[#171321]">客户看板内容区</h3>
+            <h3 className="font-semibold text-[#171321]">交付内容区</h3>
           </div>
           <p className="mt-1 text-xs leading-5 text-[#716a80]">
             对应上方预览中的每一块内容。可填写说明正文、图文内容和数据表格。
@@ -2230,12 +2231,14 @@ function ModuleUploadCard({
   definition,
   disabled,
   importing,
+  onPreview,
   onTemplate,
   onFile,
 }: {
   definition: ImportCardDefinition;
   disabled: boolean;
   importing: boolean;
+  onPreview: () => void;
   onTemplate: () => void;
   onFile: (file: File) => void;
 }) {
@@ -2261,6 +2264,15 @@ function ModuleUploadCard({
             size="sm"
             variant="ghost"
             disabled={importing}
+            onClick={onPreview}
+          >
+            <Eye className="h-3.5 w-3.5" />
+            预览
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={importing}
             onClick={onTemplate}
           >
             下载当前内容模板
@@ -2276,7 +2288,7 @@ function ModuleUploadCard({
             ) : (
               <UploadCloud className="h-3.5 w-3.5" />
             )}
-            上传
+            上传并预览
           </Button>
         </div>
       </div>
@@ -2293,4 +2305,17 @@ function ModuleUploadCard({
       />
     </article>
   );
+}
+
+function dashboardModulePreviewSection(
+  module: Exclude<DashboardImportModule, "section-table">,
+): CustomerDashboardMirrorSection {
+  if (module === "keywords") return "keywords";
+  if (module === "questions" || module === "response-logic") {
+    return "questions";
+  }
+  if (module === "monitoring") return "monitoring";
+  if (module === "optimization-report") return "report";
+  if (module === "content-assets") return "content";
+  return "brand";
 }

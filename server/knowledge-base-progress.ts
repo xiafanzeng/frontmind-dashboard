@@ -85,6 +85,12 @@ export interface KnowledgeBasePresentationEnvelope {
   revision: number;
   /** The leaf rendered for the next customer action, or null at completion. */
   leafId: string | null;
+  /** Whether this turn returned validated image attachments for the leaf. */
+  imageState?: "attached" | "no_eligible_asset" | "not_applicable";
+  /** Stable asset IDs corresponding to the returned image attachments. */
+  assetIds?: string[];
+  /** Actual number of image attachments returned in this turn. */
+  imageCount?: number;
 }
 
 export interface KnowledgeBaseProgressSummary {
@@ -433,7 +439,15 @@ function parsePresentationEnvelopeObject(
   }
   assertOnlyKeys(
     input,
-    ["kind", "schemaVersion", "revision", "leafId"],
+    [
+      "kind",
+      "schemaVersion",
+      "revision",
+      "leafId",
+      "imageState",
+      "assetIds",
+      "imageCount",
+    ],
     "Presentation envelope",
   );
   if (input.kind !== KNOWLEDGE_BASE_PRESENTATION_KIND) {
@@ -462,11 +476,58 @@ function parsePresentationEnvelopeObject(
   if (typeof input.leafId === "string" && !leafId) {
     fail("INVALID_ENVELOPE", "Presentation envelope leafId cannot be empty");
   }
+  const imageState =
+    input.imageState === undefined
+      ? undefined
+      : String(input.imageState).trim();
+  if (
+    imageState !== undefined &&
+    !["attached", "no_eligible_asset", "not_applicable"].includes(imageState)
+  ) {
+    fail("INVALID_ENVELOPE", "Presentation envelope imageState is invalid");
+  }
+  if (
+    input.assetIds !== undefined &&
+    (!Array.isArray(input.assetIds) ||
+      input.assetIds.some(
+        (assetId) => typeof assetId !== "string" || !assetId.trim(),
+      ))
+  ) {
+    fail("INVALID_ENVELOPE", "Presentation envelope assetIds are invalid");
+  }
+  const assetIds =
+    input.assetIds === undefined
+      ? undefined
+      : Array.from(
+          new Set((input.assetIds as string[]).map((assetId) => assetId.trim())),
+        );
+  if (
+    input.imageCount !== undefined &&
+    (!Number.isSafeInteger(input.imageCount) ||
+      Number(input.imageCount) < 0 ||
+      Number(input.imageCount) > 3)
+  ) {
+    fail(
+      "INVALID_ENVELOPE",
+      "Presentation envelope imageCount must be an integer from 0 to 3",
+    );
+  }
   return {
     kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
     schemaVersion: KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION,
     revision: Number(input.revision),
     leafId: leafId as string | null,
+    ...(imageState
+      ? {
+          imageState: imageState as NonNullable<
+            KnowledgeBasePresentationEnvelope["imageState"]
+          >,
+        }
+      : {}),
+    ...(assetIds ? { assetIds } : {}),
+    ...(input.imageCount !== undefined
+      ? { imageCount: Number(input.imageCount) }
+      : {}),
   };
 }
 

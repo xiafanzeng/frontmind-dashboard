@@ -1,11 +1,17 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { apiKeyOwnership, upstreamResources, users } from "../drizzle/schema";
+import {
+  apiCredentials,
+  apiKeyOwnership,
+  upstreamResources,
+  users,
+} from "../drizzle/schema";
 import {
   AuthServiceError,
   assertAdminHasNoHistoricalCredentialResources,
   assertAdminHasNoUsageOwnedUsers,
   credentialsUseSameUpstreamApiKey,
+  deleteActiveApiCredentialInTransaction,
   deleteManagedUser,
   decryptApiKey,
   encryptApiKey,
@@ -226,6 +232,66 @@ describe("API credential encryption", () => {
         ...websiteEncrypted,
       }),
     ).toBe(apiKey);
+  });
+
+  it("adds a monotonically versioned tombstone when a Key is revoked", async () => {
+    const active = {
+      id: randomUUID(),
+      userId: 42,
+      version: 3,
+      status: "active",
+      encryptedKey: "encrypted",
+    };
+    const inserted: Array<Record<string, unknown>> = [];
+    const executor = {
+      select: vi.fn(() => ({
+        from: vi.fn((table) => {
+          expect(table).toBe(apiCredentials);
+          return {
+            where: vi.fn(() => ({
+              orderBy: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([active]),
+                })),
+              })),
+            })),
+          };
+        }),
+      })),
+      update: vi.fn((table) => {
+        expect(table).toBe(apiCredentials);
+        return {
+          set: vi.fn((values) => ({
+            where: vi.fn(async () => Object.assign(active, values)),
+          })),
+        };
+      }),
+      insert: vi.fn((table) => {
+        expect(table).toBe(apiCredentials);
+        return {
+          values: vi.fn(async (values) => {
+            inserted.push(values);
+          }),
+        };
+      }),
+    };
+
+    await expect(
+      deleteActiveApiCredentialInTransaction({
+        executor,
+        userId: 42,
+        now: new Date("2026-07-30T12:00:00.000Z"),
+      }),
+    ).resolves.toEqual({ version: 4, deleted: true });
+    expect(active.status).toBe("deleted");
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0]).toMatchObject({
+      userId: 42,
+      version: 4,
+      status: "deleted",
+      validationStatus: "unverified",
+    });
+    expect(JSON.stringify(inserted[0])).not.toContain("sk-");
   });
 
   it("fails closed when the encryption key is missing or malformed", () => {

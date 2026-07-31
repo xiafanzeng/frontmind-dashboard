@@ -137,6 +137,27 @@ consistent aggregate counts and rejection reasons. There is no minimum image
 count. Reject sprites, icon sheets, decorative backgrounds, mostly transparent
 media and logo collages masquerading as product visuals.
 
+### Per-node image delivery
+
+Image packaging and conversational image delivery are both required. On every
+turn that presents a leaf:
+
+- inspect that leaf's `assetIds` and choose at most three genuinely relevant
+  eligible assets;
+- return the exact validated local image bytes as real response image/file
+  attachments in the same turn, so the Dashboard can render them below the
+  leaf body;
+- use the packaged filename and meaningful alt/caption metadata;
+- never substitute a Markdown-only relative path, an origin/CDN URL, a source
+  link, or a textual “配图” placeholder for the actual attachment;
+- do not wait for the final ZIP to expose an already available current-leaf
+  image.
+
+If the current leaf has no eligible related asset, return no image rather than
+inventing one. A text-only turn is valid only in that case. Response attachments
+are delivery copies of the same bytes tracked by the stable asset records and
+do not replace their inclusion in the final ZIP.
+
 `target_met` means all candidates were inspected and required brand/product
 coverage was met. `source_limited` requires all candidates inspected plus a
 concrete coverage gap. `budget_limited` requires real uninspected candidates.
@@ -166,11 +187,18 @@ When the service supplies `FRONTMIND_KB_MANIFEST`, `FRONTMIND_KB_PROGRESS`,
 7. Every non-initial turn emits exactly one progress/reopen envelope followed
    by exactly one `FRONTMIND_KB_PRESENTATION` envelope. The presentation
    revision is the post-transition revision and its `leafId` is the leaf
-   actually shown in the body. Use `null` after the last leaf is completed.
+   actually shown in the body. It also declares `imageState`, `assetIds` and
+   `imageCount`: use `attached` with the exact 1–3 attached stable asset IDs,
+   or `no_eligible_asset` with an empty list and zero. Use `leafId: null`,
+   `imageState: not_applicable`, an empty list and zero after the last leaf is
+   completed.
 8. After 100%, later corrections reopen only the most relevant existing leaf.
 9. The visible body contains only the actual presented leaf (plus first-turn
    tree statistics when required). Do not append sources, unresolved items,
    verification notes, action guidance or a confirmation question.
+10. Every presented leaf also follows **Per-node image delivery**. Returning
+    only image captions or package-relative Markdown when eligible related
+    bytes already exist is a protocol failure.
 
 Use normal Markdown, not ASCII trees or simulated interfaces.
 

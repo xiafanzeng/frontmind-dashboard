@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { ConversationProvider } from "@/contexts/ConversationContext";
 import { useResumePolling } from "@/hooks/useResumePolling";
 import { trpc } from "@/lib/trpc";
-import { deliveryMemberNav } from "@/pages/DeliveryMemberDashboard";
+import { deliveryMemberNavForRole } from "@/pages/DeliveryMemberDashboard";
 import { DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY } from "@/lib/frontmind-api";
 import { DELIVERY_ROLE_LABELS } from "@shared/delivery-roles";
 
@@ -26,7 +26,6 @@ function ProjectAgentHome() {
 }
 
 export default function DeliveryMemberAgent() {
-  const credential = trpc.delivery.mine.credentialStatus.useQuery();
   const assignments = trpc.delivery.mine.assignments.useQuery();
   const [projectAssignmentId, setProjectAssignmentId] = useState(() =>
     typeof window === "undefined"
@@ -61,18 +60,9 @@ export default function DeliveryMemberAgent() {
       mode="fullscreen"
       eyebrow="工程师 · 工具"
       title="通用智能体"
-      navItems={deliveryMemberNav}
-      roleLabel={
-        credential.error
-          ? "API Key 状态读取失败"
-          : credential.isLoading
-            ? "正在读取 API Key 状态"
-            : credential.data?.configured
-              ? "API Key 已配置"
-              : "API Key 尚未配置，请联系管理员"
-      }
+      navItems={deliveryMemberNavForRole(currentAssignment?.roleType)}
       toolbar={
-        assignments.data?.length || credential.error ? (
+        assignments.data?.length ? (
           <div className="flex items-center gap-2">
             {assignments.data?.length ? (
               <select
@@ -98,16 +88,6 @@ export default function DeliveryMemberAgent() {
                 ))}
               </select>
             ) : null}
-            {credential.error && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => void credential.refetch()}
-              >
-                <RefreshCw className="h-4 w-4" />
-                重试 Key 状态
-              </Button>
-            )}
           </div>
         ) : undefined
       }

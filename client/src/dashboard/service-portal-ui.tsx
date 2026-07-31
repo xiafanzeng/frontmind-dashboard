@@ -1027,7 +1027,7 @@ function FormalPurchaseActions({
   );
 }
 
-function SalesAdvisorDialog({
+export function SalesAdvisorDialog({
   open,
   onOpenChange,
   targetPlan,

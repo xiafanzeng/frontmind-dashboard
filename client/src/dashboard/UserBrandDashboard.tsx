@@ -57,6 +57,7 @@ import {
   type QuestionCitationRow,
 } from "./citationDistributionData";
 import {
+  SalesAdvisorDialog,
   ServiceAccountDrawer,
   ServiceHome,
   ServiceLockedPage,
@@ -164,7 +165,7 @@ const semanticSubpages = [
     id: "website-management",
     section: "semantic",
     label: "AI 友好官网管理",
-    desc: "前往阿里云完成域名注册与 ICP 备案，通过后提交备案结果。",
+    desc: "先购买并提交域名，领取 AI 运维返回的备案服务码后完成 ICP 备案。",
   },
 ];
 
@@ -200,6 +201,7 @@ function getPreviewDeliveryWorkspace(
   const domainCompleted = unlocked;
   const icpCompleted = planCode === "luxury";
   return {
+    marketEdition: "domestic",
     contentAssetCatalog,
     websiteContentCatalog: [
       { value: "company_facts", label: "企业资料与品牌事实" },
@@ -215,10 +217,18 @@ function getPreviewDeliveryWorkspace(
         : domainCompleted
           ? "not_started"
           : "locked",
-      canSubmitIcp: !icpCompleted,
+      canSubmitDomain: !domainCompleted,
+      canSubmitIcp: domainCompleted && !icpCompleted,
       canSubmitContent: icpCompleted,
+      styleState: icpCompleted ? "legacy_confirmed" : "locked",
+      styleRevision: icpCompleted ? 1 : 0,
+      styleBatch: null,
+      selectedStyleSampleId: null,
+      styleConfirmed: icpCompleted,
+      canSelectStyle: false,
+      canRequestStyleRevision: false,
       lockReason: !icpCompleted
-        ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
+        ? "请先购买并提交域名，领取备案服务码后完成 ICP 备案。"
         : "",
     },
     quotas: {
@@ -576,13 +586,25 @@ export function PreviewUserBrandDashboard({
     fixtures.contentAssetCatalog,
   );
   const selectedTicket = deliveryWorkspace.tickets.find(
-    (ticket) =>
-      ticket.type === "content_asset" && ticket.id === selectedDeliveryTicketId,
+    (ticket) => ticket.id === selectedDeliveryTicketId,
   );
   const ticketDetail = selectedTicket
     ? {
         ticket: {
           ...selectedTicket,
+          revision: selectedTicket.revision || 1,
+          canReply: !["completed", "rejected", "cancelled"].includes(
+            selectedTicket.status,
+          ),
+          canAttach:
+            selectedTicket.type === "content_asset" ||
+            [
+              "company_facts",
+              "product_case_docs",
+              "industry_news",
+              "company_news",
+              "faq_content",
+            ].includes(selectedTicket.category || ""),
           description:
             "围绕已确认企业事实整理内容方案，并核验可公开的案例与图片素材。",
           targetPage: null,
@@ -610,7 +632,7 @@ export function PreviewUserBrandDashboard({
             actorLabel: "服务团队",
             message:
               selectedTicket.publicSummary ||
-              "管理员会在工单详情中更新沟通内容。",
+              "服务团队会在工单详情中更新沟通与交付结果。",
             fromStatus: "submitted",
             toStatus: selectedTicket.status,
             operationResult: null,
@@ -744,6 +766,10 @@ function PersistentUserBrandDashboard({
     },
   );
   const createDeliveryTicketMutation = deliveryTicketApi.create.useMutation();
+  const selectWebsiteStyleMutation =
+    deliveryTicketApi.selectWebsiteStyle.useMutation();
+  const requestWebsiteStyleRevisionMutation =
+    deliveryTicketApi.requestWebsiteStyleRevision.useMutation();
   const deliveryTicketDetailQuery = deliveryTicketApi.detail.useQuery(
     {
       ticketId:
@@ -799,7 +825,7 @@ function PersistentUserBrandDashboard({
       deliveryWorkspaceError={
         deliveryWorkspaceQuery.error?.message ||
         (deliveryWorkspaceQuery.isError
-          ? "工单与官网资料暂时无法载入，请稍后刷新。"
+          ? "交付资料暂时无法载入，请稍后刷新。"
           : null)
       }
       deliveryTicketLists={{
@@ -832,6 +858,14 @@ function PersistentUserBrandDashboard({
       onCreateDeliveryTicket={(input) =>
         createDeliveryTicketMutation.mutateAsync(input)
       }
+      onSelectWebsiteStyle={async (input) => {
+        await selectWebsiteStyleMutation.mutateAsync(input);
+        await refreshDeliveryWorkspaceAndLists();
+      }}
+      onRequestWebsiteStyleRevision={async (input) => {
+        await requestWebsiteStyleRevisionMutation.mutateAsync(input);
+        await refreshDeliveryWorkspaceAndLists();
+      }}
       selectedDeliveryTicketId={selectedDeliveryTicketId}
       onOpenDeliveryTicket={setSelectedDeliveryTicketId}
       onCloseDeliveryTicket={() => setSelectedDeliveryTicketId(null)}
@@ -879,6 +913,8 @@ function UserBrandDashboardContent({
   deliveryTicketLists = null,
   onRefreshDeliveryWorkspace,
   onCreateDeliveryTicket,
+  onSelectWebsiteStyle,
+  onRequestWebsiteStyleRevision,
   selectedDeliveryTicketId = null,
   onOpenDeliveryTicket,
   onCloseDeliveryTicket,
@@ -902,6 +938,7 @@ function UserBrandDashboardContent({
       : { section: "service", sub: null },
   );
   const [accountOpen, setAccountOpen] = useState(false);
+  const [salesAdvisorOpen, setSalesAdvisorOpen] = useState(false);
   const [selectedType, setSelectedType] = useState(null);
   const [responseQuestionId, setResponseQuestionId] = useState(null);
   const [questionIntakeDraft, setQuestionIntakeDraft] = useState(null);
@@ -954,7 +991,8 @@ function UserBrandDashboardContent({
   const canMutateDeliveryTicket =
     !previewMode &&
     Boolean(
-      selectedDeliveryTicketQuota?.allowed ??
+      deliveryTicketDetailPayload?.ticket?.canReply ??
+        selectedDeliveryTicketQuota?.allowed ??
         (contentAssetQuota?.allowed || websiteOperationQuota?.allowed),
     );
   const managedQuestionGroups = useMemo(
@@ -1039,7 +1077,7 @@ function UserBrandDashboardContent({
       await onRefreshDeliveryWorkspace?.();
     }
     toast.success(previewMode ? "预览工单已提交" : "内容需求已提交", {
-      description: "管理员会在工作台中审核需求并反馈后续安排。",
+      description: "服务团队核对后会交由 AI 内容分发工程师执行。",
     });
   };
   const submitWebsiteOperationRequest = async (payload) => {
@@ -1071,7 +1109,7 @@ function UserBrandDashboardContent({
     });
     await onRefreshDeliveryWorkspace?.();
     toast.success("官网运营工单已提交", {
-      description: "管理员会核验权限、资料与实施范围后更新处理状态。",
+      description: "服务团队核对权限与资料后会交由 AI 运维工程师执行。",
     });
   };
   const capabilityKey = getRouteCapability(route.section, route.sub);
@@ -1303,6 +1341,7 @@ function UserBrandDashboardContent({
                 (route.sub === "website-management" ? (
                   <AiWebsiteManagementWorkspace
                     planCode={servicePortal.plan.code}
+                    marketEdition={deliveryWorkspace.marketEdition}
                     websiteWorkflow={
                       deliveryWorkspace.websiteWorkflow ||
                       deliveryWorkspace.workflowState ||
@@ -1320,9 +1359,13 @@ function UserBrandDashboardContent({
                     hasMore={websiteTicketList?.hasMore ?? false}
                     error={websiteTicketList?.error || deliveryWorkspaceError}
                     onSubmit={submitWebsiteOperationRequest}
+                    onSelectStyle={onSelectWebsiteStyle}
+                    onRequestStyleRevision={onRequestWebsiteStyleRevision}
+                    onOpenTicket={onOpenDeliveryTicket}
                     onRefresh={onRefreshDeliveryWorkspace}
                     onLoadMore={websiteTicketList?.onLoadMore}
                     onUpgrade={() => setAccountOpen(true)}
+                    onContactAdvisor={() => setSalesAdvisorOpen(true)}
                   />
                 ) : (
                   <SemanticAssetSystem
@@ -1395,6 +1438,10 @@ function UserBrandDashboardContent({
         mutationPending={deliveryTicketMutationPending}
         onRefresh={onRefreshDeliveryTicket}
         onAddMessage={onAddDeliveryTicketMessage}
+      />
+      <SalesAdvisorDialog
+        open={salesAdvisorOpen}
+        onOpenChange={setSalesAdvisorOpen}
       />
     </div>
   );
@@ -1790,7 +1837,12 @@ export function ManagedDashboardSection({
   );
 }
 
-function ManagedKeywordTables({ tables, loading, error, embedded = false }) {
+export function ManagedKeywordTables({
+  tables,
+  loading,
+  error,
+  embedded = false,
+}) {
   const [searchTerm, setSearchTerm] = useState("");
   const keyword = searchTerm.trim().toLowerCase();
   const visibleTables = useMemo(() => {
@@ -2472,7 +2524,8 @@ function QuestionIntakePanelView({
           <span>目标问题</span>
           <h3>从品牌全域词库选择或直接输入需要优化的问题</h3>
           <p>
-            提交后进入管理员确认。管理员确认启动时，问题才会锁定并占用本周期对应类别额度。
+            提交后由 AI
+            监控与优化工程师确认；确认启动时，问题才会锁定并占用本周期对应类别额度。
           </p>
         </div>
         <div className="question-intake-heading-actions">
@@ -2553,7 +2606,7 @@ function QuestionIntakePanelView({
             })
           }
         >
-          {submitting ? "正在提交…" : "提醒管理员确认"}
+          {submitting ? "正在提交…" : "提交专业审核"}
         </button>
       </div>
 
@@ -2576,7 +2629,7 @@ function QuestionIntakePanelView({
 
       {pendingQuestions.length > 0 && (
         <div className="question-intake-pending">
-          <span>待管理员确认</span>
+          <span>待监控工程师确认</span>
           {pendingQuestions.map((item) => (
             <article key={item.id}>
               <strong>{item.question}</strong>
@@ -2586,7 +2639,7 @@ function QuestionIntakePanelView({
                     (option) => option.value === item.category,
                   )?.label
                 }
-                · 管理员确认启动后计入额度
+                · 监控工程师确认启动后计入额度
               </small>
             </article>
           ))}
@@ -2613,8 +2666,8 @@ function PreviewQuestionIntakePanel(props) {
           ...current.filter((item) => item.question !== input.question),
         ]);
         props.onDraftChange?.(null);
-        toast.success("已提醒管理员确认", {
-          description: "管理员确认启动后，问题才会锁定并占用额度。",
+        toast.success("已提交专业审核", {
+          description: "监控工程师确认启动后，问题才会锁定并占用额度。",
         });
         return true;
       }}
@@ -2659,8 +2712,8 @@ function PersistentQuestionIntakePanel(props) {
           props.onDraftChange?.(null);
           await portfolioQuery.refetch();
           props.onPortalRefresh?.();
-          toast.success("已提醒管理员确认", {
-            description: "管理员确认启动后，问题才会锁定并占用额度。",
+          toast.success("已提交专业审核", {
+            description: "监控工程师确认启动后，问题才会锁定并占用额度。",
           });
           return true;
         } catch (error) {
@@ -3763,7 +3816,7 @@ function SemanticAssetSystem({
       <PageHeader
         eyebrow="MindPromise智诺 / AI 友好内容资产"
         title="内容资产运营"
-        desc="在 GEO 服务之外，可根据目的选择内容类型提交制作需求，由管理员审核后安排内容制作与发布。"
+        desc="按业务目标选择内容类型并提交需求；交付管理员协调服务范围，内容分发工程师负责制作、发布并登记公开结果。"
       />
 
       {requestsLocked ? (
@@ -3844,7 +3897,7 @@ function safePublishedMediaUrl(value) {
   }
 }
 
-function PublishedContentAssets({ assets }) {
+export function PublishedContentAssets({ assets }) {
   if (!Array.isArray(assets) || assets.length === 0) return null;
 
   return (

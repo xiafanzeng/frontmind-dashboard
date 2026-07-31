@@ -15,6 +15,8 @@ import {
   users,
   type MessageMetadata,
 } from "../drizzle/schema";
+import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
+import { uniquifyOrderedIds } from "../shared/ordered-id";
 import {
   type AuthenticatedUser,
   credentialMayServeAccount,
@@ -46,6 +48,7 @@ const inlineImageSchema = z.object({
 
 const messageSchema = z.object({
   id: z.string().min(1).max(128),
+  upstreamOutputId: z.string().min(1).max(128).optional(),
   role: z.enum(["user", "assistant"]),
   content: z.string().max(2_000_000),
   attachments: z.array(attachmentSchema).max(100).optional(),
@@ -734,6 +737,9 @@ function buildMessageMetadata(
   message: z.infer<typeof messageSchema>,
 ): MessageMetadata | null {
   const metadata: MessageMetadata = {};
+  if (message.upstreamOutputId) {
+    metadata.upstreamOutputId = message.upstreamOutputId;
+  }
   if (message.outputFiles) metadata.outputFiles = message.outputFiles;
   if (message.inlineImages) metadata.inlineImages = message.inlineImages;
   if (message.elapsedTime !== undefined)
@@ -793,11 +799,14 @@ async function loadPersistedMessages(
     const metadata = (message.metadata ?? {}) as MessageMetadata;
     return {
       id: publicId(userId, message.id, projectAssignmentId),
+      ...(metadata.upstreamOutputId
+        ? { upstreamOutputId: metadata.upstreamOutputId }
+        : {}),
       role:
         message.role === "assistant"
           ? ("assistant" as const)
           : ("user" as const),
-      content: message.content,
+      content: normalizeKnowledgeCollectionCopy(message.content),
       timestamp: message.sentAt.getTime(),
       attachments: (attachmentsByMessage.get(message.id) ?? []).map(
         (attachment: typeof attachments.$inferSelect) => ({
@@ -831,6 +840,26 @@ async function loadPersistedMessages(
 
 type SnapshotMessage = ConversationSnapshot["messages"][number];
 type MessageTurn = { user: SnapshotMessage; assistants: SnapshotMessage[] };
+
+export function repairSnapshotMessageIds(
+  messagesToRepair: readonly SnapshotMessage[],
+): SnapshotMessage[] {
+  const repairedMessages = uniquifyOrderedIds(messagesToRepair);
+  const repairedAttachments = uniquifyOrderedIds(
+    repairedMessages.flatMap((message) => message.attachments ?? []),
+  );
+  let attachmentIndex = 0;
+
+  return repairedMessages.map((message) => {
+    if (!message.attachments?.length) return message;
+    const nextAttachments = repairedAttachments.slice(
+      attachmentIndex,
+      attachmentIndex + message.attachments.length,
+    );
+    attachmentIndex += message.attachments.length;
+    return { ...message, attachments: nextAttachments };
+  });
+}
 
 function splitMessageTurns(messagesToSplit: SnapshotMessage[]) {
   const prelude: SnapshotMessage[] = [];
@@ -1066,6 +1095,10 @@ async function persistSnapshot(
       updatedAt: Date.now(),
     };
   }
+  snapshot = {
+    ...snapshot,
+    messages: repairSnapshotMessageIds(snapshot.messages),
+  };
 
   const { credentialId: resolvedCredentialId, bindings } =
     await resolveSnapshotCredentialId(executor, userId, snapshot, {
@@ -1156,7 +1189,7 @@ async function persistSnapshot(
       conversationId: persistedConversationId,
       userId,
       role: message.role,
-      content: message.content,
+      content: normalizeKnowledgeCollectionCopy(message.content),
       sequence,
       metadata: buildMessageMetadata(message),
       sentAt,
@@ -1456,11 +1489,14 @@ async function listSnapshots(
       const metadata = (message.metadata ?? {}) as MessageMetadata;
       return {
         id: publicId(userId, message.id, projectAssignmentId),
+        ...(metadata.upstreamOutputId
+          ? { upstreamOutputId: metadata.upstreamOutputId }
+          : {}),
         role:
           message.role === "assistant"
             ? ("assistant" as const)
             : ("user" as const),
-        content: message.content,
+        content: normalizeKnowledgeCollectionCopy(message.content),
         timestamp: message.sentAt.getTime(),
         attachments: (attachmentsByMessage.get(message.id) ?? []).map(
           (attachment) => ({

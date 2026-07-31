@@ -1083,6 +1083,12 @@ export const deliveryTickets = mysqlTable(
       table.assignedMemberId,
       table.status,
     ),
+    index("delivery_tickets_member_status_resolved_id_idx").on(
+      table.assignedMemberId,
+      table.status,
+      table.resolvedAt,
+      table.id,
+    ),
     foreignKey({
       name: "delivery_tickets_project_assignment_fk",
       columns: [table.assignedProjectAssignmentId],
@@ -1230,6 +1236,125 @@ export const deliveryTicketAttachments = mysqlTable(
       table.ownerUserId,
       table.upstreamFileId,
     ),
+  ],
+);
+
+/** Records which delivery administrator originally created an engineer. */
+export const deliveryMemberOrigins = mysqlTable(
+  "delivery_member_origins",
+  {
+    engineerUserId: int("engineerUserId")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    createdByAdminId: int("createdByAdminId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    index("delivery_member_origins_admin_idx").on(table.createdByAdminId),
+  ],
+);
+
+/** One durable website-style approval workflow per customer workspace. */
+export const websiteStyleWorkflows = mysqlTable(
+  "website_style_workflows",
+  {
+    userId: int("userId")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    status: mysqlEnum("status", [
+      "waiting_samples",
+      "awaiting_selection",
+      "revision_requested",
+      "confirmed",
+      "legacy_confirmed",
+    ])
+      .default("waiting_samples")
+      .notNull(),
+    currentBatchId: varchar("currentBatchId", { length: 36 }),
+    selectedSampleId: varchar("selectedSampleId", { length: 36 }),
+    selectedByUserId: int("selectedByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    selectedAt: timestamp("selectedAt"),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [index("website_style_workflows_status_idx").on(table.status)],
+);
+
+/** Engineer-published batches of exactly three website style samples. */
+export const websiteStyleSampleBatches = mysqlTable(
+  "website_style_sample_batches",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    ticketId: varchar("ticketId", { length: 36 })
+      .notNull()
+      .references(() => deliveryTickets.id, { onDelete: "cascade" }),
+    ordinal: int("ordinal", { unsigned: true }).notNull(),
+    status: mysqlEnum("status", [
+      "published",
+      "revision_requested",
+      "selected",
+      "superseded",
+    ])
+      .default("published")
+      .notNull(),
+    engineerNote: text("engineerNote"),
+    publishedByUserId: int("publishedByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    publishedAt: timestamp("publishedAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("website_style_batches_user_ordinal_uq").on(
+      table.userId,
+      table.ordinal,
+    ),
+    index("website_style_batches_ticket_status_idx").on(
+      table.ticketId,
+      table.status,
+    ),
+  ],
+);
+
+/** The customer-visible images within one website-style sample batch. */
+export const websiteStyleSamples = mysqlTable(
+  "website_style_samples",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    batchId: varchar("batchId", { length: 36 })
+      .notNull()
+      .references(() => websiteStyleSampleBatches.id, {
+        onDelete: "cascade",
+      }),
+    attachmentId: varchar("attachmentId", { length: 36 }).notNull(),
+    label: varchar("label", { length: 160 }).notNull(),
+    note: text("note"),
+    sortOrder: int("sortOrder", { unsigned: true }).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("website_style_samples_batch_order_uq").on(
+      table.batchId,
+      table.sortOrder,
+    ),
+    uniqueIndex("website_style_samples_batch_attachment_uq").on(
+      table.batchId,
+      table.attachmentId,
+    ),
+    foreignKey({
+      name: "website_style_samples_attachment_fk",
+      columns: [table.attachmentId],
+      foreignColumns: [deliveryTicketAttachments.id],
+    }).onDelete("restrict"),
   ],
 );
 
@@ -2593,6 +2718,7 @@ export const conversationTurns = mysqlTable(
 );
 
 export type MessageMetadata = {
+  upstreamOutputId?: string;
   outputFiles?: Array<{ fileUrl: string; fileName: string; mimeType: string }>;
   inlineImages?: Array<{ src: string; alt?: string }>;
   elapsedTime?: number;

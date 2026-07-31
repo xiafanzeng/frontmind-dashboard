@@ -15,6 +15,9 @@ export type AuthUser = {
     | "content_distribution_engineer"
     | null;
   engineerApiKeyConfigured?: boolean;
+  engineerApiKeyVersion?: number;
+  engineerApiKeyManageable?: boolean;
+  engineerApiKeyManageReason?: string | null;
   marketEdition: "domestic" | "overseas";
   isActive: boolean;
 };

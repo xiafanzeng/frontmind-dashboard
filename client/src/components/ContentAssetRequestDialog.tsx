@@ -235,7 +235,7 @@ export default function ContentAssetRequestDialog({
               </div>
             </div>
             <p className="rounded-xl bg-[#f8f5fa] px-4 py-3 text-sm leading-6 text-[#645a70]">
-              管理员会审核话题、资料与图片，并协调适合该内容的行业权威信源发布；实际渠道和发布时间以工单确认结果为准。
+              服务团队会核验话题、资料与图片，并由内容分发工程师完成内容制作和渠道登记；实际渠道和发布时间以工单结果为准。
             </p>
             <DialogFooter>
               <Button
@@ -283,10 +283,10 @@ export default function ContentAssetRequestDialog({
                 />
                 <div>
                   <h3 className="text-sm font-semibold text-[#2b2036]">
-                    管理员如何处理
+                    服务团队如何交付
                   </h3>
                   <p className="mt-1 text-sm leading-6 text-[#706778]">
-                    管理员会核验企业事实与内容边界，完善写作方案，并协调与话题相匹配的行业权威信源发布。
+                    交付管理员负责核验范围和协调异常，AI 内容分发工程师负责制作内容、完成渠道分发并登记公开结果。
                   </p>
                 </div>
               </div>

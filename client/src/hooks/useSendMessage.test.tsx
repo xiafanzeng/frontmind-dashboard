@@ -4,6 +4,7 @@ import {
   useSendMessage,
   classifyFailure,
   getTaskPollDelay,
+  outputForKnowledgePresentation,
   sliceNewOutput,
 } from "../hooks/useSendMessage";
 
@@ -109,6 +110,40 @@ describe("sliceNewOutput", () => {
     ]);
 
     expect(result.map((item) => item.id)).toEqual(["new-1"]);
+  });
+});
+
+describe("outputForKnowledgePresentation", () => {
+  it("recovers the latest protocol turn when stable output IDs are reused", () => {
+    const old = {
+      id: "reused-output",
+      type: "message",
+      role: "assistant" as const,
+      content: [
+        {
+          type: "output_text",
+          text: "节点 2.3\n<!-- FRONTMIND_KB_PRESENTATION {\"leafId\":\"2.3\"} -->",
+        },
+      ],
+    };
+    const current = {
+      ...old,
+      content: [
+        {
+          type: "output_text",
+          text: "节点 2.4\n<!-- FRONTMIND_KB_PRESENTATION {\"leafId\":\"2.4\"} -->",
+        },
+      ],
+    };
+    const image = {
+      id: "leaf-image",
+      type: "output_image",
+      image_url: "/v1/files/leaf-image",
+    };
+
+    expect(
+      outputForKnowledgePresentation([old, current, image], []),
+    ).toEqual([current, image]);
   });
 });
 

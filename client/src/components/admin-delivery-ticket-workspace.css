@@ -2,6 +2,7 @@
   display: grid;
   gap: 20px;
   color: #221a33;
+  container-type: inline-size;
 }
 
 .admin-delivery-toolbar,
@@ -856,6 +857,37 @@
   font-size: 12px;
 }
 
+.admin-ticket-customer-card {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.admin-ticket-customer-card > div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  border: 1px solid #ebe4ef;
+  border-radius: 12px;
+  padding: 11px 12px;
+  background: #fbf9fd;
+}
+
+.admin-ticket-customer-card span {
+  color: #8b8495;
+  font-size: 11px;
+}
+
+.admin-ticket-customer-card strong {
+  overflow: hidden;
+  color: #332842;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .admin-ticket-request-card,
 .admin-ticket-status-card,
 .admin-ticket-delivery-card {
@@ -954,6 +986,10 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
   margin-top: 18px;
+}
+
+.admin-ticket-timelines.is-single {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .admin-ticket-timeline,
@@ -1666,6 +1702,25 @@
   }
 }
 
+@container (max-width: 760px) {
+  .admin-ticket-master-detail {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-ticket-list-panel {
+    border-right: 0;
+    border-bottom: 1px solid #e8e1ee;
+  }
+
+  .admin-ticket-list {
+    max-height: 360px;
+  }
+
+  .admin-ticket-customer-card {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 920px) {
   .admin-delivery-toolbar {
     align-items: stretch;
@@ -1732,6 +1787,10 @@
 }
 
 @media (max-width: 640px) {
+  .admin-ticket-customer-card {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .admin-delivery-quota-heading {
     align-items: stretch;
     flex-direction: column;

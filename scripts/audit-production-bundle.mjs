@@ -200,6 +200,29 @@ async function collectTestSourceFiles(directory) {
   return files;
 }
 
+function containsJavaScriptString(bundle, value) {
+  if (bundle.includes(value)) return true;
+  const unicodeEscaped = Array.from(value, (character) => {
+    const codePoint = character.codePointAt(0);
+    if (
+      codePoint === undefined ||
+      (codePoint >= 0x20 && codePoint <= 0x7e)
+    ) {
+      return character;
+    }
+    if (codePoint <= 0xffff) {
+      return `\\u${codePoint.toString(16).padStart(4, "0")}`;
+    }
+    const adjusted = codePoint - 0x10000;
+    const high = 0xd800 + (adjusted >> 10);
+    const low = 0xdc00 + (adjusted & 0x3ff);
+    return `\\u${high.toString(16).padStart(4, "0")}\\u${low
+      .toString(16)
+      .padStart(4, "0")}`;
+  }).join("");
+  return bundle.toLowerCase().includes(unicodeEscaped.toLowerCase());
+}
+
 try {
   const buildStat = await stat(buildRoot);
   if (!buildStat.isDirectory()) {
@@ -355,6 +378,53 @@ try {
   violations.push({
     file: "private-workflows/socratic-kb-builder-v3.skill",
     label: "invalid runtime Skill archive",
+  });
+}
+
+try {
+  const versionPath = join(
+    buildRoot,
+    "public",
+    "__frontmind__",
+    "version.json",
+  );
+  const version = JSON.parse(await readFile(versionPath, "utf8"));
+  if (
+    typeof version.version !== "string" ||
+    !/^[a-f0-9]{40}$/i.test(version.gitSha || "") ||
+    !Number.isFinite(Date.parse(version.builtAt || "")) ||
+    version.copyRevision !== "knowledge-collection-copy-v2"
+  ) {
+    throw new Error("invalid version fields");
+  }
+
+  const publicRoot = join(buildRoot, "public");
+  const indexHtml = await readFile(join(publicRoot, "index.html"), "utf8");
+  const javascriptAssets = Array.from(
+    indexHtml.matchAll(/(?:src|href)=["']\/?(assets\/[^"'?]+\.js)/g),
+    (match) => match[1],
+  );
+  if (!javascriptAssets.length) {
+    throw new Error("index does not reference a hashed JavaScript asset");
+  }
+  const activeCopy =
+    "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。";
+  const [clientBundles, serverBundle] = await Promise.all([
+    Promise.all(
+      javascriptAssets.map((asset) => readFile(join(publicRoot, asset), "utf8")),
+    ),
+    readFile(join(buildRoot, "index.js"), "utf8"),
+  ]);
+  if (!clientBundles.some((content) => content.includes(activeCopy))) {
+    throw new Error("active copy is missing from loaded client assets");
+  }
+  if (!containsJavaScriptString(serverBundle, activeCopy)) {
+    throw new Error("active copy is missing from the server bundle");
+  }
+} catch {
+  violations.push({
+    file: "public/__frontmind__/version.json",
+    label: "build identity, loaded assets, or active server copy is inconsistent",
   });
 }
 

@@ -32,6 +32,8 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   "service_quota_period.delivery_limits_adjusted": "调整交付额度",
   "presales.credential.replaced": "更新官网 API Key",
   "presales.credential.deleted": "删除官网 API Key",
+  "delivery.engineer_credential.replaced": "更新工程师 API Key",
+  "delivery.engineer_credential.revoked": "撤销工程师 API Key",
   "icp_material.uploaded": "上传备案材料",
   "icp_material.downloaded": "下载备案材料",
   "icp_material.withdrawn": "撤回备案材料",

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH,
+  assertKnowledgeBaseNodeImageDelivery,
   assertKnowledgeBaseCustomerOutput,
   classifyKnowledgeBaseUserAction,
+  collectKnowledgeBaseOutputImageKeys,
   extractFinalKnowledgeBaseAssistantText,
   isAmbiguousKnowledgeBaseAdvance,
 } from "./knowledge-base-progress-service";
@@ -135,5 +138,115 @@ describe("knowledge-base model output boundary", () => {
         },
       ]),
     ).toContain("毛利率");
+  });
+});
+
+describe("knowledge-base per-node image delivery", () => {
+  const presentation = {
+    kind: "frontmind.knowledge-base.presentation" as const,
+    schemaVersion: 1 as const,
+    revision: 3,
+    leafId: "product.api",
+    imageState: "attached" as const,
+    assetIds: ["asset-product-api"],
+    imageCount: 1,
+  };
+
+  it("counts snake-case and camel-case managed image outputs once", () => {
+    expect(
+      collectKnowledgeBaseOutputImageKeys([
+        {
+          role: "assistant",
+          type: "message",
+          content: [
+            {
+              type: "output_image",
+              file_id: "image-1",
+              file_name: "api.webp",
+            },
+          ],
+        },
+        {
+          type: "output_file",
+          fileId: "image-2",
+          fileName: "diagram.png",
+        },
+      ]),
+    ).toEqual(new Set(["image-1", "image-2"]));
+  });
+
+  it("accepts a declared image only when a real output attachment exists", () => {
+    expect(() =>
+      assertKnowledgeBaseNodeImageDelivery({
+        skillContentHash: KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH,
+        presentation,
+        output: [
+          {
+            type: "output_image",
+            file_id: "image-1",
+            file_name: "api.webp",
+          },
+        ],
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      assertKnowledgeBaseNodeImageDelivery({
+        skillContentHash: KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH,
+        presentation,
+        output: [],
+      }),
+    ).toThrow("当前节点图片附件与资产声明不一致");
+  });
+
+  it("keeps historical v3 task envelopes backward compatible", () => {
+    expect(() =>
+      assertKnowledgeBaseNodeImageDelivery({
+        skillContentHash: "historical-skill-hash",
+        presentation: {
+          kind: "frontmind.knowledge-base.presentation",
+          schemaVersion: 1,
+          revision: 3,
+          leafId: "product.api",
+        },
+        output: [],
+      }),
+    ).not.toThrow();
+  });
+
+  it("does not count an earlier turn's image in the current presentation", () => {
+    expect(() =>
+      assertKnowledgeBaseNodeImageDelivery({
+        skillContentHash: KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH,
+        presentation: {
+          kind: "frontmind.knowledge-base.presentation",
+          schemaVersion: 1,
+          revision: 4,
+          leafId: "team.research",
+          imageState: "no_eligible_asset",
+          assetIds: [],
+          imageCount: 0,
+        },
+        output: [
+          {
+            role: "assistant",
+            type: "message",
+            content:
+              '<!-- FRONTMIND_KB_PRESENTATION {"leafId":"product.api"} -->',
+          },
+          {
+            type: "output_image",
+            file_id: "old-image",
+            file_name: "old.webp",
+          },
+          {
+            role: "assistant",
+            type: "message",
+            content:
+              '<!-- FRONTMIND_KB_PRESENTATION {"leafId":"team.research"} -->',
+          },
+        ],
+      }),
+    ).not.toThrow();
   });
 });

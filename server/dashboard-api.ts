@@ -6592,6 +6592,7 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
     await createKnowledgeMonitoringHandoff({
       userId: targetUserId,
       actorUserId: actor.id,
+      knowledgeSnapshotId: snapshot?.id ?? snapshotId,
     });
     res.json({ kind: "knowledge", snapshot });
   } catch (error) {
@@ -7507,6 +7508,7 @@ router.put(
         await createKnowledgeMonitoringHandoff({
           userId: targetUserId,
           actorUserId: actor.id,
+          knowledgeSnapshotId: snapshot?.id ?? snapshotId,
         });
         await writeWorkspaceAuditEvent({
           actor,

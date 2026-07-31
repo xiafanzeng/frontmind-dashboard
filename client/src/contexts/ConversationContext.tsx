@@ -19,10 +19,10 @@ import {
   type OutputMessage,
 } from "@/lib/frontmind-api";
 import {
-  KNOWLEDGE_COLLECTION_STATUS_COPY,
-  LEGACY_KNOWLEDGE_COLLECTION_STATUS_COPY,
+  normalizeKnowledgeCollectionCopy,
 } from "@shared/knowledge-base-copy";
 import { stripKnowledgeBaseReferenceAppendix } from "@shared/knowledge-base-output";
+import { uniquifyOrderedIds } from "@shared/ordered-id";
 
 // Types for local conversation management
 export interface Attachment {
@@ -58,6 +58,8 @@ export interface StepGroup {
 
 export interface LocalMessage {
   id: string;
+  /** Stable provider output identity; the local id may be disambiguated per turn. */
+  upstreamOutputId?: string;
   role: "user" | "assistant";
   content: string;
   attachments?: Attachment[];
@@ -113,6 +115,26 @@ export interface Conversation {
    * Format: "sk-a...b1c2" (first 4 + last 4 chars of the key).
    */
   apiKeyFingerprint?: string;
+}
+
+export function repairConversationMessageIds(
+  messages: readonly LocalMessage[],
+): LocalMessage[] {
+  const repairedMessages = uniquifyOrderedIds(messages);
+  const repairedAttachments = uniquifyOrderedIds(
+    repairedMessages.flatMap((message) => message.attachments ?? []),
+  );
+  let attachmentIndex = 0;
+
+  return repairedMessages.map((message) => {
+    if (!message.attachments?.length) return message;
+    const nextAttachments = repairedAttachments.slice(
+      attachmentIndex,
+      attachmentIndex + message.attachments.length,
+    );
+    attachmentIndex += message.attachments.length;
+    return { ...message, attachments: nextAttachments };
+  });
 }
 
 interface ConversationState {
@@ -174,7 +196,10 @@ function conversationReducer(
           c.id === action.payload.conversationId
             ? {
                 ...c,
-                messages: [...c.messages, action.payload.message],
+                messages: repairConversationMessageIds([
+                  ...c.messages,
+                  action.payload.message,
+                ]),
                 updatedAt: Date.now(),
               }
             : c,
@@ -235,27 +260,22 @@ function conversationReducer(
           // Only filter out messages that were manually deleted by the user
           const deletedIds = new Set(c.deletedMessageIds || []);
 
-          // Deduplicate incoming messages against HISTORICAL messages only
-          // (messages from previous turns, i.e. before the last user message).
-          // This prevents old turn messages from re-appearing in multi-turn.
-          // We only check by ID — content dedup is removed because it was too
-          // aggressive and caused legitimate new messages to be silently dropped.
-          const historicalIds = new Set(kept.map((m) => m.id));
-
           const newMessages = action.payload.messages.filter((m) => {
             // Skip messages that were manually deleted
             if (m.id && deletedIds.has(m.id)) return false;
             // Steps placeholders always pass through (they get replaced each poll)
             if (m.isStepsPlaceholder) return true;
-            // Skip if this exact ID already exists in historical messages
-            if (m.id && historicalIds.has(m.id)) return false;
             return true;
           });
 
-          // Replace trailing assistant messages with the new authoritative set
+          // Provider output IDs can be reused across two user turns. Preserve
+          // both turns and deterministically disambiguate the local/database ID.
           return {
             ...c,
-            messages: [...kept, ...newMessages],
+            messages: repairConversationMessageIds([
+              ...kept,
+              ...newMessages,
+            ]),
             updatedAt: Date.now(),
           };
         }),
@@ -340,7 +360,7 @@ export function prepareConversationForCloud(
 
   return {
     ...cloudConversation,
-    messages: conversation.messages.map((message) => ({
+    messages: repairConversationMessageIds(conversation.messages).map((message) => ({
       ...message,
       attachments: message.attachments?.map((attachment) => {
         const {
@@ -1176,6 +1196,51 @@ function normalizeFileUrl(url: string): string {
   return url;
 }
 
+function outputResourceDescriptor(value: Record<string, unknown>) {
+  const fileId = String(value.fileId || value.file_id || "").trim();
+  const rawUrl = String(
+    value.fileUrl ||
+      value.file_url ||
+      value.imageUrl ||
+      value.image_url ||
+      value.url ||
+      "",
+  ).trim();
+  const fileUrl =
+    rawUrl ||
+    (fileId
+      ? `/api/frontmind/v1/files/${encodeURIComponent(fileId)}`
+      : "");
+  const fileName = String(
+    value.fileName ||
+      value.file_name ||
+      value.filename ||
+      value.name ||
+      "file",
+  );
+  const mimeType = String(
+    value.mimeType || value.mime_type || value.content_type || "",
+  );
+  return {
+    fileUrl: fileUrl ? normalizeFileUrl(fileUrl) : "",
+    fileName,
+    mimeType,
+  };
+}
+
+function isImageOutputResource(input: {
+  type: string;
+  fileName: string;
+  mimeType: string;
+}) {
+  return (
+    input.type === "output_image" ||
+    input.type === "image" ||
+    input.mimeType.toLowerCase().startsWith("image/") ||
+    /\.(?:avif|gif|jpe?g|png|svg|webp)$/i.test(input.fileName)
+  );
+}
+
 /**
  * Parse FrontMind API output messages into local messages
  * Handles both OpenAI Responses API format and native FrontMind API format.
@@ -1257,11 +1322,7 @@ function isManagedKnowledgeBaseImageSource(src: string): boolean {
 export function sanitizeKnowledgeBaseCustomerMarkdown(text: string): string {
   if (!text) return "";
 
-  return stripKnowledgeBaseReferenceAppendix(text)
-    .replaceAll(
-      LEGACY_KNOWLEDGE_COLLECTION_STATUS_COPY,
-      KNOWLEDGE_COLLECTION_STATUS_COPY,
-    )
+  return normalizeKnowledgeCollectionCopy(stripKnowledgeBaseReferenceAppendix(text))
     .replace(
       /!\[([^\]\n]*)]\(\s*<?(https?:\/\/[^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/gi,
       (_match, alt: string) => (alt.trim() ? `配图：${alt.trim()}` : ""),
@@ -1293,6 +1354,55 @@ function _parseOutputMessagesInner(
 
   for (const msg of output) {
     const msgType = msg.type || "message";
+
+    if (
+      msgType === "output_image" ||
+      msgType === "image" ||
+      msgType === "output_file" ||
+      msgType === "file"
+    ) {
+      const descriptor = outputResourceDescriptor(
+        msg as Record<string, unknown>,
+      );
+      if (descriptor.fileUrl) {
+        const image = isImageOutputResource({
+          type: msgType,
+          fileName: descriptor.fileName,
+          mimeType: descriptor.mimeType,
+        });
+        messages.push({
+          id:
+            msg.id ||
+            `msg-file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          ...(msg.id ? { upstreamOutputId: msg.id } : {}),
+          role: "assistant",
+          content: "",
+          timestamp: Date.now(),
+          ...(image
+            ? {
+                inlineImages: [
+                  {
+                    src: descriptor.fileUrl,
+                    alt: descriptor.fileName || "Generated image",
+                  },
+                ],
+              }
+            : {
+                outputFiles: [
+                  {
+                    fileUrl: descriptor.fileUrl,
+                    fileName: descriptor.fileName,
+                    mimeType:
+                      descriptor.mimeType || "application/octet-stream",
+                  },
+                ],
+              }),
+          responseStartedAt,
+          modelName,
+        });
+      }
+      continue;
+    }
 
     // Check if this is an intermediate step (non-message type)
     if (isIntermediateStepType(msgType)) {
@@ -1356,32 +1466,28 @@ function _parseOutputMessagesInner(
           // Normalize field names: API may return snake_case or camelCase
           const c: any = content;
           const contentType = c.type || "";
-          const fileId = c.fileId || c.file_id || "";
-          const rawFileUrl = c.fileUrl || c.file_url || c.url || "";
-          const fileUrl =
-            rawFileUrl ||
-            (typeof fileId === "string" && fileId.trim()
-              ? `/api/frontmind/v1/files/${encodeURIComponent(fileId.trim())}`
-              : "");
-          const fileName = c.fileName || c.file_name || c.name || "file";
-          const mimeType = c.mimeType || c.mime_type || c.content_type || "";
+          const { fileUrl, fileName, mimeType } =
+            outputResourceDescriptor(c);
           const textValue = c.text ?? c.value ?? null;
 
           if (
             (contentType === "output_file" || contentType === "file") &&
             fileUrl
           ) {
-            // Normalize file URL: route external API URLs through our proxy for auth
-            const normalizedFileUrl = normalizeFileUrl(fileUrl);
-            // Check if it's an image file
-            if (mimeType.startsWith("image/")) {
+            if (
+              isImageOutputResource({
+                type: contentType,
+                fileName,
+                mimeType,
+              })
+            ) {
               inlineImages.push({
-                src: normalizedFileUrl,
+                src: fileUrl,
                 alt: fileName || "Generated image",
               });
             } else {
               files.push({
-                fileUrl: normalizedFileUrl,
+                fileUrl,
                 fileName,
                 mimeType: mimeType || "application/octet-stream",
               });
@@ -1390,9 +1496,8 @@ function _parseOutputMessagesInner(
             (contentType === "output_image" || contentType === "image") &&
             fileUrl
           ) {
-            const normalizedFileUrl = normalizeFileUrl(fileUrl);
             inlineImages.push({
-              src: normalizedFileUrl,
+              src: fileUrl,
               alt: fileName || "Generated image",
             });
           } else if (
@@ -1442,6 +1547,7 @@ function _parseOutputMessagesInner(
           id:
             msg.id ||
             `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          ...(msg.id ? { upstreamOutputId: msg.id } : {}),
           role: "assistant",
           content:
             textParts.length > 0

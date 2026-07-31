@@ -12,6 +12,7 @@ import {
 import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
+import DeliveryWorkflowGuide from "@/components/DeliveryWorkflowGuide";
 import PortalShell from "@/components/PortalShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -61,6 +62,8 @@ type ProjectTeamEngineer = {
   isActive: boolean;
   engineerRoleType: DeliveryRoleType | null;
   apiKeyConfigured: boolean;
+  apiKeyManageable?: boolean;
+  apiKeyManageReason?: string | null;
 };
 
 type ProjectTicket = {
@@ -279,7 +282,7 @@ export default function AdminDeliveryRoles() {
       toast.success(
         input.engineerUserId == null
           ? "项目岗位已解除分配"
-          : "项目工程师已更新，未结束任务已同步转交",
+          : "项目工程师已更新，未结束工单已按岗位同步转交",
       );
     } catch (error) {
       await refresh();
@@ -586,6 +589,34 @@ function ProjectDetails({
   );
   const missing = getMissingProjectRoleTypes(project, assignments);
   const managerMissing = project.managerId == null;
+  const roleStates = Object.fromEntries(
+    ROLE_TYPES.map((roleType) => {
+      const assignment = projectAssignments.find(
+        (row) => row.roleType === roleType,
+      );
+      const currentEngineer = engineers.find(
+        (engineer) => engineer.id === assignment?.engineerUserId,
+      );
+      return [
+        roleType,
+        {
+          enabled: project.requiredRoleTypes.includes(roleType),
+          ownerLabel: assignment?.engineerUserId
+            ? currentEngineer
+              ? engineerName(currentEngineer)
+              : assignment.engineerDisplayName ||
+                assignment.engineerUsername ||
+                `工程师 #${assignment.engineerUserId}`
+            : null,
+          openTicketCount: tickets.filter(
+            (ticket) =>
+              ticket.userId === project.id &&
+              ticket.workflowDomain === roleType,
+          ).length,
+        },
+      ];
+    }),
+  );
 
   return (
     <div className="space-y-5">
@@ -628,10 +659,16 @@ function ProjectDetails({
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           {project.managerId
-            ? `账号：${project.managerUsername || `#${project.managerId}`}`
+            ? `账号：${project.managerUsername || `#${project.managerId}`}。工程师加入后由该管理员负责项目协调；只有跨多个交付管理员共享的工程师 Key 才由系统管理员维护。`
             : "请在客户交付工作台设置该项目的交付管理员。"}
         </p>
       </div>
+
+      <DeliveryWorkflowGuide
+        audience="admin"
+        activeRole={highlightedRole}
+        roleStates={roleStates}
+      />
 
       <div className="grid gap-3">
         {ROLE_TYPES.map((roleType) => {
@@ -688,7 +725,8 @@ function ProjectRoleCard({
 }) {
   const enabled = project.requiredRoleTypes.includes(roleType);
   const matchingEngineers = engineers.filter(
-    (engineer) => engineer.isActive && engineer.engineerRoleType === roleType,
+    (engineer) =>
+      engineer.isActive && engineer.engineerRoleType === roleType,
   );
   const currentEngineer = engineers.find(
     (engineer) => engineer.id === assignment?.engineerUserId,
@@ -780,7 +818,9 @@ function ProjectRoleCard({
                   : `当前负责人：${currentEngineerLabel}。该岗位已随套餐停用，可以解除遗留负责人。`
                 : activeTicketCount
                   ? `${activeTicketCount} 个未结束工单将随负责人同步转交`
-                  : "当前没有未结束工单"}
+                  : assigned
+                    ? `由${project.managerDisplayName || project.managerUsername || "项目交付管理员"}统一管理`
+                    : "当前没有未结束工单"}
             </p>
           )}
         </div>
@@ -828,7 +868,11 @@ function ProjectRoleCard({
             matchingEngineers.map((engineer) => (
               <option key={engineer.id} value={engineer.id}>
                 {engineerName(engineer)}
-                {engineer.apiKeyConfigured ? "" : "（Key 未配置）"}
+                {!engineer.apiKeyConfigured
+                  ? "（Key 未配置）"
+                  : engineer.apiKeyManageable === false
+                    ? "（Key 由系统管理员维护）"
+                    : ""}
               </option>
             ))}
         </select>

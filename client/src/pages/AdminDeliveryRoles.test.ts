@@ -209,4 +209,18 @@ describe("customer project team helpers", () => {
     }
     expect(source).toContain('title="客户项目团队"');
   });
+
+  it("separates project coordination from shared-engineer key ownership", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminDeliveryRoles.tsx"),
+      "utf8",
+    );
+
+    expect(source).toContain("未结束工单已按岗位同步转交");
+    expect(source).toContain(
+      "工程师加入后由该管理员负责项目协调；只有跨多个交付管理员共享的工程师 Key 才由系统管理员维护",
+    );
+    expect(source).not.toContain("engineer.apiKeyManageable !== false");
+    expect(source).toContain("Key 由系统管理员维护");
+  });
 });

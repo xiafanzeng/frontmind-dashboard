@@ -789,7 +789,7 @@ function deriveNextAction(input: {
     if (input.currentPeriodPendingApprovalCount > 0) {
       return {
         kind: "await_question_confirmation",
-        label: "等待管理员确认启动问题",
+        label: "等待监控工程师确认启动问题",
         href: "/brand-question-portfolio",
       };
     }
@@ -3213,7 +3213,7 @@ export async function approveWorkspaceQuestionSelection(input: {
     if (candidate.selectionApprovalStatus !== "pending") {
       throw new ServiceEntitlementError(
         "QUESTION_SELECTION_CONFIRMATION_REQUIRED",
-        "该问题尚未由用户提交管理员确认。",
+        "该问题尚未由用户提交专业审核。",
         409,
       );
     }
@@ -3263,7 +3263,7 @@ export async function approveWorkspaceQuestionSelection(input: {
     if (question.selectionApprovalStatus !== "pending") {
       throw new ServiceEntitlementError(
         "QUESTION_SELECTION_CONFIRMATION_REQUIRED",
-        "该问题尚未由用户提交管理员确认。",
+        "该问题尚未由用户提交专业审核。",
         409,
       );
     }

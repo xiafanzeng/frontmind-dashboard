@@ -293,8 +293,12 @@ describe("UserBrandDashboard service experience", () => {
     expect(
       screen.getAllByText("阿里云域名注册与 ICP 备案").length,
     ).toBeGreaterThan(0);
+    expect(screen.queryByText("购买域名并提交 AI 运维工单")).toBeNull();
+    expect(screen.queryByText("领取服务码并完成 ICP 备案")).toBeNull();
     expect(screen.queryByText("ICP 备案与主体材料")).not.toBeInTheDocument();
-    expect(screen.getAllByText("官网内容运营").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("AI专用官网构建与内容运营").length,
+    ).toBeGreaterThan(0);
     expect(
       screen.getByRole("heading", { name: "提交官网内容运营工单" }),
     ).toBeInTheDocument();
@@ -427,9 +431,9 @@ describe("UserBrandDashboard service experience", () => {
     expect(screen.getByText("已从品牌全域词库带入")).toBeInTheDocument();
 
     expect(
-      screen.getByRole("button", { name: "提醒管理员确认" }),
+      screen.getByRole("button", { name: "提交专业审核" }),
     ).toBeInTheDocument();
-    expect(screen.queryByText("待管理员确认")).not.toBeInTheDocument();
+    expect(screen.queryByText("待监控工程师确认")).not.toBeInTheDocument();
   });
 
   it("uses compact single-line intake controls and links back to the brand question library", () => {

@@ -151,6 +151,56 @@ describe("ConversationProvider cloud hydration", () => {
 });
 
 describe("prepareConversationForCloud", () => {
+  it("self-heals reused assistant and attachment IDs before cloud sync", () => {
+    const clean = prepareConversationForCloud({
+      ...conversation("duplicate-output"),
+      messages: [
+        {
+          id: "confirm-1",
+          role: "user",
+          content: "确认",
+          timestamp: 1,
+        },
+        {
+          id: "provider-output",
+          upstreamOutputId: "provider-output",
+          role: "assistant",
+          content: "节点 2.3",
+          timestamp: 2,
+          attachments: [
+            { id: "asset", type: "image", name: "one.webp", fileId: "one" },
+          ],
+        },
+        {
+          id: "confirm-2",
+          role: "user",
+          content: "确认",
+          timestamp: 3,
+        },
+        {
+          id: "provider-output",
+          upstreamOutputId: "provider-output",
+          role: "assistant",
+          content: "节点 2.4",
+          timestamp: 4,
+          attachments: [
+            { id: "asset", type: "image", name: "two.webp", fileId: "two" },
+          ],
+        },
+      ],
+    });
+
+    expect(clean.messages.map((item) => item.id)).toEqual([
+      "confirm-1",
+      "provider-output",
+      "confirm-2",
+      "provider-output~2",
+    ]);
+    expect(
+      clean.messages.flatMap((item) => item.attachments ?? []).map((item) => item.id),
+    ).toEqual(["asset", "asset~2"]);
+  });
+
   it("removes browser-only payloads and keeps file metadata", () => {
     const clean = prepareConversationForCloud({
       ...conversation("one"),
@@ -233,6 +283,49 @@ describe("parseOutputMessages file IDs", () => {
         alt: "chart.png",
       },
     ]);
+  });
+
+  it("renders image_url content and top-level output images without MIME metadata", () => {
+    const messages = parseOutputMessages([
+      {
+        id: "assistant-image-url",
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_image",
+            image_url: "https://files.example.test/leaf-hero.webp",
+            filename: "leaf-hero.webp",
+          },
+        ],
+      },
+      {
+        id: "standalone-image",
+        type: "output_image",
+        imageUrl: "/v1/files/asset%202",
+        name: "asset-2.png",
+      },
+    ]);
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatchObject({
+      upstreamOutputId: "assistant-image-url",
+      inlineImages: [
+        {
+          src: expect.stringContaining("/api/frontmind/proxy-download?url="),
+          alt: "leaf-hero.webp",
+        },
+      ],
+    });
+    expect(messages[1]).toMatchObject({
+      upstreamOutputId: "standalone-image",
+      inlineImages: [
+        {
+          src: "/api/frontmind/v1/files/asset%202",
+          alt: "asset-2.png",
+        },
+      ],
+    });
   });
 });
 

@@ -129,6 +129,9 @@ export default function AdminUsers() {
           adminAccessLevel: null,
           engineerRoleType: engineer.engineerRoleType,
           engineerApiKeyConfigured: engineer.apiKeyConfigured,
+          engineerApiKeyVersion: engineer.apiKeyVersion,
+          engineerApiKeyManageable: engineer.apiKeyManageable,
+          engineerApiKeyManageReason: engineer.apiKeyManageReason,
           marketEdition: "domestic",
           isActive: engineer.isActive,
         }),
@@ -244,8 +247,7 @@ export default function AdminUsers() {
                 <div>
                   <h2 className="font-semibold">工程师账号与 Key</h2>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    工程师岗位固定；创建时可选配置
-                    Key，创建后的验证、替换与撤销仅由系统管理员管理。
+                    工程师岗位固定；你可以维护自己客户项目中的工程师，以及自己创建且尚未分配的工程师 Key。
                   </p>
                 </div>
                 <Button
@@ -318,7 +320,25 @@ export default function AdminUsers() {
                             ? "Key 已配置"
                             : "Key 未配置"}
                         </Badge>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={engineer.engineerApiKeyManageable === false}
+                          title={
+                            engineer.engineerApiKeyManageReason || undefined
+                          }
+                          onClick={() => setEngineerApiKeyUser(engineer)}
+                        >
+                          <KeyRound className="h-4 w-4" />
+                          管理 Key
+                        </Button>
                       </div>
+                      {engineer.engineerApiKeyManageable === false &&
+                        engineer.engineerApiKeyManageReason && (
+                          <p className="text-xs text-muted-foreground sm:basis-full sm:text-right">
+                            {engineer.engineerApiKeyManageReason}
+                          </p>
+                        )}
                     </div>
                   ))
                 ) : (
@@ -346,6 +366,10 @@ export default function AdminUsers() {
               setLocation(`/admin/customers/${userId}/service`);
             }
           }}
+        />
+        <EngineerApiKeyDialog
+          user={engineerApiKeyUser}
+          onOpenChange={(open) => !open && setEngineerApiKeyUser(null)}
         />
       </PortalShell>
     );
@@ -1256,7 +1280,7 @@ export function CreateUserDialog({
                     placeholder={
                       role === "user"
                         ? "创建前会验证 Key，可与其他客户使用相同原始 Key"
-                        : "可留空；创建后仅系统管理员可验证并配置"
+                        : "可留空；创建后由有权限的交付管理员或系统管理员配置"
                     }
                     disabled={createMutation.isPending}
                   />
@@ -1268,7 +1292,7 @@ export function CreateUserDialog({
                   ) : (
                     <p className="text-xs leading-5 text-muted-foreground">
                       未填写也可以创建账号，列表和客户项目团队会提示“Key
-                      未配置”；后续验证、替换与撤销仅由系统管理员处理。
+                      未配置”。未分配工程师由创建者管理；只服务单一交付管理员客户时由该管理员管理；跨管理员共享时由系统管理员管理。
                     </p>
                   )}
                 </div>
@@ -1372,6 +1396,7 @@ export function EngineerApiKeyDialog({
       await setApiKeyMutation.mutateAsync({
         engineerUserId: user.id,
         apiKey: apiKey.trim(),
+        expectedVersion: user.engineerApiKeyVersion ?? 0,
       });
       await utils.admin.users.list.invalidate();
       await utils.delivery.management.overview.invalidate();
@@ -1392,7 +1417,10 @@ export function EngineerApiKeyDialog({
   const handleRevokeApiKey = async () => {
     if (!user) return;
     try {
-      await revokeApiKeyMutation.mutateAsync({ engineerUserId: user.id });
+      await revokeApiKeyMutation.mutateAsync({
+        engineerUserId: user.id,
+        expectedVersion: user.engineerApiKeyVersion ?? 0,
+      });
       await utils.admin.users.list.invalidate();
       await utils.delivery.management.overview.invalidate();
       toast.success("工程师 API Key 已撤销", {

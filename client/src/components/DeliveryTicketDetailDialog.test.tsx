@@ -136,7 +136,7 @@ describe("DeliveryTicketDetailDialog", () => {
     );
 
     expect(screen.getByText("请补充客户书面授权。")).toBeInTheDocument();
-    expect(screen.getByText("待受理")).toBeInTheDocument();
+    expect(screen.getByText("已提交")).toBeInTheDocument();
     expect(screen.queryByText("已提交 → 待补充资料")).not.toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /客户授权书.pdf/ }),
@@ -277,7 +277,7 @@ describe("DeliveryTicketDetailDialog", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows only the public summary for a completed website ticket", () => {
+  it("shows the public timeline and attachments for a completed website ticket", () => {
     render(
       <DeliveryTicketDetailDialog
         open
@@ -290,6 +290,8 @@ describe("DeliveryTicketDetailDialog", () => {
             publicStatus: "completed",
             publicSummary: "已完成企业新闻页面内容更新。",
             targetPage: "https://example.com/news",
+            canReply: false,
+            canAttach: true,
           },
           events: detail.events,
           attachments: detail.attachments,
@@ -301,14 +303,15 @@ describe("DeliveryTicketDetailDialog", () => {
     expect(
       screen.getByText("已完成企业新闻页面内容更新。"),
     ).toBeInTheDocument();
-    expect(screen.queryByText("处理时间线")).not.toBeInTheDocument();
-    expect(screen.queryByText("附件与交付文件")).not.toBeInTheDocument();
+    expect(screen.getByText("处理时间线")).toBeInTheDocument();
+    expect(screen.getByText("附件与交付文件")).toBeInTheDocument();
+    expect(screen.getByText("请补充客户书面授权。")).toBeInTheDocument();
     expect(
       screen.queryByRole("link", { name: /目标页面/ }),
     ).not.toBeInTheDocument();
   });
 
-  it("keeps a pending website ticket summary-only without reply or cancellation controls", () => {
+  it("lets the customer answer a website supplement request without sensitive attachments", () => {
     render(
       <DeliveryTicketDetailDialog
         open
@@ -317,10 +320,15 @@ describe("DeliveryTicketDetailDialog", () => {
           ticket: {
             ...detail.ticket,
             type: "website_operation",
-            status: "submitted",
+            category: "icp_filing",
+            status: "needs_information",
             publicStatus: "pending",
-            publicSummary: null,
+            publicStage: "action_required",
+            publicStageLabel: "待您补充",
+            publicSummary: "请补充 ICP 主体备案号的文字说明。",
             targetPage: "https://example.com/news",
+            canReply: true,
+            canAttach: false,
           },
           events: detail.events,
           attachments: detail.attachments,
@@ -331,17 +339,14 @@ describe("DeliveryTicketDetailDialog", () => {
     );
 
     expect(
-      screen.getByText(
-        "该需求正在等待管理员受理，完成后将在这里显示内容总结。",
-      ),
+      screen.getByText("请补充 ICP 主体备案号的文字说明。"),
     ).toBeInTheDocument();
-    expect(screen.queryByText("处理时间线")).not.toBeInTheDocument();
+    expect(screen.getByText("处理时间线")).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "提交补充资料" }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "取消工单" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "提交补充资料" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("上传补充资料")).not.toBeInTheDocument();
+    expect(screen.getByText(/此工单只接收文字补充/)).toBeInTheDocument();
   });
 });
 

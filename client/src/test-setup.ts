@@ -1,5 +1,7 @@
 import "@testing-library/jest-dom";
 
+vi.stubGlobal("__FRONTMIND_BUILD_VERSION__", "test");
+
 // Mock window.matchMedia
 Object.defineProperty(window, "matchMedia", {
   writable: true,

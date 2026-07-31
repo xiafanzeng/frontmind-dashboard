@@ -3,6 +3,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { defineConfig, type Plugin, type ViteDevServer } from "vite";
 
 // =============================================================================
@@ -149,14 +150,23 @@ function vitePluginFrontMindDebugCollector(): Plugin {
   };
 }
 
-function vitePluginFrontMindBuildVersion(buildVersion: string): Plugin {
+function vitePluginFrontMindBuildVersion(
+  buildVersion: string,
+  gitSha: string,
+  builtAt: string,
+): Plugin {
   return {
     name: "frontmind-build-version",
     generateBundle() {
       this.emitFile({
         type: "asset",
         fileName: "__frontmind__/version.json",
-        source: `${JSON.stringify({ version: buildVersion })}\n`,
+        source: `${JSON.stringify({
+          version: buildVersion,
+          gitSha,
+          builtAt,
+          copyRevision: "knowledge-collection-copy-v2",
+        })}\n`,
       });
     },
   };
@@ -184,6 +194,25 @@ function vitePluginProductionPublicAssets(): Plugin {
       source: "assets/cuhksz-emblem.png",
       output: "assets/cuhksz-emblem.png",
     },
+    ...[
+      "01-domain-search.webp",
+      "02-filing-entry.webp",
+      "03-enterprise-sponsor.webp",
+      "04-owner-contact-empty.webp",
+      "05-owner-contact-filled.webp",
+      "06-mobile-enterprise-main.webp",
+      "07-mobile-owner-upload.webp",
+      "08-sms-review-stage.webp",
+      "09-sms-message.webp",
+      "10-sms-verification.webp",
+      "11-sms-resend.webp",
+      "12-icp-filing-process.webp",
+      "13-existing-sponsor-prefilled.webp",
+      "14-existing-sponsor-mobile.webp",
+    ].map((filename) => ({
+      source: `assets/aliyun-icp-guide/${filename}`,
+      output: `assets/aliyun-icp-guide/${filename}`,
+    })),
   ];
   const publicDirectory = path.resolve(import.meta.dirname, "client/public");
   return {
@@ -208,12 +237,31 @@ function vitePluginProductionPublicAssets(): Plugin {
 
 export default defineConfig(({ mode }) => {
   const isProduction = mode === "production";
+  const repositorySha = (() => {
+    try {
+      return execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: PROJECT_ROOT,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      return "";
+    }
+  })();
+  const gitSha =
+    process.env.FRONTMIND_BUILD_SHA?.trim() ||
+    process.env.COMMIT_SHA?.trim() ||
+    process.env.RENDER_GIT_COMMIT?.trim() ||
+    repositorySha ||
+    "local";
+  const builtAt = new Date().toISOString();
   const buildVersion =
-    process.env.FRONTMIND_BUILD_VERSION?.trim() || `${Date.now()}`;
+    process.env.FRONTMIND_BUILD_VERSION?.trim() ||
+    (gitSha !== "local" ? gitSha : `${Date.now()}`);
   const plugins = [
     react(),
     tailwindcss(),
-    vitePluginFrontMindBuildVersion(buildVersion),
+    vitePluginFrontMindBuildVersion(buildVersion, gitSha, builtAt),
     isProduction && vitePluginProductionPublicAssets(),
     !isProduction && jsxLocPlugin(),
     !isProduction && vitePluginFrontMindDebugCollector(),

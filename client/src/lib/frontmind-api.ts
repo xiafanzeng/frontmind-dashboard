@@ -247,12 +247,17 @@ export interface OutputSummary {
 export interface OutputContent {
   type?: string;
   text?: string | null;
+  url?: string;
   fileUrl?: string;
   file_url?: string;
+  imageUrl?: string;
+  image_url?: string;
   fileId?: string;
   file_id?: string;
   fileName?: string;
   file_name?: string;
+  filename?: string;
+  name?: string;
   mimeType?: string;
   mime_type?: string;
   annotations?: unknown;
@@ -563,7 +568,12 @@ export async function createResponseLogicTask(
  */
 export async function createKnowledgeBaseTurnTask(
   input: Message[],
-  context: { conversationId: string; taskId: string },
+  context: {
+    conversationId: string;
+    taskId: string;
+    expectedRevision?: number;
+    expectedLeafId?: string;
+  },
 ): Promise<TaskResponse> {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(

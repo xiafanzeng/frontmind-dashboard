@@ -89,6 +89,7 @@ describe("service portal migration chain", () => {
       "0041_lovely_harry_osborn",
       "0042_heavy_xorn",
       "0043_clumsy_lilandra",
+      "0044_delivery_history_credentials_and_website_style",
     ]);
   });
 
@@ -729,6 +730,27 @@ describe("service portal migration chain", () => {
     );
     expect(orders).toContain(
       "CONSTRAINT `website_project_orders_fulfilled_time_ck`",
+    );
+  });
+
+  it("adds delivery history, engineer origins and the website-style workflow incrementally", async () => {
+    const delivery = await migration(
+      "0044_delivery_history_credentials_and_website_style.sql",
+    );
+    expect(delivery).toContain(
+      "delivery_tickets_member_status_resolved_id_idx",
+    );
+    for (const table of [
+      "delivery_member_origins",
+      "website_style_workflows",
+      "website_style_sample_batches",
+      "website_style_samples",
+    ]) {
+      expect(delivery).toContain(`CREATE TABLE \`${table}\``);
+    }
+    expect(delivery).toContain("website_style_samples_attachment_fk");
+    expect(delivery).not.toMatch(
+      /(?:^|\n)\s*(?:DROP|TRUNCATE|DELETE)\s/mi,
     );
   });
 });

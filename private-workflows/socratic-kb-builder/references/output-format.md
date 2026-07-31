@@ -205,6 +205,20 @@ documents. `customerVisible` is true only for polished overviews and leaves.
 Document and asset IDs are stable and unique. Every `assetIds` and
 `documentIds` relationship must resolve in both directions.
 
+## Conversational presentation assets
+
+The final archive relationship is not enough for an interactive confirmation
+turn. Whenever a leaf is presented, return up to three eligible assets from
+that leaf's `assetIds` as actual response image/file attachments using the
+validated local bytes. Do not return source hotlinks or only write a relative
+Markdown path. The Dashboard must be able to render the attachment before the
+user is allowed to confirm that leaf. When no eligible asset is related to the
+leaf, return no attachment and keep the asset gap in the internal reports.
+The `FRONTMIND_KB_PRESENTATION` envelope must report the same delivery with
+`imageState`, `assetIds` and `imageCount`. Use `attached` for 1–3 real
+attachments, `no_eligible_asset` for a presented leaf with none, and
+`not_applicable` only when `leafId` is null after completion.
+
 For schema version 2, compute `requiredFormalCharacters` exactly:
 
 - Overview with evidence: `max(120, min(target, floor(evidence * 0.25)))`,

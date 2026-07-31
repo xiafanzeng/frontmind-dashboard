@@ -22,6 +22,10 @@ import {
   DELIVERY_ROLE_LABELS,
   type DeliveryRoleType,
 } from "@shared/delivery-roles";
+import {
+  DELIVERY_TICKET_STATUS_LABELS,
+  type DeliveryTicketStatus,
+} from "@shared/delivery-ticket";
 
 type DispatchPriority = "low" | "normal" | "high" | "urgent";
 
@@ -31,7 +35,7 @@ type DispatchTicket = {
   title?: string | null;
   operation?: string | null;
   category?: string | null;
-  status: string;
+  status: DeliveryTicketStatus;
   workflowDomain: DeliveryRoleType | null;
   assignedProjectAssignmentId?: string | null;
   assignedMemberId: number | null;
@@ -113,6 +117,10 @@ export default function AdminDeliveryDispatch() {
       }
     >
       <div className="mx-auto w-full max-w-6xl">
+        <div className="mb-4 rounded-xl border border-primary/20 bg-primary/[0.035] px-4 py-3 text-sm leading-6 text-muted-foreground">
+          <strong className="text-foreground">调度规则：</strong>
+          先在客户项目中配齐固定岗位，再设置优先级和催办。更换岗位负责人会自动转交该岗位全部未结束工单；管理员不在调度页代替工程师执行或完成工单。
+        </div>
         <Card>
           <CardHeader>
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -259,7 +267,9 @@ function DispatchRow({
                 ticket.category ||
                 "交付工单"}
             </p>
-            <Badge variant="outline">{ticket.status}</Badge>
+            <Badge variant="outline">
+              {DELIVERY_TICKET_STATUS_LABELS[ticket.status]}
+            </Badge>
             {needsEngineer && (
               <Badge
                 variant="outline"

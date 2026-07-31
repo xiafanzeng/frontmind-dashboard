@@ -6,6 +6,20 @@ import ChatInput from "./ChatInput";
 
 const mocks = vi.hoisted(() => ({
   sendMessage: vi.fn(async () => true),
+  activeConversation: {
+    id: "kb-conversation",
+    taskId: "kb-task",
+    status: "awaiting_input",
+    messages: [
+      { id: "user", role: "user", content: "确认", timestamp: 1 },
+      {
+        id: "assistant",
+        role: "assistant",
+        content: "## 法定主体与成立时间\n正文",
+        timestamp: 2,
+      },
+    ],
+  },
 }));
 
 vi.mock("@/hooks/useSendMessage", () => ({
@@ -17,11 +31,7 @@ vi.mock("@/hooks/useSendMessage", () => ({
 
 vi.mock("@/contexts/ConversationContext", () => ({
   useConversation: () => ({
-    activeConversation: {
-      id: "kb-conversation",
-      taskId: "kb-task",
-      status: "awaiting_input",
-    },
+    activeConversation: mocks.activeConversation,
   }),
 }));
 
@@ -97,6 +107,36 @@ describe("knowledge-base ChatInput actions", () => {
   beforeEach(() => {
     mocks.sendMessage.mockClear();
     mocks.sendMessage.mockResolvedValue(true);
+    mocks.activeConversation.messages = [
+      { id: "user", role: "user", content: "确认", timestamp: 1 },
+      {
+        id: "assistant",
+        role: "assistant",
+        content: "## 法定主体与成立时间\n正文",
+        timestamp: 2,
+      },
+    ];
+  });
+
+  it("does not allow another confirmation until the current presentation renders", () => {
+    mocks.activeConversation.messages = [
+      { id: "user", role: "user", content: "确认", timestamp: 1 },
+    ];
+
+    render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={progress}
+      />,
+    );
+
+    expect(
+      screen.getByText("正在恢复当前节点正文与图片，内容显示完整后才可确认。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "确认当前内容" }),
+    ).toBeDisabled();
   });
 
   it("shows the authoritative current node and sends strict quick actions", async () => {
@@ -119,9 +159,39 @@ describe("knowledge-base ChatInput actions", () => {
       expect(mocks.sendMessage).toHaveBeenCalledWith(
         "确认",
         [],
-        expect.objectContaining({ syncKnowledgeBaseSnapshot: true }),
+        expect.objectContaining({
+          syncKnowledgeBaseSnapshot: true,
+          knowledgeBaseExpectedRevision: 2,
+          knowledgeBaseExpectedLeafId: "identity.legal",
+        }),
       ),
     );
+  });
+
+  it("locks the confirmation synchronously until the request settles", async () => {
+    let finishSend!: (sent: boolean) => void;
+    mocks.sendMessage.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        finishSend = resolve;
+      }),
+    );
+    render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={progress}
+      />,
+    );
+
+    const confirm = screen.getByRole("button", { name: "确认当前内容" });
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(confirm).toBeDisabled();
+
+    finishSend(true);
+    await waitFor(() => expect(confirm).not.toBeDisabled());
   });
 
   it("disables quick actions when revision text or files are present", () => {

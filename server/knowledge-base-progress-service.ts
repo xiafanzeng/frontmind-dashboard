@@ -33,8 +33,12 @@ import {
   parseKnowledgeBaseProgressEnvelope,
   parseKnowledgeBaseReopenEnvelope,
   type KnowledgeBaseLeafStatus,
+  type KnowledgeBasePresentationEnvelope,
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
+
+export const KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH =
+  "e84d5200b4bffa2ac6ff95f6a74d3d9a2875fa7b04f766e5df407ae5b833bdf6";
 
 export type KnowledgeBaseUserAction =
   | "initial"
@@ -76,6 +80,136 @@ function normalizeConversationId(value: string) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function collectKnowledgeBaseOutputImageKeys(
+  value: unknown,
+  result = new Set<string>(),
+  depth = 0,
+) {
+  if (value === null || value === undefined || depth > 50) return result;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectKnowledgeBaseOutputImageKeys(item, result, depth + 1);
+    }
+    return result;
+  }
+  if (!isRecord(value)) return result;
+
+  const type = stringValue(value.type).toLowerCase();
+  const mimeType = stringValue(
+    value.mimeType || value.mime_type || value.content_type,
+  ).toLowerCase();
+  const fileName = stringValue(
+    value.fileName || value.file_name || value.filename || value.name,
+  );
+  const resourceId = stringValue(value.fileId || value.file_id);
+  const resourceUrl = stringValue(
+    value.fileUrl ||
+      value.file_url ||
+      value.imageUrl ||
+      value.image_url ||
+      value.url,
+  );
+  const isImage =
+    type === "output_image" ||
+    type === "image" ||
+    mimeType.startsWith("image/") ||
+    /\.(?:avif|gif|jpe?g|png|svg|webp)$/i.test(fileName);
+  if (isImage && (resourceId || resourceUrl)) {
+    result.add(resourceId || resourceUrl);
+  }
+
+  for (const item of Object.values(value)) {
+    if (item && typeof item === "object") {
+      collectKnowledgeBaseOutputImageKeys(item, result, depth + 1);
+    }
+  }
+  return result;
+}
+
+function latestKnowledgeBasePresentationOutput(output: unknown) {
+  if (!Array.isArray(output)) return output;
+  const assistantIndexes = output.flatMap((item, index) =>
+    extractFinalKnowledgeBaseAssistantText([item]) ? [index] : [],
+  );
+  if (assistantIndexes.length === 0) return output;
+  const presentationIndex =
+    [...assistantIndexes]
+      .reverse()
+      .find((index) =>
+        extractFinalKnowledgeBaseAssistantText([output[index]]).includes(
+          "FRONTMIND_KB_PRESENTATION",
+        ),
+      ) ?? assistantIndexes[assistantIndexes.length - 1]!;
+  return output.slice(presentationIndex);
+}
+
+export function assertKnowledgeBaseNodeImageDelivery(input: {
+  skillContentHash: string | null;
+  presentation: KnowledgeBasePresentationEnvelope;
+  output: unknown;
+}) {
+  if (
+    input.skillContentHash !==
+    KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH
+  ) {
+    return;
+  }
+  const { presentation } = input;
+  if (
+    presentation.imageState === undefined ||
+    presentation.assetIds === undefined ||
+    presentation.imageCount === undefined
+  ) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "当前节点缺少图片交付声明，本轮未推进",
+    );
+  }
+
+  const actualImageCount = collectKnowledgeBaseOutputImageKeys(
+    latestKnowledgeBasePresentationOutput(input.output),
+  ).size;
+  if (presentation.leafId === null) {
+    if (
+      presentation.imageState !== "not_applicable" ||
+      presentation.assetIds.length !== 0 ||
+      presentation.imageCount !== 0 ||
+      actualImageCount !== 0
+    ) {
+      throw new KnowledgeBaseBuildError(
+        "PROGRESS_PROTOCOL_INVALID",
+        "知识库已完成，本轮图片交付声明必须为 not_applicable",
+      );
+    }
+    return;
+  }
+
+  if (presentation.imageState === "attached") {
+    if (
+      presentation.assetIds.length === 0 ||
+      presentation.assetIds.length !== presentation.imageCount ||
+      presentation.imageCount !== actualImageCount
+    ) {
+      throw new KnowledgeBaseBuildError(
+        "PROGRESS_PROTOCOL_INVALID",
+        "当前节点图片附件与资产声明不一致，本轮未推进",
+      );
+    }
+    return;
+  }
+  if (
+    presentation.imageState !== "no_eligible_asset" ||
+    presentation.assetIds.length !== 0 ||
+    presentation.imageCount !== 0 ||
+    actualImageCount !== 0
+  ) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "当前节点无可交付图片时必须明确声明 no_eligible_asset",
+    );
+  }
 }
 
 function stringValue(value: unknown) {
@@ -531,6 +665,8 @@ export async function claimKnowledgeBaseTurn(input: {
   taskId: string;
   userText: string;
   attachmentCount: number;
+  expectedRevision?: number;
+  expectedLeafId?: string;
 }) {
   const db = await requireDb();
   const conversationId = normalizeConversationId(input.conversationId);
@@ -552,6 +688,12 @@ export async function claimKnowledgeBaseTurn(input: {
         eq(knowledgeBaseBuilds.status, "confirming"),
         isNotNull(knowledgeBaseBuilds.currentLeafId),
         isNull(knowledgeBaseBuilds.awaitingResponseSince),
+        input.expectedRevision === undefined
+          ? undefined
+          : eq(knowledgeBaseBuilds.revision, input.expectedRevision),
+        input.expectedLeafId
+          ? eq(knowledgeBaseBuilds.currentLeafId, input.expectedLeafId)
+          : undefined,
       ),
     );
   if (!result[0]?.affectedRows) {
@@ -859,10 +1001,15 @@ export async function reconcileKnowledgeBaseProgress(input: {
             },
             reopenedRows,
           );
-          assertKnowledgeBasePresentationMatchesState(
+          const presentation = assertKnowledgeBasePresentationMatchesState(
             expectedReopenedState,
             text,
           );
+          assertKnowledgeBaseNodeImageDelivery({
+            skillContentHash: build.skillContentHash,
+            presentation,
+            output: input.output,
+          });
         }
         await tx
           .update(knowledgeBaseBuildNodes)
@@ -930,7 +1077,15 @@ export async function reconcileKnowledgeBaseProgress(input: {
       assertActionMatchesTransition(action, envelope.transition.to);
       const nextState = applyKnowledgeBaseProgressEnvelope(state, envelope);
       if (build.skillVersion === "3") {
-        assertKnowledgeBasePresentationMatchesState(nextState, text);
+        const presentation = assertKnowledgeBasePresentationMatchesState(
+          nextState,
+          text,
+        );
+        assertKnowledgeBaseNodeImageDelivery({
+          skillContentHash: build.skillContentHash,
+          presentation,
+          output: input.output,
+        });
       }
       const summary = getKnowledgeBaseProgressSummary(nextState);
       const packageAllowed = canPackageKnowledgeBase(nextState);

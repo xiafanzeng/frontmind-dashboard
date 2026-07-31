@@ -299,6 +299,7 @@ describe("website knowledge import v3 manifest binding", () => {
     expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledWith({
       userId: 7,
       actorUserId: 7,
+      knowledgeSnapshotId: "snapshot-new",
     });
   });
 

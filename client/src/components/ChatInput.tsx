@@ -34,6 +34,7 @@ import {
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
+import { consumePendingFrontMindBuildDraft } from "@/lib/build-version";
 
 interface FilePreview {
   file: File;
@@ -62,7 +63,7 @@ export default function ChatInput({
   responseLogicContext?: ResponseLogicTaskContext;
   knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
 }) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => consumePendingFrontMindBuildDraft());
   const [files, setFiles] = useState<FilePreview[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isSending, setIsSending] = useState(false);
@@ -111,6 +112,24 @@ export default function ChatInput({
   const currentKnowledgeLeaf = knowledgeBaseProgress?.branches
     .flatMap((branch) => branch.leaves)
     .find((leaf) => leaf.id === knowledgeBaseProgress.build.currentLeafId);
+  const lastUserMessageIndex = (() => {
+    const messages = activeConversation?.messages ?? [];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === "user") return index;
+    }
+    return -1;
+  })();
+  const currentNodePresentationReady = Boolean(
+    activeConversation?.messages
+      .slice(lastUserMessageIndex + 1)
+      .some(
+        (message) =>
+          message.role === "assistant" &&
+          !message.isStepsPlaceholder &&
+          (Boolean(message.content.trim()) ||
+            Boolean(message.inlineImages?.length)),
+      ),
+  );
   const knowledgeBaseComplete =
     syncKnowledgeBaseSnapshot &&
     Boolean(knowledgeBaseProgress?.packageAllowed) &&
@@ -184,6 +203,14 @@ export default function ChatInput({
           {
             agentProfile: fixedAgentProfile || selectedModel,
             syncKnowledgeBaseSnapshot,
+            knowledgeBaseExpectedRevision:
+              syncKnowledgeBaseSnapshot && knowledgeBaseProgress
+                ? knowledgeBaseProgress.build.revision
+                : undefined,
+            knowledgeBaseExpectedLeafId:
+              syncKnowledgeBaseSnapshot && currentKnowledgeLeaf
+                ? currentKnowledgeLeaf.id
+                : undefined,
             responseLogicContext,
           },
         );
@@ -203,6 +230,8 @@ export default function ChatInput({
       inputLocked,
       isSending,
       knowledgeBaseNotStarted,
+      knowledgeBaseProgress,
+      currentKnowledgeLeaf,
       responseLogicContext,
       selectedModel,
       sendMessage,
@@ -280,7 +309,10 @@ export default function ChatInput({
     isSending ||
     inputLocked ||
     isUploading ||
-    knowledgeBaseNotStarted;
+    knowledgeBaseNotStarted ||
+    (syncKnowledgeBaseSnapshot &&
+      Boolean(currentKnowledgeLeaf) &&
+      !currentNodePresentationReady);
 
   // Get current model display info
   const currentModelInfo =
@@ -345,7 +377,9 @@ export default function ChatInput({
                         {currentKnowledgeLeaf!.title}
                       </p>
                       <p className="mt-1 text-xs leading-5 text-violet-800/80">
-                        可直接确认，也可以输入修改意见或上传资料。
+                        {currentNodePresentationReady
+                          ? "可直接确认，也可以输入修改意见或上传资料。"
+                          : "正在恢复当前节点正文与图片，内容显示完整后才可确认。"}
                       </p>
                     </div>
                     <div className="shrink-0">

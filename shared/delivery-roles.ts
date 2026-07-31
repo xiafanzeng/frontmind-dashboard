@@ -27,6 +27,7 @@ export const deliveryWorkflowOperationSchema = z.enum([
   "channel_distribution",
   "domain_application",
   "icp_filing",
+  "website_style_samples",
   "company_facts",
   "product_case_docs",
   "industry_news",
@@ -48,6 +49,7 @@ const OPERATIONS_BY_ROLE: Record<
     "knowledge_reset",
     "domain_application",
     "icp_filing",
+    "website_style_samples",
     "company_facts",
     "product_case_docs",
     "industry_news",
@@ -74,6 +76,18 @@ export function deliveryRoleOwnsOperation(
   operation: DeliveryWorkflowOperation,
 ) {
   return OPERATIONS_BY_ROLE[roleType].includes(operation);
+}
+
+/**
+ * Monitoring starts only after the public distribution path is actually
+ * ready for observation. Internal asset publication and website page writes
+ * still have downstream distribution/site-check work and must not trigger an
+ * early retest.
+ */
+export function deliveryOperationTriggersMonitoringRetest(
+  operation: DeliveryWorkflowOperation,
+) {
+  return operation === "channel_distribution" || operation === "site_check";
 }
 
 export const knowledgeResetReasonSchema = z.enum([

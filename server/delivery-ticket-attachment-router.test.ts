@@ -161,4 +161,35 @@ describe("delivery ticket attachment authorization", () => {
       dependencies.getCredentialForUpstreamResource,
     ).not.toHaveBeenCalled();
   });
+
+  it("allows the originally assigned engineer to read a terminal task attachment without an active project assignment", async () => {
+    dependencies.getDb.mockResolvedValue(
+      attachmentDatabase({
+        attachment: {
+          id: "attachment-1",
+          ownerUserId: engineer.id,
+          upstreamFileId: "file-1",
+        },
+        ticketUserId: 7,
+        ticketStatus: "completed",
+        assignedProjectAssignmentId: "project-a",
+        assignedMemberId: engineer.id,
+        eventVisibility: "internal",
+      }),
+    );
+
+    await expect(
+      resolveAuthorizedTicketAttachment({
+        actor: engineer,
+        attachmentId: "attachment-1",
+      }),
+    ).resolves.toMatchObject({
+      ticketStatus: "completed",
+      assignedMemberId: engineer.id,
+    });
+    expect(dependencies.assertDeliveryProjectContext).not.toHaveBeenCalled();
+    expect(
+      dependencies.getCredentialForUpstreamResource,
+    ).toHaveBeenCalledWith(engineer.id, "file", "file-1", "project-a");
+  });
 });

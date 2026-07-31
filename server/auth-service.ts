@@ -158,6 +158,7 @@ export type DecryptedCredential = {
 
 export type CredentialStatus = {
   configured: boolean;
+  version: number;
   fingerprint: string | null;
   status: "active" | "retired" | "invalid" | null;
   verifiedAt: number | null;
@@ -512,21 +513,47 @@ export async function changeOwnPassword(
 }
 
 export async function listManagedUsers(): Promise<
-  Array<AuthenticatedUser & { engineerApiKeyConfigured: boolean }>
+  Array<
+    AuthenticatedUser & {
+      engineerApiKeyConfigured: boolean;
+      engineerApiKeyVersion: number;
+    }
+  >
 > {
   const db = await requireDb();
   const [rows, credentialRows] = await Promise.all([
     db.select().from(users).orderBy(desc(users.createdAt)),
     db
-      .select({ userId: apiCredentials.userId })
-      .from(apiCredentials)
-      .where(eq(apiCredentials.status, "active")),
+      .select({
+        userId: apiCredentials.userId,
+        version: apiCredentials.version,
+        status: apiCredentials.status,
+      })
+      .from(apiCredentials),
   ]);
-  const configuredUserIds = new Set(credentialRows.map((row) => row.userId));
+  const configuredUserIds = new Set(
+    credentialRows
+      .filter((row) => row.status === "active")
+      .map((row) => row.userId),
+  );
+  const credentialVersionByUserId = new Map<number, number>();
+  for (const credential of credentialRows) {
+    credentialVersionByUserId.set(
+      credential.userId,
+      Math.max(
+        credential.version,
+        credentialVersionByUserId.get(credential.userId) ?? 0,
+      ),
+    );
+  }
   return rows.map((row) => ({
     ...toAuthenticatedUser(row),
     engineerApiKeyConfigured:
       row.role === "delivery_member" && configuredUserIds.has(row.id),
+    engineerApiKeyVersion:
+      row.role === "delivery_member"
+        ? (credentialVersionByUserId.get(row.id) ?? 0)
+        : 0,
   }));
 }
 
@@ -1425,6 +1452,7 @@ function toCredentialStatus(
         : (credential?.status ?? null);
   return {
     configured: Boolean(credential && credential.status === "active"),
+    version: credential?.version ?? 0,
     fingerprint: credential?.fingerprint ?? null,
     status,
     verifiedAt: credential?.verifiedAt?.getTime() ?? null,
@@ -1436,12 +1464,7 @@ export async function getApiCredentialStatus(userId: number) {
   const rows = await db
     .select()
     .from(apiCredentials)
-    .where(
-      and(
-        eq(apiCredentials.userId, userId),
-        eq(apiCredentials.status, "active"),
-      ),
-    )
+    .where(eq(apiCredentials.userId, userId))
     .orderBy(desc(apiCredentials.version))
     .limit(1);
   return toCredentialStatus(rows[0]);
@@ -1546,24 +1569,66 @@ export async function replaceApiCredential(
 
 export async function deleteActiveApiCredential(userId: number) {
   const db = await requireDb();
-  const now = new Date();
-  await db.transaction(async (tx) => {
-    await tx
-      .update(apiCredentials)
-      .set({
-        status: "deleted",
-        deletedAt: now,
-        encryptedKey: randomBytes(32).toString("base64"),
-        encryptionIv: randomBytes(12).toString("base64"),
-        encryptionAuthTag: randomBytes(16).toString("base64"),
-      })
-      .where(
-        and(
-          eq(apiCredentials.userId, userId),
-          eq(apiCredentials.status, "active"),
-        ),
-      );
+  await db.transaction((tx) =>
+    deleteActiveApiCredentialInTransaction({
+      executor: tx,
+      userId,
+    }),
+  );
+}
+
+export async function deleteActiveApiCredentialInTransaction(input: {
+  executor: any;
+  userId: number;
+  now?: Date;
+}) {
+  const now = input.now ?? new Date();
+  const latestRows = await input.executor
+    .select()
+    .from(apiCredentials)
+    .where(eq(apiCredentials.userId, input.userId))
+    .orderBy(desc(apiCredentials.version))
+    .limit(1)
+    .for("update");
+  const latest = latestRows[0];
+  if (!latest || latest.status !== "active") {
+    return { version: latest?.version ?? 0, deleted: false as const };
+  }
+  await input.executor
+    .update(apiCredentials)
+    .set({
+      status: "deleted",
+      deletedAt: now,
+      encryptedKey: randomBytes(32).toString("base64"),
+      encryptionIv: randomBytes(12).toString("base64"),
+      encryptionAuthTag: randomBytes(16).toString("base64"),
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(apiCredentials.userId, input.userId),
+        eq(apiCredentials.status, "active"),
+      ),
+    );
+  const tombstoneVersion = latest.version + 1;
+  await input.executor.insert(apiCredentials).values({
+    id: randomUUID(),
+    userId: input.userId,
+    version: tombstoneVersion,
+    encryptionVersion: 1,
+    encryptedKey: randomBytes(32).toString("base64"),
+    encryptionIv: randomBytes(12).toString("base64"),
+    encryptionAuthTag: randomBytes(16).toString("base64"),
+    fingerprint: randomBytes(16).toString("hex"),
+    status: "deleted",
+    validationStatus: "unverified",
+    verifiedAt: null,
+    retiredAt: null,
+    deletedAt: now,
+    createdAt: now,
+    updatedAt: now,
   });
+  return { version: tombstoneVersion, deleted: true as const };
 }
 
 export async function getDecryptedCredentialForUser(

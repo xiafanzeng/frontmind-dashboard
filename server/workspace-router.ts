@@ -61,6 +61,8 @@ import {
   getPublicDeliveryTicketDetail,
   getPublicDeliveryTicketWorkspaceMetadata,
   listWorkspaceDeliveryTickets,
+  requestWebsiteStyleRevision,
+  selectWebsiteStyleSample,
   toPublicDeliveryTicketCreationResult,
 } from "./delivery-ticket-service";
 import type { DashboardPayload } from "../shared/dashboard";
@@ -241,6 +243,40 @@ export const workspaceRouter = router({
               value: input,
             }),
           );
+        } catch (error) {
+          toServiceError(error);
+        }
+      }),
+    selectWebsiteStyle: protectedProcedure
+      .input(
+        z.object({
+          sampleId: z.string().uuid(),
+          expectedRevision: z.number().int().positive(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        try {
+          return await selectWebsiteStyleSample({
+            actor: ctx.user,
+            ...input,
+          });
+        } catch (error) {
+          toServiceError(error);
+        }
+      }),
+    requestWebsiteStyleRevision: protectedProcedure
+      .input(
+        z.object({
+          reason: z.string().trim().min(1).max(2_000),
+          expectedRevision: z.number().int().positive(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        try {
+          return await requestWebsiteStyleRevision({
+            actor: ctx.user,
+            ...input,
+          });
         } catch (error) {
           toServiceError(error);
         }

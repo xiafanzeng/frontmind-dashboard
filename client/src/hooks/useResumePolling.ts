@@ -32,6 +32,7 @@ import {
 } from "@/lib/knowledge-progress";
 import {
   collectAssistantOutputIds,
+  outputForKnowledgePresentation,
   sliceNewOutput,
 } from "@/hooks/useSendMessage";
 import { toast } from "sonner";
@@ -69,9 +70,9 @@ async function checkAndUpdateTask(
     }
     const isKnowledgeBaseConversation = Boolean(existingProgress);
 
-    // Parse and update output messages
-    const baselineOutputLength = conv.lastKnownOutputLength || 0;
-    if (taskData.output && taskData.output.length > 0) {
+    const applyRetrievedOutput = (knowledgeBase: boolean) => {
+      if (!taskData.output || taskData.output.length === 0) return;
+      const baselineOutputLength = conv.lastKnownOutputLength || 0;
       const lastUserIndex = conv.messages.reduce(
         (latest, message, index) => (message.role === "user" ? index : latest),
         -1,
@@ -86,15 +87,18 @@ async function checkAndUpdateTask(
         baselineOutputLength,
         historicalOutputIds,
       );
+      const presentationOutput = knowledgeBase
+        ? outputForKnowledgePresentation(taskData.output, newOutput)
+        : newOutput;
 
-      if (newOutput.length > 0) {
+      if (presentationOutput.length > 0) {
         try {
           const parsedMessages = parseOutputMessages(
-            newOutput,
+            presentationOutput,
             conv.startedAt || conv.createdAt,
             conv.messages?.[conv.messages.length - 1]?.modelName,
           );
-          const msgs = isKnowledgeBaseConversation
+          const msgs = knowledgeBase
             ? sanitizeKnowledgeBaseOutputMessages(parsedMessages)
             : parsedMessages;
           if (msgs.length > 0) {
@@ -111,6 +115,13 @@ async function checkAndUpdateTask(
           console.error("[ResumePolling] Error parsing output:", parseErr);
         }
       }
+    };
+
+    // Ordinary conversations can render incremental output immediately.
+    // Knowledge-base output is rendered only after the server accepts its
+    // progress/presentation envelopes below.
+    if (!isKnowledgeBaseConversation) {
+      applyRetrievedOutput(false);
     }
 
     try {
@@ -120,6 +131,7 @@ async function checkAndUpdateTask(
           taskId: taskData.id,
         });
         if (interaction.interactionState === "awaiting_input") {
+          applyRetrievedOutput(true);
           updateStatus(conv.id, "awaiting_input", {
             taskId: taskData.id,
             taskUrl: taskData.metadata?.task_url,
@@ -132,6 +144,7 @@ async function checkAndUpdateTask(
           interaction.interactionState === "ready_to_publish" ||
           interaction.interactionState === "published"
         ) {
+          applyRetrievedOutput(true);
           updateStatus(conv.id, "completed", {
             taskId: taskData.id,
             completedAt: Date.now(),
@@ -243,7 +256,7 @@ export function useResumePolling() {
   updateStatusRef.current = updateStatus;
   const updateAssistantMessagesRef = useRef(updateAssistantMessages);
   updateAssistantMessagesRef.current = updateAssistantMessages;
-  const recoveredCompletedTasksRef = useRef(new Set<string>());
+  const recoveredTerminalTasksRef = useRef(new Set<string>());
 
   const stopResumePolling = useCallback(() => {
     if (resumeTimerRef.current) {
@@ -372,38 +385,37 @@ export function useResumePolling() {
 
   useEffect(() => stopResumePolling, [stopResumePolling]);
 
-  // A task may finish while its final progress reconciliation is interrupted.
-  // Completed knowledge-base conversations are checked once after hydration so
-  // the server-side output ledger can safely catch up after a refresh.
+  // A task may finish while its final progress reconciliation is interrupted,
+  // or an older build may have been incorrectly marked as error when the
+  // provider reused a stable output ID. Recheck terminal knowledge-base tasks
+  // once after hydration and render their output only after server validation.
   useEffect(() => {
     if (!hydrated) {
-      recoveredCompletedTasksRef.current.clear();
+      recoveredTerminalTasksRef.current.clear();
       return;
     }
     for (const conversation of state.conversations) {
-      if (conversation.status !== "completed" || !conversation.taskId) continue;
+      if (
+        (conversation.status !== "completed" &&
+          conversation.status !== "error") ||
+        !conversation.taskId
+      ) {
+        continue;
+      }
       const key = `${conversation.id}:${conversation.taskId}`;
-      if (recoveredCompletedTasksRef.current.has(key)) continue;
-      recoveredCompletedTasksRef.current.add(key);
+      if (recoveredTerminalTasksRef.current.has(key)) continue;
+      recoveredTerminalTasksRef.current.add(key);
       void (async () => {
         try {
           const progress = await fetchKnowledgeBaseProgress(conversation.id);
           if (!progress) return;
-          const interaction = await reconcileKnowledgeBaseProgress({
-            conversationId: conversation.id,
-            taskId: conversation.taskId,
-          });
-          if (interaction.interactionState === "awaiting_input") {
-            updateStatusRef.current(conversation.id, "awaiting_input", {
-              taskId: conversation.taskId,
-            });
-          } else if (interaction.interactionState === "failed") {
-            updateStatusRef.current(conversation.id, "error", {
-              completedAt: Date.now(),
-            });
-          }
+          await checkAndUpdateTask(
+            conversation,
+            updateStatusRef.current,
+            updateAssistantMessagesRef.current,
+          );
         } catch {
-          recoveredCompletedTasksRef.current.delete(key);
+          recoveredTerminalTasksRef.current.delete(key);
         }
       })();
     }

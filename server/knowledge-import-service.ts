@@ -775,6 +775,7 @@ export async function importWebsiteKnowledgeArtifact(input: {
     await createKnowledgeMonitoringHandoff({
       userId: provision.userId,
       actorUserId: provision.userId,
+      knowledgeSnapshotId: snapshot?.id ?? snapshotId,
     });
     return {
       status: "completed" as const,

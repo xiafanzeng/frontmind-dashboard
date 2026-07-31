@@ -74,6 +74,8 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
     expect(prompt).toContain("不得输出参考资料、参考来源");
     expect(prompt).toContain("可见正文结束后直接附机器信封");
+    expect(prompt).toContain("以 output_image 或 image MIME 的 output_file");
+    expect(prompt).toContain("不得只写包内相对路径");
     expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(10_000);
     expect(prompt).not.toContain("# Skill");
     expect(prompt).not.toContain("current Pro Agent");
@@ -111,6 +113,8 @@ describe("knowledge base execution contract", () => {
       "Never create an interactive",
       "verification_gaps",
       "00_web_intelligence_report.md",
+      "Per-node image delivery",
+      "real response image/file",
     ]) {
       expect(skill).toContain(invariant);
     }
@@ -315,7 +319,7 @@ describe("knowledge base execution contract", () => {
     ).toBe("验收企业");
   });
 
-  it("selects only unseen cumulative output and preserves non-cumulative turns", () => {
+  it("selects unseen output, preserves non-cumulative turns, and replays terminal stable IDs", () => {
     const cumulative = [
       { id: "out-1", role: "assistant", content: "first" },
       { id: "out-2", role: "assistant", content: "second" },
@@ -343,6 +347,24 @@ describe("knowledge base execution contract", () => {
         lastOutputItemIds: ["out-1", "out-2"],
       }),
     ).toEqual([]);
+
+    const replacedTerminalTurn = [
+      {
+        id: "out-2",
+        role: "assistant",
+        content: "same provider ID, replaced terminal content",
+      },
+    ];
+    expect(
+      selectUnreconciledKnowledgeOutput(
+        replacedTerminalTurn,
+        {
+          lastOutputLength: 1,
+          lastOutputItemIds: ["out-2"],
+        },
+        { replayStableOutput: true },
+      ),
+    ).toEqual(replacedTerminalTurn);
   });
 
   it("reconciles closed envelopes while ignoring partial waiting output", () => {

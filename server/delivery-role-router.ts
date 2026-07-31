@@ -3,11 +3,14 @@ import { z } from "zod";
 import { deliveryRoleTypeSchema } from "../shared/delivery-roles";
 import { toTrpcError } from "./auth-router";
 import {
+  approveMyCustomerQuestionSelection,
   dispatchDeliveryTicket,
-  getMyDeliveryCredentialStatus,
+  getMyDeliveryHistory,
+  getMyDeliveryTicketDetail,
   getMyDeliveryWorkbench,
   listDeliveryRoleManagement,
   listMyProjectAssignments,
+  publishWebsiteStyleSamples,
   setDeliveryMemberCredential,
   revokeDeliveryMemberCredential,
   setProjectEngineer,
@@ -70,6 +73,7 @@ export const deliveryRoleRouter = router({
         z.object({
           engineerUserId: z.number().int().positive(),
           apiKey: z.string().trim().min(8).max(4096),
+          expectedVersion: z.number().int().nonnegative(),
         }),
       )
       .mutation(({ ctx, input }) =>
@@ -78,16 +82,23 @@ export const deliveryRoleRouter = router({
             actor: ctx.user,
             memberUserId: input.engineerUserId,
             apiKey: input.apiKey,
+            expectedVersion: input.expectedVersion,
           }),
         ),
       ),
     revokeEngineerApiKey: adminProcedure
-      .input(z.object({ engineerUserId: z.number().int().positive() }))
+      .input(
+        z.object({
+          engineerUserId: z.number().int().positive(),
+          expectedVersion: z.number().int().nonnegative(),
+        }),
+      )
       .mutation(({ ctx, input }) =>
         serviceCall(() =>
           revokeDeliveryMemberCredential({
             actor: ctx.user,
             memberUserId: input.engineerUserId,
+            expectedVersion: input.expectedVersion,
           }),
         ),
       ),
@@ -103,9 +114,83 @@ export const deliveryRoleRouter = router({
           getMyDeliveryWorkbench({ actor: ctx.user, ...input }),
         ),
       ),
-    credentialStatus: protectedProcedure.query(({ ctx }) =>
-      serviceCall(() => getMyDeliveryCredentialStatus(ctx.user)),
-    ),
+    approveQuestionSelection: protectedProcedure
+      .input(
+        z.object({
+          projectAssignmentId: z.string().uuid(),
+          questionId: z.string().trim().min(1).max(64),
+          expectedRevision: z.number().int().positive(),
+        }),
+      )
+      .mutation(({ ctx, input }) =>
+        serviceCall(() =>
+          approveMyCustomerQuestionSelection({
+            actor: ctx.user,
+            ...input,
+          }),
+        ),
+      ),
+    history: protectedProcedure
+      .input(
+        z
+          .object({
+            status: z.enum(["completed", "rejected", "cancelled"]).optional(),
+            customerUserId: z.number().int().positive().optional(),
+            operation: z.string().trim().min(1).max(64).optional(),
+            limit: z.number().int().min(1).max(50).default(20),
+            cursor: z
+              .object({
+                resolvedAt: z.number().int().nonnegative(),
+                id: z.string().uuid(),
+              })
+              .optional(),
+          })
+          .default({ limit: 20 }),
+      )
+      .query(({ ctx, input }) =>
+        serviceCall(() => getMyDeliveryHistory({ actor: ctx.user, ...input })),
+      ),
+    ticketDetail: protectedProcedure
+      .input(z.object({ ticketId: z.string().uuid() }))
+      .query(({ ctx, input }) =>
+        serviceCall(() =>
+          getMyDeliveryTicketDetail({ actor: ctx.user, ...input }),
+        ),
+      ),
+    publishWebsiteStyleSamples: protectedProcedure
+      .input(
+        z.object({
+          projectAssignmentId: z.string().uuid(),
+          ticketId: z.string().uuid(),
+          expectedWorkflowRevision: z.number().int().positive(),
+          engineerNote: z.string().trim().max(2_000).optional(),
+          samples: z
+            .array(
+              z.object({
+                fileId: z.string().trim().min(1).max(255),
+                filename: z.string().trim().min(1).max(512),
+                mimeType: z.string().trim().min(1).max(255),
+                sizeBytes: z
+                  .number()
+                  .int()
+                  .positive()
+                  .max(10 * 1024 * 1024),
+                sha256: z
+                  .string()
+                  .regex(/^[a-f0-9]{64}$/i)
+                  .optional(),
+                label: z.string().trim().min(1).max(160),
+                note: z.string().trim().max(2_000).optional(),
+              }),
+            )
+            .length(3),
+        }),
+      )
+      .mutation(({ ctx, input }) =>
+        serviceCall(() =>
+          publishWebsiteStyleSamples({ actor: ctx.user, ...input }),
+        ),
+      ),
     knowledgeResetPreview: protectedProcedure
       .input(
         z.object({
@@ -171,6 +256,7 @@ export const deliveryRoleRouter = router({
                 .optional(),
               needsFurtherOptimization: z.boolean().optional(),
               domain: z.string().trim().max(512).optional(),
+              icpServiceCode: z.string().trim().max(512).optional(),
               icpProvince: z.string().trim().max(64).optional(),
               icpNumber: z.string().trim().max(128).optional(),
               icpNotRequired: z.boolean().optional(),

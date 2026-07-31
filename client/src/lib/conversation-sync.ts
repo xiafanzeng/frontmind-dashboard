@@ -191,6 +191,17 @@ export class ConversationSyncQueue<T extends { id: string }> {
 }
 
 export function getErrorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) return error.message;
+  if (error instanceof Error && error.message) {
+    if (
+      /Failed query:|params:|insert into [`"]?messages|ER_DUP_ENTRY|Duplicate entry/i.test(
+        error.message,
+      )
+    ) {
+      return "云端会话写入暂时失败，系统会自动修复并重试；请勿重复提交。";
+    }
+    return error.message.length > 300
+      ? `${error.message.slice(0, 300)}…`
+      : error.message;
+  }
   return "对话同步失败，请检查网络后重试";
 }

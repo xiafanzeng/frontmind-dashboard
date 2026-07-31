@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   ADMIN_WORKSPACE_TAB_IDS,
   ADMIN_WORKSPACE_TABS,
+  adminWorkspaceTabsForAccess,
   canCreateManagedCustomer,
 } from "./AdminWorkspace";
 
@@ -17,23 +18,60 @@ describe("admin customer workspace", () => {
     expect(canCreateManagedCustomer(undefined)).toBe(false);
   });
 
-  it("places 工单与官网 between knowledge and delivery management", () => {
+  it("keeps customer management in four focused workflow tabs", () => {
     expect(ADMIN_WORKSPACE_TAB_IDS).toEqual([
       "service",
       "knowledge",
       "tickets",
-      "delivery",
       "credential",
-      "activity",
     ]);
     expect(ADMIN_WORKSPACE_TABS.map((item) => item.label)).toEqual([
-      "套餐与问题",
+      "用户流程",
       "知识库流程",
-      "工单与官网",
-      "客户看板展示",
+      "工单",
       "客户 Key 与积分",
-      "操作记录",
     ]);
+  });
+
+  it("keeps delivery-admin coordination routes reachable without exposing execution tabs", () => {
+    expect(
+      adminWorkspaceTabsForAccess({
+        isSystemAdmin: false,
+        canViewSelectedUserUsage: false,
+      }).map((tab) => tab.value),
+    ).toEqual(["service", "tickets"]);
+
+    expect(
+      adminWorkspaceTabsForAccess({
+        isSystemAdmin: false,
+        canViewSelectedUserUsage: true,
+      }).map((tab) => tab.value),
+    ).toEqual(["service", "tickets", "credential"]);
+
+    expect(
+      adminWorkspaceTabsForAccess({
+        isSystemAdmin: true,
+        canViewSelectedUserUsage: true,
+      }).map((tab) => tab.value),
+    ).toEqual(["service", "knowledge", "tickets", "credential"]);
+  });
+
+  it("folds delivery content into service and removes the workspace audit tab", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+
+    expect(source).toContain('{tab === "service" &&');
+    expect(source).toContain("<DashboardSkeletonEditor");
+    expect(source).toContain("<CustomerDashboardMirror");
+    expect(source).toContain("客户正式页面协调视图");
+    expect(source).toContain("不能在此代替工程师修改或发布内容");
+    expect(source).not.toContain('{tab === "delivery"');
+    expect(source).not.toContain('{tab === "activity"');
+    expect(source).not.toContain("客户工作区操作记录");
+    expect(source).not.toContain("只读验收");
+    expect(source).not.toContain("/preview");
   });
 
   it("does not request or render the removed manual-order queue", () => {
@@ -44,6 +82,19 @@ describe("admin customer workspace", () => {
     expect(source).not.toContain(".manualOrders");
     expect(source).not.toContain("人工签约与开通待办");
     expect(source).not.toContain("ManualOrderCard");
+  });
+
+  it("keeps question review with the monitoring engineer and system-admin fallback", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+
+    expect(source).toContain("editable={isSystemAdmin}");
+    expect(source).toContain("canConfirm={isSystemAdmin}");
+    expect(source).toContain("等待监控工程师确认");
+    expect(source).toContain("系统管理员异常接管");
+    expect(source).not.toContain("等待管理员确认");
   });
 
   it("does not render or submit order and contract identifiers", () => {

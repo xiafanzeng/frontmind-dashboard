@@ -4,9 +4,8 @@ import { httpBatchLink } from "@trpc/client";
 import { createRoot } from "react-dom/client";
 import superjson from "superjson";
 import App from "./App";
+import { checkFrontMindBuildVersion } from "@/lib/build-version";
 import "./index.css";
-
-declare const __FRONTMIND_BUILD_VERSION__: string;
 
 const queryClient = new QueryClient();
 
@@ -69,43 +68,26 @@ const trpcClient = trpc.createClient({
 //   - One lightweight check (~100 bytes) when the tab regains focus
 //   - Automatic reload only when a genuinely new version is detected
 // ============================================================
-const initialVersion = __FRONTMIND_BUILD_VERSION__;
-
-async function checkVersion() {
-  try {
-    const res = await fetch(`/__frontmind__/version.json?_t=${Date.now()}`, {
-      cache: "no-store",
-    });
-    if (!res.ok) return;
-    const data = await res.json();
-    const version = typeof data.version === "string" ? data.version : null;
-
-    if (version && version !== initialVersion) {
-      // New version detected — reload to pick up new assets
-      console.log(
-        `[VersionCheck] New version detected: ${version} (was ${initialVersion}). Reloading...`
-      );
-      window.location.reload();
-    }
-  } catch {
-    // Silently ignore fetch errors (offline, server down, etc.)
-  }
-}
-
 if (import.meta.env.PROD) {
-  void checkVersion();
+  void checkFrontMindBuildVersion();
 
   // Re-check when the user switches back to this tab.
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
-      void checkVersion();
+      void checkFrontMindBuildVersion();
     }
   });
 
   // Also check on window focus (covers some edge cases not caught by visibilitychange).
   window.addEventListener("focus", () => {
-    void checkVersion();
+    void checkFrontMindBuildVersion();
   });
+
+  window.setInterval(() => {
+    if (document.visibilityState === "visible") {
+      void checkFrontMindBuildVersion();
+    }
+  }, 5 * 60 * 1000);
 }
 
 createRoot(document.getElementById("root")!).render(

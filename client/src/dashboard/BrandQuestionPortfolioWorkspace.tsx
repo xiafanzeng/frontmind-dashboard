@@ -275,7 +275,7 @@ export default function BrandQuestionPortfolioWorkspace({
               品牌全域词库
             </h1>
             <p className="mt-3 max-w-3xl text-sm leading-7 text-[#716a80]">
-              候选问题只基于当前已发布的企业知识库生成。选择问题后会进入问题优化，由您提交管理员确认；管理员确认启动后才会锁定并占用额度。
+              候选问题只基于当前已发布的企业知识库生成。选择问题后会进入专业审核，由 AI 监控与优化工程师确认启动；确认后才会锁定并占用额度。
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -441,7 +441,7 @@ export default function BrandQuestionPortfolioWorkspace({
                                 {selected
                                   ? "进入问题优化"
                                   : pending
-                                    ? "待管理员确认"
+                                    ? "待监控工程师确认"
                                     : "选择并进入问题优化"}
                               </Button>
                             </div>

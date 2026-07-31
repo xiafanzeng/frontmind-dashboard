@@ -13,6 +13,7 @@ import {
   max,
   ne,
   or,
+  sql,
 } from "drizzle-orm";
 
 import {
@@ -29,12 +30,17 @@ import {
   users,
   workspaceSiteChecks,
   workspaceSiteProfiles,
+  websiteStyleSampleBatches,
+  websiteStyleSamples,
+  websiteStyleWorkflows,
 } from "../drizzle/schema";
 import {
   DELIVERY_TICKET_PUBLIC_STATUS_LABELS,
+  DELIVERY_TICKET_PUBLIC_STAGE_LABELS,
   DELIVERY_TICKET_STATUS_LABELS,
   deliveryOperationResultSchema,
   deliveryTicketPublicStatus,
+  deliveryTicketPublicStage,
   icpNonSensitiveDeclarationsSchema,
   publicContentAssetTicketDetailSchema,
   publicKnowledgeBaseTicketDetailSchema,
@@ -63,6 +69,10 @@ import {
   WEBSITE_CONTENT_CATALOG,
   contentAssetMediaOptionsForMarketEdition,
 } from "../shared/delivery-catalog";
+import {
+  DELIVERY_ROLE_LABELS,
+  type DeliveryRoleType,
+} from "../shared/delivery-roles";
 import type { AuthenticatedUser } from "./auth-service";
 import { getDb } from "./db";
 import { assertWorkspaceAccess, isSystemAdmin } from "./dashboard-service";
@@ -70,6 +80,17 @@ import { getServicePortal } from "./service-entitlement";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { DeliveryTicketError } from "./delivery-ticket-error";
 export { DeliveryTicketError } from "./delivery-ticket-error";
+
+export function assertManagedTicketCanBeExecutedByAdmin(ticket: {
+  workflowDomain?: DeliveryRoleType | null;
+}) {
+  if (!ticket.workflowDomain) return;
+  throw new DeliveryTicketError(
+    "ROLE_OWNED_TICKET_ADMIN_EXECUTION_FORBIDDEN",
+    `该工单已由${DELIVERY_ROLE_LABELS[ticket.workflowDomain]}负责，请在对应工程师工作台完成执行与交付；管理员仅负责协调、催办和异常治理。`,
+    403,
+  );
+}
 
 async function requireDb() {
   const db = await getDb();
@@ -200,6 +221,22 @@ const WEBSITE_CONTENT_CATEGORIES = new Set<string>(
   WEBSITE_CONTENT_CATALOG.map((item) => item.value),
 );
 
+export function websiteTicketAllowsPublicAttachments(
+  category: string | null | undefined,
+) {
+  return Boolean(category && WEBSITE_CONTENT_CATEGORIES.has(category));
+}
+
+export function deliveryTicketStatusAfterCustomerMessage(input: {
+  actorRole: AuthenticatedUser["role"];
+  currentStatus: DeliveryTicketStatus;
+}) {
+  return input.actorRole === "user" &&
+    input.currentStatus === "needs_information"
+    ? ("submitted" as const)
+    : input.currentStatus;
+}
+
 export async function assertWebsiteTicketWorkflow(
   executor: any,
   userId: number,
@@ -231,7 +268,7 @@ export async function assertWebsiteTicketWorkflow(
     if (profile?.domainStatus === "completed") {
       throw new DeliveryTicketError(
         "DOMAIN_ALREADY_VERIFIED",
-        "当前企业域名已由管理员确认，无需重复申请。",
+        "当前企业域名已由 AI 运维工程师核验，无需重复申请。",
       );
     }
     return { profile, domain };
@@ -267,6 +304,22 @@ export async function assertWebsiteTicketWorkflow(
       throw new DeliveryTicketError(
         "WEBSITE_PREREQUISITES_REQUIRED",
         "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。",
+        403,
+      );
+    }
+    const styleRows = await executor
+      .select({ status: websiteStyleWorkflows.status })
+      .from(websiteStyleWorkflows)
+      .where(eq(websiteStyleWorkflows.userId, userId))
+      .limit(1)
+      .for("update");
+    if (
+      !styleRows[0] ||
+      !["confirmed", "legacy_confirmed"].includes(styleRows[0].status)
+    ) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_REQUIRED",
+        "请先等待工程师提供官网图片风格样例，并确认其中一种风格。",
         403,
       );
     }
@@ -510,6 +563,7 @@ function ticketDto(
     attachmentCount?: number;
     latestPublicMessage?: string | null;
     assignedAdmins?: Array<{ id: number; name: string }>;
+    assignedMemberName?: string | null;
   },
 ) {
   const assignedAdmins = extra?.assignedAdmins ?? [];
@@ -524,6 +578,12 @@ function ticketDto(
     quotaPool: row.quotaPool,
     quotaState: row.quotaState,
     category: row.category,
+    workflowDomain: row.workflowDomain,
+    operation: row.operation,
+    assignedProjectAssignmentId: row.assignedProjectAssignmentId,
+    assignedMemberId: row.assignedMemberId,
+    assignedMemberName: extra?.assignedMemberName ?? null,
+    priority: row.priority,
     topic: row.topic,
     title: row.title,
     description: row.description,
@@ -539,6 +599,11 @@ function ticketDto(
     publicStatusLabel:
       DELIVERY_TICKET_PUBLIC_STATUS_LABELS[
         deliveryTicketPublicStatus(row.status)
+      ],
+    publicStage: deliveryTicketPublicStage(row.status),
+    publicStageLabel:
+      DELIVERY_TICKET_PUBLIC_STAGE_LABELS[
+        deliveryTicketPublicStage(row.status)
       ],
     publicSummary: row.publicSummary,
     deliveryLinks: row.deliveryLinks,
@@ -596,7 +661,9 @@ function publicDeliveryCategoryLabel(ticket: InternalDeliveryTicketDto) {
   const category = nonEmpty(ticket.category);
   if (!category) return null;
   if (ticket.type === "knowledge_base") {
-    return category === "knowledge_reset" ? "知识库重置" : category;
+    if (category === "knowledge_reset") return "知识库重置";
+    if (category === "knowledge_delivery") return "品牌全域知识库";
+    return category;
   }
   if (ticket.type === "content_asset") {
     return (
@@ -622,6 +689,7 @@ export function toPublicDeliveryTicketSummary(
   ticket: InternalDeliveryTicketDto,
 ): PublicDeliveryTicketSummary {
   const publicStatus = deliveryTicketPublicStatus(ticket.status);
+  const publicStage = deliveryTicketPublicStage(ticket.status);
   const base = {
     id: ticket.id,
     type: ticket.type,
@@ -633,8 +701,12 @@ export function toPublicDeliveryTicketSummary(
       nonEmpty(ticket.category),
     publicStatus,
     publicStatusLabel: DELIVERY_TICKET_PUBLIC_STATUS_LABELS[publicStatus],
+    publicStage,
+    publicStageLabel: DELIVERY_TICKET_PUBLIC_STAGE_LABELS[publicStage],
     publicSummary:
-      publicStatus === "completed" ? nonEmpty(ticket.publicSummary) : null,
+      publicStatus === "completed" || publicStage === "action_required"
+        ? nonEmpty(ticket.publicSummary)
+        : null,
     knowledgeSnapshotId: ticket.knowledgeSnapshotId,
   };
   return publicDeliveryTicketSummarySchema.parse(
@@ -742,6 +814,78 @@ async function loadSiteProfile(db: any, userId: number) {
         updatedAt: null,
       }
     : null;
+}
+
+async function loadWebsiteStyleWorkflow(db: any, userId: number) {
+  const workflowRows = await db
+    .select()
+    .from(websiteStyleWorkflows)
+    .where(eq(websiteStyleWorkflows.userId, userId))
+    .limit(1);
+  const workflow = workflowRows[0];
+  if (!workflow) return null;
+  if (!workflow.currentBatchId) {
+    return {
+      status: workflow.status,
+      revision: workflow.revision,
+      selectedSampleId: workflow.selectedSampleId,
+      selectedAt: epoch(workflow.selectedAt),
+      currentBatch: null,
+    };
+  }
+  const [batchRows, sampleRows] = await Promise.all([
+    db
+      .select()
+      .from(websiteStyleSampleBatches)
+      .where(eq(websiteStyleSampleBatches.id, workflow.currentBatchId))
+      .limit(1),
+    db
+      .select({
+        sample: websiteStyleSamples,
+        attachment: deliveryTicketAttachments,
+      })
+      .from(websiteStyleSamples)
+      .innerJoin(
+        deliveryTicketAttachments,
+        eq(deliveryTicketAttachments.id, websiteStyleSamples.attachmentId),
+      )
+      .where(eq(websiteStyleSamples.batchId, workflow.currentBatchId))
+      .orderBy(asc(websiteStyleSamples.sortOrder)),
+  ]);
+  const batch = batchRows[0];
+  return {
+    status: workflow.status,
+    revision: workflow.revision,
+    selectedSampleId: workflow.selectedSampleId,
+    selectedAt: epoch(workflow.selectedAt),
+    currentBatch: batch
+      ? {
+          id: batch.id,
+          ordinal: batch.ordinal,
+          status: batch.status,
+          engineerNote: batch.engineerNote,
+          publishedAt: epoch(batch.publishedAt),
+          samples: sampleRows.map(
+            ({
+              sample,
+              attachment,
+            }: {
+              sample: typeof websiteStyleSamples.$inferSelect;
+              attachment: typeof deliveryTicketAttachments.$inferSelect;
+            }) => ({
+              id: sample.id,
+              label: sample.label,
+              note: sample.note,
+              sortOrder: sample.sortOrder,
+              attachmentId: attachment.id,
+              filename: attachment.filename,
+              mimeType: attachment.mimeType,
+              imageUrl: `/api/delivery-ticket-attachments/${attachment.id}/content`,
+            }),
+          ),
+        }
+      : null,
+  };
 }
 
 async function currentQuota(
@@ -871,7 +1015,14 @@ async function hydrateTicketSummaries(
   if (!rows.length) return [] as Array<ReturnType<typeof ticketDto>>;
   const ids = rows.map((row: any) => row.ticket.id);
   const userIds = [...new Set(rows.map((row) => row.ticket.userId))];
-  const [attachments, events] = await Promise.all([
+  const assignedMemberIds = [
+    ...new Set(
+      rows.flatMap((row) =>
+        row.ticket.assignedMemberId ? [row.ticket.assignedMemberId] : [],
+      ),
+    ),
+  ];
+  const [attachments, events, assignedMembers] = await Promise.all([
     db
       .select({ ticketId: deliveryTicketAttachments.ticketId, value: count() })
       .from(deliveryTicketAttachments)
@@ -891,6 +1042,16 @@ async function hydrateTicketSummaries(
         ),
       )
       .orderBy(desc(deliveryTicketEvents.createdAt)),
+    assignedMemberIds.length
+      ? db
+          .select({
+            id: users.id,
+            displayName: users.displayName,
+            username: users.username,
+          })
+          .from(users)
+          .where(inArray(users.id, assignedMemberIds))
+      : [],
   ]);
   const assignments = await db
     .select({
@@ -917,6 +1078,20 @@ async function hydrateTicketSummaries(
   const counts = new Map<string, number>(
     attachments.map((row: any) => [row.ticketId, Number(row.value)]),
   );
+  const memberNames = new Map<number, string>(
+    (
+      assignedMembers as Array<{
+        id: number;
+        displayName: string | null;
+        username: string | null;
+      }>
+    ).map((member) => [
+      member.id,
+      member.displayName?.trim() ||
+        member.username?.trim() ||
+        `工程师 ${member.id}`,
+    ]),
+  );
   const latest = new Map<string, string | null>();
   for (const event of events) {
     if (!latest.has(event.ticketId) && event.message) {
@@ -930,6 +1105,9 @@ async function hydrateTicketSummaries(
         attachmentCount: counts.get(row.ticket.id) ?? 0,
         latestPublicMessage: latest.get(row.ticket.id) ?? null,
         assignedAdmins: assignedByUser.get(row.ticket.userId) ?? [],
+        assignedMemberName: row.ticket.assignedMemberId
+          ? (memberNames.get(row.ticket.assignedMemberId) ?? null)
+          : null,
       }),
   );
 }
@@ -1087,50 +1265,58 @@ export async function getDeliveryTicketWorkspace(userId: number) {
 export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
   const db = await requireDb();
   const portal = await getServicePortal(userId);
-  const [accountRows, siteProfile, quotas, pendingRows, ownerRows] =
-    await Promise.all([
-      db
-        .select({ marketEdition: users.marketEdition })
-        .from(users)
-        .where(eq(users.id, userId))
-        .limit(1),
-      loadSiteProfile(db, userId),
-      currentQuota(db, userId, portal),
-      db
-        .select({ value: count() })
-        .from(deliveryTickets)
-        .where(
-          and(
-            eq(deliveryTickets.userId, userId),
-            inArray(deliveryTickets.status, [
-              "submitted",
-              "needs_information",
-              "scheduled",
-              "in_progress",
-            ]),
-          ),
+  const [
+    accountRows,
+    siteProfile,
+    styleWorkflow,
+    quotas,
+    pendingRows,
+    ownerRows,
+  ] = await Promise.all([
+    db
+      .select({ marketEdition: users.marketEdition })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1),
+    loadSiteProfile(db, userId),
+    loadWebsiteStyleWorkflow(db, userId),
+    currentQuota(db, userId, portal),
+    db
+      .select({ value: count() })
+      .from(deliveryTickets)
+      .where(
+        and(
+          eq(deliveryTickets.userId, userId),
+          inArray(deliveryTickets.status, [
+            "submitted",
+            "needs_information",
+            "scheduled",
+            "in_progress",
+          ]),
         ),
-      db
-        .select({ roleType: deliveryProjectAssignments.roleType })
-        .from(deliveryProjectAssignments)
-        .innerJoin(
-          users,
-          eq(users.id, deliveryProjectAssignments.engineerUserId),
-        )
-        .where(
-          and(
-            eq(deliveryProjectAssignments.customerUserId, userId),
-            eq(users.role, "delivery_member"),
-            eq(users.engineerRoleType, deliveryProjectAssignments.roleType),
-            eq(users.isActive, true),
-          ),
+      ),
+    db
+      .select({ roleType: deliveryProjectAssignments.roleType })
+      .from(deliveryProjectAssignments)
+      .innerJoin(users, eq(users.id, deliveryProjectAssignments.engineerUserId))
+      .where(
+        and(
+          eq(deliveryProjectAssignments.customerUserId, userId),
+          eq(users.role, "delivery_member"),
+          eq(users.engineerRoleType, deliveryProjectAssignments.roleType),
+          eq(users.isActive, true),
         ),
-    ]);
+      ),
+  ]);
   const ownerTypes = new Set(ownerRows.map((row) => row.roleType));
   const domainCompleted = siteProfile?.domainStatus === "completed";
   const icpCompleted =
     siteProfile?.icpStatus === "approved" ||
     siteProfile?.icpStatus === "not_required";
+  const styleState =
+    styleWorkflow?.status ?? (icpCompleted ? "waiting_samples" : "locked");
+  const styleConfirmed =
+    styleState === "confirmed" || styleState === "legacy_confirmed";
   const marketEdition = accountRows[0]?.marketEdition ?? "domestic";
   return {
     siteProfile,
@@ -1153,9 +1339,16 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
       icpStatus: siteProfile?.icpStatus ?? "not_submitted",
       domainCompleted,
       icpCompleted,
+      styleState,
+      styleRevision: styleWorkflow?.revision ?? 0,
+      styleBatch: styleWorkflow?.currentBatch ?? null,
+      selectedStyleSampleId: styleWorkflow?.selectedSampleId ?? null,
+      styleConfirmed,
+      canSelectStyle: styleState === "awaiting_selection",
+      canRequestStyleRevision: styleState === "awaiting_selection",
       canSubmitDomain: !domainCompleted,
       canSubmitIcp: !icpCompleted,
-      canSubmitContent: domainCompleted && icpCompleted,
+      canSubmitContent: domainCompleted && icpCompleted && styleConfirmed,
       icpProvince: siteProfile?.icpProvince ?? null,
       icpProvinceOptions: ICP_PROVINCES,
       icpLockReason: null,
@@ -1163,7 +1356,13 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
         ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
         : !icpCompleted
           ? "请先提交并确认域名与 ICP 主体备案号。"
-          : null,
+          : !styleConfirmed
+            ? styleState === "awaiting_selection"
+              ? "请先选择一种官网图片风格，或填写原因退回工程师重做。"
+              : styleState === "revision_requested"
+                ? "已退回工程师重做，正在等待新一批图片风格样例。"
+                : "正在等待工程师提供三张官网图片风格样例。"
+            : null,
     },
   };
 }
@@ -1182,6 +1381,7 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
     metadata.siteProfile?.icpStatus === "submitted";
   const domainCompleted = metadata.websiteWorkflow.domainCompleted;
   const icpCompleted = metadata.websiteWorkflow.icpCompleted;
+  const styleConfirmed = metadata.websiteWorkflow.styleConfirmed;
   const aiOperationsUnavailableReason =
     metadata.quotas.website_content_publish.reason ||
     "尚未分配 AI 运维工程师，请联系交付管理员。";
@@ -1218,13 +1418,27 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
         deliveryOwners.aiOperations && !domainCompleted && !domainPending,
       canSubmitIcp:
         deliveryOwners.aiOperations &&
+        domainCompleted &&
         !icpCompleted &&
         !domainPending &&
         !icpPending,
       canSubmitContent:
-        deliveryOwners.aiOperations && domainCompleted && icpCompleted,
+        deliveryOwners.aiOperations &&
+        domainCompleted &&
+        icpCompleted &&
+        styleConfirmed,
+      styleState: metadata.websiteWorkflow.styleState,
+      styleRevision: metadata.websiteWorkflow.styleRevision,
+      styleBatch: metadata.websiteWorkflow.styleBatch,
+      selectedStyleSampleId: metadata.websiteWorkflow.selectedStyleSampleId,
+      styleConfirmed,
+      canSelectStyle:
+        deliveryOwners.aiOperations && metadata.websiteWorkflow.canSelectStyle,
+      canRequestStyleRevision:
+        deliveryOwners.aiOperations &&
+        metadata.websiteWorkflow.canRequestStyleRevision,
       domainLockReason: domainPending
-        ? "域名申请工单待管理员受理。"
+        ? "域名申请工单正在等待 AI 运维工程师处理。"
         : !deliveryOwners.aiOperations
           ? aiOperationsUnavailableReason
           : domainCompleted
@@ -1232,16 +1446,20 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
             : null,
       icpLockReason: !deliveryOwners.aiOperations
         ? aiOperationsUnavailableReason
-        : domainPending || icpPending
-          ? "域名与 ICP 备案结果待管理员确认。"
-          : null,
+        : !domainCompleted
+          ? domainPending
+            ? "域名工单正在处理；工单完成并返回备案服务码后，才可提交 ICP 备案结果。"
+            : "请先购买域名并提交 AI 运维工单，领取备案服务码后再进行 ICP 备案。"
+          : icpPending
+            ? "ICP 备案结果待 AI 运维工程师核验。"
+            : null,
       contentLockReason: !deliveryOwners.aiOperations
         ? aiOperationsUnavailableReason
         : !domainCompleted
-          ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
+          ? "请先购买域名并提交 AI 运维工单，领取备案服务码后完成 ICP 备案。"
           : !icpCompleted
             ? "请先提交并确认域名与 ICP 主体备案号。"
-            : null,
+            : metadata.websiteWorkflow.contentLockReason,
       icpProvinceOptions: metadata.websiteWorkflow.icpProvinceOptions,
     },
   });
@@ -1251,6 +1469,244 @@ export async function getPublicDeliveryTicketWorkspaceMetadata(userId: number) {
   return toPublicDeliveryTicketWorkspaceMetadata(
     await getDeliveryTicketWorkspaceMetadata(userId),
   );
+}
+
+export async function selectWebsiteStyleSample(input: {
+  actor: AuthenticatedUser;
+  sampleId: string;
+  expectedRevision: number;
+}) {
+  if (input.actor.role !== "user") {
+    throw new DeliveryTicketError(
+      "WEBSITE_STYLE_USER_REQUIRED",
+      "只有当前客户可以确认官网图片风格。",
+      403,
+    );
+  }
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const workflowRows = await tx
+      .select()
+      .from(websiteStyleWorkflows)
+      .where(eq(websiteStyleWorkflows.userId, input.actor.id))
+      .limit(1)
+      .for("update");
+    const workflow = workflowRows[0];
+    if (
+      !workflow ||
+      workflow.status !== "awaiting_selection" ||
+      workflow.revision !== input.expectedRevision ||
+      !workflow.currentBatchId
+    ) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_STATE_CHANGED",
+        "官网风格样例状态已变化，请刷新后重试。",
+        409,
+      );
+    }
+    const sampleRows = await tx
+      .select({
+        sample: websiteStyleSamples,
+        batch: websiteStyleSampleBatches,
+      })
+      .from(websiteStyleSamples)
+      .innerJoin(
+        websiteStyleSampleBatches,
+        eq(websiteStyleSampleBatches.id, websiteStyleSamples.batchId),
+      )
+      .where(
+        and(
+          eq(websiteStyleSamples.id, input.sampleId),
+          eq(websiteStyleSamples.batchId, workflow.currentBatchId),
+          eq(websiteStyleSampleBatches.userId, input.actor.id),
+        ),
+      )
+      .limit(1);
+    const selected = sampleRows[0];
+    if (!selected) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_SAMPLE_NOT_FOUND",
+        "官网风格样例不存在。",
+        404,
+      );
+    }
+    const ticketRows = await tx
+      .select()
+      .from(deliveryTickets)
+      .where(eq(deliveryTickets.id, selected.batch.ticketId))
+      .limit(1)
+      .for("update");
+    const ticket = ticketRows[0];
+    if (!ticket || ticket.userId !== input.actor.id) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_SAMPLE_NOT_FOUND",
+        "官网风格样例不存在。",
+        404,
+      );
+    }
+    const now = new Date();
+    await tx
+      .update(websiteStyleWorkflows)
+      .set({
+        status: "confirmed",
+        selectedSampleId: selected.sample.id,
+        selectedByUserId: input.actor.id,
+        selectedAt: now,
+        revision: workflow.revision + 1,
+        updatedAt: now,
+      })
+      .where(eq(websiteStyleWorkflows.userId, input.actor.id));
+    await tx
+      .update(websiteStyleSampleBatches)
+      .set({ status: "selected", updatedAt: now })
+      .where(eq(websiteStyleSampleBatches.id, selected.batch.id));
+    await tx
+      .update(deliveryTickets)
+      .set({
+        status: "completed",
+        publicSummary: `客户已确认官网图片风格：${selected.sample.label}`,
+        resolvedAt: now,
+        revision: sql`${deliveryTickets.revision} + 1`,
+        updatedByUserId: input.actor.id,
+        updatedAt: now,
+      })
+      .where(eq(deliveryTickets.id, ticket.id));
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID(),
+      ticketId: ticket.id,
+      userId: input.actor.id,
+      actorUserId: input.actor.id,
+      actorRole: "user",
+      kind: "status_change",
+      visibility: "customer",
+      message: `客户已确认官网图片风格：${selected.sample.label}。官网构建与内容运营现已解锁。`,
+      fromStatus: ticket.status,
+      toStatus: "completed",
+      createdAt: now,
+    });
+    return {
+      success: true as const,
+      selectedSampleId: selected.sample.id,
+      workflowRevision: workflow.revision + 1,
+    };
+  });
+}
+
+export async function requestWebsiteStyleRevision(input: {
+  actor: AuthenticatedUser;
+  reason: string;
+  expectedRevision: number;
+}) {
+  if (input.actor.role !== "user") {
+    throw new DeliveryTicketError(
+      "WEBSITE_STYLE_USER_REQUIRED",
+      "只有当前客户可以退回官网图片风格样例。",
+      403,
+    );
+  }
+  const reason = input.reason.trim();
+  if (!reason) {
+    throw new DeliveryTicketError(
+      "WEBSITE_STYLE_REVISION_REASON_REQUIRED",
+      "请填写需要调整的风格方向。",
+      400,
+    );
+  }
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const workflowRows = await tx
+      .select()
+      .from(websiteStyleWorkflows)
+      .where(eq(websiteStyleWorkflows.userId, input.actor.id))
+      .limit(1)
+      .for("update");
+    const workflow = workflowRows[0];
+    if (
+      !workflow ||
+      workflow.status !== "awaiting_selection" ||
+      workflow.revision !== input.expectedRevision ||
+      !workflow.currentBatchId
+    ) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_STATE_CHANGED",
+        "官网风格样例状态已变化，请刷新后重试。",
+        409,
+      );
+    }
+    const batchRows = await tx
+      .select()
+      .from(websiteStyleSampleBatches)
+      .where(
+        and(
+          eq(websiteStyleSampleBatches.id, workflow.currentBatchId),
+          eq(websiteStyleSampleBatches.userId, input.actor.id),
+        ),
+      )
+      .limit(1);
+    const batch = batchRows[0];
+    if (!batch) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_BATCH_NOT_FOUND",
+        "官网风格样例批次不存在。",
+        404,
+      );
+    }
+    const ticketRows = await tx
+      .select()
+      .from(deliveryTickets)
+      .where(eq(deliveryTickets.id, batch.ticketId))
+      .limit(1)
+      .for("update");
+    const ticket = ticketRows[0];
+    if (!ticket || ticket.userId !== input.actor.id) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_BATCH_NOT_FOUND",
+        "官网风格样例批次不存在。",
+        404,
+      );
+    }
+    const now = new Date();
+    await tx
+      .update(websiteStyleWorkflows)
+      .set({
+        status: "revision_requested",
+        revision: workflow.revision + 1,
+        updatedAt: now,
+      })
+      .where(eq(websiteStyleWorkflows.userId, input.actor.id));
+    await tx
+      .update(websiteStyleSampleBatches)
+      .set({ status: "revision_requested", updatedAt: now })
+      .where(eq(websiteStyleSampleBatches.id, batch.id));
+    await tx
+      .update(deliveryTickets)
+      .set({
+        status: "in_progress",
+        publicSummary: "客户已退回本批风格样例，等待工程师重新提供。",
+        resolvedAt: null,
+        revision: sql`${deliveryTickets.revision} + 1`,
+        updatedByUserId: input.actor.id,
+        updatedAt: now,
+      })
+      .where(eq(deliveryTickets.id, ticket.id));
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID(),
+      ticketId: ticket.id,
+      userId: input.actor.id,
+      actorUserId: input.actor.id,
+      actorRole: "user",
+      kind: "status_change",
+      visibility: "customer",
+      message: `客户要求调整官网图片风格：${reason}`,
+      fromStatus: ticket.status,
+      toStatus: "in_progress",
+      createdAt: now,
+    });
+    return {
+      success: true as const,
+      workflowRevision: workflow.revision + 1,
+    };
+  });
 }
 
 /**
@@ -1779,7 +2235,7 @@ export async function getDeliveryTicketDetail(input: {
 }) {
   const db = await requireDb();
   const ticket = await requireOwnedTicket(db, input.userId, input.ticketId);
-  const [events, attachmentRows] = await Promise.all([
+  const [events, attachmentRows, assignedMemberRows] = await Promise.all([
     db
       .select()
       .from(deliveryTicketEvents)
@@ -1807,6 +2263,17 @@ export async function getDeliveryTicketDetail(input: {
       )
       .where(eq(deliveryTicketAttachments.ticketId, ticket.id))
       .orderBy(asc(deliveryTicketAttachments.createdAt)),
+    input.includeInternal && ticket.assignedMemberId
+      ? db
+          .select({
+            id: users.id,
+            displayName: users.displayName,
+            username: users.username,
+          })
+          .from(users)
+          .where(eq(users.id, ticket.assignedMemberId))
+          .limit(1)
+      : [],
   ]);
   const attachments = attachmentRows
     .filter((row) =>
@@ -1817,7 +2284,14 @@ export async function getDeliveryTicketDetail(input: {
     )
     .map((row) => row.attachment);
   return {
-    ticket: ticketDto(ticket, { attachmentCount: attachments.length }),
+    ticket: ticketDto(ticket, {
+      attachmentCount: attachments.length,
+      assignedMemberName: assignedMemberRows[0]
+        ? assignedMemberRows[0].displayName?.trim() ||
+          assignedMemberRows[0].username?.trim() ||
+          `工程师 ${assignedMemberRows[0].id}`
+        : null,
+    }),
     events: events.map((event) => ({
       id: event.id,
       eventType: event.kind,
@@ -1863,7 +2337,72 @@ export async function getPublicDeliveryTicketDetail(input: {
   const ticket = await requireOwnedTicket(db, input.userId, input.ticketId);
   const summary = toPublicDeliveryTicketSummary(ticketDto(ticket));
   if (summary.type === "website_operation") {
-    return publicWebsiteTicketDetailSchema.parse({ ticket: summary });
+    const [events, attachments] = await Promise.all([
+      db
+        .select({
+          id: deliveryTicketEvents.id,
+          actorRole: deliveryTicketEvents.actorRole,
+          message: deliveryTicketEvents.message,
+          createdAt: deliveryTicketEvents.createdAt,
+        })
+        .from(deliveryTicketEvents)
+        .where(
+          and(
+            eq(deliveryTicketEvents.ticketId, ticket.id),
+            eq(deliveryTicketEvents.visibility, "customer"),
+          ),
+        )
+        .orderBy(asc(deliveryTicketEvents.createdAt)),
+      db
+        .select({
+          id: deliveryTicketAttachments.id,
+          filename: deliveryTicketAttachments.filename,
+          mimeType: deliveryTicketAttachments.mimeType,
+          sizeBytes: deliveryTicketAttachments.sizeBytes,
+          purpose: deliveryTicketAttachments.purpose,
+          kind: deliveryTicketAttachments.kind,
+          createdAt: deliveryTicketAttachments.createdAt,
+        })
+        .from(deliveryTicketAttachments)
+        .innerJoin(
+          deliveryTicketEvents,
+          and(
+            eq(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
+            eq(
+              deliveryTicketEvents.ticketId,
+              deliveryTicketAttachments.ticketId,
+            ),
+            eq(deliveryTicketEvents.visibility, "customer"),
+          ),
+        )
+        .where(eq(deliveryTicketAttachments.ticketId, ticket.id))
+        .orderBy(asc(deliveryTicketAttachments.createdAt)),
+    ]);
+    return publicWebsiteTicketDetailSchema.parse({
+      ticket: {
+        ...summary,
+        revision: ticket.revision,
+        canReply: !TERMINAL_STATUSES.has(ticket.status),
+        canAttach: websiteTicketAllowsPublicAttachments(ticket.category),
+      },
+      events: events.map((event) => ({
+        id: event.id,
+        actorRole: event.actorRole,
+        actorLabel: event.actorRole === "user" ? "用户" : "服务团队",
+        message: event.message,
+        createdAt: epoch(event.createdAt),
+      })),
+      attachments: attachments.map((attachment) => ({
+        id: attachment.id,
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+        sizeBytes: attachment.sizeBytes,
+        purpose: attachment.purpose,
+        kind: attachment.kind,
+        createdAt: epoch(attachment.createdAt),
+        downloadUrl: `/api/delivery-ticket-attachments/${attachment.id}/content`,
+      })),
+    });
   }
 
   if (summary.type === "knowledge_base") {
@@ -1975,17 +2514,21 @@ export function isDeliveryTicketAttachmentVisible(
 
 export function assertDeliveryTicketMessagePolicy(input: {
   ticketType: DeliveryTicketType;
+  ticketCategory?: string | null;
   actorRole: AuthenticatedUser["role"];
   visibility: "customer" | "internal";
+  attachmentCount?: number;
 }) {
   if (
     input.ticketType === "website_operation" &&
-    (input.actorRole === "user" || input.visibility !== "internal")
+    input.visibility === "customer" &&
+    (input.attachmentCount ?? 0) > 0 &&
+    !websiteTicketAllowsPublicAttachments(input.ticketCategory)
   ) {
     throw new DeliveryTicketError(
-      "WEBSITE_CUSTOMER_MESSAGES_NOT_ALLOWED",
-      "官网工单不提供公开交流或文件回传，处理结果将直接体现在网站和内容总结中。",
-      403,
+      "WEBSITE_PUBLIC_ATTACHMENTS_NOT_ALLOWED",
+      "该官网工单只接收文字补充；请勿上传证件、密码、负责人照片或其他备案材料。",
+      400,
     );
   }
 }
@@ -2035,8 +2578,10 @@ export async function addDeliveryTicketMessage(input: {
     const visibility = input.visibility ?? "customer";
     assertDeliveryTicketMessagePolicy({
       ticketType: ticket.type,
+      ticketCategory: ticket.category,
       actorRole: input.actor.role,
       visibility,
+      attachmentCount: input.value.attachments.length,
     });
     const existing = await tx
       .select()
@@ -2058,6 +2603,11 @@ export async function addDeliveryTicketMessage(input: {
     await verifyOwnedAttachments(tx, input.actor.id, input.value.attachments);
     const now = new Date();
     const eventId = randomUUID();
+    const nextStatus = deliveryTicketStatusAfterCustomerMessage({
+      actorRole: input.actor.role,
+      currentStatus: ticket.status,
+    });
+    const returnsToServiceQueue = nextStatus !== ticket.status;
     await tx.insert(deliveryTicketEvents).values({
       id: eventId,
       ticketId: ticket.id,
@@ -2068,6 +2618,8 @@ export async function addDeliveryTicketMessage(input: {
       visibility,
       clientRequestId: input.value.clientRequestId,
       message: input.value.message,
+      fromStatus: returnsToServiceQueue ? ticket.status : null,
+      toStatus: returnsToServiceQueue ? nextStatus : null,
       createdAt: now,
     });
     const files = attachmentRows({
@@ -2084,7 +2636,16 @@ export async function addDeliveryTicketMessage(input: {
     if (files.length) await tx.insert(deliveryTicketAttachments).values(files);
     await tx
       .update(deliveryTickets)
-      .set({ updatedByUserId: input.actor.id, updatedAt: now })
+      .set({
+        ...(returnsToServiceQueue
+          ? {
+              status: nextStatus,
+              revision: sql`${deliveryTickets.revision} + 1`,
+            }
+          : {}),
+        updatedByUserId: input.actor.id,
+        updatedAt: now,
+      })
       .where(eq(deliveryTickets.id, ticket.id));
     return { eventId, idempotent: false };
   });
@@ -2287,6 +2848,7 @@ export async function updateManagedDeliveryTicket(input: {
       input.value.ticketId,
       true,
     );
+    assertManagedTicketCanBeExecutedByAdmin(ticket);
     await assertExistingDeliveryTicketSettlementScope({
       executor: tx,
       userId: input.userId,
@@ -2335,7 +2897,7 @@ export async function updateManagedDeliveryTicket(input: {
     ) {
       throw new DeliveryTicketError(
         "WEBSITE_PUBLIC_MESSAGE_NOT_ALLOWED",
-        "官网工单不提供客户公开交流，完成结果请写入内容总结。",
+        "官网工单的完成结果请写入内容总结，无需额外添加完成消息。",
         400,
       );
     }
@@ -2594,6 +3156,7 @@ export async function recordManagedDeliveryOperation(input: {
       input.ticketId,
       true,
     );
+    assertManagedTicketCanBeExecutedByAdmin(ticket);
     assertDeliveryTicketServiceEligibility(portal, ticket.type);
     const duplicate = await tx
       .select({ id: deliveryTicketEvents.id })

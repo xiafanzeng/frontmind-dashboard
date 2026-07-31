@@ -3,9 +3,7 @@ import {
   CreditCard,
   ClipboardList,
   Database,
-  Eye,
   FileArchive,
-  History,
   KeyRound,
   Loader2,
   LockKeyhole,
@@ -21,6 +19,7 @@ import { useAuth } from "@/_core/hooks/useAuth";
 import DashboardSkeletonEditor from "@/components/DashboardSkeletonEditor";
 import DashboardVersionHistory from "@/components/DashboardVersionHistory";
 import AdminDeliveryTicketWorkspace from "@/components/AdminDeliveryTicketWorkspace";
+import CustomerDashboardMirror from "@/components/CustomerDashboardMirror";
 import KnowledgeBaseViewer from "@/components/KnowledgeBaseViewer";
 import KnowledgeBaseProgressPanel from "@/components/KnowledgeBaseProgressPanel";
 import ManagerAssignmentEditor from "@/components/ManagerAssignmentEditor";
@@ -34,7 +33,6 @@ import {
   type WorkspaceTab,
 } from "@/lib/admin-workspace-tabs";
 import { trpc } from "@/lib/trpc";
-import { auditActionLabel, auditEventDetail } from "@/lib/audit-display";
 import { getAdminNav } from "@/pages/AdminDashboard";
 import { CreateUserDialog } from "@/pages/AdminUsers";
 
@@ -50,17 +48,28 @@ export function canCreateManagedCustomer(
 }
 
 export const ADMIN_WORKSPACE_TABS = [
-  { value: "service", label: "套餐与问题", icon: PackageCheck },
+  { value: "service", label: "用户流程", icon: PackageCheck },
   { value: "knowledge", label: "知识库流程", icon: Database },
-  { value: "tickets", label: "工单与官网", icon: ClipboardList },
-  { value: "delivery", label: "客户看板展示", icon: Database },
+  { value: "tickets", label: "工单", icon: ClipboardList },
   { value: "credential", label: "客户 Key 与积分", icon: KeyRound },
-  { value: "activity", label: "操作记录", icon: History },
 ] as const satisfies ReadonlyArray<{
   value: WorkspaceTab;
   label: string;
   icon: typeof PackageCheck;
 }>;
+
+export function adminWorkspaceTabsForAccess(input: {
+  isSystemAdmin: boolean;
+  canViewSelectedUserUsage: boolean;
+}) {
+  return ADMIN_WORKSPACE_TABS.filter(({ value }) => {
+    if (input.isSystemAdmin) {
+      return value !== "credential" || input.canViewSelectedUserUsage;
+    }
+    if (value === "service" || value === "tickets") return true;
+    return value === "credential" && input.canViewSelectedUserUsage;
+  });
+}
 
 const QUESTION_CATEGORY_LABELS: Record<string, string> = {
   industry: "行业词",
@@ -265,15 +274,19 @@ function AdminQuestionRow({
           <p className="m-0 text-xs leading-5 text-[#716a80]">
             确认后将锁定该问题，并占用当前服务周期对应类别额度。
           </p>
-          <Button
-            size="sm"
-            className="bg-[#5b2a86] hover:bg-[#49216c]"
-            disabled={!canConfirm || confirming}
-            onClick={() => void onConfirm()}
-          >
-            {confirming && <Loader2 className="h-4 w-4 animate-spin" />}
-            {canConfirm ? "确认启动并占用额度" : "等待管理员确认"}
-          </Button>
+          {canConfirm ? (
+            <Button
+              size="sm"
+              className="bg-[#5b2a86] hover:bg-[#49216c]"
+              disabled={confirming}
+              onClick={() => void onConfirm()}
+            >
+              {confirming && <Loader2 className="h-4 w-4 animate-spin" />}
+              系统管理员异常接管
+            </Button>
+          ) : (
+            <Badge variant="outline">等待监控工程师确认</Badge>
+          )}
         </div>
       )}
       {(question.evidence?.length || question.quotaPeriodId) && (
@@ -363,6 +376,11 @@ export default function AdminWorkspace({
       (workspaceQuery.data?.isSystemAdmin ||
         selectedUser.usageOwner?.adminId === user?.id),
   );
+  const isSystemAdmin = Boolean(workspaceQuery.data?.isSystemAdmin);
+  const availableTabs = adminWorkspaceTabsForAccess({
+    isSystemAdmin,
+    canViewSelectedUserUsage,
+  });
 
   useEffect(() => {
     setSelectedUserId(initialUserId);
@@ -371,8 +389,10 @@ export default function AdminWorkspace({
   useEffect(() => {
     if (
       workspaceQuery.data &&
-      !workspaceQuery.data.isSystemAdmin &&
-      !["service", "activity"].includes(tab)
+      !adminWorkspaceTabsForAccess({
+        isSystemAdmin: workspaceQuery.data.isSystemAdmin,
+        canViewSelectedUserUsage,
+      }).some(({ value }) => value === tab)
     ) {
       setTab("service");
       if (selectedUserId) {
@@ -381,7 +401,13 @@ export default function AdminWorkspace({
         });
       }
     }
-  }, [selectedUserId, setLocation, tab, workspaceQuery.data]);
+  }, [
+    canViewSelectedUserUsage,
+    selectedUserId,
+    setLocation,
+    tab,
+    workspaceQuery.data,
+  ]);
 
   const queryInput = { userId: selectedUserId || 1 };
   const dashboardQuery = trpc.admin.workspace.dashboard.useQuery(queryInput, {
@@ -424,24 +450,6 @@ export default function AdminWorkspace({
     retry: false,
     staleTime: 60_000,
   });
-  const auditQuery = (trpc.admin as any).controlPlane.audit.useQuery(
-    {
-      workspaceUserId: selectedUserId || undefined,
-      limit: 100,
-    },
-    {
-      enabled: Boolean(selectedUser),
-      retry: false,
-    },
-  );
-  const taskActivityQuery = trpc.admin.workspace.taskActivity.useQuery(
-    queryInput,
-    {
-      enabled: Boolean(selectedUser),
-      retry: false,
-    },
-  );
-
   const assignmentMutation = trpc.admin.workspace.assignments.useMutation({
     onSuccess: (data) => {
       utils.admin.workspace.list.setData(undefined, data);
@@ -900,12 +908,7 @@ export default function AdminWorkspace({
               )}
 
               <div className="mt-6 flex flex-wrap gap-2 border-t border-[#eee8f2] pt-4">
-                {ADMIN_WORKSPACE_TABS.filter(
-                  ({ value }) =>
-                    (workspaceQuery.data?.isSystemAdmin ||
-                      ["service", "activity"].includes(value)) &&
-                    (value !== "credential" || canViewSelectedUserUsage),
-                ).map(({ value, label, icon: Icon }) => (
+                {availableTabs.map(({ value, label, icon: Icon }) => (
                   <button
                     key={value}
                     type="button"
@@ -925,16 +928,6 @@ export default function AdminWorkspace({
                     {label}
                   </button>
                 ))}
-                <Button
-                  variant="outline"
-                  className="ml-auto border-[#dcd1e3] bg-white text-[#5b2a86]"
-                  onClick={() =>
-                    setLocation(`/admin/customers/${selectedUser.id}/preview`)
-                  }
-                >
-                  <Eye className="h-4 w-4" />
-                  只读验收
-                </Button>
               </div>
             </PortalCard>
 
@@ -971,7 +964,9 @@ export default function AdminWorkspace({
                         )}
                       </p>
                       <p className="mt-1 text-xs text-[#9a94a8]">
-                        商业权益仅系统管理员可调整；所属管理员可查看并维护交付内容。
+                        {workspaceQuery.data?.isSystemAdmin
+                          ? "商业权益仅系统管理员可调整；正式内容编辑只用于初始化和异常治理，正常交付由对应工程师完成。"
+                          : "交付管理员查看客户正式页面并协调对应工程师；不能直接修改或发布岗位交付内容。"}
                       </p>
                     </div>
                   </div>
@@ -1231,9 +1226,7 @@ export default function AdminWorkspace({
                               const targetTab: WorkspaceTab =
                                 step.id === "knowledge"
                                   ? "knowledge"
-                                  : step.id === "question"
-                                    ? "service"
-                                    : "delivery";
+                                  : "service";
                               setTab(targetTab);
                               setLocation(
                                 `/admin/customers/${selectedUser.id}/${targetTab}`,
@@ -1344,7 +1337,10 @@ export default function AdminWorkspace({
                   <div>
                     <h3 className="font-semibold text-[#171321]">企业问题库</h3>
                     <p className="mt-1 text-sm leading-6 text-[#716a80]">
-                      展示模型候选、已购问题与当前选题。接管该客户的管理员可以调整文字并锁定需要保留的候选项。
+                      展示模型候选、已购问题与当前选题。
+                      {isSystemAdmin
+                        ? "系统管理员仅在异常接管时调整或确认；正常流程由监控与优化工程师审核。"
+                        : "交付管理员在这里查看和协调，正常审核由监控与优化工程师完成。"}
                     </p>
                   </div>
                   <div className="mt-5 grid gap-3">
@@ -1365,9 +1361,9 @@ export default function AdminWorkspace({
                           <AdminQuestionRow
                             key={question.id}
                             question={question}
-                            editable={true}
+                            editable={isSystemAdmin}
                             saving={updateQuestionMutation.isPending}
-                            canConfirm={true}
+                            canConfirm={isSystemAdmin}
                             confirming={
                               confirmQuestionSelectionMutation.isPending
                             }
@@ -1421,7 +1417,7 @@ export default function AdminWorkspace({
               </div>
             )}
 
-            {tab === "delivery" &&
+            {tab === "service" &&
               (dashboardQuery.error ? (
                 <PortalCard className="border-[#ebc8d4] bg-[#fff8fa] p-6 text-sm text-[#a02652]">
                   <p className="font-semibold">交付内容暂时无法载入</p>
@@ -1431,36 +1427,63 @@ export default function AdminWorkspace({
                 </PortalCard>
               ) : (
                 <div className="space-y-5">
-                  <DashboardSkeletonEditor
-                    userId={selectedUser.id}
-                    workspace={dashboardQuery.data}
-                    loading={dashboardQuery.isLoading}
-                    profileOnly={false}
-                    authoritativeQuestions={
-                      serviceQuery.data?.purchasedQuestions
-                    }
-                    authoritativeQuestionsLoading={serviceQuery.isLoading}
-                    authoritativeQuestionsError={
-                      serviceQuery.error?.message ?? null
-                    }
-                    onWorkspaceChanged={async () => {
-                      await Promise.all([
-                        dashboardQuery.refetch(),
-                        workspaceQuery.refetch(),
-                        serviceQuery.refetch(),
-                        questionPortfolioQuery.refetch(),
-                      ]);
-                    }}
-                  />
-                  <DashboardVersionHistory
-                    userId={selectedUser.id}
-                    onWorkspaceChanged={async () => {
-                      await Promise.all([
-                        dashboardQuery.refetch(),
-                        workspaceQuery.refetch(),
-                      ]);
-                    }}
-                  />
+                  {isSystemAdmin ? (
+                    <>
+                      <DashboardSkeletonEditor
+                        userId={selectedUser.id}
+                        workspace={dashboardQuery.data}
+                        loading={dashboardQuery.isLoading}
+                        profileOnly={false}
+                        authoritativeQuestions={
+                          serviceQuery.data?.purchasedQuestions
+                        }
+                        authoritativeQuestionsLoading={serviceQuery.isLoading}
+                        authoritativeQuestionsError={
+                          serviceQuery.error?.message ?? null
+                        }
+                        onWorkspaceChanged={async () => {
+                          await Promise.all([
+                            dashboardQuery.refetch(),
+                            workspaceQuery.refetch(),
+                            serviceQuery.refetch(),
+                            questionPortfolioQuery.refetch(),
+                          ]);
+                        }}
+                      />
+                      <DashboardVersionHistory
+                        userId={selectedUser.id}
+                        onWorkspaceChanged={async () => {
+                          await Promise.all([
+                            dashboardQuery.refetch(),
+                            workspaceQuery.refetch(),
+                          ]);
+                        }}
+                      />
+                    </>
+                  ) : dashboardQuery.isLoading ? (
+                    <PortalCard className="p-8 text-center text-sm text-[#716a80]">
+                      <Loader2 className="mx-auto mb-3 h-5 w-5 animate-spin" />
+                      正在读取客户正式页面…
+                    </PortalCard>
+                  ) : dashboardQuery.data?.payload ? (
+                    <CustomerDashboardMirror
+                      payload={dashboardQuery.data.payload}
+                      allowedSections={[
+                        "brand",
+                        "keywords",
+                        "questions",
+                        "monitoring",
+                        "report",
+                        "content",
+                      ]}
+                      heading="客户正式页面协调视图"
+                      description="这里与客户当前正式版本一致。交付管理员用于核对结果、回复客户和催办对应工程师，不能在此代替工程师修改或发布内容。"
+                    />
+                  ) : (
+                    <PortalCard className="p-8 text-center text-sm text-[#716a80]">
+                      该客户尚未发布正式用户页面；请先确认项目岗位是否已配齐，并协调对应工程师处理。
+                    </PortalCard>
+                  )}
                 </div>
               ))}
 
@@ -1472,9 +1495,11 @@ export default function AdminWorkspace({
                   selectedUser.displayName ||
                   selectedUser.username
                 }
+                customerUsername={selectedUser.username}
                 servicePlanCode={selectedUser.service?.planCode}
                 serviceStatus={selectedUser.service?.status}
-                canAdjustQuota={Boolean(workspaceQuery.data?.isSystemAdmin)}
+                canAdjustQuota={isSystemAdmin}
+                canExecuteDelivery={isSystemAdmin}
               />
             )}
 
@@ -1902,156 +1927,6 @@ export default function AdminWorkspace({
                 与积分由主负责人维护。协作管理员可以继续处理交付内容，但不能查看该客户的
                 Key 使用信息。
               </PortalCard>
-            )}
-
-            {tab === "activity" && (
-              <div className="space-y-5">
-                <PortalCard className="overflow-hidden">
-                  <div className="border-b border-[#eee8f2] p-5 sm:p-6">
-                    <h3 className="font-semibold text-[#171321]">
-                      客户智能体任务
-                    </h3>
-                    <p className="mt-2 text-sm leading-6 text-[#716a80]">
-                      展示最近 100 条持久化任务的真实状态、模型、耗时与错误。
-                    </p>
-                  </div>
-                  {taskActivityQuery.isLoading ? (
-                    <p className="p-6 text-sm text-[#716a80]">
-                      正在读取任务记录…
-                    </p>
-                  ) : taskActivityQuery.error ? (
-                    <p className="p-6 text-sm text-[#a02652]">
-                      {taskActivityQuery.error.message ||
-                        "任务记录暂时无法载入"}
-                    </p>
-                  ) : taskActivityQuery.data?.turns.length ? (
-                    <>
-                      <div className="grid grid-cols-2 gap-2 border-b border-[#eee8f2] p-4 sm:grid-cols-5">
-                        {[
-                          ["排队", taskActivityQuery.data.counts.queued],
-                          ["执行中", taskActivityQuery.data.counts.running],
-                          ["已完成", taskActivityQuery.data.counts.completed],
-                          ["失败", taskActivityQuery.data.counts.failed],
-                          ["已取消", taskActivityQuery.data.counts.cancelled],
-                        ].map(([label, value]) => (
-                          <div
-                            key={String(label)}
-                            className="rounded-xl bg-[#f8f5fa] p-3"
-                          >
-                            <p className="text-xs text-[#857e91]">
-                              {String(label)}
-                            </p>
-                            <p className="mt-1 text-xl font-semibold text-[#332842]">
-                              {Number(value)}
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="max-h-[480px] divide-y divide-[#eee8f2] overflow-y-auto custom-scrollbar">
-                        {taskActivityQuery.data.turns.map((turn) => (
-                          <article
-                            key={turn.id}
-                            className="grid gap-2 px-5 py-4 sm:grid-cols-[minmax(0,1fr)_110px_130px_180px] sm:items-center sm:px-6"
-                          >
-                            <div className="min-w-0">
-                              <p className="truncate font-mono text-xs font-semibold text-[#484057]">
-                                {turn.conversationId}
-                              </p>
-                              {turn.errorMessage && (
-                                <p className="mt-1 line-clamp-2 text-xs leading-5 text-[#a02652]">
-                                  {turn.errorMessage}
-                                </p>
-                              )}
-                            </div>
-                            <span className="text-xs text-[#716a80]">
-                              {turn.model || "未记录"}
-                            </span>
-                            <span className="text-xs font-semibold text-[#5b2a86]">
-                              {turn.status}
-                            </span>
-                            <span className="text-xs text-[#857e91] sm:text-right">
-                              {displayDuration(turn.durationMs)}
-                            </span>
-                          </article>
-                        ))}
-                      </div>
-                    </>
-                  ) : (
-                    <p className="p-6 text-sm text-[#716a80]">
-                      当前客户尚无持久化任务记录。
-                    </p>
-                  )}
-                </PortalCard>
-
-                <PortalCard className="overflow-hidden">
-                  <div className="border-b border-[#eee8f2] p-5 sm:p-6">
-                    <div className="flex items-center gap-2">
-                      <History className="h-5 w-5 text-[#5b2a86]" />
-                      <h3 className="font-semibold text-[#171321]">
-                        客户工作区操作记录
-                      </h3>
-                    </div>
-                    <p className="mt-2 text-sm leading-6 text-[#716a80]">
-                      记录权限、套餐、知识库、问题、内容、密钥与发布操作；
-                      密钥和敏感元数据只保留脱敏信息。
-                    </p>
-                  </div>
-                  {auditQuery.isLoading ? (
-                    <p className="p-6 text-sm text-[#716a80]">
-                      正在读取操作记录…
-                    </p>
-                  ) : auditQuery.error ? (
-                    <p className="p-6 text-sm text-[#a02652]">
-                      {auditQuery.error.message || "操作记录暂时无法载入"}
-                    </p>
-                  ) : auditQuery.data?.events?.length ? (
-                    <div className="divide-y divide-[#eee8f2]">
-                      {auditQuery.data.events.map((event: any) => (
-                        <article
-                          key={event.id}
-                          className="grid gap-2 px-5 py-4 sm:grid-cols-[170px_minmax(0,1fr)_180px] sm:px-6"
-                        >
-                          <div>
-                            <p className="text-sm font-semibold text-[#332842]">
-                              {event.actorUsername || "系统"}
-                            </p>
-                            <p className="mt-1 text-xs text-[#9a94a8]">
-                              {event.actorAccessLevel === "system_admin"
-                                ? "系统管理员"
-                                : event.actorAccessLevel === "delivery_admin"
-                                  ? "交付管理员"
-                                  : "系统"}
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-sm font-medium text-[#484057]">
-                              {auditActionLabel(event.action)}
-                            </p>
-                            <p className="mt-1 text-xs leading-5 text-[#857e91]">
-                              {auditEventDetail(
-                                event,
-                                selectedUser?.displayName ||
-                                  selectedUser?.username,
-                              )}
-                            </p>
-                          </div>
-                          <time className="text-xs text-[#9a94a8] sm:text-right">
-                            {event.createdAt
-                              ? new Date(event.createdAt).toLocaleString(
-                                  "zh-CN",
-                                )
-                              : "时间未记录"}
-                          </time>
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="p-6 text-sm text-[#716a80]">
-                      当前客户尚无可显示的操作记录。
-                    </p>
-                  )}
-                </PortalCard>
-              </div>
             )}
           </div>
         )}

@@ -39,11 +39,6 @@ const AdminWorkspace = lazy(() =>
     default: component,
   })),
 );
-const AdminCustomerPreview = lazy(() =>
-  import("./pages/AdminCustomerPreview").then(({ default: component }) => ({
-    default: component,
-  })),
-);
 const AdminUsers = lazy(() =>
   import("./pages/AdminUsers").then(({ default: component }) => ({
     default: component,
@@ -142,17 +137,6 @@ function Router() {
         <AdminOnly>
           <AdminWorkspace />
         </AdminOnly>
-      </Route>
-      <Route path={"/admin/customers/:userId/preview"}>
-        {(params) => {
-          const userId = Number(params.userId);
-          if (!Number.isInteger(userId) || userId <= 0) return <NotFound />;
-          return (
-            <AdminOnly>
-              <AdminCustomerPreview userId={userId} />
-            </AdminOnly>
-          );
-        }}
       </Route>
       <Route path={"/admin/customers/:userId/:tab"}>
         {(params) => {

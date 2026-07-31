@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import {
-  Activity,
   BriefcaseBusiness,
   Check,
   CheckCircle2,
@@ -10,7 +9,6 @@ import {
   Database,
   Download,
   FileArchive,
-  FileText,
   Gauge,
   History,
   KeyRound,
@@ -31,6 +29,9 @@ import { toast } from "sonner";
 
 import KnowledgeBaseViewer from "@/components/KnowledgeBaseViewer";
 import AdminDeliveryTicketWorkspace from "@/components/AdminDeliveryTicketWorkspace";
+import CustomerDashboardMirror, {
+  type CustomerDashboardMirrorSection,
+} from "@/components/CustomerDashboardMirror";
 import ManagerAssignmentEditor from "@/components/ManagerAssignmentEditor";
 import PortalShell, { PortalCard } from "@/components/PortalShell";
 import { Badge } from "@/components/ui/badge";
@@ -52,6 +53,7 @@ import {
   type PreviewAdminAccessLevel,
 } from "@/lib/preview-navigation";
 import AdminAgent from "@/pages/AdminAgent";
+import type { DashboardPayload } from "@shared/dashboard";
 
 const knowledgeNodes = [
   "企业身份与定位",
@@ -426,13 +428,7 @@ export function PreviewAdminPresales() {
   );
 }
 
-type PreviewWorkspaceTab =
-  | "service"
-  | "knowledge"
-  | "tickets"
-  | "delivery"
-  | "credential"
-  | "activity";
+type PreviewWorkspaceTab = "service" | "knowledge" | "tickets" | "credential";
 
 type PreviewManagedUser = {
   id: number;
@@ -495,14 +491,9 @@ export function PreviewAdminUsers({
   const [tab, setTab] = useState<PreviewWorkspaceTab>(() => {
     if (typeof window === "undefined") return "service";
     const requested = new URLSearchParams(window.location.search).get("tab");
-    return [
-      "service",
-      "knowledge",
-      "tickets",
-      "delivery",
-      "credential",
-      "activity",
-    ].includes(requested || "")
+    return ["service", "knowledge", "tickets", "credential"].includes(
+      requested || "",
+    )
       ? (requested as PreviewWorkspaceTab)
       : "service";
   });
@@ -669,12 +660,10 @@ export function PreviewAdminUsers({
             <div className="mt-6 flex flex-wrap gap-2 border-t border-[#eee8f2] pt-4">
               {(
                 [
-                  ["service", "套餐与问题", PackageCheck],
+                  ["service", "用户流程", PackageCheck],
                   ["knowledge", "知识库流程", Database],
-                  ["tickets", "工单与官网", ClipboardList],
-                  ["delivery", "客户看板展示", FileText],
+                  ["tickets", "工单", ClipboardList],
                   ["credential", "API Key 与积分", KeyRound],
-                  ["activity", "操作记录", History],
                 ] as const
               ).map(([value, label, Icon]) => (
                 <button
@@ -695,17 +684,20 @@ export function PreviewAdminUsers({
           </PortalCard>
 
           {tab === "service" && (
-            <PreviewServiceManager
-              userName={selectedUser.name}
-              plan={servicePlans[selectedId] || "basic"}
-              editable={systemAdmin}
-              onPlanChange={(plan) =>
-                setServicePlans((current) => ({
-                  ...current,
-                  [selectedId]: plan,
-                }))
-              }
-            />
+            <div className="space-y-5">
+              <PreviewServiceManager
+                userName={selectedUser.name}
+                plan={servicePlans[selectedId] || "basic"}
+                editable={systemAdmin}
+                onPlanChange={(plan) =>
+                  setServicePlans((current) => ({
+                    ...current,
+                    [selectedId]: plan,
+                  }))
+                }
+              />
+              <PreviewDeliveryControl userName={selectedUser.name} />
+            </div>
           )}
           {tab === "knowledge" && (
             <>
@@ -735,14 +727,13 @@ export function PreviewAdminUsers({
               <KnowledgeBaseViewer snapshot={previewKnowledgeSnapshot} />
             </>
           )}
-          {tab === "delivery" && (
-            <PreviewDeliveryControl userName={selectedUser.name} />
-          )}
           {tab === "tickets" && (
             <AdminDeliveryTicketWorkspace
               userId={selectedUser.id}
               enterpriseName={selectedUser.name}
+              customerUsername={selectedUser.username}
               canAdjustQuota={systemAdmin}
+              canExecuteDelivery={systemAdmin}
               preview
               previewFixtures={adminDeliveryTicketPreviewFixtures}
             />
@@ -754,7 +745,6 @@ export function PreviewAdminUsers({
               onApiKeyChange={setApiKey}
             />
           )}
-          {tab === "activity" && <PreviewWorkspaceActivity />}
         </div>
       </div>
     </PortalShell>
@@ -823,6 +813,93 @@ export const previewDeliveryModules = [
   },
 ] as const;
 
+const previewCustomerDashboardPayload: DashboardPayload = {
+  brandName: "验收企业",
+  headline: "企业级 GEO 用户流程",
+  summary: "这里展示管理员发布后客户实际看到的品牌资料与阶段交付结果。",
+  metrics: [
+    { label: "正式问题", value: 8, unit: "项" },
+    { label: "监控回答", value: 24, unit: "条" },
+  ],
+  sections: [
+    {
+      id: "brand-overview",
+      title: "品牌建设",
+      subtitle: "客户可见的企业事实与品牌内容",
+      body: "企业资料、核心优势、产品服务和公开证据均在此持续更新。",
+      items: [
+        {
+          title: "核心优势",
+          description: "研发、产品与交付能力已经完成结构化整理。",
+          meta: "客户正式版本",
+        },
+      ],
+      tables: [],
+    },
+  ],
+  keywordTables: [
+    {
+      id: "global-keywords",
+      title: "品牌全域词库",
+      columns: ["问题词", "场景", "优先级"],
+      rows: [["如何选择企业级 GEO 服务？", "方案选型", "重点覆盖"]],
+    },
+  ],
+  questions: [
+    {
+      id: "question-1",
+      groupId: "scenario",
+      groupTitle: "产品场景词",
+      groupSubtitle: "决策问题",
+      tone: "teal",
+      question: "企业如何建立可被 AI 准确引用的品牌知识？",
+      intent: "了解知识库、内容与监控之间的完整交付关系。",
+      summary: "已由客户提交并完成审核。",
+    },
+  ],
+  monitoringAnswers: [
+    {
+      id: "answer-1",
+      questionId: "question-1",
+      platform: "AI 搜索平台",
+      collectedAt: "2026-07-30",
+      answerNo: 1,
+      content: "当前回答已经能够引用企业官网与公开媒体中的核心事实。",
+      citationCount: 1,
+      screenshotUrl: "",
+      citations: [
+        {
+          id: "citation-1",
+          title: "企业官网",
+          url: "https://example.com",
+          media: "官网",
+        },
+      ],
+    },
+  ],
+  citations: [],
+  contentAssets: [
+    {
+      id: "content-1",
+      group: "FAQ",
+      name: "AI 友好问答内容",
+      description: "围绕客户已确认问题生成并发布的结构化内容。",
+      wordRange: "800–1200 字",
+      scene: "官网 FAQ",
+      articles: [
+        {
+          id: "article-1",
+          title: "企业如何建立品牌全域知识库？",
+          intro: "从品牌事实、问题目录到持续监控形成统一闭环。",
+          sections: [],
+        },
+      ],
+    },
+  ],
+  optimizationReport: null,
+  progressReports: [],
+};
+
 function downloadPreviewDeliveryTemplate(
   module: (typeof previewDeliveryModules)[number],
 ) {
@@ -841,6 +918,16 @@ function downloadPreviewDeliveryTemplate(
 
 export function PreviewDeliveryControl({ userName }: { userName: string }) {
   const [revision, setRevision] = useState(6);
+  const [previewSection, setPreviewSection] =
+    useState<CustomerDashboardMirrorSection>("brand");
+  const previewPayload = useMemo(
+    () => ({
+      ...previewCustomerDashboardPayload,
+      brandName: userName,
+      headline: `${userName} · GEO 用户流程`,
+    }),
+    [userName],
+  );
 
   const publishSample = (title: string) => {
     setRevision((current) => current + 1);
@@ -854,16 +941,18 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
       <PortalCard className="overflow-hidden">
         <div className="flex flex-col gap-4 border-b border-[#e8e1ee] bg-[linear-gradient(135deg,#fbf8fd,#f4edf8)] p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
           <div>
-            <p className="text-xs font-semibold text-[#5b2a86]">客户看板预览</p>
+            <p className="text-xs font-semibold text-[#5b2a86]">
+              用户流程内容管理
+            </p>
             <h3 className="mt-1 font-semibold text-[#171321]">{userName}</h3>
             <p className="mt-2 text-sm leading-6 text-[#716a80]">
-              上传或编辑后先预览，再发布到该用户的固定看板结构。
+              按用户真实页面分区维护品牌内容、问题监控、进度报告与内容资产。
             </p>
           </div>
           <div className="flex gap-2">
             <Button
               variant="outline"
-              onClick={() => toast.success("已打开未发布内容预览样式")}
+              onClick={() => setPreviewSection("brand")}
             >
               预览
             </Button>
@@ -875,6 +964,14 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
             </Button>
           </div>
         </div>
+        <div className="border-b border-[#e8e1ee] bg-[#f6f3f8] p-4 sm:p-6">
+          <CustomerDashboardMirror
+            payload={previewPayload}
+            initialSection={previewSection}
+            heading="用户当前所见"
+            description="所有分区均读取与用户端相同的数据，发布前可在这里逐项核对。"
+          />
+        </div>
         <div className="grid gap-3 p-5 sm:grid-cols-2 sm:p-6 xl:grid-cols-3">
           {previewDeliveryModules.map((module) => (
             <article
@@ -884,6 +981,16 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
               <p className="font-semibold text-[#332842]">{module.title}</p>
               <p className="mt-1 text-xs text-[#857e91]">{module.format}</p>
               <div className="mt-4 grid gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() =>
+                    setPreviewSection(previewSectionForModule(module.key))
+                  }
+                >
+                  预览用户所见
+                </Button>
                 <Button
                   size="sm"
                   variant="outline"
@@ -912,7 +1019,7 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
           <div>
             <div className="flex items-center gap-2">
               <History className="h-5 w-5 text-[#5b2a86]" />
-              <h3 className="font-semibold text-[#171321]">看板骨架发布历史</h3>
+              <h3 className="font-semibold text-[#171321]">交付内容发布历史</h3>
             </div>
             <p className="mt-2 text-sm text-[#716a80]">
               仅记录企业资料、指标与看板板块；其他业务内容由各自模块管理。恢复历史时会生成新版本，不会覆盖旧记录。
@@ -965,69 +1072,17 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
   );
 }
 
-function PreviewWorkspaceActivity() {
-  const tasks = [
-    ["知识库构建", "Pro", "已完成", "18 分 42 秒"],
-    ["应答逻辑智能体", "Pro", "执行中", "3 分 16 秒"],
-    ["监控数据导入", "—", "已完成", "12 秒"],
-  ];
-  const audits = [
-    ["FrontMind Admin", "发布知识库版本", "今天 15:24"],
-    ["王晨", "导入问题监控与引用", "今天 14:08"],
-    ["FrontMind Admin", "更新套餐合同", "昨天 18:32"],
-  ];
-
-  return (
-    <div className="space-y-5">
-      <PortalCard className="overflow-hidden">
-        <div className="border-b border-[#e8e1ee] p-5 sm:p-6">
-          <h3 className="font-semibold text-[#171321]">客户智能体任务</h3>
-          <p className="mt-2 text-sm text-[#716a80]">
-            查看真实模型、执行状态、耗时与失败原因。
-          </p>
-        </div>
-        <div className="divide-y divide-[#eee8f2]">
-          {tasks.map(([title, model, status, duration]) => (
-            <article
-              key={title}
-              className="grid gap-2 px-5 py-4 sm:grid-cols-[minmax(0,1fr)_90px_100px_130px] sm:items-center sm:px-6"
-            >
-              <p className="font-medium text-[#484057]">{title}</p>
-              <span className="text-xs text-[#716a80]">{model}</span>
-              <span className="text-xs font-semibold text-[#5b2a86]">
-                {status}
-              </span>
-              <span className="text-xs text-[#857e91] sm:text-right">
-                {duration}
-              </span>
-            </article>
-          ))}
-        </div>
-      </PortalCard>
-      <PortalCard className="overflow-hidden">
-        <div className="border-b border-[#e8e1ee] p-5 sm:p-6">
-          <h3 className="font-semibold text-[#171321]">工作区操作记录</h3>
-          <p className="mt-2 text-sm text-[#716a80]">
-            套餐、权限、密钥、内容发布和恢复操作均保留审计记录。
-          </p>
-        </div>
-        <div className="divide-y divide-[#eee8f2]">
-          {audits.map(([actor, action, date]) => (
-            <article
-              key={`${actor}-${action}`}
-              className="grid gap-2 px-5 py-4 sm:grid-cols-[180px_minmax(0,1fr)_150px] sm:px-6"
-            >
-              <strong className="text-sm text-[#332842]">{actor}</strong>
-              <span className="text-sm text-[#484057]">{action}</span>
-              <time className="text-xs text-[#857e91] sm:text-right">
-                {date}
-              </time>
-            </article>
-          ))}
-        </div>
-      </PortalCard>
-    </div>
-  );
+function previewSectionForModule(
+  module: (typeof previewDeliveryModules)[number]["key"],
+): CustomerDashboardMirrorSection {
+  if (module === "keyword-bank") return "keywords";
+  if (module === "questions" || module === "response-logic") {
+    return "questions";
+  }
+  if (module === "monitoring") return "monitoring";
+  if (module === "progress-report") return "report";
+  if (module === "content-assets") return "content";
+  return "brand";
 }
 
 function PreviewServiceManager({

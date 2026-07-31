@@ -47,6 +47,7 @@ import {
 import { preparedFileService } from "./prepared-file-service";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
+import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
 
 const router = Router();
 
@@ -306,7 +307,7 @@ function sanitizeText(text: string): string {
     const sourceLower = getSourceBrandLower();
     const sourceTitle = getSourceBrandTitle();
     const sourceUpper = sourceLower.toUpperCase();
-    return text
+    const sanitized = text
       .replace(
         new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"),
         "https://api.frontmind.",
@@ -331,6 +332,7 @@ function sanitizeText(text: string): string {
         new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"),
         "frontmind",
       );
+    return normalizeKnowledgeCollectionCopy(sanitized);
   } catch (e) {
     console.error("[sanitizeText] Error:", e);
     return text;

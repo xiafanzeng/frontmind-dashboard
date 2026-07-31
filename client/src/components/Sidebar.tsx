@@ -209,27 +209,25 @@ export default function Sidebar({
 
       {/* New Chat Button */}
       <div className="relative z-10 px-3 pt-3 pb-1 flex-shrink-0">
-        {showSettings && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                onClick={() => createConversation()}
-                variant="outline"
-                className={cn(
-                  "w-full border-border/70 bg-card/70 hover:bg-card text-sidebar-foreground hover:text-foreground transition-all duration-200 shadow-sm",
-                  collapsed ? "px-0 justify-center" : "justify-start gap-2",
-                )}
-                size="sm"
-              >
-                <Plus className="w-4 h-4 flex-shrink-0" />
-                {!collapsed && <span className="text-sm">新内容流程</span>}
-              </Button>
-            </TooltipTrigger>
-            {collapsed && (
-              <TooltipContent side="right">新内容流程</TooltipContent>
-            )}
-          </Tooltip>
-        )}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              onClick={() => createConversation()}
+              variant="outline"
+              className={cn(
+                "w-full border-border/70 bg-card/70 hover:bg-card text-sidebar-foreground hover:text-foreground transition-all duration-200 shadow-sm",
+                collapsed ? "px-0 justify-center" : "justify-start gap-2",
+              )}
+              size="sm"
+            >
+              <Plus className="w-4 h-4 flex-shrink-0" />
+              {!collapsed && <span className="text-sm">新内容流程</span>}
+            </Button>
+          </TooltipTrigger>
+          {collapsed && (
+            <TooltipContent side="right">新内容流程</TooltipContent>
+          )}
+        </Tooltip>
       </div>
 
       {/* Conversation List */}
@@ -308,31 +306,33 @@ export default function Sidebar({
           </Tooltip>
         )}
 
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              onClick={onOpenSettings}
-              variant="ghost"
-              className={cn(
-                "w-full text-muted-foreground hover:text-foreground hover:bg-card/70",
-                collapsed ? "px-0 justify-center" : "justify-start gap-2",
-              )}
-              size="sm"
-            >
-              <Settings className="w-4 h-4 flex-shrink-0" />
-              {!collapsed && (
-                <span className="text-xs">
-                  {showAccountMenu ? "设置" : "API Key 与积分"}
-                </span>
-              )}
-            </Button>
-          </TooltipTrigger>
-          {collapsed && (
-            <TooltipContent side="right">
-              {showAccountMenu ? "设置" : "API Key 与积分"}
-            </TooltipContent>
-          )}
-        </Tooltip>
+        {showSettings && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                onClick={onOpenSettings}
+                variant="ghost"
+                className={cn(
+                  "w-full text-muted-foreground hover:text-foreground hover:bg-card/70",
+                  collapsed ? "px-0 justify-center" : "justify-start gap-2",
+                )}
+                size="sm"
+              >
+                <Settings className="w-4 h-4 flex-shrink-0" />
+                {!collapsed && (
+                  <span className="text-xs">
+                    {showAccountMenu ? "设置" : "API Key 与积分"}
+                  </span>
+                )}
+              </Button>
+            </TooltipTrigger>
+            {collapsed && (
+              <TooltipContent side="right">
+                {showAccountMenu ? "设置" : "API Key 与积分"}
+              </TooltipContent>
+            )}
+          </Tooltip>
+        )}
 
         {showAccountMenu && (
           <AccountMenu collapsed={collapsed} onOpenSettings={onOpenSettings} />
@@ -573,17 +573,15 @@ function SidebarInner({
 
       {/* New Chat Button */}
       <div className="relative z-10 shrink-0 px-3 pb-1 pt-3">
-        {showSettings && (
-          <Button
-            onClick={() => createConversation()}
-            variant="outline"
-            className="w-full justify-start gap-2 border-border/70 bg-card/70 text-sidebar-foreground shadow-sm transition-all duration-200 hover:bg-card hover:text-foreground"
-            size="sm"
-          >
-            <Plus className="w-4 h-4 flex-shrink-0" />
-            <span className="text-sm">新内容流程</span>
-          </Button>
-        )}
+        <Button
+          onClick={() => createConversation()}
+          variant="outline"
+          className="w-full justify-start gap-2 border-border/70 bg-card/70 text-sidebar-foreground shadow-sm transition-all duration-200 hover:bg-card hover:text-foreground"
+          size="sm"
+        >
+          <Plus className="w-4 h-4 flex-shrink-0" />
+          <span className="text-sm">新内容流程</span>
+        </Button>
       </div>
 
       {/* Conversation List */}
@@ -640,17 +638,19 @@ function SidebarInner({
             <span className="text-xs">售前页面</span>
           </Button>
         )}
-        <Button
-          onClick={onOpenSettings}
-          variant="ghost"
-          className="w-full text-muted-foreground hover:text-foreground hover:bg-card/70 justify-start gap-2"
-          size="sm"
-        >
-          <Settings className="w-4 h-4 flex-shrink-0" />
-          <span className="text-xs">
-            {showAccountMenu ? "设置" : "API Key 与积分"}
-          </span>
-        </Button>
+        {showSettings && (
+          <Button
+            onClick={onOpenSettings}
+            variant="ghost"
+            className="w-full text-muted-foreground hover:text-foreground hover:bg-card/70 justify-start gap-2"
+            size="sm"
+          >
+            <Settings className="w-4 h-4 flex-shrink-0" />
+            <span className="text-xs">
+              {showAccountMenu ? "设置" : "API Key 与积分"}
+            </span>
+          </Button>
+        )}
         {showAccountMenu && (
           <AccountMenu
             onOpenSettings={onOpenSettings}

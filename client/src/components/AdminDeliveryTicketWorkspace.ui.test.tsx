@@ -1,13 +1,5 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const mocks = vi.hoisted(() => ({
-  listRefetch: vi.fn(),
-  detailRefetch: vi.fn(),
-  toastSuccess: vi.fn(),
-  toastError: vi.fn(),
-  toastInfo: vi.fn(),
-}));
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
 vi.mock("wouter", () => ({
   useLocation: () => ["/admin/workspace", vi.fn()],
@@ -24,29 +16,22 @@ vi.mock("@/lib/trpc", () => ({
         list: {
           useInfiniteQuery: () => ({
             data: {
-              pages: [
-                {
-                  tickets: [],
-                  quotas: {},
-                  nextCursor: null,
-                },
-              ],
+              pages: [{ tickets: [], quotas: {}, nextCursor: null }],
             },
-            refetch: mocks.listRefetch,
+            refetch: vi.fn(),
             fetchNextPage: vi.fn(),
             hasNextPage: false,
             isFetchingNextPage: false,
+            isFetching: false,
             isLoading: false,
-            isError: false,
             error: null,
           }),
         },
         detail: {
           useQuery: () => ({
             data: null,
-            refetch: mocks.detailRefetch,
+            refetch: vi.fn(),
             isLoading: false,
-            isError: false,
             error: null,
           }),
         },
@@ -67,174 +52,196 @@ vi.mock("@/lib/trpc", () => ({
   },
 }));
 
-vi.mock("sonner", () => ({
-  toast: {
-    success: mocks.toastSuccess,
-    error: mocks.toastError,
-    info: mocks.toastInfo,
-  },
-}));
-
 import AdminDeliveryTicketWorkspace from "./AdminDeliveryTicketWorkspace";
 
-describe("AdminDeliveryTicketWorkspace website current-content template UI", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.stubGlobal(
-      "URL",
-      Object.assign(URL, {
-        createObjectURL: vi.fn(() => "blob:website-current-template"),
-        revokeObjectURL: vi.fn(),
-      }),
+const executionPreviewFixtures = {
+  tickets: [
+    {
+      id: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+      userId: 42,
+      type: "website_operation" as const,
+      category: "company_facts",
+      title: "发布企业事实页面",
+      status: "in_progress" as const,
+      revision: 2,
+      createdAt: "2026-07-30T22:43:00+08:00",
+      updatedAt: "2026-07-30T22:43:00+08:00",
+    },
+  ],
+  events: [],
+  periodId: "2026-q3",
+  revision: 1,
+  contentAssetQuota: {
+    used: 0,
+    reserved: 0,
+    consumed: 0,
+    limit: 10,
+  },
+  websiteContentQuota: {
+    used: 0,
+    reserved: 0,
+    consumed: 0,
+    limit: 10,
+  },
+};
+
+describe("AdminDeliveryTicketWorkspace streamlined UI", () => {
+  it("shows only the ticket workspace without standalone website tools", () => {
+    render(
+      <AdminDeliveryTicketWorkspace
+        userId={42}
+        enterpriseName="测试企业"
+        customerUsername="test-user"
+      />,
     );
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    expect(screen.getByText("测试企业工单记录")).toBeInTheDocument();
+    expect(screen.getAllByText("客户工单")).toHaveLength(2);
+    expect(screen.queryByText("客户官网内容进度")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("批量更新官网内容（高级工具）"),
+    ).not.toBeInTheDocument();
   });
 
-  it("downloads, preflights, confirms the diff and publishes the exact same file", async () => {
-    const fileHash = "c".repeat(64);
-    const preflightToken = "signed-website-content-preflight-token";
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            format: "frontmind.website-content-template.v1",
-            workspaceUserId: 42,
-            records: [],
-          }),
-          {
-            status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              "Content-Disposition":
-                'attachment; filename="frontmind-website-content-current-42.json"',
-            },
-          },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            kind: "website-content-template-preview",
-            preview: {
-              fileHash,
-              workspaceUserId: 42,
-              totals: {
-                records: 1,
-                changed: 1,
-                completing: 1,
-                summariesUpdated: 1,
-                unchanged: 0,
-              },
-              changes: [
-                {
-                  ticketId: "970b87d8-d4f4-45db-8f11-44c45f52ade9",
-                  revision: 3,
-                  category: "company_facts",
-                  categoryLabel: "企业资料与品牌事实",
-                  topic: "更新企业品牌事实",
-                  currentComplete: false,
-                  incomingComplete: true,
-                  currentPublicSummary: "",
-                  incomingPublicSummary: "已完成企业品牌事实页面更新。",
-                  change: "complete",
-                },
-              ],
-              preflightToken,
-              preflightExpiresAt: "2099-07-28T00:00:00.000Z",
-            },
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            kind: "website-content-template",
-            result: { success: true, changed: 1 },
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          },
-        ),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-
+  it("keeps a knowledge reset ticket focused on the customer and reset result", async () => {
     render(
-      <AdminDeliveryTicketWorkspace userId={42} enterpriseName="测试企业" />,
+      <AdminDeliveryTicketWorkspace
+        userId={42}
+        enterpriseName="测试企业"
+        customerUsername="test-user"
+        preview
+        previewFixtures={{
+          tickets: [
+            {
+              id: "4a67e445-37bb-45ed-9268-4ca9437e4d70",
+              userId: 42,
+              type: "knowledge_base",
+              category: "knowledge_reset",
+              title: "知识库重置申请",
+              status: "completed",
+              publicSummary: "知识库已清空，可以重新开始首次构建。",
+              revision: 2,
+              createdAt: "2026-07-30T22:43:00+08:00",
+              updatedAt: "2026-07-30T22:43:00+08:00",
+            },
+          ],
+          events: [
+            {
+              id: "submitted",
+              visibility: "customer",
+              actorLabel: "用户",
+              statusTo: "submitted",
+              message: "客户提交知识库重置申请。",
+              createdAt: "2026-07-30T22:43:00+08:00",
+            },
+            {
+              id: "completed",
+              visibility: "customer",
+              actorLabel: "交付成员",
+              statusTo: "completed",
+              message: "知识库重置已批准并完成清理。",
+              createdAt: "2026-07-30T22:43:00+08:00",
+            },
+          ],
+          periodId: "2026-q3",
+          revision: 1,
+          contentAssetQuota: {
+            used: 0,
+            reserved: 0,
+            consumed: 0,
+            limit: 0,
+          },
+          websiteContentQuota: {
+            used: 0,
+            reserved: 0,
+            consumed: 0,
+            limit: 0,
+          },
+        }}
+      />,
     );
 
-    expect(screen.getByText("客户官网内容进度")).toBeInTheDocument();
-    expect(screen.getByText("企业资料与品牌事实")).toBeInTheDocument();
-    expect(screen.getAllByText("尚未提交")).toHaveLength(5);
-
-    fireEvent.click(screen.getByText("批量更新官网内容（高级工具）"));
-    fireEvent.click(screen.getByRole("button", { name: "下载当前内容模板" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    expect(fetchMock.mock.calls[0]).toEqual([
-      "/api/website-content-template/42",
-      { credentials: "include" },
-    ]);
-    expect(HTMLAnchorElement.prototype.click).toHaveBeenCalledOnce();
-
-    const card = screen
-      .getByText("批量更新官网内容（高级工具）")
-      .closest("details");
-    expect(card).not.toBeNull();
-    const file = new File(
-      [
-        JSON.stringify({
-          format: "frontmind.website-content-template.v1",
-          workspaceUserId: 42,
-        }),
-      ],
-      "官网内容当前模板.json",
-      { type: "application/json" },
-    );
-    fireEvent.change(
-      card!.querySelector<HTMLInputElement>('input[type="file"]')!,
-      { target: { files: [file] } },
-    );
-
-    expect(await screen.findByText("发布前差异确认")).toBeInTheDocument();
+    expect(await screen.findByText("@test-user")).toBeInTheDocument();
+    expect(screen.getByText("#42")).toBeInTheDocument();
+    expect(screen.getByText("客户未填写重置原因。")).toBeInTheDocument();
+    expect(screen.getByText("处理记录")).toBeInTheDocument();
+    expect(screen.getByText("重置处理结果")).toBeInTheDocument();
     expect(
-      screen.getByText("已完成企业品牌事实页面更新。"),
+      screen.getByText("知识库已清空，可以重新开始首次构建。"),
     ).toBeInTheDocument();
-    expect(mocks.listRefetch).not.toHaveBeenCalled();
 
-    const previewOptions = fetchMock.mock.calls[1]![1] as RequestInit;
-    expect(previewOptions.method).toBe("PUT");
-    expect(previewOptions.body).toBe(file);
-    expect(previewOptions.headers).toEqual(
-      expect.objectContaining({
-        "X-Import-Preview": "true",
-      }),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "确认发布" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-    const publishOptions = fetchMock.mock.calls[2]![1] as RequestInit;
-    expect(publishOptions.method).toBe("PUT");
-    expect(publishOptions.body).toBe(file);
-    expect(publishOptions.headers).toEqual(
-      expect.objectContaining({
-        "X-Import-File-Hash": fileHash,
-        "X-Import-Preflight-Token": preflightToken,
-      }),
-    );
+    expect(screen.queryByText("管理员内部记录")).not.toBeInTheDocument();
+    expect(screen.queryByText("回复客户与回传成果")).not.toBeInTheDocument();
+    expect(screen.queryByText("结构化交付记录")).not.toBeInTheDocument();
     expect(
-      (publishOptions.headers as Record<string, string>)["X-Import-Preview"],
-    ).toBeUndefined();
-    await waitFor(() => expect(mocks.listRefetch).toHaveBeenCalledTimes(2));
-    expect(mocks.toastSuccess).toHaveBeenCalledWith(
-      "官网内容已发布",
-      expect.objectContaining({
-        description: "1 条工单在同一事务中完成更新。",
-      }),
+      screen.queryByText("完成工单并发布内容总结"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps delivery administrators in coordination mode for an active ticket", async () => {
+    render(
+      <AdminDeliveryTicketWorkspace
+        userId={42}
+        enterpriseName="测试企业"
+        customerUsername="test-user"
+        preview
+        previewFixtures={executionPreviewFixtures}
+      />,
     );
+
+    expect(await screen.findByText(/当前为交付协调模式/)).toBeInTheDocument();
+    expect(
+      screen.queryByText("完成工单并发布内容总结"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("保存交付记录")).not.toBeInTheDocument();
+  });
+
+  it("shows fallback execution controls only when explicitly authorized", async () => {
+    render(
+      <AdminDeliveryTicketWorkspace
+        userId={42}
+        enterpriseName="测试企业"
+        customerUsername="test-user"
+        preview
+        canExecuteDelivery
+        previewFixtures={executionPreviewFixtures}
+      />,
+    );
+
+    expect(
+      await screen.findByText("完成工单并发布内容总结"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("完成工单")).toBeInTheDocument();
+    expect(screen.queryByText(/当前为交付协调模式/)).not.toBeInTheDocument();
+  });
+
+  it("does not let a system administrator execute a role-owned ticket", async () => {
+    render(
+      <AdminDeliveryTicketWorkspace
+        userId={42}
+        enterpriseName="测试企业"
+        customerUsername="test-user"
+        preview
+        canExecuteDelivery
+        previewFixtures={{
+          ...executionPreviewFixtures,
+          tickets: executionPreviewFixtures.tickets.map((ticket) => ({
+            ...ticket,
+            workflowDomain: "ai_operations_engineer" as const,
+            operation: "company_facts" as const,
+            assignedMemberId: 19,
+            assignedMemberName: "AI 运维工程师",
+          })),
+        }}
+      />,
+    );
+
+    expect(
+      await screen.findByText(/该工单由AI 运维工程师执行/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("完成工单并发布内容总结"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("保存交付记录")).not.toBeInTheDocument();
   });
 });

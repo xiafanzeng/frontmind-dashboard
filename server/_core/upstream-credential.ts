@@ -109,7 +109,9 @@ export async function resolveUpstreamCredential(
         primaryResource ? 403 : 428,
         primaryResource
           ? "该任务或文件不属于当前账号，或其原 API Key 已删除"
-          : "当前账号尚未由管理员配置 API Key",
+          : user.role === "delivery_member"
+            ? "当前工具凭据尚未配置，请联系负责该项目的交付管理员"
+            : "当前账号尚未由管理员配置 API Key",
         primaryResource
           ? "UPSTREAM_RESOURCE_FORBIDDEN"
           : "API_CREDENTIAL_REQUIRED",

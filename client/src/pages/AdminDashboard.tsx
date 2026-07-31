@@ -32,15 +32,19 @@ import {
 import { isSystemAdminAccount } from "@/lib/admin-access";
 import {
   buildAdminTicketListInput,
-  deliveryTicketPublicStatus,
   flattenAdminTicketPages,
   formatAdminTicketDate,
   normalizeAdminTicketList,
+  ticketTypeLabel,
 } from "@/components/AdminDeliveryTicketWorkspace";
 import {
   DELIVERY_ROLE_LABELS,
   type DeliveryRoleType,
 } from "@shared/delivery-roles";
+import {
+  DELIVERY_TICKET_STATUS_LABELS,
+  type DeliveryTicketStatus,
+} from "@shared/delivery-ticket";
 
 type ApiKeyUsageAlert = {
   id: string;
@@ -662,7 +666,7 @@ export default function AdminDashboard({
         assignedAdminId: ticketManager,
         query: debouncedTicketKeyword,
         type: ticketType,
-        publicStatus: ticketStatus,
+        status: ticketStatus,
         limit: 100,
         order: "created_asc",
       }),
@@ -710,7 +714,7 @@ export default function AdminDashboard({
       }
       if (
         ticketStatus !== "all" &&
-        deliveryTicketPublicStatus(ticket) !== ticketStatus
+        ticket.status !== ticketStatus
       ) {
         return false;
       }
@@ -758,10 +762,18 @@ export default function AdminDashboard({
   const ticketCounts = previewMode
     ? previewPermissionTickets.reduce(
         (counts, ticket) => {
-          counts[deliveryTicketPublicStatus(ticket)] += 1;
+          counts[ticket.status] += 1;
           return counts;
         },
-        { pending: 0, completed: 0 },
+        {
+          submitted: 0,
+          needs_information: 0,
+          scheduled: 0,
+          in_progress: 0,
+          completed: 0,
+          rejected: 0,
+          cancelled: 0,
+        } as Record<DeliveryTicketStatus, number>,
       )
     : (ticketListQuery.data?.pages?.[0] as any)?.counts || {};
   const ticketListUnavailable =
@@ -1218,10 +1230,12 @@ export default function AdminDashboard({
               <div>
                 <div className="flex items-center gap-2">
                   <ClipboardList className="h-5 w-5 text-[#5b2a86]" />
-                  <h2 className="font-semibold text-[#171321]">待受理工单</h2>
+                  <h2 className="font-semibold text-[#171321]">
+                    交付工单总览
+                  </h2>
                 </div>
                 <p className="mt-2 text-sm leading-6 text-[#716a80]">
-                  按提交时间从旧到新排列；仅展示当前管理员有权处理的客户工单。
+                  按提交时间从旧到新排列，并展示工程师实际处理状态；交付管理员只查看与协调自己负责的客户。
                 </p>
               </div>
               <div
@@ -1248,6 +1262,7 @@ export default function AdminDashboard({
                   className="h-10 rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#484057]"
                 >
                   <option value="all">全部类型</option>
+                  <option value="knowledge_base">品牌知识库</option>
                   <option value="content_asset">内容资产</option>
                   <option value="website_operation">官网运营</option>
                 </select>
@@ -1255,7 +1270,7 @@ export default function AdminDashboard({
                   <select
                     value={ticketManager}
                     onChange={(event) => setTicketManager(event.target.value)}
-                    aria-label="筛选负责人"
+                    aria-label="筛选交付管理员"
                     className="h-10 rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#484057]"
                   >
                     <option value="all">全部负责人</option>
@@ -1273,26 +1288,49 @@ export default function AdminDashboard({
                   className="h-10 rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#484057]"
                 >
                   <option value="all">全部状态</option>
-                  <option value="pending">待受理</option>
+                  <option value="submitted">已提交</option>
+                  <option value="needs_information">待补充资料</option>
+                  <option value="scheduled">已排期</option>
+                  <option value="in_progress">处理中</option>
                   <option value="completed">已完成</option>
+                  <option value="rejected">未受理</option>
+                  <option value="cancelled">已取消</option>
                 </select>
               </div>
             </div>
-            <div className="mt-5 grid gap-2 sm:grid-cols-2">
+            <div className="mt-5 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               {[
                 [
-                  "待受理",
+                  "待工程师领取",
                   ticketListUnavailable
                     ? null
-                    : (ticketCounts.pending ?? ticketCounts.publicPending ?? 0),
+                    : (ticketCounts.submitted ?? 0),
                 ],
                 [
-                  "已完成",
+                  "待客户补资料",
                   ticketListUnavailable
                     ? null
-                    : (ticketCounts.completed ??
-                      ticketCounts.publicCompleted ??
+                    : (ticketCounts.needsInformation ??
+                      ticketCounts.needs_information ??
                       0),
+                ],
+                [
+                  "工程师执行中",
+                  ticketListUnavailable
+                    ? null
+                    : (ticketCounts.scheduled ?? 0) +
+                      (ticketCounts.inProgress ??
+                        ticketCounts.in_progress ??
+                        0),
+                ],
+                [
+                  "已结束",
+                  ticketListUnavailable
+                    ? null
+                    : (ticketCounts.completedPublic ??
+                      (ticketCounts.completed ?? 0) +
+                        (ticketCounts.rejected ?? 0) +
+                        (ticketCounts.cancelled ?? 0)),
                 ],
               ].map(([label, value]) => (
                 <div
@@ -1326,14 +1364,15 @@ export default function AdminDashboard({
           ) : (
             <div>
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[1020px] text-left">
+                <table className="w-full min-w-[1160px] text-left">
                   <thead className="bg-[#fbf9fd] text-xs text-[#716a80]">
                     <tr>
                       <th className="px-5 py-3 font-medium sm:px-6">企业</th>
                       <th className="px-5 py-3 font-medium">需求</th>
                       <th className="px-5 py-3 font-medium">类型</th>
                       <th className="px-5 py-3 font-medium">状态</th>
-                      <th className="px-5 py-3 font-medium">负责人</th>
+                      <th className="px-5 py-3 font-medium">执行岗位</th>
+                      <th className="px-5 py-3 font-medium">交付管理员</th>
                       <th className="px-5 py-3 font-medium">提交时间</th>
                       <th className="px-5 py-3 text-right font-medium sm:px-6">
                         操作
@@ -1358,16 +1397,33 @@ export default function AdminDashboard({
                           )}
                         </td>
                         <td className="px-5 py-4 text-[#716a80]">
-                          {ticket.type === "website_operation"
-                            ? "官网运营"
-                            : "内容资产"}
+                          {ticketTypeLabel(ticket.type)}
                         </td>
                         <td className="px-5 py-4">
                           <span className="rounded-full bg-[#f2ebf7] px-2.5 py-1 text-xs font-semibold text-[#5b2a86]">
-                            {deliveryTicketPublicStatus(ticket) === "completed"
-                              ? "已完成"
-                              : "待受理"}
+                            {
+                              DELIVERY_TICKET_STATUS_LABELS[
+                                ticket.status as DeliveryTicketStatus
+                              ]
+                            }
                           </span>
+                        </td>
+                        <td className="px-5 py-4 text-[#716a80]">
+                          <p>
+                            {ticket.workflowDomain
+                              ? DELIVERY_ROLE_LABELS[
+                                  ticket.workflowDomain as DeliveryRoleType
+                                ]
+                              : "旧版工单"}
+                          </p>
+                          <p className="mt-1 text-xs text-[#9a94a8]">
+                            {ticket.assignedMemberId
+                              ? ticket.assignedMemberName ||
+                                `工程师 #${ticket.assignedMemberId}`
+                              : ticket.workflowDomain
+                                ? "工程师待分配"
+                                : "无岗位"}
+                          </p>
                         </td>
                         <td className="px-5 py-4 text-[#716a80]">
                           {assignedManagersForTicket(ticket)
@@ -1407,7 +1463,7 @@ export default function AdminDashboard({
                               );
                             }}
                           >
-                            处理工单
+                            {systemAdmin ? "查看工单" : "查看与协调"}
                             <ArrowRight className="h-4 w-4" />
                           </button>
                         </td>

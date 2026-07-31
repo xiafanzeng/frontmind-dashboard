@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ConversationSyncQueue } from "./conversation-sync";
+import { ConversationSyncQueue, getErrorMessage } from "./conversation-sync";
 
 type Snapshot = { id: string; value: number };
 
@@ -110,5 +110,20 @@ describe("ConversationSyncQueue", () => {
 
     expect(syncSnapshot).toHaveBeenCalledTimes(1);
     expect(onPermanentError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("getErrorMessage", () => {
+  it("does not expose SQL parameters or assistant content in the sync banner", () => {
+    const message = getErrorMessage(
+      new Error(
+        "Failed query: insert into `messages` values (?) params: 企业内部正文",
+      ),
+    );
+
+    expect(message).toBe(
+      "云端会话写入暂时失败，系统会自动修复并重试；请勿重复提交。",
+    );
+    expect(message).not.toContain("企业内部正文");
   });
 });

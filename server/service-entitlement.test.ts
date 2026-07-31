@@ -737,7 +737,7 @@ describe("service portal derivation", () => {
     ).toBe("select_service_questions");
   });
 
-  it("waits for administrator confirmation, then opens the first approved question without requiring a full quota", () => {
+  it("waits for monitoring-engineer confirmation, then opens the first approved question without requiring a full quota", () => {
     const waiting = deriveServicePortalState(
       state("advanced", {
         knowledgeVersion: 2,
@@ -748,7 +748,7 @@ describe("service portal derivation", () => {
     );
     expect(waiting.nextAction).toMatchObject({
       kind: "await_question_confirmation",
-      label: "等待管理员确认启动问题",
+      label: "等待监控工程师确认启动问题",
     });
     expect(waiting.purchasedQuestions).toHaveLength(0);
 

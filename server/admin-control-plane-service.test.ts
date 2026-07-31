@@ -281,14 +281,14 @@ describe("control-plane overview aggregation", () => {
     expect(
       overview.todos.find((todo) => todo.kind === "customer_configuration")
         ?.href,
-    ).toBe("/admin/customers/10/delivery");
+    ).toBe("/admin/customers/10/service");
     expect(
       overview.todos.find(
         (todo) => todo.kind === "credential" && todo.userId === 11,
       )?.href,
     ).toBe("/admin/customers/11/credential");
     expect(overview.todos.find((todo) => todo.kind === "task")?.href).toBe(
-      "/admin/customers/10/activity",
+      "/admin/customers/10/knowledge",
     );
   });
 
