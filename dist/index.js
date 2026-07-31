@@ -4406,7 +4406,7 @@ var dashboardOptimizationReportSchema = z3.object({
   questionBaselines: z3.array(dashboardOptimizationBaselineSchema).max(500).optional(),
   questionReports: z3.array(dashboardOptimizationQuestionReportSchema).max(500).optional()
 }).superRefine((report, context) => {
-  const ensureUnique = (values, path10) => {
+  const ensureUnique = (values, path11) => {
     const seen = /* @__PURE__ */ new Set();
     values.forEach((value, index2) => {
       if (!value || !seen.has(value)) {
@@ -4416,9 +4416,9 @@ var dashboardOptimizationReportSchema = z3.object({
       context.addIssue({
         code: "custom",
         path: [
-          path10,
+          path11,
           index2,
-          path10 === "questionBaselines" ? "questionId" : "id"
+          path11 === "questionBaselines" ? "questionId" : "id"
         ],
         message: "\u540C\u4E00\u95EE\u9898\u53EA\u80FD\u53D1\u5E03\u4E00\u4EFD\u62A5\u544A"
       });
@@ -4711,8 +4711,8 @@ var websitePurchaseRequestV2Schema = z4.object({
       "service startsAt must match order paidAt"
     ]
   ];
-  for (const [valid, path10, message] of checks) {
-    if (!valid) context.addIssue({ code: "custom", path: path10, message });
+  for (const [valid, path11, message] of checks) {
+    if (!valid) context.addIssue({ code: "custom", path: path11, message });
   }
 });
 var purchaseStatusSchema = z4.enum([
@@ -19698,12 +19698,12 @@ async function parseRedirectWorkbook(data) {
   for (const row of rows) {
     if (invalidRows.has(row.row) || globallyVisited.has(row.sourceUrl))
       continue;
-    const path10 = /* @__PURE__ */ new Map();
+    const path11 = /* @__PURE__ */ new Map();
     let current = row;
     while (current && !invalidRows.has(current.row)) {
-      if (path10.has(current.sourceUrl)) {
-        const cycleStart = path10.get(current.sourceUrl);
-        const cycleRows = [...path10.entries()].filter(([, position]) => position >= cycleStart).map(([source]) => nextBySource.get(source)).filter(Boolean);
+      if (path11.has(current.sourceUrl)) {
+        const cycleStart = path11.get(current.sourceUrl);
+        const cycleRows = [...path11.entries()].filter(([, position]) => position >= cycleStart).map(([source]) => nextBySource.get(source)).filter(Boolean);
         for (const cycleRow of cycleRows) invalidRows.add(cycleRow.row);
         errors.push({
           row: current.row,
@@ -19712,10 +19712,10 @@ async function parseRedirectWorkbook(data) {
         break;
       }
       if (globallyVisited.has(current.sourceUrl)) break;
-      path10.set(current.sourceUrl, path10.size);
+      path11.set(current.sourceUrl, path11.size);
       current = nextBySource.get(current.targetUrl);
     }
-    for (const source of path10.keys()) globallyVisited.add(source);
+    for (const source of path11.keys()) globallyVisited.add(source);
   }
   const validRows = rows.filter((row) => !invalidRows.has(row.row));
   return {
@@ -27674,9 +27674,9 @@ async function fileExists(filePath) {
 }
 async function pathSize(targetPath) {
   try {
-    const stat = await fs3.stat(targetPath);
-    if (stat.isFile()) return stat.size;
-    if (!stat.isDirectory()) return 0;
+    const stat2 = await fs3.stat(targetPath);
+    if (stat2.isFile()) return stat2.size;
+    if (!stat2.isDirectory()) return 0;
     const entries = await fs3.readdir(targetPath);
     let total = 0;
     for (const entry of entries) {
@@ -29042,13 +29042,13 @@ function publicUpstreamTaskPayload(value, apiKey) {
   return deepSanitizeJson(redactPublicTaskValues(result, apiKey));
 }
 function isPublicTaskPayloadRequest(method, targetPath) {
-  const path10 = targetPath.split("?")[0].replace(/\/+$/, "");
+  const path11 = targetPath.split("?")[0].replace(/\/+$/, "");
   const normalizedMethod = method.toUpperCase();
-  if (normalizedMethod === "POST" && (path10 === "/v1/tasks" || path10 === "/v1/responses")) {
+  if (normalizedMethod === "POST" && (path11 === "/v1/tasks" || path11 === "/v1/responses")) {
     return true;
   }
   if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
-  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path10);
+  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path11);
 }
 function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
   if (value === null || value === void 0 || depth > 50) return ids;
@@ -40240,10 +40240,10 @@ router7.post("/:assetId/download-token", async (req, res) => {
 });
 async function streamPreparedFile(req, res, manifest, disposition) {
   const filePath = preparedFileService.contentPath(manifest.id);
-  const stat = await fs6.stat(filePath);
+  const stat2 = await fs6.stat(filePath);
   const range = parseByteRange(
     typeof req.headers.range === "string" ? req.headers.range : void 0,
-    stat.size
+    stat2.size
   );
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Accept-Ranges", "bytes");
@@ -40260,17 +40260,17 @@ async function streamPreparedFile(req, res, manifest, disposition) {
     return;
   }
   if (range === "invalid") {
-    res.setHeader("Content-Range", `bytes */${stat.size}`);
+    res.setHeader("Content-Range", `bytes */${stat2.size}`);
     res.status(416).end();
     return;
   }
   const start = range?.start ?? 0;
-  const end = range?.end ?? stat.size - 1;
+  const end = range?.end ?? stat2.size - 1;
   const contentLength = end - start + 1;
   res.setHeader("Content-Length", String(contentLength));
   if (range) {
     res.status(206);
-    res.setHeader("Content-Range", `bytes ${start}-${end}/${stat.size}`);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${stat2.size}`);
   } else {
     res.status(200);
   }
@@ -40410,9 +40410,8 @@ router7.head("/:assetId/content", async (req, res) => {
 var prepared_file_router_default = router7;
 
 // server/presales-proxy.ts
-import { createHash as createHash16, createHmac as createHmac5, timingSafeEqual as timingSafeEqual6 } from "node:crypto";
+import { createHash as createHash17, createHmac as createHmac5, timingSafeEqual as timingSafeEqual6 } from "node:crypto";
 import { once } from "node:events";
-import { Transform } from "node:stream";
 import {
   Router as Router7,
   json as json3
@@ -41617,8 +41616,8 @@ function monitorBaseUrl(env = process.env) {
   }
   return parsed.toString().replace(/\/+$/, "");
 }
-function buildMonitorRequestUrl(path10, env = process.env) {
-  const normalizedPath = path10.replace(/^\/+/, "");
+function buildMonitorRequestUrl(path11, env = process.env) {
+  const normalizedPath = path11.replace(/^\/+/, "");
   if (!normalizedPath || /[?#\\]/.test(normalizedPath)) {
     throw new PresalesMonitorError(
       "MONITOR_NOT_CONFIGURED",
@@ -41629,12 +41628,12 @@ function buildMonitorRequestUrl(path10, env = process.env) {
   return new URL(normalizedPath, `${monitorBaseUrl(env)}/`).toString();
 }
 var AxiosMonitorTransport = class {
-  async request(method, path10, credential, payload) {
+  async request(method, path11, credential, payload) {
     let response2;
     try {
       response2 = await axios9.request({
         method,
-        url: buildMonitorRequestUrl(path10),
+        url: buildMonitorRequestUrl(path11),
         data: payload,
         headers: {
           Authorization: `Bearer ${credential.apiKey}`,
@@ -42032,6 +42031,188 @@ function assertFrontMindPublicUrlConfigured(env = process.env) {
   return configured;
 }
 
+// server/presales-file-store.ts
+import { createHash as createHash16, randomUUID as randomUUID24 } from "node:crypto";
+import {
+  createReadStream as createReadStream3,
+  createWriteStream
+} from "node:fs";
+import * as fs7 from "node:fs/promises";
+import path10 from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+function storageRoot2() {
+  const assetRoot = path10.resolve(
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path10.join(process.cwd(), ".frontmind-dashboard-assets")
+  );
+  return path10.join(assetRoot, "presales-files");
+}
+function storageKey(fileId) {
+  return createHash16("sha256").update(fileId, "utf8").digest("hex");
+}
+function pathsFor(fileId) {
+  const root = storageRoot2();
+  const key = storageKey(fileId);
+  return {
+    root,
+    content: path10.join(root, `${key}.content`),
+    manifest: path10.join(root, `${key}.json`)
+  };
+}
+function cleanFilename(value, fallback) {
+  const normalized = String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").replace(/[\\/]/g, "_").trim();
+  return normalized ? normalized.slice(0, 512) : fallback;
+}
+function cleanMimeType(value) {
+  const normalized = String(value || "").replace(/[\r\n]/g, "").trim();
+  return normalized && normalized.length <= 255 ? normalized : "application/octet-stream";
+}
+async function readManifest(fileId) {
+  const { manifest } = pathsFor(fileId);
+  try {
+    const parsed = JSON.parse(
+      await fs7.readFile(manifest, "utf8")
+    );
+    if (parsed.schemaVersion !== 1 || parsed.fileId !== fileId) return null;
+    return parsed;
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+async function writeManifest(fileId, value) {
+  const { root, manifest } = pathsFor(fileId);
+  await fs7.mkdir(root, { recursive: true, mode: 448 });
+  await fs7.chmod(root, 448).catch(() => void 0);
+  const temporary = `${manifest}.${randomUUID24()}.tmp`;
+  try {
+    await fs7.writeFile(temporary, `${JSON.stringify(value)}
+`, {
+      encoding: "utf8",
+      mode: 384,
+      flag: "wx"
+    });
+    await fs7.rename(temporary, manifest);
+  } finally {
+    await fs7.rm(temporary, { force: true }).catch(() => void 0);
+  }
+}
+async function recordPresalesFileDescriptor(input) {
+  await writeManifest(input.fileId, {
+    schemaVersion: 1,
+    fileId: input.fileId,
+    filename: cleanFilename(input.filename, input.fileId),
+    mimeType: cleanMimeType(input.mimeType),
+    sizeBytes: Number.isSafeInteger(input.sizeBytes) && Number(input.sizeBytes) >= 0 ? Number(input.sizeBytes) : null,
+    sha256: null,
+    state: "pending",
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+async function stagePresalesFileContent(input) {
+  const paths = pathsFor(input.fileId);
+  await fs7.mkdir(paths.root, { recursive: true, mode: 448 });
+  await fs7.chmod(paths.root, 448).catch(() => void 0);
+  const temporary = path10.join(
+    paths.root,
+    `${storageKey(input.fileId)}.${randomUUID24()}.upload.tmp`
+  );
+  let sizeBytes = 0;
+  const hash = createHash16("sha256");
+  const limiter = new Transform({
+    transform(chunk, _encoding, callback) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      sizeBytes += bytes.length;
+      if (sizeBytes > input.maxBytes) {
+        callback(new Error("FILE_TOO_LARGE"));
+        return;
+      }
+      hash.update(bytes);
+      callback(null, bytes);
+    }
+  });
+  try {
+    await pipeline(
+      input.stream,
+      limiter,
+      createWriteStream(temporary, { flags: "wx", mode: 384 })
+    );
+  } catch (error) {
+    await fs7.rm(temporary, { force: true }).catch(() => void 0);
+    throw error;
+  }
+  const sha2564 = hash.digest("hex");
+  let consumed = false;
+  const discard = async () => {
+    if (consumed) return;
+    consumed = true;
+    await fs7.rm(temporary, { force: true }).catch(() => void 0);
+  };
+  return {
+    sizeBytes,
+    sha256: sha2564,
+    createReadStream: () => createReadStream3(temporary),
+    discard,
+    commit: async ({ filename, mimeType }) => {
+      if (consumed) throw new Error("STAGED_FILE_ALREADY_CONSUMED");
+      const previous = await readManifest(input.fileId);
+      const manifest = {
+        schemaVersion: 1,
+        fileId: input.fileId,
+        filename: cleanFilename(filename ?? previous?.filename, input.fileId),
+        mimeType: cleanMimeType(mimeType ?? previous?.mimeType),
+        sizeBytes,
+        sha256: sha2564,
+        state: "stored",
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      try {
+        await fs7.rename(temporary, paths.content);
+        consumed = true;
+        await writeManifest(input.fileId, manifest);
+      } catch (error) {
+        consumed = true;
+        await Promise.all([
+          fs7.rm(temporary, { force: true }).catch(() => void 0),
+          fs7.rm(paths.content, { force: true }).catch(() => void 0)
+        ]);
+        throw error;
+      }
+    }
+  };
+}
+async function readStoredPresalesFile(fileId) {
+  const paths = pathsFor(fileId);
+  let stats;
+  try {
+    stats = await fs7.stat(paths.content);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stats.isFile() || stats.size <= 0) {
+    throw new Error("LOCAL_FILE_CONTENT_INVALID");
+  }
+  const manifest = await readManifest(fileId);
+  if (manifest?.state === "stored" && Number.isSafeInteger(manifest.sizeBytes) && manifest.sizeBytes !== stats.size) {
+    throw new Error("LOCAL_FILE_CONTENT_SIZE_MISMATCH");
+  }
+  return {
+    filename: cleanFilename(manifest?.filename, fileId),
+    mimeType: cleanMimeType(manifest?.mimeType),
+    sizeBytes: stats.size,
+    sha256: typeof manifest?.sha256 === "string" ? manifest.sha256 : null,
+    createReadStream: () => createReadStream3(paths.content)
+  };
+}
+async function removeStoredPresalesFile(fileId) {
+  const paths = pathsFor(fileId);
+  await Promise.all([
+    fs7.rm(paths.content, { force: true }),
+    fs7.rm(paths.manifest, { force: true })
+  ]);
+}
+
 // server/presales-proxy.ts
 var router8 = Router7();
 var SERVICE_TOKEN_HEADER = "x-frontmind-service-token";
@@ -42085,7 +42266,7 @@ function buildPresalesTaskBody(input) {
   };
 }
 function tokenDigest(value) {
-  return createHash16("sha256").update(value, "utf8").digest();
+  return createHash17("sha256").update(value, "utf8").digest();
 }
 function uploadTicketSignature(encodedPayload, secret) {
   return createHmac5("sha256", secret).update(`frontmind-presales-upload:v1.${encodedPayload}`, "utf8").digest();
@@ -42490,6 +42671,12 @@ router8.post("/files", fileJsonParser, async (req, res) => {
       kind: "file",
       upstreamId: id
     });
+    await recordPresalesFileDescriptor({
+      fileId: id,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes
+    });
     const payload = redactUpstreamPayload(response2.data, credential.apiKey);
     const uploadUrl = typeof payload?.upload_url === "string" ? payload.upload_url : "";
     const proxyUploadTicket = uploadUrl ? createPresalesUploadTicket({
@@ -42563,33 +42750,40 @@ router8.put("/files/:fileId/content", async (req, res) => {
         (await fetchFileMetadata2(fileId, credential)).upload_url ?? ""
       )
     );
-    let received = 0;
-    const limiter = new Transform({
-      transform(chunk, _encoding, callback) {
-        received += Buffer.byteLength(chunk);
-        if (received > MAX_PROXY_UPLOAD_BYTES) {
-          callback(new Error("FILE_TOO_LARGE"));
-          return;
-        }
-        callback(null, chunk);
-      }
+    const staged = await stagePresalesFileContent({
+      fileId,
+      stream: req,
+      maxBytes: MAX_PROXY_UPLOAD_BYTES
     });
-    req.pipe(limiter);
-    const response2 = await axios10.put(target, limiter, {
-      ...safeExternalRequestOptions,
-      // SigV4 authenticates the exact request URL; following a redirect would
-      // invalidate the signature and surface as a misleading storage error.
-      maxRedirects: 0,
-      headers: {
-        "Content-Type": String(req.headers["x-original-content-type"] ?? "") || req.headers["content-type"] || "application/octet-stream",
-        ...contentLength > 0 ? { "Content-Length": String(contentLength) } : {}
-      },
-      timeout: UPSTREAM_TIMEOUT_MS,
-      maxBodyLength: MAX_PROXY_UPLOAD_BYTES,
-      maxContentLength: 1024 * 1024,
-      validateStatus: () => true
-    });
+    if (staged.sizeBytes === 0) {
+      await staged.discard();
+      return res.status(400).json({
+        error: { code: "FILE_EMPTY", message: "File content is empty" }
+      });
+    }
+    const originalContentType = String(req.headers["x-original-content-type"] ?? "") || String(req.headers["content-type"] ?? "") || "application/octet-stream";
+    let response2;
+    try {
+      response2 = await axios10.put(target, staged.createReadStream(), {
+        ...safeExternalRequestOptions,
+        // SigV4 authenticates the exact request URL; following a redirect would
+        // invalidate the signature and surface as a misleading storage error.
+        maxRedirects: 0,
+        headers: {
+          "Content-Type": originalContentType,
+          "Content-Length": String(staged.sizeBytes)
+        },
+        timeout: UPSTREAM_TIMEOUT_MS,
+        maxBodyLength: MAX_PROXY_UPLOAD_BYTES,
+        maxContentLength: 1024 * 1024,
+        validateStatus: () => true
+      });
+    } catch (error) {
+      await staged.discard();
+      throw error;
+    }
     if (response2.status < 200 || response2.status >= 300) {
+      await staged.discard();
       return res.status(forwardedStatus(response2.status)).json({
         error: {
           code: "UPSTREAM_FILE_UPLOAD_FAILED",
@@ -42601,6 +42795,7 @@ router8.put("/files/:fileId/content", async (req, res) => {
         }
       });
     }
+    await staged.commit({ mimeType: originalContentType });
     res.status(200).json(buildProxyUploadSuccess(response2.status));
   } catch (error) {
     if (error instanceof Error && error.message === "FILE_TOO_LARGE") {
@@ -42630,6 +42825,7 @@ router8.delete("/files/:fileId", async (req, res) => {
       credential.apiKey
     );
     if (outcome.ok) {
+      await removeStoredPresalesFile(fileId);
       res.status(outcome.status).end();
       return;
     }
@@ -42825,10 +43021,41 @@ function sendFileContentDownloadFailure(res, input) {
     }
   });
 }
+async function streamStoredPresalesFile(res, fileId, stored) {
+  let streamedBytes = 0;
+  try {
+    res.status(200);
+    res.setHeader("Content-Type", stored.mimeType);
+    res.setHeader("Content-Length", String(stored.sizeBytes));
+    const encoded = encodeURIComponent(stored.filename || fileId);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`
+    );
+    for await (const value of stored.createReadStream()) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      if (!chunk.length) continue;
+      streamedBytes += chunk.length;
+      if (!res.write(chunk)) await once(res, "drain");
+    }
+    if (streamedBytes !== stored.sizeBytes) throw new Error("SHORT_READ");
+    res.end();
+  } catch {
+    sendFileContentDownloadFailure(res, {
+      fileId,
+      errorCode: "LOCAL_FILE_CONTENT_FAILED"
+    });
+  }
+}
 router8.get("/files/:fileId/content", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
     const credential = await requireResourceCredential("file", fileId);
+    const stored = await readStoredPresalesFile(fileId);
+    if (stored) {
+      await streamStoredPresalesFile(res, fileId, stored);
+      return;
+    }
     const response2 = await axios10.get(
       `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}/content`,
       {
@@ -42963,12 +43190,12 @@ router8.use((_req, res) => {
 var presales_proxy_default = router8;
 
 // server/provisioning-router.ts
-import { createHash as createHash19, timingSafeEqual as timingSafeEqual7 } from "node:crypto";
+import { createHash as createHash20, timingSafeEqual as timingSafeEqual7 } from "node:crypto";
 import express3 from "express";
 import { z as z30 } from "zod";
 
 // server/provisioning-service.ts
-import { createHash as createHash17, createHmac as createHmac6, randomUUID as randomUUID24 } from "node:crypto";
+import { createHash as createHash18, createHmac as createHmac6, randomUUID as randomUUID25 } from "node:crypto";
 import { eq as eq28 } from "drizzle-orm";
 import { z as z26 } from "zod";
 var usernameSchema3 = z26.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
@@ -43065,7 +43292,7 @@ function canonicalJson5(value) {
   return `{${Object.keys(record).filter((key) => record[key] !== void 0).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson5(record[key])}`).join(",")}}`;
 }
 function hashProvisioningIdempotencyKey(value) {
-  return createHash17("sha256").update(value, "utf8").digest("hex");
+  return createHash18("sha256").update(value, "utf8").digest("hex");
 }
 function hashProvisioningRequest(request, secret) {
   return createHmac6("sha256", secret).update(canonicalJson5(request), "utf8").digest("hex");
@@ -43128,7 +43355,7 @@ async function provisionWebsiteUser(input, options = {}) {
   if (existing) return resolveReplay(existing, requestHash3);
   try {
     const stored = await repository.createAtomically({
-      id: randomUUID24(),
+      id: randomUUID25(),
       idempotencyKeyHash,
       requestHash: requestHash3,
       request,
@@ -43338,7 +43565,7 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
 
 // server/knowledge-import-service.ts
 import axios11 from "axios";
-import { createHash as createHash18, randomUUID as randomUUID25 } from "node:crypto";
+import { createHash as createHash19, randomUUID as randomUUID26 } from "node:crypto";
 import { and as and25, eq as eq29 } from "drizzle-orm";
 import { z as z27 } from "zod";
 var sha256Schema3 = z27.string().trim().regex(/^[a-f0-9]{64}$/i);
@@ -43472,7 +43699,7 @@ function resolveKnowledgeImportProjectOwner(provisions, requestedCompanyName) {
   };
 }
 function idempotencyHash(value) {
-  return createHash18("sha256").update(value, "utf8").digest("hex");
+  return createHash19("sha256").update(value, "utf8").digest("hex");
 }
 var websiteKnowledgeImportV3ReferencePrefix = "website-kb:v3";
 var websiteKnowledgeImportV4ReferencePrefix = "website-kb:v4";
@@ -43623,7 +43850,7 @@ async function reserveReceipt(input) {
         409
       );
     }
-    const receiptId = randomUUID25();
+    const receiptId = randomUUID26();
     try {
       await tx.insert(knowledgeImportReceipts).values({
         id: receiptId,
@@ -43784,7 +44011,7 @@ async function importWebsiteKnowledgeArtifact(input) {
       apiKey: credential.apiKey,
       baseUrl: getUpstreamBaseUrl()
     });
-    const archiveHash = createHash18("sha256").update(downloaded.buffer).digest("hex");
+    const archiveHash = createHash19("sha256").update(downloaded.buffer).digest("hex");
     if (archiveHash !== knowledgeImportArtifactSha256(value).toLowerCase()) {
       throw new KnowledgeImportError(
         "ARTIFACT_HASH_MISMATCH",
@@ -43792,7 +44019,7 @@ async function importWebsiteKnowledgeArtifact(input) {
         409
       );
     }
-    const snapshotId = randomUUID25();
+    const snapshotId = randomUUID26();
     const parsed = await readKnowledgeArchive(
       downloaded.buffer,
       downloaded.filename,
@@ -44630,7 +44857,7 @@ var PUBLIC_PLACEHOLDER_MARKERS2 = [
   "your_token"
 ];
 function tokenDigest2(value) {
-  return createHash19("sha256").update(value, "utf8").digest();
+  return createHash20("sha256").update(value, "utf8").digest();
 }
 function isUsableProvisioningServiceToken(value) {
   const normalized = value?.trim() ?? "";
@@ -45011,15 +45238,15 @@ function pathWithoutQuery(req) {
   return req.originalUrl.replace(/^\/api\/frontmind/, "").split("?")[0] || "/";
 }
 function getPrimaryResource(req) {
-  const path10 = pathWithoutQuery(req);
-  const taskMatch = path10.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
+  const path11 = pathWithoutQuery(req);
+  const taskMatch = path11.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
   if (taskMatch) return { kind: "task", id: decodeURIComponent(taskMatch[1]) };
-  const fileMatch = path10.match(/^\/v1\/files\/([^/]+)/);
+  const fileMatch = path11.match(/^\/v1\/files\/([^/]+)/);
   if (fileMatch) return { kind: "file", id: decodeURIComponent(fileMatch[1]) };
-  if (path10 === "/download-token" && typeof req.body?.fileId === "string") {
+  if (path11 === "/download-token" && typeof req.body?.fileId === "string") {
     return { kind: "file", id: req.body.fileId };
   }
-  if (req.method === "POST" && path10 === "/v1/tasks") {
+  if (req.method === "POST" && path11 === "/v1/tasks") {
     const continuationId = req.body?.taskId ?? req.body?.previous_response_id;
     if (typeof continuationId === "string" && continuationId) {
       return { kind: "task", id: continuationId };
@@ -45461,12 +45688,12 @@ router9.get("/:attachmentId/content", async (req, res) => {
 var delivery_ticket_attachment_router_default = router9;
 
 // server/website-content-template-api.ts
-import { createHash as createHash20 } from "node:crypto";
+import { createHash as createHash21 } from "node:crypto";
 import express4 from "express";
 import { ZodError as ZodError2 } from "zod";
 
 // server/website-content-template-service.ts
-import { randomUUID as randomUUID26 } from "node:crypto";
+import { randomUUID as randomUUID27 } from "node:crypto";
 import { and as and29, asc as asc10, eq as eq33, inArray as inArray16 } from "drizzle-orm";
 var WEBSITE_CONTENT_CATEGORIES2 = WEBSITE_CONTENT_CATALOG.map(
   (item) => item.value
@@ -45746,7 +45973,7 @@ async function publishWebsiteContentTemplate(input) {
           )
         );
         await tx.insert(deliveryTicketEvents).values({
-          id: randomUUID26(),
+          id: randomUUID27(),
           ticketId: ticket.id,
           userId: input.workspaceUserId,
           actorUserId: input.actor.id,
@@ -45875,7 +46102,7 @@ function requestBytes(req) {
   return Buffer.alloc(0);
 }
 function websiteContentTemplateFileHash(bytes) {
-  return createHash20("sha256").update(bytes).digest("hex");
+  return createHash21("sha256").update(bytes).digest("hex");
 }
 function assertWebsiteContentTemplatePublishHash(value, actual) {
   const expected = value?.trim().toLowerCase() || "";
@@ -46039,7 +46266,7 @@ var website_content_template_api_default = router10;
 // server/knowledge-base-live-preview-api.ts
 import axios13 from "axios";
 import { Router as Router9 } from "express";
-import { randomUUID as randomUUID27 } from "node:crypto";
+import { randomUUID as randomUUID28 } from "node:crypto";
 var router11 = Router9();
 var SESSION_TTL_MS = 3 * 60 * 60 * 1e3;
 var TERMINAL_TASK_STATUSES = /* @__PURE__ */ new Set([
@@ -46348,7 +46575,7 @@ router11.post("/start", async (req, res) => {
       });
       return;
     }
-    const sessionId = randomUUID27();
+    const sessionId = randomUUID28();
     const analysis = analyzeKnowledgeBaseLiveTask(created.task, { mode });
     const terminal = analysis.terminal;
     if (terminal) {
