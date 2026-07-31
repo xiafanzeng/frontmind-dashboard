@@ -951,6 +951,12 @@ var deliveryTickets = mysqlTable(
       table.assignedMemberId,
       table.status
     ),
+    index("delivery_tickets_member_status_resolved_id_idx").on(
+      table.assignedMemberId,
+      table.status,
+      table.resolvedAt,
+      table.id
+    ),
     foreignKey({
       name: "delivery_tickets_project_assignment_fk",
       columns: [table.assignedProjectAssignmentId],
@@ -1061,6 +1067,103 @@ var deliveryTicketAttachments = mysqlTable(
       table.ownerUserId,
       table.upstreamFileId
     )
+  ]
+);
+var deliveryMemberOrigins = mysqlTable(
+  "delivery_member_origins",
+  {
+    engineerUserId: int("engineerUserId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    createdByAdminId: int("createdByAdminId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    index("delivery_member_origins_admin_idx").on(table.createdByAdminId)
+  ]
+);
+var websiteStyleWorkflows = mysqlTable(
+  "website_style_workflows",
+  {
+    userId: int("userId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    status: mysqlEnum("status", [
+      "waiting_samples",
+      "awaiting_selection",
+      "revision_requested",
+      "confirmed",
+      "legacy_confirmed"
+    ]).default("waiting_samples").notNull(),
+    currentBatchId: varchar("currentBatchId", { length: 36 }),
+    selectedSampleId: varchar("selectedSampleId", { length: 36 }),
+    selectedByUserId: int("selectedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    selectedAt: timestamp("selectedAt"),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [index("website_style_workflows_status_idx").on(table.status)]
+);
+var websiteStyleSampleBatches = mysqlTable(
+  "website_style_sample_batches",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    ticketId: varchar("ticketId", { length: 36 }).notNull().references(() => deliveryTickets.id, { onDelete: "cascade" }),
+    ordinal: int("ordinal", { unsigned: true }).notNull(),
+    status: mysqlEnum("status", [
+      "published",
+      "revision_requested",
+      "selected",
+      "superseded"
+    ]).default("published").notNull(),
+    engineerNote: text("engineerNote"),
+    publishedByUserId: int("publishedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    publishedAt: timestamp("publishedAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("website_style_batches_user_ordinal_uq").on(
+      table.userId,
+      table.ordinal
+    ),
+    index("website_style_batches_ticket_status_idx").on(
+      table.ticketId,
+      table.status
+    )
+  ]
+);
+var websiteStyleSamples = mysqlTable(
+  "website_style_samples",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    batchId: varchar("batchId", { length: 36 }).notNull().references(() => websiteStyleSampleBatches.id, {
+      onDelete: "cascade"
+    }),
+    attachmentId: varchar("attachmentId", { length: 36 }).notNull(),
+    label: varchar("label", { length: 160 }).notNull(),
+    note: text("note"),
+    sortOrder: int("sortOrder", { unsigned: true }).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("website_style_samples_batch_order_uq").on(
+      table.batchId,
+      table.sortOrder
+    ),
+    uniqueIndex("website_style_samples_batch_attachment_uq").on(
+      table.batchId,
+      table.attachmentId
+    ),
+    foreignKey({
+      name: "website_style_samples_attachment_fk",
+      columns: [table.attachmentId],
+      foreignColumns: [deliveryTicketAttachments.id]
+    }).onDelete("restrict")
   ]
 );
 var workspaceSiteProfiles = mysqlTable(
@@ -3767,6 +3870,13 @@ var DELIVERY_TICKET_PUBLIC_STATUS_LABELS = Object.freeze({
   pending: "\u5F85\u53D7\u7406",
   completed: "\u5DF2\u5B8C\u6210"
 });
+var DELIVERY_TICKET_PUBLIC_STAGE_LABELS = Object.freeze({
+  awaiting_service: "\u5DF2\u63D0\u4EA4",
+  processing: "\u5904\u7406\u4E2D",
+  action_required: "\u5F85\u60A8\u8865\u5145",
+  completed: "\u5DF2\u5B8C\u6210",
+  closed: "\u5DF2\u7ED3\u675F"
+});
 var publicDeliveryLinkSchema = z5.object({
   label: z5.string().trim().min(1).max(160),
   url: httpUrlSchema
@@ -3779,6 +3889,20 @@ var publicDeliveryTicketSummaryBaseSchema = z5.object({
   topic: z5.string().trim().max(512).nullable(),
   publicStatus: z5.enum(["pending", "completed"]),
   publicStatusLabel: z5.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
+  publicStage: z5.enum([
+    "awaiting_service",
+    "processing",
+    "action_required",
+    "completed",
+    "closed"
+  ]),
+  publicStageLabel: z5.enum([
+    "\u5DF2\u63D0\u4EA4",
+    "\u5904\u7406\u4E2D",
+    "\u5F85\u60A8\u8865\u5145",
+    "\u5DF2\u5B8C\u6210",
+    "\u5DF2\u7ED3\u675F"
+  ]),
   publicSummary: z5.string().max(5e4).nullable(),
   knowledgeSnapshotId: z5.string().uuid().nullable().optional()
 });
@@ -3824,7 +3948,13 @@ var publicContentAssetTicketDetailSchema = z5.object({
   attachments: z5.array(publicDeliveryTicketAttachmentSchema).max(100)
 }).strict();
 var publicWebsiteTicketDetailSchema = z5.object({
-  ticket: publicWebsiteTicketSummarySchema
+  ticket: publicWebsiteTicketSummarySchema.extend({
+    revision: z5.number().int().positive(),
+    canReply: z5.boolean(),
+    canAttach: z5.boolean()
+  }).strict(),
+  events: z5.array(publicDeliveryTicketEventSchema),
+  attachments: z5.array(publicDeliveryTicketAttachmentSchema).max(100)
 }).strict();
 var publicKnowledgeBaseTicketDetailSchema = z5.object({
   ticket: publicKnowledgeBaseTicketSummarySchema,
@@ -3878,6 +4008,43 @@ var publicDeliveryTicketWorkspaceMetadataSchema = z5.object({
   websiteWorkflow: z5.object({
     domainCompleted: z5.boolean(),
     icpCompleted: z5.boolean(),
+    styleState: z5.enum([
+      "locked",
+      "waiting_samples",
+      "awaiting_selection",
+      "revision_requested",
+      "confirmed",
+      "legacy_confirmed"
+    ]),
+    styleRevision: z5.number().int().nonnegative(),
+    styleBatch: z5.object({
+      id: z5.string().uuid(),
+      ordinal: z5.number().int().positive(),
+      status: z5.enum([
+        "published",
+        "revision_requested",
+        "selected",
+        "superseded"
+      ]),
+      engineerNote: z5.string().nullable(),
+      publishedAt: z5.number().int().nonnegative().nullable(),
+      samples: z5.array(
+        z5.object({
+          id: z5.string().uuid(),
+          label: z5.string().trim().min(1).max(160),
+          note: z5.string().nullable(),
+          sortOrder: z5.number().int().positive(),
+          attachmentId: z5.string().uuid(),
+          filename: z5.string().trim().min(1).max(512),
+          mimeType: z5.string().nullable(),
+          imageUrl: z5.string().trim().min(1)
+        }).strict()
+      ).length(3)
+    }).strict().nullable(),
+    selectedStyleSampleId: z5.string().uuid().nullable(),
+    styleConfirmed: z5.boolean(),
+    canSelectStyle: z5.boolean(),
+    canRequestStyleRevision: z5.boolean(),
     canSubmitDomain: z5.boolean(),
     canSubmitIcp: z5.boolean(),
     canSubmitContent: z5.boolean(),
@@ -5251,7 +5418,7 @@ var PreparedFileService = class {
 var preparedFileService = new PreparedFileService();
 
 // server/delivery-role-service.ts
-import { and as and6, desc as desc6, eq as eq7, inArray as inArray5, isNull as isNull3, sql as sql2 } from "drizzle-orm";
+import { and as and8, asc as asc5, desc as desc8, eq as eq9, inArray as inArray6, isNull as isNull4, lt as lt4, or as or3, sql as sql3 } from "drizzle-orm";
 
 // shared/delivery-roles.ts
 import { z as z6 } from "zod";
@@ -5274,6 +5441,7 @@ var deliveryWorkflowOperationSchema = z6.enum([
   "channel_distribution",
   "domain_application",
   "icp_filing",
+  "website_style_samples",
   "company_facts",
   "product_case_docs",
   "industry_news",
@@ -5288,6 +5456,145 @@ var knowledgeResetReasonSchema = z6.enum([
   "enterprise_materials",
   "other"
 ]);
+
+// server/delivery-ticket-service.ts
+import {
+  and as and6,
+  asc as asc3,
+  count,
+  desc as desc6,
+  eq as eq7,
+  gt as gt3,
+  inArray as inArray5,
+  like,
+  lt as lt3,
+  max,
+  ne as ne2,
+  or as or2,
+  sql as sql2
+} from "drizzle-orm";
+
+// shared/delivery-catalog.ts
+var CONTENT_ASSET_CATALOG = Object.freeze([
+  {
+    id: "A1",
+    code: "A1",
+    group: "A",
+    type: "\u54C1\u724C\u4E8B\u5B9E\u5185\u5BB9",
+    label: "\u4F01\u4E1A\u8D44\u6599\u4E0E\u54C1\u724C\u4E8B\u5B9E",
+    description: "\u6574\u7406\u4F01\u4E1A\u7B80\u4ECB\u3001\u53D1\u5C55\u5386\u7A0B\u3001\u8D44\u8D28\u8363\u8A89\u7B49\u53EF\u6838\u9A8C\u7684\u54C1\u724C\u4E8B\u5B9E\u3002"
+  },
+  {
+    id: "A2",
+    code: "A2",
+    group: "A",
+    type: "\u6848\u4F8B\u5185\u5BB9",
+    label: "\u7528\u6237\u6848\u4F8B\u4E0E\u6210\u529F\u6545\u4E8B",
+    description: "\u5C06\u9879\u76EE\u80CC\u666F\u3001\u89E3\u51B3\u65B9\u6848\u4E0E\u91CF\u5316\u6210\u679C\u6574\u7406\u4E3A\u53EF\u4FE1\u5BA2\u6237\u6848\u4F8B\u3002"
+  },
+  {
+    id: "B1",
+    code: "B1",
+    group: "B",
+    type: "\u884C\u4E1A\u5185\u5BB9",
+    label: "\u884C\u4E1A\u89C2\u70B9\u4E0E\u8D8B\u52BF\u89C2\u5BDF",
+    description: "\u56F4\u7ED5\u884C\u4E1A\u53D8\u5316\u3001\u5173\u952E\u8BAE\u9898\u548C\u4E13\u4E1A\u5224\u65AD\u5F62\u6210\u6DF1\u5EA6\u89C2\u70B9\u5185\u5BB9\u3002"
+  },
+  {
+    id: "B2",
+    code: "B2",
+    group: "B",
+    type: "\u4EA7\u54C1\u5185\u5BB9",
+    label: "\u4EA7\u54C1\u80FD\u529B\u4E0E\u5E94\u7528\u573A\u666F",
+    description: "\u6E05\u6670\u8BF4\u660E\u4EA7\u54C1\u80FD\u529B\u3001\u9002\u7528\u573A\u666F\u3001\u4F7F\u7528\u65B9\u5F0F\u4E0E\u9009\u62E9\u4F9D\u636E\u3002"
+  },
+  {
+    id: "C1",
+    code: "C1",
+    group: "C",
+    type: "\u65B0\u95FB\u5185\u5BB9",
+    label: "\u4F01\u4E1A\u65B0\u95FB\u4E0E\u52A8\u6001",
+    description: "\u53D1\u5E03\u4F01\u4E1A\u8FDB\u5C55\u3001\u5408\u4F5C\u52A8\u6001\u3001\u6D3B\u52A8\u4FE1\u606F\u4E0E\u91CD\u8981\u91CC\u7A0B\u7891\u3002"
+  },
+  {
+    id: "D1",
+    code: "D1",
+    group: "D",
+    type: "\u95EE\u7B54\u5185\u5BB9",
+    label: "\u77E5\u4E4E\u95EE\u7B54",
+    description: "\u56F4\u7ED5\u7528\u6237\u771F\u5B9E\u95EE\u9898\u8F93\u51FA\u4E13\u4E1A\u3001\u81EA\u7136\u4E14\u6709\u4E8B\u5B9E\u652F\u6491\u7684\u56DE\u7B54\u3002"
+  }
+]);
+var WEBSITE_CONTENT_CATALOG = Object.freeze([
+  { value: "company_facts", label: "\u4F01\u4E1A\u8D44\u6599\u4E0E\u54C1\u724C\u4E8B\u5B9E" },
+  { value: "product_case_docs", label: "\u4EA7\u54C1\u6848\u4F8B\u4E0E\u6587\u6863" },
+  { value: "industry_news", label: "\u884C\u4E1A\u65B0\u95FB\u4E0E\u89C2\u5BDF" },
+  { value: "company_news", label: "\u4F01\u4E1A\u65B0\u95FB\u4E0E\u52A8\u6001" },
+  { value: "faq_content", label: "FAQ \u4E0E\u95EE\u7B54\u9875\u9762" }
+]);
+var DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+  "\u4ECA\u65E5\u5934\u6761",
+  "\u641C\u72D0",
+  "\u7F51\u6613",
+  "\u817E\u8BAF",
+  "\u65B0\u6D6A",
+  "\u767E\u5EA6",
+  "\u4E2D\u534E\u7F51",
+  "\u51E4\u51F0\u7F51",
+  "\u5FAE\u535A"
+]);
+var OVERSEAS_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+  "\u7F8E\u8054\u793E",
+  "\u4ECA\u65E5\u7F8E\u56FD",
+  "\u96C5\u864E",
+  "Business Insider",
+  "Barchart"
+]);
+var ALL_CONTENT_ASSET_MEDIA_OPTIONS = Object.freeze([
+  ...DOMESTIC_CONTENT_ASSET_MEDIA_OPTIONS,
+  ...OVERSEAS_CONTENT_ASSET_MEDIA_OPTIONS
+]);
+var ICP_PROVINCES = Object.freeze([
+  "\u5317\u4EAC",
+  "\u5929\u6D25",
+  "\u6CB3\u5317",
+  "\u5C71\u897F",
+  "\u5185\u8499\u53E4",
+  "\u8FBD\u5B81",
+  "\u5409\u6797",
+  "\u9ED1\u9F99\u6C5F",
+  "\u4E0A\u6D77",
+  "\u6C5F\u82CF",
+  "\u6D59\u6C5F",
+  "\u5B89\u5FBD",
+  "\u798F\u5EFA",
+  "\u6C5F\u897F",
+  "\u5C71\u4E1C",
+  "\u6CB3\u5357",
+  "\u6E56\u5317",
+  "\u6E56\u5357",
+  "\u5E7F\u4E1C",
+  "\u5E7F\u897F",
+  "\u6D77\u5357",
+  "\u91CD\u5E86",
+  "\u56DB\u5DDD",
+  "\u8D35\u5DDE",
+  "\u4E91\u5357",
+  "\u897F\u85CF",
+  "\u9655\u897F",
+  "\u7518\u8083",
+  "\u9752\u6D77",
+  "\u5B81\u590F",
+  "\u65B0\u7586"
+]);
+
+// server/delivery-ticket-service.ts
+var WEBSITE_CONTENT_CATEGORIES = new Set(
+  WEBSITE_CONTENT_CATALOG.map((item) => item.value)
+);
+
+// server/knowledge-base-progress-service.ts
+import { and as and7, asc as asc4, desc as desc7, eq as eq8, isNotNull as isNotNull2, isNull as isNull3 } from "drizzle-orm";
 
 // server/delivery-role-service.ts
 async function requireDb3() {
@@ -5327,12 +5634,12 @@ async function assertDeliveryProjectContext(input) {
     roleType: deliveryProjectAssignments.roleType,
     customerUsername: users.username,
     customerName: users.displayName
-  }).from(deliveryProjectAssignments).innerJoin(users, eq7(users.id, deliveryProjectAssignments.customerUserId)).where(
-    and6(
-      eq7(deliveryProjectAssignments.id, input.projectAssignmentId),
-      eq7(deliveryProjectAssignments.engineerUserId, input.actor.id),
-      eq7(users.role, "user"),
-      eq7(users.isActive, true)
+  }).from(deliveryProjectAssignments).innerJoin(users, eq9(users.id, deliveryProjectAssignments.customerUserId)).where(
+    and8(
+      eq9(deliveryProjectAssignments.id, input.projectAssignmentId),
+      eq9(deliveryProjectAssignments.engineerUserId, input.actor.id),
+      eq9(users.role, "user"),
+      eq9(users.isActive, true)
     )
   ).limit(1);
   const role = rows[0];
@@ -5342,18 +5649,18 @@ async function assertDeliveryProjectContext(input) {
   if (input.customerUserId !== void 0 && input.customerUserId !== role.customerUserId) {
     throw new AuthServiceError("NOT_FOUND", "\u5BA2\u6237\u672A\u5206\u914D\u7ED9\u5F53\u524D\u5DE5\u7A0B\u5E08");
   }
-  const contractRows = await db.select().from(serviceContracts).where(eq7(serviceContracts.userId, role.customerUserId));
+  const contractRows = await db.select().from(serviceContracts).where(eq9(serviceContracts.userId, role.customerUserId));
   const currentContract = selectPortalContract(
     contractRows
   );
   if (!requiredRolesForPlan(currentContract?.planCode).includes(role.roleType)) {
     const activeTicketRows = await db.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
-      and6(
-        eq7(
+      and8(
+        eq9(
           deliveryTickets.assignedProjectAssignmentId,
           role.projectAssignmentId
         ),
-        inArray5(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)
+        inArray6(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)
       )
     ).limit(1);
     if (!activeTicketRows[0]) {
@@ -5364,6 +5671,21 @@ async function assertDeliveryProjectContext(input) {
     ...role,
     customerName: role.customerName || role.customerUsername || `\u5BA2\u6237 ${role.customerUserId}`
   };
+}
+
+// shared/knowledge-base-copy.ts
+var KNOWLEDGE_COLLECTION_STATUS_COPY = "FrontMind \u6B63\u5728\u6309\u4E1A\u52A1\u5206\u652F\u8FDB\u884C\u8D44\u6599\u91C7\u96C6\u3002\u6B64\u9636\u6BB5\u65E0\u9700\u9010\u9879\u786E\u8BA4\uFF0C\u5B8C\u6210\u540E\u5C06\u76F4\u63A5\u751F\u6210\u53EF\u6838\u9A8C\u77E5\u8BC6\u5E93\u3002";
+var HISTORICAL_KNOWLEDGE_COPY_REWRITES = [
+  {
+    from: "FrontMind \u6B63\u5728\u6309\u4E1A\u52A1\u5206\u652F\u8FDB\u884C\u5E7F\u5EA6\u4F18\u5148\u3001\u6DF1\u5EA6\u53D7\u63A7\u7684\u8D44\u6599\u91C7\u96C6\u3002\u6B64\u9636\u6BB5\u65E0\u9700\u9010\u9879\u786E\u8BA4\uFF0C\u5B8C\u6210\u540E\u5C06\u76F4\u63A5\u751F\u6210\u53EF\u6838\u9A8C\u77E5\u8BC6\u5E93\u3002",
+    to: KNOWLEDGE_COLLECTION_STATUS_COPY
+  }
+];
+function normalizeKnowledgeCollectionCopy(value) {
+  return HISTORICAL_KNOWLEDGE_COPY_REWRITES.reduce(
+    (current, rewrite) => current.replaceAll(rewrite.from, rewrite.to),
+    value
+  );
 }
 
 // server/manus-proxy.ts
@@ -5548,7 +5870,7 @@ function sanitizeText(text2) {
     const sourceLower = getSourceBrandLower();
     const sourceTitle = getSourceBrandTitle();
     const sourceUpper = sourceLower.toUpperCase();
-    return text2.replace(
+    const sanitized = text2.replace(
       new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"),
       "https://api.frontmind."
     ).replace(
@@ -5567,6 +5889,7 @@ function sanitizeText(text2) {
       new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"),
       "frontmind"
     );
+    return normalizeKnowledgeCollectionCopy(sanitized);
   } catch (e) {
     console.error("[sanitizeText] Error:", e);
     return text2;

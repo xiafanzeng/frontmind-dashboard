@@ -2,7 +2,7 @@
 import "dotenv/config";
 import express5 from "express";
 import { createServer } from "http";
-import { sql as sql5 } from "drizzle-orm";
+import { sql as sql6 } from "drizzle-orm";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 
 // server/admin-router.ts
@@ -955,6 +955,12 @@ var deliveryTickets = mysqlTable(
       table.assignedMemberId,
       table.status
     ),
+    index("delivery_tickets_member_status_resolved_id_idx").on(
+      table.assignedMemberId,
+      table.status,
+      table.resolvedAt,
+      table.id
+    ),
     foreignKey({
       name: "delivery_tickets_project_assignment_fk",
       columns: [table.assignedProjectAssignmentId],
@@ -1065,6 +1071,103 @@ var deliveryTicketAttachments = mysqlTable(
       table.ownerUserId,
       table.upstreamFileId
     )
+  ]
+);
+var deliveryMemberOrigins = mysqlTable(
+  "delivery_member_origins",
+  {
+    engineerUserId: int("engineerUserId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    createdByAdminId: int("createdByAdminId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    index("delivery_member_origins_admin_idx").on(table.createdByAdminId)
+  ]
+);
+var websiteStyleWorkflows = mysqlTable(
+  "website_style_workflows",
+  {
+    userId: int("userId").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+    status: mysqlEnum("status", [
+      "waiting_samples",
+      "awaiting_selection",
+      "revision_requested",
+      "confirmed",
+      "legacy_confirmed"
+    ]).default("waiting_samples").notNull(),
+    currentBatchId: varchar("currentBatchId", { length: 36 }),
+    selectedSampleId: varchar("selectedSampleId", { length: 36 }),
+    selectedByUserId: int("selectedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    selectedAt: timestamp("selectedAt"),
+    revision: int("revision", { unsigned: true }).default(1).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [index("website_style_workflows_status_idx").on(table.status)]
+);
+var websiteStyleSampleBatches = mysqlTable(
+  "website_style_sample_batches",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+    ticketId: varchar("ticketId", { length: 36 }).notNull().references(() => deliveryTickets.id, { onDelete: "cascade" }),
+    ordinal: int("ordinal", { unsigned: true }).notNull(),
+    status: mysqlEnum("status", [
+      "published",
+      "revision_requested",
+      "selected",
+      "superseded"
+    ]).default("published").notNull(),
+    engineerNote: text("engineerNote"),
+    publishedByUserId: int("publishedByUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    publishedAt: timestamp("publishedAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("website_style_batches_user_ordinal_uq").on(
+      table.userId,
+      table.ordinal
+    ),
+    index("website_style_batches_ticket_status_idx").on(
+      table.ticketId,
+      table.status
+    )
+  ]
+);
+var websiteStyleSamples = mysqlTable(
+  "website_style_samples",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    batchId: varchar("batchId", { length: 36 }).notNull().references(() => websiteStyleSampleBatches.id, {
+      onDelete: "cascade"
+    }),
+    attachmentId: varchar("attachmentId", { length: 36 }).notNull(),
+    label: varchar("label", { length: 160 }).notNull(),
+    note: text("note"),
+    sortOrder: int("sortOrder", { unsigned: true }).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("website_style_samples_batch_order_uq").on(
+      table.batchId,
+      table.sortOrder
+    ),
+    uniqueIndex("website_style_samples_batch_attachment_uq").on(
+      table.batchId,
+      table.attachmentId
+    ),
+    foreignKey({
+      name: "website_style_samples_attachment_fk",
+      columns: [table.attachmentId],
+      foreignColumns: [deliveryTicketAttachments.id]
+    }).onDelete("restrict")
   ]
 );
 var workspaceSiteProfiles = mysqlTable(
@@ -2572,12 +2675,29 @@ async function listManagedUsers() {
   const db = await requireDb();
   const [rows, credentialRows] = await Promise.all([
     db.select().from(users).orderBy(desc(users.createdAt)),
-    db.select({ userId: apiCredentials.userId }).from(apiCredentials).where(eq2(apiCredentials.status, "active"))
+    db.select({
+      userId: apiCredentials.userId,
+      version: apiCredentials.version,
+      status: apiCredentials.status
+    }).from(apiCredentials)
   ]);
-  const configuredUserIds = new Set(credentialRows.map((row) => row.userId));
+  const configuredUserIds = new Set(
+    credentialRows.filter((row) => row.status === "active").map((row) => row.userId)
+  );
+  const credentialVersionByUserId = /* @__PURE__ */ new Map();
+  for (const credential of credentialRows) {
+    credentialVersionByUserId.set(
+      credential.userId,
+      Math.max(
+        credential.version,
+        credentialVersionByUserId.get(credential.userId) ?? 0
+      )
+    );
+  }
   return rows.map((row) => ({
     ...toAuthenticatedUser(row),
-    engineerApiKeyConfigured: row.role === "delivery_member" && configuredUserIds.has(row.id)
+    engineerApiKeyConfigured: row.role === "delivery_member" && configuredUserIds.has(row.id),
+    engineerApiKeyVersion: row.role === "delivery_member" ? credentialVersionByUserId.get(row.id) ?? 0 : 0
   }));
 }
 async function getManagedUser(userId) {
@@ -3094,6 +3214,7 @@ function toCredentialStatus(credential) {
   const status = credential?.status === "deleted" ? null : credential?.validationStatus === "invalid" ? "invalid" : credential?.status ?? null;
   return {
     configured: Boolean(credential && credential.status === "active"),
+    version: credential?.version ?? 0,
     fingerprint: credential?.fingerprint ?? null,
     status,
     verifiedAt: credential?.verifiedAt?.getTime() ?? null
@@ -3101,12 +3222,7 @@ function toCredentialStatus(credential) {
 }
 async function getApiCredentialStatus(userId) {
   const db = await requireDb();
-  const rows = await db.select().from(apiCredentials).where(
-    and(
-      eq2(apiCredentials.userId, userId),
-      eq2(apiCredentials.status, "active")
-    )
-  ).orderBy(desc(apiCredentials.version)).limit(1);
+  const rows = await db.select().from(apiCredentials).where(eq2(apiCredentials.userId, userId)).orderBy(desc(apiCredentials.version)).limit(1);
   return toCredentialStatus(rows[0]);
 }
 async function getEffectiveApiCredentialStatus(accountId) {
@@ -3175,21 +3291,52 @@ async function replaceApiCredential(userId, apiKey, validator = validateUpstream
 }
 async function deleteActiveApiCredential(userId) {
   const db = await requireDb();
-  const now = /* @__PURE__ */ new Date();
-  await db.transaction(async (tx) => {
-    await tx.update(apiCredentials).set({
-      status: "deleted",
-      deletedAt: now,
-      encryptedKey: randomBytes(32).toString("base64"),
-      encryptionIv: randomBytes(12).toString("base64"),
-      encryptionAuthTag: randomBytes(16).toString("base64")
-    }).where(
-      and(
-        eq2(apiCredentials.userId, userId),
-        eq2(apiCredentials.status, "active")
-      )
-    );
+  await db.transaction(
+    (tx) => deleteActiveApiCredentialInTransaction({
+      executor: tx,
+      userId
+    })
+  );
+}
+async function deleteActiveApiCredentialInTransaction(input) {
+  const now = input.now ?? /* @__PURE__ */ new Date();
+  const latestRows = await input.executor.select().from(apiCredentials).where(eq2(apiCredentials.userId, input.userId)).orderBy(desc(apiCredentials.version)).limit(1).for("update");
+  const latest = latestRows[0];
+  if (!latest || latest.status !== "active") {
+    return { version: latest?.version ?? 0, deleted: false };
+  }
+  await input.executor.update(apiCredentials).set({
+    status: "deleted",
+    deletedAt: now,
+    encryptedKey: randomBytes(32).toString("base64"),
+    encryptionIv: randomBytes(12).toString("base64"),
+    encryptionAuthTag: randomBytes(16).toString("base64"),
+    updatedAt: now
+  }).where(
+    and(
+      eq2(apiCredentials.userId, input.userId),
+      eq2(apiCredentials.status, "active")
+    )
+  );
+  const tombstoneVersion = latest.version + 1;
+  await input.executor.insert(apiCredentials).values({
+    id: randomUUID(),
+    userId: input.userId,
+    version: tombstoneVersion,
+    encryptionVersion: 1,
+    encryptedKey: randomBytes(32).toString("base64"),
+    encryptionIv: randomBytes(12).toString("base64"),
+    encryptionAuthTag: randomBytes(16).toString("base64"),
+    fingerprint: randomBytes(16).toString("hex"),
+    status: "deleted",
+    validationStatus: "unverified",
+    verifiedAt: null,
+    retiredAt: null,
+    deletedAt: now,
+    createdAt: now,
+    updatedAt: now
   });
+  return { version: tombstoneVersion, deleted: true };
 }
 async function getDecryptedCredentialForUser(userId, credentialId) {
   const db = await requireDb();
@@ -4901,6 +5048,20 @@ var DELIVERY_TICKET_PUBLIC_STATUS_LABELS = Object.freeze({
   pending: "\u5F85\u53D7\u7406",
   completed: "\u5DF2\u5B8C\u6210"
 });
+function deliveryTicketPublicStage(status) {
+  if (status === "in_progress") return "processing";
+  if (status === "needs_information") return "action_required";
+  if (status === "completed") return "completed";
+  if (status === "rejected" || status === "cancelled") return "closed";
+  return "awaiting_service";
+}
+var DELIVERY_TICKET_PUBLIC_STAGE_LABELS = Object.freeze({
+  awaiting_service: "\u5DF2\u63D0\u4EA4",
+  processing: "\u5904\u7406\u4E2D",
+  action_required: "\u5F85\u60A8\u8865\u5145",
+  completed: "\u5DF2\u5B8C\u6210",
+  closed: "\u5DF2\u7ED3\u675F"
+});
 var publicDeliveryLinkSchema = z6.object({
   label: z6.string().trim().min(1).max(160),
   url: httpUrlSchema
@@ -4913,6 +5074,20 @@ var publicDeliveryTicketSummaryBaseSchema = z6.object({
   topic: z6.string().trim().max(512).nullable(),
   publicStatus: z6.enum(["pending", "completed"]),
   publicStatusLabel: z6.enum(["\u5F85\u53D7\u7406", "\u5DF2\u5B8C\u6210"]),
+  publicStage: z6.enum([
+    "awaiting_service",
+    "processing",
+    "action_required",
+    "completed",
+    "closed"
+  ]),
+  publicStageLabel: z6.enum([
+    "\u5DF2\u63D0\u4EA4",
+    "\u5904\u7406\u4E2D",
+    "\u5F85\u60A8\u8865\u5145",
+    "\u5DF2\u5B8C\u6210",
+    "\u5DF2\u7ED3\u675F"
+  ]),
   publicSummary: z6.string().max(5e4).nullable(),
   knowledgeSnapshotId: z6.string().uuid().nullable().optional()
 });
@@ -4958,7 +5133,13 @@ var publicContentAssetTicketDetailSchema = z6.object({
   attachments: z6.array(publicDeliveryTicketAttachmentSchema).max(100)
 }).strict();
 var publicWebsiteTicketDetailSchema = z6.object({
-  ticket: publicWebsiteTicketSummarySchema
+  ticket: publicWebsiteTicketSummarySchema.extend({
+    revision: z6.number().int().positive(),
+    canReply: z6.boolean(),
+    canAttach: z6.boolean()
+  }).strict(),
+  events: z6.array(publicDeliveryTicketEventSchema),
+  attachments: z6.array(publicDeliveryTicketAttachmentSchema).max(100)
 }).strict();
 var publicKnowledgeBaseTicketDetailSchema = z6.object({
   ticket: publicKnowledgeBaseTicketSummarySchema,
@@ -5012,6 +5193,43 @@ var publicDeliveryTicketWorkspaceMetadataSchema = z6.object({
   websiteWorkflow: z6.object({
     domainCompleted: z6.boolean(),
     icpCompleted: z6.boolean(),
+    styleState: z6.enum([
+      "locked",
+      "waiting_samples",
+      "awaiting_selection",
+      "revision_requested",
+      "confirmed",
+      "legacy_confirmed"
+    ]),
+    styleRevision: z6.number().int().nonnegative(),
+    styleBatch: z6.object({
+      id: z6.string().uuid(),
+      ordinal: z6.number().int().positive(),
+      status: z6.enum([
+        "published",
+        "revision_requested",
+        "selected",
+        "superseded"
+      ]),
+      engineerNote: z6.string().nullable(),
+      publishedAt: z6.number().int().nonnegative().nullable(),
+      samples: z6.array(
+        z6.object({
+          id: z6.string().uuid(),
+          label: z6.string().trim().min(1).max(160),
+          note: z6.string().nullable(),
+          sortOrder: z6.number().int().positive(),
+          attachmentId: z6.string().uuid(),
+          filename: z6.string().trim().min(1).max(512),
+          mimeType: z6.string().nullable(),
+          imageUrl: z6.string().trim().min(1)
+        }).strict()
+      ).length(3)
+    }).strict().nullable(),
+    selectedStyleSampleId: z6.string().uuid().nullable(),
+    styleConfirmed: z6.boolean(),
+    canSelectStyle: z6.boolean(),
+    canRequestStyleRevision: z6.boolean(),
     canSubmitDomain: z6.boolean(),
     canSubmitIcp: z6.boolean(),
     canSubmitContent: z6.boolean(),
@@ -5322,7 +5540,15 @@ function parsePresentationEnvelopeObject(input) {
   }
   assertOnlyKeys(
     input,
-    ["kind", "schemaVersion", "revision", "leafId"],
+    [
+      "kind",
+      "schemaVersion",
+      "revision",
+      "leafId",
+      "imageState",
+      "assetIds",
+      "imageCount"
+    ],
     "Presentation envelope"
   );
   if (input.kind !== KNOWLEDGE_BASE_PRESENTATION_KIND) {
@@ -5350,11 +5576,34 @@ function parsePresentationEnvelopeObject(input) {
   if (typeof input.leafId === "string" && !leafId) {
     fail("INVALID_ENVELOPE", "Presentation envelope leafId cannot be empty");
   }
+  const imageState = input.imageState === void 0 ? void 0 : String(input.imageState).trim();
+  if (imageState !== void 0 && !["attached", "no_eligible_asset", "not_applicable"].includes(imageState)) {
+    fail("INVALID_ENVELOPE", "Presentation envelope imageState is invalid");
+  }
+  if (input.assetIds !== void 0 && (!Array.isArray(input.assetIds) || input.assetIds.some(
+    (assetId) => typeof assetId !== "string" || !assetId.trim()
+  ))) {
+    fail("INVALID_ENVELOPE", "Presentation envelope assetIds are invalid");
+  }
+  const assetIds = input.assetIds === void 0 ? void 0 : Array.from(
+    new Set(input.assetIds.map((assetId) => assetId.trim()))
+  );
+  if (input.imageCount !== void 0 && (!Number.isSafeInteger(input.imageCount) || Number(input.imageCount) < 0 || Number(input.imageCount) > 3)) {
+    fail(
+      "INVALID_ENVELOPE",
+      "Presentation envelope imageCount must be an integer from 0 to 3"
+    );
+  }
   return {
     kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
     schemaVersion: KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION,
     revision: Number(input.revision),
-    leafId
+    leafId,
+    ...imageState ? {
+      imageState
+    } : {},
+    ...assetIds ? { assetIds } : {},
+    ...input.imageCount !== void 0 ? { imageCount: Number(input.imageCount) } : {}
   };
 }
 function parseKnowledgeBasePresentationEnvelope(input) {
@@ -6099,7 +6348,7 @@ function deriveNextAction(input) {
     if (input.currentPeriodPendingApprovalCount > 0) {
       return {
         kind: "await_question_confirmation",
-        label: "\u7B49\u5F85\u7BA1\u7406\u5458\u786E\u8BA4\u542F\u52A8\u95EE\u9898",
+        label: "\u7B49\u5F85\u76D1\u63A7\u5DE5\u7A0B\u5E08\u786E\u8BA4\u542F\u52A8\u95EE\u9898",
         href: "/brand-question-portfolio"
       };
     }
@@ -7809,7 +8058,7 @@ async function approveWorkspaceQuestionSelection(input) {
     if (candidate.selectionApprovalStatus !== "pending") {
       throw new ServiceEntitlementError(
         "QUESTION_SELECTION_CONFIRMATION_REQUIRED",
-        "\u8BE5\u95EE\u9898\u5C1A\u672A\u7531\u7528\u6237\u63D0\u4EA4\u7BA1\u7406\u5458\u786E\u8BA4\u3002",
+        "\u8BE5\u95EE\u9898\u5C1A\u672A\u7531\u7528\u6237\u63D0\u4EA4\u4E13\u4E1A\u5BA1\u6838\u3002",
         409
       );
     }
@@ -7847,7 +8096,7 @@ async function approveWorkspaceQuestionSelection(input) {
     if (question.selectionApprovalStatus !== "pending") {
       throw new ServiceEntitlementError(
         "QUESTION_SELECTION_CONFIRMATION_REQUIRED",
-        "\u8BE5\u95EE\u9898\u5C1A\u672A\u7531\u7528\u6237\u63D0\u4EA4\u7BA1\u7406\u5458\u786E\u8BA4\u3002",
+        "\u8BE5\u95EE\u9898\u5C1A\u672A\u7531\u7528\u6237\u63D0\u4EA4\u4E13\u4E1A\u5BA1\u6838\u3002",
         409
       );
     }
@@ -9681,7 +9930,7 @@ function buildAdminControlPlaneOverview(input) {
         description: "\u5C1A\u672A\u53D1\u5E03\u53EF\u6821\u9A8C\u7684\u4F01\u4E1A\u770B\u677F\u5185\u5BB9\u3002",
         status: "unconfigured",
         updatedAt: user.createdAt.getTime(),
-        href: `/admin/customers/${user.id}/delivery`
+        href: `/admin/customers/${user.id}/service`
       });
     }
     if (user.isActive && (serviceStatus !== "active" || serviceExpiringSoon)) {
@@ -9746,7 +9995,7 @@ function buildAdminControlPlaneOverview(input) {
         description: "\u5B58\u5728\u5931\u8D25\u7684\u667A\u80FD\u4F53\u6267\u884C\u8BB0\u5F55\uFF0C\u8BF7\u8FDB\u5165\u5BA2\u6237\u5DE5\u4F5C\u533A\u68C0\u67E5\u5E76\u91CD\u8BD5\u3002",
         status: "failed",
         updatedAt: row.updatedAt?.getTime() ?? null,
-        href: `/admin/customers/${row.userId}/activity`
+        href: `/admin/customers/${row.userId}/knowledge`
       });
     }
   }
@@ -11360,6 +11609,7 @@ function customerFormalContentViolation(value) {
 }
 
 // server/knowledge-base-progress-service.ts
+var KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH = "e84d5200b4bffa2ac6ff95f6a74d3d9a2875fa7b04f766e5df407ae5b833bdf6";
 var KnowledgeBaseBuildError = class extends Error {
   constructor(code, message) {
     super(message);
@@ -11386,6 +11636,89 @@ function normalizeConversationId(value) {
 }
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function collectKnowledgeBaseOutputImageKeys(value, result = /* @__PURE__ */ new Set(), depth = 0) {
+  if (value === null || value === void 0 || depth > 50) return result;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectKnowledgeBaseOutputImageKeys(item, result, depth + 1);
+    }
+    return result;
+  }
+  if (!isRecord(value)) return result;
+  const type = stringValue(value.type).toLowerCase();
+  const mimeType = stringValue(
+    value.mimeType || value.mime_type || value.content_type
+  ).toLowerCase();
+  const fileName = stringValue(
+    value.fileName || value.file_name || value.filename || value.name
+  );
+  const resourceId = stringValue(value.fileId || value.file_id);
+  const resourceUrl = stringValue(
+    value.fileUrl || value.file_url || value.imageUrl || value.image_url || value.url
+  );
+  const isImage = type === "output_image" || type === "image" || mimeType.startsWith("image/") || /\.(?:avif|gif|jpe?g|png|svg|webp)$/i.test(fileName);
+  if (isImage && (resourceId || resourceUrl)) {
+    result.add(resourceId || resourceUrl);
+  }
+  for (const item of Object.values(value)) {
+    if (item && typeof item === "object") {
+      collectKnowledgeBaseOutputImageKeys(item, result, depth + 1);
+    }
+  }
+  return result;
+}
+function latestKnowledgeBasePresentationOutput(output) {
+  if (!Array.isArray(output)) return output;
+  const assistantIndexes = output.flatMap(
+    (item, index2) => extractFinalKnowledgeBaseAssistantText([item]) ? [index2] : []
+  );
+  if (assistantIndexes.length === 0) return output;
+  const presentationIndex = [...assistantIndexes].reverse().find(
+    (index2) => extractFinalKnowledgeBaseAssistantText([output[index2]]).includes(
+      "FRONTMIND_KB_PRESENTATION"
+    )
+  ) ?? assistantIndexes[assistantIndexes.length - 1];
+  return output.slice(presentationIndex);
+}
+function assertKnowledgeBaseNodeImageDelivery(input) {
+  if (input.skillContentHash !== KNOWLEDGE_BASE_NODE_IMAGE_CONTRACT_CONTENT_HASH) {
+    return;
+  }
+  const { presentation } = input;
+  if (presentation.imageState === void 0 || presentation.assetIds === void 0 || presentation.imageCount === void 0) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "\u5F53\u524D\u8282\u70B9\u7F3A\u5C11\u56FE\u7247\u4EA4\u4ED8\u58F0\u660E\uFF0C\u672C\u8F6E\u672A\u63A8\u8FDB"
+    );
+  }
+  const actualImageCount = collectKnowledgeBaseOutputImageKeys(
+    latestKnowledgeBasePresentationOutput(input.output)
+  ).size;
+  if (presentation.leafId === null) {
+    if (presentation.imageState !== "not_applicable" || presentation.assetIds.length !== 0 || presentation.imageCount !== 0 || actualImageCount !== 0) {
+      throw new KnowledgeBaseBuildError(
+        "PROGRESS_PROTOCOL_INVALID",
+        "\u77E5\u8BC6\u5E93\u5DF2\u5B8C\u6210\uFF0C\u672C\u8F6E\u56FE\u7247\u4EA4\u4ED8\u58F0\u660E\u5FC5\u987B\u4E3A not_applicable"
+      );
+    }
+    return;
+  }
+  if (presentation.imageState === "attached") {
+    if (presentation.assetIds.length === 0 || presentation.assetIds.length !== presentation.imageCount || presentation.imageCount !== actualImageCount) {
+      throw new KnowledgeBaseBuildError(
+        "PROGRESS_PROTOCOL_INVALID",
+        "\u5F53\u524D\u8282\u70B9\u56FE\u7247\u9644\u4EF6\u4E0E\u8D44\u4EA7\u58F0\u660E\u4E0D\u4E00\u81F4\uFF0C\u672C\u8F6E\u672A\u63A8\u8FDB"
+      );
+    }
+    return;
+  }
+  if (presentation.imageState !== "no_eligible_asset" || presentation.assetIds.length !== 0 || presentation.imageCount !== 0 || actualImageCount !== 0) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "\u5F53\u524D\u8282\u70B9\u65E0\u53EF\u4EA4\u4ED8\u56FE\u7247\u65F6\u5FC5\u987B\u660E\u786E\u58F0\u660E no_eligible_asset"
+    );
+  }
 }
 function stringValue(value) {
   if (typeof value === "string") return value.trim();
@@ -11727,7 +12060,9 @@ async function claimKnowledgeBaseTurn(input) {
       eq10(knowledgeBaseBuilds.upstreamTaskId, input.taskId),
       eq10(knowledgeBaseBuilds.status, "confirming"),
       isNotNull2(knowledgeBaseBuilds.currentLeafId),
-      isNull3(knowledgeBaseBuilds.awaitingResponseSince)
+      isNull3(knowledgeBaseBuilds.awaitingResponseSince),
+      input.expectedRevision === void 0 ? void 0 : eq10(knowledgeBaseBuilds.revision, input.expectedRevision),
+      input.expectedLeafId ? eq10(knowledgeBaseBuilds.currentLeafId, input.expectedLeafId) : void 0
     )
   );
   if (!result[0]?.affectedRows) {
@@ -11948,10 +12283,15 @@ async function reconcileKnowledgeBaseProgress(input) {
             },
             reopenedRows
           );
-          assertKnowledgeBasePresentationMatchesState(
+          const presentation = assertKnowledgeBasePresentationMatchesState(
             expectedReopenedState,
             text2
           );
+          assertKnowledgeBaseNodeImageDelivery({
+            skillContentHash: build.skillContentHash,
+            presentation,
+            output: input.output
+          });
         }
         await tx.update(knowledgeBaseBuildNodes).set({
           status: "needs_verification",
@@ -12010,7 +12350,15 @@ async function reconcileKnowledgeBaseProgress(input) {
       assertActionMatchesTransition(action, envelope.transition.to);
       const nextState = applyKnowledgeBaseProgressEnvelope(state, envelope);
       if (build.skillVersion === "3") {
-        assertKnowledgeBasePresentationMatchesState(nextState, text2);
+        const presentation = assertKnowledgeBasePresentationMatchesState(
+          nextState,
+          text2
+        );
+        assertKnowledgeBaseNodeImageDelivery({
+          skillContentHash: build.skillContentHash,
+          presentation,
+          output: input.output
+        });
       }
       const summary = getKnowledgeBaseProgressSummary(nextState);
       const packageAllowed = canPackageKnowledgeBase(nextState);
@@ -15461,7 +15809,8 @@ import {
   lt as lt3,
   max,
   ne as ne3,
-  or as or3
+  or as or3,
+  sql as sql2
 } from "drizzle-orm";
 
 // shared/delivery-catalog.ts
@@ -15581,6 +15930,82 @@ var ICP_PROVINCES = Object.freeze([
   "\u65B0\u7586"
 ]);
 
+// shared/delivery-roles.ts
+import { z as z9 } from "zod";
+var deliveryRoleTypeSchema = z9.enum([
+  "ai_operations_engineer",
+  "monitoring_optimization_engineer",
+  "content_distribution_engineer"
+]);
+var DELIVERY_ROLE_LABELS = {
+  ai_operations_engineer: "AI \u8FD0\u7EF4\u5DE5\u7A0B\u5E08",
+  monitoring_optimization_engineer: "AI \u76D1\u63A7\u4E0E\u4F18\u5316\u5DE5\u7A0B\u5E08",
+  content_distribution_engineer: "AI \u5185\u5BB9\u5206\u53D1\u5DE5\u7A0B\u5E08"
+};
+var deliveryWorkflowOperationSchema = z9.enum([
+  "build_exception",
+  "knowledge_maintenance",
+  "knowledge_reset",
+  "question_catalog",
+  "initial_monitoring",
+  "monitoring_import",
+  "monitoring_retest",
+  "stage_report",
+  "response_logic",
+  "content_asset_publish",
+  "channel_distribution",
+  "domain_application",
+  "icp_filing",
+  "website_style_samples",
+  "company_facts",
+  "product_case_docs",
+  "industry_news",
+  "company_news",
+  "faq_content",
+  "site_check"
+]);
+var OPERATIONS_BY_ROLE = {
+  ai_operations_engineer: [
+    "build_exception",
+    "knowledge_maintenance",
+    "knowledge_reset",
+    "domain_application",
+    "icp_filing",
+    "website_style_samples",
+    "company_facts",
+    "product_case_docs",
+    "industry_news",
+    "company_news",
+    "faq_content",
+    "site_check"
+  ],
+  monitoring_optimization_engineer: [
+    "question_catalog",
+    "initial_monitoring",
+    "monitoring_import",
+    "monitoring_retest",
+    "stage_report"
+  ],
+  content_distribution_engineer: [
+    "response_logic",
+    "content_asset_publish",
+    "channel_distribution"
+  ]
+};
+function deliveryRoleOwnsOperation(roleType, operation) {
+  return OPERATIONS_BY_ROLE[roleType].includes(operation);
+}
+function deliveryOperationTriggersMonitoringRetest(operation) {
+  return operation === "channel_distribution" || operation === "site_check";
+}
+var knowledgeResetReasonSchema = z9.enum([
+  "stuck",
+  "upload_error",
+  "build_error",
+  "enterprise_materials",
+  "other"
+]);
+
 // server/delivery-ticket-error.ts
 var DeliveryTicketError = class extends Error {
   constructor(code, message, statusCode = 409) {
@@ -15592,6 +16017,14 @@ var DeliveryTicketError = class extends Error {
 };
 
 // server/delivery-ticket-service.ts
+function assertManagedTicketCanBeExecutedByAdmin(ticket) {
+  if (!ticket.workflowDomain) return;
+  throw new DeliveryTicketError(
+    "ROLE_OWNED_TICKET_ADMIN_EXECUTION_FORBIDDEN",
+    `\u8BE5\u5DE5\u5355\u5DF2\u7531${DELIVERY_ROLE_LABELS[ticket.workflowDomain]}\u8D1F\u8D23\uFF0C\u8BF7\u5728\u5BF9\u5E94\u5DE5\u7A0B\u5E08\u5DE5\u4F5C\u53F0\u5B8C\u6210\u6267\u884C\u4E0E\u4EA4\u4ED8\uFF1B\u7BA1\u7406\u5458\u4EC5\u8D1F\u8D23\u534F\u8C03\u3001\u50AC\u529E\u548C\u5F02\u5E38\u6CBB\u7406\u3002`,
+    403
+  );
+}
 async function requireDb9() {
   const db = await getDb();
   if (!db) {
@@ -15679,6 +16112,12 @@ function normalizeDomain(value) {
 var WEBSITE_CONTENT_CATEGORIES = new Set(
   WEBSITE_CONTENT_CATALOG.map((item) => item.value)
 );
+function websiteTicketAllowsPublicAttachments(category) {
+  return Boolean(category && WEBSITE_CONTENT_CATEGORIES.has(category));
+}
+function deliveryTicketStatusAfterCustomerMessage(input) {
+  return input.actorRole === "user" && input.currentStatus === "needs_information" ? "submitted" : input.currentStatus;
+}
 async function assertWebsiteTicketWorkflow(executor, userId, value) {
   if (value.type !== "website_operation") {
     return { profile: null, domain: null };
@@ -15701,7 +16140,7 @@ async function assertWebsiteTicketWorkflow(executor, userId, value) {
     if (profile?.domainStatus === "completed") {
       throw new DeliveryTicketError(
         "DOMAIN_ALREADY_VERIFIED",
-        "\u5F53\u524D\u4F01\u4E1A\u57DF\u540D\u5DF2\u7531\u7BA1\u7406\u5458\u786E\u8BA4\uFF0C\u65E0\u9700\u91CD\u590D\u7533\u8BF7\u3002"
+        "\u5F53\u524D\u4F01\u4E1A\u57DF\u540D\u5DF2\u7531 AI \u8FD0\u7EF4\u5DE5\u7A0B\u5E08\u6838\u9A8C\uFF0C\u65E0\u9700\u91CD\u590D\u7533\u8BF7\u3002"
       );
     }
     return { profile, domain };
@@ -15728,6 +16167,14 @@ async function assertWebsiteTicketWorkflow(executor, userId, value) {
       throw new DeliveryTicketError(
         "WEBSITE_PREREQUISITES_REQUIRED",
         "\u8BF7\u5148\u5728\u963F\u91CC\u4E91\u5B8C\u6210\u57DF\u540D\u6CE8\u518C\u4E0E ICP \u5907\u6848\uFF0C\u5E76\u63D0\u4EA4\u5907\u6848\u7ED3\u679C\u3002",
+        403
+      );
+    }
+    const styleRows = await executor.select({ status: websiteStyleWorkflows.status }).from(websiteStyleWorkflows).where(eq16(websiteStyleWorkflows.userId, userId)).limit(1).for("update");
+    if (!styleRows[0] || !["confirmed", "legacy_confirmed"].includes(styleRows[0].status)) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_REQUIRED",
+        "\u8BF7\u5148\u7B49\u5F85\u5DE5\u7A0B\u5E08\u63D0\u4F9B\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u6837\u4F8B\uFF0C\u5E76\u786E\u8BA4\u5176\u4E2D\u4E00\u79CD\u98CE\u683C\u3002",
         403
       );
     }
@@ -15885,6 +16332,12 @@ function ticketDto(row, extra) {
     quotaPool: row.quotaPool,
     quotaState: row.quotaState,
     category: row.category,
+    workflowDomain: row.workflowDomain,
+    operation: row.operation,
+    assignedProjectAssignmentId: row.assignedProjectAssignmentId,
+    assignedMemberId: row.assignedMemberId,
+    assignedMemberName: extra?.assignedMemberName ?? null,
+    priority: row.priority,
     topic: row.topic,
     title: row.title,
     description: row.description,
@@ -15898,6 +16351,8 @@ function ticketDto(row, extra) {
     statusLabel: DELIVERY_TICKET_STATUS_LABELS[row.status],
     publicStatus: deliveryTicketPublicStatus(row.status),
     publicStatusLabel: DELIVERY_TICKET_PUBLIC_STATUS_LABELS[deliveryTicketPublicStatus(row.status)],
+    publicStage: deliveryTicketPublicStage(row.status),
+    publicStageLabel: DELIVERY_TICKET_PUBLIC_STAGE_LABELS[deliveryTicketPublicStage(row.status)],
     publicSummary: row.publicSummary,
     deliveryLinks: row.deliveryLinks,
     revision: row.revision,
@@ -15947,7 +16402,9 @@ function publicDeliveryCategoryLabel(ticket) {
   const category = nonEmpty(ticket.category);
   if (!category) return null;
   if (ticket.type === "knowledge_base") {
-    return category === "knowledge_reset" ? "\u77E5\u8BC6\u5E93\u91CD\u7F6E" : category;
+    if (category === "knowledge_reset") return "\u77E5\u8BC6\u5E93\u91CD\u7F6E";
+    if (category === "knowledge_delivery") return "\u54C1\u724C\u5168\u57DF\u77E5\u8BC6\u5E93";
+    return category;
   }
   if (ticket.type === "content_asset") {
     return CONTENT_ASSET_CATALOG.find((item) => item.id === category)?.label ?? category;
@@ -15959,6 +16416,7 @@ function publicDeliveryCategoryLabel(ticket) {
 }
 function toPublicDeliveryTicketSummary(ticket) {
   const publicStatus2 = deliveryTicketPublicStatus(ticket.status);
+  const publicStage = deliveryTicketPublicStage(ticket.status);
   const base = {
     id: ticket.id,
     type: ticket.type,
@@ -15967,7 +16425,9 @@ function toPublicDeliveryTicketSummary(ticket) {
     topic: nonEmpty(ticket.topic) ?? nonEmpty(ticket.title) ?? nonEmpty(ticket.category),
     publicStatus: publicStatus2,
     publicStatusLabel: DELIVERY_TICKET_PUBLIC_STATUS_LABELS[publicStatus2],
-    publicSummary: publicStatus2 === "completed" ? nonEmpty(ticket.publicSummary) : null,
+    publicStage,
+    publicStageLabel: DELIVERY_TICKET_PUBLIC_STAGE_LABELS[publicStage],
+    publicSummary: publicStatus2 === "completed" || publicStage === "action_required" ? nonEmpty(ticket.publicSummary) : null,
     knowledgeSnapshotId: ticket.knowledgeSnapshotId
   };
   return publicDeliveryTicketSummarySchema.parse(
@@ -16032,6 +16492,59 @@ async function loadSiteProfile(db, userId) {
     revision: 0,
     updatedAt: null
   } : null;
+}
+async function loadWebsiteStyleWorkflow(db, userId) {
+  const workflowRows = await db.select().from(websiteStyleWorkflows).where(eq16(websiteStyleWorkflows.userId, userId)).limit(1);
+  const workflow = workflowRows[0];
+  if (!workflow) return null;
+  if (!workflow.currentBatchId) {
+    return {
+      status: workflow.status,
+      revision: workflow.revision,
+      selectedSampleId: workflow.selectedSampleId,
+      selectedAt: epoch3(workflow.selectedAt),
+      currentBatch: null
+    };
+  }
+  const [batchRows, sampleRows] = await Promise.all([
+    db.select().from(websiteStyleSampleBatches).where(eq16(websiteStyleSampleBatches.id, workflow.currentBatchId)).limit(1),
+    db.select({
+      sample: websiteStyleSamples,
+      attachment: deliveryTicketAttachments
+    }).from(websiteStyleSamples).innerJoin(
+      deliveryTicketAttachments,
+      eq16(deliveryTicketAttachments.id, websiteStyleSamples.attachmentId)
+    ).where(eq16(websiteStyleSamples.batchId, workflow.currentBatchId)).orderBy(asc7(websiteStyleSamples.sortOrder))
+  ]);
+  const batch = batchRows[0];
+  return {
+    status: workflow.status,
+    revision: workflow.revision,
+    selectedSampleId: workflow.selectedSampleId,
+    selectedAt: epoch3(workflow.selectedAt),
+    currentBatch: batch ? {
+      id: batch.id,
+      ordinal: batch.ordinal,
+      status: batch.status,
+      engineerNote: batch.engineerNote,
+      publishedAt: epoch3(batch.publishedAt),
+      samples: sampleRows.map(
+        ({
+          sample,
+          attachment
+        }) => ({
+          id: sample.id,
+          label: sample.label,
+          note: sample.note,
+          sortOrder: sample.sortOrder,
+          attachmentId: attachment.id,
+          filename: attachment.filename,
+          mimeType: attachment.mimeType,
+          imageUrl: `/api/delivery-ticket-attachments/${attachment.id}/content`
+        })
+      )
+    } : null
+  };
 }
 async function currentQuota(db, userId, portal) {
   const periodIds = [
@@ -16107,7 +16620,14 @@ async function hydrateTicketSummaries(db, rows) {
   if (!rows.length) return [];
   const ids = rows.map((row) => row.ticket.id);
   const userIds = [...new Set(rows.map((row) => row.ticket.userId))];
-  const [attachments2, events] = await Promise.all([
+  const assignedMemberIds = [
+    ...new Set(
+      rows.flatMap(
+        (row) => row.ticket.assignedMemberId ? [row.ticket.assignedMemberId] : []
+      )
+    )
+  ];
+  const [attachments2, events, assignedMembers] = await Promise.all([
     db.select({ ticketId: deliveryTicketAttachments.ticketId, value: count2() }).from(deliveryTicketAttachments).where(inArray8(deliveryTicketAttachments.ticketId, ids)).groupBy(deliveryTicketAttachments.ticketId),
     db.select({
       ticketId: deliveryTicketEvents.ticketId,
@@ -16118,7 +16638,12 @@ async function hydrateTicketSummaries(db, rows) {
         inArray8(deliveryTicketEvents.ticketId, ids),
         eq16(deliveryTicketEvents.visibility, "customer")
       )
-    ).orderBy(desc13(deliveryTicketEvents.createdAt))
+    ).orderBy(desc13(deliveryTicketEvents.createdAt)),
+    assignedMemberIds.length ? db.select({
+      id: users.id,
+      displayName: users.displayName,
+      username: users.username
+    }).from(users).where(inArray8(users.id, assignedMemberIds)) : []
   ]);
   const assignments = await db.select({
     userId: userAdminAssignments.userId,
@@ -16138,6 +16663,12 @@ async function hydrateTicketSummaries(db, rows) {
   const counts = new Map(
     attachments2.map((row) => [row.ticketId, Number(row.value)])
   );
+  const memberNames = new Map(
+    assignedMembers.map((member) => [
+      member.id,
+      member.displayName?.trim() || member.username?.trim() || `\u5DE5\u7A0B\u5E08 ${member.id}`
+    ])
+  );
   const latest = /* @__PURE__ */ new Map();
   for (const event of events) {
     if (!latest.has(event.ticketId) && event.message) {
@@ -16149,7 +16680,8 @@ async function hydrateTicketSummaries(db, rows) {
       enterpriseName: row.enterpriseName,
       attachmentCount: counts.get(row.ticket.id) ?? 0,
       latestPublicMessage: latest.get(row.ticket.id) ?? null,
-      assignedAdmins: assignedByUser.get(row.ticket.userId) ?? []
+      assignedAdmins: assignedByUser.get(row.ticket.userId) ?? [],
+      assignedMemberName: row.ticket.assignedMemberId ? memberNames.get(row.ticket.assignedMemberId) ?? null : null
     })
   );
 }
@@ -16262,9 +16794,17 @@ async function getDeliveryTicketWorkspace(userId) {
 async function getDeliveryTicketWorkspaceMetadata(userId) {
   const db = await requireDb9();
   const portal = await getServicePortal(userId);
-  const [accountRows, siteProfile, quotas, pendingRows, ownerRows] = await Promise.all([
+  const [
+    accountRows,
+    siteProfile,
+    styleWorkflow,
+    quotas,
+    pendingRows,
+    ownerRows
+  ] = await Promise.all([
     db.select({ marketEdition: users.marketEdition }).from(users).where(eq16(users.id, userId)).limit(1),
     loadSiteProfile(db, userId),
+    loadWebsiteStyleWorkflow(db, userId),
     currentQuota(db, userId, portal),
     db.select({ value: count2() }).from(deliveryTickets).where(
       and13(
@@ -16277,10 +16817,7 @@ async function getDeliveryTicketWorkspaceMetadata(userId) {
         ])
       )
     ),
-    db.select({ roleType: deliveryProjectAssignments.roleType }).from(deliveryProjectAssignments).innerJoin(
-      users,
-      eq16(users.id, deliveryProjectAssignments.engineerUserId)
-    ).where(
+    db.select({ roleType: deliveryProjectAssignments.roleType }).from(deliveryProjectAssignments).innerJoin(users, eq16(users.id, deliveryProjectAssignments.engineerUserId)).where(
       and13(
         eq16(deliveryProjectAssignments.customerUserId, userId),
         eq16(users.role, "delivery_member"),
@@ -16292,6 +16829,8 @@ async function getDeliveryTicketWorkspaceMetadata(userId) {
   const ownerTypes = new Set(ownerRows.map((row) => row.roleType));
   const domainCompleted = siteProfile?.domainStatus === "completed";
   const icpCompleted = siteProfile?.icpStatus === "approved" || siteProfile?.icpStatus === "not_required";
+  const styleState = styleWorkflow?.status ?? (icpCompleted ? "waiting_samples" : "locked");
+  const styleConfirmed = styleState === "confirmed" || styleState === "legacy_confirmed";
   const marketEdition = accountRows[0]?.marketEdition ?? "domestic";
   return {
     siteProfile,
@@ -16313,13 +16852,20 @@ async function getDeliveryTicketWorkspaceMetadata(userId) {
       icpStatus: siteProfile?.icpStatus ?? "not_submitted",
       domainCompleted,
       icpCompleted,
+      styleState,
+      styleRevision: styleWorkflow?.revision ?? 0,
+      styleBatch: styleWorkflow?.currentBatch ?? null,
+      selectedStyleSampleId: styleWorkflow?.selectedSampleId ?? null,
+      styleConfirmed,
+      canSelectStyle: styleState === "awaiting_selection",
+      canRequestStyleRevision: styleState === "awaiting_selection",
       canSubmitDomain: !domainCompleted,
       canSubmitIcp: !icpCompleted,
-      canSubmitContent: domainCompleted && icpCompleted,
+      canSubmitContent: domainCompleted && icpCompleted && styleConfirmed,
       icpProvince: siteProfile?.icpProvince ?? null,
       icpProvinceOptions: ICP_PROVINCES,
       icpLockReason: null,
-      contentLockReason: !domainCompleted ? "\u8BF7\u5148\u5728\u963F\u91CC\u4E91\u5B8C\u6210\u57DF\u540D\u6CE8\u518C\u4E0E ICP \u5907\u6848\uFF0C\u5E76\u63D0\u4EA4\u5907\u6848\u7ED3\u679C\u3002" : !icpCompleted ? "\u8BF7\u5148\u63D0\u4EA4\u5E76\u786E\u8BA4\u57DF\u540D\u4E0E ICP \u4E3B\u4F53\u5907\u6848\u53F7\u3002" : null
+      contentLockReason: !domainCompleted ? "\u8BF7\u5148\u5728\u963F\u91CC\u4E91\u5B8C\u6210\u57DF\u540D\u6CE8\u518C\u4E0E ICP \u5907\u6848\uFF0C\u5E76\u63D0\u4EA4\u5907\u6848\u7ED3\u679C\u3002" : !icpCompleted ? "\u8BF7\u5148\u63D0\u4EA4\u5E76\u786E\u8BA4\u57DF\u540D\u4E0E ICP \u4E3B\u4F53\u5907\u6848\u53F7\u3002" : !styleConfirmed ? styleState === "awaiting_selection" ? "\u8BF7\u5148\u9009\u62E9\u4E00\u79CD\u5B98\u7F51\u56FE\u7247\u98CE\u683C\uFF0C\u6216\u586B\u5199\u539F\u56E0\u9000\u56DE\u5DE5\u7A0B\u5E08\u91CD\u505A\u3002" : styleState === "revision_requested" ? "\u5DF2\u9000\u56DE\u5DE5\u7A0B\u5E08\u91CD\u505A\uFF0C\u6B63\u5728\u7B49\u5F85\u65B0\u4E00\u6279\u56FE\u7247\u98CE\u683C\u6837\u4F8B\u3002" : "\u6B63\u5728\u7B49\u5F85\u5DE5\u7A0B\u5E08\u63D0\u4F9B\u4E09\u5F20\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u6837\u4F8B\u3002" : null
     }
   };
 }
@@ -16333,6 +16879,7 @@ function toPublicDeliveryTicketWorkspaceMetadata(metadata) {
   const icpPending = metadata.siteProfile?.icpStatus === "preparing" || metadata.siteProfile?.icpStatus === "submitted";
   const domainCompleted = metadata.websiteWorkflow.domainCompleted;
   const icpCompleted = metadata.websiteWorkflow.icpCompleted;
+  const styleConfirmed = metadata.websiteWorkflow.styleConfirmed;
   const aiOperationsUnavailableReason = metadata.quotas.website_content_publish.reason || "\u5C1A\u672A\u5206\u914D AI \u8FD0\u7EF4\u5DE5\u7A0B\u5E08\uFF0C\u8BF7\u8054\u7CFB\u4EA4\u4ED8\u7BA1\u7406\u5458\u3002";
   const quota = (value, hasOwner) => ({
     type: value.type,
@@ -16362,11 +16909,18 @@ function toPublicDeliveryTicketWorkspaceMetadata(metadata) {
       domainCompleted,
       icpCompleted,
       canSubmitDomain: deliveryOwners.aiOperations && !domainCompleted && !domainPending,
-      canSubmitIcp: deliveryOwners.aiOperations && !icpCompleted && !domainPending && !icpPending,
-      canSubmitContent: deliveryOwners.aiOperations && domainCompleted && icpCompleted,
-      domainLockReason: domainPending ? "\u57DF\u540D\u7533\u8BF7\u5DE5\u5355\u5F85\u7BA1\u7406\u5458\u53D7\u7406\u3002" : !deliveryOwners.aiOperations ? aiOperationsUnavailableReason : domainCompleted ? null : null,
-      icpLockReason: !deliveryOwners.aiOperations ? aiOperationsUnavailableReason : domainPending || icpPending ? "\u57DF\u540D\u4E0E ICP \u5907\u6848\u7ED3\u679C\u5F85\u7BA1\u7406\u5458\u786E\u8BA4\u3002" : null,
-      contentLockReason: !deliveryOwners.aiOperations ? aiOperationsUnavailableReason : !domainCompleted ? "\u8BF7\u5148\u5728\u963F\u91CC\u4E91\u5B8C\u6210\u57DF\u540D\u6CE8\u518C\u4E0E ICP \u5907\u6848\uFF0C\u5E76\u63D0\u4EA4\u5907\u6848\u7ED3\u679C\u3002" : !icpCompleted ? "\u8BF7\u5148\u63D0\u4EA4\u5E76\u786E\u8BA4\u57DF\u540D\u4E0E ICP \u4E3B\u4F53\u5907\u6848\u53F7\u3002" : null,
+      canSubmitIcp: deliveryOwners.aiOperations && domainCompleted && !icpCompleted && !domainPending && !icpPending,
+      canSubmitContent: deliveryOwners.aiOperations && domainCompleted && icpCompleted && styleConfirmed,
+      styleState: metadata.websiteWorkflow.styleState,
+      styleRevision: metadata.websiteWorkflow.styleRevision,
+      styleBatch: metadata.websiteWorkflow.styleBatch,
+      selectedStyleSampleId: metadata.websiteWorkflow.selectedStyleSampleId,
+      styleConfirmed,
+      canSelectStyle: deliveryOwners.aiOperations && metadata.websiteWorkflow.canSelectStyle,
+      canRequestStyleRevision: deliveryOwners.aiOperations && metadata.websiteWorkflow.canRequestStyleRevision,
+      domainLockReason: domainPending ? "\u57DF\u540D\u7533\u8BF7\u5DE5\u5355\u6B63\u5728\u7B49\u5F85 AI \u8FD0\u7EF4\u5DE5\u7A0B\u5E08\u5904\u7406\u3002" : !deliveryOwners.aiOperations ? aiOperationsUnavailableReason : domainCompleted ? null : null,
+      icpLockReason: !deliveryOwners.aiOperations ? aiOperationsUnavailableReason : !domainCompleted ? domainPending ? "\u57DF\u540D\u5DE5\u5355\u6B63\u5728\u5904\u7406\uFF1B\u5DE5\u5355\u5B8C\u6210\u5E76\u8FD4\u56DE\u5907\u6848\u670D\u52A1\u7801\u540E\uFF0C\u624D\u53EF\u63D0\u4EA4 ICP \u5907\u6848\u7ED3\u679C\u3002" : "\u8BF7\u5148\u8D2D\u4E70\u57DF\u540D\u5E76\u63D0\u4EA4 AI \u8FD0\u7EF4\u5DE5\u5355\uFF0C\u9886\u53D6\u5907\u6848\u670D\u52A1\u7801\u540E\u518D\u8FDB\u884C ICP \u5907\u6848\u3002" : icpPending ? "ICP \u5907\u6848\u7ED3\u679C\u5F85 AI \u8FD0\u7EF4\u5DE5\u7A0B\u5E08\u6838\u9A8C\u3002" : null,
+      contentLockReason: !deliveryOwners.aiOperations ? aiOperationsUnavailableReason : !domainCompleted ? "\u8BF7\u5148\u8D2D\u4E70\u57DF\u540D\u5E76\u63D0\u4EA4 AI \u8FD0\u7EF4\u5DE5\u5355\uFF0C\u9886\u53D6\u5907\u6848\u670D\u52A1\u7801\u540E\u5B8C\u6210 ICP \u5907\u6848\u3002" : !icpCompleted ? "\u8BF7\u5148\u63D0\u4EA4\u5E76\u786E\u8BA4\u57DF\u540D\u4E0E ICP \u4E3B\u4F53\u5907\u6848\u53F7\u3002" : metadata.websiteWorkflow.contentLockReason,
       icpProvinceOptions: metadata.websiteWorkflow.icpProvinceOptions
     }
   });
@@ -16375,6 +16929,177 @@ async function getPublicDeliveryTicketWorkspaceMetadata(userId) {
   return toPublicDeliveryTicketWorkspaceMetadata(
     await getDeliveryTicketWorkspaceMetadata(userId)
   );
+}
+async function selectWebsiteStyleSample(input) {
+  if (input.actor.role !== "user") {
+    throw new DeliveryTicketError(
+      "WEBSITE_STYLE_USER_REQUIRED",
+      "\u53EA\u6709\u5F53\u524D\u5BA2\u6237\u53EF\u4EE5\u786E\u8BA4\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u3002",
+      403
+    );
+  }
+  const db = await requireDb9();
+  return db.transaction(async (tx) => {
+    const workflowRows = await tx.select().from(websiteStyleWorkflows).where(eq16(websiteStyleWorkflows.userId, input.actor.id)).limit(1).for("update");
+    const workflow = workflowRows[0];
+    if (!workflow || workflow.status !== "awaiting_selection" || workflow.revision !== input.expectedRevision || !workflow.currentBatchId) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_STATE_CHANGED",
+        "\u5B98\u7F51\u98CE\u683C\u6837\u4F8B\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002",
+        409
+      );
+    }
+    const sampleRows = await tx.select({
+      sample: websiteStyleSamples,
+      batch: websiteStyleSampleBatches
+    }).from(websiteStyleSamples).innerJoin(
+      websiteStyleSampleBatches,
+      eq16(websiteStyleSampleBatches.id, websiteStyleSamples.batchId)
+    ).where(
+      and13(
+        eq16(websiteStyleSamples.id, input.sampleId),
+        eq16(websiteStyleSamples.batchId, workflow.currentBatchId),
+        eq16(websiteStyleSampleBatches.userId, input.actor.id)
+      )
+    ).limit(1);
+    const selected = sampleRows[0];
+    if (!selected) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_SAMPLE_NOT_FOUND",
+        "\u5B98\u7F51\u98CE\u683C\u6837\u4F8B\u4E0D\u5B58\u5728\u3002",
+        404
+      );
+    }
+    const ticketRows = await tx.select().from(deliveryTickets).where(eq16(deliveryTickets.id, selected.batch.ticketId)).limit(1).for("update");
+    const ticket = ticketRows[0];
+    if (!ticket || ticket.userId !== input.actor.id) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_SAMPLE_NOT_FOUND",
+        "\u5B98\u7F51\u98CE\u683C\u6837\u4F8B\u4E0D\u5B58\u5728\u3002",
+        404
+      );
+    }
+    const now = /* @__PURE__ */ new Date();
+    await tx.update(websiteStyleWorkflows).set({
+      status: "confirmed",
+      selectedSampleId: selected.sample.id,
+      selectedByUserId: input.actor.id,
+      selectedAt: now,
+      revision: workflow.revision + 1,
+      updatedAt: now
+    }).where(eq16(websiteStyleWorkflows.userId, input.actor.id));
+    await tx.update(websiteStyleSampleBatches).set({ status: "selected", updatedAt: now }).where(eq16(websiteStyleSampleBatches.id, selected.batch.id));
+    await tx.update(deliveryTickets).set({
+      status: "completed",
+      publicSummary: `\u5BA2\u6237\u5DF2\u786E\u8BA4\u5B98\u7F51\u56FE\u7247\u98CE\u683C\uFF1A${selected.sample.label}`,
+      resolvedAt: now,
+      revision: sql2`${deliveryTickets.revision} + 1`,
+      updatedByUserId: input.actor.id,
+      updatedAt: now
+    }).where(eq16(deliveryTickets.id, ticket.id));
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID12(),
+      ticketId: ticket.id,
+      userId: input.actor.id,
+      actorUserId: input.actor.id,
+      actorRole: "user",
+      kind: "status_change",
+      visibility: "customer",
+      message: `\u5BA2\u6237\u5DF2\u786E\u8BA4\u5B98\u7F51\u56FE\u7247\u98CE\u683C\uFF1A${selected.sample.label}\u3002\u5B98\u7F51\u6784\u5EFA\u4E0E\u5185\u5BB9\u8FD0\u8425\u73B0\u5DF2\u89E3\u9501\u3002`,
+      fromStatus: ticket.status,
+      toStatus: "completed",
+      createdAt: now
+    });
+    return {
+      success: true,
+      selectedSampleId: selected.sample.id,
+      workflowRevision: workflow.revision + 1
+    };
+  });
+}
+async function requestWebsiteStyleRevision(input) {
+  if (input.actor.role !== "user") {
+    throw new DeliveryTicketError(
+      "WEBSITE_STYLE_USER_REQUIRED",
+      "\u53EA\u6709\u5F53\u524D\u5BA2\u6237\u53EF\u4EE5\u9000\u56DE\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u6837\u4F8B\u3002",
+      403
+    );
+  }
+  const reason = input.reason.trim();
+  if (!reason) {
+    throw new DeliveryTicketError(
+      "WEBSITE_STYLE_REVISION_REASON_REQUIRED",
+      "\u8BF7\u586B\u5199\u9700\u8981\u8C03\u6574\u7684\u98CE\u683C\u65B9\u5411\u3002",
+      400
+    );
+  }
+  const db = await requireDb9();
+  return db.transaction(async (tx) => {
+    const workflowRows = await tx.select().from(websiteStyleWorkflows).where(eq16(websiteStyleWorkflows.userId, input.actor.id)).limit(1).for("update");
+    const workflow = workflowRows[0];
+    if (!workflow || workflow.status !== "awaiting_selection" || workflow.revision !== input.expectedRevision || !workflow.currentBatchId) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_STATE_CHANGED",
+        "\u5B98\u7F51\u98CE\u683C\u6837\u4F8B\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002",
+        409
+      );
+    }
+    const batchRows = await tx.select().from(websiteStyleSampleBatches).where(
+      and13(
+        eq16(websiteStyleSampleBatches.id, workflow.currentBatchId),
+        eq16(websiteStyleSampleBatches.userId, input.actor.id)
+      )
+    ).limit(1);
+    const batch = batchRows[0];
+    if (!batch) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_BATCH_NOT_FOUND",
+        "\u5B98\u7F51\u98CE\u683C\u6837\u4F8B\u6279\u6B21\u4E0D\u5B58\u5728\u3002",
+        404
+      );
+    }
+    const ticketRows = await tx.select().from(deliveryTickets).where(eq16(deliveryTickets.id, batch.ticketId)).limit(1).for("update");
+    const ticket = ticketRows[0];
+    if (!ticket || ticket.userId !== input.actor.id) {
+      throw new DeliveryTicketError(
+        "WEBSITE_STYLE_BATCH_NOT_FOUND",
+        "\u5B98\u7F51\u98CE\u683C\u6837\u4F8B\u6279\u6B21\u4E0D\u5B58\u5728\u3002",
+        404
+      );
+    }
+    const now = /* @__PURE__ */ new Date();
+    await tx.update(websiteStyleWorkflows).set({
+      status: "revision_requested",
+      revision: workflow.revision + 1,
+      updatedAt: now
+    }).where(eq16(websiteStyleWorkflows.userId, input.actor.id));
+    await tx.update(websiteStyleSampleBatches).set({ status: "revision_requested", updatedAt: now }).where(eq16(websiteStyleSampleBatches.id, batch.id));
+    await tx.update(deliveryTickets).set({
+      status: "in_progress",
+      publicSummary: "\u5BA2\u6237\u5DF2\u9000\u56DE\u672C\u6279\u98CE\u683C\u6837\u4F8B\uFF0C\u7B49\u5F85\u5DE5\u7A0B\u5E08\u91CD\u65B0\u63D0\u4F9B\u3002",
+      resolvedAt: null,
+      revision: sql2`${deliveryTickets.revision} + 1`,
+      updatedByUserId: input.actor.id,
+      updatedAt: now
+    }).where(eq16(deliveryTickets.id, ticket.id));
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID12(),
+      ticketId: ticket.id,
+      userId: input.actor.id,
+      actorUserId: input.actor.id,
+      actorRole: "user",
+      kind: "status_change",
+      visibility: "customer",
+      message: `\u5BA2\u6237\u8981\u6C42\u8C03\u6574\u5B98\u7F51\u56FE\u7247\u98CE\u683C\uFF1A${reason}`,
+      fromStatus: ticket.status,
+      toStatus: "in_progress",
+      createdAt: now
+    });
+    return {
+      success: true,
+      workflowRevision: workflow.revision + 1
+    };
+  });
 }
 async function withSerializedTicketCreation(input) {
   return input.withLock(async (scope) => {
@@ -16761,7 +17486,7 @@ async function assertExistingDeliveryTicketSettlementScope(input) {
 async function getDeliveryTicketDetail(input) {
   const db = await requireDb9();
   const ticket = await requireOwnedTicket(db, input.userId, input.ticketId);
-  const [events, attachmentRows2] = await Promise.all([
+  const [events, attachmentRows2, assignedMemberRows] = await Promise.all([
     db.select().from(deliveryTicketEvents).where(
       and13(
         eq16(deliveryTicketEvents.ticketId, ticket.id),
@@ -16777,7 +17502,12 @@ async function getDeliveryTicketDetail(input) {
         eq16(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
         eq16(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId)
       )
-    ).where(eq16(deliveryTicketAttachments.ticketId, ticket.id)).orderBy(asc7(deliveryTicketAttachments.createdAt))
+    ).where(eq16(deliveryTicketAttachments.ticketId, ticket.id)).orderBy(asc7(deliveryTicketAttachments.createdAt)),
+    input.includeInternal && ticket.assignedMemberId ? db.select({
+      id: users.id,
+      displayName: users.displayName,
+      username: users.username
+    }).from(users).where(eq16(users.id, ticket.assignedMemberId)).limit(1) : []
   ]);
   const attachments2 = attachmentRows2.filter(
     (row) => isDeliveryTicketAttachmentVisible(
@@ -16786,7 +17516,10 @@ async function getDeliveryTicketDetail(input) {
     )
   ).map((row) => row.attachment);
   return {
-    ticket: ticketDto(ticket, { attachmentCount: attachments2.length }),
+    ticket: ticketDto(ticket, {
+      attachmentCount: attachments2.length,
+      assignedMemberName: assignedMemberRows[0] ? assignedMemberRows[0].displayName?.trim() || assignedMemberRows[0].username?.trim() || `\u5DE5\u7A0B\u5E08 ${assignedMemberRows[0].id}` : null
+    }),
     events: events.map((event) => ({
       id: event.id,
       eventType: event.kind,
@@ -16821,7 +17554,63 @@ async function getPublicDeliveryTicketDetail(input) {
   const ticket = await requireOwnedTicket(db, input.userId, input.ticketId);
   const summary = toPublicDeliveryTicketSummary(ticketDto(ticket));
   if (summary.type === "website_operation") {
-    return publicWebsiteTicketDetailSchema.parse({ ticket: summary });
+    const [events2, attachments3] = await Promise.all([
+      db.select({
+        id: deliveryTicketEvents.id,
+        actorRole: deliveryTicketEvents.actorRole,
+        message: deliveryTicketEvents.message,
+        createdAt: deliveryTicketEvents.createdAt
+      }).from(deliveryTicketEvents).where(
+        and13(
+          eq16(deliveryTicketEvents.ticketId, ticket.id),
+          eq16(deliveryTicketEvents.visibility, "customer")
+        )
+      ).orderBy(asc7(deliveryTicketEvents.createdAt)),
+      db.select({
+        id: deliveryTicketAttachments.id,
+        filename: deliveryTicketAttachments.filename,
+        mimeType: deliveryTicketAttachments.mimeType,
+        sizeBytes: deliveryTicketAttachments.sizeBytes,
+        purpose: deliveryTicketAttachments.purpose,
+        kind: deliveryTicketAttachments.kind,
+        createdAt: deliveryTicketAttachments.createdAt
+      }).from(deliveryTicketAttachments).innerJoin(
+        deliveryTicketEvents,
+        and13(
+          eq16(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
+          eq16(
+            deliveryTicketEvents.ticketId,
+            deliveryTicketAttachments.ticketId
+          ),
+          eq16(deliveryTicketEvents.visibility, "customer")
+        )
+      ).where(eq16(deliveryTicketAttachments.ticketId, ticket.id)).orderBy(asc7(deliveryTicketAttachments.createdAt))
+    ]);
+    return publicWebsiteTicketDetailSchema.parse({
+      ticket: {
+        ...summary,
+        revision: ticket.revision,
+        canReply: !TERMINAL_STATUSES.has(ticket.status),
+        canAttach: websiteTicketAllowsPublicAttachments(ticket.category)
+      },
+      events: events2.map((event) => ({
+        id: event.id,
+        actorRole: event.actorRole,
+        actorLabel: event.actorRole === "user" ? "\u7528\u6237" : "\u670D\u52A1\u56E2\u961F",
+        message: event.message,
+        createdAt: epoch3(event.createdAt)
+      })),
+      attachments: attachments3.map((attachment) => ({
+        id: attachment.id,
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+        sizeBytes: attachment.sizeBytes,
+        purpose: attachment.purpose,
+        kind: attachment.kind,
+        createdAt: epoch3(attachment.createdAt),
+        downloadUrl: `/api/delivery-ticket-attachments/${attachment.id}/content`
+      }))
+    });
   }
   if (summary.type === "knowledge_base") {
     const events2 = await db.select({
@@ -16908,11 +17697,11 @@ function isDeliveryTicketAttachmentVisible(includeInternal, eventVisibility) {
   return includeInternal || eventVisibility === "customer";
 }
 function assertDeliveryTicketMessagePolicy(input) {
-  if (input.ticketType === "website_operation" && (input.actorRole === "user" || input.visibility !== "internal")) {
+  if (input.ticketType === "website_operation" && input.visibility === "customer" && (input.attachmentCount ?? 0) > 0 && !websiteTicketAllowsPublicAttachments(input.ticketCategory)) {
     throw new DeliveryTicketError(
-      "WEBSITE_CUSTOMER_MESSAGES_NOT_ALLOWED",
-      "\u5B98\u7F51\u5DE5\u5355\u4E0D\u63D0\u4F9B\u516C\u5F00\u4EA4\u6D41\u6216\u6587\u4EF6\u56DE\u4F20\uFF0C\u5904\u7406\u7ED3\u679C\u5C06\u76F4\u63A5\u4F53\u73B0\u5728\u7F51\u7AD9\u548C\u5185\u5BB9\u603B\u7ED3\u4E2D\u3002",
-      403
+      "WEBSITE_PUBLIC_ATTACHMENTS_NOT_ALLOWED",
+      "\u8BE5\u5B98\u7F51\u5DE5\u5355\u53EA\u63A5\u6536\u6587\u5B57\u8865\u5145\uFF1B\u8BF7\u52FF\u4E0A\u4F20\u8BC1\u4EF6\u3001\u5BC6\u7801\u3001\u8D1F\u8D23\u4EBA\u7167\u7247\u6216\u5176\u4ED6\u5907\u6848\u6750\u6599\u3002",
+      400
     );
   }
 }
@@ -16953,8 +17742,10 @@ async function addDeliveryTicketMessage(input) {
     const visibility = input.visibility ?? "customer";
     assertDeliveryTicketMessagePolicy({
       ticketType: ticket.type,
+      ticketCategory: ticket.category,
       actorRole: input.actor.role,
-      visibility
+      visibility,
+      attachmentCount: input.value.attachments.length
     });
     const existing = await tx.select().from(deliveryTicketEvents).where(
       and13(
@@ -16972,6 +17763,11 @@ async function addDeliveryTicketMessage(input) {
     await verifyOwnedAttachments(tx, input.actor.id, input.value.attachments);
     const now = /* @__PURE__ */ new Date();
     const eventId = randomUUID12();
+    const nextStatus = deliveryTicketStatusAfterCustomerMessage({
+      actorRole: input.actor.role,
+      currentStatus: ticket.status
+    });
+    const returnsToServiceQueue = nextStatus !== ticket.status;
     await tx.insert(deliveryTicketEvents).values({
       id: eventId,
       ticketId: ticket.id,
@@ -16982,6 +17778,8 @@ async function addDeliveryTicketMessage(input) {
       visibility,
       clientRequestId: input.value.clientRequestId,
       message: input.value.message,
+      fromStatus: returnsToServiceQueue ? ticket.status : null,
+      toStatus: returnsToServiceQueue ? nextStatus : null,
       createdAt: now
     });
     const files = attachmentRows({
@@ -16994,7 +17792,14 @@ async function addDeliveryTicketMessage(input) {
       now
     });
     if (files.length) await tx.insert(deliveryTicketAttachments).values(files);
-    await tx.update(deliveryTickets).set({ updatedByUserId: input.actor.id, updatedAt: now }).where(eq16(deliveryTickets.id, ticket.id));
+    await tx.update(deliveryTickets).set({
+      ...returnsToServiceQueue ? {
+        status: nextStatus,
+        revision: sql2`${deliveryTickets.revision} + 1`
+      } : {},
+      updatedByUserId: input.actor.id,
+      updatedAt: now
+    }).where(eq16(deliveryTickets.id, ticket.id));
     return { eventId, idempotent: false };
   });
 }
@@ -17120,6 +17925,7 @@ async function updateManagedDeliveryTicket(input) {
       input.value.ticketId,
       true
     );
+    assertManagedTicketCanBeExecutedByAdmin(ticket);
     await assertExistingDeliveryTicketSettlementScope({
       executor: tx,
       userId: input.userId,
@@ -17162,7 +17968,7 @@ async function updateManagedDeliveryTicket(input) {
     if (ticket.type === "website_operation" && nonEmpty(input.value.publicMessage)) {
       throw new DeliveryTicketError(
         "WEBSITE_PUBLIC_MESSAGE_NOT_ALLOWED",
-        "\u5B98\u7F51\u5DE5\u5355\u4E0D\u63D0\u4F9B\u5BA2\u6237\u516C\u5F00\u4EA4\u6D41\uFF0C\u5B8C\u6210\u7ED3\u679C\u8BF7\u5199\u5165\u5185\u5BB9\u603B\u7ED3\u3002",
+        "\u5B98\u7F51\u5DE5\u5355\u7684\u5B8C\u6210\u7ED3\u679C\u8BF7\u5199\u5165\u5185\u5BB9\u603B\u7ED3\uFF0C\u65E0\u9700\u989D\u5916\u6DFB\u52A0\u5B8C\u6210\u6D88\u606F\u3002",
         400
       );
     }
@@ -17353,6 +18159,7 @@ async function recordManagedDeliveryOperation(input) {
       input.ticketId,
       true
     );
+    assertManagedTicketCanBeExecutedByAdmin(ticket);
     assertDeliveryTicketServiceEligibility(portal, ticket.type);
     const duplicate = await tx.select({ id: deliveryTicketEvents.id }).from(deliveryTicketEvents).where(
       and13(
@@ -19017,80 +19824,9 @@ async function confirmRedirectWorkbook(input) {
   });
 }
 
-// shared/delivery-roles.ts
-import { z as z9 } from "zod";
-var deliveryRoleTypeSchema = z9.enum([
-  "ai_operations_engineer",
-  "monitoring_optimization_engineer",
-  "content_distribution_engineer"
-]);
-var DELIVERY_ROLE_LABELS = {
-  ai_operations_engineer: "AI \u8FD0\u7EF4\u5DE5\u7A0B\u5E08",
-  monitoring_optimization_engineer: "AI \u76D1\u63A7\u4E0E\u4F18\u5316\u5DE5\u7A0B\u5E08",
-  content_distribution_engineer: "AI \u5185\u5BB9\u5206\u53D1\u5DE5\u7A0B\u5E08"
-};
-var deliveryWorkflowOperationSchema = z9.enum([
-  "build_exception",
-  "knowledge_maintenance",
-  "knowledge_reset",
-  "question_catalog",
-  "initial_monitoring",
-  "monitoring_import",
-  "monitoring_retest",
-  "stage_report",
-  "response_logic",
-  "content_asset_publish",
-  "channel_distribution",
-  "domain_application",
-  "icp_filing",
-  "company_facts",
-  "product_case_docs",
-  "industry_news",
-  "company_news",
-  "faq_content",
-  "site_check"
-]);
-var OPERATIONS_BY_ROLE = {
-  ai_operations_engineer: [
-    "build_exception",
-    "knowledge_maintenance",
-    "knowledge_reset",
-    "domain_application",
-    "icp_filing",
-    "company_facts",
-    "product_case_docs",
-    "industry_news",
-    "company_news",
-    "faq_content",
-    "site_check"
-  ],
-  monitoring_optimization_engineer: [
-    "question_catalog",
-    "initial_monitoring",
-    "monitoring_import",
-    "monitoring_retest",
-    "stage_report"
-  ],
-  content_distribution_engineer: [
-    "response_logic",
-    "content_asset_publish",
-    "channel_distribution"
-  ]
-};
-function deliveryRoleOwnsOperation(roleType, operation) {
-  return OPERATIONS_BY_ROLE[roleType].includes(operation);
-}
-var knowledgeResetReasonSchema = z9.enum([
-  "stuck",
-  "upload_error",
-  "build_error",
-  "enterprise_materials",
-  "other"
-]);
-
 // server/delivery-role-service.ts
 import { randomUUID as randomUUID15 } from "node:crypto";
-import { and as and17, desc as desc15, eq as eq20, inArray as inArray11, isNull as isNull5, sql as sql2 } from "drizzle-orm";
+import { and as and17, asc as asc8, desc as desc15, eq as eq20, inArray as inArray11, isNull as isNull5, lt as lt4, or as or4, sql as sql3 } from "drizzle-orm";
 async function requireDb12() {
   const db = await getDb();
   if (!db) {
@@ -19104,6 +19840,52 @@ async function requireDb12() {
 function requireDeliveryManager(actor) {
   if (!hasExplicitAdminRole(actor)) {
     throw new AuthServiceError("INVALID_CREDENTIAL", "\u9700\u8981\u4EA4\u4ED8\u7BA1\u7406\u6743\u9650");
+  }
+}
+function decideEngineerCredentialManagementScope(input) {
+  const managerAdminIds = Array.from(
+    new Set(
+      input.assignmentAdminIds.filter(
+        (id) => typeof id === "number"
+      )
+    )
+  );
+  if (input.systemAdmin) {
+    return { manageable: true, reason: null, managerAdminIds };
+  }
+  if (input.assignmentAdminIds.length > 0 && input.assignmentAdminIds.some((id) => id === null)) {
+    return {
+      manageable: false,
+      reason: "\u8BE5\u5DE5\u7A0B\u5E08\u5B58\u5728\u5C1A\u672A\u660E\u786E\u4EA4\u4ED8\u7BA1\u7406\u5458\u5F52\u5C5E\u7684\u5BA2\u6237\uFF0CKey \u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EF4\u62A4\u3002",
+      managerAdminIds
+    };
+  }
+  if (managerAdminIds.length > 1) {
+    return {
+      manageable: false,
+      reason: "\u8BE5\u5DE5\u7A0B\u5E08\u540C\u65F6\u670D\u52A1\u591A\u4E2A\u4EA4\u4ED8\u7BA1\u7406\u5458\u7684\u5BA2\u6237\uFF0CKey \u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EF4\u62A4\u3002",
+      managerAdminIds
+    };
+  }
+  if (managerAdminIds.length === 1) {
+    return {
+      manageable: managerAdminIds[0] === input.actorUserId,
+      reason: managerAdminIds[0] === input.actorUserId ? null : "\u8BE5\u5DE5\u7A0B\u5E08\u5F53\u524D\u4E0D\u5C5E\u4E8E\u4F60\u7684\u5BA2\u6237\u9879\u76EE\u3002",
+      managerAdminIds
+    };
+  }
+  return {
+    manageable: input.createdByAdminId === input.actorUserId,
+    reason: input.createdByAdminId === input.actorUserId ? null : "\u8BE5\u672A\u5206\u914D\u5DE5\u7A0B\u5E08\u4E0D\u662F\u7531\u5F53\u524D\u4EA4\u4ED8\u7BA1\u7406\u5458\u521B\u5EFA\u3002",
+    managerAdminIds
+  };
+}
+function assertDeliveryMemberCredentialVersion(input) {
+  if (input.actualVersion !== input.expectedVersion) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "\u5DE5\u7A0B\u5E08 API Key \u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5"
+    );
   }
 }
 async function getActiveDeliveryProjectOwner(executor, customerUserId, roleType) {
@@ -19146,6 +19928,54 @@ async function assertCanManageProject(input) {
     );
   }
 }
+async function engineerCredentialManagementScope(input) {
+  const [assignmentRows, originRows] = await Promise.all([
+    input.executor.select({
+      customerUserId: deliveryProjectAssignments.customerUserId,
+      deliveryAdminId: userUsageOwners.deliveryAdminId
+    }).from(deliveryProjectAssignments).leftJoin(
+      userUsageOwners,
+      eq20(userUsageOwners.userId, deliveryProjectAssignments.customerUserId)
+    ).where(
+      eq20(deliveryProjectAssignments.engineerUserId, input.engineerUserId)
+    ),
+    input.executor.select({ createdByAdminId: deliveryMemberOrigins.createdByAdminId }).from(deliveryMemberOrigins).where(eq20(deliveryMemberOrigins.engineerUserId, input.engineerUserId)).limit(1)
+  ]);
+  const customerUserIds = Array.from(
+    new Set(
+      assignmentRows.map(
+        (row) => row.customerUserId
+      )
+    )
+  );
+  const createdByAdminId = originRows[0]?.createdByAdminId ?? null;
+  return {
+    ...decideEngineerCredentialManagementScope({
+      systemAdmin: input.actor.adminAccessLevel === "system_admin",
+      actorUserId: input.actor.id,
+      assignmentAdminIds: assignmentRows.map(
+        (row) => row.deliveryAdminId
+      ),
+      createdByAdminId
+    }),
+    customerUserIds
+  };
+}
+async function requireEngineerCredentialManagement(input) {
+  requireDeliveryManager(input.actor);
+  const rows = await input.executor.select({ role: users.role }).from(users).where(eq20(users.id, input.engineerUserId)).limit(1);
+  if (rows[0]?.role !== "delivery_member") {
+    throw new AuthServiceError("NOT_FOUND", "\u5DE5\u7A0B\u5E08\u4E0D\u5B58\u5728");
+  }
+  const scope = await engineerCredentialManagementScope(input);
+  if (!scope.manageable) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      scope.reason || "\u65E0\u6743\u7EF4\u62A4\u8BE5\u5DE5\u7A0B\u5E08 API Key"
+    );
+  }
+  return scope;
+}
 async function listDeliveryRoleManagement(actor) {
   requireDeliveryManager(actor);
   const db = await requireDb12();
@@ -19155,7 +19985,9 @@ async function listDeliveryRoleManagement(actor) {
     ownerRows,
     adminRows,
     engineers,
-    credentials
+    credentials,
+    allAssignmentRows,
+    originRows
   ] = await Promise.all([
     db.select({
       id: users.id,
@@ -19179,7 +20011,13 @@ async function listDeliveryRoleManagement(actor) {
       isActive: users.isActive,
       engineerRoleType: users.engineerRoleType
     }).from(users).where(eq20(users.role, "delivery_member")).orderBy(desc15(users.createdAt)),
-    db.select({ userId: apiCredentials.userId }).from(apiCredentials).where(eq20(apiCredentials.status, "active"))
+    db.select({
+      userId: apiCredentials.userId,
+      version: apiCredentials.version,
+      status: apiCredentials.status
+    }).from(apiCredentials),
+    db.select().from(deliveryProjectAssignments),
+    db.select().from(deliveryMemberOrigins)
   ]);
   const visibleCustomers = actor.adminAccessLevel === "system_admin" ? allCustomers : allCustomers.filter(
     (customer) => ownerRows.some(
@@ -19187,12 +20025,10 @@ async function listDeliveryRoleManagement(actor) {
     )
   );
   const customerIds = visibleCustomers.map((customer) => customer.id);
-  const [assignmentRows, statisticsTickets] = customerIds.length ? await Promise.all([
-    db.select().from(deliveryProjectAssignments).where(
-      inArray11(deliveryProjectAssignments.customerUserId, customerIds)
-    ),
-    db.select().from(deliveryTickets).where(inArray11(deliveryTickets.userId, customerIds)).orderBy(desc15(deliveryTickets.updatedAt))
-  ]) : [[], []];
+  const assignmentRows = allAssignmentRows.filter(
+    (assignment) => customerIds.includes(assignment.customerUserId)
+  );
+  const statisticsTickets = customerIds.length ? await db.select().from(deliveryTickets).where(inArray11(deliveryTickets.userId, customerIds)).orderBy(desc15(deliveryTickets.updatedAt)) : [];
   const activeTickets = statisticsTickets.filter(
     (ticket) => ACTIVE_DELIVERY_STATUSES.includes(ticket.status)
   );
@@ -19228,8 +20064,18 @@ async function listDeliveryRoleManagement(actor) {
     }
   }
   const configuredEngineerIds = new Set(
-    credentials.map((credential) => credential.userId)
+    credentials.filter((credential) => credential.status === "active").map((credential) => credential.userId)
   );
+  const credentialVersionByEngineerId = /* @__PURE__ */ new Map();
+  for (const credential of credentials) {
+    credentialVersionByEngineerId.set(
+      credential.userId,
+      Math.max(
+        credential.version,
+        credentialVersionByEngineerId.get(credential.userId) ?? 0
+      )
+    );
+  }
   const engineerById = new Map(
     engineers.map((engineer) => [engineer.id, engineer])
   );
@@ -19258,10 +20104,28 @@ async function listDeliveryRoleManagement(actor) {
       engineerApiKeyConfigured: assignment.engineerUserId != null && configuredEngineerIds.has(assignment.engineerUserId)
     };
   });
-  const enrichedEngineers = engineers.map((engineer) => ({
-    ...engineer,
-    apiKeyConfigured: configuredEngineerIds.has(engineer.id)
-  }));
+  const enrichedEngineers = engineers.map((engineer) => {
+    const engineerAssignments = allAssignmentRows.filter(
+      (assignment) => assignment.engineerUserId === engineer.id
+    );
+    const assignmentAdminIds = engineerAssignments.map(
+      (assignment) => ownerRows.find((owner) => owner.userId === assignment.customerUserId)?.deliveryAdminId ?? null
+    );
+    const originAdminId = originRows.find((origin) => origin.engineerUserId === engineer.id)?.createdByAdminId ?? null;
+    const managementScope = decideEngineerCredentialManagementScope({
+      systemAdmin: actor.adminAccessLevel === "system_admin",
+      actorUserId: actor.id,
+      assignmentAdminIds,
+      createdByAdminId: originAdminId
+    });
+    return {
+      ...engineer,
+      apiKeyConfigured: configuredEngineerIds.has(engineer.id),
+      apiKeyVersion: credentialVersionByEngineerId.get(engineer.id) ?? 0,
+      apiKeyManageable: managementScope.manageable,
+      apiKeyManageReason: managementScope.reason
+    };
+  });
   const roleStats = Object.fromEntries(
     [
       "ai_operations_engineer",
@@ -19333,6 +20197,11 @@ async function createDeliveryEngineer(input) {
         apiKey
       });
     }
+    await tx.insert(deliveryMemberOrigins).values({
+      engineerUserId: user.id,
+      createdByAdminId: input.actor.id,
+      createdAt: /* @__PURE__ */ new Date()
+    });
     await writeWorkspaceAuditEvent(
       {
         actor: input.actor,
@@ -19562,7 +20431,7 @@ async function dispatchDeliveryTicket(input) {
     });
     await tx.update(deliveryTickets).set({
       priority: input.priority,
-      revision: sql2`${deliveryTickets.revision} + 1`,
+      revision: sql3`${deliveryTickets.revision} + 1`,
       updatedByUserId: input.actor.id,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(eq20(deliveryTickets.id, ticket.id));
@@ -19622,7 +20491,7 @@ async function listMyProjectAssignments(actor) {
   }).from(deliveryProjectAssignments).innerJoin(users, eq20(users.id, deliveryProjectAssignments.customerUserId)).where(
     and17(
       eq20(deliveryProjectAssignments.engineerUserId, actor.id),
-      actor.engineerRoleType ? eq20(deliveryProjectAssignments.roleType, actor.engineerRoleType) : sql2`false`,
+      actor.engineerRoleType ? eq20(deliveryProjectAssignments.roleType, actor.engineerRoleType) : sql3`false`,
       eq20(users.role, "user"),
       eq20(users.isActive, true)
     )
@@ -19662,6 +20531,294 @@ async function listMyProjectAssignments(actor) {
     customerName: row.customerName || row.customerUsername || `\u5BA2\u6237 ${row.customerUserId}`,
     roleLabel: DELIVERY_ROLE_LABELS[row.roleType]
   }));
+}
+var TERMINAL_DELIVERY_STATUSES = [
+  "completed",
+  "rejected",
+  "cancelled"
+];
+async function getMyDeliveryHistory(input) {
+  if (input.actor.role !== "delivery_member") {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "\u8BE5\u8BB0\u5F55\u4EC5\u5BF9\u5DE5\u7A0B\u5E08\u5F00\u653E");
+  }
+  const db = await requireDb12();
+  const cursorDate = input.cursor ? new Date(input.cursor.resolvedAt) : void 0;
+  const resolvedSortAt = sql3`COALESCE(${deliveryTickets.resolvedAt}, ${deliveryTickets.updatedAt})`;
+  const [rows, customerRows, operationRows] = await Promise.all([
+    db.select({
+      ticket: deliveryTickets,
+      customerUsername: users.username,
+      customerName: users.displayName,
+      resolvedSortAt
+    }).from(deliveryTickets).innerJoin(users, eq20(users.id, deliveryTickets.userId)).where(
+      and17(
+        eq20(deliveryTickets.assignedMemberId, input.actor.id),
+        input.status ? eq20(deliveryTickets.status, input.status) : inArray11(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES),
+        input.customerUserId ? eq20(deliveryTickets.userId, input.customerUserId) : void 0,
+        input.operation ? eq20(deliveryTickets.operation, input.operation) : void 0,
+        cursorDate ? or4(
+          lt4(resolvedSortAt, cursorDate),
+          and17(
+            eq20(resolvedSortAt, cursorDate),
+            lt4(deliveryTickets.id, input.cursor.id)
+          )
+        ) : void 0
+      )
+    ).orderBy(desc15(resolvedSortAt), desc15(deliveryTickets.id)).limit(input.limit + 1),
+    db.selectDistinct({
+      id: users.id,
+      name: users.displayName,
+      username: users.username
+    }).from(deliveryTickets).innerJoin(users, eq20(users.id, deliveryTickets.userId)).where(
+      and17(
+        eq20(deliveryTickets.assignedMemberId, input.actor.id),
+        inArray11(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES)
+      )
+    ).orderBy(asc8(users.displayName), asc8(users.username), asc8(users.id)),
+    db.selectDistinct({ operation: deliveryTickets.operation }).from(deliveryTickets).where(
+      and17(
+        eq20(deliveryTickets.assignedMemberId, input.actor.id),
+        inArray11(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES)
+      )
+    ).orderBy(asc8(deliveryTickets.operation))
+  ]);
+  const hasMore = rows.length > input.limit;
+  const selected = rows.slice(0, input.limit);
+  const items = selected.map(
+    ({ ticket, customerName, customerUsername, resolvedSortAt: resolvedSortAt2 }) => ({
+      id: ticket.id,
+      customerUserId: ticket.userId,
+      customerName: customerName || customerUsername || `\u5BA2\u6237 ${ticket.userId}`,
+      customerUsername,
+      projectAssignmentId: ticket.assignedProjectAssignmentId,
+      title: ticket.title || ticket.operation || ticket.category || "\u4EA4\u4ED8\u5DE5\u5355",
+      operation: ticket.operation,
+      status: ticket.status,
+      publicSummary: ticket.publicSummary,
+      resultExcerpt: ticket.publicSummary || ticket.internalNote || ticket.description || "\u5DF2\u5B8C\u6210\u5904\u7406\uFF0C\u70B9\u51FB\u67E5\u770B\u8BE6\u7EC6\u8BB0\u5F55\u3002",
+      resolvedAt: resolvedSortAt2.getTime(),
+      updatedAt: ticket.updatedAt.getTime()
+    })
+  );
+  const last = selected.at(-1);
+  return {
+    items,
+    filters: {
+      customers: customerRows.map((customer) => ({
+        ...customer,
+        name: customer.name || customer.username || `\u5BA2\u6237 ${customer.id}`
+      })),
+      operations: operationRows.map((row) => row.operation).filter((operation) => Boolean(operation))
+    },
+    nextCursor: hasMore && last ? {
+      resolvedAt: last.resolvedSortAt.getTime(),
+      id: last.ticket.id
+    } : null
+  };
+}
+async function getMyDeliveryTicketDetail(input) {
+  if (input.actor.role !== "delivery_member") {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "\u8BE5\u8BB0\u5F55\u4EC5\u5BF9\u5DE5\u7A0B\u5E08\u5F00\u653E");
+  }
+  const db = await requireDb12();
+  const rows = await db.select({
+    ticket: deliveryTickets,
+    customerUsername: users.username,
+    customerName: users.displayName
+  }).from(deliveryTickets).innerJoin(users, eq20(users.id, deliveryTickets.userId)).where(
+    and17(
+      eq20(deliveryTickets.id, input.ticketId),
+      eq20(deliveryTickets.assignedMemberId, input.actor.id),
+      inArray11(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES)
+    )
+  ).limit(1);
+  const row = rows[0];
+  if (!row) {
+    throw new AuthServiceError("NOT_FOUND", "\u4EFB\u52A1\u8BB0\u5F55\u4E0D\u5B58\u5728");
+  }
+  const [events, attachments2, resetRows] = await Promise.all([
+    db.select().from(deliveryTicketEvents).where(eq20(deliveryTicketEvents.ticketId, row.ticket.id)).orderBy(asc8(deliveryTicketEvents.createdAt)),
+    db.select().from(deliveryTicketAttachments).where(eq20(deliveryTicketAttachments.ticketId, row.ticket.id)).orderBy(asc8(deliveryTicketAttachments.createdAt)),
+    row.ticket.operation === "knowledge_reset" ? db.select().from(knowledgeBaseResetRequests).where(eq20(knowledgeBaseResetRequests.ticketId, row.ticket.id)).limit(1) : Promise.resolve([])
+  ]);
+  const reset = resetRows[0];
+  return {
+    ticket: {
+      ...row.ticket,
+      createdAt: row.ticket.createdAt.getTime(),
+      updatedAt: row.ticket.updatedAt.getTime(),
+      resolvedAt: row.ticket.resolvedAt?.getTime() ?? null,
+      scheduledAt: row.ticket.scheduledAt?.getTime() ?? null
+    },
+    customer: {
+      id: row.ticket.userId,
+      name: row.customerName || row.customerUsername || `\u5BA2\u6237 ${row.ticket.userId}`,
+      username: row.customerUsername
+    },
+    events: events.map((event) => ({
+      ...event,
+      createdAt: event.createdAt.getTime()
+    })),
+    attachments: attachments2.map((attachment) => ({
+      ...attachment,
+      createdAt: attachment.createdAt.getTime(),
+      downloadUrl: `/api/delivery-ticket-attachments/${attachment.id}/content`
+    })),
+    knowledgeReset: reset ? {
+      id: reset.id,
+      reasonCode: reset.reasonCode,
+      reasonNote: reset.reasonNote,
+      status: reset.status,
+      decisionNote: reset.decisionNote,
+      cleanupSummary: reset.cleanupSummary,
+      decidedAt: reset.decidedAt?.getTime() ?? null,
+      createdAt: reset.createdAt.getTime()
+    } : null
+  };
+}
+async function publishWebsiteStyleSamples(input) {
+  if (input.samples.length !== 3) {
+    throw new AuthServiceError("CONFLICT", "\u6BCF\u6279\u5FC5\u987B\u63D0\u4EA4\u6070\u597D\u4E09\u5F20\u56FE\u7247\u6837\u4F8B");
+  }
+  if (new Set(input.samples.map((sample) => sample.fileId)).size !== input.samples.length) {
+    throw new AuthServiceError("CONFLICT", "\u4E09\u5F20\u56FE\u7247\u6837\u4F8B\u4E0D\u80FD\u91CD\u590D");
+  }
+  for (const sample of input.samples) {
+    if (!/^image\/(?:png|jpeg|webp)$/i.test(sample.mimeType) || sample.sizeBytes <= 0 || sample.sizeBytes > 10 * 1024 * 1024) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u6837\u4F8B\u4EC5\u652F\u6301 10MB \u4EE5\u5185\u7684 PNG\u3001JPEG \u6216 WebP \u56FE\u7247"
+      );
+    }
+  }
+  const db = await requireDb12();
+  return db.transaction(async (tx) => {
+    const ticketRows = await tx.select().from(deliveryTickets).where(eq20(deliveryTickets.id, input.ticketId)).limit(1).for("update");
+    const ticket = ticketRows[0];
+    if (!ticket || ticket.operation !== "website_style_samples" || ticket.assignedMemberId !== input.actor.id || ticket.assignedProjectAssignmentId !== input.projectAssignmentId || !["submitted", "in_progress"].includes(ticket.status)) {
+      throw new AuthServiceError("NOT_FOUND", "\u5B98\u7F51\u98CE\u683C\u6837\u4F8B\u4EFB\u52A1\u4E0D\u5B58\u5728");
+    }
+    await assertDeliveryProjectContext({
+      actor: input.actor,
+      projectAssignmentId: input.projectAssignmentId,
+      customerUserId: ticket.userId,
+      expectedRoleType: "ai_operations_engineer",
+      executor: tx
+    });
+    const workflowRows = await tx.select().from(websiteStyleWorkflows).where(eq20(websiteStyleWorkflows.userId, ticket.userId)).limit(1).for("update");
+    const workflow = workflowRows[0];
+    if (!workflow || workflow.revision !== input.expectedWorkflowRevision || !["waiting_samples", "revision_requested"].includes(workflow.status)) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u5B98\u7F51\u98CE\u683C\u9009\u62E9\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5"
+      );
+    }
+    const resourceRows = await tx.select({ upstreamId: upstreamResources.upstreamId }).from(upstreamResources).where(
+      and17(
+        eq20(upstreamResources.userId, input.actor.id),
+        eq20(upstreamResources.projectAssignmentId, input.projectAssignmentId),
+        eq20(upstreamResources.kind, "file"),
+        inArray11(
+          upstreamResources.upstreamId,
+          input.samples.map((sample) => sample.fileId)
+        )
+      )
+    );
+    if (new Set(resourceRows.map((resource) => resource.upstreamId)).size !== 3) {
+      throw new AuthServiceError(
+        "INVALID_CREDENTIAL",
+        "\u6837\u4F8B\u56FE\u7247\u4E0D\u5C5E\u4E8E\u5F53\u524D\u5DE5\u7A0B\u5E08\u5BA2\u6237\u9879\u76EE"
+      );
+    }
+    const latestBatchRows = await tx.select({ ordinal: websiteStyleSampleBatches.ordinal }).from(websiteStyleSampleBatches).where(eq20(websiteStyleSampleBatches.userId, ticket.userId)).orderBy(desc15(websiteStyleSampleBatches.ordinal)).limit(1);
+    const now = /* @__PURE__ */ new Date();
+    const eventId = randomUUID15();
+    const batchId = randomUUID15();
+    const attachmentIds = input.samples.map(() => randomUUID15());
+    if (workflow.currentBatchId) {
+      await tx.update(websiteStyleSampleBatches).set({ status: "superseded", updatedAt: now }).where(eq20(websiteStyleSampleBatches.id, workflow.currentBatchId));
+    }
+    await tx.insert(deliveryTicketEvents).values({
+      id: eventId,
+      ticketId: ticket.id,
+      userId: ticket.userId,
+      actorUserId: input.actor.id,
+      actorRole: "delivery_member",
+      kind: "attachment",
+      visibility: "customer",
+      message: input.engineerNote?.trim() || "\u5DE5\u7A0B\u5E08\u5DF2\u63D0\u4EA4\u4E09\u5F20\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u6837\u4F8B\uFF0C\u8BF7\u9009\u62E9\u4E00\u5F20\u6216\u9000\u56DE\u91CD\u505A\u3002",
+      fromStatus: ticket.status,
+      toStatus: "needs_information",
+      actorContext: {
+        projectAssignmentId: input.projectAssignmentId,
+        customerUserId: ticket.userId,
+        roleType: "ai_operations_engineer"
+      },
+      createdAt: now
+    });
+    await tx.insert(deliveryTicketAttachments).values(
+      input.samples.map((sample, index2) => ({
+        id: attachmentIds[index2],
+        ticketId: ticket.id,
+        eventId,
+        workspaceUserId: ticket.userId,
+        ownerUserId: input.actor.id,
+        kind: "deliverable",
+        upstreamFileId: sample.fileId,
+        filename: sample.filename,
+        mimeType: sample.mimeType,
+        sizeBytes: sample.sizeBytes,
+        sha256: sample.sha256 || null,
+        purpose: "\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u6837\u4F8B",
+        authorization: "owned",
+        createdAt: now
+      }))
+    );
+    await tx.insert(websiteStyleSampleBatches).values({
+      id: batchId,
+      userId: ticket.userId,
+      ticketId: ticket.id,
+      ordinal: (latestBatchRows[0]?.ordinal ?? 0) + 1,
+      status: "published",
+      engineerNote: input.engineerNote?.trim() || null,
+      publishedByUserId: input.actor.id,
+      publishedAt: now,
+      createdAt: now,
+      updatedAt: now
+    });
+    await tx.insert(websiteStyleSamples).values(
+      input.samples.map((sample, index2) => ({
+        id: randomUUID15(),
+        batchId,
+        attachmentId: attachmentIds[index2],
+        label: sample.label.trim(),
+        note: sample.note?.trim() || null,
+        sortOrder: index2 + 1,
+        createdAt: now
+      }))
+    );
+    await tx.update(websiteStyleWorkflows).set({
+      status: "awaiting_selection",
+      currentBatchId: batchId,
+      selectedSampleId: null,
+      selectedByUserId: null,
+      selectedAt: null,
+      revision: workflow.revision + 1,
+      updatedAt: now
+    }).where(eq20(websiteStyleWorkflows.userId, ticket.userId));
+    await tx.update(deliveryTickets).set({
+      status: "needs_information",
+      publicSummary: "\u5DF2\u63D0\u4F9B\u4E09\u5F20\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u6837\u4F8B\uFF0C\u7B49\u5F85\u5BA2\u6237\u9009\u62E9\u6216\u9000\u56DE\u91CD\u505A\u3002",
+      revision: sql3`${deliveryTickets.revision} + 1`,
+      updatedByUserId: input.actor.id,
+      updatedAt: now
+    }).where(eq20(deliveryTickets.id, ticket.id));
+    return {
+      batchId,
+      workflowRevision: workflow.revision + 1,
+      status: "awaiting_selection"
+    };
+  });
 }
 async function assertDeliveryProjectContext(input) {
   if (input.actor.role !== "delivery_member") {
@@ -19732,13 +20889,18 @@ async function getMyDeliveryWorkbench(input) {
     questions,
     batches,
     profiles,
+    styleWorkflows,
     checks,
-    dashboards
+    dashboards,
+    websiteWorkspace,
+    knowledgeProgress,
+    knowledgeSnapshot
   ] = await Promise.all([
     customerIds.length ? db.select({
       id: users.id,
       username: users.username,
-      displayName: users.displayName
+      displayName: users.displayName,
+      marketEdition: users.marketEdition
     }).from(users).where(inArray11(users.id, customerIds)) : [],
     customerIds.length ? db.select({
       userId: knowledgeBaseBuilds.userId,
@@ -19750,8 +20912,18 @@ async function getMyDeliveryWorkbench(input) {
       status: knowledgeBaseSnapshots.status
     }).from(knowledgeBaseSnapshots).where(inArray11(knowledgeBaseSnapshots.userId, customerIds)) : [],
     customerIds.length ? db.select({
+      id: workspaceQuestions.id,
       userId: workspaceQuestions.userId,
-      status: workspaceQuestions.status
+      category: workspaceQuestions.category,
+      question: workspaceQuestions.question,
+      intent: workspaceQuestions.intent,
+      rationale: workspaceQuestions.rationale,
+      source: workspaceQuestions.source,
+      status: workspaceQuestions.status,
+      selectionApprovalStatus: workspaceQuestions.selectionApprovalStatus,
+      selectionRequestedAt: workspaceQuestions.selectionRequestedAt,
+      locked: workspaceQuestions.locked,
+      revision: workspaceQuestions.revision
     }).from(workspaceQuestions).where(inArray11(workspaceQuestions.userId, customerIds)) : [],
     customerIds.length ? db.select({
       userId: monitoringBatches.userId,
@@ -19764,17 +20936,25 @@ async function getMyDeliveryWorkbench(input) {
       domainStatus: workspaceSiteProfiles.domainStatus,
       icpStatus: workspaceSiteProfiles.icpStatus
     }).from(workspaceSiteProfiles).where(inArray11(workspaceSiteProfiles.userId, customerIds)) : [],
+    customerIds.length ? db.select().from(websiteStyleWorkflows).where(inArray11(websiteStyleWorkflows.userId, customerIds)) : [],
     customerIds.length ? db.select({
       userId: workspaceSiteChecks.userId,
       status: workspaceSiteChecks.status
     }).from(workspaceSiteChecks).where(inArray11(workspaceSiteChecks.userId, customerIds)) : [],
     customerIds.length ? db.select({
       userId: userDashboardContents.userId,
-      revision: userDashboardContents.revision
-    }).from(userDashboardContents).where(inArray11(userDashboardContents.userId, customerIds)) : []
+      payload: userDashboardContents.payload,
+      revision: userDashboardContents.revision,
+      sourceName: userDashboardContents.sourceName,
+      updatedAt: userDashboardContents.updatedAt
+    }).from(userDashboardContents).where(inArray11(userDashboardContents.userId, customerIds)) : [],
+    role.roleType === "ai_operations_engineer" ? getDeliveryTicketWorkspace(role.customerUserId) : null,
+    role.roleType === "ai_operations_engineer" ? getKnowledgeBaseProgress({ userId: role.customerUserId }) : null,
+    role.roleType === "ai_operations_engineer" ? getLatestKnowledgeSnapshot(role.customerUserId) : null
   ]);
   const counts = {
     submitted: 0,
+    scheduled: 0,
     in_progress: 0,
     needs_information: 0,
     completed: 0
@@ -19835,15 +21015,80 @@ async function getMyDeliveryWorkbench(input) {
   const dashboardRevisionByUser = new Map(
     dashboards.map((dashboard) => [dashboard.userId, dashboard.revision])
   );
+  const marketEditionByUser = new Map(
+    customers.map((customer) => [customer.id, customer.marketEdition])
+  );
+  const dashboardRecord = dashboards.find(
+    (dashboard) => dashboard.userId === role.customerUserId
+  );
+  const parsedDashboard = dashboardRecord ? dashboardPayloadSchema.safeParse(dashboardRecord.payload) : null;
   return {
     assignment: role,
     customers: customersWithDetails,
+    customerQuestions: questions.map((question) => ({
+      ...question,
+      selectionRequestedAt: question.selectionRequestedAt?.getTime?.() ?? null
+    })),
+    dashboard: dashboardRecord && parsedDashboard?.success ? {
+      payload: parsedDashboard.data,
+      revision: dashboardRecord.revision,
+      sourceName: dashboardRecord.sourceName,
+      updatedAt: dashboardRecord.updatedAt.getTime()
+    } : null,
+    aiOperationsPreview: role.roleType === "ai_operations_engineer" ? {
+      websiteWorkspace,
+      knowledgeProgress,
+      knowledgeSnapshot
+    } : null,
     tickets: tickets.map((ticket) => ({
       ...ticket,
-      dashboardRevision: dashboardRevisionByUser.get(ticket.userId) ?? 0
+      dashboardRevision: dashboardRevisionByUser.get(ticket.userId) ?? 0,
+      websiteStyleWorkflowRevision: styleWorkflows.find((workflow) => workflow.userId === ticket.userId)?.revision ?? 0,
+      websiteStyleState: styleWorkflows.find((workflow) => workflow.userId === ticket.userId)?.status ?? null,
+      marketEdition: marketEditionByUser.get(ticket.userId) ?? null
     })),
     counts
   };
+}
+async function approveMyCustomerQuestionSelection(input) {
+  const role = await assertDeliveryProjectContext(input);
+  if (role.roleType !== "monitoring_optimization_engineer") {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u53EA\u6709\u95EE\u9898\u76D1\u63A7\u5DE5\u7A0B\u5E08\u53EF\u4EE5\u5BA1\u6838\u5BA2\u6237\u63D0\u4EA4\u7684\u95EE\u9898"
+    );
+  }
+  const db = await requireDb12();
+  const activeCatalogTickets = await db.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
+    and17(
+      eq20(
+        deliveryTickets.assignedProjectAssignmentId,
+        role.projectAssignmentId
+      ),
+      eq20(deliveryTickets.userId, role.customerUserId),
+      eq20(deliveryTickets.operation, "question_catalog"),
+      inArray11(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)
+    )
+  ).limit(1);
+  if (!activeCatalogTickets[0]) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "\u54C1\u724C\u8BCD\u5E93\u4E0E\u95EE\u9898\u76EE\u5F55\u5DE5\u5355\u5C1A\u672A\u89E3\u9501\u6216\u5DF2\u7ECF\u7ED3\u675F"
+    );
+  }
+  try {
+    return await approveWorkspaceQuestionSelection({
+      userId: role.customerUserId,
+      questionId: input.questionId,
+      expectedRevision: input.expectedRevision,
+      actorUserId: input.actor.id
+    });
+  } catch (error) {
+    if (error instanceof ServiceEntitlementError) {
+      throw new AuthServiceError("CONFLICT", error.message);
+    }
+    throw error;
+  }
 }
 var MEMBER_TICKET_TRANSITIONS = {
   submitted: ["in_progress", "needs_information", "rejected", "cancelled"],
@@ -20001,6 +21246,71 @@ async function createAssignedWorkflowTicket(input) {
   });
   return id;
 }
+async function ensureWebsiteStyleWorkflowTicket(input) {
+  const existingWorkflow = await input.executor.select().from(websiteStyleWorkflows).where(eq20(websiteStyleWorkflows.userId, input.sourceTicket.userId)).limit(1).for("update");
+  if (existingWorkflow[0]) return existingWorkflow[0].currentBatchId;
+  const owner = await getActiveDeliveryProjectOwner(
+    input.executor,
+    input.sourceTicket.userId,
+    "ai_operations_engineer"
+  );
+  if (!owner) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "\u5907\u6848\u5DF2\u901A\u8FC7\uFF0C\u4F46\u5C1A\u672A\u5206\u914D AI \u8FD0\u7EF4\u5DE5\u7A0B\u5E08\uFF0C\u65E0\u6CD5\u521B\u5EFA\u5B98\u7F51\u98CE\u683C\u6837\u4F8B\u4EFB\u52A1"
+    );
+  }
+  const now = /* @__PURE__ */ new Date();
+  const ticketId = randomUUID15();
+  await input.executor.insert(websiteStyleWorkflows).values({
+    userId: input.sourceTicket.userId,
+    status: "waiting_samples",
+    currentBatchId: null,
+    selectedSampleId: null,
+    selectedByUserId: null,
+    selectedAt: null,
+    revision: 1,
+    createdAt: now,
+    updatedAt: now
+  });
+  await input.executor.insert(deliveryTickets).values({
+    id: ticketId,
+    userId: input.sourceTicket.userId,
+    contractId: input.sourceTicket.contractId,
+    quotaPeriodId: input.sourceTicket.quotaPeriodId,
+    type: "website_operation",
+    quotaPool: null,
+    ordinal: 0,
+    clientRequestId: randomUUID15(),
+    category: "website_style_samples",
+    title: "\u63D0\u4F9B AI \u4E13\u7528\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u6837\u4F8B",
+    description: "ICP\u5907\u6848\u5DF2\u786E\u8BA4\uFF0C\u8BF7\u63D0\u4F9B\u4E09\u5F20\u56FE\u7247\u98CE\u683C\u6837\u4F8B\u4F9B\u5BA2\u6237\u9009\u62E9\uFF1B\u5BA2\u6237\u786E\u8BA4\u540E\u518D\u5F00\u59CB\u5B98\u7F51\u6784\u5EFA\u4E0E\u5185\u5BB9\u8FD0\u8425\u3002",
+    workflowDomain: "ai_operations_engineer",
+    operation: "website_style_samples",
+    assignedProjectAssignmentId: owner.projectAssignmentId,
+    assignedMemberId: owner.engineerUserId,
+    technicalDedupeKey: `website-style:${input.sourceTicket.userId}`,
+    quotaState: "consumed",
+    status: "submitted",
+    createdByUserId: input.actorUserId,
+    updatedByUserId: input.actorUserId,
+    createdAt: now,
+    updatedAt: now
+  });
+  await input.executor.insert(deliveryTicketEvents).values({
+    id: randomUUID15(),
+    ticketId,
+    userId: input.sourceTicket.userId,
+    actorUserId: input.actorUserId,
+    actorRole: "system",
+    kind: "created",
+    visibility: "customer",
+    message: "\u5907\u6848\u7ED3\u679C\u5DF2\u786E\u8BA4\uFF0C\u6B63\u5728\u7B49\u5F85\u5DE5\u7A0B\u5E08\u63D0\u4F9B\u4E09\u5F20\u5B98\u7F51\u56FE\u7247\u98CE\u683C\u6837\u4F8B\u3002",
+    toStatus: "submitted",
+    createdAt: now
+  });
+  return ticketId;
+}
 async function updateMyDeliveryTicket(input) {
   const db = await requireDb12();
   return db.transaction(async (tx) => {
@@ -20056,6 +21366,184 @@ async function updateMyDeliveryTicket(input) {
         (input.handoff?.contentAssetIds ?? ticket.contentAssetIds ?? []).map((id) => id.trim()).filter(Boolean)
       )
     );
+    let publishedDashboard;
+    const loadPublishedDashboard = async () => {
+      if (publishedDashboard !== void 0) return publishedDashboard;
+      const dashboardRows = await tx.select({ payload: userDashboardContents.payload }).from(userDashboardContents).where(eq20(userDashboardContents.userId, ticket.userId)).limit(1);
+      const parsed = dashboardPayloadSchema.safeParse(
+        dashboardRows[0]?.payload
+      );
+      publishedDashboard = parsed.success ? parsed.data : null;
+      return publishedDashboard;
+    };
+    if (input.status === "completed" && ticket.operation === "question_catalog") {
+      const questionRows = await tx.select({ id: workspaceQuestions.id }).from(workspaceQuestions).where(
+        and17(
+          eq20(workspaceQuestions.userId, ticket.userId),
+          eq20(workspaceQuestions.status, "selected"),
+          eq20(workspaceQuestions.selectionApprovalStatus, "approved")
+        )
+      ).limit(1);
+      const dashboard = await loadPublishedDashboard();
+      if (!questionRows[0] || !dashboard?.keywordTables.length) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u95EE\u9898\u76EE\u5F55\u5DE5\u5355\u524D\u5FC5\u987B\u5148\u53D1\u5E03\u54C1\u724C\u8BCD\u5E93\uFF0C\u5E76\u81F3\u5C11\u5BA1\u6838\u901A\u8FC7\u4E00\u6761\u5BA2\u6237\u9009\u62E9\u7684\u95EE\u9898"
+        );
+      }
+    }
+    if (["in_progress", "completed"].includes(input.status) && ticket.operation === "initial_monitoring") {
+      const [completedCatalogRows, approvedQuestionRows] = await Promise.all([
+        tx.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
+          and17(
+            eq20(deliveryTickets.userId, ticket.userId),
+            eq20(deliveryTickets.operation, "question_catalog"),
+            eq20(deliveryTickets.status, "completed")
+          )
+        ).limit(1),
+        tx.select({ id: workspaceQuestions.id }).from(workspaceQuestions).where(
+          and17(
+            eq20(workspaceQuestions.userId, ticket.userId),
+            eq20(workspaceQuestions.status, "selected"),
+            eq20(workspaceQuestions.selectionApprovalStatus, "approved")
+          )
+        ).limit(1)
+      ]);
+      if (!completedCatalogRows[0] || !approvedQuestionRows[0]) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u8BF7\u5148\u5B8C\u6210\u54C1\u724C\u8BCD\u5E93\u4E0E\u95EE\u9898\u76EE\u5F55\u5DE5\u5355\uFF0C\u5E76\u5BA1\u6838\u901A\u8FC7\u5BA2\u6237\u9009\u62E9\u7684\u95EE\u9898"
+        );
+      }
+    }
+    if (input.status === "completed" && ["initial_monitoring", "monitoring_import", "monitoring_retest"].includes(
+      ticket.operation || ""
+    )) {
+      if (!monitoringBatchKey) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u76D1\u63A7\u5DE5\u5355\u524D\u5FC5\u987B\u7ED1\u5B9A\u5DF2\u53D1\u5E03\u7684\u6B63\u5F0F\u76D1\u63A7\u6279\u6B21"
+        );
+      }
+      if (ticket.operation === "monitoring_retest" && monitoringBatchKey === ticket.monitoringBatchKey) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u6548\u679C\u590D\u6D4B\u5FC5\u987B\u7ED1\u5B9A\u65B0\u7684\u76D1\u63A7\u6279\u6B21\uFF0C\u4E0D\u80FD\u7EE7\u7EED\u4F7F\u7528\u590D\u6D4B\u524D\u57FA\u7EBF"
+        );
+      }
+      const batchRows = await tx.select({
+        id: monitoringBatches.id,
+        sampleCount: monitoringBatches.sampleCount
+      }).from(monitoringBatches).where(
+        and17(
+          eq20(monitoringBatches.userId, ticket.userId),
+          eq20(monitoringBatches.batchKey, monitoringBatchKey)
+        )
+      ).orderBy(desc15(monitoringBatches.collectedAt)).limit(1);
+      const monitoringBatch = batchRows[0];
+      if (!monitoringBatch || monitoringBatch.sampleCount < 1) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u6240\u586B\u76D1\u63A7\u6279\u6B21\u5C1A\u672A\u53D1\u5E03\u6B63\u5F0F\u7B54\u6848\uFF0C\u8BF7\u5148\u5B8C\u6210\u5BFC\u5165\u5E76\u5728\u7528\u6237\u9884\u89C8\u4E2D\u6838\u5BF9"
+        );
+      }
+      const optimizationQuestionIds = Array.from(
+        new Set(
+          (input.handoff?.optimizationQuestionIds ?? []).map((id) => id.trim()).filter(Boolean)
+        )
+      );
+      if (optimizationQuestionIds.length) {
+        const [questionRows, sampleRows] = await Promise.all([
+          tx.select({ id: workspaceQuestions.id }).from(workspaceQuestions).where(
+            and17(
+              eq20(workspaceQuestions.userId, ticket.userId),
+              eq20(workspaceQuestions.status, "selected"),
+              inArray11(workspaceQuestions.id, optimizationQuestionIds)
+            )
+          ),
+          tx.select({ questionId: monitoringSamples.questionId }).from(monitoringSamples).where(
+            and17(
+              eq20(monitoringSamples.userId, ticket.userId),
+              eq20(monitoringSamples.batchId, monitoringBatch.id),
+              inArray11(monitoringSamples.questionId, optimizationQuestionIds)
+            )
+          )
+        ]);
+        const validQuestionIds = new Set(questionRows.map((row) => row.id));
+        const monitoredQuestionIds = new Set(
+          sampleRows.map((row) => row.questionId)
+        );
+        const invalidQuestionIds = optimizationQuestionIds.filter(
+          (id) => !validQuestionIds.has(id) || !monitoredQuestionIds.has(id)
+        );
+        if (invalidQuestionIds.length) {
+          throw new AuthServiceError(
+            "CONFLICT",
+            `\u4EE5\u4E0B\u5F85\u4F18\u5316\u95EE\u9898\u672A\u88AB\u5BA2\u6237\u786E\u8BA4\u6216\u4E0D\u5C5E\u4E8E\u8BE5\u76D1\u63A7\u6279\u6B21\uFF1A${invalidQuestionIds.join("\u3001")}`
+          );
+        }
+      }
+    }
+    if (input.status === "completed" && ticket.operation === "response_logic") {
+      if (!ticket.sourceQuestionId || !responseLogicRevision) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u5E94\u7B54\u903B\u8F91\u524D\u5FC5\u987B\u7ED1\u5B9A\u6765\u6E90\u95EE\u9898\u548C\u6B63\u5F0F\u7248\u672C"
+        );
+      }
+      const responseRows = await tx.select({
+        status: responseLogicEntries.status,
+        version: responseLogicEntries.version
+      }).from(responseLogicEntries).where(
+        and17(
+          eq20(responseLogicEntries.userId, ticket.userId),
+          eq20(responseLogicEntries.questionId, ticket.sourceQuestionId)
+        )
+      ).limit(1);
+      const responseLogic = responseRows[0];
+      if (!responseLogic || responseLogic.status !== "confirmed" || responseLogic.version !== responseLogicRevision) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          `\u5E94\u7B54\u903B\u8F91 V${responseLogicRevision} \u5C1A\u672A\u4F5C\u4E3A\u8BE5\u95EE\u9898\u7684\u6B63\u5F0F\u7248\u672C\u53D1\u5E03`
+        );
+      }
+    }
+    if (input.status === "completed" && (ticket.operation === "content_asset_publish" || ticket.operation === "channel_distribution")) {
+      if (!contentAssetIds.length) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u5185\u5BB9\u53D1\u5E03\u6216\u6E20\u9053\u5206\u53D1\u524D\u5FC5\u987B\u7ED1\u5B9A\u6B63\u5F0F\u5185\u5BB9\u8D44\u4EA7 ID"
+        );
+      }
+      const dashboard = await loadPublishedDashboard();
+      const publishedAssetIds = new Set(
+        dashboard?.contentAssets.map((asset) => asset.id) ?? []
+      );
+      const missingAssetIds = contentAssetIds.filter(
+        (id) => !publishedAssetIds.has(id)
+      );
+      if (missingAssetIds.length) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          `\u4EE5\u4E0B\u5185\u5BB9\u8D44\u4EA7\u5C1A\u672A\u8FDB\u5165\u5BA2\u6237\u6B63\u5F0F\u770B\u677F\uFF1A${missingAssetIds.join("\u3001")}`
+        );
+      }
+    }
+    if (input.status === "completed" && ticket.operation === "stage_report") {
+      const dashboard = await loadPublishedDashboard();
+      if (!dashboard?.optimizationReport) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u9636\u6BB5\u62A5\u544A\u5DE5\u5355\u524D\u5FC5\u987B\u5148\u53D1\u5E03\u5BA2\u6237\u53EF\u89C1\u7684\u6B63\u5F0F\u4F18\u5316\u62A5\u544A"
+        );
+      }
+    }
+    const icpServiceCode = input.handoff?.icpServiceCode?.trim() || "";
+    let domainApplicationOverseas = false;
+    if (input.status === "completed" && ticket.operation === "domain_application") {
+      const accountRows = await tx.select({ marketEdition: users.marketEdition }).from(users).where(eq20(users.id, ticket.userId)).limit(1);
+      domainApplicationOverseas = accountRows[0]?.marketEdition === "overseas";
+    }
     const websiteContentOperations = [
       "company_facts",
       "product_case_docs",
@@ -20108,6 +21596,12 @@ async function updateMyDeliveryTicket(input) {
     }
     if (input.status === "completed" && ticket.operation === "domain_application") {
       const domainInput = input.handoff?.domain?.trim() || "";
+      if (!domainApplicationOverseas && !icpServiceCode) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u5B8C\u6210\u57DF\u540D\u5DE5\u5355\u524D\u5FC5\u987B\u586B\u5199\u8981\u8FD4\u56DE\u7ED9\u5BA2\u6237\u7684\u5907\u6848\u670D\u52A1\u7801"
+        );
+      }
       let domain;
       try {
         domain = new URL(
@@ -20132,6 +21626,11 @@ async function updateMyDeliveryTicket(input) {
           domain,
           domainStatus: "completed",
           domainVerifiedAt: profile.domainVerifiedAt ?? now,
+          ...domainApplicationOverseas ? {
+            icpNumber: null,
+            icpStatus: "not_required",
+            icpVerifiedAt: now
+          } : {},
           revision: profile.revision + 1,
           updatedByUserId: input.actor.id,
           updatedAt: now
@@ -20143,11 +21642,19 @@ async function updateMyDeliveryTicket(input) {
           siteMode: "unknown",
           domainStatus: "completed",
           domainVerifiedAt: now,
-          icpStatus: "not_submitted",
+          icpStatus: domainApplicationOverseas ? "not_required" : "not_submitted",
+          icpVerifiedAt: domainApplicationOverseas ? now : null,
           revision: 1,
           updatedByUserId: input.actor.id,
           createdAt: now,
           updatedAt: now
+        });
+      }
+      if (domainApplicationOverseas) {
+        await ensureWebsiteStyleWorkflowTicket({
+          executor: tx,
+          sourceTicket: ticket,
+          actorUserId: input.actor.id
         });
       }
     }
@@ -20177,6 +21684,11 @@ async function updateMyDeliveryTicket(input) {
         updatedByUserId: input.actor.id,
         updatedAt: now
       }).where(eq20(workspaceSiteProfiles.userId, ticket.userId));
+      await ensureWebsiteStyleWorkflowTicket({
+        executor: tx,
+        sourceTicket: ticket,
+        actorUserId: input.actor.id
+      });
     }
     if (input.status === "completed" && ticket.operation === "site_check") {
       const check2 = input.handoff?.siteCheck;
@@ -20184,6 +21696,12 @@ async function updateMyDeliveryTicket(input) {
         throw new AuthServiceError(
           "CONFLICT",
           "\u5B8C\u6210\u7AD9\u70B9\u68C0\u67E5\u524D\u5FC5\u987B\u767B\u8BB0\u68C0\u67E5\u7ED3\u679C"
+        );
+      }
+      if (check2.status === "failed") {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "\u7AD9\u70B9\u68C0\u67E5\u672A\u901A\u8FC7\u65F6\u4E0D\u80FD\u5B8C\u6210\u5DE5\u5355\uFF1B\u8BF7\u5148\u4FEE\u6B63\u9875\u9762\uFF0C\u6216\u5C06\u5DE5\u5355\u8BBE\u4E3A\u7B49\u5F85\u8865\u5145\u540E\u7EE7\u7EED\u5904\u7406"
         );
       }
       const checkRows = await tx.select().from(workspaceSiteChecks).where(
@@ -20218,7 +21736,7 @@ async function updateMyDeliveryTicket(input) {
     }
     await tx.update(deliveryTickets).set({
       status: input.status,
-      publicSummary: input.message?.trim() || ticket.publicSummary,
+      publicSummary: input.status === "completed" && ticket.operation === "domain_application" ? domainApplicationOverseas ? "\u6D77\u5916\u7248\u57DF\u540D\u5DF2\u6838\u9A8C\uFF1B\u4E2D\u56FD\u9999\u6E2F\u6216\u6D77\u5916\u8282\u70B9\u65E0\u9700\u529E\u7406\u5DE5\u4FE1\u90E8 ICP \u5907\u6848\u3002" : `\u5907\u6848\u670D\u52A1\u7801\uFF1A${icpServiceCode}` : input.message?.trim() || ticket.publicSummary,
       deliveryLinks,
       monitoringBatchKey,
       responseLogicRevision,
@@ -20226,7 +21744,7 @@ async function updateMyDeliveryTicket(input) {
       resolvedAt: ["completed", "rejected", "cancelled"].includes(
         input.status
       ) ? now : null,
-      revision: sql2`${deliveryTickets.revision} + 1`,
+      revision: sql3`${deliveryTickets.revision} + 1`,
       updatedByUserId: input.actor.id,
       updatedAt: now
     }).where(eq20(deliveryTickets.id, ticket.id));
@@ -20389,7 +21907,7 @@ async function updateMyDeliveryTicket(input) {
       }
     }
     let retestTicketId = null;
-    if (input.status === "completed" && input.publicUrl && ticket.workflowDomain !== "monitoring_optimization_engineer") {
+    if (input.status === "completed" && operation.success && deliveryOperationTriggersMonitoringRetest(operation.data)) {
       retestTicketId = await createMonitoringRetestTicket({
         executor: tx,
         sourceTicket,
@@ -20407,18 +21925,103 @@ async function updateMyDeliveryTicket(input) {
 async function createKnowledgeMonitoringHandoff(input) {
   const db = await requireDb12();
   return db.transaction(async (tx) => {
-    const owner = await getActiveDeliveryProjectOwner(
-      tx,
-      input.userId,
-      "monitoring_optimization_engineer"
-    );
-    if (!owner) return { created: [], assigned: false };
     const periodRows = await tx.select({
       id: serviceQuotaPeriods.id,
       contractId: serviceQuotaPeriods.contractId
     }).from(serviceQuotaPeriods).where(eq20(serviceQuotaPeriods.userId, input.userId)).orderBy(desc15(serviceQuotaPeriods.endsAt)).limit(1);
     const period = periodRows[0];
-    if (!period) return { created: [], assigned: false };
+    if (!period) {
+      return {
+        created: [],
+        assigned: false,
+        knowledgeTicketId: null
+      };
+    }
+    const snapshotRows = input.knowledgeSnapshotId ? await tx.select({
+      id: knowledgeBaseSnapshots.id,
+      maintenanceTicketId: knowledgeBaseSnapshots.maintenanceTicketId
+    }).from(knowledgeBaseSnapshots).where(
+      and17(
+        eq20(knowledgeBaseSnapshots.id, input.knowledgeSnapshotId),
+        eq20(knowledgeBaseSnapshots.userId, input.userId),
+        eq20(knowledgeBaseSnapshots.status, "active")
+      )
+    ).limit(1) : await tx.select({
+      id: knowledgeBaseSnapshots.id,
+      maintenanceTicketId: knowledgeBaseSnapshots.maintenanceTicketId
+    }).from(knowledgeBaseSnapshots).where(
+      and17(
+        eq20(knowledgeBaseSnapshots.userId, input.userId),
+        eq20(knowledgeBaseSnapshots.status, "active")
+      )
+    ).orderBy(desc15(knowledgeBaseSnapshots.version)).limit(1);
+    const snapshotId = snapshotRows[0]?.id ?? null;
+    const snapshotIsMaintenance = Boolean(snapshotRows[0]?.maintenanceTicketId);
+    const aiOwner = await getActiveDeliveryProjectOwner(
+      tx,
+      input.userId,
+      "ai_operations_engineer"
+    );
+    let knowledgeTicketId = null;
+    if (snapshotId && !snapshotIsMaintenance) {
+      const existingKnowledgeTickets = await tx.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
+        and17(
+          eq20(deliveryTickets.userId, input.userId),
+          eq20(deliveryTickets.type, "knowledge_base"),
+          eq20(deliveryTickets.operation, "knowledge_delivery"),
+          eq20(deliveryTickets.knowledgeSnapshotId, snapshotId)
+        )
+      ).limit(1);
+      knowledgeTicketId = existingKnowledgeTickets[0]?.id ?? randomUUID15();
+      if (!existingKnowledgeTickets[0]) {
+        const now = /* @__PURE__ */ new Date();
+        await tx.insert(deliveryTickets).values({
+          id: knowledgeTicketId,
+          userId: input.userId,
+          contractId: period.contractId,
+          quotaPeriodId: period.id,
+          type: "knowledge_base",
+          quotaPool: null,
+          ordinal: 0,
+          clientRequestId: randomUUID15(),
+          category: "knowledge_delivery",
+          title: "\u54C1\u724C\u5168\u57DF\u77E5\u8BC6\u5E93",
+          description: "\u77E5\u8BC6\u5E93\u6784\u5EFA\u5B8C\u6210\u540E\u7531\u7CFB\u7EDF\u81EA\u52A8\u751F\u6210\u7684\u4EA4\u4ED8\u8BB0\u5F55\u3002",
+          knowledgeSnapshotId: snapshotId,
+          workflowDomain: "ai_operations_engineer",
+          operation: "knowledge_delivery",
+          assignedProjectAssignmentId: aiOwner?.projectAssignmentId ?? null,
+          assignedMemberId: aiOwner?.engineerUserId ?? null,
+          technicalDedupeKey: `knowledge-delivery:${snapshotId}`,
+          quotaState: "consumed",
+          status: "completed",
+          publicSummary: "\u54C1\u724C\u5168\u57DF\u77E5\u8BC6\u5E93\u5DF2\u5B8C\u6210\u6784\u5EFA\u5E76\u53D1\u5E03\u3002",
+          createdByUserId: input.actorUserId,
+          updatedByUserId: input.actorUserId,
+          resolvedAt: now,
+          createdAt: now,
+          updatedAt: now
+        });
+        await tx.insert(deliveryTicketEvents).values({
+          id: randomUUID15(),
+          ticketId: knowledgeTicketId,
+          userId: input.userId,
+          actorUserId: input.actorUserId,
+          actorRole: "system",
+          kind: "status_change",
+          visibility: "customer",
+          message: "\u54C1\u724C\u5168\u57DF\u77E5\u8BC6\u5E93\u5DF2\u5B8C\u6210\u6784\u5EFA\u5E76\u53D1\u5E03\uFF0C\u4EA4\u4ED8\u8BB0\u5F55\u5DF2\u81EA\u52A8\u5F52\u6863\u3002",
+          fromStatus: "submitted",
+          toStatus: "completed",
+          createdAt: now
+        });
+      }
+    }
+    const owner = await getActiveDeliveryProjectOwner(
+      tx,
+      input.userId,
+      "monitoring_optimization_engineer"
+    );
     const operations = ["question_catalog", "initial_monitoring"];
     const existing = await tx.select({ operation: deliveryTickets.operation }).from(deliveryTickets).where(
       and17(
@@ -20442,11 +22045,11 @@ async function createKnowledgeMonitoringHandoff(input) {
         ordinal: 0,
         clientRequestId: randomUUID15(),
         category: operation,
-        title: operation === "question_catalog" ? "\u914D\u7F6E\u54C1\u724C\u95EE\u9898\u76EE\u5F55" : "\u6267\u884C\u9996\u6B21\u95EE\u9898\u76D1\u63A7",
+        title: operation === "question_catalog" ? "\u914D\u7F6E\u54C1\u724C\u8BCD\u5E93\u4E0E\u95EE\u9898\u76EE\u5F55" : "\u6267\u884C\u9996\u6B21\u95EE\u9898\u76D1\u63A7",
         workflowDomain: "monitoring_optimization_engineer",
         operation,
-        assignedProjectAssignmentId: owner.projectAssignmentId,
-        assignedMemberId: owner.engineerUserId,
+        assignedProjectAssignmentId: owner?.projectAssignmentId ?? null,
+        assignedMemberId: owner?.engineerUserId ?? null,
         quotaState: "consumed",
         status: "submitted",
         createdByUserId: input.actorUserId,
@@ -20460,78 +22063,106 @@ async function createKnowledgeMonitoringHandoff(input) {
         actorRole: "system",
         kind: "created",
         visibility: "customer",
-        message: operation === "question_catalog" ? "\u77E5\u8BC6\u5E93\u5DF2\u53D1\u5E03\uFF0C\u95EE\u9898\u76EE\u5F55\u914D\u7F6E\u5DE5\u5355\u5DF2\u89E3\u9501\u3002" : "\u77E5\u8BC6\u5E93\u5DF2\u53D1\u5E03\uFF0C\u9996\u6B21\u95EE\u9898\u76D1\u63A7\u5DE5\u5355\u5DF2\u89E3\u9501\u3002",
+        message: operation === "question_catalog" ? "\u77E5\u8BC6\u5E93\u5DF2\u53D1\u5E03\uFF0C\u54C1\u724C\u8BCD\u5E93\u4E0E\u95EE\u9898\u76EE\u5F55\u914D\u7F6E\u5DE5\u5355\u5DF2\u89E3\u9501\u3002" : "\u9996\u6B21\u95EE\u9898\u76D1\u63A7\u5DE5\u5355\u5DF2\u521B\u5EFA\uFF1B\u5B8C\u6210\u95EE\u9898\u76EE\u5F55\u5E76\u5BA1\u6838\u5BA2\u6237\u9009\u9898\u540E\u81EA\u52A8\u89E3\u9501\u3002",
         toStatus: "submitted",
         createdAt: /* @__PURE__ */ new Date()
       });
     }
-    return { created, assigned: true };
+    return {
+      created,
+      assigned: Boolean(owner),
+      knowledgeTicketId
+    };
   });
 }
 async function setDeliveryMemberCredential(input) {
   requireDeliveryManager(input.actor);
-  if (input.actor.adminAccessLevel !== "system_admin") {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u7EF4\u62A4\u5DE5\u7A0B\u5E08 API Key"
-    );
-  }
+  await validateUpstreamApiKey(input.apiKey);
   const db = await requireDb12();
-  const rows = await db.select({ role: users.role }).from(users).where(eq20(users.id, input.memberUserId)).limit(1);
-  if (rows[0]?.role !== "delivery_member") {
-    throw new AuthServiceError("NOT_FOUND", "\u5DE5\u7A0B\u5E08\u4E0D\u5B58\u5728");
-  }
-  const previous = await getApiCredentialStatus(input.memberUserId);
-  const credential = await replaceApiCredential(
-    input.memberUserId,
-    input.apiKey
-  );
-  await writeWorkspaceAuditEvent({
-    actor: input.actor,
-    action: "delivery.engineer_credential.replaced",
-    targetType: "user",
-    targetId: input.memberUserId,
-    workspaceUserId: null,
-    metadata: {
-      previouslyConfigured: previous.configured,
-      configured: credential.configured
-    }
+  return db.transaction(async (tx) => {
+    const scope = await requireEngineerCredentialManagement({
+      executor: tx,
+      actor: input.actor,
+      engineerUserId: input.memberUserId
+    });
+    const credentialRows = await tx.select().from(apiCredentials).where(eq20(apiCredentials.userId, input.memberUserId)).orderBy(desc15(apiCredentials.version)).limit(1).for("update");
+    const latest = credentialRows[0];
+    const previous = latest?.status === "active" ? latest : void 0;
+    const actualVersion = latest?.version ?? 0;
+    assertDeliveryMemberCredentialVersion({
+      actualVersion,
+      expectedVersion: input.expectedVersion
+    });
+    const credential = await replaceApiCredentialInTransaction({
+      executor: tx,
+      userId: input.memberUserId,
+      apiKey: input.apiKey
+    });
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "delivery.engineer_credential.replaced",
+        targetType: "user",
+        targetId: input.memberUserId,
+        workspaceUserId: null,
+        metadata: {
+          previouslyConfigured: Boolean(previous),
+          previousVersion: actualVersion,
+          credentialVersion: credential.version,
+          configured: credential.configured,
+          managerAdminIds: scope.managerAdminIds,
+          affectedCustomerUserIds: scope.customerUserIds
+        }
+      },
+      tx
+    );
+    return credential;
   });
-  return credential;
 }
 async function revokeDeliveryMemberCredential(input) {
   requireDeliveryManager(input.actor);
-  if (input.actor.adminAccessLevel !== "system_admin") {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u7EF4\u62A4\u5DE5\u7A0B\u5E08 API Key"
-    );
-  }
   const db = await requireDb12();
-  const rows = await db.select({ role: users.role }).from(users).where(eq20(users.id, input.memberUserId)).limit(1);
-  if (rows[0]?.role !== "delivery_member") {
-    throw new AuthServiceError("NOT_FOUND", "\u5DE5\u7A0B\u5E08\u4E0D\u5B58\u5728");
-  }
-  const previous = await getApiCredentialStatus(input.memberUserId);
-  await deleteActiveApiCredential(input.memberUserId);
-  await writeWorkspaceAuditEvent({
-    actor: input.actor,
-    action: "delivery.engineer_credential.revoked",
-    targetType: "user",
-    targetId: input.memberUserId,
-    workspaceUserId: null,
-    metadata: {
-      previouslyConfigured: previous.configured,
-      configured: false
+  return db.transaction(async (tx) => {
+    const scope = await requireEngineerCredentialManagement({
+      executor: tx,
+      actor: input.actor,
+      engineerUserId: input.memberUserId
+    });
+    const credentialRows = await tx.select().from(apiCredentials).where(eq20(apiCredentials.userId, input.memberUserId)).orderBy(desc15(apiCredentials.version)).limit(1).for("update");
+    const latest = credentialRows[0];
+    const previous = latest?.status === "active" ? latest : void 0;
+    const actualVersion = latest?.version ?? 0;
+    assertDeliveryMemberCredentialVersion({
+      actualVersion,
+      expectedVersion: input.expectedVersion
+    });
+    if (!previous) {
+      throw new AuthServiceError("CONFLICT", "\u5DE5\u7A0B\u5E08 API Key \u5C1A\u672A\u914D\u7F6E");
     }
+    const deletion = await deleteActiveApiCredentialInTransaction({
+      executor: tx,
+      userId: input.memberUserId
+    });
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "delivery.engineer_credential.revoked",
+        targetType: "user",
+        targetId: input.memberUserId,
+        workspaceUserId: null,
+        metadata: {
+          previouslyConfigured: Boolean(previous),
+          previousVersion: actualVersion,
+          credentialVersion: deletion.version,
+          configured: false,
+          managerAdminIds: scope.managerAdminIds,
+          affectedCustomerUserIds: scope.customerUserIds
+        }
+      },
+      tx
+    );
+    return { success: true };
   });
-  return { success: true };
-}
-async function getMyDeliveryCredentialStatus(actor) {
-  if (actor.role !== "delivery_member") {
-    throw new AuthServiceError("INVALID_CREDENTIAL", "\u9700\u8981\u4EA4\u4ED8\u6210\u5458\u6743\u9650");
-  }
-  return getApiCredentialStatus(actor.id);
 }
 
 // server/managed-user-onboarding-service.ts
@@ -22186,9 +23817,50 @@ var adminRouter = router({
 
 // server/conversation-router.ts
 import { TRPCError as TRPCError4 } from "@trpc/server";
-import { and as and19, asc as asc8, desc as desc17, eq as eq22, inArray as inArray12, isNull as isNull6 } from "drizzle-orm";
+import { and as and19, asc as asc9, desc as desc17, eq as eq22, inArray as inArray12, isNull as isNull6 } from "drizzle-orm";
 import { randomUUID as randomUUID17 } from "node:crypto";
 import { z as z11 } from "zod";
+
+// shared/knowledge-base-copy.ts
+var KNOWLEDGE_COLLECTION_STATUS_COPY = "FrontMind \u6B63\u5728\u6309\u4E1A\u52A1\u5206\u652F\u8FDB\u884C\u8D44\u6599\u91C7\u96C6\u3002\u6B64\u9636\u6BB5\u65E0\u9700\u9010\u9879\u786E\u8BA4\uFF0C\u5B8C\u6210\u540E\u5C06\u76F4\u63A5\u751F\u6210\u53EF\u6838\u9A8C\u77E5\u8BC6\u5E93\u3002";
+var HISTORICAL_KNOWLEDGE_COPY_REWRITES = [
+  {
+    from: "FrontMind \u6B63\u5728\u6309\u4E1A\u52A1\u5206\u652F\u8FDB\u884C\u5E7F\u5EA6\u4F18\u5148\u3001\u6DF1\u5EA6\u53D7\u63A7\u7684\u8D44\u6599\u91C7\u96C6\u3002\u6B64\u9636\u6BB5\u65E0\u9700\u9010\u9879\u786E\u8BA4\uFF0C\u5B8C\u6210\u540E\u5C06\u76F4\u63A5\u751F\u6210\u53EF\u6838\u9A8C\u77E5\u8BC6\u5E93\u3002",
+    to: KNOWLEDGE_COLLECTION_STATUS_COPY
+  }
+];
+function normalizeKnowledgeCollectionCopy(value) {
+  return HISTORICAL_KNOWLEDGE_COPY_REWRITES.reduce(
+    (current, rewrite) => current.replaceAll(rewrite.from, rewrite.to),
+    value
+  );
+}
+
+// shared/ordered-id.ts
+function uniquifyOrderedIds(items, maxLength = 128) {
+  const used = /* @__PURE__ */ new Set();
+  const nextOrdinal = /* @__PURE__ */ new Map();
+  return items.map((item) => {
+    const original = item.id;
+    if (!used.has(original)) {
+      used.add(original);
+      nextOrdinal.set(original, 2);
+      return item;
+    }
+    let ordinal = nextOrdinal.get(original) ?? 2;
+    let candidate = "";
+    do {
+      const suffix = `~${ordinal}`;
+      candidate = `${original.slice(0, Math.max(1, maxLength - suffix.length))}${suffix}`;
+      ordinal += 1;
+    } while (used.has(candidate));
+    used.add(candidate);
+    nextOrdinal.set(original, ordinal);
+    return { ...item, id: candidate };
+  });
+}
+
+// server/conversation-router.ts
 var attachmentSchema = z11.object({
   id: z11.string().min(1).max(128),
   type: z11.enum(["file", "image"]),
@@ -22206,6 +23878,7 @@ var inlineImageSchema = z11.object({
 });
 var messageSchema = z11.object({
   id: z11.string().min(1).max(128),
+  upstreamOutputId: z11.string().min(1).max(128).optional(),
   role: z11.enum(["user", "assistant"]),
   content: z11.string().max(2e6),
   attachments: z11.array(attachmentSchema).max(100).optional(),
@@ -22651,6 +24324,9 @@ async function persistResource(executor, input, validatedResourceKeys) {
 }
 function buildMessageMetadata(message) {
   const metadata = {};
+  if (message.upstreamOutputId) {
+    metadata.upstreamOutputId = message.upstreamOutputId;
+  }
   if (message.outputFiles) metadata.outputFiles = message.outputFiles;
   if (message.inlineImages) metadata.inlineImages = message.inlineImages;
   if (message.elapsedTime !== void 0)
@@ -22674,7 +24350,7 @@ async function loadPersistedMessages(executor, userId, conversationId, projectAs
       eq22(messages.conversationId, conversationId),
       isNull6(messages.deletedAt)
     )
-  ).orderBy(asc8(messages.sequence));
+  ).orderBy(asc9(messages.sequence));
   const messageIds = messageRows.map((row) => row.id);
   const attachmentRows2 = messageIds.length === 0 ? [] : await executor.select().from(attachments).where(
     and19(
@@ -22693,8 +24369,9 @@ async function loadPersistedMessages(executor, userId, conversationId, projectAs
     const metadata = message.metadata ?? {};
     return {
       id: publicId(userId, message.id, projectAssignmentId),
+      ...metadata.upstreamOutputId ? { upstreamOutputId: metadata.upstreamOutputId } : {},
       role: message.role === "assistant" ? "assistant" : "user",
-      content: message.content,
+      content: normalizeKnowledgeCollectionCopy(message.content),
       timestamp: message.sentAt.getTime(),
       attachments: (attachmentsByMessage.get(message.id) ?? []).map(
         (attachment) => ({
@@ -22713,6 +24390,22 @@ async function loadPersistedMessages(executor, userId, conversationId, projectAs
       ...metadata.isStepsPlaceholder !== void 0 ? { isStepsPlaceholder: metadata.isStepsPlaceholder } : {},
       ...metadata.modelName ? { modelName: metadata.modelName } : {}
     };
+  });
+}
+function repairSnapshotMessageIds(messagesToRepair) {
+  const repairedMessages = uniquifyOrderedIds(messagesToRepair);
+  const repairedAttachments = uniquifyOrderedIds(
+    repairedMessages.flatMap((message) => message.attachments ?? [])
+  );
+  let attachmentIndex = 0;
+  return repairedMessages.map((message) => {
+    if (!message.attachments?.length) return message;
+    const nextAttachments = repairedAttachments.slice(
+      attachmentIndex,
+      attachmentIndex + message.attachments.length
+    );
+    attachmentIndex += message.attachments.length;
+    return { ...message, attachments: nextAttachments };
   });
 }
 function splitMessageTurns(messagesToSplit) {
@@ -22880,6 +24573,10 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       updatedAt: Date.now()
     };
   }
+  snapshot = {
+    ...snapshot,
+    messages: repairSnapshotMessageIds(snapshot.messages)
+  };
   const { credentialId: resolvedCredentialId, bindings } = await resolveSnapshotCredentialId(executor, userId, snapshot, {
     existingCredentialId: existing?.apiCredentialId,
     importCredentialId: options.importCredentialId,
@@ -22946,7 +24643,7 @@ async function persistSnapshot(executor, userId, snapshot, options = {}) {
       conversationId: persistedConversationId2,
       userId,
       role: message.role,
-      content: message.content,
+      content: normalizeKnowledgeCollectionCopy(message.content),
       sequence,
       metadata: buildMessageMetadata(message),
       sentAt,
@@ -23144,7 +24841,7 @@ async function listSnapshots(userId, projectAssignmentId = null) {
       inArray12(messages.conversationId, ids),
       isNull6(messages.deletedAt)
     )
-  ).orderBy(asc8(messages.sequence));
+  ).orderBy(asc9(messages.sequence));
   const messageIds = messageRows.map((row) => row.id);
   const attachmentRows2 = messageIds.length === 0 ? [] : await db.select().from(attachments).where(
     and19(
@@ -23172,8 +24869,9 @@ async function listSnapshots(userId, projectAssignmentId = null) {
       const metadata = message.metadata ?? {};
       return {
         id: publicId(userId, message.id, projectAssignmentId),
+        ...metadata.upstreamOutputId ? { upstreamOutputId: metadata.upstreamOutputId } : {},
         role: message.role === "assistant" ? "assistant" : "user",
-        content: message.content,
+        content: normalizeKnowledgeCollectionCopy(message.content),
         timestamp: message.sentAt.getTime(),
         attachments: (attachmentsByMessage.get(message.id) ?? []).map(
           (attachment) => ({
@@ -23735,7 +25433,7 @@ async function getHistoricalQuestionResults(input, dependencies = DEFAULT_DEPEND
 import { randomUUID as randomUUID18 } from "node:crypto";
 import { unlink } from "node:fs/promises";
 import path from "node:path";
-import { and as and20, desc as desc18, eq as eq23, inArray as inArray13, lt as lt4, or as or4, sql as sql3 } from "drizzle-orm";
+import { and as and20, desc as desc18, eq as eq23, inArray as inArray13, lt as lt5, or as or5, sql as sql4 } from "drizzle-orm";
 var dashboardAssetRoot = path.resolve(
   process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path.join(process.cwd(), ".frontmind-dashboard-assets")
 );
@@ -24071,7 +25769,7 @@ async function decideKnowledgeReset(input) {
         status: "rejected",
         publicSummary: input.decisionNote.trim(),
         resolvedAt: now,
-        revision: sql3`${deliveryTickets.revision} + 1`,
+        revision: sql4`${deliveryTickets.revision} + 1`,
         updatedByUserId: input.actor.id,
         updatedAt: now
       }).where(eq23(deliveryTickets.id, row.request.ticketId));
@@ -24138,10 +25836,10 @@ async function decideKnowledgeReset(input) {
       }).from(upstreamResources).where(
         and20(
           eq23(upstreamResources.userId, row.request.userId),
-          or4(
-            storedIds.length ? inArray13(upstreamResources.conversationId, storedIds) : sql3`false`,
-            buildTaskIds.length ? inArray13(upstreamResources.upstreamId, buildTaskIds) : sql3`false`,
-            receiptResourceIds.length ? inArray13(upstreamResources.upstreamId, receiptResourceIds) : sql3`false`
+          or5(
+            storedIds.length ? inArray13(upstreamResources.conversationId, storedIds) : sql4`false`,
+            buildTaskIds.length ? inArray13(upstreamResources.upstreamId, buildTaskIds) : sql4`false`,
+            receiptResourceIds.length ? inArray13(upstreamResources.upstreamId, receiptResourceIds) : sql4`false`
           )
         )
       )
@@ -24228,7 +25926,7 @@ async function decideKnowledgeReset(input) {
       updatedAt: now
     }).onDuplicateKeyUpdate({
       set: {
-        revision: sql3`${knowledgeBaseResetStates.revision} + 1`,
+        revision: sql4`${knowledgeBaseResetStates.revision} + 1`,
         updatedAt: now
       }
     });
@@ -24245,7 +25943,7 @@ async function decideKnowledgeReset(input) {
       status: "completed",
       publicSummary: "\u77E5\u8BC6\u5E93\u5DF2\u6E05\u7A7A\uFF0C\u53EF\u4EE5\u91CD\u65B0\u5F00\u59CB\u9996\u6B21\u6784\u5EFA\u3002",
       resolvedAt: now,
-      revision: sql3`${deliveryTickets.revision} + 1`,
+      revision: sql4`${deliveryTickets.revision} + 1`,
       updatedByUserId: input.actor.id,
       updatedAt: now
     }).where(eq23(deliveryTickets.id, row.request.ticketId));
@@ -24279,7 +25977,7 @@ async function processKnowledgeResetCleanupJobs() {
   const jobs = await db.select().from(knowledgeBaseResetCleanupJobs).where(
     and20(
       inArray13(knowledgeBaseResetCleanupJobs.status, ["pending", "failed"]),
-      lt4(knowledgeBaseResetCleanupJobs.attemptCount, 5)
+      lt5(knowledgeBaseResetCleanupJobs.attemptCount, 5)
     )
   ).orderBy(knowledgeBaseResetCleanupJobs.createdAt).limit(50);
   for (const job of jobs) {
@@ -24321,7 +26019,7 @@ async function processKnowledgeResetCleanupJobs() {
       await db.transaction(async (tx) => {
         await tx.update(knowledgeBaseResetCleanupJobs).set({
           status: "completed",
-          attemptCount: sql3`${knowledgeBaseResetCleanupJobs.attemptCount} + 1`,
+          attemptCount: sql4`${knowledgeBaseResetCleanupJobs.attemptCount} + 1`,
           lastError: null,
           completedAt: /* @__PURE__ */ new Date(),
           updatedAt: /* @__PURE__ */ new Date()
@@ -24339,7 +26037,7 @@ async function processKnowledgeResetCleanupJobs() {
     } catch (error) {
       await db.update(knowledgeBaseResetCleanupJobs).set({
         status: "failed",
-        attemptCount: sql3`${knowledgeBaseResetCleanupJobs.attemptCount} + 1`,
+        attemptCount: sql4`${knowledgeBaseResetCleanupJobs.attemptCount} + 1`,
         lastError: error instanceof Error ? error.message.slice(0, 2e3) : "\u5220\u9664\u5931\u8D25",
         updatedAt: /* @__PURE__ */ new Date()
       }).where(eq23(knowledgeBaseResetCleanupJobs.id, job.id));
@@ -24478,6 +26176,36 @@ var workspaceRouter = router({
             value: input
           })
         );
+      } catch (error) {
+        toServiceError(error);
+      }
+    }),
+    selectWebsiteStyle: protectedProcedure.input(
+      z16.object({
+        sampleId: z16.string().uuid(),
+        expectedRevision: z16.number().int().positive()
+      })
+    ).mutation(async ({ ctx, input }) => {
+      try {
+        return await selectWebsiteStyleSample({
+          actor: ctx.user,
+          ...input
+        });
+      } catch (error) {
+        toServiceError(error);
+      }
+    }),
+    requestWebsiteStyleRevision: protectedProcedure.input(
+      z16.object({
+        reason: z16.string().trim().min(1).max(2e3),
+        expectedRevision: z16.number().int().positive()
+      })
+    ).mutation(async ({ ctx, input }) => {
+      try {
+        return await requestWebsiteStyleRevision({
+          actor: ctx.user,
+          ...input
+        });
       } catch (error) {
         toServiceError(error);
       }
@@ -24833,22 +26561,30 @@ var deliveryRoleRouter = router({
     setEngineerApiKey: adminProcedure.input(
       z17.object({
         engineerUserId: z17.number().int().positive(),
-        apiKey: z17.string().trim().min(8).max(4096)
+        apiKey: z17.string().trim().min(8).max(4096),
+        expectedVersion: z17.number().int().nonnegative()
       })
     ).mutation(
       ({ ctx, input }) => serviceCall(
         () => setDeliveryMemberCredential({
           actor: ctx.user,
           memberUserId: input.engineerUserId,
-          apiKey: input.apiKey
+          apiKey: input.apiKey,
+          expectedVersion: input.expectedVersion
         })
       )
     ),
-    revokeEngineerApiKey: adminProcedure.input(z17.object({ engineerUserId: z17.number().int().positive() })).mutation(
+    revokeEngineerApiKey: adminProcedure.input(
+      z17.object({
+        engineerUserId: z17.number().int().positive(),
+        expectedVersion: z17.number().int().nonnegative()
+      })
+    ).mutation(
       ({ ctx, input }) => serviceCall(
         () => revokeDeliveryMemberCredential({
           actor: ctx.user,
-          memberUserId: input.engineerUserId
+          memberUserId: input.engineerUserId,
+          expectedVersion: input.expectedVersion
         })
       )
     )
@@ -24862,8 +26598,61 @@ var deliveryRoleRouter = router({
         () => getMyDeliveryWorkbench({ actor: ctx.user, ...input })
       )
     ),
-    credentialStatus: protectedProcedure.query(
-      ({ ctx }) => serviceCall(() => getMyDeliveryCredentialStatus(ctx.user))
+    approveQuestionSelection: protectedProcedure.input(
+      z17.object({
+        projectAssignmentId: z17.string().uuid(),
+        questionId: z17.string().trim().min(1).max(64),
+        expectedRevision: z17.number().int().positive()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => approveMyCustomerQuestionSelection({
+          actor: ctx.user,
+          ...input
+        })
+      )
+    ),
+    history: protectedProcedure.input(
+      z17.object({
+        status: z17.enum(["completed", "rejected", "cancelled"]).optional(),
+        customerUserId: z17.number().int().positive().optional(),
+        operation: z17.string().trim().min(1).max(64).optional(),
+        limit: z17.number().int().min(1).max(50).default(20),
+        cursor: z17.object({
+          resolvedAt: z17.number().int().nonnegative(),
+          id: z17.string().uuid()
+        }).optional()
+      }).default({ limit: 20 })
+    ).query(
+      ({ ctx, input }) => serviceCall(() => getMyDeliveryHistory({ actor: ctx.user, ...input }))
+    ),
+    ticketDetail: protectedProcedure.input(z17.object({ ticketId: z17.string().uuid() })).query(
+      ({ ctx, input }) => serviceCall(
+        () => getMyDeliveryTicketDetail({ actor: ctx.user, ...input })
+      )
+    ),
+    publishWebsiteStyleSamples: protectedProcedure.input(
+      z17.object({
+        projectAssignmentId: z17.string().uuid(),
+        ticketId: z17.string().uuid(),
+        expectedWorkflowRevision: z17.number().int().positive(),
+        engineerNote: z17.string().trim().max(2e3).optional(),
+        samples: z17.array(
+          z17.object({
+            fileId: z17.string().trim().min(1).max(255),
+            filename: z17.string().trim().min(1).max(512),
+            mimeType: z17.string().trim().min(1).max(255),
+            sizeBytes: z17.number().int().positive().max(10 * 1024 * 1024),
+            sha256: z17.string().regex(/^[a-f0-9]{64}$/i).optional(),
+            label: z17.string().trim().min(1).max(160),
+            note: z17.string().trim().max(2e3).optional()
+          })
+        ).length(3)
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => publishWebsiteStyleSamples({ actor: ctx.user, ...input })
+      )
     ),
     knowledgeResetPreview: protectedProcedure.input(
       z17.object({
@@ -24913,6 +26702,7 @@ var deliveryRoleRouter = router({
           ]).optional(),
           needsFurtherOptimization: z17.boolean().optional(),
           domain: z17.string().trim().max(512).optional(),
+          icpServiceCode: z17.string().trim().max(512).optional(),
           icpProvince: z17.string().trim().max(64).optional(),
           icpNumber: z17.string().trim().max(128).optional(),
           icpNotRequired: z17.boolean().optional(),
@@ -24973,6 +26763,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import fs from "node:fs";
 import path2 from "node:path";
+import { execFileSync } from "node:child_process";
 import { defineConfig } from "vite";
 var PROJECT_ROOT = import.meta.dirname;
 var LOG_DIR = path2.join(PROJECT_ROOT, ".frontmind-logs");
@@ -25081,14 +26872,19 @@ function vitePluginFrontMindDebugCollector() {
     }
   };
 }
-function vitePluginFrontMindBuildVersion(buildVersion) {
+function vitePluginFrontMindBuildVersion(buildVersion, gitSha, builtAt) {
   return {
     name: "frontmind-build-version",
     generateBundle() {
       this.emitFile({
         type: "asset",
         fileName: "__frontmind__/version.json",
-        source: `${JSON.stringify({ version: buildVersion })}
+        source: `${JSON.stringify({
+          version: buildVersion,
+          gitSha,
+          builtAt,
+          copyRevision: "knowledge-collection-copy-v2"
+        })}
 `
       });
     }
@@ -25115,7 +26911,26 @@ function vitePluginProductionPublicAssets() {
     {
       source: "assets/cuhksz-emblem.png",
       output: "assets/cuhksz-emblem.png"
-    }
+    },
+    ...[
+      "01-domain-search.webp",
+      "02-filing-entry.webp",
+      "03-enterprise-sponsor.webp",
+      "04-owner-contact-empty.webp",
+      "05-owner-contact-filled.webp",
+      "06-mobile-enterprise-main.webp",
+      "07-mobile-owner-upload.webp",
+      "08-sms-review-stage.webp",
+      "09-sms-message.webp",
+      "10-sms-verification.webp",
+      "11-sms-resend.webp",
+      "12-icp-filing-process.webp",
+      "13-existing-sponsor-prefilled.webp",
+      "14-existing-sponsor-mobile.webp"
+    ].map((filename) => ({
+      source: `assets/aliyun-icp-guide/${filename}`,
+      output: `assets/aliyun-icp-guide/${filename}`
+    }))
   ];
   const publicDirectory = path2.resolve(import.meta.dirname, "client/public");
   return {
@@ -25139,11 +26954,24 @@ function vitePluginProductionPublicAssets() {
 }
 var vite_config_default = defineConfig(({ mode }) => {
   const isProduction = mode === "production";
-  const buildVersion = process.env.FRONTMIND_BUILD_VERSION?.trim() || `${Date.now()}`;
+  const repositorySha = (() => {
+    try {
+      return execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: PROJECT_ROOT,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      }).trim();
+    } catch {
+      return "";
+    }
+  })();
+  const gitSha = process.env.FRONTMIND_BUILD_SHA?.trim() || process.env.COMMIT_SHA?.trim() || process.env.RENDER_GIT_COMMIT?.trim() || repositorySha || "local";
+  const builtAt = (/* @__PURE__ */ new Date()).toISOString();
+  const buildVersion = process.env.FRONTMIND_BUILD_VERSION?.trim() || (gitSha !== "local" ? gitSha : `${Date.now()}`);
   const plugins = [
     react(),
     tailwindcss(),
-    vitePluginFrontMindBuildVersion(buildVersion),
+    vitePluginFrontMindBuildVersion(buildVersion, gitSha, builtAt),
     isProduction && vitePluginProductionPublicAssets(),
     !isProduction && jsxLocPlugin(),
     !isProduction && vitePluginFrontMindDebugCollector()
@@ -26412,7 +28240,7 @@ function sanitizeText(text2) {
     const sourceLower = getSourceBrandLower();
     const sourceTitle = getSourceBrandTitle();
     const sourceUpper = sourceLower.toUpperCase();
-    return text2.replace(
+    const sanitized = text2.replace(
       new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"),
       "https://api.frontmind."
     ).replace(
@@ -26431,6 +28259,7 @@ function sanitizeText(text2) {
       new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"),
       "frontmind"
     );
+    return normalizeKnowledgeCollectionCopy(sanitized);
   } catch (e) {
     console.error("[sanitizeText] Error:", e);
     return text2;
@@ -28453,7 +30282,7 @@ var manus_proxy_default = router2;
 
 // server/knowledge-base-api.ts
 import axios5 from "axios";
-import { and as and21, eq as eq24, inArray as inArray14, isNotNull as isNotNull3, or as or5 } from "drizzle-orm";
+import { and as and21, eq as eq24, inArray as inArray14, isNotNull as isNotNull3, or as or6 } from "drizzle-orm";
 import { Router as Router2 } from "express";
 import fs5 from "fs/promises";
 import JSZip2 from "jszip";
@@ -28642,9 +30471,6 @@ async function buildDirectorySkillArchive(input) {
   throw lastError instanceof Error ? lastError : new Error(`Could not load Skill ${input.name}`);
 }
 
-// shared/knowledge-base-copy.ts
-var KNOWLEDGE_COLLECTION_STATUS_COPY = "FrontMind \u6B63\u5728\u6309\u4E1A\u52A1\u5206\u652F\u8FDB\u884C\u8D44\u6599\u91C7\u96C6\u3002\u6B64\u9636\u6BB5\u65E0\u9700\u9010\u9879\u786E\u8BA4\uFF0C\u5B8C\u6210\u540E\u5C06\u76F4\u63A5\u751F\u6210\u53EF\u6838\u9A8C\u77E5\u8BC6\u5E93\u3002";
-
 // server/knowledge-base-api.ts
 var router3 = Router2();
 async function requireKnowledgeBuildCapability(userId, res) {
@@ -28696,7 +30522,7 @@ function outputItemIds(output) {
     (item) => item && typeof item === "object" && "id" in item ? String(item.id || "") : ""
   ).filter(Boolean);
 }
-function selectUnreconciledKnowledgeOutput(output, ledger) {
+function selectUnreconciledKnowledgeOutput(output, ledger, options = {}) {
   if (output.length > ledger.lastOutputLength) {
     return output.slice(ledger.lastOutputLength);
   }
@@ -28709,7 +30535,7 @@ function selectUnreconciledKnowledgeOutput(output, ledger) {
   if (unseenById.length > 0) return unseenById;
   const currentIds = outputItemIds(output);
   if (currentIds.length > 0 && currentIds.every((id) => previousIds.has(id))) {
-    return [];
+    return options.replayStableOutput ? output : [];
   }
   return output;
 }
@@ -28850,7 +30676,8 @@ async function reconcileAvailableKnowledgeOutput(input) {
   });
   const unreconciled = selectUnreconciledKnowledgeOutput(
     input.output,
-    input.ledger
+    input.ledger,
+    { replayStableOutput: upstreamTaskTerminal(input.upstreamStatus) }
   );
   if (shouldReconcileKnowledgeOutput(unreconciled, input.upstreamStatus, {
     requirePresentation: progress?.build.skillVersion === "3"
@@ -28889,7 +30716,7 @@ async function recoverOpenKnowledgeBaseTasks(options) {
     and21(
       inArray14(knowledgeBaseBuilds.status, ["researching", "confirming"]),
       isNotNull3(knowledgeBaseBuilds.upstreamTaskId),
-      or5(
+      or6(
         eq24(knowledgeBaseBuilds.status, "researching"),
         isNotNull3(knowledgeBaseBuilds.awaitingResponseSince)
       )
@@ -29253,6 +31080,7 @@ async function buildKnowledgeBasePrompt({
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u77E5\u8BC6\u6811\u7EDF\u8BA1\uFF08\u4EC5\u9996\u8F6E\u9700\u8981\uFF09\u548C\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\u3002\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\uFF1B\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\u3002\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u5D4C\u5165\u5B98\u7F51\u6216 CDN \u56FE\u7247\u5916\u94FE\u3002\u56FE\u7247\u5FC5\u987B\u5148\u4E0B\u8F7D\u771F\u5B9E\u5B57\u8282\u3001\u89E3\u7801\u6821\u9A8C\u5E76\u6253\u5165\u6700\u7EC8 ZIP\uFF0C\u518D\u4EE5\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u5F15\u7528\uFF1B\u9632\u76D7\u94FE\u3001\u7B7E\u540D\u3001\u8FC7\u671F\u6216\u65E0\u6CD5\u4E0B\u8F7D\u7684\u5730\u5740\u53EA\u80FD\u8FDB\u5165\u5185\u90E8\u6765\u6E90\u8BB0\u5F55\uFF0C\u7EDD\u4E0D\u80FD\u4F5C\u4E3A\u5BA2\u6237\u56FE\u7247\u8FD4\u56DE\u3002",
+    "\u9010\u8282\u70B9\u786E\u8BA4\u8FD8\u5FC5\u987B\u4EA4\u4ED8\u771F\u5B9E\u56FE\u7247\u9644\u4EF6\uFF1A\u5C55\u793A\u8282\u70B9\u5B58\u5728\u5408\u683C related assetIds \u65F6\uFF0C\u4ECE\u5DF2\u4E0B\u8F7D\u5E76\u9A8C\u8BC1\u7684\u672C\u5730\u5B57\u8282\u4E2D\u9009\u62E9\u6700\u591A\u4E09\u5F20\uFF0C\u4EE5 output_image \u6216 image MIME \u7684 output_file \u4F5C\u4E3A\u540C\u4E00\u56DE\u590D\u7684\u771F\u5B9E\u9644\u4EF6\u8FD4\u56DE\u3002\u4E0D\u5F97\u53EA\u5199\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u3001\u56FE\u7247\u6807\u9898\u6216\u201C\u914D\u56FE\u201D\u5360\u4F4D\uFF1B\u5F53\u524D\u8282\u70B9\u6CA1\u6709\u5408\u683C\u5173\u8054\u7D20\u6750\u65F6\u624D\u5141\u8BB8\u7EAF\u6587\u5B57\u8FD4\u56DE\u3002\u9010\u8F6E\u9644\u4EF6\u4E0E\u6700\u7EC8 ZIP \u5FC5\u987B\u4F7F\u7528\u540C\u4E00\u8D44\u4EA7\u5B57\u8282\u3002",
     `\u8D44\u6599\u91C7\u96C6\u9636\u6BB5\u7EDF\u4E00\u5411\u5BA2\u6237\u663E\u793A\uFF1A${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
     "",
     "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
@@ -29283,9 +31111,10 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     "### \u540E\u7EED\u6BCF\u8F6E\u5355\u8282\u70B9\u72B6\u6001",
     "\u670D\u52A1\u7AEF\u4ECE revision=0\u3001\u6E05\u5355\u7B2C\u4E00\u4E2A\u53F6\u5B50\u4E3A current \u5F00\u59CB\u3002\u540E\u7EED\u6BCF\u8F6E\u672B\u5C3E\u5FC5\u987B\u4F9D\u6B21\u9644\u4E00\u4E2A\u72B6\u6001\u4FE1\u5C01\u548C\u4E00\u4E2A\u5C55\u793A\u4FE1\u5C01\uFF1A",
     '<!-- FRONTMIND_KB_PROGRESS\n{"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":0,"transition":{"leafId":"1.1","from":"current","to":"confirmed","reason":"\u7528\u6237\u660E\u786E\u786E\u8BA4"}}\n-->',
-    '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2"}\n-->',
+    '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
     "revision \u5FC5\u987B\u7B49\u4E8E\u5F53\u524D\u670D\u52A1\u7AEF revision\uFF1B\u6BCF\u6B21\u88AB\u63A5\u53D7\u540E\u52A0 1\u3002leafId \u53EA\u80FD\u662F\u5F53\u524D\u53F6\u5B50\uFF0Cfrom \u53EA\u80FD\u662F current \u6216 needs_verification\u3002",
     "FRONTMIND_KB_PROGRESS \u58F0\u660E\u672C\u8F6E\u5904\u7406\u7684\u65E7\u8282\u70B9\uFF1BFRONTMIND_KB_PRESENTATION \u58F0\u660E\u56DE\u590D\u6B63\u6587\u5B9E\u9645\u5C55\u793A\u7684\u65B0\u72B6\u6001\u3002\u5C55\u793A\u4FE1\u5C01 revision \u5FC5\u987B\u7B49\u4E8E\u63D0\u4EA4\u540E\u7684 revision\uFF0CleafId \u5FC5\u987B\u7B49\u4E8E\u63D0\u4EA4\u540E\u670D\u52A1\u7AEF\u7684 currentLeafId\uFF1B\u5168\u90E8\u5B8C\u6210\u65F6 leafId \u4E3A null\u3002",
+    "FRONTMIND_KB_PRESENTATION \u8FD8\u5FC5\u987B\u58F0\u660E\u5B9E\u9645\u56FE\u7247\u4EA4\u4ED8\uFF1A\u6709 1-3 \u5F20\u771F\u5B9E\u9644\u4EF6\u65F6 imageState=attached\u3001assetIds \u4E3A\u5BF9\u5E94\u7A33\u5B9A\u8D44\u4EA7 ID \u4E14 imageCount \u7B49\u4E8E\u9644\u4EF6\u6570\uFF1B\u5F53\u524D\u8282\u70B9\u786E\u65E0\u5408\u683C\u56FE\u7247\u65F6\u4F7F\u7528 no_eligible_asset\u3001\u7A7A\u6570\u7EC4\u548C 0\uFF1BleafId=null \u65F6\u53EA\u80FD\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002\u58F0\u660E\u4E0E\u771F\u5B9E\u9644\u4EF6\u4E0D\u4E00\u81F4\u65F6\u670D\u52A1\u7AEF\u62D2\u7EDD\u63A8\u8FDB\u3002",
     "\u53EA\u6709\u7528\u6237\u672C\u8F6E\u56DE\u590D\u6070\u597D\u8868\u8FBE\u201C\u786E\u8BA4/\u786E\u8BA4\u65E0\u8BEF/OK/\u6CA1\u95EE\u9898/\u901A\u8FC7\u201D\u7B49\u660E\u786E\u786E\u8BA4\u65F6\uFF0Cto \u624D\u80FD\u4E3A confirmed\uFF0C\u5E76\u53EA\u524D\u8FDB\u4E00\u4E2A\u53F6\u5B50\u3002",
     "\u53EA\u6709\u7528\u6237\u672C\u8F6E\u660E\u786E\u56DE\u590D\u201C\u8DF3\u8FC7/\u76F4\u63A5\u9884\u586B/\u91C7\u7528\u9884\u586B/\u4FDD\u7559\u9884\u586B\u201D\u7B49\u65F6\uFF0Cto \u624D\u80FD\u4E3A direct_prefilled\uFF0C\u5E76\u53EA\u524D\u8FDB\u4E00\u4E2A\u53F6\u5B50\u3002",
     "direct_prefilled \u53EA\u7528\u4E8E\u517C\u5BB9\u7528\u6237\u4E3B\u52A8\u8F93\u5165\u7684\u65E7\u534F\u8BAE\u52A8\u4F5C\uFF1B\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\u3002\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
@@ -29404,7 +31233,7 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     "\u53EA\u8981\u672C\u8F6E\u5305\u542B\u9644\u4EF6\uFF0C\u65E0\u8BBA\u6587\u5B57\u662F\u5426\u5305\u542B\u201C\u786E\u8BA4\u201D\uFF0C\u90FD\u5FC5\u987B\u6309\u8865\u5145/\u4FEE\u8BA2\u5904\u7406\uFF0C\u4FDD\u6301 needs_verification\u3002",
     "\u56DE\u590D\u672B\u5C3E\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PROGRESS \u4FE1\u5C01\u3002",
     action === "confirm" || action === "direct_prefill" ? nextPending ? `\u5148\u7B80\u77ED\u786E\u8BA4\u5DF2\u5904\u7406 ${current.id}\uFF0C\u6B63\u6587\u4E3B\u4F53\u968F\u540E\u5B8C\u6574\u5C55\u793A\u4E0B\u4E00\u8282\u70B9 ${nextPending.id}\uFF5C${nextPending.branchTitle} / ${nextPending.title}\u3002\u4E0D\u5F97\u518D\u6B21\u628A ${current.id} \u4F5C\u4E3A\u4E3B\u4F53\u3002` : `\u8FD9\u662F\u6700\u540E\u4E00\u4E2A\u8282\u70B9\u3002\u7B80\u77ED\u786E\u8BA4 ${current.id} \u540E\u76F4\u63A5\u751F\u6210\u552F\u4E00\u6700\u7EC8 ZIP\uFF0C\u4E0D\u518D\u5C55\u793A\u8282\u70B9\u6B63\u6587\u3002` : `\u66F4\u65B0\u5E76\u5B8C\u6574\u91CD\u65B0\u5C55\u793A\u5F53\u524D\u8282\u70B9 ${current.id}\uFF1B\u4E0D\u5F97\u5C55\u793A\u6216\u63A8\u8FDB\u5230\u540E\u7EED\u8282\u70B9\u3002`,
-    isV3 ? `\u56DE\u590D\u672B\u5C3E\u8FD8\u5FC5\u987B\u9644\u4E14\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF1Arevision=${postRevision}\uFF0CleafId=${action === "confirm" || action === "direct_prefill" ? nextPending?.id || "null" : current.id}\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1A\u8BF7\u9075\u5FAA\u76F8\u540C\u7684\u5C55\u793A\u884C\u4E3A\uFF1B\u5982\u89C4\u7EA6\u652F\u6301\uFF0C\u53EF\u9644 FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0C\u4F46\u670D\u52A1\u7AEF\u4E0D\u5F3A\u5236\u8981\u6C42\u3002"
+    isV3 ? `\u56DE\u590D\u672B\u5C3E\u8FD8\u5FC5\u987B\u9644\u4E14\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF1Arevision=${postRevision}\uFF0CleafId=${action === "confirm" || action === "direct_prefill" ? nextPending?.id || "null" : current.id}\u3002\u540C\u65F6\u4E25\u683C\u58F0\u660E imageState\u3001assetIds\u3001imageCount\uFF1A\u5B9E\u9645\u8FD4\u56DE 1-3 \u5F20\u56FE\u7247\u9644\u4EF6\u65F6\u4F7F\u7528 attached \u548C\u5BF9\u5E94\u7A33\u5B9A\u8D44\u4EA7 ID\uFF1B\u5F53\u524D\u8282\u70B9\u786E\u65E0\u5408\u683C\u56FE\u7247\u65F6\u4F7F\u7528 no_eligible_asset\u3001\u7A7A\u6570\u7EC4\u548C 0\uFF1BleafId=null \u65F6\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1A\u8BF7\u9075\u5FAA\u76F8\u540C\u7684\u5C55\u793A\u884C\u4E3A\uFF1B\u5982\u89C4\u7EA6\u652F\u6301\uFF0C\u53EF\u9644 FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0C\u4F46\u670D\u52A1\u7AEF\u4E0D\u5F3A\u5236\u8981\u6C42\u3002"
   ].join("\n") : [
     `\u5F53\u524D\u77E5\u8BC6\u5E93\u5DF2\u5B8C\u6210\uFF0Crevision=${progress.build.revision}\u3002`,
     "\u672C\u8F6E\u5982\u6709\u8865\u5145\u6216\u4FEE\u6539\uFF0C\u53EA\u80FD\u4ECE\u73B0\u6709\u8282\u70B9\u4E2D\u9009\u62E9\u4E00\u4E2A\u6700\u76F8\u5173\u8282\u70B9\u91CD\u65B0\u6838\u9A8C\uFF0C\u5E76\u9644\u4E00\u4E2A FRONTMIND_KB_REOPEN \u4FE1\u5C01\uFF1B\u4E0D\u5F97\u91CD\u5EFA\u77E5\u8BC6\u6811\u6216\u590D\u7528\u65E7\u5305\u3002",
@@ -29417,6 +31246,7 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u51FA\u73B0\u201C\u672C\u8F6E\u91C7\u96C6/\u672C\u77E5\u8BC6\u5E93/\u8BC1\u636E\u4E0D\u8DB3/\u5DF2\u6838\u9A8C\u201D\u7B49\u8FC7\u7A0B\u5224\u65AD\uFF0C\u4E5F\u4E0D\u5F97\u51FA\u73B0\u5BA2\u6237\u5E94\u3001\u91C7\u8D2D\u65B9\u5E94\u3001\u5EFA\u8BAE\u3001\u5C3D\u8C03\u3001\u5408\u89C4\u5BA1\u67E5\u3001\u4E0D\u80FD\u4EC5\u51ED\u3001\u4E0D\u5B9C\u8F6C\u6362\u6216\u4E0D\u80FD\u5916\u63A8\u7B49\u5EFA\u8BAE\u6027\u8868\u8FBE\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\uFF1B\u7528\u6237\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\u5F53\u524D\u5185\u5BB9\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\uFF0C\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\u3002\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\uFF1B\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
+    "\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u5982\u6709\u5408\u683C related assetIds\uFF0C\u5FC5\u987B\u628A\u6700\u591A\u4E09\u5F20\u5DF2\u4E0B\u8F7D\u9A8C\u8BC1\u7684\u672C\u5730\u56FE\u7247\u4F5C\u4E3A\u540C\u4E00\u56DE\u590D\u7684 output_image \u6216 image MIME output_file \u9644\u4EF6\u8FD4\u56DE\uFF1B\u4E0D\u80FD\u53EA\u8F93\u51FA\u5305\u5185\u8DEF\u5F84\u3001\u56FE\u7247\u6807\u9898\u3001\u6587\u5B57\u5360\u4F4D\u6216\u5B98\u7F51/CDN \u70ED\u94FE\u3002\u53EA\u6709\u8BE5\u8282\u70B9\u786E\u5B9E\u6CA1\u6709\u5408\u683C\u5173\u8054\u7D20\u6750\u65F6\u624D\u53EF\u7EAF\u6587\u5B57\u8FD4\u56DE\u3002",
     "",
     "# \u5F53\u524D\u77E5\u8BC6\u5E93\u72B6\u6001",
     stateReminder,
@@ -29430,7 +31260,7 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     ...isV3 ? [
       "# v3 \u5C55\u793A\u4FE1\u5C01\uFF08\u673A\u5668\u6821\u9A8C\uFF09",
       "\u5C55\u793A\u4FE1\u5C01\u5FC5\u987B\u4F4D\u4E8E\u53EF\u89C1\u6B63\u6587\u4E4B\u540E\u3002\u786E\u8BA4/\u76F4\u63A5\u9884\u586B\u5C55\u793A\u4E0B\u4E00\u8282\u70B9\uFF1B\u4FEE\u8BA2\u5C55\u793A\u539F\u8282\u70B9\uFF1B\u6700\u540E\u8282\u70B9\u5B8C\u6210\u4E3A null\u3002",
-      '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2"}\n-->'
+      '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->'
     ] : []
   ].join("\n");
 }
@@ -29642,11 +31472,22 @@ router3.post("/turn", async (req, res) => {
   const conversationId = String(body.conversationId || "").trim();
   const taskId = String(body.taskId || "").trim();
   const userMessage = String(body.userMessage || "").slice(0, 2e6);
+  const expectedRevision = body.expectedRevision;
+  const expectedLeafId = String(body.expectedLeafId || "").trim();
   if (!conversationId || !taskId || !userMessage.trim() && !body.attachments?.length) {
     res.status(400).json({
       error: {
         code: "INVALID_KNOWLEDGE_BASE_TURN",
         message: "\u8BF7\u8F93\u5165\u5F53\u524D\u8282\u70B9\u7684\u786E\u8BA4\u3001\u4FEE\u8BA2\u6216\u8865\u5145\u8D44\u6599"
+      }
+    });
+    return;
+  }
+  if (expectedRevision !== void 0 && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)) {
+    res.status(400).json({
+      error: {
+        code: "INVALID_KNOWLEDGE_BASE_REVISION",
+        message: "\u5F53\u524D\u77E5\u8BC6\u8282\u70B9\u7248\u672C\u65E0\u6548\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5"
       }
     });
     return;
@@ -29688,6 +31529,15 @@ router3.post("/turn", async (req, res) => {
       });
       return;
     }
+    if (expectedRevision !== void 0 && boundBuild.revision !== expectedRevision || expectedLeafId && boundBuild.currentLeafId !== expectedLeafId) {
+      res.status(409).json({
+        error: {
+          code: "KNOWLEDGE_BASE_STALE_PRESENTATION",
+          message: "\u5F53\u524D\u8282\u70B9\u5DF2\u66F4\u65B0\uFF0C\u672C\u6B21\u91CD\u590D\u63D0\u4EA4\u672A\u6267\u884C\uFF1B\u8BF7\u4EE5\u6700\u65B0\u5185\u5BB9\u4E3A\u51C6"
+        }
+      });
+      return;
+    }
     const taskCredential = await getCredentialForUpstreamResource(
       req.frontmindUser.id,
       "task",
@@ -29724,7 +31574,9 @@ router3.post("/turn", async (req, res) => {
       conversationId,
       taskId,
       userText: userMessage,
-      attachmentCount: attachments2.length
+      attachmentCount: attachments2.length,
+      expectedRevision,
+      expectedLeafId: expectedLeafId || void 0
     });
     let created;
     try {
@@ -30941,7 +32793,7 @@ import {
   randomUUID as randomUUID20,
   timingSafeEqual as timingSafeEqual4
 } from "node:crypto";
-import { and as and22, eq as eq25, isNull as isNull7, lt as lt5 } from "drizzle-orm";
+import { and as and22, eq as eq25, isNull as isNull7, lt as lt6 } from "drizzle-orm";
 import { z as z19 } from "zod";
 var DEFAULT_TTL_SECONDS = 5 * 60;
 var MIN_SECRET_LENGTH = 32;
@@ -31198,7 +33050,7 @@ async function consumeDashboardImportPreflight(input) {
 async function cleanupExpiredDashboardImportPreflights(now = /* @__PURE__ */ new Date()) {
   const db = await getDb();
   if (!db) return 0;
-  const result = await db.delete(dashboardImportPreflights).where(lt5(dashboardImportPreflights.expiresAt, now));
+  const result = await db.delete(dashboardImportPreflights).where(lt6(dashboardImportPreflights.expiresAt, now));
   const metadata = result;
   return metadata.rowsAffected ?? metadata.affectedRows ?? 0;
 }
@@ -35988,7 +37840,8 @@ router5.post("/knowledge/publish", async (req, res) => {
     });
     await createKnowledgeMonitoringHandoff({
       userId: targetUserId,
-      actorUserId: actor.id
+      actorUserId: actor.id,
+      knowledgeSnapshotId: snapshot?.id ?? snapshotId
     });
     res.json({ kind: "knowledge", snapshot });
   } catch (error) {
@@ -36806,7 +38659,8 @@ router5.put(
         });
         await createKnowledgeMonitoringHandoff({
           userId: targetUserId,
-          actorUserId: actor.id
+          actorUserId: actor.id,
+          knowledgeSnapshotId: snapshot?.id ?? snapshotId
         });
         await writeWorkspaceAuditEvent({
           actor,
@@ -41546,7 +43400,8 @@ async function importWebsiteKnowledgeArtifact(input) {
     );
     await createKnowledgeMonitoringHandoff({
       userId: provision.userId,
-      actorUserId: provision.userId
+      actorUserId: provision.userId,
+      knowledgeSnapshotId: snapshot?.id ?? snapshotId
     });
     return {
       status: "completed",
@@ -41781,7 +43636,7 @@ function createPaymentReceiptLedgerService(options = {}) {
 }
 
 // server/project-order-registry-service.ts
-import { and as and27, eq as eq31, sql as sql4 } from "drizzle-orm";
+import { and as and27, eq as eq31, sql as sql5 } from "drizzle-orm";
 
 // shared/project-order-registry.ts
 import { z as z29 } from "zod";
@@ -42035,7 +43890,7 @@ async function defaultRepository3() {
     async update(orderId, expectedRevision, value) {
       const result = await db.update(websiteProjectOrders).set({
         ...value,
-        revision: sql4`${websiteProjectOrders.revision} + 1`
+        revision: sql5`${websiteProjectOrders.revision} + 1`
       }).where(
         and27(
           eq31(websiteProjectOrders.orderId, orderId),
@@ -42051,7 +43906,7 @@ async function defaultRepository3() {
         const result = await tx.update(websiteProjectOrders).set({
           state: "closed",
           lastEventAt: closedAt,
-          revision: sql4`${websiteProjectOrders.revision} + 1`
+          revision: sql5`${websiteProjectOrders.revision} + 1`
         }).where(
           and27(
             eq31(websiteProjectOrders.orderId, intentOrderId),
@@ -42756,7 +44611,7 @@ async function resolveUpstreamCredential(req, res, next) {
       sendCredentialError(
         res,
         primaryResource ? 403 : 428,
-        primaryResource ? "\u8BE5\u4EFB\u52A1\u6216\u6587\u4EF6\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7\uFF0C\u6216\u5176\u539F API Key \u5DF2\u5220\u9664" : "\u5F53\u524D\u8D26\u53F7\u5C1A\u672A\u7531\u7BA1\u7406\u5458\u914D\u7F6E API Key",
+        primaryResource ? "\u8BE5\u4EFB\u52A1\u6216\u6587\u4EF6\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8D26\u53F7\uFF0C\u6216\u5176\u539F API Key \u5DF2\u5220\u9664" : user.role === "delivery_member" ? "\u5F53\u524D\u5DE5\u5177\u51ED\u636E\u5C1A\u672A\u914D\u7F6E\uFF0C\u8BF7\u8054\u7CFB\u8D1F\u8D23\u8BE5\u9879\u76EE\u7684\u4EA4\u4ED8\u7BA1\u7406\u5458" : "\u5F53\u524D\u8D26\u53F7\u5C1A\u672A\u7531\u7BA1\u7406\u5458\u914D\u7F6E API Key",
         primaryResource ? "UPSTREAM_RESOURCE_FORBIDDEN" : "API_CREDENTIAL_REQUIRED"
       );
       return;
@@ -42984,21 +44839,24 @@ async function resolveAuthorizedTicketAttachment(input) {
       );
     }
   } else if (input.actor.role === "delivery_member") {
-    if (!input.projectAssignmentId || row.assignedProjectAssignmentId !== input.projectAssignmentId) {
-      throw new DeliveryTicketError(
-        "ATTACHMENT_NOT_FOUND",
-        "\u5DE5\u5355\u9644\u4EF6\u4E0D\u5B58\u5728\u3002",
-        404
-      );
-    }
-    await assertDeliveryProjectContext({
-      actor: input.actor,
-      projectAssignmentId: input.projectAssignmentId,
-      customerUserId: row.ticketUserId
-    });
-    if (["submitted", "needs_information", "scheduled", "in_progress"].includes(
+    const terminal = ["completed", "rejected", "cancelled"].includes(
       row.ticketStatus
-    ) && row.assignedMemberId !== input.actor.id) {
+    );
+    if (!terminal) {
+      if (!input.projectAssignmentId || row.assignedProjectAssignmentId !== input.projectAssignmentId) {
+        throw new DeliveryTicketError(
+          "ATTACHMENT_NOT_FOUND",
+          "\u5DE5\u5355\u9644\u4EF6\u4E0D\u5B58\u5728\u3002",
+          404
+        );
+      }
+      await assertDeliveryProjectContext({
+        actor: input.actor,
+        projectAssignmentId: input.projectAssignmentId,
+        customerUserId: row.ticketUserId
+      });
+    }
+    if (row.assignedMemberId !== input.actor.id) {
       throw new DeliveryTicketError(
         "ATTACHMENT_NOT_FOUND",
         "\u5DE5\u5355\u9644\u4EF6\u4E0D\u5B58\u5728\u3002",
@@ -43015,11 +44873,12 @@ async function resolveAuthorizedTicketAttachment(input) {
       410
     );
   }
-  const projectCredential = input.actor.role === "delivery_member" && input.projectAssignmentId ? await getCredentialForUpstreamResource(
+  const credentialProjectAssignmentId = input.actor.role === "delivery_member" ? row.assignedProjectAssignmentId || input.projectAssignmentId : null;
+  const projectCredential = input.actor.role === "delivery_member" && credentialProjectAssignmentId ? await getCredentialForUpstreamResource(
     input.actor.id,
     "file",
     row.attachment.upstreamFileId,
-    input.projectAssignmentId
+    credentialProjectAssignmentId
   ) : null;
   const customerCredential = !projectCredential && row.attachment.ownerUserId === row.ticketUserId ? await getCredentialForUpstreamResource(
     row.ticketUserId,
@@ -43156,7 +45015,7 @@ import { ZodError as ZodError2 } from "zod";
 
 // server/website-content-template-service.ts
 import { randomUUID as randomUUID26 } from "node:crypto";
-import { and as and29, asc as asc9, eq as eq33, inArray as inArray16 } from "drizzle-orm";
+import { and as and29, asc as asc10, eq as eq33, inArray as inArray16 } from "drizzle-orm";
 var WEBSITE_CONTENT_CATEGORIES2 = WEBSITE_CONTENT_CATALOG.map(
   (item) => item.value
 );
@@ -43225,7 +45084,7 @@ async function loadWebsiteContentTicketRows(executor, workspaceUserId2, lock = f
       eq33(deliveryTickets.type, "website_operation"),
       inArray16(deliveryTickets.category, WEBSITE_CONTENT_CATEGORIES2)
     )
-  ).orderBy(asc9(deliveryTickets.createdAt), asc9(deliveryTickets.id));
+  ).orderBy(asc10(deliveryTickets.createdAt), asc10(deliveryTickets.id));
   if (lock) query = query.for("update");
   return await query;
 }
@@ -43793,7 +45652,7 @@ async function startServer() {
       monitorBaseUrl();
       const db = await getDb();
       if (!db) throw new Error("Database is not configured");
-      await db.execute(sql5`select 1`);
+      await db.execute(sql6`select 1`);
       const [preparedFiles, skills, paymentReceipts, projectOrders] = await Promise.all([
         preparedFileService.health(),
         getRuntimeSkillReadiness(),
