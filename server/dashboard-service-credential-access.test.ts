@@ -25,15 +25,15 @@ describe("managed customer credential authorization", () => {
     ).not.toThrow();
   });
 
-  it("allows only the delivery administrator recorded as primary owner", () => {
+  it("never grants customer Key mutation access to delivery administrators", () => {
     expect(() =>
       assertManagedCredentialMutationAccess(actor(42, "delivery_admin"), 42),
-    ).not.toThrow();
+    ).toThrow(/仅由系统管理员/);
     expect(() =>
       assertManagedCredentialMutationAccess(actor(43, "delivery_admin"), 42),
-    ).toThrow(/客户主负责人/);
+    ).toThrow(/仅由系统管理员/);
     expect(() =>
       assertManagedCredentialMutationAccess(actor(43, "delivery_admin"), null),
-    ).toThrow(/客户主负责人/);
+    ).toThrow(/仅由系统管理员/);
   });
 });

@@ -16,10 +16,7 @@ import {
 import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
-import {
-  isDeliveryAdminAccount,
-  isSystemAdminAccount,
-} from "@/lib/admin-access";
+import { isSystemAdminAccount } from "@/lib/admin-access";
 import {
   creditEventBus,
   fetchCreditUsage,
@@ -67,8 +64,7 @@ export default function SettingsDialog({
   const [creditTasks, setCreditTasks] = useState<CreditUsageTask[]>([]);
   const { user } = useAuth();
   const utils = trpc.useUtils();
-  const showCreditUsage =
-    isSystemAdminAccount(user) || isDeliveryAdminAccount(user);
+  const showCreditUsage = isSystemAdminAccount(user);
 
   const statusQuery = trpc.credential.status.useQuery(undefined, {
     enabled: open && showCreditUsage,
@@ -230,7 +226,7 @@ export default function SettingsDialog({
               智能服务设置
             </DialogTitle>
             <DialogDescription className="text-sm leading-6 text-muted-foreground">
-              智能服务由负责管理员统一维护，您可以直接使用当前套餐已开放的功能。
+              API Key 由系统管理员统一维护，您可以直接使用当前账号已开放的功能。
             </DialogDescription>
           </DialogHeader>
         </DialogContent>

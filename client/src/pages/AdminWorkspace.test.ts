@@ -18,16 +18,14 @@ describe("admin customer workspace", () => {
     expect(canCreateManagedCustomer(undefined)).toBe(false);
   });
 
-  it("keeps customer management in four focused workflow tabs", () => {
+  it("keeps knowledge-base work inside the unified user-flow tab", () => {
     expect(ADMIN_WORKSPACE_TAB_IDS).toEqual([
       "service",
-      "knowledge",
       "tickets",
       "credential",
     ]);
     expect(ADMIN_WORKSPACE_TABS.map((item) => item.label)).toEqual([
       "用户流程",
-      "知识库流程",
       "工单",
       "客户 Key 与积分",
     ]);
@@ -46,14 +44,14 @@ describe("admin customer workspace", () => {
         isSystemAdmin: false,
         canViewSelectedUserUsage: true,
       }).map((tab) => tab.value),
-    ).toEqual(["service", "tickets", "credential"]);
+    ).toEqual(["service", "tickets"]);
 
     expect(
       adminWorkspaceTabsForAccess({
         isSystemAdmin: true,
         canViewSelectedUserUsage: true,
       }).map((tab) => tab.value),
-    ).toEqual(["service", "knowledge", "tickets", "credential"]);
+    ).toEqual(["service", "tickets", "credential"]);
   });
 
   it("folds delivery content into service and removes the workspace audit tab", () => {
@@ -71,6 +69,9 @@ describe("admin customer workspace", () => {
     );
     expect(source).toContain("websiteWorkspace={websiteWorkspacePreview}");
     expect(source).toContain("knowledgePreview={{");
+    expect(source).toContain("activity: knowledgeActivityQuery.data");
+    expect(source).not.toContain('{tab === "knowledge"');
+    expect(source).not.toContain('label: "知识库流程"');
     expect(source).not.toContain('{tab === "delivery"');
     expect(source).not.toContain('{tab === "activity"');
     expect(source).not.toContain("客户工作区操作记录");

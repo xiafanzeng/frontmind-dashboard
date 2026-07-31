@@ -139,6 +139,37 @@ describe("knowledge base leaf manifest validation", () => {
       42,
     );
   });
+
+  it("accepts the bare manifest JSON returned by a real upstream task", () => {
+    const leaves = Array.from({ length: 8 }, (_, index) => ({
+      id: `${index + 1}.1`,
+      title: `节点 ${index + 1}`,
+      branchId: `branch-${index + 1}`,
+      branchTitle: `业务分支 ${index + 1}`,
+    }));
+    const rawOutput = [
+      "知识树统计：8 个业务分支，8 个叶子节点。",
+      JSON.stringify({
+        kind: "frontmind.knowledge-base.manifest",
+        schemaVersion: 1,
+        leaves,
+      }),
+      JSON.stringify({
+        kind: "frontmind.workflow-state",
+        schemaVersion: 1,
+        currentLeafId: "1.1",
+      }),
+      JSON.stringify({
+        kind: "frontmind.knowledge-base.presentation",
+        schemaVersion: 1,
+        leafId: "1.1",
+      }),
+    ].join("\n");
+
+    expect(parseKnowledgeBaseManifestEnvelope(rawOutput).leaves).toEqual(
+      leaves,
+    );
+  });
 });
 
 describe("knowledge base single-leaf progression", () => {
@@ -219,6 +250,25 @@ describe("model progress envelope boundary", () => {
     ].join("\n\n");
 
     expect(parseKnowledgeBaseProgressEnvelope(output)).toEqual(expected);
+  });
+
+  it("accepts canonical progress and presentation objects emitted as bare JSON", () => {
+    const expected = envelope(0, "identity.name", "current", "confirmed");
+    const presentation = {
+      kind: "frontmind.knowledge-base.presentation" as const,
+      schemaVersion: 1 as const,
+      revision: 1,
+      leafId: "identity.position",
+      imageState: "no_eligible_asset" as const,
+      assetIds: [],
+      imageCount: 0,
+    };
+    const output = `${JSON.stringify(expected)}\n${JSON.stringify(presentation)}`;
+
+    expect(parseKnowledgeBaseProgressEnvelope(output)).toEqual(expected);
+    expect(parseKnowledgeBasePresentationEnvelope(output)).toEqual(
+      presentation,
+    );
   });
 
   it("rejects a jump to a non-current leaf", () => {

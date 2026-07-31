@@ -321,14 +321,16 @@ export default function Sidebar({
                 <Settings className="w-4 h-4 flex-shrink-0" />
                 {!collapsed && (
                   <span className="text-xs">
-                    {showAccountMenu ? "设置" : "API Key 与积分"}
+                    {showAccountMenu || !isSystemAdmin
+                      ? "设置"
+                      : "API Key 与积分"}
                   </span>
                 )}
               </Button>
             </TooltipTrigger>
             {collapsed && (
               <TooltipContent side="right">
-                {showAccountMenu ? "设置" : "API Key 与积分"}
+                {showAccountMenu || !isSystemAdmin ? "设置" : "API Key 与积分"}
               </TooltipContent>
             )}
           </Tooltip>
@@ -647,7 +649,7 @@ function SidebarInner({
           >
             <Settings className="w-4 h-4 flex-shrink-0" />
             <span className="text-xs">
-              {showAccountMenu ? "设置" : "API Key 与积分"}
+              {showAccountMenu || !isSystemAdmin ? "设置" : "API Key 与积分"}
             </span>
           </Button>
         )}

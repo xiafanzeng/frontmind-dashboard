@@ -6,9 +6,7 @@ import {
   ChevronRight,
   ClipboardList,
   Coins,
-  Database,
   Download,
-  FileArchive,
   Gauge,
   History,
   KeyRound,
@@ -45,7 +43,10 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
-import { previewKnowledgeSnapshot } from "@/lib/preview-data";
+import {
+  previewKnowledgeProgress,
+  previewKnowledgeSnapshot,
+} from "@/lib/preview-data";
 import { adminDeliveryTicketPreviewFixtures } from "@/lib/development-preview-fixtures";
 import {
   getRoleScopedPreviewAdminNav,
@@ -428,7 +429,7 @@ export function PreviewAdminPresales() {
   );
 }
 
-type PreviewWorkspaceTab = "service" | "knowledge" | "tickets" | "credential";
+type PreviewWorkspaceTab = "service" | "tickets" | "credential";
 
 type PreviewManagedUser = {
   id: number;
@@ -491,9 +492,7 @@ export function PreviewAdminUsers({
   const [tab, setTab] = useState<PreviewWorkspaceTab>(() => {
     if (typeof window === "undefined") return "service";
     const requested = new URLSearchParams(window.location.search).get("tab");
-    return ["service", "knowledge", "tickets", "credential"].includes(
-      requested || "",
-    )
+    return ["service", "tickets", "credential"].includes(requested || "")
       ? (requested as PreviewWorkspaceTab)
       : "service";
   });
@@ -661,7 +660,6 @@ export function PreviewAdminUsers({
               {(
                 [
                   ["service", "用户流程", PackageCheck],
-                  ["knowledge", "知识库流程", Database],
                   ["tickets", "工单", ClipboardList],
                   ["credential", "API Key 与积分", KeyRound],
                 ] as const
@@ -698,34 +696,6 @@ export function PreviewAdminUsers({
               />
               <PreviewDeliveryControl userName={selectedUser.name} />
             </div>
-          )}
-          {tab === "knowledge" && (
-            <>
-              <PortalCard className="p-5 sm:p-6">
-                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                  <div>
-                    <h3 className="font-semibold text-[#171321]">
-                      发布知识库版本
-                    </h3>
-                    <p className="mt-1 text-sm leading-6 text-[#716a80]">
-                      ZIP 会完整解析文档与图片，并更新用户端精美展示。
-                    </p>
-                  </div>
-                  <Button
-                    className="bg-[#5b2a86] hover:bg-[#49216c]"
-                    onClick={() =>
-                      toast.success("样例上传入口可用", {
-                        description: "正式环境会打开知识库文件选择器。",
-                      })
-                    }
-                  >
-                    <FileArchive className="h-4 w-4" />
-                    上传知识库
-                  </Button>
-                </div>
-              </PortalCard>
-              <KnowledgeBaseViewer snapshot={previewKnowledgeSnapshot} />
-            </>
           )}
           {tab === "tickets" && (
             <AdminDeliveryTicketWorkspace
@@ -968,6 +938,10 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
           <CustomerDashboardMirror
             payload={previewPayload}
             initialSection={previewSection}
+            knowledgePreview={{
+              progress: previewKnowledgeProgress,
+              snapshot: previewKnowledgeSnapshot,
+            }}
             heading="用户当前所见"
             description="所有分区均读取与用户端相同的数据，发布前可在这里逐项核对。"
           />

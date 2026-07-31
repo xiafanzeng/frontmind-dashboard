@@ -1,21 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useLocation } from "wouter";
 import {
   Activity,
   AlertTriangle,
-  ArrowRight,
   Bot,
   BriefcaseBusiness,
-  CalendarClock,
   ClipboardList,
   Gauge,
+  KeyRound,
+  Loader2,
   RefreshCw,
-  Search,
   Send,
   UserCog,
   Users,
   UsersRound,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
 import PortalShell, {
@@ -23,7 +23,25 @@ import PortalShell, {
   type PortalNavItem,
 } from "@/components/PortalShell";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { trpc } from "@/lib/trpc";
 import {
   getRoleScopedPreviewAdminNav,
@@ -31,20 +49,9 @@ import {
 } from "@/lib/preview-navigation";
 import { isSystemAdminAccount } from "@/lib/admin-access";
 import {
-  buildAdminTicketListInput,
-  flattenAdminTicketPages,
-  formatAdminTicketDate,
-  normalizeAdminTicketList,
-  ticketTypeLabel,
-} from "@/components/AdminDeliveryTicketWorkspace";
-import {
   DELIVERY_ROLE_LABELS,
   type DeliveryRoleType,
 } from "@shared/delivery-roles";
-import {
-  DELIVERY_TICKET_STATUS_LABELS,
-  type DeliveryTicketStatus,
-} from "@shared/delivery-ticket";
 
 type ApiKeyUsageAlert = {
   id: string;
@@ -66,6 +73,8 @@ type AdminUsageHierarchyManager = {
   adminId: number;
   displayName: string;
   username: string | null;
+  apiKeyConfigured: boolean;
+  apiKeyVersion: number;
   keyPool: {
     fingerprint: string | null;
     credentialCount: number;
@@ -90,6 +99,37 @@ type AdminUsageHierarchyManager = {
     syncStatus: string;
     fetchedAt: number | string | Date | null;
   }>;
+};
+
+type AdminUsageHierarchyEngineer = {
+  engineerId: number;
+  displayName: string;
+  username: string | null;
+  apiKeyConfigured: boolean;
+  apiKeyVersion: number;
+  keyTotalUsed: number;
+  ownAgentMonthUsed: number;
+  otherOrUnattributedUsed: number;
+  fingerprint: string | null;
+  syncStatus: string;
+  fetchedAt: number | string | Date | null;
+};
+
+type AdminUsageHierarchyCustomer = {
+  userId: number;
+  enterpriseName: string;
+  username: string | null;
+  deliveryAdminId: number | null;
+  deliveryAdminName: string | null;
+  apiKeyConfigured: boolean;
+  apiKeyVersion: number;
+  usesInheritedKey: boolean;
+  keyTotalUsed: number;
+  ownAgentMonthUsed: number;
+  otherOrUnattributedUsed: number;
+  fingerprint: string | null;
+  syncStatus: string;
+  fetchedAt: number | string | Date | null;
 };
 
 export function normalizeApiKeyUsageAlerts(value: unknown): ApiKeyUsageAlert[] {
@@ -178,6 +218,7 @@ type DeliveryEngineerStatusSource = {
     isActive?: boolean | number | null;
     engineerRoleType?: DeliveryRoleType | null;
     apiKeyConfigured?: boolean | null;
+    apiKeyVersion?: number | null;
   }>;
   assignments?: Array<{
     customerUserId: number;
@@ -211,6 +252,11 @@ export type DeliveryEngineerStatusRow = {
   workStatusLabel: string;
   isActive: boolean;
   apiKeyConfigured: boolean;
+  apiKeyVersion: number;
+  keyTotalUsed: number;
+  ownAgentMonthUsed: number;
+  otherOrUnattributedUsed: number;
+  usageSyncStatus: string;
 };
 
 export function buildDeliveryEngineerStatusRows(
@@ -297,6 +343,11 @@ export function buildDeliveryEngineerStatusRows(
         workStatusLabel,
         isActive,
         apiKeyConfigured: Boolean(engineer.apiKeyConfigured),
+        apiKeyVersion: Math.max(0, Number(engineer.apiKeyVersion) || 0),
+        keyTotalUsed: 0,
+        ownAgentMonthUsed: 0,
+        otherOrUnattributedUsed: 0,
+        usageSyncStatus: "unconfigured",
       };
     })
     .sort((left, right) => {
@@ -451,10 +502,6 @@ export function getPreviewAdminWorkspaceHref(systemAdmin: boolean, query = "") {
   return normalizedQuery ? `${href}?${normalizedQuery}` : href;
 }
 
-export function canCreateCustomerFromDashboard(_systemAdmin: boolean) {
-  return true;
-}
-
 export function filterApiKeyUsageForAdmin(
   items: ApiKeyUsageAlert[],
   systemAdmin: boolean,
@@ -528,6 +575,8 @@ export function groupSharedKeyUsage(items: ApiKeyUsageAlert[]) {
 export function normalizeUsageHierarchy(value: unknown): {
   period: { label: string };
   managers: AdminUsageHierarchyManager[];
+  engineers: AdminUsageHierarchyEngineer[];
+  customers: AdminUsageHierarchyCustomer[];
 } {
   const payload =
     value && typeof value === "object" ? (value as Record<string, any>) : {};
@@ -537,6 +586,8 @@ export function normalizeUsageHierarchy(value: unknown): {
         displayName:
           String(entry?.displayName || "").trim() || "未命名交付管理员",
         username: entry?.username ? String(entry.username) : null,
+        apiKeyConfigured: entry?.apiKeyConfigured === true,
+        apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
         keyPool: {
           fingerprint: entry?.keyPool?.fingerprint
             ? String(entry.keyPool.fingerprint)
@@ -588,12 +639,320 @@ export function normalizeUsageHierarchy(value: unknown): {
           : [],
       }))
     : [];
+  const engineers = Array.isArray(payload.engineers)
+    ? payload.engineers.map(
+        (entry: any): AdminUsageHierarchyEngineer => ({
+          engineerId: Math.max(0, Number(entry?.engineerId) || 0),
+          displayName:
+            String(entry?.displayName || "").trim() || "未命名工程师",
+          username: entry?.username ? String(entry.username) : null,
+          apiKeyConfigured: entry?.apiKeyConfigured === true,
+          apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
+          keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
+          ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
+          otherOrUnattributedUsed: Math.max(
+            0,
+            Number(entry?.otherOrUnattributedUsed) || 0,
+          ),
+          fingerprint: entry?.fingerprint ? String(entry.fingerprint) : null,
+          syncStatus: String(entry?.syncStatus || "unconfigured"),
+          fetchedAt: entry?.fetchedAt ?? null,
+        }),
+      )
+    : [];
+  const customers = Array.isArray(payload.customers)
+    ? payload.customers.map(
+        (entry: any): AdminUsageHierarchyCustomer => ({
+          userId: Math.max(0, Number(entry?.userId) || 0),
+          enterpriseName:
+            String(entry?.enterpriseName || "").trim() || "未命名客户",
+          username: entry?.username ? String(entry.username) : null,
+          deliveryAdminId:
+            Number.isInteger(Number(entry?.deliveryAdminId)) &&
+            Number(entry.deliveryAdminId) > 0
+              ? Number(entry.deliveryAdminId)
+              : null,
+          deliveryAdminName: entry?.deliveryAdminName
+            ? String(entry.deliveryAdminName)
+            : null,
+          apiKeyConfigured: entry?.apiKeyConfigured === true,
+          apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
+          usesInheritedKey: entry?.usesInheritedKey === true,
+          keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
+          ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
+          otherOrUnattributedUsed: Math.max(
+            0,
+            Number(entry?.otherOrUnattributedUsed) || 0,
+          ),
+          fingerprint: entry?.fingerprint ? String(entry.fingerprint) : null,
+          syncStatus: String(entry?.syncStatus || "unconfigured"),
+          fetchedAt: entry?.fetchedAt ?? null,
+        }),
+      )
+    : [];
   return {
     period: {
       label: String(payload?.period?.label || "本月"),
     },
     managers,
+    engineers,
+    customers,
   };
+}
+
+type OverviewApiKeyTarget = {
+  kind: "customer" | "delivery_admin" | "engineer";
+  userId: number;
+  displayName: string;
+  username: string;
+  configured: boolean;
+  version: number;
+};
+
+type KeyManagementRow = OverviewApiKeyTarget & {
+  typeLabel: string;
+  scopeLabel: string;
+  inherited: boolean;
+  ownAgentMonthUsed: number;
+  keyTotalUsed: number;
+  otherOrUnattributedUsed: number;
+};
+
+function AdminOverviewApiKeyDialog({
+  target,
+  onOpenChange,
+  onSaved,
+}: {
+  target: OverviewApiKeyTarget | null;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => Promise<void> | void;
+}) {
+  const [apiKey, setApiKey] = useState("");
+  const [revokeOpen, setRevokeOpen] = useState(false);
+  const setEngineerMutation =
+    trpc.delivery.management.setEngineerApiKey.useMutation();
+  const revokeEngineerMutation =
+    trpc.delivery.management.revokeEngineerApiKey.useMutation();
+  const setAdminMutation =
+    trpc.delivery.management.setDeliveryAdminApiKey.useMutation();
+  const revokeAdminMutation =
+    trpc.delivery.management.revokeDeliveryAdminApiKey.useMutation();
+  const setCustomerMutation =
+    trpc.admin.workspace.replaceCredential.useMutation();
+  const revokeCustomerMutation =
+    trpc.admin.workspace.deleteCredential.useMutation();
+  const busy =
+    setEngineerMutation.isPending ||
+    revokeEngineerMutation.isPending ||
+    setAdminMutation.isPending ||
+    revokeAdminMutation.isPending ||
+    setCustomerMutation.isPending ||
+    revokeCustomerMutation.isPending;
+  const subjectLabel =
+    target?.kind === "delivery_admin"
+      ? "交付管理员"
+      : target?.kind === "customer"
+        ? "客户"
+        : "工程师";
+
+  const close = () => {
+    if (busy) return;
+    setApiKey("");
+    setRevokeOpen(false);
+    setEngineerMutation.reset();
+    revokeEngineerMutation.reset();
+    setAdminMutation.reset();
+    revokeAdminMutation.reset();
+    setCustomerMutation.reset();
+    revokeCustomerMutation.reset();
+    onOpenChange(false);
+  };
+
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!target || apiKey.trim().length < 8) return;
+    try {
+      if (target.kind === "customer") {
+        await setCustomerMutation.mutateAsync({
+          userId: target.userId,
+          apiKey: apiKey.trim(),
+          reason: "交付总览统一配置客户 Key",
+        });
+      } else if (target.kind === "engineer") {
+        await setEngineerMutation.mutateAsync({
+          engineerUserId: target.userId,
+          apiKey: apiKey.trim(),
+          expectedVersion: target.version,
+        });
+      } else {
+        await setAdminMutation.mutateAsync({
+          adminUserId: target.userId,
+          apiKey: apiKey.trim(),
+          expectedVersion: target.version,
+        });
+      }
+      await onSaved();
+      toast.success(
+        `${subjectLabel} API Key 已${target.configured ? "替换" : "配置"}`,
+        { description: target.displayName },
+      );
+      setApiKey("");
+      setRevokeOpen(false);
+      onOpenChange(false);
+    } catch (error) {
+      toast.error(`无法配置${subjectLabel} API Key`, {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    }
+  };
+
+  const revoke = async () => {
+    if (!target) return;
+    try {
+      if (target.kind === "customer") {
+        await revokeCustomerMutation.mutateAsync({
+          userId: target.userId,
+          reason: "交付总览统一撤销客户 Key",
+        });
+      } else if (target.kind === "engineer") {
+        await revokeEngineerMutation.mutateAsync({
+          engineerUserId: target.userId,
+          expectedVersion: target.version,
+        });
+      } else {
+        await revokeAdminMutation.mutateAsync({
+          adminUserId: target.userId,
+          expectedVersion: target.version,
+        });
+      }
+      await onSaved();
+      toast.success(`${subjectLabel} API Key 已撤销`, {
+        description: target.displayName,
+      });
+      setApiKey("");
+      setRevokeOpen(false);
+      onOpenChange(false);
+    } catch (error) {
+      toast.error(`无法撤销${subjectLabel} API Key`, {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    }
+  };
+
+  return (
+    <>
+      <Dialog open={Boolean(target)} onOpenChange={(open) => !open && close()}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <KeyRound className="h-5 w-5 text-primary" />
+              配置{subjectLabel} API Key
+            </DialogTitle>
+            <DialogDescription>
+              {target?.displayName} · @{target?.username}。Key
+              仅在服务端加密保存，不会在页面返回明文。
+            </DialogDescription>
+          </DialogHeader>
+          <form className="space-y-4" onSubmit={save}>
+            <div className="rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
+              当前状态：
+              <span
+                className={
+                  target?.configured
+                    ? "font-medium text-emerald-700"
+                    : "font-medium text-amber-700"
+                }
+              >
+                {target?.configured ? "已配置" : "未配置"}
+              </span>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="overview-api-key">
+                {target?.configured ? "新的 API Key" : "API Key"}
+              </Label>
+              <Input
+                id="overview-api-key"
+                type="password"
+                autoComplete="off"
+                value={apiKey}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder="输入后将先验证，再加密保存"
+                disabled={busy}
+              />
+              <p className="text-xs leading-5 text-muted-foreground">
+                系统管理员统一维护账号 Key，交付管理员只负责岗位与项目安排。
+              </p>
+            </div>
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
+              <Button
+                type="button"
+                variant="outline"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                disabled={busy || !target?.configured}
+                onClick={() => setRevokeOpen(true)}
+              >
+                撤销 Key
+              </Button>
+              <div className="flex flex-col-reverse gap-2 sm:flex-row">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={close}
+                  disabled={busy}
+                >
+                  取消
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={busy || apiKey.trim().length < 8}
+                >
+                  {(setEngineerMutation.isPending ||
+                    setAdminMutation.isPending ||
+                    setCustomerMutation.isPending) && (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  )}
+                  验证并{target?.configured ? "替换" : "配置"}
+                </Button>
+              </div>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog
+        open={revokeOpen}
+        onOpenChange={(open) => !busy && setRevokeOpen(open)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>撤销{subjectLabel} API Key</AlertDialogTitle>
+            <AlertDialogDescription>
+              撤销后，{target?.displayName}
+              将无法调用通用智能体，直至系统管理员重新配置有效 Key。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              disabled={busy}
+              onClick={(event) => {
+                event.preventDefault();
+                void revoke();
+              }}
+            >
+              {(revokeEngineerMutation.isPending ||
+                revokeAdminMutation.isPending ||
+                revokeCustomerMutation.isPending) && (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              )}
+              确认撤销
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
 }
 
 export default function AdminDashboard({
@@ -626,7 +985,7 @@ export default function AdminDashboard({
   const usageHierarchyQuery = (
     trpc.admin as any
   ).apiKeyUsageAlerts.hierarchy.useQuery(undefined, {
-    enabled: !previewMode && user?.role === "admin",
+    enabled: !previewMode && user?.role === "admin" && systemAdmin,
     retry: false,
     refetchOnWindowFocus: false,
   });
@@ -643,155 +1002,19 @@ export default function AdminDashboard({
       refetchOnWindowFocus: false,
     },
   );
-  const [ticketKeyword, setTicketKeyword] = useState("");
-  const [ticketType, setTicketType] = useState("all");
-  const [ticketStatus, setTicketStatus] = useState("all");
-  const [ticketManager, setTicketManager] = useState("all");
   const [selectedUsageManagerId, setSelectedUsageManagerId] = useState<
     number | null
   >(null);
-  const [debouncedTicketKeyword, setDebouncedTicketKeyword] = useState("");
-
-  useEffect(() => {
-    const timeout = window.setTimeout(
-      () => setDebouncedTicketKeyword(ticketKeyword.trim()),
-      250,
-    );
-    return () => window.clearTimeout(timeout);
-  }, [ticketKeyword]);
-
-  const ticketListInput = useMemo(
-    () =>
-      buildAdminTicketListInput({
-        assignedAdminId: ticketManager,
-        query: debouncedTicketKeyword,
-        type: ticketType,
-        status: ticketStatus,
-        limit: 100,
-        order: "created_asc",
-      }),
-    [debouncedTicketKeyword, ticketManager, ticketStatus, ticketType],
+  const [apiKeyTarget, setApiKeyTarget] = useState<OverviewApiKeyTarget | null>(
+    null,
   );
-  const ticketListQuery = (
-    trpc.admin as any
-  ).deliveryTickets.list.useInfiniteQuery(ticketListInput, {
-    enabled: !previewMode && user?.role === "admin",
-    retry: false,
-    getNextPageParam: (lastPage: any) => lastPage?.nextCursor || undefined,
-  });
+  const [keyAccountType, setKeyAccountType] = useState<
+    "all" | OverviewApiKeyTarget["kind"]
+  >("all");
+  const [keyAccountSearch, setKeyAccountSearch] = useState("");
   const navItems = previewMode
     ? getPreviewAdminNav(systemAdmin)
     : getAdminNav(systemAdmin);
-  const previewTicketOverview = previewFixtures?.ticketOverview ?? {
-    counts: {},
-    tickets: [],
-  };
-  const ticketListPages = (ticketListQuery.data?.pages || []) as unknown[];
-  const previewPermissionTickets = useMemo(
-    () =>
-      filterPreviewTicketsForAdmin(
-        normalizeAdminTicketList(previewTicketOverview),
-        systemAdmin,
-        previewFixtures?.managedAdminId,
-      ),
-    [previewTicketOverview, previewFixtures?.managedAdminId, systemAdmin],
-  );
-  const ticketQueue = useMemo(() => {
-    const tickets = previewMode
-      ? previewPermissionTickets
-      : flattenAdminTicketPages(ticketListPages);
-    if (!previewMode) return tickets;
-    const query = ticketKeyword.trim().toLocaleLowerCase("zh-CN");
-    return tickets.filter((ticket) => {
-      if (ticketType !== "all" && ticket.type !== ticketType) return false;
-      if (
-        ticketManager !== "all" &&
-        !assignedManagersForTicket(ticket).some(
-          (manager: AssignedTicketManager) => manager.id === ticketManager,
-        )
-      ) {
-        return false;
-      }
-      if (
-        ticketStatus !== "all" &&
-        ticket.status !== ticketStatus
-      ) {
-        return false;
-      }
-      if (!query) return true;
-      return [
-        ticket.enterpriseName,
-        ticket.title,
-        ticket.topic,
-        ticket.category,
-      ].some((value) =>
-        String(value || "")
-          .toLocaleLowerCase("zh-CN")
-          .includes(query),
-      );
-    });
-  }, [
-    previewMode,
-    previewPermissionTickets,
-    ticketKeyword,
-    ticketListPages,
-    ticketManager,
-    ticketStatus,
-    ticketType,
-  ]);
-  const ticketManagers = useMemo(() => {
-    if (!previewMode) {
-      return (workspaceQuery.data?.admins ?? []).map(
-        (manager) =>
-          [
-            String(manager.id),
-            manager.displayName || manager.username || `管理员 ${manager.id}`,
-          ] as const,
-      );
-    }
-    const unique = new Map<string, string>();
-    normalizeAdminTicketList(previewTicketOverview).forEach((ticket) => {
-      assignedManagersForTicket(ticket).forEach(
-        (manager: AssignedTicketManager) => {
-          unique.set(manager.id, manager.name);
-        },
-      );
-    });
-    return [...unique.entries()];
-  }, [previewMode, workspaceQuery.data?.admins]);
-  const ticketCounts = previewMode
-    ? previewPermissionTickets.reduce(
-        (counts, ticket) => {
-          counts[ticket.status] += 1;
-          return counts;
-        },
-        {
-          submitted: 0,
-          needs_information: 0,
-          scheduled: 0,
-          in_progress: 0,
-          completed: 0,
-          rejected: 0,
-          cancelled: 0,
-        } as Record<DeliveryTicketStatus, number>,
-      )
-    : (ticketListQuery.data?.pages?.[0] as any)?.counts || {};
-  const ticketListUnavailable =
-    !previewMode &&
-    (ticketListQuery.isLoading || Boolean(ticketListQuery.error));
-  const sortedTicketQueue = useMemo(
-    () =>
-      [...ticketQueue].sort((left, right) => {
-        const leftTime = new Date(
-          left.createdAt || left.updatedAt || 0,
-        ).getTime();
-        const rightTime = new Date(
-          right.createdAt || right.updatedAt || 0,
-        ).getTime();
-        return leftTime - rightTime;
-      }),
-    [ticketQueue],
-  );
   const previewUsageHierarchy = useMemo(() => {
     const items = filterPreviewApiKeyUsageForAdmin(
       normalizeApiKeyUsageAlerts(previewFixtures?.usageAlerts ?? []),
@@ -824,11 +1047,15 @@ export default function AdminDashboard({
       users.reduce((sum, customer) => sum + customer.monthUsed, 0);
     return {
       period: { label: "2026 年 7 月" },
+      engineers: [],
+      customers: [],
       managers: [
         {
           adminId: Number(previewFixtures?.managedAdminId || 101),
           displayName: "交付管理员",
           username: "delivery.admin",
+          apiKeyConfigured: true,
+          apiKeyVersion: 1,
           keyPool: {
             fingerprint: pool?.fingerprint || "9f17b2d4a631c809",
             credentialCount: pool?.fingerprint ? 1 : 0,
@@ -860,9 +1087,94 @@ export default function AdminDashboard({
     ) ||
     usageManagers[0] ||
     null;
+  const engineerUsageById = new Map(
+    usageHierarchy.engineers.map((engineer) => [engineer.engineerId, engineer]),
+  );
   const deliveryEngineerStatusRows = buildDeliveryEngineerStatusRows(
     deliveryRoleOverviewQuery.data,
-  );
+  ).map((engineer) => {
+    const usage = engineerUsageById.get(engineer.id);
+    return {
+      ...engineer,
+      apiKeyConfigured: usage?.apiKeyConfigured ?? engineer.apiKeyConfigured,
+      apiKeyVersion: usage?.apiKeyVersion ?? engineer.apiKeyVersion,
+      keyTotalUsed: usage?.keyTotalUsed ?? 0,
+      ownAgentMonthUsed: usage?.ownAgentMonthUsed ?? 0,
+      otherOrUnattributedUsed: usage?.otherOrUnattributedUsed ?? 0,
+      usageSyncStatus: usage?.syncStatus ?? "unconfigured",
+    };
+  });
+  const keyManagementRows: KeyManagementRow[] = [
+    ...usageManagers.map(
+      (manager): KeyManagementRow => ({
+        kind: "delivery_admin",
+        userId: manager.adminId,
+        displayName: manager.displayName,
+        username: manager.username || `admin-${manager.adminId}`,
+        configured: manager.apiKeyConfigured,
+        version: manager.apiKeyVersion,
+        typeLabel: "交付管理员",
+        scopeLabel: `负责 ${manager.users.length} 个客户`,
+        inherited: false,
+        ownAgentMonthUsed: manager.ownAgentMonthUsed,
+        keyTotalUsed: manager.keyPool.totalUsed,
+        otherOrUnattributedUsed: Math.max(
+          0,
+          manager.keyPool.totalUsed - manager.ownAgentMonthUsed,
+        ),
+      }),
+    ),
+    ...deliveryEngineerStatusRows.map(
+      (engineer): KeyManagementRow => ({
+        kind: "engineer",
+        userId: engineer.id,
+        displayName: engineer.displayName,
+        username: engineer.username,
+        configured: engineer.apiKeyConfigured,
+        version: engineer.apiKeyVersion,
+        typeLabel: "工程师",
+        scopeLabel: engineer.roleType
+          ? `${DELIVERY_ROLE_LABELS[engineer.roleType]} · ${engineer.projectCount} 个项目`
+          : `岗位未设置 · ${engineer.projectCount} 个项目`,
+        inherited: false,
+        ownAgentMonthUsed: engineer.ownAgentMonthUsed,
+        keyTotalUsed: engineer.keyTotalUsed,
+        otherOrUnattributedUsed: engineer.otherOrUnattributedUsed,
+      }),
+    ),
+    ...usageHierarchy.customers.map(
+      (customer): KeyManagementRow => ({
+        kind: "customer",
+        userId: customer.userId,
+        displayName: customer.enterpriseName,
+        username: customer.username || `customer-${customer.userId}`,
+        configured: customer.apiKeyConfigured,
+        version: customer.apiKeyVersion,
+        typeLabel: "客户",
+        scopeLabel: customer.deliveryAdminName
+          ? `负责人：${customer.deliveryAdminName}`
+          : "负责人待分配",
+        inherited: customer.usesInheritedKey,
+        ownAgentMonthUsed: customer.ownAgentMonthUsed,
+        keyTotalUsed: customer.keyTotalUsed,
+        otherOrUnattributedUsed: customer.otherOrUnattributedUsed,
+      }),
+    ),
+  ].sort((left, right) => {
+    if (left.configured !== right.configured) return left.configured ? 1 : -1;
+    return left.displayName.localeCompare(right.displayName, "zh-CN");
+  });
+  const normalizedKeySearch = keyAccountSearch.trim().toLocaleLowerCase();
+  const visibleKeyManagementRows = keyManagementRows.filter((row) => {
+    if (keyAccountType !== "all" && row.kind !== keyAccountType) return false;
+    if (!normalizedKeySearch) return true;
+    return `${row.displayName} ${row.username} ${row.scopeLabel}`
+      .toLocaleLowerCase()
+      .includes(normalizedKeySearch);
+  });
+  const missingKeyCount = keyManagementRows.filter(
+    (row) => !row.configured,
+  ).length;
 
   useEffect(() => {
     if (selectedUsageManagerId == null && usageManagers[0]?.adminId != null) {
@@ -875,41 +1187,6 @@ export default function AdminDashboard({
       eyebrow="FrontMind 管理中心"
       title="交付总览"
       navItems={navItems}
-      toolbar={
-        <div className="flex items-center gap-2">
-          <Button
-            size="sm"
-            variant="outline"
-            className="border-[#d8cde0] bg-white/85 text-[#4f2b6d]"
-            onClick={() =>
-              setLocation(
-                previewMode
-                  ? getPreviewAdminWorkspaceHref(systemAdmin)
-                  : "/admin/workspace",
-              )
-            }
-          >
-            <BriefcaseBusiness className="h-4 w-4" />
-            <span className="hidden sm:inline">打开客户交付工作台</span>
-            <span className="sm:hidden">客户工作台</span>
-          </Button>
-          {canCreateCustomerFromDashboard(systemAdmin) && (
-            <Button
-              size="sm"
-              onClick={() =>
-                setLocation(
-                  previewMode
-                    ? getPreviewAdminWorkspaceHref(systemAdmin, "action=create")
-                    : "/admin/workspace?action=create",
-                )
-              }
-            >
-              <UserCog className="h-4 w-4" />
-              创建客户
-            </Button>
-          )}
-        </div>
-      }
       accountLabel={
         previewMode
           ? `${systemAdmin ? "系统管理员" : "交付管理员"}验收账号`
@@ -922,12 +1199,200 @@ export default function AdminDashboard({
       }
     >
       <div className="space-y-5">
+        {systemAdmin && !previewMode && (
+          <PortalCard className="overflow-hidden">
+            <div className="flex flex-col gap-4 border-b border-[#eee8f2] px-5 py-4 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <KeyRound className="h-5 w-5 text-[#5b2a86]" />
+                  <h2 className="font-semibold text-[#171321]">
+                    统一 API Key 管理
+                  </h2>
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+                      missingKeyCount > 0
+                        ? "bg-[#fff1f4] text-[#a02652]"
+                        : "bg-[#eaf7f0] text-[#16794f]"
+                    }`}
+                  >
+                    {missingKeyCount > 0
+                      ? `${missingKeyCount} 个待配置`
+                      : "全部已配置"}
+                  </span>
+                </div>
+                <p className="mt-1 text-sm leading-6 text-[#716a80]">
+                  客户、交付管理员和工程师使用同一套管理入口；交付管理员端不展示
+                  Key 配置能力。
+                </p>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={
+                  usageHierarchyQuery.isFetching || usageSyncMutation.isPending
+                }
+                onClick={() => usageSyncMutation.mutate()}
+              >
+                <RefreshCw
+                  className={`h-4 w-4 ${
+                    usageHierarchyQuery.isFetching ||
+                    usageSyncMutation.isPending
+                      ? "animate-spin"
+                      : ""
+                  }`}
+                />
+                {usageHierarchyQuery.isFetching || usageSyncMutation.isPending
+                  ? "同步中"
+                  : "刷新用量"}
+              </Button>
+            </div>
+
+            <div className="flex flex-col gap-3 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex flex-wrap gap-2">
+                {[
+                  ["all", "全部"],
+                  ["customer", "客户"],
+                  ["delivery_admin", "交付管理员"],
+                  ["engineer", "工程师"],
+                ].map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() =>
+                      setKeyAccountType(
+                        value as "all" | OverviewApiKeyTarget["kind"],
+                      )
+                    }
+                    className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                      keyAccountType === value
+                        ? "border-[#6f3a98] bg-[#6f3a98] text-white"
+                        : "border-[#ddd4e5] bg-white text-[#5f576c] hover:border-[#a98cbd]"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <Input
+                value={keyAccountSearch}
+                onChange={(event) => setKeyAccountSearch(event.target.value)}
+                placeholder="搜索账号、名称或负责人"
+                aria-label="搜索 Key 管理账号"
+                className="h-9 bg-white lg:w-72"
+              />
+            </div>
+
+            {usageHierarchyQuery.isLoading ||
+            deliveryRoleOverviewQuery.isLoading ? (
+              <div className="p-6 text-sm text-[#716a80]">
+                正在读取账号 Key 与积分…
+              </div>
+            ) : usageHierarchyQuery.error || deliveryRoleOverviewQuery.error ? (
+              <div className="p-6 text-sm text-[#a02652]">
+                Key 管理数据暂时无法读取。
+              </div>
+            ) : visibleKeyManagementRows.length === 0 ? (
+              <div className="p-6 text-sm text-[#716a80]">
+                没有符合当前筛选条件的账号。
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <div className="min-w-[1050px]">
+                  <div className="grid grid-cols-[minmax(200px,1.2fr)_110px_minmax(210px,1.2fr)_170px_130px_130px_140px] gap-4 border-b border-[#eee8f2] px-5 py-3 text-xs font-medium text-[#716a80] sm:px-6">
+                    <span>账号</span>
+                    <span>类型</span>
+                    <span>归属范围</span>
+                    <span>Key 状态</span>
+                    <span>本月自用</span>
+                    <span>Key 总额</span>
+                    <span>操作</span>
+                  </div>
+                  {visibleKeyManagementRows.map((row) => (
+                    <div
+                      key={`${row.kind}-${row.userId}`}
+                      className="grid grid-cols-[minmax(200px,1.2fr)_110px_minmax(210px,1.2fr)_170px_130px_130px_140px] items-center gap-4 border-b border-[#eee8f2] px-5 py-4 last:border-b-0 sm:px-6"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-[#332842]">
+                          {row.displayName}
+                        </p>
+                        <p className="mt-1 truncate text-xs text-[#857e91]">
+                          @{row.username}
+                        </p>
+                      </div>
+                      <span className="w-fit rounded-full bg-[#f3edf7] px-2.5 py-1 text-xs font-medium text-[#6a338f]">
+                        {row.typeLabel}
+                      </span>
+                      <p className="truncate text-sm text-[#5f576c]">
+                        {row.scopeLabel}
+                      </p>
+                      <div className="text-xs">
+                        <p
+                          className={
+                            row.configured
+                              ? "font-medium text-[#16794f]"
+                              : "font-medium text-[#a02652]"
+                          }
+                        >
+                          {row.configured
+                            ? "独立 Key 已配置"
+                            : row.inherited
+                              ? "使用历史共享 Key"
+                              : "Key 待配置"}
+                        </p>
+                        {row.inherited && (
+                          <p className="mt-1 text-[#946800]">
+                            建议配置独立 Key
+                          </p>
+                        )}
+                      </div>
+                      <p className="text-sm font-semibold text-[#5b2a86]">
+                        {row.ownAgentMonthUsed.toLocaleString()}
+                      </p>
+                      <div>
+                        <p className="text-sm font-semibold text-[#332842]">
+                          {row.keyTotalUsed.toLocaleString()}
+                        </p>
+                        {row.keyTotalUsed > row.ownAgentMonthUsed && (
+                          <p className="mt-1 text-xs text-[#857e91]">
+                            其他 {row.otherOrUnattributedUsed.toLocaleString()}
+                          </p>
+                        )}
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={row.configured ? "outline" : "default"}
+                        onClick={() =>
+                          setApiKeyTarget({
+                            kind: row.kind,
+                            userId: row.userId,
+                            displayName: row.displayName,
+                            username: row.username,
+                            configured: row.configured,
+                            version: row.version,
+                          })
+                        }
+                      >
+                        <KeyRound className="h-3.5 w-3.5" />
+                        {row.configured ? "更换 Key" : "配置 Key"}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </PortalCard>
+        )}
         {!previewMode && (
           <PortalCard className="overflow-hidden">
             <div className="border-b border-[#eee8f2] px-5 py-4 sm:px-6">
               <h2 className="font-semibold text-[#171321]">工程师状态</h2>
               <p className="mt-1 text-sm text-[#716a80]">
-                按人员查看专业岗位、负责项目和当前工作状态；项目岗位缺员请前往客户项目团队处理。
+                {systemAdmin
+                  ? "按人员查看岗位、项目、本月自用与 Key 总额；工程师 Key 由系统管理员统一配置。"
+                  : "按人员查看专业岗位、负责项目和当前工作状态；项目岗位缺员请前往客户项目团队处理。"}
               </p>
             </div>
             {deliveryRoleOverviewQuery.isLoading ? (
@@ -944,13 +1409,26 @@ export default function AdminDashboard({
               </div>
             ) : (
               <div className="overflow-x-auto">
-                <div className="min-w-[760px]">
-                  <div className="grid grid-cols-[minmax(180px,1.2fr)_minmax(170px,1.1fr)_minmax(190px,1.3fr)_150px_140px] gap-4 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 text-xs font-medium text-[#716a80] sm:px-6">
+                <div
+                  className={systemAdmin ? "min-w-[1040px]" : "min-w-[720px]"}
+                >
+                  <div
+                    className={`grid gap-4 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 text-xs font-medium text-[#716a80] sm:px-6 ${
+                      systemAdmin
+                        ? "grid-cols-[minmax(160px,1.1fr)_minmax(160px,1fr)_minmax(180px,1.2fr)_140px_170px_180px]"
+                        : "grid-cols-[minmax(180px,1.2fr)_minmax(170px,1.1fr)_minmax(220px,1.4fr)_150px]"
+                    }`}
+                  >
                     <span>工程师</span>
                     <span>专业岗位</span>
                     <span>负责项目</span>
                     <span>当前状态</span>
-                    <span>账号与 Key</span>
+                    {systemAdmin && (
+                      <>
+                        <span>本月积分</span>
+                        <span>账号与 Key 状态</span>
+                      </>
+                    )}
                   </div>
                   {deliveryEngineerStatusRows.map((engineer) => {
                     const statusTone =
@@ -966,7 +1444,11 @@ export default function AdminDashboard({
                     return (
                       <div
                         key={engineer.id}
-                        className="grid grid-cols-[minmax(180px,1.2fr)_minmax(170px,1.1fr)_minmax(190px,1.3fr)_150px_140px] items-center gap-4 border-b border-[#eee8f2] px-5 py-4 last:border-b-0 sm:px-6"
+                        className={`grid items-center gap-4 border-b border-[#eee8f2] px-5 py-4 last:border-b-0 sm:px-6 ${
+                          systemAdmin
+                            ? "grid-cols-[minmax(160px,1.1fr)_minmax(160px,1fr)_minmax(180px,1.2fr)_140px_170px_180px]"
+                            : "grid-cols-[minmax(180px,1.2fr)_minmax(170px,1.1fr)_minmax(220px,1.4fr)_150px]"
+                        }`}
                       >
                         <div className="min-w-0">
                           <p className="truncate text-sm font-semibold text-[#332842]">
@@ -1000,28 +1482,49 @@ export default function AdminDashboard({
                             {engineer.workStatusLabel}
                           </span>
                         </div>
-                        <div className="space-y-1 text-xs">
-                          <p
-                            className={
-                              engineer.isActive
-                                ? "text-[#16794f]"
-                                : "text-[#857e91]"
-                            }
-                          >
-                            {engineer.isActive ? "账号启用" : "账号停用"}
-                          </p>
-                          <p
-                            className={
-                              engineer.apiKeyConfigured
-                                ? "text-[#16794f]"
-                                : "text-[#a02652]"
-                            }
-                          >
-                            {engineer.apiKeyConfigured
-                              ? "Key 已配置"
-                              : "Key 未配置"}
-                          </p>
-                        </div>
+                        {systemAdmin && (
+                          <>
+                            <div className="space-y-1 text-xs text-[#716a80]">
+                              <p>
+                                自用{" "}
+                                <span className="font-semibold text-[#5b2a86]">
+                                  {engineer.ownAgentMonthUsed.toLocaleString()}
+                                </span>
+                              </p>
+                              <p>
+                                Key 总额{" "}
+                                <span className="font-semibold text-[#332842]">
+                                  {engineer.keyTotalUsed.toLocaleString()}
+                                </span>
+                              </p>
+                            </div>
+                            <div className="space-y-1 text-xs">
+                              <p
+                                className={
+                                  engineer.isActive
+                                    ? "text-[#16794f]"
+                                    : "text-[#857e91]"
+                                }
+                              >
+                                {engineer.isActive ? "账号启用" : "账号停用"}
+                              </p>
+                              <p
+                                className={
+                                  engineer.apiKeyConfigured
+                                    ? "text-[#16794f]"
+                                    : "text-[#a02652]"
+                                }
+                              >
+                                {engineer.apiKeyConfigured
+                                  ? "Key 已配置"
+                                  : "Key 未配置"}
+                              </p>
+                              <p className="pt-1 text-[#857e91]">
+                                在上方统一 Key 管理区操作
+                              </p>
+                            </div>
+                          </>
+                        )}
                       </div>
                     );
                   })}
@@ -1030,466 +1533,222 @@ export default function AdminDashboard({
             )}
           </PortalCard>
         )}
-        <PortalCard className="overflow-hidden">
-          <div className="flex items-center justify-between gap-4 border-b border-[#eee8f2] px-5 py-4 sm:px-6">
-            <div>
-              <div className="flex items-center gap-2">
-                <AlertTriangle className="h-5 w-5 text-[#c89013]" />
-                <h2 className="font-semibold text-[#171321]">交付管理员积分</h2>
-              </div>
-              <p className="mt-1 text-sm leading-6 text-[#716a80]">
-                {systemAdmin
-                  ? "先选择交付管理员，再查看该管理员名下的 Key 池、管理员自用 Agent 积分与用户本月消耗。"
-                  : "名下各 Key 池总消耗取自上游；管理员本人和名下用户按任务归属独立记账。"}
-              </p>
-            </div>
-            {!previewMode && (
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={
-                  usageHierarchyQuery.isFetching || usageSyncMutation.isPending
-                }
-                onClick={() => usageSyncMutation.mutate()}
-              >
-                <RefreshCw
-                  className={`h-4 w-4 ${
-                    usageHierarchyQuery.isFetching ||
-                    usageSyncMutation.isPending
-                      ? "animate-spin"
-                      : ""
-                  }`}
-                />
-                {usageHierarchyQuery.isFetching || usageSyncMutation.isPending
-                  ? "同步中"
-                  : "刷新用量"}
-              </Button>
-            )}
-          </div>
-          {!previewMode && usageHierarchyQuery.isLoading ? (
-            <div className="p-6 text-sm text-[#716a80]">正在读取用量快照…</div>
-          ) : !previewMode && usageHierarchyQuery.error ? (
-            <div className="p-6 text-sm text-[#a02652]">用量暂时无法读取。</div>
-          ) : usageManagers.length === 0 ? (
-            <div className="p-6 text-sm text-[#716a80]">
-              当前权限范围内暂无交付管理员用量记录。
-            </div>
-          ) : (
-            <div
-              className={`grid gap-5 p-5 sm:p-6 ${
-                systemAdmin ? "lg:grid-cols-[250px_minmax(0,1fr)]" : ""
-              }`}
-            >
-              {systemAdmin && (
-                <aside className="space-y-2">
-                  {usageManagers.map((manager) => (
-                    <button
-                      key={manager.adminId}
-                      type="button"
-                      onClick={() => setSelectedUsageManagerId(manager.adminId)}
-                      className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
-                        selectedUsageManager?.adminId === manager.adminId
-                          ? "border-[#7a45a7] bg-[#f6f0fa]"
-                          : "border-[#e8e1ee] bg-white hover:border-[#cdb9dc]"
-                      }`}
-                    >
-                      <p className="truncate text-sm font-semibold text-[#332842]">
-                        {manager.displayName}
-                      </p>
-                      <p className="mt-1 truncate text-xs text-[#857e91]">
-                        {manager.users.length} 个受管用户
-                      </p>
-                    </button>
-                  ))}
-                </aside>
-              )}
-
-              {selectedUsageManager && (
-                <section className="min-w-0">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <h3 className="text-lg font-semibold text-[#221a33]">
-                        {selectedUsageManager.displayName}
-                      </h3>
-                      <p className="mt-1 font-mono text-xs text-[#857e91]">
-                        {selectedUsageManager.keyPool.credentialCount === 0
-                          ? "尚未配置有效 Key"
-                          : selectedUsageManager.keyPool.credentialCount === 1
-                            ? selectedUsageManager.keyPool.fingerprint ||
-                              "1 个有效 Key"
-                            : `${selectedUsageManager.keyPool.credentialCount} 个有效 Key`}
-                      </p>
-                    </div>
-                    <p className="text-xs text-[#857e91]">
-                      {usageHierarchy.period.label} · 北京时间自然月
-                    </p>
-                  </div>
-
-                  <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                    {[
-                      [
-                        "名下 Key 池总消耗",
-                        selectedUsageManager.keyPool.totalUsed,
-                      ],
-                      [
-                        "管理员自用 Agent 积分",
-                        selectedUsageManager.ownAgentMonthUsed,
-                      ],
-                      ["已归属到本管理员", selectedUsageManager.attributedUsed],
-                      [
-                        "其他或未归属",
-                        selectedUsageManager.otherOrUnattributedUsed,
-                      ],
-                    ].map(([label, value]) => (
-                      <div
-                        key={String(label)}
-                        className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4"
-                      >
-                        <p className="text-xs font-medium text-[#716a80]">
-                          {label}
-                        </p>
-                        <p className="mt-2 text-2xl font-semibold text-[#5b2a86]">
-                          {Number(value).toLocaleString()}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                  {selectedUsageManager.keyPool.syncStatus !== "ok" && (
-                    <p className="mt-3 rounded-xl border border-[#ead7a5] bg-[#fffaf0] px-3 py-2 text-xs leading-5 text-[#8a6200]">
-                      名下 Key
-                      池的本月用量尚未完整同步，请刷新用量后再据此判断是否更换
-                      Key。
-                    </p>
-                  )}
-
-                  <div className="mt-5 flex flex-wrap items-center justify-between gap-2">
-                    <h4 className="text-sm font-semibold text-[#332842]">
-                      名下用户本月消耗
-                    </h4>
-                    <p className="text-xs text-[#857e91]">
-                      用户端不展示积分信息
-                    </p>
-                  </div>
-                  <div className="mt-3 overflow-hidden rounded-2xl border border-[#e8e1ee]">
-                    {selectedUsageManager.users.length === 0 ? (
-                      <p className="px-4 py-8 text-center text-sm text-[#716a80]">
-                        该管理员暂未分配用户。
-                      </p>
-                    ) : (
-                      selectedUsageManager.users.map((customer) => (
-                        <button
-                          key={customer.userId}
-                          type="button"
-                          onClick={() =>
-                            setLocation(
-                              previewMode
-                                ? `${getPreviewAdminWorkspaceHref(systemAdmin)}?user=${customer.userId}&tab=credential`
-                                : `/admin/workspace?user=${customer.userId}&tab=credential`,
-                            )
-                          }
-                          className="grid w-full gap-2 border-b border-[#eee8f2] px-4 py-3 text-left last:border-b-0 hover:bg-[#fbf9fd] sm:grid-cols-[minmax(0,1fr)_150px_120px] sm:items-center"
-                        >
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-[#332842]">
-                              {customer.enterpriseName}
-                            </p>
-                            <p className="mt-1 truncate text-xs text-[#857e91]">
-                              {customer.username || `用户 ${customer.userId}`}
-                            </p>
-                          </div>
-                          <p className="text-sm font-semibold text-[#5b2a86]">
-                            {customer.monthUsed.toLocaleString()}
-                          </p>
-                          <p
-                            className={`text-xs sm:text-right ${
-                              customer.credentialSource !== "unconfigured"
-                                ? "text-[#16794f]"
-                                : "text-[#a02652]"
-                            }`}
-                          >
-                            {customer.usesManagerKey
-                              ? "使用管理员 Key"
-                              : customer.credentialSource === "customer"
-                                ? "客户独立 Key"
-                                : "Key 未配置"}
-                          </p>
-                        </button>
-                      ))
-                    )}
-                  </div>
-                </section>
-              )}
-            </div>
-          )}
-        </PortalCard>
-
-        <PortalCard className="overflow-hidden">
-          <div className="border-b border-[#eee8f2] px-5 py-5 sm:px-6">
-            <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+        {systemAdmin && (
+          <PortalCard className="overflow-hidden">
+            <div className="border-b border-[#eee8f2] px-5 py-4 sm:px-6">
               <div>
                 <div className="flex items-center gap-2">
-                  <ClipboardList className="h-5 w-5 text-[#5b2a86]" />
+                  <AlertTriangle className="h-5 w-5 text-[#c89013]" />
                   <h2 className="font-semibold text-[#171321]">
-                    交付工单总览
+                    交付管理员积分
                   </h2>
                 </div>
-                <p className="mt-2 text-sm leading-6 text-[#716a80]">
-                  按提交时间从旧到新排列，并展示工程师实际处理状态；交付管理员只查看与协调自己负责的客户。
+                <p className="mt-1 text-sm leading-6 text-[#716a80]">
+                  先选择交付管理员，再查看该管理员名下的 Key 池、管理员自用
+                  Agent 积分与用户本月消耗。
                 </p>
               </div>
+            </div>
+            {!previewMode && usageHierarchyQuery.isLoading ? (
+              <div className="p-6 text-sm text-[#716a80]">
+                正在读取用量快照…
+              </div>
+            ) : !previewMode && usageHierarchyQuery.error ? (
+              <div className="p-6 text-sm text-[#a02652]">
+                用量暂时无法读取。
+              </div>
+            ) : usageManagers.length === 0 ? (
+              <div className="p-6 text-sm text-[#716a80]">
+                当前权限范围内暂无交付管理员用量记录。
+              </div>
+            ) : (
               <div
-                className={`grid gap-2 sm:grid-cols-2 ${
-                  systemAdmin
-                    ? "xl:grid-cols-[220px_140px_140px_150px]"
-                    : "xl:grid-cols-[220px_140px_150px]"
+                className={`grid gap-5 p-5 sm:p-6 ${
+                  systemAdmin ? "lg:grid-cols-[250px_minmax(0,1fr)]" : ""
                 }`}
               >
-                <label className="relative">
-                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a94a8]" />
-                  <Input
-                    value={ticketKeyword}
-                    onChange={(event) => setTicketKeyword(event.target.value)}
-                    className="bg-[#fbf9fd] pl-9"
-                    placeholder="搜索企业或话题"
-                    aria-label="搜索工单"
-                  />
-                </label>
-                <select
-                  value={ticketType}
-                  onChange={(event) => setTicketType(event.target.value)}
-                  aria-label="筛选工单类型"
-                  className="h-10 rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#484057]"
-                >
-                  <option value="all">全部类型</option>
-                  <option value="knowledge_base">品牌知识库</option>
-                  <option value="content_asset">内容资产</option>
-                  <option value="website_operation">官网运营</option>
-                </select>
                 {systemAdmin && (
-                  <select
-                    value={ticketManager}
-                    onChange={(event) => setTicketManager(event.target.value)}
-                    aria-label="筛选交付管理员"
-                    className="h-10 rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#484057]"
-                  >
-                    <option value="all">全部负责人</option>
-                    {ticketManagers.map(([value, label]) => (
-                      <option key={value} value={value}>
-                        {label}
-                      </option>
+                  <aside className="space-y-2">
+                    {usageManagers.map((manager) => (
+                      <button
+                        key={manager.adminId}
+                        type="button"
+                        onClick={() =>
+                          setSelectedUsageManagerId(manager.adminId)
+                        }
+                        className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
+                          selectedUsageManager?.adminId === manager.adminId
+                            ? "border-[#7a45a7] bg-[#f6f0fa]"
+                            : "border-[#e8e1ee] bg-white hover:border-[#cdb9dc]"
+                        }`}
+                      >
+                        <p className="truncate text-sm font-semibold text-[#332842]">
+                          {manager.displayName}
+                        </p>
+                        <p className="mt-1 truncate text-xs text-[#857e91]">
+                          {manager.users.length} 个受管用户
+                        </p>
+                      </button>
                     ))}
-                  </select>
+                  </aside>
                 )}
-                <select
-                  value={ticketStatus}
-                  onChange={(event) => setTicketStatus(event.target.value)}
-                  aria-label="筛选工单状态"
-                  className="h-10 rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#484057]"
-                >
-                  <option value="all">全部状态</option>
-                  <option value="submitted">已提交</option>
-                  <option value="needs_information">待补充资料</option>
-                  <option value="scheduled">已排期</option>
-                  <option value="in_progress">处理中</option>
-                  <option value="completed">已完成</option>
-                  <option value="rejected">未受理</option>
-                  <option value="cancelled">已取消</option>
-                </select>
-              </div>
-            </div>
-            <div className="mt-5 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-              {[
-                [
-                  "待工程师领取",
-                  ticketListUnavailable
-                    ? null
-                    : (ticketCounts.submitted ?? 0),
-                ],
-                [
-                  "待客户补资料",
-                  ticketListUnavailable
-                    ? null
-                    : (ticketCounts.needsInformation ??
-                      ticketCounts.needs_information ??
-                      0),
-                ],
-                [
-                  "工程师执行中",
-                  ticketListUnavailable
-                    ? null
-                    : (ticketCounts.scheduled ?? 0) +
-                      (ticketCounts.inProgress ??
-                        ticketCounts.in_progress ??
-                        0),
-                ],
-                [
-                  "已结束",
-                  ticketListUnavailable
-                    ? null
-                    : (ticketCounts.completedPublic ??
-                      (ticketCounts.completed ?? 0) +
-                        (ticketCounts.rejected ?? 0) +
-                        (ticketCounts.cancelled ?? 0)),
-                ],
-              ].map(([label, value]) => (
-                <div
-                  key={String(label)}
-                  className="rounded-xl border border-[#e8e1ee] bg-[#fbf9fd] px-4 py-3"
-                >
-                  <p className="text-xs font-medium text-[#857e91]">
-                    {String(label)}
-                  </p>
-                  <p className="mt-1 text-xl font-semibold text-[#332842]">
-                    {value === null ? "—" : Number(value)}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </div>
 
-          {ticketListQuery.isLoading && !previewMode ? (
-            <div className="p-8 text-center text-sm text-[#716a80]">
-              正在汇总工单…
-            </div>
-          ) : ticketListQuery.error && !previewMode ? (
-            <div className="p-6 text-sm text-[#a02652]">
-              工单队列暂时无法载入：
-              {ticketListQuery.error.message || "请刷新后重试。"}
-            </div>
-          ) : sortedTicketQueue.length === 0 ? (
-            <div className="p-8 text-center text-sm text-[#716a80]">
-              当前没有符合条件的工单。
-            </div>
-          ) : (
-            <div>
-              <div className="overflow-x-auto">
-                <table className="w-full min-w-[1160px] text-left">
-                  <thead className="bg-[#fbf9fd] text-xs text-[#716a80]">
-                    <tr>
-                      <th className="px-5 py-3 font-medium sm:px-6">企业</th>
-                      <th className="px-5 py-3 font-medium">需求</th>
-                      <th className="px-5 py-3 font-medium">类型</th>
-                      <th className="px-5 py-3 font-medium">状态</th>
-                      <th className="px-5 py-3 font-medium">执行岗位</th>
-                      <th className="px-5 py-3 font-medium">交付管理员</th>
-                      <th className="px-5 py-3 font-medium">提交时间</th>
-                      <th className="px-5 py-3 text-right font-medium sm:px-6">
-                        操作
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[#eee8f2]">
-                    {sortedTicketQueue.map((ticket) => (
-                      <tr key={ticket.id} className="text-sm">
-                        <td className="px-5 py-4 font-semibold text-[#332842] sm:px-6">
-                          {ticket.enterpriseName ||
-                            `客户 ${ticket.userId || ""}`}
-                        </td>
-                        <td className="max-w-[360px] px-5 py-4">
-                          <p className="truncate font-medium text-[#484057]">
-                            {ticket.title || ticket.topic || "未命名工单"}
+                {selectedUsageManager && (
+                  <section className="min-w-0">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <h3 className="text-lg font-semibold text-[#221a33]">
+                          {selectedUsageManager.displayName}
+                        </h3>
+                        <p
+                          className={`mt-1 text-xs font-medium ${
+                            selectedUsageManager.apiKeyConfigured
+                              ? "text-[#16794f]"
+                              : "text-[#a02652]"
+                          }`}
+                        >
+                          管理员自用 Key：
+                          {selectedUsageManager.apiKeyConfigured
+                            ? "已配置"
+                            : "未配置"}
+                        </p>
+                        <p className="mt-1 font-mono text-xs text-[#857e91]">
+                          名下 Key 池：
+                          {selectedUsageManager.keyPool.credentialCount === 0
+                            ? "尚无有效 Key"
+                            : selectedUsageManager.keyPool.credentialCount === 1
+                              ? selectedUsageManager.keyPool.fingerprint ||
+                                "1 个有效 Key"
+                              : `${selectedUsageManager.keyPool.credentialCount} 个有效 Key`}
+                        </p>
+                      </div>
+                      <div className="flex flex-col items-end gap-2">
+                        <p className="text-xs text-[#857e91]">
+                          {usageHierarchy.period.label} · 北京时间自然月
+                        </p>
+                        {systemAdmin && !previewMode && (
+                          <p className="text-xs text-[#6a338f]">
+                            Key 请在上方统一管理区配置
                           </p>
-                          {ticket.topic && ticket.title !== ticket.topic && (
-                            <p className="mt-1 truncate text-xs text-[#9a94a8]">
-                              {ticket.topic}
-                            </p>
-                          )}
-                        </td>
-                        <td className="px-5 py-4 text-[#716a80]">
-                          {ticketTypeLabel(ticket.type)}
-                        </td>
-                        <td className="px-5 py-4">
-                          <span className="rounded-full bg-[#f2ebf7] px-2.5 py-1 text-xs font-semibold text-[#5b2a86]">
-                            {
-                              DELIVERY_TICKET_STATUS_LABELS[
-                                ticket.status as DeliveryTicketStatus
-                              ]
-                            }
-                          </span>
-                        </td>
-                        <td className="px-5 py-4 text-[#716a80]">
-                          <p>
-                            {ticket.workflowDomain
-                              ? DELIVERY_ROLE_LABELS[
-                                  ticket.workflowDomain as DeliveryRoleType
-                                ]
-                              : "旧版工单"}
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                      {[
+                        [
+                          "名下 Key 池总消耗",
+                          selectedUsageManager.keyPool.totalUsed,
+                        ],
+                        [
+                          "管理员自用 Agent 积分",
+                          selectedUsageManager.ownAgentMonthUsed,
+                        ],
+                        [
+                          "已归属到本管理员",
+                          selectedUsageManager.attributedUsed,
+                        ],
+                        [
+                          "其他或未归属",
+                          selectedUsageManager.otherOrUnattributedUsed,
+                        ],
+                      ].map(([label, value]) => (
+                        <div
+                          key={String(label)}
+                          className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4"
+                        >
+                          <p className="text-xs font-medium text-[#716a80]">
+                            {label}
                           </p>
-                          <p className="mt-1 text-xs text-[#9a94a8]">
-                            {ticket.assignedMemberId
-                              ? ticket.assignedMemberName ||
-                                `工程师 #${ticket.assignedMemberId}`
-                              : ticket.workflowDomain
-                                ? "工程师待分配"
-                                : "无岗位"}
+                          <p className="mt-2 text-2xl font-semibold text-[#5b2a86]">
+                            {Number(value).toLocaleString()}
                           </p>
-                        </td>
-                        <td className="px-5 py-4 text-[#716a80]">
-                          {assignedManagersForTicket(ticket)
-                            .map((manager) => manager.name)
-                            .join("、") || "待分配"}
-                        </td>
-                        <td className="px-5 py-4 text-xs text-[#857e91]">
-                          <span className="inline-flex items-center gap-1.5">
-                            <CalendarClock className="h-3.5 w-3.5" />
-                            {formatAdminTicketDate(
-                              ticket.createdAt || ticket.updatedAt,
-                            )}
-                          </span>
-                        </td>
-                        <td className="px-5 py-4 text-right sm:px-6">
+                        </div>
+                      ))}
+                    </div>
+                    {selectedUsageManager.keyPool.syncStatus !== "ok" && (
+                      <p className="mt-3 rounded-xl border border-[#ead7a5] bg-[#fffaf0] px-3 py-2 text-xs leading-5 text-[#8a6200]">
+                        名下 Key
+                        池的本月用量尚未完整同步，请刷新用量后再据此判断是否更换
+                        Key。
+                      </p>
+                    )}
+
+                    <div className="mt-5 flex flex-wrap items-center justify-between gap-2">
+                      <h4 className="text-sm font-semibold text-[#332842]">
+                        名下用户本月消耗
+                      </h4>
+                      <p className="text-xs text-[#857e91]">
+                        用户端不展示积分信息
+                      </p>
+                    </div>
+                    <div className="mt-3 overflow-hidden rounded-2xl border border-[#e8e1ee]">
+                      {selectedUsageManager.users.length === 0 ? (
+                        <p className="px-4 py-8 text-center text-sm text-[#716a80]">
+                          该管理员暂未分配用户。
+                        </p>
+                      ) : (
+                        selectedUsageManager.users.map((customer) => (
                           <button
+                            key={customer.userId}
                             type="button"
-                            className="inline-flex items-center gap-1.5 font-semibold text-[#5b2a86]"
-                            onClick={() => {
-                              const customerId = Number(ticket.userId);
-                              if (
-                                !Number.isInteger(customerId) ||
-                                customerId <= 0
-                              )
-                                return;
-                              if (previewMode) {
-                                setLocation(
-                                  getPreviewAdminWorkspaceHref(
-                                    systemAdmin,
-                                    "tab=tickets",
-                                  ),
-                                );
-                                return;
-                              }
+                            onClick={() =>
                               setLocation(
-                                `/admin/customers/${customerId}/tickets?ticketId=${encodeURIComponent(ticket.id)}`,
-                              );
-                            }}
+                                previewMode
+                                  ? `${getPreviewAdminWorkspaceHref(systemAdmin)}?user=${customer.userId}&tab=credential`
+                                  : `/admin/workspace?user=${customer.userId}&tab=credential`,
+                              )
+                            }
+                            className="grid w-full gap-2 border-b border-[#eee8f2] px-4 py-3 text-left last:border-b-0 hover:bg-[#fbf9fd] sm:grid-cols-[minmax(0,1fr)_150px_120px] sm:items-center"
                           >
-                            {systemAdmin ? "查看工单" : "查看与协调"}
-                            <ArrowRight className="h-4 w-4" />
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-semibold text-[#332842]">
+                                {customer.enterpriseName}
+                              </p>
+                              <p className="mt-1 truncate text-xs text-[#857e91]">
+                                {customer.username || `用户 ${customer.userId}`}
+                              </p>
+                            </div>
+                            <p className="text-sm font-semibold text-[#5b2a86]">
+                              {customer.monthUsed.toLocaleString()}
+                            </p>
+                            <p
+                              className={`text-xs sm:text-right ${
+                                customer.credentialSource !== "unconfigured"
+                                  ? "text-[#16794f]"
+                                  : "text-[#a02652]"
+                              }`}
+                            >
+                              {customer.usesManagerKey
+                                ? "使用管理员 Key"
+                                : customer.credentialSource === "customer"
+                                  ? "客户独立 Key"
+                                  : "Key 未配置"}
+                            </p>
                           </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                        ))
+                      )}
+                    </div>
+                  </section>
+                )}
               </div>
-              {ticketListQuery.hasNextPage && !previewMode && (
-                <div className="flex justify-center border-t border-[#eee8f2] p-4">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={ticketListQuery.isFetchingNextPage}
-                    onClick={() => void ticketListQuery.fetchNextPage()}
-                  >
-                    {ticketListQuery.isFetchingNextPage
-                      ? "正在加载…"
-                      : "加载更多工单"}
-                  </Button>
-                </div>
-              )}
-            </div>
-          )}
-        </PortalCard>
+            )}
+          </PortalCard>
+        )}
       </div>
+      {!previewMode && (
+        <AdminOverviewApiKeyDialog
+          target={apiKeyTarget}
+          onOpenChange={(open) => !open && setApiKeyTarget(null)}
+          onSaved={async () => {
+            await Promise.all([
+              deliveryRoleOverviewQuery.refetch(),
+              usageHierarchyQuery.refetch(),
+              workspaceQuery.refetch(),
+            ]);
+          }}
+        />
+      )}
     </PortalShell>
   );
 }

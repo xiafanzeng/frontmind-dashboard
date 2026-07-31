@@ -28,6 +28,35 @@ describe("sanitizeBrandText", () => {
     expect(visible).not.toContain("FRONTMIND_KB_PROGRESS");
     expect(visible).not.toContain('"revision":3');
   });
+
+  it("hides bare protocol JSON from real knowledge-base output", () => {
+    const visible = sanitizeBrandText(
+      [
+        "## 1.1 企业定位",
+        "企业定位正文。",
+        JSON.stringify({
+          kind: "frontmind.knowledge-base.manifest",
+          schemaVersion: 1,
+          leaves: [{ id: "1.1", title: "企业定位" }],
+        }),
+        JSON.stringify({
+          kind: "frontmind.workflow-state",
+          schemaVersion: 1,
+          currentLeafId: "1.1",
+        }),
+        JSON.stringify({
+          kind: "frontmind.knowledge-base.presentation",
+          schemaVersion: 1,
+          leafId: "1.1",
+        }),
+      ].join("\n"),
+    );
+
+    expect(visible).toContain("企业定位正文。");
+    expect(visible).not.toContain("frontmind.knowledge-base.manifest");
+    expect(visible).not.toContain("frontmind.workflow-state");
+    expect(visible).not.toContain("frontmind.knowledge-base.presentation");
+  });
 });
 
 describe("createResponseLogicTask", () => {

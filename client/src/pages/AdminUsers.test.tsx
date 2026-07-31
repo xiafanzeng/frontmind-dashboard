@@ -69,7 +69,7 @@ describe("CreateUserDialog", () => {
     vi.clearAllMocks();
   });
 
-  it("requires an initial password, plan and customer API Key for immediate activation", () => {
+  it("allows system administrators to configure a customer Key now or later", () => {
     render(
       <CreateUserDialog
         open
@@ -85,12 +85,12 @@ describe("CreateUserDialog", () => {
     expect(screen.getByText("初始密码")).toBeInTheDocument();
     expect(screen.getByText("确认初始密码")).toBeInTheDocument();
     expect(screen.queryByText(/设置密码链接/)).toBeNull();
-    expect(screen.getByLabelText("客户 API Key")).toHaveAttribute(
+    expect(screen.getByLabelText("客户 API Key（可选）")).toHaveAttribute(
       "type",
       "password",
     );
     expect(screen.getByRole("button", { name: "创建客户账号" })).toBeDisabled();
-    expect(screen.getByText(/账号立即可用/)).toBeInTheDocument();
+    expect(screen.getByText(/交付总览.*配置/)).toBeInTheDocument();
     const dialog = screen.getByRole("dialog");
     expect(dialog.className).toContain("100dvh");
     expect(dialog.querySelector(".overflow-y-auto")).not.toBeNull();
@@ -133,9 +133,7 @@ describe("CreateUserDialog", () => {
       />,
     );
 
-    fireEvent.click(
-      screen.getByRole("combobox", { name: "客户主负责人" }),
-    );
+    fireEvent.click(screen.getByRole("combobox", { name: "客户主负责人" }));
     expect(
       screen.getByRole("option", { name: "交付负责人 · @delivery.owner" }),
     ).toBeInTheDocument();
@@ -170,6 +168,8 @@ describe("CreateUserDialog", () => {
     expect(screen.getByText(/交付负责人/)).toBeInTheDocument();
     expect(screen.getByText(/自动归属当前账号/)).toBeInTheDocument();
     expect(screen.getByText(/自动归属当前交付管理员/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("客户 API Key（可选）")).toBeNull();
+    expect(screen.getByText(/无需填写或接触 Key/)).toBeInTheDocument();
   });
 
   it("lets delivery administrators create customers or engineers, but not administrators", () => {
@@ -187,6 +187,12 @@ describe("CreateUserDialog", () => {
     expect(screen.getByRole("option", { name: "客户" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "工程师" })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: "管理员" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("option", { name: "工程师" }));
+    expect(screen.queryByLabelText("工程师 API Key（可选）")).toBeNull();
+    expect(
+      screen.getByText(/由系统管理员在交付总览统一配置工程师/),
+    ).toBeInTheDocument();
   });
 
   it("requires one fixed engineer role and keeps the engineer API Key optional", async () => {
@@ -256,7 +262,7 @@ describe("engineer account management", () => {
     isActive: true,
   };
 
-  it("shows the fixed role, Key warning and Key management action in the account list", () => {
+  it("shows the fixed role and read-only Key status in the account list", () => {
     render(
       <UserRow
         account={engineer}
@@ -266,7 +272,6 @@ describe("engineer account management", () => {
         onResetPassword={() => undefined}
         onChangeAccessLevel={() => undefined}
         onChangeStatus={() => undefined}
-        onManageApiKey={() => undefined}
         onDelete={() => undefined}
       />,
     );
@@ -274,9 +279,7 @@ describe("engineer account management", () => {
     expect(screen.getByText("工程师")).toBeInTheDocument();
     expect(screen.getByText("AI 运维工程师")).toBeInTheDocument();
     expect(screen.getByText("Key 未配置")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "管理 Key" }),
-    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "管理 Key" })).toBeNull();
   });
 
   it("keeps raw engineer Keys hidden and allows configuration from the account page", async () => {

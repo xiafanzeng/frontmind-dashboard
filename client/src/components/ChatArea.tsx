@@ -750,7 +750,7 @@ function StandardConversationHint({
   );
 }
 
-function EmptyConversationHint({
+export function EmptyConversationHint({
   onStartKnowledgeBase,
   companyName,
   companyConfigured,
@@ -841,20 +841,16 @@ function EmptyConversationHint({
       <motion.div
         initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
-        className="space-y-7"
+        className="flex min-h-[420px] flex-col items-center justify-center px-4 py-10 text-center"
       >
-        {/* Introduction section */}
-        <div className="text-center py-8">
-          <h3 className="text-lg font-semibold text-foreground/70 mb-3">
-            内容制作智能体编排工作流
-          </h3>
-          <p className="text-sm text-muted-foreground leading-relaxed max-w-lg mx-auto">
-            以研究、分析与交付为核心的专业内容生产引擎
-          </p>
-          <p className="mx-auto mt-3 max-w-xl text-sm leading-6 text-foreground/70">
+        <div className="mx-auto flex max-w-xl flex-col items-center">
+          <span className="grid h-12 w-12 place-items-center rounded-2xl bg-primary/10 text-primary">
+            <BookOpen className="h-5 w-5" />
+          </span>
+          <p className="mt-5 text-base leading-7 text-foreground/75">
             {KNOWLEDGE_BASE_FOUNDATION_COPY}
           </p>
-          <div className="flex flex-wrap justify-center gap-3 pt-6">
+          <div className="mt-6">
             <Button
               type="button"
               onClick={() => setDialogOpen(true)}
@@ -864,22 +860,20 @@ function EmptyConversationHint({
               构建企业知识库
             </Button>
           </div>
-        </div>
-
-        {/* Features highlight */}
-        <div className="flex flex-wrap justify-center gap-4 pt-1">
-          <FeatureBadge
-            icon={<FileText className="w-3.5 h-3.5" />}
-            text="资料输入"
-          />
-          <FeatureBadge
-            icon={<Sparkles className="w-3.5 h-3.5" />}
-            text="智能分析"
-          />
-          <FeatureBadge
-            icon={<Download className="w-3.5 h-3.5" />}
-            text="报告交付"
-          />
+          <div className="mt-8 flex flex-wrap justify-center gap-4">
+            <FeatureBadge
+              icon={<FileText className="w-3.5 h-3.5" />}
+              text="资料输入"
+            />
+            <FeatureBadge
+              icon={<Sparkles className="w-3.5 h-3.5" />}
+              text="智能分析"
+            />
+            <FeatureBadge
+              icon={<Download className="w-3.5 h-3.5" />}
+              text="报告交付"
+            />
+          </div>
         </div>
       </motion.div>
 

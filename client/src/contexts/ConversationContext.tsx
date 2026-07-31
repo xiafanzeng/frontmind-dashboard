@@ -21,7 +21,10 @@ import {
 import {
   normalizeKnowledgeCollectionCopy,
 } from "@shared/knowledge-base-copy";
-import { stripKnowledgeBaseReferenceAppendix } from "@shared/knowledge-base-output";
+import {
+  stripKnowledgeBaseProtocolPayloads,
+  stripKnowledgeBaseReferenceAppendix,
+} from "@shared/knowledge-base-output";
 import { uniquifyOrderedIds } from "@shared/ordered-id";
 
 // Types for local conversation management
@@ -1322,7 +1325,11 @@ function isManagedKnowledgeBaseImageSource(src: string): boolean {
 export function sanitizeKnowledgeBaseCustomerMarkdown(text: string): string {
   if (!text) return "";
 
-  return normalizeKnowledgeCollectionCopy(stripKnowledgeBaseReferenceAppendix(text))
+  return normalizeKnowledgeCollectionCopy(
+    stripKnowledgeBaseReferenceAppendix(
+      stripKnowledgeBaseProtocolPayloads(text),
+    ),
+  )
     .replace(
       /!\[([^\]\n]*)]\(\s*<?(https?:\/\/[^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/gi,
       (_match, alt: string) => (alt.trim() ? `配图：${alt.trim()}` : ""),

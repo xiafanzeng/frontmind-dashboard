@@ -48,6 +48,7 @@ import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
 import { buildDeterministicTaskAttachmentArchive } from "./task-attachment-package";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import { KNOWLEDGE_COLLECTION_STATUS_COPY } from "../shared/knowledge-base-copy";
+import { extractKnowledgeBaseProtocolObjects } from "../shared/knowledge-base-output";
 
 const router = Router();
 
@@ -276,11 +277,22 @@ export function shouldReconcileKnowledgeOutput(
 ) {
   const text = extractFinalKnowledgeBaseAssistantText(output);
   if (!text) return false;
+  const rawKinds = new Set(
+    extractKnowledgeBaseProtocolObjects(text).map((value) => value.kind),
+  );
   if (options.requirePresentation) {
-    if (COMPLETE_KNOWLEDGE_MANIFEST.test(text)) return true;
     if (
-      COMPLETE_KNOWLEDGE_TRANSITION.test(text) &&
-      COMPLETE_KNOWLEDGE_PRESENTATION.test(text)
+      COMPLETE_KNOWLEDGE_MANIFEST.test(text) ||
+      rawKinds.has("frontmind.knowledge-base.manifest")
+    ) {
+      return true;
+    }
+    if (
+      (COMPLETE_KNOWLEDGE_TRANSITION.test(text) ||
+        rawKinds.has("frontmind.knowledge-base.progress") ||
+        rawKinds.has("frontmind.knowledge-base.reopen")) &&
+      (COMPLETE_KNOWLEDGE_PRESENTATION.test(text) ||
+        rawKinds.has("frontmind.knowledge-base.presentation"))
     ) {
       return true;
     }
@@ -288,7 +300,10 @@ export function shouldReconcileKnowledgeOutput(
   }
   if (
     COMPLETE_KNOWLEDGE_PROTOCOL_ENVELOPE.test(text) ||
-    COMPLETE_KNOWLEDGE_PROTOCOL_COMMENT.test(text)
+    COMPLETE_KNOWLEDGE_PROTOCOL_COMMENT.test(text) ||
+    rawKinds.has("frontmind.knowledge-base.manifest") ||
+    rawKinds.has("frontmind.knowledge-base.progress") ||
+    rawKinds.has("frontmind.knowledge-base.reopen")
   ) {
     return true;
   }
@@ -936,6 +951,7 @@ export async function buildKnowledgeBasePrompt({
       : "当前账号没有已迁移的初步知识库，将从官网、全网与上传资料开始预填。",
     "## 必须执行的机器可验证进度协议",
     "这是服务端状态机协议，优先级高于 skill 中任何会自动跨节点的表述。可读正文照常输出：首轮末尾只能附一个清单信封；后续轮末尾必须依次附一个状态/重开信封和一个展示信封。",
+    "信封的 `<!-- FRONTMIND_KB_...` 开头与 `-->` 结尾都是协议必填内容，必须原样保留；禁止输出裸 JSON，禁止输出 SOCRATIC_KB_STATE，禁止用 frontmind.workflow-state、frontmind.knowledge-base.message 或其他自创对象替代下列四种规定信封。",
     "",
     "### 首轮研究与知识树建立",
     "完成官网、公开来源、上传资料研究和正式图文预填后，按企业实际资料量建立自适应一级分支和 8-115 个真实叶子节点。白牌企业或只有宣传单时只保留有事实价值或明确缺口的必要叶子，不得为数量、字数或图片数填充内容。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
@@ -990,7 +1006,7 @@ export async function uploadKnowledgeBaseSkillArchive({
   return { ...uploaded, contentHash: archive.contentHash };
 }
 
-async function createFrontMindTask({
+export async function createFrontMindTask({
   baseUrl,
   apiKey,
   prompt,
@@ -1101,7 +1117,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
         `当前节点状态：${current.status}`,
         `服务端判定本轮动作：${action}`,
         "只要本轮包含附件，无论文字是否包含“确认”，都必须按补充/修订处理，保持 needs_verification。",
-        "回复末尾只能附一个 FRONTMIND_KB_PROGRESS 信封。",
+        "回复末尾只能附一个 FRONTMIND_KB_PROGRESS 信封；HTML 注释开头和结尾是信封的一部分，不得省略或改成裸 JSON。",
         action === "confirm" || action === "direct_prefill"
           ? nextPending
             ? `先简短确认已处理 ${current.id}，正文主体随后完整展示下一节点 ${nextPending.id}｜${nextPending.branchTitle} / ${nextPending.title}。不得再次把 ${current.id} 作为主体。`
@@ -1131,6 +1147,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     "客户可见回复不得出现“本轮采集/本知识库/证据不足/已核验”等过程判断，也不得出现客户应、采购方应、建议、尽调、合规审查、不能仅凭、不宜转换或不能外推等建议性表达。",
     "客户可见回复不得主动提供“直接预填”或“跳过”选项；用户正常操作只有确认当前内容，或者提交修改/附件后确认修订稿。",
     "客户可见回复只输出实际展示节点的完整正文/合规配图，不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题。所有来源只进入内部证据文件；可见正文结束后直接附机器信封。",
+    "机器信封必须保留完整的 `<!-- FRONTMIND_KB_...` 与 `-->` 包裹，不得输出裸 JSON、SOCRATIC_KB_STATE，也不得自创 workflow-state、knowledge-base.message 或其他状态对象。",
     "实际展示节点如有合格 related assetIds，必须把最多三张已下载验证的本地图片作为同一回复的 output_image 或 image MIME output_file 附件返回；不能只输出包内路径、图片标题、文字占位或官网/CDN 热链。只有该节点确实没有合格关联素材时才可纯文字返回。",
     "",
     "# 当前知识库状态",

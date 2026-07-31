@@ -107,7 +107,7 @@ describe("SettingsDialog", () => {
 
     expect(screen.getByText("智能服务设置")).toBeInTheDocument();
     expect(
-      screen.getByText(/智能服务由负责管理员统一维护/),
+      screen.getByText(/API Key.*由系统管理员统一维护/),
     ).toBeInTheDocument();
     expect(screen.queryByText("API Key 使用教程")).not.toBeInTheDocument();
     expect(screen.queryByText("当前 Key 本月总积分")).not.toBeInTheDocument();
@@ -126,7 +126,7 @@ describe("SettingsDialog", () => {
     expect(screen.queryByText("迁移到当前账号")).not.toBeInTheDocument();
   });
 
-  it("shows usage records for an explicit delivery administrator regardless of username", async () => {
+  it("hides Key controls from an explicit delivery administrator", () => {
     mocks.authUser = {
       id: 3,
       username: "admin",
@@ -138,20 +138,11 @@ describe("SettingsDialog", () => {
 
     render(<SettingsDialog open onOpenChange={vi.fn()} />);
 
-    await waitFor(() =>
-      expect(mocks.fetchCreditUsage).toHaveBeenCalledWith({
-        force: false,
-        fingerprint: "key-abcd",
-        accountId: 3,
-      }),
-    );
-    expect(screen.getByText("当前 Key 本月总积分")).toBeInTheDocument();
-    expect(await screen.findByText("128 积分")).toBeInTheDocument();
-    expect(screen.getByText("最近任务明细")).toBeInTheDocument();
-    expect(screen.getByLabelText("输入新的 API Key")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "验证并更换" }),
-    ).toBeInTheDocument();
+    expect(screen.getByText("智能服务设置")).toBeInTheDocument();
+    expect(screen.getByText(/由系统管理员统一维护/)).toBeInTheDocument();
+    expect(screen.queryByText("当前 Key 本月总积分")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("输入新的 API Key")).not.toBeInTheDocument();
+    expect(mocks.fetchCreditUsage).not.toHaveBeenCalled();
   });
 
   it("shows credit usage and recent tasks for an explicit system administrator", async () => {
@@ -178,9 +169,7 @@ describe("SettingsDialog", () => {
     expect(
       screen.getByText(/同一 API Key 可供多个账号共享/),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText(/总积分反映整个 Key 池的消耗/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/总积分反映整个 Key 池的消耗/)).toBeInTheDocument();
     expect(
       screen.getByText(/最近任务明细仅显示当前账号创建的任务/),
     ).toBeInTheDocument();
@@ -190,11 +179,11 @@ describe("SettingsDialog", () => {
 
   it("tests the saved credential when the replacement field is empty", async () => {
     mocks.authUser = {
-      id: 3,
+      id: 1,
       username: "admin",
-      displayName: "运营管理员",
+      displayName: "系统管理员",
       role: "admin",
-      adminAccessLevel: "delivery_admin",
+      adminAccessLevel: "system_admin",
       isActive: true,
     };
     mocks.testCredential.mockResolvedValue({ ok: true });

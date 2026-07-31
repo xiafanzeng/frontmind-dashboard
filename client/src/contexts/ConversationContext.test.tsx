@@ -373,6 +373,28 @@ describe("knowledge-base image delivery boundary", () => {
     );
   });
 
+  it("removes bare knowledge-base protocol objects from customer markdown", () => {
+    expect(
+      sanitizeKnowledgeBaseCustomerMarkdown(
+        [
+          "## 企业定位",
+          "",
+          "硅基流动是 AI 基础设施平台。",
+          "",
+          JSON.stringify({
+            kind: "frontmind.knowledge-base.presentation",
+            revision: 1,
+            leafId: "1.1",
+          }),
+          JSON.stringify({
+            kind: "frontmind.workflow-state",
+            currentLeafId: "1.1",
+          }),
+        ].join("\n"),
+      ),
+    ).toBe("## 企业定位\n\n硅基流动是 AI 基础设施平台。");
+  });
+
   it("keeps only controlled image sources in knowledge-base messages", () => {
     const [message] = sanitizeKnowledgeBaseOutputMessages([
       {

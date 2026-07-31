@@ -77,7 +77,7 @@ type ManagedUserOnboardingDependencies = {
       userId: number;
       actorUserId: number;
       deliveryAdminId: number;
-      apiKey: string;
+      apiKey?: string;
       now: Date;
     },
     executor: unknown,
@@ -108,10 +108,11 @@ async function defaultTransaction() {
 }
 
 /**
- * Creates a password-ready login account, direct credential, active contract,
- * quota windows and responsible-admin assignment in one transaction after the
- * credential has been validated upstream. Only the derived password hash is
- * passed into the transaction.
+ * Creates a password-ready login account, active contract, quota windows and
+ * responsible-admin assignment in one transaction. A system administrator can
+ * optionally configure the direct credential during creation; otherwise the
+ * account appears in the centralized Key queue. Only the derived password hash
+ * is passed into the transaction.
  */
 export async function createManagedServiceUser(
   input: {
@@ -122,7 +123,7 @@ export async function createManagedServiceUser(
     planCode: ServicePlanCode;
     marketEdition: AccountMarketEdition;
     deliveryAdminId: number;
-    apiKey: string;
+    apiKey?: string;
   },
   dependencies: ManagedUserOnboardingDependencies = {},
 ) {
@@ -141,13 +142,22 @@ export async function createManagedServiceUser(
       "交付管理员创建的客户必须归属当前账号",
     );
   }
+  const apiKey = input.apiKey?.trim() || null;
+  if (apiKey && !hasSystemAdminAccess(input.actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "客户 API Key 仅由系统管理员统一维护",
+    );
+  }
   const planCode = provisionableServicePlanCodeSchema.parse(input.planCode);
   const now = dependencies.now?.() ?? new Date();
   const contractId = dependencies.randomId?.() ?? randomUUID();
   const plan = SERVICE_PLAN_CATALOG[planCode];
   const startsAt = now;
   const endsAt = getServiceContractTermEnd(planCode, startsAt);
-  await (dependencies.validateApiKey ?? validateUpstreamApiKey)(input.apiKey);
+  if (apiKey) {
+    await (dependencies.validateApiKey ?? validateUpstreamApiKey)(apiKey);
+  }
   const passwordHash = await hashPassword(input.password);
   const transaction = dependencies.transaction ?? (await defaultTransaction());
   const createAccount =
@@ -180,12 +190,14 @@ export async function createManagedServiceUser(
     dependencies.persistCredentialAndAssignment ??
     (async (value, executor) => {
       const tx = executor as any;
-      await replaceApiCredentialInTransaction({
-        executor: tx,
-        userId: value.userId,
-        apiKey: value.apiKey,
-        now: value.now,
-      });
+      if (value.apiKey) {
+        await replaceApiCredentialInTransaction({
+          executor: tx,
+          userId: value.userId,
+          apiKey: value.apiKey,
+          now: value.now,
+        });
+      }
       await tx.insert(userAdminAssignments).values({
         userId: value.userId,
         adminId: value.deliveryAdminId,
@@ -293,7 +305,7 @@ export async function createManagedServiceUser(
         userId,
         actorUserId: input.actor.id,
         deliveryAdminId: input.deliveryAdminId,
-        apiKey: input.apiKey,
+        apiKey: apiKey ?? undefined,
         now,
       },
       executor,
@@ -314,6 +326,7 @@ export async function createManagedServiceUser(
           contractId,
           entitlementStatus: "active",
           deliveryAdminId: input.deliveryAdminId,
+          apiKeyConfigured: Boolean(apiKey),
           quotaPeriodCount: quotaPeriods.length,
         },
       },

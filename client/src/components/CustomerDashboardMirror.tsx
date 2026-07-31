@@ -20,6 +20,7 @@ import KnowledgeBaseProgressPanel from "@/components/KnowledgeBaseProgressPanel"
 import KnowledgeBaseViewer, {
   type KnowledgeSnapshotView,
 } from "@/components/KnowledgeBaseViewer";
+import MarkdownRenderer from "@/components/MarkdownRenderer";
 import AiWebsiteManagementWorkspace from "@/dashboard/AiWebsiteManagementWorkspace";
 import ProgressReportWorkspace from "@/dashboard/ProgressReportWorkspace";
 import QuestionMonitoringWorkspace from "@/dashboard/QuestionMonitoringWorkspace";
@@ -116,10 +117,7 @@ type CustomerDashboardMirrorProps = {
         tickets: PublicDeliveryTicketSummary[];
       })
     | null;
-  knowledgePreview?: {
-    progress?: KnowledgeBaseProgressDto | null;
-    snapshot?: KnowledgeSnapshotView | null;
-  } | null;
+  knowledgePreview?: CustomerKnowledgePreview | null;
   initialSection?: CustomerDashboardMirrorSection;
   allowedSections?: readonly CustomerDashboardMirrorSection[];
   heading?: string;
@@ -127,6 +125,40 @@ type CustomerDashboardMirrorProps = {
   editActions?: ReactNode;
   renderSectionActions?: (section: CustomerDashboardMirrorSection) => ReactNode;
   statusLabel?: string;
+};
+
+export type CustomerKnowledgeActivity = {
+  build: {
+    companyName: string;
+    conversationId: string;
+    status: string;
+    protocolError?: string | null;
+  } | null;
+  turns: Array<{
+    id: string | number;
+    model?: string | null;
+    status: string;
+    durationMs?: number | null;
+    errorMessage?: string | null;
+  }>;
+  messages: Array<{
+    id: string | number;
+    role: string;
+    content: string;
+    sentAt?: number | string | Date | null;
+  }>;
+};
+
+export type CustomerKnowledgePreview = {
+  progress?: KnowledgeBaseProgressDto | null;
+  snapshot?: KnowledgeSnapshotView | null;
+  activity?: CustomerKnowledgeActivity | null;
+  activityLoading?: boolean;
+  activityError?: string | null;
+  progressLoading?: boolean;
+  progressError?: string | null;
+  snapshotLoading?: boolean;
+  snapshotError?: string | null;
 };
 
 export default function CustomerDashboardMirror({
@@ -372,12 +404,31 @@ function CustomerDashboardSection({
   }
 
   if (section === "knowledge-build") {
-    return knowledgePreview?.progress ? (
-      <section className="page-shell">
-        <KnowledgeBaseProgressPanel
-          progress={knowledgePreview.progress}
-          title="知识库构建进度"
+    return knowledgePreview?.progress ||
+      knowledgePreview?.activity ||
+      knowledgePreview?.activityLoading ||
+      knowledgePreview?.activityError ||
+      knowledgePreview?.progressLoading ||
+      knowledgePreview?.progressError ? (
+      <section className="page-shell space-y-5">
+        <KnowledgeActivityPanel
+          activity={knowledgePreview.activity}
+          loading={knowledgePreview.activityLoading}
+          error={knowledgePreview.activityError}
         />
+        {knowledgePreview.progressError ? (
+          <MirrorError
+            title="知识库构建进度读取失败"
+            message={knowledgePreview.progressError}
+          />
+        ) : (
+          <KnowledgeBaseProgressPanel
+            progress={knowledgePreview.progress}
+            loading={knowledgePreview.progressLoading}
+            title="客户知识库构建进度"
+            emptyMessage="该客户尚未开始对话式知识库构建；官网导入的一次性知识库不会伪造节点进度。"
+          />
+        )}
       </section>
     ) : (
       <MirrorEmpty title="知识库智能体" />
@@ -385,10 +436,20 @@ function CustomerDashboardSection({
   }
 
   if (section === "knowledge") {
-    return knowledgePreview?.snapshot ? (
+    return knowledgePreview?.snapshotError ? (
+      <section className="page-shell">
+        <MirrorError
+          title="知识库展示版本读取失败"
+          message={knowledgePreview.snapshotError}
+        />
+      </section>
+    ) : knowledgePreview?.snapshot || knowledgePreview?.snapshotLoading ? (
       <section className="page-shell">
         <div className="overflow-hidden rounded-2xl border border-[#e5ddea] bg-white p-4 sm:p-6">
-          <KnowledgeBaseViewer snapshot={knowledgePreview.snapshot} />
+          <KnowledgeBaseViewer
+            snapshot={knowledgePreview.snapshot}
+            loading={knowledgePreview.snapshotLoading}
+          />
         </div>
       </section>
     ) : (
@@ -467,6 +528,151 @@ function CustomerDashboardSection({
   ) : (
     <MirrorEmpty title="内容资产运营" />
   );
+}
+
+function KnowledgeActivityPanel({
+  activity,
+  loading,
+  error,
+}: {
+  activity?: CustomerKnowledgeActivity | null;
+  loading?: boolean;
+  error?: string | null;
+}) {
+  if (error) {
+    return <MirrorError title="知识库任务记录读取失败" message={error} />;
+  }
+  if (loading) {
+    return (
+      <div className="rounded-2xl border border-[#e5ddea] bg-white p-6 text-sm text-[#716a80]">
+        正在读取知识库任务与对话…
+      </div>
+    );
+  }
+  if (!activity?.build) {
+    return (
+      <div className="rounded-2xl border border-[#e5ddea] bg-white p-6 text-sm text-[#716a80]">
+        该客户尚未开始对话式知识库构建。
+      </div>
+    );
+  }
+
+  return (
+    <div className="overflow-hidden rounded-2xl border border-[#e5ddea] bg-white">
+      <div className="border-b border-[#eee8f2] p-5 sm:p-6">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <p className="text-xs font-semibold text-[#5b2a86]">
+              当前知识库构建
+            </p>
+            <h3 className="mt-1 font-semibold text-[#171321]">
+              {activity.build.companyName}
+            </h3>
+            <p className="mt-2 break-all font-mono text-xs text-[#9a94a8]">
+              {activity.build.conversationId}
+            </p>
+          </div>
+          <span className="w-fit rounded-full bg-[#5b2a86]/10 px-2.5 py-1 text-xs font-semibold text-[#5b2a86]">
+            {activity.build.status}
+          </span>
+        </div>
+        {activity.build.protocolError && (
+          <div className="mt-4 rounded-xl border border-[#ebc8d4] bg-[#fff8fa] p-3 text-sm leading-6 text-[#a02652]">
+            {activity.build.protocolError}
+          </div>
+        )}
+      </div>
+      <div className="grid gap-0 xl:grid-cols-[360px_minmax(0,1fr)]">
+        <div className="border-b border-[#eee8f2] p-5 xl:border-b-0 xl:border-r">
+          <h4 className="text-sm font-semibold text-[#332842]">执行任务</h4>
+          {activity.turns.length ? (
+            <div className="mt-3 max-h-[430px] space-y-2 overflow-y-auto custom-scrollbar">
+              {activity.turns.map((turn) => (
+                <article
+                  key={turn.id}
+                  className="rounded-xl border border-[#e8e1ee] bg-[#fbf9fd] p-3"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs font-semibold text-[#484057]">
+                      {turn.model || "模型未记录"}
+                    </span>
+                    <span className="text-xs text-[#857e91]">
+                      {turn.status}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xs text-[#857e91]">
+                    {displayDuration(turn.durationMs)}
+                  </p>
+                  {turn.errorMessage && (
+                    <p className="mt-2 text-xs leading-5 text-[#a02652]">
+                      {turn.errorMessage}
+                    </p>
+                  )}
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-3 text-sm text-[#716a80]">暂无执行任务记录。</p>
+          )}
+        </div>
+        <div className="p-5">
+          <h4 className="text-sm font-semibold text-[#332842]">最近对话</h4>
+          {activity.messages.length ? (
+            <div className="mt-3 max-h-[520px] space-y-3 overflow-y-auto pr-1 custom-scrollbar">
+              {activity.messages.map((message) => (
+                <article
+                  key={message.id}
+                  className={`rounded-2xl border p-4 ${
+                    message.role === "user"
+                      ? "border-[#ddd1e5] bg-[#f7f1fb]"
+                      : "border-[#e8e1ee] bg-white"
+                  }`}
+                >
+                  <div className="mb-2 flex items-center justify-between gap-3 text-xs font-semibold text-[#857e91]">
+                    <span>
+                      {message.role === "user"
+                        ? "用户"
+                        : message.role === "assistant"
+                          ? "Agent"
+                          : message.role}
+                    </span>
+                    <span>
+                      {message.sentAt
+                        ? new Date(message.sentAt).toLocaleString("zh-CN")
+                        : "时间未记录"}
+                    </span>
+                  </div>
+                  <div className="text-sm leading-6 text-[#484057]">
+                    <MarkdownRenderer content={message.content} />
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-3 text-sm text-[#716a80]">暂无持久化对话记录。</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MirrorError({ title, message }: { title: string; message: string }) {
+  return (
+    <div className="rounded-2xl border border-[#ebc8d4] bg-[#fff8fa] p-6 text-sm text-[#a02652]">
+      <p className="font-semibold">{title}</p>
+      <p className="mt-1 leading-6">{message || "请刷新后重试。"}</p>
+    </div>
+  );
+}
+
+function displayDuration(value?: number | null) {
+  if (!Number.isFinite(value) || (value ?? 0) < 0) return "执行中或未记录";
+  const seconds = Math.round((value ?? 0) / 1_000);
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes} 分 ${remainder} 秒`;
 }
 
 function MirrorEmpty({ title }: { title: string }) {

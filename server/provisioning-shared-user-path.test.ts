@@ -399,7 +399,6 @@ describe("shared Admin and website user creation path", () => {
       planCode: "luxury",
       marketEdition: "overseas",
       deliveryAdminId: 12_345,
-      apiKey: "sk-delivery-customer-credential-000001",
     });
 
     expect(result).toMatchObject({

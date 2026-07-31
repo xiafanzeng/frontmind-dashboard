@@ -62,6 +62,7 @@ import {
 } from "../upstream-config";
 import { createPaymentReceiptLedgerService } from "../payment-receipt-ledger-service";
 import { createProjectOrderRegistryService } from "../project-order-registry-service";
+import knowledgeBaseLivePreviewApi from "../knowledge-base-live-preview-api";
 
 const paymentReceiptLedgerReadiness = createPaymentReceiptLedgerService();
 const projectOrderRegistryReadiness = createProjectOrderRegistryService();
@@ -135,6 +136,10 @@ async function startServer() {
   // JSON/form payloads keep a bounded parser.
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+  if (process.env.NODE_ENV === "development") {
+    app.use("/api/dev/knowledge-base-live", knowledgeBaseLivePreviewApi);
+  }
 
   app.get("/healthz", async (_req, res) => {
     try {

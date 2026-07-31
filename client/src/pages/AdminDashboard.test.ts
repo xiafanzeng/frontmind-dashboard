@@ -6,7 +6,6 @@ import { describe, expect, it } from "vitest";
 import {
   adminNav,
   buildDeliveryEngineerStatusRows,
-  canCreateCustomerFromDashboard,
   channelDistributionUrl,
   filterApiKeyUsageForAdmin,
   filterPreviewApiKeyUsageForAdmin,
@@ -168,26 +167,25 @@ describe("administrator channel navigation", () => {
     );
   });
 
-  it("allows system and delivery administrators to create customer accounts", () => {
-    expect(canCreateCustomerFromDashboard(false)).toBe(true);
-    expect(canCreateCustomerFromDashboard(true)).toBe(true);
-  });
-
-  it("uses a concise delivery overview with toolbar actions and no marketing banner", () => {
+  it("uses a concise delivery overview without duplicate toolbar actions", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminDashboard.tsx"),
       "utf8",
     );
     expect(source).toContain('title="交付总览"');
-    expect(source).toContain("打开客户交付工作台");
-    expect(source).toContain("创建客户");
+    expect(source).not.toContain("打开客户交付工作台");
+    expect(source).not.toContain(">创建客户<");
     expect(source).toContain("管理员自用 Agent 积分");
+    expect(source).toContain("统一 API Key 管理");
+    expect(source).toContain("客户、交付管理员和工程师使用同一套管理入口");
+    expect(source).toContain("Key 总额");
     expect(source).not.toContain("管理员通用 Agent");
     expect(source).not.toContain("从客户签约到交付验收的统一工作台");
     expect(source).not.toContain(
       "套餐权益、知识库流程、选题、应答逻辑、问题监控",
     );
     expect(source).toContain("工程师状态");
+    expect(source).not.toContain("交付工单总览");
     expect(source).not.toContain("四角色交付状态");
     expect(source).not.toContain("stats?.pendingAssignment");
   });
@@ -360,6 +358,33 @@ describe("administrator channel navigation", () => {
   it("keeps delivery administrators separate even when they share one upstream Key", () => {
     const hierarchy = normalizeUsageHierarchy({
       period: { label: "2026 年 7 月" },
+      engineers: [
+        {
+          engineerId: 21,
+          displayName: "工程师一组",
+          apiKeyConfigured: true,
+          apiKeyVersion: 3,
+          keyTotalUsed: 900,
+          ownAgentMonthUsed: 240,
+          otherOrUnattributedUsed: 660,
+          syncStatus: "ok",
+        },
+      ],
+      customers: [
+        {
+          userId: 101,
+          enterpriseName: "甲公司",
+          deliveryAdminId: 11,
+          deliveryAdminName: "交付一组",
+          apiKeyConfigured: false,
+          apiKeyVersion: 2,
+          usesInheritedKey: true,
+          keyTotalUsed: 1_000,
+          ownAgentMonthUsed: 300,
+          otherOrUnattributedUsed: 700,
+          syncStatus: "ok",
+        },
+      ],
       managers: [
         {
           adminId: 11,
@@ -401,6 +426,22 @@ describe("administrator channel navigation", () => {
     expect(
       hierarchy.managers.map((manager) => manager.keyPool.totalUsed),
     ).toEqual([1_000, 1_000]);
+    expect(hierarchy.engineers[0]).toMatchObject({
+      engineerId: 21,
+      apiKeyConfigured: true,
+      apiKeyVersion: 3,
+      keyTotalUsed: 900,
+      ownAgentMonthUsed: 240,
+    });
+    expect(hierarchy.customers[0]).toMatchObject({
+      userId: 101,
+      deliveryAdminName: "交付一组",
+      apiKeyConfigured: false,
+      apiKeyVersion: 2,
+      usesInheritedKey: true,
+      keyTotalUsed: 1_000,
+      ownAgentMonthUsed: 300,
+    });
   });
 
   it("does not expose another manager's preview tickets to a delivery administrator", () => {

@@ -69,6 +69,7 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("FRONTMIND_KB_PROGRESS");
     expect(prompt).toContain("FRONTMIND_KB_PRESENTATION");
     expect(prompt).toContain("FRONTMIND_KB_REOPEN");
+    expect(prompt).toContain("禁止输出 SOCRATIC_KB_STATE");
     expect(prompt).toContain("补充、修订、问题或上传资料");
     expect(prompt).toContain("to 必须为 needs_verification");
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
@@ -421,6 +422,49 @@ describe("knowledge base execution contract", () => {
     ).toBe(true);
     expect(
       shouldReconcileKnowledgeOutput(transitionOnly, "completed", {
+        requirePresentation: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("reconciles a complete bare-JSON protocol while the task is still running", () => {
+    const bareManifest = [
+      {
+        id: "raw-manifest",
+        role: "assistant",
+        type: "message",
+        content: JSON.stringify({
+          kind: "frontmind.knowledge-base.manifest",
+          schemaVersion: 1,
+          leaves: [],
+        }),
+      },
+    ];
+    const bareTransition = [
+      {
+        id: "raw-transition",
+        role: "assistant",
+        type: "message",
+        content: [
+          JSON.stringify({
+            kind: "frontmind.knowledge-base.progress",
+            schemaVersion: 1,
+          }),
+          JSON.stringify({
+            kind: "frontmind.knowledge-base.presentation",
+            schemaVersion: 1,
+          }),
+        ].join("\n"),
+      },
+    ];
+
+    expect(
+      shouldReconcileKnowledgeOutput(bareManifest, "running", {
+        requirePresentation: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldReconcileKnowledgeOutput(bareTransition, "running", {
         requirePresentation: true,
       }),
     ).toBe(true);

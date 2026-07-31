@@ -11,8 +11,10 @@ import {
   listDeliveryRoleManagement,
   listMyProjectAssignments,
   publishWebsiteStyleSamples,
+  revokeDeliveryAdminCredential,
   setDeliveryMemberCredential,
   revokeDeliveryMemberCredential,
+  setDeliveryAdminCredential,
   setProjectEngineer,
   updateMyDeliveryTicket,
   urgeDeliveryTicket,
@@ -99,6 +101,37 @@ export const deliveryRoleRouter = router({
             actor: ctx.user,
             memberUserId: input.engineerUserId,
             expectedVersion: input.expectedVersion,
+          }),
+        ),
+      ),
+    setDeliveryAdminApiKey: adminProcedure
+      .input(
+        z.object({
+          adminUserId: z.number().int().positive(),
+          apiKey: z.string().trim().min(8).max(4096),
+          expectedVersion: z.number().int().nonnegative(),
+        }),
+      )
+      .mutation(({ ctx, input }) =>
+        serviceCall(() =>
+          setDeliveryAdminCredential({
+            actor: ctx.user,
+            ...input,
+          }),
+        ),
+      ),
+    revokeDeliveryAdminApiKey: adminProcedure
+      .input(
+        z.object({
+          adminUserId: z.number().int().positive(),
+          expectedVersion: z.number().int().nonnegative(),
+        }),
+      )
+      .mutation(({ ctx, input }) =>
+        serviceCall(() =>
+          revokeDeliveryAdminCredential({
+            actor: ctx.user,
+            ...input,
           }),
         ),
       ),

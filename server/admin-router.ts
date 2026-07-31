@@ -271,6 +271,7 @@ export function managedMonitoringCitationSummaryValue(input: {
 export const adminRouter = router({
   apiKeyUsageAlerts: router({
     hierarchy: adminProcedure.query(async ({ ctx }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await getAdminApiUsageHierarchy(ctx.user);
       } catch (error) {
@@ -278,6 +279,7 @@ export const adminRouter = router({
       }
     }),
     overview: adminProcedure.query(async ({ ctx }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await getApiUsageAlertOverview(ctx.user);
       } catch (error) {
@@ -285,6 +287,7 @@ export const adminRouter = router({
       }
     }),
     sync: adminProcedure.mutation(async ({ ctx }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await syncApiUsageSnapshots(ctx.user);
       } catch (error) {
@@ -1053,6 +1056,7 @@ export const adminRouter = router({
     credentialStatus: adminProcedure
       .input(z.object({ userId: z.number().int().positive() }))
       .query(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await getManagedCredentialStatus(ctx.user, input.userId);
         } catch (error) {
@@ -1126,6 +1130,7 @@ export const adminRouter = router({
     creditUsage: adminProcedure
       .input(z.object({ userId: z.number().int().positive() }))
       .query(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
         try {
           return await getManagedUserCreditUsage(ctx.user, input.userId);
         } catch (error) {
@@ -1521,7 +1526,7 @@ export const adminRouter = router({
             planCode: provisionableServicePlanCodeSchema,
             marketEdition: accountMarketEditionSchema,
             deliveryAdminId: z.number().int().positive(),
-            apiKey: presalesApiKeySchema,
+            apiKey: presalesApiKeySchema.optional(),
           }),
           z.object({
             username: usernameSchema,

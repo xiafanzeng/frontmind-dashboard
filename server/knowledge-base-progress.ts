@@ -1,3 +1,5 @@
+import { extractKnowledgeBaseProtocolObjects } from "../shared/knowledge-base-output";
+
 export const KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES = 8;
 export const KNOWLEDGE_BASE_MANIFEST_MAX_LEAVES = 115;
 export const KNOWLEDGE_BASE_PROGRESS_KIND = "frontmind.knowledge-base.progress";
@@ -327,6 +329,54 @@ function parseManifestEnvelopeObject(
   };
 }
 
+function parseProtocolEnvelopeText<T>(
+  input: string,
+  options: {
+    marker: string;
+    kind: string;
+    code: "INVALID_MANIFEST" | "INVALID_ENVELOPE";
+    label: string;
+    parseObject: (value: unknown) => T;
+  },
+): T {
+  const markerPattern = new RegExp(
+    `<!--\\s*${options.marker}\\s*([\\s\\S]*?)-->`,
+    "g",
+  );
+  const markerMatches = [...input.matchAll(markerPattern)];
+  const rawMatches = extractKnowledgeBaseProtocolObjects(input).filter(
+    (value) => value.kind === options.kind,
+  );
+  if (markerMatches.length > 1) {
+    fail(
+      options.code,
+      `Model output must contain exactly one ${options.marker} envelope`,
+    );
+  }
+  if (markerMatches.length === 1) {
+    if (rawMatches.length > 1) {
+      fail(
+        options.code,
+        `Model output must contain exactly one ${options.marker} envelope`,
+      );
+    }
+    try {
+      return options.parseObject(JSON.parse(markerMatches[0]![1]!.trim()));
+    } catch (error) {
+      if (error instanceof KnowledgeBaseProgressError) throw error;
+      fail(options.code, `${options.label} envelope contains invalid JSON`);
+    }
+  }
+
+  if (rawMatches.length !== 1) {
+    fail(
+      options.code,
+      `Model output must contain exactly one ${options.marker} envelope`,
+    );
+  }
+  return options.parseObject(rawMatches[0]);
+}
+
 /** Parses the one production manifest emitted after the research phase. */
 export function parseKnowledgeBaseManifestEnvelope(
   input: unknown,
@@ -334,23 +384,13 @@ export function parseKnowledgeBaseManifestEnvelope(
   if (typeof input !== "string") {
     return parseManifestEnvelopeObject(input);
   }
-  const markerPattern = new RegExp(
-    `<!--\\s*${KNOWLEDGE_BASE_MANIFEST_MARKER}\\s*([\\s\\S]*?)-->`,
-    "g",
-  );
-  const matches = [...input.matchAll(markerPattern)];
-  if (matches.length !== 1) {
-    fail(
-      "INVALID_MANIFEST",
-      `Model output must contain exactly one ${KNOWLEDGE_BASE_MANIFEST_MARKER} envelope`,
-    );
-  }
-  try {
-    return parseManifestEnvelopeObject(JSON.parse(matches[0][1].trim()));
-  } catch (error) {
-    if (error instanceof KnowledgeBaseProgressError) throw error;
-    fail("INVALID_MANIFEST", "Manifest envelope contains invalid JSON");
-  }
+  return parseProtocolEnvelopeText(input, {
+    marker: KNOWLEDGE_BASE_MANIFEST_MARKER,
+    kind: KNOWLEDGE_BASE_MANIFEST_KIND,
+    code: "INVALID_MANIFEST",
+    label: "Manifest",
+    parseObject: parseManifestEnvelopeObject,
+  });
 }
 
 export function formatKnowledgeBaseManifestEnvelope(
@@ -405,23 +445,13 @@ export function parseKnowledgeBaseReopenEnvelope(
   input: unknown,
 ): KnowledgeBaseReopenEnvelope {
   if (typeof input !== "string") return parseReopenEnvelopeObject(input);
-  const markerPattern = new RegExp(
-    `<!--\\s*${KNOWLEDGE_BASE_REOPEN_MARKER}\\s*([\\s\\S]*?)-->`,
-    "g",
-  );
-  const matches = [...input.matchAll(markerPattern)];
-  if (matches.length !== 1) {
-    fail(
-      "INVALID_ENVELOPE",
-      `Model output must contain exactly one ${KNOWLEDGE_BASE_REOPEN_MARKER} envelope`,
-    );
-  }
-  try {
-    return parseReopenEnvelopeObject(JSON.parse(matches[0][1].trim()));
-  } catch (error) {
-    if (error instanceof KnowledgeBaseProgressError) throw error;
-    fail("INVALID_ENVELOPE", "Reopen envelope contains invalid JSON");
-  }
+  return parseProtocolEnvelopeText(input, {
+    marker: KNOWLEDGE_BASE_REOPEN_MARKER,
+    kind: KNOWLEDGE_BASE_REOPEN_KIND,
+    code: "INVALID_ENVELOPE",
+    label: "Reopen",
+    parseObject: parseReopenEnvelopeObject,
+  });
 }
 
 export function formatKnowledgeBaseReopenEnvelope(
@@ -537,23 +567,13 @@ export function parseKnowledgeBasePresentationEnvelope(
   if (typeof input !== "string") {
     return parsePresentationEnvelopeObject(input);
   }
-  const markerPattern = new RegExp(
-    `<!--\\s*${KNOWLEDGE_BASE_PRESENTATION_MARKER}\\s*([\\s\\S]*?)-->`,
-    "g",
-  );
-  const matches = [...input.matchAll(markerPattern)];
-  if (matches.length !== 1) {
-    fail(
-      "INVALID_ENVELOPE",
-      `Model output must contain exactly one ${KNOWLEDGE_BASE_PRESENTATION_MARKER} envelope`,
-    );
-  }
-  try {
-    return parsePresentationEnvelopeObject(JSON.parse(matches[0][1].trim()));
-  } catch (error) {
-    if (error instanceof KnowledgeBaseProgressError) throw error;
-    fail("INVALID_ENVELOPE", "Presentation envelope contains invalid JSON");
-  }
+  return parseProtocolEnvelopeText(input, {
+    marker: KNOWLEDGE_BASE_PRESENTATION_MARKER,
+    kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
+    code: "INVALID_ENVELOPE",
+    label: "Presentation",
+    parseObject: parsePresentationEnvelopeObject,
+  });
 }
 
 export function formatKnowledgeBasePresentationEnvelope(
@@ -785,32 +805,13 @@ export function parseKnowledgeBaseProgressEnvelope(
   if (typeof input !== "string") {
     return parseEnvelopeObject(input);
   }
-
-  const markerPattern = new RegExp(
-    `<!--\\s*${KNOWLEDGE_BASE_PROGRESS_MARKER}\\s*([\\s\\S]*?)-->`,
-    "g",
-  );
-  const matches = [...input.matchAll(markerPattern)];
-  if (matches.length > 1) {
-    fail(
-      "INVALID_ENVELOPE",
-      "Model output must contain at most one progress envelope",
-    );
-  }
-
-  const serialized = matches.length === 1 ? matches[0][1].trim() : input.trim();
-  if (!serialized) {
-    fail("INVALID_ENVELOPE", "Progress envelope JSON is empty");
-  }
-
-  try {
-    return parseEnvelopeObject(JSON.parse(serialized));
-  } catch (error) {
-    if (error instanceof KnowledgeBaseProgressError) {
-      throw error;
-    }
-    fail("INVALID_ENVELOPE", "Progress envelope contains invalid JSON");
-  }
+  return parseProtocolEnvelopeText(input, {
+    marker: KNOWLEDGE_BASE_PROGRESS_MARKER,
+    kind: KNOWLEDGE_BASE_PROGRESS_KIND,
+    code: "INVALID_ENVELOPE",
+    label: "Progress",
+    parseObject: parseEnvelopeObject,
+  });
 }
 
 export function formatKnowledgeBaseProgressEnvelope(

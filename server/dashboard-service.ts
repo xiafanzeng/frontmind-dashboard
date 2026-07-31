@@ -209,19 +209,12 @@ export function assertManagedCredentialMutationAccess(
     AuthenticatedUser,
     "id" | "role" | "username" | "adminAccessLevel"
   >,
-  deliveryAdminId: number | null | undefined,
+  _deliveryAdminId: number | null | undefined,
 ) {
   if (isSystemAdmin(actor)) return;
-  if (
-    actor.role === "admin" &&
-    actor.adminAccessLevel === "delivery_admin" &&
-    deliveryAdminId === actor.id
-  ) {
-    return;
-  }
   throw new AuthServiceError(
     "INVALID_CREDENTIAL",
-    "只有客户主负责人或系统管理员可以管理客户 Key",
+    "客户 API Key 仅由系统管理员统一维护",
   );
 }
 
@@ -1286,10 +1279,14 @@ export async function listManagedWorkspaceUsers(actor: AuthenticatedUser) {
           : null,
         credential: {
           configured: Boolean(credential),
-          fingerprint: credential?.fingerprint ?? null,
-          status: credential?.validationStatus ?? null,
-          verifiedAt: credential?.verifiedAt?.getTime() ?? null,
-          inherited: Boolean(!directCredential && usageOwner),
+          fingerprint: systemAdmin ? (credential?.fingerprint ?? null) : null,
+          status: systemAdmin ? (credential?.validationStatus ?? null) : null,
+          verifiedAt: systemAdmin
+            ? (credential?.verifiedAt?.getTime() ?? null)
+            : null,
+          inherited: systemAdmin
+            ? Boolean(!directCredential && usageOwner)
+            : false,
         },
       };
     }),
@@ -1474,25 +1471,8 @@ export async function replaceManagedUserCredential(input: {
   apiKey: string;
   reason?: string;
 }) {
-  if (input.actor.role !== "admin") {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "只有管理员可以维护用户 API Key",
-    );
-  }
+  assertManagedCredentialMutationAccess(input.actor, null);
   await assertWorkspaceAccess(input.actor, input.userId);
-  if (!isSystemAdmin(input.actor)) {
-    const db = await requireDb();
-    const owners = await db
-      .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-      .from(userUsageOwners)
-      .where(eq(userUsageOwners.userId, input.userId))
-      .limit(1);
-    assertManagedCredentialMutationAccess(
-      input.actor,
-      owners[0]?.deliveryAdminId,
-    );
-  }
   const credential = await replaceApiCredential(input.userId, input.apiKey);
   await writeWorkspaceAuditEvent({
     actor: input.actor,
@@ -1514,25 +1494,8 @@ export async function deleteManagedUserCredential(input: {
   userId: number;
   reason?: string;
 }) {
-  if (input.actor.role !== "admin") {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "只有管理员可以维护用户 API Key",
-    );
-  }
+  assertManagedCredentialMutationAccess(input.actor, null);
   await assertWorkspaceAccess(input.actor, input.userId);
-  if (!isSystemAdmin(input.actor)) {
-    const db = await requireDb();
-    const owners = await db
-      .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-      .from(userUsageOwners)
-      .where(eq(userUsageOwners.userId, input.userId))
-      .limit(1);
-    assertManagedCredentialMutationAccess(
-      input.actor,
-      owners[0]?.deliveryAdminId,
-    );
-  }
   await deleteActiveApiCredential(input.userId);
   await writeWorkspaceAuditEvent({
     actor: input.actor,
@@ -1913,21 +1876,13 @@ export async function getManagedUserCreditUsage(
   userId: number,
   _windowDays = 30,
 ) {
-  await assertWorkspaceAccess(actor, userId);
   if (!isSystemAdmin(actor)) {
-    const db = await requireDb();
-    const owners = await db
-      .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-      .from(userUsageOwners)
-      .where(eq(userUsageOwners.userId, userId))
-      .limit(1);
-    if (owners[0] && owners[0].deliveryAdminId !== actor.id) {
-      throw new AuthServiceError(
-        "INVALID_CREDENTIAL",
-        "只有该用户的积分与 Key 归属管理员可以查看本月积分",
-      );
-    }
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "客户 Key 与积分仅由系统管理员查看",
+    );
   }
+  await assertWorkspaceAccess(actor, userId);
   return getAccountMonthlyCreditUsage(userId);
 }
 

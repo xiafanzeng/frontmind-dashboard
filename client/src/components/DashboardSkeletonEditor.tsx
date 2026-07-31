@@ -29,9 +29,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import CustomerDashboardMirror, {
+  type CustomerKnowledgePreview,
   type CustomerDashboardMirrorSection,
 } from "@/components/CustomerDashboardMirror";
-import type { KnowledgeSnapshotView } from "@/components/KnowledgeBaseViewer";
 import { trpc } from "@/lib/trpc";
 import {
   createDashboardModuleTemplateMetadata,
@@ -41,7 +41,6 @@ import {
   type DashboardModuleImportPreview,
   type DashboardPayload,
 } from "@shared/dashboard";
-import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import type {
   PublicDeliveryTicketSummary,
   PublicDeliveryTicketWorkspaceMetadata,
@@ -72,10 +71,7 @@ type DashboardSkeletonEditorProps = {
   userId: number;
   workspace?: DashboardWorkspaceSnapshot;
   loading?: boolean;
-  knowledgePreview?: {
-    progress?: KnowledgeBaseProgressDto | null;
-    snapshot?: KnowledgeSnapshotView | null;
-  } | null;
+  knowledgePreview?: CustomerKnowledgePreview | null;
   websiteWorkspace?:
     | (PublicDeliveryTicketWorkspaceMetadata & {
         tickets: PublicDeliveryTicketSummary[];

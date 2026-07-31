@@ -45,7 +45,10 @@ import {
   validateUpstreamApiKey,
   type AuthenticatedUser,
 } from "./auth-service";
-import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
+import {
+  hasSystemAdminAccess,
+  writeWorkspaceAuditEvent,
+} from "./admin-control-plane-service";
 import { getLatestKnowledgeSnapshot } from "./dashboard-service";
 import { getDb } from "./db";
 import { getDeliveryTicketWorkspace } from "./delivery-ticket-service";
@@ -75,6 +78,15 @@ function requireDeliveryManager(actor: AuthenticatedUser) {
   }
 }
 
+function requireSystemAdminCredentialManagement(actor: AuthenticatedUser) {
+  if (!hasSystemAdminAccess(actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "API Key 仅由系统管理员统一维护",
+    );
+  }
+}
+
 export function decideEngineerCredentialManagementScope(input: {
   systemAdmin: boolean;
   actorUserId: number;
@@ -91,40 +103,9 @@ export function decideEngineerCredentialManagementScope(input: {
   if (input.systemAdmin) {
     return { manageable: true, reason: null, managerAdminIds };
   }
-  if (
-    input.assignmentAdminIds.length > 0 &&
-    input.assignmentAdminIds.some((id) => id === null)
-  ) {
-    return {
-      manageable: false,
-      reason:
-        "该工程师存在尚未明确交付管理员归属的客户，Key 由系统管理员维护。",
-      managerAdminIds,
-    };
-  }
-  if (managerAdminIds.length > 1) {
-    return {
-      manageable: false,
-      reason: "该工程师同时服务多个交付管理员的客户，Key 由系统管理员维护。",
-      managerAdminIds,
-    };
-  }
-  if (managerAdminIds.length === 1) {
-    return {
-      manageable: managerAdminIds[0] === input.actorUserId,
-      reason:
-        managerAdminIds[0] === input.actorUserId
-          ? null
-          : "该工程师当前不属于你的客户项目。",
-      managerAdminIds,
-    };
-  }
   return {
-    manageable: input.createdByAdminId === input.actorUserId,
-    reason:
-      input.createdByAdminId === input.actorUserId
-        ? null
-        : "该未分配工程师不是由当前交付管理员创建。",
+    manageable: false,
+    reason: "工程师 API Key 仅由系统管理员统一维护，避免跨项目 Key 归属冲突。",
     managerAdminIds,
   };
 }
@@ -353,7 +334,14 @@ export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
   const activeTickets = statisticsTickets.filter((ticket) =>
     ACTIVE_DELIVERY_STATUSES.includes(ticket.status as any),
   );
-  const ticketEvents = activeTickets.length
+  const completedTickets = statisticsTickets.filter(
+    (ticket) => ticket.status === "completed",
+  );
+  const terminalTickets = statisticsTickets.filter((ticket) =>
+    ["completed", "rejected", "cancelled"].includes(ticket.status),
+  );
+  const dispatchTicketIds = activeTickets.map((ticket) => ticket.id);
+  const ticketEvents = dispatchTicketIds.length
     ? await db
         .select({
           id: deliveryTicketEvents.id,
@@ -367,12 +355,7 @@ export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
           createdAt: deliveryTicketEvents.createdAt,
         })
         .from(deliveryTicketEvents)
-        .where(
-          inArray(
-            deliveryTicketEvents.ticketId,
-            activeTickets.map((ticket) => ticket.id),
-          ),
-        )
+        .where(inArray(deliveryTicketEvents.ticketId, dispatchTicketIds))
         .orderBy(desc(deliveryTicketEvents.createdAt))
     : [];
   const adminById = new Map(adminRows.map((admin) => [admin.id, admin]));
@@ -516,6 +499,8 @@ export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
     assignments,
     engineers: enrichedEngineers,
     tickets: activeTickets,
+    completedTickets,
+    terminalTickets,
     ticketEvents,
     roleStats,
   };
@@ -538,6 +523,9 @@ export async function createDeliveryEngineer(input: {
 }) {
   requireDeliveryManager(input.actor);
   const apiKey = input.apiKey?.trim() || null;
+  if (apiKey) {
+    requireSystemAdminCredentialManagement(input.actor);
+  }
   if (apiKey) await validateUpstreamApiKey(apiKey);
   const db = await requireDb();
   return db.transaction(async (tx) => {
@@ -3173,6 +3161,7 @@ export async function setDeliveryMemberCredential(input: {
   expectedVersion: number;
 }) {
   requireDeliveryManager(input.actor);
+  requireSystemAdminCredentialManagement(input.actor);
   await validateUpstreamApiKey(input.apiKey);
   const db = await requireDb();
   return db.transaction(async (tx) => {
@@ -3228,6 +3217,7 @@ export async function revokeDeliveryMemberCredential(input: {
   expectedVersion: number;
 }) {
   requireDeliveryManager(input.actor);
+  requireSystemAdminCredentialManagement(input.actor);
   const db = await requireDb();
   return db.transaction(async (tx) => {
     const scope = await requireEngineerCredentialManagement({
@@ -3270,6 +3260,141 @@ export async function revokeDeliveryMemberCredential(input: {
           configured: false,
           managerAdminIds: scope.managerAdminIds,
           affectedCustomerUserIds: scope.customerUserIds,
+        },
+      },
+      tx,
+    );
+    return { success: true as const };
+  });
+}
+
+async function requireDeliveryAdminCredentialTarget(input: {
+  executor: any;
+  adminUserId: number;
+}) {
+  const rows = await input.executor
+    .select({
+      id: users.id,
+      role: users.role,
+      adminAccessLevel: users.adminAccessLevel,
+    })
+    .from(users)
+    .where(eq(users.id, input.adminUserId))
+    .limit(1)
+    .for("update");
+  const target = rows[0];
+  if (
+    !target ||
+    target.role !== "admin" ||
+    target.adminAccessLevel !== "delivery_admin"
+  ) {
+    throw new AuthServiceError("NOT_FOUND", "交付管理员不存在");
+  }
+  return target;
+}
+
+export async function setDeliveryAdminCredential(input: {
+  actor: AuthenticatedUser;
+  adminUserId: number;
+  apiKey: string;
+  expectedVersion: number;
+}) {
+  requireDeliveryManager(input.actor);
+  requireSystemAdminCredentialManagement(input.actor);
+  await validateUpstreamApiKey(input.apiKey);
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    await requireDeliveryAdminCredentialTarget({
+      executor: tx,
+      adminUserId: input.adminUserId,
+    });
+    const credentialRows = await tx
+      .select()
+      .from(apiCredentials)
+      .where(eq(apiCredentials.userId, input.adminUserId))
+      .orderBy(desc(apiCredentials.version))
+      .limit(1)
+      .for("update");
+    const latest = credentialRows[0];
+    const actualVersion = latest?.version ?? 0;
+    if (actualVersion !== input.expectedVersion) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "交付管理员 API Key 状态已变化，请刷新后重试",
+      );
+    }
+    const credential = await replaceApiCredentialInTransaction({
+      executor: tx,
+      userId: input.adminUserId,
+      apiKey: input.apiKey,
+    });
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "delivery.admin_credential.replaced",
+        targetType: "user",
+        targetId: input.adminUserId,
+        workspaceUserId: null,
+        metadata: {
+          previouslyConfigured: latest?.status === "active",
+          previousVersion: actualVersion,
+          credentialVersion: credential.version,
+          configured: credential.configured,
+        },
+      },
+      tx,
+    );
+    return credential;
+  });
+}
+
+export async function revokeDeliveryAdminCredential(input: {
+  actor: AuthenticatedUser;
+  adminUserId: number;
+  expectedVersion: number;
+}) {
+  requireDeliveryManager(input.actor);
+  requireSystemAdminCredentialManagement(input.actor);
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    await requireDeliveryAdminCredentialTarget({
+      executor: tx,
+      adminUserId: input.adminUserId,
+    });
+    const credentialRows = await tx
+      .select()
+      .from(apiCredentials)
+      .where(eq(apiCredentials.userId, input.adminUserId))
+      .orderBy(desc(apiCredentials.version))
+      .limit(1)
+      .for("update");
+    const latest = credentialRows[0];
+    const actualVersion = latest?.version ?? 0;
+    if (actualVersion !== input.expectedVersion) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "交付管理员 API Key 状态已变化，请刷新后重试",
+      );
+    }
+    if (latest?.status !== "active") {
+      throw new AuthServiceError("CONFLICT", "交付管理员 API Key 尚未配置");
+    }
+    const deletion = await deleteActiveApiCredentialInTransaction({
+      executor: tx,
+      userId: input.adminUserId,
+    });
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "delivery.admin_credential.revoked",
+        targetType: "user",
+        targetId: input.adminUserId,
+        workspaceUserId: null,
+        metadata: {
+          previouslyConfigured: true,
+          previousVersion: actualVersion,
+          credentialVersion: deletion.version,
+          configured: false,
         },
       },
       tx,

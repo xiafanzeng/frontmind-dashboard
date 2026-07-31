@@ -12,7 +12,6 @@ import {
 import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
-import DeliveryWorkflowGuide from "@/components/DeliveryWorkflowGuide";
 import PortalShell from "@/components/PortalShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -589,34 +588,6 @@ function ProjectDetails({
   );
   const missing = getMissingProjectRoleTypes(project, assignments);
   const managerMissing = project.managerId == null;
-  const roleStates = Object.fromEntries(
-    ROLE_TYPES.map((roleType) => {
-      const assignment = projectAssignments.find(
-        (row) => row.roleType === roleType,
-      );
-      const currentEngineer = engineers.find(
-        (engineer) => engineer.id === assignment?.engineerUserId,
-      );
-      return [
-        roleType,
-        {
-          enabled: project.requiredRoleTypes.includes(roleType),
-          ownerLabel: assignment?.engineerUserId
-            ? currentEngineer
-              ? engineerName(currentEngineer)
-              : assignment.engineerDisplayName ||
-                assignment.engineerUsername ||
-                `工程师 #${assignment.engineerUserId}`
-            : null,
-          openTicketCount: tickets.filter(
-            (ticket) =>
-              ticket.userId === project.id &&
-              ticket.workflowDomain === roleType,
-          ).length,
-        },
-      ];
-    }),
-  );
 
   return (
     <div className="space-y-5">
@@ -663,12 +634,6 @@ function ProjectDetails({
             : "请在客户交付工作台设置该项目的交付管理员。"}
         </p>
       </div>
-
-      <DeliveryWorkflowGuide
-        audience="admin"
-        activeRole={highlightedRole}
-        roleStates={roleStates}
-      />
 
       <div className="grid gap-3">
         {ROLE_TYPES.map((roleType) => {
@@ -725,8 +690,7 @@ function ProjectRoleCard({
 }) {
   const enabled = project.requiredRoleTypes.includes(roleType);
   const matchingEngineers = engineers.filter(
-    (engineer) =>
-      engineer.isActive && engineer.engineerRoleType === roleType,
+    (engineer) => engineer.isActive && engineer.engineerRoleType === roleType,
   );
   const currentEngineer = engineers.find(
     (engineer) => engineer.id === assignment?.engineerUserId,

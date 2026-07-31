@@ -1,9 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   CreditCard,
   ClipboardList,
-  Database,
-  FileArchive,
   KeyRound,
   Loader2,
   LockKeyhole,
@@ -20,10 +18,7 @@ import DashboardSkeletonEditor from "@/components/DashboardSkeletonEditor";
 import DashboardVersionHistory from "@/components/DashboardVersionHistory";
 import AdminDeliveryTicketWorkspace from "@/components/AdminDeliveryTicketWorkspace";
 import CustomerDashboardMirror from "@/components/CustomerDashboardMirror";
-import KnowledgeBaseViewer from "@/components/KnowledgeBaseViewer";
-import KnowledgeBaseProgressPanel from "@/components/KnowledgeBaseProgressPanel";
 import ManagerAssignmentEditor from "@/components/ManagerAssignmentEditor";
-import MarkdownRenderer from "@/components/MarkdownRenderer";
 import PortalShell, { PortalCard } from "@/components/PortalShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -49,7 +44,6 @@ export function canCreateManagedCustomer(
 
 export const ADMIN_WORKSPACE_TABS = [
   { value: "service", label: "用户流程", icon: PackageCheck },
-  { value: "knowledge", label: "知识库流程", icon: Database },
   { value: "tickets", label: "工单", icon: ClipboardList },
   { value: "credential", label: "客户 Key 与积分", icon: KeyRound },
 ] as const satisfies ReadonlyArray<{
@@ -66,8 +60,7 @@ export function adminWorkspaceTabsForAccess(input: {
     if (input.isSystemAdmin) {
       return value !== "credential" || input.canViewSelectedUserUsage;
     }
-    if (value === "service" || value === "tickets") return true;
-    return value === "credential" && input.canViewSelectedUserUsage;
+    return value === "service" || value === "tickets";
   });
 }
 
@@ -102,15 +95,6 @@ function displayDate(value: number | string | Date | null | undefined) {
     month: "2-digit",
     day: "2-digit",
   }).format(date);
-}
-
-function displayDuration(value: number | null | undefined) {
-  if (!Number.isFinite(value) || (value ?? 0) < 0) return "执行中或未记录";
-  const seconds = Math.round((value ?? 0) / 1_000);
-  if (seconds < 60) return `${seconds} 秒`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = seconds % 60;
-  return `${minutes} 分 ${remainder} 秒`;
 }
 
 async function readImportError(response: Response) {
@@ -357,7 +341,6 @@ export default function AdminWorkspace({
   const [customerApiKey, setCustomerApiKey] = useState("");
   const [carryQuestionIds, setCarryQuestionIds] = useState<string[]>([]);
   const [uploading, setUploading] = useState<"knowledge" | null>(null);
-  const knowledgeFileRef = useRef<HTMLInputElement>(null);
 
   const workspaceQuery = trpc.admin.workspace.list.useQuery(undefined, {
     enabled: user?.role === "admin",
@@ -372,9 +355,7 @@ export default function AdminWorkspace({
       )
     : null;
   const canViewSelectedUserUsage = Boolean(
-    selectedUser &&
-      (workspaceQuery.data?.isSystemAdmin ||
-        selectedUser.usageOwner?.adminId === user?.id),
+    selectedUser && workspaceQuery.data?.isSystemAdmin,
   );
   const isSystemAdmin = Boolean(workspaceQuery.data?.isSystemAdmin);
   const availableTabs = adminWorkspaceTabsForAccess({
@@ -651,7 +632,6 @@ export default function AdminWorkspace({
       });
     } finally {
       setUploading(null);
-      if (knowledgeFileRef.current) knowledgeFileRef.current.value = "";
     }
   };
 
@@ -1256,13 +1236,9 @@ export default function AdminWorkspace({
                             disabled={step.status === "locked"}
                             className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4 text-left transition enabled:hover:border-[#cdb9db] enabled:hover:bg-white disabled:cursor-not-allowed disabled:opacity-75"
                             onClick={() => {
-                              const targetTab: WorkspaceTab =
-                                step.id === "knowledge"
-                                  ? "knowledge"
-                                  : "service";
-                              setTab(targetTab);
+                              setTab("service");
                               setLocation(
-                                `/admin/customers/${selectedUser.id}/${targetTab}`,
+                                `/admin/customers/${selectedUser.id}/service`,
                               );
                             }}
                           >
@@ -1469,6 +1445,15 @@ export default function AdminWorkspace({
                         knowledgePreview={{
                           progress: knowledgeProgressQuery.data?.progress,
                           snapshot: knowledgeQuery.data?.snapshot,
+                          activity: knowledgeActivityQuery.data,
+                          activityLoading: knowledgeActivityQuery.isLoading,
+                          activityError:
+                            knowledgeActivityQuery.error?.message ?? null,
+                          progressLoading: knowledgeProgressQuery.isLoading,
+                          progressError:
+                            knowledgeProgressQuery.error?.message ?? null,
+                          snapshotLoading: knowledgeQuery.isLoading,
+                          snapshotError: knowledgeQuery.error?.message ?? null,
                         }}
                         websiteWorkspace={websiteWorkspacePreview}
                         knowledgeUploading={uploading === "knowledge"}
@@ -1518,6 +1503,15 @@ export default function AdminWorkspace({
                       knowledgePreview={{
                         progress: knowledgeProgressQuery.data?.progress,
                         snapshot: knowledgeQuery.data?.snapshot,
+                        activity: knowledgeActivityQuery.data,
+                        activityLoading: knowledgeActivityQuery.isLoading,
+                        activityError:
+                          knowledgeActivityQuery.error?.message ?? null,
+                        progressLoading: knowledgeProgressQuery.isLoading,
+                        progressError:
+                          knowledgeProgressQuery.error?.message ?? null,
+                        snapshotLoading: knowledgeQuery.isLoading,
+                        snapshotError: knowledgeQuery.error?.message ?? null,
                       }}
                       heading="客户实际页面"
                       description="这里与客户账号看到的完整看板一致。"
@@ -1545,202 +1539,6 @@ export default function AdminWorkspace({
                 canAdjustQuota={isSystemAdmin}
                 canExecuteDelivery={isSystemAdmin}
               />
-            )}
-
-            {tab === "knowledge" && (
-              <>
-                {knowledgeActivityQuery.error ? (
-                  <PortalCard className="border-[#ebc8d4] bg-[#fff8fa] p-6 text-sm text-[#a02652]">
-                    <p className="font-semibold">知识库任务记录读取失败</p>
-                    <p className="mt-1 leading-6">
-                      {knowledgeActivityQuery.error.message || "请刷新后重试。"}
-                    </p>
-                  </PortalCard>
-                ) : knowledgeActivityQuery.isLoading ? (
-                  <PortalCard className="p-6 text-sm text-[#716a80]">
-                    正在读取知识库任务与对话…
-                  </PortalCard>
-                ) : knowledgeActivityQuery.data?.build ? (
-                  <PortalCard className="overflow-hidden">
-                    <div className="border-b border-[#eee8f2] p-5 sm:p-6">
-                      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                        <div>
-                          <p className="text-xs font-semibold text-[#5b2a86]">
-                            当前知识库构建
-                          </p>
-                          <h3 className="mt-1 font-semibold text-[#171321]">
-                            {knowledgeActivityQuery.data.build.companyName}
-                          </h3>
-                          <p className="mt-2 break-all font-mono text-xs text-[#9a94a8]">
-                            {knowledgeActivityQuery.data.build.conversationId}
-                          </p>
-                        </div>
-                        <Badge className="bg-[#5b2a86]/10 text-[#5b2a86]">
-                          {knowledgeActivityQuery.data.build.status}
-                        </Badge>
-                      </div>
-                      {knowledgeActivityQuery.data.build.protocolError && (
-                        <div className="mt-4 rounded-xl border border-[#ebc8d4] bg-[#fff8fa] p-3 text-sm leading-6 text-[#a02652]">
-                          {knowledgeActivityQuery.data.build.protocolError}
-                        </div>
-                      )}
-                    </div>
-                    <div className="grid gap-0 xl:grid-cols-[360px_minmax(0,1fr)]">
-                      <div className="border-b border-[#eee8f2] p-5 xl:border-b-0 xl:border-r">
-                        <h4 className="text-sm font-semibold text-[#332842]">
-                          执行任务
-                        </h4>
-                        {knowledgeActivityQuery.data.turns.length ? (
-                          <div className="mt-3 max-h-[430px] space-y-2 overflow-y-auto custom-scrollbar">
-                            {knowledgeActivityQuery.data.turns.map((turn) => (
-                              <article
-                                key={turn.id}
-                                className="rounded-xl border border-[#e8e1ee] bg-[#fbf9fd] p-3"
-                              >
-                                <div className="flex items-center justify-between gap-3">
-                                  <span className="text-xs font-semibold text-[#484057]">
-                                    {turn.model || "模型未记录"}
-                                  </span>
-                                  <span className="text-xs text-[#857e91]">
-                                    {turn.status}
-                                  </span>
-                                </div>
-                                <p className="mt-2 text-xs text-[#857e91]">
-                                  {displayDuration(turn.durationMs)}
-                                </p>
-                                {turn.errorMessage && (
-                                  <p className="mt-2 text-xs leading-5 text-[#a02652]">
-                                    {turn.errorMessage}
-                                  </p>
-                                )}
-                              </article>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="mt-3 text-sm text-[#716a80]">
-                            暂无执行任务记录。
-                          </p>
-                        )}
-                      </div>
-                      <div className="p-5">
-                        <h4 className="text-sm font-semibold text-[#332842]">
-                          最近对话
-                        </h4>
-                        {knowledgeActivityQuery.data.messages.length ? (
-                          <div className="mt-3 max-h-[520px] space-y-3 overflow-y-auto pr-1 custom-scrollbar">
-                            {knowledgeActivityQuery.data.messages.map(
-                              (message) => (
-                                <article
-                                  key={message.id}
-                                  className={`rounded-2xl border p-4 ${
-                                    message.role === "user"
-                                      ? "border-[#ddd1e5] bg-[#f7f1fb]"
-                                      : "border-[#e8e1ee] bg-white"
-                                  }`}
-                                >
-                                  <div className="mb-2 flex items-center justify-between gap-3 text-xs font-semibold text-[#857e91]">
-                                    <span>
-                                      {message.role === "user"
-                                        ? "用户"
-                                        : message.role === "assistant"
-                                          ? "Agent"
-                                          : message.role}
-                                    </span>
-                                    <span>
-                                      {message.sentAt
-                                        ? new Date(
-                                            message.sentAt,
-                                          ).toLocaleString("zh-CN")
-                                        : "时间未记录"}
-                                    </span>
-                                  </div>
-                                  <div className="text-sm leading-6 text-[#484057]">
-                                    <MarkdownRenderer
-                                      content={message.content}
-                                    />
-                                  </div>
-                                </article>
-                              ),
-                            )}
-                          </div>
-                        ) : (
-                          <p className="mt-3 text-sm text-[#716a80]">
-                            暂无持久化对话记录。
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </PortalCard>
-                ) : (
-                  <PortalCard className="p-6 text-sm text-[#716a80]">
-                    该客户尚未开始对话式知识库构建。
-                  </PortalCard>
-                )}
-
-                {knowledgeProgressQuery.error ? (
-                  <PortalCard className="border-[#ebc8d4] bg-[#fff8fa] p-6 text-sm text-[#a02652]">
-                    <p className="font-semibold">知识库构建进度读取失败</p>
-                    <p className="mt-1 leading-6">
-                      {knowledgeProgressQuery.error.message || "请刷新后重试。"}
-                    </p>
-                  </PortalCard>
-                ) : (
-                  <KnowledgeBaseProgressPanel
-                    progress={knowledgeProgressQuery.data?.progress}
-                    loading={knowledgeProgressQuery.isLoading}
-                    title="客户知识库构建进度"
-                    emptyMessage="该客户尚未开始对话式知识库构建；官网导入的一次性知识库不会伪造节点进度。"
-                  />
-                )}
-                <PortalCard className="p-5 sm:p-6">
-                  <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                    <div>
-                      <h3 className="font-semibold text-[#171321]">
-                        发布知识库版本
-                      </h3>
-                      <p className="mt-1 text-sm leading-6 text-[#716a80]">
-                        ZIP 会完整解析 Markdown、TXT、JSON、CSV、HTML
-                        与图片；网页不会执行，只作为安全知识内容展示。
-                      </p>
-                    </div>
-                    <Button
-                      className="shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
-                      disabled={uploading !== null}
-                      onClick={() => knowledgeFileRef.current?.click()}
-                    >
-                      {uploading === "knowledge" ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <FileArchive className="h-4 w-4" />
-                      )}
-                      上传知识库
-                    </Button>
-                    <input
-                      ref={knowledgeFileRef}
-                      type="file"
-                      accept=".zip,.md,.markdown,.txt,.json,.csv,.html,.htm"
-                      className="hidden"
-                      onChange={(event) => {
-                        const file = event.target.files?.[0];
-                        if (file) void handleUpload(file);
-                      }}
-                    />
-                  </div>
-                </PortalCard>
-                {knowledgeQuery.error ? (
-                  <PortalCard className="border-[#ebc8d4] bg-[#fff8fa] p-6 text-sm text-[#a02652]">
-                    <p className="font-semibold">知识库展示版本读取失败</p>
-                    <p className="mt-1 leading-6">
-                      {knowledgeQuery.error.message || "请刷新后重试。"}
-                    </p>
-                  </PortalCard>
-                ) : (
-                  <KnowledgeBaseViewer
-                    snapshot={knowledgeQuery.data?.snapshot}
-                    loading={knowledgeQuery.isLoading}
-                  />
-                )}
-              </>
             )}
 
             {tab === "credential" && canViewSelectedUserUsage && (

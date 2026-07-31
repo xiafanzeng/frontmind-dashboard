@@ -15,6 +15,7 @@
 
 import type { ResponseLogicDraft } from "@shared/response-logic";
 import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progress";
+import { stripKnowledgeBaseProtocolPayloads } from "@shared/knowledge-base-output";
 import { userFacingErrorMessage } from "@/lib/user-facing-error";
 
 /**
@@ -112,11 +113,7 @@ export function sanitizeBrandText(text: string): string {
 
   try {
     const source = ["ma", "nus"].join("");
-    return text
-      .replace(
-        /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?(?:-->|$)/gi,
-        "",
-      )
+    return stripKnowledgeBaseProtocolPayloads(text)
       .replace(
         new RegExp(`https?:\\/\\/api\\.${source}\\.`, "gi"),
         "https://api.frontmind.",

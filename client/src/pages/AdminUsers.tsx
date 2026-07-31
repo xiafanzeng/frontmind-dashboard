@@ -92,9 +92,6 @@ export default function AdminUsers() {
   const [accessLevelChange, setAccessLevelChange] =
     useState<AccessLevelChange | null>(null);
   const [deleteUser, setDeleteUser] = useState<AuthUser | null>(null);
-  const [engineerApiKeyUser, setEngineerApiKeyUser] = useState<AuthUser | null>(
-    null,
-  );
 
   const usersQuery = trpc.admin.users.list.useQuery(undefined, {
     enabled: systemAdmin,
@@ -245,9 +242,10 @@ export default function AdminUsers() {
             <CardContent className="p-6">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <h2 className="font-semibold">工程师账号与 Key</h2>
+                  <h2 className="font-semibold">工程师账号与岗位</h2>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    工程师岗位固定；你可以维护自己客户项目中的工程师，以及自己创建且尚未分配的工程师 Key。
+                    工程师 Key
+                    由系统管理员统一配置；交付管理员只安排岗位、客户项目和交付工作。
                   </p>
                 </div>
                 <Button
@@ -308,37 +306,7 @@ export default function AdminUsers() {
                             ? DELIVERY_ROLE_LABELS[engineer.engineerRoleType]
                             : "岗位未配置"}
                         </Badge>
-                        <Badge
-                          variant="outline"
-                          className={
-                            engineer.engineerApiKeyConfigured
-                              ? "text-emerald-700"
-                              : "text-amber-700"
-                          }
-                        >
-                          {engineer.engineerApiKeyConfigured
-                            ? "Key 已配置"
-                            : "Key 未配置"}
-                        </Badge>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={engineer.engineerApiKeyManageable === false}
-                          title={
-                            engineer.engineerApiKeyManageReason || undefined
-                          }
-                          onClick={() => setEngineerApiKeyUser(engineer)}
-                        >
-                          <KeyRound className="h-4 w-4" />
-                          管理 Key
-                        </Button>
                       </div>
-                      {engineer.engineerApiKeyManageable === false &&
-                        engineer.engineerApiKeyManageReason && (
-                          <p className="text-xs text-muted-foreground sm:basis-full sm:text-right">
-                            {engineer.engineerApiKeyManageReason}
-                          </p>
-                        )}
                     </div>
                   ))
                 ) : (
@@ -366,10 +334,6 @@ export default function AdminUsers() {
               setLocation(`/admin/customers/${userId}/service`);
             }
           }}
-        />
-        <EngineerApiKeyDialog
-          user={engineerApiKeyUser}
-          onOpenChange={(open) => !open && setEngineerApiKeyUser(null)}
         />
       </PortalShell>
     );
@@ -428,7 +392,8 @@ export default function AdminUsers() {
     >
       <div className="mx-auto w-full max-w-6xl">
         <p className="mb-5 text-sm text-[#716a80]">
-          创建客户、管理员与工程师账号，配置岗位、凭据和管理员权限，并管理账号生命周期。
+          创建客户、管理员与工程师账号，配置岗位和管理员权限，并管理账号生命周期；所有
+          Key 统一前往交付总览配置。
         </p>
 
         <section className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
@@ -502,7 +467,6 @@ export default function AdminUsers() {
                     onChangeStatus={(isActive) =>
                       setStatusChange({ user: account, isActive })
                     }
-                    onManageApiKey={() => setEngineerApiKeyUser(account)}
                     onDelete={() => setDeleteUser(account)}
                   />
                 ))}
@@ -527,11 +491,6 @@ export default function AdminUsers() {
         user={resetUser}
         onOpenChange={(open) => !open && setResetUser(null)}
       />
-      <EngineerApiKeyDialog
-        user={engineerApiKeyUser}
-        onOpenChange={(open) => !open && setEngineerApiKeyUser(null)}
-      />
-
       <AlertDialog
         open={Boolean(accessLevelChange)}
         onOpenChange={(open) =>
@@ -693,7 +652,6 @@ export function UserRow({
   onResetPassword,
   onChangeAccessLevel,
   onChangeStatus,
-  onManageApiKey,
   onDelete,
 }: {
   account: AuthUser;
@@ -705,7 +663,6 @@ export function UserRow({
     adminAccessLevel: "system_admin" | "delivery_admin",
   ) => void;
   onChangeStatus: (isActive: boolean) => void;
-  onManageApiKey: () => void;
   onDelete: () => void;
 }) {
   const name = account.displayName || account.username;
@@ -809,17 +766,6 @@ export function UserRow({
             {systemAdmin ? "设为交付管理员" : "设为系统管理员"}
           </Button>
         )}
-        {account.role === "delivery_member" && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={busy}
-            onClick={onManageApiKey}
-          >
-            <KeyRound className="h-3.5 w-3.5" />
-            管理 Key
-          </Button>
-        )}
         <Button
           size="sm"
           variant="outline"
@@ -921,6 +867,8 @@ export function CreateUserDialog({
   const effectiveDeliveryAdminId = fixedDeliveryAdmin
     ? String(fixedDeliveryAdmin.id)
     : deliveryAdminId;
+  const canSetEngineerApiKey = !fixedDeliveryAdmin;
+  const canSetCustomerApiKey = !fixedDeliveryAdmin;
   const createMutation = trpc.admin.users.create.useMutation({
     onSuccess: () =>
       Promise.all([
@@ -982,10 +930,6 @@ export function CreateUserDialog({
       toast.error("请选择客户版本");
       return;
     }
-    if (role === "user" && !apiKey.trim()) {
-      toast.error("请填写客户 API Key");
-      return;
-    }
     if (role === "user" && !effectiveDeliveryAdminId) {
       toast.error("请选择客户主负责人");
       return;
@@ -1012,7 +956,10 @@ export function CreateUserDialog({
                 password,
                 role: "delivery_member",
                 engineerRoleType: engineerRoleType as DeliveryRoleType,
-                apiKey: apiKey.trim() || undefined,
+                apiKey:
+                  canSetEngineerApiKey && apiKey.trim()
+                    ? apiKey.trim()
+                    : undefined,
               })
             : await createMutation.mutateAsync({
                 username: normalizedUsername,
@@ -1022,7 +969,10 @@ export function CreateUserDialog({
                 planCode: planCode as ProvisionableServicePlanCode,
                 marketEdition: marketEdition as AccountMarketEdition,
                 deliveryAdminId: Number(effectiveDeliveryAdminId),
-                apiKey: apiKey.trim(),
+                apiKey:
+                  canSetCustomerApiKey && apiKey.trim()
+                    ? apiKey.trim()
+                    : undefined,
               });
       toast.success("账号已创建", {
         description: displayName.trim() || normalizedUsername,
@@ -1048,12 +998,12 @@ export function CreateUserDialog({
             </DialogTitle>
             <DialogDescription>
               {userOnly && allowEngineer
-                ? "创建客户或工程师账号。客户自动归属当前交付管理员；工程师岗位创建后固定，API Key 可稍后补充。"
+                ? "创建客户或工程师账号并安排交付归属；所有 Key 由系统管理员在交付总览统一配置。"
                 : userOnly && fixedDeliveryAdmin
-                  ? "设置客户初始密码、套餐和有效 API Key；创建后客户自动归属当前交付管理员，账号立即可用。"
+                  ? "设置客户初始密码和套餐；创建后自动归属当前交付管理员，Key 由系统管理员统一配置。"
                   : userOnly
-                    ? "设置客户初始密码、套餐、主负责人和有效 API Key；创建完成后账号立即可用。"
-                    : "客户、管理员和工程师均由系统管理员设置初始密码；客户需配置套餐、主负责人和有效 API Key，工程师需固定选择岗位。"}
+                    ? "设置客户初始密码、套餐和主负责人；Key 可由系统管理员稍后在交付总览配置。"
+                    : "创建客户、管理员或工程师账号；所有账号 Key 统一由系统管理员维护。"}
             </DialogDescription>
           </DialogHeader>
           <form
@@ -1169,6 +1119,11 @@ export function CreateUserDialog({
                   <p className="text-xs leading-5 text-muted-foreground">
                     岗位创建后不可在项目分配时改变；同一工程师可以负责多个客户项目。
                   </p>
+                  {fixedDeliveryAdmin && (
+                    <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                      账号创建后，由系统管理员在交付总览统一配置工程师 Key。
+                    </p>
+                  )}
                 </div>
               )}
               {role === "user" && (
@@ -1258,17 +1213,25 @@ export function CreateUserDialog({
                         </SelectContent>
                       </Select>
                       <p className="text-xs leading-5 text-muted-foreground">
-                        客户主负责人可以是 Admin 或交付管理员，并承担该客户的交付与任务用量归属。
+                        客户主负责人可以是 Admin
+                        或交付管理员，并承担该客户的交付与任务用量归属。
                       </p>
                     </div>
                   )}
+                  {fixedDeliveryAdmin && (
+                    <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                      客户创建后会进入系统管理员的待配置 Key
+                      列表；交付管理员无需填写或接触 Key。
+                    </p>
+                  )}
                 </>
               )}
-              {(role === "user" || role === "delivery_member") && (
+              {((role === "user" && canSetCustomerApiKey) ||
+                (role === "delivery_member" && canSetEngineerApiKey)) && (
                 <div className="space-y-2">
                   <Label htmlFor="create-api-key">
                     {role === "user"
-                      ? "客户 API Key"
+                      ? "客户 API Key（可选）"
                       : "工程师 API Key（可选）"}
                   </Label>
                   <Input
@@ -1279,20 +1242,19 @@ export function CreateUserDialog({
                     onChange={(event) => setApiKey(event.target.value)}
                     placeholder={
                       role === "user"
-                        ? "创建前会验证 Key，可与其他客户使用相同原始 Key"
-                        : "可留空；创建后由有权限的交付管理员或系统管理员配置"
+                        ? "可留空；创建后在交付总览统一配置"
+                        : "可留空；创建后也可在交付总览由系统管理员配置"
                     }
                     disabled={createMutation.isPending}
                   />
                   {role === "user" ? (
                     <p className="text-xs leading-5 text-muted-foreground">
-                      Key 将按客户账号独立加密和版本化。以后替换该客户的 Key
-                      不会影响其他账号。
+                      由系统管理员维护；填写后会先验证，再按客户账号独立加密和版本化。
                     </p>
                   ) : (
                     <p className="text-xs leading-5 text-muted-foreground">
                       未填写也可以创建账号，列表和客户项目团队会提示“Key
-                      未配置”。未分配工程师由创建者管理；只服务单一交付管理员客户时由该管理员管理；跨管理员共享时由系统管理员管理。
+                      未配置”。工程师 Key 始终由系统管理员统一维护。
                     </p>
                   )}
                 </div>
@@ -1342,7 +1304,6 @@ export function CreateUserDialog({
                   (role === "user" &&
                     (!planCode ||
                       !marketEdition ||
-                      !apiKey.trim() ||
                       !effectiveDeliveryAdminId)) ||
                   (role === "delivery_member" && !engineerRoleType)
                 }

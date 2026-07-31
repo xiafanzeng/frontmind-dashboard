@@ -13,7 +13,10 @@ import type {
   KnowledgeBaseProgressDto,
   KnowledgeBaseProgressLeafDto,
 } from "../shared/knowledge-base-progress";
-import { stripKnowledgeBaseReferenceAppendix } from "../shared/knowledge-base-output";
+import {
+  stripKnowledgeBaseProtocolPayloads,
+  stripKnowledgeBaseReferenceAppendix,
+} from "../shared/knowledge-base-output";
 import { AuthServiceError } from "./auth-service";
 import { getDb } from "./db";
 import {
@@ -282,10 +285,7 @@ export function extractFinalKnowledgeBaseAssistantText(
 export function assertKnowledgeBaseCustomerOutput(output: unknown) {
   const text = extractFinalKnowledgeBaseAssistantText(output);
   const customerVisibleText = stripKnowledgeBaseReferenceAppendix(
-    text.replace(
-      /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
-      "",
-    ),
+    stripKnowledgeBaseProtocolPayloads(text),
   );
   const violation = customerFormalContentViolation(customerVisibleText);
   if (violation) {
@@ -314,11 +314,7 @@ function reconciliationHash(input: {
 }
 
 function modelOutputAudit(text: string) {
-  const auditMarkdown = text
-    .replace(
-      /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
-      "",
-    )
+  const auditMarkdown = stripKnowledgeBaseProtocolPayloads(text)
     .trim()
     .slice(-2_000_000);
   const contentMarkdown =

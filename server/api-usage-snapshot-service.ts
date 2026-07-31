@@ -95,6 +95,7 @@ async function accessibleDeliveryAdmins(
         id: users.id,
         displayName: users.displayName,
         username: users.username,
+        adminAccessLevel: users.adminAccessLevel,
       })
       .from(users)
       .where(and(eq(users.role, "admin"), eq(users.isActive, true)));
@@ -107,8 +108,24 @@ async function accessibleDeliveryAdmins(
       id: actor.id,
       displayName: actor.displayName ?? null,
       username: actor.username,
+      adminAccessLevel: actor.adminAccessLevel,
     },
   ];
+}
+
+async function accessibleDeliveryEngineers(
+  actor: AuthenticatedUser,
+  executor: any,
+) {
+  if (!isSystemAdmin(actor)) return [];
+  return executor
+    .select({
+      id: users.id,
+      displayName: users.displayName,
+      username: users.username,
+    })
+    .from(users)
+    .where(and(eq(users.role, "delivery_member"), eq(users.isActive, true)));
 }
 
 async function ensureUsagePolicy(input: {
@@ -224,6 +241,12 @@ async function usageCredentialFingerprints(input: {
 }
 
 export async function getApiUsageAlertOverview(actor: AuthenticatedUser) {
+  if (!isSystemAdmin(actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "只有系统管理员可以查看 Key 与积分总览。",
+    );
+  }
   const db = await requireDb();
   const workspaceUsers = await accessibleWorkspaceUsers(actor, db);
   const scopes = [
@@ -336,17 +359,28 @@ export async function getApiUsageAlertOverview(actor: AuthenticatedUser) {
 }
 
 export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
-  if (actor.role !== "admin") {
+  if (!isSystemAdmin(actor)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "只有管理员可以查看积分使用情况。",
+      "只有系统管理员可以查看 Key 与积分使用情况。",
     );
   }
   const db = await requireDb();
-  const managers = await accessibleDeliveryAdmins(actor, db);
+  const [accessibleManagers, engineers, customers] = await Promise.all([
+    accessibleDeliveryAdmins(actor, db),
+    accessibleDeliveryEngineers(actor, db),
+    accessibleWorkspaceUsers(actor, db),
+  ]);
+  const managers = isSystemAdmin(actor)
+    ? accessibleManagers.filter(
+        (manager: any) => manager.adminAccessLevel === "delivery_admin",
+      )
+    : accessibleManagers;
   const managerIds = managers.map((manager: any) => Number(manager.id));
+  const engineerIds = engineers.map((engineer: any) => Number(engineer.id));
+  const customerIds = customers.map((customer: any) => Number(customer.id));
   const ownerships =
-    managerIds.length === 0
+    customerIds.length === 0
       ? []
       : await db
           .select({
@@ -354,29 +388,10 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
             userId: userUsageOwners.userId,
           })
           .from(userUsageOwners)
-          .where(inArray(userUsageOwners.deliveryAdminId, managerIds));
-  const customerIds = [
-    ...new Set(ownerships.map((ownership: any) => Number(ownership.userId))),
+          .where(inArray(userUsageOwners.userId, customerIds));
+  const subjectIds = [
+    ...new Set([...managerIds, ...customerIds, ...engineerIds]),
   ];
-  const customers =
-    customerIds.length === 0
-      ? []
-      : await db
-          .select({
-            id: users.id,
-            enterpriseName: users.displayName,
-            username: users.username,
-            isActive: users.isActive,
-          })
-          .from(users)
-          .where(
-            and(
-              eq(users.role, "user"),
-              eq(users.isActive, true),
-              inArray(users.id, customerIds),
-            ),
-          );
-  const subjectIds = [...new Set([...managerIds, ...customerIds])];
   const policies = await Promise.all(
     subjectIds.map((subjectId) =>
       ensureUsagePolicy({
@@ -407,6 +422,32 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
     executor: db,
     userIds: subjectIds,
   });
+  const managedCredentialUserIds = [
+    ...managerIds,
+    ...engineerIds,
+    ...customerIds,
+  ];
+  const managedCredentialRows =
+    managedCredentialUserIds.length === 0
+      ? []
+      : await db
+          .select({
+            userId: apiCredentials.userId,
+            version: apiCredentials.version,
+            status: apiCredentials.status,
+          })
+          .from(apiCredentials)
+          .where(inArray(apiCredentials.userId, managedCredentialUserIds))
+          .orderBy(desc(apiCredentials.version));
+  const latestManagedCredentialById = new Map<
+    number,
+    (typeof managedCredentialRows)[number]
+  >();
+  for (const credential of managedCredentialRows) {
+    if (!latestManagedCredentialById.has(Number(credential.userId))) {
+      latestManagedCredentialById.set(Number(credential.userId), credential);
+    }
+  }
   const period = getShanghaiCalendarMonthPeriod();
 
   const usageFor = (userId: number) => {
@@ -448,11 +489,81 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
   const customerById = new Map(
     customers.map((customer: any) => [Number(customer.id), customer]),
   );
+  const adminById = new Map<
+    number,
+    { displayName?: string | null; username?: string | null }
+  >(accessibleManagers.map((manager: any) => [Number(manager.id), manager]));
+  const ownerByCustomerId = new Map(
+    ownerships.map((ownership: any) => [
+      Number(ownership.userId),
+      Number(ownership.adminId),
+    ]),
+  );
+
+  const customerUsage = customers.map((customer: any) => {
+    const customerId = Number(customer.id);
+    const usage = usageFor(customerId);
+    const latestCredential = latestManagedCredentialById.get(customerId);
+    const ownerId = ownerByCustomerId.get(customerId) ?? null;
+    const owner = ownerId == null ? null : adminById.get(ownerId);
+    const directApiKeyConfigured = latestCredential?.status === "active";
+    return {
+      userId: customerId,
+      enterpriseName:
+        customer.enterpriseName?.trim() ||
+        customer.username?.trim() ||
+        `客户 ${customer.id}`,
+      username: customer.username,
+      deliveryAdminId: ownerId,
+      deliveryAdminName:
+        owner?.displayName?.trim() || owner?.username?.trim() || null,
+      apiKeyConfigured: directApiKeyConfigured,
+      apiKeyVersion: latestCredential?.version ?? 0,
+      usesInheritedKey:
+        !directApiKeyConfigured &&
+        usage.credentialOwnerId !== null &&
+        usage.credentialOwnerId !== customerId,
+      keyTotalUsed: usage.used,
+      ownAgentMonthUsed: usage.accountUsed,
+      otherOrUnattributedUsed: Math.max(0, usage.used - usage.accountUsed),
+      fingerprint: usage.fingerprint,
+      syncStatus: usage.syncStatus,
+      fetchedAt: usage.fetchedAt,
+    };
+  });
+
+  const engineerUsage = engineers.map((engineer: any) => {
+    const usage = usageFor(Number(engineer.id));
+    const latestCredential = latestManagedCredentialById.get(
+      Number(engineer.id),
+    );
+    return {
+      engineerId: Number(engineer.id),
+      displayName:
+        engineer.displayName?.trim() ||
+        engineer.username?.trim() ||
+        `工程师 ${engineer.id}`,
+      username: engineer.username,
+      apiKeyConfigured: latestCredential?.status === "active",
+      apiKeyVersion: latestCredential?.version ?? 0,
+      keyTotalUsed: usage.used,
+      ownAgentMonthUsed: usage.accountUsed,
+      otherOrUnattributedUsed: Math.max(0, usage.used - usage.accountUsed),
+      fingerprint: usage.fingerprint,
+      syncStatus: usage.syncStatus,
+      fetchedAt: usage.fetchedAt,
+    };
+  });
 
   return {
     period,
+    customers: customerUsage,
+    engineers: engineerUsage,
     managers: managers.map((manager: any) => {
       const managerUsage = usageFor(Number(manager.id));
+      const latestManagerCredential = latestManagedCredentialById.get(
+        Number(manager.id),
+      );
       const managedCustomerRecords = ownerships
         .filter(
           (ownership: any) => Number(ownership.adminId) === Number(manager.id),
@@ -531,6 +642,8 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
           manager.username?.trim() ||
           `交付管理员 ${manager.id}`,
         username: manager.username,
+        apiKeyConfigured: latestManagerCredential?.status === "active",
+        apiKeyVersion: latestManagerCredential?.version ?? 0,
         keyPool: {
           fingerprint:
             managerUsage.fingerprint ??
@@ -620,14 +733,26 @@ async function mapWithConcurrency<T>(
 }
 
 export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
+  if (!isSystemAdmin(actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "只有系统管理员可以同步 Key 与积分使用情况。",
+    );
+  }
   const db = await requireDb();
-  const workspaceUsers = await accessibleWorkspaceUsers(actor, db);
-  const deliveryAdmins = await accessibleDeliveryAdmins(actor, db);
+  const [workspaceUsers, deliveryAdmins, deliveryEngineers] = await Promise.all(
+    [
+      accessibleWorkspaceUsers(actor, db),
+      accessibleDeliveryAdmins(actor, db),
+      accessibleDeliveryEngineers(actor, db),
+    ],
+  );
   const fingerprints = await usageCredentialFingerprints({
     executor: db,
     userIds: [
       ...workspaceUsers.map((user: any) => user.id),
       ...deliveryAdmins.map((admin: any) => admin.id),
+      ...deliveryEngineers.map((engineer: any) => engineer.id),
     ],
   });
   const now = new Date();
@@ -681,6 +806,9 @@ export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
   const workspaceUserIds: number[] = workspaceUsers.map((user: any) =>
     Number(user.id),
   );
+  const deliveryEngineerIds: number[] = deliveryEngineers.map((engineer: any) =>
+    Number(engineer.id),
+  );
   const allWorkspaceOwnershipRows =
     workspaceUserIds.length === 0
       ? []
@@ -702,7 +830,11 @@ export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
     return ownerId === undefined || deliveryAdminIds.includes(ownerId);
   });
   const accountIds = [
-    ...new Set([...deliveryAdminIds, ...syncableWorkspaceUserIds]),
+    ...new Set([
+      ...deliveryAdminIds,
+      ...syncableWorkspaceUserIds,
+      ...deliveryEngineerIds,
+    ]),
   ];
   const policyEntries = await Promise.all(
     accountIds.map(async (accountId) => ({

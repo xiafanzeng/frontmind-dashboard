@@ -149,24 +149,25 @@ describe("credential ownership policy", () => {
     expect(authMocks.deleteActiveApiCredential).toHaveBeenCalledWith(1);
   });
 
-  it("lets a delivery administrator save and replace their own Agent API Key", async () => {
+  it("keeps delivery administrator Agent Keys under system-admin control", async () => {
     const caller = credentialRouter.createCaller(
       context("admin", "delivery_admin"),
     );
 
-    await caller.set({ apiKey: "sk-delivery-admin-key" });
-    await caller.replace({ apiKey: "sk-delivery-admin-key-2" });
-
-    expect(authMocks.replaceApiCredential).toHaveBeenNthCalledWith(
-      1,
-      3,
-      "sk-delivery-admin-key",
-    );
-    expect(authMocks.replaceApiCredential).toHaveBeenNthCalledWith(
-      2,
-      3,
-      "sk-delivery-admin-key-2",
-    );
+    await expect(
+      caller.set({ apiKey: "sk-delivery-admin-key" }),
+    ).rejects.toMatchObject<Partial<TRPCError>>({ code: "FORBIDDEN" });
+    await expect(
+      caller.replace({ apiKey: "sk-delivery-admin-key-2" }),
+    ).rejects.toMatchObject<Partial<TRPCError>>({ code: "FORBIDDEN" });
+    await expect(caller.delete()).rejects.toMatchObject<Partial<TRPCError>>({
+      code: "FORBIDDEN",
+    });
+    await expect(caller.status()).rejects.toMatchObject<Partial<TRPCError>>({
+      code: "FORBIDDEN",
+    });
+    expect(authMocks.replaceApiCredential).not.toHaveBeenCalled();
+    expect(authMocks.deleteActiveApiCredential).not.toHaveBeenCalled();
   });
 
   it("does not grant credential controls to the admin username without an access level", async () => {

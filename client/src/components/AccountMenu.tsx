@@ -160,7 +160,11 @@ export default function AccountMenu({
             }}
           >
             <Settings />
-            {user.role === "admin" ? "API Key 与积分" : "智能服务设置"}
+            {isSystemAdmin
+              ? "API Key 与积分"
+              : user.role === "admin"
+                ? "设置"
+                : "智能服务设置"}
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setPasswordOpen(true)}>
             <KeyRound />

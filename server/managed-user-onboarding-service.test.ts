@@ -112,10 +112,12 @@ function harness(options?: {
         throw new Error("credential failed");
       }
       const state = executor as TestState;
-      state.credentials.push({
-        userId: value.userId,
-        apiKey: value.apiKey,
-      });
+      if (value.apiKey) {
+        state.credentials.push({
+          userId: value.userId,
+          apiKey: value.apiKey,
+        });
+      }
       state.assignments.push({
         userId: value.userId,
         adminId: value.deliveryAdminId,
@@ -311,7 +313,6 @@ describe("managed user onboarding", () => {
         planCode: "luxury",
         marketEdition: "domestic",
         deliveryAdminId: 42,
-        apiKey: "sk-customer-valid-credential-00000005",
       },
       test.dependencies,
     );
@@ -319,10 +320,32 @@ describe("managed user onboarding", () => {
     expect(result.assignedToCreator).toBe(true);
     expect(result.assignedDeliveryAdminId).toBe(42);
     expect(test.state().accounts).toEqual([501]);
+    expect(test.state().credentials).toEqual([]);
     expect(test.state().assignments).toEqual([{ userId: 501, adminId: 42 }]);
     expect(test.state().audits[0]).toMatchObject({
       metadata: { deliveryAdminId: 42 },
     });
+  });
+
+  it("rejects a customer Key supplied by a delivery administrator", async () => {
+    const test = harness();
+    const transaction = vi.spyOn(test.dependencies, "transaction");
+
+    await expect(
+      createManagedServiceUser(
+        {
+          actor: actor("delivery_admin"),
+          username: "delivery.with-key.customer",
+          password: "customer-initial-password",
+          planCode: "basic",
+          marketEdition: "domestic",
+          deliveryAdminId: 42,
+          apiKey: "sk-delivery-cannot-configure-customer",
+        },
+        test.dependencies,
+      ),
+    ).rejects.toThrow("仅由系统管理员");
+    expect(transaction).not.toHaveBeenCalled();
   });
 
   it("rejects a delivery administrator assigning a new customer to another administrator", async () => {

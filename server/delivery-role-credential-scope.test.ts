@@ -18,27 +18,31 @@ describe("delivery engineer credential management scope", () => {
       createdByAdminId,
     });
 
-  it("allows the administrator who owns all assigned customer projects", () => {
+  it("keeps engineer Key management away from delivery administrators", () => {
     expect(decide([10, 10])).toMatchObject({
-      manageable: true,
+      manageable: false,
+      reason: expect.stringContaining("仅由系统管理员"),
       managerAdminIds: [10],
     });
   });
 
-  it("rejects another administrator and any shared or unowned portfolio", () => {
-    expect(decide([20])).toMatchObject({ manageable: false });
+  it("applies the same system-only rule to shared or unowned portfolios", () => {
+    expect(decide([20])).toMatchObject({
+      manageable: false,
+      reason: expect.stringContaining("仅由系统管理员"),
+    });
     expect(decide([10, 20])).toMatchObject({
       manageable: false,
-      reason: expect.stringContaining("多个交付管理员"),
+      reason: expect.stringContaining("仅由系统管理员"),
     });
     expect(decide([10, null])).toMatchObject({
       manageable: false,
-      reason: expect.stringContaining("尚未明确"),
+      reason: expect.stringContaining("仅由系统管理员"),
     });
   });
 
-  it("uses origin only while the engineer has no customer assignments", () => {
-    expect(decide([], 10)).toMatchObject({ manageable: true });
+  it("does not grant Key management based on account creation origin", () => {
+    expect(decide([], 10)).toMatchObject({ manageable: false });
     expect(decide([], 20)).toMatchObject({ manageable: false });
   });
 

@@ -1,3 +1,4 @@
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { adminProcedure, router } from "./_core/trpc";
 import {
@@ -9,6 +10,7 @@ import {
   validateUpstreamApiKey,
 } from "./auth-service";
 import { toTrpcError } from "./auth-router";
+import { hasSystemAdminAccess } from "./admin-control-plane-service";
 
 const apiKeyInput = z.object({
   apiKey: z
@@ -35,8 +37,20 @@ async function saveCredential(userId: number, apiKey: string) {
   }
 }
 
+function requireSystemAdminCredentialAccess(
+  user: Parameters<typeof hasSystemAdminAccess>[0],
+) {
+  if (!hasSystemAdminAccess(user)) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "所有账号 API Key 仅由系统管理员统一维护",
+    });
+  }
+}
+
 export const credentialRouter = router({
   status: adminProcedure.query(async ({ ctx }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
     try {
       return await getApiCredentialStatus(ctx.user.id);
     } catch (error) {
@@ -44,17 +58,20 @@ export const credentialRouter = router({
     }
   }),
 
-  set: adminProcedure
-    .input(apiKeyInput)
-    .mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
+  set: adminProcedure.input(apiKeyInput).mutation(({ ctx, input }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
+    return saveCredential(ctx.user.id, input.apiKey);
+  }),
 
-  replace: adminProcedure
-    .input(apiKeyInput)
-    .mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
+  replace: adminProcedure.input(apiKeyInput).mutation(({ ctx, input }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
+    return saveCredential(ctx.user.id, input.apiKey);
+  }),
 
   test: adminProcedure
     .input(testApiKeyInput)
     .mutation(async ({ ctx, input }) => {
+      requireSystemAdminCredentialAccess(ctx.user);
       try {
         const savedCredential = input.apiKey
           ? null
@@ -71,6 +88,7 @@ export const credentialRouter = router({
     }),
 
   delete: adminProcedure.mutation(async ({ ctx }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
     try {
       await deleteActiveApiCredential(ctx.user.id);
       return { success: true } as const;

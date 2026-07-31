@@ -208,6 +208,8 @@ describe("customer project team helpers", () => {
       expect(source).not.toContain(retiredCopy);
     }
     expect(source).toContain('title="客户项目团队"');
+    expect(source).not.toContain("<DeliveryWorkflowGuide");
+    expect(source).not.toContain("项目交付协作链");
   });
 
   it("separates project coordination from shared-engineer key ownership", () => {

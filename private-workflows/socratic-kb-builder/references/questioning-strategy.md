@@ -30,8 +30,9 @@ The first customer-visible answer must:
   asset IDs.
 - End the visible body after the first leaf. Do not add citations, source
   lists, unresolved items, action guidance or a confirmation question.
-- End with exactly one valid `FRONTMIND_KB_MANIFEST` envelope when the
-  application requires it.
+- End with exactly one valid `FRONTMIND_KB_MANIFEST` envelope. The application
+  always requires it on the first turn. Include the complete 8–115 item
+  `leaves` array; a count or `SOCRATIC_KB_STATE` summary is invalid.
 
 Do not dump raw snapshots, page excerpts, crawl logs, or internal planning.
 

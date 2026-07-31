@@ -100,6 +100,45 @@ describe("CustomerDashboardMirror", () => {
     expect(screen.queryByRole("tab", { name: "品牌建设" })).toBeNull();
   });
 
+  it("keeps knowledge activity and progress inside the user-flow knowledge section", () => {
+    render(
+      <CustomerDashboardMirror
+        payload={payload}
+        initialSection="knowledge-build"
+        knowledgePreview={{
+          progress: {} as any,
+          activity: {
+            build: {
+              companyName: "示例品牌",
+              conversationId: "conversation-1",
+              status: "构建中",
+            },
+            turns: [
+              {
+                id: "turn-1",
+                model: "FrontMind Agent",
+                status: "completed",
+                durationMs: 12_000,
+              },
+            ],
+            messages: [
+              {
+                id: "message-1",
+                role: "assistant",
+                content: "已完成资料核验。",
+              },
+            ],
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("当前知识库构建")).toBeInTheDocument();
+    expect(screen.getByText("FrontMind Agent")).toBeInTheDocument();
+    expect(screen.getByText("已完成资料核验。")).toBeInTheDocument();
+    expect(screen.getByText("知识库构建进度用户页")).toBeInTheDocument();
+  });
+
   it("renders the complete customer dashboard shell for administrators", () => {
     render(<CustomerDashboardMirror payload={payload} />);
 

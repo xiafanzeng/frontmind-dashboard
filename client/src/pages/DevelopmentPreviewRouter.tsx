@@ -1,5 +1,6 @@
 import { Redirect } from "wouter";
 
+import { ConversationProvider } from "@/contexts/ConversationContext";
 import { PreviewUserBrandDashboard } from "@/dashboard/UserBrandDashboard";
 import {
   adminDashboardPreviewFixtures,
@@ -10,6 +11,7 @@ import {
   previewAdminWorkspaceHref,
 } from "@/lib/preview-navigation";
 import AdminDashboard from "@/pages/AdminDashboard";
+import KnowledgeBaseLivePreview from "@/pages/KnowledgeBaseLivePreview";
 import {
   PreviewAdminAccounts,
   PreviewAdminAgent,
@@ -20,6 +22,20 @@ import {
 type DevelopmentPreviewRouterProps = {
   location: string;
 };
+
+type PreviewPlanCode = "basic" | "advanced" | "luxury";
+
+function PreviewUserRoute({ planCode }: { planCode?: PreviewPlanCode }) {
+  return (
+    <ConversationProvider>
+      <PreviewUserBrandDashboard
+        initialSection="brand"
+        planCode={planCode}
+        fixtures={userPreviewFixtures}
+      />
+    </ConversationProvider>
+  );
+}
 
 /**
  * Development/acceptance-only routes.
@@ -33,37 +49,16 @@ export default function DevelopmentPreviewRouter({
   const route = location.split("?")[0];
 
   switch (route) {
+    case "/preview/knowledge-base-live":
+      return <KnowledgeBaseLivePreview />;
     case "/preview/user":
-      return (
-        <PreviewUserBrandDashboard
-          initialSection="brand"
-          fixtures={userPreviewFixtures}
-        />
-      );
+      return <PreviewUserRoute />;
     case "/preview/user/basic":
-      return (
-        <PreviewUserBrandDashboard
-          initialSection="brand"
-          planCode="basic"
-          fixtures={userPreviewFixtures}
-        />
-      );
+      return <PreviewUserRoute planCode="basic" />;
     case "/preview/user/advanced":
-      return (
-        <PreviewUserBrandDashboard
-          initialSection="brand"
-          planCode="advanced"
-          fixtures={userPreviewFixtures}
-        />
-      );
+      return <PreviewUserRoute planCode="advanced" />;
     case "/preview/user/luxury":
-      return (
-        <PreviewUserBrandDashboard
-          initialSection="brand"
-          planCode="luxury"
-          fixtures={userPreviewFixtures}
-        />
-      );
+      return <PreviewUserRoute planCode="luxury" />;
     case "/preview/admin/delivery":
     case "/preview/admin":
       return (

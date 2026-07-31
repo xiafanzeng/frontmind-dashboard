@@ -26,6 +26,24 @@ leaves, 1,500 ZIP files, 480 images and 160 MiB of image bytes. Stop duplicate
 SKUs, pagination, translated copies and low-value news before they displace
 uncovered business dimensions.
 
+## Development protocol contract probe
+
+When and only when the task input begins with the exact marker
+`FRONTMIND_KB_PROTOCOL_PROBE_V1`, run the isolated protocol self-test instead of
+the normal knowledge-base workflow:
+
+- do not browse, search, call tools, read enterprise sources, create files or
+  perform research;
+- transform the eight pipe-delimited test rows from the task input into one
+  ordered `leaves` array without changing any field;
+- output the single visible line requested by the task, followed by exactly one
+  documented `FRONTMIND_KB_MANIFEST` HTML-comment envelope;
+- use `kind: frontmind.knowledge-base.manifest` and `schemaVersion: 1`;
+- emit no bare JSON, code fence, other protocol, explanation or attachment.
+
+This probe is a development-only transport and instruction-conformance check.
+It never creates, confirms, replaces or publishes an enterprise knowledge base.
+
 ## Knowledge and evidence layers
 
 Create an adaptive 8–115 leaf tree covering enterprise identity, team,
@@ -167,6 +185,24 @@ Badges do not satisfy product-family visual coverage.
 
 When the service supplies `FRONTMIND_KB_MANIFEST`, `FRONTMIND_KB_PROGRESS`,
 `FRONTMIND_KB_PRESENTATION` or `FRONTMIND_KB_REOPEN`, follow it exactly.
+These are the only allowed conversational state protocols. Never emit
+`SOCRATIC_KB_STATE`, `frontmind.workflow-state`,
+`frontmind.knowledge-base.message`, or any other invented state object.
+
+The first turn must end with exactly one complete manifest envelope, even when
+all research and drafts are already complete:
+
+```text
+<!-- FRONTMIND_KB_MANIFEST
+{"kind":"frontmind.knowledge-base.manifest","schemaVersion":1,"leaves":[{"id":"1.1","title":"一句话定位","branchId":"identity","branchTitle":"企业身份"}]}
+-->
+```
+
+The example shows structure only. The actual `leaves` array must contain every
+one of the adaptive 8–115 leaves, with the final stable `id`, `title`,
+`branchId`, and `branchTitle` of each leaf. A branch/leaf count, the current
+leaf, an internal tree object, or a state summary never substitutes for the
+complete manifest.
 
 1. The first turn researches, builds the full tree and all prefilled formal
    drafts, then presents only the first leaf and one manifest envelope.
