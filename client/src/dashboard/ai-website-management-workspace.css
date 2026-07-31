@@ -657,6 +657,16 @@
   font-weight: var(--fm-weight-bold, 700);
 }
 
+.ai-website-guide-stage-submission {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid #cdb8dc;
+  border-radius: 12px;
+  background: #faf7fc;
+  scroll-margin-top: 24px;
+}
+
 .ai-website-guide-visuals {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -670,7 +680,10 @@
 
 .ai-website-guide-figure {
   display: grid;
+  width: 100%;
+  max-width: var(--guide-image-width);
   min-width: 0;
+  justify-self: center;
   gap: 7px;
   margin: 0;
 }

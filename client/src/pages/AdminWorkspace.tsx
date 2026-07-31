@@ -437,6 +437,38 @@ export default function AdminWorkspace({
       retry: false,
     },
   );
+  const deliveryPreviewQuery = (
+    trpc.admin.deliveryTickets as any
+  ).list.useInfiniteQuery(
+    { userId: selectedUserId || 1, limit: 100 },
+    {
+      enabled: Boolean(selectedUser),
+      retry: false,
+      getNextPageParam: (lastPage: any) => lastPage?.nextCursor || undefined,
+    },
+  );
+  const deliveryPreviewPages = deliveryPreviewQuery.data?.pages ?? [];
+  const deliveryPreviewMetadata = deliveryPreviewPages[0] ?? null;
+  const websiteWorkspacePreview = deliveryPreviewMetadata
+    ? {
+        quotas: deliveryPreviewMetadata.quotas,
+        contentAssetCatalog: deliveryPreviewMetadata.contentAssetCatalog ?? [],
+        websiteContentCatalog:
+          deliveryPreviewMetadata.websiteContentCatalog ?? [],
+        marketEdition: deliveryPreviewMetadata.marketEdition ?? "domestic",
+        preferredMediaOptions:
+          deliveryPreviewMetadata.preferredMediaOptions ?? [],
+        deliveryOwners: {
+          aiOperations: true,
+          monitoringOptimization: true,
+          contentDistribution: true,
+        },
+        websiteWorkflow: deliveryPreviewMetadata.websiteWorkflow ?? null,
+        tickets: deliveryPreviewPages.flatMap(
+          (page: any) => page?.tickets ?? page?.items ?? [],
+        ),
+      }
+    : null;
   const questionPortfolioQuery = (
     trpc.admin.workspace as any
   ).questionPortfolio.useQuery(queryInput, {
@@ -607,6 +639,7 @@ export default function AdminWorkspace({
       await Promise.all([
         dashboardQuery.refetch(),
         knowledgeQuery.refetch(),
+        knowledgeProgressQuery.refetch(),
         workspaceQuery.refetch(),
       ]);
       toast.success("知识库新版本已发布", {
@@ -1433,7 +1466,19 @@ export default function AdminWorkspace({
                         userId={selectedUser.id}
                         workspace={dashboardQuery.data}
                         loading={dashboardQuery.isLoading}
-                        profileOnly={false}
+                        knowledgePreview={{
+                          progress: knowledgeProgressQuery.data?.progress,
+                          snapshot: knowledgeQuery.data?.snapshot,
+                        }}
+                        websiteWorkspace={websiteWorkspacePreview}
+                        knowledgeUploading={uploading === "knowledge"}
+                        onUploadKnowledge={handleUpload}
+                        onOpenWebsiteWorkspace={() => {
+                          setTab("tickets");
+                          setLocation(
+                            `/admin/customers/${selectedUser.id}/tickets`,
+                          );
+                        }}
                         authoritativeQuestions={
                           serviceQuery.data?.purchasedQuestions
                         }
@@ -1447,6 +1492,7 @@ export default function AdminWorkspace({
                             workspaceQuery.refetch(),
                             serviceQuery.refetch(),
                             questionPortfolioQuery.refetch(),
+                            deliveryPreviewQuery.refetch(),
                           ]);
                         }}
                       />
@@ -1468,16 +1514,14 @@ export default function AdminWorkspace({
                   ) : dashboardQuery.data?.payload ? (
                     <CustomerDashboardMirror
                       payload={dashboardQuery.data.payload}
-                      allowedSections={[
-                        "brand",
-                        "keywords",
-                        "questions",
-                        "monitoring",
-                        "report",
-                        "content",
-                      ]}
-                      heading="客户正式页面协调视图"
-                      description="这里与客户当前正式版本一致。交付管理员用于核对结果、回复客户和催办对应工程师，不能在此代替工程师修改或发布内容。"
+                      websiteWorkspace={websiteWorkspacePreview}
+                      knowledgePreview={{
+                        progress: knowledgeProgressQuery.data?.progress,
+                        snapshot: knowledgeQuery.data?.snapshot,
+                      }}
+                      heading="客户实际页面"
+                      description="这里与客户账号看到的完整看板一致。"
+                      statusLabel={`正式版本 R${dashboardQuery.data.revision ?? 0}`}
                     />
                   ) : (
                     <PortalCard className="p-8 text-center text-sm text-[#716a80]">

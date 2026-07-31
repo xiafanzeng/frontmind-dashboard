@@ -1,8 +1,10 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { Readable } from "node:stream";
 import express from "express";
 import axios from "axios";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { HttpGeoPresalesBroker } from "../../frontmind-website/server/geo/broker";
 
 vi.mock("./presales-service", async () => {
   const actual =
@@ -15,9 +17,11 @@ vi.mock("./presales-service", async () => {
     completePresalesTaskReservation: vi.fn(),
     getActivePresalesCredential: vi.fn(),
     getPresalesCredentialForResource: vi.fn(),
+    hasPresalesOutputUrlGrant: vi.fn(),
     recordPresalesUpstreamResource: vi.fn(),
     releasePresalesTaskReservation: vi.fn(),
     resolvePresalesTaskCredentialForFiles: vi.fn(),
+    syncPresalesOutputUrlGrants: vi.fn(),
   };
 });
 
@@ -28,9 +32,11 @@ import {
   completePresalesTaskReservation,
   getActivePresalesCredential,
   getPresalesCredentialForResource,
+  hasPresalesOutputUrlGrant,
   recordPresalesUpstreamResource,
   releasePresalesTaskReservation,
   resolvePresalesTaskCredentialForFiles,
+  syncPresalesOutputUrlGrants,
 } from "./presales-service";
 
 const token = "4UT1aQh7tFzS0I8NDkcM8Gv7r5d9ZLr0shF9xXfPjYg";
@@ -134,13 +140,17 @@ describe("presales create-time upload capability", () => {
       },
     });
     vi.mocked(recordPresalesUpstreamResource).mockResolvedValue(undefined);
+    vi.mocked(hasPresalesOutputUrlGrant).mockResolvedValue(true);
+    vi.mocked(syncPresalesOutputUrlGrants).mockResolvedValue(undefined);
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
     vi.mocked(getActivePresalesCredential).mockReset();
     vi.mocked(getPresalesCredentialForResource).mockReset();
+    vi.mocked(hasPresalesOutputUrlGrant).mockReset();
     vi.mocked(recordPresalesUpstreamResource).mockReset();
+    vi.mocked(syncPresalesOutputUrlGrants).mockReset();
     if (originalServiceToken === undefined) {
       delete process.env.FRONTMIND_PRESALES_SERVICE_TOKEN;
     } else {
@@ -202,6 +212,195 @@ describe("presales create-time upload capability", () => {
       signedUrl,
       expect.anything(),
       expect.objectContaining({ maxRedirects: 0 }),
+    );
+  });
+
+  it("round-trips Website Broker bytes through the canonical content endpoint without GETting its upload URL", async () => {
+    const bytes = Buffer.from("zip");
+    let storedBytes = Buffer.alloc(0);
+    const signedUploadUrl =
+      "https://uploads.example.test/final.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=put-only";
+    vi.spyOn(axios, "post").mockResolvedValue({
+      status: 201,
+      data: {
+        id: "file-1",
+        filename: "final.zip",
+        upload_url: signedUploadUrl,
+        upload_expires_at: new Date(Date.now() + 180_000).toISOString(),
+      },
+    });
+    vi.spyOn(axios, "put").mockImplementation(async (_url, body) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of body as AsyncIterable<Buffer>) {
+        chunks.push(Buffer.from(chunk));
+      }
+      storedBytes = Buffer.concat(chunks);
+      return { status: 204, data: "" };
+    });
+    const get = vi.spyOn(axios, "get").mockImplementation(async () => ({
+      status: 200,
+      headers: {
+        "content-type": "application/zip",
+        "content-length": String(storedBytes.length),
+        "content-disposition": "attachment; filename*=UTF-8''website-final.zip",
+      },
+      data: Readable.from([storedBytes]),
+    }));
+
+    await withServer(async (baseUrl) => {
+      const broker = new HttpGeoPresalesBroker({
+        baseUrl,
+        serviceToken: token,
+        fetchImpl: (input, init) =>
+          fetch(input, { ...init, signal: undefined }),
+      });
+      const file = await broker.createFile({
+        filename: "final.zip",
+        mimeType: "application/zip",
+        sizeBytes: bytes.length,
+      });
+      await broker.uploadFile(
+        file.id,
+        bytes,
+        "application/zip",
+        file.proxy_upload_ticket,
+      );
+      const downloaded = await broker.downloadFile(file.id);
+      expect(downloaded.status).toBe(200);
+      expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(bytes);
+      expect(downloaded.headers.get("content-disposition")).toContain(
+        "website-final.zip",
+      );
+    });
+
+    expect(storedBytes).toEqual(bytes);
+    expect(get).toHaveBeenCalledOnce();
+    expect(get.mock.calls[0]![0]).toContain("/v1/files/file-1/content");
+    expect(get.mock.calls[0]![0]).not.toBe(signedUploadUrl);
+  });
+
+  it.each([403, 404, 503])(
+    "returns a controlled file-content error for upstream status %s",
+    async (status) => {
+      vi.spyOn(axios, "get").mockResolvedValue({
+        status,
+        headers: {},
+        data: { secret: "must-not-leak" },
+      });
+
+      await withServer(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/files/file-1/content`, {
+          headers: { "x-frontmind-service-token": token },
+        });
+        expect(response.status).toBe(status);
+        await expect(response.json()).resolves.toEqual({
+          error: {
+            code: "UPSTREAM_FILE_CONTENT_FAILED",
+            message: "File content download failed",
+          },
+        });
+      });
+    },
+  );
+
+  it("rejects an empty upstream file body", async () => {
+    vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: { "content-type": "application/zip" },
+      data: Readable.from([]),
+    });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/files/file-1/content`, {
+        headers: { "x-frontmind-service-token": token },
+      });
+      expect(response.status).toBe(502);
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "UPSTREAM_FILE_CONTENT_EMPTY",
+          message: "File content download failed",
+        },
+      });
+    });
+  });
+
+  it("rejects an upstream file whose declared body exceeds the archive limit", async () => {
+    vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: {
+        "content-type": "application/zip",
+        "content-length": String(100 * 1024 * 1024 + 1),
+      },
+      data: Readable.from([Buffer.from("must-not-stream")]),
+    });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/files/file-1/content`, {
+        headers: { "x-frontmind-service-token": token },
+      });
+      expect(response.status).toBe(502);
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "UPSTREAM_FILE_CONTENT_TOO_LARGE",
+          message: "File content download failed",
+        },
+      });
+    });
+  });
+
+  it("keeps the trusted URL-only task-output fallback for historical tasks", async () => {
+    const target = "https://downloads.example.test/historical.zip?sig=trusted";
+    const bytes = Buffer.from("historical-zip");
+    const get = vi
+      .spyOn(axios, "get")
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          id: "task-legacy",
+          status: "completed",
+          output: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "output_file",
+                  filename: "historical.zip",
+                  file_url: target,
+                },
+              ],
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {
+          "content-type": "application/zip",
+          "content-length": String(bytes.length),
+        },
+        data: Readable.from([bytes]),
+      });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/tasks/task-legacy/output?${new URLSearchParams({
+          url: target,
+          filename: "historical.zip",
+        }).toString()}`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(response.status).toBe(200);
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+    });
+
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(get.mock.calls[0]![0]).toContain("/v1/tasks/task-legacy");
+    expect(get.mock.calls[1]![0]).toBe(target);
+    expect(hasPresalesOutputUrlGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentTaskId: "task-legacy",
+        url: target,
+      }),
     );
   });
 });

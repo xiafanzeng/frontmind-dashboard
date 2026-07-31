@@ -117,18 +117,18 @@ export function deliveryMemberNavForRole(
   return deliveryMemberNav;
 }
 
-const ROLE_DASHBOARD_SECTIONS: Record<
+export const ROLE_DASHBOARD_SECTIONS: Record<
   DeliveryRoleType,
   readonly CustomerDashboardMirrorSection[]
 > = {
-  ai_operations_engineer: ["website", "knowledge", "brand", "content"],
+  ai_operations_engineer: ["knowledge-build", "knowledge", "website"],
   monitoring_optimization_engineer: [
     "keywords",
     "questions",
     "monitoring",
     "report",
   ],
-  content_distribution_engineer: ["questions", "content"],
+  content_distribution_engineer: ["content"],
 };
 
 type BusinessModuleImportDefinition = {
@@ -532,7 +532,7 @@ export default function DeliveryMemberDashboard({
       currentAssignment?.customerName ||
       currentAssignment?.customerUsername ||
       "当前客户",
-    headline: "客户品牌看板尚未发布",
+    headline: "客户页面尚未发布内容",
     summary: "",
     metrics: [],
     sections: [],
@@ -658,8 +658,21 @@ export default function DeliveryMemberDashboard({
                 ticket,
                 workbench.data?.tickets ?? [],
               );
+              const isNewCustomerTicket =
+                ticket.status === "submitted" &&
+                ticket.createdByUserId === ticket.userId;
               return (
-                <div key={ticket.id} className="rounded-xl border p-4">
+                <div
+                  key={ticket.id}
+                  id={`ticket-editor-${ticket.id}`}
+                  data-new-customer-ticket={isNewCustomerTicket || undefined}
+                  data-customer-page-editor="true"
+                  className={`rounded-xl border p-4 ${
+                    isNewCustomerTicket
+                      ? "border-red-500 bg-red-50/80 ring-2 ring-red-500/25 dark:border-red-400 dark:bg-red-950/25"
+                      : ""
+                  }`}
+                >
                   <div className="flex items-center justify-between gap-3">
                     <p className="font-medium">
                       {ticket.title ||
@@ -667,11 +680,20 @@ export default function DeliveryMemberDashboard({
                         ticket.category ||
                         "交付工单"}
                     </p>
-                    <Badge variant="outline">
-                      {DELIVERY_TICKET_STATUS_LABELS[
-                        ticket.status as DeliveryTicketStatus
-                      ] || ticket.status}
-                    </Badge>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      {isNewCustomerTicket && (
+                        <Badge variant="destructive">用户新提交</Badge>
+                      )}
+                      <Badge
+                        variant={
+                          isNewCustomerTicket ? "destructive" : "outline"
+                        }
+                      >
+                        {DELIVERY_TICKET_STATUS_LABELS[
+                          ticket.status as DeliveryTicketStatus
+                        ] || ticket.status}
+                      </Badge>
+                    </div>
                   </div>
                   <p className="mt-2 text-xs text-muted-foreground">
                     {operationLabel(ticket.operation)} · 客户 #{ticket.userId}
@@ -819,11 +841,39 @@ export default function DeliveryMemberDashboard({
               initialSection={
                 ROLE_DASHBOARD_SECTIONS[currentAssignment.roleType][0]
               }
-              heading="用户实际页面验收预览"
+              heading="客户页面内容与发布"
               description={
                 workbench.data?.dashboard
-                  ? `这里是客户当前正式版本 R${workbench.data.dashboard.revision}，不是可直接编辑的草稿。本岗位只显示负责分区；完成工单前，应确认交付结果已经出现在这里。`
-                  : "客户品牌看板尚未发布；官网与知识库仍读取正式数据。本岗位只显示负责分区，完成工单前应确认交付结果已经出现。"
+                  ? `这里只展示本岗位交付后客户真正能看到或操作的正式内容，当前版本 R${workbench.data.dashboard.revision}。教程、内部流程和其他岗位模块不进入验收视图。`
+                  : "这里只展示本岗位交付后客户真正能看到或操作的正式内容；教程、内部流程和其他岗位模块不进入验收视图。"
+              }
+              editActions={
+                tickets.length ? (
+                  tickets.map((ticket) => (
+                    <Button
+                      key={ticket.id}
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        document
+                          .getElementById(`ticket-editor-${ticket.id}`)
+                          ?.scrollIntoView({
+                            behavior: "smooth",
+                            block: "center",
+                          })
+                      }
+                    >
+                      修改并发布：
+                      {ticket.title ||
+                        operationLabel(ticket.operation) ||
+                        "当前工单"}
+                    </Button>
+                  ))
+                ) : (
+                  <span className="text-xs text-muted-foreground">
+                    当前没有可修改的未结束工单
+                  </span>
+                )
               }
             />
           ) : (

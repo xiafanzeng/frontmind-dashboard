@@ -10,6 +10,8 @@ import {
 
 const mocks = vi.hoisted(() => ({
   createTask: vi.fn(),
+  createKnowledgeBaseTurnTask: vi.fn(),
+  createResponseLogicTask: vi.fn(),
   retrieveTask: vi.fn(),
   uploadFile: vi.fn(),
   fileToBase64: vi.fn(),
@@ -20,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   updateTitle: vi.fn(),
   createConversation: vi.fn(),
   parseOutputMessages: vi.fn(),
+  sanitizeKnowledgeBaseOutputMessages: vi.fn((messages: any[]) => messages),
   useConversation: vi.fn(),
   prepareUploadFiles: vi.fn(),
   isImageUpload: vi.fn(),
@@ -27,12 +30,15 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/frontmind-api", () => ({
   createTask: mocks.createTask,
+  createKnowledgeBaseTurnTask: mocks.createKnowledgeBaseTurnTask,
+  createResponseLogicTask: mocks.createResponseLogicTask,
   retrieveTask: mocks.retrieveTask,
   uploadFile: mocks.uploadFile,
   fileToBase64: mocks.fileToBase64,
   creditEventBus: {
     emit: mocks.creditEmit,
   },
+  sanitizeBrandText: (value: string) => value.replace(/Manus/gi, "FrontMind"),
 }));
 
 vi.mock("@/lib/attachment-files", () => ({
@@ -45,6 +51,12 @@ vi.mock("@/lib/attachment-files", () => ({
 vi.mock("@/contexts/ConversationContext", () => ({
   useConversation: mocks.useConversation,
   parseOutputMessages: mocks.parseOutputMessages,
+  sanitizeKnowledgeBaseOutputMessages:
+    mocks.sanitizeKnowledgeBaseOutputMessages,
+}));
+
+vi.mock("@/lib/knowledge-progress", () => ({
+  reconcileKnowledgeBaseProgress: vi.fn(),
 }));
 
 function mockConversationContext(overrides = {}) {
@@ -164,6 +176,17 @@ describe("useSendMessage", () => {
       status: "completed",
       output: [],
     });
+    mocks.createKnowledgeBaseTurnTask.mockResolvedValue({
+      id: "test-kb-task-id",
+      status: "running",
+      output: [],
+      knowledgeInteraction: {
+        interactionState: "executing",
+        canReply: false,
+        canPublish: false,
+        lockReason: "任务仍在执行",
+      },
+    });
     mocks.retrieveTask.mockResolvedValue({
       id: "test-task-id",
       status: "completed",
@@ -204,6 +227,72 @@ describe("useSendMessage", () => {
   it("should return uploadProgress as null initially", () => {
     const { result } = renderHook(() => useSendMessage());
     expect(result.current.uploadProgress).toBeNull();
+  });
+
+  it("shows initial running knowledge text and leaves polling to the global owner", async () => {
+    vi.useFakeTimers();
+    mocks.createKnowledgeBaseTurnTask.mockResolvedValueOnce({
+      id: "test-kb-task-id",
+      status: "running",
+      output: [
+        {
+          id: "kb-running-copy",
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "FrontMind 正在按业务分支进行资料采集。",
+            },
+          ],
+        },
+      ],
+      knowledgeInteraction: {
+        interactionState: "executing",
+        canReply: false,
+        canPublish: false,
+        lockReason: "任务仍在执行",
+      },
+    });
+    mocks.parseOutputMessages.mockReturnValueOnce([
+      {
+        id: "kb-running-copy",
+        upstreamOutputId: "kb-running-copy",
+        role: "assistant",
+        content: "FrontMind 正在按业务分支进行资料采集。",
+        timestamp: 2,
+      },
+    ]);
+
+    const { result, unmount } = renderHook(() => useSendMessage());
+    await act(async () => {
+      await result.current.sendMessage("继续", [], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedRevision: 1,
+        knowledgeBaseExpectedLeafId: "1.1",
+      });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
+      "test-conv-id",
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: "FrontMind 正在按业务分支进行资料采集。",
+        }),
+      ]),
+    );
+    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "running",
+      expect.not.objectContaining({ lastKnownOutputLength: expect.anything() }),
+    );
+
+    unmount();
+    vi.useRealTimers();
   });
 
   it("does not retry createTask when upstream is overloaded", async () => {

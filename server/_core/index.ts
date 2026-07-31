@@ -206,7 +206,7 @@ async function startServer() {
   app.use("/api/manus", (_req, res) => {
     res
       .status(404)
-      .json({ error: { message: "Not found", code: "NOT_FOUND" } });
+      .json({ error: { message: "接口不存在", code: "NOT_FOUND" } });
   });
   // One-click enterprise knowledge base workflow powered by the Socratic KB skill.
   app.use(
@@ -246,7 +246,7 @@ async function startServer() {
   app.use("/api", (_req, res) => {
     res
       .status(404)
-      .json({ error: { message: "Not found", code: "NOT_FOUND" } });
+      .json({ error: { message: "接口不存在", code: "NOT_FOUND" } });
   });
   // development mode uses Vite, production mode uses static files
   if (process.env.NODE_ENV === "development") {

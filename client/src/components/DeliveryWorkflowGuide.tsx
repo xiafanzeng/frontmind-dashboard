@@ -33,17 +33,49 @@ export default function DeliveryWorkflowGuide({
   roleStates?: Partial<Record<DeliveryRoleType, DeliveryWorkflowRoleState>>;
   audience?: "engineer" | "admin";
 }) {
+  if (audience === "engineer" && activeRole) {
+    const definition = DELIVERY_ROLE_WORKFLOWS[activeRole];
+    return (
+      <section className="rounded-2xl border bg-card p-5 sm:p-6">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="font-semibold">我的岗位职责</h2>
+            <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
+              这里只展示当前岗位需要完成的工作；请按工单执行，并登记可核验的交付结果。
+            </p>
+          </div>
+          <Badge className="w-fit shrink-0">当前岗位</Badge>
+        </div>
+
+        <article className="mt-4 rounded-2xl border border-primary bg-primary/[0.045] p-4 ring-1 ring-primary/20">
+          <h3 className="font-semibold">{DELIVERY_ROLE_LABELS[activeRole]}</h3>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">
+            {definition.mission}
+          </p>
+          <ul className="mt-3 space-y-1.5 border-t pt-3 text-xs leading-5 text-muted-foreground">
+            {definition.responsibilities.map((item) => (
+              <li key={item} className="flex items-start gap-2">
+                <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                <span>{item}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 border-t pt-3 text-xs leading-5 text-muted-foreground">
+            <strong className="text-foreground">完成标准：</strong>
+            {definition.delivers}
+          </p>
+        </article>
+      </section>
+    );
+  }
+
   return (
     <section className="rounded-2xl border bg-card p-5 sm:p-6">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h2 className="font-semibold">
-            {audience === "admin" ? "项目交付协作链" : "我的职责与交接位置"}
-          </h2>
+          <h2 className="font-semibold">项目交付协作链</h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-            {audience === "admin"
-              ? "管理员负责配齐岗位、确认负责人和协调异常；工程师只在自己的岗位工单中执行并交付。"
-              : "只处理当前岗位工单；完成时必须确认产出已经进入用户实际页面或形成可核验交付记录。"}
+            管理员负责配齐岗位、确认负责人和协调异常；工程师只在自己的岗位工单中执行并交付。
           </p>
         </div>
         <Badge variant="outline" className="w-fit shrink-0">

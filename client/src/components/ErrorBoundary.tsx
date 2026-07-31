@@ -32,7 +32,7 @@ class ErrorBoundary extends Component<Props, State> {
               className="text-destructive mb-6 flex-shrink-0"
             />
 
-            <h2 className="text-xl mb-4">An unexpected error occurred.</h2>
+            <h2 className="text-xl mb-4">页面发生异常</h2>
 
             {showErrorDetails ? (
               <div className="p-4 w-full rounded bg-muted overflow-auto mb-6">
@@ -51,11 +51,11 @@ class ErrorBoundary extends Component<Props, State> {
               className={cn(
                 "flex items-center gap-2 px-4 py-2 rounded-lg",
                 "bg-primary text-primary-foreground",
-                "hover:opacity-90 cursor-pointer"
+                "hover:opacity-90 cursor-pointer",
               )}
             >
               <RotateCcw size={16} />
-              Reload Page
+              刷新页面
             </button>
           </div>
         </div>

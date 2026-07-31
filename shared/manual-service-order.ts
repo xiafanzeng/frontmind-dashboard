@@ -59,8 +59,8 @@ export const manualServiceAccountTargetSchema = z.discriminatedUnion("mode", [
       displayName: z.string().trim().min(2).max(128),
       password: z
         .string()
-        .min(8, "Password must contain at least 8 characters")
-        .max(MAX_PASSWORD_LENGTH, "Password is too long"),
+        .min(8, "密码至少需要 8 个字符")
+        .max(MAX_PASSWORD_LENGTH, `密码不能超过 ${MAX_PASSWORD_LENGTH} 个字符`),
     })
     .strict(),
   z

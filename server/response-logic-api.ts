@@ -505,19 +505,18 @@ function compactKnowledgeSnapshot(snapshot: KnowledgeSnapshotForPrompt) {
   }
   const assets = snapshot.assets
     .slice(0, 200)
-    .map(
-      (asset) =>
-        [
-          `- ${asset.caption || asset.alt || asset.path}`,
-          `path=${asset.path}`,
-          `type=${asset.mimeType || "未知格式"}`,
-          `size=${asset.size} bytes`,
-          asset.branchId ? `branch=${asset.branchId}` : "",
-          asset.ownership ? `ownership=${asset.ownership}` : "",
-          asset.sourcePageUrl ? `source=${asset.sourcePageUrl}` : "",
-        ]
-          .filter(Boolean)
-          .join("｜"),
+    .map((asset) =>
+      [
+        `- ${asset.caption || asset.alt || asset.path}`,
+        `path=${asset.path}`,
+        `type=${asset.mimeType || "未知格式"}`,
+        `size=${asset.size} bytes`,
+        asset.branchId ? `branch=${asset.branchId}` : "",
+        asset.ownership ? `ownership=${asset.ownership}` : "",
+        asset.sourcePageUrl ? `source=${asset.sourcePageUrl}` : "",
+      ]
+        .filter(Boolean)
+        .join("｜"),
     )
     .join("\n");
 
@@ -999,7 +998,7 @@ router.post(["/start", "/turn"], async (req, res) => {
 
   const activeCredentials = getFrontMindCredentials(req);
   if (!activeCredentials.apiKey) {
-    res.status(401).json({ error: { message: "Missing API key" } });
+    res.status(401).json({ error: { message: "尚未配置 API Key" } });
     return;
   }
 
@@ -1130,9 +1129,7 @@ router.post(["/start", "/turn"], async (req, res) => {
           );
         } catch (error) {
           await Promise.allSettled(
-            generatedAttachments.map((attachment) =>
-              attachment.removeOrphan(),
-            ),
+            generatedAttachments.map((attachment) => attachment.removeOrphan()),
           );
           throw error;
         }
@@ -1204,9 +1201,7 @@ router.post(["/start", "/turn"], async (req, res) => {
           taskId: String(created.task.id),
         });
         await Promise.allSettled(
-          generatedAttachments.map((attachment) =>
-            attachment.removeOrphan(),
-          ),
+          generatedAttachments.map((attachment) => attachment.removeOrphan()),
         );
       }
       throw persistenceError;

@@ -188,7 +188,7 @@ async function fetchFileAsBlob(
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch file: HTTP ${response.status}`);
+    throw new Error(`文件读取失败（HTTP ${response.status}）`);
   }
 
   // Safety check: if we got JSON metadata instead of binary content
@@ -215,7 +215,7 @@ async function fetchFileAsBlob(
     } catch {
       // Not valid JSON or no upload_url
     }
-    throw new Error("Received metadata instead of file content");
+    throw new Error("服务返回了文件信息，但未返回文件内容");
   }
 
   const blob = await response.blob();
@@ -233,12 +233,12 @@ async function createDirectDownloadUrl(fileId: string): Promise<string> {
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to create download link: HTTP ${response.status}`);
+    throw new Error(`下载链接创建失败（HTTP ${response.status}）`);
   }
 
   const data = await response.json();
   if (!data.downloadUrl) {
-    throw new Error("Download link response missing downloadUrl");
+    throw new Error("下载链接响应缺少有效地址");
   }
   return data.downloadUrl;
 }
@@ -324,7 +324,7 @@ export default function FilePreview({
             });
         }
       } else {
-        setPreviewError("No file source available");
+        setPreviewError("没有可用的文件来源");
         setLoadingPreview(false);
       }
     }

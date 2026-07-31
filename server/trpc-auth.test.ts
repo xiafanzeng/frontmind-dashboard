@@ -4,6 +4,7 @@ import type { AuthenticatedUser } from "./auth-service";
 import type { TrpcContext } from "./_core/context";
 import {
   adminProcedure,
+  localizedUserFacingError,
   protectedProcedure,
   publicProcedure,
   router,
@@ -85,5 +86,28 @@ describe("tRPC authorization middleware", () => {
     await expect(caller.admin()).rejects.toMatchObject<Partial<TRPCError>>({
       code: "FORBIDDEN",
     });
+  });
+});
+
+describe("tRPC user-facing error localization", () => {
+  it("keeps Chinese errors and translates common English authentication errors", () => {
+    expect(localizedUserFacingError("账号已停用", "FORBIDDEN")).toBe(
+      "账号已停用",
+    );
+    expect(
+      localizedUserFacingError("Invalid username or password", "UNAUTHORIZED"),
+    ).toBe("用户名或密码不正确");
+    expect(localizedUserFacingError("Network Error", "BAD_GATEWAY")).toBe(
+      "网络连接异常，请检查网络后重试",
+    );
+  });
+
+  it("does not expose an unknown English backend failure", () => {
+    expect(
+      localizedUserFacingError(
+        "driver failed while reading internal table",
+        "INTERNAL_SERVER_ERROR",
+      ),
+    ).toBe("请求暂时无法完成，请稍后重试");
   });
 });

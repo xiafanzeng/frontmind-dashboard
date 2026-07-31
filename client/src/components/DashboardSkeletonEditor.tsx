@@ -31,6 +31,7 @@ import {
 import CustomerDashboardMirror, {
   type CustomerDashboardMirrorSection,
 } from "@/components/CustomerDashboardMirror";
+import type { KnowledgeSnapshotView } from "@/components/KnowledgeBaseViewer";
 import { trpc } from "@/lib/trpc";
 import {
   createDashboardModuleTemplateMetadata,
@@ -40,6 +41,11 @@ import {
   type DashboardModuleImportPreview,
   type DashboardPayload,
 } from "@shared/dashboard";
+import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
+import type {
+  PublicDeliveryTicketSummary,
+  PublicDeliveryTicketWorkspaceMetadata,
+} from "@shared/delivery-ticket";
 import OptimizationReportEditor from "./OptimizationReportEditor";
 
 type DashboardImportModule =
@@ -66,7 +72,18 @@ type DashboardSkeletonEditorProps = {
   userId: number;
   workspace?: DashboardWorkspaceSnapshot;
   loading?: boolean;
-  profileOnly?: boolean;
+  knowledgePreview?: {
+    progress?: KnowledgeBaseProgressDto | null;
+    snapshot?: KnowledgeSnapshotView | null;
+  } | null;
+  websiteWorkspace?:
+    | (PublicDeliveryTicketWorkspaceMetadata & {
+        tickets: PublicDeliveryTicketSummary[];
+      })
+    | null;
+  knowledgeUploading?: boolean;
+  onUploadKnowledge?: (file: File) => void | Promise<void>;
+  onOpenWebsiteWorkspace?: () => void;
   authoritativeQuestions?: readonly AuthoritativeQuestionTemplateSource[];
   authoritativeQuestionsLoading?: boolean;
   authoritativeQuestionsError?: string | null;
@@ -345,26 +362,26 @@ async function downloadMonitoringCurrentTemplate(userId: number) {
 const importCards: ImportCardDefinition[] = [
   {
     module: "profile",
-    title: "首页标题与简介",
-    description: "更新客户看板顶部显示的企业名称、主标题和简介。",
+    title: "页面抬头",
+    description: "上传客户服务首页的抬头内容。",
     accept: ".json,application/json",
-    format: "JSON 当前模板",
+    format: "JSON 当前数据",
     icon: Building2,
   },
   {
     module: "metrics",
-    title: "首页数据概览",
-    description: "批量更新客户看板首页的数据卡片、单位和口径说明。",
+    title: "数据卡片",
+    description: "上传客户服务首页的数据卡片。",
     accept: ".json,application/json",
-    format: "JSON 当前模板",
+    format: "JSON 当前数据",
     icon: BarChart3,
   },
   {
     module: "sections",
-    title: "品牌建设内容区",
-    description: "更新客户品牌建设页面中的正文、图片、卡片和数据表格。",
+    title: "页面内容",
+    description: "上传客户服务首页的正文、图片和表格。",
     accept: ".json,application/json",
-    format: "JSON 当前模板",
+    format: "JSON 当前数据",
     icon: LayoutTemplate,
   },
   {
@@ -424,9 +441,9 @@ function clonePayload(payload: DashboardPayload) {
 
 export function dashboardEditorDisplayText(value: string) {
   return value
-    .replaceAll("企业数据骨架", "交付内容与进度")
-    .replaceAll("看板指标", "首页数据概览")
-    .replaceAll("内容板块与卡片", "交付内容区");
+    .replaceAll("企业数据骨架", "客户页面")
+    .replaceAll("看板指标", "数据卡片")
+    .replaceAll("内容板块与卡片", "页面内容");
 }
 
 function nextSectionId(sections: DashboardPayload["sections"]) {
@@ -540,7 +557,11 @@ export default function DashboardSkeletonEditor({
   userId,
   workspace,
   loading = false,
-  profileOnly = false,
+  knowledgePreview = null,
+  websiteWorkspace = null,
+  knowledgeUploading = false,
+  onUploadKnowledge,
+  onOpenWebsiteWorkspace,
   authoritativeQuestions,
   authoritativeQuestionsLoading = false,
   authoritativeQuestionsError = null,
@@ -551,9 +572,6 @@ export default function DashboardSkeletonEditor({
   );
   const [dirty, setDirty] = useState(false);
   const [publishReason, setPublishReason] = useState("");
-  const [previewOpen, setPreviewOpen] = useState(false);
-  const [previewSection, setPreviewSection] =
-    useState<CustomerDashboardMirrorSection>("brand");
   const [importingKey, setImportingKey] = useState("");
   const [pendingMonitoringImport, setPendingMonitoringImport] =
     useState<PendingMonitoringImport | null>(null);
@@ -951,6 +969,53 @@ export default function DashboardSkeletonEditor({
     }
   };
 
+  const downloadCurrentModule = (card: ImportCardDefinition) => {
+    if (card.module === "monitoring") {
+      void downloadMonitoringCurrentTemplate(userId)
+        .then(() => toast.success("当前问题监控模板已下载"))
+        .catch((error) =>
+          toast.error("问题监控模板下载失败", {
+            description:
+              error instanceof Error ? error.message : "请稍后重试。",
+          }),
+        );
+      return;
+    }
+    if (
+      (card.module === "questions" || card.module === "response-logic") &&
+      authoritativeQuestionsLoading
+    ) {
+      toast.warning("正在读取正式问题目录，请稍后再下载。");
+      return;
+    }
+    if (
+      (card.module === "questions" || card.module === "response-logic") &&
+      authoritativeQuestionsError
+    ) {
+      toast.error("正式问题目录暂时无法读取", {
+        description: authoritativeQuestionsError,
+      });
+      return;
+    }
+    if (card.module === "response-logic" && responseLogicQuery.isLoading) {
+      toast.warning("正在读取当前应答逻辑，请稍后再下载。");
+      return;
+    }
+    if (card.module === "response-logic" && responseLogicQuery.error) {
+      toast.error("当前应答逻辑暂时无法读取", {
+        description: responseLogicQuery.error.message,
+      });
+      return;
+    }
+    downloadModuleTemplate({
+      module: card.module,
+      revision,
+      payload: workspace?.payload ?? draft!,
+      responseLogicRecords: responseLogicQuery.data?.records ?? [],
+      authoritativeQuestions,
+    });
+  };
+
   if (loading || !draft) {
     return (
       <PortalCard className="grid min-h-[420px] place-items-center p-8 text-sm text-[#716a80]">
@@ -964,298 +1029,63 @@ export default function DashboardSkeletonEditor({
 
   return (
     <div className="space-y-5">
-      <PortalCard className="overflow-hidden">
-        <div className="flex flex-col gap-4 border-b border-[#e8e1ee] bg-[linear-gradient(135deg,#fbf8fd,#f4edf8)] p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
-          <div>
-            <div className="flex items-center gap-2 text-[#5b2a86]">
-              <LayoutTemplate className="h-5 w-5" />
-              <h3 className="font-semibold">用户流程内容管理</h3>
-            </div>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-[#716a80]">
-              直接维护客户真实看板的每个分区；上传、预检并发布后，客户账号读取同一份内容。
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded-lg border border-[#ded3e6] bg-white px-3 py-2 text-xs text-[#716a80]">
-              内容版本 R{revision}
-            </span>
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => void onWorkspaceChanged?.()}
-            >
-              <RefreshCw className="h-4 w-4" />
-              刷新
-            </Button>
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => setPreviewOpen(true)}
-            >
-              <Eye className="h-4 w-4" />
-              放大查看
-            </Button>
-            <Button
-              className="bg-[#5b2a86] hover:bg-[#49216c]"
-              disabled={!dirty || busy}
-              onClick={() => void saveDashboard()}
-            >
-              {updateMutation.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Save className="h-4 w-4" />
-              )}
-              发布修改
-            </Button>
-          </div>
-        </div>
-
-        <div className="border-b border-[#e8e1ee] bg-[#f7f3f9] p-4 sm:p-6">
-          <div className="overflow-hidden rounded-2xl border border-[#ded3e6] bg-white shadow-[0_18px_45px_rgba(55,32,76,0.08)]">
-            <div className="flex flex-col gap-2 border-b border-[#e8e1ee] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <strong className="text-sm text-[#332842]">
-                  用户完整看板实时预览
-                </strong>
-                <p className="mt-1 text-xs leading-5 text-[#81778a]">
-                  下方编辑内容会立即出现在这里；只有点击“发布修改”后客户才会看到。
-                </p>
-              </div>
-              <span
-                className={`w-fit rounded-full px-3 py-1 text-xs font-semibold ${
-                  dirty
-                    ? "bg-[#fff2d6] text-[#855f08]"
-                    : "bg-[#eaf7f0] text-[#236647]"
-                }`}
+      <CustomerDashboardMirror
+        payload={draft}
+        knowledgePreview={knowledgePreview}
+        websiteWorkspace={websiteWorkspace}
+        heading="客户实际页面"
+        description="当前打开的就是客户看板本体；切换左侧分区，在原位置下载当前数据或上传修改。"
+        statusLabel={`正式版本 R${revision}`}
+        editActions={
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => void onWorkspaceChanged?.()}
+          >
+            <RefreshCw className="h-4 w-4" />
+            刷新
+          </Button>
+        }
+        renderSectionActions={(section) => {
+          if (
+            (section === "knowledge-build" || section === "knowledge") &&
+            onUploadKnowledge
+          ) {
+            return (
+              <KnowledgeInlineActions
+                uploading={knowledgeUploading}
+                onFile={onUploadKnowledge}
+              />
+            );
+          }
+          if (section === "website" && onOpenWebsiteWorkspace) {
+            return (
+              <Button
+                size="sm"
+                className="bg-[#5b2a86] hover:bg-[#49216c]"
+                onClick={onOpenWebsiteWorkspace}
               >
-                {dirty ? "有未发布修改" : `客户当前版本 R${revision}`}
-              </span>
-            </div>
-            <div className="max-h-[560px] overflow-y-auto bg-[#f6f3f8] p-3 sm:p-5">
-              <CustomerDashboardMirror
-                payload={draft}
-                initialSection={previewSection}
-                heading="用户当前所见"
-                description="品牌建设、词库、问题、监控、报告与内容资产均使用同一份客户数据。"
-              />
-            </div>
-          </div>
-        </div>
-
-        <div className="grid gap-5 p-5 sm:p-6 xl:grid-cols-[minmax(0,1fr)_320px]">
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <Building2 className="h-4 w-4 text-[#5b2a86]" />
-              <h4 className="font-semibold text-[#221a33]">
-                更新首页标题与简介
-              </h4>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <EditorField label="企业名称">
-                <Input
-                  aria-label="企业名称"
-                  value={draft.brandName}
-                  maxLength={160}
-                  disabled={busy || enterpriseIdentityBound}
-                  onChange={(event) =>
-                    patchDraft({ brandName: event.target.value })
-                  }
-                />
-                {enterpriseIdentityBound && (
-                  <span className="block text-xs leading-5 text-[#8a8194]">
-                    企业身份已绑定。为避免知识库、监控与应答逻辑串库，更换企业请新建用户账号。
-                  </span>
-                )}
-              </EditorField>
-              <EditorField label="客户看到的主标题">
-                <Input
-                  aria-label="客户看到的主标题"
-                  value={draft.headline}
-                  maxLength={300}
-                  disabled={busy}
-                  onChange={(event) =>
-                    patchDraft({ headline: event.target.value })
-                  }
-                />
-              </EditorField>
-            </div>
-            <EditorField label="客户看到的企业简介">
-              <Textarea
-                value={draft.summary}
-                rows={4}
-                maxLength={4_000}
+                打开官网交付
+              </Button>
+            );
+          }
+          return dashboardModulesForSection(section).map((module) => {
+            const card = importCards.find((item) => item.module === module);
+            if (!card) return null;
+            return (
+              <ModuleInlineActions
+                key={card.module}
+                definition={card}
                 disabled={busy}
-                className="resize-y"
-                onChange={(event) =>
-                  patchDraft({ summary: event.target.value })
-                }
+                importing={importingKey === card.module}
+                onTemplate={() => downloadCurrentModule(card)}
+                onFile={(file) => void importModule(card.module, file)}
               />
-            </EditorField>
-          </div>
-
-          <div className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
-            <strong className="text-sm text-[#484057]">
-              修改如何同步给客户
-            </strong>
-            <ul className="mt-3 space-y-2 text-xs leading-5 text-[#716a80]">
-              <li>首次发布会绑定企业名称，之后不能在同一账号切换企业。</li>
-              <li>编辑时只更新上方预览，点击“发布修改”才会同步给客户。</li>
-              <li>下方每个用户页面分区都可单独下载、预览和上传。</li>
-              <li>版本冲突时不会覆盖其他管理员的更新。</li>
-            </ul>
-            <label className="mt-4 block text-xs font-semibold text-[#716a80]">
-              本次发布说明（可选）
-              <Input
-                value={publishReason}
-                disabled={busy}
-                maxLength={2_000}
-                className="mt-2 bg-white text-xs"
-                placeholder="例如：更新产品参数与客户案例"
-                onChange={(event) => setPublishReason(event.target.value)}
-              />
-            </label>
-            {dirty && (
-              <p className="mt-4 rounded-xl bg-[#fff5dc] px-3 py-2 text-xs text-[#8b6500]">
-                当前有尚未发布的修改，请发布或刷新后再使用批量更新工具。
-              </p>
-            )}
-          </div>
-        </div>
-      </PortalCard>
-
-      {!profileOnly && (
-        <>
-          <MetricEditor
-            metrics={draft.metrics}
-            disabled={busy}
-            onChange={(metrics) => patchDraft({ metrics })}
-          />
-
-          <SectionEditor
-            sections={draft.sections}
-            disabled={busy}
-            importingKey={importingKey}
-            tableImportDisabled={!enterpriseIdentityBound}
-            onChange={(sections) => patchDraft({ sections })}
-            onImportTable={(sectionId, file) =>
-              void importModule("section-table", file, sectionId)
-            }
-          />
-
-          <OptimizationReportEditor
-            userId={userId}
-            report={draft.optimizationReport}
-            questions={draft.questions}
-            disabled={busy}
-            onChange={(optimizationReport) =>
-              patchDraft({ optimizationReport })
-            }
-          />
-        </>
-      )}
-
-      <PortalCard className="overflow-hidden">
-        <div className="flex items-center gap-2 border-b border-[#e8e1ee] p-5 sm:p-6">
-          <UploadCloud className="h-5 w-5 text-[#5b2a86]" />
-          <div>
-            <h3 className="font-semibold text-[#171321]">用户页面分区更新</h3>
-            <p className="mt-1 text-sm leading-6 text-[#716a80]">
-              每个分区都可先预览用户所见，再下载当前内容或上传更新文件。
-            </p>
-          </div>
-        </div>
-        <div className="p-5 sm:p-6">
-          <p className="mb-5 text-sm leading-6 text-[#716a80]">
-            每类数据会单独校验和发布。上传前请保持问题 ID、资产 ID
-            等关联字段不变。
-          </p>
-          {!enterpriseIdentityBound && (
-            <p className="mb-5 rounded-xl bg-[#fff5dc] px-3 py-2 text-xs leading-5 text-[#8b6500]">
-              请先确认企业名称并点击“发布修改”，或先上传“首页标题与简介”；企业身份确认后才可上传其他数据。
-            </p>
-          )}
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {importCards
-              .filter((card) => !profileOnly || card.module === "profile")
-              .map((card) => (
-                <ModuleUploadCard
-                  key={card.module}
-                  definition={card}
-                  disabled={
-                    busy ||
-                    dirty ||
-                    (!enterpriseIdentityBound && card.module !== "profile")
-                  }
-                  importing={importingKey === card.module}
-                  onPreview={() => {
-                    setPreviewSection(
-                      dashboardModulePreviewSection(card.module),
-                    );
-                    setPreviewOpen(true);
-                  }}
-                  onTemplate={() => {
-                    if (card.module === "monitoring") {
-                      void downloadMonitoringCurrentTemplate(userId)
-                        .then(() => toast.success("当前问题监控模板已下载"))
-                        .catch((error) =>
-                          toast.error("问题监控模板下载失败", {
-                            description:
-                              error instanceof Error
-                                ? error.message
-                                : "请稍后重试。",
-                          }),
-                        );
-                      return;
-                    }
-                    if (
-                      (card.module === "questions" ||
-                        card.module === "response-logic") &&
-                      authoritativeQuestionsLoading
-                    ) {
-                      toast.warning("正在读取正式问题目录，请稍后再下载。");
-                      return;
-                    }
-                    if (
-                      (card.module === "questions" ||
-                        card.module === "response-logic") &&
-                      authoritativeQuestionsError
-                    ) {
-                      toast.error("正式问题目录暂时无法读取", {
-                        description: authoritativeQuestionsError,
-                      });
-                      return;
-                    }
-                    if (
-                      card.module === "response-logic" &&
-                      responseLogicQuery.isLoading
-                    ) {
-                      toast.warning("正在读取当前应答逻辑，请稍后再下载。");
-                      return;
-                    }
-                    if (
-                      card.module === "response-logic" &&
-                      responseLogicQuery.error
-                    ) {
-                      toast.error("当前应答逻辑暂时无法读取", {
-                        description: responseLogicQuery.error.message,
-                      });
-                      return;
-                    }
-                    downloadModuleTemplate({
-                      module: card.module,
-                      revision,
-                      payload: workspace?.payload ?? draft,
-                      responseLogicRecords:
-                        responseLogicQuery.data?.records ?? [],
-                      authoritativeQuestions,
-                    });
-                  }}
-                  onFile={(file) => void importModule(card.module, file)}
-                />
-              ))}
-          </div>
-        </div>
-      </PortalCard>
+            );
+          });
+        }}
+      />
 
       <Dialog
         open={Boolean(pendingDashboardModuleImport)}
@@ -1726,27 +1556,6 @@ export default function DashboardSkeletonEditor({
           )}
         </DialogContent>
       </Dialog>
-
-      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
-        <DialogContent className="max-h-[92vh] max-w-[min(1180px,calc(100vw-2rem))] overflow-hidden p-0">
-          <DialogHeader className="border-b border-[#e8e1ee] px-6 py-5 text-left">
-            <DialogTitle>
-              {dirty ? "未发布内容预览" : `当前内容预览 · R${revision}`}
-            </DialogTitle>
-            <DialogDescription>
-              此预览只使用当前编辑器中的数据，不会写入数据库或触发用户端更新。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="max-h-[calc(92vh-104px)] overflow-y-auto bg-[#f6f3f8] p-4 sm:p-6">
-            <CustomerDashboardMirror
-              payload={draft}
-              initialSection={previewSection}
-              heading="用户完整看板"
-              description="此预览与用户端读取同一份草稿数据；发布后才会替换客户当前版本。"
-            />
-          </div>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
@@ -1812,7 +1621,7 @@ function MetricEditor({
         <div>
           <div className="flex items-center gap-2">
             <BarChart3 className="h-5 w-5 text-[#5b2a86]" />
-            <h3 className="font-semibold text-[#171321]">首页数据概览</h3>
+            <h3 className="font-semibold text-[#171321]">数据卡片</h3>
           </div>
           <p className="mt-1 text-xs leading-5 text-[#716a80]">
             对应客户看板顶部的数据卡片。文档、图片和字数由发布版本自动校准，其他展示数据可直接维护。
@@ -1930,7 +1739,7 @@ function SectionEditor({
         <div>
           <div className="flex items-center gap-2">
             <LayoutTemplate className="h-5 w-5 text-[#5b2a86]" />
-            <h3 className="font-semibold text-[#171321]">交付内容区</h3>
+            <h3 className="font-semibold text-[#171321]">页面内容</h3>
           </div>
           <p className="mt-1 text-xs leading-5 text-[#716a80]">
             对应上方预览中的每一块内容。可填写说明正文、图文内容和数据表格。
@@ -2000,7 +1809,7 @@ function SectionEditor({
                   }
                 />
               </EditorField>
-              <EditorField label="客户看到的区域标题">
+              <EditorField label="区域标题">
                 <Input
                   value={section.title}
                   maxLength={160}
@@ -2227,6 +2036,99 @@ function SectionTableUploadButton({
   );
 }
 
+function KnowledgeInlineActions({
+  uploading,
+  onFile,
+}: {
+  uploading: boolean;
+  onFile: (file: File) => void | Promise<void>;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  return (
+    <>
+      <Button
+        size="sm"
+        className="bg-[#5b2a86] hover:bg-[#49216c]"
+        disabled={uploading}
+        onClick={() => inputRef.current?.click()}
+      >
+        {uploading ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <UploadCloud className="h-3.5 w-3.5" />
+        )}
+        上传知识库
+      </Button>
+      <input
+        ref={inputRef}
+        hidden
+        type="file"
+        accept=".zip,.md,.markdown,.txt,.json,.csv,.html,.htm"
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          if (file) void onFile(file);
+          event.target.value = "";
+        }}
+      />
+    </>
+  );
+}
+
+function ModuleInlineActions({
+  definition,
+  disabled,
+  importing,
+  onTemplate,
+  onFile,
+}: {
+  definition: ImportCardDefinition;
+  disabled: boolean;
+  importing: boolean;
+  onTemplate: () => void;
+  onFile: (file: File) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  return (
+    <div className="inline-flex flex-wrap items-center gap-2">
+      <span className="text-xs font-semibold text-[#5b2a86]">
+        {definition.title}
+      </span>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={importing}
+        onClick={onTemplate}
+      >
+        下载当前数据
+      </Button>
+      <Button
+        size="sm"
+        className="bg-[#5b2a86] hover:bg-[#49216c]"
+        disabled={disabled || importing}
+        onClick={() => inputRef.current?.click()}
+      >
+        {importing ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <UploadCloud className="h-3.5 w-3.5" />
+        )}
+        上传修改
+      </Button>
+      <input
+        ref={inputRef}
+        hidden
+        type="file"
+        accept={definition.accept}
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          if (file) onFile(file);
+          event.target.value = "";
+        }}
+      />
+    </div>
+  );
+}
+
 function ModuleUploadCard({
   definition,
   disabled,
@@ -2307,15 +2209,15 @@ function ModuleUploadCard({
   );
 }
 
-function dashboardModulePreviewSection(
-  module: Exclude<DashboardImportModule, "section-table">,
-): CustomerDashboardMirrorSection {
-  if (module === "keywords") return "keywords";
-  if (module === "questions" || module === "response-logic") {
-    return "questions";
-  }
-  if (module === "monitoring") return "monitoring";
-  if (module === "optimization-report") return "report";
-  if (module === "content-assets") return "content";
-  return "brand";
+function dashboardModulesForSection(
+  section: CustomerDashboardMirrorSection,
+): Array<Exclude<DashboardImportModule, "section-table">> {
+  if (section === "home") return ["profile", "metrics", "sections"];
+  if (section === "keywords") return ["keywords"];
+  if (section === "questions") return ["questions"];
+  if (section === "response-logic") return ["response-logic"];
+  if (section === "monitoring") return ["monitoring"];
+  if (section === "report") return ["optimization-report"];
+  if (section === "content") return ["content-assets"];
+  return [];
 }

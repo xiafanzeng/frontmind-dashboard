@@ -37,6 +37,70 @@ var validationFieldLabels = {
   category: "\u7C7B\u578B",
   topic: "\u8BDD\u9898"
 };
+function localizedUserFacingError(message, code = "INTERNAL_SERVER_ERROR") {
+  const normalized = message.trim();
+  if (/[\u3400-\u9fff]/u.test(normalized)) return normalized;
+  if (/invalid (?:username|user name) or password/i.test(normalized)) {
+    return "\u7528\u6237\u540D\u6216\u5BC6\u7801\u4E0D\u6B63\u786E";
+  }
+  if (/account is disabled/i.test(normalized)) return "\u8D26\u53F7\u5DF2\u505C\u7528";
+  if (/username already exists/i.test(normalized)) return "\u7528\u6237\u540D\u5DF2\u5B58\u5728";
+  if (/password.*(?:at least|too short)/i.test(normalized)) {
+    return "\u5BC6\u7801\u957F\u5EA6\u4E0D\u8DB3\uFF0C\u8BF7\u6309\u9875\u9762\u8981\u6C42\u91CD\u65B0\u8F93\u5165";
+  }
+  if (/password.*too long/i.test(normalized)) return "\u5BC6\u7801\u957F\u5EA6\u8D85\u8FC7\u9650\u5236";
+  if (/api credential.*not found/i.test(normalized)) {
+    return "API \u51ED\u636E\u4E0D\u5B58\u5728\u6216\u5DF2\u5931\u6548";
+  }
+  if (/conversation.*not found/i.test(normalized)) return "\u5BF9\u8BDD\u8BB0\u5F55\u4E0D\u5B58\u5728";
+  if (/workspace.*not found/i.test(normalized)) return "\u5DE5\u4F5C\u533A\u4E0D\u5B58\u5728";
+  if (/user.*not found/i.test(normalized)) return "\u7528\u6237\u4E0D\u5B58\u5728";
+  if (/not found/i.test(normalized)) return "\u8BF7\u6C42\u7684\u5185\u5BB9\u4E0D\u5B58\u5728";
+  if (/unauthorized|invalid session|please log(?:in| in)|authentication/i.test(
+    normalized
+  )) {
+    return "\u767B\u5F55\u72B6\u6001\u65E0\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55";
+  }
+  if (/forbidden|permission|access denied/i.test(normalized)) {
+    return "\u5F53\u524D\u8D26\u53F7\u65E0\u6743\u6267\u884C\u6B64\u64CD\u4F5C";
+  }
+  if (/rate limit|too many requests/i.test(normalized)) {
+    return "\u64CD\u4F5C\u8FC7\u4E8E\u9891\u7E41\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5";
+  }
+  if (/timeout|timed out/i.test(normalized)) return "\u8BF7\u6C42\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5";
+  if (/network|failed to fetch/i.test(normalized)) {
+    return "\u7F51\u7EDC\u8FDE\u63A5\u5F02\u5E38\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u540E\u91CD\u8BD5";
+  }
+  switch (code) {
+    case "BAD_REQUEST":
+    case "PARSE_ERROR":
+    case "UNPROCESSABLE_CONTENT":
+      return "\u63D0\u4EA4\u5185\u5BB9\u6709\u8BEF\uFF0C\u8BF7\u68C0\u67E5\u540E\u91CD\u8BD5";
+    case "UNAUTHORIZED":
+      return "\u8BF7\u5148\u767B\u5F55\u540E\u518D\u64CD\u4F5C";
+    case "FORBIDDEN":
+      return "\u5F53\u524D\u8D26\u53F7\u65E0\u6743\u6267\u884C\u6B64\u64CD\u4F5C";
+    case "NOT_FOUND":
+      return "\u8BF7\u6C42\u7684\u5185\u5BB9\u4E0D\u5B58\u5728";
+    case "CONFLICT":
+    case "PRECONDITION_FAILED":
+      return "\u5F53\u524D\u6570\u636E\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5";
+    case "PAYLOAD_TOO_LARGE":
+      return "\u63D0\u4EA4\u5185\u5BB9\u8FC7\u5927\uFF0C\u8BF7\u7F29\u51CF\u540E\u91CD\u8BD5";
+    case "UNSUPPORTED_MEDIA_TYPE":
+      return "\u6587\u4EF6\u683C\u5F0F\u4E0D\u53D7\u652F\u6301";
+    case "TOO_MANY_REQUESTS":
+      return "\u64CD\u4F5C\u8FC7\u4E8E\u9891\u7E41\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5";
+    case "TIMEOUT":
+    case "GATEWAY_TIMEOUT":
+      return "\u8BF7\u6C42\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5";
+    case "BAD_GATEWAY":
+    case "SERVICE_UNAVAILABLE":
+      return "\u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5";
+    default:
+      return "\u8BF7\u6C42\u6682\u65F6\u65E0\u6CD5\u5B8C\u6210\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5";
+  }
+}
 function localizedZodIssue(issue) {
   if (/[\u3400-\u9fff]/u.test(issue.message)) return issue.message;
   const rawField = String(issue.path.at(-1) ?? "\u8F93\u5165\u5185\u5BB9");
@@ -55,7 +119,12 @@ function localizedZodIssue(issue) {
 var t = initTRPC.context().create({
   transformer: superjson,
   errorFormatter({ shape, error }) {
-    if (!(error.cause instanceof ZodError)) return shape;
+    if (!(error.cause instanceof ZodError)) {
+      return {
+        ...shape,
+        message: localizedUserFacingError(shape.message, error.code)
+      };
+    }
     const issue = error.cause.issues[0];
     return {
       ...shape,
@@ -2632,21 +2701,15 @@ async function loginWithPassword(username, password, clientAddress) {
   const passwordMatches = await verifyPassword(password, passwordHash);
   if (!user || !passwordMatches) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError(
-      "INVALID_PASSWORD",
-      "Invalid username or password"
-    );
+    throw new AuthServiceError("INVALID_PASSWORD", "\u7528\u6237\u540D\u6216\u5BC6\u7801\u4E0D\u6B63\u786E");
   }
   if (!user.isActive) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError("ACCOUNT_DISABLED", "Account is disabled");
+    throw new AuthServiceError("ACCOUNT_DISABLED", "\u8D26\u53F7\u5DF2\u505C\u7528");
   }
   if (user.role === "admin" && !isExplicitAdminAccessLevel(user.adminAccessLevel)) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError(
-      "ACCOUNT_DISABLED",
-      "Administrator access level is not configured"
-    );
+    throw new AuthServiceError("ACCOUNT_DISABLED", "\u7BA1\u7406\u5458\u6743\u9650\u5C1A\u672A\u914D\u7F6E");
   }
   loginAttempts.delete(attemptKey);
   const lastSignedIn = /* @__PURE__ */ new Date();
@@ -8957,15 +9020,12 @@ async function createServicePurchaseIntent(input) {
 }
 
 // server/auth-router.ts
-var passwordSchema = z7.string().min(
-  MIN_PASSWORD_LENGTH,
-  `Password must contain at least ${MIN_PASSWORD_LENGTH} characters`
-).max(MAX_PASSWORD_LENGTH, "Password is too long");
+var passwordSchema = z7.string().min(MIN_PASSWORD_LENGTH, `\u5BC6\u7801\u81F3\u5C11\u9700\u8981 ${MIN_PASSWORD_LENGTH} \u4E2A\u5B57\u7B26`).max(MAX_PASSWORD_LENGTH, `\u5BC6\u7801\u4E0D\u80FD\u8D85\u8FC7 ${MAX_PASSWORD_LENGTH} \u4E2A\u5B57\u7B26`);
 function toTrpcError(error) {
   if (!(error instanceof AuthServiceError)) {
     return new TRPCError2({
       code: "INTERNAL_SERVER_ERROR",
-      message: "The request could not be completed",
+      message: "\u8BF7\u6C42\u6682\u65F6\u65E0\u6CD5\u5B8C\u6210\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
       cause: error
     });
   }
@@ -8993,7 +9053,7 @@ function toTrpcError(error) {
     case "INVALID_MASTER_KEY":
       return new TRPCError2({
         code: "INTERNAL_SERVER_ERROR",
-        message: "The service is not configured correctly",
+        message: "\u670D\u52A1\u914D\u7F6E\u5F02\u5E38\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458",
         cause: error
       });
   }
@@ -14256,7 +14316,7 @@ var manualServiceAccountTargetSchema = z8.discriminatedUnion("mode", [
     mode: z8.literal("create"),
     username: usernameSchema,
     displayName: z8.string().trim().min(2).max(128),
-    password: z8.string().min(8, "Password must contain at least 8 characters").max(MAX_PASSWORD_LENGTH, "Password is too long")
+    password: z8.string().min(8, "\u5BC6\u7801\u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(MAX_PASSWORD_LENGTH, `\u5BC6\u7801\u4E0D\u80FD\u8D85\u8FC7 ${MAX_PASSWORD_LENGTH} \u4E2A\u5B57\u7B26`)
   }).strict(),
   z8.object({
     mode: z8.literal("bind_existing"),
@@ -20537,13 +20597,25 @@ var TERMINAL_DELIVERY_STATUSES = [
   "rejected",
   "cancelled"
 ];
+function deliveryHistoryTimestamp(value) {
+  const timestamp2 = value instanceof Date ? value.getTime() : typeof value === "number" ? value : typeof value === "string" && value.trim() ? new Date(value).getTime() : Number.NaN;
+  if (!Number.isFinite(timestamp2)) {
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "\u4EFB\u52A1\u8BB0\u5F55\u7684\u65F6\u95F4\u6570\u636E\u65E0\u6548\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5"
+    );
+  }
+  return timestamp2;
+}
 async function getMyDeliveryHistory(input) {
   if (input.actor.role !== "delivery_member") {
     throw new AuthServiceError("INVALID_CREDENTIAL", "\u8BE5\u8BB0\u5F55\u4EC5\u5BF9\u5DE5\u7A0B\u5E08\u5F00\u653E");
   }
   const db = await requireDb12();
   const cursorDate = input.cursor ? new Date(input.cursor.resolvedAt) : void 0;
-  const resolvedSortAt = sql3`COALESCE(${deliveryTickets.resolvedAt}, ${deliveryTickets.updatedAt})`;
+  const resolvedSortAt = sql3`COALESCE(${deliveryTickets.resolvedAt}, ${deliveryTickets.updatedAt})`.mapWith(
+    deliveryTickets.updatedAt
+  );
   const [rows, customerRows, operationRows] = await Promise.all([
     db.select({
       ticket: deliveryTickets,
@@ -20596,7 +20668,7 @@ async function getMyDeliveryHistory(input) {
       status: ticket.status,
       publicSummary: ticket.publicSummary,
       resultExcerpt: ticket.publicSummary || ticket.internalNote || ticket.description || "\u5DF2\u5B8C\u6210\u5904\u7406\uFF0C\u70B9\u51FB\u67E5\u770B\u8BE6\u7EC6\u8BB0\u5F55\u3002",
-      resolvedAt: resolvedSortAt2.getTime(),
+      resolvedAt: deliveryHistoryTimestamp(resolvedSortAt2),
       updatedAt: ticket.updatedAt.getTime()
     })
   );
@@ -20611,7 +20683,7 @@ async function getMyDeliveryHistory(input) {
       operations: operationRows.map((row) => row.operation).filter((operation) => Boolean(operation))
     },
     nextCursor: hasMore && last ? {
-      resolvedAt: last.resolvedSortAt.getTime(),
+      resolvedAt: deliveryHistoryTimestamp(last.resolvedSortAt),
       id: last.ticket.id
     } : null
   };
@@ -29880,7 +29952,7 @@ router2.post("/download-token", async (req, res) => {
     const fileId = req.body?.fileId || "";
     if (!apiKey) {
       return res.status(401).json({
-        error: { message: "Missing API key", code: "MISSING_API_KEY" }
+        error: { message: "\u5C1A\u672A\u914D\u7F6E API Key", code: "MISSING_API_KEY" }
       });
     }
     if (!fileId) {
@@ -30118,7 +30190,7 @@ router2.all("/*", async (req, res) => {
   try {
     if (!apiKey) {
       return res.status(401).json({
-        error: { message: "Missing API key", code: "MISSING_API_KEY" }
+        error: { message: "\u5C1A\u672A\u914D\u7F6E API Key", code: "MISSING_API_KEY" }
       });
     }
     const targetPath = req.originalUrl.replace(/^\/api\/frontmind/, "");
@@ -32496,7 +32568,7 @@ router4.post(["/start", "/turn"], async (req, res) => {
   }
   const activeCredentials = getFrontMindCredentials(req);
   if (!activeCredentials.apiKey) {
-    res.status(401).json({ error: { message: "Missing API key" } });
+    res.status(401).json({ error: { message: "\u5C1A\u672A\u914D\u7F6E API Key" } });
     return;
   }
   let logSecret = activeCredentials.apiKey;
@@ -32614,9 +32686,7 @@ router4.post(["/start", "/turn"], async (req, res) => {
           );
         } catch (error) {
           await Promise.allSettled(
-            generatedAttachments.map(
-              (attachment) => attachment.removeOrphan()
-            )
+            generatedAttachments.map((attachment) => attachment.removeOrphan())
           );
           throw error;
         }
@@ -32687,9 +32757,7 @@ router4.post(["/start", "/turn"], async (req, res) => {
           taskId: String(created.task.id)
         });
         await Promise.allSettled(
-          generatedAttachments.map(
-            (attachment) => attachment.removeOrphan()
-          )
+          generatedAttachments.map((attachment) => attachment.removeOrphan())
         );
       }
       throw persistenceError;
@@ -40052,6 +40120,7 @@ var prepared_file_router_default = router7;
 
 // server/presales-proxy.ts
 import { createHash as createHash16, createHmac as createHmac5, timingSafeEqual as timingSafeEqual6 } from "node:crypto";
+import { once } from "node:events";
 import { Transform } from "node:stream";
 import {
   Router as Router7,
@@ -41849,6 +41918,22 @@ function safeFilename(value, fallback = "download") {
   const filename = String(value || fallback).replace(/[\\/\0\r\n]/g, "_").trim();
   return filename || fallback;
 }
+function filenameFromContentDisposition(value, fallback) {
+  const disposition = String(value || "");
+  const encoded = disposition.match(
+    /filename\*\s*=\s*(?:"?UTF-8''([^";\r\n]+)"?)/i
+  )?.[1];
+  if (encoded) {
+    try {
+      return safeFilename(decodeURIComponent(encoded.trim()), fallback);
+    } catch {
+    }
+  }
+  const plain = disposition.match(
+    /filename\s*=\s*(?:"([^"\r\n]+)"|([^;\s\r\n]+))/i
+  );
+  return safeFilename(plain?.[1] || plain?.[2], fallback);
+}
 function upstreamErrorDetail(data, fallback, apiKey) {
   const detail = String(
     data?.error?.message ?? data?.message ?? fallback
@@ -42429,16 +42514,30 @@ async function streamExternalOutput(res, target, filename) {
   );
   response2.data.pipe(res);
 }
+function sendFileContentDownloadFailure(res, input) {
+  console.warn("[Presales Proxy] File content download failed", {
+    phase: "file_content_download",
+    fileId: input.fileId,
+    upstreamStatus: input.upstreamStatus,
+    errorCode: input.errorCode
+  });
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  res.status(
+    input.upstreamStatus && input.upstreamStatus >= 400 ? forwardedStatus(input.upstreamStatus) : 502
+  ).json({
+    error: {
+      code: input.errorCode,
+      message: "File content download failed"
+    }
+  });
+}
 router8.get("/files/:fileId/content", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
     const credential = await requireResourceCredential("file", fileId);
-    const metadata = await fetchFileMetadata2(fileId, credential);
-    const filename = safeFilename(metadata.filename, fileId);
-    if (metadata.upload_url) {
-      await streamExternalOutput(res, String(metadata.upload_url), filename);
-      return;
-    }
     const response2 = await axios10.get(
       `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}/content`,
       {
@@ -42450,23 +42549,85 @@ router8.get("/files/:fileId/content", async (req, res) => {
       }
     );
     if (response2.status < 200 || response2.status >= 300) {
-      return res.status(forwardedStatus(response2.status)).json({
-        error: {
-          code: "OUTPUT_DOWNLOAD_FAILED",
-          message: "Output download failed"
-        }
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response2.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_FAILED"
       });
+      return;
     }
-    res.setHeader(
-      "Content-Type",
-      String(response2.headers["content-type"] ?? "application/octet-stream")
+    const declaredLengthHeader = response2.headers["content-length"];
+    const declaredLength = declaredLengthHeader === void 0 ? void 0 : Number(declaredLengthHeader);
+    if (declaredLength === 0) {
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response2.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_EMPTY"
+      });
+      return;
+    }
+    if (declaredLength !== void 0 && (!Number.isSafeInteger(declaredLength) || declaredLength < 0 || declaredLength > MAX_PROXY_UPLOAD_BYTES)) {
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response2.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_TOO_LARGE"
+      });
+      return;
+    }
+    const filename = filenameFromContentDisposition(
+      response2.headers["content-disposition"],
+      fileId
     );
-    const encoded = encodeURIComponent(filename);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`
-    );
-    response2.data.pipe(res);
+    let streamedBytes = 0;
+    try {
+      for await (const value of response2.data) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        if (!chunk.length) continue;
+        if (streamedBytes + chunk.length > MAX_PROXY_UPLOAD_BYTES) {
+          sendFileContentDownloadFailure(res, {
+            fileId,
+            upstreamStatus: response2.status,
+            errorCode: "UPSTREAM_FILE_CONTENT_TOO_LARGE"
+          });
+          return;
+        }
+        if (streamedBytes === 0) {
+          res.status(200);
+          res.setHeader(
+            "Content-Type",
+            String(
+              response2.headers["content-type"] ?? "application/octet-stream"
+            )
+          );
+          if (declaredLength !== void 0) {
+            res.setHeader("Content-Length", String(declaredLength));
+          }
+          const encoded = encodeURIComponent(filename);
+          res.setHeader(
+            "Content-Disposition",
+            `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`
+          );
+        }
+        streamedBytes += chunk.length;
+        if (!res.write(chunk)) await once(res, "drain");
+      }
+    } catch {
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response2.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_STREAM_FAILED"
+      });
+      return;
+    }
+    if (!streamedBytes) {
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response2.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_EMPTY"
+      });
+      return;
+    }
+    res.end();
   } catch (error) {
     sendKnownError(res, error);
   }
@@ -45711,7 +45872,7 @@ async function startServer() {
     manus_proxy_default
   );
   app.use("/api/manus", (_req, res) => {
-    res.status(404).json({ error: { message: "Not found", code: "NOT_FOUND" } });
+    res.status(404).json({ error: { message: "\u63A5\u53E3\u4E0D\u5B58\u5728", code: "NOT_FOUND" } });
   });
   app.use(
     "/api/knowledge-base",
@@ -45741,7 +45902,7 @@ async function startServer() {
     })
   );
   app.use("/api", (_req, res) => {
-    res.status(404).json({ error: { message: "Not found", code: "NOT_FOUND" } });
+    res.status(404).json({ error: { message: "\u63A5\u53E3\u4E0D\u5B58\u5728", code: "NOT_FOUND" } });
   });
   if (process.env.NODE_ENV === "development") {
     await setupVite(app, server);

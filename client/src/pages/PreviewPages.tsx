@@ -919,7 +919,7 @@ function downloadPreviewDeliveryTemplate(
 export function PreviewDeliveryControl({ userName }: { userName: string }) {
   const [revision, setRevision] = useState(6);
   const [previewSection, setPreviewSection] =
-    useState<CustomerDashboardMirrorSection>("brand");
+    useState<CustomerDashboardMirrorSection>("keywords");
   const previewPayload = useMemo(
     () => ({
       ...previewCustomerDashboardPayload,
@@ -952,7 +952,7 @@ export function PreviewDeliveryControl({ userName }: { userName: string }) {
           <div className="flex gap-2">
             <Button
               variant="outline"
-              onClick={() => setPreviewSection("brand")}
+              onClick={() => setPreviewSection("keywords")}
             >
               预览
             </Button>
@@ -1082,7 +1082,7 @@ function previewSectionForModule(
   if (module === "monitoring") return "monitoring";
   if (module === "progress-report") return "report";
   if (module === "content-assets") return "content";
-  return "brand";
+  return "keywords";
 }
 
 function PreviewServiceManager({

@@ -65,8 +65,12 @@ describe("admin customer workspace", () => {
     expect(source).toContain('{tab === "service" &&');
     expect(source).toContain("<DashboardSkeletonEditor");
     expect(source).toContain("<CustomerDashboardMirror");
-    expect(source).toContain("客户正式页面协调视图");
-    expect(source).toContain("不能在此代替工程师修改或发布内容");
+    expect(source).toContain('heading="客户实际页面"');
+    expect(source).toContain(
+      'description="这里与客户账号看到的完整看板一致。"',
+    );
+    expect(source).toContain("websiteWorkspace={websiteWorkspacePreview}");
+    expect(source).toContain("knowledgePreview={{");
     expect(source).not.toContain('{tab === "delivery"');
     expect(source).not.toContain('{tab === "activity"');
     expect(source).not.toContain("客户工作区操作记录");

@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   retrieveTask: vi.fn(),
   updateStatus: vi.fn(),
   updateAssistantMessages: vi.fn(),
+  addMessage: vi.fn(),
   parseOutputMessages: vi.fn((..._args: any[]): any[] => []),
   sanitizeKnowledgeBaseOutputMessages: vi.fn((messages: any[]) => messages),
   fetchKnowledgeBaseProgress: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock("@/contexts/ConversationContext", () => ({
     state: { conversations: mocks.conversations },
     updateStatus: mocks.updateStatus,
     updateAssistantMessages: mocks.updateAssistantMessages,
+    addMessage: mocks.addMessage,
   }),
   parseOutputMessages: mocks.parseOutputMessages,
   sanitizeKnowledgeBaseOutputMessages:
@@ -29,6 +31,7 @@ vi.mock("@/contexts/ConversationContext", () => ({
 vi.mock("@/lib/frontmind-api", () => ({
   retrieveTask: mocks.retrieveTask,
   creditEventBus: { emit: vi.fn() },
+  sanitizeBrandText: (value: string) => value.replace(/Manus/gi, "FrontMind"),
 }));
 
 vi.mock("@/lib/knowledge-progress", () => ({
@@ -169,6 +172,172 @@ describe("useResumePolling hydration gate", () => {
       expect.arrayContaining([
         expect.objectContaining({ id: "new-1", content: "new answer" }),
       ]),
+    );
+
+    unmount();
+  });
+
+  it("renders running knowledge-base text without unlocking the conversation", async () => {
+    mocks.hydrated = true;
+    mocks.conversations = [
+      {
+        id: "kb-running",
+        title: "Knowledge",
+        messages: [
+          {
+            id: "user-current",
+            role: "user",
+            content: "开始构建企业知识库",
+            timestamp: 1,
+          },
+        ],
+        status: "running",
+        taskId: "task-kb-running",
+        createdAt: 1,
+        startedAt: 1,
+        updatedAt: 1,
+        lastKnownOutputLength: 0,
+      },
+    ];
+    const runningOutput = [
+      {
+        id: "collection-status",
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "FrontMind 正在按业务分支进行资料采集。",
+          },
+        ],
+      },
+    ];
+    mocks.retrieveTask.mockResolvedValue({
+      id: "task-kb-running",
+      status: "running",
+      output: runningOutput,
+    });
+    mocks.fetchKnowledgeBaseProgress.mockResolvedValue({
+      build: { id: "build", conversationId: "kb-running" },
+    });
+    mocks.reconcileKnowledgeBaseProgress.mockResolvedValue({
+      progress: {
+        build: { id: "build", conversationId: "kb-running" },
+      },
+      interactionState: "executing",
+      canReply: false,
+      canPublish: false,
+      lockReason: "任务仍在执行",
+    });
+    mocks.parseOutputMessages.mockReturnValue([
+      {
+        id: "collection-status",
+        upstreamOutputId: "collection-status",
+        role: "assistant",
+        content: "FrontMind 正在按业务分支进行资料采集。",
+        timestamp: 2,
+      },
+    ]);
+
+    const { unmount } = renderHook(() => useResumePolling());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
+      "kb-running",
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: "FrontMind 正在按业务分支进行资料采集。",
+        }),
+      ]),
+    );
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "kb-running",
+      "running",
+      expect.not.objectContaining({ lastKnownOutputLength: expect.anything() }),
+    );
+    expect(mocks.updateStatus).not.toHaveBeenCalledWith(
+      "kb-running",
+      "awaiting_input",
+      expect.anything(),
+    );
+
+    unmount();
+  });
+
+  it("keeps safe text and persists an error when terminal knowledge protocol validation fails", async () => {
+    mocks.hydrated = true;
+    mocks.conversations = [
+      {
+        id: "kb-invalid",
+        title: "Knowledge",
+        messages: [
+          {
+            id: "user-current",
+            role: "user",
+            content: "确认",
+            timestamp: 1,
+          },
+        ],
+        status: "running",
+        taskId: "task-kb-invalid",
+        createdAt: 1,
+        startedAt: 1,
+        updatedAt: 1,
+        lastKnownOutputLength: 0,
+      },
+    ];
+    mocks.retrieveTask.mockResolvedValue({
+      id: "task-kb-invalid",
+      status: "completed",
+      output: [
+        {
+          id: "safe-final-text",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "最后一条安全正文" }],
+        },
+      ],
+    });
+    mocks.fetchKnowledgeBaseProgress.mockResolvedValue({
+      build: { id: "build", conversationId: "kb-invalid" },
+    });
+    mocks.reconcileKnowledgeBaseProgress.mockRejectedValue(
+      new Error("Manus envelope is incomplete"),
+    );
+    mocks.parseOutputMessages.mockReturnValue([
+      {
+        id: "safe-final-text",
+        upstreamOutputId: "safe-final-text",
+        role: "assistant",
+        content: "最后一条安全正文",
+        timestamp: 2,
+      },
+    ]);
+
+    const { unmount } = renderHook(() => useResumePolling());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
+      "kb-invalid",
+      expect.arrayContaining([
+        expect.objectContaining({ content: "最后一条安全正文" }),
+      ]),
+    );
+    expect(mocks.addMessage).toHaveBeenCalledWith(
+      "kb-invalid",
+      expect.objectContaining({
+        id: "msg-kb-error-task-kb-invalid",
+        content: expect.stringContaining("FrontMind envelope is incomplete"),
+      }),
+    );
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "kb-invalid",
+      "error",
+      expect.objectContaining({ lastKnownOutputLength: 1 }),
     );
 
     unmount();

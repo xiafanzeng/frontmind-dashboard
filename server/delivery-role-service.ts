@@ -1019,6 +1019,24 @@ const TERMINAL_DELIVERY_STATUSES = [
   "cancelled",
 ] as const;
 
+export function deliveryHistoryTimestamp(value: unknown): number {
+  const timestamp =
+    value instanceof Date
+      ? value.getTime()
+      : typeof value === "number"
+        ? value
+        : typeof value === "string" && value.trim()
+          ? new Date(value).getTime()
+          : Number.NaN;
+  if (!Number.isFinite(timestamp)) {
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "任务记录的时间数据无效，请稍后重试",
+    );
+  }
+  return timestamp;
+}
+
 export async function getMyDeliveryHistory(input: {
   actor: AuthenticatedUser;
   status?: (typeof TERMINAL_DELIVERY_STATUSES)[number];
@@ -1034,7 +1052,10 @@ export async function getMyDeliveryHistory(input: {
   const cursorDate = input.cursor
     ? new Date(input.cursor.resolvedAt)
     : undefined;
-  const resolvedSortAt = sql<Date>`COALESCE(${deliveryTickets.resolvedAt}, ${deliveryTickets.updatedAt})`;
+  const resolvedSortAt =
+    sql<Date>`COALESCE(${deliveryTickets.resolvedAt}, ${deliveryTickets.updatedAt})`.mapWith(
+      deliveryTickets.updatedAt,
+    );
   const [rows, customerRows, operationRows] = await Promise.all([
     db
       .select({
@@ -1114,7 +1135,7 @@ export async function getMyDeliveryHistory(input: {
         ticket.internalNote ||
         ticket.description ||
         "已完成处理，点击查看详细记录。",
-      resolvedAt: resolvedSortAt.getTime(),
+      resolvedAt: deliveryHistoryTimestamp(resolvedSortAt),
       updatedAt: ticket.updatedAt.getTime(),
     }),
   );
@@ -1133,7 +1154,7 @@ export async function getMyDeliveryHistory(input: {
     nextCursor:
       hasMore && last
         ? {
-            resolvedAt: last.resolvedSortAt.getTime(),
+            resolvedAt: deliveryHistoryTimestamp(last.resolvedSortAt),
             id: last.ticket.id,
           }
         : null,

@@ -84,6 +84,13 @@ vi.mock("@/lib/trpc", () => ({
 }));
 
 vi.mock("@/components/PortalShell", () => ({
+  PortalCard: ({
+    children,
+    className,
+  }: {
+    children?: React.ReactNode;
+    className?: string;
+  }) => <section className={className}>{children}</section>,
   default: ({
     eyebrow,
     title,
@@ -114,6 +121,7 @@ vi.mock("@/pages/AdminDashboard", () => ({
 
 import DeliveryMemberDashboard, {
   deliveryMemberNavForRole,
+  ROLE_DASHBOARD_SECTIONS,
 } from "./DeliveryMemberDashboard";
 
 describe("DeliveryMemberDashboard project context", () => {
@@ -146,6 +154,27 @@ describe("DeliveryMemberDashboard project context", () => {
         (item) => item.label,
       ),
     ).not.toContain("问题监控");
+  });
+
+  it("limits every engineer preview to customer-facing output owned by that role", () => {
+    expect(ROLE_DASHBOARD_SECTIONS.ai_operations_engineer).toEqual([
+      "knowledge-build",
+      "knowledge",
+      "website",
+    ]);
+    expect(ROLE_DASHBOARD_SECTIONS.monitoring_optimization_engineer).toEqual([
+      "keywords",
+      "questions",
+      "monitoring",
+      "report",
+    ]);
+    expect(ROLE_DASHBOARD_SECTIONS.content_distribution_engineer).toEqual([
+      "content",
+    ]);
+
+    for (const sections of Object.values(ROLE_DASHBOARD_SECTIONS)) {
+      expect(sections).not.toContain("brand");
+    }
   });
 
   it("shows the project-assignment empty state and clears a stale selection", async () => {
@@ -203,6 +232,100 @@ describe("DeliveryMemberDashboard project context", () => {
       DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
       "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
     );
+  });
+
+  it("shows only the current engineer role and highlights newly submitted tickets in red", async () => {
+    mocks.assignments = [
+      {
+        projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+        customerUserId: 101,
+        customerName: "示例客户",
+        customerUsername: "example.customer",
+        roleType: "ai_operations_engineer",
+      },
+    ];
+    mocks.workbenchData = {
+      customers: [],
+      counts: {
+        submitted: 1,
+        scheduled: 0,
+        in_progress: 0,
+        needs_information: 0,
+        completed: 0,
+      },
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+          userId: 101,
+          title: "客户新提交的官网工单",
+          operation: "site_check",
+          status: "submitted",
+          createdByUserId: 101,
+          revision: 1,
+          updatedAt: Date.parse("2026-07-31T00:00:00.000Z"),
+        },
+      ],
+      customerQuestions: [],
+      dashboard: {
+        revision: 3,
+        payload: {
+          brandName: "示例客户",
+          headline: "不应显示的品牌建设内容",
+          summary: "",
+          metrics: [],
+          sections: [],
+          keywordTables: [],
+          questions: [],
+          monitoringAnswers: [],
+          citations: [],
+          contentAssets: [],
+          optimizationReport: null,
+          progressReports: [],
+        },
+      },
+      aiOperationsPreview: {
+        websiteWorkspace: {
+          marketEdition: "domestic",
+          quotas: {
+            content_asset_publish: {},
+            website_content_publish: {},
+          },
+          contentAssetCatalog: [],
+          websiteContentCatalog: [],
+          preferredMediaOptions: [],
+          deliveryOwners: {},
+          websiteWorkflow: {
+            domainStatus: "completed",
+            icpStatus: "completed",
+            canSubmitContent: true,
+          },
+          tickets: [],
+        },
+        knowledgeProgress: null,
+        knowledgeSnapshot: null,
+      },
+    };
+
+    render(<DeliveryMemberDashboard />);
+
+    expect(await screen.findByText("我的岗位职责")).toBeInTheDocument();
+    expect(screen.getByText("AI 运维工程师")).toBeInTheDocument();
+    expect(screen.queryByText("AI 监控与优化工程师")).not.toBeInTheDocument();
+    expect(screen.queryByText("AI 内容分发工程师")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("客户", { selector: "h3" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("用户新提交")).toBeInTheDocument();
+    const newTicketCard = document.querySelector(
+      "[data-new-customer-ticket='true']",
+    );
+    expect(newTicketCard).toHaveTextContent("客户新提交的官网工单");
+    expect(newTicketCard).toHaveClass("border-red-500", "ring-red-500/25");
+    expect(screen.queryByRole("tab", { name: "品牌建设" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "AI 友好内容" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: /修改并发布：客户新提交的官网工单/ }),
+    ).toBeInTheDocument();
   });
 
   it("shows customer names and opens the full knowledge-reset history detail", () => {
@@ -325,18 +448,13 @@ describe("DeliveryMemberDashboard project context", () => {
       await screen.findByRole("button", { name: "填写交付结果" }),
     );
 
-    expect(
-      screen.getByText("完成交付并确认下游交接"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("完成交付并确认下游交接")).toBeInTheDocument();
     expect(screen.getByText(/系统会按所选发布目标/)).toBeInTheDocument();
     expect(screen.queryByText("media、website")).not.toBeInTheDocument();
 
-    fireEvent.change(
-      screen.getByPlaceholderText(/已完成首轮问题监控/),
-      {
-        target: { value: "内容资产已经发布并完成用户侧核验。" },
-      },
-    );
+    fireEvent.change(screen.getByPlaceholderText(/已完成首轮问题监控/), {
+      target: { value: "内容资产已经发布并完成用户侧核验。" },
+    });
     fireEvent.change(screen.getByPlaceholderText("https://"), {
       target: { value: "https://example.com/asset/1" },
     });
@@ -455,9 +573,7 @@ describe("DeliveryMemberDashboard project context", () => {
     expect(confirmSpy).not.toHaveBeenCalled();
     expect(promptSpy).not.toHaveBeenCalled();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "确认发布到正式数据" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "确认发布到正式数据" }));
 
     await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
     const publishHeaders = fetchSpy.mock.calls[1]?.[1]?.headers as Record<
@@ -512,7 +628,9 @@ describe("DeliveryMemberDashboard project context", () => {
     render(<DeliveryMemberDashboard />);
 
     expect(
-      await screen.findByText("已发布本批三张样例，正在等待客户选择或退回重做。"),
+      await screen.findByText(
+        "已发布本批三张样例，正在等待客户选择或退回重做。",
+      ),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "开始处理" }),

@@ -7516,7 +7516,7 @@ router.post("/download-token", async (req, res) => {
     const fileId = req.body?.fileId || "";
     if (!apiKey) {
       return res.status(401).json({
-        error: { message: "Missing API key", code: "MISSING_API_KEY" }
+        error: { message: "\u5C1A\u672A\u914D\u7F6E API Key", code: "MISSING_API_KEY" }
       });
     }
     if (!fileId) {
@@ -7754,7 +7754,7 @@ router.all("/*", async (req, res) => {
   try {
     if (!apiKey) {
       return res.status(401).json({
-        error: { message: "Missing API key", code: "MISSING_API_KEY" }
+        error: { message: "\u5C1A\u672A\u914D\u7F6E API Key", code: "MISSING_API_KEY" }
       });
     }
     const targetPath = req.originalUrl.replace(/^\/api\/frontmind/, "");

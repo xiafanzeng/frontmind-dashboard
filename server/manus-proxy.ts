@@ -2722,7 +2722,7 @@ router.post("/download-token", async (req: Request, res: Response) => {
 
     if (!apiKey) {
       return res.status(401).json({
-        error: { message: "Missing API key", code: "MISSING_API_KEY" },
+        error: { message: "尚未配置 API Key", code: "MISSING_API_KEY" },
       });
     }
     if (!fileId) {
@@ -2995,7 +2995,7 @@ router.all("/*", async (req: Request, res: Response) => {
   try {
     if (!apiKey) {
       return res.status(401).json({
-        error: { message: "Missing API key", code: "MISSING_API_KEY" },
+        error: { message: "尚未配置 API Key", code: "MISSING_API_KEY" },
       });
     }
 

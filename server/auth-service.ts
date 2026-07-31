@@ -450,24 +450,18 @@ export async function loginWithPassword(
 
   if (!user || !passwordMatches) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError(
-      "INVALID_PASSWORD",
-      "Invalid username or password",
-    );
+    throw new AuthServiceError("INVALID_PASSWORD", "用户名或密码不正确");
   }
   if (!user.isActive) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError("ACCOUNT_DISABLED", "Account is disabled");
+    throw new AuthServiceError("ACCOUNT_DISABLED", "账号已停用");
   }
   if (
     user.role === "admin" &&
     !isExplicitAdminAccessLevel(user.adminAccessLevel)
   ) {
     recordLoginFailure(attemptKey);
-    throw new AuthServiceError(
-      "ACCOUNT_DISABLED",
-      "Administrator access level is not configured",
-    );
+    throw new AuthServiceError("ACCOUNT_DISABLED", "管理员权限尚未配置");
   }
 
   loginAttempts.delete(attemptKey);

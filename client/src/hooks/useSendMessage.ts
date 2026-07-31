@@ -15,15 +15,13 @@ import {
   uploadFile,
   fileToBase64,
   creditEventBus,
+  sanitizeBrandText,
   type ContentItem,
   type Message,
-  type OutputMessage,
   type ResponseLogicTaskContext,
 } from "@/lib/frontmind-api";
 import {
   useConversation,
-  parseOutputMessages,
-  sanitizeKnowledgeBaseOutputMessages,
   type Attachment,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
@@ -35,7 +33,19 @@ import {
 } from "@/lib/attachment-files";
 import { reconcileKnowledgeBaseProgress } from "@/lib/knowledge-progress";
 import { requireCurrentFrontMindBuild } from "@/lib/build-version";
+import {
+  collectAssistantOutputIds,
+  outputForKnowledgeProgress,
+  projectTaskOutputMessages,
+  sliceNewOutput,
+} from "@/lib/task-output-projection";
 import { toast } from "sonner";
+
+export {
+  collectAssistantOutputIds,
+  outputForKnowledgePresentation,
+  sliceNewOutput,
+} from "@/lib/task-output-projection";
 
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY = 1000; // 1 second
@@ -100,173 +110,7 @@ async function withRetry<T>(
     }
   }
 
-  throw lastError || new Error("Max retries exceeded");
-}
-
-function stableOutputIdentity(item: OutputMessage): string | undefined {
-  if (typeof item.id === "string" && item.id.trim()) {
-    return `id:${item.id}`;
-  }
-  if (typeof item.call_id === "string" && item.call_id.trim()) {
-    return `call:${item.type || "output"}:${item.call_id}`;
-  }
-  return undefined;
-}
-
-function dedupeStableOutput(output: OutputMessage[]): OutputMessage[] {
-  const seen = new Set<string>();
-  return output.filter((item) => {
-    const identity = stableOutputIdentity(item);
-    if (!identity) return true;
-    if (seen.has(identity)) return false;
-    seen.add(identity);
-    return true;
-  });
-}
-
-export function collectAssistantOutputIds(
-  messages:
-    | Array<{ id?: string; upstreamOutputId?: string; role?: string }>
-    | undefined,
-): string[] {
-  if (!messages) return [];
-  return messages.flatMap((message) =>
-    message.role === "assistant"
-      ? [
-          typeof message.upstreamOutputId === "string" &&
-          message.upstreamOutputId.trim()
-            ? message.upstreamOutputId
-            : typeof message.id === "string"
-              ? message.id
-              : "",
-        ].filter(Boolean)
-      : [],
-  );
-}
-
-/**
- * Select the current turn's output from APIs that may return either the full
- * cumulative task history or only the current turn.
- *
- * Stable output IDs are the authoritative signal. The length-only fallback is
- * retained for older payloads, but a shorter response is treated as a
- * non-cumulative current-turn response instead of being silently discarded.
- */
-export function sliceNewOutput(
-  output: OutputMessage[],
-  baseline: number,
-  historicalOutputIds: readonly string[] = [],
-): OutputMessage[] {
-  if (baseline <= 0) {
-    return dedupeStableOutput(output);
-  }
-
-  const historicalIds = new Set(historicalOutputIds);
-  if (historicalIds.size > 0) {
-    const historicalMatches = output
-      .map((item, index) => ({ id: item.id, index }))
-      .filter(
-        (
-          match,
-        ): match is {
-          id: string;
-          index: number;
-        } => typeof match.id === "string" && historicalIds.has(match.id),
-      );
-
-    if (historicalMatches.length === 0) {
-      return dedupeStableOutput(output);
-    }
-
-    if (output.length < baseline) {
-      return dedupeStableOutput(
-        output.filter(
-          (item) => typeof item.id !== "string" || !historicalIds.has(item.id),
-        ),
-      );
-    }
-
-    const lastHistoricalIndex = Math.max(
-      ...historicalMatches.map((match) => match.index),
-    );
-    return dedupeStableOutput(
-      output.slice(Math.max(baseline, lastHistoricalIndex + 1)),
-    );
-  }
-
-  if (baseline >= output.length) {
-    return dedupeStableOutput(output);
-  }
-  return dedupeStableOutput(output.slice(baseline));
-}
-
-/**
- * Knowledge-base tasks may return either a cumulative output array or only the
- * current turn. Reconciliation is idempotent on the server, so falling back to
- * the complete response is safer than silently missing a node transition.
- */
-function outputForKnowledgeProgress(
-  output: OutputMessage[],
-  slicedOutput: OutputMessage[],
-): OutputMessage[] {
-  return slicedOutput.length > 0 ? slicedOutput : output;
-}
-
-function outputItemText(item: OutputMessage) {
-  const content = item.content as unknown;
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) =>
-      typeof part === "string"
-        ? part
-        : part && typeof part === "object" && "text" in part
-          ? String((part as { text?: unknown }).text ?? "")
-          : "",
-    )
-    .join("\n");
-}
-
-/**
- * A provider can reuse output IDs or return a same-length cumulative array.
- * Progress reconciliation already falls back to the full output in that case;
- * select the latest protocol-bearing assistant turn for rendering as well.
- */
-export function outputForKnowledgePresentation(
-  output: OutputMessage[],
-  slicedOutput: OutputMessage[],
-): OutputMessage[] {
-  if (slicedOutput.length > 0) return slicedOutput;
-
-  const messageIndexes = output.flatMap((item, index) =>
-    item.role === "assistant" || item.type === "message" || !item.type
-      ? [index]
-      : [],
-  );
-  if (messageIndexes.length === 0) return [];
-
-  const protocolIndex =
-    [...messageIndexes]
-      .reverse()
-      .find((index) =>
-        /FRONTMIND_KB_(?:MANIFEST|PRESENTATION|PROGRESS|REOPEN)/.test(
-          outputItemText(output[index]!),
-        ),
-      ) ?? messageIndexes[messageIndexes.length - 1]!;
-  const resourceTypes = new Set([
-    "output_image",
-    "image",
-    "output_file",
-    "file",
-  ]);
-
-  return output
-    .slice(protocolIndex)
-    .filter(
-      (item, offset) =>
-        offset === 0 ||
-        resourceTypes.has(item.type || ""),
-    );
+  throw lastError || new Error("重试次数已达上限");
 }
 
 export type FailureKind = "quota" | "attachment" | "auth" | "busy" | "unknown";
@@ -391,7 +235,6 @@ export function useSendMessage() {
       baselineOutputLength: number,
       historicalOutputIds: readonly string[],
       modelName?: string,
-      syncKnowledgeBaseSnapshot = false,
     ) => {
       // Stop any existing polling first
       stopPolling();
@@ -402,43 +245,6 @@ export function useSendMessage() {
       let completionHandled = false;
       let consecutiveErrors = 0;
       const MAX_CONSECUTIVE_ERRORS = 10;
-      const applyValidatedKnowledgeOutput = (
-        output: OutputMessage[] | undefined,
-        elapsedSeconds?: number,
-      ) => {
-        if (!output || output.length === 0) return;
-        const newOutput = sliceNewOutput(
-          output,
-          baselineOutputLength,
-          historicalOutputIds,
-        );
-        const presentationOutput = outputForKnowledgePresentation(
-          output,
-          newOutput,
-        );
-        if (presentationOutput.length === 0) return;
-        try {
-          const assistantMsgs = sanitizeKnowledgeBaseOutputMessages(
-            parseOutputMessages(
-              presentationOutput,
-              responseStartedAt,
-              modelName,
-            ),
-          );
-          if (elapsedSeconds != null && assistantMsgs.length > 0) {
-            assistantMsgs[assistantMsgs.length - 1].elapsedTime =
-              elapsedSeconds;
-          }
-          if (assistantMsgs.length > 0) {
-            updateAssistantMessagesRef.current(convId, assistantMsgs);
-          }
-        } catch (parseErr) {
-          console.error(
-            "[Polling] Error parsing validated knowledge output:",
-            parseErr,
-          );
-        }
-      };
 
       const pollOnce = async () => {
         if (!pollingActiveRef.current || completionHandled) return;
@@ -461,13 +267,16 @@ export function useSendMessage() {
               historicalOutputIds,
             );
 
-            if (newOutput.length > 0 && !syncKnowledgeBaseSnapshot) {
+            if (newOutput.length > 0) {
               try {
-                const assistantMsgs = parseOutputMessages(
-                  newOutput,
+                const assistantMsgs = projectTaskOutputMessages({
+                  output: updated.output,
+                  baselineOutputLength,
+                  historicalOutputIds,
                   responseStartedAt,
                   modelName,
-                );
+                  knowledgeBase: false,
+                });
                 if (assistantMsgs.length > 0) {
                   updateAssistantMessagesRef.current(convId, assistantMsgs);
                 }
@@ -491,106 +300,12 @@ export function useSendMessage() {
           const normalizedStatus =
             updated.status === "failed" ? "error" : updated.status;
 
-          if (syncKnowledgeBaseSnapshot) {
-            try {
-              const interaction = await reconcileKnowledgeBaseProgress({
-                conversationId: convId,
-                taskId: updated.id,
-              });
-              if (interaction.interactionState === "awaiting_input") {
-                completionHandled = true;
-                stopPolling();
-                applyValidatedKnowledgeOutput(
-                  updated.output,
-                  (Date.now() - responseStartedAt) / 1000,
-                );
-                updateStatusRef.current(convId, "awaiting_input", {
-                  taskId: updated.id,
-                  taskUrl: updated.metadata?.task_url,
-                  previousResponseId: updated.id,
-                  lastKnownOutputLength: updated.output?.length || 0,
-                });
-                toast.info("当前知识节点已就绪", {
-                  description: "请确认、修改或补充当前内容。",
-                });
-                creditEventBus.emit();
-                return;
-              }
-              if (
-                interaction.interactionState === "ready_to_publish" ||
-                interaction.interactionState === "published"
-              ) {
-                completionHandled = true;
-                stopPolling();
-                applyValidatedKnowledgeOutput(
-                  updated.output,
-                  (Date.now() - responseStartedAt) / 1000,
-                );
-                updateStatusRef.current(convId, "completed", {
-                  taskId: updated.id,
-                  completedAt: Date.now(),
-                  lastKnownOutputLength: updated.output?.length || 0,
-                });
-                toast.info("知识库内容已完成", {
-                  description:
-                    interaction.interactionState === "ready_to_publish"
-                      ? "最终成品已通过校验，可执行唯一一次直接更新。"
-                      : "知识库已发布；后续修改请提交维护工单。",
-                });
-                creditEventBus.emit();
-                return;
-              }
-              if (interaction.interactionState === "failed") {
-                completionHandled = true;
-                stopPolling();
-                updateStatusRef.current(convId, "error", {
-                  taskId: updated.id,
-                  completedAt: Date.now(),
-                  lastKnownOutputLength: updated.output?.length || 0,
-                });
-                toast.error(interaction.lockReason || "当前知识节点未通过校验");
-                return;
-              }
-              if (normalizedStatus === "completed") {
-                completionHandled = true;
-                stopPolling();
-                updateStatusRef.current(convId, "error", {
-                  taskId: updated.id,
-                  completedAt: Date.now(),
-                  lastKnownOutputLength: updated.output?.length || 0,
-                });
-                toast.error("任务已结束，但未返回完整的知识节点状态");
-                return;
-              }
-            } catch (error) {
-              if (normalizedStatus === "completed") {
-                completionHandled = true;
-                stopPolling();
-                updateStatusRef.current(convId, "error", {
-                  taskId: updated.id,
-                  completedAt: Date.now(),
-                });
-                toast.error("当前知识节点未通过校验", {
-                  description:
-                    error instanceof Error
-                      ? error.message
-                      : "请重新同步任务状态。",
-                });
-                return;
-              }
-            }
-          }
-
           updateStatusRef.current(convId, normalizedStatus as any, {
             taskId: updated.id,
             taskUrl: updated.metadata?.task_url,
           });
 
-          if (
-            !syncKnowledgeBaseSnapshot &&
-            normalizedStatus === "completed" &&
-            !completionHandled
-          ) {
+          if (normalizedStatus === "completed" && !completionHandled) {
             completionHandled = true;
             stopPolling();
             const completedAt = Date.now();
@@ -616,19 +331,14 @@ export function useSendMessage() {
 
               if (newOutput.length > 0) {
                 try {
-                  const finalMsgs = syncKnowledgeBaseSnapshot
-                    ? sanitizeKnowledgeBaseOutputMessages(
-                        parseOutputMessages(
-                          newOutput,
-                          responseStartedAt,
-                          modelName,
-                        ),
-                      )
-                    : parseOutputMessages(
-                        newOutput,
-                        responseStartedAt,
-                        modelName,
-                      );
+                  const finalMsgs = projectTaskOutputMessages({
+                    output: updated.output,
+                    baselineOutputLength,
+                    historicalOutputIds,
+                    responseStartedAt,
+                    modelName,
+                    knowledgeBase: false,
+                  });
                   if (finalMsgs.length > 0) {
                     finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
                     updateAssistantMessagesRef.current(convId, finalMsgs);
@@ -639,34 +349,6 @@ export function useSendMessage() {
                     parseErr,
                   );
                 }
-              }
-
-              const knowledgeProgressOutput = outputForKnowledgeProgress(
-                updated.output,
-                newOutput,
-              );
-
-              if (
-                syncKnowledgeBaseSnapshot &&
-                knowledgeProgressOutput.length > 0
-              ) {
-                try {
-                  await reconcileKnowledgeBaseProgress({
-                    conversationId: convId,
-                    taskId: updated.id,
-                  });
-                } catch (error) {
-                  toast.warning("当前节点尚未通过进度校验", {
-                    description:
-                      error instanceof Error
-                        ? error.message
-                        : "请继续在当前节点补充或明确确认。",
-                  });
-                }
-                toast.info("知识库对话已完成", {
-                  description:
-                    "请点击构建流程页面右上角的“更新知识库”同步展示内容。",
-                });
               }
             }
 
@@ -1023,28 +705,37 @@ export function useSendMessage() {
           setIsRetrying(false);
 
           const knowledgeInteraction = response.knowledgeInteraction;
-          const effectiveStatus =
-            options?.syncKnowledgeBaseSnapshot && knowledgeInteraction
-              ? knowledgeInteraction.interactionState === "awaiting_input"
-                ? "awaiting_input"
-                : knowledgeInteraction.interactionState ===
-                      "ready_to_publish" ||
-                    knowledgeInteraction.interactionState === "published"
-                  ? "completed"
-                  : knowledgeInteraction.interactionState === "failed"
-                    ? "error"
-                    : knowledgeInteraction.interactionState === "queued"
-                      ? "pending"
-                      : response.status === "completed"
-                        ? "error"
-                        : "running"
-              : response.status;
+          const effectiveStatus = options?.syncKnowledgeBaseSnapshot
+            ? knowledgeInteraction?.interactionState === "awaiting_input"
+              ? "awaiting_input"
+              : knowledgeInteraction?.interactionState ===
+                    "ready_to_publish" ||
+                  knowledgeInteraction?.interactionState === "published"
+                ? "completed"
+                : knowledgeInteraction?.interactionState === "failed" ||
+                    response.status === "completed" ||
+                    response.status === "failed" ||
+                    response.status === "error"
+                  ? "error"
+                  : knowledgeInteraction?.interactionState === "queued" ||
+                      response.status === "pending"
+                    ? "pending"
+                    : "running"
+            : response.status;
+          const totalInitialOutputLength = response.output?.length || 0;
+          const initialStatusIsTerminal =
+            effectiveStatus === "awaiting_input" ||
+            effectiveStatus === "completed" ||
+            effectiveStatus === "error";
 
           updateStatus(convId, effectiveStatus as any, {
             taskId: response.id,
             taskUrl: response.metadata?.task_url,
             previousResponseId: response.id,
             startedAt: responseStartedAt,
+            ...(initialStatusIsTerminal
+              ? { lastKnownOutputLength: totalInitialOutputLength }
+              : {}),
           });
 
           toast.success("任务已创建", {
@@ -1053,14 +744,10 @@ export function useSendMessage() {
             duration: 3200,
           });
 
-          // Parse initial output if available — only new items
-          if (
-            response.output &&
-            response.output.length > 0 &&
-            (!options?.syncKnowledgeBaseSnapshot ||
-              effectiveStatus === "awaiting_input" ||
-              effectiveStatus === "completed")
-          ) {
+          // Visible output is independent from knowledge-base protocol state.
+          // Running knowledge text is projected immediately, while only the
+          // server interaction envelope can unlock input or publishing.
+          if (response.output && response.output.length > 0) {
             const newOutput = sliceNewOutput(
               response.output,
               baselineOutputLength,
@@ -1072,34 +759,23 @@ export function useSendMessage() {
                 `baseline=${baselineOutputLength}, new=${newOutput.length}, status=${response.status}`,
             );
 
-            const presentationOutput = options?.syncKnowledgeBaseSnapshot
-              ? outputForKnowledgePresentation(response.output, newOutput)
-              : newOutput;
-
-            if (presentationOutput.length > 0) {
-              try {
-                const assistantMsgs = options?.syncKnowledgeBaseSnapshot
-                  ? sanitizeKnowledgeBaseOutputMessages(
-                      parseOutputMessages(
-                        presentationOutput,
-                        responseStartedAt,
-                        agentProfile,
-                      ),
-                    )
-                  : parseOutputMessages(
-                      presentationOutput,
-                      responseStartedAt,
-                      agentProfile,
-                    );
-                if (assistantMsgs.length > 0) {
-                  updateAssistantMessages(convId, assistantMsgs);
-                }
-              } catch (parseErr) {
-                console.error(
-                  "[SendMessage] Error parsing initial output:",
-                  parseErr,
-                );
+            try {
+              const assistantMsgs = projectTaskOutputMessages({
+                output: response.output,
+                baselineOutputLength,
+                historicalOutputIds,
+                responseStartedAt,
+                modelName: agentProfile,
+                knowledgeBase: Boolean(options?.syncKnowledgeBaseSnapshot),
+              });
+              if (assistantMsgs.length > 0) {
+                updateAssistantMessages(convId, assistantMsgs);
               }
+            } catch (parseErr) {
+              console.error(
+                "[SendMessage] Error parsing initial output:",
+                parseErr,
+              );
             }
           } else if (isMultiTurn && effectiveStatus === "completed") {
             updateStatus(convId, "completed", {
@@ -1108,7 +784,10 @@ export function useSendMessage() {
           }
 
           // Start sequential polling if task is running or pending
-          if (effectiveStatus === "running" || effectiveStatus === "pending") {
+          if (
+            !options?.syncKnowledgeBaseSnapshot &&
+            (effectiveStatus === "running" || effectiveStatus === "pending")
+          ) {
             startPolling(
               response.id,
               convId,
@@ -1117,7 +796,6 @@ export function useSendMessage() {
               baselineOutputLength,
               historicalOutputIds,
               agentProfile,
-              options?.syncKnowledgeBaseSnapshot,
             );
           }
 
@@ -1132,10 +810,18 @@ export function useSendMessage() {
             effectiveStatus === "error" &&
             options?.syncKnowledgeBaseSnapshot
           ) {
-            toast.error(
-              knowledgeInteraction?.lockReason ||
+            const knowledgeError = sanitizeBrandText(
+              response.error?.message ||
+                knowledgeInteraction?.lockReason ||
                 "任务未返回完整的知识节点状态",
             );
+            addMessage(convId, {
+              id: `msg-kb-error-${response.id.slice(-72)}`,
+              role: "assistant",
+              content: `❌ 错误: ${knowledgeError}`,
+              timestamp: Date.now(),
+            });
+            toast.error(knowledgeError);
           }
 
           if (effectiveStatus === "completed") {
@@ -1157,35 +843,24 @@ export function useSendMessage() {
                 historicalOutputIds,
               );
 
-              const presentationOutput = options?.syncKnowledgeBaseSnapshot
-                ? outputForKnowledgePresentation(response.output, newOutput)
-                : newOutput;
-
-              if (presentationOutput.length > 0) {
-                try {
-                  const finalMsgs = options?.syncKnowledgeBaseSnapshot
-                    ? sanitizeKnowledgeBaseOutputMessages(
-                        parseOutputMessages(
-                          presentationOutput,
-                          responseStartedAt,
-                          agentProfile,
-                        ),
-                      )
-                    : parseOutputMessages(
-                        presentationOutput,
-                        responseStartedAt,
-                        agentProfile,
-                      );
-                  if (finalMsgs.length > 0) {
-                    finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
-                    updateAssistantMessages(convId, finalMsgs);
-                  }
-                } catch (parseErr) {
-                  console.error(
-                    "[SendMessage] Error parsing completed output:",
-                    parseErr,
-                  );
+              try {
+                const finalMsgs = projectTaskOutputMessages({
+                  output: response.output,
+                  baselineOutputLength,
+                  historicalOutputIds,
+                  responseStartedAt,
+                  modelName: agentProfile,
+                  knowledgeBase: Boolean(options?.syncKnowledgeBaseSnapshot),
+                });
+                if (finalMsgs.length > 0) {
+                  finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
+                  updateAssistantMessages(convId, finalMsgs);
                 }
+              } catch (parseErr) {
+                console.error(
+                  "[SendMessage] Error parsing completed output:",
+                  parseErr,
+                );
               }
 
               const knowledgeProgressOutput = outputForKnowledgeProgress(

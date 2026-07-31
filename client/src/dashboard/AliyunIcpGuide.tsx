@@ -15,6 +15,7 @@ import {
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
   useEffect,
   useRef,
   useState,
@@ -61,6 +62,7 @@ export type AliyunIcpGuideProps = {
   currentPhase?: "domain" | "icp";
   scenario?: AliyunGuideScenario;
   onScenarioChange?: (scenario: AliyunGuideScenario) => void;
+  stageThreeContent?: ReactNode;
 };
 
 export type AliyunGuideScenario =
@@ -76,7 +78,7 @@ const firstFilingStages: GuideStage[] = [
   {
     id: 1,
     title: "准备资料，创建企业域名信息模板并完成实名认证",
-    summary: "先完成企业实名模板；此时不需要备案服务码。",
+    summary: "先完成企业实名模板。",
     duration: "填写约 10 分钟，审核通常 1–5 个工作日",
     path: "阿里云域名控制台 → 左侧“信息模板” → “创建新信息模板”",
     tasks: [
@@ -95,7 +97,6 @@ const firstFilingStages: GuideStage[] = [
     avoid: [
       "不要误选“个人”模板，也不要填写企业简称、品牌名或英文名。",
       "模板审核中或失败时不要购买域名；先按失败原因修正并重新提交。",
-      "不要提前向 FrontMind 索要备案服务码；购买并提交域名后，AI 运维工单会返回。",
     ],
     done: "信息模板列表明确显示“模板实名成功”或“实名认证成功”。",
     trouble:
@@ -932,6 +933,11 @@ function GuideFigure({
   return (
     <figure
       className={`ai-website-guide-figure${image.portrait ? " portrait" : ""}`}
+      style={
+        {
+          "--guide-image-width": `${image.width}px`,
+        } as CSSProperties
+      }
     >
       <button
         type="button"
@@ -983,6 +989,7 @@ export default function AliyunIcpGuide({
   currentPhase = "domain",
   scenario,
   onScenarioChange,
+  stageThreeContent,
 }: AliyunIcpGuideProps) {
   const [internalScenario, setInternalScenario] =
     useState<AliyunGuideScenario>("first_filing");
@@ -1002,7 +1009,7 @@ export default function AliyunIcpGuide({
     first_filing: {
       title: "企业首次备案：照着下面 7 个阶段一步一步做",
       description:
-        "适用于主体和网站都没有办理过 ICP 备案的国内版客户。先注册企业实名域名，提交给 FrontMind；AI 运维工单返回备案服务码后，再开始 ICP 备案。",
+        "适用于主体和网站都没有办理过 ICP 备案的国内版客户。先注册企业实名域名，再按下面的阶段逐步办理。",
       routingTitle: "已有备案或使用海外节点？请切换教程",
       routingDescription:
         "企业已有 ICP 主体备案、需要为新域名新增网站时，请切换到“已有 ICP 备案”；中国香港或海外节点请切换到海外版。",
@@ -1015,9 +1022,6 @@ export default function AliyunIcpGuide({
         "可正常收信的邮箱",
         "拟注册域名（准备 2–3 个候选）",
       ],
-      codeTitle: "备案服务码不用提前准备",
-      codeDescription:
-        "购买域名后回到本页提交域名。AI 运维工单完成时会在处理结果中返回备案服务码，拿到后再进入阿里云备案系统。",
     },
     existing_filing: {
       title: "企业已有 ICP 备案：在现有主体下新增网站",
@@ -1036,9 +1040,6 @@ export default function AliyunIcpGuide({
         "域名企业实名信息",
         "负责人可接听手机号和邮箱",
       ],
-      codeTitle: "仍然先提交域名，再领取本次服务码",
-      codeDescription:
-        "准备好新域名后，在本页提交域名。AI 运维会按“已有主体下新增网站”场景核验，并在国内版工单完成时返回备案服务码。",
     },
     overseas: {
       title: "海外版：中国香港或海外节点无需工信部 ICP 备案",
@@ -1055,9 +1056,6 @@ export default function AliyunIcpGuide({
         "拟注册域名（准备 2–3 个候选）",
         "已确认的中国香港或海外部署地域",
       ],
-      codeTitle: "海外版不需要备案服务码和 ICP 备案号",
-      codeDescription:
-        "域名购买成功后仍需回到本页提交，以便 AI 运维创建海外节点、DNS 和 HTTPS 配置工单；工单不会要求备案服务码。",
     },
   } satisfies Record<
     AliyunGuideScenario,
@@ -1069,8 +1067,6 @@ export default function AliyunIcpGuide({
       advisorLabel: string;
       checklistTitle: string;
       checklistItems: string[];
-      codeTitle: string;
-      codeDescription: string;
     }
   >;
   const activeCopy = scenarioCopy[activeScenario];
@@ -1241,13 +1237,6 @@ export default function AliyunIcpGuide({
             </ul>
           </div>
 
-          <div className="ai-website-guide-routing">
-            <div>
-              <strong>{activeCopy.codeTitle}</strong>
-              <p>{activeCopy.codeDescription}</p>
-            </div>
-          </div>
-
           <div className="ai-website-guide-version-note">
             <Clock3 size={16} aria-hidden="true" />
             <p>
@@ -1311,6 +1300,8 @@ export default function AliyunIcpGuide({
                         ))}
                       </ol>
                     </div>
+
+                    {stage.id === 3 && stageThreeContent}
 
                     {stage.images && (
                       <div className="ai-website-guide-visuals">
@@ -1380,47 +1371,19 @@ export default function AliyunIcpGuide({
           })}
         </ol>
 
-        <div className="ai-website-guide-finish">
-          <CheckCircle2 size={22} aria-hidden="true" />
-          <div>
-            <strong>
-              {activeScenario === "overseas"
-                ? "海外版域名状态已显示“正常”？"
-                : currentPhase === "domain"
-                  ? "阿里云域名状态已显示“正常”？"
-                  : "阿里云已显示备案通过？"}
-            </strong>
-            {activeScenario === "overseas" ? (
-              <p>
-                保持当前海外版标签，在下方提交域名。系统会创建香港 /
-                海外节点配置工单，不要求备案服务码或 ICP 备案号。
-              </p>
-            ) : currentPhase === "domain" ? (
-              <p>
-                先在下方提交已购买域名。AI
-                运维工单返回备案服务码后，页面会开放备案结果提交。
-              </p>
-            ) : (
+        {currentPhase === "icp" && (
+          <div className="ai-website-guide-finish">
+            <CheckCircle2 size={22} aria-hidden="true" />
+            <div>
+              <strong>阿里云已显示备案通过？</strong>
               <p>
                 请从已完成订单详情中复制 ICP
                 主体备案号，然后只在下方回填域名和备案号。
               </p>
-            )}
+            </div>
+            <a href="#ai-website-result-form">我已取得备案号，去填写结果</a>
           </div>
-          <a
-            href={
-              currentPhase === "domain"
-                ? "#ai-website-domain-form"
-                : "#ai-website-result-form"
-            }
-          >
-            {activeScenario === "overseas"
-              ? "域名已购买，按海外版提交"
-              : currentPhase === "domain"
-                ? "域名已购买，去提交域名"
-                : "我已取得备案号，去填写结果"}
-          </a>
-        </div>
+        )}
 
         <div className="ai-website-guide-security">
           <AlertTriangle size={17} aria-hidden="true" />

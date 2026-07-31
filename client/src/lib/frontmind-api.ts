@@ -15,6 +15,7 @@
 
 import type { ResponseLogicDraft } from "@shared/response-logic";
 import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progress";
+import { userFacingErrorMessage } from "@/lib/user-facing-error";
 
 /**
  * Model display mapping: public model id -> display name.
@@ -113,7 +114,7 @@ export function sanitizeBrandText(text: string): string {
     const source = ["ma", "nus"].join("");
     return text
       .replace(
-        /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
+        /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?(?:-->|$)/gi,
         "",
       )
       .replace(
@@ -319,7 +320,12 @@ async function apiRequest(
           errorMsg += `: ${response.statusText}`;
         }
       }
-      const requestError = new Error(errorMsg) as Error & {
+      const requestError = new Error(
+        userFacingErrorMessage(
+          Object.assign(new Error(errorMsg), { status: response.status }),
+          `接口请求失败（${response.status}）`,
+        ),
+      ) as Error & {
         status?: number;
       };
       requestError.status = response.status;
@@ -539,7 +545,12 @@ export async function createResponseLogicTask(
       } catch {
         // Keep the status-derived message.
       }
-      throw new Error(message);
+      throw new Error(
+        userFacingErrorMessage(
+          Object.assign(new Error(message), { status: response.status }),
+          `任务创建失败（${response.status}）`,
+        ),
+      );
     }
     const payload = await response.json();
     const data = payload?.task || payload;
@@ -600,7 +611,12 @@ export async function createKnowledgeBaseTurnTask(
       } catch {
         // Keep the status-derived message.
       }
-      throw new Error(message);
+      throw new Error(
+        userFacingErrorMessage(
+          Object.assign(new Error(message), { status: response.status }),
+          `任务创建失败（${response.status}）`,
+        ),
+      );
     }
     const payload = await response.json();
     const data = payload?.task || payload;
@@ -743,19 +759,16 @@ export async function uploadFileToUrl(
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve();
       } else {
-        const detail = xhr.responseText
-          ? xhr.responseText.slice(0, 200)
-          : xhr.statusText || `HTTP ${xhr.status}`;
-        reject(new Error(`Upload failed (${xhr.status}): ${detail}`));
+        reject(new Error(`文件上传失败（${xhr.status}）`));
       }
     });
 
     xhr.addEventListener("error", () => {
-      reject(new Error("Upload network error - S3 可能存在 CORS 限制"));
+      reject(new Error("文件上传网络异常，存储服务可能未允许当前来源"));
     });
 
     xhr.addEventListener("abort", () => {
-      reject(new Error("Upload aborted"));
+      reject(new Error("文件上传已取消"));
     });
 
     xhr.send(file);
@@ -892,10 +905,12 @@ async function uploadFileToUrlViaProxy(
           }
         })();
         const error = new Error(
-          upstreamMessage ||
-            (xhr.status >= 400 && xhr.status < 500
+          userFacingErrorMessage(
+            Object.assign(new Error(upstreamMessage), { status: xhr.status }),
+            xhr.status >= 400 && xhr.status < 500
               ? "上传地址无效或已失效，请重新选择文件后重试"
-              : "文件上传失败，请稍后重试"),
+              : "文件上传失败，请稍后重试",
+          ),
         ) as Error & { status?: number };
         error.status = xhr.status;
         reject(error);
@@ -903,10 +918,10 @@ async function uploadFileToUrlViaProxy(
     });
 
     xhr.addEventListener("error", () =>
-      reject(new Error("Proxy upload network error")),
+      reject(new Error("文件代理上传网络异常")),
     );
     xhr.addEventListener("abort", () =>
-      reject(new Error("Proxy upload aborted")),
+      reject(new Error("文件代理上传已取消")),
     );
 
     xhr.send(file);
@@ -1095,8 +1110,14 @@ export async function testConnection(): Promise<{
       errorDetail = errData.error?.message || errData.message || errorDetail;
     } catch {}
 
-    return { ok: false, message: errorDetail };
+    return {
+      ok: false,
+      message: userFacingErrorMessage(
+        Object.assign(new Error(errorDetail), { status: response.status }),
+        `连接失败（${response.status}）`,
+      ),
+    };
   } catch (err: any) {
-    return { ok: false, message: err.message || "连接失败" };
+    return { ok: false, message: userFacingErrorMessage(err, "连接失败") };
   }
 }

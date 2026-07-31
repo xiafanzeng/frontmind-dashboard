@@ -7,6 +7,7 @@ import { useAuth } from "@/_core/hooks/useAuth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { userFacingErrorMessage } from "@/lib/user-facing-error";
 
 const LOGIN_BACKGROUND = "/assets/frontmind-login-background.webp";
 const WORDMARK = "/assets/frontmind-wordmark.svg";
@@ -31,13 +32,11 @@ export default function Login() {
       await login(normalizedUsername, password);
       setLocation("/", { replace: true });
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "登录失败，请稍后重试";
+      const message = userFacingErrorMessage(error, "登录失败，请稍后重试");
       toast.error("无法登录", {
-        description:
-          message.includes("UNAUTHORIZED") || message.includes("用户名")
-            ? "用户名或密码不正确"
-            : message,
+        description: message.includes("用户名")
+          ? "用户名或密码不正确"
+          : message,
       });
     }
   };

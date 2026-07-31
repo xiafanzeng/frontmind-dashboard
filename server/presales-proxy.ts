@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { once } from "node:events";
 import { Transform } from "node:stream";
 import {
   Router,
@@ -301,6 +302,24 @@ function safeFilename(value: unknown, fallback = "download") {
     .replace(/[\\/\0\r\n]/g, "_")
     .trim();
   return filename || fallback;
+}
+
+function filenameFromContentDisposition(value: unknown, fallback: string) {
+  const disposition = String(value || "");
+  const encoded = disposition.match(
+    /filename\*\s*=\s*(?:"?UTF-8''([^";\r\n]+)"?)/i,
+  )?.[1];
+  if (encoded) {
+    try {
+      return safeFilename(decodeURIComponent(encoded.trim()), fallback);
+    } catch {
+      // Fall through to the plain filename or the file id.
+    }
+  }
+  const plain = disposition.match(
+    /filename\s*=\s*(?:"([^"\r\n]+)"|([^;\s\r\n]+))/i,
+  );
+  return safeFilename(plain?.[1] || plain?.[2], fallback);
 }
 
 function upstreamErrorDetail(data: any, fallback: string, apiKey?: string) {
@@ -1015,16 +1034,46 @@ async function streamExternalOutput(
   response.data.pipe(res);
 }
 
+function sendFileContentDownloadFailure(
+  res: Response,
+  input: {
+    fileId: string;
+    upstreamStatus?: number;
+    errorCode:
+      | "UPSTREAM_FILE_CONTENT_FAILED"
+      | "UPSTREAM_FILE_CONTENT_EMPTY"
+      | "UPSTREAM_FILE_CONTENT_TOO_LARGE"
+      | "UPSTREAM_FILE_CONTENT_STREAM_FAILED";
+  },
+) {
+  console.warn("[Presales Proxy] File content download failed", {
+    phase: "file_content_download",
+    fileId: input.fileId,
+    upstreamStatus: input.upstreamStatus,
+    errorCode: input.errorCode,
+  });
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  res
+    .status(
+      input.upstreamStatus && input.upstreamStatus >= 400
+        ? forwardedStatus(input.upstreamStatus)
+        : 502,
+    )
+    .json({
+      error: {
+        code: input.errorCode,
+        message: "File content download failed",
+      },
+    });
+}
+
 router.get("/files/:fileId/content", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
     const credential = await requireResourceCredential("file", fileId);
-    const metadata = await fetchFileMetadata(fileId, credential);
-    const filename = safeFilename(metadata.filename, fileId);
-    if (metadata.upload_url) {
-      await streamExternalOutput(res, String(metadata.upload_url), filename);
-      return;
-    }
     const response = await axios.get(
       `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}/content`,
       {
@@ -1036,23 +1085,96 @@ router.get("/files/:fileId/content", async (req, res) => {
       },
     );
     if (response.status < 200 || response.status >= 300) {
-      return res.status(forwardedStatus(response.status)).json({
-        error: {
-          code: "OUTPUT_DOWNLOAD_FAILED",
-          message: "Output download failed",
-        },
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_FAILED",
       });
+      return;
     }
-    res.setHeader(
-      "Content-Type",
-      String(response.headers["content-type"] ?? "application/octet-stream"),
+    const declaredLengthHeader = response.headers["content-length"];
+    const declaredLength =
+      declaredLengthHeader === undefined
+        ? undefined
+        : Number(declaredLengthHeader);
+    if (declaredLength === 0) {
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_EMPTY",
+      });
+      return;
+    }
+    if (
+      declaredLength !== undefined &&
+      (!Number.isSafeInteger(declaredLength) ||
+        declaredLength < 0 ||
+        declaredLength > MAX_PROXY_UPLOAD_BYTES)
+    ) {
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_TOO_LARGE",
+      });
+      return;
+    }
+
+    const filename = filenameFromContentDisposition(
+      response.headers["content-disposition"],
+      fileId,
     );
-    const encoded = encodeURIComponent(filename);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`,
-    );
-    response.data.pipe(res);
+    let streamedBytes = 0;
+    try {
+      for await (const value of response.data as AsyncIterable<unknown>) {
+        const chunk = Buffer.isBuffer(value)
+          ? value
+          : Buffer.from(value as any);
+        if (!chunk.length) continue;
+        if (streamedBytes + chunk.length > MAX_PROXY_UPLOAD_BYTES) {
+          sendFileContentDownloadFailure(res, {
+            fileId,
+            upstreamStatus: response.status,
+            errorCode: "UPSTREAM_FILE_CONTENT_TOO_LARGE",
+          });
+          return;
+        }
+        if (streamedBytes === 0) {
+          res.status(200);
+          res.setHeader(
+            "Content-Type",
+            String(
+              response.headers["content-type"] ?? "application/octet-stream",
+            ),
+          );
+          if (declaredLength !== undefined) {
+            res.setHeader("Content-Length", String(declaredLength));
+          }
+          const encoded = encodeURIComponent(filename);
+          res.setHeader(
+            "Content-Disposition",
+            `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`,
+          );
+        }
+        streamedBytes += chunk.length;
+        if (!res.write(chunk)) await once(res, "drain");
+      }
+    } catch {
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_STREAM_FAILED",
+      });
+      return;
+    }
+    if (!streamedBytes) {
+      sendFileContentDownloadFailure(res, {
+        fileId,
+        upstreamStatus: response.status,
+        errorCode: "UPSTREAM_FILE_CONTENT_EMPTY",
+      });
+      return;
+    }
+    res.end();
   } catch (error) {
     sendKnownError(res, error);
   }

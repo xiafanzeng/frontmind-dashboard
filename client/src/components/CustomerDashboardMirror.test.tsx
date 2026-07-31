@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { DashboardPayload } from "@shared/dashboard";
 
 vi.mock("@/dashboard/UserBrandDashboard", () => ({
-  ManagedDashboardSection: () => <div>品牌建设用户页</div>,
+  ManagedDashboardSection: () => <div>服务首页用户页</div>,
   ManagedKeywordTables: () => <div>品牌全域词库用户页</div>,
   PublishedContentAssets: () => <div>已发布内容资产用户页</div>,
 }));
@@ -59,7 +59,7 @@ describe("CustomerDashboardMirror", () => {
     expect(
       screen.getByRole("tab", { name: "品牌全域词库" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "问题目录" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "问题优化" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "问题监控" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "进度报告" })).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "品牌建设" })).toBeNull();
@@ -95,9 +95,25 @@ describe("CustomerDashboardMirror", () => {
     );
 
     expect(screen.getByText("AI 友好官网用户页")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "知识库" }));
-    expect(screen.getByText("知识库构建进度用户页")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "知识库展示" }));
     expect(screen.getByText("知识库展示用户页")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "品牌建设" })).toBeNull();
+  });
+
+  it("renders the complete customer dashboard shell for administrators", () => {
+    render(<CustomerDashboardMirror payload={payload} />);
+
+    expect(screen.getByText("服务首页用户页")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "服务首页" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: "知识库智能体" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: "应答逻辑智能体" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: "AI 友好官网管理" }),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "品牌建设" })).toBeNull();
   });
 });

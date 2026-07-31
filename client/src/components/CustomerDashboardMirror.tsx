@@ -1,20 +1,25 @@
-import { useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import {
+  Activity,
   BarChart3,
-  BookOpenText,
+  Bot,
   Database,
   FileText,
   Globe2,
+  House,
   LibraryBig,
   ListChecks,
+  Menu,
   Newspaper,
+  Shield,
+  Target,
+  X,
 } from "lucide-react";
 
 import KnowledgeBaseProgressPanel from "@/components/KnowledgeBaseProgressPanel";
 import KnowledgeBaseViewer, {
   type KnowledgeSnapshotView,
 } from "@/components/KnowledgeBaseViewer";
-import { PortalCard } from "@/components/PortalShell";
 import AiWebsiteManagementWorkspace from "@/dashboard/AiWebsiteManagementWorkspace";
 import ProgressReportWorkspace from "@/dashboard/ProgressReportWorkspace";
 import QuestionMonitoringWorkspace from "@/dashboard/QuestionMonitoringWorkspace";
@@ -30,26 +35,79 @@ import type {
 } from "@shared/delivery-ticket";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 
+import "@/dashboard/dashboard-styles.css";
+import "./customer-dashboard-mirror.css";
+
 export type CustomerDashboardMirrorSection =
-  | "brand"
-  | "website"
+  | "home"
+  | "knowledge-build"
   | "knowledge"
   | "keywords"
   | "questions"
+  | "response-logic"
   | "monitoring"
   | "report"
-  | "content";
+  | "content"
+  | "website";
 
-const CUSTOMER_DASHBOARD_SECTIONS = [
-  { value: "brand", label: "品牌建设", icon: BookOpenText },
-  { value: "website", label: "AI 友好官网", icon: Globe2 },
-  { value: "knowledge", label: "知识库", icon: Database },
-  { value: "keywords", label: "品牌全域词库", icon: LibraryBig },
-  { value: "questions", label: "问题目录", icon: ListChecks },
-  { value: "monitoring", label: "问题监控", icon: BarChart3 },
-  { value: "report", label: "进度报告", icon: FileText },
-  { value: "content", label: "AI 友好内容", icon: Newspaper },
-] as const;
+type CustomerDashboardNavigationItem = {
+  value: CustomerDashboardMirrorSection;
+  label: string;
+  icon: typeof House;
+};
+
+const CUSTOMER_DASHBOARD_GROUPS: ReadonlyArray<{
+  label: string;
+  icon: typeof House;
+  items: readonly CustomerDashboardNavigationItem[];
+}> = [
+  {
+    label: "服务概览",
+    icon: House,
+    items: [{ value: "home", label: "服务首页", icon: House }],
+  },
+  {
+    label: "品牌建设",
+    icon: Shield,
+    items: [
+      {
+        value: "knowledge-build",
+        label: "知识库智能体",
+        icon: Database,
+      },
+      { value: "knowledge", label: "知识库展示", icon: Database },
+      { value: "keywords", label: "品牌全域词库", icon: LibraryBig },
+    ],
+  },
+  {
+    label: "意图优化",
+    icon: Target,
+    items: [
+      { value: "questions", label: "问题优化", icon: ListChecks },
+      { value: "response-logic", label: "应答逻辑智能体", icon: Bot },
+    ],
+  },
+  {
+    label: "进度监控",
+    icon: Activity,
+    items: [
+      { value: "monitoring", label: "问题监控", icon: BarChart3 },
+      { value: "report", label: "进度报告", icon: FileText },
+    ],
+  },
+  {
+    label: "AI 友好内容资产",
+    icon: Database,
+    items: [
+      { value: "content", label: "内容资产运营", icon: Newspaper },
+      { value: "website", label: "AI 友好官网管理", icon: Globe2 },
+    ],
+  },
+];
+
+const ALL_CUSTOMER_DASHBOARD_SECTIONS = CUSTOMER_DASHBOARD_GROUPS.flatMap(
+  (group) => group.items.map((item) => item.value),
+);
 
 type CustomerDashboardMirrorProps = {
   payload: DashboardPayload;
@@ -66,78 +124,180 @@ type CustomerDashboardMirrorProps = {
   allowedSections?: readonly CustomerDashboardMirrorSection[];
   heading?: string;
   description?: string;
+  editActions?: ReactNode;
+  renderSectionActions?: (section: CustomerDashboardMirrorSection) => ReactNode;
+  statusLabel?: string;
 };
 
 export default function CustomerDashboardMirror({
   payload,
   websiteWorkspace = null,
   knowledgePreview = null,
-  initialSection = "brand",
+  initialSection = "home",
   allowedSections,
-  heading = "客户页面实时版本",
-  description = "这里读取与客户账号相同的数据；切换分区即可核对客户实际看到的内容。",
+  heading,
+  description,
+  editActions,
+  renderSectionActions,
+  statusLabel,
 }: CustomerDashboardMirrorProps) {
-  const sections = useMemo(
+  const visibleSections = useMemo(
     () =>
-      CUSTOMER_DASHBOARD_SECTIONS.filter(
-        (section) =>
-          !allowedSections || allowedSections.includes(section.value),
+      ALL_CUSTOMER_DASHBOARD_SECTIONS.filter(
+        (section) => !allowedSections || allowedSections.includes(section),
       ),
     [allowedSections],
   );
   const [activeSection, setActiveSection] =
     useState<CustomerDashboardMirrorSection>(
-      sections.some((section) => section.value === initialSection)
+      visibleSections.includes(initialSection)
         ? initialSection
-        : (sections[0]?.value ?? "brand"),
+        : (visibleSections[0] ?? "home"),
     );
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   useEffect(() => {
-    if (sections.some((section) => section.value === initialSection)) {
+    if (visibleSections.includes(initialSection)) {
       setActiveSection(initialSection);
     } else {
-      setActiveSection(sections[0]?.value ?? "brand");
+      setActiveSection(visibleSections[0] ?? "home");
     }
-  }, [initialSection, sections]);
+  }, [initialSection, visibleSections]);
+
+  const selectSection = (section: CustomerDashboardMirrorSection) => {
+    setActiveSection(section);
+    setMobileNavOpen(false);
+  };
+  const sectionActions = renderSectionActions?.(activeSection);
+  const showEditorBar = Boolean(
+    heading || description || editActions || sectionActions || statusLabel,
+  );
 
   return (
-    <PortalCard className="overflow-hidden">
-      <div className="border-b border-[#e8e1ee] bg-[linear-gradient(135deg,#fbf8fd,#f4edf8)] px-5 py-4 sm:px-6">
-        <h3 className="font-semibold text-[#171321]">{heading}</h3>
-        <p className="mt-1 text-sm leading-6 text-[#716a80]">{description}</p>
-        <div
-          className="mt-4 flex gap-2 overflow-x-auto pb-1"
-          role="tablist"
-          aria-label="客户页面分区"
+    <section
+      className="user-brand-dashboard customer-dashboard-mirror"
+      aria-label={heading || "客户看板"}
+    >
+      <div
+        className={`app-shell customer-dashboard-mirror-shell ${
+          mobileNavOpen ? "nav-open" : ""
+        }`}
+      >
+        <button
+          className="mobile-menu-btn"
+          type="button"
+          onClick={() => setMobileNavOpen((open) => !open)}
+          aria-label="切换客户看板菜单"
         >
-          {sections.map(({ value, label, icon: Icon }) => (
-            <button
-              key={value}
-              type="button"
-              role="tab"
-              aria-selected={activeSection === value}
-              onClick={() => setActiveSection(value)}
-              className={`inline-flex shrink-0 items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium transition ${
-                activeSection === value
-                  ? "bg-[#5b2a86] text-white"
-                  : "border border-[#ded3e6] bg-white text-[#655c70] hover:text-[#5b2a86]"
-              }`}
-            >
-              <Icon className="h-4 w-4" />
-              {label}
-            </button>
-          ))}
-        </div>
+          {mobileNavOpen ? <X size={22} /> : <Menu size={22} />}
+        </button>
+        {mobileNavOpen && (
+          <button
+            type="button"
+            className="mobile-nav-overlay"
+            aria-label="关闭客户看板菜单"
+            onClick={() => setMobileNavOpen(false)}
+          />
+        )}
+
+        <aside className="global-nav customer-dashboard-mirror-nav">
+          <div className="nav-title-block">
+            <img
+              className="frontmind-logo frontmind-reference-logo"
+              src="/frontmind-contract-logo-white.svg"
+              alt="FrontMind"
+            />
+            <p>智能品牌优化看板</p>
+          </div>
+
+          <div
+            className="nav-group-card promise-card"
+            role="tablist"
+            aria-label="客户页面分区"
+          >
+            <div className="nav-group-head">
+              <span>MindPromise智诺</span>
+            </div>
+            {CUSTOMER_DASHBOARD_GROUPS.map((group) => {
+              const items = group.items.filter((item) =>
+                visibleSections.includes(item.value),
+              );
+              if (!items.length) return null;
+              const GroupIcon = group.icon;
+              const groupActive = items.some(
+                (item) => item.value === activeSection,
+              );
+              return (
+                <div key={group.label} className="customer-mirror-nav-group">
+                  <div
+                    className={`nav-section-label ${
+                      groupActive ? "active" : ""
+                    }`}
+                  >
+                    <GroupIcon className="nav-icon" size={16} />
+                    <span>{group.label}</span>
+                  </div>
+                  <div className="sub-nav">
+                    {items.map((item) => (
+                      <button
+                        key={item.value}
+                        type="button"
+                        role="tab"
+                        aria-selected={activeSection === item.value}
+                        className={activeSection === item.value ? "active" : ""}
+                        onClick={() => selectSection(item.value)}
+                      >
+                        <span>{item.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="sidebar-footer-brand">
+            <small>当前企业</small>
+            <strong>{payload.brandName}</strong>
+            <small>客户账号实际页面</small>
+          </div>
+        </aside>
+
+        <main className="dashboard-main customer-dashboard-mirror-main">
+          <div className="project-ribbon final-ribbon">
+            <div>
+              <span>FrontMind 智能品牌优化看板</span>
+              <h1>{payload.brandName}</h1>
+            </div>
+          </div>
+
+          {showEditorBar && (
+            <div className="customer-dashboard-editor-bar">
+              <div className="customer-dashboard-editor-copy">
+                {heading && <strong>{heading}</strong>}
+                {description && <p>{description}</p>}
+              </div>
+              <div className="customer-dashboard-editor-actions">
+                {statusLabel && (
+                  <span className="customer-dashboard-status">
+                    {statusLabel}
+                  </span>
+                )}
+                {editActions}
+                {sectionActions}
+              </div>
+            </div>
+          )}
+
+          <CustomerDashboardSection
+            section={activeSection}
+            payload={payload}
+            websiteWorkspace={websiteWorkspace}
+            knowledgePreview={knowledgePreview}
+          />
+        </main>
       </div>
-      <div className="bg-[#f6f3f8] p-3 sm:p-5">
-        <CustomerDashboardSection
-          section={activeSection}
-          payload={payload}
-          websiteWorkspace={websiteWorkspace}
-          knowledgePreview={knowledgePreview}
-        />
-      </div>
-    </PortalCard>
+    </section>
   );
 }
 
@@ -187,109 +347,106 @@ function CustomerDashboardSection({
     return [...groups.values()];
   }, [payload.questions]);
 
-  if (section === "brand") {
+  if (section === "home") {
     return (
-      <ManagedDashboardSection
-        payload={payload}
-        loading={false}
-        error={null}
-        embedded
-      />
+      <ManagedDashboardSection payload={payload} loading={false} error={null} />
     );
   }
 
   if (section === "website") {
     return websiteWorkspace ? (
-      <div className="user-brand-dashboard overflow-hidden rounded-2xl bg-white">
-        <AiWebsiteManagementWorkspace
-          planCode="advanced"
-          marketEdition={websiteWorkspace.marketEdition}
-          websiteWorkflow={websiteWorkspace.websiteWorkflow}
-          contentCatalog={websiteWorkspace.websiteContentCatalog}
-          quota={websiteWorkspace.quotas.website_content_publish}
-          tickets={websiteWorkspace.tickets.filter(
-            (ticket) => ticket.type === "website_operation",
-          )}
-          readOnlyPreview
-        />
-      </div>
+      <AiWebsiteManagementWorkspace
+        planCode="advanced"
+        marketEdition={websiteWorkspace.marketEdition}
+        websiteWorkflow={websiteWorkspace.websiteWorkflow}
+        contentCatalog={websiteWorkspace.websiteContentCatalog}
+        quota={websiteWorkspace.quotas.website_content_publish}
+        tickets={websiteWorkspace.tickets.filter(
+          (ticket) => ticket.type === "website_operation",
+        )}
+        readOnlyPreview
+      />
     ) : (
-      <MirrorEmpty title="AI 友好官网" />
+      <MirrorEmpty title="AI 友好官网管理" />
+    );
+  }
+
+  if (section === "knowledge-build") {
+    return knowledgePreview?.progress ? (
+      <section className="page-shell">
+        <KnowledgeBaseProgressPanel
+          progress={knowledgePreview.progress}
+          title="知识库构建进度"
+        />
+      </section>
+    ) : (
+      <MirrorEmpty title="知识库智能体" />
     );
   }
 
   if (section === "knowledge") {
-    return knowledgePreview?.progress || knowledgePreview?.snapshot ? (
-      <div className="grid gap-4">
-        <KnowledgeBaseProgressPanel
-          progress={knowledgePreview.progress}
-          title="客户当前知识库构建进度"
-        />
+    return knowledgePreview?.snapshot ? (
+      <section className="page-shell">
         <div className="overflow-hidden rounded-2xl border border-[#e5ddea] bg-white p-4 sm:p-6">
           <KnowledgeBaseViewer snapshot={knowledgePreview.snapshot} />
         </div>
-      </div>
+      </section>
     ) : (
-      <MirrorEmpty title="知识库" />
+      <MirrorEmpty title="知识库展示" />
     );
   }
 
   if (section === "keywords") {
     return (
-      <div className="user-brand-dashboard overflow-hidden rounded-2xl bg-white">
-        <ManagedKeywordTables
-          tables={payload.keywordTables}
-          loading={false}
-          error={null}
-          embedded
-        />
-      </div>
+      <ManagedKeywordTables
+        tables={payload.keywordTables}
+        loading={false}
+        error={null}
+      />
     );
   }
 
-  if (section === "questions") {
+  if (section === "questions" || section === "response-logic") {
     return payload.questions.length ? (
-      <div className="grid gap-3 lg:grid-cols-2">
-        {payload.questions.map((question) => (
-          <article
-            key={question.id}
-            className="rounded-2xl border border-[#e5ddea] bg-white p-4"
-          >
-            <p className="text-xs font-semibold text-[#7b4b9d]">
-              {question.groupTitle}
-            </p>
-            <h4 className="mt-2 font-semibold leading-6 text-[#332842]">
-              {question.question}
-            </h4>
-            {question.intent && (
-              <p className="mt-3 text-sm leading-6 text-[#655c70]">
-                {question.intent}
-              </p>
-            )}
-            {question.summary && (
-              <p className="mt-2 text-xs leading-5 text-[#8a8194]">
-                {question.summary}
-              </p>
-            )}
-          </article>
-        ))}
-      </div>
+      <section className="page-shell">
+        <header className="page-header">
+          <span className="eyebrow">MindPromise智诺 / 意图优化</span>
+          <h2>
+            {section === "response-logic" ? "应答逻辑智能体" : "问题优化"}
+          </h2>
+          <p>
+            {section === "response-logic"
+              ? "逐题核对已发布的用户问题、应答目标与确认口径。"
+              : "查看客户问题目录与每个问题对应的真实用户意图。"}
+          </p>
+        </header>
+        <div className="customer-dashboard-question-grid">
+          {payload.questions.map((question) => (
+            <article key={question.id}>
+              <span>{question.groupTitle}</span>
+              <h4>{question.question}</h4>
+              {question.intent && <p>{question.intent}</p>}
+              {question.summary && <small>{question.summary}</small>}
+            </article>
+          ))}
+        </div>
+      </section>
     ) : (
-      <MirrorEmpty title="问题目录" />
+      <MirrorEmpty
+        title={section === "response-logic" ? "应答逻辑智能体" : "问题优化"}
+      />
     );
   }
 
   if (section === "monitoring") {
     return questionGroups.length || payload.monitoringAnswers.length ? (
-      <div className="user-brand-dashboard overflow-hidden rounded-2xl bg-white">
-        <QuestionMonitoringWorkspace
-          questionGroups={questionGroups}
-          monitoringAnswers={payload.monitoringAnswers}
-          citationMode="inline"
-          monitoringAnswersLoading={false}
-          monitoringAnswersError={false}
-        />
-      </div>
+      <QuestionMonitoringWorkspace
+        questionGroups={questionGroups}
+        monitoringAnswers={payload.monitoringAnswers}
+        citationMode="inline"
+        monitoringAnswersLoading={false}
+        monitoringAnswersError={false}
+      />
     ) : (
       <MirrorEmpty title="问题监控" />
     );
@@ -297,32 +454,35 @@ function CustomerDashboardSection({
 
   if (section === "report") {
     return payload.optimizationReport ? (
-      <div className="overflow-hidden rounded-2xl border border-[#e5ddea] bg-white">
-        <ProgressReportWorkspace report={payload.optimizationReport} />
-      </div>
+      <ProgressReportWorkspace report={payload.optimizationReport} />
     ) : (
       <MirrorEmpty title="进度报告" />
     );
   }
 
   return payload.contentAssets.length ? (
-    <div className="user-brand-dashboard overflow-hidden rounded-2xl bg-white p-4 sm:p-6">
+    <section className="page-shell">
       <PublishedContentAssets assets={payload.contentAssets} />
-    </div>
+    </section>
   ) : (
-    <MirrorEmpty title="AI 友好内容" />
+    <MirrorEmpty title="内容资产运营" />
   );
 }
 
 function MirrorEmpty({ title }: { title: string }) {
   return (
-    <div className="grid min-h-56 place-items-center rounded-2xl border border-dashed border-[#dcd1e3] bg-white p-8 text-center">
-      <div>
-        <p className="font-semibold text-[#403748]">{title}尚未发布内容</p>
-        <p className="mt-2 text-sm text-[#81778a]">
-          上传并通过预检后，这里会立即呈现客户看到的结果。
-        </p>
-      </div>
-    </div>
+    <section className="page-shell">
+      <header className="page-header">
+        <span className="eyebrow">MindPromise智诺</span>
+        <h2>{title}</h2>
+        <p>当前客户账号尚未发布这一分区的正式内容。</p>
+      </header>
+      <section className="panel">
+        <div className="empty-state">
+          <Database size={24} />
+          <p>发布后，管理员、工程师和客户会在同一位置看到结果。</p>
+        </div>
+      </section>
+    </section>
   );
 }

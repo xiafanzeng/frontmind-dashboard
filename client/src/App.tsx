@@ -18,6 +18,7 @@ import {
 import SetupPassword from "./pages/SetupPassword";
 import { isSystemAdminAccount } from "@/lib/admin-access";
 import { hasExplicitAdminRole } from "@shared/admin-access";
+import { userFacingErrorMessage } from "@/lib/user-facing-error";
 
 const UserDashboard = lazy(() =>
   import("./pages/UserDashboard").then(({ default: component }) => ({
@@ -251,7 +252,7 @@ export function AuthBoundary() {
         <div className="glass-card w-full max-w-sm rounded-2xl p-7 text-center">
           <h1 className="text-lg font-semibold">暂时无法连接服务</h1>
           <p className="mt-2 break-words text-sm text-muted-foreground">
-            {error.message || "请检查网络连接后重试。"}
+            {userFacingErrorMessage(error, "请检查网络连接后重试。")}
           </p>
           <Button
             className="mt-5"

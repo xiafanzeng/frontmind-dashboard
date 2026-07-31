@@ -36,7 +36,7 @@ async function fetchImageWithAuth(url: string): Promise<string> {
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch image: HTTP ${response.status}`);
+    throw new Error(`图片读取失败（HTTP ${response.status}）`);
   }
 
   const contentType = response.headers.get("content-type") || "";
@@ -54,18 +54,16 @@ async function fetchImageWithAuth(url: string): Promise<string> {
           headers: deliveryProjectHeaders(),
         });
         if (!proxyResponse.ok) {
-          throw new Error(
-            `Failed to fetch from proxy: HTTP ${proxyResponse.status}`,
-          );
+          throw new Error(`图片代理读取失败（HTTP ${proxyResponse.status}）`);
         }
         const blob = await proxyResponse.blob();
         return URL.createObjectURL(blob);
       }
     } catch (e) {
       // Not JSON or no upload_url - rethrow if it was a fetch error
-      if (e instanceof Error && e.message.includes("Failed to fetch")) throw e;
+      if (e instanceof Error && e.message.includes("读取失败")) throw e;
     }
-    throw new Error("Received JSON instead of image data");
+    throw new Error("服务返回的不是有效图片");
   }
 
   const blob = await response.blob();

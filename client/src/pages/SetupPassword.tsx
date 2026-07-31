@@ -5,6 +5,7 @@ import { useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { trpc } from "@/lib/trpc";
+import { userFacingErrorMessage } from "@/lib/user-facing-error";
 
 export default function SetupPassword() {
   const [, navigate] = useLocation();
@@ -40,9 +41,7 @@ export default function SetupPassword() {
     try {
       await setup.mutateAsync({ token, newPassword: password });
     } catch (error) {
-      setMessage(
-        error instanceof Error ? error.message : "密码设置失败，请稍后重试。",
-      );
+      setMessage(userFacingErrorMessage(error, "密码设置失败，请稍后重试。"));
     }
   };
 

@@ -14,6 +14,78 @@ const validationFieldLabels: Record<string, string> = {
   topic: "话题",
 };
 
+export function localizedUserFacingError(
+  message: string,
+  code: string = "INTERNAL_SERVER_ERROR",
+) {
+  const normalized = message.trim();
+  if (/[\u3400-\u9fff]/u.test(normalized)) return normalized;
+
+  if (/invalid (?:username|user name) or password/i.test(normalized)) {
+    return "用户名或密码不正确";
+  }
+  if (/account is disabled/i.test(normalized)) return "账号已停用";
+  if (/username already exists/i.test(normalized)) return "用户名已存在";
+  if (/password.*(?:at least|too short)/i.test(normalized)) {
+    return "密码长度不足，请按页面要求重新输入";
+  }
+  if (/password.*too long/i.test(normalized)) return "密码长度超过限制";
+  if (/api credential.*not found/i.test(normalized)) {
+    return "API 凭据不存在或已失效";
+  }
+  if (/conversation.*not found/i.test(normalized)) return "对话记录不存在";
+  if (/workspace.*not found/i.test(normalized)) return "工作区不存在";
+  if (/user.*not found/i.test(normalized)) return "用户不存在";
+  if (/not found/i.test(normalized)) return "请求的内容不存在";
+  if (
+    /unauthorized|invalid session|please log(?:in| in)|authentication/i.test(
+      normalized,
+    )
+  ) {
+    return "登录状态无效，请重新登录";
+  }
+  if (/forbidden|permission|access denied/i.test(normalized)) {
+    return "当前账号无权执行此操作";
+  }
+  if (/rate limit|too many requests/i.test(normalized)) {
+    return "操作过于频繁，请稍后重试";
+  }
+  if (/timeout|timed out/i.test(normalized)) return "请求超时，请稍后重试";
+  if (/network|failed to fetch/i.test(normalized)) {
+    return "网络连接异常，请检查网络后重试";
+  }
+
+  switch (code) {
+    case "BAD_REQUEST":
+    case "PARSE_ERROR":
+    case "UNPROCESSABLE_CONTENT":
+      return "提交内容有误，请检查后重试";
+    case "UNAUTHORIZED":
+      return "请先登录后再操作";
+    case "FORBIDDEN":
+      return "当前账号无权执行此操作";
+    case "NOT_FOUND":
+      return "请求的内容不存在";
+    case "CONFLICT":
+    case "PRECONDITION_FAILED":
+      return "当前数据已变化，请刷新后重试";
+    case "PAYLOAD_TOO_LARGE":
+      return "提交内容过大，请缩减后重试";
+    case "UNSUPPORTED_MEDIA_TYPE":
+      return "文件格式不受支持";
+    case "TOO_MANY_REQUESTS":
+      return "操作过于频繁，请稍后重试";
+    case "TIMEOUT":
+    case "GATEWAY_TIMEOUT":
+      return "请求超时，请稍后重试";
+    case "BAD_GATEWAY":
+    case "SERVICE_UNAVAILABLE":
+      return "服务暂时不可用，请稍后重试";
+    default:
+      return "请求暂时无法完成，请稍后重试";
+  }
+}
+
 function localizedZodIssue(issue: ZodError["issues"][number]) {
   if (/[\u3400-\u9fff]/u.test(issue.message)) return issue.message;
   const rawField = String(issue.path.at(-1) ?? "输入内容");
@@ -38,7 +110,12 @@ function localizedZodIssue(issue: ZodError["issues"][number]) {
 const t = initTRPC.context<TrpcContext>().create({
   transformer: superjson,
   errorFormatter({ shape, error }) {
-    if (!(error.cause instanceof ZodError)) return shape;
+    if (!(error.cause instanceof ZodError)) {
+      return {
+        ...shape,
+        message: localizedUserFacingError(shape.message, error.code),
+      };
+    }
     const issue = error.cause.issues[0];
     return {
       ...shape,

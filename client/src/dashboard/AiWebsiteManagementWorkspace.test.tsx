@@ -31,7 +31,7 @@ function websiteQuota(
 }
 
 describe("AiWebsiteManagementWorkspace", () => {
-  it("makes the engineer mirror explicitly read-only", () => {
+  it("shows only customer-facing results in the engineer preview", () => {
     render(
       <AiWebsiteManagementWorkspace
         planCode="advanced"
@@ -47,12 +47,19 @@ describe("AiWebsiteManagementWorkspace", () => {
     );
 
     expect(
-      screen.getByText(/当前为工程师验收预览，数据与客户正式页面一致/),
+      screen.getByRole("heading", { name: "客户官网结果预览" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("验收预览不提供客户提交操作。"),
+      screen.getByRole("heading", { name: "客户当前可见状态" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "提交工单" })).toBeDisabled();
+    expect(
+      screen.getByRole("heading", { name: "客户收到的公开交付结果" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("阿里云企业域名注册图文教程"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/图文教程逐步完成/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "提交工单" })).toBeNull();
   });
 
   it("removes the old technical console and exposes the fixed two-step workflow", () => {
@@ -114,11 +121,15 @@ describe("AiWebsiteManagementWorkspace", () => {
     );
 
     expect(screen.queryByLabelText("需求类型")).not.toBeInTheDocument();
-    expect(screen.getByText("域名购买完成后，在这里提交")).toBeInTheDocument();
+    expect(
+      screen.queryByText("域名购买完成后，在这里提交"),
+    ).not.toBeInTheDocument();
     expect(
       screen.getByText("企业首次备案：照着下面 7 个阶段一步一步做"),
     ).toBeInTheDocument();
-    expect(screen.getByText("备案服务码不用提前准备")).toBeInTheDocument();
+    expect(
+      screen.queryByText("备案服务码不用提前准备"),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByText("FrontMind 备案服务码", { selector: "li" }),
     ).not.toBeInTheDocument();
@@ -158,7 +169,9 @@ describe("AiWebsiteManagementWorkspace", () => {
     expect(
       screen.getByRole("link", { name: /去阿里云开始 ICP 备案/ }),
     ).toHaveAttribute("href", "https://beian.aliyun.com/");
-    expect(screen.getByLabelText("已购买域名")).toBeInTheDocument();
+    const purchasedDomain = screen.getByLabelText("已购买域名");
+    expect(stageThree.closest("li")).toContainElement(purchasedDomain);
+    expect(screen.getByText("域名购买完成后，在这里提交")).toBeInTheDocument();
     expect(screen.queryByLabelText("ICP 主体备案号")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "提交工单" }),
@@ -198,6 +211,9 @@ describe("AiWebsiteManagementWorkspace", () => {
       "/assets/aliyun-icp-guide/03-enterprise-sponsor.webp",
     );
     expect(screenshot).toHaveAttribute("loading", "lazy");
+    expect(screenshot.closest("figure")).toHaveStyle({
+      "--guide-image-width": "1269px",
+    });
 
     const openButton = screen.getByRole("button", {
       name: /放大查看：阿里云企业备案主办者基础信息表单示例/,
@@ -308,6 +324,11 @@ describe("AiWebsiteManagementWorkspace", () => {
       />,
     );
 
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /回到 FrontMind 提交已购买域名，等待备案服务码/,
+      }),
+    );
     fireEvent.change(screen.getByLabelText("已购买域名"), {
       target: { value: "example.cn" },
     });
@@ -443,6 +464,11 @@ describe("AiWebsiteManagementWorkspace", () => {
         name: "海外版 · 香港/海外节点",
       }),
     ).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /回到 FrontMind 按海外版提交域名/,
+      }),
+    );
     expect(
       screen.getByText("海外版域名购买完成后，在这里提交"),
     ).toBeInTheDocument();

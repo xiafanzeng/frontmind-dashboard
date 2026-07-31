@@ -25,17 +25,14 @@ import {
 
 const passwordSchema = z
   .string()
-  .min(
-    MIN_PASSWORD_LENGTH,
-    `Password must contain at least ${MIN_PASSWORD_LENGTH} characters`,
-  )
-  .max(MAX_PASSWORD_LENGTH, "Password is too long");
+  .min(MIN_PASSWORD_LENGTH, `密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`)
+  .max(MAX_PASSWORD_LENGTH, `密码不能超过 ${MAX_PASSWORD_LENGTH} 个字符`);
 
 export function toTrpcError(error: unknown): TRPCError {
   if (!(error instanceof AuthServiceError)) {
     return new TRPCError({
       code: "INTERNAL_SERVER_ERROR",
-      message: "The request could not be completed",
+      message: "请求暂时无法完成，请稍后重试",
       cause: error,
     });
   }
@@ -64,7 +61,7 @@ export function toTrpcError(error: unknown): TRPCError {
     case "INVALID_MASTER_KEY":
       return new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
-        message: "The service is not configured correctly",
+        message: "服务配置异常，请联系管理员",
         cause: error,
       });
   }

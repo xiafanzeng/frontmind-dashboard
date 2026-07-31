@@ -1085,9 +1085,7 @@ export default function OptimizationReportEditor({
           <div>
             <div className="flex items-center gap-2">
               <FileText className="h-5 w-5 text-[#5b2a86]" />
-              <h3 className="font-semibold text-[#171321]">
-                进度报告逐字段维护
-              </h3>
+              <h3 className="font-semibold text-[#171321]">进度报告内容维护</h3>
             </div>
             <p className="mt-2 text-sm leading-6 text-[#716a80]">
               当前尚未创建进度报告。创建后可按正式问题维护真实答案、截图、分析和优化后效果。
@@ -1138,9 +1136,7 @@ export default function OptimizationReportEditor({
           <div>
             <div className="flex items-center gap-2">
               <FileText className="h-5 w-5 text-[#5b2a86]" />
-              <h3 className="font-semibold text-[#171321]">
-                进度报告逐字段维护
-              </h3>
+              <h3 className="font-semibold text-[#171321]">进度报告内容维护</h3>
             </div>
             <p className="mt-2 text-sm leading-6 text-[#716a80]">
               所有内容随看板版本统一预览和发布；用户端不会回退到示例答案或固定分析。

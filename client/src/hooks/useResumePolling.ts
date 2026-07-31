@@ -21,20 +21,21 @@
 import { useEffect, useRef, useCallback } from "react";
 import {
   useConversation,
-  parseOutputMessages,
-  sanitizeKnowledgeBaseOutputMessages,
   type Conversation,
 } from "@/contexts/ConversationContext";
-import { retrieveTask, creditEventBus } from "@/lib/frontmind-api";
+import {
+  retrieveTask,
+  creditEventBus,
+  sanitizeBrandText,
+} from "@/lib/frontmind-api";
 import {
   fetchKnowledgeBaseProgress,
   reconcileKnowledgeBaseProgress,
 } from "@/lib/knowledge-progress";
 import {
   collectAssistantOutputIds,
-  outputForKnowledgePresentation,
-  sliceNewOutput,
-} from "@/hooks/useSendMessage";
+  projectTaskOutputMessages,
+} from "@/lib/task-output-projection";
 import { toast } from "sonner";
 
 export function getResumePollDelay(elapsedMs: number) {
@@ -53,6 +54,7 @@ async function checkAndUpdateTask(
   updateAssistantMessages: ReturnType<
     typeof useConversation
   >["updateAssistantMessages"],
+  addMessage: ReturnType<typeof useConversation>["addMessage"],
 ): Promise<boolean> {
   if (!conv.taskId) return false;
 
@@ -65,8 +67,15 @@ async function checkAndUpdateTask(
     > = null;
     try {
       existingProgress = await fetchKnowledgeBaseProgress(conv.id);
-    } catch {
-      // Non-knowledge conversations do not have a build row.
+    } catch (error) {
+      // The endpoint returns a successful null payload for ordinary
+      // conversations. A rejected request is therefore transient and must not
+      // let a knowledge task bypass protocol reconciliation.
+      console.error(
+        "[ResumePolling] Error fetching knowledge progress:",
+        error,
+      );
+      return true;
     }
     const isKnowledgeBaseConversation = Boolean(existingProgress);
 
@@ -82,48 +91,50 @@ async function checkAndUpdateTask(
           ? conv.messages.slice(0, lastUserIndex)
           : conv.messages;
       const historicalOutputIds = collectAssistantOutputIds(historicalMessages);
-      const newOutput = sliceNewOutput(
-        taskData.output,
-        baselineOutputLength,
-        historicalOutputIds,
-      );
-      const presentationOutput = knowledgeBase
-        ? outputForKnowledgePresentation(taskData.output, newOutput)
-        : newOutput;
-
-      if (presentationOutput.length > 0) {
-        try {
-          const parsedMessages = parseOutputMessages(
-            presentationOutput,
-            conv.startedAt || conv.createdAt,
-            conv.messages?.[conv.messages.length - 1]?.modelName,
-          );
-          const msgs = knowledgeBase
-            ? sanitizeKnowledgeBaseOutputMessages(parsedMessages)
-            : parsedMessages;
-          if (msgs.length > 0) {
-            // If completed, attach elapsed time to last message
-            if (normalizedStatus === "completed") {
-              const completedAt = Date.now();
-              const elapsedSec =
-                (completedAt - (conv.startedAt || conv.createdAt)) / 1000;
-              msgs[msgs.length - 1].elapsedTime = elapsedSec;
-            }
-            updateAssistantMessages(conv.id, msgs);
+      try {
+        const msgs = projectTaskOutputMessages({
+          output: taskData.output,
+          baselineOutputLength,
+          historicalOutputIds,
+          responseStartedAt: conv.startedAt || conv.createdAt,
+          modelName: [...conv.messages]
+            .reverse()
+            .find((message) => message.role === "assistant" && message.modelName)
+            ?.modelName,
+          knowledgeBase,
+        });
+        if (msgs.length > 0) {
+          // If completed, attach elapsed time to last message
+          if (normalizedStatus === "completed") {
+            const completedAt = Date.now();
+            const elapsedSec =
+              (completedAt - (conv.startedAt || conv.createdAt)) / 1000;
+            msgs[msgs.length - 1].elapsedTime = elapsedSec;
           }
-        } catch (parseErr) {
-          console.error("[ResumePolling] Error parsing output:", parseErr);
+          updateAssistantMessages(conv.id, msgs);
         }
+      } catch (parseErr) {
+        console.error("[ResumePolling] Error parsing output:", parseErr);
       }
     };
 
-    // Ordinary conversations can render incremental output immediately.
-    // Knowledge-base output is rendered only after the server accepts its
-    // progress/presentation envelopes below.
-    if (!isKnowledgeBaseConversation) {
-      applyRetrievedOutput(false);
-    }
+    const appendKnowledgeBaseError = (message: string) => {
+      const id = `msg-kb-error-${taskData.id.slice(-72)}`;
+      if (conv.messages.some((existing) => existing.id === id)) return;
+      addMessage(conv.id, {
+        id,
+        role: "assistant",
+        content: `❌ 错误: ${sanitizeBrandText(message)}`,
+        timestamp: Date.now(),
+      });
+    };
 
+    // Text visibility is independent from protocol reconciliation. The
+    // conversation remains locked while the authoritative interaction state
+    // is running or queued.
+    applyRetrievedOutput(isKnowledgeBaseConversation);
+
+    let reconciliationError: unknown;
     try {
       if (existingProgress) {
         const interaction = await reconcileKnowledgeBaseProgress({
@@ -131,7 +142,6 @@ async function checkAndUpdateTask(
           taskId: taskData.id,
         });
         if (interaction.interactionState === "awaiting_input") {
-          applyRetrievedOutput(true);
           updateStatus(conv.id, "awaiting_input", {
             taskId: taskData.id,
             taskUrl: taskData.metadata?.task_url,
@@ -144,7 +154,6 @@ async function checkAndUpdateTask(
           interaction.interactionState === "ready_to_publish" ||
           interaction.interactionState === "published"
         ) {
-          applyRetrievedOutput(true);
           updateStatus(conv.id, "completed", {
             taskId: taskData.id,
             completedAt: Date.now(),
@@ -153,25 +162,35 @@ async function checkAndUpdateTask(
           return false;
         }
         if (interaction.interactionState === "failed") {
+          const errorMessage =
+            interaction.lockReason || "知识树状态未通过校验";
           updateStatus(conv.id, "error", {
             taskId: taskData.id,
             completedAt: Date.now(),
             lastKnownOutputLength: taskData.output?.length || 0,
           });
+          appendKnowledgeBaseError(errorMessage);
+          toast.error(sanitizeBrandText(errorMessage));
           return false;
         }
       }
-    } catch {
+    } catch (error) {
+      reconciliationError = error;
       // A partial running response is allowed to remain unreconciled. The
       // next visibility/focus poll will retry with the completed envelope.
     }
 
     if (isKnowledgeBaseConversation && normalizedStatus === "completed") {
+      const errorMessage =
+        reconciliationError instanceof Error
+          ? `知识树状态未通过校验：${reconciliationError.message}`
+          : "任务已结束，但未返回完整的知识节点状态";
       updateStatus(conv.id, "error", {
         completedAt: Date.now(),
         lastKnownOutputLength: taskData.output?.length || 0,
       });
-      toast.error("任务已结束，但未返回完整的知识节点状态");
+      appendKnowledgeBaseError(errorMessage);
+      toast.error(sanitizeBrandText(errorMessage));
       return false;
     }
 
@@ -206,7 +225,10 @@ async function checkAndUpdateTask(
         lastKnownOutputLength: totalOutputLength,
       });
       const errorMsg = taskData.error?.message || "任务执行出错";
-      toast.error(errorMsg);
+      if (isKnowledgeBaseConversation) {
+        appendKnowledgeBaseError(errorMsg);
+      }
+      toast.error(sanitizeBrandText(errorMsg));
       creditEventBus.emit();
       return false; // Done
     }
@@ -231,8 +253,13 @@ async function checkAndUpdateTask(
 }
 
 export function useResumePolling() {
-  const { state, hydrated, updateStatus, updateAssistantMessages } =
-    useConversation();
+  const {
+    state,
+    hydrated,
+    updateStatus,
+    updateAssistantMessages,
+    addMessage,
+  } = useConversation();
   const resumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resumeStartedAtRef = useRef<number>(0);
   const isResumingRef = useRef(false);
@@ -256,6 +283,8 @@ export function useResumePolling() {
   updateStatusRef.current = updateStatus;
   const updateAssistantMessagesRef = useRef(updateAssistantMessages);
   updateAssistantMessagesRef.current = updateAssistantMessages;
+  const addMessageRef = useRef(addMessage);
+  addMessageRef.current = addMessage;
   const recoveredTerminalTasksRef = useRef(new Set<string>());
 
   const stopResumePolling = useCallback(() => {
@@ -293,6 +322,19 @@ export function useResumePolling() {
     const stillRunning = new Set(runningConvs.map((c) => c.id));
 
     const pollOnce = async () => {
+      // A new task can be created while this global loop is already polling a
+      // different conversation. Fold it into the same owner on the next pass
+      // instead of requiring another local polling loop.
+      for (const conversation of stateRef.current.conversations) {
+        if (
+          (conversation.status === "running" ||
+            conversation.status === "pending") &&
+          conversation.taskId
+        ) {
+          stillRunning.add(conversation.id);
+        }
+      }
+
       // Check each still-running conversation
       const toRemove: string[] = [];
       for (const convId of stillRunning) {
@@ -308,6 +350,7 @@ export function useResumePolling() {
           conv,
           updateStatusRef.current,
           updateAssistantMessagesRef.current,
+          addMessageRef.current,
         );
 
         if (!isStillRunning) {
@@ -413,6 +456,7 @@ export function useResumePolling() {
             conversation,
             updateStatusRef.current,
             updateAssistantMessagesRef.current,
+            addMessageRef.current,
           );
         } catch {
           recoveredTerminalTasksRef.current.delete(key);

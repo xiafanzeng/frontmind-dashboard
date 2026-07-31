@@ -87,4 +87,23 @@ describe("Login", () => {
     expect(authMock.login).not.toHaveBeenCalled();
     expect(toastMock.error).toHaveBeenCalledWith("请输入用户名和密码");
   });
+
+  it("shows an English authentication failure in Chinese", async () => {
+    authMock.login.mockRejectedValue(new Error("Invalid username or password"));
+    render(<Login />);
+
+    fireEvent.change(screen.getByLabelText("用户名"), {
+      target: { value: "demo" },
+    });
+    fireEvent.change(screen.getByLabelText("密码"), {
+      target: { value: "wrong-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "登录" }));
+
+    await waitFor(() =>
+      expect(toastMock.error).toHaveBeenCalledWith("无法登录", {
+        description: "用户名或密码不正确",
+      }),
+    );
+  });
 });

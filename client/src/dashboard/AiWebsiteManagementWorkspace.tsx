@@ -477,6 +477,21 @@ export default function AiWebsiteManagementWorkspace({
     !serviceAllowed ||
     !onSubmit;
 
+  if (readOnlyPreview) {
+    return (
+      <EngineerWebsiteCustomerPreview
+        siteProfile={siteProfile}
+        websiteWorkflow={websiteWorkflow}
+        workflow={workflow}
+        styleState={styleState}
+        contentTypes={contentTypes}
+        tickets={tickets}
+        loading={loading}
+        error={error}
+      />
+    );
+  }
+
   function handleFiles(event: ChangeEvent<HTMLInputElement>) {
     const nextFiles = Array.from(event.target.files ?? []);
     setAttachments((current) => [...current, ...nextFiles]);
@@ -582,15 +597,9 @@ export default function AiWebsiteManagementWorkspace({
         <p className="ai-website-intro">
           {overseasAccount
             ? "先注册企业实名域名，再回到这里提交域名创建 AI 运维工单。香港或海外节点无需办理工信部 ICP 备案。"
-            : "先在阿里云购买企业实名域名，再回到这里提交域名创建 AI 运维工单。工单返回备案服务码后，再到阿里云完成材料提交和人脸核验。"}
+            : "先在阿里云购买企业实名域名，再按图文教程逐步完成域名提交和 ICP 备案。"}
         </p>
       </header>
-
-      {readOnlyPreview && (
-        <div className="ai-website-inline-state" role="note">
-          当前为工程师验收预览，数据与客户正式页面一致；只能核对结果，不能代替客户提交、选择或退回。
-        </div>
-      )}
 
       <section
         className="ai-website-prerequisites"
@@ -602,7 +611,7 @@ export default function AiWebsiteManagementWorkspace({
             <p>
               {overseasAccount
                 ? "域名提交后由 AI 运维完成香港或海外节点、DNS 与 HTTPS 配置。"
-                : "域名提交后由 AI 运维返回备案服务码，再继续 ICP 备案。"}
+                : "先完成企业域名注册，再按当前进度继续办理。"}
             </p>
           </div>
         </div>
@@ -845,193 +854,228 @@ export default function AiWebsiteManagementWorkspace({
                     onContactAdvisor={onContactAdvisor}
                     scenario={guideScenario}
                     onScenarioChange={setGuideScenario}
-                  />
-                  <div
-                    className="ai-website-result-heading"
-                    id={
-                      phase === "domain"
-                        ? "ai-website-domain-form"
-                        : "ai-website-result-form"
+                    stageThreeContent={
+                      phase === "domain" ? (
+                        <div
+                          className="ai-website-guide-stage-submission"
+                          id="ai-website-domain-form"
+                          tabIndex={-1}
+                        >
+                          <div className="ai-website-result-heading">
+                            <strong>
+                              {guideScenario === "overseas"
+                                ? "海外版域名购买完成后，在这里提交"
+                                : "域名购买完成后，在这里提交"}
+                            </strong>
+                            <p>
+                              {guideScenario === "overseas"
+                                ? "只提交域名列表中状态为“正常”的主域名。系统会把香港或海外节点场景写入 AI 运维工单；无需备案服务码和 ICP 备案号。"
+                                : "只提交阿里云域名列表中状态为“正常”的主域名。提交后会自动创建 AI 运维工单，并在工单完成时返回备案服务码。"}
+                            </p>
+                          </div>
+
+                          <label className="ai-website-form-field">
+                            <span>已购买域名</span>
+                            <input
+                              type="text"
+                              aria-label="已购买域名"
+                              aria-required="true"
+                              value={topic}
+                              onChange={(event) => setTopic(event.target.value)}
+                              placeholder="例如 example.com"
+                            />
+                            <small className="ai-website-field-help">
+                              不要填写
+                              www、http、https、订单号或页面路径；此处无需备案服务码。
+                            </small>
+                          </label>
+
+                          {!onSubmit && (
+                            <div
+                              className="ai-website-inline-state"
+                              role="status"
+                            >
+                              工单提交服务暂时不可用。
+                            </div>
+                          )}
+
+                          <div className="ai-website-form-actions">
+                            <p
+                              className={`ai-website-submit-message ${submitState}`}
+                              aria-live="polite"
+                            >
+                              {submitMessage}
+                            </p>
+                            <button
+                              type="submit"
+                              className="ai-website-primary-button"
+                              disabled={submitDisabled}
+                            >
+                              <Send size={17} aria-hidden="true" />
+                              {submitting
+                                ? "正在提交…"
+                                : "提交域名，创建 AI 运维工单"}
+                            </button>
+                          </div>
+                        </div>
+                      ) : undefined
                     }
-                    tabIndex={-1}
-                  >
-                    <strong>
-                      {phase === "domain"
-                        ? overseasAccount
-                          ? "海外版域名购买完成后，在这里提交"
-                          : "域名购买完成后，在这里提交"
-                        : "备案通过后，仅回填以下两项"}
-                    </strong>
-                    {phase === "domain" ? (
-                      <p>
-                        {overseasAccount
-                          ? "只提交域名列表中状态为“正常”的主域名。系统会把香港或海外节点场景写入 AI 运维工单；无需备案服务码和 ICP 备案号。"
-                          : "只提交阿里云域名列表中状态为“正常”的主域名。提交后会自动创建 AI 运维工单，并在工单完成时返回备案服务码。"}
-                      </p>
-                    ) : (
+                  />
+                  {phase === "icp" && (
+                    <div
+                      className="ai-website-result-heading"
+                      id="ai-website-result-form"
+                      tabIndex={-1}
+                    >
+                      <strong>备案通过后，仅回填以下两项</strong>
                       <p>
                         请确认阿里云备案状态已显示通过，再提交域名与 ICP
                         主体备案号供平台确认。
                       </p>
-                    )}
-                  </div>
-                </>
-              )}
-
-              <label className="ai-website-form-field">
-                <span>
-                  {phase === "domain"
-                    ? "已购买域名"
-                    : phase === "icp"
-                      ? "已备案域名"
-                      : "话题"}
-                </span>
-                <input
-                  type="text"
-                  aria-label={
-                    phase === "domain"
-                      ? "已购买域名"
-                      : phase === "icp"
-                        ? "已备案域名"
-                        : "话题"
-                  }
-                  aria-required="true"
-                  value={topic}
-                  onChange={(event) => setTopic(event.target.value)}
-                  placeholder={
-                    phase === "domain" || phase === "icp"
-                      ? "例如 example.com"
-                      : "填写本次需要更新的官网话题"
-                  }
-                />
-                {phase === "domain" && (
-                  <small className="ai-website-field-help">
-                    不要填写
-                    www、http、https、订单号或页面路径；此处无需备案服务码。
-                  </small>
-                )}
-              </label>
-
-              {phase === "icp" ? (
-                <label className="ai-website-form-field">
-                  <span>ICP 主体备案号</span>
-                  <input
-                    type="text"
-                    aria-label="ICP 主体备案号"
-                    aria-required="true"
-                    value={icpNumber}
-                    onChange={(event) => setIcpNumber(event.target.value)}
-                    placeholder="例如 京ICP备12345678号"
-                  />
-                  <small className="ai-website-field-help">
-                    请填写备案主体编号，不要填写密码、证件号码、负责人照片或其他备案材料。
-                  </small>
-                </label>
-              ) : phase === "content" ? (
-                <>
-                  <label className="ai-website-form-field">
-                    <span>内容说明（选填）</span>
-                    <textarea
-                      rows={5}
-                      value={details}
-                      onChange={(event) => setDetails(event.target.value)}
-                      placeholder="补充本次需求的背景、范围和需要管理员关注的事项"
-                    />
-                  </label>
-
-                  <label className="ai-website-form-field">
-                    <span>参考资料（选填）</span>
-                    <textarea
-                      rows={3}
-                      value={referenceLinks}
-                      onChange={(event) =>
-                        setReferenceLinks(event.target.value)
-                      }
-                      placeholder="每行一个公开参考链接"
-                    />
-                  </label>
-
-                  <div className="ai-website-upload">
-                    <div>
-                      <strong>附件（选填）</strong>
-                      <span>可上传与本次官网内容需求有关的资料。</span>
                     </div>
-                    <label className="ai-website-upload-button">
-                      <Upload size={17} aria-hidden="true" />
-                      选择文件
-                      <input
-                        type="file"
-                        multiple
-                        onChange={handleFiles}
-                        aria-label="上传官网工单附件"
-                      />
-                    </label>
-                  </div>
-
-                  {attachments.length > 0 && (
-                    <ul
-                      className="ai-website-file-list"
-                      aria-label="待上传文件"
-                    >
-                      {attachments.map((file, index) => (
-                        <li key={`${file.name}-${file.size}-${index}`}>
-                          <Paperclip size={15} aria-hidden="true" />
-                          <span>{file.name}</span>
-                          <button
-                            type="button"
-                            aria-label={`移除 ${file.name}`}
-                            onClick={() =>
-                              setAttachments((current) =>
-                                current.filter(
-                                  (_, fileIndex) => fileIndex !== index,
-                                ),
-                              )
-                            }
-                          >
-                            <X size={15} aria-hidden="true" />
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
                   )}
                 </>
-              ) : null}
-
-              {quotaExhausted && (
-                <div className="ai-website-inline-state warning" role="alert">
-                  当前官网内容发布额度已用完，暂时不能提交新的内容运营工单。
-                </div>
-              )}
-              {!onSubmit && (
-                <div className="ai-website-inline-state" role="status">
-                  {readOnlyPreview
-                    ? "验收预览不提供客户提交操作。"
-                    : "工单提交服务暂时不可用。"}
-                </div>
               )}
 
-              <div className="ai-website-form-actions">
-                <p
-                  className={`ai-website-submit-message ${submitState}`}
-                  aria-live="polite"
-                >
-                  {submitMessage}
-                </p>
-                <button
-                  type="submit"
-                  className="ai-website-primary-button"
-                  disabled={submitDisabled}
-                >
-                  <Send size={17} aria-hidden="true" />
-                  {submitting
-                    ? "正在提交…"
-                    : phase === "domain"
-                      ? "提交域名，创建 AI 运维工单"
-                      : phase === "icp"
-                        ? "提交备案结果"
-                        : "提交工单"}
-                </button>
-              </div>
+              {phase !== "domain" && (
+                <>
+                  <label className="ai-website-form-field">
+                    <span>{phase === "icp" ? "已备案域名" : "话题"}</span>
+                    <input
+                      type="text"
+                      aria-label={phase === "icp" ? "已备案域名" : "话题"}
+                      aria-required="true"
+                      value={topic}
+                      onChange={(event) => setTopic(event.target.value)}
+                      placeholder={
+                        phase === "icp"
+                          ? "例如 example.com"
+                          : "填写本次需要更新的官网话题"
+                      }
+                    />
+                  </label>
+
+                  {phase === "icp" ? (
+                    <label className="ai-website-form-field">
+                      <span>ICP 主体备案号</span>
+                      <input
+                        type="text"
+                        aria-label="ICP 主体备案号"
+                        aria-required="true"
+                        value={icpNumber}
+                        onChange={(event) => setIcpNumber(event.target.value)}
+                        placeholder="例如 京ICP备12345678号"
+                      />
+                      <small className="ai-website-field-help">
+                        请填写备案主体编号，不要填写密码、证件号码、负责人照片或其他备案材料。
+                      </small>
+                    </label>
+                  ) : (
+                    <>
+                      <label className="ai-website-form-field">
+                        <span>内容说明（选填）</span>
+                        <textarea
+                          rows={5}
+                          value={details}
+                          onChange={(event) => setDetails(event.target.value)}
+                          placeholder="补充本次需求的背景、范围和需要管理员关注的事项"
+                        />
+                      </label>
+
+                      <label className="ai-website-form-field">
+                        <span>参考资料（选填）</span>
+                        <textarea
+                          rows={3}
+                          value={referenceLinks}
+                          onChange={(event) =>
+                            setReferenceLinks(event.target.value)
+                          }
+                          placeholder="每行一个公开参考链接"
+                        />
+                      </label>
+
+                      <div className="ai-website-upload">
+                        <div>
+                          <strong>附件（选填）</strong>
+                          <span>可上传与本次官网内容需求有关的资料。</span>
+                        </div>
+                        <label className="ai-website-upload-button">
+                          <Upload size={17} aria-hidden="true" />
+                          选择文件
+                          <input
+                            type="file"
+                            multiple
+                            onChange={handleFiles}
+                            aria-label="上传官网工单附件"
+                          />
+                        </label>
+                      </div>
+
+                      {attachments.length > 0 && (
+                        <ul
+                          className="ai-website-file-list"
+                          aria-label="待上传文件"
+                        >
+                          {attachments.map((file, index) => (
+                            <li key={`${file.name}-${file.size}-${index}`}>
+                              <Paperclip size={15} aria-hidden="true" />
+                              <span>{file.name}</span>
+                              <button
+                                type="button"
+                                aria-label={`移除 ${file.name}`}
+                                onClick={() =>
+                                  setAttachments((current) =>
+                                    current.filter(
+                                      (_, fileIndex) => fileIndex !== index,
+                                    ),
+                                  )
+                                }
+                              >
+                                <X size={15} aria-hidden="true" />
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </>
+                  )}
+
+                  {quotaExhausted && (
+                    <div
+                      className="ai-website-inline-state warning"
+                      role="alert"
+                    >
+                      当前官网内容发布额度已用完，暂时不能提交新的内容运营工单。
+                    </div>
+                  )}
+                  {!onSubmit && (
+                    <div className="ai-website-inline-state" role="status">
+                      工单提交服务暂时不可用。
+                    </div>
+                  )}
+
+                  <div className="ai-website-form-actions">
+                    <p
+                      className={`ai-website-submit-message ${submitState}`}
+                      aria-live="polite"
+                    >
+                      {submitMessage}
+                    </p>
+                    <button
+                      type="submit"
+                      className="ai-website-primary-button"
+                      disabled={submitDisabled}
+                    >
+                      <Send size={17} aria-hidden="true" />
+                      {submitting
+                        ? "正在提交…"
+                        : phase === "icp"
+                          ? "提交备案结果"
+                          : "提交工单"}
+                    </button>
+                  </div>
+                </>
+              )}
             </>
           )}
         </form>
@@ -1168,6 +1212,230 @@ export default function AiWebsiteManagementWorkspace({
               />
               {loadingMore ? "正在载入…" : "加载更多"}
             </button>
+          </div>
+        )}
+      </section>
+    </section>
+  );
+}
+
+function EngineerWebsiteCustomerPreview({
+  siteProfile,
+  websiteWorkflow,
+  workflow,
+  styleState,
+  contentTypes,
+  tickets,
+  loading,
+  error,
+}: {
+  siteProfile: AiWebsiteSiteProfile | null;
+  websiteWorkflow: AiWebsiteWorkflowMetadata | null;
+  workflow: ReturnType<typeof deriveWorkflow>;
+  styleState: NonNullable<AiWebsiteWorkflowMetadata["styleState"]>;
+  contentTypes: WorkOrderTypeDefinition[];
+  tickets: AiWebsiteTicket[];
+  loading: boolean;
+  error: string | null;
+}) {
+  const styleBatch = websiteWorkflow?.styleBatch;
+  const domainStatus = workflow.domainCompleted
+    ? "已完成"
+    : workflow.domainPending
+      ? "处理中"
+      : "尚未提交";
+  const icpStatus = workflow.icpCompleted
+    ? "已完成"
+    : workflow.icpPending
+      ? "处理中"
+      : workflow.domainCompleted
+        ? "尚未提交"
+        : "等待域名完成";
+
+  return (
+    <section
+      className="ai-website-workspace"
+      aria-labelledby="engineer-website-preview-title"
+    >
+      <header className="ai-website-header">
+        <p className="ai-website-eyebrow">客户真实交互内容</p>
+        <h1 id="engineer-website-preview-title">客户官网结果预览</h1>
+        <p className="ai-website-intro">
+          这里只呈现客户实际收到的官网状态、可选风格样例和公开交付结果。域名与
+          ICP 教程、客户提交表单及内部流程不进入客户内容核对区。
+        </p>
+      </header>
+
+      <section
+        className="ai-website-prerequisites"
+        aria-labelledby="engineer-website-status-title"
+      >
+        <div className="ai-website-section-heading">
+          <div>
+            <h2 id="engineer-website-status-title">客户当前可见状态</h2>
+            <p>
+              {siteProfile?.domain
+                ? `当前域名：${siteProfile.domain}`
+                : "客户页面尚未显示正式域名。"}
+            </p>
+          </div>
+        </div>
+        <ol className="ai-website-stepper">
+          <WorkflowStep
+            index={1}
+            label={`域名配置 · ${domainStatus}`}
+            state={
+              workflow.domainCompleted
+                ? "completed"
+                : workflow.domainPending
+                  ? "pending"
+                  : "current"
+            }
+          />
+          <WorkflowStep
+            index={2}
+            label={`ICP 备案 · ${icpStatus}`}
+            state={
+              workflow.icpCompleted
+                ? "completed"
+                : workflow.icpPending
+                  ? "pending"
+                  : workflow.domainCompleted
+                    ? "current"
+                    : "locked"
+            }
+          />
+        </ol>
+      </section>
+
+      {(styleBatch?.samples?.length || styleState !== "legacy_confirmed") && (
+        <section
+          className="ai-website-form"
+          aria-labelledby="engineer-style-preview-title"
+        >
+          <div className="ai-website-section-heading">
+            <div>
+              <h2 id="engineer-style-preview-title">客户收到的官网图片风格</h2>
+              <p>
+                仅核对已经发布给客户选择的样例；发布或重做请使用上方对应工单的修改入口。
+              </p>
+            </div>
+          </div>
+          {styleBatch?.samples?.length ? (
+            <>
+              {styleBatch.engineerNote && (
+                <div className="ai-website-inline-state">
+                  客户可见说明：{styleBatch.engineerNote}
+                </div>
+              )}
+              <div className="ai-website-style-grid">
+                {styleBatch.samples.map((sample) => {
+                  const selected =
+                    websiteWorkflow?.selectedStyleSampleId === sample.id;
+                  return (
+                    <article className="ai-website-style-card" key={sample.id}>
+                      <img src={sample.imageUrl} alt={sample.label} />
+                      <div>
+                        <strong>{sample.label}</strong>
+                        {sample.note && <p>{sample.note}</p>}
+                        <span
+                          className="ai-website-order-status"
+                          data-status={
+                            selected ? "completed" : "awaiting_service"
+                          }
+                        >
+                          {selected ? "客户已选择" : "待客户选择"}
+                        </span>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
+            <div className="ai-website-inline-state" role="status">
+              {styleState === "revision_requested"
+                ? "客户已退回本批风格，当前等待工程师发布新的三张样例。"
+                : styleState === "waiting_samples"
+                  ? "客户当前看到的是等待工程师发布三张风格样例。"
+                  : "客户尚未收到可选择的官网图片风格。"}
+            </div>
+          )}
+        </section>
+      )}
+
+      <section
+        className="ai-website-orders"
+        aria-labelledby="engineer-website-results-title"
+      >
+        <div className="ai-website-section-heading">
+          <div>
+            <h2 id="engineer-website-results-title">客户收到的公开交付结果</h2>
+            <p>这里只显示客户可见的工单状态、公开摘要和交付链接。</p>
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="ai-website-orders-state" role="status">
+            正在载入客户可见结果…
+          </div>
+        ) : error ? (
+          <div className="ai-website-orders-state error" role="alert">
+            <AlertCircle size={19} aria-hidden="true" />
+            {error}
+          </div>
+        ) : tickets.length === 0 ? (
+          <div className="ai-website-orders-state">
+            <FileText size={22} aria-hidden="true" />
+            <strong>客户尚未收到官网交付结果</strong>
+            <span>通过对应工单发布后，客户可见结果会显示在这里。</span>
+          </div>
+        ) : (
+          <div className="ai-website-order-list">
+            {tickets.map((ticket) => {
+              const terminal = ticketIsCompleted(ticket);
+              const summary = ticketSummary(ticket);
+              return (
+                <article className="ai-website-order-row" key={ticket.id}>
+                  <div className="ai-website-order-toggle">
+                    <span className="ai-website-order-main">
+                      <small>{categoryLabel(ticket, contentTypes)}</small>
+                      <strong>
+                        {ticket.topic || ticket.title || "官网内容需求"}
+                      </strong>
+                    </span>
+                    <span
+                      className="ai-website-order-status"
+                      data-status={
+                        ticket.publicStage ||
+                        (terminal ? "completed" : "awaiting_service")
+                      }
+                    >
+                      {terminal && (
+                        <CheckCircle2 size={14} aria-hidden="true" />
+                      )}
+                      {ticket.publicStageLabel ||
+                        (terminal ? "已完成" : "处理中")}
+                    </span>
+                  </div>
+                  {(summary || ticket.deliveryLinks?.length) && (
+                    <div className="ai-website-order-summary">
+                      {summary && <p>{summary}</p>}
+                      {ticket.deliveryLinks?.map((link) => (
+                        <a
+                          key={link.id || `${ticket.id}-${link.url}`}
+                          href={link.url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {link.label}
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </article>
+              );
+            })}
           </div>
         )}
       </section>
