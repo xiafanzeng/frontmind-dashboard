@@ -5343,6 +5343,85 @@ import { and as and3, asc as asc2, desc as desc3, eq as eq4, gt as gt2, inArray 
 // server/authenticated-knowledge-service.ts
 import { and as and2, desc as desc2, eq as eq3, gte } from "drizzle-orm";
 
+// shared/knowledge-base-output.ts
+var KNOWLEDGE_BASE_REFERENCE_APPENDIX_HEADER = /(?:^|\r?\n)[\t ]*(?:#{1,6}[\t ]*)?(?:\*\*|__)?(?:参考资料|参考来源|引用来源|references?|sources?)(?:\*\*|__)?[\t ]*(?:(?:[:：])[\t ]*[^\r\n]*)?[\t ]*(?=\r?$)/im;
+var KNOWLEDGE_BASE_PROTOCOL_COMMENT = /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?(?:-->|$)/gi;
+var LEGACY_SOCRATIC_KNOWLEDGE_STATE_COMMENT = /<!--\s*SOCRATIC_KB_STATE\b[\s\S]*?(?:SOCRATIC_KB_STATE\s*-->|-->|$)/gi;
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function isKnowledgeBaseProtocolKind(value) {
+  return typeof value === "string" && (value.startsWith("frontmind.knowledge-base.") || value === "frontmind.workflow-state");
+}
+function findKnowledgeBaseProtocolObjectMatches(text2) {
+  const matches = [];
+  for (let start = 0; start < text2.length; start += 1) {
+    if (text2[start] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index2 = start; index2 < text2.length; index2 += 1) {
+      const character = text2[index2];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (character === "\\") {
+          escaped = true;
+        } else if (character === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (character === '"') {
+        inString = true;
+        continue;
+      }
+      if (character === "{") {
+        depth += 1;
+        continue;
+      }
+      if (character !== "}") continue;
+      depth -= 1;
+      if (depth !== 0) continue;
+      try {
+        const value = JSON.parse(text2.slice(start, index2 + 1));
+        if (isRecord(value) && isKnowledgeBaseProtocolKind(value.kind)) {
+          matches.push({ start, end: index2 + 1, value });
+        }
+        start = index2;
+      } catch {
+      }
+      break;
+    }
+  }
+  return matches;
+}
+function extractKnowledgeBaseProtocolObjects(text2) {
+  return findKnowledgeBaseProtocolObjectMatches(String(text2 || "")).map(
+    (match) => match.value
+  );
+}
+function stripKnowledgeBaseProtocolPayloads(text2) {
+  const withoutComments = String(text2 || "").replace(KNOWLEDGE_BASE_PROTOCOL_COMMENT, "").replace(LEGACY_SOCRATIC_KNOWLEDGE_STATE_COMMENT, "");
+  const matches = findKnowledgeBaseProtocolObjectMatches(withoutComments);
+  if (matches.length === 0) return withoutComments;
+  let cursor = 0;
+  let visible = "";
+  for (const match of matches) {
+    visible += withoutComments.slice(cursor, match.start);
+    cursor = match.end;
+  }
+  return (visible + withoutComments.slice(cursor)).replace(
+    /```(?:json)?[\t ]*\r?\n[\t ]*```/gi,
+    ""
+  );
+}
+function stripKnowledgeBaseReferenceAppendix(text2) {
+  const normalized = String(text2 || "");
+  const match = KNOWLEDGE_BASE_REFERENCE_APPENDIX_HEADER.exec(normalized);
+  return (match ? normalized.slice(0, match.index) : normalized).trim();
+}
+
 // server/knowledge-base-progress.ts
 var KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES = 8;
 var KNOWLEDGE_BASE_MANIFEST_MAX_LEAVES = 115;
@@ -5519,27 +5598,54 @@ function parseManifestEnvelopeObject(input) {
     )
   };
 }
+function parseProtocolEnvelopeText(input, options) {
+  const markerPattern = new RegExp(
+    `<!--\\s*${options.marker}\\s*([\\s\\S]*?)-->`,
+    "g"
+  );
+  const markerMatches = [...input.matchAll(markerPattern)];
+  const rawMatches = extractKnowledgeBaseProtocolObjects(input).filter(
+    (value) => value.kind === options.kind
+  );
+  if (markerMatches.length > 1) {
+    fail(
+      options.code,
+      `Model output must contain exactly one ${options.marker} envelope`
+    );
+  }
+  if (markerMatches.length === 1) {
+    if (rawMatches.length > 1) {
+      fail(
+        options.code,
+        `Model output must contain exactly one ${options.marker} envelope`
+      );
+    }
+    try {
+      return options.parseObject(JSON.parse(markerMatches[0][1].trim()));
+    } catch (error) {
+      if (error instanceof KnowledgeBaseProgressError) throw error;
+      fail(options.code, `${options.label} envelope contains invalid JSON`);
+    }
+  }
+  if (rawMatches.length !== 1) {
+    fail(
+      options.code,
+      `Model output must contain exactly one ${options.marker} envelope`
+    );
+  }
+  return options.parseObject(rawMatches[0]);
+}
 function parseKnowledgeBaseManifestEnvelope(input) {
   if (typeof input !== "string") {
     return parseManifestEnvelopeObject(input);
   }
-  const markerPattern = new RegExp(
-    `<!--\\s*${KNOWLEDGE_BASE_MANIFEST_MARKER}\\s*([\\s\\S]*?)-->`,
-    "g"
-  );
-  const matches = [...input.matchAll(markerPattern)];
-  if (matches.length !== 1) {
-    fail(
-      "INVALID_MANIFEST",
-      `Model output must contain exactly one ${KNOWLEDGE_BASE_MANIFEST_MARKER} envelope`
-    );
-  }
-  try {
-    return parseManifestEnvelopeObject(JSON.parse(matches[0][1].trim()));
-  } catch (error) {
-    if (error instanceof KnowledgeBaseProgressError) throw error;
-    fail("INVALID_MANIFEST", "Manifest envelope contains invalid JSON");
-  }
+  return parseProtocolEnvelopeText(input, {
+    marker: KNOWLEDGE_BASE_MANIFEST_MARKER,
+    kind: KNOWLEDGE_BASE_MANIFEST_KIND,
+    code: "INVALID_MANIFEST",
+    label: "Manifest",
+    parseObject: parseManifestEnvelopeObject
+  });
 }
 function parseReopenEnvelopeObject(input) {
   if (!isPlainObject(input)) {
@@ -5579,23 +5685,13 @@ function parseReopenEnvelopeObject(input) {
 }
 function parseKnowledgeBaseReopenEnvelope(input) {
   if (typeof input !== "string") return parseReopenEnvelopeObject(input);
-  const markerPattern = new RegExp(
-    `<!--\\s*${KNOWLEDGE_BASE_REOPEN_MARKER}\\s*([\\s\\S]*?)-->`,
-    "g"
-  );
-  const matches = [...input.matchAll(markerPattern)];
-  if (matches.length !== 1) {
-    fail(
-      "INVALID_ENVELOPE",
-      `Model output must contain exactly one ${KNOWLEDGE_BASE_REOPEN_MARKER} envelope`
-    );
-  }
-  try {
-    return parseReopenEnvelopeObject(JSON.parse(matches[0][1].trim()));
-  } catch (error) {
-    if (error instanceof KnowledgeBaseProgressError) throw error;
-    fail("INVALID_ENVELOPE", "Reopen envelope contains invalid JSON");
-  }
+  return parseProtocolEnvelopeText(input, {
+    marker: KNOWLEDGE_BASE_REOPEN_MARKER,
+    kind: KNOWLEDGE_BASE_REOPEN_KIND,
+    code: "INVALID_ENVELOPE",
+    label: "Reopen",
+    parseObject: parseReopenEnvelopeObject
+  });
 }
 function parsePresentationEnvelopeObject(input) {
   if (!isPlainObject(input)) {
@@ -5673,23 +5769,13 @@ function parseKnowledgeBasePresentationEnvelope(input) {
   if (typeof input !== "string") {
     return parsePresentationEnvelopeObject(input);
   }
-  const markerPattern = new RegExp(
-    `<!--\\s*${KNOWLEDGE_BASE_PRESENTATION_MARKER}\\s*([\\s\\S]*?)-->`,
-    "g"
-  );
-  const matches = [...input.matchAll(markerPattern)];
-  if (matches.length !== 1) {
-    fail(
-      "INVALID_ENVELOPE",
-      `Model output must contain exactly one ${KNOWLEDGE_BASE_PRESENTATION_MARKER} envelope`
-    );
-  }
-  try {
-    return parsePresentationEnvelopeObject(JSON.parse(matches[0][1].trim()));
-  } catch (error) {
-    if (error instanceof KnowledgeBaseProgressError) throw error;
-    fail("INVALID_ENVELOPE", "Presentation envelope contains invalid JSON");
-  }
+  return parseProtocolEnvelopeText(input, {
+    marker: KNOWLEDGE_BASE_PRESENTATION_MARKER,
+    kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
+    code: "INVALID_ENVELOPE",
+    label: "Presentation",
+    parseObject: parsePresentationEnvelopeObject
+  });
 }
 function assertKnowledgeBasePresentationMatchesState(state, input) {
   assertValidKnowledgeBaseProgressState(state);
@@ -5859,29 +5945,13 @@ function parseKnowledgeBaseProgressEnvelope(input) {
   if (typeof input !== "string") {
     return parseEnvelopeObject(input);
   }
-  const markerPattern = new RegExp(
-    `<!--\\s*${KNOWLEDGE_BASE_PROGRESS_MARKER}\\s*([\\s\\S]*?)-->`,
-    "g"
-  );
-  const matches = [...input.matchAll(markerPattern)];
-  if (matches.length > 1) {
-    fail(
-      "INVALID_ENVELOPE",
-      "Model output must contain at most one progress envelope"
-    );
-  }
-  const serialized = matches.length === 1 ? matches[0][1].trim() : input.trim();
-  if (!serialized) {
-    fail("INVALID_ENVELOPE", "Progress envelope JSON is empty");
-  }
-  try {
-    return parseEnvelopeObject(JSON.parse(serialized));
-  } catch (error) {
-    if (error instanceof KnowledgeBaseProgressError) {
-      throw error;
-    }
-    fail("INVALID_ENVELOPE", "Progress envelope contains invalid JSON");
-  }
+  return parseProtocolEnvelopeText(input, {
+    marker: KNOWLEDGE_BASE_PROGRESS_MARKER,
+    kind: KNOWLEDGE_BASE_PROGRESS_KIND,
+    code: "INVALID_ENVELOPE",
+    label: "Progress",
+    parseObject: parseEnvelopeObject
+  });
 }
 function validateKnowledgeBaseProgressEnvelope(state, input) {
   assertValidKnowledgeBaseProgressState(state);
@@ -10365,14 +10435,11 @@ async function assertWorkspaceAccess(actor, targetUserId) {
   }
   throw new AuthServiceError("NOT_FOUND", "User workspace not found");
 }
-function assertManagedCredentialMutationAccess(actor, deliveryAdminId) {
+function assertManagedCredentialMutationAccess(actor, _deliveryAdminId) {
   if (isSystemAdmin(actor)) return;
-  if (actor.role === "admin" && actor.adminAccessLevel === "delivery_admin" && deliveryAdminId === actor.id) {
-    return;
-  }
   throw new AuthServiceError(
     "INVALID_CREDENTIAL",
-    "\u53EA\u6709\u5BA2\u6237\u4E3B\u8D1F\u8D23\u4EBA\u6216\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u7BA1\u7406\u5BA2\u6237 Key"
+    "\u5BA2\u6237 API Key \u4EC5\u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EDF\u4E00\u7EF4\u62A4"
   );
 }
 function toPublicOptimizationReport(report) {
@@ -11075,10 +11142,10 @@ async function listManagedWorkspaceUsers(actor) {
         } : null,
         credential: {
           configured: Boolean(credential),
-          fingerprint: credential?.fingerprint ?? null,
-          status: credential?.validationStatus ?? null,
-          verifiedAt: credential?.verifiedAt?.getTime() ?? null,
-          inherited: Boolean(!directCredential && usageOwner)
+          fingerprint: systemAdmin ? credential?.fingerprint ?? null : null,
+          status: systemAdmin ? credential?.validationStatus ?? null : null,
+          verifiedAt: systemAdmin ? credential?.verifiedAt?.getTime() ?? null : null,
+          inherited: systemAdmin ? Boolean(!directCredential && usageOwner) : false
         }
       };
     })
@@ -11198,21 +11265,8 @@ async function setWorkspaceAssignments(input) {
   return listManagedWorkspaceUsers(input.actor);
 }
 async function replaceManagedUserCredential(input) {
-  if (input.actor.role !== "admin") {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "\u53EA\u6709\u7BA1\u7406\u5458\u53EF\u4EE5\u7EF4\u62A4\u7528\u6237 API Key"
-    );
-  }
+  assertManagedCredentialMutationAccess(input.actor, null);
   await assertWorkspaceAccess(input.actor, input.userId);
-  if (!isSystemAdmin(input.actor)) {
-    const db = await requireDb4();
-    const owners = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq9(userUsageOwners.userId, input.userId)).limit(1);
-    assertManagedCredentialMutationAccess(
-      input.actor,
-      owners[0]?.deliveryAdminId
-    );
-  }
   const credential = await replaceApiCredential(input.userId, input.apiKey);
   await writeWorkspaceAuditEvent({
     actor: input.actor,
@@ -11229,21 +11283,8 @@ async function replaceManagedUserCredential(input) {
   return credential;
 }
 async function deleteManagedUserCredential(input) {
-  if (input.actor.role !== "admin") {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "\u53EA\u6709\u7BA1\u7406\u5458\u53EF\u4EE5\u7EF4\u62A4\u7528\u6237 API Key"
-    );
-  }
+  assertManagedCredentialMutationAccess(input.actor, null);
   await assertWorkspaceAccess(input.actor, input.userId);
-  if (!isSystemAdmin(input.actor)) {
-    const db = await requireDb4();
-    const owners = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq9(userUsageOwners.userId, input.userId)).limit(1);
-    assertManagedCredentialMutationAccess(
-      input.actor,
-      owners[0]?.deliveryAdminId
-    );
-  }
   await deleteActiveApiCredential(input.userId);
   await writeWorkspaceAuditEvent({
     actor: input.actor,
@@ -11520,17 +11561,13 @@ async function getAccountMonthlyCreditUsage(userId, now = Date.now()) {
   });
 }
 async function getManagedUserCreditUsage(actor, userId, _windowDays = 30) {
-  await assertWorkspaceAccess(actor, userId);
   if (!isSystemAdmin(actor)) {
-    const db = await requireDb4();
-    const owners = await db.select({ deliveryAdminId: userUsageOwners.deliveryAdminId }).from(userUsageOwners).where(eq9(userUsageOwners.userId, userId)).limit(1);
-    if (owners[0] && owners[0].deliveryAdminId !== actor.id) {
-      throw new AuthServiceError(
-        "INVALID_CREDENTIAL",
-        "\u53EA\u6709\u8BE5\u7528\u6237\u7684\u79EF\u5206\u4E0E Key \u5F52\u5C5E\u7BA1\u7406\u5458\u53EF\u4EE5\u67E5\u770B\u672C\u6708\u79EF\u5206"
-      );
-    }
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u5BA2\u6237 Key \u4E0E\u79EF\u5206\u4EC5\u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u67E5\u770B"
+    );
   }
+  await assertWorkspaceAccess(actor, userId);
   return getAccountMonthlyCreditUsage(userId);
 }
 async function getManagedCredentialStatus(actor, userId) {
@@ -11547,14 +11584,6 @@ async function getManagedCredentialStatus(actor, userId) {
 // server/knowledge-base-progress-service.ts
 import { createHash as createHash6, randomUUID as randomUUID8 } from "node:crypto";
 import { and as and9, asc as asc3, desc as desc9, eq as eq10, isNotNull as isNotNull2, isNull as isNull3 } from "drizzle-orm";
-
-// shared/knowledge-base-output.ts
-var KNOWLEDGE_BASE_REFERENCE_APPENDIX_HEADER = /(?:^|\r?\n)[\t ]*(?:#{1,6}[\t ]*)?(?:\*\*|__)?(?:参考资料|参考来源|引用来源|references?|sources?)(?:\*\*|__)?[\t ]*(?:(?:[:：])[\t ]*[^\r\n]*)?[\t ]*(?=\r?$)/im;
-function stripKnowledgeBaseReferenceAppendix(text2) {
-  const normalized = String(text2 || "");
-  const match = KNOWLEDGE_BASE_REFERENCE_APPENDIX_HEADER.exec(normalized);
-  return (match ? normalized.slice(0, match.index) : normalized).trim();
-}
 
 // server/knowledge-base-artifact.ts
 import { createHash as createHash5 } from "node:crypto";
@@ -11694,7 +11723,7 @@ function normalizeConversationId(value) {
   }
   return normalized;
 }
-function isRecord(value) {
+function isRecord2(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function collectKnowledgeBaseOutputImageKeys(value, result = /* @__PURE__ */ new Set(), depth = 0) {
@@ -11705,7 +11734,7 @@ function collectKnowledgeBaseOutputImageKeys(value, result = /* @__PURE__ */ new
     }
     return result;
   }
-  if (!isRecord(value)) return result;
+  if (!isRecord2(value)) return result;
   const type = stringValue(value.type).toLowerCase();
   const mimeType = stringValue(
     value.mimeType || value.mime_type || value.content_type
@@ -11782,13 +11811,13 @@ function assertKnowledgeBaseNodeImageDelivery(input) {
 }
 function stringValue(value) {
   if (typeof value === "string") return value.trim();
-  if (isRecord(value) && typeof value.value === "string") {
+  if (isRecord2(value) && typeof value.value === "string") {
     return value.value.trim();
   }
   return "";
 }
 function typedKnowledgeAssistantMessageText(value) {
-  if (!isRecord(value) || value.role !== "assistant") return "";
+  if (!isRecord2(value) || value.role !== "assistant") return "";
   const type = typeof value.type === "string" ? value.type.trim().toLowerCase() : "";
   if (type && !["message", "output_message", "output_text", "text"].includes(type)) {
     return "";
@@ -11809,7 +11838,7 @@ function typedKnowledgeAssistantMessageText(value) {
         if (text3 && !parts.includes(text3)) parts.push(text3);
         continue;
       }
-      if (!isRecord(rawContent)) continue;
+      if (!isRecord2(rawContent)) continue;
       const contentType = typeof rawContent.type === "string" ? rawContent.type.trim().toLowerCase() : "";
       if (!["output_text", "text", "message", ""].includes(contentType)) {
         continue;
@@ -11830,10 +11859,7 @@ function extractFinalKnowledgeBaseAssistantText(output) {
 function assertKnowledgeBaseCustomerOutput(output) {
   const text2 = extractFinalKnowledgeBaseAssistantText(output);
   const customerVisibleText = stripKnowledgeBaseReferenceAppendix(
-    text2.replace(
-      /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
-      ""
-    )
+    stripKnowledgeBaseProtocolPayloads(text2)
   );
   const violation = customerFormalContentViolation(customerVisibleText);
   if (violation) {
@@ -11854,10 +11880,7 @@ function reconciliationHash(input) {
   ).digest("hex");
 }
 function modelOutputAudit(text2) {
-  const auditMarkdown = text2.replace(
-    /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/gi,
-    ""
-  ).trim().slice(-2e6);
+  const auditMarkdown = stripKnowledgeBaseProtocolPayloads(text2).trim().slice(-2e6);
   const contentMarkdown = stripKnowledgeBaseReferenceAppendix(auditMarkdown).slice(-2e6);
   const sourceUrls = Array.from(
     new Set(auditMarkdown.match(/https?:\/\/[^\s<>)\]"']+/gi) || [])
@@ -18512,7 +18535,8 @@ async function accessibleDeliveryAdmins(actor, executor) {
     return executor.select({
       id: users.id,
       displayName: users.displayName,
-      username: users.username
+      username: users.username,
+      adminAccessLevel: users.adminAccessLevel
     }).from(users).where(and14(eq17(users.role, "admin"), eq17(users.isActive, true)));
   }
   if (actor.role !== "admin" || actor.adminAccessLevel !== "delivery_admin") {
@@ -18522,9 +18546,18 @@ async function accessibleDeliveryAdmins(actor, executor) {
     {
       id: actor.id,
       displayName: actor.displayName ?? null,
-      username: actor.username
+      username: actor.username,
+      adminAccessLevel: actor.adminAccessLevel
     }
   ];
+}
+async function accessibleDeliveryEngineers(actor, executor) {
+  if (!isSystemAdmin(actor)) return [];
+  return executor.select({
+    id: users.id,
+    displayName: users.displayName,
+    username: users.username
+  }).from(users).where(and14(eq17(users.role, "delivery_member"), eq17(users.isActive, true)));
 }
 async function ensureUsagePolicy(input) {
   const key = policyKey(input.scope, input.workspaceUserId);
@@ -18598,6 +18631,12 @@ async function usageCredentialFingerprints(input) {
   };
 }
 async function getApiUsageAlertOverview(actor) {
+  if (!isSystemAdmin(actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u67E5\u770B Key \u4E0E\u79EF\u5206\u603B\u89C8\u3002"
+    );
+  }
   const db = await requireDb10();
   const workspaceUsers = await accessibleWorkspaceUsers(actor, db);
   const scopes = [
@@ -18672,35 +18711,31 @@ async function getApiUsageAlertOverview(actor) {
   return { items };
 }
 async function getAdminApiUsageHierarchy(actor) {
-  if (actor.role !== "admin") {
+  if (!isSystemAdmin(actor)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "\u53EA\u6709\u7BA1\u7406\u5458\u53EF\u4EE5\u67E5\u770B\u79EF\u5206\u4F7F\u7528\u60C5\u51B5\u3002"
+      "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u67E5\u770B Key \u4E0E\u79EF\u5206\u4F7F\u7528\u60C5\u51B5\u3002"
     );
   }
   const db = await requireDb10();
-  const managers = await accessibleDeliveryAdmins(actor, db);
+  const [accessibleManagers, engineers, customers] = await Promise.all([
+    accessibleDeliveryAdmins(actor, db),
+    accessibleDeliveryEngineers(actor, db),
+    accessibleWorkspaceUsers(actor, db)
+  ]);
+  const managers = isSystemAdmin(actor) ? accessibleManagers.filter(
+    (manager) => manager.adminAccessLevel === "delivery_admin"
+  ) : accessibleManagers;
   const managerIds = managers.map((manager) => Number(manager.id));
-  const ownerships = managerIds.length === 0 ? [] : await db.select({
+  const engineerIds = engineers.map((engineer) => Number(engineer.id));
+  const customerIds = customers.map((customer) => Number(customer.id));
+  const ownerships = customerIds.length === 0 ? [] : await db.select({
     adminId: userUsageOwners.deliveryAdminId,
     userId: userUsageOwners.userId
-  }).from(userUsageOwners).where(inArray9(userUsageOwners.deliveryAdminId, managerIds));
-  const customerIds = [
-    ...new Set(ownerships.map((ownership) => Number(ownership.userId)))
+  }).from(userUsageOwners).where(inArray9(userUsageOwners.userId, customerIds));
+  const subjectIds = [
+    .../* @__PURE__ */ new Set([...managerIds, ...customerIds, ...engineerIds])
   ];
-  const customers = customerIds.length === 0 ? [] : await db.select({
-    id: users.id,
-    enterpriseName: users.displayName,
-    username: users.username,
-    isActive: users.isActive
-  }).from(users).where(
-    and14(
-      eq17(users.role, "user"),
-      eq17(users.isActive, true),
-      inArray9(users.id, customerIds)
-    )
-  );
-  const subjectIds = [.../* @__PURE__ */ new Set([...managerIds, ...customerIds])];
   const policies = await Promise.all(
     subjectIds.map(
       (subjectId) => ensureUsagePolicy({
@@ -18726,6 +18761,22 @@ async function getAdminApiUsageHierarchy(actor) {
     executor: db,
     userIds: subjectIds
   });
+  const managedCredentialUserIds = [
+    ...managerIds,
+    ...engineerIds,
+    ...customerIds
+  ];
+  const managedCredentialRows = managedCredentialUserIds.length === 0 ? [] : await db.select({
+    userId: apiCredentials.userId,
+    version: apiCredentials.version,
+    status: apiCredentials.status
+  }).from(apiCredentials).where(inArray9(apiCredentials.userId, managedCredentialUserIds)).orderBy(desc14(apiCredentials.version));
+  const latestManagedCredentialById = /* @__PURE__ */ new Map();
+  for (const credential of managedCredentialRows) {
+    if (!latestManagedCredentialById.has(Number(credential.userId))) {
+      latestManagedCredentialById.set(Number(credential.userId), credential);
+    }
+  }
   const period = getShanghaiCalendarMonthPeriod();
   const usageFor = (userId) => {
     const policy = policyByUser.get(userId);
@@ -18757,10 +18808,65 @@ async function getAdminApiUsageHierarchy(actor) {
   const customerById = new Map(
     customers.map((customer) => [Number(customer.id), customer])
   );
+  const adminById = new Map(accessibleManagers.map((manager) => [Number(manager.id), manager]));
+  const ownerByCustomerId = new Map(
+    ownerships.map((ownership) => [
+      Number(ownership.userId),
+      Number(ownership.adminId)
+    ])
+  );
+  const customerUsage = customers.map((customer) => {
+    const customerId = Number(customer.id);
+    const usage = usageFor(customerId);
+    const latestCredential = latestManagedCredentialById.get(customerId);
+    const ownerId = ownerByCustomerId.get(customerId) ?? null;
+    const owner = ownerId == null ? null : adminById.get(ownerId);
+    const directApiKeyConfigured = latestCredential?.status === "active";
+    return {
+      userId: customerId,
+      enterpriseName: customer.enterpriseName?.trim() || customer.username?.trim() || `\u5BA2\u6237 ${customer.id}`,
+      username: customer.username,
+      deliveryAdminId: ownerId,
+      deliveryAdminName: owner?.displayName?.trim() || owner?.username?.trim() || null,
+      apiKeyConfigured: directApiKeyConfigured,
+      apiKeyVersion: latestCredential?.version ?? 0,
+      usesInheritedKey: !directApiKeyConfigured && usage.credentialOwnerId !== null && usage.credentialOwnerId !== customerId,
+      keyTotalUsed: usage.used,
+      ownAgentMonthUsed: usage.accountUsed,
+      otherOrUnattributedUsed: Math.max(0, usage.used - usage.accountUsed),
+      fingerprint: usage.fingerprint,
+      syncStatus: usage.syncStatus,
+      fetchedAt: usage.fetchedAt
+    };
+  });
+  const engineerUsage = engineers.map((engineer) => {
+    const usage = usageFor(Number(engineer.id));
+    const latestCredential = latestManagedCredentialById.get(
+      Number(engineer.id)
+    );
+    return {
+      engineerId: Number(engineer.id),
+      displayName: engineer.displayName?.trim() || engineer.username?.trim() || `\u5DE5\u7A0B\u5E08 ${engineer.id}`,
+      username: engineer.username,
+      apiKeyConfigured: latestCredential?.status === "active",
+      apiKeyVersion: latestCredential?.version ?? 0,
+      keyTotalUsed: usage.used,
+      ownAgentMonthUsed: usage.accountUsed,
+      otherOrUnattributedUsed: Math.max(0, usage.used - usage.accountUsed),
+      fingerprint: usage.fingerprint,
+      syncStatus: usage.syncStatus,
+      fetchedAt: usage.fetchedAt
+    };
+  });
   return {
     period,
+    customers: customerUsage,
+    engineers: engineerUsage,
     managers: managers.map((manager) => {
       const managerUsage = usageFor(Number(manager.id));
+      const latestManagerCredential = latestManagedCredentialById.get(
+        Number(manager.id)
+      );
       const managedCustomerRecords = ownerships.filter(
         (ownership) => Number(ownership.adminId) === Number(manager.id)
       ).map((ownership) => customerById.get(Number(ownership.userId))).filter(Boolean).map((customer) => {
@@ -18812,6 +18918,8 @@ async function getAdminApiUsageHierarchy(actor) {
         adminId: Number(manager.id),
         displayName: manager.displayName?.trim() || manager.username?.trim() || `\u4EA4\u4ED8\u7BA1\u7406\u5458 ${manager.id}`,
         username: manager.username,
+        apiKeyConfigured: latestManagerCredential?.status === "active",
+        apiKeyVersion: latestManagerCredential?.version ?? 0,
         keyPool: {
           fingerprint: managerUsage.fingerprint ?? (poolUsages.length === 1 ? poolUsages[0].fingerprint : null),
           credentialCount: keyPools.size,
@@ -18873,14 +18981,26 @@ async function mapWithConcurrency(values, concurrency, callback) {
   );
 }
 async function syncApiUsageSnapshots(actor) {
+  if (!isSystemAdmin(actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u53EA\u6709\u7CFB\u7EDF\u7BA1\u7406\u5458\u53EF\u4EE5\u540C\u6B65 Key \u4E0E\u79EF\u5206\u4F7F\u7528\u60C5\u51B5\u3002"
+    );
+  }
   const db = await requireDb10();
-  const workspaceUsers = await accessibleWorkspaceUsers(actor, db);
-  const deliveryAdmins = await accessibleDeliveryAdmins(actor, db);
+  const [workspaceUsers, deliveryAdmins, deliveryEngineers] = await Promise.all(
+    [
+      accessibleWorkspaceUsers(actor, db),
+      accessibleDeliveryAdmins(actor, db),
+      accessibleDeliveryEngineers(actor, db)
+    ]
+  );
   const fingerprints = await usageCredentialFingerprints({
     executor: db,
     userIds: [
       ...workspaceUsers.map((user) => user.id),
-      ...deliveryAdmins.map((admin) => admin.id)
+      ...deliveryAdmins.map((admin) => admin.id),
+      ...deliveryEngineers.map((engineer) => engineer.id)
     ]
   });
   const now = /* @__PURE__ */ new Date();
@@ -18934,6 +19054,9 @@ async function syncApiUsageSnapshots(actor) {
   const workspaceUserIds = workspaceUsers.map(
     (user) => Number(user.id)
   );
+  const deliveryEngineerIds = deliveryEngineers.map(
+    (engineer) => Number(engineer.id)
+  );
   const allWorkspaceOwnershipRows = workspaceUserIds.length === 0 ? [] : await db.select({
     userId: userUsageOwners.userId,
     deliveryAdminId: userUsageOwners.deliveryAdminId
@@ -18949,7 +19072,11 @@ async function syncApiUsageSnapshots(actor) {
     return ownerId === void 0 || deliveryAdminIds.includes(ownerId);
   });
   const accountIds = [
-    .../* @__PURE__ */ new Set([...deliveryAdminIds, ...syncableWorkspaceUserIds])
+    .../* @__PURE__ */ new Set([
+      ...deliveryAdminIds,
+      ...syncableWorkspaceUserIds,
+      ...deliveryEngineerIds
+    ])
   ];
   const policyEntries = await Promise.all(
     accountIds.map(async (accountId) => ({
@@ -19902,6 +20029,14 @@ function requireDeliveryManager(actor) {
     throw new AuthServiceError("INVALID_CREDENTIAL", "\u9700\u8981\u4EA4\u4ED8\u7BA1\u7406\u6743\u9650");
   }
 }
+function requireSystemAdminCredentialManagement(actor) {
+  if (!hasSystemAdminAccess(actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "API Key \u4EC5\u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EDF\u4E00\u7EF4\u62A4"
+    );
+  }
+}
 function decideEngineerCredentialManagementScope(input) {
   const managerAdminIds = Array.from(
     new Set(
@@ -19913,30 +20048,9 @@ function decideEngineerCredentialManagementScope(input) {
   if (input.systemAdmin) {
     return { manageable: true, reason: null, managerAdminIds };
   }
-  if (input.assignmentAdminIds.length > 0 && input.assignmentAdminIds.some((id) => id === null)) {
-    return {
-      manageable: false,
-      reason: "\u8BE5\u5DE5\u7A0B\u5E08\u5B58\u5728\u5C1A\u672A\u660E\u786E\u4EA4\u4ED8\u7BA1\u7406\u5458\u5F52\u5C5E\u7684\u5BA2\u6237\uFF0CKey \u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EF4\u62A4\u3002",
-      managerAdminIds
-    };
-  }
-  if (managerAdminIds.length > 1) {
-    return {
-      manageable: false,
-      reason: "\u8BE5\u5DE5\u7A0B\u5E08\u540C\u65F6\u670D\u52A1\u591A\u4E2A\u4EA4\u4ED8\u7BA1\u7406\u5458\u7684\u5BA2\u6237\uFF0CKey \u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EF4\u62A4\u3002",
-      managerAdminIds
-    };
-  }
-  if (managerAdminIds.length === 1) {
-    return {
-      manageable: managerAdminIds[0] === input.actorUserId,
-      reason: managerAdminIds[0] === input.actorUserId ? null : "\u8BE5\u5DE5\u7A0B\u5E08\u5F53\u524D\u4E0D\u5C5E\u4E8E\u4F60\u7684\u5BA2\u6237\u9879\u76EE\u3002",
-      managerAdminIds
-    };
-  }
   return {
-    manageable: input.createdByAdminId === input.actorUserId,
-    reason: input.createdByAdminId === input.actorUserId ? null : "\u8BE5\u672A\u5206\u914D\u5DE5\u7A0B\u5E08\u4E0D\u662F\u7531\u5F53\u524D\u4EA4\u4ED8\u7BA1\u7406\u5458\u521B\u5EFA\u3002",
+    manageable: false,
+    reason: "\u5DE5\u7A0B\u5E08 API Key \u4EC5\u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EDF\u4E00\u7EF4\u62A4\uFF0C\u907F\u514D\u8DE8\u9879\u76EE Key \u5F52\u5C5E\u51B2\u7A81\u3002",
     managerAdminIds
   };
 }
@@ -20092,7 +20206,14 @@ async function listDeliveryRoleManagement(actor) {
   const activeTickets = statisticsTickets.filter(
     (ticket) => ACTIVE_DELIVERY_STATUSES.includes(ticket.status)
   );
-  const ticketEvents = activeTickets.length ? await db.select({
+  const completedTickets = statisticsTickets.filter(
+    (ticket) => ticket.status === "completed"
+  );
+  const terminalTickets = statisticsTickets.filter(
+    (ticket) => ["completed", "rejected", "cancelled"].includes(ticket.status)
+  );
+  const dispatchTicketIds = activeTickets.map((ticket) => ticket.id);
+  const ticketEvents = dispatchTicketIds.length ? await db.select({
     id: deliveryTicketEvents.id,
     ticketId: deliveryTicketEvents.ticketId,
     actorUserId: deliveryTicketEvents.actorUserId,
@@ -20102,12 +20223,7 @@ async function listDeliveryRoleManagement(actor) {
     fromStatus: deliveryTicketEvents.fromStatus,
     toStatus: deliveryTicketEvents.toStatus,
     createdAt: deliveryTicketEvents.createdAt
-  }).from(deliveryTicketEvents).where(
-    inArray11(
-      deliveryTicketEvents.ticketId,
-      activeTickets.map((ticket) => ticket.id)
-    )
-  ).orderBy(desc15(deliveryTicketEvents.createdAt)) : [];
+  }).from(deliveryTicketEvents).where(inArray11(deliveryTicketEvents.ticketId, dispatchTicketIds)).orderBy(desc15(deliveryTicketEvents.createdAt)) : [];
   const adminById = new Map(adminRows.map((admin) => [admin.id, admin]));
   const contractByCustomer = /* @__PURE__ */ new Map();
   for (const customer of visibleCustomers) {
@@ -20224,6 +20340,8 @@ async function listDeliveryRoleManagement(actor) {
     assignments,
     engineers: enrichedEngineers,
     tickets: activeTickets,
+    completedTickets,
+    terminalTickets,
     ticketEvents,
     roleStats
   };
@@ -20237,6 +20355,9 @@ var ACTIVE_DELIVERY_STATUSES = [
 async function createDeliveryEngineer(input) {
   requireDeliveryManager(input.actor);
   const apiKey = input.apiKey?.trim() || null;
+  if (apiKey) {
+    requireSystemAdminCredentialManagement(input.actor);
+  }
   if (apiKey) await validateUpstreamApiKey(apiKey);
   const db = await requireDb12();
   return db.transaction(async (tx) => {
@@ -22149,6 +22270,7 @@ async function createKnowledgeMonitoringHandoff(input) {
 }
 async function setDeliveryMemberCredential(input) {
   requireDeliveryManager(input.actor);
+  requireSystemAdminCredentialManagement(input.actor);
   await validateUpstreamApiKey(input.apiKey);
   const db = await requireDb12();
   return db.transaction(async (tx) => {
@@ -22193,6 +22315,7 @@ async function setDeliveryMemberCredential(input) {
 }
 async function revokeDeliveryMemberCredential(input) {
   requireDeliveryManager(input.actor);
+  requireSystemAdminCredentialManagement(input.actor);
   const db = await requireDb12();
   return db.transaction(async (tx) => {
     const scope = await requireEngineerCredentialManagement({
@@ -22236,6 +22359,105 @@ async function revokeDeliveryMemberCredential(input) {
     return { success: true };
   });
 }
+async function requireDeliveryAdminCredentialTarget(input) {
+  const rows = await input.executor.select({
+    id: users.id,
+    role: users.role,
+    adminAccessLevel: users.adminAccessLevel
+  }).from(users).where(eq20(users.id, input.adminUserId)).limit(1).for("update");
+  const target = rows[0];
+  if (!target || target.role !== "admin" || target.adminAccessLevel !== "delivery_admin") {
+    throw new AuthServiceError("NOT_FOUND", "\u4EA4\u4ED8\u7BA1\u7406\u5458\u4E0D\u5B58\u5728");
+  }
+  return target;
+}
+async function setDeliveryAdminCredential(input) {
+  requireDeliveryManager(input.actor);
+  requireSystemAdminCredentialManagement(input.actor);
+  await validateUpstreamApiKey(input.apiKey);
+  const db = await requireDb12();
+  return db.transaction(async (tx) => {
+    await requireDeliveryAdminCredentialTarget({
+      executor: tx,
+      adminUserId: input.adminUserId
+    });
+    const credentialRows = await tx.select().from(apiCredentials).where(eq20(apiCredentials.userId, input.adminUserId)).orderBy(desc15(apiCredentials.version)).limit(1).for("update");
+    const latest = credentialRows[0];
+    const actualVersion = latest?.version ?? 0;
+    if (actualVersion !== input.expectedVersion) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u4EA4\u4ED8\u7BA1\u7406\u5458 API Key \u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5"
+      );
+    }
+    const credential = await replaceApiCredentialInTransaction({
+      executor: tx,
+      userId: input.adminUserId,
+      apiKey: input.apiKey
+    });
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "delivery.admin_credential.replaced",
+        targetType: "user",
+        targetId: input.adminUserId,
+        workspaceUserId: null,
+        metadata: {
+          previouslyConfigured: latest?.status === "active",
+          previousVersion: actualVersion,
+          credentialVersion: credential.version,
+          configured: credential.configured
+        }
+      },
+      tx
+    );
+    return credential;
+  });
+}
+async function revokeDeliveryAdminCredential(input) {
+  requireDeliveryManager(input.actor);
+  requireSystemAdminCredentialManagement(input.actor);
+  const db = await requireDb12();
+  return db.transaction(async (tx) => {
+    await requireDeliveryAdminCredentialTarget({
+      executor: tx,
+      adminUserId: input.adminUserId
+    });
+    const credentialRows = await tx.select().from(apiCredentials).where(eq20(apiCredentials.userId, input.adminUserId)).orderBy(desc15(apiCredentials.version)).limit(1).for("update");
+    const latest = credentialRows[0];
+    const actualVersion = latest?.version ?? 0;
+    if (actualVersion !== input.expectedVersion) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "\u4EA4\u4ED8\u7BA1\u7406\u5458 API Key \u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5"
+      );
+    }
+    if (latest?.status !== "active") {
+      throw new AuthServiceError("CONFLICT", "\u4EA4\u4ED8\u7BA1\u7406\u5458 API Key \u5C1A\u672A\u914D\u7F6E");
+    }
+    const deletion = await deleteActiveApiCredentialInTransaction({
+      executor: tx,
+      userId: input.adminUserId
+    });
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "delivery.admin_credential.revoked",
+        targetType: "user",
+        targetId: input.adminUserId,
+        workspaceUserId: null,
+        metadata: {
+          previouslyConfigured: true,
+          previousVersion: actualVersion,
+          credentialVersion: deletion.version,
+          configured: false
+        }
+      },
+      tx
+    );
+    return { success: true };
+  });
+}
 
 // server/managed-user-onboarding-service.ts
 import { randomUUID as randomUUID16 } from "node:crypto";
@@ -22263,13 +22485,22 @@ async function createManagedServiceUser(input, dependencies = {}) {
       "\u4EA4\u4ED8\u7BA1\u7406\u5458\u521B\u5EFA\u7684\u5BA2\u6237\u5FC5\u987B\u5F52\u5C5E\u5F53\u524D\u8D26\u53F7"
     );
   }
+  const apiKey = input.apiKey?.trim() || null;
+  if (apiKey && !hasSystemAdminAccess(input.actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "\u5BA2\u6237 API Key \u4EC5\u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EDF\u4E00\u7EF4\u62A4"
+    );
+  }
   const planCode = provisionableServicePlanCodeSchema.parse(input.planCode);
   const now = dependencies.now?.() ?? /* @__PURE__ */ new Date();
   const contractId = dependencies.randomId?.() ?? randomUUID16();
   const plan = SERVICE_PLAN_CATALOG[planCode];
   const startsAt = now;
   const endsAt = getServiceContractTermEnd(planCode, startsAt);
-  await (dependencies.validateApiKey ?? validateUpstreamApiKey)(input.apiKey);
+  if (apiKey) {
+    await (dependencies.validateApiKey ?? validateUpstreamApiKey)(apiKey);
+  }
   const passwordHash = await hashPassword(input.password);
   const transaction = dependencies.transaction ?? await defaultTransaction();
   const createAccount = dependencies.createAccount ?? ((accountInput, executor) => createManagedUserWithPasswordHash(
@@ -22293,12 +22524,14 @@ async function createManagedServiceUser(input, dependencies = {}) {
   const writeAudit = dependencies.writeAudit ?? ((event, executor) => writeWorkspaceAuditEvent(event, executor));
   const persistCredentialAndAssignment = dependencies.persistCredentialAndAssignment ?? (async (value, executor) => {
     const tx = executor;
-    await replaceApiCredentialInTransaction({
-      executor: tx,
-      userId: value.userId,
-      apiKey: value.apiKey,
-      now: value.now
-    });
+    if (value.apiKey) {
+      await replaceApiCredentialInTransaction({
+        executor: tx,
+        userId: value.userId,
+        apiKey: value.apiKey,
+        now: value.now
+      });
+    }
     await tx.insert(userAdminAssignments).values({
       userId: value.userId,
       adminId: value.deliveryAdminId,
@@ -22391,7 +22624,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
         userId,
         actorUserId: input.actor.id,
         deliveryAdminId: input.deliveryAdminId,
-        apiKey: input.apiKey,
+        apiKey: apiKey ?? void 0,
         now
       },
       executor
@@ -22411,6 +22644,7 @@ async function createManagedServiceUser(input, dependencies = {}) {
           contractId,
           entitlementStatus: "active",
           deliveryAdminId: input.deliveryAdminId,
+          apiKeyConfigured: Boolean(apiKey),
           quotaPeriodCount: quotaPeriods.length
         }
       },
@@ -22652,6 +22886,7 @@ function managedMonitoringCitationSummaryValue(input) {
 var adminRouter = router({
   apiKeyUsageAlerts: router({
     hierarchy: adminProcedure.query(async ({ ctx }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await getAdminApiUsageHierarchy(ctx.user);
       } catch (error) {
@@ -22659,6 +22894,7 @@ var adminRouter = router({
       }
     }),
     overview: adminProcedure.query(async ({ ctx }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await getApiUsageAlertOverview(ctx.user);
       } catch (error) {
@@ -22666,6 +22902,7 @@ var adminRouter = router({
       }
     }),
     sync: adminProcedure.mutation(async ({ ctx }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await syncApiUsageSnapshots(ctx.user);
       } catch (error) {
@@ -23309,6 +23546,7 @@ var adminRouter = router({
       }
     }),
     credentialStatus: adminProcedure.input(z10.object({ userId: z10.number().int().positive() })).query(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await getManagedCredentialStatus(ctx.user, input.userId);
       } catch (error) {
@@ -23370,6 +23608,7 @@ var adminRouter = router({
       }
     }),
     creditUsage: adminProcedure.input(z10.object({ userId: z10.number().int().positive() })).query(async ({ ctx, input }) => {
+      requireSystemAdmin(ctx.user);
       try {
         return await getManagedUserCreditUsage(ctx.user, input.userId);
       } catch (error) {
@@ -23704,7 +23943,7 @@ var adminRouter = router({
           planCode: provisionableServicePlanCodeSchema,
           marketEdition: accountMarketEditionSchema,
           deliveryAdminId: z10.number().int().positive(),
-          apiKey: presalesApiKeySchema
+          apiKey: presalesApiKeySchema.optional()
         }),
         z10.object({
           username: usernameSchema2,
@@ -25080,6 +25319,7 @@ var conversationRouter = router({
 });
 
 // server/credential-router.ts
+import { TRPCError as TRPCError5 } from "@trpc/server";
 import { z as z12 } from "zod";
 var apiKeyInput = z12.object({
   apiKey: z12.string().trim().min(8, "API Key \u81F3\u5C11\u9700\u8981 8 \u4E2A\u5B57\u7B26").max(4096, "API Key \u4E0D\u80FD\u8D85\u8FC7 4096 \u4E2A\u5B57\u7B26")
@@ -25094,17 +25334,33 @@ async function saveCredential(userId, apiKey) {
     throw toTrpcError(error);
   }
 }
+function requireSystemAdminCredentialAccess(user) {
+  if (!hasSystemAdminAccess(user)) {
+    throw new TRPCError5({
+      code: "FORBIDDEN",
+      message: "\u6240\u6709\u8D26\u53F7 API Key \u4EC5\u7531\u7CFB\u7EDF\u7BA1\u7406\u5458\u7EDF\u4E00\u7EF4\u62A4"
+    });
+  }
+}
 var credentialRouter = router({
   status: adminProcedure.query(async ({ ctx }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
     try {
       return await getApiCredentialStatus(ctx.user.id);
     } catch (error) {
       throw toTrpcError(error);
     }
   }),
-  set: adminProcedure.input(apiKeyInput).mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
-  replace: adminProcedure.input(apiKeyInput).mutation(({ ctx, input }) => saveCredential(ctx.user.id, input.apiKey)),
+  set: adminProcedure.input(apiKeyInput).mutation(({ ctx, input }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
+    return saveCredential(ctx.user.id, input.apiKey);
+  }),
+  replace: adminProcedure.input(apiKeyInput).mutation(({ ctx, input }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
+    return saveCredential(ctx.user.id, input.apiKey);
+  }),
   test: adminProcedure.input(testApiKeyInput).mutation(async ({ ctx, input }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
     try {
       const savedCredential = input.apiKey ? null : await getDecryptedCredentialForUser(ctx.user.id);
       const apiKey = input.apiKey ?? savedCredential?.apiKey;
@@ -25118,6 +25374,7 @@ var credentialRouter = router({
     }
   }),
   delete: adminProcedure.mutation(async ({ ctx }) => {
+    requireSystemAdminCredentialAccess(ctx.user);
     try {
       await deleteActiveApiCredential(ctx.user.id);
       return { success: true };
@@ -25131,7 +25388,7 @@ var credentialRouter = router({
 import { z as z13 } from "zod";
 
 // server/_core/notification.ts
-import { TRPCError as TRPCError5 } from "@trpc/server";
+import { TRPCError as TRPCError6 } from "@trpc/server";
 var TITLE_MAX_LENGTH = 1200;
 var CONTENT_MAX_LENGTH = 2e4;
 var trimValue = (value) => value.trim();
@@ -25145,13 +25402,13 @@ var buildEndpointUrl = (baseUrl) => {
 };
 var validatePayload = (input) => {
   if (!isNonEmptyString(input.title)) {
-    throw new TRPCError5({
+    throw new TRPCError6({
       code: "BAD_REQUEST",
       message: "Notification title is required."
     });
   }
   if (!isNonEmptyString(input.content)) {
-    throw new TRPCError5({
+    throw new TRPCError6({
       code: "BAD_REQUEST",
       message: "Notification content is required."
     });
@@ -25159,13 +25416,13 @@ var validatePayload = (input) => {
   const title = trimValue(input.title);
   const content = trimValue(input.content);
   if (title.length > TITLE_MAX_LENGTH) {
-    throw new TRPCError5({
+    throw new TRPCError6({
       code: "BAD_REQUEST",
       message: `Notification title must be at most ${TITLE_MAX_LENGTH} characters.`
     });
   }
   if (content.length > CONTENT_MAX_LENGTH) {
-    throw new TRPCError5({
+    throw new TRPCError6({
       code: "BAD_REQUEST",
       message: `Notification content must be at most ${CONTENT_MAX_LENGTH} characters.`
     });
@@ -25175,13 +25432,13 @@ var validatePayload = (input) => {
 async function notifyOwner(payload) {
   const { title, content } = validatePayload(payload);
   if (!ENV.forgeApiUrl) {
-    throw new TRPCError5({
+    throw new TRPCError6({
       code: "INTERNAL_SERVER_ERROR",
       message: "Notification service URL is not configured."
     });
   }
   if (!ENV.forgeApiKey) {
-    throw new TRPCError5({
+    throw new TRPCError6({
       code: "INTERNAL_SERVER_ERROR",
       message: "Notification service API key is not configured."
     });
@@ -25235,7 +25492,7 @@ var systemRouter = router({
 });
 
 // server/workspace-router.ts
-import { TRPCError as TRPCError6 } from "@trpc/server";
+import { TRPCError as TRPCError7 } from "@trpc/server";
 import { z as z16 } from "zod";
 
 // shared/response-logic.ts
@@ -26138,21 +26395,21 @@ function projectUserDashboardPayload(input) {
 }
 function toServiceError(error) {
   if (error instanceof DeliveryTicketError) {
-    throw new TRPCError6({
+    throw new TRPCError7({
       code: error.statusCode === 404 ? "NOT_FOUND" : error.statusCode === 403 ? "FORBIDDEN" : error.statusCode === 400 ? "BAD_REQUEST" : error.statusCode === 503 ? "INTERNAL_SERVER_ERROR" : "CONFLICT",
       message: error.message,
       cause: error
     });
   }
   if (error instanceof ServiceEntitlementError) {
-    throw new TRPCError6({
+    throw new TRPCError7({
       code: error.statusCode === 404 ? "NOT_FOUND" : error.statusCode === 403 ? "FORBIDDEN" : error.statusCode === 400 ? "BAD_REQUEST" : error.statusCode === 503 ? "INTERNAL_SERVER_ERROR" : "CONFLICT",
       message: error.message,
       cause: error
     });
   }
   if (error instanceof PurchaseProvisioningError) {
-    throw new TRPCError6({
+    throw new TRPCError7({
       code: error.status === 404 ? "NOT_FOUND" : error.status === 403 ? "FORBIDDEN" : error.status === 400 ? "BAD_REQUEST" : error.status === 503 ? "INTERNAL_SERVER_ERROR" : "CONFLICT",
       message: error.message,
       cause: error
@@ -26236,7 +26493,7 @@ var workspaceRouter = router({
     }),
     create: protectedProcedure.input(createDeliveryTicketSchema).mutation(async ({ ctx, input }) => {
       if (ctx.user.role !== "user") {
-        throw new TRPCError6({
+        throw new TRPCError7({
           code: "FORBIDDEN",
           message: "\u53EA\u6709\u5F53\u524D\u7528\u6237\u53EF\u4EE5\u63D0\u4EA4\u4EA4\u4ED8\u5DE5\u5355\u3002"
         });
@@ -26284,7 +26541,7 @@ var workspaceRouter = router({
     }),
     addMessage: protectedProcedure.input(addDeliveryTicketMessageSchema).mutation(async ({ ctx, input }) => {
       if (ctx.user.role !== "user") {
-        throw new TRPCError6({
+        throw new TRPCError7({
           code: "FORBIDDEN",
           message: "\u53EA\u6709\u5F53\u524D\u7528\u6237\u53EF\u4EE5\u8865\u5145\u5DE5\u5355\u8D44\u6599\u3002"
         });
@@ -26321,7 +26578,7 @@ var workspaceRouter = router({
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
-      throw new TRPCError6({
+      throw new TRPCError7({
         code: "FORBIDDEN",
         message: "\u53EA\u6709\u5F53\u524D\u7528\u6237\u53EF\u4EE5\u53D1\u8D77\u8D2D\u4E70\u610F\u5411\u3002"
       });
@@ -26342,7 +26599,7 @@ var workspaceRouter = router({
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
-      throw new TRPCError6({
+      throw new TRPCError7({
         code: "FORBIDDEN",
         message: "\u53EA\u6709\u5F53\u524D\u7528\u6237\u53EF\u4EE5\u63D0\u4EA4\u76EE\u6807\u95EE\u9898\u3002"
       });
@@ -26382,7 +26639,7 @@ var workspaceRouter = router({
     ])
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
-      throw new TRPCError6({
+      throw new TRPCError7({
         code: "FORBIDDEN",
         message: "\u53EA\u6709\u5F53\u524D\u7528\u6237\u53EF\u4EE5\u63D0\u4EA4\u76EE\u6807\u95EE\u9898\u3002"
       });
@@ -26415,7 +26672,7 @@ var workspaceRouter = router({
     })
   ).mutation(async ({ ctx, input }) => {
     if (ctx.user.role !== "user") {
-      throw new TRPCError6({
+      throw new TRPCError7({
         code: "FORBIDDEN",
         message: "\u53EA\u6709\u5F53\u524D\u7528\u6237\u672C\u4EBA\u53EF\u4EE5\u786E\u8BA4\u95EE\u9898\u4F18\u5316\u7ED3\u679C\u3002"
       });
@@ -26657,6 +26914,33 @@ var deliveryRoleRouter = router({
           actor: ctx.user,
           memberUserId: input.engineerUserId,
           expectedVersion: input.expectedVersion
+        })
+      )
+    ),
+    setDeliveryAdminApiKey: adminProcedure.input(
+      z17.object({
+        adminUserId: z17.number().int().positive(),
+        apiKey: z17.string().trim().min(8).max(4096),
+        expectedVersion: z17.number().int().nonnegative()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => setDeliveryAdminCredential({
+          actor: ctx.user,
+          ...input
+        })
+      )
+    ),
+    revokeDeliveryAdminApiKey: adminProcedure.input(
+      z17.object({
+        adminUserId: z17.number().int().positive(),
+        expectedVersion: z17.number().int().nonnegative()
+      })
+    ).mutation(
+      ({ ctx, input }) => serviceCall(
+        () => revokeDeliveryAdminCredential({
+          actor: ctx.user,
+          ...input
         })
       )
     )
@@ -30682,14 +30966,19 @@ function upstreamTaskTerminal(status) {
 function shouldReconcileKnowledgeOutput(output, status, options = {}) {
   const text2 = extractFinalKnowledgeBaseAssistantText(output);
   if (!text2) return false;
+  const rawKinds = new Set(
+    extractKnowledgeBaseProtocolObjects(text2).map((value) => value.kind)
+  );
   if (options.requirePresentation) {
-    if (COMPLETE_KNOWLEDGE_MANIFEST.test(text2)) return true;
-    if (COMPLETE_KNOWLEDGE_TRANSITION.test(text2) && COMPLETE_KNOWLEDGE_PRESENTATION.test(text2)) {
+    if (COMPLETE_KNOWLEDGE_MANIFEST.test(text2) || rawKinds.has("frontmind.knowledge-base.manifest")) {
+      return true;
+    }
+    if ((COMPLETE_KNOWLEDGE_TRANSITION.test(text2) || rawKinds.has("frontmind.knowledge-base.progress") || rawKinds.has("frontmind.knowledge-base.reopen")) && (COMPLETE_KNOWLEDGE_PRESENTATION.test(text2) || rawKinds.has("frontmind.knowledge-base.presentation"))) {
       return true;
     }
     return upstreamTaskTerminal(status);
   }
-  if (COMPLETE_KNOWLEDGE_PROTOCOL_ENVELOPE.test(text2) || COMPLETE_KNOWLEDGE_PROTOCOL_COMMENT.test(text2)) {
+  if (COMPLETE_KNOWLEDGE_PROTOCOL_ENVELOPE.test(text2) || COMPLETE_KNOWLEDGE_PROTOCOL_COMMENT.test(text2) || rawKinds.has("frontmind.knowledge-base.manifest") || rawKinds.has("frontmind.knowledge-base.progress") || rawKinds.has("frontmind.knowledge-base.reopen")) {
     return true;
   }
   return upstreamTaskTerminal(status);
@@ -31174,6 +31463,7 @@ ${operatorNotes}` : "\u64CD\u4F5C\u8005\u5907\u6CE8\uFF1A\u672A\u586B\u5199",
     ].join("\n") : "\u5F53\u524D\u8D26\u53F7\u6CA1\u6709\u5DF2\u8FC1\u79FB\u7684\u521D\u6B65\u77E5\u8BC6\u5E93\uFF0C\u5C06\u4ECE\u5B98\u7F51\u3001\u5168\u7F51\u4E0E\u4E0A\u4F20\u8D44\u6599\u5F00\u59CB\u9884\u586B\u3002",
     "## \u5FC5\u987B\u6267\u884C\u7684\u673A\u5668\u53EF\u9A8C\u8BC1\u8FDB\u5EA6\u534F\u8BAE",
     "\u8FD9\u662F\u670D\u52A1\u7AEF\u72B6\u6001\u673A\u534F\u8BAE\uFF0C\u4F18\u5148\u7EA7\u9AD8\u4E8E skill \u4E2D\u4EFB\u4F55\u4F1A\u81EA\u52A8\u8DE8\u8282\u70B9\u7684\u8868\u8FF0\u3002\u53EF\u8BFB\u6B63\u6587\u7167\u5E38\u8F93\u51FA\uFF1A\u9996\u8F6E\u672B\u5C3E\u53EA\u80FD\u9644\u4E00\u4E2A\u6E05\u5355\u4FE1\u5C01\uFF1B\u540E\u7EED\u8F6E\u672B\u5C3E\u5FC5\u987B\u4F9D\u6B21\u9644\u4E00\u4E2A\u72B6\u6001/\u91CD\u5F00\u4FE1\u5C01\u548C\u4E00\u4E2A\u5C55\u793A\u4FE1\u5C01\u3002",
+    "\u4FE1\u5C01\u7684 `<!-- FRONTMIND_KB_...` \u5F00\u5934\u4E0E `-->` \u7ED3\u5C3E\u90FD\u662F\u534F\u8BAE\u5FC5\u586B\u5185\u5BB9\uFF0C\u5FC5\u987B\u539F\u6837\u4FDD\u7559\uFF1B\u7981\u6B62\u8F93\u51FA\u88F8 JSON\uFF0C\u7981\u6B62\u8F93\u51FA SOCRATIC_KB_STATE\uFF0C\u7981\u6B62\u7528 frontmind.workflow-state\u3001frontmind.knowledge-base.message \u6216\u5176\u4ED6\u81EA\u521B\u5BF9\u8C61\u66FF\u4EE3\u4E0B\u5217\u56DB\u79CD\u89C4\u5B9A\u4FE1\u5C01\u3002",
     "",
     "### \u9996\u8F6E\u7814\u7A76\u4E0E\u77E5\u8BC6\u6811\u5EFA\u7ACB",
     "\u5B8C\u6210\u5B98\u7F51\u3001\u516C\u5F00\u6765\u6E90\u3001\u4E0A\u4F20\u8D44\u6599\u7814\u7A76\u548C\u6B63\u5F0F\u56FE\u6587\u9884\u586B\u540E\uFF0C\u6309\u4F01\u4E1A\u5B9E\u9645\u8D44\u6599\u91CF\u5EFA\u7ACB\u81EA\u9002\u5E94\u4E00\u7EA7\u5206\u652F\u548C 8-115 \u4E2A\u771F\u5B9E\u53F6\u5B50\u8282\u70B9\u3002\u767D\u724C\u4F01\u4E1A\u6216\u53EA\u6709\u5BA3\u4F20\u5355\u65F6\u53EA\u4FDD\u7559\u6709\u4E8B\u5B9E\u4EF7\u503C\u6216\u660E\u786E\u7F3A\u53E3\u7684\u5FC5\u8981\u53F6\u5B50\uFF0C\u4E0D\u5F97\u4E3A\u6570\u91CF\u3001\u5B57\u6570\u6216\u56FE\u7247\u6570\u586B\u5145\u5185\u5BB9\u3002\u4E00\u7EA7\u5206\u652F\u6570\u91CF\u4E0D\u8BBE\u56FA\u5B9A\u503C\uFF1B\u6BCF\u4E2A\u53F6\u5B50\u5FC5\u987B\u6709\u5168\u5C40\u552F\u4E00\u4E14\u540E\u7EED\u4E0D\u53D8\u7684 id\u3001title\u3001branchId\u3001branchTitle\u3002\u9996\u8F6E\u6B63\u6587\u5C55\u793A\u5B8C\u6574\u5206\u652F\u7EDF\u8BA1\u5E76\u5448\u73B0\u7B2C\u4E00\u4E2A\u53F6\u5B50\u8282\u70B9\uFF0C\u7136\u540E\u4EC5\u5728\u56DE\u590D\u672B\u5C3E\u9644\uFF1A",
@@ -31303,7 +31593,7 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     `\u5F53\u524D\u8282\u70B9\u72B6\u6001\uFF1A${current.status}`,
     `\u670D\u52A1\u7AEF\u5224\u5B9A\u672C\u8F6E\u52A8\u4F5C\uFF1A${action}`,
     "\u53EA\u8981\u672C\u8F6E\u5305\u542B\u9644\u4EF6\uFF0C\u65E0\u8BBA\u6587\u5B57\u662F\u5426\u5305\u542B\u201C\u786E\u8BA4\u201D\uFF0C\u90FD\u5FC5\u987B\u6309\u8865\u5145/\u4FEE\u8BA2\u5904\u7406\uFF0C\u4FDD\u6301 needs_verification\u3002",
-    "\u56DE\u590D\u672B\u5C3E\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PROGRESS \u4FE1\u5C01\u3002",
+    "\u56DE\u590D\u672B\u5C3E\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PROGRESS \u4FE1\u5C01\uFF1BHTML \u6CE8\u91CA\u5F00\u5934\u548C\u7ED3\u5C3E\u662F\u4FE1\u5C01\u7684\u4E00\u90E8\u5206\uFF0C\u4E0D\u5F97\u7701\u7565\u6216\u6539\u6210\u88F8 JSON\u3002",
     action === "confirm" || action === "direct_prefill" ? nextPending ? `\u5148\u7B80\u77ED\u786E\u8BA4\u5DF2\u5904\u7406 ${current.id}\uFF0C\u6B63\u6587\u4E3B\u4F53\u968F\u540E\u5B8C\u6574\u5C55\u793A\u4E0B\u4E00\u8282\u70B9 ${nextPending.id}\uFF5C${nextPending.branchTitle} / ${nextPending.title}\u3002\u4E0D\u5F97\u518D\u6B21\u628A ${current.id} \u4F5C\u4E3A\u4E3B\u4F53\u3002` : `\u8FD9\u662F\u6700\u540E\u4E00\u4E2A\u8282\u70B9\u3002\u7B80\u77ED\u786E\u8BA4 ${current.id} \u540E\u76F4\u63A5\u751F\u6210\u552F\u4E00\u6700\u7EC8 ZIP\uFF0C\u4E0D\u518D\u5C55\u793A\u8282\u70B9\u6B63\u6587\u3002` : `\u66F4\u65B0\u5E76\u5B8C\u6574\u91CD\u65B0\u5C55\u793A\u5F53\u524D\u8282\u70B9 ${current.id}\uFF1B\u4E0D\u5F97\u5C55\u793A\u6216\u63A8\u8FDB\u5230\u540E\u7EED\u8282\u70B9\u3002`,
     isV3 ? `\u56DE\u590D\u672B\u5C3E\u8FD8\u5FC5\u987B\u9644\u4E14\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF1Arevision=${postRevision}\uFF0CleafId=${action === "confirm" || action === "direct_prefill" ? nextPending?.id || "null" : current.id}\u3002\u540C\u65F6\u4E25\u683C\u58F0\u660E imageState\u3001assetIds\u3001imageCount\uFF1A\u5B9E\u9645\u8FD4\u56DE 1-3 \u5F20\u56FE\u7247\u9644\u4EF6\u65F6\u4F7F\u7528 attached \u548C\u5BF9\u5E94\u7A33\u5B9A\u8D44\u4EA7 ID\uFF1B\u5F53\u524D\u8282\u70B9\u786E\u65E0\u5408\u683C\u56FE\u7247\u65F6\u4F7F\u7528 no_eligible_asset\u3001\u7A7A\u6570\u7EC4\u548C 0\uFF1BleafId=null \u65F6\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1A\u8BF7\u9075\u5FAA\u76F8\u540C\u7684\u5C55\u793A\u884C\u4E3A\uFF1B\u5982\u89C4\u7EA6\u652F\u6301\uFF0C\u53EF\u9644 FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0C\u4F46\u670D\u52A1\u7AEF\u4E0D\u5F3A\u5236\u8981\u6C42\u3002"
   ].join("\n") : [
@@ -31318,6 +31608,7 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u51FA\u73B0\u201C\u672C\u8F6E\u91C7\u96C6/\u672C\u77E5\u8BC6\u5E93/\u8BC1\u636E\u4E0D\u8DB3/\u5DF2\u6838\u9A8C\u201D\u7B49\u8FC7\u7A0B\u5224\u65AD\uFF0C\u4E5F\u4E0D\u5F97\u51FA\u73B0\u5BA2\u6237\u5E94\u3001\u91C7\u8D2D\u65B9\u5E94\u3001\u5EFA\u8BAE\u3001\u5C3D\u8C03\u3001\u5408\u89C4\u5BA1\u67E5\u3001\u4E0D\u80FD\u4EC5\u51ED\u3001\u4E0D\u5B9C\u8F6C\u6362\u6216\u4E0D\u80FD\u5916\u63A8\u7B49\u5EFA\u8BAE\u6027\u8868\u8FBE\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\uFF1B\u7528\u6237\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\u5F53\u524D\u5185\u5BB9\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\uFF0C\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\u3002\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\uFF1B\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
+    "\u673A\u5668\u4FE1\u5C01\u5FC5\u987B\u4FDD\u7559\u5B8C\u6574\u7684 `<!-- FRONTMIND_KB_...` \u4E0E `-->` \u5305\u88F9\uFF0C\u4E0D\u5F97\u8F93\u51FA\u88F8 JSON\u3001SOCRATIC_KB_STATE\uFF0C\u4E5F\u4E0D\u5F97\u81EA\u521B workflow-state\u3001knowledge-base.message \u6216\u5176\u4ED6\u72B6\u6001\u5BF9\u8C61\u3002",
     "\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u5982\u6709\u5408\u683C related assetIds\uFF0C\u5FC5\u987B\u628A\u6700\u591A\u4E09\u5F20\u5DF2\u4E0B\u8F7D\u9A8C\u8BC1\u7684\u672C\u5730\u56FE\u7247\u4F5C\u4E3A\u540C\u4E00\u56DE\u590D\u7684 output_image \u6216 image MIME output_file \u9644\u4EF6\u8FD4\u56DE\uFF1B\u4E0D\u80FD\u53EA\u8F93\u51FA\u5305\u5185\u8DEF\u5F84\u3001\u56FE\u7247\u6807\u9898\u3001\u6587\u5B57\u5360\u4F4D\u6216\u5B98\u7F51/CDN \u70ED\u94FE\u3002\u53EA\u6709\u8BE5\u8282\u70B9\u786E\u5B9E\u6CA1\u6709\u5408\u683C\u5173\u8054\u7D20\u6750\u65F6\u624D\u53EF\u7EAF\u6587\u5B57\u8FD4\u56DE\u3002",
     "",
     "# \u5F53\u524D\u77E5\u8BC6\u5E93\u72B6\u6001",
@@ -39144,18 +39435,18 @@ async function buildBrandQuestionPortfolioPrompt(context) {
     "\u53EA\u5141\u8BB8\u5F15\u7528 evidence ZIP \u7684 knowledge.md \u4E2D\u51FA\u73B0\u7684 documentPath\u3002\u5FC5\u987B\u539F\u6837\u56DE\u663E\u670D\u52A1\u7AEF\u7ED9\u51FA\u7684\u77E5\u8BC6\u5E93\u6807\u8BC6\u3001\u7248\u672C\u3001\u54C8\u5E0C\u3001\u5957\u9910\u548C\u989D\u5EA6\u5468\u671F\u3002"
   ].join("\n");
 }
-function isRecord2(value) {
+function isRecord3(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function stringValue3(value) {
   if (typeof value === "string") return value.trim();
-  if (isRecord2(value) && typeof value.value === "string") {
+  if (isRecord3(value) && typeof value.value === "string") {
     return value.value.trim();
   }
   return "";
 }
 function typedAssistantMessageText(value) {
-  if (!isRecord2(value) || value.role !== "assistant") return "";
+  if (!isRecord3(value) || value.role !== "assistant") return "";
   const type = typeof value.type === "string" ? value.type.trim().toLowerCase() : "";
   if (type && !["message", "output_message", "output_text", "text"].includes(type)) {
     return "";
@@ -39176,7 +39467,7 @@ function typedAssistantMessageText(value) {
         if (text3 && !parts.includes(text3)) parts.push(text3);
         continue;
       }
-      if (!isRecord2(rawContent)) continue;
+      if (!isRecord3(rawContent)) continue;
       const contentType = typeof rawContent.type === "string" ? rawContent.type.trim().toLowerCase() : "";
       if (!["output_text", "text", "message", ""].includes(contentType)) {
         continue;
@@ -40294,7 +40585,7 @@ function requestHash2(input) {
     })
   );
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function normalizedText2(value) {
@@ -40381,14 +40672,14 @@ function monitorTaskId(value) {
   return taskId;
 }
 function responseTaskIds(payload) {
-  if (!isRecord3(payload) || !isRecord3(payload.data)) return /* @__PURE__ */ new Set();
+  if (!isRecord4(payload) || !isRecord4(payload.data)) return /* @__PURE__ */ new Set();
   const ids = /* @__PURE__ */ new Set();
   const parentId = normalizedText2(payload.data.taskId);
   if (parentId) ids.add(parentId);
   const children = payload.data.subTaskList;
   if (Array.isArray(children)) {
     for (const child of children) {
-      if (!isRecord3(child)) continue;
+      if (!isRecord4(child)) continue;
       const id = normalizedText2(child.taskId);
       if (id) ids.add(id);
     }
@@ -40396,7 +40687,7 @@ function responseTaskIds(payload) {
   return ids;
 }
 function assertResponseOwner(payload, taskId, source, requireTopLevel = false) {
-  if (!isRecord3(payload) || !isRecord3(payload.data)) {
+  if (!isRecord4(payload) || !isRecord4(payload.data)) {
     throw new PresalesMonitorError(
       "MONITOR_SHAPE_MISMATCH",
       502,
@@ -40421,7 +40712,7 @@ function assertResponseOwner(payload, taskId, source, requireTopLevel = false) {
   }
 }
 function validateMonitorSubmitResponse(payload, input) {
-  if (!isRecord3(payload) || payload.success !== true || !isRecord3(payload.data)) {
+  if (!isRecord4(payload) || payload.success !== true || !isRecord4(payload.data)) {
     throw new PresalesMonitorError(
       "MONITOR_SUBMISSION_UNKNOWN",
       502,
@@ -40444,7 +40735,7 @@ function validateMonitorSubmitResponse(payload, input) {
   const ids = [];
   const scopes = {};
   for (const child of children) {
-    if (!isRecord3(child)) {
+    if (!isRecord4(child)) {
       throw new PresalesMonitorError(
         "MONITOR_SUBMISSION_UNKNOWN",
         502,
@@ -40510,7 +40801,7 @@ function sanitizeEvidence(value, maxItems) {
         return sanitizeMonitorPublicText(raw);
       })();
       if (text2) cleaned = text2;
-    } else if (isRecord3(entry)) {
+    } else if (isRecord4(entry)) {
       const object = {};
       const index2 = nonnegativeInteger(entry.index);
       if (index2 !== null) object.index = index2;
@@ -40562,7 +40853,7 @@ function citationsFromInlineMarkers(answerContent, referenceList) {
   const entries = Array.isArray(referenceList) ? referenceList : referenceList === null || referenceList === void 0 ? [] : [referenceList];
   const byIndex = /* @__PURE__ */ new Map();
   for (const entry of entries.slice(0, MAX_EVIDENCE_CANDIDATES)) {
-    if (!isRecord3(entry)) continue;
+    if (!isRecord4(entry)) continue;
     const index2 = nonnegativeInteger(entry.index);
     if (index2 === null || !requested.has(index2)) continue;
     const sanitized = sanitizeEvidence(entry, 1)[0];
@@ -40635,7 +40926,7 @@ function firstMediaUrl(record, keys) {
     const direct = safeMediaUrl(record[key]);
     if (direct) return direct;
     const nested = record[key];
-    if (isRecord3(nested)) {
+    if (isRecord4(nested)) {
       for (const nestedKey of ["url", "src", "href"]) {
         const candidate = safeMediaUrl(nested[nestedKey]);
         if (candidate) return candidate;
@@ -40649,7 +40940,7 @@ function normalizeMediaCandidate(value) {
     const url2 = safeMediaUrl(value);
     return url2 ? { type: mediaTypeFrom(void 0, url2), url: url2 } : void 0;
   }
-  if (!isRecord3(value)) return void 0;
+  if (!isRecord4(value)) return void 0;
   const url = firstMediaUrl(value, [
     "url",
     "href",
@@ -40748,7 +41039,7 @@ function sanitizeMonitorMedia(value, answerContent) {
   const candidates = rawItems.map(normalizeMediaCandidate);
   const embedded = rawItems.flatMap((item) => {
     if (typeof item === "string") return mediaFromAnswerHtml(item);
-    if (!isRecord3(item)) return [];
+    if (!isRecord4(item)) return [];
     return mediaFromAnswerHtml(item.html ?? item.content ?? item.markup);
   });
   const result = [];
@@ -40823,7 +41114,7 @@ function normalizeResultSnapshot(payload, run) {
       "\u76D1\u63A7\u53F0\u8D26\u7F3A\u5C11\u4EFB\u52A1 ID"
     );
   }
-  if (!isRecord3(payload) || payload.success !== true || !isRecord3(payload.data)) {
+  if (!isRecord4(payload) || payload.success !== true || !isRecord4(payload.data)) {
     throw new MonitorRemoteError("\u76D1\u63A7\u7ED3\u679C\u63A5\u53E3\u672A\u8FD4\u56DE\u6709\u6548 JSON", true);
   }
   assertResponseOwner(payload, taskId, "\u76D1\u63A7\u7ED3\u679C", true);
@@ -40863,7 +41154,7 @@ function normalizeResultSnapshot(payload, run) {
   const seen = /* @__PURE__ */ new Set();
   const items = [];
   for (const child of children) {
-    if (!isRecord3(child)) {
+    if (!isRecord4(child)) {
       throw new PresalesMonitorError(
         "MONITOR_SHAPE_MISMATCH",
         502,
@@ -40976,9 +41267,9 @@ function mergeMedia(first, second) {
   return result;
 }
 function monitorCheckpoint(value) {
-  if (!isRecord3(value) || !Array.isArray(value.items)) return { items: [] };
+  if (!isRecord4(value) || !Array.isArray(value.items)) return { items: [] };
   return {
-    items: value.items.filter(isRecord3)
+    items: value.items.filter(isRecord4)
   };
 }
 function jsonStringArray(value) {
@@ -40999,10 +41290,10 @@ function jsonScopeMap(value) {
       return {};
     }
   })() : value;
-  if (!isRecord3(parsed)) return {};
+  if (!isRecord4(parsed)) return {};
   const result = {};
   for (const [id, scope] of Object.entries(parsed)) {
-    if (!isRecord3(scope)) continue;
+    if (!isRecord4(scope)) continue;
     const platform = toPublicMonitorPlatform(scope.platform);
     const runIndex = positiveInteger(scope.runIndex);
     if (platform && runIndex !== null && runIndex <= MONITOR_REPEAT_PER_PLATFORM) {
@@ -41073,11 +41364,11 @@ function checkpointSignature(checkpoint) {
 }
 function publicMonitorRun(run, includeResult) {
   const platforms = jsonStringArray(run.platforms).map(toPublicMonitorPlatform).filter((item) => item !== null).filter((item, index2, items) => items.indexOf(item) === index2);
-  const final = isRecord3(run.finalResult) ? run.finalResult : null;
+  const final = isRecord4(run.finalResult) ? run.finalResult : null;
   const checkpointResult = includeResult && !final && POLLABLE_LOCAL_STATUSES.has(run.status) ? buildCheckpointResult(run, monitorCheckpoint(run.checkpoint)) : null;
   const result = includeResult && final && Array.isArray(final.records) ? final : checkpointResult;
   const records = Array.isArray(result?.records) ? result.records.flatMap((record) => {
-    if (!isRecord3(record)) return [];
+    if (!isRecord4(record)) return [];
     const platform = toPublicMonitorPlatform(record.platform);
     if (!platform) return [];
     return [{ ...record, platform }];
@@ -41106,7 +41397,7 @@ function statusData(payload, run) {
       "\u76D1\u63A7\u53F0\u8D26\u7F3A\u5C11\u4EFB\u52A1 ID"
     );
   }
-  if (!isRecord3(payload) || payload.success !== true || !isRecord3(payload.data)) {
+  if (!isRecord4(payload) || payload.success !== true || !isRecord4(payload.data)) {
     throw new MonitorRemoteError("\u76D1\u63A7\u72B6\u6001\u63A5\u53E3\u672A\u8FD4\u56DE\u6709\u6548 JSON", true);
   }
   assertResponseOwner(payload, taskId, "\u76D1\u63A7\u72B6\u6001");
@@ -41367,7 +41658,7 @@ var AxiosMonitorTransport = class {
       );
     }
     const message = sanitizeMonitorErrorText(
-      isRecord3(response2.data) ? response2.data.message : void 0,
+      isRecord4(response2.data) ? response2.data.message : void 0,
       credential.apiKey,
       `\u76D1\u63A7\u63A5\u53E3\u8FD4\u56DE HTTP ${response2.status}`
     );
@@ -41377,7 +41668,7 @@ var AxiosMonitorTransport = class {
         method === "GET" && [408, 425, 429, 500, 502, 503, 504].includes(response2.status)
       );
     }
-    if (!isRecord3(response2.data) || response2.data.success !== true) {
+    if (!isRecord4(response2.data) || response2.data.success !== true) {
       throw new MonitorRemoteError(message, false);
     }
     return redactExactSecret(response2.data, credential.apiKey);
@@ -41408,7 +41699,7 @@ function redactExactSecret(value, secret, depth = 0) {
   if (Array.isArray(value)) {
     return value.map((item) => redactExactSecret(item, secret, depth + 1));
   }
-  if (!isRecord3(value)) return value;
+  if (!isRecord4(value)) return value;
   const output = {};
   for (const [key, child] of Object.entries(value)) {
     if (["authorization", "apiKey", "api_key"].includes(key)) continue;
@@ -41655,9 +41946,9 @@ function sendMonitorError(res, error) {
   });
 }
 function createPresalesMonitorRouter(service = new PresalesMonitorService()) {
-  const router11 = Router6();
+  const router12 = Router6();
   const parser = json2({ limit: "32kb" });
-  router11.post("/", parser, async (req, res) => {
+  router12.post("/", parser, async (req, res) => {
     try {
       const outcome = await service.create(req.body ?? {});
       if (outcome.replayed) res.setHeader("Idempotent-Replayed", "true");
@@ -41671,14 +41962,14 @@ function createPresalesMonitorRouter(service = new PresalesMonitorService()) {
       sendMonitorError(res, error);
     }
   });
-  router11.get("/:runId", async (req, res) => {
+  router12.get("/:runId", async (req, res) => {
     try {
       res.json({ run: await service.get(String(req.params.runId || "")) });
     } catch (error) {
       sendMonitorError(res, error);
     }
   });
-  router11.get("/:runId/result", async (req, res) => {
+  router12.get("/:runId/result", async (req, res) => {
     try {
       const run = await service.result(String(req.params.runId || ""));
       const pending = POLLABLE_LOCAL_STATUSES.has(run.status);
@@ -41687,7 +41978,7 @@ function createPresalesMonitorRouter(service = new PresalesMonitorService()) {
       sendMonitorError(res, error);
     }
   });
-  router11.delete("/:runId", async (req, res) => {
+  router12.delete("/:runId", async (req, res) => {
     try {
       await service.remove(String(req.params.runId || ""));
       res.status(204).end();
@@ -41695,7 +41986,7 @@ function createPresalesMonitorRouter(service = new PresalesMonitorService()) {
       sendMonitorError(res, error);
     }
   });
-  return router11;
+  return router12;
 }
 var presalesMonitorRouter = createPresalesMonitorRouter();
 
@@ -42028,11 +42319,11 @@ function redactUpstreamPayload(value, apiKey, depth = 0) {
   }
   return output;
 }
-function isRecord4(value) {
+function isRecord5(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function isOutputFileRecord(value) {
-  if (!isRecord4(value)) return false;
+  if (!isRecord5(value)) return false;
   const type = String(value.type ?? "").toLowerCase();
   return type === "output_file" || type === "file";
 }
@@ -42052,7 +42343,7 @@ function collectTaskArtifacts(value) {
     urls: /* @__PURE__ */ new Set(),
     truncated: false
   };
-  if (!isRecord4(value) || !Array.isArray(value.output)) return result;
+  if (!isRecord5(value) || !Array.isArray(value.output)) return result;
   const candidates = [];
   const addCandidate = (candidate) => {
     if (candidates.length < MAX_TRUSTED_TASK_ARTIFACTS + 1) {
@@ -42066,7 +42357,7 @@ function collectTaskArtifacts(value) {
       addCandidate(item);
       continue;
     }
-    if (!isRecord4(item)) continue;
+    if (!isRecord5(item)) continue;
     const type = String(item.type ?? "").toLowerCase();
     if (type && type !== "message" && type !== "output_message" || item.role !== "assistant" || !Array.isArray(item.content)) {
       continue;
@@ -44373,8 +44664,8 @@ function createProvisioningRouter(options = {}) {
   const manualOrders = options.manualOrders ?? createManualServiceOrderService({ secret: configuredToken });
   const paymentReceipts = options.paymentReceipts ?? createPaymentReceiptLedgerService();
   const projectOrders = options.projectOrders ?? createProjectOrderRegistryService();
-  const router11 = express3.Router();
-  router11.use((req, res, next) => {
+  const router12 = express3.Router();
+  router12.use((req, res, next) => {
     res.setHeader("Cache-Control", "private, no-store");
     if (!isUsableProvisioningServiceToken(configuredToken)) {
       res.status(503).json({
@@ -44396,7 +44687,7 @@ function createProvisioningRouter(options = {}) {
     }
     next();
   });
-  router11.post(
+  router12.post(
     "/payment-receipts",
     express3.json({ limit: "16kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44411,14 +44702,14 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  router11.get("/payment-receipts/ready", async (_req, res) => {
+  router12.get("/payment-receipts/ready", async (_req, res) => {
     try {
       res.json(await paymentReceipts.ready());
     } catch (error) {
       sendProvisioningError(res, error);
     }
   });
-  router11.get("/payment-receipts/:orderId", async (req, res) => {
+  router12.get("/payment-receipts/:orderId", async (req, res) => {
     try {
       const query = paymentReceiptReadQuerySchema.parse(req.query);
       const request = paymentReceiptReadRequestSchema.parse({
@@ -44430,7 +44721,7 @@ function createProvisioningRouter(options = {}) {
       sendProvisioningError(res, error);
     }
   });
-  router11.put(
+  router12.put(
     "/project-orders/:orderId",
     express3.json({ limit: "16kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44455,7 +44746,7 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  router11.post(
+  router12.post(
     "/project-order-intents/:intentOrderId/commit",
     express3.json({ limit: "16kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44474,14 +44765,14 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  router11.get("/project-orders/ready", async (_req, res) => {
+  router12.get("/project-orders/ready", async (_req, res) => {
     try {
       res.json(await projectOrders.ready());
     } catch (error) {
       sendProvisioningError(res, error);
     }
   });
-  router11.get("/project-orders/projects/:projectId", async (req, res) => {
+  router12.get("/project-orders/projects/:projectId", async (req, res) => {
     try {
       const projectId = projectOrderProjectIdSchema.parse(req.params.projectId);
       res.json(await projectOrders.readProject(projectId));
@@ -44489,7 +44780,7 @@ function createProvisioningRouter(options = {}) {
       sendProvisioningError(res, error);
     }
   });
-  router11.post(
+  router12.post(
     "/users",
     express3.json({ limit: "32kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44507,7 +44798,7 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  router11.post(
+  router12.post(
     "/manual-orders",
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44526,7 +44817,7 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  router11.get("/manual-orders/:reference/status", async (req, res) => {
+  router12.get("/manual-orders/:reference/status", async (req, res) => {
     try {
       const reference = z30.string().trim().min(4).max(128).parse(req.params.reference);
       res.json(
@@ -44539,7 +44830,7 @@ function createProvisioningRouter(options = {}) {
       sendProvisioningError(res, error);
     }
   });
-  router11.post(
+  router12.post(
     "/manual-orders/:reference/payment",
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44559,7 +44850,7 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  router11.post(
+  router12.post(
     "/manual-orders/:reference/account",
     express3.json({ limit: "32kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44579,7 +44870,7 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  router11.post(
+  router12.post(
     "/purchases",
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44596,7 +44887,7 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  router11.get("/purchases/:reference/status", async (req, res) => {
+  router12.get("/purchases/:reference/status", async (req, res) => {
     try {
       const reference = z30.string().trim().min(4).max(128).parse(req.params.reference);
       res.json(
@@ -44609,7 +44900,7 @@ function createProvisioningRouter(options = {}) {
       sendProvisioningError(res, error);
     }
   });
-  router11.post(
+  router12.post(
     "/projects/:projectId/knowledge-imports",
     express3.json({ limit: "64kb", strict: true, type: "application/json" }),
     async (req, res) => {
@@ -44642,7 +44933,7 @@ function createProvisioningRouter(options = {}) {
       }
     }
   );
-  return router11;
+  return router12;
 }
 function sendProvisioningError(res, error) {
   if (error instanceof z30.ZodError) {
@@ -45745,6 +46036,418 @@ router10.put(
 );
 var website_content_template_api_default = router10;
 
+// server/knowledge-base-live-preview-api.ts
+import axios13 from "axios";
+import { Router as Router9 } from "express";
+import { randomUUID as randomUUID27 } from "node:crypto";
+var router11 = Router9();
+var SESSION_TTL_MS = 3 * 60 * 60 * 1e3;
+var TERMINAL_TASK_STATUSES = /* @__PURE__ */ new Set([
+  "completed",
+  "complete",
+  "succeeded",
+  "failed",
+  "error",
+  "cancelled",
+  "canceled",
+  "done",
+  "finished"
+]);
+var KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES = [
+  {
+    id: "1.1",
+    title: "\u4F01\u4E1A\u5B9A\u4F4D",
+    branchId: "identity",
+    branchTitle: "\u4F01\u4E1A\u8EAB\u4EFD"
+  },
+  {
+    id: "2.1",
+    title: "\u6838\u5FC3\u56E2\u961F",
+    branchId: "team",
+    branchTitle: "\u56E2\u961F\u4E0E\u7EC4\u7EC7"
+  },
+  {
+    id: "3.1",
+    title: "\u4EA7\u54C1\u4F53\u7CFB",
+    branchId: "products",
+    branchTitle: "\u4EA7\u54C1\u4E0E\u670D\u52A1"
+  },
+  {
+    id: "4.1",
+    title: "\u6280\u672F\u80FD\u529B",
+    branchId: "capabilities",
+    branchTitle: "\u80FD\u529B\u4F53\u7CFB"
+  },
+  {
+    id: "5.1",
+    title: "\u884C\u4E1A\u573A\u666F",
+    branchId: "industries",
+    branchTitle: "\u884C\u4E1A\u4E0E\u573A\u666F"
+  },
+  {
+    id: "6.1",
+    title: "\u5BA2\u6237\u6848\u4F8B",
+    branchId: "cases",
+    branchTitle: "\u6848\u4F8B\u4E0E\u6210\u679C"
+  },
+  {
+    id: "7.1",
+    title: "\u5DEE\u5F02\u5316\u4F18\u52BF",
+    branchId: "differentiation",
+    branchTitle: "\u54C1\u724C\u5DEE\u5F02\u5316"
+  },
+  {
+    id: "8.1",
+    title: "\u5408\u4F5C\u4E0E\u652F\u6301",
+    branchId: "cooperation",
+    branchTitle: "\u5408\u4F5C\u4E0E\u652F\u6301"
+  }
+];
+var livePreviewSessions = /* @__PURE__ */ new Map();
+function remoteAddress(req) {
+  return String(req.socket.remoteAddress || "").toLowerCase();
+}
+function isLoopbackKnowledgePreviewRequest(req) {
+  const address = remoteAddress(req);
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+function cleanupExpiredSessions() {
+  const expiresBefore = Date.now() - SESSION_TTL_MS;
+  for (const [sessionId, session] of livePreviewSessions) {
+    if (session.createdAt >= expiresBefore) continue;
+    livePreviewSessions.delete(sessionId);
+    if (!session.skillRemoved) {
+      session.skillRemoved = true;
+      void session.removeSkill().catch(() => void 0);
+    }
+  }
+}
+router11.use((req, res, next) => {
+  if (process.env.NODE_ENV !== "development" || !isLoopbackKnowledgePreviewRequest(req)) {
+    res.status(404).json({
+      error: { code: "NOT_FOUND", message: "\u63A5\u53E3\u4E0D\u5B58\u5728" }
+    });
+    return;
+  }
+  cleanupExpiredSessions();
+  next();
+});
+function normalizedTaskStatus(value) {
+  return String(value || "running").trim().toLowerCase();
+}
+function protocolDiagnostic(text2, marker, kind, parser) {
+  const count4 = extractKnowledgeBaseProtocolObjects(text2).filter(
+    (value) => value.kind === kind
+  ).length;
+  if (count4 === 0 && !text2.includes(marker)) return null;
+  try {
+    return { kind, count: count4, valid: true, value: parser(text2) };
+  } catch (error) {
+    return {
+      kind,
+      count: count4,
+      valid: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+function analyzeKnowledgeBaseLiveTask(task, options = {}) {
+  const runMode = options.mode || "full";
+  const taskRecord = task && typeof task === "object" && !Array.isArray(task) ? task : {};
+  const status = normalizedTaskStatus(taskRecord.status);
+  const output = Array.isArray(taskRecord.output) ? taskRecord.output : [];
+  const assistantText = extractFinalKnowledgeBaseAssistantText(output);
+  const protocolObjects = extractKnowledgeBaseProtocolObjects(assistantText);
+  const legacySocraticStateCount = (assistantText.match(/<!--\s*SOCRATIC_KB_STATE\b/gi) || []).length;
+  const protocolKinds = protocolObjects.map(
+    (value) => String(value.kind || "")
+  );
+  const visibleMarkdown = normalizeKnowledgeCollectionCopy(
+    stripKnowledgeBaseReferenceAppendix(
+      stripKnowledgeBaseProtocolPayloads(assistantText)
+    )
+  ).trim();
+  const manifestDiagnostic = protocolDiagnostic(
+    assistantText,
+    "FRONTMIND_KB_MANIFEST",
+    "frontmind.knowledge-base.manifest",
+    parseKnowledgeBaseManifestEnvelope
+  );
+  const progressDiagnostic = protocolDiagnostic(
+    assistantText,
+    "FRONTMIND_KB_PROGRESS",
+    "frontmind.knowledge-base.progress",
+    parseKnowledgeBaseProgressEnvelope
+  );
+  const reopenDiagnostic = protocolDiagnostic(
+    assistantText,
+    "FRONTMIND_KB_REOPEN",
+    "frontmind.knowledge-base.reopen",
+    parseKnowledgeBaseReopenEnvelope
+  );
+  const presentationDiagnostic = protocolDiagnostic(
+    assistantText,
+    "FRONTMIND_KB_PRESENTATION",
+    "frontmind.knowledge-base.presentation",
+    parseKnowledgeBasePresentationEnvelope
+  );
+  const rawDiagnostics = [
+    manifestDiagnostic,
+    progressDiagnostic,
+    reopenDiagnostic,
+    presentationDiagnostic
+  ].filter(Boolean);
+  const manifestTurn = Boolean(manifestDiagnostic);
+  const diagnostics = rawDiagnostics.map((diagnostic) => ({
+    ...diagnostic,
+    authoritative: !manifestTurn || diagnostic.kind === "frontmind.knowledge-base.manifest"
+  }));
+  const manifest = manifestDiagnostic?.valid && manifestDiagnostic.value && typeof manifestDiagnostic.value === "object" ? manifestDiagnostic.value : null;
+  const branchCounts = manifest ? Object.entries(
+    manifest.leaves.reduce((counts, leaf) => {
+      const branch = leaf.branchTitle || leaf.branchId || "\u672A\u5206\u7EC4";
+      counts[branch] = (counts[branch] || 0) + 1;
+      return counts;
+    }, {})
+  ).map(([title, leafCount]) => ({ title, leafCount })) : [];
+  const issues = [];
+  const terminal = TERMINAL_TASK_STATUSES.has(status);
+  if (terminal && !assistantText) {
+    issues.push("\u4EFB\u52A1\u5DF2\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u627E\u5230\u5E26 assistant \u89D2\u8272\u7684\u53EF\u89E3\u6790\u6587\u672C\u8F93\u51FA");
+  }
+  if (terminal && !manifestDiagnostic) {
+    issues.push("\u4EFB\u52A1\u5DF2\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u627E\u5230\u77E5\u8BC6\u6811 manifest");
+  }
+  if (legacySocraticStateCount > 0) {
+    issues.push("\u8FD4\u56DE\u4E86\u5DF2\u7981\u7528\u7684\u65E7 SOCRATIC_KB_STATE \u72B6\u6001\u5BF9\u8C61");
+  }
+  for (const diagnostic of diagnostics) {
+    if (diagnostic.authoritative && !diagnostic.valid) {
+      issues.push(`${diagnostic.kind}\uFF1A${diagnostic.error}`);
+    }
+  }
+  if (visibleMarkdown.includes("FRONTMIND_KB_") || visibleMarkdown.includes("SOCRATIC_KB_STATE") || visibleMarkdown.includes("frontmind.knowledge-base.") || visibleMarkdown.includes("frontmind.workflow-state")) {
+    issues.push("\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4ECD\u5305\u542B\u673A\u5668\u534F\u8BAE");
+  }
+  if (runMode === "protocol_probe" && manifest) {
+    const actualLeaves = manifest.leaves.map((leaf) => ({
+      id: leaf.id,
+      title: leaf.title,
+      branchId: leaf.branchId,
+      branchTitle: leaf.branchTitle
+    }));
+    if (JSON.stringify(actualLeaves) !== JSON.stringify(KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES)) {
+      issues.push("\u534F\u8BAE\u63A2\u9488 manifest \u4E0E\u9884\u671F\u7684 8 \u4E2A\u53F6\u5B50\u4E0D\u5B8C\u5168\u4E00\u81F4");
+    }
+  }
+  return {
+    runMode,
+    taskId: String(taskRecord.id || taskRecord.task_id || ""),
+    status,
+    terminal,
+    outputCount: output.length,
+    assistantCharacterCount: assistantText.length,
+    visibleCharacterCount: visibleMarkdown.length,
+    visibleMarkdown,
+    rawAssistantText: assistantText,
+    protocolKinds,
+    legacySocraticStateCount,
+    protocolObjects,
+    diagnostics,
+    manifest: manifest ? {
+      leafCount: manifest.leaves.length,
+      branchCount: branchCounts.length,
+      branchCounts,
+      firstLeaf: manifest.leaves[0] || null,
+      lastLeaf: manifest.leaves[manifest.leaves.length - 1] || null,
+      leaves: manifest.leaves
+    } : null,
+    issues
+  };
+}
+function resolveLivePreviewApiKey(value) {
+  const supplied = typeof value === "string" ? value.trim() : "";
+  return supplied || process.env.FRONTMIND_LIVE_TEST_API_KEY?.trim() || "";
+}
+function buildKnowledgeBaseProtocolProbePrompt() {
+  const sourceRows = KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES.map(
+    (leaf) => `${leaf.id}|${leaf.title}|${leaf.branchId}|${leaf.branchTitle}`
+  ).join("\n");
+  return [
+    "FRONTMIND_KB_PROTOCOL_PROBE_V1",
+    "\u4E25\u683C\u6267\u884C\u968F\u4EFB\u52A1\u9644\u5E26\u7684 socratic-kb-builder v3 Skill \u4E2D\u7684\u534F\u8BAE\u81EA\u68C0\u6A21\u5F0F\u3002",
+    "\u8FD9\u662F\u672C\u673A\u5F00\u53D1\u73AF\u5883\u7684\u673A\u5668\u534F\u8BAE\u5951\u7EA6\u63A2\u9488\uFF0C\u4E0D\u662F\u4F01\u4E1A\u77E5\u8BC6\u5E93\u6784\u5EFA\u4EFB\u52A1\u3002",
+    "\u7981\u6B62\u8054\u7F51\u3001\u641C\u7D22\u3001\u6D4F\u89C8\u3001\u8C03\u7528\u5DE5\u5177\u3001\u8BFB\u53D6\u4F01\u4E1A\u8D44\u6599\u3001\u751F\u6210\u6587\u4EF6\u6216\u5F00\u5C55\u7814\u7A76\u3002",
+    "\u628A\u4E0B\u9762 8 \u884C\u6D4B\u8BD5\u6570\u636E\u6309\u539F\u987A\u5E8F\u8F6C\u6362\u4E3A\u5B8C\u6574 leaves\uFF1B\u6BCF\u884C\u5B57\u6BB5\u4F9D\u6B21\u4E3A id\u3001title\u3001branchId\u3001branchTitle\uFF1A",
+    sourceRows,
+    "",
+    "\u56DE\u590D\u53EA\u80FD\u5305\u542B\u4E00\u884C\u53EF\u89C1\u6587\u5B57\u201C\u534F\u8BAE\u63A2\u9488\u54CD\u5E94\u201D\uFF0C\u968F\u540E\u7D27\u63A5\u4E14\u53EA\u63A5\u4E00\u4E2A\u5B8C\u6574\u7684 FRONTMIND_KB_MANIFEST \u6CE8\u91CA\u4FE1\u5C01\u3002",
+    "\u4FE1\u5C01\u5185\u5FC5\u987B\u662F\u4E25\u683C JSON\uFF1Akind \u4E3A frontmind.knowledge-base.manifest\uFF0CschemaVersion \u4E3A 1\uFF0Cleaves \u4E0E\u4EE5\u4E0A 8 \u884C\u9010\u5B57\u6BB5\u5B8C\u5168\u4E00\u81F4\u3002",
+    "\u7981\u6B62\u8F93\u51FA\u88F8 JSON\u3001\u4EE3\u7801\u56F4\u680F\u3001FRONTMIND_KB_PROGRESS\u3001FRONTMIND_KB_PRESENTATION\u3001SOCRATIC_KB_STATE\u3001workflow-state\u3001knowledge-base.message \u6216\u4EFB\u4F55\u89E3\u91CA\u3002"
+  ].join("\n");
+}
+router11.get("/configuration", (_req, res) => {
+  res.json({
+    serverCredentialConfigured: Boolean(
+      process.env.FRONTMIND_LIVE_TEST_API_KEY?.trim()
+    ),
+    upstreamBaseUrl: getUpstreamBaseUrl()
+  });
+});
+router11.post("/start", async (req, res) => {
+  const mode = req.body?.mode === "protocol_probe" ? "protocol_probe" : "full";
+  const companyName = typeof req.body?.companyName === "string" ? req.body.companyName.normalize("NFKC").trim() : "";
+  const companyWebsite = typeof req.body?.companyWebsite === "string" ? req.body.companyWebsite.trim() : "";
+  const apiKey = resolveLivePreviewApiKey(req.body?.apiKey);
+  if (!companyName || companyName.length > 255) {
+    res.status(400).json({
+      error: { code: "INVALID_COMPANY_NAME", message: "\u8BF7\u8F93\u5165\u6709\u6548\u4F01\u4E1A\u540D\u79F0" }
+    });
+    return;
+  }
+  if (!apiKey) {
+    res.status(503).json({
+      error: {
+        code: "LIVE_API_KEY_REQUIRED",
+        message: "\u672C\u5730\u670D\u52A1\u672A\u914D\u7F6E FRONTMIND_LIVE_TEST_API_KEY\uFF1B\u53EF\u5728\u9875\u9762\u4E2D\u63D0\u4EA4\u4E00\u6B21\u6027 API Key"
+      }
+    });
+    return;
+  }
+  const baseUrl = getUpstreamBaseUrl();
+  let skill;
+  try {
+    const descriptor = await getKnowledgeBaseSkillDescriptor();
+    const prompt = mode === "protocol_probe" ? buildKnowledgeBaseProtocolProbePrompt() : await buildKnowledgeBasePrompt({
+      conversationId: `live-preview-${Date.now()}`,
+      companyName,
+      companyWebsite,
+      operatorNotes: "\u672C\u5730\u771F\u5B9E API \u4E0E\u6E32\u67D3\u56DE\u5F52\u3002\u4E25\u683C\u8F93\u51FA\u5B8C\u6574\u5BA2\u6237\u6B63\u6587\u53CA\u89C4\u5B9A\u7684\u673A\u5668\u4FE1\u5C01\u3002",
+      attachments: [],
+      prefillKnowledgeSnapshot: null
+    });
+    skill = await uploadKnowledgeBaseSkillArchive({
+      baseUrl,
+      apiKey,
+      skillVersion: descriptor.version,
+      skillContentHash: descriptor.contentHash
+    });
+    const created = await createFrontMindTask({
+      baseUrl,
+      apiKey,
+      prompt,
+      attachments: [skill.attachment]
+    });
+    if (!created.ok) {
+      await skill.removeOrphan().catch(() => void 0);
+      res.status(created.status).json({
+        error: {
+          code: "UPSTREAM_TASK_CREATE_FAILED",
+          message: created.detail
+        }
+      });
+      return;
+    }
+    const sessionId = randomUUID27();
+    const analysis = analyzeKnowledgeBaseLiveTask(created.task, { mode });
+    const terminal = analysis.terminal;
+    if (terminal) {
+      await skill.removeOrphan().catch(() => void 0);
+    }
+    livePreviewSessions.set(sessionId, {
+      taskId: created.task.id,
+      apiKey: terminal ? null : apiKey,
+      mode,
+      createdAt: Date.now(),
+      removeSkill: skill.removeOrphan,
+      skillRemoved: terminal,
+      finalAnalysis: terminal ? analysis : null
+    });
+    res.status(201).json({
+      sessionId,
+      analysis
+    });
+  } catch (error) {
+    if (skill) await skill.removeOrphan().catch(() => void 0);
+    res.status(502).json({
+      error: {
+        code: "LIVE_PREVIEW_START_FAILED",
+        message: error instanceof Error ? error.message : String(error)
+      }
+    });
+  }
+});
+router11.get("/:sessionId", async (req, res) => {
+  const session = livePreviewSessions.get(req.params.sessionId);
+  if (!session) {
+    res.status(404).json({
+      error: {
+        code: "LIVE_PREVIEW_SESSION_NOT_FOUND",
+        message: "\u672C\u5730\u9A8C\u6536\u4F1A\u8BDD\u4E0D\u5B58\u5728\u6216\u5DF2\u7ECF\u8FC7\u671F"
+      }
+    });
+    return;
+  }
+  if (session.finalAnalysis) {
+    res.json({
+      sessionId: req.params.sessionId,
+      analysis: session.finalAnalysis
+    });
+    return;
+  }
+  if (!session.apiKey) {
+    res.status(410).json({
+      error: {
+        code: "LIVE_PREVIEW_CREDENTIAL_RELEASED",
+        message: "\u672C\u5730\u9A8C\u6536\u4F1A\u8BDD\u5DF2\u7ECF\u7ED3\u675F"
+      }
+    });
+    return;
+  }
+  try {
+    const response2 = await axios13.get(
+      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(session.taskId)}`,
+      {
+        headers: {
+          API_KEY: session.apiKey,
+          Authorization: `Bearer ${session.apiKey}`
+        },
+        timeout: 12e4,
+        validateStatus: () => true
+      }
+    );
+    if (response2.status < 200 || response2.status >= 300) {
+      res.status(response2.status).json({
+        error: {
+          code: "UPSTREAM_TASK_READ_FAILED",
+          message: `\u8BFB\u53D6\u771F\u5B9E\u4EFB\u52A1\u5931\u8D25\uFF08${response2.status}\uFF09`
+        }
+      });
+      return;
+    }
+    const analysis = analyzeKnowledgeBaseLiveTask(response2.data, {
+      mode: session.mode
+    });
+    if (analysis.terminal) {
+      session.finalAnalysis = analysis;
+      session.apiKey = null;
+      if (!session.skillRemoved) {
+        session.skillRemoved = true;
+        void session.removeSkill().catch(() => void 0);
+      }
+    }
+    res.json({ sessionId: req.params.sessionId, analysis });
+  } catch (error) {
+    res.status(502).json({
+      error: {
+        code: "LIVE_PREVIEW_POLL_FAILED",
+        message: error instanceof Error ? error.message : String(error)
+      }
+    });
+  }
+});
+var knowledge_base_live_preview_api_default = router11;
+
 // server/_core/index.ts
 var paymentReceiptLedgerReadiness = createPaymentReceiptLedgerService();
 var projectOrderRegistryReadiness = createProjectOrderRegistryService();
@@ -45807,6 +46510,9 @@ async function startServer() {
   app.use("/api/internal/provisioning", provisioning_router_default);
   app.use(express5.json({ limit: "50mb" }));
   app.use(express5.urlencoded({ limit: "50mb", extended: true }));
+  if (process.env.NODE_ENV === "development") {
+    app.use("/api/dev/knowledge-base-live", knowledge_base_live_preview_api_default);
+  }
   app.get("/healthz", async (_req, res) => {
     try {
       assertUpstreamBaseUrlConfigured();
