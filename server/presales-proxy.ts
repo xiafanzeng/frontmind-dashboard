@@ -80,12 +80,20 @@ const attachmentSchema = z.object({
   filename: z.string().trim().min(1).max(512),
 });
 
+const presalesAgentProfileSchema = z.enum([
+  "frontmind-base",
+  "frontmind-pro",
+]);
+
 const taskCreateSchema = z
   .object({
     prompt: z.string().trim().min(1).max(2_000_000),
     attachments: z.array(attachmentSchema).max(20).optional().default([]),
     idempotencyKey: z.string().trim().min(16).max(512).optional(),
     projectId: z.string().trim().min(8).max(80).optional(),
+    agentProfile: presalesAgentProfileSchema
+      .optional()
+      .default("frontmind-base"),
   })
   .superRefine((value, context) => {
     if (value.projectId && !value.idempotencyKey) {
@@ -100,11 +108,16 @@ const taskCreateSchema = z
 export function buildPresalesTaskBody(input: {
   prompt: string;
   attachments?: Array<{ file_id: string; filename: string }>;
+  agentProfile?: z.infer<typeof presalesAgentProfileSchema>;
 }) {
+  const agentProfile =
+    input.agentProfile === "frontmind-pro"
+      ? "frontmind-pro"
+      : "frontmind-base";
   return {
     prompt: input.prompt,
     attachments: input.attachments ?? [],
-    agentProfile: toUpstreamAgentProfile("frontmind-base"),
+    agentProfile: toUpstreamAgentProfile(agentProfile),
     taskMode: "agent" as const,
   };
 }

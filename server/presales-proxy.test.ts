@@ -170,7 +170,7 @@ describe("presales upload capability", () => {
 });
 
 describe("presales upstream contract", () => {
-  it("hard-codes Base agent mode regardless of browser-controlled fields", () => {
+  it("defaults website tasks to Base agent mode", () => {
     const body = buildPresalesTaskBody({
       prompt: "build the knowledge base",
       attachments: [{ file_id: "file-1", filename: "brief.pdf" }],
@@ -185,6 +185,20 @@ describe("presales upstream contract", () => {
     expect(JSON.stringify(body)).not.toContain("max");
     expect(JSON.stringify(body)).not.toContain("lite");
     expect(JSON.stringify(body)).not.toContain("idempotency");
+  });
+
+  it("forwards the trusted website Pro profile for question generation", () => {
+    const body = buildPresalesTaskBody({
+      prompt: "generate the question recommendation",
+      attachments: [{ file_id: "file-2", filename: "knowledge-base.zip" }],
+      agentProfile: "frontmind-pro",
+    });
+    expect(body).toEqual({
+      prompt: "generate the question recommendation",
+      attachments: [{ file_id: "file-2", filename: "knowledge-base.zip" }],
+      agentProfile: "manus-1.6-max",
+      taskMode: "agent",
+    });
   });
 
   it("returns JSON for successful raw uploads, including upstream 204", () => {

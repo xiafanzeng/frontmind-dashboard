@@ -633,7 +633,7 @@ describe("presales idempotent task route", () => {
     }
   });
 
-  it("calls upstream once with the hash and completes the reservation", async () => {
+  it("calls upstream once with the hash and trusted Pro profile", async () => {
     const keyHash = "a".repeat(64);
     vi.mocked(acquirePresalesTaskReservation).mockResolvedValue({
       state: "acquired",
@@ -668,7 +668,7 @@ describe("presales idempotent task route", () => {
     expect(createMock).toHaveBeenCalledOnce();
     expect(createMock.mock.calls[0][1]).toMatchObject({
       prompt: "build knowledge base",
-      agentProfile: "manus-1.6",
+      agentProfile: "manus-1.6-max",
       taskMode: "agent",
     });
     expect(JSON.stringify(createMock.mock.calls[0][1])).not.toContain(
