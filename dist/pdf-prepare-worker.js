@@ -6172,6 +6172,13 @@ var PUBLIC_TASK_OUTPUT_SCALAR_KEYS = [
   "mime_type",
   "mimeType"
 ];
+var PUBLIC_ASSISTANT_TEXT_OUTPUT_TYPES = /* @__PURE__ */ new Set([
+  "",
+  "message",
+  "output_message",
+  "output_text",
+  "text"
+]);
 var PUBLIC_TASK_CONTENT_SCALAR_KEYS = [
   "type",
   "text",
@@ -6257,7 +6264,7 @@ function publicTaskAnnotations(value) {
   const annotations = value.map((item) => pickPublicScalars(item, PUBLIC_TASK_ANNOTATION_SCALAR_KEYS)).filter((item) => Object.keys(item).length > 0);
   return annotations.length > 0 ? annotations : void 0;
 }
-function publicTaskContent(value) {
+function publicTaskContent(value, options = {}) {
   if (!Array.isArray(value)) return [];
   const content = [];
   for (const item of value) {
@@ -6269,6 +6276,14 @@ function publicTaskContent(value) {
       source,
       PUBLIC_TASK_CONTENT_SCALAR_KEYS
     );
+    if (options.normalizeAssistantText && ["", "message", "output_message", "output_text", "text"].includes(type) && typeof sanitized.text !== "string") {
+      const textCandidate = source.text ?? source.output_text ?? source.value;
+      if (typeof textCandidate === "string") {
+        sanitized.text = textCandidate;
+      } else if (textCandidate && typeof textCandidate === "object" && !Array.isArray(textCandidate) && typeof textCandidate.value === "string") {
+        sanitized.text = textCandidate.value;
+      }
+    }
     const annotations = publicTaskAnnotations(source.annotations);
     if (annotations) sanitized.annotations = annotations;
     if (Object.keys(sanitized).length > 0) content.push(sanitized);
@@ -6291,8 +6306,22 @@ function publicTaskOutput(value) {
       PUBLIC_TASK_OUTPUT_SCALAR_KEYS
     );
     if (role === "assistant") sanitized.role = "assistant";
-    const content = publicTaskContent(source.content);
-    if (content.length > 0) sanitized.content = content;
+    const isPublicAssistantTextOutput = role === "assistant" && PUBLIC_ASSISTANT_TEXT_OUTPUT_TYPES.has(type);
+    if (isPublicAssistantTextOutput && typeof source.output_text === "string") {
+      sanitized.output_text = source.output_text;
+    } else if (isPublicAssistantTextOutput && source.output_text && typeof source.output_text === "object" && !Array.isArray(source.output_text) && typeof source.output_text.value === "string") {
+      sanitized.output_text = {
+        value: source.output_text.value
+      };
+    }
+    if (isPublicAssistantTextOutput && typeof source.content === "string") {
+      sanitized.content = source.content;
+    } else {
+      const content = publicTaskContent(source.content, {
+        normalizeAssistantText: isPublicAssistantTextOutput
+      });
+      if (content.length > 0) sanitized.content = content;
+    }
     if (Array.isArray(source.summary)) {
       const summary = source.summary.map((entry) => pickPublicScalars(entry, ["type", "text"])).filter((entry) => Object.keys(entry).length > 0);
       if (summary.length > 0) sanitized.summary = summary;

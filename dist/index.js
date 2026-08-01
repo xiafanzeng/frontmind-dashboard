@@ -29103,6 +29103,13 @@ var PUBLIC_TASK_OUTPUT_SCALAR_KEYS = [
   "mime_type",
   "mimeType"
 ];
+var PUBLIC_ASSISTANT_TEXT_OUTPUT_TYPES = /* @__PURE__ */ new Set([
+  "",
+  "message",
+  "output_message",
+  "output_text",
+  "text"
+]);
 var PUBLIC_TASK_CONTENT_SCALAR_KEYS = [
   "type",
   "text",
@@ -29188,7 +29195,7 @@ function publicTaskAnnotations(value) {
   const annotations = value.map((item) => pickPublicScalars(item, PUBLIC_TASK_ANNOTATION_SCALAR_KEYS)).filter((item) => Object.keys(item).length > 0);
   return annotations.length > 0 ? annotations : void 0;
 }
-function publicTaskContent(value) {
+function publicTaskContent(value, options = {}) {
   if (!Array.isArray(value)) return [];
   const content = [];
   for (const item of value) {
@@ -29200,6 +29207,14 @@ function publicTaskContent(value) {
       source,
       PUBLIC_TASK_CONTENT_SCALAR_KEYS
     );
+    if (options.normalizeAssistantText && ["", "message", "output_message", "output_text", "text"].includes(type) && typeof sanitized.text !== "string") {
+      const textCandidate = source.text ?? source.output_text ?? source.value;
+      if (typeof textCandidate === "string") {
+        sanitized.text = textCandidate;
+      } else if (textCandidate && typeof textCandidate === "object" && !Array.isArray(textCandidate) && typeof textCandidate.value === "string") {
+        sanitized.text = textCandidate.value;
+      }
+    }
     const annotations = publicTaskAnnotations(source.annotations);
     if (annotations) sanitized.annotations = annotations;
     if (Object.keys(sanitized).length > 0) content.push(sanitized);
@@ -29222,8 +29237,22 @@ function publicTaskOutput(value) {
       PUBLIC_TASK_OUTPUT_SCALAR_KEYS
     );
     if (role === "assistant") sanitized.role = "assistant";
-    const content = publicTaskContent(source.content);
-    if (content.length > 0) sanitized.content = content;
+    const isPublicAssistantTextOutput = role === "assistant" && PUBLIC_ASSISTANT_TEXT_OUTPUT_TYPES.has(type);
+    if (isPublicAssistantTextOutput && typeof source.output_text === "string") {
+      sanitized.output_text = source.output_text;
+    } else if (isPublicAssistantTextOutput && source.output_text && typeof source.output_text === "object" && !Array.isArray(source.output_text) && typeof source.output_text.value === "string") {
+      sanitized.output_text = {
+        value: source.output_text.value
+      };
+    }
+    if (isPublicAssistantTextOutput && typeof source.content === "string") {
+      sanitized.content = source.content;
+    } else {
+      const content = publicTaskContent(source.content, {
+        normalizeAssistantText: isPublicAssistantTextOutput
+      });
+      if (content.length > 0) sanitized.content = content;
+    }
     if (Array.isArray(source.summary)) {
       const summary = source.summary.map((entry) => pickPublicScalars(entry, ["type", "text"])).filter((entry) => Object.keys(entry).length > 0);
       if (summary.length > 0) sanitized.summary = summary;
@@ -31253,6 +31282,18 @@ function upstreamTaskFailed(status) {
 function upstreamTaskTerminal(status) {
   return upstreamTaskFailed(status) || normalizedUpstreamTaskStatus(status) === "completed";
 }
+function shouldReplayStableKnowledgeOutput(status) {
+  if (upstreamTaskTerminal(status)) return true;
+  return (/* @__PURE__ */ new Set([
+    "awaiting_input",
+    "awaiting_user",
+    "awaiting_user_input",
+    "waiting",
+    "paused",
+    "requires_action",
+    "input_required"
+  ])).has(normalizedUpstreamTaskStatus(status));
+}
 function shouldReconcileKnowledgeOutput(output, status, options = {}) {
   const text2 = extractFinalKnowledgeBaseAssistantText(output);
   if (!text2) return false;
@@ -31328,7 +31369,11 @@ async function reconcileAvailableKnowledgeOutput(input) {
   const unreconciled = selectUnreconciledKnowledgeOutput(
     input.output,
     input.ledger,
-    { replayStableOutput: upstreamTaskTerminal(input.upstreamStatus) }
+    {
+      replayStableOutput: shouldReplayStableKnowledgeOutput(
+        input.upstreamStatus
+      )
+    }
   );
   if (shouldReconcileKnowledgeOutput(unreconciled, input.upstreamStatus, {
     requirePresentation: progress?.build.skillVersion === "3"
@@ -47069,8 +47114,8 @@ function analyzeKnowledgeBaseLiveTask(task, options = {}) {
       issues.push("\u534F\u8BAE\u63A2\u9488 manifest \u4E0E\u9884\u671F\u7684 8 \u4E2A\u53F6\u5B50\u4E0D\u5B8C\u5168\u4E00\u81F4");
     }
   }
-  if (terminal && runMode === "full" && manifest && imageCount !== 3) {
-    issues.push(`\u9996\u8F6E\u5FC5\u987B\u8FD4\u56DE\u6070\u597D 3 \u5F20\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`);
+  if (terminal && runMode === "full" && manifest && imageCount !== 1) {
+    issues.push(`\u9996\u8F6E\u5FC5\u987B\u53EA\u8FD4\u56DE\u4E00\u5F20\u4F01\u4E1A\u5B98\u65B9\u4E3B Logo\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`);
   }
   if (terminal && runMode === "protocol_probe" && imageCount !== 0) {
     issues.push(`\u534F\u8BAE\u63A2\u9488\u7981\u6B62\u8FD4\u56DE\u56FE\u7247\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`);
