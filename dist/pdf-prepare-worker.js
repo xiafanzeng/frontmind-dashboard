@@ -93,7 +93,8 @@ import {
   inArray,
   isNotNull,
   isNull,
-  ne
+  ne,
+  or
 } from "drizzle-orm";
 
 // shared/const.ts
@@ -107,6 +108,7 @@ function isExplicitAdminAccessLevel(value) {
 // drizzle/schema.ts
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   check,
   foreignKey,
@@ -312,6 +314,11 @@ var apiUsageSnapshots = mysqlTable(
       "unconfigured"
     ]).default("pending").notNull(),
     errorCode: varchar("errorCode", { length: 64 }),
+    /** Monotonic cross-process claim for one policy refresh. */
+    syncGeneration: int("syncGeneration", { unsigned: true }).default(0).notNull(),
+    /** Only the holder of the latest token may finalize a refresh. */
+    syncToken: varchar("syncToken", { length: 36 }),
+    syncStartedAt: timestamp("syncStartedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
   },
@@ -320,6 +327,95 @@ var apiUsageSnapshots = mysqlTable(
     index("api_usage_snapshots_status_fetched_idx").on(
       table.syncStatus,
       table.fetchedAt
+    ),
+    index("api_usage_snapshots_sync_claim_idx").on(
+      table.syncToken,
+      table.syncStartedAt
+    )
+  ]
+);
+var apiUsageTaskLedger = mysqlTable(
+  "api_usage_task_ledger",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    scope: mysqlEnum("scope", ["managed_user", "website_frontend"]).notNull(),
+    upstreamTaskId: varchar("upstreamTaskId", { length: 255 }).notNull(),
+    credentialFingerprint: varchar("credentialFingerprint", {
+      length: 32
+    }).notNull(),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }),
+    accountUserId: int("accountUserId").references(() => users.id, {
+      onDelete: "set null"
+    }),
+    isFirstParty: boolean("isFirstParty").default(false).notNull(),
+    taskCreatedAtMs: bigint("taskCreatedAtMs", {
+      mode: "number",
+      unsigned: true
+    }).notNull(),
+    creditUsage: bigint("creditUsage", { mode: "number", unsigned: true }).default(0).notNull(),
+    isTerminal: boolean("isTerminal").default(false).notNull(),
+    observedAt: timestamp("observedAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("api_usage_task_ledger_scope_task_uq").on(
+      table.scope,
+      table.upstreamTaskId
+    ),
+    index("api_usage_task_ledger_account_time_idx").on(
+      table.accountUserId,
+      table.taskCreatedAtMs
+    ),
+    index("api_usage_task_ledger_pool_time_idx").on(
+      table.scope,
+      table.credentialFingerprint,
+      table.taskCreatedAtMs
+    )
+  ]
+);
+var apiUsageCredentialCoverage = mysqlTable(
+  "api_usage_credential_coverage",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    scope: mysqlEnum("scope", ["managed_user", "website_frontend"]).notNull(),
+    credentialFingerprint: varchar("credentialFingerprint", {
+      length: 32
+    }).notNull(),
+    coveredFromMs: bigint("coveredFromMs", {
+      mode: "number",
+      unsigned: true
+    }).notNull(),
+    fullScanAtMs: bigint("fullScanAtMs", {
+      mode: "number",
+      unsigned: true
+    }).notNull(),
+    credentialRetiredAtMs: bigint("credentialRetiredAtMs", {
+      mode: "number",
+      unsigned: true
+    }),
+    allTasksSettled: boolean("allTasksSettled").default(false).notNull(),
+    scanGeneration: int("scanGeneration", { unsigned: true }).default(0).notNull(),
+    scanToken: varchar("scanToken", { length: 36 }),
+    scanStartedAtMs: bigint("scanStartedAtMs", {
+      mode: "number",
+      unsigned: true
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("api_usage_credential_coverage_scope_fp_uq").on(
+      table.scope,
+      table.credentialFingerprint
+    ),
+    index("api_usage_credential_coverage_scan_idx").on(
+      table.scope,
+      table.fullScanAtMs
+    ),
+    index("api_usage_credential_coverage_claim_idx").on(
+      table.scanToken,
+      table.scanStartedAtMs
     )
   ]
 );
@@ -1886,6 +1982,23 @@ var knowledgeBaseBuilds = mysqlTable(
       "protocol_error",
       "failed"
     ]).default("researching").notNull(),
+    /**
+     * Monotonic build identity. Resetting/restarting a build increments the
+     * generation so a delayed task from an older run can be ignored safely.
+     */
+    generation: int("generation", { unsigned: true }).default(1).notNull(),
+    /** Monotonic version for atomic server-approved UI observations. */
+    stateEpoch: int("stateEpoch", { unsigned: true }).default(0).notNull(),
+    activeTurnId: varchar("activeTurnId", { length: 36 }),
+    /** Cross-process claim for legacy/open builds which have no active turn. */
+    recoveryLeaseOwnerHash: varchar("recoveryLeaseOwnerHash", { length: 64 }),
+    recoveryLeaseExpiresAt: timestamp("recoveryLeaseExpiresAt"),
+    lastAppliedOperationKey: varchar("lastAppliedOperationKey", {
+      length: 128
+    }),
+    currentPresentationKey: varchar("currentPresentationKey", {
+      length: 191
+    }),
     revision: int("revision").default(0).notNull(),
     currentLeafId: varchar("currentLeafId", { length: 191 }),
     totalNodeCount: int("totalNodeCount").default(0).notNull(),
@@ -1904,6 +2017,17 @@ var knowledgeBaseBuilds = mysqlTable(
     packageFileId: varchar("packageFileId", { length: 255 }),
     packageFilename: varchar("packageFilename", { length: 512 }),
     packageDescriptorHash: varchar("packageDescriptorHash", { length: 64 }),
+    /** Immutable, Dashboard-owned copy of the first-node official logo. */
+    logoStorageKey: varchar("logoStorageKey", { length: 1024 }),
+    logoSha256: varchar("logoSha256", { length: 64 }),
+    logoBytes: int("logoBytes", { unsigned: true }),
+    logoFilename: varchar("logoFilename", { length: 512 }),
+    logoMimeType: varchar("logoMimeType", { length: 255 }),
+    /** Immutable, Dashboard-owned copy of the validated final archive. */
+    packageStorageKey: varchar("packageStorageKey", { length: 1024 }),
+    packageArchiveSha256: varchar("packageArchiveSha256", { length: 64 }),
+    packageSizeBytes: int("packageSizeBytes", { unsigned: true }),
+    protocolErrorCode: varchar("protocolErrorCode", { length: 128 }),
     protocolError: text("protocolError"),
     publishedSnapshotId: varchar("publishedSnapshotId", {
       length: 36
@@ -1922,7 +2046,12 @@ var knowledgeBaseBuilds = mysqlTable(
       table.userId,
       table.status
     ),
-    index("knowledge_base_builds_task_idx").on(table.upstreamTaskId)
+    index("knowledge_base_builds_task_idx").on(table.upstreamTaskId),
+    index("knowledge_base_builds_active_turn_idx").on(table.activeTurnId),
+    index("knowledge_base_builds_recovery_lease_idx").on(
+      table.status,
+      table.recoveryLeaseExpiresAt
+    )
   ]
 );
 var knowledgeBaseBuildNodes = mysqlTable(
@@ -1948,6 +2077,9 @@ var knowledgeBaseBuildNodes = mysqlTable(
     sourceUrls: json("sourceUrls").$type().default([]).notNull(),
     imageUrls: json("imageUrls").$type().default([]).notNull(),
     lastTaskId: varchar("lastTaskId", { length: 255 }),
+    sourceTurnId: varchar("sourceTurnId", { length: 36 }),
+    presentationKey: varchar("presentationKey", { length: 191 }),
+    contentSha256: varchar("contentSha256", { length: 64 }),
     lastResponseAt: timestamp("lastResponseAt"),
     confirmedAt: timestamp("confirmedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -1965,7 +2097,8 @@ var knowledgeBaseBuildNodes = mysqlTable(
     index("knowledge_base_build_nodes_status_idx").on(
       table.buildId,
       table.status
-    )
+    ),
+    index("knowledge_base_build_nodes_source_turn_idx").on(table.sourceTurnId)
   ]
 );
 var knowledgeBaseResetRequests = mysqlTable(
@@ -2180,6 +2313,26 @@ var conversationTurns = mysqlTable(
       { onDelete: "set null" }
     ),
     clientRequestId: varchar("clientRequestId", { length: 128 }).notNull(),
+    buildId: varchar("buildId", { length: 36 }).references(
+      () => knowledgeBaseBuilds.id,
+      { onDelete: "set null" }
+    ),
+    buildGeneration: int("buildGeneration", { unsigned: true }),
+    /**
+     * Stable logical-operation identity. It is nullable for legacy turns and
+     * globally unique for newly reserved knowledge-base turns.
+     */
+    operationKey: varchar("operationKey", { length: 128 }),
+    operationType: varchar("operationType", { length: 32 }),
+    expectedRevision: int("expectedRevision"),
+    expectedLeafId: varchar("expectedLeafId", { length: 191 }),
+    requestHash: varchar("requestHash", { length: 64 }),
+    upstreamIdempotencyKeyHash: varchar("upstreamIdempotencyKeyHash", {
+      length: 64
+    }),
+    attachmentFileIds: json("attachmentFileIds").$type().default([]).notNull(),
+    metadata: json("metadata").$type().default({}).notNull(),
+    leaseExpiresAt: timestamp("leaseExpiresAt"),
     model: varchar("model", { length: 128 }),
     status: mysqlEnum("status", [
       "queued",
@@ -2201,8 +2354,17 @@ var conversationTurns = mysqlTable(
       table.conversationId,
       table.clientRequestId
     ),
+    uniqueIndex("conversation_turns_operation_key_uq").on(table.operationKey),
     index("conversation_turns_user_status_idx").on(table.userId, table.status),
-    index("conversation_turns_upstream_task_idx").on(table.upstreamTaskId)
+    index("conversation_turns_upstream_task_idx").on(table.upstreamTaskId),
+    index("conversation_turns_build_generation_idx").on(
+      table.buildId,
+      table.buildGeneration
+    ),
+    index("conversation_turns_lease_idx").on(
+      table.status,
+      table.leaseExpiresAt
+    )
   ]
 );
 var messages = mysqlTable(
@@ -2606,7 +2768,7 @@ async function recordUpstreamResource(input) {
 }
 
 // server/dashboard-service.ts
-import { and as and5, desc as desc5, eq as eq6, inArray as inArray4, lt as lt2 } from "drizzle-orm";
+import { and as and6, desc as desc5, eq as eq7, gte as gte4, inArray as inArray5, lt as lt3, or as or3 } from "drizzle-orm";
 
 // shared/dashboard.ts
 import { z as z3 } from "zod";
@@ -4145,7 +4307,7 @@ var MAX_KNOWLEDGE_SNAPSHOT_ARCHIVE_BYTES = 250 * 1024 * 1024;
 
 // server/admin-control-plane-service.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { and as and4, desc as desc4, eq as eq5, gte as gte2, inArray as inArray3, isNull as isNull2, lt, or } from "drizzle-orm";
+import { and as and4, desc as desc4, eq as eq5, gte as gte2, inArray as inArray3, isNull as isNull2, lt, or as or2 } from "drizzle-orm";
 function getEffectiveAdminAccessLevel(user) {
   if (user.role !== "admin") return null;
   return isExplicitAdminAccessLevel(user.adminAccessLevel) ? user.adminAccessLevel : null;
@@ -4205,6 +4367,9 @@ async function writeWorkspaceAuditEvent(input, executor) {
   return event;
 }
 
+// server/api-usage-ledger.ts
+import { and as and5, eq as eq6, gte as gte3, inArray as inArray4, lt as lt2, sql as sql2 } from "drizzle-orm";
+
 // server/dashboard-service.ts
 var CREDIT_PAGE_LIMIT = 100;
 var CREDIT_MAX_PAGES = 20;
@@ -4224,15 +4389,27 @@ function aggregateSharedKeyCreditUsagePage(input) {
   const recentTasks = [];
   let totalUsed = 0;
   let accountUsed = 0;
+  let complete = true;
+  let datedTaskCount = 0;
+  let expiredTaskCount = 0;
   let reachedCutoff = false;
   for (const task of input.tasks) {
     const id = String(task?.id ?? task?.task_id ?? "");
-    if (!id || input.seenTaskIds.has(id)) continue;
+    if (!id) {
+      complete = false;
+      continue;
+    }
+    if (input.seenTaskIds.has(id)) continue;
     input.seenTaskIds.add(id);
     const createdAtMs = parseCreatedAt(task?.created_at);
-    if (createdAtMs !== null && createdAtMs < input.cutoff) {
-      reachedCutoff = true;
-      break;
+    if (createdAtMs === null) {
+      complete = false;
+      continue;
+    }
+    datedTaskCount += 1;
+    if (createdAtMs < input.cutoff) {
+      expiredTaskCount += 1;
+      continue;
     }
     if (createdAtMs !== null && input.endExclusive !== void 0 && createdAtMs >= input.endExclusive) {
       continue;
@@ -4240,7 +4417,11 @@ function aggregateSharedKeyCreditUsagePage(input) {
     const creditUsage = Number(
       task?.credit_usage ?? task?.metadata?.credit_usage ?? 0
     );
-    if (!Number.isFinite(creditUsage) || creditUsage <= 0) continue;
+    if (!Number.isFinite(creditUsage) || creditUsage < 0) {
+      complete = false;
+      continue;
+    }
+    if (creditUsage === 0) continue;
     totalUsed += creditUsage;
     if (!input.ownedTaskIds.has(id)) continue;
     accountUsed += creditUsage;
@@ -4253,7 +4434,8 @@ function aggregateSharedKeyCreditUsagePage(input) {
       })
     });
   }
-  return { totalUsed, accountUsed, recentTasks, reachedCutoff };
+  reachedCutoff = complete && datedTaskCount > 0 && expiredTaskCount === datedTaskCount;
+  return { totalUsed, accountUsed, recentTasks, reachedCutoff, complete };
 }
 function getShanghaiCalendarMonthPeriod(now = Date.now()) {
   const shanghaiOffsetMs = 8 * 60 * 60 * 1e3;
@@ -4333,6 +4515,7 @@ async function getAccountCreditUsageBetween(userId, input) {
     accountUsed += pageResult.accountUsed;
     recentTasks.push(...pageResult.recentTasks);
     reachedCutoff = pageResult.reachedCutoff;
+    if (!pageResult.complete) complete = false;
     after = payload?.last_id || tasks[tasks.length - 1]?.id;
     if (pageIndex === CREDIT_MAX_PAGES - 1 && payload?.has_more && after && !reachedCutoff) {
       complete = false;
@@ -5421,7 +5604,19 @@ var PreparedFileService = class {
 var preparedFileService = new PreparedFileService();
 
 // server/delivery-role-service.ts
-import { and as and8, asc as asc5, desc as desc8, eq as eq9, inArray as inArray6, isNull as isNull4, lt as lt4, or as or3, sql as sql3 } from "drizzle-orm";
+import {
+  and as and10,
+  asc as asc5,
+  count as count2,
+  desc as desc9,
+  eq as eq11,
+  gt as gt4,
+  inArray as inArray7,
+  isNull as isNull4,
+  lt as lt5,
+  or as or5,
+  sql as sql4
+} from "drizzle-orm";
 
 // shared/delivery-roles.ts
 import { z as z6 } from "zod";
@@ -5462,19 +5657,19 @@ var knowledgeResetReasonSchema = z6.enum([
 
 // server/delivery-ticket-service.ts
 import {
-  and as and6,
+  and as and7,
   asc as asc3,
   count,
   desc as desc6,
-  eq as eq7,
+  eq as eq8,
   gt as gt3,
-  inArray as inArray5,
+  inArray as inArray6,
   like,
-  lt as lt3,
+  lt as lt4,
   max,
   ne as ne2,
-  or as or2,
-  sql as sql2
+  or as or4,
+  sql as sql3
 } from "drizzle-orm";
 
 // shared/delivery-catalog.ts
@@ -5597,7 +5792,10 @@ var WEBSITE_CONTENT_CATEGORIES = new Set(
 );
 
 // server/knowledge-base-progress-service.ts
-import { and as and7, asc as asc4, desc as desc7, eq as eq8, isNotNull as isNotNull2, isNull as isNull3 } from "drizzle-orm";
+import { and as and9, asc as asc4, desc as desc8, eq as eq10, isNotNull as isNotNull2, isNull as isNull3 } from "drizzle-orm";
+
+// server/knowledge-base-conversation-messages.ts
+import { and as and8, desc as desc7, eq as eq9 } from "drizzle-orm";
 
 // server/delivery-role-service.ts
 async function requireDb3() {
@@ -5637,12 +5835,12 @@ async function assertDeliveryProjectContext(input) {
     roleType: deliveryProjectAssignments.roleType,
     customerUsername: users.username,
     customerName: users.displayName
-  }).from(deliveryProjectAssignments).innerJoin(users, eq9(users.id, deliveryProjectAssignments.customerUserId)).where(
-    and8(
-      eq9(deliveryProjectAssignments.id, input.projectAssignmentId),
-      eq9(deliveryProjectAssignments.engineerUserId, input.actor.id),
-      eq9(users.role, "user"),
-      eq9(users.isActive, true)
+  }).from(deliveryProjectAssignments).innerJoin(users, eq11(users.id, deliveryProjectAssignments.customerUserId)).where(
+    and10(
+      eq11(deliveryProjectAssignments.id, input.projectAssignmentId),
+      eq11(deliveryProjectAssignments.engineerUserId, input.actor.id),
+      eq11(users.role, "user"),
+      eq11(users.isActive, true)
     )
   ).limit(1);
   const role = rows[0];
@@ -5652,18 +5850,18 @@ async function assertDeliveryProjectContext(input) {
   if (input.customerUserId !== void 0 && input.customerUserId !== role.customerUserId) {
     throw new AuthServiceError("NOT_FOUND", "\u5BA2\u6237\u672A\u5206\u914D\u7ED9\u5F53\u524D\u5DE5\u7A0B\u5E08");
   }
-  const contractRows = await db.select().from(serviceContracts).where(eq9(serviceContracts.userId, role.customerUserId));
+  const contractRows = await db.select().from(serviceContracts).where(eq11(serviceContracts.userId, role.customerUserId));
   const currentContract = selectPortalContract(
     contractRows
   );
   if (!requiredRolesForPlan(currentContract?.planCode).includes(role.roleType)) {
     const activeTicketRows = await db.select({ id: deliveryTickets.id }).from(deliveryTickets).where(
-      and8(
-        eq9(
+      and10(
+        eq11(
           deliveryTickets.assignedProjectAssignmentId,
           role.projectAssignmentId
         ),
-        inArray6(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)
+        inArray7(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)
       )
     ).limit(1);
     if (!activeTicketRows[0]) {
