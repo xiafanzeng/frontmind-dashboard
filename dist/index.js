@@ -12004,10 +12004,10 @@ function assertKnowledgeBaseInitialImageDelivery(output) {
   const imageCount = collectKnowledgeBaseOutputImageKeys(
     latestKnowledgeBasePresentationOutput(output)
   ).size;
-  if (imageCount !== 3) {
+  if (imageCount !== 1) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
-      `\u9996\u4E2A\u77E5\u8BC6\u8282\u70B9\u5FC5\u987B\u5C55\u793A\u6070\u597D\u4E09\u5F20\u4E92\u4E0D\u91CD\u590D\u7684\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`
+      `\u9996\u4E2A\u77E5\u8BC6\u8282\u70B9\u5FC5\u987B\u53EA\u5C55\u793A\u4E00\u5F20\u4F01\u4E1A\u5B98\u65B9\u4E3B Logo\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`
     );
   }
 }
@@ -31736,7 +31736,7 @@ async function buildKnowledgeBasePrompt({
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u77E5\u8BC6\u6811\u7EDF\u8BA1\uFF08\u4EC5\u9996\u8F6E\u9700\u8981\uFF09\u548C\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\u3002\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\uFF1B\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\u3002\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u5D4C\u5165\u5B98\u7F51\u6216 CDN \u56FE\u7247\u5916\u94FE\u3002\u56FE\u7247\u5FC5\u987B\u5148\u4E0B\u8F7D\u771F\u5B9E\u5B57\u8282\u3001\u89E3\u7801\u6821\u9A8C\u5E76\u6253\u5165\u6700\u7EC8 ZIP\uFF0C\u518D\u4EE5\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u5F15\u7528\uFF1B\u9632\u76D7\u94FE\u3001\u7B7E\u540D\u3001\u8FC7\u671F\u6216\u65E0\u6CD5\u4E0B\u8F7D\u7684\u5730\u5740\u53EA\u80FD\u8FDB\u5165\u5185\u90E8\u6765\u6E90\u8BB0\u5F55\uFF0C\u7EDD\u4E0D\u80FD\u4F5C\u4E3A\u5BA2\u6237\u56FE\u7247\u8FD4\u56DE\u3002",
-    "\u9996\u8F6E\u5FC5\u987B\u91C7\u96C6\u5E76\u8FD4\u56DE\u6070\u597D\u4E09\u5F20\u4E92\u4E0D\u91CD\u590D\u7684\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\uFF1A\u4E3B Logo\u3001\u54C1\u724C\u4E3B\u89C6\u89C9\u3001\u5178\u578B\u4EA7\u54C1/UI/\u67B6\u6784\u56FE\u5404\u4E00\u5F20\uFF1B\u53D6\u5F97\u4E09\u5F20\u540E\u7ACB\u5373\u505C\u6B62\u56FE\u7247\u53D1\u73B0\u3002\u53EA\u6709\u9996\u8F6E\u6E05\u5355\u7B2C\u4E00\u4E2A\u53F6\u5B50\uFF08\u901A\u5E38\u4E3A 1.1 \u4E00\u53E5\u8BDD\u5B9A\u4F4D\uFF09\u53EF\u628A\u5DF2\u4E0B\u8F7D\u9A8C\u8BC1\u7684\u672C\u5730\u5B57\u8282\u4F5C\u4E3A output_image \u6216 image MIME output_file \u8FD4\u56DE\u3002\u4E0D\u5F97\u7528\u91CD\u590D\u88C1\u5207\u3001\u5360\u4F4D\u56FE\u3001\u5E93\u5B58\u56FE\u3001\u5B98\u7F51/CDN \u70ED\u94FE\u6216\u6587\u5B57\u8BF4\u660E\u51D1\u6570\uFF1B\u65E0\u6CD5\u53D6\u5F97\u4E09\u5F20\u5408\u683C\u771F\u5B9E\u5B57\u8282\u65F6\u4E0D\u5F97\u4F2A\u9020\u6210\u529F\u3002\u540E\u7EED\u6240\u6709\u8282\u70B9\u3001\u4FEE\u8BA2\u4E0E\u91CD\u5F00\u8F6E\u6B21\u4E00\u5F8B\u7EAF\u6587\u5B57\uFF0C\u4E0D\u5F97\u641C\u7D22\u3001\u91CD\u590D\u6216\u65B0\u589E\u56FE\u7247\u9644\u4EF6\u3002\u9996\u8F6E\u9644\u4EF6\u4E0E\u6700\u7EC8 ZIP \u5FC5\u987B\u4F7F\u7528\u540C\u4E00\u8D44\u4EA7\u5B57\u8282\u3002",
+    "\u9996\u8F6E\u5FC5\u987B\u53EA\u91C7\u96C6\u5E76\u8FD4\u56DE\u4E00\u5F20\u4F01\u4E1A\u5B98\u65B9\u4E3B Logo\uFF1B\u53D6\u5F97\u5408\u683C Logo \u540E\u7ACB\u5373\u505C\u6B62\u6240\u6709\u56FE\u7247\u53D1\u73B0\u3002\u4E0D\u5F97\u91C7\u96C6\u6216\u6253\u5305\u54C1\u724C\u4E3B\u89C6\u89C9\u3001\u4E1A\u52A1\u56FE\u3001\u4EA7\u54C1/UI/\u67B6\u6784\u56FE\u3001\u6848\u4F8B\u56FE\u3001\u56E2\u961F\u56FE\u6216\u5176\u4ED6\u56FE\u7247\u3002\u53EA\u6709\u9996\u8F6E\u6E05\u5355\u7B2C\u4E00\u4E2A\u53F6\u5B50\uFF08\u901A\u5E38\u4E3A 1.1 \u4E00\u53E5\u8BDD\u5B9A\u4F4D\uFF09\u53EF\u628A\u5DF2\u4E0B\u8F7D\u9A8C\u8BC1\u7684\u672C\u5730 Logo \u5B57\u8282\u4F5C\u4E3A output_image \u6216 image MIME output_file \u8FD4\u56DE\u3002\u4E0D\u5F97\u7528 favicon\u3001\u56FE\u6807\u3001\u5360\u4F4D\u56FE\u3001\u5E93\u5B58\u56FE\u3001\u5B98\u7F51/CDN \u70ED\u94FE\u6216\u6587\u5B57\u8BF4\u660E\u66FF\u4EE3\uFF1B\u65E0\u6CD5\u53D6\u5F97\u5408\u683C\u771F\u5B9E Logo \u5B57\u8282\u65F6\u4E0D\u5F97\u4F2A\u9020\u6210\u529F\u3002\u540E\u7EED\u6240\u6709\u8282\u70B9\u3001\u4FEE\u8BA2\u4E0E\u91CD\u5F00\u8F6E\u6B21\u4E00\u5F8B\u7EAF\u6587\u5B57\uFF0C\u4E0D\u5F97\u641C\u7D22\u3001\u91CD\u590D\u6216\u65B0\u589E\u56FE\u7247\u9644\u4EF6\u3002\u9996\u8F6E\u9644\u4EF6\u4E0E\u6700\u7EC8 ZIP \u5FC5\u987B\u4F7F\u7528\u540C\u4E00 Logo \u5B57\u8282\u3002",
     `\u8D44\u6599\u91C7\u96C6\u9636\u6BB5\u7EDF\u4E00\u5411\u5BA2\u6237\u663E\u793A\uFF1A${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
     "",
     "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
@@ -31932,7 +31932,7 @@ ${JSON.stringify({
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\uFF1B\u7528\u6237\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\u5F53\u524D\u5185\u5BB9\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587\uFF0C\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\u3002\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\uFF1B\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "\u673A\u5668\u4FE1\u5C01\u5FC5\u987B\u4FDD\u7559\u5B8C\u6574\u7684 `<!-- FRONTMIND_KB_...` \u4E0E `-->` \u5305\u88F9\uFF0C\u4E0D\u5F97\u8F93\u51FA\u88F8 JSON\u3001SOCRATIC_KB_STATE\uFF0C\u4E5F\u4E0D\u5F97\u81EA\u521B workflow-state\u3001knowledge-base.message \u6216\u5176\u4ED6\u72B6\u6001\u5BF9\u8C61\u3002",
-    "\u8FD9\u662F\u975E\u9996\u8F6E\u77E5\u8BC6\u8282\u70B9\u56DE\u590D\uFF0C\u5FC5\u987B\u7EAF\u6587\u5B57\u8FD4\u56DE\uFF1A\u4E0D\u5F97\u7EE7\u7EED\u641C\u7D22\u56FE\u7247\uFF0C\u4E0D\u5F97\u8FD4\u56DE\u3001\u91CD\u590D\u6216\u91CD\u65B0\u9644\u52A0\u4EFB\u4F55 output_image\u3001image MIME output_file\u3001\u5305\u5185\u56FE\u7247\u8DEF\u5F84\u6216\u5B98\u7F51/CDN \u70ED\u94FE\u3002\u6070\u597D\u4E09\u5F20\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\u53EA\u5141\u8BB8\u5728\u9996\u8F6E\u7B2C\u4E00\u4E2A\u53F6\u5B50\u5C55\u793A\u3002",
+    "\u8FD9\u662F\u975E\u9996\u8F6E\u77E5\u8BC6\u8282\u70B9\u56DE\u590D\uFF0C\u5FC5\u987B\u7EAF\u6587\u5B57\u8FD4\u56DE\uFF1A\u4E0D\u5F97\u7EE7\u7EED\u641C\u7D22\u56FE\u7247\uFF0C\u4E0D\u5F97\u8FD4\u56DE\u3001\u91CD\u590D\u6216\u91CD\u65B0\u9644\u52A0\u4EFB\u4F55 output_image\u3001image MIME output_file\u3001\u5305\u5185\u56FE\u7247\u8DEF\u5F84\u6216\u5B98\u7F51/CDN \u70ED\u94FE\u3002\u6070\u597D\u4E00\u5F20\u4F01\u4E1A\u5B98\u65B9\u4E3B Logo \u53EA\u5141\u8BB8\u5728\u9996\u8F6E\u7B2C\u4E00\u4E2A\u53F6\u5B50\u5C55\u793A\u3002",
     "",
     "# \u5F53\u524D\u77E5\u8BC6\u5E93\u72B6\u6001",
     stateReminder,
@@ -34581,7 +34581,7 @@ var internalPackageManifestSchema = z20.object({
       }
     });
     const selection = value.imageSelection;
-    for (const key of [
+    const requiredImageSelectionKeys = [
       "status",
       "discoveredCandidateImages",
       "inspectedCandidateImages",
@@ -34590,9 +34590,9 @@ var internalPackageManifestSchema = z20.object({
       "discoveryMethods",
       "rejectionReasons",
       "stopReason",
-      "productFamilyCoverage",
       "candidates"
-    ]) {
+    ];
+    for (const key of requiredImageSelectionKeys) {
       if (selection[key] === void 0) {
         context.addIssue({
           code: "custom",
@@ -34601,7 +34601,21 @@ var internalPackageManifestSchema = z20.object({
         });
       }
     }
+    if (!(value.profile === "dashboard-enterprise-v1" && value.schemaVersion === 3) && selection.productFamilyCoverage === void 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["imageSelection", "productFamilyCoverage"],
+        message: "schemaVersion 2 image selection requires productFamilyCoverage"
+      });
+    }
     if (value.profile === "dashboard-enterprise-v1") {
+      if (value.schemaVersion === 3 && selection.productFamilyCoverage !== void 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["imageSelection", "productFamilyCoverage"],
+          message: "dashboard enterprise v3 packages only one Logo and must omit productFamilyCoverage"
+        });
+      }
       if (value.websiteV2Normalized !== void 0) {
         context.addIssue({
           code: "custom",
@@ -35377,6 +35391,7 @@ function validateProfilePackage(input) {
     maxDocuments: 220,
     maxWebQueries: 120
   };
+  const isSingleLogoDashboardV3 = input.profile === "dashboard-enterprise-v1" && manifest.schemaVersion === 3;
   if (input.packagePaths.length > limits.files) {
     throw new KnowledgeArchiveValidationError(
       "structure",
@@ -35680,10 +35695,10 @@ function validateProfilePackage(input) {
         "\u56FE\u7247\u5019\u9009\u9010\u9879\u53F0\u8D26\u4E0E\u53D1\u73B0\u3001\u68C0\u67E5\u3001\u6253\u5305\u7ED3\u679C\u4E0D\u4E00\u81F4"
       );
     }
-    if ([...requiredImageDiscoveryMethods].some((method) => !methods.has(method))) {
+    if (isSingleLogoDashboardV3 && methods.size === 0 || !isSingleLogoDashboardV3 && [...requiredImageDiscoveryMethods].some((method) => !methods.has(method))) {
       throw new KnowledgeArchiveValidationError(
         "media",
-        "\u56FE\u7247\u53D1\u73B0\u53F0\u8D26\u672A\u8986\u76D6\u5168\u90E8\u8981\u6C42\u7684\u7B2C\u4E00\u65B9\u56FE\u7247\u53D1\u73B0\u65B9\u5F0F"
+        isSingleLogoDashboardV3 ? "Logo \u53D1\u73B0\u53F0\u8D26\u5FC5\u987B\u8BB0\u5F55\u5B9E\u9645\u4F7F\u7528\u7684\u53D1\u73B0\u65B9\u5F0F" : "\u56FE\u7247\u53D1\u73B0\u53F0\u8D26\u672A\u8986\u76D6\u5168\u90E8\u8981\u6C42\u7684\u7B2C\u4E00\u65B9\u56FE\u7247\u53D1\u73B0\u65B9\u5F0F"
       );
     }
     if (completeness.acquisition.images?.total !== discovered || enrichedAssets.length > selection.eligibleFirstPartyImages) {
@@ -35692,10 +35707,11 @@ function validateProfilePackage(input) {
         "\u56FE\u7247\u53D1\u73B0\u53F0\u8D26\u4E0E\u5B8C\u6574\u5EA6\u7EDF\u8BA1\u6216\u5B9E\u9645\u6253\u5305\u6570\u91CF\u4E0D\u4E00\u81F4"
       );
     }
-    if (completeness.acquisition.officialPages?.completed === void 0 || selection.scannedSourcePages !== completeness.acquisition.officialPages.completed) {
+    const completedOfficialPages = completeness.acquisition.officialPages?.completed;
+    if (completedOfficialPages === void 0 || (isSingleLogoDashboardV3 ? selection.scannedSourcePages > completedOfficialPages : selection.scannedSourcePages !== completedOfficialPages)) {
       throw new KnowledgeArchiveValidationError(
         "media",
-        "\u56FE\u7247\u626B\u63CF\u9875\u6570\u5FC5\u987B\u8986\u76D6\u6240\u6709\u6210\u529F\u89E3\u6790\u7684\u5B98\u7F51\u9875\u9762"
+        isSingleLogoDashboardV3 ? "Logo \u626B\u63CF\u9875\u6570\u4E0D\u80FD\u8D85\u8FC7\u6210\u529F\u89E3\u6790\u7684\u5B98\u7F51\u9875\u9762\u6570" : "\u56FE\u7247\u626B\u63CF\u9875\u6570\u5FC5\u987B\u8986\u76D6\u6240\u6709\u6210\u529F\u89E3\u6790\u7684\u5B98\u7F51\u9875\u9762"
       );
     }
     if (selection.status === "target_met") {
@@ -35722,6 +35738,18 @@ function validateProfilePackage(input) {
         throw new KnowledgeArchiveValidationError(
           "media",
           "budget_limited \u5FC5\u987B\u5B58\u5728\u56E0\u9884\u7B97\u672A\u68C0\u67E5\u7684\u5DF2\u53D1\u73B0\u5019\u9009\u56FE\u7247"
+        );
+      }
+    }
+    if (isSingleLogoDashboardV3) {
+      const firstLeaf = enrichedDocuments.find(
+        (document) => document.kind === "leaf"
+      );
+      const logo = enrichedAssets[0];
+      if (selection.status !== "target_met" || selection.eligibleFirstPartyImages !== 1 || enrichedAssets.length !== 1 || !logo || logo.assetType !== "brand_identity" || logo.displayRole !== "badge" || !firstLeaf?.id || logo.documentIds.length !== 1 || logo.documentIds[0] !== firstLeaf.id || selection.productFamilyCoverage !== void 0) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          "Dashboard v3 \u5FC5\u987B\u53EA\u6253\u5305\u4E00\u5F20\u4F01\u4E1A\u5B98\u65B9 Logo\uFF0C\u5E76\u4E14\u53EA\u5173\u8054\u9996\u4E2A\u77E5\u8BC6\u53F6\u5B50"
         );
       }
     }
@@ -35752,29 +35780,31 @@ function validateProfilePackage(input) {
         "v2 \u5FC5\u987B\u81F3\u5C11\u58F0\u660E\u4E00\u4E2A\u4EA7\u54C1\u6216\u670D\u52A1\u65CF\uFF0C\u4E14\u4EA7\u54C1\u5206\u652F\u7684\u6BCF\u4E2A\u53F6\u5B50\u90FD\u5FC5\u987B\u58F0\u660E productFamilyId"
       );
     }
-    const coverageIds = new Set(
-      (selection.productFamilyCoverage || []).map((family) => family.familyId)
-    );
-    if (coverageIds.size !== (selection.productFamilyCoverage || []).length || coverageIds.size !== productLeafFamilyIds.size || [...coverageIds].some((familyId) => !productLeafFamilyIds.has(familyId))) {
-      throw new KnowledgeArchiveValidationError(
-        "media",
-        "\u4EA7\u54C1\u65CF\u56FE\u7247\u8986\u76D6\u6E05\u5355\u5FC5\u987B\u4E0E\u4EA7\u54C1\u6216\u670D\u52A1\u53F6\u5B50\u4E2D\u7684\u4EA7\u54C1\u65CF\u5B8C\u5168\u4E00\u81F4"
+    if (!isSingleLogoDashboardV3) {
+      const coverageIds = new Set(
+        (selection.productFamilyCoverage || []).map((family) => family.familyId)
       );
-    }
-    const enrichedAssetIds = new Set(
-      enrichedAssets.map((asset) => asset.id).filter(Boolean)
-    );
-    for (const family of selection.productFamilyCoverage || []) {
-      if (family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) || family.officialImageAvailable && family.assetIds.some((assetId) => {
-        const asset = enrichedAssetsById.get(assetId);
-        return !["product_ui", "product_diagram", "case_photo"].includes(
-          asset?.assetType || ""
-        );
-      }) || family.officialImageAvailable && family.assetIds.length === 0 || !family.officialImageAvailable && !family.gapReason || input.profile === "dashboard-enterprise-v1" && family.checkedSources.length === 0) {
+      if (coverageIds.size !== (selection.productFamilyCoverage || []).length || coverageIds.size !== productLeafFamilyIds.size || [...coverageIds].some((familyId) => !productLeafFamilyIds.has(familyId))) {
         throw new KnowledgeArchiveValidationError(
           "media",
-          `\u4EA7\u54C1\u65CF\u56FE\u7247\u8986\u76D6\u8BB0\u5F55\u4E0D\u5B8C\u6574\uFF1A${family.familyName}`
+          "\u4EA7\u54C1\u65CF\u56FE\u7247\u8986\u76D6\u6E05\u5355\u5FC5\u987B\u4E0E\u4EA7\u54C1\u6216\u670D\u52A1\u53F6\u5B50\u4E2D\u7684\u4EA7\u54C1\u65CF\u5B8C\u5168\u4E00\u81F4"
         );
+      }
+      const enrichedAssetIds = new Set(
+        enrichedAssets.map((asset) => asset.id).filter(Boolean)
+      );
+      for (const family of selection.productFamilyCoverage || []) {
+        if (family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) || family.officialImageAvailable && family.assetIds.some((assetId) => {
+          const asset = enrichedAssetsById.get(assetId);
+          return !["product_ui", "product_diagram", "case_photo"].includes(
+            asset?.assetType || ""
+          );
+        }) || family.officialImageAvailable && family.assetIds.length === 0 || !family.officialImageAvailable && !family.gapReason || input.profile === "dashboard-enterprise-v1" && family.checkedSources.length === 0) {
+          throw new KnowledgeArchiveValidationError(
+            "media",
+            `\u4EA7\u54C1\u65CF\u56FE\u7247\u8986\u76D6\u8BB0\u5F55\u4E0D\u5B8C\u6574\uFF1A${family.familyName}`
+          );
+        }
       }
     }
   }
