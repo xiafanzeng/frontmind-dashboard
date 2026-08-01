@@ -7,15 +7,18 @@ import {
   KNOWLEDGE_BASE_PROGRESS_KIND,
   KnowledgeBaseProgressError,
   applyKnowledgeBaseProgressEnvelope,
+  assertKnowledgeBaseProtocolOperation,
   assertKnowledgeBasePresentationMatchesState,
   assertKnowledgeBaseReadyForPackage,
   canPackageKnowledgeBase,
+  classifyKnowledgeBaseUpstreamTaskStatus,
   createKnowledgeBaseProgressState,
   formatKnowledgeBaseProgressEnvelope,
   formatKnowledgeBasePresentationEnvelope,
   getKnowledgeBaseProgressSummary,
   parseKnowledgeBaseProgressEnvelope,
   parseKnowledgeBasePresentationEnvelope,
+  parseKnowledgeBaseReopenEnvelope,
   formatKnowledgeBaseManifestEnvelope,
   parseKnowledgeBaseManifestEnvelope,
   shouldShowKnowledgeBaseCheckmark,
@@ -31,6 +34,100 @@ const manifest: KnowledgeBaseLeafManifestEntry[] = [
   { id: "identity.position", title: "企业定位", branchId: "identity" },
   { id: "product.primary", title: "核心产品", branchId: "product" },
 ];
+
+describe("knowledge base upstream status classifier", () => {
+  it.each(["completed", "complete", "succeeded", "done", "finished"])(
+    "classifies %s as a successful terminal status",
+    (status) => {
+      expect(classifyKnowledgeBaseUpstreamTaskStatus(status)).toMatchObject({
+        phase: "succeeded",
+        settled: true,
+        terminal: true,
+        failed: false,
+      });
+    },
+  );
+
+  it.each(["failed", "error", "cancelled", "canceled"])(
+    "classifies %s as a failed terminal status",
+    (status) => {
+      expect(classifyKnowledgeBaseUpstreamTaskStatus(status)).toMatchObject({
+        settled: true,
+        terminal: true,
+        failed: true,
+      });
+    },
+  );
+
+  it("keeps streaming and interaction-ready states distinct", () => {
+    expect(
+      classifyKnowledgeBaseUpstreamTaskStatus("in-progress"),
+    ).toMatchObject({ phase: "active", settled: false });
+    expect(
+      classifyKnowledgeBaseUpstreamTaskStatus("awaiting_user"),
+    ).toMatchObject({
+      phase: "awaiting_input",
+      settled: true,
+      terminal: false,
+    });
+  });
+});
+
+describe("knowledge base v4 operation identity", () => {
+  it("classifies a well-formed envelope from an older turn as an idempotent stale operation", () => {
+    expectProgressError(
+      () =>
+        assertKnowledgeBaseProtocolOperation(
+          {
+            schemaVersion: 2,
+            operationId: `kbv2_${"a".repeat(64)}`,
+            turnId: "00000000-0000-4000-8000-000000000001",
+          },
+          {
+            operationId: `kbv2_${"b".repeat(64)}`,
+            turnId: "00000000-0000-4000-8000-000000000002",
+            requireV4: true,
+          },
+        ),
+      "STALE_OPERATION",
+    );
+  });
+
+  it("keeps a legacy envelope on a v4 build as a real protocol error", () => {
+    expectProgressError(
+      () =>
+        assertKnowledgeBaseProtocolOperation(
+          { schemaVersion: 1 },
+          {
+            operationId: `kbv2_${"b".repeat(64)}`,
+            turnId: "00000000-0000-4000-8000-000000000002",
+            requireV4: true,
+          },
+        ),
+      "INVALID_ENVELOPE",
+    );
+  });
+});
+
+describe("knowledge base streaming envelope boundary", () => {
+  it("never parses JSON from an unclosed protocol comment", () => {
+    const partial = `<!-- FRONTMIND_KB_PROGRESS
+${JSON.stringify({
+  kind: "frontmind.knowledge-base.progress",
+  schemaVersion: 1,
+  revision: 0,
+  transition: {
+    leafId: "identity.name",
+    from: "current",
+    to: "confirmed",
+  },
+})}`;
+    expectProgressError(
+      () => parseKnowledgeBaseProgressEnvelope(partial),
+      "INVALID_ENVELOPE",
+    );
+  });
+});
 
 function envelope(
   revision: number,
@@ -242,6 +339,41 @@ describe("knowledge base single-leaf progression", () => {
 });
 
 describe("model progress envelope boundary", () => {
+  it("round-trips v4 presentation operation identity", () => {
+    const presentation = {
+      kind: "frontmind.knowledge-base.presentation" as const,
+      schemaVersion: 2 as const,
+      operationId: `kbv2_${"a".repeat(64)}`,
+      turnId: "00000000-0000-4000-8000-000000000001",
+      revision: 1,
+      leafId: "identity.position",
+      imageState: "no_eligible_asset" as const,
+      assetIds: [],
+      imageCount: 0,
+    };
+
+    expect(
+      parseKnowledgeBasePresentationEnvelope(
+        formatKnowledgeBasePresentationEnvelope(presentation),
+      ),
+    ).toEqual(presentation);
+  });
+
+  it("does not expose the removed reopen transition in protocol v4", () => {
+    expectProgressError(
+      () =>
+        parseKnowledgeBaseReopenEnvelope({
+          kind: "frontmind.knowledge-base.reopen",
+          schemaVersion: 2,
+          operationId: `kbv2_${"a".repeat(64)}`,
+          turnId: "00000000-0000-4000-8000-000000000001",
+          revision: 3,
+          leafId: "identity.name",
+        }),
+      "INVALID_ENVELOPE",
+    );
+  });
+
   it("extracts one hidden machine-readable envelope from model output", () => {
     const expected = envelope(0, "identity.name", "current", "confirmed");
     const output = [

@@ -13,9 +13,12 @@ import {
 } from "@/lib/preview-navigation";
 import AdminDashboard from "@/pages/AdminDashboard";
 import KnowledgeBaseLivePreview from "@/pages/KnowledgeBaseLivePreview";
+import KnowledgeBaseProductionAcceptance from "@/pages/KnowledgeBaseProductionAcceptance";
 import {
   PreviewAdminAccounts,
   PreviewAdminAgent,
+  PreviewAdminDeliveryRoles,
+  PreviewAdminDispatch,
   PreviewAdminPresales,
   PreviewAdminUsers,
 } from "@/pages/PreviewPages";
@@ -51,6 +54,8 @@ export default function DevelopmentPreviewRouter({
 
   switch (route) {
     case "/preview/knowledge-base-live":
+      return <KnowledgeBaseProductionAcceptance />;
+    case "/preview/knowledge-base-upstream-probe":
       return <KnowledgeBaseLivePreview />;
     case "/preview/user":
       return <PreviewUserRoute />;
@@ -60,15 +65,10 @@ export default function DevelopmentPreviewRouter({
       return <PreviewUserRoute planCode="advanced" />;
     case "/preview/user/luxury":
       return <PreviewUserRoute planCode="luxury" />;
-    case "/preview/admin/delivery":
     case "/preview/admin":
-      return (
-        <AdminDashboard
-          preview
-          previewAccessLevel="delivery_admin"
-          previewFixtures={adminDashboardPreviewFixtures}
-        />
-      );
+      return <Redirect to={previewAdminRootHref("system_admin")} />;
+    case "/preview/admin/delivery":
+      return <Redirect to={previewAdminWorkspaceHref("delivery_admin")} />;
     case "/preview/admin/system":
       return (
         <AdminDashboard
@@ -81,6 +81,14 @@ export default function DevelopmentPreviewRouter({
       return <PreviewAdminUsers previewAccessLevel="delivery_admin" />;
     case previewAdminWorkspaceHref("system_admin"):
       return <PreviewAdminUsers previewAccessLevel="system_admin" />;
+    case previewAdminPageHref("delivery_admin", "delivery-roles"):
+      return <PreviewAdminDeliveryRoles previewAccessLevel="delivery_admin" />;
+    case previewAdminPageHref("system_admin", "delivery-roles"):
+      return <PreviewAdminDeliveryRoles previewAccessLevel="system_admin" />;
+    case previewAdminPageHref("delivery_admin", "dispatch"):
+      return <PreviewAdminDispatch previewAccessLevel="delivery_admin" />;
+    case previewAdminPageHref("system_admin", "dispatch"):
+      return <PreviewAdminDispatch previewAccessLevel="system_admin" />;
     case previewAdminPageHref("delivery_admin", "agent"):
       return <PreviewAdminAgent previewAccessLevel="delivery_admin" />;
     case previewAdminPageHref("system_admin", "agent"):
@@ -88,7 +96,9 @@ export default function DevelopmentPreviewRouter({
     case previewAdminPageHref("system_admin", "presales"):
       return <PreviewAdminPresales />;
     case previewAdminPageHref("system_admin", "accounts"):
-      return <PreviewAdminAccounts />;
+      return <PreviewAdminAccounts previewAccessLevel="system_admin" />;
+    case previewAdminPageHref("delivery_admin", "accounts"):
+      return <PreviewAdminAccounts previewAccessLevel="delivery_admin" />;
     case "/preview/admin/agent":
       return <Redirect to={previewAdminRootHref("system_admin")} />;
     case "/preview/admin/workflow":
@@ -97,6 +107,12 @@ export default function DevelopmentPreviewRouter({
       return <Redirect to={previewAdminPageHref("system_admin", "presales")} />;
     case "/preview/admin/users":
       return <Redirect to={previewAdminWorkspaceHref("system_admin")} />;
+    case "/preview/admin/delivery-roles":
+      return (
+        <Redirect to={previewAdminPageHref("system_admin", "delivery-roles")} />
+      );
+    case "/preview/admin/dispatch":
+      return <Redirect to={previewAdminPageHref("system_admin", "dispatch")} />;
     case "/preview/admin/accounts":
       return <Redirect to={previewAdminPageHref("system_admin", "accounts")} />;
     default:

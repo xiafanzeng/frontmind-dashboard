@@ -36,8 +36,13 @@ import {
 } from "./presales-monitor";
 import { isFrontMindPublicUrlConfigured } from "./public-url";
 import {
+  acquirePresalesFileCreateReservation,
+  completePresalesFileCreateReservation,
+  hashPresalesFileCreatePayload,
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
+  releasePresalesFileCreateReservation,
+  removePresalesFileCreateReservation,
   removeStoredPresalesFile,
   stagePresalesFileContent,
   type StoredPresalesFile,
@@ -73,6 +78,7 @@ const fileCreateSchema = z.object({
     .nonnegative()
     .max(MAX_PROXY_UPLOAD_BYTES)
     .optional(),
+  idempotencyKey: z.string().trim().min(16).max(512).optional(),
 });
 
 const attachmentSchema = z.object({
@@ -357,6 +363,14 @@ function forwardedStatus(value: unknown, fallback = 502) {
     : fallback;
 }
 
+function isDefinitiveFileCreateRejection(status: number) {
+  return (
+    status >= 400 &&
+    status < 500 &&
+    ![408, 409, 425, 429].includes(status)
+  );
+}
+
 function sendKnownError(res: Response, error: unknown) {
   if (error instanceof z.ZodError) {
     res.status(400).json({
@@ -400,10 +414,13 @@ function sendKnownError(res: Response, error: unknown) {
     });
     return;
   }
-  console.error(
-    "[Presales Proxy] Request failed:",
-    error instanceof Error ? error.message.slice(0, 300) : "Unknown error",
-  );
+  // Transport libraries can embed request headers or serialized bodies in an
+  // error message. Keep operation keys, API keys, prompts and attachment
+  // metadata out of production logs even on an unexpected failure.
+  console.error("[Presales Proxy] Request failed", {
+    diagnosticCode: "PRESALES_UPSTREAM_ERROR",
+    errorType: error instanceof Error ? error.name : "UnknownError",
+  });
   res.status(502).json({
     error: {
       code: "PRESALES_UPSTREAM_ERROR",
@@ -643,6 +660,63 @@ router.post("/files", fileJsonParser, async (req, res) => {
   try {
     const input = fileCreateSchema.parse(req.body ?? {});
     const credential = await requireActiveCredential();
+    let reservation: {
+      keyHash: string;
+      attemptId: string;
+    } | null = null;
+    if (input.idempotencyKey) {
+      const acquired = await acquirePresalesFileCreateReservation({
+        idempotencyKey: input.idempotencyKey,
+        requestHash: hashPresalesFileCreatePayload(input),
+        apiCredentialId: credential.id,
+        credentialVersion: credential.version,
+      });
+      if (acquired.state === "conflict") {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "该幂等键已用于不同的文件请求或 API Key 版本",
+        );
+      }
+      if (acquired.state === "pending") {
+        throw new AuthServiceError(
+          "IDEMPOTENCY_PENDING",
+          "相同文件正在创建中，请稍后重试",
+          acquired.retryAfterMs,
+        );
+      }
+      if (acquired.state === "deleted") {
+        res.status(410).json({
+          error: {
+            code: "FILE_OPERATION_RETIRED",
+            message: "该文件创建操作已完成清理，不能再次执行",
+          },
+        });
+        return;
+      }
+      if (acquired.state === "completed") {
+        const proxyUploadTicket = acquired.uploadUrl
+          ? createPresalesUploadTicket({
+              fileId: acquired.upstreamFileId,
+              target: acquired.uploadUrl,
+              upstreamExpiresAt: acquired.uploadExpiresAt,
+            })
+          : undefined;
+        res.setHeader("Idempotent-Replayed", "true");
+        res.status(200).json({
+          id: acquired.upstreamFileId,
+          filename: acquired.upstreamFilename ?? input.filename,
+          status: acquired.upstreamStatus ?? "pending",
+          ...(acquired.uploadExpiresAt !== null
+            ? { upload_expires_at: acquired.uploadExpiresAt }
+            : {}),
+          ...(proxyUploadTicket
+            ? { proxy_upload_ticket: proxyUploadTicket }
+            : {}),
+        });
+        return;
+      }
+      reservation = acquired;
+    }
     const response = await axios.post(
       `${getUpstreamBaseUrl()}/v1/files`,
       { filename: input.filename },
@@ -650,12 +724,21 @@ router.post("/files", fileJsonParser, async (req, res) => {
         headers: {
           ...upstreamHeaders(credential.apiKey),
           "Content-Type": "application/json",
+          ...(reservation
+            ? { "Idempotency-Key": reservation.keyHash }
+            : {}),
         },
         timeout: 120_000,
         validateStatus: () => true,
       },
     );
     if (response.status < 200 || response.status >= 300) {
+      if (
+        reservation &&
+        isDefinitiveFileCreateRejection(response.status)
+      ) {
+        await releasePresalesFileCreateReservation(reservation);
+      }
       return res.status(forwardedStatus(response.status)).json({
         error: {
           code: "UPSTREAM_FILE_CREATE_FAILED",
@@ -697,6 +780,23 @@ router.post("/files", fileJsonParser, async (req, res) => {
           upstreamExpiresAt: payload?.upload_expires_at,
         })
       : undefined;
+    if (reservation) {
+      await completePresalesFileCreateReservation({
+        ...reservation,
+        upstreamFileId: id,
+        upstreamFilename:
+          typeof payload?.filename === "string"
+            ? payload.filename
+            : input.filename,
+        upstreamStatus:
+          typeof payload?.status === "string" ? payload.status : "pending",
+        ...(uploadUrl ? { uploadUrl } : {}),
+        ...(typeof payload?.upload_expires_at === "string" ||
+        typeof payload?.upload_expires_at === "number"
+          ? { uploadExpiresAt: payload.upload_expires_at }
+          : {}),
+      });
+    }
     res.status(201).json({
       ...(payload ?? {}),
       id,
@@ -865,7 +965,10 @@ router.delete("/files/:fileId", async (req, res) => {
       credential.apiKey,
     );
     if (outcome.ok) {
-      await removeStoredPresalesFile(fileId);
+      await Promise.all([
+        removeStoredPresalesFile(fileId),
+        removePresalesFileCreateReservation(fileId),
+      ]);
       res.status(outcome.status).end();
       return;
     }

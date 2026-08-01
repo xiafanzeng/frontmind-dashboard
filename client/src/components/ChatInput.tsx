@@ -12,7 +12,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useSendMessage } from "@/hooks/useSendMessage";
-import { useConversation } from "@/contexts/ConversationContext";
+import {
+  currentKnowledgeBasePresentationReady,
+  useConversation,
+} from "@/contexts/ConversationContext";
 import {
   MODEL_OPTIONS,
   getConfig,
@@ -102,33 +105,26 @@ export default function ChatInput({
   const isRunning =
     activeConversation?.status === "running" ||
     activeConversation?.status === "pending";
+  const knowledgeBaseAttachmentResumeRequired =
+    syncKnowledgeBaseSnapshot &&
+    activeConversation?.knowledgeBase?.notice?.code ===
+      "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED";
   const knowledgeBaseNotStarted =
     syncKnowledgeBaseSnapshot && !activeConversation?.taskId;
   const knowledgeInteractionLocked =
     syncKnowledgeBaseSnapshot &&
     Boolean(activeConversation?.taskId) &&
     activeConversation?.status !== "awaiting_input";
-  const inputLocked = isRunning || knowledgeInteractionLocked;
+  const inputLocked =
+    (isRunning || knowledgeInteractionLocked) &&
+    !knowledgeBaseAttachmentResumeRequired;
   const currentKnowledgeLeaf = knowledgeBaseProgress?.branches
     .flatMap((branch) => branch.leaves)
     .find((leaf) => leaf.id === knowledgeBaseProgress.build.currentLeafId);
-  const lastUserMessageIndex = (() => {
-    const messages = activeConversation?.messages ?? [];
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      if (messages[index]?.role === "user") return index;
-    }
-    return -1;
-  })();
-  const currentNodePresentationReady = Boolean(
-    activeConversation?.messages
-      .slice(lastUserMessageIndex + 1)
-      .some(
-        (message) =>
-          message.role === "assistant" &&
-          !message.isStepsPlaceholder &&
-          (Boolean(message.content.trim()) ||
-            Boolean(message.inlineImages?.length)),
-      ),
+  const currentNodePresentationReady = currentKnowledgeBasePresentationReady(
+    activeConversation,
+    knowledgeBaseProgress?.build.revision,
+    knowledgeBaseProgress?.build.currentLeafId,
   );
   const knowledgeBaseComplete =
     syncKnowledgeBaseSnapshot &&
@@ -203,6 +199,10 @@ export default function ChatInput({
           {
             agentProfile: fixedAgentProfile || selectedModel,
             syncKnowledgeBaseSnapshot,
+            knowledgeBaseExpectedGeneration:
+              syncKnowledgeBaseSnapshot && activeConversation?.knowledgeBase
+                ? activeConversation.knowledgeBase.generation
+                : undefined,
             knowledgeBaseExpectedRevision:
               syncKnowledgeBaseSnapshot && knowledgeBaseProgress
                 ? knowledgeBaseProgress.build.revision

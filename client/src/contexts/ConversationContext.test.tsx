@@ -1,6 +1,7 @@
 import React from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { knowledgeBaseUserMessagePublicId } from "@shared/knowledge-base-message";
 import {
   ConversationProvider,
   parseOutputMessages,
@@ -80,6 +81,54 @@ describe("ConversationProvider cloud hydration", () => {
     ]);
   });
 
+  it("collapses an optimistic request and its canonical server turn on first hydration", async () => {
+    const canonicalId = knowledgeBaseUserMessagePublicId("turn-1");
+    mocks.listRefetch.mockResolvedValueOnce({
+      data: [
+        {
+          ...conversation("knowledge-base"),
+          messages: [
+            {
+              id: "optimistic-request",
+              role: "user",
+              content: "确认",
+              timestamp: 90,
+              knowledgeBase: {
+                kind: "pending_user",
+                clientRequestId: "request-1",
+                serverOwned: false,
+              },
+            },
+            {
+              id: canonicalId,
+              role: "user",
+              content: "确认",
+              timestamp: 100,
+              knowledgeBase: {
+                kind: "pending_user",
+                clientRequestId: "request-1",
+                turnId: "turn-1",
+                serverOwned: true,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    expect(result.current.state.conversations[0]?.messages).toHaveLength(1);
+    expect(result.current.state.conversations[0]?.messages[0]?.id).toBe(
+      canonicalId,
+    );
+    expect(
+      result.current.state.conversations[0]?.messages[0]?.knowledgeBase
+        ?.serverOwned,
+    ).toBe(true);
+  });
+
   it("clears conversations immediately when the user logs out", async () => {
     const { result, rerender } = renderHook(() => useConversation(), {
       wrapper,
@@ -147,6 +196,70 @@ describe("ConversationProvider cloud hydration", () => {
         }),
       ),
     );
+  });
+
+  it("does not delete or overwrite a hydrated server-owned KB turn", async () => {
+    const protectedConversation: Conversation = {
+      ...conversation("knowledge-base"),
+      status: "awaiting_input",
+      messages: [
+        {
+          id: "turn-1",
+          role: "user",
+          content: "确认",
+          timestamp: 100,
+          knowledgeBase: {
+            kind: "pending_user",
+            clientRequestId: "request-1",
+            turnId: "turn-1",
+            serverOwned: true,
+          },
+        },
+        {
+          id: "presentation-1",
+          role: "assistant",
+          content: "## 1.2\n已批准正文",
+          timestamp: 110,
+          knowledgeBase: {
+            kind: "presentation",
+            turnId: "turn-1",
+            presentationKey: "presentation-1",
+            generation: 1,
+            revision: 1,
+            leafId: "1.2",
+            serverOwned: true,
+          },
+        },
+      ],
+    };
+    mocks.listRefetch.mockResolvedValueOnce({
+      data: [protectedConversation],
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    act(() => {
+      result.current.deleteMessage("knowledge-base", "presentation-1");
+      result.current.updateAssistantMessages("knowledge-base", [
+        {
+          id: "stale-raw-output",
+          role: "assistant",
+          content: "旧上游投影",
+          timestamp: 120,
+        },
+      ]);
+      result.current.deleteConversation("knowledge-base");
+    });
+
+    const current = result.current.state.conversations.find(
+      (item) => item.id === "knowledge-base",
+    );
+    expect(current?.messages.map((message) => message.id)).toEqual([
+      "turn-1",
+      "presentation-1",
+    ]);
+    expect(current?.deletedMessageIds ?? []).not.toContain("presentation-1");
+    expect(mocks.deleteConversation).not.toHaveBeenCalled();
   });
 });
 
@@ -244,6 +357,36 @@ describe("prepareConversationForCloud", () => {
     expect(clean.messages[0].inlineImages).toEqual([
       { src: "/api/frontmind/v1/files/image" },
     ]);
+  });
+
+  it("keeps KB provenance and removes tombstones targeting server-owned messages", () => {
+    const clean = prepareConversationForCloud({
+      ...conversation("knowledge-base-metadata"),
+      deletedMessageIds: ["presentation-1", "ordinary-deleted"],
+      messages: [
+        {
+          id: "presentation-1",
+          role: "assistant",
+          content: "## 1.2\n已批准正文",
+          timestamp: 10,
+          knowledgeBase: {
+            kind: "presentation",
+            turnId: "turn-1",
+            presentationKey: "presentation-1",
+            generation: 1,
+            revision: 1,
+            leafId: "1.2",
+            serverOwned: true,
+          },
+        },
+      ],
+    });
+
+    expect(clean.messages[0]?.knowledgeBase).toMatchObject({
+      presentationKey: "presentation-1",
+      serverOwned: true,
+    });
+    expect(clean.deletedMessageIds).toEqual(["ordinary-deleted"]);
   });
 });
 

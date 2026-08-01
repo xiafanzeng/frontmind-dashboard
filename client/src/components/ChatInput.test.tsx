@@ -17,9 +17,28 @@ const mocks = vi.hoisted(() => ({
         role: "assistant",
         content: "## 法定主体与成立时间\n正文",
         timestamp: 2,
+        knowledgeBase: {
+          kind: "presentation",
+          turnId: "turn-2",
+          presentationKey: "presentation-2",
+          revision: 2,
+          leafId: "identity.legal",
+        },
       },
     ],
-  },
+    knowledgeBase: {
+      generation: 1,
+      stateEpoch: 2,
+      activeTurnId: "turn-2",
+      activeClientRequestId: "request-2",
+      interactionState: "awaiting_input",
+      canReply: true,
+      presentationKey: "presentation-2",
+      revision: 2,
+      leafId: "identity.legal",
+      notice: null,
+    },
+  } as any,
 }));
 
 vi.mock("@/hooks/useSendMessage", () => ({
@@ -33,6 +52,25 @@ vi.mock("@/contexts/ConversationContext", () => ({
   useConversation: () => ({
     activeConversation: mocks.activeConversation,
   }),
+  currentKnowledgeBasePresentationReady: (
+    conversation: any,
+    revision: number,
+    leafId: string,
+  ) =>
+    Boolean(
+      conversation?.status === "awaiting_input" &&
+        conversation?.knowledgeBase?.canReply &&
+        conversation?.knowledgeBase?.revision === revision &&
+        conversation?.knowledgeBase?.leafId === leafId &&
+        conversation.messages.some(
+          (message: any) =>
+            message.knowledgeBase?.kind === "presentation" &&
+            message.knowledgeBase?.turnId ===
+              conversation.knowledgeBase.activeTurnId &&
+            message.knowledgeBase?.presentationKey ===
+              conversation.knowledgeBase.presentationKey,
+        ),
+    ),
 }));
 
 vi.mock("@/lib/frontmind-api", () => ({
@@ -114,8 +152,18 @@ describe("knowledge-base ChatInput actions", () => {
         role: "assistant",
         content: "## 法定主体与成立时间\n正文",
         timestamp: 2,
+        knowledgeBase: {
+          kind: "presentation",
+          turnId: "turn-2",
+          presentationKey: "presentation-2",
+          revision: 2,
+          leafId: "identity.legal",
+        },
       },
     ];
+    mocks.activeConversation.status = "awaiting_input";
+    mocks.activeConversation.knowledgeBase.canReply = true;
+    mocks.activeConversation.knowledgeBase.notice = null;
   });
 
   it("does not allow another confirmation until the current presentation renders", () => {
@@ -162,6 +210,7 @@ describe("knowledge-base ChatInput actions", () => {
         [],
         expect.objectContaining({
           syncKnowledgeBaseSnapshot: true,
+          knowledgeBaseExpectedGeneration: 1,
           knowledgeBaseExpectedRevision: 2,
           knowledgeBaseExpectedLeafId: "identity.legal",
         }),
@@ -240,5 +289,29 @@ describe("knowledge-base ChatInput actions", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
 
     await waitFor(() => expect(mocks.sendMessage).not.toHaveBeenCalled());
+  });
+
+  it("unlocks file selection only for an attachment-resume reservation", () => {
+    mocks.activeConversation.status = "running";
+    mocks.activeConversation.knowledgeBase.canReply = false;
+    mocks.activeConversation.knowledgeBase.notice = {
+      errorKey: "attachments-required",
+      code: "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED",
+      message: "请重新选择原文件",
+      severity: "warning" as const,
+      retryable: false,
+      turnId: "turn-2",
+    };
+    const { container } = render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={progress}
+      />,
+    );
+
+    expect(screen.getByRole("textbox")).not.toBeDisabled();
+    expect(container.querySelector('input[type="file"]')).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
   });
 });

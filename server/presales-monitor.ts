@@ -41,7 +41,7 @@ const PUBLIC_MONITOR_PLATFORM_IDS = new Map(
 );
 
 export const MONITOR_REPEAT_PER_PLATFORM = 5;
-export const MONITOR_POLL_INTERVAL_MS = 300_000;
+export const MONITOR_POLL_INTERVAL_MS = 10_000;
 const MONITOR_POLL_LEASE_MS = 120_000;
 const MONITOR_HTTP_TIMEOUT_MS = 60_000;
 const MAX_MONITOR_RESPONSE_BYTES = 12 * 1024 * 1024;
@@ -285,6 +285,7 @@ export function monitorCredentialFromEnv(
     fingerprint: digest.slice(0, 32),
     status: "active",
     verifiedAt: null,
+    retiredAt: null,
   };
 }
 
@@ -1028,10 +1029,6 @@ export function sanitizeMonitorAnswerText(
     })
     .replace(/<\/?[A-Za-z][^>]*>/g, " ")
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n[ \t]+/g, "\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
     .trim();
   return sanitizeMonitorPublicText(text).slice(0, MAX_ANSWER_CHARACTERS);
 }

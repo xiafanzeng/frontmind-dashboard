@@ -1,7 +1,13 @@
 import type {
+  KnowledgeBaseObservationDto as SharedKnowledgeBaseObservationDto,
   KnowledgeBaseInteractionDto,
   KnowledgeBaseProgressDto,
 } from "@shared/knowledge-base-progress";
+
+export type KnowledgeBaseObservationDto = SharedKnowledgeBaseObservationDto & {
+  /** Transitional compatibility for endpoints that still return progress beside observation. */
+  progress?: KnowledgeBaseProgressDto | null;
+};
 
 async function readErrorMessage(response: Response) {
   try {
@@ -47,20 +53,87 @@ export async function reconcileKnowledgeBaseProgress(input: {
   conversationId: string;
   taskId?: string;
 }): Promise<KnowledgeBaseInteractionDto> {
+  const observation = await reconcileKnowledgeBaseObservation(input);
+  return observation.interaction;
+}
+
+function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
+  const source = payload?.observation ?? payload ?? {};
+  const interaction = (source.interaction ?? payload?.interaction) as
+    | KnowledgeBaseInteractionDto
+    | undefined;
+  if (!interaction) {
+    throw new Error("知识库状态接口未返回 interaction");
+  }
+  const progress =
+    (source.progress as KnowledgeBaseProgressDto | null | undefined) ??
+    (payload?.progress as KnowledgeBaseProgressDto | null | undefined) ??
+    interaction.progress ??
+    null;
+  return {
+    stateEpoch: Number(source.stateEpoch ?? 0),
+    generation: Number(source.generation ?? 0),
+    authoritativeTaskId:
+      source.authoritativeTaskId ?? source.taskId ?? payload?.task?.id ?? null,
+    activeTurn: source.activeTurn ?? null,
+    interaction: { ...interaction, progress },
+    approvedPresentation: source.approvedPresentation ?? null,
+    package: source.package ?? null,
+    notice: source.notice ?? null,
+    conversationVersion: source.conversationVersion ?? null,
+    progress,
+  };
+}
+
+export function knowledgeBaseObservationFromPayload(
+  payload: unknown,
+): KnowledgeBaseObservationDto {
+  return normalizeObservation(payload);
+}
+
+export async function reconcileKnowledgeBaseObservation(
+  input: { conversationId: string },
+  signal?: AbortSignal,
+): Promise<KnowledgeBaseObservationDto> {
   const response = await fetch("/api/knowledge-base/progress/reconcile", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversationId: input.conversationId }),
+    signal,
+  });
+  if (!response.ok) {
+    const error = new Error(await readErrorMessage(response)) as Error & {
+      status?: number;
+    };
+    error.status = response.status;
+    throw error;
+  }
+  const payload = await response.json();
+  return normalizeObservation(payload);
+}
+
+export async function retryKnowledgeBaseTurn(input: {
+  conversationId: string;
+  clientRequestId: string;
+  expectedGeneration: number;
+  expectedRevision: number;
+  expectedLeafId: string | null;
+}): Promise<KnowledgeBaseObservationDto> {
+  const response = await fetch("/api/knowledge-base/retry", {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
-  if (!response.ok) throw new Error(await readErrorMessage(response));
-  const payload = await response.json();
-  window.dispatchEvent(
-    new CustomEvent("frontmind:knowledge-progress-updated", {
-      detail: payload.progress,
-    }),
-  );
-  return payload.interaction as KnowledgeBaseInteractionDto;
+  if (!response.ok) {
+    const error = new Error(await readErrorMessage(response)) as Error & {
+      status?: number;
+    };
+    error.status = response.status;
+    throw error;
+  }
+  return normalizeObservation(await response.json());
 }
 
 /**
@@ -83,16 +156,10 @@ export async function getKnowledgeBaseTurnProtocolReminder(
       .flatMap((branch) => branch.leaves)
       .find((leaf) => leaf.id === progress.build.currentLeafId);
     if (!current) {
-      const leafInventory = progress.branches
-        .flatMap((branch) => branch.leaves)
-        .map((leaf) => `${leaf.id}:${leaf.title}`)
-        .join("；");
       return [
         "[知识库状态协议]",
-        `当前知识库已完成，服务端 revision=${progress.build.revision}。本轮用户正在提出发布后的补充或修订，不得直接复用旧 ZIP，也不得创建新知识树。`,
-        `请从现有叶子中选择且只选择一个最相关节点，更新该节点草稿并在回复末尾附一个 FRONTMIND_KB_REOPEN 信封：{"kind":"frontmind.knowledge-base.reopen","schemaVersion":1,"revision":${progress.build.revision},"leafId":"所选节点ID","reason":"本轮修订原因"}。`,
-        "选中的节点会重新进入待核验；用户明确确认后才能再次生成新版 ZIP。",
-        `现有叶子：${leafInventory}`,
+        `当前知识库已完成，服务端 revision=${progress.build.revision}。不得重开节点、复用旧 ZIP 或重建知识树。`,
+        "发布后的修改统一进入维护工单，本对话不再生成状态协议信封。",
       ].join("\n");
     }
     return [

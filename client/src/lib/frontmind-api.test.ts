@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createKnowledgeBaseTurnTask,
+  reserveKnowledgeBaseTurnWithAttachments,
+  stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
   retrieveTask,
@@ -123,6 +125,108 @@ describe("createResponseLogicTask", () => {
 });
 
 describe("createKnowledgeBaseTurnTask", () => {
+  it("reserves the logical turn before any file id exists", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        reservation: {
+          state: "awaiting_attachments",
+          turnId: "turn-reserved",
+          clientRequestId: "request-files",
+          generation: 2,
+          revision: 5,
+          leafId: "1.6",
+          stagedAttachmentCount: 0,
+          expectedAttachmentCount: 1,
+          requiresUpload: true,
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const manifest = [
+      {
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 10,
+        sha256: "a".repeat(64),
+      },
+    ];
+
+    await reserveKnowledgeBaseTurnWithAttachments(
+      [{ role: "user", content: [{ type: "input_text", text: "修订" }] }],
+      {
+        conversationId: "conv-kb",
+        clientRequestId: "request-files",
+        expectedGeneration: 2,
+        expectedRevision: 5,
+        expectedLeafId: "1.6",
+        attachmentManifest: manifest,
+      },
+    );
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/knowledge-base/turn/reserve");
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      conversationId: "conv-kb",
+      clientRequestId: "request-files",
+      expectedGeneration: 2,
+      expectedRevision: 5,
+      expectedLeafId: "1.6",
+      userMessage: "修订",
+      attachmentManifest: manifest,
+      resumeExisting: false,
+    });
+  });
+
+  it("stages one stable file id and dispatches without resending file ids", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ task: { id: "task-next", status: "running" } }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const manifest = [
+      {
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 10,
+        sha256: "a".repeat(64),
+      },
+    ];
+    await stageKnowledgeBaseTurnAttachment({
+      conversationId: "conv-kb",
+      turnId: "turn-reserved",
+      clientRequestId: "request-files",
+      attachmentManifest: manifest,
+      index: 0,
+      attachment: { file_id: "file-facts", filename: "facts.pdf" },
+    });
+    await createKnowledgeBaseTurnTask([], {
+      conversationId: "conv-kb",
+      clientRequestId: "request-files",
+      attachmentReservation: {
+        turnId: "turn-reserved",
+        attachmentManifest: manifest,
+      },
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/knowledge-base/turn/attachments/stage",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/api/knowledge-base/turn/dispatch",
+    );
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      conversationId: "conv-kb",
+      clientRequestId: "request-files",
+      turnId: "turn-reserved",
+      attachmentManifest: manifest,
+    });
+  });
+
   it("fences a confirmation to the visible revision and leaf", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -136,7 +240,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       [{ role: "user", content: [{ type: "input_text", text: "确认" }] }],
       {
         conversationId: "conv-kb",
-        taskId: "task-current",
+        clientRequestId: "request-confirm-1",
         expectedRevision: 45,
         expectedLeafId: "5.5",
       },
@@ -145,10 +249,49 @@ describe("createKnowledgeBaseTurnTask", () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body).toMatchObject({
       conversationId: "conv-kb",
-      taskId: "task-current",
+      clientRequestId: "request-confirm-1",
       userMessage: "确认",
       expectedRevision: 45,
       expectedLeafId: "5.5",
+    });
+  });
+
+  it("accepts a complete terminal observation without a task pointer", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        observation: {
+          stateEpoch: 8,
+          generation: 2,
+          authoritativeTaskId: null,
+          activeTurn: null,
+          interaction: {
+            progress: null,
+            interactionState: "published",
+            canReply: false,
+            canPublish: false,
+            lockReason: null,
+          },
+          approvedPresentation: null,
+          package: null,
+          notice: null,
+          conversationVersion: 9,
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      createKnowledgeBaseTurnTask(
+        [{ role: "user", content: [{ type: "input_text", text: "确认" }] }],
+        {
+          conversationId: "conv-terminal",
+          clientRequestId: "request-terminal",
+        },
+      ),
+    ).resolves.toMatchObject({
+      id: "kb-observation-2-8",
+      knowledgeObservation: { stateEpoch: 8, generation: 2 },
     });
   });
 });

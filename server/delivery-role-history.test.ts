@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { deliveryHistoryTimestamp } from "./delivery-role-service";
+import {
+  deliveryTicketActionRank,
+  deliveryTicketDependencyState,
+  deliveryHistoryTimestamp,
+  deliveryTicketStatusGroup,
+  getMyDeliveryTickets,
+  MY_DELIVERY_TICKET_LIMIT,
+} from "./delivery-role-service";
 
 describe("delivery history timestamps", () => {
   it("accepts decoded dates and raw driver timestamp strings", () => {
@@ -16,5 +23,56 @@ describe("delivery history timestamps", () => {
     expect(() => deliveryHistoryTimestamp("not-a-date")).toThrow(
       "任务记录的时间数据无效，请稍后重试",
     );
+  });
+});
+
+describe("my delivery ticket pool", () => {
+  it("uses the two public status groups and a bounded result", () => {
+    expect(deliveryTicketStatusGroup("submitted")).toBe("pending");
+    expect(deliveryTicketStatusGroup("in_progress")).toBe("pending");
+    expect(deliveryTicketStatusGroup("completed")).toBe("completed");
+    expect(deliveryTicketStatusGroup("rejected")).toBe("completed");
+    expect(deliveryTicketStatusGroup("unknown")).toBeNull();
+    expect(MY_DELIVERY_TICKET_LIMIT).toBe(50);
+    expect(
+      [
+        "in_progress",
+        "submitted",
+        "scheduled",
+        "needs_information",
+        "completed",
+      ].map(deliveryTicketActionRank),
+    ).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it("makes the monitoring dependency an explicit server decision", () => {
+    expect(
+      deliveryTicketDependencyState({
+        operation: "initial_monitoring",
+        status: "submitted",
+        hasCompletedQuestionCatalog: false,
+      }),
+    ).toMatchObject({
+      dependencySatisfied: false,
+      dependencyBlockReason: expect.stringContaining("品牌词库与问题目录"),
+    });
+    expect(
+      deliveryTicketDependencyState({
+        operation: "initial_monitoring",
+        status: "submitted",
+        hasCompletedQuestionCatalog: true,
+      }),
+    ).toEqual({
+      dependencySatisfied: true,
+      dependencyBlockReason: null,
+    });
+  });
+
+  it("rejects non-engineers before attempting any database query", async () => {
+    await expect(
+      getMyDeliveryTickets({
+        actor: { id: 9, role: "user" } as any,
+      }),
+    ).rejects.toThrow("该工单池仅对工程师开放");
   });
 });

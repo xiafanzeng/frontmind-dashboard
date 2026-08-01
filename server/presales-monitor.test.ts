@@ -532,6 +532,28 @@ describe("presales monitor payload and reservation", () => {
     ]);
   });
 
+  it("preserves the Markdown structure used by real monitoring answers", () => {
+    const markdown = `# 服务商靠谱性综合评估
+
+## 一、优势（靠谱的地方）
+
+### 1. 技术与性价比突出
+
+1. **接口兼容性**：兼容 OpenAI 格式；
+2. **部署形态**：支持公有云与私有化部署。
+
+> ⚠️ 区分：共享 API ≠ 独享算力实例${"  "}
+> ✅ 测试、低并发业务：按量实例可用
+
+调用路径为 \`/v1/chat/completions\`。
+
+### ❌ 不适合
+
+- 要求严格 SLA 的核心业务。`;
+
+    expect(sanitizeMonitorAnswerText(markdown)).toBe(markdown);
+  });
+
   it("redacts a monitor secret before limiting error text length", () => {
     const secret = "sk-frontmind-secret-value";
     const cleaned = sanitizeMonitorErrorText(
@@ -677,7 +699,7 @@ describe("presales monitor payload and reservation", () => {
 });
 
 describe("presales monitor polling and public result", () => {
-  it("does not poll before 300 seconds and coalesces high-frequency GETs", async () => {
+  it("does not poll before 10 seconds and coalesces high-frequency GETs", async () => {
     const harness = makeHarness(["deepseek"]);
     const created = await harness.service.create(createInput());
     await Promise.all(

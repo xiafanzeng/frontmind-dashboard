@@ -1,6 +1,19 @@
+import { execFileSync } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
-import { extname, join, relative, resolve } from "node:path";
+import { basename, extname, join, relative, resolve } from "node:path";
 import JSZip from "jszip";
+import {
+  canonicalKnowledgeBaseSkillArchiveHash,
+  legacyKnowledgeBaseSkillInstructionHash,
+} from "../shared/knowledge-base-skill-archive-hash.js";
+import {
+  assertCleanProductionApprovalSource,
+  assertCleanProductionBuildSource,
+} from "./assert-clean-build-source.mjs";
+import {
+  assertBuildArtifactLineage,
+  verifyBuildArtifactManifest,
+} from "./build-artifact-identity.mjs";
 
 const projectRoot = resolve(import.meta.dirname, "..");
 const buildRoot = resolve(projectRoot, process.argv[2] || "dist");
@@ -126,6 +139,7 @@ const requiredSkillFiles = [
   "private-workflows/socratic-kb-builder.skill",
   "private-workflows/socratic-kb-builder-v1.skill",
   "private-workflows/socratic-kb-builder-v3.skill",
+  "private-workflows/socratic-kb-builder-v4.skill",
   "private-workflows/brand-question-portfolio.skill/SKILL.md",
   "private-workflows/brand-question-portfolio.skill/references/output-contract.md",
   "private-workflows/response-logic-builder.skill/SKILL.md",
@@ -140,6 +154,7 @@ const runtimeSkillRoots = [
   "private-workflows/socratic-kb-builder.skill",
   "private-workflows/socratic-kb-builder-v1.skill",
   "private-workflows/socratic-kb-builder-v3.skill",
+  "private-workflows/socratic-kb-builder-v4.skill",
   "private-workflows/brand-question-portfolio.skill",
   "private-workflows/response-logic-builder.skill",
 ];
@@ -209,10 +224,7 @@ function containsJavaScriptString(bundle, value) {
   if (bundle.includes(value)) return true;
   const unicodeEscaped = Array.from(value, (character) => {
     const codePoint = character.codePointAt(0);
-    if (
-      codePoint === undefined ||
-      (codePoint >= 0x20 && codePoint <= 0x7e)
-    ) {
+    if (codePoint === undefined || (codePoint >= 0x20 && codePoint <= 0x7e)) {
       return character;
     }
     if (codePoint <= 0xffff) {
@@ -238,7 +250,129 @@ try {
   process.exit(1);
 }
 
+const artifactManifest = await verifyBuildArtifactManifest(buildRoot);
+const expectedArtifactRoot = String(
+  process.env.FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256 || "",
+)
+  .trim()
+  .toLowerCase();
+if (!/^[a-f0-9]{64}$/u.test(expectedArtifactRoot)) {
+  throw new Error("FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256_REQUIRED");
+}
+if (expectedArtifactRoot !== artifactManifest.rootSha256) {
+  throw new Error("FRONTMIND_ARTIFACT_EXTERNAL_ROOT_MISMATCH");
+}
+
+if (process.env.FRONTMIND_INTERNAL_RELEASE_AUDIT_STAGE) {
+  if (
+    process.env.FRONTMIND_INTERNAL_RELEASE_AUDIT_STAGE !==
+    artifactManifest.buildSourceSha
+  ) {
+    throw new Error("BUILD_INTERNAL_AUDIT_STAGE_NOT_AUTHORIZED");
+  }
+  assertCleanProductionBuildSource({
+    repositoryRoot: projectRoot,
+    expectedBuildSha: artifactManifest.buildSourceSha,
+    env: process.env,
+  });
+} else {
+  const approvalSha =
+    process.env.FRONTMIND_APPROVED_RELEASE_SHA?.trim().toLowerCase() ||
+    execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: projectRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+      .trim()
+      .toLowerCase();
+  assertCleanProductionApprovalSource({
+    repositoryRoot: projectRoot,
+    approvalSha,
+    buildSourceSha: artifactManifest.buildSourceSha,
+    env: process.env,
+  });
+  assertBuildArtifactLineage({
+    repositoryRoot: projectRoot,
+    approvalSha,
+    buildSourceSha: artifactManifest.buildSourceSha,
+  });
+}
+
 const violations = [];
+try {
+  const skillRoot = join(buildRoot, "private-workflows");
+  const aliasNames = (await readdir(skillRoot)).filter((name) =>
+    /^socratic-kb-builder-v[34]-[a-f0-9]{64}\.skill$/u.test(name),
+  );
+  const records = [];
+  for (const name of aliasNames) {
+    const archivePath = join(skillRoot, name);
+    const bytes = await readFile(archivePath);
+    const archive = await JSZip.loadAsync(bytes);
+    const entryNames = Object.keys(archive.files);
+    for (const [entryName, entry] of Object.entries(archive.files)) {
+      const originalName = entry.unsafeOriginalName || entryName;
+      if (
+        originalName.startsWith("/") ||
+        /^[A-Za-z]:/u.test(originalName) ||
+        originalName.includes("\\") ||
+        originalName.split("/").includes("..") ||
+        !allowedKnowledgeBaseArchiveEntries.has(entryName)
+      ) {
+        violations.push({
+          file: `${relative(projectRoot, archivePath)}:${entryName}`,
+          label: "invalid historical Skill archive entry",
+        });
+      }
+      if (entry.dir) continue;
+      const content = await entry.async("string");
+      for (const rule of forbiddenPatterns) {
+        if (rule.pattern.test(content)) {
+          violations.push({
+            file: `${relative(projectRoot, archivePath)}:${entryName}`,
+            label: rule.label,
+          });
+        }
+      }
+    }
+    for (const required of requiredKnowledgeBaseEntries) {
+      if (!entryNames.includes(required)) {
+        violations.push({
+          file: relative(projectRoot, archivePath),
+          label: `missing Skill entry ${required}`,
+        });
+      }
+    }
+    records.push({
+      name,
+      pinnedHash: basename(name, ".skill").split("-").at(-1),
+      canonicalHash: await canonicalKnowledgeBaseSkillArchiveHash(bytes),
+      legacyHash: await legacyKnowledgeBaseSkillInstructionHash(bytes),
+    });
+  }
+  for (const record of records) {
+    const direct =
+      record.pinnedHash === record.canonicalHash ||
+      record.pinnedHash === record.legacyHash;
+    const anchored = records.some(
+      (candidate) =>
+        candidate.canonicalHash === record.canonicalHash &&
+        (candidate.pinnedHash === candidate.canonicalHash ||
+          candidate.pinnedHash === candidate.legacyHash),
+    );
+    if (!direct && !anchored) {
+      violations.push({
+        file: `private-workflows/${record.name}`,
+        label: "historical Skill alias has no canonical or legacy anchor",
+      });
+    }
+  }
+} catch {
+  violations.push({
+    file: "private-workflows/socratic-kb-builder-v3/v4-<hash>.skill",
+    label: "historical runtime Skill aliases cannot be audited",
+  });
+}
 for (const sourceRoot of ["client", "server"]) {
   for (const file of await collectTestSourceFiles(
     join(projectRoot, sourceRoot),
@@ -348,7 +482,7 @@ try {
   const archivePath = join(
     buildRoot,
     "private-workflows",
-    "socratic-kb-builder-v3.skill",
+    "socratic-kb-builder-v4.skill",
   );
   const archive = await JSZip.loadAsync(await readFile(archivePath));
   for (const [entryName, entry] of Object.entries(archive.files)) {
@@ -395,7 +529,7 @@ try {
   }
 } catch {
   violations.push({
-    file: "private-workflows/socratic-kb-builder-v3.skill",
+    file: "private-workflows/socratic-kb-builder-v4.skill",
     label: "invalid runtime Skill archive",
   });
 }
@@ -411,6 +545,7 @@ try {
   if (
     typeof version.version !== "string" ||
     !/^[a-f0-9]{40}$/i.test(version.gitSha || "") ||
+    version.gitSha.toLowerCase() !== artifactManifest.buildSourceSha ||
     !Number.isFinite(Date.parse(version.builtAt || "")) ||
     version.copyRevision !== "knowledge-collection-copy-v2"
   ) {
@@ -430,7 +565,9 @@ try {
     "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。";
   const [clientBundles, serverBundle] = await Promise.all([
     Promise.all(
-      javascriptAssets.map((asset) => readFile(join(publicRoot, asset), "utf8")),
+      javascriptAssets.map((asset) =>
+        readFile(join(publicRoot, asset), "utf8"),
+      ),
     ),
     readFile(join(buildRoot, "index.js"), "utf8"),
   ]);
@@ -440,10 +577,25 @@ try {
   if (!containsJavaScriptString(serverBundle, activeCopy)) {
     throw new Error("active copy is missing from the server bundle");
   }
+  for (const releaseIdentityMarker of [
+    artifactManifest.buildSourceSha,
+    "FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256",
+    "FRONTMIND_APPROVED_RELEASE_SHA",
+    "expectedRootSha256",
+    "actualRootSha256",
+    "/readyz",
+  ]) {
+    if (!serverBundle.includes(releaseIdentityMarker)) {
+      throw new Error(
+        `release identity marker is missing from server bundle: ${releaseIdentityMarker}`,
+      );
+    }
+  }
 } catch {
   violations.push({
     file: "public/__frontmind__/version.json",
-    label: "build identity, loaded assets, or active server copy is inconsistent",
+    label:
+      "build identity, loaded assets, or active server copy is inconsistent",
   });
 }
 
@@ -470,7 +622,17 @@ for (const entry of allEntries) {
     }
   }
 }
+const validatedIdentityMetadata = new Set([
+  "artifact-manifest.json",
+  "build-source.json",
+  "public/__frontmind__/version.json",
+]);
 for (const file of await collectTextFiles(buildRoot)) {
+  const artifactRelativePath = relative(buildRoot, file).split("\\").join("/");
+  // These files are parsed and cryptographically validated above. Scanning
+  // random hexadecimal hashes as prose would create probabilistic false
+  // positives for numeric policy patterns such as the retired port.
+  if (validatedIdentityMetadata.has(artifactRelativePath)) continue;
   const content = withoutApprovedBranding(await readFile(file, "utf8"));
   for (const rule of forbiddenPatterns) {
     if (rule.pattern.test(content)) {

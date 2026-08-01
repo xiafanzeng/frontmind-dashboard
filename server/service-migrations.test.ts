@@ -10,6 +10,22 @@ import {
 } from "../drizzle/schema";
 
 const drizzleRoot = path.resolve(process.cwd(), "drizzle");
+const knowledgeBaseDeploymentRunbook = path.resolve(
+  process.cwd(),
+  "KNOWLEDGE_BASE_V2_DEPLOYMENT.md",
+);
+const knowledgeBaseMysqlAcceptance = path.resolve(
+  process.cwd(),
+  "scripts/knowledge-base-mysql-acceptance.test.ts",
+);
+const knowledgeBaseMysqlE2eAcceptance = path.resolve(
+  process.cwd(),
+  "scripts/knowledge-base-mysql-e2e-acceptance.test.ts",
+);
+const apiUsageMigrationVerifier = path.resolve(
+  process.cwd(),
+  "scripts/verify-api-usage-migration-schema.mjs",
+);
 
 async function migration(name: string) {
   return readFile(path.join(drizzleRoot, name), "utf8");
@@ -90,7 +106,299 @@ describe("service portal migration chain", () => {
       "0042_heavy_xorn",
       "0043_clumsy_lilandra",
       "0044_delivery_history_credentials_and_website_style",
+      "0045_knowledge_base_state_machine",
+      "0046_api_usage_snapshot_claims",
+      "0047_api_usage_task_ledger",
+      "0048_api_usage_coverage_claims",
     ]);
+  });
+
+  it("adds an immutable task usage ledger and coverage proof without destructive changes", async () => {
+    const migrationSql = await migration("0047_api_usage_task_ledger.sql");
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
+    for (const statement of [
+      "CREATE TABLE `api_usage_credential_coverage`",
+      "CREATE TABLE `api_usage_task_ledger`",
+      "`isTerminal` boolean NOT NULL DEFAULT false",
+      "`allTasksSettled` boolean NOT NULL DEFAULT false",
+      "api_usage_task_ledger_scope_task_uq",
+      "api_usage_task_ledger_pool_time_idx",
+    ]) {
+      expect(migrationSql).toContain(statement);
+    }
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0047_snapshot.json"),
+        "utf8",
+      ),
+    );
+    expect(
+      snapshot.tables.api_usage_task_ledger.columns.isTerminal,
+    ).toMatchObject({ type: "boolean", notNull: true, default: false });
+    expect(
+      snapshot.tables.api_usage_credential_coverage.columns.allTasksSettled,
+    ).toMatchObject({ type: "boolean", notNull: true, default: false });
+  });
+
+  it("adds token-bound coverage scan claims without rewriting ledger facts", async () => {
+    const migrationSql = await migration("0048_api_usage_coverage_claims.sql");
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
+    for (const statement of [
+      "ADD `scanGeneration` int unsigned DEFAULT 0 NOT NULL",
+      "ADD `scanToken` varchar(36)",
+      "ADD `scanStartedAtMs` bigint unsigned",
+      "CREATE INDEX `api_usage_credential_coverage_claim_idx`",
+    ]) {
+      expect(migrationSql).toContain(statement);
+    }
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0048_snapshot.json"),
+        "utf8",
+      ),
+    );
+    expect(
+      snapshot.tables.api_usage_credential_coverage.columns.scanGeneration,
+    ).toMatchObject({ type: "int unsigned", notNull: true, default: 0 });
+    expect(
+      snapshot.tables.api_usage_credential_coverage.indexes
+        .api_usage_credential_coverage_claim_idx,
+    ).toMatchObject({
+      isUnique: false,
+      columns: ["scanToken", "scanStartedAtMs"],
+    });
+  });
+
+  it("keeps 0046-0048 behind an exact ordered-ledger and schema gate", async () => {
+    const [verifier, runbook] = await Promise.all([
+      readFile(apiUsageMigrationVerifier, "utf8"),
+      readFile(knowledgeBaseDeploymentRunbook, "utf8"),
+    ]);
+
+    for (const requiredGuard of [
+      "MIGRATION_LEDGER_NOT_APPROVED_PREFIX",
+      "MIGRATION_LEDGER_PREFIX_MISMATCH",
+      "MIGRATION_LEDGER_INCOMPLETE",
+      "API_USAGE_PENDING_COLUMN_PRESENT",
+      "API_USAGE_PENDING_INDEX_PRESENT",
+      "API_USAGE_PENDING_TABLE_PRESENT",
+      "API_USAGE_COLUMN_SET_MISMATCH",
+      "API_USAGE_FOREIGN_KEY_MISMATCH",
+      "API_USAGE_0046_0048_SCHEMA_OK",
+      "0046_api_usage_snapshot_claims",
+      "0047_api_usage_task_ledger",
+      "0048_api_usage_coverage_claims",
+    ]) {
+      expect(verifier).toContain(requiredGuard);
+    }
+    for (const requiredGuard of [
+      "verify-api-usage-migration-schema.mjs pre",
+      "verify-api-usage-migration-schema.mjs post",
+      "API_USAGE_0046_0048_SCHEMA_VERIFIED=YES",
+      "严格有序前缀",
+      "完全一致",
+    ]) {
+      expect(runbook).toContain(requiredGuard);
+    }
+  });
+
+  it("adds monotonic API usage snapshot claims without rewriting usage data", async () => {
+    const migrationSql = await migration("0046_api_usage_snapshot_claims.sql");
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
+    for (const statement of [
+      "ADD `syncGeneration` int unsigned DEFAULT 0 NOT NULL",
+      "ADD `syncToken` varchar(36)",
+      "ADD `syncStartedAt` timestamp",
+      "CREATE INDEX `api_usage_snapshots_sync_claim_idx`",
+    ]) {
+      expect(migrationSql).toContain(statement);
+    }
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0046_snapshot.json"),
+        "utf8",
+      ),
+    );
+    expect(
+      snapshot.tables.api_usage_snapshots.columns.syncGeneration,
+    ).toMatchObject({ type: "int unsigned", notNull: true, default: 0 });
+    expect(snapshot.tables.api_usage_snapshots.columns.syncToken).toMatchObject(
+      {
+        type: "varchar(36)",
+        notNull: false,
+      },
+    );
+    expect(
+      snapshot.tables.api_usage_snapshots.indexes
+        .api_usage_snapshots_sync_claim_idx,
+    ).toMatchObject({
+      isUnique: false,
+      columns: ["syncToken", "syncStartedAt"],
+    });
+  });
+
+  it("adds the exactly-once knowledge-base state machine without destructive changes", async () => {
+    const migrationSql = await migration(
+      "0045_knowledge_base_state_machine.sql",
+    );
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
+    for (const statement of [
+      "ADD `operationKey` varchar(128)",
+      "ADD `attachmentFileIds` json DEFAULT ('[]') NOT NULL",
+      "ADD `metadata` json DEFAULT ('{}') NOT NULL",
+      "ADD `generation` int unsigned DEFAULT 1 NOT NULL",
+      "ADD `stateEpoch` int unsigned DEFAULT 0 NOT NULL",
+      "ADD `activeTurnId` varchar(36)",
+      "ADD `recoveryLeaseOwnerHash` varchar(64)",
+      "ADD `recoveryLeaseExpiresAt` timestamp",
+      "ADD `sourceTurnId` varchar(36)",
+      "ADD `contentSha256` varchar(64)",
+      "ADD CONSTRAINT `conversation_turns_operation_key_uq` UNIQUE(`operationKey`)",
+      "ON DELETE set null ON UPDATE no action",
+      "CREATE INDEX `conversation_turns_build_generation_idx`",
+      "CREATE INDEX `conversation_turns_lease_idx`",
+      "CREATE INDEX `knowledge_base_builds_active_turn_idx`",
+      "CREATE INDEX `knowledge_base_builds_recovery_lease_idx`",
+    ]) {
+      expect(migrationSql).toContain(statement);
+    }
+
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0045_snapshot.json"),
+        "utf8",
+      ),
+    ) as {
+      tables: Record<
+        string,
+        {
+          columns: Record<
+            string,
+            { type: string; notNull: boolean; default?: unknown }
+          >;
+          indexes: Record<string, { isUnique: boolean; columns: string[] }>;
+          foreignKeys: Record<
+            string,
+            { tableTo: string; columnsFrom: string[]; onDelete?: string }
+          >;
+        }
+      >;
+    };
+    const turns = snapshot.tables.conversation_turns;
+    const builds = snapshot.tables.knowledge_base_builds;
+    const nodes = snapshot.tables.knowledge_base_build_nodes;
+    expect(turns.columns.attachmentFileIds).toMatchObject({
+      type: "json",
+      notNull: true,
+      default: "('[]')",
+    });
+    expect(turns.columns.metadata).toMatchObject({
+      type: "json",
+      notNull: true,
+      default: "('{}')",
+    });
+    expect(builds.columns.generation).toMatchObject({
+      type: "int unsigned",
+      notNull: true,
+      default: 1,
+    });
+    expect(builds.columns.stateEpoch).toMatchObject({
+      type: "int unsigned",
+      notNull: true,
+      default: 0,
+    });
+    expect(builds.columns.recoveryLeaseOwnerHash).toMatchObject({
+      type: "varchar(64)",
+      notNull: false,
+    });
+    expect(builds.columns.recoveryLeaseExpiresAt).toMatchObject({
+      type: "timestamp",
+      notNull: false,
+    });
+    expect(
+      builds.indexes.knowledge_base_builds_recovery_lease_idx,
+    ).toMatchObject({
+      isUnique: false,
+      columns: ["status", "recoveryLeaseExpiresAt"],
+    });
+    expect(turns.indexes.conversation_turns_operation_key_uq).toMatchObject({
+      isUnique: true,
+      columns: ["operationKey"],
+    });
+    expect(
+      turns.foreignKeys.conversation_turns_buildId_knowledge_base_builds_id_fk,
+    ).toMatchObject({
+      tableTo: "knowledge_base_builds",
+      columnsFrom: ["buildId"],
+      onDelete: "set null",
+    });
+    expect(nodes.columns.contentSha256).toMatchObject({
+      type: "varchar(64)",
+      notNull: false,
+    });
+  });
+
+  it("keeps the 0045 deployment gate restart-safe and exact", async () => {
+    const runbook = await readFile(knowledgeBaseDeploymentRunbook, "utf8");
+
+    for (const requiredGuard of [
+      "KB_0045_PARTIAL_SCHEMA_RESTORE_REQUIRED",
+      "KB_V2_SCHEMA_OBJECTS_BEFORE=columns:${presentColumns}",
+      "KB migration ledger mismatch",
+      "column_type, is_nullable, column_default",
+      "conversation_turns_buildId_knowledge_base_builds_id_fk",
+      "KB foreign key mismatch",
+      "FRONTMIND_KB_V2_COMPLETION_V3",
+      "FRONTMIND_KB_MYSQL_ACCEPTANCE_DATABASE_URL",
+      "unset DATABASE_URL; cd /app && pnpm test:kb:mysql-acceptance",
+      "unset DATABASE_URL; cd /app && pnpm test:kb:mysql-e2e-acceptance",
+      "KB_MYSQL_ACCEPTANCE_COMPLETED",
+      "KB_MYSQL_E2E_ACCEPTANCE_COMPLETED",
+      "mysqlStateMachineAccepted=YES",
+      "mysqlEightLeafE2eAccepted=YES",
+      "migrationHash=$KB_0045_EXPECTED_HASH",
+      "migrationWhen=$KB_0045_EXPECTED_WHEN",
+      "只能完整恢复本轮已验证的 `DATABASE_BACKUP`",
+    ]) {
+      expect(runbook).toContain(requiredGuard);
+    }
+  });
+
+  it("keeps real-MySQL acceptance isolated from the production database", async () => {
+    const [harness, e2eHarness] = await Promise.all([
+      readFile(knowledgeBaseMysqlAcceptance, "utf8"),
+      readFile(knowledgeBaseMysqlE2eAcceptance, "utf8"),
+    ]);
+
+    for (const source of [harness, e2eHarness]) {
+      expect(source).toContain("frontmind_kb_acceptance");
+      expect(source).toContain("DATABASE_MUST_BE_EMPTY");
+      expect(source).not.toContain("process.env.DATABASE_URL");
+      expect(source).not.toMatch(/DROP\s+(?:DATABASE|SCHEMA|TABLE)/iu);
+    }
+    expect(harness).toContain("reserveKnowledgeBaseStartBuild");
+    expect(harness).toContain("reserveKnowledgeBaseTurn");
+    expect(harness).toContain("claimKnowledgeBaseTurnForRecovery");
+    expect(harness).toContain("FOR UPDATE");
+    expect(harness).toContain("ER_DUP_ENTRY");
+    expect(e2eHarness).toContain("KB_MYSQL_E2E_ACCEPTANCE_COMPLETE");
+    expect(e2eHarness).toContain("frontmind-knowledge-base.zip");
+    for (const migrationTag of [
+      "0045_knowledge_base_state_machine",
+      "0046_api_usage_snapshot_claims",
+      "0047_api_usage_task_ledger",
+      "0048_api_usage_coverage_claims",
+    ]) {
+      expect(e2eHarness).toContain(migrationTag);
+    }
   });
 
   it("drops the delivery-role foreign keys by their executable migration names", async () => {
@@ -749,8 +1057,6 @@ describe("service portal migration chain", () => {
       expect(delivery).toContain(`CREATE TABLE \`${table}\``);
     }
     expect(delivery).toContain("website_style_samples_attachment_fk");
-    expect(delivery).not.toMatch(
-      /(?:^|\n)\s*(?:DROP|TRUNCATE|DELETE)\s/mi,
-    );
+    expect(delivery).not.toMatch(/(?:^|\n)\s*(?:DROP|TRUNCATE|DELETE)\s/im);
   });
 });

@@ -8,11 +8,125 @@ export const KNOWLEDGE_BASE_REOPEN_KIND = "frontmind.knowledge-base.reopen";
 export const KNOWLEDGE_BASE_PRESENTATION_KIND =
   "frontmind.knowledge-base.presentation";
 export const KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION = 1;
+export const KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION = 2;
+export type KnowledgeBaseProtocolSchemaVersion =
+  | typeof KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION
+  | typeof KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION;
 export const KNOWLEDGE_BASE_PROGRESS_MARKER = "FRONTMIND_KB_PROGRESS";
 export const KNOWLEDGE_BASE_MANIFEST_MARKER = "FRONTMIND_KB_MANIFEST";
 export const KNOWLEDGE_BASE_REOPEN_MARKER = "FRONTMIND_KB_REOPEN";
-export const KNOWLEDGE_BASE_PRESENTATION_MARKER =
-  "FRONTMIND_KB_PRESENTATION";
+export const KNOWLEDGE_BASE_PRESENTATION_MARKER = "FRONTMIND_KB_PRESENTATION";
+
+export type KnowledgeBaseUpstreamTaskPhase =
+  | "active"
+  | "awaiting_input"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "unknown";
+
+export interface KnowledgeBaseUpstreamTaskStatus {
+  normalized: string;
+  phase: KnowledgeBaseUpstreamTaskPhase;
+  /** The provider will not append ordinary streaming text in this state. */
+  settled: boolean;
+  terminal: boolean;
+  failed: boolean;
+}
+
+/**
+ * Keep provider status handling in one place. Providers have used all of the
+ * aliases below in production; treating only `completed` as terminal leaves a
+ * durable build locked forever after a perfectly ordinary `done` response.
+ */
+export function classifyKnowledgeBaseUpstreamTaskStatus(
+  status: unknown,
+): KnowledgeBaseUpstreamTaskStatus {
+  const normalized = String(status || "running")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (
+    new Set([
+      "completed",
+      "complete",
+      "succeeded",
+      "success",
+      "done",
+      "finished",
+    ]).has(normalized)
+  ) {
+    return {
+      normalized,
+      phase: "succeeded",
+      settled: true,
+      terminal: true,
+      failed: false,
+    };
+  }
+  if (new Set(["failed", "error", "errored"]).has(normalized)) {
+    return {
+      normalized,
+      phase: "failed",
+      settled: true,
+      terminal: true,
+      failed: true,
+    };
+  }
+  if (new Set(["cancelled", "canceled"]).has(normalized)) {
+    return {
+      normalized,
+      phase: "cancelled",
+      settled: true,
+      terminal: true,
+      failed: true,
+    };
+  }
+  if (
+    new Set([
+      "awaiting_input",
+      "awaiting_user",
+      "awaiting_user_input",
+      "waiting",
+      "paused",
+      "requires_action",
+      "input_required",
+    ]).has(normalized)
+  ) {
+    return {
+      normalized,
+      phase: "awaiting_input",
+      settled: true,
+      terminal: false,
+      failed: false,
+    };
+  }
+  if (
+    new Set([
+      "created",
+      "queued",
+      "pending",
+      "running",
+      "in_progress",
+      "processing",
+    ]).has(normalized)
+  ) {
+    return {
+      normalized,
+      phase: "active",
+      settled: false,
+      terminal: false,
+      failed: false,
+    };
+  }
+  return {
+    normalized,
+    phase: "unknown",
+    settled: false,
+    terminal: false,
+    failed: false,
+  };
+}
 
 export const knowledgeBaseLeafStatuses = [
   "pending",
@@ -61,20 +175,26 @@ export interface KnowledgeBaseProgressTransition {
 
 export interface KnowledgeBaseProgressEnvelope {
   kind: typeof KNOWLEDGE_BASE_PROGRESS_KIND;
-  schemaVersion: typeof KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION;
+  schemaVersion: KnowledgeBaseProtocolSchemaVersion;
+  operationId?: string;
+  turnId?: string;
   revision: number;
   transition: KnowledgeBaseProgressTransition;
 }
 
 export interface KnowledgeBaseManifestEnvelope {
   kind: typeof KNOWLEDGE_BASE_MANIFEST_KIND;
-  schemaVersion: typeof KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION;
+  schemaVersion: KnowledgeBaseProtocolSchemaVersion;
+  operationId?: string;
+  turnId?: string;
   leaves: KnowledgeBaseLeafManifestEntry[];
 }
 
 export interface KnowledgeBaseReopenEnvelope {
   kind: typeof KNOWLEDGE_BASE_REOPEN_KIND;
-  schemaVersion: typeof KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION;
+  schemaVersion: KnowledgeBaseProtocolSchemaVersion;
+  operationId?: string;
+  turnId?: string;
   revision: number;
   leafId: string;
   reason?: string;
@@ -82,7 +202,9 @@ export interface KnowledgeBaseReopenEnvelope {
 
 export interface KnowledgeBasePresentationEnvelope {
   kind: typeof KNOWLEDGE_BASE_PRESENTATION_KIND;
-  schemaVersion: typeof KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION;
+  schemaVersion: KnowledgeBaseProtocolSchemaVersion;
+  operationId?: string;
+  turnId?: string;
   /** The authoritative revision after the progress transition is applied. */
   revision: number;
   /** The leaf rendered for the next customer action, or null at completion. */
@@ -111,6 +233,7 @@ export type KnowledgeBaseProgressErrorCode =
   | "INVALID_MANIFEST"
   | "INVALID_STATE"
   | "INVALID_ENVELOPE"
+  | "STALE_OPERATION"
   | "STALE_REVISION"
   | "NO_CURRENT_LEAF"
   | "WRONG_LEAF"
@@ -154,6 +277,65 @@ function assertOnlyKeys(
     fail(
       "INVALID_ENVELOPE",
       `${label} contains unsupported fields: ${unexpectedKeys.join(", ")}`,
+    );
+  }
+}
+
+function parseProtocolIdentity(value: Record<string, unknown>) {
+  const schemaVersion = value.schemaVersion;
+  if (
+    schemaVersion !== KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION &&
+    schemaVersion !== KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION
+  ) {
+    fail("INVALID_ENVELOPE", "Protocol envelope schema version is invalid");
+  }
+  const operationId =
+    typeof value.operationId === "string" ? value.operationId.trim() : "";
+  const turnId = typeof value.turnId === "string" ? value.turnId.trim() : "";
+  if (schemaVersion === KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION) {
+    if (!operationId || operationId.length > 128) {
+      fail("INVALID_ENVELOPE", "v4 envelope operationId is required");
+    }
+    if (!turnId || turnId.length > 36) {
+      fail("INVALID_ENVELOPE", "v4 envelope turnId is required");
+    }
+  } else if (value.operationId !== undefined || value.turnId !== undefined) {
+    fail(
+      "INVALID_ENVELOPE",
+      "Legacy envelope cannot declare v4 operation identity",
+    );
+  }
+  return {
+    schemaVersion,
+    ...(operationId ? { operationId } : {}),
+    ...(turnId ? { turnId } : {}),
+  } as const;
+}
+
+export function assertKnowledgeBaseProtocolOperation(
+  envelope: {
+    schemaVersion: KnowledgeBaseProtocolSchemaVersion;
+    operationId?: string;
+    turnId?: string;
+  },
+  expected: { operationId: string; turnId: string; requireV4: boolean },
+) {
+  if (!expected.requireV4) {
+    if (envelope.schemaVersion !== KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION) {
+      fail("INVALID_ENVELOPE", "Legacy build received a v4 protocol envelope");
+    }
+    return;
+  }
+  if (envelope.schemaVersion !== KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION) {
+    fail("INVALID_ENVELOPE", "v4 build received a legacy protocol envelope");
+  }
+  if (
+    envelope.operationId !== expected.operationId ||
+    envelope.turnId !== expected.turnId
+  ) {
+    fail(
+      "STALE_OPERATION",
+      "Protocol envelope does not belong to the active knowledge-base turn",
     );
   }
 }
@@ -303,7 +485,10 @@ function parseManifestEnvelopeObject(
     fail("INVALID_MANIFEST", "Manifest envelope must be an object");
   }
   const unexpectedKeys = Object.keys(input).filter(
-    (key) => !["kind", "schemaVersion", "leaves"].includes(key),
+    (key) =>
+      !["kind", "schemaVersion", "operationId", "turnId", "leaves"].includes(
+        key,
+      ),
   );
   if (unexpectedKeys.length > 0) {
     fail(
@@ -314,15 +499,21 @@ function parseManifestEnvelopeObject(
   if (input.kind !== KNOWLEDGE_BASE_MANIFEST_KIND) {
     fail("INVALID_MANIFEST", "Manifest envelope kind is invalid");
   }
-  if (input.schemaVersion !== KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION) {
-    fail("INVALID_MANIFEST", "Manifest envelope schema version is invalid");
+  let identity: ReturnType<typeof parseProtocolIdentity>;
+  try {
+    identity = parseProtocolIdentity(input);
+  } catch (error) {
+    if (error instanceof KnowledgeBaseProgressError) {
+      fail("INVALID_MANIFEST", error.message);
+    }
+    throw error;
   }
   if (!Array.isArray(input.leaves)) {
     fail("INVALID_MANIFEST", "Manifest envelope leaves must be an array");
   }
   return {
     kind: KNOWLEDGE_BASE_MANIFEST_KIND,
-    schemaVersion: KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION,
+    ...identity,
     leaves: validateProductionKnowledgeBaseLeafManifest(
       input.leaves as KnowledgeBaseLeafManifestEntry[],
     ),
@@ -344,6 +535,7 @@ function parseProtocolEnvelopeText<T>(
     "g",
   );
   const markerMatches = [...input.matchAll(markerPattern)];
+  const markerOpeningPattern = new RegExp(`<!--\\s*${options.marker}\\b`, "i");
   const rawMatches = extractKnowledgeBaseProtocolObjects(input).filter(
     (value) => value.kind === options.kind,
   );
@@ -366,6 +558,14 @@ function parseProtocolEnvelopeText<T>(
       if (error instanceof KnowledgeBaseProgressError) throw error;
       fail(options.code, `${options.label} envelope contains invalid JSON`);
     }
+  }
+
+  // Do not recover JSON from an unfinished HTML comment. During streaming the
+  // JSON object can become syntactically complete several chunks before the
+  // provider appends `-->`; accepting it here advances the state without the
+  // companion presentation/resources that belong to the same turn.
+  if (markerOpeningPattern.test(input)) {
+    fail(options.code, `${options.label} envelope is not closed`);
   }
 
   if (rawMatches.length !== 1) {
@@ -408,14 +608,26 @@ function parseReopenEnvelopeObject(
   }
   assertOnlyKeys(
     input,
-    ["kind", "schemaVersion", "revision", "leafId", "reason"],
+    [
+      "kind",
+      "schemaVersion",
+      "operationId",
+      "turnId",
+      "revision",
+      "leafId",
+      "reason",
+    ],
     "Reopen envelope",
   );
   if (input.kind !== KNOWLEDGE_BASE_REOPEN_KIND) {
     fail("INVALID_ENVELOPE", "Reopen envelope kind is invalid");
   }
-  if (input.schemaVersion !== KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION) {
-    fail("INVALID_ENVELOPE", "Reopen envelope schema version is invalid");
+  const identity = parseProtocolIdentity(input);
+  if (identity.schemaVersion === KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION) {
+    fail(
+      "INVALID_ENVELOPE",
+      "Protocol v4 does not support reopening completed knowledge-base builds",
+    );
   }
   if (!Number.isSafeInteger(input.revision) || Number(input.revision) < 0) {
     fail(
@@ -432,7 +644,7 @@ function parseReopenEnvelopeObject(
   }
   return {
     kind: KNOWLEDGE_BASE_REOPEN_KIND,
-    schemaVersion: KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION,
+    ...identity,
     revision: Number(input.revision),
     leafId,
     ...(typeof input.reason === "string"
@@ -472,6 +684,8 @@ function parsePresentationEnvelopeObject(
     [
       "kind",
       "schemaVersion",
+      "operationId",
+      "turnId",
       "revision",
       "leafId",
       "imageState",
@@ -483,12 +697,7 @@ function parsePresentationEnvelopeObject(
   if (input.kind !== KNOWLEDGE_BASE_PRESENTATION_KIND) {
     fail("INVALID_ENVELOPE", "Presentation envelope kind is invalid");
   }
-  if (input.schemaVersion !== KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION) {
-    fail(
-      "INVALID_ENVELOPE",
-      "Presentation envelope schema version is invalid",
-    );
-  }
+  const identity = parseProtocolIdentity(input);
   if (!Number.isSafeInteger(input.revision) || Number(input.revision) < 0) {
     fail(
       "INVALID_ENVELOPE",
@@ -529,7 +738,9 @@ function parsePresentationEnvelopeObject(
     input.assetIds === undefined
       ? undefined
       : Array.from(
-          new Set((input.assetIds as string[]).map((assetId) => assetId.trim())),
+          new Set(
+            (input.assetIds as string[]).map((assetId) => assetId.trim()),
+          ),
         );
   if (
     input.imageCount !== undefined &&
@@ -544,7 +755,7 @@ function parsePresentationEnvelopeObject(
   }
   return {
     kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
-    schemaVersion: KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION,
+    ...identity,
     revision: Number(input.revision),
     leafId: leafId as string | null,
     ...(imageState
@@ -716,15 +927,20 @@ function parseEnvelopeObject(input: unknown): KnowledgeBaseProgressEnvelope {
   }
   assertOnlyKeys(
     input,
-    ["kind", "schemaVersion", "revision", "transition"],
+    [
+      "kind",
+      "schemaVersion",
+      "operationId",
+      "turnId",
+      "revision",
+      "transition",
+    ],
     "Progress envelope",
   );
   if (input.kind !== KNOWLEDGE_BASE_PROGRESS_KIND) {
     fail("INVALID_ENVELOPE", "Progress envelope kind is invalid");
   }
-  if (input.schemaVersion !== KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION) {
-    fail("INVALID_ENVELOPE", "Progress envelope schema version is invalid");
-  }
+  const identity = parseProtocolIdentity(input);
   if (!Number.isSafeInteger(input.revision) || Number(input.revision) < 0) {
     fail(
       "INVALID_ENVELOPE",
@@ -778,7 +994,7 @@ function parseEnvelopeObject(input: unknown): KnowledgeBaseProgressEnvelope {
 
   return {
     kind: KNOWLEDGE_BASE_PROGRESS_KIND,
-    schemaVersion: KNOWLEDGE_BASE_PROGRESS_SCHEMA_VERSION,
+    ...identity,
     revision: Number(input.revision),
     transition: {
       leafId,

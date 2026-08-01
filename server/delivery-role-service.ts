@@ -1,5 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNull,
+  lt,
+  or,
+  sql,
+} from "drizzle-orm";
 
 import {
   apiCredentials,
@@ -331,14 +343,26 @@ export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
         .where(inArray(deliveryTickets.userId, customerIds))
         .orderBy(desc(deliveryTickets.updatedAt))
     : [];
-  const activeTickets = statisticsTickets.filter((ticket) =>
-    ACTIVE_DELIVERY_STATUSES.includes(ticket.status as any),
+  const publicTickets = statisticsTickets
+    .map((ticket) => ({
+      ...ticket,
+      managementStatus: deliveryTicketStatusGroup(ticket.status),
+    }))
+    .filter(
+      (
+        ticket,
+      ): ticket is typeof ticket & {
+        managementStatus: "pending" | "completed";
+      } => ticket.managementStatus !== null,
+    );
+  const activeTickets = publicTickets.filter(
+    (ticket) => ticket.managementStatus === "pending",
   );
   const completedTickets = statisticsTickets.filter(
     (ticket) => ticket.status === "completed",
   );
-  const terminalTickets = statisticsTickets.filter((ticket) =>
-    ["completed", "rejected", "cancelled"].includes(ticket.status),
+  const terminalTickets = publicTickets.filter(
+    (ticket) => ticket.managementStatus === "completed",
   );
   const dispatchTicketIds = activeTickets.map((ticket) => ticket.id);
   const ticketEvents = dispatchTicketIds.length
@@ -512,6 +536,287 @@ const ACTIVE_DELIVERY_STATUSES = [
   "scheduled",
   "in_progress",
 ] as const;
+
+export const MY_DELIVERY_TICKET_LIMIT = 50;
+
+const INITIAL_MONITORING_DEPENDENCY_MESSAGE =
+  "请先完成“品牌词库与问题目录”：至少一条客户选择的问题需要审核通过，随后才能开始首次监控。";
+
+export function deliveryTicketActionRank(status: string) {
+  switch (status) {
+    case "in_progress":
+      return 0;
+    case "submitted":
+      return 1;
+    case "scheduled":
+      return 2;
+    case "needs_information":
+      return 3;
+    default:
+      return 4;
+  }
+}
+
+export function deliveryTicketDependencyState(input: {
+  operation: string | null;
+  status: string;
+  hasCompletedQuestionCatalog: boolean;
+}) {
+  const blocked =
+    input.operation === "initial_monitoring" &&
+    input.status !== "completed" &&
+    !input.hasCompletedQuestionCatalog;
+  return {
+    dependencySatisfied: !blocked,
+    dependencyBlockReason: blocked
+      ? INITIAL_MONITORING_DEPENDENCY_MESSAGE
+      : null,
+  };
+}
+
+export function deliveryTicketStatusGroup(status: string) {
+  return ACTIVE_DELIVERY_STATUSES.includes(status as any)
+    ? ("pending" as const)
+    : (["completed", "rejected", "cancelled"] as const).includes(status as any)
+      ? ("completed" as const)
+      : null;
+}
+
+/**
+ * Lists the signed-in engineer's own tickets across every assigned customer.
+ * Authorization is intentionally anchored on assignedMemberId rather than a
+ * client-supplied project assignment. The bounded result and all supporting
+ * filters/counts are loaded in a fixed number of batched queries.
+ */
+export async function getMyDeliveryTickets(input: {
+  actor: AuthenticatedUser;
+  customerUserId?: number;
+  statusGroup?: "pending" | "completed";
+  limit?: number;
+  cursor?: { actionRank: number; updatedAt: number; id: string };
+}) {
+  if (input.actor.role !== "delivery_member") {
+    throw new AuthServiceError("INVALID_CREDENTIAL", "该工单池仅对工程师开放");
+  }
+  const db = await requireDb();
+  const statusFilter =
+    input.statusGroup === "pending"
+      ? ACTIVE_DELIVERY_STATUSES
+      : input.statusGroup === "completed"
+        ? TERMINAL_DELIVERY_STATUSES
+        : [...ACTIVE_DELIVERY_STATUSES, ...TERMINAL_DELIVERY_STATUSES];
+  const ownershipFilter = and(
+    eq(deliveryTickets.assignedMemberId, input.actor.id),
+    inArray(deliveryTickets.status, statusFilter),
+    input.customerUserId
+      ? eq(deliveryTickets.userId, input.customerUserId)
+      : undefined,
+  );
+  const actionRank = sql<number>`CASE ${deliveryTickets.status}
+    WHEN 'in_progress' THEN 0
+    WHEN 'submitted' THEN 1
+    WHEN 'scheduled' THEN 2
+    WHEN 'needs_information' THEN 3
+    ELSE 4 END`;
+  const cursorDate = input.cursor
+    ? new Date(input.cursor.updatedAt)
+    : undefined;
+  const pageLimit = input.limit ?? MY_DELIVERY_TICKET_LIMIT;
+  const cursorFilter =
+    input.cursor && cursorDate
+      ? or(
+          gt(actionRank, input.cursor.actionRank),
+          and(
+            eq(actionRank, input.cursor.actionRank),
+            or(
+              lt(deliveryTickets.updatedAt, cursorDate),
+              and(
+                eq(deliveryTickets.updatedAt, cursorDate),
+                lt(deliveryTickets.id, input.cursor.id),
+              ),
+            ),
+          ),
+        )
+      : undefined;
+
+  const [ticketRows, customerRows, countRows, nextPendingRows] =
+    await Promise.all([
+      db
+        .select({
+          ticket: deliveryTickets,
+          customerUsername: users.username,
+          customerName: users.displayName,
+          customerMarketEdition: users.marketEdition,
+        })
+        .from(deliveryTickets)
+        .innerJoin(users, eq(users.id, deliveryTickets.userId))
+        .where(and(ownershipFilter, cursorFilter))
+        .orderBy(
+          asc(actionRank),
+          desc(deliveryTickets.updatedAt),
+          desc(deliveryTickets.id),
+        )
+        .limit(pageLimit + 1),
+      db
+        .selectDistinct({
+          id: users.id,
+          name: users.displayName,
+          username: users.username,
+        })
+        .from(deliveryTickets)
+        .innerJoin(users, eq(users.id, deliveryTickets.userId))
+        .where(eq(deliveryTickets.assignedMemberId, input.actor.id))
+        .orderBy(asc(users.displayName), asc(users.username), asc(users.id)),
+      db
+        .select({ status: deliveryTickets.status, value: count() })
+        .from(deliveryTickets)
+        .where(
+          and(
+            eq(deliveryTickets.assignedMemberId, input.actor.id),
+            inArray(deliveryTickets.status, [
+              ...ACTIVE_DELIVERY_STATUSES,
+              ...TERMINAL_DELIVERY_STATUSES,
+            ]),
+            input.customerUserId
+              ? eq(deliveryTickets.userId, input.customerUserId)
+              : undefined,
+          ),
+        )
+        .groupBy(deliveryTickets.status),
+      db
+        .select({
+          ticket: deliveryTickets,
+          customerUsername: users.username,
+          customerName: users.displayName,
+        })
+        .from(deliveryTickets)
+        .innerJoin(users, eq(users.id, deliveryTickets.userId))
+        .where(
+          and(
+            eq(deliveryTickets.assignedMemberId, input.actor.id),
+            inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+            input.customerUserId
+              ? eq(deliveryTickets.userId, input.customerUserId)
+              : undefined,
+          ),
+        )
+        .orderBy(
+          asc(actionRank),
+          desc(deliveryTickets.updatedAt),
+          desc(deliveryTickets.id),
+        )
+        .limit(1),
+    ]);
+
+  const hasMore = ticketRows.length > pageLimit;
+  const selectedRows = ticketRows.slice(0, pageLimit);
+  const customerIds = [
+    ...new Set(selectedRows.map((row) => row.ticket.userId)),
+  ];
+  const [dashboardRows, styleWorkflowRows, completedCatalogRows] =
+    customerIds.length
+      ? await Promise.all([
+          db
+            .select({
+              userId: userDashboardContents.userId,
+              revision: userDashboardContents.revision,
+            })
+            .from(userDashboardContents)
+            .where(inArray(userDashboardContents.userId, customerIds)),
+          db
+            .select({
+              userId: websiteStyleWorkflows.userId,
+              revision: websiteStyleWorkflows.revision,
+              status: websiteStyleWorkflows.status,
+            })
+            .from(websiteStyleWorkflows)
+            .where(inArray(websiteStyleWorkflows.userId, customerIds)),
+          db
+            .selectDistinct({ userId: deliveryTickets.userId })
+            .from(deliveryTickets)
+            .where(
+              and(
+                inArray(deliveryTickets.userId, customerIds),
+                eq(deliveryTickets.operation, "question_catalog"),
+                eq(deliveryTickets.status, "completed"),
+              ),
+            ),
+        ])
+      : [[], [], []];
+  const dashboardRevisionByUser = new Map(
+    dashboardRows.map((row) => [row.userId, row.revision]),
+  );
+  const styleWorkflowByUser = new Map(
+    styleWorkflowRows.map((row) => [row.userId, row]),
+  );
+  const customersWithCompletedCatalog = new Set(
+    completedCatalogRows.map((row) => row.userId),
+  );
+  const counts = { pending: 0, completed: 0 };
+  for (const row of countRows) {
+    const group = deliveryTicketStatusGroup(row.status);
+    if (group) counts[group] += Number(row.value);
+  }
+
+  const items = selectedRows.map(
+    ({ ticket, customerName, customerUsername, customerMarketEdition }) => {
+      const styleWorkflow = styleWorkflowByUser.get(ticket.userId);
+      return {
+        ...ticket,
+        customerName:
+          customerName || customerUsername || `客户 ${ticket.userId}`,
+        customerUsername,
+        statusGroup: deliveryTicketStatusGroup(ticket.status),
+        dashboardRevision: dashboardRevisionByUser.get(ticket.userId) ?? 0,
+        websiteStyleWorkflowRevision: styleWorkflow?.revision ?? 0,
+        websiteStyleState: styleWorkflow?.status ?? null,
+        marketEdition: customerMarketEdition ?? null,
+        ...deliveryTicketDependencyState({
+          operation: ticket.operation,
+          status: ticket.status,
+          hasCompletedQuestionCatalog: customersWithCompletedCatalog.has(
+            ticket.userId,
+          ),
+        }),
+      };
+    },
+  );
+  const last = selectedRows.at(-1)?.ticket;
+  const nextPendingRow = nextPendingRows[0];
+  return {
+    items,
+    nextPending: nextPendingRow
+      ? {
+          id: nextPendingRow.ticket.id,
+          userId: nextPendingRow.ticket.userId,
+          title: nextPendingRow.ticket.title,
+          operation: nextPendingRow.ticket.operation,
+          status: nextPendingRow.ticket.status,
+          customerName:
+            nextPendingRow.customerName ||
+            nextPendingRow.customerUsername ||
+            `客户 ${nextPendingRow.ticket.userId}`,
+          customerUsername: nextPendingRow.customerUsername,
+        }
+      : null,
+    filters: {
+      customers: customerRows.map((customer) => ({
+        ...customer,
+        name: customer.name || customer.username || `客户 ${customer.id}`,
+      })),
+    },
+    counts,
+    nextCursor:
+      hasMore && last
+        ? {
+            actionRank: deliveryTicketActionRank(last.status),
+            updatedAt: last.updatedAt.getTime(),
+            id: last.id,
+          }
+        : null,
+    limit: pageLimit,
+  };
+}
 
 export async function createDeliveryEngineer(input: {
   actor: AuthenticatedUser;
@@ -823,101 +1128,6 @@ export async function createProjectMonitoringHandoffIfReady(input: {
       });
     }
   }
-}
-
-export async function dispatchDeliveryTicket(input: {
-  actor: AuthenticatedUser;
-  ticketId: string;
-  priority: "low" | "normal" | "high" | "urgent";
-}) {
-  requireDeliveryManager(input.actor);
-  const db = await requireDb();
-  return db.transaction(async (tx) => {
-    const ticketRows = await tx
-      .select()
-      .from(deliveryTickets)
-      .where(eq(deliveryTickets.id, input.ticketId))
-      .limit(1)
-      .for("update");
-    const ticket = ticketRows[0];
-    if (!ticket || !ACTIVE_DELIVERY_STATUSES.includes(ticket.status as any)) {
-      throw new AuthServiceError("NOT_FOUND", "待调度工单不存在");
-    }
-    if (!ticket.workflowDomain) {
-      throw new AuthServiceError(
-        "CONFLICT",
-        "旧版技术工单仅供只读查看，不能重新进入交付流程",
-      );
-    }
-    await assertCanManageProject({
-      executor: tx,
-      actor: input.actor,
-      customerUserId: ticket.userId,
-    });
-    await tx
-      .update(deliveryTickets)
-      .set({
-        priority: input.priority,
-        revision: sql`${deliveryTickets.revision} + 1`,
-        updatedByUserId: input.actor.id,
-        updatedAt: new Date(),
-      })
-      .where(eq(deliveryTickets.id, ticket.id));
-    await tx.insert(deliveryTicketEvents).values({
-      id: randomUUID(),
-      ticketId: ticket.id,
-      userId: ticket.userId,
-      actorUserId: input.actor.id,
-      actorRole: "admin",
-      kind: "message",
-      visibility: "internal",
-      message: `工单优先级已调整为 ${input.priority}。`,
-      createdAt: new Date(),
-    });
-    return { success: true as const };
-  });
-}
-
-export async function urgeDeliveryTicket(input: {
-  actor: AuthenticatedUser;
-  ticketId: string;
-  message?: string;
-}) {
-  requireDeliveryManager(input.actor);
-  const db = await requireDb();
-  return db.transaction(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(deliveryTickets)
-      .where(eq(deliveryTickets.id, input.ticketId))
-      .limit(1)
-      .for("update");
-    const ticket = rows[0];
-    if (
-      !ticket ||
-      !ticket.workflowDomain ||
-      !ACTIVE_DELIVERY_STATUSES.includes(ticket.status as any)
-    ) {
-      throw new AuthServiceError("NOT_FOUND", "可催办工单不存在");
-    }
-    await assertCanManageProject({
-      executor: tx,
-      actor: input.actor,
-      customerUserId: ticket.userId,
-    });
-    await tx.insert(deliveryTicketEvents).values({
-      id: randomUUID(),
-      ticketId: ticket.id,
-      userId: ticket.userId,
-      actorUserId: input.actor.id,
-      actorRole: "admin",
-      kind: "message",
-      visibility: "internal",
-      message: input.message?.trim() || "交付管理员已催办，请尽快处理。",
-      createdAt: new Date(),
-    });
-    return { success: true as const };
-  });
 }
 
 export async function listMyProjectAssignments(actor: AuthenticatedUser) {
@@ -1529,29 +1739,10 @@ export async function getMyDeliveryWorkbench(input: {
 }) {
   const role = await assertDeliveryProjectContext(input);
   const db = await requireDb();
-  const tickets = await db
-    .select()
-    .from(deliveryTickets)
-    .where(
-      and(
-        eq(deliveryTickets.workflowDomain, role.roleType),
-        eq(
-          deliveryTickets.assignedProjectAssignmentId,
-          role.projectAssignmentId,
-        ),
-      ),
-    )
-    .orderBy(desc(deliveryTickets.updatedAt));
   const customerIds = [role.customerUserId];
   const [
     customers,
-    builds,
-    snapshots,
     questions,
-    batches,
-    profiles,
-    styleWorkflows,
-    checks,
     dashboards,
     websiteWorkspace,
     knowledgeProgress,
@@ -1567,25 +1758,6 @@ export async function getMyDeliveryWorkbench(input: {
           })
           .from(users)
           .where(inArray(users.id, customerIds))
-      : [],
-    customerIds.length
-      ? db
-          .select({
-            userId: knowledgeBaseBuilds.userId,
-            status: knowledgeBaseBuilds.status,
-            updatedAt: knowledgeBaseBuilds.updatedAt,
-          })
-          .from(knowledgeBaseBuilds)
-          .where(inArray(knowledgeBaseBuilds.userId, customerIds))
-      : [],
-    customerIds.length
-      ? db
-          .select({
-            userId: knowledgeBaseSnapshots.userId,
-            status: knowledgeBaseSnapshots.status,
-          })
-          .from(knowledgeBaseSnapshots)
-          .where(inArray(knowledgeBaseSnapshots.userId, customerIds))
       : [],
     customerIds.length
       ? db
@@ -1609,42 +1781,6 @@ export async function getMyDeliveryWorkbench(input: {
     customerIds.length
       ? db
           .select({
-            userId: monitoringBatches.userId,
-            sampleCount: monitoringBatches.sampleCount,
-            citationCount: monitoringBatches.citationCount,
-          })
-          .from(monitoringBatches)
-          .where(inArray(monitoringBatches.userId, customerIds))
-      : [],
-    customerIds.length
-      ? db
-          .select({
-            userId: workspaceSiteProfiles.userId,
-            domain: workspaceSiteProfiles.domain,
-            domainStatus: workspaceSiteProfiles.domainStatus,
-            icpStatus: workspaceSiteProfiles.icpStatus,
-          })
-          .from(workspaceSiteProfiles)
-          .where(inArray(workspaceSiteProfiles.userId, customerIds))
-      : [],
-    customerIds.length
-      ? db
-          .select()
-          .from(websiteStyleWorkflows)
-          .where(inArray(websiteStyleWorkflows.userId, customerIds))
-      : [],
-    customerIds.length
-      ? db
-          .select({
-            userId: workspaceSiteChecks.userId,
-            status: workspaceSiteChecks.status,
-          })
-          .from(workspaceSiteChecks)
-          .where(inArray(workspaceSiteChecks.userId, customerIds))
-      : [],
-    customerIds.length
-      ? db
-          .select({
             userId: userDashboardContents.userId,
             payload: userDashboardContents.payload,
             revision: userDashboardContents.revision,
@@ -1664,80 +1800,6 @@ export async function getMyDeliveryWorkbench(input: {
       ? getLatestKnowledgeSnapshot(role.customerUserId)
       : null,
   ]);
-  const counts = {
-    submitted: 0,
-    scheduled: 0,
-    in_progress: 0,
-    needs_information: 0,
-    completed: 0,
-  };
-  for (const ticket of tickets) {
-    if (ticket.status in counts) {
-      counts[ticket.status as keyof typeof counts] += 1;
-    }
-  }
-  const customersWithDetails = customers.map((customer) => {
-    let details: string[];
-    if (role.roleType === "ai_operations_engineer") {
-      const customerBuilds = builds.filter((row) => row.userId === customer.id);
-      const latestBuild = [...customerBuilds].sort(
-        (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
-      )[0];
-      const profile = profiles.find((row) => row.userId === customer.id);
-      const customerChecks = checks.filter((row) => row.userId === customer.id);
-      details = [
-        `构建 ${customerBuilds.length}`,
-        `展示版本 ${snapshots.filter((row) => row.userId === customer.id).length}`,
-        `最新状态 ${latestBuild?.status ?? "未构建"}`,
-        `域名 ${profile?.domain || "未配置"}`,
-        `备案 ${profile?.icpStatus || "未提交"}`,
-        `检查通过 ${
-          customerChecks.filter((row) => row.status === "passed").length
-        }/${customerChecks.length}`,
-      ];
-    } else if (role.roleType === "monitoring_optimization_engineer") {
-      const customerBatches = batches.filter(
-        (row) => row.userId === customer.id,
-      );
-      details = [
-        `已选问题 ${
-          questions.filter(
-            (row) => row.userId === customer.id && row.status === "selected",
-          ).length
-        }`,
-        `监控答案 ${customerBatches.reduce(
-          (sum, row) => sum + row.sampleCount,
-          0,
-        )}`,
-        `引用 ${customerBatches.reduce(
-          (sum, row) => sum + row.citationCount,
-          0,
-        )}`,
-      ];
-    } else if (role.roleType === "content_distribution_engineer") {
-      const customerTickets = tickets.filter(
-        (row) => row.userId === customer.id,
-      );
-      details = [
-        `内容工单 ${customerTickets.length}`,
-        `已完成 ${
-          customerTickets.filter((row) => row.status === "completed").length
-        }`,
-        `待处理 ${
-          customerTickets.filter((row) =>
-            ACTIVE_DELIVERY_STATUSES.includes(row.status as any),
-          ).length
-        }`,
-      ];
-    } else details = [];
-    return { ...customer, details };
-  });
-  const dashboardRevisionByUser = new Map(
-    dashboards.map((dashboard) => [dashboard.userId, dashboard.revision]),
-  );
-  const marketEditionByUser = new Map(
-    customers.map((customer) => [customer.id, customer.marketEdition]),
-  );
   const dashboardRecord = dashboards.find(
     (dashboard) => dashboard.userId === role.customerUserId,
   );
@@ -1746,7 +1808,7 @@ export async function getMyDeliveryWorkbench(input: {
     : null;
   return {
     assignment: role,
-    customers: customersWithDetails,
+    customers,
     customerQuestions: questions.map((question) => ({
       ...question,
       selectionRequestedAt: question.selectionRequestedAt?.getTime?.() ?? null,
@@ -1768,18 +1830,6 @@ export async function getMyDeliveryWorkbench(input: {
             knowledgeSnapshot,
           }
         : null,
-    tickets: tickets.map((ticket) => ({
-      ...ticket,
-      dashboardRevision: dashboardRevisionByUser.get(ticket.userId) ?? 0,
-      websiteStyleWorkflowRevision:
-        styleWorkflows.find((workflow) => workflow.userId === ticket.userId)
-          ?.revision ?? 0,
-      websiteStyleState:
-        styleWorkflows.find((workflow) => workflow.userId === ticket.userId)
-          ?.status ?? null,
-      marketEdition: marketEditionByUser.get(ticket.userId) ?? null,
-    })),
-    counts,
   };
 }
 

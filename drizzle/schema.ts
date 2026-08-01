@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   check,
   foreignKey,
@@ -276,6 +277,13 @@ export const apiUsageSnapshots = mysqlTable(
       .default("pending")
       .notNull(),
     errorCode: varchar("errorCode", { length: 64 }),
+    /** Monotonic cross-process claim for one policy refresh. */
+    syncGeneration: int("syncGeneration", { unsigned: true })
+      .default(0)
+      .notNull(),
+    /** Only the holder of the latest token may finalize a refresh. */
+    syncToken: varchar("syncToken", { length: 36 }),
+    syncStartedAt: timestamp("syncStartedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
@@ -284,6 +292,103 @@ export const apiUsageSnapshots = mysqlTable(
     index("api_usage_snapshots_status_fetched_idx").on(
       table.syncStatus,
       table.fetchedAt,
+    ),
+    index("api_usage_snapshots_sync_claim_idx").on(
+      table.syncToken,
+      table.syncStartedAt,
+    ),
+  ],
+);
+
+/** Immutable task-level usage facts retained across API Key rotations. */
+export const apiUsageTaskLedger = mysqlTable(
+  "api_usage_task_ledger",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    scope: mysqlEnum("scope", ["managed_user", "website_frontend"]).notNull(),
+    upstreamTaskId: varchar("upstreamTaskId", { length: 255 }).notNull(),
+    credentialFingerprint: varchar("credentialFingerprint", {
+      length: 32,
+    }).notNull(),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }),
+    accountUserId: int("accountUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    isFirstParty: boolean("isFirstParty").default(false).notNull(),
+    taskCreatedAtMs: bigint("taskCreatedAtMs", {
+      mode: "number",
+      unsigned: true,
+    }).notNull(),
+    creditUsage: bigint("creditUsage", { mode: "number", unsigned: true })
+      .default(0)
+      .notNull(),
+    isTerminal: boolean("isTerminal").default(false).notNull(),
+    observedAt: timestamp("observedAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("api_usage_task_ledger_scope_task_uq").on(
+      table.scope,
+      table.upstreamTaskId,
+    ),
+    index("api_usage_task_ledger_account_time_idx").on(
+      table.accountUserId,
+      table.taskCreatedAtMs,
+    ),
+    index("api_usage_task_ledger_pool_time_idx").on(
+      table.scope,
+      table.credentialFingerprint,
+      table.taskCreatedAtMs,
+    ),
+  ],
+);
+
+/** Proves that one physical Key was fully scanned before it became unusable. */
+export const apiUsageCredentialCoverage = mysqlTable(
+  "api_usage_credential_coverage",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    scope: mysqlEnum("scope", ["managed_user", "website_frontend"]).notNull(),
+    credentialFingerprint: varchar("credentialFingerprint", {
+      length: 32,
+    }).notNull(),
+    coveredFromMs: bigint("coveredFromMs", {
+      mode: "number",
+      unsigned: true,
+    }).notNull(),
+    fullScanAtMs: bigint("fullScanAtMs", {
+      mode: "number",
+      unsigned: true,
+    }).notNull(),
+    credentialRetiredAtMs: bigint("credentialRetiredAtMs", {
+      mode: "number",
+      unsigned: true,
+    }),
+    allTasksSettled: boolean("allTasksSettled").default(false).notNull(),
+    scanGeneration: int("scanGeneration", { unsigned: true })
+      .default(0)
+      .notNull(),
+    scanToken: varchar("scanToken", { length: 36 }),
+    scanStartedAtMs: bigint("scanStartedAtMs", {
+      mode: "number",
+      unsigned: true,
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("api_usage_credential_coverage_scope_fp_uq").on(
+      table.scope,
+      table.credentialFingerprint,
+    ),
+    index("api_usage_credential_coverage_scan_idx").on(
+      table.scope,
+      table.fullScanAtMs,
+    ),
+    index("api_usage_credential_coverage_claim_idx").on(
+      table.scanToken,
+      table.scanStartedAtMs,
     ),
   ],
 );
@@ -2325,6 +2430,23 @@ export const knowledgeBaseBuilds = mysqlTable(
     ])
       .default("researching")
       .notNull(),
+    /**
+     * Monotonic build identity. Resetting/restarting a build increments the
+     * generation so a delayed task from an older run can be ignored safely.
+     */
+    generation: int("generation", { unsigned: true }).default(1).notNull(),
+    /** Monotonic version for atomic server-approved UI observations. */
+    stateEpoch: int("stateEpoch", { unsigned: true }).default(0).notNull(),
+    activeTurnId: varchar("activeTurnId", { length: 36 }),
+    /** Cross-process claim for legacy/open builds which have no active turn. */
+    recoveryLeaseOwnerHash: varchar("recoveryLeaseOwnerHash", { length: 64 }),
+    recoveryLeaseExpiresAt: timestamp("recoveryLeaseExpiresAt"),
+    lastAppliedOperationKey: varchar("lastAppliedOperationKey", {
+      length: 128,
+    }),
+    currentPresentationKey: varchar("currentPresentationKey", {
+      length: 191,
+    }),
     revision: int("revision").default(0).notNull(),
     currentLeafId: varchar("currentLeafId", { length: 191 }),
     totalNodeCount: int("totalNodeCount").default(0).notNull(),
@@ -2348,6 +2470,17 @@ export const knowledgeBaseBuilds = mysqlTable(
     packageFileId: varchar("packageFileId", { length: 255 }),
     packageFilename: varchar("packageFilename", { length: 512 }),
     packageDescriptorHash: varchar("packageDescriptorHash", { length: 64 }),
+    /** Immutable, Dashboard-owned copy of the first-node official logo. */
+    logoStorageKey: varchar("logoStorageKey", { length: 1024 }),
+    logoSha256: varchar("logoSha256", { length: 64 }),
+    logoBytes: int("logoBytes", { unsigned: true }),
+    logoFilename: varchar("logoFilename", { length: 512 }),
+    logoMimeType: varchar("logoMimeType", { length: 255 }),
+    /** Immutable, Dashboard-owned copy of the validated final archive. */
+    packageStorageKey: varchar("packageStorageKey", { length: 1024 }),
+    packageArchiveSha256: varchar("packageArchiveSha256", { length: 64 }),
+    packageSizeBytes: int("packageSizeBytes", { unsigned: true }),
+    protocolErrorCode: varchar("protocolErrorCode", { length: 128 }),
     protocolError: text("protocolError"),
     publishedSnapshotId: varchar("publishedSnapshotId", {
       length: 36,
@@ -2367,6 +2500,11 @@ export const knowledgeBaseBuilds = mysqlTable(
       table.status,
     ),
     index("knowledge_base_builds_task_idx").on(table.upstreamTaskId),
+    index("knowledge_base_builds_active_turn_idx").on(table.activeTurnId),
+    index("knowledge_base_builds_recovery_lease_idx").on(
+      table.status,
+      table.recoveryLeaseExpiresAt,
+    ),
   ],
 );
 
@@ -2398,6 +2536,9 @@ export const knowledgeBaseBuildNodes = mysqlTable(
     sourceUrls: json("sourceUrls").$type<string[]>().default([]).notNull(),
     imageUrls: json("imageUrls").$type<string[]>().default([]).notNull(),
     lastTaskId: varchar("lastTaskId", { length: 255 }),
+    sourceTurnId: varchar("sourceTurnId", { length: 36 }),
+    presentationKey: varchar("presentationKey", { length: 191 }),
+    contentSha256: varchar("contentSha256", { length: 64 }),
     lastResponseAt: timestamp("lastResponseAt"),
     confirmedAt: timestamp("confirmedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -2416,6 +2557,7 @@ export const knowledgeBaseBuildNodes = mysqlTable(
       table.buildId,
       table.status,
     ),
+    index("knowledge_base_build_nodes_source_turn_idx").on(table.sourceTurnId),
   ],
 );
 
@@ -2689,6 +2831,32 @@ export const conversationTurns = mysqlTable(
       { onDelete: "set null" },
     ),
     clientRequestId: varchar("clientRequestId", { length: 128 }).notNull(),
+    buildId: varchar("buildId", { length: 36 }).references(
+      () => knowledgeBaseBuilds.id,
+      { onDelete: "set null" },
+    ),
+    buildGeneration: int("buildGeneration", { unsigned: true }),
+    /**
+     * Stable logical-operation identity. It is nullable for legacy turns and
+     * globally unique for newly reserved knowledge-base turns.
+     */
+    operationKey: varchar("operationKey", { length: 128 }),
+    operationType: varchar("operationType", { length: 32 }),
+    expectedRevision: int("expectedRevision"),
+    expectedLeafId: varchar("expectedLeafId", { length: 191 }),
+    requestHash: varchar("requestHash", { length: 64 }),
+    upstreamIdempotencyKeyHash: varchar("upstreamIdempotencyKeyHash", {
+      length: 64,
+    }),
+    attachmentFileIds: json("attachmentFileIds")
+      .$type<string[]>()
+      .default([])
+      .notNull(),
+    metadata: json("metadata")
+      .$type<Record<string, unknown>>()
+      .default({})
+      .notNull(),
+    leaseExpiresAt: timestamp("leaseExpiresAt"),
     model: varchar("model", { length: 128 }),
     status: mysqlEnum("status", [
       "queued",
@@ -2712,8 +2880,17 @@ export const conversationTurns = mysqlTable(
       table.conversationId,
       table.clientRequestId,
     ),
+    uniqueIndex("conversation_turns_operation_key_uq").on(table.operationKey),
     index("conversation_turns_user_status_idx").on(table.userId, table.status),
     index("conversation_turns_upstream_task_idx").on(table.upstreamTaskId),
+    index("conversation_turns_build_generation_idx").on(
+      table.buildId,
+      table.buildGeneration,
+    ),
+    index("conversation_turns_lease_idx").on(
+      table.status,
+      table.leaseExpiresAt,
+    ),
   ],
 );
 

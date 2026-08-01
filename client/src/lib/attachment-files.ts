@@ -9,6 +9,8 @@ import {
 export const ZIP_REFERENCE_PROMPT =
   "附件 ZIP 中包含用户上传的原始参考图片，请解压后读取图片内容作为参考。";
 
+export const MAX_KNOWLEDGE_BASE_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+
 export interface ZippedImageInfo {
   name: string;
   width: number;
@@ -37,6 +39,37 @@ const IMAGE_FILE_EXTENSION = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic|heif)$/i;
 
 export function isImageUpload(file: File): boolean {
   return file.type.startsWith("image/") || IMAGE_FILE_EXTENSION.test(file.name);
+}
+
+async function readFileBytes(file: File): Promise<ArrayBuffer> {
+  if (typeof file.arrayBuffer === "function") return file.arrayBuffer();
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      if (reader.result instanceof ArrayBuffer) resolve(reader.result);
+      else reject(new Error("无法读取附件字节"));
+    });
+    reader.addEventListener("error", () =>
+      reject(reader.error || new Error("无法读取附件字节")),
+    );
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+/**
+ * Binds a resumable knowledge-base reservation to the exact browser bytes,
+ * not merely to a filename/size/timestamp tuple that another file can mimic.
+ */
+export async function sha256UploadFile(file: File): Promise<string> {
+  if (file.size > MAX_KNOWLEDGE_BASE_ATTACHMENT_BYTES) {
+    throw new Error("单个知识库附件不能超过 100 MB");
+  }
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error("当前浏览器无法校验附件完整性，请升级后重试");
+  const digest = await subtle.digest("SHA-256", await readFileBytes(file));
+  return [...new Uint8Array(digest)]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 export async function prepareUploadFiles(
@@ -100,6 +133,13 @@ async function createOriginalImagesZip(
 ): Promise<File> {
   const zip = new JSZip();
   const folder = zip.folder("original-images");
+  const stableLastModified = Math.max(
+    0,
+    ...images.map(({ file }) => Number(file.lastModified || 0)),
+  );
+  const zipEntryDate = new Date(
+    Math.max(Date.UTC(1980, 0, 1), stableLastModified),
+  );
 
   if (!folder) {
     throw new Error("创建图片 ZIP 目录失败");
@@ -116,13 +156,13 @@ async function createOriginalImagesZip(
 
   images.forEach(({ file, inspection }, index) => {
     const entryName = uniqueZipEntryName(file.name, usedNames, index);
-    folder.file(entryName, file, { binary: true });
+    folder.file(entryName, file, { binary: true, date: zipEntryDate });
     readmeLines.push(
       `- ${entryName}: ${formatImageInspectionSummary(inspection)}; original size ${formatFileSize(file.size)}`,
     );
   });
 
-  zip.file("README.txt", readmeLines.join("\n"));
+  zip.file("README.txt", readmeLines.join("\n"), { date: zipEntryDate });
 
   try {
     const blob = await zip.generateAsync({
@@ -130,20 +170,34 @@ async function createOriginalImagesZip(
       compression: "STORE",
       mimeType: "application/zip",
     });
-    return new File([blob], buildOriginalImagesZipName(), {
+    return new File([blob], buildOriginalImagesZipName(images), {
       type: "application/zip",
-      lastModified: Date.now(),
+      lastModified: stableLastModified,
     });
   } catch (err: any) {
     throw new Error(`图片 ZIP 打包失败：${err?.message || "未知错误"}`);
   }
 }
 
-function buildOriginalImagesZipName(now = new Date()): string {
-  const yyyy = String(now.getFullYear());
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
-  return `frontmind-original-images-${yyyy}${mm}${dd}.zip`;
+function buildOriginalImagesZipName(images: OversizedImage[]): string {
+  const identity = JSON.stringify(
+    images.map(({ file }) => ({
+      name: file.name,
+      size: file.size,
+      type: file.type || "application/octet-stream",
+      lastModified: Number(file.lastModified || 0),
+    })),
+  );
+  // FNV-1a is used only for a stable, non-security filename suffix. The full
+  // ordered manifest remains the server-side idempotency identity.
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < identity.length; index += 1) {
+    hash ^= identity.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `frontmind-original-images-${(hash >>> 0)
+    .toString(16)
+    .padStart(8, "0")}.zip`;
 }
 
 function uniqueZipEntryName(

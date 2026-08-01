@@ -2,12 +2,14 @@ import {
   Activity,
   Bot,
   BriefcaseBusiness,
+  ClipboardList,
   Database,
-  Gauge,
   Home as HomeIcon,
+  KeyRound,
   Send,
   UserCog,
   Users,
+  UsersRound,
 } from "lucide-react";
 
 import type { PortalNavItem } from "@/components/PortalShell";
@@ -25,9 +27,15 @@ export const previewUserNav: PortalNavItem[] = [
 
 export const previewAdminNav: PortalNavItem[] = [
   {
-    label: "交付总览",
+    label: "API与人员管理",
     href: "/preview/admin",
-    icon: Gauge,
+    icon: KeyRound,
+    group: "运营",
+  },
+  {
+    label: "官网任务与积分",
+    href: "/preview/admin/presales",
+    icon: BriefcaseBusiness,
     group: "运营",
   },
   {
@@ -37,9 +45,15 @@ export const previewAdminNav: PortalNavItem[] = [
     group: "客户与服务",
   },
   {
-    label: "官网任务与积分",
-    href: "/preview/admin/presales",
-    icon: BriefcaseBusiness,
+    label: "客户项目团队",
+    href: "/preview/admin/delivery-roles",
+    icon: UsersRound,
+    group: "客户与服务",
+  },
+  {
+    label: "工单",
+    href: "/preview/admin/dispatch",
+    icon: ClipboardList,
     group: "客户与服务",
   },
   {
@@ -67,13 +81,35 @@ export const previewAdminNav: PortalNavItem[] = [
 ];
 
 const previewDeliveryAdminNav: PortalNavItem[] = [
-  previewAdminNav[0],
-  previewAdminNav[1],
+  {
+    label: "客户管理",
+    href: "/preview/admin/users",
+    icon: UserCog,
+    group: "交付管理",
+  },
+  {
+    label: "客户项目团队",
+    href: "/preview/admin/delivery-roles",
+    icon: UsersRound,
+    group: "交付管理",
+  },
+  {
+    label: "工单",
+    href: "/preview/admin/dispatch",
+    icon: ClipboardList,
+    group: "交付管理",
+  },
   {
     label: "FrontMind Agent",
     href: "/preview/admin/agent",
     icon: Bot,
     group: "Agent 与资源",
+  },
+  {
+    label: "账号与权限",
+    href: "/preview/admin/accounts",
+    icon: Users,
+    group: "交付管理",
   },
 ];
 
@@ -93,7 +129,13 @@ export function previewAdminWorkspaceHref(
 
 export function previewAdminPageHref(
   accessLevel: PreviewAdminAccessLevel,
-  page: "workspace" | "agent" | "presales" | "accounts",
+  page:
+    | "workspace"
+    | "delivery-roles"
+    | "dispatch"
+    | "agent"
+    | "presales"
+    | "accounts",
 ): string {
   return `${previewAdminRootHref(accessLevel)}/${page}`;
 }
@@ -115,6 +157,11 @@ export function getRoleScopedPreviewAdminNav(
   const internalHrefMap: Record<string, string> = {
     "/preview/admin": root,
     "/preview/admin/users": previewAdminPageHref(accessLevel, "workspace"),
+    "/preview/admin/delivery-roles": previewAdminPageHref(
+      accessLevel,
+      "delivery-roles",
+    ),
+    "/preview/admin/dispatch": previewAdminPageHref(accessLevel, "dispatch"),
     "/preview/admin/agent": previewAdminPageHref(accessLevel, "agent"),
     "/preview/admin/presales": previewAdminPageHref(accessLevel, "presales"),
     "/preview/admin/accounts": previewAdminPageHref(accessLevel, "accounts"),

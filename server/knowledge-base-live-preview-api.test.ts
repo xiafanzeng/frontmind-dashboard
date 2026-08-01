@@ -5,6 +5,8 @@ import {
   buildKnowledgeBaseProtocolProbePrompt,
   collectKnowledgeBasePreviewFileIds,
   KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES,
+  KNOWLEDGE_BASE_PROTOCOL_PROBE_OPERATION_ID,
+  KNOWLEDGE_BASE_PROTOCOL_PROBE_TURN_ID,
   rehydratedConfirmationProgressState,
   selectInitialKnowledgeBaseLiveTask,
 } from "./knowledge-base-live-preview-api";
@@ -261,7 +263,9 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
     const prompt = buildKnowledgeBaseProtocolProbePrompt();
     const probeManifest = {
       kind: "frontmind.knowledge-base.manifest",
-      schemaVersion: 1,
+      schemaVersion: 2,
+      operationId: KNOWLEDGE_BASE_PROTOCOL_PROBE_OPERATION_ID,
+      turnId: KNOWLEDGE_BASE_PROTOCOL_PROBE_TURN_ID,
       leaves: KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES,
     };
     const analysis = analyzeKnowledgeBaseLiveTask(
@@ -278,7 +282,7 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
       { mode: "protocol_probe" },
     );
 
-    expect(prompt).toContain("FRONTMIND_KB_PROTOCOL_PROBE_V1");
+    expect(prompt).toContain("FRONTMIND_KB_PROTOCOL_PROBE_V2");
     expect(prompt).toContain("禁止联网、搜索、浏览、调用工具");
     expect(prompt).toContain("8.1|合作与支持|cooperation|合作与支持");
     expect(analysis.runMode).toBe("protocol_probe");

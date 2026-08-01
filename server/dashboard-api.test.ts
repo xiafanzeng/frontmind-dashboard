@@ -21,6 +21,7 @@ import {
   dashboardFromCsv,
   dashboardPayloadWithServiceQuestionCatalog,
   dashboardQuestionCatalogFromService,
+  dashboardKnowledgePublishErrorForLog,
   downloadArchiveBytes,
   importDashboardPayload,
   mergeDashboardModule,
@@ -58,6 +59,45 @@ import {
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe("knowledge publish error logging", () => {
+  it("does not retain legacy Axios headers, body or the complete API key", () => {
+    const secret = "legacy-publish-secret-value-123456789";
+    const error = Object.assign(new Error(`legacy publish failed: ${secret}`), {
+      name: "AxiosError",
+      code: "ERR_BAD_RESPONSE",
+      config: {
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          API_KEY: secret,
+        },
+        data: { prompt: secret, rawArchive: "private-body" },
+      },
+      request: { rawHeaders: ["Authorization", secret] },
+      response: {
+        status: 500,
+        headers: { "x-request-id": "publish-request-1" },
+        data: { API_KEY: secret, body: "private-response-body" },
+      },
+    });
+
+    const safe = dashboardKnowledgePublishErrorForLog(error, [secret]);
+    const serialized = JSON.stringify(safe);
+
+    expect(safe).toEqual({
+      name: "AxiosError",
+      message: "legacy publish failed: [REDACTED]",
+      code: "ERR_BAD_RESPONSE",
+      status: 500,
+      requestId: "publish-request-1",
+    });
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain("Authorization");
+    expect(serialized).not.toContain("API_KEY");
+    expect(serialized).not.toContain("private-body");
+    expect(serialized).not.toContain("private-response-body");
+  });
 });
 
 describe("knowledge snapshot asset cleanup boundary", () => {

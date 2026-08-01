@@ -78,9 +78,21 @@ const DevelopmentPreviewRouter = import.meta.env.DEV
   ? lazy(() => import("./pages/DevelopmentPreviewRouter"))
   : null;
 
+export function adminHomePath(
+  user: Parameters<typeof isSystemAdminAccount>[0],
+): "/" | "/admin/workspace" | null {
+  if (isSystemAdminAccount(user)) return "/";
+  if (isDeliveryAdminAccount(user)) return "/admin/workspace";
+  return null;
+}
+
 function RoleLanding() {
   const { user } = useAuth();
-  if (canAccessAdminRoutes(user)) return <AdminDashboard />;
+  const adminHome = adminHomePath(user);
+  if (adminHome === "/") return <AdminDashboard />;
+  if (adminHome === "/admin/workspace") {
+    return <Redirect to="/admin/workspace" />;
+  }
   if (user?.role === "delivery_member") return <DeliveryMemberDashboard />;
   return <UserDashboard />;
 }
@@ -188,9 +200,14 @@ function Router() {
           <DeliveryMemberAgent />
         </DeliveryMemberOnly>
       </Route>
+      <Route path={"/delivery/workbench"}>
+        <DeliveryMemberOnly>
+          <DeliveryMemberDashboard customerWorkbench />
+        </DeliveryMemberOnly>
+      </Route>
       <Route path={"/delivery/tasks"}>
         <DeliveryMemberOnly>
-          <DeliveryMemberDashboard taskHistory />
+          <Redirect to="/" />
         </DeliveryMemberOnly>
       </Route>
       <Route path={"/workflow"}>

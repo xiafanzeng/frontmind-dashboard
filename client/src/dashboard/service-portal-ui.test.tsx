@@ -151,10 +151,17 @@ describe("service workflow UI gates", () => {
     expect(within(quotaOverview).getByText("0 / 5")).toBeInTheDocument();
 
     const packageScope = screen.getByTestId("service-plan-scope");
+    const planSummary = screen.getByTestId("service-plan-summary");
+    const planCard = screen.getByLabelText("当前服务版本：进阶版");
+    expect(planCard).toHaveClass("self-start");
+    expect(planSummary).not.toHaveClass("sm:grid-cols-2");
     expect(packageScope).toHaveClass("grid-cols-2");
     expect(packageScope.children).toHaveLength(4);
     expect(within(packageScope).getByText("竞品对比词")).not.toHaveClass(
       "truncate",
+    );
+    expect(within(packageScope).getByText("竞品对比词")).not.toHaveClass(
+      "whitespace-nowrap",
     );
 
     expect(screen.getByText("1 个已购问题")).toBeInTheDocument();

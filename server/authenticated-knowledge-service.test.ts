@@ -4,6 +4,8 @@ import { isAuthenticatedAdvancedKnowledgePublication } from "./authenticated-kno
 
 const CONTRACT_START = new Date("2026-07-01T00:00:00.000Z");
 const PUBLISHED_AT = new Date("2026-07-02T00:00:00.000Z");
+const ARCHIVE_HASH = "a".repeat(64);
+const DESCRIPTOR_HASH = "d".repeat(64);
 
 function publication(
   overrides: {
@@ -18,8 +20,8 @@ function publication(
       sourceBuildId: "build-1",
       sourceBuildRevision: 40,
       sourceTaskId: "task-1",
-      sourceArtifactHash: "artifact-hash",
-      archiveHash: "archive-hash",
+      sourceArtifactHash: ARCHIVE_HASH,
+      archiveHash: ARCHIVE_HASH,
       createdAt: PUBLISHED_AT,
       ...overrides.snapshot,
     },
@@ -36,7 +38,8 @@ function publication(
       upstreamTaskId: "task-1",
       packageRevision: 40,
       packageTaskId: "task-1",
-      packageDescriptorHash: "artifact-hash",
+      packageDescriptorHash: DESCRIPTOR_HASH,
+      packageArchiveSha256: ARCHIVE_HASH,
       publishedSnapshotId: "snapshot-1",
       publishedAt: PUBLISHED_AT,
       createdAt: new Date("2026-07-01T01:00:00.000Z"),
@@ -51,6 +54,33 @@ describe("authenticated advanced knowledge publication", () => {
     expect(isAuthenticatedAdvancedKnowledgePublication(publication())).toBe(
       true,
     );
+  });
+
+  it("preserves the descriptor-hash path only for packages without durable bytes", () => {
+    expect(
+      isAuthenticatedAdvancedKnowledgePublication(
+        publication({
+          snapshot: {
+            sourceArtifactHash: DESCRIPTOR_HASH,
+            archiveHash: ARCHIVE_HASH,
+          },
+          build: { packageArchiveSha256: null },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a durable publication whose snapshot bytes differ from the bound archive", () => {
+    expect(
+      isAuthenticatedAdvancedKnowledgePublication(
+        publication({
+          snapshot: {
+            sourceArtifactHash: DESCRIPTOR_HASH,
+            archiveHash: DESCRIPTOR_HASH,
+          },
+        }),
+      ),
+    ).toBe(false);
   });
 
   it("does not treat a website one-shot snapshot as advanced completion", () => {

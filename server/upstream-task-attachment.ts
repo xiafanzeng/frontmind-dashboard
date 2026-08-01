@@ -11,41 +11,60 @@ export async function uploadUpstreamTaskAttachment(input: {
   filename: string;
   bytes: Buffer;
   mimeType?: string;
+  /** Stable per-turn/per-slot key. Required by durable KB attachment callers. */
+  idempotencyKey?: string;
+  /** Completed reservation replay: reuse this file and refresh its upload URL. */
+  existingFileId?: string;
+  /** Persist file ownership before any byte upload can begin. */
+  onFileResolved?: (fileId: string) => Promise<void>;
 }) {
   const mimeType = input.mimeType || "application/zip";
   const authHeaders = {
     API_KEY: input.apiKey,
     Authorization: `Bearer ${input.apiKey}`,
   };
-  const created = await axios.post(
-    `${input.baseUrl}/v1/files`,
-    { filename: input.filename },
-    {
-      headers: { ...authHeaders, "Content-Type": "application/json" },
-      timeout: 120_000,
-      validateStatus: () => true,
-    },
-  );
-  const fileId = String(created.data?.id || created.data?.file_id || "");
-  if (created.status < 200 || created.status >= 300 || !fileId) {
-    throw new Error(`Task attachment creation failed: ${input.filename}`);
+  let createdData: Record<string, unknown> = {};
+  let fileId = String(input.existingFileId || "").trim();
+  if (!fileId) {
+    const created = await axios.post(
+      `${input.baseUrl}/v1/files`,
+      { filename: input.filename },
+      {
+        headers: {
+          ...authHeaders,
+          "Content-Type": "application/json",
+          ...(input.idempotencyKey
+            ? { "Idempotency-Key": input.idempotencyKey }
+            : {}),
+        },
+        timeout: 120_000,
+        validateStatus: () => true,
+      },
+    );
+    createdData =
+      created.data && typeof created.data === "object" ? created.data : {};
+    fileId = String(createdData.id || createdData.file_id || "");
+    if (created.status < 200 || created.status >= 300 || !fileId) {
+      throw new Error(`Task attachment creation failed: ${input.filename}`);
+    }
   }
 
   const removeOrphan = async () => {
     await axios
-      .delete(
-        `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
-        {
-          headers: authHeaders,
-          timeout: 30_000,
-          validateStatus: () => true,
-        },
-      )
+      .delete(`${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`, {
+        headers: authHeaders,
+        timeout: 30_000,
+        validateStatus: () => true,
+      })
       .catch(() => undefined);
   };
 
   try {
-    let uploadUrl = String(created.data?.upload_url || "");
+    // Once this callback commits, file id + credential + conversation cleanup
+    // ownership are durable. Never delete the file on later upload failures;
+    // recovery must refresh the signed URL and retry the same file id.
+    await input.onFileResolved?.(fileId);
+    let uploadUrl = String(createdData.upload_url || "");
     if (!uploadUrl) {
       const metadata = await axios.get(
         `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
@@ -85,7 +104,7 @@ export async function uploadUpstreamTaskAttachment(input: {
       removeOrphan,
     };
   } catch (error) {
-    await removeOrphan();
+    if (!input.onFileResolved) await removeOrphan();
     throw error;
   }
 }

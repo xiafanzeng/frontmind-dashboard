@@ -3,7 +3,6 @@ import {
   ClipboardList,
   Loader2,
   PackageCheck,
-  Plus,
   RefreshCw,
   UserCog,
 } from "lucide-react";
@@ -26,18 +25,9 @@ import {
 } from "@/lib/admin-workspace-tabs";
 import { trpc } from "@/lib/trpc";
 import { getAdminNav } from "@/pages/AdminDashboard";
-import { CreateUserDialog } from "@/pages/AdminUsers";
 
 export { ADMIN_WORKSPACE_TAB_IDS };
 export type { WorkspaceTab };
-
-export function canCreateManagedCustomer(
-  adminAccessLevel?: "system_admin" | "delivery_admin" | null,
-) {
-  return (
-    adminAccessLevel === "system_admin" || adminAccessLevel === "delivery_admin"
-  );
-}
 
 export const ADMIN_WORKSPACE_TABS = [
   { value: "service", label: "用户流程", icon: PackageCheck },
@@ -120,12 +110,6 @@ export default function AdminWorkspace({
   const [selectedUserId, setSelectedUserId] = useState<number | null>(
     initialUserId,
   );
-  const [createClientOpen, setCreateClientOpen] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return (
-      new URLSearchParams(window.location.search).get("action") === "create"
-    );
-  });
   const [tab, setTab] = useState<WorkspaceTab>(initialTab);
   const [servicePlan, setServicePlan] = useState<
     "basic" | "advanced" | "luxury"
@@ -350,62 +334,23 @@ export default function AdminWorkspace({
   return (
     <PortalShell
       eyebrow="管理中心 · 客户与服务"
-      title="客户交付工作台"
+      title={isSystemAdmin ? "客户交付工作台" : "客户管理"}
       navItems={getAdminNav(Boolean(workspaceQuery.data?.isSystemAdmin))}
       toolbar={
-        <div className="flex items-center gap-2">
-          {canCreateManagedCustomer(user?.adminAccessLevel) && (
-            <Button size="sm" onClick={() => setCreateClientOpen(true)}>
-              <Plus className="h-4 w-4" />
-              创建客户
-            </Button>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            className="border-[#e1d8e8] bg-white"
-            disabled={workspaceQuery.isFetching}
-            onClick={() => void workspaceQuery.refetch()}
-          >
-            <RefreshCw
-              className={`h-4 w-4 ${workspaceQuery.isFetching ? "animate-spin" : ""}`}
-            />
-            刷新
-          </Button>
-        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="border-[#e1d8e8] bg-white"
+          disabled={workspaceQuery.isFetching}
+          onClick={() => void workspaceQuery.refetch()}
+        >
+          <RefreshCw
+            className={`h-4 w-4 ${workspaceQuery.isFetching ? "animate-spin" : ""}`}
+          />
+          刷新
+        </Button>
       }
     >
-      {canCreateManagedCustomer(user?.adminAccessLevel) && (
-        <CreateUserDialog
-          open={createClientOpen}
-          onOpenChange={setCreateClientOpen}
-          userOnly
-          fixedDeliveryAdmin={
-            user?.adminAccessLevel === "delivery_admin"
-              ? {
-                  id: user.id,
-                  username: user.username,
-                  displayName: user.displayName,
-                }
-              : undefined
-          }
-          deliveryAdmins={(workspaceQuery.data?.admins ?? [])
-            .filter(
-              (admin) =>
-                admin.isActive &&
-                (admin.adminAccessLevel === "system_admin" ||
-                  admin.adminAccessLevel === "delivery_admin"),
-            )
-            .map((admin) => ({
-              ...admin,
-              username: admin.username || `admin-${admin.id}`,
-            }))}
-          onCreated={(userId) => {
-            setSelectedUserId(userId);
-            void workspaceQuery.refetch();
-          }}
-        />
-      )}
       {workspaceQuery.error && (
         <PortalCard className="mb-5 border-[#ebc8d4] bg-[#fff8fa] p-5 text-sm text-[#a02652]">
           <p className="font-semibold">客户工作区暂时无法载入</p>
@@ -420,12 +365,12 @@ export default function AdminWorkspace({
           <div className="border-b border-[#e8e1ee] p-5">
             <div className="flex items-center gap-2">
               <UserCog className="h-5 w-5 text-[#5b2a86]" />
-              <h2 className="font-semibold text-[#171321]">用户列表</h2>
+              <h2 className="font-semibold text-[#171321]">客户列表</h2>
             </div>
             <p className="mt-2 text-xs leading-5 text-[#716a80]">
               {workspaceQuery.data?.isSystemAdmin
-                ? "系统管理员可分配所有用户；其他管理员仅看到被分配的用户。"
-                : "仅显示已分配给你的用户。"}
+                ? "系统管理员可查看全部客户；其他管理员仅看到被分配的客户。"
+                : "仅显示已分配给你的客户。"}
             </p>
           </div>
           <div className="max-h-[680px] divide-y divide-[#eee8f2] overflow-y-auto custom-scrollbar">
@@ -439,7 +384,7 @@ export default function AdminWorkspace({
               </div>
             ) : workspaceQuery.data?.users.length === 0 ? (
               <div className="p-8 text-center text-sm text-[#716a80]">
-                暂无可管理用户
+                暂无可管理客户
               </div>
             ) : (
               workspaceQuery.data?.users.map((account) => (
@@ -504,7 +449,7 @@ export default function AdminWorkspace({
               ? "正在核验客户访问权限…"
               : selectedUserId
                 ? "该客户不存在，或尚未分配给当前管理员。"
-                : "请选择一个用户开始管理"}
+                : "请选择一个客户开始管理"}
           </PortalCard>
         ) : (
           <div className="min-w-0 space-y-5">
@@ -512,7 +457,7 @@ export default function AdminWorkspace({
               <div className="grid gap-5 lg:grid-cols-[minmax(240px,1fr)_minmax(0,2fr)] lg:items-start">
                 <div className="min-w-0">
                   <p className="text-xs font-semibold text-[#5b2a86]">
-                    用户工作空间
+                    客户工作空间
                   </p>
                   <h2
                     className="mt-1 truncate text-2xl font-semibold text-[#171321]"

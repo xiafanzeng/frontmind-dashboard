@@ -59,7 +59,7 @@ Interpret user input narrowly:
 - Any correction, supplement, question, or upload →
   `needs_verification`; update and re-present the same leaf. A turn containing
   a file never advances, even when its text contains confirmation language.
-- On every non-initial turn, append one progress/reopen envelope and one
+- On every non-initial turn, append exactly one progress envelope and one
   `FRONTMIND_KB_PRESENTATION` envelope. The latter uses the post-transition
   revision and the leaf actually displayed; use `leafId: null` only when the
   final leaf has completed.
@@ -83,7 +83,7 @@ asset. Select exactly one primary official company Logo and do not select a
 business, hero, product, UI, architecture, case or other image. Use its caption
 and alt text from `00_package_manifest.json`. Never show a filename or remote
 URL as if it were a successfully packaged image. Never return an image
-attachment on a later confirmation, revision or reopened-leaf turn.
+attachment on a later confirmation or current-leaf revision turn.
 
 ## Final turn
 

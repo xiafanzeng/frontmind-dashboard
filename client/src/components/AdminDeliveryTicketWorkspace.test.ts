@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  adminDeliveryEventPublicStatusLabel,
+  adminDeliveryTicketPublicStatusLabel,
   buildAdminTicketListInput,
   deliveryTicketPublicStatus,
   flattenAdminTicketPages,
@@ -67,6 +69,15 @@ describe("administrator delivery ticket workspace contract", () => {
         publicStatus: "completed",
       }),
     ).toBe("completed");
+    expect(
+      adminDeliveryTicketPublicStatusLabel({ status: "in_progress" }),
+    ).toBe("待处理");
+    expect(adminDeliveryTicketPublicStatusLabel({ status: "rejected" })).toBe(
+      "已完成",
+    );
+    expect(adminDeliveryEventPublicStatusLabel("scheduled")).toBe("待处理");
+    expect(adminDeliveryEventPublicStatusLabel("cancelled")).toBe("已完成");
+    expect(adminDeliveryEventPublicStatusLabel("legacy_unknown")).toBeNull();
   });
 
   it("flattens cursor pages while retaining first-page workspace metadata", () => {
@@ -270,5 +281,4 @@ describe("administrator delivery ticket workspace contract", () => {
       ),
     ).toBeNull();
   });
-
 });

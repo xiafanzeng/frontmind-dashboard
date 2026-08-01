@@ -4,7 +4,6 @@ import {
   Bot,
   CheckCircle2,
   ClipboardList,
-  Clock3,
   Send,
   Upload,
   Users,
@@ -21,7 +20,6 @@ import PortalShell, { type PortalNavItem } from "@/components/PortalShell";
 import CustomerDashboardMirror, {
   type CustomerDashboardMirrorSection,
 } from "@/components/CustomerDashboardMirror";
-import DeliveryWorkflowGuide from "@/components/DeliveryWorkflowGuide";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -38,8 +36,6 @@ import { trpc } from "@/lib/trpc";
 import {
   DELIVERY_OPERATION_LABELS,
   deliveryTicketActionGuidance,
-  deliveryTicketDependencyBlockReason,
-  sortDeliveryProjectTicketsByAction,
 } from "@/lib/delivery-workflow";
 import {
   buildDeliveryCompletionPayload,
@@ -68,18 +64,18 @@ import {
 } from "@shared/delivery-ticket";
 
 export const deliveryMemberNav: PortalNavItem[] = [
-  { label: "我的工作台", href: "/", icon: ClipboardList, group: "交付" },
+  { label: "我的工单", href: "/", icon: ClipboardList, group: "工作台" },
+  {
+    label: "客户工作台",
+    href: "/delivery/workbench",
+    icon: Users,
+    group: "工作台",
+  },
   {
     label: "通用智能体",
     href: "/delivery/agent",
     icon: Bot,
     group: "工具",
-  },
-  {
-    label: "我的任务记录",
-    href: "/delivery/tasks",
-    icon: Clock3,
-    group: "记录",
   },
 ];
 
@@ -89,29 +85,31 @@ export function deliveryMemberNavForRole(
   if (roleType === "monitoring_optimization_engineer") {
     return [
       deliveryMemberNav[0]!,
+      deliveryMemberNav[1]!,
       {
         label: "问题监控",
         href: issueMonitorUrl,
         icon: Activity,
-        group: "交付",
+        group: "工具",
         external: true,
         newWindow: true,
       },
-      ...deliveryMemberNav.slice(1),
+      deliveryMemberNav[2]!,
     ];
   }
   if (roleType === "content_distribution_engineer") {
     return [
       deliveryMemberNav[0]!,
+      deliveryMemberNav[1]!,
       {
         label: "渠道分发",
         href: channelDistributionUrl,
         icon: Send,
-        group: "交付",
+        group: "工具",
         external: true,
         newWindow: true,
       },
-      ...deliveryMemberNav.slice(1),
+      deliveryMemberNav[2]!,
     ];
   }
   return deliveryMemberNav;
@@ -334,10 +332,15 @@ function businessModuleBatchLabel(
 }
 
 export default function DeliveryMemberDashboard({
-  taskHistory = false,
+  customerWorkbench = false,
 }: {
-  taskHistory?: boolean;
+  /** The old taskHistory prop was removed: /delivery/tasks now aliases /. */
+  customerWorkbench?: boolean;
 }) {
+  return customerWorkbench ? <CustomerWorkbenchView /> : <MyTicketsView />;
+}
+
+function CustomerWorkbenchView() {
   const assignmentsQuery = trpc.delivery.mine.assignments.useQuery();
   const [projectAssignmentId, setProjectAssignmentId] = useState(() =>
     typeof window === "undefined"
@@ -372,25 +375,39 @@ export default function DeliveryMemberDashboard({
     { projectAssignmentId },
     { enabled: Boolean(currentAssignment) },
   );
+  const customerActionTickets = trpc.delivery.mine.tickets.useInfiniteQuery(
+    {
+      customerUserId: currentAssignment?.customerUserId ?? 1,
+      statusGroup: "pending",
+      limit: 50,
+    },
+    {
+      enabled: Boolean(currentAssignment),
+      getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    },
+  );
+  const customerActionItems = useMemo(
+    () =>
+      (customerActionTickets.data?.pages ?? [])
+        .flatMap((page) => page.items)
+        .filter(
+          (ticket) =>
+            ticket.statusGroup === "pending" &&
+            ticket.userId === currentAssignment?.customerUserId &&
+            ticket.assignedProjectAssignmentId ===
+              currentAssignment?.projectAssignmentId,
+        ),
+    [
+      currentAssignment?.customerUserId,
+      currentAssignment?.projectAssignmentId,
+      customerActionTickets.data?.pages,
+    ],
+  );
+  const refreshCustomerActionsAndPreview = async () => {
+    await Promise.all([customerActionTickets.refetch(), workbench.refetch()]);
+  };
   const approveQuestionSelection =
     trpc.delivery.mine.approveQuestionSelection.useMutation();
-  const tickets = useMemo(() => {
-    const filtered = (workbench.data?.tickets ?? []).filter((ticket) =>
-      taskHistory
-        ? ["completed", "rejected", "cancelled"].includes(ticket.status)
-        : !["completed", "rejected", "cancelled"].includes(ticket.status),
-    );
-    return taskHistory
-      ? filtered
-      : sortDeliveryProjectTicketsByAction(
-          filtered as Array<
-            (typeof filtered)[number] & {
-              operation?: DeliveryWorkflowOperation | null;
-              status: DeliveryTicketStatus;
-            }
-          >,
-        );
-  }, [taskHistory, workbench.data?.tickets]);
   const pendingCustomerQuestions = useMemo(
     () =>
       (workbench.data?.customerQuestions ?? []).filter(
@@ -400,11 +417,6 @@ export default function DeliveryMemberDashboard({
       ),
     [workbench.data?.customerQuestions],
   );
-  const nextTicket = tickets[0];
-  const nextTicketGuidance = nextTicket
-    ? deliveryTicketActionGuidance(nextTicket.status as DeliveryTicketStatus)
-    : null;
-  const ticketCounts = workbench.data?.counts;
   const currentNav = deliveryMemberNavForRole(currentAssignment?.roleType);
   const projectSelector = assignmentsQuery.data?.length ? (
     <select
@@ -431,15 +443,11 @@ export default function DeliveryMemberDashboard({
     </select>
   ) : null;
 
-  if (taskHistory) {
-    return <DeliveryHistoryView />;
-  }
-
   if (assignmentsQuery.error) {
     return (
       <PortalShell
         eyebrow="工程师"
-        title={taskHistory ? "我的任务记录" : "我的工作台"}
+        title="我的客户工作台"
         navItems={currentNav}
       >
         <Card className="mx-auto max-w-xl">
@@ -467,7 +475,7 @@ export default function DeliveryMemberDashboard({
     return (
       <PortalShell
         eyebrow="工程师"
-        title={taskHistory ? "我的任务记录" : "我的工作台"}
+        title="我的客户工作台"
         navItems={currentNav}
       >
         <Card className="mx-auto max-w-xl">
@@ -482,7 +490,11 @@ export default function DeliveryMemberDashboard({
 
   if (!assignmentsQuery.isLoading && !assignmentsQuery.data?.length) {
     return (
-      <PortalShell eyebrow="工程师" title="我的工作台" navItems={currentNav}>
+      <PortalShell
+        eyebrow="工程师"
+        title="我的客户工作台"
+        navItems={currentNav}
+      >
         <Card className="mx-auto max-w-xl">
           <CardContent className="py-14 text-center">
             <Users className="mx-auto h-8 w-8 text-muted-foreground" />
@@ -498,8 +510,8 @@ export default function DeliveryMemberDashboard({
   if (currentAssignment && workbench.error) {
     return (
       <PortalShell
-        eyebrow="工程师 · 客户项目工作台"
-        title={taskHistory ? "我的任务记录" : "我的工作台"}
+        eyebrow="工程师 · 客户工作台"
+        title="我的客户工作台"
         navItems={currentNav}
         roleLabel={`${currentAssignment.customerName || currentAssignment.customerUsername} · ${DELIVERY_ROLE_LABELS[currentAssignment.roleType]}`}
       >
@@ -544,8 +556,8 @@ export default function DeliveryMemberDashboard({
 
   return (
     <PortalShell
-      eyebrow="工程师 · 客户项目工作台"
-      title={taskHistory ? "我的任务记录" : "我的工作台"}
+      eyebrow="工程师 · 客户工作台"
+      title="我的客户工作台"
       navItems={currentNav}
       roleLabel={
         currentAssignment
@@ -553,201 +565,130 @@ export default function DeliveryMemberDashboard({
           : undefined
       }
     >
-      {currentAssignment && !taskHistory && (
-        <div className="mb-5 space-y-4">
-          <DeliveryWorkflowGuide activeRole={currentAssignment.roleType} />
-
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-[1.7fr_repeat(4,minmax(0,0.7fr))]">
-            <Card className="border-primary/25 bg-primary/[0.035]">
-              <CardContent className="p-4">
-                <p className="text-xs font-semibold text-primary">
-                  现在优先处理
-                </p>
-                <p className="mt-1 font-semibold">
-                  {nextTicket
-                    ? nextTicket.title ||
-                      operationLabel(nextTicket.operation) ||
-                      "当前工单"
-                    : "当前没有未结束工单"}
-                </p>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  {nextTicketGuidance?.description ||
-                    "等待交付管理员分配新的岗位工单；不要自行创建客户需求。"}
-                </p>
-              </CardContent>
-            </Card>
-            {[
-              [
-                "待开始",
-                (ticketCounts?.submitted ?? 0) + (ticketCounts?.scheduled ?? 0),
-              ],
-              ["处理中", ticketCounts?.in_progress ?? 0],
-              ["等客户补充", ticketCounts?.needs_information ?? 0],
-              ["本项目已完成", ticketCounts?.completed ?? 0],
-            ].map(([label, value]) => (
-              <Card key={String(label)}>
-                <CardContent className="p-4">
-                  <p className="text-xs text-muted-foreground">
-                    {String(label)}
-                  </p>
-                  <p className="mt-1 text-2xl font-semibold">{Number(value)}</p>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <div className="grid gap-5 xl:grid-cols-[0.75fr_1.25fr]">
+      <div className="grid gap-5">
         <Card data-testid="current-delivery-target">
           <CardHeader className="gap-3">
-            <CardTitle>当前交付对象</CardTitle>
+            <CardTitle>当前客户</CardTitle>
             {projectSelector}
           </CardHeader>
-          <CardContent className="space-y-2">
-            {(workbench.data?.customers ?? []).map((customer) => (
-              <div
-                key={customer.id}
-                className="rounded-xl border px-4 py-3 text-sm"
-              >
-                <p className="font-medium">
-                  {customer.displayName || customer.username}
-                </p>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  客户 #{customer.id}
-                </p>
-                <div className="mt-3 flex flex-wrap gap-1.5">
-                  {customer.details.map((detail) => (
-                    <Badge
-                      key={detail}
-                      variant="secondary"
-                      className="font-normal"
-                    >
-                      {detail}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-            ))}
-            {!workbench.data?.customers.length && (
-              <p className="py-8 text-center text-sm text-muted-foreground">
-                当前客户项目暂无可用资料
+          <CardContent>
+            <div className="rounded-xl border bg-muted/20 px-4 py-3 text-sm">
+              <p className="font-medium">
+                {currentAssignment?.customerName ||
+                  currentAssignment?.customerUsername ||
+                  "当前客户"}
               </p>
-            )}
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>
-              {taskHistory
-                ? "已完成任务"
-                : `我的未结束工单（${tickets.length}）`}
-            </CardTitle>
-            {!taskHistory && (
-              <p className="text-sm text-muted-foreground">
-                已按“处理中 → 待领取 → 已排期 → 等客户补充”的行动顺序排列。
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                在下方直接提交或修改当前岗位的交付内容，并预览客户最终看到的正式看板。
               </p>
-            )}
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {tickets.map((ticket) => {
-              const dependencyBlockReason = deliveryTicketDependencyBlockReason(
-                ticket,
-                workbench.data?.tickets ?? [],
-              );
-              const isNewCustomerTicket =
-                ticket.status === "submitted" &&
-                ticket.createdByUserId === ticket.userId;
-              return (
-                <div
-                  key={ticket.id}
-                  id={`ticket-editor-${ticket.id}`}
-                  data-new-customer-ticket={isNewCustomerTicket || undefined}
-                  data-customer-page-editor="true"
-                  className={`rounded-xl border p-4 ${
-                    isNewCustomerTicket
-                      ? "border-red-500 bg-red-50/80 ring-2 ring-red-500/25 dark:border-red-400 dark:bg-red-950/25"
-                      : ""
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="font-medium">
-                      {ticket.title ||
-                        ticket.operation ||
-                        ticket.category ||
-                        "交付工单"}
-                    </p>
-                    <div className="flex flex-wrap items-center justify-end gap-2">
-                      {isNewCustomerTicket && (
-                        <Badge variant="destructive">用户新提交</Badge>
-                      )}
-                      <Badge
-                        variant={
-                          isNewCustomerTicket ? "destructive" : "outline"
-                        }
-                      >
-                        {DELIVERY_TICKET_STATUS_LABELS[
-                          ticket.status as DeliveryTicketStatus
-                        ] || ticket.status}
-                      </Badge>
-                    </div>
-                  </div>
-                  <p className="mt-2 text-xs text-muted-foreground">
-                    {operationLabel(ticket.operation)} · 客户 #{ticket.userId}
-                  </p>
-                  {!taskHistory && (
-                    <div className="mt-3 rounded-xl bg-muted/35 px-3 py-2 text-xs leading-5">
-                      <strong>
-                        {
-                          deliveryTicketActionGuidance(
-                            ticket.status as DeliveryTicketStatus,
-                          ).label
-                        }
-                      </strong>
-                      <p className="mt-0.5 text-muted-foreground">
-                        {
-                          deliveryTicketActionGuidance(
-                            ticket.status as DeliveryTicketStatus,
-                          ).description
-                        }
-                      </p>
-                    </div>
-                  )}
-                  {ticket.operation === "knowledge_reset" &&
-                    ticket.status === "submitted" && (
-                      <KnowledgeResetDecision
-                        projectAssignmentId={projectAssignmentId}
-                        requestId={ticket.clientRequestId}
-                        onDone={() => workbench.refetch()}
-                      />
-                    )}
-                  {ticket.operation !== "knowledge_reset" &&
-                    ticket.status !== "completed" &&
-                    !dependencyBlockReason && (
-                      <DeliveryTicketActions
-                        projectAssignmentId={projectAssignmentId}
-                        ticket={ticket}
-                        onDone={() => workbench.refetch()}
-                      />
-                    )}
-                  {dependencyBlockReason && (
-                    <div className="mt-3 rounded-xl border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
-                      <strong>等待前置工单</strong>
-                      <p className="mt-0.5">{dependencyBlockReason}</p>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-            {!tickets.length && (
-              <div className="py-10 text-center text-sm text-muted-foreground">
-                <CheckCircle2 className="mx-auto mb-3 h-7 w-7" />
-                暂无{taskHistory ? "已完成" : "待处理"}工单
-              </div>
-            )}
+            </div>
           </CardContent>
         </Card>
       </div>
+
+      {currentAssignment && (
+        <Card
+          id="customer-content-actions"
+          data-testid="customer-content-actions"
+          className="mt-5 scroll-mt-5"
+        >
+          <CardHeader>
+            <CardTitle>内容提交与修改</CardTitle>
+            <p className="text-sm text-muted-foreground">
+              这里只提供当前客户、当前岗位可执行的内容操作；完整工单列表、筛选和处理历史统一在“我的工单”查看。
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {customerActionTickets.isLoading ? (
+              <div className="py-10 text-center text-sm text-muted-foreground">
+                <Loader2 className="mx-auto mb-3 h-6 w-6 animate-spin" />
+                正在载入可操作内容
+              </div>
+            ) : customerActionTickets.error ? (
+              <div className="py-10 text-center">
+                <AlertTriangle className="mx-auto h-6 w-6 text-destructive" />
+                <p className="mt-3 text-sm font-medium">内容操作读取失败</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {customerActionTickets.error.message}
+                </p>
+                <Button
+                  className="mt-4"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void customerActionTickets.refetch()}
+                >
+                  <RefreshCw className="h-4 w-4" />
+                  重试
+                </Button>
+              </div>
+            ) : customerActionItems.length ? (
+              <>
+                {customerActionItems.map((ticket) => (
+                  <div
+                    key={ticket.id}
+                    data-testid="customer-content-action"
+                    className="rounded-xl border p-4"
+                  >
+                    <p className="font-medium">{ticket.title}</p>
+                    {operationLabel(ticket.operation) && (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {operationLabel(ticket.operation)}
+                      </p>
+                    )}
+                    {ticket.operation === "knowledge_reset" &&
+                      ticket.status === "submitted" &&
+                      ticket.clientRequestId && (
+                        <KnowledgeResetDecision
+                          projectAssignmentId={
+                            currentAssignment.projectAssignmentId
+                          }
+                          requestId={ticket.clientRequestId}
+                          onDone={refreshCustomerActionsAndPreview}
+                        />
+                      )}
+                    {ticket.operation !== "knowledge_reset" &&
+                      !ticket.dependencyBlockReason && (
+                        <DeliveryTicketActions
+                          projectAssignmentId={
+                            currentAssignment.projectAssignmentId
+                          }
+                          ticket={ticket}
+                          onDone={refreshCustomerActionsAndPreview}
+                        />
+                      )}
+                    {ticket.dependencyBlockReason && (
+                      <div className="mt-3 rounded-xl border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+                        <strong>等待前置内容</strong>
+                        <p className="mt-0.5">{ticket.dependencyBlockReason}</p>
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {customerActionTickets.hasNextPage && (
+                  <div className="pt-2 text-center">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={customerActionTickets.isFetchingNextPage}
+                      onClick={() => void customerActionTickets.fetchNextPage()}
+                    >
+                      {customerActionTickets.isFetchingNextPage && (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      )}
+                      加载更多可操作内容
+                    </Button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="py-10 text-center text-sm text-muted-foreground">
+                当前客户的本岗位暂无可提交或修改内容
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {currentAssignment?.roleType === "monitoring_optimization_engineer" && (
         <Card className="mt-5">
@@ -789,7 +730,7 @@ export default function DeliveryMemberDashboard({
                         questionId: question.id,
                         expectedRevision: question.revision,
                       });
-                      await workbench.refetch();
+                      await refreshCustomerActionsAndPreview();
                       toast.success("客户问题已审核通过");
                     } catch (error) {
                       toast.error(
@@ -845,32 +786,12 @@ export default function DeliveryMemberDashboard({
                   : "这里只展示本岗位交付后客户真正能看到或操作的正式内容；教程、内部流程和其他岗位模块不进入验收视图。"
               }
               editActions={
-                tickets.length ? (
-                  tickets.map((ticket) => (
-                    <Button
-                      key={ticket.id}
-                      size="sm"
-                      variant="outline"
-                      onClick={() =>
-                        document
-                          .getElementById(`ticket-editor-${ticket.id}`)
-                          ?.scrollIntoView({
-                            behavior: "smooth",
-                            block: "center",
-                          })
-                      }
-                    >
-                      修改并发布：
-                      {ticket.title ||
-                        operationLabel(ticket.operation) ||
-                        "当前工单"}
-                    </Button>
-                  ))
-                ) : (
-                  <span className="text-xs text-muted-foreground">
-                    当前没有可修改的未结束工单
-                  </span>
-                )
+                <a
+                  href="#customer-content-actions"
+                  className="inline-flex h-9 items-center justify-center rounded-md border bg-background px-3 text-sm font-medium shadow-sm transition hover:bg-accent"
+                >
+                  提交或修改当前客户内容
+                </a>
               }
             />
           ) : (
@@ -911,7 +832,7 @@ const KNOWLEDGE_RESET_STATUS_LABELS: Record<string, string> = {
   rejected: "已拒绝",
 };
 
-function displayTaskDate(value: number | null | undefined) {
+function displayTaskDate(value: number | Date | null | undefined) {
   if (!value) return "时间未记录";
   return new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",
@@ -923,7 +844,7 @@ function displayTaskDate(value: number | null | undefined) {
   }).format(new Date(value));
 }
 
-function DeliveryHistoryView() {
+function MyTicketsView() {
   const assignments = trpc.delivery.mine.assignments.useQuery();
   const selectedProjectAssignmentId =
     typeof window === "undefined"
@@ -934,20 +855,21 @@ function DeliveryHistoryView() {
       (assignment) =>
         assignment.projectAssignmentId === selectedProjectAssignmentId,
     )?.roleType ?? assignments.data?.[0]?.roleType;
-  const [status, setStatus] = useState("");
-  const [customerUserId, setCustomerUserId] = useState("");
-  const [operation, setOperation] = useState("");
+  const [statusGroup, setStatusGroup] = useState("");
+  const [customerUserId, setCustomerUserId] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return (
+      new URLSearchParams(window.location.search).get("customerUserId") || ""
+    );
+  });
   const [selectedTicketId, setSelectedTicketId] = useState<string | null>(null);
-  const history = trpc.delivery.mine.history.useInfiniteQuery(
+  const tickets = trpc.delivery.mine.tickets.useInfiniteQuery(
     {
-      limit: 20,
-      ...(status
-        ? {
-            status: status as "completed" | "rejected" | "cancelled",
-          }
-        : {}),
       ...(customerUserId ? { customerUserId: Number(customerUserId) } : {}),
-      ...(operation ? { operation } : {}),
+      ...(statusGroup
+        ? { statusGroup: statusGroup as "pending" | "completed" }
+        : {}),
+      limit: 50,
     },
     {
       getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
@@ -959,43 +881,109 @@ function DeliveryHistoryView() {
     },
     { enabled: Boolean(selectedTicketId), retry: false },
   );
-  const items = history.data?.pages.flatMap((page) => page.items) ?? [];
-  const customerOptions = history.data?.pages[0]?.filters.customers ?? [];
-  const operationOptions = history.data?.pages[0]?.filters.operations ?? [];
+  const ticketPages = tickets.data?.pages ?? [];
+  const ticketSummary = ticketPages[0];
+  const items = ticketPages.flatMap((page) => page.items);
+  const customerOptions = ticketSummary?.filters.customers ?? [];
+  const pendingItems = items.filter((item) => item.statusGroup === "pending");
+  const completedItems = items.filter(
+    (item) => item.statusGroup === "completed",
+  );
+  const nextTicket = ticketSummary?.nextPending;
+  const chooseCustomer = (nextCustomerUserId: string) => {
+    setCustomerUserId(nextCustomerUserId);
+  };
 
   return (
     <PortalShell
       eyebrow="工程师 · 全部客户"
-      title="我的任务记录"
+      title="我的工单"
       navItems={deliveryMemberNavForRole(selectedRoleType)}
       toolbar={
         <Button
           variant="outline"
           size="sm"
-          disabled={history.isFetching}
-          onClick={() => void history.refetch()}
+          disabled={tickets.isFetching}
+          onClick={() => void tickets.refetch()}
         >
           <RefreshCw
-            className={history.isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"}
+            className={tickets.isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"}
           />
           刷新
         </Button>
       }
     >
+      <div className="mb-5 grid gap-3 sm:grid-cols-3">
+        <Card className="border-primary/25 bg-primary/[0.035] sm:col-span-1">
+          <CardContent className="p-4">
+            <p className="text-xs font-semibold text-primary">现在优先处理</p>
+            <p className="mt-1 font-semibold">
+              {nextTicket?.title ||
+                operationLabel(nextTicket?.operation) ||
+                "当前没有待处理工单"}
+            </p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              {nextTicket
+                ? `${nextTicket.customerName} · ${deliveryTicketActionGuidance(nextTicket.status as DeliveryTicketStatus).description}`
+                : "当前负责的全部客户都没有待处理工单。"}
+            </p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">待处理</p>
+            <p className="mt-1 text-2xl font-semibold">
+              {ticketSummary?.counts.pending ?? 0}
+            </p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">已完成</p>
+            <p className="mt-1 text-2xl font-semibold">
+              {ticketSummary?.counts.completed ?? 0}
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
       <Card>
         <CardHeader className="gap-4">
           <div>
-            <CardTitle>全部客户历史任务</CardTitle>
+            <CardTitle>我的工单</CardTitle>
             <p className="mt-1 text-sm text-muted-foreground">
-              点击记录可查看申请内容、处理结论、附件和完整时间线。
+              默认汇总当前工程师负责的全部客户；选择客户只过滤本工单池，不影响其他客户工单的归属。
             </p>
           </div>
-          <div className="grid gap-2 sm:grid-cols-3">
+          <div className="flex flex-wrap gap-2" aria-label="客户快捷筛选">
+            <Button
+              type="button"
+              size="sm"
+              variant={customerUserId ? "outline" : "default"}
+              onClick={() => chooseCustomer("")}
+            >
+              全部客户
+            </Button>
+            {customerOptions.map((customer) => (
+              <Button
+                key={customer.id}
+                type="button"
+                size="sm"
+                variant={
+                  customerUserId === String(customer.id) ? "default" : "outline"
+                }
+                onClick={() => chooseCustomer(String(customer.id))}
+              >
+                {customer.name}
+              </Button>
+            ))}
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
             <select
               aria-label="按客户筛选"
               className="h-10 rounded-md border bg-background px-3 text-sm"
               value={customerUserId}
-              onChange={(event) => setCustomerUserId(event.target.value)}
+              onChange={(event) => chooseCustomer(event.target.value)}
             >
               <option value="">全部客户</option>
               {customerOptions.map((customer) => (
@@ -1008,86 +996,159 @@ function DeliveryHistoryView() {
             <select
               aria-label="按状态筛选"
               className="h-10 rounded-md border bg-background px-3 text-sm"
-              value={status}
-              onChange={(event) => setStatus(event.target.value)}
+              value={statusGroup}
+              onChange={(event) => setStatusGroup(event.target.value)}
             >
               <option value="">全部状态</option>
+              <option value="pending">待处理</option>
               <option value="completed">已完成</option>
-              <option value="rejected">已拒绝</option>
-              <option value="cancelled">已取消</option>
-            </select>
-            <select
-              aria-label="按业务类型筛选"
-              className="h-10 rounded-md border bg-background px-3 text-sm"
-              value={operation}
-              onChange={(event) => setOperation(event.target.value)}
-            >
-              <option value="">全部业务类型</option>
-              {operationOptions.map((value) => (
-                <option key={value} value={value}>
-                  {operationLabel(value)}
-                </option>
-              ))}
             </select>
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
-          {history.isLoading ? (
+          {tickets.isLoading ? (
             <div className="py-14 text-center text-sm text-muted-foreground">
               <Loader2 className="mx-auto mb-3 h-7 w-7 animate-spin" />
-              正在载入任务记录
+              正在载入全部客户工单
             </div>
-          ) : history.error ? (
+          ) : tickets.error ? (
             <div className="py-14 text-center">
               <AlertTriangle className="mx-auto h-7 w-7 text-destructive" />
-              <p className="mt-3 font-medium">任务记录读取失败</p>
+              <p className="mt-3 font-medium">工单读取失败</p>
               <p className="mt-1 text-sm text-muted-foreground">
-                {history.error.message}
+                {tickets.error.message}
               </p>
             </div>
           ) : items.length ? (
             <>
-              {items.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  className="w-full rounded-xl border p-4 text-left transition hover:border-primary/40 hover:bg-muted/30"
-                  onClick={() => setSelectedTicketId(item.id)}
-                >
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="font-medium">{item.title}</p>
-                      <p className="mt-1 text-sm text-foreground/75">
-                        {item.customerName}
-                        {item.customerUsername
-                          ? ` · @${item.customerUsername}`
-                          : ""}
+              {pendingItems.map((item) => {
+                const dependencyBlockReason = item.dependencyBlockReason;
+                const isNewCustomerTicket =
+                  item.status === "submitted" &&
+                  item.createdByUserId === item.userId;
+                return (
+                  <div
+                    key={item.id}
+                    data-new-customer-ticket={isNewCustomerTicket || undefined}
+                    className={`rounded-xl border p-4 ${
+                      isNewCustomerTicket
+                        ? "border-red-500 bg-red-50/80 ring-2 ring-red-500/25"
+                        : ""
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="font-medium">{item.title}</p>
+                        <p className="mt-1 text-sm text-foreground/75">
+                          {item.customerName}
+                          {item.customerUsername
+                            ? ` · @${item.customerUsername}`
+                            : ""}
+                        </p>
+                      </div>
+                      <Badge
+                        variant={
+                          isNewCustomerTicket ? "destructive" : "outline"
+                        }
+                      >
+                        {isNewCustomerTicket
+                          ? "用户新提交"
+                          : DELIVERY_TICKET_STATUS_LABELS[
+                              item.status as DeliveryTicketStatus
+                            ] || item.status}
+                      </Badge>
+                    </div>
+                    <div className="mt-3 rounded-xl bg-muted/35 px-3 py-2 text-xs leading-5">
+                      <strong>
+                        {
+                          deliveryTicketActionGuidance(
+                            item.status as DeliveryTicketStatus,
+                          ).label
+                        }
+                      </strong>
+                      <p className="mt-0.5 text-muted-foreground">
+                        {
+                          deliveryTicketActionGuidance(
+                            item.status as DeliveryTicketStatus,
+                          ).description
+                        }
                       </p>
                     </div>
-                    <Badge variant="outline">
-                      {TERMINAL_STATUS_LABELS[item.status] || item.status}
-                    </Badge>
+                    {item.operation === "knowledge_reset" &&
+                      item.status === "submitted" &&
+                      item.assignedProjectAssignmentId &&
+                      item.clientRequestId && (
+                        <KnowledgeResetDecision
+                          projectAssignmentId={item.assignedProjectAssignmentId}
+                          requestId={item.clientRequestId}
+                          onDone={() => tickets.refetch()}
+                        />
+                      )}
+                    {item.operation !== "knowledge_reset" &&
+                      item.assignedProjectAssignmentId &&
+                      !dependencyBlockReason && (
+                        <DeliveryTicketActions
+                          projectAssignmentId={item.assignedProjectAssignmentId}
+                          ticket={item}
+                          onDone={() => tickets.refetch()}
+                        />
+                      )}
+                    {dependencyBlockReason && (
+                      <div className="mt-3 rounded-xl border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+                        <strong>等待前置工单</strong>
+                        <p className="mt-0.5">{dependencyBlockReason}</p>
+                      </div>
+                    )}
                   </div>
-                  <p className="mt-3 line-clamp-2 text-sm text-muted-foreground">
-                    {item.resultExcerpt}
-                  </p>
-                  <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                    <span>{operationLabel(item.operation) || "交付任务"}</span>
-                    <span>{displayTaskDate(item.resolvedAt)}</span>
+                );
+              })}
+              {completedItems.length > 0 && (
+                <div className="pt-4">
+                  <p className="mb-3 text-sm font-semibold">已完成工单</p>
+                  <div className="space-y-3">
+                    {completedItems.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className="w-full rounded-xl border p-4 text-left transition hover:border-primary/40 hover:bg-muted/30"
+                        onClick={() => setSelectedTicketId(item.id)}
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <p className="font-medium">{item.title}</p>
+                            <p className="mt-1 text-sm text-foreground/75">
+                              {item.customerName}
+                            </p>
+                          </div>
+                          <Badge variant="outline">
+                            {TERMINAL_STATUS_LABELS[item.status] || "已完成"}
+                          </Badge>
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                          <span>
+                            {operationLabel(item.operation) || "交付任务"}
+                          </span>
+                          <span>
+                            {displayTaskDate(item.resolvedAt || item.updatedAt)}
+                          </span>
+                        </div>
+                      </button>
+                    ))}
                   </div>
-                </button>
-              ))}
-              {history.hasNextPage && (
-                <div className="pt-2 text-center">
+                </div>
+              )}
+              {tickets.hasNextPage && (
+                <div className="pt-3 text-center">
                   <Button
+                    type="button"
                     variant="outline"
-                    disabled={history.isFetchingNextPage}
-                    onClick={() => void history.fetchNextPage()}
+                    disabled={tickets.isFetchingNextPage}
+                    onClick={() => void tickets.fetchNextPage()}
                   >
-                    {history.isFetchingNextPage && (
+                    {tickets.isFetchingNextPage && (
                       <Loader2 className="h-4 w-4 animate-spin" />
                     )}
-                    加载更多
+                    加载更多工单
                   </Button>
                 </div>
               )}
@@ -1095,7 +1156,7 @@ function DeliveryHistoryView() {
           ) : (
             <div className="py-14 text-center text-sm text-muted-foreground">
               <CheckCircle2 className="mx-auto mb-3 h-7 w-7" />
-              当前筛选条件下暂无历史任务
+              当前筛选条件下暂无工单
             </div>
           )}
         </CardContent>

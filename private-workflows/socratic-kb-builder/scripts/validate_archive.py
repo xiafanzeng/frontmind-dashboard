@@ -131,6 +131,7 @@ DISPLAY_ROLES = {"badge"}
 MANIFEST_KEYS = {
     "schemaVersion",
     "profile",
+    "buildRevision",
     "documents",
     "assets",
     "counts",
@@ -651,6 +652,12 @@ def validate_archive(path: Path) -> list[str]:
             manifest.get("profile") == "dashboard-enterprise-v1",
             "00_package_manifest.json profile must be dashboard-enterprise-v1",
         )
+        validation.require(
+            isinstance(manifest.get("buildRevision"), int)
+            and not isinstance(manifest.get("buildRevision"), bool)
+            and manifest.get("buildRevision") >= 0,
+            "00_package_manifest.json buildRevision must be a non-negative integer",
+        )
 
         documents_value = manifest.get("documents")
         assets_value = manifest.get("assets")
@@ -795,13 +802,16 @@ def validate_archive(path: Path) -> list[str]:
                 require_exact_keys(
                     raw_document,
                     allowed=DOCUMENT_KEYS,
-                    required=DOCUMENT_REQUIRED_KEYS
-                    | {
-                        "evidenceDocumentIds",
-                        "evidenceCharacters",
-                        "requiredFormalCharacters",
-                        "contentStatus",
-                    },
+                    required=(
+                        DOCUMENT_REQUIRED_KEYS
+                        | {
+                            "evidenceDocumentIds",
+                            "evidenceCharacters",
+                            "requiredFormalCharacters",
+                            "contentStatus",
+                        }
+                        | ({"branchTitle", "order"} if kind == "leaf" else set())
+                    ),
                     where=where,
                     validation=validation,
                 )
@@ -888,6 +898,20 @@ def validate_archive(path: Path) -> list[str]:
                     )
                 _ = evidence_document_ids
             if kind == "leaf":
+                branch_title = require_string(
+                    raw_document, "branchTitle", where, validation
+                )
+                order = raw_document.get("order")
+                validation.require(
+                    bool(branch_title), f"{where}.leaf requires branchTitle"
+                )
+                validation.require(
+                    isinstance(order, int)
+                    and not isinstance(order, bool)
+                    and order == leaf_count,
+                    f"{where}.order must equal zero-based manifest leaf position "
+                    f"{leaf_count}",
+                )
                 leaf_count += 1
                 if first_leaf_id is None:
                     first_leaf_id = doc_id

@@ -579,7 +579,7 @@ export function ServiceHome({
         data-testid="service-home-overview"
       >
         <article
-          className="min-w-0 overflow-hidden rounded-[22px] border border-[#5b2a86]/15 bg-[linear-gradient(135deg,#25124f,#5b2a86)] p-6 text-white shadow-[0_18px_48px_rgba(33,19,58,.13)] md:p-8"
+          className="min-w-0 self-start overflow-hidden rounded-[22px] border border-[#5b2a86]/15 bg-[linear-gradient(135deg,#25124f,#5b2a86)] p-6 text-white shadow-[0_18px_48px_rgba(33,19,58,.13)] md:p-8"
           aria-label={`当前服务版本：${portal.plan.name}`}
         >
           <div>
@@ -601,22 +601,27 @@ export function ServiceHome({
               </div>
             </div>
           </div>
-          <div className="mt-10 grid min-w-0 gap-3 sm:grid-cols-2">
+          <div
+            className="mt-8 grid min-w-0 gap-3"
+            data-testid="service-plan-summary"
+          >
             <div className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.07] p-4">
-              <span className="flex items-center gap-2 text-xs text-white/55">
-                <CalendarRange className="h-4 w-4" />
-                服务有效期
-              </span>
-              <strong className="mt-2 block text-sm leading-6 text-white">
-                {validityLabel(portal)}
-              </strong>
+              <div className="flex min-w-0 flex-wrap items-start justify-between gap-x-4 gap-y-2">
+                <span className="flex shrink-0 items-center gap-2 text-xs text-white/55">
+                  <CalendarRange className="h-4 w-4" />
+                  服务有效期
+                </span>
+                <strong className="min-w-0 text-right text-sm leading-5 text-white">
+                  {validityLabel(portal)}
+                </strong>
+              </div>
             </div>
             <div className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.07] p-4">
               <span className="flex items-center gap-2 text-xs text-white/55">
                 <Sparkles className="h-4 w-4" />
                 套餐范围
               </span>
-              <strong className="mt-2 block text-sm leading-6 text-white">
+              <div className="mt-3 min-w-0 text-sm leading-6 text-white">
                 {portal.quotas.length > 0 ? (
                   <span
                     className={`grid min-w-0 gap-2 ${
@@ -627,9 +632,9 @@ export function ServiceHome({
                     {portal.quotas.slice(0, 4).map((quota) => (
                       <span
                         key={quota.key}
-                        className="grid min-w-0 content-start gap-0.5 rounded-lg bg-white/[0.045] px-2.5 py-2"
+                        className="grid min-h-14 min-w-0 content-start gap-1 rounded-xl border border-white/[0.06] bg-white/[0.045] px-3 py-2.5"
                       >
-                        <small className="block min-w-0 whitespace-nowrap text-[10px] font-medium leading-4 text-white/65">
+                        <small className="block min-w-0 break-words text-[10px] font-medium leading-4 text-white/65">
                           {quota.label}
                         </small>
                         <span className="block text-xs font-semibold leading-4 text-white">
@@ -643,7 +648,7 @@ export function ServiceHome({
                 ) : (
                   "待服务配置同步"
                 )}
-              </strong>
+              </div>
             </div>
           </div>
         </article>

@@ -27,6 +27,7 @@ import {
   type AuthenticatedUser,
 } from "./auth-service";
 import { getDb } from "./db";
+import { knowledgeBaseWritesAreEmergencyBlocked } from "./knowledge-base-runtime-guard";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getServicePortal } from "./service-entitlement";
 import { getUpstreamBaseUrl } from "./upstream-config";
@@ -63,6 +64,8 @@ type KnowledgeCounts = {
     id: string;
     conversationId: string;
     upstreamTaskId: string | null;
+    logoStorageKey: string | null;
+    packageStorageKey: string | null;
   }>;
   snapshots: Array<{
     id: string;
@@ -80,13 +83,20 @@ type KnowledgeCounts = {
 export function knowledgeSnapshotCleanupStorageKeys(
   userId: number,
   snapshots: KnowledgeCounts["snapshots"],
+  builds: KnowledgeCounts["builds"] = [],
 ) {
   return Array.from(
     new Set(
-      snapshots.flatMap((snapshot) => [
-        ...snapshot.assets.map((asset) => asset.key).filter(Boolean),
-        knowledgeSnapshotArchiveStorageKey(userId, snapshot.id),
-      ]),
+      [
+        ...snapshots.flatMap((snapshot) => [
+          ...snapshot.assets.map((asset) => asset.key).filter(Boolean),
+          knowledgeSnapshotArchiveStorageKey(userId, snapshot.id),
+        ]),
+        ...builds.flatMap((build) => [
+          build.logoStorageKey,
+          build.packageStorageKey,
+        ]),
+      ].filter((key): key is string => Boolean(key)),
     ),
   );
 }
@@ -101,6 +111,8 @@ async function getKnowledgeCounts(
         id: knowledgeBaseBuilds.id,
         conversationId: knowledgeBaseBuilds.conversationId,
         upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+        logoStorageKey: knowledgeBaseBuilds.logoStorageKey,
+        packageStorageKey: knowledgeBaseBuilds.packageStorageKey,
       })
       .from(knowledgeBaseBuilds)
       .where(eq(knowledgeBaseBuilds.userId, userId)),
@@ -248,6 +260,13 @@ export async function getKnowledgeResetStatus(userId: number) {
 }
 
 export async function assertKnowledgeBaseWritable(userId: number) {
+  const emergencyBlock = knowledgeBaseWritesAreEmergencyBlocked();
+  if (emergencyBlock) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "知识库写入已因状态不变量告警临时关闭，请稍后重试",
+    );
+  }
   const db = await requireDb();
   const rows = await db
     .select({ id: knowledgeBaseResetRequests.id })
@@ -591,6 +610,7 @@ export async function decideKnowledgeReset(input: {
     const localAssetKeys = knowledgeSnapshotCleanupStorageKeys(
       row.request.userId,
       counts.snapshots,
+      counts.builds,
     );
     const [conversationRows, attachmentRows, resourceRows] = await Promise.all([
       storedIds.length

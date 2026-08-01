@@ -27,10 +27,11 @@ describe("administrator channel navigation", () => {
     "keeps the unified administrator navigation order in %s",
     (_name, navigation) => {
       expect(navigation.map((item) => item.label)).toEqual([
-        "交付总览",
-        "客户交付工作台",
-        ...(_name === "real" ? ["客户项目团队", "工单调度"] : []),
+        "API与人员管理",
         "官网任务与积分",
+        "客户交付工作台",
+        "客户项目团队",
+        "工单",
         "账号与权限",
         "问题监控",
         "渠道分发",
@@ -85,7 +86,7 @@ describe("administrator channel navigation", () => {
       ).toBe(false);
       expect(
         navigation.find((item) => item.label === "官网任务与积分"),
-      ).toMatchObject({ group: "客户与服务" });
+      ).toMatchObject({ group: "运营" });
     },
   );
 
@@ -93,10 +94,9 @@ describe("administrator channel navigation", () => {
     const deliveryAdminNavigation = getAdminNav(false);
 
     expect(deliveryAdminNavigation.map((item) => item.label)).toEqual([
-      "交付总览",
       "客户管理",
       "客户项目团队",
-      "工单调度",
+      "工单",
       "FrontMind Agent",
       "账号与权限",
     ]);
@@ -121,8 +121,7 @@ describe("administrator channel navigation", () => {
     const deliveryNavigation = getPreviewAdminNav(false);
     const systemNavigation = getPreviewAdminNav(true);
 
-    expect(deliveryNavigation[0]?.href).toBe("/preview/admin/delivery");
-    expect(deliveryNavigation[1]?.href).toBe(
+    expect(deliveryNavigation[0]?.href).toBe(
       "/preview/admin/delivery/workspace",
     );
     expect(
@@ -130,6 +129,16 @@ describe("administrator channel navigation", () => {
         (item) => item.href === "/preview/admin/delivery/agent",
       ),
     ).toBe(true);
+    expect(deliveryNavigation.map((item) => item.label)).toEqual([
+      "客户管理",
+      "客户项目团队",
+      "工单",
+      "FrontMind Agent",
+      "账号与权限",
+    ]);
+    expect(
+      deliveryNavigation.find((item) => item.label === "账号与权限"),
+    ).toMatchObject({ href: "/preview/admin/delivery/accounts" });
     expect(
       deliveryNavigation.some(
         (item) =>
@@ -163,9 +172,6 @@ describe("administrator channel navigation", () => {
     expect(getPreviewAdminWorkspaceHref(true)).toBe(
       "/preview/admin/system/workspace",
     );
-    expect(getPreviewAdminWorkspaceHref(true, "action=create")).toBe(
-      "/preview/admin/system/workspace?action=create",
-    );
   });
 
   it("uses a concise delivery overview without duplicate toolbar actions", () => {
@@ -173,7 +179,7 @@ describe("administrator channel navigation", () => {
       resolve(process.cwd(), "client/src/pages/AdminDashboard.tsx"),
       "utf8",
     );
-    expect(source).toContain('title="交付总览"');
+    expect(source).toContain('title="API与人员管理"');
     expect(source).not.toContain("打开客户交付工作台");
     expect(source).not.toContain(">创建客户<");
     expect(source).not.toContain("交付管理员积分");
@@ -182,8 +188,24 @@ describe("administrator channel navigation", () => {
     );
     expect(source).not.toContain("管理员自用 Agent 积分");
     expect(source).toContain("统一 API Key 管理");
-    expect(source).toContain("客户、交付管理员和工程师使用同一套管理入口");
+    expect(source).toContain(
+      "客户、系统管理员、交付管理员和工程师使用同一套管理入口",
+    );
+    expect(source).toContain(
+      "trpc.admin.apiKeyUsageAlerts.replaceTargetCredential.useMutation()",
+    );
+    expect(source).toContain(
+      "trpc.admin.apiKeyUsageAlerts.revokeTargetCredential.useMutation()",
+    );
+    expect(source).toContain('confirmation: "REPLACE_API_KEY"');
+    expect(source).toContain('confirmation: "REVOKE_API_KEY"');
+    expect(source).toContain("迟到请求不会覆盖较新的 Key");
+    expect(source).toContain("近 30 天自用");
     expect(source).toContain("Key 总额");
+    expect(source).toContain("同步不完整");
+    expect(source).toContain('row.syncStatus === "ok"');
+    expect(source).toContain('engineer.usageSyncStatus === "ok"');
+    expect(source).toContain("只读验收预览 · 近 30 天");
     expect(source).not.toContain("管理员通用 Agent");
     expect(source).not.toContain("从客户签约到交付验收的统一工作台");
     expect(source).not.toContain(
@@ -193,6 +215,32 @@ describe("administrator channel navigation", () => {
     expect(source).not.toContain("交付工单总览");
     expect(source).not.toContain("四角色交付状态");
     expect(source).not.toContain("stats?.pendingAssignment");
+  });
+
+  it("keeps system administrators and non-ok usage states in the unified hierarchy", () => {
+    const normalized = normalizeUsageHierarchy({
+      period: { label: "近 30 天" },
+      systemAdmins: [
+        {
+          adminId: 1,
+          displayName: "系统管理员",
+          username: "system.admin",
+          apiKeyConfigured: true,
+          apiKeyVersion: 3,
+          keyTotalUsed: 20,
+          ownAgentMonthUsed: 10,
+          syncStatus: "error",
+          fetchedAt: null,
+        },
+      ],
+    });
+    expect(normalized.systemAdmins).toEqual([
+      expect.objectContaining({
+        adminId: 1,
+        apiKeyVersion: 3,
+        syncStatus: "error",
+      }),
+    ]);
   });
 
   it("presents delivery workload as one status row per engineer", () => {

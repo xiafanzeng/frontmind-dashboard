@@ -11,6 +11,8 @@ import {
 const mocks = vi.hoisted(() => ({
   createTask: vi.fn(),
   createKnowledgeBaseTurnTask: vi.fn(),
+  reserveKnowledgeBaseTurnWithAttachments: vi.fn(),
+  stageKnowledgeBaseTurnAttachment: vi.fn(),
   createResponseLogicTask: vi.fn(),
   retrieveTask: vi.fn(),
   reconcileKnowledgeBaseProgress: vi.fn(),
@@ -22,16 +24,24 @@ const mocks = vi.hoisted(() => ({
   updateAssistantMessages: vi.fn(),
   updateTitle: vi.fn(),
   createConversation: vi.fn(),
+  registerKnowledgeBaseConversation: vi.fn(),
+  wakeKnowledgeBaseConversation: vi.fn(),
+  commitKnowledgeBaseObservation: vi.fn(),
+  rollbackPendingKnowledgeBaseTurn: vi.fn(),
   parseOutputMessages: vi.fn(),
   sanitizeKnowledgeBaseOutputMessages: vi.fn((messages: any[]) => messages),
   useConversation: vi.fn(),
   prepareUploadFiles: vi.fn(),
   isImageUpload: vi.fn(),
+  sha256UploadFile: vi.fn(),
 }));
 
 vi.mock("@/lib/frontmind-api", () => ({
   createTask: mocks.createTask,
   createKnowledgeBaseTurnTask: mocks.createKnowledgeBaseTurnTask,
+  reserveKnowledgeBaseTurnWithAttachments:
+    mocks.reserveKnowledgeBaseTurnWithAttachments,
+  stageKnowledgeBaseTurnAttachment: mocks.stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask: mocks.createResponseLogicTask,
   retrieveTask: mocks.retrieveTask,
   uploadFile: mocks.uploadFile,
@@ -45,6 +55,7 @@ vi.mock("@/lib/frontmind-api", () => ({
 vi.mock("@/lib/attachment-files", () => ({
   prepareUploadFiles: mocks.prepareUploadFiles,
   isImageUpload: mocks.isImageUpload,
+  sha256UploadFile: mocks.sha256UploadFile,
   ZIP_REFERENCE_PROMPT:
     "附件 ZIP 中包含用户上传的原始参考图片，请解压后读取图片内容作为参考。",
 }));
@@ -69,6 +80,10 @@ function mockConversationContext(overrides = {}) {
     updateAssistantMessages: mocks.updateAssistantMessages,
     updateTitle: mocks.updateTitle,
     createConversation: mocks.createConversation,
+    registerKnowledgeBaseConversation: mocks.registerKnowledgeBaseConversation,
+    wakeKnowledgeBaseConversation: mocks.wakeKnowledgeBaseConversation,
+    commitKnowledgeBaseObservation: mocks.commitKnowledgeBaseObservation,
+    rollbackPendingKnowledgeBaseTurn: mocks.rollbackPendingKnowledgeBaseTurn,
     ...overrides,
   };
 }
@@ -180,6 +195,9 @@ describe("useSendMessage", () => {
       status: "completed",
       output: [],
     });
+    mocks.sha256UploadFile.mockImplementation(async (file: File) =>
+      file.name === "facts.pdf" ? "a".repeat(64) : "b".repeat(64),
+    );
     mocks.createKnowledgeBaseTurnTask.mockResolvedValue({
       id: "test-kb-task-id",
       status: "running",
@@ -191,6 +209,24 @@ describe("useSendMessage", () => {
         lockReason: "任务仍在执行",
       },
     });
+    mocks.stageKnowledgeBaseTurnAttachment.mockResolvedValue({
+      reservation: { stagedAttachmentCount: 1 },
+    });
+    mocks.reserveKnowledgeBaseTurnWithAttachments.mockImplementation(
+      async (_input: unknown, context: any) => ({
+        reservation: {
+          state: "awaiting_attachments",
+          turnId: "reserved-turn-1",
+          clientRequestId: context.clientRequestId,
+          generation: context.expectedGeneration,
+          revision: context.expectedRevision,
+          leafId: context.expectedLeafId,
+          stagedAttachmentCount: 0,
+          expectedAttachmentCount: context.attachmentManifest.length,
+          requiresUpload: true,
+        },
+      }),
+    );
     mocks.retrieveTask.mockResolvedValue({
       id: "test-task-id",
       status: "completed",
@@ -240,70 +276,44 @@ describe("useSendMessage", () => {
     expect(result.current.uploadProgress).toBeNull();
   });
 
-  it("polls, reconciles, and renders the next knowledge node after an async confirmation", async () => {
-    vi.useFakeTimers();
-    mocks.createKnowledgeBaseTurnTask.mockResolvedValueOnce({
-      id: "test-kb-task-id",
-      status: "running",
-      output: [],
-      knowledgeInteraction: {
+  it("hands an async knowledge confirmation to the authoritative coordinator without reading raw output", async () => {
+    const observation = {
+      stateEpoch: 2,
+      generation: 1,
+      authoritativeTaskId: "test-kb-task-id",
+      activeTurn: {
+        id: "turn-2",
+        clientRequestId: "request-2",
+        operationKey: "operation-2",
+        operationType: "confirm",
+        status: "completed",
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: "1.1",
+        startedAt: 1,
+        completedAt: 2,
+        updatedAt: 2,
+      },
+      interaction: {
+        progress: null,
         interactionState: "executing",
         canReply: false,
         canPublish: false,
-        lockReason: "任务仍在执行",
+        lockReason: null,
       },
-    });
-    const completedOutput = [
-      {
-        id: "kb-confirmed-output",
-        type: "output_message",
-        role: "assistant",
-        content: [
-          {
-            type: "output_text",
-            text: [
-              "1.1 已确认。",
-              "",
-              "## 1.2 使命、愿景与企业主张",
-              "",
-              "硅基流动以加速 AGI 普惠人类为使命。",
-              "",
-              '<!-- FRONTMIND_KB_PROGRESS {"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":0,"transition":{"leafId":"1.1","from":"current","to":"confirmed","reason":"用户明确确认"}} -->',
-              '<!-- FRONTMIND_KB_PRESENTATION {"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0} -->',
-            ].join("\n"),
-          },
-        ],
-      },
-    ];
-    mocks.retrieveTask.mockResolvedValueOnce({
+      approvedPresentation: null,
+      package: null,
+      notice: null,
+      conversationVersion: 2,
+    };
+    mocks.createKnowledgeBaseTurnTask.mockResolvedValueOnce({
       id: "test-kb-task-id",
-      status: "completed",
-      output: completedOutput,
+      status: "running",
+      output: [{ id: "raw-output-must-not-render" }],
+      knowledgeObservation: observation,
     });
-    mocks.reconcileKnowledgeBaseProgress.mockResolvedValueOnce({
-      progress: {
-        build: {
-          revision: 1,
-          currentLeafId: "1.2",
-        },
-      },
-      interactionState: "awaiting_input",
-      canReply: true,
-      canPublish: false,
-      lockReason: null,
-    });
-    mocks.parseOutputMessages.mockReturnValueOnce([
-      {
-        id: "kb-confirmed-output",
-        upstreamOutputId: "kb-confirmed-output",
-        role: "assistant",
-        content:
-          "1.1 已确认。\n\n## 1.2 使命、愿景与企业主张\n\n硅基流动以加速 AGI 普惠人类为使命。",
-        timestamp: 2,
-      },
-    ]);
 
-    const { result, unmount } = renderHook(() => useSendMessage());
+    const { result } = renderHook(() => useSendMessage());
     await act(async () => {
       await result.current.sendMessage("确认", [], {
         syncKnowledgeBaseSnapshot: true,
@@ -311,37 +321,228 @@ describe("useSendMessage", () => {
         knowledgeBaseExpectedLeafId: "1.1",
       });
     });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(3_000);
+    expect(mocks.commitKnowledgeBaseObservation).toHaveBeenCalledWith(
+      "test-conv-id",
+      observation,
+    );
+    expect(mocks.wakeKnowledgeBaseConversation).toHaveBeenCalledWith(
+      "test-conv-id",
+    );
+    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
+  });
+
+  it("reserves before upload, stages every file, then dispatches the same logical turn", async () => {
+    const file = new File(["facts"], "facts.pdf", {
+      type: "application/pdf",
+      lastModified: 1_700_000_000_000,
+    });
+    mockPreparedFiles([file]);
+    mocks.reserveKnowledgeBaseTurnWithAttachments.mockResolvedValueOnce({
+      reservation: {
+        state: "awaiting_attachments",
+        turnId: "reserved-turn-files",
+        clientRequestId: "server-canonical-request",
+        generation: 3,
+        revision: 7,
+        leafId: "2.1",
+        stagedAttachmentCount: 0,
+        expectedAttachmentCount: 1,
+        requiresUpload: true,
+      },
+      knowledgeObservation: {
+        stateEpoch: 8,
+        generation: 3,
+        authoritativeTaskId: "parent-task",
+        activeTurn: null,
+        interaction: {
+          progress: null,
+          interactionState: "executing",
+          canReply: false,
+          canPublish: false,
+          lockReason: "附件上传中",
+        },
+        approvedPresentation: null,
+        package: null,
+        notice: null,
+        conversationVersion: 9,
+      },
     });
 
-    expect(mocks.retrieveTask).toHaveBeenCalledWith("test-kb-task-id");
-    expect(mocks.reconcileKnowledgeBaseProgress).toHaveBeenCalledWith({
-      conversationId: "test-conv-id",
-      taskId: "test-kb-task-id",
+    const { result } = renderHook(() => useSendMessage());
+    await act(async () => {
+      await result.current.sendMessage("请结合附件修订", [file], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedGeneration: 3,
+        knowledgeBaseExpectedRevision: 7,
+        knowledgeBaseExpectedLeafId: "2.1",
+      });
     });
-    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith("test-conv-id", [
-      {
-        id: "kb-confirmed-output",
-        upstreamOutputId: "kb-confirmed-output",
-        role: "assistant",
-        content:
-          "1.1 已确认。\n\n## 1.2 使命、愿景与企业主张\n\n硅基流动以加速 AGI 普惠人类为使命。",
-        timestamp: 2,
-      },
-    ]);
-    expect(mocks.updateStatus).toHaveBeenCalledWith(
-      "test-conv-id",
-      "awaiting_input",
+
+    expect(
+      mocks.reserveKnowledgeBaseTurnWithAttachments.mock.invocationCallOrder[0],
+    ).toBeLessThan(mocks.uploadFile.mock.invocationCallOrder[0]);
+    expect(mocks.uploadFile.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[0],
+    );
+    expect(
+      mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      mocks.createKnowledgeBaseTurnTask.mock.invocationCallOrder[0],
+    );
+    expect(mocks.stageKnowledgeBaseTurnAttachment).toHaveBeenCalledWith(
       expect.objectContaining({
-        taskId: "test-kb-task-id",
-        previousResponseId: "test-kb-task-id",
-        lastKnownOutputLength: 1,
+        turnId: "reserved-turn-files",
+        clientRequestId: "server-canonical-request",
+        index: 0,
+        attachment: { file_id: "file-facts.pdf", filename: "facts.pdf" },
       }),
     );
+    expect(
+      mocks.reserveKnowledgeBaseTurnWithAttachments.mock.calls[0][1]
+        .attachmentManifest,
+    ).toEqual([
+      expect.objectContaining({
+        filename: "facts.pdf",
+        sha256: "a".repeat(64),
+      }),
+    ]);
+    expect(mocks.createKnowledgeBaseTurnTask.mock.calls[0][1]).toMatchObject({
+      clientRequestId: "server-canonical-request",
+      attachmentReservation: {
+        turnId: "reserved-turn-files",
+      },
+    });
+    const pendingMessages = mocks.addMessage.mock.calls.filter(
+      ([, message]) => message.knowledgeBase?.kind === "pending_user",
+    );
+    expect(pendingMessages).toHaveLength(1);
+    expect(pendingMessages[0]?.[1]).toMatchObject({
+      knowledgeBase: {
+        clientRequestId: "server-canonical-request",
+        turnId: "reserved-turn-files",
+      },
+    });
+    expect(mocks.addMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.uploadFile.mock.invocationCallOrder[0],
+    );
+  });
 
-    unmount();
-    vi.useRealTimers();
+  it("dispatches an attachment-only resume when every file id is already staged", async () => {
+    const first = new File(["a"], "a.txt", {
+      type: "text/plain",
+      lastModified: 10,
+    });
+    const second = new File(["b"], "b.txt", {
+      type: "text/plain",
+      lastModified: 20,
+    });
+    mockPreparedFiles([first, second]);
+    mocks.reserveKnowledgeBaseTurnWithAttachments.mockResolvedValueOnce({
+      reservation: {
+        state: "awaiting_attachments",
+        turnId: "reserved-all-staged",
+        clientRequestId: "original-request",
+        generation: 3,
+        revision: 7,
+        leafId: "2.1",
+        stagedAttachmentCount: 2,
+        expectedAttachmentCount: 2,
+        requiresUpload: true,
+      },
+    });
+
+    const { result } = renderHook(() => useSendMessage());
+    await act(async () => {
+      await result.current.sendMessage("", [first, second], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedGeneration: 3,
+        knowledgeBaseExpectedRevision: 7,
+        knowledgeBaseExpectedLeafId: "2.1",
+      });
+    });
+
+    expect(mocks.uploadFile).not.toHaveBeenCalled();
+    expect(mocks.stageKnowledgeBaseTurnAttachment).not.toHaveBeenCalled();
+    expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledWith(
+      [{ role: "user", content: [] }],
+      expect.objectContaining({
+        clientRequestId: "original-request",
+        attachmentReservation: expect.objectContaining({
+          turnId: "reserved-all-staged",
+        }),
+      }),
+    );
+  });
+
+  it("reuses the server clientRequestId and does not duplicate a visible pending reservation", async () => {
+    const file = new File(["a"], "a.txt", {
+      type: "text/plain",
+      lastModified: 10,
+    });
+    mockPreparedFiles([file]);
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "conversation-resume",
+          title: "企业知识库构建",
+          status: "running",
+          messages: [
+            {
+              id: "existing-pending",
+              role: "user",
+              content: "",
+              timestamp: 1,
+              knowledgeBase: {
+                kind: "pending_user",
+                clientRequestId: "original-request",
+                turnId: "reserved-turn",
+              },
+            },
+          ],
+          knowledgeBase: {
+            activeClientRequestId: "original-request",
+            notice: { code: "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED" },
+          },
+          lastKnownOutputLength: 0,
+        },
+      }),
+    );
+    mocks.reserveKnowledgeBaseTurnWithAttachments.mockResolvedValueOnce({
+      reservation: {
+        state: "awaiting_attachments",
+        turnId: "reserved-turn",
+        clientRequestId: "original-request",
+        generation: 3,
+        revision: 7,
+        leafId: "2.1",
+        stagedAttachmentCount: 1,
+        expectedAttachmentCount: 1,
+        requiresUpload: true,
+      },
+    });
+
+    const { result } = renderHook(() => useSendMessage());
+    await act(async () => {
+      await result.current.sendMessage("", [file], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedGeneration: 3,
+        knowledgeBaseExpectedRevision: 7,
+        knowledgeBaseExpectedLeafId: "2.1",
+      });
+    });
+
+    expect(
+      mocks.reserveKnowledgeBaseTurnWithAttachments.mock.calls[0][1],
+    ).toMatchObject({
+      clientRequestId: "original-request",
+      resumeExisting: true,
+    });
+    expect(mocks.addMessage).not.toHaveBeenCalled();
+    expect(mocks.createKnowledgeBaseTurnTask.mock.calls[0][1]).toMatchObject({
+      clientRequestId: "original-request",
+      attachmentReservation: { turnId: "reserved-turn" },
+    });
   });
 
   it("does not retry createTask when upstream is overloaded", async () => {

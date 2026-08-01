@@ -17,6 +17,10 @@ import type { ResponseLogicDraft } from "@shared/response-logic";
 import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progress";
 import { stripKnowledgeBaseProtocolPayloads } from "@shared/knowledge-base-output";
 import { userFacingErrorMessage } from "@/lib/user-facing-error";
+import {
+  knowledgeBaseObservationFromPayload,
+  type KnowledgeBaseObservationDto,
+} from "@/lib/knowledge-progress";
 
 /**
  * Model display mapping: public model id -> display name.
@@ -207,6 +211,7 @@ export interface TaskResponse {
     code?: string;
   };
   knowledgeInteraction?: KnowledgeBaseInteractionDto;
+  knowledgeObservation?: KnowledgeBaseObservationDto;
 }
 
 export interface ResponseLogicTaskContext {
@@ -574,13 +579,153 @@ export async function createResponseLogicTask(
  * route. The server owns the model, current node, revision, and progress
  * contract; the browser supplies only the visible turn and uploaded file IDs.
  */
+export interface KnowledgeBaseAttachmentManifestItem {
+  filename: string;
+  sizeBytes: number;
+  mimeType: string;
+  lastModified: number;
+  sha256: string;
+}
+
+export interface KnowledgeBaseAttachmentTurnReservation {
+  state:
+    | "awaiting_attachments"
+    | "pending"
+    | "bound"
+    | "completed"
+    | "terminal";
+  turnId: string;
+  clientRequestId: string;
+  generation: number;
+  revision: number;
+  leafId: string | null;
+  stagedAttachmentCount: number;
+  expectedAttachmentCount: number;
+  requiresUpload: boolean;
+}
+
+async function knowledgeBaseRequestError(response: Response, fallback: string) {
+  let message = `API Error ${response.status}`;
+  let payload: any = null;
+  try {
+    payload = await response.json();
+    message = payload?.error?.message || payload?.message || message;
+  } catch {
+    // Keep the status-derived message.
+  }
+  const error = new Error(
+    userFacingErrorMessage(
+      Object.assign(new Error(message), { status: response.status }),
+      fallback,
+    ),
+  ) as Error & {
+    status?: number;
+    knowledgeObservation?: KnowledgeBaseObservationDto;
+  };
+  error.status = response.status;
+  if (payload?.observation) {
+    error.knowledgeObservation = knowledgeBaseObservationFromPayload(payload);
+  }
+  return error;
+}
+
+export async function reserveKnowledgeBaseTurnWithAttachments(
+  input: Message[],
+  context: {
+    conversationId: string;
+    clientRequestId: string;
+    expectedGeneration: number;
+    expectedRevision: number;
+    expectedLeafId: string;
+    attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+    resumeExisting?: boolean;
+  },
+): Promise<{
+  reservation: KnowledgeBaseAttachmentTurnReservation;
+  knowledgeObservation?: KnowledgeBaseObservationDto;
+}> {
+  const response = await fetch("/api/knowledge-base/turn/reserve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({
+      conversationId: context.conversationId,
+      clientRequestId: context.clientRequestId,
+      expectedGeneration: context.expectedGeneration,
+      expectedRevision: context.expectedRevision,
+      expectedLeafId: context.expectedLeafId,
+      userMessage: buildPromptText(input),
+      attachmentManifest: context.attachmentManifest,
+      resumeExisting: context.resumeExisting === true,
+    }),
+  });
+  if (!response.ok) {
+    throw await knowledgeBaseRequestError(
+      response,
+      `本轮预约失败（${response.status}）`,
+    );
+  }
+  const payload = await response.json();
+  if (!payload?.reservation?.turnId || !payload.reservation.clientRequestId) {
+    throw new Error("本轮预约失败：服务端未返回逻辑轮次");
+  }
+  return {
+    reservation: payload.reservation,
+    knowledgeObservation: payload?.observation
+      ? knowledgeBaseObservationFromPayload(payload)
+      : undefined,
+  };
+}
+
+export async function stageKnowledgeBaseTurnAttachment(input: {
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+  attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+  index: number;
+  attachment: { file_id: string; filename: string };
+}) {
+  // Staging is a replay-safe database append. Retry the same file id so a lost
+  // response cannot force a second upload or a replacement at this index.
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(
+        "/api/knowledge-base/turn/attachments/stage",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(input),
+        },
+      );
+      if (!response.ok) {
+        throw await knowledgeBaseRequestError(
+          response,
+          `附件暂存失败（${response.status}）`,
+        );
+      }
+      return await response.json();
+    } catch (error) {
+      lastError = error;
+      const status = Number((error as { status?: unknown })?.status || 0);
+      if ((status >= 400 && status < 500) || attempt === 2) throw error;
+    }
+  }
+  throw lastError;
+}
+
 export async function createKnowledgeBaseTurnTask(
   input: Message[],
   context: {
     conversationId: string;
-    taskId: string;
+    clientRequestId: string;
     expectedRevision?: number;
     expectedLeafId?: string;
+    attachmentReservation?: {
+      turnId: string;
+      attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+    };
   },
 ): Promise<TaskResponse> {
   const controller = new AbortController();
@@ -589,36 +734,55 @@ export async function createKnowledgeBaseTurnTask(
     CREATE_TASK_TIMEOUT_MS,
   );
   try {
-    const response = await fetch("/api/knowledge-base/turn", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      signal: controller.signal,
-      body: JSON.stringify({
-        ...context,
-        userMessage: buildPromptText(input),
-        attachments: extractAttachments(input),
-      }),
-    });
+    const response = await fetch(
+      context.attachmentReservation
+        ? "/api/knowledge-base/turn/dispatch"
+        : "/api/knowledge-base/turn",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        signal: controller.signal,
+        body: JSON.stringify({
+          conversationId: context.conversationId,
+          clientRequestId: context.clientRequestId,
+          ...(context.attachmentReservation
+            ? {
+                turnId: context.attachmentReservation.turnId,
+                attachmentManifest:
+                  context.attachmentReservation.attachmentManifest,
+              }
+            : {
+                expectedRevision: context.expectedRevision,
+                expectedLeafId: context.expectedLeafId,
+                userMessage: buildPromptText(input),
+                attachments: extractAttachments(input),
+              }),
+        }),
+      },
+    );
     if (!response.ok) {
-      let message = `API Error ${response.status}`;
-      try {
-        const payload = await response.json();
-        message = payload?.error?.message || payload?.message || message;
-      } catch {
-        // Keep the status-derived message.
-      }
-      throw new Error(
-        userFacingErrorMessage(
-          Object.assign(new Error(message), { status: response.status }),
-          `任务创建失败（${response.status}）`,
-        ),
+      throw await knowledgeBaseRequestError(
+        response,
+        `任务创建失败（${response.status}）`,
       );
     }
     const payload = await response.json();
     const data = payload?.task || payload;
-    const taskId = data?.id || data?.task_id;
-    if (!taskId) throw new Error("任务创建失败：未返回任务 ID");
+    const observation = payload?.observation
+      ? knowledgeBaseObservationFromPayload(payload)
+      : undefined;
+    const taskId =
+      data?.id ||
+      data?.task_id ||
+      observation?.authoritativeTaskId ||
+      observation?.activeTurn?.id ||
+      (observation
+        ? `kb-observation-${observation.generation}-${observation.stateEpoch}`
+        : "");
+    if (!observation && !data?.id && !data?.task_id) {
+      throw new Error("任务创建失败：未返回权威任务状态");
+    }
     if (payload?.progress) {
       window.dispatchEvent(
         new CustomEvent("frontmind:knowledge-progress-updated", {
@@ -636,7 +800,9 @@ export async function createKnowledgeBaseTurnTask(
         task_title: data.title || data.task_title || data.metadata?.task_title,
       },
       output: data.output || [],
-      knowledgeInteraction: payload?.interaction,
+      knowledgeInteraction:
+        payload?.observation?.interaction ?? payload?.interaction,
+      knowledgeObservation: observation,
     };
   } finally {
     window.clearTimeout(timeoutId);

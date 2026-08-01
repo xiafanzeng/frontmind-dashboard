@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -166,7 +166,7 @@ describe("SettingsDialog", () => {
     expect(mocks.fetchCreditUsage).not.toHaveBeenCalled();
   });
 
-  it("shows credit usage and recent tasks for an explicit system administrator", async () => {
+  it("routes a system administrator to the unified API and people console", () => {
     mocks.authUser = {
       id: 1,
       username: "security-owner",
@@ -178,43 +178,10 @@ describe("SettingsDialog", () => {
 
     render(<SettingsDialog open onOpenChange={vi.fn()} />);
 
-    await waitFor(() =>
-      expect(mocks.fetchCreditUsage).toHaveBeenCalledWith({
-        force: false,
-        fingerprint: "key-abcd",
-        accountId: 1,
-      }),
-    );
-    expect(await screen.findByText("128 积分")).toBeInTheDocument();
-    expect(screen.getByText("当前 Key 本月总积分")).toBeInTheDocument();
-    expect(
-      screen.getByText(/同一 API Key 可供多个账号共享/),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/总积分反映整个 Key 池的消耗/)).toBeInTheDocument();
-    expect(
-      screen.getByText(/最近任务明细仅显示当前账号创建的任务/),
-    ).toBeInTheDocument();
-    expect(screen.getByText("最近任务明细")).toBeInTheDocument();
-    expect(screen.getByText("GEO 品牌洞察")).toBeInTheDocument();
-  });
-
-  it("tests the saved credential when the replacement field is empty", async () => {
-    mocks.authUser = {
-      id: 1,
-      username: "admin",
-      displayName: "系统管理员",
-      role: "admin",
-      adminAccessLevel: "system_admin",
-      isActive: true,
-    };
-    mocks.testCredential.mockResolvedValue({ ok: true });
-    render(<SettingsDialog open onOpenChange={vi.fn()} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
-
-    await waitFor(() =>
-      expect(mocks.testCredential).toHaveBeenCalledWith({ apiKey: undefined }),
-    );
-    expect(await screen.findByText(/连接正常/)).toBeInTheDocument();
+    expect(screen.getByText(/API 与人员管理/)).toBeInTheDocument();
+    expect(screen.queryByText(/本月总积分/)).not.toBeInTheDocument();
+    expect(screen.queryByText("最近任务明细")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/API Key/)).not.toBeInTheDocument();
+    expect(mocks.fetchCreditUsage).not.toHaveBeenCalled();
   });
 });

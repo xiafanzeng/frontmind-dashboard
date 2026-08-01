@@ -18,6 +18,7 @@ import {
   isNotNull,
   isNull,
   ne,
+  or,
 } from "drizzle-orm";
 import type { Request } from "express";
 import { COOKIE_NAME } from "../shared/const";
@@ -29,8 +30,10 @@ import {
   apiCredentials,
   apiKeyOwnership,
   conversations,
+  conversationTurns,
   deliveryProjectAssignments,
   deliveryTickets,
+  knowledgeBaseBuilds,
   presalesApiCredentials,
   sessions,
   upstreamResources,
@@ -1588,6 +1591,282 @@ export async function deleteActiveApiCredentialInTransaction(input: {
   if (!latest || latest.status !== "active") {
     return { version: latest?.version ?? 0, deleted: false as const };
   }
+  // Reservation creation locks the exact credential before the build. Keep the
+  // same credential -> build lock order here so deletion cannot race a new
+  // active turn into existence after this check.
+  const activeKnowledgeBaseReferences = await input.executor
+    .select({ turnId: conversationTurns.id })
+    .from(conversationTurns)
+    .innerJoin(
+      knowledgeBaseBuilds,
+      and(
+        eq(knowledgeBaseBuilds.activeTurnId, conversationTurns.id),
+        eq(knowledgeBaseBuilds.generation, conversationTurns.buildGeneration),
+      ),
+    )
+    .where(
+      and(
+        eq(conversationTurns.apiCredentialId, latest.id),
+        inArray(knowledgeBaseBuilds.status, [
+          "researching",
+          "confirming",
+          "protocol_error",
+        ]),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  if (activeKnowledgeBaseReferences[0]) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "当前 API Key 仍被在建或可重试的知识库轮次使用；请等待任务完成或先完成知识库重置，再删除该 Key",
+    );
+  }
+
+  // Generic upstream resources do not carry a trustworthy terminal marker in
+  // the local ledger. Cryptoshredding their only credential could strand an
+  // Agent task, attachment, download, or recovery flow after the UI has
+  // already accepted the revoke. Fail closed; rotation remains available and
+  // safely retains the referenced version as retired.
+  const boundUpstreamResources = await input.executor
+    .select({
+      kind: upstreamResources.kind,
+      upstreamId: upstreamResources.upstreamId,
+    })
+    .from(upstreamResources)
+    .where(eq(upstreamResources.apiCredentialId, latest.id))
+    .for("update");
+  if (boundUpstreamResources[0]) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "当前 API Key 仍绑定已有任务或文件，无法安全撤销；请改用替换 Key，系统会保留旧版本供在途任务恢复",
+    );
+  }
+
+  // Historical state-machine migrations can leave a completed build without
+  // an active turn while its sole authoritative ZIP still has to be rebound
+  // from the pinned upstream task.  That is just as live a credential
+  // dependency as an active turn: cryptoshredding the credential would make
+  // the retryable PACKAGE_REBIND_REQUIRED state permanent.  Lock the build
+  // after the credential (the same credential -> build order used above),
+  // then lock the matching turn/resource coordinates before deciding.
+  // Coordinate discovery is intentionally cross-account: a delivery/usage
+  // owner's credential can be pinned by a managed customer's build.
+  const credentialTurnCoordinates = await input.executor
+    .select({
+      buildId: conversationTurns.buildId,
+      buildGeneration: conversationTurns.buildGeneration,
+      upstreamTaskId: conversationTurns.upstreamTaskId,
+      status: conversationTurns.status,
+    })
+    .from(conversationTurns)
+    .where(eq(conversationTurns.apiCredentialId, latest.id));
+  if (
+    credentialTurnCoordinates.some(
+      (turn: any) => turn.status === "queued" || turn.status === "running",
+    )
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "当前 API Key 仍被已预约或运行中的任务使用，无法安全撤销；请改用替换 Key，系统会保留旧版本供任务继续恢复。",
+    );
+  }
+  const credentialResourceCoordinates = await input.executor
+    .select({
+      kind: upstreamResources.kind,
+      upstreamId: upstreamResources.upstreamId,
+    })
+    .from(upstreamResources)
+    .where(eq(upstreamResources.apiCredentialId, latest.id));
+  const credentialBuildIds = Array.from(
+    new Set<string>(
+      credentialTurnCoordinates
+        .map((turn: any) => turn.buildId)
+        .filter(
+          (value: unknown): value is string =>
+            typeof value === "string" && value.length > 0,
+        ),
+    ),
+  );
+  const credentialTaskIds = Array.from(
+    new Set<string>([
+      ...credentialTurnCoordinates
+        .map((turn: any) => turn.upstreamTaskId)
+        .filter(
+          (value: unknown): value is string =>
+            typeof value === "string" && value.length > 0,
+        ),
+      ...credentialResourceCoordinates
+        .filter((resource: any) => resource.kind === "task")
+        .map((resource: any) => resource.upstreamId)
+        .filter(
+          (value: unknown): value is string =>
+            typeof value === "string" && value.length > 0,
+        ),
+    ]),
+  );
+  const credentialFileIds = Array.from(
+    new Set<string>(
+      credentialResourceCoordinates
+        .filter((resource: any) => resource.kind === "file")
+        .map((resource: any) => resource.upstreamId)
+        .filter(
+          (value: unknown): value is string =>
+            typeof value === "string" && value.length > 0,
+        ),
+    ),
+  );
+  const credentialBuildCoordinate = or(
+    eq(knowledgeBaseBuilds.userId, input.userId),
+    ...(credentialBuildIds.length > 0
+      ? [inArray(knowledgeBaseBuilds.id, credentialBuildIds)]
+      : []),
+    ...(credentialTaskIds.length > 0
+      ? [
+          inArray(knowledgeBaseBuilds.upstreamTaskId, credentialTaskIds),
+          inArray(knowledgeBaseBuilds.packageTaskId, credentialTaskIds),
+        ]
+      : []),
+    ...(credentialFileIds.length > 0
+      ? [inArray(knowledgeBaseBuilds.packageFileId, credentialFileIds)]
+      : []),
+  );
+  const artifactRecoveryBuilds = await input.executor
+    .select({
+      id: knowledgeBaseBuilds.id,
+      generation: knowledgeBaseBuilds.generation,
+      status: knowledgeBaseBuilds.status,
+      protocolErrorCode: knowledgeBaseBuilds.protocolErrorCode,
+      skillVersion: knowledgeBaseBuilds.skillVersion,
+      upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+      packageTaskId: knowledgeBaseBuilds.packageTaskId,
+      packageFileId: knowledgeBaseBuilds.packageFileId,
+      packageStorageKey: knowledgeBaseBuilds.packageStorageKey,
+      packageArchiveSha256: knowledgeBaseBuilds.packageArchiveSha256,
+      packageSizeBytes: knowledgeBaseBuilds.packageSizeBytes,
+      logoStorageKey: knowledgeBaseBuilds.logoStorageKey,
+      logoSha256: knowledgeBaseBuilds.logoSha256,
+      logoBytes: knowledgeBaseBuilds.logoBytes,
+    })
+    .from(knowledgeBaseBuilds)
+    .where(
+      and(
+        credentialBuildCoordinate,
+        or(
+          eq(knowledgeBaseBuilds.status, "protocol_error"),
+          eq(knowledgeBaseBuilds.status, "ready_to_publish"),
+        ),
+      ),
+    )
+    .for("update");
+  const recoveryDependencies = artifactRecoveryBuilds.filter((build: any) => {
+    const packageDurable = Boolean(
+      build.packageStorageKey &&
+        /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || "")) &&
+        Number(build.packageSizeBytes) > 0,
+    );
+    const logoDurable = Boolean(
+      build.logoStorageKey &&
+        /^[a-f0-9]{64}$/u.test(String(build.logoSha256 || "")) &&
+        Number(build.logoBytes) > 0,
+    );
+    return (
+      (build.status === "protocol_error" &&
+        build.protocolErrorCode === "PACKAGE_REBIND_REQUIRED") ||
+      (build.status === "ready_to_publish" &&
+        (build.skillVersion === "3" || build.skillVersion === "4") &&
+        (!packageDurable || (build.skillVersion === "4" && !logoDurable)))
+    );
+  });
+  if (recoveryDependencies.length > 0) {
+    const buildIds = recoveryDependencies.map((build: any) => build.id);
+    const pinnedTurns = await input.executor
+      .select({
+        buildId: conversationTurns.buildId,
+        buildGeneration: conversationTurns.buildGeneration,
+        upstreamTaskId: conversationTurns.upstreamTaskId,
+      })
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.apiCredentialId, latest.id),
+          inArray(conversationTurns.buildId, buildIds),
+        ),
+      )
+      .for("update");
+    const taskIds: string[] = Array.from(
+      new Set<string>(
+        recoveryDependencies
+          .flatMap((build: any) => [build.packageTaskId, build.upstreamTaskId])
+          .filter(
+            (value: unknown): value is string =>
+              typeof value === "string" && value.length > 0,
+          ) as string[],
+      ),
+    );
+    const fileIds: string[] = Array.from(
+      new Set<string>(
+        recoveryDependencies
+          .map((build: any) => build.packageFileId)
+          .filter(
+            (value: unknown): value is string =>
+              typeof value === "string" && value.length > 0,
+          ) as string[],
+      ),
+    );
+    const resourceCoordinate =
+      taskIds.length > 0 || fileIds.length > 0
+        ? or(
+            ...(taskIds.length > 0
+              ? [
+                  and(
+                    eq(upstreamResources.kind, "task"),
+                    inArray(upstreamResources.upstreamId, taskIds),
+                  ),
+                ]
+              : []),
+            ...(fileIds.length > 0
+              ? [
+                  and(
+                    eq(upstreamResources.kind, "file"),
+                    inArray(upstreamResources.upstreamId, fileIds),
+                  ),
+                ]
+              : []),
+          )
+        : undefined;
+    const pinnedResources = resourceCoordinate
+      ? await input.executor
+          .select({
+            kind: upstreamResources.kind,
+            upstreamId: upstreamResources.upstreamId,
+          })
+          .from(upstreamResources)
+          .where(
+            and(
+              eq(upstreamResources.apiCredentialId, latest.id),
+              resourceCoordinate,
+            ),
+          )
+          .for("update")
+      : [];
+    const pinnedByTurn = recoveryDependencies.some((build: any) =>
+      pinnedTurns.some(
+        (turn: any) =>
+          turn.buildId === build.id &&
+          turn.buildGeneration === build.generation &&
+          (!turn.upstreamTaskId ||
+            turn.upstreamTaskId === build.packageTaskId ||
+            turn.upstreamTaskId === build.upstreamTaskId),
+      ),
+    );
+    if (pinnedByTurn || pinnedResources.length > 0) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "当前 API Key 仍是历史知识库 ZIP/Logo 权威重绑所需的唯一凭证；请先完成成品固化与重新绑定，或先轮换 Key 保留该凭证版本",
+      );
+    }
+  }
   await input.executor
     .update(apiCredentials)
     .set({
@@ -1655,6 +1934,147 @@ export async function getDecryptedCredentialForUser(
     status: credential.status,
     verifiedAt: credential.verifiedAt,
   };
+}
+
+/**
+ * Resolves the exact credential version captured by a durable background
+ * reservation. This differs from the ordinary "active credential" lookup:
+ * rotating a Key must not move an in-flight idempotency operation into a new
+ * upstream credential namespace.
+ */
+export async function getDecryptedCredentialForAccountById(
+  accountId: number,
+  credentialId: string,
+): Promise<DecryptedCredential | null> {
+  const db = await requireDb();
+  if (!(await credentialMayServeAccount(db, accountId, credentialId))) {
+    return null;
+  }
+  const rows = await db
+    .select()
+    .from(apiCredentials)
+    .where(
+      and(
+        eq(apiCredentials.id, credentialId),
+        ne(apiCredentials.status, "deleted"),
+      ),
+    )
+    .limit(1);
+  const credential = rows[0];
+  if (!credential || credential.status === "deleted") return null;
+  return {
+    id: credential.id,
+    userId: credential.userId,
+    version: credential.version,
+    apiKey: decryptApiKey(credential),
+    fingerprint: credential.fingerprint,
+    status: credential.status,
+    verifiedAt: credential.verifiedAt,
+  };
+}
+
+/**
+ * Resolve the credential pinned to one already-authoritative knowledge-base
+ * reservation. This is deliberately not a general cross-account credential
+ * lookup: the credential, build and active turn are locked in the global
+ * credential -> build -> turn order and every persisted coordinate must match
+ * the caller's claim. The durable turn remains the historical authority after
+ * a managed account is reassigned from usage owner A to B.
+ */
+export async function getDecryptedCredentialForKnowledgeBaseReservation(
+  input: {
+    userId: number;
+    turnId: string;
+    buildId: string;
+    buildGeneration: number;
+    apiCredentialId: string;
+  },
+  executor?: any,
+): Promise<DecryptedCredential | null> {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const credential = (
+      await tx
+        .select()
+        .from(apiCredentials)
+        .where(eq(apiCredentials.id, input.apiCredentialId))
+        .limit(1)
+        .for("update")
+    )[0] as ApiCredential | undefined;
+    if (
+      !credential ||
+      (credential.status !== "active" && credential.status !== "retired")
+    ) {
+      return null;
+    }
+
+    const build = (
+      await tx
+        .select({
+          id: knowledgeBaseBuilds.id,
+          userId: knowledgeBaseBuilds.userId,
+          generation: knowledgeBaseBuilds.generation,
+          activeTurnId: knowledgeBaseBuilds.activeTurnId,
+          status: knowledgeBaseBuilds.status,
+        })
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, input.buildId),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+            eq(knowledgeBaseBuilds.generation, input.buildGeneration),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (
+      !build ||
+      build.activeTurnId !== input.turnId ||
+      !["researching", "confirming", "protocol_error"].includes(
+        String(build.status),
+      )
+    ) {
+      return null;
+    }
+
+    const turn = (
+      await tx
+        .select({
+          id: conversationTurns.id,
+          userId: conversationTurns.userId,
+          buildId: conversationTurns.buildId,
+          buildGeneration: conversationTurns.buildGeneration,
+          apiCredentialId: conversationTurns.apiCredentialId,
+          status: conversationTurns.status,
+        })
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, input.turnId),
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, input.buildId),
+            eq(conversationTurns.buildGeneration, input.buildGeneration),
+            eq(conversationTurns.apiCredentialId, input.apiCredentialId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (!turn || (turn.status !== "queued" && turn.status !== "running")) {
+      return null;
+    }
+
+    return {
+      id: credential.id,
+      userId: credential.userId,
+      version: credential.version,
+      apiKey: decryptApiKey(credential),
+      fingerprint: credential.fingerprint,
+      status: credential.status,
+      verifiedAt: credential.verifiedAt,
+    };
+  });
 }
 
 /**

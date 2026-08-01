@@ -7,6 +7,8 @@ const MAX_URL_LENGTH = 8_192;
 
 export interface KnowledgeArchiveDescriptor {
   outputItemId: string;
+  /** All provider projections that described this same physical file. */
+  outputItemIds?: string[];
   fileId?: string;
   url?: string;
   filename: string;
@@ -50,13 +52,12 @@ function descriptorFromTypedFile(
     .toLowerCase()
     .slice(0, 255);
   const rawFileId = String(item.file_id ?? item.fileId ?? "").trim();
-  const rawUrl = String(
-    item.file_url ?? item.fileUrl ?? item.url ?? "",
-  ).trim();
-  const fileId = (rawFileId || knowledgeArchiveFileIdFromUrl(rawUrl) || "").slice(
-    0,
-    MAX_FILE_ID_LENGTH,
-  );
+  const rawUrl = String(item.file_url ?? item.fileUrl ?? item.url ?? "").trim();
+  const fileId = (
+    rawFileId ||
+    knowledgeArchiveFileIdFromUrl(rawUrl) ||
+    ""
+  ).slice(0, MAX_FILE_ID_LENGTH);
   const url = rawUrl.slice(0, MAX_URL_LENGTH);
   const isZip =
     filename.toLowerCase().endsWith(".zip") ||
@@ -87,16 +88,35 @@ export function collectKnowledgeArchiveDescriptors(
   for (let outputIndex = 0; outputIndex < output.length; outputIndex += 1) {
     if (descriptors.length >= MAX_ARCHIVE_CANDIDATES) break;
     const item = asObject(output[outputIndex]);
-    if (!item || item.role === "user") continue;
+    if (!item) continue;
+    const role = String(item.role || "")
+      .trim()
+      .toLowerCase();
+    const type = String(item.type || "")
+      .trim()
+      .toLowerCase();
+    if (
+      role === "user" ||
+      role === "tool" ||
+      role === "system" ||
+      role === "developer" ||
+      type.includes("reasoning") ||
+      type.includes("tool") ||
+      type.startsWith("input_")
+    ) {
+      continue;
+    }
     const parentId = String(item.id || `output:${outputIndex}`).slice(0, 191);
 
-    const topLevel = descriptorFromTypedFile(item, parentId);
+    const topLevel =
+      !role || role === "assistant"
+        ? descriptorFromTypedFile(item, parentId)
+        : null;
     if (topLevel) descriptors.push(topLevel);
     if (descriptors.length >= MAX_ARCHIVE_CANDIDATES) break;
 
-    const type = String(item.type || "message").toLowerCase();
     if (
-      item.role !== "assistant" ||
+      role !== "assistant" ||
       (type !== "message" && type !== "output_message") ||
       !Array.isArray(item.content)
     ) {
@@ -116,7 +136,46 @@ export function collectKnowledgeArchiveDescriptors(
     }
   }
 
-  return descriptors;
+  const deduplicated: KnowledgeArchiveDescriptor[] = [];
+  for (const descriptor of descriptors) {
+    const aliases = new Set(
+      [
+        descriptor.fileId,
+        descriptor.url,
+        descriptor.url
+          ? knowledgeArchiveFileIdFromUrl(descriptor.url)
+          : undefined,
+      ].filter(Boolean),
+    );
+    const existingIndex = deduplicated.findIndex((candidate) =>
+      [
+        candidate.fileId,
+        candidate.url,
+        candidate.url
+          ? knowledgeArchiveFileIdFromUrl(candidate.url)
+          : undefined,
+      ]
+        .filter(Boolean)
+        .some((alias) => aliases.has(alias)),
+    );
+    if (existingIndex < 0) {
+      deduplicated.push(descriptor);
+      continue;
+    }
+    const existing = deduplicated[existingIndex]!;
+    deduplicated[existingIndex] = {
+      ...existing,
+      outputItemIds: [
+        ...new Set([
+          ...(existing.outputItemIds || [existing.outputItemId]),
+          ...(descriptor.outputItemIds || [descriptor.outputItemId]),
+        ]),
+      ],
+      ...(descriptor.fileId ? { fileId: descriptor.fileId } : {}),
+      ...(descriptor.url ? { url: descriptor.url } : {}),
+    };
+  }
+  return deduplicated;
 }
 
 export function knowledgeArchiveDescriptorHash(
@@ -135,6 +194,59 @@ export function knowledgeArchiveDescriptorHash(
         filename: descriptor.filename,
         mimeType: descriptor.mimeType,
       }),
+    )
+    .digest("hex");
+}
+
+function canonicalPhysicalArchiveUrl(value: string) {
+  try {
+    const parsed = new URL(value);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return String(value || "").split(/[?#]/u, 1)[0] || "";
+  }
+}
+
+/**
+ * Stable v4 physical identity. Provider output item IDs, nesting/projection
+ * order and signed URL query parameters are transport details, not file
+ * identity. The immutable byte digest is bound separately below.
+ */
+export function knowledgeArchivePhysicalDescriptorHash(
+  descriptor: KnowledgeArchiveDescriptor,
+) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        fileId: descriptor.fileId || null,
+        canonicalUrl: descriptor.fileId
+          ? null
+          : canonicalPhysicalArchiveUrl(descriptor.url || ""),
+        filename: descriptor.filename.normalize("NFKC").trim().toLowerCase(),
+        mimeType: descriptor.mimeType.trim().toLowerCase(),
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+export function knowledgeArchiveBoundDescriptorHash(
+  descriptor: KnowledgeArchiveDescriptor,
+  artifactSha256: string,
+) {
+  if (!/^[a-f0-9]{64}$/iu.test(artifactSha256)) {
+    throw new Error("知识库 ZIP 字节哈希无效");
+  }
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        physicalDescriptorHash:
+          knowledgeArchivePhysicalDescriptorHash(descriptor),
+        artifactSha256: artifactSha256.toLowerCase(),
+      }),
+      "utf8",
     )
     .digest("hex");
 }

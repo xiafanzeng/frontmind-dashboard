@@ -3,10 +3,8 @@ import { z } from "zod";
 import { adminProcedure, router } from "./_core/trpc";
 import {
   AuthServiceError,
-  deleteActiveApiCredential,
   getDecryptedCredentialForUser,
   getApiCredentialStatus,
-  replaceApiCredential,
   validateUpstreamApiKey,
 } from "./auth-service";
 import { toTrpcError } from "./auth-router";
@@ -29,14 +27,6 @@ const testApiKeyInput = z.object({
     .optional(),
 });
 
-async function saveCredential(userId: number, apiKey: string) {
-  try {
-    return await replaceApiCredential(userId, apiKey);
-  } catch (error) {
-    throw toTrpcError(error);
-  }
-}
-
 function requireSystemAdminCredentialAccess(
   user: Parameters<typeof hasSystemAdminAccess>[0],
 ) {
@@ -58,14 +48,20 @@ export const credentialRouter = router({
     }
   }),
 
-  set: adminProcedure.input(apiKeyInput).mutation(({ ctx, input }) => {
+  set: adminProcedure.input(apiKeyInput).mutation(({ ctx }) => {
     requireSystemAdminCredentialAccess(ctx.user);
-    return saveCredential(ctx.user.id, input.apiKey);
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "请在“API 与人员管理”统一入口配置账号 API Key",
+    });
   }),
 
-  replace: adminProcedure.input(apiKeyInput).mutation(({ ctx, input }) => {
+  replace: adminProcedure.input(apiKeyInput).mutation(({ ctx }) => {
     requireSystemAdminCredentialAccess(ctx.user);
-    return saveCredential(ctx.user.id, input.apiKey);
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "请在“API 与人员管理”统一入口替换账号 API Key",
+    });
   }),
 
   test: adminProcedure
@@ -87,13 +83,11 @@ export const credentialRouter = router({
       }
     }),
 
-  delete: adminProcedure.mutation(async ({ ctx }) => {
+  delete: adminProcedure.mutation(({ ctx }) => {
     requireSystemAdminCredentialAccess(ctx.user);
-    try {
-      await deleteActiveApiCredential(ctx.user.id);
-      return { success: true } as const;
-    } catch (error) {
-      throw toTrpcError(error);
-    }
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "请在“API 与人员管理”统一入口撤销账号 API Key",
+    });
   }),
 });

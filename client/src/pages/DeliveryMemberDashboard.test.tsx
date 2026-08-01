@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import {
   fireEvent,
   render,
@@ -21,10 +24,24 @@ const mocks = vi.hoisted(() => ({
       | "content_distribution_engineer";
   }>,
   workbenchUseQuery: vi.fn(),
+  ticketsUseQuery: vi.fn(),
+  fetchNextTickets: vi.fn(),
+  refetchTickets: vi.fn(),
   refetchWorkbench: vi.fn(),
   workbenchData: { customers: [], tickets: [] } as any,
   updateTicketMutation: vi.fn(),
-  historyPages: [] as Array<any>,
+  ticketsData: {
+    items: [],
+    filters: { customers: [] },
+    counts: { pending: 0, completed: 0 },
+    nextPending: null as any,
+    nextCursor: null as null | {
+      actionRank: number;
+      updatedAt: number;
+      id: string;
+    },
+    limit: 50,
+  } as any,
   detailData: null as any,
 }));
 
@@ -47,17 +64,68 @@ vi.mock("@/lib/trpc", () => ({
             };
           },
         },
-        history: {
-          useInfiniteQuery: () => ({
-            data: { pages: mocks.historyPages },
-            isLoading: false,
-            isFetching: false,
-            error: null,
-            hasNextPage: false,
-            isFetchingNextPage: false,
-            refetch: vi.fn(),
-            fetchNextPage: vi.fn(),
-          }),
+        tickets: {
+          useInfiniteQuery: (...args: unknown[]) => {
+            mocks.ticketsUseQuery(args[0]);
+            const fallbackItems = (mocks.workbenchData.tickets ?? []).map(
+              (ticket: any) => ({
+                ...ticket,
+                customerName:
+                  mocks.assignments.find(
+                    (assignment) => assignment.customerUserId === ticket.userId,
+                  )?.customerName || `客户 ${ticket.userId}`,
+                customerUsername:
+                  mocks.assignments.find(
+                    (assignment) => assignment.customerUserId === ticket.userId,
+                  )?.customerUsername || null,
+                assignedProjectAssignmentId:
+                  ticket.assignedProjectAssignmentId ||
+                  mocks.assignments.find(
+                    (assignment) => assignment.customerUserId === ticket.userId,
+                  )?.projectAssignmentId,
+                statusGroup: ["completed", "rejected", "cancelled"].includes(
+                  ticket.status,
+                )
+                  ? "completed"
+                  : "pending",
+              }),
+            );
+            const data = mocks.ticketsData.items.length
+              ? mocks.ticketsData
+              : {
+                  ...mocks.ticketsData,
+                  items: fallbackItems,
+                  filters: {
+                    customers: mocks.assignments.map((assignment) => ({
+                      id: assignment.customerUserId,
+                      name: assignment.customerName,
+                      username: assignment.customerUsername,
+                    })),
+                  },
+                  counts: {
+                    pending: fallbackItems.filter(
+                      (ticket: any) => ticket.statusGroup === "pending",
+                    ).length,
+                    completed: fallbackItems.filter(
+                      (ticket: any) => ticket.statusGroup === "completed",
+                    ).length,
+                  },
+                  nextPending:
+                    fallbackItems.find(
+                      (ticket: any) => ticket.statusGroup === "pending",
+                    ) ?? null,
+                };
+            return {
+              data: { pages: [data], pageParams: [undefined] },
+              isLoading: false,
+              isFetching: false,
+              isFetchingNextPage: false,
+              hasNextPage: Boolean(data.nextCursor),
+              error: null,
+              refetch: mocks.refetchTickets,
+              fetchNextPage: mocks.fetchNextTickets,
+            };
+          },
         },
         ticketDetail: {
           useQuery: () => ({
@@ -135,7 +203,14 @@ describe("DeliveryMemberDashboard project context", () => {
     vi.clearAllMocks();
     mocks.assignments = [];
     mocks.workbenchData = { customers: [], tickets: [] };
-    mocks.historyPages = [];
+    mocks.ticketsData = {
+      items: [],
+      filters: { customers: [] },
+      counts: { pending: 0, completed: 0 },
+      nextPending: null,
+      nextCursor: null,
+      limit: 50,
+    };
     mocks.detailData = null;
     mocks.updateTicketMutation.mockResolvedValue({
       success: true,
@@ -146,20 +221,30 @@ describe("DeliveryMemberDashboard project context", () => {
 
   it("places role tools in the left navigation and limits them by role", () => {
     expect(
+      deliveryMemberNavForRole("ai_operations_engineer").map(
+        (item) => item.label,
+      ),
+    ).toEqual(["我的工单", "客户工作台", "通用智能体"]);
+    expect(
       deliveryMemberNavForRole("monitoring_optimization_engineer").map(
         (item) => item.label,
       ),
-    ).toContain("问题监控");
+    ).toEqual(["我的工单", "客户工作台", "问题监控", "通用智能体"]);
     expect(
       deliveryMemberNavForRole("content_distribution_engineer").map(
         (item) => item.label,
       ),
-    ).toContain("渠道分发");
+    ).toEqual(["我的工单", "客户工作台", "渠道分发", "通用智能体"]);
     expect(
       deliveryMemberNavForRole("ai_operations_engineer").map(
         (item) => item.label,
       ),
     ).not.toContain("问题监控");
+    expect(
+      deliveryMemberNavForRole("monitoring_optimization_engineer").map(
+        (item) => item.group,
+      ),
+    ).toEqual(["工作台", "工作台", "工具", "工具"]);
   });
 
   it("limits every engineer preview to customer-facing output owned by that role", () => {
@@ -183,13 +268,263 @@ describe("DeliveryMemberDashboard project context", () => {
     }
   });
 
+  it("keeps the customer workbench action panel scoped and leaves history in My Tickets", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/DeliveryMemberDashboard.tsx"),
+      "utf8",
+    );
+    const workbenchSource = source.slice(
+      source.indexOf("function CustomerWorkbenchView()"),
+      source.indexOf("const TERMINAL_STATUS_LABELS"),
+    );
+
+    expect(workbenchSource).toContain('statusGroup: "pending"');
+    expect(workbenchSource).toContain("limit: 50");
+    expect(workbenchSource).toContain("ticket.assignedProjectAssignmentId ===");
+    expect(workbenchSource).toContain("<DeliveryTicketActions");
+    expect(workbenchSource).toContain("<KnowledgeResetDecision");
+    expect(workbenchSource).toContain('href="#customer-content-actions"');
+    expect(workbenchSource).not.toContain("DeliveryHistoryDetailDialog");
+    expect(workbenchSource).not.toContain('aria-label="按状态筛选"');
+    expect(workbenchSource).toContain("customerActionTickets.fetchNextPage");
+    expect(workbenchSource).toContain("加载更多可操作内容");
+    expect(workbenchSource).not.toContain(
+      "href={`/?customerUserId=${currentAssignment.customerUserId}`}",
+    );
+  });
+
+  it("loads every assigned customer's tickets by default and filters only after a customer click", async () => {
+    mocks.assignments = [
+      {
+        projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+        customerUserId: 101,
+        customerName: "客户甲",
+        customerUsername: "customer-a",
+        roleType: "ai_operations_engineer",
+      },
+      {
+        projectAssignmentId: "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+        customerUserId: 202,
+        customerName: "客户乙",
+        customerUsername: "customer-b",
+        roleType: "ai_operations_engineer",
+      },
+    ];
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+          userId: 101,
+          customerName: "客户甲",
+          customerUsername: "customer-a",
+          title: "甲公司工单",
+          operation: "site_check",
+          status: "submitted",
+          statusGroup: "pending",
+          assignedProjectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+          revision: 1,
+        },
+        {
+          id: "5a67e445-37bb-45ed-9268-4ca9437e4d72",
+          userId: 202,
+          customerName: "客户乙",
+          customerUsername: "customer-b",
+          title: "乙公司工单",
+          operation: "site_check",
+          status: "completed",
+          statusGroup: "completed",
+          assignedProjectAssignmentId: "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+          revision: 2,
+          updatedAt: Date.parse("2026-08-01T00:00:00.000Z"),
+        },
+      ],
+      filters: {
+        customers: [
+          { id: 101, name: "客户甲", username: "customer-a" },
+          { id: 202, name: "客户乙", username: "customer-b" },
+        ],
+      },
+      counts: { pending: 1, completed: 1 },
+      nextPending: {
+        id: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+        userId: 101,
+        customerName: "客户甲",
+        customerUsername: "customer-a",
+        title: "甲公司工单",
+        operation: "site_check",
+        status: "submitted",
+      },
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard />);
+
+    expect(screen.getAllByText("甲公司工单").length).toBeGreaterThan(0);
+    expect(screen.getByText("乙公司工单")).toBeInTheDocument();
+    expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({ limit: 50 });
+    expect(mocks.workbenchUseQuery).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      within(screen.getByLabelText("客户快捷筛选")).getByRole("button", {
+        name: "客户乙",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({
+        customerUserId: 202,
+        limit: 50,
+      }),
+    );
+    expect(sessionStorage.setItem).not.toHaveBeenCalled();
+  });
+
+  it("uses the server dependency decision even when the completed prerequisite is outside the visible page", () => {
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "6a67e445-37bb-45ed-9268-4ca9437e4d73",
+          userId: 101,
+          customerName: "客户甲",
+          title: "首次监控",
+          operation: "initial_monitoring",
+          status: "submitted",
+          statusGroup: "pending",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          assignedProjectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+          revision: 1,
+        },
+      ],
+      filters: {
+        customers: [{ id: 101, name: "客户甲", username: "customer-a" }],
+      },
+      counts: { pending: 1, completed: 1 },
+      nextPending: {
+        id: "6a67e445-37bb-45ed-9268-4ca9437e4d73",
+        userId: 101,
+        customerName: "客户甲",
+        customerUsername: "customer-a",
+        title: "首次监控",
+        operation: "initial_monitoring",
+        status: "submitted",
+      },
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard />);
+
+    expect(screen.queryByText("等待前置工单")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "开始处理" }),
+    ).toBeInTheDocument();
+  });
+
+  it("loads subsequent ticket pages through the stable server cursor", () => {
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "7a67e445-37bb-45ed-9268-4ca9437e4d74",
+          userId: 101,
+          customerName: "客户甲",
+          title: "待处理工单",
+          operation: "site_check",
+          status: "submitted",
+          statusGroup: "pending",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          assignedProjectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+          revision: 1,
+        },
+      ],
+      filters: {
+        customers: [{ id: 101, name: "客户甲", username: "customer-a" }],
+      },
+      counts: { pending: 51, completed: 0 },
+      nextPending: {
+        id: "7a67e445-37bb-45ed-9268-4ca9437e4d74",
+        userId: 101,
+        customerName: "客户甲",
+        customerUsername: "customer-a",
+        title: "待处理工单",
+        operation: "site_check",
+        status: "submitted",
+      },
+      nextCursor: {
+        actionRank: 1,
+        updatedAt: Date.parse("2026-08-01T00:00:00.000Z"),
+        id: "7a67e445-37bb-45ed-9268-4ca9437e4d74",
+      },
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard />);
+    fireEvent.click(screen.getByRole("button", { name: "加载更多工单" }));
+
+    expect(mocks.fetchNextTickets).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the authoritative next pending ticket visible while filtering completed history", async () => {
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "8a67e445-37bb-45ed-9268-4ca9437e4d75",
+          userId: 101,
+          customerName: "客户甲",
+          title: "已完成历史",
+          operation: "site_check",
+          status: "completed",
+          statusGroup: "completed",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          revision: 2,
+          updatedAt: Date.parse("2026-08-01T00:00:00.000Z"),
+        },
+      ],
+      filters: {
+        customers: [{ id: 101, name: "客户甲", username: "customer-a" }],
+      },
+      counts: { pending: 3, completed: 1 },
+      nextPending: {
+        id: "9a67e445-37bb-45ed-9268-4ca9437e4d76",
+        userId: 101,
+        customerName: "客户甲",
+        customerUsername: "customer-a",
+        title: "服务端优先工单",
+        operation: "site_check",
+        status: "in_progress",
+      },
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard />);
+    fireEvent.change(screen.getByRole("combobox", { name: "按状态筛选" }), {
+      target: { value: "completed" },
+    });
+
+    await waitFor(() =>
+      expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({
+        statusGroup: "completed",
+        limit: 50,
+      }),
+    );
+    expect(screen.getByText("服务端优先工单")).toBeInTheDocument();
+    expect(screen.queryByText("当前没有待处理工单")).not.toBeInTheDocument();
+  });
+
   it("shows the project-assignment empty state and clears a stale selection", async () => {
     vi.mocked(sessionStorage.getItem).mockReturnValue(
       "stale-project-assignment",
     );
 
-    render(<DeliveryMemberDashboard />);
+    render(<DeliveryMemberDashboard customerWorkbench />);
 
+    expect(
+      screen.getByRole("heading", { name: "我的客户工作台" }),
+    ).toBeInTheDocument();
     expect(
       screen.getByText("尚未分配客户项目，请联系交付管理员"),
     ).toBeInTheDocument();
@@ -212,7 +547,7 @@ describe("DeliveryMemberDashboard project context", () => {
       },
     ];
 
-    render(<DeliveryMemberDashboard />);
+    render(<DeliveryMemberDashboard customerWorkbench />);
 
     const projectSelector = await screen.findByRole("combobox", {
       name: "当前客户项目",
@@ -247,7 +582,7 @@ describe("DeliveryMemberDashboard project context", () => {
     );
   });
 
-  it("shows only the current engineer role and highlights newly submitted tickets in red", async () => {
+  it("keeps the customer workbench focused on preview and only exposes the selected project's actions", async () => {
     mocks.assignments = [
       {
         projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
@@ -318,55 +653,150 @@ describe("DeliveryMemberDashboard project context", () => {
         knowledgeSnapshot: null,
       },
     };
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+          userId: 101,
+          customerName: "示例客户",
+          title: "客户新提交的官网工单",
+          operation: "site_check",
+          status: "submitted",
+          statusGroup: "pending",
+          createdByUserId: 101,
+          assignedProjectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+          dependencyBlockReason: null,
+          revision: 1,
+          updatedAt: Date.parse("2026-07-31T00:00:00.000Z"),
+        },
+        {
+          id: "5a67e445-37bb-45ed-9268-4ca9437e4d72",
+          userId: 101,
+          customerName: "示例客户",
+          title: "同客户其他岗位工单",
+          operation: "site_check",
+          status: "submitted",
+          statusGroup: "pending",
+          assignedProjectAssignmentId: "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+          dependencyBlockReason: null,
+          revision: 2,
+          updatedAt: Date.parse("2026-07-30T00:00:00.000Z"),
+        },
+        {
+          id: "6a67e445-37bb-45ed-9268-4ca9437e4d73",
+          userId: 101,
+          customerName: "示例客户",
+          title: "当前岗位历史工单",
+          operation: "site_check",
+          status: "completed",
+          statusGroup: "completed",
+          assignedProjectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+          dependencyBlockReason: null,
+          revision: 3,
+          updatedAt: Date.parse("2026-07-29T00:00:00.000Z"),
+        },
+      ],
+      filters: {
+        customers: [
+          { id: 101, name: "示例客户", username: "example.customer" },
+        ],
+      },
+      counts: { pending: 2, completed: 1 },
+      nextPending: null,
+      nextCursor: {
+        actionRank: 1,
+        updatedAt: Date.parse("2026-07-29T00:00:00.000Z"),
+        id: "6a67e445-37bb-45ed-9268-4ca9437e4d73",
+      },
+      limit: 50,
+    };
 
-    render(<DeliveryMemberDashboard />);
+    render(<DeliveryMemberDashboard customerWorkbench />);
 
-    expect(await screen.findByText("我的岗位职责")).toBeInTheDocument();
-    expect(screen.getByText("AI 运维工程师")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "我的客户工作台" }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("project-role-label")).toHaveTextContent(
+      "AI 运维工程师",
+    );
     expect(screen.queryByText("AI 监控与优化工程师")).not.toBeInTheDocument();
     expect(screen.queryByText("AI 内容分发工程师")).not.toBeInTheDocument();
     expect(
       screen.queryByText("客户", { selector: "h3" }),
     ).not.toBeInTheDocument();
-    expect(screen.getByText("用户新提交")).toBeInTheDocument();
-    const newTicketCard = document.querySelector(
-      "[data-new-customer-ticket='true']",
-    );
-    expect(newTicketCard).toHaveTextContent("客户新提交的官网工单");
-    expect(newTicketCard).toHaveClass("border-red-500", "ring-red-500/25");
+    expect(screen.queryByText("用户新提交")).toBeNull();
+    expect(
+      document.querySelector("[data-new-customer-ticket='true']"),
+    ).toBeNull();
     expect(screen.queryByRole("tab", { name: "品牌建设" })).toBeNull();
     expect(screen.queryByRole("tab", { name: "AI 友好内容" })).toBeNull();
+    expect(screen.queryByText("我的未结束工单")).toBeNull();
+    expect(screen.queryByText("现在优先处理")).toBeNull();
     expect(
-      screen.getByRole("button", { name: /修改并发布：客户新提交的官网工单/ }),
+      within(screen.getByTestId("customer-content-actions")).getByText(
+        "内容提交与修改",
+      ),
     ).toBeInTheDocument();
+    expect(screen.getByText("客户新提交的官网工单")).toBeInTheDocument();
+    expect(screen.queryByText("同客户其他岗位工单")).not.toBeInTheDocument();
+    expect(screen.queryByText("当前岗位历史工单")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "按状态筛选" }),
+    ).not.toBeInTheDocument();
+    expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({
+      customerUserId: 101,
+      statusGroup: "pending",
+      limit: 50,
+    });
+    expect(
+      screen.getByRole("link", { name: "提交或修改当前客户内容" }),
+    ).toHaveAttribute("href", "#customer-content-actions");
+    fireEvent.click(screen.getByRole("button", { name: "加载更多可操作内容" }));
+    expect(mocks.fetchNextTickets).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始处理" }));
+
+    await waitFor(() =>
+      expect(mocks.updateTicketMutation).toHaveBeenCalledWith({
+        projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+        ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+        expectedRevision: 1,
+        status: "in_progress",
+      }),
+    );
+    await waitFor(() => {
+      expect(mocks.refetchTickets).toHaveBeenCalled();
+      expect(mocks.refetchWorkbench).toHaveBeenCalled();
+    });
   });
 
   it("shows customer names and opens the full knowledge-reset history detail", () => {
-    mocks.historyPages = [
-      {
-        items: [
-          {
-            id: "297769f5-9ec5-4d64-9c3a-9abdb603632d",
-            customerUserId: 12,
-            customerName: "星河科技",
-            customerUsername: "xinghe",
-            title: "知识库重置申请",
-            operation: "knowledge_reset",
-            status: "completed",
-            resultExcerpt: "已批准并完成清理，共清理 8 项。",
-            resolvedAt: Date.parse("2026-07-30T12:00:00.000Z"),
-          },
-        ],
-        filters: {
-          customers: [
-            { id: 12, name: "星河科技", username: "xinghe" },
-            { id: 18, name: "远山制造", username: "yuanshan" },
-          ],
-          operations: ["knowledge_reset"],
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "297769f5-9ec5-4d64-9c3a-9abdb603632d",
+          customerUserId: 12,
+          customerName: "星河科技",
+          customerUsername: "xinghe",
+          title: "知识库重置申请",
+          operation: "knowledge_reset",
+          status: "completed",
+          statusGroup: "completed",
+          publicSummary: "已批准并完成清理，共清理 8 项。",
+          resolvedAt: Date.parse("2026-07-30T12:00:00.000Z"),
         },
-        nextCursor: null,
+      ],
+      filters: {
+        customers: [
+          { id: 12, name: "星河科技", username: "xinghe" },
+          { id: 18, name: "远山制造", username: "yuanshan" },
+        ],
       },
-    ];
+      counts: { pending: 0, completed: 1 },
+      nextPending: null,
+      nextCursor: null,
+      limit: 50,
+    };
     mocks.detailData = {
       ticket: {
         title: "知识库重置申请",
@@ -391,7 +821,7 @@ describe("DeliveryMemberDashboard project context", () => {
       },
     };
 
-    render(<DeliveryMemberDashboard taskHistory />);
+    render(<DeliveryMemberDashboard />);
 
     expect(
       screen.getByRole("option", { name: /星河科技/ }),
@@ -399,10 +829,6 @@ describe("DeliveryMemberDashboard project context", () => {
     expect(
       screen.getByRole("option", { name: /远山制造/ }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText("已批准并完成清理，共清理 8 项。"),
-    ).toBeInTheDocument();
-
     fireEvent.click(screen.getByRole("button", { name: /知识库重置申请/ }));
 
     expect(screen.getByText("知识库重置结果")).toBeInTheDocument();
@@ -597,7 +1023,7 @@ describe("DeliveryMemberDashboard project context", () => {
       "signed-preflight-token",
     );
     expect(publishHeaders["x-import-preview"]).toBeUndefined();
-    await waitFor(() => expect(mocks.refetchWorkbench).toHaveBeenCalled());
+    await waitFor(() => expect(mocks.refetchTickets).toHaveBeenCalled());
 
     confirmSpy.mockRestore();
     promptSpy.mockRestore();

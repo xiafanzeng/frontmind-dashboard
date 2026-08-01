@@ -16,7 +16,7 @@ vi.mock("@/pages/Login", () => ({
   default: () => <div>LOGIN_REQUIRED</div>,
 }));
 
-import { AuthBoundary, canAccessAdminRoutes } from "./App";
+import { adminHomePath, AuthBoundary, canAccessAdminRoutes } from "./App";
 
 describe("administrator route access", () => {
   it("allows both system and delivery administrators into shared admin routes", () => {
@@ -39,6 +39,22 @@ describe("administrator route access", () => {
       }),
     ).toBe(false);
     expect(canAccessAdminRoutes({ role: "user" })).toBe(false);
+  });
+
+  it("lands delivery administrators on customer management instead of the removed overview", () => {
+    expect(
+      adminHomePath({
+        role: "admin",
+        adminAccessLevel: "system_admin",
+      } as any),
+    ).toBe("/");
+    expect(
+      adminHomePath({
+        role: "admin",
+        adminAccessLevel: "delivery_admin",
+      } as any),
+    ).toBe("/admin/workspace");
+    expect(adminHomePath({ role: "user" } as any)).toBeNull();
   });
 });
 

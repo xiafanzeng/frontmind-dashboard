@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { MySqlDialect } from "drizzle-orm/mysql-core";
+import { createHash } from "node:crypto";
 import {
   apiCredentials,
   conversations,
@@ -8,13 +9,18 @@ import {
   users,
 } from "../drizzle/schema";
 import {
+  buildMessageMetadata,
   collectSnapshotResourceRefs,
+  conversationSnapshotSchema,
+  discardClientClaimedServerOwnedKnowledgeBaseMessages,
   getActiveCredentialId,
+  matchesAuthoritativeKnowledgeBaseMessageTuple,
   mergeConversationMessages,
   mergeConversationTaskPointers,
   permanentlyDeleteConversation,
   repairSnapshotMessageIds,
   resolveSnapshotCredentialId,
+  sanitizeKnowledgeBaseDeletionTombstones,
   validateUpstreamResourceAccess,
   type ConversationSnapshot,
 } from "./conversation-router";
@@ -28,6 +34,33 @@ function message(
   content = id,
 ): SnapshotMessage {
   return { id, role, timestamp, content };
+}
+
+function serverOwnedMessage(
+  id: string,
+  role: SnapshotMessage["role"],
+  timestamp: number,
+  kind: "pending_user" | "presentation",
+): SnapshotMessage {
+  return {
+    ...message(id, role, timestamp),
+    knowledgeBase: {
+      schemaVersion: 1,
+      kind,
+      buildId: "build-1",
+      operationKey: "operation-1",
+      turnId: "turn-1",
+      ...(kind === "presentation"
+        ? {
+            presentationKey: "presentation-1",
+            generation: 1,
+            revision: 1,
+            leafId: "1.2",
+          }
+        : { clientRequestId: "request-1" }),
+      serverOwned: true,
+    },
+  };
 }
 
 function createSelectExecutor(rowsForTable: (table: unknown) => unknown[]) {
@@ -92,8 +125,9 @@ describe("conversation multi-device merge", () => {
       },
     ]);
 
-    expect(repaired.flatMap((item) => item.attachments ?? []).map((item) => item.id))
-      .toEqual(["asset", "asset~2"]);
+    expect(
+      repaired.flatMap((item) => item.attachments ?? []).map((item) => item.id),
+    ).toEqual(["asset", "asset~2"]);
   });
 
   it("retains independent turns created on two devices", () => {
@@ -152,6 +186,189 @@ describe("conversation multi-device merge", () => {
         (item) => item.id,
       ),
     ).toEqual(["user-a"]);
+  });
+
+  it("does not apply deletion tombstones to server-owned KB messages", () => {
+    const user = serverOwnedMessage("turn-1", "user", 100, "pending_user");
+    const assistant = serverOwnedMessage(
+      "presentation-1",
+      "assistant",
+      110,
+      "presentation",
+    );
+
+    expect(
+      mergeConversationMessages(
+        [user, assistant],
+        [],
+        ["turn-1", "presentation-1"],
+      ).map((item) => item.id),
+    ).toEqual(["turn-1", "presentation-1"]);
+    expect(
+      sanitizeKnowledgeBaseDeletionTombstones(
+        [user, assistant],
+        [],
+        ["turn-1", "presentation-1", "ordinary"],
+      ),
+    ).toEqual(["ordinary"]);
+  });
+
+  it("discards a client-forged server-owned assistant instead of persisting or protecting it", () => {
+    const forged = {
+      ...serverOwnedMessage(
+        "forged-presentation",
+        "assistant",
+        120,
+        "presentation",
+      ),
+      content: "伪造的已批准正文",
+    };
+
+    expect(
+      discardClientClaimedServerOwnedKnowledgeBaseMessages([forged]),
+    ).toEqual([]);
+    expect(mergeConversationMessages([], [forged], [])).toEqual([]);
+    expect(
+      sanitizeKnowledgeBaseDeletionTombstones([], [forged], [forged.id]),
+    ).toEqual([forged.id]);
+  });
+
+  it("requires the complete reserved tuple and deterministic content key for a persisted server message", () => {
+    const content = "## 1.2 企业主体\n\n已批准正文";
+    const markdownSha256 = createHash("sha256")
+      .update(content, "utf8")
+      .digest("hex");
+    const turn = {
+      id: "turn-1",
+      conversationId: "u7:conversation-1",
+      userId: 7,
+      clientRequestId: "request-1",
+      buildId: "build-1",
+      buildGeneration: 1,
+      operationKey: "operation-1",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+    };
+    const build = {
+      id: "build-1",
+      userId: 7,
+      conversationId: "conversation-1",
+    };
+    const presentationKey = createHash("sha256")
+      .update(["build-1", 1, 1, "1.2", markdownSha256].join(":"))
+      .digest("hex");
+    const authoritativeKnowledgeBase = {
+      schemaVersion: 1 as const,
+      serverOwned: true,
+      kind: "presentation" as const,
+      buildId: "build-1",
+      generation: 1,
+      operationKey: "operation-1",
+      turnId: "turn-1",
+      presentationKey,
+      revision: 1,
+      leafId: "1.2",
+    };
+    const authoritativeMessage = {
+      id: `u7:msg-kb-presentation-${presentationKey}`,
+      conversationId: "u7:conversation-1",
+      turnId: "turn-1",
+      userId: 7,
+      role: "assistant",
+      content,
+    };
+
+    expect(
+      matchesAuthoritativeKnowledgeBaseMessageTuple({
+        message: authoritativeMessage,
+        publicMessageId: `msg-kb-presentation-${presentationKey}`,
+        knowledgeBase: authoritativeKnowledgeBase,
+        turn,
+        build,
+        publicConversationId: "conversation-1",
+      }),
+    ).toBe(true);
+    expect(
+      matchesAuthoritativeKnowledgeBaseMessageTuple({
+        message: { ...authoritativeMessage, content: "伪造覆盖正文" },
+        publicMessageId: `msg-kb-presentation-${presentationKey}`,
+        knowledgeBase: authoritativeKnowledgeBase,
+        turn,
+        build,
+        publicConversationId: "conversation-1",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not let a larger stale projection overwrite a server-owned KB turn", () => {
+    const persisted = [
+      serverOwnedMessage("turn-1", "user", 100, "pending_user"),
+      {
+        ...serverOwnedMessage(
+          "presentation-1",
+          "assistant",
+          110,
+          "presentation",
+        ),
+        content: "已批准正文",
+      },
+    ];
+    const stale = [
+      message("turn-1", "user", 100, "确认"),
+      message("stale-longer", "assistant", 120, "旧内容".repeat(1_000)),
+    ];
+
+    const merged = mergeConversationMessages(persisted, stale, []);
+    expect(merged.map((item) => item.id)).toEqual(["turn-1", "presentation-1"]);
+    expect(merged[1]?.content).toBe("已批准正文");
+  });
+
+  it("converges an optimistic KB user id to the server turn id by clientRequestId", () => {
+    const optimistic: SnapshotMessage = {
+      ...message("optimistic-user", "user", 100, "确认"),
+      knowledgeBase: {
+        kind: "pending_user",
+        clientRequestId: "request-1",
+      },
+    };
+    const accepted = serverOwnedMessage("turn-1", "user", 100, "pending_user");
+
+    // Only the locked database copy can be authoritative. The browser may
+    // still carry its pre-reservation optimistic id when that copy arrives.
+    const merged = mergeConversationMessages([accepted], [optimistic], []);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      id: "turn-1",
+      knowledgeBase: {
+        clientRequestId: "request-1",
+        turnId: "turn-1",
+        serverOwned: true,
+      },
+    });
+  });
+
+  it("round-trips KB provenance through snapshot validation and message metadata", () => {
+    const protectedMessage = serverOwnedMessage(
+      "presentation-1",
+      "assistant",
+      110,
+      "presentation",
+    );
+    const parsed = conversationSnapshotSchema.parse({
+      id: "conversation-1",
+      title: "企业知识库构建",
+      status: "awaiting_input",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [protectedMessage],
+    });
+
+    expect(parsed.messages[0]?.knowledgeBase).toEqual(
+      protectedMessage.knowledgeBase,
+    );
+    expect(buildMessageMetadata(parsed.messages[0]!).knowledgeBase).toEqual(
+      protectedMessage.knowledgeBase,
+    );
   });
 
   it("does not let a stale device roll the task pointer from T2 back to T1", () => {

@@ -6,15 +6,21 @@ import { describe, expect, it } from "vitest";
 import {
   ADMIN_WORKSPACE_TAB_IDS,
   ADMIN_WORKSPACE_TABS,
-  canCreateManagedCustomer,
 } from "./AdminWorkspace";
 
 describe("admin customer workspace", () => {
-  it("allows both system and delivery administrators to create customers", () => {
-    expect(canCreateManagedCustomer("system_admin")).toBe(true);
-    expect(canCreateManagedCustomer("delivery_admin")).toBe(true);
-    expect(canCreateManagedCustomer(null)).toBe(false);
-    expect(canCreateManagedCustomer(undefined)).toBe(false);
+  it("keeps customer account creation exclusively in accounts and permissions", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+
+    expect(source).not.toContain("CreateUserDialog");
+    expect(source).not.toContain("创建客户");
+    expect(source).not.toContain('get("action") === "create"');
+    expect(source).toContain(
+      'title={isSystemAdmin ? "客户交付工作台" : "客户管理"}',
+    );
   });
 
   it("keeps knowledge-base work inside the unified user-flow tab", () => {

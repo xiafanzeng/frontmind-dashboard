@@ -11,6 +11,8 @@ import {
   createTask,
   createResponseLogicTask,
   createKnowledgeBaseTurnTask,
+  reserveKnowledgeBaseTurnWithAttachments,
+  stageKnowledgeBaseTurnAttachment,
   retrieveTask,
   uploadFile,
   fileToBase64,
@@ -19,6 +21,7 @@ import {
   type ContentItem,
   type Message,
   type ResponseLogicTaskContext,
+  type KnowledgeBaseAttachmentManifestItem,
 } from "@/lib/frontmind-api";
 import {
   useConversation,
@@ -29,13 +32,12 @@ import {
   prepareUploadFiles,
   ZIP_REFERENCE_PROMPT,
   isImageUpload,
+  sha256UploadFile,
   type PreparedUploadFiles,
 } from "@/lib/attachment-files";
-import { reconcileKnowledgeBaseProgress } from "@/lib/knowledge-progress";
 import { requireCurrentFrontMindBuild } from "@/lib/build-version";
 import {
   collectAssistantOutputIds,
-  outputForKnowledgeProgress,
   projectTaskOutputMessages,
   sliceNewOutput,
 } from "@/lib/task-output-projection";
@@ -192,6 +194,10 @@ export function useSendMessage() {
     updateAssistantMessages,
     updateTitle,
     createConversation,
+    registerKnowledgeBaseConversation,
+    wakeKnowledgeBaseConversation,
+    commitKnowledgeBaseObservation,
+    rollbackPendingKnowledgeBaseTurn,
   } = useConversation();
 
   // Use a ref to track whether polling should continue.
@@ -235,7 +241,6 @@ export function useSendMessage() {
       baselineOutputLength: number,
       historicalOutputIds: readonly string[],
       modelName?: string,
-      knowledgeBase = false,
     ) => {
       // Stop any existing polling first
       stopPolling();
@@ -245,31 +250,7 @@ export function useSendMessage() {
       let lastNewOutputLen = 0;
       let completionHandled = false;
       let consecutiveErrors = 0;
-      let approvedProjectionMisses = 0;
       const MAX_CONSECUTIVE_ERRORS = 10;
-      const MAX_APPROVED_PROJECTION_MISSES = 10;
-
-      const finishKnowledgeBaseError = (
-        updatedTaskId: string,
-        errorMessage: string,
-        outputLength: number,
-      ) => {
-        completionHandled = true;
-        stopPolling();
-        updateStatusRef.current(convId, "error", {
-          taskId: updatedTaskId,
-          completedAt: Date.now(),
-          lastKnownOutputLength: outputLength,
-        });
-        addMessageRef.current(convId, {
-          id: `msg-kb-error-${updatedTaskId.slice(-72)}`,
-          role: "assistant",
-          content: `❌ 错误: ${sanitizeBrandText(errorMessage)}`,
-          timestamp: Date.now(),
-        });
-        toast.error(sanitizeBrandText(errorMessage));
-        creditEventBus.emit();
-      };
 
       const pollOnce = async () => {
         if (!pollingActiveRef.current || completionHandled) return;
@@ -284,142 +265,71 @@ export function useSendMessage() {
 
           if (!pollingActiveRef.current || completionHandled) return;
 
-          if (knowledgeBase) {
-            const normalizedUpstreamStatus =
-              updated.status === "failed" ? "error" : updated.status;
-            const upstreamSettled = [
-              "completed",
-              "error",
-              "failed",
-              "awaiting_input",
-              "awaiting_user",
-              "awaiting_user_input",
-              "input_required",
-              "requires_action",
-            ].includes(String(updated.status));
-            let interaction: Awaited<
-              ReturnType<typeof reconcileKnowledgeBaseProgress>
-            >;
+          // Ordinary-chat polling is intentionally isolated from the KB
+          // coordinator and may continue rendering raw task output.
+          // Slice only NEW output items
+          if (updated.output && updated.output.length > 0) {
+            const newOutput = sliceNewOutput(
+              updated.output,
+              baselineOutputLength,
+              historicalOutputIds,
+            );
 
-            try {
-              // Reconciliation is deliberately performed after retrieving the
-              // task. The server validates the protocol first; only that
-              // approved revision/leaf pair is allowed into the conversation.
-              interaction = await reconcileKnowledgeBaseProgress({
-                conversationId: convId,
-                taskId: updated.id,
-              });
-            } catch (error) {
-              if (upstreamSettled) {
-                finishKnowledgeBaseError(
-                  updated.id,
-                  error instanceof Error
-                    ? `知识树状态未通过校验：${error.message}`
-                    : "任务已结束，但未返回完整的知识节点状态",
-                  updated.output?.length || 0,
-                );
-                return;
-              }
-              throw error;
-            }
-
-            if (!pollingActiveRef.current || completionHandled) return;
-
-            if (
-              interaction.progress &&
-              (interaction.interactionState === "awaiting_input" ||
-                interaction.interactionState === "ready_to_publish" ||
-                interaction.interactionState === "published")
-            ) {
-              const assistantMsgs = projectTaskOutputMessages({
-                output: updated.output,
-                baselineOutputLength,
-                historicalOutputIds,
-                responseStartedAt,
-                modelName,
-                knowledgeBase: true,
-                knowledgeBasePresentation: {
-                  revision: interaction.progress.build.revision,
-                  leafId: interaction.progress.build.currentLeafId,
-                },
-              });
-
-              if (assistantMsgs.length === 0) {
-                // A provider read can lag a successful server reconciliation.
-                // Keep polling instead of exposing an unconfirmable empty node.
-                approvedProjectionMisses++;
-                updateStatusRef.current(convId, "running", {
-                  taskId: updated.id,
-                  taskUrl: updated.metadata?.task_url,
+            if (newOutput.length > 0) {
+              try {
+                const assistantMsgs = projectTaskOutputMessages({
+                  output: updated.output,
+                  baselineOutputLength,
+                  historicalOutputIds,
+                  responseStartedAt,
+                  modelName,
+                  knowledgeBase: false,
                 });
-                if (
-                  upstreamSettled &&
-                  approvedProjectionMisses >= MAX_APPROVED_PROJECTION_MISSES
-                ) {
-                  finishKnowledgeBaseError(
-                    updated.id,
-                    "当前节点已通过校验，但正文无法解析。请重试本轮。",
-                    updated.output?.length || 0,
-                  );
-                  return;
+                if (assistantMsgs.length > 0) {
+                  updateAssistantMessagesRef.current(convId, assistantMsgs);
                 }
-              } else {
-                completionHandled = true;
-                stopPolling();
-                updateAssistantMessagesRef.current(convId, assistantMsgs);
-                const outputLength = updated.output?.length || 0;
-                if (interaction.interactionState === "awaiting_input") {
-                  updateStatusRef.current(convId, "awaiting_input", {
-                    taskId: updated.id,
-                    taskUrl: updated.metadata?.task_url,
-                    previousResponseId: updated.id,
-                    lastKnownOutputLength: outputLength,
-                  });
-                  toast.info("当前知识节点已就绪", {
-                    description: "请确认、修改或补充当前内容。",
-                  });
-                } else {
-                  updateStatusRef.current(convId, "completed", {
-                    taskId: updated.id,
-                    completedAt: Date.now(),
-                    lastKnownOutputLength: outputLength,
-                  });
-                  toast.success("知识库已完成", {
-                    description: "所有节点已通过校验。",
-                  });
-                }
-                creditEventBus.emit();
-                return;
+              } catch (parseErr) {
+                console.error(
+                  "[Polling] Error parsing output messages:",
+                  parseErr,
+                );
               }
-            } else if (interaction.interactionState === "failed") {
-              finishKnowledgeBaseError(
-                updated.id,
-                interaction.lockReason || "知识树状态未通过校验",
-                updated.output?.length || 0,
-              );
-              return;
-            } else if (upstreamSettled) {
-              finishKnowledgeBaseError(
-                updated.id,
-                interaction.lockReason ||
-                  "任务已结束，但未返回完整的知识节点状态",
-                updated.output?.length || 0,
-              );
-              return;
-            } else {
-              updateStatusRef.current(
-                convId,
-                normalizedUpstreamStatus === "pending" ? "pending" : "running",
-                {
-                  taskId: updated.id,
-                  taskUrl: updated.metadata?.task_url,
-                },
-              );
+              if (newOutput.length !== lastNewOutputLen) {
+                console.log(
+                  `[Polling] New output items: ${newOutput.length}, ` +
+                    `total output: ${updated.output.length}, baseline: ${baselineOutputLength}`,
+                );
+                lastNewOutputLen = newOutput.length;
+              }
             }
+          }
 
-            consecutiveErrors = 0;
-          } else {
-            // Slice only NEW output items
+          // Normalize status
+          const normalizedStatus =
+            updated.status === "failed" ? "error" : updated.status;
+
+          updateStatusRef.current(convId, normalizedStatus as any, {
+            taskId: updated.id,
+            taskUrl: updated.metadata?.task_url,
+          });
+
+          if (normalizedStatus === "completed" && !completionHandled) {
+            completionHandled = true;
+            stopPolling();
+            const completedAt = Date.now();
+            const elapsedSec = (completedAt - responseStartedAt) / 1000;
+
+            const totalOutputLength = updated.output?.length || 0;
+
+            updateStatusRef.current(convId, "completed", {
+              completedAt,
+              lastKnownOutputLength: totalOutputLength,
+            });
+
+            // Final parse of output — this is the authoritative final set.
+            // The regular polling section above already parsed the same output,
+            // but we do it once more here to ensure we have the complete set
+            // and to attach elapsedTime to the last message.
             if (updated.output && updated.output.length > 0) {
               const newOutput = sliceNewOutput(
                 updated.output,
@@ -429,7 +339,7 @@ export function useSendMessage() {
 
               if (newOutput.length > 0) {
                 try {
-                  const assistantMsgs = projectTaskOutputMessages({
+                  const finalMsgs = projectTaskOutputMessages({
                     output: updated.output,
                     baselineOutputLength,
                     historicalOutputIds,
@@ -437,122 +347,59 @@ export function useSendMessage() {
                     modelName,
                     knowledgeBase: false,
                   });
-                  if (assistantMsgs.length > 0) {
-                    updateAssistantMessagesRef.current(convId, assistantMsgs);
+                  if (finalMsgs.length > 0) {
+                    finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
+                    updateAssistantMessagesRef.current(convId, finalMsgs);
                   }
                 } catch (parseErr) {
                   console.error(
-                    "[Polling] Error parsing output messages:",
+                    "[Polling] Error parsing final output messages:",
                     parseErr,
                   );
                 }
-                if (newOutput.length !== lastNewOutputLen) {
-                  console.log(
-                    `[Polling] New output items: ${newOutput.length}, ` +
-                      `total output: ${updated.output.length}, baseline: ${baselineOutputLength}`,
-                  );
-                  lastNewOutputLen = newOutput.length;
-                }
               }
             }
 
-            // Normalize status
-            const normalizedStatus =
-              updated.status === "failed" ? "error" : updated.status;
-
-            updateStatusRef.current(convId, normalizedStatus as any, {
-              taskId: updated.id,
-              taskUrl: updated.metadata?.task_url,
+            toast.success("任务已完成", {
+              description: `本次处理耗时 ${elapsedSec.toFixed(1)}s，结果已同步到当前内容流程。`,
+              duration: 3200,
             });
 
-            if (normalizedStatus === "completed" && !completionHandled) {
-              completionHandled = true;
-              stopPolling();
-              const completedAt = Date.now();
-              const elapsedSec = (completedAt - responseStartedAt) / 1000;
-
-              const totalOutputLength = updated.output?.length || 0;
-
-              updateStatusRef.current(convId, "completed", {
-                completedAt,
-                lastKnownOutputLength: totalOutputLength,
-              });
-
-              // Final parse of output — this is the authoritative final set.
-              // The regular polling section above already parsed the same output,
-              // but we do it once more here to ensure we have the complete set
-              // and to attach elapsedTime to the last message.
-              if (updated.output && updated.output.length > 0) {
-                const newOutput = sliceNewOutput(
-                  updated.output,
-                  baselineOutputLength,
-                  historicalOutputIds,
-                );
-
-                if (newOutput.length > 0) {
-                  try {
-                    const finalMsgs = projectTaskOutputMessages({
-                      output: updated.output,
-                      baselineOutputLength,
-                      historicalOutputIds,
-                      responseStartedAt,
-                      modelName,
-                      knowledgeBase: false,
-                    });
-                    if (finalMsgs.length > 0) {
-                      finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
-                      updateAssistantMessagesRef.current(convId, finalMsgs);
-                    }
-                  } catch (parseErr) {
-                    console.error(
-                      "[Polling] Error parsing final output messages:",
-                      parseErr,
-                    );
-                  }
-                }
-              }
-
-              toast.success("任务已完成", {
-                description: `本次处理耗时 ${elapsedSec.toFixed(1)}s，结果已同步到当前内容流程。`,
-                duration: 3200,
-              });
-
-              // Emit credit refresh event on task completion
-              creditEventBus.emit();
-              return;
-            }
-
-            if (normalizedStatus === "error" && !completionHandled) {
-              completionHandled = true;
-              stopPolling();
-              const completedAt = Date.now();
-
-              const totalOutputLength = updated.output?.length || 0;
-
-              updateStatusRef.current(convId, "error", {
-                completedAt,
-                lastKnownOutputLength: totalOutputLength,
-              });
-              const errorMsg = updated.error?.message || "任务执行出错";
-              const failureAdvice = getFailureAdvice(errorMsg);
-              const displayError = getFailureDisplayMessage(errorMsg);
-              toast.error("任务执行失败", {
-                description: failureAdvice,
-              });
-              addMessageRef.current(convId, {
-                id: `msg-err-${Date.now()}`,
-                role: "assistant",
-                content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
-                timestamp: Date.now(),
-              });
-
-              // Emit credit refresh event even on error (credits may have been consumed)
-              creditEventBus.emit();
-              return;
-            }
-
-            consecutiveErrors = 0;
+            // Emit credit refresh event on task completion
+            creditEventBus.emit();
+            return;
           }
+
+          if (normalizedStatus === "error" && !completionHandled) {
+            completionHandled = true;
+            stopPolling();
+            const completedAt = Date.now();
+
+            const totalOutputLength = updated.output?.length || 0;
+
+            updateStatusRef.current(convId, "error", {
+              completedAt,
+              lastKnownOutputLength: totalOutputLength,
+            });
+            const errorMsg = updated.error?.message || "任务执行出错";
+            const failureAdvice = getFailureAdvice(errorMsg);
+            const displayError = getFailureDisplayMessage(errorMsg);
+            toast.error("任务执行失败", {
+              description: failureAdvice,
+            });
+            addMessageRef.current(convId, {
+              id: `msg-err-${Date.now()}`,
+              role: "assistant",
+              content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
+              timestamp: Date.now(),
+            });
+
+            // Emit credit refresh event even on error (credits may have been consumed)
+            creditEventBus.emit();
+            return;
+          }
+
+          consecutiveErrors = 0;
         } catch (err: any) {
           console.error("Polling error:", err);
           consecutiveErrors++;
@@ -605,6 +452,7 @@ export function useSendMessage() {
         retryConfig?: RetryConfig;
         agentProfile?: string;
         syncKnowledgeBaseSnapshot?: boolean;
+        knowledgeBaseExpectedGeneration?: number;
         knowledgeBaseExpectedRevision?: number;
         knowledgeBaseExpectedLeafId?: string;
         responseLogicContext?: ResponseLogicTaskContext;
@@ -632,6 +480,26 @@ export function useSendMessage() {
         if (!convId) {
           convId = createConversation();
           conv = null;
+        }
+
+        const resumableKnowledgeBaseClientRequestId =
+          options?.syncKnowledgeBaseSnapshot &&
+          conv?.knowledgeBase?.notice?.code ===
+            "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED"
+            ? conv.knowledgeBase.activeClientRequestId
+            : null;
+        const resumingKnowledgeBaseAttachments = Boolean(
+          resumableKnowledgeBaseClientRequestId,
+        );
+        let knowledgeBaseClientRequestId = options?.syncKnowledgeBaseSnapshot
+          ? resumingKnowledgeBaseAttachments
+            ? resumableKnowledgeBaseClientRequestId!
+            : typeof crypto !== "undefined" && "randomUUID" in crypto
+              ? crypto.randomUUID()
+              : `kb-turn-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+          : undefined;
+        if (options?.syncKnowledgeBaseSnapshot) {
+          registerKnowledgeBaseConversation(convId);
         }
 
         const baselineOutputLength = conv?.lastKnownOutputLength || 0;
@@ -672,6 +540,140 @@ export function useSendMessage() {
               "原图像素和文件内容不会被压缩或重编码，将作为文件附件发送。",
             duration: 5000,
           });
+        }
+
+        let knowledgeBaseAttachmentManifest:
+          | KnowledgeBaseAttachmentManifestItem[]
+          | undefined;
+        if (
+          options?.syncKnowledgeBaseSnapshot &&
+          preparedUploads.files.length > 0
+        ) {
+          try {
+            knowledgeBaseAttachmentManifest = await Promise.all(
+              preparedUploads.files.map(async ({ file }) => ({
+                filename: file.name,
+                sizeBytes: file.size,
+                mimeType: file.type || "application/octet-stream",
+                lastModified: Math.max(0, Number(file.lastModified || 0)),
+                sha256: await sha256UploadFile(file),
+              })),
+            );
+          } catch (error) {
+            toast.error("附件完整性校验失败", {
+              description:
+                error instanceof Error
+                  ? error.message
+                  : "请重新选择原文件后重试。",
+            });
+            return false;
+          }
+        }
+        let knowledgeBaseAttachmentReservation:
+          | {
+              turnId: string;
+              attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+            }
+          | undefined;
+        let knowledgeBasePendingMessageAdded = false;
+        let alreadyStagedKnowledgeBaseAttachments = 0;
+        if (knowledgeBaseAttachmentManifest) {
+          if (
+            !Number.isSafeInteger(options?.knowledgeBaseExpectedGeneration) ||
+            !Number.isSafeInteger(options?.knowledgeBaseExpectedRevision) ||
+            !options?.knowledgeBaseExpectedLeafId
+          ) {
+            toast.error("当前知识节点坐标缺失", {
+              description: "请刷新知识库状态后重新选择附件。",
+            });
+            return false;
+          }
+          try {
+            const reserved = await reserveKnowledgeBaseTurnWithAttachments(
+              [{ role: "user", content: contentItems }],
+              {
+                conversationId: convId,
+                clientRequestId: knowledgeBaseClientRequestId!,
+                expectedGeneration: options.knowledgeBaseExpectedGeneration!,
+                expectedRevision: options.knowledgeBaseExpectedRevision!,
+                expectedLeafId: options.knowledgeBaseExpectedLeafId,
+                attachmentManifest: knowledgeBaseAttachmentManifest,
+                resumeExisting:
+                  resumingKnowledgeBaseAttachments && !text.trim(),
+              },
+            );
+            knowledgeBaseClientRequestId = reserved.reservation.clientRequestId;
+            alreadyStagedKnowledgeBaseAttachments = Math.max(
+              0,
+              Math.min(
+                reserved.reservation.stagedAttachmentCount || 0,
+                preparedUploads.files.length,
+              ),
+            );
+            knowledgeBaseAttachmentReservation = {
+              turnId: reserved.reservation.turnId,
+              attachmentManifest: knowledgeBaseAttachmentManifest,
+            };
+            const reservationTimestamp = Date.now();
+            const reservationMessageAlreadyVisible = conv?.messages.some(
+              (message) =>
+                message.role === "user" &&
+                message.knowledgeBase?.clientRequestId ===
+                  knowledgeBaseClientRequestId,
+            );
+            if (!reservationMessageAlreadyVisible) {
+              addMessage(convId, {
+                id: `msg-kb-pending-${reservationTimestamp}-${Math.random()
+                  .toString(36)
+                  .slice(2, 6)}`,
+                role: "user",
+                content: text.trim(),
+                attachments: preparedUploads.files.map(({ file }, index) => ({
+                  id: `att-kb-reserved-${index}-${reservationTimestamp}`,
+                  type: "file" as const,
+                  name: file.name,
+                  file,
+                })),
+                timestamp: reservationTimestamp,
+                knowledgeBase: {
+                  kind: "pending_user" as const,
+                  clientRequestId: knowledgeBaseClientRequestId,
+                  turnId: reserved.reservation.turnId,
+                  generation: reserved.reservation.generation,
+                  revision: reserved.reservation.revision,
+                  leafId: reserved.reservation.leafId,
+                  serverOwned: true,
+                },
+              });
+            }
+            knowledgeBasePendingMessageAdded = true;
+            if (reserved.knowledgeObservation) {
+              commitKnowledgeBaseObservation(
+                convId,
+                reserved.knowledgeObservation,
+              );
+            }
+            wakeKnowledgeBaseConversation(convId);
+            if (reserved.reservation.state !== "awaiting_attachments") {
+              toast.info("本轮已在处理中", {
+                description: "系统已恢复原预约，不会重复上传或创建任务。",
+              });
+              return true;
+            }
+          } catch (error: any) {
+            if (error?.knowledgeObservation) {
+              commitKnowledgeBaseObservation(
+                convId,
+                error.knowledgeObservation,
+              );
+            }
+            wakeKnowledgeBaseConversation(convId);
+            toast.error("附件预约失败", {
+              description:
+                error?.message || "请按当前节点重新选择原文件后重试。",
+            });
+            return false;
+          }
         }
 
         // Process files with progress tracking. All attachments are sent as files,
@@ -715,6 +717,29 @@ export function useSendMessage() {
             fileBase64 = await fileToBase64(file);
           }
 
+          if (
+            knowledgeBaseAttachmentReservation &&
+            i < alreadyStagedKnowledgeBaseAttachments
+          ) {
+            attachments.push({
+              id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              type: "file",
+              name: file.name,
+              base64: fileBase64,
+              blobUrl: fileBlobUrl,
+              file,
+            });
+            setUploadProgress({
+              currentFileIndex: i,
+              totalFiles,
+              currentFileName: file.name,
+              currentFilePercent: 100,
+              overallPercent: Math.round(((i + 1) / totalFiles) * 100),
+              conversationId: convId,
+            });
+            continue;
+          }
+
           try {
             console.log("[SendMessage] Uploading file attachment", {
               filename: file.name,
@@ -746,6 +771,21 @@ export function useSendMessage() {
               fileId: result.fileId,
             });
 
+            if (knowledgeBaseAttachmentReservation) {
+              await stageKnowledgeBaseTurnAttachment({
+                conversationId: convId,
+                turnId: knowledgeBaseAttachmentReservation.turnId,
+                clientRequestId: knowledgeBaseClientRequestId!,
+                attachmentManifest:
+                  knowledgeBaseAttachmentReservation.attachmentManifest,
+                index: i,
+                attachment: {
+                  file_id: result.fileId,
+                  filename: result.filename,
+                },
+              });
+            }
+
             contentItems.push({
               type: "input_file",
               file_id: result.fileId,
@@ -766,6 +806,13 @@ export function useSendMessage() {
               `File upload failed for "${file.name}":`,
               uploadErr.message,
             );
+            if (uploadErr?.knowledgeObservation) {
+              commitKnowledgeBaseObservation(
+                convId,
+                uploadErr.knowledgeObservation,
+              );
+              wakeKnowledgeBaseConversation(convId);
+            }
             toast.error(`文件 "${file.name}" 上传失败`, {
               description: uploadErr?.message || "请稍后重试。",
             });
@@ -785,7 +832,9 @@ export function useSendMessage() {
         // Clear upload progress
         setUploadProgress(null);
 
-        if (contentItems.length === 0) return false;
+        if (contentItems.length === 0 && !knowledgeBaseAttachmentReservation) {
+          return false;
+        }
 
         // Add user message to conversation
         const userMessage: LocalMessage = {
@@ -794,9 +843,19 @@ export function useSendMessage() {
           content: text.trim(),
           attachments: attachments.length > 0 ? attachments : undefined,
           timestamp: Date.now(),
+          ...(knowledgeBaseClientRequestId
+            ? {
+                knowledgeBase: {
+                  kind: "pending_user" as const,
+                  clientRequestId: knowledgeBaseClientRequestId,
+                },
+              }
+            : {}),
         };
 
-        addMessage(convId, userMessage);
+        if (!knowledgeBasePendingMessageAdded) {
+          addMessage(convId, userMessage);
+        }
 
         // Update title if this is the first message
         if (!conv || conv.messages.length === 0) {
@@ -848,9 +907,10 @@ export function useSendMessage() {
           const response = options?.syncKnowledgeBaseSnapshot
             ? await createKnowledgeBaseTurnTask(input, {
                 conversationId: convId,
-                taskId: conv?.previousResponseId || "",
+                clientRequestId: knowledgeBaseClientRequestId!,
                 expectedRevision: options.knowledgeBaseExpectedRevision,
                 expectedLeafId: options.knowledgeBaseExpectedLeafId,
+                attachmentReservation: knowledgeBaseAttachmentReservation,
               })
             : options?.responseLogicContext
               ? await createResponseLogicTask(input, {
@@ -865,39 +925,33 @@ export function useSendMessage() {
           setRetryCount(0);
           setIsRetrying(false);
 
-          const knowledgeInteraction = response.knowledgeInteraction;
-          const effectiveStatus = options?.syncKnowledgeBaseSnapshot
-            ? knowledgeInteraction?.interactionState === "awaiting_input"
-              ? "awaiting_input"
-              : knowledgeInteraction?.interactionState === "ready_to_publish" ||
-                  knowledgeInteraction?.interactionState === "published"
-                ? "completed"
-                : knowledgeInteraction?.interactionState === "failed" ||
-                    response.status === "completed" ||
-                    response.status === "failed" ||
-                    response.status === "error"
-                  ? "error"
-                  : knowledgeInteraction?.interactionState === "queued" ||
-                      response.status === "pending"
-                    ? "pending"
-                    : "running"
-            : response.status;
+          if (options?.syncKnowledgeBaseSnapshot) {
+            if (response.knowledgeObservation) {
+              commitKnowledgeBaseObservation(
+                convId,
+                response.knowledgeObservation,
+              );
+            } else {
+              // Compatibility during the server rollout: stay locked until the
+              // coordinator obtains a complete authoritative observation.
+              updateStatus(convId, "running", {
+                taskId: response.id,
+                previousResponseId: response.id,
+                startedAt: responseStartedAt,
+              });
+            }
+            wakeKnowledgeBaseConversation(convId);
+            toast.success("本轮已提交", {
+              description: "FrontMind 正在生成并校验当前知识节点。",
+              duration: 3200,
+            });
+            return true;
+          }
+
+          const effectiveStatus = response.status;
           const totalInitialOutputLength = response.output?.length || 0;
           const initialStatusIsTerminal =
-            effectiveStatus === "awaiting_input" ||
-            effectiveStatus === "completed" ||
-            effectiveStatus === "error";
-          const authoritativeKnowledgePresentation =
-            options?.syncKnowledgeBaseSnapshot &&
-            knowledgeInteraction?.progress &&
-            (knowledgeInteraction.interactionState === "awaiting_input" ||
-              knowledgeInteraction.interactionState === "ready_to_publish" ||
-              knowledgeInteraction.interactionState === "published")
-              ? {
-                  revision: knowledgeInteraction.progress.build.revision,
-                  leafId: knowledgeInteraction.progress.build.currentLeafId,
-                }
-              : undefined;
+            effectiveStatus === "completed" || effectiveStatus === "error";
 
           updateStatus(convId, effectiveStatus as any, {
             taskId: response.id,
@@ -936,8 +990,7 @@ export function useSendMessage() {
                 historicalOutputIds,
                 responseStartedAt,
                 modelName: agentProfile,
-                knowledgeBase: Boolean(options?.syncKnowledgeBaseSnapshot),
-                knowledgeBasePresentation: authoritativeKnowledgePresentation,
+                knowledgeBase: false,
               });
               if (assistantMsgs.length > 0) {
                 updateAssistantMessages(convId, assistantMsgs);
@@ -954,9 +1007,8 @@ export function useSendMessage() {
             });
           }
 
-          // Start sequential polling if task is running or pending. Knowledge
-          // turns own their live polling too; the global hook remains recovery
-          // for reloads/background tabs rather than the only completion path.
+          // Ordinary chat keeps its local sequential poller. Knowledge-base
+          // sends returned above and are owned exclusively by the provider coordinator.
           if (effectiveStatus === "running" || effectiveStatus === "pending") {
             startPolling(
               response.id,
@@ -966,33 +1018,7 @@ export function useSendMessage() {
               baselineOutputLength,
               historicalOutputIds,
               agentProfile,
-              Boolean(options?.syncKnowledgeBaseSnapshot),
             );
-          }
-
-          if (effectiveStatus === "awaiting_input") {
-            toast.info("当前知识节点已就绪", {
-              description: "请确认、修改或补充当前内容。",
-            });
-            creditEventBus.emit();
-          }
-
-          if (
-            effectiveStatus === "error" &&
-            options?.syncKnowledgeBaseSnapshot
-          ) {
-            const knowledgeError = sanitizeBrandText(
-              response.error?.message ||
-                knowledgeInteraction?.lockReason ||
-                "任务未返回完整的知识节点状态",
-            );
-            addMessage(convId, {
-              id: `msg-kb-error-${response.id.slice(-72)}`,
-              role: "assistant",
-              content: `❌ 错误: ${knowledgeError}`,
-              timestamp: Date.now(),
-            });
-            toast.error(knowledgeError);
           }
 
           if (effectiveStatus === "completed") {
@@ -1008,12 +1034,6 @@ export function useSendMessage() {
             });
 
             if (response.output && response.output.length > 0) {
-              const newOutput = sliceNewOutput(
-                response.output,
-                baselineOutputLength,
-                historicalOutputIds,
-              );
-
               try {
                 const finalMsgs = projectTaskOutputMessages({
                   output: response.output,
@@ -1021,8 +1041,7 @@ export function useSendMessage() {
                   historicalOutputIds,
                   responseStartedAt,
                   modelName: agentProfile,
-                  knowledgeBase: Boolean(options?.syncKnowledgeBaseSnapshot),
-                  knowledgeBasePresentation: authoritativeKnowledgePresentation,
+                  knowledgeBase: false,
                 });
                 if (finalMsgs.length > 0) {
                   finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
@@ -1033,34 +1052,6 @@ export function useSendMessage() {
                   "[SendMessage] Error parsing completed output:",
                   parseErr,
                 );
-              }
-
-              const knowledgeProgressOutput = outputForKnowledgeProgress(
-                response.output,
-                newOutput,
-              );
-
-              if (
-                options?.syncKnowledgeBaseSnapshot &&
-                knowledgeProgressOutput.length > 0
-              ) {
-                try {
-                  await reconcileKnowledgeBaseProgress({
-                    conversationId: convId,
-                    taskId: response.id,
-                  });
-                } catch (error) {
-                  toast.warning("当前节点尚未通过进度校验", {
-                    description:
-                      error instanceof Error
-                        ? error.message
-                        : "请继续在当前节点补充或明确确认。",
-                  });
-                }
-                toast.info("知识库对话已完成", {
-                  description:
-                    "请点击构建流程页面右上角的“更新知识库”同步展示内容。",
-                });
               }
             }
 
@@ -1073,6 +1064,40 @@ export function useSendMessage() {
             creditEventBus.emit();
           }
         } catch (err: any) {
+          if (options?.syncKnowledgeBaseSnapshot) {
+            const status = Number(err?.status || 0);
+            if (
+              status === 409 &&
+              knowledgeBaseClientRequestId &&
+              !knowledgeBaseAttachmentReservation
+            ) {
+              rollbackPendingKnowledgeBaseTurn(
+                convId,
+                knowledgeBaseClientRequestId,
+              );
+            } else {
+              if (err?.knowledgeObservation) {
+                commitKnowledgeBaseObservation(
+                  convId,
+                  err.knowledgeObservation,
+                );
+              }
+              updateStatus(convId, "running", {
+                startedAt: responseStartedAt,
+              });
+            }
+            wakeKnowledgeBaseConversation(convId);
+            toast.error(
+              status === 409 ? "当前节点已更新" : "正在恢复本轮状态",
+              {
+                description:
+                  status === 409
+                    ? "已刷新服务端最新节点，请按最新内容继续。"
+                    : "请求结果暂时未知，系统会按本轮请求编号自动恢复，不会重复提交。",
+              },
+            );
+            return false;
+          }
           updateStatus(convId, "error", {
             startedAt: responseStartedAt,
             completedAt: Date.now(),
@@ -1103,6 +1128,10 @@ export function useSendMessage() {
       createConversation,
       stopPolling,
       startPolling,
+      registerKnowledgeBaseConversation,
+      wakeKnowledgeBaseConversation,
+      commitKnowledgeBaseObservation,
+      rollbackPendingKnowledgeBaseTurn,
     ],
   );
 

@@ -4,7 +4,6 @@ import {
   Bot,
   BriefcaseBusiness,
   ClipboardList,
-  Gauge,
   KeyRound,
   Loader2,
   RefreshCw,
@@ -112,6 +111,11 @@ type AdminUsageHierarchyEngineer = {
   syncStatus: string;
   fetchedAt: number | string | Date | null;
 };
+
+type AdminUsageHierarchySystemAdmin = Omit<
+  AdminUsageHierarchyEngineer,
+  "engineerId"
+> & { adminId: number };
 
 type AdminUsageHierarchyCustomer = {
   userId: number;
@@ -392,7 +396,13 @@ export function filterPreviewTicketsForAdmin(
 }
 
 export const adminNav: PortalNavItem[] = [
-  { label: "交付总览", href: "/", icon: Gauge, group: "运营" },
+  { label: "API与人员管理", href: "/", icon: KeyRound, group: "运营" },
+  {
+    label: "官网任务与积分",
+    href: "/admin/presales",
+    icon: BriefcaseBusiness,
+    group: "运营",
+  },
   {
     label: "客户交付工作台",
     href: "/admin/workspace",
@@ -407,15 +417,9 @@ export const adminNav: PortalNavItem[] = [
     group: "客户与服务",
   },
   {
-    label: "工单调度",
+    label: "工单",
     href: "/admin/dispatch",
     icon: ClipboardList,
-    group: "客户与服务",
-  },
-  {
-    label: "官网任务与积分",
-    href: "/admin/presales",
-    icon: BriefcaseBusiness,
     group: "客户与服务",
   },
   {
@@ -445,7 +449,6 @@ export const adminNav: PortalNavItem[] = [
 export function getAdminNav(systemAdmin: boolean) {
   if (systemAdmin) return adminNav;
   return [
-    { label: "交付总览", href: "/", icon: Gauge, group: "交付管理" },
     {
       label: "客户管理",
       href: "/admin/workspace",
@@ -460,7 +463,7 @@ export function getAdminNav(systemAdmin: boolean) {
       group: "交付管理",
     },
     {
-      label: "工单调度",
+      label: "工单",
       href: "/admin/dispatch",
       icon: ClipboardList,
       group: "交付管理",
@@ -566,6 +569,7 @@ export function groupSharedKeyUsage(items: ApiKeyUsageAlert[]) {
 
 export function normalizeUsageHierarchy(value: unknown): {
   period: { label: string };
+  systemAdmins: AdminUsageHierarchySystemAdmin[];
   managers: AdminUsageHierarchyManager[];
   engineers: AdminUsageHierarchyEngineer[];
   customers: AdminUsageHierarchyCustomer[];
@@ -631,6 +635,27 @@ export function normalizeUsageHierarchy(value: unknown): {
           : [],
       }))
     : [];
+  const systemAdmins = Array.isArray(payload.systemAdmins)
+    ? payload.systemAdmins.map(
+        (entry: any): AdminUsageHierarchySystemAdmin => ({
+          adminId: Math.max(0, Number(entry?.adminId) || 0),
+          displayName:
+            String(entry?.displayName || "").trim() || "未命名系统管理员",
+          username: entry?.username ? String(entry.username) : null,
+          apiKeyConfigured: entry?.apiKeyConfigured === true,
+          apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
+          keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
+          ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
+          otherOrUnattributedUsed: Math.max(
+            0,
+            Number(entry?.otherOrUnattributedUsed) || 0,
+          ),
+          fingerprint: entry?.fingerprint ? String(entry.fingerprint) : null,
+          syncStatus: String(entry?.syncStatus || "unconfigured"),
+          fetchedAt: entry?.fetchedAt ?? null,
+        }),
+      )
+    : [];
   const engineers = Array.isArray(payload.engineers)
     ? payload.engineers.map(
         (entry: any): AdminUsageHierarchyEngineer => ({
@@ -684,8 +709,9 @@ export function normalizeUsageHierarchy(value: unknown): {
     : [];
   return {
     period: {
-      label: String(payload?.period?.label || "本月"),
+      label: String(payload?.period?.label || "近 30 天"),
     },
+    systemAdmins,
     managers,
     engineers,
     customers,
@@ -693,7 +719,7 @@ export function normalizeUsageHierarchy(value: unknown): {
 }
 
 type OverviewApiKeyTarget = {
-  kind: "customer" | "delivery_admin" | "engineer";
+  kind: "customer" | "delivery_admin" | "system_admin" | "engineer";
   userId: number;
   displayName: string;
   username: string;
@@ -708,6 +734,8 @@ type KeyManagementRow = OverviewApiKeyTarget & {
   ownAgentMonthUsed: number;
   keyTotalUsed: number;
   otherOrUnattributedUsed: number;
+  syncStatus: string;
+  fetchedAt: number | string | Date | null;
 };
 
 function AdminOverviewApiKeyDialog({
@@ -721,68 +749,52 @@ function AdminOverviewApiKeyDialog({
 }) {
   const [apiKey, setApiKey] = useState("");
   const [revokeOpen, setRevokeOpen] = useState(false);
-  const setEngineerMutation =
-    trpc.delivery.management.setEngineerApiKey.useMutation();
-  const revokeEngineerMutation =
-    trpc.delivery.management.revokeEngineerApiKey.useMutation();
-  const setAdminMutation =
-    trpc.delivery.management.setDeliveryAdminApiKey.useMutation();
-  const revokeAdminMutation =
-    trpc.delivery.management.revokeDeliveryAdminApiKey.useMutation();
-  const setCustomerMutation =
-    trpc.admin.workspace.replaceCredential.useMutation();
-  const revokeCustomerMutation =
-    trpc.admin.workspace.deleteCredential.useMutation();
+  const [replaceConfirmOpen, setReplaceConfirmOpen] = useState(false);
+  const [allowIncompleteHistory, setAllowIncompleteHistory] = useState(false);
+  const replaceTargetMutation =
+    trpc.admin.apiKeyUsageAlerts.replaceTargetCredential.useMutation();
+  const revokeTargetMutation =
+    trpc.admin.apiKeyUsageAlerts.revokeTargetCredential.useMutation();
   const busy =
-    setEngineerMutation.isPending ||
-    revokeEngineerMutation.isPending ||
-    setAdminMutation.isPending ||
-    revokeAdminMutation.isPending ||
-    setCustomerMutation.isPending ||
-    revokeCustomerMutation.isPending;
+    replaceTargetMutation.isPending || revokeTargetMutation.isPending;
   const subjectLabel =
-    target?.kind === "delivery_admin"
-      ? "交付管理员"
-      : target?.kind === "customer"
-        ? "客户"
-        : "工程师";
+    target?.kind === "system_admin"
+      ? "系统管理员"
+      : target?.kind === "delivery_admin"
+        ? "交付管理员"
+        : target?.kind === "customer"
+          ? "客户"
+          : "工程师";
 
   const close = () => {
     if (busy) return;
     setApiKey("");
     setRevokeOpen(false);
-    setEngineerMutation.reset();
-    revokeEngineerMutation.reset();
-    setAdminMutation.reset();
-    revokeAdminMutation.reset();
-    setCustomerMutation.reset();
-    revokeCustomerMutation.reset();
+    setReplaceConfirmOpen(false);
+    setAllowIncompleteHistory(false);
+    replaceTargetMutation.reset();
+    revokeTargetMutation.reset();
     onOpenChange(false);
   };
 
-  const save = async (event: FormEvent<HTMLFormElement>) => {
+  const requestSaveConfirmation = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!target || apiKey.trim().length < 8) return;
+    setReplaceConfirmOpen(true);
+  };
+
+  const save = async () => {
+    if (!target || apiKey.trim().length < 8) return;
     try {
-      if (target.kind === "customer") {
-        await setCustomerMutation.mutateAsync({
-          userId: target.userId,
-          apiKey: apiKey.trim(),
-          reason: "交付总览统一配置客户 Key",
-        });
-      } else if (target.kind === "engineer") {
-        await setEngineerMutation.mutateAsync({
-          engineerUserId: target.userId,
-          apiKey: apiKey.trim(),
-          expectedVersion: target.version,
-        });
-      } else {
-        await setAdminMutation.mutateAsync({
-          adminUserId: target.userId,
-          apiKey: apiKey.trim(),
-          expectedVersion: target.version,
-        });
-      }
+      await replaceTargetMutation.mutateAsync({
+        kind: target.kind,
+        userId: target.userId,
+        apiKey: apiKey.trim(),
+        expectedVersion: target.version,
+        reason: "API与人员管理统一入口替换账号 API Key",
+        confirmation: "REPLACE_API_KEY",
+        allowIncompleteHistory,
+      });
       await onSaved();
       toast.success(
         `${subjectLabel} API Key 已${target.configured ? "替换" : "配置"}`,
@@ -790,6 +802,7 @@ function AdminOverviewApiKeyDialog({
       );
       setApiKey("");
       setRevokeOpen(false);
+      setReplaceConfirmOpen(false);
       onOpenChange(false);
     } catch (error) {
       toast.error(`无法配置${subjectLabel} API Key`, {
@@ -801,22 +814,13 @@ function AdminOverviewApiKeyDialog({
   const revoke = async () => {
     if (!target) return;
     try {
-      if (target.kind === "customer") {
-        await revokeCustomerMutation.mutateAsync({
-          userId: target.userId,
-          reason: "交付总览统一撤销客户 Key",
-        });
-      } else if (target.kind === "engineer") {
-        await revokeEngineerMutation.mutateAsync({
-          engineerUserId: target.userId,
-          expectedVersion: target.version,
-        });
-      } else {
-        await revokeAdminMutation.mutateAsync({
-          adminUserId: target.userId,
-          expectedVersion: target.version,
-        });
-      }
+      await revokeTargetMutation.mutateAsync({
+        kind: target.kind,
+        userId: target.userId,
+        expectedVersion: target.version,
+        reason: "API与人员管理统一入口撤销账号 API Key",
+        confirmation: "REVOKE_API_KEY",
+      });
       await onSaved();
       toast.success(`${subjectLabel} API Key 已撤销`, {
         description: target.displayName,
@@ -845,7 +849,7 @@ function AdminOverviewApiKeyDialog({
               仅在服务端加密保存，不会在页面返回明文。
             </DialogDescription>
           </DialogHeader>
-          <form className="space-y-4" onSubmit={save}>
+          <form className="space-y-4" onSubmit={requestSaveConfirmation}>
             <div className="rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
               当前状态：
               <span
@@ -898,9 +902,7 @@ function AdminOverviewApiKeyDialog({
                   type="submit"
                   disabled={busy || apiKey.trim().length < 8}
                 >
-                  {(setEngineerMutation.isPending ||
-                    setAdminMutation.isPending ||
-                    setCustomerMutation.isPending) && (
+                  {replaceTargetMutation.isPending && (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   )}
                   验证并{target?.configured ? "替换" : "配置"}
@@ -910,6 +912,58 @@ function AdminOverviewApiKeyDialog({
           </form>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog
+        open={replaceConfirmOpen}
+        onOpenChange={(open) => !busy && setReplaceConfirmOpen(open)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              确认{target?.configured ? "替换" : "配置"}
+              {subjectLabel} API Key
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {
+                "系统将先验证新 Key，再以版本校验原子切换。旧 Key 会保留为退役版本供已提交任务安全恢复；若状态已被其他管理员更新，迟到请求不会覆盖较新的 Key。"
+              }
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {target?.configured && (
+            <label className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={allowIncompleteHistory}
+                onChange={(event) =>
+                  setAllowIncompleteHistory(event.target.checked)
+                }
+                disabled={busy}
+              />
+              <span>
+                旧 Key
+                已失效，允许应急替换。未能完整扫描的历史用量将显示为“不可用”，不会显示为
+                0。
+              </span>
+            </label>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busy}
+              onClick={(event) => {
+                event.preventDefault();
+                void save();
+              }}
+            >
+              {replaceTargetMutation.isPending && (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              )}
+              确认验证并{target?.configured ? "替换" : "配置"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog
         open={revokeOpen}
@@ -933,9 +987,7 @@ function AdminOverviewApiKeyDialog({
                 void revoke();
               }}
             >
-              {(revokeEngineerMutation.isPending ||
-                revokeAdminMutation.isPending ||
-                revokeCustomerMutation.isPending) && (
+              {revokeTargetMutation.isPending && (
                 <Loader2 className="h-4 w-4 animate-spin" />
               )}
               确认撤销
@@ -1034,7 +1086,8 @@ export default function AdminDashboard({
       ownAgentMonthUsed +
       users.reduce((sum, customer) => sum + customer.monthUsed, 0);
     return {
-      period: { label: "2026 年 7 月" },
+      period: { label: "近 30 天" },
+      systemAdmins: [],
       engineers: [],
       customers: [],
       managers: [
@@ -1084,9 +1137,28 @@ export default function AdminDashboard({
       ownAgentMonthUsed: usage?.ownAgentMonthUsed ?? 0,
       otherOrUnattributedUsed: usage?.otherOrUnattributedUsed ?? 0,
       usageSyncStatus: usage?.syncStatus ?? "unconfigured",
+      usageFetchedAt: usage?.fetchedAt ?? null,
     };
   });
   const keyManagementRows: KeyManagementRow[] = [
+    ...usageHierarchy.systemAdmins.map(
+      (administrator): KeyManagementRow => ({
+        kind: "system_admin",
+        userId: administrator.adminId,
+        displayName: administrator.displayName,
+        username: administrator.username || `system-${administrator.adminId}`,
+        configured: administrator.apiKeyConfigured,
+        version: administrator.apiKeyVersion,
+        typeLabel: "系统管理员",
+        scopeLabel: "系统管理与通用 Agent",
+        inherited: false,
+        ownAgentMonthUsed: administrator.ownAgentMonthUsed,
+        keyTotalUsed: administrator.keyTotalUsed,
+        otherOrUnattributedUsed: administrator.otherOrUnattributedUsed,
+        syncStatus: administrator.syncStatus,
+        fetchedAt: administrator.fetchedAt,
+      }),
+    ),
     ...usageManagers.map(
       (manager): KeyManagementRow => ({
         kind: "delivery_admin",
@@ -1104,6 +1176,8 @@ export default function AdminDashboard({
           0,
           manager.keyPool.totalUsed - manager.ownAgentMonthUsed,
         ),
+        syncStatus: manager.keyPool.syncStatus,
+        fetchedAt: manager.keyPool.fetchedAt,
       }),
     ),
     ...deliveryEngineerStatusRows.map(
@@ -1122,6 +1196,8 @@ export default function AdminDashboard({
         ownAgentMonthUsed: engineer.ownAgentMonthUsed,
         keyTotalUsed: engineer.keyTotalUsed,
         otherOrUnattributedUsed: engineer.otherOrUnattributedUsed,
+        syncStatus: engineer.usageSyncStatus,
+        fetchedAt: engineer.usageFetchedAt,
       }),
     ),
     ...usageHierarchy.customers.map(
@@ -1140,6 +1216,8 @@ export default function AdminDashboard({
         ownAgentMonthUsed: customer.ownAgentMonthUsed,
         keyTotalUsed: customer.keyTotalUsed,
         otherOrUnattributedUsed: customer.otherOrUnattributedUsed,
+        syncStatus: customer.syncStatus,
+        fetchedAt: customer.fetchedAt,
       }),
     ),
   ].sort((left, right) => {
@@ -1161,7 +1239,7 @@ export default function AdminDashboard({
   return (
     <PortalShell
       eyebrow="FrontMind 管理中心"
-      title="交付总览"
+      title="API与人员管理"
       navItems={navItems}
       accountLabel={
         previewMode
@@ -1175,7 +1253,7 @@ export default function AdminDashboard({
       }
     >
       <div className="space-y-5">
-        {systemAdmin && !previewMode && (
+        {systemAdmin && (
           <PortalCard className="overflow-hidden">
             <div className="flex flex-col gap-4 border-b border-[#eee8f2] px-5 py-4 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
               <div>
@@ -1197,31 +1275,38 @@ export default function AdminDashboard({
                   </span>
                 </div>
                 <p className="mt-1 text-sm leading-6 text-[#716a80]">
-                  客户、交付管理员和工程师使用同一套管理入口；交付管理员端不展示
+                  客户、系统管理员、交付管理员和工程师使用同一套管理入口；交付管理员端不展示
                   Key 配置能力。
                 </p>
               </div>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={
-                  usageHierarchyQuery.isFetching || usageSyncMutation.isPending
-                }
-                onClick={() => usageSyncMutation.mutate()}
-              >
-                <RefreshCw
-                  className={`h-4 w-4 ${
+              {previewMode ? (
+                <span className="rounded-full border border-[#ddd4e5] bg-white px-3 py-1.5 text-xs font-medium text-[#716a80]">
+                  只读验收预览 · 近 30 天
+                </span>
+              ) : (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={
                     usageHierarchyQuery.isFetching ||
                     usageSyncMutation.isPending
-                      ? "animate-spin"
-                      : ""
-                  }`}
-                />
-                {usageHierarchyQuery.isFetching || usageSyncMutation.isPending
-                  ? "同步中"
-                  : "刷新用量"}
-              </Button>
+                  }
+                  onClick={() => usageSyncMutation.mutate()}
+                >
+                  <RefreshCw
+                    className={`h-4 w-4 ${
+                      usageHierarchyQuery.isFetching ||
+                      usageSyncMutation.isPending
+                        ? "animate-spin"
+                        : ""
+                    }`}
+                  />
+                  {usageHierarchyQuery.isFetching || usageSyncMutation.isPending
+                    ? "同步中"
+                    : "刷新用量"}
+                </Button>
+              )}
             </div>
 
             <div className="flex flex-col gap-3 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
@@ -1230,6 +1315,7 @@ export default function AdminDashboard({
                   ["all", "全部"],
                   ["customer", "客户"],
                   ["delivery_admin", "交付管理员"],
+                  ["system_admin", "系统管理员"],
                   ["engineer", "工程师"],
                 ].map(([value, label]) => (
                   <button
@@ -1280,7 +1366,7 @@ export default function AdminDashboard({
                     <span>类型</span>
                     <span>归属范围</span>
                     <span>Key 状态</span>
-                    <span>本月自用</span>
+                    <span>近 30 天自用</span>
                     <span>Key 总额</span>
                     <span>操作</span>
                   </div>
@@ -1324,23 +1410,37 @@ export default function AdminDashboard({
                         )}
                       </div>
                       <p className="text-sm font-semibold text-[#5b2a86]">
-                        {row.ownAgentMonthUsed.toLocaleString()}
+                        {row.syncStatus === "ok"
+                          ? row.ownAgentMonthUsed.toLocaleString()
+                          : "—"}
                       </p>
                       <div>
                         <p className="text-sm font-semibold text-[#332842]">
-                          {row.keyTotalUsed.toLocaleString()}
+                          {row.syncStatus === "ok"
+                            ? row.keyTotalUsed.toLocaleString()
+                            : "—"}
                         </p>
-                        {row.keyTotalUsed > row.ownAgentMonthUsed && (
+                        {row.syncStatus !== "ok" ? (
+                          <p className="mt-1 text-xs text-[#946800]">
+                            {row.syncStatus === "unconfigured"
+                              ? "尚未配置"
+                              : row.syncStatus === "pending"
+                                ? "等待同步"
+                                : "同步不完整"}
+                          </p>
+                        ) : row.keyTotalUsed > row.ownAgentMonthUsed ? (
                           <p className="mt-1 text-xs text-[#857e91]">
                             其他 {row.otherOrUnattributedUsed.toLocaleString()}
                           </p>
-                        )}
+                        ) : null}
                       </div>
                       <Button
                         type="button"
                         size="sm"
                         variant={row.configured ? "outline" : "default"}
-                        onClick={() =>
+                        disabled={previewMode}
+                        onClick={() => {
+                          if (previewMode) return;
                           setApiKeyTarget({
                             kind: row.kind,
                             userId: row.userId,
@@ -1348,11 +1448,15 @@ export default function AdminDashboard({
                             username: row.username,
                             configured: row.configured,
                             version: row.version,
-                          })
-                        }
+                          });
+                        }}
                       >
                         <KeyRound className="h-3.5 w-3.5" />
-                        {row.configured ? "更换 Key" : "配置 Key"}
+                        {previewMode
+                          ? "只读"
+                          : row.configured
+                            ? "更换 Key"
+                            : "配置 Key"}
                       </Button>
                     </div>
                   ))}
@@ -1367,7 +1471,7 @@ export default function AdminDashboard({
               <h2 className="font-semibold text-[#171321]">工程师状态</h2>
               <p className="mt-1 text-sm text-[#716a80]">
                 {systemAdmin
-                  ? "按人员查看岗位、项目、本月自用与 Key 总额；工程师 Key 由系统管理员统一配置。"
+                  ? "按人员查看岗位、项目、近 30 天自用与 Key 总额；工程师 Key 由系统管理员统一配置。"
                   : "按人员查看专业岗位、负责项目和当前工作状态；项目岗位缺员请前往客户项目团队处理。"}
               </p>
             </div>
@@ -1401,7 +1505,7 @@ export default function AdminDashboard({
                     <span>当前状态</span>
                     {systemAdmin && (
                       <>
-                        <span>本月积分</span>
+                        <span>近 30 天积分</span>
                         <span>账号与 Key 状态</span>
                       </>
                     )}
@@ -1464,15 +1568,28 @@ export default function AdminDashboard({
                               <p>
                                 自用{" "}
                                 <span className="font-semibold text-[#5b2a86]">
-                                  {engineer.ownAgentMonthUsed.toLocaleString()}
+                                  {engineer.usageSyncStatus === "ok"
+                                    ? engineer.ownAgentMonthUsed.toLocaleString()
+                                    : "—"}
                                 </span>
                               </p>
                               <p>
                                 Key 总额{" "}
                                 <span className="font-semibold text-[#332842]">
-                                  {engineer.keyTotalUsed.toLocaleString()}
+                                  {engineer.usageSyncStatus === "ok"
+                                    ? engineer.keyTotalUsed.toLocaleString()
+                                    : "—"}
                                 </span>
                               </p>
+                              {engineer.usageSyncStatus !== "ok" && (
+                                <p className="text-[#946800]">
+                                  {engineer.usageSyncStatus === "unconfigured"
+                                    ? "尚未配置"
+                                    : engineer.usageSyncStatus === "pending"
+                                      ? "等待同步"
+                                      : "同步不完整"}
+                                </p>
+                              )}
                             </div>
                             <div className="space-y-1 text-xs">
                               <p

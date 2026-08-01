@@ -99,16 +99,30 @@ beforeEach(() => {
 describe("knowledge-base reset status", () => {
   it("queues both rendered assets and the immutable snapshot ZIP for cleanup", () => {
     expect(
-      knowledgeSnapshotCleanupStorageKeys(42, [
-        {
-          id: "00000000-0000-4000-8000-000000000123",
-          sourceConversationId: null,
-          assets: [{ key: "knowledge-assets/snapshot/logo.webp" }],
-        },
-      ]),
+      knowledgeSnapshotCleanupStorageKeys(
+        42,
+        [
+          {
+            id: "00000000-0000-4000-8000-000000000123",
+            sourceConversationId: null,
+            assets: [{ key: "knowledge-assets/snapshot/logo.webp" }],
+          },
+        ],
+        [
+          {
+            id: "build-1",
+            conversationId: "conversation-1",
+            upstreamTaskId: "task-1",
+            logoStorageKey: "knowledge-builds/42/build-1/logo.bin",
+            packageStorageKey: "knowledge-builds/42/build-1/package.zip",
+          },
+        ],
+      ),
     ).toEqual([
       "knowledge-assets/snapshot/logo.webp",
       "knowledge-archives/42/00000000-0000-4000-8000-000000000123.zip",
+      "knowledge-builds/42/build-1/logo.bin",
+      "knowledge-builds/42/build-1/package.zip",
     ]);
   });
 

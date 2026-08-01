@@ -135,6 +135,29 @@ describe("system administrator boundary", () => {
         caller.presales.usage(),
     ],
     [
+      "replace a managed API Key from unified management",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.apiKeyUsageAlerts.replaceTargetCredential({
+          kind: "customer",
+          userId: 7,
+          apiKey: "managed-api-secret-key",
+          expectedVersion: 3,
+          reason: "boundary test",
+          confirmation: "REPLACE_API_KEY",
+        }),
+    ],
+    [
+      "revoke a managed API Key from unified management",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.apiKeyUsageAlerts.revokeTargetCredential({
+          kind: "engineer",
+          userId: 8,
+          expectedVersion: 2,
+          reason: "boundary test",
+          confirmation: "REVOKE_API_KEY",
+        }),
+    ],
+    [
       "list signing-first manual orders",
       (caller: ReturnType<typeof adminRouter.createCaller>) =>
         caller.manualOrders.list(),

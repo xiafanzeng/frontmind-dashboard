@@ -4,6 +4,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import JSZip from "jszip";
 
+import {
+  canonicalKnowledgeBaseSkillArchiveHash,
+  legacyKnowledgeBaseSkillInstructionHash,
+} from "../shared/knowledge-base-skill-archive-hash.js";
+
 const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -16,7 +21,7 @@ const sourceRoot = path.join(
 const outputPath = path.join(
   projectRoot,
   "private-workflows",
-  "socratic-kb-builder-v3.skill",
+  "socratic-kb-builder-v4.skill",
 );
 const fixedDate = new Date("2000-01-01T00:00:00.000Z");
 
@@ -29,34 +34,88 @@ export const socraticKnowledgeBaseSkillEntries = [
   "scripts/validate_archive.py",
 ];
 
-async function readRequiredSource(relativePath) {
-  const content = await fs.readFile(path.join(sourceRoot, relativePath));
+async function readRequiredSource(root, relativePath) {
+  const content = await fs.readFile(path.join(root, relativePath));
   if (content.length === 0) {
     throw new Error(`Skill source is empty: ${relativePath}`);
   }
   return content;
 }
 
-async function skillInstructionHash(archive) {
-  const zip = await JSZip.loadAsync(archive);
-  const skill = await zip.file("SKILL.md")?.async("string");
-  if (!skill) {
-    throw new Error("Existing v3 Skill archive is missing SKILL.md");
+async function writeHistoricalArchiveNoClobber(targetPath, archive) {
+  try {
+    await fs.writeFile(targetPath, archive, { flag: "wx" });
+    return;
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
   }
-  return createHash("sha256")
-    .update(`# Skill\n\n${skill.trim()}`)
-    .digest("hex");
+  const existing = await fs.readFile(targetPath);
+  if (!existing.equals(archive)) {
+    throw new Error(
+      `Refusing to overwrite immutable historical Skill archive: ${targetPath}`,
+    );
+  }
 }
 
-export async function packageSocraticKnowledgeBaseSkill() {
+async function historicalArchiveExists(targetPath, archive) {
+  try {
+    const existing = await fs.readFile(targetPath);
+    if (!existing.equals(archive)) {
+      throw new Error(
+        `Immutable historical Skill archive has conflicting bytes: ${targetPath}`,
+      );
+    }
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function preserveExistingSkillArchive(
+  selectedOutputPath,
+  archive,
+  contentHash,
+) {
+  const canonicalPath = path.join(
+    path.dirname(selectedOutputPath),
+    `socratic-kb-builder-v4-${contentHash}.skill`,
+  );
+  const alreadyCanonical = await historicalArchiveExists(
+    canonicalPath,
+    archive,
+  );
+  if (alreadyCanonical) return;
+
+  // A pre-canonical active archive may still be referenced by the historical
+  // SKILL.md-only pin. Write that compatibility alias before the canonical
+  // marker so an interrupted migration can safely retry.
+  const legacyHash = await legacyKnowledgeBaseSkillInstructionHash(archive);
+  await writeHistoricalArchiveNoClobber(
+    path.join(
+      path.dirname(selectedOutputPath),
+      `socratic-kb-builder-v4-${legacyHash}.skill`,
+    ),
+    archive,
+  );
+  await writeHistoricalArchiveNoClobber(canonicalPath, archive);
+}
+
+export async function packageSocraticKnowledgeBaseSkill(options = {}) {
+  const selectedSourceRoot = options.sourceRoot || sourceRoot;
+  const selectedOutputPath = options.outputPath || outputPath;
   const zip = new JSZip();
   for (const relativePath of [...socraticKnowledgeBaseSkillEntries].sort()) {
-    zip.file(relativePath, await readRequiredSource(relativePath), {
-      binary: true,
-      createFolders: false,
-      date: fixedDate,
-      unixPermissions: relativePath.endsWith(".py") ? 0o100755 : 0o100644,
-    });
+    zip.file(
+      relativePath,
+      await readRequiredSource(selectedSourceRoot, relativePath),
+      {
+        binary: true,
+        createFolders: false,
+        date: fixedDate,
+        unixPermissions: relativePath.endsWith(".py") ? 0o100755 : 0o100644,
+      },
+    );
   }
   const archive = await zip.generateAsync({
     type: "nodebuffer",
@@ -65,29 +124,51 @@ export async function packageSocraticKnowledgeBaseSkill() {
     platform: "UNIX",
     streamFiles: false,
   });
+  const contentHash = await canonicalKnowledgeBaseSkillArchiveHash(archive);
   let existing = null;
   try {
-    existing = await fs.readFile(outputPath);
+    existing = await fs.readFile(selectedOutputPath);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  if (!existing?.equals(archive)) {
-    if (existing) {
-      const previousHash = await skillInstructionHash(existing);
-      await fs.writeFile(
-        path.join(
-          path.dirname(outputPath),
-          `socratic-kb-builder-v3-${previousHash}.skill`,
-        ),
+  let deployedArchive = archive;
+  if (!existing) {
+    await fs.writeFile(selectedOutputPath, archive);
+  } else {
+    const existingContentHash =
+      await canonicalKnowledgeBaseSkillArchiveHash(existing);
+    if (existingContentHash === contentHash) {
+      // A ZIP implementation or metadata change may alter container bytes
+      // while preserving every logical entry. Keep the deployed bytes and
+      // migrate their old SKILL-only alias exactly once.
+      deployedArchive = existing;
+      await preserveExistingSkillArchive(
+        selectedOutputPath,
         existing,
+        existingContentHash,
       );
+    } else {
+      await preserveExistingSkillArchive(
+        selectedOutputPath,
+        existing,
+        existingContentHash,
+      );
+      await fs.writeFile(selectedOutputPath, archive);
     }
-    await fs.writeFile(outputPath, archive);
   }
+  await writeHistoricalArchiveNoClobber(
+    path.join(
+      path.dirname(selectedOutputPath),
+      `socratic-kb-builder-v4-${contentHash}.skill`,
+    ),
+    deployedArchive,
+  );
   return {
-    outputPath,
-    bytes: archive.length,
-    sha256: createHash("sha256").update(archive).digest("hex"),
+    outputPath: selectedOutputPath,
+    bytes: deployedArchive.length,
+    sha256: contentHash,
+    contentHash,
+    archiveSha256: createHash("sha256").update(deployedArchive).digest("hex"),
   };
 }
 

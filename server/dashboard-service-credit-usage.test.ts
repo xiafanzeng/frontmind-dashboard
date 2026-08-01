@@ -3,9 +3,31 @@ import { describe, expect, it } from "vitest";
 import {
   aggregateSharedKeyCreditUsagePage,
   getShanghaiCalendarMonthPeriod,
+  getShanghaiRollingUsagePeriod,
+  usageContributionForCredential,
 } from "./dashboard-service";
 
 describe("shared API Key credit usage", () => {
+  it("keeps current physical Key pool totals separate from cross-history account usage", () => {
+    const accountIds = new Set([42]);
+    const oldA = usageContributionForCredential({
+      creditUsage: 10,
+      credentialFingerprint: "fingerprint-A",
+      poolFingerprint: "fingerprint-C",
+      ownerId: 42,
+      accountIds,
+    });
+    const currentC = usageContributionForCredential({
+      creditUsage: 20,
+      credentialFingerprint: "fingerprint-C",
+      poolFingerprint: "fingerprint-C",
+      ownerId: 42,
+      accountIds,
+    });
+    expect(oldA.poolUsed + currentC.poolUsed).toBe(20);
+    expect(oldA.accountUsed + currentC.accountUsed).toBe(30);
+  });
+
   it("shows the shared pool total without exposing another account's task details", () => {
     const now = Date.now();
     const result = aggregateSharedKeyCreditUsagePage({
@@ -73,6 +95,55 @@ describe("shared API Key credit usage", () => {
     expect(second.totalUsed).toBe(0);
     expect(second.accountUsed).toBe(0);
     expect(second.recentTasks).toEqual([]);
+  });
+
+  it("does not stop at one out-of-order expired task", () => {
+    const now = Date.parse("2026-08-02T08:00:00.000Z");
+    const cutoff = now - 30 * 86_400_000;
+    const result = aggregateSharedKeyCreditUsagePage({
+      tasks: [
+        { id: "old-first", created_at: cutoff - 1, credit_usage: 99 },
+        { id: "new-later", created_at: cutoff + 1, credit_usage: 40 },
+      ],
+      ownedTaskIds: new Set(["new-later"]),
+      cutoff,
+      endExclusive: now,
+      seenTaskIds: new Set(),
+    });
+
+    expect(result).toMatchObject({
+      totalUsed: 40,
+      accountUsed: 40,
+      reachedCutoff: false,
+      complete: true,
+    });
+  });
+
+  it("uses an exact rolling 30-day boundary while formatting in Asia/Shanghai", () => {
+    const now = Date.parse("2026-08-02T08:00:00.000Z");
+    const period = getShanghaiRollingUsagePeriod(30, now);
+    expect(period).toMatchObject({
+      label: "近 30 天",
+      timezone: "Asia/Shanghai",
+      startAt: Date.parse("2026-07-03T08:00:00.000Z"),
+      endAt: now,
+    });
+    const result = aggregateSharedKeyCreditUsagePage({
+      tasks: [
+        { id: "at-cutoff", created_at: period.startAt, credit_usage: 30 },
+        {
+          id: "before-cutoff",
+          created_at: period.startAt - 1,
+          credit_usage: 99,
+        },
+      ],
+      ownedTaskIds: new Set(["at-cutoff", "before-cutoff"]),
+      cutoff: period.startAt,
+      endExclusive: period.endAt,
+      seenTaskIds: new Set(),
+    });
+    expect(result.totalUsed).toBe(30);
+    expect(result.accountUsed).toBe(30);
   });
 
   it("uses a Beijing-time calendar month instead of a rolling 30-day window", () => {

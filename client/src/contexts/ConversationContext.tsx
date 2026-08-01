@@ -18,14 +18,21 @@ import {
   type TaskResponse,
   type OutputMessage,
 } from "@/lib/frontmind-api";
+import { normalizeKnowledgeCollectionCopy } from "@shared/knowledge-base-copy";
 import {
-  normalizeKnowledgeCollectionCopy,
-} from "@shared/knowledge-base-copy";
+  knowledgeBasePresentationMessagePublicId,
+  knowledgeBaseUserMessagePublicId,
+} from "@shared/knowledge-base-message";
 import {
   stripKnowledgeBaseProtocolPayloads,
   stripKnowledgeBaseReferenceAppendix,
 } from "@shared/knowledge-base-output";
 import { uniquifyOrderedIds } from "@shared/ordered-id";
+import {
+  reconcileKnowledgeBaseObservation,
+  type KnowledgeBaseObservationDto,
+} from "@/lib/knowledge-progress";
+import { KnowledgeBasePollingCoordinator } from "@/lib/knowledge-base-coordinator";
 
 // Types for local conversation management
 export interface Attachment {
@@ -82,6 +89,45 @@ export interface LocalMessage {
   isStepsPlaceholder?: boolean;
   /** The public model profile used for this message (e.g. "frontmind-lite") */
   modelName?: string;
+  /** Server-approved knowledge-base projection metadata. Never inferred from raw output. */
+  knowledgeBase?: {
+    schemaVersion?: 1;
+    kind: "pending_user" | "presentation";
+    buildId?: string;
+    operationKey?: string;
+    clientRequestId?: string;
+    turnId?: string;
+    presentationKey?: string;
+    generation?: number;
+    revision?: number;
+    leafId?: string | null;
+    serverOwned?: boolean;
+  };
+}
+
+export interface KnowledgeBaseClientNotice {
+  errorKey: string;
+  code?: string;
+  message: string;
+  severity: "info" | "warning" | "error";
+  retryable: boolean;
+  turnId?: string | null;
+}
+
+export interface KnowledgeBaseClientState {
+  initialized: boolean;
+  generation: number;
+  stateEpoch: number;
+  activeTurnId: string | null;
+  activeClientRequestId: string | null;
+  /** Provenance of the currently approved presentation; remains after the reservation is released. */
+  presentationTurnId: string | null;
+  interactionState: KnowledgeBaseObservationDto["interaction"]["interactionState"];
+  canReply: boolean;
+  presentationKey: string | null;
+  revision: number | null;
+  leafId: string | null;
+  notice: KnowledgeBaseClientNotice | null;
 }
 
 export interface Conversation {
@@ -118,6 +164,8 @@ export interface Conversation {
    * Format: "sk-a...b1c2" (first 4 + last 4 chars of the key).
    */
   apiKeyFingerprint?: string;
+  /** Authoritative KB UI state. It is refreshed from the server observation. */
+  knowledgeBase?: KnowledgeBaseClientState;
 }
 
 export function repairConversationMessageIds(
@@ -138,6 +186,14 @@ export function repairConversationMessageIds(
     attachmentIndex += message.attachments.length;
     return { ...message, attachments: nextAttachments };
   });
+}
+
+export function isServerOwnedKnowledgeBaseMessage(message: LocalMessage) {
+  return message.knowledgeBase?.serverOwned === true;
+}
+
+function hasServerOwnedKnowledgeBaseMessages(conversation: Conversation) {
+  return conversation.messages.some(isServerOwnedKnowledgeBaseMessage);
 }
 
 interface ConversationState {
@@ -169,8 +225,24 @@ type Action =
       type: "UPDATE_ASSISTANT_MESSAGES";
       payload: { conversationId: string; messages: LocalMessage[] };
     }
+  | {
+      type: "MARK_KNOWLEDGE_BASE";
+      payload: { conversationId: string };
+    }
+  | {
+      type: "COMMIT_KB_OBSERVATION";
+      payload: {
+        conversationId: string;
+        observation: KnowledgeBaseObservationDto;
+      };
+    }
+  | {
+      type: "ROLLBACK_KB_PENDING_TURN";
+      payload: { conversationId: string; clientRequestId: string };
+    }
   | { type: "UPDATE_TITLE"; payload: { conversationId: string; title: string } }
   | { type: "DELETE_CONVERSATION"; payload: string }
+  | { type: "DISCARD_CONVERSATION_LOCALLY"; payload: string }
   | {
       type: "DELETE_MESSAGE";
       payload: { conversationId: string; messageId: string };
@@ -244,6 +316,12 @@ function conversationReducer(
         ...state,
         conversations: state.conversations.map((c) => {
           if (c.id !== action.payload.conversationId) return c;
+          if (
+            c.knowledgeBase?.initialized ||
+            hasServerOwnedKnowledgeBaseMessages(c)
+          ) {
+            return c;
+          }
 
           // Find the index of the last user message.
           // All assistant messages after it belong to the current turn and will be
@@ -275,13 +353,60 @@ function conversationReducer(
           // both turns and deterministically disambiguate the local/database ID.
           return {
             ...c,
-            messages: repairConversationMessageIds([
-              ...kept,
-              ...newMessages,
-            ]),
+            messages: repairConversationMessageIds([...kept, ...newMessages]),
             updatedAt: Date.now(),
           };
         }),
+      };
+    }
+    case "MARK_KNOWLEDGE_BASE": {
+      return {
+        ...state,
+        conversations: state.conversations.map((conversation) =>
+          conversation.id !== action.payload.conversationId ||
+          conversation.knowledgeBase
+            ? conversation
+            : {
+                ...conversation,
+                knowledgeBase: emptyKnowledgeBaseClientState(),
+              },
+        ),
+      };
+    }
+    case "ROLLBACK_KB_PENDING_TURN": {
+      return {
+        ...state,
+        conversations: state.conversations.map((conversation) => {
+          if (conversation.id !== action.payload.conversationId) {
+            return conversation;
+          }
+          return {
+            ...conversation,
+            messages: conversation.messages.filter(
+              (message) =>
+                isServerOwnedKnowledgeBaseMessage(message) ||
+                !(
+                  message.knowledgeBase?.kind === "pending_user" &&
+                  message.knowledgeBase.clientRequestId ===
+                    action.payload.clientRequestId
+                ),
+            ),
+            updatedAt: Date.now(),
+          };
+        }),
+      };
+    }
+    case "COMMIT_KB_OBSERVATION": {
+      return {
+        ...state,
+        conversations: state.conversations.map((conversation) =>
+          conversation.id === action.payload.conversationId
+            ? applyKnowledgeBaseObservation(
+                conversation,
+                action.payload.observation,
+              )
+            : conversation,
+        ),
       };
     }
     case "UPDATE_TITLE": {
@@ -301,24 +426,50 @@ function conversationReducer(
     case "DELETE_MESSAGE": {
       return {
         ...state,
-        conversations: state.conversations.map((c) =>
-          c.id === action.payload.conversationId
-            ? {
-                ...c,
-                messages: c.messages.filter(
-                  (m) => m.id !== action.payload.messageId,
-                ),
-                deletedMessageIds: [
-                  ...(c.deletedMessageIds || []),
-                  action.payload.messageId,
-                ],
-                updatedAt: Date.now(),
-              }
-            : c,
-        ),
+        conversations: state.conversations.map((c) => {
+          if (c.id !== action.payload.conversationId) return c;
+          const target = c.messages.find(
+            (message) => message.id === action.payload.messageId,
+          );
+          if (target && isServerOwnedKnowledgeBaseMessage(target)) return c;
+          return {
+            ...c,
+            messages: c.messages.filter(
+              (m) => m.id !== action.payload.messageId,
+            ),
+            deletedMessageIds: [
+              ...(c.deletedMessageIds || []),
+              action.payload.messageId,
+            ],
+            updatedAt: Date.now(),
+          };
+        }),
       };
     }
     case "DELETE_CONVERSATION": {
+      const target = state.conversations.find(
+        (conversation) => conversation.id === action.payload,
+      );
+      if (
+        target &&
+        (target.knowledgeBase?.initialized ||
+          hasServerOwnedKnowledgeBaseMessages(target))
+      ) {
+        return state;
+      }
+      const remaining = state.conversations.filter(
+        (c) => c.id !== action.payload,
+      );
+      return {
+        ...state,
+        conversations: remaining,
+        activeConversationId:
+          state.activeConversationId === action.payload
+            ? (remaining[0]?.id ?? null)
+            : state.activeConversationId,
+      };
+    }
+    case "DISCARD_CONVERSATION_LOCALLY": {
       const remaining = state.conversations.filter(
         (c) => c.id !== action.payload,
       );
@@ -337,6 +488,393 @@ function conversationReducer(
     default:
       return state;
   }
+}
+
+function emptyKnowledgeBaseClientState(): KnowledgeBaseClientState {
+  return {
+    initialized: false,
+    generation: 0,
+    stateEpoch: 0,
+    activeTurnId: null,
+    activeClientRequestId: null,
+    presentationTurnId: null,
+    interactionState: "queued",
+    canReply: false,
+    presentationKey: null,
+    revision: null,
+    leafId: null,
+    notice: null,
+  };
+}
+
+function stableKnowledgeBaseMessageId(key: string) {
+  return knowledgeBasePresentationMessagePublicId(key);
+}
+
+function observationActiveTurnId(observation: KnowledgeBaseObservationDto) {
+  return observation.activeTurn?.id ?? null;
+}
+
+export function approvedKnowledgeBasePresentationMatches(
+  observation: KnowledgeBaseObservationDto,
+) {
+  const presentation = observation.approvedPresentation;
+  const progress = observation.progress ?? observation.interaction.progress;
+  const activeTurnId = observationActiveTurnId(observation);
+  return Boolean(
+    presentation &&
+      presentation.visibleMarkdown.trim() &&
+      presentation.turnId &&
+      (!activeTurnId || presentation.turnId === activeTurnId) &&
+      progress &&
+      presentation.revision === progress.build.revision &&
+      presentation.leafId === progress.build.currentLeafId,
+  );
+}
+
+function knowledgeObservationIsStale(
+  current: KnowledgeBaseClientState | undefined,
+  observation: KnowledgeBaseObservationDto,
+) {
+  if (!current) return false;
+  if (!current.initialized) return false;
+  if (observation.generation < current.generation) return true;
+  if (observation.generation > current.generation) return false;
+  if (observation.stateEpoch < current.stateEpoch) return true;
+  if (observation.stateEpoch > current.stateEpoch) return false;
+
+  const incomingTurnId = observationActiveTurnId(observation);
+  if (
+    current.activeTurnId &&
+    incomingTurnId &&
+    current.activeTurnId !== incomingTurnId
+  ) {
+    return true;
+  }
+  return (
+    current.activeTurnId === incomingTurnId &&
+    current.interactionState === observation.interaction.interactionState &&
+    current.presentationKey ===
+      (observation.approvedPresentation?.presentationKey ?? null) &&
+    current.notice?.errorKey === (observation.notice?.key ?? undefined)
+  );
+}
+
+function observationPrecedesPersistedKnowledgeBaseHistory(
+  messages: readonly LocalMessage[],
+  observation: KnowledgeBaseObservationDto,
+) {
+  const persisted = messages
+    .filter(
+      (message) =>
+        isServerOwnedKnowledgeBaseMessage(message) &&
+        message.knowledgeBase?.kind === "presentation",
+    )
+    .reduce(
+      (latest, message) => {
+        const candidate = {
+          generation: message.knowledgeBase?.generation ?? -1,
+          revision: message.knowledgeBase?.revision ?? -1,
+        };
+        return candidate.generation > latest.generation ||
+          (candidate.generation === latest.generation &&
+            candidate.revision > latest.revision)
+          ? candidate
+          : latest;
+      },
+      { generation: -1, revision: -1 },
+    );
+  if (observation.generation < persisted.generation) return true;
+  const observedRevision =
+    observation.approvedPresentation?.revision ??
+    observation.interaction.progress?.build.revision ??
+    -1;
+  return (
+    observation.generation === persisted.generation &&
+    observedRevision < persisted.revision
+  );
+}
+
+function knowledgeBasePresentationMessage(
+  observation: KnowledgeBaseObservationDto,
+): LocalMessage | null {
+  const presentation = observation.approvedPresentation;
+  if (!presentation || !approvedKnowledgeBasePresentationMatches(observation)) {
+    return null;
+  }
+  const inlineImages = (presentation.resources ?? [])
+    .map((resource) => ({
+      src: resource.sameOriginUrl,
+      alt: resource.filename,
+      mimeType: resource.mimeType,
+      kind: resource.kind,
+    }))
+    .filter(
+      (resource) =>
+        resource.src.startsWith("/") &&
+        (resource.mimeType.startsWith("image/") ||
+          /image|logo/i.test(resource.kind)),
+    )
+    .map(({ src, alt }) => ({ src, alt }));
+
+  return {
+    id: stableKnowledgeBaseMessageId(presentation.presentationKey),
+    role: "assistant",
+    content: sanitizeKnowledgeBaseCustomerMarkdown(
+      presentation.visibleMarkdown,
+    ),
+    timestamp: Date.now(),
+    inlineImages: inlineImages.length > 0 ? inlineImages : undefined,
+    knowledgeBase: {
+      schemaVersion: 1,
+      kind: "presentation",
+      buildId: (observation.progress ?? observation.interaction.progress)?.build
+        .id,
+      operationKey: observation.activeTurn?.operationKey,
+      turnId: presentation.turnId,
+      presentationKey: presentation.presentationKey,
+      generation: observation.generation,
+      revision: presentation.revision,
+      leafId: presentation.leafId,
+      serverOwned: true,
+    },
+  };
+}
+
+export function applyKnowledgeBaseObservation(
+  conversation: Conversation,
+  observation: KnowledgeBaseObservationDto,
+): Conversation {
+  if (
+    knowledgeObservationIsStale(conversation.knowledgeBase, observation) ||
+    observationPrecedesPersistedKnowledgeBaseHistory(
+      conversation.messages,
+      observation,
+    )
+  ) {
+    return conversation;
+  }
+
+  const activeTurnId = observationActiveTurnId(observation);
+  const activeClientRequestId = observation.activeTurn?.clientRequestId ?? null;
+  const presentationClientRequestId =
+    observation.approvedPresentation?.clientRequestId ?? null;
+  const presentation = knowledgeBasePresentationMessage(observation);
+  const presentationMatches = Boolean(presentation);
+  const interactionState = observation.interaction.interactionState;
+  const nextStatus: Conversation["status"] =
+    interactionState === "awaiting_input"
+      ? presentationMatches && observation.interaction.canReply
+        ? "awaiting_input"
+        : "running"
+      : interactionState === "ready_to_publish" ||
+          interactionState === "published"
+        ? "completed"
+        : interactionState === "failed"
+          ? "error"
+          : interactionState === "queued"
+            ? "pending"
+            : "running";
+
+  let messages = conversation.messages;
+  let presentationUserIndex = -1;
+  if (activeTurnId && activeClientRequestId) {
+    messages = messages.map((message) => {
+      if (
+        message.role !== "user" ||
+        message.knowledgeBase?.kind !== "pending_user" ||
+        message.knowledgeBase.clientRequestId !== activeClientRequestId
+      ) {
+        return message;
+      }
+      return {
+        ...message,
+        id: knowledgeBaseUserMessagePublicId(activeTurnId),
+        knowledgeBase: {
+          ...message.knowledgeBase,
+          schemaVersion: 1,
+          buildId: (observation.progress ?? observation.interaction.progress)
+            ?.build.id,
+          operationKey: observation.activeTurn?.operationKey,
+          turnId: activeTurnId,
+          generation: observation.generation,
+          revision: observation.activeTurn?.expectedRevision ?? undefined,
+          leafId: observation.activeTurn?.expectedLeafId ?? null,
+          serverOwned: true,
+        },
+      };
+    });
+    if (presentation?.knowledgeBase?.turnId === activeTurnId) {
+      presentationUserIndex = messages.findIndex(
+        (message) =>
+          message.role === "user" &&
+          message.knowledgeBase?.clientRequestId === activeClientRequestId &&
+          message.knowledgeBase?.turnId === activeTurnId,
+      );
+    }
+  }
+  if (presentation && !activeClientRequestId && presentationClientRequestId) {
+    const pendingIndex = messages.findIndex(
+      (message) =>
+        message.role === "user" &&
+        message.knowledgeBase?.kind === "pending_user" &&
+        message.knowledgeBase.clientRequestId === presentationClientRequestId,
+    );
+    if (pendingIndex >= 0) {
+      const pending = messages[pendingIndex]!;
+      messages = messages.map((message, index) =>
+        index === pendingIndex
+          ? {
+              ...pending,
+              id: knowledgeBaseUserMessagePublicId(
+                presentation.knowledgeBase!.turnId!,
+              ),
+              knowledgeBase: {
+                ...pending.knowledgeBase!,
+                schemaVersion: 1,
+                buildId: (
+                  observation.progress ?? observation.interaction.progress
+                )?.build.id,
+                turnId: presentation.knowledgeBase!.turnId,
+                generation: observation.generation,
+                revision: observation.approvedPresentation?.revision,
+                leafId: observation.approvedPresentation?.leafId,
+                serverOwned: true,
+              },
+            }
+          : message,
+      );
+      presentationUserIndex = pendingIndex;
+    }
+  }
+  if (presentation) {
+    if (presentationUserIndex < 0) {
+      presentationUserIndex = messages.findIndex(
+        (message) =>
+          message.role === "user" &&
+          message.knowledgeBase?.serverOwned === true &&
+          message.knowledgeBase.turnId === presentation.knowledgeBase?.turnId,
+      );
+    }
+    const existingPresentationIndex = messages.findIndex(
+      (message) =>
+        message.role === "assistant" &&
+        message.knowledgeBase?.presentationKey ===
+          presentation.knowledgeBase?.presentationKey,
+    );
+    if (existingPresentationIndex >= 0) {
+      messages = messages.map((message, index) =>
+        index === existingPresentationIndex ? presentation : message,
+      );
+    } else if (presentationUserIndex >= 0) {
+      messages = [
+        ...messages.slice(0, presentationUserIndex + 1),
+        presentation,
+        ...messages.slice(presentationUserIndex + 1),
+      ];
+    } else {
+      // A released observation without a matching request identity may be an
+      // older presentation observed after a network-unknown POST. Keep every
+      // optimistic message unbound; never guess that the last pending message
+      // produced it. A presentation not already in local history can still be
+      // appended as authoritative server content without claiming any request.
+      messages = [...messages, presentation];
+    }
+  }
+  messages = repairConversationMessageIds(messages);
+
+  const protectedMessageIds = new Set(
+    messages
+      .filter(isServerOwnedKnowledgeBaseMessage)
+      .map((message) => message.id),
+  );
+
+  const rawNotice = observation.notice;
+  const noticeKey = rawNotice?.key;
+  const notice =
+    rawNotice?.message && noticeKey
+      ? {
+          errorKey: noticeKey,
+          code: rawNotice.code,
+          message: sanitizeBrandText(rawNotice.message),
+          severity: rawNotice.severity ?? ("error" as const),
+          retryable: rawNotice.retryable === true,
+          turnId: rawNotice.turnId,
+        }
+      : null;
+
+  return {
+    ...conversation,
+    messages,
+    status: nextStatus,
+    taskId: observation.authoritativeTaskId ?? conversation.taskId,
+    previousResponseId:
+      observation.authoritativeTaskId ?? conversation.previousResponseId,
+    deletedMessageIds: conversation.deletedMessageIds?.filter(
+      (messageId) => !protectedMessageIds.has(messageId),
+    ),
+    completedAt:
+      nextStatus === "completed" || nextStatus === "error"
+        ? Date.now()
+        : undefined,
+    knowledgeBase: {
+      initialized: true,
+      generation: observation.generation,
+      stateEpoch: observation.stateEpoch,
+      activeTurnId,
+      activeClientRequestId,
+      presentationTurnId:
+        observation.approvedPresentation?.turnId ??
+        conversation.knowledgeBase?.presentationTurnId ??
+        null,
+      interactionState,
+      canReply:
+        interactionState === "awaiting_input" &&
+        presentationMatches &&
+        observation.interaction.canReply,
+      presentationKey:
+        observation.approvedPresentation?.presentationKey ?? null,
+      revision:
+        observation.approvedPresentation?.revision ??
+        observation.interaction.progress?.build.revision ??
+        null,
+      leafId:
+        observation.approvedPresentation?.leafId ??
+        observation.interaction.progress?.build.currentLeafId ??
+        null,
+      notice,
+    },
+    updatedAt: Date.now(),
+  };
+}
+
+export function currentKnowledgeBasePresentationReady(
+  conversation: Conversation | null | undefined,
+  revision: number | undefined,
+  leafId: string | null | undefined,
+) {
+  const knowledgeBase = conversation?.knowledgeBase;
+  if (
+    !conversation ||
+    conversation.status !== "awaiting_input" ||
+    !knowledgeBase?.canReply ||
+    knowledgeBase.revision !== revision ||
+    knowledgeBase.leafId !== leafId ||
+    !knowledgeBase.presentationKey ||
+    !knowledgeBase.presentationTurnId
+  ) {
+    return false;
+  }
+  return conversation.messages.some(
+    (message) =>
+      message.role === "assistant" &&
+      message.content.trim() &&
+      message.knowledgeBase?.kind === "presentation" &&
+      message.knowledgeBase.turnId === knowledgeBase.presentationTurnId &&
+      message.knowledgeBase.presentationKey === knowledgeBase.presentationKey &&
+      message.knowledgeBase.revision === revision &&
+      message.knowledgeBase.leafId === leafId,
+  );
 }
 
 const EMPTY_STATE: ConversationState = {
@@ -360,10 +898,19 @@ export function prepareConversationForCloud(
 ): Conversation {
   const { apiKeyFingerprint: _legacyFingerprint, ...cloudConversation } =
     conversation;
+  const repairedMessages = repairConversationMessageIds(conversation.messages);
+  const protectedMessageIds = new Set(
+    repairedMessages
+      .filter(isServerOwnedKnowledgeBaseMessage)
+      .map((message) => message.id),
+  );
 
   return {
     ...cloudConversation,
-    messages: repairConversationMessageIds(conversation.messages).map((message) => ({
+    deletedMessageIds: conversation.deletedMessageIds?.filter(
+      (messageId) => !protectedMessageIds.has(messageId),
+    ),
+    messages: repairedMessages.map((message) => ({
       ...message,
       attachments: message.attachments?.map((attachment) => {
         const {
@@ -390,15 +937,19 @@ function normalizeConversation(conversation: Conversation): Conversation {
   };
   const now = Date.now();
   const createdAt = toTimestamp(conversation.createdAt, now);
+  const normalizedMessages = Array.isArray(conversation.messages)
+    ? conversation.messages.map((message) => ({
+        ...message,
+        timestamp: toTimestamp(message.timestamp, createdAt),
+      }))
+    : [];
 
   return {
     ...conversation,
-    messages: Array.isArray(conversation.messages)
-      ? conversation.messages.map((message) => ({
-          ...message,
-          timestamp: toTimestamp(message.timestamp, createdAt),
-        }))
-      : [],
+    // A crash can leave both the optimistic request and the canonical
+    // server-owned turn in the first cloud snapshot. Collapse that pair before
+    // it ever reaches the reducer; otherwise it survives until another save.
+    messages: mergeServerOwnedKnowledgeBaseMessages([], normalizedMessages),
     createdAt,
     updatedAt: toTimestamp(conversation.updatedAt, createdAt),
     startedAt:
@@ -409,6 +960,186 @@ function normalizeConversation(conversation: Conversation): Conversation {
       conversation.completedAt === undefined
         ? undefined
         : toTimestamp(conversation.completedAt, createdAt),
+  };
+}
+
+function knowledgeBaseMessageIdentity(message: LocalMessage) {
+  const metadata = message.knowledgeBase;
+  if (!metadata) return `id:${message.id}`;
+  if (metadata.presentationKey) {
+    return `presentation:${metadata.presentationKey}`;
+  }
+  if (metadata.kind === "pending_user" && metadata.clientRequestId) {
+    return `request:${metadata.clientRequestId}:${metadata.kind}`;
+  }
+  if (metadata.turnId) return `turn:${metadata.turnId}:${metadata.kind}`;
+  if (metadata.clientRequestId) {
+    return `request:${metadata.clientRequestId}:${metadata.kind}`;
+  }
+  return `id:${message.id}`;
+}
+
+function knowledgeBaseMessageVersion(message: LocalMessage) {
+  return [
+    message.knowledgeBase?.generation ?? -1,
+    message.knowledgeBase?.revision ?? -1,
+    message.timestamp,
+  ] as const;
+}
+
+function knowledgeBaseMessageIsAtLeastAsNew(
+  candidate: LocalMessage,
+  current: LocalMessage,
+) {
+  const left = knowledgeBaseMessageVersion(candidate);
+  const right = knowledgeBaseMessageVersion(current);
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return left[index] > right[index];
+  }
+  return true;
+}
+
+function compareHydratedMessageOrder(left: LocalMessage, right: LocalMessage) {
+  if (
+    isServerOwnedKnowledgeBaseMessage(left) &&
+    isServerOwnedKnowledgeBaseMessage(right)
+  ) {
+    const leftGeneration = left.knowledgeBase?.generation ?? -1;
+    const rightGeneration = right.knowledgeBase?.generation ?? -1;
+    if (leftGeneration !== rightGeneration) {
+      return leftGeneration - rightGeneration;
+    }
+    const leftRevision = left.knowledgeBase?.revision ?? -1;
+    const rightRevision = right.knowledgeBase?.revision ?? -1;
+    if (leftRevision !== rightRevision) return leftRevision - rightRevision;
+    if (left.knowledgeBase?.kind !== right.knowledgeBase?.kind) {
+      return left.knowledgeBase?.kind === "pending_user" ? -1 : 1;
+    }
+  }
+  return left.timestamp - right.timestamp;
+}
+
+/** Preserve immutable KB history when a cloud list response was read earlier. */
+export function mergeServerOwnedKnowledgeBaseMessages(
+  localMessages: readonly LocalMessage[],
+  remoteMessages: readonly LocalMessage[],
+) {
+  const merged: LocalMessage[] = [];
+  const identityToIndex = new Map<string, number>();
+  const idToIndex = new Map<string, number>();
+  for (const remoteMessage of remoteMessages) {
+    const identity = knowledgeBaseMessageIdentity(remoteMessage);
+    const existingIndex =
+      identityToIndex.get(identity) ?? idToIndex.get(remoteMessage.id);
+    if (existingIndex === undefined) {
+      identityToIndex.set(identity, merged.length);
+      idToIndex.set(remoteMessage.id, merged.length);
+      merged.push(remoteMessage);
+      continue;
+    }
+    const existing = merged[existingIndex]!;
+    if (
+      (isServerOwnedKnowledgeBaseMessage(remoteMessage) &&
+        !isServerOwnedKnowledgeBaseMessage(existing)) ||
+      (isServerOwnedKnowledgeBaseMessage(remoteMessage) &&
+        knowledgeBaseMessageIsAtLeastAsNew(remoteMessage, existing))
+    ) {
+      merged[existingIndex] = remoteMessage;
+      identityToIndex.set(identity, existingIndex);
+      idToIndex.set(remoteMessage.id, existingIndex);
+    }
+  }
+  for (const localMessage of localMessages) {
+    if (!isServerOwnedKnowledgeBaseMessage(localMessage)) continue;
+    const identity = knowledgeBaseMessageIdentity(localMessage);
+    const existingIndex =
+      identityToIndex.get(identity) ?? idToIndex.get(localMessage.id);
+    if (existingIndex === undefined) {
+      identityToIndex.set(identity, merged.length);
+      idToIndex.set(localMessage.id, merged.length);
+      merged.push(localMessage);
+      continue;
+    }
+    const existing = merged[existingIndex]!;
+    if (
+      !isServerOwnedKnowledgeBaseMessage(existing) ||
+      knowledgeBaseMessageIsAtLeastAsNew(localMessage, existing)
+    ) {
+      merged[existingIndex] = localMessage;
+      identityToIndex.set(identity, existingIndex);
+      idToIndex.set(localMessage.id, existingIndex);
+    }
+  }
+  return repairConversationMessageIds(
+    merged
+      .map((message, order) => ({ message, order }))
+      .sort(
+        (left, right) =>
+          compareHydratedMessageOrder(left.message, right.message) ||
+          left.order - right.order,
+      )
+      .map(({ message }) => message),
+  );
+}
+
+export function mergeKnowledgeBaseHydration(
+  local: Conversation | undefined,
+  remote: Conversation,
+): Conversation {
+  if (!local) return remote;
+  const protectedRemoteMessages = mergeServerOwnedKnowledgeBaseMessages(
+    local.messages,
+    remote.messages,
+  );
+  const protectedRemoteMessageIds = new Set(
+    protectedRemoteMessages
+      .filter(isServerOwnedKnowledgeBaseMessage)
+      .map((message) => message.id),
+  );
+  const remoteWithProtectedHistory = {
+    ...remote,
+    messages: protectedRemoteMessages,
+    deletedMessageIds: remote.deletedMessageIds?.filter(
+      (messageId) => !protectedRemoteMessageIds.has(messageId),
+    ),
+  };
+  if (!local.knowledgeBase?.initialized) return remoteWithProtectedHistory;
+  const localState = local.knowledgeBase;
+  const remoteState = remote.knowledgeBase;
+  const remoteIsNewer = Boolean(
+    remoteState?.initialized &&
+      (remoteState.generation > localState.generation ||
+        (remoteState.generation === localState.generation &&
+          remoteState.stateEpoch > localState.stateEpoch)),
+  );
+  if (remoteIsNewer) return remoteWithProtectedHistory;
+
+  // A list request may have started before an observation commit. Preserve the
+  // locally accepted server projection until the coordinator supplies a newer
+  // epoch; a stale cloud snapshot must not blank or rewind the current node.
+  const protectedLocalMessages = mergeServerOwnedKnowledgeBaseMessages(
+    remote.messages,
+    local.messages,
+  );
+  const protectedLocalMessageIds = new Set(
+    protectedLocalMessages
+      .filter(isServerOwnedKnowledgeBaseMessage)
+      .map((message) => message.id),
+  );
+  return {
+    ...remote,
+    messages: protectedLocalMessages,
+    status: local.status,
+    taskId: local.taskId,
+    previousResponseId: local.previousResponseId,
+    taskUrl: local.taskUrl,
+    startedAt: local.startedAt,
+    completedAt: local.completedAt,
+    knowledgeBase: localState,
+    deletedMessageIds: local.deletedMessageIds?.filter(
+      (messageId) => !protectedLocalMessageIds.has(messageId),
+    ),
+    updatedAt: Math.max(local.updatedAt, remote.updatedAt),
   };
 }
 
@@ -471,6 +1202,17 @@ interface ConversationContextType {
     conversationId: string,
     messages: LocalMessage[],
   ) => void;
+  registerKnowledgeBaseConversation: (conversationId: string) => void;
+  wakeKnowledgeBaseConversation: (conversationId: string) => void;
+  isKnowledgeBaseConversation: (conversationId: string) => boolean;
+  commitKnowledgeBaseObservation: (
+    conversationId: string,
+    observation: KnowledgeBaseObservationDto,
+  ) => void;
+  rollbackPendingKnowledgeBaseTurn: (
+    conversationId: string,
+    clientRequestId: string,
+  ) => void;
   updateTitle: (conversationId: string, title: string) => void;
   deleteConversation: (id: string) => void;
   discardConversationLocally: (id: string) => void;
@@ -517,6 +1259,12 @@ export function ConversationProvider({
   const syncSnapshotRef = useRef(syncSnapshotMutation.mutateAsync);
   const deleteRemoteRef = useRef(deleteMutation.mutateAsync);
   const projectAssignmentIdRef = useRef(projectAssignmentId);
+  const knowledgeBaseConversationIdsRef = useRef(new Set<string>());
+  const knowledgeBaseCoordinatorRef =
+    useRef<KnowledgeBasePollingCoordinator | null>(null);
+  const applyKnowledgeBaseObservationRef = useRef<
+    (conversationId: string, observation: KnowledgeBaseObservationDto) => void
+  >(() => undefined);
 
   listRefetchRef.current = listQuery.refetch;
   syncSnapshotRef.current = syncSnapshotMutation.mutateAsync;
@@ -596,6 +1344,132 @@ export function ConversationProvider({
     [replaceState],
   );
 
+  const commitKnowledgeBaseObservation = useCallback(
+    (conversationId: string, observation: KnowledgeBaseObservationDto) => {
+      const before = stateRef.current.conversations.find(
+        (conversation) => conversation.id === conversationId,
+      );
+      const nextState = conversationReducer(stateRef.current, {
+        type: "COMMIT_KB_OBSERVATION",
+        payload: { conversationId, observation },
+      });
+      const after = nextState.conversations.find(
+        (conversation) => conversation.id === conversationId,
+      );
+      if (!after || after === before) return;
+      replaceState(nextState);
+      if (canSyncRef.current) {
+        syncQueueRef.current!.enqueueSnapshot(
+          prepareConversationForCloud(after),
+        );
+      }
+      const progress = observation.progress ?? observation.interaction.progress;
+      if (progress) {
+        window.dispatchEvent(
+          new CustomEvent("frontmind:knowledge-progress-updated", {
+            detail: progress,
+          }),
+        );
+      }
+    },
+    [replaceState],
+  );
+  applyKnowledgeBaseObservationRef.current = commitKnowledgeBaseObservation;
+
+  const registerKnowledgeBaseConversation = useCallback(
+    (conversationId: string) => {
+      if (!conversationId) return;
+      knowledgeBaseConversationIdsRef.current.add(conversationId);
+      const conversation = stateRef.current.conversations.find(
+        (candidate) => candidate.id === conversationId,
+      );
+      if (conversation && !conversation.knowledgeBase) {
+        const nextState = conversationReducer(stateRef.current, {
+          type: "MARK_KNOWLEDGE_BASE",
+          payload: { conversationId },
+        });
+        replaceState(nextState);
+      }
+      knowledgeBaseCoordinatorRef.current?.register(conversationId);
+    },
+    [replaceState],
+  );
+
+  const wakeKnowledgeBaseConversation = useCallback(
+    (conversationId: string) => {
+      registerKnowledgeBaseConversation(conversationId);
+      knowledgeBaseCoordinatorRef.current?.wake(conversationId);
+    },
+    [registerKnowledgeBaseConversation],
+  );
+
+  const isKnowledgeBaseConversation = useCallback(
+    (conversationId: string) =>
+      knowledgeBaseConversationIdsRef.current.has(conversationId) ||
+      Boolean(
+        stateRef.current.conversations.find(
+          (conversation) => conversation.id === conversationId,
+        )?.knowledgeBase,
+      ),
+    [],
+  );
+
+  const rollbackPendingKnowledgeBaseTurn = useCallback(
+    (conversationId: string, clientRequestId: string) => {
+      commit(
+        {
+          type: "ROLLBACK_KB_PENDING_TURN",
+          payload: { conversationId, clientRequestId },
+        },
+        [conversationId],
+      );
+    },
+    [commit],
+  );
+
+  useEffect(() => {
+    const coordinator = new KnowledgeBasePollingCoordinator({
+      observe: (conversationId, signal) =>
+        reconcileKnowledgeBaseObservation({ conversationId }, signal),
+      apply: (conversationId, observation) =>
+        applyKnowledgeBaseObservationRef.current(conversationId, observation),
+      onTransientError: (conversationId, error) => {
+        console.warn("[KnowledgeBaseCoordinator] reconcile deferred", {
+          conversationId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+      onPermanentError: (conversationId, error) => {
+        console.warn("[KnowledgeBaseCoordinator] reconcile stopped", {
+          conversationId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
+    knowledgeBaseCoordinatorRef.current = coordinator;
+    for (const conversationId of knowledgeBaseConversationIdsRef.current) {
+      coordinator.register(conversationId);
+      coordinator.wake(conversationId);
+    }
+
+    const wakeAll = () => coordinator.wakeAll();
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") wakeAll();
+    };
+    window.addEventListener("focus", wakeAll);
+    window.addEventListener("online", wakeAll);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      window.removeEventListener("focus", wakeAll);
+      window.removeEventListener("online", wakeAll);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      coordinator.dispose();
+      if (knowledgeBaseCoordinatorRef.current === coordinator) {
+        knowledgeBaseCoordinatorRef.current = null;
+      }
+    };
+  }, [projectAssignmentId, userId]);
+
   const hydrateForUser = useCallback(
     async (expectedUserId: number, initial: boolean) => {
       const generation = ++hydrationGenerationRef.current;
@@ -614,9 +1488,16 @@ export function ConversationProvider({
           return;
         }
 
-        const remoteConversations = (result.data ?? []).map(
-          normalizeConversation,
-        );
+        const remoteConversations = (result.data ?? [])
+          .map(normalizeConversation)
+          .map((remote) =>
+            mergeKnowledgeBaseHydration(
+              stateRef.current.conversations.find(
+                (local) => local.id === remote.id,
+              ),
+              remote,
+            ),
+          );
         // The workspace is already visible while its first conversation query
         // is in flight. Preserve brand-new local conversations created during
         // that short window, then persist them once hydration succeeds.
@@ -675,6 +1556,8 @@ export function ConversationProvider({
     syncQueueRef.current!.reset();
     canSyncRef.current = false;
     accountIdRef.current = userId;
+    knowledgeBaseCoordinatorRef.current?.reset();
+    knowledgeBaseConversationIdsRef.current.clear();
     replaceState(EMPTY_STATE);
     setSyncError(null);
 
@@ -780,6 +1663,18 @@ export function ConversationProvider({
 
   const deleteConversation = useCallback(
     (id: string) => {
+      const conversation = stateRef.current.conversations.find(
+        (candidate) => candidate.id === id,
+      );
+      if (
+        conversation &&
+        (conversation.knowledgeBase?.initialized ||
+          hasServerOwnedKnowledgeBaseMessages(conversation))
+      ) {
+        return;
+      }
+      knowledgeBaseConversationIdsRef.current.delete(id);
+      knowledgeBaseCoordinatorRef.current?.unregister(id);
       commit({ type: "DELETE_CONVERSATION", payload: id });
       if (canSyncRef.current) syncQueueRef.current!.enqueueDelete(id);
     },
@@ -788,8 +1683,10 @@ export function ConversationProvider({
 
   const discardConversationLocally = useCallback(
     (id: string) => {
+      knowledgeBaseConversationIdsRef.current.delete(id);
+      knowledgeBaseCoordinatorRef.current?.unregister(id);
       const nextState = conversationReducer(stateRef.current, {
-        type: "DELETE_CONVERSATION",
+        type: "DISCARD_CONVERSATION_LOCALLY",
         payload: id,
       });
       replaceState(nextState);
@@ -869,6 +1766,11 @@ export function ConversationProvider({
         addMessage,
         updateStatus,
         updateAssistantMessages,
+        registerKnowledgeBaseConversation,
+        wakeKnowledgeBaseConversation,
+        isKnowledgeBaseConversation,
+        commitKnowledgeBaseObservation,
+        rollbackPendingKnowledgeBaseTurn,
         updateTitle,
         deleteConversation,
         discardConversationLocally,
@@ -1215,15 +2117,9 @@ function outputResourceDescriptor(value: Record<string, unknown>) {
   ).trim();
   const fileUrl =
     rawUrl ||
-    (fileId
-      ? `/api/frontmind/v1/files/${encodeURIComponent(fileId)}`
-      : "");
+    (fileId ? `/api/frontmind/v1/files/${encodeURIComponent(fileId)}` : "");
   const fileName = String(
-    value.fileName ||
-      value.file_name ||
-      value.filename ||
-      value.name ||
-      "file",
+    value.fileName || value.file_name || value.filename || value.name || "file",
   );
   const mimeType = String(
     value.mimeType || value.mime_type || value.content_type || "",
@@ -1403,8 +2299,7 @@ function _parseOutputMessagesInner(
                   {
                     fileUrl: descriptor.fileUrl,
                     fileName: descriptor.fileName,
-                    mimeType:
-                      descriptor.mimeType || "application/octet-stream",
+                    mimeType: descriptor.mimeType || "application/octet-stream",
                   },
                 ],
               }),
@@ -1486,8 +2381,7 @@ function _parseOutputMessagesInner(
           // Normalize field names: API may return snake_case or camelCase
           const c: any = content;
           const contentType = c.type || "";
-          const { fileUrl, fileName, mimeType } =
-            outputResourceDescriptor(c);
+          const { fileUrl, fileName, mimeType } = outputResourceDescriptor(c);
           const rawTextValue = c.text ?? c.output_text ?? c.value ?? null;
           const textValue =
             typeof rawTextValue === "string"

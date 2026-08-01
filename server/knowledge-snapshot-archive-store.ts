@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink } from "node:fs/promises";
 import path from "node:path";
+
+import { installImmutableFileAtomically } from "./atomic-immutable-file";
 
 export const MAX_KNOWLEDGE_SNAPSHOT_ARCHIVE_BYTES = 250 * 1024 * 1024;
 
@@ -128,10 +130,11 @@ export async function persistKnowledgeSnapshotArchive(input: {
   });
   const absolutePath = archiveAbsolutePath(input.userId, input.snapshotId);
   await mkdir(path.dirname(absolutePath), { recursive: true });
-  try {
-    await writeFile(absolutePath, input.buffer, { flag: "wx", mode: 0o600 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  const installResult = await installImmutableFileAtomically({
+    target: absolutePath,
+    buffer: input.buffer,
+  });
+  if (installResult === "exists") {
     const existing = await readFile(absolutePath);
     assertArchiveBytes({
       buffer: existing,

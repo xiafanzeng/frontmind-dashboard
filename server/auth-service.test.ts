@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   apiCredentials,
   apiKeyOwnership,
+  conversationTurns,
+  knowledgeBaseBuilds,
   upstreamResources,
   users,
 } from "../drizzle/schema";
@@ -15,6 +17,7 @@ import {
   deleteManagedUser,
   decryptApiKey,
   encryptApiKey,
+  getDecryptedCredentialForKnowledgeBaseReservation,
   getApiKeyFingerprint,
   hashPassword,
   hashSessionToken,
@@ -28,6 +31,18 @@ import {
 } from "./presales-service";
 
 const originalMasterKey = process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY;
+
+function mockLockedRows<T>(rows: T[]) {
+  return {
+    for: vi.fn().mockResolvedValue(rows),
+    then<TResult1 = T[], TResult2 = never>(
+      resolve?: ((value: T[]) => TResult1 | PromiseLike<TResult1>) | null,
+      reject?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+    ) {
+      return Promise.resolve(rows).then(resolve, reject);
+    },
+  };
+}
 
 describe("password authentication primitives", () => {
   it("normalizes usernames consistently", () => {
@@ -209,6 +224,114 @@ describe("API credential encryption", () => {
     ).toBe(false);
   });
 
+  it("uses a locked historical KB reservation as the only authority after owner A is replaced by B", async () => {
+    const credentialId = randomUUID();
+    const turnId = randomUUID();
+    const buildId = randomUUID();
+    const apiKey = "sk-historical-owner-a-reservation";
+    const encrypted = encryptApiKey(7, credentialId, apiKey);
+    const credential = {
+      id: credentialId,
+      userId: 7,
+      version: 3,
+      ...encrypted,
+      fingerprint: getApiKeyFingerprint(apiKey),
+      status: "retired",
+      validationStatus: "verified",
+      verifiedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      retiredAt: new Date(),
+      deletedAt: null,
+    };
+    const build = {
+      id: buildId,
+      userId: 42,
+      generation: 2,
+      activeTurnId: turnId,
+      status: "researching",
+    };
+    const turn = {
+      id: turnId,
+      userId: 42,
+      buildId,
+      buildGeneration: 2,
+      apiCredentialId: credentialId,
+      status: "running",
+    };
+    const lockOrder: string[] = [];
+    const executor = {
+      transaction: async (run: (tx: any) => Promise<unknown>) =>
+        run({
+          select: () => ({
+            from: (table: unknown) => ({
+              where: () => ({
+                limit: () => ({
+                  for: async () => {
+                    if (table === apiCredentials) {
+                      lockOrder.push("credential");
+                      return [credential];
+                    }
+                    if (table === knowledgeBaseBuilds) {
+                      lockOrder.push("build");
+                      return [build];
+                    }
+                    if (table === conversationTurns) {
+                      lockOrder.push("turn");
+                      return [turn];
+                    }
+                    return [];
+                  },
+                }),
+              }),
+            }),
+          }),
+        }),
+    };
+
+    await expect(
+      getDecryptedCredentialForKnowledgeBaseReservation(
+        {
+          userId: 42,
+          turnId,
+          buildId,
+          buildGeneration: 2,
+          apiCredentialId: credentialId,
+        },
+        executor,
+      ),
+    ).resolves.toMatchObject({ id: credentialId, userId: 7, apiKey });
+    expect(lockOrder).toEqual(["credential", "build", "turn"]);
+
+    build.activeTurnId = randomUUID();
+    await expect(
+      getDecryptedCredentialForKnowledgeBaseReservation(
+        {
+          userId: 42,
+          turnId,
+          buildId,
+          buildGeneration: 2,
+          apiCredentialId: credentialId,
+        },
+        executor,
+      ),
+    ).resolves.toBeNull();
+    build.activeTurnId = turnId;
+    credential.status = "deleted";
+    await expect(
+      getDecryptedCredentialForKnowledgeBaseReservation(
+        {
+          userId: 42,
+          turnId,
+          buildId,
+          buildGeneration: 2,
+          apiCredentialId: credentialId,
+        },
+        executor,
+      ),
+    ).resolves.toBeNull();
+  });
+
   it("allows an account credential to independently store the website's raw Key", () => {
     const apiKey = "sk-shared-between-account-and-website";
     const accountCredentialId = randomUUID();
@@ -246,6 +369,28 @@ describe("API credential encryption", () => {
     const executor = {
       select: vi.fn(() => ({
         from: vi.fn((table) => {
+          if (table === conversationTurns) {
+            return {
+              innerJoin: vi.fn(() => ({
+                where: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([]),
+                  })),
+                })),
+              })),
+              where: vi.fn(() => mockLockedRows([])),
+            };
+          }
+          if (table === upstreamResources) {
+            return { where: vi.fn(() => mockLockedRows([])) };
+          }
+          if (table === knowledgeBaseBuilds) {
+            return {
+              where: vi.fn(() => ({
+                for: vi.fn().mockResolvedValue([]),
+              })),
+            };
+          }
           expect(table).toBe(apiCredentials);
           return {
             where: vi.fn(() => ({
@@ -292,6 +437,333 @@ describe("API credential encryption", () => {
       validationStatus: "unverified",
     });
     expect(JSON.stringify(inserted[0])).not.toContain("sk-");
+  });
+
+  it("blocks credential revocation while an authoritative knowledge-base turn is recoverable", async () => {
+    const active = {
+      id: randomUUID(),
+      userId: 42,
+      version: 3,
+      status: "active",
+      encryptedKey: "encrypted",
+    };
+    const update = vi.fn();
+    const insert = vi.fn();
+    const executor = {
+      select: vi.fn(() => ({
+        from: vi.fn((table) => {
+          if (table === apiCredentials) {
+            return {
+              where: vi.fn(() => ({
+                orderBy: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([active]),
+                  })),
+                })),
+              })),
+            };
+          }
+          expect(table).toBe(conversationTurns);
+          return {
+            innerJoin: vi.fn(() => ({
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([{ turnId: "turn-1" }]),
+                })),
+              })),
+            })),
+          };
+        }),
+      })),
+      update,
+      insert,
+    };
+
+    await expect(
+      deleteActiveApiCredentialInTransaction({
+        executor,
+        userId: 42,
+        now: new Date("2026-07-30T12:00:00.000Z"),
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("知识库轮次"),
+    });
+    expect(update).not.toHaveBeenCalled();
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("preserves a Key while any upstream task or file still depends on it", async () => {
+    const active = {
+      id: randomUUID(),
+      userId: 42,
+      version: 3,
+      status: "active",
+      encryptedKey: "still-decryptable",
+    };
+    const build = {
+      id: "build-historical",
+      userId: 84,
+      generation: 1,
+      status: "protocol_error",
+      protocolErrorCode: "PACKAGE_REBIND_REQUIRED",
+      skillVersion: "4",
+      upstreamTaskId: "task-historical",
+      packageTaskId: "task-historical",
+      packageFileId: "file-historical-zip",
+      packageStorageKey: null,
+      packageArchiveSha256: null,
+      packageSizeBytes: null,
+      logoStorageKey: null,
+      logoSha256: null,
+      logoBytes: null,
+    };
+    const update = vi.fn();
+    const insert = vi.fn();
+    const executor = {
+      select: vi.fn(() => ({
+        from: vi.fn((table) => {
+          if (table === apiCredentials) {
+            return {
+              where: vi.fn(() => ({
+                orderBy: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([active]),
+                  })),
+                })),
+              })),
+            };
+          }
+          if (table === knowledgeBaseBuilds) {
+            return {
+              where: vi.fn(() => ({
+                for: vi.fn().mockResolvedValue([build]),
+              })),
+            };
+          }
+          if (table === upstreamResources) {
+            return {
+              where: vi.fn(() =>
+                mockLockedRows([
+                  { kind: "task", upstreamId: "task-historical" },
+                ]),
+              ),
+            };
+          }
+          expect(table).toBe(conversationTurns);
+          return {
+            innerJoin: vi.fn(() => ({
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([]),
+                })),
+              })),
+            })),
+            where: vi.fn(() =>
+              mockLockedRows([
+                {
+                  buildId: build.id,
+                  buildGeneration: build.generation,
+                  upstreamTaskId: build.upstreamTaskId,
+                },
+              ]),
+            ),
+          };
+        }),
+      })),
+      update,
+      insert,
+    };
+
+    await expect(
+      deleteActiveApiCredentialInTransaction({
+        executor,
+        userId: 42,
+        now: new Date("2026-08-02T00:00:00.000Z"),
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("仍绑定已有任务或文件"),
+    });
+    expect(active.encryptedKey).toBe("still-decryptable");
+    expect(update).not.toHaveBeenCalled();
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("allows cryptoshredding after authoritative ZIP and Logo rebind has completed", async () => {
+    const active = {
+      id: randomUUID(),
+      userId: 42,
+      version: 3,
+      status: "active",
+      encryptedKey: "still-decryptable",
+    };
+    const inserted: Array<Record<string, unknown>> = [];
+    const executor = {
+      select: vi.fn(() => ({
+        from: vi.fn((table) => {
+          if (table === apiCredentials) {
+            return {
+              where: vi.fn(() => ({
+                orderBy: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([active]),
+                  })),
+                })),
+              })),
+            };
+          }
+          if (table === knowledgeBaseBuilds) {
+            return {
+              where: vi.fn(() => ({
+                for: vi.fn().mockResolvedValue([
+                  {
+                    id: "build-historical",
+                    generation: 1,
+                    status: "ready_to_publish",
+                    protocolErrorCode: null,
+                    skillVersion: "4",
+                    upstreamTaskId: "task-historical",
+                    packageTaskId: "task-historical",
+                    packageFileId: "file-historical-zip",
+                    packageStorageKey: "builds/42/package.zip",
+                    packageArchiveSha256: "a".repeat(64),
+                    packageSizeBytes: 4096,
+                    logoStorageKey: "builds/42/logo.bin",
+                    logoSha256: "b".repeat(64),
+                    logoBytes: 512,
+                  },
+                ]),
+              })),
+            };
+          }
+          if (table === upstreamResources) {
+            return { where: vi.fn(() => mockLockedRows([])) };
+          }
+          expect(table).toBe(conversationTurns);
+          return {
+            innerJoin: vi.fn(() => ({
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([]),
+                })),
+              })),
+            })),
+            where: vi.fn(() => mockLockedRows([])),
+          };
+        }),
+      })),
+      update: vi.fn(() => ({
+        set: vi.fn((values) => ({
+          where: vi.fn(async () => Object.assign(active, values)),
+        })),
+      })),
+      insert: vi.fn(() => ({
+        values: vi.fn(async (values) => inserted.push(values)),
+      })),
+    };
+
+    await expect(
+      deleteActiveApiCredentialInTransaction({
+        executor,
+        userId: 42,
+        now: new Date("2026-08-02T00:01:00.000Z"),
+      }),
+    ).resolves.toEqual({ version: 4, deleted: true });
+    expect(active.status).toBe("deleted");
+    expect(active.encryptedKey).not.toBe("still-decryptable");
+    expect(inserted).toHaveLength(1);
+  });
+
+  it("allows deleting an unreferenced active replacement while recovery remains pinned to a retired version", async () => {
+    const activeReplacement = {
+      id: "credential-active-v4",
+      userId: 42,
+      version: 4,
+      status: "active",
+      encryptedKey: "replacement-ciphertext",
+    };
+    const inserted: Array<Record<string, unknown>> = [];
+    const executor = {
+      select: vi.fn(() => ({
+        from: vi.fn((table) => {
+          if (table === apiCredentials) {
+            return {
+              where: vi.fn(() => ({
+                orderBy: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([activeReplacement]),
+                  })),
+                })),
+              })),
+            };
+          }
+          if (table === knowledgeBaseBuilds) {
+            return {
+              where: vi.fn(() => ({
+                for: vi.fn().mockResolvedValue([
+                  {
+                    id: "build-historical",
+                    generation: 1,
+                    status: "protocol_error",
+                    protocolErrorCode: "PACKAGE_REBIND_REQUIRED",
+                    skillVersion: "4",
+                    upstreamTaskId: "task-retired-key",
+                    packageTaskId: "task-retired-key",
+                    packageFileId: "file-retired-key",
+                    packageStorageKey: null,
+                    packageArchiveSha256: null,
+                    packageSizeBytes: null,
+                    logoStorageKey: null,
+                    logoSha256: null,
+                    logoBytes: null,
+                  },
+                ]),
+              })),
+            };
+          }
+          if (table === upstreamResources) {
+            return {
+              where: vi.fn(() =>
+                // The task/file rows belong to the retained v3 credential,
+                // not the current replacement selected above.
+                mockLockedRows([]),
+              ),
+            };
+          }
+          expect(table).toBe(conversationTurns);
+          return {
+            innerJoin: vi.fn(() => ({
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([]),
+                })),
+              })),
+            })),
+            where: vi.fn(() => mockLockedRows([])),
+          };
+        }),
+      })),
+      update: vi.fn(() => ({
+        set: vi.fn((values) => ({
+          where: vi.fn(async () => Object.assign(activeReplacement, values)),
+        })),
+      })),
+      insert: vi.fn(() => ({
+        values: vi.fn(async (values) => inserted.push(values)),
+      })),
+    };
+
+    await expect(
+      deleteActiveApiCredentialInTransaction({
+        executor,
+        userId: 42,
+        now: new Date("2026-08-02T00:02:00.000Z"),
+      }),
+    ).resolves.toEqual({ version: 5, deleted: true });
+    expect(activeReplacement.status).toBe("deleted");
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0]).toMatchObject({ version: 5, status: "deleted" });
   });
 
   it("fails closed when the encryption key is missing or malformed", () => {

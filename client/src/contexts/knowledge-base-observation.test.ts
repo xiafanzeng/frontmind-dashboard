@@ -1,0 +1,467 @@
+import { describe, expect, it } from "vitest";
+import type { KnowledgeBaseObservationDto } from "@/lib/knowledge-progress";
+import {
+  knowledgeBasePresentationMessagePublicId,
+  knowledgeBaseUserMessagePublicId,
+} from "@shared/knowledge-base-message";
+import {
+  applyKnowledgeBaseObservation,
+  currentKnowledgeBasePresentationReady,
+  mergeKnowledgeBaseHydration,
+  mergeServerOwnedKnowledgeBaseMessages,
+  type Conversation,
+} from "./ConversationContext";
+
+function presentationKey(revision: number) {
+  return revision.toString(16).padStart(64, "0");
+}
+
+function presentationMessageId(revision: number) {
+  return knowledgeBasePresentationMessagePublicId(presentationKey(revision));
+}
+
+function progress(revision: number, leafId: string) {
+  return {
+    build: {
+      id: "build",
+      conversationId: "conversation",
+      companyName: "FrontMind",
+      status: "confirming" as const,
+      revision,
+      currentLeafId: leafId,
+      protocolError: null,
+      updatedAt: revision,
+    },
+    summary: {
+      total: 3,
+      handled: revision,
+      confirmed: revision,
+      directPrefilled: 0,
+      pending: 1,
+      current: 1,
+      needsVerification: 0,
+      overallPercent: revision * 10,
+    },
+    branches: [],
+    packageAllowed: false,
+  };
+}
+
+function observation(
+  epoch: number,
+  turnId: string,
+  revision: number,
+  leafId: string,
+  body: string | null,
+): KnowledgeBaseObservationDto {
+  const currentProgress = progress(revision, leafId);
+  return {
+    stateEpoch: epoch,
+    generation: 1,
+    authoritativeTaskId: `task-${turnId}`,
+    activeTurn: {
+      id: turnId,
+      clientRequestId: `request-${turnId}`,
+      operationKey: `operation-${turnId}`,
+      operationType: "confirm",
+      status: "completed",
+      buildGeneration: 1,
+      expectedRevision: revision,
+      expectedLeafId: leafId,
+      startedAt: 1,
+      completedAt: 2,
+      updatedAt: 2,
+    },
+    interaction: {
+      progress: currentProgress,
+      interactionState: "awaiting_input",
+      canReply: true,
+      canPublish: false,
+      lockReason: null,
+    },
+    approvedPresentation: body
+      ? {
+          turnId,
+          clientRequestId: `request-${turnId}`,
+          presentationKey: presentationKey(revision),
+          revision,
+          leafId,
+          visibleMarkdown: body,
+          contentSha256: `sha-${turnId}`,
+          imageState: "no_eligible_asset",
+          resources: [],
+        }
+      : null,
+    package: null,
+    notice: null,
+    conversationVersion: epoch,
+  };
+}
+
+function conversation(): Conversation {
+  return {
+    id: "conversation",
+    title: "企业知识库构建",
+    status: "running",
+    taskId: "task-old",
+    createdAt: 1,
+    updatedAt: 1,
+    messages: [
+      {
+        id: "user-turn-1",
+        role: "user",
+        content: "确认",
+        timestamp: 1,
+        knowledgeBase: {
+          kind: "pending_user",
+          clientRequestId: "request-turn-1",
+        },
+      },
+    ],
+  };
+}
+
+describe("authoritative KB observation reducer", () => {
+  it("keeps awaiting_input locked when the server has not approved a body", () => {
+    const next = applyKnowledgeBaseObservation(
+      conversation(),
+      observation(1, "turn-1", 1, "1.2", null),
+    );
+
+    expect(next.status).toBe("running");
+    expect(next.knowledgeBase?.canReply).toBe(false);
+    expect(currentKnowledgeBasePresentationReady(next, 1, "1.2")).toBe(false);
+    expect(next.messages).toHaveLength(1);
+    expect(next.messages[0]).toMatchObject({
+      id: knowledgeBaseUserMessagePublicId("turn-1"),
+      knowledgeBase: {
+        turnId: "turn-1",
+        serverOwned: true,
+      },
+    });
+  });
+
+  it("renders and unlocks an approved body after the successful reservation is released", () => {
+    const released = {
+      ...observation(2, "turn-1", 1, "1.2", "## 1.2\n已批准正文"),
+      activeTurn: null,
+    };
+    const next = applyKnowledgeBaseObservation(conversation(), released);
+
+    expect(next.status).toBe("awaiting_input");
+    expect(next.knowledgeBase?.activeTurnId).toBeNull();
+    expect(next.knowledgeBase?.presentationTurnId).toBe("turn-1");
+    expect(next.knowledgeBase?.canReply).toBe(true);
+    expect(currentKnowledgeBasePresentationReady(next, 1, "1.2")).toBe(true);
+    expect(next.messages.at(-1)?.content).toContain("已批准正文");
+    expect(next.messages.map((message) => message.id)).toEqual([
+      knowledgeBaseUserMessagePublicId("turn-1"),
+      presentationMessageId(1),
+    ]);
+    expect(
+      next.messages.every((message) => message.knowledgeBase?.serverOwned),
+    ).toBe(true);
+  });
+
+  it("keeps a network-unknown pending request unbound when only the old presentation is observed", () => {
+    const releasedOld = {
+      ...observation(2, "turn-1", 1, "1.2", "## 1.2\n旧的已批准正文"),
+      activeTurn: null,
+    };
+    const current = applyKnowledgeBaseObservation(conversation(), releasedOld);
+    const withUnknownRequest: Conversation = {
+      ...current,
+      messages: [
+        ...current.messages,
+        {
+          id: "optimistic-request-2",
+          role: "user",
+          content: "确认",
+          timestamp: 3,
+          knowledgeBase: {
+            kind: "pending_user",
+            clientRequestId: "request-turn-2",
+            serverOwned: false,
+          },
+        },
+      ],
+    };
+
+    const next = applyKnowledgeBaseObservation(withUnknownRequest, releasedOld);
+    const pending = next.messages.find(
+      (message) => message.knowledgeBase?.clientRequestId === "request-turn-2",
+    );
+
+    expect(pending).toMatchObject({
+      id: "optimistic-request-2",
+      knowledgeBase: {
+        clientRequestId: "request-turn-2",
+        serverOwned: false,
+      },
+    });
+    expect(pending?.knowledgeBase?.turnId).toBeUndefined();
+    expect(
+      next.messages.findIndex(
+        (message) =>
+          message.knowledgeBase?.presentationKey === presentationKey(1),
+      ),
+    ).toBeLessThan(
+      next.messages.findIndex(
+        (message) =>
+          message.knowledgeBase?.clientRequestId === "request-turn-2",
+      ),
+    );
+    expect(next.messages.at(-1)?.id).toBe("optimistic-request-2");
+  });
+
+  it("does not bind a newer pending request when an older active turn arrives late", () => {
+    const withNewPending = conversation();
+    withNewPending.messages.push({
+      id: "optimistic-request-2",
+      role: "user",
+      content: "确认",
+      timestamp: 2,
+      knowledgeBase: {
+        kind: "pending_user",
+        clientRequestId: "request-turn-2",
+        serverOwned: false,
+      },
+    });
+
+    const next = applyKnowledgeBaseObservation(
+      withNewPending,
+      observation(2, "turn-1", 1, "1.2", "## 1.2\n旧轮正文"),
+    );
+    const newerPending = next.messages.find(
+      (message) => message.knowledgeBase?.clientRequestId === "request-turn-2",
+    );
+
+    expect(newerPending?.knowledgeBase?.serverOwned).not.toBe(true);
+    expect(newerPending?.knowledgeBase?.turnId).toBeUndefined();
+    expect(
+      next.messages.find(
+        (message) =>
+          message.knowledgeBase?.clientRequestId === "request-turn-1",
+      )?.knowledgeBase?.turnId,
+    ).toBe("turn-1");
+  });
+
+  it("binds an accepted new turn without moving the previous approved presentation onto it", () => {
+    const releasedOld = {
+      ...observation(2, "turn-1", 1, "1.2", "## 1.2\n旧的已批准正文"),
+      activeTurn: null,
+    };
+    const current = applyKnowledgeBaseObservation(conversation(), releasedOld);
+    const withNewPending: Conversation = {
+      ...current,
+      messages: [
+        ...current.messages,
+        {
+          id: "optimistic-request-2",
+          role: "user",
+          content: "确认",
+          timestamp: 3,
+          knowledgeBase: {
+            kind: "pending_user",
+            clientRequestId: "request-turn-2",
+            serverOwned: false,
+          },
+        },
+      ],
+    };
+    const acceptedTurn = observation(3, "turn-2", 1, "1.2", null);
+    const executing = {
+      ...releasedOld,
+      stateEpoch: 3,
+      activeTurn: acceptedTurn.activeTurn,
+      interaction: {
+        ...releasedOld.interaction,
+        interactionState: "executing" as const,
+        canReply: false,
+      },
+    };
+
+    const next = applyKnowledgeBaseObservation(withNewPending, executing);
+    const newUserIndex = next.messages.findIndex(
+      (message) => message.knowledgeBase?.clientRequestId === "request-turn-2",
+    );
+    const oldPresentationIndex = next.messages.findIndex(
+      (message) =>
+        message.knowledgeBase?.presentationKey === presentationKey(1),
+    );
+
+    expect(next.messages[newUserIndex]?.knowledgeBase).toMatchObject({
+      turnId: "turn-2",
+      serverOwned: true,
+    });
+    expect(oldPresentationIndex).toBeLessThan(newUserIndex);
+    expect(next.messages[oldPresentationIndex]?.knowledgeBase?.turnId).toBe(
+      "turn-1",
+    );
+  });
+
+  it("rejects an old turn arriving after a newer approved presentation", () => {
+    const firstUser = conversation();
+    firstUser.messages.push({
+      id: "user-turn-2",
+      role: "user",
+      content: "确认",
+      timestamp: 2,
+      knowledgeBase: {
+        kind: "pending_user",
+        clientRequestId: "request-turn-2",
+      },
+    });
+    const current = applyKnowledgeBaseObservation(
+      firstUser,
+      observation(2, "turn-2", 2, "1.3", "## 1.3\n新正文"),
+    );
+    const stale = applyKnowledgeBaseObservation(
+      current,
+      observation(1, "turn-1", 1, "1.2", "## 1.2\n旧正文"),
+    );
+
+    expect(stale).toBe(current);
+    expect(stale.messages.at(-1)?.content).toContain("新正文");
+    expect(stale.messages.at(-1)?.content).not.toContain("旧正文");
+  });
+
+  it("deduplicates a repeated notice without creating assistant error bubbles", () => {
+    const failed = {
+      ...observation(3, "turn-1", 1, "1.2", null),
+      interaction: {
+        ...observation(3, "turn-1", 1, "1.2", null).interaction,
+        interactionState: "failed" as const,
+        canReply: false,
+      },
+      notice: {
+        key: "kb:turn-1:invalid-protocol",
+        code: "INVALID_PROTOCOL",
+        severity: "error" as const,
+        message: "本轮协议不完整，请重试。",
+        retryable: true,
+        turnId: "turn-1",
+        createdAt: 3,
+      },
+    };
+    const once = applyKnowledgeBaseObservation(conversation(), failed);
+    const twice = applyKnowledgeBaseObservation(once, failed);
+
+    expect(twice.knowledgeBase?.notice?.errorKey).toBe(
+      "kb:turn-1:invalid-protocol",
+    );
+    expect(twice.knowledgeBase?.notice?.retryable).toBe(true);
+    expect(twice.knowledgeBase?.revision).toBe(1);
+    expect(twice.knowledgeBase?.leafId).toBe("1.2");
+    expect(
+      twice.messages.filter((message) => message.role === "assistant"),
+    ).toHaveLength(0);
+  });
+
+  it("does not let a stale hydration response erase an approved node", () => {
+    const local = applyKnowledgeBaseObservation(
+      conversation(),
+      observation(2, "turn-1", 1, "1.2", "## 1.2\n已批准正文"),
+    );
+    const remote = {
+      ...conversation(),
+      status: "running" as const,
+      messages: [conversation().messages[0]],
+      updatedAt: local.updatedAt + 1,
+    };
+
+    const merged = mergeKnowledgeBaseHydration(local, remote);
+    expect(merged.status).toBe("awaiting_input");
+    expect(merged.messages.at(-1)?.content).toContain("已批准正文");
+    expect(merged.knowledgeBase?.stateEpoch).toBe(2);
+  });
+
+  it("keeps prior immutable history when hydration carries a newer KB epoch", () => {
+    const local = applyKnowledgeBaseObservation(
+      conversation(),
+      observation(2, "turn-1", 1, "1.2", "## 1.2\n第一节点"),
+    );
+    const remote = applyKnowledgeBaseObservation(
+      {
+        ...conversation(),
+        messages: [],
+      },
+      observation(3, "turn-2", 2, "1.3", "## 1.3\n第二节点"),
+    );
+
+    const merged = mergeKnowledgeBaseHydration(local, remote);
+    expect(merged.knowledgeBase?.stateEpoch).toBe(3);
+    expect(merged.messages.map((message) => message.id)).toEqual([
+      knowledgeBaseUserMessagePublicId("turn-1"),
+      presentationMessageId(1),
+      presentationMessageId(2),
+    ]);
+    expect(
+      merged.messages.map((message) => message.content).join("\n"),
+    ).toContain("第一节点");
+    expect(
+      merged.messages.map((message) => message.content).join("\n"),
+    ).toContain("第二节点");
+  });
+
+  it("preserves server-owned history even before client KB state is restored", () => {
+    const approved = applyKnowledgeBaseObservation(
+      conversation(),
+      observation(2, "turn-1", 1, "1.2", "## 1.2\n已批准正文"),
+    );
+    const localWithoutState = { ...approved, knowledgeBase: undefined };
+    const staleRemote = {
+      ...conversation(),
+      messages: [],
+      deletedMessageIds: [presentationMessageId(1)],
+      updatedAt: approved.updatedAt + 1,
+    };
+
+    const merged = mergeKnowledgeBaseHydration(localWithoutState, staleRemote);
+    expect(merged.messages.map((message) => message.id)).toEqual([
+      knowledgeBaseUserMessagePublicId("turn-1"),
+      presentationMessageId(1),
+    ]);
+    expect(merged.deletedMessageIds ?? []).not.toContain(
+      presentationMessageId(1),
+    );
+  });
+
+  it("does not replace a server-owned presentation with the same-id stale copy", () => {
+    const approved = applyKnowledgeBaseObservation(
+      conversation(),
+      observation(2, "turn-1", 1, "1.2", "## 1.2\n已批准正文"),
+    );
+    const presentation = approved.messages.at(-1)!;
+    const merged = mergeServerOwnedKnowledgeBaseMessages(
+      [presentation],
+      [
+        {
+          ...presentation,
+          content: "旧正文",
+          knowledgeBase: undefined,
+          timestamp: presentation.timestamp + 10,
+        },
+      ],
+    );
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.content).toContain("已批准正文");
+    expect(merged[0]?.knowledgeBase?.serverOwned).toBe(true);
+  });
+
+  it("rejects an older observation using durable presentation metadata as the floor", () => {
+    const current = applyKnowledgeBaseObservation(
+      conversation(),
+      observation(3, "turn-3", 3, "1.4", "## 1.4\n当前正文"),
+    );
+    const rehydratedWithoutState = { ...current, knowledgeBase: undefined };
+    const stale = applyKnowledgeBaseObservation(
+      rehydratedWithoutState,
+      observation(2, "turn-2", 2, "1.3", "## 1.3\n旧正文"),
+    );
+
+    expect(stale).toBe(rehydratedWithoutState);
+    expect(stale.messages.at(-1)?.content).toContain("当前正文");
+  });
+});

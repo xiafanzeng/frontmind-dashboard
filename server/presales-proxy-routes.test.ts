@@ -230,6 +230,130 @@ describe("presales create-time upload capability", () => {
     );
   });
 
+  it("replays one durable file id after the create response is lost, then tombstones cleanup", async () => {
+    const idempotencyKey =
+      "geo-custom-question-file:operation-hash:archive:0:v1";
+    const signedUrl =
+      "https://uploads.example.test/custom.zip?X-Amz-Signature=response-lost";
+    const create = vi.spyOn(axios, "post").mockResolvedValue({
+      status: 201,
+      data: {
+        id: "file-response-lost",
+        filename: "custom.zip",
+        status: "pending",
+        upload_url: signedUrl,
+        upload_expires_at: new Date(Date.now() + 180_000).toISOString(),
+      },
+    });
+    const request = {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-frontmind-service-token": token,
+      },
+      body: JSON.stringify({
+        filename: "custom.zip",
+        mimeType: "application/zip",
+        sizeBytes: 3,
+        idempotencyKey,
+      }),
+    } as const;
+
+    // The first server fully commits the response, but the Website caller can
+    // lose it before reading the file id.
+    await withServer(async (baseUrl) => {
+      const lost = await fetch(`${baseUrl}/files`, request);
+      expect(lost.status).toBe(201);
+    });
+
+    // Starting a fresh HTTP server exercises disk replay rather than a module
+    // cache. Rotate the active credential before retrying: the immutable
+    // completed operation must still return its original file id and must not
+    // invoke the upstream create endpoint in the new account.
+    vi.mocked(getActivePresalesCredential).mockResolvedValue({
+      id: "credential-2",
+      version: 2,
+      apiKey: "sk-upload-file-rotated",
+      fingerprint: "fingerprint-rotated",
+      status: "active",
+      verifiedAt: new Date(),
+    });
+    await withServer(async (baseUrl) => {
+      const replay = await fetch(`${baseUrl}/files`, request);
+      expect(replay.status).toBe(200);
+      expect(replay.headers.get("idempotent-replayed")).toBe("true");
+      await expect(replay.json()).resolves.toMatchObject({
+        id: "file-response-lost",
+        filename: "custom.zip",
+        proxy_upload_ticket: expect.stringMatching(/^v1\./),
+      });
+
+      vi.spyOn(axios, "delete").mockResolvedValue({ status: 204, data: "" });
+      const cleaned = await fetch(`${baseUrl}/files/file-response-lost`, {
+        method: "DELETE",
+        headers: { "x-frontmind-service-token": token },
+      });
+      expect(cleaned.status).toBe(204);
+
+      const lateReplay = await fetch(`${baseUrl}/files`, request);
+      expect(lateReplay.status).toBe(410);
+      await expect(lateReplay.json()).resolves.toEqual({
+        error: {
+          code: "FILE_OPERATION_RETIRED",
+          message: "该文件创建操作已完成清理，不能再次执行",
+        },
+      });
+    });
+
+    expect(create).toHaveBeenCalledOnce();
+    expect(create.mock.calls[0]?.[1]).toEqual({ filename: "custom.zip" });
+    expect(JSON.stringify(create.mock.calls[0]?.[1])).not.toContain(
+      idempotencyKey,
+    );
+    expect(create.mock.calls[0]?.[2]).toMatchObject({
+      headers: {
+        "Idempotency-Key": expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
+  });
+
+  it("keeps an ambiguous file-create lease without logging its key or body", async () => {
+    const idempotencyKey =
+      "geo-custom-question-file:secret-operation:skill:0:v1";
+    const filename = "secret-customer-contract.skill.zip";
+    const create = vi
+      .spyOn(axios, "post")
+      .mockRejectedValue(new Error(`timeout ${idempotencyKey} ${filename}`));
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const request = {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-frontmind-service-token": token,
+      },
+      body: JSON.stringify({
+        filename,
+        mimeType: "application/zip",
+        sizeBytes: 3,
+        idempotencyKey,
+      }),
+    } as const;
+
+    await withServer(async (baseUrl) => {
+      const unknown = await fetch(`${baseUrl}/files`, request);
+      expect(unknown.status).toBe(502);
+
+      const immediateRetry = await fetch(`${baseUrl}/files`, request);
+      expect(immediateRetry.status).toBe(425);
+      expect(immediateRetry.headers.get("retry-after")).toBeTruthy();
+    });
+
+    expect(create).toHaveBeenCalledOnce();
+    const logged = JSON.stringify(log.mock.calls);
+    expect(logged).not.toContain(idempotencyKey);
+    expect(logged).not.toContain(filename);
+  });
+
   it("round-trips Website Broker bytes through durable local storage without calling an upstream download endpoint", async () => {
     const bytes = Buffer.from("zip");
     let storedBytes = Buffer.alloc(0);

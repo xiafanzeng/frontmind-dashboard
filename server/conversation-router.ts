@@ -1,11 +1,12 @@
 import { TRPCError } from "@trpc/server";
 import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
   apiCredentials,
   attachments,
   conversations,
+  conversationTurns,
   knowledgeBaseBuilds,
   knowledgeBaseConversationTombstones,
   knowledgeBaseResetRequests,
@@ -16,6 +17,10 @@ import {
   type MessageMetadata,
 } from "../drizzle/schema";
 import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
+import {
+  knowledgeBasePresentationMessagePublicId,
+  knowledgeBaseUserMessagePublicId,
+} from "../shared/knowledge-base-message";
 import { uniquifyOrderedIds } from "../shared/ordered-id";
 import {
   type AuthenticatedUser,
@@ -25,6 +30,7 @@ import {
 } from "./auth-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getDb } from "./db";
+import { knowledgeBaseMarkdownSha256 } from "./knowledge-base-package-validation";
 import { protectedProcedure, router } from "./_core/trpc";
 import { getUpstreamBaseUrl } from "./upstream-config";
 
@@ -46,6 +52,157 @@ const inlineImageSchema = z.object({
   alt: z.string().max(512).optional(),
 });
 
+const knowledgeBaseMessageSchema = z.object({
+  schemaVersion: z.literal(1).optional(),
+  kind: z.enum(["pending_user", "presentation"]),
+  buildId: z.string().min(1).max(128).optional(),
+  operationKey: z.string().min(1).max(128).optional(),
+  clientRequestId: z.string().min(1).max(128).optional(),
+  turnId: z.string().min(1).max(128).optional(),
+  presentationKey: z.string().min(1).max(191).optional(),
+  generation: z.number().int().nonnegative().optional(),
+  revision: z.number().int().nonnegative().optional(),
+  leafId: z.string().max(191).nullable().optional(),
+  serverOwned: z.boolean().optional(),
+});
+
+type KnowledgeBaseMessageMetadata = z.infer<typeof knowledgeBaseMessageSchema>;
+
+type ServerOwnedMessageIdentity = {
+  id: string;
+  conversationId: string;
+  turnId: string | null;
+  userId: number;
+  role: string;
+  content: string;
+};
+
+type ServerOwnedTurnIdentity = {
+  id: string;
+  conversationId: string;
+  userId: number;
+  clientRequestId: string;
+  buildId: string | null;
+  buildGeneration: number | null;
+  operationKey: string | null;
+  expectedRevision: number | null;
+  expectedLeafId: string | null;
+};
+
+type ServerOwnedBuildIdentity = {
+  id: string;
+  userId: number;
+  conversationId: string;
+};
+
+function knowledgeBasePresentationKey(input: {
+  buildId: string;
+  generation: number;
+  revision: number;
+  leafId: string;
+  content: string;
+}) {
+  return createHash("sha256")
+    .update(
+      [
+        input.buildId,
+        input.generation,
+        input.revision,
+        input.leafId,
+        knowledgeBaseMarkdownSha256(input.content),
+      ].join(":"),
+    )
+    .digest("hex");
+}
+
+/**
+ * `serverOwned` is not an authentication token. A database message receives
+ * immutable KB treatment only when its complete identity still matches the
+ * server-reserved turn/build and the deterministic public message identity.
+ */
+export function matchesAuthoritativeKnowledgeBaseMessageTuple(input: {
+  message: ServerOwnedMessageIdentity;
+  publicMessageId: string;
+  knowledgeBase: KnowledgeBaseMessageMetadata;
+  turn: ServerOwnedTurnIdentity | undefined;
+  build: ServerOwnedBuildIdentity | undefined;
+  publicConversationId: string;
+}) {
+  const { message, publicMessageId, knowledgeBase, turn, build } = input;
+  if (
+    knowledgeBase.serverOwned !== true ||
+    knowledgeBase.schemaVersion !== 1 ||
+    !turn ||
+    !build ||
+    message.userId !== turn.userId ||
+    message.conversationId !== turn.conversationId ||
+    message.turnId !== turn.id ||
+    build.userId !== message.userId ||
+    build.conversationId !== input.publicConversationId ||
+    knowledgeBase.turnId !== turn.id ||
+    knowledgeBase.buildId !== turn.buildId ||
+    knowledgeBase.buildId !== build.id ||
+    knowledgeBase.generation !== turn.buildGeneration ||
+    knowledgeBase.operationKey !== turn.operationKey ||
+    knowledgeBase.revision === undefined ||
+    knowledgeBase.leafId === undefined
+  ) {
+    return false;
+  }
+
+  if (knowledgeBase.kind === "pending_user") {
+    try {
+      if (
+        message.role !== "user" ||
+        publicMessageId !== knowledgeBaseUserMessagePublicId(turn.id) ||
+        knowledgeBase.clientRequestId !== turn.clientRequestId ||
+        knowledgeBase.presentationKey !== undefined ||
+        knowledgeBase.revision !== turn.expectedRevision ||
+        (knowledgeBase.leafId ?? null) !== (turn.expectedLeafId ?? null)
+      ) {
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  if (
+    message.role !== "assistant" ||
+    knowledgeBase.clientRequestId !== undefined ||
+    !knowledgeBase.presentationKey ||
+    !knowledgeBase.leafId ||
+    (knowledgeBase.revision !== turn.expectedRevision &&
+      knowledgeBase.revision !== (turn.expectedRevision ?? -2) + 1)
+  ) {
+    return false;
+  }
+  try {
+    return (
+      publicMessageId ===
+        knowledgeBasePresentationMessagePublicId(
+          knowledgeBase.presentationKey,
+        ) &&
+      knowledgeBase.presentationKey ===
+        knowledgeBasePresentationKey({
+          buildId: build.id,
+          generation: knowledgeBase.generation,
+          revision: knowledgeBase.revision,
+          leafId: knowledgeBase.leafId,
+          content: message.content,
+        })
+    );
+  } catch {
+    return false;
+  }
+}
+
+function parsedKnowledgeBaseMessageMetadata(metadata: MessageMetadata) {
+  const parsed = knowledgeBaseMessageSchema.safeParse(metadata.knowledgeBase);
+  return parsed.success ? parsed.data : undefined;
+}
+
 const messageSchema = z.object({
   id: z.string().min(1).max(128),
   upstreamOutputId: z.string().min(1).max(128).optional(),
@@ -61,6 +218,7 @@ const messageSchema = z.object({
   stepGroups: z.array(z.unknown()).max(500).optional(),
   isStepsPlaceholder: z.boolean().optional(),
   modelName: z.string().max(128).optional(),
+  knowledgeBase: knowledgeBaseMessageSchema.optional(),
 });
 
 export const conversationSnapshotSchema = z.object({
@@ -197,6 +355,24 @@ function asDate(value: number | undefined): Date | null {
   if (value === undefined) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function conversationStatusForKnowledgeBuild(
+  build: Pick<
+    typeof knowledgeBaseBuilds.$inferSelect,
+    "status" | "awaitingResponseSince"
+  >,
+): ConversationSnapshot["status"] {
+  if (build.status === "ready_to_publish" || build.status === "published") {
+    return "completed";
+  }
+  if (build.status === "protocol_error" || build.status === "failed") {
+    return "error";
+  }
+  if (build.status === "confirming" && !build.awaitingResponseSince) {
+    return "awaiting_input";
+  }
+  return "running";
 }
 
 function requireDb(db: Awaited<ReturnType<typeof getDb>>) {
@@ -733,7 +909,7 @@ async function persistResource(
   );
 }
 
-function buildMessageMetadata(
+export function buildMessageMetadata(
   message: z.infer<typeof messageSchema>,
 ): MessageMetadata | null {
   const metadata: MessageMetadata = {};
@@ -754,7 +930,109 @@ function buildMessageMetadata(
     metadata.isStepsPlaceholder = message.isStepsPlaceholder;
   }
   if (message.modelName) metadata.modelName = message.modelName;
+  if (message.knowledgeBase) metadata.knowledgeBase = message.knowledgeBase;
   return Object.keys(metadata).length > 0 ? metadata : null;
+}
+
+async function authoritativeKnowledgeBaseMetadataForMessages(
+  executor: any,
+  userId: number,
+  messageRows: Array<typeof messages.$inferSelect>,
+  projectAssignmentId: string | null,
+) {
+  const candidates = messageRows.flatMap((message) => {
+    const knowledgeBase = parsedKnowledgeBaseMessageMetadata(
+      (message.metadata ?? {}) as MessageMetadata,
+    );
+    return knowledgeBase?.serverOwned === true && message.turnId
+      ? [{ message, knowledgeBase }]
+      : [];
+  });
+  const verified = new Map<string, KnowledgeBaseMessageMetadata>();
+  // Knowledge-base state is account-owned. Project snapshots must never gain
+  // immutable messages merely by carrying another user's metadata marker.
+  if (projectAssignmentId || candidates.length === 0) return verified;
+
+  const turnIds = Array.from(
+    new Set(candidates.map(({ message }) => message.turnId!)),
+  );
+  const turnRows = (await executor
+    .select({
+      id: conversationTurns.id,
+      conversationId: conversationTurns.conversationId,
+      userId: conversationTurns.userId,
+      clientRequestId: conversationTurns.clientRequestId,
+      buildId: conversationTurns.buildId,
+      buildGeneration: conversationTurns.buildGeneration,
+      operationKey: conversationTurns.operationKey,
+      expectedRevision: conversationTurns.expectedRevision,
+      expectedLeafId: conversationTurns.expectedLeafId,
+    })
+    .from(conversationTurns)
+    .where(
+      and(
+        eq(conversationTurns.userId, userId),
+        inArray(conversationTurns.id, turnIds),
+      ),
+    )) as ServerOwnedTurnIdentity[];
+  const turnsById = new Map(turnRows.map((turn) => [turn.id, turn]));
+  const buildIds = Array.from(
+    new Set(
+      turnRows
+        .map((turn) => turn.buildId)
+        .filter((buildId): buildId is string => Boolean(buildId)),
+    ),
+  );
+  const buildRows =
+    buildIds.length === 0
+      ? []
+      : ((await executor
+          .select({
+            id: knowledgeBaseBuilds.id,
+            userId: knowledgeBaseBuilds.userId,
+            conversationId: knowledgeBaseBuilds.conversationId,
+          })
+          .from(knowledgeBaseBuilds)
+          .where(
+            and(
+              eq(knowledgeBaseBuilds.userId, userId),
+              inArray(knowledgeBaseBuilds.id, buildIds),
+            ),
+          )) as ServerOwnedBuildIdentity[]);
+  const buildsById = new Map(buildRows.map((build) => [build.id, build]));
+
+  for (const { message, knowledgeBase } of candidates) {
+    const turn = turnsById.get(message.turnId!);
+    const build = turn?.buildId ? buildsById.get(turn.buildId) : undefined;
+    if (
+      matchesAuthoritativeKnowledgeBaseMessageTuple({
+        message,
+        publicMessageId: publicId(userId, message.id, projectAssignmentId),
+        knowledgeBase,
+        turn,
+        build,
+        publicConversationId: publicId(
+          userId,
+          message.conversationId,
+          projectAssignmentId,
+        ),
+      })
+    ) {
+      verified.set(message.id, knowledgeBase);
+    }
+  }
+  return verified;
+}
+
+function persistedKnowledgeBaseMetadata(
+  message: typeof messages.$inferSelect,
+  authoritative: ReadonlyMap<string, KnowledgeBaseMessageMetadata>,
+) {
+  const parsed = parsedKnowledgeBaseMessageMetadata(
+    (message.metadata ?? {}) as MessageMetadata,
+  );
+  if (parsed?.serverOwned !== true) return parsed;
+  return authoritative.get(message.id);
 }
 
 async function loadPersistedMessages(
@@ -795,8 +1073,20 @@ async function loadPersistedMessages(
     attachmentsByMessage.set(attachment.messageId, current);
   }
 
+  const authoritativeKnowledgeBase =
+    await authoritativeKnowledgeBaseMetadataForMessages(
+      executor,
+      userId,
+      messageRows,
+      projectAssignmentId,
+    );
+
   return messageRows.map((message: typeof messages.$inferSelect) => {
     const metadata = (message.metadata ?? {}) as MessageMetadata;
+    const knowledgeBase = persistedKnowledgeBaseMetadata(
+      message,
+      authoritativeKnowledgeBase,
+    );
     return {
       id: publicId(userId, message.id, projectAssignmentId),
       ...(metadata.upstreamOutputId
@@ -834,12 +1124,65 @@ async function loadPersistedMessages(
         ? { isStepsPlaceholder: metadata.isStepsPlaceholder }
         : {}),
       ...(metadata.modelName ? { modelName: metadata.modelName } : {}),
+      ...(knowledgeBase ? { knowledgeBase } : {}),
     };
   });
 }
 
 type SnapshotMessage = ConversationSnapshot["messages"][number];
 type MessageTurn = { user: SnapshotMessage; assistants: SnapshotMessage[] };
+
+export function isServerOwnedKnowledgeBaseMessage(
+  message: SnapshotMessage,
+): boolean {
+  return message.knowledgeBase?.serverOwned === true;
+}
+
+/**
+ * Browser snapshots may echo server messages, but they can never originate
+ * them. Echoes are recovered from the locked database copy during merge; a
+ * claimed server-owned message without such a copy is discarded completely.
+ */
+export function discardClientClaimedServerOwnedKnowledgeBaseMessages(
+  incoming: SnapshotMessage[],
+) {
+  return incoming.filter(
+    (message) => !isServerOwnedKnowledgeBaseMessage(message),
+  );
+}
+
+function turnHasServerOwnedKnowledgeBaseMessage(turn: MessageTurn) {
+  return (
+    isServerOwnedKnowledgeBaseMessage(turn.user) ||
+    turn.assistants.some(isServerOwnedKnowledgeBaseMessage)
+  );
+}
+
+function messageTurnIdentity(turn: MessageTurn) {
+  const requestId = turn.user.knowledgeBase?.clientRequestId;
+  if (requestId) return `kb-request:${requestId}`;
+  const turnId = turn.user.knowledgeBase?.turnId;
+  if (turnId) return `kb-turn:${turnId}`;
+  return `message:${turn.user.id}`;
+}
+
+export function sanitizeKnowledgeBaseDeletionTombstones(
+  persisted: SnapshotMessage[],
+  incoming: SnapshotMessage[],
+  deletedMessageIds: string[],
+) {
+  // `incoming` is intentionally excluded: `serverOwned` is client-controlled
+  // at this boundary and therefore cannot grant deletion immunity.
+  void incoming;
+  const protectedIds = new Set(
+    persisted
+      .filter(isServerOwnedKnowledgeBaseMessage)
+      .map((message) => message.id),
+  );
+  return Array.from(new Set(deletedMessageIds)).filter(
+    (messageId) => !protectedIds.has(messageId),
+  );
+}
 
 export function repairSnapshotMessageIds(
   messagesToRepair: readonly SnapshotMessage[],
@@ -902,29 +1245,63 @@ function assistantProjectionScore(projected: SnapshotMessage[]) {
  * Merge by user turn rather than replacing an entire conversation snapshot.
  * The incoming assistant set is authoritative for a turn it knows about
  * (allowing polling placeholders to disappear), while turns created on
- * another device are retained. Explicit deletion tombstones win everywhere.
+ * another device are retained. Tombstones win for user-owned messages, while
+ * immutable server-owned KB turns are outside the browser deletion domain.
  */
 export function mergeConversationMessages(
   persisted: SnapshotMessage[],
   incoming: SnapshotMessage[],
   deletedMessageIds: string[],
 ) {
-  const deleted = new Set(deletedMessageIds);
+  incoming = discardClientClaimedServerOwnedKnowledgeBaseMessages(incoming);
+  const deleted = new Set(
+    sanitizeKnowledgeBaseDeletionTombstones(
+      persisted,
+      incoming,
+      deletedMessageIds,
+    ),
+  );
   const persistedSplit = splitMessageTurns(persisted);
   const incomingSplit = splitMessageTurns(incoming);
   const prelude = new Map<string, SnapshotMessage>();
   for (const message of persistedSplit.prelude)
     prelude.set(message.id, message);
-  for (const message of incomingSplit.prelude) prelude.set(message.id, message);
+  for (const message of incomingSplit.prelude) {
+    const existing = prelude.get(message.id);
+    if (!existing || !isServerOwnedKnowledgeBaseMessage(existing)) {
+      prelude.set(message.id, message);
+    }
+  }
 
   const turns = new Map<string, MessageTurn>();
-  for (const turn of persistedSplit.turns) turns.set(turn.user.id, turn);
+  for (const turn of persistedSplit.turns) {
+    const identity = messageTurnIdentity(turn);
+    const existing = turns.get(identity);
+    if (!existing || !turnHasServerOwnedKnowledgeBaseMessage(existing)) {
+      turns.set(identity, turn);
+    }
+  }
   for (const turn of incomingSplit.turns) {
-    const persistedTurn = turns.get(turn.user.id);
+    let turnIdentity = messageTurnIdentity(turn);
+    let persistedTurn = turns.get(turnIdentity);
     if (!persistedTurn) {
-      turns.set(turn.user.id, turn);
+      const sameUserId = Array.from(turns.entries()).find(
+        ([, candidate]) => candidate.user.id === turn.user.id,
+      );
+      if (sameUserId) {
+        [turnIdentity, persistedTurn] = sameUserId;
+      }
+    }
+    if (!persistedTurn) {
+      turns.set(turnIdentity, turn);
       continue;
     }
+    // Once the server has accepted a KB confirmation/presentation, a stale
+    // browser snapshot is never authoritative for any part of that turn.
+    if (turnHasServerOwnedKnowledgeBaseMessage(persistedTurn)) continue;
+    const mergedUser = isServerOwnedKnowledgeBaseMessage(turn.user)
+      ? turn.user
+      : persistedTurn.user;
     // Polling projections only become richer (placeholder -> partial -> final).
     // A stale device changing an unrelated scalar must not regress a final
     // assistant result back to its older placeholder/partial projection.
@@ -932,9 +1309,14 @@ export function mergeConversationMessages(
       assistantProjectionScore(turn.assistants) >
       assistantProjectionScore(persistedTurn.assistants)
     ) {
-      turns.set(turn.user.id, {
-        user: persistedTurn.user,
+      turns.set(turnIdentity, {
+        user: mergedUser,
         assistants: turn.assistants,
+      });
+    } else if (mergedUser !== persistedTurn.user) {
+      turns.set(turnIdentity, {
+        user: mergedUser,
+        assistants: persistedTurn.assistants,
       });
     }
   }
@@ -973,7 +1355,32 @@ async function persistSnapshot(
     projectAssignmentId?: string | null;
   } = {},
 ): Promise<"imported" | "skipped" | "updated"> {
+  snapshot = {
+    ...snapshot,
+    messages: discardClientClaimedServerOwnedKnowledgeBaseMessages(
+      snapshot.messages,
+    ),
+  };
   const projectAssignmentId = options.projectAssignmentId ?? null;
+  const knowledgeBuildRows = await executor
+    .select({
+      id: knowledgeBaseBuilds.id,
+      status: knowledgeBaseBuilds.status,
+      upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+      lastOutputLength: knowledgeBaseBuilds.lastOutputLength,
+      awaitingResponseSince: knowledgeBaseBuilds.awaitingResponseSince,
+      completedAt: knowledgeBaseBuilds.completedAt,
+    })
+    .from(knowledgeBaseBuilds)
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, userId),
+        eq(knowledgeBaseBuilds.conversationId, snapshot.id),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const knowledgeBuild = knowledgeBuildRows[0];
   const lockedKnowledgeBuilds = await executor
     .select({ id: knowledgeBaseBuilds.id })
     .from(knowledgeBaseBuilds)
@@ -1052,17 +1459,16 @@ async function persistSnapshot(
   if (existing && options.skipExisting) return "skipped";
 
   if (existing) {
-    const deletedMessageIds = Array.from(
-      new Set([
-        ...existing.deletedMessageIds,
-        ...(snapshot.deletedMessageIds ?? []),
-      ]),
-    );
     const persistedMessages = await loadPersistedMessages(
       executor,
       userId,
       persistedConversationId,
       projectAssignmentId,
+    );
+    const deletedMessageIds = sanitizeKnowledgeBaseDeletionTombstones(
+      persistedMessages,
+      snapshot.messages,
+      [...existing.deletedMessageIds, ...(snapshot.deletedMessageIds ?? [])],
     );
     const taskPointers = await resolveTaskPointersForSnapshot(
       executor,
@@ -1095,9 +1501,15 @@ async function persistSnapshot(
       updatedAt: Date.now(),
     };
   }
+  const repairedMessages = repairSnapshotMessageIds(snapshot.messages);
   snapshot = {
     ...snapshot,
-    messages: repairSnapshotMessageIds(snapshot.messages),
+    messages: repairedMessages,
+    deletedMessageIds: sanitizeKnowledgeBaseDeletionTombstones(
+      repairedMessages,
+      [],
+      snapshot.deletedMessageIds ?? [],
+    ),
   };
 
   const { credentialId: resolvedCredentialId, bindings } =
@@ -1113,14 +1525,33 @@ async function persistSnapshot(
     apiCredentialId,
     projectAssignmentId,
     title: snapshot.title,
-    status: snapshot.status,
-    upstreamTaskId: snapshot.taskId ?? null,
-    previousResponseId: snapshot.previousResponseId ?? null,
-    taskUrl: snapshot.taskUrl ?? null,
-    lastKnownOutputLength: snapshot.lastKnownOutputLength ?? 0,
+    status: knowledgeBuild
+      ? existing?.status && existing.status !== "archived"
+        ? existing.status
+        : conversationStatusForKnowledgeBuild(knowledgeBuild)
+      : snapshot.status,
+    upstreamTaskId: knowledgeBuild
+      ? knowledgeBuild.upstreamTaskId
+      : (snapshot.taskId ?? null),
+    previousResponseId: knowledgeBuild
+      ? knowledgeBuild.upstreamTaskId
+      : (snapshot.previousResponseId ?? null),
+    taskUrl: knowledgeBuild
+      ? (existing?.taskUrl ?? null)
+      : (snapshot.taskUrl ?? null),
+    lastKnownOutputLength: knowledgeBuild
+      ? Math.max(
+          knowledgeBuild.lastOutputLength,
+          existing?.lastKnownOutputLength ?? 0,
+        )
+      : (snapshot.lastKnownOutputLength ?? 0),
     deletedMessageIds: snapshot.deletedMessageIds ?? [],
-    startedAt: asDate(snapshot.startedAt),
-    completedAt: asDate(snapshot.completedAt),
+    startedAt: knowledgeBuild
+      ? (existing?.startedAt ?? asDate(snapshot.startedAt))
+      : asDate(snapshot.startedAt),
+    completedAt: knowledgeBuild
+      ? (knowledgeBuild.completedAt ?? existing?.completedAt ?? null)
+      : asDate(snapshot.completedAt),
     createdAt: asDate(snapshot.createdAt) ?? new Date(),
     updatedAt: asDate(snapshot.updatedAt) ?? new Date(),
   };
@@ -1174,6 +1605,31 @@ async function persistSnapshot(
     }
   }
 
+  const requestedTurnIds = Array.from(
+    new Set(
+      snapshot.messages
+        .filter(isServerOwnedKnowledgeBaseMessage)
+        .map((message) => message.knowledgeBase?.turnId)
+        .filter((turnId): turnId is string => Boolean(turnId)),
+    ),
+  );
+  const validTurnIds = new Set(
+    requestedTurnIds.length === 0
+      ? []
+      : (
+          await executor
+            .select({ id: conversationTurns.id })
+            .from(conversationTurns)
+            .where(
+              and(
+                eq(conversationTurns.userId, userId),
+                eq(conversationTurns.conversationId, persistedConversationId),
+                inArray(conversationTurns.id, requestedTurnIds),
+              ),
+            )
+        ).map((turn: { id: string }) => turn.id),
+  );
+
   // A snapshot is authoritative for this conversation. Replacing children also
   // removes stale polling placeholders and preserves manual-delete tombstones on
   // the parent conversation.
@@ -1187,6 +1643,11 @@ async function persistSnapshot(
     await executor.insert(messages).values({
       id: storageId(userId, message.id, projectAssignmentId),
       conversationId: persistedConversationId,
+      turnId:
+        message.knowledgeBase?.turnId &&
+        validTurnIds.has(message.knowledgeBase.turnId)
+          ? message.knowledgeBase.turnId
+          : null,
       userId,
       role: message.role,
       content: normalizeKnowledgeCollectionCopy(message.content),
@@ -1482,11 +1943,23 @@ async function listSnapshots(
     messagesByConversation.set(message.conversationId, current);
   }
 
+  const authoritativeKnowledgeBase =
+    await authoritativeKnowledgeBaseMetadataForMessages(
+      db,
+      userId,
+      messageRows,
+      projectAssignmentId,
+    );
+
   return conversationRows.map((row) => ({
     id: publicId(userId, row.id, projectAssignmentId),
     title: row.title,
     messages: (messagesByConversation.get(row.id) ?? []).map((message) => {
       const metadata = (message.metadata ?? {}) as MessageMetadata;
+      const knowledgeBase = persistedKnowledgeBaseMetadata(
+        message,
+        authoritativeKnowledgeBase,
+      );
       return {
         id: publicId(userId, message.id, projectAssignmentId),
         ...(metadata.upstreamOutputId
@@ -1526,6 +1999,7 @@ async function listSnapshots(
           ? { isStepsPlaceholder: metadata.isStepsPlaceholder }
           : {}),
         ...(metadata.modelName ? { modelName: metadata.modelName } : {}),
+        ...(knowledgeBase ? { knowledgeBase } : {}),
       };
     }),
     ...(row.upstreamTaskId ? { taskId: row.upstreamTaskId } : {}),
@@ -1607,27 +2081,49 @@ export const conversationRouter = router({
         input.id,
         projectAssignmentId,
       );
-      const existing = await db
-        .select({
-          userId: conversations.userId,
-          projectAssignmentId: conversations.projectAssignmentId,
-        })
-        .from(conversations)
-        .where(eq(conversations.id, persistedConversationId))
-        .limit(1);
-      const owned = projectAssignmentId
-        ? existing[0]?.projectAssignmentId === projectAssignmentId
-        : existing[0]?.userId === ctx.user.id &&
-          existing[0]?.projectAssignmentId == null;
-      if (!existing[0] || !owned) {
-        throw new TRPCError({ code: "NOT_FOUND", message: "会话不存在" });
-      }
-      await permanentlyDeleteConversation(
-        db,
-        ctx.user.id,
-        persistedConversationId,
-        projectAssignmentId,
-      );
+      await db.transaction(async (tx) => {
+        // KB transitions lock the build before touching conversation state.
+        // Keep the same order here so delete cannot deadlock or race a start.
+        const knowledgeBuild = await tx
+          .select({ id: knowledgeBaseBuilds.id })
+          .from(knowledgeBaseBuilds)
+          .where(
+            and(
+              eq(knowledgeBaseBuilds.userId, ctx.user.id),
+              eq(knowledgeBaseBuilds.conversationId, input.id),
+            ),
+          )
+          .limit(1)
+          .for("update");
+        if (knowledgeBuild[0]) {
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "知识库会话由服务端持有；如需清除，请使用知识库重置工单",
+          });
+        }
+        const existing = await tx
+          .select({
+            userId: conversations.userId,
+            projectAssignmentId: conversations.projectAssignmentId,
+          })
+          .from(conversations)
+          .where(eq(conversations.id, persistedConversationId))
+          .limit(1)
+          .for("update");
+        const owned = projectAssignmentId
+          ? existing[0]?.projectAssignmentId === projectAssignmentId
+          : existing[0]?.userId === ctx.user.id &&
+            existing[0]?.projectAssignmentId == null;
+        if (!existing[0] || !owned) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "会话不存在" });
+        }
+        await permanentlyDeleteConversation(
+          tx,
+          ctx.user.id,
+          persistedConversationId,
+          projectAssignmentId,
+        );
+      });
       return { success: true } as const;
     }),
 

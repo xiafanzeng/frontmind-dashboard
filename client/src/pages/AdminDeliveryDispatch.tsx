@@ -1,14 +1,11 @@
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
-  BellRing,
   ChevronDown,
   ChevronUp,
   RefreshCw,
   Search,
-  UserCog,
 } from "lucide-react";
-import { toast } from "sonner";
 import { useLocation } from "wouter";
 
 import { useAuth } from "@/_core/hooks/useAuth";
@@ -25,12 +22,15 @@ import {
   DELIVERY_ROLE_LABELS,
   type DeliveryRoleType,
 } from "@shared/delivery-roles";
-import {
-  DELIVERY_TICKET_STATUS_LABELS,
-  type DeliveryTicketStatus,
-} from "@shared/delivery-ticket";
+import { type DeliveryTicketStatus } from "@shared/delivery-ticket";
 
-type DispatchPriority = "low" | "normal" | "high" | "urgent";
+export type AdminTicketStatus = "pending" | "completed";
+
+const TERMINAL_DELIVERY_TICKET_STATUSES = new Set<DeliveryTicketStatus>([
+  "completed",
+  "rejected",
+  "cancelled",
+]);
 
 type DispatchTicket = {
   id: string;
@@ -41,10 +41,10 @@ type DispatchTicket = {
   operation?: string | null;
   category?: string | null;
   status: DeliveryTicketStatus;
+  managementStatus?: AdminTicketStatus;
   workflowDomain: DeliveryRoleType | null;
   assignedProjectAssignmentId?: string | null;
   assignedMemberId: number | null;
-  priority: DispatchPriority;
   createdAt?: Date | string | null;
   resolvedAt?: Date | string | null;
 };
@@ -73,7 +73,7 @@ type DispatchEngineer = {
   displayName: string | null;
 };
 
-type DispatchTicketEvent = {
+export type DispatchTicketEvent = {
   id: string;
   ticketId: string;
   actorRole: string;
@@ -96,22 +96,31 @@ type DispatchOverview = {
 type DispatchFilters = {
   query: string;
   type: string;
-  status: string;
+  status: "all" | AdminTicketStatus;
   role: string;
+  customerId: string;
   managerId: string;
 };
 
-export function projectTeamConfigurationHref(
-  customerUserId: number,
-  roleType: DeliveryRoleType,
-) {
-  return `/admin/delivery-roles?customer=${customerUserId}&role=${encodeURIComponent(roleType)}`;
+export function toAdminTicketStatus(
+  status: DeliveryTicketStatus,
+): AdminTicketStatus {
+  return TERMINAL_DELIVERY_TICKET_STATUSES.has(status)
+    ? "completed"
+    : "pending";
 }
 
-export function ticketNeedsProjectEngineer(
-  ticket: Pick<DispatchTicket, "workflowDomain" | "assignedMemberId">,
+export function hasAuthoritativeProjectOwner(
+  ticket: Pick<
+    DispatchTicket,
+    "workflowDomain" | "assignedProjectAssignmentId" | "assignedMemberId"
+  >,
 ) {
-  return Boolean(ticket.workflowDomain) && ticket.assignedMemberId == null;
+  return (
+    !ticket.workflowDomain ||
+    (Boolean(ticket.assignedProjectAssignmentId) &&
+      ticket.assignedMemberId != null)
+  );
 }
 
 export function filterDispatchTickets(
@@ -123,13 +132,23 @@ export function filterDispatchTickets(
   const projectById = new Map(projects.map((project) => [project.id, project]));
   return tickets.filter((ticket) => {
     if (filters.type !== "all" && ticket.type !== filters.type) return false;
-    if (filters.status !== "all" && ticket.status !== filters.status) {
+    if (
+      filters.status !== "all" &&
+      (ticket.managementStatus ?? toAdminTicketStatus(ticket.status)) !==
+        filters.status
+    ) {
       return false;
     }
     if (filters.role !== "all" && ticket.workflowDomain !== filters.role) {
       return false;
     }
     const project = projectById.get(ticket.userId);
+    if (
+      filters.customerId !== "all" &&
+      String(ticket.userId) !== filters.customerId
+    ) {
+      return false;
+    }
     if (
       filters.managerId !== "all" &&
       String(project?.managerId ?? "") !== filters.managerId
@@ -152,6 +171,39 @@ export function filterDispatchTickets(
   });
 }
 
+/**
+ * Build the event lookup once for the whole page. Keeping this outside each
+ * ticket row avoids rescanning the complete event history for every ticket.
+ */
+export function groupDispatchTicketEvents(
+  events: DispatchTicketEvent[],
+): Map<string, DispatchTicketEvent[]> {
+  const eventsByTicket = new Map<string, DispatchTicketEvent[]>();
+  for (const event of events) {
+    const ticketEvents = eventsByTicket.get(event.ticketId);
+    if (ticketEvents) {
+      ticketEvents.push(event);
+    } else {
+      eventsByTicket.set(event.ticketId, [event]);
+    }
+  }
+  return eventsByTicket;
+}
+
+export function adminTicketEventPublicMessage(event: DispatchTicketEvent) {
+  const message = event.message?.trim();
+  if (message) return message;
+
+  const publicStatus = event.toStatus
+    ? TERMINAL_DELIVERY_TICKET_STATUSES.has(
+        event.toStatus as DeliveryTicketStatus,
+      )
+      ? "已完成"
+      : "待处理"
+    : null;
+  return publicStatus ? `工单状态更新为${publicStatus}。` : "工单记录已更新。";
+}
+
 export default function AdminDeliveryDispatch() {
   const { user } = useAuth();
   const systemAdmin = isSystemAdminAccount(user);
@@ -160,8 +212,11 @@ export default function AdminDeliveryDispatch() {
   const data = overview.data as unknown as DispatchOverview | undefined;
   const [query, setQuery] = useState("");
   const [ticketType, setTicketType] = useState("all");
-  const [ticketStatus, setTicketStatus] = useState("all");
+  const [ticketStatus, setTicketStatus] = useState<"all" | AdminTicketStatus>(
+    "all",
+  );
   const [roleType, setRoleType] = useState("all");
+  const [customerId, setCustomerId] = useState("all");
   const [managerId, setManagerId] = useState("all");
   const terminalTickets = data?.terminalTickets ?? data?.completedTickets ?? [];
   const allTickets = useMemo(
@@ -175,10 +230,12 @@ export default function AdminDeliveryDispatch() {
         type: ticketType,
         status: ticketStatus,
         role: roleType,
+        customerId,
         managerId,
       }),
     [
       allTickets,
+      customerId,
       data?.projects,
       managerId,
       query,
@@ -186,6 +243,10 @@ export default function AdminDeliveryDispatch() {
       ticketStatus,
       ticketType,
     ],
+  );
+  const eventsByTicket = useMemo(
+    () => groupDispatchTicketEvents(data?.ticketEvents ?? []),
+    [data?.ticketEvents],
   );
   const managerOptions = useMemo(() => {
     const managers = new Map<string, string>();
@@ -217,8 +278,8 @@ export default function AdminDeliveryDispatch() {
 
   return (
     <PortalShell
-      eyebrow="交付管理 · 工单调度"
-      title="工单调度"
+      eyebrow="交付管理 · 工单"
+      title="工单"
       navItems={getAdminNav(systemAdmin)}
       toolbar={
         <Button
@@ -232,20 +293,10 @@ export default function AdminDeliveryDispatch() {
       }
     >
       <div className="mx-auto w-full max-w-7xl">
-        <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="mb-5 grid gap-3 sm:grid-cols-2">
           {[
-            ["全部工单", allTickets.length],
-            [
-              "待补齐岗位",
-              (data?.tickets ?? []).filter(ticketNeedsProjectEngineer).length,
-            ],
-            [
-              "执行中",
-              (data?.tickets ?? []).filter((ticket) =>
-                ["scheduled", "in_progress"].includes(ticket.status),
-              ).length,
-            ],
-            ["已完成", data?.completedTickets?.length ?? 0],
+            ["待处理", data?.tickets?.length ?? 0],
+            ["已完成", terminalTickets.length],
           ].map(([label, value]) => (
             <div
               key={String(label)}
@@ -261,11 +312,11 @@ export default function AdminDeliveryDispatch() {
 
         <Card className="mb-5">
           <CardHeader>
-            <CardTitle>交付工单总览与筛选</CardTitle>
+            <CardTitle>工单筛选</CardTitle>
           </CardHeader>
           <CardContent
             className={`grid gap-3 md:grid-cols-2 ${
-              systemAdmin ? "xl:grid-cols-5" : "xl:grid-cols-4"
+              systemAdmin ? "xl:grid-cols-6" : "xl:grid-cols-5"
             }`}
           >
             <label className="relative">
@@ -291,18 +342,30 @@ export default function AdminDeliveryDispatch() {
             </select>
             <select
               value={ticketStatus}
-              onChange={(event) => setTicketStatus(event.target.value)}
+              onChange={(event) =>
+                setTicketStatus(event.target.value as "all" | AdminTicketStatus)
+              }
               aria-label="筛选工单状态"
               className="h-10 rounded-md border bg-background px-3 text-sm"
             >
               <option value="all">全部状态</option>
-              <option value="submitted">已提交</option>
-              <option value="needs_information">待补充资料</option>
-              <option value="scheduled">已排期</option>
-              <option value="in_progress">处理中</option>
+              <option value="pending">待处理</option>
               <option value="completed">已完成</option>
-              <option value="rejected">未受理</option>
-              <option value="cancelled">已取消</option>
+            </select>
+            <select
+              value={customerId}
+              onChange={(event) => setCustomerId(event.target.value)}
+              aria-label="筛选客户"
+              className="h-10 rounded-md border bg-background px-3 text-sm"
+            >
+              <option value="all">全部客户</option>
+              {(data?.projects ?? []).map((project) => (
+                <option key={project.id} value={String(project.id)}>
+                  {project.displayName ||
+                    project.username ||
+                    `客户 #${project.id}`}
+                </option>
+              ))}
             </select>
             <select
               value={roleType}
@@ -336,27 +399,16 @@ export default function AdminDeliveryDispatch() {
         </Card>
 
         <div className="mb-4 rounded-xl border border-primary/20 bg-primary/[0.035] px-4 py-3 text-sm leading-6 text-muted-foreground">
-          <strong className="text-foreground">调度规则：</strong>
-          先在客户项目中配齐固定岗位，再设置优先级和催办。更换岗位负责人会自动转交该岗位全部未结束工单；管理员不在调度页代替工程师执行或完成工单。
+          <strong className="text-foreground">分配规则：</strong>
+          工单根据客户项目团队与岗位自动分配给对应工程师。管理员可跨客户筛选并查看详情，但不能手动分配、调整优先级、催办或代替工程师完成工单。
         </div>
         <Card>
           <CardHeader>
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <CardTitle>未结束工单</CardTitle>
+              <CardTitle>待处理</CardTitle>
               <div className="flex flex-wrap gap-2 text-xs">
                 <Badge variant="outline">
                   共 {filteredActiveTickets.length} 个
-                </Badge>
-                <Badge
-                  variant="outline"
-                  className="border-amber-300 text-amber-700"
-                >
-                  待分配{" "}
-                  {
-                    filteredActiveTickets.filter(ticketNeedsProjectEngineer)
-                      .length
-                  }{" "}
-                  个
                 </Badge>
               </div>
             </div>
@@ -372,20 +424,11 @@ export default function AdminDeliveryDispatch() {
               </p>
             ) : (
               filteredActiveTickets.map((ticket) => (
-                <DispatchRow
+                <PendingTicketRow
                   key={ticket.id}
                   ticket={ticket}
                   overview={data!}
-                  onConfigureProject={() => {
-                    if (!ticket.workflowDomain) return;
-                    setLocation(
-                      projectTeamConfigurationHref(
-                        ticket.userId,
-                        ticket.workflowDomain,
-                      ),
-                    );
-                  }}
-                  onDone={() => overview.refetch()}
+                  events={eventsByTicket.get(ticket.id) ?? []}
                   onOpenDetail={() => openTicketDetail(ticket)}
                 />
               ))
@@ -394,7 +437,7 @@ export default function AdminDeliveryDispatch() {
               !overview.error &&
               !filteredActiveTickets.length && (
                 <p className="py-10 text-center text-sm text-muted-foreground">
-                  当前没有待调度工单
+                  当前没有符合条件的待处理工单
                 </p>
               )}
           </CardContent>
@@ -402,7 +445,7 @@ export default function AdminDeliveryDispatch() {
         <Card className="mt-5">
           <CardHeader>
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <CardTitle>已结束工单</CardTitle>
+              <CardTitle>已完成</CardTitle>
               <div className="flex flex-wrap gap-2">
                 <Badge variant="outline">
                   筛选结果 {filteredTerminalTickets.length} 个
@@ -411,7 +454,7 @@ export default function AdminDeliveryDispatch() {
                   variant="outline"
                   className="border-emerald-300 text-emerald-700"
                 >
-                  已完成 {data?.completedTickets?.length ?? 0} 个
+                  已完成 {terminalTickets.length} 个
                 </Badge>
               </div>
             </div>
@@ -419,11 +462,11 @@ export default function AdminDeliveryDispatch() {
           <CardContent className="space-y-3">
             {overview.isLoading ? (
               <p className="py-10 text-center text-sm text-muted-foreground">
-                正在读取已结束工单…
+                正在读取已完成工单…
               </p>
             ) : overview.error ? (
               <p className="py-10 text-center text-sm text-destructive">
-                已结束工单暂时无法读取，请刷新后重试。
+                已完成工单暂时无法读取，请刷新后重试。
               </p>
             ) : (
               filteredTerminalTickets.map((ticket) => (
@@ -439,7 +482,7 @@ export default function AdminDeliveryDispatch() {
               !overview.error &&
               !filteredTerminalTickets.length && (
                 <p className="py-10 text-center text-sm text-muted-foreground">
-                  当前没有符合条件的已结束工单
+                  当前没有符合条件的已完成工单
                 </p>
               )}
           </CardContent>
@@ -449,28 +492,18 @@ export default function AdminDeliveryDispatch() {
   );
 }
 
-function DispatchRow({
+function PendingTicketRow({
   ticket,
   overview,
-  onConfigureProject,
-  onDone,
+  events,
   onOpenDetail,
 }: {
   ticket: DispatchTicket;
   overview: DispatchOverview;
-  onConfigureProject: () => void;
-  onDone: () => Promise<unknown>;
+  events: DispatchTicketEvent[];
   onOpenDetail: () => void;
 }) {
-  const [priority, setPriority] = useState<DispatchPriority>(
-    ticket.priority || "normal",
-  );
   const [historyOpen, setHistoryOpen] = useState(false);
-  const dispatch = trpc.delivery.management.dispatchTicket.useMutation();
-  const urge = trpc.delivery.management.urgeTicket.useMutation();
-  const events = overview.ticketEvents.filter(
-    (event) => event.ticketId === ticket.id,
-  );
   const project = overview.projects.find(
     (candidate) => candidate.id === ticket.userId,
   );
@@ -491,40 +524,17 @@ function DispatchRow({
           displayName: projectAssignment.engineerDisplayName,
         }
       : undefined);
-  const needsEngineer = ticketNeedsProjectEngineer(ticket);
-
-  const save = async () => {
-    try {
-      await dispatch.mutateAsync({
-        ticketId: ticket.id,
-        priority,
-      });
-      await onDone();
-      toast.success("工单优先级已更新");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "调度失败");
-    }
-  };
-
-  const sendUrge = async () => {
-    try {
-      await urge.mutateAsync({ ticketId: ticket.id });
-      await onDone();
-      toast.success("已写入催办记录");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "催办失败");
-    }
-  };
+  const assignmentSynchronized = hasAuthoritativeProjectOwner(ticket);
 
   return (
     <div
       className={
-        needsEngineer
+        !assignmentSynchronized
           ? "rounded-xl border border-amber-300 bg-amber-50/30 p-4"
           : "rounded-xl border p-4"
       }
     >
-      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_180px_auto] lg:items-center">
+      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <p className="truncate font-medium">
@@ -533,16 +543,14 @@ function DispatchRow({
                 ticket.category ||
                 "交付工单"}
             </p>
-            <Badge variant="outline">
-              {DELIVERY_TICKET_STATUS_LABELS[ticket.status]}
-            </Badge>
-            {needsEngineer && (
+            <Badge variant="outline">待处理</Badge>
+            {!assignmentSynchronized && (
               <Badge
                 variant="outline"
                 className="border-amber-300 text-amber-700"
               >
                 <AlertTriangle className="mr-1 h-3 w-3" />
-                待分配
+                岗位归属同步异常
               </Badge>
             )}
           </div>
@@ -561,7 +569,7 @@ function DispatchRow({
               project?.managerUsername ||
               "待设置"}
           </p>
-          {ticket.workflowDomain && !needsEngineer && (
+          {ticket.workflowDomain && assignmentSynchronized && (
             <p className="mt-2 text-xs">
               负责人：
               <span className="font-medium">
@@ -573,65 +581,23 @@ function DispatchRow({
           )}
         </div>
 
-        <select
-          className="h-10 rounded-md border bg-background px-3 text-sm"
-          aria-label="工单优先级"
-          value={priority}
-          disabled={!ticket.workflowDomain}
-          onChange={(event) =>
-            setPriority(event.target.value as DispatchPriority)
-          }
-        >
-          <option value="low">低优先级</option>
-          <option value="normal">普通优先级</option>
-          <option value="high">高优先级</option>
-          <option value="urgent">紧急优先级</option>
-        </select>
-
-        <div className="flex flex-wrap gap-2">
-          <Button
-            disabled={dispatch.isPending || !ticket.workflowDomain}
-            onClick={() => void save()}
-          >
-            保存优先级
-          </Button>
-          {needsEngineer && (
-            <Button variant="outline" onClick={onConfigureProject}>
-              <UserCog className="h-4 w-4" />
-              配置项目岗位
-            </Button>
-          )}
-        </div>
+        <Button size="sm" variant="outline" onClick={onOpenDetail}>
+          查看工单详情
+        </Button>
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-2 border-t pt-3">
-        {ticket.workflowDomain && (
-          <>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={urge.isPending}
-              onClick={() => void sendUrge()}
-            >
-              <BellRing className="h-3.5 w-3.5" />
-              催办
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => setHistoryOpen((value) => !value)}
-            >
-              {historyOpen ? (
-                <ChevronUp className="h-3.5 w-3.5" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5" />
-              )}
-              处理记录（{events.length}）
-            </Button>
-          </>
-        )}
-        <Button size="sm" variant="ghost" onClick={onOpenDetail}>
-          查看工单
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => setHistoryOpen((value) => !value)}
+        >
+          {historyOpen ? (
+            <ChevronUp className="h-3.5 w-3.5" />
+          ) : (
+            <ChevronDown className="h-3.5 w-3.5" />
+          )}
+          处理记录（{events.length}）
         </Button>
       </div>
 
@@ -685,7 +651,7 @@ function CompletedDispatchRow({
               variant="outline"
               className="border-emerald-300 text-emerald-700"
             >
-              {DELIVERY_TICKET_STATUS_LABELS[ticket.status]}
+              已完成
             </Badge>
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
@@ -738,7 +704,7 @@ function TicketEventHistory({ events }: { events: DispatchTicketEvent[] }) {
             {new Date(event.createdAt).toLocaleString("zh-CN")} ·{" "}
             {event.actorRole}
           </span>
-          <p>{event.message || `${event.fromStatus} → ${event.toStatus}`}</p>
+          <p>{adminTicketEventPublicMessage(event)}</p>
         </div>
       ))}
       {!events.length && (

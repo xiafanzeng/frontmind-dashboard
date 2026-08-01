@@ -38,10 +38,9 @@ Every customer-visible overview and leaf must contain exactly one block:
 ```markdown
 <!-- FRONTMIND_FORMAL_CONTENT_START -->
 
-## 正式正文
-
-[Publication-ready content. Use stable asset IDs for image relationships; do
-not embed raw source URLs here.]
+[For a leaf: copy the complete server-approved leaf Markdown exactly, including
+its protocol leaf heading. For an overview: use publication-ready overview
+content. Do not embed raw source URLs here.]
 
 <!-- FRONTMIND_FORMAL_CONTENT_END -->
 
@@ -66,6 +65,7 @@ Use this exact top-level contract. Extra fields are forbidden:
 {
   "schemaVersion": 3,
   "profile": "dashboard-enterprise-v1",
+  "buildRevision": 66,
   "documents": [
     {
       "id": "overview-products",
@@ -73,7 +73,8 @@ Use this exact top-level contract. Extra fields are forbidden:
       "kind": "overview",
       "title": "产品与服务综述",
       "branchId": "products",
-      "order": 10,
+      "branchTitle": "产品与服务",
+      "order": 0,
       "evidenceStatus": "verified_first_party",
       "sourceIds": ["source-official-products"],
       "evidenceDocumentIds": ["evidence-official-products"],
@@ -89,7 +90,8 @@ Use this exact top-level contract. Extra fields are forbidden:
       "kind": "leaf",
       "title": "产品族 A",
       "branchId": "products",
-      "order": 20,
+      "branchTitle": "产品与服务",
+      "order": 0,
       "evidenceStatus": "verified_first_party",
       "sourceIds": ["source-official-products"],
       "evidenceDocumentIds": ["evidence-official-products"],
@@ -175,6 +177,16 @@ Use this exact top-level contract. Extra fields are forbidden:
   }
 }
 ```
+
+For `kind: "leaf"`, `branchTitle` and `order` are mandatory. `order` is the
+zero-based position of that leaf in the original protocol manifest; overview,
+evidence and index documents do not participate in this sequence. The one
+formal-content block in each leaf file must be the exact server-approved leaf
+Markdown, not a rewritten final-report variant.
+
+`buildRevision` is not an example to copy blindly. On the final turn it must
+equal the service-supplied post-transition revision in that turn's
+`FRONTMIND_KB_PROGRESS` and `FRONTMIND_KB_PRESENTATION` envelopes.
 
 Allowed document kinds are `overview`, `leaf`, `evidence`, `report`, and
 `index`. Allowed evidence states are `verified_first_party`,
@@ -269,7 +281,8 @@ use or target attainment.
 - Ownership must be exactly `first_party`.
 - Every asset must belong to a branch and at least one customer-visible
   document.
-- The sole v3 asset declares `assetType: brand_identity` and
+- The sole builder-v4 asset (inside archive schema v3) declares
+  `assetType: brand_identity` and
   `displayRole: badge`, and is at least 256×256. No business, hero, product,
   UI, architecture, case, team, environment, certificate or other image may be
   packaged.

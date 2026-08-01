@@ -7,6 +7,16 @@ import { promisify } from "node:util";
 import JSZip from "jszip";
 import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  readKnowledgeArchive,
+  removeStoredKnowledgeAssets,
+} from "./dashboard-api";
+import {
+  assertKnowledgeBasePackageMatchesBuild,
+  canonicalPackagedKnowledgeBaseLeafMarkdown,
+  knowledgeBaseMarkdownSha256,
+  selectLegacyKnowledgeBaseLogoAsset,
+} from "./knowledge-base-package-validation";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -157,8 +167,9 @@ ${narrative}
       kind: "leaf",
       title: `知识叶子 ${index + 1}`,
       branchId: "products",
+      branchTitle: "产品与服务",
       productFamilyId: "family-a",
-      order: index + 1,
+      order: index,
       evidenceStatus: "verified_first_party",
       sourceIds: [sourceId],
       evidenceDocumentIds: [`evidence-leaf-${index + 1}`],
@@ -233,6 +244,7 @@ ${narrative}
   files[`${root}/00_package_manifest.json`] = JSON.stringify({
     schemaVersion: 3,
     profile: "dashboard-enterprise-v1",
+    buildRevision: 40,
     documents,
     assets,
     counts: {
@@ -273,6 +285,213 @@ describe("dashboard enterprise Skill archive validator", () => {
       code: 0,
       stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
     });
+  });
+
+  it("parses a real ZIP and binds its exact leaf/order/branch/body/Logo set", async () => {
+    const files = await validDeepArchiveFiles();
+    const archivePath = await writeArchive(files);
+    const parsed = await readKnowledgeArchive(
+      await fs.readFile(archivePath),
+      "fixture.zip",
+      "22222222-2222-4222-8222-222222222222",
+      {
+        validationProfile: "dashboard-enterprise-v1",
+        archiveContractVersions: [3],
+      },
+    );
+    try {
+      const leaves = parsed.documents
+        .filter((document) => document.kind === "leaf")
+        .sort((left, right) => left.order! - right.order!);
+      const nodes = leaves.map((document) => {
+        const contentMarkdown = canonicalPackagedKnowledgeBaseLeafMarkdown(
+          document.content,
+        );
+        return {
+          leafId: document.id!,
+          title: document.title,
+          branchId: document.branchId!,
+          branchTitle: document.branchTitle!,
+          ordinal: document.order!,
+          status: "confirmed",
+          contentMarkdown,
+          contentSha256: knowledgeBaseMarkdownSha256(contentMarkdown),
+        };
+      });
+      expect(
+        assertKnowledgeBasePackageMatchesBuild({
+          nodes,
+          documents: parsed.documents,
+          assets: parsed.assets,
+          expectedLogoSha256: parsed.assets[0]!.sha256!,
+        }),
+      ).toMatchObject({ leafCount: 40 });
+    } finally {
+      await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
+    }
+  });
+
+  it("rebinds a representative pinned v3 ZIP with 10/20 order and three visuals", async () => {
+    const files = await validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    manifest.schemaVersion = 2;
+    delete manifest.buildRevision;
+    const leaves = manifest.documents.filter(
+      (document: { kind?: string }) => document.kind === "leaf",
+    );
+    leaves.forEach((document: { order?: number }, index: number) => {
+      document.order = (index + 1) * 10;
+    });
+
+    const additionalAssets = await Promise.all(
+      [
+        {
+          id: "asset-brand-hero",
+          filename: "brand-hero.webp",
+          assetType: "environment_photo",
+          displayRole: "hero",
+          background: "#d9ece7",
+        },
+        {
+          id: "asset-product-ui",
+          filename: "product-ui.webp",
+          assetType: "product_ui",
+          displayRole: "inline",
+          background: "#8fb8ae",
+        },
+      ].map(async (asset) => {
+        const bytes = await sharp({
+          create: {
+            width: 1600,
+            height: 900,
+            channels: 3,
+            background: asset.background,
+          },
+        })
+          .webp()
+          .toBuffer();
+        const assetPath = `09_media_assets/${asset.filename}`;
+        files[`${root}/${assetPath}`] = bytes;
+        return {
+          id: asset.id,
+          path: assetPath,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          mimeType: "image/webp",
+          bytes: bytes.length,
+          width: 1600,
+          height: 900,
+          caption: asset.id,
+          branchId: "products",
+          documentIds: ["leaf-1"],
+          sourcePageUrl: "https://example.com/",
+          sourceAssetUrl: `https://example.com/assets/${asset.filename}`,
+          sourceKind: "official_web",
+          ownership: "first_party",
+          assetType: asset.assetType,
+          displayRole: asset.displayRole,
+        };
+      }),
+    );
+    manifest.assets.push(...additionalAssets);
+    leaves[0].assetIds = manifest.assets.map(
+      (asset: { id: string }) => asset.id,
+    );
+    manifest.counts.totalFiles += additionalAssets.length;
+    manifest.counts.packagedImages = 3;
+    manifest.imageSelection.discoveredCandidateImages = 3;
+    manifest.imageSelection.inspectedCandidateImages = 3;
+    manifest.imageSelection.eligibleFirstPartyImages = 3;
+    manifest.imageSelection.discoveryMethods = [
+      "img",
+      "srcset",
+      "lazy_load",
+      "picture",
+      "css_background",
+      "open_graph",
+      "gallery",
+      "official_document",
+    ];
+    manifest.imageSelection.candidates = manifest.assets.map(
+      (asset: {
+        id: string;
+        sourceAssetUrl: string;
+        sourcePageUrl: string;
+      }) => ({
+        url: asset.sourceAssetUrl,
+        sourcePageUrl: asset.sourcePageUrl,
+        method: "img",
+        status: "eligible",
+        assetId: asset.id,
+      }),
+    );
+    manifest.imageSelection.productFamilyCoverage = [
+      {
+        familyId: "family-a",
+        familyName: "产品族 A",
+        officialImageAvailable: true,
+        assetIds: ["asset-product-ui"],
+        checkedSources: ["https://example.com/"],
+      },
+    ];
+    const completeness = JSON.parse(
+      String(files[`${root}/00_completeness.json`]),
+    );
+    completeness.acquisition.images = { completed: 3, total: 3 };
+    files[`${root}/00_completeness.json`] = JSON.stringify(completeness);
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+
+    const archivePath = await writeArchive(files);
+    const parsed = await readKnowledgeArchive(
+      await fs.readFile(archivePath),
+      "legacy-v3.zip",
+      "33333333-3333-4333-8333-333333333333",
+      {
+        validationProfile: "dashboard-enterprise-v1",
+        archiveContractVersions: [2],
+      },
+    );
+    try {
+      const packageLeaves = parsed.documents
+        .filter((document) => document.kind === "leaf")
+        .sort((left, right) => left.order! - right.order!);
+      const nodes = packageLeaves.map((document, ordinal) => {
+        const contentMarkdown = canonicalPackagedKnowledgeBaseLeafMarkdown(
+          document.content,
+        );
+        return {
+          leafId: document.id!,
+          title: document.title,
+          branchId: document.branchId!,
+          branchTitle: document.branchTitle!,
+          ordinal,
+          status: "confirmed",
+          contentMarkdown,
+          contentSha256: knowledgeBaseMarkdownSha256(contentMarkdown),
+        };
+      });
+      const logo = selectLegacyKnowledgeBaseLogoAsset({
+        assets: parsed.assets,
+      });
+      expect(logo).toMatchObject({
+        id: "asset-brand-logo",
+        assetType: "brand_identity",
+        displayRole: "badge",
+      });
+      expect(
+        assertKnowledgeBasePackageMatchesBuild({
+          nodes,
+          documents: parsed.documents,
+          assets: parsed.assets,
+          expectedLogoSha256: logo.sha256!,
+          legacyV3Compatibility: true,
+        }),
+      ).toMatchObject({ leafCount: 40, logoSha256: logo.sha256 });
+    } finally {
+      await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
+    }
   });
 
   it("accepts evidence-limited prose below the writing target without padding", async () => {
@@ -351,9 +570,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
     const result = await runValidator(await writeArchive(files));
 
     expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain(
-      "assetType must be brand_identity",
-    );
+    expect(result.stderr).toContain("assetType must be brand_identity");
   });
 
   it("rejects evidence duplicated after normalization", async () => {

@@ -452,7 +452,7 @@ export default function KnowledgeBaseLivePreview() {
       .find(
         (value) =>
           value.kind === "frontmind.knowledge-base.presentation" &&
-          value.schemaVersion === 1 &&
+          (value.schemaVersion === 1 || value.schemaVersion === 2) &&
           Number.isSafeInteger(value.revision) &&
           (value.leafId === null || typeof value.leafId === "string"),
       );
@@ -497,14 +497,15 @@ export default function KnowledgeBaseLivePreview() {
             <div>
               <div className="flex items-center gap-2 text-sm font-medium text-emerald-700">
                 <ShieldCheck className="h-4 w-4" />
-                仅本机开发环境 · 真实 FrontMind API
+                仅本机开发环境 · 上游协议诊断
               </div>
               <h1 className="mt-2 text-2xl font-semibold">
-                知识库 API 与渲染验收台
+                FrontMind 上游协议探针
               </h1>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-                使用正式知识库 Skill、FrontMind-Pro
-                和任务接口；机器协议经严格校验后从客户正文中剥离。无需登录看板账号。
+                真实调用 FrontMind API 并检查原始协议与资源传输；此页不经过
+                Dashboard 数据库、权威 reconcile
+                或生产会话组件，因此不能作为上线验收通过依据。
               </p>
             </div>
             <div className="rounded-xl bg-slate-100 px-3 py-2 text-xs text-slate-600">

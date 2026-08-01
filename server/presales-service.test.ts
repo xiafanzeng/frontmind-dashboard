@@ -10,6 +10,7 @@ import {
 } from "../drizzle/schema";
 import {
   PRESALES_REVOKABLE_STATUSES,
+  aggregatePresalesCreditUsagePage,
   acquirePresalesTaskReservation,
   completePresalesTaskReservation,
   deletePresalesApiCredential,
@@ -81,6 +82,79 @@ describe("presales credential encryption", () => {
   });
 });
 
+describe("presales rolling usage aggregation", () => {
+  it("deduplicates the same task returned by multiple credential versions and enforces the 30-day boundary", () => {
+    const now = Date.parse("2026-08-02T08:00:00.000Z");
+    const cutoff = now - 30 * 86_400_000;
+    const seenTaskIds = new Set<string>();
+    const currentVersion = aggregatePresalesCreditUsagePage({
+      tasks: [
+        { id: "shared-task", created_at: cutoff, credit_usage: 40 },
+        { id: "future-task", created_at: now, credit_usage: 100 },
+      ],
+      websiteTaskIds: new Set(["shared-task", "future-task"]),
+      cutoffMs: cutoff,
+      endExclusive: now,
+      seenTaskIds,
+    });
+    const retiredVersion = aggregatePresalesCreditUsagePage({
+      tasks: [
+        { id: "shared-task", created_at: cutoff, credit_usage: 40 },
+        { id: "old-task", created_at: cutoff - 1, credit_usage: 80 },
+      ],
+      websiteTaskIds: new Set(["shared-task", "old-task"]),
+      cutoffMs: cutoff,
+      endExclusive: now,
+      seenTaskIds,
+    });
+    expect(currentVersion).toMatchObject({
+      keyTotalUsed: 40,
+      websiteUsed: 40,
+    });
+    expect(retiredVersion).toMatchObject({
+      keyTotalUsed: 0,
+      websiteUsed: 0,
+      reachedCutoff: true,
+    });
+  });
+
+  it("marks a page incomplete instead of reporting a false total when a task timestamp is unknown", () => {
+    const result = aggregatePresalesCreditUsagePage({
+      tasks: [{ id: "unknown-time", credit_usage: 50 }],
+      websiteTaskIds: new Set(["unknown-time"]),
+      cutoffMs: 0,
+      endExclusive: Date.now(),
+      seenTaskIds: new Set(),
+    });
+    expect(result).toMatchObject({
+      keyTotalUsed: 0,
+      websiteUsed: 0,
+      complete: false,
+    });
+  });
+
+  it("keeps scanning a page when an expired task appears before a recent task", () => {
+    const now = Date.parse("2026-08-02T08:00:00.000Z");
+    const cutoff = now - 30 * 86_400_000;
+    const result = aggregatePresalesCreditUsagePage({
+      tasks: [
+        { id: "old-first", created_at: cutoff - 1, credit_usage: 99 },
+        { id: "new-later", created_at: cutoff + 1, credit_usage: 40 },
+      ],
+      websiteTaskIds: new Set(["new-later"]),
+      cutoffMs: cutoff,
+      endExclusive: now,
+      seenTaskIds: new Set(),
+    });
+    expect(result).toMatchObject({
+      keyTotalUsed: 40,
+      websiteUsed: 40,
+      reachedCutoff: false,
+      complete: true,
+    });
+  });
+});
+
 function resourceCredential(id: string, status: "active" | "retired") {
   return {
     id,
@@ -101,25 +175,33 @@ function resourceCredential(id: string, status: "active" | "retired") {
 }
 
 describe("presales credential version binding", () => {
-  it("uses a retired credential when all attachments belong to that version", async () => {
+  it("rejects retired attachments even when they all belong to one old version", async () => {
     const oldCredential = resourceCredential("credential-1", "retired");
-    const credential = await resolvePresalesTaskCredentialForFiles(
-      ["kb.zip", "evidence.pdf", "kb.zip"],
-      { getForFile: async () => oldCredential },
-    );
-
-    expect(credential).toMatchObject({
-      id: "credential-1",
-      version: 1,
-      status: "retired",
-      apiKey: "sk-credential-1",
-    });
-    expect(credential).not.toHaveProperty("resource");
+    const active = resourceCredential("credential-2", "active");
+    await expect(
+      resolvePresalesTaskCredentialForFiles(
+        ["kb.zip", "evidence.pdf", "kb.zip"],
+        {
+          getActive: async () => {
+            const { resource: _resource, ...value } = active;
+            return value;
+          },
+          getForFile: async () => oldCredential,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
   });
 
   it("rejects attachments owned by multiple credential versions", async () => {
     await expect(
       resolvePresalesTaskCredentialForFiles(["old.zip", "new.pdf"], {
+        getActive: async () => {
+          const { resource: _resource, ...value } = resourceCredential(
+            "credential-2",
+            "active",
+          );
+          return value;
+        },
         getForFile: async (fileId) =>
           fileId === "old.zip"
             ? resourceCredential("credential-1", "retired")
@@ -131,6 +213,13 @@ describe("presales credential version binding", () => {
   it("rejects an attachment whose credential was revoked", async () => {
     await expect(
       resolvePresalesTaskCredentialForFiles(["revoked.zip"], {
+        getActive: async () => {
+          const { resource: _resource, ...value } = resourceCredential(
+            "credential-2",
+            "active",
+          );
+          return value;
+        },
         getForFile: async () => null,
       }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
@@ -146,17 +235,37 @@ describe("presales credential version binding", () => {
     });
     expect(credential?.id).toBe("credential-2");
   });
+
+  it("returns the current credential when every attachment belongs to it", async () => {
+    const activeResource = resourceCredential("credential-2", "active");
+    const { resource: _resource, ...active } = activeResource;
+    const credential = await resolvePresalesTaskCredentialForFiles(
+      ["current.zip", "current.skill.zip"],
+      {
+        getActive: async () => active,
+        getForFile: async () => activeResource,
+      },
+    );
+    expect(credential).toEqual(active);
+  });
 });
 
 describe("presales credential revocation", () => {
-  it("targets active and retired versions and destroys stored ciphertext", async () => {
+  it("destroys only an unbound active version and preserves retired history", async () => {
     let update: Record<string, unknown> | undefined;
+    let selectIndex = 0;
     const executor = {
-      select: () => ({
-        from: () => ({
-          where: async () => [],
-        }),
-      }),
+      select: () => {
+        const rows = selectIndex++ === 0 ? [{ id: "active-credential" }] : [];
+        return {
+          from: () => ({
+            where: () => ({
+              for: async () => rows,
+              limit: () => ({ for: async () => rows }),
+            }),
+          }),
+        };
+      },
       update: () => ({
         set: (value: Record<string, unknown>) => {
           update = value;
@@ -167,7 +276,7 @@ describe("presales credential revocation", () => {
 
     await deletePresalesApiCredential(executor);
 
-    expect(PRESALES_REVOKABLE_STATUSES).toEqual(["active", "retired"]);
+    expect(PRESALES_REVOKABLE_STATUSES).toEqual(["active"]);
     expect(update).toMatchObject({
       status: "deleted",
       validationStatus: "unverified",
@@ -176,6 +285,38 @@ describe("presales credential revocation", () => {
     expect(String(update?.encryptedKey)).toHaveLength(44);
     expect(String(update?.encryptionIv)).toHaveLength(16);
     expect(String(update?.encryptionAuthTag)).toHaveLength(24);
+  });
+
+  it("fails closed when the active website Key still owns a task, file or monitor run", async () => {
+    let selectIndex = 0;
+    let updateCalled = false;
+    const executor = {
+      select: () => {
+        const rows =
+          selectIndex++ === 0
+            ? [{ id: "active-credential" }]
+            : selectIndex === 2
+              ? [{ id: "bound-resource" }]
+              : [];
+        return {
+          from: () => ({
+            where: () => ({
+              for: async () => rows,
+              limit: () => ({ for: async () => rows }),
+            }),
+          }),
+        };
+      },
+      update: () => {
+        updateCalled = true;
+        return { set: () => ({ where: async () => undefined }) };
+      },
+    };
+
+    await expect(deletePresalesApiCredential(executor)).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect(updateCalled).toBe(false);
   });
 
   it("stores only a deterministic hash for signed task output URLs", () => {

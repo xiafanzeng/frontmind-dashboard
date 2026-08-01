@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import JSZip from "jszip";
-import { prepareUploadFiles } from "./attachment-files";
+import { prepareUploadFiles, sha256UploadFile } from "./attachment-files";
 
 const mocks = vi.hoisted(() => ({
   inspectImageFile: vi.fn(),
@@ -41,6 +41,21 @@ describe("attachment-files", () => {
     expect(result.files[0].file).toBe(image);
   });
 
+  it("distinguishes equal metadata files by their exact SHA-256 bytes", async () => {
+    const metadata = {
+      type: "application/octet-stream",
+      lastModified: 1_700_000_000_000,
+    };
+    const first = new File(["aaaa"], "same.bin", metadata);
+    const second = new File(["bbbb"], "same.bin", metadata);
+
+    expect(first.size).toBe(second.size);
+    expect(first.lastModified).toBe(second.lastModified);
+    expect(await sha256UploadFile(first)).not.toBe(
+      await sha256UploadFile(second),
+    );
+  });
+
   it("packs oversized images into a lossless ZIP with original names", async () => {
     mocks.inspectImageFile.mockResolvedValueOnce({
       width: 25_893,
@@ -59,7 +74,7 @@ describe("attachment-files", () => {
     expect(result.didZipLargeImages).toBe(true);
     expect(result.files).toHaveLength(1);
     expect(result.files[0].file.name).toMatch(
-      /^frontmind-original-images-\d{8}\.zip$/,
+      /^frontmind-original-images-[0-9a-f]{8}\.zip$/,
     );
     expect(result.files[0].file.type).toBe("application/zip");
 
@@ -87,7 +102,37 @@ describe("attachment-files", () => {
     expect(result.files).toHaveLength(2);
     expect(result.files[0].file).toBe(pdf);
     expect(result.files[1].file.name).toMatch(
-      /^frontmind-original-images-\d{8}\.zip$/,
+      /^frontmind-original-images-[0-9a-f]{8}\.zip$/,
     );
+  });
+
+  it("produces the same upload manifest metadata for the same original images", async () => {
+    mocks.inspectImageFile.mockResolvedValue({
+      width: 26_009,
+      height: 8_270,
+      pixels: 215_094_430,
+      size: 7_000_000,
+      isLarge: true,
+      reasons: ["总像素 215.1MP"],
+    });
+    const image = new File(["same-image"], "large.png", {
+      type: "image/png",
+      lastModified: 1_700_000_000_000,
+    });
+
+    const first = (await prepareUploadFiles([image])).files[0]!.file;
+    const second = (await prepareUploadFiles([image])).files[0]!.file;
+
+    expect({
+      name: first.name,
+      size: first.size,
+      type: first.type,
+      lastModified: first.lastModified,
+    }).toEqual({
+      name: second.name,
+      size: second.size,
+      type: second.type,
+      lastModified: second.lastModified,
+    });
   });
 });

@@ -60,12 +60,37 @@ const EMPTY_STATUS: CredentialStatus = {
 export const DEFAULT_API_KEY_USAGE_LIMIT = 230_000;
 export const DEFAULT_API_KEY_WARNING_RATIO = 0.8;
 
+export function presalesUsageDisplayState(input: {
+  complete: boolean;
+  keyTotalUsed: number;
+  websiteUsed: number;
+  limit: number;
+}) {
+  if (!input.complete) {
+    return {
+      keyTotalLabel: "—",
+      websiteUsedLabel: "—",
+      percentageLabel: "—",
+      progressPercentage: 0,
+    };
+  }
+  const percentage =
+    Math.round((input.keyTotalUsed / Math.max(1, input.limit)) * 1000) / 10;
+  return {
+    keyTotalLabel: input.keyTotalUsed.toLocaleString(),
+    websiteUsedLabel: input.websiteUsed.toLocaleString(),
+    percentageLabel: `${percentage}%`,
+    progressPercentage: Math.min(100, percentage),
+  };
+}
+
 export default function AdminPresales() {
   const [, setLocation] = useLocation();
   const { user } = useAuth();
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [allowIncompleteHistory, setAllowIncompleteHistory] = useState(false);
   const [connectionState, setConnectionState] = useState<
     "idle" | "success" | "error"
   >("idle");
@@ -101,7 +126,7 @@ export default function AdminPresales() {
       items.find((item: any) => item?.scope === "website_frontend") ?? null
     );
   }, [policyOverviewQuery.data]);
-  const usageWindowDays = Math.max(1, Number(websitePolicy?.windowDays) || 30);
+  const usageWindowDays = 30;
   const usageQuery = trpc.admin.presales.usage.useQuery(
     { windowDays: usageWindowDays },
     {
@@ -134,12 +159,16 @@ export default function AdminPresales() {
   }, [apiKey]);
 
   useEffect(() => {
+    setAllowIncompleteHistory(false);
+  }, [status.version]);
+
+  useEffect(() => {
     if (!websitePolicy) return;
     setPolicyLimit(String(websitePolicy.limit));
     setPolicyWarningPercent(
       String(Math.round(Number(websitePolicy.warningRatio) * 100)),
     );
-    setPolicyWindowDays(String(websitePolicy.windowDays));
+    setPolicyWindowDays("30");
   }, [websitePolicy]);
 
   const maskedFingerprint = useMemo(() => {
@@ -156,12 +185,19 @@ export default function AdminPresales() {
     }
     try {
       if (status.configured) {
-        await replaceMutation.mutateAsync({ apiKey: value });
+        await replaceMutation.mutateAsync({
+          apiKey: value,
+          allowIncompleteHistory,
+        });
       } else {
-        await setMutation.mutateAsync({ apiKey: value });
+        await setMutation.mutateAsync({
+          apiKey: value,
+          allowIncompleteHistory,
+        });
       }
       setApiKey("");
       setShowApiKey(false);
+      setAllowIncompleteHistory(false);
       setConnectionState("success");
       await refreshAll();
       toast.success(
@@ -194,6 +230,7 @@ export default function AdminPresales() {
       toast.success("售前服务连接正常", { description: `${latency}ms` });
     } catch (error) {
       setLatencyMs(null);
+      setAllowIncompleteHistory(false);
       setConnectionState("error");
       toast.error("连接测试失败", {
         description:
@@ -291,6 +328,7 @@ export default function AdminPresales() {
   const recentWebsiteTasks = usageQuery.data?.recentWebsiteTasks ?? [];
   const keyTotalUsed = usageQuery.data?.keyTotalUsed ?? 0;
   const websiteUsed = usageQuery.data?.websiteUsed ?? 0;
+  const usageComplete = usageQuery.data?.complete !== false;
   const usageLimit = Math.max(
     1,
     Number(websitePolicy?.limit) || DEFAULT_API_KEY_USAGE_LIMIT,
@@ -302,9 +340,15 @@ export default function AdminPresales() {
       Number(websitePolicy?.warningRatio) || DEFAULT_API_KEY_WARNING_RATIO,
     ),
   );
-  const usagePercentage = Math.round((keyTotalUsed / usageLimit) * 1000) / 10;
-  const usageTone =
-    keyTotalUsed >= usageLimit
+  const usageDisplay = presalesUsageDisplayState({
+    complete: usageComplete,
+    keyTotalUsed,
+    websiteUsed,
+    limit: usageLimit,
+  });
+  const usageTone = !usageComplete
+    ? "unavailable"
+    : keyTotalUsed >= usageLimit
       ? "critical"
       : keyTotalUsed >= usageLimit * warningRatio
         ? "warning"
@@ -442,6 +486,25 @@ export default function AdminPresales() {
                     </p>
                   </div>
 
+                  {status.configured && (
+                    <label className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2.5 text-xs leading-5 text-amber-950">
+                      <input
+                        type="checkbox"
+                        className="mt-1"
+                        checked={allowIncompleteHistory}
+                        onChange={(event) =>
+                          setAllowIncompleteHistory(event.target.checked)
+                        }
+                        disabled={saving}
+                      />
+                      <span>
+                        旧 Key
+                        已失效时允许应急替换；未完整扫描的历史用量会显示为“不可用”，不会记为
+                        0。
+                      </span>
+                    </label>
+                  )}
+
                   {connectionState !== "idle" && (
                     <div
                       className={`flex items-center gap-2 rounded-xl border px-3 py-2.5 text-xs ${
@@ -562,18 +625,26 @@ export default function AdminPresales() {
                   </div>
                 ) : (
                   <div className="space-y-5">
+                    {!usageComplete && (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                        历史 Key 或任务分页未能完整读取。近 30
+                        天总量与百分比已隐藏，避免把部分结果误认为准确用量。
+                      </div>
+                    )}
                     <div
                       className={`rounded-2xl border p-5 ${
                         usageTone === "critical"
                           ? "border-red-200 bg-red-50/70"
                           : usageTone === "warning"
                             ? "border-amber-200 bg-amber-50/70"
-                            : "border-primary/10 bg-primary/[0.055]"
+                            : usageTone === "unavailable"
+                              ? "border-slate-200 bg-slate-50/80"
+                              : "border-primary/10 bg-primary/[0.055]"
                       }`}
                     >
                       <div className="flex items-center justify-between gap-3">
                         <p className="fm-eyebrow text-muted-foreground">
-                          当前 Key 总积分使用 / 上限
+                          当前 Key 近 30 天总积分使用 / 上限
                         </p>
                         <Badge
                           variant="outline"
@@ -582,25 +653,29 @@ export default function AdminPresales() {
                               ? "border-red-200 bg-white text-red-700"
                               : usageTone === "warning"
                                 ? "border-amber-200 bg-white text-amber-700"
-                                : "border-emerald-200 bg-white text-emerald-700"
+                                : usageTone === "unavailable"
+                                  ? "border-slate-300 bg-white text-slate-700"
+                                  : "border-emerald-200 bg-white text-emerald-700"
                           }
                         >
                           {usageTone === "critical"
                             ? "严重预警"
                             : usageTone === "warning"
                               ? "用量预警"
-                              : "用量正常"}
+                              : usageTone === "unavailable"
+                                ? "统计不完整"
+                                : "用量正常"}
                         </Badge>
                       </div>
                       <div className="mt-2 flex items-end justify-between gap-3">
                         <p className="text-3xl font-semibold tracking-tight text-primary">
-                          {keyTotalUsed.toLocaleString()}
+                          {usageDisplay.keyTotalLabel}
                           <span className="ml-1 text-sm font-normal text-muted-foreground">
                             / {usageLimit.toLocaleString()}
                           </span>
                         </p>
                         <span className="pb-1 text-sm text-muted-foreground">
-                          {usagePercentage}%
+                          {usageDisplay.percentageLabel}
                         </span>
                       </div>
                       <div className="mt-3 h-2 overflow-hidden rounded-full bg-white">
@@ -613,7 +688,7 @@ export default function AdminPresales() {
                                 : "bg-primary"
                           }`}
                           style={{
-                            width: `${Math.min(100, usagePercentage)}%`,
+                            width: `${usageDisplay.progressPercentage}%`,
                           }}
                         />
                       </div>
@@ -624,7 +699,7 @@ export default function AdminPresales() {
                         其中官网前台任务使用
                       </p>
                       <p className="mt-1 text-2xl font-semibold text-foreground">
-                        {websiteUsed.toLocaleString()}
+                        {usageDisplay.websiteUsedLabel}
                       </p>
                     </div>
 
@@ -716,10 +791,12 @@ export default function AdminPresales() {
                           id="website-window-days"
                           inputMode="numeric"
                           value={policyWindowDays}
-                          onChange={(event) =>
-                            setPolicyWindowDays(event.target.value)
-                          }
+                          readOnly
+                          disabled
                         />
+                        <p className="text-xs text-muted-foreground">
+                          正式用量口径固定为精确滚动 30 天。
+                        </p>
                       </div>
                     </div>
                     <Button

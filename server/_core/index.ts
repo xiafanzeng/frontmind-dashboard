@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { sql } from "drizzle-orm";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter } from "../routers";
@@ -9,8 +11,10 @@ import { serveStatic, setupVite } from "./vite";
 import manusProxy from "../manus-proxy";
 import knowledgeBaseApi, {
   getKnowledgeBaseSkillDescriptor,
+  recoverExpiredKnowledgeBaseTurns,
   recoverOpenKnowledgeBaseTasks,
 } from "../knowledge-base-api";
+import { cleanupOrphanedKnowledgeBuildArtifactCandidates } from "../knowledge-base-artifact-binding-service";
 import responseLogicApi, {
   getResponseLogicSkillDescriptor,
 } from "../response-logic-api";
@@ -63,14 +67,33 @@ import {
 import { createPaymentReceiptLedgerService } from "../payment-receipt-ledger-service";
 import { createProjectOrderRegistryService } from "../project-order-registry-service";
 import knowledgeBaseLivePreviewApi from "../knowledge-base-live-preview-api";
+import knowledgeBaseArtifactApi from "../knowledge-base-artifact-api";
+import { auditKnowledgeBaseStateInvariants } from "../knowledge-base-invariant-audit";
+import { runtimeErrorForLog } from "./runtime-error-log";
+import {
+  evaluateKnowledgeBaseReadiness,
+  knowledgeBaseReadinessHttpStatus,
+  knowledgeBaseRecoveryHealth,
+  runLeasedKnowledgeBaseRecovery,
+} from "./knowledge-base-readiness";
+import { createKnowledgeBaseRecoverySweep } from "../knowledge-base-recovery-worker";
+import { createRuntimeReleaseArtifactVerifier } from "../../scripts/runtime-artifact-integrity.mjs";
+
+declare const __FRONTMIND_BUILD_SHA__: string | undefined;
 
 const paymentReceiptLedgerReadiness = createPaymentReceiptLedgerService();
 const projectOrderRegistryReadiness = createProjectOrderRegistryService();
+const compiledBuildSha =
+  typeof __FRONTMIND_BUILD_SHA__ === "string"
+    ? __FRONTMIND_BUILD_SHA__.trim().toLowerCase()
+    : "";
 const applicationBuildSha =
-  process.env.FRONTMIND_BUILD_SHA?.trim() ||
-  process.env.COMMIT_SHA?.trim() ||
-  process.env.RENDER_GIT_COMMIT?.trim() ||
+  compiledBuildSha ||
+  process.env.FRONTMIND_BUILD_SHA?.trim().toLowerCase() ||
+  process.env.COMMIT_SHA?.trim().toLowerCase() ||
+  process.env.RENDER_GIT_COMMIT?.trim().toLowerCase() ||
   null;
+const runtimeBuildRoot = path.dirname(fileURLToPath(import.meta.url));
 
 function assertProductionConfiguration() {
   if (process.env.NODE_ENV !== "production") return;
@@ -98,6 +121,18 @@ async function getRuntimeSkillReadiness() {
 }
 
 async function startServer() {
+  const verifyCurrentReleaseArtifact = createRuntimeReleaseArtifactVerifier(
+    runtimeBuildRoot,
+    {
+      buildSourceSha: applicationBuildSha,
+      env: process.env,
+      ttlMs: 5_000,
+    },
+  );
+  const startupReleaseArtifact =
+    process.env.NODE_ENV === "production"
+      ? await verifyCurrentReleaseArtifact({ force: true })
+      : undefined;
   assertProductionConfiguration();
   if (process.env.NODE_ENV === "production") {
     await assertAdminAccessLevelsBackfilled();
@@ -141,25 +176,52 @@ async function startServer() {
     app.use("/api/dev/knowledge-base-live", knowledgeBaseLivePreviewApi);
   }
 
-  app.get("/healthz", async (_req, res) => {
+  app.get(["/healthz", "/readyz"], async (_req, res) => {
     try {
       assertUpstreamBaseUrlConfigured();
       monitorBaseUrl();
       const db = await getDb();
       if (!db) throw new Error("Database is not configured");
       await db.execute(sql`select 1`);
-      const [preparedFiles, skills, paymentReceipts, projectOrders] =
-        await Promise.all([
-          preparedFileService.health(),
-          getRuntimeSkillReadiness(),
-          paymentReceiptLedgerReadiness.ready(),
-          projectOrderRegistryReadiness.ready(),
-        ]);
-      res.json({
+      const [
+        preparedFiles,
+        skills,
+        paymentReceipts,
+        projectOrders,
+        knowledgeBase,
+        currentReleaseArtifact,
+      ] = await Promise.all([
+        preparedFileService.health(),
+        getRuntimeSkillReadiness(),
+        paymentReceiptLedgerReadiness.ready(),
+        projectOrderRegistryReadiness.ready(),
+        evaluateKnowledgeBaseReadiness({
+          db,
+          recoveryRequired: process.env.NODE_ENV === "production",
+          assetRootRequired: process.env.NODE_ENV === "production",
+        }),
+        startupReleaseArtifact
+          ? verifyCurrentReleaseArtifact()
+          : Promise.resolve(undefined),
+      ]);
+      const status = knowledgeBaseReadinessHttpStatus(knowledgeBase);
+      const response = {
         status: "ok",
         build: {
           sha: applicationBuildSha,
         },
+        artifact: currentReleaseArtifact
+          ? {
+              verified: true,
+              schemaVersion: currentReleaseArtifact.manifest.schemaVersion,
+              approvalSha: currentReleaseArtifact.approvalSha,
+              buildSourceSha: currentReleaseArtifact.buildSourceSha,
+              expectedRootSha256: currentReleaseArtifact.expectedRootSha256,
+              actualRootSha256: currentReleaseArtifact.actualRootSha256,
+              rootSha256: currentReleaseArtifact.actualRootSha256,
+              fileCount: currentReleaseArtifact.manifest.files.length,
+            }
+          : undefined,
         configuration: {
           monitorCredentialConfigured: isDedicatedMonitorCredentialConfigured(),
           monitorApiBaseUrlConfigured: true,
@@ -181,9 +243,23 @@ async function startServer() {
           version,
           contentHash,
         })),
+        knowledgeBase: knowledgeBase.dto,
+      };
+      if (status === 503) {
+        console.error("[Health] knowledge_base_unavailable", {
+          code: "KB_READINESS_UNAVAILABLE",
+        });
+        res.status(status).json({
+          ...response,
+          status: "unavailable",
+        });
+        return;
+      }
+      res.status(status).json(response);
+    } catch {
+      console.error("[Health] readiness_check_failed", {
+        code: "READINESS_CHECK_FAILED",
       });
-    } catch (error) {
-      console.error("[Health] Readiness check failed", error);
       res.status(503).json({ status: "unavailable" });
     }
   });
@@ -214,6 +290,11 @@ async function startServer() {
       .json({ error: { message: "接口不存在", code: "NOT_FOUND" } });
   });
   // One-click enterprise knowledge base workflow powered by the Socratic KB skill.
+  app.use(
+    "/api/knowledge-base/artifacts",
+    requireExpressAuth,
+    knowledgeBaseArtifactApi,
+  );
   app.use(
     "/api/knowledge-base",
     requireExpressAuth,
@@ -261,13 +342,18 @@ async function startServer() {
   }
 
   // Return a controlled response for malformed percent-encoded request paths.
-  app.use((err: any, _req: any, res: any, next: any) => {
+  app.use((err: any, req: any, res: any, next: any) => {
     if (err instanceof URIError) {
       // Silently ignore URI decode errors from malformed paths
       res.status(400).end();
       return;
     }
-    console.error("[HTTP] Unhandled request error", err);
+    console.error(
+      "[HTTP] Unhandled request error",
+      runtimeErrorForLog(err, {
+        additionalSecrets: [req.frontmindCredential?.apiKey],
+      }),
+    );
     if (res.headersSent) {
       next(err);
       return;
@@ -297,19 +383,68 @@ async function startServer() {
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);
     if (process.env.NODE_ENV === "production") {
-      void recoverOpenKnowledgeBaseTasks()
-        .then((result) => {
+      const recoverKnowledgeBaseState = createKnowledgeBaseRecoverySweep({
+        recoverExpiredTurns: () => recoverExpiredKnowledgeBaseTurns(),
+        recoverOpenBuilds: (options) => recoverOpenKnowledgeBaseTasks(options),
+        cleanupArtifactCandidates: () =>
+          cleanupOrphanedKnowledgeBuildArtifactCandidates(),
+      });
+      const runKnowledgeRecovery = async () => {
+        try {
+          const recovery = await runLeasedKnowledgeBaseRecovery({
+            tracker: knowledgeBaseRecoveryHealth,
+            recover: recoverKnowledgeBaseState,
+          });
+          if (!recovery) return;
+          const { claimedTurnIds: _claimedTurnIds, ...turnMetrics } =
+            recovery.turns;
           console.info(
-            "[KnowledgeBaseRecovery] startup_scan_complete",
-            JSON.stringify(result),
+            "[KnowledgeBaseRecovery] scan_complete",
+            JSON.stringify({
+              turns: turnMetrics,
+              builds: recovery.builds,
+              artifacts: recovery.artifacts,
+            }),
           );
-        })
-        .catch((error) => {
-          console.error("[KnowledgeBaseRecovery] startup_scan_failed", error);
+        } catch (error) {
+          console.error(
+            "[KnowledgeBaseRecovery] scan_failed",
+            runtimeErrorForLog(error),
+          );
+        }
+      };
+      void runKnowledgeRecovery();
+      const knowledgeRecoveryTimer = setInterval(
+        () => void runKnowledgeRecovery(),
+        30_000,
+      );
+      knowledgeRecoveryTimer.unref();
+      const runKnowledgeInvariantAudit = () => {
+        void auditKnowledgeBaseStateInvariants({
+          blockWritesOnP0: true,
+        }).catch((error) => {
+          console.error(
+            "[KnowledgeBaseInvariant] audit_failed",
+            runtimeErrorForLog(error),
+          );
         });
+      };
+      const knowledgeInvariantWarmup = setTimeout(
+        runKnowledgeInvariantAudit,
+        60_000,
+      );
+      knowledgeInvariantWarmup.unref();
+      const knowledgeInvariantTimer = setInterval(
+        runKnowledgeInvariantAudit,
+        5 * 60_000,
+      );
+      knowledgeInvariantTimer.unref();
       const runResetCleanup = () => {
         void processKnowledgeResetCleanupJobs().catch((error) => {
-          console.error("[KnowledgeBaseReset] cleanup_retry_failed", error);
+          console.error(
+            "[KnowledgeBaseReset] cleanup_retry_failed",
+            runtimeErrorForLog(error),
+          );
         });
       };
       runResetCleanup();
@@ -320,6 +455,6 @@ async function startServer() {
 }
 
 startServer().catch((error) => {
-  console.error(error);
+  console.error("[Server] startup_failed", runtimeErrorForLog(error));
   process.exitCode = 1;
 });

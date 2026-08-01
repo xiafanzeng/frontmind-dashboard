@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, ne } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, ne } from "drizzle-orm";
 
 import {
   presalesApiCredentials,
@@ -20,9 +20,21 @@ import {
 } from "./auth-service";
 import { getDb } from "./db";
 import { getUpstreamBaseUrl } from "./upstream-config";
+import {
+  claimUsageCredentialCoverage,
+  hasCompleteExpectedTaskSet,
+  loadUsageCoverage,
+  isUsageTaskTerminal,
+  markUsageCredentialCoverage,
+  readWebsiteUsageLedger,
+  recordUsageLedgerEntries,
+  selectPhysicalCredentialRows,
+  usageCoverageSupportsRetiredCredential,
+  usageCoverageSupportsReplacement,
+} from "./api-usage-ledger";
 
 const PRESALES_CREDENTIAL_SLOT = "website";
-export const PRESALES_REVOKABLE_STATUSES = ["active", "retired"] as const;
+export const PRESALES_REVOKABLE_STATUSES = ["active"] as const;
 const CREDIT_USAGE_LOOKBACK_DAYS = 30;
 const CREDIT_USAGE_PAGE_LIMIT = 100;
 const CREDIT_USAGE_MAX_PAGES = 20;
@@ -44,6 +56,7 @@ export type DecryptedPresalesCredential = {
   fingerprint: string;
   status: "active" | "retired";
   verifiedAt: Date | null;
+  retiredAt: Date | null;
 };
 
 export type PresalesCreditUsageTask = {
@@ -59,6 +72,7 @@ export type WebsiteApiKeyUsage = {
   websiteUsed: number;
   recentWebsiteTasks: PresalesCreditUsageTask[];
   fetchedAt: number;
+  complete: boolean;
 };
 
 export type PresalesTaskReservation =
@@ -150,9 +164,52 @@ export async function replacePresalesApiCredential(
   actorUserId: number,
   apiKey: string,
   validator: (apiKey: string) => Promise<void> = validateUpstreamApiKey,
+  allowIncompleteHistory = false,
 ) {
   await validator(apiKey);
   const db = await requireDb();
+  const existingRows = await db
+    .select()
+    .from(presalesApiCredentials)
+    .where(
+      and(
+        eq(presalesApiCredentials.slot, PRESALES_CREDENTIAL_SLOT),
+        eq(presalesApiCredentials.status, "active"),
+      ),
+    )
+    .orderBy(desc(presalesApiCredentials.version))
+    .limit(1);
+  const existing = existingRows[0];
+  if (existing) {
+    try {
+      await getPresalesCreditUsage(CREDIT_USAGE_LOOKBACK_DAYS);
+    } catch {
+      // Coverage below decides whether normal replacement may proceed.
+    }
+  }
+  const coverageByFingerprint = existing
+    ? await loadUsageCoverage({
+        executor: db,
+        scope: "website_frontend",
+        fingerprints: [existing.fingerprint],
+      })
+    : new Map<string, any>();
+  const coverageNow = Date.now();
+  const historyIncomplete = Boolean(
+    existing &&
+      !usageCoverageSupportsReplacement({
+        coverage: coverageByFingerprint.get(existing.fingerprint),
+        periodStartMs:
+          coverageNow - CREDIT_USAGE_LOOKBACK_DAYS * 24 * 60 * 60 * 1_000,
+        nowMs: coverageNow,
+      }),
+  );
+  if (historyIncomplete && !allowIncompleteHistory) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "旧官网 API Key 无法完成近 30 天扫描或仍有进行中任务。若旧 Key 已失效，可明确允许历史用量暂时不可用后应急替换；系统不会把缺失历史显示为 0。",
+    );
+  }
   const credentialId = randomUUID();
   const encrypted = encryptPresalesApiKey(credentialId, apiKey);
   const fingerprint = getApiKeyFingerprint(apiKey);
@@ -166,6 +223,12 @@ export async function replacePresalesApiCredential(
       .orderBy(desc(presalesApiCredentials.version))
       .limit(1)
       .for("update");
+    if ((latest[0]?.id ?? null) !== (existing?.id ?? null)) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "官网 API Key 状态已变化，请刷新后重试。",
+      );
+    }
     const nextVersion = (latest[0]?.version ?? 0) + 1;
 
     await tx
@@ -197,6 +260,11 @@ export async function replacePresalesApiCredential(
     return credential;
   });
 
+  try {
+    await getPresalesCreditUsage(CREDIT_USAGE_LOOKBACK_DAYS);
+  } catch {
+    // Keep the prior exact values hidden until a later complete scan.
+  }
   return toCredentialStatus(inserted);
 }
 
@@ -204,6 +272,44 @@ export async function deletePresalesApiCredential(executor?: any) {
   const db = executor ?? (await requireDb());
   const now = new Date();
   const remove = async (tx: any) => {
+    const activeRows = await tx
+      .select({ id: presalesApiCredentials.id })
+      .from(presalesApiCredentials)
+      .where(
+        and(
+          eq(presalesApiCredentials.slot, PRESALES_CREDENTIAL_SLOT),
+          eq(presalesApiCredentials.status, "active"),
+        ),
+      )
+      .for("update");
+    if (activeRows.length === 0) return;
+    const activeIds = activeRows.map((row: any) => row.id);
+    const [resources, taskRequests, monitorRuns] = await Promise.all([
+      tx
+        .select({ id: presalesUpstreamResources.id })
+        .from(presalesUpstreamResources)
+        .where(inArray(presalesUpstreamResources.apiCredentialId, activeIds))
+        .limit(1)
+        .for("update"),
+      tx
+        .select({ id: presalesTaskRequests.id })
+        .from(presalesTaskRequests)
+        .where(inArray(presalesTaskRequests.apiCredentialId, activeIds))
+        .limit(1)
+        .for("update"),
+      tx
+        .select({ id: presalesMonitorRuns.id })
+        .from(presalesMonitorRuns)
+        .where(inArray(presalesMonitorRuns.apiCredentialId, activeIds))
+        .limit(1)
+        .for("update"),
+    ]);
+    if (resources[0] || taskRequests[0] || monitorRuns[0]) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "当前官网 API Key 仍绑定任务、文件或监控运行，无法安全撤销；请改用替换，系统会保留旧版本供恢复和历史用量追踪。",
+      );
+    }
     await tx
       .update(presalesApiCredentials)
       .set({
@@ -217,9 +323,8 @@ export async function deletePresalesApiCredential(executor?: any) {
       .where(
         and(
           eq(presalesApiCredentials.slot, PRESALES_CREDENTIAL_SLOT),
-          inArray(presalesApiCredentials.status, [
-            ...PRESALES_REVOKABLE_STATUSES,
-          ]),
+          eq(presalesApiCredentials.status, "active"),
+          inArray(presalesApiCredentials.id, activeIds),
         ),
       );
   };
@@ -243,6 +348,7 @@ function toDecryptedCredential(
     fingerprint: credential.fingerprint,
     status: credential.status,
     verifiedAt: credential.verifiedAt,
+    retiredAt: credential.retiredAt,
   };
 }
 
@@ -335,18 +441,20 @@ type PresalesTaskCredentialResolverOptions = {
 };
 
 /**
- * Tasks with attachments must use the immutable credential version that owns
- * those files. This keeps an older knowledge-base output usable after a key
- * rotation without ever mixing resources across upstream accounts.
+ * Every new task is created with the current credential. Attachments from a
+ * retired credential must be copied under the current credential first. This
+ * prevents a rotation between ZIP and Skill preparation from either mixing
+ * upstream accounts or silently creating a new task with a retired key.
  */
 export async function resolvePresalesTaskCredentialForFiles(
   fileIds: string[],
   options: PresalesTaskCredentialResolverOptions = {},
 ) {
+  const active = await (options.getActive ?? getActivePresalesCredential)();
+  if (!active) return null;
+
   const uniqueFileIds = [...new Set(fileIds)];
-  if (uniqueFileIds.length === 0) {
-    return (options.getActive ?? getActivePresalesCredential)();
-  }
+  if (uniqueFileIds.length === 0) return active;
 
   const getForFile =
     options.getForFile ??
@@ -360,23 +468,13 @@ export async function resolvePresalesTaskCredentialForFiles(
   }
 
   const resolved = credentials as PresalesResourceCredential[];
-  const credentialIds = new Set(resolved.map((credential) => credential.id));
-  if (credentialIds.size !== 1) {
+  if (resolved.some((credential) => credential.id !== active.id)) {
     throw new AuthServiceError(
       "CONFLICT",
-      "附件来自多个 API Key 版本，不能在同一任务中混用",
+      "附件不属于当前售前 API Key 版本，请在当前版本下重新准备附件",
     );
   }
-
-  const [credential] = resolved;
-  return {
-    id: credential.id,
-    version: credential.version,
-    apiKey: credential.apiKey,
-    fingerprint: credential.fingerprint,
-    status: credential.status,
-    verifiedAt: credential.verifiedAt,
-  } satisfies DecryptedPresalesCredential;
+  return active;
 }
 
 function canonicalJson(value: unknown): string {
@@ -887,146 +985,419 @@ function parseCreatedAt(value: unknown): number | null {
 
 function taskCreditUsage(task: any) {
   const value = Number(task?.credit_usage ?? task?.metadata?.credit_usage ?? 0);
-  return Number.isFinite(value) && value > 0 ? value : 0;
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+export function aggregatePresalesCreditUsagePage(input: {
+  tasks: any[];
+  websiteTaskIds: ReadonlySet<string>;
+  cutoffMs: number;
+  endExclusive: number;
+  seenTaskIds: Set<string>;
+}) {
+  let keyTotalUsed = 0;
+  let websiteUsed = 0;
+  let reachedCutoff = false;
+  let complete = true;
+  let datedTaskCount = 0;
+  let expiredTaskCount = 0;
+  const recentWebsiteTasks: PresalesCreditUsageTask[] = [];
+  for (const task of input.tasks) {
+    const id = String(task?.id ?? task?.task_id ?? "");
+    if (!id) {
+      complete = false;
+      continue;
+    }
+    if (input.seenTaskIds.has(id)) continue;
+    input.seenTaskIds.add(id);
+    const createdAt = parseCreatedAt(task?.created_at);
+    if (createdAt === null) {
+      complete = false;
+      continue;
+    }
+    datedTaskCount += 1;
+    if (createdAt < input.cutoffMs) {
+      expiredTaskCount += 1;
+      continue;
+    }
+    if (createdAt >= input.endExclusive) continue;
+    const creditUsage = taskCreditUsage(task);
+    if (creditUsage === null) {
+      complete = false;
+      continue;
+    }
+    if (creditUsage === 0) continue;
+    keyTotalUsed += creditUsage;
+    if (!input.websiteTaskIds.has(id)) continue;
+    websiteUsed += creditUsage;
+    recentWebsiteTasks.push({
+      id,
+      title: String(
+        task?.metadata?.task_title ??
+          task?.task_title ??
+          task?.instructions?.slice?.(0, 40) ??
+          id.slice(0, 12),
+      ),
+      creditUsage,
+      createdAt,
+    });
+  }
+  reachedCutoff =
+    complete && datedTaskCount > 0 && expiredTaskCount === datedTaskCount;
+  return {
+    keyTotalUsed,
+    websiteUsed,
+    recentWebsiteTasks,
+    reachedCutoff,
+    complete,
+  };
 }
 
 export async function getPresalesCreditUsage(
   windowDays = CREDIT_USAGE_LOOKBACK_DAYS,
+  now = Date.now(),
 ): Promise<WebsiteApiKeyUsage> {
-  const credential = await getActivePresalesCredential();
   const normalizedWindowDays =
     Number.isInteger(windowDays) && windowDays > 0 && windowDays <= 365
       ? windowDays
       : CREDIT_USAGE_LOOKBACK_DAYS;
-  if (!credential) {
+  const db = await requireDb();
+  const credentialRows = await db
+    .select()
+    .from(presalesApiCredentials)
+    .where(
+      and(
+        eq(presalesApiCredentials.slot, PRESALES_CREDENTIAL_SLOT),
+        inArray(presalesApiCredentials.status, ["active", "retired"]),
+      ),
+    )
+    .orderBy(desc(presalesApiCredentials.version));
+  if (credentialRows.length === 0) {
     return {
       windowDays: normalizedWindowDays,
       keyTotalUsed: 0,
       websiteUsed: 0,
       recentWebsiteTasks: [] as PresalesCreditUsageTask[],
-      fetchedAt: Date.now(),
+      fetchedAt: now,
+      complete: true,
     };
   }
 
-  const db = await requireDb();
+  const credentialIds = credentialRows.map((credential) => credential.id);
+  const credentialByFingerprint = new Map<
+    string,
+    ReturnType<typeof toDecryptedCredential>
+  >();
+  for (const credentialRow of selectPhysicalCredentialRows(credentialRows)) {
+    if (!credentialByFingerprint.has(credentialRow.fingerprint)) {
+      credentialByFingerprint.set(
+        credentialRow.fingerprint,
+        toDecryptedCredential(credentialRow),
+      );
+    }
+  }
+  const credentials = [...credentialByFingerprint.values()];
+  const coverageByFingerprint = await loadUsageCoverage({
+    executor: db,
+    scope: "website_frontend",
+    fingerprints: credentials.map((credential) => credential.fingerprint),
+  });
+  const usageNow = now;
+  const cutoffMs = usageNow - normalizedWindowDays * 24 * 60 * 60 * 1000;
   const [resourceRows, ownedRows, monitorRows] = await Promise.all([
     db
-      .select({ upstreamTaskId: presalesUpstreamResources.upstreamId })
+      .select({
+        upstreamTaskId: presalesUpstreamResources.upstreamId,
+        apiCredentialId: presalesUpstreamResources.apiCredentialId,
+        createdAt: presalesUpstreamResources.createdAt,
+      })
       .from(presalesUpstreamResources)
       .where(
         and(
-          eq(presalesUpstreamResources.apiCredentialId, credential.id),
+          inArray(presalesUpstreamResources.apiCredentialId, credentialIds),
           eq(presalesUpstreamResources.kind, "task"),
+          gte(presalesUpstreamResources.createdAt, new Date(cutoffMs)),
         ),
       ),
     db
-      .select({ upstreamTaskId: presalesTaskRequests.upstreamTaskId })
+      .select({
+        upstreamTaskId: presalesTaskRequests.upstreamTaskId,
+        apiCredentialId: presalesTaskRequests.apiCredentialId,
+        createdAt: presalesTaskRequests.createdAt,
+        status: presalesTaskRequests.status,
+      })
       .from(presalesTaskRequests)
       .where(
         and(
-          eq(presalesTaskRequests.apiCredentialId, credential.id),
-          eq(presalesTaskRequests.status, "completed"),
+          inArray(presalesTaskRequests.apiCredentialId, credentialIds),
+          gte(presalesTaskRequests.createdAt, new Date(cutoffMs)),
         ),
       ),
     db
-      .select({ upstreamTaskId: presalesMonitorRuns.upstreamTaskId })
+      .select({
+        upstreamTaskId: presalesMonitorRuns.upstreamTaskId,
+        apiCredentialId: presalesMonitorRuns.apiCredentialId,
+        createdAt: presalesMonitorRuns.createdAt,
+        status: presalesMonitorRuns.status,
+      })
       .from(presalesMonitorRuns)
-      .where(eq(presalesMonitorRuns.apiCredentialId, credential.id)),
+      .where(
+        and(
+          inArray(presalesMonitorRuns.apiCredentialId, credentialIds),
+          gte(presalesMonitorRuns.createdAt, new Date(cutoffMs)),
+        ),
+      ),
   ]);
   const websiteTaskIds = new Set(
     [...resourceRows, ...ownedRows, ...monitorRows]
       .map((row) => row.upstreamTaskId?.trim())
       .filter((id): id is string => Boolean(id)),
   );
-  const cutoffMs = Date.now() - normalizedWindowDays * 24 * 60 * 60 * 1000;
+  const fingerprintByCredentialId = new Map(
+    credentialRows.map((credential) => [credential.id, credential.fingerprint]),
+  );
+  const expectedTaskIdsByFingerprint = new Map<string, Set<string>>();
+  for (const row of [...resourceRows, ...ownedRows, ...monitorRows]) {
+    const taskId = row.upstreamTaskId?.trim();
+    if (!taskId || row.createdAt.getTime() < cutoffMs) continue;
+    const fingerprint = fingerprintByCredentialId.get(row.apiCredentialId);
+    if (!fingerprint) continue;
+    const expected = expectedTaskIdsByFingerprint.get(fingerprint) ?? new Set();
+    expected.add(taskId);
+    expectedTaskIdsByFingerprint.set(fingerprint, expected);
+  }
+  const terminalMonitorStates = new Set([
+    "completed",
+    "partial_review_required",
+    "remote_failed",
+    "shape_mismatch",
+  ]);
+  const unsettledFingerprints = new Set<string>();
+  for (const row of ownedRows) {
+    if (row.status !== "pending") continue;
+    const fingerprint = fingerprintByCredentialId.get(row.apiCredentialId);
+    if (fingerprint) unsettledFingerprints.add(fingerprint);
+  }
+  for (const row of monitorRows) {
+    if (terminalMonitorStates.has(row.status)) continue;
+    const fingerprint = fingerprintByCredentialId.get(row.apiCredentialId);
+    if (fingerprint) unsettledFingerprints.add(fingerprint);
+  }
   const recentWebsiteTasks: PresalesCreditUsageTask[] = [];
   const seen = new Set<string>();
   let keyTotalUsed = 0;
   let websiteUsed = 0;
-  let after: string | undefined;
-  let reachedCutoff = false;
-
-  for (
-    let page = 0;
-    page < CREDIT_USAGE_MAX_PAGES && !reachedCutoff;
-    page += 1
-  ) {
-    const params = new URLSearchParams({
-      limit: String(CREDIT_USAGE_PAGE_LIMIT),
-      order: "desc",
+  let complete = true;
+  for (const credential of credentials) {
+    if (
+      credential.status === "retired" &&
+      credential.retiredAt &&
+      credential.retiredAt.getTime() <= cutoffMs &&
+      !unsettledFingerprints.has(credential.fingerprint) &&
+      !expectedTaskIdsByFingerprint.get(credential.fingerprint)?.size
+    ) {
+      continue;
+    }
+    const existingCoverage = coverageByFingerprint.get(credential.fingerprint);
+    if (
+      credential.status === "retired" &&
+      !unsettledFingerprints.has(credential.fingerprint) &&
+      usageCoverageSupportsRetiredCredential({
+        coverage: existingCoverage,
+        periodStartMs: cutoffMs,
+        credentialRetiredAtMs: credential.retiredAt?.getTime() ?? null,
+      })
+    ) {
+      continue;
+    }
+    const scanToken = await claimUsageCredentialCoverage({
+      executor: db,
+      scope: "website_frontend",
+      credentialFingerprint: credential.fingerprint,
+      coveredFromMs: cutoffMs,
+      scanStartedAtMs: usageNow,
+      credentialRetiredAtMs: credential.retiredAt?.getTime() ?? null,
     });
-    if (after) params.set("after", after);
-    let response: globalThis.Response;
-    try {
-      response = await fetch(
-        `${getUpstreamBaseUrl()}/v1/tasks?${params.toString()}`,
-        {
-          headers: {
-            API_KEY: credential.apiKey,
-            Authorization: `Bearer ${credential.apiKey}`,
-            Accept: "application/json",
+    let after: string | undefined;
+    let credentialComplete = true;
+    let allFirstPartyTasksSettled = !unsettledFingerprints.has(
+      credential.fingerprint,
+    );
+    const seenForCredential = new Set<string>();
+    const seenCursors = new Set<string>();
+    for (let page = 0; page < CREDIT_USAGE_MAX_PAGES; page += 1) {
+      const params = new URLSearchParams({
+        limit: String(CREDIT_USAGE_PAGE_LIMIT),
+        order: "desc",
+      });
+      if (after) params.set("after", after);
+      let response: globalThis.Response;
+      try {
+        response = await fetch(
+          `${getUpstreamBaseUrl()}/v1/tasks?${params.toString()}`,
+          {
+            headers: {
+              API_KEY: credential.apiKey,
+              Authorization: `Bearer ${credential.apiKey}`,
+              Accept: "application/json",
+            },
+            redirect: "error",
+            signal: AbortSignal.timeout(30_000),
           },
-          redirect: "error",
-          signal: AbortSignal.timeout(30_000),
-        },
-      );
-    } catch {
-      throw new AuthServiceError(
-        "UPSTREAM_UNAVAILABLE",
-        "暂时无法读取售前积分使用情况",
-      );
-    }
-    if (!response.ok) {
-      throw new AuthServiceError(
-        response.status === 401 || response.status === 403
-          ? "INVALID_CREDENTIAL"
-          : "UPSTREAM_UNAVAILABLE",
-        "暂时无法读取售前积分使用情况",
-      );
-    }
+        );
+      } catch {
+        if (credential.status === "retired") {
+          credentialComplete = usageCoverageSupportsRetiredCredential({
+            coverage: coverageByFingerprint.get(credential.fingerprint),
+            periodStartMs: cutoffMs,
+            credentialRetiredAtMs: credential.retiredAt?.getTime() ?? null,
+          });
+          break;
+        }
+        throw new AuthServiceError(
+          "UPSTREAM_UNAVAILABLE",
+          "暂时无法读取售前积分使用情况",
+        );
+      }
+      if (!response.ok) {
+        if (
+          credential.status === "retired" &&
+          (response.status === 401 || response.status === 403)
+        ) {
+          credentialComplete = usageCoverageSupportsRetiredCredential({
+            coverage: coverageByFingerprint.get(credential.fingerprint),
+            periodStartMs: cutoffMs,
+            credentialRetiredAtMs: credential.retiredAt?.getTime() ?? null,
+          });
+          break;
+        }
+        throw new AuthServiceError(
+          response.status === 401 || response.status === 403
+            ? "INVALID_CREDENTIAL"
+            : "UPSTREAM_UNAVAILABLE",
+          "暂时无法读取售前积分使用情况",
+        );
+      }
 
-    const payload = (await response.json()) as any;
-    const tasks = Array.isArray(payload?.data) ? payload.data : [];
-    if (tasks.length === 0) break;
-
-    for (const task of tasks) {
-      const id = String(task?.id ?? task?.task_id ?? "");
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      const createdAt = parseCreatedAt(task?.created_at);
-      if (createdAt !== null && createdAt < cutoffMs) {
-        reachedCutoff = true;
+      const payload = (await response.json()) as any;
+      const tasks = Array.isArray(payload?.data) ? payload.data : [];
+      if (tasks.length === 0) {
+        if (payload?.has_more) credentialComplete = false;
         break;
       }
-      const creditUsage = taskCreditUsage(task);
-      if (creditUsage <= 0) continue;
-      keyTotalUsed += creditUsage;
-      if (!websiteTaskIds.has(id)) continue;
-      websiteUsed += creditUsage;
-      recentWebsiteTasks.push({
-        id,
-        title: String(
-          task?.metadata?.task_title ??
-            task?.task_title ??
-            task?.instructions?.slice?.(0, 40) ??
-            id.slice(0, 12),
-        ),
-        creditUsage,
-        createdAt,
-      });
-    }
+      for (const task of tasks) {
+        const taskId = String(task?.id ?? task?.task_id ?? "");
+        if (taskId) seenForCredential.add(taskId);
+      }
 
-    after =
-      String(payload?.last_id ?? tasks[tasks.length - 1]?.id ?? "") ||
-      undefined;
-    if (!payload?.has_more || !after) break;
+      const pageUsage = aggregatePresalesCreditUsagePage({
+        tasks,
+        websiteTaskIds,
+        cutoffMs,
+        endExclusive: usageNow,
+        seenTaskIds: seen,
+      });
+      keyTotalUsed += pageUsage.keyTotalUsed;
+      websiteUsed += pageUsage.websiteUsed;
+      recentWebsiteTasks.push(...pageUsage.recentWebsiteTasks);
+      if (!pageUsage.complete) complete = false;
+      for (const task of tasks) {
+        const taskId = String(task?.id ?? task?.task_id ?? "");
+        if (
+          taskId &&
+          websiteTaskIds.has(taskId) &&
+          !isUsageTaskTerminal(task)
+        ) {
+          allFirstPartyTasksSettled = false;
+        }
+      }
+      const ledgerWrite = await recordUsageLedgerEntries({
+        executor: db,
+        scope: "website_frontend",
+        credentialFingerprint: credential.fingerprint,
+        apiCredentialId: credential.id,
+        observedAt: new Date(usageNow),
+        entries: tasks.flatMap((task: any) => {
+          const taskId = String(task?.id ?? task?.task_id ?? "");
+          const createdAt = parseCreatedAt(task?.created_at);
+          const creditUsage = taskCreditUsage(task);
+          return taskId && createdAt !== null && creditUsage !== null
+            ? [
+                {
+                  upstreamTaskId: taskId,
+                  accountUserId: null,
+                  isFirstParty: websiteTaskIds.has(taskId),
+                  taskCreatedAtMs: createdAt,
+                  creditUsage,
+                  isTerminal: isUsageTaskTerminal(task),
+                },
+              ]
+            : [];
+        }),
+      });
+      if (!ledgerWrite.complete) credentialComplete = false;
+      if (!pageUsage.complete) credentialComplete = false;
+
+      after =
+        String(
+          payload?.last_id ??
+            tasks[tasks.length - 1]?.id ??
+            tasks[tasks.length - 1]?.task_id ??
+            "",
+        ) || undefined;
+      if (payload?.has_more && !after) {
+        credentialComplete = false;
+        break;
+      }
+      if (after && seenCursors.has(after)) {
+        credentialComplete = false;
+        break;
+      }
+      if (after) seenCursors.add(after);
+      if (page === CREDIT_USAGE_MAX_PAGES - 1 && payload?.has_more && after) {
+        credentialComplete = false;
+      }
+      if (!payload?.has_more || !after) break;
+    }
+    const expectedTaskIds =
+      expectedTaskIdsByFingerprint.get(credential.fingerprint) ?? new Set();
+    if (!hasCompleteExpectedTaskSet(expectedTaskIds, seenForCredential)) {
+      credentialComplete = false;
+    }
+    if (credentialComplete) {
+      const finalized = await markUsageCredentialCoverage({
+        executor: db,
+        scope: "website_frontend",
+        credentialFingerprint: credential.fingerprint,
+        coveredFromMs: cutoffMs,
+        fullScanAtMs: usageNow,
+        credentialRetiredAtMs: credential.retiredAt?.getTime() ?? null,
+        allTasksSettled: allFirstPartyTasksSettled,
+        scanToken,
+      });
+      if (!finalized) credentialComplete = false;
+    }
+    if (!credentialComplete) {
+      complete = false;
+    }
   }
+
+  const currentFingerprint =
+    credentialRows.find((credential) => credential.status === "active")
+      ?.fingerprint ?? credentials[0]!.fingerprint;
+  const ledgerUsage = await readWebsiteUsageLedger({
+    executor: db,
+    currentFingerprint,
+    startAt: cutoffMs,
+    endAt: usageNow,
+  });
 
   return {
     windowDays: normalizedWindowDays,
-    keyTotalUsed,
-    websiteUsed,
+    keyTotalUsed: ledgerUsage.keyTotalUsed,
+    websiteUsed: ledgerUsage.websiteUsed,
     recentWebsiteTasks,
-    fetchedAt: Date.now(),
+    fetchedAt: usageNow,
+    complete,
   };
 }

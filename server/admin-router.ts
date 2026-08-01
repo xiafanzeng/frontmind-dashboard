@@ -17,7 +17,6 @@ import {
 } from "./presales-service";
 import {
   assertDashboardEnterpriseIdentity,
-  deleteManagedUserCredential,
   getDashboardContentRevision,
   getDashboardWorkspace,
   getLatestKnowledgeSnapshot,
@@ -26,7 +25,6 @@ import {
   listDashboardContentRevisions,
   listManagedWorkspaceUsers,
   isSystemAdmin,
-  replaceManagedUserCredential,
   rollbackDashboardContentRevision,
   setWorkspaceAssignments,
   updateDashboardWorkspace,
@@ -113,6 +111,8 @@ import {
 import {
   getAdminApiUsageHierarchy,
   getApiUsageAlertOverview,
+  replaceManagedApiKeyTarget,
+  revokeManagedApiKeyTarget,
   syncApiUsageSnapshots,
   updateApiUsagePolicy,
 } from "./api-usage-snapshot-service";
@@ -294,13 +294,79 @@ export const adminRouter = router({
         throw toTrpcError(error);
       }
     }),
+    replaceTargetCredential: adminProcedure
+      .input(
+        z
+          .object({
+            kind: z.enum([
+              "customer",
+              "delivery_admin",
+              "system_admin",
+              "engineer",
+            ]),
+            userId: z.number().int().positive(),
+            apiKey: presalesApiKeySchema,
+            expectedVersion: z.number().int().nonnegative(),
+            reason: z.string().trim().min(1).max(2_000),
+            confirmation: z.literal("REPLACE_API_KEY"),
+            allowIncompleteHistory: z.boolean().optional().default(false),
+          })
+          .strict(),
+      )
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await replaceManagedApiKeyTarget({
+            actor: ctx.user,
+            kind: input.kind,
+            userId: input.userId,
+            apiKey: input.apiKey,
+            expectedVersion: input.expectedVersion,
+            reason: input.reason,
+            allowIncompleteHistory: input.allowIncompleteHistory,
+          });
+        } catch (error) {
+          throw toTrpcError(error);
+        }
+      }),
+    revokeTargetCredential: adminProcedure
+      .input(
+        z
+          .object({
+            kind: z.enum([
+              "customer",
+              "delivery_admin",
+              "system_admin",
+              "engineer",
+            ]),
+            userId: z.number().int().positive(),
+            expectedVersion: z.number().int().nonnegative(),
+            reason: z.string().trim().min(1).max(2_000),
+            confirmation: z.literal("REVOKE_API_KEY"),
+          })
+          .strict(),
+      )
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await revokeManagedApiKeyTarget({
+            actor: ctx.user,
+            kind: input.kind,
+            userId: input.userId,
+            expectedVersion: input.expectedVersion,
+            reason: input.reason,
+          });
+        } catch (error) {
+          throw toTrpcError(error);
+        }
+      }),
     updatePolicy: adminProcedure
       .input(
         z.object({
           policyId: z.string().uuid(),
           limit: z.number().int().positive().max(2_000_000_000),
           warningRatio: z.number().min(0.01).max(1),
-          windowDays: z.number().int().min(1).max(365),
+          windowDays: z.literal(30),
         }),
       )
       .mutation(async ({ ctx, input }) => {
@@ -1085,48 +1151,6 @@ export const adminRouter = router({
         }
       }),
 
-    replaceCredential: adminProcedure
-      .input(
-        z.object({
-          userId: z.number().int().positive(),
-          apiKey: presalesApiKeySchema,
-          reason: z.string().trim().max(2_000).optional(),
-        }),
-      )
-      .mutation(async ({ ctx, input }) => {
-        requireSystemAdmin(ctx.user);
-        try {
-          return await replaceManagedUserCredential({
-            actor: ctx.user,
-            userId: input.userId,
-            apiKey: input.apiKey,
-            reason: input.reason,
-          });
-        } catch (error) {
-          throw toTrpcError(error);
-        }
-      }),
-
-    deleteCredential: adminProcedure
-      .input(
-        z.object({
-          userId: z.number().int().positive(),
-          reason: z.string().trim().max(2_000).optional(),
-        }),
-      )
-      .mutation(async ({ ctx, input }) => {
-        requireSystemAdmin(ctx.user);
-        try {
-          return await deleteManagedUserCredential({
-            actor: ctx.user,
-            userId: input.userId,
-            reason: input.reason,
-          });
-        } catch (error) {
-          throw toTrpcError(error);
-        }
-      }),
-
     creditUsage: adminProcedure
       .input(z.object({ userId: z.number().int().positive() }))
       .query(async ({ ctx, input }) => {
@@ -1396,6 +1420,7 @@ export const adminRouter = router({
         z.object({
           apiKey: presalesApiKeySchema,
           reason: z.string().trim().max(2_000).optional(),
+          allowIncompleteHistory: z.boolean().optional().default(false),
         }),
       )
       .mutation(async ({ ctx, input }) => {
@@ -1404,6 +1429,8 @@ export const adminRouter = router({
           const credential = await replacePresalesApiCredential(
             ctx.user.id,
             input.apiKey,
+            undefined,
+            input.allowIncompleteHistory,
           );
           await writeWorkspaceAuditEvent({
             actor: ctx.user,
@@ -1414,6 +1441,7 @@ export const adminRouter = router({
             metadata: {
               fingerprint: credential.fingerprint,
               status: credential.status,
+              emergencyReplacement: input.allowIncompleteHistory,
             },
           });
           return credential;
@@ -1427,6 +1455,7 @@ export const adminRouter = router({
         z.object({
           apiKey: presalesApiKeySchema,
           reason: z.string().trim().max(2_000).optional(),
+          allowIncompleteHistory: z.boolean().optional().default(false),
         }),
       )
       .mutation(async ({ ctx, input }) => {
@@ -1435,6 +1464,8 @@ export const adminRouter = router({
           const credential = await replacePresalesApiCredential(
             ctx.user.id,
             input.apiKey,
+            undefined,
+            input.allowIncompleteHistory,
           );
           await writeWorkspaceAuditEvent({
             actor: ctx.user,
@@ -1445,6 +1476,7 @@ export const adminRouter = router({
             metadata: {
               fingerprint: credential.fingerprint,
               status: credential.status,
+              emergencyReplacement: input.allowIncompleteHistory,
             },
           });
           return credential;
@@ -1491,7 +1523,7 @@ export const adminRouter = router({
       .input(
         z
           .object({
-            windowDays: z.number().int().min(1).max(365),
+            windowDays: z.literal(30),
           })
           .optional(),
       )

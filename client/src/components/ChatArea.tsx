@@ -7,6 +7,7 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import {
   useConversation,
+  type KnowledgeBaseClientNotice,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -63,12 +64,75 @@ import { Textarea } from "@/components/ui/textarea";
 import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progress";
 import { trpc } from "@/lib/trpc";
 import {
-  collectAssistantOutputIds,
-  projectTaskOutputMessages,
-} from "@/lib/task-output-projection";
+  knowledgeBaseObservationFromPayload,
+  reconcileKnowledgeBaseObservation,
+  retryKnowledgeBaseTurn,
+  type KnowledgeBaseObservationDto,
+} from "@/lib/knowledge-progress";
 
 export const KNOWLEDGE_BASE_FOUNDATION_COPY =
   "企业知识库是品牌事实与产品信息的统一底稿，也是构建 AI 专用友好官网、生成内容与准确回答客户问题的基础。";
+
+export const KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE =
+  "PACKAGE_REBIND_REQUIRED";
+
+export function knowledgeBaseNoticeRecoveryMode(
+  notice: Pick<KnowledgeBaseClientNotice, "code">,
+) {
+  return notice.code === KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE
+    ? ("reconcile" as const)
+    : ("new_turn" as const);
+}
+
+export function knowledgeBaseNoticeRetryLabel(
+  notice: Pick<KnowledgeBaseClientNotice, "code">,
+) {
+  return knowledgeBaseNoticeRecoveryMode(notice) === "reconcile"
+    ? "重新绑定成品"
+    : "重试本轮";
+}
+
+export function knowledgeBasePackageRebindResolved(
+  observation: KnowledgeBaseObservationDto,
+) {
+  return (
+    observation.notice?.code !== KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE &&
+    observation.interaction.interactionState === "ready_to_publish" &&
+    Boolean(observation.package)
+  );
+}
+
+/**
+ * PACKAGE_REBIND_REQUIRED is repaired by rereading the existing authoritative
+ * task. It must never reserve a new turn or submit another billable request.
+ */
+export async function recoverKnowledgeBaseNotice(
+  input: {
+    conversationId: string;
+    notice: Pick<KnowledgeBaseClientNotice, "code">;
+    clientRequestId: string;
+    expectedGeneration: number;
+    expectedRevision: number;
+    expectedLeafId: string | null;
+  },
+  dependencies: {
+    reconcile?: typeof reconcileKnowledgeBaseObservation;
+    retry?: typeof retryKnowledgeBaseTurn;
+  } = {},
+): Promise<KnowledgeBaseObservationDto> {
+  if (knowledgeBaseNoticeRecoveryMode(input.notice) === "reconcile") {
+    return (dependencies.reconcile ?? reconcileKnowledgeBaseObservation)({
+      conversationId: input.conversationId,
+    });
+  }
+  return (dependencies.retry ?? retryKnowledgeBaseTurn)({
+    conversationId: input.conversationId,
+    clientRequestId: input.clientRequestId,
+    expectedGeneration: input.expectedGeneration,
+    expectedRevision: input.expectedRevision,
+    expectedLeafId: input.expectedLeafId,
+  });
+}
 
 const EMPTY_STATE_IMG =
   "https://d2xsxph8kpxj0f.cloudfront.net/310519663465762565/ZiWzJwHCXtKB4GziVKqKt6/fm-logo_cde8eb94.png";
@@ -88,7 +152,8 @@ interface OneClickTaskStartResponse {
   startedAt?: number;
   progress?: KnowledgeBaseProgressDto;
   interaction?: KnowledgeBaseInteractionDto;
-  task: {
+  observation?: KnowledgeBaseObservationDto;
+  task?: {
     id: string;
     status: ReportTaskStatus;
     taskUrl?: string;
@@ -103,13 +168,6 @@ interface DeepReportStartInput {
   operatorNotes?: string;
   agentProfile?: string;
   files: File[];
-}
-
-function normalizeReportStatus(status: string | undefined): ReportTaskStatus {
-  if (status === "failed") return "error";
-  if (status === "pending" || status === "completed" || status === "error")
-    return status;
-  return "running";
 }
 
 async function readErrorMessage(response: Response) {
@@ -267,8 +325,11 @@ export default function ChatArea({
     deleteMessage,
     addMessage,
     updateStatus,
-    updateAssistantMessages,
     updateTitle,
+    registerKnowledgeBaseConversation,
+    wakeKnowledgeBaseConversation,
+    commitKnowledgeBaseObservation,
+    rollbackPendingKnowledgeBaseTurn,
   } = useConversation();
   const dashboardQuery = trpc.workspace.dashboard.useQuery(undefined, {
     enabled: !responseLogicContext && showKnowledgeBaseStarter,
@@ -279,10 +340,26 @@ export default function ChatArea({
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const [, setTick] = useState(0);
+  const [retryingKnowledgeBase, setRetryingKnowledgeBase] = useState(false);
 
   const status = activeConversation?.status;
   const startedAt = activeConversation?.startedAt;
   const completedAt = activeConversation?.completedAt;
+
+  useEffect(() => {
+    if (!syncKnowledgeBaseSnapshot || !activeConversation?.id) return;
+    registerKnowledgeBaseConversation(activeConversation.id);
+    if (activeConversation.taskId || knowledgeBaseProgress) {
+      wakeKnowledgeBaseConversation(activeConversation.id);
+    }
+  }, [
+    activeConversation?.id,
+    activeConversation?.taskId,
+    knowledgeBaseProgress,
+    registerKnowledgeBaseConversation,
+    syncKnowledgeBaseSnapshot,
+    wakeKnowledgeBaseConversation,
+  ]);
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -313,6 +390,11 @@ export default function ChatArea({
 
       const conversationId = activeConversation.id;
       const responseStartedAt = Date.now();
+      const clientRequestId =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `kb-start-${responseStartedAt}-${Math.random().toString(36).slice(2, 10)}`;
+      let requestDispatched = false;
 
       try {
         const uploadedAttachments: Array<{
@@ -327,6 +409,21 @@ export default function ChatArea({
           });
         }
 
+        registerKnowledgeBaseConversation(conversationId);
+
+        addMessage(conversationId, {
+          id: `msg-kb-start-${responseStartedAt}`,
+          role: "user",
+          content: "开始构建企业知识库",
+          timestamp: responseStartedAt,
+          knowledgeBase: {
+            kind: "pending_user",
+            clientRequestId,
+          },
+        });
+        updateTitle(conversationId, "企业知识库构建");
+
+        requestDispatched = true;
         const response = await fetch("/api/knowledge-base/start", {
           method: "POST",
           headers: {
@@ -335,6 +432,7 @@ export default function ChatArea({
           credentials: "include",
           body: JSON.stringify({
             conversationId,
+            clientRequestId,
             companyName,
             companyWebsite,
             operatorNotes,
@@ -344,90 +442,35 @@ export default function ChatArea({
         });
 
         if (!response.ok) {
-          throw new Error(await readErrorMessage(response));
+          const requestError = new Error(
+            await readErrorMessage(response),
+          ) as Error & { status?: number };
+          requestError.status = response.status;
+          throw requestError;
         }
 
         const data = (await response.json()) as OneClickTaskStartResponse;
-        if (!data.task?.id) {
+        if (!data.observation && !data.task?.id) {
           throw new Error("任务创建失败：未返回任务 ID");
         }
 
-        addMessage(conversationId, {
-          id: `msg-kb-start-${responseStartedAt}`,
-          role: "user",
-          content: "开始构建企业知识库",
-          timestamp: responseStartedAt,
-        });
-        updateTitle(conversationId, "企业知识库构建");
-
-        const normalizedStatus = normalizeReportStatus(data.task.status);
-        const initialStatus =
-          data.interaction?.interactionState === "awaiting_input"
-            ? "awaiting_input"
-            : data.interaction?.interactionState === "ready_to_publish" ||
-                data.interaction?.interactionState === "published"
-              ? "completed"
-              : data.interaction?.interactionState === "failed"
-                ? "error"
-                : data.interaction?.interactionState === "queued"
-                  ? "pending"
-                  : normalizedStatus === "completed"
-                    ? "error"
-                    : normalizedStatus;
         const taskStartedAt = data.startedAt || responseStartedAt;
-        const totalOutputLength = data.task.output?.length || 0;
-        const initialStatusIsTerminal =
-          initialStatus === "awaiting_input" ||
-          initialStatus === "completed" ||
-          initialStatus === "error";
-        const authoritativeKnowledgePresentation =
-          data.progress &&
-          (data.interaction?.interactionState === "awaiting_input" ||
-            data.interaction?.interactionState === "ready_to_publish" ||
-            data.interaction?.interactionState === "published")
-            ? {
-                revision: data.progress.build.revision,
-                leafId: data.progress.build.currentLeafId,
-              }
-            : undefined;
-        if (data.progress) {
-          window.dispatchEvent(
-            new CustomEvent("frontmind:knowledge-progress-updated", {
-              detail: data.progress,
-            }),
+        if (data.observation) {
+          commitKnowledgeBaseObservation(
+            conversationId,
+            knowledgeBaseObservationFromPayload(data),
           );
-        }
-
-        updateStatus(conversationId, initialStatus, {
-          taskId: data.task.id,
-          taskUrl: data.task.taskUrl,
-          previousResponseId: data.task.id,
-          startedAt: taskStartedAt,
-          ...(initialStatusIsTerminal
-            ? { lastKnownOutputLength: totalOutputLength }
-            : {}),
-        });
-
-        if (data.task.output && data.task.output.length > 0) {
-          const assistantMessages = projectTaskOutputMessages({
-            output: data.task.output,
-            baselineOutputLength: activeConversation.lastKnownOutputLength || 0,
-            historicalOutputIds: collectAssistantOutputIds(
-              activeConversation.messages,
-            ),
-            responseStartedAt: taskStartedAt,
-            modelName: selectedAgentProfile,
-            knowledgeBase: true,
-            knowledgeBasePresentation: authoritativeKnowledgePresentation,
+        } else {
+          // Compatibility while the server fleet rolls forward. Never project
+          // data.task.output for KB; the coordinator will obtain the approved DTO.
+          updateStatus(conversationId, "running", {
+            taskId: data.task!.id,
+            taskUrl: data.task!.taskUrl,
+            previousResponseId: data.task!.id,
+            startedAt: taskStartedAt,
           });
-          if (initialStatus === "completed" && assistantMessages.length > 0) {
-            assistantMessages[assistantMessages.length - 1].elapsedTime =
-              (Date.now() - taskStartedAt) / 1000;
-          }
-          if (assistantMessages.length > 0) {
-            updateAssistantMessages(conversationId, assistantMessages);
-          }
         }
+        wakeKnowledgeBaseConversation(conversationId);
 
         toast.success("已开始构建企业知识库", {
           description:
@@ -435,48 +478,113 @@ export default function ChatArea({
           duration: 3200,
         });
 
-        if (initialStatus === "awaiting_input") {
-          toast.info("知识树研究阶段已完成", {
-            description: "首个知识节点已就绪，请确认、修改或补充当前内容。",
-          });
-          creditEventBus.emit();
-        } else if (initialStatus === "completed") {
-          const completedAt = Date.now();
-          updateStatus(conversationId, "completed", {
-            completedAt,
-            lastKnownOutputLength: totalOutputLength,
-          });
-          toast.info("知识树研究阶段已完成", {
-            description:
-              "请从当前节点开始逐项确认；全部节点走完后才可更新知识库展示。",
-          });
-          creditEventBus.emit();
-        } else if (initialStatus === "error") {
-          const errorMessage = sanitizeBrandText(
-            data.interaction?.lockReason || "任务未返回完整的知识节点状态",
-          );
-          addMessage(conversationId, {
-            id: `msg-kb-error-${data.task.id.slice(-72)}`,
-            role: "assistant",
-            content: `❌ 错误: ${errorMessage}`,
-            timestamp: Date.now(),
-          });
-          toast.error(errorMessage);
-        }
+        creditEventBus.emit();
       } catch (error: any) {
         const errorMessage = error?.message || "启动失败";
-        updateStatus(conversationId, "idle");
-        toast.error("启动失败", { description: errorMessage });
+        const status = Number(error?.status || 0);
+        const definitelyRejected =
+          status >= 400 && status < 500 && status !== 408 && status !== 429;
+        if (!requestDispatched || definitelyRejected) {
+          rollbackPendingKnowledgeBaseTurn(conversationId, clientRequestId);
+          updateStatus(conversationId, "idle");
+          toast.error("启动失败", { description: errorMessage });
+        } else {
+          updateStatus(conversationId, "running", {
+            startedAt: responseStartedAt,
+          });
+          wakeKnowledgeBaseConversation(conversationId);
+          toast.warning("正在恢复启动结果", {
+            description:
+              "请求结果暂时未知，系统会按本次请求编号恢复，不会重复创建知识库任务。",
+          });
+        }
       }
     },
     [
       activeConversation,
       addMessage,
-      updateAssistantMessages,
+      commitKnowledgeBaseObservation,
+      registerKnowledgeBaseConversation,
+      rollbackPendingKnowledgeBaseTurn,
       updateStatus,
       updateTitle,
+      wakeKnowledgeBaseConversation,
     ],
   );
+
+  const retryCurrentKnowledgeBaseTurn = useCallback(async () => {
+    const conversation = activeConversation;
+    const knowledgeBase = conversation?.knowledgeBase;
+    if (
+      !conversation ||
+      !knowledgeBase?.notice?.retryable ||
+      knowledgeBase.revision === null ||
+      retryingKnowledgeBase
+    ) {
+      return;
+    }
+    setRetryingKnowledgeBase(true);
+    const clientRequestId =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `kb-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const recoveryMode = knowledgeBaseNoticeRecoveryMode(knowledgeBase.notice);
+    try {
+      const observation = await recoverKnowledgeBaseNotice({
+        conversationId: conversation.id,
+        notice: knowledgeBase.notice,
+        clientRequestId,
+        expectedGeneration: knowledgeBase.generation,
+        expectedRevision: knowledgeBase.revision,
+        expectedLeafId: knowledgeBase.leafId,
+      });
+      commitKnowledgeBaseObservation(conversation.id, observation);
+      wakeKnowledgeBaseConversation(conversation.id);
+      if (recoveryMode === "reconcile") {
+        if (!knowledgeBasePackageRebindResolved(observation)) {
+          toast.warning("知识库成品仍在等待重新绑定", {
+            description:
+              observation.notice?.message ||
+              "原任务的完整 ZIP 或访问凭证尚未就绪，系统会继续恢复。",
+          });
+          return;
+        }
+        toast.success("知识库成品已重新绑定", {
+          description: "已复用原权威任务完成校验，没有创建新的模型任务。",
+        });
+      } else {
+        toast.success("已重新发起当前节点", {
+          description: "本次使用新的幂等操作，不会复用上一条失败任务。",
+        });
+      }
+    } catch (error) {
+      const status = Number((error as { status?: unknown })?.status || 0);
+      if (!status || status === 408 || status === 429 || status >= 500) {
+        wakeKnowledgeBaseConversation(conversation.id);
+        toast.warning("正在恢复重试结果", {
+          description:
+            "网络结果暂时未知，系统会恢复同一操作，不会重复创建任务。",
+        });
+      } else {
+        toast.error(
+          recoveryMode === "reconcile"
+            ? "重新绑定知识库成品失败"
+            : "重试当前节点失败",
+          {
+            description:
+              error instanceof Error ? error.message : "请刷新权威状态后再试",
+          },
+        );
+      }
+    } finally {
+      setRetryingKnowledgeBase(false);
+    }
+  }, [
+    activeConversation,
+    commitKnowledgeBaseObservation,
+    retryingKnowledgeBase,
+    wakeKnowledgeBaseConversation,
+  ]);
 
   if (!activeConversation) {
     return <EmptyState />;
@@ -599,14 +707,57 @@ export default function ChatArea({
                 message={msg}
                 isRunning={status === "running" || status === "pending"}
                 suppressKnowledgeArtifacts={syncKnowledgeBaseSnapshot}
-                onDelete={() => {
-                  if (activeConversation) {
-                    deleteMessage(activeConversation.id, msg.id);
-                  }
-                }}
+                onDelete={
+                  syncKnowledgeBaseSnapshot
+                    ? undefined
+                    : () => {
+                        if (activeConversation) {
+                          deleteMessage(activeConversation.id, msg.id);
+                        }
+                      }
+                }
               />
             ))}
           </AnimatePresence>
+
+          {syncKnowledgeBaseSnapshot &&
+            activeConversation.knowledgeBase?.notice && (
+              <div
+                className={cn(
+                  "rounded-xl border px-4 py-3 text-sm",
+                  activeConversation.knowledgeBase.notice.severity === "error"
+                    ? "border-red-200 bg-red-50 text-red-800"
+                    : activeConversation.knowledgeBase.notice.severity ===
+                        "warning"
+                      ? "border-amber-200 bg-amber-50 text-amber-800"
+                      : "border-blue-200 bg-blue-50 text-blue-800",
+                )}
+                data-testid="knowledge-base-notice"
+                data-error-key={
+                  activeConversation.knowledgeBase.notice.errorKey
+                }
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <span>{activeConversation.knowledgeBase.notice.message}</span>
+                  {activeConversation.knowledgeBase.notice.retryable && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={retryingKnowledgeBase}
+                      onClick={() => void retryCurrentKnowledgeBaseTurn()}
+                    >
+                      {retryingKnowledgeBase && (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      )}
+                      {knowledgeBaseNoticeRetryLabel(
+                        activeConversation.knowledgeBase.notice,
+                      )}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )}
 
           {/* Typing indicator when running */}
           {(status === "running" || status === "pending") &&

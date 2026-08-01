@@ -116,6 +116,10 @@ export const KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES = [
     branchTitle: "合作与支持",
   },
 ] as const;
+export const KNOWLEDGE_BASE_PROTOCOL_PROBE_OPERATION_ID =
+  "knowledge-base-protocol-probe";
+export const KNOWLEDGE_BASE_PROTOCOL_PROBE_TURN_ID =
+  "00000000-0000-4000-8000-000000000004";
 
 type LivePreviewSession = {
   taskId: string;
@@ -125,6 +129,8 @@ type LivePreviewSession = {
   lastLoggedSummary: string;
   progressState: KnowledgeBaseProgressState | null;
   confirmationCount: number;
+  skillVersion: string;
+  skillContentHash: string | null;
   skillAttachment: { file_id: string; filename: string } | null;
   removeSkill: () => Promise<void>;
   skillRemoved: boolean;
@@ -366,14 +372,11 @@ export function analyzeKnowledgeBaseLiveTask(
     // A continuation is not accepted until its transition has also been
     // applied to the authoritative server state in
     // reconcileTerminalLiveAnalysis. Structural validity alone is not enough.
-    protocolAccepted:
-      runMode === "continuation" ? false : structurallyAccepted,
+    protocolAccepted: runMode === "continuation" ? false : structurallyAccepted,
     outputCount: output.length,
     imageCount: suppressCustomerOutput ? 0 : imageCount,
     assistantCharacterCount: assistantText.length,
-    visibleCharacterCount: suppressCustomerOutput
-      ? 0
-      : visibleMarkdown.length,
+    visibleCharacterCount: suppressCustomerOutput ? 0 : visibleMarkdown.length,
     visibleMarkdown: suppressCustomerOutput ? "" : visibleMarkdown,
     rawAssistantText: assistantText,
     rawOutput: suppressCustomerOutput ? [] : presentationOutput,
@@ -524,15 +527,15 @@ export function buildKnowledgeBaseProtocolProbePrompt() {
     (leaf) => `${leaf.id}|${leaf.title}|${leaf.branchId}|${leaf.branchTitle}`,
   ).join("\n");
   return [
-    "FRONTMIND_KB_PROTOCOL_PROBE_V1",
-    "严格执行随任务附带的 socratic-kb-builder v3 Skill 中的协议自检模式。",
+    "FRONTMIND_KB_PROTOCOL_PROBE_V2",
+    "严格执行随任务附带的 socratic-kb-builder v4 Skill 中的协议自检模式。",
     "这是本机开发环境的机器协议契约探针，不是企业知识库构建任务。",
     "禁止联网、搜索、浏览、调用工具、读取企业资料、生成文件或开展研究。",
     "把下面 8 行测试数据按原顺序转换为完整 leaves；每行字段依次为 id、title、branchId、branchTitle：",
     sourceRows,
     "",
     "回复只能包含一行可见文字“协议探针响应”，随后紧接且只接一个完整的 FRONTMIND_KB_MANIFEST 注释信封。",
-    "信封内必须是严格 JSON：kind 为 frontmind.knowledge-base.manifest，schemaVersion 为 1，leaves 与以上 8 行逐字段完全一致。",
+    `信封内必须是严格 JSON：kind 为 frontmind.knowledge-base.manifest，schemaVersion 为 2，operationId 为 ${KNOWLEDGE_BASE_PROTOCOL_PROBE_OPERATION_ID}，turnId 为 ${KNOWLEDGE_BASE_PROTOCOL_PROBE_TURN_ID}，leaves 与以上 8 行逐字段完全一致。`,
     "禁止输出裸 JSON、代码围栏、FRONTMIND_KB_PROGRESS、FRONTMIND_KB_PRESENTATION、SOCRATIC_KB_STATE、workflow-state、knowledge-base.message 或任何解释。",
   ].join("\n");
 }
@@ -761,6 +764,8 @@ router.post("/start", async (req, res) => {
     | undefined;
   try {
     const descriptor = await getKnowledgeBaseSkillDescriptor();
+    const sessionId = randomUUID();
+    const initialOperationId = `live-preview:${sessionId}:start`;
     const prompt =
       mode === "protocol_probe"
         ? buildKnowledgeBaseProtocolProbePrompt()
@@ -772,6 +777,11 @@ router.post("/start", async (req, res) => {
               "本地真实 API 与渲染回归。严格输出完整客户正文及规定的机器信封。",
             attachments: [],
             prefillKnowledgeSnapshot: null,
+            protocolOperation: {
+              skillVersion: descriptor.version,
+              operationId: initialOperationId,
+              turnId: sessionId,
+            },
           });
     skill = await uploadKnowledgeBaseSkillArchive({
       baseUrl,
@@ -784,6 +794,7 @@ router.post("/start", async (req, res) => {
       apiKey,
       prompt,
       attachments: [skill.attachment],
+      idempotencyKey: initialOperationId,
     });
     if (!created.ok) {
       await skill.removeOrphan().catch(() => undefined);
@@ -796,7 +807,6 @@ router.post("/start", async (req, res) => {
       return;
     }
 
-    const sessionId = randomUUID();
     let analysis = analyzeKnowledgeBaseLiveTask(created.task, { mode });
     const terminal = analysis.terminal;
     if (terminal && mode === "protocol_probe") {
@@ -821,6 +831,8 @@ router.post("/start", async (req, res) => {
       lastLoggedSummary: `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`,
       progressState,
       confirmationCount: 0,
+      skillVersion: descriptor.version,
+      skillContentHash: descriptor.contentHash,
       skillAttachment: skill.attachment,
       removeSkill: skill.removeOrphan,
       skillRemoved: terminal && mode === "protocol_probe",
@@ -916,6 +928,12 @@ router.post("/recover", async (req, res) => {
     const progressState = progressStateFromInitialText(
       analysis.rawAssistantText,
     );
+    const recoveredManifest = parseKnowledgeBaseManifestEnvelope(
+      analysis.rawAssistantText,
+    );
+    const recoveredSkill = await getKnowledgeBaseSkillDescriptor({
+      version: recoveredManifest.schemaVersion === 2 ? "4" : "3",
+    });
     analysis = analyzeKnowledgeBaseLiveTask(initialTask, {
       mode: "full",
       progressState,
@@ -930,6 +948,8 @@ router.post("/recover", async (req, res) => {
       lastLoggedSummary: `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`,
       progressState,
       confirmationCount: 0,
+      skillVersion: recoveredSkill.version,
+      skillContentHash: recoveredSkill.contentHash,
       skillAttachment: null,
       removeSkill: async () => undefined,
       skillRemoved: true,
@@ -1001,6 +1021,12 @@ router.post("/confirm", async (req, res) => {
           confirmationCount,
         }),
         confirmationCount,
+        skillVersion:
+          parseKnowledgeBaseManifestEnvelope(sourceRawAssistantText)
+            .schemaVersion === 2
+            ? "4"
+            : "3",
+        skillContentHash: null,
         skillAttachment: null,
         removeSkill: async () => undefined,
         skillRemoved: true,
@@ -1043,7 +1069,11 @@ router.post("/confirm", async (req, res) => {
     // as a system attachment on every continued local session. It is not part
     // of the user's attachment list, so a plain confirmation remains confirm.
     if (!session.skillAttachment) {
-      const descriptor = await getKnowledgeBaseSkillDescriptor();
+      const descriptor = await getKnowledgeBaseSkillDescriptor({
+        version: session.skillVersion,
+        contentHash: session.skillContentHash,
+      });
+      session.skillContentHash = descriptor.contentHash;
       const currentSkill = await uploadKnowledgeBaseSkillArchive({
         baseUrl: getUpstreamBaseUrl(),
         apiKey,
@@ -1061,13 +1091,18 @@ router.post("/confirm", async (req, res) => {
       session.skillRemoved = false;
     }
 
+    const turnId = randomUUID();
+    const operationId = `live-preview:${sessionId}:confirm:${session.confirmationCount + 1}`;
     const prompt = await buildKnowledgeBaseTurnPrompt({
       userId: 0,
       conversationId: `live-preview-${sessionId}`,
       userMessage: "确认",
       attachments: [],
-      skillVersion: "3",
+      skillVersion: session.skillVersion,
+      skillContentHash: session.skillContentHash,
       progressOverride: progressOverrideFromState(session.progressState),
+      protocolOperation:
+        session.skillVersion === "4" ? { operationId, turnId } : undefined,
     });
     const created = await createFrontMindTask({
       baseUrl: getUpstreamBaseUrl(),
@@ -1075,6 +1110,7 @@ router.post("/confirm", async (req, res) => {
       prompt,
       attachments: [session.skillAttachment],
       taskId: session.taskId,
+      idempotencyKey: operationId,
     });
     if (!created.ok) {
       res.status(created.status).json({

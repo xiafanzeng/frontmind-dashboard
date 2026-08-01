@@ -392,7 +392,7 @@ export default function AdminUsers() {
       <div className="mx-auto w-full max-w-6xl">
         <p className="mb-5 text-sm text-[#716a80]">
           创建客户、管理员与工程师账号，配置岗位和管理员权限，并管理账号生命周期；所有
-          Key 统一前往交付总览配置。
+          Key 统一前往 API 与人员管理配置。
         </p>
 
         <section className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
@@ -848,7 +848,6 @@ export function CreateUserDialog({
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [apiKey, setApiKey] = useState("");
   const [role, setRole] = useState<CreatableAccountRole>("user");
   const [engineerRoleType, setEngineerRoleType] = useState<
     DeliveryRoleType | ""
@@ -866,8 +865,6 @@ export function CreateUserDialog({
   const effectiveDeliveryAdminId = fixedDeliveryAdmin
     ? String(fixedDeliveryAdmin.id)
     : deliveryAdminId;
-  const canSetEngineerApiKey = !fixedDeliveryAdmin;
-  const canSetCustomerApiKey = !fixedDeliveryAdmin;
   const createMutation = trpc.admin.users.create.useMutation({
     onSuccess: () =>
       Promise.all([
@@ -882,7 +879,6 @@ export function CreateUserDialog({
     setDisplayName("");
     setPassword("");
     setConfirmPassword("");
-    setApiKey("");
     setRole("user");
     setEngineerRoleType("");
     setPlanCode("");
@@ -955,10 +951,6 @@ export function CreateUserDialog({
                 password,
                 role: "delivery_member",
                 engineerRoleType: engineerRoleType as DeliveryRoleType,
-                apiKey:
-                  canSetEngineerApiKey && apiKey.trim()
-                    ? apiKey.trim()
-                    : undefined,
               })
             : await createMutation.mutateAsync({
                 username: normalizedUsername,
@@ -968,10 +960,6 @@ export function CreateUserDialog({
                 planCode: planCode as ProvisionableServicePlanCode,
                 marketEdition: marketEdition as AccountMarketEdition,
                 deliveryAdminId: Number(effectiveDeliveryAdminId),
-                apiKey:
-                  canSetCustomerApiKey && apiKey.trim()
-                    ? apiKey.trim()
-                    : undefined,
               });
       toast.success("账号已创建", {
         description: displayName.trim() || normalizedUsername,
@@ -997,11 +985,11 @@ export function CreateUserDialog({
             </DialogTitle>
             <DialogDescription>
               {userOnly && allowEngineer
-                ? "创建客户或工程师账号并安排交付归属；所有 Key 由系统管理员在交付总览统一配置。"
+                ? "创建客户或工程师账号并安排交付归属；所有 Key 由系统管理员在 API 与人员管理统一配置。"
                 : userOnly && fixedDeliveryAdmin
                   ? "设置客户初始密码和套餐；创建后自动归属当前交付管理员，Key 由系统管理员统一配置。"
                   : userOnly
-                    ? "设置客户初始密码、套餐和主负责人；Key 可由系统管理员稍后在交付总览配置。"
+                    ? "设置客户初始密码、套餐和主负责人；Key 可由系统管理员稍后在 API 与人员管理配置。"
                     : "创建客户、管理员或工程师账号；所有账号 Key 统一由系统管理员维护。"}
             </DialogDescription>
           </DialogHeader>
@@ -1020,7 +1008,6 @@ export function CreateUserDialog({
                       setPlanCode("");
                       setMarketEdition("");
                       setEngineerRoleType("");
-                      setApiKey("");
                     }}
                     disabled={createMutation.isPending}
                   >
@@ -1120,7 +1107,8 @@ export function CreateUserDialog({
                   </p>
                   {fixedDeliveryAdmin && (
                     <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
-                      账号创建后，由系统管理员在交付总览统一配置工程师 Key。
+                      账号创建后，由系统管理员在 API 与人员管理统一配置工程师
+                      Key。
                     </p>
                   )}
                 </div>
@@ -1225,38 +1213,11 @@ export function CreateUserDialog({
                   )}
                 </>
               )}
-              {((role === "user" && canSetCustomerApiKey) ||
-                (role === "delivery_member" && canSetEngineerApiKey)) && (
-                <div className="space-y-2">
-                  <Label htmlFor="create-api-key">
-                    {role === "user"
-                      ? "客户 API Key（可选）"
-                      : "工程师 API Key（可选）"}
-                  </Label>
-                  <Input
-                    id="create-api-key"
-                    type="password"
-                    autoComplete="off"
-                    value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
-                    placeholder={
-                      role === "user"
-                        ? "可留空；创建后在交付总览统一配置"
-                        : "可留空；创建后也可在交付总览由系统管理员配置"
-                    }
-                    disabled={createMutation.isPending}
-                  />
-                  {role === "user" ? (
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      由系统管理员维护；填写后会先验证，再按客户账号独立加密和版本化。
-                    </p>
-                  ) : (
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      未填写也可以创建账号，列表和客户项目团队会提示“Key
-                      未配置”。工程师 Key 始终由系统管理员统一维护。
-                    </p>
-                  )}
-                </div>
+              {(role === "user" || role === "delivery_member") && (
+                <p className="rounded-lg border border-primary/15 bg-primary/5 px-3 py-2 text-xs leading-5 text-muted-foreground">
+                  账号创建后，请在“API 与人员管理”统一配置 API
+                  Key；创建账号弹窗不再接收 Key。
+                </p>
               )}
               {role === "admin" && (
                 <div className="space-y-2">
@@ -1331,182 +1292,32 @@ export function EngineerApiKeyDialog({
   user: AuthUser | null;
   onOpenChange: (open: boolean) => void;
 }) {
-  const utils = trpc.useUtils();
-  const [apiKey, setApiKey] = useState("");
-  const [revokeOpen, setRevokeOpen] = useState(false);
-  const setApiKeyMutation =
-    trpc.delivery.management.setEngineerApiKey.useMutation();
-  const revokeApiKeyMutation =
-    trpc.delivery.management.revokeEngineerApiKey.useMutation();
-  const busy = setApiKeyMutation.isPending || revokeApiKeyMutation.isPending;
-
-  const close = () => {
-    if (busy) return;
-    setApiKey("");
-    setRevokeOpen(false);
-    setApiKeyMutation.reset();
-    revokeApiKeyMutation.reset();
-    onOpenChange(false);
-  };
-
-  const handleSetApiKey = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!user || !apiKey.trim()) return;
-    try {
-      await setApiKeyMutation.mutateAsync({
-        engineerUserId: user.id,
-        apiKey: apiKey.trim(),
-        expectedVersion: user.engineerApiKeyVersion ?? 0,
-      });
-      await utils.admin.users.list.invalidate();
-      await utils.delivery.management.overview.invalidate();
-      toast.success(
-        user.engineerApiKeyConfigured
-          ? "工程师 API Key 已替换"
-          : "工程师 API Key 已配置",
-        { description: user.displayName || user.username },
-      );
-      close();
-    } catch (error) {
-      toast.error("无法配置工程师 API Key", {
-        description: error instanceof Error ? error.message : "请稍后重试",
-      });
-    }
-  };
-
-  const handleRevokeApiKey = async () => {
-    if (!user) return;
-    try {
-      await revokeApiKeyMutation.mutateAsync({
-        engineerUserId: user.id,
-        expectedVersion: user.engineerApiKeyVersion ?? 0,
-      });
-      await utils.admin.users.list.invalidate();
-      await utils.delivery.management.overview.invalidate();
-      toast.success("工程师 API Key 已撤销", {
-        description: user.displayName || user.username,
-      });
-      close();
-    } catch (error) {
-      toast.error("无法撤销工程师 API Key", {
-        description: error instanceof Error ? error.message : "请稍后重试",
-      });
-    }
-  };
-
   return (
-    <>
-      <Dialog open={Boolean(user)} onOpenChange={(open) => !open && close()}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <KeyRound className="h-5 w-5 text-primary" />
-              管理工程师 API Key
-            </DialogTitle>
-            <DialogDescription>
-              {user?.displayName || user?.username} · @{user?.username}。Key
-              只在服务端加密保存，此处不会返回明文。
-            </DialogDescription>
-          </DialogHeader>
-          <form className="space-y-4" onSubmit={handleSetApiKey}>
-            <div className="rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
-              当前状态：
-              <span
-                className={
-                  user?.engineerApiKeyConfigured
-                    ? "font-medium text-emerald-700"
-                    : "font-medium text-amber-700"
-                }
-              >
-                {user?.engineerApiKeyConfigured ? "已配置" : "未配置"}
-              </span>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="engineer-api-key">
-                {user?.engineerApiKeyConfigured ? "新的 API Key" : "API Key"}
-              </Label>
-              <Input
-                id="engineer-api-key"
-                type="password"
-                autoComplete="off"
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder="输入后将先验证，再加密保存"
-                disabled={busy}
-              />
-              <p className="text-xs leading-5 text-muted-foreground">
-                保存成功后只显示配置状态，无法在页面查看原始 Key。
-              </p>
-            </div>
-            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
-              <Button
-                type="button"
-                variant="outline"
-                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                disabled={busy || !user?.engineerApiKeyConfigured}
-                onClick={() => setRevokeOpen(true)}
-              >
-                撤销 Key
-              </Button>
-              <div className="flex flex-col-reverse gap-2 sm:flex-row">
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={close}
-                  disabled={busy}
-                >
-                  取消
-                </Button>
-                <Button
-                  type="submit"
-                  disabled={busy || apiKey.trim().length < 8}
-                >
-                  {setApiKeyMutation.isPending && (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  )}
-                  验证并{user?.engineerApiKeyConfigured ? "替换" : "配置"}
-                </Button>
-              </div>
-            </div>
-          </form>
-        </DialogContent>
-      </Dialog>
-
-      <AlertDialog
-        open={revokeOpen}
-        onOpenChange={(open) =>
-          !revokeApiKeyMutation.isPending && setRevokeOpen(open)
-        }
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>撤销工程师 API Key</AlertDialogTitle>
-            <AlertDialogDescription>
-              撤销后，{user?.displayName || user?.username}
-              将无法调用通用智能体，直至重新配置有效 Key。
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={revokeApiKeyMutation.isPending}>
-              取消
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-white hover:bg-destructive/90"
-              disabled={revokeApiKeyMutation.isPending}
-              onClick={(event) => {
-                event.preventDefault();
-                void handleRevokeApiKey();
-              }}
-            >
-              {revokeApiKeyMutation.isPending && (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              )}
-              确认撤销
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </>
+    <Dialog
+      open={Boolean(user)}
+      onOpenChange={(open) => !open && onOpenChange(false)}
+    >
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <KeyRound className="h-5 w-5 text-primary" />
+            工程师 API Key 已统一管理
+          </DialogTitle>
+          <DialogDescription>
+            {user?.displayName || user?.username} · @{user?.username}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="rounded-lg border border-primary/15 bg-primary/5 p-4 text-sm leading-6">
+          配置、替换与撤销操作已移至系统管理员的“API
+          与人员管理”统一入口；此处不再提供旧写入口。
+        </div>
+        <div className="flex justify-end">
+          <Button type="button" onClick={() => onOpenChange(false)}>
+            知道了
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

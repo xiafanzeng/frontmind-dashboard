@@ -69,7 +69,7 @@ describe("CreateUserDialog", () => {
     vi.clearAllMocks();
   });
 
-  it("allows system administrators to configure a customer Key now or later", () => {
+  it("creates the customer first and routes Key configuration to the unified console", () => {
     render(
       <CreateUserDialog
         open
@@ -85,12 +85,9 @@ describe("CreateUserDialog", () => {
     expect(screen.getByText("初始密码")).toBeInTheDocument();
     expect(screen.getByText("确认初始密码")).toBeInTheDocument();
     expect(screen.queryByText(/设置密码链接/)).toBeNull();
-    expect(screen.getByLabelText("客户 API Key（可选）")).toHaveAttribute(
-      "type",
-      "password",
-    );
+    expect(screen.queryByLabelText("客户 API Key（可选）")).toBeNull();
     expect(screen.getByRole("button", { name: "创建客户账号" })).toBeDisabled();
-    expect(screen.getByText(/交付总览.*配置/)).toBeInTheDocument();
+    expect(screen.getByText(/创建账号弹窗不再接收 Key/)).toBeInTheDocument();
     const dialog = screen.getByRole("dialog");
     expect(dialog.className).toContain("100dvh");
     expect(dialog.querySelector(".overflow-y-auto")).not.toBeNull();
@@ -191,22 +188,19 @@ describe("CreateUserDialog", () => {
     fireEvent.click(screen.getByRole("option", { name: "工程师" }));
     expect(screen.queryByLabelText("工程师 API Key（可选）")).toBeNull();
     expect(
-      screen.getByText(/由系统管理员在交付总览统一配置工程师/),
+      screen.getByText(/由系统管理员在 API 与人员管理统一配置工程师/),
     ).toBeInTheDocument();
   });
 
-  it("requires one fixed engineer role and keeps the engineer API Key optional", async () => {
+  it("requires one fixed engineer role and omits API Key from account creation", async () => {
     mocks.createUser.mockResolvedValue({ user: { id: 88 } });
     render(<CreateUserDialog open onOpenChange={() => undefined} />);
 
     fireEvent.click(screen.getByRole("combobox", { name: "账号角色" }));
     fireEvent.click(screen.getByRole("option", { name: "工程师" }));
 
-    expect(screen.getByText("工程师 API Key（可选）")).toBeInTheDocument();
-    expect(screen.getByLabelText("工程师 API Key（可选）")).toHaveAttribute(
-      "type",
-      "password",
-    );
+    expect(screen.queryByText("工程师 API Key（可选）")).toBeNull();
+    expect(screen.getByText(/创建账号弹窗不再接收 Key/)).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "创建工程师账号" }),
     ).toBeDisabled();
@@ -243,7 +237,6 @@ describe("CreateUserDialog", () => {
         password: "secret1",
         role: "delivery_member",
         engineerRoleType: "ai_operations_engineer",
-        apiKey: undefined,
       }),
     );
   });
@@ -282,26 +275,14 @@ describe("engineer account management", () => {
     expect(screen.queryByRole("button", { name: "管理 Key" })).toBeNull();
   });
 
-  it("keeps raw engineer Keys hidden and allows configuration from the account page", async () => {
-    mocks.setEngineerApiKey.mockResolvedValue({});
+  it("removes the account-page Key writer and routes engineers to unified management", () => {
     render(
       <EngineerApiKeyDialog user={engineer} onOpenChange={() => undefined} />,
     );
 
-    const input = screen.getByLabelText("API Key");
-    expect(input).toHaveAttribute("type", "password");
-    expect(screen.getByText("当前状态：")).toHaveTextContent("未配置");
-    expect(screen.getByRole("button", { name: "撤销 Key" })).toBeDisabled();
-
-    fireEvent.change(input, { target: { value: "sk-engineer-secret" } });
-    fireEvent.click(screen.getByRole("button", { name: "验证并配置" }));
-
-    await waitFor(() =>
-      expect(mocks.setEngineerApiKey).toHaveBeenCalledWith({
-        engineerUserId: 88,
-        apiKey: "sk-engineer-secret",
-        expectedVersion: 0,
-      }),
-    );
+    expect(screen.getByText("工程师 API Key 已统一管理")).toBeInTheDocument();
+    expect(screen.getByText(/API 与人员管理/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("API Key")).not.toBeInTheDocument();
+    expect(mocks.setEngineerApiKey).not.toHaveBeenCalled();
   });
 });

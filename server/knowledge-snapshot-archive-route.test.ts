@@ -52,17 +52,37 @@ import dashboardRouter from "./dashboard-api";
 
 const servers: Server[] = [];
 const snapshotId = "00000000-0000-4000-8000-000000000123";
-const archive = Buffer.from(
-  "PK\u0003\u0004verified-knowledge-archive",
-  "binary",
-);
+let archive: Buffer;
+let archiveHash: string;
 
-beforeEach(() => {
+async function downloadableArchive(extraFiles: Record<string, string> = {}) {
+  const zip = new JSZip();
+  const root = "company_knowledge_base";
+  for (const file of [
+    "README.md",
+    "00_knowledge_tree.md",
+    "00_crawl_coverage_report.md",
+    "00_web_intelligence_report.md",
+    "00_source_index.md",
+    "09_media_assets/asset_inventory.md",
+    "10_reference_assets/reference_asset_inventory.md",
+  ]) {
+    zip.file(`${root}/${file}`, `# ${file}\n\n已验证的知识库内容。`);
+  }
+  for (const [file, content] of Object.entries(extraFiles)) {
+    zip.file(file, content);
+  }
+  return zip.generateAsync({ type: "nodebuffer" });
+}
+
+beforeEach(async () => {
+  archive = await downloadableArchive();
+  archiveHash = createHash("sha256").update(archive).digest("hex");
   mocks.getKnowledgeSnapshotForWorkspace.mockReset().mockResolvedValue({
     id: snapshotId,
     userId: 42,
     sourceFileName: "企业知识库.zip",
-    archiveHash: "a".repeat(64),
+    archiveHash,
     totalBytes: archive.length,
   });
   mocks.readKnowledgeSnapshotArchive.mockReset().mockResolvedValue(archive);
@@ -122,7 +142,7 @@ describe("knowledge snapshot ZIP endpoint", () => {
     expect(mocks.readKnowledgeSnapshotArchive).toHaveBeenCalledWith({
       userId: 42,
       snapshotId,
-      expectedSha256: "a".repeat(64),
+      expectedSha256: archiveHash,
       expectedBytes: archive.length,
     });
   });
@@ -134,9 +154,7 @@ describe("knowledge snapshot ZIP endpoint", () => {
     const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
     process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
     try {
-      const zip = new JSZip();
-      zip.file("company_knowledge_base/README.md", "# 可下载的企业知识库");
-      const bytes = await zip.generateAsync({ type: "nodebuffer" });
+      const bytes = await downloadableArchive();
       const archiveHash = createHash("sha256").update(bytes).digest("hex");
       const archiveStore = await vi.importActual<
         typeof import("./knowledge-snapshot-archive-store")
@@ -185,5 +203,32 @@ describe("knowledge snapshot ZIP endpoint", () => {
 
     expect(response.status).toBe(404);
     expect(mocks.readKnowledgeSnapshotArchive).not.toHaveBeenCalled();
+  });
+
+  it("refuses a path-traversal ZIP before sending any archive bytes", async () => {
+    const unsafe = await downloadableArchive({
+      "../escaped.md": "不得写出知识库根目录",
+    });
+    const unsafeHash = createHash("sha256").update(unsafe).digest("hex");
+    mocks.getKnowledgeSnapshotForWorkspace.mockResolvedValueOnce({
+      id: snapshotId,
+      userId: 42,
+      sourceFileName: "企业知识库.zip",
+      archiveHash: unsafeHash,
+      totalBytes: unsafe.length,
+    });
+    mocks.readKnowledgeSnapshotArchive.mockResolvedValueOnce(unsafe);
+
+    const response = await fetch(await startApp(), {
+      headers: { "x-test-auth": "user" },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.headers.get("content-type")).not.toContain(
+      "application/zip",
+    );
+    expect(await response.json()).toMatchObject({
+      error: { code: "KNOWLEDGE_ARCHIVE_UNSAFE_INVALID" },
+    });
   });
 });

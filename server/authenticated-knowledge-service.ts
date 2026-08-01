@@ -10,6 +10,7 @@ import {
   KNOWLEDGE_BASE_MANIFEST_MAX_LEAVES,
   KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES,
 } from "./knowledge-base-progress";
+import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
 import { getDb } from "./db";
 
 export function isAuthenticatedAdvancedKnowledgePublication(input: {
@@ -39,6 +40,7 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
     | "packageRevision"
     | "packageTaskId"
     | "packageDescriptorHash"
+    | "packageArchiveSha256"
     | "publishedSnapshotId"
     | "publishedAt"
     | "createdAt"
@@ -47,6 +49,7 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
 }) {
   const { snapshot, build } = input;
   const handled = build.confirmedCount + build.directPrefilledCount;
+  const publicationBindingHash = knowledgeBasePublicationBindingHash(build);
   return (
     snapshot.createdAt.getTime() >= input.notBefore.getTime() &&
     build.createdAt.getTime() >= input.notBefore.getTime() &&
@@ -57,8 +60,10 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
     snapshot.sourceTaskId === build.upstreamTaskId &&
     snapshot.sourceTaskId === build.packageTaskId &&
     Boolean(snapshot.sourceArtifactHash) &&
-    snapshot.sourceArtifactHash === build.packageDescriptorHash &&
+    snapshot.sourceArtifactHash === publicationBindingHash &&
     Boolean(snapshot.archiveHash) &&
+    (!build.packageArchiveSha256 ||
+      snapshot.archiveHash === build.packageArchiveSha256) &&
     build.status === "published" &&
     build.publishedSnapshotId === snapshot.id &&
     Boolean(build.publishedAt) &&

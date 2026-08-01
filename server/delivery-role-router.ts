@@ -4,20 +4,15 @@ import { deliveryRoleTypeSchema } from "../shared/delivery-roles";
 import { toTrpcError } from "./auth-router";
 import {
   approveMyCustomerQuestionSelection,
-  dispatchDeliveryTicket,
   getMyDeliveryHistory,
+  getMyDeliveryTickets,
   getMyDeliveryTicketDetail,
   getMyDeliveryWorkbench,
   listDeliveryRoleManagement,
   listMyProjectAssignments,
   publishWebsiteStyleSamples,
-  revokeDeliveryAdminCredential,
-  setDeliveryMemberCredential,
-  revokeDeliveryMemberCredential,
-  setDeliveryAdminCredential,
   setProjectEngineer,
   updateMyDeliveryTicket,
-  urgeDeliveryTicket,
 } from "./delivery-role-service";
 import { adminProcedure, protectedProcedure, router } from "./_core/trpc";
 import {
@@ -48,93 +43,6 @@ export const deliveryRoleRouter = router({
       .mutation(({ ctx, input }) =>
         serviceCall(() => setProjectEngineer({ actor: ctx.user, ...input })),
       ),
-    dispatchTicket: adminProcedure
-      .input(
-        z.object({
-          ticketId: z.string().uuid(),
-          priority: z.enum(["low", "normal", "high", "urgent"]),
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() =>
-          dispatchDeliveryTicket({ actor: ctx.user, ...input }),
-        ),
-      ),
-    urgeTicket: adminProcedure
-      .input(
-        z.object({
-          ticketId: z.string().uuid(),
-          message: z.string().trim().max(2_000).optional(),
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() => urgeDeliveryTicket({ actor: ctx.user, ...input })),
-      ),
-    setEngineerApiKey: adminProcedure
-      .input(
-        z.object({
-          engineerUserId: z.number().int().positive(),
-          apiKey: z.string().trim().min(8).max(4096),
-          expectedVersion: z.number().int().nonnegative(),
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() =>
-          setDeliveryMemberCredential({
-            actor: ctx.user,
-            memberUserId: input.engineerUserId,
-            apiKey: input.apiKey,
-            expectedVersion: input.expectedVersion,
-          }),
-        ),
-      ),
-    revokeEngineerApiKey: adminProcedure
-      .input(
-        z.object({
-          engineerUserId: z.number().int().positive(),
-          expectedVersion: z.number().int().nonnegative(),
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() =>
-          revokeDeliveryMemberCredential({
-            actor: ctx.user,
-            memberUserId: input.engineerUserId,
-            expectedVersion: input.expectedVersion,
-          }),
-        ),
-      ),
-    setDeliveryAdminApiKey: adminProcedure
-      .input(
-        z.object({
-          adminUserId: z.number().int().positive(),
-          apiKey: z.string().trim().min(8).max(4096),
-          expectedVersion: z.number().int().nonnegative(),
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() =>
-          setDeliveryAdminCredential({
-            actor: ctx.user,
-            ...input,
-          }),
-        ),
-      ),
-    revokeDeliveryAdminApiKey: adminProcedure
-      .input(
-        z.object({
-          adminUserId: z.number().int().positive(),
-          expectedVersion: z.number().int().nonnegative(),
-        }),
-      )
-      .mutation(({ ctx, input }) =>
-        serviceCall(() =>
-          revokeDeliveryAdminCredential({
-            actor: ctx.user,
-            ...input,
-          }),
-        ),
-      ),
   }),
   mine: router({
     assignments: protectedProcedure.query(({ ctx }) =>
@@ -146,6 +54,26 @@ export const deliveryRoleRouter = router({
         serviceCall(() =>
           getMyDeliveryWorkbench({ actor: ctx.user, ...input }),
         ),
+      ),
+    tickets: protectedProcedure
+      .input(
+        z
+          .object({
+            customerUserId: z.number().int().positive().optional(),
+            statusGroup: z.enum(["pending", "completed"]).optional(),
+            limit: z.number().int().min(1).max(100).default(50),
+            cursor: z
+              .object({
+                actionRank: z.number().int().min(0).max(4),
+                updatedAt: z.number().int().nonnegative(),
+                id: z.string().uuid(),
+              })
+              .optional(),
+          })
+          .default({ limit: 50 }),
+      )
+      .query(({ ctx, input }) =>
+        serviceCall(() => getMyDeliveryTickets({ actor: ctx.user, ...input })),
       ),
     approveQuestionSelection: protectedProcedure
       .input(

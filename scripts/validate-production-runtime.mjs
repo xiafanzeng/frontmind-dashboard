@@ -49,8 +49,52 @@ const decodeBase64Key = (name) => {
 };
 
 try {
+  const approvedReleaseSha = process.env.FRONTMIND_APPROVED_RELEASE_SHA || "";
+  if (!/^[a-f0-9]{40}$/u.test(approvedReleaseSha)) {
+    fail("FRONTMIND_APPROVED_RELEASE_SHA_VALUE_INVALID");
+  }
+  const expectedArtifactRoot =
+    process.env.FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256 || "";
+  if (!/^[a-f0-9]{64}$/u.test(expectedArtifactRoot)) {
+    fail("FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256_VALUE_INVALID");
+  }
+  const configuredBuildSourceSha = process.env.FRONTMIND_BUILD_SHA || "";
+  if (
+    configuredBuildSourceSha &&
+    (!/^[a-f0-9]{40}$/u.test(configuredBuildSourceSha) ||
+      configuredBuildSourceSha === approvedReleaseSha)
+  ) {
+    fail("FRONTMIND_BUILD_SHA_VALUE_INVALID");
+  }
+
   for (const [name, expected] of Object.entries(exactValues)) {
     if (process.env[name] !== expected) fail(`${name}_VALUE_INVALID`);
+  }
+
+  const knowledgeBaseRollout =
+    process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT || "";
+  if (!/^(?:100|[0-9]{1,2})(?:\.\d{1,2})?$/u.test(knowledgeBaseRollout)) {
+    fail("FRONTMIND_KB_V4_ROLLOUT_PERCENT_VALUE_INVALID");
+  }
+  const rolloutValue = Number(knowledgeBaseRollout);
+  if (rolloutValue < 0 || rolloutValue > 100) {
+    fail("FRONTMIND_KB_V4_ROLLOUT_PERCENT_VALUE_INVALID");
+  }
+  const knowledgeBaseAllowlist =
+    process.env.FRONTMIND_KB_V4_ALLOW_USER_IDS || "";
+  if (
+    knowledgeBaseAllowlist &&
+    !/^[1-9]\d*(?:,[1-9]\d*)*$/u.test(knowledgeBaseAllowlist)
+  ) {
+    fail("FRONTMIND_KB_V4_ALLOW_USER_IDS_VALUE_INVALID");
+  }
+  const knowledgeBaseWritesDisabled =
+    process.env.KNOWLEDGE_BASE_WRITES_DISABLED || "";
+  if (
+    knowledgeBaseWritesDisabled &&
+    !/^(?:0|1|false|true|no|yes|off|on)$/iu.test(knowledgeBaseWritesDisabled)
+  ) {
+    fail("KNOWLEDGE_BASE_WRITES_DISABLED_VALUE_INVALID");
   }
 
   const databaseUrl = process.env.DATABASE_URL;

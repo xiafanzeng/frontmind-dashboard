@@ -478,15 +478,8 @@ export function PreviewAdminUsers({
   previewAccessLevel?: PreviewAdminAccessLevel;
 }) {
   const systemAdmin = previewAccessLevel === "system_admin";
-  const [users, setUsers] = useState<PreviewManagedUser[]>(managedUsers);
+  const users = managedUsers;
   const [selectedId, setSelectedId] = useState(1);
-  const [createOpen, setCreateOpen] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return (
-      systemAdmin &&
-      new URLSearchParams(window.location.search).get("action") === "create"
-    );
-  });
   const [tab, setTab] = useState<PreviewWorkspaceTab>(() => {
     if (typeof window === "undefined") return "service";
     const requested = new URLSearchParams(window.location.search).get("tab");
@@ -525,60 +518,28 @@ export function PreviewAdminUsers({
   return (
     <PortalShell
       eyebrow="管理中心 · 客户与服务"
-      title="客户交付工作台"
+      title={systemAdmin ? "客户交付工作台" : "客户管理"}
       navItems={getRoleScopedPreviewAdminNav(previewAccessLevel)}
       accountLabel={`${systemAdmin ? "系统管理员" : "交付管理员"}验收账号`}
       roleLabel={`${systemAdmin ? "系统管理员" : "交付管理员"} · 验收预览`}
       toolbar={
-        <div className="flex items-center gap-2">
-          {systemAdmin && (
-            <Button size="sm" onClick={() => setCreateOpen(true)}>
-              <Plus className="h-4 w-4" />
-              创建客户
-            </Button>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            className="border-[#e1d8e8] bg-white"
-            onClick={() => toast.success("样例数据已刷新")}
-          >
-            <RefreshCw className="h-4 w-4" />
-            刷新
-          </Button>
-        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="border-[#e1d8e8] bg-white"
+          onClick={() => toast.success("样例数据已刷新")}
+        >
+          <RefreshCw className="h-4 w-4" />
+          刷新
+        </Button>
       }
     >
-      {systemAdmin && (
-        <PreviewCreateAccountDialog
-          open={createOpen}
-          onOpenChange={setCreateOpen}
-          userOnly
-          onCreated={(draft) => {
-            const id = Math.max(0, ...users.map((user) => user.id)) + 1;
-            setUsers((current) => [
-              ...current,
-              {
-                id,
-                name: draft.name,
-                username: draft.username,
-              },
-            ]);
-            setAssignments((current) => ({ ...current, [id]: [101] }));
-            setServicePlans((current) => ({
-              ...current,
-              [id]: draft.planCode ?? "basic",
-            }));
-            setSelectedId(id);
-          }}
-        />
-      )}
       <div className="grid gap-5 xl:grid-cols-[330px_minmax(0,1fr)]">
         <PortalCard className="h-fit overflow-hidden">
           <div className="border-b border-[#e8e1ee] p-5">
             <div className="flex items-center gap-2">
               <UserCog className="h-5 w-5 text-[#5b2a86]" />
-              <h2 className="font-semibold text-[#171321]">用户列表</h2>
+              <h2 className="font-semibold text-[#171321]">客户列表</h2>
             </div>
             <div className="relative mt-4">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a94a8]" />
@@ -623,7 +584,7 @@ export function PreviewAdminUsers({
             <div className="grid gap-5 lg:grid-cols-[minmax(240px,1fr)_minmax(0,2fr)] lg:items-start">
               <div className="min-w-0">
                 <p className="text-xs font-semibold text-[#5b2a86]">
-                  用户工作空间
+                  客户工作空间
                 </p>
                 <h2
                   className="mt-1 truncate text-2xl font-semibold text-[#171321]"
@@ -699,6 +660,178 @@ export function PreviewAdminUsers({
           )}
         </div>
       </div>
+    </PortalShell>
+  );
+}
+
+const previewProjectTeams = [
+  {
+    customer: "验收企业",
+    username: "acceptance",
+    roles: [
+      ["AI 运维工程师", "林哲"],
+      ["AI 监控与优化工程师", "周宁"],
+      ["AI 内容分发工程师", "何川"],
+    ],
+  },
+  {
+    customer: "验收企业 B",
+    username: "acceptance_b",
+    roles: [
+      ["AI 运维工程师", "赵恺"],
+      ["AI 监控与优化工程师", "许薇"],
+      ["AI 内容分发工程师", "沈航"],
+    ],
+  },
+  {
+    customer: "验收企业 C",
+    username: "acceptance_c",
+    roles: [
+      ["AI 运维工程师", "待配置"],
+      ["AI 监控与优化工程师", "待配置"],
+      ["AI 内容分发工程师", "待配置"],
+    ],
+  },
+] as const;
+
+export function PreviewAdminDeliveryRoles({
+  previewAccessLevel = "system_admin",
+}: {
+  previewAccessLevel?: PreviewAdminAccessLevel;
+}) {
+  const systemAdmin = previewAccessLevel === "system_admin";
+  const teams = systemAdmin
+    ? previewProjectTeams
+    : previewProjectTeams.slice(0, 2);
+  return (
+    <PortalShell
+      eyebrow="管理中心 · 客户与服务"
+      title="客户项目团队"
+      navItems={getRoleScopedPreviewAdminNav(previewAccessLevel)}
+      accountLabel={`${systemAdmin ? "系统管理员" : "交付管理员"}验收账号`}
+      roleLabel={`${systemAdmin ? "系统管理员" : "交付管理员"} · 验收预览`}
+    >
+      <div className="mb-5 rounded-xl border border-primary/20 bg-primary/[0.035] px-4 py-3 text-sm leading-6 text-muted-foreground">
+        项目岗位在这里绑定工程师；绑定后，新增和未结束工单会自动归属对应岗位人员。
+      </div>
+      <div className="grid gap-4 xl:grid-cols-2">
+        {teams.map((team) => (
+          <PortalCard key={team.username} className="overflow-hidden">
+            <div className="border-b border-[#eee8f2] px-5 py-4">
+              <h2 className="font-semibold text-[#171321]">{team.customer}</h2>
+              <p className="mt-1 text-xs text-[#857e91]">@{team.username}</p>
+            </div>
+            <div className="divide-y divide-[#eee8f2] px-5">
+              {team.roles.map(([role, engineer]) => (
+                <div
+                  key={role}
+                  className="flex items-center justify-between gap-4 py-4 text-sm"
+                >
+                  <span className="text-[#5f576c]">{role}</span>
+                  <Badge
+                    variant="outline"
+                    className={
+                      engineer === "待配置"
+                        ? "border-amber-300 text-amber-700"
+                        : "border-emerald-300 text-emerald-700"
+                    }
+                  >
+                    {engineer}
+                  </Badge>
+                </div>
+              ))}
+            </div>
+          </PortalCard>
+        ))}
+      </div>
+    </PortalShell>
+  );
+}
+
+const previewManagementTickets = [
+  {
+    id: "ticket-1",
+    customer: "验收企业",
+    title: "企业知识库构建异常处理",
+    role: "AI 运维工程师",
+    engineer: "林哲",
+    status: "待处理",
+  },
+  {
+    id: "ticket-2",
+    customer: "验收企业 B",
+    title: "品牌词库与问题目录",
+    role: "AI 监控与优化工程师",
+    engineer: "许薇",
+    status: "待处理",
+  },
+  {
+    id: "ticket-3",
+    customer: "验收企业",
+    title: "官网企业事实内容发布",
+    role: "AI 内容分发工程师",
+    engineer: "何川",
+    status: "已完成",
+  },
+] as const;
+
+export function PreviewAdminDispatch({
+  previewAccessLevel = "system_admin",
+}: {
+  previewAccessLevel?: PreviewAdminAccessLevel;
+}) {
+  const systemAdmin = previewAccessLevel === "system_admin";
+  const pending = previewManagementTickets.filter(
+    (ticket) => ticket.status === "待处理",
+  );
+  const completed = previewManagementTickets.filter(
+    (ticket) => ticket.status === "已完成",
+  );
+  return (
+    <PortalShell
+      eyebrow="管理中心 · 客户与服务"
+      title="工单"
+      navItems={getRoleScopedPreviewAdminNav(previewAccessLevel)}
+      accountLabel={`${systemAdmin ? "系统管理员" : "交付管理员"}验收账号`}
+      roleLabel={`${systemAdmin ? "系统管理员" : "交付管理员"} · 验收预览`}
+    >
+      <div className="mb-5 grid gap-3 sm:grid-cols-2">
+        <PortalCard className="p-4">
+          <p className="text-xs text-muted-foreground">待处理</p>
+          <p className="mt-1 text-2xl font-semibold">{pending.length}</p>
+        </PortalCard>
+        <PortalCard className="p-4">
+          <p className="text-xs text-muted-foreground">已完成</p>
+          <p className="mt-1 text-2xl font-semibold">{completed.length}</p>
+        </PortalCard>
+      </div>
+      {(
+        [
+          ["待处理", pending],
+          ["已完成", completed],
+        ] as const
+      ).map(([label, tickets]) => (
+        <PortalCard key={label} className="mb-5 overflow-hidden">
+          <div className="border-b border-[#eee8f2] px-5 py-4">
+            <h2 className="font-semibold text-[#171321]">{label}</h2>
+          </div>
+          <div className="divide-y divide-[#eee8f2] px-5">
+            {tickets.map((ticket) => (
+              <article key={ticket.id} className="py-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="font-medium text-[#332842]">{ticket.title}</p>
+                    <p className="mt-1 text-sm text-[#716a80]">
+                      {ticket.customer} · {ticket.role} · {ticket.engineer}
+                    </p>
+                  </div>
+                  <Badge variant="outline">{ticket.status}</Badge>
+                </div>
+              </article>
+            ))}
+          </div>
+        </PortalCard>
+      ))}
     </PortalShell>
   );
 }
@@ -1436,35 +1569,43 @@ const initialAccounts: PreviewAccount[] = [
   },
 ];
 
-export function PreviewAdminAccounts() {
+export function PreviewAdminAccounts({
+  previewAccessLevel = "system_admin",
+}: {
+  previewAccessLevel?: PreviewAdminAccessLevel;
+}) {
+  const systemAdmin = previewAccessLevel === "system_admin";
   const [accounts, setAccounts] = useState(initialAccounts);
   const [createOpen, setCreateOpen] = useState(false);
+  const visibleAccounts = systemAdmin
+    ? accounts
+    : accounts.filter((account) => account.role === "用户");
   const activeCount = useMemo(
-    () => accounts.filter((account) => account.active).length,
-    [accounts],
+    () => visibleAccounts.filter((account) => account.active).length,
+    [visibleAccounts],
   );
 
   return (
     <PortalShell
       eyebrow="管理员工作台 · 账号管理"
-      title="账号创建与生命周期"
-      navItems={getRoleScopedPreviewAdminNav("system_admin")}
-      accountLabel="系统管理员验收账号"
-      roleLabel="系统管理员 · 验收预览"
+      title="账号与权限"
+      navItems={getRoleScopedPreviewAdminNav(previewAccessLevel)}
+      accountLabel={`${systemAdmin ? "系统管理员" : "交付管理员"}验收账号`}
+      roleLabel={`${systemAdmin ? "系统管理员" : "交付管理员"} · 验收预览`}
       toolbar={
         <Button
           className="bg-[#5b2a86] hover:bg-[#49216c]"
           onClick={() => setCreateOpen(true)}
         >
           <Plus className="h-4 w-4" />
-          创建账号
+          {systemAdmin ? "创建账号" : "创建客户账号"}
         </Button>
       }
     >
       <div className="mb-5 grid gap-3 sm:grid-cols-3">
         <MetricCard
           label="账号总数"
-          value={String(accounts.length)}
+          value={String(visibleAccounts.length)}
           icon={Users}
         />
         <MetricCard
@@ -1475,7 +1616,8 @@ export function PreviewAdminAccounts() {
         <MetricCard
           label="管理员"
           value={String(
-            accounts.filter((account) => account.role === "管理员").length,
+            visibleAccounts.filter((account) => account.role === "管理员")
+              .length,
           )}
           icon={ShieldCheck}
         />
@@ -1507,7 +1649,7 @@ export function PreviewAdminAccounts() {
               </tr>
             </thead>
             <tbody className="divide-y divide-[#eee8f2]">
-              {accounts.map((account) => (
+              {visibleAccounts.map((account) => (
                 <tr key={account.id}>
                   <td className="px-5 py-4">
                     <p className="font-medium text-[#221a33]">{account.name}</p>
@@ -1575,6 +1717,7 @@ export function PreviewAdminAccounts() {
       <PreviewCreateAccountDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
+        userOnly={!systemAdmin}
         onCreated={(draft) =>
           setAccounts((current) => [
             ...current,

@@ -9,7 +9,11 @@ import JSZip from "jszip";
 import sharp from "sharp";
 import { z } from "zod";
 
-import { deliveryTickets, userDashboardContents } from "../drizzle/schema";
+import {
+  deliveryTickets,
+  knowledgeBaseBuildNodes,
+  userDashboardContents,
+} from "../drizzle/schema";
 import {
   dashboardContentAssetSchema,
   dashboardAdminImportModuleSchema,
@@ -45,6 +49,7 @@ import {
 } from "../shared/response-logic";
 import type { FrontMindRequest } from "./_core/express-auth";
 import { requireExpressAuth } from "./_core/express-auth";
+import { safeErrorForLog } from "./_core/sensitive-data";
 import {
   assertSafeExternalUrl,
   safeExternalRequestOptions,
@@ -120,6 +125,9 @@ import {
   readKnowledgeSnapshotArchive,
   removeKnowledgeSnapshotArchive,
 } from "./knowledge-snapshot-archive-store";
+import { readKnowledgeBuildArtifact } from "./knowledge-build-artifact-store";
+import { assertKnowledgeBasePackageMatchesBuild } from "./knowledge-base-package-validation";
+import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
 
 const router = express.Router();
 const MAX_ARCHIVE_ENTRIES = 2_000;
@@ -740,6 +748,9 @@ const internalPackageManifestSchema = z
   .object({
     schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
     profile: z.enum(["website-lead-v1", "dashboard-enterprise-v1"]),
+    // Required by builder v4 at bind time. Optional here preserves historical
+    // schema-v3 archives created before the server-authoritative build epoch.
+    buildRevision: z.number().int().nonnegative().optional(),
     websiteV2Normalized: z.literal(true).optional(),
     documents: z
       .array(
@@ -921,6 +932,45 @@ const internalPackageManifestSchema = z
   })
   .strict()
   .superRefine((value, context) => {
+    if (
+      value.profile === "dashboard-enterprise-v1" &&
+      value.schemaVersion === 3 &&
+      value.buildRevision !== undefined
+    ) {
+      const leaves = value.documents.filter(
+        (document) => document.kind === "leaf",
+      );
+      const orders: number[] = [];
+      leaves.forEach((leaf, index) => {
+        for (const key of ["branchId", "branchTitle", "order"] as const) {
+          if (leaf[key] === undefined) {
+            context.addIssue({
+              code: "custom",
+              path: ["documents", value.documents.indexOf(leaf), key],
+              message: `builder v4 leaf requires ${key}`,
+            });
+          }
+        }
+        if (typeof leaf.order === "number") orders.push(leaf.order);
+      });
+      const expectedOrders = Array.from(
+        { length: leaves.length },
+        (_, index) => index,
+      );
+      if (
+        orders.length !== expectedOrders.length ||
+        [...orders]
+          .sort((left, right) => left - right)
+          .some((order, index) => order !== expectedOrders[index])
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["documents"],
+          message:
+            "builder v4 leaf order must be the complete zero-based sequence",
+        });
+      }
+    }
     const documentById = new Map(
       value.documents.map((document) => [document.id, document]),
     );
@@ -1293,6 +1343,15 @@ export async function removeStoredKnowledgeAssets(keys: string[]) {
       unlink(path.join(storageRoot, key)).catch(() => undefined),
     ),
   );
+}
+
+/** Read one parser-owned temporary asset without exposing the storage root. */
+export async function readStoredKnowledgeAssetBytes(key: string) {
+  const normalized = String(key || "").trim();
+  if (!normalized || normalized !== path.basename(normalized)) {
+    throw new Error("知识库临时资源标识无效");
+  }
+  return readFile(path.join(storageRoot, normalized));
 }
 
 export async function removeUncommittedStoredKnowledgeAssets(input: {
@@ -2097,8 +2156,7 @@ function validateProfilePackage(input: {
           maxWebQueries: 120,
         };
   const isSingleLogoDashboardV3 =
-    input.profile === "dashboard-enterprise-v1" &&
-    manifest.schemaVersion === 3;
+    input.profile === "dashboard-enterprise-v1" && manifest.schemaVersion === 3;
   if (input.packagePaths.length > limits.files) {
     throw new KnowledgeArchiveValidationError(
       "structure",
@@ -2499,7 +2557,9 @@ function validateProfilePackage(input: {
     if (
       (isSingleLogoDashboardV3 && methods.size === 0) ||
       (!isSingleLogoDashboardV3 &&
-        [...requiredImageDiscoveryMethods].some((method) => !methods.has(method)))
+        [...requiredImageDiscoveryMethods].some(
+          (method) => !methods.has(method),
+        ))
     ) {
       throw new KnowledgeArchiveValidationError(
         "media",
@@ -2643,7 +2703,9 @@ function validateProfilePackage(input: {
     }
     if (!isSingleLogoDashboardV3) {
       const coverageIds = new Set(
-        (selection.productFamilyCoverage || []).map((family) => family.familyId),
+        (selection.productFamilyCoverage || []).map(
+          (family) => family.familyId,
+        ),
       );
       if (
         coverageIds.size !== (selection.productFamilyCoverage || []).length ||
@@ -6179,11 +6241,14 @@ export async function readKnowledgeArchive(
       });
       return { ...document, content };
     });
+    const packageBuildRevision =
+      "manifest" in validated ? validated.manifest.buildRevision : undefined;
     return {
       documents: linkedDocuments,
       assets: validated.assets,
       storedAssetKeys,
       validationProfile,
+      packageBuildRevision,
       packageManifestSha256: rawTextByRelativePath.has(packageManifestPath)
         ? createHash("sha256")
             .update(
@@ -6214,6 +6279,75 @@ export async function readKnowledgeArchive(
     }
     throw error;
   }
+}
+
+function assertKnowledgeArchiveDownloadIntegrity(input: {
+  buffer: Buffer;
+  expectedSha256: string;
+  expectedBytes: number;
+}) {
+  const actualSha256 = createHash("sha256").update(input.buffer).digest("hex");
+  if (
+    !Number.isInteger(input.expectedBytes) ||
+    input.expectedBytes <= 0 ||
+    input.buffer.length !== input.expectedBytes ||
+    !/^[a-f0-9]{64}$/iu.test(input.expectedSha256) ||
+    actualSha256 !== input.expectedSha256.toLowerCase()
+  ) {
+    throw new KnowledgeArchiveValidationError(
+      "unsafe",
+      "知识库 ZIP 下载字节数或 SHA-256 与持久化版本不一致",
+    );
+  }
+}
+
+/**
+ * A ZIP magic-byte/hash check alone does not prove an archive is safe to hand
+ * to a customer. Re-run the production archive reader for every final ZIP
+ * download, remove its temporary decoded assets, then re-check immutable byte
+ * identity after parsing. Callers may add the build/node binding assertion but
+ * must never replace the shared path/CRC/size/profile validation here.
+ */
+export async function validateKnowledgeArchiveForDownload(input: {
+  buffer: Buffer;
+  sourceFileName: string;
+  expectedSha256: string;
+  expectedBytes: number;
+  validationProfile?: KnowledgeBaseValidationProfile;
+  archiveContractVersions?: readonly (1 | 2 | 3)[];
+  validateParsed?: (
+    parsed: Awaited<ReturnType<typeof readKnowledgeArchive>>,
+  ) => void | Promise<void>;
+}) {
+  assertKnowledgeArchiveDownloadIntegrity(input);
+  let parsed: Awaited<ReturnType<typeof readKnowledgeArchive>>;
+  try {
+    parsed = await readKnowledgeArchive(
+      input.buffer,
+      input.sourceFileName,
+      randomUUID(),
+      {
+        validationProfile: input.validationProfile,
+        archiveContractVersions: input.archiveContractVersions,
+      },
+    );
+  } catch (error) {
+    if (error instanceof KnowledgeArchiveValidationError) throw error;
+    const message =
+      error instanceof Error ? error.message : "知识库 ZIP 下载复核失败";
+    throw new KnowledgeArchiveValidationError(
+      classifyKnowledgeArchiveError(message),
+      message,
+    );
+  }
+  try {
+    await input.validateParsed?.(parsed);
+  } finally {
+    await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
+  }
+  // Parsing and the caller's semantic validation must not substitute for the
+  // exact durable byte contract used in Content-Length/ETag/download records.
+  assertKnowledgeArchiveDownloadIntegrity(input);
 }
 
 function normalizedEnterpriseEvidence(value: string) {
@@ -6256,6 +6390,13 @@ function upstreamHeaders(apiKey: string) {
     API_KEY: apiKey,
     Authorization: `Bearer ${apiKey}`,
   };
+}
+
+export function dashboardKnowledgePublishErrorForLog(
+  error: unknown,
+  secrets: Iterable<unknown> = [],
+) {
+  return safeErrorForLog(error, { secrets });
 }
 
 export async function downloadArchiveBytes(input: {
@@ -6587,6 +6728,7 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
   let storedAssetKeys: string[] = [];
   let snapshotCommitted = false;
   let storedArchive: { userId: number; snapshotId: string } | undefined;
+  const publishLogSecrets: unknown[] = [req.frontmindCredential?.apiKey];
   try {
     await assertRoleScopedWorkspaceExecution({
       req,
@@ -6611,66 +6753,100 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       res.json({ kind: "knowledge", snapshot, idempotent: true });
       return;
     }
-    const taskId = String(build.packageTaskId || "");
-    if (
-      !taskId ||
-      taskId !== build.upstreamTaskId ||
-      build.packageRevision !== build.revision ||
-      !build.packageOutputItemId ||
-      !build.packageDescriptorHash
-    ) {
-      throw new Error("最终知识库文件尚未与当前完成版本绑定");
-    }
-    const credential = await getCredentialForUpstreamResource(
-      targetUserId,
-      "task",
-      taskId,
+    const taskId = String(build.packageTaskId || build.upstreamTaskId || "");
+    const hasDurablePackage = Boolean(
+      build.packageStorageKey &&
+        build.packageArchiveSha256 &&
+        build.packageSizeBytes,
     );
-    if (!credential)
-      throw new Error("知识库任务不属于当前用户或 API Key 已失效");
+    let downloaded: { buffer: Buffer; filename: string };
+    let sourceArtifactHash: string;
 
-    const baseUrl = getUpstreamBaseUrl(req);
-    const taskResponse = await axios.get(
-      `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
-      {
-        headers: upstreamHeaders(credential.apiKey),
-        proxy: false,
-        timeout: 120_000,
-        maxContentLength: 50 * 1024 * 1024,
-        validateStatus: () => true,
-      },
-    );
-    if (taskResponse.status !== 200) {
-      throw new Error(`读取知识库任务结果失败 (${taskResponse.status})`);
-    }
-    const task = taskResponse.data?.task || taskResponse.data || {};
-    const returnedTaskId = String(task.id || task.task_id || "");
-    if (returnedTaskId !== taskId) {
-      throw new Error("读取到的知识库任务与当前完成版本不匹配");
-    }
-    if (task.status === "failed" || task.status === "error") {
-      throw new Error("知识库任务执行失败，无法发布");
-    }
-    const output = Array.isArray(task.output) ? task.output : [];
-    const matchingDescriptors = collectKnowledgeArchiveDescriptors(
-      output,
-    ).filter(
-      (candidate) =>
-        candidate.outputItemId === build.packageOutputItemId &&
-        knowledgeArchiveDescriptorHash(candidate) ===
-          build.packageDescriptorHash &&
-        (!build.packageFileId || candidate.fileId === build.packageFileId),
-    );
-    if (matchingDescriptors.length !== 1) {
-      throw new Error("任务结果中无法唯一确认当前版本的知识库 ZIP");
-    }
-    const descriptor = matchingDescriptors[0]!;
+    if (hasDurablePackage) {
+      // v4 publication consumes the exact bytes that reconciliation already
+      // downloaded, parsed and bound to this build generation. It deliberately
+      // does not read the upstream task or depend on a signed URL/API key.
+      downloaded = {
+        buffer: await readKnowledgeBuildArtifact({
+          userId: targetUserId,
+          buildId: build.id,
+          generation: build.generation,
+          kind: "package",
+          expectedSha256: build.packageArchiveSha256!,
+          expectedBytes: build.packageSizeBytes!,
+          storageKey: build.packageStorageKey!,
+        }),
+        filename: String(
+          build.packageFilename || "frontmind-knowledge-base.zip",
+        ),
+      };
+      sourceArtifactHash = knowledgeBasePublicationBindingHash(build)!;
+    } else {
+      // Only pre-state-machine v1 imports retain the upstream compatibility
+      // path. Builder v3/v4 publication must consume bytes that reconcile
+      // already validated and persisted under the build generation.
+      if (
+        build.skillVersion === "3" ||
+        build.skillVersion === "4" ||
+        !taskId ||
+        taskId !== build.upstreamTaskId ||
+        build.packageRevision !== build.revision ||
+        !build.packageOutputItemId ||
+        !build.packageDescriptorHash
+      ) {
+        throw new Error("最终知识库文件尚未完成不可变持久化与版本绑定");
+      }
+      const credential = await getCredentialForUpstreamResource(
+        targetUserId,
+        "task",
+        taskId,
+      );
+      if (!credential)
+        throw new Error("知识库任务不属于当前用户或 API Key 已失效");
+      publishLogSecrets.push(credential.apiKey);
 
-    const downloaded = await downloadArchiveBytes({
-      descriptor,
-      apiKey: credential.apiKey,
-      baseUrl,
-    });
+      const baseUrl = getUpstreamBaseUrl(req);
+      const taskResponse = await axios.get(
+        `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
+        {
+          headers: upstreamHeaders(credential.apiKey),
+          proxy: false,
+          timeout: 120_000,
+          maxContentLength: 50 * 1024 * 1024,
+          validateStatus: () => true,
+        },
+      );
+      if (taskResponse.status !== 200) {
+        throw new Error(`读取知识库任务结果失败 (${taskResponse.status})`);
+      }
+      const task = taskResponse.data?.task || taskResponse.data || {};
+      const returnedTaskId = String(task.id || task.task_id || "");
+      if (returnedTaskId !== taskId) {
+        throw new Error("读取到的知识库任务与当前完成版本不匹配");
+      }
+      if (task.status === "failed" || task.status === "error") {
+        throw new Error("知识库任务执行失败，无法发布");
+      }
+      const output = Array.isArray(task.output) ? task.output : [];
+      const matchingDescriptors = collectKnowledgeArchiveDescriptors(
+        output,
+      ).filter(
+        (candidate) =>
+          candidate.outputItemId === build.packageOutputItemId &&
+          knowledgeArchiveDescriptorHash(candidate) ===
+            build.packageDescriptorHash &&
+          (!build.packageFileId || candidate.fileId === build.packageFileId),
+      );
+      if (matchingDescriptors.length !== 1) {
+        throw new Error("任务结果中无法唯一确认当前版本的知识库 ZIP");
+      }
+      downloaded = await downloadArchiveBytes({
+        descriptor: matchingDescriptors[0]!,
+        apiKey: credential.apiKey,
+        baseUrl,
+      });
+      sourceArtifactHash = build.packageDescriptorHash;
+    }
     const archiveHash = createHash("sha256")
       .update(downloaded.buffer)
       .digest("hex");
@@ -6683,10 +6859,46 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
         validationProfile:
           build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
         archiveContractVersions:
-          build.skillVersion === "1" ? undefined : [2, 3],
+          build.skillVersion === "1"
+            ? undefined
+            : build.skillVersion === "4"
+              ? [3]
+              : [2, 3],
       },
     );
     storedAssetKeys = parsed.storedAssetKeys;
+    if (build.skillVersion === "3" || build.skillVersion === "4") {
+      if (
+        build.skillVersion === "4" &&
+        parsed.packageBuildRevision !== build.revision
+      ) {
+        throw new Error(
+          `最终 ZIP buildRevision 与发布版本不一致：期望 ${build.revision}，实际 ${String(parsed.packageBuildRevision ?? "缺失")}`,
+        );
+      }
+      const db = await getDb();
+      if (!db) throw new Error("数据库暂不可用，无法校验最终知识库节点");
+      const nodes = await db
+        .select()
+        .from(knowledgeBaseBuildNodes)
+        .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
+      assertKnowledgeBasePackageMatchesBuild({
+        nodes: nodes.map((node) => ({
+          leafId: node.leafId,
+          title: node.title,
+          branchId: node.branchId,
+          branchTitle: node.branchTitle,
+          ordinal: node.ordinal,
+          status: node.status,
+          contentMarkdown: node.contentMarkdown,
+          contentSha256: node.contentSha256,
+        })),
+        documents: parsed.documents,
+        assets: parsed.assets,
+        expectedLogoSha256: String(build.logoSha256 || ""),
+        legacyV3Compatibility: build.skillVersion === "3",
+      });
+    }
     const workspace = await getDashboardWorkspace(targetUserId);
     assertKnowledgeArchiveEnterpriseIdentity({
       enterpriseIdentityConfirmed: Boolean(workspace.enterpriseIdentityBoundAt),
@@ -6709,7 +6921,7 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       sourceBuildId: build.id,
       sourceBuildRevision: build.revision,
       sourceTaskId: taskId,
-      sourceArtifactHash: build.packageDescriptorHash,
+      sourceArtifactHash,
       archiveHash,
       documents: parsed.documents,
       assets: parsed.assets,
@@ -6749,7 +6961,10 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
         return;
       }
     }
-    console.error("[Dashboard] Knowledge publish failed", error);
+    console.error(
+      "[Dashboard] Knowledge publish failed",
+      dashboardKnowledgePublishErrorForLog(error, publishLogSecrets),
+    );
     res
       .status(error instanceof ServiceEntitlementError ? error.statusCode : 400)
       .json({
@@ -7789,6 +8004,17 @@ router.get(
         expectedSha256: snapshot.archiveHash,
         expectedBytes: snapshot.totalBytes,
       });
+      await validateKnowledgeArchiveForDownload({
+        buffer: bytes,
+        sourceFileName: snapshot.sourceFileName,
+        expectedSha256: snapshot.archiveHash,
+        expectedBytes: snapshot.totalBytes,
+        // Historical is the compatibility superset for snapshots created
+        // before profile/version metadata was persisted. It still executes
+        // the shared CRC, path traversal, symlink, entry-count, expansion and
+        // required-root structure checks before any bytes leave the server.
+        validationProfile: "historical",
+      });
       res.setHeader("Cache-Control", "private, no-store");
       res.setHeader("Content-Type", "application/zip");
       res.setHeader("Content-Length", String(bytes.length));
@@ -7800,14 +8026,25 @@ router.get(
     } catch (error) {
       const archiveError =
         error instanceof KnowledgeSnapshotArchiveError ? error : null;
+      const validationError =
+        error instanceof KnowledgeArchiveValidationError ? error : null;
       res
         .status(
-          archiveError && archiveError.code !== "ARCHIVE_NOT_FOUND" ? 409 : 404,
+          validationError ||
+            (archiveError && archiveError.code !== "ARCHIVE_NOT_FOUND")
+            ? 409
+            : 404,
         )
         .json({
           error: {
-            message: archiveError?.message || "知识库 ZIP 不存在",
-            code: archiveError?.code || "NOT_FOUND",
+            message:
+              validationError?.message ||
+              archiveError?.message ||
+              "知识库 ZIP 不存在",
+            code:
+              knowledgeArchiveErrorCode(validationError) ||
+              archiveError?.code ||
+              "NOT_FOUND",
           },
         });
     }

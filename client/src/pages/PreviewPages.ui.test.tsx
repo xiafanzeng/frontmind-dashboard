@@ -27,10 +27,44 @@ vi.mock("@/components/PortalShell", () => ({
 }));
 
 import {
+  PreviewAdminAccounts,
+  PreviewAdminDeliveryRoles,
+  PreviewAdminDispatch,
   PreviewCreateAccountDialog,
   PreviewDeliveryControl,
   PreviewAdminUsers,
 } from "./PreviewPages";
+
+describe("role-scoped administrator previews", () => {
+  it("shows only assigned project teams to a delivery administrator", () => {
+    render(<PreviewAdminDeliveryRoles previewAccessLevel="delivery_admin" />);
+
+    expect(screen.getByText("交付管理员验收账号")).toBeInTheDocument();
+    expect(screen.getByText("验收企业")).toBeInTheDocument();
+    expect(screen.getByText("验收企业 B")).toBeInTheDocument();
+    expect(screen.queryByText("验收企业 C")).not.toBeInTheDocument();
+  });
+
+  it("uses only the two public management statuses in the ticket preview", () => {
+    render(<PreviewAdminDispatch previewAccessLevel="delivery_admin" />);
+
+    expect(screen.getAllByText("待处理").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("已完成").length).toBeGreaterThan(0);
+    expect(screen.queryByText("处理中")).not.toBeInTheDocument();
+    expect(screen.queryByText("待领取")).not.toBeInTheDocument();
+    expect(screen.queryByText("等客户补充")).not.toBeInTheDocument();
+  });
+
+  it("keeps delivery administrator account management role-scoped", () => {
+    render(<PreviewAdminAccounts previewAccessLevel="delivery_admin" />);
+
+    expect(screen.getByText("交付管理员验收账号")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "创建客户账号" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("系统管理员")).not.toBeInTheDocument();
+  });
+});
 
 describe("preview account creation form", () => {
   it("requires an initial password, plan and market edition for a customer account", () => {
@@ -122,14 +156,14 @@ describe("preview account creation form", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("keeps system-only customer and assignment controls on the system workspace", () => {
+  it("keeps account creation out of the system customer workspace", () => {
     render(<PreviewAdminUsers previewAccessLevel="system_admin" />);
 
     expect(screen.getByText("系统管理员验收账号")).toBeInTheDocument();
     expect(screen.getByText("验收企业 C")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "创建客户" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "创建客户" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByLabelText("套餐版本")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "编辑分配" }),

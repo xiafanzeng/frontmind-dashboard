@@ -28,10 +28,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { uploadFile } from "@/lib/frontmind-api";
 import { trpc } from "@/lib/trpc";
-import {
-  DELIVERY_TICKET_STATUS_LABELS,
-  type DeliveryTicketStatus,
-} from "@shared/delivery-ticket";
+import { type DeliveryTicketStatus } from "@shared/delivery-ticket";
 import {
   DELIVERY_ROLE_LABELS,
   type DeliveryRoleType,
@@ -146,6 +143,16 @@ const OPEN_TICKET_STATUSES = new Set<DeliveryTicketStatus>([
   "scheduled",
   "in_progress",
 ]);
+
+export type AdminDeliveryTicketPublicStatus = "pending" | "completed";
+
+export const ADMIN_DELIVERY_TICKET_PUBLIC_STATUS_LABELS: Record<
+  AdminDeliveryTicketPublicStatus,
+  string
+> = Object.freeze({
+  pending: "待处理",
+  completed: "已完成",
+});
 
 function asRecord(value: unknown): Record<string, any> {
   return value && typeof value === "object"
@@ -305,6 +312,26 @@ export function deliveryTicketPublicStatus(
     : "completed";
 }
 
+export function adminDeliveryTicketPublicStatusLabel(
+  ticket:
+    | Pick<AdminDeliveryTicket, "status" | "publicStatus">
+    | null
+    | undefined,
+) {
+  return ADMIN_DELIVERY_TICKET_PUBLIC_STATUS_LABELS[
+    deliveryTicketPublicStatus(ticket)
+  ];
+}
+
+export function adminDeliveryEventPublicStatusLabel(
+  status: string | null | undefined,
+) {
+  if (!STATUS_ORDER.includes(status as DeliveryTicketStatus)) return null;
+  return adminDeliveryTicketPublicStatusLabel({
+    status: status as DeliveryTicketStatus,
+  });
+}
+
 export function normalizeTicketDetail(
   value: unknown,
   fallback?: AdminDeliveryTicket,
@@ -392,10 +419,10 @@ function StatusPill({
 }: {
   ticket: Pick<AdminDeliveryTicket, "status" | "publicStatus">;
 }) {
-  const status = ticket.status;
+  const status = deliveryTicketPublicStatus(ticket);
   return (
     <span className={`admin-ticket-status is-${status}`}>
-      {DELIVERY_TICKET_STATUS_LABELS[status]}
+      {ADMIN_DELIVERY_TICKET_PUBLIC_STATUS_LABELS[status]}
     </span>
   );
 }
@@ -444,47 +471,49 @@ function Timeline({
       </header>
       {events.length ? (
         <div className="admin-ticket-timeline-list">
-          {events.map((event) => (
-            <article key={event.id}>
-              <div>
-                <strong>{event.actorLabel || "管理员"}</strong>
-                <time>{formatAdminTicketDate(event.createdAt)}</time>
-              </div>
-              {event.statusTo && (
-                <span className="admin-ticket-event-label">
-                  状态更新为{" "}
-                  {DELIVERY_TICKET_STATUS_LABELS[
-                    event.statusTo as DeliveryTicketStatus
-                  ] || event.statusTo}
-                </span>
-              )}
-              {event.message && <p>{event.message}</p>}
-              {event.attachments?.length ? (
-                <div className="admin-ticket-attachment-list">
-                  {event.attachments.map((attachment, index) => (
-                    <a
-                      key={attachment.id || attachment.fileId || index}
-                      href={safeAdminDeliveryUrl(attachment.url) || undefined}
-                      target={
-                        safeAdminDeliveryUrl(attachment.url)
-                          ? "_blank"
-                          : undefined
-                      }
-                      rel={
-                        safeAdminDeliveryUrl(attachment.url)
-                          ? "noopener noreferrer"
-                          : undefined
-                      }
-                      aria-disabled={!safeAdminDeliveryUrl(attachment.url)}
-                    >
-                      <Paperclip className="h-3.5 w-3.5" />
-                      {attachment.filename || "交付文件"}
-                    </a>
-                  ))}
+          {events.map((event) => {
+            const publicStatusLabel = adminDeliveryEventPublicStatusLabel(
+              event.statusTo,
+            );
+            return (
+              <article key={event.id}>
+                <div>
+                  <strong>{event.actorLabel || "管理员"}</strong>
+                  <time>{formatAdminTicketDate(event.createdAt)}</time>
                 </div>
-              ) : null}
-            </article>
-          ))}
+                {publicStatusLabel && (
+                  <span className="admin-ticket-event-label">
+                    状态更新为 {publicStatusLabel}
+                  </span>
+                )}
+                {event.message && <p>{event.message}</p>}
+                {event.attachments?.length ? (
+                  <div className="admin-ticket-attachment-list">
+                    {event.attachments.map((attachment, index) => (
+                      <a
+                        key={attachment.id || attachment.fileId || index}
+                        href={safeAdminDeliveryUrl(attachment.url) || undefined}
+                        target={
+                          safeAdminDeliveryUrl(attachment.url)
+                            ? "_blank"
+                            : undefined
+                        }
+                        rel={
+                          safeAdminDeliveryUrl(attachment.url)
+                            ? "noopener noreferrer"
+                            : undefined
+                        }
+                        aria-disabled={!safeAdminDeliveryUrl(attachment.url)}
+                      >
+                        <Paperclip className="h-3.5 w-3.5" />
+                        {attachment.filename || "交付文件"}
+                      </a>
+                    ))}
+                  </div>
+                ) : null}
+              </article>
+            );
+          })}
         </div>
       ) : (
         <p className="admin-ticket-timeline-empty">
@@ -531,7 +560,9 @@ export default function AdminDeliveryTicketWorkspace({
   }, []);
   const [selectedTicketId, setSelectedTicketId] = useState(initialTicketId);
   const [typeFilter, setTypeFilter] = useState("all");
-  const [statusFilter, setStatusFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState<
+    "all" | AdminDeliveryTicketPublicStatus
+  >("all");
   const [keyword, setKeyword] = useState("");
   const [debouncedKeyword, setDebouncedKeyword] = useState("");
 
@@ -549,7 +580,7 @@ export default function AdminDeliveryTicketWorkspace({
         userId,
         query: debouncedKeyword,
         type: typeFilter,
-        status: statusFilter,
+        publicStatus: statusFilter,
         limit: 20,
       }),
     [debouncedKeyword, statusFilter, typeFilter, userId],
@@ -700,8 +731,12 @@ export default function AdminDeliveryTicketWorkspace({
     if (!previewMode) return tickets;
     return tickets.filter((ticket) => {
       if (typeFilter !== "all" && ticket.type !== typeFilter) return false;
-      if (statusFilter !== "all" && ticket.status !== statusFilter)
+      if (
+        statusFilter !== "all" &&
+        deliveryTicketPublicStatus(ticket) !== statusFilter
+      ) {
         return false;
+      }
       const query = keyword.trim().toLocaleLowerCase("zh-CN");
       if (!query) return true;
       return [
@@ -1032,7 +1067,7 @@ export default function AdminDeliveryTicketWorkspace({
           <span>
             {canExecuteSelectedTicket
               ? "当前为旧版无岗位工单兜底：可以处理并留存准确的客户交付记录。"
-              : "按真实内部状态查看、沟通和催办；实际执行与交付由对应岗位工程师完成。"}
+              : "按待处理与已完成两种公开状态查看和沟通；实际执行与交付由对应岗位工程师完成。"}
           </span>
         </div>
       </div>
@@ -1041,7 +1076,7 @@ export default function AdminDeliveryTicketWorkspace({
           <LockKeyhole className="h-4 w-4" />
           <span>
             {selectedWorkflowDomain
-              ? `当前为交付协调模式：该工单由${DELIVERY_ROLE_LABELS[selectedWorkflowDomain]}执行。管理员可以查看、回复客户、记录内部备注和催办，但不能代替工程师发布成果或完成工单。`
+              ? `当前为交付协调模式：该工单由${DELIVERY_ROLE_LABELS[selectedWorkflowDomain]}执行。管理员可以查看、回复客户和记录内部备注，但不能代替工程师发布成果或完成工单。`
               : "当前为交付协调模式：可以查看完整工单、回复客户和记录内部备注，但不能代替工程师发布成果、上传知识库或完成工单。"}
           </span>
         </div>
@@ -1193,17 +1228,18 @@ export default function AdminDeliveryTicketWorkspace({
               </select>
               <select
                 value={statusFilter}
-                onChange={(event) => setStatusFilter(event.target.value)}
+                onChange={(event) =>
+                  setStatusFilter(
+                    event.target.value as
+                      | "all"
+                      | AdminDeliveryTicketPublicStatus,
+                  )
+                }
                 aria-label="筛选工单状态"
               >
                 <option value="all">全部状态</option>
-                <option value="submitted">已提交</option>
-                <option value="needs_information">待补充资料</option>
-                <option value="scheduled">已排期</option>
-                <option value="in_progress">处理中</option>
+                <option value="pending">待处理</option>
                 <option value="completed">已完成</option>
-                <option value="rejected">未受理</option>
-                <option value="cancelled">已取消</option>
               </select>
             </div>
           </div>
@@ -1332,13 +1368,13 @@ export default function AdminDeliveryTicketWorkspace({
                   </strong>
                 </div>
                 <div>
-                  <span>工程师分配</span>
+                  <span>岗位负责人</span>
                   <strong>
                     {detail.ticket.assignedMemberId
                       ? detail.ticket.assignedMemberName ||
                         `工程师 #${detail.ticket.assignedMemberId}`
                       : detail.ticket.workflowDomain
-                        ? "待分配"
+                        ? "岗位归属同步异常"
                         : "无岗位"}
                   </strong>
                 </div>
@@ -1779,7 +1815,7 @@ export default function AdminDeliveryTicketWorkspace({
                       <p>
                         {isDomainApplication
                           ? "请确认域名状态正常，再将备案服务码写入下方处理结果；客户会在已完成工单中领取。"
-                          : "用户列表只显示待受理或已完成；完成摘要会进入用户历史记录。"}
+                          : "用户列表只显示待处理或已完成；完成摘要会进入用户历史记录。"}
                       </p>
                     </div>
                     <History className="h-5 w-5" />

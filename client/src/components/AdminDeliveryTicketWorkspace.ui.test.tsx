@@ -196,6 +196,60 @@ describe("AdminDeliveryTicketWorkspace streamlined UI", () => {
     expect(screen.queryByText("保存交付记录")).not.toBeInTheDocument();
   });
 
+  it("projects every internal workflow state into only pending or completed", async () => {
+    render(
+      <AdminDeliveryTicketWorkspace
+        userId={42}
+        enterpriseName="测试企业"
+        customerUsername="test-user"
+        preview
+        previewFixtures={{
+          ...executionPreviewFixtures,
+          tickets: [
+            executionPreviewFixtures.tickets[0],
+            {
+              ...executionPreviewFixtures.tickets[0],
+              id: "4a67e445-37bb-45ed-9268-4ca9437e4d72",
+              title: "已关闭历史工单",
+              status: "rejected" as const,
+            },
+          ],
+          events: [
+            {
+              id: "scheduled",
+              visibility: "customer" as const,
+              actorLabel: "交付成员",
+              statusTo: "scheduled",
+              createdAt: "2026-07-30T22:43:00+08:00",
+            },
+            {
+              id: "completed",
+              visibility: "customer" as const,
+              actorLabel: "交付成员",
+              statusTo: "rejected",
+              createdAt: "2026-07-31T22:43:00+08:00",
+            },
+          ],
+        }}
+      />,
+    );
+
+    const statusFilter = screen.getByLabelText("筛选工单状态");
+    expect(statusFilter).toContainHTML(
+      '<option value="pending">待处理</option>',
+    );
+    expect(statusFilter).toContainHTML(
+      '<option value="completed">已完成</option>',
+    );
+    expect(statusFilter.querySelectorAll("option")).toHaveLength(3);
+    expect(await screen.findAllByText("待处理")).not.toHaveLength(0);
+    expect(screen.getAllByText("已完成")).not.toHaveLength(0);
+    expect(screen.queryByText("已排期")).not.toBeInTheDocument();
+    expect(screen.queryByText("处理中")).not.toBeInTheDocument();
+    expect(screen.queryByText("未受理")).not.toBeInTheDocument();
+    expect(screen.queryByText(/催办/)).not.toBeInTheDocument();
+  });
+
   it("shows fallback execution controls only when explicitly authorized", async () => {
     render(
       <AdminDeliveryTicketWorkspace
@@ -211,6 +265,12 @@ describe("AdminDeliveryTicketWorkspace streamlined UI", () => {
     expect(
       await screen.findByText("完成工单并发布内容总结"),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "用户列表只显示待处理或已完成；完成摘要会进入用户历史记录。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/待受理/)).not.toBeInTheDocument();
     expect(screen.getByText("完成工单")).toBeInTheDocument();
     expect(screen.queryByText(/当前为交付协调模式/)).not.toBeInTheDocument();
   });
