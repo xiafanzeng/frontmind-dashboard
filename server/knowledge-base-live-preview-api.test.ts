@@ -3,10 +3,13 @@ import { describe, expect, it } from "vitest";
 import {
   analyzeKnowledgeBaseLiveTask,
   buildKnowledgeBaseProtocolProbePrompt,
+  collectKnowledgeBasePreviewFileIds,
   KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES,
+  rehydratedConfirmationProgressState,
+  selectInitialKnowledgeBaseLiveTask,
 } from "./knowledge-base-live-preview-api";
 
-function taskWithText(text: string, status = "completed") {
+function taskWithText(text: string, status = "completed", imageCount = 3) {
   return {
     id: "task-live-preview",
     status,
@@ -15,7 +18,14 @@ function taskWithText(text: string, status = "completed") {
         id: "message-1",
         type: "message",
         role: "assistant",
-        content: [{ type: "output_text", text }],
+        content: [
+          { type: "output_text", text },
+          ...Array.from({ length: imageCount }, (_, index) => ({
+            type: "output_image",
+            file_id: `image-${index + 1}`,
+            file_name: `image-${index + 1}.webp`,
+          })),
+        ],
       },
     ],
   };
@@ -35,6 +45,39 @@ function manifest() {
 }
 
 describe("analyzeKnowledgeBaseLiveTask", () => {
+  it("normalizes URL-only image descriptors to preview file IDs", () => {
+    expect(
+      collectKnowledgeBasePreviewFileIds([
+        {
+          type: "output_image",
+          image_url:
+            "https://api.example.test/v1/files/url-image/content?token=1",
+        },
+        { type: "output_image", file_id: "direct-image" },
+        { type: "output_file", file_id: "not-an-image", file_name: "a.pdf" },
+      ]),
+    ).toEqual(new Set(["url-image", "direct-image"]));
+  });
+
+  it("rehydrates the exact current leaf after a development server restart", () => {
+    const state = rehydratedConfirmationProgressState({
+      initialText: `首轮正文\n<!-- FRONTMIND_KB_MANIFEST\n${JSON.stringify(manifest())}\n-->`,
+      revision: 1,
+      currentLeafId: "2.1",
+      confirmationCount: 1,
+    });
+
+    expect(state).toMatchObject({
+      revision: 1,
+      currentLeafId: "2.1",
+    });
+    expect(state.leaves.slice(0, 3)).toMatchObject([
+      { id: "1.1", status: "confirmed" },
+      { id: "2.1", status: "current" },
+      { id: "3.1", status: "pending" },
+    ]);
+  });
+
   it("renders bare protocol output without leaking machine JSON", () => {
     const analysis = analyzeKnowledgeBaseLiveTask(
       taskWithText(
@@ -111,6 +154,58 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
     expect(analysis.issues).toEqual([]);
   });
 
+  it("never treats a failed terminal task as a successful turn", () => {
+    const analysis = analyzeKnowledgeBaseLiveTask(
+      taskWithText(
+        `节点正文\n<!-- FRONTMIND_KB_MANIFEST\n${JSON.stringify(manifest())}\n-->`,
+        "failed",
+      ),
+    );
+
+    expect(analysis.terminal).toBe(true);
+    expect(analysis.successfulTerminal).toBe(false);
+    expect(analysis.issues).toContain("任务以失败或取消状态结束：failed");
+  });
+
+  it("suppresses stale cumulative output while a confirmation is running", () => {
+    const analysis = analyzeKnowledgeBaseLiveTask(
+      taskWithText(
+        '旧节点正文\n<!-- FRONTMIND_KB_PROGRESS\n{"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":1,"action":"confirm","leafId":"1.1","status":"confirmed"}\n-->',
+        "running",
+        0,
+      ),
+      { mode: "continuation" },
+    );
+
+    expect(analysis.visibleMarkdown).toBe("");
+    expect(analysis.rawOutput).toEqual([]);
+    expect(analysis.protocolObjects).toEqual([]);
+    expect(analysis.issues).toEqual([]);
+  });
+
+  it("fails closed when a completed confirmation returns the legacy progress shape", () => {
+    const analysis = analyzeKnowledgeBaseLiveTask(
+      taskWithText(
+        [
+          "## 1.1 一句话定位",
+          "重复的旧节点正文",
+          '<!-- FRONTMIND_KB_PROGRESS\n{"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":1,"action":"revise","leafId":"1.1","status":"needs_verification"}\n-->',
+          '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.1","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
+        ].join("\n\n"),
+        "completed",
+        0,
+      ),
+      { mode: "continuation" },
+    );
+
+    expect(analysis.protocolAccepted).toBe(false);
+    expect(analysis.visibleMarkdown).toBe("");
+    expect(analysis.rawOutput).toEqual([]);
+    expect(analysis.issues).toEqual([
+      "frontmind.knowledge-base.progress：Progress envelope contains unsupported fields: action, leafId, status",
+    ]);
+  });
+
   it("reports duplicate canonical manifests after terminal completion", () => {
     const rawManifest = JSON.stringify(manifest());
     const analysis = analyzeKnowledgeBaseLiveTask(
@@ -147,6 +242,8 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
           '{"revision":0,"knowledgeTree":{"branches":9,"leaves":52}}',
           "SOCRATIC_KB_STATE-->",
         ].join("\n"),
+        "completed",
+        0,
       ),
     );
 
@@ -175,6 +272,8 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
           JSON.stringify(probeManifest),
           "-->",
         ].join("\n"),
+        "completed",
+        0,
       ),
       { mode: "protocol_probe" },
     );
@@ -201,6 +300,8 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
           JSON.stringify(wrongManifest),
           "-->",
         ].join("\n"),
+        "completed",
+        0,
       ),
       { mode: "protocol_probe" },
     );
@@ -208,5 +309,43 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
     expect(analysis.issues).toContain(
       "协议探针 manifest 与预期的 8 个叶子不完全一致",
     );
+  });
+
+  it("recovers the initial manifest and its nested images from cumulative later turns", () => {
+    const initial = taskWithText(
+      [
+        "## 1.1 企业定位",
+        "<!-- FRONTMIND_KB_MANIFEST",
+        JSON.stringify(manifest()),
+        "-->",
+      ].join("\n"),
+    );
+    const cumulative = {
+      ...initial,
+      output: [
+        ...initial.output,
+        {
+          id: "later-turn",
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "重复的 1.1\n<!-- FRONTMIND_KB_PROGRESS {} -->",
+            },
+          ],
+        },
+      ],
+    };
+
+    const recovered = analyzeKnowledgeBaseLiveTask(
+      selectInitialKnowledgeBaseLiveTask(cumulative),
+      { mode: "full" },
+    );
+
+    expect(recovered.manifest?.leafCount).toBe(8);
+    expect(recovered.imageCount).toBe(3);
+    expect(recovered.visibleMarkdown).toBe("## 1.1 企业定位");
+    expect(recovered.issues).toEqual([]);
   });
 });

@@ -49,6 +49,47 @@ const snapshot: KnowledgeSnapshotView = {
 };
 
 describe("KnowledgeBaseViewer", () => {
+  it("offers the authenticated snapshot ZIP from the published knowledge view", () => {
+    render(
+      <KnowledgeBaseViewer
+        snapshot={{
+          ...snapshot,
+          archiveHash: "a".repeat(64),
+          archiveAvailable: true,
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("link", { name: "下载成品 ZIP" })).toHaveAttribute(
+      "href",
+      "/api/dashboard/knowledge/snapshots/snapshot-1/archive",
+    );
+    expect(screen.getByRole("link", { name: "下载成品 ZIP" })).toHaveAttribute(
+      "download",
+      "企业知识库.zip",
+    );
+  });
+
+  it("does not advertise a ZIP when the snapshot has no persisted archive hash", () => {
+    render(<KnowledgeBaseViewer snapshot={snapshot} />);
+
+    expect(screen.queryByRole("link", { name: "下载成品 ZIP" })).toBeNull();
+  });
+
+  it("does not advertise a historical ZIP whose archive bytes are unavailable", () => {
+    render(
+      <KnowledgeBaseViewer
+        snapshot={{
+          ...snapshot,
+          archiveHash: "a".repeat(64),
+          archiveAvailable: false,
+        }}
+      />,
+    );
+
+    expect(screen.queryByRole("link", { name: "下载成品 ZIP" })).toBeNull();
+  });
+
   it("keeps authoritative snapshot metrics but omits a decorative directory count", () => {
     render(<KnowledgeBaseViewer snapshot={snapshot} />);
 

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import JSZip from "jszip";
+import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 
 const execFileAsync = promisify(execFile);
@@ -52,7 +53,7 @@ async function runValidator(archivePath: string) {
   }
 }
 
-function validDeepArchiveFiles() {
+async function validDeepArchiveFiles() {
   const root = "fixture_knowledge_base";
   const supportingPaths = [
     "README.md",
@@ -96,16 +97,6 @@ ${narrative}
 
 - source-official
 `;
-  const discoveryMethods = [
-    "img",
-    "srcset",
-    "lazy_load",
-    "picture",
-    "css_background",
-    "open_graph",
-    "gallery",
-    "official_document",
-  ];
   const overviewPath = "branches/products/00_overview.md";
   const overviewEvidencePath = "branches/products/evidence/overview.md";
   files[`${root}/${overviewEvidencePath}`] = "证".repeat(100);
@@ -178,6 +169,75 @@ ${narrative}
       contentStatus: "limited_evidence",
     });
   }
+  const classicImages = await Promise.all(
+    [
+      {
+        id: "asset-brand-logo",
+        filename: "brand-logo.png",
+        width: 512,
+        height: 512,
+        background: "#173c36",
+        assetType: "brand_identity",
+        displayRole: "badge",
+      },
+      {
+        id: "asset-brand-hero",
+        filename: "brand-hero.png",
+        width: 1200,
+        height: 600,
+        background: "#d9c8a9",
+        assetType: "environment_photo",
+        displayRole: "hero",
+      },
+      {
+        id: "asset-product-ui",
+        filename: "product-ui.png",
+        width: 800,
+        height: 450,
+        background: "#5877a8",
+        assetType: "product_ui",
+        displayRole: "inline",
+      },
+    ].map(async (image) => ({
+      ...image,
+      bytes: await sharp({
+        create: {
+          width: image.width,
+          height: image.height,
+          channels: 3,
+          background: image.background,
+        },
+      })
+        .png()
+        .toBuffer(),
+    })),
+  );
+  const overview = documents.find(
+    (document) => document.id === "overview-products",
+  )!;
+  overview.assetIds = classicImages.map((image) => image.id);
+  const assets = classicImages.map((image) => {
+    const assetPath = `09_media_assets/classic/${image.filename}`;
+    files[`${root}/${assetPath}`] = image.bytes;
+    return {
+      id: image.id,
+      path: assetPath,
+      sha256: createHash("sha256").update(image.bytes).digest("hex"),
+      mimeType: "image/png",
+      bytes: image.bytes.length,
+      width: image.width,
+      height: image.height,
+      caption: image.filename,
+      branchId: "products",
+      documentIds: ["overview-products"],
+      sourcePageUrl: "https://example.com/products",
+      sourceAssetUrl: `https://example.com/assets/${image.filename}`,
+      sourceKind: "official_web",
+      ownership: "first_party",
+      assetType: image.assetType,
+      displayRole: image.displayRole,
+    };
+  });
   files[`${root}/00_completeness.json`] = JSON.stringify({
     counts: {
       totalLeaves: 40,
@@ -189,47 +249,51 @@ ${narrative}
       notApplicable: 0,
     },
     acquisition: {
-      officialPages: { completed: 0, total: 0 },
-      images: { completed: 0, total: 0 },
+      officialPages: { completed: 1, total: 1 },
+      images: { completed: 3, total: 3 },
       documents: { completed: 0, total: 0 },
       webQueries: { completed: 0, total: 0 },
     },
-    gaps: ["官网没有可用于交付的第一方图片"],
+    gaps: [],
     evaluatedAt: "2026-07-29T00:00:00.000Z",
   });
   files[`${root}/00_package_manifest.json`] = JSON.stringify({
     schemaVersion: 3,
     profile: "dashboard-enterprise-v1",
     documents,
-    assets: [],
+    assets,
     counts: {
-      totalFiles: documents.length + 2,
+      totalFiles: documents.length + 5,
       customerVisibleCharacters: 3_320,
       evidenceCharacters: 4_100,
-      packagedImages: 0,
+      packagedImages: 3,
     },
     imageSelection: {
-      status: "source_limited",
-      discoveredCandidateImages: 0,
-      inspectedCandidateImages: 0,
-      eligibleFirstPartyImages: 0,
+      status: "target_met",
+      discoveredCandidateImages: 3,
+      inspectedCandidateImages: 3,
+      eligibleFirstPartyImages: 3,
       rejectedCandidateImages: 0,
-      scannedSourcePages: 0,
-      discoveryMethods,
-      candidates: [],
+      scannedSourcePages: 1,
+      discoveryMethods: ["img"],
+      candidates: assets.map((asset) => ({
+        url: asset.sourceAssetUrl,
+        sourcePageUrl: asset.sourcePageUrl,
+        method: "img",
+        status: "eligible",
+        assetId: asset.id,
+      })),
       rejectionReasons: [],
       stopReason: "已检查所有官方页面和资料",
       productFamilyCoverage: [
         {
           familyId: "family-a",
           familyName: "产品族 A",
-          officialImageAvailable: false,
-          assetIds: [],
+          officialImageAvailable: true,
+          assetIds: ["asset-product-ui"],
           checkedSources: ["https://example.com/products"],
-          gapReason: "官方来源未提供可交付图片",
         },
       ],
-      shortfallReason: "官网没有可用于交付的第一方图片",
     },
   });
   return files;
@@ -237,7 +301,7 @@ ${narrative}
 
 describe("dashboard enterprise Skill archive validator", () => {
   it("accepts a complete deep archive with an honest zero-image shortfall", async () => {
-    const archivePath = await writeArchive(validDeepArchiveFiles());
+    const archivePath = await writeArchive(await validDeepArchiveFiles());
 
     const result = await runValidator(archivePath);
 
@@ -248,7 +312,7 @@ describe("dashboard enterprise Skill archive validator", () => {
   });
 
   it("accepts evidence-limited prose below the writing target without padding", async () => {
-    const archivePath = await writeArchive(validDeepArchiveFiles());
+    const archivePath = await writeArchive(await validDeepArchiveFiles());
 
     const result = await runValidator(archivePath);
 
@@ -256,7 +320,7 @@ describe("dashboard enterprise Skill archive validator", () => {
   });
 
   it("rejects customer-facing audit language while allowing it in internal gaps", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     files[`${root}/branches/products/leaf-1.md`] = `# 知识叶子 1
 
@@ -289,7 +353,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("rejects a rich evidence relationship reported as zero characters", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
@@ -311,7 +375,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("rejects a product family omitted from the media coverage audit", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
@@ -328,7 +392,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("rejects evidence duplicated after normalization", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
@@ -356,7 +420,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("rejects acquired evidence omitted from every formal document", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
@@ -386,7 +450,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("rejects referenced evidence without an explicit matching branchId", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
@@ -406,7 +470,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("uses productFamilyId instead of title keywords for product branches", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
@@ -414,6 +478,9 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
     for (const document of manifest.documents) {
       if (document.branchId === "products") document.branchId = "catalog-a";
       if (document.id === "overview-products") document.title = "核心目录";
+    }
+    for (const asset of manifest.assets) {
+      if (asset.branchId === "products") asset.branchId = "catalog-a";
     }
     files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
 
@@ -423,7 +490,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("rejects a product branch with a partially declared family", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
@@ -442,7 +509,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("rejects v2 without any product or service family", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
@@ -529,7 +596,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   });
 
   it("rejects a header-only image that cannot be decoded", async () => {
-    const files = validDeepArchiveFiles();
+    const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const imagePath = "09_media_assets/product_images/header-only.jpg";
     const bytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);

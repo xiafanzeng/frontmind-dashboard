@@ -21,6 +21,7 @@ import {
 import { dashboardPayloadSchema } from "../shared/dashboard";
 import { getCredentialForUpstreamResource } from "./auth-service";
 import { getDb } from "./db";
+import { knowledgeSnapshotArchiveStorageKey } from "./knowledge-snapshot-archive-store";
 import { getUpstreamBaseUrl } from "./upstream-config";
 
 export const SILICONFLOW_MAINTENANCE_BRAND = "硅基流动";
@@ -36,6 +37,23 @@ function normalizeEnterpriseName(value: string) {
 
 function persistedConversationId(userId: number, publicId: string) {
   return `u${userId}:${publicId}`;
+}
+
+export function siliconFlowKnowledgeSnapshotCleanupStorageKeys(
+  userId: number,
+  snapshots: Array<{
+    id: string;
+    assets: Array<{ key?: string }>;
+  }>,
+) {
+  return Array.from(
+    new Set(
+      snapshots.flatMap((snapshot) => [
+        ...snapshot.assets.map((asset) => asset.key).filter(Boolean),
+        knowledgeSnapshotArchiveStorageKey(userId, snapshot.id),
+      ]),
+    ),
+  ) as string[];
 }
 
 export function assertSiliconFlowMaintenanceIdentity(input: {
@@ -332,14 +350,12 @@ async function collectInventory(
       ownershipRows: ownershipCounts.get(`file:${upstreamId}`) || 0,
     })),
   ];
-  const localAssetKeys: string[] = Array.from(
-    new Set<string>(
-      snapshotRows.flatMap((row: any) =>
-        (row.assets || [])
-          .map((asset: { key?: string }) => asset.key)
-          .filter((key: string | undefined): key is string => Boolean(key)),
-      ),
-    ),
+  const localAssetKeys = siliconFlowKnowledgeSnapshotCleanupStorageKeys(
+    userId,
+    snapshotRows.map((row: any) => ({
+      id: row.id,
+      assets: row.assets || [],
+    })),
   );
   const resetRows = await executor
     .select({ revision: knowledgeBaseResetStates.revision })

@@ -30,6 +30,8 @@ import {
   parseMonitoringCurrentTemplate,
   parseAuthoritativeQuestionsTemplate,
   parseOptimizationReportTemplate,
+  removeUncommittedStoredKnowledgeAssets,
+  runCommittedKnowledgeSnapshotSideEffects,
   responseLogicImportsFromTabularSources,
   validateProgressReportScreenshot,
 } from "./dashboard-api";
@@ -56,6 +58,57 @@ import {
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe("knowledge snapshot asset cleanup boundary", () => {
+  it.each(["monitoring handoff", "workspace audit"])(
+    "preserves committed snapshot assets when %s fails",
+    async () => {
+      const removeAssets = vi.fn().mockResolvedValue(undefined);
+
+      await removeUncommittedStoredKnowledgeAssets({
+        snapshotCommitted: true,
+        storedAssetKeys: ["committed-image.webp"],
+        removeAssets,
+      });
+
+      expect(removeAssets).not.toHaveBeenCalled();
+    },
+  );
+
+  it("still removes staged assets when snapshot creation did not commit", async () => {
+    const removeAssets = vi.fn().mockResolvedValue(undefined);
+
+    await removeUncommittedStoredKnowledgeAssets({
+      snapshotCommitted: false,
+      storedAssetKeys: ["staged-image.webp"],
+      removeAssets,
+    });
+
+    expect(removeAssets).toHaveBeenCalledWith(["staged-image.webp"]);
+  });
+});
+
+describe("committed knowledge snapshot side effects", () => {
+  it("keeps handoff and audit failures non-fatal after snapshot commit", async () => {
+    const warn = vi.fn();
+    const handoff = vi.fn().mockRejectedValue(new Error("handoff failed"));
+    const audit = vi.fn().mockRejectedValue(new Error("audit failed"));
+
+    await expect(
+      runCommittedKnowledgeSnapshotSideEffects(
+        [
+          { name: "monitoring handoff", run: handoff },
+          { name: "publication audit", run: audit },
+        ],
+        warn,
+      ),
+    ).resolves.toEqual(["monitoring handoff", "publication audit"]);
+
+    expect(handoff).toHaveBeenCalledOnce();
+    expect(audit).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("dashboard enterprise identity", () => {

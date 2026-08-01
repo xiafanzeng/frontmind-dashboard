@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
   downloadArchiveBytes: vi.fn(),
   readKnowledgeArchive: vi.fn(),
   removeStoredKnowledgeAssets: vi.fn(),
+  persistKnowledgeSnapshotArchive: vi.fn(),
+  removeKnowledgeSnapshotArchive: vi.fn(),
   assertKnowledgeArchiveEnterpriseIdentity: vi.fn(),
   createKnowledgeSnapshot: vi.fn(),
   getDashboardWorkspace: vi.fn(),
@@ -46,6 +48,11 @@ vi.mock("./dashboard-service", () => ({
   createKnowledgeSnapshot: mocks.createKnowledgeSnapshot,
   getDashboardWorkspace: mocks.getDashboardWorkspace,
   getLatestKnowledgeSnapshot: mocks.getLatestKnowledgeSnapshot,
+}));
+
+vi.mock("./knowledge-snapshot-archive-store", () => ({
+  persistKnowledgeSnapshotArchive: mocks.persistKnowledgeSnapshotArchive,
+  removeKnowledgeSnapshotArchive: mocks.removeKnowledgeSnapshotArchive,
 }));
 
 vi.mock("./presales-service", () => ({
@@ -119,6 +126,7 @@ function importDatabase(transactionResults: unknown[][] = [[], []]) {
       operation(tx),
     update: () => updateQuery,
     transactionUpdates,
+    receiptUpdateWhere: updateQuery.where,
   };
 }
 
@@ -171,6 +179,10 @@ describe("website knowledge import v3 manifest binding", () => {
       assets: [],
     });
     mocks.removeStoredKnowledgeAssets.mockResolvedValue(undefined);
+    mocks.persistKnowledgeSnapshotArchive.mockResolvedValue(
+      "knowledge-archives/7/snapshot-new.zip",
+    );
+    mocks.removeKnowledgeSnapshotArchive.mockResolvedValue(undefined);
     mocks.getDashboardWorkspace.mockResolvedValue({
       payload: { brandName: "示例企业" },
     });
@@ -221,6 +233,7 @@ describe("website knowledge import v3 manifest binding", () => {
       },
     );
     expect(mocks.createKnowledgeSnapshot).not.toHaveBeenCalled();
+    expect(mocks.persistKnowledgeSnapshotArchive).not.toHaveBeenCalled();
     expect(mocks.removeStoredKnowledgeAssets).toHaveBeenCalledWith([]);
   });
 
@@ -296,11 +309,105 @@ describe("website knowledge import v3 manifest binding", () => {
       }),
     );
     expect(mocks.assertKnowledgeBaseWritable).toHaveBeenCalledWith(7);
+    expect(mocks.persistKnowledgeSnapshotArchive).toHaveBeenCalledWith({
+      userId: 7,
+      snapshotId: expect.any(String),
+      buffer,
+      expectedSha256: artifactSha256,
+    });
     expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledWith({
       userId: 7,
       actorUserId: 7,
       knowledgeSnapshotId: "snapshot-new",
     });
+  });
+
+  it("preserves committed snapshot assets when the monitoring handoff fails", async () => {
+    const buffer = Buffer.from("validated archive bytes");
+    const artifactSha256 = createHash("sha256").update(buffer).digest("hex");
+    mocks.readKnowledgeArchive.mockResolvedValue({
+      packageManifestSha256: "c".repeat(64),
+      storedAssetKeys: ["committed-image.webp"],
+      documents: [],
+      assets: [],
+    });
+    mocks.createKnowledgeMonitoringHandoff.mockRejectedValue(
+      new Error("simulated handoff failure"),
+    );
+
+    await expect(
+      importWebsiteKnowledgeArtifact({
+        projectId: "project-acceptance-001",
+        idempotencyKey: "website-kb-handoff-failure",
+        value: {
+          schemaVersion: 3,
+          archiveContractVersion: 1,
+          validationProfile: "website-lead-v1",
+          packageManifestSha256: "c".repeat(64),
+          companyName: "示例企业",
+          taskId: "task-website-kb-v3",
+          outputItemId: "output-v3",
+          fileId: "file-v3",
+          descriptorHash: "a".repeat(64),
+          artifactSha256,
+          filename: "knowledge.zip",
+        },
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      replayed: false,
+      snapshot: { id: "snapshot-new" },
+    });
+
+    expect(mocks.createKnowledgeSnapshot).toHaveBeenCalled();
+    expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledTimes(2);
+    expect(mocks.removeStoredKnowledgeAssets).not.toHaveBeenCalled();
+    expect(mocks.removeKnowledgeSnapshotArchive).not.toHaveBeenCalled();
+  });
+
+  it("retries a zero-row receipt completion and returns the committed snapshot", async () => {
+    const buffer = Buffer.from("validated archive bytes");
+    const artifactSha256 = createHash("sha256").update(buffer).digest("hex");
+    const database = importDatabase();
+    database.receiptUpdateWhere
+      .mockResolvedValueOnce([{ affectedRows: 0 }])
+      .mockResolvedValueOnce([{ affectedRows: 1 }]);
+    mocks.getDb.mockResolvedValue(database);
+    mocks.readKnowledgeArchive.mockResolvedValue({
+      packageManifestSha256: "c".repeat(64),
+      storedAssetKeys: ["committed-image.webp"],
+      documents: [],
+      assets: [],
+    });
+
+    await expect(
+      importWebsiteKnowledgeArtifact({
+        projectId: "project-acceptance-001",
+        idempotencyKey: "website-kb-receipt-recovery",
+        value: {
+          schemaVersion: 3,
+          archiveContractVersion: 1,
+          validationProfile: "website-lead-v1",
+          packageManifestSha256: "c".repeat(64),
+          companyName: "示例企业",
+          taskId: "task-website-kb-v3",
+          outputItemId: "output-v3",
+          fileId: "file-v3",
+          descriptorHash: "a".repeat(64),
+          artifactSha256,
+          filename: "knowledge.zip",
+        },
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      replayed: false,
+      snapshot: { id: "snapshot-new" },
+    });
+
+    expect(database.receiptUpdateWhere).toHaveBeenCalledTimes(2);
+    expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledOnce();
+    expect(mocks.removeStoredKnowledgeAssets).not.toHaveBeenCalled();
+    expect(mocks.removeKnowledgeSnapshotArchive).not.toHaveBeenCalled();
   });
 
   it("keeps an identical completed v3 receipt idempotent without revalidation", async () => {
@@ -355,6 +462,7 @@ describe("website knowledge import v3 manifest binding", () => {
 
     expect(mocks.axiosGet).not.toHaveBeenCalled();
     expect(mocks.readKnowledgeArchive).not.toHaveBeenCalled();
+    expect(mocks.persistKnowledgeSnapshotArchive).not.toHaveBeenCalled();
   });
 
   it("uses the finalized file for v4 while binding lineage to the candidate task", async () => {
@@ -428,5 +536,11 @@ describe("website knowledge import v3 manifest binding", () => {
         archiveHash: finalSha256,
       }),
     );
+    expect(mocks.persistKnowledgeSnapshotArchive).toHaveBeenCalledWith({
+      userId: 7,
+      snapshotId: expect.any(String),
+      buffer,
+      expectedSha256: finalSha256,
+    });
   });
 });

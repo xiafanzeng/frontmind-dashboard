@@ -1551,8 +1551,8 @@ def validate_archive(path: Path) -> list[str]:
             f"missing={sorted(asset_paths - actual_image_paths)[:8]}",
         )
         validation.require(
-            len(asset_paths) <= MAX_IMAGES,
-            f"archive must contain no more than {MAX_IMAGES} real packaged images",
+            len(asset_paths) == MAX_IMAGES,
+            f"archive must contain exactly {MAX_IMAGES} real packaged images",
         )
         validation.require(
             image_bytes_total <= MAX_IMAGE_BYTES,
@@ -1605,8 +1605,8 @@ def validate_archive(path: Path) -> list[str]:
             validation=validation,
         )
         validation.require(
-            selection_status in IMAGE_SELECTION_STATUSES,
-            "imageSelection.status must be target_met, source_limited, or budget_limited",
+            selection_status == "target_met",
+            "new dashboard-enterprise-v1 archives require imageSelection.status target_met",
         )
         for key, value in (
             ("discoveredCandidateImages", discovered),

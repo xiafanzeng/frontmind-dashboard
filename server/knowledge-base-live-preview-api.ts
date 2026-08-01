@@ -1,21 +1,39 @@
 import axios from "axios";
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
+import sharp from "sharp";
 import {
   buildKnowledgeBasePrompt,
+  buildKnowledgeBaseTurnPrompt,
   createFrontMindTask,
   getKnowledgeBaseSkillDescriptor,
   uploadKnowledgeBaseSkillArchive,
 } from "./knowledge-base-api";
-import { extractFinalKnowledgeBaseAssistantText } from "./knowledge-base-progress-service";
 import {
+  assertKnowledgeBaseInitialImageDelivery,
+  assertKnowledgeBaseNodeImageDelivery,
+  collectKnowledgeBaseOutputImageKeys,
+  collectKnowledgeBaseOutputImageResourceAliases,
+  extractFinalKnowledgeBaseAssistantText,
+  latestKnowledgeBasePresentationOutput,
+} from "./knowledge-base-progress-service";
+import {
+  applyKnowledgeBaseProgressEnvelope,
+  assertKnowledgeBasePresentationMatchesState,
+  createKnowledgeBaseProgressState,
+  getKnowledgeBaseProgressSummary,
   parseKnowledgeBaseManifestEnvelope,
   parseKnowledgeBasePresentationEnvelope,
   parseKnowledgeBaseProgressEnvelope,
   parseKnowledgeBaseReopenEnvelope,
+  type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
 import { getUpstreamBaseUrl } from "./upstream-config";
 import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
+import {
+  assertSafeExternalUrl,
+  safeExternalRequestOptions,
+} from "./_core/safe-external-url";
 import {
   extractKnowledgeBaseProtocolObjects,
   stripKnowledgeBaseProtocolPayloads,
@@ -35,8 +53,18 @@ const TERMINAL_TASK_STATUSES = new Set([
   "done",
   "finished",
 ]);
+const SUCCESSFUL_TERMINAL_TASK_STATUSES = new Set([
+  "completed",
+  "complete",
+  "succeeded",
+  "done",
+  "finished",
+]);
 
-export type KnowledgeBaseLivePreviewMode = "full" | "protocol_probe";
+export type KnowledgeBaseLivePreviewMode =
+  | "full"
+  | "protocol_probe"
+  | "continuation";
 
 export const KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES = [
   {
@@ -94,6 +122,10 @@ type LivePreviewSession = {
   apiKey: string | null;
   mode: KnowledgeBaseLivePreviewMode;
   createdAt: number;
+  lastLoggedSummary: string;
+  progressState: KnowledgeBaseProgressState | null;
+  confirmationCount: number;
+  skillAttachment: { file_id: string; filename: string } | null;
   removeSkill: () => Promise<void>;
   skillRemoved: boolean;
   finalAnalysis: ReturnType<typeof analyzeKnowledgeBaseLiveTask> | null;
@@ -170,7 +202,11 @@ function protocolDiagnostic(
 
 export function analyzeKnowledgeBaseLiveTask(
   task: unknown,
-  options: { mode?: KnowledgeBaseLivePreviewMode } = {},
+  options: {
+    mode?: KnowledgeBaseLivePreviewMode;
+    progressState?: KnowledgeBaseProgressState | null;
+    confirmationCount?: number;
+  } = {},
 ) {
   const runMode = options.mode || "full";
   const taskRecord =
@@ -179,6 +215,9 @@ export function analyzeKnowledgeBaseLiveTask(
       : {};
   const status = normalizedTaskStatus(taskRecord.status);
   const output = Array.isArray(taskRecord.output) ? taskRecord.output : [];
+  const presentationOutput = latestKnowledgeBasePresentationOutput(output);
+  const imageCount =
+    collectKnowledgeBaseOutputImageKeys(presentationOutput).size;
   const assistantText = extractFinalKnowledgeBaseAssistantText(output);
   const protocolObjects = extractKnowledgeBaseProtocolObjects(assistantText);
   const legacySocraticStateCount = (
@@ -255,11 +294,21 @@ export function analyzeKnowledgeBaseLiveTask(
 
   const issues: string[] = [];
   const terminal = TERMINAL_TASK_STATUSES.has(status);
+  const successfulTerminal = SUCCESSFUL_TERMINAL_TASK_STATUSES.has(status);
+  if (terminal && !successfulTerminal) {
+    issues.push(`任务以失败或取消状态结束：${status}`);
+  }
   if (terminal && !assistantText) {
     issues.push("任务已结束，但没有找到带 assistant 角色的可解析文本输出");
   }
-  if (terminal && !manifestDiagnostic) {
+  if (terminal && runMode !== "continuation" && !manifestDiagnostic) {
     issues.push("任务已结束，但没有找到知识树 manifest");
+  }
+  if (terminal && runMode === "continuation" && !progressDiagnostic) {
+    issues.push("确认任务已结束，但没有找到 FRONTMIND_KB_PROGRESS");
+  }
+  if (terminal && runMode === "continuation" && !presentationDiagnostic) {
+    issues.push("确认任务已结束，但没有找到 FRONTMIND_KB_PRESENTATION");
   }
   if (legacySocraticStateCount > 0) {
     issues.push("返回了已禁用的旧 SOCRATIC_KB_STATE 状态对象");
@@ -291,38 +340,183 @@ export function analyzeKnowledgeBaseLiveTask(
       issues.push("协议探针 manifest 与预期的 8 个叶子不完全一致");
     }
   }
+  if (terminal && runMode === "full" && manifest && imageCount !== 3) {
+    issues.push(`首轮必须返回恰好 3 张经典企业图片，实际返回 ${imageCount} 张`);
+  }
+  if (terminal && runMode === "protocol_probe" && imageCount !== 0) {
+    issues.push(`协议探针禁止返回图片，实际返回 ${imageCount} 张`);
+  }
+  if (terminal && runMode === "continuation" && imageCount !== 0) {
+    issues.push(`后续确认轮次禁止返回图片，实际返回 ${imageCount} 张`);
+  }
+  const suppressStaleContinuation = runMode === "continuation" && !terminal;
+  const structurallyAccepted =
+    terminal && successfulTerminal && issues.length === 0;
+  const suppressRejectedContinuation =
+    runMode === "continuation" && terminal && !structurallyAccepted;
+  const suppressCustomerOutput =
+    suppressStaleContinuation || suppressRejectedContinuation;
 
   return {
     runMode,
     taskId: String(taskRecord.id || taskRecord.task_id || ""),
     status,
     terminal,
+    successfulTerminal,
+    // A continuation is not accepted until its transition has also been
+    // applied to the authoritative server state in
+    // reconcileTerminalLiveAnalysis. Structural validity alone is not enough.
+    protocolAccepted:
+      runMode === "continuation" ? false : structurallyAccepted,
     outputCount: output.length,
+    imageCount: suppressCustomerOutput ? 0 : imageCount,
     assistantCharacterCount: assistantText.length,
-    visibleCharacterCount: visibleMarkdown.length,
-    visibleMarkdown,
+    visibleCharacterCount: suppressCustomerOutput
+      ? 0
+      : visibleMarkdown.length,
+    visibleMarkdown: suppressCustomerOutput ? "" : visibleMarkdown,
     rawAssistantText: assistantText,
-    protocolKinds,
-    legacySocraticStateCount,
-    protocolObjects,
-    diagnostics,
-    manifest: manifest
+    rawOutput: suppressCustomerOutput ? [] : presentationOutput,
+    confirmationCount: Math.max(0, options.confirmationCount || 0),
+    knowledgeProgress: options.progressState
       ? {
-          leafCount: manifest.leaves.length,
-          branchCount: branchCounts.length,
-          branchCounts,
-          firstLeaf: manifest.leaves[0] || null,
-          lastLeaf: manifest.leaves[manifest.leaves.length - 1] || null,
-          leaves: manifest.leaves,
+          revision: options.progressState.revision,
+          currentLeafId: options.progressState.currentLeafId,
+          ...getKnowledgeBaseProgressSummary(options.progressState),
         }
       : null,
-    issues,
+    protocolKinds: suppressStaleContinuation ? [] : protocolKinds,
+    legacySocraticStateCount: suppressStaleContinuation
+      ? 0
+      : legacySocraticStateCount,
+    protocolObjects: suppressStaleContinuation ? [] : protocolObjects,
+    diagnostics: suppressStaleContinuation ? [] : diagnostics,
+    manifest:
+      !suppressStaleContinuation && manifest
+        ? {
+            leafCount: manifest.leaves.length,
+            branchCount: branchCounts.length,
+            branchCounts,
+            firstLeaf: manifest.leaves[0] || null,
+            lastLeaf: manifest.leaves[manifest.leaves.length - 1] || null,
+            leaves: manifest.leaves,
+          }
+        : null,
+    issues: suppressStaleContinuation ? [] : issues,
   };
 }
 
 function resolveLivePreviewApiKey(value: unknown) {
   const supplied = typeof value === "string" ? value.trim() : "";
   return supplied || process.env.FRONTMIND_LIVE_TEST_API_KEY?.trim() || "";
+}
+
+function detectedRasterImageMime(bytes: Buffer) {
+  if (
+    bytes.length >= 8 &&
+    bytes
+      .subarray(0, 8)
+      .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
+    return "image/png";
+  }
+  if (
+    bytes.length >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff
+  ) {
+    return "image/jpeg";
+  }
+  const signature = bytes.subarray(0, 12).toString("ascii");
+  if (signature.startsWith("GIF87a") || signature.startsWith("GIF89a")) {
+    return "image/gif";
+  }
+  if (signature.startsWith("RIFF") && signature.slice(8, 12) === "WEBP") {
+    return "image/webp";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes.subarray(4, 8).toString("ascii") === "ftyp" &&
+    /^(?:avif|avis)$/i.test(bytes.subarray(8, 12).toString("ascii"))
+  ) {
+    return "image/avif";
+  }
+  return "";
+}
+
+async function sendLivePreviewImage(
+  res: Response,
+  data: unknown,
+  maxBytes: number,
+) {
+  const bytes = Buffer.from(data as ArrayBuffer);
+  const contentType = detectedRasterImageMime(bytes);
+  if (!bytes.length || bytes.length > maxBytes) {
+    res.status(413).end();
+    return false;
+  }
+  if (!contentType) {
+    res.status(415).end();
+    return false;
+  }
+  try {
+    const decoder = sharp(bytes, {
+      failOn: "warning",
+      limitInputPixels: 40_000_000,
+      animated: false,
+    });
+    const metadata = await decoder.metadata();
+    const decodedMime =
+      metadata.format === "png"
+        ? "image/png"
+        : metadata.format === "jpeg"
+          ? "image/jpeg"
+          : metadata.format === "gif"
+            ? "image/gif"
+            : metadata.format === "webp"
+              ? "image/webp"
+              : metadata.format === "heif"
+                ? "image/avif"
+                : "";
+    if (
+      !decodedMime ||
+      decodedMime !== contentType ||
+      !metadata.width ||
+      !metadata.height
+    ) {
+      res.status(415).end();
+      return false;
+    }
+    // metadata() alone may accept a truncated header. Force a complete pixel
+    // decode before returning the original, signed bytes to the browser.
+    await decoder.clone().raw().toBuffer();
+  } catch {
+    res.status(415).end();
+    return false;
+  }
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Content-Length", String(bytes.length));
+  res.setHeader("Cache-Control", "private, no-store");
+  res.send(bytes);
+  return true;
+}
+
+export function collectKnowledgeBasePreviewFileIds(output: unknown) {
+  const ids = new Set<string>();
+  for (const key of collectKnowledgeBaseOutputImageResourceAliases(output)) {
+    const match = key.match(/\/v1\/files\/([^/?#]+)/);
+    if (match?.[1]) {
+      try {
+        ids.add(decodeURIComponent(match[1]));
+      } catch {
+        // Malformed URLs cannot identify a downloadable file.
+      }
+    } else if (!/^https?:\/\//i.test(key) && !/[\s/?#]/u.test(key)) {
+      ids.add(key);
+    }
+  }
+  return ids;
 }
 
 export function buildKnowledgeBaseProtocolProbePrompt() {
@@ -341,6 +535,185 @@ export function buildKnowledgeBaseProtocolProbePrompt() {
     "信封内必须是严格 JSON：kind 为 frontmind.knowledge-base.manifest，schemaVersion 为 1，leaves 与以上 8 行逐字段完全一致。",
     "禁止输出裸 JSON、代码围栏、FRONTMIND_KB_PROGRESS、FRONTMIND_KB_PRESENTATION、SOCRATIC_KB_STATE、workflow-state、knowledge-base.message 或任何解释。",
   ].join("\n");
+}
+
+function progressOverrideFromState(state: KnowledgeBaseProgressState) {
+  return {
+    build: {
+      revision: state.revision,
+      currentLeafId: state.currentLeafId,
+    },
+    branches: [
+      {
+        leaves: state.leaves.map((leaf) => ({
+          id: leaf.id,
+          title: leaf.title,
+          branchTitle: leaf.branchTitle || leaf.branchId || "未分组",
+          status: leaf.status,
+        })),
+      },
+    ],
+  };
+}
+
+function progressStateFromInitialText(text: string) {
+  return createKnowledgeBaseProgressState(
+    parseKnowledgeBaseManifestEnvelope(text).leaves,
+  );
+}
+
+export function rehydratedConfirmationProgressState(input: {
+  initialText: string;
+  revision: unknown;
+  currentLeafId: unknown;
+  confirmationCount: number;
+}) {
+  const initialState = progressStateFromInitialText(input.initialText);
+  const revision = Number(input.revision);
+  const currentLeafId =
+    typeof input.currentLeafId === "string"
+      ? input.currentLeafId.trim()
+      : input.currentLeafId === null
+        ? null
+        : initialState.currentLeafId;
+  if (
+    !Number.isSafeInteger(revision) ||
+    revision < 0 ||
+    revision !== input.confirmationCount
+  ) {
+    throw new Error("恢复确认状态的 revision 与已通过次数不一致");
+  }
+  const currentIndex = currentLeafId
+    ? initialState.leaves.findIndex((leaf) => leaf.id === currentLeafId)
+    : initialState.leaves.length;
+  if (currentIndex < 0 || currentIndex !== input.confirmationCount) {
+    throw new Error("恢复确认状态的当前节点与已通过次数不一致");
+  }
+  return {
+    ...initialState,
+    revision,
+    currentLeafId,
+    leaves: initialState.leaves.map((leaf, index) => ({
+      ...leaf,
+      status:
+        index < currentIndex
+          ? ("confirmed" as const)
+          : index === currentIndex
+            ? ("current" as const)
+            : ("pending" as const),
+    })),
+  };
+}
+
+export function selectInitialKnowledgeBaseLiveTask(task: unknown) {
+  const taskRecord =
+    task && typeof task === "object" && !Array.isArray(task)
+      ? (task as Record<string, unknown>)
+      : {};
+  const output = Array.isArray(taskRecord.output) ? taskRecord.output : [];
+  const manifestIndex = output.findIndex((item) => {
+    const text = extractFinalKnowledgeBaseAssistantText([item]);
+    if (!text) return false;
+    try {
+      parseKnowledgeBaseManifestEnvelope(text);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (manifestIndex < 0) return task;
+
+  let end = manifestIndex + 1;
+  while (end < output.length) {
+    if (extractFinalKnowledgeBaseAssistantText([output[end]])) break;
+    end += 1;
+  }
+  return {
+    ...taskRecord,
+    status: "completed",
+    output: output.slice(manifestIndex, end),
+  };
+}
+
+function reconcileTerminalLiveAnalysis(
+  session: LivePreviewSession,
+  task: unknown,
+) {
+  let analysis = analyzeKnowledgeBaseLiveTask(task, {
+    mode: session.mode,
+    progressState: session.progressState,
+    confirmationCount: session.confirmationCount,
+  });
+  if (!analysis.terminal) return analysis;
+  if (!analysis.successfulTerminal) return analysis;
+
+  let validationError = "";
+  try {
+    if (session.mode === "full") {
+      assertKnowledgeBaseInitialImageDelivery(
+        task && typeof task === "object"
+          ? (task as { output?: unknown }).output
+          : undefined,
+      );
+      session.progressState = progressStateFromInitialText(
+        analysis.rawAssistantText,
+      );
+    } else if (session.mode === "continuation") {
+      if (!session.progressState) {
+        throw new Error("确认任务缺少可恢复的知识树状态");
+      }
+      const envelope = parseKnowledgeBaseProgressEnvelope(
+        analysis.rawAssistantText,
+      );
+      const nextState = applyKnowledgeBaseProgressEnvelope(
+        session.progressState,
+        envelope,
+      );
+      const presentation = assertKnowledgeBasePresentationMatchesState(
+        nextState,
+        analysis.rawAssistantText,
+      );
+      assertKnowledgeBaseNodeImageDelivery({
+        presentation,
+        output:
+          task && typeof task === "object"
+            ? (task as { output?: unknown }).output
+            : undefined,
+      });
+      session.progressState = nextState;
+      session.confirmationCount += 1;
+    }
+  } catch (error) {
+    validationError = error instanceof Error ? error.message : String(error);
+  }
+
+  analysis = analyzeKnowledgeBaseLiveTask(task, {
+    mode: session.mode,
+    progressState: session.progressState,
+    confirmationCount: session.confirmationCount,
+  });
+  if (
+    validationError &&
+    !analysis.issues.some(
+      (issue) =>
+        issue === validationError || issue.endsWith(`：${validationError}`),
+    )
+  ) {
+    analysis.issues.push(validationError);
+  }
+  analysis.protocolAccepted =
+    !validationError &&
+    analysis.successfulTerminal &&
+    analysis.issues.length === 0;
+  if (!analysis.protocolAccepted) {
+    // Keep rawAssistantText and diagnostics for debugging, but never let a
+    // rejected provider response replace the last accepted customer node.
+    analysis.visibleMarkdown = "";
+    analysis.visibleCharacterCount = 0;
+    analysis.rawOutput = [];
+    analysis.imageCount = 0;
+  }
+  return analysis;
 }
 
 router.get("/configuration", (_req, res) => {
@@ -424,19 +797,42 @@ router.post("/start", async (req, res) => {
     }
 
     const sessionId = randomUUID();
-    const analysis = analyzeKnowledgeBaseLiveTask(created.task, { mode });
+    let analysis = analyzeKnowledgeBaseLiveTask(created.task, { mode });
     const terminal = analysis.terminal;
-    if (terminal) {
+    if (terminal && mode === "protocol_probe") {
       await skill.removeOrphan().catch(() => undefined);
+    }
+    let progressState: KnowledgeBaseProgressState | null = null;
+    if (terminal && mode === "full" && analysis.issues.length === 0) {
+      assertKnowledgeBaseInitialImageDelivery(created.task.output);
+      progressState = createKnowledgeBaseProgressState(
+        parseKnowledgeBaseManifestEnvelope(analysis.rawAssistantText).leaves,
+      );
+      analysis = analyzeKnowledgeBaseLiveTask(created.task, {
+        mode,
+        progressState,
+      });
     }
     livePreviewSessions.set(sessionId, {
       taskId: created.task.id,
-      apiKey: terminal ? null : apiKey,
+      apiKey: mode === "protocol_probe" && terminal ? null : apiKey,
       mode,
       createdAt: Date.now(),
+      lastLoggedSummary: `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`,
+      progressState,
+      confirmationCount: 0,
+      skillAttachment: skill.attachment,
       removeSkill: skill.removeOrphan,
-      skillRemoved: terminal,
+      skillRemoved: terminal && mode === "protocol_probe",
       finalAnalysis: terminal ? analysis : null,
+    });
+    console.info("[KnowledgeBaseLivePreview] task started", {
+      sessionId,
+      taskId: created.task.id,
+      mode,
+      status: analysis.status,
+      outputCount: analysis.outputCount,
+      visibleCharacterCount: analysis.visibleCharacterCount,
     });
     res.status(201).json({
       sessionId,
@@ -450,6 +846,388 @@ router.post("/start", async (req, res) => {
         message: error instanceof Error ? error.message : String(error),
       },
     });
+  }
+});
+
+router.post("/recover", async (req, res) => {
+  const taskId =
+    typeof req.body?.taskId === "string" ? req.body.taskId.trim() : "";
+  const apiKey = resolveLivePreviewApiKey(req.body?.apiKey);
+  if (!taskId || !apiKey) {
+    res.status(400).json({
+      error: {
+        code: "LIVE_PREVIEW_RECOVERY_INPUT_REQUIRED",
+        message: "恢复真实任务需要任务 ID 和一次性 API Key",
+      },
+    });
+    return;
+  }
+
+  try {
+    const response = await axios.get(
+      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
+      {
+        headers: {
+          API_KEY: apiKey,
+          Authorization: `Bearer ${apiKey}`,
+        },
+        timeout: 120_000,
+        validateStatus: () => true,
+      },
+    );
+    if (response.status < 200 || response.status >= 300) {
+      res.status(response.status).json({
+        error: {
+          code: "UPSTREAM_TASK_READ_FAILED",
+          message: `恢复真实任务失败（${response.status}）`,
+        },
+      });
+      return;
+    }
+
+    const initialTask = selectInitialKnowledgeBaseLiveTask(response.data);
+    let analysis = analyzeKnowledgeBaseLiveTask(initialTask, {
+      mode: "full",
+    });
+    if (!analysis.terminal) {
+      res.status(409).json({
+        error: {
+          code: "LIVE_PREVIEW_TASK_NOT_TERMINAL",
+          message: "该任务仍在运行，暂不能恢复为确认状态",
+        },
+      });
+      return;
+    }
+    if (analysis.issues.length > 0) {
+      res.status(422).json({
+        error: {
+          code: "LIVE_PREVIEW_RECOVERY_VALIDATION_FAILED",
+          message: analysis.issues.join("；"),
+        },
+      });
+      return;
+    }
+
+    assertKnowledgeBaseInitialImageDelivery(
+      initialTask && typeof initialTask === "object"
+        ? (initialTask as { output?: unknown }).output
+        : undefined,
+    );
+    const progressState = progressStateFromInitialText(
+      analysis.rawAssistantText,
+    );
+    analysis = analyzeKnowledgeBaseLiveTask(initialTask, {
+      mode: "full",
+      progressState,
+      confirmationCount: 0,
+    });
+    const sessionId = randomUUID();
+    livePreviewSessions.set(sessionId, {
+      taskId,
+      apiKey,
+      mode: "full",
+      createdAt: Date.now(),
+      lastLoggedSummary: `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`,
+      progressState,
+      confirmationCount: 0,
+      skillAttachment: null,
+      removeSkill: async () => undefined,
+      skillRemoved: true,
+      finalAnalysis: analysis,
+    });
+    console.info("[KnowledgeBaseLivePreview] task recovered", {
+      sessionId,
+      taskId,
+      imageCount: analysis.imageCount,
+      leafCount: analysis.manifest?.leafCount || 0,
+      currentLeafId: progressState.currentLeafId,
+    });
+    res.status(201).json({ sessionId, analysis });
+  } catch (error) {
+    res.status(502).json({
+      error: {
+        code: "LIVE_PREVIEW_RECOVERY_FAILED",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+});
+
+router.post("/confirm", async (req, res) => {
+  const requestedSessionId =
+    typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
+  let session = requestedSessionId
+    ? livePreviewSessions.get(requestedSessionId)
+    : undefined;
+  let sessionId = requestedSessionId;
+  const rehydrating = !session;
+
+  try {
+    if (!session) {
+      const sourceTaskId =
+        typeof req.body?.sourceTaskId === "string"
+          ? req.body.sourceTaskId.trim()
+          : "";
+      const sourceRawAssistantText =
+        typeof req.body?.sourceRawAssistantText === "string"
+          ? req.body.sourceRawAssistantText
+          : "";
+      if (!sourceTaskId || !sourceRawAssistantText) {
+        res.status(404).json({
+          error: {
+            code: "LIVE_PREVIEW_SESSION_NOT_FOUND",
+            message: "本地会话已重启，请保留首轮结果后重新提交确认",
+          },
+        });
+        return;
+      }
+      sessionId = randomUUID();
+      const confirmationCount = Math.max(
+        0,
+        Math.trunc(Number(req.body?.confirmationCount) || 0),
+      );
+      session = {
+        taskId: sourceTaskId,
+        apiKey: null,
+        mode: "continuation",
+        createdAt: Date.now(),
+        lastLoggedSummary: "",
+        progressState: rehydratedConfirmationProgressState({
+          initialText: sourceRawAssistantText,
+          revision: req.body?.sourceRevision ?? confirmationCount,
+          currentLeafId:
+            req.body?.sourceCurrentLeafId ??
+            (confirmationCount === 0 ? undefined : null),
+          confirmationCount,
+        }),
+        confirmationCount,
+        skillAttachment: null,
+        removeSkill: async () => undefined,
+        skillRemoved: true,
+        finalAnalysis: null,
+      };
+    }
+
+    if (!session.progressState || !session.progressState.currentLeafId) {
+      res.status(409).json({
+        error: {
+          code: "LIVE_PREVIEW_NO_CURRENT_LEAF",
+          message: "当前知识树没有可确认节点",
+        },
+      });
+      return;
+    }
+    if (!rehydrating && !session.finalAnalysis) {
+      res.status(409).json({
+        error: {
+          code: "LIVE_PREVIEW_TURN_RUNNING",
+          message: "上一轮确认仍在运行",
+        },
+      });
+      return;
+    }
+
+    const apiKey = resolveLivePreviewApiKey(req.body?.apiKey) || session.apiKey;
+    if (!apiKey) {
+      res.status(503).json({
+        error: {
+          code: "LIVE_API_KEY_REQUIRED",
+          message: "首次继续确认时需要在页面提交一次性 API Key",
+        },
+      });
+      return;
+    }
+
+    // A recovered task can still carry an older Skill and rejected assistant
+    // turns in its upstream context. Reattach the current deterministic Skill
+    // as a system attachment on every continued local session. It is not part
+    // of the user's attachment list, so a plain confirmation remains confirm.
+    if (!session.skillAttachment) {
+      const descriptor = await getKnowledgeBaseSkillDescriptor();
+      const currentSkill = await uploadKnowledgeBaseSkillArchive({
+        baseUrl: getUpstreamBaseUrl(),
+        apiKey,
+        skillVersion: descriptor.version,
+        skillContentHash: descriptor.contentHash,
+      });
+      const previousRemoveSkill = session.removeSkill;
+      session.skillAttachment = currentSkill.attachment;
+      session.removeSkill = async () => {
+        await Promise.allSettled([
+          previousRemoveSkill(),
+          currentSkill.removeOrphan(),
+        ]);
+      };
+      session.skillRemoved = false;
+    }
+
+    const prompt = await buildKnowledgeBaseTurnPrompt({
+      userId: 0,
+      conversationId: `live-preview-${sessionId}`,
+      userMessage: "确认",
+      attachments: [],
+      skillVersion: "3",
+      progressOverride: progressOverrideFromState(session.progressState),
+    });
+    const created = await createFrontMindTask({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey,
+      prompt,
+      attachments: [session.skillAttachment],
+      taskId: session.taskId,
+    });
+    if (!created.ok) {
+      res.status(created.status).json({
+        error: {
+          code: "LIVE_PREVIEW_CONFIRM_FAILED",
+          message: created.detail,
+        },
+      });
+      return;
+    }
+
+    session.taskId = created.task.id;
+    session.apiKey = apiKey;
+    session.mode = "continuation";
+    session.createdAt = Date.now();
+    session.finalAnalysis = null;
+    let analysis = analyzeKnowledgeBaseLiveTask(created.task, {
+      mode: "continuation",
+      progressState: session.progressState,
+      confirmationCount: session.confirmationCount,
+    });
+    if (analysis.terminal) {
+      analysis = reconcileTerminalLiveAnalysis(session, created.task);
+      session.finalAnalysis = analysis;
+    }
+    session.lastLoggedSummary = `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`;
+    livePreviewSessions.set(sessionId, session);
+    console.info("[KnowledgeBaseLivePreview] confirmation started", {
+      sessionId,
+      taskId: session.taskId,
+      confirmationNumber: session.confirmationCount + 1,
+      revision: session.progressState.revision,
+      currentLeafId: session.progressState.currentLeafId,
+      status: analysis.status,
+    });
+    res.status(201).json({ sessionId, analysis });
+  } catch (error) {
+    res.status(422).json({
+      error: {
+        code: "LIVE_PREVIEW_CONFIRM_FAILED",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+});
+
+router.get("/:sessionId/external-image", async (req, res) => {
+  const session = livePreviewSessions.get(req.params.sessionId);
+  const imageUrl = typeof req.query.url === "string" ? req.query.url : "";
+  if (!session?.finalAnalysis || !imageUrl) {
+    res.status(404).end();
+    return;
+  }
+  const allowedImages = collectKnowledgeBaseOutputImageResourceAliases(
+    session.finalAnalysis.rawOutput,
+  );
+  if (!allowedImages.has(imageUrl)) {
+    res.status(403).end();
+    return;
+  }
+
+  const maxBytes = 32 * 1024 * 1024;
+  try {
+    const imageResponse = await axios.get(assertSafeExternalUrl(imageUrl), {
+      ...safeExternalRequestOptions,
+      responseType: "arraybuffer",
+      timeout: 120_000,
+      maxContentLength: maxBytes,
+      maxBodyLength: maxBytes,
+      validateStatus: () => true,
+    });
+    if (imageResponse.status < 200 || imageResponse.status >= 300) {
+      res.status(404).end();
+      return;
+    }
+    await sendLivePreviewImage(res, imageResponse.data, maxBytes);
+  } catch {
+    res.status(502).end();
+  }
+});
+
+router.get("/:sessionId/files/:fileId", async (req, res) => {
+  const session = livePreviewSessions.get(req.params.sessionId);
+  const fileId = String(req.params.fileId || "").trim();
+  if (!session?.apiKey || !session.finalAnalysis || !fileId) {
+    res.status(404).end();
+    return;
+  }
+  const allowedFileIds = collectKnowledgeBasePreviewFileIds(
+    session.finalAnalysis.rawOutput,
+  );
+  if (!allowedFileIds.has(fileId)) {
+    res.status(403).end();
+    return;
+  }
+
+  const headers = {
+    API_KEY: session.apiKey,
+    Authorization: `Bearer ${session.apiKey}`,
+  };
+  const maxBytes = 32 * 1024 * 1024;
+  try {
+    let imageResponse = await axios.get(
+      `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}/content`,
+      {
+        headers,
+        responseType: "arraybuffer",
+        timeout: 120_000,
+        maxContentLength: maxBytes,
+        maxBodyLength: maxBytes,
+        validateStatus: () => true,
+      },
+    );
+    const contentType = String(imageResponse.headers["content-type"] || "");
+    if (
+      imageResponse.status < 200 ||
+      imageResponse.status >= 300 ||
+      contentType.includes("application/json")
+    ) {
+      const metadata = await axios.get(
+        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
+        {
+          headers,
+          timeout: 120_000,
+          validateStatus: () => true,
+        },
+      );
+      const downloadUrl = String(
+        metadata.data?.upload_url ||
+          metadata.data?.download_url ||
+          metadata.data?.file_url ||
+          "",
+      );
+      if (metadata.status < 200 || metadata.status >= 300 || !downloadUrl) {
+        res.status(404).end();
+        return;
+      }
+      imageResponse = await axios.get(assertSafeExternalUrl(downloadUrl), {
+        ...safeExternalRequestOptions,
+        responseType: "arraybuffer",
+        timeout: 120_000,
+        maxContentLength: maxBytes,
+        maxBodyLength: maxBytes,
+        validateStatus: () => true,
+      });
+    }
+    if (imageResponse.status < 200 || imageResponse.status >= 300) {
+      res.status(415).end();
+      return;
+    }
+    await sendLivePreviewImage(res, imageResponse.data, maxBytes);
+  } catch {
+    res.status(502).end();
   }
 });
 
@@ -503,13 +1281,33 @@ router.get("/:sessionId", async (req, res) => {
       return;
     }
 
-    const analysis = analyzeKnowledgeBaseLiveTask(response.data, {
+    let analysis = analyzeKnowledgeBaseLiveTask(response.data, {
       mode: session.mode,
+      progressState: session.progressState,
+      confirmationCount: session.confirmationCount,
     });
     if (analysis.terminal) {
+      analysis = reconcileTerminalLiveAnalysis(session, response.data);
+    }
+    const summary = `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`;
+    if (summary !== session.lastLoggedSummary) {
+      session.lastLoggedSummary = summary;
+      console.info("[KnowledgeBaseLivePreview] task updated", {
+        sessionId: req.params.sessionId,
+        taskId: session.taskId,
+        mode: session.mode,
+        status: analysis.status,
+        outputCount: analysis.outputCount,
+        visibleCharacterCount: analysis.visibleCharacterCount,
+        issueCount: analysis.issues.length,
+      });
+    }
+    if (analysis.terminal) {
       session.finalAnalysis = analysis;
-      session.apiKey = null;
-      if (!session.skillRemoved) {
+      if (session.mode === "protocol_probe") {
+        session.apiKey = null;
+      }
+      if (session.mode === "protocol_probe" && !session.skillRemoved) {
         session.skillRemoved = true;
         void session.removeSkill().catch(() => undefined);
       }

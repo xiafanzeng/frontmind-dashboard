@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -16,6 +16,8 @@ import MarkdownRenderer from "@/components/MarkdownRenderer";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
+import type { OutputMessage } from "@/lib/frontmind-api";
+import { projectTaskOutputMessages } from "@/lib/task-output-projection";
 import { stripKnowledgeBaseProtocolPayloads } from "@shared/knowledge-base-output";
 
 type BranchCount = {
@@ -24,15 +26,28 @@ type BranchCount = {
 };
 
 type LiveAnalysis = {
-  runMode: "full" | "protocol_probe" | "replay";
+  runMode: "full" | "protocol_probe" | "continuation" | "replay";
   taskId: string;
   status: string;
   terminal: boolean;
+  successfulTerminal?: boolean;
+  protocolAccepted?: boolean;
   outputCount: number;
+  imageCount?: number;
   assistantCharacterCount: number;
   visibleCharacterCount: number;
   visibleMarkdown: string;
   rawAssistantText: string;
+  rawOutput?: OutputMessage[];
+  confirmationCount?: number;
+  knowledgeProgress?: null | {
+    revision: number;
+    currentLeafId: string | null;
+    total: number;
+    pending: number;
+    confirmed: number;
+    overallPercent: number;
+  };
   protocolKinds: string[];
   legacySocraticStateCount: number;
   protocolObjects: Array<Record<string, unknown>>;
@@ -62,11 +77,12 @@ type LiveAnalysis = {
 type LiveResponse = {
   sessionId: string;
   analysis: LiveAnalysis;
+  initialRawAssistantText?: string;
 };
 
 const LIVE_PREVIEW_STORAGE_KEY = "frontmind.knowledge-base-live-preview";
 
-function readPersistedLiveResponse(): LiveResponse | null {
+export function readPersistedLiveResponse(): LiveResponse | null {
   if (typeof window === "undefined") return null;
   try {
     const parsed = JSON.parse(
@@ -76,6 +92,10 @@ function readPersistedLiveResponse(): LiveResponse | null {
       ? {
           sessionId: String(parsed.sessionId || ""),
           analysis: parsed.analysis as LiveAnalysis,
+          initialRawAssistantText:
+            typeof parsed.initialRawAssistantText === "string"
+              ? parsed.initialRawAssistantText
+              : undefined,
         }
       : null;
   } catch {
@@ -95,11 +115,13 @@ function readReplayLiveResponse(): LiveResponse | null {
   ).length;
   return {
     sessionId: "",
+    initialRawAssistantText: rawAssistantText,
     analysis: {
       runMode: "replay",
       taskId: params.get("taskId") || "replayed-real-task",
       status: "completed",
       terminal: true,
+      protocolAccepted: true,
       outputCount: Number(params.get("outputCount") || 1),
       assistantCharacterCount: rawAssistantText.length,
       visibleCharacterCount: visibleMarkdown.length,
@@ -120,9 +142,15 @@ function readInitialLiveResponse() {
 }
 
 function persistLiveResponse(value: LiveResponse) {
+  const previous = readPersistedLiveResponse();
+  const initialRawAssistantText =
+    value.initialRawAssistantText ||
+    (value.analysis.manifest ? value.analysis.rawAssistantText : "") ||
+    previous?.initialRawAssistantText ||
+    undefined;
   window.sessionStorage.setItem(
     LIVE_PREVIEW_STORAGE_KEY,
-    JSON.stringify(value),
+    JSON.stringify({ ...value, initialRawAssistantText }),
   );
 }
 
@@ -140,6 +168,28 @@ function responseError(payload: unknown, fallback: string) {
   return fallback;
 }
 
+function livePreviewImageSource(src: string, sessionId: string) {
+  const fileMatch = src.match(/^\/api\/frontmind\/v1\/files\/([^/?#]+)/);
+  if (fileMatch?.[1] && sessionId) {
+    let fileId = fileMatch[1];
+    try {
+      fileId = decodeURIComponent(fileId);
+    } catch {
+      return src;
+    }
+    return `/api/dev/knowledge-base-live/${encodeURIComponent(sessionId)}/files/${encodeURIComponent(fileId)}`;
+  }
+  if (src.startsWith("/api/frontmind/proxy-download?")) {
+    const externalUrl = new URL(src, window.location.origin).searchParams.get(
+      "url",
+    );
+    if (externalUrl && /^https?:\/\//i.test(externalUrl) && sessionId) {
+      return `/api/dev/knowledge-base-live/${encodeURIComponent(sessionId)}/external-image?url=${encodeURIComponent(externalUrl)}`;
+    }
+  }
+  return src;
+}
+
 async function readJson(response: Response) {
   return (await response.json().catch(() => null)) as unknown;
 }
@@ -155,6 +205,12 @@ function Metric({ label, value }: { label: string; value: string | number }) {
 
 export default function KnowledgeBaseLivePreview() {
   const [persistedResponse] = useState(readInitialLiveResponse);
+  const [recoveryTaskId] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return (
+      new URLSearchParams(window.location.search).get("resumeTaskId") || ""
+    );
+  });
   const [companyName, setCompanyName] = useState("FrontMind超前智能");
   const [companyWebsite, setCompanyWebsite] = useState(
     "https://www.frontmind.net/",
@@ -173,6 +229,7 @@ export default function KnowledgeBaseLivePreview() {
     "full" | "protocol_probe" | null
   >(null);
   const [polling, setPolling] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -268,6 +325,80 @@ export default function KnowledgeBaseLivePreview() {
     }
   };
 
+  const confirmCurrent = async () => {
+    if (!analysis) return;
+    setConfirming(true);
+    setError("");
+    try {
+      const response = await fetch("/api/dev/knowledge-base-live/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          sourceTaskId: analysis.taskId,
+          sourceRawAssistantText:
+            readPersistedLiveResponse()?.initialRawAssistantText ||
+            analysis.rawAssistantText,
+          confirmationCount: analysis.confirmationCount || 0,
+          sourceRevision: analysis.knowledgeProgress?.revision ?? 0,
+          sourceCurrentLeafId:
+            analysis.knowledgeProgress?.currentLeafId ?? null,
+          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+        }),
+      });
+      const payload = await readJson(response);
+      if (!response.ok) {
+        throw new Error(responseError(payload, "确认当前节点失败"));
+      }
+      const live = payload as LiveResponse;
+      setSessionId(live.sessionId);
+      setAnalysis(live.analysis);
+      persistLiveResponse(live);
+      setApiKey("");
+    } catch (confirmError) {
+      setError(
+        confirmError instanceof Error
+          ? confirmError.message
+          : String(confirmError),
+      );
+    } finally {
+      setConfirming(false);
+    }
+  };
+
+  const recoverTask = async () => {
+    if (!recoveryTaskId) return;
+    setConfirming(true);
+    setError("");
+    try {
+      const response = await fetch("/api/dev/knowledge-base-live/recover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskId: recoveryTaskId,
+          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+        }),
+      });
+      const payload = await readJson(response);
+      if (!response.ok) {
+        throw new Error(responseError(payload, "恢复真实任务失败"));
+      }
+      const live = payload as LiveResponse;
+      setSessionId(live.sessionId);
+      setAnalysis(live.analysis);
+      persistLiveResponse(live);
+      setApiKey("");
+    } catch (recoverError) {
+      setError(
+        recoverError instanceof Error
+          ? recoverError.message
+          : String(recoverError),
+      );
+    } finally {
+      setConfirming(false);
+    }
+  };
+
   const progress = analysis?.terminal
     ? 100
     : analysis?.manifest
@@ -275,9 +406,70 @@ export default function KnowledgeBaseLivePreview() {
       : analysis?.visibleCharacterCount
         ? 30
         : 3;
-  const renderedVisibleMarkdown = analysis
-    ? stripKnowledgeBaseProtocolPayloads(analysis.visibleMarkdown).trim()
-    : "";
+  const protocolAccepted =
+    analysis?.protocolAccepted ??
+    Boolean(
+      analysis &&
+        analysis.runMode !== "continuation" &&
+        analysis.terminal &&
+        analysis.successfulTerminal !== false &&
+        analysis.issues.length === 0,
+    );
+  const renderedVisibleMarkdown =
+    analysis && (analysis.runMode !== "continuation" || protocolAccepted)
+      ? stripKnowledgeBaseProtocolPayloads(analysis.visibleMarkdown).trim()
+      : "";
+  const projectionTarget = useMemo(() => {
+    if (!analysis || !protocolAccepted) return undefined;
+    if (analysis.knowledgeProgress) {
+      return {
+        revision: analysis.knowledgeProgress.revision,
+        leafId: analysis.knowledgeProgress.currentLeafId,
+      };
+    }
+    const firstLeaf = analysis.manifest?.firstLeaf;
+    if (firstLeaf) return { revision: 0, leafId: firstLeaf.id };
+    const presentation = [...analysis.protocolObjects]
+      .reverse()
+      .find(
+        (value) =>
+          value.kind === "frontmind.knowledge-base.presentation" &&
+          value.schemaVersion === 1 &&
+          Number.isSafeInteger(value.revision) &&
+          (value.leafId === null || typeof value.leafId === "string"),
+      );
+    if (presentation) {
+      return {
+        revision: Number(presentation.revision),
+        leafId:
+          presentation.leafId === null
+            ? null
+            : String(presentation.leafId).trim(),
+      };
+    }
+    return undefined;
+  }, [analysis, protocolAccepted]);
+  const projectedMessages = useMemo(() => {
+    if (!analysis?.rawOutput?.length || !projectionTarget) return [];
+    return projectTaskOutputMessages({
+      output: analysis.rawOutput,
+      baselineOutputLength: 0,
+      responseStartedAt: Date.now(),
+      modelName: "frontmind-pro",
+      knowledgeBase: true,
+      knowledgeBasePresentation: projectionTarget,
+    }).map((message) => ({
+      ...message,
+      inlineImages: message.inlineImages?.map((image) => ({
+        ...image,
+        src: livePreviewImageSource(image.src, sessionId),
+      })),
+    }));
+  }, [analysis, projectionTarget, sessionId]);
+  const currentLeafId =
+    analysis?.knowledgeProgress?.currentLeafId ||
+    (analysis?.runMode === "full" ? analysis.manifest?.firstLeaf?.id : null);
+  const confirmationCount = analysis?.confirmationCount || 0;
 
   return (
     <main className="min-h-screen bg-slate-50 px-5 py-8 text-slate-950">
@@ -324,6 +516,19 @@ export default function KnowledgeBaseLivePreview() {
               />
             </label>
             <div className="flex flex-col gap-2 self-end">
+              {recoveryTaskId && (
+                <Button
+                  disabled={confirming || !apiKey.trim()}
+                  onClick={() => void recoverTask()}
+                >
+                  {confirming ? (
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4" />
+                  )}
+                  {analysis ? "重新恢复首轮结果" : "恢复首轮结果"}
+                </Button>
+              )}
               <Button
                 disabled={Boolean(submittingMode) || !companyName.trim()}
                 onClick={() => void start("full")}
@@ -391,34 +596,79 @@ export default function KnowledgeBaseLivePreview() {
                       ? "真实协议探针"
                       : analysis.runMode === "replay"
                         ? "真实响应回放"
-                        : "真实任务状态"}
+                        : analysis.runMode === "continuation"
+                          ? `真实确认推进 · 已通过 ${confirmationCount}/3 次`
+                          : "真实任务状态"}
                     ：{analysis.status}
                   </div>
                   <div className="mt-1 font-mono text-xs text-slate-500">
                     {analysis.taskId}
                   </div>
                 </div>
-                <Button
-                  variant="outline"
-                  disabled={polling}
-                  onClick={() => void poll(sessionId)}
-                >
-                  <RefreshCw
-                    className={`h-4 w-4 ${polling ? "animate-spin" : ""}`}
-                  />
-                  立即刷新
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  {analysis.terminal &&
+                    analysis.successfulTerminal !== false &&
+                    protocolAccepted &&
+                    analysis.runMode !== "protocol_probe" &&
+                    currentLeafId &&
+                    confirmationCount < 3 && (
+                      <Button
+                        disabled={confirming}
+                        onClick={() => void confirmCurrent()}
+                      >
+                        {confirming ? (
+                          <LoaderCircle className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Play className="h-4 w-4" />
+                        )}
+                        确认当前节点（第 {confirmationCount + 1}/3 次）
+                      </Button>
+                    )}
+                  {analysis.terminal &&
+                    analysis.successfulTerminal !== false &&
+                    analysis.runMode === "continuation" &&
+                    !protocolAccepted &&
+                    currentLeafId &&
+                    confirmationCount < 3 && (
+                      <Button
+                        variant="outline"
+                        disabled={confirming}
+                        onClick={() => void confirmCurrent()}
+                      >
+                        {confirming ? (
+                          <LoaderCircle className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                        重试本次确认（节点未推进）
+                      </Button>
+                    )}
+                  <Button
+                    variant="outline"
+                    disabled={polling || !sessionId}
+                    onClick={() => void poll(sessionId)}
+                  >
+                    <RefreshCw
+                      className={`h-4 w-4 ${polling ? "animate-spin" : ""}`}
+                    />
+                    立即刷新
+                  </Button>
+                </div>
               </div>
               <Progress className="mt-5" value={progress} />
-              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
                 <Metric label="上游输出项" value={analysis.outputCount} />
+                <Metric
+                  label="本轮图片"
+                  value={protocolAccepted ? (analysis.imageCount ?? 0) : 0}
+                />
                 <Metric
                   label="原始字符"
                   value={analysis.assistantCharacterCount}
                 />
                 <Metric
                   label="可见字符"
-                  value={analysis.visibleCharacterCount}
+                  value={protocolAccepted ? analysis.visibleCharacterCount : 0}
                 />
                 <Metric
                   label="业务分支"
@@ -439,8 +689,41 @@ export default function KnowledgeBaseLivePreview() {
                   manifest、progress、presentation 与兼容协议对象均已隐藏。
                 </p>
                 <div className="mt-5 min-h-40 rounded-2xl border border-slate-200 bg-slate-50 p-5">
-                  {renderedVisibleMarkdown ? (
+                  {projectedMessages.length > 0 ? (
+                    <div className="space-y-5">
+                      {projectedMessages.map((message) => (
+                        <div key={message.id} className="space-y-4">
+                          {message.content.trim() && (
+                            <MarkdownRenderer content={message.content} />
+                          )}
+                          {message.inlineImages?.length ? (
+                            <div className="grid gap-4 md:grid-cols-3">
+                              {message.inlineImages.map((image, index) => (
+                                <figure
+                                  key={`${message.id}-image-${index}`}
+                                  className="overflow-hidden rounded-2xl border border-slate-200 bg-white"
+                                >
+                                  <img
+                                    src={image.src}
+                                    alt={
+                                      image.alt || `首轮经典图片 ${index + 1}`
+                                    }
+                                    className="h-48 w-full object-contain"
+                                  />
+                                </figure>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : renderedVisibleMarkdown ? (
                     <MarkdownRenderer content={renderedVisibleMarkdown} />
+                  ) : analysis.terminal && !protocolAccepted ? (
+                    <div className="flex items-start gap-2 text-sm leading-6 text-amber-700">
+                      <AlertTriangle className="mt-1 h-4 w-4 shrink-0" />
+                      本轮响应未通过协议校验，已拒绝替换当前节点正文；知识树状态没有推进。
+                    </div>
                   ) : (
                     <div className="flex items-center gap-2 text-sm text-slate-500">
                       <LoaderCircle className="h-4 w-4 animate-spin" />

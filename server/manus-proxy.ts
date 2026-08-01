@@ -48,6 +48,7 @@ import { preparedFileService } from "./prepared-file-service";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
+import { collectUpstreamOutputFileIds } from "./upstream-output-resources";
 
 const router = Router();
 
@@ -971,50 +972,6 @@ export function isPublicTaskPayloadRequest(
   }
   if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
   return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path);
-}
-
-function collectOutputFileIds(
-  value: unknown,
-  ids = new Set<string>(),
-  currentKey?: string,
-  depth = 0,
-) {
-  if (value === null || value === undefined || depth > 50) return ids;
-  if (typeof value === "string") {
-    if ((currentKey === "file_id" || currentKey === "fileId") && value) {
-      ids.add(value);
-    }
-    if (
-      currentKey === "url" ||
-      currentKey === "file_url" ||
-      currentKey === "fileUrl" ||
-      currentKey === "image_url" ||
-      currentKey === "imageUrl"
-    ) {
-      const match = value.match(/\/v1\/files\/([^/?#]+)/);
-      if (match?.[1]) {
-        try {
-          ids.add(decodeURIComponent(match[1]));
-        } catch {
-          // Ignore malformed upstream URLs; they will not be downloadable.
-        }
-      }
-    }
-    return ids;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value)
-      collectOutputFileIds(item, ids, undefined, depth + 1);
-    return ids;
-  }
-  if (typeof value === "object") {
-    for (const [key, item] of Object.entries(
-      value as Record<string, unknown>,
-    )) {
-      collectOutputFileIds(item, ids, key, depth + 1);
-    }
-  }
-  return ids;
 }
 
 interface OutputPdfDescriptor {
@@ -3087,15 +3044,49 @@ router.all("/*", async (req: Request, res: Response) => {
       // through this application's upload endpoint. Record them before the
       // browser receives their URLs so later preview/download requests remain
       // bound to the same account and credential version.
-      for (const fileId of collectOutputFileIds(response.data)) {
-        await recordUpstreamResource({
+      for (const fileId of collectUpstreamOutputFileIds(response.data)) {
+        const registration = {
           userId: req.frontmindUser.id,
           apiCredentialId: req.frontmindCredential.id,
-          kind: "file",
+          kind: "file" as const,
           upstreamId: fileId,
           projectAssignmentId:
             req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
-        });
+        };
+        let recorded = false;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            await recordUpstreamResource(registration);
+            recorded = true;
+            break;
+          } catch (error) {
+            lastError = error;
+            if (attempt < 2) {
+              await new Promise((resolve) =>
+                setTimeout(resolve, 50 * 2 ** attempt),
+              );
+            }
+          }
+        }
+        if (recorded) continue;
+
+        // Never make an already-created upstream task look uncreated: a
+        // browser retry could otherwise create and bill a duplicate task.
+        console.error(
+          "[FrontMind Proxy] Output file registration pending",
+          safeErrorForLog(lastError),
+        );
+        res.setHeader("X-FrontMind-Resource-Registration", "pending");
+        const retryTimer = setTimeout(() => {
+          void recordUpstreamResource(registration).catch((error) => {
+            console.error(
+              "[FrontMind Proxy] Output file retry failed",
+              safeErrorForLog(error),
+            );
+          });
+        }, 1_000);
+        retryTimer.unref?.();
       }
 
       // Registration is metadata-only. The single background worker downloads

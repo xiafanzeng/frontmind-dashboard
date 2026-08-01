@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY } from "@/lib/frontmind-api";
@@ -108,7 +114,7 @@ vi.mock("@/components/PortalShell", () => ({
       <span>{eyebrow}</span>
       <h1>{title}</h1>
       {roleLabel && <p data-testid="project-role-label">{roleLabel}</p>}
-      {toolbar}
+      {toolbar && <div data-testid="portal-toolbar">{toolbar}</div>}
       {children}
     </main>
   ),
@@ -211,6 +217,13 @@ describe("DeliveryMemberDashboard project context", () => {
     const projectSelector = await screen.findByRole("combobox", {
       name: "当前客户项目",
     });
+    expect(screen.queryByTestId("portal-toolbar")).not.toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("current-delivery-target")).getByRole(
+        "combobox",
+        { name: "当前客户项目" },
+      ),
+    ).toBe(projectSelector);
     expect(projectSelector).toHaveValue("1e9f33bc-40e2-4a8e-9bda-40d92a94b11f");
     expect(
       screen.getByRole("option", {

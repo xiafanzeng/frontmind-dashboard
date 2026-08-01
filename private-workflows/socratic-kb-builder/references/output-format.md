@@ -154,9 +154,7 @@ Use this exact top-level contract. Extra fields are forbidden:
       "gallery",
       "official_document"
     ],
-    "rejectionReasons": [
-      { "reason": "重复字节", "count": 1 }
-    ],
+    "rejectionReasons": [{ "reason": "重复字节", "count": 1 }],
     "stopReason": "已取得三张互不重复的经典企业图片，停止图片发现",
     "productFamilyCoverage": [
       {
@@ -206,8 +204,8 @@ Document and asset IDs are stable and unique. Every `assetIds` and
 
 ## Conversational presentation assets
 
-Associate the archive's maximum three classic assets only with the manifest's
-first leaf. Return their validated local bytes as actual response image/file
+Associate the archive's exactly three classic assets only with the manifest's
+first leaf. Return all three validated local bytes as actual response image/file
 attachments on the initial first-leaf turn. Do not return source hotlinks or
 only write a relative Markdown path. Every later turn is text-only. Each
 non-null `FRONTMIND_KB_PRESENTATION` envelope therefore uses
@@ -256,7 +254,7 @@ The manifest counts must match the actual ZIP:
 - `customerVisibleCharacters`: validator-counted formal characters.
 - `evidenceCharacters`: retained deduplicated evidence characters, maximum
   3,000,000.
-- `packagedImages`: unique validated first-party image files, maximum 3.
+- `packagedImages`: unique validated first-party image files, exactly 3.
 
 Keep all existing `00_completeness.json` fields, evidence statuses, and
 completeness calculations unchanged. Do not derive completeness from resource

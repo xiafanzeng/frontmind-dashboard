@@ -6,6 +6,7 @@ import {
   assertKnowledgeBaseCustomerOutput,
   classifyKnowledgeBaseUserAction,
   collectKnowledgeBaseOutputImageKeys,
+  collectKnowledgeBaseOutputImageResourceAliases,
   extractFinalKnowledgeBaseAssistantText,
   isAmbiguousKnowledgeBaseAdvance,
 } from "./knowledge-base-progress-service";
@@ -175,6 +176,24 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     ).toEqual(new Set(["image-1", "image-2"]));
   });
 
+  it("authorizes both aliases without double-counting one image", () => {
+    const output = [
+      {
+        type: "output_image",
+        file_id: "image-1",
+        image_url: "https://cdn.example.test/image-1.webp?token=1",
+        file_name: "image-1.webp",
+      },
+    ];
+
+    expect(collectKnowledgeBaseOutputImageKeys(output)).toEqual(
+      new Set(["image-1"]),
+    );
+    expect(collectKnowledgeBaseOutputImageResourceAliases(output)).toEqual(
+      new Set(["image-1", "https://cdn.example.test/image-1.webp?token=1"]),
+    );
+  });
+
   it("rejects image attachments on every non-initial node turn", () => {
     expect(() =>
       assertKnowledgeBaseNodeImageDelivery({
@@ -204,12 +223,19 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     ).toThrow("缺少图片交付声明");
   });
 
-  it("allows no more than three distinct first-turn image outputs", () => {
+  it("requires exactly three distinct first-turn image outputs", () => {
     const image = (id: string) => ({
       type: "output_image",
       file_id: id,
       file_name: `${id}.webp`,
     });
+    expect(() =>
+      assertKnowledgeBaseInitialImageDelivery([
+        { role: "assistant", type: "message", content: "1.1 正文" },
+        image("logo"),
+        image("hero"),
+      ]),
+    ).toThrow("必须展示恰好三张");
     expect(() =>
       assertKnowledgeBaseInitialImageDelivery([
         { role: "assistant", type: "message", content: "1.1 正文" },
@@ -226,7 +252,7 @@ describe("knowledge-base first-leaf-only image delivery", () => {
         image("product"),
         image("duplicate-or-extra"),
       ]),
-    ).toThrow("最多只能展示三张");
+    ).toThrow("必须展示恰好三张");
   });
 
   it("does not count an earlier turn's image in the current presentation", () => {

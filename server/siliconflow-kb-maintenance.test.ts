@@ -2,10 +2,25 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertSiliconFlowMaintenanceIdentity,
+  siliconFlowKnowledgeSnapshotCleanupStorageKeys,
   SILICONFLOW_MAINTENANCE_BRAND,
 } from "./siliconflow-kb-maintenance";
 
 describe("SiliconFlow one-time knowledge-base maintenance guard", () => {
+  it("includes each deterministic snapshot ZIP key in local cleanup", () => {
+    expect(
+      siliconFlowKnowledgeSnapshotCleanupStorageKeys(42, [
+        {
+          id: "00000000-0000-4000-8000-000000000123",
+          assets: [{ key: "knowledge-assets/42/logo.webp" }],
+        },
+      ]),
+    ).toEqual([
+      "knowledge-assets/42/logo.webp",
+      "knowledge-archives/42/00000000-0000-4000-8000-000000000123.zip",
+    ]);
+  });
+
   it("accepts only one explicit user whose formal and build names match", () => {
     expect(() =>
       assertSiliconFlowMaintenanceIdentity({

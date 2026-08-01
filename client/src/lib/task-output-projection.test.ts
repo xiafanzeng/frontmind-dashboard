@@ -135,6 +135,42 @@ describe("task output projection", () => {
     expect(messages).toEqual([]);
   });
 
+  it("renders a genuinely new running collection status", () => {
+    const historical = assistantOutput("old-node", "1.2 企业主体\n旧正文");
+    const running = assistantOutput(
+      "collection-status",
+      "FrontMind 正在按业务分支进行资料采集。",
+    );
+
+    const messages = projectTaskOutputMessages({
+      output: [historical, running],
+      baselineOutputLength: 1,
+      historicalOutputIds: ["old-node"],
+      responseStartedAt: 2,
+      knowledgeBase: true,
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.content).toBe("FrontMind 正在按业务分支进行资料采集。");
+  });
+
+  it("does not replay a reused historical output ID as running text", () => {
+    const historical = assistantOutput(
+      "reused-output",
+      "FrontMind 正在处理上一节点。",
+    );
+
+    expect(
+      projectTaskOutputMessages({
+        output: [historical],
+        baselineOutputLength: 1,
+        historicalOutputIds: ["reused-output"],
+        responseStartedAt: 2,
+        knowledgeBase: true,
+      }),
+    ).toEqual([]);
+  });
+
   it("suppresses a stale previous node until the authoritative next node arrives", () => {
     const stale = assistantOutput(
       "reused-output",

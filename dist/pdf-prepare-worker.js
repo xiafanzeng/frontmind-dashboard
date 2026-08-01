@@ -4140,6 +4140,9 @@ function selectPortalContract(contracts, now = /* @__PURE__ */ new Date()) {
   })[0] ?? null;
 }
 
+// server/knowledge-snapshot-archive-store.ts
+var MAX_KNOWLEDGE_SNAPSHOT_ARCHIVE_BYTES = 250 * 1024 * 1024;
+
 // server/admin-control-plane-service.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { and as and4, desc as desc4, eq as eq5, gte as gte2, inArray as inArray3, isNull as isNull2, lt, or } from "drizzle-orm";
@@ -5688,6 +5691,46 @@ function normalizeKnowledgeCollectionCopy(value) {
   );
 }
 
+// server/upstream-output-resources.ts
+function normalizedUpstreamFileId(value) {
+  const normalized = value.trim();
+  return normalized.length > 0 && normalized.length <= 255 && !/[\s/?#\u0000-\u001f\u007f]/u.test(normalized) ? normalized : "";
+}
+function collectUpstreamOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
+  if (value === null || value === void 0 || depth > 50) return ids;
+  if (typeof value === "string") {
+    if ((currentKey === "file_id" || currentKey === "fileId") && value) {
+      const fileId = normalizedUpstreamFileId(value);
+      if (fileId) ids.add(fileId);
+    }
+    if (currentKey === "url" || currentKey === "file_url" || currentKey === "fileUrl" || currentKey === "image_url" || currentKey === "imageUrl") {
+      const match = value.match(/\/v1\/files\/([^/?#]+)/);
+      if (match?.[1]) {
+        try {
+          const fileId = normalizedUpstreamFileId(decodeURIComponent(match[1]));
+          if (fileId) ids.add(fileId);
+        } catch {
+        }
+      }
+    }
+    return ids;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectUpstreamOutputFileIds(item, ids, void 0, depth + 1);
+    }
+    return ids;
+  }
+  if (typeof value === "object") {
+    for (const [key, item] of Object.entries(
+      value
+    )) {
+      collectUpstreamOutputFileIds(item, ids, key, depth + 1);
+    }
+  }
+  return ids;
+}
+
 // server/manus-proxy.ts
 var router = Router();
 var fileMetaCache = /* @__PURE__ */ new Map();
@@ -6323,37 +6366,6 @@ function isPublicTaskPayloadRequest(method, targetPath) {
   }
   if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
   return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path3);
-}
-function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
-  if (value === null || value === void 0 || depth > 50) return ids;
-  if (typeof value === "string") {
-    if ((currentKey === "file_id" || currentKey === "fileId") && value) {
-      ids.add(value);
-    }
-    if (currentKey === "url" || currentKey === "file_url" || currentKey === "fileUrl" || currentKey === "image_url" || currentKey === "imageUrl") {
-      const match = value.match(/\/v1\/files\/([^/?#]+)/);
-      if (match?.[1]) {
-        try {
-          ids.add(decodeURIComponent(match[1]));
-        } catch {
-        }
-      }
-    }
-    return ids;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value)
-      collectOutputFileIds(item, ids, void 0, depth + 1);
-    return ids;
-  }
-  if (typeof value === "object") {
-    for (const [key, item] of Object.entries(
-      value
-    )) {
-      collectOutputFileIds(item, ids, key, depth + 1);
-    }
-  }
-  return ids;
 }
 function collectOutputPdfDescriptors(value, descriptors = [], depth = 0) {
   if (!value || depth > 50) return descriptors;
@@ -7815,14 +7827,45 @@ router.all("/*", async (req, res) => {
           });
         }
       }
-      for (const fileId of collectOutputFileIds(response.data)) {
-        await recordUpstreamResource({
+      for (const fileId of collectUpstreamOutputFileIds(response.data)) {
+        const registration = {
           userId: req.frontmindUser.id,
           apiCredentialId: req.frontmindCredential.id,
           kind: "file",
           upstreamId: fileId,
           projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null
-        });
+        };
+        let recorded = false;
+        let lastError;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            await recordUpstreamResource(registration);
+            recorded = true;
+            break;
+          } catch (error) {
+            lastError = error;
+            if (attempt < 2) {
+              await new Promise(
+                (resolve) => setTimeout(resolve, 50 * 2 ** attempt)
+              );
+            }
+          }
+        }
+        if (recorded) continue;
+        console.error(
+          "[FrontMind Proxy] Output file registration pending",
+          safeErrorForLog(lastError)
+        );
+        res.setHeader("X-FrontMind-Resource-Registration", "pending");
+        const retryTimer = setTimeout(() => {
+          void recordUpstreamResource(registration).catch((error) => {
+            console.error(
+              "[FrontMind Proxy] Output file retry failed",
+              safeErrorForLog(error)
+            );
+          });
+        }, 1e3);
+        retryTimer.unref?.();
       }
       for (const descriptor of collectOutputPdfDescriptors(response.data)) {
         try {

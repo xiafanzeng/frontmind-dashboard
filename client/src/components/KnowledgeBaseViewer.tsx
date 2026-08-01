@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { BookOpen, Database, FileText, Images, Search } from "lucide-react";
+import {
+  BookOpen,
+  Database,
+  Download,
+  FileText,
+  Images,
+  Search,
+} from "lucide-react";
 
 import MarkdownRenderer from "@/components/MarkdownRenderer";
 import { Input } from "@/components/ui/input";
@@ -22,6 +29,8 @@ export type KnowledgeSnapshotView = {
   imageCount: number;
   characterCount: number;
   totalBytes: number;
+  archiveHash?: string | null;
+  archiveAvailable?: boolean;
   createdAt: Date | number | string;
 };
 
@@ -518,6 +527,20 @@ export default function KnowledgeBaseViewer({
 
   return (
     <div className="space-y-4">
+      {snapshot.sourceFileName.toLowerCase().endsWith(".zip") &&
+        snapshot.archiveAvailable === true &&
+        /^[a-f0-9]{64}$/i.test(snapshot.archiveHash || "") && (
+          <div className="flex justify-end">
+            <a
+              href={`/api/dashboard/knowledge/snapshots/${encodeURIComponent(snapshot.id)}/archive`}
+              download={snapshot.sourceFileName}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-[#5b2a86] px-4 text-sm font-medium text-white shadow-sm transition hover:bg-[#49216c] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b2a86] focus-visible:ring-offset-2"
+            >
+              <Download className="h-4 w-4" />
+              下载成品 ZIP
+            </a>
+          </div>
+        )}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         {[
           ["知识文档", `${snapshot.documentCount} 篇`],

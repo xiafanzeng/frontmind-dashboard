@@ -35,6 +35,10 @@ import {
   assertServiceCapability,
   ServiceEntitlementError,
 } from "./service-entitlement";
+import {
+  persistKnowledgeSnapshotArchive,
+  removeKnowledgeSnapshotArchive,
+} from "./knowledge-snapshot-archive-store";
 
 const sha256Schema = z
   .string()
@@ -604,6 +608,42 @@ export async function importWebsiteKnowledgeArtifact(input: {
   }
 
   let storedAssetKeys: string[] = [];
+  let snapshotCommitted = false;
+  let storedArchive: { userId: number; snapshotId: string } | undefined;
+  let committedSnapshot: Awaited<
+    ReturnType<typeof createKnowledgeSnapshot>
+  > | null = null;
+  let committedSnapshotId = "";
+  let committedSourceFileName = "";
+  let receiptCompleted = false;
+  const completeReceipt = async () => {
+    const result = await db
+      .update(knowledgeImportReceipts)
+      .set({
+        status: "completed",
+        snapshotId: committedSnapshotId,
+        sourceFileName: committedSourceFileName,
+        completedAt: new Date(),
+        errorCode: null,
+        errorMessage: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(knowledgeImportReceipts.id, reservation.receiptId),
+          eq(knowledgeImportReceipts.status, "processing"),
+        ),
+      );
+    const affectedRows = Number(
+      (result as { affectedRows?: unknown } | undefined)?.affectedRows ??
+        (result as Array<{ affectedRows?: unknown }> | undefined)?.[0]
+          ?.affectedRows,
+    );
+    if (affectedRows === 0) {
+      throw new Error("知识库导入回执状态已变化，无法写入完成状态");
+    }
+    receiptCompleted = true;
+  };
   try {
     await assertKnowledgeBaseWritable(provision.userId);
     try {
@@ -743,6 +783,13 @@ export async function importWebsiteKnowledgeArtifact(input: {
       brandName: workspace.payload.brandName,
       documents: parsed.documents,
     });
+    await persistKnowledgeSnapshotArchive({
+      userId: provision.userId,
+      snapshotId,
+      buffer: downloaded.buffer,
+      expectedSha256: archiveHash,
+    });
+    storedArchive = { userId: provision.userId, snapshotId };
     const snapshot = await createKnowledgeSnapshot({
       snapshotId,
       userId: provision.userId,
@@ -755,23 +802,11 @@ export async function importWebsiteKnowledgeArtifact(input: {
       assets: parsed.assets,
       totalBytes: downloaded.buffer.length,
     });
-    await db
-      .update(knowledgeImportReceipts)
-      .set({
-        status: "completed",
-        snapshotId,
-        sourceFileName: downloaded.filename,
-        completedAt: new Date(),
-        errorCode: null,
-        errorMessage: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(knowledgeImportReceipts.id, reservation.receiptId),
-          eq(knowledgeImportReceipts.status, "processing"),
-        ),
-      );
+    committedSnapshot = snapshot;
+    committedSnapshotId = snapshot?.id ?? snapshotId;
+    committedSourceFileName = downloaded.filename;
+    snapshotCommitted = true;
+    await completeReceipt();
     await createKnowledgeMonitoringHandoff({
       userId: provision.userId,
       actorUserId: provision.userId,
@@ -784,7 +819,44 @@ export async function importWebsiteKnowledgeArtifact(input: {
       snapshot,
     };
   } catch (error) {
-    await removeStoredKnowledgeAssets(storedAssetKeys);
+    if (snapshotCommitted) {
+      if (!receiptCompleted) {
+        await completeReceipt().catch((receiptError) => {
+          console.error(
+            "[KnowledgeImport] Snapshot committed but receipt completion retry failed",
+            receiptError,
+          );
+        });
+      }
+      await createKnowledgeMonitoringHandoff({
+        userId: provision.userId,
+        actorUserId: provision.userId,
+        knowledgeSnapshotId: committedSnapshotId,
+      }).catch((handoffError) => {
+        console.error(
+          "[KnowledgeImport] Snapshot committed but monitoring handoff retry failed",
+          handoffError,
+        );
+      });
+      console.warn(
+        "[KnowledgeImport] Returning committed snapshot after a non-fatal post-commit failure",
+        error,
+      );
+      return {
+        status: "completed" as const,
+        replayed: false,
+        receiptId: reservation.receiptId,
+        snapshot: committedSnapshot,
+      };
+    }
+    if (!snapshotCommitted) {
+      await removeStoredKnowledgeAssets(storedAssetKeys);
+      if (storedArchive) {
+        await removeKnowledgeSnapshotArchive(storedArchive).catch(
+          () => undefined,
+        );
+      }
+    }
     await markReceiptFailed(reservation.receiptId, error);
     throw error instanceof KnowledgeImportError
       ? error

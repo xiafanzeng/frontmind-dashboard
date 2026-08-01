@@ -128,7 +128,60 @@ export function collectKnowledgeBaseOutputImageKeys(
   return result;
 }
 
-function latestKnowledgeBasePresentationOutput(output: unknown) {
+/**
+ * Return every usable alias carried by an image descriptor. Some upstream
+ * versions provide both a durable file ID and a signed CDN URL for one image;
+ * counting still uses one preferred key, while download authorization must
+ * recognize both aliases.
+ */
+export function collectKnowledgeBaseOutputImageResourceAliases(
+  value: unknown,
+  result = new Set<string>(),
+  depth = 0,
+) {
+  if (value === null || value === undefined || depth > 50) return result;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectKnowledgeBaseOutputImageResourceAliases(item, result, depth + 1);
+    }
+    return result;
+  }
+  if (!isRecord(value)) return result;
+
+  const type = stringValue(value.type).toLowerCase();
+  const mimeType = stringValue(
+    value.mimeType || value.mime_type || value.content_type,
+  ).toLowerCase();
+  const fileName = stringValue(
+    value.fileName || value.file_name || value.filename || value.name,
+  );
+  const resourceId = stringValue(value.fileId || value.file_id);
+  const resourceUrl = stringValue(
+    value.fileUrl ||
+      value.file_url ||
+      value.imageUrl ||
+      value.image_url ||
+      value.url,
+  );
+  const isImage =
+    type === "output_image" ||
+    type === "image" ||
+    mimeType.startsWith("image/") ||
+    /\.(?:avif|gif|jpe?g|png|svg|webp)$/i.test(fileName);
+  if (isImage) {
+    if (resourceId) result.add(resourceId);
+    if (resourceUrl) result.add(resourceUrl);
+  }
+
+  for (const item of Object.values(value)) {
+    if (item && typeof item === "object") {
+      collectKnowledgeBaseOutputImageResourceAliases(item, result, depth + 1);
+    }
+  }
+  return result;
+}
+
+export function latestKnowledgeBasePresentationOutput(output: unknown) {
   if (!Array.isArray(output)) return output;
   const assistantIndexes = output.flatMap((item, index) =>
     extractFinalKnowledgeBaseAssistantText([item]) ? [index] : [],
@@ -196,10 +249,10 @@ export function assertKnowledgeBaseInitialImageDelivery(output: unknown) {
   const imageCount = collectKnowledgeBaseOutputImageKeys(
     latestKnowledgeBasePresentationOutput(output),
   ).size;
-  if (imageCount > 3) {
+  if (imageCount !== 3) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
-      "首个知识节点最多只能展示三张互不重复的经典企业图片",
+      `首个知识节点必须展示恰好三张互不重复的经典企业图片，实际返回 ${imageCount} 张`,
     );
   }
 }

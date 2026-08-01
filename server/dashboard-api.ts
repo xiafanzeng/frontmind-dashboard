@@ -64,6 +64,7 @@ import {
   getKnowledgeAssetById,
   getLatestKnowledgeSnapshot,
   getKnowledgeSnapshotById,
+  getKnowledgeSnapshotForWorkspace,
   updateDashboardWorkspace,
   type DashboardWorkspaceWriteHook,
 } from "./dashboard-service";
@@ -112,6 +113,13 @@ import {
   issueDashboardImportPreflight,
 } from "./dashboard-import-preflight-service";
 import { readStoredPresalesFile } from "./presales-file-store";
+import {
+  KnowledgeSnapshotArchiveError,
+  knowledgeArchiveContentDisposition,
+  persistKnowledgeSnapshotArchive,
+  readKnowledgeSnapshotArchive,
+  removeKnowledgeSnapshotArchive,
+} from "./knowledge-snapshot-archive-store";
 
 const router = express.Router();
 const MAX_ARCHIVE_ENTRIES = 2_000;
@@ -1260,6 +1268,37 @@ export async function removeStoredKnowledgeAssets(keys: string[]) {
       unlink(path.join(storageRoot, key)).catch(() => undefined),
     ),
   );
+}
+
+export async function removeUncommittedStoredKnowledgeAssets(input: {
+  snapshotCommitted: boolean;
+  storedAssetKeys: string[];
+  removeAssets?: (keys: string[]) => Promise<void>;
+}) {
+  if (input.snapshotCommitted) return;
+  await (input.removeAssets ?? removeStoredKnowledgeAssets)(
+    input.storedAssetKeys,
+  );
+}
+
+export async function runCommittedKnowledgeSnapshotSideEffects(
+  effects: Array<{ name: string; run: () => Promise<unknown> }>,
+  warn: (message: string, error: unknown) => void = (message, error) =>
+    console.warn(message, error),
+) {
+  const warnings: string[] = [];
+  for (const effect of effects) {
+    try {
+      await effect.run();
+    } catch (error) {
+      warnings.push(effect.name);
+      warn(
+        `[Dashboard] Knowledge snapshot committed; ${effect.name} will be retried independently`,
+        error,
+      );
+    }
+  }
+  return warnings;
 }
 
 const textExtensions = new Set([
@@ -6484,6 +6523,8 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
   }
 
   let storedAssetKeys: string[] = [];
+  let snapshotCommitted = false;
+  let storedArchive: { userId: number; snapshotId: string } | undefined;
   try {
     await assertRoleScopedWorkspaceExecution({
       req,
@@ -6590,6 +6631,13 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       brandName: workspace.payload.brandName,
       documents: parsed.documents,
     });
+    await persistKnowledgeSnapshotArchive({
+      userId: targetUserId,
+      snapshotId,
+      buffer: downloaded.buffer,
+      expectedSha256: archiveHash,
+    });
+    storedArchive = { userId: targetUserId, snapshotId };
     const snapshot = await createKnowledgeSnapshot({
       snapshotId,
       userId: targetUserId,
@@ -6605,6 +6653,7 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       assets: parsed.assets,
       totalBytes: downloaded.buffer.length,
     });
+    snapshotCommitted = true;
     await createKnowledgeMonitoringHandoff({
       userId: targetUserId,
       actorUserId: actor.id,
@@ -6612,11 +6661,15 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
     });
     res.json({ kind: "knowledge", snapshot });
   } catch (error) {
-    await Promise.all(
-      storedAssetKeys.map((key) =>
-        unlink(path.join(storageRoot, key)).catch(() => undefined),
-      ),
-    );
+    await removeUncommittedStoredKnowledgeAssets({
+      snapshotCommitted,
+      storedAssetKeys,
+    });
+    if (!snapshotCommitted && storedArchive) {
+      await removeKnowledgeSnapshotArchive(storedArchive).catch(
+        () => undefined,
+      );
+    }
     const publishedBuild = await assertKnowledgeBasePublishable({
       userId: targetUserId,
       conversationId,
@@ -7500,6 +7553,8 @@ router.put(
             }
           : { validationProfile: "historical" },
       );
+      let snapshotCommitted = false;
+      let storedArchive = false;
       try {
         const workspace = await getDashboardWorkspace(targetUserId);
         assertKnowledgeArchiveEnterpriseIdentity({
@@ -7509,6 +7564,19 @@ router.put(
           brandName: workspace.payload.brandName,
           documents: parsed.documents,
         });
+        const archiveHash =
+          extension === ".zip"
+            ? createHash("sha256").update(buffer).digest("hex")
+            : undefined;
+        if (archiveHash) {
+          await persistKnowledgeSnapshotArchive({
+            userId: targetUserId,
+            snapshotId,
+            buffer,
+            expectedSha256: archiveHash,
+          });
+          storedArchive = true;
+        }
         const snapshot = await createKnowledgeSnapshot({
           snapshotId,
           userId: targetUserId,
@@ -7517,38 +7585,56 @@ router.put(
           sourceConversationId,
           sourceBuildId,
           maintenanceTicketId,
+          archiveHash,
           documents: parsed.documents,
           assets: parsed.assets,
           totalBytes: buffer.length,
         });
-        await createKnowledgeMonitoringHandoff({
-          userId: targetUserId,
-          actorUserId: actor.id,
-          knowledgeSnapshotId: snapshot?.id ?? snapshotId,
-        });
-        await writeWorkspaceAuditEvent({
-          actor,
-          action: "workspace.knowledge.published",
-          targetType: "knowledge_snapshot",
-          targetId: snapshot?.id ?? snapshotId,
-          workspaceUserId: targetUserId,
-          metadata: {
-            sourceName: sourceFileName,
-            sourceConversationId,
-            sourceBuildId,
-            maintenanceTicketId,
-            documentCount: snapshot?.documentCount ?? parsed.documents.length,
-            imageCount: snapshot?.imageCount ?? parsed.assets.length,
-            totalBytes: snapshot?.totalBytes ?? buffer.length,
+        snapshotCommitted = true;
+        await runCommittedKnowledgeSnapshotSideEffects([
+          {
+            name: "monitoring handoff",
+            run: () =>
+              createKnowledgeMonitoringHandoff({
+                userId: targetUserId,
+                actorUserId: actor.id,
+                knowledgeSnapshotId: snapshot?.id ?? snapshotId,
+              }),
           },
-        });
+          {
+            name: "publication audit",
+            run: () =>
+              writeWorkspaceAuditEvent({
+                actor,
+                action: "workspace.knowledge.published",
+                targetType: "knowledge_snapshot",
+                targetId: snapshot?.id ?? snapshotId,
+                workspaceUserId: targetUserId,
+                metadata: {
+                  sourceName: sourceFileName,
+                  sourceConversationId,
+                  sourceBuildId,
+                  maintenanceTicketId,
+                  documentCount:
+                    snapshot?.documentCount ?? parsed.documents.length,
+                  imageCount: snapshot?.imageCount ?? parsed.assets.length,
+                  totalBytes: snapshot?.totalBytes ?? buffer.length,
+                },
+              }),
+          },
+        ]);
         res.json({ kind: "knowledge", snapshot });
       } catch (error) {
-        await Promise.all(
-          parsed.storedAssetKeys.map((key) =>
-            unlink(path.join(storageRoot, key)).catch(() => undefined),
-          ),
-        );
+        await removeUncommittedStoredKnowledgeAssets({
+          snapshotCommitted,
+          storedAssetKeys: parsed.storedAssetKeys,
+        });
+        if (!snapshotCommitted && storedArchive) {
+          await removeKnowledgeSnapshotArchive({
+            userId: targetUserId,
+            snapshotId,
+          }).catch(() => undefined);
+        }
         throw error;
       }
     } catch (error) {
@@ -7609,6 +7695,57 @@ router.put(
                               ? error.code
                               : knowledgeArchiveErrorCode(error) ||
                                 "IMPORT_FAILED",
+          },
+        });
+    }
+  },
+);
+
+router.get(
+  "/knowledge/snapshots/:snapshotId/archive",
+  async (req: FrontMindRequest, res) => {
+    try {
+      const snapshotId = z.string().uuid().parse(req.params.snapshotId);
+      const snapshot = await getKnowledgeSnapshotForWorkspace({
+        actor: req.frontmindUser!,
+        snapshotId,
+      });
+      if (
+        !snapshot ||
+        !snapshot.sourceFileName.toLowerCase().endsWith(".zip") ||
+        !snapshot.archiveHash ||
+        !/^[a-f0-9]{64}$/i.test(snapshot.archiveHash)
+      ) {
+        throw new KnowledgeSnapshotArchiveError(
+          "ARCHIVE_NOT_FOUND",
+          "该知识库版本尚无可下载的 ZIP 归档",
+        );
+      }
+      const bytes = await readKnowledgeSnapshotArchive({
+        userId: snapshot.userId,
+        snapshotId,
+        expectedSha256: snapshot.archiveHash,
+        expectedBytes: snapshot.totalBytes,
+      });
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Length", String(bytes.length));
+      res.setHeader(
+        "Content-Disposition",
+        knowledgeArchiveContentDisposition(snapshot.sourceFileName),
+      );
+      res.send(bytes);
+    } catch (error) {
+      const archiveError =
+        error instanceof KnowledgeSnapshotArchiveError ? error : null;
+      res
+        .status(
+          archiveError && archiveError.code !== "ARCHIVE_NOT_FOUND" ? 409 : 404,
+        )
+        .json({
+          error: {
+            message: archiveError?.message || "知识库 ZIP 不存在",
+            code: archiveError?.code || "NOT_FOUND",
           },
         });
     }

@@ -756,12 +756,7 @@ export function useSendMessage() {
 
           // Ordinary tasks may render running output. Knowledge-base text is
           // shown only after the server validates the exact revision/leaf pair.
-          if (
-            response.output &&
-            response.output.length > 0 &&
-            (!options?.syncKnowledgeBaseSnapshot ||
-              authoritativeKnowledgePresentation)
-          ) {
+          if (response.output && response.output.length > 0) {
             const newOutput = sliceNewOutput(
               response.output,
               baselineOutputLength,

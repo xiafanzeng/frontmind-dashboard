@@ -408,11 +408,7 @@ export default function ChatArea({
             : {}),
         });
 
-        if (
-          data.task.output &&
-          data.task.output.length > 0 &&
-          authoritativeKnowledgePresentation
-        ) {
+        if (data.task.output && data.task.output.length > 0) {
           const assistantMessages = projectTaskOutputMessages({
             output: data.task.output,
             baselineOutputLength: activeConversation.lastKnownOutputLength || 0,

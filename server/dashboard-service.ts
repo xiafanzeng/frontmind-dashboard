@@ -41,6 +41,7 @@ import {
   selectPortalContract,
   type ServicePortalContractRecord,
 } from "./service-entitlement";
+import { isKnowledgeSnapshotArchiveAvailable } from "./knowledge-snapshot-archive-store";
 import {
   hasSystemAdminAccess,
   writeWorkspaceAuditEvent,
@@ -876,10 +877,18 @@ export async function rollbackDashboardContentRevision(input: {
 }
 
 function publicSnapshot<
-  T extends { id: string; assets: KnowledgeAssetRecord[] },
->(snapshot: T) {
+  T extends {
+    id: string;
+    userId: number;
+    sourceFileName: string;
+    archiveHash: string | null;
+    totalBytes: number;
+    assets: KnowledgeAssetRecord[];
+  },
+>(snapshot: T, archiveAvailable: boolean) {
   return {
     ...snapshot,
+    archiveAvailable,
     assets: snapshot.assets.map((asset, index) => ({
       ...asset,
       url: asset.id
@@ -887,6 +896,27 @@ function publicSnapshot<
         : `/api/dashboard/knowledge/assets/${snapshot.id}/${index}`,
     })),
   };
+}
+
+async function publicKnowledgeSnapshot<
+  T extends {
+    id: string;
+    userId: number;
+    sourceFileName: string;
+    archiveHash: string | null;
+    totalBytes: number;
+    assets: KnowledgeAssetRecord[];
+  },
+>(snapshot: T) {
+  const archiveAvailable =
+    snapshot.sourceFileName.toLowerCase().endsWith(".zip") &&
+    /^[a-f0-9]{64}$/i.test(snapshot.archiveHash || "") &&
+    (await isKnowledgeSnapshotArchiveAvailable({
+      userId: snapshot.userId,
+      snapshotId: snapshot.id,
+      expectedBytes: snapshot.totalBytes,
+    }));
+  return publicSnapshot(snapshot, archiveAvailable);
 }
 
 export async function getLatestKnowledgeSnapshot(userId: number) {
@@ -902,7 +932,7 @@ export async function getLatestKnowledgeSnapshot(userId: number) {
     )
     .orderBy(desc(knowledgeBaseSnapshots.version))
     .limit(1);
-  return rows[0] ? publicSnapshot(rows[0]) : null;
+  return rows[0] ? publicKnowledgeSnapshot(rows[0]) : null;
 }
 
 export async function getKnowledgeSnapshotById(input: {
@@ -920,7 +950,23 @@ export async function getKnowledgeSnapshotById(input: {
       ),
     )
     .limit(1);
-  return rows[0] ? publicSnapshot(rows[0]) : null;
+  return rows[0] ? publicKnowledgeSnapshot(rows[0]) : null;
+}
+
+export async function getKnowledgeSnapshotForWorkspace(input: {
+  actor: AuthenticatedUser;
+  snapshotId: string;
+}) {
+  const db = await requireDb();
+  const rows = await db
+    .select()
+    .from(knowledgeBaseSnapshots)
+    .where(eq(knowledgeBaseSnapshots.id, input.snapshotId))
+    .limit(1);
+  const snapshot = rows[0];
+  if (!snapshot) return null;
+  await assertWorkspaceAccess(input.actor, snapshot.userId);
+  return publicKnowledgeSnapshot(snapshot);
 }
 
 export async function getKnowledgeAsset(input: {

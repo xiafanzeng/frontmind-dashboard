@@ -406,32 +406,30 @@ export default function DeliveryMemberDashboard({
     : null;
   const ticketCounts = workbench.data?.counts;
   const currentNav = deliveryMemberNavForRole(currentAssignment?.roleType);
-  const projectToolbar = assignmentsQuery.data?.length ? (
-    <div className="flex items-center gap-2">
-      <select
-        aria-label="当前客户项目"
-        className="h-10 rounded-md border bg-card px-3 text-sm"
-        value={projectAssignmentId}
-        onChange={(event) => {
-          sessionStorage.setItem(
-            DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
-            event.target.value,
-          );
-          setProjectAssignmentId(event.target.value);
-        }}
-      >
-        {assignmentsQuery.data.map((assignment) => (
-          <option
-            key={assignment.projectAssignmentId}
-            value={assignment.projectAssignmentId}
-          >
-            {assignment.customerName || assignment.customerUsername} ·{" "}
-            {DELIVERY_ROLE_LABELS[assignment.roleType]}
-          </option>
-        ))}
-      </select>
-    </div>
-  ) : undefined;
+  const projectSelector = assignmentsQuery.data?.length ? (
+    <select
+      aria-label="当前客户项目"
+      className="h-10 w-full rounded-md border bg-card px-3 text-sm"
+      value={projectAssignmentId}
+      onChange={(event) => {
+        sessionStorage.setItem(
+          DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+          event.target.value,
+        );
+        setProjectAssignmentId(event.target.value);
+      }}
+    >
+      {assignmentsQuery.data.map((assignment) => (
+        <option
+          key={assignment.projectAssignmentId}
+          value={assignment.projectAssignmentId}
+        >
+          {assignment.customerName || assignment.customerUsername} ·{" "}
+          {DELIVERY_ROLE_LABELS[assignment.roleType]}
+        </option>
+      ))}
+    </select>
+  ) : null;
 
   if (taskHistory) {
     return <DeliveryHistoryView />;
@@ -504,7 +502,6 @@ export default function DeliveryMemberDashboard({
         title={taskHistory ? "我的任务记录" : "我的工作台"}
         navItems={currentNav}
         roleLabel={`${currentAssignment.customerName || currentAssignment.customerUsername} · ${DELIVERY_ROLE_LABELS[currentAssignment.roleType]}`}
-        toolbar={projectToolbar}
       >
         <Card className="mx-auto max-w-xl">
           <CardContent className="py-14 text-center">
@@ -555,7 +552,6 @@ export default function DeliveryMemberDashboard({
           ? `${currentAssignment.customerName || currentAssignment.customerUsername} · ${DELIVERY_ROLE_LABELS[currentAssignment.roleType]}`
           : undefined
       }
-      toolbar={projectToolbar}
     >
       {currentAssignment && !taskHistory && (
         <div className="mb-5 space-y-4">
@@ -603,9 +599,10 @@ export default function DeliveryMemberDashboard({
       )}
 
       <div className="grid gap-5 xl:grid-cols-[0.75fr_1.25fr]">
-        <Card>
-          <CardHeader>
+        <Card data-testid="current-delivery-target">
+          <CardHeader className="gap-3">
             <CardTitle>当前交付对象</CardTitle>
+            {projectSelector}
           </CardHeader>
           <CardContent className="space-y-2">
             {(workbench.data?.customers ?? []).map((customer) => (

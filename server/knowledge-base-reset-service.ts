@@ -30,6 +30,7 @@ import { getDb } from "./db";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getServicePortal } from "./service-entitlement";
 import { getUpstreamBaseUrl } from "./upstream-config";
+import { knowledgeSnapshotArchiveStorageKey } from "./knowledge-snapshot-archive-store";
 
 const ACTIVE_TICKET_STATUSES = [
   "submitted",
@@ -75,6 +76,20 @@ type KnowledgeCounts = {
   }>;
   hasKnowledge: boolean;
 };
+
+export function knowledgeSnapshotCleanupStorageKeys(
+  userId: number,
+  snapshots: KnowledgeCounts["snapshots"],
+) {
+  return Array.from(
+    new Set(
+      snapshots.flatMap((snapshot) => [
+        ...snapshot.assets.map((asset) => asset.key).filter(Boolean),
+        knowledgeSnapshotArchiveStorageKey(userId, snapshot.id),
+      ]),
+    ),
+  );
+}
 
 async function getKnowledgeCounts(
   executor: any,
@@ -573,12 +588,9 @@ export async function decideKnowledgeReset(input: {
       .map((receipt) => receipt.fileId)
       .filter((id): id is string => Boolean(id));
     const receiptResourceIds = [...receiptTaskIds, ...receiptFileIds];
-    const localAssetKeys = Array.from(
-      new Set(
-        counts.snapshots.flatMap((snapshot) =>
-          snapshot.assets.map((asset) => asset.key).filter(Boolean),
-        ),
-      ),
+    const localAssetKeys = knowledgeSnapshotCleanupStorageKeys(
+      row.request.userId,
+      counts.snapshots,
     );
     const [conversationRows, attachmentRows, resourceRows] = await Promise.all([
       storedIds.length

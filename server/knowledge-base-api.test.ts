@@ -8,6 +8,7 @@ import {
   KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
   KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
   buildKnowledgeBasePrompt,
+  buildKnowledgeBaseTurnPrompt,
   buildKnowledgeBasePrefillEvidenceArchive,
   buildKnowledgePrefillExcerpt,
   deriveKnowledgeBaseInteraction,
@@ -121,6 +122,55 @@ describe("knowledge base execution contract", () => {
     ]) {
       expect(skill).toContain(invariant);
     }
+  });
+
+  it("pins every confirmation to the exact canonical transition envelopes", async () => {
+    const prompt = await buildKnowledgeBaseTurnPrompt({
+      userId: 0,
+      conversationId: "turn-contract",
+      userMessage: "确认",
+      attachments: [],
+      skillVersion: "3",
+      progressOverride: {
+        build: { revision: 4, currentLeafId: "1.2" },
+        branches: [
+          {
+            leaves: [
+              {
+                id: "1.2",
+                title: "企业名称",
+                branchTitle: "企业身份",
+                status: "current",
+              },
+              {
+                id: "1.3",
+                title: "使命愿景",
+                branchTitle: "企业身份",
+                status: "pending",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(prompt).toContain(
+      '{"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":4,"transition":{"leafId":"1.2","from":"current","to":"confirmed","reason":"用户明确确认"}}',
+    );
+    expect(prompt).toContain(
+      '{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":5,"leafId":"1.3","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}',
+    );
+    expect(prompt).toContain("不得把 action、leafId、status 放在顶层");
+    expect(prompt).not.toContain('"action":"confirm"');
+    expect(
+      prompt
+        .trim()
+        .endsWith(
+          '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":5,"leafId":"1.3","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
+        ),
+    ).toBe(true);
+    expect(prompt).toContain("旧 Skill、旧回复或旧协议示例");
+    expect(prompt).toContain("最终输出锁（最高优先级");
   });
 
   it("balances historical prefill across branches and caps it at 80,000 characters", () => {

@@ -18,7 +18,10 @@ import {
   knowledgeBaseSnapshots,
   knowledgeImportReceipts,
 } from "../drizzle/schema";
-import { getKnowledgeResetStatus } from "./knowledge-base-reset-service";
+import {
+  getKnowledgeResetStatus,
+  knowledgeSnapshotCleanupStorageKeys,
+} from "./knowledge-base-reset-service";
 
 function query(rows: Array<Record<string, unknown>>) {
   const chain = {
@@ -94,6 +97,21 @@ beforeEach(() => {
 });
 
 describe("knowledge-base reset status", () => {
+  it("queues both rendered assets and the immutable snapshot ZIP for cleanup", () => {
+    expect(
+      knowledgeSnapshotCleanupStorageKeys(42, [
+        {
+          id: "00000000-0000-4000-8000-000000000123",
+          sourceConversationId: null,
+          assets: [{ key: "knowledge-assets/snapshot/logo.webp" }],
+        },
+      ]),
+    ).toEqual([
+      "knowledge-assets/snapshot/logo.webp",
+      "knowledge-archives/42/00000000-0000-4000-8000-000000000123.zip",
+    ]);
+  });
+
   it("allows a reset request while a build is still in progress", async () => {
     dependencies.getDb.mockResolvedValue(
       resetStatusDb({ withPartialBuild: true }),

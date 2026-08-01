@@ -138,7 +138,7 @@ async function checkAndUpdateTask(
     // Ordinary tasks can stream partial text. Knowledge-base tasks must wait
     // for server reconciliation, otherwise a provider's stale cumulative item
     // can briefly replace the current node before the new envelope arrives.
-    if (!isKnowledgeBaseConversation) applyRetrievedOutput(false);
+    applyRetrievedOutput(isKnowledgeBaseConversation);
 
     let reconciliationError: unknown;
     try {

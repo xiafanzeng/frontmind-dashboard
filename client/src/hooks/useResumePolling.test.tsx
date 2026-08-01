@@ -177,7 +177,7 @@ describe("useResumePolling hydration gate", () => {
     unmount();
   });
 
-  it("does not render unvalidated running knowledge-base text", async () => {
+  it("renders a safe running knowledge-base collection status", async () => {
     mocks.hydrated = true;
     mocks.conversations = [
       {
@@ -244,7 +244,14 @@ describe("useResumePolling hydration gate", () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
 
-    expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
+    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
+      "kb-running",
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: "FrontMind 正在按业务分支进行资料采集。",
+        }),
+      ]),
+    );
     expect(mocks.updateStatus).toHaveBeenCalledWith(
       "kb-running",
       "running",

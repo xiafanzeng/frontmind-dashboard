@@ -232,7 +232,7 @@ describe("useSendMessage", () => {
     expect(result.current.uploadProgress).toBeNull();
   });
 
-  it("suppresses unvalidated running knowledge text and leaves polling to the global owner", async () => {
+  it("shows a safe running collection status and leaves polling to the global owner", async () => {
     vi.useFakeTimers();
     mocks.createKnowledgeBaseTurnTask.mockResolvedValueOnce({
       id: "test-kb-task-id",
@@ -279,7 +279,14 @@ describe("useSendMessage", () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
 
-    expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
+    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
+      "test-conv-id",
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: "FrontMind 正在按业务分支进行资料采集。",
+        }),
+      ]),
+    );
     expect(mocks.retrieveTask).not.toHaveBeenCalled();
     expect(mocks.updateStatus).toHaveBeenCalledWith(
       "test-conv-id",

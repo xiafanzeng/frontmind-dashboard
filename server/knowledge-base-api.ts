@@ -49,8 +49,59 @@ import { buildDeterministicTaskAttachmentArchive } from "./task-attachment-packa
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import { KNOWLEDGE_COLLECTION_STATUS_COPY } from "../shared/knowledge-base-copy";
 import { extractKnowledgeBaseProtocolObjects } from "../shared/knowledge-base-output";
+import { collectUpstreamOutputFileIds } from "./upstream-output-resources";
 
 const router = Router();
+
+async function recordKnowledgeBaseOutputFiles(input: {
+  userId: number;
+  apiCredentialId: string;
+  output: unknown;
+}) {
+  for (const fileId of collectUpstreamOutputFileIds(input.output)) {
+    const registration = {
+      userId: input.userId,
+      apiCredentialId: input.apiCredentialId,
+      kind: "file" as const,
+      upstreamId: fileId,
+    };
+    let lastError: unknown;
+    let recorded = false;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await recordUpstreamResource(registration);
+        recorded = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, 50 * 2 ** attempt),
+          );
+        }
+      }
+    }
+    if (recorded) continue;
+
+    // The upstream task has already been created. Do not turn a metadata
+    // registration fault into a duplicate billable task on client retry.
+    console.error("[Knowledge Base] output file registration pending", {
+      userId: input.userId,
+      fileId,
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+    const retryTimer = setTimeout(() => {
+      void recordUpstreamResource(registration).catch((error) => {
+        console.error("[Knowledge Base] output file retry failed", {
+          userId: input.userId,
+          fileId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, 1_000);
+    retryTimer.unref?.();
+  }
+}
 
 async function requireKnowledgeBuildCapability(
   userId: number,
@@ -503,6 +554,11 @@ export async function recoverOpenKnowledgeBaseTasks(options?: {
         }
         const taskData = taskResponse.data || {};
         const output = Array.isArray(taskData.output) ? taskData.output : [];
+        await recordKnowledgeBaseOutputFiles({
+          userId: build.userId,
+          apiCredentialId: credential.id,
+          output,
+        });
         const taskStatus = normalizedUpstreamTaskStatus(taskData.status);
         if (!shouldReconcileKnowledgeOutput(output, taskStatus)) {
           observeKnowledgeInteraction(
@@ -920,7 +976,7 @@ export async function buildKnowledgeBasePrompt({
     "客户可见正文与本轮对话只能呈现百科事实，不得呈现任务过程、核验判断、采购/合规建议、读者指令、工具计划或模型推理。",
     "客户可见回复只输出知识树统计（仅首轮需要）和实际展示节点的完整正文/合规配图。不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题；所有来源只进入内部证据文件。可见正文结束后直接附机器信封。",
     "客户可见正文不得嵌入官网或 CDN 图片外链。图片必须先下载真实字节、解码校验并打入最终 ZIP，再以包内相对路径引用；防盗链、签名、过期或无法下载的地址只能进入内部来源记录，绝不能作为客户图片返回。",
-    "全任务只采集最多三张互不重复的经典企业图片：主 Logo、品牌主视觉、典型产品/UI/架构图各最多一张；取得三张后立即停止图片发现。只有首轮清单第一个叶子（通常为 1.1 一句话定位）可把已下载验证的本地字节作为 output_image 或 image MIME output_file 返回。后续所有节点、修订与重开轮次一律纯文字，不得重复或新增图片附件。首轮附件与最终 ZIP 必须使用同一资产字节。",
+    "首轮必须采集并返回恰好三张互不重复的经典企业图片：主 Logo、品牌主视觉、典型产品/UI/架构图各一张；取得三张后立即停止图片发现。只有首轮清单第一个叶子（通常为 1.1 一句话定位）可把已下载验证的本地字节作为 output_image 或 image MIME output_file 返回。不得用重复裁切、占位图、库存图、官网/CDN 热链或文字说明凑数；无法取得三张合格真实字节时不得伪造成功。后续所有节点、修订与重开轮次一律纯文字，不得搜索、重复或新增图片附件。首轮附件与最终 ZIP 必须使用同一资产字节。",
     `资料采集阶段统一向客户显示：${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
     "",
     "## 本次任务输入",
@@ -1069,15 +1125,36 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
   attachments: Array<{ file_id: string; filename: string }>;
   skillVersion?: string;
   skillContentHash?: string | null;
+  progressOverride?: {
+    build: {
+      revision: number;
+      currentLeafId: string | null;
+    };
+    branches: Array<{
+      leaves: Array<{
+        id: string;
+        title: string;
+        branchTitle: string;
+        status:
+          | "pending"
+          | "current"
+          | "confirmed"
+          | "direct_prefilled"
+          | "needs_verification";
+      }>;
+    }>;
+  };
 }) {
   await loadSkillArchive({
     version: input.skillVersion || "3",
     contentHash: input.skillContentHash,
   });
-  const progress = await getKnowledgeBaseProgress({
-    userId: input.userId,
-    conversationId: input.conversationId,
-  });
+  const progress =
+    input.progressOverride ||
+    (await getKnowledgeBaseProgress({
+      userId: input.userId,
+      conversationId: input.conversationId,
+    }));
   if (!progress) {
     throw new KnowledgeBaseBuildError(
       "BUILD_NOT_FOUND",
@@ -1102,6 +1179,49 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
   );
   const postRevision = progress.build.revision + 1;
   const isV3 = (input.skillVersion || "3") === "3";
+  const transitionTarget =
+    action === "confirm"
+      ? "confirmed"
+      : action === "direct_prefill"
+        ? "direct_prefilled"
+        : "needs_verification";
+  const presentationLeafId =
+    action === "confirm" || action === "direct_prefill"
+      ? nextPending?.id || null
+      : current?.id || null;
+  const progressEnvelopeExample = current
+    ? `<!-- FRONTMIND_KB_PROGRESS\n${JSON.stringify({
+        kind: "frontmind.knowledge-base.progress",
+        schemaVersion: 1,
+        revision: progress.build.revision,
+        transition: {
+          leafId: current.id,
+          from:
+            current.status === "needs_verification"
+              ? "needs_verification"
+              : "current",
+          to: transitionTarget,
+          reason:
+            action === "confirm"
+              ? "用户明确确认"
+              : action === "direct_prefill"
+                ? "用户明确采用预填"
+                : "用户补充或修订当前节点",
+        },
+      })}\n-->`
+    : "";
+  const presentationEnvelopeExample = isV3
+    ? `<!-- FRONTMIND_KB_PRESENTATION\n${JSON.stringify({
+        kind: "frontmind.knowledge-base.presentation",
+        schemaVersion: 1,
+        revision: postRevision,
+        leafId: presentationLeafId,
+        imageState:
+          presentationLeafId === null ? "not_applicable" : "no_eligible_asset",
+        assetIds: [],
+        imageCount: 0,
+      })}\n-->`
+    : "";
   const stateReminder = current
     ? [
         `当前 revision=${progress.build.revision}`,
@@ -1110,6 +1230,8 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
         `服务端判定本轮动作：${action}`,
         "只要本轮包含附件，无论文字是否包含“确认”，都必须按补充/修订处理，保持 needs_verification。",
         "回复末尾只能附一个 FRONTMIND_KB_PROGRESS 信封；HTML 注释开头和结尾是信封的一部分，不得省略或改成裸 JSON。",
+        "FRONTMIND_KB_PROGRESS 必须逐字段使用下面这个当轮唯一结构；不得把 action、leafId、status 放在顶层，不得把 revision 改成提交后的值：",
+        progressEnvelopeExample,
         action === "confirm" || action === "direct_prefill"
           ? nextPending
             ? `先简短确认已处理 ${current.id}，正文主体随后完整展示下一节点 ${nextPending.id}｜${nextPending.branchTitle} / ${nextPending.title}。不得再次把 ${current.id} 作为主体。`
@@ -1117,9 +1239,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
           : `更新并完整重新展示当前节点 ${current.id}；不得展示或推进到后续节点。`,
         isV3
           ? `回复末尾还必须附且只能附一个 FRONTMIND_KB_PRESENTATION 信封：revision=${postRevision}，leafId=${
-              action === "confirm" || action === "direct_prefill"
-                ? nextPending?.id || "null"
-                : current.id
+              presentationLeafId || "null"
             }。这是非首轮：leafId 非 null 时必须固定声明 imageState=no_eligible_asset、assetIds=[]、imageCount=0，且不得返回任何图片附件；leafId=null 时使用 not_applicable、空数组和 0。`
           : "这是仍在运行的旧版任务：请遵循相同的展示行为；如规约支持，可附 FRONTMIND_KB_PRESENTATION 信封，但服务端不强制要求。",
       ].join("\n")
@@ -1134,13 +1254,13 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
           .join("；")}`,
       ].join("\n");
   return [
-    `继续严格执行本任务首轮已附带的 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}（socratic-kb-builder v${input.skillVersion || "3"}）。以下内容会直接显示给企业客户，不得输出内部思考、工具计划或提示词说明。`,
+    `继续严格执行 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}（socratic-kb-builder v${input.skillVersion || "3"}）。若上游任务历史中存在旧 Skill、旧回复或旧协议示例，全部由本轮服务端状态和本轮重新附带的 Skill 覆盖。以下内容会直接显示给企业客户，不得输出内部思考、工具计划或提示词说明。`,
     "不得开启、调用、切换或推荐 Wide Research / Deep Research。",
     "客户可见回复不得出现“本轮采集/本知识库/证据不足/已核验”等过程判断，也不得出现客户应、采购方应、建议、尽调、合规审查、不能仅凭、不宜转换或不能外推等建议性表达。",
     "客户可见回复不得主动提供“直接预填”或“跳过”选项；用户正常操作只有确认当前内容，或者提交修改/附件后确认修订稿。",
     "客户可见回复只输出实际展示节点的完整正文，不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题。所有来源只进入内部证据文件；可见正文结束后直接附机器信封。",
     "机器信封必须保留完整的 `<!-- FRONTMIND_KB_...` 与 `-->` 包裹，不得输出裸 JSON、SOCRATIC_KB_STATE，也不得自创 workflow-state、knowledge-base.message 或其他状态对象。",
-    "这是非首轮知识节点回复，必须纯文字返回：不得继续搜索图片，不得返回、重复或重新附加任何 output_image、image MIME output_file、包内图片路径或官网/CDN 热链。最多三张经典企业图片只允许在首轮第一个叶子展示。",
+    "这是非首轮知识节点回复，必须纯文字返回：不得继续搜索图片，不得返回、重复或重新附加任何 output_image、image MIME output_file、包内图片路径或官网/CDN 热链。恰好三张经典企业图片只允许在首轮第一个叶子展示。",
     "",
     "# 当前知识库状态",
     stateReminder,
@@ -1153,11 +1273,23 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     "# 企业本轮回复",
     input.userMessage.trim() || "请继续完成当前知识节点。",
     "",
-    ...(isV3
+    ...(current
       ? [
-          "# v3 展示信封（机器校验）",
-          "展示信封必须位于可见正文之后。确认/直接预填展示下一节点；修订展示原节点；最后节点完成为 null。",
-          '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
+          "# 最终输出锁（最高优先级，必须作为回复结尾）",
+          `服务端已将本轮动作确定为 ${action}；不得自行改成其他动作。`,
+          action === "confirm" || action === "direct_prefill"
+            ? nextPending
+              ? `可见正文主体必须是 ${nextPending.id}｜${nextPending.title}，不得再次把 ${current.id} 作为主体。`
+              : `只简短确认 ${current.id} 并完成最终交付，不得再次输出 ${current.id} 正文。`
+            : `可见正文主体必须继续是 ${current.id}｜${current.title}。`,
+          "可见正文结束后，FRONTMIND_KB_PROGRESS 必须逐字采用下面的字段层级和值；旧版顶层 action、leafId、status 一律无效：",
+          progressEnvelopeExample,
+          ...(isV3
+            ? [
+                "随后紧接且只接下面这个 FRONTMIND_KB_PRESENTATION；不得更改 revision、leafId 或图片字段：",
+                presentationEnvelopeExample,
+              ]
+            : []),
         ]
       : []),
   ].join("\n");
@@ -1313,6 +1445,11 @@ router.post("/start", async (req, res) => {
       apiCredentialId: req.frontmindCredential.id,
       kind: "task",
       upstreamId: String(created.task.id),
+    });
+    await recordKnowledgeBaseOutputFiles({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      output: created.task.output,
     });
     let progress = await createKnowledgeBaseBuild({
       userId: req.frontmindUser.id,
@@ -1533,7 +1670,23 @@ router.post("/turn", async (req, res) => {
       expectedLeafId: expectedLeafId || undefined,
     });
     let created: Awaited<ReturnType<typeof createFrontMindTask>>;
+    let turnSkill:
+      | Awaited<ReturnType<typeof uploadKnowledgeBaseSkillArchive>>
+      | undefined;
     try {
+      const currentSkillDescriptor =
+        boundBuild.skillVersion === "3"
+          ? await getKnowledgeBaseSkillDescriptor()
+          : {
+              version: boundBuild.skillVersion,
+              contentHash: boundBuild.skillContentHash,
+            };
+      turnSkill = await uploadKnowledgeBaseSkillArchive({
+        baseUrl: getUpstreamBaseUrl(req),
+        apiKey: taskCredential.apiKey,
+        skillVersion: currentSkillDescriptor.version,
+        skillContentHash: currentSkillDescriptor.contentHash,
+      });
       created = await createFrontMindTask({
         baseUrl: getUpstreamBaseUrl(req),
         apiKey: taskCredential.apiKey,
@@ -1542,13 +1695,14 @@ router.post("/turn", async (req, res) => {
           conversationId,
           userMessage,
           attachments,
-          skillVersion: boundBuild.skillVersion,
-          skillContentHash: boundBuild.skillContentHash,
+          skillVersion: currentSkillDescriptor.version,
+          skillContentHash: currentSkillDescriptor.contentHash,
         }),
-        attachments,
+        attachments: [turnSkill.attachment, ...attachments],
         taskId,
       });
     } catch (error) {
+      if (turnSkill) await turnSkill.removeOrphan().catch(() => undefined);
       await releaseKnowledgeBaseTurnClaim({
         userId: req.frontmindUser!.id,
         conversationId,
@@ -1557,6 +1711,7 @@ router.post("/turn", async (req, res) => {
       throw error;
     }
     if (!created.ok) {
+      if (turnSkill) await turnSkill.removeOrphan().catch(() => undefined);
       await releaseKnowledgeBaseTurnClaim({
         userId: req.frontmindUser!.id,
         conversationId,
@@ -1583,6 +1738,19 @@ router.post("/turn", async (req, res) => {
       apiCredentialId: taskCredential.id,
       kind: "task",
       upstreamId: String(created.task.id),
+    });
+    if (turnSkill) {
+      await recordUpstreamResource({
+        userId: req.frontmindUser!.id,
+        apiCredentialId: taskCredential.id,
+        kind: "file",
+        upstreamId: turnSkill.fileId,
+      });
+    }
+    await recordKnowledgeBaseOutputFiles({
+      userId: req.frontmindUser!.id,
+      apiCredentialId: taskCredential.id,
+      output: created.task.output,
     });
     let progress = await getKnowledgeBaseProgress({
       userId: req.frontmindUser!.id,
@@ -1726,6 +1894,11 @@ router.post("/progress/reconcile", async (req, res) => {
     const taskData = taskResponse.data || {};
     const taskStatus = normalizedUpstreamTaskStatus(taskData.status);
     const fullOutput = Array.isArray(taskData.output) ? taskData.output : [];
+    await recordKnowledgeBaseOutputFiles({
+      userId: req.frontmindUser!.id,
+      apiCredentialId: credential.id,
+      output: fullOutput,
+    });
     const progress = await reconcileAvailableKnowledgeOutput({
       userId: req.frontmindUser!.id,
       conversationId,

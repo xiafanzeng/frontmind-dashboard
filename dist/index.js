@@ -4406,7 +4406,7 @@ var dashboardOptimizationReportSchema = z3.object({
   questionBaselines: z3.array(dashboardOptimizationBaselineSchema).max(500).optional(),
   questionReports: z3.array(dashboardOptimizationQuestionReportSchema).max(500).optional()
 }).superRefine((report, context) => {
-  const ensureUnique = (values, path11) => {
+  const ensureUnique = (values, path12) => {
     const seen = /* @__PURE__ */ new Set();
     values.forEach((value, index2) => {
       if (!value || !seen.has(value)) {
@@ -4416,9 +4416,9 @@ var dashboardOptimizationReportSchema = z3.object({
       context.addIssue({
         code: "custom",
         path: [
-          path11,
+          path12,
           index2,
-          path11 === "questionBaselines" ? "questionId" : "id"
+          path12 === "questionBaselines" ? "questionId" : "id"
         ],
         message: "\u540C\u4E00\u95EE\u9898\u53EA\u80FD\u53D1\u5E03\u4E00\u4EFD\u62A5\u544A"
       });
@@ -4711,8 +4711,8 @@ var websitePurchaseRequestV2Schema = z4.object({
       "service startsAt must match order paidAt"
     ]
   ];
-  for (const [valid, path11, message] of checks) {
-    if (!valid) context.addIssue({ code: "custom", path: path11, message });
+  for (const [valid, path12, message] of checks) {
+    if (!valid) context.addIssue({ code: "custom", path: path12, message });
   }
 });
 var purchaseStatusSchema = z4.enum([
@@ -9886,6 +9886,161 @@ async function getPresalesCreditUsage(windowDays = CREDIT_USAGE_LOOKBACK_DAYS) {
 import { randomUUID as randomUUID7 } from "node:crypto";
 import { and as and8, desc as desc8, eq as eq9, inArray as inArray5, lt as lt2 } from "drizzle-orm";
 
+// server/knowledge-snapshot-archive-store.ts
+import { createHash as createHash5 } from "node:crypto";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+var MAX_KNOWLEDGE_SNAPSHOT_ARCHIVE_BYTES = 250 * 1024 * 1024;
+var KnowledgeSnapshotArchiveError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "KnowledgeSnapshotArchiveError";
+  }
+};
+function dashboardAssetRoot() {
+  return path.resolve(
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path.join(process.cwd(), ".frontmind-dashboard-assets")
+  );
+}
+function assertSnapshotIdentity(userId, snapshotId) {
+  if (!Number.isInteger(userId) || userId <= 0) {
+    throw new KnowledgeSnapshotArchiveError(
+      "ARCHIVE_INVALID",
+      "\u77E5\u8BC6\u5E93\u5F52\u6863\u6240\u5C5E\u7528\u6237\u65E0\u6548"
+    );
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    snapshotId
+  )) {
+    throw new KnowledgeSnapshotArchiveError(
+      "ARCHIVE_INVALID",
+      "\u77E5\u8BC6\u5E93\u7248\u672C\u6807\u8BC6\u65E0\u6548"
+    );
+  }
+}
+function knowledgeSnapshotArchiveStorageKey(userId, snapshotId) {
+  assertSnapshotIdentity(userId, snapshotId);
+  return path.join("knowledge-archives", String(userId), `${snapshotId}.zip`);
+}
+function archiveAbsolutePath(userId, snapshotId) {
+  const root = dashboardAssetRoot();
+  const absolutePath = path.resolve(
+    root,
+    knowledgeSnapshotArchiveStorageKey(userId, snapshotId)
+  );
+  if (!absolutePath.startsWith(`${root}${path.sep}`)) {
+    throw new KnowledgeSnapshotArchiveError(
+      "ARCHIVE_INVALID",
+      "\u77E5\u8BC6\u5E93\u5F52\u6863\u8DEF\u5F84\u65E0\u6548"
+    );
+  }
+  return absolutePath;
+}
+function hasZipMagic(buffer) {
+  if (buffer.length < 4 || buffer[0] !== 80 || buffer[1] !== 75) {
+    return false;
+  }
+  return buffer[2] === 3 && buffer[3] === 4 || buffer[2] === 5 && buffer[3] === 6 || buffer[2] === 7 && buffer[3] === 8;
+}
+function sha2562(buffer) {
+  return createHash5("sha256").update(buffer).digest("hex");
+}
+function assertArchiveBytes(input) {
+  if (input.buffer.length === 0 || input.buffer.length > MAX_KNOWLEDGE_SNAPSHOT_ARCHIVE_BYTES || !hasZipMagic(input.buffer)) {
+    throw new KnowledgeSnapshotArchiveError(
+      "ARCHIVE_INVALID",
+      "\u77E5\u8BC6\u5E93\u6210\u54C1\u4E0D\u662F\u6709\u6548\u7684 ZIP \u5F52\u6863"
+    );
+  }
+  if (input.expectedBytes !== void 0 && input.buffer.length !== input.expectedBytes) {
+    throw new KnowledgeSnapshotArchiveError(
+      "ARCHIVE_INTEGRITY_MISMATCH",
+      "\u77E5\u8BC6\u5E93 ZIP \u5B57\u8282\u6570\u4E0E\u5DF2\u53D1\u5E03\u7248\u672C\u4E0D\u4E00\u81F4"
+    );
+  }
+  if (!/^[a-f0-9]{64}$/i.test(input.expectedSha256) || sha2562(input.buffer) !== input.expectedSha256.toLowerCase()) {
+    throw new KnowledgeSnapshotArchiveError(
+      "ARCHIVE_INTEGRITY_MISMATCH",
+      "\u77E5\u8BC6\u5E93 ZIP \u54C8\u5E0C\u4E0E\u5DF2\u53D1\u5E03\u7248\u672C\u4E0D\u4E00\u81F4"
+    );
+  }
+}
+async function persistKnowledgeSnapshotArchive(input) {
+  assertArchiveBytes({
+    buffer: input.buffer,
+    expectedSha256: input.expectedSha256
+  });
+  const absolutePath = archiveAbsolutePath(input.userId, input.snapshotId);
+  await mkdir(path.dirname(absolutePath), { recursive: true });
+  try {
+    await writeFile(absolutePath, input.buffer, { flag: "wx", mode: 384 });
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    const existing = await readFile(absolutePath);
+    assertArchiveBytes({
+      buffer: existing,
+      expectedSha256: input.expectedSha256
+    });
+  }
+  return knowledgeSnapshotArchiveStorageKey(input.userId, input.snapshotId);
+}
+async function readKnowledgeSnapshotArchive(input) {
+  const absolutePath = archiveAbsolutePath(input.userId, input.snapshotId);
+  let archiveStat;
+  try {
+    archiveStat = await stat(absolutePath);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      throw new KnowledgeSnapshotArchiveError(
+        "ARCHIVE_NOT_FOUND",
+        "\u8BE5\u77E5\u8BC6\u5E93\u7248\u672C\u5C1A\u65E0\u53EF\u4E0B\u8F7D\u7684 ZIP \u5F52\u6863"
+      );
+    }
+    throw error;
+  }
+  if (!archiveStat.isFile() || archiveStat.size <= 0 || archiveStat.size > MAX_KNOWLEDGE_SNAPSHOT_ARCHIVE_BYTES || archiveStat.size !== input.expectedBytes) {
+    throw new KnowledgeSnapshotArchiveError(
+      "ARCHIVE_INTEGRITY_MISMATCH",
+      "\u77E5\u8BC6\u5E93 ZIP \u6587\u4EF6\u5927\u5C0F\u4E0E\u5DF2\u53D1\u5E03\u7248\u672C\u4E0D\u4E00\u81F4"
+    );
+  }
+  const buffer = await readFile(absolutePath);
+  assertArchiveBytes({
+    buffer,
+    expectedSha256: input.expectedSha256,
+    expectedBytes: input.expectedBytes
+  });
+  return buffer;
+}
+async function isKnowledgeSnapshotArchiveAvailable(input) {
+  const absolutePath = archiveAbsolutePath(input.userId, input.snapshotId);
+  let archiveStat;
+  try {
+    archiveStat = await stat(absolutePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!archiveStat.isFile() || archiveStat.size <= 0 || archiveStat.size > MAX_KNOWLEDGE_SNAPSHOT_ARCHIVE_BYTES) {
+    return false;
+  }
+  return input.expectedBytes === void 0 || archiveStat.size === input.expectedBytes;
+}
+async function removeKnowledgeSnapshotArchive(input) {
+  try {
+    await unlink(archiveAbsolutePath(input.userId, input.snapshotId));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+function knowledgeArchiveContentDisposition(filename) {
+  const safe = path.basename(String(filename || "")).replace(/[\\/\0"\r\n]/g, "_").trim() || "knowledge-base.zip";
+  const zipName = safe.toLowerCase().endsWith(".zip") ? safe : `${safe}.zip`;
+  const encoded = encodeURIComponent(zipName);
+  return `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`;
+}
+
 // server/admin-control-plane-service.ts
 import { randomUUID as randomUUID6 } from "node:crypto";
 import { and as and7, desc as desc7, eq as eq8, gte as gte2, inArray as inArray4, isNull as isNull2, lt, or } from "drizzle-orm";
@@ -10877,14 +11032,23 @@ async function rollbackDashboardContentRevision(input) {
     revision: nextRevision
   };
 }
-function publicSnapshot(snapshot) {
+function publicSnapshot(snapshot, archiveAvailable) {
   return {
     ...snapshot,
+    archiveAvailable,
     assets: snapshot.assets.map((asset, index2) => ({
       ...asset,
       url: asset.id ? `/api/dashboard/knowledge/assets/${snapshot.id}/by-id/${encodeURIComponent(asset.id)}` : `/api/dashboard/knowledge/assets/${snapshot.id}/${index2}`
     }))
   };
+}
+async function publicKnowledgeSnapshot(snapshot) {
+  const archiveAvailable = snapshot.sourceFileName.toLowerCase().endsWith(".zip") && /^[a-f0-9]{64}$/i.test(snapshot.archiveHash || "") && await isKnowledgeSnapshotArchiveAvailable({
+    userId: snapshot.userId,
+    snapshotId: snapshot.id,
+    expectedBytes: snapshot.totalBytes
+  });
+  return publicSnapshot(snapshot, archiveAvailable);
 }
 async function getLatestKnowledgeSnapshot(userId) {
   const db = await requireDb4();
@@ -10894,7 +11058,7 @@ async function getLatestKnowledgeSnapshot(userId) {
       eq9(knowledgeBaseSnapshots.status, "active")
     )
   ).orderBy(desc8(knowledgeBaseSnapshots.version)).limit(1);
-  return rows[0] ? publicSnapshot(rows[0]) : null;
+  return rows[0] ? publicKnowledgeSnapshot(rows[0]) : null;
 }
 async function getKnowledgeSnapshotById(input) {
   const db = await requireDb4();
@@ -10904,7 +11068,15 @@ async function getKnowledgeSnapshotById(input) {
       eq9(knowledgeBaseSnapshots.userId, input.userId)
     )
   ).limit(1);
-  return rows[0] ? publicSnapshot(rows[0]) : null;
+  return rows[0] ? publicKnowledgeSnapshot(rows[0]) : null;
+}
+async function getKnowledgeSnapshotForWorkspace(input) {
+  const db = await requireDb4();
+  const rows = await db.select().from(knowledgeBaseSnapshots).where(eq9(knowledgeBaseSnapshots.id, input.snapshotId)).limit(1);
+  const snapshot = rows[0];
+  if (!snapshot) return null;
+  await assertWorkspaceAccess(input.actor, snapshot.userId);
+  return publicKnowledgeSnapshot(snapshot);
 }
 async function getKnowledgeAsset(input) {
   const db = await requireDb4();
@@ -11582,11 +11754,11 @@ async function getManagedCredentialStatus(actor, userId) {
 }
 
 // server/knowledge-base-progress-service.ts
-import { createHash as createHash6, randomUUID as randomUUID8 } from "node:crypto";
+import { createHash as createHash7, randomUUID as randomUUID8 } from "node:crypto";
 import { and as and9, asc as asc3, desc as desc9, eq as eq10, isNotNull as isNotNull2, isNull as isNull3 } from "drizzle-orm";
 
 // server/knowledge-base-artifact.ts
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash6 } from "node:crypto";
 var MAX_ARCHIVE_CANDIDATES = 32;
 var MAX_FILE_ID_LENGTH = 255;
 var MAX_FILENAME_LENGTH = 512;
@@ -11660,11 +11832,11 @@ function collectKnowledgeArchiveDescriptors(output) {
   return descriptors;
 }
 function knowledgeArchiveDescriptorHash(descriptor) {
-  return createHash5("sha256").update(
+  return createHash6("sha256").update(
     JSON.stringify({
       outputItemId: descriptor.outputItemId,
       fileId: descriptor.fileId || null,
-      urlHash: descriptor.fileId ? null : createHash5("sha256").update(descriptor.url || "").digest("hex"),
+      urlHash: descriptor.fileId ? null : createHash6("sha256").update(descriptor.url || "").digest("hex"),
       filename: descriptor.filename,
       mimeType: descriptor.mimeType
     })
@@ -11756,6 +11928,38 @@ function collectKnowledgeBaseOutputImageKeys(value, result = /* @__PURE__ */ new
   }
   return result;
 }
+function collectKnowledgeBaseOutputImageResourceAliases(value, result = /* @__PURE__ */ new Set(), depth = 0) {
+  if (value === null || value === void 0 || depth > 50) return result;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectKnowledgeBaseOutputImageResourceAliases(item, result, depth + 1);
+    }
+    return result;
+  }
+  if (!isRecord2(value)) return result;
+  const type = stringValue(value.type).toLowerCase();
+  const mimeType = stringValue(
+    value.mimeType || value.mime_type || value.content_type
+  ).toLowerCase();
+  const fileName = stringValue(
+    value.fileName || value.file_name || value.filename || value.name
+  );
+  const resourceId = stringValue(value.fileId || value.file_id);
+  const resourceUrl = stringValue(
+    value.fileUrl || value.file_url || value.imageUrl || value.image_url || value.url
+  );
+  const isImage = type === "output_image" || type === "image" || mimeType.startsWith("image/") || /\.(?:avif|gif|jpe?g|png|svg|webp)$/i.test(fileName);
+  if (isImage) {
+    if (resourceId) result.add(resourceId);
+    if (resourceUrl) result.add(resourceUrl);
+  }
+  for (const item of Object.values(value)) {
+    if (item && typeof item === "object") {
+      collectKnowledgeBaseOutputImageResourceAliases(item, result, depth + 1);
+    }
+  }
+  return result;
+}
 function latestKnowledgeBasePresentationOutput(output) {
   if (!Array.isArray(output)) return output;
   const assistantIndexes = output.flatMap(
@@ -11800,10 +12004,10 @@ function assertKnowledgeBaseInitialImageDelivery(output) {
   const imageCount = collectKnowledgeBaseOutputImageKeys(
     latestKnowledgeBasePresentationOutput(output)
   ).size;
-  if (imageCount > 3) {
+  if (imageCount !== 3) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
-      "\u9996\u4E2A\u77E5\u8BC6\u8282\u70B9\u6700\u591A\u53EA\u80FD\u5C55\u793A\u4E09\u5F20\u4E92\u4E0D\u91CD\u590D\u7684\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247"
+      `\u9996\u4E2A\u77E5\u8BC6\u8282\u70B9\u5FC5\u987B\u5C55\u793A\u6070\u597D\u4E09\u5F20\u4E92\u4E0D\u91CD\u590D\u7684\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`
     );
   }
 }
@@ -11869,7 +12073,7 @@ function assertKnowledgeBaseCustomerOutput(output) {
   return text2;
 }
 function reconciliationHash(input) {
-  return createHash6("sha256").update(
+  return createHash7("sha256").update(
     JSON.stringify({
       output: input.output,
       userText: input.userText,
@@ -14293,7 +14497,7 @@ async function getMonitoringFilterOptions(userId, quotaPeriodIds, filters = {}) 
 
 // server/manual-service-order-service.ts
 import {
-  createHash as createHash7,
+  createHash as createHash8,
   createHmac as createHmac2,
   randomUUID as randomUUID10,
   timingSafeEqual as timingSafeEqual3
@@ -14462,8 +14666,8 @@ function canonicalJson3(value) {
   const record = value;
   return `{${Object.keys(record).filter((key) => record[key] !== void 0).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson3(record[key])}`).join(",")}}`;
 }
-function sha2562(value) {
-  return createHash7("sha256").update(value, "utf8").digest("hex");
+function sha2563(value) {
+  return createHash8("sha256").update(value, "utf8").digest("hex");
 }
 function hmac(value, secret) {
   return createHmac2("sha256", secret).update(canonicalJson3(value), "utf8").digest("hex");
@@ -14701,7 +14905,7 @@ function createManualServiceOrderService(options = {}) {
     async create(input) {
       const value = createManualServiceOrderRequestSchema.parse(input.request);
       const secret = configuredSecret(input.secret ?? options.secret);
-      const keyHash = sha2562(input.idempotencyKey.trim());
+      const keyHash = sha2563(input.idempotencyKey.trim());
       const requestHash3 = hmac(value, secret);
       const repo = await repository();
       const existing = await repo.findByCreateKey(keyHash);
@@ -14893,7 +15097,7 @@ function createManualServiceOrderService(options = {}) {
     async recordPayment(input) {
       const value = manualServicePaymentRequestSchema.parse(input.request);
       const secret = configuredSecret(input.secret ?? options.secret);
-      const paymentKeyHash = sha2562(input.idempotencyKey.trim());
+      const paymentKeyHash = sha2563(input.idempotencyKey.trim());
       const paymentRequestHash = hmac(value, secret);
       const row = await (await repository()).mutate(input.reference, async (current) => {
         if (current.status === "account_setup_required" || current.status === "activation_required" || current.status === "active") {
@@ -14938,7 +15142,7 @@ function createManualServiceOrderService(options = {}) {
     async setupAccount(input) {
       const value = manualServiceAccountSetupRequestSchema.parse(input.request);
       const secret = configuredSecret(input.secret ?? options.secret);
-      const accountKeyHash = sha2562(input.idempotencyKey.trim());
+      const accountKeyHash = sha2563(input.idempotencyKey.trim());
       const accountRequestHash = hmac(value, secret);
       const customerPasswordHash = value.account.mode === "create" ? await hashCustomerPassword(value.account.password) : null;
       let purchase;
@@ -15876,7 +16080,7 @@ async function setManagedAdminAccessLevel(input, dependencies = {}) {
 }
 
 // server/delivery-ticket-service.ts
-import { createHash as createHash8, randomUUID as randomUUID12 } from "node:crypto";
+import { createHash as createHash9, randomUUID as randomUUID12 } from "node:crypto";
 import {
   and as and13,
   asc as asc7,
@@ -16267,7 +16471,7 @@ async function assertWebsiteTicketWorkflow(executor, userId, value) {
   );
 }
 function technicalTicketDedupeKey(input) {
-  return createHash8("sha256").update(
+  return createHash9("sha256").update(
     `${nonEmpty(input.category) ?? "general_request"}\0${normalizeTargetPage(input.targetPage)}`
   ).digest("hex");
 }
@@ -19431,7 +19635,7 @@ async function adjustDeliveryTicketQuota(input) {
 }
 
 // server/delivery-redirect-service.ts
-import { createHash as createHash9, randomUUID as randomUUID14 } from "node:crypto";
+import { createHash as createHash10, randomUUID as randomUUID14 } from "node:crypto";
 import axios from "axios";
 import ExcelJS from "exceljs";
 import { and as and16, eq as eq19 } from "drizzle-orm";
@@ -19695,12 +19899,12 @@ async function parseRedirectWorkbook(data) {
   for (const row of rows) {
     if (invalidRows.has(row.row) || globallyVisited.has(row.sourceUrl))
       continue;
-    const path11 = /* @__PURE__ */ new Map();
+    const path12 = /* @__PURE__ */ new Map();
     let current = row;
     while (current && !invalidRows.has(current.row)) {
-      if (path11.has(current.sourceUrl)) {
-        const cycleStart = path11.get(current.sourceUrl);
-        const cycleRows = [...path11.entries()].filter(([, position]) => position >= cycleStart).map(([source]) => nextBySource.get(source)).filter(Boolean);
+      if (path12.has(current.sourceUrl)) {
+        const cycleStart = path12.get(current.sourceUrl);
+        const cycleRows = [...path12.entries()].filter(([, position]) => position >= cycleStart).map(([source]) => nextBySource.get(source)).filter(Boolean);
         for (const cycleRow of cycleRows) invalidRows.add(cycleRow.row);
         errors.push({
           row: current.row,
@@ -19709,10 +19913,10 @@ async function parseRedirectWorkbook(data) {
         break;
       }
       if (globallyVisited.has(current.sourceUrl)) break;
-      path11.set(current.sourceUrl, path11.size);
+      path12.set(current.sourceUrl, path12.size);
       current = nextBySource.get(current.targetUrl);
     }
-    for (const source of path11.keys()) globallyVisited.add(source);
+    for (const source of path12.keys()) globallyVisited.add(source);
   }
   const validRows = rows.filter((row) => !invalidRows.has(row.row));
   return {
@@ -19800,7 +20004,7 @@ async function previewRedirectWorkbook(input) {
   await assertWorkspaceAccess(input.actor, input.userId);
   assertDeliveryTicketServiceEligibility(await getServicePortal(input.userId));
   const buffer = await downloadOwnedFile(input.actor.id, input.fileId);
-  const fileHash = createHash9("sha256").update(buffer).digest("hex");
+  const fileHash = createHash10("sha256").update(buffer).digest("hex");
   const now = /* @__PURE__ */ new Date();
   const db = await requireDb11();
   const existingRows = await db.select().from(deliveryRedirectPreviews).where(
@@ -25757,11 +25961,11 @@ async function getHistoricalQuestionResults(input, dependencies = DEFAULT_DEPEND
 
 // server/knowledge-base-reset-service.ts
 import { randomUUID as randomUUID18 } from "node:crypto";
-import { unlink } from "node:fs/promises";
-import path from "node:path";
+import { unlink as unlink2 } from "node:fs/promises";
+import path2 from "node:path";
 import { and as and20, desc as desc18, eq as eq23, inArray as inArray13, lt as lt5, or as or5, sql as sql4 } from "drizzle-orm";
-var dashboardAssetRoot = path.resolve(
-  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path.join(process.cwd(), ".frontmind-dashboard-assets")
+var dashboardAssetRoot2 = path2.resolve(
+  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path2.join(process.cwd(), ".frontmind-dashboard-assets")
 );
 async function requireDb14() {
   const db = await getDb();
@@ -25775,6 +25979,16 @@ async function requireDb14() {
 }
 function persistedConversationId(userId, publicId2) {
   return `u${userId}:${publicId2}`;
+}
+function knowledgeSnapshotCleanupStorageKeys(userId, snapshots) {
+  return Array.from(
+    new Set(
+      snapshots.flatMap((snapshot) => [
+        ...snapshot.assets.map((asset) => asset.key).filter(Boolean),
+        knowledgeSnapshotArchiveStorageKey(userId, snapshot.id)
+      ])
+    )
+  );
 }
 async function getKnowledgeCounts(executor, userId) {
   const [builds, snapshots, receipts] = await Promise.all([
@@ -26135,12 +26349,9 @@ async function decideKnowledgeReset(input) {
     const receiptTaskIds = counts.receipts.map((receipt) => receipt.taskId).filter((id) => Boolean(id));
     const receiptFileIds = counts.receipts.map((receipt) => receipt.fileId).filter((id) => Boolean(id));
     const receiptResourceIds = [...receiptTaskIds, ...receiptFileIds];
-    const localAssetKeys = Array.from(
-      new Set(
-        counts.snapshots.flatMap(
-          (snapshot) => snapshot.assets.map((asset) => asset.key).filter(Boolean)
-        )
-      )
+    const localAssetKeys = knowledgeSnapshotCleanupStorageKeys(
+      row.request.userId,
+      counts.snapshots
     );
     const [conversationRows, attachmentRows2, resourceRows] = await Promise.all([
       storedIds.length ? tx.select({ id: conversations.id }).from(conversations).where(
@@ -26309,12 +26520,12 @@ async function processKnowledgeResetCleanupJobs() {
   for (const job of jobs) {
     try {
       if (job.kind === "local_asset") {
-        const assetPath = path.resolve(dashboardAssetRoot, job.upstreamId);
-        if (!assetPath.startsWith(`${dashboardAssetRoot}${path.sep}`)) {
+        const assetPath = path2.resolve(dashboardAssetRoot2, job.upstreamId);
+        if (!assetPath.startsWith(`${dashboardAssetRoot2}${path2.sep}`)) {
           throw new Error("\u77E5\u8BC6\u5E93\u672C\u5730\u8D44\u6E90\u8DEF\u5F84\u65E0\u6548");
         }
         try {
-          await unlink(assetPath);
+          await unlink2(assetPath);
         } catch (error) {
           if (error.code !== "ENOENT") throw error;
         }
@@ -27107,7 +27318,7 @@ async function createContext(opts) {
 import express from "express";
 import fs2 from "fs";
 import { nanoid } from "nanoid";
-import path3 from "path";
+import path4 from "path";
 import { createServer as createViteServer } from "vite";
 
 // vite.config.ts
@@ -27115,11 +27326,11 @@ import { jsxLocPlugin } from "@builder.io/vite-plugin-jsx-loc";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import fs from "node:fs";
-import path2 from "node:path";
+import path3 from "node:path";
 import { execFileSync } from "node:child_process";
 import { defineConfig } from "vite";
 var PROJECT_ROOT = import.meta.dirname;
-var LOG_DIR = path2.join(PROJECT_ROOT, ".frontmind-logs");
+var LOG_DIR = path3.join(PROJECT_ROOT, ".frontmind-logs");
 var MAX_LOG_SIZE_BYTES = 1 * 1024 * 1024;
 var TRIM_TARGET_BYTES = Math.floor(MAX_LOG_SIZE_BYTES * 0.6);
 function ensureLogDir() {
@@ -27150,7 +27361,7 @@ function trimLogFile(logPath, maxSize) {
 function writeToLogFile(source, entries) {
   if (entries.length === 0) return;
   ensureLogDir();
-  const logPath = path2.join(LOG_DIR, `${source}.log`);
+  const logPath = path3.join(LOG_DIR, `${source}.log`);
   const lines = entries.map((entry) => {
     const ts = (/* @__PURE__ */ new Date()).toISOString();
     return `[${ts}] ${JSON.stringify(entry)}`;
@@ -27285,12 +27496,12 @@ function vitePluginProductionPublicAssets() {
       output: `assets/aliyun-icp-guide/${filename}`
     }))
   ];
-  const publicDirectory = path2.resolve(import.meta.dirname, "client/public");
+  const publicDirectory = path3.resolve(import.meta.dirname, "client/public");
   return {
     name: "frontmind-production-public-assets",
     generateBundle() {
       for (const asset of allowedAssets) {
-        const assetPath = path2.join(publicDirectory, asset.source);
+        const assetPath = path3.join(publicDirectory, asset.source);
         if (!fs.existsSync(assetPath)) {
           this.error(
             `Required production public asset is missing: ${asset.source}`
@@ -27333,19 +27544,19 @@ var vite_config_default = defineConfig(({ mode }) => {
     plugins,
     resolve: {
       alias: {
-        "@": path2.resolve(import.meta.dirname, "client", "src"),
-        "@shared": path2.resolve(import.meta.dirname, "shared"),
-        "@assets": path2.resolve(import.meta.dirname, "attached_assets")
+        "@": path3.resolve(import.meta.dirname, "client", "src"),
+        "@shared": path3.resolve(import.meta.dirname, "shared"),
+        "@assets": path3.resolve(import.meta.dirname, "attached_assets")
       }
     },
     define: {
       __FRONTMIND_BUILD_VERSION__: JSON.stringify(buildVersion)
     },
-    envDir: path2.resolve(import.meta.dirname),
-    root: path2.resolve(import.meta.dirname, "client"),
-    publicDir: isProduction ? false : path2.resolve(import.meta.dirname, "client", "public"),
+    envDir: path3.resolve(import.meta.dirname),
+    root: path3.resolve(import.meta.dirname, "client"),
+    publicDir: isProduction ? false : path3.resolve(import.meta.dirname, "client", "public"),
     build: {
-      outDir: path2.resolve(import.meta.dirname, "dist/public"),
+      outDir: path3.resolve(import.meta.dirname, "dist/public"),
       emptyOutDir: true
     },
     server: {
@@ -27382,7 +27593,7 @@ async function setupVite(app, server) {
   app.use("*", async (req, res, next) => {
     const url = req.originalUrl;
     try {
-      const clientTemplate = path3.resolve(
+      const clientTemplate = path4.resolve(
         import.meta.dirname,
         "../..",
         "client",
@@ -27402,7 +27613,7 @@ async function setupVite(app, server) {
   });
 }
 function serveStatic(app) {
-  const distPath = process.env.NODE_ENV === "development" ? path3.resolve(import.meta.dirname, "../..", "dist", "public") : path3.resolve(import.meta.dirname, "public");
+  const distPath = process.env.NODE_ENV === "development" ? path4.resolve(import.meta.dirname, "../..", "dist", "public") : path4.resolve(import.meta.dirname, "public");
   if (!fs2.existsSync(distPath)) {
     console.error(
       `Could not find the build directory: ${distPath}, make sure to build the client first`
@@ -27412,11 +27623,11 @@ function serveStatic(app) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-    res.sendFile(path3.resolve(distPath, "__frontmind__", "version.json"));
+    res.sendFile(path4.resolve(distPath, "__frontmind__", "version.json"));
   });
   app.use(
     "/assets",
-    express.static(path3.resolve(distPath, "assets"), {
+    express.static(path4.resolve(distPath, "assets"), {
       maxAge: "1y",
       immutable: true
     })
@@ -27432,7 +27643,7 @@ function serveStatic(app) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-    res.sendFile(path3.resolve(distPath, "index.html"));
+    res.sendFile(path4.resolve(distPath, "index.html"));
   });
 }
 
@@ -27589,11 +27800,11 @@ function safeErrorForLog(error, options = {}) {
 
 // server/prepared-file-service.ts
 import axios2 from "axios";
-import { createHash as createHash10 } from "node:crypto";
+import { createHash as createHash11 } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import fs3 from "node:fs/promises";
-import path4 from "node:path";
+import path5 from "node:path";
 import { Worker } from "node:worker_threads";
 var THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1e3;
 var FIVE_MINUTES_MS = 5 * 60 * 1e3;
@@ -27636,7 +27847,7 @@ function stableExternalIdentity(url) {
 }
 function createPreparedAssetId(ownerUserId, credentialId, source, projectAssignmentId) {
   const sourceIdentity = source.kind === "file" ? `file:${source.fileId}` : `external:${stableExternalIdentity(source.url)}`;
-  return createHash10("sha256").update(
+  return createHash11("sha256").update(
     `frontmind-pdf-v1\0${ownerUserId}\0${credentialId}\0${sourceIdentity}${projectAssignmentId ? `\0project-assignment:${projectAssignmentId}` : ""}`
   ).digest("hex").slice(0, 40);
 }
@@ -27671,13 +27882,13 @@ async function fileExists(filePath) {
 }
 async function pathSize(targetPath) {
   try {
-    const stat2 = await fs3.stat(targetPath);
-    if (stat2.isFile()) return stat2.size;
-    if (!stat2.isDirectory()) return 0;
+    const stat3 = await fs3.stat(targetPath);
+    if (stat3.isFile()) return stat3.size;
+    if (!stat3.isDirectory()) return 0;
     const entries = await fs3.readdir(targetPath);
     let total = 0;
     for (const entry of entries) {
-      total += await pathSize(path4.join(targetPath, entry));
+      total += await pathSize(path5.join(targetPath, entry));
     }
     return total;
   } catch {
@@ -27693,7 +27904,7 @@ async function commandAvailable(command, args) {
 }
 async function hashFile(filePath) {
   return new Promise((resolve, reject) => {
-    const hash = createHash10("sha256");
+    const hash = createHash11("sha256");
     const stream = createReadStream(filePath);
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("error", reject);
@@ -27710,7 +27921,7 @@ var PreparedFileService = class {
     this.initPromise = null;
     this.processing = 0;
     this.cleanupTimer = null;
-    this.rootDir = rootDir || process.env.FRONTMIND_PREPARED_FILE_DIR || (process.env.NODE_ENV === "production" ? "/var/lib/frontmind/prepared-files" : path4.resolve(process.cwd(), ".frontmind-prepared-files"));
+    this.rootDir = rootDir || process.env.FRONTMIND_PREPARED_FILE_DIR || (process.env.NODE_ENV === "production" ? "/var/lib/frontmind/prepared-files" : path5.resolve(process.cwd(), ".frontmind-prepared-files"));
     this.workerConcurrency = finitePositiveInteger(
       process.env.FRONTMIND_PDF_WORKERS,
       1
@@ -27748,7 +27959,7 @@ var PreparedFileService = class {
     }
     const entries = await fs3.readdir(this.rootDir, { withFileTypes: true });
     for (const entry of entries) {
-      const fullPath = path4.join(this.rootDir, entry.name);
+      const fullPath = path5.join(this.rootDir, entry.name);
       if (entry.isDirectory() && (entry.name.endsWith(".work") || entry.name.endsWith(".tmp-work"))) {
         await fs3.rm(fullPath, { recursive: true, force: true });
         continue;
@@ -28394,22 +28605,62 @@ var PreparedFileService = class {
     ]);
   }
   manifestPath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.json`);
+    return path5.join(this.rootDir, `${assetId}.json`);
   }
   sourcePath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.source.tmp`);
+    return path5.join(this.rootDir, `${assetId}.source.tmp`);
   }
   preparedTempPath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.prepared.tmp`);
+    return path5.join(this.rootDir, `${assetId}.prepared.tmp`);
   }
   pdfPath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.pdf`);
+    return path5.join(this.rootDir, `${assetId}.pdf`);
   }
   workPath(assetId) {
-    return path4.join(this.rootDir, `${assetId}.work`);
+    return path5.join(this.rootDir, `${assetId}.work`);
   }
 };
 var preparedFileService = new PreparedFileService();
+
+// server/upstream-output-resources.ts
+function normalizedUpstreamFileId(value) {
+  const normalized = value.trim();
+  return normalized.length > 0 && normalized.length <= 255 && !/[\s/?#\u0000-\u001f\u007f]/u.test(normalized) ? normalized : "";
+}
+function collectUpstreamOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
+  if (value === null || value === void 0 || depth > 50) return ids;
+  if (typeof value === "string") {
+    if ((currentKey === "file_id" || currentKey === "fileId") && value) {
+      const fileId = normalizedUpstreamFileId(value);
+      if (fileId) ids.add(fileId);
+    }
+    if (currentKey === "url" || currentKey === "file_url" || currentKey === "fileUrl" || currentKey === "image_url" || currentKey === "imageUrl") {
+      const match = value.match(/\/v1\/files\/([^/?#]+)/);
+      if (match?.[1]) {
+        try {
+          const fileId = normalizedUpstreamFileId(decodeURIComponent(match[1]));
+          if (fileId) ids.add(fileId);
+        } catch {
+        }
+      }
+    }
+    return ids;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectUpstreamOutputFileIds(item, ids, void 0, depth + 1);
+    }
+    return ids;
+  }
+  if (typeof value === "object") {
+    for (const [key, item] of Object.entries(
+      value
+    )) {
+      collectUpstreamOutputFileIds(item, ids, key, depth + 1);
+    }
+  }
+  return ids;
+}
 
 // server/manus-proxy.ts
 var router2 = Router();
@@ -29039,44 +29290,13 @@ function publicUpstreamTaskPayload(value, apiKey) {
   return deepSanitizeJson(redactPublicTaskValues(result, apiKey));
 }
 function isPublicTaskPayloadRequest(method, targetPath) {
-  const path11 = targetPath.split("?")[0].replace(/\/+$/, "");
+  const path12 = targetPath.split("?")[0].replace(/\/+$/, "");
   const normalizedMethod = method.toUpperCase();
-  if (normalizedMethod === "POST" && (path11 === "/v1/tasks" || path11 === "/v1/responses")) {
+  if (normalizedMethod === "POST" && (path12 === "/v1/tasks" || path12 === "/v1/responses")) {
     return true;
   }
   if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") return false;
-  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path11);
-}
-function collectOutputFileIds(value, ids = /* @__PURE__ */ new Set(), currentKey, depth = 0) {
-  if (value === null || value === void 0 || depth > 50) return ids;
-  if (typeof value === "string") {
-    if ((currentKey === "file_id" || currentKey === "fileId") && value) {
-      ids.add(value);
-    }
-    if (currentKey === "url" || currentKey === "file_url" || currentKey === "fileUrl" || currentKey === "image_url" || currentKey === "imageUrl") {
-      const match = value.match(/\/v1\/files\/([^/?#]+)/);
-      if (match?.[1]) {
-        try {
-          ids.add(decodeURIComponent(match[1]));
-        } catch {
-        }
-      }
-    }
-    return ids;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value)
-      collectOutputFileIds(item, ids, void 0, depth + 1);
-    return ids;
-  }
-  if (typeof value === "object") {
-    for (const [key, item] of Object.entries(
-      value
-    )) {
-      collectOutputFileIds(item, ids, key, depth + 1);
-    }
-  }
-  return ids;
+  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(path12);
 }
 function collectOutputPdfDescriptors(value, descriptors = [], depth = 0) {
   if (!value || depth > 50) return descriptors;
@@ -30532,14 +30752,45 @@ router2.all("/*", async (req, res) => {
           });
         }
       }
-      for (const fileId of collectOutputFileIds(response2.data)) {
-        await recordUpstreamResource({
+      for (const fileId of collectUpstreamOutputFileIds(response2.data)) {
+        const registration = {
           userId: req.frontmindUser.id,
           apiCredentialId: req.frontmindCredential.id,
           kind: "file",
           upstreamId: fileId,
           projectAssignmentId: req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null
-        });
+        };
+        let recorded = false;
+        let lastError;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            await recordUpstreamResource(registration);
+            recorded = true;
+            break;
+          } catch (error) {
+            lastError = error;
+            if (attempt < 2) {
+              await new Promise(
+                (resolve) => setTimeout(resolve, 50 * 2 ** attempt)
+              );
+            }
+          }
+        }
+        if (recorded) continue;
+        console.error(
+          "[FrontMind Proxy] Output file registration pending",
+          safeErrorForLog(lastError)
+        );
+        res.setHeader("X-FrontMind-Resource-Registration", "pending");
+        const retryTimer = setTimeout(() => {
+          void recordUpstreamResource(registration).catch((error) => {
+            console.error(
+              "[FrontMind Proxy] Output file retry failed",
+              safeErrorForLog(error)
+            );
+          });
+        }, 1e3);
+        retryTimer.unref?.();
       }
       for (const descriptor of collectOutputPdfDescriptors(response2.data)) {
         try {
@@ -30639,8 +30890,8 @@ import { and as and21, eq as eq24, inArray as inArray14, isNotNull as isNotNull3
 import { Router as Router2 } from "express";
 import fs5 from "fs/promises";
 import JSZip2 from "jszip";
-import path6 from "path";
-import { createHash as createHash12 } from "node:crypto";
+import path7 from "path";
+import { createHash as createHash13 } from "node:crypto";
 
 // server/upstream-task-attachment.ts
 import axios4 from "axios";
@@ -30720,9 +30971,9 @@ async function uploadUpstreamTaskAttachment(input) {
 }
 
 // server/task-attachment-package.ts
-import { createHash as createHash11 } from "node:crypto";
+import { createHash as createHash12 } from "node:crypto";
 import fs4 from "node:fs/promises";
-import path5 from "node:path";
+import path6 from "node:path";
 import JSZip from "jszip";
 var ARCHIVE_DATE = /* @__PURE__ */ new Date("1980-01-01T00:00:00.000Z");
 function assertSafeArchivePath(relativePath) {
@@ -30748,9 +30999,9 @@ async function buildDeterministicTaskAttachmentArchive(input) {
   const fileManifest = files.map((file) => ({
     path: file.path,
     bytes: file.content.byteLength,
-    sha256: createHash11("sha256").update(file.content).digest("hex")
+    sha256: createHash12("sha256").update(file.content).digest("hex")
   }));
-  const contentHash = createHash11("sha256").update(JSON.stringify(fileManifest)).digest("hex");
+  const contentHash = createHash12("sha256").update(JSON.stringify(fileManifest)).digest("hex");
   const zip = new JSZip();
   for (const file of files) {
     zip.file(file.path, file.content, {
@@ -30793,10 +31044,10 @@ async function buildDirectorySkillArchive(input) {
   for (const directoryCandidate of input.directoryCandidates) {
     try {
       const directory = await fs4.realpath(directoryCandidate);
-      const expectedRoot = `${directory}${path5.sep}`;
+      const expectedRoot = `${directory}${path6.sep}`;
       const files = await Promise.all(
         input.files.map(async (relativePath) => {
-          const resolved = path5.resolve(directory, relativePath);
+          const resolved = path6.resolve(directory, relativePath);
           if (!resolved.startsWith(expectedRoot)) {
             throw new Error(`Unsafe Skill path: ${relativePath}`);
           }
@@ -30826,6 +31077,48 @@ async function buildDirectorySkillArchive(input) {
 
 // server/knowledge-base-api.ts
 var router3 = Router2();
+async function recordKnowledgeBaseOutputFiles(input) {
+  for (const fileId of collectUpstreamOutputFileIds(input.output)) {
+    const registration = {
+      userId: input.userId,
+      apiCredentialId: input.apiCredentialId,
+      kind: "file",
+      upstreamId: fileId
+    };
+    let lastError;
+    let recorded = false;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await recordUpstreamResource(registration);
+        recorded = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) {
+          await new Promise(
+            (resolve) => setTimeout(resolve, 50 * 2 ** attempt)
+          );
+        }
+      }
+    }
+    if (recorded) continue;
+    console.error("[Knowledge Base] output file registration pending", {
+      userId: input.userId,
+      fileId,
+      error: lastError instanceof Error ? lastError.message : String(lastError)
+    });
+    const retryTimer = setTimeout(() => {
+      void recordUpstreamResource(registration).catch((error) => {
+        console.error("[Knowledge Base] output file retry failed", {
+          userId: input.userId,
+          fileId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    }, 1e3);
+    retryTimer.unref?.();
+  }
+}
 async function requireKnowledgeBuildCapability(userId, res) {
   try {
     await assertServiceCapability(userId, "knowledgeBuild");
@@ -31132,6 +31425,11 @@ async function recoverOpenKnowledgeBaseTasks(options) {
         }
         const taskData = taskResponse.data || {};
         const output = Array.isArray(taskData.output) ? taskData.output : [];
+        await recordKnowledgeBaseOutputFiles({
+          userId: build.userId,
+          apiCredentialId: credential.id,
+          output
+        });
         const taskStatus = normalizedUpstreamTaskStatus(taskData.status);
         if (!shouldReconcileKnowledgeOutput(output, taskStatus)) {
           observeKnowledgeInteraction(
@@ -31175,27 +31473,27 @@ async function recoverOpenKnowledgeBaseTasks(options) {
   return result;
 }
 var configuredKnowledgeBaseSkillPath = process.env.FRONTMIND_KB_SKILL_PATH?.trim();
-if (configuredKnowledgeBaseSkillPath && !path6.isAbsolute(configuredKnowledgeBaseSkillPath)) {
+if (configuredKnowledgeBaseSkillPath && !path7.isAbsolute(configuredKnowledgeBaseSkillPath)) {
   throw new Error("FRONTMIND_KB_SKILL_PATH must be an absolute path");
 }
 var skillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [configuredKnowledgeBaseSkillPath] : [
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     process.cwd(),
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "socratic-kb-builder.skill"
   ),
-  path6.resolve(
+  path7.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -31204,15 +31502,15 @@ var skillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [configuredKnowl
   )
 ];
 var legacySkillArchiveCandidates = configuredKnowledgeBaseSkillPath ? [
-  path6.join(
-    path6.dirname(configuredKnowledgeBaseSkillPath),
+  path7.join(
+    path7.dirname(configuredKnowledgeBaseSkillPath),
     "socratic-kb-builder-v1.skill"
   )
 ] : skillArchiveCandidates.map(
-  (candidate) => path6.join(path6.dirname(candidate), "socratic-kb-builder-v1.skill")
+  (candidate) => path7.join(path7.dirname(candidate), "socratic-kb-builder-v1.skill")
 );
 var currentSkillArchiveCandidates = skillArchiveCandidates.map(
-  (candidate) => path6.join(path6.dirname(candidate), "socratic-kb-builder-v3.skill")
+  (candidate) => path7.join(path7.dirname(candidate), "socratic-kb-builder-v3.skill")
 );
 var skillArchiveCache = /* @__PURE__ */ new Map();
 var KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME = "socratic-kb-builder.skill.zip";
@@ -31246,8 +31544,8 @@ async function loadSkillArchive(selection = { version: "3" }) {
   let contentHashMismatchError = null;
   const candidates = version === "1" ? legacySkillArchiveCandidates : version === "2" ? skillArchiveCandidates : [
     ...selection.contentHash ? currentSkillArchiveCandidates.map(
-      (candidate) => path6.join(
-        path6.dirname(candidate),
+      (candidate) => path7.join(
+        path7.dirname(candidate),
         `socratic-kb-builder-v3-${selection.contentHash}.skill`
       )
     ) : [],
@@ -31277,7 +31575,7 @@ ${content.trim()}`);
       const instructions = sections.join("\n\n---\n\n");
       const loaded = {
         instructions,
-        contentHash: createHash12("sha256").update(instructions).digest("hex"),
+        contentHash: createHash13("sha256").update(instructions).digest("hex"),
         archivePath: candidate
       };
       if (selection.contentHash && selection.contentHash !== loaded.contentHash) {
@@ -31438,7 +31736,7 @@ async function buildKnowledgeBasePrompt({
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0E\u672C\u8F6E\u5BF9\u8BDD\u53EA\u80FD\u5448\u73B0\u767E\u79D1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u5448\u73B0\u4EFB\u52A1\u8FC7\u7A0B\u3001\u6838\u9A8C\u5224\u65AD\u3001\u91C7\u8D2D/\u5408\u89C4\u5EFA\u8BAE\u3001\u8BFB\u8005\u6307\u4EE4\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u6A21\u578B\u63A8\u7406\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u77E5\u8BC6\u6811\u7EDF\u8BA1\uFF08\u4EC5\u9996\u8F6E\u9700\u8981\uFF09\u548C\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587/\u5408\u89C4\u914D\u56FE\u3002\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\uFF1B\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\u3002\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u6B63\u6587\u4E0D\u5F97\u5D4C\u5165\u5B98\u7F51\u6216 CDN \u56FE\u7247\u5916\u94FE\u3002\u56FE\u7247\u5FC5\u987B\u5148\u4E0B\u8F7D\u771F\u5B9E\u5B57\u8282\u3001\u89E3\u7801\u6821\u9A8C\u5E76\u6253\u5165\u6700\u7EC8 ZIP\uFF0C\u518D\u4EE5\u5305\u5185\u76F8\u5BF9\u8DEF\u5F84\u5F15\u7528\uFF1B\u9632\u76D7\u94FE\u3001\u7B7E\u540D\u3001\u8FC7\u671F\u6216\u65E0\u6CD5\u4E0B\u8F7D\u7684\u5730\u5740\u53EA\u80FD\u8FDB\u5165\u5185\u90E8\u6765\u6E90\u8BB0\u5F55\uFF0C\u7EDD\u4E0D\u80FD\u4F5C\u4E3A\u5BA2\u6237\u56FE\u7247\u8FD4\u56DE\u3002",
-    "\u5168\u4EFB\u52A1\u53EA\u91C7\u96C6\u6700\u591A\u4E09\u5F20\u4E92\u4E0D\u91CD\u590D\u7684\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\uFF1A\u4E3B Logo\u3001\u54C1\u724C\u4E3B\u89C6\u89C9\u3001\u5178\u578B\u4EA7\u54C1/UI/\u67B6\u6784\u56FE\u5404\u6700\u591A\u4E00\u5F20\uFF1B\u53D6\u5F97\u4E09\u5F20\u540E\u7ACB\u5373\u505C\u6B62\u56FE\u7247\u53D1\u73B0\u3002\u53EA\u6709\u9996\u8F6E\u6E05\u5355\u7B2C\u4E00\u4E2A\u53F6\u5B50\uFF08\u901A\u5E38\u4E3A 1.1 \u4E00\u53E5\u8BDD\u5B9A\u4F4D\uFF09\u53EF\u628A\u5DF2\u4E0B\u8F7D\u9A8C\u8BC1\u7684\u672C\u5730\u5B57\u8282\u4F5C\u4E3A output_image \u6216 image MIME output_file \u8FD4\u56DE\u3002\u540E\u7EED\u6240\u6709\u8282\u70B9\u3001\u4FEE\u8BA2\u4E0E\u91CD\u5F00\u8F6E\u6B21\u4E00\u5F8B\u7EAF\u6587\u5B57\uFF0C\u4E0D\u5F97\u91CD\u590D\u6216\u65B0\u589E\u56FE\u7247\u9644\u4EF6\u3002\u9996\u8F6E\u9644\u4EF6\u4E0E\u6700\u7EC8 ZIP \u5FC5\u987B\u4F7F\u7528\u540C\u4E00\u8D44\u4EA7\u5B57\u8282\u3002",
+    "\u9996\u8F6E\u5FC5\u987B\u91C7\u96C6\u5E76\u8FD4\u56DE\u6070\u597D\u4E09\u5F20\u4E92\u4E0D\u91CD\u590D\u7684\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\uFF1A\u4E3B Logo\u3001\u54C1\u724C\u4E3B\u89C6\u89C9\u3001\u5178\u578B\u4EA7\u54C1/UI/\u67B6\u6784\u56FE\u5404\u4E00\u5F20\uFF1B\u53D6\u5F97\u4E09\u5F20\u540E\u7ACB\u5373\u505C\u6B62\u56FE\u7247\u53D1\u73B0\u3002\u53EA\u6709\u9996\u8F6E\u6E05\u5355\u7B2C\u4E00\u4E2A\u53F6\u5B50\uFF08\u901A\u5E38\u4E3A 1.1 \u4E00\u53E5\u8BDD\u5B9A\u4F4D\uFF09\u53EF\u628A\u5DF2\u4E0B\u8F7D\u9A8C\u8BC1\u7684\u672C\u5730\u5B57\u8282\u4F5C\u4E3A output_image \u6216 image MIME output_file \u8FD4\u56DE\u3002\u4E0D\u5F97\u7528\u91CD\u590D\u88C1\u5207\u3001\u5360\u4F4D\u56FE\u3001\u5E93\u5B58\u56FE\u3001\u5B98\u7F51/CDN \u70ED\u94FE\u6216\u6587\u5B57\u8BF4\u660E\u51D1\u6570\uFF1B\u65E0\u6CD5\u53D6\u5F97\u4E09\u5F20\u5408\u683C\u771F\u5B9E\u5B57\u8282\u65F6\u4E0D\u5F97\u4F2A\u9020\u6210\u529F\u3002\u540E\u7EED\u6240\u6709\u8282\u70B9\u3001\u4FEE\u8BA2\u4E0E\u91CD\u5F00\u8F6E\u6B21\u4E00\u5F8B\u7EAF\u6587\u5B57\uFF0C\u4E0D\u5F97\u641C\u7D22\u3001\u91CD\u590D\u6216\u65B0\u589E\u56FE\u7247\u9644\u4EF6\u3002\u9996\u8F6E\u9644\u4EF6\u4E0E\u6700\u7EC8 ZIP \u5FC5\u987B\u4F7F\u7528\u540C\u4E00\u8D44\u4EA7\u5B57\u8282\u3002",
     `\u8D44\u6599\u91C7\u96C6\u9636\u6BB5\u7EDF\u4E00\u5411\u5BA2\u6237\u663E\u793A\uFF1A${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
     "",
     "## \u672C\u6B21\u4EFB\u52A1\u8F93\u5165",
@@ -31562,7 +31860,7 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     version: input.skillVersion || "3",
     contentHash: input.skillContentHash
   });
-  const progress = await getKnowledgeBaseProgress({
+  const progress = input.progressOverride || await getKnowledgeBaseProgress({
     userId: input.userId,
     conversationId: input.conversationId
   });
@@ -31584,6 +31882,32 @@ async function buildKnowledgeBaseTurnPrompt(input) {
   );
   const postRevision = progress.build.revision + 1;
   const isV3 = (input.skillVersion || "3") === "3";
+  const transitionTarget = action === "confirm" ? "confirmed" : action === "direct_prefill" ? "direct_prefilled" : "needs_verification";
+  const presentationLeafId = action === "confirm" || action === "direct_prefill" ? nextPending?.id || null : current?.id || null;
+  const progressEnvelopeExample = current ? `<!-- FRONTMIND_KB_PROGRESS
+${JSON.stringify({
+    kind: "frontmind.knowledge-base.progress",
+    schemaVersion: 1,
+    revision: progress.build.revision,
+    transition: {
+      leafId: current.id,
+      from: current.status === "needs_verification" ? "needs_verification" : "current",
+      to: transitionTarget,
+      reason: action === "confirm" ? "\u7528\u6237\u660E\u786E\u786E\u8BA4" : action === "direct_prefill" ? "\u7528\u6237\u660E\u786E\u91C7\u7528\u9884\u586B" : "\u7528\u6237\u8865\u5145\u6216\u4FEE\u8BA2\u5F53\u524D\u8282\u70B9"
+    }
+  })}
+-->` : "";
+  const presentationEnvelopeExample = isV3 ? `<!-- FRONTMIND_KB_PRESENTATION
+${JSON.stringify({
+    kind: "frontmind.knowledge-base.presentation",
+    schemaVersion: 1,
+    revision: postRevision,
+    leafId: presentationLeafId,
+    imageState: presentationLeafId === null ? "not_applicable" : "no_eligible_asset",
+    assetIds: [],
+    imageCount: 0
+  })}
+-->` : "";
   const stateReminder = current ? [
     `\u5F53\u524D revision=${progress.build.revision}`,
     `\u5F53\u524D\u4E14\u552F\u4E00\u53EF\u5904\u7406\u8282\u70B9\uFF1A${current.id}\uFF5C${current.branchTitle} / ${current.title}`,
@@ -31591,8 +31915,10 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     `\u670D\u52A1\u7AEF\u5224\u5B9A\u672C\u8F6E\u52A8\u4F5C\uFF1A${action}`,
     "\u53EA\u8981\u672C\u8F6E\u5305\u542B\u9644\u4EF6\uFF0C\u65E0\u8BBA\u6587\u5B57\u662F\u5426\u5305\u542B\u201C\u786E\u8BA4\u201D\uFF0C\u90FD\u5FC5\u987B\u6309\u8865\u5145/\u4FEE\u8BA2\u5904\u7406\uFF0C\u4FDD\u6301 needs_verification\u3002",
     "\u56DE\u590D\u672B\u5C3E\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PROGRESS \u4FE1\u5C01\uFF1BHTML \u6CE8\u91CA\u5F00\u5934\u548C\u7ED3\u5C3E\u662F\u4FE1\u5C01\u7684\u4E00\u90E8\u5206\uFF0C\u4E0D\u5F97\u7701\u7565\u6216\u6539\u6210\u88F8 JSON\u3002",
+    "FRONTMIND_KB_PROGRESS \u5FC5\u987B\u9010\u5B57\u6BB5\u4F7F\u7528\u4E0B\u9762\u8FD9\u4E2A\u5F53\u8F6E\u552F\u4E00\u7ED3\u6784\uFF1B\u4E0D\u5F97\u628A action\u3001leafId\u3001status \u653E\u5728\u9876\u5C42\uFF0C\u4E0D\u5F97\u628A revision \u6539\u6210\u63D0\u4EA4\u540E\u7684\u503C\uFF1A",
+    progressEnvelopeExample,
     action === "confirm" || action === "direct_prefill" ? nextPending ? `\u5148\u7B80\u77ED\u786E\u8BA4\u5DF2\u5904\u7406 ${current.id}\uFF0C\u6B63\u6587\u4E3B\u4F53\u968F\u540E\u5B8C\u6574\u5C55\u793A\u4E0B\u4E00\u8282\u70B9 ${nextPending.id}\uFF5C${nextPending.branchTitle} / ${nextPending.title}\u3002\u4E0D\u5F97\u518D\u6B21\u628A ${current.id} \u4F5C\u4E3A\u4E3B\u4F53\u3002` : `\u8FD9\u662F\u6700\u540E\u4E00\u4E2A\u8282\u70B9\u3002\u7B80\u77ED\u786E\u8BA4 ${current.id} \u540E\u76F4\u63A5\u751F\u6210\u552F\u4E00\u6700\u7EC8 ZIP\uFF0C\u4E0D\u518D\u5C55\u793A\u8282\u70B9\u6B63\u6587\u3002` : `\u66F4\u65B0\u5E76\u5B8C\u6574\u91CD\u65B0\u5C55\u793A\u5F53\u524D\u8282\u70B9 ${current.id}\uFF1B\u4E0D\u5F97\u5C55\u793A\u6216\u63A8\u8FDB\u5230\u540E\u7EED\u8282\u70B9\u3002`,
-    isV3 ? `\u56DE\u590D\u672B\u5C3E\u8FD8\u5FC5\u987B\u9644\u4E14\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF1Arevision=${postRevision}\uFF0CleafId=${action === "confirm" || action === "direct_prefill" ? nextPending?.id || "null" : current.id}\u3002\u8FD9\u662F\u975E\u9996\u8F6E\uFF1AleafId \u975E null \u65F6\u5FC5\u987B\u56FA\u5B9A\u58F0\u660E imageState=no_eligible_asset\u3001assetIds=[]\u3001imageCount=0\uFF0C\u4E14\u4E0D\u5F97\u8FD4\u56DE\u4EFB\u4F55\u56FE\u7247\u9644\u4EF6\uFF1BleafId=null \u65F6\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1A\u8BF7\u9075\u5FAA\u76F8\u540C\u7684\u5C55\u793A\u884C\u4E3A\uFF1B\u5982\u89C4\u7EA6\u652F\u6301\uFF0C\u53EF\u9644 FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0C\u4F46\u670D\u52A1\u7AEF\u4E0D\u5F3A\u5236\u8981\u6C42\u3002"
+    isV3 ? `\u56DE\u590D\u672B\u5C3E\u8FD8\u5FC5\u987B\u9644\u4E14\u53EA\u80FD\u9644\u4E00\u4E2A FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF1Arevision=${postRevision}\uFF0CleafId=${presentationLeafId || "null"}\u3002\u8FD9\u662F\u975E\u9996\u8F6E\uFF1AleafId \u975E null \u65F6\u5FC5\u987B\u56FA\u5B9A\u58F0\u660E imageState=no_eligible_asset\u3001assetIds=[]\u3001imageCount=0\uFF0C\u4E14\u4E0D\u5F97\u8FD4\u56DE\u4EFB\u4F55\u56FE\u7247\u9644\u4EF6\uFF1BleafId=null \u65F6\u4F7F\u7528 not_applicable\u3001\u7A7A\u6570\u7EC4\u548C 0\u3002` : "\u8FD9\u662F\u4ECD\u5728\u8FD0\u884C\u7684\u65E7\u7248\u4EFB\u52A1\uFF1A\u8BF7\u9075\u5FAA\u76F8\u540C\u7684\u5C55\u793A\u884C\u4E3A\uFF1B\u5982\u89C4\u7EA6\u652F\u6301\uFF0C\u53EF\u9644 FRONTMIND_KB_PRESENTATION \u4FE1\u5C01\uFF0C\u4F46\u670D\u52A1\u7AEF\u4E0D\u5F3A\u5236\u8981\u6C42\u3002"
   ].join("\n") : [
     `\u5F53\u524D\u77E5\u8BC6\u5E93\u5DF2\u5B8C\u6210\uFF0Crevision=${progress.build.revision}\u3002`,
     "\u672C\u8F6E\u5982\u6709\u8865\u5145\u6216\u4FEE\u6539\uFF0C\u53EA\u80FD\u4ECE\u73B0\u6709\u8282\u70B9\u4E2D\u9009\u62E9\u4E00\u4E2A\u6700\u76F8\u5173\u8282\u70B9\u91CD\u65B0\u6838\u9A8C\uFF0C\u5E76\u9644\u4E00\u4E2A FRONTMIND_KB_REOPEN \u4FE1\u5C01\uFF1B\u4E0D\u5F97\u91CD\u5EFA\u77E5\u8BC6\u6811\u6216\u590D\u7528\u65E7\u5305\u3002",
@@ -31600,13 +31926,13 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     `\u73B0\u6709\u8282\u70B9\uFF1A${leaves.map((leaf) => `${leaf.id}:${leaf.title}`).join("\uFF1B")}`
   ].join("\n");
   return [
-    `\u7EE7\u7EED\u4E25\u683C\u6267\u884C\u672C\u4EFB\u52A1\u9996\u8F6E\u5DF2\u9644\u5E26\u7684 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}\uFF08socratic-kb-builder v${input.skillVersion || "3"}\uFF09\u3002\u4EE5\u4E0B\u5185\u5BB9\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u63D0\u793A\u8BCD\u8BF4\u660E\u3002`,
+    `\u7EE7\u7EED\u4E25\u683C\u6267\u884C ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}\uFF08socratic-kb-builder v${input.skillVersion || "3"}\uFF09\u3002\u82E5\u4E0A\u6E38\u4EFB\u52A1\u5386\u53F2\u4E2D\u5B58\u5728\u65E7 Skill\u3001\u65E7\u56DE\u590D\u6216\u65E7\u534F\u8BAE\u793A\u4F8B\uFF0C\u5168\u90E8\u7531\u672C\u8F6E\u670D\u52A1\u7AEF\u72B6\u6001\u548C\u672C\u8F6E\u91CD\u65B0\u9644\u5E26\u7684 Skill \u8986\u76D6\u3002\u4EE5\u4E0B\u5185\u5BB9\u4F1A\u76F4\u63A5\u663E\u793A\u7ED9\u4F01\u4E1A\u5BA2\u6237\uFF0C\u4E0D\u5F97\u8F93\u51FA\u5185\u90E8\u601D\u8003\u3001\u5DE5\u5177\u8BA1\u5212\u6216\u63D0\u793A\u8BCD\u8BF4\u660E\u3002`,
     "\u4E0D\u5F97\u5F00\u542F\u3001\u8C03\u7528\u3001\u5207\u6362\u6216\u63A8\u8350 Wide Research / Deep Research\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u51FA\u73B0\u201C\u672C\u8F6E\u91C7\u96C6/\u672C\u77E5\u8BC6\u5E93/\u8BC1\u636E\u4E0D\u8DB3/\u5DF2\u6838\u9A8C\u201D\u7B49\u8FC7\u7A0B\u5224\u65AD\uFF0C\u4E5F\u4E0D\u5F97\u51FA\u73B0\u5BA2\u6237\u5E94\u3001\u91C7\u8D2D\u65B9\u5E94\u3001\u5EFA\u8BAE\u3001\u5C3D\u8C03\u3001\u5408\u89C4\u5BA1\u67E5\u3001\u4E0D\u80FD\u4EC5\u51ED\u3001\u4E0D\u5B9C\u8F6C\u6362\u6216\u4E0D\u80FD\u5916\u63A8\u7B49\u5EFA\u8BAE\u6027\u8868\u8FBE\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u4E0D\u5F97\u4E3B\u52A8\u63D0\u4F9B\u201C\u76F4\u63A5\u9884\u586B\u201D\u6216\u201C\u8DF3\u8FC7\u201D\u9009\u9879\uFF1B\u7528\u6237\u6B63\u5E38\u64CD\u4F5C\u53EA\u6709\u786E\u8BA4\u5F53\u524D\u5185\u5BB9\uFF0C\u6216\u8005\u63D0\u4EA4\u4FEE\u6539/\u9644\u4EF6\u540E\u786E\u8BA4\u4FEE\u8BA2\u7A3F\u3002",
     "\u5BA2\u6237\u53EF\u89C1\u56DE\u590D\u53EA\u8F93\u51FA\u5B9E\u9645\u5C55\u793A\u8282\u70B9\u7684\u5B8C\u6574\u6B63\u6587\uFF0C\u4E0D\u5F97\u8F93\u51FA\u53C2\u8003\u8D44\u6599\u3001\u53C2\u8003\u6765\u6E90\u3001References\u3001Sources\u3001\u7F16\u53F7\u5F15\u7528\u3001\u5916\u90E8\u5F15\u7528\u94FE\u63A5\u3001\u672A\u51B3\u4E8B\u9879\u3001\u6838\u9A8C\u5907\u6CE8\u3001\u64CD\u4F5C\u63D0\u793A\u6216\u786E\u8BA4\u95EE\u9898\u3002\u6240\u6709\u6765\u6E90\u53EA\u8FDB\u5165\u5185\u90E8\u8BC1\u636E\u6587\u4EF6\uFF1B\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\u76F4\u63A5\u9644\u673A\u5668\u4FE1\u5C01\u3002",
     "\u673A\u5668\u4FE1\u5C01\u5FC5\u987B\u4FDD\u7559\u5B8C\u6574\u7684 `<!-- FRONTMIND_KB_...` \u4E0E `-->` \u5305\u88F9\uFF0C\u4E0D\u5F97\u8F93\u51FA\u88F8 JSON\u3001SOCRATIC_KB_STATE\uFF0C\u4E5F\u4E0D\u5F97\u81EA\u521B workflow-state\u3001knowledge-base.message \u6216\u5176\u4ED6\u72B6\u6001\u5BF9\u8C61\u3002",
-    "\u8FD9\u662F\u975E\u9996\u8F6E\u77E5\u8BC6\u8282\u70B9\u56DE\u590D\uFF0C\u5FC5\u987B\u7EAF\u6587\u5B57\u8FD4\u56DE\uFF1A\u4E0D\u5F97\u7EE7\u7EED\u641C\u7D22\u56FE\u7247\uFF0C\u4E0D\u5F97\u8FD4\u56DE\u3001\u91CD\u590D\u6216\u91CD\u65B0\u9644\u52A0\u4EFB\u4F55 output_image\u3001image MIME output_file\u3001\u5305\u5185\u56FE\u7247\u8DEF\u5F84\u6216\u5B98\u7F51/CDN \u70ED\u94FE\u3002\u6700\u591A\u4E09\u5F20\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\u53EA\u5141\u8BB8\u5728\u9996\u8F6E\u7B2C\u4E00\u4E2A\u53F6\u5B50\u5C55\u793A\u3002",
+    "\u8FD9\u662F\u975E\u9996\u8F6E\u77E5\u8BC6\u8282\u70B9\u56DE\u590D\uFF0C\u5FC5\u987B\u7EAF\u6587\u5B57\u8FD4\u56DE\uFF1A\u4E0D\u5F97\u7EE7\u7EED\u641C\u7D22\u56FE\u7247\uFF0C\u4E0D\u5F97\u8FD4\u56DE\u3001\u91CD\u590D\u6216\u91CD\u65B0\u9644\u52A0\u4EFB\u4F55 output_image\u3001image MIME output_file\u3001\u5305\u5185\u56FE\u7247\u8DEF\u5F84\u6216\u5B98\u7F51/CDN \u70ED\u94FE\u3002\u6070\u597D\u4E09\u5F20\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\u53EA\u5141\u8BB8\u5728\u9996\u8F6E\u7B2C\u4E00\u4E2A\u53F6\u5B50\u5C55\u793A\u3002",
     "",
     "# \u5F53\u524D\u77E5\u8BC6\u5E93\u72B6\u6001",
     stateReminder,
@@ -31617,10 +31943,16 @@ async function buildKnowledgeBaseTurnPrompt(input) {
     "# \u4F01\u4E1A\u672C\u8F6E\u56DE\u590D",
     input.userMessage.trim() || "\u8BF7\u7EE7\u7EED\u5B8C\u6210\u5F53\u524D\u77E5\u8BC6\u8282\u70B9\u3002",
     "",
-    ...isV3 ? [
-      "# v3 \u5C55\u793A\u4FE1\u5C01\uFF08\u673A\u5668\u6821\u9A8C\uFF09",
-      "\u5C55\u793A\u4FE1\u5C01\u5FC5\u987B\u4F4D\u4E8E\u53EF\u89C1\u6B63\u6587\u4E4B\u540E\u3002\u786E\u8BA4/\u76F4\u63A5\u9884\u586B\u5C55\u793A\u4E0B\u4E00\u8282\u70B9\uFF1B\u4FEE\u8BA2\u5C55\u793A\u539F\u8282\u70B9\uFF1B\u6700\u540E\u8282\u70B9\u5B8C\u6210\u4E3A null\u3002",
-      '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->'
+    ...current ? [
+      "# \u6700\u7EC8\u8F93\u51FA\u9501\uFF08\u6700\u9AD8\u4F18\u5148\u7EA7\uFF0C\u5FC5\u987B\u4F5C\u4E3A\u56DE\u590D\u7ED3\u5C3E\uFF09",
+      `\u670D\u52A1\u7AEF\u5DF2\u5C06\u672C\u8F6E\u52A8\u4F5C\u786E\u5B9A\u4E3A ${action}\uFF1B\u4E0D\u5F97\u81EA\u884C\u6539\u6210\u5176\u4ED6\u52A8\u4F5C\u3002`,
+      action === "confirm" || action === "direct_prefill" ? nextPending ? `\u53EF\u89C1\u6B63\u6587\u4E3B\u4F53\u5FC5\u987B\u662F ${nextPending.id}\uFF5C${nextPending.title}\uFF0C\u4E0D\u5F97\u518D\u6B21\u628A ${current.id} \u4F5C\u4E3A\u4E3B\u4F53\u3002` : `\u53EA\u7B80\u77ED\u786E\u8BA4 ${current.id} \u5E76\u5B8C\u6210\u6700\u7EC8\u4EA4\u4ED8\uFF0C\u4E0D\u5F97\u518D\u6B21\u8F93\u51FA ${current.id} \u6B63\u6587\u3002` : `\u53EF\u89C1\u6B63\u6587\u4E3B\u4F53\u5FC5\u987B\u7EE7\u7EED\u662F ${current.id}\uFF5C${current.title}\u3002`,
+      "\u53EF\u89C1\u6B63\u6587\u7ED3\u675F\u540E\uFF0CFRONTMIND_KB_PROGRESS \u5FC5\u987B\u9010\u5B57\u91C7\u7528\u4E0B\u9762\u7684\u5B57\u6BB5\u5C42\u7EA7\u548C\u503C\uFF1B\u65E7\u7248\u9876\u5C42 action\u3001leafId\u3001status \u4E00\u5F8B\u65E0\u6548\uFF1A",
+      progressEnvelopeExample,
+      ...isV3 ? [
+        "\u968F\u540E\u7D27\u63A5\u4E14\u53EA\u63A5\u4E0B\u9762\u8FD9\u4E2A FRONTMIND_KB_PRESENTATION\uFF1B\u4E0D\u5F97\u66F4\u6539 revision\u3001leafId \u6216\u56FE\u7247\u5B57\u6BB5\uFF1A",
+        presentationEnvelopeExample
+      ] : []
     ] : []
   ].join("\n");
 }
@@ -31757,6 +32089,11 @@ router3.post("/start", async (req, res) => {
       apiCredentialId: req.frontmindCredential.id,
       kind: "task",
       upstreamId: String(created.task.id)
+    });
+    await recordKnowledgeBaseOutputFiles({
+      userId: req.frontmindUser.id,
+      apiCredentialId: req.frontmindCredential.id,
+      output: created.task.output
     });
     let progress = await createKnowledgeBaseBuild({
       userId: req.frontmindUser.id,
@@ -31939,7 +32276,18 @@ router3.post("/turn", async (req, res) => {
       expectedLeafId: expectedLeafId || void 0
     });
     let created;
+    let turnSkill;
     try {
+      const currentSkillDescriptor = boundBuild.skillVersion === "3" ? await getKnowledgeBaseSkillDescriptor() : {
+        version: boundBuild.skillVersion,
+        contentHash: boundBuild.skillContentHash
+      };
+      turnSkill = await uploadKnowledgeBaseSkillArchive({
+        baseUrl: getUpstreamBaseUrl(req),
+        apiKey: taskCredential.apiKey,
+        skillVersion: currentSkillDescriptor.version,
+        skillContentHash: currentSkillDescriptor.contentHash
+      });
       created = await createFrontMindTask({
         baseUrl: getUpstreamBaseUrl(req),
         apiKey: taskCredential.apiKey,
@@ -31948,13 +32296,14 @@ router3.post("/turn", async (req, res) => {
           conversationId,
           userMessage,
           attachments: attachments2,
-          skillVersion: boundBuild.skillVersion,
-          skillContentHash: boundBuild.skillContentHash
+          skillVersion: currentSkillDescriptor.version,
+          skillContentHash: currentSkillDescriptor.contentHash
         }),
-        attachments: attachments2,
+        attachments: [turnSkill.attachment, ...attachments2],
         taskId
       });
     } catch (error) {
+      if (turnSkill) await turnSkill.removeOrphan().catch(() => void 0);
       await releaseKnowledgeBaseTurnClaim({
         userId: req.frontmindUser.id,
         conversationId,
@@ -31963,6 +32312,7 @@ router3.post("/turn", async (req, res) => {
       throw error;
     }
     if (!created.ok) {
+      if (turnSkill) await turnSkill.removeOrphan().catch(() => void 0);
       await releaseKnowledgeBaseTurnClaim({
         userId: req.frontmindUser.id,
         conversationId,
@@ -31989,6 +32339,19 @@ router3.post("/turn", async (req, res) => {
       apiCredentialId: taskCredential.id,
       kind: "task",
       upstreamId: String(created.task.id)
+    });
+    if (turnSkill) {
+      await recordUpstreamResource({
+        userId: req.frontmindUser.id,
+        apiCredentialId: taskCredential.id,
+        kind: "file",
+        upstreamId: turnSkill.fileId
+      });
+    }
+    await recordKnowledgeBaseOutputFiles({
+      userId: req.frontmindUser.id,
+      apiCredentialId: taskCredential.id,
+      output: created.task.output
     });
     let progress = await getKnowledgeBaseProgress({
       userId: req.frontmindUser.id,
@@ -32113,6 +32476,11 @@ router3.post("/progress/reconcile", async (req, res) => {
     const taskData = taskResponse.data || {};
     const taskStatus = normalizedUpstreamTaskStatus(taskData.status);
     const fullOutput = Array.isArray(taskData.output) ? taskData.output : [];
+    await recordKnowledgeBaseOutputFiles({
+      userId: req.frontmindUser.id,
+      apiCredentialId: credential.id,
+      output: fullOutput
+    });
     const progress = await reconcileAvailableKnowledgeOutput({
       userId: req.frontmindUser.id,
       conversationId,
@@ -32143,7 +32511,7 @@ var knowledge_base_api_default = router3;
 // server/response-logic-api.ts
 import axios6 from "axios";
 import { Router as Router3 } from "express";
-import path7 from "node:path";
+import path8 from "node:path";
 import { z as z18 } from "zod";
 var router4 = Router3();
 var attachmentSchema2 = z18.object({
@@ -32339,29 +32707,29 @@ function buildVerifiedResponseLogicAttachments(attachments2, uploadedAt = /* @__
   });
 }
 var configuredResponseLogicSkillPath = process.env.FRONTMIND_RESPONSE_LOGIC_SKILL_PATH?.trim();
-if (configuredResponseLogicSkillPath && !path7.isAbsolute(configuredResponseLogicSkillPath)) {
+if (configuredResponseLogicSkillPath && !path8.isAbsolute(configuredResponseLogicSkillPath)) {
   throw new Error(
     "FRONTMIND_RESPONSE_LOGIC_SKILL_PATH must be an absolute path"
   );
 }
 var skillDirectoryCandidates = configuredResponseLogicSkillPath ? [configuredResponseLogicSkillPath] : [
-  path7.resolve(
+  path8.resolve(
     import.meta.dirname,
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path7.resolve(
+  path8.resolve(
     process.cwd(),
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path7.resolve(
+  path8.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "response-logic-builder.skill"
   ),
-  path7.resolve(
+  path8.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -33090,9 +33458,9 @@ router4.post(["/start", "/turn"], async (req, res) => {
 var response_logic_api_default = router4;
 
 // server/dashboard-api.ts
-import { createHash as createHash14, randomUUID as randomUUID22 } from "node:crypto";
-import { mkdir as mkdir2, readFile as readFile2, unlink as unlink2, writeFile as writeFile2 } from "node:fs/promises";
-import path9 from "node:path";
+import { createHash as createHash15, randomUUID as randomUUID22 } from "node:crypto";
+import { mkdir as mkdir3, readFile as readFile3, unlink as unlink3, writeFile as writeFile3 } from "node:fs/promises";
+import path10 from "node:path";
 import axios7 from "axios";
 import { and as and23, eq as eq26, inArray as inArray15 } from "drizzle-orm";
 import ExcelJS2 from "exceljs";
@@ -33425,31 +33793,31 @@ function startDashboardImportPreflightCleanupScheduler() {
 }
 
 // server/presales-file-store.ts
-import { createHash as createHash13, randomUUID as randomUUID21 } from "node:crypto";
+import { createHash as createHash14, randomUUID as randomUUID21 } from "node:crypto";
 import {
   createReadStream as createReadStream2,
   createWriteStream
 } from "node:fs";
 import * as fs6 from "node:fs/promises";
-import path8 from "node:path";
+import path9 from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 function storageRoot() {
-  const assetRoot = path8.resolve(
-    process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path8.join(process.cwd(), ".frontmind-dashboard-assets")
+  const assetRoot = path9.resolve(
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path9.join(process.cwd(), ".frontmind-dashboard-assets")
   );
-  return path8.join(assetRoot, "presales-files");
+  return path9.join(assetRoot, "presales-files");
 }
 function storageKey(fileId) {
-  return createHash13("sha256").update(fileId, "utf8").digest("hex");
+  return createHash14("sha256").update(fileId, "utf8").digest("hex");
 }
 function pathsFor(fileId) {
   const root = storageRoot();
   const key = storageKey(fileId);
   return {
     root,
-    content: path8.join(root, `${key}.content`),
-    manifest: path8.join(root, `${key}.json`)
+    content: path9.join(root, `${key}.content`),
+    manifest: path9.join(root, `${key}.json`)
   };
 }
 function cleanFilename(value, fallback) {
@@ -33506,12 +33874,12 @@ async function stagePresalesFileContent(input) {
   const paths = pathsFor(input.fileId);
   await fs6.mkdir(paths.root, { recursive: true, mode: 448 });
   await fs6.chmod(paths.root, 448).catch(() => void 0);
-  const temporary = path8.join(
+  const temporary = path9.join(
     paths.root,
     `${storageKey(input.fileId)}.${randomUUID21()}.upload.tmp`
   );
   let sizeBytes = 0;
-  const hash = createHash13("sha256");
+  const hash = createHash14("sha256");
   const limiter = new Transform({
     transform(chunk, _encoding, callback) {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -33534,7 +33902,7 @@ async function stagePresalesFileContent(input) {
     await fs6.rm(temporary, { force: true }).catch(() => void 0);
     throw error;
   }
-  const sha2564 = hash.digest("hex");
+  const sha2565 = hash.digest("hex");
   let consumed = false;
   const discard = async () => {
     if (consumed) return;
@@ -33543,7 +33911,7 @@ async function stagePresalesFileContent(input) {
   };
   return {
     sizeBytes,
-    sha256: sha2564,
+    sha256: sha2565,
     createReadStream: () => createReadStream2(temporary),
     discard,
     commit: async ({ filename, mimeType }) => {
@@ -33555,7 +33923,7 @@ async function stagePresalesFileContent(input) {
         filename: cleanFilename(filename ?? previous?.filename, input.fileId),
         mimeType: cleanMimeType(mimeType ?? previous?.mimeType),
         sizeBytes,
-        sha256: sha2564,
+        sha256: sha2565,
         state: "stored",
         updatedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
@@ -34436,8 +34804,8 @@ var completenessAcquisitionSchema = z20.object({
     webQueries: completenessAcquisitionCountSchema.optional()
   }).passthrough()
 }).passthrough();
-var storageRoot2 = path9.resolve(
-  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path9.join(process.cwd(), ".frontmind-dashboard-assets")
+var storageRoot2 = path10.resolve(
+  process.env.FRONTMIND_DASHBOARD_ASSET_DIR || path10.join(process.cwd(), ".frontmind-dashboard-assets")
 );
 function assertDashboardAssetStorageConfigured() {
   if (process.env.NODE_ENV === "production" && !process.env.FRONTMIND_DASHBOARD_ASSET_DIR?.trim()) {
@@ -34449,9 +34817,30 @@ function assertDashboardAssetStorageConfigured() {
 async function removeStoredKnowledgeAssets(keys) {
   await Promise.all(
     keys.map(
-      (key) => unlink2(path9.join(storageRoot2, key)).catch(() => void 0)
+      (key) => unlink3(path10.join(storageRoot2, key)).catch(() => void 0)
     )
   );
+}
+async function removeUncommittedStoredKnowledgeAssets(input) {
+  if (input.snapshotCommitted) return;
+  await (input.removeAssets ?? removeStoredKnowledgeAssets)(
+    input.storedAssetKeys
+  );
+}
+async function runCommittedKnowledgeSnapshotSideEffects(effects, warn = (message, error) => console.warn(message, error)) {
+  const warnings = [];
+  for (const effect of effects) {
+    try {
+      await effect.run();
+    } catch (error) {
+      warnings.push(effect.name);
+      warn(
+        `[Dashboard] Knowledge snapshot committed; ${effect.name} will be retried independently`,
+        error
+      );
+    }
+  }
+  return warnings;
 }
 var textExtensions = /* @__PURE__ */ new Set([
   ".md",
@@ -34662,7 +35051,7 @@ function hasSupportedImageSignature(extension, bytes) {
   return false;
 }
 function validateProgressReportScreenshot(input) {
-  const extension = path9.extname(input.filename).toLowerCase();
+  const extension = path10.extname(input.filename).toLowerCase();
   const mimeType = imageMimeByExtension[extension];
   if (!mimeType || ![".png", ".jpg", ".jpeg", ".webp"].includes(extension)) {
     throw new Error("\u7B54\u6848\u622A\u56FE\u4EC5\u652F\u6301 PNG\u3001JPG \u6216 WEBP");
@@ -34673,13 +35062,13 @@ function validateProgressReportScreenshot(input) {
   return { extension, mimeType };
 }
 function titleFromPath(filePath) {
-  return path9.basename(filePath, path9.extname(filePath)).replace(/^\d+[._-]*/, "").replace(/[-_]+/g, " ").trim() || "\u77E5\u8BC6\u6587\u6863";
+  return path10.basename(filePath, path10.extname(filePath)).replace(/^\d+[._-]*/, "").replace(/[-_]+/g, " ").trim() || "\u77E5\u8BC6\u6587\u6863";
 }
 function htmlToMarkdownLikeText(html) {
   return html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi, "# $1\n").replace(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi, "## $1\n").replace(/<h3\b[^>]*>([\s\S]*?)<\/h3>/gi, "### $1\n").replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "- $1\n").replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n\n").replace(/<[^>]+>/g, "").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/\n{3,}/g, "\n\n").trim();
 }
 function normalizeTextDocument(filePath, content) {
-  const extension = path9.extname(filePath).toLowerCase();
+  const extension = path10.extname(filePath).toLowerCase();
   if (extension === ".html" || extension === ".htm") {
     return htmlToMarkdownLikeText(content);
   }
@@ -34906,7 +35295,7 @@ function packagedEvidenceDocumentFingerprint(document) {
     /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~，。！？；：“”‘’（）【】《》…—·]/g,
     ""
   );
-  return normalized ? createHash14("sha256").update(normalized).digest("hex") : void 0;
+  return normalized ? createHash15("sha256").update(normalized).digest("hex") : void 0;
 }
 function reportedPackagedImageCount(markdown) {
   for (const pattern of [
@@ -35028,7 +35417,7 @@ function validateProfilePackage(input) {
     manifest.documents.map((document) => packageRelativePath(document.path))
   );
   for (const relativePath of input.rawTextByRelativePath.keys()) {
-    if (path9.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
+    if (path10.posix.extname(relativePath).toLowerCase() === ".md" && !allowedUnlistedText.has(relativePath) && !manifestDocumentPaths.has(relativePath)) {
       throw new KnowledgeArchiveValidationError(
         "structure",
         `package manifest \u672A\u767B\u8BB0\u6587\u672C\u6587\u4EF6\uFF1A${relativePath}`
@@ -36303,7 +36692,7 @@ function parseOptimizationReportTemplate(input) {
   return parsed.data;
 }
 function recordFingerprint(value) {
-  return createHash14("sha256").update(JSON.stringify(value)).digest("hex");
+  return createHash15("sha256").update(JSON.stringify(value)).digest("hex");
 }
 function recordDiffByKey(before, after, recordKey) {
   const keyed = (items) => {
@@ -36954,7 +37343,7 @@ function monitoringPayloadFromTabularSources(input) {
             );
           }
           const answerNo = answerOffset + 1;
-          const digest = createHash14("sha1").update(
+          const digest = createHash15("sha1").update(
             [source.title, model, questionId, date, answerNo, content].join(
               ""
             )
@@ -37163,7 +37552,7 @@ function monitoringPayloadFromTabularSources(input) {
       }
       const model = String(row[modelIndex] || "").trim();
       if (date) requireImportDate(date, sourceRow);
-      const digest = createHash14("sha1").update(
+      const digest = createHash15("sha1").update(
         [
           source.title,
           rowIndex,
@@ -37333,7 +37722,7 @@ function responseLogicImportsFromTabularSources(input) {
   return records;
 }
 async function responseLogicImportsFromFile(input) {
-  const extension = path9.extname(input.sourceFileName).toLowerCase();
+  const extension = path10.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
     const raw = JSON.parse(input.buffer.toString("utf8"));
     const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -37361,7 +37750,7 @@ async function responseLogicImportsFromFile(input) {
   }
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path9.basename(input.sourceFileName, extension),
+      title: path10.basename(input.sourceFileName, extension),
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
       )
@@ -37373,12 +37762,12 @@ async function responseLogicImportsFromFile(input) {
   });
 }
 async function tabularTablesFromFile(input) {
-  const extension = path9.extname(input.sourceFileName).toLowerCase();
+  const extension = path10.extname(input.sourceFileName).toLowerCase();
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path9.basename(
+      title: path10.basename(
         input.sourceFileName,
-        path9.extname(input.sourceFileName)
+        path10.extname(input.sourceFileName)
       ) || "\u6570\u636E\u8868\u683C",
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
@@ -37390,7 +37779,7 @@ async function tabularTablesFromFile(input) {
   ).filter((table) => Boolean(table));
 }
 async function dashboardPayloadFromFile(input) {
-  const extension = path9.extname(input.sourceFileName).toLowerCase();
+  const extension = path10.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
     return dashboardPayloadFromModuleJson({
       text: input.buffer.toString("utf8"),
@@ -37401,7 +37790,7 @@ async function dashboardPayloadFromFile(input) {
   }
   const sources = extension === ".xlsx" ? await workbookRows(input.buffer) : [
     {
-      title: path9.basename(input.sourceFileName, extension),
+      title: path10.basename(input.sourceFileName, extension),
       rows: parseCsvRows(
         input.buffer.toString("utf8").replace(/^\uFEFF/, "")
       )
@@ -37431,11 +37820,11 @@ function validIsoDate(value) {
   return Number.isFinite(date.getTime()) ? date.toISOString() : void 0;
 }
 function stableMonitoringBatchKey(input) {
-  const digest = input.sourceHash?.toLowerCase().match(/^[a-f0-9]{64}$/)?.[0] ?? createHash14("sha256").update(JSON.stringify(input.monitoringContent)).digest("hex");
+  const digest = input.sourceHash?.toLowerCase().match(/^[a-f0-9]{64}$/)?.[0] ?? createHash15("sha256").update(JSON.stringify(input.monitoringContent)).digest("hex");
   return `dashboard-import:sha256:${digest}`;
 }
 function embeddedCitationSourceId(input) {
-  const digest = createHash14("sha256").update(
+  const digest = createHash15("sha256").update(
     JSON.stringify([
       input.answerId,
       input.index,
@@ -37571,7 +37960,7 @@ function buildDashboardMonitoringImport(input) {
   });
 }
 function monitoringImportFileHash(buffer) {
-  return createHash14("sha256").update(buffer).digest("hex");
+  return createHash15("sha256").update(buffer).digest("hex");
 }
 function buildMonitoringImportPreview(input) {
   const { batch } = input;
@@ -37725,7 +38114,7 @@ function dashboardImportTransactionHooks(input) {
 }
 async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options = {}) {
   const validationProfile = options.validationProfile ?? "historical";
-  const extension = path9.extname(sourceFileName).toLowerCase();
+  const extension = path10.extname(sourceFileName).toLowerCase();
   if (extension !== ".zip") {
     if (validationProfile !== "historical") {
       throw new KnowledgeArchiveValidationError(
@@ -37784,7 +38173,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
   const rawTextByArchivePath = /* @__PURE__ */ new Map();
   let unpackedBytes = 0;
   let declaredUnpackedBytes = 0;
-  await mkdir2(storageRoot2, { recursive: true });
+  await mkdir3(storageRoot2, { recursive: true });
   try {
     const normalizedPaths = /* @__PURE__ */ new Set();
     const packagePaths = [];
@@ -37800,7 +38189,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       }
       normalizedPaths.add(normalizedKey2);
       packagePaths.push(archivePath);
-      const fileExtension = path9.extname(archivePath).toLowerCase();
+      const fileExtension = path10.extname(archivePath).toLowerCase();
       if (validationProfile !== "historical" && [".bmp", ".heic", ".heif", ".ico", ".svg", ".tif", ".tiff"].includes(
         fileExtension
       )) {
@@ -37856,14 +38245,14 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
           throw new Error(`\u77E5\u8BC6\u5E93\u56FE\u7247\u683C\u5F0F\u4E0E\u5185\u5BB9\u4E0D\u5339\u914D\uFF1A${archivePath}`);
         }
         const key = `${randomUUID22()}${fileExtension}`;
-        await writeFile2(path9.join(storageRoot2, key), bytes, { flag: "wx" });
+        await writeFile3(path10.join(storageRoot2, key), bytes, { flag: "wx" });
         storedAssetKeys.push(key);
         assets.push({
           key,
           path: archivePath,
           mimeType,
           size: bytes.length,
-          sha256: createHash14("sha256").update(bytes).digest("hex"),
+          sha256: createHash15("sha256").update(bytes).digest("hex"),
           ...dimensions
         });
       } else {
@@ -37928,8 +38317,8 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       let content = document.content;
       validated.assets.forEach((asset, index2) => {
         const url = asset.id ? `/api/dashboard/knowledge/assets/${snapshotId}/by-id/${encodeURIComponent(asset.id)}` : `/api/dashboard/knowledge/assets/${snapshotId}/${index2}`;
-        const relativePath = path9.posix.relative(
-          path9.posix.dirname(document.path),
+        const relativePath = path10.posix.relative(
+          path10.posix.dirname(document.path),
           asset.path
         );
         const candidates = [
@@ -37937,7 +38326,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
           encodeURI(asset.path),
           relativePath,
           encodeURI(relativePath),
-          path9.basename(asset.path)
+          path10.basename(asset.path)
         ];
         for (const candidate of candidates) {
           content = content.replaceAll(`(${candidate})`, `(${url})`);
@@ -37951,7 +38340,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
       assets: validated.assets,
       storedAssetKeys,
       validationProfile,
-      packageManifestSha256: rawTextByRelativePath.has(packageManifestPath) ? createHash14("sha256").update(
+      packageManifestSha256: rawTextByRelativePath.has(packageManifestPath) ? createHash15("sha256").update(
         Buffer.from(
           rawTextByRelativePath.get(packageManifestPath),
           "utf8"
@@ -37961,7 +38350,7 @@ async function readKnowledgeArchive(buffer, sourceFileName, snapshotId, options 
   } catch (error) {
     await Promise.all(
       storedAssetKeys.map(
-        (key) => unlink2(path9.join(storageRoot2, key)).catch(() => void 0)
+        (key) => unlink3(path10.join(storageRoot2, key)).catch(() => void 0)
       )
     );
     if (validationProfile !== "historical" && !(error instanceof KnowledgeArchiveValidationError)) {
@@ -37983,7 +38372,7 @@ function assertKnowledgeArchiveEnterpriseIdentity(input) {
     throw new Error("\u8BF7\u5148\u7531\u7BA1\u7406\u5458\u914D\u7F6E\u5F53\u524D\u8D26\u53F7\u7684\u4F01\u4E1A\u540D\u79F0");
   }
   const identityDocuments = input.documents.filter((document) => {
-    const basename = path9.posix.basename(document.path).toLowerCase();
+    const basename = path10.posix.basename(document.path).toLowerCase();
     return basename === "readme.md" || basename === "00_knowledge_tree.md" || basename === "00_source_index.md";
   });
   const candidates = identityDocuments.length > 0 ? identityDocuments : input.documents;
@@ -38018,7 +38407,7 @@ async function downloadArchiveBytes(input) {
       }
       const chunks2 = [];
       let totalBytes2 = 0;
-      const hash = createHash14("sha256");
+      const hash = createHash15("sha256");
       for await (const rawChunk of stored.createReadStream()) {
         const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
         totalBytes2 += chunk.length;
@@ -38037,7 +38426,7 @@ async function downloadArchiveBytes(input) {
       const buffer2 = Buffer.concat(chunks2, totalBytes2);
       filename = stored.filename || filename;
       if (!filename.toLowerCase().endsWith(".zip")) {
-        filename = `${path9.basename(filename, path9.extname(filename)) || "knowledge-base"}.zip`;
+        filename = `${path10.basename(filename, path10.extname(filename)) || "knowledge-base"}.zip`;
       }
       return { buffer: buffer2, filename };
     }
@@ -38080,9 +38469,9 @@ async function downloadArchiveBytes(input) {
   const responseFilename = encodedFilename || plainFilename;
   if (responseFilename) {
     try {
-      filename = path9.basename(decodeURIComponent(responseFilename.trim()));
+      filename = path10.basename(decodeURIComponent(responseFilename.trim()));
     } catch {
-      filename = path9.basename(responseFilename.trim());
+      filename = path10.basename(responseFilename.trim());
     }
   }
   const declaredLength = Number(response2.headers["content-length"] || 0);
@@ -38119,7 +38508,7 @@ async function downloadArchiveBytes(input) {
     throw new Error("\u77E5\u8BC6\u5E93 ZIP \u8D85\u8FC7 250 MB");
   }
   if (!filename.toLowerCase().endsWith(".zip")) {
-    filename = `${path9.basename(filename, path9.extname(filename)) || "knowledge-base"}.zip`;
+    filename = `${path10.basename(filename, path10.extname(filename)) || "knowledge-base"}.zip`;
   }
   return { buffer, filename };
 }
@@ -38198,14 +38587,14 @@ router5.put(
         bytes
       });
       const assetName = `${randomUUID22()}${extension}`;
-      const relativeKey = path9.join(
+      const relativeKey = path10.join(
         "progress-report-screenshots",
         String(targetUserId),
         assetName
       );
-      const absolutePath = path9.join(storageRoot2, relativeKey);
-      await mkdir2(path9.dirname(absolutePath), { recursive: true });
-      await writeFile2(absolutePath, bytes, { flag: "wx" });
+      const absolutePath = path10.join(storageRoot2, relativeKey);
+      await mkdir3(path10.dirname(absolutePath), { recursive: true });
+      await writeFile3(absolutePath, bytes, { flag: "wx" });
       const url = `/api/dashboard/report-assets/${targetUserId}/${assetName}`;
       await writeWorkspaceAuditEvent({
         actor,
@@ -38246,11 +38635,11 @@ router5.get(
         throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       }
       await assertWorkspaceAccess(req.frontmindUser, targetUserId);
-      const extension = path9.extname(assetName).toLowerCase();
+      const extension = path10.extname(assetName).toLowerCase();
       const mimeType = imageMimeByExtension[extension];
       if (!mimeType) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
-      const bytes = await readFile2(
-        path9.join(
+      const bytes = await readFile3(
+        path10.join(
           storageRoot2,
           "progress-report-screenshots",
           String(targetUserId),
@@ -38284,6 +38673,8 @@ router5.post("/knowledge/publish", async (req, res) => {
     return;
   }
   let storedAssetKeys = [];
+  let snapshotCommitted = false;
+  let storedArchive;
   try {
     await assertRoleScopedWorkspaceExecution({
       req,
@@ -38356,7 +38747,7 @@ router5.post("/knowledge/publish", async (req, res) => {
       apiKey: credential.apiKey,
       baseUrl
     });
-    const archiveHash = createHash14("sha256").update(downloaded.buffer).digest("hex");
+    const archiveHash = createHash15("sha256").update(downloaded.buffer).digest("hex");
     const snapshotId = randomUUID22();
     const parsed = await readKnowledgeArchive(
       downloaded.buffer,
@@ -38374,6 +38765,13 @@ router5.post("/knowledge/publish", async (req, res) => {
       brandName: workspace.payload.brandName,
       documents: parsed.documents
     });
+    await persistKnowledgeSnapshotArchive({
+      userId: targetUserId,
+      snapshotId,
+      buffer: downloaded.buffer,
+      expectedSha256: archiveHash
+    });
+    storedArchive = { userId: targetUserId, snapshotId };
     const snapshot = await createKnowledgeSnapshot({
       snapshotId,
       userId: targetUserId,
@@ -38389,6 +38787,7 @@ router5.post("/knowledge/publish", async (req, res) => {
       assets: parsed.assets,
       totalBytes: downloaded.buffer.length
     });
+    snapshotCommitted = true;
     await createKnowledgeMonitoringHandoff({
       userId: targetUserId,
       actorUserId: actor.id,
@@ -38396,11 +38795,15 @@ router5.post("/knowledge/publish", async (req, res) => {
     });
     res.json({ kind: "knowledge", snapshot });
   } catch (error) {
-    await Promise.all(
-      storedAssetKeys.map(
-        (key) => unlink2(path9.join(storageRoot2, key)).catch(() => void 0)
-      )
-    );
+    await removeUncommittedStoredKnowledgeAssets({
+      snapshotCommitted,
+      storedAssetKeys
+    });
+    if (!snapshotCommitted && storedArchive) {
+      await removeKnowledgeSnapshotArchive(storedArchive).catch(
+        () => void 0
+      );
+    }
     const publishedBuild = await assertKnowledgeBasePublishable({
       userId: targetUserId,
       conversationId
@@ -38451,7 +38854,7 @@ router5.put(
       const expectedRevision = dashboardRevisionHeader(
         req.header("x-dashboard-revision")
       );
-      const extension = path9.extname(sourceFileName).toLowerCase();
+      const extension = path10.extname(sourceFileName).toLowerCase();
       const mode = req.header("x-import-mode") || "auto";
       if (mode === "dashboard" || mode === "auto" && [".csv", ".json", ".xlsx"].includes(extension)) {
         const importModule = dashboardImportModule(
@@ -39187,6 +39590,8 @@ router5.put(
           archiveContractVersions: [2, 3]
         } : { validationProfile: "historical" }
       );
+      let snapshotCommitted = false;
+      let storedArchive = false;
       try {
         const workspace = await getDashboardWorkspace(targetUserId);
         assertKnowledgeArchiveEnterpriseIdentity({
@@ -39196,6 +39601,16 @@ router5.put(
           brandName: workspace.payload.brandName,
           documents: parsed.documents
         });
+        const archiveHash = extension === ".zip" ? createHash15("sha256").update(buffer).digest("hex") : void 0;
+        if (archiveHash) {
+          await persistKnowledgeSnapshotArchive({
+            userId: targetUserId,
+            snapshotId,
+            buffer,
+            expectedSha256: archiveHash
+          });
+          storedArchive = true;
+        }
         const snapshot = await createKnowledgeSnapshot({
           snapshotId,
           userId: targetUserId,
@@ -39204,38 +39619,53 @@ router5.put(
           sourceConversationId,
           sourceBuildId,
           maintenanceTicketId,
+          archiveHash,
           documents: parsed.documents,
           assets: parsed.assets,
           totalBytes: buffer.length
         });
-        await createKnowledgeMonitoringHandoff({
-          userId: targetUserId,
-          actorUserId: actor.id,
-          knowledgeSnapshotId: snapshot?.id ?? snapshotId
-        });
-        await writeWorkspaceAuditEvent({
-          actor,
-          action: "workspace.knowledge.published",
-          targetType: "knowledge_snapshot",
-          targetId: snapshot?.id ?? snapshotId,
-          workspaceUserId: targetUserId,
-          metadata: {
-            sourceName: sourceFileName,
-            sourceConversationId,
-            sourceBuildId,
-            maintenanceTicketId,
-            documentCount: snapshot?.documentCount ?? parsed.documents.length,
-            imageCount: snapshot?.imageCount ?? parsed.assets.length,
-            totalBytes: snapshot?.totalBytes ?? buffer.length
+        snapshotCommitted = true;
+        await runCommittedKnowledgeSnapshotSideEffects([
+          {
+            name: "monitoring handoff",
+            run: () => createKnowledgeMonitoringHandoff({
+              userId: targetUserId,
+              actorUserId: actor.id,
+              knowledgeSnapshotId: snapshot?.id ?? snapshotId
+            })
+          },
+          {
+            name: "publication audit",
+            run: () => writeWorkspaceAuditEvent({
+              actor,
+              action: "workspace.knowledge.published",
+              targetType: "knowledge_snapshot",
+              targetId: snapshot?.id ?? snapshotId,
+              workspaceUserId: targetUserId,
+              metadata: {
+                sourceName: sourceFileName,
+                sourceConversationId,
+                sourceBuildId,
+                maintenanceTicketId,
+                documentCount: snapshot?.documentCount ?? parsed.documents.length,
+                imageCount: snapshot?.imageCount ?? parsed.assets.length,
+                totalBytes: snapshot?.totalBytes ?? buffer.length
+              }
+            })
           }
-        });
+        ]);
         res.json({ kind: "knowledge", snapshot });
       } catch (error) {
-        await Promise.all(
-          parsed.storedAssetKeys.map(
-            (key) => unlink2(path9.join(storageRoot2, key)).catch(() => void 0)
-          )
-        );
+        await removeUncommittedStoredKnowledgeAssets({
+          snapshotCommitted,
+          storedAssetKeys: parsed.storedAssetKeys
+        });
+        if (!snapshotCommitted && storedArchive) {
+          await removeKnowledgeSnapshotArchive({
+            userId: targetUserId,
+            snapshotId
+          }).catch(() => void 0);
+        }
         throw error;
       }
     } catch (error) {
@@ -39259,6 +39689,48 @@ router5.put(
   }
 );
 router5.get(
+  "/knowledge/snapshots/:snapshotId/archive",
+  async (req, res) => {
+    try {
+      const snapshotId = z20.string().uuid().parse(req.params.snapshotId);
+      const snapshot = await getKnowledgeSnapshotForWorkspace({
+        actor: req.frontmindUser,
+        snapshotId
+      });
+      if (!snapshot || !snapshot.sourceFileName.toLowerCase().endsWith(".zip") || !snapshot.archiveHash || !/^[a-f0-9]{64}$/i.test(snapshot.archiveHash)) {
+        throw new KnowledgeSnapshotArchiveError(
+          "ARCHIVE_NOT_FOUND",
+          "\u8BE5\u77E5\u8BC6\u5E93\u7248\u672C\u5C1A\u65E0\u53EF\u4E0B\u8F7D\u7684 ZIP \u5F52\u6863"
+        );
+      }
+      const bytes = await readKnowledgeSnapshotArchive({
+        userId: snapshot.userId,
+        snapshotId,
+        expectedSha256: snapshot.archiveHash,
+        expectedBytes: snapshot.totalBytes
+      });
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Length", String(bytes.length));
+      res.setHeader(
+        "Content-Disposition",
+        knowledgeArchiveContentDisposition(snapshot.sourceFileName)
+      );
+      res.send(bytes);
+    } catch (error) {
+      const archiveError = error instanceof KnowledgeSnapshotArchiveError ? error : null;
+      res.status(
+        archiveError && archiveError.code !== "ARCHIVE_NOT_FOUND" ? 409 : 404
+      ).json({
+        error: {
+          message: archiveError?.message || "\u77E5\u8BC6\u5E93 ZIP \u4E0D\u5B58\u5728",
+          code: archiveError?.code || "NOT_FOUND"
+        }
+      });
+    }
+  }
+);
+router5.get(
   "/knowledge/assets/:snapshotId/by-id/:assetId",
   async (req, res) => {
     try {
@@ -39269,7 +39741,7 @@ router5.get(
       });
       if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
-      const bytes = await readFile2(path9.join(storageRoot2, result.asset.key));
+      const bytes = await readFile3(path10.join(storageRoot2, result.asset.key));
       res.setHeader("Content-Type", result.asset.mimeType);
       res.setHeader("Cache-Control", "private, max-age=3600");
       res.setHeader("Content-Disposition", "inline");
@@ -39292,7 +39764,7 @@ router5.get(
       });
       if (!result) throw new Error("\u8D44\u6E90\u4E0D\u5B58\u5728");
       await assertWorkspaceAccess(req.frontmindUser, result.snapshot.userId);
-      const bytes = await readFile2(path9.join(storageRoot2, result.asset.key));
+      const bytes = await readFile3(path10.join(storageRoot2, result.asset.key));
       res.setHeader("Content-Type", result.asset.mimeType);
       res.setHeader("Cache-Control", "private, max-age=3600");
       res.setHeader("Content-Disposition", "inline");
@@ -39305,7 +39777,7 @@ router5.get(
 var dashboard_api_default = router5;
 
 // server/brand-question-portfolio-api.ts
-import { createHash as createHash15 } from "node:crypto";
+import { createHash as createHash16 } from "node:crypto";
 import axios8 from "axios";
 import { Router as Router4 } from "express";
 import { z as z23 } from "zod";
@@ -39463,7 +39935,7 @@ function assertBrandQuestionPortfolioContext(portfolio, expected) {
 }
 
 // server/brand-question-portfolio-runtime.ts
-import path10 from "node:path";
+import path11 from "node:path";
 function candidateTargets(context) {
   return {
     industry: context.quota.industry * 3,
@@ -39473,29 +39945,29 @@ function candidateTargets(context) {
   };
 }
 var configuredBrandQuestionSkillPath = process.env.FRONTMIND_BRAND_QUESTION_SKILL_PATH?.trim();
-if (configuredBrandQuestionSkillPath && !path10.isAbsolute(configuredBrandQuestionSkillPath)) {
+if (configuredBrandQuestionSkillPath && !path11.isAbsolute(configuredBrandQuestionSkillPath)) {
   throw new Error(
     "FRONTMIND_BRAND_QUESTION_SKILL_PATH must be an absolute path"
   );
 }
 var skillDirectoryCandidates2 = configuredBrandQuestionSkillPath ? [configuredBrandQuestionSkillPath] : [
-  path10.resolve(
+  path11.resolve(
     import.meta.dirname,
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path10.resolve(
+  path11.resolve(
     process.cwd(),
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path10.resolve(
+  path11.resolve(
     import.meta.dirname,
     "..",
     "private-workflows",
     "brand-question-portfolio.skill"
   ),
-  path10.resolve(
+  path11.resolve(
     import.meta.dirname,
     "..",
     "..",
@@ -39869,7 +40341,7 @@ async function currentContext(userId) {
     planCode: portal.service.planCode,
     quotaPeriodId: portal.quotas.periodId,
     enterprise: {
-      identityHash: createHash15("sha256").update(
+      identityHash: createHash16("sha256").update(
         `${userId}\0${workspace.payload.brandName.normalize("NFKC").trim().toLowerCase()}`
       ).digest("hex"),
       canonicalName: workspace.payload.brandName.trim()
@@ -40432,10 +40904,10 @@ router7.post("/:assetId/download-token", async (req, res) => {
 });
 async function streamPreparedFile(req, res, manifest, disposition) {
   const filePath = preparedFileService.contentPath(manifest.id);
-  const stat2 = await fs7.stat(filePath);
+  const stat3 = await fs7.stat(filePath);
   const range = parseByteRange(
     typeof req.headers.range === "string" ? req.headers.range : void 0,
-    stat2.size
+    stat3.size
   );
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Accept-Ranges", "bytes");
@@ -40452,17 +40924,17 @@ async function streamPreparedFile(req, res, manifest, disposition) {
     return;
   }
   if (range === "invalid") {
-    res.setHeader("Content-Range", `bytes */${stat2.size}`);
+    res.setHeader("Content-Range", `bytes */${stat3.size}`);
     res.status(416).end();
     return;
   }
   const start = range?.start ?? 0;
-  const end = range?.end ?? stat2.size - 1;
+  const end = range?.end ?? stat3.size - 1;
   const contentLength = end - start + 1;
   res.setHeader("Content-Length", String(contentLength));
   if (range) {
     res.status(206);
-    res.setHeader("Content-Range", `bytes ${start}-${end}/${stat2.size}`);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${stat3.size}`);
   } else {
     res.status(200);
   }
@@ -40602,7 +41074,7 @@ router7.head("/:assetId/content", async (req, res) => {
 var prepared_file_router_default = router7;
 
 // server/presales-proxy.ts
-import { createHash as createHash17, createHmac as createHmac5, timingSafeEqual as timingSafeEqual6 } from "node:crypto";
+import { createHash as createHash18, createHmac as createHmac5, timingSafeEqual as timingSafeEqual6 } from "node:crypto";
 import { once } from "node:events";
 import {
   Router as Router7,
@@ -40612,7 +41084,7 @@ import axios10 from "axios";
 import { z as z25 } from "zod";
 
 // server/presales-monitor.ts
-import { createHash as createHash16, randomUUID as randomUUID24 } from "node:crypto";
+import { createHash as createHash17, randomUUID as randomUUID24 } from "node:crypto";
 import axios9 from "axios";
 import { and as and24, eq as eq27, isNull as isNull8 } from "drizzle-orm";
 import { json as json2, Router as Router6 } from "express";
@@ -40704,8 +41176,8 @@ function canonicalJson4(value) {
   const record = value;
   return `{${Object.keys(record).filter((key) => record[key] !== void 0).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson4(record[key])}`).join(",")}}`;
 }
-function sha2563(value) {
-  return createHash16("sha256").update(value, "utf8").digest("hex");
+function sha2564(value) {
+  return createHash17("sha256").update(value, "utf8").digest("hex");
 }
 function monitorCredentialFromEnv(env = process.env) {
   const apiKey = env.FRONTMIND_MONITOR_API_KEY?.trim();
@@ -40714,7 +41186,7 @@ function monitorCredentialFromEnv(env = process.env) {
   )) {
     return null;
   }
-  const digest = sha2563(apiKey);
+  const digest = sha2564(apiKey);
   const version = Number.parseInt(digest.slice(32, 40), 16) % 2147483646 + 1;
   return {
     id: `${ENV_MONITOR_CREDENTIAL_PREFIX}${digest.slice(0, 32)}`,
@@ -40769,7 +41241,7 @@ function buildMonitorSubmitPayload(input) {
   };
 }
 function requestHash2(input) {
-  return sha2563(
+  return sha2564(
     canonicalJson4({
       schema: "frontmind-presales-monitor-v1",
       payload: buildMonitorSubmitPayload(input)
@@ -41497,7 +41969,7 @@ function isSuccessful(item) {
   return item.status === "completed" && Boolean(item.answerText?.trim()) && !item.error;
 }
 function publicRecordId(runId, subTaskId) {
-  return `mr_${sha2563(`${runId}:${subTaskId}`).slice(0, 24)}`;
+  return `mr_${sha2564(`${runId}:${subTaskId}`).slice(0, 24)}`;
 }
 function buildFinalResult(run, checkpoint, partial) {
   const scopes = jsonScopeMap(run.subtaskScopes);
@@ -41545,7 +42017,7 @@ function buildCheckpointResult(run, checkpoint) {
   );
 }
 function checkpointSignature(checkpoint) {
-  return sha2563(
+  return sha2564(
     canonicalJson4(
       [...checkpoint.items].sort(
         (a, b) => a.subTaskId.localeCompare(b.subTaskId)
@@ -41808,8 +42280,8 @@ function monitorBaseUrl(env = process.env) {
   }
   return parsed.toString().replace(/\/+$/, "");
 }
-function buildMonitorRequestUrl(path11, env = process.env) {
-  const normalizedPath = path11.replace(/^\/+/, "");
+function buildMonitorRequestUrl(path12, env = process.env) {
+  const normalizedPath = path12.replace(/^\/+/, "");
   if (!normalizedPath || /[?#\\]/.test(normalizedPath)) {
     throw new PresalesMonitorError(
       "MONITOR_NOT_CONFIGURED",
@@ -41820,12 +42292,12 @@ function buildMonitorRequestUrl(path11, env = process.env) {
   return new URL(normalizedPath, `${monitorBaseUrl(env)}/`).toString();
 }
 var AxiosMonitorTransport = class {
-  async request(method, path11, credential, payload) {
+  async request(method, path12, credential, payload) {
     let response2;
     try {
       response2 = await axios9.request({
         method,
-        url: buildMonitorRequestUrl(path11),
+        url: buildMonitorRequestUrl(path12),
         data: payload,
         headers: {
           Authorization: `Bearer ${credential.apiKey}`,
@@ -41919,7 +42391,7 @@ var PresalesMonitorService = class {
     const platforms = [...input.platforms];
     const expectedItems = platforms.length * MONITOR_REPEAT_PER_PLATFORM;
     const reservation = await this.repository.reserve({
-      idempotencyKeyHash: sha2563(input.idempotencyKey),
+      idempotencyKeyHash: sha2564(input.idempotencyKey),
       requestHash: requestHash2({ question: input.question, platforms }),
       credential,
       question: input.question,
@@ -42253,11 +42725,16 @@ var attachmentSchema3 = z25.object({
   file_id: z25.string().trim().min(1).max(255),
   filename: z25.string().trim().min(1).max(512)
 });
+var presalesAgentProfileSchema = z25.enum([
+  "frontmind-base",
+  "frontmind-pro"
+]);
 var taskCreateSchema = z25.object({
   prompt: z25.string().trim().min(1).max(2e6),
   attachments: z25.array(attachmentSchema3).max(20).optional().default([]),
   idempotencyKey: z25.string().trim().min(16).max(512).optional(),
-  projectId: z25.string().trim().min(8).max(80).optional()
+  projectId: z25.string().trim().min(8).max(80).optional(),
+  agentProfile: presalesAgentProfileSchema.optional().default("frontmind-base")
 }).superRefine((value, context) => {
   if (value.projectId && !value.idempotencyKey) {
     context.addIssue({
@@ -42268,15 +42745,16 @@ var taskCreateSchema = z25.object({
   }
 });
 function buildPresalesTaskBody(input) {
+  const agentProfile = input.agentProfile === "frontmind-pro" ? "frontmind-pro" : "frontmind-base";
   return {
     prompt: input.prompt,
     attachments: input.attachments ?? [],
-    agentProfile: toUpstreamAgentProfile("frontmind-base"),
+    agentProfile: toUpstreamAgentProfile(agentProfile),
     taskMode: "agent"
   };
 }
 function tokenDigest(value) {
-  return createHash17("sha256").update(value, "utf8").digest();
+  return createHash18("sha256").update(value, "utf8").digest();
 }
 function uploadTicketSignature(encodedPayload, secret) {
   return createHmac5("sha256", secret).update(`frontmind-presales-upload:v1.${encodedPayload}`, "utf8").digest();
@@ -43200,12 +43678,12 @@ router8.use((_req, res) => {
 var presales_proxy_default = router8;
 
 // server/provisioning-router.ts
-import { createHash as createHash20, timingSafeEqual as timingSafeEqual7 } from "node:crypto";
+import { createHash as createHash21, timingSafeEqual as timingSafeEqual7 } from "node:crypto";
 import express3 from "express";
 import { z as z30 } from "zod";
 
 // server/provisioning-service.ts
-import { createHash as createHash18, createHmac as createHmac6, randomUUID as randomUUID25 } from "node:crypto";
+import { createHash as createHash19, createHmac as createHmac6, randomUUID as randomUUID25 } from "node:crypto";
 import { eq as eq28 } from "drizzle-orm";
 import { z as z26 } from "zod";
 var usernameSchema3 = z26.string().trim().min(3, "Username must contain at least 3 characters").max(64, "Username is too long").regex(
@@ -43302,7 +43780,7 @@ function canonicalJson5(value) {
   return `{${Object.keys(record).filter((key) => record[key] !== void 0).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson5(record[key])}`).join(",")}}`;
 }
 function hashProvisioningIdempotencyKey(value) {
-  return createHash18("sha256").update(value, "utf8").digest("hex");
+  return createHash19("sha256").update(value, "utf8").digest("hex");
 }
 function hashProvisioningRequest(request, secret) {
   return createHmac6("sha256", secret).update(canonicalJson5(request), "utf8").digest("hex");
@@ -43575,7 +44053,7 @@ async function readStoredProvision(executor, idempotencyKeyHash) {
 
 // server/knowledge-import-service.ts
 import axios11 from "axios";
-import { createHash as createHash19, randomUUID as randomUUID26 } from "node:crypto";
+import { createHash as createHash20, randomUUID as randomUUID26 } from "node:crypto";
 import { and as and25, eq as eq29 } from "drizzle-orm";
 import { z as z27 } from "zod";
 var sha256Schema3 = z27.string().trim().regex(/^[a-f0-9]{64}$/i);
@@ -43709,7 +44187,7 @@ function resolveKnowledgeImportProjectOwner(provisions, requestedCompanyName) {
   };
 }
 function idempotencyHash(value) {
-  return createHash19("sha256").update(value, "utf8").digest("hex");
+  return createHash20("sha256").update(value, "utf8").digest("hex");
 }
 var websiteKnowledgeImportV3ReferencePrefix = "website-kb:v3";
 var websiteKnowledgeImportV4ReferencePrefix = "website-kb:v4";
@@ -43944,6 +44422,35 @@ async function importWebsiteKnowledgeArtifact(input) {
     };
   }
   let storedAssetKeys = [];
+  let snapshotCommitted = false;
+  let storedArchive;
+  let committedSnapshot = null;
+  let committedSnapshotId = "";
+  let committedSourceFileName = "";
+  let receiptCompleted = false;
+  const completeReceipt = async () => {
+    const result = await db.update(knowledgeImportReceipts).set({
+      status: "completed",
+      snapshotId: committedSnapshotId,
+      sourceFileName: committedSourceFileName,
+      completedAt: /* @__PURE__ */ new Date(),
+      errorCode: null,
+      errorMessage: null,
+      updatedAt: /* @__PURE__ */ new Date()
+    }).where(
+      and25(
+        eq29(knowledgeImportReceipts.id, reservation.receiptId),
+        eq29(knowledgeImportReceipts.status, "processing")
+      )
+    );
+    const affectedRows = Number(
+      result?.affectedRows ?? result?.[0]?.affectedRows
+    );
+    if (affectedRows === 0) {
+      throw new Error("\u77E5\u8BC6\u5E93\u5BFC\u5165\u56DE\u6267\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u65E0\u6CD5\u5199\u5165\u5B8C\u6210\u72B6\u6001");
+    }
+    receiptCompleted = true;
+  };
   try {
     await assertKnowledgeBaseWritable(provision.userId);
     try {
@@ -44021,7 +44528,7 @@ async function importWebsiteKnowledgeArtifact(input) {
       apiKey: credential.apiKey,
       baseUrl: getUpstreamBaseUrl()
     });
-    const archiveHash = createHash19("sha256").update(downloaded.buffer).digest("hex");
+    const archiveHash = createHash20("sha256").update(downloaded.buffer).digest("hex");
     if (archiveHash !== knowledgeImportArtifactSha256(value).toLowerCase()) {
       throw new KnowledgeImportError(
         "ARTIFACT_HASH_MISMATCH",
@@ -44061,6 +44568,13 @@ async function importWebsiteKnowledgeArtifact(input) {
       brandName: workspace.payload.brandName,
       documents: parsed.documents
     });
+    await persistKnowledgeSnapshotArchive({
+      userId: provision.userId,
+      snapshotId,
+      buffer: downloaded.buffer,
+      expectedSha256: archiveHash
+    });
+    storedArchive = { userId: provision.userId, snapshotId };
     const snapshot = await createKnowledgeSnapshot({
       snapshotId,
       userId: provision.userId,
@@ -44073,20 +44587,11 @@ async function importWebsiteKnowledgeArtifact(input) {
       assets: parsed.assets,
       totalBytes: downloaded.buffer.length
     });
-    await db.update(knowledgeImportReceipts).set({
-      status: "completed",
-      snapshotId,
-      sourceFileName: downloaded.filename,
-      completedAt: /* @__PURE__ */ new Date(),
-      errorCode: null,
-      errorMessage: null,
-      updatedAt: /* @__PURE__ */ new Date()
-    }).where(
-      and25(
-        eq29(knowledgeImportReceipts.id, reservation.receiptId),
-        eq29(knowledgeImportReceipts.status, "processing")
-      )
-    );
+    committedSnapshot = snapshot;
+    committedSnapshotId = snapshot?.id ?? snapshotId;
+    committedSourceFileName = downloaded.filename;
+    snapshotCommitted = true;
+    await completeReceipt();
     await createKnowledgeMonitoringHandoff({
       userId: provision.userId,
       actorUserId: provision.userId,
@@ -44099,7 +44604,44 @@ async function importWebsiteKnowledgeArtifact(input) {
       snapshot
     };
   } catch (error) {
-    await removeStoredKnowledgeAssets(storedAssetKeys);
+    if (snapshotCommitted) {
+      if (!receiptCompleted) {
+        await completeReceipt().catch((receiptError) => {
+          console.error(
+            "[KnowledgeImport] Snapshot committed but receipt completion retry failed",
+            receiptError
+          );
+        });
+      }
+      await createKnowledgeMonitoringHandoff({
+        userId: provision.userId,
+        actorUserId: provision.userId,
+        knowledgeSnapshotId: committedSnapshotId
+      }).catch((handoffError) => {
+        console.error(
+          "[KnowledgeImport] Snapshot committed but monitoring handoff retry failed",
+          handoffError
+        );
+      });
+      console.warn(
+        "[KnowledgeImport] Returning committed snapshot after a non-fatal post-commit failure",
+        error
+      );
+      return {
+        status: "completed",
+        replayed: false,
+        receiptId: reservation.receiptId,
+        snapshot: committedSnapshot
+      };
+    }
+    if (!snapshotCommitted) {
+      await removeStoredKnowledgeAssets(storedAssetKeys);
+      if (storedArchive) {
+        await removeKnowledgeSnapshotArchive(storedArchive).catch(
+          () => void 0
+        );
+      }
+    }
     await markReceiptFailed(reservation.receiptId, error);
     throw error instanceof KnowledgeImportError ? error : new KnowledgeImportError(
       "KNOWLEDGE_IMPORT_FAILED",
@@ -44867,7 +45409,7 @@ var PUBLIC_PLACEHOLDER_MARKERS2 = [
   "your_token"
 ];
 function tokenDigest2(value) {
-  return createHash20("sha256").update(value, "utf8").digest();
+  return createHash21("sha256").update(value, "utf8").digest();
 }
 function isUsableProvisioningServiceToken(value) {
   const normalized = value?.trim() ?? "";
@@ -45248,15 +45790,15 @@ function pathWithoutQuery(req) {
   return req.originalUrl.replace(/^\/api\/frontmind/, "").split("?")[0] || "/";
 }
 function getPrimaryResource(req) {
-  const path11 = pathWithoutQuery(req);
-  const taskMatch = path11.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
+  const path12 = pathWithoutQuery(req);
+  const taskMatch = path12.match(/^\/v1\/(?:tasks|responses)\/([^/]+)/);
   if (taskMatch) return { kind: "task", id: decodeURIComponent(taskMatch[1]) };
-  const fileMatch = path11.match(/^\/v1\/files\/([^/]+)/);
+  const fileMatch = path12.match(/^\/v1\/files\/([^/]+)/);
   if (fileMatch) return { kind: "file", id: decodeURIComponent(fileMatch[1]) };
-  if (path11 === "/download-token" && typeof req.body?.fileId === "string") {
+  if (path12 === "/download-token" && typeof req.body?.fileId === "string") {
     return { kind: "file", id: req.body.fileId };
   }
-  if (req.method === "POST" && path11 === "/v1/tasks") {
+  if (req.method === "POST" && path12 === "/v1/tasks") {
     const continuationId = req.body?.taskId ?? req.body?.previous_response_id;
     if (typeof continuationId === "string" && continuationId) {
       return { kind: "task", id: continuationId };
@@ -45698,7 +46240,7 @@ router9.get("/:attachmentId/content", async (req, res) => {
 var delivery_ticket_attachment_router_default = router9;
 
 // server/website-content-template-api.ts
-import { createHash as createHash21 } from "node:crypto";
+import { createHash as createHash22 } from "node:crypto";
 import express4 from "express";
 import { ZodError as ZodError2 } from "zod";
 
@@ -46112,7 +46654,7 @@ function requestBytes(req) {
   return Buffer.alloc(0);
 }
 function websiteContentTemplateFileHash(bytes) {
-  return createHash21("sha256").update(bytes).digest("hex");
+  return createHash22("sha256").update(bytes).digest("hex");
 }
 function assertWebsiteContentTemplatePublishHash(value, actual) {
   const expected = value?.trim().toLowerCase() || "";
@@ -46277,6 +46819,7 @@ var website_content_template_api_default = router10;
 import axios13 from "axios";
 import { Router as Router9 } from "express";
 import { randomUUID as randomUUID28 } from "node:crypto";
+import sharp2 from "sharp";
 var router11 = Router9();
 var SESSION_TTL_MS = 3 * 60 * 60 * 1e3;
 var TERMINAL_TASK_STATUSES = /* @__PURE__ */ new Set([
@@ -46287,6 +46830,13 @@ var TERMINAL_TASK_STATUSES = /* @__PURE__ */ new Set([
   "error",
   "cancelled",
   "canceled",
+  "done",
+  "finished"
+]);
+var SUCCESSFUL_TERMINAL_TASK_STATUSES = /* @__PURE__ */ new Set([
+  "completed",
+  "complete",
+  "succeeded",
   "done",
   "finished"
 ]);
@@ -46393,6 +46943,8 @@ function analyzeKnowledgeBaseLiveTask(task, options = {}) {
   const taskRecord = task && typeof task === "object" && !Array.isArray(task) ? task : {};
   const status = normalizedTaskStatus(taskRecord.status);
   const output = Array.isArray(taskRecord.output) ? taskRecord.output : [];
+  const presentationOutput = latestKnowledgeBasePresentationOutput(output);
+  const imageCount = collectKnowledgeBaseOutputImageKeys(presentationOutput).size;
   const assistantText = extractFinalKnowledgeBaseAssistantText(output);
   const protocolObjects = extractKnowledgeBaseProtocolObjects(assistantText);
   const legacySocraticStateCount = (assistantText.match(/<!--\s*SOCRATIC_KB_STATE\b/gi) || []).length;
@@ -46449,11 +47001,21 @@ function analyzeKnowledgeBaseLiveTask(task, options = {}) {
   ).map(([title, leafCount]) => ({ title, leafCount })) : [];
   const issues = [];
   const terminal = TERMINAL_TASK_STATUSES.has(status);
+  const successfulTerminal = SUCCESSFUL_TERMINAL_TASK_STATUSES.has(status);
+  if (terminal && !successfulTerminal) {
+    issues.push(`\u4EFB\u52A1\u4EE5\u5931\u8D25\u6216\u53D6\u6D88\u72B6\u6001\u7ED3\u675F\uFF1A${status}`);
+  }
   if (terminal && !assistantText) {
     issues.push("\u4EFB\u52A1\u5DF2\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u627E\u5230\u5E26 assistant \u89D2\u8272\u7684\u53EF\u89E3\u6790\u6587\u672C\u8F93\u51FA");
   }
-  if (terminal && !manifestDiagnostic) {
+  if (terminal && runMode !== "continuation" && !manifestDiagnostic) {
     issues.push("\u4EFB\u52A1\u5DF2\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u627E\u5230\u77E5\u8BC6\u6811 manifest");
+  }
+  if (terminal && runMode === "continuation" && !progressDiagnostic) {
+    issues.push("\u786E\u8BA4\u4EFB\u52A1\u5DF2\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u627E\u5230 FRONTMIND_KB_PROGRESS");
+  }
+  if (terminal && runMode === "continuation" && !presentationDiagnostic) {
+    issues.push("\u786E\u8BA4\u4EFB\u52A1\u5DF2\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u627E\u5230 FRONTMIND_KB_PRESENTATION");
   }
   if (legacySocraticStateCount > 0) {
     issues.push("\u8FD4\u56DE\u4E86\u5DF2\u7981\u7528\u7684\u65E7 SOCRATIC_KB_STATE \u72B6\u6001\u5BF9\u8C61");
@@ -46477,21 +47039,47 @@ function analyzeKnowledgeBaseLiveTask(task, options = {}) {
       issues.push("\u534F\u8BAE\u63A2\u9488 manifest \u4E0E\u9884\u671F\u7684 8 \u4E2A\u53F6\u5B50\u4E0D\u5B8C\u5168\u4E00\u81F4");
     }
   }
+  if (terminal && runMode === "full" && manifest && imageCount !== 3) {
+    issues.push(`\u9996\u8F6E\u5FC5\u987B\u8FD4\u56DE\u6070\u597D 3 \u5F20\u7ECF\u5178\u4F01\u4E1A\u56FE\u7247\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`);
+  }
+  if (terminal && runMode === "protocol_probe" && imageCount !== 0) {
+    issues.push(`\u534F\u8BAE\u63A2\u9488\u7981\u6B62\u8FD4\u56DE\u56FE\u7247\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`);
+  }
+  if (terminal && runMode === "continuation" && imageCount !== 0) {
+    issues.push(`\u540E\u7EED\u786E\u8BA4\u8F6E\u6B21\u7981\u6B62\u8FD4\u56DE\u56FE\u7247\uFF0C\u5B9E\u9645\u8FD4\u56DE ${imageCount} \u5F20`);
+  }
+  const suppressStaleContinuation = runMode === "continuation" && !terminal;
+  const structurallyAccepted = terminal && successfulTerminal && issues.length === 0;
+  const suppressRejectedContinuation = runMode === "continuation" && terminal && !structurallyAccepted;
+  const suppressCustomerOutput = suppressStaleContinuation || suppressRejectedContinuation;
   return {
     runMode,
     taskId: String(taskRecord.id || taskRecord.task_id || ""),
     status,
     terminal,
+    successfulTerminal,
+    // A continuation is not accepted until its transition has also been
+    // applied to the authoritative server state in
+    // reconcileTerminalLiveAnalysis. Structural validity alone is not enough.
+    protocolAccepted: runMode === "continuation" ? false : structurallyAccepted,
     outputCount: output.length,
+    imageCount: suppressCustomerOutput ? 0 : imageCount,
     assistantCharacterCount: assistantText.length,
-    visibleCharacterCount: visibleMarkdown.length,
-    visibleMarkdown,
+    visibleCharacterCount: suppressCustomerOutput ? 0 : visibleMarkdown.length,
+    visibleMarkdown: suppressCustomerOutput ? "" : visibleMarkdown,
     rawAssistantText: assistantText,
-    protocolKinds,
-    legacySocraticStateCount,
-    protocolObjects,
-    diagnostics,
-    manifest: manifest ? {
+    rawOutput: suppressCustomerOutput ? [] : presentationOutput,
+    confirmationCount: Math.max(0, options.confirmationCount || 0),
+    knowledgeProgress: options.progressState ? {
+      revision: options.progressState.revision,
+      currentLeafId: options.progressState.currentLeafId,
+      ...getKnowledgeBaseProgressSummary(options.progressState)
+    } : null,
+    protocolKinds: suppressStaleContinuation ? [] : protocolKinds,
+    legacySocraticStateCount: suppressStaleContinuation ? 0 : legacySocraticStateCount,
+    protocolObjects: suppressStaleContinuation ? [] : protocolObjects,
+    diagnostics: suppressStaleContinuation ? [] : diagnostics,
+    manifest: !suppressStaleContinuation && manifest ? {
       leafCount: manifest.leaves.length,
       branchCount: branchCounts.length,
       branchCounts,
@@ -46499,12 +47087,80 @@ function analyzeKnowledgeBaseLiveTask(task, options = {}) {
       lastLeaf: manifest.leaves[manifest.leaves.length - 1] || null,
       leaves: manifest.leaves
     } : null,
-    issues
+    issues: suppressStaleContinuation ? [] : issues
   };
 }
 function resolveLivePreviewApiKey(value) {
   const supplied = typeof value === "string" ? value.trim() : "";
   return supplied || process.env.FRONTMIND_LIVE_TEST_API_KEY?.trim() || "";
+}
+function detectedRasterImageMime(bytes) {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return "image/png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) {
+    return "image/jpeg";
+  }
+  const signature3 = bytes.subarray(0, 12).toString("ascii");
+  if (signature3.startsWith("GIF87a") || signature3.startsWith("GIF89a")) {
+    return "image/gif";
+  }
+  if (signature3.startsWith("RIFF") && signature3.slice(8, 12) === "WEBP") {
+    return "image/webp";
+  }
+  if (bytes.length >= 12 && bytes.subarray(4, 8).toString("ascii") === "ftyp" && /^(?:avif|avis)$/i.test(bytes.subarray(8, 12).toString("ascii"))) {
+    return "image/avif";
+  }
+  return "";
+}
+async function sendLivePreviewImage(res, data, maxBytes) {
+  const bytes = Buffer.from(data);
+  const contentType = detectedRasterImageMime(bytes);
+  if (!bytes.length || bytes.length > maxBytes) {
+    res.status(413).end();
+    return false;
+  }
+  if (!contentType) {
+    res.status(415).end();
+    return false;
+  }
+  try {
+    const decoder = sharp2(bytes, {
+      failOn: "warning",
+      limitInputPixels: 4e7,
+      animated: false
+    });
+    const metadata = await decoder.metadata();
+    const decodedMime = metadata.format === "png" ? "image/png" : metadata.format === "jpeg" ? "image/jpeg" : metadata.format === "gif" ? "image/gif" : metadata.format === "webp" ? "image/webp" : metadata.format === "heif" ? "image/avif" : "";
+    if (!decodedMime || decodedMime !== contentType || !metadata.width || !metadata.height) {
+      res.status(415).end();
+      return false;
+    }
+    await decoder.clone().raw().toBuffer();
+  } catch {
+    res.status(415).end();
+    return false;
+  }
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Content-Length", String(bytes.length));
+  res.setHeader("Cache-Control", "private, no-store");
+  res.send(bytes);
+  return true;
+}
+function collectKnowledgeBasePreviewFileIds(output) {
+  const ids = /* @__PURE__ */ new Set();
+  for (const key of collectKnowledgeBaseOutputImageResourceAliases(output)) {
+    const match = key.match(/\/v1\/files\/([^/?#]+)/);
+    if (match?.[1]) {
+      try {
+        ids.add(decodeURIComponent(match[1]));
+      } catch {
+      }
+    } else if (!/^https?:\/\//i.test(key) && !/[\s/?#]/u.test(key)) {
+      ids.add(key);
+    }
+  }
+  return ids;
 }
 function buildKnowledgeBaseProtocolProbePrompt() {
   const sourceRows = KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES.map(
@@ -46522,6 +47178,136 @@ function buildKnowledgeBaseProtocolProbePrompt() {
     "\u4FE1\u5C01\u5185\u5FC5\u987B\u662F\u4E25\u683C JSON\uFF1Akind \u4E3A frontmind.knowledge-base.manifest\uFF0CschemaVersion \u4E3A 1\uFF0Cleaves \u4E0E\u4EE5\u4E0A 8 \u884C\u9010\u5B57\u6BB5\u5B8C\u5168\u4E00\u81F4\u3002",
     "\u7981\u6B62\u8F93\u51FA\u88F8 JSON\u3001\u4EE3\u7801\u56F4\u680F\u3001FRONTMIND_KB_PROGRESS\u3001FRONTMIND_KB_PRESENTATION\u3001SOCRATIC_KB_STATE\u3001workflow-state\u3001knowledge-base.message \u6216\u4EFB\u4F55\u89E3\u91CA\u3002"
   ].join("\n");
+}
+function progressOverrideFromState(state) {
+  return {
+    build: {
+      revision: state.revision,
+      currentLeafId: state.currentLeafId
+    },
+    branches: [
+      {
+        leaves: state.leaves.map((leaf) => ({
+          id: leaf.id,
+          title: leaf.title,
+          branchTitle: leaf.branchTitle || leaf.branchId || "\u672A\u5206\u7EC4",
+          status: leaf.status
+        }))
+      }
+    ]
+  };
+}
+function progressStateFromInitialText(text2) {
+  return createKnowledgeBaseProgressState(
+    parseKnowledgeBaseManifestEnvelope(text2).leaves
+  );
+}
+function rehydratedConfirmationProgressState(input) {
+  const initialState = progressStateFromInitialText(input.initialText);
+  const revision = Number(input.revision);
+  const currentLeafId = typeof input.currentLeafId === "string" ? input.currentLeafId.trim() : input.currentLeafId === null ? null : initialState.currentLeafId;
+  if (!Number.isSafeInteger(revision) || revision < 0 || revision !== input.confirmationCount) {
+    throw new Error("\u6062\u590D\u786E\u8BA4\u72B6\u6001\u7684 revision \u4E0E\u5DF2\u901A\u8FC7\u6B21\u6570\u4E0D\u4E00\u81F4");
+  }
+  const currentIndex = currentLeafId ? initialState.leaves.findIndex((leaf) => leaf.id === currentLeafId) : initialState.leaves.length;
+  if (currentIndex < 0 || currentIndex !== input.confirmationCount) {
+    throw new Error("\u6062\u590D\u786E\u8BA4\u72B6\u6001\u7684\u5F53\u524D\u8282\u70B9\u4E0E\u5DF2\u901A\u8FC7\u6B21\u6570\u4E0D\u4E00\u81F4");
+  }
+  return {
+    ...initialState,
+    revision,
+    currentLeafId,
+    leaves: initialState.leaves.map((leaf, index2) => ({
+      ...leaf,
+      status: index2 < currentIndex ? "confirmed" : index2 === currentIndex ? "current" : "pending"
+    }))
+  };
+}
+function selectInitialKnowledgeBaseLiveTask(task) {
+  const taskRecord = task && typeof task === "object" && !Array.isArray(task) ? task : {};
+  const output = Array.isArray(taskRecord.output) ? taskRecord.output : [];
+  const manifestIndex = output.findIndex((item) => {
+    const text2 = extractFinalKnowledgeBaseAssistantText([item]);
+    if (!text2) return false;
+    try {
+      parseKnowledgeBaseManifestEnvelope(text2);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (manifestIndex < 0) return task;
+  let end = manifestIndex + 1;
+  while (end < output.length) {
+    if (extractFinalKnowledgeBaseAssistantText([output[end]])) break;
+    end += 1;
+  }
+  return {
+    ...taskRecord,
+    status: "completed",
+    output: output.slice(manifestIndex, end)
+  };
+}
+function reconcileTerminalLiveAnalysis(session, task) {
+  let analysis = analyzeKnowledgeBaseLiveTask(task, {
+    mode: session.mode,
+    progressState: session.progressState,
+    confirmationCount: session.confirmationCount
+  });
+  if (!analysis.terminal) return analysis;
+  if (!analysis.successfulTerminal) return analysis;
+  let validationError = "";
+  try {
+    if (session.mode === "full") {
+      assertKnowledgeBaseInitialImageDelivery(
+        task && typeof task === "object" ? task.output : void 0
+      );
+      session.progressState = progressStateFromInitialText(
+        analysis.rawAssistantText
+      );
+    } else if (session.mode === "continuation") {
+      if (!session.progressState) {
+        throw new Error("\u786E\u8BA4\u4EFB\u52A1\u7F3A\u5C11\u53EF\u6062\u590D\u7684\u77E5\u8BC6\u6811\u72B6\u6001");
+      }
+      const envelope = parseKnowledgeBaseProgressEnvelope(
+        analysis.rawAssistantText
+      );
+      const nextState = applyKnowledgeBaseProgressEnvelope(
+        session.progressState,
+        envelope
+      );
+      const presentation = assertKnowledgeBasePresentationMatchesState(
+        nextState,
+        analysis.rawAssistantText
+      );
+      assertKnowledgeBaseNodeImageDelivery({
+        presentation,
+        output: task && typeof task === "object" ? task.output : void 0
+      });
+      session.progressState = nextState;
+      session.confirmationCount += 1;
+    }
+  } catch (error) {
+    validationError = error instanceof Error ? error.message : String(error);
+  }
+  analysis = analyzeKnowledgeBaseLiveTask(task, {
+    mode: session.mode,
+    progressState: session.progressState,
+    confirmationCount: session.confirmationCount
+  });
+  if (validationError && !analysis.issues.some(
+    (issue) => issue === validationError || issue.endsWith(`\uFF1A${validationError}`)
+  )) {
+    analysis.issues.push(validationError);
+  }
+  analysis.protocolAccepted = !validationError && analysis.successfulTerminal && analysis.issues.length === 0;
+  if (!analysis.protocolAccepted) {
+    analysis.visibleMarkdown = "";
+    analysis.visibleCharacterCount = 0;
+    analysis.rawOutput = [];
+    analysis.imageCount = 0;
+  }
+  return analysis;
 }
 router11.get("/configuration", (_req, res) => {
   res.json({
@@ -46586,19 +47372,42 @@ router11.post("/start", async (req, res) => {
       return;
     }
     const sessionId = randomUUID28();
-    const analysis = analyzeKnowledgeBaseLiveTask(created.task, { mode });
+    let analysis = analyzeKnowledgeBaseLiveTask(created.task, { mode });
     const terminal = analysis.terminal;
-    if (terminal) {
+    if (terminal && mode === "protocol_probe") {
       await skill.removeOrphan().catch(() => void 0);
+    }
+    let progressState = null;
+    if (terminal && mode === "full" && analysis.issues.length === 0) {
+      assertKnowledgeBaseInitialImageDelivery(created.task.output);
+      progressState = createKnowledgeBaseProgressState(
+        parseKnowledgeBaseManifestEnvelope(analysis.rawAssistantText).leaves
+      );
+      analysis = analyzeKnowledgeBaseLiveTask(created.task, {
+        mode,
+        progressState
+      });
     }
     livePreviewSessions.set(sessionId, {
       taskId: created.task.id,
-      apiKey: terminal ? null : apiKey,
+      apiKey: mode === "protocol_probe" && terminal ? null : apiKey,
       mode,
       createdAt: Date.now(),
+      lastLoggedSummary: `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`,
+      progressState,
+      confirmationCount: 0,
+      skillAttachment: skill.attachment,
       removeSkill: skill.removeOrphan,
-      skillRemoved: terminal,
+      skillRemoved: terminal && mode === "protocol_probe",
       finalAnalysis: terminal ? analysis : null
+    });
+    console.info("[KnowledgeBaseLivePreview] task started", {
+      sessionId,
+      taskId: created.task.id,
+      mode,
+      status: analysis.status,
+      outputCount: analysis.outputCount,
+      visibleCharacterCount: analysis.visibleCharacterCount
     });
     res.status(201).json({
       sessionId,
@@ -46612,6 +47421,348 @@ router11.post("/start", async (req, res) => {
         message: error instanceof Error ? error.message : String(error)
       }
     });
+  }
+});
+router11.post("/recover", async (req, res) => {
+  const taskId = typeof req.body?.taskId === "string" ? req.body.taskId.trim() : "";
+  const apiKey = resolveLivePreviewApiKey(req.body?.apiKey);
+  if (!taskId || !apiKey) {
+    res.status(400).json({
+      error: {
+        code: "LIVE_PREVIEW_RECOVERY_INPUT_REQUIRED",
+        message: "\u6062\u590D\u771F\u5B9E\u4EFB\u52A1\u9700\u8981\u4EFB\u52A1 ID \u548C\u4E00\u6B21\u6027 API Key"
+      }
+    });
+    return;
+  }
+  try {
+    const response2 = await axios13.get(
+      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
+      {
+        headers: {
+          API_KEY: apiKey,
+          Authorization: `Bearer ${apiKey}`
+        },
+        timeout: 12e4,
+        validateStatus: () => true
+      }
+    );
+    if (response2.status < 200 || response2.status >= 300) {
+      res.status(response2.status).json({
+        error: {
+          code: "UPSTREAM_TASK_READ_FAILED",
+          message: `\u6062\u590D\u771F\u5B9E\u4EFB\u52A1\u5931\u8D25\uFF08${response2.status}\uFF09`
+        }
+      });
+      return;
+    }
+    const initialTask = selectInitialKnowledgeBaseLiveTask(response2.data);
+    let analysis = analyzeKnowledgeBaseLiveTask(initialTask, {
+      mode: "full"
+    });
+    if (!analysis.terminal) {
+      res.status(409).json({
+        error: {
+          code: "LIVE_PREVIEW_TASK_NOT_TERMINAL",
+          message: "\u8BE5\u4EFB\u52A1\u4ECD\u5728\u8FD0\u884C\uFF0C\u6682\u4E0D\u80FD\u6062\u590D\u4E3A\u786E\u8BA4\u72B6\u6001"
+        }
+      });
+      return;
+    }
+    if (analysis.issues.length > 0) {
+      res.status(422).json({
+        error: {
+          code: "LIVE_PREVIEW_RECOVERY_VALIDATION_FAILED",
+          message: analysis.issues.join("\uFF1B")
+        }
+      });
+      return;
+    }
+    assertKnowledgeBaseInitialImageDelivery(
+      initialTask && typeof initialTask === "object" ? initialTask.output : void 0
+    );
+    const progressState = progressStateFromInitialText(
+      analysis.rawAssistantText
+    );
+    analysis = analyzeKnowledgeBaseLiveTask(initialTask, {
+      mode: "full",
+      progressState,
+      confirmationCount: 0
+    });
+    const sessionId = randomUUID28();
+    livePreviewSessions.set(sessionId, {
+      taskId,
+      apiKey,
+      mode: "full",
+      createdAt: Date.now(),
+      lastLoggedSummary: `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`,
+      progressState,
+      confirmationCount: 0,
+      skillAttachment: null,
+      removeSkill: async () => void 0,
+      skillRemoved: true,
+      finalAnalysis: analysis
+    });
+    console.info("[KnowledgeBaseLivePreview] task recovered", {
+      sessionId,
+      taskId,
+      imageCount: analysis.imageCount,
+      leafCount: analysis.manifest?.leafCount || 0,
+      currentLeafId: progressState.currentLeafId
+    });
+    res.status(201).json({ sessionId, analysis });
+  } catch (error) {
+    res.status(502).json({
+      error: {
+        code: "LIVE_PREVIEW_RECOVERY_FAILED",
+        message: error instanceof Error ? error.message : String(error)
+      }
+    });
+  }
+});
+router11.post("/confirm", async (req, res) => {
+  const requestedSessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
+  let session = requestedSessionId ? livePreviewSessions.get(requestedSessionId) : void 0;
+  let sessionId = requestedSessionId;
+  const rehydrating = !session;
+  try {
+    if (!session) {
+      const sourceTaskId = typeof req.body?.sourceTaskId === "string" ? req.body.sourceTaskId.trim() : "";
+      const sourceRawAssistantText = typeof req.body?.sourceRawAssistantText === "string" ? req.body.sourceRawAssistantText : "";
+      if (!sourceTaskId || !sourceRawAssistantText) {
+        res.status(404).json({
+          error: {
+            code: "LIVE_PREVIEW_SESSION_NOT_FOUND",
+            message: "\u672C\u5730\u4F1A\u8BDD\u5DF2\u91CD\u542F\uFF0C\u8BF7\u4FDD\u7559\u9996\u8F6E\u7ED3\u679C\u540E\u91CD\u65B0\u63D0\u4EA4\u786E\u8BA4"
+          }
+        });
+        return;
+      }
+      sessionId = randomUUID28();
+      const confirmationCount = Math.max(
+        0,
+        Math.trunc(Number(req.body?.confirmationCount) || 0)
+      );
+      session = {
+        taskId: sourceTaskId,
+        apiKey: null,
+        mode: "continuation",
+        createdAt: Date.now(),
+        lastLoggedSummary: "",
+        progressState: rehydratedConfirmationProgressState({
+          initialText: sourceRawAssistantText,
+          revision: req.body?.sourceRevision ?? confirmationCount,
+          currentLeafId: req.body?.sourceCurrentLeafId ?? (confirmationCount === 0 ? void 0 : null),
+          confirmationCount
+        }),
+        confirmationCount,
+        skillAttachment: null,
+        removeSkill: async () => void 0,
+        skillRemoved: true,
+        finalAnalysis: null
+      };
+    }
+    if (!session.progressState || !session.progressState.currentLeafId) {
+      res.status(409).json({
+        error: {
+          code: "LIVE_PREVIEW_NO_CURRENT_LEAF",
+          message: "\u5F53\u524D\u77E5\u8BC6\u6811\u6CA1\u6709\u53EF\u786E\u8BA4\u8282\u70B9"
+        }
+      });
+      return;
+    }
+    if (!rehydrating && !session.finalAnalysis) {
+      res.status(409).json({
+        error: {
+          code: "LIVE_PREVIEW_TURN_RUNNING",
+          message: "\u4E0A\u4E00\u8F6E\u786E\u8BA4\u4ECD\u5728\u8FD0\u884C"
+        }
+      });
+      return;
+    }
+    const apiKey = resolveLivePreviewApiKey(req.body?.apiKey) || session.apiKey;
+    if (!apiKey) {
+      res.status(503).json({
+        error: {
+          code: "LIVE_API_KEY_REQUIRED",
+          message: "\u9996\u6B21\u7EE7\u7EED\u786E\u8BA4\u65F6\u9700\u8981\u5728\u9875\u9762\u63D0\u4EA4\u4E00\u6B21\u6027 API Key"
+        }
+      });
+      return;
+    }
+    if (!session.skillAttachment) {
+      const descriptor = await getKnowledgeBaseSkillDescriptor();
+      const currentSkill = await uploadKnowledgeBaseSkillArchive({
+        baseUrl: getUpstreamBaseUrl(),
+        apiKey,
+        skillVersion: descriptor.version,
+        skillContentHash: descriptor.contentHash
+      });
+      const previousRemoveSkill = session.removeSkill;
+      session.skillAttachment = currentSkill.attachment;
+      session.removeSkill = async () => {
+        await Promise.allSettled([
+          previousRemoveSkill(),
+          currentSkill.removeOrphan()
+        ]);
+      };
+      session.skillRemoved = false;
+    }
+    const prompt = await buildKnowledgeBaseTurnPrompt({
+      userId: 0,
+      conversationId: `live-preview-${sessionId}`,
+      userMessage: "\u786E\u8BA4",
+      attachments: [],
+      skillVersion: "3",
+      progressOverride: progressOverrideFromState(session.progressState)
+    });
+    const created = await createFrontMindTask({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey,
+      prompt,
+      attachments: [session.skillAttachment],
+      taskId: session.taskId
+    });
+    if (!created.ok) {
+      res.status(created.status).json({
+        error: {
+          code: "LIVE_PREVIEW_CONFIRM_FAILED",
+          message: created.detail
+        }
+      });
+      return;
+    }
+    session.taskId = created.task.id;
+    session.apiKey = apiKey;
+    session.mode = "continuation";
+    session.createdAt = Date.now();
+    session.finalAnalysis = null;
+    let analysis = analyzeKnowledgeBaseLiveTask(created.task, {
+      mode: "continuation",
+      progressState: session.progressState,
+      confirmationCount: session.confirmationCount
+    });
+    if (analysis.terminal) {
+      analysis = reconcileTerminalLiveAnalysis(session, created.task);
+      session.finalAnalysis = analysis;
+    }
+    session.lastLoggedSummary = `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`;
+    livePreviewSessions.set(sessionId, session);
+    console.info("[KnowledgeBaseLivePreview] confirmation started", {
+      sessionId,
+      taskId: session.taskId,
+      confirmationNumber: session.confirmationCount + 1,
+      revision: session.progressState.revision,
+      currentLeafId: session.progressState.currentLeafId,
+      status: analysis.status
+    });
+    res.status(201).json({ sessionId, analysis });
+  } catch (error) {
+    res.status(422).json({
+      error: {
+        code: "LIVE_PREVIEW_CONFIRM_FAILED",
+        message: error instanceof Error ? error.message : String(error)
+      }
+    });
+  }
+});
+router11.get("/:sessionId/external-image", async (req, res) => {
+  const session = livePreviewSessions.get(req.params.sessionId);
+  const imageUrl = typeof req.query.url === "string" ? req.query.url : "";
+  if (!session?.finalAnalysis || !imageUrl) {
+    res.status(404).end();
+    return;
+  }
+  const allowedImages = collectKnowledgeBaseOutputImageResourceAliases(
+    session.finalAnalysis.rawOutput
+  );
+  if (!allowedImages.has(imageUrl)) {
+    res.status(403).end();
+    return;
+  }
+  const maxBytes = 32 * 1024 * 1024;
+  try {
+    const imageResponse = await axios13.get(assertSafeExternalUrl(imageUrl), {
+      ...safeExternalRequestOptions,
+      responseType: "arraybuffer",
+      timeout: 12e4,
+      maxContentLength: maxBytes,
+      maxBodyLength: maxBytes,
+      validateStatus: () => true
+    });
+    if (imageResponse.status < 200 || imageResponse.status >= 300) {
+      res.status(404).end();
+      return;
+    }
+    await sendLivePreviewImage(res, imageResponse.data, maxBytes);
+  } catch {
+    res.status(502).end();
+  }
+});
+router11.get("/:sessionId/files/:fileId", async (req, res) => {
+  const session = livePreviewSessions.get(req.params.sessionId);
+  const fileId = String(req.params.fileId || "").trim();
+  if (!session?.apiKey || !session.finalAnalysis || !fileId) {
+    res.status(404).end();
+    return;
+  }
+  const allowedFileIds = collectKnowledgeBasePreviewFileIds(
+    session.finalAnalysis.rawOutput
+  );
+  if (!allowedFileIds.has(fileId)) {
+    res.status(403).end();
+    return;
+  }
+  const headers = {
+    API_KEY: session.apiKey,
+    Authorization: `Bearer ${session.apiKey}`
+  };
+  const maxBytes = 32 * 1024 * 1024;
+  try {
+    let imageResponse = await axios13.get(
+      `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}/content`,
+      {
+        headers,
+        responseType: "arraybuffer",
+        timeout: 12e4,
+        maxContentLength: maxBytes,
+        maxBodyLength: maxBytes,
+        validateStatus: () => true
+      }
+    );
+    const contentType = String(imageResponse.headers["content-type"] || "");
+    if (imageResponse.status < 200 || imageResponse.status >= 300 || contentType.includes("application/json")) {
+      const metadata = await axios13.get(
+        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
+        {
+          headers,
+          timeout: 12e4,
+          validateStatus: () => true
+        }
+      );
+      const downloadUrl = String(
+        metadata.data?.upload_url || metadata.data?.download_url || metadata.data?.file_url || ""
+      );
+      if (metadata.status < 200 || metadata.status >= 300 || !downloadUrl) {
+        res.status(404).end();
+        return;
+      }
+      imageResponse = await axios13.get(assertSafeExternalUrl(downloadUrl), {
+        ...safeExternalRequestOptions,
+        responseType: "arraybuffer",
+        timeout: 12e4,
+        maxContentLength: maxBytes,
+        maxBodyLength: maxBytes,
+        validateStatus: () => true
+      });
+    }
+    if (imageResponse.status < 200 || imageResponse.status >= 300) {
+      res.status(415).end();
+      return;
+    }
+    await sendLivePreviewImage(res, imageResponse.data, maxBytes);
+  } catch {
+    res.status(502).end();
   }
 });
 router11.get("/:sessionId", async (req, res) => {
@@ -46662,13 +47813,33 @@ router11.get("/:sessionId", async (req, res) => {
       });
       return;
     }
-    const analysis = analyzeKnowledgeBaseLiveTask(response2.data, {
-      mode: session.mode
+    let analysis = analyzeKnowledgeBaseLiveTask(response2.data, {
+      mode: session.mode,
+      progressState: session.progressState,
+      confirmationCount: session.confirmationCount
     });
     if (analysis.terminal) {
+      analysis = reconcileTerminalLiveAnalysis(session, response2.data);
+    }
+    const summary = `${analysis.status}:${analysis.outputCount}:${analysis.visibleCharacterCount}`;
+    if (summary !== session.lastLoggedSummary) {
+      session.lastLoggedSummary = summary;
+      console.info("[KnowledgeBaseLivePreview] task updated", {
+        sessionId: req.params.sessionId,
+        taskId: session.taskId,
+        mode: session.mode,
+        status: analysis.status,
+        outputCount: analysis.outputCount,
+        visibleCharacterCount: analysis.visibleCharacterCount,
+        issueCount: analysis.issues.length
+      });
+    }
+    if (analysis.terminal) {
       session.finalAnalysis = analysis;
-      session.apiKey = null;
-      if (!session.skillRemoved) {
+      if (session.mode === "protocol_probe") {
+        session.apiKey = null;
+      }
+      if (session.mode === "protocol_probe" && !session.skillRemoved) {
         session.skillRemoved = true;
         void session.removeSkill().catch(() => void 0);
       }

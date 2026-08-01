@@ -111,7 +111,7 @@ that carry the legacy evidence-proportional value remain readable.
 
 ## Image discovery, quality and coverage
 
-Acquire at most three distinct classic enterprise images for the entire build.
+Acquire exactly three distinct classic enterprise images for the entire build.
 Inspect only the minimum first-party pages or uploads needed to fill these
 ordered slots, and stop all image discovery as soon as three eligible assets
 have been validated:
@@ -121,10 +121,13 @@ have been validated:
 3. one representative product UI, product diagram, architecture figure or
    typical official product image.
 
-If an eligible slot does not exist, package fewer than three images. Never fill
-a slot with a duplicate crop, alternate encoding, translated copy, badge, icon,
-decorative background or unrelated stock image. Deduplicate by decoded content
-and visual identity, not URL or filename alone.
+Do not emit a successful initial manifest until all three slots are backed by
+downloaded, decoded first-party bytes. Never fill a slot with a duplicate crop,
+alternate encoding, translated copy, badge, icon, decorative background,
+unrelated stock image, placeholder or hotlink. If three eligible assets cannot
+be obtained within the hard ceilings, fail the build honestly instead of
+claiming a complete first turn. Deduplicate by decoded content and visual
+identity, not URL or filename alone.
 
 Only package validated first-party AVIF, WebP, PNG, JPEG or GIF bytes. Rasterize
 useful SVGs, deduplicate decoded content, and never upscale a small raster to
@@ -162,7 +165,7 @@ these three roles and may be lower than the total successfully parsed pages.
 ### First-leaf-only image delivery
 
 Associate all validated classic assets only with the manifest's first leaf
-(normally `1.1 一句话定位`). On the initial turn, return its one to three exact
+(normally `1.1 一句话定位`). On the initial turn, return its exactly three
 validated local image bytes as real response image/file attachments below the
 first-leaf body. Use stable asset IDs, packaged filenames and meaningful alt or
 caption metadata. Never substitute Markdown-only paths, origin/CDN URLs, source
@@ -176,9 +179,9 @@ Response attachments on the first turn are delivery copies of the same bytes
 included in the final ZIP.
 
 `target_met` means all recorded candidates were inspected and the three classic
-asset roles were met. `source_limited` requires all recorded candidates
-inspected plus a concrete missing classic-asset role. `budget_limited` requires
-real uninspected candidates. Badges do not satisfy any classic-asset role.
+asset roles were met. A new successful build must use `target_met`; a
+`source_limited` or `budget_limited` result is an internal failure diagnostic,
+not a deliverable initial turn. Badges do not satisfy any classic-asset role.
 
 ## Confirmation state
 
@@ -202,6 +205,25 @@ one of the adaptive 8–115 leaves, with the final stable `id`, `title`,
 `branchId`, and `branchTitle` of each leaf. A branch/leaf count, the current
 leaf, an internal tree object, or a state summary never substitutes for the
 complete manifest.
+
+For every later turn, copy the exact revision, leaf IDs, statuses and envelope
+values supplied by the service for that turn. The progress object has one
+nested `transition`; `action`, `leafId` and `status` are never top-level
+progress fields. This is the canonical shape:
+
+```text
+<!-- FRONTMIND_KB_PROGRESS
+{"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":0,"transition":{"leafId":"1.1","from":"current","to":"confirmed","reason":"用户明确确认"}}
+-->
+<!-- FRONTMIND_KB_PRESENTATION
+{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}
+-->
+```
+
+The service prompt supplies the authoritative values and a complete pair for
+the current turn. Emit that pair after the visible body without translating it
+to an older schema. A legacy object such as
+`{"action":"confirm","leafId":"1.1","status":"confirmed"}` is invalid.
 
 1. The first turn researches, builds the full tree and all prefilled formal
    drafts, then presents only the first leaf and one manifest envelope.

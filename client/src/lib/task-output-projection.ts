@@ -83,6 +83,22 @@ function knowledgeBaseProtocolTarget(
   return null;
 }
 
+function isSafeKnowledgeBaseRunningMessage(item: OutputMessage): boolean {
+  if (item.role !== "assistant" && item.type !== "message" && item.type) {
+    return false;
+  }
+  const text = outputMessageText(item).trim();
+  if (
+    !text ||
+    text.length > 1_000 ||
+    /FRONTMIND_KB_|SOCRATIC_KB_STATE/i.test(text)
+  ) {
+    return false;
+  }
+  if (extractKnowledgeBaseProtocolObjects(text).length > 0) return false;
+  return /正在|处理中|资料采集|资料收集|检索中|研究阶段/.test(text);
+}
+
 function stableOutputIdentity(item: OutputMessage): string | undefined {
   const resourceTypes = new Set([
     "output_image",
@@ -230,9 +246,15 @@ export function outputForKnowledgeProgress(
  */
 export function outputForKnowledgePresentation(
   output: OutputMessage[],
-  _slicedOutput: OutputMessage[],
+  slicedOutput: OutputMessage[],
   expected?: KnowledgeBasePresentationTarget,
 ): OutputMessage[] {
+  if (!expected) {
+    return dedupeStableOutput(
+      slicedOutput.filter(isSafeKnowledgeBaseRunningMessage),
+    );
+  }
+
   const protocolMessages = output.flatMap((item, index) => {
     if (item.role !== "assistant" && item.type !== "message" && item.type) {
       return [];
@@ -240,15 +262,13 @@ export function outputForKnowledgePresentation(
     const target = knowledgeBaseProtocolTarget(item);
     return target ? [{ index, target }] : [];
   });
-  const authoritative = expected
-    ? [...protocolMessages]
-        .reverse()
-        .find(
-          ({ target }) =>
-            target.revision === expected.revision &&
-            target.leafId === expected.leafId,
-        )
-    : protocolMessages[protocolMessages.length - 1];
+  const authoritative = [...protocolMessages]
+    .reverse()
+    .find(
+      ({ target }) =>
+        target.revision === expected.revision &&
+        target.leafId === expected.leafId,
+    );
   if (!authoritative) return [];
 
   const resourceTypes = new Set([
