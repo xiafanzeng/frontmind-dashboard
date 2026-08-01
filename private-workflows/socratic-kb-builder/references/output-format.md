@@ -77,7 +77,7 @@ Use this exact top-level contract. Extra fields are forbidden:
       "evidenceStatus": "verified_first_party",
       "sourceIds": ["source-official-products"],
       "evidenceDocumentIds": ["evidence-official-products"],
-      "assetIds": ["asset-product-family-a"],
+      "assetIds": [],
       "customerVisible": true,
       "evidenceCharacters": 24000,
       "requiredFormalCharacters": 5000,
@@ -93,7 +93,7 @@ Use this exact top-level contract. Extra fields are forbidden:
       "evidenceStatus": "verified_first_party",
       "sourceIds": ["source-official-products"],
       "evidenceDocumentIds": ["evidence-official-products"],
-      "assetIds": ["asset-product-family-a"],
+      "assetIds": ["asset-company-logo"],
       "customerVisible": true,
       "evidenceCharacters": 24000,
       "requiredFormalCharacters": 500,
@@ -113,37 +113,37 @@ Use this exact top-level contract. Extra fields are forbidden:
   ],
   "assets": [
     {
-      "id": "asset-product-family-a",
-      "path": "branches/products/images/family-a.webp",
+      "id": "asset-company-logo",
+      "path": "09_media_assets/company-logo.png",
       "sha256": "64-lowercase-hex-characters",
-      "mimeType": "image/webp",
+      "mimeType": "image/png",
       "bytes": 123456,
-      "width": 1600,
-      "height": 900,
-      "caption": "产品族 A 官方主图",
-      "alt": "产品族 A 外观",
+      "width": 512,
+      "height": 512,
+      "caption": "企业官方 Logo",
+      "alt": "企业 Logo",
       "branchId": "products",
-      "documentIds": ["overview-products", "leaf-product-family-a"],
-      "sourcePageUrl": "https://official.example/products/a",
-      "sourceAssetUrl": "https://official.example/media/a.webp",
+      "documentIds": ["leaf-product-family-a"],
+      "sourcePageUrl": "https://official.example/",
+      "sourceAssetUrl": "https://official.example/media/logo.png",
       "ownership": "first_party",
-      "assetType": "product_ui",
-      "displayRole": "hero"
+      "assetType": "brand_identity",
+      "displayRole": "badge"
     }
   ],
   "counts": {
     "totalFiles": 400,
     "customerVisibleCharacters": 120000,
     "evidenceCharacters": 1800000,
-    "packagedImages": 3
+    "packagedImages": 1
   },
   "imageSelection": {
     "status": "target_met",
-    "discoveredCandidateImages": 4,
-    "inspectedCandidateImages": 4,
-    "eligibleFirstPartyImages": 3,
+    "discoveredCandidateImages": 2,
+    "inspectedCandidateImages": 2,
+    "eligibleFirstPartyImages": 1,
     "rejectedCandidateImages": 1,
-    "scannedSourcePages": 3,
+    "scannedSourcePages": 1,
     "discoveryMethods": [
       "img",
       "srcset",
@@ -154,24 +154,22 @@ Use this exact top-level contract. Extra fields are forbidden:
       "gallery",
       "official_document"
     ],
-    "rejectionReasons": [{ "reason": "重复字节", "count": 1 }],
-    "stopReason": "已取得三张互不重复的经典企业图片，停止图片发现",
-    "productFamilyCoverage": [
-      {
-        "familyId": "family-a",
-        "familyName": "产品族 A",
-        "officialImageAvailable": true,
-        "assetIds": ["asset-product-family-a"],
-        "checkedSources": ["https://official.example/products/a"]
-      }
-    ],
+    "rejectionReasons": [{ "reason": "favicon 不是企业主 Logo", "count": 1 }],
+    "stopReason": "已取得企业官方 Logo，停止图片发现",
     "candidates": [
       {
-        "url": "https://official.example/media/a.webp",
-        "sourcePageUrl": "https://official.example/products/a",
+        "url": "https://official.example/media/logo.png",
+        "sourcePageUrl": "https://official.example/",
         "method": "img",
         "status": "eligible",
-        "assetId": "asset-product-family-a"
+        "assetId": "asset-company-logo"
+      },
+      {
+        "url": "https://official.example/favicon.ico",
+        "sourcePageUrl": "https://official.example/",
+        "method": "img",
+        "status": "rejected",
+        "rejectionReason": "favicon 不是企业主 Logo"
       }
     ]
   }
@@ -204,10 +202,10 @@ Document and asset IDs are stable and unique. Every `assetIds` and
 
 ## Conversational presentation assets
 
-Associate the archive's exactly three classic assets only with the manifest's
-first leaf. Return all three validated local bytes as actual response image/file
-attachments on the initial first-leaf turn. Do not return source hotlinks or
-only write a relative Markdown path. Every later turn is text-only. Each
+Associate the archive's sole official company Logo only with the manifest's
+first leaf. Return that one validated local byte as an actual response
+image/file attachment on the initial first-leaf turn. Do not return source
+hotlinks or only write a relative Markdown path. Every later turn is text-only. Each
 non-null `FRONTMIND_KB_PRESENTATION` envelope therefore uses
 `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`;
 `not_applicable` is reserved for `leafId: null` after completion.
@@ -226,26 +224,24 @@ For schema version 2, compute `requiredFormalCharacters` exactly:
   evidence; otherwise use `limited_evidence`. Formal content must meet the
   computed requirement, but must not be padded to reach the target.
 
-`imageSelection` is an auditable discovery funnel. `inspectedCandidateImages`
+`imageSelection` is an auditable Logo-discovery funnel. `inspectedCandidateImages`
 equals eligible plus rejected candidates and cannot exceed discovered
 candidates. Rejection-reason counts sum to rejected candidates. List every
-discovery method actually checked and every core product/service family.
-When `officialImageAvailable` is true, `assetIds` must contain at least one
-packaged image; otherwise provide a concrete `gapReason` and non-empty
-`checkedSources`. Every product/service leaf must carry `productFamilyId`;
-v2 uses this field—not title keywords—to identify product/service families and
-their branches. At least one family is required. If one leaf in a branch has
-`productFamilyId`, every leaf in that branch must declare it. The distinct leaf
-family IDs and `productFamilyCoverage` IDs must match exactly.
+discovery method actually checked. Every product/service leaf must still carry
+`productFamilyId`; this field identifies product/service families and their
+branches independently of image selection. At least one family is required. If
+one leaf in a branch has `productFamilyId`, every leaf in that branch must
+declare it.
 
 List every inspected candidate with URL, source page, actual method and
 `eligible`, `rejected`, or `uninspected` status. Use `target_met` only when all
-candidates were inspected and the three classic image roles are filled. Use
+candidates were inspected and exactly one official company Logo is packaged as
+`brand_identity` with display role `badge`. Use
 `source_limited` after inspecting
 every candidate when a concrete coverage gap remains, or `budget_limited` when
 real candidates remain uninspected. Both limited statuses require a non-empty
 `shortfallReason` and `stopReason`. Stop image discovery immediately after
-three distinct eligible classic assets. Never reduce a counter to make a
+the first eligible official company Logo. Never reduce a counter to make a
 shortfall pass.
 
 The manifest counts must match the actual ZIP:
@@ -254,7 +250,7 @@ The manifest counts must match the actual ZIP:
 - `customerVisibleCharacters`: validator-counted formal characters.
 - `evidenceCharacters`: retained deduplicated evidence characters, maximum
   3,000,000.
-- `packagedImages`: unique validated first-party image files, exactly 3.
+- `packagedImages`: unique validated first-party image files, exactly 1.
 
 Keep all existing `00_completeness.json` fields, evidence statuses, and
 completeness calculations unchanged. Do not derive completeness from resource
@@ -273,12 +269,12 @@ use or target attainment.
 - Ownership must be exactly `first_party`.
 - Every asset must belong to a branch and at least one customer-visible
   document.
-- Every v2 asset declares `assetType` and `displayRole`. `hero` images are at
-  least 1200×600, `badge` images at least 256×256, and other `inline` images at
-  least 800×450. Product-family coverage uses only `product_ui`,
-  `product_diagram`, or `case_photo`.
+- The sole v3 asset declares `assetType: brand_identity` and
+  `displayRole: badge`, and is at least 256×256. No business, hero, product,
+  UI, architecture, case, team, environment, certificate or other image may be
+  packaged.
 - `imageSelection.scannedSourcePages` must not exceed successfully parsed
-  official pages; only pages actually inspected for the three classic assets
+  official pages; only pages actually inspected for the primary official Logo
   count here.
 
 ## Required reports
@@ -289,7 +285,8 @@ and bytes, document parsing, upload processing, and budget stops.
 
 The public-web report records every query, language, result domain,
 selected/rejected source, conflict, and unresolved gap. The media-gap report
-explains any brand, product-family or inspection coverage gap.
+explains any Logo discovery or inspection gap. It does not request
+product-family or business imagery.
 
 ## `00_completeness.json`
 

@@ -18,7 +18,7 @@ page and direct asset URLs for every third-party lead.
 ## First research turn
 
 Complete bounded research and the adaptive manifest before the first
-confirmation. Respect the 1,200 HTML, 1,800 total-link, 3-image,
+confirmation. Respect the 1,200 HTML, 1,800 total-link, 1-image,
 120-document, 100-upload, 120-query, 3-million-evidence-character, and
 330/360-minute gates from `SKILL.md`.
 
@@ -26,8 +26,8 @@ The first customer-visible answer must:
 
 - Display branch counts and the true 8–115 leaf total.
 - Present the first leaf as polished formal content.
-- Show up to three distinct classic images whose bytes were downloaded,
-  validated, assigned stable asset IDs and associated only with the first leaf.
+- Show exactly one official company Logo whose bytes were downloaded,
+  validated, assigned a stable asset ID and associated only with the first leaf.
 - End the visible body after the first leaf. Do not add citations, source
   lists, unresolved items, action guidance or a confirmation question.
 - End with exactly one valid `FRONTMIND_KB_MANIFEST` envelope. The application
@@ -41,8 +41,8 @@ Do not dump raw snapshots, page excerpts, crawl logs, or internal planning.
 For the current leaf, show only:
 
 1. The publication-ready draft.
-2. On the initial first-leaf turn only, up to three distinct classic
-   first-party images. Every later turn is text-only.
+2. On the initial first-leaf turn only, exactly one official company Logo.
+   Every later turn is text-only.
 
 Do not add a `参考资料`, `参考来源`, `References` or `Sources` section. Do not
 use numbered citation markers or external citation links in the visible body.
@@ -78,12 +78,12 @@ benchmarks until confirmed. An absence of evidence is not a negative claim.
 
 ## Images in the interaction
 
-Only the initial first-leaf answer may show packaged, validated first-party
-assets. Select at most one primary logo, one brand hero and one representative
-product/UI/architecture image, deduplicated by visual content. Use captions and
-alt text from `00_package_manifest.json`. Never show a filename or remote URL
-as if it were a successfully packaged image. Never return an image attachment
-on a later confirmation, revision or reopened-leaf turn.
+Only the initial first-leaf answer may show a packaged, validated first-party
+asset. Select exactly one primary official company Logo and do not select a
+business, hero, product, UI, architecture, case or other image. Use its caption
+and alt text from `00_package_manifest.json`. Never show a filename or remote
+URL as if it were a successfully packaged image. Never return an image
+attachment on a later confirmation, revision or reopened-leaf turn.
 
 ## Final turn
 

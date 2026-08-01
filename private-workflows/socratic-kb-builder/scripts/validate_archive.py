@@ -25,7 +25,7 @@ MAX_COMPRESSED_BYTES = 250 * MIB
 MAX_UNCOMPRESSED_BYTES = 200 * MIB
 MAX_IMAGE_BYTES = 30 * MIB
 MAX_FILES = 1_500
-MAX_IMAGES = 3
+MAX_IMAGES = 1
 MIN_LEAVES = 8
 MAX_LEAVES = 115
 TARGET_FORMAL_CHARACTERS_MIN = 80_000
@@ -126,18 +126,8 @@ CUSTOMER_FORMAL_LEAKAGE = (
         ),
     ),
 )
-ASSET_TYPES = {
-    "brand_identity",
-    "product_ui",
-    "product_diagram",
-    "case_photo",
-    "team_photo",
-    "environment_photo",
-    "certificate_badge",
-    "document_figure",
-    "other",
-}
-DISPLAY_ROLES = {"hero", "inline", "badge"}
+ASSET_TYPES = {"brand_identity"}
+DISPLAY_ROLES = {"badge"}
 MANIFEST_KEYS = {
     "schemaVersion",
     "profile",
@@ -224,7 +214,6 @@ IMAGE_SELECTION_KEYS = {
     "discoveryMethods",
     "rejectionReasons",
     "stopReason",
-    "productFamilyCoverage",
     "candidates",
     "shortfallReason",
 }
@@ -708,6 +697,7 @@ def validate_archive(path: Path) -> list[str]:
         formal_total = 0
         evidence_total = 0
         leaf_count = 0
+        first_leaf_id: str | None = None
         branch_leaf_ids: dict[str, list[str]] = {}
         branch_overviews: dict[str, int] = {}
         formal_hashes: dict[str, str] = {}
@@ -899,6 +889,8 @@ def validate_archive(path: Path) -> list[str]:
                 _ = evidence_document_ids
             if kind == "leaf":
                 leaf_count += 1
+                if first_leaf_id is None:
+                    first_leaf_id = doc_id
                 branch_leaf_ids.setdefault(branch_id, []).append(doc_id)
                 if evidence_status in actual_leaf_status_counts:
                     actual_leaf_status_counts[evidence_status] += 1
@@ -1393,11 +1385,11 @@ def validate_archive(path: Path) -> list[str]:
                 )
             validation.require(
                 asset_type in ASSET_TYPES,
-                f"{where}.assetType is invalid",
+                f"{where}.assetType must be brand_identity",
             )
             validation.require(
                 display_role in DISPLAY_ROLES,
-                f"{where}.displayRole is invalid",
+                f"{where}.displayRole must be badge",
             )
             badge_type = asset_type in {"brand_identity", "certificate_badge"}
             validation.require(
@@ -1508,8 +1500,8 @@ def validate_archive(path: Path) -> list[str]:
             asset_hashes.add(actual_digest)
             image_bytes_total += len(data)
             validation.require(
-                bool(related_documents),
-                f"{where}.documentIds must contain at least one document",
+                related_documents == [first_leaf_id],
+                f"{where}.documentIds must contain only the first leaf",
             )
             for document_id in related_documents:
                 validation.require(
@@ -1589,7 +1581,6 @@ def validate_archive(path: Path) -> list[str]:
         discovery_methods = image_selection.get("discoveryMethods")
         rejection_reasons = image_selection.get("rejectionReasons")
         stop_reason = image_selection.get("stopReason")
-        product_families = image_selection.get("productFamilyCoverage")
         candidates = image_selection.get("candidates")
         shortfall = image_selection.get("shortfallReason")
         require_exact_keys(
@@ -1800,7 +1791,7 @@ def validate_archive(path: Path) -> list[str]:
                 and {str(method).strip() for method in discovery_methods}
                 <= REQUIRED_IMAGE_DISCOVERY_METHODS,
                 "imageSelection.discoveryMethods must record only methods "
-                "actually used to obtain the classic assets",
+                "actually used to obtain the official company Logo",
             )
         validation.require(
             isinstance(stop_reason, str) and bool(stop_reason.strip()),
@@ -1831,75 +1822,6 @@ def validate_archive(path: Path) -> list[str]:
                 rejection_total == rejected,
                 "image rejection-reason counts must equal rejectedCandidateImages",
             )
-        validation.require(
-            isinstance(product_families, list),
-            "imageSelection.productFamilyCoverage must be an array",
-        )
-        if isinstance(product_families, list):
-            family_ids: set[str] = set()
-            for index, family in enumerate(product_families):
-                where = f"imageSelection.productFamilyCoverage[{index}]"
-                if not isinstance(family, dict):
-                    validation.errors.append(f"{where} must be an object")
-                    continue
-                official_available = family.get("officialImageAvailable")
-                required_family_keys = {
-                    "familyId",
-                    "familyName",
-                    "officialImageAvailable",
-                    "assetIds",
-                    "checkedSources",
-                } | (set() if official_available is True else {"gapReason"})
-                require_exact_keys(
-                    family,
-                    allowed=required_family_keys | {"gapReason"},
-                    required=required_family_keys,
-                    where=where,
-                    validation=validation,
-                )
-                family_id = require_string(family, "familyId", where, validation)
-                require_string(family, "familyName", where, validation)
-                family_assets = require_string_list(
-                    family, "assetIds", where, validation
-                )
-                checked_sources = require_string_list(
-                    family, "checkedSources", where, validation
-                )
-                validation.require(
-                    isinstance(official_available, bool),
-                    f"{where}.officialImageAvailable must be boolean",
-                )
-                validation.require(
-                    family_id not in family_ids,
-                    f"duplicate product family id: {family_id}",
-                )
-                family_ids.add(family_id)
-                validation.require(
-                    all(asset_id in assets for asset_id in family_assets),
-                    f"{where}.assetIds contains an unknown packaged image",
-                )
-                validation.require(
-                    bool(checked_sources),
-                    f"{where}.checkedSources must identify inspected official sources",
-                )
-                if official_available is True:
-                    validation.require(
-                        all(
-                            assets.get(asset_id, {}).get("assetType")
-                            in {"product_ui", "product_diagram", "case_photo"}
-                            for asset_id in family_assets
-                        ),
-                        f"{where} product coverage must use product UI, diagram, "
-                        "or case imagery",
-                    )
-                else:
-                    require_string(family, "gapReason", where, validation)
-            validation.require(
-                family_ids == product_family_ids,
-                "imageSelection.productFamilyCoverage IDs must exactly match "
-                f"product/service leaf family IDs; coverage={sorted(family_ids)}, "
-                f"leaves={sorted(product_family_ids)}",
-            )
         if (
             isinstance(eligible, int)
             and not isinstance(eligible, bool)
@@ -1925,26 +1847,14 @@ def validate_archive(path: Path) -> list[str]:
                 validation.require(
                     len(uninspected_candidates) == 0
                     and len(asset_paths) == MAX_IMAGES
-                    and any(
+                    and all(
                         asset.get("assetType") == "brand_identity"
-                        for asset in assets.values()
-                    )
-                    and any(
-                        asset.get("displayRole") == "hero"
-                        for asset in assets.values()
-                    )
-                    and any(
-                        asset.get("assetType")
-                        in {
-                            "product_ui",
-                            "product_diagram",
-                            "case_photo",
-                            "document_figure",
-                        }
+                        and asset.get("displayRole") == "badge"
+                        and asset.get("documentIds") == [first_leaf_id]
                         for asset in assets.values()
                     ),
-                    "target_met requires three distinct classic assets: "
-                    "brand identity, brand hero, and representative product imagery",
+                    "target_met requires exactly one official company Logo "
+                    "linked only to the first leaf",
                 )
                 validation.require(
                     "shortfallReason" not in image_selection,

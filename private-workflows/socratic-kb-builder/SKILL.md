@@ -1,12 +1,12 @@
 ---
 name: socratic-kb-builder
-description: Build a deep illustrated enterprise encyclopedia, keep formal customer prose separate from evidence, and confirm one prefilled leaf at a time.
+description: Build a deep enterprise encyclopedia with one official company logo, keep formal customer prose separate from evidence, and confirm one prefilled leaf at a time.
 ---
 
 # Socratic Enterprise Knowledge Base Builder
 
 Build a reusable Chinese enterprise encyclopedia with deep evidence coverage,
-real first-party images and one-leaf-at-a-time confirmation.
+exactly one official company logo and one-leaf-at-a-time confirmation.
 
 ## Execution mode
 
@@ -22,7 +22,7 @@ real first-party images and one-leaf-at-a-time confirmation.
 Hard ceilings: 1,200 official HTML attempts, 1,800 visited links, 120 useful
 official documents, 100 cumulative uploads, 120 public queries, 3,000,000
 retained evidence characters, 180,000 customer-visible characters, 8–115
-leaves, 1,500 ZIP files, 3 images and 30 MiB of image bytes. Stop duplicate
+leaves, 1,500 ZIP files, 1 image and 30 MiB of image bytes. Stop duplicate
 SKUs, pagination, translated copies and low-value news before they displace
 uncovered business dimensions.
 
@@ -109,25 +109,21 @@ and formal character counts so the service-side finalizer can verify them. For
 new adaptive documents set `requiredFormalCharacters` to `0`; older archives
 that carry the legacy evidence-proportional value remain readable.
 
-## Image discovery, quality and coverage
+## Logo discovery and quality
 
-Acquire exactly three distinct classic enterprise images for the entire build.
-Inspect only the minimum first-party pages or uploads needed to fill these
-ordered slots, and stop all image discovery as soon as three eligible assets
-have been validated:
+Acquire exactly one image for the entire build: the enterprise's primary
+official Logo. Inspect only the minimum first-party page, official document or
+user upload needed to obtain it, then stop all image discovery immediately.
 
-1. the primary logo or brand identity asset;
-2. one official brand hero or representative enterprise visual;
-3. one representative product UI, product diagram, architecture figure or
-   typical official product image.
-
-Do not emit a successful initial manifest until all three slots are backed by
-downloaded, decoded first-party bytes. Never fill a slot with a duplicate crop,
-alternate encoding, translated copy, badge, icon, decorative background,
-unrelated stock image, placeholder or hotlink. If three eligible assets cannot
-be obtained within the hard ceilings, fail the build honestly instead of
-claiming a complete first turn. Deduplicate by decoded content and visual
-identity, not URL or filename alone.
+Do not search for or package a brand hero, business visual, product image,
+product UI, architecture diagram, case image, team image, environment image,
+certificate image or any other non-Logo visual. Do not emit a successful
+initial manifest until the Logo is backed by downloaded and decoded
+first-party bytes. Never substitute a favicon, app icon, badge, logo collage,
+decorative background, stock image, placeholder or hotlink. If the primary
+official Logo cannot be obtained within the hard ceilings, fail the build
+honestly instead of claiming a complete first turn. Deduplicate by decoded
+content and visual identity, not URL or filename alone.
 
 Only package validated first-party AVIF, WebP, PNG, JPEG or GIF bytes. Rasterize
 useful SVGs, deduplicate decoded content, and never upscale a small raster to
@@ -140,36 +136,31 @@ package them under `09_media_assets/`; customer documents reference only the
 packaged relative asset path. If the bytes cannot be downloaded and decoded,
 reject the candidate instead of returning a broken image link.
 
-Every v2 asset includes:
+The sole v3 asset must use:
 
-- `assetType`: `brand_identity | product_ui | product_diagram | case_photo |
-team_photo | environment_photo | certificate_badge | document_figure | other`
-- `displayRole`: `hero | inline | badge`
+- `assetType`: `brand_identity`
+- `displayRole`: `badge`
 
-Minimum dimensions:
-
-- `hero`: 1200×600;
-- a `brand_identity` or `certificate_badge` badge: 256×256;
-- every other inline photo, UI, diagram or figure: 800×450.
+The Logo must be at least 256×256. Do not upscale a smaller raster merely to
+pass this gate.
 
 Record every inspected candidate with a public source page or packaged
 official/user-uploaded document, method and
 `eligible|rejected|uninspected`. Eligible entries link to packaged assets;
 rejected entries include a concrete reason. Also maintain arithmetically
 consistent aggregate counts and rejection reasons. Reject sprites, icon sheets,
-decorative backgrounds, mostly transparent media and logo collages
-masquerading as product visuals.
+decorative backgrounds, mostly transparent media and logo collages.
 `imageSelection.scannedSourcePages` is the actual number of pages inspected for
-these three roles and may be lower than the total successfully parsed pages.
+the primary Logo and may be lower than the total successfully parsed pages.
 
 ### First-leaf-only image delivery
 
-Associate all validated classic assets only with the manifest's first leaf
-(normally `1.1 一句话定位`). On the initial turn, return its exactly three
-validated local image bytes as real response image/file attachments below the
-first-leaf body. Use stable asset IDs, packaged filenames and meaningful alt or
-caption metadata. Never substitute Markdown-only paths, origin/CDN URLs, source
-links or textual placeholders.
+Associate the sole validated Logo only with the manifest's first leaf
+(normally `1.1 一句话定位`). On the initial turn, return exactly that one
+validated local Logo byte attachment below the first-leaf body. Use a stable
+asset ID, packaged filename and meaningful alt or caption metadata. Never
+substitute a Markdown-only path, origin/CDN URL, source link or textual
+placeholder.
 
 Every later turn is text-only, including revisions and reopened leaves. Do not
 search for, return, repeat or reattach images after the initial first-leaf
@@ -178,10 +169,11 @@ uses `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`.
 Response attachments on the first turn are delivery copies of the same bytes
 included in the final ZIP.
 
-`target_met` means all recorded candidates were inspected and the three classic
-asset roles were met. A new successful build must use `target_met`; a
+`target_met` means all recorded candidates were inspected and exactly one
+primary official Logo was packaged as `brand_identity` with display role
+`badge`. A new successful build must use `target_met`; a
 `source_limited` or `budget_limited` result is an internal failure diagnostic,
-not a deliverable initial turn. Badges do not satisfy any classic-asset role.
+not a deliverable initial turn.
 
 ## Confirmation state
 

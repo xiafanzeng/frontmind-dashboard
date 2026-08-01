@@ -223,7 +223,7 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     ).toThrow("缺少图片交付声明");
   });
 
-  it("requires exactly three distinct first-turn image outputs", () => {
+  it("requires exactly one first-turn Logo output", () => {
     const image = (id: string) => ({
       type: "output_image",
       file_id: id,
@@ -233,26 +233,15 @@ describe("knowledge-base first-leaf-only image delivery", () => {
       assertKnowledgeBaseInitialImageDelivery([
         { role: "assistant", type: "message", content: "1.1 正文" },
         image("logo"),
-        image("hero"),
-      ]),
-    ).toThrow("必须展示恰好三张");
-    expect(() =>
-      assertKnowledgeBaseInitialImageDelivery([
-        { role: "assistant", type: "message", content: "1.1 正文" },
-        image("logo"),
-        image("hero"),
-        image("product"),
       ]),
     ).not.toThrow();
     expect(() =>
       assertKnowledgeBaseInitialImageDelivery([
         { role: "assistant", type: "message", content: "1.1 正文" },
         image("logo"),
-        image("hero"),
-        image("product"),
-        image("duplicate-or-extra"),
+        image("business-visual"),
       ]),
-    ).toThrow("必须展示恰好三张");
+    ).toThrow("必须只展示一张企业官方主 Logo");
   });
 
   it("does not count an earlier turn's image in the current presentation", () => {

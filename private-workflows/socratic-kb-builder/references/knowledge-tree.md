@@ -45,7 +45,8 @@ Create one branch overview plus the associated leaf documents. The overview:
 
 - Synthesizes the branch into coherent customer-ready prose.
 - Connects facts rather than enumerating page titles.
-- Includes the strongest two or three evidence-backed images by asset ID.
+- Has no image asset. The sole official company Logo belongs only to the first
+  leaf and must not be repeated in an overview.
 - Points to leaves for detail without copying their full text.
 
 Assign every overview and leaf `complete`, `limited_evidence`, or

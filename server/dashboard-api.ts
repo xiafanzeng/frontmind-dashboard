@@ -964,7 +964,7 @@ const internalPackageManifestSchema = z
         }
       });
       const selection = value.imageSelection;
-      for (const key of [
+      const requiredImageSelectionKeys = [
         "status",
         "discoveredCandidateImages",
         "inspectedCandidateImages",
@@ -973,9 +973,9 @@ const internalPackageManifestSchema = z
         "discoveryMethods",
         "rejectionReasons",
         "stopReason",
-        "productFamilyCoverage",
         "candidates",
-      ] as const) {
+      ] as const;
+      for (const key of requiredImageSelectionKeys) {
         if (selection[key] === undefined) {
           context.addIssue({
             code: "custom",
@@ -984,7 +984,32 @@ const internalPackageManifestSchema = z
           });
         }
       }
+      if (
+        !(
+          value.profile === "dashboard-enterprise-v1" &&
+          value.schemaVersion === 3
+        ) &&
+        selection.productFamilyCoverage === undefined
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["imageSelection", "productFamilyCoverage"],
+          message:
+            "schemaVersion 2 image selection requires productFamilyCoverage",
+        });
+      }
       if (value.profile === "dashboard-enterprise-v1") {
+        if (
+          value.schemaVersion === 3 &&
+          selection.productFamilyCoverage !== undefined
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["imageSelection", "productFamilyCoverage"],
+            message:
+              "dashboard enterprise v3 packages only one Logo and must omit productFamilyCoverage",
+          });
+        }
         if (value.websiteV2Normalized !== undefined) {
           context.addIssue({
             code: "custom",
@@ -2071,6 +2096,9 @@ function validateProfilePackage(input: {
           maxDocuments: 220,
           maxWebQueries: 120,
         };
+  const isSingleLogoDashboardV3 =
+    input.profile === "dashboard-enterprise-v1" &&
+    manifest.schemaVersion === 3;
   if (input.packagePaths.length > limits.files) {
     throw new KnowledgeArchiveValidationError(
       "structure",
@@ -2469,11 +2497,15 @@ function validateProfilePackage(input: {
       );
     }
     if (
-      [...requiredImageDiscoveryMethods].some((method) => !methods.has(method))
+      (isSingleLogoDashboardV3 && methods.size === 0) ||
+      (!isSingleLogoDashboardV3 &&
+        [...requiredImageDiscoveryMethods].some((method) => !methods.has(method)))
     ) {
       throw new KnowledgeArchiveValidationError(
         "media",
-        "图片发现台账未覆盖全部要求的第一方图片发现方式",
+        isSingleLogoDashboardV3
+          ? "Logo 发现台账必须记录实际使用的发现方式"
+          : "图片发现台账未覆盖全部要求的第一方图片发现方式",
       );
     }
     if (
@@ -2485,14 +2517,19 @@ function validateProfilePackage(input: {
         "图片发现台账与完整度统计或实际打包数量不一致",
       );
     }
+    const completedOfficialPages =
+      completeness.acquisition.officialPages?.completed;
     if (
-      completeness.acquisition.officialPages?.completed === undefined ||
-      selection.scannedSourcePages !==
-        completeness.acquisition.officialPages.completed
+      completedOfficialPages === undefined ||
+      (isSingleLogoDashboardV3
+        ? selection.scannedSourcePages! > completedOfficialPages
+        : selection.scannedSourcePages !== completedOfficialPages)
     ) {
       throw new KnowledgeArchiveValidationError(
         "media",
-        "图片扫描页数必须覆盖所有成功解析的官网页面",
+        isSingleLogoDashboardV3
+          ? "Logo 扫描页数不能超过成功解析的官网页面数"
+          : "图片扫描页数必须覆盖所有成功解析的官网页面",
       );
     }
     if (selection.status === "target_met") {
@@ -2526,6 +2563,29 @@ function validateProfilePackage(input: {
         throw new KnowledgeArchiveValidationError(
           "media",
           "budget_limited 必须存在因预算未检查的已发现候选图片",
+        );
+      }
+    }
+    if (isSingleLogoDashboardV3) {
+      const firstLeaf = enrichedDocuments.find(
+        (document) => document.kind === "leaf",
+      );
+      const logo = enrichedAssets[0];
+      if (
+        selection.status !== "target_met" ||
+        selection.eligibleFirstPartyImages !== 1 ||
+        enrichedAssets.length !== 1 ||
+        !logo ||
+        logo.assetType !== "brand_identity" ||
+        logo.displayRole !== "badge" ||
+        !firstLeaf?.id ||
+        logo.documentIds.length !== 1 ||
+        logo.documentIds[0] !== firstLeaf.id ||
+        selection.productFamilyCoverage !== undefined
+      ) {
+        throw new KnowledgeArchiveValidationError(
+          "media",
+          "Dashboard v3 必须只打包一张企业官方 Logo，并且只关联首个知识叶子",
         );
       }
     }
@@ -2581,41 +2641,43 @@ function validateProfilePackage(input: {
         "v2 必须至少声明一个产品或服务族，且产品分支的每个叶子都必须声明 productFamilyId",
       );
     }
-    const coverageIds = new Set(
-      (selection.productFamilyCoverage || []).map((family) => family.familyId),
-    );
-    if (
-      coverageIds.size !== (selection.productFamilyCoverage || []).length ||
-      coverageIds.size !== productLeafFamilyIds.size ||
-      [...coverageIds].some((familyId) => !productLeafFamilyIds.has(familyId))
-    ) {
-      throw new KnowledgeArchiveValidationError(
-        "media",
-        "产品族图片覆盖清单必须与产品或服务叶子中的产品族完全一致",
+    if (!isSingleLogoDashboardV3) {
+      const coverageIds = new Set(
+        (selection.productFamilyCoverage || []).map((family) => family.familyId),
       );
-    }
-    const enrichedAssetIds = new Set(
-      enrichedAssets.map((asset) => asset.id).filter(Boolean),
-    );
-    for (const family of selection.productFamilyCoverage || []) {
       if (
-        family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) ||
-        (family.officialImageAvailable &&
-          family.assetIds.some((assetId) => {
-            const asset = enrichedAssetsById.get(assetId);
-            return !["product_ui", "product_diagram", "case_photo"].includes(
-              asset?.assetType || "",
-            );
-          })) ||
-        (family.officialImageAvailable && family.assetIds.length === 0) ||
-        (!family.officialImageAvailable && !family.gapReason) ||
-        (input.profile === "dashboard-enterprise-v1" &&
-          family.checkedSources.length === 0)
+        coverageIds.size !== (selection.productFamilyCoverage || []).length ||
+        coverageIds.size !== productLeafFamilyIds.size ||
+        [...coverageIds].some((familyId) => !productLeafFamilyIds.has(familyId))
       ) {
         throw new KnowledgeArchiveValidationError(
           "media",
-          `产品族图片覆盖记录不完整：${family.familyName}`,
+          "产品族图片覆盖清单必须与产品或服务叶子中的产品族完全一致",
         );
+      }
+      const enrichedAssetIds = new Set(
+        enrichedAssets.map((asset) => asset.id).filter(Boolean),
+      );
+      for (const family of selection.productFamilyCoverage || []) {
+        if (
+          family.assetIds.some((assetId) => !enrichedAssetIds.has(assetId)) ||
+          (family.officialImageAvailable &&
+            family.assetIds.some((assetId) => {
+              const asset = enrichedAssetsById.get(assetId);
+              return !["product_ui", "product_diagram", "case_photo"].includes(
+                asset?.assetType || "",
+              );
+            })) ||
+          (family.officialImageAvailable && family.assetIds.length === 0) ||
+          (!family.officialImageAvailable && !family.gapReason) ||
+          (input.profile === "dashboard-enterprise-v1" &&
+            family.checkedSources.length === 0)
+        ) {
+          throw new KnowledgeArchiveValidationError(
+            "media",
+            `产品族图片覆盖记录不完整：${family.familyName}`,
+          );
+        }
       }
     }
   }

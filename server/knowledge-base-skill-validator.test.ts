@@ -169,75 +169,48 @@ ${narrative}
       contentStatus: "limited_evidence",
     });
   }
-  const classicImages = await Promise.all(
-    [
-      {
-        id: "asset-brand-logo",
-        filename: "brand-logo.png",
+  const companyLogo = {
+    id: "asset-brand-logo",
+    filename: "brand-logo.png",
+    width: 512,
+    height: 512,
+    assetType: "brand_identity",
+    displayRole: "badge",
+    bytes: await sharp({
+      create: {
         width: 512,
         height: 512,
+        channels: 3,
         background: "#173c36",
-        assetType: "brand_identity",
-        displayRole: "badge",
       },
-      {
-        id: "asset-brand-hero",
-        filename: "brand-hero.png",
-        width: 1200,
-        height: 600,
-        background: "#d9c8a9",
-        assetType: "environment_photo",
-        displayRole: "hero",
-      },
-      {
-        id: "asset-product-ui",
-        filename: "product-ui.png",
-        width: 800,
-        height: 450,
-        background: "#5877a8",
-        assetType: "product_ui",
-        displayRole: "inline",
-      },
-    ].map(async (image) => ({
-      ...image,
-      bytes: await sharp({
-        create: {
-          width: image.width,
-          height: image.height,
-          channels: 3,
-          background: image.background,
-        },
-      })
-        .png()
-        .toBuffer(),
-    })),
-  );
-  const overview = documents.find(
-    (document) => document.id === "overview-products",
-  )!;
-  overview.assetIds = classicImages.map((image) => image.id);
-  const assets = classicImages.map((image) => {
-    const assetPath = `09_media_assets/classic/${image.filename}`;
-    files[`${root}/${assetPath}`] = image.bytes;
-    return {
-      id: image.id,
+    })
+      .png()
+      .toBuffer(),
+  };
+  const firstLeaf = documents.find((document) => document.id === "leaf-1")!;
+  firstLeaf.assetIds = [companyLogo.id];
+  const assetPath = `09_media_assets/${companyLogo.filename}`;
+  files[`${root}/${assetPath}`] = companyLogo.bytes;
+  const assets = [
+    {
+      id: companyLogo.id,
       path: assetPath,
-      sha256: createHash("sha256").update(image.bytes).digest("hex"),
+      sha256: createHash("sha256").update(companyLogo.bytes).digest("hex"),
       mimeType: "image/png",
-      bytes: image.bytes.length,
-      width: image.width,
-      height: image.height,
-      caption: image.filename,
+      bytes: companyLogo.bytes.length,
+      width: companyLogo.width,
+      height: companyLogo.height,
+      caption: "企业官方 Logo",
       branchId: "products",
-      documentIds: ["overview-products"],
-      sourcePageUrl: "https://example.com/products",
-      sourceAssetUrl: `https://example.com/assets/${image.filename}`,
+      documentIds: ["leaf-1"],
+      sourcePageUrl: "https://example.com/",
+      sourceAssetUrl: `https://example.com/assets/${companyLogo.filename}`,
       sourceKind: "official_web",
       ownership: "first_party",
-      assetType: image.assetType,
-      displayRole: image.displayRole,
-    };
-  });
+      assetType: companyLogo.assetType,
+      displayRole: companyLogo.displayRole,
+    },
+  ];
   files[`${root}/00_completeness.json`] = JSON.stringify({
     counts: {
       totalLeaves: 40,
@@ -250,7 +223,7 @@ ${narrative}
     },
     acquisition: {
       officialPages: { completed: 1, total: 1 },
-      images: { completed: 3, total: 3 },
+      images: { completed: 1, total: 1 },
       documents: { completed: 0, total: 0 },
       webQueries: { completed: 0, total: 0 },
     },
@@ -263,16 +236,16 @@ ${narrative}
     documents,
     assets,
     counts: {
-      totalFiles: documents.length + 5,
+      totalFiles: documents.length + 3,
       customerVisibleCharacters: 3_320,
       evidenceCharacters: 4_100,
-      packagedImages: 3,
+      packagedImages: 1,
     },
     imageSelection: {
       status: "target_met",
-      discoveredCandidateImages: 3,
-      inspectedCandidateImages: 3,
-      eligibleFirstPartyImages: 3,
+      discoveredCandidateImages: 1,
+      inspectedCandidateImages: 1,
+      eligibleFirstPartyImages: 1,
       rejectedCandidateImages: 0,
       scannedSourcePages: 1,
       discoveryMethods: ["img"],
@@ -285,22 +258,13 @@ ${narrative}
       })),
       rejectionReasons: [],
       stopReason: "已检查所有官方页面和资料",
-      productFamilyCoverage: [
-        {
-          familyId: "family-a",
-          familyName: "产品族 A",
-          officialImageAvailable: true,
-          assetIds: ["asset-product-ui"],
-          checkedSources: ["https://example.com/products"],
-        },
-      ],
     },
   });
   return files;
 }
 
 describe("dashboard enterprise Skill archive validator", () => {
-  it("accepts a complete deep archive with an honest zero-image shortfall", async () => {
+  it("accepts a complete deep archive with exactly one official Logo", async () => {
     const archivePath = await writeArchive(await validDeepArchiveFiles());
 
     const result = await runValidator(archivePath);
@@ -374,20 +338,21 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
     );
   });
 
-  it("rejects a product family omitted from the media coverage audit", async () => {
+  it("rejects a business visual in place of the official Logo", async () => {
     const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
     );
-    manifest.imageSelection.productFamilyCoverage = [];
+    manifest.assets[0].assetType = "environment_photo";
+    manifest.assets[0].displayRole = "hero";
     files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
 
     const result = await runValidator(await writeArchive(files));
 
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain(
-      "productFamilyCoverage IDs must exactly match product/service leaf family IDs",
+      "assetType must be brand_identity",
     );
   });
 
@@ -517,7 +482,6 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
     for (const document of manifest.documents) {
       delete document.productFamilyId;
     }
-    manifest.imageSelection.productFamilyCoverage = [];
     files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
 
     const result = await runValidator(await writeArchive(files));
@@ -576,7 +540,6 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
         ],
         rejectionReasons: [],
         stopReason: "已检查所有官方页面和资料",
-        productFamilyCoverage: [],
       },
     };
     const archivePath = await writeArchive({
@@ -598,16 +561,17 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
   it("rejects a header-only image that cannot be decoded", async () => {
     const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
-    const imagePath = "09_media_assets/product_images/header-only.jpg";
+    const imagePath = "09_media_assets/header-only-logo.jpg";
     const bytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    delete files[`${root}/09_media_assets/brand-logo.png`];
     files[`${root}/${imagePath}`] = bytes;
     const manifest = JSON.parse(
       String(files[`${root}/00_package_manifest.json`]),
     );
-    const overview = manifest.documents.find(
-      (document: { id?: string }) => document.id === "overview-products",
+    const firstLeaf = manifest.documents.find(
+      (document: { id?: string }) => document.id === "leaf-1",
     );
-    overview.assetIds = ["asset-header-only"];
+    firstLeaf.assetIds = ["asset-header-only"];
     manifest.assets = [
       {
         id: "asset-header-only",
@@ -619,18 +583,17 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
         height: 1,
         caption: "伪图片",
         branchId: "products",
-        documentIds: ["overview-products"],
-        sourcePageUrl: "https://example.com/products",
+        documentIds: ["leaf-1"],
+        sourcePageUrl: "https://example.com/",
         sourceAssetUrl: "https://example.com/assets/header-only.jpg",
         ownership: "first_party",
-        assetType: "product_ui",
-        displayRole: "inline",
+        assetType: "brand_identity",
+        displayRole: "badge",
       },
     ];
-    manifest.counts.totalFiles += 1;
     manifest.counts.packagedImages = 1;
     manifest.imageSelection = {
-      status: "source_limited",
+      status: "target_met",
       discoveredCandidateImages: 1,
       inspectedCandidateImages: 1,
       eligibleFirstPartyImages: 1,
@@ -657,16 +620,6 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
       ],
       rejectionReasons: [],
       stopReason: "已检查所有官方页面和资料",
-      productFamilyCoverage: [
-        {
-          familyId: "family-a",
-          familyName: "产品族 A",
-          officialImageAvailable: true,
-          assetIds: ["asset-header-only"],
-          checkedSources: ["https://example.com/products"],
-        },
-      ],
-      shortfallReason: "仅发现一张候选素材",
     };
     files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
     const completeness = JSON.parse(

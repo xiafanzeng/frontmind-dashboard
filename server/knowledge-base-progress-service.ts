@@ -249,10 +249,10 @@ export function assertKnowledgeBaseInitialImageDelivery(output: unknown) {
   const imageCount = collectKnowledgeBaseOutputImageKeys(
     latestKnowledgeBasePresentationOutput(output),
   ).size;
-  if (imageCount !== 3) {
+  if (imageCount !== 1) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
-      `首个知识节点必须展示恰好三张互不重复的经典企业图片，实际返回 ${imageCount} 张`,
+      `首个知识节点必须只展示一张企业官方主 Logo，实际返回 ${imageCount} 张`,
     );
   }
 }

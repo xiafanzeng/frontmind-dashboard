@@ -873,10 +873,76 @@ ${narrative}
 
   it("accepts a v3 archive while retaining v2 compatibility", async () => {
     const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+    const root = "深度企业_knowledge_base";
     const manifestPath = "深度企业_knowledge_base/00_package_manifest.json";
     const manifest = JSON.parse(await zip.file(manifestPath)!.async("string"));
+    const logoPath = "09_media_assets/company-logo.png";
+    const logoBytes = await sharp({
+      create: {
+        width: 256,
+        height: 256,
+        channels: 3,
+        background: "#173c36",
+      },
+    })
+      .png()
+      .toBuffer();
+    zip.file(`${root}/${logoPath}`, logoBytes);
     manifest.schemaVersion = 3;
+    manifest.documents.find(
+      (document: { id?: string }) => document.id === "leaf-1",
+    ).assetIds = ["asset-company-logo"];
+    manifest.assets = [
+      {
+        id: "asset-company-logo",
+        path: logoPath,
+        sha256: createHash("sha256").update(logoBytes).digest("hex"),
+        mimeType: "image/png",
+        bytes: logoBytes.length,
+        width: 256,
+        height: 256,
+        caption: "企业官方 Logo",
+        alt: "企业 Logo",
+        branchId: "products",
+        documentIds: ["leaf-1"],
+        sourcePageUrl: "https://example.com/",
+        sourceAssetUrl: "https://example.com/assets/logo.png",
+        sourceKind: "official_web",
+        ownership: "first_party",
+        assetType: "brand_identity",
+        displayRole: "badge",
+      },
+    ];
+    manifest.counts.totalFiles += 1;
+    manifest.counts.packagedImages = 1;
+    manifest.imageSelection = {
+      status: "target_met",
+      discoveredCandidateImages: 1,
+      inspectedCandidateImages: 1,
+      eligibleFirstPartyImages: 1,
+      rejectedCandidateImages: 0,
+      scannedSourcePages: 0,
+      discoveryMethods: ["img"],
+      candidates: [
+        {
+          url: "https://example.com/assets/logo.png",
+          sourcePageUrl: "https://example.com/",
+          method: "img",
+          status: "eligible",
+          assetId: "asset-company-logo",
+        },
+      ],
+      rejectionReasons: [],
+      stopReason: "已取得企业官方 Logo，停止图片发现",
+    };
     zip.file(manifestPath, JSON.stringify(manifest));
+    const completenessPath = `${root}/00_completeness.json`;
+    const completeness = JSON.parse(
+      await zip.file(completenessPath)!.async("string"),
+    );
+    completeness.acquisition.images = { completed: 1, total: 1 };
+    completeness.gaps = [];
+    zip.file(completenessPath, JSON.stringify(completeness));
 
     const result = await readKnowledgeArchive(
       await zip.generateAsync({ type: "nodebuffer" }),

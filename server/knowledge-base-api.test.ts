@@ -76,8 +76,9 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
     expect(prompt).toContain("不得输出参考资料、参考来源");
     expect(prompt).toContain("可见正文结束后直接附机器信封");
-    expect(prompt).toContain("主 Logo、品牌主视觉、典型产品/UI/架构图");
-    expect(prompt).toContain("取得三张后立即停止图片发现");
+    expect(prompt).toContain("只采集并返回一张企业官方主 Logo");
+    expect(prompt).toContain("不得采集或打包品牌主视觉、业务图");
+    expect(prompt).toContain("取得合格 Logo 后立即停止所有图片发现");
     expect(prompt).toContain("后续所有节点、修订与重开轮次一律纯文字");
     expect(prompt).toContain("imageState=no_eligible_asset");
     expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(10_000);
@@ -110,15 +111,13 @@ describe("knowledge base execution contract", () => {
       "assetType",
       "displayRole",
       "scannedSourcePages",
-      "1200×600",
-      "800×450",
       "256×256",
       "Customer writing boundary",
       "Never create an interactive",
       "verification_gaps",
       "00_web_intelligence_report.md",
       "First-leaf-only image delivery",
-      "real response image/file",
+      "validated local Logo byte attachment",
     ]) {
       expect(skill).toContain(invariant);
     }
