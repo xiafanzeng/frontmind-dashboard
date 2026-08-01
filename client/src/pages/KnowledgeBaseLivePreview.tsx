@@ -18,7 +18,10 @@ import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import type { OutputMessage } from "@/lib/frontmind-api";
 import { projectTaskOutputMessages } from "@/lib/task-output-projection";
-import { stripKnowledgeBaseProtocolPayloads } from "@shared/knowledge-base-output";
+import {
+  extractKnowledgeBaseProtocolObjects,
+  stripKnowledgeBaseProtocolPayloads,
+} from "@shared/knowledge-base-output";
 
 type BranchCount = {
   title: string;
@@ -108,6 +111,7 @@ function readReplayLiveResponse(): LiveResponse | null {
   const params = new URLSearchParams(window.location.search);
   const rawAssistantText = params.get("replay");
   if (!rawAssistantText) return null;
+  const protocolObjects = extractKnowledgeBaseProtocolObjects(rawAssistantText);
   const visibleMarkdown =
     stripKnowledgeBaseProtocolPayloads(rawAssistantText).trim();
   const legacySocraticStateCount = (
@@ -127,12 +131,26 @@ function readReplayLiveResponse(): LiveResponse | null {
       visibleCharacterCount: visibleMarkdown.length,
       visibleMarkdown,
       rawAssistantText,
-      protocolKinds: [],
+      rawOutput: [
+        {
+          id: "replayed-real-output",
+          type: "output_message",
+          role: "assistant",
+          content: [{ type: "output_text", text: rawAssistantText }],
+        },
+      ],
+      protocolKinds: protocolObjects.map((value) => String(value.kind || "")),
       legacySocraticStateCount,
-      protocolObjects: [],
+      protocolObjects,
       diagnostics: [],
       manifest: null,
-      issues: ["任务已结束，但没有找到知识树 manifest"],
+      issues: protocolObjects.some(
+        (value) =>
+          value.kind === "frontmind.knowledge-base.manifest" ||
+          value.kind === "frontmind.knowledge-base.presentation",
+      )
+        ? []
+        : ["任务已结束，但没有找到知识树或当前节点协议"],
     },
   };
 }
@@ -705,9 +723,7 @@ export default function KnowledgeBaseLivePreview() {
                                 >
                                   <img
                                     src={image.src}
-                                    alt={
-                                      image.alt || `首轮经典图片 ${index + 1}`
-                                    }
+                                    alt={image.alt || "企业官方主 Logo"}
                                     className="h-48 w-full object-contain"
                                   />
                                 </figure>

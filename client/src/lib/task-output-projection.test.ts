@@ -27,6 +27,41 @@ function presentation(revision: number, leafId: string | null) {
 }
 
 describe("task output projection", () => {
+  it("renders a validated output_message after the first confirmation advances revision 0 to 1", () => {
+    const text = [
+      "1.1 已确认。",
+      "",
+      "## 1.2 使命、愿景与企业主张",
+      "",
+      "硅基流动以加速 AGI 普惠人类为使命。",
+      "",
+      '<!-- FRONTMIND_KB_PROGRESS {"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":0,"transition":{"leafId":"1.1","from":"current","to":"confirmed","reason":"用户明确确认"}} -->',
+      '<!-- FRONTMIND_KB_PRESENTATION {"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0} -->',
+    ].join("\n");
+    const output = [
+      {
+        id: "confirmed-node-output",
+        type: "output_message",
+        role: "assistant" as const,
+        content: [{ type: "output_text", text }],
+      },
+    ];
+
+    const messages = projectTaskOutputMessages({
+      output,
+      baselineOutputLength: 1,
+      historicalOutputIds: ["confirmed-node-output"],
+      responseStartedAt: 1,
+      knowledgeBase: true,
+      knowledgeBasePresentation: { revision: 1, leafId: "1.2" },
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.content).toContain("1.1 已确认");
+    expect(messages[0]?.content).toContain("1.2 使命、愿景与企业主张");
+    expect(messages[0]?.content).not.toContain("FRONTMIND_KB_");
+  });
+
   it("uses the latest same-ID replacement when the output length is unchanged", () => {
     const latest = assistantOutput(
       "reused-output",

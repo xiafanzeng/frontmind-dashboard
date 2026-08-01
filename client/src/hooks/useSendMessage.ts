@@ -235,6 +235,7 @@ export function useSendMessage() {
       baselineOutputLength: number,
       historicalOutputIds: readonly string[],
       modelName?: string,
+      knowledgeBase = false,
     ) => {
       // Stop any existing polling first
       stopPolling();
@@ -244,7 +245,31 @@ export function useSendMessage() {
       let lastNewOutputLen = 0;
       let completionHandled = false;
       let consecutiveErrors = 0;
+      let approvedProjectionMisses = 0;
       const MAX_CONSECUTIVE_ERRORS = 10;
+      const MAX_APPROVED_PROJECTION_MISSES = 10;
+
+      const finishKnowledgeBaseError = (
+        updatedTaskId: string,
+        errorMessage: string,
+        outputLength: number,
+      ) => {
+        completionHandled = true;
+        stopPolling();
+        updateStatusRef.current(convId, "error", {
+          taskId: updatedTaskId,
+          completedAt: Date.now(),
+          lastKnownOutputLength: outputLength,
+        });
+        addMessageRef.current(convId, {
+          id: `msg-kb-error-${updatedTaskId.slice(-72)}`,
+          role: "assistant",
+          content: `❌ 错误: ${sanitizeBrandText(errorMessage)}`,
+          timestamp: Date.now(),
+        });
+        toast.error(sanitizeBrandText(errorMessage));
+        creditEventBus.emit();
+      };
 
       const pollOnce = async () => {
         if (!pollingActiveRef.current || completionHandled) return;
@@ -259,69 +284,142 @@ export function useSendMessage() {
 
           if (!pollingActiveRef.current || completionHandled) return;
 
-          // Slice only NEW output items
-          if (updated.output && updated.output.length > 0) {
-            const newOutput = sliceNewOutput(
-              updated.output,
-              baselineOutputLength,
-              historicalOutputIds,
-            );
+          if (knowledgeBase) {
+            const normalizedUpstreamStatus =
+              updated.status === "failed" ? "error" : updated.status;
+            const upstreamSettled = [
+              "completed",
+              "error",
+              "failed",
+              "awaiting_input",
+              "awaiting_user",
+              "awaiting_user_input",
+              "input_required",
+              "requires_action",
+            ].includes(String(updated.status));
+            let interaction: Awaited<
+              ReturnType<typeof reconcileKnowledgeBaseProgress>
+            >;
 
-            if (newOutput.length > 0) {
-              try {
-                const assistantMsgs = projectTaskOutputMessages({
-                  output: updated.output,
-                  baselineOutputLength,
-                  historicalOutputIds,
-                  responseStartedAt,
-                  modelName,
-                  knowledgeBase: false,
-                });
-                if (assistantMsgs.length > 0) {
-                  updateAssistantMessagesRef.current(convId, assistantMsgs);
-                }
-              } catch (parseErr) {
-                console.error(
-                  "[Polling] Error parsing output messages:",
-                  parseErr,
+            try {
+              // Reconciliation is deliberately performed after retrieving the
+              // task. The server validates the protocol first; only that
+              // approved revision/leaf pair is allowed into the conversation.
+              interaction = await reconcileKnowledgeBaseProgress({
+                conversationId: convId,
+                taskId: updated.id,
+              });
+            } catch (error) {
+              if (upstreamSettled) {
+                finishKnowledgeBaseError(
+                  updated.id,
+                  error instanceof Error
+                    ? `知识树状态未通过校验：${error.message}`
+                    : "任务已结束，但未返回完整的知识节点状态",
+                  updated.output?.length || 0,
                 );
+                return;
               }
-              if (newOutput.length !== lastNewOutputLen) {
-                console.log(
-                  `[Polling] New output items: ${newOutput.length}, ` +
-                    `total output: ${updated.output.length}, baseline: ${baselineOutputLength}`,
-                );
-                lastNewOutputLen = newOutput.length;
-              }
+              throw error;
             }
-          }
 
-          // Normalize status
-          const normalizedStatus =
-            updated.status === "failed" ? "error" : updated.status;
+            if (!pollingActiveRef.current || completionHandled) return;
 
-          updateStatusRef.current(convId, normalizedStatus as any, {
-            taskId: updated.id,
-            taskUrl: updated.metadata?.task_url,
-          });
+            if (
+              interaction.progress &&
+              (interaction.interactionState === "awaiting_input" ||
+                interaction.interactionState === "ready_to_publish" ||
+                interaction.interactionState === "published")
+            ) {
+              const assistantMsgs = projectTaskOutputMessages({
+                output: updated.output,
+                baselineOutputLength,
+                historicalOutputIds,
+                responseStartedAt,
+                modelName,
+                knowledgeBase: true,
+                knowledgeBasePresentation: {
+                  revision: interaction.progress.build.revision,
+                  leafId: interaction.progress.build.currentLeafId,
+                },
+              });
 
-          if (normalizedStatus === "completed" && !completionHandled) {
-            completionHandled = true;
-            stopPolling();
-            const completedAt = Date.now();
-            const elapsedSec = (completedAt - responseStartedAt) / 1000;
+              if (assistantMsgs.length === 0) {
+                // A provider read can lag a successful server reconciliation.
+                // Keep polling instead of exposing an unconfirmable empty node.
+                approvedProjectionMisses++;
+                updateStatusRef.current(convId, "running", {
+                  taskId: updated.id,
+                  taskUrl: updated.metadata?.task_url,
+                });
+                if (
+                  upstreamSettled &&
+                  approvedProjectionMisses >= MAX_APPROVED_PROJECTION_MISSES
+                ) {
+                  finishKnowledgeBaseError(
+                    updated.id,
+                    "当前节点已通过校验，但正文无法解析。请重试本轮。",
+                    updated.output?.length || 0,
+                  );
+                  return;
+                }
+              } else {
+                completionHandled = true;
+                stopPolling();
+                updateAssistantMessagesRef.current(convId, assistantMsgs);
+                const outputLength = updated.output?.length || 0;
+                if (interaction.interactionState === "awaiting_input") {
+                  updateStatusRef.current(convId, "awaiting_input", {
+                    taskId: updated.id,
+                    taskUrl: updated.metadata?.task_url,
+                    previousResponseId: updated.id,
+                    lastKnownOutputLength: outputLength,
+                  });
+                  toast.info("当前知识节点已就绪", {
+                    description: "请确认、修改或补充当前内容。",
+                  });
+                } else {
+                  updateStatusRef.current(convId, "completed", {
+                    taskId: updated.id,
+                    completedAt: Date.now(),
+                    lastKnownOutputLength: outputLength,
+                  });
+                  toast.success("知识库已完成", {
+                    description: "所有节点已通过校验。",
+                  });
+                }
+                creditEventBus.emit();
+                return;
+              }
+            } else if (interaction.interactionState === "failed") {
+              finishKnowledgeBaseError(
+                updated.id,
+                interaction.lockReason || "知识树状态未通过校验",
+                updated.output?.length || 0,
+              );
+              return;
+            } else if (upstreamSettled) {
+              finishKnowledgeBaseError(
+                updated.id,
+                interaction.lockReason ||
+                  "任务已结束，但未返回完整的知识节点状态",
+                updated.output?.length || 0,
+              );
+              return;
+            } else {
+              updateStatusRef.current(
+                convId,
+                normalizedUpstreamStatus === "pending" ? "pending" : "running",
+                {
+                  taskId: updated.id,
+                  taskUrl: updated.metadata?.task_url,
+                },
+              );
+            }
 
-            const totalOutputLength = updated.output?.length || 0;
-
-            updateStatusRef.current(convId, "completed", {
-              completedAt,
-              lastKnownOutputLength: totalOutputLength,
-            });
-
-            // Final parse of output — this is the authoritative final set.
-            // The regular polling section above already parsed the same output,
-            // but we do it once more here to ensure we have the complete set
-            // and to attach elapsedTime to the last message.
+            consecutiveErrors = 0;
+          } else {
+            // Slice only NEW output items
             if (updated.output && updated.output.length > 0) {
               const newOutput = sliceNewOutput(
                 updated.output,
@@ -331,7 +429,7 @@ export function useSendMessage() {
 
               if (newOutput.length > 0) {
                 try {
-                  const finalMsgs = projectTaskOutputMessages({
+                  const assistantMsgs = projectTaskOutputMessages({
                     output: updated.output,
                     baselineOutputLength,
                     historicalOutputIds,
@@ -339,59 +437,122 @@ export function useSendMessage() {
                     modelName,
                     knowledgeBase: false,
                   });
-                  if (finalMsgs.length > 0) {
-                    finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
-                    updateAssistantMessagesRef.current(convId, finalMsgs);
+                  if (assistantMsgs.length > 0) {
+                    updateAssistantMessagesRef.current(convId, assistantMsgs);
                   }
                 } catch (parseErr) {
                   console.error(
-                    "[Polling] Error parsing final output messages:",
+                    "[Polling] Error parsing output messages:",
                     parseErr,
                   );
+                }
+                if (newOutput.length !== lastNewOutputLen) {
+                  console.log(
+                    `[Polling] New output items: ${newOutput.length}, ` +
+                      `total output: ${updated.output.length}, baseline: ${baselineOutputLength}`,
+                  );
+                  lastNewOutputLen = newOutput.length;
                 }
               }
             }
 
-            toast.success("任务已完成", {
-              description: `本次处理耗时 ${elapsedSec.toFixed(1)}s，结果已同步到当前内容流程。`,
-              duration: 3200,
+            // Normalize status
+            const normalizedStatus =
+              updated.status === "failed" ? "error" : updated.status;
+
+            updateStatusRef.current(convId, normalizedStatus as any, {
+              taskId: updated.id,
+              taskUrl: updated.metadata?.task_url,
             });
 
-            // Emit credit refresh event on task completion
-            creditEventBus.emit();
-            return;
+            if (normalizedStatus === "completed" && !completionHandled) {
+              completionHandled = true;
+              stopPolling();
+              const completedAt = Date.now();
+              const elapsedSec = (completedAt - responseStartedAt) / 1000;
+
+              const totalOutputLength = updated.output?.length || 0;
+
+              updateStatusRef.current(convId, "completed", {
+                completedAt,
+                lastKnownOutputLength: totalOutputLength,
+              });
+
+              // Final parse of output — this is the authoritative final set.
+              // The regular polling section above already parsed the same output,
+              // but we do it once more here to ensure we have the complete set
+              // and to attach elapsedTime to the last message.
+              if (updated.output && updated.output.length > 0) {
+                const newOutput = sliceNewOutput(
+                  updated.output,
+                  baselineOutputLength,
+                  historicalOutputIds,
+                );
+
+                if (newOutput.length > 0) {
+                  try {
+                    const finalMsgs = projectTaskOutputMessages({
+                      output: updated.output,
+                      baselineOutputLength,
+                      historicalOutputIds,
+                      responseStartedAt,
+                      modelName,
+                      knowledgeBase: false,
+                    });
+                    if (finalMsgs.length > 0) {
+                      finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
+                      updateAssistantMessagesRef.current(convId, finalMsgs);
+                    }
+                  } catch (parseErr) {
+                    console.error(
+                      "[Polling] Error parsing final output messages:",
+                      parseErr,
+                    );
+                  }
+                }
+              }
+
+              toast.success("任务已完成", {
+                description: `本次处理耗时 ${elapsedSec.toFixed(1)}s，结果已同步到当前内容流程。`,
+                duration: 3200,
+              });
+
+              // Emit credit refresh event on task completion
+              creditEventBus.emit();
+              return;
+            }
+
+            if (normalizedStatus === "error" && !completionHandled) {
+              completionHandled = true;
+              stopPolling();
+              const completedAt = Date.now();
+
+              const totalOutputLength = updated.output?.length || 0;
+
+              updateStatusRef.current(convId, "error", {
+                completedAt,
+                lastKnownOutputLength: totalOutputLength,
+              });
+              const errorMsg = updated.error?.message || "任务执行出错";
+              const failureAdvice = getFailureAdvice(errorMsg);
+              const displayError = getFailureDisplayMessage(errorMsg);
+              toast.error("任务执行失败", {
+                description: failureAdvice,
+              });
+              addMessageRef.current(convId, {
+                id: `msg-err-${Date.now()}`,
+                role: "assistant",
+                content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
+                timestamp: Date.now(),
+              });
+
+              // Emit credit refresh event even on error (credits may have been consumed)
+              creditEventBus.emit();
+              return;
+            }
+
+            consecutiveErrors = 0;
           }
-
-          if (normalizedStatus === "error" && !completionHandled) {
-            completionHandled = true;
-            stopPolling();
-            const completedAt = Date.now();
-
-            const totalOutputLength = updated.output?.length || 0;
-
-            updateStatusRef.current(convId, "error", {
-              completedAt,
-              lastKnownOutputLength: totalOutputLength,
-            });
-            const errorMsg = updated.error?.message || "任务执行出错";
-            const failureAdvice = getFailureAdvice(errorMsg);
-            const displayError = getFailureDisplayMessage(errorMsg);
-            toast.error("任务执行失败", {
-              description: failureAdvice,
-            });
-            addMessageRef.current(convId, {
-              id: `msg-err-${Date.now()}`,
-              role: "assistant",
-              content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
-              timestamp: Date.now(),
-            });
-
-            // Emit credit refresh event even on error (credits may have been consumed)
-            creditEventBus.emit();
-            return;
-          }
-
-          consecutiveErrors = 0;
         } catch (err: any) {
           console.error("Polling error:", err);
           consecutiveErrors++;
@@ -793,11 +954,10 @@ export function useSendMessage() {
             });
           }
 
-          // Start sequential polling if task is running or pending
-          if (
-            !options?.syncKnowledgeBaseSnapshot &&
-            (effectiveStatus === "running" || effectiveStatus === "pending")
-          ) {
+          // Start sequential polling if task is running or pending. Knowledge
+          // turns own their live polling too; the global hook remains recovery
+          // for reloads/background tabs rather than the only completion path.
+          if (effectiveStatus === "running" || effectiveStatus === "pending") {
             startPolling(
               response.id,
               convId,
@@ -806,6 +966,7 @@ export function useSendMessage() {
               baselineOutputLength,
               historicalOutputIds,
               agentProfile,
+              Boolean(options?.syncKnowledgeBaseSnapshot),
             );
           }
 

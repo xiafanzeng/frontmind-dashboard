@@ -318,6 +318,143 @@ describe("public task payload boundary", () => {
     expect(serialized).not.toContain('"instructions"');
     expect(serialized).not.toContain('"knowledge_base"');
   });
+
+  it("preserves top-level assistant text without exposing request-shaped output", () => {
+    const credential = "sentinel-task-credential-do-not-expose";
+    const privateSentinel = "PRIVATE-REQUEST-CONTEXT-SENTINEL";
+    const result = publicUpstreamTaskPayload(
+      {
+        id: "task-safe",
+        status: "completed",
+        output: [
+          ...["message", "output_message", "output_text", "text"].map(
+            (type, index) => ({
+              id: `assistant-${index}`,
+              type,
+              role: "assistant",
+              output_text: `public output_text ${index}`,
+              content: `public content ${index}`,
+              prompt: privateSentinel,
+              input: privateSentinel,
+              system: privateSentinel,
+              instructions: privateSentinel,
+            }),
+          ),
+          {
+            id: "user-secret",
+            type: "message",
+            role: "user",
+            output_text: privateSentinel,
+            content: privateSentinel,
+          },
+          {
+            id: "system-secret",
+            type: "output_message",
+            role: "system",
+            output_text: privateSentinel,
+            content: privateSentinel,
+          },
+          {
+            id: "instruction-secret",
+            type: "instructions",
+            role: "assistant",
+            output_text: privateSentinel,
+            content: privateSentinel,
+          },
+          {
+            id: "reasoning-safe",
+            type: "reasoning",
+            role: "assistant",
+            output_text: privateSentinel,
+            content: privateSentinel,
+            summary: [{ type: "summary_text", text: "public progress" }],
+          },
+          {
+            id: "assistant-value-shape",
+            type: "output_text",
+            role: "assistant",
+            output_text: { value: "public value-shaped output_text" },
+          },
+          {
+            id: "assistant-untyped-string-content",
+            role: "assistant",
+            content: "public untyped assistant content",
+          },
+          {
+            id: "assistant-nested-value-shape",
+            type: "output_message",
+            role: "assistant",
+            content: [
+              {
+                type: "output_text",
+                output_text: { value: "public nested value-shaped text" },
+              },
+            ],
+          },
+        ],
+        prompt: privateSentinel,
+        input: privateSentinel,
+        system: privateSentinel,
+        instructions: privateSentinel,
+        API_KEY: credential,
+      },
+      credential,
+    );
+
+    expect(result).toEqual({
+      id: "task-safe",
+      status: "completed",
+      output: [
+        ...["message", "output_message", "output_text", "text"].map(
+          (type, index) => ({
+            id: `assistant-${index}`,
+            type,
+            role: "assistant",
+            output_text: `public output_text ${index}`,
+            content: `public content ${index}`,
+          }),
+        ),
+        {
+          id: "reasoning-safe",
+          type: "reasoning",
+          role: "assistant",
+          summary: [{ type: "summary_text", text: "public progress" }],
+        },
+        {
+          id: "assistant-value-shape",
+          type: "output_text",
+          role: "assistant",
+          output_text: { value: "public value-shaped output_text" },
+        },
+        {
+          id: "assistant-untyped-string-content",
+          role: "assistant",
+          content: "public untyped assistant content",
+        },
+        {
+          id: "assistant-nested-value-shape",
+          type: "output_message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "public nested value-shaped text",
+            },
+          ],
+        },
+      ],
+    });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(privateSentinel);
+    expect(serialized).not.toContain(credential);
+    expect(serialized).not.toContain('"prompt"');
+    expect(serialized).not.toContain('"input"');
+    expect(serialized).not.toContain('"system"');
+    expect(serialized).not.toContain('"instructions"');
+    expect(serialized).not.toContain("user-secret");
+    expect(serialized).not.toContain("system-secret");
+    expect(serialized).not.toContain("instruction-secret");
+  });
 });
 
 describe("external download size boundary", () => {

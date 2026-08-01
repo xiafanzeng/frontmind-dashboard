@@ -340,8 +340,8 @@ export function analyzeKnowledgeBaseLiveTask(
       issues.push("协议探针 manifest 与预期的 8 个叶子不完全一致");
     }
   }
-  if (terminal && runMode === "full" && manifest && imageCount !== 3) {
-    issues.push(`首轮必须返回恰好 3 张经典企业图片，实际返回 ${imageCount} 张`);
+  if (terminal && runMode === "full" && manifest && imageCount !== 1) {
+    issues.push(`首轮必须只返回一张企业官方主 Logo，实际返回 ${imageCount} 张`);
   }
   if (terminal && runMode === "protocol_probe" && imageCount !== 0) {
     issues.push(`协议探针禁止返回图片，实际返回 ${imageCount} 张`);

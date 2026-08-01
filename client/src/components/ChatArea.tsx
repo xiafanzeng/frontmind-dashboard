@@ -515,7 +515,10 @@ export default function ChatArea({
             <h2 className="max-w-[400px] truncate text-sm font-semibold text-foreground/80">
               {sanitizedTitle}
             </h2>
-            <StatusBadge status={status || "idle"} />
+            <StatusBadge
+              status={status || "idle"}
+              knowledgeBase={syncKnowledgeBaseSnapshot}
+            />
           </div>
           {(executionModel || startedAt) && (
             <div
@@ -2161,7 +2164,13 @@ function MessageBubble({
 /**
  * StatusBadge — simplified: removed "已完成" icon display per req 4
  */
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({
+  status,
+  knowledgeBase = false,
+}: {
+  status: string;
+  knowledgeBase?: boolean;
+}) {
   const config: Record<
     string,
     { icon: React.ReactNode; label: string; className: string }
@@ -2183,7 +2192,7 @@ function StatusBadge({ status }: { status: string }) {
     },
     awaiting_input: {
       icon: <Clock className="w-3 h-3" />,
-      label: "等待回复",
+      label: knowledgeBase ? "待确认" : "等待回复",
       className: "bg-violet-50 text-violet-700 border-violet-200/60",
     },
     completed: {

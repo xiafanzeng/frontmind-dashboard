@@ -1124,8 +1124,12 @@ function buildStepGroups(
  * Check if an output item is an intermediate step (non-message type)
  */
 function isIntermediateStepType(type: string): boolean {
-  // "message" is a regular message, everything else is an intermediate step
-  if (type === "message") return false;
+  // FrontMind/OpenAI-compatible providers use several names for a typed
+  // assistant message. Keep this list aligned with the server-side knowledge
+  // protocol parser so a validated response cannot disappear in the browser.
+  if (["message", "output_message", "output_text", "text"].includes(type)) {
+    return false;
+  }
 
   // Known intermediate step types
   const knownStepTypes = [
@@ -1450,8 +1454,17 @@ function _parseOutputMessagesInner(
         }
       } else if (!rawContent || !Array.isArray(rawContent)) {
         // Try to extract text from the message object itself (fallback)
+        const fallbackValue =
+          (msg as any).output_text ||
+          (msg as any).text ||
+          (msg as any).message ||
+          (msg as any).output;
         const fallbackText =
-          (msg as any).text || (msg as any).message || (msg as any).output;
+          typeof fallbackValue === "string"
+            ? fallbackValue
+            : fallbackValue && typeof fallbackValue.value === "string"
+              ? fallbackValue.value
+              : undefined;
         if (typeof fallbackText === "string" && fallbackText.trim()) {
           textParts.push(fallbackText);
         }
@@ -1475,7 +1488,13 @@ function _parseOutputMessagesInner(
           const contentType = c.type || "";
           const { fileUrl, fileName, mimeType } =
             outputResourceDescriptor(c);
-          const textValue = c.text ?? c.value ?? null;
+          const rawTextValue = c.text ?? c.output_text ?? c.value ?? null;
+          const textValue =
+            typeof rawTextValue === "string"
+              ? rawTextValue
+              : rawTextValue && typeof rawTextValue.value === "string"
+                ? rawTextValue.value
+                : null;
 
           if (
             (contentType === "output_file" || contentType === "file") &&

@@ -895,9 +895,9 @@ describe("UserBrandDashboard formal workspace", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("img", {
-        name: "FrontMind 服务专员微信二维码",
+        name: "FrontMind 服务专员企业微信二维码",
       }),
-    ).toHaveAttribute("src", "/frontmind-sales-wechat.png");
+    ).toHaveAttribute("src", "/frontmind-sales-wechat.png?v=wecom-20260801");
   });
 
   it("does not expose the retired content-system entry", () => {
@@ -1143,9 +1143,9 @@ describe("UserBrandDashboard formal workspace", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("img", {
-        name: "FrontMind 服务专员微信二维码",
+        name: "FrontMind 服务专员企业微信二维码",
       }),
-    ).toHaveAttribute("src", "/frontmind-sales-wechat.png");
+    ).toHaveAttribute("src", "/frontmind-sales-wechat.png?v=wecom-20260801");
     expect(purchaseIntentMutateAsync).not.toHaveBeenCalled();
   });
 

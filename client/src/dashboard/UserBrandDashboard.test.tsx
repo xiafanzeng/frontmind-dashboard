@@ -597,9 +597,9 @@ describe("UserBrandDashboard service experience", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("img", {
-        name: "FrontMind 服务专员微信二维码",
+        name: "FrontMind 服务专员企业微信二维码",
       }),
-    ).toHaveAttribute("src", "/frontmind-sales-wechat.png");
+    ).toHaveAttribute("src", "/frontmind-sales-wechat.png?v=wecom-20260801");
     expect(screen.queryByText(/API Key/i)).not.toBeInTheDocument();
   });
 
@@ -640,9 +640,9 @@ describe("UserBrandDashboard service experience", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole("img", {
-        name: "FrontMind 服务专员微信二维码",
+        name: "FrontMind 服务专员企业微信二维码",
       }),
-    ).toHaveAttribute("src", "/frontmind-sales-wechat.png");
+    ).toHaveAttribute("src", "/frontmind-sales-wechat.png?v=wecom-20260801");
   });
 
   it("keeps prior-cycle questions out of the compact current-cycle summary", () => {

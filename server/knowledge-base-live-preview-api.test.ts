@@ -9,7 +9,7 @@ import {
   selectInitialKnowledgeBaseLiveTask,
 } from "./knowledge-base-live-preview-api";
 
-function taskWithText(text: string, status = "completed", imageCount = 3) {
+function taskWithText(text: string, status = "completed", imageCount = 1) {
   return {
     id: "task-live-preview",
     status,
@@ -344,7 +344,7 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
     );
 
     expect(recovered.manifest?.leafCount).toBe(8);
-    expect(recovered.imageCount).toBe(3);
+    expect(recovered.imageCount).toBe(1);
     expect(recovered.visibleMarkdown).toBe("## 1.1 企业定位");
     expect(recovered.issues).toEqual([]);
   });

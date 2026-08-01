@@ -1056,19 +1056,19 @@ export function SalesAdvisorDialog({
           </DialogTitle>
           <DialogDescription className="mt-2 leading-6">
             {planLabel}
-            需要由专员确认企业需求、服务周期与交付范围，请使用微信扫码联系。
+            需要由专员确认企业需求、服务周期与交付范围，请使用企业微信扫码联系。
           </DialogDescription>
         </DialogHeader>
         <div className="px-6 pb-6 pt-5">
           <div className="overflow-hidden rounded-2xl border border-border/70 bg-white p-3">
             <img
-              src="/frontmind-sales-wechat.png"
-              alt="FrontMind 服务专员微信二维码"
+              src="/frontmind-sales-wechat.png?v=wecom-20260801"
+              alt="FrontMind 服务专员企业微信二维码"
               className="mx-auto block max-h-[430px] w-full object-contain"
             />
           </div>
           <p className="mb-0 mt-4 text-center text-xs leading-5 text-muted-foreground">
-            扫码添加后，请备注企业名称与希望咨询的套餐版本。
+            使用企业微信扫码添加后，请备注企业名称与希望咨询的套餐版本。
           </p>
         </div>
       </DialogContent>

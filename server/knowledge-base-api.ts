@@ -321,6 +321,24 @@ function upstreamTaskTerminal(status: unknown) {
   );
 }
 
+/**
+ * Some providers stop at an interaction-ready status instead of `completed`.
+ * At that point a same-ID output replacement is stable and must be replayed,
+ * but an incomplete envelope must still remain non-terminal for validation.
+ */
+export function shouldReplayStableKnowledgeOutput(status: unknown) {
+  if (upstreamTaskTerminal(status)) return true;
+  return new Set([
+    "awaiting_input",
+    "awaiting_user",
+    "awaiting_user_input",
+    "waiting",
+    "paused",
+    "requires_action",
+    "input_required",
+  ]).has(normalizedUpstreamTaskStatus(status));
+}
+
 export function shouldReconcileKnowledgeOutput(
   output: unknown[],
   status: unknown,
@@ -446,7 +464,11 @@ async function reconcileAvailableKnowledgeOutput(input: {
   const unreconciled = selectUnreconciledKnowledgeOutput(
     input.output,
     input.ledger,
-    { replayStableOutput: upstreamTaskTerminal(input.upstreamStatus) },
+    {
+      replayStableOutput: shouldReplayStableKnowledgeOutput(
+        input.upstreamStatus,
+      ),
+    },
   );
   if (
     shouldReconcileKnowledgeOutput(unreconciled, input.upstreamStatus, {

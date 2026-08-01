@@ -197,7 +197,9 @@ describe("prepareConversationForCloud", () => {
       "provider-output~2",
     ]);
     expect(
-      clean.messages.flatMap((item) => item.attachments ?? []).map((item) => item.id),
+      clean.messages
+        .flatMap((item) => item.attachments ?? [])
+        .map((item) => item.id),
     ).toEqual(["asset", "asset~2"]);
   });
 
@@ -246,6 +248,49 @@ describe("prepareConversationForCloud", () => {
 });
 
 describe("parseOutputMessages file IDs", () => {
+  it.each([
+    {
+      type: "output_message",
+      content: [{ type: "output_text", text: "output_message 正文" }],
+      expected: "output_message 正文",
+    },
+    {
+      type: "output_text",
+      text: "top-level text 正文",
+      expected: "top-level text 正文",
+    },
+    {
+      type: "text",
+      output_text: { value: "top-level output_text 正文" },
+      expected: "top-level output_text 正文",
+    },
+    {
+      type: "output_message",
+      content: [
+        {
+          type: "output_text",
+          output_text: { value: "nested output_text 正文" },
+        },
+      ],
+      expected: "nested output_text 正文",
+    },
+  ])("renders typed assistant $type records as messages", (record) => {
+    const messages = parseOutputMessages([
+      {
+        id: `assistant-${record.type}`,
+        role: "assistant",
+        ...record,
+      },
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      upstreamOutputId: `assistant-${record.type}`,
+      role: "assistant",
+      content: record.expected,
+    });
+  });
+
   it("renders snake-case PDF and camel-case image IDs through protected URLs", () => {
     const messages = parseOutputMessages([
       {

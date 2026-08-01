@@ -84,7 +84,7 @@ async function checkAndUpdateTask(
       knowledgeBase: boolean,
       knowledgeBasePresentation?: KnowledgeBasePresentationTarget,
     ) => {
-      if (!taskData.output || taskData.output.length === 0) return;
+      if (!taskData.output || taskData.output.length === 0) return false;
       const baselineOutputLength = conv.lastKnownOutputLength || 0;
       const lastUserIndex = conv.messages.reduce(
         (latest, message, index) => (message.role === "user" ? index : latest),
@@ -118,10 +118,12 @@ async function checkAndUpdateTask(
             msgs[msgs.length - 1].elapsedTime = elapsedSec;
           }
           updateAssistantMessages(conv.id, msgs);
+          return true;
         }
       } catch (parseErr) {
         console.error("[ResumePolling] Error parsing output:", parseErr);
       }
+      return false;
     };
 
     const appendKnowledgeBaseError = (message: string) => {
@@ -153,10 +155,22 @@ async function checkAndUpdateTask(
             interaction.interactionState === "ready_to_publish" ||
             interaction.interactionState === "published")
         ) {
-          applyRetrievedOutput(true, {
+          const projected = applyRetrievedOutput(true, {
             revision: interaction.progress.build.revision,
             leafId: interaction.progress.build.currentLeafId,
           });
+          if (!projected) {
+            // Never expose an awaiting-input state without the matching body:
+            // ChatInput intentionally disables confirmation until that body is
+            // present. Continue recovery polling so this cannot become the
+            // permanent empty-node state reported in production.
+            updateStatus(conv.id, "running", {
+              taskId: taskData.id,
+              taskUrl: taskData.metadata?.task_url,
+              previousResponseId: taskData.id,
+            });
+            return true;
+          }
         }
         if (interaction.interactionState === "awaiting_input") {
           updateStatus(conv.id, "awaiting_input", {

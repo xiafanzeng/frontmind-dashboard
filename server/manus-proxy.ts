@@ -712,6 +712,14 @@ const PUBLIC_TASK_OUTPUT_SCALAR_KEYS = [
   "mimeType",
 ] as const;
 
+const PUBLIC_ASSISTANT_TEXT_OUTPUT_TYPES = new Set([
+  "",
+  "message",
+  "output_message",
+  "output_text",
+  "text",
+]);
+
 const PUBLIC_TASK_CONTENT_SCALAR_KEYS = [
   "type",
   "text",
@@ -820,7 +828,10 @@ function publicTaskAnnotations(value: unknown): unknown[] | undefined {
   return annotations.length > 0 ? annotations : undefined;
 }
 
-function publicTaskContent(value: unknown): Record<string, unknown>[] {
+function publicTaskContent(
+  value: unknown,
+  options: { normalizeAssistantText?: boolean } = {},
+): Record<string, unknown>[] {
   if (!Array.isArray(value)) return [];
   const content: Record<string, unknown>[] = [];
   for (const item of value) {
@@ -834,6 +845,23 @@ function publicTaskContent(value: unknown): Record<string, unknown>[] {
       source,
       PUBLIC_TASK_CONTENT_SCALAR_KEYS,
     );
+    if (
+      options.normalizeAssistantText &&
+      ["", "message", "output_message", "output_text", "text"].includes(type) &&
+      typeof sanitized.text !== "string"
+    ) {
+      const textCandidate = source.text ?? source.output_text ?? source.value;
+      if (typeof textCandidate === "string") {
+        sanitized.text = textCandidate;
+      } else if (
+        textCandidate &&
+        typeof textCandidate === "object" &&
+        !Array.isArray(textCandidate) &&
+        typeof (textCandidate as { value?: unknown }).value === "string"
+      ) {
+        sanitized.text = (textCandidate as { value: string }).value;
+      }
+    }
     const annotations = publicTaskAnnotations(source.annotations);
     if (annotations) sanitized.annotations = annotations;
     if (Object.keys(sanitized).length > 0) content.push(sanitized);
@@ -866,8 +894,29 @@ function publicTaskOutput(value: unknown): Record<string, unknown>[] {
     );
     if (role === "assistant") sanitized.role = "assistant";
 
-    const content = publicTaskContent(source.content);
-    if (content.length > 0) sanitized.content = content;
+    const isPublicAssistantTextOutput =
+      role === "assistant" && PUBLIC_ASSISTANT_TEXT_OUTPUT_TYPES.has(type);
+    if (isPublicAssistantTextOutput && typeof source.output_text === "string") {
+      sanitized.output_text = source.output_text;
+    } else if (
+      isPublicAssistantTextOutput &&
+      source.output_text &&
+      typeof source.output_text === "object" &&
+      !Array.isArray(source.output_text) &&
+      typeof (source.output_text as { value?: unknown }).value === "string"
+    ) {
+      sanitized.output_text = {
+        value: (source.output_text as { value: string }).value,
+      };
+    }
+    if (isPublicAssistantTextOutput && typeof source.content === "string") {
+      sanitized.content = source.content;
+    } else {
+      const content = publicTaskContent(source.content, {
+        normalizeAssistantText: isPublicAssistantTextOutput,
+      });
+      if (content.length > 0) sanitized.content = content;
+    }
 
     if (Array.isArray(source.summary)) {
       const summary = source.summary

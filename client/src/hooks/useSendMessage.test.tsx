@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   createKnowledgeBaseTurnTask: vi.fn(),
   createResponseLogicTask: vi.fn(),
   retrieveTask: vi.fn(),
+  reconcileKnowledgeBaseProgress: vi.fn(),
   uploadFile: vi.fn(),
   fileToBase64: vi.fn(),
   creditEmit: vi.fn(),
@@ -56,7 +57,7 @@ vi.mock("@/contexts/ConversationContext", () => ({
 }));
 
 vi.mock("@/lib/knowledge-progress", () => ({
-  reconcileKnowledgeBaseProgress: vi.fn(),
+  reconcileKnowledgeBaseProgress: mocks.reconcileKnowledgeBaseProgress,
 }));
 
 function mockConversationContext(overrides = {}) {
@@ -195,6 +196,13 @@ describe("useSendMessage", () => {
       status: "completed",
       output: [],
     });
+    mocks.reconcileKnowledgeBaseProgress.mockResolvedValue({
+      progress: null,
+      interactionState: "executing",
+      canReply: false,
+      canPublish: false,
+      lockReason: "任务仍在执行",
+    });
     mocks.uploadFile.mockImplementation(async (file: File) => ({
       fileId: `file-${file.name}`,
       filename: file.name,
@@ -232,24 +240,12 @@ describe("useSendMessage", () => {
     expect(result.current.uploadProgress).toBeNull();
   });
 
-  it("shows a safe running collection status and leaves polling to the global owner", async () => {
+  it("polls, reconciles, and renders the next knowledge node after an async confirmation", async () => {
     vi.useFakeTimers();
     mocks.createKnowledgeBaseTurnTask.mockResolvedValueOnce({
       id: "test-kb-task-id",
       status: "running",
-      output: [
-        {
-          id: "kb-running-copy",
-          type: "message",
-          role: "assistant",
-          content: [
-            {
-              type: "output_text",
-              text: "FrontMind 正在按业务分支进行资料采集。",
-            },
-          ],
-        },
-      ],
+      output: [],
       knowledgeInteraction: {
         interactionState: "executing",
         canReply: false,
@@ -257,41 +253,91 @@ describe("useSendMessage", () => {
         lockReason: "任务仍在执行",
       },
     });
+    const completedOutput = [
+      {
+        id: "kb-confirmed-output",
+        type: "output_message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: [
+              "1.1 已确认。",
+              "",
+              "## 1.2 使命、愿景与企业主张",
+              "",
+              "硅基流动以加速 AGI 普惠人类为使命。",
+              "",
+              '<!-- FRONTMIND_KB_PROGRESS {"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":0,"transition":{"leafId":"1.1","from":"current","to":"confirmed","reason":"用户明确确认"}} -->',
+              '<!-- FRONTMIND_KB_PRESENTATION {"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0} -->',
+            ].join("\n"),
+          },
+        ],
+      },
+    ];
+    mocks.retrieveTask.mockResolvedValueOnce({
+      id: "test-kb-task-id",
+      status: "completed",
+      output: completedOutput,
+    });
+    mocks.reconcileKnowledgeBaseProgress.mockResolvedValueOnce({
+      progress: {
+        build: {
+          revision: 1,
+          currentLeafId: "1.2",
+        },
+      },
+      interactionState: "awaiting_input",
+      canReply: true,
+      canPublish: false,
+      lockReason: null,
+    });
     mocks.parseOutputMessages.mockReturnValueOnce([
       {
-        id: "kb-running-copy",
-        upstreamOutputId: "kb-running-copy",
+        id: "kb-confirmed-output",
+        upstreamOutputId: "kb-confirmed-output",
         role: "assistant",
-        content: "FrontMind 正在按业务分支进行资料采集。",
+        content:
+          "1.1 已确认。\n\n## 1.2 使命、愿景与企业主张\n\n硅基流动以加速 AGI 普惠人类为使命。",
         timestamp: 2,
       },
     ]);
 
     const { result, unmount } = renderHook(() => useSendMessage());
     await act(async () => {
-      await result.current.sendMessage("继续", [], {
+      await result.current.sendMessage("确认", [], {
         syncKnowledgeBaseSnapshot: true,
-        knowledgeBaseExpectedRevision: 1,
+        knowledgeBaseExpectedRevision: 0,
         knowledgeBaseExpectedLeafId: "1.1",
       });
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.advanceTimersByTimeAsync(3_000);
     });
 
-    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith(
-      "test-conv-id",
-      expect.arrayContaining([
-        expect.objectContaining({
-          content: "FrontMind 正在按业务分支进行资料采集。",
-        }),
-      ]),
-    );
-    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(mocks.retrieveTask).toHaveBeenCalledWith("test-kb-task-id");
+    expect(mocks.reconcileKnowledgeBaseProgress).toHaveBeenCalledWith({
+      conversationId: "test-conv-id",
+      taskId: "test-kb-task-id",
+    });
+    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith("test-conv-id", [
+      {
+        id: "kb-confirmed-output",
+        upstreamOutputId: "kb-confirmed-output",
+        role: "assistant",
+        content:
+          "1.1 已确认。\n\n## 1.2 使命、愿景与企业主张\n\n硅基流动以加速 AGI 普惠人类为使命。",
+        timestamp: 2,
+      },
+    ]);
     expect(mocks.updateStatus).toHaveBeenCalledWith(
       "test-conv-id",
-      "running",
-      expect.not.objectContaining({ lastKnownOutputLength: expect.anything() }),
+      "awaiting_input",
+      expect.objectContaining({
+        taskId: "test-kb-task-id",
+        previousResponseId: "test-kb-task-id",
+        lastKnownOutputLength: 1,
+      }),
     );
 
     unmount();

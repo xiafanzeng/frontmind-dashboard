@@ -172,10 +172,16 @@ describe("KnowledgeBaseLivePreview", () => {
   });
 
   it("replays a captured real response through the customer renderer", async () => {
-    const realOutput =
-      "## 1.1 企业定位\n\nFrontMind 超前智能\n\n<!--SOCRATIC_KB_STATE\n" +
-      '{"knowledgeTree":{"branches":9,"leaves":52}}\n' +
-      "SOCRATIC_KB_STATE-->";
+    const realOutput = [
+      "1.1 已确认。",
+      "",
+      "## 1.2 使命、愿景与企业主张",
+      "",
+      "硅基流动以加速 AGI 普惠人类为使命。",
+      "",
+      '<!-- FRONTMIND_KB_PROGRESS {"kind":"frontmind.knowledge-base.progress","schemaVersion":1,"revision":0,"transition":{"leafId":"1.1","from":"current","to":"confirmed","reason":"用户明确确认"}} -->',
+      '<!-- FRONTMIND_KB_PRESENTATION {"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":1,"leafId":"1.2","imageState":"no_eligible_asset","assetIds":[],"imageCount":0} -->',
+    ].join("\n");
     window.history.replaceState(
       null,
       "",
@@ -191,15 +197,18 @@ describe("KnowledgeBaseLivePreview", () => {
     render(<KnowledgeBaseLivePreview />);
 
     expect(
-      await screen.findByRole("heading", { name: "1.1 企业定位" }),
+      await screen.findByRole("heading", {
+        name: "1.2 使命、愿景与企业主张",
+      }),
     ).toBeInTheDocument();
     const customerSection = screen
       .getByRole("heading", { name: "客户可见渲染" })
       .closest("section");
-    expect(customerSection).not.toHaveTextContent("SOCRATIC_KB_STATE");
+    expect(customerSection).toHaveTextContent("1.1 已确认");
+    expect(customerSection).not.toHaveTextContent("FRONTMIND_KB_");
     expect(screen.getByText("real-task")).toBeInTheDocument();
     expect(
-      screen.getByText(/检测到 1 个旧 SOCRATIC 状态对象/),
+      screen.getByText("当前返回未发现结构或可见内容泄漏问题。"),
     ).toBeInTheDocument();
   });
 

@@ -444,4 +444,69 @@ describe("useResumePolling hydration gate", () => {
 
     unmount();
   });
+
+  it("keeps recovering instead of exposing an empty awaiting-input node", async () => {
+    mocks.hydrated = true;
+    mocks.conversations = [
+      {
+        id: "kb-empty-projection",
+        title: "Knowledge",
+        messages: [{ id: "user", role: "user", content: "确认", timestamp: 1 }],
+        status: "running",
+        taskId: "task-kb-empty",
+        createdAt: 1,
+        startedAt: 1,
+        updatedAt: 1,
+        lastKnownOutputLength: 1,
+      },
+    ];
+    mocks.retrieveTask.mockResolvedValue({
+      id: "task-kb-empty",
+      status: "completed",
+      output: [
+        {
+          id: "unrecognized-provider-shape",
+          type: "future_message_type",
+          role: "assistant",
+          content: [],
+        },
+      ],
+    });
+    mocks.fetchKnowledgeBaseProgress.mockResolvedValue({
+      build: { id: "build", conversationId: "kb-empty-projection" },
+    });
+    mocks.reconcileKnowledgeBaseProgress.mockResolvedValue({
+      progress: {
+        build: {
+          id: "build",
+          conversationId: "kb-empty-projection",
+          revision: 1,
+          currentLeafId: "1.2",
+        },
+      },
+      interactionState: "awaiting_input",
+      canReply: true,
+      canPublish: false,
+      lockReason: null,
+    });
+    mocks.parseOutputMessages.mockReturnValue([]);
+
+    const { unmount } = renderHook(() => useResumePolling());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "kb-empty-projection",
+      "running",
+      expect.objectContaining({ taskId: "task-kb-empty" }),
+    );
+    expect(mocks.updateStatus).not.toHaveBeenCalledWith(
+      "kb-empty-projection",
+      "awaiting_input",
+      expect.anything(),
+    );
+
+    unmount();
+  });
 });

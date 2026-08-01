@@ -16,6 +16,7 @@ import {
   readKnowledgeBaseSkillArchiveAttachment,
   resolveKnowledgeBaseEnterpriseIdentity,
   selectUnreconciledKnowledgeOutput,
+  shouldReplayStableKnowledgeOutput,
   shouldReconcileKnowledgeOutput,
   uploadKnowledgeBaseSkillArchive,
 } from "./knowledge-base-api";
@@ -440,6 +441,34 @@ describe("knowledge base execution contract", () => {
     );
     expect(shouldReconcileKnowledgeOutput(closedInvalid, "running")).toBe(true);
     expect(shouldReconcileKnowledgeOutput(partial, "completed")).toBe(true);
+  });
+
+  it("replays same-ID output when the provider is waiting for the next user turn", () => {
+    expect(shouldReplayStableKnowledgeOutput("awaiting_user")).toBe(true);
+    expect(shouldReplayStableKnowledgeOutput("input_required")).toBe(true);
+    expect(shouldReplayStableKnowledgeOutput("completed")).toBe(true);
+    expect(shouldReplayStableKnowledgeOutput("running")).toBe(false);
+
+    const replacedOutput = [
+      {
+        id: "reused-output",
+        role: "assistant",
+        content: "new closed knowledge envelope",
+      },
+    ];
+    expect(
+      selectUnreconciledKnowledgeOutput(
+        replacedOutput,
+        {
+          lastOutputLength: 1,
+          lastOutputItemIds: ["reused-output"],
+        },
+        {
+          replayStableOutput:
+            shouldReplayStableKnowledgeOutput("awaiting_user"),
+        },
+      ),
+    ).toEqual(replacedOutput);
   });
 
   it("waits for both v3 transition and presentation envelopes", () => {
