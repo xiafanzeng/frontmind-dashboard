@@ -249,7 +249,7 @@ export async function runReleaseDb(argv = process.argv.slice(2)) {
       // actionable fact, not a transport failure. Controllers need the full
       // JSON to distinguish ordinary preflight blocking from recovery of an
       // interrupted migration. postflight and migrate remain fail-closed.
-      return releasePlan("plan", connection, manifest);
+      return await releasePlan("plan", connection, manifest);
     }
     if (parsed.command === "postflight") {
       const result = await releasePlan("postflight", connection, manifest);

@@ -386,6 +386,10 @@ mysqlDescribe("additive release path on real MySQL 8.4.10", () => {
         status: "exact",
         schema: { status: "exact" },
       });
+      await expect(runReleaseDb(["plan", "--json"])).resolves.toMatchObject({
+        status: "exact",
+        schema: { status: "exact" },
+      });
 
       const backup = runMysqlClient(target, "mysqldump", target.database);
       const backupHash = sha256(backup);
