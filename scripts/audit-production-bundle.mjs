@@ -573,6 +573,11 @@ try {
       );
     }
   }
+  if (
+    /\bfrom\s*["']vite["']|\bimport\s*\(\s*["']vite["']/u.test(serverBundle)
+  ) {
+    throw new Error("development Vite runtime leaked into server bundle");
+  }
 } catch {
   violations.push({
     file: "public/__frontmind__/version.json",

@@ -49,6 +49,7 @@ run("pnpm", [
   "--format=esm",
   "--entry-names=[name]",
   "--outdir=dist",
+  '--define:process.env.NODE_ENV="production"',
   `--define:__FRONTMIND_BUILD_SHA__=${JSON.stringify(buildSourceSha)}`,
 ]);
 run(process.execPath, ["scripts/copy-runtime-skills.mjs"]);
