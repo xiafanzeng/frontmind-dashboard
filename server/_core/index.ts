@@ -227,13 +227,16 @@ async function startServer() {
         throw new Error("Migration manifest is not loaded");
       }
       await db.execute(sql`select 1`);
+      const migrationState = await evaluateReleaseReadiness(
+        db,
+        migrationManifest,
+      );
       const [
         preparedFiles,
         skills,
         paymentReceipts,
         projectOrders,
         knowledgeBase,
-        migrationState,
       ] = await Promise.all([
         preparedFileService.health(),
         getRuntimeSkillReadiness(),
@@ -241,10 +244,12 @@ async function startServer() {
         projectOrderRegistryReadiness.ready(),
         evaluateKnowledgeBaseReadiness({
           db,
+          schemaVerified:
+            migrationState.journal.status === "exact" &&
+            migrationState.schema.status === "exact",
           recoveryRequired: process.env.NODE_ENV === "production",
           assetRootRequired: process.env.NODE_ENV === "production",
         }),
-        evaluateReleaseReadiness(db, migrationManifest),
       ]);
       const ready =
         knowledgeBaseReadinessHttpStatus(knowledgeBase) === 200 &&

@@ -371,6 +371,29 @@ describe("knowledge-base production readiness", () => {
     expect(lowSpaceFs.writeFile).not.toHaveBeenCalled();
   });
 
+  it("uses the complete journal contract instead of repeating the legacy 0045 metadata probe", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "frontmind-health-"));
+    temporaryRoots.push(root);
+    const execute = vi
+      .fn()
+      .mockRejectedValue(new Error("LEGACY_METADATA_PROBE_MUST_NOT_RUN"));
+    const result = await evaluateKnowledgeBaseReadiness({
+      db: { execute },
+      schemaVerified: true,
+      recoveryRequired: false,
+      assetRootDir: root,
+      minimumAvailableBytes: 1,
+      writesBlocked: () => null,
+    });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.ready).toBe(true);
+    expect(result.dto.schema).toEqual({
+      migration: "complete_migration_journal",
+      status: "ok",
+    });
+  });
+
   it("requires the configured dashboard asset volume in production readiness", async () => {
     vi.stubEnv("FRONTMIND_DASHBOARD_ASSET_DIR", "");
     await expect(

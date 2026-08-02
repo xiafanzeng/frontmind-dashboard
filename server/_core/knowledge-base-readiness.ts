@@ -6,7 +6,8 @@ import { sql, type SQL } from "drizzle-orm";
 
 import { knowledgeBaseWritesAreEmergencyBlocked } from "../knowledge-base-runtime-guard";
 
-const KNOWLEDGE_BASE_MIGRATION = "0045_knowledge_base_state_machine";
+const KNOWLEDGE_BASE_LEGACY_MIGRATION = "0045_knowledge_base_state_machine";
+const KNOWLEDGE_BASE_SCHEMA_AUTHORITY = "complete_migration_journal";
 export const MIN_DASHBOARD_ASSET_AVAILABLE_BYTES = 512 * 1024 * 1024;
 
 const REQUIRED_COLUMNS = new Map<
@@ -599,7 +600,9 @@ export async function runLeasedKnowledgeBaseRecovery<
 
 export type KnowledgeBaseReadinessDto = {
   schema: {
-    migration: typeof KNOWLEDGE_BASE_MIGRATION;
+    migration:
+      | typeof KNOWLEDGE_BASE_LEGACY_MIGRATION
+      | typeof KNOWLEDGE_BASE_SCHEMA_AUTHORITY;
     status: "ok" | "unavailable";
   };
   assetStorage: {
@@ -614,6 +617,7 @@ export type KnowledgeBaseReadinessDto = {
 
 export async function evaluateKnowledgeBaseReadiness(input: {
   db: SchemaDatabase;
+  schemaVerified?: boolean;
   recoveryRequired: boolean;
   recoveryTracker?: KnowledgeBaseRecoveryHealthTracker;
   assetRootDir?: string;
@@ -623,7 +627,9 @@ export async function evaluateKnowledgeBaseReadiness(input: {
   writesBlocked?: () => unknown;
 }) {
   const [schemaResult, assetResult] = await Promise.allSettled([
-    assertKnowledgeBase0045Schema(input.db),
+    input.schemaVerified
+      ? Promise.resolve()
+      : assertKnowledgeBase0045Schema(input.db),
     probeDashboardAssetStorage({
       rootDir: input.assetRootDir,
       configuredRootRequired: input.assetRootRequired,
@@ -641,7 +647,9 @@ export async function evaluateKnowledgeBaseReadiness(input: {
   );
   const dto: KnowledgeBaseReadinessDto = {
     schema: {
-      migration: KNOWLEDGE_BASE_MIGRATION,
+      migration: input.schemaVerified
+        ? KNOWLEDGE_BASE_SCHEMA_AUTHORITY
+        : KNOWLEDGE_BASE_LEGACY_MIGRATION,
       status: schemaResult.status === "fulfilled" ? "ok" : "unavailable",
     },
     assetStorage: {
