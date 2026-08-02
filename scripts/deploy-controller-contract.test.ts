@@ -17,6 +17,7 @@ const productionInstaller = path.resolve("deploy/production/install.sh");
 const digest = `sha256:${"a".repeat(64)}`;
 const baselineDigest = `sha256:${"7".repeat(64)}`;
 const image = `ghcr.io/xiafanzeng/frontmind-dashboard@${digest}`;
+const websiteImage = `ghcr.io/xiafanzeng/frontmind-website@${digest}`;
 const sourceSha = "b".repeat(40);
 const temporaryRoots: string[] = [];
 const systemSha256sum = spawnSync("sh", ["-c", "command -v sha256sum"], {
@@ -37,10 +38,14 @@ type PlanStatus =
   | "error";
 
 type HarnessOptions = {
+  service?: "dashboard" | "website";
   planStatus?: PlanStatus;
   planSequence?: PlanStatus[];
   readySourceSha?: string;
   readyImageDigest?: string;
+  activeSourceSha?: string;
+  activeReadyImageDigest?: string;
+  activeImageReference?: string;
   cosignExit?: number;
   migrationMode?: "success" | "timeout" | "precondition-changed";
   backupMode?: "success" | "dump-fail";
@@ -102,10 +107,14 @@ async function writeVerifiedRecoveryBackup(backupDir: string) {
 
 async function harness(options: HarnessOptions = {}) {
   const {
+    service = "dashboard",
     planStatus = "exact",
     planSequence = [planStatus],
     readySourceSha = sourceSha,
     readyImageDigest = digest,
+    activeSourceSha = sourceSha,
+    activeReadyImageDigest = baselineDigest,
+    activeImageReference = `frontmind-${service}:temp-${sourceSha.slice(0, 7)}`,
     cosignExit = 0,
     migrationMode = "success",
     backupMode = "success",
@@ -113,6 +122,12 @@ async function harness(options: HarnessOptions = {}) {
     localImageDigests = [],
     bootstrapped = true,
   } = options;
+  const repository = `ghcr.io/xiafanzeng/frontmind-${service}`;
+  const candidateImage = `${repository}@${digest}`;
+  const imageEnvKey =
+    service === "dashboard"
+      ? "FRONTMIND_DASHBOARD_IMAGE"
+      : "FRONTMIND_WEBSITE_IMAGE";
   const root = await mkdtemp(path.join(tmpdir(), "frontmind-controller-"));
   temporaryRoots.push(root);
   const bin = path.join(root, "bin");
@@ -123,6 +138,7 @@ async function harness(options: HarnessOptions = {}) {
   const backupDir = path.join(root, "backups");
   const log = path.join(root, "commands.log");
   const planCounter = path.join(root, "plan-counter");
+  const rolloutCounter = path.join(root, "rollout-counter");
   const backupCnf = path.join(root, "backup.cnf");
   const restoreCnf = path.join(root, "restore.cnf");
   await Promise.all([
@@ -140,23 +156,29 @@ async function harness(options: HarnessOptions = {}) {
   await writeFile(path.join(composeDir, "compose.yaml"), "services: {}\n");
   await writeFile(
     path.join(root, "compose.env"),
-    "FRONTMIND_DASHBOARD_HOST_PORT=3001\n",
+    service === "dashboard"
+      ? "FRONTMIND_DASHBOARD_HOST_PORT=3001\n"
+      : "FRONTMIND_WEBSITE_HOST_PORT=8888\n",
   );
   await writeFile(
-    path.join(configRoot, "dashboard.env"),
+    path.join(configRoot, `${service}.env`),
     [
-      "IMAGE_REPOSITORY=ghcr.io/xiafanzeng/frontmind-dashboard",
-      "COSIGN_IDENTITY=https://github.com/xiafanzeng/frontmind-dashboard/.github/workflows/dashboard-ci.yml@refs/heads/main",
+      `IMAGE_REPOSITORY=${repository}`,
+      service === "dashboard"
+        ? "COSIGN_IDENTITY=https://github.com/xiafanzeng/frontmind-dashboard/.github/workflows/dashboard-ci.yml@refs/heads/main"
+        : "COSIGN_IDENTITY=https://github.com/xiafanzeng/frontmind-website/.github/workflows/ci-release.yml@refs/heads/main",
       "COSIGN_ISSUER=https://token.actions.githubusercontent.com",
       `COMPOSE_DIR=${composeDir}`,
       `COMPOSE_FILE=${path.join(composeDir, "compose.yaml")}`,
       `COMPOSE_ENV_FILE=${path.join(root, "compose.env")}`,
       `IMAGE_ENV_FILE=${path.join(composeDir, ".env")}`,
-      "COMPOSE_SERVICE=dashboard",
-      "IMAGE_ENV_KEY=FRONTMIND_DASHBOARD_IMAGE",
-      "LOCAL_READY_URL=http://127.0.0.1:3001/readyz",
-      "PUBLIC_READY_URL=https://dashboard.invalid/readyz",
-      "READY_SHA_SHAPE=dashboard",
+      `COMPOSE_SERVICE=${service}`,
+      `IMAGE_ENV_KEY=${imageEnvKey}`,
+      service === "dashboard"
+        ? "LOCAL_READY_URL=http://127.0.0.1:3001/readyz"
+        : "LOCAL_READY_URL=http://127.0.0.1:8888/readyz",
+      `PUBLIC_READY_URL=https://${service}.invalid/readyz`,
+      `READY_SHA_SHAPE=${service}`,
       `STATE_DIR=${stateDir}`,
       `BACKUP_DIR=${backupDir}`,
       "BACKUP_DATABASE=frontmind_acceptance",
@@ -193,7 +215,7 @@ async function harness(options: HarnessOptions = {}) {
     )
     .replace(
       "readonly CANDIDATE_READY_BUDGET_SECONDS=90",
-      "readonly CANDIDATE_READY_BUDGET_SECONDS=1",
+      "readonly CANDIDATE_READY_BUDGET_SECONDS=2",
     );
   const controllerFile = path.join(root, "controller");
   await executable(controllerFile, controller);
@@ -226,8 +248,21 @@ exec "$@"
   await executable(
     path.join(bin, "curl"),
     `#!/usr/bin/env bash
-printf '{"status":"ok","build":{"sha":"%s","imageDigest":"%s"},"migration":{"journalHash":"%s"}}\\n' \
-  "$TEST_READY_SOURCE_SHA" "$TEST_READY_IMAGE_DIGEST" "${"c".repeat(64)}"
+rollout_count=0
+[[ ! -f "$TEST_ROLLOUT_COUNTER" ]] || read -r rollout_count <"$TEST_ROLLOUT_COUNTER"
+ready_source="$TEST_READY_SOURCE_SHA"
+ready_digest="$TEST_READY_IMAGE_DIGEST"
+if [[ "$TEST_FORCED_INITIAL_TAKEOVER" == 1 && ( $rollout_count -eq 0 || $rollout_count -ge 2 ) ]]; then
+  ready_source="$TEST_ACTIVE_SOURCE_SHA"
+  ready_digest="$TEST_ACTIVE_READY_IMAGE_DIGEST"
+fi
+if [[ "$TEST_SERVICE" == dashboard ]]; then
+  printf '{"status":"ok","build":{"sha":"%s","imageDigest":"%s"},"migration":{"journalHash":"%s"}}\\n' \
+    "$ready_source" "$ready_digest" "${"c".repeat(64)}"
+else
+  printf '{"status":"ok","buildSha":"%s","imageDigest":"%s","dependencies":{"status":"ok"}}\\n' \
+    "$ready_source" "$ready_digest"
+fi
 `,
   );
   await executable(
@@ -244,15 +279,23 @@ if [[ "\${1:-}" == login ]]; then
   exit 0
 fi
 if [[ "$args" == *" image inspect "*"org.opencontainers.image.revision"* ]]; then echo "$TEST_SOURCE_SHA"; exit 0; fi
+if [[ "$args" == *" inspect "*"org.opencontainers.image.revision"* ]]; then echo "$TEST_ACTIVE_SOURCE_SHA"; exit 0; fi
 if [[ "$args" == *" image inspect "*"{{.Id}}"* ]]; then echo "sha256:${"9".repeat(64)}"; exit 0; fi
+if [[ "$args" == *" inspect "*"{{.State.Running}}"* ]]; then echo "true"; exit 0; fi
+if [[ "$args" == *" inspect "*"{{.Config.Image}}"* ]]; then echo "$TEST_ACTIVE_IMAGE_REFERENCE"; exit 0; fi
 if [[ "$args" == *" inspect "*"{{.Image}}"* ]]; then echo "sha256:${"9".repeat(64)}"; exit 0; fi
-if [[ "$args" == *" ps -q dashboard "* ]]; then echo "frontmind-running-dashboard"; exit 0; fi
+if [[ "$args" == *" ps -q $TEST_SERVICE "* ]]; then echo "frontmind-running-$TEST_SERVICE"; exit 0; fi
 if [[ "$args" == *" image ls "* ]]; then
   IFS=',' read -r -a local_digests <<<"$TEST_LOCAL_IMAGE_DIGESTS"
   for local_digest in "\${local_digests[@]}"; do
-    [[ -n "$local_digest" ]] && printf 'ghcr.io/xiafanzeng/frontmind-dashboard@%s\\n' "$local_digest"
+    [[ -n "$local_digest" ]] && printf '%s@%s\\n' "$TEST_REPOSITORY" "$local_digest"
   done
   exit 0
+fi
+if [[ "$args" == *" up -d "* ]]; then
+  rollout_count=0
+  [[ ! -f "$TEST_ROLLOUT_COUNTER" ]] || read -r rollout_count <"$TEST_ROLLOUT_COUNTER"
+  printf '%s\\n' "$((rollout_count + 1))" >"$TEST_ROLLOUT_COUNTER"
 fi
 if [[ "$args" == *" release-db-plan plan --json "* ]]; then
   printf '%s\n' "plan-config \${DOCKER_CONFIG:-unset}" >>"$TEST_LOG"
@@ -382,10 +425,17 @@ fi
         SUDO_USER: forced ? "frontmind-deploy" : "",
         PATH: `${bin}:${process.env.PATH}`,
         TEST_LOG: log,
+        TEST_SERVICE: service,
+        TEST_REPOSITORY: repository,
         TEST_PLAN_SEQUENCE: planSequence.join(","),
         TEST_PLAN_COUNTER: planCounter,
+        TEST_ROLLOUT_COUNTER: rolloutCounter,
+        TEST_FORCED_INITIAL_TAKEOVER: forced && !bootstrapped ? "1" : "0",
         TEST_READY_SOURCE_SHA: readySourceSha,
         TEST_READY_IMAGE_DIGEST: readyImageDigest,
+        TEST_ACTIVE_SOURCE_SHA: activeSourceSha,
+        TEST_ACTIVE_READY_IMAGE_DIGEST: activeReadyImageDigest,
+        TEST_ACTIVE_IMAGE_REFERENCE: activeImageReference,
         TEST_SOURCE_SHA: sourceSha,
         TEST_COSIGN_EXIT: String(cosignExit),
         TEST_MIGRATION_MODE: migrationMode,
@@ -394,14 +444,14 @@ fi
         TEST_LOCAL_IMAGE_DIGESTS: localImageDigests.join(","),
       },
     });
-  const run = (candidate = image) =>
-    runWithArgs(["dashboard", candidate, sourceSha]);
-  const runForced = (candidate = image, input = registryEnvelope) =>
-    runWithArgs(["dashboard", candidate, sourceSha], { forced: true, input });
-  const bootstrap = (candidate = image) =>
-    runWithArgs(["--bootstrap-state", "dashboard", candidate, sourceSha]);
-  const acknowledge = (candidate = image) =>
-    runWithArgs(["--acknowledge-incident", "dashboard", candidate, sourceSha]);
+  const run = (candidate = candidateImage) =>
+    runWithArgs([service, candidate, sourceSha]);
+  const runForced = (candidate = candidateImage, input = registryEnvelope) =>
+    runWithArgs([service, candidate, sourceSha], { forced: true, input });
+  const bootstrap = (candidate = candidateImage) =>
+    runWithArgs(["--bootstrap-state", service, candidate, sourceSha]);
+  const acknowledge = (candidate = candidateImage) =>
+    runWithArgs(["--acknowledge-incident", service, candidate, sourceSha]);
   return {
     root,
     backupDir,
@@ -409,6 +459,7 @@ fi
     log,
     state: path.join(stateDir, "state.json"),
     registryToken,
+    image: candidateImage,
     run,
     runForced,
     bootstrap,
@@ -466,6 +517,156 @@ describe("deploy controller shell contract", () => {
       expect(commands).not.toContain(`docker pull ${image}`);
     },
   );
+
+  it("establishes the first Dashboard state from a signed same-source image without database writes", async () => {
+    const test = await harness({ bootstrapped: false });
+    const result = test.runForced();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("INITIAL_SIGNED_TAKEOVER_SUCCESS");
+
+    expect(JSON.parse(await readFile(test.state, "utf8"))).toMatchObject({
+      currentDigest: digest,
+      previousDigest: "",
+      sourceSha,
+      journalHash: "c".repeat(64),
+      lastResult: {
+        status: "success",
+        message: "initial-signed-takeover",
+      },
+    });
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).toContain(
+      "cosign verify --certificate-identity https://github.com/xiafanzeng/frontmind-dashboard/.github/workflows/dashboard-ci.yml@refs/heads/main --certificate-oidc-issuer https://token.actions.githubusercontent.com",
+    );
+    expect(commands).toContain(`docker pull ${image}`);
+    expect(commands).toContain("inspect --format {{.State.Running}}");
+    expect(commands).toContain("release-db-plan plan --json");
+    expect(commands).toContain("plan-config unset");
+    expect((commands.match(/^docker .* up -d /gmu) || []).length).toBe(1);
+    expect(commands).not.toContain("release-db-migrate migrate");
+    expect(commands).not.toContain("mysqldump");
+    expect(commands).not.toContain("DROP DATABASE");
+  });
+
+  it("establishes the first Website state without invoking any database service", async () => {
+    const test = await harness({ service: "website", bootstrapped: false });
+    const result = test.runForced();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("INITIAL_SIGNED_TAKEOVER_SUCCESS");
+    expect(JSON.parse(await readFile(test.state, "utf8"))).toMatchObject({
+      currentDigest: digest,
+      previousDigest: "",
+      sourceSha,
+      journalHash: "not-applicable",
+      lastResult: { message: "initial-signed-takeover" },
+    });
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).toContain(`docker pull ${websiteImage}`);
+    expect(commands).not.toContain("release-db-");
+    expect(commands).not.toContain("mysql");
+    expect(commands).not.toContain("mysqldump");
+  });
+
+  it("takes over an internally consistent older source SHA without database writes", async () => {
+    const olderSourceSha = "e".repeat(40);
+    const test = await harness({
+      bootstrapped: false,
+      activeSourceSha: olderSourceSha,
+    });
+    const result = test.runForced();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("INITIAL_SIGNED_TAKEOVER_SUCCESS");
+    expect(olderSourceSha).not.toBe(sourceSha);
+    expect(JSON.parse(await readFile(test.state, "utf8"))).toMatchObject({
+      currentDigest: digest,
+      previousDigest: "",
+      sourceSha,
+      lastResult: { message: "initial-signed-takeover" },
+    });
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).toContain("cosign verify");
+    expect(commands).toContain("release-db-plan plan --json");
+    expect((commands.match(/^docker .* up -d /gmu) || []).length).toBe(1);
+    expect(commands).not.toContain("release-db-migrate migrate");
+    expect(commands).not.toContain("mysqldump");
+    expect(commands).not.toContain("DROP DATABASE");
+  });
+
+  it("rejects a malformed active source label before database or service changes", async () => {
+    const test = await harness({
+      bootstrapped: false,
+      activeSourceSha: "not-a-source-sha",
+    });
+    const result = test.runForced();
+    expect(result.status).toBe(73);
+    expect(result.stderr).toContain(
+      "INITIAL_TAKEOVER_ACTIVE_SOURCE_SHA_INVALID",
+    );
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).toContain("cosign verify");
+    expect(commands).not.toContain("release-db-");
+    expect(commands).not.toContain(" up -d ");
+    await expect(readFile(test.state, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("blocks pending migrations during initial takeover before backup or mutation", async () => {
+    const test = await harness({
+      bootstrapped: false,
+      planStatus: "pending-expand",
+    });
+    const result = test.runForced();
+    expect(result.status).toBe(78);
+    expect(result.stderr).toContain(
+      "INITIAL_TAKEOVER_DATABASE_NOT_EXACT:pending",
+    );
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).toContain("release-db-plan plan --json");
+    expect(commands).not.toContain("release-db-migrate migrate");
+    expect(commands).not.toContain("mysqldump");
+    expect(commands).not.toContain(" up -d ");
+    await expect(readFile(test.state, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("blocks an exact ledger with schema drift during initial takeover", async () => {
+    const test = await harness({
+      bootstrapped: false,
+      planStatus: "exact-schema-diverged",
+    });
+    const result = test.runForced();
+    expect(result.status).toBe(78);
+    expect(result.stderr).toContain(
+      "INITIAL_TAKEOVER_DATABASE_SCHEMA_NOT_EXACT:diverged",
+    );
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).toContain("release-db-plan plan --json");
+    expect(commands).not.toContain("release-db-migrate migrate");
+    expect(commands).not.toContain("mysqldump");
+    expect(commands).not.toContain(" up -d ");
+  });
+
+  it("restores the captured pre-controller runtime when the first signed candidate is unready", async () => {
+    const test = await harness({
+      bootstrapped: false,
+      readyImageDigest: `sha256:${"6".repeat(64)}`,
+    });
+    const result = test.runForced();
+    expect(result.status).toBe(75);
+    expect(result.stderr).toContain(
+      "INITIAL_SIGNED_TAKEOVER_FAILED_PREVIOUS_RUNTIME_RESTORED",
+    );
+    const commands = await readFile(test.log, "utf8");
+    expect((commands.match(/^docker .* up -d /gmu) || []).length).toBe(2);
+    expect(commands).toContain(" stop dashboard");
+    expect(commands).not.toContain("mysqldump");
+    expect(commands).not.toContain("release-db-migrate migrate");
+    await expect(readFile(test.state, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
 
   it("deploys exact without backup and treats the same digest as an idempotent no-op", async () => {
     const test = await harness();

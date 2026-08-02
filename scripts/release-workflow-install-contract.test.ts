@@ -11,6 +11,9 @@ import {
 } from "./assert-current-pdf-runtime-revision.mjs";
 
 const dashboardWorkflow = path.resolve(".github/workflows/dashboard-ci.yml");
+const productionKnownHosts = path.resolve(
+  ".github/deploy/production_known_hosts",
+);
 const pdfWorkflow = path.resolve(".github/workflows/pdf-runtime.yml");
 const pdfDockerfile = path.resolve("deploy/1panel-node-pdf/Dockerfile");
 const installer = path.resolve("deploy/production/install.sh");
@@ -36,16 +39,25 @@ describe("release workflow source-ordering contracts", () => {
     expect(workflow).not.toMatch(/pnpm\/action-setup@v4\s+with:\s+version:/gu);
   });
 
-  it("builds and signs the first Dashboard image before auto-deploy is enabled", async () => {
+  it("builds and signs before every automatic main deployment", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
-    expect(
-      workflow.match(/if: vars\.DASHBOARD_AUTO_DEPLOY_ENABLED == 'true'/gu),
-    ).toHaveLength(3);
+    expect(workflow).not.toContain("DASHBOARD_AUTO_DEPLOY_ENABLED");
     expect(workflow.indexOf("Build and push image")).toBeLessThan(
       workflow.indexOf("Install restricted deploy key"),
     );
     expect(workflow.indexOf("Sign exact application digest")).toBeLessThan(
       workflow.indexOf("Install restricted deploy key"),
+    );
+    expect(workflow).toContain(
+      "install -m 0644 .github/deploy/production_known_hosts ~/.ssh/known_hosts",
+    );
+    expect(workflow).toContain("DEPLOY_HOST: 149.88.85.148");
+    expect(workflow).toContain("DEPLOY_USER: frontmind-deploy");
+    expect(workflow).not.toContain("ssh-keyscan");
+
+    const knownHosts = await readFile(productionKnownHosts, "utf8");
+    expect(knownHosts).toMatch(
+      /^149\.88\.85\.148 ssh-ed25519 [A-Za-z0-9+/=]+\n$/u,
     );
   });
 

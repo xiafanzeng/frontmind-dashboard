@@ -128,27 +128,17 @@ current/previous。服务器只主动保留 current 与 previous。
 
 ## 3. GitHub 配置
 
-Dashboard 仓库：
+两个仓库各只需要一个 Actions Secret：
 
-| 类型     | 名称                            | 内容                                         |
-| -------- | ------------------------------- | -------------------------------------------- |
-| Secret   | `DASHBOARD_DEPLOY_SSH_KEY`      | 只绑定 Dashboard forced-command 的私钥       |
-| Secret   | `PRODUCTION_DEPLOY_KNOWN_HOSTS` | 人工核验过的生产主机公钥                     |
-| Variable | `PRODUCTION_DEPLOY_HOST`        | 生产 SSH 主机名或 IP                         |
-| Variable | `PRODUCTION_DEPLOY_PORT`        | SSH 端口，空值按 22                          |
-| Variable | `PRODUCTION_DEPLOY_USER`        | 固定为 `frontmind-deploy`                    |
-| Variable | `DASHBOARD_AUTO_DEPLOY_ENABLED` | 首次 bootstrap 前为 `false`，完成后为 `true` |
+| 仓库      | Secret                           | 内容                                       |
+| --------- | -------------------------------- | ------------------------------------------ |
+| Dashboard | `DASHBOARD_DEPLOY_SSH_KEY`       | 只绑定 Dashboard forced-command 的私钥     |
+| Website   | `WEBSITE_DEPLOY_SSH_PRIVATE_KEY` | 只绑定 Website forced-command 的另一把私钥 |
 
-Website 仓库：
-
-| 类型     | 名称                             | 内容                                         |
-| -------- | -------------------------------- | -------------------------------------------- |
-| Secret   | `WEBSITE_DEPLOY_SSH_PRIVATE_KEY` | 只绑定 Website forced-command 的另一把私钥   |
-| Secret   | `WEBSITE_DEPLOY_KNOWN_HOSTS`     | 人工核验过的生产主机公钥                     |
-| Variable | `WEBSITE_DEPLOY_HOST`            | 生产 SSH 主机名或 IP                         |
-| Variable | `WEBSITE_DEPLOY_PORT`            | SSH 端口，空值按 22                          |
-| Variable | `WEBSITE_DEPLOY_USER`            | 固定为 `frontmind-deploy`                    |
-| Variable | `WEBSITE_AUTO_DEPLOY_ENABLED`    | 首次 bootstrap 前为 `false`，完成后为 `true` |
+生产主机 `149.88.85.148`、端口 `22`、用户 `frontmind-deploy` 和已人工核验的 ED25519
+host key 都是公开发布策略，不是秘密；它们分别固定在 workflow 与
+`.github/deploy/production_known_hosts` 中并进入代码评审。workflow 禁止运行时
+`ssh-keyscan` 或关闭 host-key 校验，也不再依赖容易漂移的 Repository variables。
 
 `GITHUB_TOKEN` 由 Actions 自动提供，用于 GHCR 和 OIDC，不新增长期 GHCR 写入或读取
 令牌。自动发布时，workflow 只通过 SSH 标准输入发送两行
@@ -158,11 +148,20 @@ root-only 的 `/run` 临时 Docker 配置，镜像拉取后立即删除，不把
 Compose、容器环境、日志或长期 `/root/.docker/config.json`。Dashboard/Website 私钥必须
 独立；服务器 `authorized_keys` 分别把它们固定到对应服务，无法选择或切换服务。
 
-首次切换时保持 `DASHBOARD_AUTO_DEPLOY_ENABLED` 和
-`WEBSITE_AUTO_DEPLOY_ENABLED` 未设置或为 `false`。两个仓库第一次进入 `main` 的提交
-仍会完成全部验证、构建、推送和签名，但跳过 SSH 部署与 deployed marker；root 分别启动、
-验证并 bootstrap 对应基线 digest 后，再把各自变量设为 `true`。后续 `main` 提交才进入
-全自动部署。
+任何提交进入 `main` 后，在 CI 全绿时自动构建、签名并发布，不再设置
+`*_AUTO_DEPLOY_ENABLED` 开关或增加普通发布人工审批。服务器在 `state.json` 不存在时只开放
+一次受限的“首次签名镜像接管”：仍从 stdin 使用本次 job 的
+临时 GHCR 凭据，严格验证仓库、digest、Cosign workflow identity 与 OCI revision；随后
+独立证明现有运行容器的 source SHA/digest 与本机/公网 readiness 自洽且健康。当前 source SHA
+可以不同于签名候选；候选仍必须由 `main` workflow 签名且 OCI revision 等于请求 SHA。
+Dashboard 还必须只读得到 `plan=exact` 且 `schema.status=exact`；`pending/ahead/diverged`
+全部在备份、migration 或服务重建前阻断。Website 不调用任何数据库命令。
+
+接管前 controller 会捕获现有容器的 image ID、原 image reference 与 readiness digest。
+候选未通过 readiness 时，它在同一个总 deadline 内重建原运行镜像并再次核对本机/公网
+identity；只有候选成功后才写首份 state，`previousDigest` 留空且结果记为
+`initial-signed-takeover`。现有临时镜像不是经 GHCR digest 验签的回滚身份，因此只用于本次
+接管失败时原地恢复，不写成长期 `previousDigest`；下一次成功发布会自然产生首个正式 previous。
 
 ## 4. 服务器首次安装边界
 
@@ -204,8 +203,9 @@ UID/GID `10001:10001`；Website 固定 `10002:10002`，两者不可混用。
 3. 为应用、readiness、migrator、backup、restore 建立分离账户：应用只有业务 DML，
    readiness 只读 ledger/information_schema，migrator 只在一次性容器持有目标库
    DDL，backup 只读，restore 可重建目标库；
-4. 仅首次 root-only 基线切换按临时管理员凭据执行 `docker login ghcr.io`，完成
-   `frontmind-bootstrap-state` 后立即执行 `docker logout ghcr.io`；后续普通自动发布只使用
+4. 首选首次切换也由受限 CI 自动接管，不需要 root 登录 GHCR；只有使用下文兼容的
+   root-only `frontmind-bootstrap-state` 入口时，才按临时管理员凭据执行
+   `docker login ghcr.io`，完成后立即 `docker logout ghcr.io`。所有普通自动发布只使用
    Actions 经 SSH stdin 传入的 job-scoped `GITHUB_TOKEN`，不依赖或回退到 root 长期登录；
 5. Compose 由 controller 直接从上述两个服务器路径运行，1Panel 只观察运行结果；
    现有反向代理继续指向 `127.0.0.1:3001` 与 `127.0.0.1:8888`，不要再挂载源码或
@@ -213,9 +213,11 @@ UID/GID `10001:10001`；Website 固定 `10002:10002`，两者不可混用。
 6. 首次手工触发 PDF runtime workflow；
 7. 首次切换前只读核验生产 ledger 是镜像 journal 的严格有序前缀，并导出原
    1Panel 配置；
-8. 选择一个与当前数据库完全兼容、已经由 `main` workflow 签名的基线 digest，先按
-   导出的旧配置作为外部回退，使用新 Compose 启动该基线。确认本机与公网
-   `/readyz` 都返回该 source SHA 和精确 image digest 后，由 root 一次性执行：
+8. 首选路径是让受限 CI forced-command 直接从当前健康运行态切换到本次签名 digest；
+   controller 会自动执行上述双向 identity 核对、验签、exact DB plan、回退捕获和 readiness
+   门，并在成功后建立首份 state。若签名 digest 已经由管理员使用新 Compose
+   启动，则可在确认本机与公网 `/readyz` 都返回该 source SHA 和精确 image digest 后，
+   由 root 使用一次性兼容入口登记：
 
    ```bash
    sudo /usr/local/sbin/frontmind-bootstrap-state \
@@ -224,7 +226,7 @@ UID/GID `10001:10001`；Website 固定 `10002:10002`，两者不可混用。
      <40hex-source-sha>
    ```
 
-   Website 独立执行同一命令并把 service/repository 换为 `website`。该入口要求 state
+   Website 独立执行同一命令并把 service/repository 换为 `website`。root 入口要求 state
    尚不存在，会再次验签、pull、核对 OCI revision label、当前 Compose container 的
    image ID，以及本机/公网 readiness 的 source SHA + digest；它只写 image env 和
    原子 state，不调用 release-db、backup、restore 或 migration，也不会凭空登记一个

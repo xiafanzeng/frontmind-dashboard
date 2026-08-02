@@ -289,45 +289,39 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "$IMAGE@$DIGEST"
       - name: Install restricted deploy key
-        if: vars.DASHBOARD_AUTO_DEPLOY_ENABLED == 'true'
         shell: bash
         env:
           DEPLOY_KEY: ${{ secrets.DASHBOARD_DEPLOY_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.PRODUCTION_DEPLOY_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
+          : "${DEPLOY_KEY:?DASHBOARD_DEPLOY_SSH_KEY is required}"
           install -d -m 0700 ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" >~/.ssh/dashboard_deploy
-          printf '%s\n' "$KNOWN_HOSTS" >~/.ssh/known_hosts
-          chmod 0600 ~/.ssh/dashboard_deploy ~/.ssh/known_hosts
+          install -m 0644 .github/deploy/production_known_hosts ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/dashboard_deploy
           ssh-keygen -y -f ~/.ssh/dashboard_deploy >/dev/null
       - name: Deploy through fixed Dashboard capability
-        if: vars.DASHBOARD_AUTO_DEPLOY_ENABLED == 'true'
         shell: bash
         env:
           IMAGE: ${{ steps.image.outputs.repository }}
           DIGEST: ${{ steps.build.outputs.digest }}
-          DEPLOY_HOST: ${{ vars.PRODUCTION_DEPLOY_HOST }}
-          DEPLOY_PORT: ${{ vars.PRODUCTION_DEPLOY_PORT }}
-          DEPLOY_USER: ${{ vars.PRODUCTION_DEPLOY_USER }}
+          DEPLOY_HOST: 149.88.85.148
+          DEPLOY_PORT: "22"
+          DEPLOY_USER: frontmind-deploy
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          : "${DEPLOY_HOST:?PRODUCTION_DEPLOY_HOST is required}"
-          : "${DEPLOY_USER:?PRODUCTION_DEPLOY_USER is required}"
-          port="${DEPLOY_PORT:-22}"
           printf '%s\n%s\n' "$GHCR_USERNAME" "$GHCR_TOKEN" |
             ssh -T \
               -i ~/.ssh/dashboard_deploy \
-              -p "$port" \
+              -p "$DEPLOY_PORT" \
               -o BatchMode=yes \
               -o IdentitiesOnly=yes \
               -o StrictHostKeyChecking=yes \
               "$DEPLOY_USER@$DEPLOY_HOST" \
               "$IMAGE@$DIGEST $GITHUB_SHA"
       - name: Record immutable successful-deployment marker
-        if: vars.DASHBOARD_AUTO_DEPLOY_ENABLED == 'true'
         env:
           IMAGE: ${{ steps.image.outputs.repository }}
           DIGEST: ${{ steps.build.outputs.digest }}

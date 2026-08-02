@@ -45,6 +45,7 @@ config_is_root_only() {
 
 registry_auth_dir=""
 candidate_env=""
+initial_runtime_env=""
 
 cleanup_ephemeral_registry_auth() {
   local expected_prefix
@@ -67,6 +68,9 @@ cleanup_ephemeral_registry_auth() {
 cleanup_on_exit() {
   if [[ -n $candidate_env ]]; then
     rm -f -- "$candidate_env" || true
+  fi
+  if [[ -n $initial_runtime_env ]]; then
+    rm -f -- "$initial_runtime_env" || true
   fi
   cleanup_ephemeral_registry_auth || true
 }
@@ -194,8 +198,20 @@ flock -n 9 || die "DEPLOY_ALREADY_RUNNING:${service}" 75
 if [[ $mode == "bootstrap-state" && ( -e $state_file || -L $state_file ) ]]; then
   die "BOOTSTRAP_STATE_ALREADY_EXISTS" 73
 fi
+initial_signed_takeover=0
 if [[ $mode != "bootstrap-state" && ! -f $state_file ]]; then
-  die "DEPLOY_STATE_NOT_BOOTSTRAPPED" 73
+  if [[ -e $state_file || -L $state_file ]]; then
+    die "DEPLOY_STATE_INVALID"
+  fi
+  if [[ $mode == "deploy" && ${SUDO_USER:-} == "frontmind-deploy" ]]; then
+    # A restricted GitHub Actions deployment may establish the first signed
+    # state only by replacing an already-running, internally consistent
+    # service. The dedicated path below is deliberately unable to migrate,
+    # back up, restore or otherwise write the database.
+    initial_signed_takeover=1
+  else
+    die "DEPLOY_STATE_NOT_BOOTSTRAPPED" 73
+  fi
 fi
 
 digest="${image##*@}"
@@ -376,6 +392,95 @@ wait_until_ready() {
     sleep 2
   done
   return 1
+}
+
+ready_payload_digest() {
+  local payload="$1"
+  case "$READY_SHA_SHAPE" in
+    dashboard)
+      jq -er '.build.imageDigest | select(type == "string" and test("^sha256:[a-f0-9]{64}$"))' \
+        <<<"$payload"
+      ;;
+    website)
+      jq -er '.imageDigest | select(type == "string" and test("^sha256:[a-f0-9]{64}$"))' \
+        <<<"$payload"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+INITIAL_RUNTIME_SOURCE_SHA=""
+INITIAL_RUNTIME_DIGEST=""
+INITIAL_RUNTIME_IMAGE_REFERENCE=""
+INITIAL_RUNTIME_IMAGE_ID=""
+
+capture_initial_runtime() {
+  local environment_file="$1" container_id running active_source image_reference
+  local image_id local_payload public_payload active_digest deadline
+  container_id="$(compose "$environment_file" ps -q "$COMPOSE_SERVICE")"
+  [[ -n $container_id && $container_id != *$'\n'* ]] \
+    || die "INITIAL_TAKEOVER_ACTIVE_CONTAINER_NOT_UNIQUE" 73
+  running="$(docker inspect --format '{{.State.Running}}' "$container_id")"
+  [[ $running == "true" ]] || die "INITIAL_TAKEOVER_ACTIVE_CONTAINER_NOT_RUNNING" 73
+  active_source="$(docker inspect \
+    --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+    "$container_id")"
+  [[ $active_source =~ ^[a-f0-9]{40}$ ]] \
+    || die "INITIAL_TAKEOVER_ACTIVE_SOURCE_SHA_INVALID" 73
+  image_reference="$(docker inspect --format '{{.Config.Image}}' "$container_id")"
+  [[ $image_reference =~ ^[A-Za-z0-9][A-Za-z0-9._/@:-]*$ ]] \
+    || die "INITIAL_TAKEOVER_ACTIVE_IMAGE_REFERENCE_INVALID" 73
+  image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
+  [[ $image_id =~ ^sha256:[a-f0-9]{64}$ ]] \
+    || die "INITIAL_TAKEOVER_ACTIVE_IMAGE_ID_INVALID" 73
+
+  deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    local_payload="$(curl --fail --silent --show-error --max-time 4 \
+      "$LOCAL_READY_URL" 2>/dev/null || true)"
+    active_digest="$(ready_payload_digest "$local_payload" 2>/dev/null || true)"
+    if [[ -n $active_digest ]] && \
+      ready_payload_matches_identity "$local_payload" "$active_source" "$active_digest"; then
+      public_payload="$(curl --fail --silent --show-error --max-time 6 \
+        "$PUBLIC_READY_URL" 2>/dev/null || true)"
+      if ready_payload_matches_identity \
+        "$public_payload" "$active_source" "$active_digest"; then
+        INITIAL_RUNTIME_SOURCE_SHA="$active_source"
+        INITIAL_RUNTIME_DIGEST="$active_digest"
+        INITIAL_RUNTIME_IMAGE_REFERENCE="$image_reference"
+        INITIAL_RUNTIME_IMAGE_ID="$image_id"
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  die "INITIAL_TAKEOVER_ACTIVE_RUNTIME_NOT_READY" 75
+}
+
+make_initial_runtime_env() {
+  local target="$1" selected_image="$INITIAL_RUNTIME_IMAGE_REFERENCE"
+  local resolved_image_id=""
+  resolved_image_id="$(docker image inspect --format '{{.Id}}' \
+    "$selected_image" 2>/dev/null || true)"
+  if [[ $resolved_image_id != "$INITIAL_RUNTIME_IMAGE_ID" ]]; then
+    # A mutable local tag must never redirect rollback. Docker accepts the
+    # immutable local image ID as an image reference when the original tag no
+    # longer resolves to the captured image.
+    selected_image="$INITIAL_RUNTIME_IMAGE_ID"
+  fi
+  cp -- "$COMPOSE_ENV_FILE" "$target" || return 1
+  printf '%s=%s\n' "$IMAGE_ENV_KEY" "$selected_image" >>"$target" || return 1
+  printf 'FRONTMIND_IMAGE_DIGEST=%s\n' "$INITIAL_RUNTIME_DIGEST" >>"$target" || return 1
+  chmod 0600 "$target" || return 1
+}
+
+restore_initial_runtime() {
+  local candidate_environment="$1" deadline="$2"
+  compose "$candidate_environment" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+  compose_before_deadline "$deadline" "$initial_runtime_env" \
+    up -d --no-deps --force-recreate "$COMPOSE_SERVICE" || return 1
+  wait_until_ready \
+    "$INITIAL_RUNTIME_SOURCE_SHA" "$INITIAL_RUNTIME_DIGEST" "$deadline"
 }
 
 run_release_db() {
@@ -804,6 +909,66 @@ if [[ $mode == "bootstrap-state" ]]; then
     "success" "bootstrap-current" "$digest"
   rotate_service_images "$digest" ""
   log "BOOTSTRAP_STATE_SUCCESS service=${service} current=${digest} previous=empty source=${source_sha}"
+  exit 0
+fi
+
+if (( initial_signed_takeover == 1 )); then
+  # This path is the only automatic way to establish a missing state file. It
+  # can replace only an already-running service whose image label and local /
+  # public readiness identities agree with each other. The old source SHA may
+  # differ from the signed candidate revision. Dashboard accepts an exact
+  # ledger and exact schema only; pending migrations are intentionally blocked
+  # before backup or migration code is reachable.
+  log "INITIAL_SIGNED_TAKEOVER_PREFLIGHT service=${service} source=${source_sha}"
+  capture_initial_runtime "$candidate_env"
+  initial_runtime_env="$(mktemp)"
+  make_initial_runtime_env "$initial_runtime_env" \
+    || die "INITIAL_TAKEOVER_RUNTIME_ENV_CAPTURE_FAILED" 73
+
+  journal_hash="not-applicable"
+  if [[ $service == "dashboard" ]]; then
+    log "INITIAL_SIGNED_TAKEOVER_DATABASE_PLAN_START"
+    initial_plan_json="$(run_release_db_json "$candidate_env" plan --json)" \
+      || die "INITIAL_TAKEOVER_DATABASE_PLAN_FAILED" 78
+    initial_plan_status="$(jq -r '.status // "missing"' <<<"$initial_plan_json")"
+    initial_schema_status="$(jq -r '.schema.status // "missing"' <<<"$initial_plan_json")"
+    if [[ $initial_plan_status != "exact" ]]; then
+      die "INITIAL_TAKEOVER_DATABASE_NOT_EXACT:${initial_plan_status}" 78
+    fi
+    if [[ $initial_schema_status != "exact" ]]; then
+      die "INITIAL_TAKEOVER_DATABASE_SCHEMA_NOT_EXACT:${initial_schema_status}" 78
+    fi
+    journal_hash="$(jq -r '.journalHash // .expected.journalHash // ""' \
+      <<<"$initial_plan_json")"
+    [[ $journal_hash =~ ^[a-f0-9]{64}$ ]] \
+      || die "INITIAL_TAKEOVER_JOURNAL_HASH_INVALID" 78
+  fi
+
+  log "INITIAL_SIGNED_TAKEOVER_ROLLOUT_START service=${service}"
+  initial_rollout_deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
+  initial_candidate_deadline=$((SECONDS + CANDIDATE_READY_BUDGET_SECONDS))
+  if ! roll_out \
+    "$candidate_env" "$source_sha" "$digest" "$initial_candidate_deadline"; then
+    log "INITIAL_SIGNED_TAKEOVER_CANDIDATE_FAILED"
+    if restore_initial_runtime "$candidate_env" "$initial_rollout_deadline"; then
+      die "INITIAL_SIGNED_TAKEOVER_FAILED_PREVIOUS_RUNTIME_RESTORED" 75
+    fi
+    die "INITIAL_SIGNED_TAKEOVER_FAILED_ROLLBACK_UNPROVEN" 75
+  fi
+
+  if [[ -e $state_file || -L $state_file ]]; then
+    if restore_initial_runtime "$candidate_env" "$initial_rollout_deadline"; then
+      die "INITIAL_SIGNED_TAKEOVER_STATE_APPEARED_PREVIOUS_RUNTIME_RESTORED" 75
+    fi
+    die "INITIAL_SIGNED_TAKEOVER_STATE_APPEARED_ROLLBACK_UNPROVEN" 75
+  fi
+  write_active_image_env "$image"
+  deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  write_state \
+    "$digest" "" "$source_sha" "$journal_hash" "$deployed_at" \
+    "success" "initial-signed-takeover" "$digest"
+  rotate_service_images "$digest" ""
+  log "INITIAL_SIGNED_TAKEOVER_SUCCESS service=${service} current=${digest} previous=empty source=${source_sha}"
   exit 0
 fi
 
