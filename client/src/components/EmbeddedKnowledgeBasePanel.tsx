@@ -30,7 +30,10 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import { useConversation } from "@/contexts/ConversationContext";
+import {
+  useConversation,
+  type Conversation,
+} from "@/contexts/ConversationContext";
 import { syncKnowledgeBaseArchiveFromOutput } from "@/lib/knowledge-snapshot";
 import { trpc } from "@/lib/trpc";
 import Home from "@/pages/Home";
@@ -38,6 +41,38 @@ import type {
   KnowledgeBaseLeafStatus,
   KnowledgeBaseProgressDto,
 } from "@shared/knowledge-base-progress";
+
+function isKnowledgeBaseConversationCandidate(
+  conversation: Conversation | null,
+) {
+  return Boolean(
+    conversation &&
+      (conversation.knowledgeBase ||
+        conversation.title === "企业知识库构建" ||
+        conversation.messages.some((message) => message.knowledgeBase)),
+  );
+}
+
+export function shouldDiscardConversationAfterKnowledgeReset(input: {
+  observedRevision: number | null;
+  revision: number;
+  hasKnowledge: boolean;
+  conversation: Conversation | null;
+}) {
+  const resetCompleted =
+    input.observedRevision === null
+      ? input.revision > 0 && !input.hasKnowledge
+      : input.revision > input.observedRevision;
+  if (!resetCompleted || !input.conversation) return false;
+  const conversation = input.conversation;
+  return Boolean(
+    isKnowledgeBaseConversationCandidate(conversation) &&
+      (conversation.knowledgeBase?.initialized ||
+        conversation.taskId ||
+        conversation.status !== "idle" ||
+        conversation.messages.some((message) => message.knowledgeBase)),
+  );
+}
 
 export default function EmbeddedKnowledgeBasePanel({
   preview = false,
@@ -101,9 +136,25 @@ export default function EmbeddedKnowledgeBasePanel({
   useEffect(() => {
     const revision = resetQuery.data?.revision;
     if (revision === undefined) return;
+    const resetNeedsAcknowledgement =
+      observedResetRevision === null
+        ? revision > 0 && resetQuery.data?.hasKnowledge === false
+        : revision > observedResetRevision;
     if (
-      observedResetRevision !== null &&
-      revision > observedResetRevision &&
+      resetNeedsAcknowledgement &&
+      !isKnowledgeBaseConversationCandidate(activeConversation)
+    ) {
+      // RealBuildFlow may not have selected its scoped conversation yet. Keep
+      // the reset pending so a stale KB conversation cannot become the baseline.
+      return;
+    }
+    if (
+      shouldDiscardConversationAfterKnowledgeReset({
+        observedRevision: observedResetRevision,
+        revision,
+        hasKnowledge: resetQuery.data?.hasKnowledge === true,
+        conversation: activeConversation,
+      }) &&
       activeConversation
     ) {
       discardConversationLocally(activeConversation.id);
@@ -237,7 +288,10 @@ export default function EmbeddedKnowledgeBasePanel({
           </div>
         </div>
       ) : (
-        <RealBuildFlow mode={mode} />
+        <RealBuildFlow
+          key={`knowledge-build-${resetQuery.data?.revision ?? 0}`}
+          mode={mode}
+        />
       )}
     </section>
   );
@@ -626,6 +680,10 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
           (conversation) => conversation.id === latestConversationId,
         )
       : undefined;
+    if (conversationId && !scopedConversation) {
+      setConversationId(null);
+      return;
+    }
     if (!conversationId && latestConversation) {
       setConversationId(latestConversation.id);
       setActive(latestConversation.id);
@@ -664,6 +722,10 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
   );
   const [liveProgress, setLiveProgress] =
     useState<KnowledgeBaseProgressDto | null>(null);
+
+  useEffect(() => {
+    setLiveProgress(null);
+  }, [conversationId]);
 
   useEffect(() => {
     if (progressQuery.data?.progress !== undefined) {

@@ -157,6 +157,44 @@ describe("KnowledgeBasePollingCoordinator", () => {
     expect(onPermanentError).toHaveBeenCalledWith("conversation", permanent);
     expect(onTransientError).not.toHaveBeenCalled();
     expect(setTimer).not.toHaveBeenCalled();
+    expect(coordinator.isRegistered("conversation")).toBe(false);
+    coordinator.dispose();
+  });
+
+  it("gives a racing start a bounded 404 grace period, then settles permanently", async () => {
+    let now = 1_000;
+    let scheduled: (() => void) | undefined;
+    const notFound = Object.assign(new Error("not found"), { status: 404 });
+    const observe = vi.fn().mockRejectedValue(notFound);
+    const onTransientError = vi.fn();
+    const onPermanentError = vi.fn();
+    const coordinator = new KnowledgeBasePollingCoordinator({
+      observe,
+      apply: vi.fn(),
+      onTransientError,
+      onPermanentError,
+      now: () => now,
+      notFoundGraceMs: 15_000,
+      setTimer: ((callback: () => void) => {
+        scheduled = callback;
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+    });
+
+    coordinator.wake("conversation");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onTransientError).toHaveBeenCalledWith("conversation", notFound);
+    expect(onPermanentError).not.toHaveBeenCalled();
+
+    now += 15_001;
+    scheduled?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(observe).toHaveBeenCalledTimes(2);
+    expect(onPermanentError).toHaveBeenCalledWith("conversation", notFound);
     coordinator.dispose();
   });
 });

@@ -24,11 +24,14 @@ afterEach(() => {
 });
 
 describe("knowledge-base v4 rollout", () => {
-  it("defaults production new-build access to closed", () => {
+  it("defaults production new-build access to fully enabled", () => {
     process.env.NODE_ENV = "production";
     delete process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT;
     delete process.env.FRONTMIND_KB_V4_ALLOW_USER_IDS;
-    expect(knowledgeBaseV4RolloutDecision(42).enabled).toBe(false);
+    expect(knowledgeBaseV4RolloutDecision(42)).toMatchObject({
+      enabled: true,
+      percent: 100,
+    });
   });
 
   it("uses a stable account bucket for percentage rollout", () => {

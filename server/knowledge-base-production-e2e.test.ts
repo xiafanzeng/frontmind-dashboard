@@ -742,12 +742,15 @@ describe("knowledge-base production final-package acceptance", () => {
   let upstreamServer: Server | undefined;
   let dashboardServer: Server | undefined;
   const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+  const previousRolloutPercent = process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT;
   const previousAxiosAdapter = axios.defaults.adapter;
 
   beforeAll(async () => {
     axios.defaults.adapter = "http";
     assetRoot = await mkdtemp(path.join(tmpdir(), "frontmind-kb-e2e-"));
     process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
+    // A stale rollout value must not disable the only supported build path.
+    process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT = "0";
     dependencies.assertServiceCapability.mockResolvedValue(undefined);
     dependencies.assertKnowledgeBaseWritable.mockResolvedValue(undefined);
     dependencies.createKnowledgeMonitoringHandoff.mockResolvedValue({
@@ -768,6 +771,11 @@ describe("knowledge-base production final-package acceptance", () => {
       delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
     } else {
       process.env.FRONTMIND_DASHBOARD_ASSET_DIR = previousAssetRoot;
+    }
+    if (previousRolloutPercent === undefined) {
+      delete process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT;
+    } else {
+      process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT = previousRolloutPercent;
     }
     if (assetRoot) await rm(assetRoot, { recursive: true, force: true });
   });

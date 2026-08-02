@@ -7,6 +7,7 @@ import {
   conversations,
   conversationTurns,
   knowledgeBaseBuilds,
+  knowledgeBaseConversationTombstones,
   messages,
   upstreamResources,
   userUsageOwners,
@@ -86,6 +87,7 @@ interface TurnServiceStore {
   turns: ConversationTurn[];
   messages: any[];
   credentials: any[];
+  tombstones: any[];
   resources: any[];
   usageOwnerId: number | null;
 }
@@ -95,6 +97,7 @@ function createTurnServiceExecutor(input: {
   conversation?: any;
   turns?: ConversationTurn[];
   credentials?: any[];
+  tombstones?: any[];
   resources?: any[];
   usageOwnerId?: number | null;
   turnSelections: TurnSelection[][];
@@ -114,6 +117,7 @@ function createTurnServiceExecutor(input: {
         },
       ]),
     ],
+    tombstones: [...(input.tombstones || [])],
     resources: [...(input.resources || [])],
     usageOwnerId: input.usageOwnerId ?? null,
   };
@@ -142,6 +146,9 @@ function createTurnServiceExecutor(input: {
             typeof selection === "function" ? selection(store) : selection;
           lastSelectedTurn = rows[0];
           return rows;
+        }
+        if (table === knowledgeBaseConversationTombstones) {
+          return store.tombstones;
         }
         if (table === messages) {
           const isIdentityLookup = messageSelectionIndex++ % 2 === 0;
@@ -248,6 +255,7 @@ function createTurnServiceExecutor(input: {
         store.turns = snapshot.turns;
         store.messages = snapshot.messages;
         store.credentials = snapshot.credentials;
+        store.tombstones = snapshot.tombstones;
         store.resources = snapshot.resources;
         store.usageOwnerId = snapshot.usageOwnerId;
         throw error;
@@ -704,6 +712,28 @@ describe("knowledge-base atomic start reservation", () => {
     },
     now: new Date("2026-08-01T00:00:00.000Z"),
   };
+
+  it("rejects a tombstoned conversation before reserving a build", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      tombstones: [
+        {
+          id: "00000000-0000-4000-8000-000000000099",
+          userId: 1,
+          publicConversationId: "conversation-atomic",
+          resetRequestId: "00000000-0000-4000-8000-000000000098",
+        },
+      ],
+      turnSelections: [[]],
+    });
+
+    await expect(
+      reserveKnowledgeBaseStartBuild(startInput, executor),
+    ).rejects.toMatchObject({ code: "CONVERSATION_RESET" });
+    expect(store.build).toBeNull();
+    expect(store.conversation).toBeNull();
+    expect(store.turns).toHaveLength(0);
+    expect(store.messages).toHaveLength(0);
+  });
 
   it("commits one build and replays only the identical start request", async () => {
     const { executor, store } = createTurnServiceExecutor({

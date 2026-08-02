@@ -240,6 +240,10 @@ type Action =
       type: "ROLLBACK_KB_PENDING_TURN";
       payload: { conversationId: string; clientRequestId: string };
     }
+  | {
+      type: "SETTLE_KB_START_FAILURE";
+      payload: { conversationId: string; clientRequestId: string };
+    }
   | { type: "UPDATE_TITLE"; payload: { conversationId: string; title: string } }
   | { type: "DELETE_CONVERSATION"; payload: string }
   | { type: "DISCARD_CONVERSATION_LOCALLY"; payload: string }
@@ -391,6 +395,48 @@ function conversationReducer(
                     action.payload.clientRequestId
                 ),
             ),
+            updatedAt: Date.now(),
+          };
+        }),
+      };
+    }
+    case "SETTLE_KB_START_FAILURE": {
+      return {
+        ...state,
+        conversations: state.conversations.map((conversation) => {
+          if (conversation.id !== action.payload.conversationId) {
+            return conversation;
+          }
+          const requestWasAccepted = conversation.messages.some(
+            (message) =>
+              isServerOwnedKnowledgeBaseMessage(message) &&
+              message.knowledgeBase?.kind === "pending_user" &&
+              message.knowledgeBase.clientRequestId ===
+                action.payload.clientRequestId,
+          );
+          if (requestWasAccepted) return conversation;
+          const messages = conversation.messages.filter(
+            (message) =>
+              isServerOwnedKnowledgeBaseMessage(message) ||
+              !(
+                message.knowledgeBase?.kind === "pending_user" &&
+                message.knowledgeBase.clientRequestId ===
+                  action.payload.clientRequestId
+              ),
+          );
+          if (messages.length === conversation.messages.length) {
+            return conversation;
+          }
+          return {
+            ...conversation,
+            messages,
+            status: "idle",
+            taskId: undefined,
+            taskUrl: undefined,
+            previousResponseId: undefined,
+            startedAt: undefined,
+            completedAt: undefined,
+            lastKnownOutputLength: undefined,
             updatedAt: Date.now(),
           };
         }),
@@ -1213,6 +1259,10 @@ interface ConversationContextType {
     conversationId: string,
     clientRequestId: string,
   ) => void;
+  settleKnowledgeBaseStartFailure: (
+    conversationId: string,
+    clientRequestId: string,
+  ) => void;
   updateTitle: (conversationId: string, title: string) => void;
   deleteConversation: (id: string) => void;
   discardConversationLocally: (id: string) => void;
@@ -1427,6 +1477,36 @@ export function ConversationProvider({
     [commit],
   );
 
+  const settleKnowledgeBaseStartFailure = useCallback(
+    (conversationId: string, clientRequestId: string) => {
+      const conversation = stateRef.current.conversations.find(
+        (candidate) => candidate.id === conversationId,
+      );
+      const requestWasAccepted = conversation?.messages.some(
+        (message) =>
+          isServerOwnedKnowledgeBaseMessage(message) &&
+          message.knowledgeBase?.kind === "pending_user" &&
+          message.knowledgeBase.clientRequestId === clientRequestId,
+      );
+      const hasOptimisticRequest = conversation?.messages.some(
+        (message) =>
+          message.knowledgeBase?.kind === "pending_user" &&
+          message.knowledgeBase.serverOwned !== true &&
+          message.knowledgeBase.clientRequestId === clientRequestId,
+      );
+      if (requestWasAccepted || !hasOptimisticRequest) return;
+      knowledgeBaseCoordinatorRef.current?.unregister(conversationId);
+      commit(
+        {
+          type: "SETTLE_KB_START_FAILURE",
+          payload: { conversationId, clientRequestId },
+        },
+        [conversationId],
+      );
+    },
+    [commit],
+  );
+
   useEffect(() => {
     const coordinator = new KnowledgeBasePollingCoordinator({
       observe: (conversationId, signal) =>
@@ -1444,6 +1524,27 @@ export function ConversationProvider({
           conversationId,
           error: error instanceof Error ? error.message : String(error),
         });
+        const status = Number((error as { status?: unknown })?.status || 0);
+        if (status !== 404) return;
+        const conversation = stateRef.current.conversations.find(
+          (candidate) => candidate.id === conversationId,
+        );
+        const pendingStart = [...(conversation?.messages || [])]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === "user" &&
+              message.content === "开始构建企业知识库" &&
+              message.knowledgeBase?.kind === "pending_user" &&
+              message.knowledgeBase.serverOwned !== true &&
+              Boolean(message.knowledgeBase.clientRequestId),
+          );
+        if (pendingStart?.knowledgeBase?.clientRequestId) {
+          settleKnowledgeBaseStartFailure(
+            conversationId,
+            pendingStart.knowledgeBase.clientRequestId,
+          );
+        }
       },
     });
     knowledgeBaseCoordinatorRef.current = coordinator;
@@ -1468,7 +1569,7 @@ export function ConversationProvider({
         knowledgeBaseCoordinatorRef.current = null;
       }
     };
-  }, [projectAssignmentId, userId]);
+  }, [projectAssignmentId, settleKnowledgeBaseStartFailure, userId]);
 
   const hydrateForUser = useCallback(
     async (expectedUserId: number, initial: boolean) => {
@@ -1771,6 +1872,7 @@ export function ConversationProvider({
         isKnowledgeBaseConversation,
         commitKnowledgeBaseObservation,
         rollbackPendingKnowledgeBaseTurn,
+        settleKnowledgeBaseStartFailure,
         updateTitle,
         deleteConversation,
         discardConversationLocally,

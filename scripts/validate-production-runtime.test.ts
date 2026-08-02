@@ -25,7 +25,7 @@ function productionEnvironment() {
       "/app/dist/private-workflows/brand-question-portfolio.skill",
     FRONTMIND_RESPONSE_LOGIC_SKILL_PATH:
       "/app/dist/private-workflows/response-logic-builder.skill",
-    FRONTMIND_KB_V4_ROLLOUT_PERCENT: "0",
+    FRONTMIND_KB_V4_ROLLOUT_PERCENT: "100",
     FRONTMIND_KB_V4_ALLOW_USER_IDS: "",
     FRONTMIND_CREDENTIAL_ENCRYPTION_KEY: `base64:${Buffer.alloc(32, 1).toString("base64")}`,
     FRONTMIND_PRESALES_SERVICE_TOKEN: "p".repeat(32),

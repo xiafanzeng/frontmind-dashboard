@@ -8,6 +8,7 @@ interface CoordinatorSlot {
   controller: AbortController | null;
   timer: ReturnType<typeof setTimeout> | null;
   startedAt: number;
+  notFoundSince: number | null;
 }
 
 export interface KnowledgeBaseCoordinatorOptions {
@@ -24,6 +25,7 @@ export interface KnowledgeBaseCoordinatorOptions {
   now?: () => number;
   setTimer?: typeof setTimeout;
   clearTimer?: typeof clearTimeout;
+  notFoundGraceMs?: number;
 }
 
 export function getKnowledgeBasePollDelay(elapsedMs: number) {
@@ -78,6 +80,7 @@ export class KnowledgeBasePollingCoordinator {
       controller: null,
       timer: null,
       startedAt: (this.options.now ?? Date.now)(),
+      notFoundSince: null,
     });
   }
 
@@ -162,6 +165,7 @@ export class KnowledgeBasePollingCoordinator {
       ) {
         return;
       }
+      slot.notFoundSince = null;
       this.options.apply(conversationId, observation);
       if (observationNeedsPolling(observation)) {
         this.schedule(conversationId, slot);
@@ -169,12 +173,25 @@ export class KnowledgeBasePollingCoordinator {
     } catch (error) {
       if (!controller.signal.aborted && slot.generation === generation) {
         const status = Number((error as { status?: unknown })?.status || 0);
+        const now = (this.options.now ?? Date.now)();
+        if (status === 404 && slot.notFoundSince === null) {
+          slot.notFoundSince = now;
+        }
+        const notFoundWithinGrace =
+          status === 404 &&
+          now - (slot.notFoundSince ?? now) <
+            (this.options.notFoundGraceMs ?? 15_000);
         const retryable =
-          !status || status === 408 || status === 429 || status >= 500;
+          !status ||
+          status === 408 ||
+          status === 429 ||
+          status >= 500 ||
+          notFoundWithinGrace;
         if (retryable) {
           this.options.onTransientError?.(conversationId, error);
           this.schedule(conversationId, slot);
         } else {
+          this.unregister(conversationId);
           this.options.onPermanentError?.(conversationId, error);
         }
       }

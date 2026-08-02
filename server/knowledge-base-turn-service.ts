@@ -7,6 +7,7 @@ import {
   conversations,
   conversationTurns,
   knowledgeBaseBuilds,
+  knowledgeBaseConversationTombstones,
   upstreamResources,
   userUsageOwners,
   type ConversationTurn,
@@ -97,6 +98,7 @@ export interface KnowledgeBasePreparedDispatch {
 export type KnowledgeBaseTurnReservationErrorCode =
   | "INVALID_REQUEST"
   | "BUILD_NOT_FOUND"
+  | "CONVERSATION_RESET"
   | "CONFLICT"
   | "IDEMPOTENCY_PENDING"
   | "RESERVATION_NOT_FOUND"
@@ -1644,10 +1646,9 @@ export async function reserveKnowledgeBaseStartBuild(
   const db = executor ?? (await requireDb());
 
   return db.transaction(async (tx: any) => {
-    // Global mutation lock order is credential -> current owner slot -> build
-    // -> turn. Do this before the build insert so credential deletion or an
-    // inherited-owner reassignment cannot deadlock with `/start`, and a stale
-    // middleware credential cannot create a new reservation after A -> B.
+    // Global mutation lock order is credential -> current owner slot -> reset
+    // tombstone -> build -> turn. Do this before the build insert so an old
+    // browser tab can never resurrect a conversation after an approved reset.
     const pinnedCredential = await lockKnowledgeBaseReservationCredential(
       tx,
       input.apiCredentialId ?? null,
@@ -1665,6 +1666,28 @@ export async function reserveKnowledgeBaseStartBuild(
           "The API credential selected for this new knowledge-base build is no longer authorized for the account",
         );
       }
+    }
+    const resetTombstone = (
+      await tx
+        .select({ id: knowledgeBaseConversationTombstones.id })
+        .from(knowledgeBaseConversationTombstones)
+        .where(
+          and(
+            eq(knowledgeBaseConversationTombstones.userId, input.userId),
+            eq(
+              knowledgeBaseConversationTombstones.publicConversationId,
+              conversationId,
+            ),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (resetTombstone) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONVERSATION_RESET",
+        "该知识库会话已被重置，请使用新会话重新构建",
+      );
     }
     const candidateBuildId = randomUUID();
     await tx

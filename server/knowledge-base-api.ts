@@ -88,7 +88,6 @@ import {
   type KnowledgeBaseStagedArtifactCandidate,
 } from "./knowledge-base-artifact-binding-service";
 import { collectKnowledgeArchiveDescriptors } from "./knowledge-base-artifact";
-import { knowledgeBaseV4RolloutDecision } from "./knowledge-base-rollout";
 import {
   bindKnowledgeBaseTurnUpstreamTask,
   claimKnowledgeBaseDeferredTurnDispatch,
@@ -3143,6 +3142,7 @@ router.post("/start", async (req, res) => {
     return;
   }
 
+  let reservationCreated = false;
   try {
     await assertKnowledgeBaseWritable(req.frontmindUser.id);
     const existingBuild = await getKnowledgeBaseProgress({
@@ -3167,16 +3167,6 @@ router.post("/start", async (req, res) => {
       brandName: workspace.payload.brandName,
       requestedCompanyName,
     });
-    const rollout = knowledgeBaseV4RolloutDecision(req.frontmindUser.id);
-    if (!rollout.enabled) {
-      res.status(503).json({
-        error: {
-          code: "KNOWLEDGE_BASE_ROLLOUT_PENDING",
-          message: "知识库新构建正在灰度开放，已有构建不受影响",
-        },
-      });
-      return;
-    }
     const latestSkillDescriptor = await getKnowledgeBaseSkillDescriptor();
     const userAttachments = normalizeUserAttachments(body.attachments);
     for (const attachment of userAttachments) {
@@ -3234,9 +3224,9 @@ router.post("/start", async (req, res) => {
         prefillSnapshotId: prefillKnowledgeSnapshot?.id || null,
       },
     });
+    reservationCreated = true;
     const { build, reservation } = startReservation;
-    // A build and its first turn now share one transaction. Existing legacy
-    // builds retain their pinned Skill contract for the entire generation.
+    // The build and first turn commit together; legacy builds keep their pinned Skill contract.
     const skillDescriptor = {
       name: build.skillName,
       version: build.skillVersion,
@@ -3447,6 +3437,7 @@ router.post("/start", async (req, res) => {
               ? deterministicKnowledgeBaseCreateFailureMessage(createError)
               : "创建企业知识库任务失败，系统将按原预约自动恢复",
         },
+        reservationCreated: true,
         ...(observation
           ? {
               observation,
@@ -3547,6 +3538,7 @@ router.post("/start", async (req, res) => {
           : null;
       res.status(status).json({
         error: { code: error.code, message: error.message },
+        reservationCreated: false,
         ...(observation
           ? {
               observation,
@@ -3561,6 +3553,7 @@ router.post("/start", async (req, res) => {
       res.status(error.code === "ENTERPRISE_NOT_CONFIGURED" ? 422 : 409).json({
         error: error.message,
         code: error.code,
+        reservationCreated,
       });
       return;
     }
@@ -3570,6 +3563,7 @@ router.post("/start", async (req, res) => {
           code: error.code,
           message: error.message,
         },
+        reservationCreated,
       });
       return;
     }
@@ -3579,7 +3573,13 @@ router.post("/start", async (req, res) => {
       error,
       additionalSecrets: [apiKey, req.frontmindCredential?.apiKey],
     });
-    res.status(500).json({ error: "启动企业知识库任务失败，请稍后重试" });
+    res.status(500).json({
+      error: {
+        code: "KNOWLEDGE_BASE_START_FAILED",
+        message: "启动企业知识库任务失败，请稍后重试",
+      },
+      reservationCreated,
+    });
   }
 });
 

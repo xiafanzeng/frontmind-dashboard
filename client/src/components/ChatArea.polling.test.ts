@@ -4,13 +4,64 @@ import {
   knowledgeBaseNoticeRecoveryMode,
   knowledgeBaseNoticeRetryLabel,
   knowledgeBasePackageRebindResolved,
+  readKnowledgeBaseStartRequestError,
   recoverKnowledgeBaseNotice,
+  shouldRecoverKnowledgeBaseStartFailure,
 } from "./ChatArea";
 
 describe("knowledge-base starter", () => {
   it("explains why the knowledge base must be built before the first task", () => {
     expect(KNOWLEDGE_BASE_FOUNDATION_COPY).toContain("AI 专用友好官网");
     expect(KNOWLEDGE_BASE_FOUNDATION_COPY).toContain("准确回答客户问题");
+  });
+
+  it("uses the durable reservation fact instead of treating every 5xx as accepted", () => {
+    expect(
+      shouldRecoverKnowledgeBaseStartFailure(true, {
+        status: 500,
+        reservationCreated: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRecoverKnowledgeBaseStartFailure(true, {
+        status: 409,
+        reservationCreated: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRecoverKnowledgeBaseStartFailure(true, {
+        status: 503,
+        code: "KNOWLEDGE_BASE_ROLLOUT_PENDING",
+      }),
+    ).toBe(false);
+    expect(shouldRecoverKnowledgeBaseStartFailure(true, { status: 503 })).toBe(
+      true,
+    );
+  });
+
+  it("preserves the server error code and reservation boundary", async () => {
+    const error = await readKnowledgeBaseStartRequestError(
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "KNOWLEDGE_BASE_START_FAILED",
+            message: "启动失败",
+          },
+          reservationCreated: false,
+        }),
+        {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    expect(error).toMatchObject({
+      message: "启动失败",
+      status: 500,
+      code: "KNOWLEDGE_BASE_START_FAILED",
+      reservationCreated: false,
+    });
   });
 });
 

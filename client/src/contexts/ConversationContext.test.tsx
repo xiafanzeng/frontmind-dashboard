@@ -261,6 +261,100 @@ describe("ConversationProvider cloud hydration", () => {
     expect(current?.deletedMessageIds ?? []).not.toContain("presentation-1");
     expect(mocks.deleteConversation).not.toHaveBeenCalled();
   });
+
+  it("atomically settles an unaccepted KB start without leaving task identity", async () => {
+    mocks.listRefetch.mockResolvedValueOnce({
+      data: [conversation("knowledge-base-start")],
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    act(() => {
+      result.current.registerKnowledgeBaseConversation("knowledge-base-start");
+      result.current.addMessage("knowledge-base-start", {
+        id: "optimistic-start",
+        role: "user",
+        content: "开始构建企业知识库",
+        timestamp: 1,
+        knowledgeBase: {
+          kind: "pending_user",
+          clientRequestId: "request-start",
+        },
+      });
+      result.current.updateStatus("knowledge-base-start", "running", {
+        taskId: "stale-task",
+        taskUrl: "https://tasks.example.test/stale-task",
+        previousResponseId: "stale-task",
+        startedAt: 10,
+      });
+      result.current.settleKnowledgeBaseStartFailure(
+        "knowledge-base-start",
+        "request-start",
+      );
+    });
+
+    const settled = result.current.state.conversations.find(
+      (item) => item.id === "knowledge-base-start",
+    );
+    expect(settled).toMatchObject({ status: "idle", messages: [] });
+    expect(settled?.taskId).toBeUndefined();
+    expect(settled?.taskUrl).toBeUndefined();
+    expect(settled?.previousResponseId).toBeUndefined();
+    expect(settled?.startedAt).toBeUndefined();
+    expect(settled?.completedAt).toBeUndefined();
+  });
+
+  it("does not settle a start after the same request became server-owned", async () => {
+    mocks.listRefetch.mockResolvedValueOnce({
+      data: [conversation("accepted-knowledge-base-start")],
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    act(() => {
+      result.current.addMessage("accepted-knowledge-base-start", {
+        id: "optimistic-start",
+        role: "user",
+        content: "开始构建企业知识库",
+        timestamp: 1,
+        knowledgeBase: {
+          kind: "pending_user",
+          clientRequestId: "accepted-request",
+        },
+      });
+      result.current.addMessage("accepted-knowledge-base-start", {
+        id: "canonical-start",
+        role: "user",
+        content: "开始构建企业知识库",
+        timestamp: 2,
+        knowledgeBase: {
+          kind: "pending_user",
+          clientRequestId: "accepted-request",
+          turnId: "turn-1",
+          serverOwned: true,
+        },
+      });
+      result.current.updateStatus("accepted-knowledge-base-start", "running", {
+        taskId: "accepted-task",
+        startedAt: 10,
+      });
+      result.current.settleKnowledgeBaseStartFailure(
+        "accepted-knowledge-base-start",
+        "accepted-request",
+      );
+    });
+
+    const accepted = result.current.state.conversations.find(
+      (item) => item.id === "accepted-knowledge-base-start",
+    );
+    expect(accepted?.status).toBe("running");
+    expect(accepted?.taskId).toBe("accepted-task");
+    expect(
+      accepted?.messages.some(
+        (message) => message.knowledgeBase?.serverOwned === true,
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("prepareConversationForCloud", () => {

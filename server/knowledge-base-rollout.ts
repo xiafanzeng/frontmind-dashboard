@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 
 function configuredRolloutPercent() {
-  const fallback = process.env.NODE_ENV === "production" ? "0" : "100";
+  // V4 is the only supported creation path. Keep the parser for the rollout
+  // audit tooling, but never silently disable customer builds in production.
+  const fallback = "100";
   const raw = (process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT || fallback).trim();
   if (!/^(?:100|[0-9]{1,2})(?:\.\d{1,2})?$/u.test(raw)) {
     throw new Error(

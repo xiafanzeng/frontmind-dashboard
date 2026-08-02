@@ -170,17 +170,61 @@ interface DeepReportStartInput {
   files: File[];
 }
 
-async function readErrorMessage(response: Response) {
+type KnowledgeBaseStartRequestError = Error & {
+  status?: number;
+  code?: string;
+  reservationCreated?: boolean;
+  observation?: KnowledgeBaseObservationDto;
+};
+
+export async function readKnowledgeBaseStartRequestError(
+  response: Response,
+): Promise<KnowledgeBaseStartRequestError> {
   try {
     const data = await response.json();
-    return (
+    const errorNode =
+      data?.error && typeof data.error === "object" ? data.error : null;
+    const message =
       (typeof data.error === "string" ? data.error : data.error?.message) ||
       data.message ||
-      `请求失败 (${response.status})`
-    );
+      `请求失败 (${response.status})`;
+    const error = new Error(message) as KnowledgeBaseStartRequestError;
+    error.status = response.status;
+    error.code =
+      String(errorNode?.code || data?.code || "").trim() || undefined;
+    if (typeof data?.reservationCreated === "boolean") {
+      error.reservationCreated = data.reservationCreated;
+    }
+    if (data?.observation) {
+      try {
+        error.observation = knowledgeBaseObservationFromPayload(data);
+      } catch {
+        // The HTTP error remains actionable even if an optional observation is malformed.
+      }
+    }
+    return error;
   } catch {
-    return `请求失败 (${response.status})`;
+    const error = new Error(
+      `请求失败 (${response.status})`,
+    ) as KnowledgeBaseStartRequestError;
+    error.status = response.status;
+    return error;
   }
+}
+
+export function shouldRecoverKnowledgeBaseStartFailure(
+  requestDispatched: boolean,
+  error: Pick<
+    KnowledgeBaseStartRequestError,
+    "status" | "code" | "reservationCreated"
+  >,
+) {
+  if (!requestDispatched) return false;
+  if (error.reservationCreated === true) return true;
+  if (error.reservationCreated === false) return false;
+  if (error.code === "KNOWLEDGE_BASE_ROLLOUT_PENDING") return false;
+  const status = Number(error.status || 0);
+  return !status || status === 408 || status === 429 || status >= 500;
 }
 
 /**
@@ -329,7 +373,8 @@ export default function ChatArea({
     registerKnowledgeBaseConversation,
     wakeKnowledgeBaseConversation,
     commitKnowledgeBaseObservation,
-    rollbackPendingKnowledgeBaseTurn,
+    settleKnowledgeBaseStartFailure,
+    discardConversationLocally,
   } = useConversation();
   const dashboardQuery = trpc.workspace.dashboard.useQuery(undefined, {
     enabled: !responseLogicContext && showKnowledgeBaseStarter,
@@ -442,11 +487,7 @@ export default function ChatArea({
         });
 
         if (!response.ok) {
-          const requestError = new Error(
-            await readErrorMessage(response),
-          ) as Error & { status?: number };
-          requestError.status = response.status;
-          throw requestError;
+          throw await readKnowledgeBaseStartRequestError(response);
         }
 
         const data = (await response.json()) as OneClickTaskStartResponse;
@@ -481,12 +522,18 @@ export default function ChatArea({
         creditEventBus.emit();
       } catch (error: any) {
         const errorMessage = error?.message || "启动失败";
-        const status = Number(error?.status || 0);
-        const definitelyRejected =
-          status >= 400 && status < 500 && status !== 408 && status !== 429;
-        if (!requestDispatched || definitelyRejected) {
-          rollbackPendingKnowledgeBaseTurn(conversationId, clientRequestId);
-          updateStatus(conversationId, "idle");
+        if (error?.observation) {
+          settleKnowledgeBaseStartFailure(conversationId, clientRequestId);
+          commitKnowledgeBaseObservation(conversationId, error.observation);
+          wakeKnowledgeBaseConversation(conversationId);
+          toast.error("启动结果已确认", { description: errorMessage });
+        } else if (
+          !shouldRecoverKnowledgeBaseStartFailure(requestDispatched, error)
+        ) {
+          settleKnowledgeBaseStartFailure(conversationId, clientRequestId);
+          if (error?.code === "CONVERSATION_RESET") {
+            discardConversationLocally(conversationId);
+          }
           toast.error("启动失败", { description: errorMessage });
         } else {
           updateStatus(conversationId, "running", {
@@ -495,7 +542,7 @@ export default function ChatArea({
           wakeKnowledgeBaseConversation(conversationId);
           toast.warning("正在恢复启动结果", {
             description:
-              "请求结果暂时未知，系统会按本次请求编号恢复，不会重复创建知识库任务。",
+              "请求结果暂时未知，系统正在核对服务端是否已受理，不会重复创建知识库任务。",
           });
         }
       }
@@ -504,8 +551,9 @@ export default function ChatArea({
       activeConversation,
       addMessage,
       commitKnowledgeBaseObservation,
+      discardConversationLocally,
       registerKnowledgeBaseConversation,
-      rollbackPendingKnowledgeBaseTurn,
+      settleKnowledgeBaseStartFailure,
       updateStatus,
       updateTitle,
       wakeKnowledgeBaseConversation,
