@@ -1,5 +1,5 @@
 import axios from "axios";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
@@ -108,6 +108,12 @@ const FIVE_GIB = 5 * 1024 * 1024 * 1024;
 const DISK_CHECK_INTERVAL_BYTES = 64 * 1024 * 1024;
 const DEFAULT_LARGE_PDF_THRESHOLD_BYTES = 64 * 1024 * 1024;
 
+type PreparedFileFilesystemStats = {
+  bavail: number;
+  bsize: number;
+  blocks: number;
+};
+
 export class PreparedFileError extends Error {
   constructor(
     public readonly code: string,
@@ -115,6 +121,66 @@ export class PreparedFileError extends Error {
   ) {
     super(message);
     this.name = "PreparedFileError";
+  }
+}
+
+export function evaluatePreparedFileStorage(
+  stats: PreparedFileFilesystemStats,
+) {
+  const totalBytes = stats.blocks * stats.bsize;
+  const availableBytes = stats.bavail * stats.bsize;
+  if (
+    !Number.isSafeInteger(totalBytes) ||
+    totalBytes <= 0 ||
+    !Number.isSafeInteger(availableBytes) ||
+    availableBytes < 0
+  ) {
+    throw new PreparedFileError(
+      "PREPARED_FILE_STORAGE_STATS_INVALID",
+      "PDF 持久卷空间信息无效",
+    );
+  }
+  const reserveBytes = Math.max(Math.floor(totalBytes * 0.1), FIVE_GIB);
+  if (availableBytes < reserveBytes) {
+    throw new PreparedFileError(
+      "INSUFFICIENT_STORAGE",
+      "服务器可用磁盘空间不足，请清理缓存后重试",
+    );
+  }
+  return { totalBytes, availableBytes, reserveBytes };
+}
+
+export async function assertPreparedFileStoreWritable(rootDir: string) {
+  const root = await fs.lstat(rootDir);
+  if (!root.isDirectory() || root.isSymbolicLink()) {
+    throw new PreparedFileError(
+      "PREPARED_FILE_STORAGE_ROOT_INVALID",
+      "PDF 持久卷必须是真实目录",
+    );
+  }
+  const probePath = path.join(
+    rootDir,
+    `.frontmind-readiness-${process.pid}-${randomUUID()}.tmp`,
+  );
+  const expected = `frontmind-prepared-file-readiness:${randomUUID()}\n`;
+  try {
+    await fs.writeFile(probePath, expected, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    const actual = await fs.readFile(probePath, "utf8");
+    if (actual !== expected) {
+      throw new Error("PREPARED_FILE_STORAGE_PROBE_MISMATCH");
+    }
+  } catch (error) {
+    if (error instanceof PreparedFileError) throw error;
+    throw new PreparedFileError(
+      "PREPARED_FILE_STORAGE_NOT_WRITABLE",
+      "PDF 持久卷无法完成无损读写探针",
+    );
+  } finally {
+    await fs.rm(probePath, { force: true }).catch(() => undefined);
   }
 }
 
@@ -541,10 +607,13 @@ export class PreparedFileService {
   async health() {
     await this.initialize();
     const stats = await fs.statfs(this.rootDir);
+    const storage = evaluatePreparedFileStorage(stats);
+    await assertPreparedFileStoreWritable(this.rootDir);
     return {
       cacheDirectory: this.rootDir,
-      availableBytes: stats.bavail * stats.bsize,
-      totalBytes: stats.blocks * stats.bsize,
+      availableBytes: storage.availableBytes,
+      totalBytes: storage.totalBytes,
+      reserveBytes: storage.reserveBytes,
       queueLength: this.queue.length,
       activeWorkers: this.processing,
     };

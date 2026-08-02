@@ -1176,9 +1176,10 @@ function ChangePasswordDialog({
         currentPassword,
         newPassword,
       });
-      toast.success("密码已更新");
+      toast.success("密码已更新，请重新登录");
       reset();
       onOpenChange(false);
+      window.location.replace("/login");
     } catch (error) {
       toast.error("无法修改密码", {
         description: error instanceof Error ? error.message : "请稍后重试",

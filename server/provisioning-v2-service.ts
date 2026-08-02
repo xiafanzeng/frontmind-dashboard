@@ -24,11 +24,13 @@ import {
 } from "../shared/provisioning-v2";
 import {
   AuthServiceError,
+  consumeAllUserPasswordSetupTokensInExecutor,
   createManagedUser,
   createManagedUserWithPasswordHash,
   hashPassword,
   isSupportedPasswordHash,
   normalizeUsername,
+  revokeAllUserSessionsInExecutor,
 } from "./auth-service";
 import { getDb } from "./db";
 import { provisionBasicEntitlement } from "./basic-entitlement-service";
@@ -856,17 +858,36 @@ export async function setupWebsiteAccountPassword(input: {
         400,
       );
     }
+    const accountRows = await tx
+      .select({
+        id: users.id,
+        username: users.username,
+        role: users.role,
+        isActive: users.isActive,
+      })
+      .from(users)
+      .where(eq(users.id, row.userId))
+      .limit(1)
+      .for("update");
+    const account = accountRows[0];
+    if (
+      !account ||
+      account.role !== "user" ||
+      !account.isActive ||
+      account.username !== row.requestedUsername
+    ) {
+      throw new PurchaseProvisioningError(
+        "ACCOUNT_SETUP_INVALID",
+        "账号设置链接无效或已过期",
+        400,
+      );
+    }
     await tx
       .update(users)
       .set({ passwordHash, passwordChangedAt: now, updatedAt: now })
-      .where(eq(users.id, row.userId));
-    await tx
-      .update(websiteUserProvisions)
-      .set({
-        accountSetupTokenConsumedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(websiteUserProvisions.id, row.id));
+      .where(eq(users.id, account.id));
+    await consumeAllUserPasswordSetupTokensInExecutor(tx, account.id, now);
+    await revokeAllUserSessionsInExecutor(tx, account.id, now);
     return {
       success: true as const,
       username: row.requestedUsername,

@@ -10,13 +10,4 @@ export function assertCleanProductionReleaseWorktree(options?: {
   expectedBuildSha?: string;
 }): string;
 
-export function assertCleanProductionApprovalSource(options: {
-  repositoryRoot?: string;
-  env?: Readonly<Record<string, string | undefined>>;
-  approvalSha?: string;
-  buildSourceSha: string;
-}): string;
-
 export function changedSourcePaths(repositoryRoot: string): string[];
-export function changedArtifactPaths(repositoryRoot: string): string[];
-export function changedWorktreePaths(repositoryRoot: string): string[];

@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, extname, join, relative, resolve } from "node:path";
 import JSZip from "jszip";
@@ -6,14 +5,12 @@ import {
   canonicalKnowledgeBaseSkillArchiveHash,
   legacyKnowledgeBaseSkillInstructionHash,
 } from "../shared/knowledge-base-skill-archive-hash.js";
+import { assertCleanProductionBuildSource } from "./assert-clean-build-source.mjs";
+import { verifyBuildArtifactManifest } from "./build-artifact-identity.mjs";
 import {
-  assertCleanProductionApprovalSource,
-  assertCleanProductionBuildSource,
-} from "./assert-clean-build-source.mjs";
-import {
-  assertBuildArtifactLineage,
-  verifyBuildArtifactManifest,
-} from "./build-artifact-identity.mjs";
+  createMigrationManifest,
+  readMigrationManifest,
+} from "./migration-manifest.mjs";
 
 const projectRoot = resolve(import.meta.dirname, "..");
 const buildRoot = resolve(projectRoot, process.argv[2] || "dist");
@@ -148,6 +145,10 @@ const requiredSkillFiles = [
 const requiredRuntimeFiles = [
   "index.js",
   "pdf-prepare-worker.js",
+  "release-db.js",
+  "migration-manifest.json",
+  "drizzle/meta/_journal.json",
+  "drizzle/migration-policy.json",
   "verify-presales-file-roundtrip.js",
 ];
 const runtimeSkillRoots = [
@@ -251,52 +252,18 @@ try {
 }
 
 const artifactManifest = await verifyBuildArtifactManifest(buildRoot);
-const expectedArtifactRoot = String(
-  process.env.FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256 || "",
-)
-  .trim()
-  .toLowerCase();
-if (!/^[a-f0-9]{64}$/u.test(expectedArtifactRoot)) {
-  throw new Error("FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256_REQUIRED");
-}
-if (expectedArtifactRoot !== artifactManifest.rootSha256) {
-  throw new Error("FRONTMIND_ARTIFACT_EXTERNAL_ROOT_MISMATCH");
-}
-
-if (process.env.FRONTMIND_INTERNAL_RELEASE_AUDIT_STAGE) {
-  if (
-    process.env.FRONTMIND_INTERNAL_RELEASE_AUDIT_STAGE !==
+if (
+  process.env.FRONTMIND_INTERNAL_RELEASE_AUDIT_STAGE &&
+  process.env.FRONTMIND_INTERNAL_RELEASE_AUDIT_STAGE !==
     artifactManifest.buildSourceSha
-  ) {
-    throw new Error("BUILD_INTERNAL_AUDIT_STAGE_NOT_AUTHORIZED");
-  }
-  assertCleanProductionBuildSource({
-    repositoryRoot: projectRoot,
-    expectedBuildSha: artifactManifest.buildSourceSha,
-    env: process.env,
-  });
-} else {
-  const approvalSha =
-    process.env.FRONTMIND_APPROVED_RELEASE_SHA?.trim().toLowerCase() ||
-    execFileSync("git", ["rev-parse", "HEAD"], {
-      cwd: projectRoot,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    })
-      .trim()
-      .toLowerCase();
-  assertCleanProductionApprovalSource({
-    repositoryRoot: projectRoot,
-    approvalSha,
-    buildSourceSha: artifactManifest.buildSourceSha,
-    env: process.env,
-  });
-  assertBuildArtifactLineage({
-    repositoryRoot: projectRoot,
-    approvalSha,
-    buildSourceSha: artifactManifest.buildSourceSha,
-  });
+) {
+  throw new Error("BUILD_INTERNAL_AUDIT_STAGE_NOT_AUTHORIZED");
 }
+assertCleanProductionBuildSource({
+  repositoryRoot: projectRoot,
+  expectedBuildSha: artifactManifest.buildSourceSha,
+  env: process.env,
+});
 
 const violations = [];
 try {
@@ -413,6 +380,25 @@ for (const relativePath of requiredRuntimeFiles) {
       label: "missing production runtime file",
     });
   }
+}
+
+try {
+  const [packagedManifest, reconstructedManifest] = await Promise.all([
+    readMigrationManifest(join(buildRoot, "migration-manifest.json")),
+    createMigrationManifest({ migrationsFolder: join(buildRoot, "drizzle") }),
+  ]);
+  if (
+    packagedManifest.journalHash !== reconstructedManifest.journalHash ||
+    packagedManifest.schemaHash !== reconstructedManifest.schemaHash ||
+    packagedManifest.schemaSnapshot !== reconstructedManifest.schemaSnapshot
+  ) {
+    throw new Error("packaged migration journal or schema differs from source");
+  }
+} catch {
+  violations.push({
+    file: "migration-manifest.json",
+    label: "invalid or inconsistent production migration manifest",
+  });
 }
 
 for (const relativeRoot of runtimeSkillRoots) {
@@ -579,10 +565,6 @@ try {
   }
   for (const releaseIdentityMarker of [
     artifactManifest.buildSourceSha,
-    "FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256",
-    "FRONTMIND_APPROVED_RELEASE_SHA",
-    "expectedRootSha256",
-    "actualRootSha256",
     "/readyz",
   ]) {
     if (!serverBundle.includes(releaseIdentityMarker)) {
@@ -625,6 +607,9 @@ for (const entry of allEntries) {
 const validatedIdentityMetadata = new Set([
   "artifact-manifest.json",
   "build-source.json",
+  "migration-manifest.json",
+  "drizzle/meta/_journal.json",
+  "drizzle/migration-policy.json",
   "public/__frontmind__/version.json",
 ]);
 for (const file of await collectTextFiles(buildRoot)) {
@@ -632,7 +617,12 @@ for (const file of await collectTextFiles(buildRoot)) {
   // These files are parsed and cryptographically validated above. Scanning
   // random hexadecimal hashes as prose would create probabilistic false
   // positives for numeric policy patterns such as the retired port.
-  if (validatedIdentityMetadata.has(artifactRelativePath)) continue;
+  if (
+    validatedIdentityMetadata.has(artifactRelativePath) ||
+    /^drizzle\/meta\/\d{4}_snapshot\.json$/u.test(artifactRelativePath)
+  ) {
+    continue;
+  }
   const content = withoutApprovedBranding(await readFile(file, "utf8"));
   for (const rule of forbiddenPatterns) {
     if (rule.pattern.test(content)) {

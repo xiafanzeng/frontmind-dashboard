@@ -182,9 +182,13 @@ export const authRouter = router({
           ctx.user.id,
           input.currentPassword,
           input.newPassword,
-          getSessionTokenFromRequest(ctx.req),
         );
-        return { success: true } as const;
+        ctx.res.clearCookie(COOKIE_NAME, {
+          ...getSessionCookieOptions(ctx.req),
+          sameSite: "lax",
+          maxAge: -1,
+        });
+        return { success: true, reauthenticationRequired: true } as const;
       } catch (error) {
         throw toTrpcError(error);
       }

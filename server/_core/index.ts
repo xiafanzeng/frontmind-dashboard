@@ -77,7 +77,14 @@ import {
   runLeasedKnowledgeBaseRecovery,
 } from "./knowledge-base-readiness";
 import { createKnowledgeBaseRecoverySweep } from "../knowledge-base-recovery-worker";
-import { createRuntimeReleaseArtifactVerifier } from "../../scripts/runtime-artifact-integrity.mjs";
+import {
+  bundledMigrationManifestPath,
+  evaluateMigrationJournal,
+  loadMigrationManifest,
+  type MigrationManifest,
+} from "./migration-journal";
+import { validateProductionRuntimeEnvironment } from "../../scripts/validate-production-runtime.mjs";
+import { evaluateDatabaseSchema } from "../../scripts/schema-contract.mjs";
 
 declare const __FRONTMIND_BUILD_SHA__: string | undefined;
 
@@ -93,6 +100,8 @@ const applicationBuildSha =
   process.env.COMMIT_SHA?.trim().toLowerCase() ||
   process.env.RENDER_GIT_COMMIT?.trim().toLowerCase() ||
   null;
+const applicationImageDigest =
+  process.env.FRONTMIND_IMAGE_DIGEST?.trim().toLowerCase() || null;
 const runtimeBuildRoot = path.dirname(fileURLToPath(import.meta.url));
 
 function assertProductionConfiguration() {
@@ -120,25 +129,47 @@ async function getRuntimeSkillReadiness() {
   return [knowledgeBase, brandQuestions, responseLogic];
 }
 
+async function evaluateReleaseReadiness(
+  db: NonNullable<Awaited<ReturnType<typeof getDb>>>,
+  manifest: MigrationManifest,
+) {
+  const journal = await evaluateMigrationJournal(db, manifest);
+  const schema =
+    journal.status === "exact"
+      ? await evaluateDatabaseSchema(
+          { query: (query) => db.execute(sql.raw(query)) },
+          manifest.schemaContract,
+        )
+      : {
+          status: "not_checked" as const,
+          expectedHash: manifest.schemaHash,
+          expectedTableCount: manifest.schemaTableCount,
+        };
+  return { journal, schema };
+}
+
 async function startServer() {
-  const verifyCurrentReleaseArtifact = createRuntimeReleaseArtifactVerifier(
-    runtimeBuildRoot,
-    {
-      buildSourceSha: applicationBuildSha,
-      env: process.env,
-      ttlMs: 5_000,
-    },
-  );
-  const startupReleaseArtifact =
-    process.env.NODE_ENV === "production"
-      ? await verifyCurrentReleaseArtifact({ force: true })
-      : undefined;
+  let migrationManifest: MigrationManifest | null = null;
+  if (process.env.NODE_ENV === "production") {
+    const runtimeIdentity = validateProductionRuntimeEnvironment(process.env);
+    if (runtimeIdentity.buildSourceSha !== applicationBuildSha) {
+      throw new Error("FRONTMIND_RUNTIME_BUILD_SOURCE_SHA_MISMATCH");
+    }
+    migrationManifest = await loadMigrationManifest(
+      process.env.FRONTMIND_MIGRATION_MANIFEST_PATH ||
+        bundledMigrationManifestPath(runtimeBuildRoot),
+    );
+  }
   assertProductionConfiguration();
   if (process.env.NODE_ENV === "production") {
     await assertAdminAccessLevelsBackfilled();
     await getRuntimeSkillReadiness();
   }
-  await preparedFileService.initialize();
+  if (process.env.NODE_ENV === "production") {
+    await preparedFileService.health();
+  } else {
+    await preparedFileService.initialize();
+  }
   const app = express();
   const server = createServer(app);
   app.disable("x-powered-by");
@@ -176,12 +207,25 @@ async function startServer() {
     app.use("/api/dev/knowledge-base-live", knowledgeBaseLivePreviewApi);
   }
 
-  app.get(["/healthz", "/readyz"], async (_req, res) => {
+  app.get("/healthz", (_req, res) => {
+    res.status(200).json({
+      status: "ok",
+      build: {
+        sha: applicationBuildSha,
+        imageDigest: applicationImageDigest,
+      },
+    });
+  });
+
+  app.get("/readyz", async (_req, res) => {
     try {
       assertUpstreamBaseUrlConfigured();
       monitorBaseUrl();
       const db = await getDb();
       if (!db) throw new Error("Database is not configured");
+      if (!migrationManifest) {
+        throw new Error("Migration manifest is not loaded");
+      }
       await db.execute(sql`select 1`);
       const [
         preparedFiles,
@@ -189,7 +233,7 @@ async function startServer() {
         paymentReceipts,
         projectOrders,
         knowledgeBase,
-        currentReleaseArtifact,
+        migrationState,
       ] = await Promise.all([
         preparedFileService.health(),
         getRuntimeSkillReadiness(),
@@ -200,28 +244,30 @@ async function startServer() {
           recoveryRequired: process.env.NODE_ENV === "production",
           assetRootRequired: process.env.NODE_ENV === "production",
         }),
-        startupReleaseArtifact
-          ? verifyCurrentReleaseArtifact()
-          : Promise.resolve(undefined),
+        evaluateReleaseReadiness(db, migrationManifest),
       ]);
-      const status = knowledgeBaseReadinessHttpStatus(knowledgeBase);
+      const ready =
+        knowledgeBaseReadinessHttpStatus(knowledgeBase) === 200 &&
+        migrationState.journal.status === "exact" &&
+        migrationState.schema.status === "exact";
+      const status = ready ? 200 : 503;
       const response = {
         status: "ok",
         build: {
           sha: applicationBuildSha,
+          imageDigest: applicationImageDigest,
         },
-        artifact: currentReleaseArtifact
-          ? {
-              verified: true,
-              schemaVersion: currentReleaseArtifact.manifest.schemaVersion,
-              approvalSha: currentReleaseArtifact.approvalSha,
-              buildSourceSha: currentReleaseArtifact.buildSourceSha,
-              expectedRootSha256: currentReleaseArtifact.expectedRootSha256,
-              actualRootSha256: currentReleaseArtifact.actualRootSha256,
-              rootSha256: currentReleaseArtifact.actualRootSha256,
-              fileCount: currentReleaseArtifact.manifest.files.length,
-            }
-          : undefined,
+        migration: {
+          status: migrationState.journal.status,
+          journalHash: migrationState.journal.journalHash,
+          expectedCount: migrationState.journal.expected.count,
+          appliedCount: migrationState.journal.applied.count,
+          latestExpectedTag: migrationState.journal.expected.latestTag,
+          latestAppliedTag: migrationState.journal.applied.latestTag,
+          pendingCount: migrationState.journal.pending.length,
+          allPendingExpand: migrationState.journal.allPendingExpand,
+          schema: migrationState.schema,
+        },
         configuration: {
           monitorCredentialConfigured: isDedicatedMonitorCredentialConfigured(),
           monitorApiBaseUrlConfigured: true,
@@ -231,6 +277,7 @@ async function startServer() {
         preparedFiles: {
           status: "ok",
           availableBytes: preparedFiles.availableBytes,
+          reserveBytes: preparedFiles.reserveBytes,
           queueLength: preparedFiles.queueLength,
           activeWorkers: preparedFiles.activeWorkers,
         },
@@ -245,9 +292,11 @@ async function startServer() {
         })),
         knowledgeBase: knowledgeBase.dto,
       };
-      if (status === 503) {
-        console.error("[Health] knowledge_base_unavailable", {
-          code: "KB_READINESS_UNAVAILABLE",
+      if (!ready) {
+        console.error("[Health] readiness_unavailable", {
+          code: "READINESS_UNAVAILABLE",
+          migrationStatus: migrationState.journal.status,
+          schemaStatus: migrationState.schema.status,
         });
         res.status(status).json({
           ...response,

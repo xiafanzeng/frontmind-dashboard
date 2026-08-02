@@ -50,7 +50,6 @@ execFileSync(process.execPath, ["scripts/audit-production-bundle.mjs"], {
   env: {
     ...releaseEnvironment,
     FRONTMIND_INTERNAL_RELEASE_AUDIT_STAGE: buildSourceSha,
-    FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256: manifest.rootSha256,
   },
   stdio: "inherit",
 });

@@ -3,6 +3,11 @@ import { extname, join, resolve } from "node:path";
 
 const projectRoot = resolve(import.meta.dirname, "..");
 const buildRoot = resolve(projectRoot, process.argv[2] || "dist");
+const immutableMigrationMetadata = new Set([
+  join(buildRoot, "migration-manifest.json"),
+  join(buildRoot, "drizzle", "meta", "_journal.json"),
+  join(buildRoot, "drizzle", "migration-policy.json"),
+]);
 const textExtensions = new Set([
   ".css",
   ".html",
@@ -55,6 +60,7 @@ const rewriteCounts = new Map(
 const residualFiles = [];
 
 for (const file of await collectTextFiles(buildRoot)) {
+  if (immutableMigrationMetadata.has(file)) continue;
   let content = await readFile(file, "utf8");
   let changed = false;
   for (const rewrite of incidentalRewrites) {

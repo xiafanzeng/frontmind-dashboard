@@ -41,6 +41,7 @@ import {
   userPasswordSetupTokens,
   userUsageOwners,
   users,
+  websiteUserProvisions,
   type ApiCredential,
   type UpstreamResource,
   type User,
@@ -305,6 +306,10 @@ export function getSessionTokenFromRequest(req: Request): string | null {
 
 export async function createSession(userId: number) {
   const db = await requireDb();
+  return createSessionInExecutor(db, userId);
+}
+
+async function createSessionInExecutor(executor: any, userId: number) {
   const token = randomBytes(32).toString("base64url");
   const now = Date.now();
   const session = {
@@ -315,7 +320,7 @@ export async function createSession(userId: number) {
     lastSeenAt: new Date(now),
   };
 
-  await db.insert(sessions).values(session);
+  await executor.insert(sessions).values(session);
   return { token, session };
 }
 
@@ -330,7 +335,11 @@ export async function authenticateRequest(
 
   const tokenHash = hashSessionToken(token);
   const rows = await db
-    .select({ user: users, lastSeenAt: sessions.lastSeenAt })
+    .select({
+      user: users,
+      lastSeenAt: sessions.lastSeenAt,
+      sessionCreatedAt: sessions.createdAt,
+    })
     .from(sessions)
     .innerJoin(users, eq(sessions.userId, users.id))
     .where(
@@ -345,6 +354,14 @@ export async function authenticateRequest(
 
   const row = rows[0];
   if (!row) return null;
+  if (
+    sessionPredatesPasswordChange(
+      row.sessionCreatedAt,
+      row.user.passwordChangedAt,
+    )
+  ) {
+    return null;
+  }
   if (
     row.user.role === "admin" &&
     !isExplicitAdminAccessLevel(row.user.adminAccessLevel)
@@ -377,19 +394,63 @@ export async function revokeSessionToken(token: string | null | undefined) {
     );
 }
 
-export async function revokeAllUserSessions(
-  userId: number,
-  exceptToken?: string | null,
-) {
+export async function revokeAllUserSessions(userId: number) {
   const db = await requireDb();
+  await revokeAllUserSessionsInExecutor(db, userId);
+}
+
+export function sessionPredatesPasswordChange(
+  sessionCreatedAt: Date,
+  passwordChangedAt: Date | null,
+) {
+  return Boolean(
+    passwordChangedAt &&
+      sessionCreatedAt.getTime() < passwordChangedAt.getTime(),
+  );
+}
+
+export async function revokeAllUserSessionsInExecutor(
+  executor: any,
+  userId: number,
+  now = new Date(),
+) {
   const conditions = [eq(sessions.userId, userId), isNull(sessions.revokedAt)];
-  if (exceptToken) {
-    conditions.push(ne(sessions.tokenHash, hashSessionToken(exceptToken)));
-  }
-  await db
+  await executor
     .update(sessions)
-    .set({ revokedAt: new Date() })
+    .set({ revokedAt: now })
     .where(and(...conditions));
+}
+
+/**
+ * Password-setup capabilities are issued by both the Dashboard managed-user
+ * flow and the Website purchase flow. A committed password change must retire
+ * every outstanding capability from both protocols in the same transaction;
+ * otherwise an older setup URL could overwrite the newer password later.
+ */
+export async function consumeAllUserPasswordSetupTokensInExecutor(
+  executor: any,
+  userId: number,
+  now = new Date(),
+) {
+  await executor
+    .update(userPasswordSetupTokens)
+    .set({ consumedAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(userPasswordSetupTokens.userId, userId),
+        isNull(userPasswordSetupTokens.consumedAt),
+      ),
+    );
+  await executor
+    .update(websiteUserProvisions)
+    .set({ accountSetupTokenConsumedAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(websiteUserProvisions.userId, userId),
+        isNotNull(websiteUserProvisions.accountSetupTokenHash),
+        isNull(websiteUserProvisions.accountSetupTokenConsumedAt),
+      ),
+    );
 }
 
 function loginAttemptKey(username: string, clientAddress: string) {
@@ -441,72 +502,76 @@ export async function loginWithPassword(
   assertLoginAllowed(attemptKey);
 
   const db = await requireDb();
-  const rows = await db
-    .select()
-    .from(users)
-    .where(eq(users.username, normalizedUsername))
-    .limit(1);
-  const user = rows[0];
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .select()
+      .from(users)
+      .where(eq(users.username, normalizedUsername))
+      .limit(1)
+      .for("update");
+    const user = rows[0];
+    const passwordHash = user?.passwordHash ?? DUMMY_PASSWORD_HASH;
+    const passwordMatches = await verifyPassword(password, passwordHash);
 
-  const passwordHash = user?.passwordHash ?? DUMMY_PASSWORD_HASH;
-  const passwordMatches = await verifyPassword(password, passwordHash);
+    if (!user || !passwordMatches) {
+      recordLoginFailure(attemptKey);
+      throw new AuthServiceError("INVALID_PASSWORD", "用户名或密码不正确");
+    }
+    if (!user.isActive) {
+      recordLoginFailure(attemptKey);
+      throw new AuthServiceError("ACCOUNT_DISABLED", "账号已停用");
+    }
+    if (
+      user.role === "admin" &&
+      !isExplicitAdminAccessLevel(user.adminAccessLevel)
+    ) {
+      recordLoginFailure(attemptKey);
+      throw new AuthServiceError("ACCOUNT_DISABLED", "管理员权限尚未配置");
+    }
 
-  if (!user || !passwordMatches) {
-    recordLoginFailure(attemptKey);
-    throw new AuthServiceError("INVALID_PASSWORD", "用户名或密码不正确");
-  }
-  if (!user.isActive) {
-    recordLoginFailure(attemptKey);
-    throw new AuthServiceError("ACCOUNT_DISABLED", "账号已停用");
-  }
-  if (
-    user.role === "admin" &&
-    !isExplicitAdminAccessLevel(user.adminAccessLevel)
-  ) {
-    recordLoginFailure(attemptKey);
-    throw new AuthServiceError("ACCOUNT_DISABLED", "管理员权限尚未配置");
-  }
-
-  loginAttempts.delete(attemptKey);
-  const lastSignedIn = new Date();
-  await db.update(users).set({ lastSignedIn }).where(eq(users.id, user.id));
-  const created = await createSession(user.id);
-
-  return {
-    user: toAuthenticatedUser({ ...user, lastSignedIn }),
-    ...created,
-  };
+    loginAttempts.delete(attemptKey);
+    const lastSignedIn = new Date();
+    await tx.update(users).set({ lastSignedIn }).where(eq(users.id, user.id));
+    const created = await createSessionInExecutor(tx, user.id);
+    return {
+      user: toAuthenticatedUser({ ...user, lastSignedIn }),
+      ...created,
+    };
+  });
 }
 
 export async function changeOwnPassword(
   userId: number,
   currentPassword: string,
   newPassword: string,
-  currentSessionToken?: string | null,
 ) {
   const db = await requireDb();
-  const rows = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-  const user = rows[0];
-  if (
-    !user?.passwordHash ||
-    !(await verifyPassword(currentPassword, user.passwordHash))
-  ) {
-    throw new AuthServiceError(
-      "INVALID_PASSWORD",
-      "Current password is incorrect",
-    );
-  }
-
   const passwordHash = await hashPassword(newPassword);
-  await db
-    .update(users)
-    .set({ passwordHash, passwordChangedAt: new Date() })
-    .where(eq(users.id, userId));
-  await revokeAllUserSessions(userId, currentSessionToken);
+  await db.transaction(async (tx) => {
+    const rows = await tx
+      .select()
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+      .for("update");
+    const user = rows[0];
+    if (
+      !user?.passwordHash ||
+      !(await verifyPassword(currentPassword, user.passwordHash))
+    ) {
+      throw new AuthServiceError(
+        "INVALID_PASSWORD",
+        "Current password is incorrect",
+      );
+    }
+    const now = new Date();
+    await tx
+      .update(users)
+      .set({ passwordHash, passwordChangedAt: now, updatedAt: now })
+      .where(eq(users.id, userId));
+    await consumeAllUserPasswordSetupTokensInExecutor(tx, userId, now);
+    await revokeAllUserSessionsInExecutor(tx, userId, now);
+  });
 }
 
 export async function listManagedUsers(): Promise<
@@ -844,10 +909,8 @@ export async function setupManagedUserPassword(input: {
       .update(users)
       .set({ passwordHash, passwordChangedAt: now, updatedAt: now })
       .where(eq(users.id, account.id));
-    await tx
-      .update(userPasswordSetupTokens)
-      .set({ consumedAt: now, updatedAt: now })
-      .where(eq(userPasswordSetupTokens.id, setup.id));
+    await consumeAllUserPasswordSetupTokensInExecutor(tx, account.id, now);
+    await revokeAllUserSessionsInExecutor(tx, account.id, now);
     return {
       success: true as const,
       username: account.username ?? "",
@@ -861,31 +924,25 @@ export async function resetManagedUserPassword(
   newPassword: string,
 ) {
   const db = await requireDb();
-  const existing = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-  if (!existing[0]) throw new AuthServiceError("NOT_FOUND", "User not found");
-
   const passwordHash = await hashPassword(newPassword);
   const now = new Date();
   await db.transaction(async (tx) => {
+    const existing = await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+      .for("update");
+    if (!existing[0]) {
+      throw new AuthServiceError("NOT_FOUND", "User not found");
+    }
     await tx
       .update(users)
-      .set({ passwordHash, passwordChangedAt: now })
+      .set({ passwordHash, passwordChangedAt: now, updatedAt: now })
       .where(eq(users.id, userId));
-    await tx
-      .update(userPasswordSetupTokens)
-      .set({ consumedAt: now, updatedAt: now })
-      .where(
-        and(
-          eq(userPasswordSetupTokens.userId, userId),
-          isNull(userPasswordSetupTokens.consumedAt),
-        ),
-      );
+    await consumeAllUserPasswordSetupTokensInExecutor(tx, userId, now);
+    await revokeAllUserSessionsInExecutor(tx, userId, now);
   });
-  await revokeAllUserSessions(userId);
 }
 
 export async function setManagedUserActive(userId: number, isActive: boolean) {
@@ -983,18 +1040,10 @@ export async function setManagedUserActive(userId: number, isActive: boolean) {
     await tx.update(users).set({ isActive }).where(eq(users.id, userId));
     if (!isActive) {
       const now = new Date();
-      await tx
-        .update(userPasswordSetupTokens)
-        .set({ consumedAt: now, updatedAt: now })
-        .where(
-          and(
-            eq(userPasswordSetupTokens.userId, userId),
-            isNull(userPasswordSetupTokens.consumedAt),
-          ),
-        );
+      await consumeAllUserPasswordSetupTokensInExecutor(tx, userId, now);
+      await revokeAllUserSessionsInExecutor(tx, userId, now);
     }
   });
-  if (!isActive) await revokeAllUserSessions(userId);
   const updated = await getManagedUser(userId);
   if (!updated) throw new AuthServiceError("NOT_FOUND", "User not found");
   return updated;
@@ -1104,15 +1153,12 @@ export async function deleteManagedUser(
           .update(users)
           .set({ isActive: false, updatedAt: now })
           .where(eq(users.id, targetUserId));
-        await tx
-          .update(userPasswordSetupTokens)
-          .set({ consumedAt: now, updatedAt: now })
-          .where(
-            and(
-              eq(userPasswordSetupTokens.userId, targetUserId),
-              isNull(userPasswordSetupTokens.consumedAt),
-            ),
-          );
+        await consumeAllUserPasswordSetupTokensInExecutor(
+          tx,
+          targetUserId,
+          now,
+        );
+        await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
         return { disposition: "deactivated_for_history" as const };
       }
     }
@@ -1233,25 +1279,25 @@ export async function deleteManagedUser(
           .update(users)
           .set({ isActive: false, updatedAt: now })
           .where(eq(users.id, targetUserId));
-        await tx
-          .update(userPasswordSetupTokens)
-          .set({ consumedAt: now, updatedAt: now })
-          .where(
-            and(
-              eq(userPasswordSetupTokens.userId, targetUserId),
-              isNull(userPasswordSetupTokens.consumedAt),
-            ),
-          );
+        await consumeAllUserPasswordSetupTokensInExecutor(
+          tx,
+          targetUserId,
+          now,
+        );
+        await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
         return { disposition: "deactivated_for_history" as const };
       }
     }
 
+    // Website provisions retain their audit row with ON DELETE SET NULL. Mark
+    // both setup-token protocols consumed before deleting the account so the
+    // durable ledger does not preserve a misleading live capability.
+    const now = new Date();
+    await consumeAllUserPasswordSetupTokensInExecutor(tx, targetUserId, now);
+    await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
     await permanentlyDeleteManagedUserRows(tx, targetUserId);
     return { disposition: "permanently_deleted" as const };
   });
-  if (result.disposition === "deactivated_for_history") {
-    await revokeAllUserSessions(targetUserId);
-  }
   return result;
 }
 

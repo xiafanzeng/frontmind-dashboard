@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   BarChart3,
   ChevronLeft,
@@ -7,6 +6,7 @@ import {
   Layers3,
   MessageSquareQuote,
   Search,
+  type LucideIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
@@ -16,9 +16,17 @@ import { trpc } from "@/lib/trpc";
 import type { DashboardPayload } from "@shared/dashboard";
 import "./question-monitoring-workspace.css";
 
-const categoryOrder = ["reputation", "basic", "ranking", "comparison"];
+const categoryOrder = ["reputation", "basic", "ranking", "comparison"] as const;
 
-const categoryMeta = {
+type CategoryMetadata = {
+  label: string;
+  eyebrow: string;
+  description: string;
+  tone: string;
+  icon: LucideIcon;
+};
+
+const categoryMeta: Record<string, CategoryMetadata> = {
   reputation: {
     label: "美誉舆情",
     eyebrow: "美誉舆情",
@@ -51,7 +59,61 @@ const categoryMeta = {
 
 const managedCategoryIcons = [MessageSquareQuote, Layers3, BarChart3, Search];
 
-const emptyMonitoringIntent = {
+type MonitoringIntent = {
+  id: string;
+  name: string;
+  subtitle: string;
+  questions: string[];
+  questionIds?: string[];
+};
+
+type MonitoringCitation = {
+  id?: string;
+  title?: string;
+  url?: string;
+  media?: string;
+  model?: string;
+  domain?: string;
+};
+
+type MonitoringAnswer = {
+  id?: string;
+  sourceRecordId?: string;
+  batchKey?: string;
+  model?: string;
+  modelName?: string;
+  platform?: string;
+  answerNo?: number;
+  content?: string;
+  citationCount?: number;
+  monitorRank?: number;
+  screenshotUrl?: string;
+  collectedAt?: string;
+  citations?: MonitoringCitation[];
+};
+
+type MonitoringQuestionRecord = {
+  question: string;
+  date?: string;
+  answers: MonitoringAnswer[];
+};
+
+type MonitoringAnswerBook = {
+  label?: string;
+  platforms: Array<{
+    name: string;
+    questions: MonitoringQuestionRecord[];
+  }>;
+};
+
+type ManagedMonitoringAnswer = DashboardPayload["monitoringAnswers"][number] & {
+  sourceRecordId?: string;
+  batchKey?: string;
+  model?: string;
+  modelName?: string;
+};
+
+const emptyMonitoringIntent: MonitoringIntent = {
   id: "",
   name: "",
   subtitle: "",
@@ -120,7 +182,7 @@ function monitoringDateLabel(value: unknown) {
   return `${match[1]}年${Number(match[2])}月${Number(match[3])}日`;
 }
 
-function cleanText(value) {
+function cleanText(value: unknown) {
   if (value === null || value === undefined) return "";
   return String(value)
     .replace(/\[\]\(@[^)]*\)/g, "")
@@ -132,7 +194,7 @@ function cleanText(value) {
     .trim();
 }
 
-function cleanAnswerContent(value) {
+function cleanAnswerContent(value: unknown) {
   return cleanText(value)
     .replace(
       /如果你[^。！？\n]{0,120}(?:问我|继续问我|再问我|告诉我|需要)[^。！？\n]*[。！？～~]?/g,
@@ -148,10 +210,10 @@ function cleanAnswerContent(value) {
     .trim();
 }
 
-function safeHttpUrl(value) {
+function safeHttpUrl(value: unknown) {
   if (!value) return "";
   try {
-    const url = new URL(value);
+    const url = new URL(String(value));
     return url.protocol === "http:" || url.protocol === "https:"
       ? url.toString()
       : "";
@@ -160,7 +222,7 @@ function safeHttpUrl(value) {
   }
 }
 
-function domainFromCitation(citation) {
+function domainFromCitation(citation: MonitoringCitation) {
   const explicitDomain = cleanText(citation?.domain);
   if (explicitDomain) return explicitDomain;
   const href = safeHttpUrl(citation?.url || "");
@@ -172,47 +234,56 @@ function domainFromCitation(citation) {
   }
 }
 
-function compareCollectedAt(first, second) {
-  const firstTime = Date.parse(first || "");
-  const secondTime = Date.parse(second || "");
+function compareCollectedAt(first: unknown, second: unknown) {
+  const firstTime = Date.parse(String(first || ""));
+  const secondTime = Date.parse(String(second || ""));
   if (Number.isFinite(firstTime) && Number.isFinite(secondTime)) {
     return secondTime - firstTime;
   }
   return String(second || "").localeCompare(String(first || ""), "zh-CN");
 }
 
-function buildManagedMonitoringData(questionGroups, monitoringAnswers) {
+function buildManagedMonitoringData(
+  questionGroups: IntentQuestionGroup[] | undefined,
+  monitoringAnswers: ManagedMonitoringAnswer[] | undefined,
+) {
   if (!Array.isArray(questionGroups)) return null;
 
   const answers = Array.isArray(monitoringAnswers) ? monitoringAnswers : [];
-  const questionById = new Map();
+  const questionById = new Map<
+    string,
+    {
+      group: IntentQuestionGroup;
+      question: IntentQuestionGroup["questions"][number];
+    }
+  >();
   questionGroups.forEach((group) => {
     (group.questions || []).forEach((question) => {
       questionById.set(question.id, { group, question });
     });
   });
 
-  const answerBooks = {};
-  const meta = {};
+  const answerBooks: Record<string, MonitoringAnswerBook> = {};
+  const meta: Record<string, CategoryMetadata> = {};
   const intents = questionGroups.map((group, groupIndex) => {
     const groupAnswers = answers.filter(
       (answer) => questionById.get(answer.questionId)?.group.id === group.id,
     );
-    const platforms = new Map();
+    const platforms = new Map<string, Map<string, MonitoringQuestionRecord>>();
 
     groupAnswers.forEach((answer) => {
       const questionEntry = questionById.get(answer.questionId);
       if (!questionEntry) return;
       const platformName = answer.platform || "未标注平台";
       if (!platforms.has(platformName)) platforms.set(platformName, new Map());
-      const platformQuestions = platforms.get(platformName);
+      const platformQuestions = platforms.get(platformName)!;
       if (!platformQuestions.has(questionEntry.question.question)) {
         platformQuestions.set(questionEntry.question.question, {
           question: questionEntry.question.question,
           answers: [],
         });
       }
-      platformQuestions.get(questionEntry.question.question).answers.push({
+      platformQuestions.get(questionEntry.question.question)!.answers.push({
         id: answer.id,
         sourceRecordId: answer.sourceRecordId,
         batchKey: answer.batchKey,
@@ -255,8 +326,12 @@ function buildManagedMonitoringData(questionGroups, monitoringAnswers) {
   return { intents, answerBooks, meta };
 }
 
-function questionAnswers(book, question) {
-  const answers = (book?.platforms || []).flatMap((platform) => {
+function questionAnswers(book: unknown, question: string) {
+  const normalizedBook =
+    book && typeof book === "object"
+      ? (book as Partial<MonitoringAnswerBook>)
+      : undefined;
+  const answers = (normalizedBook?.platforms || []).flatMap((platform) => {
     const record = (platform.questions || []).find(
       (item) => item.question === question,
     );
@@ -295,7 +370,7 @@ function CitationList({
   citations,
   emptyMessage,
 }: {
-  citations: any[];
+  citations: MonitoringCitation[];
   emptyMessage: string;
 }) {
   if (citations.length === 0) {
@@ -405,7 +480,11 @@ function ManagedAnswerSources({
   questionId: string;
 }) {
   const sampleId = answer?.id || "";
-  const [cursorState, setCursorState] = useState({
+  const [cursorState, setCursorState] = useState<{
+    cursor: string | undefined;
+    previousCursors: Array<string | undefined>;
+    page: number;
+  }>({
     cursor: undefined,
     previousCursors: [],
     page: 1,
@@ -582,14 +661,7 @@ function AnswerSources({
 
 export type QuestionMonitoringWorkspaceProps = {
   questionGroups?: IntentQuestionGroup[];
-  monitoringAnswers?: Array<
-    DashboardPayload["monitoringAnswers"][number] & {
-      sourceRecordId?: string;
-      batchKey?: string;
-      model?: string;
-      modelName?: string;
-    }
-  >;
+  monitoringAnswers?: ManagedMonitoringAnswer[];
   batchKey?: string;
   modelOptions?: Array<string | MonitoringFilterOption>;
   dateOptions?: MonitoringFilterOption[];
@@ -655,14 +727,24 @@ export default function QuestionMonitoringWorkspace({
     () => buildManagedMonitoringData(questionGroups, monitoringAnswers),
     [monitoringAnswers, questionGroups],
   );
-  const orderedIntents = useMemo(() => {
+  const orderedIntents = useMemo<MonitoringIntent[]>(() => {
     if (managedData) return managedData.intents;
-    return categoryOrder
-      .map((id) => previewIntents.find((intent) => intent.id === id))
-      .filter(Boolean);
+    return categoryOrder.flatMap((id) => {
+      const intent = previewIntents.find((candidate) => candidate.id === id);
+      return intent
+        ? [
+            {
+              ...intent,
+              subtitle: intent.subtitle || "",
+              questions: intent.questions || [],
+            },
+          ]
+        : [];
+    });
   }, [managedData, previewIntents]);
   const activeAnswerBooks = managedData?.answerBooks || previewAnswerBooks;
-  const activeCategoryMeta = managedData?.meta || categoryMeta;
+  const activeCategoryMeta: Record<string, CategoryMetadata> =
+    managedData?.meta || categoryMeta;
   const [selectedIntentId, setSelectedIntentId] = useState(
     orderedIntents[0]?.id || "reputation",
   );
@@ -718,8 +800,10 @@ export default function QuestionMonitoringWorkspace({
       ];
     });
   }, [modelOptions, unfilteredAnswers]);
-  const effectiveDateOptions = useMemo(() => {
-    const source =
+  const effectiveDateOptions = useMemo<
+    Array<{ value: string; dateKey: string; label: string }>
+  >(() => {
+    const source: MonitoringFilterOption[] =
       dateOptions && dateOptions.length > 0
         ? dateOptions
         : unfilteredAnswers.map((answer) => ({
@@ -758,12 +842,8 @@ export default function QuestionMonitoringWorkspace({
       [
         ...new Set(
           effectiveDateOptions
-            .map(
-              (option) =>
-                option.dateKey ||
-                monitoringDateKey(option.collectedAt || option.value),
-            )
-            .filter(Boolean),
+            .map((option) => option.dateKey || monitoringDateKey(option.value))
+            .filter((value): value is string => Boolean(value)),
         ),
       ].sort(),
     [effectiveDateOptions],
@@ -908,28 +988,28 @@ export default function QuestionMonitoringWorkspace({
     if (sourceBodyRef.current) sourceBodyRef.current.scrollTop = 0;
   }, [currentAnswer?.id, selectedQuestion]);
 
-  function selectCategory(intent) {
+  function selectCategory(intent: MonitoringIntent) {
     advanceAfterLoadRef.current = false;
     setSelectedIntentId(intent.id);
     setSelectedQuestion(intent.questions[0] || "");
     setAnswerIndex(0);
   }
 
-  function selectQuestionValue(question) {
+  function selectQuestionValue(question: string) {
     if (!selectedIntent.questions.includes(question)) return;
     advanceAfterLoadRef.current = false;
     setSelectedQuestion(question);
     setAnswerIndex(0);
   }
 
-  function selectModelValue(model) {
+  function selectModelValue(model: string) {
     advanceAfterLoadRef.current = false;
     if (selectedModel === undefined) setLocalSelectedModel(model);
     onSelectedModelChange?.(model);
     setAnswerIndex(0);
   }
 
-  function selectDateFromValue(date) {
+  function selectDateFromValue(date: string) {
     advanceAfterLoadRef.current = false;
     if (selectedDateFrom === undefined) setLocalSelectedDateFrom(date);
     onSelectedDateFromChange?.(date);
@@ -941,7 +1021,7 @@ export default function QuestionMonitoringWorkspace({
     setAnswerIndex(0);
   }
 
-  function selectDateToValue(date) {
+  function selectDateToValue(date: string) {
     advanceAfterLoadRef.current = false;
     if (selectedDateTo === undefined) setLocalSelectedDateTo(date);
     onSelectedDateToChange?.(date);

@@ -39,13 +39,3 @@ export function verifyBuildArtifactManifest(
   buildRoot: string,
   options?: { expectedBuildSourceSha?: string },
 ): Promise<BuildArtifactManifest>;
-
-export function assertBuildArtifactLineage(options: {
-  repositoryRoot: string;
-  approvalSha: string;
-  buildSourceSha: string;
-}): {
-  approvalSha: string;
-  buildSourceSha: string;
-  changedPaths: string[];
-};

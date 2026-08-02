@@ -50,14 +50,15 @@ pnpm install
 cp .env.example .env
 ```
 
-以上复制步骤只用于本地开发。生产服务器不得创建 `.env`、`.env.local` 或
-`.env.production`，必须按 [1Panel 部署手册](./1PANEL_AFTER_CLONE_DEPLOYMENT.md)
-只在 1Panel 运行环境变量界面配置。
+以上复制步骤和本页的数据库命令只用于本地开发。生产环境使用签名 OCI 镜像、
+root-only runtime/migrator 配置和受限 digest 部署控制器；不得在服务器检出源码、提交
+`dist` 或手工运行常规 migration。唯一发布入口见
+[权威发布手册](./docs/operations/RELEASE.md)。
 
-生产 PDF 运行环境必须从
+生产 PDF 运行环境从
 [`deploy/1panel-node-pdf/Dockerfile`](./deploy/1panel-node-pdf/Dockerfile)
-构建固定派生镜像，使 Poppler、Ghostscript 与项目声明的精确 pnpm 在容器重建后仍然
-存在；禁止只在一次性运行容器中临时安装系统包或启用包管理器。
+独立构建并按 digest 固定，使 Poppler、Ghostscript 与项目声明的精确 pnpm 在容器重建后
+仍然存在；普通 Dashboard 更新不会重建该基础镜像。
 
 本地 `.env` 至少设置 `DATABASE_URL`、`FRONTMIND_CREDENTIAL_ENCRYPTION_KEY`、`FRONTMIND_PRESALES_SERVICE_TOKEN`、`FRONTMIND_PROVISIONING_SERVICE_TOKEN`、`FRONTMIND_MONITOR_API_KEY`、`FRONTMIND_PUBLIC_URL` 和 `FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET`。`FRONTMIND_MONITOR_API_KEY` 必须是监控服务专用凭据，生产环境不会回退使用普通售前 Key；`FRONTMIND_PUBLIC_URL` 必须是可供客户浏览器访问的真实 HTTPS 地址，用于生成开户与工作台链接。凭据密钥、两个服务令牌和预检签名密钥都应使用至少 32 位的独立随机值，并只保存在服务端，且不得互相复用。轮换预检签名密钥会使尚未发布的短时预检凭证失效，但不会影响已发布内容。
 
@@ -149,7 +150,7 @@ frontmind-client/
 
 ## Development
 
-### Build for Production
+### Local production-mode build
 
 ```bash
 pnpm build
@@ -157,7 +158,16 @@ pnpm db:migrate
 pnpm start
 ```
 
-生产进程固定监听 `PORT`（新版 Dashboard 默认 `3001`），`GET /healthz` 会同时检查数据库连接，并返回不含密钥的监控凭据与公开 URL readiness 布尔值。生产启动时若缺少数据库地址、凭据加密主密钥、看板导入预检签名密钥、合格的售前服务令牌、开户服务令牌、监控专用凭据或有效的 `FRONTMIND_PUBLIC_URL` 会直接失败，避免以不完整配置对外服务。官网可通过已鉴权的 `GET /api/internal/presales/status` 读取 `monitorCredentialConfigured` 与 `publicUrlConfigured`，在付费动作发生前阻断不完整配置。
+以上命令只用于本地验证；正式镜像由 CI 构建。生产进程固定监听 `PORT`（默认
+`3001`）。`GET /healthz` 是不访问数据库或文件系统的轻量 liveness；`GET /readyz`
+检查数据库、完整 migration journal、由最新 Drizzle snapshot 固化的完整 Schema
+contract（含默认值、生成列、字符集/排序规则与 CHECK 表达式）、持久卷、Skills、
+恢复状态和内部账本，任一失败返回 503。其中 PDF
+prepared-files 持久卷会执行唯一临时文件的写入、读回和删除探针，并要求保留
+`max(文件系统容量 10%, 5 GiB)` 可用空间。镜像 entrypoint 会在
+监听端口前自动执行环境与 `exact-ledger + exact-schema` preflight。官网可通过已鉴权的
+`GET /api/internal/presales/status` 读取 `monitorCredentialConfigured` 与
+`publicUrlConfigured`，在付费动作发生前阻断不完整配置。
 
 官网服务端通过 `/api/internal/presales` 调用售前代理，并在每次请求中携带 `x-frontmind-service-token`。代理仅开放受约束的文件创建/上传/幂等删除、Base 任务创建/查询/删除及任务输出下载；所有上游任务和文件 ID 都会先写入售前资源账本，不能将该接口用作任意上游代理。`POST /tasks` 可传 `idempotencyKey`：数据库只保存其 SHA-256，并将预留绑定到规范化请求摘要和 API Key 版本；重复请求会复用原任务，冲突或仍在处理的请求不会再次调用上游。输出下载只接受上游结构化文件记录，外部签名 URL 仅保存 SHA-256 授权摘要。更换 Key 后，旧文件仍由其原凭据版本处理；管理员执行撤销时会同时销毁当前与全部历史版本。
 

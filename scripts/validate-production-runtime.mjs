@@ -1,6 +1,8 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 const fail = (code) => {
-  console.error(code);
-  process.exit(1);
+  throw new Error(code);
 };
 
 const exactValues = {
@@ -31,8 +33,8 @@ const secretNames = [
   "FRONTMIND_MONITOR_API_KEY",
 ];
 
-const decodeBase64Key = (name) => {
-  const value = process.env[name] || "";
+const decodeBase64Key = (env, name) => {
+  const value = env[name] || "";
   if (!value.startsWith("base64:")) fail(`${name}_FORMAT_INVALID`);
   const encoded = value.slice("base64:".length);
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
@@ -48,31 +50,21 @@ const decodeBase64Key = (name) => {
   }
 };
 
-try {
-  const approvedReleaseSha = process.env.FRONTMIND_APPROVED_RELEASE_SHA || "";
-  if (!/^[a-f0-9]{40}$/u.test(approvedReleaseSha)) {
-    fail("FRONTMIND_APPROVED_RELEASE_SHA_VALUE_INVALID");
-  }
-  const expectedArtifactRoot =
-    process.env.FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256 || "";
-  if (!/^[a-f0-9]{64}$/u.test(expectedArtifactRoot)) {
-    fail("FRONTMIND_EXPECTED_ARTIFACT_ROOT_SHA256_VALUE_INVALID");
-  }
-  const configuredBuildSourceSha = process.env.FRONTMIND_BUILD_SHA || "";
-  if (
-    configuredBuildSourceSha &&
-    (!/^[a-f0-9]{40}$/u.test(configuredBuildSourceSha) ||
-      configuredBuildSourceSha === approvedReleaseSha)
-  ) {
+export function validateProductionRuntimeEnvironment(env = process.env) {
+  const configuredBuildSourceSha = env.FRONTMIND_BUILD_SHA || "";
+  if (!/^[a-f0-9]{40}$/u.test(configuredBuildSourceSha)) {
     fail("FRONTMIND_BUILD_SHA_VALUE_INVALID");
+  }
+  const imageDigest = env.FRONTMIND_IMAGE_DIGEST || "";
+  if (!/^sha256:[a-f0-9]{64}$/u.test(imageDigest)) {
+    fail("FRONTMIND_IMAGE_DIGEST_VALUE_INVALID");
   }
 
   for (const [name, expected] of Object.entries(exactValues)) {
-    if (process.env[name] !== expected) fail(`${name}_VALUE_INVALID`);
+    if (env[name] !== expected) fail(`${name}_VALUE_INVALID`);
   }
 
-  const knowledgeBaseRollout =
-    process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT || "";
+  const knowledgeBaseRollout = env.FRONTMIND_KB_V4_ROLLOUT_PERCENT || "";
   if (!/^(?:100|[0-9]{1,2})(?:\.\d{1,2})?$/u.test(knowledgeBaseRollout)) {
     fail("FRONTMIND_KB_V4_ROLLOUT_PERCENT_VALUE_INVALID");
   }
@@ -80,16 +72,14 @@ try {
   if (rolloutValue < 0 || rolloutValue > 100) {
     fail("FRONTMIND_KB_V4_ROLLOUT_PERCENT_VALUE_INVALID");
   }
-  const knowledgeBaseAllowlist =
-    process.env.FRONTMIND_KB_V4_ALLOW_USER_IDS || "";
+  const knowledgeBaseAllowlist = env.FRONTMIND_KB_V4_ALLOW_USER_IDS || "";
   if (
     knowledgeBaseAllowlist &&
     !/^[1-9]\d*(?:,[1-9]\d*)*$/u.test(knowledgeBaseAllowlist)
   ) {
     fail("FRONTMIND_KB_V4_ALLOW_USER_IDS_VALUE_INVALID");
   }
-  const knowledgeBaseWritesDisabled =
-    process.env.KNOWLEDGE_BASE_WRITES_DISABLED || "";
+  const knowledgeBaseWritesDisabled = env.KNOWLEDGE_BASE_WRITES_DISABLED || "";
   if (
     knowledgeBaseWritesDisabled &&
     !/^(?:0|1|false|true|no|yes|off|on)$/iu.test(knowledgeBaseWritesDisabled)
@@ -97,7 +87,7 @@ try {
     fail("KNOWLEDGE_BASE_WRITES_DISABLED_VALUE_INVALID");
   }
 
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = env.DATABASE_URL;
   if (!databaseUrl) fail("DATABASE_URL_MISSING");
   let target;
   try {
@@ -118,9 +108,9 @@ try {
     fail("DATABASE_URL_TARGET_INVALID");
   }
 
-  decodeBase64Key("FRONTMIND_CREDENTIAL_ENCRYPTION_KEY");
+  decodeBase64Key(env, "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY");
   for (const name of secretNames.slice(1)) {
-    const value = process.env[name] || "";
+    const value = env[name] || "";
     if (
       value.length < 32 ||
       /^(?:replace|placeholder|changeme|test|example)/iu.test(value)
@@ -129,12 +119,12 @@ try {
     }
   }
 
-  const secrets = secretNames.map((name) => process.env[name]);
+  const secrets = secretNames.map((name) => env[name]);
   if (new Set(secrets).size !== secrets.length) {
     fail("PRODUCTION_SECRETS_NOT_UNIQUE");
   }
 
-  const viteValues = Object.entries(process.env)
+  const viteValues = Object.entries(env)
     .filter(([name]) => name.startsWith("VITE_"))
     .map(([, value]) => value)
     .filter(Boolean);
@@ -142,7 +132,23 @@ try {
     fail("PRODUCTION_SECRET_EXPOSED_TO_VITE");
   }
 
-  console.log("RUNTIME_ENV_OK");
-} catch {
-  fail("RUNTIME_ENV_CHECK_FAILED");
+  return {
+    buildSourceSha: configuredBuildSourceSha,
+    imageDigest,
+  };
+}
+
+const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
+if (invokedPath === fileURLToPath(import.meta.url)) {
+  try {
+    validateProductionRuntimeEnvironment();
+    console.log("RUNTIME_ENV_OK");
+  } catch (error) {
+    console.error(
+      error instanceof Error && /^[A-Z0-9_]+$/u.test(error.message)
+        ? error.message
+        : "RUNTIME_ENV_CHECK_FAILED",
+    );
+    process.exitCode = 1;
+  }
 }

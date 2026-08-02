@@ -136,7 +136,7 @@ try {
     journalEntries.slice(0, ledgerRows.length).map((entry) => entry.tag),
   );
   const [tableRows] = await connection.query(`
-    SELECT table_name, engine
+    SELECT TABLE_NAME AS table_name, ENGINE AS engine
     FROM information_schema.tables
     WHERE table_schema = DATABASE()
       AND table_name IN (
@@ -147,8 +147,9 @@ try {
   `);
   const tables = new Map(tableRows.map((row) => [row.table_name, row]));
   const [columnRows] = await connection.query(`
-    SELECT table_name, column_name, column_type, is_nullable, column_default,
-           extra
+    SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name,
+           COLUMN_TYPE AS column_type, IS_NULLABLE AS is_nullable,
+           COLUMN_DEFAULT AS column_default, EXTRA AS extra
     FROM information_schema.columns
     WHERE table_schema = DATABASE()
       AND table_name IN (
@@ -161,7 +162,9 @@ try {
     columnRows.map((row) => [`${row.table_name}.${row.column_name}`, row]),
   );
   const [indexRows] = await connection.query(`
-    SELECT table_name, index_name, column_name, seq_in_index, non_unique
+    SELECT TABLE_NAME AS table_name, INDEX_NAME AS index_name,
+           COLUMN_NAME AS column_name, SEQ_IN_INDEX AS seq_in_index,
+           NON_UNIQUE AS non_unique
     FROM information_schema.statistics
     WHERE table_schema = DATABASE()
       AND table_name IN (
@@ -310,9 +313,13 @@ try {
       ["scope", "fullScanAtMs"],
     );
     const [foreignKeyRows] = await connection.query(`
-      SELECT kcu.table_name, kcu.constraint_name, kcu.column_name,
-             kcu.referenced_table_name, kcu.referenced_column_name,
-             rc.delete_rule, rc.update_rule
+      SELECT kcu.TABLE_NAME AS table_name,
+             kcu.CONSTRAINT_NAME AS constraint_name,
+             kcu.COLUMN_NAME AS column_name,
+             kcu.REFERENCED_TABLE_NAME AS referenced_table_name,
+             kcu.REFERENCED_COLUMN_NAME AS referenced_column_name,
+             rc.DELETE_RULE AS delete_rule,
+             rc.UPDATE_RULE AS update_rule
       FROM information_schema.key_column_usage kcu
       JOIN information_schema.referential_constraints rc
         ON rc.constraint_schema = kcu.constraint_schema

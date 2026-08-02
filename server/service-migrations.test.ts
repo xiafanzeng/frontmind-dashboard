@@ -26,6 +26,10 @@ const apiUsageMigrationVerifier = path.resolve(
   process.cwd(),
   "scripts/verify-api-usage-migration-schema.mjs",
 );
+const dashboardCiWorkflow = path.resolve(
+  process.cwd(),
+  ".github/workflows/dashboard-ci.yml",
+);
 
 async function migration(name: string) {
   return readFile(path.join(drizzleRoot, name), "utf8");
@@ -174,9 +178,10 @@ describe("service portal migration chain", () => {
   });
 
   it("keeps 0046-0048 behind an exact ordered-ledger and schema gate", async () => {
-    const [verifier, runbook] = await Promise.all([
+    const [verifier, runbook, workflow] = await Promise.all([
       readFile(apiUsageMigrationVerifier, "utf8"),
       readFile(knowledgeBaseDeploymentRunbook, "utf8"),
+      readFile(dashboardCiWorkflow, "utf8"),
     ]);
 
     for (const requiredGuard of [
@@ -192,18 +197,28 @@ describe("service portal migration chain", () => {
       "0046_api_usage_snapshot_claims",
       "0047_api_usage_task_ledger",
       "0048_api_usage_coverage_claims",
+      "TABLE_NAME AS table_name",
+      "COLUMN_DEFAULT AS column_default",
+      "INDEX_NAME AS index_name",
+      "CONSTRAINT_NAME AS constraint_name",
     ]) {
       expect(verifier).toContain(requiredGuard);
     }
+    expect(workflow).toMatch(
+      /run: node scripts\/verify-api-usage-migration-schema\.mjs post/u,
+    );
     for (const requiredGuard of [
-      "verify-api-usage-migration-schema.mjs pre",
-      "verify-api-usage-migration-schema.mjs post",
-      "API_USAGE_0046_0048_SCHEMA_VERIFIED=YES",
-      "严格有序前缀",
-      "完全一致",
+      "release-db-plan plan --json",
+      "status=exact",
+      "0045_knowledge_base_state_machine",
+      "ahead/diverged",
+      "/readyz",
+      "docs/operations/RELEASE.md",
     ]) {
       expect(runbook).toContain(requiredGuard);
     }
+    expect(runbook).not.toContain("verify-api-usage-migration-schema.mjs");
+    expect(runbook).not.toContain("API_USAGE_0046_0048_SCHEMA_VERIFIED=YES");
   });
 
   it("adds monotonic API usage snapshot claims without rewriting usage data", async () => {
@@ -350,26 +365,26 @@ describe("service portal migration chain", () => {
     const runbook = await readFile(knowledgeBaseDeploymentRunbook, "utf8");
 
     for (const requiredGuard of [
-      "KB_0045_PARTIAL_SCHEMA_RESTORE_REQUIRED",
-      "KB_V2_SCHEMA_OBJECTS_BEFORE=columns:${presentColumns}",
-      "KB migration ledger mismatch",
-      "column_type, is_nullable, column_default",
-      "conversation_turns_buildId_knowledge_base_builds_id_fk",
-      "KB foreign key mismatch",
-      "FRONTMIND_KB_V2_COMPLETION_V3",
-      "FRONTMIND_KB_MYSQL_ACCEPTANCE_DATABASE_URL",
-      "unset DATABASE_URL; cd /app && pnpm test:kb:mysql-acceptance",
-      "unset DATABASE_URL; cd /app && pnpm test:kb:mysql-e2e-acceptance",
-      "KB_MYSQL_ACCEPTANCE_COMPLETED",
-      "KB_MYSQL_E2E_ACCEPTANCE_COMPLETED",
-      "mysqlStateMachineAccepted=YES",
-      "mysqlEightLeafE2eAccepted=YES",
-      "migrationHash=$KB_0045_EXPECTED_HASH",
-      "migrationWhen=$KB_0045_EXPECTED_WHEN",
-      "只能完整恢复本轮已验证的 `DATABASE_BACKUP`",
+      "本文不是常规发布入口",
+      "docs/operations/RELEASE.md",
+      "release-db-plan plan --json",
+      "0045_knowledge_base_state_machine",
+      ".frontmind-kb-v2-0045-complete-v3",
+      "root-owned",
+      "`0600`",
+      "/readyz",
+      "/healthz",
+      "frontmind-contract-maintenance",
+      "--allow-contract",
+      "不得再次执行 migration",
+      "migration 结果未知时只读重查 plan",
+      "绝不盲目重跑",
+      "restore 失败时保持 Dashboard 停写",
     ]) {
       expect(runbook).toContain(requiredGuard);
     }
+    expect(runbook).not.toContain("pnpm db:migrate");
+    expect(runbook).not.toContain("mysql -e");
   });
 
   it("keeps real-MySQL acceptance isolated from the production database", async () => {
@@ -381,6 +396,8 @@ describe("service portal migration chain", () => {
     for (const source of [harness, e2eHarness]) {
       expect(source).toContain("frontmind_kb_acceptance");
       expect(source).toContain("DATABASE_MUST_BE_EMPTY");
+      expect(source).toContain("TABLE_NAME AS tableName");
+      expect(source).toContain("ENGINE AS engine");
       expect(source).not.toContain("process.env.DATABASE_URL");
       expect(source).not.toMatch(/DROP\s+(?:DATABASE|SCHEMA|TABLE)/iu);
     }

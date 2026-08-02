@@ -34,30 +34,68 @@ async function createRepository() {
 
 afterEach(async () => {
   await Promise.all(
-    temporaryRepositories.splice(0).map((directory) =>
-      rm(directory, { recursive: true, force: true }),
-    ),
+    temporaryRepositories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
 
 describe("production build source identity", () => {
+  it("accepts an explicit immutable SHA only for a Git-free CI build context", async () => {
+    const repositoryRoot = await mkdtemp(
+      path.join(tmpdir(), "frontmind-build-archive-"),
+    );
+    temporaryRepositories.push(repositoryRoot);
+    const sha = "a".repeat(40);
+
+    expect(() =>
+      assertCleanProductionBuildSource({
+        repositoryRoot,
+        env: { FRONTMIND_BUILD_SHA: sha },
+      }),
+    ).toThrow("BUILD_SOURCE_GIT_METADATA_REQUIRED");
+    expect(
+      assertCleanProductionBuildSource({
+        repositoryRoot,
+        env: {
+          FRONTMIND_ARCHIVE_BUILD: "1",
+          FRONTMIND_BUILD_SHA: sha,
+          BUILD_SHA: sha,
+        },
+      }),
+    ).toBe(sha);
+    expect(() =>
+      assertCleanProductionBuildSource({
+        repositoryRoot,
+        env: {
+          FRONTMIND_ARCHIVE_BUILD: "1",
+          FRONTMIND_BUILD_SHA: sha,
+          BUILD_SHA: "b".repeat(40),
+        },
+      }),
+    ).toThrow("BUILD_SOURCE_COMMIT_MISMATCH");
+  });
+
   it("allows only dist drift around an immutable source commit", async () => {
     const repositoryRoot = await createRepository();
     const sha = git(repositoryRoot, ["rev-parse", "HEAD"]);
 
-    expect(
-      assertCleanProductionBuildSource({ repositoryRoot, env: {} }),
-    ).toBe(sha);
+    expect(assertCleanProductionBuildSource({ repositoryRoot, env: {} })).toBe(
+      sha,
+    );
     await writeFile(path.join(repositoryRoot, "dist", "index.js"), "new\n");
     await writeFile(path.join(repositoryRoot, "dist", "chunk.js"), "new\n");
-    expect(
-      assertCleanProductionBuildSource({ repositoryRoot, env: {} }),
-    ).toBe(sha);
+    expect(assertCleanProductionBuildSource({ repositoryRoot, env: {} })).toBe(
+      sha,
+    );
   });
 
   it("rejects modified, staged and untracked source paths", async () => {
     const repositoryRoot = await createRepository();
-    await writeFile(path.join(repositoryRoot, "source.ts"), "export const x=1\n");
+    await writeFile(
+      path.join(repositoryRoot, "source.ts"),
+      "export const x=1\n",
+    );
     expect(() =>
       assertCleanProductionBuildSource({ repositoryRoot, env: {} }),
     ).toThrow(/BUILD_SOURCE_NOT_COMMITTED:source\.ts/u);

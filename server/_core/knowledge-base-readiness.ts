@@ -172,23 +172,52 @@ function rowValue(row: SchemaRow, ...keys: string[]) {
   for (const key of keys) {
     if (row[key] !== undefined) return row[key];
   }
+  const normalizedKeys = new Set(
+    keys.map((key) => key.replaceAll("_", "").toLowerCase()),
+  );
+  for (const [key, value] of Object.entries(row)) {
+    if (normalizedKeys.has(key.replaceAll("_", "").toLowerCase())) {
+      return value;
+    }
+  }
   return undefined;
 }
 
 function normalizedColumnDefault(value: unknown) {
   if (value === null || value === undefined) return null;
-  let normalized = String(value).trim();
+  let normalized: string;
+  if (Buffer.isBuffer(value)) {
+    normalized = value.toString("utf8");
+  } else if (value instanceof Uint8Array) {
+    normalized = Buffer.from(value).toString("utf8");
+  } else if (Array.isArray(value) || typeof value === "object") {
+    try {
+      normalized = JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  } else {
+    normalized = String(value);
+  }
+  normalized = normalized.trim();
   while (normalized.startsWith("(") && normalized.endsWith(")")) {
     normalized = normalized.slice(1, -1).trim();
   }
-  normalized = normalized.replace(/^_utf8mb4/iu, "");
+  const compactExpression = normalized.replace(/\s+/gu, "").toLowerCase();
+  if (compactExpression === "json_array()") return "[]";
+  if (compactExpression === "json_object()") return "{}";
+  normalized = normalized.replace(/^_[a-z0-9]+(?=')/iu, "");
   if (
     (normalized.startsWith("'") && normalized.endsWith("'")) ||
     (normalized.startsWith('"') && normalized.endsWith('"'))
   ) {
     normalized = normalized.slice(1, -1);
   }
-  return normalized;
+  try {
+    return JSON.stringify(JSON.parse(normalized));
+  } catch {
+    return normalized;
+  }
 }
 
 function systemErrorCode(error: unknown) {
@@ -218,11 +247,11 @@ export async function assertKnowledgeBase0045Schema(db: SchemaDatabase) {
   const [columnResult, indexResult, foreignKeyResult] = await Promise.all([
     db.execute(sql`
       SELECT
-        table_name AS tableName,
-        column_name AS columnName,
-        column_type AS columnType,
-        is_nullable AS isNullable,
-        column_default AS columnDefault
+        table_name AS table_name,
+        column_name AS column_name,
+        column_type AS column_type,
+        is_nullable AS is_nullable,
+        column_default AS column_default
       FROM information_schema.columns
       WHERE table_schema = DATABASE()
         AND table_name IN (
@@ -233,11 +262,11 @@ export async function assertKnowledgeBase0045Schema(db: SchemaDatabase) {
     `),
     db.execute(sql`
       SELECT
-        table_name AS tableName,
-        index_name AS indexName,
-        column_name AS columnName,
-        seq_in_index AS seqInIndex,
-        non_unique AS nonUnique
+        table_name AS table_name,
+        index_name AS index_name,
+        column_name AS column_name,
+        seq_in_index AS seq_in_index,
+        non_unique AS non_unique
       FROM information_schema.statistics
       WHERE table_schema = DATABASE()
         AND table_name IN (
@@ -249,13 +278,13 @@ export async function assertKnowledgeBase0045Schema(db: SchemaDatabase) {
     `),
     db.execute(sql`
       SELECT
-        kcu.table_name AS tableName,
-        kcu.constraint_name AS constraintName,
-        kcu.column_name AS columnName,
-        kcu.referenced_table_name AS referencedTableName,
-        kcu.referenced_column_name AS referencedColumnName,
-        rc.delete_rule AS deleteRule,
-        rc.update_rule AS updateRule
+        kcu.table_name AS table_name,
+        kcu.constraint_name AS constraint_name,
+        kcu.column_name AS column_name,
+        kcu.referenced_table_name AS referenced_table_name,
+        kcu.referenced_column_name AS referenced_column_name,
+        rc.delete_rule AS delete_rule,
+        rc.update_rule AS update_rule
       FROM information_schema.key_column_usage kcu
       JOIN information_schema.referential_constraints rc
         ON rc.constraint_schema = kcu.constraint_schema

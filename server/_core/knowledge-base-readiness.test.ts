@@ -211,6 +211,17 @@ function schemaDb(overrides?: {
   };
 }
 
+function uppercaseInformationSchemaRows(rows: Record<string, unknown>[]) {
+  return rows.map((row) =>
+    Object.fromEntries(
+      Object.entries(row).map(([key, value]) => [
+        key.replace(/([a-z0-9])([A-Z])/gu, "$1_$2").toUpperCase(),
+        value,
+      ]),
+    ),
+  );
+}
+
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
@@ -253,6 +264,45 @@ describe("knowledge-base production readiness", () => {
 
     await expect(
       assertKnowledgeBase0045Schema(schemaDb({ foreignKeys: [] })),
+    ).rejects.toMatchObject({ code: "KB_SCHEMA_0045_INCOMPLETE" });
+  });
+
+  it("normalizes MySQL 8.4 aliases and semantic JSON defaults without hiding drift", async () => {
+    const rows = schemaRows();
+    const mysql84Columns = rows.columns.map((row) => {
+      const normalized: Record<string, unknown> = { ...row };
+      if (row.columnName === "attachmentFileIds") {
+        normalized.columnDefault = Buffer.from("( JSON_ARRAY ( ) )", "utf8");
+      }
+      if (row.columnName === "metadata") {
+        normalized.columnDefault = {};
+      }
+      return normalized;
+    });
+
+    await expect(
+      assertKnowledgeBase0045Schema(
+        schemaDb({
+          columns: uppercaseInformationSchemaRows(mysql84Columns),
+          indexes: uppercaseInformationSchemaRows(rows.indexes),
+          foreignKeys: uppercaseInformationSchemaRows(rows.foreignKeys),
+        }),
+      ),
+    ).resolves.toBeUndefined();
+
+    const nonEmptyDefaultColumns = mysql84Columns.map((row) =>
+      row.columnName === "attachmentFileIds"
+        ? { ...row, columnDefault: Buffer.from("('[1]')", "utf8") }
+        : row,
+    );
+    await expect(
+      assertKnowledgeBase0045Schema(
+        schemaDb({
+          columns: uppercaseInformationSchemaRows(nonEmptyDefaultColumns),
+          indexes: uppercaseInformationSchemaRows(rows.indexes),
+          foreignKeys: uppercaseInformationSchemaRows(rows.foreignKeys),
+        }),
+      ),
     ).rejects.toMatchObject({ code: "KB_SCHEMA_0045_INCOMPLETE" });
   });
 

@@ -521,7 +521,7 @@ mysqlDescribe(
       ]);
 
       const [engineRows] = await pool.query<RowDataPacket[]>(
-        `SELECT table_name, engine
+        `SELECT TABLE_NAME AS tableName, ENGINE AS engine
            FROM information_schema.tables
           WHERE table_schema = DATABASE()
             AND table_name IN (

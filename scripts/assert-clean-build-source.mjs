@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,7 +11,60 @@ function git(repositoryRoot, args) {
   }).trim();
 }
 
+function normalizedFullSha(value, errorCode) {
+  const sha = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!/^[a-f0-9]{40}$/u.test(sha)) throw new Error(errorCode);
+  return sha;
+}
+
+function repositoryHasGitMetadata(repositoryRoot) {
+  return existsSync(path.join(repositoryRoot, ".git"));
+}
+
+function archiveBuildSourceSha(options, repositoryRoot) {
+  const env = options.env || {};
+  if (env.FRONTMIND_ARCHIVE_BUILD !== "1") {
+    throw new Error("BUILD_SOURCE_GIT_METADATA_REQUIRED");
+  }
+  const expectedBuildSha = normalizedFullSha(
+    options.expectedBuildSha || env.FRONTMIND_BUILD_SHA,
+    "BUILD_SOURCE_EXPECTED_SHA_INVALID",
+  );
+  const requestedShas = [
+    env.FRONTMIND_BUILD_SHA,
+    env.BUILD_SHA,
+    env.COMMIT_SHA,
+    env.RENDER_GIT_COMMIT,
+    env.RAILWAY_GIT_COMMIT_SHA,
+    env.GITHUB_SHA,
+  ]
+    .map((value) =>
+      String(value || "")
+        .trim()
+        .toLowerCase(),
+    )
+    .filter(Boolean);
+  if (requestedShas.length === 0) {
+    throw new Error("BUILD_SOURCE_EXPECTED_SHA_INVALID");
+  }
+  for (const requestedSha of requestedShas) {
+    if (!/^[a-f0-9]{40}$/u.test(requestedSha)) {
+      throw new Error("BUILD_SOURCE_ENV_SHA_INVALID");
+    }
+    if (requestedSha !== expectedBuildSha) {
+      throw new Error("BUILD_SOURCE_COMMIT_MISMATCH");
+    }
+  }
+  if (!path.isAbsolute(repositoryRoot)) {
+    throw new Error("BUILD_SOURCE_ROOT_INVALID");
+  }
+  return expectedBuildSha;
+}
+
 export function changedSourcePaths(repositoryRoot) {
+  if (!repositoryHasGitMetadata(repositoryRoot)) return [];
   const sourcePathspec = ["--", ".", ":(exclude)dist", ":(exclude)dist/**"];
   const groups = [
     git(repositoryRoot, ["diff", "--name-only", ...sourcePathspec]),
@@ -27,50 +81,9 @@ export function changedSourcePaths(repositoryRoot) {
   ).sort();
 }
 
-export function changedArtifactPaths(repositoryRoot) {
-  const artifactPathspec = ["--", "dist"];
-  const groups = [
-    git(repositoryRoot, ["diff", "--name-only", ...artifactPathspec]),
-    git(repositoryRoot, [
-      "diff",
-      "--cached",
-      "--name-only",
-      ...artifactPathspec,
-    ]),
-    git(repositoryRoot, [
-      "ls-files",
-      "--others",
-      "--exclude-standard",
-      ...artifactPathspec,
-    ]),
-  ];
-  return Array.from(
-    new Set(groups.flatMap((value) => value.split("\n")).filter(Boolean)),
-  ).sort();
-}
-
-export function changedWorktreePaths(repositoryRoot) {
-  return Array.from(
-    new Set([
-      ...changedSourcePaths(repositoryRoot),
-      ...changedArtifactPaths(repositoryRoot),
-    ]),
-  ).sort();
-}
-
-function normalizedFullSha(value, errorCode) {
-  const sha = String(value || "")
-    .trim()
-    .toLowerCase();
-  if (!/^[a-f0-9]{40}$/u.test(sha)) throw new Error(errorCode);
-  return sha;
-}
-
 /**
- * The public production-build entrance is intentionally stricter than its
- * internal stages. It must see a completely clean Git worktree, including
- * tracked, staged and untracked dist paths, before it is allowed to recreate
- * the exact repository dist directory.
+ * A release is built directly from one immutable source commit. `dist/` is a
+ * disposable, ignored build directory and must never be committed again.
  */
 export function assertCleanProductionReleaseWorktree(options = {}) {
   const repositoryRoot = path.resolve(
@@ -80,102 +93,32 @@ export function assertCleanProductionReleaseWorktree(options = {}) {
     ...options,
     repositoryRoot,
   });
-  const dirtyPaths = changedWorktreePaths(repositoryRoot);
-  if (dirtyPaths.length > 0) {
+  if (!repositoryHasGitMetadata(repositoryRoot)) return sha;
+  const trackedDistPaths = git(repositoryRoot, ["ls-files", "--", "dist"])
+    .split("\n")
+    .filter(Boolean);
+  if (trackedDistPaths.length > 0) {
     throw new Error(
-      `BUILD_RELEASE_WORKTREE_NOT_CLEAN:${dirtyPaths.slice(0, 20).join(",")}`,
+      `BUILD_RELEASE_DIST_MUST_NOT_BE_TRACKED:${trackedDistPaths
+        .slice(0, 20)
+        .join(",")}`,
     );
   }
   return sha;
 }
 
 /**
- * Approval runs execute at the dist-only approval commit F. Platform checkout
- * variables must identify F, while explicit artifact source variables keep
- * identifying the source commit S embedded in dist.
- */
-export function assertCleanProductionApprovalSource(options = {}) {
-  const repositoryRoot = path.resolve(
-    options.repositoryRoot || path.resolve(import.meta.dirname, ".."),
-  );
-  const approvalSha = normalizedFullSha(
-    options.approvalSha || git(repositoryRoot, ["rev-parse", "HEAD"]),
-    "BUILD_APPROVAL_SHA_INVALID",
-  );
-  const buildSourceSha = normalizedFullSha(
-    options.buildSourceSha,
-    "BUILD_ARTIFACT_SOURCE_SHA_INVALID",
-  );
-  const repositorySha = normalizedFullSha(
-    git(repositoryRoot, ["rev-parse", "HEAD"]),
-    "BUILD_APPROVAL_SHA_INVALID",
-  );
-  if (repositorySha !== approvalSha) {
-    throw new Error("BUILD_APPROVAL_COMMIT_MISMATCH");
-  }
-
-  const env = options.env || {};
-  if (!env.FRONTMIND_APPROVED_RELEASE_SHA) {
-    throw new Error("BUILD_APPROVAL_ENV_SHA_REQUIRED");
-  }
-  if (
-    normalizedFullSha(
-      env.FRONTMIND_APPROVED_RELEASE_SHA,
-      "BUILD_APPROVAL_ENV_SHA_INVALID",
-    ) !== approvalSha
-  ) {
-    throw new Error("BUILD_APPROVAL_ENV_SHA_MISMATCH");
-  }
-  for (const value of [
-    env.GITHUB_SHA,
-    env.COMMIT_SHA,
-    env.RENDER_GIT_COMMIT,
-    env.RAILWAY_GIT_COMMIT_SHA,
-  ].filter(Boolean)) {
-    if (
-      normalizedFullSha(value, "BUILD_APPROVAL_ENV_SHA_INVALID") !== approvalSha
-    ) {
-      throw new Error("BUILD_APPROVAL_ENV_SHA_MISMATCH");
-    }
-  }
-  for (const value of [env.FRONTMIND_BUILD_SHA, env.BUILD_SHA].filter(
-    Boolean,
-  )) {
-    if (
-      normalizedFullSha(value, "BUILD_SOURCE_ENV_SHA_INVALID") !==
-      buildSourceSha
-    ) {
-      throw new Error("BUILD_SOURCE_COMMIT_MISMATCH");
-    }
-  }
-
-  const dirtySourcePaths = changedSourcePaths(repositoryRoot);
-  if (dirtySourcePaths.length > 0) {
-    throw new Error(
-      `BUILD_SOURCE_NOT_COMMITTED:${dirtySourcePaths.slice(0, 20).join(",")}`,
-    );
-  }
-  const dirtyArtifactPaths = changedArtifactPaths(repositoryRoot);
-  if (dirtyArtifactPaths.length > 0) {
-    throw new Error(
-      `BUILD_APPROVAL_ARTIFACT_NOT_COMMITTED:${dirtyArtifactPaths
-        .slice(0, 20)
-        .join(",")}`,
-    );
-  }
-  return approvalSha;
-}
-
-/**
- * Production artifacts must describe an immutable source commit. `dist/` is
- * deliberately allowed to differ because it is generated in the second
- * release commit; every source, migration, test and Skill file must already be
- * committed before Vite reads `git rev-parse HEAD` for version.json.
+ * Production artifacts must describe the exact immutable source commit.
+ * `dist/` is excluded because it is generated and ignored, while every source,
+ * migration, test and Skill file must already be committed.
  */
 export function assertCleanProductionBuildSource(options = {}) {
   const repositoryRoot = path.resolve(
     options.repositoryRoot || path.resolve(import.meta.dirname, ".."),
   );
+  if (!repositoryHasGitMetadata(repositoryRoot)) {
+    return archiveBuildSourceSha(options, repositoryRoot);
+  }
   const repositorySha = normalizedFullSha(
     git(repositoryRoot, ["rev-parse", "HEAD"]),
     "BUILD_SOURCE_COMMIT_INVALID",
