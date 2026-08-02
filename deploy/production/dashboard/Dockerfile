@@ -27,7 +27,7 @@ COPY . .
 RUN test "${#SOURCE_SHA}" -eq 40 \
     && ! printf '%s' "${SOURCE_SHA}" | grep -q '[^0-9a-f]' \
     && pnpm install --frozen-lockfile \
-    && pnpm build \
+    && NODE_ENV=production pnpm build \
     && test -f dist/index.js \
     && test -f dist/release-db.js \
     && test -f dist/migration-manifest.json \

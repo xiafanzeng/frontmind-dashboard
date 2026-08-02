@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readlink,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -107,14 +108,26 @@ try {
   const sourceSha = git(["rev-parse", "HEAD"]);
   const environment = {
     ...process.env,
+    // The production Docker builder installs devDependencies under this outer
+    // value. The release entry must still force Vite's production constants so
+    // DEV-only routes and fixtures cannot enter the signed image.
+    NODE_ENV: "development",
+    FRONTMIND_ARCHIVE_BUILD: "1",
     FRONTMIND_BUILD_SHA: sourceSha,
     BUILD_SHA: sourceSha,
     GITHUB_SHA: sourceSha,
     COMMIT_SHA: sourceSha,
   };
 
-  run("pnpm", ["build"], environment);
-  run("pnpm", ["audit:production"], environment);
+  const repositoryGitMetadata = path.join(releaseRepository, ".git");
+  const archivedGitMetadata = path.join(testRoot, "release-git-metadata");
+  await rename(repositoryGitMetadata, archivedGitMetadata);
+  try {
+    run("pnpm", ["build"], environment);
+    run("pnpm", ["audit:production"], environment);
+  } finally {
+    await rename(archivedGitMetadata, repositoryGitMetadata);
+  }
   const statusAfterBuild = git([
     "status",
     "--porcelain=v1",

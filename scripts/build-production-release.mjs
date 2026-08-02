@@ -24,6 +24,7 @@ await recreateEmptyProductionBuildRoot({
 
 const releaseEnvironment = {
   ...process.env,
+  NODE_ENV: "production",
   FRONTMIND_BUILD_SHA: buildSourceSha,
   BUILD_SHA: buildSourceSha,
   FRONTMIND_INTERNAL_RELEASE_BUILD_STAGE: buildSourceSha,
