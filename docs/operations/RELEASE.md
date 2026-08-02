@@ -393,3 +393,27 @@ backupFile、候选镜像与日志作为事故事实。尤其是 `in_progress` �
 
 0045 知识库专项只在首次只读 preflight 证明生产仍未完成时使用；完成后只作为
 灾难恢复附录，不得回到常规发布主路径。
+
+## 8. 使用 FrontMind Release Skill
+
+Codex 已安装本机 Skill：
+
+```text
+/Users/fanzengxia/.codex/skills/frontmind-release
+```
+
+在 Dashboard、Website 或它们的父目录完成修改后，直接输入：
+
+```text
+使用 $frontmind-release 把当前 FrontMind 修改验证、提交并上线；expand 自动，删表/contract 先让我审核。
+```
+
+Skill 会检查两个仓库的实际 diff 和 migration journal，验证发生变化的仓库，提交并推送
+`main`，等待精确 SHA 对应的 CI、签名镜像和自动部署，再核对本机/公网 readiness、原子
+state 与回滚 digest。完成条件不是“已经 commit”，而是两个本地工作区都无 Changes、均与
+`origin/main` 同步，且生产运行精确签名 digest。
+
+普通代码/UI 和符合 policy 的 expand migration 不再询问日常审批；出现 DROP/RENAME、删表、
+类型或 enum 缩窄、NOT NULL 收紧、数据删除、ahead/diverged、无法安全完成外部认证或其他
+contract 风险时，Skill 必须在生产写操作前停下并说明需要的人工决定。1Panel 仅用于查看容器
+和日志，不是发布操作入口。
