@@ -147,7 +147,10 @@ Before the first deployment:
    name only when it does not already exist; fill real values and keep owner
    root and mode 0600.
 2. Confirm the Dashboard database network name in dashboard-compose.env.
-3. Log the root Docker client into private GHCR with packages:read.
+3. For the one-time root-only bootstrap, use a temporary GHCR login and run
+   docker logout ghcr.io immediately after frontmind-bootstrap-state succeeds.
+   Normal forced-command deployments receive the job-scoped GITHUB_TOKEN over
+   SSH stdin and never depend on a persistent root Docker login.
 4. Configure the GitHub repository variables/secrets listed in
    docs/operations/RELEASE.md.
 5. Add the generated frontmind-deploy user's SSH public endpoint to GitHub.

@@ -150,10 +150,13 @@ Website 仓库：
 | Variable | `WEBSITE_DEPLOY_USER`            | 固定为 `frontmind-deploy`                    |
 | Variable | `WEBSITE_AUTO_DEPLOY_ENABLED`    | 首次 bootstrap 前为 `false`，完成后为 `true` |
 
-`GITHUB_TOKEN` 由 Actions 自动提供，用于 GHCR 和 OIDC，不新增长期 GHCR 写入
-令牌。Dashboard/Website 私钥必须独立；服务器 `authorized_keys` 分别把它们固定
-到对应服务，SSH 原始命令只能包含 `<image@digest> <source-sha>`，无法选择或切换
-服务。
+`GITHUB_TOKEN` 由 Actions 自动提供，用于 GHCR 和 OIDC，不新增长期 GHCR 写入或读取
+令牌。自动发布时，workflow 只通过 SSH 标准输入发送两行
+`github.actor + GITHUB_TOKEN`；SSH 原始命令仍只能包含
+`<image@digest> <source-sha>`。服务器只为本次 `cosign verify + docker pull` 创建
+root-only 的 `/run` 临时 Docker 配置，镜像拉取后立即删除，不把令牌写进命令参数、
+Compose、容器环境、日志或长期 `/root/.docker/config.json`。Dashboard/Website 私钥必须
+独立；服务器 `authorized_keys` 分别把它们固定到对应服务，无法选择或切换服务。
 
 首次切换时保持 `DASHBOARD_AUTO_DEPLOY_ENABLED` 和
 `WEBSITE_AUTO_DEPLOY_ENABLED` 未设置或为 `false`。两个仓库第一次进入 `main` 的提交
@@ -201,7 +204,9 @@ UID/GID `10001:10001`；Website 固定 `10002:10002`，两者不可混用。
 3. 为应用、readiness、migrator、backup、restore 建立分离账户：应用只有业务 DML，
    readiness 只读 ledger/information_schema，migrator 只在一次性容器持有目标库
    DDL，backup 只读，restore 可重建目标库；
-4. root 执行 `docker login ghcr.io`，令牌只需 `packages:read`；
+4. 仅首次 root-only 基线切换按临时管理员凭据执行 `docker login ghcr.io`，完成
+   `frontmind-bootstrap-state` 后立即执行 `docker logout ghcr.io`；后续普通自动发布只使用
+   Actions 经 SSH stdin 传入的 job-scoped `GITHUB_TOKEN`，不依赖或回退到 root 长期登录；
 5. Compose 由 controller 直接从上述两个服务器路径运行，1Panel 只观察运行结果；
    现有反向代理继续指向 `127.0.0.1:3001` 与 `127.0.0.1:8888`，不要再挂载源码或
    在服务器安装项目依赖；
@@ -252,6 +257,11 @@ controller 必须显式判断两层状态。`postflight` 与 `migrate` 对同一
 
 Website 流程没有 DB service，永远不会读取、备份或迁移数据库，也不会重建
 Dashboard。
+
+由 `frontmind-deploy` forced-command 发起的普通发布必须从 stdin 收到且只收到 GitHub actor
+与 job-scoped token 两行；缺失、格式错误、多余输入或未关闭的输入都会在验签和 pull 前
+失败。控制器不会读取持久 Docker 登录作为 fallback。root 直接执行的一次性 bootstrap、
+contract 维护窗和事故确认仍保持独立的管理员入口，不复用自动发布 capability。
 
 状态只写入 `/var/lib/frontmind-deploy/<service>/state.json`，包含
 `currentDigest`、`previousDigest`、`sourceSha`、`journalHash`、`deployedAt` 和

@@ -3,6 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly CONFIG_ROOT="/etc/frontmind-deploy/services"
+readonly REGISTRY_AUTH_RUNTIME_ROOT="/run"
 readonly DEPLOY_TIMEOUT_SECONDS=120
 readonly CANDIDATE_READY_BUDGET_SECONDS=90
 readonly RELEASE_DB_READ_TIMEOUT_SECONDS=90
@@ -42,6 +43,72 @@ config_is_root_only() {
   [[ $owner == "0" && $((8#$mode & 0077)) -eq 0 ]]
 }
 
+registry_auth_dir=""
+candidate_env=""
+
+cleanup_ephemeral_registry_auth() {
+  local expected_prefix
+  [[ -n $registry_auth_dir ]] || return 0
+  expected_prefix="${REGISTRY_AUTH_RUNTIME_ROOT}/frontmind-ghcr-${service}."
+  if [[ $registry_auth_dir != "${expected_prefix}"* || ! -d $registry_auth_dir || -L $registry_auth_dir ]]; then
+    log "REGISTRY_AUTH_TEMP_DIR_INVALID"
+    return 1
+  fi
+  if [[ -L ${registry_auth_dir}/config.json ]]; then
+    log "REGISTRY_AUTH_CONFIG_SYMLINK_REJECTED"
+    return 1
+  fi
+  rm -f -- "${registry_auth_dir}/config.json" || return 1
+  rmdir -- "$registry_auth_dir" || return 1
+  registry_auth_dir=""
+  unset DOCKER_CONFIG
+}
+
+cleanup_on_exit() {
+  if [[ -n $candidate_env ]]; then
+    rm -f -- "$candidate_env" || true
+  fi
+  cleanup_ephemeral_registry_auth || true
+}
+
+read_ephemeral_registry_auth() {
+  local registry_username="" registry_token="" trailing_line="" trailing_status=0
+  IFS= read -r -t 10 registry_username || die "REGISTRY_AUTH_USERNAME_REQUIRED" 77
+  IFS= read -r -t 10 registry_token || die "REGISTRY_AUTH_TOKEN_REQUIRED" 77
+  if IFS= read -r -t 1 trailing_line; then
+    registry_token=""
+    die "REGISTRY_AUTH_ENVELOPE_REJECTED" 77
+  else
+    trailing_status=$?
+  fi
+  [[ $trailing_status -eq 1 ]] || {
+    registry_token=""
+    die "REGISTRY_AUTH_ENVELOPE_NOT_CLOSED" 77
+  }
+  [[ ${#registry_username} -le 100 && $registry_username =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*(\[bot\])?$ ]] || {
+    registry_token=""
+    die "REGISTRY_AUTH_USERNAME_REJECTED" 77
+  }
+  [[ ${#registry_token} -ge 20 && ${#registry_token} -le 1024 && $registry_token != *[[:space:]]* ]] || {
+    registry_token=""
+    die "REGISTRY_AUTH_TOKEN_REJECTED" 77
+  }
+
+  registry_auth_dir="$(mktemp -d "${REGISTRY_AUTH_RUNTIME_ROOT}/frontmind-ghcr-${service}.XXXXXX")" \
+    || {
+      registry_token=""
+      die "REGISTRY_AUTH_TEMP_DIR_CREATE_FAILED"
+    }
+  chmod 0700 "$registry_auth_dir"
+  export DOCKER_CONFIG="$registry_auth_dir"
+  if ! printf '%s' "$registry_token" | docker login ghcr.io \
+    --username "$registry_username" --password-stdin >/dev/null; then
+    registry_token=""
+    die "REGISTRY_AUTH_LOGIN_FAILED" 77
+  fi
+  registry_token=""
+}
+
 mode="deploy"
 allow_contract=0
 case "${1:-}" in
@@ -69,6 +136,7 @@ case "$service" in
   dashboard | website) ;;
   *) die "DEPLOY_SERVICE_REJECTED" 64 ;;
 esac
+trap cleanup_on_exit EXIT
 if (( allow_contract == 1 )) && [[ $service != "dashboard" ]]; then
   die "CONTRACT_MODE_DASHBOARD_ONLY" 64
 fi
@@ -703,10 +771,15 @@ if [[ $mode == "acknowledge-incident" ]]; then
   exit 0
 fi
 
+if [[ $mode == "deploy" && ${SUDO_USER:-} == "frontmind-deploy" ]]; then
+  read_ephemeral_registry_auth
+fi
 verify_candidate
+if [[ -n $registry_auth_dir ]]; then
+  cleanup_ephemeral_registry_auth || die "REGISTRY_AUTH_CLEANUP_FAILED"
+fi
 
 candidate_env="$(mktemp)"
-trap 'rm -f -- "$candidate_env"' EXIT
 make_compose_env "$candidate_env" "$image"
 
 if [[ $mode == "bootstrap-state" ]]; then

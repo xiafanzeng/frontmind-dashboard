@@ -119,6 +119,7 @@ async function harness(options: HarnessOptions = {}) {
   const configRoot = path.join(root, "config/services");
   const composeDir = path.join(root, "compose");
   const stateDir = path.join(root, "state");
+  const registryAuthRoot = path.join(root, "registry-auth");
   const backupDir = path.join(root, "backups");
   const log = path.join(root, "commands.log");
   const planCounter = path.join(root, "plan-counter");
@@ -129,6 +130,7 @@ async function harness(options: HarnessOptions = {}) {
     mkdir(configRoot, { recursive: true }),
     mkdir(composeDir, { recursive: true }),
     mkdir(stateDir, { recursive: true }),
+    mkdir(registryAuthRoot, { recursive: true }),
     mkdir(backupDir, { recursive: true }),
   ]);
   await Promise.all([
@@ -170,6 +172,10 @@ async function harness(options: HarnessOptions = {}) {
       `readonly CONFIG_ROOT="${configRoot}"`,
     )
     .replace(
+      'readonly REGISTRY_AUTH_RUNTIME_ROOT="/run"',
+      `readonly REGISTRY_AUTH_RUNTIME_ROOT="${registryAuthRoot}"`,
+    )
+    .replace(
       '[[ $EUID -eq 0 ]] || die "DEPLOY_CONTROLLER_REQUIRES_ROOT"',
       ": # root check replaced only in disposable test copy",
     )
@@ -196,6 +202,7 @@ async function harness(options: HarnessOptions = {}) {
     path.join(bin, "cosign"),
     `#!/usr/bin/env bash
 echo "cosign $*" >>"$TEST_LOG"
+echo "cosign-config \${DOCKER_CONFIG:-unset}" >>"$TEST_LOG"
 exit "\${TEST_COSIGN_EXIT:-0}"
 `,
   );
@@ -229,6 +236,13 @@ printf '{"status":"ok","build":{"sha":"%s","imageDigest":"%s"},"migration":{"jou
 set -e
 echo "docker $*" >>"$TEST_LOG"
 args=" $* "
+if [[ "\${1:-}" == login ]]; then
+  password="$(cat)"
+  [[ -n "$password" && -n "\${DOCKER_CONFIG:-}" ]]
+  printf '%s\n' "registry-config $DOCKER_CONFIG" >>"$TEST_LOG"
+  printf '%s\n' '{"auths":{"ghcr.io":{"auth":"redacted-test-value"}}}' >"$DOCKER_CONFIG/config.json"
+  exit 0
+fi
 if [[ "$args" == *" image inspect "*"org.opencontainers.image.revision"* ]]; then echo "$TEST_SOURCE_SHA"; exit 0; fi
 if [[ "$args" == *" image inspect "*"{{.Id}}"* ]]; then echo "sha256:${"9".repeat(64)}"; exit 0; fi
 if [[ "$args" == *" inspect "*"{{.Image}}"* ]]; then echo "sha256:${"9".repeat(64)}"; exit 0; fi
@@ -241,6 +255,7 @@ if [[ "$args" == *" image ls "* ]]; then
   exit 0
 fi
 if [[ "$args" == *" release-db-plan plan --json "* ]]; then
+  printf '%s\n' "plan-config \${DOCKER_CONFIG:-unset}" >>"$TEST_LOG"
   count=0
   [[ ! -f "$TEST_PLAN_COUNTER" ]] || read -r count <"$TEST_PLAN_COUNTER"
   count=$((count + 1))
@@ -353,11 +368,18 @@ fi
     );
   }
 
-  const runWithArgs = (args: string[]) =>
+  const registryToken = `ghs_${"t".repeat(40)}`;
+  const registryEnvelope = `xiafanzeng\n${registryToken}\n`;
+  const runWithArgs = (
+    args: string[],
+    { forced = false, input }: { forced?: boolean; input?: string } = {},
+  ) =>
     spawnSync("bash", [controllerFile, ...args], {
       encoding: "utf8",
+      input,
       env: {
         ...process.env,
+        SUDO_USER: forced ? "frontmind-deploy" : "",
         PATH: `${bin}:${process.env.PATH}`,
         TEST_LOG: log,
         TEST_PLAN_SEQUENCE: planSequence.join(","),
@@ -374,6 +396,8 @@ fi
     });
   const run = (candidate = image) =>
     runWithArgs(["dashboard", candidate, sourceSha]);
+  const runForced = (candidate = image, input = registryEnvelope) =>
+    runWithArgs(["dashboard", candidate, sourceSha], { forced: true, input });
   const bootstrap = (candidate = image) =>
     runWithArgs(["--bootstrap-state", "dashboard", candidate, sourceSha]);
   const acknowledge = (candidate = image) =>
@@ -381,9 +405,12 @@ fi
   return {
     root,
     backupDir,
+    registryAuthRoot,
     log,
     state: path.join(stateDir, "state.json"),
+    registryToken,
     run,
+    runForced,
     bootstrap,
     acknowledge,
   };
@@ -398,6 +425,48 @@ afterEach(async () => {
 });
 
 describe("deploy controller shell contract", () => {
+  it("uses the forced deploy stdin token only in a temporary registry config", async () => {
+    const test = await harness();
+    const result = test.runForced();
+    expect(result.status, result.stderr).toBe(0);
+
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).toContain(
+      "docker login ghcr.io --username xiafanzeng --password-stdin",
+    );
+    expect(commands).toContain("cosign verify");
+    expect(commands).toContain(`docker pull ${image}`);
+    expect(commands).toContain("plan-config unset");
+    expect(commands).not.toContain(test.registryToken);
+
+    const registryConfig = commands.match(/^registry-config ([^\n]+)$/mu)?.[1];
+    const cosignConfig = commands.match(/^cosign-config ([^\n]+)$/mu)?.[1];
+    expect(registryConfig).toBeTruthy();
+    expect(registryConfig).toMatch(
+      new RegExp(`^${test.registryAuthRoot}/frontmind-ghcr-dashboard\\.`),
+    );
+    expect(cosignConfig).toBe(registryConfig);
+    expect(spawnSync("test", ["!", "-e", registryConfig!]).status).toBe(0);
+  });
+
+  it.each([
+    ["missing", ""],
+    ["missing token", "xiafanzeng\n"],
+    ["invalid username", `bad actor\nghs_${"t".repeat(40)}\n`],
+    ["short token", "xiafanzeng\nshort\n"],
+    ["extra line", `xiafanzeng\nghs_${"t".repeat(40)}\nextra\n`],
+  ])(
+    "rejects %s forced deploy registry auth before verification",
+    async (_label, input) => {
+      const test = await harness();
+      const result = test.runForced(image, input);
+      expect(result.status).toBe(77);
+      const commands = await readFile(test.log, "utf8");
+      expect(commands).not.toContain("cosign verify");
+      expect(commands).not.toContain(`docker pull ${image}`);
+    },
+  );
+
   it("deploys exact without backup and treats the same digest as an idempotent no-op", async () => {
     const test = await harness();
     const first = test.run();

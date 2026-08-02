@@ -49,6 +49,28 @@ describe("release workflow source-ordering contracts", () => {
     );
   });
 
+  it("streams the job-scoped GHCR credential to the restricted deploy command", async () => {
+    const workflow = await readFile(dashboardWorkflow, "utf8");
+    const deployStep = workflow.slice(
+      workflow.indexOf(
+        "      - name: Deploy through fixed Dashboard capability",
+      ),
+      workflow.indexOf(
+        "      - name: Record immutable successful-deployment marker",
+      ),
+    );
+
+    expect(deployStep).toContain("GHCR_USERNAME: ${{ github.actor }}");
+    expect(deployStep).toContain("GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}");
+    expect(deployStep).toContain(
+      `printf '%s\\n%s\\n' "$GHCR_USERNAME" "$GHCR_TOKEN" |`,
+    );
+    expect(deployStep).toContain('"$IMAGE@$DIGEST $GITHUB_SHA"');
+    expect(deployStep).not.toContain(
+      '"$IMAGE@$DIGEST $GITHUB_SHA $GHCR_TOKEN"',
+    );
+  });
+
   it("checks the complete multi-commit push range for PDF base changes", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const producerWorkflow = await readFile(pdfWorkflow, "utf8");

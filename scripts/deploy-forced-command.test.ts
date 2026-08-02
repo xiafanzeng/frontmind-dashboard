@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -13,12 +13,23 @@ const sourceSha = "b".repeat(40);
 
 describe("fixed-service deploy SSH command", () => {
   let binDir: string;
+  let stdinLog: string;
 
   beforeAll(async () => {
     binDir = await mkdtemp(path.join(tmpdir(), "frontmind-deploy-command-"));
+    stdinLog = path.join(binDir, "stdin.log");
     await writeFile(
       path.join(binDir, "sudo"),
-      "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\"\n",
+      [
+        "#!/usr/bin/env sh",
+        "username=''",
+        "token=''",
+        "IFS= read -r username || true",
+        "IFS= read -r token || true",
+        'printf \'%s %s\\n\' "$username" "${#token}" >"$TEST_STDIN_LOG"',
+        "printf '%s\\n' \"$*\"",
+        "",
+      ].join("\n"),
       { mode: 0o755 },
     );
   });
@@ -27,13 +38,15 @@ describe("fixed-service deploy SSH command", () => {
     await rm(binDir, { recursive: true, force: true });
   });
 
-  function run(fixedService: string, command: string) {
+  function run(fixedService: string, command: string, input?: string) {
     return spawnSync("bash", [wrapper, fixedService], {
       encoding: "utf8",
+      input,
       env: {
         ...process.env,
         PATH: `${binDir}:${process.env.PATH}`,
         SSH_ORIGINAL_COMMAND: command,
+        TEST_STDIN_LOG: stdinLog,
       },
     });
   }
@@ -44,6 +57,20 @@ describe("fixed-service deploy SSH command", () => {
     expect(result.stdout.trim()).toBe(
       `-n /usr/local/sbin/frontmind-deploy-controller dashboard ${digest} ${sourceSha}`,
     );
+  });
+
+  it("passes the registry auth envelope through sudo without logging the token", async () => {
+    const token = `ghs_${"t".repeat(40)}`;
+    const result = run(
+      "dashboard",
+      `${digest} ${sourceSha}`,
+      `xiafanzeng\n${token}\n`,
+    );
+    expect(result.status).toBe(0);
+    expect(await readFile(stdinLog, "utf8")).toBe(
+      `xiafanzeng ${token.length}\n`,
+    );
+    expect(`${result.stdout}${result.stderr}`).not.toContain(token);
   });
 
   it("rejects attempts to choose or add another service", () => {

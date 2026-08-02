@@ -310,19 +310,22 @@ jobs:
           DEPLOY_HOST: ${{ vars.PRODUCTION_DEPLOY_HOST }}
           DEPLOY_PORT: ${{ vars.PRODUCTION_DEPLOY_PORT }}
           DEPLOY_USER: ${{ vars.PRODUCTION_DEPLOY_USER }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           : "${DEPLOY_HOST:?PRODUCTION_DEPLOY_HOST is required}"
           : "${DEPLOY_USER:?PRODUCTION_DEPLOY_USER is required}"
           port="${DEPLOY_PORT:-22}"
-          ssh -T \
-            -i ~/.ssh/dashboard_deploy \
-            -p "$port" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            "$DEPLOY_USER@$DEPLOY_HOST" \
-            "$IMAGE@$DIGEST $GITHUB_SHA"
+          printf '%s\n%s\n' "$GHCR_USERNAME" "$GHCR_TOKEN" |
+            ssh -T \
+              -i ~/.ssh/dashboard_deploy \
+              -p "$port" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "$IMAGE@$DIGEST $GITHUB_SHA"
       - name: Record immutable successful-deployment marker
         if: vars.DASHBOARD_AUTO_DEPLOY_ENABLED == 'true'
         env:
