@@ -364,10 +364,31 @@ describe("database schema contract", () => {
     attachmentDefault.extra = "DEFAULT_GENERATED";
     metadataDefault.columnDefault = "_utf8mb4\\'{}\\'";
     metadataDefault.extra = "DEFAULT_GENERATED";
+    const usersCheck = rows.checks.find(
+      (check) => check.constraintName === "users_engineer_role_consistency_ck",
+    )!;
+    usersCheck.checkClause = `
+      (((\`role\` = _utf8mb4\\'delivery_member\\') AND
+        (\`engineerRoleType\` IS NOT NULL)) OR
+       ((\`role\` <> _utf8mb4\\'delivery_member\\') AND
+        (\`engineerRoleType\` IS NULL)))
+    `;
 
     await expect(
       evaluateDatabaseSchema(databaseFromRows(rows), contract),
     ).resolves.toMatchObject({ status: "exact", differences: [] });
+
+    const exactCheck = usersCheck.checkClause;
+    usersCheck.checkClause = exactCheck.replaceAll("delivery_member", "admin");
+    const checkDrift = await evaluateDatabaseSchema(
+      databaseFromRows(rows),
+      contract,
+    );
+    expect(checkDrift.status).toBe("diverged");
+    expect(checkDrift.differences).toEqual([
+      expect.stringMatching(/\.checks\.\d+\.expression$/u),
+    ]);
+    usersCheck.checkClause = exactCheck;
 
     attachmentDefault.columnDefault = "_utf8mb4\\'[1]\\'";
     const drift = await evaluateDatabaseSchema(

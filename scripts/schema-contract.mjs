@@ -623,15 +623,18 @@ function databaseLiteral(value) {
   }
 }
 
-function normalizeInformationSchemaDefaultExpression(value) {
+function normalizeInformationSchemaExpression(value) {
   const raw = String(value).trim();
-  // MySQL 8.4 can expose a character-set introduced expression literal from
-  // INFORMATION_SCHEMA.COLUMNS with the delimiter quotes backslash-escaped,
-  // for example _utf8mb4\'[]\'. Convert only that complete metadata form into
-  // ordinary SQL syntax; the normal tokenizer still validates the payload and
-  // the resulting literal is still compared against the schema contract.
-  const escapedLiteral = raw.match(/^(_[A-Za-z0-9]+)\\'([\s\S]*)\\'$/u);
-  return escapedLiteral ? `${escapedLiteral[1]}'${escapedLiteral[2]}'` : raw;
+  // MySQL 8.4 can expose character-set introduced literals from
+  // INFORMATION_SCHEMA with their delimiter quotes backslash-escaped, both as
+  // a complete default (`_utf8mb4\'[]\'`) and inside CHECK/generated
+  // expressions. Convert only complete introduced-literal pairs. The normal
+  // tokenizer still validates the surrounding expression and the result is
+  // still compared against the full schema contract.
+  return raw.replace(
+    /(?<![A-Za-z0-9_$])(_[A-Za-z0-9]+)\\'([\s\S]*?)\\'/gu,
+    (_match, introducer, payload) => `${introducer}'${payload}'`,
+  );
 }
 
 function defaultFromSnapshot(column) {
@@ -669,7 +672,7 @@ function defaultFromDatabase(value, type, extra) {
   }
   const defaultGenerated = /default_generated/iu.test(extra);
   if (defaultGenerated) {
-    raw = normalizeInformationSchemaDefaultExpression(raw);
+    raw = normalizeInformationSchemaExpression(raw);
   }
   if (type === "json") {
     const literal = databaseLiteral(raw);
@@ -774,7 +777,7 @@ function generatedFromSnapshot(column) {
 }
 
 function generatedFromDatabase(expression, extra) {
-  const raw = String(expression ?? "").trim();
+  const raw = normalizeInformationSchemaExpression(expression ?? "");
   if (!raw) return null;
   const normalizedExtra = String(extra ?? "").toLowerCase();
   const storage = normalizedExtra.includes("virtual generated")
@@ -1499,7 +1502,9 @@ export async function inspectDatabaseSchema(database, expectedContract) {
             rowValue(row, "constraintName", "CONSTRAINT_NAME"),
           ),
           expression: normalizeSqlExpression(
-            rowValue(row, "checkClause", "CHECK_CLAUSE"),
+            normalizeInformationSchemaExpression(
+              rowValue(row, "checkClause", "CHECK_CLAUSE"),
+            ),
           ),
           enforced:
             String(rowValue(row, "enforced", "ENFORCED")).toUpperCase() ===
