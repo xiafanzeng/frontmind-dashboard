@@ -1,6 +1,43 @@
 import { describe, expect, it } from "vitest";
 
-import { assertExpandSql } from "./check-migration-append-only.mjs";
+import {
+  assertExpandSql,
+  assertNoEmptyMigrationBlocks,
+} from "./check-migration-append-only.mjs";
+
+describe("migration statement breakpoint policy", () => {
+  it("rejects leading, trailing and consecutive empty statement blocks", () => {
+    for (const sql of [
+      "--> statement-breakpoint\nALTER TABLE `users` ADD `nickname` varchar(128);",
+      "ALTER TABLE `users` ADD `nickname` varchar(128);--> statement-breakpoint\n",
+      "ALTER TABLE `users` ADD `nickname` varchar(128);--> statement-breakpoint\n--> statement-breakpoint\nCREATE INDEX `users_name_idx` ON `users` (`name`);",
+      "-- comment only\n--> statement-breakpoint\nALTER TABLE `users` ADD `nickname` varchar(128);",
+      "/* comment only */--> statement-breakpoint\nALTER TABLE `users` ADD `nickname` varchar(128);",
+    ]) {
+      expect(() => assertNoEmptyMigrationBlocks("0049_empty", sql)).toThrow(
+        "MIGRATION_EMPTY_STATEMENT_BLOCK",
+      );
+    }
+  });
+
+  it("allows one executable statement in every breakpoint block", () => {
+    expect(() =>
+      assertNoEmptyMigrationBlocks(
+        "0049_valid",
+        "ALTER TABLE `users` ADD `nickname` varchar(128);--> statement-breakpoint\nCREATE INDEX `users_name_idx` ON `users` (`name`);",
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects multiple executable statements inside one breakpoint block", () => {
+    expect(() =>
+      assertNoEmptyMigrationBlocks(
+        "0049_multiple",
+        "ALTER TABLE `users` ADD `nickname` varchar(128); CREATE INDEX `users_name_idx` ON `users` (`name`);",
+      ),
+    ).toThrow("MIGRATION_MULTIPLE_STATEMENTS_BLOCK");
+  });
+});
 
 describe("append-only expand SQL policy", () => {
   it("allows additive tables, nullable columns and compatible literal defaults", () => {

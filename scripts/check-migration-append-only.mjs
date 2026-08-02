@@ -67,80 +67,81 @@ function assertJournalShape(entries) {
   });
 }
 
+function parseSqlBlock(block, onInvalid) {
+  const parsed = [];
+  let current = "";
+  let quote = null;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < block.length; index += 1) {
+    const character = block[index];
+    const next = block[index + 1];
+    if (lineComment) {
+      if (character === "\n") {
+        lineComment = false;
+        current += " ";
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        blockComment = false;
+        current += " ";
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      current += character;
+      if (character === "\\" && next) {
+        current += next;
+        index += 1;
+      } else if (character === quote && next === quote) {
+        current += next;
+        index += 1;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "-" && next === "-") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === "#") {
+      lineComment = true;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quote = character;
+      current += character;
+      continue;
+    }
+    if (character === ";") {
+      if (current.trim()) parsed.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  if (quote || blockComment) onInvalid();
+  if (current.trim()) parsed.push(current.trim());
+  return parsed;
+}
+
 export function assertExpandSql(tag, sql) {
   const reject = () => {
     throw new Error(`EXPAND_MIGRATION_HAS_CONTRACT_SQL:${tag}`);
   };
-  const parseBlock = (block) => {
-    const parsed = [];
-    let current = "";
-    let quote = null;
-    let lineComment = false;
-    let blockComment = false;
-    for (let index = 0; index < block.length; index += 1) {
-      const character = block[index];
-      const next = block[index + 1];
-      if (lineComment) {
-        if (character === "\n") {
-          lineComment = false;
-          current += " ";
-        }
-        continue;
-      }
-      if (blockComment) {
-        if (character === "*" && next === "/") {
-          blockComment = false;
-          current += " ";
-          index += 1;
-        }
-        continue;
-      }
-      if (quote) {
-        current += character;
-        if (character === "\\" && next) {
-          current += next;
-          index += 1;
-        } else if (character === quote && next === quote) {
-          current += next;
-          index += 1;
-        } else if (character === quote) {
-          quote = null;
-        }
-        continue;
-      }
-      if (character === "-" && next === "-") {
-        lineComment = true;
-        index += 1;
-        continue;
-      }
-      if (character === "#") {
-        lineComment = true;
-        continue;
-      }
-      if (character === "/" && next === "*") {
-        blockComment = true;
-        index += 1;
-        continue;
-      }
-      if (character === "'" || character === '"' || character === "`") {
-        quote = character;
-        current += character;
-        continue;
-      }
-      if (character === ";") {
-        if (current.trim()) parsed.push(current.trim());
-        current = "";
-        continue;
-      }
-      current += character;
-    }
-    if (quote || blockComment) reject();
-    if (current.trim()) parsed.push(current.trim());
-    return parsed;
-  };
   const statements = [];
   for (const block of sql.split(/-->\s*statement-breakpoint/iu)) {
-    const blockStatements = parseBlock(block);
+    const blockStatements = parseSqlBlock(block, reject);
     // Drizzle breakpoints are the execution boundary. Requiring exactly one
     // statement per non-empty block prevents an allowed CREATE/ADD prefix from
     // hiding a second contract statement after a semicolon.
@@ -230,6 +231,22 @@ export function assertExpandSql(tag, sql) {
   }
 }
 
+export function assertNoEmptyMigrationBlocks(tag, sql) {
+  const blocks = sql.split(/-->\s*statement-breakpoint/iu);
+  for (const block of blocks) {
+    const rejectInvalidSql = () => {
+      throw new Error(`MIGRATION_STATEMENT_BLOCK_INVALID:${tag}`);
+    };
+    const statements = parseSqlBlock(block, rejectInvalidSql);
+    if (statements.length === 0) {
+      throw new Error(`MIGRATION_EMPTY_STATEMENT_BLOCK:${tag}`);
+    }
+    if (statements.length > 1) {
+      throw new Error(`MIGRATION_MULTIPLE_STATEMENTS_BLOCK:${tag}`);
+    }
+  }
+}
+
 const journal = await readJson(path.join(drizzleRoot, "meta/_journal.json"));
 assertJournalShape(journal.entries);
 
@@ -301,6 +318,7 @@ for (const entry of futureEntries) {
   }
   const sql = await readFile(migrationFile(entry), "utf8");
   await readFile(snapshotFile(entry));
+  assertNoEmptyMigrationBlocks(entry.tag, sql);
   if (classification === "expand") assertExpandSql(entry.tag, sql);
 }
 

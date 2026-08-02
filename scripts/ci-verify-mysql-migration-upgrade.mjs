@@ -16,6 +16,7 @@ import { migrate } from "drizzle-orm/mysql2/migrator";
 
 import { createMigrationManifest } from "./migration-manifest.mjs";
 import { evaluateDatabaseSchema } from "./schema-contract.mjs";
+import { isApprovedUnreleasedMigrationCorrection } from "./unreleased-migration-correction-policy.mjs";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 if (!databaseUrl) throw new Error("DATABASE_URL_REQUIRED");
@@ -81,11 +82,25 @@ if (explicitBaseIdx) {
     ]);
     const baseSql = gitShow(baseRef, `drizzle/${entry.tag}.sql`);
     const baseSnapshot = gitShow(baseRef, `drizzle/meta/${snapshotName}`);
+    const currentSqlSha256 = sha256(currentSql);
+    const baseSqlSha256 = sha256(baseSql);
+    const approvedUnreleasedCorrection =
+      isApprovedUnreleasedMigrationCorrection({
+        baseRef,
+        tag: entry.tag,
+        baseSqlSha256,
+        currentSqlSha256,
+      });
     if (
-      sha256(currentSql) !== sha256(baseSql) ||
+      (!approvedUnreleasedCorrection && currentSqlSha256 !== baseSqlSha256) ||
       sha256(currentSnapshot) !== sha256(baseSnapshot)
     ) {
       throw new Error(`BASE_REF_RELEASED_MIGRATION_MUTATED:${entry.tag}`);
+    }
+    if (approvedUnreleasedCorrection) {
+      console.log(
+        `UNRELEASED_MIGRATION_CORRECTION_ACCEPTED:${entry.tag}:${baseRef}`,
+      );
     }
   }
   if (baseJournal.entries.length > 49) {
