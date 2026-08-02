@@ -12,6 +12,7 @@ import {
   extractFinalKnowledgeBaseAssistantText,
   isIdempotentKnowledgeBaseReconcileError,
   isAmbiguousKnowledgeBaseAdvance,
+  isKnowledgeBaseAcknowledgementOnlyOutput,
   knowledgeBaseObservationConversationStorageId,
   knowledgeBaseProtocolErrorIsRetryable,
   knowledgeBaseStagedArtifactMatchesAuthority,
@@ -107,6 +108,23 @@ describe("knowledge-base user action classification", () => {
 });
 
 describe("knowledge-base model output boundary", () => {
+  it("classifies a terminal receipt as a retryable protocol failure, never content", () => {
+    expect(
+      isKnowledgeBaseAcknowledgementOnlyOutput([
+        { role: "assistant", type: "message", content: "已收到。" },
+      ]),
+    ).toBe(true);
+    expect(
+      isKnowledgeBaseAcknowledgementOnlyOutput([
+        {
+          role: "assistant",
+          type: "message",
+          content: "## 1.1 一句话定位\n完整知识库正文",
+        },
+      ]),
+    ).toBe(false);
+  });
+
   it("projects only the presentation leaf and removes the prior confirmation", () => {
     const projected = projectKnowledgeBasePresentationMarkdown({
       markdown: [

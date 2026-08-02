@@ -441,6 +441,7 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("后续所有节点与当前节点修订轮次一律纯文字");
     expect(prompt).toContain("资料采集状态只由 Dashboard 展示");
     expect(prompt).toContain("不得复述、输出或以“正在采集”“处理中”");
+    expect(prompt).toContain("不得先发送或以“已收到”“好的”“开始处理”");
     expect(prompt).not.toContain(
       "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
     );
@@ -1133,6 +1134,23 @@ describe("knowledge base execution contract", () => {
       shouldReconcileKnowledgeOutput(transitionOnly, "completed", {
         requirePresentation: true,
       }),
+    ).toBe(true);
+  });
+
+  it("routes a terminal acknowledgement-only response into protocol validation", () => {
+    expect(
+      shouldReconcileKnowledgeOutput(
+        [
+          {
+            id: "ack-only",
+            role: "assistant",
+            type: "message",
+            content: "已收到。",
+          },
+        ],
+        "completed",
+        { requirePresentation: true },
+      ),
     ).toBe(true);
   });
 

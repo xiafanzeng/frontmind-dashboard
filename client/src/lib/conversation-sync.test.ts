@@ -114,6 +114,16 @@ describe("ConversationSyncQueue", () => {
 });
 
 describe("getErrorMessage", () => {
+  it("identifies a MySQL deadlock as an automatically retried initialization conflict", () => {
+    expect(
+      getErrorMessage(
+        new Error(
+          "Failed query: insert into `conversations` values (?) ER_LOCK_DEADLOCK",
+        ),
+      ),
+    ).toBe("会话初始化遇到并发冲突，系统已自动重试；无需重复提交。");
+  });
+
   it("does not expose SQL parameters or assistant content in the sync banner", () => {
     const message = getErrorMessage(
       new Error(

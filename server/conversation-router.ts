@@ -385,6 +385,109 @@ function requireDb(db: Awaited<ReturnType<typeof getDb>>) {
   return db;
 }
 
+const RETRYABLE_CONVERSATION_SYNC_MYSQL_CODES = new Set([
+  "ER_LOCK_DEADLOCK",
+  "ER_LOCK_WAIT_TIMEOUT",
+  "ER_DUP_ENTRY",
+]);
+
+export function conversationSyncMysqlErrorCode(error: unknown) {
+  const visited = new Set<unknown>();
+  let fallbackCode: string | undefined;
+  let current = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (!current || typeof current !== "object" || visited.has(current)) break;
+    visited.add(current);
+    const candidate = current as {
+      code?: unknown;
+      errno?: unknown;
+      sqlState?: unknown;
+      cause?: unknown;
+    };
+    if (typeof candidate.code === "string") {
+      if (RETRYABLE_CONVERSATION_SYNC_MYSQL_CODES.has(candidate.code)) {
+        return candidate.code;
+      }
+      fallbackCode ??= candidate.code;
+    }
+    if (candidate.errno === 1213) return "ER_LOCK_DEADLOCK";
+    if (candidate.errno === 1205) return "ER_LOCK_WAIT_TIMEOUT";
+    if (candidate.errno === 1062) return "ER_DUP_ENTRY";
+    if (candidate.sqlState === "40001") return "ER_LOCK_DEADLOCK";
+    current = candidate.cause;
+  }
+  return fallbackCode;
+}
+
+export function isRetryableConversationSyncTransactionError(error: unknown) {
+  const code = conversationSyncMysqlErrorCode(error);
+  return Boolean(code && RETRYABLE_CONVERSATION_SYNC_MYSQL_CODES.has(code));
+}
+
+export async function retryConversationSyncTransaction<T>(
+  operation: () => Promise<T>,
+  options: {
+    maxAttempts?: number;
+    sleep?: (delayMs: number) => Promise<void>;
+  } = {},
+) {
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 3);
+  const sleep =
+    options.sleep ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (
+        attempt >= maxAttempts ||
+        !isRetryableConversationSyncTransactionError(error)
+      ) {
+        throw error;
+      }
+      await sleep(10 * 2 ** (attempt - 1));
+    }
+  }
+}
+
+export function runConversationWriteTransaction<T>(
+  db: NonNullable<Awaited<ReturnType<typeof getDb>>>,
+  operation: (tx: any) => Promise<T>,
+) {
+  return retryConversationSyncTransaction(() =>
+    db.transaction(operation, {
+      isolationLevel: "read committed",
+      accessMode: "read write",
+    }),
+  );
+}
+
+export async function loadConversationSnapshotRowForUpdateIfPresent(
+  executor: any,
+  persistedConversationId: string,
+) {
+  const candidates = await executor
+    .select({ id: conversations.id })
+    .from(conversations)
+    .where(eq(conversations.id, persistedConversationId))
+    .limit(1);
+  const observedExisting = Boolean(candidates[0]);
+  const existing = observedExisting
+    ? (
+        await executor
+          .select()
+          .from(conversations)
+          .where(eq(conversations.id, persistedConversationId))
+          .limit(1)
+          // Existing snapshots still require serialization so a later
+          // delete/reinsert cannot erase a turn written by another device.
+          .for("update")
+      )[0]
+    : undefined;
+  return { observedExisting, existing };
+}
+
 /**
  * Permanently removes a conversation. Foreign keys cascade to its turns,
  * messages, and attachments. Upstream ownership ledger rows deliberately
@@ -1362,15 +1465,8 @@ async function persistSnapshot(
     ),
   };
   const projectAssignmentId = options.projectAssignmentId ?? null;
-  const knowledgeBuildRows = await executor
-    .select({
-      id: knowledgeBaseBuilds.id,
-      status: knowledgeBaseBuilds.status,
-      upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
-      lastOutputLength: knowledgeBaseBuilds.lastOutputLength,
-      awaitingResponseSince: knowledgeBaseBuilds.awaitingResponseSince,
-      completedAt: knowledgeBaseBuilds.completedAt,
-    })
+  const knowledgeBuildCandidates = await executor
+    .select({ id: knowledgeBaseBuilds.id })
     .from(knowledgeBaseBuilds)
     .where(
       and(
@@ -1378,8 +1474,22 @@ async function persistSnapshot(
         eq(knowledgeBaseBuilds.conversationId, snapshot.id),
       ),
     )
-    .limit(1)
-    .for("update");
+    .limit(1);
+  const knowledgeBuildRows = knowledgeBuildCandidates[0]
+    ? await executor
+        .select({
+          id: knowledgeBaseBuilds.id,
+          status: knowledgeBaseBuilds.status,
+          upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+          lastOutputLength: knowledgeBaseBuilds.lastOutputLength,
+          awaitingResponseSince: knowledgeBaseBuilds.awaitingResponseSince,
+          completedAt: knowledgeBaseBuilds.completedAt,
+        })
+        .from(knowledgeBaseBuilds)
+        .where(eq(knowledgeBaseBuilds.id, knowledgeBuildCandidates[0].id))
+        .limit(1)
+        .for("update")
+    : [];
   const knowledgeBuild = knowledgeBuildRows[0];
   const lockedKnowledgeBuilds = await executor
     .select({ id: knowledgeBaseBuilds.id })
@@ -1397,8 +1507,7 @@ async function persistSnapshot(
         eq(knowledgeBaseBuilds.conversationId, snapshot.id),
       ),
     )
-    .limit(1)
-    .for("update");
+    .limit(1);
   if (lockedKnowledgeBuilds[0]) {
     if (options.skipExisting) return "skipped";
     throw new TRPCError({
@@ -1418,8 +1527,7 @@ async function persistSnapshot(
         ),
       ),
     )
-    .limit(1)
-    .for("update");
+    .limit(1);
   if (tombstones[0]) {
     if (options.skipExisting) return "skipped";
     throw new TRPCError({
@@ -1432,16 +1540,21 @@ async function persistSnapshot(
     snapshot.id,
     projectAssignmentId,
   );
-  const existingRows = await executor
-    .select()
-    .from(conversations)
-    .where(eq(conversations.id, persistedConversationId))
-    .limit(1)
-    // Serialize whole-snapshot merges for this conversation. Without this
-    // lock, two transactions can both merge from the same old message set and
-    // the later delete/reinsert phase would erase the other device's new turn.
-    .for("update");
-  const existing = existingRows[0];
+  // Do not take a next-key lock for a row that does not exist. Two new public
+  // conversations commonly sort into the same PRIMARY-key gap; locking both
+  // missing IDs before INSERT makes their insert-intention locks deadlock.
+  const { observedExisting, existing } =
+    await loadConversationSnapshotRowForUpdateIfPresent(
+      executor,
+      persistedConversationId,
+    );
+  if (observedExisting && !existing) {
+    if (options.skipExisting) return "skipped";
+    throw new TRPCError({
+      code: "NOT_FOUND",
+      message: "会话已在同步期间删除",
+    });
+  }
 
   const existingOwned = projectAssignmentId
     ? existing?.projectAssignmentId === projectAssignmentId
@@ -2045,11 +2158,23 @@ export const conversationRouter = router({
         input.projectAssignmentId,
       );
       const db = requireDb(await getDb());
-      await db.transaction(async (tx) => {
-        await persistSnapshot(tx, ctx.user.id, input.conversation, {
-          projectAssignmentId,
+      try {
+        await runConversationWriteTransaction(db, async (tx) => {
+          await persistSnapshot(tx, ctx.user.id, input.conversation, {
+            projectAssignmentId,
+          });
         });
-      });
+      } catch (error) {
+        const code = conversationSyncMysqlErrorCode(error);
+        if (code === "ER_LOCK_DEADLOCK" || code === "ER_LOCK_WAIT_TIMEOUT") {
+          throw new TRPCError({
+            code: "SERVICE_UNAVAILABLE",
+            message: "会话初始化遇到并发冲突，系统已自动重试；无需重复提交。",
+            cause: error,
+          });
+        }
+        throw error;
+      }
       const snapshots = await listSnapshots(ctx.user.id, projectAssignmentId);
       const persisted = snapshots.find(
         (item) => item.id === input.conversation.id,
@@ -2081,7 +2206,7 @@ export const conversationRouter = router({
         input.id,
         projectAssignmentId,
       );
-      await db.transaction(async (tx) => {
+      await runConversationWriteTransaction(db, async (tx) => {
         // KB transitions lock the build before touching conversation state.
         // Keep the same order here so delete cannot deadlock or race a start.
         const knowledgeBuild = await tx
@@ -2150,7 +2275,7 @@ export const conversationRouter = router({
       let imported = 0;
       let skipped = 0;
       for (const conversation of input.conversations) {
-        const result = await db.transaction((tx) =>
+        const result = await runConversationWriteTransaction(db, (tx) =>
           persistSnapshot(tx, ctx.user.id, conversation, {
             skipExisting: true,
             importCredentialId: prepared.credentialId,

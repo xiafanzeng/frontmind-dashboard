@@ -1229,7 +1229,10 @@ interface ConversationContextType {
   loading: boolean;
   hydrated: boolean;
   syncError: string | null;
-  createConversation: () => string;
+  createConversation: (options?: {
+    title?: string;
+    reuseEmpty?: boolean;
+  }) => string;
   setActive: (id: string) => void;
   addMessage: (conversationId: string, message: LocalMessage) => void;
   updateStatus: (
@@ -1676,29 +1679,46 @@ export function ConversationProvider({
     canSyncRef.current = hydrated && userId !== null;
   }, [hydrated, userId]);
 
-  const createConversation = useCallback(() => {
-    const id = `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const conversation: Conversation = {
-      id,
-      title: "新内容流程",
-      messages: [],
-      status: "idle",
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-    const nextState = conversationReducer(stateRef.current, {
-      type: "NEW_CONVERSATION",
-      payload: conversation,
-    });
-    replaceState(nextState);
-    if (canSyncRef.current) {
-      syncQueueRef.current!.enqueueSnapshot(
-        prepareConversationForCloud(conversation),
-        true,
-      );
-    }
-    return id;
-  }, [replaceState]);
+  const createConversation = useCallback(
+    (options?: { title?: string; reuseEmpty?: boolean }) => {
+      const title = options?.title?.trim() || "新内容流程";
+      if (options?.reuseEmpty) {
+        const reusable = stateRef.current.conversations.find(
+          (conversation) =>
+            conversation.title === title &&
+            conversation.status === "idle" &&
+            conversation.messages.length === 0 &&
+            !conversation.taskId &&
+            !conversation.previousResponseId &&
+            !conversation.knowledgeBase?.initialized,
+        );
+        if (reusable) return reusable.id;
+      }
+
+      const id = `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const conversation: Conversation = {
+        id,
+        title,
+        messages: [],
+        status: "idle",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      const nextState = conversationReducer(stateRef.current, {
+        type: "NEW_CONVERSATION",
+        payload: conversation,
+      });
+      replaceState(nextState);
+      if (canSyncRef.current) {
+        syncQueueRef.current!.enqueueSnapshot(
+          prepareConversationForCloud(conversation),
+          true,
+        );
+      }
+      return id;
+    },
+    [replaceState],
+  );
 
   const setActive = useCallback(
     (id: string) => {

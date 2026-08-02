@@ -892,6 +892,15 @@ export function extractFinalKnowledgeBaseAssistantText(
   return extractAuthoritativeKnowledgeBaseAssistantText(output);
 }
 
+export function isKnowledgeBaseAcknowledgementOnlyOutput(output: unknown) {
+  const normalized = extractFinalKnowledgeBaseAssistantText(output)
+    .trim()
+    .replace(/[\s。！!，,]/gu, "");
+  return ["已收到", "收到", "好的", "好", "开始处理", "马上处理"].includes(
+    normalized,
+  );
+}
+
 export function assertKnowledgeBaseCustomerOutput(output: unknown) {
   const text = extractFinalKnowledgeBaseAssistantText(output);
   const customerVisibleText = stripKnowledgeBaseReferenceAppendix(
@@ -3230,7 +3239,12 @@ export async function reconcileKnowledgeBaseProgress(input: {
       });
       if (progress) return progress;
     }
-    const message = friendlyProtocolError(error);
+    const acknowledgementOnly = isKnowledgeBaseAcknowledgementOnlyOutput(
+      input.output,
+    );
+    const message = acknowledgementOnly
+      ? "上游智能体仅返回了确认回执，未生成知识库正文；本轮未写入，现可安全重试"
+      : friendlyProtocolError(error);
     // Deliberately do not update the output ledger on failure. A provider may
     // append a missing companion resource to the same cumulative output; the
     // next observation must revalidate that complete bundle.
@@ -3245,6 +3259,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
         error,
       }),
       message,
+      code: acknowledgementOnly ? "UPSTREAM_ACKNOWLEDGEMENT_ONLY" : undefined,
     });
     const progress = await getKnowledgeBaseProgress({
       userId: input.userId,

@@ -44,6 +44,7 @@ import {
 } from "@/lib/frontmind-api";
 import ChatInput from "./ChatInput";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
+import { KNOWLEDGE_COLLECTION_STATUS_COPY } from "@shared/knowledge-base-copy";
 import MarkdownRenderer from "./MarkdownRenderer";
 import ImagePreview from "./ImagePreview";
 import FilePreview from "./FilePreview";
@@ -72,6 +73,12 @@ import {
 
 export const KNOWLEDGE_BASE_FOUNDATION_COPY =
   "企业知识库是品牌事实与产品信息的统一底稿，也是构建 AI 专用友好官网、生成内容与准确回答客户问题的基础。";
+
+export function runningAssistantStatusText(syncKnowledgeBaseSnapshot: boolean) {
+  return syncKnowledgeBaseSnapshot
+    ? KNOWLEDGE_COLLECTION_STATUS_COPY
+    : "FrontMind AI 正在处理...";
+}
 
 export const KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE =
   "PACKAGE_REBIND_REQUIRED";
@@ -826,7 +833,11 @@ export default function ChatArea({
                   (m.content && m.content.trim() !== ""),
               );
               return !hasStepsOrContent;
-            })() && <TypingIndicator />}
+            })() && (
+              <TypingIndicator
+                text={runningAssistantStatusText(syncKnowledgeBaseSnapshot)}
+              />
+            )}
 
           <div ref={bottomRef} />
         </div>

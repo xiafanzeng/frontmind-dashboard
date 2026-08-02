@@ -6,6 +6,7 @@ import {
   knowledgeBasePackageRebindResolved,
   readKnowledgeBaseStartRequestError,
   recoverKnowledgeBaseNotice,
+  runningAssistantStatusText,
   shouldRecoverKnowledgeBaseStartFailure,
 } from "./ChatArea";
 
@@ -13,6 +14,13 @@ describe("knowledge-base starter", () => {
   it("explains why the knowledge base must be built before the first task", () => {
     expect(KNOWLEDGE_BASE_FOUNDATION_COPY).toContain("AI 专用友好官网");
     expect(KNOWLEDGE_BASE_FOUNDATION_COPY).toContain("准确回答客户问题");
+  });
+
+  it("shows an explicit Dashboard-owned collection status while awaiting approved content", () => {
+    expect(runningAssistantStatusText(true)).toBe(
+      "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
+    );
+    expect(runningAssistantStatusText(false)).toBe("FrontMind AI 正在处理...");
   });
 
   it("uses the durable reservation fact instead of treating every 5xx as accepted", () => {

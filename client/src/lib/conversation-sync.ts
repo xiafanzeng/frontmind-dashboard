@@ -193,6 +193,13 @@ export class ConversationSyncQueue<T extends { id: string }> {
 export function getErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) {
     if (
+      /ER_LOCK_DEADLOCK|Deadlock found when trying to get lock|errno\s*[:=]?\s*1213/i.test(
+        error.message,
+      )
+    ) {
+      return "会话初始化遇到并发冲突，系统已自动重试；无需重复提交。";
+    }
+    if (
       /Failed query:|params:|insert into [`"]?messages|ER_DUP_ENTRY|Duplicate entry/i.test(
         error.message,
       )

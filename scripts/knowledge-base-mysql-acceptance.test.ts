@@ -10,6 +10,7 @@ import mysql, {
   type RowDataPacket,
 } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { conversations } from "../drizzle/schema";
 
 import {
   KnowledgeBaseTurnReservationError,
@@ -22,6 +23,10 @@ import {
   claimKnowledgeBaseOpenRecoveryBuild,
   releaseKnowledgeBaseOpenRecoveryLease,
 } from "../server/knowledge-base-open-recovery-lease";
+import {
+  loadConversationSnapshotRowForUpdateIfPresent,
+  runConversationWriteTransaction,
+} from "../server/conversation-router";
 
 const ACCEPTANCE_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_DATABASE_URL";
 const REQUIRED_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_REQUIRED";
@@ -274,6 +279,47 @@ mysqlDescribe("knowledge-base real MySQL state-machine acceptance", () => {
     }
     if (pool) await pool.end();
   }, 60_000);
+
+  it("inserts concurrent new conversation snapshots without PRIMARY gap deadlocks", async () => {
+    expect(userId).not.toBeNull();
+    const ids = [`u${userId}:conv-${runId}-a`, `u${userId}:conv-${runId}-b`];
+    let readyCount = 0;
+    let releaseBoth!: () => void;
+    const bothSelected = new Promise<void>((resolve) => {
+      releaseBoth = resolve;
+    });
+
+    const insertSnapshot = (id: string) =>
+      runConversationWriteTransaction(executor, async (tx) => {
+        const selected = await loadConversationSnapshotRowForUpdateIfPresent(
+          tx,
+          id,
+        );
+        expect(selected.observedExisting).toBe(false);
+        expect(selected.existing).toBeUndefined();
+        readyCount += 1;
+        if (readyCount === ids.length) releaseBoth();
+        await bothSelected;
+        const now = new Date();
+        await tx.insert(conversations).values({
+          id,
+          userId: userId!,
+          title: "KB concurrent draft",
+          status: "idle",
+          deletedMessageIds: [],
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+        });
+      });
+
+    await Promise.all(ids.map((id) => insertSnapshot(id)));
+    const [rows] = await pool.query<RowDataPacket[]>(
+      "SELECT COUNT(*) AS conversationCount FROM conversations WHERE id IN (?, ?)",
+      ids,
+    );
+    expect(Number(rows[0]?.conversationCount || 0)).toBe(2);
+  });
 
   it("proves exactly-once reservations, stale-write guards, leases and rollback", async () => {
     expect(userId).not.toBeNull();

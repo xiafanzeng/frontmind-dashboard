@@ -275,6 +275,28 @@ export default function EmbeddedKnowledgeBasePanel({
           onProgressChange={setPreviewProgress}
           mode={mode}
         />
+      ) : resetQuery.isError ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+          <div className="max-w-lg rounded-2xl border bg-muted/30 p-7 text-center">
+            <p className="font-medium">知识库状态读取失败</p>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">
+              尚未创建新的构建会话，请先重新读取重置状态。
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              className="mt-4"
+              onClick={() => void resetQuery.refetch()}
+            >
+              重新读取
+            </Button>
+          </div>
+        </div>
+      ) : !resetQuery.data ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center gap-2 p-6 text-sm text-muted-foreground">
+          <Loader2 className="h-5 w-5 animate-spin text-primary" />
+          正在确认知识库重置状态…
+        </div>
       ) : resetQuery.data?.locked ? (
         <div className="flex min-h-0 flex-1 items-center justify-center p-6">
           <div className="max-w-lg rounded-2xl border bg-muted/30 p-7 text-center">
@@ -647,14 +669,8 @@ function KnowledgeMaintenanceTicketButton({
 }
 
 function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
-  const {
-    state,
-    activeConversation,
-    hydrated,
-    createConversation,
-    setActive,
-    updateTitle,
-  } = useConversation();
+  const { state, activeConversation, hydrated, createConversation, setActive } =
+    useConversation();
   const [conversationId, setConversationId] = useState<string | null>(null);
   const trpcUtils = trpc.useUtils();
   const latestProgressQuery = trpc.workspace.knowledgeProgress.useQuery(
@@ -672,7 +688,14 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
     : undefined;
 
   useEffect(() => {
-    if (!hydrated || latestProgressQuery.isLoading) return;
+    if (
+      !hydrated ||
+      latestProgressQuery.isLoading ||
+      latestProgressQuery.isError ||
+      !latestProgressQuery.data
+    ) {
+      return;
+    }
     const latestConversationId =
       latestProgressQuery.data?.progress?.build.conversationId;
     const latestConversation = latestConversationId
@@ -696,8 +719,10 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
       return;
     }
     if (!conversationId) {
-      const nextConversationId = createConversation();
-      updateTitle(nextConversationId, "企业知识库构建");
+      const nextConversationId = createConversation({
+        title: "企业知识库构建",
+        reuseEmpty: true,
+      });
       setConversationId(nextConversationId);
     }
   }, [
@@ -706,11 +731,11 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
     createConversation,
     hydrated,
     latestProgressQuery.data?.progress?.build.conversationId,
+    latestProgressQuery.isError,
     latestProgressQuery.isLoading,
     scopedConversation,
     setActive,
     state.conversations,
-    updateTitle,
   ]);
 
   const progressQuery = trpc.workspace.knowledgeProgress.useQuery(
@@ -765,6 +790,36 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
       loading={progressQuery.isLoading}
     />
   );
+
+  if (latestProgressQuery.isError) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+        <div className="max-w-lg rounded-2xl border bg-muted/30 p-7 text-center">
+          <p className="font-medium">构建会话读取失败</p>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">
+            尚未创建新的构建会话，请先恢复已有会话状态。
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            className="mt-4"
+            onClick={() => void latestProgressQuery.refetch()}
+          >
+            重新读取
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (latestProgressQuery.isLoading || !latestProgressQuery.data) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center gap-2 p-6 text-sm text-muted-foreground">
+        <Loader2 className="h-5 w-5 animate-spin text-primary" />
+        正在恢复构建会话…
+      </div>
+    );
+  }
 
   return (
     <div

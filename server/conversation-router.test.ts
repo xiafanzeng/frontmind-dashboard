@@ -11,6 +11,7 @@ import {
 import {
   buildMessageMetadata,
   collectSnapshotResourceRefs,
+  conversationSyncMysqlErrorCode,
   conversationSnapshotSchema,
   discardClientClaimedServerOwnedKnowledgeBaseMessages,
   getActiveCredentialId,
@@ -19,6 +20,7 @@ import {
   mergeConversationTaskPointers,
   permanentlyDeleteConversation,
   repairSnapshotMessageIds,
+  retryConversationSyncTransaction,
   resolveSnapshotCredentialId,
   sanitizeKnowledgeBaseDeletionTombstones,
   validateUpstreamResourceAccess,
@@ -26,6 +28,57 @@ import {
 } from "./conversation-router";
 
 type SnapshotMessage = ConversationSnapshot["messages"][number];
+
+describe("conversation snapshot transaction retry", () => {
+  it("finds a nested MySQL deadlock behind a wrapper error code", () => {
+    const inner = Object.assign(new Error("deadlock"), {
+      code: "ER_LOCK_DEADLOCK",
+      errno: 1213,
+    });
+    const outer = Object.assign(new Error("Failed query"), {
+      code: "ER_QUERY_WRAPPER",
+      cause: inner,
+    });
+
+    expect(conversationSyncMysqlErrorCode(outer)).toBe("ER_LOCK_DEADLOCK");
+    expect(conversationSyncMysqlErrorCode({ sqlState: "40001" })).toBe(
+      "ER_LOCK_DEADLOCK",
+    );
+  });
+
+  it("restarts the whole transaction after transient failures", async () => {
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const operation = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error("deadlock"), { errno: 1213 }),
+      )
+      .mockRejectedValueOnce(
+        Object.assign(new Error("duplicate create"), {
+          code: "ER_DUP_ENTRY",
+        }),
+      )
+      .mockResolvedValue("saved");
+
+    await expect(
+      retryConversationSyncTransaction(operation, { sleep }),
+    ).resolves.toBe("saved");
+    expect(operation).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenNthCalledWith(1, 10);
+    expect(sleep).toHaveBeenNthCalledWith(2, 20);
+  });
+
+  it("does not retry a deterministic application failure", async () => {
+    const operation = vi.fn().mockRejectedValue(new Error("forbidden"));
+
+    await expect(
+      retryConversationSyncTransaction(operation, {
+        sleep: vi.fn(),
+      }),
+    ).rejects.toThrow("forbidden");
+    expect(operation).toHaveBeenCalledTimes(1);
+  });
+});
 
 function message(
   id: string,

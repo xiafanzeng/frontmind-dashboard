@@ -4,8 +4,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   resetRefetch: vi.fn(),
   knowledgeRefetch: vi.fn(),
+  progressRefetch: vi.fn(),
+  setProgressData: vi.fn(),
+  createConversation: vi.fn(),
   discardConversationLocally: vi.fn(),
   activeConversation: null as any,
+  resetIsError: false,
+  progressIsError: false,
+  progressData: { progress: null } as any,
   resetStatus: {
     revision: 0,
     hasKnowledge: false,
@@ -21,7 +27,11 @@ vi.mock("@/_core/hooks/useAuth", () => ({
 }));
 vi.mock("@/contexts/ConversationContext", () => ({
   useConversation: () => ({
+    state: { conversations: [] },
     activeConversation: mocks.activeConversation,
+    hydrated: true,
+    createConversation: mocks.createConversation,
+    setActive: vi.fn(),
     discardConversationLocally: mocks.discardConversationLocally,
   }),
 }));
@@ -36,7 +46,20 @@ vi.mock("@/pages/Home", () => ({
 }));
 vi.mock("@/lib/trpc", () => ({
   trpc: {
+    useUtils: () => ({
+      workspace: {
+        knowledgeProgress: { setData: mocks.setProgressData },
+      },
+    }),
     workspace: {
+      knowledgeProgress: {
+        useQuery: () => ({
+          data: mocks.progressData,
+          isLoading: false,
+          isError: mocks.progressIsError,
+          refetch: mocks.progressRefetch,
+        }),
+      },
       knowledge: {
         useQuery: () => ({
           data: { snapshot: null },
@@ -48,6 +71,7 @@ vi.mock("@/lib/trpc", () => ({
         status: {
           useQuery: () => ({
             data: mocks.resetStatus,
+            isError: mocks.resetIsError,
             refetch: mocks.resetRefetch,
           }),
         },
@@ -69,7 +93,15 @@ import EmbeddedKnowledgeBasePanel, {
 beforeEach(() => {
   mocks.resetRefetch.mockReset().mockResolvedValue(undefined);
   mocks.knowledgeRefetch.mockReset().mockResolvedValue(undefined);
+  mocks.progressRefetch.mockReset().mockResolvedValue(undefined);
+  mocks.setProgressData.mockReset();
+  mocks.createConversation
+    .mockReset()
+    .mockReturnValue("knowledge-conversation");
   mocks.discardConversationLocally.mockReset();
+  mocks.resetIsError = false;
+  mocks.progressIsError = false;
+  mocks.progressData = { progress: null };
   mocks.activeConversation = null;
   mocks.resetStatus = {
     revision: 0,
@@ -82,6 +114,50 @@ beforeEach(() => {
 });
 
 describe("EmbeddedKnowledgeBasePanel reset action", () => {
+  it("does not mount the build flow before reset status is known", () => {
+    mocks.resetStatus = undefined;
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("正在确认知识库重置状态…")).toBeInTheDocument();
+    expect(mocks.createConversation).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when reset status cannot be read", () => {
+    mocks.resetStatus = undefined;
+    mocks.resetIsError = true;
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("知识库状态读取失败")).toBeInTheDocument();
+    expect(mocks.createConversation).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the latest build conversation cannot be read", () => {
+    mocks.progressData = undefined;
+    mocks.progressIsError = true;
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("构建会话读取失败")).toBeInTheDocument();
+    expect(mocks.createConversation).not.toHaveBeenCalled();
+  });
+
   it("keeps the reset action visible before completion and refreshes it when build progress starts", () => {
     render(
       <EmbeddedKnowledgeBasePanel

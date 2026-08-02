@@ -81,6 +81,33 @@ describe("ConversationProvider cloud hydration", () => {
     ]);
   });
 
+  it("single-flights creation of the same blank knowledge-base conversation", async () => {
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+    mocks.syncSnapshot.mockClear();
+
+    let firstId = "";
+    let secondId = "";
+    act(() => {
+      firstId = result.current.createConversation({
+        title: "企业知识库构建",
+        reuseEmpty: true,
+      });
+      secondId = result.current.createConversation({
+        title: "企业知识库构建",
+        reuseEmpty: true,
+      });
+    });
+
+    expect(secondId).toBe(firstId);
+    expect(
+      result.current.state.conversations.filter(
+        (item) => item.title === "企业知识库构建",
+      ),
+    ).toHaveLength(1);
+    await waitFor(() => expect(mocks.syncSnapshot).toHaveBeenCalledTimes(1));
+  });
+
   it("collapses an optimistic request and its canonical server turn on first hydration", async () => {
     const canonicalId = knowledgeBaseUserMessagePublicId("turn-1");
     mocks.listRefetch.mockResolvedValueOnce({
