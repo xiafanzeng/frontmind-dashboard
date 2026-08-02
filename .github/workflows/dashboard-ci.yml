@@ -126,8 +126,21 @@ jobs:
         run: pnpm test:kb:mysql-e2e-acceptance
       - if: matrix.suite == 'migration-upgrade-base-ref'
         env:
-          FRONTMIND_UPGRADE_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || format('{0}^', github.sha) }}
-        run: node scripts/ci-verify-mysql-migration-upgrade.mjs
+          FRONTMIND_PR_BASE_REF: ${{ github.base_ref }}
+          FRONTMIND_PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            FRONTMIND_UPGRADE_BASE_REF="origin/$FRONTMIND_PR_BASE_REF"
+          elif [[ "$GITHUB_EVENT_NAME" == push && "$FRONTMIND_PUSH_BEFORE" =~ ^[a-f0-9]{40}$ && ! "$FRONTMIND_PUSH_BEFORE" =~ ^0+$ ]]; then
+            # A push can contain several commits. Test the complete remote
+            # before -> current range, not only the final commit's parent.
+            FRONTMIND_UPGRADE_BASE_REF="$FRONTMIND_PUSH_BEFORE"
+          else
+            FRONTMIND_UPGRADE_BASE_REF="$GITHUB_SHA^"
+          fi
+          export FRONTMIND_UPGRADE_BASE_REF
+          node scripts/ci-verify-mysql-migration-upgrade.mjs
       - if: matrix.suite == 'migration-upgrade-historical'
         env:
           FRONTMIND_UPGRADE_BASE_IDX: 44

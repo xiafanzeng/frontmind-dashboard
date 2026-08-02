@@ -346,6 +346,40 @@ describe("database schema contract", () => {
     ]);
   });
 
+  it("normalizes MySQL 8.4 escaped character-set JSON defaults without hiding drift", async () => {
+    const contract = await currentContract();
+    const rows = metadataRows(contract);
+    const attachmentDefault = rows.columns.find(
+      (column) =>
+        column.tableName === "conversation_turns" &&
+        column.columnName === "attachmentFileIds",
+    )!;
+    const metadataDefault = rows.columns.find(
+      (column) =>
+        column.tableName === "conversation_turns" &&
+        column.columnName === "metadata",
+    )!;
+
+    attachmentDefault.columnDefault = "_utf8mb4\\'[]\\'";
+    attachmentDefault.extra = "DEFAULT_GENERATED";
+    metadataDefault.columnDefault = "_utf8mb4\\'{}\\'";
+    metadataDefault.extra = "DEFAULT_GENERATED";
+
+    await expect(
+      evaluateDatabaseSchema(databaseFromRows(rows), contract),
+    ).resolves.toMatchObject({ status: "exact", differences: [] });
+
+    attachmentDefault.columnDefault = "_utf8mb4\\'[1]\\'";
+    const drift = await evaluateDatabaseSchema(
+      databaseFromRows(rows),
+      contract,
+    );
+    expect(drift.status).toBe("diverged");
+    expect(drift.differences).toEqual([
+      expect.stringMatching(/\.default\.value$/u),
+    ]);
+  });
+
   it("compares defaults, on-update clauses, charsets, collations, and CHECK bodies", async () => {
     const contract = await currentContract();
     const cases: Array<{

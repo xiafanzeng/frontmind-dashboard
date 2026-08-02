@@ -49,6 +49,27 @@ Dashboard readiness 必须包含完整 migration journal，状态只有
 `exact | pending | ahead | diverged`；当 ledger 为 `exact` 时还必须逐项核对完整
 Schema contract，Schema 状态必须为 `exact`，否则运行服务拒绝就绪。
 
+### 1.2 最快上线与 1Panel 边界
+
+常规发布的操作入口只有 `main`，不需要登录 1Panel 或 SSH：
+
+```text
+Dashboard / Website 工作区 0 changes
+-> 分别提交并推送 main
+-> 各自 CI 全绿并签名镜像 digest
+-> 受限 SSH forced-command 调用固定服务 controller
+-> /readyz 同时核对 source SHA 与 image digest
+-> 成功原子更新 current / previous，失败自动回滚
+```
+
+1Panel 仅用于人工查看容器、日志、资源和反向代理，不是发布控制面。不应在
+1Panel 内把 digest 改成可变 tag、手工点击重建、修改生产环境变量或运行 migration。
+服务器的唯一发布事实来自 root-owned controller policy、精确 digest 和原子 state。
+
+首次切换、事故核验或 contract 维护窗可由管理员直接 SSH 执行本文的 root
+命令；这不代表恢复“服务器 `git pull` + 挂载源码”。SSH 上仍只验签、拉取和运行
+CI 已生成的精确镜像；CI 未全绿时禁止绕过流水线从本地或服务器构建代替。
+
 ## 2. CI 行为
 
 Dashboard 的 [dashboard-ci.yml](../../.github/workflows/dashboard-ci.yml) 在 PR
@@ -120,13 +141,13 @@ Dashboard 仓库：
 
 Website 仓库：
 
-| 类型     | 名称                             | 内容                                       |
-| -------- | -------------------------------- | ------------------------------------------ |
-| Secret   | `WEBSITE_DEPLOY_SSH_PRIVATE_KEY` | 只绑定 Website forced-command 的另一把私钥 |
-| Secret   | `WEBSITE_DEPLOY_KNOWN_HOSTS`     | 人工核验过的生产主机公钥                   |
-| Variable | `WEBSITE_DEPLOY_HOST`            | 生产 SSH 主机名或 IP                       |
-| Variable | `WEBSITE_DEPLOY_PORT`            | SSH 端口，空值按 22                        |
-| Variable | `WEBSITE_DEPLOY_USER`            | 固定为 `frontmind-deploy`                  |
+| 类型     | 名称                             | 内容                                         |
+| -------- | -------------------------------- | -------------------------------------------- |
+| Secret   | `WEBSITE_DEPLOY_SSH_PRIVATE_KEY` | 只绑定 Website forced-command 的另一把私钥   |
+| Secret   | `WEBSITE_DEPLOY_KNOWN_HOSTS`     | 人工核验过的生产主机公钥                     |
+| Variable | `WEBSITE_DEPLOY_HOST`            | 生产 SSH 主机名或 IP                         |
+| Variable | `WEBSITE_DEPLOY_PORT`            | SSH 端口，空值按 22                          |
+| Variable | `WEBSITE_DEPLOY_USER`            | 固定为 `frontmind-deploy`                    |
 | Variable | `WEBSITE_AUTO_DEPLOY_ENABLED`    | 首次 bootstrap 前为 `false`，完成后为 `true` |
 
 `GITHUB_TOKEN` 由 Actions 自动提供，用于 GHCR 和 OIDC，不新增长期 GHCR 写入
@@ -181,8 +202,9 @@ UID/GID `10001:10001`；Website 固定 `10002:10002`，两者不可混用。
    readiness 只读 ledger/information_schema，migrator 只在一次性容器持有目标库
    DDL，backup 只读，restore 可重建目标库；
 4. root 执行 `docker login ghcr.io`，令牌只需 `packages:read`；
-5. 在 1Panel 中从上述两个服务器路径分别创建 Compose，反向代理继续指向
-   `127.0.0.1:3001` 与 `127.0.0.1:8888`；不要再挂载源码或安装依赖；
+5. Compose 由 controller 直接从上述两个服务器路径运行，1Panel 只观察运行结果；
+   现有反向代理继续指向 `127.0.0.1:3001` 与 `127.0.0.1:8888`，不要再挂载源码或
+   在服务器安装项目依赖；
 6. 首次手工触发 PDF runtime workflow；
 7. 首次切换前只读核验生产 ledger 是镜像 journal 的严格有序前缀，并导出原
    1Panel 配置；

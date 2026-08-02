@@ -73,6 +73,27 @@ describe("release workflow source-ordering contracts", () => {
     }
   });
 
+  it("upgrades MySQL from the complete multi-commit push base", async () => {
+    const workflow = await readFile(dashboardWorkflow, "utf8");
+    const upgradeStep = workflow.slice(
+      workflow.indexOf(
+        "      - if: matrix.suite == 'migration-upgrade-base-ref'",
+      ),
+      workflow.indexOf(
+        "      - if: matrix.suite == 'migration-upgrade-historical'",
+      ),
+    );
+
+    expect(upgradeStep).toContain(
+      "FRONTMIND_PUSH_BEFORE: ${{ github.event.before }}",
+    );
+    expect(upgradeStep).toContain(
+      'FRONTMIND_UPGRADE_BASE_REF="$FRONTMIND_PUSH_BEFORE"',
+    );
+    expect(upgradeStep).toContain('FRONTMIND_UPGRADE_BASE_REF="$GITHUB_SHA^"');
+    expect(upgradeStep).not.toContain("format('{0}^', github.sha)");
+  });
+
   it("binds a dispatched PDF revision to the signed promoted digest and current tree", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const producer = await readFile(pdfDockerfile, "utf8");

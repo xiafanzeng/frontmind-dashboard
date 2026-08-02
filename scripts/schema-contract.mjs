@@ -623,6 +623,17 @@ function databaseLiteral(value) {
   }
 }
 
+function normalizeInformationSchemaDefaultExpression(value) {
+  const raw = String(value).trim();
+  // MySQL 8.4 can expose a character-set introduced expression literal from
+  // INFORMATION_SCHEMA.COLUMNS with the delimiter quotes backslash-escaped,
+  // for example _utf8mb4\'[]\'. Convert only that complete metadata form into
+  // ordinary SQL syntax; the normal tokenizer still validates the payload and
+  // the resulting literal is still compared against the schema contract.
+  const escapedLiteral = raw.match(/^(_[A-Za-z0-9]+)\\'([\s\S]*)\\'$/u);
+  return escapedLiteral ? `${escapedLiteral[1]}'${escapedLiteral[2]}'` : raw;
+}
+
 function defaultFromSnapshot(column) {
   if (!Object.hasOwn(column, "default")) return null;
   const value = column.default;
@@ -656,6 +667,10 @@ function defaultFromDatabase(value, type, extra) {
   } else {
     raw = String(value);
   }
+  const defaultGenerated = /default_generated/iu.test(extra);
+  if (defaultGenerated) {
+    raw = normalizeInformationSchemaDefaultExpression(raw);
+  }
   if (type === "json") {
     const literal = databaseLiteral(raw);
     const jsonCandidate = literal === undefined ? raw : literal;
@@ -680,7 +695,7 @@ function defaultFromDatabase(value, type, extra) {
   }
   const literal = databaseLiteral(raw);
   if (literal !== undefined) return { kind: "literal", value: literal };
-  if (/default_generated/iu.test(extra)) {
+  if (defaultGenerated) {
     return { kind: "expression", value: normalizeSqlExpression(raw) };
   }
   if (type === "boolean") {

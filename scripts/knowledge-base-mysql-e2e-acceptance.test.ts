@@ -612,6 +612,14 @@ mysqlDescribe(
       }
       try {
         if (pool && userId) {
+          // Generated skill uploads are durably recorded in the security
+          // ownership ledger. That ledger intentionally RESTRICTs credential
+          // deletion, so remove the account-owned ledger rows before deleting
+          // the credential (the same ordering used by managed-user deletion).
+          await pool.execute(
+            "DELETE FROM upstream_resources WHERE userId = ?",
+            [userId],
+          );
           await pool.execute(
             "UPDATE knowledge_base_builds SET publishedSnapshotId = NULL WHERE userId = ?",
             [userId],
@@ -640,14 +648,18 @@ mysqlDescribe(
                (SELECT COUNT(*) FROM users WHERE id = ?) AS users,
                (SELECT COUNT(*) FROM knowledge_base_builds WHERE userId = ?) AS builds,
                (SELECT COUNT(*) FROM conversations WHERE userId = ?) AS conversations,
-               (SELECT COUNT(*) FROM knowledge_base_snapshots WHERE userId = ?) AS snapshots`,
-            [userId, userId, userId, userId],
+               (SELECT COUNT(*) FROM knowledge_base_snapshots WHERE userId = ?) AS snapshots,
+               (SELECT COUNT(*) FROM upstream_resources WHERE userId = ?) AS resources,
+               (SELECT COUNT(*) FROM api_credentials WHERE userId = ?) AS credentials`,
+            [userId, userId, userId, userId, userId, userId],
           );
           expect(remaining[0]).toMatchObject({
             users: 0,
             builds: 0,
             conversations: 0,
             snapshots: 0,
+            resources: 0,
+            credentials: 0,
           });
         }
       } catch (error) {
@@ -1079,6 +1091,7 @@ mysqlDescribe(
           ],
         },
       });
+      const readsAfterInitialProjection = authoritativeTaskReads;
       for (let replay = 0; replay < 2; replay += 1) {
         expect(await reconcileKnowledgeBase(initial.task.id)).toMatchObject({
           notice: null,
@@ -1090,6 +1103,7 @@ mysqlDescribe(
           },
         });
       }
+      expect(authoritativeTaskReads).toBe(readsAfterInitialProjection);
 
       const unauthenticatedLogo = await fetch(
         `${dashboardListener.baseUrl}/api/knowledge-base/artifacts/${build.id}/logo`,
@@ -1214,6 +1228,7 @@ mysqlDescribe(
               resources: [],
             },
           });
+          const readsBeforeSettledReconcile = authoritativeTaskReads;
           expect(await reconcileKnowledgeBase(result.task.id)).toMatchObject({
             notice: null,
             interaction: {
@@ -1226,6 +1241,7 @@ mysqlDescribe(
               },
             },
           });
+          expect(authoritativeTaskReads).toBe(readsBeforeSettledReconcile);
         }
         const postCount = operationTaskPosts.get(turn.operationKey!);
         const uploadCount = uploadedFileSequence;
@@ -1256,13 +1272,33 @@ mysqlDescribe(
 
       expect(logoDownloads).toBe(1);
       expect(packageDownloads).toBe(1);
-      expect(authoritativeTaskReads).toBe(FINAL_REVISION + 1);
+      // Every create response in this fixture is already authoritative and is
+      // committed into the local projection before the HTTP response returns.
+      // Focus/online reconcile wakes must therefore be local immutable reads,
+      // not nine redundant provider GETs.
+      expect(authoritativeTaskReads).toBe(0);
       expect(uploadedFileSequence).toBe(FINAL_REVISION + 1);
       expect(uploadedFileBytes.size).toBe(FINAL_REVISION + 1);
       expect(operationTaskPosts.size).toBe(FINAL_REVISION + 1);
       expect([...operationTaskPosts.values()]).toEqual(
         Array(FINAL_REVISION + 1).fill(1),
       );
+      const [resourceLedgerRows] = await pool.query<RowDataPacket[]>(
+        `SELECT
+           COUNT(*) AS resourceCount,
+           SUM(kind = 'file') AS fileResourceCount,
+           COUNT(DISTINCT apiCredentialId) AS credentialCount
+         FROM upstream_resources
+         WHERE userId = ?`,
+        [userId],
+      );
+      expect(Number(resourceLedgerRows[0]?.resourceCount || 0)).toBe(
+        FINAL_REVISION + 1,
+      );
+      expect(Number(resourceLedgerRows[0]?.fileResourceCount || 0)).toBe(
+        FINAL_REVISION + 1,
+      );
+      expect(Number(resourceLedgerRows[0]?.credentialCount || 0)).toBe(1);
 
       const finalBuild = (
         await executor
