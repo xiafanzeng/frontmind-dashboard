@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  API_USAGE_SCAN_CONCURRENCY,
   apiUsageSeverity,
   assertManagedApiKeyTarget,
   isRollingUsageSnapshotCurrent,
@@ -12,6 +13,10 @@ import {
   usageCredentialPoolKey,
   usageSnapshotUsageValues,
 } from "./api-usage-snapshot-service";
+
+it("serializes overlapping historical credential scans", () => {
+  expect(API_USAGE_SCAN_CONCURRENCY).toBe(1);
+});
 
 describe("apiUsageSeverity", () => {
   it("warns exactly at 184,000 of the default 230,000 limit", () => {

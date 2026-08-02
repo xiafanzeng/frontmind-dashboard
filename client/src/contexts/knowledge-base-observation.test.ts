@@ -351,6 +351,8 @@ describe("authoritative KB observation reducer", () => {
       "kb:turn-1:invalid-protocol",
     );
     expect(twice.knowledgeBase?.notice?.retryable).toBe(true);
+    expect(twice.status).toBe("error");
+    expect(twice.knowledgeBase?.interactionState).toBe("failed");
     expect(twice.knowledgeBase?.revision).toBe(1);
     expect(twice.knowledgeBase?.leafId).toBe("1.2");
     expect(

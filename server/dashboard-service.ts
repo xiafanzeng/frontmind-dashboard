@@ -61,6 +61,10 @@ import {
   selectPhysicalCredentialRows,
   usageCoverageSupportsRetiredCredential,
 } from "./api-usage-ledger";
+import {
+  buildRollingUsageTaskParams,
+  usagePageReachedCutoff,
+} from "./upstream-task-usage";
 
 const CREDIT_PAGE_LIMIT = 100;
 const CREDIT_MAX_PAGES = 20;
@@ -1675,8 +1679,11 @@ export function aggregateSharedKeyCreditUsagePage(input: {
   // Do not trust one out-of-order item as an end-of-window sentinel. The
   // requested upstream order is descending, but a whole page outside the
   // window is the minimum safe signal for stopping pagination.
-  reachedCutoff =
-    complete && datedTaskCount > 0 && expiredTaskCount === datedTaskCount;
+  reachedCutoff = usagePageReachedCutoff({
+    complete,
+    datedTaskCount,
+    expiredTaskCount,
+  });
 
   return { totalUsed, accountUsed, recentTasks, reachedCutoff, complete };
 }
@@ -1974,11 +1981,12 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
     const seenForCredential = new Set<string>();
     const seenCursors = new Set<string>();
     for (let pageIndex = 0; pageIndex < CREDIT_MAX_PAGES; pageIndex += 1) {
-      const params = new URLSearchParams({
-        limit: String(CREDIT_PAGE_LIMIT),
-        order: "desc",
+      const params = buildRollingUsageTaskParams({
+        limit: CREDIT_PAGE_LIMIT,
+        startAt: period.startAt,
+        endAt: period.endAt,
+        after,
       });
-      if (after) params.set("after", after);
       let response: globalThis.Response;
       try {
         response = await fetch(
@@ -2110,6 +2118,11 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
           }),
         });
       }
+      const pageReachedCutoff = usagePageReachedCutoff({
+        complete: pageComplete,
+        datedTaskCount,
+        expiredTaskCount,
+      });
       const ledgerWrite = await recordUsageLedgerEntries({
         executor: db,
         scope: "managed_user",
@@ -2145,6 +2158,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
       });
       if (!ledgerWrite.complete) pageComplete = false;
       if (!pageComplete) credentialComplete = false;
+      if (pageReachedCutoff) break;
       after =
         String(
           payload?.last_id ??

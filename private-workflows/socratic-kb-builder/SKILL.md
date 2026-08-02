@@ -83,6 +83,9 @@ Never put any of the following in formal prose or in the customer-facing turn:
 - task or collection process, including “本轮”“本次采集”“本包”“本知识库”,
   extraction failures, evidence sufficiency, verification status or source
   selection;
+- standalone collection/progress acknowledgements such as “正在采集”, “处理中”
+  or “稍后生成”; the initial turn may end only after the first complete leaf,
+  full manifest and validated official Logo have all been returned;
 - filler or intermediate wording, including “补充说明”“第 N 个内容节点” and
   “本轮整理结果”;
 - reader, customer, buyer or compliance advice, including “客户应”“采购方应”,

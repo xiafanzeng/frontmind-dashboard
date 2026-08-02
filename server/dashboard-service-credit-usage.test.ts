@@ -119,6 +119,28 @@ describe("shared API Key credit usage", () => {
     });
   });
 
+  it("stops once a complete page is entirely older than the rolling window", () => {
+    const now = Date.parse("2026-08-02T08:00:00.000Z");
+    const cutoff = now - 30 * 86_400_000;
+    const result = aggregateSharedKeyCreditUsagePage({
+      tasks: [
+        { id: "old-a", created_at: cutoff - 1, credit_usage: 99 },
+        { id: "old-b", created_at: cutoff - 2, credit_usage: 88 },
+      ],
+      ownedTaskIds: new Set(["old-a", "old-b"]),
+      cutoff,
+      endExclusive: now,
+      seenTaskIds: new Set(),
+    });
+
+    expect(result).toMatchObject({
+      totalUsed: 0,
+      accountUsed: 0,
+      reachedCutoff: true,
+      complete: true,
+    });
+  });
+
   it("uses an exact rolling 30-day boundary while formatting in Asia/Shanghai", () => {
     const now = Date.parse("2026-08-02T08:00:00.000Z");
     const period = getShanghaiRollingUsagePeriod(30, now);

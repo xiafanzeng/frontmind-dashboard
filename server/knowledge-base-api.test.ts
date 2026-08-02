@@ -439,6 +439,11 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("不得采集或打包品牌主视觉、业务图");
     expect(prompt).toContain("取得合格 Logo 后立即停止所有图片发现");
     expect(prompt).toContain("后续所有节点与当前节点修订轮次一律纯文字");
+    expect(prompt).toContain("资料采集状态只由 Dashboard 展示");
+    expect(prompt).toContain("不得复述、输出或以“正在采集”“处理中”");
+    expect(prompt).not.toContain(
+      "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
+    );
     expect(prompt).toContain("imageState=no_eligible_asset");
     expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(10_000);
     expect(prompt).not.toContain("# Skill");

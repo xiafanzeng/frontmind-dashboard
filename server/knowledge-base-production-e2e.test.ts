@@ -2012,7 +2012,7 @@ describe("knowledge-base production final-package acceptance", () => {
     );
   }, 120_000);
 
-  it("persists three settled failures only for the exact active task", async () => {
+  it("returns the durable third settled failure only for the exact active task", async () => {
     const state = initialState();
     const buildId = "44444444-4444-4444-8444-444444444444";
     const turnId = "55555555-5555-4555-8555-555555555555";
@@ -2085,9 +2085,10 @@ describe("knowledge-base production final-package acceptance", () => {
       updatedAt: now,
     });
     dependencies.getDb.mockResolvedValue(memoryDatabase(state));
-    const { observeKnowledgeBaseProtocolFailure } = await import(
-      "./knowledge-base-progress-service"
-    );
+    const {
+      observeKnowledgeBaseProtocolFailure,
+      reconcileKnowledgeBaseProgress,
+    } = await import("./knowledge-base-progress-service");
     const observe = (second: number, observedTaskId = taskId) =>
       observeKnowledgeBaseProtocolFailure({
         userId: USER_ID,
@@ -2121,20 +2122,44 @@ describe("knowledge-base production final-package acceptance", () => {
     state.turns[0]!.status = "running";
     state.turns[0]!.completedAt = null;
     await expect(observe(0, "stale-task")).resolves.toBe(false);
-    await expect(observe(0)).resolves.toBe(false);
-    await expect(observe(5)).resolves.toBe(false);
-    await expect(observe(10)).resolves.toBe(true);
+    vi.useFakeTimers();
+    try {
+      for (const second of [0, 5, 10]) {
+        vi.setSystemTime(
+          new Date(`2026-08-01T00:00:${String(second).padStart(2, "0")}.000Z`),
+        );
+        const progress = await reconcileKnowledgeBaseProgress({
+          userId: USER_ID,
+          conversationId: PUBLIC_CONVERSATION_ID,
+          taskId,
+          output: [
+            {
+              role: "assistant",
+              content: [
+                { type: "output_text", text: "stable invalid terminal output" },
+              ],
+            },
+          ],
+          upstreamStatus: "completed",
+        });
+        expect(progress.build.status).toBe(
+          second === 10 ? "protocol_error" : "confirming",
+        );
+      }
+    } finally {
+      vi.useRealTimers();
+    }
     expect(state.builds[0]).toMatchObject({
       status: "protocol_error",
       stateEpoch: 5,
       activeTurnId: turnId,
-      protocolErrorCode: "UPSTREAM_TASK_READ_FAILED",
+      protocolErrorCode: "PROGRESS_PROTOCOL_INVALID",
     });
     expect(state.nodes[0]!.contentMarkdown).toBe(approvedBody);
     expect(state.turns[0]).toMatchObject({
       status: "failed",
       upstreamTaskId: taskId,
-      errorCode: "UPSTREAM_TASK_READ_FAILED",
+      errorCode: "PROGRESS_PROTOCOL_INVALID",
       leaseExpiresAt: null,
     });
   });

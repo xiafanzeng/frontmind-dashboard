@@ -33,6 +33,11 @@ export const DEFAULT_API_USAGE_LIMIT = 230_000;
 export const DEFAULT_API_USAGE_WARNING_RATIO = 0.8;
 export const DEFAULT_API_USAGE_WINDOW_DAYS = 30;
 export const API_USAGE_SNAPSHOT_FRESHNESS_MS = 30 * 60 * 1_000;
+// A current-Key group may also scan credentials from an account's history.
+// Serialize groups until that historical work is deduplicated by physical
+// fingerprint; concurrent groups can otherwise invalidate each other's
+// coverage claim and turn a complete total into PARTIAL_TASK_SCAN.
+export const API_USAGE_SCAN_CONCURRENCY = 1;
 
 type ApiUsageScope = "website_frontend" | "managed_user";
 type ApiUsageSeverity = "normal" | "warning" | "critical" | "unavailable";
@@ -1480,7 +1485,7 @@ export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
   );
   await mapWithConcurrency(
     [...accountIdsByCredential.values()],
-    3,
+    API_USAGE_SCAN_CONCURRENCY,
     async ({
       fingerprint,
       credentialOwnerIds,

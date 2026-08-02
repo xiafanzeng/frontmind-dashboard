@@ -3234,7 +3234,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
     // Deliberately do not update the output ledger on failure. A provider may
     // append a missing companion resource to the same cumulative output; the
     // next observation must revalidate that complete bundle.
-    const persisted = await observeKnowledgeBaseProtocolFailure({
+    await observeKnowledgeBaseProtocolFailure({
       userId: input.userId,
       conversationId,
       taskId: input.taskId,
@@ -3246,13 +3246,11 @@ export async function reconcileKnowledgeBaseProgress(input: {
       }),
       message,
     });
-    if (!persisted) {
-      const progress = await getKnowledgeBaseProgress({
-        userId: input.userId,
-        conversationId,
-      });
-      if (progress) return progress;
-    }
+    const progress = await getKnowledgeBaseProgress({
+      userId: input.userId,
+      conversationId,
+    });
+    if (progress) return progress;
     throw new KnowledgeBaseBuildError("PROGRESS_PROTOCOL_INVALID", message);
   }
 }

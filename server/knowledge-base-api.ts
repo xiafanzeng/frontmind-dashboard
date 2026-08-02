@@ -60,7 +60,6 @@ import { getDb } from "./db";
 import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
 import { buildDeterministicTaskAttachmentArchive } from "./task-attachment-package";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
-import { KNOWLEDGE_COLLECTION_STATUS_COPY } from "../shared/knowledge-base-copy";
 import { extractKnowledgeBaseProtocolObjects } from "../shared/knowledge-base-output";
 import {
   canonicalKnowledgeBaseSkillArchiveHash,
@@ -2581,7 +2580,7 @@ export async function buildKnowledgeBasePrompt({
     "客户可见回复只输出知识树统计（仅首轮需要）和实际展示节点的完整正文/合规配图。不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题；所有来源只进入内部证据文件。可见正文结束后直接附机器信封。",
     "客户可见正文不得嵌入官网或 CDN 图片外链。图片必须先下载真实字节、解码校验并打入最终 ZIP，再以包内相对路径引用；防盗链、签名、过期或无法下载的地址只能进入内部来源记录，绝不能作为客户图片返回。",
     "首轮必须只采集并返回一张企业官方主 Logo；取得合格 Logo 后立即停止所有图片发现。不得采集或打包品牌主视觉、业务图、产品/UI/架构图、案例图、团队图或其他图片。只有首轮清单第一个叶子（通常为 1.1 一句话定位）可把已下载验证的本地 Logo 字节作为 output_image 或 image MIME output_file 返回。不得用 favicon、图标、占位图、库存图、官网/CDN 热链或文字说明替代；无法取得合格真实 Logo 字节时不得伪造成功。后续所有节点与当前节点修订轮次一律纯文字，不得搜索、重复或新增图片附件。首轮附件与最终 ZIP 必须使用同一 Logo 字节。",
-    `资料采集阶段统一向客户显示：${KNOWLEDGE_COLLECTION_STATUS_COPY}`,
+    "资料采集状态只由 Dashboard 展示。不得复述、输出或以“正在采集”“处理中”“稍后生成”等过程回执结束任务；首轮只有在返回第一个叶子的完整正文、完整 Manifest 和一张经校验的官方主 Logo 后才可结束。",
     "",
     "## 本次任务输入",
     `构建会话标识：${conversationId || "未提供"}`,
@@ -4767,6 +4766,11 @@ router.post("/progress/reconcile", async (req, res) => {
       currentObservation?.interaction.progress?.build.status;
     const packageRebindRequired =
       currentObservation?.notice?.code === "PACKAGE_REBIND_REQUIRED";
+    const immutableProjection =
+      immutableStatus === "ready_to_publish" ||
+      immutableStatus === "published" ||
+      (!packageRebindRequired &&
+        (immutableStatus === "protocol_error" || immutableStatus === "failed"));
     const preservePackageRebindObservation = () => {
       if (!packageRebindRequired || !currentObservation) return false;
       res.json({
@@ -4776,11 +4780,7 @@ router.post("/progress/reconcile", async (req, res) => {
       });
       return true;
     };
-    if (
-      currentObservation &&
-      (immutableStatus === "ready_to_publish" ||
-        immutableStatus === "published")
-    ) {
+    if (currentObservation && immutableProjection) {
       res.json({
         progress: currentObservation.interaction.progress,
         interaction: currentObservation.interaction,

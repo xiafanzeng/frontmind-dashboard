@@ -32,6 +32,10 @@ import {
   usageCoverageSupportsRetiredCredential,
   usageCoverageSupportsReplacement,
 } from "./api-usage-ledger";
+import {
+  buildRollingUsageTaskParams,
+  usagePageReachedCutoff,
+} from "./upstream-task-usage";
 
 const PRESALES_CREDENTIAL_SLOT = "website";
 export const PRESALES_REVOKABLE_STATUSES = ["active"] as const;
@@ -1042,8 +1046,11 @@ export function aggregatePresalesCreditUsagePage(input: {
       createdAt,
     });
   }
-  reachedCutoff =
-    complete && datedTaskCount > 0 && expiredTaskCount === datedTaskCount;
+  reachedCutoff = usagePageReachedCutoff({
+    complete,
+    datedTaskCount,
+    expiredTaskCount,
+  });
   return {
     keyTotalUsed,
     websiteUsed,
@@ -1226,11 +1233,12 @@ export async function getPresalesCreditUsage(
     const seenForCredential = new Set<string>();
     const seenCursors = new Set<string>();
     for (let page = 0; page < CREDIT_USAGE_MAX_PAGES; page += 1) {
-      const params = new URLSearchParams({
-        limit: String(CREDIT_USAGE_PAGE_LIMIT),
-        order: "desc",
+      const params = buildRollingUsageTaskParams({
+        limit: CREDIT_USAGE_PAGE_LIMIT,
+        startAt: cutoffMs,
+        endAt: usageNow,
+        after,
       });
-      if (after) params.set("after", after);
       let response: globalThis.Response;
       try {
         response = await fetch(
@@ -1337,6 +1345,7 @@ export async function getPresalesCreditUsage(
       });
       if (!ledgerWrite.complete) credentialComplete = false;
       if (!pageUsage.complete) credentialComplete = false;
+      if (pageUsage.reachedCutoff) break;
 
       after =
         String(

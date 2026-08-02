@@ -103,7 +103,22 @@ export async function reconcileKnowledgeBaseObservation(
     signal,
   });
   if (!response.ok) {
-    const error = new Error(await readErrorMessage(response)) as Error & {
+    const message = await readErrorMessage(response);
+    if (response.status === 422) {
+      const projectionResponse = await fetch(
+        `/api/knowledge-base/progress/${encodeURIComponent(input.conversationId)}`,
+        { credentials: "include", signal },
+      );
+      if (projectionResponse.ok) {
+        const projection = normalizeObservation(
+          await projectionResponse.json(),
+        );
+        if (projection.interaction.interactionState === "failed") {
+          return projection;
+        }
+      }
+    }
+    const error = new Error(message) as Error & {
       status?: number;
     };
     error.status = response.status;
