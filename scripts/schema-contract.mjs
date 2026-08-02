@@ -733,6 +733,10 @@ function defaultFromDatabase(value, type, extra) {
   return { kind: "literal", value: raw };
 }
 
+export function normalizeDatabaseColumnDefault(value, type, extra = "") {
+  return defaultFromDatabase(value, normalizeType(type), String(extra ?? ""));
+}
+
 function currentTimestampForType(type) {
   const precision = type.match(/^(?:timestamp|datetime)\((\d+)\)$/u)?.[1];
   return precision

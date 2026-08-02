@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import mysql from "mysql2/promise";
 
+import { normalizeDatabaseColumnDefault } from "./schema-contract.mjs";
+
 const mode = String(process.argv[2] || "").trim();
 if (mode !== "pre" && mode !== "post") {
   throw new Error("API_USAGE_MIGRATION_VERIFY_MODE_REQUIRED:pre|post");
@@ -29,30 +31,19 @@ for (const tag of requiredTags) {
   }
 }
 
-function normalizeDefault(value) {
-  if (value === null || value === undefined) return null;
-  let normalized = String(value).trim().toLowerCase();
-  while (normalized.startsWith("(") && normalized.endsWith(")")) {
-    normalized = normalized.slice(1, -1).trim();
-  }
-  normalized = normalized.replace(/^_utf8mb4/u, "");
-  if (
-    (normalized.startsWith("'") && normalized.endsWith("'")) ||
-    (normalized.startsWith('"') && normalized.endsWith('"'))
-  ) {
-    normalized = normalized.slice(1, -1);
-  }
-  if (normalized === "current_timestamp()") return "current_timestamp";
-  return normalized;
-}
-
 function assertColumn(actualColumns, table, name, expected) {
   const row = actualColumns.get(`${table}.${name}`);
   if (
     !row ||
     String(row.column_type).toLowerCase() !== expected.type ||
     String(row.is_nullable).toUpperCase() !== expected.nullable ||
-    normalizeDefault(row.column_default) !== expected.defaultValue ||
+    JSON.stringify(
+      normalizeDatabaseColumnDefault(
+        row.column_default,
+        row.column_type,
+        row.extra,
+      ),
+    ) !== JSON.stringify(expected.defaultValue) ||
     (expected.onUpdate === true &&
       !String(row.extra || "")
         .toLowerCase()
@@ -177,7 +168,12 @@ try {
   const column = (type, nullable, defaultValue = null, onUpdate = false) => ({
     type,
     nullable,
-    defaultValue,
+    defaultValue:
+      defaultValue === null
+        ? null
+        : defaultValue === "current_timestamp"
+          ? { kind: "expression", value: "current_timestamp()" }
+          : { kind: "literal", value: defaultValue },
     onUpdate,
   });
   const snapshotClaimsApplied = appliedTags.has(requiredTags[0]);

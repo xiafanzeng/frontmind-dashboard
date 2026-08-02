@@ -95,6 +95,7 @@ function mysqlClientCommand(
       arguments: [
         "run",
         "--rm",
+        ...(command === "mysql" ? ["--interactive"] : []),
         "--network",
         "host",
         "-e",
@@ -242,6 +243,29 @@ function configureReleaseDb(input: {
 }
 
 describe("temporary additive release fixture", () => {
+  it("keeps stdin attached when Docker restores a backup", () => {
+    const previousClientMode = process.env[CLIENT_MODE_ENV];
+    process.env[CLIENT_MODE_ENV] = "docker";
+    try {
+      const target: MysqlTarget = {
+        host: "127.0.0.1",
+        port: "3306",
+        username: "acceptance",
+        password: "unused",
+        database: "frontmind_acceptance",
+      };
+      expect(
+        mysqlClientCommand(target, "mysql", target.database).arguments,
+      ).toContain("--interactive");
+      expect(
+        mysqlClientCommand(target, "mysqldump", target.database).arguments,
+      ).not.toContain("--interactive");
+    } finally {
+      if (previousClientMode === undefined) delete process.env[CLIENT_MODE_ENV];
+      else process.env[CLIENT_MODE_ENV] = previousClientMode;
+    }
+  });
+
   it("appends one classified expand migration and a matching schema contract", async () => {
     const temporaryRoot = await mkdtemp(
       path.join(tmpdir(), "frontmind-release-fixture-"),

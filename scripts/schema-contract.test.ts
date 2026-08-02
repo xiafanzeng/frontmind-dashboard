@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   createSchemaContractFromSnapshot,
   evaluateDatabaseSchema,
+  normalizeDatabaseColumnDefault,
   parseSchemaContract,
   schemaContractHash,
   type DatabaseSchemaContract,
@@ -276,7 +277,7 @@ describe("database schema contract", () => {
         column.columnType === "timestamp" &&
         column.extra.includes("DEFAULT_GENERATED"),
     )!;
-    timestampDefault.columnDefault = "CURRENT_TIMESTAMP";
+    timestampDefault.columnDefault = "now()";
     const jsonDefault = rows.columns.find(
       (column) => column.columnType === "json" && column.columnDefault === "[]",
     )!;
@@ -304,6 +305,24 @@ describe("database schema contract", () => {
     await expect(
       evaluateDatabaseSchema(databaseFromRows(rows), contract),
     ).resolves.toMatchObject({ status: "exact", differences: [] });
+
+    expect(
+      normalizeDatabaseColumnDefault(
+        "CURRENT_TIMESTAMP",
+        "timestamp(0)",
+        "DEFAULT_GENERATED",
+      ),
+    ).toEqual({ kind: "expression", value: "current_timestamp()" });
+    expect(
+      normalizeDatabaseColumnDefault("now()", "timestamp", "DEFAULT_GENERATED"),
+    ).toEqual({ kind: "expression", value: "current_timestamp()" });
+    expect(
+      normalizeDatabaseColumnDefault(
+        "CURRENT_TIMESTAMP(3)",
+        "timestamp(3)",
+        "DEFAULT_GENERATED",
+      ),
+    ).toEqual({ kind: "expression", value: "current_timestamp(3)" });
   });
 
   it("normalizes MySQL 8.4 alias casing and JSON metadata values semantically", async () => {
