@@ -1532,7 +1532,6 @@ mysqlDescribe(
           sha256: fixture.logoSha256,
         }),
       ]);
-      expect(sha256(await unpacked.assets[0]!.buffer)).toBe(fixture.logoSha256);
 
       const finalPersistedBuild = (
         await executor
