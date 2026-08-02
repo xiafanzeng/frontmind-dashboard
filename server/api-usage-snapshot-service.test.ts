@@ -12,6 +12,8 @@ import {
   assertManagedApiKeyTarget,
   bulkManagedApiKeyActionTargets,
   bulkPreviousCredentialGroups,
+  claimUsageSnapshotRefresh,
+  isDuplicateApiUsageSnapshotError,
   isRollingUsageSnapshotCurrent,
   latestUsageSnapshotByPolicy,
   resolveEffectiveUsageCredentials,
@@ -20,6 +22,61 @@ import {
   usageCredentialPoolKey,
   usageSnapshotUsageValues,
 } from "./api-usage-snapshot-service";
+
+describe("API usage snapshot duplicate-key detection", () => {
+  it("recognizes direct mysql2 and Drizzle-wrapped duplicate errors", () => {
+    expect(
+      isDuplicateApiUsageSnapshotError({ code: "ER_DUP_ENTRY", errno: 1062 }),
+    ).toBe(true);
+    expect(
+      isDuplicateApiUsageSnapshotError({
+        name: "DrizzleQueryError",
+        cause: { code: "ER_DUP_ENTRY", errno: 1062, sqlState: "23000" },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not misclassify unrelated or cyclic errors", () => {
+    expect(
+      isDuplicateApiUsageSnapshotError({
+        cause: { code: "ER_LOCK_DEADLOCK", errno: 1213 },
+      }),
+    ).toBe(false);
+    const cyclic: { cause?: unknown } = {};
+    cyclic.cause = cyclic;
+    expect(isDuplicateApiUsageSnapshotError(cyclic)).toBe(false);
+  });
+
+  it("claims an existing policy through one atomic insert-or-update statement", async () => {
+    const onDuplicateKeyUpdate = vi.fn().mockResolvedValue(undefined);
+    const values = vi.fn().mockReturnValue({ onDuplicateKeyUpdate });
+    const insert = vi.fn().mockReturnValue({ values });
+    const now = new Date("2026-08-03T01:00:00.000Z");
+
+    const syncToken = await claimUsageSnapshotRefresh({
+      executor: { insert },
+      policy: { id: "policy-existing" },
+      now,
+    });
+
+    expect(insert).toHaveBeenCalledTimes(1);
+    expect(values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        policyId: "policy-existing",
+        syncGeneration: 1,
+        syncToken,
+        syncStartedAt: now,
+      }),
+    );
+    expect(onDuplicateKeyUpdate).toHaveBeenCalledWith({
+      set: expect.objectContaining({
+        syncToken,
+        syncStartedAt: now,
+        updatedAt: now,
+      }),
+    });
+  });
+});
 
 it("serializes overlapping historical credential scans", () => {
   expect(API_USAGE_SCAN_CONCURRENCY).toBe(1);

@@ -12,6 +12,12 @@ const RUNTIME_SECRET_ENV_KEYS = [
 
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 
+function isParameterizedQueryError(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { query?: unknown; params?: unknown };
+  return typeof candidate.query === "string" && Array.isArray(candidate.params);
+}
+
 export function runtimeLogSecrets(
   additional: Iterable<unknown> = [],
   env: RuntimeEnvironment = process.env,
@@ -41,10 +47,16 @@ export function runtimeErrorForLog(
     env?: RuntimeEnvironment;
   } = {},
 ) {
-  return safeErrorForLog(error, {
+  const safe = safeErrorForLog(error, {
     secrets: runtimeLogSecrets(
       options.additionalSecrets,
       options.env ?? process.env,
     ),
   });
+  // DrizzleQueryError embeds the complete parameter list in its outer message.
+  // Dropping only the `params` property is insufficient, so parameterized
+  // query failures receive a fixed operational message.
+  return isParameterizedQueryError(error)
+    ? { ...safe, message: "Database query failed" }
+    : safe;
 }

@@ -13,6 +13,7 @@ import {
   userUsageOwners,
   users,
 } from "../drizzle/schema";
+import { runtimeErrorForLog } from "./_core/runtime-error-log";
 import { usageCoverageSupportsReplacement } from "./api-usage-ledger";
 import {
   AuthServiceError,
@@ -42,6 +43,30 @@ export const API_USAGE_SNAPSHOT_FRESHNESS_MS = 30 * 60 * 1_000;
 export const API_USAGE_SCAN_CONCURRENCY = 1;
 export const API_USAGE_SNAPSHOT_SYNC_LOCK_NAME =
   "frontmind-dashboard:api-usage-snapshot-sync";
+
+/**
+ * Drizzle wraps mysql2 failures in DrizzleQueryError and preserves the native
+ * error under `cause`. Duplicate-key handling must therefore inspect the
+ * bounded cause chain instead of assuming `code` exists on the outer error.
+ */
+export function isDuplicateApiUsageSnapshotError(error: unknown) {
+  const visited = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (!current || typeof current !== "object" || visited.has(current)) break;
+    visited.add(current);
+    const candidate = current as {
+      code?: unknown;
+      errno?: unknown;
+      cause?: unknown;
+    };
+    if (candidate.code === "ER_DUP_ENTRY" || candidate.errno === 1062) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
+}
 
 type ApiUsageSnapshotSyncResult = {
   synced: number;
@@ -1924,7 +1949,7 @@ async function upsertSnapshot(input: {
         createdAt: input.now,
       });
     } catch (error) {
-      if ((error as { code?: string })?.code !== "ER_DUP_ENTRY") throw error;
+      if (!isDuplicateApiUsageSnapshotError(error)) throw error;
       await input.executor
         .update(apiUsageSnapshots)
         .set(values)
@@ -1933,9 +1958,9 @@ async function upsertSnapshot(input: {
   }
 }
 
-async function claimUsageSnapshotRefresh(input: {
+export async function claimUsageSnapshotRefresh(input: {
   executor: any;
-  policy: typeof apiUsagePolicies.$inferSelect;
+  policy: Pick<typeof apiUsagePolicies.$inferSelect, "id">;
   now: Date;
 }) {
   const syncToken = randomUUID();
@@ -1958,20 +1983,17 @@ async function claimUsageSnapshotRefresh(input: {
     createdAt: input.now,
     updatedAt: input.now,
   };
-  try {
-    await input.executor.insert(apiUsageSnapshots).values(initial);
-    return syncToken;
-  } catch (error) {
-    if ((error as { code?: string })?.code !== "ER_DUP_ENTRY") throw error;
-  }
   await input.executor
-    .update(apiUsageSnapshots)
-    .set({
-      syncGeneration: sql`${apiUsageSnapshots.syncGeneration} + 1`,
-      syncToken,
-      syncStartedAt: input.now,
-    })
-    .where(eq(apiUsageSnapshots.policyId, input.policy.id));
+    .insert(apiUsageSnapshots)
+    .values(initial)
+    .onDuplicateKeyUpdate({
+      set: {
+        syncGeneration: sql`${apiUsageSnapshots.syncGeneration} + 1`,
+        syncToken,
+        syncStartedAt: input.now,
+        updatedAt: input.now,
+      },
+    });
   return syncToken;
 }
 
@@ -2340,7 +2362,10 @@ export async function startApiUsageSnapshotScheduler() {
   } as AuthenticatedUser;
   const run = () =>
     syncApiUsageSnapshots(actor).catch((error) => {
-      console.error("[API usage snapshot] Scheduled sync failed", error);
+      console.error(
+        "[API usage snapshot] Scheduled sync failed",
+        runtimeErrorForLog(error),
+      );
     });
   const initial = setTimeout(run, 10_000);
   initial.unref();

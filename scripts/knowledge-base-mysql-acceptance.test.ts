@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { and, eq, lte } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import { migrate } from "drizzle-orm/mysql2/migrator";
 import mysql, {
@@ -10,7 +11,11 @@ import mysql, {
   type RowDataPacket,
 } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { conversations } from "../drizzle/schema";
+import {
+  apiUsagePolicies,
+  apiUsageSnapshots,
+  conversations,
+} from "../drizzle/schema";
 
 import {
   KnowledgeBaseTurnReservationError,
@@ -28,6 +33,7 @@ import {
   runConversationWriteTransaction,
 } from "../server/conversation-router";
 import { cleanupExpiredDeliveryTickets } from "../server/delivery-ticket-retention";
+import { claimUsageSnapshotRefresh } from "../server/api-usage-snapshot-service";
 
 const ACCEPTANCE_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_DATABASE_URL";
 const REQUIRED_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_REQUIRED";
@@ -320,6 +326,92 @@ mysqlDescribe("knowledge-base real MySQL state-machine acceptance", () => {
       ids,
     );
     expect(Number(rows[0]?.conversationCount || 0)).toBe(2);
+  });
+
+  it("atomically reclaims one usage snapshot and lets only the latest delayed claim finalize", async () => {
+    expect(userId).not.toBeNull();
+    const policyId = randomUUID();
+    await executor.insert(apiUsagePolicies).values({
+      id: policyId,
+      policyKey: `managed_user:${userId}:${runId}`,
+      scope: "managed_user",
+      workspaceUserId: userId!,
+    });
+    const [policy] = await executor
+      .select()
+      .from(apiUsagePolicies)
+      .where(eq(apiUsagePolicies.id, policyId));
+    expect(policy).toBeDefined();
+
+    const firstNow = new Date(Date.now() - 10_000);
+    const firstToken = await claimUsageSnapshotRefresh({
+      executor,
+      policy: policy!,
+      now: firstNow,
+    });
+    const secondNow = new Date(Date.now() - 5_000);
+    const secondToken = await claimUsageSnapshotRefresh({
+      executor,
+      policy: policy!,
+      now: secondNow,
+    });
+
+    let rows = await executor
+      .select()
+      .from(apiUsageSnapshots)
+      .where(eq(apiUsageSnapshots.policyId, policyId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      syncGeneration: 2,
+      syncToken: secondToken,
+      syncStatus: "pending",
+    });
+    expect(firstToken).not.toBe(secondToken);
+    expect(rows[0]!.updatedAt.getTime()).toBe(
+      Math.floor(secondNow.getTime() / 1_000) * 1_000,
+    );
+
+    await executor
+      .update(apiUsageSnapshots)
+      .set({ syncStatus: "ok", used: 111, updatedAt: secondNow })
+      .where(
+        and(
+          eq(apiUsageSnapshots.policyId, policyId),
+          eq(apiUsageSnapshots.syncToken, firstToken),
+          lte(apiUsageSnapshots.updatedAt, secondNow),
+        ),
+      );
+    rows = await executor
+      .select()
+      .from(apiUsageSnapshots)
+      .where(eq(apiUsageSnapshots.policyId, policyId));
+    expect(rows[0]).toMatchObject({ syncStatus: "pending", used: 0 });
+
+    await executor
+      .update(apiUsageSnapshots)
+      .set({
+        syncStatus: "ok",
+        used: 222,
+        fetchedAt: secondNow,
+        updatedAt: secondNow,
+      })
+      .where(
+        and(
+          eq(apiUsageSnapshots.policyId, policyId),
+          eq(apiUsageSnapshots.syncToken, secondToken),
+          lte(apiUsageSnapshots.updatedAt, secondNow),
+        ),
+      );
+    rows = await executor
+      .select()
+      .from(apiUsageSnapshots)
+      .where(eq(apiUsageSnapshots.policyId, policyId));
+    expect(rows[0]).toMatchObject({
+      syncStatus: "ok",
+      used: 222,
+      syncGeneration: 2,
+      syncToken: secondToken,
+    });
   });
 
   it("purges expired delivery records while retaining compact workflow facts", async () => {

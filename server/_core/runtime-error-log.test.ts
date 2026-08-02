@@ -1,3 +1,4 @@
+import { DrizzleQueryError } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 
 import { runtimeErrorForLog, runtimeLogSecrets } from "./runtime-error-log";
@@ -56,5 +57,24 @@ describe("runtime error logging", () => {
     expect(serialized).not.toContain("config");
     expect(serialized).not.toContain("response");
     expect(runtimeLogSecrets([], env)).toContain(databasePassword);
+  });
+
+  it("drops Drizzle query parameters and nested database error details", () => {
+    const sensitiveParameter = "credential-fingerprint-value";
+    const error = new DrizzleQueryError(
+      "insert into table values (?)",
+      [sensitiveParameter],
+      Object.assign(new Error(`Duplicate entry ${sensitiveParameter}`), {
+        code: "ER_DUP_ENTRY",
+        errno: 1062,
+      }),
+    );
+
+    const serialized = JSON.stringify(runtimeErrorForLog(error, { env: {} }));
+
+    expect(serialized).toContain("Database query failed");
+    expect(serialized).not.toContain(sensitiveParameter);
+    expect(serialized).not.toContain("params");
+    expect(serialized).not.toContain("cause");
   });
 });
