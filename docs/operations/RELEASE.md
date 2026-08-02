@@ -269,7 +269,9 @@ Dashboard。
   `__drizzle_migrations` 不作为应用表参与 Schema hash。MySQL 为外键隐式生成，且列序
   完全一致、名称严格等于外键名、首列名或 `首列名_数字` 的 BTREE 非唯一索引才会被
   规范化排除；任意文本前缀或列序不同的索引不会被忽略，任何其他未声明索引仍视为
-  漂移。字符字段必须继承表默认值、表必须继承数据库默认值；因此合法的 MySQL 数据库
+  漂移。外键约束名不影响关系语义；只有在本地列、引用表/列、`ON UPDATE` 和
+  `ON DELETE` 全部唯一匹配时，历史短名才规范化为 snapshot 名称；缺失、重复或任何
+  语义不同仍视为漂移。字符字段必须继承表默认值、表必须继承数据库默认值；因此合法的 MySQL 数据库
   默认 collation 不会被误报，但单表或单列 charset/collation 漂移会阻断 readiness。
 
 ledger 为 `pending` 时，plan 只判断严格前缀并把 Schema 标为 `not_checked`，因为旧版

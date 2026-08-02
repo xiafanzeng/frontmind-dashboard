@@ -1300,6 +1300,40 @@ function isAutomaticForeignKeyIndex(index, foreignKeys, declaredIndexNames) {
   });
 }
 
+function foreignKeySemanticIdentity(foreignKey) {
+  return JSON.stringify([
+    foreignKey.columns,
+    foreignKey.referencedTable,
+    foreignKey.referencedColumns,
+    foreignKey.onUpdate,
+    foreignKey.onDelete,
+  ]);
+}
+
+function normalizeDatabaseForeignKeyNames(foreignKeys, expectedForeignKeys) {
+  const expectedBySemantics = new Map();
+  for (const foreignKey of expectedForeignKeys ?? []) {
+    const identity = foreignKeySemanticIdentity(foreignKey);
+    const candidates = expectedBySemantics.get(identity) ?? [];
+    candidates.push(foreignKey.name);
+    expectedBySemantics.set(identity, candidates);
+  }
+  return foreignKeys
+    .map((foreignKey) => {
+      const expectedNames = expectedBySemantics.get(
+        foreignKeySemanticIdentity(foreignKey),
+      );
+      // Constraint names are not relational semantics and several historical
+      // migrations intentionally used shorter names than later snapshots.
+      // Normalize only a unique full-semantic match; missing, duplicate or
+      // action/column/reference drift remains visible in the contract.
+      return expectedNames?.length === 1
+        ? { ...foreignKey, name: expectedNames[0] }
+        : foreignKey;
+    })
+    .sort((left, right) => left.name.localeCompare(right.name, "en"));
+}
+
 export async function inspectDatabaseSchema(database, expectedContract) {
   if (!database || typeof database.query !== "function") {
     throw new Error("DATABASE_SCHEMA_ADAPTER_INVALID");
@@ -1431,7 +1465,7 @@ export async function inspectDatabaseSchema(database, expectedContract) {
         "SEQ_IN_INDEX",
       ]).map(actualIndexColumn);
 
-      const foreignKeys = [
+      const rawForeignKeys = [
         ...groupRows(foreignKeyRows.get(name) ?? [], "constraintName"),
       ]
         .map(([foreignKeyName, rows]) => {
@@ -1463,6 +1497,10 @@ export async function inspectDatabaseSchema(database, expectedContract) {
           };
         })
         .sort((left, right) => left.name.localeCompare(right.name, "en"));
+      const foreignKeys = normalizeDatabaseForeignKeyNames(
+        rawForeignKeys,
+        expectedTables.get(name)?.foreignKeys,
+      );
 
       const declaredIndexNames = new Set(
         (expectedTables.get(name)?.indexes ?? []).map((index) => index.name),
@@ -1492,7 +1530,11 @@ export async function inspectDatabaseSchema(database, expectedContract) {
         })
         .filter(
           (index) =>
-            !isAutomaticForeignKeyIndex(index, foreignKeys, declaredIndexNames),
+            !isAutomaticForeignKeyIndex(
+              index,
+              rawForeignKeys,
+              declaredIndexNames,
+            ),
         )
         .sort((left, right) => left.name.localeCompare(right.name, "en"));
 

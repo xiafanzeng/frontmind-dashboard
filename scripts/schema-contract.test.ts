@@ -514,6 +514,36 @@ describe("database schema contract", () => {
     expect(drift.differences.join("\n")).toMatch(/\.generated\.expression/u);
   });
 
+  it("normalizes historical foreign-key names only when every semantic field matches", async () => {
+    const contract = await currentContract();
+    const exactRows = metadataRows(contract);
+    const table = contract.tables.find(
+      (candidate) => candidate.foreignKeys.length > 0,
+    )!;
+    const foreignKey = table.foreignKeys[0]!;
+    const foreignKeyRows = exactRows.foreignKeys.filter(
+      (row) =>
+        row.tableName === table.name && row.constraintName === foreignKey.name,
+    );
+    expect(foreignKeyRows.length).toBeGreaterThan(0);
+    for (const row of foreignKeyRows) {
+      row.constraintName = "historical_short_fk";
+    }
+
+    await expect(
+      evaluateDatabaseSchema(databaseFromRows(exactRows), contract),
+    ).resolves.toMatchObject({ status: "exact", differences: [] });
+
+    foreignKeyRows[0]!.deleteRule =
+      foreignKeyRows[0]!.deleteRule === "CASCADE" ? "RESTRICT" : "CASCADE";
+    const drift = await evaluateDatabaseSchema(
+      databaseFromRows(exactRows),
+      contract,
+    );
+    expect(drift.status).toBe("diverged");
+    expect(drift.differences.join("\n")).toMatch(/\.foreignKeys\./u);
+  });
+
   it("ignores only MySQL's generated foreign-key index and fails closed on drift", async () => {
     const contract = await currentContract();
     const exactRows = metadataRows(contract);
