@@ -147,6 +147,18 @@ describe("system administrator boundary", () => {
         }),
     ],
     [
+      "bulk replace managed API Keys from unified management",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.apiKeyUsageAlerts.bulkReplaceTargetCredentials({
+          scope: { kind: "engineers", engineerIds: [8] },
+          targets: [{ userId: 8, expectedVersion: 2 }],
+          applyMode: "unconfigured_only",
+          apiKey: "managed-api-secret-key",
+          reason: "boundary test",
+          confirmation: "BULK_REPLACE_API_KEYS",
+        }),
+    ],
+    [
       "revoke a managed API Key from unified management",
       (caller: ReturnType<typeof adminRouter.createCaller>) =>
         caller.apiKeyUsageAlerts.revokeTargetCredential({

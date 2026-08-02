@@ -1032,6 +1032,38 @@ describe("delivery ticket quota lifecycle", () => {
     });
   });
 
+  it("keeps consumed quota exhausted after its verbose ticket is archived", () => {
+    const archivedPeriod = {
+      id: "period-archived",
+      contractId: "contract-archived",
+      contentAssetPublishLimit: 1,
+      websiteContentPublishLimit: 1,
+      archivedContentAssetPublishUsed: 1,
+      archivedWebsiteContentPublishUsed: 1,
+    };
+
+    expect(
+      selectDeliveryTicketQuotaPeriod({
+        periods: [archivedPeriod],
+        quotaPool: "content_asset_publish",
+        activeCounts: new Map(),
+      }),
+    ).toBeNull();
+    expect(
+      aggregateDeliveryTicketQuotaCapacity({
+        periods: [archivedPeriod],
+        quotaPool: "website_content_publish",
+        activeRows: [],
+      }),
+    ).toEqual({
+      limit: 1,
+      reserved: 0,
+      consumed: 1,
+      used: 1,
+      remaining: 0,
+    });
+  });
+
   it("detects attachment ownership gaps without trusting descriptors", () => {
     expect(
       missingOwnedAttachmentIds(

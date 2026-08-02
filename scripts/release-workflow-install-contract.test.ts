@@ -17,6 +17,9 @@ const productionKnownHosts = path.resolve(
 const pdfWorkflow = path.resolve(".github/workflows/pdf-runtime.yml");
 const pdfDockerfile = path.resolve("deploy/1panel-node-pdf/Dockerfile");
 const installer = path.resolve("deploy/production/install.sh");
+const websiteRuntimeEnvExample = path.resolve(
+  "deploy/production/website/runtime.env.example",
+);
 const noClobberLibrary = path.resolve(
   "deploy/production/install-config-no-clobber.sh",
 );
@@ -432,6 +435,14 @@ describe("production installer no-clobber policy", () => {
     ).toHaveLength(2);
     expect(script).toContain('"$CONFIG_ROOT/dashboard-compose.env.example"');
     expect(script).toContain('"$CONFIG_ROOT/website-compose.env.example"');
+  });
+
+  it("requires a distinct production contract authorization code", async () => {
+    const example = await readFile(websiteRuntimeEnvExample, "utf8");
+    expect(example).toContain(
+      "FRONTMIND_GEO_CONTRACT_AUTH_CODE=replace-with-independent-random-contract-code",
+    );
+    expect(example).not.toContain("frontmind666");
   });
 });
 

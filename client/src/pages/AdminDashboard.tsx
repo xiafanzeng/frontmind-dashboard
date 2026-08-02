@@ -70,6 +70,7 @@ type AdminUsageHierarchyManager = {
   adminId: number;
   displayName: string;
   username: string | null;
+  isActive: boolean;
   apiKeyConfigured: boolean;
   apiKeyVersion: number;
   keyPool: {
@@ -102,6 +103,7 @@ type AdminUsageHierarchyEngineer = {
   engineerId: number;
   displayName: string;
   username: string | null;
+  isActive: boolean;
   apiKeyConfigured: boolean;
   apiKeyVersion: number;
   keyTotalUsed: number;
@@ -121,6 +123,7 @@ type AdminUsageHierarchyCustomer = {
   userId: number;
   enterpriseName: string;
   username: string | null;
+  isActive: boolean;
   deliveryAdminId: number | null;
   deliveryAdminName: string | null;
   apiKeyConfigured: boolean;
@@ -417,7 +420,7 @@ export const adminNav: PortalNavItem[] = [
     group: "客户与服务",
   },
   {
-    label: "工单",
+    label: "工单管理",
     href: "/admin/dispatch",
     icon: ClipboardList,
     group: "客户与服务",
@@ -582,6 +585,7 @@ export function normalizeUsageHierarchy(value: unknown): {
         displayName:
           String(entry?.displayName || "").trim() || "未命名交付管理员",
         username: entry?.username ? String(entry.username) : null,
+        isActive: entry?.isActive !== false,
         apiKeyConfigured: entry?.apiKeyConfigured === true,
         apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
         keyPool: {
@@ -642,6 +646,7 @@ export function normalizeUsageHierarchy(value: unknown): {
           displayName:
             String(entry?.displayName || "").trim() || "未命名系统管理员",
           username: entry?.username ? String(entry.username) : null,
+          isActive: entry?.isActive !== false,
           apiKeyConfigured: entry?.apiKeyConfigured === true,
           apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
           keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
@@ -663,6 +668,7 @@ export function normalizeUsageHierarchy(value: unknown): {
           displayName:
             String(entry?.displayName || "").trim() || "未命名工程师",
           username: entry?.username ? String(entry.username) : null,
+          isActive: entry?.isActive !== false,
           apiKeyConfigured: entry?.apiKeyConfigured === true,
           apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
           keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
@@ -684,6 +690,7 @@ export function normalizeUsageHierarchy(value: unknown): {
           enterpriseName:
             String(entry?.enterpriseName || "").trim() || "未命名客户",
           username: entry?.username ? String(entry.username) : null,
+          isActive: entry?.isActive !== false,
           deliveryAdminId:
             Number.isInteger(Number(entry?.deliveryAdminId)) &&
             Number(entry.deliveryAdminId) > 0
@@ -727,9 +734,11 @@ type OverviewApiKeyTarget = {
   version: number;
 };
 
-type KeyManagementRow = OverviewApiKeyTarget & {
+export type KeyManagementRow = OverviewApiKeyTarget & {
   typeLabel: string;
   scopeLabel: string;
+  isActive: boolean;
+  deliveryAdminId: number | null;
   inherited: boolean;
   ownAgentMonthUsed: number;
   keyTotalUsed: number;
@@ -737,6 +746,35 @@ type KeyManagementRow = OverviewApiKeyTarget & {
   syncStatus: string;
   fetchedAt: number | string | Date | null;
 };
+
+export type BulkApiKeyScope =
+  | { kind: "all" }
+  | { kind: "delivery_admin"; deliveryAdminId: number }
+  | { kind: "engineers"; engineerIds: number[] };
+
+const MAX_BULK_API_KEY_CHANGES = 200;
+const MAX_BULK_API_KEY_SCOPE_SNAPSHOT = 5_000;
+
+export function bulkApiKeyTargetsForScope(
+  rows: KeyManagementRow[],
+  scope: BulkApiKeyScope,
+) {
+  const activeRows = rows.filter((row) => row.isActive);
+  if (scope.kind === "all") return activeRows;
+  if (scope.kind === "delivery_admin") {
+    return activeRows.filter(
+      (row) =>
+        (row.kind === "delivery_admin" &&
+          row.userId === scope.deliveryAdminId) ||
+        (row.kind === "customer" &&
+          row.deliveryAdminId === scope.deliveryAdminId),
+    );
+  }
+  const engineerIds = new Set(scope.engineerIds);
+  return activeRows.filter(
+    (row) => row.kind === "engineer" && engineerIds.has(row.userId),
+  );
+}
 
 function AdminOverviewApiKeyDialog({
   target,
@@ -999,6 +1037,437 @@ function AdminOverviewApiKeyDialog({
   );
 }
 
+function AdminBulkApiKeyDialog({
+  open,
+  rows,
+  onOpenChange,
+  onSaved,
+}: {
+  open: boolean;
+  rows: KeyManagementRow[];
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => Promise<void> | void;
+}) {
+  const [scopeKind, setScopeKind] = useState<
+    "all" | "delivery_admin" | "engineers"
+  >("all");
+  const [deliveryAdminId, setDeliveryAdminId] = useState("");
+  const [engineerIds, setEngineerIds] = useState<number[]>([]);
+  const [engineerSearch, setEngineerSearch] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [replaceExisting, setReplaceExisting] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const bulkMutation =
+    trpc.admin.apiKeyUsageAlerts.bulkReplaceTargetCredentials.useMutation();
+  const busy = bulkMutation.isPending;
+  const managers = rows.filter(
+    (row) => row.isActive && row.kind === "delivery_admin",
+  );
+  const engineers = rows.filter(
+    (row) => row.isActive && row.kind === "engineer",
+  );
+  const normalizedEngineerSearch = engineerSearch.trim().toLocaleLowerCase();
+  const visibleEngineers = engineers.filter((engineer) =>
+    `${engineer.displayName} ${engineer.username}`
+      .toLocaleLowerCase()
+      .includes(normalizedEngineerSearch),
+  );
+  const scope: BulkApiKeyScope | null =
+    scopeKind === "all"
+      ? { kind: "all" }
+      : scopeKind === "delivery_admin"
+        ? Number(deliveryAdminId) > 0
+          ? {
+              kind: "delivery_admin",
+              deliveryAdminId: Number(deliveryAdminId),
+            }
+          : null
+        : engineerIds.length > 0
+          ? { kind: "engineers", engineerIds }
+          : null;
+  const targets = scope ? bulkApiKeyTargetsForScope(rows, scope) : [];
+  const configuredCount = targets.filter((target) => target.configured).length;
+  const unconfiguredCount = targets.length - configuredCount;
+  const actionTargets = replaceExisting
+    ? targets
+    : targets.filter((target) => !target.configured);
+  const actionCount = actionTargets.length;
+  const knownActionLimitExceeded =
+    !replaceExisting && actionCount > MAX_BULK_API_KEY_CHANGES;
+  const scopeSnapshotLimitExceeded =
+    targets.length > MAX_BULK_API_KEY_SCOPE_SNAPSHOT;
+  const selectedManager =
+    scopeKind === "delivery_admin"
+      ? managers.find((manager) => manager.userId === Number(deliveryAdminId))
+      : null;
+
+  const reset = () => {
+    setScopeKind("all");
+    setDeliveryAdminId("");
+    setEngineerIds([]);
+    setEngineerSearch("");
+    setApiKey("");
+    setReplaceExisting(false);
+    setConfirmOpen(false);
+    bulkMutation.reset();
+  };
+  const close = () => {
+    if (busy) return;
+    reset();
+    onOpenChange(false);
+  };
+  const selectScopeKind = (next: "all" | "delivery_admin" | "engineers") => {
+    setScopeKind(next);
+    setReplaceExisting(false);
+    if (next === "delivery_admin" && !deliveryAdminId && managers[0]) {
+      setDeliveryAdminId(String(managers[0].userId));
+    }
+  };
+  const requestConfirmation = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (
+      !scope ||
+      knownActionLimitExceeded ||
+      scopeSnapshotLimitExceeded ||
+      apiKey.trim().length < 8 ||
+      actionCount === 0
+    )
+      return;
+    setConfirmOpen(true);
+  };
+  const save = async () => {
+    if (
+      !scope ||
+      knownActionLimitExceeded ||
+      scopeSnapshotLimitExceeded ||
+      apiKey.trim().length < 8 ||
+      actionCount === 0
+    )
+      return;
+    try {
+      const result = await bulkMutation.mutateAsync({
+        scope,
+        targets: targets.map((target) => ({
+          userId: target.userId,
+          expectedVersion: target.version,
+        })),
+        applyMode: replaceExisting ? "replace_all" : "unconfigured_only",
+        apiKey: apiKey.trim(),
+        reason: "API与人员管理批量配置账号 API Key",
+        confirmation: "BULK_REPLACE_API_KEYS",
+      });
+      await onSaved();
+      toast.success(`已为 ${result.updatedCount} 个账号配置 API Key`, {
+        description:
+          result.unchangedCount > 0
+            ? `${result.unchangedCount} 个账号无需变更；用量统计将在下次同步后更新`
+            : "用量统计将在下次同步后更新",
+      });
+      reset();
+      onOpenChange(false);
+    } catch (error) {
+      toast.error("无法完成批量 API Key 配置", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    }
+  };
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && close()}>
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <UsersRound className="h-5 w-5 text-primary" />
+              批量配置 API Key
+            </DialogTitle>
+            <DialogDescription>
+              输入一次
+              Key，按明确范围分发给启用账号。每个账号仍独立加密保存并保留自己的版本历史。
+            </DialogDescription>
+          </DialogHeader>
+          <form className="space-y-5" onSubmit={requestConfirmation}>
+            <div className="space-y-2">
+              <Label>配置范围</Label>
+              <div className="grid gap-2 sm:grid-cols-3">
+                {[
+                  ["all", "所有启用账号"],
+                  ["delivery_admin", "交付管理员范围"],
+                  ["engineers", "选择工程师"],
+                ].map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    aria-pressed={scopeKind === value}
+                    disabled={busy}
+                    onClick={() =>
+                      selectScopeKind(
+                        value as "all" | "delivery_admin" | "engineers",
+                      )
+                    }
+                    className={`rounded-lg border px-3 py-2 text-sm font-medium transition ${
+                      scopeKind === value
+                        ? "border-[#6f3a98] bg-[#f3edf7] text-[#5b2a86]"
+                        : "border-border bg-white text-[#5f576c] hover:border-[#a98cbd]"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {scopeKind === "all" && (
+                <p className="text-xs leading-5 text-muted-foreground">
+                  包含启用的客户、交付管理员、工程师和系统管理员；停用账号不会被配置。
+                </p>
+              )}
+            </div>
+
+            {scopeKind === "delivery_admin" && (
+              <div className="space-y-2">
+                <Label htmlFor="bulk-delivery-admin">选择交付管理员</Label>
+                <select
+                  id="bulk-delivery-admin"
+                  value={deliveryAdminId}
+                  disabled={busy || managers.length === 0}
+                  onChange={(event) => {
+                    setDeliveryAdminId(event.target.value);
+                    setReplaceExisting(false);
+                  }}
+                  className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  <option value="">请选择交付管理员</option>
+                  {managers.map((manager) => {
+                    const customerCount = rows.filter(
+                      (row) =>
+                        row.isActive &&
+                        row.kind === "customer" &&
+                        row.deliveryAdminId === manager.userId,
+                    ).length;
+                    return (
+                      <option key={manager.userId} value={manager.userId}>
+                        {manager.displayName}（本人 + {customerCount} 个客户）
+                      </option>
+                    );
+                  })}
+                </select>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  {selectedManager
+                    ? `将包含 ${selectedManager.displayName} 本人及其名下启用客户，不包含工程师。`
+                    : "交付管理员范围包含管理员本人和名下启用客户，不包含工程师。"}
+                </p>
+              </div>
+            )}
+
+            {scopeKind === "engineers" && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="bulk-engineer-search">选择工程师</Label>
+                  <div className="flex gap-2 text-xs">
+                    <button
+                      type="button"
+                      className="text-[#6a338f] hover:underline"
+                      disabled={busy || engineers.length === 0}
+                      onClick={() => {
+                        setEngineerIds(engineers.map((row) => row.userId));
+                        setReplaceExisting(false);
+                      }}
+                    >
+                      全选
+                    </button>
+                    <button
+                      type="button"
+                      className="text-[#716a80] hover:underline"
+                      disabled={busy || engineerIds.length === 0}
+                      onClick={() => {
+                        setEngineerIds([]);
+                        setReplaceExisting(false);
+                      }}
+                    >
+                      清空
+                    </button>
+                  </div>
+                </div>
+                <Input
+                  id="bulk-engineer-search"
+                  value={engineerSearch}
+                  disabled={busy}
+                  onChange={(event) => setEngineerSearch(event.target.value)}
+                  placeholder="搜索工程师"
+                />
+                <div className="max-h-44 space-y-1 overflow-y-auto rounded-lg border p-2">
+                  {visibleEngineers.length === 0 ? (
+                    <p className="px-2 py-3 text-sm text-muted-foreground">
+                      没有符合条件的启用工程师。
+                    </p>
+                  ) : (
+                    visibleEngineers.map((engineer) => (
+                      <label
+                        key={engineer.userId}
+                        className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 text-sm hover:bg-muted/50"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={engineerIds.includes(engineer.userId)}
+                          disabled={busy}
+                          onChange={(event) => {
+                            setEngineerIds((current) =>
+                              event.target.checked
+                                ? [...new Set([...current, engineer.userId])]
+                                : current.filter(
+                                    (userId) => userId !== engineer.userId,
+                                  ),
+                            );
+                            setReplaceExisting(false);
+                          }}
+                        />
+                        <span className="font-medium text-[#332842]">
+                          {engineer.displayName}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          @{engineer.username}
+                        </span>
+                      </label>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div className="rounded-lg border border-[#e5ddea] bg-[#fbf9fd] p-3 text-sm text-[#5f576c]">
+              <p className="font-medium text-[#332842]">
+                当前范围：{targets.length} 个启用账号
+              </p>
+              <p className="mt-1 text-xs leading-5">
+                首次配置 {unconfiguredCount} 个；已有 Key {configuredCount} 个。
+                {replaceExisting
+                  ? ` 服务器会排除已经是本次 Key 的账号，当前范围最多涉及 ${actionCount} 个账号。`
+                  : ` 默认只配置 ${actionCount} 个尚未配置的账号。`}
+              </p>
+              {knownActionLimitExceeded && (
+                <p className="mt-1 text-xs font-medium text-[#a02652]">
+                  单次最多变更 {MAX_BULK_API_KEY_CHANGES}
+                  个账号，请缩小范围或先使用“只配置未配置账号”。
+                </p>
+              )}
+              {replaceExisting &&
+                targets.length > MAX_BULK_API_KEY_CHANGES &&
+                !scopeSnapshotLimitExceeded && (
+                  <p className="mt-1 text-xs font-medium text-amber-700">
+                    提交后会按本次 Key 排除无需变化的账号；若实际仍需变更超过
+                    {MAX_BULK_API_KEY_CHANGES} 个，整批将停止且不会写入。
+                  </p>
+                )}
+              {scopeSnapshotLimitExceeded && (
+                <p className="mt-1 text-xs font-medium text-[#a02652]">
+                  单次范围最多包含 {MAX_BULK_API_KEY_SCOPE_SNAPSHOT}
+                  个账号，请缩小范围后重试。
+                </p>
+              )}
+            </div>
+
+            <label className="flex items-start gap-3 rounded-lg border border-border/70 p-3 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={replaceExisting}
+                disabled={busy || configuredCount === 0}
+                onChange={(event) => setReplaceExisting(event.target.checked)}
+              />
+              <span>
+                <span className="font-medium text-[#332842]">
+                  同时替换范围内已有 Key
+                </span>
+                <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                  默认关闭以避免误退役现有
+                  Key。开启后，范围内账号将统一切换到本次输入的 Key。
+                </span>
+              </span>
+            </label>
+
+            <div className="space-y-2">
+              <Label htmlFor="bulk-api-key">API Key</Label>
+              <Input
+                id="bulk-api-key"
+                type="password"
+                autoComplete="off"
+                value={apiKey}
+                disabled={busy}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder="输入一次，验证后按范围加密保存"
+              />
+              <p className="text-xs leading-5 text-muted-foreground">
+                Key 明文不会写入日志、审计记录或返回浏览器。
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={close}
+                disabled={busy}
+              >
+                取消
+              </Button>
+              <Button
+                type="submit"
+                disabled={
+                  busy ||
+                  !scope ||
+                  knownActionLimitExceeded ||
+                  scopeSnapshotLimitExceeded ||
+                  actionCount === 0 ||
+                  apiKey.trim().length < 8
+                }
+              >
+                {busy && <Loader2 className="h-4 w-4 animate-spin" />}
+                继续确认
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog
+        open={confirmOpen}
+        onOpenChange={(nextOpen) => !busy && setConfirmOpen(nextOpen)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {replaceExisting
+                ? `确认在 ${targets.length} 个账号范围内统一配置 Key`
+                : `确认为 ${actionCount} 个账号批量配置 Key`}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              这些账号将共享同一个上游 API
+              Key，但密文、版本和任务归属仍按账号独立保存。整批操作将在一个事务内完成，任一账号发生版本冲突都会全部回滚。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-950">
+            这是一次性批量分发；以后单独修改某个账号不会自动联动其他账号。共享
+            Key 会扩大泄露影响范围，并限制未知历史任务导入。旧 Key
+            无法完整扫描时，整批会停止，需改用单账号应急替换。
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>返回检查</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busy}
+              onClick={(event) => {
+                event.preventDefault();
+                void save();
+              }}
+            >
+              {busy && <Loader2 className="h-4 w-4 animate-spin" />}
+              确认并批量配置
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
 export default function AdminDashboard({
   preview = false,
   previewAccessLevel = "system_admin",
@@ -1048,6 +1517,7 @@ export default function AdminDashboard({
   const [apiKeyTarget, setApiKeyTarget] = useState<OverviewApiKeyTarget | null>(
     null,
   );
+  const [bulkApiKeyOpen, setBulkApiKeyOpen] = useState(false);
   const [keyAccountType, setKeyAccountType] = useState<
     "all" | OverviewApiKeyTarget["kind"]
   >("all");
@@ -1095,6 +1565,7 @@ export default function AdminDashboard({
           adminId: Number(previewFixtures?.managedAdminId || 101),
           displayName: "交付管理员",
           username: "delivery.admin",
+          isActive: true,
           apiKeyConfigured: true,
           apiKeyVersion: 1,
           keyPool: {
@@ -1147,6 +1618,8 @@ export default function AdminDashboard({
         userId: administrator.adminId,
         displayName: administrator.displayName,
         username: administrator.username || `system-${administrator.adminId}`,
+        isActive: administrator.isActive,
+        deliveryAdminId: null,
         configured: administrator.apiKeyConfigured,
         version: administrator.apiKeyVersion,
         typeLabel: "系统管理员",
@@ -1165,6 +1638,8 @@ export default function AdminDashboard({
         userId: manager.adminId,
         displayName: manager.displayName,
         username: manager.username || `admin-${manager.adminId}`,
+        isActive: manager.isActive,
+        deliveryAdminId: manager.adminId,
         configured: manager.apiKeyConfigured,
         version: manager.apiKeyVersion,
         typeLabel: "交付管理员",
@@ -1186,6 +1661,8 @@ export default function AdminDashboard({
         userId: engineer.id,
         displayName: engineer.displayName,
         username: engineer.username,
+        isActive: engineer.isActive,
+        deliveryAdminId: null,
         configured: engineer.apiKeyConfigured,
         version: engineer.apiKeyVersion,
         typeLabel: "工程师",
@@ -1206,6 +1683,8 @@ export default function AdminDashboard({
         userId: customer.userId,
         displayName: customer.enterpriseName,
         username: customer.username || `customer-${customer.userId}`,
+        isActive: customer.isActive,
+        deliveryAdminId: customer.deliveryAdminId,
         configured: customer.apiKeyConfigured,
         version: customer.apiKeyVersion,
         typeLabel: "客户",
@@ -1284,28 +1763,44 @@ export default function AdminDashboard({
                   只读验收预览 · 近 30 天
                 </span>
               ) : (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={
-                    usageHierarchyQuery.isFetching ||
-                    usageSyncMutation.isPending
-                  }
-                  onClick={() => usageSyncMutation.mutate()}
-                >
-                  <RefreshCw
-                    className={`h-4 w-4 ${
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={
+                      usageHierarchyQuery.isLoading ||
+                      deliveryRoleOverviewQuery.isLoading ||
+                      keyManagementRows.length === 0
+                    }
+                    onClick={() => setBulkApiKeyOpen(true)}
+                  >
+                    <UsersRound className="h-4 w-4" />
+                    批量配置 Key
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={
                       usageHierarchyQuery.isFetching ||
                       usageSyncMutation.isPending
-                        ? "animate-spin"
-                        : ""
-                    }`}
-                  />
-                  {usageHierarchyQuery.isFetching || usageSyncMutation.isPending
-                    ? "同步中"
-                    : "刷新用量"}
-                </Button>
+                    }
+                    onClick={() => usageSyncMutation.mutate()}
+                  >
+                    <RefreshCw
+                      className={`h-4 w-4 ${
+                        usageHierarchyQuery.isFetching ||
+                        usageSyncMutation.isPending
+                          ? "animate-spin"
+                          : ""
+                      }`}
+                    />
+                    {usageHierarchyQuery.isFetching ||
+                    usageSyncMutation.isPending
+                      ? "同步中"
+                      : "刷新用量"}
+                  </Button>
+                </div>
               )}
             </div>
 
@@ -1628,17 +2123,31 @@ export default function AdminDashboard({
         )}
       </div>
       {!previewMode && (
-        <AdminOverviewApiKeyDialog
-          target={apiKeyTarget}
-          onOpenChange={(open) => !open && setApiKeyTarget(null)}
-          onSaved={async () => {
-            await Promise.all([
-              deliveryRoleOverviewQuery.refetch(),
-              usageHierarchyQuery.refetch(),
-              workspaceQuery.refetch(),
-            ]);
-          }}
-        />
+        <>
+          <AdminOverviewApiKeyDialog
+            target={apiKeyTarget}
+            onOpenChange={(open) => !open && setApiKeyTarget(null)}
+            onSaved={async () => {
+              await Promise.all([
+                deliveryRoleOverviewQuery.refetch(),
+                usageHierarchyQuery.refetch(),
+                workspaceQuery.refetch(),
+              ]);
+            }}
+          />
+          <AdminBulkApiKeyDialog
+            open={bulkApiKeyOpen}
+            rows={keyManagementRows}
+            onOpenChange={setBulkApiKeyOpen}
+            onSaved={async () => {
+              await Promise.all([
+                deliveryRoleOverviewQuery.refetch(),
+                usageHierarchyQuery.refetch(),
+                workspaceQuery.refetch(),
+              ]);
+            }}
+          />
+        </>
       )}
     </PortalShell>
   );

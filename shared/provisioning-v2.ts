@@ -8,6 +8,13 @@ const serviceCategorySchema = z.enum([
 const isoDateTimeSchema = z.string().datetime({ offset: true });
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/i);
 const identifierSchema = z.string().trim().min(4).max(128);
+const purchaseContractBaseShape = {
+  status: z.literal("pending_admin_confirmation"),
+  projectId: z.string().trim().min(8).max(80),
+  orderId: z.string().trim().min(8).max(64),
+  questionId: z.string().trim().min(4).max(80),
+  templateVersion: z.string().trim().min(1).max(64),
+};
 
 export const websitePurchaseRequestV2Schema = z
   .object({
@@ -42,34 +49,44 @@ export const websitePurchaseRequestV2Schema = z
           .strict(),
       })
       .strict(),
-    contract: z
-      .object({
-        id: identifierSchema,
-        status: z.literal("pending_admin_confirmation"),
-        projectId: z.string().trim().min(8).max(80),
-        orderId: z.string().trim().min(8).max(64),
-        questionId: z.string().trim().min(4).max(80),
-        templateVersion: z.string().trim().min(1).max(64),
-        evidence: z
-          .object({
-            type: z.literal("system_admin_confirmation"),
-            artifact: z
-              .object({
-                taskId: z.string().trim().min(1).max(128).nullable(),
-                fileId: z.string().trim().min(1).max(128).nullable(),
-                outputDescriptor: z
-                  .string()
-                  .trim()
-                  .min(1)
-                  .max(500)
-                  .nullable(),
-                sha256: sha256Schema.nullable(),
-              })
-              .strict(),
-          })
-          .strict(),
-      })
-      .strict(),
+    contract: z.union([
+      z
+        .object({
+          ...purchaseContractBaseShape,
+          id: identifierSchema,
+          evidence: z
+            .object({
+              type: z.literal("system_admin_confirmation"),
+              artifact: z
+                .object({
+                  taskId: z.string().trim().min(1).max(128).nullable(),
+                  fileId: z.string().trim().min(1).max(128).nullable(),
+                  outputDescriptor: z
+                    .string()
+                    .trim()
+                    .min(1)
+                    .max(500)
+                    .nullable(),
+                  sha256: sha256Schema.nullable(),
+                })
+                .strict(),
+            })
+            .strict(),
+        })
+        .strict(),
+      z
+        .object({
+          ...purchaseContractBaseShape,
+          evidence: z
+            .object({
+              type: z.literal("external_wechat_confirmation"),
+              eventReference: identifierSchema,
+              authorizedAt: isoDateTimeSchema,
+            })
+            .strict(),
+        })
+        .strict(),
+    ]),
     account: z.discriminatedUnion("mode", [
       z
         .object({
@@ -95,8 +112,7 @@ export const websitePurchaseRequestV2Schema = z
   .superRefine((value, context) => {
     const expectedDuration = 30 * 24 * 60 * 60 * 1000;
     if (
-      Date.parse(value.service.endsAt) -
-        Date.parse(value.service.startsAt) !==
+      Date.parse(value.service.endsAt) - Date.parse(value.service.startsAt) !==
       expectedDuration
     ) {
       context.addIssue({
@@ -129,6 +145,18 @@ export const websitePurchaseRequestV2Schema = z
     ];
     for (const [valid, path, message] of checks) {
       if (!valid) context.addIssue({ code: "custom", path, message });
+    }
+    if (
+      value.contract.evidence.type === "external_wechat_confirmation" &&
+      Date.parse(value.order.paidAt) <=
+        Date.parse(value.contract.evidence.authorizedAt)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["order", "paidAt"],
+        message:
+          "order paidAt must be later than external contract authorizedAt",
+      });
     }
   });
 

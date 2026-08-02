@@ -506,6 +506,13 @@ async function readStoredProvision(
     .limit(1);
   const provision = rows[0] as WebsiteUserProvision | undefined;
   if (!provision) return null;
+  if (!provision.contractId) {
+    throw new ProvisioningError(
+      "DATABASE_UNAVAILABLE",
+      "The legacy provision record is missing its electronic contract id",
+      503,
+    );
+  }
   if (
     provision.status !== "completed" ||
     !provision.userId ||

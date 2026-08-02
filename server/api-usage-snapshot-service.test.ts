@@ -1,21 +1,109 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   API_USAGE_SCAN_CONCURRENCY,
+  API_USAGE_SNAPSHOT_SYNC_LOCK_NAME,
   apiUsageSeverity,
+  assertBulkManagedApiKeyTargetSelection,
+  assertBulkManagedApiKeyTargetVersions,
   assertManagedApiKeyTarget,
+  bulkManagedApiKeyActionTargets,
+  bulkPreviousCredentialGroups,
   isRollingUsageSnapshotCurrent,
   latestUsageSnapshotByPolicy,
   resolveEffectiveUsageCredentials,
+  resolveBulkManagedApiKeyTargets,
+  runApiUsageSnapshotSyncWithLock,
   usageCredentialPoolKey,
   usageSnapshotUsageValues,
 } from "./api-usage-snapshot-service";
 
 it("serializes overlapping historical credential scans", () => {
   expect(API_USAGE_SCAN_CONCURRENCY).toBe(1);
+});
+
+describe("API usage snapshot synchronization lock", () => {
+  it("holds one MySQL named lock for the complete synchronization", async () => {
+    const query = vi
+      .fn()
+      .mockResolvedValueOnce([[{ acquired: 1 }], undefined])
+      .mockResolvedValueOnce([[{ released: 1 }], undefined]);
+    const end = vi.fn().mockResolvedValue(undefined);
+    const sync = vi.fn().mockResolvedValue({
+      synced: 3,
+      failed: 0,
+      finishedAt: 123,
+    });
+
+    await expect(
+      runApiUsageSnapshotSyncWithLock({
+        databaseUrl: "mysql://acceptance.invalid/frontmind",
+        createConnection: async () => ({ query, end }),
+        sync,
+      }),
+    ).resolves.toEqual({ synced: 3, failed: 0, finishedAt: 123 });
+    expect(query).toHaveBeenNthCalledWith(
+      1,
+      "SELECT GET_LOCK(?, 0) AS acquired",
+      [API_USAGE_SNAPSHOT_SYNC_LOCK_NAME],
+    );
+    expect(query).toHaveBeenNthCalledWith(
+      2,
+      "SELECT RELEASE_LOCK(?) AS released",
+      [API_USAGE_SNAPSHOT_SYNC_LOCK_NAME],
+    );
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(end).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a second server instance when the database lock is busy", async () => {
+    const sync = vi.fn();
+    const end = vi.fn().mockResolvedValue(undefined);
+    const result = await runApiUsageSnapshotSyncWithLock({
+      databaseUrl: "mysql://acceptance.invalid/frontmind",
+      createConnection: async () => ({
+        query: vi.fn().mockResolvedValue([[{ acquired: 0 }], undefined]),
+        end,
+      }),
+      sync,
+    });
+
+    expect(result.skipped).toBe("already_running");
+    expect(sync).not.toHaveBeenCalled();
+    expect(end).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips overlapping timer and manual runs in the same process", async () => {
+    let finishFirst!: (value: {
+      synced: number;
+      failed: number;
+      finishedAt: number;
+    }) => void;
+    const first = runApiUsageSnapshotSyncWithLock({
+      databaseUrl: "",
+      sync: () =>
+        new Promise((resolve) => {
+          finishFirst = resolve;
+        }),
+    });
+    await Promise.resolve();
+
+    const overlapping = await runApiUsageSnapshotSyncWithLock({
+      databaseUrl: "",
+      sync: vi.fn(),
+    });
+    expect(overlapping.skipped).toBe("already_running");
+
+    finishFirst({ synced: 1, failed: 0, finishedAt: 456 });
+    await expect(first).resolves.toEqual({
+      synced: 1,
+      failed: 0,
+      finishedAt: 456,
+    });
+  });
 });
 
 describe("apiUsageSeverity", () => {
@@ -330,5 +418,236 @@ describe("unified managed API Key target CAS", () => {
         expectedVersion: 4,
       }),
     ).toThrow(/类型不匹配/);
+  });
+});
+
+describe("bulk managed API Key scopes", () => {
+  const accounts = [
+    { id: 1, role: "user", isActive: true },
+    {
+      id: 2,
+      role: "admin",
+      adminAccessLevel: "delivery_admin",
+      isActive: true,
+    },
+    {
+      id: 3,
+      role: "admin",
+      adminAccessLevel: "system_admin",
+      isActive: true,
+    },
+    { id: 4, role: "delivery_member", isActive: true },
+    { id: 5, role: "user", isActive: false },
+    { id: 6, role: "admin", adminAccessLevel: null, isActive: true },
+    { id: 7, role: "delivery_member", isActive: true },
+  ];
+  const ownerships = [
+    { userId: 1, deliveryAdminId: 2 },
+    { userId: 5, deliveryAdminId: 2 },
+  ];
+
+  it("resolves every active supported account while excluding disabled and legacy admin rows", () => {
+    expect(
+      resolveBulkManagedApiKeyTargets({
+        scope: { kind: "all" },
+        accounts,
+        ownerships,
+      }),
+    ).toEqual([
+      { userId: 1, kind: "customer" },
+      { userId: 2, kind: "delivery_admin" },
+      { userId: 3, kind: "system_admin" },
+      { userId: 4, kind: "engineer" },
+      { userId: 7, kind: "engineer" },
+    ]);
+  });
+
+  it("uses usage ownership for one delivery manager and never pulls in engineers", () => {
+    expect(
+      resolveBulkManagedApiKeyTargets({
+        scope: { kind: "delivery_admin", deliveryAdminId: 2 },
+        accounts,
+        ownerships,
+      }),
+    ).toEqual([
+      { userId: 1, kind: "customer" },
+      { userId: 2, kind: "delivery_admin" },
+    ]);
+  });
+
+  it("accepts only explicitly selected active engineers", () => {
+    expect(
+      resolveBulkManagedApiKeyTargets({
+        scope: { kind: "engineers", engineerIds: [7, 4, 7] },
+        accounts,
+        ownerships,
+      }),
+    ).toEqual([
+      { userId: 4, kind: "engineer" },
+      { userId: 7, kind: "engineer" },
+    ]);
+    expect(() =>
+      resolveBulkManagedApiKeyTargets({
+        scope: { kind: "engineers", engineerIds: [1] },
+        accounts,
+        ownerships,
+      }),
+    ).toThrow(/工程师不存在/);
+  });
+
+  it("rejects duplicate or drifted browser target snapshots", () => {
+    const resolvedTargets = [
+      { userId: 1, kind: "customer" as const },
+      { userId: 2, kind: "delivery_admin" as const },
+    ];
+    expect(
+      assertBulkManagedApiKeyTargetSelection({
+        resolvedTargets,
+        requestedTargets: [
+          { userId: 2, expectedVersion: 4 },
+          { userId: 1, expectedVersion: 1 },
+        ],
+      }),
+    ).toEqual([
+      { userId: 1, kind: "customer", expectedVersion: 1 },
+      { userId: 2, kind: "delivery_admin", expectedVersion: 4 },
+    ]);
+    expect(() =>
+      assertBulkManagedApiKeyTargetSelection({
+        resolvedTargets,
+        requestedTargets: [
+          { userId: 1, expectedVersion: 1 },
+          { userId: 1, expectedVersion: 1 },
+        ],
+      }),
+    ).toThrow(/重复账号/);
+    expect(() =>
+      assertBulkManagedApiKeyTargetSelection({
+        resolvedTargets,
+        requestedTargets: [{ userId: 1, expectedVersion: 1 }],
+      }),
+    ).toThrow(/范围已变化/);
+  });
+
+  it("selects only accounts that will actually change for each apply mode", () => {
+    const resolvedTargets = [
+      { userId: 1, kind: "customer" as const },
+      { userId: 2, kind: "delivery_admin" as const },
+      { userId: 4, kind: "engineer" as const },
+    ];
+    const latestCredentials = new Map([
+      [1, { status: "active", fingerprint: "fp_next" }],
+      [2, { status: "deleted", fingerprint: "fp_retired" }],
+    ]);
+
+    expect(
+      bulkManagedApiKeyActionTargets({
+        resolvedTargets,
+        latestCredentials,
+        applyMode: "unconfigured_only",
+        nextFingerprint: "fp_next",
+      }).map((target) => target.userId),
+    ).toEqual([2, 4]);
+    expect(
+      bulkManagedApiKeyActionTargets({
+        resolvedTargets,
+        latestCredentials,
+        applyMode: "replace_all",
+        nextFingerprint: "fp_next",
+      }).map((target) => target.userId),
+    ).toEqual([2, 4]);
+  });
+
+  it("does not count same-Key accounts against the 200-change limit", () => {
+    const resolvedTargets = Array.from({ length: 201 }, (_, index) => ({
+      userId: index + 1,
+      kind: "customer" as const,
+    }));
+    const latestCredentials = new Map(
+      resolvedTargets.map((target) => [
+        target.userId,
+        {
+          status: "active",
+          fingerprint: target.userId === 201 ? "fp_old" : "fp_next",
+        },
+      ]),
+    );
+
+    expect(
+      bulkManagedApiKeyActionTargets({
+        resolvedTargets,
+        latestCredentials,
+        applyMode: "replace_all",
+        nextFingerprint: "fp_next",
+      }).map((target) => target.userId),
+    ).toEqual([201]);
+  });
+
+  it("deduplicates shared old fingerprints and ignores same-Key or deleted credentials", () => {
+    const groups = bulkPreviousCredentialGroups({
+      targets: [{ userId: 1 }, { userId: 2 }, { userId: 3 }, { userId: 4 }],
+      latestCredentials: new Map([
+        [1, { userId: 1, status: "active", fingerprint: "fp_old_shared" }],
+        [2, { userId: 2, status: "active", fingerprint: "fp_old_shared" }],
+        [3, { userId: 3, status: "deleted", fingerprint: "fp_tombstone" }],
+        [4, { userId: 4, status: "active", fingerprint: "fp_next" }],
+      ]),
+      nextFingerprint: "fp_next",
+    });
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.fingerprint).toBe("fp_old_shared");
+    expect([...groups[0]!.accountIds]).toEqual([1, 2]);
+  });
+
+  it("preflights every actionable version before a batch writes", () => {
+    const targets = [
+      {
+        userId: 1,
+        kind: "customer" as const,
+        expectedVersion: 2,
+      },
+      {
+        userId: 4,
+        kind: "engineer" as const,
+        expectedVersion: 3,
+      },
+    ];
+    const targetAccounts = new Map([
+      [1, { id: 1, role: "user" }],
+      [4, { id: 4, role: "delivery_member" }],
+    ]);
+    const staleCredentials = new Map([
+      [1, { version: 2, status: "active" }],
+      [4, { version: 4, status: "active" }],
+    ]);
+
+    expect(() =>
+      assertBulkManagedApiKeyTargetVersions({
+        targets,
+        accounts: targetAccounts,
+        latestCredentials: staleCredentials,
+        applyMode: "replace_all",
+      }),
+    ).toThrow(/迟到请求不会覆盖/);
+    expect(() =>
+      assertBulkManagedApiKeyTargetVersions({
+        targets,
+        accounts: targetAccounts,
+        latestCredentials: staleCredentials,
+        applyMode: "unconfigured_only",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertBulkManagedApiKeyTargetVersions({
+        targets,
+        accounts: targetAccounts,
+        latestCredentials: new Map([
+          [1, { version: 2, status: "active" }],
+          [4, { version: 4, status: "deleted" }],
+        ]),
+        applyMode: "unconfigured_only",
+      }),
+    ).toThrow(/迟到请求不会覆盖/);
   });
 });

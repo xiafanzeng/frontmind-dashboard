@@ -51,7 +51,7 @@ export const previewAdminNav: PortalNavItem[] = [
     group: "客户与服务",
   },
   {
-    label: "工单",
+    label: "工单管理",
     href: "/preview/admin/dispatch",
     icon: ClipboardList,
     group: "客户与服务",

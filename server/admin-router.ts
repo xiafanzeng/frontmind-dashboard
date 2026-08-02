@@ -109,6 +109,7 @@ import {
   upsertWorkspaceSiteCheck,
 } from "./delivery-ticket-service";
 import {
+  bulkReplaceManagedApiKeyTargets,
   getAdminApiUsageHierarchy,
   getApiUsageAlertOverview,
   replaceManagedApiKeyTarget,
@@ -294,6 +295,63 @@ export const adminRouter = router({
         throw toTrpcError(error);
       }
     }),
+    bulkReplaceTargetCredentials: adminProcedure
+      .input(
+        z
+          .object({
+            scope: z.discriminatedUnion("kind", [
+              z.object({ kind: z.literal("all") }).strict(),
+              z
+                .object({
+                  kind: z.literal("delivery_admin"),
+                  deliveryAdminId: z.number().int().positive(),
+                })
+                .strict(),
+              z
+                .object({
+                  kind: z.literal("engineers"),
+                  engineerIds: z
+                    .array(z.number().int().positive())
+                    .min(1)
+                    .max(5_000),
+                })
+                .strict(),
+            ]),
+            targets: z
+              .array(
+                z
+                  .object({
+                    userId: z.number().int().positive(),
+                    expectedVersion: z.number().int().nonnegative(),
+                  })
+                  .strict(),
+              )
+              .min(1)
+              .max(5_000),
+            applyMode: z
+              .enum(["unconfigured_only", "replace_all"])
+              .default("unconfigured_only"),
+            apiKey: presalesApiKeySchema,
+            reason: z.string().trim().min(1).max(2_000),
+            confirmation: z.literal("BULK_REPLACE_API_KEYS"),
+          })
+          .strict(),
+      )
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await bulkReplaceManagedApiKeyTargets({
+            actor: ctx.user,
+            scope: input.scope,
+            targets: input.targets,
+            applyMode: input.applyMode,
+            apiKey: input.apiKey,
+            reason: input.reason,
+          });
+        } catch (error) {
+          throw toTrpcError(error);
+        }
+      }),
     replaceTargetCredential: adminProcedure
       .input(
         z

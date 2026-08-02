@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
-import { and, desc, eq, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, lte, sql } from "drizzle-orm";
+import mysql from "mysql2/promise";
 
 import {
   apiCredentials,
@@ -16,6 +17,7 @@ import { usageCoverageSupportsReplacement } from "./api-usage-ledger";
 import {
   AuthServiceError,
   deleteActiveApiCredentialInTransaction,
+  getApiKeyFingerprint,
   replaceApiCredentialInTransaction,
   validateUpstreamApiKey,
   type AuthenticatedUser,
@@ -38,6 +40,78 @@ export const API_USAGE_SNAPSHOT_FRESHNESS_MS = 30 * 60 * 1_000;
 // fingerprint; concurrent groups can otherwise invalidate each other's
 // coverage claim and turn a complete total into PARTIAL_TASK_SCAN.
 export const API_USAGE_SCAN_CONCURRENCY = 1;
+export const API_USAGE_SNAPSHOT_SYNC_LOCK_NAME =
+  "frontmind-dashboard:api-usage-snapshot-sync";
+
+type ApiUsageSnapshotSyncResult = {
+  synced: number;
+  failed: number;
+  finishedAt: number;
+  skipped?: "already_running";
+};
+
+type ApiUsageSnapshotLockConnection = {
+  query: (sql: string, values?: unknown[]) => Promise<[any, unknown]>;
+  end: () => Promise<void>;
+};
+
+let apiUsageSnapshotSyncRunning = false;
+
+export async function runApiUsageSnapshotSyncWithLock(input: {
+  databaseUrl?: string;
+  createConnection?: (url: string) => Promise<ApiUsageSnapshotLockConnection>;
+  sync: () => Promise<ApiUsageSnapshotSyncResult>;
+}): Promise<ApiUsageSnapshotSyncResult> {
+  if (apiUsageSnapshotSyncRunning) {
+    return {
+      synced: 0,
+      failed: 0,
+      finishedAt: Date.now(),
+      skipped: "already_running",
+    };
+  }
+  apiUsageSnapshotSyncRunning = true;
+  const databaseUrl =
+    input.databaseUrl ?? process.env.DATABASE_URL?.trim() ?? "";
+  let connection: ApiUsageSnapshotLockConnection | null = null;
+  let acquired = false;
+  try {
+    if (!databaseUrl) return await input.sync();
+    const createConnection =
+      input.createConnection ??
+      ((url: string) =>
+        mysql.createConnection(url) as Promise<ApiUsageSnapshotLockConnection>);
+    connection = await createConnection(databaseUrl);
+    const [rows] = await connection.query("SELECT GET_LOCK(?, 0) AS acquired", [
+      API_USAGE_SNAPSHOT_SYNC_LOCK_NAME,
+    ]);
+    acquired = Number(rows?.[0]?.acquired ?? 0) === 1;
+    if (!acquired) {
+      return {
+        synced: 0,
+        failed: 0,
+        finishedAt: Date.now(),
+        skipped: "already_running",
+      };
+    }
+    return await input.sync();
+  } finally {
+    try {
+      if (connection) {
+        if (acquired) {
+          await connection
+            .query("SELECT RELEASE_LOCK(?) AS released", [
+              API_USAGE_SNAPSHOT_SYNC_LOCK_NAME,
+            ])
+            .catch(() => undefined);
+        }
+        await connection.end();
+      }
+    } finally {
+      apiUsageSnapshotSyncRunning = false;
+    }
+  }
+}
 
 type ApiUsageScope = "website_frontend" | "managed_user";
 type ApiUsageSeverity = "normal" | "warning" | "critical" | "unavailable";
@@ -46,6 +120,174 @@ export type ManagedApiKeyTargetKind =
   | "delivery_admin"
   | "system_admin"
   | "engineer";
+
+export type BulkManagedApiKeyScope =
+  | { kind: "all" }
+  | { kind: "delivery_admin"; deliveryAdminId: number }
+  | { kind: "engineers"; engineerIds: number[] };
+
+export type BulkManagedApiKeyRequestedTarget = {
+  userId: number;
+  expectedVersion: number;
+};
+
+export type BulkManagedApiKeyApplyMode = "unconfigured_only" | "replace_all";
+
+type BulkManagedApiKeyAccount = {
+  id: number;
+  role: string;
+  adminAccessLevel?: string | null;
+  isActive?: boolean | null;
+};
+
+function managedApiKeyTargetKind(
+  account: BulkManagedApiKeyAccount,
+): ManagedApiKeyTargetKind | null {
+  if (account.role === "user") return "customer";
+  if (account.role === "delivery_member") return "engineer";
+  if (
+    account.role === "admin" &&
+    (account.adminAccessLevel === "delivery_admin" ||
+      account.adminAccessLevel === "system_admin")
+  ) {
+    return account.adminAccessLevel;
+  }
+  return null;
+}
+
+export function resolveBulkManagedApiKeyTargets(input: {
+  scope: BulkManagedApiKeyScope;
+  accounts: BulkManagedApiKeyAccount[];
+  ownerships: Array<{ userId: number; deliveryAdminId: number }>;
+}) {
+  const candidates = input.accounts
+    .filter((account) => account.isActive !== false)
+    .map((account) => ({
+      userId: Number(account.id),
+      kind: managedApiKeyTargetKind(account),
+    }))
+    .filter(
+      (target): target is { userId: number; kind: ManagedApiKeyTargetKind } =>
+        Number.isInteger(target.userId) && target.userId > 0 && !!target.kind,
+    );
+  const candidateById = new Map(
+    candidates.map((target) => [target.userId, target]),
+  );
+
+  if (input.scope.kind === "all") {
+    return candidates.sort((left, right) => left.userId - right.userId);
+  }
+  if (input.scope.kind === "delivery_admin") {
+    const deliveryAdminId = input.scope.deliveryAdminId;
+    const manager = candidateById.get(deliveryAdminId);
+    if (manager?.kind !== "delivery_admin") {
+      throw new AuthServiceError("NOT_FOUND", "所选交付管理员不存在");
+    }
+    const customerIds = new Set(
+      input.ownerships
+        .filter(
+          (ownership) => Number(ownership.deliveryAdminId) === deliveryAdminId,
+        )
+        .map((ownership) => Number(ownership.userId)),
+    );
+    return candidates
+      .filter(
+        (target) =>
+          target.userId === manager.userId ||
+          (target.kind === "customer" && customerIds.has(target.userId)),
+      )
+      .sort((left, right) => left.userId - right.userId);
+  }
+
+  const selectedEngineerIds = new Set(input.scope.engineerIds.map(Number));
+  if (
+    selectedEngineerIds.size === 0 ||
+    [...selectedEngineerIds].some(
+      (userId) => candidateById.get(userId)?.kind !== "engineer",
+    )
+  ) {
+    throw new AuthServiceError("NOT_FOUND", "所选工程师不存在");
+  }
+  return [...selectedEngineerIds]
+    .map((userId) => candidateById.get(userId)!)
+    .sort((left, right) => left.userId - right.userId);
+}
+
+export function assertBulkManagedApiKeyTargetSelection(input: {
+  resolvedTargets: Array<{ userId: number; kind: ManagedApiKeyTargetKind }>;
+  requestedTargets: BulkManagedApiKeyRequestedTarget[];
+}) {
+  const requestedById = new Map<number, BulkManagedApiKeyRequestedTarget>();
+  for (const target of input.requestedTargets) {
+    if (requestedById.has(target.userId)) {
+      throw new AuthServiceError("CONFLICT", "批量 Key 范围包含重复账号");
+    }
+    requestedById.set(target.userId, target);
+  }
+  const exactSelection =
+    requestedById.size === input.resolvedTargets.length &&
+    input.resolvedTargets.every((target) => requestedById.has(target.userId));
+  if (!exactSelection) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "批量 Key 范围已变化，请刷新账号列表后重试",
+    );
+  }
+  return input.resolvedTargets.map((target) => ({
+    ...target,
+    expectedVersion: requestedById.get(target.userId)!.expectedVersion,
+  }));
+}
+
+export function bulkManagedApiKeyActionTargets<
+  T extends { userId: number; kind: ManagedApiKeyTargetKind },
+>(input: {
+  resolvedTargets: T[];
+  latestCredentials: Map<
+    number,
+    { status: string; fingerprint?: string | null }
+  >;
+  applyMode: BulkManagedApiKeyApplyMode;
+  nextFingerprint: string;
+}) {
+  return input.resolvedTargets.filter((target) => {
+    const credential = input.latestCredentials.get(target.userId);
+    if (input.applyMode === "unconfigured_only") {
+      return credential?.status !== "active";
+    }
+    return (
+      credential?.status !== "active" ||
+      credential.fingerprint !== input.nextFingerprint
+    );
+  });
+}
+
+export function assertBulkManagedApiKeyTargetVersions(input: {
+  targets: Array<{
+    userId: number;
+    kind: ManagedApiKeyTargetKind;
+    expectedVersion: number;
+  }>;
+  accounts: Map<number, BulkManagedApiKeyAccount>;
+  latestCredentials: Map<number, { version: number; status: string }>;
+  applyMode: BulkManagedApiKeyApplyMode;
+}) {
+  for (const target of input.targets) {
+    const credential = input.latestCredentials.get(target.userId);
+    if (
+      input.applyMode === "unconfigured_only" &&
+      credential?.status === "active"
+    ) {
+      continue;
+    }
+    assertManagedApiKeyTarget({
+      kind: target.kind,
+      target: input.accounts.get(target.userId),
+      actualVersion: credential?.version ?? 0,
+      expectedVersion: target.expectedVersion,
+    });
+  }
+}
 
 async function requireDb() {
   const db = await getDb();
@@ -96,6 +338,469 @@ export function assertManagedApiKeyTarget(input: {
       "API Key 状态已变化，请刷新后重试；迟到请求不会覆盖较新的 Key",
     );
   }
+}
+
+async function loadBulkManagedApiKeyScopeState(input: {
+  executor: any;
+  scope: BulkManagedApiKeyScope;
+  lock?: boolean;
+}) {
+  const loadAccounts = async (userIds?: number[]) => {
+    const query = input.executor
+      .select({
+        id: users.id,
+        role: users.role,
+        adminAccessLevel: users.adminAccessLevel,
+        isActive: users.isActive,
+      })
+      .from(users);
+    const orderedQuery = userIds
+      ? query
+          .where(inArray(users.id, userIds))
+          .orderBy(
+            sql`case when ${users.role} = 'user' then 0 else 1 end`,
+            asc(users.id),
+          )
+      : query.orderBy(
+          sql`case when ${users.role} = 'user' then 0 else 1 end`,
+          asc(users.id),
+        );
+    return input.lock ? await orderedQuery.for("update") : await orderedQuery;
+  };
+
+  let accounts: BulkManagedApiKeyAccount[];
+  let ownerships: Array<{ userId: number; deliveryAdminId: number }> = [];
+  if (input.scope.kind === "delivery_admin") {
+    const ownershipQuery = input.executor
+      .select({
+        userId: userUsageOwners.userId,
+        deliveryAdminId: userUsageOwners.deliveryAdminId,
+      })
+      .from(userUsageOwners)
+      .where(eq(userUsageOwners.deliveryAdminId, input.scope.deliveryAdminId))
+      .orderBy(asc(userUsageOwners.userId));
+    const observedOwnerships: Array<{
+      userId: number;
+      deliveryAdminId: number;
+    }> = await ownershipQuery;
+    accounts = await loadAccounts([
+      ...new Set([
+        input.scope.deliveryAdminId,
+        ...observedOwnerships.map((ownership) => Number(ownership.userId)),
+      ]),
+    ]);
+    ownerships = input.lock
+      ? await ownershipQuery.for("update")
+      : observedOwnerships;
+    if (input.lock) {
+      const observedCustomerIds = observedOwnerships
+        .map((ownership) => Number(ownership.userId))
+        .sort((left, right) => left - right);
+      const lockedCustomerIds = ownerships
+        .map((ownership) => Number(ownership.userId))
+        .sort((left, right) => left - right);
+      if (
+        observedCustomerIds.length !== lockedCustomerIds.length ||
+        observedCustomerIds.some(
+          (userId, index) => userId !== lockedCustomerIds[index],
+        )
+      ) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "交付管理员负责范围已变化，请刷新账号列表后重试",
+        );
+      }
+    }
+  } else if (input.scope.kind === "engineers") {
+    accounts = await loadAccounts([
+      ...new Set(input.scope.engineerIds.map(Number)),
+    ]);
+  } else {
+    accounts = await loadAccounts();
+  }
+  const resolvedTargets = resolveBulkManagedApiKeyTargets({
+    scope: input.scope,
+    accounts,
+    ownerships,
+  });
+  return { accounts, ownerships, resolvedTargets };
+}
+
+function latestManagedCredentialByUser<
+  T extends { userId: number; version: number },
+>(rows: T[]) {
+  const latest = new Map<number, T>();
+  for (const row of rows) {
+    const userId = Number(row.userId);
+    const existing = latest.get(userId);
+    if (!existing || Number(row.version) > Number(existing.version)) {
+      latest.set(userId, row);
+    }
+  }
+  return latest;
+}
+
+export function bulkPreviousCredentialGroups(input: {
+  targets: Array<{ userId: number }>;
+  latestCredentials: Map<
+    number,
+    { userId: number; status: string; fingerprint: string }
+  >;
+  nextFingerprint: string;
+}) {
+  const groups = new Map<
+    string,
+    { fingerprint: string; accountIds: Set<number> }
+  >();
+  for (const target of input.targets) {
+    const credential = input.latestCredentials.get(target.userId);
+    if (
+      credential?.status !== "active" ||
+      credential.fingerprint === input.nextFingerprint
+    ) {
+      continue;
+    }
+    const group = groups.get(credential.fingerprint) ?? {
+      fingerprint: credential.fingerprint,
+      accountIds: new Set<number>(),
+    };
+    group.accountIds.add(target.userId);
+    groups.set(credential.fingerprint, group);
+  }
+  return [...groups.values()];
+}
+
+async function scanBulkPreviousCredentialGroups(
+  groups: Array<{ fingerprint: string; accountIds: Set<number> }>,
+) {
+  for (const group of groups) {
+    const accountIds = [...group.accountIds];
+    try {
+      await getSharedKeyMonthlyCreditUsageForAccounts({
+        credentialOwnerIds: accountIds,
+        accountIds,
+        poolFingerprint: group.fingerprint,
+        windowDays: DEFAULT_API_USAGE_WINDOW_DAYS,
+      });
+    } catch {
+      // Coverage is checked authoritatively after the best-effort scan. A
+      // prior fresh proof may still permit the atomic batch replacement.
+    }
+  }
+}
+
+function incompleteBulkHistoryTargets(input: {
+  targets: Array<{ userId: number }>;
+  latestCredentials: Map<
+    number,
+    { userId: number; status: string; fingerprint: string }
+  >;
+  coverageByFingerprint: Map<string, any>;
+  nextFingerprint: string;
+  nowMs: number;
+}) {
+  const periodStartMs = getShanghaiRollingUsagePeriod(
+    DEFAULT_API_USAGE_WINDOW_DAYS,
+    input.nowMs,
+  ).startAt;
+  return input.targets.filter((target) => {
+    const credential = input.latestCredentials.get(target.userId);
+    if (
+      credential?.status !== "active" ||
+      credential.fingerprint === input.nextFingerprint
+    ) {
+      return false;
+    }
+    return !usageCoverageSupportsReplacement({
+      coverage: input.coverageByFingerprint.get(credential.fingerprint),
+      periodStartMs,
+      nowMs: input.nowMs,
+    });
+  });
+}
+
+export async function bulkReplaceManagedApiKeyTargets(input: {
+  actor: AuthenticatedUser;
+  scope: BulkManagedApiKeyScope;
+  targets: BulkManagedApiKeyRequestedTarget[];
+  applyMode: BulkManagedApiKeyApplyMode;
+  apiKey: string;
+  reason?: string;
+}) {
+  if (!isSystemAdmin(input.actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "只有系统管理员可以批量配置账号 API Key。",
+    );
+  }
+  const db = await requireDb();
+  const initialScope = await loadBulkManagedApiKeyScopeState({
+    executor: db,
+    scope: input.scope,
+  });
+  const scopeTargetIds = initialScope.resolvedTargets.map(
+    (target) => target.userId,
+  );
+  if (scopeTargetIds.length === 0) {
+    throw new AuthServiceError("CONFLICT", "当前批量范围内没有可配置账号");
+  }
+  const initialCredentialRows = await db
+    .select({
+      userId: apiCredentials.userId,
+      version: apiCredentials.version,
+      status: apiCredentials.status,
+      fingerprint: apiCredentials.fingerprint,
+    })
+    .from(apiCredentials)
+    .where(inArray(apiCredentials.userId, scopeTargetIds))
+    .orderBy(asc(apiCredentials.userId), desc(apiCredentials.version));
+  const initialLatestCredentials = latestManagedCredentialByUser(
+    initialCredentialRows,
+  );
+  const initialScopeTargets = assertBulkManagedApiKeyTargetSelection({
+    resolvedTargets: initialScope.resolvedTargets,
+    requestedTargets: input.targets,
+  });
+  const nextFingerprint = getApiKeyFingerprint(input.apiKey);
+  const initialActionTargets = bulkManagedApiKeyActionTargets({
+    resolvedTargets: initialScopeTargets,
+    latestCredentials: initialLatestCredentials,
+    applyMode: input.applyMode,
+    nextFingerprint,
+  });
+  if (initialActionTargets.length > 200) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "单次批量配置最多支持 200 个实际变更账号，请缩小范围后重试",
+    );
+  }
+  await validateUpstreamApiKey(input.apiKey);
+  const previousGroups = bulkPreviousCredentialGroups({
+    targets: initialActionTargets,
+    latestCredentials: initialLatestCredentials,
+    nextFingerprint,
+  });
+  const initialFingerprints = previousGroups.map((group) => group.fingerprint);
+  const initialCoverageRows = initialFingerprints.length
+    ? await db
+        .select()
+        .from(apiUsageCredentialCoverage)
+        .where(
+          and(
+            eq(apiUsageCredentialCoverage.scope, "managed_user"),
+            inArray(
+              apiUsageCredentialCoverage.credentialFingerprint,
+              initialFingerprints,
+            ),
+          ),
+        )
+    : [];
+  const initialCoverageByFingerprint = new Map(
+    initialCoverageRows.map((coverage: any) => [
+      String(coverage.credentialFingerprint),
+      coverage,
+    ]),
+  );
+  const coverageNowMs = Date.now();
+  const coveragePeriodStartMs = getShanghaiRollingUsagePeriod(
+    DEFAULT_API_USAGE_WINDOW_DAYS,
+    coverageNowMs,
+  ).startAt;
+  await scanBulkPreviousCredentialGroups(
+    previousGroups.filter(
+      (group) =>
+        !usageCoverageSupportsReplacement({
+          coverage: initialCoverageByFingerprint.get(group.fingerprint),
+          periodStartMs: coveragePeriodStartMs,
+          nowMs: coverageNowMs,
+        }),
+    ),
+  );
+
+  const batchId = randomUUID();
+  const replacedAt = new Date();
+  const result = await db.transaction(async (tx) => {
+    const lockedScope = await loadBulkManagedApiKeyScopeState({
+      executor: tx,
+      scope: input.scope,
+      lock: true,
+    });
+    const accountById = new Map<number, BulkManagedApiKeyAccount>(
+      (lockedScope.accounts as BulkManagedApiKeyAccount[]).map((account) => [
+        Number(account.id),
+        account,
+      ]),
+    );
+    const credentialRows = await tx
+      .select({
+        userId: apiCredentials.userId,
+        version: apiCredentials.version,
+        status: apiCredentials.status,
+        fingerprint: apiCredentials.fingerprint,
+      })
+      .from(apiCredentials)
+      .where(
+        inArray(
+          apiCredentials.userId,
+          lockedScope.resolvedTargets.map((target) => target.userId),
+        ),
+      )
+      .orderBy(asc(apiCredentials.userId), desc(apiCredentials.version))
+      .for("update");
+    const latestCredentials = latestManagedCredentialByUser(credentialRows);
+    const lockedScopeTargets = assertBulkManagedApiKeyTargetSelection({
+      resolvedTargets: lockedScope.resolvedTargets,
+      requestedTargets: input.targets,
+    });
+    const lockedActionTargets = bulkManagedApiKeyActionTargets({
+      resolvedTargets: lockedScopeTargets,
+      latestCredentials,
+      applyMode: input.applyMode,
+      nextFingerprint,
+    });
+    if (lockedActionTargets.length > 200) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "单次批量配置最多支持 200 个实际变更账号，请缩小范围后重试",
+      );
+    }
+    assertBulkManagedApiKeyTargetVersions({
+      targets: lockedActionTargets,
+      accounts: accountById,
+      latestCredentials,
+      applyMode: input.applyMode,
+    });
+
+    const fingerprints =
+      input.applyMode === "replace_all"
+        ? [
+            ...new Set(
+              lockedActionTargets
+                .map((target) => latestCredentials.get(target.userId))
+                .filter(
+                  (credential) =>
+                    credential?.status === "active" &&
+                    credential.fingerprint !== nextFingerprint,
+                )
+                .map((credential) => credential!.fingerprint),
+            ),
+          ]
+        : [];
+    const coverageRows = fingerprints.length
+      ? await tx
+          .select()
+          .from(apiUsageCredentialCoverage)
+          .where(
+            and(
+              eq(apiUsageCredentialCoverage.scope, "managed_user"),
+              inArray(
+                apiUsageCredentialCoverage.credentialFingerprint,
+                fingerprints,
+              ),
+            ),
+          )
+          .for("update")
+      : [];
+    const coverageByFingerprint = new Map(
+      coverageRows.map((coverage: any) => [
+        String(coverage.credentialFingerprint),
+        coverage,
+      ]),
+    );
+    const historyIncomplete = incompleteBulkHistoryTargets({
+      targets: input.applyMode === "replace_all" ? lockedActionTargets : [],
+      latestCredentials,
+      coverageByFingerprint,
+      nextFingerprint,
+      nowMs: replacedAt.getTime(),
+    });
+    if (historyIncomplete.length > 0) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        `${historyIncomplete.length} 个账号的旧 API Key 未完成近 30 天扫描，批量操作已全部停止。请重试；失效 Key 请改用单账号应急替换。`,
+      );
+    }
+
+    let updatedCount = 0;
+    let unchangedCount = lockedScopeTargets.length - lockedActionTargets.length;
+    const versions: Array<{ userId: number; version: number }> = [];
+    for (const target of lockedActionTargets) {
+      const currentCredential = latestCredentials.get(target.userId);
+      if (
+        currentCredential?.status === "active" &&
+        (input.applyMode === "unconfigured_only" ||
+          currentCredential.fingerprint === nextFingerprint)
+      ) {
+        unchangedCount += 1;
+        versions.push({
+          userId: target.userId,
+          version: currentCredential.version,
+        });
+        continue;
+      }
+      const credential = await replaceApiCredentialInTransaction({
+        executor: tx,
+        userId: target.userId,
+        apiKey: input.apiKey,
+        now: replacedAt,
+      });
+      updatedCount += 1;
+      versions.push({ userId: target.userId, version: credential.version });
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "admin.api_credential.bulk_replaced",
+          targetType: target.kind,
+          targetId: target.userId,
+          workspaceUserId: target.kind === "customer" ? target.userId : null,
+          reason: input.reason,
+          now: replacedAt,
+          metadata: {
+            batchId,
+            scopeKind: input.scope.kind,
+            applyMode: input.applyMode,
+            previousVersion: currentCredential?.version ?? 0,
+            credentialVersion: credential.version,
+            historyIncomplete: false,
+          },
+        },
+        tx,
+      );
+    }
+    await writeWorkspaceAuditEvent(
+      {
+        actor: input.actor,
+        action: "admin.api_credential.bulk_completed",
+        targetType: "api_credential_batch",
+        targetId: batchId,
+        reason: input.reason,
+        now: replacedAt,
+        metadata: {
+          scope: input.scope,
+          applyMode: input.applyMode,
+          scopeTargetCount: lockedScope.resolvedTargets.length,
+          targetCount: lockedActionTargets.length,
+          updatedCount,
+          unchangedCount,
+          targetUserIds: lockedActionTargets.map((target) => target.userId),
+        },
+      },
+      tx,
+    );
+    return {
+      batchId,
+      scopeTargetCount: lockedScope.resolvedTargets.length,
+      targetCount: lockedActionTargets.length,
+      updatedCount,
+      unchangedCount,
+      versions,
+    };
+  });
+
+  // Do not hold the HTTP mutation open for a second unbounded history scan
+  // after the transaction has committed. The regular snapshot worker binds
+  // retired coverage and refreshes the now-stale fingerprint snapshots.
+  return result;
 }
 
 export async function replaceManagedApiKeyTarget(input: {
@@ -209,7 +914,11 @@ export async function replaceManagedApiKeyTarget(input: {
       actualVersion,
       expectedVersion: input.expectedVersion,
     });
-    const currentCredential = credentialRows[0];
+    // Deleted credentials are version tombstones for CAS only. They are not
+    // readable old Keys and must never require a coverage proof before the
+    // account can be configured again.
+    const currentCredential =
+      credentialRows[0]?.status === "active" ? credentialRows[0] : undefined;
     const coverageRows = currentCredential
       ? await tx
           .select()
@@ -379,6 +1088,7 @@ async function accessibleWorkspaceUsers(
         id: users.id,
         enterpriseName: users.displayName,
         username: users.username,
+        isActive: users.isActive,
       })
       .from(users)
       .where(eq(users.role, "user"));
@@ -388,6 +1098,7 @@ async function accessibleWorkspaceUsers(
       id: users.id,
       enterpriseName: users.displayName,
       username: users.username,
+      isActive: users.isActive,
     })
     .from(userAdminAssignments)
     .innerJoin(users, eq(users.id, userAdminAssignments.userId))
@@ -411,6 +1122,7 @@ async function accessibleDeliveryAdmins(
         displayName: users.displayName,
         username: users.username,
         adminAccessLevel: users.adminAccessLevel,
+        isActive: users.isActive,
       })
       .from(users)
       .where(eq(users.role, "admin"));
@@ -424,6 +1136,7 @@ async function accessibleDeliveryAdmins(
       displayName: actor.displayName ?? null,
       username: actor.username,
       adminAccessLevel: actor.adminAccessLevel,
+      isActive: actor.isActive,
     },
   ];
 }
@@ -438,6 +1151,7 @@ async function accessibleDeliveryEngineers(
       id: users.id,
       displayName: users.displayName,
       username: users.username,
+      isActive: users.isActive,
     })
     .from(users)
     .where(eq(users.role, "delivery_member"));
@@ -992,6 +1706,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
         customer.username?.trim() ||
         `客户 ${customer.id}`,
       username: customer.username,
+      isActive: customer.isActive !== false,
       deliveryAdminId: ownerId,
       deliveryAdminName:
         owner?.displayName?.trim() || owner?.username?.trim() || null,
@@ -1022,6 +1737,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
         engineer.username?.trim() ||
         `工程师 ${engineer.id}`,
       username: engineer.username,
+      isActive: engineer.isActive !== false,
       apiKeyConfigured: latestCredential?.status === "active",
       apiKeyVersion: latestCredential?.version ?? 0,
       keyTotalUsed: usage.used,
@@ -1047,6 +1763,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
           administrator.username?.trim() ||
           `系统管理员 ${administrator.id}`,
         username: administrator.username,
+        isActive: administrator.isActive !== false,
         apiKeyConfigured: latestCredential?.status === "active",
         apiKeyVersion: latestCredential?.version ?? 0,
         keyTotalUsed: usage.used,
@@ -1121,6 +1838,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
           manager.username?.trim() ||
           `交付管理员 ${manager.id}`,
         username: manager.username,
+        isActive: manager.isActive !== false,
         apiKeyConfigured: latestManagerCredential?.status === "active",
         apiKeyVersion: latestManagerCredential?.version ?? 0,
         keyPool: {
@@ -1274,7 +1992,7 @@ async function mapWithConcurrency<T>(
   );
 }
 
-export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
+async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
   if (!isSystemAdmin(actor)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
@@ -1545,6 +2263,18 @@ export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
     },
   );
   return { synced, failed, finishedAt: Date.now() };
+}
+
+export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
+  if (!isSystemAdmin(actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "只有系统管理员可以同步 Key 与积分使用情况。",
+    );
+  }
+  return runApiUsageSnapshotSyncWithLock({
+    sync: () => syncApiUsageSnapshotsUnlocked(actor),
+  });
 }
 
 export async function updateApiUsagePolicy(input: {

@@ -42,11 +42,11 @@ describe("migration manifest", () => {
       dialect: "mysql",
       count: journal.entries.length,
       latestTag: journal.entries.at(-1)?.tag,
-      schemaSnapshot: "meta/0048_snapshot.json",
-      schemaTableCount: 57,
+      schemaSnapshot: "meta/0052_snapshot.json",
+      schemaTableCount: 59,
       schemaHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
-    expect(manifest.schemaContract.tables).toHaveLength(57);
+    expect(manifest.schemaContract.tables).toHaveLength(59);
     expect(
       manifest.schemaContract.tables.map((table) => table.name),
     ).not.toContain("__drizzle_migrations");
@@ -87,41 +87,43 @@ describe("migration manifest", () => {
     const folder = await copiedMigrations();
     const journalPath = path.join(folder, "meta", "_journal.json");
     const journal = JSON.parse(await fs.readFile(journalPath, "utf8"));
+    const probeIndex = journal.entries.length;
+    const probePrefix = String(probeIndex).padStart(4, "0");
+    const previousPrefix = String(probeIndex - 1).padStart(4, "0");
+    const probeTag = `${probePrefix}_additive_release_probe`;
     journal.entries.push({
-      idx: journal.entries.length,
+      idx: probeIndex,
       version: "7",
-      when: 1785612861130,
-      tag: "0049_additive_release_probe",
+      when: Number(journal.entries.at(-1)?.when ?? 0) + 1,
+      tag: probeTag,
       breakpoints: true,
     });
     await fs.writeFile(journalPath, `${JSON.stringify(journal, null, 2)}\n`);
     await fs.writeFile(
-      path.join(folder, "0049_additive_release_probe.sql"),
+      path.join(folder, `${probeTag}.sql`),
       "CREATE TABLE `release_probe` (`id` int NOT NULL);\n",
     );
     await fs.copyFile(
-      path.join(folder, "meta", "0048_snapshot.json"),
-      path.join(folder, "meta", "0049_snapshot.json"),
+      path.join(folder, "meta", `${previousPrefix}_snapshot.json`),
+      path.join(folder, "meta", `${probePrefix}_snapshot.json`),
     );
 
     await expect(
       createMigrationManifest({ migrationsFolder: folder }),
-    ).rejects.toThrow(
-      "MIGRATION_CLASSIFICATION_REQUIRED:0049_additive_release_probe",
-    );
+    ).rejects.toThrow(`MIGRATION_CLASSIFICATION_REQUIRED:${probeTag}`);
 
     const policyPath = path.join(folder, "migration-policy.json");
     const policy = JSON.parse(await fs.readFile(policyPath, "utf8"));
-    policy.migrations["0049_additive_release_probe"] = "expand";
+    policy.migrations[probeTag] = "expand";
     await fs.writeFile(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
     await expect(
       createMigrationManifest({ migrationsFolder: folder }),
     ).resolves.toMatchObject({
-      count: 50,
-      latestTag: "0049_additive_release_probe",
+      count: probeIndex + 1,
+      latestTag: probeTag,
       migrations: expect.arrayContaining([
         expect.objectContaining({
-          tag: "0049_additive_release_probe",
+          tag: probeTag,
           classification: "expand",
         }),
       ]),

@@ -31,14 +31,32 @@ export function isUsageTaskTerminal(task: any) {
 }
 
 export function selectPhysicalCredentialRows<
-  T extends { fingerprint: string; status: string },
+  T extends {
+    fingerprint: string;
+    status: string;
+    retiredAt?: Date | number | null;
+    version?: number;
+  },
 >(rows: T[]) {
   const byFingerprint = new Map<string, T>();
   for (const row of rows) {
     const existing = byFingerprint.get(row.fingerprint);
+    const existingRetiredAt =
+      existing?.retiredAt instanceof Date
+        ? existing.retiredAt.getTime()
+        : Number(existing?.retiredAt ?? 0);
+    const rowRetiredAt =
+      row.retiredAt instanceof Date
+        ? row.retiredAt.getTime()
+        : Number(row.retiredAt ?? 0);
     if (
       !existing ||
-      (existing.status !== "active" && row.status === "active")
+      (existing.status !== "active" && row.status === "active") ||
+      (existing.status !== "active" &&
+        row.status !== "active" &&
+        (rowRetiredAt > existingRetiredAt ||
+          (rowRetiredAt === existingRetiredAt &&
+            Number(row.version ?? 0) > Number(existing.version ?? 0))))
     ) {
       byFingerprint.set(row.fingerprint, row);
     }

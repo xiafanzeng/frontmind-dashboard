@@ -186,6 +186,56 @@ describe("manual service order internal routes", () => {
     });
   });
 
+  it("confirms an external WeChat contract through the service-token boundary", async () => {
+    const authorized = {
+      ...response("payment_required"),
+      order: {
+        ...response("payment_required").order,
+        contractAuthorizationMode: "external_wechat" as const,
+        contractAuthorizedAt: "2026-07-26T10:05:00.000Z",
+      },
+    };
+    const manualOrders = {
+      create: vi.fn(),
+      status: vi.fn(),
+      authorizeExternal: vi.fn().mockResolvedValue(authorized),
+      recordPayment: vi.fn(),
+      setupAccount: vi.fn(),
+    };
+    const baseUrl = await startApp(manualOrders);
+    const request = {
+      schemaVersion: 1,
+      authorization: {
+        mode: "external_wechat",
+        eventReference: "wechat-contract-event-001",
+        authorizedAt: "2026-07-26T10:05:00.000Z",
+      },
+    };
+    const result = await fetch(
+      `${baseUrl}/manual-orders/manual-order-reference-001/external-contract`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-frontmind-provisioning-token": SERVICE_TOKEN,
+        },
+        body: JSON.stringify(request),
+      },
+    );
+    expect(result.status).toBe(200);
+    expect(manualOrders.authorizeExternal).toHaveBeenCalledWith({
+      reference: "manual-order-reference-001",
+      request,
+      secret: SERVICE_TOKEN,
+    });
+    expect(await result.json()).toMatchObject({
+      order: {
+        status: "payment_required",
+        contractAuthorizationMode: "external_wechat",
+      },
+    });
+  });
+
   it("accepts customer credentials only after payment on the dedicated account route", async () => {
     const ready = response("active");
     const manualOrders = {

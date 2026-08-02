@@ -901,6 +901,9 @@ export function isKnowledgeBaseAcknowledgementOnlyOutput(output: unknown) {
   );
 }
 
+export const KNOWLEDGE_BASE_ACKNOWLEDGEMENT_FAILURE_MESSAGE =
+  "上游智能体仅返回了确认回执，未生成知识库正文；本轮未写入，现可安全重试";
+
 export function assertKnowledgeBaseCustomerOutput(output: unknown) {
   const text = extractFinalKnowledgeBaseAssistantText(output);
   const customerVisibleText = stripKnowledgeBaseReferenceAppendix(
@@ -2038,6 +2041,13 @@ export async function observeKnowledgeBaseProtocolFailure(input: {
   /** Exact task owned by the currently active turn, when already bound. */
   taskId?: string;
   observedAt?: Date;
+  /**
+   * Use only for an immutable, settled provider result whose protocol failure
+   * is already conclusive (for example, an acknowledgement-only response).
+   * Ordinary resource/protocol snapshots must retain the multi-observation
+   * debounce because providers can replace an incomplete settled snapshot.
+   */
+  definitive?: boolean;
 }): Promise<boolean> {
   const db = await requireDb();
   const conversationId = normalizeConversationId(input.conversationId);
@@ -2104,7 +2114,7 @@ export async function observeKnowledgeBaseProtocolFailure(input: {
         protocolFailureObservation: advanced.observation,
       },
     };
-    if (!advanced.shouldPersist) {
+    if (!input.definitive && !advanced.shouldPersist) {
       await tx
         .update(conversationTurns)
         .set({ metadata: nextMetadata, updatedAt: observedAt })
@@ -3243,7 +3253,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
       input.output,
     );
     const message = acknowledgementOnly
-      ? "上游智能体仅返回了确认回执，未生成知识库正文；本轮未写入，现可安全重试"
+      ? KNOWLEDGE_BASE_ACKNOWLEDGEMENT_FAILURE_MESSAGE
       : friendlyProtocolError(error);
     // Deliberately do not update the output ledger on failure. A provider may
     // append a missing companion resource to the same cumulative output; the
@@ -3260,6 +3270,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
       }),
       message,
       code: acknowledgementOnly ? "UPSTREAM_ACKNOWLEDGEMENT_ONLY" : undefined,
+      definitive: acknowledgementOnly,
     });
     const progress = await getKnowledgeBaseProgress({
       userId: input.userId,

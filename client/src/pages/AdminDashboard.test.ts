@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   adminNav,
+  bulkApiKeyTargetsForScope,
   buildDeliveryEngineerStatusRows,
   channelDistributionUrl,
   filterApiKeyUsageForAdmin,
@@ -16,6 +17,7 @@ import {
   issueMonitorUrl,
   normalizeApiKeyUsageAlerts,
   normalizeUsageHierarchy,
+  type KeyManagementRow,
 } from "./AdminDashboard";
 import { previewAdminNav } from "@/lib/preview-navigation";
 
@@ -31,7 +33,7 @@ describe("administrator channel navigation", () => {
         "官网任务与积分",
         "客户交付工作台",
         "客户项目团队",
-        "工单",
+        "工单管理",
         "账号与权限",
         "问题监控",
         "渠道分发",
@@ -197,6 +199,12 @@ describe("administrator channel navigation", () => {
     expect(source).toContain(
       "trpc.admin.apiKeyUsageAlerts.revokeTargetCredential.useMutation()",
     );
+    expect(source).toContain(
+      "trpc.admin.apiKeyUsageAlerts.bulkReplaceTargetCredentials.useMutation()",
+    );
+    expect(source).toContain("批量配置 Key");
+    expect(source).toContain('confirmation: "BULK_REPLACE_API_KEYS"');
+    expect(source).toContain("任一账号发生版本冲突都会全部回滚");
     expect(source).toContain('confirmation: "REPLACE_API_KEY"');
     expect(source).toContain('confirmation: "REVOKE_API_KEY"');
     expect(source).toContain("迟到请求不会覆盖较新的 Key");
@@ -524,5 +532,73 @@ describe("administrator channel navigation", () => {
       ),
     ).toEqual(["own", "shared"]);
     expect(filterPreviewTicketsForAdmin(tickets, true, "101")).toEqual(tickets);
+  });
+});
+
+describe("bulk API Key target previews", () => {
+  function keyRow(
+    input: Pick<KeyManagementRow, "kind" | "userId" | "deliveryAdminId"> &
+      Partial<KeyManagementRow>,
+  ): KeyManagementRow {
+    return {
+      displayName: `账号 ${input.userId}`,
+      username: `user-${input.userId}`,
+      configured: false,
+      version: 0,
+      typeLabel: "账号",
+      scopeLabel: "测试范围",
+      isActive: true,
+      inherited: false,
+      ownAgentMonthUsed: 0,
+      keyTotalUsed: 0,
+      otherOrUnattributedUsed: 0,
+      syncStatus: "unconfigured",
+      fetchedAt: null,
+      ...input,
+    };
+  }
+
+  const rows: KeyManagementRow[] = [
+    keyRow({ kind: "system_admin", userId: 1, deliveryAdminId: null }),
+    keyRow({
+      kind: "delivery_admin",
+      userId: 10,
+      deliveryAdminId: 10,
+    }),
+    keyRow({ kind: "customer", userId: 11, deliveryAdminId: 10 }),
+    keyRow({ kind: "customer", userId: 12, deliveryAdminId: 20 }),
+    keyRow({ kind: "engineer", userId: 30, deliveryAdminId: null }),
+    keyRow({
+      kind: "customer",
+      userId: 13,
+      deliveryAdminId: 10,
+      isActive: false,
+    }),
+  ];
+
+  it("includes every active account in the all scope and excludes disabled accounts", () => {
+    expect(
+      bulkApiKeyTargetsForScope(rows, { kind: "all" }).map(
+        (target) => target.userId,
+      ),
+    ).toEqual([1, 10, 11, 12, 30]);
+  });
+
+  it("previews one delivery manager plus owned customers without engineers", () => {
+    expect(
+      bulkApiKeyTargetsForScope(rows, {
+        kind: "delivery_admin",
+        deliveryAdminId: 10,
+      }).map((target) => target.userId),
+    ).toEqual([10, 11]);
+  });
+
+  it("previews only explicitly selected engineers", () => {
+    expect(
+      bulkApiKeyTargetsForScope(rows, {
+        kind: "engineers",
+        engineerIds: [30],
+      }).map((target) => target.userId),
+    ).toEqual([30]);
   });
 });

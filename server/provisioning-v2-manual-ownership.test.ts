@@ -235,6 +235,42 @@ describe("manual purchase ledger ownership", () => {
     });
   });
 
+  it.each([
+    [
+      "与合同授权同时付款",
+      "2026-07-26T10:10:00.000Z",
+      "2026-07-26T10:10:00.000Z",
+    ],
+    ["先付款后授权", "2026-07-26T10:09:59.999Z", "2026-07-26T10:10:00.000Z"],
+  ])("拒绝企业微信合同的无效付款顺序：%s", async (_, paidAt, authorizedAt) => {
+    databaseState.value = decisionDatabase({
+      id: "provision-external-001",
+      schemaVersion: 2,
+      status: "pending_confirmation",
+      paidAt: new Date(paidAt),
+      contractEvidence: {
+        type: "external_wechat_confirmation",
+        manualOrderReference: "manual-order-reference-001",
+        eventReference: "wechat-contract-event-001",
+        authorizedAt,
+      },
+    });
+
+    await expect(
+      decideWebsitePurchase({
+        reference: "provision-external-001",
+        manualOrderReference: "manual-order-reference-001",
+        decision: "confirm",
+        secret: SECRET,
+        now: new Date("2026-07-26T10:20:00.000Z"),
+      }),
+    ).rejects.toMatchObject({
+      code: "PURCHASE_ALREADY_DECIDED",
+      status: 400,
+      message: "企业微信合同确认记录无效",
+    });
+  });
+
   it("does not let a manual submission adopt an unowned idempotent ledger", async () => {
     const request = purchaseRequest();
     databaseState.value = decisionDatabase({

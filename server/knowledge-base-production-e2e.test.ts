@@ -2012,6 +2012,153 @@ describe("knowledge-base production final-package acceptance", () => {
     );
   }, 120_000);
 
+  it("rejects a settled acknowledgement before first-Logo binding and unlocks an immediate retry", async () => {
+    const state = initialState();
+    const buildId = "77777777-7777-4777-8777-777777777777";
+    const turnId = "88888888-8888-4888-8888-888888888888";
+    const taskId = "task-acknowledgement-only";
+    const now = new Date("2026-08-02T14:15:32.000Z");
+    state.builds.push({
+      id: buildId,
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: "FrontMind超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "d".repeat(64),
+      status: "researching",
+      generation: 1,
+      stateEpoch: 2,
+      revision: 0,
+      currentLeafId: null,
+      totalNodeCount: 0,
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      activeTurnId: turnId,
+      upstreamTaskId: taskId,
+      lastAppliedOperationKey: null,
+      lastReconciledHash: null,
+      lastOutputLength: 0,
+      lastOutputItemIds: [],
+      awaitingResponseSince: now,
+      protocolError: null,
+      protocolErrorCode: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    state.turns.push({
+      id: turnId,
+      conversationId: STORED_CONVERSATION_ID,
+      userId: USER_ID,
+      apiCredentialId: "credential-e2e",
+      clientRequestId: "request-acknowledgement-only",
+      buildId,
+      buildGeneration: 1,
+      operationKey: "operation-acknowledgement-only",
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      requestHash: "e".repeat(64),
+      upstreamIdempotencyKeyHash: "f".repeat(64),
+      attachmentFileIds: [],
+      metadata: { recovery: {} },
+      leaseExpiresAt: new Date("2026-08-02T14:20:32.000Z"),
+      status: "running",
+      upstreamTaskId: taskId,
+      errorCode: null,
+      errorMessage: null,
+      startedAt: now,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    dependencies.getDb.mockResolvedValue(memoryDatabase(state));
+    dependencies.getCredentialForUpstreamResource.mockResolvedValue({
+      id: "credential-e2e",
+      apiKey: "sk-e2e-only",
+    });
+
+    const getTask = vi.spyOn(axios, "get").mockResolvedValueOnce({
+      status: 200,
+      data: {
+        id: taskId,
+        status: "completed",
+        output: [
+          {
+            id: "assistant-acknowledgement",
+            role: "assistant",
+            type: "message",
+            content: "已收到。",
+          },
+        ],
+      },
+    } as any);
+    const { default: knowledgeBaseRouter } = await import(
+      "./knowledge-base-api"
+    );
+    const { requireExpressAuth } = await import("./_core/express-auth");
+    const dashboard = express();
+    dashboard.use(express.json());
+    dashboard.use(
+      "/api/knowledge-base",
+      requireExpressAuth,
+      knowledgeBaseRouter,
+    );
+    const listener = await listen(dashboard);
+    try {
+      const response = await fetch(
+        `${listener.baseUrl}/api/knowledge-base/progress/reconcile`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
+        },
+      );
+      expect(response.status).toBe(200);
+      expect((await response.json()) as any).toMatchObject({
+        observation: {
+          interaction: {
+            interactionState: "failed",
+            progress: {
+              build: {
+                status: "protocol_error",
+              },
+            },
+          },
+          notice: {
+            code: "UPSTREAM_ACKNOWLEDGEMENT_ONLY",
+            retryable: true,
+            message:
+              "上游智能体仅返回了确认回执，未生成知识库正文；本轮未写入，现可安全重试",
+          },
+        },
+      });
+      expect(getTask).toHaveBeenCalledTimes(1);
+      expect(state.builds[0]).toMatchObject({
+        status: "protocol_error",
+        stateEpoch: 3,
+        activeTurnId: turnId,
+        protocolErrorCode: "UPSTREAM_ACKNOWLEDGEMENT_ONLY",
+        awaitingResponseSince: null,
+        lastOutputLength: 0,
+      });
+      expect(state.turns[0]).toMatchObject({
+        status: "failed",
+        upstreamTaskId: taskId,
+        errorCode: "UPSTREAM_ACKNOWLEDGEMENT_ONLY",
+        leaseExpiresAt: null,
+      });
+    } finally {
+      getTask.mockRestore();
+      await close(listener.server);
+    }
+  });
+
   it("returns the durable third settled failure only for the exact active task", async () => {
     const state = initialState();
     const buildId = "44444444-4444-4444-8444-444444444444";

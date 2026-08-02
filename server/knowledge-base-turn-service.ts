@@ -7,6 +7,7 @@ import {
   conversations,
   conversationTurns,
   knowledgeBaseBuilds,
+  knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
   upstreamResources,
   userUsageOwners,
@@ -1646,9 +1647,10 @@ export async function reserveKnowledgeBaseStartBuild(
   const db = executor ?? (await requireDb());
 
   return db.transaction(async (tx: any) => {
-    // Global mutation lock order is credential -> current owner slot -> reset
-    // tombstone -> build -> turn. Do this before the build insert so an old
-    // browser tab can never resurrect a conversation after an approved reset.
+    // Global mutation lock order is credential -> current owner slot -> active
+    // reset tombstone -> retained reset tombstone -> build -> turn. Do this
+    // before the build insert so an old browser tab can never resurrect a
+    // conversation after an approved reset.
     const pinnedCredential = await lockKnowledgeBaseReservationCredential(
       tx,
       input.apiCredentialId ?? null,
@@ -1683,7 +1685,28 @@ export async function reserveKnowledgeBaseStartBuild(
         .limit(1)
         .for("update")
     )[0];
-    if (resetTombstone) {
+    const retainedResetTombstone = resetTombstone
+      ? null
+      : (
+          await tx
+            .select({ id: knowledgeBaseConversationRetentionTombstones.id })
+            .from(knowledgeBaseConversationRetentionTombstones)
+            .where(
+              and(
+                eq(
+                  knowledgeBaseConversationRetentionTombstones.userId,
+                  input.userId,
+                ),
+                eq(
+                  knowledgeBaseConversationRetentionTombstones.publicConversationId,
+                  conversationId,
+                ),
+              ),
+            )
+            .limit(1)
+            .for("update")
+        )[0];
+    if (resetTombstone || retainedResetTombstone) {
       throw new KnowledgeBaseTurnReservationError(
         "CONVERSATION_RESET",
         "该知识库会话已被重置，请使用新会话重新构建",

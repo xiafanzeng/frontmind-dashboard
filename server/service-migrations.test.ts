@@ -114,7 +114,72 @@ describe("service portal migration chain", () => {
       "0046_api_usage_snapshot_claims",
       "0047_api_usage_task_ledger",
       "0048_api_usage_coverage_claims",
+      "0049_external_wechat_contract_authorization",
+      "0050_nullable_manual_order_commercial_evidence",
+      "0051_delivery_ticket_retention",
+      "0052_delivery_ticket_retention_guards",
     ]);
+  });
+
+  it("adds external contract authorization evidence without replacing legacy signing columns", async () => {
+    const migrationSql = await migration(
+      "0049_external_wechat_contract_authorization.sql",
+    );
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
+    for (const column of [
+      "contractAuthorizationMode",
+      "contractAuthorizationEventReference",
+      "contractAuthorizedAt",
+    ]) {
+      expect(migrationSql).toContain(`\`${column}\``);
+    }
+  });
+
+  it("stores no commercial amount or electronic contract id before evidence exists", async () => {
+    const migrationSql = await migration(
+      "0050_nullable_manual_order_commercial_evidence.sql",
+    );
+    expect(migrationSql).toContain(
+      "ALTER TABLE `website_manual_service_orders` MODIFY COLUMN `amountFen` int unsigned",
+    );
+    expect(migrationSql).toContain(
+      "SET `amountFen` = NULL WHERE `amountFen` = 0",
+    );
+    expect(migrationSql).toContain(
+      "ALTER TABLE `website_user_provisions` MODIFY COLUMN `contractId` varchar(128)",
+    );
+    expect(migrationSql).not.toMatch(/ADD `(?:amountFen|contractId)`/u);
+  });
+
+  it("adds compact facts and a bounded scan for 30-day ticket retention", async () => {
+    const migrationSql = await migration("0051_delivery_ticket_retention.sql");
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
+    for (const statement of [
+      "CREATE TABLE `delivery_workflow_milestones`",
+      "ADD `archivedContentAssetPublishUsed`",
+      "ADD `archivedWebsiteContentPublishUsed`",
+      "delivery_tickets_status_resolved_id_idx",
+    ]) {
+      expect(migrationSql).toContain(statement);
+    }
+    expect(migrationSql).not.toMatch(/\bUPDATE\s+`delivery_tickets`\b/iu);
+  });
+
+  it("retains reset safety tombstones and unfinished cleanup jobs after ticket expiry", async () => {
+    const migrationSql = await migration(
+      "0052_delivery_ticket_retention_guards.sql",
+    );
+    for (const statement of [
+      "CREATE TABLE `knowledge_base_conversation_retention_tombstones`",
+      "MODIFY COLUMN `resetRequestId` varchar(36)",
+      "ON DELETE set null",
+    ]) {
+      expect(migrationSql).toContain(statement);
+    }
   });
 
   it("adds an immutable task usage ledger and coverage proof without destructive changes", async () => {

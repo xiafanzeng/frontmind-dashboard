@@ -68,17 +68,15 @@ function usageByPool(
     value: number | bigint;
   }>,
   pool: DeliveryTicketQuotaPool,
+  archivedConsumed = 0,
 ): DeliveryQuotaPoolUsage {
   const reserved = rows
-    .filter(
-      (row) => row.quotaPool === pool && row.quotaState === "reserved",
-    )
+    .filter((row) => row.quotaPool === pool && row.quotaState === "reserved")
     .reduce((sum, row) => sum + Number(row.value), 0);
-  const consumed = rows
-    .filter(
-      (row) => row.quotaPool === pool && row.quotaState === "consumed",
-    )
-    .reduce((sum, row) => sum + Number(row.value), 0);
+  const consumed =
+    rows
+      .filter((row) => row.quotaPool === pool && row.quotaState === "consumed")
+      .reduce((sum, row) => sum + Number(row.value), 0) + archivedConsumed;
   return { reserved, consumed, used: reserved + consumed };
 }
 
@@ -230,10 +228,12 @@ export async function adjustDeliveryTicketQuota(input: {
     const contentAssetUsage = usageByPool(
       activeRows,
       "content_asset_publish",
+      period.archivedContentAssetPublishUsed,
     );
     const websiteContentUsage = usageByPool(
       activeRows,
       "website_content_publish",
+      period.archivedWebsiteContentPublishUsed,
     );
     const next = validateDeliveryQuotaAdjustment({
       expectedRevision: input.value.expectedRevision,

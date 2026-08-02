@@ -20,6 +20,7 @@ import {
   deliveryTicketAttachments,
   deliveryTicketEvents,
   deliveryTickets,
+  deliveryWorkflowMilestones,
   knowledgeBaseResetRequests,
   knowledgeBaseBuilds,
   knowledgeBaseSnapshots,
@@ -713,36 +714,49 @@ export async function getMyDeliveryTickets(input: {
   const customerIds = [
     ...new Set(selectedRows.map((row) => row.ticket.userId)),
   ];
-  const [dashboardRows, styleWorkflowRows, completedCatalogRows] =
-    customerIds.length
-      ? await Promise.all([
-          db
-            .select({
-              userId: userDashboardContents.userId,
-              revision: userDashboardContents.revision,
-            })
-            .from(userDashboardContents)
-            .where(inArray(userDashboardContents.userId, customerIds)),
-          db
-            .select({
-              userId: websiteStyleWorkflows.userId,
-              revision: websiteStyleWorkflows.revision,
-              status: websiteStyleWorkflows.status,
-            })
-            .from(websiteStyleWorkflows)
-            .where(inArray(websiteStyleWorkflows.userId, customerIds)),
-          db
-            .selectDistinct({ userId: deliveryTickets.userId })
-            .from(deliveryTickets)
-            .where(
-              and(
-                inArray(deliveryTickets.userId, customerIds),
-                eq(deliveryTickets.operation, "question_catalog"),
-                eq(deliveryTickets.status, "completed"),
-              ),
+  const [
+    dashboardRows,
+    styleWorkflowRows,
+    completedCatalogRows,
+    archivedCatalogRows,
+  ] = customerIds.length
+    ? await Promise.all([
+        db
+          .select({
+            userId: userDashboardContents.userId,
+            revision: userDashboardContents.revision,
+          })
+          .from(userDashboardContents)
+          .where(inArray(userDashboardContents.userId, customerIds)),
+        db
+          .select({
+            userId: websiteStyleWorkflows.userId,
+            revision: websiteStyleWorkflows.revision,
+            status: websiteStyleWorkflows.status,
+          })
+          .from(websiteStyleWorkflows)
+          .where(inArray(websiteStyleWorkflows.userId, customerIds)),
+        db
+          .selectDistinct({ userId: deliveryTickets.userId })
+          .from(deliveryTickets)
+          .where(
+            and(
+              inArray(deliveryTickets.userId, customerIds),
+              eq(deliveryTickets.operation, "question_catalog"),
+              eq(deliveryTickets.status, "completed"),
             ),
-        ])
-      : [[], [], []];
+          ),
+        db
+          .select({ userId: deliveryWorkflowMilestones.userId })
+          .from(deliveryWorkflowMilestones)
+          .where(
+            and(
+              inArray(deliveryWorkflowMilestones.userId, customerIds),
+              eq(deliveryWorkflowMilestones.operation, "question_catalog"),
+            ),
+          ),
+      ])
+    : [[], [], [], []];
   const dashboardRevisionByUser = new Map(
     dashboardRows.map((row) => [row.userId, row.revision]),
   );
@@ -750,7 +764,7 @@ export async function getMyDeliveryTickets(input: {
     styleWorkflowRows.map((row) => [row.userId, row]),
   );
   const customersWithCompletedCatalog = new Set(
-    completedCatalogRows.map((row) => row.userId),
+    [...completedCatalogRows, ...archivedCatalogRows].map((row) => row.userId),
   );
   const counts = { pending: 0, completed: 0 };
   for (const row of countRows) {
@@ -2354,31 +2368,45 @@ export async function updateMyDeliveryTicket(input: {
       ["in_progress", "completed"].includes(input.status) &&
       ticket.operation === "initial_monitoring"
     ) {
-      const [completedCatalogRows, approvedQuestionRows] = await Promise.all([
-        tx
-          .select({ id: deliveryTickets.id })
-          .from(deliveryTickets)
-          .where(
-            and(
-              eq(deliveryTickets.userId, ticket.userId),
-              eq(deliveryTickets.operation, "question_catalog"),
-              eq(deliveryTickets.status, "completed"),
-            ),
-          )
-          .limit(1),
-        tx
-          .select({ id: workspaceQuestions.id })
-          .from(workspaceQuestions)
-          .where(
-            and(
-              eq(workspaceQuestions.userId, ticket.userId),
-              eq(workspaceQuestions.status, "selected"),
-              eq(workspaceQuestions.selectionApprovalStatus, "approved"),
-            ),
-          )
-          .limit(1),
-      ]);
-      if (!completedCatalogRows[0] || !approvedQuestionRows[0]) {
+      const [completedCatalogRows, archivedCatalogRows, approvedQuestionRows] =
+        await Promise.all([
+          tx
+            .select({ id: deliveryTickets.id })
+            .from(deliveryTickets)
+            .where(
+              and(
+                eq(deliveryTickets.userId, ticket.userId),
+                eq(deliveryTickets.operation, "question_catalog"),
+                eq(deliveryTickets.status, "completed"),
+              ),
+            )
+            .limit(1),
+          tx
+            .select({ id: deliveryWorkflowMilestones.id })
+            .from(deliveryWorkflowMilestones)
+            .where(
+              and(
+                eq(deliveryWorkflowMilestones.userId, ticket.userId),
+                eq(deliveryWorkflowMilestones.operation, "question_catalog"),
+              ),
+            )
+            .limit(1),
+          tx
+            .select({ id: workspaceQuestions.id })
+            .from(workspaceQuestions)
+            .where(
+              and(
+                eq(workspaceQuestions.userId, ticket.userId),
+                eq(workspaceQuestions.status, "selected"),
+                eq(workspaceQuestions.selectionApprovalStatus, "approved"),
+              ),
+            )
+            .limit(1),
+        ]);
+      if (
+        (!completedCatalogRows[0] && !archivedCatalogRows[0]) ||
+        !approvedQuestionRows[0]
+      ) {
         throw new AuthServiceError(
           "CONFLICT",
           "请先完成品牌词库与问题目录工单，并审核通过客户选择的问题",
@@ -2574,19 +2602,37 @@ export async function updateMyDeliveryTicket(input: {
           "官网内容发布前必须绑定已发布的内容资产",
         );
       }
-      const publishedRows = await tx
-        .select({ contentAssetIds: deliveryTickets.contentAssetIds })
-        .from(deliveryTickets)
-        .where(
-          and(
-            eq(deliveryTickets.userId, ticket.userId),
-            eq(deliveryTickets.workflowDomain, "content_distribution_engineer"),
-            eq(deliveryTickets.operation, "content_asset_publish"),
-            eq(deliveryTickets.status, "completed"),
+      const [publishedRows, archivedPublishedRows] = await Promise.all([
+        tx
+          .select({ contentAssetIds: deliveryTickets.contentAssetIds })
+          .from(deliveryTickets)
+          .where(
+            and(
+              eq(deliveryTickets.userId, ticket.userId),
+              eq(
+                deliveryTickets.workflowDomain,
+                "content_distribution_engineer",
+              ),
+              eq(deliveryTickets.operation, "content_asset_publish"),
+              eq(deliveryTickets.status, "completed"),
+            ),
           ),
-        );
+        tx
+          .select({
+            contentAssetIds: deliveryWorkflowMilestones.contentAssetIds,
+          })
+          .from(deliveryWorkflowMilestones)
+          .where(
+            and(
+              eq(deliveryWorkflowMilestones.userId, ticket.userId),
+              eq(deliveryWorkflowMilestones.operation, "content_asset_publish"),
+            ),
+          ),
+      ]);
       const publishedAssetIds = new Set(
-        publishedRows.flatMap((row) => row.contentAssetIds ?? []),
+        [...publishedRows, ...archivedPublishedRows].flatMap(
+          (row) => row.contentAssetIds ?? [],
+        ),
       );
       const unverifiedIds = contentAssetIds.filter(
         (id) => !publishedAssetIds.has(id),
@@ -3142,16 +3188,29 @@ export async function createKnowledgeMonitoringHandoff(input: {
       "monitoring_optimization_engineer",
     );
     const operations = ["question_catalog", "initial_monitoring"] as const;
-    const existing = await tx
-      .select({ operation: deliveryTickets.operation })
-      .from(deliveryTickets)
-      .where(
-        and(
-          eq(deliveryTickets.userId, input.userId),
-          inArray(deliveryTickets.operation, [...operations]),
+    const [existingTickets, existingMilestones] = await Promise.all([
+      tx
+        .select({ operation: deliveryTickets.operation })
+        .from(deliveryTickets)
+        .where(
+          and(
+            eq(deliveryTickets.userId, input.userId),
+            inArray(deliveryTickets.operation, [...operations]),
+          ),
         ),
-      );
-    const existingOperations = new Set(existing.map((row) => row.operation));
+      tx
+        .select({ operation: deliveryWorkflowMilestones.operation })
+        .from(deliveryWorkflowMilestones)
+        .where(
+          and(
+            eq(deliveryWorkflowMilestones.userId, input.userId),
+            inArray(deliveryWorkflowMilestones.operation, [...operations]),
+          ),
+        ),
+    ]);
+    const existingOperations = new Set(
+      [...existingTickets, ...existingMilestones].map((row) => row.operation),
+    );
     const created: string[] = [];
     for (const operation of operations) {
       if (existingOperations.has(operation)) continue;

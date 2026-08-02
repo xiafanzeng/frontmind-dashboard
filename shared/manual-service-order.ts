@@ -181,6 +181,19 @@ export const confirmManualServiceOrderSignedSchema = z
   })
   .strict();
 
+export const authorizeExternalManualServiceContractSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    authorization: z
+      .object({
+        mode: z.literal("external_wechat"),
+        eventReference: identifierSchema,
+        authorizedAt: isoDateTimeSchema,
+      })
+      .strict(),
+  })
+  .strict();
+
 export const activateManualServiceOrderSchema = z
   .object({ reference: identifierSchema })
   .strict();
@@ -200,9 +213,12 @@ export const manualServiceOrderResponseSchema = z
         reference: identifierSchema,
         projectId: z.string().trim().min(8).max(80),
         status: manualServiceOrderStatusSchema,
+        amountFen: z.number().int().positive().max(10_000_000).optional(),
         contractId: identifierSchema.optional(),
         signingUrl: z.string().url().max(2048).optional(),
         signedAt: isoDateTimeSchema.optional(),
+        contractAuthorizationMode: z.literal("external_wechat").optional(),
+        contractAuthorizedAt: isoDateTimeSchema.optional(),
         provisioningReference: identifierSchema.optional(),
         message: z.string().trim().min(1).max(1000).optional(),
         retryable: z.boolean().optional(),
@@ -244,6 +260,9 @@ export type PrepareManualServiceOrder = z.infer<
 >;
 export type ConfirmManualServiceOrderSigned = z.infer<
   typeof confirmManualServiceOrderSignedSchema
+>;
+export type AuthorizeExternalManualServiceContract = z.infer<
+  typeof authorizeExternalManualServiceContractSchema
 >;
 export type ManualServiceOrderResponse = z.infer<
   typeof manualServiceOrderResponseSchema

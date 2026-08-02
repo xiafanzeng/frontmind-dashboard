@@ -28,6 +28,7 @@
     "db:backfill-knowledge-base-v2": "tsx scripts/backfill-knowledge-base-state-machine.ts",
     "db:purge-icp-materials": "tsx scripts/purge-icp-materials.ts",
     "db:cleanup-expired": "tsx scripts/cleanup-expired-conversations.ts",
+    "db:cleanup-expired-tickets": "tsx scripts/cleanup-expired-delivery-tickets.ts",
     "kb:reset:siliconflow": "tsx scripts/reset-siliconflow-knowledge-base.ts",
     "admin:init": "tsx scripts/init-admin.ts",
     "migration:manifest": "node scripts/generate-migration-manifest.mjs --output dist/migration-manifest.json",

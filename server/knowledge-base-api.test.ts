@@ -1138,19 +1138,23 @@ describe("knowledge base execution contract", () => {
   });
 
   it("routes a terminal acknowledgement-only response into protocol validation", () => {
+    const acknowledgement = [
+      {
+        id: "ack-only",
+        role: "assistant",
+        type: "message",
+        content: "已收到。",
+      },
+    ];
     expect(
-      shouldReconcileKnowledgeOutput(
-        [
-          {
-            id: "ack-only",
-            role: "assistant",
-            type: "message",
-            content: "已收到。",
-          },
-        ],
-        "completed",
-        { requirePresentation: true },
-      ),
+      shouldReconcileKnowledgeOutput(acknowledgement, "running", {
+        requirePresentation: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldReconcileKnowledgeOutput(acknowledgement, "completed", {
+        requirePresentation: true,
+      }),
     ).toBe(true);
   });
 

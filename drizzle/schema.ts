@@ -723,7 +723,7 @@ export const websiteUserProvisions = mysqlTable(
     planCode: mysqlEnum("planCode", ["basic", "advanced", "luxury"]),
     questionId: varchar("questionId", { length: 80 }).notNull(),
     question: text("question").notNull(),
-    contractId: varchar("contractId", { length: 128 }).notNull().unique(),
+    contractId: varchar("contractId", { length: 128 }).unique(),
     contractTemplateVersion: varchar("contractTemplateVersion", {
       length: 64,
     }).notNull(),
@@ -816,7 +816,7 @@ export const websiteManualServiceOrders = mysqlTable(
     serviceDays: int("serviceDays", { unsigned: true }).default(30).notNull(),
     questionId: varchar("questionId", { length: 80 }).notNull(),
     question: text("question").notNull(),
-    amountFen: int("amountFen", { unsigned: true }).notNull(),
+    amountFen: int("amountFen", { unsigned: true }),
     contractTemplateVersion: varchar("contractTemplateVersion", {
       length: 64,
     }).notNull(),
@@ -835,6 +835,14 @@ export const websiteManualServiceOrders = mysqlTable(
     signedAt: timestamp("signedAt"),
     signatoryId: varchar("signatoryId", { length: 128 }),
     signatureNote: text("signatureNote"),
+    contractAuthorizationMode: mysqlEnum("contractAuthorizationMode", [
+      "external_wechat",
+    ]),
+    contractAuthorizationEventReference: varchar(
+      "contractAuthorizationEventReference",
+      { length: 128 },
+    ).unique("manual_orders_contract_auth_event_uq"),
+    contractAuthorizedAt: timestamp("contractAuthorizedAt"),
     paymentIdempotencyKeyHash: varchar("paymentIdempotencyKeyHash", {
       length: 64,
     }).unique(),
@@ -1018,6 +1026,17 @@ export const serviceQuotaPeriods = mysqlTable(
     })
       .default(0)
       .notNull(),
+    archivedContentAssetPublishUsed: int("archivedContentAssetPublishUsed", {
+      unsigned: true,
+    })
+      .default(0)
+      .notNull(),
+    archivedWebsiteContentPublishUsed: int(
+      "archivedWebsiteContentPublishUsed",
+      { unsigned: true },
+    )
+      .default(0)
+      .notNull(),
     revision: int("revision", { unsigned: true }).default(1).notNull(),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
@@ -1166,6 +1185,11 @@ export const deliveryTickets = mysqlTable(
       table.status,
       table.updatedAt,
     ),
+    index("delivery_tickets_status_resolved_id_idx").on(
+      table.status,
+      table.resolvedAt,
+      table.id,
+    ),
     index("delivery_tickets_user_updated_id_idx").on(
       table.userId,
       table.updatedAt,
@@ -1199,6 +1223,36 @@ export const deliveryTickets = mysqlTable(
       columns: [table.assignedProjectAssignmentId],
       foreignColumns: [deliveryProjectAssignments.id],
     }).onDelete("set null"),
+  ],
+);
+
+/**
+ * Compact workflow facts retained after verbose delivery tickets expire.
+ * One row per customer and operation preserves gates without retaining ticket
+ * messages, attachments, or duplicated presentation fields.
+ */
+export const deliveryWorkflowMilestones = mysqlTable(
+  "delivery_workflow_milestones",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    operation: varchar("operation", { length: 64 }).notNull(),
+    contentAssetIds: json("contentAssetIds")
+      .$type<string[]>()
+      .default([])
+      .notNull(),
+    completedAt: timestamp("completedAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("delivery_workflow_milestones_user_operation_uq").on(
+      table.userId,
+      table.operation,
+    ),
+    index("delivery_workflow_milestones_operation_idx").on(table.operation),
   ],
 );
 
@@ -2664,23 +2718,43 @@ export const knowledgeBaseConversationTombstones = mysqlTable(
   ],
 );
 
+/**
+ * Compact reset tombstones that outlive the verbose reset ticket. They keep
+ * stale browser tabs from recreating a knowledge-base conversation after the
+ * ticket and its request details have passed the retention window.
+ */
+export const knowledgeBaseConversationRetentionTombstones = mysqlTable(
+  "knowledge_base_conversation_retention_tombstones",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId").notNull(),
+    publicConversationId: varchar("publicConversationId", {
+      length: 191,
+    }).notNull(),
+    resetAt: timestamp("resetAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      name: "kb_retention_tombstones_user_fk",
+      columns: [table.userId],
+      foreignColumns: [users.id],
+    }).onDelete("cascade"),
+    uniqueIndex("kb_retention_tombstones_user_conversation_uq").on(
+      table.userId,
+      table.publicConversationId,
+    ),
+  ],
+);
+
 /** Retry queue for deletion of KB-only local assets and upstream resources. */
 export const knowledgeBaseResetCleanupJobs = mysqlTable(
   "knowledge_base_reset_cleanup_jobs",
   {
     id: varchar("id", { length: 36 }).primaryKey(),
-    resetRequestId: varchar("resetRequestId", { length: 36 })
-      .notNull()
-      .references(() => knowledgeBaseResetRequests.id, {
-        onDelete: "cascade",
-      }),
-    userId: int("userId")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    apiCredentialId: varchar("apiCredentialId", { length: 36 }).references(
-      () => apiCredentials.id,
-      { onDelete: "set null" },
-    ),
+    resetRequestId: varchar("resetRequestId", { length: 36 }),
+    userId: int("userId").notNull(),
+    apiCredentialId: varchar("apiCredentialId", { length: 36 }),
     kind: mysqlEnum("kind", ["task", "file", "local_asset"]).notNull(),
     upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
     status: mysqlEnum("status", ["pending", "completed", "failed"])
@@ -2693,6 +2767,21 @@ export const knowledgeBaseResetCleanupJobs = mysqlTable(
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [
+    foreignKey({
+      name: "kb_reset_cleanup_request_fk",
+      columns: [table.resetRequestId],
+      foreignColumns: [knowledgeBaseResetRequests.id],
+    }).onDelete("set null"),
+    foreignKey({
+      name: "kb_reset_cleanup_user_fk",
+      columns: [table.userId],
+      foreignColumns: [users.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "kb_reset_cleanup_credential_fk",
+      columns: [table.apiCredentialId],
+      foreignColumns: [apiCredentials.id],
+    }).onDelete("set null"),
     uniqueIndex("kb_reset_cleanup_request_resource_uq").on(
       table.resetRequestId,
       table.kind,
@@ -3059,6 +3148,10 @@ export type ServiceQuotaPeriod = typeof serviceQuotaPeriods.$inferSelect;
 export type InsertServiceQuotaPeriod = typeof serviceQuotaPeriods.$inferInsert;
 export type DeliveryTicket = typeof deliveryTickets.$inferSelect;
 export type InsertDeliveryTicket = typeof deliveryTickets.$inferInsert;
+export type DeliveryWorkflowMilestone =
+  typeof deliveryWorkflowMilestones.$inferSelect;
+export type InsertDeliveryWorkflowMilestone =
+  typeof deliveryWorkflowMilestones.$inferInsert;
 export type DeliveryTicketEvent = typeof deliveryTicketEvents.$inferSelect;
 export type InsertDeliveryTicketEvent =
   typeof deliveryTicketEvents.$inferInsert;
@@ -3128,6 +3221,8 @@ export type KnowledgeBaseResetState =
   typeof knowledgeBaseResetStates.$inferSelect;
 export type KnowledgeBaseConversationTombstone =
   typeof knowledgeBaseConversationTombstones.$inferSelect;
+export type KnowledgeBaseConversationRetentionTombstone =
+  typeof knowledgeBaseConversationRetentionTombstones.$inferSelect;
 export type KnowledgeBaseResetCleanupJob =
   typeof knowledgeBaseResetCleanupJobs.$inferSelect;
 export type ResponseLogicEntry = typeof responseLogicEntries.$inferSelect;

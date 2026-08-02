@@ -91,6 +91,29 @@ describe("task usage ledger", () => {
       retiredAt: null,
     });
   });
+
+  it("uses the last retirement when every binding for one physical Key is retired", () => {
+    const selected = selectPhysicalCredentialRows([
+      {
+        fingerprint: "shared-retired",
+        status: "retired",
+        ownerId: 1,
+        version: 9,
+        retiredAt: new Date("2026-08-02T08:00:00.000Z"),
+      },
+      {
+        fingerprint: "shared-retired",
+        status: "retired",
+        ownerId: 2,
+        version: 2,
+        retiredAt: new Date("2026-08-02T09:00:00.000Z"),
+      },
+    ]);
+    expect(selected[0]).toMatchObject({
+      ownerId: 2,
+      retiredAt: new Date("2026-08-02T09:00:00.000Z"),
+    });
+  });
   it("recognizes every supported settled state and leaves running tasks open", () => {
     for (const status of [
       "completed",

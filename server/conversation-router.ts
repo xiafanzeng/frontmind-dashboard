@@ -8,6 +8,7 @@ import {
   conversations,
   conversationTurns,
   knowledgeBaseBuilds,
+  knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
   knowledgeBaseResetRequests,
   messages,
@@ -1515,20 +1516,35 @@ async function persistSnapshot(
       message: "知识库重置工单正在审批，当前会话已只读锁定",
     });
   }
-  const tombstones = await executor
-    .select({ id: knowledgeBaseConversationTombstones.id })
-    .from(knowledgeBaseConversationTombstones)
-    .where(
-      and(
-        eq(knowledgeBaseConversationTombstones.userId, userId),
-        eq(
-          knowledgeBaseConversationTombstones.publicConversationId,
-          snapshot.id,
+  const [tombstones, retainedTombstones] = await Promise.all([
+    executor
+      .select({ id: knowledgeBaseConversationTombstones.id })
+      .from(knowledgeBaseConversationTombstones)
+      .where(
+        and(
+          eq(knowledgeBaseConversationTombstones.userId, userId),
+          eq(
+            knowledgeBaseConversationTombstones.publicConversationId,
+            snapshot.id,
+          ),
         ),
-      ),
-    )
-    .limit(1);
-  if (tombstones[0]) {
+      )
+      .limit(1),
+    executor
+      .select({ id: knowledgeBaseConversationRetentionTombstones.id })
+      .from(knowledgeBaseConversationRetentionTombstones)
+      .where(
+        and(
+          eq(knowledgeBaseConversationRetentionTombstones.userId, userId),
+          eq(
+            knowledgeBaseConversationRetentionTombstones.publicConversationId,
+            snapshot.id,
+          ),
+        ),
+      )
+      .limit(1),
+  ]);
+  if (tombstones[0] || retainedTombstones[0]) {
     if (options.skipExisting) return "skipped";
     throw new TRPCError({
       code: "CONFLICT",

@@ -8,12 +8,14 @@ import { desc, eq } from "drizzle-orm";
 
 import { websiteManualServiceOrders } from "../drizzle/schema";
 import {
+  authorizeExternalManualServiceContractSchema,
   confirmManualServiceOrderSignedSchema,
   createManualServiceOrderRequestSchema,
   manualServiceAccountSetupRequestSchema,
   manualServiceOrderResponseSchema,
   manualServicePaymentRequestSchema,
   prepareManualServiceOrderSchema,
+  type AuthorizeExternalManualServiceContract,
   type ConfirmManualServiceOrderSigned,
   type CreateManualServiceOrderRequest,
   type ManualServiceAccountSetupRequest,
@@ -193,12 +195,34 @@ function completeSigningEvidence(row: ManualOrderRow) {
   );
 }
 
+function completeExternalContractAuthorization(row: ManualOrderRow) {
+  return Boolean(
+    row.contractAuthorizationMode === "external_wechat" &&
+      row.contractAuthorizationEventReference &&
+      row.contractAuthorizedAt,
+  );
+}
+
+function completeContractEvidence(row: ManualOrderRow) {
+  return (
+    completeSigningEvidence(row) || completeExternalContractAuthorization(row)
+  );
+}
+
+function contractEvidenceAt(row: ManualOrderRow) {
+  return completeExternalContractAuthorization(row)
+    ? row.contractAuthorizedAt
+    : row.signedAt;
+}
+
 function completePayment(row: ManualOrderRow) {
   return Boolean(
     row.paymentOrderId &&
       row.paymentTradeNo &&
       row.paidAt &&
-      row.paymentRequestHash,
+      row.paymentRequestHash &&
+      Number.isInteger(row.amountFen) &&
+      (row.amountFen ?? 0) > 0,
   );
 }
 
@@ -223,7 +247,9 @@ function publicMessage(row: ManualOrderRow) {
     case "signature_required":
       return "合同已准备，请通过安全签署链接完成电子签署";
     case "payment_required":
-      return "管理员已核验签署文件，请完成服务付款";
+      return completeExternalContractAuthorization(row)
+        ? "合同已在企业微信确认，可以付款"
+        : "管理员已核验签署文件，请完成服务付款";
     case "account_setup_required":
       return "付款已确认，请设置用于登录服务看板的账号和密码";
     case "activation_required":
@@ -272,9 +298,18 @@ function buildResponse(
       reference: row.id,
       projectId: row.projectId,
       status: row.status,
+      ...(Number.isInteger(row.amountFen) && (row.amountFen ?? 0) > 0
+        ? { amountFen: row.amountFen! }
+        : {}),
       ...(row.externalContractId ? { contractId: row.externalContractId } : {}),
       ...(row.signingUrl ? { signingUrl: row.signingUrl } : {}),
       ...(row.signedAt ? { signedAt: row.signedAt.toISOString() } : {}),
+      ...(completeExternalContractAuthorization(row)
+        ? {
+            contractAuthorizationMode: "external_wechat" as const,
+            contractAuthorizedAt: row.contractAuthorizedAt!.toISOString(),
+          }
+        : {}),
       ...(row.provisioningReference
         ? { provisioningReference: row.provisioningReference }
         : {}),
@@ -432,26 +467,32 @@ export function createManualServiceOrderService(
         return null;
       }
       const actorUserId = input.actorUserId ?? current.signedByUserId;
+      const externallyAuthorized =
+        completeExternalContractAuthorization(current);
       if (
         current.status !== "activation_required" ||
-        !completeSigningEvidence(current) ||
+        !completeContractEvidence(current) ||
         !completePayment(current) ||
         !completeAccountSetup(current) ||
-        !Number.isInteger(actorUserId) ||
-        !actorUserId
+        (!externallyAuthorized &&
+          (!Number.isInteger(actorUserId) || !actorUserId))
       ) {
         return stateConflict(
-          "Signed evidence, verified payment, and customer account details are required before activation",
+          "Contract evidence, verified payment, and customer account details are required before activation",
         );
       }
       purchase = await decidePurchase({
         reference: current.provisioningReference!,
         manualOrderReference: current.id,
-        actorUserId,
+        ...(actorUserId ? { actorUserId } : {}),
         decision: "confirm",
-        signedAt: current.signedAt!,
-        signatoryId: current.signatoryId!,
-        note: current.signatureNote!,
+        ...(externallyAuthorized
+          ? {}
+          : {
+              signedAt: current.signedAt!,
+              signatoryId: current.signatoryId!,
+              note: current.signatureNote!,
+            }),
         ...(current.accountMode === "create"
           ? { manualPasswordHash: current.requestedPasswordHash! }
           : {}),
@@ -466,7 +507,7 @@ export function createManualServiceOrderService(
       return {
         status: "active",
         requestedPasswordHash: null,
-        activatedByUserId: actorUserId,
+        activatedByUserId: actorUserId ?? null,
         activatedAt,
         lastError: null,
         revision: current.revision + 1,
@@ -512,9 +553,9 @@ export function createManualServiceOrderService(
         serviceDays: 30,
         questionId: value.service.purchasedQuestion.id,
         question: value.service.purchasedQuestion.question,
-        // The commercial amount is established by the verified payment event.
-        // Zero is an internal pre-payment sentinel and is never returned to clients.
-        amountFen: 0,
+        // The commercial amount is established only by the verified payment
+        // event; an unpaid order has no amount in the durable record.
+        amountFen: null,
         contractTemplateVersion: value.contract.templateVersion,
         status: "pending_admin",
         revision: 1,
@@ -578,6 +619,10 @@ export function createManualServiceOrderService(
               }
             : null,
         signedAt: row.signedAt?.getTime() ?? null,
+        contractAuthorizationMode: row.contractAuthorizationMode,
+        contractAuthorizationEventReference:
+          row.contractAuthorizationEventReference,
+        contractAuthorizedAt: row.contractAuthorizedAt?.getTime() ?? null,
         signatoryId: row.signatoryId,
         signatureNote: row.signatureNote,
         payment:
@@ -585,6 +630,7 @@ export function createManualServiceOrderService(
             ? {
                 orderId: row.paymentOrderId,
                 tradeNo: row.paymentTradeNo,
+                amountFen: row.amountFen,
                 paidAt: row.paidAt.getTime(),
               }
             : null,
@@ -724,6 +770,84 @@ export function createManualServiceOrderService(
       return readResponse(row, configuredSecret(options.secret));
     },
 
+    async authorizeExternal(input: {
+      reference: string;
+      request: AuthorizeExternalManualServiceContract;
+      secret?: string;
+    }) {
+      const value = authorizeExternalManualServiceContractSchema.parse(
+        input.request,
+      );
+      const authorizedAt = databaseTimestamp(value.authorization.authorizedAt);
+      const updatedAt = now();
+      if (authorizedAt.getTime() > updatedAt.getTime() + 5 * 60 * 1000) {
+        scopeMismatch(
+          "The contract authorization timestamp cannot be in the future",
+        );
+      }
+      const row = await (
+        await repository()
+      ).mutate(input.reference, (current) => {
+        if (
+          current.status === "payment_required" ||
+          current.status === "account_setup_required" ||
+          current.status === "activation_required" ||
+          current.status === "active"
+        ) {
+          if (
+            completeExternalContractAuthorization(current) &&
+            sameText(
+              current.contractAuthorizationEventReference,
+              value.authorization.eventReference,
+            )
+          ) {
+            return null;
+          }
+          return stateConflict(
+            "The manual order already contains different contract evidence",
+          );
+        }
+        if (
+          current.status !== "pending_admin" &&
+          current.status !== "signature_required"
+        ) {
+          return stateConflict(
+            "Only a pending contract can be authorized externally",
+          );
+        }
+        return {
+          // The event reference proves that an administrator allowed payment;
+          // it is not an electronic-contract identifier and must never be
+          // exposed as one.
+          externalContractId: null,
+          signingUrl: null,
+          signedPdfFileId: null,
+          signedPdfFilename: null,
+          signedPdfSha256: null,
+          signedPdfStorageKey: null,
+          evidenceReportFileId: null,
+          evidenceReportFilename: null,
+          evidenceReportSha256: null,
+          signedAt: null,
+          signatoryId: null,
+          signatureNote: null,
+          signedByUserId: null,
+          contractAuthorizationMode: "external_wechat",
+          contractAuthorizationEventReference:
+            value.authorization.eventReference,
+          contractAuthorizedAt: authorizedAt,
+          status: "payment_required",
+          lastError: null,
+          revision: current.revision + 1,
+          updatedAt,
+        };
+      });
+      return readResponse(
+        row,
+        configuredSecret(input.secret ?? options.secret),
+      );
+    },
+
     async recordPayment(input: {
       reference: string;
       idempotencyKey: string;
@@ -751,18 +875,19 @@ export function createManualServiceOrderService(
         }
         if (
           current.status !== "payment_required" ||
-          !completeSigningEvidence(current)
+          !completeContractEvidence(current)
         ) {
           return stateConflict(
-            "A signed contract must be confirmed before payment can be recorded",
+            "Contract confirmation is required before payment can be recorded",
           );
         }
+        const evidenceAt = contractEvidenceAt(current);
         if (
-          !current.signedAt ||
-          Date.parse(value.payment.paidAt) < current.signedAt.getTime()
+          !evidenceAt ||
+          Date.parse(value.payment.paidAt) <= evidenceAt.getTime()
         ) {
           return scopeMismatch(
-            "The verified payment must occur after contract signing",
+            "The verified payment must occur after contract confirmation",
           );
         }
         const startsAt = databaseTimestamp(value.payment.paidAt);
@@ -840,7 +965,7 @@ export function createManualServiceOrderService(
             current.accountSetupRequestHash ||
             !current.accountMode ||
             !current.provisioningReference ||
-            !completeSigningEvidence(current) ||
+            !completeContractEvidence(current) ||
             !completePayment(current) ||
             current.accountMode !== value.account.mode
           ) {
@@ -900,7 +1025,7 @@ export function createManualServiceOrderService(
         }
         if (
           current.status !== "account_setup_required" ||
-          !completeSigningEvidence(current) ||
+          !completeContractEvidence(current) ||
           !completePayment(current)
         ) {
           return stateConflict(
@@ -931,7 +1056,7 @@ export function createManualServiceOrderService(
               id: current.paymentOrderId!,
               tradeNo: current.paymentTradeNo!,
               status: "paid",
-              amountFen: current.amountFen,
+              amountFen: current.amountFen!,
               paidAt: startsAt.toISOString(),
             },
             service: {
@@ -945,23 +1070,37 @@ export function createManualServiceOrderService(
                 question: current.question,
               },
             },
-            contract: {
-              id: current.externalContractId!,
-              status: "pending_admin_confirmation",
-              projectId: current.projectId,
-              orderId: current.paymentOrderId!,
-              questionId: current.questionId,
-              templateVersion: current.contractTemplateVersion,
-              evidence: {
-                type: "system_admin_confirmation",
-                artifact: {
-                  taskId: null,
-                  fileId: current.signedPdfFileId,
-                  outputDescriptor: current.signedPdfFilename,
-                  sha256: current.signedPdfSha256,
+            contract: completeExternalContractAuthorization(current)
+              ? {
+                  status: "pending_admin_confirmation" as const,
+                  projectId: current.projectId,
+                  orderId: current.paymentOrderId!,
+                  questionId: current.questionId,
+                  templateVersion: current.contractTemplateVersion,
+                  evidence: {
+                    type: "external_wechat_confirmation" as const,
+                    eventReference:
+                      current.contractAuthorizationEventReference!,
+                    authorizedAt: current.contractAuthorizedAt!.toISOString(),
+                  },
+                }
+              : {
+                  id: current.externalContractId!,
+                  status: "pending_admin_confirmation" as const,
+                  projectId: current.projectId,
+                  orderId: current.paymentOrderId!,
+                  questionId: current.questionId,
+                  templateVersion: current.contractTemplateVersion,
+                  evidence: {
+                    type: "system_admin_confirmation" as const,
+                    artifact: {
+                      taskId: null,
+                      fileId: current.signedPdfFileId,
+                      outputDescriptor: current.signedPdfFilename,
+                      sha256: current.signedPdfSha256,
+                    },
+                  },
                 },
-              },
-            },
             account,
           },
         });

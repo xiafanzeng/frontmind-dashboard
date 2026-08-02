@@ -15,8 +15,13 @@ describe("admin API Key mutation boundary", () => {
     expect(source).not.toContain("deleteManagedUserCredential({");
     expect(source).toContain("replaceTargetCredential: adminProcedure");
     expect(source).toContain("revokeTargetCredential: adminProcedure");
+    expect(source).toContain("bulkReplaceTargetCredentials: adminProcedure");
     expect(source).toContain('confirmation: z.literal("REPLACE_API_KEY")');
     expect(source).toContain('confirmation: z.literal("REVOKE_API_KEY")');
+    expect(source).toContain(
+      'confirmation: z.literal("BULK_REPLACE_API_KEYS")',
+    );
+    expect(source).toContain('.enum(["unconfigured_only", "replace_all"])');
   });
 
   it("removes delivery-role mutation aliases and disables the legacy self-service writer", async () => {

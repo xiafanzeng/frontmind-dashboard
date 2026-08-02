@@ -38,6 +38,7 @@ import {
   hasClosedKnowledgeBaseStateEnvelope,
   isAmbiguousKnowledgeBaseAdvance,
   isIdempotentKnowledgeBaseReconcileError,
+  isKnowledgeBaseAcknowledgementOnlyOutput,
   observeKnowledgeBaseProtocolFailure,
   reconcileKnowledgeBaseProgress,
 } from "./knowledge-base-progress-service";
@@ -448,10 +449,6 @@ function upstreamTaskFailed(status: unknown) {
   return classifyKnowledgeBaseUpstreamTaskStatus(status).failed;
 }
 
-function upstreamTaskTerminal(status: unknown) {
-  return classifyKnowledgeBaseUpstreamTaskStatus(status).terminal;
-}
-
 /**
  * Some providers stop at an interaction-ready status instead of `completed`.
  * At that point a same-ID output replacement is stable and must be replayed,
@@ -754,6 +751,9 @@ async function reconcileAvailableKnowledgeOutput(input: {
         ),
       },
     );
+    const upstreamPhase = classifyKnowledgeBaseUpstreamTaskStatus(
+      input.upstreamStatus,
+    );
     if (
       shouldReconcileKnowledgeOutput(unreconciled, input.upstreamStatus, {
         requirePresentation:
@@ -761,7 +761,10 @@ async function reconcileAvailableKnowledgeOutput(input: {
           progress?.build.skillVersion === "4",
       })
     ) {
-      if (input.artifactAccess) {
+      if (
+        input.artifactAccess &&
+        !isKnowledgeBaseAcknowledgementOnlyOutput(unreconciled)
+      ) {
         const artifactAccess = input.artifactAccess;
         let boundBuild;
         try {
@@ -782,9 +785,6 @@ async function reconcileAvailableKnowledgeOutput(input: {
           }
           throw error;
         }
-        const upstreamPhase = classifyKnowledgeBaseUpstreamTaskStatus(
-          input.upstreamStatus,
-        );
         const packageRebindRequired =
           boundBuild.status === "protocol_error" &&
           boundBuild.protocolErrorCode === "PACKAGE_REBIND_REQUIRED";

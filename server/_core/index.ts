@@ -44,6 +44,7 @@ import { processKnowledgeResetCleanupJobs } from "../knowledge-base-reset-servic
 import { assertCredentialEncryptionConfigured } from "../auth-service";
 import { getDb } from "../db";
 import deliveryTicketAttachmentRouter from "../delivery-ticket-attachment-router";
+import { startDeliveryTicketRetentionScheduler } from "../delivery-ticket-retention";
 import { startApiUsageSnapshotScheduler } from "../api-usage-snapshot-service";
 import {
   assertDedicatedMonitorCredentialConfigured,
@@ -438,6 +439,7 @@ async function startServer() {
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);
     if (process.env.NODE_ENV === "production") {
+      startDeliveryTicketRetentionScheduler();
       const recoverKnowledgeBaseState = createKnowledgeBaseRecoverySweep({
         recoverExpiredTurns: () => recoverExpiredKnowledgeBaseTurns(),
         recoverOpenBuilds: (options) => recoverOpenKnowledgeBaseTasks(options),

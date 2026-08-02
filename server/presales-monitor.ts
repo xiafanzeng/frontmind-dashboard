@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import axios from "axios";
 import { and, eq, isNull } from "drizzle-orm";
 import { json, Router, type Response } from "express";
@@ -46,8 +47,7 @@ const MONITOR_POLL_LEASE_MS = 120_000;
 const MONITOR_HTTP_TIMEOUT_MS = 60_000;
 const MAX_MONITOR_RESPONSE_BYTES = 12 * 1024 * 1024;
 const MAX_ANSWER_CHARACTERS = 200_000;
-const MAX_CITATION_ITEMS = 100;
-const MAX_REFERENCE_ITEMS = 200;
+const MAX_SOURCE_ITEMS = 200;
 const MAX_EVIDENCE_CANDIDATES = 2_000;
 const MAX_MEDIA_ITEMS = 24;
 const DEFAULT_MONITOR_BASE_URL_B64 =
@@ -119,8 +119,11 @@ type MonitorCheckpointItem = {
   status: string;
   answerText?: string;
   media: MonitorMedia[];
-  citations: MonitorEvidence[];
-  references: MonitorEvidence[];
+  /** Canonical, deduplicated union of every source returned for the answer. */
+  sources?: MonitorEvidence | MonitorEvidence[];
+  /** Legacy checkpoint fields are read only when recovering pre-v2 runs. */
+  citations?: MonitorEvidence[];
+  references?: MonitorEvidence[];
   error?: string;
   completedAt?: string;
 };
@@ -136,8 +139,7 @@ export type PublicMonitorRecord = {
   status: string;
   answerText?: string;
   media: MonitorMedia[];
-  citations: MonitorEvidence[];
-  references: MonitorEvidence[];
+  sources: MonitorEvidence[];
   error?: string;
   completedAt?: string;
 };
@@ -439,6 +441,99 @@ function isMonitorProviderHostname(hostname: string) {
   );
 }
 
+const MONITOR_TRACKING_PARAMETERS = new Set([
+  "fbclid",
+  "gclid",
+  "dclid",
+  "msclkid",
+  "mc_cid",
+  "mc_eid",
+  "igshid",
+  "ref_src",
+]);
+
+function isPrivateSourceHostname(value: string) {
+  const hostname = value
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    return true;
+  }
+  if (isIP(hostname) === 4) {
+    const octets = hostname.split(".").map(Number);
+    return (
+      octets[0] === 0 ||
+      octets[0] === 10 ||
+      octets[0] === 127 ||
+      (octets[0] === 169 && octets[1] === 254) ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 168) ||
+      octets[0] >= 224
+    );
+  }
+  if (isIP(hostname) === 6) {
+    const mappedIpv4 = (() => {
+      const match = /^::ffff:(.+)$/i.exec(hostname);
+      if (!match) return undefined;
+      if (isIP(match[1]) === 4) return match[1];
+      const groups = match[1].split(":");
+      if (
+        groups.length !== 2 ||
+        groups.some((group) => !/^[a-f0-9]{1,4}$/i.test(group))
+      ) {
+        return undefined;
+      }
+      const high = Number.parseInt(groups[0], 16);
+      const low = Number.parseInt(groups[1], 16);
+      return [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
+    })();
+    if (mappedIpv4 && isPrivateSourceHostname(mappedIpv4)) return true;
+    return (
+      hostname === "::" ||
+      hostname === "::1" ||
+      hostname.startsWith("fc") ||
+      hostname.startsWith("fd") ||
+      /^fe[89ab]/.test(hostname)
+    );
+  }
+  return false;
+}
+
+function normalizeMonitorSourceUrl(value: string) {
+  try {
+    const url = new URL(value.replace(/&amp;/gi, "&"));
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      isMonitorProviderHostname(url.hostname) ||
+      isPrivateSourceHostname(url.hostname) ||
+      containsPrivateMonitorIdentity(url.toString())
+    ) {
+      return undefined;
+    }
+    url.hash = "";
+    for (const key of Array.from(url.searchParams.keys())) {
+      if (
+        key.toLowerCase().startsWith("utm_") ||
+        MONITOR_TRACKING_PARAMETERS.has(key.toLowerCase())
+      ) {
+        url.searchParams.delete(key);
+      }
+    }
+    url.searchParams.sort();
+    return url.toString().slice(0, 4_096);
+  } catch {
+    return undefined;
+  }
+}
+
 function positiveInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value > 0
     ? value
@@ -631,16 +726,9 @@ function sanitizeEvidence(value: unknown, maxItems: number): MonitorEvidence[] {
     if (typeof entry === "string") {
       const raw = entry.trim().slice(0, 4_096);
       const text = (() => {
-        try {
-          const url = new URL(raw);
-          if (
-            isMonitorProviderHostname(url.hostname) ||
-            containsPrivateMonitorIdentity(url.toString())
-          )
-            return "";
-        } catch {
-          // Non-URL evidence is sanitized as display text below.
-        }
+        const normalizedUrl = normalizeMonitorSourceUrl(raw);
+        if (normalizedUrl) return normalizedUrl;
+        if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return "";
         return sanitizeMonitorPublicText(raw);
       })();
       if (text) cleaned = text;
@@ -668,17 +756,9 @@ function sanitizeEvidence(value: unknown, maxItems: number): MonitorEvidence[] {
       if (summary)
         object.summary = sanitizeMonitorPublicText(summary).slice(0, 2_000);
       if (rawUrl) {
-        try {
-          const url = new URL(rawUrl);
-          if (
-            !isMonitorProviderHostname(url.hostname) &&
-            !containsPrivateMonitorIdentity(url.toString())
-          ) {
-            object.url = url.toString().slice(0, 4_096);
-          }
-        } catch {
-          // Invalid source URLs are omitted without discarding safe metadata.
-        }
+        const url = normalizeMonitorSourceUrl(rawUrl);
+        if (!url) continue;
+        object.url = url;
       }
       if (
         object.title ||
@@ -744,29 +824,135 @@ function citationsFromInlineMarkers(
 function mergeCitationEvidence(
   primary: MonitorEvidence[],
   explicitInline: MonitorEvidence[],
+  maxItems = MAX_EVIDENCE_CANDIDATES,
 ): MonitorEvidence[] {
   const result: MonitorEvidence[] = [];
-  const canonicalKeys = new Set<string>();
+  const canonicalPositions = new Map<string, number>();
   const indexes = new Set<number>();
-  const urls = new Set<string>();
+  const urlPositions = new Map<string, number>();
   for (const item of [...primary, ...explicitInline]) {
     const canonicalKey = canonicalJson(item);
     const index = typeof item === "string" ? null : (item.index ?? null);
     const url = typeof item === "string" ? "" : (item.url ?? "");
-    if (
-      canonicalKeys.has(canonicalKey) ||
-      (index !== null && indexes.has(index)) ||
-      (url && urls.has(url))
-    ) {
+    const duplicatePosition =
+      canonicalPositions.get(canonicalKey) ??
+      (url ? urlPositions.get(url) : undefined);
+    if (duplicatePosition !== undefined) {
+      result[duplicatePosition] = mergeMonitorEvidenceItem(
+        result[duplicatePosition],
+        item,
+      );
       continue;
     }
-    canonicalKeys.add(canonicalKey);
+    if (index !== null && indexes.has(index)) continue;
+    const position = result.length;
+    canonicalPositions.set(canonicalKey, position);
     if (index !== null) indexes.add(index);
-    if (url) urls.add(url);
+    if (url) urlPositions.set(url, position);
     result.push(item);
-    if (result.length >= MAX_CITATION_ITEMS) break;
+    if (result.length >= maxItems) break;
   }
   return result;
+}
+
+function monitorEvidenceIdentity(item: MonitorEvidence) {
+  if (typeof item === "string") {
+    const url = normalizeMonitorSourceUrl(item);
+    return url
+      ? `url:${url}`
+      : `label:${item.trim().toLocaleLowerCase("en-US")}\u0000`;
+  }
+  if (item.url) return `url:${item.url}`;
+  const title = (item.title || item.name || item.source || "")
+    .trim()
+    .toLocaleLowerCase("en-US");
+  const domain = (item.domain || "").trim().toLocaleLowerCase("en-US");
+  if (title || domain) return `label:${title}\u0000${domain}`;
+  return `object:${canonicalJson(item)}`;
+}
+
+function mergeMonitorEvidenceItem(
+  existing: MonitorEvidence,
+  incoming: MonitorEvidence,
+): MonitorEvidence {
+  if (typeof existing === "string") {
+    return typeof incoming === "string" ? existing : incoming;
+  }
+  if (typeof incoming === "string") return existing;
+  const completeness = (item: Record<string, unknown>) => {
+    const populated = Object.values(item).filter(
+      (value) =>
+        value !== undefined &&
+        value !== null &&
+        (typeof value !== "string" || value.trim().length > 0),
+    );
+    return (
+      populated.length * 10_000 +
+      populated.reduce<number>(
+        (total, value) =>
+          total + (typeof value === "string" ? value.length : 1),
+        0,
+      )
+    );
+  };
+  const incomingIsMoreComplete =
+    completeness(incoming) > completeness(existing);
+  const preferred = incomingIsMoreComplete ? incoming : existing;
+  const secondary = incomingIsMoreComplete ? existing : incoming;
+  return {
+    ...secondary,
+    ...preferred,
+    index: preferred.index ?? secondary.index,
+    title: preferred.title ?? secondary.title,
+    name: preferred.name ?? secondary.name,
+    url: preferred.url ?? secondary.url,
+    source: preferred.source ?? secondary.source,
+    domain: preferred.domain ?? secondary.domain,
+    summary: preferred.summary ?? secondary.summary,
+  };
+}
+
+function mergeUnifiedSources(
+  ...collections: Array<MonitorEvidence[] | undefined>
+): MonitorEvidence[] {
+  const byIdentity = new Map<string, MonitorEvidence>();
+  let candidateCount = 0;
+  for (const collection of collections) {
+    for (const item of collection ?? []) {
+      if (candidateCount >= MAX_EVIDENCE_CANDIDATES) {
+        return Array.from(byIdentity.values()).slice(0, MAX_SOURCE_ITEMS);
+      }
+      candidateCount += 1;
+      const identity = monitorEvidenceIdentity(item);
+      const existing = byIdentity.get(identity);
+      byIdentity.set(
+        identity,
+        existing ? mergeMonitorEvidenceItem(existing, item) : item,
+      );
+    }
+  }
+  return Array.from(byIdentity.values()).slice(0, MAX_SOURCE_ITEMS);
+}
+
+function checkpointItemSources(item: MonitorCheckpointItem) {
+  if (Object.prototype.hasOwnProperty.call(item, "sources")) {
+    return mergeUnifiedSources(
+      sanitizeEvidence(item.sources, MAX_EVIDENCE_CANDIDATES),
+    );
+  }
+  return mergeUnifiedSources(
+    sanitizeEvidence(item.citations, MAX_EVIDENCE_CANDIDATES),
+    sanitizeEvidence(item.references, MAX_EVIDENCE_CANDIDATES),
+  );
+}
+
+function canonicalMonitorSourceValue(record: Record<string, unknown>) {
+  for (const field of ["sources", "sourceList", "source_list"] as const) {
+    if (Object.prototype.hasOwnProperty.call(record, field)) {
+      return { present: true as const, value: record[field] };
+    }
+  }
+  return { present: false as const, value: undefined };
 }
 
 function safeMediaUrl(value: unknown): string | undefined {
@@ -1133,16 +1319,22 @@ function normalizeResultSnapshot(
     seen.add(subTaskId);
     const references = sanitizeEvidence(
       child.referenceList,
-      MAX_REFERENCE_ITEMS,
+      MAX_EVIDENCE_CANDIDATES,
     );
     const inlineCitations = citationsFromInlineMarkers(
       child.answerContent,
       child.referenceList,
     );
     const citations = mergeCitationEvidence(
-      sanitizeEvidence(child.citationList, MAX_CITATION_ITEMS),
+      sanitizeEvidence(child.citationList, MAX_EVIDENCE_CANDIDATES),
       inlineCitations,
     );
+    const canonicalSources = canonicalMonitorSourceValue(child);
+    const sources = canonicalSources.present
+      ? mergeUnifiedSources(
+          sanitizeEvidence(canonicalSources.value, MAX_EVIDENCE_CANDIDATES),
+        )
+      : mergeUnifiedSources(citations, references);
     const knownInlineCitationIndexes = new Set(
       citations.flatMap((item) =>
         typeof item !== "string" && item.index !== undefined
@@ -1167,8 +1359,7 @@ function normalizeResultSnapshot(
         ).slice(0, 64) || "unknown",
       ...(answer ? { answerText: answer } : {}),
       media,
-      citations,
-      references,
+      sources,
       ...(error ? { error } : {}),
       ...(normalizeTimestamp(child.time)
         ? { completedAt: normalizeTimestamp(child.time) }
@@ -1176,23 +1367,6 @@ function normalizeResultSnapshot(
     });
   }
   return { checkpoint: { items }, remoteStatus, totalItems };
-}
-
-function mergeEvidence(
-  first: MonitorEvidence[],
-  second: MonitorEvidence[],
-  maxItems: number,
-): MonitorEvidence[] {
-  const result: MonitorEvidence[] = [];
-  const seen = new Set<string>();
-  for (const item of [...first, ...second]) {
-    const key = canonicalJson(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(item);
-    if (result.length >= maxItems) break;
-  }
-  return result;
 }
 
 function mergeCheckpoints(
@@ -1217,11 +1391,9 @@ function mergeCheckpoints(
           ? next.answerText
           : prior.answerText,
       media: mergeMedia(prior.media, next.media),
-      citations: mergeCitationEvidence(prior.citations, next.citations),
-      references: mergeEvidence(
-        prior.references,
-        next.references,
-        MAX_REFERENCE_ITEMS,
+      sources: mergeUnifiedSources(
+        checkpointItemSources(prior),
+        checkpointItemSources(next),
       ),
       error:
         priorFinal && nextFinal ? prior.error : (next.error ?? prior.error),
@@ -1329,8 +1501,7 @@ function buildFinalResult(
       status: item.status,
       ...(item.answerText ? { answerText: item.answerText } : {}),
       media: item.media ?? [],
-      citations: item.citations,
-      references: item.references,
+      sources: checkpointItemSources(item),
       ...(item.error ? { error: item.error } : {}),
       ...(item.completedAt ? { completedAt: item.completedAt } : {}),
     });
@@ -1398,7 +1569,28 @@ function publicMonitorRun(
         if (!isRecord(record)) return [];
         const platform = toPublicMonitorPlatform(record.platform);
         if (!platform) return [];
-        return [{ ...(record as PublicMonitorRecord), platform }];
+        const legacyRecord = record as unknown as MonitorCheckpointItem;
+        return [
+          {
+            recordId: normalizedText(record.recordId),
+            platform,
+            runIndex: positiveInteger(record.runIndex) || 1,
+            status: normalizedText(record.status),
+            ...(normalizedText(record.answerText)
+              ? { answerText: normalizedText(record.answerText) }
+              : {}),
+            media: Array.isArray(record.media)
+              ? (record.media as MonitorMedia[])
+              : [],
+            sources: checkpointItemSources(legacyRecord),
+            ...(normalizedText(record.error)
+              ? { error: normalizedText(record.error) }
+              : {}),
+            ...(normalizedText(record.completedAt)
+              ? { completedAt: normalizedText(record.completedAt) }
+              : {}),
+          },
+        ];
       })
     : undefined;
   return {

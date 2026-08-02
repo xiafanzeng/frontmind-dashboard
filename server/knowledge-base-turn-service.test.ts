@@ -7,6 +7,7 @@ import {
   conversations,
   conversationTurns,
   knowledgeBaseBuilds,
+  knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
   messages,
   upstreamResources,
@@ -88,6 +89,7 @@ interface TurnServiceStore {
   messages: any[];
   credentials: any[];
   tombstones: any[];
+  retainedTombstones: any[];
   resources: any[];
   usageOwnerId: number | null;
 }
@@ -98,6 +100,7 @@ function createTurnServiceExecutor(input: {
   turns?: ConversationTurn[];
   credentials?: any[];
   tombstones?: any[];
+  retainedTombstones?: any[];
   resources?: any[];
   usageOwnerId?: number | null;
   turnSelections: TurnSelection[][];
@@ -118,6 +121,7 @@ function createTurnServiceExecutor(input: {
       ]),
     ],
     tombstones: [...(input.tombstones || [])],
+    retainedTombstones: [...(input.retainedTombstones || [])],
     resources: [...(input.resources || [])],
     usageOwnerId: input.usageOwnerId ?? null,
   };
@@ -149,6 +153,9 @@ function createTurnServiceExecutor(input: {
         }
         if (table === knowledgeBaseConversationTombstones) {
           return store.tombstones;
+        }
+        if (table === knowledgeBaseConversationRetentionTombstones) {
+          return store.retainedTombstones;
         }
         if (table === messages) {
           const isIdentityLookup = messageSelectionIndex++ % 2 === 0;
@@ -256,6 +263,7 @@ function createTurnServiceExecutor(input: {
         store.messages = snapshot.messages;
         store.credentials = snapshot.credentials;
         store.tombstones = snapshot.tombstones;
+        store.retainedTombstones = snapshot.retainedTombstones;
         store.resources = snapshot.resources;
         store.usageOwnerId = snapshot.usageOwnerId;
         throw error;
@@ -721,6 +729,28 @@ describe("knowledge-base atomic start reservation", () => {
           userId: 1,
           publicConversationId: "conversation-atomic",
           resetRequestId: "00000000-0000-4000-8000-000000000098",
+        },
+      ],
+      turnSelections: [[]],
+    });
+
+    await expect(
+      reserveKnowledgeBaseStartBuild(startInput, executor),
+    ).rejects.toMatchObject({ code: "CONVERSATION_RESET" });
+    expect(store.build).toBeNull();
+    expect(store.conversation).toBeNull();
+    expect(store.turns).toHaveLength(0);
+    expect(store.messages).toHaveLength(0);
+  });
+
+  it("rejects a retained tombstone after the reset ticket has expired", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      retainedTombstones: [
+        {
+          id: "00000000-0000-4000-8000-000000000097",
+          userId: 1,
+          publicConversationId: "conversation-atomic",
+          resetAt: new Date("2026-06-01T00:00:00.000Z"),
         },
       ],
       turnSelections: [[]],

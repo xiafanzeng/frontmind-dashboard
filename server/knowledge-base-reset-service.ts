@@ -824,13 +824,25 @@ export async function decideKnowledgeReset(input: {
 
 export async function processKnowledgeResetCleanupJobs() {
   const db = await requireDb();
+  const retryCappedFailureBefore = new Date(
+    Date.now() - 7 * 24 * 60 * 60 * 1_000,
+  );
   const jobs = await db
     .select()
     .from(knowledgeBaseResetCleanupJobs)
     .where(
-      and(
-        inArray(knowledgeBaseResetCleanupJobs.status, ["pending", "failed"]),
-        lt(knowledgeBaseResetCleanupJobs.attemptCount, 5),
+      or(
+        eq(knowledgeBaseResetCleanupJobs.status, "pending"),
+        and(
+          eq(knowledgeBaseResetCleanupJobs.status, "failed"),
+          or(
+            lt(knowledgeBaseResetCleanupJobs.attemptCount, 5),
+            lt(
+              knowledgeBaseResetCleanupJobs.updatedAt,
+              retryCappedFailureBefore,
+            ),
+          ),
+        ),
       ),
     )
     .orderBy(knowledgeBaseResetCleanupJobs.createdAt)
@@ -872,16 +884,6 @@ export async function processKnowledgeResetCleanupJobs() {
         }
       }
       await db.transaction(async (tx) => {
-        await tx
-          .update(knowledgeBaseResetCleanupJobs)
-          .set({
-            status: "completed",
-            attemptCount: sql`${knowledgeBaseResetCleanupJobs.attemptCount} + 1`,
-            lastError: null,
-            completedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(knowledgeBaseResetCleanupJobs.id, job.id));
         if (job.kind !== "local_asset") {
           await tx
             .delete(upstreamResources)
@@ -893,6 +895,9 @@ export async function processKnowledgeResetCleanupJobs() {
               ),
             );
         }
+        await tx
+          .delete(knowledgeBaseResetCleanupJobs)
+          .where(eq(knowledgeBaseResetCleanupJobs.id, job.id));
       });
     } catch (error) {
       await db

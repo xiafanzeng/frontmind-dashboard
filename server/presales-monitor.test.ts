@@ -742,8 +742,10 @@ describe("presales monitor polling and public result", () => {
           title: "相关图片",
         },
       ],
-      citations: [expect.objectContaining({ title: "实际引用 1" })],
-      references: [expect.objectContaining({ title: "检索来源 1" })],
+      sources: [
+        expect.objectContaining({ title: "实际引用 1" }),
+        expect.objectContaining({ title: "检索来源 1" }),
+      ],
     });
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("subtask");
@@ -756,7 +758,7 @@ describe("presales monitor polling and public result", () => {
     expect(serialized).not.toContain("javascript:");
   });
 
-  it("preserves a full answer and keeps citations, references and media separate", async () => {
+  it("preserves a full answer and returns one deduplicated source collection", async () => {
     const harness = makeHarness(["deepseek"]);
     const created = await harness.service.create(createInput());
     const payload = resultResponse(["deepseek"]);
@@ -806,23 +808,22 @@ describe("presales monitor polling and public result", () => {
     const result = await harness.service.result(created.run.runId);
     const record = result.records?.[0];
     expect(record?.answerText).toBe(longAnswer);
-    expect(record?.citations).toHaveLength(100);
-    expect(record?.references).toHaveLength(200);
-    expect(record?.citations).toContainEqual({
+    expect(record?.sources).toHaveLength(200);
+    expect(record?.sources).toContainEqual({
       index: 16,
       source: "实际引用站点",
       url: "https://citation.invalid/actual-only",
       summary: "实际引用摘要",
     });
-    expect(record?.references).toContainEqual({
+    expect(record?.sources).toContainEqual({
       index: 1,
       title: "检索参考来源",
       source: "检索站点",
       url: "https://reference.invalid/retrieved-only",
       summary: "检索来源摘要",
     });
-    expect(JSON.stringify(record?.citations)).not.toContain("retrieved-only");
-    expect(JSON.stringify(record?.references)).not.toContain("actual-only");
+    expect(record).not.toHaveProperty("citations");
+    expect(record).not.toHaveProperty("references");
     expect(record?.media).toEqual([
       {
         type: "video",
@@ -836,6 +837,196 @@ describe("presales monitor polling and public result", () => {
       },
     ]);
     expect(JSON.stringify(record)).not.toContain("icons/private.ico");
+  });
+
+  it("normalizes source URLs, removes tracking data, and blocks private URLs", async () => {
+    const harness = makeHarness(["deepseek"]);
+    const created = await harness.service.create(createInput());
+    const payload = resultResponse(["deepseek"]);
+    const child = payload.data.subTaskList[0] as Record<string, unknown>;
+    child.citationList = [
+      {
+        title: "主要来源",
+        url: "https://Example.invalid/report?utm_source=feed&b=2&a=1#part",
+      },
+      { title: "内网来源", url: "http://127.0.0.1/private" },
+      {
+        title: "映射内网来源",
+        url: "http://[::ffff:127.0.0.1]/private",
+      },
+      {
+        title: "映射内网十六进制来源",
+        url: "http://[::ffff:a00:1]/private",
+      },
+    ];
+    child.referenceList = [
+      {
+        title: "重复来源的完整标题",
+        url: "https://example.invalid/report?a=1&b=2",
+        summary: "补充摘要",
+      },
+      { title: "无链接来源", domain: "industry.example" },
+      { title: "本地主机", url: "https://localhost/secret" },
+    ];
+    harness.transport.resultValues = [payload];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const result = await harness.service.result(created.run.runId);
+    expect(result.records?.[0].sources).toEqual([
+      {
+        title: "重复来源的完整标题",
+        url: "https://example.invalid/report?a=1&b=2",
+        summary: "补充摘要",
+      },
+      { title: "无链接来源", domain: "industry.example" },
+    ]);
+  });
+
+  it("prefers the canonical upstream source collection over legacy arrays", async () => {
+    const harness = makeHarness(["deepseek"]);
+    const created = await harness.service.create(createInput());
+    const payload = resultResponse(["deepseek"]);
+    const child = payload.data.subTaskList[0] as Record<string, unknown>;
+    child.sources = [
+      {
+        title: "规范来源",
+        url: "https://canonical.example/report?utm_source=monitor#summary",
+      },
+    ];
+    child.citationList = [
+      { title: "不应合并的旧引用", url: "https://legacy.example/citation" },
+    ];
+    child.referenceList = [
+      { title: "不应合并的旧参考", url: "https://legacy.example/reference" },
+    ];
+    harness.transport.resultValues = [payload];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const result = await harness.service.result(created.run.runId);
+    expect(result.records?.[0].sources).toEqual([
+      {
+        title: "规范来源",
+        url: "https://canonical.example/report",
+      },
+    ]);
+  });
+
+  it.each([
+    ["sources", [], []],
+    [
+      "sourceList",
+      {
+        title: "单对象规范来源",
+        url: "https://canonical.example/object",
+      },
+      [
+        {
+          title: "单对象规范来源",
+          url: "https://canonical.example/object",
+        },
+      ],
+    ],
+    [
+      "source_list",
+      "https://canonical.example/string?utm_source=monitor#part",
+      ["https://canonical.example/string"],
+    ],
+  ] as const)(
+    "treats an explicitly present %s field as authoritative",
+    async (field, value, expected) => {
+      const harness = makeHarness(["deepseek"]);
+      const created = await harness.service.create(createInput());
+      const payload = resultResponse(["deepseek"]);
+      const child = payload.data.subTaskList[0] as Record<string, unknown>;
+      child[field] = value;
+      child.citationList = [
+        { title: "不应回退的旧引用", url: "https://legacy.example/citation" },
+      ];
+      child.referenceList = [
+        { title: "不应回退的旧参考", url: "https://legacy.example/reference" },
+      ];
+      harness.transport.resultValues = [payload];
+
+      harness.advance(MONITOR_POLL_INTERVAL_MS);
+      const result = await harness.service.result(created.run.runId);
+      expect(result.records?.[0].sources).toEqual(expected);
+    },
+  );
+
+  it("deduplicates a title-only string with the equivalent structured source", async () => {
+    const harness = makeHarness(["deepseek"]);
+    const created = await harness.service.create(createInput());
+    const payload = resultResponse(["deepseek"]);
+    const child = payload.data.subTaskList[0] as Record<string, unknown>;
+    child.sources = [
+      "同名行业来源",
+      { title: "同名行业来源", summary: "保留更完整的结构化信息" },
+    ];
+    harness.transport.resultValues = [payload];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const result = await harness.service.result(created.run.runId);
+    expect(result.records?.[0].sources).toEqual([
+      { title: "同名行业来源", summary: "保留更完整的结构化信息" },
+    ]);
+  });
+
+  it("deduplicates all safe candidates before applying the 200-source limit", async () => {
+    const harness = makeHarness(["deepseek"]);
+    const created = await harness.service.create(createInput());
+    const payload = resultResponse(["deepseek"]);
+    const child = payload.data.subTaskList[0] as Record<string, unknown>;
+    child.citationList = [];
+    child.referenceList = [
+      ...Array.from({ length: 200 }, (_, index) => ({
+        index,
+        title: `同一来源版本 ${index + 1}`,
+        url: "https://sources.example/shared",
+      })),
+      {
+        index: 201,
+        title: "第 201 个唯一来源",
+        url: "https://sources.example/unique-201",
+      },
+    ];
+    harness.transport.resultValues = [payload];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const result = await harness.service.result(created.run.runId);
+    expect(result.records?.[0].sources).toHaveLength(2);
+    expect(result.records?.[0].sources).toContainEqual({
+      index: 201,
+      title: "第 201 个唯一来源",
+      url: "https://sources.example/unique-201",
+    });
+  });
+
+  it("can enrich a retained source after 200 unique identities are seen", async () => {
+    const harness = makeHarness(["deepseek"]);
+    const created = await harness.service.create(createInput());
+    const payload = resultResponse(["deepseek"]);
+    const child = payload.data.subTaskList[0] as Record<string, unknown>;
+    child.sources = [
+      ...Array.from({ length: 200 }, (_, index) => ({
+        title: `来源 ${index + 1}`,
+        url: `https://sources.example/${index + 1}`,
+      })),
+      {
+        title: "来源 1 的完整标题",
+        url: "https://sources.example/1",
+        summary: "来自候选安全窗口末尾的补充信息",
+      },
+    ];
+    harness.transport.resultValues = [payload];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const result = await harness.service.result(created.run.runId);
+    expect(result.records?.[0].sources).toHaveLength(200);
+    expect(result.records?.[0].sources?.[0]).toEqual({
+      title: "来源 1 的完整标题",
+      url: "https://sources.example/1",
+      summary: "来自候选安全窗口末尾的补充信息",
+    });
   });
 
   it("derives Kimi citations only from exact zero-based inline source indexes", async () => {
@@ -872,23 +1063,16 @@ describe("presales monitor polling and public result", () => {
     expect(record?.answerText).toContain("〔来源 1〕");
     expect(record?.answerText).not.toContain("来源 9");
     expect(record?.answerText).not.toMatch(/[\uE3A0\uE3A3\uE3A8]/u);
-    expect(record?.citations).toEqual([
-      {
-        index: 0,
-        title: "Kimi 实际引用 0",
-        url: "https://reference.invalid/kimi-0",
-      },
-      {
-        index: 1,
-        title: "Kimi 实际引用 1",
-        url: "https://reference.invalid/kimi-1",
-      },
-    ]);
-    expect(record?.references).toHaveLength(3);
-    expect(JSON.stringify(record?.citations)).not.toContain("retrieved-only");
+    expect(record?.sources).toHaveLength(3);
+    expect(record?.sources).toContainEqual({
+      index: 0,
+      title: "Kimi 实际引用 0",
+      url: "https://reference.invalid/kimi-0",
+    });
+    expect(JSON.stringify(record?.sources)).toContain("retrieved-only");
   });
 
-  it("keeps structured citations primary and safely merges explicit inline citations", async () => {
+  it("keeps the most complete duplicate while safely merging explicit inline citations", async () => {
     const harness = makeHarness(["kimi"]);
     const created = await harness.service.create(createInput(["kimi"]));
     const payload = resultResponse(["kimi"]);
@@ -924,20 +1108,14 @@ describe("presales monitor polling and public result", () => {
 
     harness.advance(MONITOR_POLL_INTERVAL_MS);
     const result = await harness.service.result(created.run.runId);
-    expect(result.records?.[0].citations).toEqual([
-      {
-        index: 0,
-        title: "结构化引用优先",
-        url: "https://reference.invalid/shared-0",
-      },
-      {
-        index: 1,
-        title: "明确内联引用",
-        url: "https://reference.invalid/inline-1",
-      },
-    ]);
-    expect(result.records?.[0].references).toHaveLength(3);
-    expect(JSON.stringify(result.records?.[0].citations)).not.toContain(
+    expect(result.records?.[0].sources).toHaveLength(3);
+    expect(result.records?.[0].sources).toContainEqual({
+      index: 0,
+      title: "同一来源的检索版本",
+      url: "https://reference.invalid/shared-0",
+      summary: "不应制造第二条重复引用",
+    });
+    expect(JSON.stringify(result.records?.[0].sources)).toContain(
       "retrieved-3",
     );
   });
@@ -1213,25 +1391,19 @@ describe("presales monitor HTTP contract", () => {
         runIndex: 1,
         status: "completed",
         answerText: "第 1 次纯文字答案",
-        citations: [
+        sources: [
           expect.objectContaining({
             title: "实际引用 1",
             url: "https://citation.invalid/1",
           }),
-        ],
-        references: [
           expect.objectContaining({
             title: "检索来源 1",
             url: "https://reference.invalid/1",
           }),
         ],
       });
-      expect(JSON.stringify(body.run.records[0].citations)).not.toContain(
-        "reference.invalid",
-      );
-      expect(JSON.stringify(body.run.records[0].references)).not.toContain(
-        "citation.invalid",
-      );
+      expect(body.run.records[0]).not.toHaveProperty("citations");
+      expect(body.run.records[0]).not.toHaveProperty("references");
       expect(JSON.stringify(body)).not.toContain("subTaskId");
       expect(JSON.stringify(body)).not.toContain(TASK_ID);
     } finally {

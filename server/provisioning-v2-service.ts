@@ -429,7 +429,7 @@ export async function submitWebsitePurchase(input: {
       planCode: "basic",
       questionId: value.service.purchasedQuestion.id,
       question: value.service.purchasedQuestion.question,
-      contractId: value.contract.id,
+      contractId: "id" in value.contract ? value.contract.id : null,
       contractTemplateVersion: value.contract.templateVersion,
       contractDocumentSha256: evidenceHash,
       contractEvidence,
@@ -523,7 +523,7 @@ export async function listPendingWebsitePurchases() {
 export async function decideWebsitePurchase(input: {
   reference: string;
   manualOrderReference?: string;
-  actorUserId: number;
+  actorUserId?: number;
   decision: "confirm" | "reject";
   signedAt?: Date;
   signatoryId?: string;
@@ -612,21 +612,52 @@ export async function decideWebsitePurchase(input: {
       return rejected[0]!;
     }
 
-    const signedAt = input.signedAt ?? now;
-    const signatoryId = input.signatoryId?.trim();
-    if (!signatoryId) {
-      throw new PurchaseProvisioningError(
-        "PURCHASE_ALREADY_DECIDED",
-        "确认签署证据时必须填写签署主体标识",
-        400,
-      );
-    }
     const submittedEvidence =
       row.contractEvidence &&
       typeof row.contractEvidence === "object" &&
       !Array.isArray(row.contractEvidence)
         ? row.contractEvidence
         : {};
+    const externallyAuthorized =
+      submittedEvidence.type === "external_wechat_confirmation";
+    const externalEventReference =
+      typeof submittedEvidence.eventReference === "string"
+        ? submittedEvidence.eventReference.trim()
+        : "";
+    const externalAuthorizedAt =
+      typeof submittedEvidence.authorizedAt === "string"
+        ? new Date(submittedEvidence.authorizedAt)
+        : undefined;
+    if (
+      externallyAuthorized &&
+      (!manualOwner ||
+        externalEventReference.length < 4 ||
+        externalEventReference.length > 128 ||
+        !externalAuthorizedAt ||
+        !Number.isFinite(externalAuthorizedAt.getTime()) ||
+        row.paidAt.getTime() <= externalAuthorizedAt.getTime() ||
+        externalAuthorizedAt.getTime() > now.getTime() + 5 * 60 * 1000)
+    ) {
+      throw new PurchaseProvisioningError(
+        "PURCHASE_ALREADY_DECIDED",
+        "企业微信合同确认记录无效",
+        400,
+      );
+    }
+    const signedAt = externallyAuthorized ? undefined : (input.signedAt ?? now);
+    const signatoryId = externallyAuthorized
+      ? undefined
+      : input.signatoryId?.trim();
+    if (
+      !externallyAuthorized &&
+      (!signatoryId || !Number.isInteger(input.actorUserId))
+    ) {
+      throw new PurchaseProvisioningError(
+        "PURCHASE_ALREADY_DECIDED",
+        "确认签署证据时必须填写签署主体标识",
+        400,
+      );
+    }
     const artifact =
       submittedEvidence.artifact &&
       typeof submittedEvidence.artifact === "object" &&
@@ -637,6 +668,7 @@ export async function decideWebsitePurchase(input: {
       typeof artifact.sha256 === "string" ? artifact.sha256.trim() : "";
     const manualEvidenceNote = input.note?.trim() || "";
     if (
+      !externallyAuthorized &&
       !/^[a-f0-9]{64}$/i.test(artifactSha256) &&
       manualEvidenceNote.length < 8
     ) {
@@ -646,15 +678,24 @@ export async function decideWebsitePurchase(input: {
         400,
       );
     }
-    const confirmedEvidence = {
-      ...submittedEvidence,
-      manualConfirmation: {
-        actorUserId: input.actorUserId,
-        signedAt: signedAt.toISOString(),
-        signatoryId,
-        note: manualEvidenceNote || null,
-      },
-    };
+    const confirmedEvidence = externallyAuthorized
+      ? {
+          ...submittedEvidence,
+          externalAuthorizationConfirmation: {
+            mode: "external_wechat",
+            eventReference: externalEventReference,
+            authorizedAt: externalAuthorizedAt!.toISOString(),
+          },
+        }
+      : {
+          ...submittedEvidence,
+          manualConfirmation: {
+            actorUserId: input.actorUserId!,
+            signedAt: signedAt!.toISOString(),
+            signatoryId: signatoryId!,
+            note: manualEvidenceNote || null,
+          },
+        };
 
     let userId = row.userId;
     if (row.accountMode === "create") {
@@ -735,8 +776,8 @@ export async function decideWebsitePurchase(input: {
       amountFen: row.amountFen,
       currency: "CNY",
       externalContractReference: row.contractId,
-      signedAt,
-      signatoryId,
+      signedAt: signedAt ?? null,
+      signatoryId: signatoryId ?? null,
       signingEvidence: confirmedEvidence,
       actorUserId: input.actorUserId,
       now,
@@ -795,8 +836,8 @@ export async function decideWebsitePurchase(input: {
       .set({
         userId,
         contractConfirmationStatus: "confirmed",
-        contractSignedAt: signedAt,
-        signatoryId,
+        contractSignedAt: signedAt ?? null,
+        signatoryId: signatoryId ?? null,
         contractEvidence: confirmedEvidence,
         status: "completed",
         accountSetupTokenHash: rawSetupToken ? sha256(rawSetupToken) : null,

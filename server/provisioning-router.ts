@@ -36,6 +36,7 @@ import {
   type ManualServiceOrderService,
 } from "./manual-service-order-service";
 import {
+  authorizeExternalManualServiceContractSchema,
   createManualServiceOrderRequestSchema,
   manualServiceAccountSetupRequestSchema,
   manualServicePaymentRequestSchema,
@@ -351,6 +352,33 @@ export function createProvisioningRouter(
       sendProvisioningError(res, error);
     }
   });
+
+  router.post(
+    "/manual-orders/:reference/external-contract",
+    express.json({ limit: "16kb", strict: true, type: "application/json" }),
+    async (req, res) => {
+      try {
+        const reference = z
+          .string()
+          .trim()
+          .min(4)
+          .max(128)
+          .parse(req.params.reference);
+        const request = authorizeExternalManualServiceContractSchema.parse(
+          req.body,
+        );
+        res.json(
+          await manualOrders.authorizeExternal({
+            reference,
+            request,
+            secret: configuredToken,
+          }),
+        );
+      } catch (error) {
+        sendProvisioningError(res, error);
+      }
+    },
+  );
 
   router.post(
     "/manual-orders/:reference/payment",

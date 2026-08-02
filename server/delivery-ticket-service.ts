@@ -410,7 +410,24 @@ type DeliveryTicketQuotaCapacityPeriod = Pick<
   | "contractId"
   | "contentAssetPublishLimit"
   | "websiteContentPublishLimit"
->;
+> &
+  Partial<
+    Pick<
+      typeof serviceQuotaPeriods.$inferSelect,
+      "archivedContentAssetPublishUsed" | "archivedWebsiteContentPublishUsed"
+    >
+  >;
+
+function archivedDeliveryTicketQuotaUsage(
+  period: DeliveryTicketQuotaCapacityPeriod,
+  quotaPool: DeliveryTicketQuotaPool,
+) {
+  return Number(
+    quotaPool === "content_asset_publish"
+      ? (period.archivedContentAssetPublishUsed ?? 0)
+      : (period.archivedWebsiteContentPublishUsed ?? 0),
+  );
+}
 
 /**
  * Selects the first real quota period with remaining capacity. Callers sort
@@ -428,7 +445,11 @@ export function selectDeliveryTicketQuotaPeriod(input: {
         input.quotaPool === "content_asset_publish"
           ? period.contentAssetPublishLimit
           : period.websiteContentPublishLimit;
-      return (input.activeCounts.get(period.id) ?? 0) < limit;
+      return (
+        (input.activeCounts.get(period.id) ?? 0) +
+          archivedDeliveryTicketQuotaUsage(period, input.quotaPool) <
+        limit
+      );
     }) ?? null
   );
 }
@@ -457,7 +478,13 @@ export function aggregateDeliveryTicketQuotaCapacity(input: {
       )
       .reduce((sum, row) => sum + Number(row.value), 0);
   const reserved = countState("reserved");
-  const consumed = countState("consumed");
+  const consumed =
+    countState("consumed") +
+    input.periods.reduce(
+      (sum, period) =>
+        sum + archivedDeliveryTicketQuotaUsage(period, input.quotaPool),
+      0,
+    );
   const used = reserved + consumed;
   return {
     limit,
@@ -904,47 +931,50 @@ async function currentQuota(
       ].filter(Boolean),
     ),
   ];
-  const periods = periodIds.length
-    ? await db
-        .select()
-        .from(serviceQuotaPeriods)
-        .where(
-          and(
-            inArray(serviceQuotaPeriods.id, periodIds),
-            eq(serviceQuotaPeriods.userId, userId),
-          ),
-        )
-        .orderBy(
-          asc(serviceQuotaPeriods.endsAt),
-          asc(serviceQuotaPeriods.startsAt),
-          asc(serviceQuotaPeriods.id),
-        )
-    : [];
-  const activeRows = periods.length
-    ? await db
-        .select({
-          quotaPeriodId: deliveryTickets.quotaPeriodId,
-          quotaPool: deliveryTickets.quotaPool,
-          quotaState: deliveryTickets.quotaState,
-          value: count(),
-        })
-        .from(deliveryTickets)
-        .where(
-          and(
-            eq(deliveryTickets.userId, userId),
-            inArray(
-              deliveryTickets.quotaPeriodId,
-              periods.map((period: any) => period.id),
+  const { periods, activeRows } = periodIds.length
+    ? await db.transaction(async (tx: any) => {
+        const periods = await tx
+          .select()
+          .from(serviceQuotaPeriods)
+          .where(
+            and(
+              inArray(serviceQuotaPeriods.id, periodIds),
+              eq(serviceQuotaPeriods.userId, userId),
             ),
-            inArray(deliveryTickets.quotaState, ["reserved", "consumed"]),
-          ),
-        )
-        .groupBy(
-          deliveryTickets.quotaPeriodId,
-          deliveryTickets.quotaPool,
-          deliveryTickets.quotaState,
-        )
-    : [];
+          )
+          .orderBy(
+            asc(serviceQuotaPeriods.endsAt),
+            asc(serviceQuotaPeriods.startsAt),
+            asc(serviceQuotaPeriods.id),
+          );
+        const activeRows = periods.length
+          ? await tx
+              .select({
+                quotaPeriodId: deliveryTickets.quotaPeriodId,
+                quotaPool: deliveryTickets.quotaPool,
+                quotaState: deliveryTickets.quotaState,
+                value: count(),
+              })
+              .from(deliveryTickets)
+              .where(
+                and(
+                  eq(deliveryTickets.userId, userId),
+                  inArray(
+                    deliveryTickets.quotaPeriodId,
+                    periods.map((period: any) => period.id),
+                  ),
+                  inArray(deliveryTickets.quotaState, ["reserved", "consumed"]),
+                ),
+              )
+              .groupBy(
+                deliveryTickets.quotaPeriodId,
+                deliveryTickets.quotaPool,
+                deliveryTickets.quotaState,
+              )
+          : [];
+        return { periods, activeRows };
+      })
+    : { periods: [], activeRows: [] };
   const periodId =
     periods.length === 1
       ? periods[0].id
@@ -1776,7 +1806,7 @@ export async function createDeliveryTicket(input: {
   return db.transaction(async (tx) =>
     withSerializedTicketCreation({
       withLock: async (criticalSection) => {
-        const periods = await tx
+        const lockedPeriods = await tx
           .select()
           .from(serviceQuotaPeriods)
           .where(
@@ -1785,18 +1815,20 @@ export async function createDeliveryTicket(input: {
               eq(serviceQuotaPeriods.userId, input.userId),
             ),
           )
-          .orderBy(
-            asc(serviceQuotaPeriods.endsAt),
-            asc(serviceQuotaPeriods.startsAt),
-            asc(serviceQuotaPeriods.id),
-          )
+          .orderBy(asc(serviceQuotaPeriods.id))
           .for("update");
-        if (!periods.length) {
+        if (!lockedPeriods.length) {
           throw new DeliveryTicketError(
             "QUOTA_PERIOD_NOT_FOUND",
             "当前服务周期已变化，请刷新后重试。",
           );
         }
+        const periods = [...lockedPeriods].sort(
+          (left, right) =>
+            left.endsAt.getTime() - right.endsAt.getTime() ||
+            left.startsAt.getTime() - right.startsAt.getTime() ||
+            left.id.localeCompare(right.id),
+        );
         return criticalSection(periods);
       },
       findDuplicate: async () => {

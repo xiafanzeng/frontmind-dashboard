@@ -344,6 +344,34 @@
       "when": 1785611861130,
       "tag": "0048_api_usage_coverage_claims",
       "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "5",
+      "when": 1785672421783,
+      "tag": "0049_external_wechat_contract_authorization",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "5",
+      "when": 1785673659172,
+      "tag": "0050_nullable_manual_order_commercial_evidence",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "5",
+      "when": 1785673776677,
+      "tag": "0051_delivery_ticket_retention",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "5",
+      "when": 1785674946919,
+      "tag": "0052_delivery_ticket_retention_guards",
+      "breakpoints": true
     }
   ]
 }
