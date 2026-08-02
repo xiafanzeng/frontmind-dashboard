@@ -544,6 +544,34 @@ describe("database schema contract", () => {
     expect(drift.differences.join("\n")).toMatch(/\.foreignKeys\./u);
   });
 
+  it("normalizes a historical index name only for one complete semantic match", async () => {
+    const contract = await currentContract();
+    const exactRows = metadataRows(contract);
+    const table = contract.tables.find((candidate) =>
+      candidate.indexes.some((index) => index.unique),
+    )!;
+    const index = table.indexes.find((candidate) => candidate.unique)!;
+    const indexRows = exactRows.indexes.filter(
+      (row) => row.tableName === table.name && row.indexName === index.name,
+    );
+    expect(indexRows.length).toBeGreaterThan(0);
+    for (const row of indexRows) {
+      row.indexName = "historical_short_uq";
+    }
+
+    await expect(
+      evaluateDatabaseSchema(databaseFromRows(exactRows), contract),
+    ).resolves.toMatchObject({ status: "exact", differences: [] });
+
+    indexRows[0]!.nonUnique = 1;
+    const drift = await evaluateDatabaseSchema(
+      databaseFromRows(exactRows),
+      contract,
+    );
+    expect(drift.status).toBe("diverged");
+    expect(drift.differences.join("\n")).toMatch(/\.indexes\./u);
+  });
+
   it("ignores only MySQL's generated foreign-key index and fails closed on drift", async () => {
     const contract = await currentContract();
     const exactRows = metadataRows(contract);

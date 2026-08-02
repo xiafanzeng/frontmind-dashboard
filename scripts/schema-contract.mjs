@@ -1310,6 +1310,37 @@ function foreignKeySemanticIdentity(foreignKey) {
   ]);
 }
 
+function indexSemanticIdentity(index) {
+  return JSON.stringify([index.columns, index.unique, index.method]);
+}
+
+function hasUniqueIndexSemanticMatch(index, actualIndexes, expectedIndexes) {
+  const identity = indexSemanticIdentity(index);
+  return (
+    actualIndexes.filter(
+      (candidate) => indexSemanticIdentity(candidate) === identity,
+    ).length === 1 &&
+    (expectedIndexes ?? []).filter(
+      (candidate) => indexSemanticIdentity(candidate) === identity,
+    ).length === 1
+  );
+}
+
+function normalizeDatabaseIndexNames(indexes, expectedIndexes) {
+  return indexes
+    .map((index) => {
+      if (!hasUniqueIndexSemanticMatch(index, indexes, expectedIndexes)) {
+        return index;
+      }
+      const identity = indexSemanticIdentity(index);
+      const expected = expectedIndexes.find(
+        (candidate) => indexSemanticIdentity(candidate) === identity,
+      );
+      return { ...index, name: expected.name };
+    })
+    .sort((left, right) => left.name.localeCompare(right.name, "en"));
+}
+
 function normalizeDatabaseForeignKeyNames(foreignKeys, expectedForeignKeys) {
   const expectedBySemantics = new Map();
   for (const foreignKey of expectedForeignKeys ?? []) {
@@ -1505,7 +1536,8 @@ export async function inspectDatabaseSchema(database, expectedContract) {
       const declaredIndexNames = new Set(
         (expectedTables.get(name)?.indexes ?? []).map((index) => index.name),
       );
-      const indexes = [...rawIndexes]
+      const expectedIndexes = expectedTables.get(name)?.indexes ?? [];
+      const actualIndexes = [...rawIndexes]
         .filter(([indexName]) => indexName !== "PRIMARY")
         .map(([indexName, rows]) => {
           const first = rows[0];
@@ -1527,16 +1559,23 @@ export async function inspectDatabaseSchema(database, expectedContract) {
             unique: Number(rowValue(first, "nonUnique", "NON_UNIQUE")) === 0,
             method: [...methods][0],
           };
-        })
-        .filter(
+        });
+      const indexes = normalizeDatabaseIndexNames(
+        actualIndexes.filter(
           (index) =>
+            hasUniqueIndexSemanticMatch(
+              index,
+              actualIndexes,
+              expectedIndexes,
+            ) ||
             !isAutomaticForeignKeyIndex(
               index,
               rawForeignKeys,
               declaredIndexNames,
             ),
-        )
-        .sort((left, right) => left.name.localeCompare(right.name, "en"));
+        ),
+        expectedIndexes,
+      ).sort((left, right) => left.name.localeCompare(right.name, "en"));
 
       const checks = (checkRows.get(name) ?? [])
         .map((row) => ({
