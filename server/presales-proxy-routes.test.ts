@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -7,7 +8,8 @@ import { Readable } from "node:stream";
 import express from "express";
 import axios from "axios";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { HttpGeoPresalesBroker } from "../../frontmind-website/server/geo/broker";
+
+import { siblingWebsiteRepositoryRoot } from "./cross-repo-test-path";
 
 vi.mock("./presales-service", async () => {
   const actual =
@@ -48,6 +50,42 @@ const originalMonitorKey = process.env.FRONTMIND_MONITOR_API_KEY;
 const originalPublicUrl = process.env.FRONTMIND_PUBLIC_URL;
 const originalDashboardAssetDir = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
 let dashboardAssetDir = "";
+const websiteBrokerPath = path.resolve(
+  siblingWebsiteRepositoryRoot(),
+  "server/geo/broker.ts",
+);
+const websiteBrokerAvailable = existsSync(websiteBrokerPath);
+const websiteBrokerIt = websiteBrokerAvailable ? it : it.skip;
+const websiteBrokerRoundTripTestName =
+  "round-trips Website Broker bytes through durable local storage without calling an upstream download endpoint";
+const websiteBrokerRejectedUploadTestName =
+  "does not publish a local file when the upstream upload was rejected";
+
+type WebsiteBrokerClient = {
+  createFile(value: {
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+  }): Promise<{ id: string; proxy_upload_ticket?: string }>;
+  uploadFile(
+    fileId: string,
+    content: Buffer,
+    mimeType: string,
+    uploadTicket?: string,
+  ): Promise<void>;
+  downloadFile(fileId: string): Promise<Response>;
+};
+
+async function createWebsiteBroker(options: {
+  baseUrl: string;
+  serviceToken: string;
+  fetchImpl: typeof fetch;
+}) {
+  const { HttpGeoPresalesBroker } = await vi.importActual<{
+    HttpGeoPresalesBroker: new (value: typeof options) => WebsiteBrokerClient;
+  }>(websiteBrokerPath);
+  return new HttpGeoPresalesBroker(options);
+}
 
 async function withServer(run: (baseUrl: string) => Promise<void>) {
   const app = express();
@@ -354,7 +392,7 @@ describe("presales create-time upload capability", () => {
     expect(logged).not.toContain(filename);
   });
 
-  it("round-trips Website Broker bytes through durable local storage without calling an upstream download endpoint", async () => {
+  websiteBrokerIt(websiteBrokerRoundTripTestName, async () => {
     const bytes = Buffer.from("zip");
     let storedBytes = Buffer.alloc(0);
     const signedUploadUrl =
@@ -387,7 +425,7 @@ describe("presales create-time upload capability", () => {
     }));
 
     await withServer(async (baseUrl) => {
-      const broker = new HttpGeoPresalesBroker({
+      const broker = await createWebsiteBroker({
         baseUrl,
         serviceToken: token,
         fetchImpl: (input, init) =>
@@ -416,7 +454,7 @@ describe("presales create-time upload capability", () => {
     expect(get).not.toHaveBeenCalled();
   });
 
-  it("does not publish a local file when the upstream upload was rejected", async () => {
+  websiteBrokerIt(websiteBrokerRejectedUploadTestName, async () => {
     const signedUploadUrl =
       "https://uploads.example.test/rejected.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=rejected";
     vi.spyOn(axios, "post").mockResolvedValue({
@@ -439,7 +477,7 @@ describe("presales create-time upload capability", () => {
     });
 
     await withServer(async (baseUrl) => {
-      const broker = new HttpGeoPresalesBroker({
+      const broker = await createWebsiteBroker({
         baseUrl,
         serviceToken: token,
         fetchImpl: (input, init) =>

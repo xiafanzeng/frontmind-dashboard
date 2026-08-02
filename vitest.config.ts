@@ -3,9 +3,19 @@ import path from "path";
 import react from "@vitejs/plugin-react";
 
 const templateRoot = path.resolve(import.meta.dirname);
+const configuredWebsiteTestRoot =
+  process.env.FRONTMIND_WEBSITE_REPOSITORY_ROOT?.trim();
+const websiteTestRoot = configuredWebsiteTestRoot
+  ? path.resolve(configuredWebsiteTestRoot)
+  : path.resolve(templateRoot, "../frontmind-website");
 
 export default defineConfig({
   root: templateRoot,
+  server: {
+    fs: {
+      allow: [templateRoot, websiteTestRoot],
+    },
+  },
   resolve: {
     alias: {
       "@": path.resolve(templateRoot, "client", "src"),

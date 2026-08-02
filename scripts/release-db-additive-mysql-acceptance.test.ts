@@ -15,6 +15,8 @@ import { runReleaseDb } from "./release-db";
 const URL_ENV = "FRONTMIND_RELEASE_MYSQL_ACCEPTANCE_DATABASE_URL";
 const REQUIRED_ENV = "FRONTMIND_RELEASE_MYSQL_ACCEPTANCE_REQUIRED";
 const CLIENT_MODE_ENV = "FRONTMIND_RELEASE_MYSQL_CLIENT_MODE";
+const MYSQL_CLIENT_IMAGE =
+  "public.ecr.aws/docker/library/mysql:8.4.10@sha256:8dbcf531a03aade657e181b9cf2f1d1803ce621a1d55610cb44cb531ab7d7db6";
 const acceptanceUrl = process.env[URL_ENV]?.trim();
 
 if (process.env[REQUIRED_ENV] === "1" && !acceptanceUrl) {
@@ -100,7 +102,7 @@ function mysqlClientCommand(
         "host",
         "-e",
         "MYSQL_PWD",
-        "mysql:8.4.10",
+        MYSQL_CLIENT_IMAGE,
         command,
         ...clientArguments,
       ],
@@ -257,6 +259,9 @@ describe("temporary additive release fixture", () => {
       expect(
         mysqlClientCommand(target, "mysql", target.database).arguments,
       ).toContain("--interactive");
+      expect(
+        mysqlClientCommand(target, "mysql", target.database).arguments,
+      ).toContain(MYSQL_CLIENT_IMAGE);
       expect(
         mysqlClientCommand(target, "mysqldump", target.database).arguments,
       ).not.toContain("--interactive");
