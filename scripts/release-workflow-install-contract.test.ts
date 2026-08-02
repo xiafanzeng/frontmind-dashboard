@@ -31,6 +31,11 @@ afterEach(async () => {
 });
 
 describe("release workflow source-ordering contracts", () => {
+  it("takes the pnpm version only from package.json", async () => {
+    const workflow = await readFile(dashboardWorkflow, "utf8");
+    expect(workflow).not.toMatch(/pnpm\/action-setup@v4\s+with:\s+version:/gu);
+  });
+
   it("builds and signs the first Dashboard image before auto-deploy is enabled", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     expect(
