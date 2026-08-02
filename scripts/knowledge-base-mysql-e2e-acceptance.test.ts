@@ -513,7 +513,9 @@ mysqlDescribe(
       expect(Number(ledgerRows[0]?.migrationCount || 0)).toBe(
         journal.entries.length,
       );
-      expect(journal.entries.slice(-4).map((entry) => entry.tag)).toEqual([
+      // Anchor this E2E to the knowledge/API migration chain instead of the
+      // moving journal tail, which may contain newer unrelated migrations.
+      expect(journal.entries.slice(45, 49).map((entry) => entry.tag)).toEqual([
         "0045_knowledge_base_state_machine",
         "0046_api_usage_snapshot_claims",
         "0047_api_usage_task_ledger",
