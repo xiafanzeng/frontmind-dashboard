@@ -21,6 +21,7 @@ import {
 import {
   getKnowledgeResetStatus,
   knowledgeSnapshotCleanupStorageKeys,
+  shouldDeleteKnowledgeResetUpstreamResource,
 } from "./knowledge-base-reset-service";
 
 function query(rows: Array<Record<string, unknown>>) {
@@ -97,6 +98,11 @@ beforeEach(() => {
 });
 
 describe("knowledge-base reset status", () => {
+  it("retains task ownership evidence while allowing file cleanup", () => {
+    expect(shouldDeleteKnowledgeResetUpstreamResource("task")).toBe(false);
+    expect(shouldDeleteKnowledgeResetUpstreamResource("file")).toBe(true);
+  });
+
   it("queues both rendered assets and the immutable snapshot ZIP for cleanup", () => {
     expect(
       knowledgeSnapshotCleanupStorageKeys(

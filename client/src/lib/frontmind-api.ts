@@ -872,17 +872,6 @@ export async function listTasks(params?: {
 }
 
 /**
- * Delete a task
- */
-export async function deleteTask(responseId: string): Promise<void> {
-  try {
-    await apiRequest(`/v1/responses/${responseId}`, { method: "DELETE" });
-  } catch {
-    await apiRequest(`/v1/tasks/${responseId}`, { method: "DELETE" });
-  }
-}
-
-/**
  * Upload a file - Step 1: Create file record
  */
 export async function createFileRecord(filename: string): Promise<FileRecord> {

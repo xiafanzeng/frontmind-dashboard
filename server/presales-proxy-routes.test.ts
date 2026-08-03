@@ -752,10 +752,8 @@ describe("presales deletion routes", () => {
     );
   });
 
-  it("returns 204 when the upstream task is already absent", async () => {
-    const deleteMock = vi
-      .spyOn(axios, "delete")
-      .mockResolvedValue({ status: 404, data: { message: "not found" } });
+  it("retains task evidence without contacting the upstream API", async () => {
+    const deleteMock = vi.spyOn(axios, "delete");
 
     await withServer(async (baseUrl) => {
       const response = await fetch(`${baseUrl}/tasks/task-1`, {
@@ -763,11 +761,13 @@ describe("presales deletion routes", () => {
         headers: { "x-frontmind-service-token": token },
       });
       expect(response.status).toBe(204);
+      expect(response.headers.get("x-frontmind-task-retention")).toBe(
+        "retained",
+      );
       expect(await response.text()).toBe("");
     });
 
-    expect(deleteMock).toHaveBeenCalledOnce();
-    expect(deleteMock.mock.calls[0][0]).toContain("/v1/tasks/task-1");
+    expect(deleteMock).not.toHaveBeenCalled();
   });
 });
 

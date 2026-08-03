@@ -1102,30 +1102,10 @@ router.get("/tasks/:taskId/result", sendTask);
 router.delete("/tasks/:taskId", async (req, res) => {
   try {
     const taskId = String(req.params.taskId || "");
-    const credential = await requireResourceCredential("task", taskId);
-    const response = await axios.delete(
-      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
-      {
-        headers: upstreamHeaders(credential.apiKey),
-        timeout: 60_000,
-        validateStatus: () => true,
-      },
-    );
-    if (
-      response.status !== 404 &&
-      (response.status < 200 || response.status >= 300)
-    ) {
-      return res.status(forwardedStatus(response.status)).json({
-        error: {
-          code: "UPSTREAM_TASK_DELETE_FAILED",
-          message: upstreamErrorDetail(
-            response.data,
-            "Task deletion failed",
-            credential.apiKey,
-          ),
-        },
-      });
-    }
+    await requireResourceCredential("task", taskId);
+    // Rolling compatibility for older Website releases: acknowledge their
+    // cleanup call, but retain both the upstream task and its local evidence.
+    res.setHeader("X-FrontMind-Task-Retention", "retained");
     res.status(204).end();
   } catch (error) {
     sendKnownError(res, error);

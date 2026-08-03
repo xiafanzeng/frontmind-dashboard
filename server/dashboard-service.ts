@@ -53,6 +53,7 @@ import {
 import {
   claimUsageCredentialCoverage,
   hasCompleteExpectedTaskSet,
+  loadTerminalUsageTaskProofs,
   loadUsageCoverage,
   isUsageTaskTerminal,
   markUsageCredentialCoverage,
@@ -1900,6 +1901,13 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
     expected.add(row.upstreamId);
     expectedTaskIdsByFingerprint.set(fingerprint, expected);
   }
+  const terminalProofsByFingerprint = await loadTerminalUsageTaskProofs({
+    executor: db,
+    scope: "managed_user",
+    fingerprints: credentials.map((credential) => credential.fingerprint),
+    startAt: period.startAt,
+    endAt: period.endAt,
+  });
   const [activeTurnRows, activeConversationRows] = await Promise.all([
     db
       .select({ apiCredentialId: conversationTurns.apiCredentialId })
@@ -2180,7 +2188,13 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
     }
     const expectedTaskIds =
       expectedTaskIdsByFingerprint.get(credential.fingerprint) ?? new Set();
-    if (!hasCompleteExpectedTaskSet(expectedTaskIds, seenForCredential)) {
+    if (
+      !hasCompleteExpectedTaskSet(
+        expectedTaskIds,
+        seenForCredential,
+        terminalProofsByFingerprint.get(credential.fingerprint),
+      )
+    ) {
       credentialComplete = false;
     }
     if (credentialComplete) {

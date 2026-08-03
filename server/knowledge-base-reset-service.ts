@@ -822,6 +822,12 @@ export async function decideKnowledgeReset(input: {
   return result;
 }
 
+export function shouldDeleteKnowledgeResetUpstreamResource(
+  kind: "task" | "file",
+) {
+  return kind === "file";
+}
+
 export async function processKnowledgeResetCleanupJobs() {
   const db = await requireDb();
   const retryCappedFailureBefore = new Date(
@@ -859,16 +865,15 @@ export async function processKnowledgeResetCleanupJobs() {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
-      } else {
+      } else if (shouldDeleteKnowledgeResetUpstreamResource(job.kind)) {
         const credential = await getCredentialForUpstreamResource(
           job.userId,
           job.kind,
           job.upstreamId,
         );
         if (!credential) throw new Error("上游资源凭据已不可用");
-        const collection = job.kind === "task" ? "tasks" : "files";
         const response = await fetch(
-          `${getUpstreamBaseUrl()}/v1/${collection}/${encodeURIComponent(job.upstreamId)}`,
+          `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(job.upstreamId)}`,
           {
             method: "DELETE",
             redirect: "error",
@@ -884,7 +889,9 @@ export async function processKnowledgeResetCleanupJobs() {
         }
       }
       await db.transaction(async (tx) => {
-        if (job.kind !== "local_asset") {
+        // Task ownership is part of the permanent usage proof chain. Resetting
+        // the knowledge-base hides business data but never removes this fact.
+        if (job.kind === "file") {
           await tx
             .delete(upstreamResources)
             .where(

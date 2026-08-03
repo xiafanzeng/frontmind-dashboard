@@ -56,6 +56,12 @@ export function siliconFlowKnowledgeSnapshotCleanupStorageKeys(
   ) as string[];
 }
 
+export function shouldDeleteSiliconFlowUpstreamResource(
+  kind: "task" | "file",
+) {
+  return kind === "file";
+}
+
 export function assertSiliconFlowMaintenanceIdentity(input: {
   userId: number;
   userMatches: number;
@@ -442,6 +448,7 @@ export async function executeSiliconFlowKnowledgeBaseReset(input: {
     Awaited<ReturnType<typeof getCredentialForUpstreamResource>>
   >();
   for (const resource of inventory.resources) {
+    if (!shouldDeleteSiliconFlowUpstreamResource(resource.kind)) continue;
     credentials.set(
       `${resource.kind}:${resource.upstreamId}`,
       await getCredentialForUpstreamResource(
@@ -507,7 +514,12 @@ export async function executeSiliconFlowKnowledgeBaseReset(input: {
     error: string;
   }> = [];
   const completedResources: CleanupResource[] = [];
+  const retainedTaskIds: string[] = [];
   for (const resource of inventory.resources) {
+    if (!shouldDeleteSiliconFlowUpstreamResource(resource.kind)) {
+      retainedTaskIds.push(resource.upstreamId);
+      continue;
+    }
     const credential = credentials.get(
       `${resource.kind}:${resource.upstreamId}`,
     );
@@ -520,9 +532,8 @@ export async function executeSiliconFlowKnowledgeBaseReset(input: {
       continue;
     }
     try {
-      const collection = resource.kind === "task" ? "tasks" : "files";
       const response = await fetch(
-        `${getUpstreamBaseUrl()}/v1/${collection}/${encodeURIComponent(resource.upstreamId)}`,
+        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(resource.upstreamId)}`,
         {
           method: "DELETE",
           redirect: "error",
@@ -581,6 +592,7 @@ export async function executeSiliconFlowKnowledgeBaseReset(input: {
       completed: completedResources.length,
       failed: failures.length,
       retry: failures,
+      retainedTaskIds,
     },
   };
 }

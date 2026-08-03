@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   isUsageTaskTerminal,
   hasCompleteExpectedTaskSet,
+  loadTerminalUsageTaskProofs,
   recordUsageLedgerEntries,
   selectPhysicalCredentialRows,
   USAGE_LEDGER_BATCH_SIZE,
@@ -60,6 +61,49 @@ describe("task usage ledger", () => {
         new Set(["task-delayed", "task-visible"]),
       ),
     ).toBe(true);
+  });
+  it("accepts an absent task only when the immutable ledger has terminal proof", () => {
+    expect(
+      hasCompleteExpectedTaskSet(
+        new Set(["task-visible", "task-retained"]),
+        new Set(["task-visible"]),
+        new Set(["task-retained"]),
+      ),
+    ).toBe(true);
+    expect(
+      hasCompleteExpectedTaskSet(
+        new Set(["task-visible", "task-missing"]),
+        new Set(["task-visible"]),
+        new Set(["different-task"]),
+      ),
+    ).toBe(false);
+  });
+
+  it("loads only the terminal usage facts returned by the proof query", async () => {
+    const executor = {
+      select: () => ({
+        from: () => ({
+          where: async () => [
+            {
+              upstreamTaskId: "task-a",
+              credentialFingerprint: "fingerprint-a",
+            },
+            {
+              upstreamTaskId: "task-b",
+              credentialFingerprint: "fingerprint-a",
+            },
+          ],
+        }),
+      }),
+    };
+    const proofs = await loadTerminalUsageTaskProofs({
+      executor,
+      scope: "website_frontend",
+      fingerprints: ["fingerprint-a"],
+      startAt: 100,
+      endAt: 200,
+    });
+    expect(proofs.get("fingerprint-a")).toEqual(new Set(["task-a", "task-b"]));
   });
   it("treats a shared physical Key as active even when a retired owner has a higher local version", () => {
     expect(

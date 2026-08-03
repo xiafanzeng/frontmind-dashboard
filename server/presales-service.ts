@@ -23,6 +23,7 @@ import { getUpstreamBaseUrl } from "./upstream-config";
 import {
   claimUsageCredentialCoverage,
   hasCompleteExpectedTaskSet,
+  loadTerminalUsageTaskProofs,
   loadUsageCoverage,
   isUsageTaskTerminal,
   markUsageCredentialCoverage,
@@ -1111,6 +1112,13 @@ export async function getPresalesCreditUsage(
   });
   const usageNow = now;
   const cutoffMs = usageNow - normalizedWindowDays * 24 * 60 * 60 * 1000;
+  const terminalProofsByFingerprint = await loadTerminalUsageTaskProofs({
+    executor: db,
+    scope: "website_frontend",
+    fingerprints: credentials.map((credential) => credential.fingerprint),
+    startAt: cutoffMs,
+    endAt: usageNow,
+  });
   const [resourceRows, ownedRows, monitorRows] = await Promise.all([
     db
       .select({
@@ -1370,7 +1378,13 @@ export async function getPresalesCreditUsage(
     }
     const expectedTaskIds =
       expectedTaskIdsByFingerprint.get(credential.fingerprint) ?? new Set();
-    if (!hasCompleteExpectedTaskSet(expectedTaskIds, seenForCredential)) {
+    if (
+      !hasCompleteExpectedTaskSet(
+        expectedTaskIds,
+        seenForCredential,
+        terminalProofsByFingerprint.get(credential.fingerprint),
+      )
+    ) {
       credentialComplete = false;
     }
     if (credentialComplete) {

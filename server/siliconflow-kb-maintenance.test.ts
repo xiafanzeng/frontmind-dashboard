@@ -3,10 +3,16 @@ import { describe, expect, it } from "vitest";
 import {
   assertSiliconFlowMaintenanceIdentity,
   siliconFlowKnowledgeSnapshotCleanupStorageKeys,
+  shouldDeleteSiliconFlowUpstreamResource,
   SILICONFLOW_MAINTENANCE_BRAND,
 } from "./siliconflow-kb-maintenance";
 
 describe("SiliconFlow one-time knowledge-base maintenance guard", () => {
+  it("retains task evidence while allowing temporary files to be deleted", () => {
+    expect(shouldDeleteSiliconFlowUpstreamResource("task")).toBe(false);
+    expect(shouldDeleteSiliconFlowUpstreamResource("file")).toBe(true);
+  });
+
   it("includes each deterministic snapshot ZIP key in local cleanup", () => {
     expect(
       siliconFlowKnowledgeSnapshotCleanupStorageKeys(42, [

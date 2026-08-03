@@ -714,31 +714,6 @@ export function publicResponseLogicTask(
   };
 }
 
-async function cancelOrphanedResponseLogicTask(input: {
-  baseUrl: string;
-  apiKey: string;
-  taskId: string;
-}) {
-  try {
-    await axios.delete(
-      `${input.baseUrl}/v1/tasks/${encodeURIComponent(input.taskId)}`,
-      {
-        headers: {
-          API_KEY: input.apiKey,
-          Authorization: `Bearer ${input.apiKey}`,
-        },
-        timeout: 15_000,
-        validateStatus: () => true,
-      },
-    );
-  } catch (error) {
-    console.error(
-      "[Response Logic Start] orphan task cleanup failed",
-      safeErrorForLog(error, { secrets: [input.apiKey] }),
-    );
-  }
-}
-
 router.get("/tasks/:taskId/status", async (req, res) => {
   const parsedQuery = responseLogicTaskStatusQuerySchema.safeParse(req.query);
   const taskId = String(req.params.taskId || "").trim();
@@ -1195,11 +1170,8 @@ router.post(["/start", "/turn"], async (req, res) => {
       });
     } catch (persistenceError) {
       if (!isContinuation) {
-        await cancelOrphanedResponseLogicTask({
-          baseUrl: getUpstreamBaseUrl(req),
-          apiKey: taskApiKey,
-          taskId: String(created.task.id),
-        });
+        // A created task is a permanent billing fact. Never compensate for a
+        // local persistence failure by deleting the upstream evidence.
         await Promise.allSettled(
           generatedAttachments.map((attachment) => attachment.removeOrphan()),
         );

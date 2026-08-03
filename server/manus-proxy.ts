@@ -96,6 +96,15 @@ export function isPrivateUpstreamCollectionRequest(
   return ["/v1/tasks", "/v1/responses", "/v1/files"].includes(pathname);
 }
 
+export function isRetainedUpstreamTaskDeleteRequest(
+  method: string,
+  targetPath: string,
+) {
+  if (method.toUpperCase() !== "DELETE") return false;
+  const pathname = targetPath.split("?")[0]?.replace(/\/+$/, "") || "/";
+  return /^\/v1\/(?:tasks|responses)\/[^/]+$/.test(pathname);
+}
+
 function safeUrlForLog(value: string) {
   try {
     const parsed = new URL(value);
@@ -3007,6 +3016,16 @@ router.all("/*", async (req: Request, res: Response) => {
 
     // Build the target URL - strip public proxy prefix.
     const targetPath = req.originalUrl.replace(/^\/api\/frontmind/, "");
+    if (isRetainedUpstreamTaskDeleteRequest(req.method, targetPath)) {
+      res.setHeader("Allow", "GET");
+      res.status(405).json({
+        error: {
+          message: "任务是永久用量凭证，不允许删除",
+          code: "TASK_RETENTION_REQUIRED",
+        },
+      });
+      return;
+    }
     if (isPrivateUpstreamCollectionRequest(req.method, targetPath)) {
       res.status(403).json({
         error: {

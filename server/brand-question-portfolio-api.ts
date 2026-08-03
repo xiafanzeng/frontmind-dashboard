@@ -273,19 +273,11 @@ router.post("/start", async (req, res) => {
         upstreamId: taskId,
       });
     } catch (error) {
-      await Promise.allSettled([
-        axios.delete(`${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`, {
-          headers: {
-            API_KEY: apiKey,
-            Authorization: `Bearer ${apiKey}`,
-          },
-          timeout: 30_000,
-          validateStatus: () => true,
-        }),
-        ...generatedAttachments.map((attachment) =>
-          attachment.removeOrphan(),
-        ),
-      ]);
+      // Preserve the task as a permanent usage fact even when local ownership
+      // persistence fails. Generated temporary files may still be reclaimed.
+      await Promise.allSettled(
+        generatedAttachments.map((attachment) => attachment.removeOrphan()),
+      );
       throw error;
     }
     const contextToken = createBrandQuestionTaskContextToken({

@@ -67,11 +67,56 @@ export function selectPhysicalCredentialRows<
 export function hasCompleteExpectedTaskSet(
   expectedTaskIds: ReadonlySet<string>,
   seenTaskIds: ReadonlySet<string>,
+  terminalProofTaskIds?: ReadonlySet<string>,
 ) {
   for (const taskId of expectedTaskIds) {
-    if (!seenTaskIds.has(taskId)) return false;
+    if (!seenTaskIds.has(taskId) && !terminalProofTaskIds?.has(taskId)) {
+      return false;
+    }
   }
   return true;
+}
+
+/**
+ * Returns durable, settled usage facts that can prove an expected task even
+ * when the upstream task index no longer returns it. Only terminal rows are
+ * accepted: a partial observation of a running task must never seal coverage.
+ */
+export async function loadTerminalUsageTaskProofs(input: {
+  executor: any;
+  scope: UsageLedgerScope;
+  fingerprints: string[];
+  startAt: number;
+  endAt: number;
+}) {
+  const fingerprints = [...new Set(input.fingerprints.filter(Boolean))];
+  const proofsByFingerprint = new Map<string, Set<string>>();
+  if (fingerprints.length === 0) return proofsByFingerprint;
+
+  const rows = await input.executor
+    .select({
+      upstreamTaskId: apiUsageTaskLedger.upstreamTaskId,
+      credentialFingerprint: apiUsageTaskLedger.credentialFingerprint,
+    })
+    .from(apiUsageTaskLedger)
+    .where(
+      and(
+        eq(apiUsageTaskLedger.scope, input.scope),
+        inArray(apiUsageTaskLedger.credentialFingerprint, fingerprints),
+        eq(apiUsageTaskLedger.isTerminal, true),
+        gte(apiUsageTaskLedger.taskCreatedAtMs, input.startAt),
+        lt(apiUsageTaskLedger.taskCreatedAtMs, input.endAt),
+      ),
+    );
+  for (const row of rows) {
+    const taskId = row.upstreamTaskId?.trim();
+    const fingerprint = row.credentialFingerprint?.trim();
+    if (!taskId || !fingerprint) continue;
+    const taskIds = proofsByFingerprint.get(fingerprint) ?? new Set<string>();
+    taskIds.add(taskId);
+    proofsByFingerprint.set(fingerprint, taskIds);
+  }
+  return proofsByFingerprint;
 }
 
 export async function recordUsageLedgerEntries(input: {

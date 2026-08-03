@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import manusProxy, {
   MAX_EXTERNAL_DOWNLOAD_BYTES,
   isPrivateUpstreamCollectionRequest,
+  isRetainedUpstreamTaskDeleteRequest,
   isPublicFilePayloadRequest,
   isPublicTaskPayloadRequest,
   publicUpstreamFilePayload,
@@ -57,6 +58,23 @@ describe("isPrivateUpstreamCollectionRequest", () => {
     ["POST", "/v1/files"],
   ])("allows %s access to scoped endpoint %s", (method, targetPath) => {
     expect(isPrivateUpstreamCollectionRequest(method, targetPath)).toBe(false);
+  });
+});
+
+describe("isRetainedUpstreamTaskDeleteRequest", () => {
+  it.each([
+    ["DELETE", "/v1/tasks/task-1"],
+    ["delete", "/v1/responses/response-1?force=true"],
+  ])("blocks %s %s", (method, targetPath) => {
+    expect(isRetainedUpstreamTaskDeleteRequest(method, targetPath)).toBe(true);
+  });
+
+  it.each([
+    ["GET", "/v1/tasks/task-1"],
+    ["DELETE", "/v1/files/file-1"],
+    ["DELETE", "/v1/tasks/task-1/content"],
+  ])("does not block unrelated request %s %s", (method, targetPath) => {
+    expect(isRetainedUpstreamTaskDeleteRequest(method, targetPath)).toBe(false);
   });
 });
 

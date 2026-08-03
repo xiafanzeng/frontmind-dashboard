@@ -160,21 +160,7 @@ try {
   );
 } finally {
   if (taskId) {
-    try {
-      const cleanupResponse = await fetch(
-        `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
-        {
-          method: "DELETE",
-          headers,
-          signal: AbortSignal.timeout(30_000),
-        },
-      );
-      cleanupStatus = cleanupResponse.ok
-        ? "deleted"
-        : `delete-failed-${cleanupResponse.status}`;
-    } catch {
-      cleanupStatus = "delete-failed";
-    }
+    cleanupStatus = "retained-as-usage-proof";
   }
   process.stdout.write(
     `${JSON.stringify({ cleanupStatus, secretPersisted: false })}\n`,
