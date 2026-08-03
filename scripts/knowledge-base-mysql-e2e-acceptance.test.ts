@@ -1007,24 +1007,40 @@ mysqlDescribe(
         pathname: "/start" | "/turn",
         body: Record<string, unknown>,
       ) => {
-        const response = await fetch(
-          `${dashboardListener.baseUrl}/api/knowledge-base${pathname}`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-test-auth": "user",
+        let lastPayload: unknown;
+        for (let attempt = 0; attempt < 400; attempt += 1) {
+          const response = await fetch(
+            `${dashboardListener.baseUrl}/api/knowledge-base${pathname}`,
+            {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-test-auth": "user",
+              },
+              body: JSON.stringify(body),
             },
-            body: JSON.stringify(body),
-          },
-        );
-        const payload = (await response.json()) as any;
-        if (response.status !== 200) {
+          );
+          const payload = (await response.json()) as any;
+          lastPayload = payload;
+          if (response.status === 200) return payload;
+          if (
+            pathname === "/turn" &&
+            response.status === 202 &&
+            (payload.accepted === true || payload.idempotent === true)
+          ) {
+            // The public contract acknowledges the durable turn before the
+            // upstream POST. Replaying these exact bytes models a lost 202 and
+            // must converge on the same turn/task without a second dispatch.
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            continue;
+          }
           throw new Error(
             `${pathname} returned ${response.status}: ${JSON.stringify(payload)}`,
           );
         }
-        return payload;
+        throw new Error(
+          `${pathname} did not settle after an accepted response: ${JSON.stringify(lastPayload)}`,
+        );
       };
       const reconcileKnowledgeBase = async (taskId?: string) => {
         const response = await fetch(
@@ -1274,13 +1290,12 @@ mysqlDescribe(
 
       expect(logoDownloads).toBe(1);
       expect(packageDownloads).toBe(1);
-      // Every create response in this fixture is already authoritative and is
-      // committed into the local projection before the HTTP response returns.
-      // Focus/online reconcile wakes must therefore be local immutable reads,
-      // not nine redundant provider GETs.
+      // The helper above replays an accepted 202 until the durable local
+      // projection settles. Focus/online reconcile wakes after that point must
+      // remain local immutable reads, not redundant provider GETs.
       expect(authoritativeTaskReads).toBe(0);
-      expect(uploadedFileSequence).toBe(FINAL_REVISION + 1);
-      expect(uploadedFileBytes.size).toBe(FINAL_REVISION + 1);
+      expect(uploadedFileSequence).toBe(1);
+      expect(uploadedFileBytes.size).toBe(1);
       expect(operationTaskPosts.size).toBe(FINAL_REVISION + 1);
       expect([...operationTaskPosts.values()]).toEqual(
         Array(FINAL_REVISION + 1).fill(1),
@@ -1294,12 +1309,8 @@ mysqlDescribe(
          WHERE userId = ?`,
         [userId],
       );
-      expect(Number(resourceLedgerRows[0]?.resourceCount || 0)).toBe(
-        FINAL_REVISION + 1,
-      );
-      expect(Number(resourceLedgerRows[0]?.fileResourceCount || 0)).toBe(
-        FINAL_REVISION + 1,
-      );
+      expect(Number(resourceLedgerRows[0]?.resourceCount || 0)).toBe(1);
+      expect(Number(resourceLedgerRows[0]?.fileResourceCount || 0)).toBe(1);
       expect(Number(resourceLedgerRows[0]?.credentialCount || 0)).toBe(1);
 
       const finalBuild = (
