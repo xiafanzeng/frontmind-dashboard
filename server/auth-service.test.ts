@@ -4,9 +4,15 @@ import {
   apiCredentials,
   apiKeyOwnership,
   conversationTurns,
+  deliveryRedirectPreviews,
+  deliveryTicketAttachments,
+  deliveryTickets,
   knowledgeBaseBuilds,
+  knowledgeBaseResetRequests,
   upstreamResources,
   users,
+  websiteStyleSampleBatches,
+  websiteStyleSamples,
 } from "../drizzle/schema";
 import {
   AuthServiceError,
@@ -80,14 +86,27 @@ describe("managed account deletion", () => {
   it("physically removes restrictive ledgers before deleting the user", async () => {
     const where = vi.fn().mockResolvedValue(undefined);
     const deleteFrom = vi.fn().mockReturnValue({ where });
+    const select = vi.fn().mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          for: vi.fn().mockResolvedValue([{ id: "style-batch-1" }]),
+        }),
+      }),
+    });
 
-    await permanentlyDeleteManagedUserRows({ delete: deleteFrom }, 42);
+    await permanentlyDeleteManagedUserRows({ delete: deleteFrom, select }, 42);
 
-    expect(deleteFrom).toHaveBeenCalledTimes(3);
-    expect(deleteFrom).toHaveBeenNthCalledWith(1, upstreamResources);
-    expect(deleteFrom).toHaveBeenNthCalledWith(2, apiKeyOwnership);
-    expect(deleteFrom).toHaveBeenNthCalledWith(3, users);
-    expect(where).toHaveBeenCalledTimes(3);
+    expect(deleteFrom).toHaveBeenCalledTimes(9);
+    expect(deleteFrom).toHaveBeenNthCalledWith(1, websiteStyleSamples);
+    expect(deleteFrom).toHaveBeenNthCalledWith(2, websiteStyleSampleBatches);
+    expect(deleteFrom).toHaveBeenNthCalledWith(3, knowledgeBaseResetRequests);
+    expect(deleteFrom).toHaveBeenNthCalledWith(4, deliveryRedirectPreviews);
+    expect(deleteFrom).toHaveBeenNthCalledWith(5, deliveryTicketAttachments);
+    expect(deleteFrom).toHaveBeenNthCalledWith(6, deliveryTickets);
+    expect(deleteFrom).toHaveBeenNthCalledWith(7, upstreamResources);
+    expect(deleteFrom).toHaveBeenNthCalledWith(8, apiKeyOwnership);
+    expect(deleteFrom).toHaveBeenNthCalledWith(9, users);
+    expect(where).toHaveBeenCalledTimes(9);
   });
 
   it("rejects deleting the administrator's current account", async () => {

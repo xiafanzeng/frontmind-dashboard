@@ -2756,6 +2756,12 @@ export const knowledgeBaseResetCleanupJobs = mysqlTable(
     userId: int("userId").notNull(),
     apiCredentialId: varchar("apiCredentialId", { length: 36 }),
     kind: mysqlEnum("kind", ["task", "file", "local_asset"]).notNull(),
+    /**
+     * Full local storage key. Local keys can exceed the upstream identifier
+     * limit, so `upstreamId` stores their SHA-256 queue identity while this
+     * column preserves the lossless path used by the cleanup worker.
+     */
+    localAssetKey: text("localAssetKey"),
     upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
     status: mysqlEnum("status", ["pending", "completed", "failed"])
       .default("pending")

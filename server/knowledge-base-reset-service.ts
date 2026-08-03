@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { unlink } from "node:fs/promises";
 import path from "node:path";
 import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
@@ -99,6 +99,21 @@ export function knowledgeSnapshotCleanupStorageKeys(
       ].filter((key): key is string => Boolean(key)),
     ),
   );
+}
+
+export function prepareKnowledgeResetCleanupResource(resource: {
+  kind: "task" | "file" | "local_asset";
+  upstreamId: string;
+  apiCredentialId: string | null;
+}) {
+  if (resource.kind !== "local_asset") {
+    return { ...resource, localAssetKey: null };
+  }
+  return {
+    ...resource,
+    upstreamId: createHash("sha256").update(resource.upstreamId).digest("hex"),
+    localAssetKey: resource.upstreamId,
+  };
 }
 
 async function getKnowledgeCounts(
@@ -724,12 +739,10 @@ export async function decideKnowledgeReset(input: {
         .insert(knowledgeBaseResetCleanupJobs)
         .values(
           [...cleanupResources.values()].map((resource) => ({
+            ...prepareKnowledgeResetCleanupResource(resource),
             id: randomUUID(),
             resetRequestId: row.request.id,
             userId: row.request.userId,
-            apiCredentialId: resource.apiCredentialId,
-            kind: resource.kind,
-            upstreamId: resource.upstreamId,
             status: "pending" as const,
             createdAt: now,
             updatedAt: now,
@@ -856,7 +869,10 @@ export async function processKnowledgeResetCleanupJobs() {
   for (const job of jobs) {
     try {
       if (job.kind === "local_asset") {
-        const assetPath = path.resolve(dashboardAssetRoot, job.upstreamId);
+        const assetPath = path.resolve(
+          dashboardAssetRoot,
+          job.localAssetKey || job.upstreamId,
+        );
         if (!assetPath.startsWith(`${dashboardAssetRoot}${path.sep}`)) {
           throw new Error("知识库本地资源路径无效");
         }

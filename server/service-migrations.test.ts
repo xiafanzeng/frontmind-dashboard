@@ -118,6 +118,7 @@ describe("service portal migration chain", () => {
       "0050_nullable_manual_order_commercial_evidence",
       "0051_delivery_ticket_retention",
       "0052_delivery_ticket_retention_guards",
+      "0053_low_dorian_gray",
     ]);
   });
 
@@ -180,6 +181,16 @@ describe("service portal migration chain", () => {
     ]) {
       expect(migrationSql).toContain(statement);
     }
+  });
+
+  it("stores long knowledge cleanup paths without widening the indexed identity", async () => {
+    const migrationSql = await migration("0053_low_dorian_gray.sql");
+    expect(migrationSql).toContain(
+      "ALTER TABLE `knowledge_base_reset_cleanup_jobs` ADD `localAssetKey` text",
+    );
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
   });
 
   it("adds an immutable task usage ledger and coverage proof without destructive changes", async () => {

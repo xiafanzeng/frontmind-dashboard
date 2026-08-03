@@ -14,6 +14,7 @@ import {
   changeOwnPassword,
   hashPassword,
   loginWithPassword,
+  permanentlyDeleteManagedUserRows,
   verifyPassword,
 } from "../server/auth-service";
 
@@ -209,5 +210,130 @@ mysqlDescribe("password/session transaction on real MySQL", () => {
     expect(Number(sessionRows[0]?.activeCount || 0)).toBe(1);
     expect(setupTokenRows[0]?.consumedAt).toBeNull();
     expect(websiteTokenRows[0]?.accountSetupTokenConsumedAt).toBeNull();
+  });
+
+  it("permanently deletes an account with reset tickets without FK-order failures", async () => {
+    const suffix = randomUUID().replaceAll("-", "");
+    const contractId = randomUUID();
+    const quotaPeriodId = randomUUID();
+    const ticketId = randomUUID();
+    const resetRequestId = randomUUID();
+    const attachmentId = randomUUID();
+    const styleBatchId = randomUUID();
+    const styleSampleId = randomUUID();
+    const [inserted] = await pool.execute<ResultSetHeader>(
+      `INSERT INTO users
+         (openId, username, displayName, loginMethod, role, marketEdition, isActive)
+       VALUES (?, ?, 'Deletion acceptance', 'password', 'user', 'domestic', 1)`,
+      [
+        `delete-mysql-${suffix}`.slice(0, 64),
+        `delete_mysql_${suffix}`.slice(0, 64),
+      ],
+    );
+    const deletedUserId = inserted.insertId;
+    await pool.execute(
+      `INSERT INTO service_contracts
+         (id, userId, planCode, startsAt, endsAt)
+       VALUES (?, ?, 'advanced', NOW(), DATE_ADD(NOW(), INTERVAL 1 MONTH))`,
+      [contractId, deletedUserId],
+    );
+    await pool.execute(
+      `INSERT INTO service_quota_periods
+         (id, contractId, userId, ordinal, startsAt, endsAt)
+       VALUES (?, ?, ?, 1, NOW(), DATE_ADD(NOW(), INTERVAL 1 MONTH))`,
+      [quotaPeriodId, contractId, deletedUserId],
+    );
+    await pool.execute(
+      `INSERT INTO delivery_tickets
+         (id, userId, contractId, quotaPeriodId, type, ordinal, clientRequestId)
+       VALUES (?, ?, ?, ?, 'knowledge_base', 1, ?)`,
+      [ticketId, deletedUserId, contractId, quotaPeriodId, resetRequestId],
+    );
+    await pool.execute(
+      `INSERT INTO knowledge_base_reset_requests
+         (id, ticketId, userId, reasonCode)
+       VALUES (?, ?, ?, 'stuck')`,
+      [resetRequestId, ticketId, deletedUserId],
+    );
+    await pool.execute(
+      `INSERT INTO delivery_ticket_attachments
+         (id, ticketId, workspaceUserId, ownerUserId, filename)
+       VALUES (?, ?, ?, ?, 'style-sample.png')`,
+      [attachmentId, ticketId, deletedUserId, deletedUserId],
+    );
+    await pool.execute(
+      `INSERT INTO website_style_sample_batches
+         (id, userId, ticketId, ordinal, publishedAt)
+       VALUES (?, ?, ?, 1, NOW())`,
+      [styleBatchId, deletedUserId, ticketId],
+    );
+    await pool.execute(
+      `INSERT INTO website_style_samples
+         (id, batchId, attachmentId, label, sortOrder)
+       VALUES (?, ?, ?, 'Deletion acceptance', 1)`,
+      [styleSampleId, styleBatchId, attachmentId],
+    );
+    await pool.execute(
+      `INSERT INTO knowledge_base_conversation_tombstones
+         (id, userId, publicConversationId, resetRequestId)
+       VALUES (?, ?, ?, ?)`,
+      [
+        randomUUID(),
+        deletedUserId,
+        `delete-${suffix}`.slice(0, 191),
+        resetRequestId,
+      ],
+    );
+    await pool.execute(
+      `INSERT INTO knowledge_base_reset_cleanup_jobs
+         (id, resetRequestId, userId, kind, upstreamId)
+       VALUES (?, ?, ?, 'task', ?)`,
+      [
+        randomUUID(),
+        resetRequestId,
+        deletedUserId,
+        `task-${suffix}`.slice(0, 255),
+      ],
+    );
+
+    const database = drizzle(pool);
+    await database.transaction((tx) =>
+      permanentlyDeleteManagedUserRows(tx, deletedUserId),
+    );
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM users WHERE id = ?) AS userCount,
+         (SELECT COUNT(*) FROM delivery_tickets WHERE id = ?) AS ticketCount,
+         (SELECT COUNT(*) FROM knowledge_base_reset_requests WHERE id = ?) AS requestCount,
+         (SELECT COUNT(*) FROM service_contracts WHERE id = ?) AS contractCount,
+         (SELECT COUNT(*) FROM service_quota_periods WHERE id = ?) AS quotaCount,
+         (SELECT COUNT(*) FROM delivery_ticket_attachments WHERE id = ?) AS attachmentCount,
+         (SELECT COUNT(*) FROM website_style_sample_batches WHERE id = ?) AS styleBatchCount,
+         (SELECT COUNT(*) FROM website_style_samples WHERE id = ?) AS styleSampleCount,
+         (SELECT COUNT(*) FROM knowledge_base_reset_cleanup_jobs WHERE userId = ?) AS cleanupCount`,
+      [
+        deletedUserId,
+        ticketId,
+        resetRequestId,
+        contractId,
+        quotaPeriodId,
+        attachmentId,
+        styleBatchId,
+        styleSampleId,
+        deletedUserId,
+      ],
+    );
+    expect(rows[0]).toMatchObject({
+      userCount: 0,
+      ticketCount: 0,
+      requestCount: 0,
+      contractCount: 0,
+      quotaCount: 0,
+      attachmentCount: 0,
+      styleBatchCount: 0,
+      styleSampleCount: 0,
+      cleanupCount: 0,
+    });
   });
 });

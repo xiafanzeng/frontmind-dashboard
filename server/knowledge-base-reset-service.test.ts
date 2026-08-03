@@ -21,6 +21,7 @@ import {
 import {
   getKnowledgeResetStatus,
   knowledgeSnapshotCleanupStorageKeys,
+  prepareKnowledgeResetCleanupResource,
   shouldDeleteKnowledgeResetUpstreamResource,
 } from "./knowledge-base-reset-service";
 
@@ -130,6 +131,23 @@ describe("knowledge-base reset status", () => {
       "knowledge-builds/42/build-1/logo.bin",
       "knowledge-builds/42/build-1/package.zip",
     ]);
+  });
+
+  it("preserves long local asset keys behind a fixed-width queue identity", () => {
+    const localAssetKey = `knowledge-builds/42/${"a".repeat(320)}/official-logo.bin`;
+
+    expect(
+      prepareKnowledgeResetCleanupResource({
+        kind: "local_asset",
+        upstreamId: localAssetKey,
+        apiCredentialId: null,
+      }),
+    ).toEqual({
+      kind: "local_asset",
+      upstreamId: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      apiCredentialId: null,
+      localAssetKey,
+    });
   });
 
   it("allows a reset request while a build is still in progress", async () => {

@@ -34,6 +34,7 @@ import {
 } from "../server/conversation-router";
 import { cleanupExpiredDeliveryTickets } from "../server/delivery-ticket-retention";
 import { claimUsageSnapshotRefresh } from "../server/api-usage-snapshot-service";
+import { prepareKnowledgeResetCleanupResource } from "../server/knowledge-base-reset-service";
 
 const ACCEPTANCE_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_DATABASE_URL";
 const REQUIRED_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_REQUIRED";
@@ -632,6 +633,45 @@ mysqlDescribe("knowledge-base real MySQL state-machine acceptance", () => {
       cleanupExpiredDeliveryTickets({ database: executor, now }),
     ).resolves.toMatchObject({ tickets: 0, quotaFacts: 0, milestones: 0 });
   }, 120_000);
+
+  it("stores a long local cleanup key losslessly behind its queue identity", async () => {
+    expect(userId).not.toBeNull();
+    const ownerId = userId!;
+    const localAssetKey = `knowledge-builds/${ownerId}/${"a".repeat(320)}/official-logo.bin`;
+    const resource = prepareKnowledgeResetCleanupResource({
+      kind: "local_asset",
+      upstreamId: localAssetKey,
+      apiCredentialId: null,
+    });
+    const cleanupJobId = randomUUID();
+    await pool.execute(
+      `INSERT INTO knowledge_base_reset_cleanup_jobs
+         (id, userId, apiCredentialId, kind, upstreamId, localAssetKey)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        cleanupJobId,
+        ownerId,
+        resource.apiCredentialId,
+        resource.kind,
+        resource.upstreamId,
+        resource.localAssetKey,
+      ],
+    );
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT upstreamId, localAssetKey
+         FROM knowledge_base_reset_cleanup_jobs WHERE id = ?`,
+      [cleanupJobId],
+    );
+    expect(rows[0]).toMatchObject({
+      upstreamId: resource.upstreamId,
+      localAssetKey,
+    });
+    await pool.execute(
+      "DELETE FROM knowledge_base_reset_cleanup_jobs WHERE id = ?",
+      [cleanupJobId],
+    );
+  });
 
   it("proves exactly-once reservations, stale-write guards, leases and rollback", async () => {
     expect(userId).not.toBeNull();

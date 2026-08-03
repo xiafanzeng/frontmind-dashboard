@@ -32,8 +32,11 @@ import {
   conversations,
   conversationTurns,
   deliveryProjectAssignments,
+  deliveryRedirectPreviews,
+  deliveryTicketAttachments,
   deliveryTickets,
   knowledgeBaseBuilds,
+  knowledgeBaseResetRequests,
   presalesApiCredentials,
   sessions,
   upstreamResources,
@@ -41,6 +44,8 @@ import {
   userPasswordSetupTokens,
   userUsageOwners,
   users,
+  websiteStyleSampleBatches,
+  websiteStyleSamples,
   websiteUserProvisions,
   type ApiCredential,
   type UpstreamResource,
@@ -1053,9 +1058,42 @@ export async function permanentlyDeleteManagedUserRows(
   executor: any,
   userId: number,
 ) {
-  // These security-ledger rows use restrictive foreign keys, so remove them
-  // before deleting the user. All remaining account-owned rows cascade from
-  // users, conversations, and messages.
+  const styleBatchRows = await executor
+    .select({ id: websiteStyleSampleBatches.id })
+    .from(websiteStyleSampleBatches)
+    .where(eq(websiteStyleSampleBatches.userId, userId))
+    .for("update");
+  const styleBatchIds = styleBatchRows.map((row: { id: string }) => row.id);
+  if (styleBatchIds.length > 0) {
+    // Samples restrict deletion of their attachment, while both the batch and
+    // attachment otherwise cascade from the same ticket. Break that cross-FK
+    // edge before deleting either parent.
+    await executor
+      .delete(websiteStyleSamples)
+      .where(inArray(websiteStyleSamples.batchId, styleBatchIds));
+    await executor
+      .delete(websiteStyleSampleBatches)
+      .where(inArray(websiteStyleSampleBatches.id, styleBatchIds));
+  }
+  // Reset requests restrict deletion of their delivery tickets, while the
+  // tickets in turn restrict deletion of their contract/quota parents. Remove
+  // this account-owned chain explicitly before deleting the user so MySQL does
+  // not depend on an unsafe cascade order.
+  await executor
+    .delete(knowledgeBaseResetRequests)
+    .where(eq(knowledgeBaseResetRequests.userId, userId));
+  await executor
+    .delete(deliveryRedirectPreviews)
+    .where(eq(deliveryRedirectPreviews.userId, userId));
+  await executor
+    .delete(deliveryTicketAttachments)
+    .where(eq(deliveryTicketAttachments.workspaceUserId, userId));
+  await executor
+    .delete(deliveryTickets)
+    .where(eq(deliveryTickets.userId, userId));
+  // These security-ledger rows also use restrictive foreign keys. All
+  // remaining account-owned rows cascade from users, conversations, and
+  // messages.
   await executor
     .delete(upstreamResources)
     .where(eq(upstreamResources.userId, userId));

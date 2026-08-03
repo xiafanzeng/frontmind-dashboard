@@ -6,10 +6,16 @@ vi.mock("./db", () => ({ getDb: databaseMock.getDb }));
 
 import {
   apiKeyOwnership,
+  deliveryRedirectPreviews,
+  deliveryTicketAttachments,
+  deliveryTickets,
+  knowledgeBaseResetRequests,
   sessions,
   upstreamResources,
   userPasswordSetupTokens,
   users,
+  websiteStyleSampleBatches,
+  websiteStyleSamples,
   websiteUserProvisions,
 } from "../drizzle/schema";
 import { COOKIE_NAME } from "../shared/const";
@@ -27,9 +33,13 @@ import {
 function lockedSelect(rows: unknown[]) {
   return {
     from: () => ({
-      where: () => ({
-        limit: () => ({ for: async () => rows }),
-      }),
+      where: () => {
+        const locked = { for: async () => rows };
+        return {
+          ...locked,
+          limit: () => locked,
+        };
+      },
     }),
   };
 }
@@ -178,6 +188,12 @@ describe("password/session atomicity", () => {
       fake.updateValues[0]?.consumedAt,
     );
     expect(fake.deleteTables).toEqual([
+      websiteStyleSamples,
+      websiteStyleSampleBatches,
+      knowledgeBaseResetRequests,
+      deliveryRedirectPreviews,
+      deliveryTicketAttachments,
+      deliveryTickets,
       upstreamResources,
       apiKeyOwnership,
       users,
