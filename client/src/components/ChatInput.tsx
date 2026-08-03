@@ -4,7 +4,13 @@
  * Features: Text input, file picker, drag & drop, upload progress,
  *           per-message model selection (FrontMind-Lite/Base/Pro).
  */
-import { useState, useRef, useCallback, useEffect } from "react";
+import {
+  useState,
+  useRef,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+} from "react";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -38,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import { consumePendingFrontMindBuildDraft } from "@/lib/build-version";
+import { useComposition } from "@/hooks/useComposition";
 
 interface FilePreview {
   file: File;
@@ -52,6 +59,43 @@ function formatFileSize(bytes: number) {
 
 const AMBIGUOUS_ADVANCE_PATTERN =
   /^(继续|下一步|下一个|继续吧|请继续|next)[。！!]*$/i;
+
+const AGENT_COMPOSER_MAX_ROWS = 8;
+const AGENT_COMPOSER_FALLBACK_LINE_HEIGHT_PX = 24;
+const AGENT_COMPOSER_FALLBACK_PADDING_PX = 8;
+const AGENT_COMPOSER_FALLBACK_MIN_HEIGHT_PX = 44;
+
+function cssPixels(value: string, fallback = 0) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function resizeAgentComposer(textarea: HTMLTextAreaElement) {
+  textarea.style.height = "auto";
+
+  const styles = window.getComputedStyle(textarea);
+  const lineHeight = cssPixels(
+    styles.lineHeight,
+    AGENT_COMPOSER_FALLBACK_LINE_HEIGHT_PX,
+  );
+  const paddingHeight =
+    cssPixels(styles.paddingTop, AGENT_COMPOSER_FALLBACK_PADDING_PX) +
+    cssPixels(styles.paddingBottom, AGENT_COMPOSER_FALLBACK_PADDING_PX);
+  const borderHeight =
+    cssPixels(styles.borderTopWidth) + cssPixels(styles.borderBottomWidth);
+  const minHeight = cssPixels(
+    styles.minHeight,
+    AGENT_COMPOSER_FALLBACK_MIN_HEIGHT_PX,
+  );
+  const maxHeight =
+    AGENT_COMPOSER_MAX_ROWS * lineHeight + paddingHeight + borderHeight;
+  const contentHeight = textarea.scrollHeight + borderHeight;
+  const nextHeight = Math.max(minHeight, Math.min(contentHeight, maxHeight));
+
+  textarea.style.maxHeight = `${maxHeight}px`;
+  textarea.style.height = `${nextHeight}px`;
+  textarea.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
+}
 
 export default function ChatInput({
   fixedAgentProfile,
@@ -91,6 +135,39 @@ export default function ChatInput({
   useEffect(() => {
     if (composerPrefill) setText(composerPrefill);
   }, [composerPrefill]);
+
+  const resizeComposer = useCallback(() => {
+    if (textareaRef.current) resizeAgentComposer(textareaRef.current);
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeComposer();
+  }, [resizeComposer, text]);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    window.addEventListener("resize", resizeComposer);
+
+    if (typeof ResizeObserver === "undefined") {
+      return () => window.removeEventListener("resize", resizeComposer);
+    }
+
+    let observedWidth = textarea.getBoundingClientRect().width;
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      const nextWidth = entry?.contentRect.width ?? observedWidth;
+      if (nextWidth === observedWidth) return;
+      observedWidth = nextWidth;
+      resizeComposer();
+    });
+    resizeObserver.observe(textarea);
+
+    return () => {
+      window.removeEventListener("resize", resizeComposer);
+      resizeObserver.disconnect();
+    };
+  }, [resizeComposer]);
 
   const { sendMessage, uploadProgress: rawUploadProgress } = useSendMessage();
   const { activeConversation } = useConversation();
@@ -258,6 +335,10 @@ export default function ChatInput({
     },
     [handleSubmit],
   );
+
+  const composerComposition = useComposition<HTMLTextAreaElement>({
+    onKeyDown: handleKeyDown,
+  });
 
   const isUploading = uploadProgress !== null;
 
@@ -473,7 +554,7 @@ export default function ChatInput({
             "focus-within:shadow-[0_24px_70px_rgba(15,23,42,0.11)] focus-within:border-primary/35",
           )}
         >
-          <div className="flex min-h-[68px] items-center gap-1.5 p-2.5 sm:gap-2 sm:p-3.5">
+          <div className="flex min-h-[68px] items-end gap-1.5 p-2.5 sm:gap-2 sm:p-3.5">
             {/* File buttons */}
             <div className="flex items-center gap-1 pb-0.5">
               <Tooltip>
@@ -502,7 +583,9 @@ export default function ChatInput({
               ref={textareaRef}
               value={text}
               onChange={handleTextChange}
-              onKeyDown={handleKeyDown}
+              onCompositionStart={composerComposition.onCompositionStart}
+              onCompositionEnd={composerComposition.onCompositionEnd}
+              onKeyDown={composerComposition.onKeyDown}
               placeholder={
                 isUploading
                   ? uploadProgress!.phase === "verifying"
@@ -524,8 +607,9 @@ export default function ChatInput({
                 isUploading ||
                 knowledgeBaseNotStarted
               }
-              rows={2}
-              className="h-11 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground/55 focus:outline-none"
+              rows={1}
+              data-max-rows={AGENT_COMPOSER_MAX_ROWS}
+              className="min-h-11 flex-1 resize-none overflow-y-hidden bg-transparent py-2 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground/55 focus:outline-none"
             />
 
             {/* Model selector + Send button */}

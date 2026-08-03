@@ -275,6 +275,73 @@ describe("knowledge-base ChatInput actions", () => {
     expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
   });
 
+  it("grows with the message and caps the composer at eight rows", () => {
+    render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={progress}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    let scrollHeight = 40;
+    Object.defineProperty(textarea, "scrollHeight", {
+      configurable: true,
+      get: () => scrollHeight,
+    });
+
+    scrollHeight = 112;
+    fireEvent.change(textarea, { target: { value: "三行左右的补充意见" } });
+    expect(textarea).toHaveStyle({ height: "112px", overflowY: "hidden" });
+
+    scrollHeight = 320;
+    fireEvent.change(textarea, {
+      target: { value: "超过八行的长篇补充意见" },
+    });
+    expect(textarea).toHaveAttribute("data-max-rows", "8");
+    expect(textarea).toHaveStyle({
+      height: "208px",
+      maxHeight: "208px",
+      overflowY: "auto",
+    });
+
+    scrollHeight = 40;
+    fireEvent.change(textarea, { target: { value: "缩短" } });
+    expect(textarea).toHaveStyle({ height: "44px", overflowY: "hidden" });
+  });
+
+  it("keeps Shift+Enter for newlines and Enter for submission", async () => {
+    render(<ChatInput fixedAgentProfile="frontmind-pro" />);
+
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "第一行\n第二行" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true });
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(textarea).toHaveValue("第一行\n第二行");
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() =>
+      expect(mocks.sendMessage).toHaveBeenCalledWith(
+        "第一行\n第二行",
+        [],
+        expect.objectContaining({ agentProfile: "frontmind-pro" }),
+      ),
+    );
+  });
+
+  it("does not submit Enter while a Chinese IME composition is active", () => {
+    render(<ChatInput fixedAgentProfile="frontmind-pro" />);
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "输入中文" } });
+    fireEvent.compositionStart(textarea);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("intercepts a standalone ambiguous continuation", async () => {
     render(
       <ChatInput
