@@ -150,6 +150,8 @@ export interface KnowledgeBaseActiveTurnDto {
   requiresAttachmentReselection?: boolean;
   stagedAttachmentCount?: number;
   expectedAttachmentCount?: number;
+  /** Canonical position of the persisted user message in this conversation. */
+  messageSequence?: number;
 }
 
 /** A server-owned resource that is safe for the customer UI to render. */
@@ -185,6 +187,9 @@ export interface KnowledgeBaseApprovedPresentationDto {
   contentSha256: string;
   imageState: "attached" | "no_eligible_asset";
   resources: KnowledgeBaseApprovedResourceDto[];
+  /** Canonical positions of this turn's request and approved response. */
+  requestMessageSequence?: number;
+  messageSequence?: number;
 }
 
 /** Immutable validated archive exposed through an authenticated download. */

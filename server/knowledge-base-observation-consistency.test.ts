@@ -5,6 +5,7 @@ import {
   conversations,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
+  messages,
 } from "../drizzle/schema";
 
 const dependencies = vi.hoisted(() => ({ getDb: vi.fn() }));
@@ -51,6 +52,7 @@ function snapshotExecutor(snapshot: {
   nodes: Record<string, unknown>[];
   conversation: Record<string, unknown>;
   turns?: Record<string, unknown>[];
+  messages?: Record<string, unknown>[];
 }) {
   return {
     select() {
@@ -60,6 +62,7 @@ function snapshotExecutor(snapshot: {
           if (table === knowledgeBaseBuildNodes) return query(snapshot.nodes);
           if (table === conversations) return query([snapshot.conversation]);
           if (table === conversationTurns) return query(snapshot.turns || []);
+          if (table === messages) return query(snapshot.messages || []);
           return query([]);
         },
       };
@@ -186,6 +189,7 @@ describe("knowledge-base observation consistency", () => {
               version: 12,
             },
             turns: [acceptedTurn],
+            messages: [{ turnId: acceptedTurn.id, role: "user", sequence: 4 }],
           }),
         );
       },
@@ -201,7 +205,66 @@ describe("knowledge-base observation consistency", () => {
       activeTurn: {
         id: "turn-accepted",
         status: "queued",
+        messageSequence: 4,
       },
+    });
+  });
+
+  it("projects canonical request and presentation message sequences", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const presentationTurn = {
+      id: "turn-presentation",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-presentation",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-presentation",
+      operationType: "confirm",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      status: "completed",
+      upstreamTaskId: "task-old",
+      metadata: {},
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build(),
+            nodes: [node({ sourceTurnId: presentationTurn.id })],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [presentationTurn],
+            messages: [
+              { turnId: presentationTurn.id, role: "user", sequence: 2 },
+              {
+                turnId: presentationTurn.id,
+                role: "assistant",
+                sequence: 3,
+              },
+            ],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.approvedPresentation).toMatchObject({
+      turnId: presentationTurn.id,
+      requestMessageSequence: 2,
+      messageSequence: 3,
     });
   });
 

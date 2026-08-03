@@ -68,6 +68,8 @@ export interface StepGroup {
 
 export interface LocalMessage {
   id: string;
+  /** Server-owned conversation order. Browser timestamps are never authoritative. */
+  serverSequence?: number;
   /** Stable provider output identity; the local id may be disambiguated per turn. */
   upstreamOutputId?: string;
   role: "user" | "assistant";
@@ -665,6 +667,7 @@ function knowledgeBasePresentationMessage(
 
   return {
     id: stableKnowledgeBaseMessageId(presentation.presentationKey),
+    serverSequence: presentation.messageSequence,
     role: "assistant",
     content: sanitizeKnowledgeBaseCustomerMarkdown(
       presentation.visibleMarkdown,
@@ -736,6 +739,8 @@ export function applyKnowledgeBaseObservation(
       return {
         ...message,
         id: knowledgeBaseUserMessagePublicId(activeTurnId),
+        serverSequence:
+          observation.activeTurn?.messageSequence ?? message.serverSequence,
         knowledgeBase: {
           ...message.knowledgeBase,
           schemaVersion: 1,
@@ -775,6 +780,9 @@ export function applyKnowledgeBaseObservation(
               id: knowledgeBaseUserMessagePublicId(
                 presentation.knowledgeBase!.turnId!,
               ),
+              serverSequence:
+                observation.approvedPresentation?.requestMessageSequence ??
+                pending.serverSequence,
               knowledgeBase: {
                 ...pending.knowledgeBase!,
                 schemaVersion: 1,
@@ -1037,6 +1045,13 @@ function knowledgeBaseMessageIsAtLeastAsNew(
   candidate: LocalMessage,
   current: LocalMessage,
 ) {
+  if (
+    candidate.serverSequence !== undefined ||
+    current.serverSequence !== undefined
+  ) {
+    if (candidate.serverSequence === undefined) return false;
+    if (current.serverSequence === undefined) return true;
+  }
   const left = knowledgeBaseMessageVersion(candidate);
   const right = knowledgeBaseMessageVersion(current);
   for (let index = 0; index < left.length; index += 1) {
@@ -1050,6 +1065,13 @@ function compareHydratedMessageOrder(left: LocalMessage, right: LocalMessage) {
     isServerOwnedKnowledgeBaseMessage(left) &&
     isServerOwnedKnowledgeBaseMessage(right)
   ) {
+    if (
+      left.serverSequence !== undefined &&
+      right.serverSequence !== undefined &&
+      left.serverSequence !== right.serverSequence
+    ) {
+      return left.serverSequence - right.serverSequence;
+    }
     const leftGeneration = left.knowledgeBase?.generation ?? -1;
     const rightGeneration = right.knowledgeBase?.generation ?? -1;
     if (leftGeneration !== rightGeneration) {
@@ -1059,7 +1081,21 @@ function compareHydratedMessageOrder(left: LocalMessage, right: LocalMessage) {
     const rightRevision = right.knowledgeBase?.revision ?? -1;
     if (leftRevision !== rightRevision) return leftRevision - rightRevision;
     if (left.knowledgeBase?.kind !== right.knowledgeBase?.kind) {
-      return left.knowledgeBase?.kind === "pending_user" ? -1 : 1;
+      const sameTurn =
+        Boolean(left.knowledgeBase?.turnId) &&
+        left.knowledgeBase?.turnId === right.knowledgeBase?.turnId;
+
+      // The start request and its first presentation share a revision and a
+      // turn, so the request comes first. Once a presentation is visible, the
+      // next confirmation also carries that presentation's revision but owns
+      // a new turn; in that case the presentation must stay before the request
+      // that advances it. Sorting every pending message first temporarily put
+      // 1.2 below the confirmation for 1.2, allowing 1.3 to render above 1.2
+      // until a later hydration happened to rebuild the history.
+      if (sameTurn) {
+        return left.knowledgeBase?.kind === "pending_user" ? -1 : 1;
+      }
+      return left.knowledgeBase?.kind === "presentation" ? -1 : 1;
     }
   }
   return left.timestamp - right.timestamp;

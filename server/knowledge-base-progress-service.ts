@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { and, asc, desc, eq, isNotNull, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 
 import {
   conversations,
   conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
+  messages,
   type ConversationTurn,
   type KnowledgeBaseBuild,
   type KnowledgeBaseBuildNode,
@@ -1614,7 +1615,14 @@ async function readKnowledgeBaseObservationProjection(
   const currentRow = build.currentLeafId
     ? rows.find((row) => row.leafId === build.currentLeafId) || null
     : null;
-  const [activeTurnRow, presentationTurnRow, conversationRow] =
+  const relevantTurnIds = [
+    ...new Set(
+      [build.activeTurnId, currentRow?.sourceTurnId].filter(
+        (turnId): turnId is string => Boolean(turnId),
+      ),
+    ),
+  ];
+  const [activeTurnRow, presentationTurnRow, conversationRow, messageRows] =
     await Promise.all([
       build.activeTurnId
         ? db
@@ -1672,6 +1680,23 @@ async function readKnowledgeBaseObservationProjection(
         )
         .limit(1)
         .then((values: Array<{ version: number }>) => values[0] || null),
+      relevantTurnIds.length > 0
+        ? db
+            .select({
+              turnId: messages.turnId,
+              role: messages.role,
+              sequence: messages.sequence,
+            })
+            .from(messages)
+            .where(
+              and(
+                eq(messages.userId, input.userId),
+                eq(messages.conversationId, persistedConversationId),
+                inArray(messages.turnId, relevantTurnIds),
+                isNull(messages.deletedAt),
+              ),
+            )
+        : Promise.resolve([]),
     ]);
 
   const verifiedBuild = await loadBuild(db, input.userId, conversationId);
@@ -1696,6 +1721,7 @@ async function readKnowledgeBaseObservationProjection(
     activeTurnRow,
     presentationTurnRow,
     conversationRow,
+    messageRows,
   });
 }
 
@@ -1709,6 +1735,11 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     "id" | "clientRequestId"
   > | null;
   conversationRow: { version: number } | null;
+  messageRows: Array<{
+    turnId: string | null;
+    role: string;
+    sequence: number;
+  }>;
 }): KnowledgeBaseObservationProjection {
   const {
     build,
@@ -1717,7 +1748,17 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     activeTurnRow,
     presentationTurnRow,
     conversationRow,
+    messageRows,
   } = input;
+  const messageSequence = (
+    turnId: string | null | undefined,
+    role: "user" | "assistant",
+  ) =>
+    turnId
+      ? messageRows.find(
+          (message) => message.turnId === turnId && message.role === role,
+        )?.sequence
+      : undefined;
   let activeTurn: KnowledgeBaseActiveTurnDto | null = null;
   const activeTurnMetadata =
     activeTurnRow?.metadata && typeof activeTurnRow.metadata === "object"
@@ -1758,6 +1799,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
         expectedClientAttachments >= 0
           ? expectedClientAttachments
           : 0,
+      messageSequence: messageSequence(activeTurnRow.id, "user"),
     };
   }
 
@@ -1815,6 +1857,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       contentSha256,
       imageState: resources.length === 1 ? "attached" : "no_eligible_asset",
       resources,
+      requestMessageSequence: messageSequence(currentRow.sourceTurnId, "user"),
+      messageSequence: messageSequence(currentRow.sourceTurnId, "assistant"),
     };
   }
 

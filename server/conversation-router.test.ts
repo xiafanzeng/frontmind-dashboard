@@ -198,6 +198,35 @@ describe("conversation multi-device merge", () => {
     ).toEqual(["user-a", "assistant-a", "user-b", "assistant-b"]);
   });
 
+  it("never rewrites persisted KB turn order from same-second IDs", () => {
+    const earlier = {
+      ...serverOwnedMessage("z-earlier", "user", 100, "pending_user"),
+      serverSequence: 0,
+      knowledgeBase: {
+        ...serverOwnedMessage("z-earlier", "user", 100, "pending_user")
+          .knowledgeBase!,
+        clientRequestId: "request-earlier",
+        turnId: "turn-earlier",
+      },
+    };
+    const later = {
+      ...serverOwnedMessage("a-later", "user", 100, "pending_user"),
+      serverSequence: 2,
+      knowledgeBase: {
+        ...serverOwnedMessage("a-later", "user", 100, "pending_user")
+          .knowledgeBase!,
+        clientRequestId: "request-later",
+        turnId: "turn-later",
+      },
+    };
+
+    expect(
+      mergeConversationMessages([earlier, later], [], []).map(
+        (item) => item.id,
+      ),
+    ).toEqual(["z-earlier", "a-later"]);
+  });
+
   it("replaces the assistant projection for a known turn", () => {
     const persisted = [
       message("user-a", "user", 100),
@@ -401,12 +430,10 @@ describe("conversation multi-device merge", () => {
   });
 
   it("round-trips KB provenance through snapshot validation and message metadata", () => {
-    const protectedMessage = serverOwnedMessage(
-      "presentation-1",
-      "assistant",
-      110,
-      "presentation",
-    );
+    const protectedMessage = {
+      ...serverOwnedMessage("presentation-1", "assistant", 110, "presentation"),
+      serverSequence: 7,
+    };
     const parsed = conversationSnapshotSchema.parse({
       id: "conversation-1",
       title: "企业知识库构建",
@@ -419,6 +446,7 @@ describe("conversation multi-device merge", () => {
     expect(parsed.messages[0]?.knowledgeBase).toEqual(
       protectedMessage.knowledgeBase,
     );
+    expect(parsed.messages[0]?.serverSequence).toBe(7);
     expect(buildMessageMetadata(parsed.messages[0]!).knowledgeBase).toEqual(
       protectedMessage.knowledgeBase,
     );

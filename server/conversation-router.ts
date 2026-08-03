@@ -206,6 +206,7 @@ function parsedKnowledgeBaseMessageMetadata(metadata: MessageMetadata) {
 
 const messageSchema = z.object({
   id: z.string().min(1).max(128),
+  serverSequence: z.number().int().nonnegative().optional(),
   upstreamOutputId: z.string().min(1).max(128).optional(),
   role: z.enum(["user", "assistant"]),
   content: z.string().max(2_000_000),
@@ -1193,6 +1194,7 @@ async function loadPersistedMessages(
     );
     return {
       id: publicId(userId, message.id, projectAssignmentId),
+      serverSequence: message.sequence,
       ...(metadata.upstreamOutputId
         ? { upstreamOutputId: metadata.upstreamOutputId }
         : {}),
@@ -1345,6 +1347,31 @@ function assistantProjectionScore(projected: SnapshotMessage[]) {
   );
 }
 
+function compareMessageTurnOrder(left: MessageTurn, right: MessageTurn) {
+  if (
+    left.user.serverSequence !== undefined &&
+    right.user.serverSequence !== undefined &&
+    left.user.serverSequence !== right.user.serverSequence
+  ) {
+    return left.user.serverSequence - right.user.serverSequence;
+  }
+  const timestampOrder = left.user.timestamp - right.user.timestamp;
+  if (timestampOrder !== 0) return timestampOrder;
+  if (
+    left.user.serverSequence !== undefined &&
+    right.user.serverSequence === undefined
+  ) {
+    return -1;
+  }
+  if (
+    left.user.serverSequence === undefined &&
+    right.user.serverSequence !== undefined
+  ) {
+    return 1;
+  }
+  return left.user.id.localeCompare(right.user.id);
+}
+
 /**
  * Merge by user turn rather than replacing an entire conversation snapshot.
  * The incoming assistant set is authoritative for a turn it knows about
@@ -1433,11 +1460,7 @@ export function mergeConversationMessages(
     );
   const mergedTurns = Array.from(turns.values())
     .filter((turn) => !deleted.has(turn.user.id))
-    .sort(
-      (left, right) =>
-        left.user.timestamp - right.user.timestamp ||
-        left.user.id.localeCompare(right.user.id),
-    );
+    .sort(compareMessageTurnOrder);
 
   return [
     ...mergedPrelude,
@@ -2091,6 +2114,7 @@ async function listSnapshots(
       );
       return {
         id: publicId(userId, message.id, projectAssignmentId),
+        serverSequence: message.sequence,
         ...(metadata.upstreamOutputId
           ? { upstreamOutputId: metadata.upstreamOutputId }
           : {}),

@@ -145,6 +145,12 @@ describe("authoritative KB observation reducer", () => {
     const released = {
       ...observation(2, "turn-1", 1, "1.2", "## 1.2\n已批准正文"),
       activeTurn: null,
+      approvedPresentation: {
+        ...observation(2, "turn-1", 1, "1.2", "## 1.2\n已批准正文")
+          .approvedPresentation!,
+        requestMessageSequence: 12,
+        messageSequence: 13,
+      },
     };
     const next = applyKnowledgeBaseObservation(conversation(), released);
 
@@ -157,6 +163,9 @@ describe("authoritative KB observation reducer", () => {
     expect(next.messages.map((message) => message.id)).toEqual([
       knowledgeBaseUserMessagePublicId("turn-1"),
       presentationMessageId(1),
+    ]);
+    expect(next.messages.map((message) => message.serverSequence)).toEqual([
+      12, 13,
     ]);
     expect(
       next.messages.every((message) => message.knowledgeBase?.serverOwned),
@@ -404,6 +413,156 @@ describe("authoritative KB observation reducer", () => {
     expect(
       merged.messages.map((message) => message.content).join("\n"),
     ).toContain("第二节点");
+  });
+
+  it("keeps each approved node before the later confirmation that advances it", () => {
+    const history: Conversation["messages"] = [
+      {
+        id: knowledgeBaseUserMessagePublicId("turn-start"),
+        role: "user",
+        content: "开始构建",
+        timestamp: 1,
+        knowledgeBase: {
+          kind: "pending_user",
+          turnId: "turn-start",
+          generation: 1,
+          revision: 0,
+          serverOwned: true,
+        },
+      },
+      {
+        id: presentationMessageId(0),
+        role: "assistant",
+        content: "## 1.1\n第一节点",
+        timestamp: 2,
+        knowledgeBase: {
+          kind: "presentation",
+          turnId: "turn-start",
+          presentationKey: presentationKey(0),
+          generation: 1,
+          revision: 0,
+          leafId: "1.1",
+          serverOwned: true,
+        },
+      },
+      {
+        id: knowledgeBaseUserMessagePublicId("turn-confirm-1"),
+        role: "user",
+        content: "确认",
+        timestamp: 3,
+        knowledgeBase: {
+          kind: "pending_user",
+          turnId: "turn-confirm-1",
+          generation: 1,
+          revision: 0,
+          leafId: "1.1",
+          serverOwned: true,
+        },
+      },
+      {
+        id: presentationMessageId(1),
+        role: "assistant",
+        content: "## 1.2\n第二节点",
+        timestamp: 4,
+        knowledgeBase: {
+          kind: "presentation",
+          turnId: "turn-confirm-1",
+          presentationKey: presentationKey(1),
+          generation: 1,
+          revision: 1,
+          leafId: "1.2",
+          serverOwned: true,
+        },
+      },
+      {
+        id: knowledgeBaseUserMessagePublicId("turn-confirm-2"),
+        role: "user",
+        content: "确认",
+        timestamp: 5,
+        knowledgeBase: {
+          kind: "pending_user",
+          turnId: "turn-confirm-2",
+          generation: 1,
+          revision: 1,
+          leafId: "1.2",
+          serverOwned: true,
+        },
+      },
+      {
+        id: presentationMessageId(2),
+        role: "assistant",
+        content: "## 1.3\n第三节点",
+        timestamp: 6,
+        knowledgeBase: {
+          kind: "presentation",
+          turnId: "turn-confirm-2",
+          presentationKey: presentationKey(2),
+          generation: 1,
+          revision: 2,
+          leafId: "1.3",
+          serverOwned: true,
+        },
+      },
+    ];
+
+    const merged = mergeServerOwnedKnowledgeBaseMessages([], history);
+
+    expect(merged.map((message) => message.content)).toEqual([
+      "开始构建",
+      "## 1.1\n第一节点",
+      "确认",
+      "## 1.2\n第二节点",
+      "确认",
+      "## 1.3\n第三节点",
+    ]);
+  });
+
+  it("uses canonical server sequence even when cached timestamps disagree", () => {
+    const remotePresentation: Conversation["messages"][number] = {
+      id: presentationMessageId(1),
+      serverSequence: 3,
+      role: "assistant",
+      content: "## 1.2\n服务器正文",
+      timestamp: 10,
+      knowledgeBase: {
+        kind: "presentation",
+        turnId: "turn-confirm-1",
+        presentationKey: presentationKey(1),
+        generation: 1,
+        revision: 1,
+        leafId: "1.2",
+        serverOwned: true,
+      },
+    };
+    const cachedPresentation = {
+      ...remotePresentation,
+      serverSequence: undefined,
+      content: "## 1.2\n浏览器旧缓存",
+      timestamp: 9_999,
+    };
+    const confirmation: Conversation["messages"][number] = {
+      id: knowledgeBaseUserMessagePublicId("turn-confirm-2"),
+      serverSequence: 4,
+      role: "user",
+      content: "确认",
+      timestamp: 1,
+      knowledgeBase: {
+        kind: "pending_user",
+        turnId: "turn-confirm-2",
+        generation: 1,
+        revision: 1,
+        leafId: "1.2",
+        serverOwned: true,
+      },
+    };
+
+    const merged = mergeServerOwnedKnowledgeBaseMessages(
+      [cachedPresentation],
+      [confirmation, remotePresentation],
+    );
+
+    expect(merged.map((message) => message.serverSequence)).toEqual([3, 4]);
+    expect(merged[0]?.content).toContain("服务器正文");
   });
 
   it("preserves server-owned history even before client KB state is restored", () => {
