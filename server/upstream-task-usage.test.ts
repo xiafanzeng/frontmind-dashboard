@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildRollingUsageTaskParams,
+  parseRollingUsageTaskPayload,
   usagePageReachedCutoff,
 } from "./upstream-task-usage";
 
@@ -46,5 +47,24 @@ describe("rolling task usage pagination", () => {
         expiredTaskCount: 100,
       }),
     ).toBe(false);
+  });
+
+  it("degrades malformed legacy attribution payloads without throwing", async () => {
+    await expect(
+      parseRollingUsageTaskPayload(
+        new Response("not-json", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      parseRollingUsageTaskPayload(Response.json({ ok: true, data: {} })),
+    ).resolves.toBeNull();
+    await expect(
+      parseRollingUsageTaskPayload(
+        Response.json({ ok: true, data: [{ id: "task-1" }] }),
+      ),
+    ).resolves.toMatchObject({ data: [{ id: "task-1" }] });
   });
 });

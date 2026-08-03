@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   API_USAGE_SCAN_CONCURRENCY,
   API_USAGE_SNAPSHOT_SYNC_LOCK_NAME,
+  apiUsageSnapshotCompletionState,
   apiUsageSeverity,
   assertBulkManagedApiKeyTargetSelection,
   assertBulkManagedApiKeyTargetVersions,
@@ -13,15 +14,187 @@ import {
   bulkManagedApiKeyActionTargets,
   bulkPreviousCredentialGroups,
   claimUsageSnapshotRefresh,
+  createManagedApiUsageRefreshQueue,
   isDuplicateApiUsageSnapshotError,
   isRollingUsageSnapshotCurrent,
   latestUsageSnapshotByPolicy,
   resolveEffectiveUsageCredentials,
   resolveBulkManagedApiKeyTargets,
   runApiUsageSnapshotSyncWithLock,
+  syncableManagedWorkspaceUserIds,
   usageCredentialPoolKey,
   usageSnapshotUsageValues,
 } from "./api-usage-snapshot-service";
+
+describe("managed API usage refresh targeting", () => {
+  it("keeps customers owned by a system administrator in the snapshot scan", () => {
+    expect(
+      syncableManagedWorkspaceUserIds({
+        workspaceUserIds: [1, 2, 3, 4],
+        ownershipRows: [
+          { userId: 1, deliveryAdminId: 10 },
+          { userId: 2, deliveryAdminId: 20 },
+          { userId: 3, deliveryAdminId: 30 },
+        ],
+        eligibleOwnerIds: [10, 20],
+      }),
+    ).toEqual([1, 2, 4]);
+  });
+
+  it("deduplicates immediate pool refreshes and retries after the global lock is busy", async () => {
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
+    const refresh = vi
+      .fn()
+      .mockResolvedValueOnce({
+        synced: 0,
+        failed: 0,
+        finishedAt: 1,
+        skipped: "already_running" as const,
+      })
+      .mockResolvedValueOnce({ synced: 2, failed: 0, finishedAt: 2 });
+    const queue = createManagedApiUsageRefreshQueue({
+      refresh,
+      retryDelayMs: 250,
+      schedule: (callback, delayMs) => {
+        scheduled.push({ callback, delayMs });
+        return {};
+      },
+    });
+    const actor = { id: 9, role: "admin" } as any;
+
+    queue.enqueue({ actor, fingerprint: "fingerprint-A" });
+    queue.enqueue({ actor, fingerprint: "fingerprint-A" });
+    queue.enqueue({ actor, fingerprint: "fingerprint-B" });
+
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.delayMs).toBe(0);
+    scheduled.shift()!.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect([...refresh.mock.calls[0]![1]]).toEqual([
+      "fingerprint-A",
+      "fingerprint-B",
+    ]);
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.delayMs).toBe(250);
+
+    scheduled.shift()!.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect([...refresh.mock.calls[1]![1]]).toEqual([
+      "fingerprint-A",
+      "fingerprint-B",
+    ]);
+    expect(scheduled).toHaveLength(0);
+  });
+
+  it("retries a targeted refresh after the refresh itself throws", async () => {
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
+    const error = new Error("temporary upstream failure");
+    const onError = vi.fn();
+    const refresh = vi
+      .fn()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce({ synced: 1, failed: 0, finishedAt: 2 });
+    const queue = createManagedApiUsageRefreshQueue({
+      refresh,
+      onError,
+      retryDelayMs: 125,
+      schedule: (callback, delayMs) => {
+        scheduled.push({ callback, delayMs });
+        return {};
+      },
+    });
+
+    queue.enqueue({
+      actor: { id: 9, role: "admin" } as any,
+      fingerprint: "fingerprint-throw",
+    });
+    scheduled.shift()!.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onError).toHaveBeenCalledWith(error);
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.delayMs).toBe(125);
+
+    scheduled.shift()!.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect([...refresh.mock.calls[1]![1]]).toEqual(["fingerprint-throw"]);
+    expect(scheduled).toHaveLength(0);
+  });
+
+  it("retries when a snapshot scan reports a retryable failure", async () => {
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
+    const refresh = vi
+      .fn()
+      .mockResolvedValueOnce({
+        synced: 0,
+        failed: 1,
+        retryableFailed: 1,
+        finishedAt: 1,
+      })
+      .mockResolvedValueOnce({ synced: 1, failed: 0, finishedAt: 2 });
+    const queue = createManagedApiUsageRefreshQueue({
+      refresh,
+      retryDelayMs: 75,
+      schedule: (callback, delayMs) => {
+        scheduled.push({ callback, delayMs });
+        return {};
+      },
+    });
+
+    queue.enqueue({
+      actor: { id: 9, role: "admin" } as any,
+      fingerprint: "fingerprint-retryable",
+    });
+    scheduled.shift()!.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.delayMs).toBe(75);
+
+    scheduled.shift()!.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(scheduled).toHaveLength(0);
+  });
+});
+
+describe("API usage snapshot completion state", () => {
+  it("keeps an authoritative total available when only account attribution is partial", () => {
+    expect(
+      apiUsageSnapshotCompletionState({
+        totalComplete: true,
+        attributionComplete: false,
+        attributionErrorCode: "PARTIAL_ACCOUNT_ATTRIBUTION",
+      }),
+    ).toEqual({
+      status: "ok",
+      errorCode: "PARTIAL_ACCOUNT_ATTRIBUTION",
+    });
+  });
+
+  it("marks only an incomplete authoritative total as a failed scan", () => {
+    expect(
+      apiUsageSnapshotCompletionState({
+        totalComplete: false,
+        attributionComplete: true,
+        attributionErrorCode: "PARTIAL_ACCOUNT_ATTRIBUTION",
+      }),
+    ).toEqual({
+      status: "error",
+      errorCode: "PARTIAL_USAGE_SCAN",
+    });
+  });
+});
 
 describe("API usage snapshot duplicate-key detection", () => {
   it("recognizes direct mysql2 and Drizzle-wrapped duplicate errors", () => {

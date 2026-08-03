@@ -84,6 +84,7 @@ type AdminUsageHierarchyManager = {
     severity: string;
   };
   ownAgentMonthUsed: number;
+  accountUsageComplete: boolean;
   attributedUsed: number;
   otherOrUnattributedUsed: number;
   users: Array<{
@@ -91,6 +92,7 @@ type AdminUsageHierarchyManager = {
     enterpriseName: string;
     username: string | null;
     monthUsed: number;
+    accountUsageComplete: boolean;
     fingerprint: string | null;
     usesManagerKey: boolean;
     credentialSource: "manager" | "customer" | "unconfigured";
@@ -108,6 +110,7 @@ type AdminUsageHierarchyEngineer = {
   apiKeyVersion: number;
   keyTotalUsed: number;
   ownAgentMonthUsed: number;
+  accountUsageComplete: boolean;
   otherOrUnattributedUsed: number;
   fingerprint: string | null;
   syncStatus: string;
@@ -131,6 +134,7 @@ type AdminUsageHierarchyCustomer = {
   usesInheritedKey: boolean;
   keyTotalUsed: number;
   ownAgentMonthUsed: number;
+  accountUsageComplete: boolean;
   otherOrUnattributedUsed: number;
   fingerprint: string | null;
   syncStatus: string;
@@ -260,6 +264,7 @@ export type DeliveryEngineerStatusRow = {
   apiKeyVersion: number;
   keyTotalUsed: number;
   ownAgentMonthUsed: number;
+  accountUsageComplete: boolean;
   otherOrUnattributedUsed: number;
   usageSyncStatus: string;
 };
@@ -351,6 +356,7 @@ export function buildDeliveryEngineerStatusRows(
         apiKeyVersion: Math.max(0, Number(engineer.apiKeyVersion) || 0),
         keyTotalUsed: 0,
         ownAgentMonthUsed: 0,
+        accountUsageComplete: true,
         otherOrUnattributedUsed: 0,
         usageSyncStatus: "unconfigured",
       };
@@ -608,6 +614,7 @@ export function normalizeUsageHierarchy(value: unknown): {
           severity: String(entry?.keyPool?.severity || "unavailable"),
         },
         ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
+        accountUsageComplete: entry?.accountUsageComplete === true,
         attributedUsed: Math.max(0, Number(entry?.attributedUsed) || 0),
         otherOrUnattributedUsed: Math.max(
           0,
@@ -620,6 +627,7 @@ export function normalizeUsageHierarchy(value: unknown): {
                 String(customer?.enterpriseName || "").trim() || "未命名客户",
               username: customer?.username ? String(customer.username) : null,
               monthUsed: Math.max(0, Number(customer?.monthUsed) || 0),
+              accountUsageComplete: customer?.accountUsageComplete === true,
               fingerprint: customer?.fingerprint
                 ? String(customer.fingerprint)
                 : null,
@@ -651,6 +659,7 @@ export function normalizeUsageHierarchy(value: unknown): {
           apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
           keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
           ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
+          accountUsageComplete: entry?.accountUsageComplete === true,
           otherOrUnattributedUsed: Math.max(
             0,
             Number(entry?.otherOrUnattributedUsed) || 0,
@@ -673,6 +682,7 @@ export function normalizeUsageHierarchy(value: unknown): {
           apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
           keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
           ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
+          accountUsageComplete: entry?.accountUsageComplete === true,
           otherOrUnattributedUsed: Math.max(
             0,
             Number(entry?.otherOrUnattributedUsed) || 0,
@@ -704,6 +714,7 @@ export function normalizeUsageHierarchy(value: unknown): {
           usesInheritedKey: entry?.usesInheritedKey === true,
           keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
           ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
+          accountUsageComplete: entry?.accountUsageComplete === true,
           otherOrUnattributedUsed: Math.max(
             0,
             Number(entry?.otherOrUnattributedUsed) || 0,
@@ -725,6 +736,20 @@ export function normalizeUsageHierarchy(value: unknown): {
   };
 }
 
+export function usageHierarchyNeedsPolling(value: unknown): boolean {
+  const hierarchy = normalizeUsageHierarchy(value);
+  return (
+    hierarchy.systemAdmins.some((entry) => entry.syncStatus === "pending") ||
+    hierarchy.engineers.some((entry) => entry.syncStatus === "pending") ||
+    hierarchy.customers.some((entry) => entry.syncStatus === "pending") ||
+    hierarchy.managers.some(
+      (entry) =>
+        entry.keyPool.syncStatus === "pending" ||
+        entry.users.some((customer) => customer.syncStatus === "pending"),
+    )
+  );
+}
+
 type OverviewApiKeyTarget = {
   kind: "customer" | "delivery_admin" | "system_admin" | "engineer";
   userId: number;
@@ -741,11 +766,30 @@ export type KeyManagementRow = OverviewApiKeyTarget & {
   deliveryAdminId: number | null;
   inherited: boolean;
   ownAgentMonthUsed: number;
+  accountUsageComplete: boolean;
   keyTotalUsed: number;
   otherOrUnattributedUsed: number;
   syncStatus: string;
   fetchedAt: number | string | Date | null;
+  fingerprint?: string | null;
+  sharedKeyAccountCount?: number;
 };
+
+export function annotateSharedKeyAccountCounts<
+  T extends { fingerprint?: string | null },
+>(rows: T[]): Array<T & { sharedKeyAccountCount: number }> {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    if (!row.fingerprint) continue;
+    counts.set(row.fingerprint, (counts.get(row.fingerprint) ?? 0) + 1);
+  }
+  return rows.map((row) => ({
+    ...row,
+    sharedKeyAccountCount: row.fingerprint
+      ? (counts.get(row.fingerprint) ?? 1)
+      : 0,
+  }));
+}
 
 export type BulkApiKeyScope =
   | { kind: "all" }
@@ -1500,6 +1544,8 @@ export default function AdminDashboard({
     enabled: !previewMode && user?.role === "admin" && systemAdmin,
     retry: false,
     refetchOnWindowFocus: false,
+    refetchInterval: (query: any) =>
+      usageHierarchyNeedsPolling(query.state.data) ? 2_000 : false,
   });
   const usageSyncMutation = (
     trpc.admin as any
@@ -1538,6 +1584,7 @@ export default function AdminDashboard({
       enterpriseName: item.enterpriseName || `客户 ${item.userId || ""}`,
       username: null,
       monthUsed: item.accountUsed,
+      accountUsageComplete: true,
       fingerprint: item.credentialFingerprint || null,
       usesManagerKey:
         Boolean(pool?.fingerprint) &&
@@ -1579,6 +1626,7 @@ export default function AdminDashboard({
             severity: "normal",
           },
           ownAgentMonthUsed,
+          accountUsageComplete: true,
           attributedUsed,
           otherOrUnattributedUsed: Math.max(
             0,
@@ -1606,12 +1654,14 @@ export default function AdminDashboard({
       apiKeyVersion: usage?.apiKeyVersion ?? engineer.apiKeyVersion,
       keyTotalUsed: usage?.keyTotalUsed ?? 0,
       ownAgentMonthUsed: usage?.ownAgentMonthUsed ?? 0,
+      accountUsageComplete: usage?.accountUsageComplete ?? true,
       otherOrUnattributedUsed: usage?.otherOrUnattributedUsed ?? 0,
       usageSyncStatus: usage?.syncStatus ?? "unconfigured",
       usageFetchedAt: usage?.fetchedAt ?? null,
+      usageFingerprint: usage?.fingerprint ?? null,
     };
   });
-  const keyManagementRows: KeyManagementRow[] = [
+  const keyManagementRows: KeyManagementRow[] = annotateSharedKeyAccountCounts([
     ...usageHierarchy.systemAdmins.map(
       (administrator): KeyManagementRow => ({
         kind: "system_admin",
@@ -1626,10 +1676,12 @@ export default function AdminDashboard({
         scopeLabel: "系统管理与通用 Agent",
         inherited: false,
         ownAgentMonthUsed: administrator.ownAgentMonthUsed,
+        accountUsageComplete: administrator.accountUsageComplete,
         keyTotalUsed: administrator.keyTotalUsed,
         otherOrUnattributedUsed: administrator.otherOrUnattributedUsed,
         syncStatus: administrator.syncStatus,
         fetchedAt: administrator.fetchedAt,
+        fingerprint: administrator.fingerprint,
       }),
     ),
     ...usageManagers.map(
@@ -1646,6 +1698,7 @@ export default function AdminDashboard({
         scopeLabel: `负责 ${manager.users.length} 个客户`,
         inherited: false,
         ownAgentMonthUsed: manager.ownAgentMonthUsed,
+        accountUsageComplete: manager.accountUsageComplete,
         keyTotalUsed: manager.keyPool.totalUsed,
         otherOrUnattributedUsed: Math.max(
           0,
@@ -1653,6 +1706,7 @@ export default function AdminDashboard({
         ),
         syncStatus: manager.keyPool.syncStatus,
         fetchedAt: manager.keyPool.fetchedAt,
+        fingerprint: manager.keyPool.fingerprint,
       }),
     ),
     ...deliveryEngineerStatusRows.map(
@@ -1671,10 +1725,12 @@ export default function AdminDashboard({
           : `岗位未设置 · ${engineer.projectCount} 个项目`,
         inherited: false,
         ownAgentMonthUsed: engineer.ownAgentMonthUsed,
+        accountUsageComplete: engineer.accountUsageComplete,
         keyTotalUsed: engineer.keyTotalUsed,
         otherOrUnattributedUsed: engineer.otherOrUnattributedUsed,
         syncStatus: engineer.usageSyncStatus,
         fetchedAt: engineer.usageFetchedAt,
+        fingerprint: engineer.usageFingerprint,
       }),
     ),
     ...usageHierarchy.customers.map(
@@ -1693,13 +1749,15 @@ export default function AdminDashboard({
           : "负责人待分配",
         inherited: customer.usesInheritedKey,
         ownAgentMonthUsed: customer.ownAgentMonthUsed,
+        accountUsageComplete: customer.accountUsageComplete,
         keyTotalUsed: customer.keyTotalUsed,
         otherOrUnattributedUsed: customer.otherOrUnattributedUsed,
         syncStatus: customer.syncStatus,
         fetchedAt: customer.fetchedAt,
+        fingerprint: customer.fingerprint,
       }),
     ),
-  ].sort((left, right) => {
+  ]).sort((left, right) => {
     if (left.configured !== right.configured) return left.configured ? 1 : -1;
     return left.displayName.localeCompare(right.displayName, "zh-CN");
   });
@@ -1755,7 +1813,9 @@ export default function AdminDashboard({
                 </div>
                 <p className="mt-1 text-sm leading-6 text-[#716a80]">
                   客户、系统管理员、交付管理员和工程师使用同一套管理入口；交付管理员端不展示
-                  Key 配置能力。
+                  Key 配置能力。相同物理 Key 或属于同一上游账号的 Key
+                  可能共享同一积分池总额；账号自用量单独归因，无法完整归因时不会误显示为
+                  0。
                 </p>
               </div>
               {previewMode ? (
@@ -1862,7 +1922,7 @@ export default function AdminDashboard({
                     <span>归属范围</span>
                     <span>Key 状态</span>
                     <span>近 30 天自用</span>
-                    <span>Key 总额</span>
+                    <span>积分池总额</span>
                     <span>操作</span>
                   </div>
                   {visibleKeyManagementRows.map((row) => (
@@ -1893,7 +1953,9 @@ export default function AdminDashboard({
                           }
                         >
                           {row.configured
-                            ? "独立 Key 已配置"
+                            ? (row.sharedKeyAccountCount ?? 0) > 1
+                              ? `共享 Key 已配置 · ${row.sharedKeyAccountCount} 个账号`
+                              : "账号 Key 已配置"
                             : row.inherited
                               ? "使用历史共享 Key"
                               : "Key 待配置"}
@@ -1904,11 +1966,19 @@ export default function AdminDashboard({
                           </p>
                         )}
                       </div>
-                      <p className="text-sm font-semibold text-[#5b2a86]">
-                        {row.syncStatus === "ok"
-                          ? row.ownAgentMonthUsed.toLocaleString()
-                          : "—"}
-                      </p>
+                      <div>
+                        <p className="text-sm font-semibold text-[#5b2a86]">
+                          {row.syncStatus === "ok" && row.accountUsageComplete
+                            ? row.ownAgentMonthUsed.toLocaleString()
+                            : "—"}
+                        </p>
+                        {row.syncStatus === "ok" &&
+                          !row.accountUsageComplete && (
+                            <p className="mt-1 text-xs text-[#946800]">
+                              账号归因不完整
+                            </p>
+                          )}
+                      </div>
                       <div>
                         <p className="text-sm font-semibold text-[#332842]">
                           {row.syncStatus === "ok"
@@ -1922,6 +1992,10 @@ export default function AdminDashboard({
                               : row.syncStatus === "pending"
                                 ? "等待同步"
                                 : "同步不完整"}
+                          </p>
+                        ) : !row.accountUsageComplete ? (
+                          <p className="mt-1 text-xs text-[#857e91]">
+                            上游总额完整
                           </p>
                         ) : row.keyTotalUsed > row.ownAgentMonthUsed ? (
                           <p className="mt-1 text-xs text-[#857e91]">
@@ -1966,7 +2040,7 @@ export default function AdminDashboard({
               <h2 className="font-semibold text-[#171321]">工程师状态</h2>
               <p className="mt-1 text-sm text-[#716a80]">
                 {systemAdmin
-                  ? "按人员查看岗位、项目、近 30 天自用与 Key 总额；工程师 Key 由系统管理员统一配置。"
+                  ? "按人员查看岗位、项目、近 30 天自用与上游积分池总额；同一上游积分池可能被多个本地账号共享。"
                   : "按人员查看专业岗位、负责项目和当前工作状态；项目岗位缺员请前往客户项目团队处理。"}
               </p>
             </div>
@@ -2063,19 +2137,26 @@ export default function AdminDashboard({
                               <p>
                                 自用{" "}
                                 <span className="font-semibold text-[#5b2a86]">
-                                  {engineer.usageSyncStatus === "ok"
+                                  {engineer.usageSyncStatus === "ok" &&
+                                  engineer.accountUsageComplete
                                     ? engineer.ownAgentMonthUsed.toLocaleString()
                                     : "—"}
                                 </span>
                               </p>
                               <p>
-                                Key 总额{" "}
+                                积分池总额{" "}
                                 <span className="font-semibold text-[#332842]">
                                   {engineer.usageSyncStatus === "ok"
                                     ? engineer.keyTotalUsed.toLocaleString()
                                     : "—"}
                                 </span>
                               </p>
+                              {engineer.usageSyncStatus === "ok" &&
+                                !engineer.accountUsageComplete && (
+                                  <p className="text-[#946800]">
+                                    账号归因不完整，上游总额可用
+                                  </p>
+                                )}
                               {engineer.usageSyncStatus !== "ok" && (
                                 <p className="text-[#946800]">
                                   {engineer.usageSyncStatus === "unconfigured"

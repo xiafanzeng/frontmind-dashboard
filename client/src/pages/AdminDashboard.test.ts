@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   adminNav,
+  annotateSharedKeyAccountCounts,
   bulkApiKeyTargetsForScope,
   buildDeliveryEngineerStatusRows,
   channelDistributionUrl,
@@ -17,6 +18,7 @@ import {
   issueMonitorUrl,
   normalizeApiKeyUsageAlerts,
   normalizeUsageHierarchy,
+  usageHierarchyNeedsPolling,
   type KeyManagementRow,
 } from "./AdminDashboard";
 import { previewAdminNav } from "@/lib/preview-navigation";
@@ -209,7 +211,9 @@ describe("administrator channel navigation", () => {
     expect(source).toContain('confirmation: "REVOKE_API_KEY"');
     expect(source).toContain("迟到请求不会覆盖较新的 Key");
     expect(source).toContain("近 30 天自用");
-    expect(source).toContain("Key 总额");
+    expect(source).toContain("积分池总额");
+    expect(source).not.toContain("Key 总额");
+    expect(source).toContain("row.accountUsageComplete");
     expect(source).toContain("同步不完整");
     expect(source).toContain('row.syncStatus === "ok"');
     expect(source).toContain('engineer.usageSyncStatus === "ok"');
@@ -237,6 +241,7 @@ describe("administrator channel navigation", () => {
           apiKeyVersion: 3,
           keyTotalUsed: 20,
           ownAgentMonthUsed: 10,
+          accountUsageComplete: false,
           syncStatus: "error",
           fetchedAt: null,
         },
@@ -247,8 +252,62 @@ describe("administrator channel navigation", () => {
         adminId: 1,
         apiKeyVersion: 3,
         syncStatus: "error",
+        accountUsageComplete: false,
       }),
     ]);
+  });
+
+  it("treats a missing account-attribution proof as incomplete", () => {
+    const normalized = normalizeUsageHierarchy({
+      engineers: [
+        {
+          engineerId: 9,
+          displayName: "工程师",
+          syncStatus: "ok",
+          ownAgentMonthUsed: 0,
+        },
+      ],
+    });
+
+    expect(normalized.engineers[0]?.accountUsageComplete).toBe(false);
+  });
+
+  it("polls only while at least one hierarchy usage snapshot is pending", () => {
+    expect(
+      usageHierarchyNeedsPolling({
+        systemAdmins: [{ syncStatus: "ok" }],
+        engineers: [{ syncStatus: "pending" }],
+      }),
+    ).toBe(true);
+    expect(
+      usageHierarchyNeedsPolling({
+        managers: [
+          {
+            keyPool: { syncStatus: "ok" },
+            users: [{ syncStatus: "pending" }],
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      usageHierarchyNeedsPolling({
+        systemAdmins: [{ syncStatus: "ok" }],
+        engineers: [{ syncStatus: "error" }],
+        customers: [{ syncStatus: "unconfigured" }],
+        managers: [{ keyPool: { syncStatus: "ok" }, users: [] }],
+      }),
+    ).toBe(false);
+  });
+
+  it("labels every account that uses the same physical Key as shared", () => {
+    const rows = annotateSharedKeyAccountCounts([
+      { userId: 1, fingerprint: "fp_shared" },
+      { userId: 2, fingerprint: "fp_shared" },
+      { userId: 3, fingerprint: "fp_unique" },
+      { userId: 4, fingerprint: null },
+    ]);
+
+    expect(rows.map((row) => row.sharedKeyAccountCount)).toEqual([2, 2, 1, 0]);
   });
 
   it("presents delivery workload as one status row per engineer", () => {
@@ -550,6 +609,7 @@ describe("bulk API Key target previews", () => {
       isActive: true,
       inherited: false,
       ownAgentMonthUsed: 0,
+      accountUsageComplete: true,
       keyTotalUsed: 0,
       otherOrUnattributedUsed: 0,
       syncStatus: "unconfigured",

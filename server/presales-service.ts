@@ -35,14 +35,16 @@ import {
 } from "./api-usage-ledger";
 import {
   buildRollingUsageTaskParams,
+  parseRollingUsageTaskPayload,
   usagePageReachedCutoff,
 } from "./upstream-task-usage";
+import { getManusRollingCreditUsage } from "./manus-usage-service";
 
 const PRESALES_CREDENTIAL_SLOT = "website";
 export const PRESALES_REVOKABLE_STATUSES = ["active"] as const;
 const CREDIT_USAGE_LOOKBACK_DAYS = 30;
 const CREDIT_USAGE_PAGE_LIMIT = 100;
-const CREDIT_USAGE_MAX_PAGES = 20;
+const CREDIT_USAGE_MAX_PAGES = 100;
 const PRESALES_TASK_LEASE_MS = 3 * 60 * 1000;
 
 export type PresalesCredentialStatus = {
@@ -78,6 +80,7 @@ export type WebsiteApiKeyUsage = {
   recentWebsiteTasks: PresalesCreditUsageTask[];
   fetchedAt: number;
   complete: boolean;
+  attributionComplete: boolean;
 };
 
 export type PresalesTaskReservation =
@@ -1088,6 +1091,7 @@ export async function getPresalesCreditUsage(
       recentWebsiteTasks: [] as PresalesCreditUsageTask[],
       fetchedAt: now,
       complete: true,
+      attributionComplete: true,
     };
   }
 
@@ -1105,6 +1109,9 @@ export async function getPresalesCreditUsage(
     }
   }
   const credentials = [...credentialByFingerprint.values()];
+  const currentCredential =
+    credentials.find((credential) => credential.status === "active") ??
+    credentials[0]!;
   const coverageByFingerprint = await loadUsageCoverage({
     executor: db,
     scope: "website_frontend",
@@ -1112,6 +1119,11 @@ export async function getPresalesCreditUsage(
   });
   const usageNow = now;
   const cutoffMs = usageNow - normalizedWindowDays * 24 * 60 * 60 * 1000;
+  const authoritativePoolUsage = await getManusRollingCreditUsage({
+    apiKey: currentCredential.apiKey,
+    startAt: cutoffMs,
+    endAt: usageNow,
+  });
   const terminalProofsByFingerprint = await loadTerminalUsageTaskProofs({
     executor: db,
     scope: "website_frontend",
@@ -1200,9 +1212,8 @@ export async function getPresalesCreditUsage(
   }
   const recentWebsiteTasks: PresalesCreditUsageTask[] = [];
   const seen = new Set<string>();
-  let keyTotalUsed = 0;
   let websiteUsed = 0;
-  let complete = true;
+  let attributionComplete = true;
   for (const credential of credentials) {
     if (
       credential.status === "retired" &&
@@ -1270,10 +1281,8 @@ export async function getPresalesCreditUsage(
           });
           break;
         }
-        throw new AuthServiceError(
-          "UPSTREAM_UNAVAILABLE",
-          "暂时无法读取售前积分使用情况",
-        );
+        credentialComplete = false;
+        break;
       }
       if (!response.ok) {
         if (
@@ -1287,16 +1296,16 @@ export async function getPresalesCreditUsage(
           });
           break;
         }
-        throw new AuthServiceError(
-          response.status === 401 || response.status === 403
-            ? "INVALID_CREDENTIAL"
-            : "UPSTREAM_UNAVAILABLE",
-          "暂时无法读取售前积分使用情况",
-        );
+        credentialComplete = false;
+        break;
       }
 
-      const payload = (await response.json()) as any;
-      const tasks = Array.isArray(payload?.data) ? payload.data : [];
+      const payload = await parseRollingUsageTaskPayload(response);
+      if (!payload) {
+        credentialComplete = false;
+        break;
+      }
+      const tasks = payload.data;
       if (tasks.length === 0) {
         if (payload?.has_more) credentialComplete = false;
         break;
@@ -1313,10 +1322,9 @@ export async function getPresalesCreditUsage(
         endExclusive: usageNow,
         seenTaskIds: seen,
       });
-      keyTotalUsed += pageUsage.keyTotalUsed;
       websiteUsed += pageUsage.websiteUsed;
       recentWebsiteTasks.push(...pageUsage.recentWebsiteTasks);
-      if (!pageUsage.complete) complete = false;
+      if (!pageUsage.complete) attributionComplete = false;
       for (const task of tasks) {
         const taskId = String(task?.id ?? task?.task_id ?? "");
         if (
@@ -1401,7 +1409,7 @@ export async function getPresalesCreditUsage(
       if (!finalized) credentialComplete = false;
     }
     if (!credentialComplete) {
-      complete = false;
+      attributionComplete = false;
     }
   }
 
@@ -1417,10 +1425,11 @@ export async function getPresalesCreditUsage(
 
   return {
     windowDays: normalizedWindowDays,
-    keyTotalUsed: ledgerUsage.keyTotalUsed,
+    keyTotalUsed: authoritativePoolUsage.totalUsed,
     websiteUsed: ledgerUsage.websiteUsed,
     recentWebsiteTasks,
     fetchedAt: usageNow,
-    complete,
+    complete: authoritativePoolUsage.complete,
+    attributionComplete,
   };
 }

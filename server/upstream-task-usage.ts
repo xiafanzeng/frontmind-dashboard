@@ -38,3 +38,25 @@ export function usagePageReachedCutoff(input: {
     input.expiredTaskCount === input.datedTaskCount
   );
 }
+
+/**
+ * The legacy task list is used only for local account attribution. A malformed
+ * success body must therefore degrade attribution to unavailable instead of
+ * invalidating an independently verified v2 pool total.
+ */
+export async function parseRollingUsageTaskPayload(
+  response: globalThis.Response,
+): Promise<(Record<string, unknown> & { data: any[] }) | null> {
+  try {
+    const payload = (await response.json()) as unknown;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return null;
+    }
+    const record = payload as Record<string, unknown>;
+    return Array.isArray(record.data)
+      ? (record as Record<string, unknown> & { data: any[] })
+      : null;
+  } catch {
+    return null;
+  }
+}

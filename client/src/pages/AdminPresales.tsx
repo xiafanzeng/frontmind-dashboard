@@ -62,6 +62,7 @@ export const DEFAULT_API_KEY_WARNING_RATIO = 0.8;
 
 export function presalesUsageDisplayState(input: {
   complete: boolean;
+  attributionComplete: boolean;
   keyTotalUsed: number;
   websiteUsed: number;
   limit: number;
@@ -78,7 +79,9 @@ export function presalesUsageDisplayState(input: {
     Math.round((input.keyTotalUsed / Math.max(1, input.limit)) * 1000) / 10;
   return {
     keyTotalLabel: input.keyTotalUsed.toLocaleString(),
-    websiteUsedLabel: input.websiteUsed.toLocaleString(),
+    websiteUsedLabel: input.attributionComplete
+      ? input.websiteUsed.toLocaleString()
+      : "—",
     percentageLabel: `${percentage}%`,
     progressPercentage: Math.min(100, percentage),
   };
@@ -329,6 +332,7 @@ export default function AdminPresales() {
   const keyTotalUsed = usageQuery.data?.keyTotalUsed ?? 0;
   const websiteUsed = usageQuery.data?.websiteUsed ?? 0;
   const usageComplete = usageQuery.data?.complete !== false;
+  const attributionComplete = usageQuery.data?.attributionComplete === true;
   const usageLimit = Math.max(
     1,
     Number(websitePolicy?.limit) || DEFAULT_API_KEY_USAGE_LIMIT,
@@ -342,6 +346,7 @@ export default function AdminPresales() {
   );
   const usageDisplay = presalesUsageDisplayState({
     complete: usageComplete,
+    attributionComplete,
     keyTotalUsed,
     websiteUsed,
     limit: usageLimit,
@@ -375,8 +380,9 @@ export default function AdminPresales() {
     >
       <div className="mx-auto w-full max-w-6xl">
         <p className="mb-6 max-w-3xl text-sm leading-7 text-[#716a80]">
-          管理官网 GEO 构建流程使用的独立前台 API Key，并核验连接、
-          最近任务与真实积分消耗。密钥只在 Agent 服务端加密保存。
+          管理官网 GEO 构建流程使用的专用前台 API Key，并核验连接、
+          最近任务与真实积分消耗。密钥只在 Agent
+          服务端加密保存；同一上游账号下的多个 Key 可能共享一个积分池。
         </p>
 
         {statusQuery.isLoading ? (
@@ -412,8 +418,8 @@ export default function AdminPresales() {
                       官网前台 API Key
                     </CardTitle>
                     <p className="mt-1.5 text-sm text-muted-foreground">
-                      与个人账号 API Key 完全隔离，仅供官网服务端调用 Base
-                      模型。
+                      与个人账号凭据分开配置，仅供官网服务端调用 Base
+                      模型；上游积分池总额仍可能与同一账号下的其他 Key 共享。
                     </p>
                   </div>
                   <Badge
@@ -586,7 +592,7 @@ export default function AdminPresales() {
                   天积分使用
                 </CardTitle>
                 <p className="text-sm text-muted-foreground">
-                  统计当前售前 API Key 下的全部上游任务消耗。
+                  统计当前凭据所属上游积分池的全部消耗，并单独归因官网任务用量。
                 </p>
               </CardHeader>
               <CardContent className="p-5 sm:p-6">
@@ -631,6 +637,11 @@ export default function AdminPresales() {
                         天总量与百分比已隐藏，避免把部分结果误认为准确用量。
                       </div>
                     )}
+                    {usageComplete && !attributionComplete && (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                        上游积分池总额与百分比已完整读取，但历史任务未能全部归因到官网。官网任务用量已隐藏，避免把部分结果误认为准确值。
+                      </div>
+                    )}
                     <div
                       className={`rounded-2xl border p-5 ${
                         usageTone === "critical"
@@ -644,7 +655,7 @@ export default function AdminPresales() {
                     >
                       <div className="flex items-center justify-between gap-3">
                         <p className="fm-eyebrow text-muted-foreground">
-                          当前 Key 近 30 天总积分使用 / 上限
+                          上游积分池近 30 天总使用 / 上限
                         </p>
                         <Badge
                           variant="outline"
@@ -754,8 +765,8 @@ export default function AdminPresales() {
                     <div>
                       <p className="text-sm font-medium">积分预警策略</p>
                       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        官网前台 Key 独立计量；默认上限 230,000，达到 80%
-                        时预警。
+                        预警基于官网凭据所属的上游积分池总额；默认上限
+                        230,000，达到 80% 时预警。
                       </p>
                     </div>
                     <div className="grid gap-3 sm:grid-cols-3">

@@ -64,11 +64,13 @@ import {
 } from "./api-usage-ledger";
 import {
   buildRollingUsageTaskParams,
+  parseRollingUsageTaskPayload,
   usagePageReachedCutoff,
 } from "./upstream-task-usage";
+import { getManusRollingCreditUsage } from "./manus-usage-service";
 
 const CREDIT_PAGE_LIMIT = 100;
-const CREDIT_MAX_PAGES = 20;
+const CREDIT_MAX_PAGES = 100;
 
 export class DashboardEnterpriseMismatchError extends AuthServiceError {
   constructor() {
@@ -1797,6 +1799,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
       fingerprint: null,
       period,
       complete: true,
+      attributionComplete: true,
     };
   }
   const credentialRows = await db
@@ -1840,6 +1843,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
       fingerprint: null,
       period,
       complete: true,
+      attributionComplete: true,
     };
   }
   // The same physical Key may be inherited, copied to another account, or
@@ -1868,6 +1872,18 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
     }
   }
   const credentials = [...credentialByFingerprint.values()];
+  const totalCredential = input.poolFingerprint
+    ? credentials.find(
+        (credential) => credential.fingerprint === input.poolFingerprint,
+      )
+    : credentials[0];
+  const authoritativePoolUsage = totalCredential
+    ? await getManusRollingCreditUsage({
+        apiKey: totalCredential.apiKey,
+        startAt: period.startAt,
+        endAt: period.endAt,
+      })
+    : { totalUsed: 0, complete: false };
   const coverageByFingerprint = await loadUsageCoverage({
     executor: db,
     scope: "managed_user",
@@ -1948,8 +1964,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
       .filter((value): value is string => Boolean(value)),
   );
   const seen = new Set<string>();
-  let totalUsed = 0;
-  let complete = true;
+  let attributionComplete = true;
   for (const credential of credentials) {
     if (
       credential.status === "retired" &&
@@ -2018,7 +2033,8 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
           });
           break;
         }
-        throw error;
+        credentialComplete = false;
+        break;
       }
       if (!response.ok) {
         if (
@@ -2032,15 +2048,15 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
           });
           break;
         }
-        throw new AuthServiceError(
-          response.status === 401 || response.status === 403
-            ? "INVALID_CREDENTIAL"
-            : "UPSTREAM_UNAVAILABLE",
-          "暂时无法读取共享 Key 的积分使用情况",
-        );
+        credentialComplete = false;
+        break;
       }
-      const payload = (await response.json()) as any;
-      const tasks = Array.isArray(payload?.data) ? payload.data : [];
+      const payload = await parseRollingUsageTaskPayload(response);
+      if (!payload) {
+        credentialComplete = false;
+        break;
+      }
+      const tasks = payload.data;
       if (tasks.length === 0) {
         if (payload?.has_more) credentialComplete = false;
         break;
@@ -2071,7 +2087,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
       for (const task of tasks) {
         const id = String(task?.id ?? task?.task_id ?? "");
         if (!id) {
-          complete = false;
+          attributionComplete = false;
           pageComplete = false;
           continue;
         }
@@ -2080,7 +2096,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
         seen.add(id);
         const createdAtMs = parseCreatedAt(task?.created_at);
         if (createdAtMs === null) {
-          complete = false;
+          attributionComplete = false;
           pageComplete = false;
           continue;
         }
@@ -2094,7 +2110,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
           task?.credit_usage ?? task?.metadata?.credit_usage ?? 0,
         );
         if (!Number.isFinite(creditUsage) || creditUsage < 0) {
-          complete = false;
+          attributionComplete = false;
           pageComplete = false;
           continue;
         }
@@ -2110,7 +2126,6 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
           ownerId,
           accountIds: accountIdSet,
         });
-        totalUsed += contribution.poolUsed;
         if (contribution.accountUsed <= 0 || ownerId === undefined) continue;
         const account = accounts.get(ownerId)!;
         account.accountUsed += contribution.accountUsed;
@@ -2211,7 +2226,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
       if (!finalized) credentialComplete = false;
     }
     if (!credentialComplete) {
-      complete = false;
+      attributionComplete = false;
     }
   }
   const ledgerUsage = await readManagedUsageLedger({
@@ -2226,12 +2241,17 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
     account.accountUsed = ledgerUsage.accountUsed.get(accountId) ?? 0;
   }
   return {
-    totalUsed: ledgerUsage.totalUsed,
+    // v2 usage.list is the authoritative balance-change history. Unlike the
+    // deprecated task list it retains consumption for deleted sessions and
+    // lets refunds reduce the displayed net usage. The local task ledger is
+    // still the source of tenant-private per-account attribution.
+    totalUsed: authoritativePoolUsage.totalUsed,
     accounts,
     fetchedAt: input.now ?? Date.now(),
     fingerprint: input.poolFingerprint ?? credentials[0]?.fingerprint ?? null,
     period,
-    complete,
+    complete: authoritativePoolUsage.complete,
+    attributionComplete,
   };
 }
 

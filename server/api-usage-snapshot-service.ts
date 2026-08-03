@@ -71,8 +71,14 @@ export function isDuplicateApiUsageSnapshotError(error: unknown) {
 type ApiUsageSnapshotSyncResult = {
   synced: number;
   failed: number;
+  retryableFailed?: number;
   finishedAt: number;
   skipped?: "already_running";
+};
+
+type ApiUsageSnapshotSyncOptions = {
+  includeWebsite?: boolean;
+  managedFingerprints?: ReadonlySet<string>;
 };
 
 type ApiUsageSnapshotLockConnection = {
@@ -495,6 +501,41 @@ export function bulkPreviousCredentialGroups(input: {
   return [...groups.values()];
 }
 
+export function syncableManagedWorkspaceUserIds(input: {
+  workspaceUserIds: number[];
+  ownershipRows: Array<{ userId: number; deliveryAdminId: number }>;
+  eligibleOwnerIds: number[];
+}) {
+  const ownerByWorkspaceUser = new Map(
+    input.ownershipRows.map((owner) => [
+      Number(owner.userId),
+      Number(owner.deliveryAdminId),
+    ]),
+  );
+  const eligibleOwnerIds = new Set(input.eligibleOwnerIds.map(Number));
+  return input.workspaceUserIds.filter((userId) => {
+    const ownerId = ownerByWorkspaceUser.get(userId);
+    return ownerId === undefined || eligibleOwnerIds.has(ownerId);
+  });
+}
+
+export function apiUsageSnapshotCompletionState(input: {
+  totalComplete: boolean;
+  attributionComplete: boolean;
+  attributionErrorCode: string;
+}) {
+  if (!input.totalComplete) {
+    return {
+      status: "error" as const,
+      errorCode: "PARTIAL_USAGE_SCAN",
+    };
+  }
+  return {
+    status: "ok" as const,
+    errorCode: input.attributionComplete ? null : input.attributionErrorCode,
+  };
+}
+
 async function scanBulkPreviousCredentialGroups(
   groups: Array<{ fingerprint: string; accountIds: Set<number> }>,
 ) {
@@ -823,8 +864,15 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
   });
 
   // Do not hold the HTTP mutation open for a second unbounded history scan
-  // after the transaction has committed. The regular snapshot worker binds
-  // retired coverage and refreshes the now-stale fingerprint snapshots.
+  // after the transaction has committed. Queue one deduplicated, targeted
+  // refresh for the new physical-Key pool; the queue shares the global named
+  // lock and retries after an overlapping full synchronization finishes.
+  if (result.updatedCount > 0) {
+    queueManagedApiUsageFingerprintRefresh({
+      actor: input.actor,
+      fingerprint: nextFingerprint,
+    });
+  }
   return result;
 }
 
@@ -846,6 +894,7 @@ export async function replaceManagedApiKeyTarget(input: {
   // One-click replacement performs a targeted old-Key scan itself. It never
   // blocks this single-account mutation on a global all-account refresh.
   await validateUpstreamApiKey(input.apiKey);
+  const nextFingerprint = getApiKeyFingerprint(input.apiKey);
   const db = await requireDb();
   const initialActiveRows = await db
     .select({ fingerprint: apiCredentials.fingerprint })
@@ -1013,17 +1062,22 @@ export async function replaceManagedApiKeyTarget(input: {
   // A post-retirement scan binds the final old-Key observation to retiredAt.
   // Failure is intentionally non-destructive: snapshots become unavailable,
   // never a misleading zero.
-  try {
-    if (!replacement.previousFingerprint) return replacement.credential;
-    await getSharedKeyMonthlyCreditUsageForAccounts({
-      credentialOwnerIds: [input.userId],
-      accountIds: [input.userId],
-      poolFingerprint: replacement.previousFingerprint,
-      windowDays: DEFAULT_API_USAGE_WINDOW_DAYS,
-    });
-  } catch {
-    // The next snapshot sync records the explicit unavailable state.
+  if (replacement.previousFingerprint) {
+    try {
+      await getSharedKeyMonthlyCreditUsageForAccounts({
+        credentialOwnerIds: [input.userId],
+        accountIds: [input.userId],
+        poolFingerprint: replacement.previousFingerprint,
+        windowDays: DEFAULT_API_USAGE_WINDOW_DAYS,
+      });
+    } catch {
+      // The next snapshot sync records the explicit unavailable state.
+    }
   }
+  queueManagedApiUsageFingerprintRefresh({
+    actor: input.actor,
+    fingerprint: nextFingerprint,
+  });
   return replacement.credential;
 }
 
@@ -1517,6 +1571,10 @@ export async function getApiUsageAlertOverview(actor: AuthenticatedUser) {
     const accountUsed = currentSnapshot
       ? Number(currentSnapshot.accountUsed ?? 0)
       : 0;
+    const attributionComplete =
+      syncStatus === "ok" &&
+      currentSnapshot?.errorCode !== "PARTIAL_ACCOUNT_ATTRIBUTION" &&
+      currentSnapshot?.errorCode !== "PARTIAL_WEBSITE_ATTRIBUTION";
     const warningRatio = policy.warningRatioBasisPoints / 10_000;
     const percentage =
       policy.limit > 0 ? Math.min(100, (used / policy.limit) * 100) : 100;
@@ -1528,6 +1586,7 @@ export async function getApiUsageAlertOverview(actor: AuthenticatedUser) {
       credentialFingerprint,
       used,
       accountUsed,
+      attributionComplete,
       limit: policy.limit,
       warningRatio,
       windowDays: DEFAULT_API_USAGE_WINDOW_DAYS,
@@ -1680,6 +1739,9 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
         : "unconfigured";
     const used = Number(currentSnapshot?.used ?? 0);
     const accountUsed = Number(currentSnapshot?.accountUsed ?? 0);
+    const accountUsageComplete =
+      syncStatus === "ok" &&
+      currentSnapshot?.errorCode !== "PARTIAL_ACCOUNT_ATTRIBUTION";
     const limit = Number(policy?.limit ?? DEFAULT_API_USAGE_LIMIT);
     const warningRatio =
       Number(policy?.warningRatioBasisPoints ?? 8_000) / 10_000;
@@ -1691,6 +1753,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
         fingerprints.credentialVersionByUser.get(userId) ?? null,
       used,
       accountUsed,
+      accountUsageComplete,
       limit,
       warningRatio,
       syncStatus,
@@ -1743,6 +1806,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
         usage.credentialOwnerId !== customerId,
       keyTotalUsed: usage.used,
       ownAgentMonthUsed: usage.accountUsed,
+      accountUsageComplete: usage.accountUsageComplete,
       otherOrUnattributedUsed: Math.max(0, usage.used - usage.accountUsed),
       fingerprint: usage.fingerprint,
       syncStatus: usage.syncStatus,
@@ -1767,6 +1831,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
       apiKeyVersion: latestCredential?.version ?? 0,
       keyTotalUsed: usage.used,
       ownAgentMonthUsed: usage.accountUsed,
+      accountUsageComplete: usage.accountUsageComplete,
       otherOrUnattributedUsed: Math.max(0, usage.used - usage.accountUsed),
       fingerprint: usage.fingerprint,
       syncStatus: usage.syncStatus,
@@ -1793,6 +1858,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
         apiKeyVersion: latestCredential?.version ?? 0,
         keyTotalUsed: usage.used,
         ownAgentMonthUsed: usage.accountUsed,
+        accountUsageComplete: usage.accountUsageComplete,
         otherOrUnattributedUsed: Math.max(0, usage.used - usage.accountUsed),
         fingerprint: usage.fingerprint,
         syncStatus: usage.syncStatus,
@@ -1830,6 +1896,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
               `用户 ${customer.id}`,
             username: customer.username,
             monthUsed: usage.accountUsed,
+            accountUsageComplete: usage.accountUsageComplete,
             fingerprint: usage.fingerprint,
             usesManagerKey,
             credentialSource: !usage.fingerprint
@@ -1882,6 +1949,7 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
           }),
         },
         ownAgentMonthUsed: managerUsage.accountUsed,
+        accountUsageComplete: managerUsage.accountUsageComplete,
         attributedUsed,
         otherOrUnattributedUsed: Math.max(0, keyPoolTotalUsed - attributedUsed),
         users: managedCustomers,
@@ -2014,7 +2082,103 @@ async function mapWithConcurrency<T>(
   );
 }
 
-async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
+type ApiUsageRefreshTimer = { unref?: () => void };
+
+export function createManagedApiUsageRefreshQueue(input: {
+  refresh: (
+    actor: AuthenticatedUser,
+    fingerprints: ReadonlySet<string>,
+  ) => Promise<ApiUsageSnapshotSyncResult>;
+  retryDelayMs?: number;
+  maxRetryDelayMs?: number;
+  maxRetryAttempts?: number;
+  schedule?: (callback: () => void, delayMs: number) => ApiUsageRefreshTimer;
+  onError?: (error: unknown) => void;
+}) {
+  const pending = new Map<
+    string,
+    { actor: AuthenticatedUser; retryAttempt: number }
+  >();
+  const retryDelayMs = input.retryDelayMs ?? 5_000;
+  const maxRetryDelayMs = input.maxRetryDelayMs ?? 60_000;
+  const maxRetryAttempts = input.maxRetryAttempts ?? 5;
+  const schedule =
+    input.schedule ??
+    ((callback: () => void, delayMs: number) => setTimeout(callback, delayMs));
+  let timer: ApiUsageRefreshTimer | null = null;
+  let running = false;
+
+  const scheduleDrain = (delayMs: number) => {
+    if (timer || running || pending.size === 0) return;
+    timer = schedule(() => {
+      timer = null;
+      void drain();
+    }, delayMs);
+    timer.unref?.();
+  };
+
+  const drain = async () => {
+    if (running || pending.size === 0) return;
+    running = true;
+    const batch = [...pending.entries()];
+    pending.clear();
+    let retry = false;
+    let nextRetryAttempt = 0;
+    try {
+      const result = await input.refresh(
+        batch[0]![1].actor,
+        new Set(batch.map(([fingerprint]) => fingerprint)),
+      );
+      retry =
+        result.skipped === "already_running" ||
+        Number(result.retryableFailed ?? 0) > 0;
+      if (retry) {
+        for (const [fingerprint, request] of batch) {
+          const retryAttempt = request.retryAttempt + 1;
+          nextRetryAttempt = Math.max(nextRetryAttempt, retryAttempt);
+          if (retryAttempt > maxRetryAttempts || pending.has(fingerprint)) {
+            continue;
+          }
+          pending.set(fingerprint, { ...request, retryAttempt });
+        }
+      }
+    } catch (error) {
+      retry = true;
+      for (const [fingerprint, request] of batch) {
+        const retryAttempt = request.retryAttempt + 1;
+        nextRetryAttempt = Math.max(nextRetryAttempt, retryAttempt);
+        if (retryAttempt > maxRetryAttempts || pending.has(fingerprint)) {
+          continue;
+        }
+        pending.set(fingerprint, { ...request, retryAttempt });
+      }
+      input.onError?.(error);
+    } finally {
+      running = false;
+      const delayMs = retry
+        ? Math.min(
+            maxRetryDelayMs,
+            retryDelayMs * 2 ** Math.max(0, nextRetryAttempt - 1),
+          )
+        : 0;
+      scheduleDrain(delayMs);
+    }
+  };
+
+  return {
+    enqueue(request: { actor: AuthenticatedUser; fingerprint: string }) {
+      const fingerprint = request.fingerprint.trim();
+      if (!fingerprint) return;
+      pending.set(fingerprint, { actor: request.actor, retryAttempt: 0 });
+      scheduleDrain(0);
+    },
+  };
+}
+
+async function syncApiUsageSnapshotsUnlocked(
+  actor: AuthenticatedUser,
+  options: ApiUsageSnapshotSyncOptions = {},
+) {
   if (!isSystemAdmin(actor)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
@@ -2046,7 +2210,8 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
   const now = new Date();
   let synced = 0;
   let failed = 0;
-  if (isSystemAdmin(actor)) {
+  let retryableFailed = 0;
+  if (isSystemAdmin(actor) && options.includeWebsite !== false) {
     const policy = await ensureUsagePolicy({
       executor: db,
       scope: "website_frontend",
@@ -2073,14 +2238,19 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
           DEFAULT_API_USAGE_WINDOW_DAYS,
           now.getTime(),
         );
+        const completion = apiUsageSnapshotCompletionState({
+          totalComplete: usage.complete,
+          attributionComplete: usage.attributionComplete,
+          attributionErrorCode: "PARTIAL_WEBSITE_ATTRIBUTION",
+        });
         await upsertSnapshot({
           executor: db,
           policy,
           credentialFingerprint: fingerprints.website,
           used: usage.keyTotalUsed,
           accountUsed: usage.websiteUsed,
-          status: usage.complete ? "ok" : "error",
-          errorCode: usage.complete ? null : "PARTIAL_TASK_SCAN",
+          status: completion.status,
+          errorCode: completion.errorCode,
           windowStartedAt: new Date(
             getShanghaiRollingUsagePeriod(
               DEFAULT_API_USAGE_WINDOW_DAYS,
@@ -2091,7 +2261,7 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
           syncToken: websiteSyncToken,
         });
         synced += 1;
-        if (!usage.complete) failed += 1;
+        if (!usage.complete || !usage.attributionComplete) failed += 1;
       } catch (error) {
         await upsertSnapshot({
           executor: db,
@@ -2104,6 +2274,7 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
           syncToken: websiteSyncToken,
         });
         failed += 1;
+        retryableFailed += 1;
       }
     }
   }
@@ -2129,15 +2300,13 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
           })
           .from(userUsageOwners)
           .where(inArray(userUsageOwners.userId, workspaceUserIds));
-  const ownerByWorkspaceUser = new Map(
-    allWorkspaceOwnershipRows.map((owner: any) => [
-      Number(owner.userId),
-      Number(owner.deliveryAdminId),
-    ]),
-  );
-  const syncableWorkspaceUserIds = workspaceUserIds.filter((userId) => {
-    const ownerId = ownerByWorkspaceUser.get(userId);
-    return ownerId === undefined || deliveryAdminIds.includes(ownerId);
+  const syncableWorkspaceUserIds = syncableManagedWorkspaceUserIds({
+    workspaceUserIds,
+    ownershipRows: allWorkspaceOwnershipRows,
+    // A customer's usage owner may be either a delivery administrator or a
+    // system administrator. Excluding the latter left that customer's policy
+    // permanently without a snapshot.
+    eligibleOwnerIds: [...deliveryAdminIds, ...systemAdministratorIds],
   });
   const accountIds = [
     ...new Set([
@@ -2147,30 +2316,6 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
       ...deliveryEngineerIds,
     ]),
   ];
-  const policyEntries = await Promise.all(
-    accountIds.map(async (accountId) => ({
-      accountId,
-      policy: await ensureUsagePolicy({
-        executor: db,
-        scope: "managed_user",
-        workspaceUserId: accountId,
-      }),
-    })),
-  );
-  const policyByAccount = new Map(
-    policyEntries.map((entry) => [entry.accountId, entry.policy]),
-  );
-  const syncTokenByAccount = new Map(
-    await Promise.all(
-      policyEntries.map(
-        async ({ accountId, policy }) =>
-          [
-            accountId,
-            await claimUsageSnapshotRefresh({ executor: db, policy, now }),
-          ] as const,
-      ),
-    ),
-  );
   const accountIdsByCredential = new Map<
     string,
     {
@@ -2203,11 +2348,44 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
     grouped.accountIds.push(accountId);
     accountIdsByCredential.set(poolKey, grouped);
   }
-  await Promise.all(
-    unconfiguredAccountIds.map((accountId) =>
-      upsertSnapshot({
+  const credentialGroups = [...accountIdsByCredential.values()].filter(
+    (group) =>
+      !options.managedFingerprints ||
+      options.managedFingerprints.has(group.fingerprint),
+  );
+  const selectedUnconfiguredAccountIds = options.managedFingerprints
+    ? []
+    : unconfiguredAccountIds;
+  const selectedAccountIds = [
+    ...new Set([
+      ...selectedUnconfiguredAccountIds,
+      ...credentialGroups.flatMap((group) => group.accountIds),
+    ]),
+  ];
+  const policyEntries = await Promise.all(
+    selectedAccountIds.map(async (accountId) => ({
+      accountId,
+      policy: await ensureUsagePolicy({
         executor: db,
-        policy: policyByAccount.get(accountId)!,
+        scope: "managed_user",
+        workspaceUserId: accountId,
+      }),
+    })),
+  );
+  const policyByAccount = new Map(
+    policyEntries.map((entry) => [entry.accountId, entry.policy]),
+  );
+  await Promise.all(
+    selectedUnconfiguredAccountIds.map(async (accountId) => {
+      const policy = policyByAccount.get(accountId)!;
+      const syncToken = await claimUsageSnapshotRefresh({
+        executor: db,
+        policy,
+        now,
+      });
+      return upsertSnapshot({
+        executor: db,
+        policy,
         credentialFingerprint: null,
         used: 0,
         accountUsed: 0,
@@ -2219,26 +2397,44 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
           ).startAt,
         ),
         now,
-        syncToken: syncTokenByAccount.get(accountId),
-      }),
-    ),
+        syncToken,
+      });
+    }),
   );
   await mapWithConcurrency(
-    [...accountIdsByCredential.values()],
+    credentialGroups,
     API_USAGE_SCAN_CONCURRENCY,
     async ({
       fingerprint,
       credentialOwnerIds,
       accountIds: groupedAccountIds,
     }) => {
+      // Claim only the pool that is about to be scanned. With serialized pool
+      // scans, claiming every policy up front made later accounts look stuck
+      // in "pending" for the duration of unrelated scans.
+      const syncTokenByAccount = new Map(
+        await Promise.all(
+          groupedAccountIds.map(async (accountId) => {
+            const policy = policyByAccount.get(accountId)!;
+            return [
+              accountId,
+              await claimUsageSnapshotRefresh({ executor: db, policy, now }),
+            ] as const;
+          }),
+        ),
+      );
       try {
-        const policy = policyByAccount.get(groupedAccountIds[0]!)!;
         const usage = await getSharedKeyMonthlyCreditUsageForAccounts({
           credentialOwnerIds: [...credentialOwnerIds],
           accountIds: groupedAccountIds,
           poolFingerprint: fingerprint,
           now: now.getTime(),
           windowDays: DEFAULT_API_USAGE_WINDOW_DAYS,
+        });
+        const completion = apiUsageSnapshotCompletionState({
+          totalComplete: usage.complete,
+          attributionComplete: usage.attributionComplete,
+          attributionErrorCode: "PARTIAL_ACCOUNT_ATTRIBUTION",
         });
         await Promise.all(
           groupedAccountIds.map((accountId) =>
@@ -2248,8 +2444,8 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
               credentialFingerprint: fingerprints.byUser.get(accountId) ?? null,
               used: usage.totalUsed,
               accountUsed: usage.accounts.get(accountId)?.accountUsed ?? 0,
-              status: usage.complete ? "ok" : "error",
-              errorCode: usage.complete ? null : "PARTIAL_TASK_SCAN",
+              status: completion.status,
+              errorCode: completion.errorCode,
               windowStartedAt: new Date(usage.period.startAt),
               now,
               syncToken: syncTokenByAccount.get(accountId),
@@ -2257,7 +2453,7 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
           ),
         );
         synced += 1;
-        if (!usage.complete) failed += 1;
+        if (!usage.complete || !usage.attributionComplete) failed += 1;
       } catch (error) {
         await Promise.all(
           groupedAccountIds.map((accountId) =>
@@ -2281,10 +2477,11 @@ async function syncApiUsageSnapshotsUnlocked(actor: AuthenticatedUser) {
           ),
         );
         failed += 1;
+        retryableFailed += 1;
       }
     },
   );
-  return { synced, failed, finishedAt: Date.now() };
+  return { synced, failed, retryableFailed, finishedAt: Date.now() };
 }
 
 export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
@@ -2297,6 +2494,30 @@ export async function syncApiUsageSnapshots(actor: AuthenticatedUser) {
   return runApiUsageSnapshotSyncWithLock({
     sync: () => syncApiUsageSnapshotsUnlocked(actor),
   });
+}
+
+const managedApiUsageRefreshQueue = createManagedApiUsageRefreshQueue({
+  refresh: (actor, fingerprints) =>
+    runApiUsageSnapshotSyncWithLock({
+      sync: () =>
+        syncApiUsageSnapshotsUnlocked(actor, {
+          includeWebsite: false,
+          managedFingerprints: fingerprints,
+        }),
+    }),
+  onError: (error) => {
+    console.error(
+      "[API usage snapshot] Targeted managed-Key sync failed",
+      runtimeErrorForLog(error),
+    );
+  },
+});
+
+function queueManagedApiUsageFingerprintRefresh(input: {
+  actor: AuthenticatedUser;
+  fingerprint: string;
+}) {
+  managedApiUsageRefreshQueue.enqueue(input);
 }
 
 export async function updateApiUsagePolicy(input: {
