@@ -343,13 +343,16 @@ mysqlDescribe("knowledge-base real MySQL state-machine acceptance", () => {
       .where(eq(apiUsagePolicies.id, policyId));
     expect(policy).toBeDefined();
 
-    const firstNow = new Date(Date.now() - 10_000);
+    // MySQL TIMESTAMP without fractional precision rounds sub-second values.
+    // Use exact seconds so this concurrency assertion is deterministic.
+    const baseNowMs = Math.floor(Date.now() / 1_000) * 1_000;
+    const firstNow = new Date(baseNowMs - 10_000);
     const firstToken = await claimUsageSnapshotRefresh({
       executor,
       policy: policy!,
       now: firstNow,
     });
-    const secondNow = new Date(Date.now() - 5_000);
+    const secondNow = new Date(baseNowMs - 5_000);
     const secondToken = await claimUsageSnapshotRefresh({
       executor,
       policy: policy!,
