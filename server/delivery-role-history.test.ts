@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  assertDeliveryCompletionSummary,
+  assertGenericDeliveryTicketTransition,
+  deliveryExecutionActorRole,
+  deriveDeliveryExecutionTransition,
   deliveryTicketActionRank,
   deliveryTicketDependencyState,
   deliveryHistoryTimestamp,
@@ -73,6 +77,103 @@ describe("my delivery ticket pool", () => {
       getMyDeliveryTickets({
         actor: { id: 9, role: "user" } as any,
       }),
-    ).rejects.toThrow("该工单池仅对工程师开放");
+    ).rejects.toThrow("该工单池仅对工程师或系统管理员开放");
+  });
+});
+
+describe("delivery execution authorization and settlement", () => {
+  it("allows engineers and system admins while excluding delivery admins", () => {
+    expect(
+      deliveryExecutionActorRole({
+        role: "delivery_member",
+        username: "engineer",
+      } as any),
+    ).toBe("delivery_member");
+    expect(
+      deliveryExecutionActorRole({
+        role: "admin",
+        username: "root-admin",
+        adminAccessLevel: "system_admin",
+      } as any),
+    ).toBe("admin");
+    expect(
+      deliveryExecutionActorRole({
+        role: "admin",
+        username: "delivery-admin",
+        adminAccessLevel: "delivery_admin",
+      } as any),
+    ).toBeNull();
+  });
+
+  it("consumes reserved quota on execution and records the first schedule", () => {
+    const now = new Date("2026-08-04T08:00:00.000Z");
+
+    expect(
+      deriveDeliveryExecutionTransition({
+        currentQuotaState: "reserved",
+        scheduledAt: null,
+        quotaReleasedAt: null,
+        technicalDedupeKey: "ticket:42",
+        nextStatus: "in_progress",
+        now,
+      }),
+    ).toEqual({
+      quotaState: "consumed",
+      scheduledAt: now,
+      quotaReleasedAt: null,
+      technicalDedupeKey: "ticket:42",
+      resolvedAt: null,
+    });
+  });
+
+  it("releases an unused reservation and clears terminal dedupe state", () => {
+    const now = new Date("2026-08-04T08:00:00.000Z");
+
+    expect(
+      deriveDeliveryExecutionTransition({
+        currentQuotaState: "reserved",
+        scheduledAt: null,
+        quotaReleasedAt: null,
+        technicalDedupeKey: "ticket:42",
+        nextStatus: "cancelled",
+        now,
+      }),
+    ).toEqual({
+      quotaState: "released",
+      scheduledAt: null,
+      quotaReleasedAt: now,
+      technicalDedupeKey: null,
+      resolvedAt: now,
+    });
+  });
+
+  it("reserves website style completion for customer sample selection", () => {
+    expect(() =>
+      assertGenericDeliveryTicketTransition({
+        operation: "website_style_samples",
+        nextStatus: "completed",
+      }),
+    ).toThrow("必须由客户通过专用选择操作确认");
+    expect(() =>
+      assertGenericDeliveryTicketTransition({
+        operation: "website_style_samples",
+        nextStatus: "in_progress",
+      }),
+    ).not.toThrow();
+  });
+
+  it("requires a non-empty customer result summary on completion", () => {
+    expect(() =>
+      assertDeliveryCompletionSummary({
+        nextStatus: "completed",
+        message: "   ",
+      }),
+    ).toThrow("客户可见的结果摘要");
+    expect(() =>
+      assertDeliveryCompletionSummary({
+        nextStatus: "completed",
+        message: "已完成交付并核验结果。",
+      }),
+    ).not.toThrow();
   });
 });

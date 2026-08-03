@@ -400,7 +400,9 @@ export default function AdminDeliveryDispatch() {
 
         <div className="mb-4 rounded-xl border border-primary/20 bg-primary/[0.035] px-4 py-3 text-sm leading-6 text-muted-foreground">
           <strong className="text-foreground">分配规则：</strong>
-          工单根据客户项目团队与岗位自动分配给对应工程师。管理员可跨客户筛选并查看详情，但不能手动分配、调整优先级、催办或代替工程师完成工单。
+          {systemAdmin
+            ? "工单根据客户项目团队与岗位自动分配给对应工程师；系统管理员可从工单详情进入完整处理工作台进行异常接管。"
+            : "工单根据客户项目团队与岗位自动分配给对应工程师；交付管理员可查看详情、沟通和协调，但不能代替工程师完成工单。"}
         </div>
         <Card>
           <CardHeader>

@@ -109,6 +109,20 @@ export function canAccessAdminRoutes(
   return Boolean(user && hasExplicitAdminRole(user));
 }
 
+export function canAccessSystemAdminRoutes(
+  user:
+    | {
+        role: "user" | "admin" | "delivery_member";
+        adminAccessLevel?: "system_admin" | "delivery_admin" | null;
+      }
+    | null
+    | undefined,
+) {
+  return Boolean(
+    user?.role === "admin" && user.adminAccessLevel === "system_admin",
+  );
+}
+
 function AdminOnly({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
   return canAccessAdminRoutes(user) ? children : <Redirect to="/" />;
@@ -116,7 +130,7 @@ function AdminOnly({ children }: { children: React.ReactNode }) {
 
 function SystemAdminOnly({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
-  return isSystemAdminAccount(user) ? children : <Redirect to="/" />;
+  return canAccessSystemAdminRoutes(user) ? children : <Redirect to="/" />;
 }
 
 function DeliveryAdminOnly({ children }: { children: React.ReactNode }) {
@@ -194,6 +208,11 @@ function Router() {
         <AdminOnly>
           <AdminDeliveryDispatch />
         </AdminOnly>
+      </Route>
+      <Route path={"/admin/delivery-workbench"}>
+        <SystemAdminOnly>
+          <DeliveryMemberDashboard customerWorkbench systemAdminMode />
+        </SystemAdminOnly>
       </Route>
       <Route path={"/delivery/agent"}>
         <DeliveryMemberOnly>

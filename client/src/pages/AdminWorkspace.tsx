@@ -944,7 +944,9 @@ export default function AdminWorkspace({
                     />
                   ) : (
                     <PortalCard className="p-8 text-center text-sm text-[#716a80]">
-                      该客户尚未发布正式用户页面；请先确认项目岗位是否已配齐，并协调对应工程师处理。
+                      {isSystemAdmin
+                        ? "该客户尚未发布正式用户页面；请先确认项目岗位是否已配齐，也可在客户工单中进入系统管理员处理工作台接管。"
+                        : "该客户尚未发布正式用户页面；请先确认项目岗位是否已配齐，并协调对应工程师处理。"}
                     </PortalCard>
                   )}
                 </div>

@@ -75,7 +75,7 @@ export default function DeliveryWorkflowGuide({
         <div>
           <h2 className="font-semibold">项目交付协作链</h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-            管理员负责配齐岗位、确认负责人和协调异常；工程师只在自己的岗位工单中执行并交付。
+            交付管理员负责配齐岗位、确认负责人和协调异常；工程师负责岗位工单执行，系统管理员可在异常场景接管处理。
           </p>
         </div>
         <Badge variant="outline" className="w-fit shrink-0">

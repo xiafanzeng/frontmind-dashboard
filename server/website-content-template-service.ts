@@ -37,6 +37,7 @@ type WebsiteContentTicketRow = Pick<
   | "quotaPeriodId"
   | "type"
   | "quotaPool"
+  | "workflowDomain"
   | "category"
   | "topic"
   | "title"
@@ -75,6 +76,25 @@ export type WebsiteContentTemplatePreview = {
   preflightExpiresAt?: string;
 };
 
+function assertNoRoleOwnedTemplateCompletion(input: {
+  rows: WebsiteContentTicketRow[];
+  changes: WebsiteContentTemplateDiffRow[];
+}) {
+  const rowsById = new Map(input.rows.map((row) => [row.id, row]));
+  const roleOwnedCompletion = input.changes.find(
+    (change) =>
+      change.change === "complete" &&
+      Boolean(rowsById.get(change.ticketId)?.workflowDomain),
+  );
+  if (roleOwnedCompletion) {
+    throw new WebsiteContentTemplateError(
+      "WEBSITE_CONTENT_TEMPLATE_ROLE_WORKBENCH_REQUIRED",
+      `工单 ${roleOwnedCompletion.ticketId} 已进入岗位工作流，请在系统管理员完整处理工作台中按岗位规则完成。`,
+      409,
+    );
+  }
+}
+
 export class WebsiteContentTemplateError extends Error {
   constructor(
     readonly code:
@@ -86,6 +106,7 @@ export class WebsiteContentTemplateError extends Error {
       | "WEBSITE_CONTENT_TEMPLATE_REOPEN_NOT_ALLOWED"
       | "WEBSITE_CONTENT_TEMPLATE_SUMMARY_REQUIRES_COMPLETION"
       | "WEBSITE_CONTENT_TEMPLATE_SUMMARY_REQUIRED"
+      | "WEBSITE_CONTENT_TEMPLATE_ROLE_WORKBENCH_REQUIRED"
       | "WEBSITE_CONTENT_TEMPLATE_NO_CHANGES",
     message: string,
     readonly statusCode = 409,
@@ -154,6 +175,7 @@ async function loadWebsiteContentTicketRows(
       quotaPeriodId: deliveryTickets.quotaPeriodId,
       type: deliveryTickets.type,
       quotaPool: deliveryTickets.quotaPool,
+      workflowDomain: deliveryTickets.workflowDomain,
       category: deliveryTickets.category,
       topic: deliveryTickets.topic,
       title: deliveryTickets.title,
@@ -344,6 +366,10 @@ export async function previewWebsiteContentTemplate(input: {
     rows,
     fileHash: input.fileHash,
   });
+  assertNoRoleOwnedTemplateCompletion({
+    rows,
+    changes: preview.changes,
+  });
   if (preview.totals.changed === 0) return preview;
   const credential = await issueDashboardImportPreflight({
     binding: {
@@ -386,6 +412,11 @@ export async function publishWebsiteContentTemplate(input: {
         400,
       );
     }
+    assertNoRoleOwnedTemplateCompletion({
+      rows,
+      changes: preview.changes,
+    });
+    const rowsById = new Map(rows.map((row) => [row.id, row]));
     await consumeDashboardImportPreflight({
       token: input.preflightToken,
       binding: {
@@ -397,7 +428,6 @@ export async function publishWebsiteContentTemplate(input: {
       },
       store: dashboardImportPreflightStoreForExecutor(tx),
     });
-    const rowsById = new Map(rows.map((row) => [row.id, row]));
     const now = new Date();
     const revisions: Array<{ ticketId: string; revision: number }> = [];
     for (const change of changed) {

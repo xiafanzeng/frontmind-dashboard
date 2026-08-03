@@ -168,12 +168,14 @@ vi.mock("@/components/PortalShell", () => ({
   default: ({
     eyebrow,
     title,
+    navItems,
     roleLabel,
     toolbar,
     children,
   }: {
     eyebrow?: string;
     title?: string;
+    navItems?: Array<{ label: string }>;
     roleLabel?: string;
     toolbar?: React.ReactNode;
     children?: React.ReactNode;
@@ -181,6 +183,9 @@ vi.mock("@/components/PortalShell", () => ({
     <main>
       <span>{eyebrow}</span>
       <h1>{title}</h1>
+      <span data-testid="portal-nav-labels">
+        {navItems?.map((item) => item.label).join("|")}
+      </span>
       {roleLabel && <p data-testid="project-role-label">{roleLabel}</p>}
       {toolbar && <div data-testid="portal-toolbar">{toolbar}</div>}
       {children}
@@ -190,6 +195,13 @@ vi.mock("@/components/PortalShell", () => ({
 
 vi.mock("@/pages/AdminDashboard", () => ({
   channelDistributionUrl: "/dashboard?section=channel-distribution",
+  getAdminNav: () => [
+    {
+      label: "客户交付工作台",
+      href: "/admin/workspace",
+      icon: () => null,
+    },
+  ],
   issueMonitorUrl: "/dashboard?section=issue-monitor",
 }));
 
@@ -217,6 +229,7 @@ describe("DeliveryMemberDashboard project context", () => {
       handoffTicketIds: [],
     });
     vi.mocked(sessionStorage.getItem).mockReturnValue(null);
+    window.history.replaceState({}, "", "/");
   });
 
   it("places role tools in the left navigation and limits them by role", () => {
@@ -274,7 +287,7 @@ describe("DeliveryMemberDashboard project context", () => {
       "utf8",
     );
     const workbenchSource = source.slice(
-      source.indexOf("function CustomerWorkbenchView()"),
+      source.indexOf("function CustomerWorkbenchView("),
       source.indexOf("const TERMINAL_STATUS_LABELS"),
     );
 
@@ -582,6 +595,65 @@ describe("DeliveryMemberDashboard project context", () => {
     );
   });
 
+  it("opens the requested project first in system-administrator mode", async () => {
+    mocks.assignments = [
+      {
+        projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+        customerUserId: 101,
+        customerName: "客户甲",
+        customerUsername: "customer-a",
+        roleType: "ai_operations_engineer",
+      },
+      {
+        projectAssignmentId: "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+        customerUserId: 202,
+        customerName: "客户乙",
+        customerUsername: "customer-b",
+        roleType: "content_distribution_engineer",
+      },
+    ];
+    vi.mocked(sessionStorage.getItem).mockReturnValue(
+      "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+    );
+    window.history.replaceState(
+      {},
+      "",
+      "/admin/delivery-workbench?projectAssignmentId=2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+    );
+
+    render(<DeliveryMemberDashboard customerWorkbench systemAdminMode />);
+
+    expect(
+      screen.getByRole("heading", { name: "系统管理员处理工作台" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("系统管理员 · 工单处理")).toBeInTheDocument();
+    expect(screen.getByTestId("portal-nav-labels")).toHaveTextContent(
+      "客户交付工作台",
+    );
+    expect(screen.getByTestId("portal-nav-labels")).not.toHaveTextContent(
+      "我的工单",
+    );
+    expect(screen.getByRole("link", { name: "返回客户工单" })).toHaveAttribute(
+      "href",
+      "/admin/workspace",
+    );
+    expect(screen.getByRole("combobox", { name: "当前客户项目" })).toHaveValue(
+      "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+    );
+    expect(sessionStorage.setItem).toHaveBeenCalledWith(
+      DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+      "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+    );
+    await waitFor(() =>
+      expect(mocks.workbenchUseQuery).toHaveBeenLastCalledWith(
+        {
+          projectAssignmentId: "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+        },
+        { enabled: true },
+      ),
+    );
+  });
+
   it("keeps the customer workbench focused on preview and only exposes the selected project's actions", async () => {
     mocks.assignments = [
       {
@@ -745,6 +817,7 @@ describe("DeliveryMemberDashboard project context", () => {
     ).not.toBeInTheDocument();
     expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({
       customerUserId: 101,
+      projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
       statusGroup: "pending",
       limit: 50,
     });

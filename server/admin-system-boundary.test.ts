@@ -84,6 +84,34 @@ describe("system administrator boundary", () => {
         }),
     ],
     [
+      "complete a customer delivery ticket",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.deliveryTickets.update({
+          userId: 7,
+          ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+          expectedRevision: 1,
+          status: "completed",
+          publicSummary: "已完成并核对交付结果。",
+        }),
+    ],
+    [
+      "record a customer delivery operation",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.deliveryTickets.recordDelivery({
+          userId: 7,
+          ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+          expectedRevision: 1,
+          clientRequestId: "cc2dfdc7-50e1-4bba-a593-fc38a6254d4d",
+          result: {
+            platform: "FrontMind",
+            targetUrl: "https://example.com/delivery-result",
+            executedAt: Date.parse("2026-07-26T08:00:00.000Z"),
+            resultStatus: "success",
+          },
+          attachments: [],
+        }),
+    ],
+    [
       "reset any password",
       (caller: ReturnType<typeof adminRouter.createCaller>) =>
         caller.users.resetPassword({

@@ -13,6 +13,7 @@ import {
   Download,
   ExternalLink,
   RefreshCw,
+  ArrowLeft,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -51,6 +52,7 @@ import {
 } from "@/lib/frontmind-api";
 import {
   channelDistributionUrl,
+  getAdminNav,
   issueMonitorUrl,
 } from "@/pages/AdminDashboard";
 import {
@@ -333,20 +335,39 @@ function businessModuleBatchLabel(
 
 export default function DeliveryMemberDashboard({
   customerWorkbench = false,
+  systemAdminMode = false,
 }: {
   /** The old taskHistory prop was removed: /delivery/tasks now aliases /. */
   customerWorkbench?: boolean;
+  /** Lets a system administrator use the full role-owned ticket workbench. */
+  systemAdminMode?: boolean;
 }) {
-  return customerWorkbench ? <CustomerWorkbenchView /> : <MyTicketsView />;
+  return customerWorkbench || systemAdminMode ? (
+    <CustomerWorkbenchView systemAdminMode={systemAdminMode} />
+  ) : (
+    <MyTicketsView />
+  );
 }
 
-function CustomerWorkbenchView() {
+function CustomerWorkbenchView({
+  systemAdminMode = false,
+}: {
+  systemAdminMode?: boolean;
+}) {
   const assignmentsQuery = trpc.delivery.mine.assignments.useQuery();
-  const [projectAssignmentId, setProjectAssignmentId] = useState(() =>
-    typeof window === "undefined"
-      ? ""
-      : sessionStorage.getItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY) || "",
-  );
+  const [projectAssignmentId, setProjectAssignmentId] = useState(() => {
+    if (typeof window === "undefined") return "";
+    const requestedProjectAssignmentId = systemAdminMode
+      ? new URLSearchParams(window.location.search)
+          .get("projectAssignmentId")
+          ?.trim()
+      : "";
+    return (
+      requestedProjectAssignmentId ||
+      sessionStorage.getItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY) ||
+      ""
+    );
+  });
   const currentAssignment = assignmentsQuery.data?.find(
     (assignment) => assignment.projectAssignmentId === projectAssignmentId,
   );
@@ -369,8 +390,15 @@ function CustomerWorkbenchView() {
         nextProjectAssignmentId,
       );
       setProjectAssignmentId(nextProjectAssignmentId);
+      return;
     }
-  }, [assignmentsQuery.data, projectAssignmentId]);
+    if (systemAdminMode) {
+      sessionStorage.setItem(
+        DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+        projectAssignmentId,
+      );
+    }
+  }, [assignmentsQuery.data, projectAssignmentId, systemAdminMode]);
   const workbench = trpc.delivery.mine.workbench.useQuery(
     { projectAssignmentId },
     { enabled: Boolean(currentAssignment) },
@@ -378,6 +406,7 @@ function CustomerWorkbenchView() {
   const customerActionTickets = trpc.delivery.mine.tickets.useInfiniteQuery(
     {
       customerUserId: currentAssignment?.customerUserId ?? 1,
+      projectAssignmentId: currentAssignment?.projectAssignmentId,
       statusGroup: "pending",
       limit: 50,
     },
@@ -417,13 +446,34 @@ function CustomerWorkbenchView() {
       ),
     [workbench.data?.customerQuestions],
   );
-  const currentNav = deliveryMemberNavForRole(currentAssignment?.roleType);
+  const currentNav = systemAdminMode
+    ? getAdminNav(true)
+    : deliveryMemberNavForRole(currentAssignment?.roleType);
+  const shellEyebrow = systemAdminMode
+    ? "系统管理员 · 工单处理"
+    : "工程师 · 客户工作台";
+  const shellTitle = systemAdminMode
+    ? "系统管理员处理工作台"
+    : "我的客户工作台";
+  const shellToolbar = systemAdminMode ? (
+    <Button asChild size="sm" variant="outline">
+      <a href="/admin/workspace">
+        <ArrowLeft className="h-4 w-4" />
+        返回客户工单
+      </a>
+    </Button>
+  ) : undefined;
   const projectSelector = assignmentsQuery.data?.length ? (
     <select
       aria-label="当前客户项目"
       className="h-10 w-full rounded-md border bg-card px-3 text-sm"
       value={projectAssignmentId}
       onChange={(event) => {
+        if (systemAdminMode && typeof window !== "undefined") {
+          const url = new URL(window.location.href);
+          url.searchParams.set("projectAssignmentId", event.target.value);
+          window.history.replaceState({}, "", url);
+        }
         sessionStorage.setItem(
           DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
           event.target.value,
@@ -446,9 +496,10 @@ function CustomerWorkbenchView() {
   if (assignmentsQuery.error) {
     return (
       <PortalShell
-        eyebrow="工程师"
-        title="我的客户工作台"
+        eyebrow={shellEyebrow}
+        title={shellTitle}
         navItems={currentNav}
+        toolbar={shellToolbar}
       >
         <Card className="mx-auto max-w-xl">
           <CardContent className="py-14 text-center">
@@ -474,9 +525,10 @@ function CustomerWorkbenchView() {
   if (assignmentsQuery.isLoading) {
     return (
       <PortalShell
-        eyebrow="工程师"
-        title="我的客户工作台"
+        eyebrow={shellEyebrow}
+        title={shellTitle}
         navItems={currentNav}
+        toolbar={shellToolbar}
       >
         <Card className="mx-auto max-w-xl">
           <CardContent className="py-14 text-center text-sm text-muted-foreground">
@@ -491,15 +543,18 @@ function CustomerWorkbenchView() {
   if (!assignmentsQuery.isLoading && !assignmentsQuery.data?.length) {
     return (
       <PortalShell
-        eyebrow="工程师"
-        title="我的客户工作台"
+        eyebrow={shellEyebrow}
+        title={shellTitle}
         navItems={currentNav}
+        toolbar={shellToolbar}
       >
         <Card className="mx-auto max-w-xl">
           <CardContent className="py-14 text-center">
             <Users className="mx-auto h-8 w-8 text-muted-foreground" />
             <p className="mt-4 font-medium">
-              尚未分配客户项目，请联系交付管理员
+              {systemAdminMode
+                ? "当前没有可处理的客户项目"
+                : "尚未分配客户项目，请联系交付管理员"}
             </p>
           </CardContent>
         </Card>
@@ -510,9 +565,10 @@ function CustomerWorkbenchView() {
   if (currentAssignment && workbench.error) {
     return (
       <PortalShell
-        eyebrow="工程师 · 客户工作台"
-        title="我的客户工作台"
+        eyebrow={shellEyebrow}
+        title={shellTitle}
         navItems={currentNav}
+        toolbar={shellToolbar}
         roleLabel={`${currentAssignment.customerName || currentAssignment.customerUsername} · ${DELIVERY_ROLE_LABELS[currentAssignment.roleType]}`}
       >
         <Card className="mx-auto max-w-xl">
@@ -556,9 +612,10 @@ function CustomerWorkbenchView() {
 
   return (
     <PortalShell
-      eyebrow="工程师 · 客户工作台"
-      title="我的客户工作台"
+      eyebrow={shellEyebrow}
+      title={shellTitle}
       navItems={currentNav}
+      toolbar={shellToolbar}
       roleLabel={
         currentAssignment
           ? `${currentAssignment.customerName || currentAssignment.customerUsername} · ${DELIVERY_ROLE_LABELS[currentAssignment.roleType]}`
@@ -579,7 +636,9 @@ function CustomerWorkbenchView() {
                   "当前客户"}
               </p>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                在下方直接提交或修改当前岗位的交付内容，并预览客户最终看到的正式看板。
+                {systemAdminMode
+                  ? "以系统管理员身份处理当前岗位工单，并预览客户最终看到的正式看板。"
+                  : "在下方直接提交或修改当前岗位的交付内容，并预览客户最终看到的正式看板。"}
               </p>
             </div>
           </CardContent>
@@ -643,6 +702,7 @@ function CustomerWorkbenchView() {
                             currentAssignment.projectAssignmentId
                           }
                           requestId={ticket.clientRequestId}
+                          systemAdminMode={systemAdminMode}
                           onDone={refreshCustomerActionsAndPreview}
                         />
                       )}
@@ -2534,7 +2594,7 @@ function DeliveryCompletionDialog({
           {websiteContentOperation && (
             <CompletionField
               label="本页面绑定的内容资产 ID"
-              description="只能填写已经由内容分发工程师完成发布的资产 ID。"
+              description="只能填写已通过内容分发岗位工单完成发布的资产 ID。"
               required
             >
               <textarea
@@ -2715,10 +2775,12 @@ function CompletionField({
 function KnowledgeResetDecision({
   projectAssignmentId,
   requestId,
+  systemAdminMode = false,
   onDone,
 }: {
   projectAssignmentId: string;
   requestId: string;
+  systemAdminMode?: boolean;
   onDone: () => Promise<unknown>;
 }) {
   const [open, setOpen] = useState(false);
@@ -2774,8 +2836,9 @@ function KnowledgeResetDecision({
           <DialogHeader>
             <DialogTitle>知识库重置审批</DialogTitle>
             <DialogDescription>
-              只有该客户当前负责的 AI 运维工程师可以执行。批准后正文、
-              历史快照和上传文件内容不会保留。
+              {systemAdminMode
+                ? "系统管理员正在以异常接管身份执行。批准后正文、历史快照和上传文件内容不会保留。"
+                : "只有该客户当前负责的 AI 运维工程师可以执行。批准后正文、历史快照和上传文件内容不会保留。"}
             </DialogDescription>
           </DialogHeader>
           {preview.isLoading ? (

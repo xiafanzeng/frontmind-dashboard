@@ -60,6 +60,7 @@ export const deliveryRoleRouter = router({
         z
           .object({
             customerUserId: z.number().int().positive().optional(),
+            projectAssignmentId: z.string().uuid().optional(),
             statusGroup: z.enum(["pending", "completed"]).optional(),
             limit: z.number().int().min(1).max(100).default(50),
             cursor: z

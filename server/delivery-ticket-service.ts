@@ -69,10 +69,7 @@ import {
   WEBSITE_CONTENT_CATALOG,
   contentAssetMediaOptionsForMarketEdition,
 } from "../shared/delivery-catalog";
-import {
-  DELIVERY_ROLE_LABELS,
-  type DeliveryRoleType,
-} from "../shared/delivery-roles";
+import type { DeliveryRoleType } from "../shared/delivery-roles";
 import type { AuthenticatedUser } from "./auth-service";
 import { getDb } from "./db";
 import { assertWorkspaceAccess, isSystemAdmin } from "./dashboard-service";
@@ -81,14 +78,22 @@ import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { DeliveryTicketError } from "./delivery-ticket-error";
 export { DeliveryTicketError } from "./delivery-ticket-error";
 
-export function assertManagedTicketCanBeExecutedByAdmin(ticket: {
-  workflowDomain?: DeliveryRoleType | null;
+export function assertManagedTicketCanBeExecutedByAdmin(input: {
+  actor: Pick<AuthenticatedUser, "role" | "username" | "adminAccessLevel">;
+  ticket: { workflowDomain?: DeliveryRoleType | null };
 }) {
-  if (!ticket.workflowDomain) return;
+  if (!isSystemAdmin(input.actor)) {
+    throw new DeliveryTicketError(
+      "DELIVERY_ADMIN_TICKET_EXECUTION_FORBIDDEN",
+      "只有系统管理员或对应岗位工程师可以处理工单；交付管理员仅负责查看、沟通与协调。",
+      403,
+    );
+  }
+  if (!input.ticket.workflowDomain) return;
   throw new DeliveryTicketError(
-    "ROLE_OWNED_TICKET_ADMIN_EXECUTION_FORBIDDEN",
-    `该工单已由${DELIVERY_ROLE_LABELS[ticket.workflowDomain]}负责，请在对应工程师工作台完成执行与交付；管理员仅负责协调、催办和异常治理。`,
-    403,
+    "ROLE_OWNED_TICKET_REQUIRES_WORKBENCH",
+    "岗位工单必须在系统管理员完整处理工作台中按对应岗位规则执行。",
+    409,
   );
 }
 
@@ -2880,7 +2885,10 @@ export async function updateManagedDeliveryTicket(input: {
       input.value.ticketId,
       true,
     );
-    assertManagedTicketCanBeExecutedByAdmin(ticket);
+    assertManagedTicketCanBeExecutedByAdmin({
+      actor: input.actor,
+      ticket,
+    });
     await assertExistingDeliveryTicketSettlementScope({
       executor: tx,
       userId: input.userId,
@@ -3188,7 +3196,10 @@ export async function recordManagedDeliveryOperation(input: {
       input.ticketId,
       true,
     );
-    assertManagedTicketCanBeExecutedByAdmin(ticket);
+    assertManagedTicketCanBeExecutedByAdmin({
+      actor: input.actor,
+      ticket,
+    });
     assertDeliveryTicketServiceEligibility(portal, ticket.type);
     const duplicate = await tx
       .select({ id: deliveryTicketEvents.id })

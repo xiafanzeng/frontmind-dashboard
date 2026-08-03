@@ -16,7 +16,12 @@ vi.mock("@/pages/Login", () => ({
   default: () => <div>LOGIN_REQUIRED</div>,
 }));
 
-import { adminHomePath, AuthBoundary, canAccessAdminRoutes } from "./App";
+import {
+  adminHomePath,
+  AuthBoundary,
+  canAccessAdminRoutes,
+  canAccessSystemAdminRoutes,
+} from "./App";
 
 describe("administrator route access", () => {
   it("allows both system and delivery administrators into shared admin routes", () => {
@@ -55,6 +60,22 @@ describe("administrator route access", () => {
       } as any),
     ).toBe("/admin/workspace");
     expect(adminHomePath({ role: "user" } as any)).toBeNull();
+  });
+
+  it("reserves the administrator processing workbench for system administrators", () => {
+    expect(
+      canAccessSystemAdminRoutes({
+        role: "admin",
+        adminAccessLevel: "system_admin",
+      }),
+    ).toBe(true);
+    expect(
+      canAccessSystemAdminRoutes({
+        role: "admin",
+        adminAccessLevel: "delivery_admin",
+      }),
+    ).toBe(false);
+    expect(canAccessSystemAdminRoutes({ role: "delivery_member" })).toBe(false);
   });
 });
 

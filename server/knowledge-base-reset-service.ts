@@ -28,7 +28,11 @@ import {
 } from "./auth-service";
 import { getDb } from "./db";
 import { knowledgeBaseWritesAreEmergencyBlocked } from "./knowledge-base-runtime-guard";
-import { assertDeliveryProjectContext } from "./delivery-role-service";
+import {
+  assertDeliveryProjectContext,
+  deliveryExecutionActorRole,
+} from "./delivery-role-service";
+import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { getServicePortal } from "./service-entitlement";
 import { getUpstreamBaseUrl } from "./upstream-config";
 import { knowledgeSnapshotArchiveStorageKey } from "./knowledge-snapshot-archive-store";
@@ -432,10 +436,18 @@ async function requirePendingRequestForMember(input: {
   requestId: string;
   executor: any;
 }) {
+  const actorRole = deliveryExecutionActorRole(input.actor);
+  if (!actorRole) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "需要工程师或系统管理员权限",
+    );
+  }
+  const systemAdmin = actorRole === "admin";
   const rows = await input.executor
     .select({
       request: knowledgeBaseResetRequests,
-      ticketRevision: deliveryTickets.revision,
+      ticket: deliveryTickets,
     })
     .from(knowledgeBaseResetRequests)
     .innerJoin(
@@ -449,7 +461,16 @@ async function requirePendingRequestForMember(input: {
   if (
     !row ||
     row.request.status !== "pending" ||
-    row.request.assignedMemberId !== input.actor.id
+    row.ticket.status !== "submitted" ||
+    row.ticket.operation !== "knowledge_reset" ||
+    row.ticket.workflowDomain !== "ai_operations_engineer" ||
+    row.ticket.userId !== row.request.userId ||
+    row.ticket.assignedProjectAssignmentId !==
+      row.request.assignedProjectAssignmentId ||
+    row.ticket.assignedProjectAssignmentId !== input.projectAssignmentId ||
+    (!systemAdmin &&
+      (row.request.assignedMemberId !== input.actor.id ||
+        row.ticket.assignedMemberId !== input.actor.id))
   ) {
     throw new AuthServiceError("NOT_FOUND", "待审批重置工单不存在");
   }
@@ -463,7 +484,13 @@ async function requirePendingRequestForMember(input: {
   if (role.projectAssignmentId !== row.request.assignedProjectAssignmentId) {
     throw new AuthServiceError("NOT_FOUND", "工单不属于当前客户项目岗位");
   }
-  return { ...row, role };
+  return {
+    ...row,
+    ticketRevision: row.ticket.revision,
+    role,
+    eventActorRole: actorRole,
+    systemAdmin,
+  };
 }
 
 export async function previewKnowledgeReset(input: {
@@ -584,7 +611,7 @@ export async function decideKnowledgeReset(input: {
         ticketId: row.request.ticketId,
         userId: row.request.userId,
         actorUserId: input.actor.id,
-        actorRole: "delivery_member",
+        actorRole: row.eventActorRole,
         kind: "status_change",
         visibility: "customer",
         message: input.decisionNote!.trim(),
@@ -597,6 +624,31 @@ export async function decideKnowledgeReset(input: {
         },
         createdAt: now,
       });
+      if (row.systemAdmin) {
+        await writeWorkspaceAuditEvent(
+          {
+            actor: input.actor,
+            action: "delivery_ticket.system_admin_override",
+            targetType: "delivery_ticket",
+            targetId: row.request.ticketId,
+            workspaceUserId: row.request.userId,
+            metadata: {
+              command: "decide_knowledge_reset",
+              decision: "reject",
+              requestId: row.request.id,
+              projectAssignmentId: row.request.assignedProjectAssignmentId,
+              workflowDomain: row.ticket.workflowDomain,
+              assignedMemberId: row.ticket.assignedMemberId,
+              fromStatus: row.ticket.status,
+              toStatus: "rejected",
+              fromRevision: row.ticket.revision,
+              toRevision: row.ticket.revision + 1,
+            },
+            now,
+          },
+          tx,
+        );
+      }
       return { decision: "rejected" as const, cleanup: null };
     }
 
@@ -814,7 +866,7 @@ export async function decideKnowledgeReset(input: {
       ticketId: row.request.ticketId,
       userId: row.request.userId,
       actorUserId: input.actor.id,
-      actorRole: "delivery_member",
+      actorRole: row.eventActorRole,
       kind: "status_change",
       visibility: "customer",
       message: "知识库重置已批准并完成清理，可以重新开始首次构建。",
@@ -827,6 +879,31 @@ export async function decideKnowledgeReset(input: {
       },
       createdAt: now,
     });
+    if (row.systemAdmin) {
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "delivery_ticket.system_admin_override",
+          targetType: "delivery_ticket",
+          targetId: row.request.ticketId,
+          workspaceUserId: row.request.userId,
+          metadata: {
+            command: "decide_knowledge_reset",
+            decision: "approve",
+            requestId: row.request.id,
+            projectAssignmentId: row.request.assignedProjectAssignmentId,
+            workflowDomain: row.ticket.workflowDomain,
+            assignedMemberId: row.ticket.assignedMemberId,
+            fromStatus: row.ticket.status,
+            toStatus: "completed",
+            fromRevision: row.ticket.revision,
+            toRevision: row.ticket.revision + 1,
+          },
+          now,
+        },
+        tx,
+      );
+    }
     return { decision: "approved" as const, cleanup };
   });
   if (result.decision === "approved") {

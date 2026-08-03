@@ -1055,8 +1055,17 @@ export default function AdminDeliveryTicketWorkspace({
   const isKnowledgeReset = detail?.ticket.category === "knowledge_reset";
   const selectedWorkflowDomain =
     detail?.ticket.workflowDomain ?? selectedTicket?.workflowDomain ?? null;
+  const selectedProjectAssignmentId =
+    detail?.ticket.assignedProjectAssignmentId ??
+    selectedTicket?.assignedProjectAssignmentId ??
+    null;
   const canExecuteSelectedTicket =
     canExecuteDelivery && !selectedWorkflowDomain;
+  const canOpenSystemAdminWorkbench =
+    canExecuteDelivery && Boolean(selectedWorkflowDomain);
+  const systemAdminWorkbenchHref = selectedProjectAssignmentId
+    ? `/admin/delivery-workbench?projectAssignmentId=${encodeURIComponent(selectedProjectAssignmentId)}`
+    : "/admin/delivery-workbench";
 
   return (
     <div className="admin-delivery-workspace">
@@ -1066,19 +1075,43 @@ export default function AdminDeliveryTicketWorkspace({
           <h2>{enterpriseName || "客户"}工单记录</h2>
           <span>
             {canExecuteSelectedTicket
-              ? "当前为旧版无岗位工单兜底：可以处理并留存准确的客户交付记录。"
-              : "按待处理与已完成两种公开状态查看和沟通；实际执行与交付由对应岗位工程师完成。"}
+              ? "当前为旧版无岗位工单兜底：系统管理员可以处理并留存准确的客户交付记录。"
+              : canOpenSystemAdminWorkbench
+                ? "系统管理员可进入完整处理工作台，使用与对应岗位工程师一致的工单流程。"
+                : "按待处理与已完成两种公开状态查看和沟通；实际执行与交付由对应岗位工程师完成。"}
           </span>
         </div>
       </div>
-      {!canExecuteSelectedTicket && (
+      {!canExecuteDelivery && (
         <div className="admin-ticket-closed-notice">
           <LockKeyhole className="h-4 w-4" />
           <span>
             {selectedWorkflowDomain
-              ? `当前为交付协调模式：该工单由${DELIVERY_ROLE_LABELS[selectedWorkflowDomain]}执行。管理员可以查看、回复客户和记录内部备注，但不能代替工程师发布成果或完成工单。`
-              : "当前为交付协调模式：可以查看完整工单、回复客户和记录内部备注，但不能代替工程师发布成果、上传知识库或完成工单。"}
+              ? `当前为交付协调模式：该工单由${DELIVERY_ROLE_LABELS[selectedWorkflowDomain]}执行。交付管理员可以查看、回复客户和记录内部备注，但不能代替工程师发布成果或完成工单。`
+              : "当前为交付协调模式：交付管理员可以查看完整工单、回复客户和记录内部备注，但不能代替工程师发布成果、上传知识库或完成工单。"}
           </span>
+        </div>
+      )}
+      {canOpenSystemAdminWorkbench && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#5b2a86]/25 bg-[#5b2a86]/[0.045] px-4 py-3">
+          <div>
+            <strong className="text-sm text-[#484057]">
+              使用完整岗位处理流程
+            </strong>
+            <p className="mt-1 text-xs leading-5 text-[#716a80]">
+              当前工单属于
+              {selectedWorkflowDomain
+                ? DELIVERY_ROLE_LABELS[selectedWorkflowDomain]
+                : "对应岗位"}
+              ，请在系统管理员处理工作台执行、上传成果并完成工单。
+            </p>
+          </div>
+          <Button asChild size="sm" className="bg-[#5b2a86] hover:bg-[#49216c]">
+            <a href={systemAdminWorkbenchHref}>
+              进入系统管理员处理工作台
+              <ExternalLink className="h-4 w-4" />
+            </a>
+          </Button>
         </div>
       )}
       {(Object.keys(contentQuota).length > 0 ||
@@ -1087,9 +1120,7 @@ export default function AdminDeliveryTicketWorkspace({
           <div className="admin-delivery-quota-heading">
             <div>
               <strong>当前服务周期发布额度</strong>
-              <span>
-                提交时预留，工单完成后正式消耗；普通所属管理员仅可查看。
-              </span>
+              <span>提交时预留，工单完成后正式消耗；交付管理员仅可查看。</span>
             </div>
             {quotaAdjustmentAvailable && !quotaEditing && (
               <Button

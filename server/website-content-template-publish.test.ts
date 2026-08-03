@@ -46,9 +46,9 @@ import {
 const ACTOR = {
   id: 7,
   role: "admin",
-  username: "delivery-admin",
-  displayName: "交付管理员",
-  adminAccessLevel: "delivery_admin",
+  username: "system-admin",
+  displayName: "系统管理员",
+  adminAccessLevel: "system_admin",
 } as any;
 const WORKSPACE_USER_ID = 42;
 const FILE_HASH = "c".repeat(64);
@@ -64,6 +64,7 @@ function ticket(
     quotaPeriodId: "period-1",
     type: "website_operation",
     quotaPool: "website_content_publish",
+    workflowDomain: null,
     category: "company_facts",
     topic: "企业品牌事实",
     title: "企业资料与品牌事实",
@@ -375,6 +376,49 @@ describe("website content template transactional publication", () => {
       "workspace.website_content.template_published",
     ]);
     expect(database.preflight.consumedAt).toBeInstanceOf(Date);
+  });
+
+  it("requires the full role workbench before completing a role-owned website ticket", async () => {
+    const current = [
+      ticket({
+        workflowDomain: "ai_operations_engineer",
+        assignedProjectAssignmentId: "0f627a35-c9cf-41bb-b20f-b42cd91864bb",
+        assignedMemberId: 19,
+      }),
+    ];
+    const template = createWebsiteContentTemplate({
+      workspaceUserId: WORKSPACE_USER_ID,
+      rows: current as any,
+      exportedAt: NOW,
+    });
+    template.records[0] = {
+      ...template.records[0]!,
+      publicSummary: "不能绕过岗位校验直接完成。",
+      complete: true,
+    };
+    const preflight = await websiteCredential();
+    const database = transactionalDatabase({
+      tickets: current,
+      preflight: preflight.row,
+    });
+    dependencies.getDb.mockResolvedValue(database.db);
+
+    await expect(
+      publishWebsiteContentTemplate({
+        actor: ACTOR,
+        workspaceUserId: WORKSPACE_USER_ID,
+        template,
+        fileHash: FILE_HASH,
+        preflightToken: preflight.credential.preflightToken,
+      }),
+    ).rejects.toMatchObject({
+      code: "WEBSITE_CONTENT_TEMPLATE_ROLE_WORKBENCH_REQUIRED",
+    });
+
+    expect(database.tickets).toEqual(current);
+    expect(database.preflight.consumedAt).toBeNull();
+    expect(database.events).toHaveLength(0);
+    expect(database.audits).toHaveLength(0);
   });
 
   it("rolls back ticket writes and nonce consumption when any record update fails", async () => {

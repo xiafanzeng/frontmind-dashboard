@@ -64,15 +64,47 @@ function settlementExecutor(
 }
 
 describe("delivery ticket contract", () => {
-  it("keeps role-owned ticket execution inside the assigned engineer workbench", () => {
+  it("routes system administrators through the role workbench while delivery administrators stay coordination-only", () => {
     expect(() =>
       assertManagedTicketCanBeExecutedByAdmin({
-        workflowDomain: "ai_operations_engineer",
+        actor: {
+          role: "admin",
+          username: "system.admin",
+          adminAccessLevel: "system_admin",
+        },
+        ticket: { workflowDomain: "ai_operations_engineer" },
       }),
-    ).toThrow(/AI 运维工程师/);
+    ).toThrow(/系统管理员完整处理工作台/);
     expect(() =>
-      assertManagedTicketCanBeExecutedByAdmin({ workflowDomain: null }),
+      assertManagedTicketCanBeExecutedByAdmin({
+        actor: {
+          role: "admin",
+          username: "system.admin",
+          adminAccessLevel: "system_admin",
+        },
+        ticket: { workflowDomain: null },
+      }),
     ).not.toThrow();
+    expect(() =>
+      assertManagedTicketCanBeExecutedByAdmin({
+        actor: {
+          role: "admin",
+          username: "delivery.admin",
+          adminAccessLevel: "delivery_admin",
+        },
+        ticket: { workflowDomain: "ai_operations_engineer" },
+      }),
+    ).toThrow(/交付管理员仅负责查看、沟通与协调/);
+    expect(() =>
+      assertManagedTicketCanBeExecutedByAdmin({
+        actor: {
+          role: "admin",
+          username: "delivery.admin",
+          adminAccessLevel: "delivery_admin",
+        },
+        ticket: { workflowDomain: null },
+      }),
+    ).toThrow(/交付管理员仅负责查看、沟通与协调/);
   });
 
   it("publishes six explained content types without the retired media type", () => {

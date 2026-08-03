@@ -7,6 +7,7 @@ import {
   eq,
   gt,
   inArray,
+  isNotNull,
   isNull,
   lt,
   or,
@@ -64,7 +65,12 @@ import {
 } from "./admin-control-plane-service";
 import { getLatestKnowledgeSnapshot } from "./dashboard-service";
 import { getDb } from "./db";
-import { getDeliveryTicketWorkspace } from "./delivery-ticket-service";
+import {
+  assertExistingDeliveryTicketSettlementScope,
+  deriveTicketQuotaTransition,
+  DeliveryTicketError,
+  getDeliveryTicketWorkspace,
+} from "./delivery-ticket-service";
 import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
 import {
   approveWorkspaceQuestionSelection,
@@ -538,6 +544,23 @@ const ACTIVE_DELIVERY_STATUSES = [
   "in_progress",
 ] as const;
 
+export function deliveryExecutionActorRole(
+  actor: Pick<AuthenticatedUser, "role" | "username" | "adminAccessLevel">,
+) {
+  if (hasSystemAdminAccess(actor)) return "admin" as const;
+  if (actor.role === "delivery_member") return "delivery_member" as const;
+  return null;
+}
+
+function deliveryRoleTicketScope(actor: AuthenticatedUser) {
+  return hasSystemAdminAccess(actor)
+    ? and(
+        isNotNull(deliveryTickets.workflowDomain),
+        isNotNull(deliveryTickets.assignedProjectAssignmentId),
+      )
+    : eq(deliveryTickets.assignedMemberId, actor.id);
+}
+
 export const MY_DELIVERY_TICKET_LIMIT = 50;
 
 const INITIAL_MONITORING_DEPENDENCY_MESSAGE =
@@ -585,21 +608,26 @@ export function deliveryTicketStatusGroup(status: string) {
 
 /**
  * Lists the signed-in engineer's own tickets across every assigned customer.
- * Authorization is intentionally anchored on assignedMemberId rather than a
- * client-supplied project assignment. The bounded result and all supporting
- * filters/counts are loaded in a fixed number of batched queries.
+ * System administrators use the same projection, limited to tickets anchored
+ * to a workflow role and project assignment. The bounded result and all
+ * supporting filters/counts are loaded in a fixed number of batched queries.
  */
 export async function getMyDeliveryTickets(input: {
   actor: AuthenticatedUser;
   customerUserId?: number;
+  projectAssignmentId?: string;
   statusGroup?: "pending" | "completed";
   limit?: number;
   cursor?: { actionRank: number; updatedAt: number; id: string };
 }) {
-  if (input.actor.role !== "delivery_member") {
-    throw new AuthServiceError("INVALID_CREDENTIAL", "该工单池仅对工程师开放");
+  if (!deliveryExecutionActorRole(input.actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "该工单池仅对工程师或系统管理员开放",
+    );
   }
   const db = await requireDb();
+  const actorTicketScope = deliveryRoleTicketScope(input.actor);
   const statusFilter =
     input.statusGroup === "pending"
       ? ACTIVE_DELIVERY_STATUSES
@@ -607,10 +635,16 @@ export async function getMyDeliveryTickets(input: {
         ? TERMINAL_DELIVERY_STATUSES
         : [...ACTIVE_DELIVERY_STATUSES, ...TERMINAL_DELIVERY_STATUSES];
   const ownershipFilter = and(
-    eq(deliveryTickets.assignedMemberId, input.actor.id),
+    actorTicketScope,
     inArray(deliveryTickets.status, statusFilter),
     input.customerUserId
       ? eq(deliveryTickets.userId, input.customerUserId)
+      : undefined,
+    input.projectAssignmentId
+      ? eq(
+          deliveryTickets.assignedProjectAssignmentId,
+          input.projectAssignmentId,
+        )
       : undefined,
   );
   const actionRank = sql<number>`CASE ${deliveryTickets.status}
@@ -666,20 +700,26 @@ export async function getMyDeliveryTickets(input: {
         })
         .from(deliveryTickets)
         .innerJoin(users, eq(users.id, deliveryTickets.userId))
-        .where(eq(deliveryTickets.assignedMemberId, input.actor.id))
+        .where(actorTicketScope)
         .orderBy(asc(users.displayName), asc(users.username), asc(users.id)),
       db
         .select({ status: deliveryTickets.status, value: count() })
         .from(deliveryTickets)
         .where(
           and(
-            eq(deliveryTickets.assignedMemberId, input.actor.id),
+            actorTicketScope,
             inArray(deliveryTickets.status, [
               ...ACTIVE_DELIVERY_STATUSES,
               ...TERMINAL_DELIVERY_STATUSES,
             ]),
             input.customerUserId
               ? eq(deliveryTickets.userId, input.customerUserId)
+              : undefined,
+            input.projectAssignmentId
+              ? eq(
+                  deliveryTickets.assignedProjectAssignmentId,
+                  input.projectAssignmentId,
+                )
               : undefined,
           ),
         )
@@ -694,10 +734,16 @@ export async function getMyDeliveryTickets(input: {
         .innerJoin(users, eq(users.id, deliveryTickets.userId))
         .where(
           and(
-            eq(deliveryTickets.assignedMemberId, input.actor.id),
+            actorTicketScope,
             inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
             input.customerUserId
               ? eq(deliveryTickets.userId, input.customerUserId)
+              : undefined,
+            input.projectAssignmentId
+              ? eq(
+                  deliveryTickets.assignedProjectAssignmentId,
+                  input.projectAssignmentId,
+                )
               : undefined,
           ),
         )
@@ -1145,9 +1191,13 @@ export async function createProjectMonitoringHandoffIfReady(input: {
 }
 
 export async function listMyProjectAssignments(actor: AuthenticatedUser) {
-  if (actor.role !== "delivery_member") {
-    throw new AuthServiceError("INVALID_CREDENTIAL", "该工作台仅对工程师开放");
+  if (!deliveryExecutionActorRole(actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "该工作台仅对工程师或系统管理员开放",
+    );
   }
+  const systemAdmin = hasSystemAdminAccess(actor);
   const db = await requireDb();
   const rows = await db
     .select({
@@ -1161,10 +1211,14 @@ export async function listMyProjectAssignments(actor: AuthenticatedUser) {
     .innerJoin(users, eq(users.id, deliveryProjectAssignments.customerUserId))
     .where(
       and(
-        eq(deliveryProjectAssignments.engineerUserId, actor.id),
-        actor.engineerRoleType
-          ? eq(deliveryProjectAssignments.roleType, actor.engineerRoleType)
-          : sql`false`,
+        systemAdmin
+          ? undefined
+          : eq(deliveryProjectAssignments.engineerUserId, actor.id),
+        systemAdmin
+          ? undefined
+          : actor.engineerRoleType
+            ? eq(deliveryProjectAssignments.roleType, actor.engineerRoleType)
+            : sql`false`,
         eq(users.role, "user"),
         eq(users.isActive, true),
       ),
@@ -1257,10 +1311,14 @@ export async function getMyDeliveryHistory(input: {
   limit: number;
   cursor?: { resolvedAt: number; id: string };
 }) {
-  if (input.actor.role !== "delivery_member") {
-    throw new AuthServiceError("INVALID_CREDENTIAL", "该记录仅对工程师开放");
+  if (!deliveryExecutionActorRole(input.actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "该记录仅对工程师或系统管理员开放",
+    );
   }
   const db = await requireDb();
+  const actorTicketScope = deliveryRoleTicketScope(input.actor);
   const cursorDate = input.cursor
     ? new Date(input.cursor.resolvedAt)
     : undefined;
@@ -1280,7 +1338,7 @@ export async function getMyDeliveryHistory(input: {
       .innerJoin(users, eq(users.id, deliveryTickets.userId))
       .where(
         and(
-          eq(deliveryTickets.assignedMemberId, input.actor.id),
+          actorTicketScope,
           input.status
             ? eq(deliveryTickets.status, input.status)
             : inArray(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES),
@@ -1313,7 +1371,7 @@ export async function getMyDeliveryHistory(input: {
       .innerJoin(users, eq(users.id, deliveryTickets.userId))
       .where(
         and(
-          eq(deliveryTickets.assignedMemberId, input.actor.id),
+          actorTicketScope,
           inArray(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES),
         ),
       )
@@ -1323,7 +1381,7 @@ export async function getMyDeliveryHistory(input: {
       .from(deliveryTickets)
       .where(
         and(
-          eq(deliveryTickets.assignedMemberId, input.actor.id),
+          actorTicketScope,
           inArray(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES),
         ),
       )
@@ -1377,8 +1435,11 @@ export async function getMyDeliveryTicketDetail(input: {
   actor: AuthenticatedUser;
   ticketId: string;
 }) {
-  if (input.actor.role !== "delivery_member") {
-    throw new AuthServiceError("INVALID_CREDENTIAL", "该记录仅对工程师开放");
+  if (!deliveryExecutionActorRole(input.actor)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "该记录仅对工程师或系统管理员开放",
+    );
   }
   const db = await requireDb();
   const rows = await db
@@ -1392,7 +1453,7 @@ export async function getMyDeliveryTicketDetail(input: {
     .where(
       and(
         eq(deliveryTickets.id, input.ticketId),
-        eq(deliveryTickets.assignedMemberId, input.actor.id),
+        deliveryRoleTicketScope(input.actor),
         inArray(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES),
       ),
     )
@@ -1475,6 +1536,14 @@ export async function publishWebsiteStyleSamples(input: {
     note?: string;
   }>;
 }) {
+  const actorRole = deliveryExecutionActorRole(input.actor);
+  if (!actorRole) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "需要工程师或系统管理员权限",
+    );
+  }
+  const systemAdmin = actorRole === "admin";
   if (input.samples.length !== 3) {
     throw new AuthServiceError("CONFLICT", "每批必须提交恰好三张图片样例");
   }
@@ -1508,7 +1577,7 @@ export async function publishWebsiteStyleSamples(input: {
     if (
       !ticket ||
       ticket.operation !== "website_style_samples" ||
-      ticket.assignedMemberId !== input.actor.id ||
+      (!systemAdmin && ticket.assignedMemberId !== input.actor.id) ||
       ticket.assignedProjectAssignmentId !== input.projectAssignmentId ||
       !["submitted", "in_progress"].includes(ticket.status)
     ) {
@@ -1544,7 +1613,12 @@ export async function publishWebsiteStyleSamples(input: {
       .where(
         and(
           eq(upstreamResources.userId, input.actor.id),
-          eq(upstreamResources.projectAssignmentId, input.projectAssignmentId),
+          systemAdmin
+            ? undefined
+            : eq(
+                upstreamResources.projectAssignmentId,
+                input.projectAssignmentId,
+              ),
           eq(upstreamResources.kind, "file"),
           inArray(
             upstreamResources.upstreamId,
@@ -1557,7 +1631,9 @@ export async function publishWebsiteStyleSamples(input: {
     ) {
       throw new AuthServiceError(
         "INVALID_CREDENTIAL",
-        "样例图片不属于当前工程师客户项目",
+        systemAdmin
+          ? "样例图片不属于当前系统管理员账号"
+          : "样例图片不属于当前工程师客户项目",
       );
     }
     const latestBatchRows = await tx
@@ -1581,12 +1657,12 @@ export async function publishWebsiteStyleSamples(input: {
       ticketId: ticket.id,
       userId: ticket.userId,
       actorUserId: input.actor.id,
-      actorRole: "delivery_member",
+      actorRole,
       kind: "attachment",
       visibility: "customer",
       message:
         input.engineerNote?.trim() ||
-        "工程师已提交三张官网图片风格样例，请选择一张或退回重做。",
+        "交付团队已提交三张官网图片风格样例，请选择一张或退回重做。",
       fromStatus: ticket.status,
       toStatus: "needs_information",
       actorContext: {
@@ -1659,6 +1735,29 @@ export async function publishWebsiteStyleSamples(input: {
         updatedAt: now,
       })
       .where(eq(deliveryTickets.id, ticket.id));
+    if (systemAdmin) {
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "delivery_ticket.system_admin_override",
+          targetType: "delivery_ticket",
+          targetId: ticket.id,
+          workspaceUserId: ticket.userId,
+          metadata: {
+            command: "publish_website_style_samples",
+            projectAssignmentId: input.projectAssignmentId,
+            workflowDomain: ticket.workflowDomain,
+            assignedMemberId: ticket.assignedMemberId,
+            fromStatus: ticket.status,
+            toStatus: "needs_information",
+            batchId,
+            sampleCount: input.samples.length,
+          },
+          now,
+        },
+        tx,
+      );
+    }
     return {
       batchId,
       workflowRevision: workflow.revision + 1,
@@ -1674,9 +1773,14 @@ export async function assertDeliveryProjectContext(input: {
   expectedRoleType?: DeliveryRoleType;
   executor?: any;
 }) {
-  if (input.actor.role !== "delivery_member") {
-    throw new AuthServiceError("INVALID_CREDENTIAL", "需要交付成员权限");
+  const actorRole = deliveryExecutionActorRole(input.actor);
+  if (!actorRole) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "需要工程师或系统管理员权限",
+    );
   }
+  const systemAdmin = actorRole === "admin";
   const db = input.executor ?? (await requireDb());
   const rows = await db
     .select({
@@ -1691,7 +1795,9 @@ export async function assertDeliveryProjectContext(input: {
     .where(
       and(
         eq(deliveryProjectAssignments.id, input.projectAssignmentId),
-        eq(deliveryProjectAssignments.engineerUserId, input.actor.id),
+        systemAdmin
+          ? undefined
+          : eq(deliveryProjectAssignments.engineerUserId, input.actor.id),
         eq(users.role, "user"),
         eq(users.isActive, true),
       ),
@@ -1700,7 +1806,7 @@ export async function assertDeliveryProjectContext(input: {
   const role = rows[0];
   if (
     !role ||
-    role.roleType !== input.actor.engineerRoleType ||
+    (!systemAdmin && role.roleType !== input.actor.engineerRoleType) ||
     (input.expectedRoleType && role.roleType !== input.expectedRoleType)
   ) {
     throw new AuthServiceError("NOT_FOUND", "当前客户项目岗位不存在");
@@ -1709,7 +1815,7 @@ export async function assertDeliveryProjectContext(input: {
     input.customerUserId !== undefined &&
     input.customerUserId !== role.customerUserId
   ) {
-    throw new AuthServiceError("NOT_FOUND", "客户未分配给当前工程师");
+    throw new AuthServiceError("NOT_FOUND", "客户与当前项目岗位不匹配");
   }
   const contractRows = await db
     .select()
@@ -1857,7 +1963,7 @@ export async function approveMyCustomerQuestionSelection(input: {
   if (role.roleType !== "monitoring_optimization_engineer") {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "只有问题监控工程师可以审核客户提交的问题",
+      "只有问题监控与优化岗位工作台可以审核客户提交的问题",
     );
   }
   const db = await requireDb();
@@ -1903,6 +2009,72 @@ const MEMBER_TICKET_TRANSITIONS: Record<string, readonly string[]> = {
   in_progress: ["needs_information", "completed", "rejected", "cancelled"],
   needs_information: ["in_progress", "cancelled"],
 };
+
+type DeliveryExecutionTransitionStatus =
+  | "in_progress"
+  | "needs_information"
+  | "completed"
+  | "rejected"
+  | "cancelled";
+
+export function assertGenericDeliveryTicketTransition(input: {
+  operation: string | null;
+  nextStatus: DeliveryExecutionTransitionStatus;
+}) {
+  if (
+    input.operation === "website_style_samples" &&
+    input.nextStatus === "completed"
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "官网风格样例必须由客户通过专用选择操作确认，不能直接完成工单",
+    );
+  }
+}
+
+export function assertDeliveryCompletionSummary(input: {
+  nextStatus: DeliveryExecutionTransitionStatus;
+  message?: string;
+}) {
+  if (input.nextStatus === "completed" && !input.message?.trim()) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "完成工单前必须填写客户可见的结果摘要",
+    );
+  }
+}
+
+export function deriveDeliveryExecutionTransition(input: {
+  currentQuotaState: "reserved" | "consumed" | "released";
+  scheduledAt: Date | null;
+  quotaReleasedAt: Date | null;
+  technicalDedupeKey: string | null;
+  nextStatus: DeliveryExecutionTransitionStatus;
+  now: Date;
+}) {
+  const quotaState = deriveTicketQuotaTransition({
+    currentState: input.currentQuotaState,
+    scheduledAt: input.scheduledAt,
+    nextStatus: input.nextStatus,
+  });
+  const terminal = ["completed", "rejected", "cancelled"].includes(
+    input.nextStatus,
+  );
+  const hasEnteredExecution = ["in_progress", "completed"].includes(
+    input.nextStatus,
+  );
+  return {
+    quotaState,
+    scheduledAt:
+      hasEnteredExecution && !input.scheduledAt ? input.now : input.scheduledAt,
+    quotaReleasedAt:
+      quotaState === "released" && input.currentQuotaState !== "released"
+        ? input.now
+        : input.quotaReleasedAt,
+    technicalDedupeKey: terminal ? null : input.technicalDedupeKey,
+    resolvedAt: terminal ? input.now : null,
+  };
+}
 
 async function createMonitoringRetestTicket(input: {
   executor: any;
@@ -2020,6 +2192,7 @@ async function createAssignedWorkflowTicket(input: {
     projectAssignmentId: string;
     customerUserId: number;
     roleType: DeliveryRoleType;
+    eventActorRole: "admin" | "delivery_member";
   };
   workflowDomain: DeliveryRoleType;
   operation:
@@ -2130,7 +2303,7 @@ async function createAssignedWorkflowTicket(input: {
     ticketId: id,
     userId: input.sourceTicket.userId,
     actorUserId: input.actorUserId,
-    actorRole: "delivery_member",
+    actorRole: input.actorRoleContext.eventActorRole,
     kind: "created",
     visibility: "customer",
     message: input.description,
@@ -2240,6 +2413,14 @@ export async function updateMyDeliveryTicket(input: {
   publicUrl?: string;
   handoff?: DeliveryTicketHandoff;
 }) {
+  const eventActorRole = deliveryExecutionActorRole(input.actor);
+  if (!eventActorRole) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "需要工程师或系统管理员权限",
+    );
+  }
+  const systemAdmin = eventActorRole === "admin";
   const db = await requireDb();
   return db.transaction(async (tx) => {
     const ticketRows = await tx
@@ -2252,13 +2433,20 @@ export async function updateMyDeliveryTicket(input: {
     if (
       !ticket ||
       !ticket.workflowDomain ||
-      ticket.assignedMemberId !== input.actor.id
+      !ticket.assignedProjectAssignmentId ||
+      (!systemAdmin && ticket.assignedMemberId !== input.actor.id)
     ) {
-      throw new AuthServiceError("NOT_FOUND", "工单不属于当前交付成员");
+      throw new AuthServiceError(
+        "NOT_FOUND",
+        "工单不属于当前项目岗位或无权处理",
+      );
+    }
+    if (ticket.assignedProjectAssignmentId !== input.projectAssignmentId) {
+      throw new AuthServiceError("NOT_FOUND", "工单不属于当前客户项目岗位");
     }
     const role = await assertDeliveryProjectContext({
       actor: input.actor,
-      projectAssignmentId: input.projectAssignmentId,
+      projectAssignmentId: ticket.assignedProjectAssignmentId,
       customerUserId: ticket.userId,
       expectedRoleType: ticket.workflowDomain,
       executor: tx,
@@ -2284,10 +2472,33 @@ export async function updateMyDeliveryTicket(input: {
     if (ticket.operation === "knowledge_reset") {
       throw new AuthServiceError("CONFLICT", "知识库重置必须使用专用审批操作");
     }
+    assertGenericDeliveryTicketTransition({
+      operation: ticket.operation,
+      nextStatus: input.status,
+    });
     if (
       !(MEMBER_TICKET_TRANSITIONS[ticket.status] ?? []).includes(input.status)
     ) {
       throw new AuthServiceError("CONFLICT", "当前工单状态不能执行该操作");
+    }
+    assertDeliveryCompletionSummary({
+      nextStatus: input.status,
+      message: input.message,
+    });
+    try {
+      await assertExistingDeliveryTicketSettlementScope({
+        executor: tx,
+        userId: ticket.userId,
+        ticket,
+      });
+    } catch (error) {
+      if (error instanceof DeliveryTicketError) {
+        throw new AuthServiceError(
+          error.statusCode === 404 ? "NOT_FOUND" : "CONFLICT",
+          error.message,
+        );
+      }
+      throw error;
     }
     const linkRequired =
       input.status === "completed" &&
@@ -2304,6 +2515,14 @@ export async function updateMyDeliveryTicket(input: {
       throw new AuthServiceError("CONFLICT", "发布完成时必须登记公开链接");
     }
     const now = new Date();
+    const transition = deriveDeliveryExecutionTransition({
+      currentQuotaState: ticket.quotaState,
+      scheduledAt: ticket.scheduledAt,
+      quotaReleasedAt: ticket.quotaReleasedAt,
+      technicalDedupeKey: ticket.technicalDedupeKey,
+      nextStatus: input.status,
+      now,
+    });
     const deliveryLinks = input.publicUrl
       ? [{ label: "公开链接", url: input.publicUrl }]
       : ticket.deliveryLinks;
@@ -2640,7 +2859,7 @@ export async function updateMyDeliveryTicket(input: {
       if (unverifiedIds.length) {
         throw new AuthServiceError(
           "CONFLICT",
-          `以下内容资产尚未由内容分发工程师发布：${unverifiedIds.join("、")}`,
+          `以下内容资产尚未完成内容分发发布：${unverifiedIds.join("、")}`,
         );
       }
     }
@@ -2844,6 +3063,7 @@ export async function updateMyDeliveryTicket(input: {
       .update(deliveryTickets)
       .set({
         status: input.status,
+        quotaState: transition.quotaState,
         publicSummary:
           input.status === "completed" &&
           ticket.operation === "domain_application"
@@ -2855,11 +3075,10 @@ export async function updateMyDeliveryTicket(input: {
         monitoringBatchKey,
         responseLogicRevision,
         contentAssetIds,
-        resolvedAt: ["completed", "rejected", "cancelled"].includes(
-          input.status,
-        )
-          ? now
-          : null,
+        scheduledAt: transition.scheduledAt,
+        quotaReleasedAt: transition.quotaReleasedAt,
+        resolvedAt: transition.resolvedAt,
+        technicalDedupeKey: transition.technicalDedupeKey,
         revision: sql`${deliveryTickets.revision} + 1`,
         updatedByUserId: input.actor.id,
         updatedAt: now,
@@ -2870,7 +3089,7 @@ export async function updateMyDeliveryTicket(input: {
       ticketId: ticket.id,
       userId: ticket.userId,
       actorUserId: input.actor.id,
-      actorRole: "delivery_member",
+      actorRole: eventActorRole,
       kind: "status_change",
       visibility: "customer",
       message: input.message?.trim() || null,
@@ -2893,6 +3112,7 @@ export async function updateMyDeliveryTicket(input: {
       projectAssignmentId: input.projectAssignmentId,
       customerUserId: role.customerUserId,
       roleType: role.roleType,
+      eventActorRole,
     };
     const handoffTicketIds: string[] = [];
     if (input.status === "completed") {
@@ -3053,6 +3273,32 @@ export async function updateMyDeliveryTicket(input: {
         sourceTicket,
         actorUserId: input.actor.id,
       });
+    }
+    if (systemAdmin) {
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "delivery_ticket.system_admin_override",
+          targetType: "delivery_ticket",
+          targetId: ticket.id,
+          workspaceUserId: ticket.userId,
+          metadata: {
+            command: "update_ticket",
+            projectAssignmentId: ticket.assignedProjectAssignmentId,
+            workflowDomain: ticket.workflowDomain,
+            assignedMemberId: ticket.assignedMemberId,
+            operation: ticket.operation,
+            fromStatus: ticket.status,
+            toStatus: input.status,
+            fromRevision: ticket.revision,
+            toRevision: ticket.revision + 1,
+            handoffTicketIds,
+            retestTicketId,
+          },
+          now,
+        },
+        tx,
+      );
     }
     return {
       success: true as const,

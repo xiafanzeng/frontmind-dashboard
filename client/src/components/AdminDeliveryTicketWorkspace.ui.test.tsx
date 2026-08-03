@@ -185,15 +185,32 @@ describe("AdminDeliveryTicketWorkspace streamlined UI", () => {
         enterpriseName="测试企业"
         customerUsername="test-user"
         preview
-        previewFixtures={executionPreviewFixtures}
+        previewFixtures={{
+          ...executionPreviewFixtures,
+          tickets: executionPreviewFixtures.tickets.map((ticket) => ({
+            ...ticket,
+            type: "content_asset" as const,
+            workflowDomain: "content_distribution_engineer" as const,
+            operation: "content_asset_publish" as const,
+            assignedMemberId: 19,
+            assignedMemberName: "AI 内容分发工程师",
+          })),
+        }}
       />,
     );
 
-    expect(await screen.findByText(/当前为交付协调模式/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/该工单由AI 内容分发工程师执行/),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText("完成工单并发布内容总结"),
     ).not.toBeInTheDocument();
     expect(screen.queryByText("保存交付记录")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", {
+        name: /进入系统管理员处理工作台/,
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("projects every internal workflow state into only pending or completed", async () => {
@@ -275,7 +292,7 @@ describe("AdminDeliveryTicketWorkspace streamlined UI", () => {
     expect(screen.queryByText(/当前为交付协调模式/)).not.toBeInTheDocument();
   });
 
-  it("does not let a system administrator execute a role-owned ticket", async () => {
+  it("sends a system administrator to the full workbench for a role-owned ticket", async () => {
     render(
       <AdminDeliveryTicketWorkspace
         userId={42}
@@ -287,21 +304,30 @@ describe("AdminDeliveryTicketWorkspace streamlined UI", () => {
           ...executionPreviewFixtures,
           tickets: executionPreviewFixtures.tickets.map((ticket) => ({
             ...ticket,
-            workflowDomain: "ai_operations_engineer" as const,
-            operation: "company_facts" as const,
+            type: "content_asset" as const,
+            workflowDomain: "content_distribution_engineer" as const,
+            operation: "content_asset_publish" as const,
+            assignedProjectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
             assignedMemberId: 19,
-            assignedMemberName: "AI 运维工程师",
+            assignedMemberName: "AI 内容分发工程师",
           })),
         }}
       />,
     );
 
+    expect(await screen.findByText(/使用完整岗位处理流程/)).toBeInTheDocument();
     expect(
-      await screen.findByText(/该工单由AI 运维工程师执行/),
-    ).toBeInTheDocument();
+      screen.getByRole("link", {
+        name: /进入系统管理员处理工作台/,
+      }),
+    ).toHaveAttribute(
+      "href",
+      "/admin/delivery-workbench?projectAssignmentId=1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+    );
     expect(
       screen.queryByText("完成工单并发布内容总结"),
     ).not.toBeInTheDocument();
     expect(screen.queryByText("保存交付记录")).not.toBeInTheDocument();
+    expect(screen.queryByText(/当前为交付协调模式/)).not.toBeInTheDocument();
   });
 });
