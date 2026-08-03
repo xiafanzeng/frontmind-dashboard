@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-import { and, eq, lte } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import { migrate } from "drizzle-orm/mysql2/migrator";
 import mysql, {
@@ -33,7 +33,10 @@ import {
   runConversationWriteTransaction,
 } from "../server/conversation-router";
 import { cleanupExpiredDeliveryTickets } from "../server/delivery-ticket-retention";
-import { claimUsageSnapshotRefresh } from "../server/api-usage-snapshot-service";
+import {
+  claimUsageSnapshotRefresh,
+  finalizeApiUsageSnapshotClaim,
+} from "../server/api-usage-snapshot-service";
 import { prepareKnowledgeResetCleanupResource } from "../server/knowledge-base-reset-service";
 
 const ACCEPTANCE_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_DATABASE_URL";
@@ -329,7 +332,7 @@ mysqlDescribe("knowledge-base real MySQL state-machine acceptance", () => {
     expect(Number(rows[0]?.conversationCount || 0)).toBe(2);
   });
 
-  it("atomically reclaims one usage snapshot and lets only the latest delayed claim finalize", async () => {
+  it("finalizes a rounded TIMESTAMP claim and lets only the latest delayed token win", async () => {
     expect(userId).not.toBeNull();
     const policyId = randomUUID();
     await executor.insert(apiUsagePolicies).values({
@@ -344,20 +347,15 @@ mysqlDescribe("knowledge-base real MySQL state-machine acceptance", () => {
       .where(eq(apiUsagePolicies.id, policyId));
     expect(policy).toBeDefined();
 
-    // MySQL TIMESTAMP without fractional precision rounds sub-second values.
-    // Use exact seconds so this concurrency assertion is deterministic.
     const baseNowMs = Math.floor(Date.now() / 1_000) * 1_000;
-    const firstNow = new Date(baseNowMs - 10_000);
+    // Production uses second-precision TIMESTAMP columns. A .750 millisecond
+    // fraction rounds into the next second in MySQL 8.4, which previously made
+    // an additional `updatedAt <= now` predicate reject the rightful token.
+    const firstNow = new Date(baseNowMs + 750);
     const firstToken = await claimUsageSnapshotRefresh({
       executor,
       policy: policy!,
       now: firstNow,
-    });
-    const secondNow = new Date(baseNowMs - 5_000);
-    const secondToken = await claimUsageSnapshotRefresh({
-      executor,
-      policy: policy!,
-      now: secondNow,
     });
 
     let rows = await executor
@@ -365,56 +363,98 @@ mysqlDescribe("knowledge-base real MySQL state-machine acceptance", () => {
       .from(apiUsageSnapshots)
       .where(eq(apiUsageSnapshots.policyId, policyId));
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({
-      syncGeneration: 2,
-      syncToken: secondToken,
-      syncStatus: "pending",
+    expect(rows[0]!.updatedAt.getTime()).toBe(baseNowMs + 1_000);
+
+    await finalizeApiUsageSnapshotClaim({
+      executor,
+      policy: policy!,
+      credentialFingerprint: "fp_mysql_acceptance",
+      used: 111,
+      accountUsed: 11,
+      status: "ok",
+      now: firstNow,
+      syncToken: firstToken,
     });
-    expect(firstToken).not.toBe(secondToken);
-    expect(rows[0]!.updatedAt.getTime()).toBe(
-      Math.floor(secondNow.getTime() / 1_000) * 1_000,
-    );
-
-    await executor
-      .update(apiUsageSnapshots)
-      .set({ syncStatus: "ok", used: 111, updatedAt: secondNow })
-      .where(
-        and(
-          eq(apiUsageSnapshots.policyId, policyId),
-          eq(apiUsageSnapshots.syncToken, firstToken),
-          lte(apiUsageSnapshots.updatedAt, secondNow),
-        ),
-      );
-    rows = await executor
-      .select()
-      .from(apiUsageSnapshots)
-      .where(eq(apiUsageSnapshots.policyId, policyId));
-    expect(rows[0]).toMatchObject({ syncStatus: "pending", used: 0 });
-
-    await executor
-      .update(apiUsageSnapshots)
-      .set({
-        syncStatus: "ok",
-        used: 222,
-        fetchedAt: secondNow,
-        updatedAt: secondNow,
-      })
-      .where(
-        and(
-          eq(apiUsageSnapshots.policyId, policyId),
-          eq(apiUsageSnapshots.syncToken, secondToken),
-          lte(apiUsageSnapshots.updatedAt, secondNow),
-        ),
-      );
     rows = await executor
       .select()
       .from(apiUsageSnapshots)
       .where(eq(apiUsageSnapshots.policyId, policyId));
     expect(rows[0]).toMatchObject({
       syncStatus: "ok",
+      used: 111,
+      accountUsed: 11,
+      syncGeneration: 1,
+      syncToken: firstToken,
+    });
+
+    const secondNow = new Date(baseNowMs + 2_750);
+    const secondToken = await claimUsageSnapshotRefresh({
+      executor,
+      policy: policy!,
+      now: secondNow,
+    });
+    const latestNow = new Date(baseNowMs + 4_750);
+    const latestToken = await claimUsageSnapshotRefresh({
+      executor,
+      policy: policy!,
+      now: latestNow,
+    });
+
+    rows = await executor
+      .select()
+      .from(apiUsageSnapshots)
+      .where(eq(apiUsageSnapshots.policyId, policyId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      syncGeneration: 3,
+      syncToken: latestToken,
+      syncStatus: "ok",
+      used: 111,
+    });
+    expect(firstToken).not.toBe(secondToken);
+    expect(secondToken).not.toBe(latestToken);
+
+    await finalizeApiUsageSnapshotClaim({
+      executor,
+      policy: policy!,
+      credentialFingerprint: "fp_mysql_acceptance",
       used: 222,
-      syncGeneration: 2,
+      accountUsed: 22,
+      status: "ok",
+      now: secondNow,
       syncToken: secondToken,
+    });
+    rows = await executor
+      .select()
+      .from(apiUsageSnapshots)
+      .where(eq(apiUsageSnapshots.policyId, policyId));
+    expect(rows[0]).toMatchObject({
+      syncStatus: "ok",
+      used: 111,
+      accountUsed: 11,
+      syncToken: latestToken,
+    });
+
+    await finalizeApiUsageSnapshotClaim({
+      executor,
+      policy: policy!,
+      credentialFingerprint: "fp_mysql_acceptance",
+      used: 333,
+      accountUsed: 33,
+      status: "ok",
+      now: latestNow,
+      syncToken: latestToken,
+    });
+    rows = await executor
+      .select()
+      .from(apiUsageSnapshots)
+      .where(eq(apiUsageSnapshots.policyId, policyId));
+    expect(rows[0]).toMatchObject({
+      syncStatus: "ok",
+      used: 333,
+      accountUsed: 33,
+      syncGeneration: 3,
+      syncToken: latestToken,
     });
   });
 

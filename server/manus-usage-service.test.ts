@@ -6,7 +6,7 @@ import {
 } from "./manus-usage-service";
 
 describe("Manus v2 usage history", () => {
-  it("computes net consumption from signed costs and refunds while excluding grants", () => {
+  it("computes net consumption while excluding account grants without task IDs", () => {
     const startAt = Date.parse("2026-07-01T00:00:00.000Z");
     const endAt = Date.parse("2026-08-01T00:00:00.000Z");
     const result = aggregateManusUsageChangePage({
@@ -26,7 +26,6 @@ describe("Manus v2 usage history", () => {
           created_at: startAt / 1_000 + 1,
         },
         {
-          task_id: "grant",
           type: "grant",
           credits: 10_000,
           created_at: startAt / 1_000 + 2,
@@ -76,7 +75,6 @@ describe("Manus v2 usage history", () => {
           },
           {
             type: "grant",
-            task_id: "grant-task",
             credits: 5_000,
             created_at: startAt / 1_000 + 8,
           },

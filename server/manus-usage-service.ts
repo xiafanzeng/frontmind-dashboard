@@ -36,14 +36,6 @@ export function aggregateManusUsageChangePage(input: {
   let expiredEntryCount = 0;
 
   for (const entry of input.entries) {
-    const taskId = String(entry?.task_id ?? "").trim();
-    if (!taskId || input.seenTaskIds?.has(taskId)) {
-      // usage.list documents one canonical row per task. Missing or repeated
-      // task identities cannot be summed safely as independent changes.
-      complete = false;
-      continue;
-    }
-    input.seenTaskIds?.add(taskId);
     const changedAt = parseUsageChangedAt(entry?.created_at);
     if (changedAt === null) {
       complete = false;
@@ -71,6 +63,15 @@ export function aggregateManusUsageChangePage(input: {
       complete = false;
       continue;
     }
+    const taskId = String(entry?.task_id ?? "").trim();
+    if (!taskId || input.seenTaskIds?.has(taskId)) {
+      // Consumption/refund rows affect the total and therefore require a
+      // stable session identity for cross-page deduplication. Account-level
+      // grants legitimately omit task_id and were already excluded above.
+      complete = false;
+      continue;
+    }
+    input.seenTaskIds?.add(taskId);
     if (
       (type === "cost" && credits > 0) ||
       (type === "refund" && credits < 0)

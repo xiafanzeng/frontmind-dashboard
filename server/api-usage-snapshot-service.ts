@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { and, asc, desc, eq, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import mysql from "mysql2/promise";
 
 import {
@@ -1958,7 +1958,8 @@ export async function getAdminApiUsageHierarchy(actor: AuthenticatedUser) {
   };
 }
 
-async function upsertSnapshot(input: {
+/** Finalize a claimed snapshot only while its opaque cross-process token wins. */
+export async function finalizeApiUsageSnapshotClaim(input: {
   executor: any;
   policy: typeof apiUsagePolicies.$inferSelect;
   credentialFingerprint: string | null;
@@ -1968,7 +1969,7 @@ async function upsertSnapshot(input: {
   errorCode?: string | null;
   windowStartedAt?: Date;
   now: Date;
-  syncToken?: string;
+  syncToken: string;
 }) {
   const existing = await input.executor
     .select()
@@ -1996,12 +1997,13 @@ async function upsertSnapshot(input: {
     errorCode: input.errorCode?.slice(0, 64) ?? null,
     updatedAt: input.now,
   } as const;
+  // The opaque claim token is the complete cross-process CAS identity. Do not
+  // also compare the second-precision MySQL TIMESTAMP with the original
+  // millisecond Date: MySQL may round that value into the next second and make
+  // the rightful claimant silently update zero rows.
   const finalizeConditions = [
     eq(apiUsageSnapshots.policyId, input.policy.id),
-    lte(apiUsageSnapshots.updatedAt, input.now),
-    ...(input.syncToken
-      ? [eq(apiUsageSnapshots.syncToken, input.syncToken)]
-      : []),
+    eq(apiUsageSnapshots.syncToken, input.syncToken),
   ];
   if (existing[0]) {
     await input.executor
@@ -2223,7 +2225,7 @@ async function syncApiUsageSnapshotsUnlocked(
       now,
     });
     if (!fingerprints.website) {
-      await upsertSnapshot({
+      await finalizeApiUsageSnapshotClaim({
         executor: db,
         policy,
         credentialFingerprint: null,
@@ -2243,7 +2245,7 @@ async function syncApiUsageSnapshotsUnlocked(
           attributionComplete: usage.attributionComplete,
           attributionErrorCode: "PARTIAL_WEBSITE_ATTRIBUTION",
         });
-        await upsertSnapshot({
+        await finalizeApiUsageSnapshotClaim({
           executor: db,
           policy,
           credentialFingerprint: fingerprints.website,
@@ -2263,7 +2265,7 @@ async function syncApiUsageSnapshotsUnlocked(
         synced += 1;
         if (!usage.complete || !usage.attributionComplete) failed += 1;
       } catch (error) {
-        await upsertSnapshot({
+        await finalizeApiUsageSnapshotClaim({
           executor: db,
           policy,
           credentialFingerprint: fingerprints.website,
@@ -2383,7 +2385,7 @@ async function syncApiUsageSnapshotsUnlocked(
         policy,
         now,
       });
-      return upsertSnapshot({
+      return finalizeApiUsageSnapshotClaim({
         executor: db,
         policy,
         credentialFingerprint: null,
@@ -2438,7 +2440,7 @@ async function syncApiUsageSnapshotsUnlocked(
         });
         await Promise.all(
           groupedAccountIds.map((accountId) =>
-            upsertSnapshot({
+            finalizeApiUsageSnapshotClaim({
               executor: db,
               policy: policyByAccount.get(accountId)!,
               credentialFingerprint: fingerprints.byUser.get(accountId) ?? null,
@@ -2448,7 +2450,7 @@ async function syncApiUsageSnapshotsUnlocked(
               errorCode: completion.errorCode,
               windowStartedAt: new Date(usage.period.startAt),
               now,
-              syncToken: syncTokenByAccount.get(accountId),
+              syncToken: syncTokenByAccount.get(accountId)!,
             }),
           ),
         );
@@ -2457,7 +2459,7 @@ async function syncApiUsageSnapshotsUnlocked(
       } catch (error) {
         await Promise.all(
           groupedAccountIds.map((accountId) =>
-            upsertSnapshot({
+            finalizeApiUsageSnapshotClaim({
               executor: db,
               policy: policyByAccount.get(accountId)!,
               credentialFingerprint: fingerprints.byUser.get(accountId) ?? null,
@@ -2472,7 +2474,7 @@ async function syncApiUsageSnapshotsUnlocked(
                 ).startAt,
               ),
               now,
-              syncToken: syncTokenByAccount.get(accountId),
+              syncToken: syncTokenByAccount.get(accountId)!,
             }),
           ),
         );
