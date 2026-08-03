@@ -180,7 +180,7 @@ describe("knowledge-base ChatInput actions", () => {
     );
 
     expect(
-      screen.getByText("正在恢复当前节点内容，显示完整后才可确认。"),
+      screen.getByText("正在处理当前节点内容，显示完整后才可确认。"),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
   });
@@ -311,7 +311,21 @@ describe("knowledge-base ChatInput actions", () => {
     );
 
     expect(screen.getByRole("textbox")).not.toBeDisabled();
-    expect(container.querySelector('input[type="file"]')).not.toBeDisabled();
+    const fileInput = container.querySelector('input[type="file"]')!;
+    expect(fileInput).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
+    expect(container.querySelector("svg.animate-spin")).not.toBeInTheDocument();
+    expect(container.querySelector("svg.lucide-send")).toBeInTheDocument();
+
+    fireEvent.change(fileInput, {
+      target: {
+        files: [new File(["image"], "补充图片.jpg", { type: "image/jpeg" })],
+      },
+    });
+
+    expect(screen.getByText("补充图片.jpg")).toBeInTheDocument();
+    const sendIcon = container.querySelector("svg.lucide-send")!;
+    expect(sendIcon).toBeInTheDocument();
+    expect(sendIcon.closest("button")).not.toBeDisabled();
   });
 });

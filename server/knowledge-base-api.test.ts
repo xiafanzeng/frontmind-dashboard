@@ -1,5 +1,4 @@
 import axios from "axios";
-import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -32,7 +31,6 @@ import {
   normalizeRecoveredTaskOutput,
   normalizeKnowledgeBaseClientAttachmentManifest,
   readKnowledgeBaseSkillArchiveAttachment,
-  requiresDeferredKnowledgeBaseAttachmentReservation,
   recoverKnowledgeBaseTurnClaimTask,
   resolveKnowledgeBaseEnterpriseIdentity,
   selectUnreconciledKnowledgeOutput,
@@ -40,7 +38,6 @@ import {
   shouldBindKnowledgeBaseInitialLogo,
   shouldReconcileKnowledgeOutput,
   uploadKnowledgeBaseSkillArchive,
-  verifyKnowledgeBaseUploadedAttachment,
   withKnowledgeBaseOpenRecoveryLeaseHeartbeat,
 } from "./knowledge-base-api";
 
@@ -210,67 +207,6 @@ describe("knowledge base execution contract", () => {
         },
       ]),
     ).toThrow("manifest entry 1 is invalid");
-  });
-
-  it("verifies staged upstream bytes against the reserved digest", async () => {
-    const reservedBytes = Buffer.from("aaaa");
-    const replacementBytes = Buffer.from("bbbb");
-    const expected = {
-      filename: "same.bin",
-      sizeBytes: reservedBytes.length,
-      mimeType: "application/octet-stream",
-      lastModified: 10,
-      sha256: createHash("sha256").update(reservedBytes).digest("hex"),
-    };
-    vi.spyOn(axios, "get").mockResolvedValueOnce({
-      status: 200,
-      data: reservedBytes,
-    });
-    await expect(
-      verifyKnowledgeBaseUploadedAttachment({
-        baseUrl: "https://api.example.test",
-        apiKey: "test-key",
-        fileId: "file-1",
-        expected,
-      }),
-    ).resolves.toEqual({
-      sizeBytes: reservedBytes.length,
-      sha256: expected.sha256,
-    });
-
-    vi.spyOn(axios, "get").mockResolvedValueOnce({
-      status: 200,
-      data: replacementBytes,
-    });
-    await expect(
-      verifyKnowledgeBaseUploadedAttachment({
-        baseUrl: "https://api.example.test",
-        apiKey: "test-key",
-        fileId: "file-2",
-        expected,
-      }),
-    ).rejects.toMatchObject({ code: "CONFLICT" });
-  });
-
-  it("does not let a v4 caller bypass digest reservation through the legacy turn route", () => {
-    expect(
-      requiresDeferredKnowledgeBaseAttachmentReservation({
-        skillVersion: "4",
-        userAttachmentCount: 1,
-      }),
-    ).toBe(true);
-    expect(
-      requiresDeferredKnowledgeBaseAttachmentReservation({
-        skillVersion: "4",
-        userAttachmentCount: 0,
-      }),
-    ).toBe(false);
-    expect(
-      requiresDeferredKnowledgeBaseAttachmentReservation({
-        skillVersion: "3",
-        userAttachmentCount: 1,
-      }),
-    ).toBe(false);
   });
 
   it("routes only unrecoverable ready packages to explicit rebind", () => {

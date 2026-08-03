@@ -820,6 +820,8 @@ describe("knowledge-base production final-package acceptance", () => {
     let includeFinalPackage = true;
     const uploadedFileBytes = new Map<string, number>();
     const operationTaskPosts = new Map<string, number>();
+    let rawTaskPosts = 0;
+    let transientConfirmationFailuresRemaining = 1;
     const idempotentTaskResponses = new Map<
       string,
       { id: string; status: "awaiting_input" | "completed"; output: unknown[] }
@@ -846,6 +848,7 @@ describe("knowledge-base production final-package acceptance", () => {
       },
     );
     upstream.post("/v1/tasks", (req, res) => {
+      rawTaskPosts += 1;
       expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
       const prompt = String(req.body.prompt || "");
       const operationId = prompt.match(/"operationId":"([^"]+)"/u)?.[1];
@@ -869,11 +872,16 @@ describe("knowledge-base production final-package acceptance", () => {
         return;
       }
 
+      const isStart = turn!.operationType === "start";
+      if (!isStart && transientConfirmationFailuresRemaining > 0) {
+        transientConfirmationFailuresRemaining -= 1;
+        res.status(503).json({ error: { message: "temporary overload" } });
+        return;
+      }
       operationTaskPosts.set(
         operationId!,
         (operationTaskPosts.get(operationId!) || 0) + 1,
       );
-      const isStart = turn!.operationType === "start";
       const revision = Number(turn!.expectedRevision);
       if (isStart) {
         expect(req.body.taskId).toBeUndefined();
@@ -1103,8 +1111,54 @@ describe("knowledge-base production final-package acceptance", () => {
           body: JSON.stringify(body),
         },
       );
-      expect(response.status).toBe(200);
-      return (await response.json()) as any;
+      if (pathname === "/turn") {
+        expect([200, 202]).toContain(response.status);
+      } else {
+        expect(response.status).toBe(200);
+      }
+      const payload = (await response.json()) as any;
+      if (pathname !== "/turn" || payload.idempotent) return payload;
+      expect(response.status).toBe(202);
+
+      const clientRequestId = String(body.clientRequestId || "");
+      const deadline = Date.now() + 5_000;
+      let acceptedTurn: (typeof state.turns)[number] | undefined;
+      while (Date.now() < deadline) {
+        acceptedTurn = state.turns.find(
+          (candidate) => candidate.clientRequestId === clientRequestId,
+        );
+        const build = state.builds.find(
+          (candidate) => candidate.id === acceptedTurn?.buildId,
+        );
+        const isDeliberatelyRejectedFinalTurn =
+          acceptedTurn?.expectedRevision === fixture.leaves.length - 1;
+        const dispatchSettled = Boolean(
+          acceptedTurn?.upstreamTaskId &&
+            ((build && build.revision > acceptedTurn.expectedRevision) ||
+              (isDeliberatelyRejectedFinalTurn && packageDownloads > 0) ||
+              acceptedTurn.status === "completed" ||
+              acceptedTurn.status === "failed" ||
+              acceptedTurn.status === "cancelled" ||
+              build?.activeTurnId !== acceptedTurn.id ||
+              build?.status === "protocol_error"),
+        );
+        if (dispatchSettled) break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(acceptedTurn?.upstreamTaskId).toBeTruthy();
+      const observationResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/knowledge-base/progress/${encodeURIComponent(String(body.conversationId || ""))}`,
+        { headers: { "x-test-auth": "user" } },
+      );
+      expect(observationResponse.status).toBe(200);
+      const observed = (await observationResponse.json()) as any;
+      return {
+        ...payload,
+        task: { id: acceptedTurn!.upstreamTaskId, status: "running" },
+        observation: observed.observation,
+        progress: observed.progress,
+        interaction: observed.interaction,
+      };
     };
 
     const startRequest = {
@@ -1475,10 +1529,20 @@ describe("knowledge-base production final-package acceptance", () => {
     expect(authoritativeTaskReads).toBe(2);
     expect(logoDownloads).toBe(2);
     expect(packageDownloads).toBe(2);
-    expect(uploadedFileSequence).toBe(9);
-    expect(uploadedFileBytes.size).toBe(9);
+    // The Skill is a build-scoped immutable asset: upload it once at start,
+    // then reuse the same owned file id for every confirmed leaf.
+    expect(uploadedFileSequence).toBe(1);
+    expect(uploadedFileBytes.size).toBe(1);
+    expect(
+      new Set(
+        state.turns
+          .flatMap((turn) => turn.attachmentFileIds || [])
+          .filter((fileId) => /^uploaded-skill-/u.test(fileId)),
+      ),
+    ).toEqual(new Set(["uploaded-skill-1"]));
     expect(operationTaskPosts.size).toBe(9);
     expect([...operationTaskPosts.values()]).toEqual(Array(9).fill(1));
+    expect(rawTaskPosts).toBe(10);
     expect(state.builds[0]).toMatchObject({
       id: buildId,
       // reservation + upstream binding + authoritative reconcile per operation

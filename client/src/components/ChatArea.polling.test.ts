@@ -7,6 +7,7 @@ import {
   readKnowledgeBaseStartRequestError,
   recoverKnowledgeBaseNotice,
   runningAssistantStatusText,
+  shouldRenderKnowledgeBaseNotice,
   shouldRecoverKnowledgeBaseStartFailure,
 } from "./ChatArea";
 
@@ -81,6 +82,17 @@ describe("knowledge-base notice recovery", () => {
     expectedRevision: 8,
     expectedLeafId: null,
   };
+
+  it("keeps the legacy attachment unlock notice internal while rendering real failures", () => {
+    expect(
+      shouldRenderKnowledgeBaseNotice({
+        code: "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED",
+      }),
+    ).toBe(false);
+    expect(
+      shouldRenderKnowledgeBaseNotice({ code: "PROGRESS_PROTOCOL_INVALID" }),
+    ).toBe(true);
+  });
 
   it("reconciles PACKAGE_REBIND_REQUIRED against the same task without creating a turn", async () => {
     const observation = { interaction: { progress: null } } as any;

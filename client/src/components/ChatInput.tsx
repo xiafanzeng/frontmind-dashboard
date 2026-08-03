@@ -370,7 +370,7 @@ export default function ChatInput({
                       <p className="mt-1 text-xs leading-5 text-violet-800/80">
                         {currentNodePresentationReady
                           ? "可直接确认，也可以输入修改意见或上传补充资料。"
-                          : "正在恢复当前节点内容，显示完整后才可确认。"}
+                          : "正在处理当前节点内容，显示完整后才可确认。"}
                       </p>
                     </div>
                     <div className="shrink-0">
@@ -406,7 +406,10 @@ export default function ChatInput({
               <div className="flex items-center gap-2 mb-1.5">
                 <Upload className="w-3.5 h-3.5 text-primary animate-pulse" />
                 <span className="text-xs text-muted-foreground">
-                  上传文件 ({uploadProgress.currentFileIndex + 1}/
+                  {uploadProgress.phase === "verifying"
+                    ? "正在校验并提交"
+                    : "上传文件"}{" "}
+                  ({uploadProgress.currentFileIndex + 1}/
                   {uploadProgress.totalFiles})：
                   <span className="text-foreground font-medium ml-1">
                     {uploadProgress.currentFileName}
@@ -502,7 +505,9 @@ export default function ChatInput({
               onKeyDown={handleKeyDown}
               placeholder={
                 isUploading
-                  ? `正在上传文件 ${uploadProgress!.overallPercent}%...`
+                  ? uploadProgress!.phase === "verifying"
+                    ? "附件已上传，正在校验并提交本轮…"
+                    : `正在上传文件 ${uploadProgress!.overallPercent}%...`
                   : inputLocked
                     ? syncKnowledgeBaseSnapshot
                       ? "正在根据你的补充资料更新当前节点…"
@@ -617,7 +622,9 @@ export default function ChatInput({
                     : "bg-muted text-muted-foreground",
                 )}
               >
-                {isSending || isRunning || isUploading ? (
+                {isSending ||
+                isUploading ||
+                (isRunning && !knowledgeBaseAttachmentResumeRequired) ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
                   <Send className="w-4 h-4" />

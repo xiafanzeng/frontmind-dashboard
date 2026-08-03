@@ -1,12 +1,40 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { reconcileKnowledgeBaseObservation } from "./knowledge-progress";
+import {
+  knowledgeBaseObservationFromPayload,
+  reconcileKnowledgeBaseObservation,
+} from "./knowledge-progress";
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("reconcileKnowledgeBaseObservation", () => {
+  it("preserves an explicit unbound authority instead of adopting a placeholder task id", () => {
+    const observation = knowledgeBaseObservationFromPayload({
+      task: { id: "turn-placeholder", status: "running" },
+      observation: {
+        stateEpoch: 4,
+        generation: 2,
+        authoritativeTaskId: null,
+        activeTurn: { id: "turn-placeholder", status: "queued" },
+        interaction: {
+          progress: null,
+          interactionState: "queued",
+          canReply: false,
+          canPublish: false,
+          lockReason: null,
+        },
+        approvedPresentation: null,
+        package: null,
+        notice: null,
+        conversationVersion: 4,
+      },
+    });
+
+    expect(observation.authoritativeTaskId).toBeNull();
+  });
+
   it("recovers a durable failed projection after reconcile returns 422", async () => {
     const failedObservation = {
       stateEpoch: 3,

@@ -82,6 +82,14 @@ export function runningAssistantStatusText(syncKnowledgeBaseSnapshot: boolean) {
 
 export const KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE =
   "PACKAGE_REBIND_REQUIRED";
+export const KNOWLEDGE_BASE_INTERNAL_ATTACHMENT_NOTICE_CODE =
+  "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED";
+
+export function shouldRenderKnowledgeBaseNotice(
+  notice: Pick<KnowledgeBaseClientNotice, "code">,
+) {
+  return notice.code !== KNOWLEDGE_BASE_INTERNAL_ATTACHMENT_NOTICE_CODE;
+}
 
 export function knowledgeBaseNoticeRecoveryMode(
   notice: Pick<KnowledgeBaseClientNotice, "code">,
@@ -776,7 +784,10 @@ export default function ChatArea({
           </AnimatePresence>
 
           {syncKnowledgeBaseSnapshot &&
-            activeConversation.knowledgeBase?.notice && (
+            activeConversation.knowledgeBase?.notice &&
+            shouldRenderKnowledgeBaseNotice(
+              activeConversation.knowledgeBase.notice,
+            ) && (
               <div
                 className={cn(
                   "rounded-xl border px-4 py-3 text-sm",

@@ -50,6 +50,7 @@ function snapshotExecutor(snapshot: {
   build: Record<string, unknown>;
   nodes: Record<string, unknown>[];
   conversation: Record<string, unknown>;
+  turns?: Record<string, unknown>[];
 }) {
   return {
     select() {
@@ -58,7 +59,7 @@ function snapshotExecutor(snapshot: {
           if (table === knowledgeBaseBuilds) return query([snapshot.build]);
           if (table === knowledgeBaseBuildNodes) return query(snapshot.nodes);
           if (table === conversations) return query([snapshot.conversation]);
-          if (table === conversationTurns) return query([]);
+          if (table === conversationTurns) return query(snapshot.turns || []);
           return query([]);
         },
       };
@@ -152,6 +153,58 @@ function node(overrides: Record<string, unknown> = {}) {
 }
 
 describe("knowledge-base observation consistency", () => {
+  it("does not expose the completed parent task while an accepted turn is unbound", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const acceptedTurn = {
+      id: "turn-accepted",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-accepted",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-accepted",
+      operationType: "confirm",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      status: "queued",
+      upstreamTaskId: null,
+      metadata: {},
+      startedAt: null,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({ activeTurnId: acceptedTurn.id }),
+            nodes: [node()],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [acceptedTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation).toMatchObject({
+      authoritativeTaskId: null,
+      activeTurn: {
+        id: "turn-accepted",
+        status: "queued",
+      },
+    });
+  });
+
   it("returns one transactional snapshot while a newer build commits concurrently", async () => {
     const live = {
       build: build(),

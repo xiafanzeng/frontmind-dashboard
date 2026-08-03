@@ -95,6 +95,7 @@ import {
   completeKnowledgeBaseGeneratedAttachment,
   findRecoverableKnowledgeBaseTurnIds,
   failKnowledgeBaseTurnDeterministically,
+  findReusableKnowledgeBaseSkillFileId,
   freezeKnowledgeBaseTurnAttachments,
   markKnowledgeBaseTurnDispatching,
   markKnowledgeBaseTurnOutcomeUnknown,
@@ -1423,11 +1424,24 @@ async function uploadRecoverySkill(input: {
     turnId: input.claim.turn.id,
     leaseToken: input.claim.leaseToken,
   });
+  const skillArchive = await readKnowledgeBaseSkillArchiveAttachment({
+    version: input.skillVersion,
+    contentHash: input.skillContentHash,
+  });
+  const reusableUpstreamFileId = await findReusableKnowledgeBaseSkillFileId({
+    userId: input.claim.turn.userId,
+    buildId: input.claim.turn.buildId!,
+    apiCredentialId: input.credential.id,
+    contentSha256: createHash("sha256")
+      .update(skillArchive.bytes)
+      .digest("hex"),
+  }).catch(() => null);
   const uploaded = await uploadKnowledgeBaseSkillArchive({
     baseUrl: input.baseUrl,
     apiKey: input.credential.apiKey,
     skillVersion: input.skillVersion,
     skillContentHash: input.skillContentHash,
+    reusableUpstreamFileId,
     durable: {
       userId: input.claim.turn.userId,
       turnId: input.claim.turn.id,
@@ -1566,7 +1580,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         turnId: claim.turn.id,
       },
     });
-    return prepareKnowledgeBaseTurnDispatch({
+    const prepared = await prepareKnowledgeBaseTurnDispatch({
       userId: claim.turn.userId,
       turnId: claim.turn.id,
       leaseToken: claim.leaseToken,
@@ -1576,6 +1590,10 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       attachments,
       parentTaskId,
     });
+    // Short accepted-path retries must reuse the exact prepared POST instead
+    // of rebuilding attachments from the stale in-memory claim.
+    claim.preparedDispatch = prepared;
+    return prepared;
   }
 
   if (kind !== "start" || !conversationId) {
@@ -1688,7 +1706,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       turnId: claim.turn.id,
     },
   });
-  return prepareKnowledgeBaseTurnDispatch({
+  const prepared = await prepareKnowledgeBaseTurnDispatch({
     userId: claim.turn.userId,
     turnId: claim.turn.id,
     leaseToken: claim.leaseToken,
@@ -1697,6 +1715,8 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     agentProfile,
     attachments,
   });
+  claim.preparedDispatch = prepared;
+  return prepared;
 }
 
 async function reconcileRecoveredKnowledgeBaseTask(input: {
@@ -2103,79 +2123,6 @@ export function normalizeKnowledgeBaseClientAttachmentManifest(
     }
     return { filename, sizeBytes, mimeType, lastModified, sha256 };
   });
-}
-
-export function requiresDeferredKnowledgeBaseAttachmentReservation(input: {
-  skillVersion: string | null | undefined;
-  userAttachmentCount: number;
-}) {
-  return input.skillVersion === "4" && input.userAttachmentCount > 0;
-}
-
-/**
- * Re-reads the just-uploaded upstream object before binding it to a durable
- * browser reservation. This prevents a same-name/same-size replacement from
- * being mistaken for the bytes whose digest was reserved before upload.
- */
-export async function verifyKnowledgeBaseUploadedAttachment(input: {
-  baseUrl: string;
-  apiKey: string;
-  fileId: string;
-  expected: KnowledgeBaseClientAttachmentManifestItem;
-}) {
-  const downloadUrl = `${input.baseUrl.replace(/\/$/u, "")}/v1/files/${encodeURIComponent(input.fileId)}/content`;
-  let lastStatus = 0;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      const response = await axios.get<ArrayBuffer>(downloadUrl, {
-        headers: {
-          API_KEY: input.apiKey,
-          Authorization: `Bearer ${input.apiKey}`,
-        },
-        responseType: "arraybuffer",
-        timeout: 120_000,
-        proxy: false,
-        maxRedirects: 0,
-        maxContentLength: MAX_KNOWLEDGE_BASE_CLIENT_ATTACHMENT_BYTES,
-        maxBodyLength: MAX_KNOWLEDGE_BASE_CLIENT_ATTACHMENT_BYTES,
-        validateStatus: () => true,
-      });
-      lastStatus = response.status;
-      if (response.status >= 200 && response.status < 300) {
-        const bytes = Buffer.from(response.data);
-        const sha256 = createHash("sha256").update(bytes).digest("hex");
-        if (
-          bytes.length !== input.expected.sizeBytes ||
-          sha256 !== input.expected.sha256
-        ) {
-          throw new KnowledgeBaseTurnReservationError(
-            "CONFLICT",
-            "上传文件字节与本轮预约不一致，请重新选择原文件",
-          );
-        }
-        return { sizeBytes: bytes.length, sha256 };
-      }
-      if (
-        ![404, 409, 425, 429].includes(response.status) &&
-        response.status < 500
-      ) {
-        break;
-      }
-    } catch (error) {
-      if (error instanceof KnowledgeBaseTurnReservationError) throw error;
-      if (attempt === 2) break;
-    }
-    if (attempt < 2) {
-      await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
-    }
-  }
-  throw new KnowledgeBaseTurnReservationError(
-    "IDEMPOTENCY_PENDING",
-    lastStatus
-      ? "上传文件尚未可验证，请稍后重试同一文件"
-      : "暂时无法验证上传文件，请稍后重试同一文件",
-    1_000,
-  );
 }
 
 function normalizeUserAttachments(
@@ -2690,6 +2637,7 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
   filename: string;
   bytes: Buffer;
   mimeType?: string;
+  reusableUpstreamFileId?: string | null;
   durable: DurableKnowledgeBaseGeneratedAttachment;
 }) {
   const mimeType = input.mimeType || "application/zip";
@@ -2704,6 +2652,36 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
     sizeBytes: input.bytes.length,
     contentSha256: createHash("sha256").update(input.bytes).digest("hex"),
   });
+  const reusableUpstreamFileId = String(
+    input.reusableUpstreamFileId || "",
+  ).trim();
+  if (
+    reusableUpstreamFileId &&
+    (!reservation.upstreamFileId ||
+      reservation.upstreamFileId === reusableUpstreamFileId)
+  ) {
+    if (!reservation.upstreamFileId) {
+      await completeKnowledgeBaseGeneratedAttachment({
+        userId: input.durable.userId,
+        turnId: input.durable.turnId,
+        leaseToken: input.durable.leaseToken,
+        role: input.durable.role,
+        attachmentIndex: input.durable.attachmentIndex,
+        requestHash: reservation.requestHash,
+        upstreamFileId: reusableUpstreamFileId,
+      });
+    }
+    return {
+      attachment: {
+        file_id: reusableUpstreamFileId,
+        filename: input.filename,
+      },
+      fileId: reusableUpstreamFileId,
+      // The file belongs to an already completed turn and may be shared by
+      // later turns in this build. A failed continuation must never delete it.
+      removeOrphan: async () => undefined,
+    };
+  }
   return uploadUpstreamTaskAttachment({
     baseUrl: input.baseUrl,
     apiKey: input.apiKey,
@@ -2733,12 +2711,14 @@ export async function uploadKnowledgeBaseSkillArchive({
   apiKey,
   skillVersion = "4",
   skillContentHash,
+  reusableUpstreamFileId,
   durable,
 }: {
   baseUrl: string;
   apiKey: string;
   skillVersion?: string;
   skillContentHash?: string | null;
+  reusableUpstreamFileId?: string | null;
   durable?: Omit<DurableKnowledgeBaseGeneratedAttachment, "role">;
 }) {
   const archive = await readKnowledgeBaseSkillArchiveAttachment({
@@ -2751,6 +2731,7 @@ export async function uploadKnowledgeBaseSkillArchive({
         apiKey,
         filename: archive.filename,
         bytes: archive.bytes,
+        reusableUpstreamFileId,
         durable: { ...durable, role: "skill" },
       })
     : await uploadUpstreamTaskAttachment({
@@ -2885,6 +2866,7 @@ async function persistKnowledgeBaseCreateFailure(input: {
   leaseToken: string;
   error: unknown;
   outcomeUnknownCode: string;
+  recoveryDelayMs?: number;
 }) {
   const createError =
     input.error instanceof KnowledgeBaseUpstreamCreateError
@@ -2911,8 +2893,100 @@ async function persistKnowledgeBaseCreateFailure(input: {
       createError.failureClass === "retriable"
         ? createError.failureCode
         : input.outcomeUnknownCode,
+    ...(input.recoveryDelayMs
+      ? { recoveryDelayMs: input.recoveryDelayMs }
+      : {}),
   });
   return createError.failureClass;
+}
+
+const KNOWLEDGE_BASE_ACCEPTED_DISPATCH_RETRY_DELAYS_MS = [
+  500, 1_500, 3_000,
+] as const;
+
+function knowledgeBaseDispatchRetryable(error: unknown) {
+  if (
+    error instanceof KnowledgeBaseTurnReservationError ||
+    error instanceof KnowledgeBaseBuildError ||
+    error instanceof KnowledgeBaseArtifactBindingError
+  ) {
+    return false;
+  }
+  if (error instanceof KnowledgeBaseUpstreamCreateError) {
+    return error.failureClass !== "deterministic";
+  }
+  if (axios.isAxiosError(error)) return true;
+  return (
+    error instanceof Error &&
+    /^Task attachment (?:creation|upload|upload URL lookup) failed:/u.test(
+      error.message,
+    )
+  );
+}
+
+/**
+ * The browser request only commits the durable turn. External file/task calls
+ * continue after the 202 response, with the same lease and idempotency keys.
+ * Short transient failures are retried here so the normal path never depends
+ * on the 30-second disaster-recovery sweep.
+ */
+async function dispatchAcceptedKnowledgeBaseClaim(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  credential: RecoveryCredential;
+}) {
+  return withKnowledgeBaseRecoveryLeaseHeartbeat({
+    claim: input.claim,
+    operation: async () => {
+      let lastError: unknown;
+      for (
+        let attempt = 0;
+        attempt <= KNOWLEDGE_BASE_ACCEPTED_DISPATCH_RETRY_DELAYS_MS.length;
+        attempt += 1
+      ) {
+        try {
+          return await dispatchKnowledgeBaseRecoveryClaim(
+            input.claim,
+            input.credential,
+          );
+        } catch (error) {
+          lastError = error;
+          const delayMs =
+            KNOWLEDGE_BASE_ACCEPTED_DISPATCH_RETRY_DELAYS_MS[attempt];
+          if (!knowledgeBaseDispatchRetryable(error) || delayMs === undefined) {
+            throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+      throw lastError;
+    },
+  });
+}
+
+function launchAcceptedKnowledgeBaseClaim(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  credential: RecoveryCredential;
+  outcomeUnknownCode: string;
+}) {
+  void dispatchAcceptedKnowledgeBaseClaim(input).catch(async (error) => {
+    await persistKnowledgeBaseCreateFailure({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      error,
+      outcomeUnknownCode: input.outcomeUnknownCode,
+      recoveryDelayMs: 1_000,
+    }).catch(() => undefined);
+    logKnowledgeBaseRuntimeFailure({
+      level: "warn",
+      event: "[KnowledgeBaseAcceptedDispatch] deferred",
+      userId: input.claim.turn.userId,
+      buildId: input.claim.turn.buildId,
+      turnId: input.claim.turn.id,
+      error,
+      additionalSecrets: [input.credential.apiKey],
+    });
+  });
 }
 
 export async function buildKnowledgeBaseTurnPrompt(input: {
@@ -3803,7 +3877,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
     res.status(400).json({
       error: {
         code: "INVALID_KNOWLEDGE_BASE_ATTACHMENT_STAGE",
-        message: "附件暂存请求无效，请重新选择原文件后重试",
+        message: "附件提交参数无效，请重新提交本轮",
       },
     });
     return;
@@ -3832,7 +3906,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
     ) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
-        "上传文件与预约清单位置不一致，请重新选择原文件",
+        "上传文件与本轮附件清单不一致",
       );
     }
     const build = await loadKnowledgeBaseBuildRecord(
@@ -3869,12 +3943,11 @@ router.post("/turn/attachments/stage", async (req, res) => {
       });
       return;
     }
-    await verifyKnowledgeBaseUploadedAttachment({
-      baseUrl: getUpstreamBaseUrl(req),
-      apiKey: taskCredential.apiKey,
-      fileId: attachment.file_id,
-      expected: manifestItem,
-    });
+    // uploadFile only calls this route after the signed PUT has completed.
+    // Bind that already-owned file id immediately, as the OEM client does.
+    // Re-downloading the entire object here made submission time depend on
+    // object-store read-after-write visibility and incorrectly rejected slow
+    // or large uploads after an arbitrary verification window.
     const turn = await stageKnowledgeBaseDeferredTurnAttachment({
       userId: req.frontmindUser.id,
       buildId: build.id,
@@ -3884,6 +3957,63 @@ router.post("/turn/attachments/stage", async (req, res) => {
       index,
       attachment,
     });
+    if (turn.stagedUserAttachmentCount >= turn.expectedUserAttachmentCount) {
+      const dispatchClaim = await claimKnowledgeBaseDeferredTurnDispatch({
+        userId: req.frontmindUser.id,
+        buildId: build.id,
+        turnId,
+        clientRequestId,
+        clientAttachmentManifest: manifest,
+      });
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus:
+          dispatchClaim.state === "completed" ? "completed" : "running",
+      }).catch(() => null);
+      if (dispatchClaim.state === "acquired") {
+        res.status(202).json({
+          reservation: {
+            state: "pending",
+            turnId: dispatchClaim.turn.id,
+            clientRequestId: dispatchClaim.turn.clientRequestId,
+            stagedAttachmentCount: dispatchClaim.turn.stagedUserAttachmentCount,
+            expectedAttachmentCount:
+              dispatchClaim.turn.expectedUserAttachmentCount,
+            requiresUpload: false,
+          },
+          task: { id: dispatchClaim.turn.id, status: "running" },
+          observation,
+          accepted: true,
+        });
+        launchAcceptedKnowledgeBaseClaim({
+          claim: dispatchClaim,
+          credential: taskCredential,
+          outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
+        });
+        return;
+      }
+      res
+        .status(dispatchClaim.state === "pending" ? 202 : 200)
+        .setHeader(
+          "Retry-After",
+          String(Math.ceil(reservationRetryAfterMs(dispatchClaim) / 1_000)),
+        )
+        .json({
+          reservation: {
+            state: dispatchClaim.state,
+            turnId: dispatchClaim.turn.id,
+            clientRequestId: dispatchClaim.turn.clientRequestId,
+            stagedAttachmentCount: dispatchClaim.turn.stagedUserAttachmentCount,
+            expectedAttachmentCount:
+              dispatchClaim.turn.expectedUserAttachmentCount,
+            requiresUpload: false,
+          },
+          observation,
+          idempotent: true,
+        });
+      return;
+    }
     const observation = await getKnowledgeBaseObservation({
       userId: req.frontmindUser.id,
       conversationId,
@@ -3908,13 +4038,21 @@ router.post("/turn/attachments/stage", async (req, res) => {
         conversationId,
         upstreamStatus: "running",
       }).catch(() => null);
+      if (error.retryAfterMs) {
+        res.setHeader(
+          "Retry-After",
+          String(Math.max(1, Math.ceil(error.retryAfterMs / 1_000))),
+        );
+      }
       res
         .status(
           error.code === "RESERVATION_NOT_FOUND"
             ? 404
             : error.code === "INVALID_REQUEST"
               ? 400
-              : 409,
+              : error.code === "IDEMPOTENCY_PENDING"
+                ? 425
+                : 409,
         )
         .json({
           error: { code: error.code, message: error.message },
@@ -3925,7 +4063,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
     res.status(422).json({
       error: {
         code: "KNOWLEDGE_BASE_ATTACHMENT_STAGE_FAILED",
-        message: "附件暂存失败；本轮预约仍保留，请重试同一文件",
+        message: "附件提交失败，请重新提交本轮",
       },
     });
   }
@@ -3950,7 +4088,7 @@ router.post("/turn/dispatch", async (req, res) => {
     res.status(400).json({
       error: {
         code: "INVALID_KNOWLEDGE_BASE_TURN_DISPATCH",
-        message: "附件绑定请求无效，请重新选择原文件后重试",
+        message: "附件提交参数无效，请重新提交本轮",
       },
     });
     return;
@@ -4035,54 +4173,27 @@ router.post("/turn/dispatch", async (req, res) => {
       return;
     }
 
-    const dispatched = await dispatchKnowledgeBaseRecoveryClaim(
-      acquiredClaim,
-      taskCredential,
-    );
     const observation = await getKnowledgeBaseObservation({
       userId: req.frontmindUser.id,
       conversationId,
       upstreamStatus: "running",
-    });
-    res.json({
-      task: { id: dispatched.taskId, status: "running" },
+    }).catch(() => null);
+    res.status(202).json({
+      task: { id: acquiredClaim.turn.id, status: "running" },
       observation,
       progress: observation?.interaction.progress || null,
       interaction:
         observation?.interaction ||
         deriveKnowledgeBaseInteraction(null, "running"),
-      startedAt: acquiredClaim.turn.startedAt?.getTime() || Date.now(),
+      accepted: true,
+      startedAt: acquiredClaim.turn.createdAt.getTime(),
+    });
+    launchAcceptedKnowledgeBaseClaim({
+      claim: acquiredClaim,
+      credential: taskCredential,
+      outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
     });
   } catch (error) {
-    let createFailureClass: KnowledgeBaseUpstreamCreateFailureClass | null =
-      null;
-    if (acquiredClaim?.state === "acquired") {
-      createFailureClass = await persistKnowledgeBaseCreateFailure({
-        userId: acquiredClaim.turn.userId,
-        turnId: acquiredClaim.turn.id,
-        leaseToken: acquiredClaim.leaseToken,
-        error,
-        outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
-      }).catch(() => null);
-    }
-    if (
-      createFailureClass === "deterministic" &&
-      error instanceof KnowledgeBaseUpstreamCreateError
-    ) {
-      const observation = await getKnowledgeBaseObservation({
-        userId: req.frontmindUser!.id,
-        conversationId,
-        upstreamStatus: "failed",
-      }).catch(() => null);
-      res.status(error.status || 502).json({
-        error: {
-          code: error.failureCode,
-          message: deterministicKnowledgeBaseCreateFailureMessage(error),
-        },
-        ...(observation ? { observation } : {}),
-      });
-      return;
-    }
     if (error instanceof KnowledgeBaseTurnReservationError) {
       const observation = req.frontmindUser
         ? await getKnowledgeBaseObservation({
@@ -4107,9 +4218,8 @@ router.post("/turn/dispatch", async (req, res) => {
     }
     res.status(502).json({
       error: {
-        code: "KNOWLEDGE_BASE_TURN_DISPATCH_UNKNOWN",
-        message:
-          "本轮已保留，附件绑定或派发结果暂时未知；请勿新建本轮，系统将按原预约恢复",
+        code: "KNOWLEDGE_BASE_TURN_DISPATCH_FAILED",
+        message: "本轮提交失败，请稍后重试",
       },
     });
   }
@@ -4121,6 +4231,8 @@ router.post("/turn", async (req, res) => {
     clientRequestId?: string;
     userMessage?: string;
     attachments?: KnowledgeBaseAttachment[];
+    resumeLegacyAttachments?: boolean;
+    attachmentManifest?: unknown;
     expectedRevision?: number;
     expectedLeafId?: string;
   };
@@ -4211,20 +4323,21 @@ router.post("/turn", async (req, res) => {
       return;
     }
     const attachments = normalizeUserAttachments(body.attachments);
+    const resumeLegacyAttachments = body.resumeLegacyAttachments === true;
+    const legacyAttachmentManifest = resumeLegacyAttachments
+      ? normalizeKnowledgeBaseClientAttachmentManifest(body.attachmentManifest)
+      : undefined;
     if (
-      requiresDeferredKnowledgeBaseAttachmentReservation({
-        skillVersion: boundBuild.skillVersion,
-        userAttachmentCount: attachments.length,
-      })
+      legacyAttachmentManifest &&
+      (legacyAttachmentManifest.length !== attachments.length ||
+        legacyAttachmentManifest.some(
+          (entry, index) => entry.filename !== attachments[index]?.filename,
+        ))
     ) {
-      res.status(409).json({
-        error: {
-          code: "KNOWLEDGE_BASE_ATTACHMENT_RESERVATION_REQUIRED",
-          message:
-            "新版知识库附件必须先完成字节校验预约，请刷新后重新选择原文件",
-        },
-      });
-      return;
+      throw new KnowledgeBaseTurnReservationError(
+        "INVALID_REQUEST",
+        "Legacy attachment manifest does not match the uploaded file order",
+      );
     }
     for (const attachment of attachments) {
       const fileCredential = await getCredentialForUpstreamResource(
@@ -4254,6 +4367,21 @@ router.post("/turn", async (req, res) => {
       version: boundBuild.skillVersion,
       contentHash: boundBuild.skillContentHash,
     };
+    const recoveryMetadata = {
+      kind: "turn",
+      conversationId,
+      parentTaskId: taskId,
+      userMessage,
+      attachments,
+      skillVersion: currentSkillDescriptor.version,
+      skillContentHash: currentSkillDescriptor.contentHash,
+      ...(legacyAttachmentManifest
+        ? {
+            attachmentManifest: legacyAttachmentManifest,
+            legacyUploadFirstTakeover: true,
+          }
+        : {}),
+    };
     const reservation = await reserveKnowledgeBaseTurn({
       userId: req.frontmindUser!.id,
       buildId: boundBuild.id,
@@ -4272,15 +4400,9 @@ router.post("/turn", async (req, res) => {
       userText: userMessage,
       userAttachmentCount: attachments.length,
       expectedAttachmentCount: attachments.length + 1,
-      recoveryMetadata: {
-        kind: "turn",
-        conversationId,
-        parentTaskId: taskId,
-        userMessage,
-        attachments,
-        skillVersion: currentSkillDescriptor.version,
-        skillContentHash: currentSkillDescriptor.contentHash,
-      },
+      clientAttachmentManifest: legacyAttachmentManifest,
+      resumeLegacyAttachmentTakeover: resumeLegacyAttachments,
+      recoveryMetadata,
     });
     if (reservation.state !== "acquired") {
       const observation = await getKnowledgeBaseObservation({
@@ -4315,186 +4437,32 @@ router.post("/turn", async (req, res) => {
         });
       return;
     }
-    const { turn, leaseToken, upstreamIdempotencyKey } = reservation;
-    const prompt = await buildKnowledgeBaseTurnPrompt({
-      userId: req.frontmindUser!.id,
-      conversationId,
-      userMessage,
-      attachments,
-      skillVersion: currentSkillDescriptor.version,
-      skillContentHash: currentSkillDescriptor.contentHash,
-      protocolOperation: {
-        operationId: turn.operationKey,
-        turnId: turn.id,
-      },
-    });
-    let created: Awaited<ReturnType<typeof createFrontMindTask>>;
-    let turnSkill:
-      | Awaited<ReturnType<typeof uploadKnowledgeBaseSkillArchive>>
-      | undefined;
-    try {
-      turnSkill = await uploadKnowledgeBaseSkillArchive({
-        baseUrl: getUpstreamBaseUrl(req),
-        apiKey: taskCredential.apiKey,
-        skillVersion: currentSkillDescriptor.version,
-        skillContentHash: currentSkillDescriptor.contentHash,
-        durable: {
-          userId: req.frontmindUser!.id,
-          turnId: turn.id,
-          leaseToken,
-          attachmentIndex: 0,
-        },
-      });
-      await renewKnowledgeBaseTurnLease({
-        userId: req.frontmindUser!.id,
-        turnId: turn.id,
-        leaseToken,
-      });
-      await stageKnowledgeBaseTurnAttachments({
-        userId: req.frontmindUser!.id,
-        turnId: turn.id,
-        leaseToken,
-        attachmentFileIds: [turnSkill.fileId],
-      });
-      await recordUpstreamResource({
-        userId: req.frontmindUser!.id,
-        apiCredentialId: taskCredential.id,
-        kind: "file",
-        upstreamId: turnSkill.fileId,
-      });
-      await freezeKnowledgeBaseTurnAttachments({
-        userId: req.frontmindUser!.id,
-        turnId: turn.id,
-        leaseToken,
-        attachmentFileIds: [
-          turnSkill.fileId,
-          ...attachments.map((attachment) => attachment.file_id),
-        ],
-      });
-      const preparedDispatch = await prepareKnowledgeBaseTurnDispatch({
-        userId: req.frontmindUser!.id,
-        turnId: turn.id,
-        leaseToken,
-        baseUrl: getUpstreamBaseUrl(req),
-        prompt,
-        agentProfile: toUpstreamAgentProfile(KNOWLEDGE_BASE_AGENT_PROFILE),
-        attachments: [turnSkill.attachment, ...attachments],
-        parentTaskId: taskId,
-      });
-      await markKnowledgeBaseTurnDispatching({
-        userId: req.frontmindUser!.id,
-        turnId: turn.id,
-        leaseToken,
-      });
-      created = await createFrontMindTask({
-        baseUrl: getUpstreamBaseUrl(req),
-        apiKey: taskCredential.apiKey,
-        requestBody: preparedDispatch.requestBody,
-        idempotencyKey: upstreamIdempotencyKey,
-      });
-    } catch (error) {
-      await persistKnowledgeBaseCreateFailure({
-        userId: req.frontmindUser!.id,
-        turnId: turn.id,
-        leaseToken,
-        error,
-        outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
-      }).catch(() => undefined);
-      throw error;
-    }
-    if (!created.ok) {
-      const createError = knowledgeBaseUpstreamCreateError(created);
-      const failureClass = await persistKnowledgeBaseCreateFailure({
-        userId: req.frontmindUser!.id,
-        turnId: turn.id,
-        leaseToken,
-        error: createError,
-        outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
-      });
-      const observation =
-        failureClass === "deterministic"
-          ? await getKnowledgeBaseObservation({
-              userId: req.frontmindUser!.id,
-              conversationId,
-              upstreamStatus: "failed",
-            })
-          : null;
-      res.status(created.status).json({
-        error: {
-          code: createError.failureCode,
-          message:
-            failureClass === "deterministic"
-              ? deterministicKnowledgeBaseCreateFailureMessage(createError)
-              : "当前知识节点提交结果暂不明确，系统将按原预约自动恢复",
-        },
-        ...(observation
-          ? {
-              observation,
-              progress: observation.interaction.progress,
-              interaction: observation.interaction,
-            }
-          : {}),
-      });
-      return;
-    }
-    await bindKnowledgeBaseTurnUpstreamTask({
-      userId: req.frontmindUser!.id,
-      turnId: turn.id,
-      leaseToken,
-      upstreamTaskId: String(created.task.id),
-    });
-    assertKnowledgeBaseCustomerOutput(created.task.output);
-    await recordUpstreamResource({
-      userId: req.frontmindUser!.id,
-      apiCredentialId: taskCredential.id,
-      kind: "task",
-      upstreamId: String(created.task.id),
-    });
-    await recordKnowledgeBaseOutputFiles({
-      userId: req.frontmindUser!.id,
-      apiCredentialId: taskCredential.id,
-      output: created.task.output,
-    });
-    let progress = await getKnowledgeBaseProgress({
-      userId: req.frontmindUser!.id,
-      conversationId,
-    });
-    if (Array.isArray(created.task.output) && created.task.output.length > 0) {
-      progress =
-        (await reconcileAvailableKnowledgeOutput({
-          userId: req.frontmindUser!.id,
-          conversationId,
-          taskId: String(created.task.id),
-          output: created.task.output,
-          upstreamStatus: created.task.status,
-          ledger: {
-            lastOutputLength: boundBuild.lastOutputLength,
-            lastOutputItemIds: boundBuild.lastOutputItemIds,
-          },
-          artifactAccess: {
-            apiKey: taskCredential.apiKey,
-            baseUrl: getUpstreamBaseUrl(req),
-          },
-        })) || progress;
-    }
     const observation = await getKnowledgeBaseObservation({
       userId: req.frontmindUser!.id,
       conversationId,
-      upstreamStatus: created.task.status,
-    });
-    res.json({
-      task: {
-        id: String(created.task.id),
-        status: created.task.status,
-        taskUrl: created.task.taskUrl,
-        title: created.task.title,
-      },
-      progress: observation?.interaction.progress || progress,
+      upstreamStatus: "running",
+    }).catch(() => null);
+    res.status(202).json({
+      task: { id: reservation.turn.id, status: "running" },
+      progress: observation?.interaction.progress || null,
       interaction:
         observation?.interaction ||
-        deriveKnowledgeBaseInteraction(progress, created.task.status),
+        deriveKnowledgeBaseInteraction(null, "running"),
       observation,
-      startedAt: Date.now(),
+      accepted: true,
+      startedAt: reservation.turn.createdAt.getTime(),
+    });
+    launchAcceptedKnowledgeBaseClaim({
+      claim: {
+        turn: reservation.turn,
+        leaseToken: reservation.leaseToken,
+        leaseExpiresAt: reservation.leaseExpiresAt,
+        upstreamIdempotencyKey: reservation.upstreamIdempotencyKey,
+        recoveryMetadata: reservation.recoveryMetadata ?? recoveryMetadata,
+        preparedDispatch: null,
+      },
+      credential: taskCredential,
+      outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
     });
   } catch (error) {
     if (error instanceof KnowledgeBaseTurnReservationError) {

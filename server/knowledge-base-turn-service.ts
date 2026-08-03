@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 
 import {
   apiCredentials,
@@ -40,6 +40,8 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   expectedAttachmentCount?: number;
   userAttachmentCount?: number;
   awaitingClientAttachments?: boolean;
+  /** The former browser reservation was atomically adopted by upload-first. */
+  legacyUploadFirstTakeover?: boolean;
   clientAttachmentManifestHash?: string;
   clientStagedAttachments?: Array<{
     index: number;
@@ -162,6 +164,8 @@ export type KnowledgeBaseTurnReservation =
       leaseToken: string;
       leaseExpiresAt: Date;
       upstreamIdempotencyKey: string;
+      /** Present when legacy takeover canonicalized durable recovery data. */
+      recoveryMetadata?: Record<string, unknown>;
     }
   | {
       state: "awaiting_attachments";
@@ -221,6 +225,11 @@ export interface ReserveKnowledgeBaseTurnInput {
   clientAttachmentManifest?: unknown;
   /** Resume after browser File objects were lost; original body remains pinned. */
   resumeDeferredReservation?: boolean;
+  /**
+   * Adopt a pre-rollout awaitingClientAttachments row after the replacement
+   * bytes have completed their normal signed PUT.
+   */
+  resumeLegacyAttachmentTakeover?: boolean;
   /** Required for retry reservations; identifies the failed active turn. */
   replacesTurnId?: string | null;
   now?: Date;
@@ -1069,7 +1078,7 @@ function acquiredResult(
   row: ConversationTurn,
   leaseToken: string,
   leaseExpiresAt: Date,
-): KnowledgeBaseTurnReservation {
+): Extract<KnowledgeBaseTurnReservation, { state: "acquired" }> {
   return {
     state: "acquired",
     turn: turnRecord({
@@ -1371,6 +1380,275 @@ async function reserveKnowledgeBaseTurnInTransaction(
     }
     const existingMetadata = metadataOf(existing);
     if (
+      !deferredClientAttachments &&
+      input.resumeLegacyAttachmentTakeover === true &&
+      (existingMetadata.awaitingClientAttachments === true ||
+        existingMetadata.legacyUploadFirstTakeover === true)
+    ) {
+      const existingRecovery = retryAuthorityRecord(existingMetadata.recovery);
+      const rawIncomingRecovery = sanitizeKnowledgeBaseRecoveryMetadata(
+        input.recoveryMetadata,
+      );
+      const incomingAttachmentsValue = rawIncomingRecovery.attachments;
+      const incomingAttachments = Array.isArray(incomingAttachmentsValue)
+        ? normalizeDeferredUserAttachments(
+            incomingAttachmentsValue.map((value) => {
+              const record = retryAuthorityRecord(value);
+              return {
+                file_id: String(record?.file_id || ""),
+                filename: String(record?.filename || ""),
+              };
+            }),
+          )
+        : [];
+      const legacyManifest = Array.isArray(existingRecovery?.attachmentManifest)
+        ? existingRecovery.attachmentManifest
+        : [];
+      const incomingManifest = Array.isArray(input.clientAttachmentManifest)
+        ? input.clientAttachmentManifest
+        : [];
+      const legacyManifestHash = hashKnowledgeBaseTurnRequest(legacyManifest);
+      const incomingManifestHash =
+        hashKnowledgeBaseTurnRequest(incomingManifest);
+      const canonicalRecovery = sanitizeKnowledgeBaseRecoveryMetadata({
+        ...rawIncomingRecovery,
+        // A browser may have lost its local pending message. The durable
+        // reservation remains the sole authority for the logical user intent.
+        userMessage: existingRecovery?.userMessage,
+        conversationId: existingRecovery?.conversationId,
+        parentTaskId: existingRecovery?.parentTaskId,
+        skillVersion: existingRecovery?.skillVersion,
+        skillContentHash: existingRecovery?.skillContentHash,
+        attachments: incomingAttachments,
+        attachmentManifest: legacyManifest,
+        deferredClientAttachments: false,
+      });
+      const legacyStaged = Array.isArray(
+        existingMetadata.clientStagedAttachments,
+      )
+        ? existingMetadata.clientStagedAttachments
+        : [];
+      const legacyExpectedAttachmentCount = Number(
+        existingMetadata.expectedAttachmentCount,
+      );
+      const legacyUserAttachmentCount = Number(
+        existingMetadata.userAttachmentCount,
+      );
+      const takeoverRequestPayload = retryAuthorityRequestPayload({
+        operationType: input.operationType,
+        recovery: canonicalRecovery,
+      });
+      const canonicalRequestHash = takeoverRequestPayload
+        ? hashKnowledgeBaseTurnRequest({
+            operationType: input.operationType,
+            generation: input.expectedGeneration,
+            revision: input.expectedRevision,
+            leafId: expectedLeafId,
+            expectedAttachmentCount,
+            userAttachmentCount,
+            payload: takeoverRequestPayload,
+          })
+        : null;
+      const canonicalIdentity: KnowledgeBaseTurnIdentity = {
+        ...identity,
+        requestHash: canonicalRequestHash || identity.requestHash,
+      };
+      const legacyAttachmentLedgerIsValid =
+        legacyStaged.length === (existing.attachmentFileIds ?? []).length &&
+        legacyStaged.every(
+          (attachment, index) =>
+            attachment.index === index &&
+            attachment.file_id === existing.attachmentFileIds[index],
+        );
+      const sameTurnIdentity =
+        existing.userId === input.userId &&
+        build.userId === input.userId &&
+        build.id === buildId &&
+        existing.clientRequestId === clientRequestId &&
+        existing.buildId === canonicalIdentity.buildId &&
+        existing.buildGeneration === canonicalIdentity.buildGeneration &&
+        existing.operationKey === canonicalIdentity.operationKey &&
+        existing.operationType === canonicalIdentity.operationType &&
+        existing.expectedRevision === canonicalIdentity.expectedRevision &&
+        (existing.expectedLeafId ?? null) ===
+          canonicalIdentity.expectedLeafId &&
+        (existing.apiCredentialId ?? null) ===
+          canonicalIdentity.apiCredentialId;
+      const samePinnedIntent =
+        existingRecovery?.kind === "turn" &&
+        rawIncomingRecovery.kind === "turn" &&
+        existingRecovery.conversationId === canonicalRecovery.conversationId &&
+        existingRecovery.parentTaskId === canonicalRecovery.parentTaskId &&
+        existingRecovery.userMessage === canonicalRecovery.userMessage &&
+        existingRecovery.skillVersion === rawIncomingRecovery.skillVersion &&
+        (existingRecovery.skillContentHash ?? null) ===
+          (rawIncomingRecovery.skillContentHash ?? null) &&
+        legacyExpectedAttachmentCount === expectedAttachmentCount &&
+        legacyUserAttachmentCount === userAttachmentCount &&
+        incomingAttachments.length === userAttachmentCount &&
+        legacyManifest.length === userAttachmentCount &&
+        incomingManifest.length === userAttachmentCount &&
+        existingMetadata.clientAttachmentManifestHash === legacyManifestHash &&
+        incomingManifestHash === legacyManifestHash &&
+        legacyManifest.every((value, index) => {
+          const record = retryAuthorityRecord(value);
+          return record?.filename === incomingAttachments[index]?.filename;
+        }) &&
+        Boolean(canonicalRequestHash);
+
+      if (!sameTurnIdentity || !samePinnedIntent) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The uploaded files cannot take over this deferred attachment turn",
+        );
+      }
+
+      if (existingMetadata.legacyUploadFirstTakeover === true) {
+        const replayDecision = evaluateKnowledgeBaseTurnReplay(
+          existing,
+          canonicalIdentity,
+          now,
+        );
+        if (replayDecision.state === "conflict") {
+          throw new KnowledgeBaseTurnReservationError(
+            "CONFLICT",
+            "The legacy attachment takeover was replayed with different content",
+          );
+        }
+        if (replayDecision.state !== "expired") {
+          return existingResult(existing, replayDecision);
+        }
+        assertKnowledgeBaseReservationCredentialAvailable(
+          canonicalIdentity.apiCredentialId,
+          pinnedCredential,
+          { allowRetired: true },
+        );
+        const replayLeaseToken = randomUUID();
+        const replayMetadata: KnowledgeBaseTurnMetadata = {
+          ...existingMetadata,
+          leaseOwnerHash: leaseOwnerHash(replayLeaseToken),
+          recovery: canonicalRecovery,
+        };
+        await tx
+          .update(conversationTurns)
+          .set({
+            metadata: replayMetadata,
+            leaseExpiresAt,
+            updatedAt: now,
+          })
+          .where(eq(conversationTurns.id, existing.id));
+        return {
+          ...acquiredResult(
+            {
+              ...existing,
+              metadata: replayMetadata,
+              leaseExpiresAt,
+              updatedAt: now,
+            },
+            replayLeaseToken,
+            leaseExpiresAt,
+          ),
+          recoveryMetadata: canonicalRecovery,
+        };
+      }
+
+      const sameActiveLegacyScope =
+        build.generation === input.expectedGeneration &&
+        build.revision === input.expectedRevision &&
+        (build.currentLeafId ?? null) === expectedLeafId &&
+        build.status === "confirming" &&
+        build.activeTurnId === existing.id &&
+        build.conversationId === existingRecovery?.conversationId &&
+        String(build.upstreamTaskId || "") ===
+          String(existingRecovery?.parentTaskId || "");
+      const safelyUnstarted =
+        existing.status === "queued" &&
+        !existing.upstreamTaskId &&
+        !existing.leaseExpiresAt &&
+        existingMetadata.attachmentsFrozen !== true &&
+        !existingMetadata.preparedDispatch &&
+        Object.keys(generatedAttachmentReservations(existingMetadata))
+          .length === 0 &&
+        Boolean(existing.operationKey) &&
+        existing.upstreamIdempotencyKeyHash ===
+          hashKnowledgeBaseUpstreamIdempotencyKey(
+            createKnowledgeBaseUpstreamIdempotencyKey(
+              String(existing.operationKey),
+            ),
+          ) &&
+        legacyAttachmentLedgerIsValid;
+
+      if (!sameActiveLegacyScope || !safelyUnstarted) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The uploaded files cannot take over this deferred attachment turn",
+        );
+      }
+      assertKnowledgeBaseReservationCredentialAvailable(
+        identity.apiCredentialId,
+        pinnedCredential,
+        { allowRetired: true },
+      );
+
+      const leaseToken = randomUUID();
+      const {
+        clientStagedAttachments: _legacyStagedAttachments,
+        ...metadataWithoutBrowserReservation
+      } = existingMetadata;
+      const nextMetadata: KnowledgeBaseTurnMetadata = {
+        ...metadataWithoutBrowserReservation,
+        attachmentsFrozen: false,
+        expectedAttachmentCount,
+        userAttachmentCount,
+        awaitingClientAttachments: false,
+        legacyUploadFirstTakeover: true,
+        leaseOwnerHash: leaseOwnerHash(leaseToken),
+        recovery: canonicalRecovery,
+      };
+      const takenOverTurn = {
+        ...existing,
+        requestHash: canonicalIdentity.requestHash,
+        attachmentFileIds: [],
+        metadata: nextMetadata,
+        leaseExpiresAt,
+        updatedAt: now,
+      } satisfies ConversationTurn;
+      await tx
+        .update(conversationTurns)
+        .set({
+          requestHash: canonicalIdentity.requestHash,
+          attachmentFileIds: [],
+          metadata: nextMetadata,
+          leaseExpiresAt,
+          updatedAt: now,
+        })
+        .where(eq(conversationTurns.id, existing.id));
+      await tx
+        .update(knowledgeBaseBuilds)
+        .set({
+          stateEpoch: build.stateEpoch + 1,
+          awaitingResponseSince: now,
+          lastTurnUserText: String(canonicalRecovery.userMessage ?? "").slice(
+            0,
+            2_000_000,
+          ),
+          lastTurnAttachmentCount: userAttachmentCount,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, build.id),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+            eq(knowledgeBaseBuilds.generation, input.expectedGeneration),
+            eq(knowledgeBaseBuilds.activeTurnId, existing.id),
+          ),
+        );
+      return {
+        ...acquiredResult(takenOverTurn, leaseToken, leaseExpiresAt),
+        recoveryMetadata: canonicalRecovery,
+      };
+    }
+    if (
       deferredClientAttachments &&
       input.resumeDeferredReservation === true &&
       !String(input.userText ?? "").trim() &&
@@ -1440,6 +1718,13 @@ async function reserveKnowledgeBaseTurnInTransaction(
       { ...existing, metadata, leaseExpiresAt, updatedAt: now },
       leaseToken,
       leaseExpiresAt,
+    );
+  }
+
+  if (input.resumeLegacyAttachmentTakeover === true) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The legacy attachment reservation no longer exists",
     );
   }
 
@@ -2713,6 +2998,169 @@ export async function completeKnowledgeBaseGeneratedAttachment(
       metadata: nextMetadata,
       updatedAt: now,
     });
+  });
+}
+
+/**
+ * Finds a previously uploaded Skill file that is safe to attach to another
+ * turn in the same live build generation.
+ *
+ * A generated-attachment reservation becomes `completed` as soon as the
+ * provider file id and ownership ledger are durable, before the signed PUT
+ * finishes. Reuse therefore also requires a completed, upstream-bound source
+ * turn whose frozen dispatch body references that exact file id. This keeps a
+ * half-uploaded file from a crashed current turn from becoming a build-wide
+ * cache entry.
+ */
+export async function findReusableKnowledgeBaseSkillFileId(
+  input: {
+    userId: number;
+    buildId: string;
+    apiCredentialId: string;
+    contentSha256: string;
+  },
+  executor?: any,
+): Promise<string | null> {
+  assertInteger(input.userId, "userId", 1);
+  const buildId = normalizeRequiredId(input.buildId, "buildId", 36);
+  const apiCredentialId = normalizeRequiredId(
+    input.apiCredentialId,
+    "apiCredentialId",
+    36,
+  );
+  const contentSha256 = String(input.contentSha256 || "").trim();
+  if (!/^[a-f0-9]{64}$/u.test(contentSha256)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Reusable Skill content hash is invalid",
+    );
+  }
+
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const build = (
+      await tx
+        .select()
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, buildId),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+          ),
+        )
+        .limit(1)
+    )[0] as KnowledgeBaseBuild | undefined;
+    if (
+      !build ||
+      build.id !== buildId ||
+      build.userId !== input.userId ||
+      !Number.isSafeInteger(build.generation)
+    ) {
+      return null;
+    }
+
+    const rows = (await tx
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, buildId),
+          eq(conversationTurns.buildGeneration, build.generation),
+          eq(conversationTurns.apiCredentialId, apiCredentialId),
+          eq(conversationTurns.status, "completed"),
+        ),
+      )
+      .orderBy(desc(conversationTurns.createdAt), desc(conversationTurns.id))
+      .limit(100)) as ConversationTurn[];
+
+    const candidates: Array<{ fileId: string }> = [];
+    for (const candidate of rows) {
+      // Re-check every ownership discriminator in application code as a
+      // fail-closed guard against malformed legacy rows and permissive mocks.
+      if (
+        candidate.userId !== input.userId ||
+        candidate.buildId !== buildId ||
+        candidate.buildGeneration !== build.generation ||
+        candidate.apiCredentialId !== apiCredentialId ||
+        candidate.status !== "completed" ||
+        !String(candidate.upstreamTaskId || "").trim()
+      ) {
+        continue;
+      }
+      const metadata = metadataOf(candidate);
+      const preparedDispatch = retryAuthorityRecord(metadata.preparedDispatch);
+      const requestBody = retryAuthorityRecord(preparedDispatch?.requestBody);
+      const preparedAttachments = requestBody?.attachments;
+      if (
+        metadata.attachmentsFrozen !== true ||
+        !Array.isArray(candidate.attachmentFileIds) ||
+        !Array.isArray(preparedAttachments)
+      ) {
+        continue;
+      }
+
+      for (const reservationValue of Object.values(
+        generatedAttachmentReservations(metadata),
+      )) {
+        const reservation = retryAuthorityRecord(reservationValue);
+        if (!reservation) continue;
+        const fileId = String(reservation.upstreamFileId || "").trim();
+        const attachmentIndex = Number(reservation.attachmentIndex);
+        if (
+          reservation.schemaVersion !== 1 ||
+          reservation.role !== "skill" ||
+          reservation.status !== "completed" ||
+          reservation.contentSha256 !== contentSha256 ||
+          !Number.isSafeInteger(attachmentIndex) ||
+          attachmentIndex < 0 ||
+          !fileId ||
+          fileId.length > MAX_ATTACHMENT_ID_LENGTH ||
+          candidate.attachmentFileIds[attachmentIndex] !== fileId ||
+          !preparedAttachments.some((attachment) => {
+            const record = retryAuthorityRecord(attachment);
+            return record?.file_id === fileId;
+          })
+        ) {
+          continue;
+        }
+        candidates.push({ fileId });
+      }
+    }
+    if (candidates.length === 0) return null;
+
+    const fileIds = [
+      ...new Set(candidates.map((candidate) => candidate.fileId)),
+    ];
+    const resources = await tx
+      .select()
+      .from(upstreamResources)
+      .where(
+        and(
+          eq(upstreamResources.userId, input.userId),
+          eq(upstreamResources.apiCredentialId, apiCredentialId),
+          eq(upstreamResources.kind, "file"),
+          isNull(upstreamResources.projectAssignmentId),
+          inArray(upstreamResources.upstreamId, fileIds),
+        ),
+      )
+      .limit(fileIds.length);
+    const ownedFileIds = new Set(
+      resources
+        .filter(
+          (resource: any) =>
+            resource.userId === input.userId &&
+            resource.apiCredentialId === apiCredentialId &&
+            resource.kind === "file" &&
+            resource.projectAssignmentId === null &&
+            fileIds.includes(String(resource.upstreamId || "")),
+        )
+        .map((resource: any) => String(resource.upstreamId)),
+    );
+    return (
+      candidates.find((candidate) => ownedFileIds.has(candidate.fileId))
+        ?.fileId ?? null
+    );
   });
 }
 

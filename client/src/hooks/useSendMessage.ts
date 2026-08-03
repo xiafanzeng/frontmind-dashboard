@@ -11,17 +11,15 @@ import {
   createTask,
   createResponseLogicTask,
   createKnowledgeBaseTurnTask,
-  reserveKnowledgeBaseTurnWithAttachments,
-  stageKnowledgeBaseTurnAttachment,
   retrieveTask,
   uploadFile,
   fileToBase64,
   creditEventBus,
   sanitizeBrandText,
   type ContentItem,
+  type KnowledgeBaseAttachmentManifestItem,
   type Message,
   type ResponseLogicTaskContext,
-  type KnowledgeBaseAttachmentManifestItem,
 } from "@/lib/frontmind-api";
 import {
   useConversation,
@@ -171,6 +169,8 @@ function getFailureDisplayMessage(errorMsg: string) {
 
 /** Upload progress info exposed to UI */
 export interface UploadProgress {
+  /** Current durable attachment phase after bytes reach object storage. */
+  phase?: "uploading" | "verifying";
   /** Index of the file currently being uploaded (0-based) */
   currentFileIndex: number;
   /** Total number of files to upload */
@@ -488,15 +488,25 @@ export function useSendMessage() {
             "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED"
             ? conv.knowledgeBase.activeClientRequestId
             : null;
-        const resumingKnowledgeBaseAttachments = Boolean(
+        const resumingLegacyKnowledgeBaseAttachmentTurn = Boolean(
           resumableKnowledgeBaseClientRequestId,
         );
-        let knowledgeBaseClientRequestId = options?.syncKnowledgeBaseSnapshot
-          ? resumingKnowledgeBaseAttachments
-            ? resumableKnowledgeBaseClientRequestId!
-            : typeof crypto !== "undefined" && "randomUUID" in crypto
+        const resumedKnowledgeBaseMessage =
+          resumingLegacyKnowledgeBaseAttachmentTurn
+            ? conv?.messages.find(
+                (message) =>
+                  message.role === "user" &&
+                  message.knowledgeBase?.clientRequestId ===
+                    resumableKnowledgeBaseClientRequestId,
+              )
+            : undefined;
+        const knowledgeBaseSubmissionText =
+          resumedKnowledgeBaseMessage?.content || text;
+        const knowledgeBaseClientRequestId = options?.syncKnowledgeBaseSnapshot
+          ? resumableKnowledgeBaseClientRequestId ||
+            (typeof crypto !== "undefined" && "randomUUID" in crypto
               ? crypto.randomUUID()
-              : `kb-turn-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+              : `kb-turn-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`)
           : undefined;
         if (options?.syncKnowledgeBaseSnapshot) {
           registerKnowledgeBaseConversation(convId);
@@ -518,8 +528,11 @@ export function useSendMessage() {
         const attachments: Attachment[] = [];
 
         // Add text
-        if (text.trim()) {
-          contentItems.push({ type: "input_text", text: text.trim() });
+        if (knowledgeBaseSubmissionText.trim()) {
+          contentItems.push({
+            type: "input_text",
+            text: knowledgeBaseSubmissionText.trim(),
+          });
         }
 
         let preparedUploads: PreparedUploadFiles;
@@ -542,15 +555,17 @@ export function useSendMessage() {
           });
         }
 
-        let knowledgeBaseAttachmentManifest:
+        let legacyAttachmentManifest:
           | KnowledgeBaseAttachmentManifestItem[]
           | undefined;
         if (
-          options?.syncKnowledgeBaseSnapshot &&
+          resumingLegacyKnowledgeBaseAttachmentTurn &&
           preparedUploads.files.length > 0
         ) {
           try {
-            knowledgeBaseAttachmentManifest = await Promise.all(
+            // This is an identity check for the old durable reservation, not
+            // a storage read-back or a timed upload verification window.
+            legacyAttachmentManifest = await Promise.all(
               preparedUploads.files.map(async ({ file }) => ({
                 filename: file.name,
                 sizeBytes: file.size,
@@ -560,117 +575,11 @@ export function useSendMessage() {
               })),
             );
           } catch (error) {
-            toast.error("附件完整性校验失败", {
+            toast.error("附件读取失败", {
               description:
                 error instanceof Error
                   ? error.message
-                  : "请重新选择原文件后重试。",
-            });
-            return false;
-          }
-        }
-        let knowledgeBaseAttachmentReservation:
-          | {
-              turnId: string;
-              attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
-            }
-          | undefined;
-        let knowledgeBasePendingMessageAdded = false;
-        let alreadyStagedKnowledgeBaseAttachments = 0;
-        if (knowledgeBaseAttachmentManifest) {
-          if (
-            !Number.isSafeInteger(options?.knowledgeBaseExpectedGeneration) ||
-            !Number.isSafeInteger(options?.knowledgeBaseExpectedRevision) ||
-            !options?.knowledgeBaseExpectedLeafId
-          ) {
-            toast.error("当前知识节点坐标缺失", {
-              description: "请刷新知识库状态后重新选择附件。",
-            });
-            return false;
-          }
-          try {
-            const reserved = await reserveKnowledgeBaseTurnWithAttachments(
-              [{ role: "user", content: contentItems }],
-              {
-                conversationId: convId,
-                clientRequestId: knowledgeBaseClientRequestId!,
-                expectedGeneration: options.knowledgeBaseExpectedGeneration!,
-                expectedRevision: options.knowledgeBaseExpectedRevision!,
-                expectedLeafId: options.knowledgeBaseExpectedLeafId,
-                attachmentManifest: knowledgeBaseAttachmentManifest,
-                resumeExisting:
-                  resumingKnowledgeBaseAttachments && !text.trim(),
-              },
-            );
-            knowledgeBaseClientRequestId = reserved.reservation.clientRequestId;
-            alreadyStagedKnowledgeBaseAttachments = Math.max(
-              0,
-              Math.min(
-                reserved.reservation.stagedAttachmentCount || 0,
-                preparedUploads.files.length,
-              ),
-            );
-            knowledgeBaseAttachmentReservation = {
-              turnId: reserved.reservation.turnId,
-              attachmentManifest: knowledgeBaseAttachmentManifest,
-            };
-            const reservationTimestamp = Date.now();
-            const reservationMessageAlreadyVisible = conv?.messages.some(
-              (message) =>
-                message.role === "user" &&
-                message.knowledgeBase?.clientRequestId ===
-                  knowledgeBaseClientRequestId,
-            );
-            if (!reservationMessageAlreadyVisible) {
-              addMessage(convId, {
-                id: `msg-kb-pending-${reservationTimestamp}-${Math.random()
-                  .toString(36)
-                  .slice(2, 6)}`,
-                role: "user",
-                content: text.trim(),
-                attachments: preparedUploads.files.map(({ file }, index) => ({
-                  id: `att-kb-reserved-${index}-${reservationTimestamp}`,
-                  type: "file" as const,
-                  name: file.name,
-                  file,
-                })),
-                timestamp: reservationTimestamp,
-                knowledgeBase: {
-                  kind: "pending_user" as const,
-                  clientRequestId: knowledgeBaseClientRequestId,
-                  turnId: reserved.reservation.turnId,
-                  generation: reserved.reservation.generation,
-                  revision: reserved.reservation.revision,
-                  leafId: reserved.reservation.leafId,
-                  serverOwned: true,
-                },
-              });
-            }
-            knowledgeBasePendingMessageAdded = true;
-            if (reserved.knowledgeObservation) {
-              commitKnowledgeBaseObservation(
-                convId,
-                reserved.knowledgeObservation,
-              );
-            }
-            wakeKnowledgeBaseConversation(convId);
-            if (reserved.reservation.state !== "awaiting_attachments") {
-              toast.info("本轮已在处理中", {
-                description: "系统已恢复原预约，不会重复上传或创建任务。",
-              });
-              return true;
-            }
-          } catch (error: any) {
-            if (error?.knowledgeObservation) {
-              commitKnowledgeBaseObservation(
-                convId,
-                error.knowledgeObservation,
-              );
-            }
-            wakeKnowledgeBaseConversation(convId);
-            toast.error("附件预约失败", {
-              description:
-                error?.message || "请按当前节点重新选择原文件后重试。",
+                  : "请重新选择文件后重试。",
             });
             return false;
           }
@@ -717,29 +626,6 @@ export function useSendMessage() {
             fileBase64 = await fileToBase64(file);
           }
 
-          if (
-            knowledgeBaseAttachmentReservation &&
-            i < alreadyStagedKnowledgeBaseAttachments
-          ) {
-            attachments.push({
-              id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-              type: "file",
-              name: file.name,
-              base64: fileBase64,
-              blobUrl: fileBlobUrl,
-              file,
-            });
-            setUploadProgress({
-              currentFileIndex: i,
-              totalFiles,
-              currentFileName: file.name,
-              currentFilePercent: 100,
-              overallPercent: Math.round(((i + 1) / totalFiles) * 100),
-              conversationId: convId,
-            });
-            continue;
-          }
-
           try {
             console.log("[SendMessage] Uploading file attachment", {
               filename: file.name,
@@ -771,21 +657,6 @@ export function useSendMessage() {
               fileId: result.fileId,
             });
 
-            if (knowledgeBaseAttachmentReservation) {
-              await stageKnowledgeBaseTurnAttachment({
-                conversationId: convId,
-                turnId: knowledgeBaseAttachmentReservation.turnId,
-                clientRequestId: knowledgeBaseClientRequestId!,
-                attachmentManifest:
-                  knowledgeBaseAttachmentReservation.attachmentManifest,
-                index: i,
-                attachment: {
-                  file_id: result.fileId,
-                  filename: result.filename,
-                },
-              });
-            }
-
             contentItems.push({
               type: "input_file",
               file_id: result.fileId,
@@ -806,6 +677,10 @@ export function useSendMessage() {
               `File upload failed for "${file.name}":`,
               uploadErr.message,
             );
+            // A terminal upload failure must release the composer immediately.
+            // uploadFile already performs its bounded retries; keeping progress
+            // here would leave the UI permanently disabled after those retries.
+            setUploadProgress(null);
             if (uploadErr?.knowledgeObservation) {
               commitKnowledgeBaseObservation(
                 convId,
@@ -832,7 +707,7 @@ export function useSendMessage() {
         // Clear upload progress
         setUploadProgress(null);
 
-        if (contentItems.length === 0 && !knowledgeBaseAttachmentReservation) {
+        if (contentItems.length === 0) {
           return false;
         }
 
@@ -840,7 +715,7 @@ export function useSendMessage() {
         const userMessage: LocalMessage = {
           id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           role: "user",
-          content: text.trim(),
+          content: knowledgeBaseSubmissionText.trim(),
           attachments: attachments.length > 0 ? attachments : undefined,
           timestamp: Date.now(),
           ...(knowledgeBaseClientRequestId
@@ -853,13 +728,13 @@ export function useSendMessage() {
             : {}),
         };
 
-        if (!knowledgeBasePendingMessageAdded) {
+        if (!resumingLegacyKnowledgeBaseAttachmentTurn) {
           addMessage(convId, userMessage);
         }
 
         // Update title if this is the first message
         if (!conv || conv.messages.length === 0) {
-          const raw = text.trim();
+          const raw = knowledgeBaseSubmissionText.trim();
           const title =
             (raw ? raw.slice(0, 10) + (raw.length > 10 ? "..." : "") : null) ||
             (files.length > 0
@@ -902,15 +777,22 @@ export function useSendMessage() {
             ),
           });
 
-          // Create task exactly once. POST /v1/tasks is non-idempotent, so retrying
-          // can create multiple upstream task windows for a single user send.
+          // Ordinary task creation remains single-shot because POST /v1/tasks is
+          // non-idempotent. The knowledge-base route owns its bounded replay by
+          // the same durable clientRequestId and exact request body.
           const response = options?.syncKnowledgeBaseSnapshot
             ? await createKnowledgeBaseTurnTask(input, {
                 conversationId: convId,
                 clientRequestId: knowledgeBaseClientRequestId!,
                 expectedRevision: options.knowledgeBaseExpectedRevision,
                 expectedLeafId: options.knowledgeBaseExpectedLeafId,
-                attachmentReservation: knowledgeBaseAttachmentReservation,
+                ...(legacyAttachmentManifest
+                  ? {
+                      legacyAttachmentTakeover: {
+                        attachmentManifest: legacyAttachmentManifest,
+                      },
+                    }
+                  : {}),
               })
             : options?.responseLogicContext
               ? await createResponseLogicTask(input, {
@@ -1066,36 +948,52 @@ export function useSendMessage() {
         } catch (err: any) {
           if (options?.syncKnowledgeBaseSnapshot) {
             const status = Number(err?.status || 0);
+            const code = String(err?.code || "");
+            const requestOutcomeUnknown =
+              !status ||
+              status === 408 ||
+              status === 425 ||
+              status === 429 ||
+              status >= 500 ||
+              code === "IDEMPOTENCY_PENDING";
+            const deterministicFailure =
+              !requestOutcomeUnknown && status !== 409;
             if (
-              status === 409 &&
-              knowledgeBaseClientRequestId &&
-              !knowledgeBaseAttachmentReservation
+              (status === 409 || deterministicFailure) &&
+              knowledgeBaseClientRequestId
             ) {
               rollbackPendingKnowledgeBaseTurn(
                 convId,
                 knowledgeBaseClientRequestId,
               );
-            } else {
-              if (err?.knowledgeObservation) {
-                commitKnowledgeBaseObservation(
-                  convId,
-                  err.knowledgeObservation,
-                );
-              }
+            }
+            if (err?.knowledgeObservation) {
+              commitKnowledgeBaseObservation(convId, err.knowledgeObservation);
+            }
+            if (requestOutcomeUnknown) {
               updateStatus(convId, "running", {
                 startedAt: responseStartedAt,
               });
             }
-            wakeKnowledgeBaseConversation(convId);
-            toast.error(
-              status === 409 ? "当前节点已更新" : "正在恢复本轮状态",
-              {
-                description:
-                  status === 409
-                    ? "已刷新服务端最新节点，请按最新内容继续。"
-                    : "请求结果暂时未知，系统会按本轮请求编号自动恢复，不会重复提交。",
-              },
-            );
+            if (!deterministicFailure || err?.knowledgeObservation) {
+              wakeKnowledgeBaseConversation(convId);
+            }
+            if (status === 409) {
+              toast.info("当前节点已更新", {
+                description: "已同步服务端最新节点，请按当前内容继续。",
+              });
+            } else if (deterministicFailure) {
+              toast.error("本轮未能提交", {
+                description: err?.message || "请检查当前内容后重新提交。",
+              });
+            } else {
+              // A disconnected browser response does not mean the accepted
+              // durable turn failed. Keep the user on the normal processing
+              // path while the coordinator observes the same request id.
+              toast.info("本轮已提交", {
+                description: "正在处理当前节点，请稍候。",
+              });
+            }
             return false;
           }
           updateStatus(convId, "error", {

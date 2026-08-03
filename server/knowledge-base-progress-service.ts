@@ -1846,8 +1846,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       severity: "warning",
       message:
         stagedClientAttachments > 0
-          ? `本轮已保留并暂存 ${stagedClientAttachments}/${expectedClientAttachments} 个附件；请重新选择原文件，系统会从未完成位置继续。`
-          : "本轮已保留，但浏览器附件尚未上传；请重新选择原文件继续，不会重复创建任务。",
+          ? `正在校验并暂存本轮附件（${stagedClientAttachments}/${expectedClientAttachments}）；完成后会直接提交本轮。`
+          : "附件已上传，正在完成完整性校验；校验通过后会直接提交本轮。",
       retryable: false,
       turnId: activeTurnRow.id,
       createdAt: activeTurnRow.updatedAt.getTime(),
@@ -1873,7 +1873,14 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     progress,
     stateEpoch: build.stateEpoch,
     generation: build.generation,
-    authoritativeTaskId: build.upstreamTaskId,
+    // While a newly accepted turn is still preparing its Skill/attachments,
+    // build.upstreamTaskId is the completed parent task. Exposing that stale
+    // id would make the coordinator reconcile old output during the short
+    // accepted-but-unbound window. Only the active turn can be authoritative
+    // until it releases the build.
+    authoritativeTaskId: activeTurnRow
+      ? activeTurnRow.upstreamTaskId
+      : build.upstreamTaskId,
     activeTurn,
     approvedPresentation,
     package: packageDto,

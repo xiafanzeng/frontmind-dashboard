@@ -604,7 +604,71 @@ export interface KnowledgeBaseAttachmentTurnReservation {
   requiresUpload: boolean;
 }
 
-async function knowledgeBaseRequestError(response: Response, fallback: string) {
+export type KnowledgeBaseRequestError = Error & {
+  status?: number;
+  code?: string;
+  retryAfter?: string;
+  retryAfterMs?: number;
+  knowledgeObservation?: KnowledgeBaseObservationDto;
+};
+
+const KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS = 4;
+const KNOWLEDGE_BASE_REQUEST_MAX_RETRY_DELAY_MS = 10_000;
+
+function isTransientKnowledgeBaseRequestError(error: unknown) {
+  const status = Number((error as { status?: unknown })?.status || 0);
+  const code = String((error as { code?: unknown })?.code || "");
+  return (
+    !status ||
+    code === "IDEMPOTENCY_PENDING" ||
+    status === 408 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500
+  );
+}
+
+function knowledgeBaseRequestRetryDelay(error: unknown, attempt: number) {
+  const serverDelay = Number(
+    (error as { retryAfterMs?: unknown })?.retryAfterMs,
+  );
+  const backoffDelay = 500 * 2 ** attempt;
+  return Math.min(
+    KNOWLEDGE_BASE_REQUEST_MAX_RETRY_DELAY_MS,
+    Math.max(
+      backoffDelay,
+      Number.isFinite(serverDelay) && serverDelay >= 0 ? serverDelay : 0,
+    ),
+  );
+}
+
+async function waitForKnowledgeBaseRequestRetry(
+  error: unknown,
+  attempt: number,
+) {
+  await new Promise((resolve) =>
+    setTimeout(resolve, knowledgeBaseRequestRetryDelay(error, attempt)),
+  );
+}
+
+function retryAfterMilliseconds(value: string | null): number | undefined {
+  const normalized = String(value || "").trim();
+  if (!normalized) return undefined;
+
+  const seconds = Number(normalized);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1_000);
+  }
+
+  const retryAt = Date.parse(normalized);
+  if (!Number.isFinite(retryAt)) return undefined;
+  return Math.max(0, retryAt - Date.now());
+}
+
+async function knowledgeBaseRequestError(
+  response: Response,
+  fallback: string,
+): Promise<KnowledgeBaseRequestError> {
   let message = `API Error ${response.status}`;
   let payload: any = null;
   try {
@@ -613,16 +677,19 @@ async function knowledgeBaseRequestError(response: Response, fallback: string) {
   } catch {
     // Keep the status-derived message.
   }
+  const retryAfter =
+    response.headers?.get?.("Retry-After")?.trim() || undefined;
   const error = new Error(
     userFacingErrorMessage(
       Object.assign(new Error(message), { status: response.status }),
       fallback,
     ),
-  ) as Error & {
-    status?: number;
-    knowledgeObservation?: KnowledgeBaseObservationDto;
-  };
+  ) as KnowledgeBaseRequestError;
   error.status = response.status;
+  error.code =
+    String(payload?.error?.code || payload?.code || "").trim() || undefined;
+  error.retryAfter = retryAfter;
+  error.retryAfterMs = retryAfterMilliseconds(retryAfter || null);
   if (payload?.observation) {
     error.knowledgeObservation = knowledgeBaseObservationFromPayload(payload);
   }
@@ -687,8 +754,11 @@ export async function stageKnowledgeBaseTurnAttachment(input: {
 }) {
   // Staging is a replay-safe database append. Retry the same file id so a lost
   // response cannot force a second upload or a replacement at this index.
+  const maxAttempts = 4;
+  const maxRetryDelayMs = 10_000;
+  const requestBody = JSON.stringify(input);
   let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       const response = await fetch(
         "/api/knowledge-base/turn/attachments/stage",
@@ -696,7 +766,7 @@ export async function stageKnowledgeBaseTurnAttachment(input: {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify(input),
+          body: requestBody,
         },
       );
       if (!response.ok) {
@@ -709,7 +779,27 @@ export async function stageKnowledgeBaseTurnAttachment(input: {
     } catch (error) {
       lastError = error;
       const status = Number((error as { status?: unknown })?.status || 0);
-      if ((status >= 400 && status < 500) || attempt === 2) throw error;
+      const code = String((error as { code?: unknown })?.code || "");
+      const retryable =
+        !status ||
+        code === "IDEMPOTENCY_PENDING" ||
+        status === 425 ||
+        status === 429 ||
+        status >= 500;
+      if (!retryable || attempt === maxAttempts - 1) throw error;
+
+      const serverDelay = Number(
+        (error as { retryAfterMs?: unknown })?.retryAfterMs,
+      );
+      const backoffDelay = 500 * 2 ** attempt;
+      const retryDelay = Math.min(
+        maxRetryDelayMs,
+        Math.max(
+          backoffDelay,
+          Number.isFinite(serverDelay) && serverDelay >= 0 ? serverDelay : 0,
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, retryDelay));
     }
   }
   throw lastError;
@@ -726,6 +816,14 @@ export async function createKnowledgeBaseTurnTask(
       turnId: string;
       attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
     };
+    /**
+     * Rollout-only bridge for a durable browser reservation created by the
+     * former reserve-before-upload client. The ordered manifest identifies
+     * the original browser bytes; it is not an upload-completion probe.
+     */
+    legacyAttachmentTakeover?: {
+      attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+    };
   },
 ): Promise<TaskResponse> {
   const controller = new AbortController();
@@ -734,76 +832,120 @@ export async function createKnowledgeBaseTurnTask(
     CREATE_TASK_TIMEOUT_MS,
   );
   try {
-    const response = await fetch(
-      context.attachmentReservation
-        ? "/api/knowledge-base/turn/dispatch"
-        : "/api/knowledge-base/turn",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        signal: controller.signal,
-        body: JSON.stringify({
-          conversationId: context.conversationId,
-          clientRequestId: context.clientRequestId,
-          ...(context.attachmentReservation
-            ? {
-                turnId: context.attachmentReservation.turnId,
-                attachmentManifest:
-                  context.attachmentReservation.attachmentManifest,
-              }
-            : {
-                expectedRevision: context.expectedRevision,
-                expectedLeafId: context.expectedLeafId,
-                userMessage: buildPromptText(input),
-                attachments: extractAttachments(input),
-              }),
-        }),
-      },
-    );
-    if (!response.ok) {
-      throw await knowledgeBaseRequestError(
-        response,
-        `任务创建失败（${response.status}）`,
-      );
+    const endpoint = context.attachmentReservation
+      ? "/api/knowledge-base/turn/dispatch"
+      : "/api/knowledge-base/turn";
+    // The server reserves this logical turn by clientRequestId before external
+    // dispatch. Serialize once and replay these exact bytes so a disconnected
+    // response can never become a second logical confirmation.
+    const requestBody = JSON.stringify({
+      conversationId: context.conversationId,
+      clientRequestId: context.clientRequestId,
+      ...(context.attachmentReservation
+        ? {
+            turnId: context.attachmentReservation.turnId,
+            attachmentManifest:
+              context.attachmentReservation.attachmentManifest,
+          }
+        : {
+            expectedRevision: context.expectedRevision,
+            expectedLeafId: context.expectedLeafId,
+            userMessage: buildPromptText(input),
+            attachments: extractAttachments(input),
+            ...(context.legacyAttachmentTakeover
+              ? {
+                  resumeLegacyAttachments: true,
+                  attachmentManifest:
+                    context.legacyAttachmentTakeover.attachmentManifest,
+                }
+              : {}),
+          }),
+    });
+    let lastError: unknown;
+
+    for (
+      let attempt = 0;
+      attempt < KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      let response: Response;
+      try {
+        response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          signal: controller.signal,
+          body: requestBody,
+        });
+      } catch (error) {
+        lastError = error;
+        if (
+          controller.signal.aborted ||
+          attempt === KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS - 1
+        ) {
+          throw error;
+        }
+        await waitForKnowledgeBaseRequestRetry(error, attempt);
+        continue;
+      }
+
+      if (!response.ok) {
+        const error = await knowledgeBaseRequestError(
+          response,
+          `任务创建失败（${response.status}）`,
+        );
+        lastError = error;
+        if (
+          !isTransientKnowledgeBaseRequestError(error) ||
+          attempt === KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS - 1
+        ) {
+          throw error;
+        }
+        await waitForKnowledgeBaseRequestRetry(error, attempt);
+        continue;
+      }
+
+      const payload = await response.json();
+      const data = payload?.task || payload;
+      const observation = payload?.observation
+        ? knowledgeBaseObservationFromPayload(payload)
+        : undefined;
+      const taskId =
+        data?.id ||
+        data?.task_id ||
+        observation?.authoritativeTaskId ||
+        observation?.activeTurn?.id ||
+        (observation
+          ? `kb-observation-${observation.generation}-${observation.stateEpoch}`
+          : "");
+      if (!observation && !data?.id && !data?.task_id) {
+        throw new Error("任务创建失败：未返回权威任务状态");
+      }
+      if (payload?.progress) {
+        window.dispatchEvent(
+          new CustomEvent("frontmind:knowledge-progress-updated", {
+            detail: payload.progress,
+          }),
+        );
+      }
+      return {
+        ...data,
+        id: taskId,
+        status: data.status === "failed" ? "error" : data.status || "running",
+        metadata: {
+          ...(data.metadata || {}),
+          task_url: data.taskUrl || data.task_url || data.metadata?.task_url,
+          task_title:
+            data.title || data.task_title || data.metadata?.task_title,
+        },
+        output: data.output || [],
+        knowledgeInteraction:
+          payload?.observation?.interaction ?? payload?.interaction,
+        knowledgeObservation: observation,
+      };
     }
-    const payload = await response.json();
-    const data = payload?.task || payload;
-    const observation = payload?.observation
-      ? knowledgeBaseObservationFromPayload(payload)
-      : undefined;
-    const taskId =
-      data?.id ||
-      data?.task_id ||
-      observation?.authoritativeTaskId ||
-      observation?.activeTurn?.id ||
-      (observation
-        ? `kb-observation-${observation.generation}-${observation.stateEpoch}`
-        : "");
-    if (!observation && !data?.id && !data?.task_id) {
-      throw new Error("任务创建失败：未返回权威任务状态");
-    }
-    if (payload?.progress) {
-      window.dispatchEvent(
-        new CustomEvent("frontmind:knowledge-progress-updated", {
-          detail: payload.progress,
-        }),
-      );
-    }
-    return {
-      ...data,
-      id: taskId,
-      status: data.status === "failed" ? "error" : data.status || "running",
-      metadata: {
-        ...(data.metadata || {}),
-        task_url: data.taskUrl || data.task_url || data.metadata?.task_url,
-        task_title: data.title || data.task_title || data.metadata?.task_title,
-      },
-      output: data.output || [],
-      knowledgeInteraction:
-        payload?.observation?.interaction ?? payload?.interaction,
-      knowledgeObservation: observation,
-    };
+
+    throw lastError || new Error("任务创建失败：已达到重试上限");
   } finally {
     window.clearTimeout(timeoutId);
   }

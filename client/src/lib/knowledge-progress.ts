@@ -70,11 +70,16 @@ function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
     (payload?.progress as KnowledgeBaseProgressDto | null | undefined) ??
     interaction.progress ??
     null;
+  const authoritativeTaskId = Object.prototype.hasOwnProperty.call(
+    source,
+    "authoritativeTaskId",
+  )
+    ? (source.authoritativeTaskId ?? null)
+    : (source.taskId ?? payload?.task?.id ?? null);
   return {
     stateEpoch: Number(source.stateEpoch ?? 0),
     generation: Number(source.generation ?? 0),
-    authoritativeTaskId:
-      source.authoritativeTaskId ?? source.taskId ?? payload?.task?.id ?? null,
+    authoritativeTaskId,
     activeTurn: source.activeTurn ?? null,
     interaction: { ...interaction, progress },
     approvedPresentation: source.approvedPresentation ?? null,

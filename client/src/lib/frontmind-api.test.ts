@@ -12,6 +12,7 @@ import {
 
 afterEach(() => {
   localStorage.clear();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -125,6 +126,241 @@ describe("createResponseLogicTask", () => {
 });
 
 describe("createKnowledgeBaseTurnTask", () => {
+  it("preserves the server error code and Retry-After metadata", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === "retry-after" ? "2" : null,
+      },
+      json: async () => ({
+        error: {
+          code: "IDEMPOTENCY_PENDING",
+          message: "相同附件仍在暂存",
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      reserveKnowledgeBaseTurnWithAttachments([], {
+        conversationId: "conv-kb",
+        clientRequestId: "request-files",
+        expectedGeneration: 2,
+        expectedRevision: 5,
+        expectedLeafId: "1.6",
+        attachmentManifest: [],
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "IDEMPOTENCY_PENDING",
+      retryAfter: "2",
+      retryAfterMs: 2_000,
+    });
+  });
+
+  it("retries a disconnected turn request with the exact same logical body", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          task: { id: "accepted-turn", status: "running" },
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const created = createKnowledgeBaseTurnTask(
+      [{ role: "user", content: [{ type: "input_text", text: "确认" }] }],
+      {
+        conversationId: "conv-kb",
+        clientRequestId: "stable-request-id",
+        expectedRevision: 5,
+        expectedLeafId: "1.6",
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(created).resolves.toMatchObject({ id: "accepted-turn" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][1].body).toBe(
+      fetchMock.mock.calls[1][1].body,
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      conversationId: "conv-kb",
+      clientRequestId: "stable-request-id",
+      expectedRevision: 5,
+      expectedLeafId: "1.6",
+      userMessage: "确认",
+    });
+  });
+
+  it("replays the exact legacy takeover manifest with the same request bytes", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          task: { id: "legacy-turn", status: "running" },
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const attachmentManifest = [
+      {
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 123,
+        sha256: "a".repeat(64),
+      },
+    ];
+
+    const created = createKnowledgeBaseTurnTask(
+      [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_file",
+              file_id: "replacement-file",
+              filename: "facts.pdf",
+            },
+          ],
+        },
+      ],
+      {
+        conversationId: "conv-kb",
+        clientRequestId: "legacy-request",
+        expectedRevision: 5,
+        expectedLeafId: "1.6",
+        legacyAttachmentTakeover: { attachmentManifest },
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(created).resolves.toMatchObject({ id: "legacy-turn" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][1].body).toBe(
+      fetchMock.mock.calls[1][1].body,
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      resumeLegacyAttachments: true,
+      attachmentManifest,
+    });
+  });
+
+  it.each([408, 425, 429, 503])(
+    "retries transient HTTP %s turn responses",
+    async (status) => {
+      vi.useFakeTimers();
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status,
+          headers: { get: () => "0" },
+          json: async () => ({
+            error: { code: "TRANSIENT", message: "请稍后重试" },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            task: { id: `accepted-${status}`, status: "running" },
+          }),
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const created = createKnowledgeBaseTurnTask([], {
+        conversationId: "conv-kb",
+        clientRequestId: `request-${status}`,
+        expectedRevision: 5,
+        expectedLeafId: "1.6",
+      });
+      await vi.advanceTimersByTimeAsync(500);
+
+      await expect(created).resolves.toMatchObject({
+        id: `accepted-${status}`,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[0][1].body).toBe(
+        fetchMock.mock.calls[1][1].body,
+      );
+    },
+  );
+
+  it("waits for Retry-After before replaying the same turn request", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: { get: () => "2" },
+        json: async () => ({
+          error: { code: "RATE_LIMITED", message: "请求过快" },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          task: { id: "accepted-after-delay", status: "running" },
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const created = createKnowledgeBaseTurnTask([], {
+      conversationId: "conv-kb",
+      clientRequestId: "request-with-retry-after",
+      expectedRevision: 5,
+      expectedLeafId: "1.6",
+    });
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(created).resolves.toMatchObject({
+      id: "accepted-after-delay",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops replaying a turn request after four transient responses", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      headers: { get: () => null },
+      json: async () => ({
+        error: { code: "TEMPORARILY_UNAVAILABLE", message: "服务繁忙" },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const created = createKnowledgeBaseTurnTask([], {
+      conversationId: "conv-kb",
+      clientRequestId: "bounded-request",
+      expectedRevision: 5,
+      expectedLeafId: "1.6",
+    });
+    const rejection = expect(created).rejects.toMatchObject({
+      status: 503,
+      code: "TEMPORARILY_UNAVAILABLE",
+    });
+    await vi.advanceTimersByTimeAsync(500 + 1_000 + 2_000);
+
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(new Set(fetchMock.mock.calls.map((call) => call[1].body))).toEqual(
+      new Set([fetchMock.mock.calls[0][1].body]),
+    );
+  });
+
   it("reserves the logical turn before any file id exists", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -225,6 +461,120 @@ describe("createKnowledgeBaseTurnTask", () => {
       turnId: "turn-reserved",
       attachmentManifest: manifest,
     });
+  });
+
+  it("retries transient attachment staging failures with the exact same file id", async () => {
+    vi.useFakeTimers();
+    const transientFailures = [
+      { status: 409, code: "IDEMPOTENCY_PENDING" },
+      { status: 425, code: "TOO_EARLY" },
+      { status: 429, code: "RATE_LIMITED" },
+      { status: 503, code: "TEMPORARILY_UNAVAILABLE" },
+    ];
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const input = {
+      conversationId: "conv-kb",
+      turnId: "turn-reserved",
+      clientRequestId: "request-files",
+      attachmentManifest: [
+        {
+          filename: "facts.pdf",
+          sizeBytes: 12,
+          mimeType: "application/pdf",
+          lastModified: 10,
+          sha256: "a".repeat(64),
+        },
+      ],
+      index: 0,
+      attachment: { file_id: "file-facts", filename: "facts.pdf" },
+    };
+
+    for (const failure of transientFailures) {
+      fetchMock.mockReset();
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: false,
+          status: failure.status,
+          headers: { get: () => "0.25" },
+          json: async () => ({
+            error: { code: failure.code, message: "请稍后重试" },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ reservation: { stagedAttachmentCount: 1 } }),
+        });
+
+      const staged = stageKnowledgeBaseTurnAttachment(input);
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(staged).resolves.toMatchObject({
+        reservation: { stagedAttachmentCount: 1 },
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const requestBodies = fetchMock.mock.calls.map((call) => call[1].body);
+      expect(new Set(requestBodies)).toEqual(new Set([JSON.stringify(input)]));
+      expect(JSON.parse(requestBodies[0]).attachment.file_id).toBe(
+        "file-facts",
+      );
+    }
+  });
+
+  it("retries a network staging failure without creating an unbounded loop", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ reservation: { stagedAttachmentCount: 1 } }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const input = {
+      conversationId: "conv-kb",
+      turnId: "turn-reserved",
+      clientRequestId: "request-files",
+      attachmentManifest: [],
+      index: 0,
+      attachment: { file_id: "file-facts", filename: "facts.pdf" },
+    };
+
+    const staged = stageKnowledgeBaseTurnAttachment(input);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(staged).resolves.toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][1].body).toBe(
+      fetchMock.mock.calls[1][1].body,
+    );
+  });
+
+  it("stops attachment staging after four transient attempts", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      headers: { get: () => null },
+      json: async () => ({
+        error: { code: "TEMPORARILY_UNAVAILABLE", message: "服务繁忙" },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const staged = stageKnowledgeBaseTurnAttachment({
+      conversationId: "conv-kb",
+      turnId: "turn-reserved",
+      clientRequestId: "request-files",
+      attachmentManifest: [],
+      index: 0,
+      attachment: { file_id: "file-facts", filename: "facts.pdf" },
+    });
+    const rejection = expect(staged).rejects.toMatchObject({
+      status: 503,
+      code: "TEMPORARILY_UNAVAILABLE",
+    });
+    await vi.runAllTimersAsync();
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("fences a confirmation to the visible revision and leaf", async () => {

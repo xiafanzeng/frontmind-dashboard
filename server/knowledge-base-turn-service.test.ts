@@ -22,6 +22,7 @@ import {
   createKnowledgeBaseUpstreamIdempotencyKey,
   evaluateKnowledgeBaseTurnReplay,
   failKnowledgeBaseTurnDeterministically,
+  findReusableKnowledgeBaseSkillFileId,
   claimKnowledgeBaseDeferredTurnDispatch,
   claimKnowledgeBaseTurnForRecovery,
   hashKnowledgeBaseTurnRequest,
@@ -697,6 +698,190 @@ describe("knowledge-base generated attachment reservations", () => {
     expect(store.resources).toHaveLength(1);
     expect(store.turns[0]!.attachmentFileIds).toEqual(["provider-file-1"]);
   });
+
+  const reusableSkillSha256 = "d".repeat(64);
+
+  function completedSkillTurn(
+    overrides: Partial<ConversationTurn> = {},
+  ): ConversationTurn {
+    const fileId = "provider-skill-file";
+    const requestBody = {
+      prompt: "continue knowledge-base build",
+      agentProfile: "manus-1.6-max",
+      taskMode: "agent" as const,
+      attachments: [
+        {
+          file_id: fileId,
+          filename: "socratic-kb-builder-v4.skill",
+        },
+      ],
+      taskId: "parent-task",
+    };
+    return turn({
+      status: "completed",
+      upstreamTaskId: "completed-provider-task",
+      attachmentFileIds: [fileId],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 1,
+        userAttachmentCount: 0,
+        generatedAttachmentReservations: {
+          "skill:0": {
+            schemaVersion: 1,
+            role: "skill",
+            attachmentIndex: 0,
+            requestHash: "e".repeat(64),
+            idempotencyKeyHash: "f".repeat(64),
+            filename: "socratic-kb-builder-v4.skill",
+            mimeType: "application/zip",
+            sizeBytes: 123,
+            contentSha256: reusableSkillSha256,
+            status: "completed",
+            upstreamFileId: fileId,
+            reservedAt: "2026-08-01T00:00:01.000Z",
+            completedAt: "2026-08-01T00:00:02.000Z",
+          },
+        },
+        preparedDispatch: {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.test",
+          requestBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+          preparedAt: "2026-08-01T00:00:03.000Z",
+        },
+      },
+      ...overrides,
+    });
+  }
+
+  function reusableSkillLookupExecutor(input?: {
+    sourceTurn?: ConversationTurn;
+    resourceOverrides?: Record<string, unknown>;
+  }) {
+    const sourceTurn = input?.sourceTurn || completedSkillTurn();
+    return createTurnServiceExecutor({
+      build: {
+        id: identity.buildId,
+        userId: 1,
+        generation: 3,
+        activeTurnId: null,
+      },
+      turns: [sourceTurn],
+      resources: [
+        {
+          id: "resource-skill-file",
+          userId: 1,
+          apiCredentialId: "credential-1",
+          projectAssignmentId: null,
+          kind: "file",
+          upstreamId: "provider-skill-file",
+          conversationId: sourceTurn.conversationId,
+          createdAt: new Date("2026-08-01T00:00:02.000Z"),
+          ...input?.resourceOverrides,
+        },
+      ],
+      turnSelections: [[() => [sourceTurn]]],
+    });
+  }
+
+  it("returns a completed Skill file only within the current user, build generation, and credential", async () => {
+    const { executor } = reusableSkillLookupExecutor();
+
+    await expect(
+      findReusableKnowledgeBaseSkillFileId(
+        {
+          userId: 1,
+          buildId: identity.buildId,
+          apiCredentialId: "credential-1",
+          contentSha256: reusableSkillSha256,
+        },
+        executor,
+      ),
+    ).resolves.toBe("provider-skill-file");
+  });
+
+  it.each([
+    ["another user", { userId: 2 }],
+    ["another build", { buildId: "00000000-0000-4000-8000-000000000099" }],
+    ["an older build generation", { buildGeneration: 2 }],
+    ["another credential", { apiCredentialId: "credential-2" }],
+    ["an unbound source turn", { upstreamTaskId: null }],
+    ["a non-terminal source turn", { status: "queued" }],
+  ] as const)("does not reuse a Skill from %s", async (_label, overrides) => {
+    const { executor } = reusableSkillLookupExecutor({
+      sourceTurn: completedSkillTurn(overrides as Partial<ConversationTurn>),
+    });
+
+    await expect(
+      findReusableKnowledgeBaseSkillFileId(
+        {
+          userId: 1,
+          buildId: identity.buildId,
+          apiCredentialId: "credential-1",
+          contentSha256: reusableSkillSha256,
+        },
+        executor,
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("rejects a merely file-bound reservation and mismatched resource ownership", async () => {
+    const halfUploaded = completedSkillTurn({
+      status: "queued",
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: false,
+        expectedAttachmentCount: 1,
+        userAttachmentCount: 0,
+        generatedAttachmentReservations: (completedSkillTurn().metadata as any)
+          .generatedAttachmentReservations,
+      },
+    });
+    const halfUploadedExecutor = reusableSkillLookupExecutor({
+      sourceTurn: halfUploaded,
+    }).executor;
+    await expect(
+      findReusableKnowledgeBaseSkillFileId(
+        {
+          userId: 1,
+          buildId: identity.buildId,
+          apiCredentialId: "credential-1",
+          contentSha256: reusableSkillSha256,
+        },
+        halfUploadedExecutor,
+      ),
+    ).resolves.toBeNull();
+
+    const foreignResourceExecutor = reusableSkillLookupExecutor({
+      resourceOverrides: { userId: 2 },
+    }).executor;
+    await expect(
+      findReusableKnowledgeBaseSkillFileId(
+        {
+          userId: 1,
+          buildId: identity.buildId,
+          apiCredentialId: "credential-1",
+          contentSha256: reusableSkillSha256,
+        },
+        foreignResourceExecutor,
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("does not reuse a completed Skill reservation with different bytes", async () => {
+    const { executor } = reusableSkillLookupExecutor();
+    await expect(
+      findReusableKnowledgeBaseSkillFileId(
+        {
+          userId: 1,
+          buildId: identity.buildId,
+          apiCredentialId: "credential-1",
+          contentSha256: "9".repeat(64),
+        },
+        executor,
+      ),
+    ).resolves.toBeNull();
+  });
 });
 
 describe("knowledge-base atomic start reservation", () => {
@@ -1228,6 +1413,47 @@ describe("knowledge-base attachment-first turn reservation", () => {
     };
   }
 
+  function uploadFirstTakeoverInput(overrides: Record<string, unknown> = {}) {
+    const attachments = [
+      { file_id: "replacement-facts", filename: "facts.pdf" },
+      {
+        file_id: "replacement-logo-notes",
+        filename: "logo-notes.txt",
+      },
+    ];
+    return {
+      userId: 1,
+      buildId: build.id,
+      clientRequestId: "deferred-request-1",
+      operationType: "revise" as const,
+      expectedGeneration: 4,
+      expectedRevision: 6,
+      expectedLeafId: "2.1",
+      requestPayload: {
+        userMessage: "请结合附件修订",
+        attachments,
+        skillVersion: "4",
+      },
+      apiCredentialId: "credential-1",
+      userText: "请结合附件修订",
+      userAttachmentCount: 2,
+      expectedAttachmentCount: 3,
+      clientAttachmentManifest: manifest,
+      resumeLegacyAttachmentTakeover: true,
+      recoveryMetadata: {
+        kind: "turn",
+        conversationId: build.conversationId,
+        parentTaskId: "parent-task",
+        userMessage: "请结合附件修订",
+        attachments,
+        attachmentManifest: manifest,
+        skillVersion: "4",
+      },
+      now: new Date("2026-08-01T00:01:00.000Z"),
+      ...overrides,
+    };
+  }
+
   it("does not create a competing turn while open-build recovery owns the lease", async () => {
     const { executor } = createTurnServiceExecutor({
       build: {
@@ -1430,6 +1656,240 @@ describe("knowledge-base attachment-first turn reservation", () => {
       },
     });
   });
+
+  it("atomically takes over without local text and coalesces a lost-202 replay", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      build: { ...build },
+      conversation: { ...conversation },
+      turnSelections: [
+        [[], []],
+        [(current) => current.turns],
+        [(current) => current.turns, (current) => current.turns],
+        [(current) => current.turns, (current) => current.turns],
+      ],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+    expect(reserved.state).toBe("awaiting_attachments");
+    const originalTurnId = reserved.turn.id;
+    const originalOperationKey = reserved.turn.operationKey;
+    const originalUpstreamIdempotencyKey =
+      createKnowledgeBaseUpstreamIdempotencyKey(originalOperationKey);
+
+    await stageKnowledgeBaseDeferredTurnAttachment(
+      {
+        userId: 1,
+        buildId: build.id,
+        turnId: originalTurnId,
+        clientRequestId: reserved.turn.clientRequestId,
+        clientAttachmentManifest: manifest,
+        index: 0,
+        attachment: { file_id: "old-staged-facts", filename: "facts.pdf" },
+      },
+      executor,
+    );
+
+    const missingLocalMessageInput = uploadFirstTakeoverInput();
+    const takeoverWithoutLocalMessage = {
+      ...missingLocalMessageInput,
+      userText: "",
+      requestPayload: {
+        ...(missingLocalMessageInput.requestPayload as Record<string, unknown>),
+        userMessage: "",
+      },
+      recoveryMetadata: {
+        ...(missingLocalMessageInput.recoveryMetadata as Record<
+          string,
+          unknown
+        >),
+        userMessage: "",
+      },
+    };
+    const takenOver = await reserveKnowledgeBaseTurn(
+      takeoverWithoutLocalMessage,
+      executor,
+    );
+    expect(takenOver).toMatchObject({
+      state: "acquired",
+      turn: {
+        id: originalTurnId,
+        clientRequestId: "deferred-request-1",
+        operationKey: originalOperationKey,
+        attachmentFileIds: [],
+        awaitingClientAttachments: false,
+      },
+      upstreamIdempotencyKey: originalUpstreamIdempotencyKey,
+    });
+    expect(store.turns).toHaveLength(1);
+    expect(store.messages).toHaveLength(1);
+    expect(store.turns[0]).toMatchObject({
+      id: originalTurnId,
+      upstreamTaskId: null,
+      attachmentFileIds: [],
+      metadata: {
+        attachmentsFrozen: false,
+        awaitingClientAttachments: false,
+        expectedAttachmentCount: 3,
+        userAttachmentCount: 2,
+        recovery: {
+          userMessage: "请结合附件修订",
+          attachments: [
+            { file_id: "replacement-facts", filename: "facts.pdf" },
+            {
+              file_id: "replacement-logo-notes",
+              filename: "logo-notes.txt",
+            },
+          ],
+        },
+      },
+    });
+    expect((store.turns[0]!.metadata as any).clientAttachmentManifestHash).toBe(
+      hashKnowledgeBaseTurnRequest(manifest),
+    );
+    expect((store.turns[0]!.metadata as any).clientStagedAttachments).toBe(
+      undefined,
+    );
+    expect(store.build).toMatchObject({
+      activeTurnId: originalTurnId,
+      stateEpoch: 4,
+      lastTurnUserText: "请结合附件修订",
+      lastTurnAttachmentCount: 2,
+    });
+
+    const replay = await reserveKnowledgeBaseTurn(
+      {
+        ...takeoverWithoutLocalMessage,
+        now: new Date("2026-08-01T00:01:01.000Z"),
+      },
+      executor,
+    );
+    expect(replay).toMatchObject({
+      state: "pending",
+      turn: { id: originalTurnId, operationKey: originalOperationKey },
+    });
+    expect(store.turns).toHaveLength(1);
+    expect(store.turns[0]!.upstreamTaskId).toBeNull();
+  });
+
+  it.each([
+    [
+      "client request identity",
+      () => uploadFirstTakeoverInput({ clientRequestId: "another-request" }),
+    ],
+    [
+      "knowledge coordinate",
+      () => uploadFirstTakeoverInput({ expectedRevision: 7 }),
+    ],
+    [
+      "pinned credential",
+      () => uploadFirstTakeoverInput({ apiCredentialId: "credential-2" }),
+    ],
+    [
+      "skill version",
+      () => {
+        const input = uploadFirstTakeoverInput();
+        return {
+          ...input,
+          requestPayload: {
+            ...(input.requestPayload as Record<string, unknown>),
+            skillVersion: "5",
+          },
+          recoveryMetadata: {
+            ...(input.recoveryMetadata as Record<string, unknown>),
+            skillVersion: "5",
+          },
+        };
+      },
+    ],
+    [
+      "reserved filename",
+      () => {
+        const input = uploadFirstTakeoverInput();
+        const attachments = [
+          { file_id: "replacement-facts", filename: "other.pdf" },
+          {
+            file_id: "replacement-logo-notes",
+            filename: "logo-notes.txt",
+          },
+        ];
+        return {
+          ...input,
+          requestPayload: {
+            ...(input.requestPayload as Record<string, unknown>),
+            attachments,
+          },
+          recoveryMetadata: {
+            ...(input.recoveryMetadata as Record<string, unknown>),
+            attachments,
+          },
+        };
+      },
+    ],
+  ])(
+    "rejects upload-first takeover outside the original %s",
+    async (_label, nextInput) => {
+      const { executor, store } = createTurnServiceExecutor({
+        build: { ...build },
+        conversation: { ...conversation },
+        turns: [],
+        credentials: [
+          { id: "credential-1", userId: 1, status: "active" },
+          { id: "credential-2", userId: 1, status: "active" },
+        ],
+        turnSelections: [
+          [[], []],
+          [(current) => current.turns, (current) => current.turns],
+        ],
+      });
+      const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+
+      await expect(
+        reserveKnowledgeBaseTurn(nextInput() as any, executor),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(store.turns).toHaveLength(1);
+      expect(store.turns[0]).toMatchObject({
+        id: reserved.turn.id,
+        upstreamTaskId: null,
+        leaseExpiresAt: null,
+        metadata: { awaitingClientAttachments: true },
+      });
+    },
+  );
+
+  it.each([
+    ["sha256", { sha256: "f".repeat(64) }],
+    ["sizeBytes", { sizeBytes: manifest[0]!.sizeBytes + 1 }],
+    ["mimeType", { mimeType: "application/octet-stream" }],
+    ["lastModified", { lastModified: manifest[0]!.lastModified + 1 }],
+  ])(
+    "rejects a same-name replacement whose %s differs from the durable manifest",
+    async (_field, mutation) => {
+      const { executor, store } = createTurnServiceExecutor({
+        build: { ...build },
+        conversation: { ...conversation },
+        turnSelections: [
+          [[], []],
+          [(current) => current.turns, (current) => current.turns],
+        ],
+      });
+      const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+      const replacementManifest = manifest.map((entry, index) =>
+        index === 0 ? { ...entry, ...mutation } : entry,
+      );
+      const input = uploadFirstTakeoverInput({
+        clientAttachmentManifest: replacementManifest,
+      });
+
+      await expect(
+        reserveKnowledgeBaseTurn(input as any, executor),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(store.turns).toHaveLength(1);
+      expect(store.turns[0]).toMatchObject({
+        id: reserved.turn.id,
+        upstreamTaskId: null,
+        metadata: { awaitingClientAttachments: true },
+      });
+    },
+  );
 
   it("never lets the recovery worker claim a browser turn awaiting files", async () => {
     const waiting = turn({
