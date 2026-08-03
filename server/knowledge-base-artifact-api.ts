@@ -1,13 +1,17 @@
+import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { Router, type Response } from "express";
+import sharp from "sharp";
 
 import {
+  conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
 } from "../drizzle/schema";
 import type { FrontMindRequest } from "./_core/express-auth";
 import {
   KnowledgeArchiveValidationError,
+  readStoredKnowledgeAssetBytes,
   validateKnowledgeArchiveForDownload,
 } from "./dashboard-api";
 import { getDb } from "./db";
@@ -16,13 +20,47 @@ import {
   KnowledgeBasePackageBindingError,
 } from "./knowledge-base-package-validation";
 import {
+  assertKnowledgeBaseCustomerUploadVisualBindings,
+  verifiedKnowledgeBaseCustomerUploadImagesFromTurn,
+  verifiedKnowledgeBaseCustomerUploadsForBuild,
+} from "./knowledge-base-customer-upload";
+import {
   KnowledgeBuildArtifactError,
   knowledgeBuildArtifactStorageKeyBelongsTo,
   readKnowledgeBuildArtifact,
   type KnowledgeBuildArtifactKind,
 } from "./knowledge-build-artifact-store";
+import { readStoredPresalesFile } from "./presales-file-store";
 
 const router = Router();
+const MAX_CUSTOMER_UPLOAD_SOURCE_BYTES = 100 * 1024 * 1024;
+const MAX_CUSTOMER_UPLOAD_SVG_BYTES = 10 * 1024 * 1024;
+// Match the upload-admission decoder: if a customer image is accepted for a
+// turn, the same original must also remain previewable from history. Final ZIP
+// assets may still be safely downscaled to the stricter packaged-image limit.
+const MAX_CUSTOMER_UPLOAD_PIXELS = 100_000_000;
+const MAX_CUSTOMER_PREVIEW_DIMENSION = 4096;
+const MAX_CUSTOMER_PREVIEW_BYTES = 80 * 1024 * 1024;
+const SAFE_CUSTOMER_RASTER_FORMATS = new Set([
+  "png",
+  "jpeg",
+  "webp",
+  "avif",
+  "gif",
+  "tiff",
+  "heif",
+]);
+
+class CustomerUploadPreviewError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CustomerUploadPreviewError";
+  }
+}
 
 type ArtifactBuild = Pick<
   typeof knowledgeBaseBuilds.$inferSelect,
@@ -215,7 +253,7 @@ async function serveBuildArtifact(
       )
       .limit(1)
   )[0];
-  if (!build) {
+  if (!build || build.userId !== userId) {
     res.status(404).json({
       error: { code: "BUILD_NOT_FOUND", message: "知识库构建记录不存在" },
     });
@@ -249,11 +287,11 @@ async function serveBuildArtifact(
           build.skillVersion === "1"
             ? undefined
             : build.skillVersion === "4"
-              ? [3]
+              ? [3, 4]
               : [2, 3],
         ...(build.skillVersion === "3" || build.skillVersion === "4"
           ? {
-              validateParsed: (parsed) => {
+              validateParsed: async (parsed) => {
                 if (
                   build.skillVersion === "4" &&
                   parsed.packageBuildRevision !== build.revision
@@ -263,6 +301,14 @@ async function serveBuildArtifact(
                     "知识库最终 ZIP buildRevision 与已绑定版本不一致",
                   );
                 }
+                const expectedCustomerUploads =
+                  build.skillVersion === "4"
+                    ? await verifiedKnowledgeBaseCustomerUploadsForBuild({
+                        userId,
+                        buildId: build.id,
+                        generation: build.generation,
+                      })
+                    : [];
                 assertKnowledgeBasePackageMatchesBuild({
                   nodes: nodes.map((node) => ({
                     leafId: node.leafId,
@@ -277,8 +323,17 @@ async function serveBuildArtifact(
                   documents: parsed.documents,
                   assets: parsed.assets,
                   expectedLogoSha256: String(build.logoSha256 || ""),
+                  packageSchemaVersion: parsed.packageSchemaVersion,
+                  expectedCustomerUploads,
                   legacyV3Compatibility: build.skillVersion === "3",
                 });
+                if (parsed.packageSchemaVersion === 4) {
+                  await assertKnowledgeBaseCustomerUploadVisualBindings({
+                    assets: parsed.assets,
+                    expectedUploads: expectedCustomerUploads,
+                    readPackagedAssetBytes: readStoredKnowledgeAssetBytes,
+                  });
+                }
               },
             }
           : {}),
@@ -301,6 +356,371 @@ async function serveBuildArtifact(
     sendArtifactError(res, error);
   }
 }
+
+function sendCustomerUploadPreviewError(res: Response, error: unknown) {
+  if (error instanceof CustomerUploadPreviewError) {
+    res.status(error.status).json({
+      error: { code: error.code, message: error.message },
+    });
+    return;
+  }
+  console.error(
+    "[KnowledgeBaseArtifact] customer_upload_preview_failed",
+    JSON.stringify({ errorCode: "CUSTOMER_UPLOAD_PREVIEW_FAILED" }),
+  );
+  res.status(500).json({
+    error: {
+      code: "CUSTOMER_UPLOAD_PREVIEW_FAILED",
+      message: "补充图片读取失败，请稍后重试",
+    },
+  });
+}
+
+function safePreviewFilename(value: string) {
+  const filename = safeDownloadFilename(value, "customer-upload");
+  const basename = filename.replace(/\.[^.]+$/u, "").slice(0, 170);
+  return `${basename || "customer-upload"}.png`;
+}
+
+function isPotentialSvg(
+  bytes: Buffer,
+  declaredMimeType: string,
+  filename: string,
+) {
+  if (
+    declaredMimeType.toLowerCase() === "image/svg+xml" ||
+    /\.svg$/iu.test(filename)
+  ) {
+    return true;
+  }
+  const prefix = bytes.subarray(0, Math.min(bytes.length, 4096));
+  if (
+    prefix.subarray(0, 2).equals(Buffer.from([0xff, 0xfe])) ||
+    prefix.subarray(0, 2).equals(Buffer.from([0xfe, 0xff]))
+  ) {
+    return true;
+  }
+  return /^\s*</u.test(prefix.toString("utf8").replace(/^\uFEFF/u, ""));
+}
+
+function assertSafeSvgSource(bytes: Buffer) {
+  if (!bytes.length || bytes.length > MAX_CUSTOMER_UPLOAD_SVG_BYTES) {
+    throw new CustomerUploadPreviewError(
+      413,
+      "CUSTOMER_UPLOAD_TOO_LARGE",
+      "该 SVG 超过安全预览大小限制",
+    );
+  }
+  let source: string;
+  try {
+    source = new TextDecoder("utf-8", { fatal: true })
+      .decode(bytes)
+      .replace(/^\uFEFF/u, "");
+  } catch {
+    throw new CustomerUploadPreviewError(
+      415,
+      "CUSTOMER_UPLOAD_IMAGE_INVALID",
+      "该 SVG 不是有效的 UTF-8 图片",
+    );
+  }
+  const withoutXmlDeclaration = source.replace(
+    /^\s*<\?xml(?:\s+[^?]*)?\?>/iu,
+    "",
+  );
+  if (
+    !/^\s*<svg\b/iu.test(withoutXmlDeclaration) ||
+    /\u0000/u.test(source) ||
+    /<!\s*(?:doctype|entity)\b/iu.test(source) ||
+    /<\s*(?:script|foreignObject|iframe|object|embed|image|feImage|audio|video|canvas|style|link|meta)\b/iu.test(
+      source,
+    ) ||
+    /\bon[a-z][\w:.-]*\s*=/iu.test(source) ||
+    /\b(?:src|xml:base)\s*=/iu.test(source) ||
+    /(?:@import|url\s*\()/iu.test(source) ||
+    /<\?/u.test(withoutXmlDeclaration) ||
+    /\bencoding\s*=\s*["'](?!utf-?8["'])/iu.test(source)
+  ) {
+    throw new CustomerUploadPreviewError(
+      415,
+      "CUSTOMER_UPLOAD_IMAGE_UNSAFE",
+      "该 SVG 含有不允许的活动内容或外部资源",
+    );
+  }
+
+  const hrefAssignments = source.match(/\b(?:xlink:)?href\s*=/giu)?.length || 0;
+  const hrefValues = [
+    ...source.matchAll(/\b(?:xlink:)?href\s*=\s*(?:"([^"]*)"|'([^']*)')/giu),
+  ];
+  if (
+    hrefValues.length !== hrefAssignments ||
+    hrefValues.some(
+      (match) => !/^#[A-Za-z_][\w:.-]*$/u.test(match[1] || match[2] || ""),
+    )
+  ) {
+    throw new CustomerUploadPreviewError(
+      415,
+      "CUSTOMER_UPLOAD_IMAGE_UNSAFE",
+      "该 SVG 含有不允许的外部引用",
+    );
+  }
+}
+
+async function renderSafeCustomerUploadPreview(input: {
+  bytes: Buffer;
+  declaredMimeType: string;
+  filename: string;
+}) {
+  const svg = isPotentialSvg(
+    input.bytes,
+    input.declaredMimeType,
+    input.filename,
+  );
+  if (svg) assertSafeSvgSource(input.bytes);
+
+  try {
+    const decoder = sharp(input.bytes, {
+      animated: false,
+      failOn: "warning",
+      limitInputPixels: MAX_CUSTOMER_UPLOAD_PIXELS,
+      sequentialRead: true,
+      ...(svg ? { density: 144 } : {}),
+    });
+    const metadata = await decoder.metadata();
+    const height = metadata.pageHeight || metadata.height;
+    if (
+      !metadata.width ||
+      !height ||
+      metadata.width * height > MAX_CUSTOMER_UPLOAD_PIXELS ||
+      (svg
+        ? metadata.format !== "svg"
+        : !SAFE_CUSTOMER_RASTER_FORMATS.has(String(metadata.format || "")))
+    ) {
+      throw new Error("CUSTOMER_UPLOAD_DECODE_MISMATCH");
+    }
+    const rendered = await decoder
+      .rotate()
+      .resize({
+        width: MAX_CUSTOMER_PREVIEW_DIMENSION,
+        height: MAX_CUSTOMER_PREVIEW_DIMENSION,
+        fit: "inside",
+        withoutEnlargement: true,
+      })
+      .png({ compressionLevel: 9 })
+      .toBuffer({ resolveWithObject: true });
+    if (
+      !rendered.info.width ||
+      !rendered.info.height ||
+      rendered.info.width * rendered.info.height > MAX_CUSTOMER_UPLOAD_PIXELS ||
+      !rendered.data.length ||
+      rendered.data.length > MAX_CUSTOMER_PREVIEW_BYTES
+    ) {
+      throw new Error("CUSTOMER_UPLOAD_PREVIEW_INVALID");
+    }
+    return rendered.data;
+  } catch (error) {
+    if (error instanceof CustomerUploadPreviewError) throw error;
+    throw new CustomerUploadPreviewError(
+      415,
+      "CUSTOMER_UPLOAD_IMAGE_INVALID",
+      "该补充图片无法安全解码",
+    );
+  }
+}
+
+async function readCustomerUploadBytes(
+  stored: NonNullable<Awaited<ReturnType<typeof readStoredPresalesFile>>>,
+) {
+  if (
+    !Number.isSafeInteger(stored.sizeBytes) ||
+    stored.sizeBytes < 1 ||
+    stored.sizeBytes > MAX_CUSTOMER_UPLOAD_SOURCE_BYTES
+  ) {
+    throw new CustomerUploadPreviewError(
+      413,
+      "CUSTOMER_UPLOAD_TOO_LARGE",
+      "该补充图片超过安全预览大小限制",
+    );
+  }
+  const chunks: Buffer[] = [];
+  let bytesRead = 0;
+  for await (const chunk of stored.createReadStream()) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytesRead += bytes.length;
+    if (bytesRead > MAX_CUSTOMER_UPLOAD_SOURCE_BYTES) {
+      throw new CustomerUploadPreviewError(
+        413,
+        "CUSTOMER_UPLOAD_TOO_LARGE",
+        "该补充图片超过安全预览大小限制",
+      );
+    }
+    chunks.push(bytes);
+  }
+  if (bytesRead !== stored.sizeBytes) {
+    throw new CustomerUploadPreviewError(
+      409,
+      "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
+      "补充图片完整性校验未通过",
+    );
+  }
+  return Buffer.concat(chunks, bytesRead);
+}
+
+async function serveCustomerUploadPreview(
+  req: FrontMindRequest,
+  res: Response,
+) {
+  const userId = req.frontmindUser?.id;
+  if (!userId) {
+    res.status(401).json({
+      error: { code: "UNAUTHORIZED", message: "请先登录" },
+    });
+    return;
+  }
+  const buildId = String(req.params.buildId || "").trim();
+  const turnId = String(req.params.turnId || "").trim();
+  const sourceSha256 = String(req.params.sourceSha || "")
+    .trim()
+    .toLowerCase();
+  const rawIndex = String(req.params.index || "").trim();
+  if (
+    !buildId ||
+    !turnId ||
+    !/^(?:0|[1-9]\d?)$/u.test(rawIndex) ||
+    !/^[a-f0-9]{64}$/u.test(sourceSha256)
+  ) {
+    res.status(404).json({
+      error: { code: "CUSTOMER_UPLOAD_NOT_FOUND", message: "补充图片不存在" },
+    });
+    return;
+  }
+  const index = Number(rawIndex);
+  const db = await getDb();
+  if (!db) {
+    res.status(503).json({
+      error: { code: "DATABASE_UNAVAILABLE", message: "数据库暂不可用" },
+    });
+    return;
+  }
+
+  const build = (
+    await db
+      .select()
+      .from(knowledgeBaseBuilds)
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, buildId),
+          eq(knowledgeBaseBuilds.userId, userId),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (!build || build.userId !== userId) {
+    res.status(404).json({
+      error: { code: "CUSTOMER_UPLOAD_NOT_FOUND", message: "补充图片不存在" },
+    });
+    return;
+  }
+
+  const turn = (
+    await db
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.id, turnId),
+          eq(conversationTurns.userId, userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          eq(conversationTurns.status, "completed"),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (
+    !turn ||
+    turn.status !== "completed" ||
+    turn.userId !== userId ||
+    turn.buildId !== build.id ||
+    turn.buildGeneration !== build.generation
+  ) {
+    res.status(404).json({
+      error: { code: "CUSTOMER_UPLOAD_NOT_FOUND", message: "补充图片不存在" },
+    });
+    return;
+  }
+
+  try {
+    const image = (
+      await verifiedKnowledgeBaseCustomerUploadImagesFromTurn(turn)
+    ).find(
+      (candidate) =>
+        candidate.turnId === turnId &&
+        candidate.index === index &&
+        candidate.sourceSha256 === sourceSha256,
+    );
+    if (!image) {
+      throw new CustomerUploadPreviewError(
+        404,
+        "CUSTOMER_UPLOAD_NOT_FOUND",
+        "补充图片不存在",
+      );
+    }
+    const stored = await readStoredPresalesFile(image.fileId);
+    if (
+      !stored ||
+      stored.filename !== image.filename ||
+      stored.sizeBytes !== image.sizeBytes ||
+      stored.sha256?.toLowerCase() !== image.sourceSha256
+    ) {
+      throw new CustomerUploadPreviewError(
+        409,
+        "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
+        "补充图片完整性校验未通过",
+      );
+    }
+    const sourceBytes = await readCustomerUploadBytes(stored);
+    if (
+      createHash("sha256").update(sourceBytes).digest("hex") !==
+      image.sourceSha256
+    ) {
+      throw new CustomerUploadPreviewError(
+        409,
+        "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
+        "补充图片完整性校验未通过",
+      );
+    }
+    const preview = await renderSafeCustomerUploadPreview({
+      bytes: sourceBytes,
+      declaredMimeType: image.mimeType,
+      filename: image.filename,
+    });
+    const previewSha256 = createHash("sha256").update(preview).digest("hex");
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Content-Length", String(preview.length));
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+    res.setHeader("ETag", `\"sha256-${previewSha256}\"`);
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename*=UTF-8''${encodeURIComponent(
+        safePreviewFilename(image.filename),
+      )}`,
+    );
+    res.end(preview);
+  } catch (error) {
+    sendCustomerUploadPreviewError(res, error);
+  }
+}
+
+router.get(
+  "/:buildId/customer-uploads/:turnId/:index/:sourceSha",
+  (req: FrontMindRequest, res) => {
+    void serveCustomerUploadPreview(req, res);
+  },
+);
 
 router.get("/:buildId/logo", (req: FrontMindRequest, res) => {
   void serveBuildArtifact(req, res, "logo");

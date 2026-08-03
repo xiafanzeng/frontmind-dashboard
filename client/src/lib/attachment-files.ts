@@ -5,6 +5,10 @@ import {
   formatImageInspectionSummary,
   type ImageInspection,
 } from "@/lib/image-inspection";
+import {
+  normalizeKnowledgeBaseAttachmentFilename,
+  normalizeKnowledgeBaseAttachmentMimeType,
+} from "@shared/knowledge-base-attachment";
 
 export const ZIP_REFERENCE_PROMPT =
   "附件 ZIP 中包含用户上传的原始参考图片，请解压后读取图片内容作为参考。";
@@ -35,10 +39,19 @@ interface OversizedImage {
   inspection: ImageInspection;
 }
 
-const IMAGE_FILE_EXTENSION = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic|heif)$/i;
+const IMAGE_FILE_EXTENSION =
+  /\.(avif|bmp|gif|heic|heif|ico|jpe?g|png|svg|tiff?|webp)$/i;
 
 export function isImageUpload(file: File): boolean {
   return file.type.startsWith("image/") || IMAGE_FILE_EXTENSION.test(file.name);
+}
+
+export function normalizedKnowledgeBaseUploadFilename(value: string) {
+  return normalizeKnowledgeBaseAttachmentFilename(value);
+}
+
+export function normalizedKnowledgeBaseUploadMimeType(file: File) {
+  return normalizeKnowledgeBaseAttachmentMimeType(file.name, file.type);
 }
 
 async function readFileBytes(file: File): Promise<ArrayBuffer> {

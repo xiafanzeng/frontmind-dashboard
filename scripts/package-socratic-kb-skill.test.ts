@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import JSZip from "jszip";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -44,6 +45,38 @@ async function fixture() {
 }
 
 describe("socratic knowledge-base Skill packaging", () => {
+  it("packages the schema-v4 customer-upload archive contract", async () => {
+    const root = await fs.mkdtemp(
+      path.join(os.tmpdir(), "frontmind-kb-skill-contract-"),
+    );
+    temporaryRoots.push(root);
+    const outputPath = path.join(root, "socratic-kb-builder-v4.skill");
+    await packageSocraticKnowledgeBaseSkill({
+      sourceRoot: path.resolve(
+        process.cwd(),
+        "private-workflows/socratic-kb-builder",
+      ),
+      outputPath,
+    });
+
+    const archive = await JSZip.loadAsync(await fs.readFile(outputPath));
+    const skill = await archive.file("SKILL.md")!.async("string");
+    const outputContract = await archive
+      .file("references/output-format.md")!
+      .async("string");
+    const validator = await archive
+      .file("scripts/validate_archive.py")!
+      .async("string");
+
+    expect(skill).toContain("`schemaVersion: 4`");
+    expect(skill).toContain("sourceUploadSha256");
+    expect(skill).toContain("Every later upstream turn is text-only");
+    expect(outputContract).toContain('"schemaVersion": 4');
+    expect(outputContract).toContain('"sourceKind": "user_upload"');
+    expect(validator).toContain("MAX_USER_UPLOAD_IMAGES = 99");
+    expect(validator).toContain("duplicate original customer upload hash");
+  });
+
   it("pins reference-only changes and preserves canonical plus legacy aliases", async () => {
     const input = await fixture();
     const first = await packageSocraticKnowledgeBaseSkill(input);

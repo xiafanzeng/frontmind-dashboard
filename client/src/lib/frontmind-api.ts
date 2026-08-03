@@ -810,8 +810,11 @@ export async function createKnowledgeBaseTurnTask(
   context: {
     conversationId: string;
     clientRequestId: string;
+    expectedGeneration?: number;
     expectedRevision?: number;
     expectedLeafId?: string;
+    /** Exact browser bytes for upload-first knowledge-base attachments. */
+    attachmentManifest?: KnowledgeBaseAttachmentManifestItem[];
     attachmentReservation?: {
       turnId: string;
       attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
@@ -848,10 +851,14 @@ export async function createKnowledgeBaseTurnTask(
               context.attachmentReservation.attachmentManifest,
           }
         : {
+            expectedGeneration: context.expectedGeneration,
             expectedRevision: context.expectedRevision,
             expectedLeafId: context.expectedLeafId,
             userMessage: buildPromptText(input),
             attachments: extractAttachments(input),
+            ...(context.attachmentManifest
+              ? { attachmentManifest: context.attachmentManifest }
+              : {}),
             ...(context.legacyAttachmentTakeover
               ? {
                   resumeLegacyAttachments: true,
@@ -1024,6 +1031,44 @@ export async function createFileRecord(filename: string): Promise<FileRecord> {
   return response.json();
 }
 
+export const FILE_UPLOAD_STALL_TIMEOUT_MS = 2 * 60 * 1000;
+export const FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS = 6 * 60 * 1000;
+
+function installFileUploadWatchdog(
+  xhr: XMLHttpRequest,
+  onProgress?: (percent: number) => void,
+) {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const arm = (waitMs: number) => {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      xhr.abort();
+    }, waitMs);
+  };
+  xhr.upload.addEventListener("progress", (event) => {
+    const uploadComplete =
+      event.lengthComputable && event.loaded >= event.total;
+    arm(
+      uploadComplete
+        ? FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS
+        : FILE_UPLOAD_STALL_TIMEOUT_MS,
+    );
+    if (onProgress && event.lengthComputable) {
+      onProgress(Math.round((event.loaded / event.total) * 100));
+    }
+  });
+  return {
+    start: () => arm(FILE_UPLOAD_STALL_TIMEOUT_MS),
+    clear: () => {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+      timeoutId = undefined;
+    },
+    timedOut: () => timedOut,
+  };
+}
+
 /**
  * Upload a file - Step 2: Upload to presigned URL with progress tracking
  */
@@ -1040,16 +1085,10 @@ export async function uploadFileToUrl(
       file.type || "application/octet-stream",
     );
 
-    if (onProgress) {
-      xhr.upload.addEventListener("progress", (event) => {
-        if (event.lengthComputable) {
-          const percent = Math.round((event.loaded / event.total) * 100);
-          onProgress(percent);
-        }
-      });
-    }
+    const watchdog = installFileUploadWatchdog(xhr, onProgress);
 
     xhr.addEventListener("load", () => {
+      watchdog.clear();
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve();
       } else {
@@ -1058,13 +1097,22 @@ export async function uploadFileToUrl(
     });
 
     xhr.addEventListener("error", () => {
+      watchdog.clear();
       reject(new Error("文件上传网络异常，存储服务可能未允许当前来源"));
     });
 
     xhr.addEventListener("abort", () => {
-      reject(new Error("文件上传已取消"));
+      watchdog.clear();
+      reject(
+        new Error(
+          watchdog.timedOut()
+            ? "文件上传长时间没有进度，请检查网络后重试"
+            : "文件上传已取消",
+        ),
+      );
     });
 
+    watchdog.start();
     xhr.send(file);
   });
 }
@@ -1084,6 +1132,7 @@ export async function uploadFile(
     initialDelay: 1000,
     maxDelay: 10000,
   },
+  options: { captureLocalCopy?: boolean; captureFilename?: string } = {},
 ): Promise<{ fileId: string; filename: string }> {
   if (onProgress) onProgress(0);
   // File-record creation is intentionally outside the retry loop. Repeating
@@ -1100,7 +1149,17 @@ export async function uploadFile(
   }
 
   try {
-    await uploadFileToUrl(fileRecord.upload_url, file, onProgress);
+    if (options.captureLocalCopy) {
+      await uploadFileToUrlViaProxy(
+        fileRecord.upload_url,
+        file,
+        onProgress,
+        fileRecord.id,
+        options.captureFilename,
+      );
+    } else {
+      await uploadFileToUrl(fileRecord.upload_url, file, onProgress);
+    }
   } catch (directErr: any) {
     console.warn(
       `Direct S3 upload failed (${directErr.message}), trying server proxy...`,
@@ -1110,7 +1169,13 @@ export async function uploadFile(
     let lastProxyError: unknown = directErr;
     for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt += 1) {
       try {
-        await uploadFileToUrlViaProxy(fileRecord.upload_url, file, onProgress);
+        await uploadFileToUrlViaProxy(
+          fileRecord.upload_url,
+          file,
+          onProgress,
+          options.captureLocalCopy ? fileRecord.id : undefined,
+          options.captureFilename,
+        );
         lastProxyError = undefined;
         break;
       } catch (proxyError) {
@@ -1147,10 +1212,14 @@ async function uploadFileToUrlViaProxy(
   uploadUrl: string,
   file: File,
   onProgress?: (percent: number) => void,
+  captureFileId?: string,
+  captureFilename?: string,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    const proxyUrl = `/api/frontmind/proxy-upload?target=${encodeURIComponent(uploadUrl)}`;
+    const params = new URLSearchParams({ target: uploadUrl });
+    if (captureFileId) params.set("capture_file_id", captureFileId);
+    const proxyUrl = `/api/frontmind/proxy-upload?${params.toString()}`;
     xhr.open("PUT", proxyUrl, true);
     // IMPORTANT: Always use application/octet-stream for proxy uploads.
     // If we send the real MIME type (e.g. application/json for .json files),
@@ -1163,6 +1232,14 @@ async function uploadFileToUrlViaProxy(
       "X-Original-Content-Type",
       file.type || "application/octet-stream",
     );
+    if (captureFileId) {
+      // XHR headers are ByteString-backed in browsers. Percent-encode the
+      // normalized UTF-8 filename so Chinese and Emoji names remain exact.
+      xhr.setRequestHeader(
+        "X-FrontMind-Capture-Filename-UTF8",
+        encodeURIComponent(captureFilename || file.name),
+      );
+    }
     const projectAssignmentId = sessionStorage
       .getItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY)
       ?.trim();
@@ -1173,16 +1250,10 @@ async function uploadFileToUrlViaProxy(
       );
     }
 
-    if (onProgress) {
-      xhr.upload.addEventListener("progress", (event) => {
-        if (event.lengthComputable) {
-          const percent = Math.round((event.loaded / event.total) * 100);
-          onProgress(percent);
-        }
-      });
-    }
+    const watchdog = installFileUploadWatchdog(xhr, onProgress);
 
     xhr.addEventListener("load", () => {
+      watchdog.clear();
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve();
       } else {
@@ -1211,13 +1282,22 @@ async function uploadFileToUrlViaProxy(
       }
     });
 
-    xhr.addEventListener("error", () =>
-      reject(new Error("文件代理上传网络异常")),
-    );
-    xhr.addEventListener("abort", () =>
-      reject(new Error("文件代理上传已取消")),
-    );
+    xhr.addEventListener("error", () => {
+      watchdog.clear();
+      reject(new Error("文件代理上传网络异常"));
+    });
+    xhr.addEventListener("abort", () => {
+      watchdog.clear();
+      reject(
+        new Error(
+          watchdog.timedOut()
+            ? "文件上传长时间没有进度，请检查网络后重试"
+            : "文件代理上传已取消",
+        ),
+      );
+    });
 
+    watchdog.start();
     xhr.send(file);
   });
 }

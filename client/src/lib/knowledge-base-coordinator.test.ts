@@ -23,57 +23,132 @@ function executingObservation(): KnowledgeBaseObservationDto {
   };
 }
 
+function awaitingInputObservation(
+  clientRequestId = "request-completed-turn-1",
+): KnowledgeBaseObservationDto {
+  const currentProgress = {
+    build: {
+      id: "build-1",
+      conversationId: "conversation",
+      companyName: "FrontMind",
+      status: "confirming" as const,
+      revision: 1,
+      currentLeafId: "1.2",
+      protocolError: null,
+      updatedAt: 1,
+    },
+    summary: {
+      total: 3,
+      handled: 1,
+      confirmed: 1,
+      directPrefilled: 0,
+      pending: 1,
+      current: 1,
+      needsVerification: 0,
+      overallPercent: 33,
+    },
+    branches: [],
+    packageAllowed: false,
+  };
+  return {
+    ...executingObservation(),
+    stateEpoch: 2,
+    activeTurn: null,
+    interaction: {
+      progress: currentProgress,
+      interactionState: "awaiting_input",
+      canReply: true,
+      canPublish: false,
+      lockReason: null,
+    },
+    approvedPresentation: {
+      turnId: "completed-turn-1",
+      clientRequestId,
+      presentationKey: "presentation-1",
+      revision: 1,
+      leafId: "1.2",
+      visibleMarkdown: "## 1.2\n正文",
+      contentSha256: "a".repeat(64),
+      imageState: "no_eligible_asset",
+      resources: [],
+    },
+  };
+}
+
 describe("KnowledgeBasePollingCoordinator", () => {
   it("stops polling once a released turn has a server-approved current presentation", () => {
-    const currentProgress = {
-      build: {
-        id: "build-1",
-        conversationId: "conversation",
-        companyName: "FrontMind",
-        status: "confirming" as const,
-        revision: 1,
-        currentLeafId: "1.2",
-        protocolError: null,
-        updatedAt: 1,
-      },
-      summary: {
-        total: 3,
-        handled: 1,
-        confirmed: 1,
-        directPrefilled: 0,
-        pending: 1,
-        current: 1,
-        needsVerification: 0,
-        overallPercent: 33,
-      },
-      branches: [],
-      packageAllowed: false,
-    };
-    expect(
-      observationNeedsPolling({
-        ...executingObservation(),
-        stateEpoch: 2,
-        activeTurn: null,
-        interaction: {
-          progress: currentProgress,
-          interactionState: "awaiting_input",
-          canReply: true,
-          canPublish: false,
-          lockReason: null,
-        },
-        approvedPresentation: {
-          turnId: "completed-turn-1",
-          clientRequestId: "request-completed-turn-1",
-          presentationKey: "presentation-1",
-          revision: 1,
-          leafId: "1.2",
-          visibleMarkdown: "## 1.2\n正文",
-          contentSha256: "a".repeat(64),
-          imageState: "no_eligible_asset",
-          resources: [],
-        },
-      }),
-    ).toBe(false);
+    expect(observationNeedsPolling(awaitingInputObservation())).toBe(false);
+  });
+
+  it("keeps polling an old stable observation until the pending request id is acknowledged", async () => {
+    let scheduled: (() => void) | undefined;
+    const oldObservation = awaitingInputObservation("request-older");
+    const acceptedObservation = awaitingInputObservation("request-pending");
+    const observe = vi
+      .fn()
+      .mockResolvedValueOnce(oldObservation)
+      .mockResolvedValueOnce(acceptedObservation);
+    const setTimer = vi.fn((callback: () => void) => {
+      scheduled = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+    const coordinator = new KnowledgeBasePollingCoordinator({
+      observe,
+      apply: vi.fn(),
+      setTimer: setTimer as unknown as typeof setTimeout,
+    });
+
+    coordinator.wake("conversation", "request-pending");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(observationNeedsPolling(oldObservation)).toBe(false);
+    expect(setTimer).toHaveBeenCalledTimes(1);
+
+    scheduled?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(observe).toHaveBeenCalledTimes(2);
+    expect(setTimer).toHaveBeenCalledTimes(1);
+    coordinator.dispose();
+  });
+
+  it("does not extend the pending-request grace when the same request wakes again", async () => {
+    let now = 1_000;
+    let scheduled: (() => void) | undefined;
+    const observe = vi
+      .fn()
+      .mockResolvedValue(awaitingInputObservation("request-older"));
+    const setTimer = vi.fn((callback: () => void) => {
+      scheduled = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+    const coordinator = new KnowledgeBasePollingCoordinator({
+      observe,
+      apply: vi.fn(),
+      now: () => now,
+      pendingRequestGraceMs: 6_000,
+      setTimer: setTimer as unknown as typeof setTimeout,
+    });
+
+    coordinator.wake("conversation", "request-pending");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(setTimer).toHaveBeenCalledTimes(1);
+
+    now += 6_001;
+    scheduled?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(setTimer).toHaveBeenCalledTimes(1);
+
+    coordinator.wake("conversation", "request-pending");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(observe).toHaveBeenCalledTimes(3);
+    expect(setTimer).toHaveBeenCalledTimes(1);
+    coordinator.dispose();
   });
 
   it("coalesces duplicate focus/wake events and never overlaps requests", async () => {

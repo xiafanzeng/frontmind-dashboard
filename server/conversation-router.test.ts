@@ -3,7 +3,12 @@ import { MySqlDialect } from "drizzle-orm/mysql-core";
 import { createHash } from "node:crypto";
 import {
   apiCredentials,
+  attachments,
   conversations,
+  conversationTurns,
+  knowledgeBaseBuildNodes,
+  knowledgeBaseBuilds,
+  messages,
   upstreamResources,
   userUsageOwners,
   users,
@@ -15,10 +20,13 @@ import {
   conversationSnapshotSchema,
   discardClientClaimedServerOwnedKnowledgeBaseMessages,
   getActiveCredentialId,
+  listSnapshots,
+  loadPersistedMessages,
   matchesAuthoritativeKnowledgeBaseMessageTuple,
   mergeConversationMessages,
   mergeConversationTaskPointers,
   permanentlyDeleteConversation,
+  reconstructKnowledgeBasePresentationInlineImages,
   repairSnapshotMessageIds,
   retryConversationSyncTransaction,
   resolveSnapshotCredentialId,
@@ -140,6 +148,326 @@ function createSelectExecutor(rowsForTable: (table: unknown) => unknown[]) {
 }
 
 describe("conversation multi-device merge", () => {
+  it("reconstructs durable customer images only for their authoritative presentation leaf", async () => {
+    const loadResources = vi.fn().mockResolvedValue([
+      {
+        kind: "customer_upload",
+        outputItemId: null,
+        fileId: null,
+        sameOriginUrl:
+          "/api/knowledge-base/artifacts/build-1/customer-uploads/turn-1/0/" +
+          "a".repeat(64),
+        filename: "customer-proof.jpg",
+        mimeType: "image/jpeg",
+        sha256: "a".repeat(64),
+        sizeBytes: 456,
+      },
+    ]);
+    const turn = {
+      id: "turn-1",
+      operationType: "revise",
+      expectedLeafId: "1.2",
+      attachmentFileIds: ["file-1"],
+      metadata: {},
+      status: "completed" as const,
+    };
+    const build = {
+      id: "build-1",
+      userId: 7,
+      conversationId: "conversation-1",
+      logoStorageKey: null,
+      logoSha256: null,
+      logoBytes: null,
+      logoFilename: null,
+      logoMimeType: null,
+    };
+    const node = {
+      buildId: "build-1",
+      leafId: "1.2",
+      ordinal: 1,
+    };
+
+    await expect(
+      reconstructKnowledgeBasePresentationInlineImages(
+        {
+          build,
+          node,
+          knowledgeBase: { kind: "presentation", leafId: "1.2" },
+          turn,
+        },
+        loadResources,
+      ),
+    ).resolves.toEqual([
+      {
+        src:
+          "/api/knowledge-base/artifacts/build-1/customer-uploads/turn-1/0/" +
+          "a".repeat(64),
+        alt: "customer-proof.jpg",
+      },
+    ]);
+    expect(loadResources).toHaveBeenCalledWith("build-1", turn);
+
+    loadResources.mockClear();
+    await expect(
+      reconstructKnowledgeBasePresentationInlineImages(
+        {
+          build,
+          node,
+          knowledgeBase: { kind: "presentation", leafId: "1.3" },
+          turn,
+        },
+        loadResources,
+      ),
+    ).resolves.toBeUndefined();
+    expect(loadResources).not.toHaveBeenCalled();
+  });
+
+  it("keeps an earlier customer image visible after the same leaf is revised again", async () => {
+    const loadResources = vi.fn().mockResolvedValue([
+      {
+        kind: "customer_upload",
+        outputItemId: null,
+        fileId: null,
+        sameOriginUrl:
+          "/api/knowledge-base/artifacts/build-1/customer-uploads/turn-earlier/0/" +
+          "b".repeat(64),
+        filename: "earlier-proof.png",
+        mimeType: "image/png",
+        sha256: "b".repeat(64),
+        sizeBytes: 789,
+      },
+    ]);
+    const turn = {
+      id: "turn-earlier",
+      operationType: "revise",
+      expectedLeafId: "1.2",
+      attachmentFileIds: ["file-earlier"],
+      metadata: {},
+      status: "completed" as const,
+    };
+
+    await expect(
+      reconstructKnowledgeBasePresentationInlineImages(
+        {
+          build: {
+            id: "build-1",
+            userId: 7,
+            conversationId: "conversation-1",
+            logoStorageKey: null,
+            logoSha256: null,
+            logoBytes: null,
+            logoFilename: null,
+            logoMimeType: null,
+          },
+          // The durable node can now point at a later revision. The earlier
+          // completed turn still owns its own exact customer-upload ledger.
+          node: {
+            buildId: "build-1",
+            leafId: "1.2",
+            ordinal: 1,
+          },
+          knowledgeBase: { kind: "presentation", leafId: "1.2" },
+          turn,
+        },
+        loadResources,
+      ),
+    ).resolves.toEqual([
+      {
+        src:
+          "/api/knowledge-base/artifacts/build-1/customer-uploads/turn-earlier/0/" +
+          "b".repeat(64),
+        alt: "earlier-proof.png",
+      },
+    ]);
+    expect(loadResources).toHaveBeenCalledWith("build-1", turn);
+  });
+
+  it("reconstructs the initial logo even when the start turn has no expected leaf", async () => {
+    const loadResources = vi.fn().mockResolvedValue([]);
+    const build = {
+      id: "build-1",
+      userId: 7,
+      conversationId: "conversation-1",
+      logoStorageKey: "knowledge-base/build-1/logo.png",
+      logoSha256: "a".repeat(64),
+      logoBytes: 123,
+      logoFilename: "official-logo.png",
+      logoMimeType: "image/png",
+    };
+    const node = {
+      buildId: "build-1",
+      leafId: "1.1",
+      ordinal: 0,
+    };
+    const initialTurn = {
+      id: "turn-initial",
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      attachmentFileIds: [],
+      metadata: {},
+      status: "completed" as const,
+    };
+
+    await expect(
+      reconstructKnowledgeBasePresentationInlineImages(
+        {
+          build,
+          node,
+          knowledgeBase: { kind: "presentation", leafId: "1.1" },
+          turn: initialTurn,
+        },
+        loadResources,
+      ),
+    ).resolves.toEqual([
+      {
+        src: "/api/knowledge-base/artifacts/build-1/logo",
+        alt: "official-logo.png",
+      },
+    ]);
+    expect(loadResources).not.toHaveBeenCalled();
+
+    await expect(
+      reconstructKnowledgeBasePresentationInlineImages(
+        {
+          build,
+          node,
+          knowledgeBase: { kind: "presentation", leafId: "1.1" },
+          turn: {
+            ...initialTurn,
+            id: "turn-revise",
+            operationType: "revise",
+            expectedLeafId: "1.1",
+          },
+        },
+        loadResources,
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("hydrates only the authoritative initial-node logo in history and list snapshots", async () => {
+    const content = "## 1.1 一句话定位\n\n初始正文";
+    const contentSha256 = createHash("sha256")
+      .update(content, "utf8")
+      .digest("hex");
+    const presentationKey = createHash("sha256")
+      .update(["build-1", 1, 0, "1.1", contentSha256].join(":"))
+      .digest("hex");
+    const presentationMessage: typeof messages.$inferSelect = {
+      id: `u7:msg-kb-presentation-${presentationKey}`,
+      conversationId: "u7:conversation-1",
+      turnId: "turn-initial",
+      userId: 7,
+      role: "assistant",
+      content,
+      sequence: 2,
+      metadata: {
+        inlineImages: [
+          { src: "https://client.invalid/forged-logo.png", alt: "伪造图片" },
+        ],
+        knowledgeBase: {
+          schemaVersion: 1,
+          serverOwned: true,
+          kind: "presentation",
+          buildId: "build-1",
+          generation: 1,
+          operationKey: "operation-initial",
+          turnId: "turn-initial",
+          presentationKey,
+          revision: 0,
+          leafId: "1.1",
+        },
+      },
+      sentAt: new Date(2_000),
+      createdAt: new Date(2_000),
+      updatedAt: new Date(2_000),
+      deletedAt: null,
+    };
+    const initialTurn = {
+      id: "turn-initial",
+      conversationId: "u7:conversation-1",
+      userId: 7,
+      clientRequestId: "request-initial",
+      buildId: "build-1",
+      buildGeneration: 1,
+      operationKey: "operation-initial",
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      attachmentFileIds: [],
+      metadata: {},
+      status: "completed",
+    };
+    const authoritativeBuild = {
+      id: "build-1",
+      userId: 7,
+      conversationId: "conversation-1",
+      logoStorageKey: "knowledge-base/build-1/logo.png",
+      logoSha256: "a".repeat(64),
+      logoBytes: 321,
+      logoFilename: "official-logo.png",
+      logoMimeType: "image/png",
+    };
+    const authoritativeNode = {
+      buildId: "build-1",
+      leafId: "1.1",
+      ordinal: 0,
+    };
+    const conversation = {
+      id: "u7:conversation-1",
+      userId: 7,
+      projectAssignmentId: null,
+      title: "知识库",
+      status: "awaiting_input",
+      upstreamTaskId: null,
+      previousResponseId: null,
+      taskUrl: null,
+      createdAt: new Date(1_000),
+      updatedAt: new Date(2_000),
+      startedAt: null,
+      completedAt: null,
+      deletedAt: null,
+      lastKnownOutputLength: 0,
+      deletedMessageIds: [],
+    };
+    const rowsForTable = (table: unknown) => {
+      if (table === conversations) return [conversation];
+      if (table === messages) return [presentationMessage];
+      if (table === attachments) return [];
+      if (table === conversationTurns) return [initialTurn];
+      if (table === knowledgeBaseBuilds) return [authoritativeBuild];
+      if (table === knowledgeBaseBuildNodes) return [authoritativeNode];
+      return [];
+    };
+
+    const { executor: historyExecutor } = createSelectExecutor(rowsForTable);
+    const history = await loadPersistedMessages(
+      historyExecutor,
+      7,
+      "u7:conversation-1",
+      null,
+    );
+    expect(history[0]?.inlineImages).toEqual([
+      {
+        src: "/api/knowledge-base/artifacts/build-1/logo",
+        alt: "official-logo.png",
+      },
+    ]);
+
+    const { executor: listExecutor } = createSelectExecutor(rowsForTable);
+    const snapshots = await listSnapshots(
+      7,
+      null,
+      listExecutor as Parameters<typeof listSnapshots>[2],
+    );
+    expect(snapshots[0]?.messages[0]?.inlineImages).toEqual([
+      {
+        src: "/api/knowledge-base/artifacts/build-1/logo",
+        alt: "official-logo.png",
+      },
+    ]);
+  });
+
   it("repairs a provider assistant ID reused across two confirmed turns", () => {
     const repaired = repairSnapshotMessageIds([
       message("confirm-1", "user", 100, "确认"),
@@ -224,6 +552,37 @@ describe("conversation multi-device merge", () => {
       mergeConversationMessages([earlier, later], [], []).map(
         (item) => item.id,
       ),
+    ).toEqual(["z-earlier", "a-later"]);
+  });
+
+  it("keeps server-sequenced history ahead of an unsequenced skewed client turn", () => {
+    const persisted = [
+      { ...message("persisted", "user", 200), serverSequence: 0 },
+      { ...message("persisted-result", "assistant", 210), serverSequence: 1 },
+    ];
+    const incoming = [
+      message("client-clock-earlier", "user", 100),
+      message("client-clock-earlier-result", "assistant", 110),
+    ];
+
+    expect(
+      mergeConversationMessages(persisted, incoming, []).map((item) => item.id),
+    ).toEqual([
+      "persisted",
+      "persisted-result",
+      "client-clock-earlier",
+      "client-clock-earlier-result",
+    ]);
+  });
+
+  it("keeps authoritative sequence for assistant-only prelude messages", () => {
+    const persisted = [
+      { ...message("z-earlier", "assistant", 100), serverSequence: 0 },
+      { ...message("a-later", "assistant", 100), serverSequence: 1 },
+    ];
+
+    expect(
+      mergeConversationMessages(persisted, [], []).map((item) => item.id),
     ).toEqual(["z-earlier", "a-later"]);
   });
 
@@ -503,6 +862,90 @@ describe("conversation multi-device merge", () => {
         incomingUpdatedAt: 2_001,
       }),
     ).toEqual({ taskId: "T2", previousResponseId: "T2" });
+  });
+});
+
+describe("conversation server sequence projection", () => {
+  const persistedMessage = (
+    id: string,
+    sequence: number,
+  ): typeof messages.$inferSelect => ({
+    id: `u7:${id}`,
+    conversationId: "u7:conversation-1",
+    turnId: null,
+    userId: 7,
+    role: "assistant",
+    content: id,
+    sequence,
+    metadata: {},
+    sentAt: new Date(1_000 + sequence),
+    createdAt: new Date(1_000 + sequence),
+    updatedAt: new Date(1_000 + sequence),
+    deletedAt: null,
+  });
+
+  it("preserves the database sequence when loading the locked snapshot", async () => {
+    const { executor } = createSelectExecutor((table) => {
+      if (table === messages) return [persistedMessage("message-1", 7)];
+      if (table === attachments) return [];
+      return [];
+    });
+
+    const projected = await loadPersistedMessages(
+      executor,
+      7,
+      "u7:conversation-1",
+      null,
+    );
+
+    expect(projected).toHaveLength(1);
+    expect(projected[0]).toMatchObject({
+      id: "message-1",
+      serverSequence: 7,
+    });
+  });
+
+  it("returns database sequences from the conversation list DTO", async () => {
+    const messageRows = [
+      persistedMessage("message-1", 4),
+      persistedMessage("message-2", 5),
+    ];
+    const { executor } = createSelectExecutor((table) => {
+      if (table === conversations) {
+        return [
+          {
+            id: "u7:conversation-1",
+            userId: 7,
+            projectAssignmentId: null,
+            title: "知识库",
+            status: "awaiting_input",
+            upstreamTaskId: null,
+            previousResponseId: null,
+            taskUrl: null,
+            createdAt: new Date(1_000),
+            updatedAt: new Date(2_000),
+            startedAt: null,
+            completedAt: null,
+            lastKnownOutputLength: 0,
+            deletedMessageIds: [],
+          },
+        ];
+      }
+      if (table === messages) return messageRows;
+      if (table === attachments) return [];
+      return [];
+    });
+
+    const projected = await listSnapshots(
+      7,
+      null,
+      executor as Parameters<typeof listSnapshots>[2],
+    );
+
+    expect(projected).toHaveLength(1);
+    expect(projected[0]?.messages.map((item) => item.serverSequence)).toEqual([
+      4, 5,
+    ]);
   });
 });
 

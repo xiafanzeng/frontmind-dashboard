@@ -142,6 +142,13 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
   documents: readonly KnowledgeDocument[];
   assets: readonly KnowledgeAsset[];
   expectedLogoSha256: string;
+  packageSchemaVersion?: 1 | 2 | 3 | 4;
+  expectedCustomerUploads?: readonly {
+    sourceSha256: string;
+    leafIds: readonly string[];
+    filenames: readonly string[];
+    mimeTypes: readonly string[];
+  }[];
   requireExactContent?: boolean;
   /**
    * Builder v3 used sparse document orders (10, 20, ...) and could package
@@ -267,18 +274,27 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
       "首轮官方主 Logo 尚未完成字节级绑定",
     );
   }
-  const imageHashes = Array.from(
+  const isCustomerUploadContract = input.packageSchemaVersion === 4;
+  const officialAssets = isCustomerUploadContract
+    ? input.assets.filter((asset) => asset.sourceKind !== "user_upload")
+    : input.assets;
+  const customerAssets = isCustomerUploadContract
+    ? input.assets.filter((asset) => asset.sourceKind === "user_upload")
+    : [];
+  const officialHashes = Array.from(
     new Set(
-      input.assets
+      officialAssets
         .map((asset) => normalizedIdentity(asset.sha256).toLowerCase())
         .filter((hash) => /^[a-f0-9]{64}$/u.test(hash)),
     ),
   );
-  const logoMatches = imageHashes.filter((hash) => hash === expectedLogoSha256);
+  const logoMatches = officialHashes.filter(
+    (hash) => hash === expectedLogoSha256,
+  );
   if (
     (input.legacyV3Compatibility && logoMatches.length !== 1) ||
     (!input.legacyV3Compatibility &&
-      (imageHashes.length !== 1 || imageHashes[0] !== expectedLogoSha256))
+      (officialHashes.length !== 1 || officialHashes[0] !== expectedLogoSha256))
   ) {
     throw new KnowledgeBasePackageBindingError(
       input.legacyV3Compatibility
@@ -287,9 +303,89 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
     );
   }
 
+  if (isCustomerUploadContract) {
+    const expectedUploads = input.expectedCustomerUploads || [];
+    const expectedByHash = new Map(
+      expectedUploads.map((upload) => [
+        normalizedIdentity(upload.sourceSha256).toLowerCase(),
+        upload,
+      ]),
+    );
+    const customerBySourceHash = new Map<string, KnowledgeAsset>();
+    for (const asset of customerAssets) {
+      const sourceHash = normalizedIdentity(
+        asset.sourceUploadSha256,
+      ).toLowerCase();
+      if (
+        !/^[a-f0-9]{64}$/u.test(sourceHash) ||
+        customerBySourceHash.has(sourceHash)
+      ) {
+        throw new KnowledgeBasePackageBindingError(
+          "最终 ZIP 包含无效或重复的客户上传图片来源哈希",
+        );
+      }
+      customerBySourceHash.set(sourceHash, asset);
+    }
+    if (
+      expectedByHash.size !== expectedUploads.length ||
+      customerBySourceHash.size !== expectedByHash.size ||
+      [...expectedByHash.keys()].some(
+        (sourceHash) => !customerBySourceHash.has(sourceHash),
+      )
+    ) {
+      throw new KnowledgeBasePackageBindingError(
+        "最终 ZIP 的客户上传图片与服务端已留存上传清单不一致",
+      );
+    }
+    for (const [sourceHash, expected] of expectedByHash) {
+      if (!/^[a-f0-9]{64}$/u.test(sourceHash)) {
+        throw new KnowledgeBasePackageBindingError(
+          "服务端客户上传图片清单包含无效来源哈希",
+        );
+      }
+      const asset = customerBySourceHash.get(sourceHash)!;
+      const filename = normalizedIdentity(asset.sourceUploadFilename);
+      const mimeType = normalizedIdentity(
+        asset.sourceUploadMimeType,
+      ).toLowerCase();
+      const expectedLeafIds = [
+        ...new Set(expected.leafIds.map(normalizedIdentity)),
+      ]
+        .filter(Boolean)
+        .sort();
+      const packagedLeafIds = [
+        ...new Set((asset.documentIds || []).map(normalizedIdentity)),
+      ]
+        .filter(Boolean)
+        .sort();
+      if (
+        asset.assetType !== "customer_supplied" ||
+        asset.displayRole !== "inline" ||
+        !expected.filenames.map(normalizedIdentity).includes(filename) ||
+        !expected.mimeTypes
+          .map((value) => normalizedIdentity(value).toLowerCase())
+          .includes(mimeType) ||
+        expectedLeafIds.length === 0 ||
+        expectedLeafIds.length !== packagedLeafIds.length ||
+        expectedLeafIds.some(
+          (leafId, index) => leafId !== packagedLeafIds[index],
+        )
+      ) {
+        throw new KnowledgeBasePackageBindingError(
+          `最终 ZIP 客户上传图片的来源或节点绑定不一致：${filename || sourceHash}`,
+        );
+      }
+    }
+  } else if ((input.expectedCustomerUploads || []).length > 0) {
+    throw new KnowledgeBasePackageBindingError(
+      "旧版最终 ZIP 合同不能绑定客户上传图片",
+    );
+  }
+
   return {
     leafCount: handledNodes.length,
     logoSha256: expectedLogoSha256,
+    customerUploadCount: customerAssets.length,
     contentHashes: handledNodes.map((node) => ({
       leafId: node.leafId,
       sha256: knowledgeBaseMarkdownSha256(node.contentMarkdown || ""),

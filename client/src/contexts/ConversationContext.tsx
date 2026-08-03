@@ -835,7 +835,11 @@ export function applyKnowledgeBaseObservation(
       messages = [...messages, presentation];
     }
   }
-  messages = repairConversationMessageIds(messages);
+  // Observation commits and later cloud hydration must produce the same
+  // ordering in the same render. In particular, do not briefly append the
+  // approved current node after a newer optimistic request and wait for a
+  // subsequent history fetch to repair it.
+  messages = mergeServerOwnedKnowledgeBaseMessages([], messages);
 
   const protectedMessageIds = new Set(
     messages
@@ -1061,17 +1065,43 @@ function knowledgeBaseMessageIsAtLeastAsNew(
 }
 
 function compareHydratedMessageOrder(left: LocalMessage, right: LocalMessage) {
+  const leftIsServerOwned = isServerOwnedKnowledgeBaseMessage(left);
+  const rightIsServerOwned = isServerOwnedKnowledgeBaseMessage(right);
+  const leftIsOptimisticKnowledgeBase =
+    Boolean(left.knowledgeBase) && !leftIsServerOwned;
+  const rightIsOptimisticKnowledgeBase =
+    Boolean(right.knowledgeBase) && !rightIsServerOwned;
+
   if (
-    isServerOwnedKnowledgeBaseMessage(left) &&
-    isServerOwnedKnowledgeBaseMessage(right)
+    left.serverSequence !== undefined &&
+    right.serverSequence !== undefined &&
+    left.serverSequence !== right.serverSequence
   ) {
-    if (
-      left.serverSequence !== undefined &&
-      right.serverSequence !== undefined &&
-      left.serverSequence !== right.serverSequence
-    ) {
-      return left.serverSequence - right.serverSequence;
-    }
+    return left.serverSequence - right.serverSequence;
+  }
+
+  // A server projection is read after its immutable database message has been
+  // assigned a sequence. If a newer browser-only request is already visible,
+  // Date.now() would otherwise make the older approved presentation appear
+  // below that request until the next cloud hydration reorders the history.
+  // An accepted request is promoted to server-owned before this comparison;
+  // therefore a remaining optimistic KB message is necessarily after the
+  // durable history represented by the projection.
+  if (
+    leftIsServerOwned &&
+    left.serverSequence !== undefined &&
+    rightIsOptimisticKnowledgeBase
+  ) {
+    return -1;
+  }
+  if (
+    rightIsServerOwned &&
+    right.serverSequence !== undefined &&
+    leftIsOptimisticKnowledgeBase
+  ) {
+    return 1;
+  }
+  if (leftIsServerOwned && rightIsServerOwned) {
     const leftGeneration = left.knowledgeBase?.generation ?? -1;
     const rightGeneration = right.knowledgeBase?.generation ?? -1;
     if (leftGeneration !== rightGeneration) {
@@ -1487,7 +1517,21 @@ export function ConversationProvider({
   const wakeKnowledgeBaseConversation = useCallback(
     (conversationId: string) => {
       registerKnowledgeBaseConversation(conversationId);
-      knowledgeBaseCoordinatorRef.current?.wake(conversationId);
+      const conversation = stateRef.current.conversations.find(
+        (candidate) => candidate.id === conversationId,
+      );
+      const pendingClientRequestId = [...(conversation?.messages ?? [])]
+        .reverse()
+        .find(
+          (message) =>
+            message.knowledgeBase?.kind === "pending_user" &&
+            message.knowledgeBase.serverOwned !== true &&
+            Boolean(message.knowledgeBase.clientRequestId),
+        )?.knowledgeBase?.clientRequestId;
+      knowledgeBaseCoordinatorRef.current?.wake(
+        conversationId,
+        pendingClientRequestId ?? null,
+      );
     },
     [registerKnowledgeBaseConversation],
   );
@@ -1505,6 +1549,10 @@ export function ConversationProvider({
 
   const rollbackPendingKnowledgeBaseTurn = useCallback(
     (conversationId: string, clientRequestId: string) => {
+      knowledgeBaseCoordinatorRef.current?.clearPendingRequest(
+        conversationId,
+        clientRequestId,
+      );
       commit(
         {
           type: "ROLLBACK_KB_PENDING_TURN",

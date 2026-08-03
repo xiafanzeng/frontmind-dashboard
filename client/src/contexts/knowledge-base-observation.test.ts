@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { KnowledgeBaseObservationDto } from "@/lib/knowledge-progress";
 import {
   knowledgeBasePresentationMessagePublicId,
@@ -221,6 +221,64 @@ describe("authoritative KB observation reducer", () => {
       ),
     );
     expect(next.messages.at(-1)?.id).toBe("optimistic-request-2");
+  });
+
+  it("places a newly observed durable presentation before a newer optimistic request in the first render", () => {
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(100);
+    try {
+      const withOnlyNewerOptimisticRequest: Conversation = {
+        ...conversation(),
+        messages: [
+          {
+            // This ID sorts before the canonical presentation ID on purpose.
+            // Neither lexical order nor an equal browser timestamp may defeat
+            // the durable database sequence.
+            id: "a-newer-optimistic-request",
+            role: "user",
+            content: "确认",
+            timestamp: 100,
+            knowledgeBase: {
+              kind: "pending_user",
+              clientRequestId: "request-newer",
+              serverOwned: false,
+            },
+          },
+        ],
+      };
+      const releasedOlderPresentation = {
+        ...observation(2, "turn-older", 1, "1.2", "## 1.2\n已批准正文"),
+        activeTurn: null,
+        approvedPresentation: {
+          ...observation(2, "turn-older", 1, "1.2", "## 1.2\n已批准正文")
+            .approvedPresentation!,
+          requestMessageSequence: 2,
+          messageSequence: 3,
+        },
+      };
+
+      const next = applyKnowledgeBaseObservation(
+        withOnlyNewerOptimisticRequest,
+        releasedOlderPresentation,
+      );
+
+      expect(next.messages.map((message) => message.id)).toEqual([
+        presentationMessageId(1),
+        "a-newer-optimistic-request",
+      ]);
+      expect(next.messages[0]).toMatchObject({
+        serverSequence: 3,
+        knowledgeBase: { kind: "presentation", serverOwned: true },
+      });
+      expect(next.messages[1]).toMatchObject({
+        timestamp: 100,
+        knowledgeBase: {
+          clientRequestId: "request-newer",
+          serverOwned: false,
+        },
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it("does not bind a newer pending request when an older active turn arrives late", () => {

@@ -40,6 +40,7 @@ import {
   canonicalKnowledgeBaseMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
+import { knowledgeBaseCustomerUploadResources } from "./knowledge-base-customer-upload";
 import { customerFormalContentViolation } from "./knowledge-customer-content";
 import {
   markKnowledgeBaseConversationCompletedInTransaction,
@@ -1644,10 +1645,7 @@ async function readKnowledgeBaseObservationProjection(
         : Promise.resolve(null),
       currentRow?.sourceTurnId
         ? db
-            .select({
-              id: conversationTurns.id,
-              clientRequestId: conversationTurns.clientRequestId,
-            })
+            .select()
             .from(conversationTurns)
             .where(
               and(
@@ -1659,14 +1657,8 @@ async function readKnowledgeBaseObservationProjection(
             )
             .limit(1)
             .then(
-              (
-                values: Array<
-                  Pick<
-                    typeof conversationTurns.$inferSelect,
-                    "id" | "clientRequestId"
-                  >
-                >,
-              ) => values[0] || null,
+              (values: Array<typeof conversationTurns.$inferSelect>) =>
+                values[0] || null,
             )
         : Promise.resolve(null),
       db
@@ -1714,12 +1706,24 @@ async function readKnowledgeBaseObservationProjection(
     throw new KnowledgeBaseObservationSnapshotChangedError();
   }
 
+  const customerUploadResources =
+    currentRow &&
+    presentationTurnRow &&
+    presentationTurnRow.id === currentRow.sourceTurnId &&
+    presentationTurnRow.expectedLeafId === currentRow.leafId
+      ? await knowledgeBaseCustomerUploadResources(
+          build.id,
+          presentationTurnRow,
+        )
+      : [];
+
   return projectKnowledgeBaseObservationSnapshot({
     build,
     progress,
     currentRow,
     activeTurnRow,
     presentationTurnRow,
+    customerUploadResources,
     conversationRow,
     messageRows,
   });
@@ -1732,8 +1736,14 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   activeTurnRow: typeof conversationTurns.$inferSelect | null;
   presentationTurnRow: Pick<
     typeof conversationTurns.$inferSelect,
-    "id" | "clientRequestId"
+    | "id"
+    | "clientRequestId"
+    | "expectedLeafId"
+    | "attachmentFileIds"
+    | "metadata"
+    | "status"
   > | null;
+  customerUploadResources: KnowledgeBaseApprovedPresentationDto["resources"];
   conversationRow: { version: number } | null;
   messageRows: Array<{
     turnId: string | null;
@@ -1747,6 +1757,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     currentRow,
     activeTurnRow,
     presentationTurnRow,
+    customerUploadResources,
     conversationRow,
     messageRows,
   } = input;
@@ -1803,7 +1814,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     };
   }
 
-  const resources =
+  const logoResources =
+    build.revision === 0 &&
     currentRow?.ordinal === 0 &&
     build.logoStorageKey &&
     build.logoSha256 &&
@@ -1823,6 +1835,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
           },
         ]
       : [];
+  const resources = [...logoResources, ...customerUploadResources];
   let approvedPresentation: KnowledgeBaseApprovedPresentationDto | null = null;
   const visibleMarkdown = canonicalKnowledgeBaseMarkdown(
     currentRow?.contentMarkdown || "",
@@ -1855,7 +1868,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       leafId: currentRow.leafId,
       visibleMarkdown,
       contentSha256,
-      imageState: resources.length === 1 ? "attached" : "no_eligible_asset",
+      imageState: resources.length > 0 ? "attached" : "no_eligible_asset",
       resources,
       requestMessageSequence: messageSequence(currentRow.sourceTurnId, "user"),
       messageSequence: messageSequence(currentRow.sourceTurnId, "assistant"),

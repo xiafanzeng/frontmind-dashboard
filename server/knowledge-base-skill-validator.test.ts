@@ -242,7 +242,7 @@ ${narrative}
     evaluatedAt: "2026-07-29T00:00:00.000Z",
   });
   files[`${root}/00_package_manifest.json`] = JSON.stringify({
-    schemaVersion: 3,
+    schemaVersion: 4,
     profile: "dashboard-enterprise-v1",
     buildRevision: 40,
     documents,
@@ -275,6 +275,51 @@ ${narrative}
   return files;
 }
 
+async function addCustomerUploadImage(
+  files: Record<string, string | Uint8Array>,
+  documentIds = ["leaf-2"],
+) {
+  const root = "fixture_knowledge_base";
+  const manifest = JSON.parse(
+    String(files[`${root}/00_package_manifest.json`]),
+  );
+  const sourceUpload = Buffer.from(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="320" height="180" fill="#73518d"/></svg>',
+  );
+  const packagedBytes = await sharp(sourceUpload).png().toBuffer();
+  const asset: Record<string, any> = {
+    id: "asset-user-office",
+    path: "09_media_assets/user-upload-office.png",
+    sha256: createHash("sha256").update(packagedBytes).digest("hex"),
+    mimeType: "image/png",
+    bytes: packagedBytes.length,
+    width: 320,
+    height: 180,
+    caption: "客户补充的办公地点图片",
+    alt: "办公地点",
+    branchId: "products",
+    documentIds,
+    sourceKind: "user_upload",
+    sourceUploadSha256: createHash("sha256").update(sourceUpload).digest("hex"),
+    sourceUploadFilename: "office-photo.svg",
+    sourceUploadMimeType: "image/svg+xml",
+    ownership: "first_party",
+    assetType: "customer_supplied",
+    displayRole: "inline",
+  };
+  files[`${root}/${asset.path}`] = packagedBytes;
+  manifest.assets.push(asset);
+  for (const documentId of documentIds) {
+    manifest.documents
+      .find((document: { id?: string }) => document.id === documentId)
+      .assetIds.push(asset.id);
+  }
+  manifest.counts.totalFiles += 1;
+  manifest.counts.packagedImages += 1;
+  files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+  return { asset, manifest, packagedBytes, sourceUpload };
+}
+
 describe("dashboard enterprise Skill archive validator", () => {
   it("accepts a complete deep archive with exactly one official Logo", async () => {
     const archivePath = await writeArchive(await validDeepArchiveFiles());
@@ -287,6 +332,104 @@ describe("dashboard enterprise Skill archive validator", () => {
     });
   });
 
+  it("deduplicates one rasterized customer upload across bound leaves without counting it as a Logo candidate", async () => {
+    const files = await validDeepArchiveFiles();
+    const { manifest } = await addCustomerUploadImage(files, [
+      "leaf-2",
+      "leaf-3",
+    ]);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result).toMatchObject({
+      code: 0,
+      stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
+    });
+    expect(manifest.schemaVersion).toBe(4);
+    expect(manifest.counts.packagedImages).toBe(2);
+    expect(manifest.assets[1].documentIds).toEqual(["leaf-2", "leaf-3"]);
+    expect(manifest.imageSelection).toMatchObject({
+      discoveredCandidateImages: 1,
+      inspectedCandidateImages: 1,
+      eligibleFirstPartyImages: 1,
+    });
+  });
+
+  it("rejects a customer-uploaded image without original-upload provenance", async () => {
+    const files = await validDeepArchiveFiles();
+    const { manifest, asset } = await addCustomerUploadImage(files);
+    delete asset.sourceUploadSha256;
+    files["fixture_knowledge_base/00_package_manifest.json"] =
+      JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "user_upload requires sourceUploadSha256, sourceUploadFilename and sourceUploadMimeType",
+    );
+  });
+
+  it("rejects duplicate assets for the same original customer upload hash", async () => {
+    const files = await validDeepArchiveFiles();
+    const { manifest, asset } = await addCustomerUploadImage(files);
+    const duplicateBytes = await sharp({
+      create: {
+        width: 320,
+        height: 180,
+        channels: 3,
+        background: "#315d54",
+      },
+    })
+      .png()
+      .toBuffer();
+    const duplicateAsset = {
+      ...asset,
+      id: "asset-user-office-duplicate",
+      path: "09_media_assets/user-upload-office-duplicate.png",
+      sha256: createHash("sha256").update(duplicateBytes).digest("hex"),
+      bytes: duplicateBytes.length,
+      documentIds: ["leaf-3"],
+    };
+    files[`fixture_knowledge_base/${duplicateAsset.path}`] = duplicateBytes;
+    manifest.assets.push(duplicateAsset);
+    manifest.documents
+      .find((document: { id?: string }) => document.id === "leaf-3")
+      .assetIds.push(duplicateAsset.id);
+    manifest.counts.totalFiles += 1;
+    manifest.counts.packagedImages += 1;
+    files["fixture_knowledge_base/00_package_manifest.json"] =
+      JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("duplicate original customer upload hash");
+  });
+
+  it("rejects an additional crawled visual even when its bytes are valid", async () => {
+    const files = await validDeepArchiveFiles();
+    const { manifest, asset } = await addCustomerUploadImage(files);
+    asset.sourceKind = "official_web";
+    asset.sourcePageUrl = "https://example.com/offices";
+    asset.sourceAssetUrl = "https://example.com/assets/office.png";
+    delete asset.sourceUploadSha256;
+    delete asset.sourceUploadFilename;
+    delete asset.sourceUploadMimeType;
+    files["fixture_knowledge_base/00_package_manifest.json"] =
+      JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "official Logo must use brand_identity/badge",
+    );
+    expect(result.stderr).toContain(
+      "exactly one non-user_upload official company Logo",
+    );
+  });
+
   it("parses a real ZIP and binds its exact leaf/order/branch/body/Logo set", async () => {
     const files = await validDeepArchiveFiles();
     const archivePath = await writeArchive(files);
@@ -296,7 +439,7 @@ describe("dashboard enterprise Skill archive validator", () => {
       "22222222-2222-4222-8222-222222222222",
       {
         validationProfile: "dashboard-enterprise-v1",
-        archiveContractVersions: [3],
+        archiveContractVersions: [4],
       },
     );
     try {
@@ -324,6 +467,8 @@ describe("dashboard enterprise Skill archive validator", () => {
           documents: parsed.documents,
           assets: parsed.assets,
           expectedLogoSha256: parsed.assets[0]!.sha256!,
+          packageSchemaVersion: parsed.packageSchemaVersion,
+          expectedCustomerUploads: [],
         }),
       ).toMatchObject({ leafCount: 40 });
     } finally {
@@ -570,7 +715,9 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
     const result = await runValidator(await writeArchive(files));
 
     expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("assetType must be brand_identity");
+    expect(result.stderr).toContain(
+      "official Logo must use brand_identity/badge",
+    );
   });
 
   it("rejects evidence duplicated after normalization", async () => {
@@ -627,7 +774,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
 
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain(
-      "v2 evidence document must be referenced by at least one overview/leaf",
+      "v4 evidence document must be referenced by at least one overview/leaf",
     );
   });
 
@@ -705,7 +852,7 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
 
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain(
-      "schema v2 must declare at least one product/service family",
+      "schema v4 must declare at least one product/service family",
     );
   });
 

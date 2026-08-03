@@ -5,9 +5,11 @@ import {
   stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+  FILE_UPLOAD_STALL_TIMEOUT_MS,
   retrieveTask,
   sanitizeBrandText,
   uploadFile,
+  uploadFileToUrl,
 } from "./frontmind-api";
 
 afterEach(() => {
@@ -178,6 +180,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       {
         conversationId: "conv-kb",
         clientRequestId: "stable-request-id",
+        expectedGeneration: 2,
         expectedRevision: 5,
         expectedLeafId: "1.6",
       },
@@ -192,6 +195,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
       conversationId: "conv-kb",
       clientRequestId: "stable-request-id",
+      expectedGeneration: 2,
       expectedRevision: 5,
       expectedLeafId: "1.6",
       userMessage: "确认",
@@ -736,6 +740,105 @@ describe("retrieveTask", () => {
 });
 
 describe("uploadFile", () => {
+  it("aborts a half-open upload only after a long no-progress watchdog", async () => {
+    vi.useFakeTimers();
+    class MockXMLHttpRequest {
+      status = 0;
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {}
+      abort() {
+        this.listeners.get("abort")?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const upload = uploadFileToUrl(
+      "https://uploads.example/stalled",
+      new File(["png"], "proof.png", { type: "image/png" }),
+    );
+    let settled = false;
+    void upload.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_STALL_TIMEOUT_MS - 1);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(upload).rejects.toThrow("长时间没有进度");
+  });
+
+  it("encodes a Chinese and Emoji capture filename as an ASCII-safe header", async () => {
+    const signedUrl =
+      "https://uploads.example/signed-unicode?X-Amz-Signature=unicode";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: "file-unicode",
+        filename: "客户补充图😀.png",
+        upload_url: signedUrl,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const headers = new Map<string, string>();
+    let requestUrl = "";
+    class MockXMLHttpRequest {
+      status = 0;
+      statusText = "";
+      responseText = "";
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+
+      open(_method: string, url: string) {
+        requestUrl = url;
+      }
+      setRequestHeader(name: string, value: string) {
+        headers.set(name, value);
+      }
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        this.status = 200;
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadFile(
+        new File(["png"], "客户补充图😀.png", { type: "image/png" }),
+        undefined,
+        { maxRetries: 0, initialDelay: 0, maxDelay: 0 },
+        {
+          captureLocalCopy: true,
+          captureFilename: "客户补充图😀.png",
+        },
+      ),
+    ).resolves.toMatchObject({ fileId: "file-unicode" });
+
+    expect(requestUrl).toContain("capture_file_id=file-unicode");
+    expect(headers.get("X-FrontMind-Capture-Filename-UTF8")).toBe(
+      encodeURIComponent("客户补充图😀.png"),
+    );
+    expect(headers.get("X-FrontMind-Capture-Filename-UTF8")).toMatch(
+      /^[\x20-\x7e]+$/u,
+    );
+  });
+
   it("creates one file record and reuses its URL across transient PUT retries", async () => {
     const signedUrl =
       "https://uploads.example/signed-one?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Signature=abcdef0123456789";

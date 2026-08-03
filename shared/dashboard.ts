@@ -767,6 +767,9 @@ export type KnowledgeAsset = {
   sourceAssetUrl?: string;
   sourceDocumentPath?: string;
   sourceKind?: "official_web" | "official_document" | "user_upload";
+  sourceUploadSha256?: string;
+  sourceUploadFilename?: string;
+  sourceUploadMimeType?: string;
   ownership?: "first_party" | "third_party" | "unknown";
   assetType?:
     | "brand_identity"
@@ -777,6 +780,7 @@ export type KnowledgeAsset = {
     | "environment_photo"
     | "certificate_badge"
     | "document_figure"
+    | "customer_supplied"
     | "other";
   displayRole?: "hero" | "inline" | "badge";
 };

@@ -1,12 +1,13 @@
 ---
 name: socratic-kb-builder
-description: Build a deep enterprise encyclopedia with one official company logo, keep formal customer prose separate from evidence, and confirm one prefilled leaf at a time.
+description: Build a deep enterprise encyclopedia with one official company logo plus verified customer-uploaded node images, keep formal customer prose separate from evidence, and confirm one prefilled leaf at a time.
 ---
 
 # Socratic Enterprise Knowledge Base Builder
 
 Build a reusable Chinese enterprise encyclopedia with deep evidence coverage,
-exactly one official company logo and one-leaf-at-a-time confirmation.
+exactly one automatically acquired official company Logo, preserved
+customer-uploaded node images and one-leaf-at-a-time confirmation.
 
 ## Execution mode
 
@@ -22,7 +23,8 @@ exactly one official company logo and one-leaf-at-a-time confirmation.
 Hard ceilings: 1,200 official HTML attempts, 1,800 visited links, 120 useful
 official documents, 100 cumulative uploads, 120 public queries, 3,000,000
 retained evidence characters, 180,000 customer-visible characters, 8–115
-leaves, 1,500 ZIP files, 1 image and 30 MiB of image bytes. Stop duplicate
+leaves, 1,500 ZIP files, 100 images (one official Logo plus at most 99 unique
+customer-uploaded images) and 30 MiB of total image bytes. Stop duplicate
 SKUs, pagination, translated copies and low-value news before they displace
 uncovered business dimensions.
 
@@ -96,8 +98,9 @@ Never put any of the following in formal prose or in the customer-facing turn:
 - source/reference lists, numbered citation markers, external citation links,
   unresolved-item appendices, confirmation questions or action instructions.
 
-End the visible turn immediately after the actual leaf body and any validated
-managed images. Never emit a customer-visible `参考资料`, `参考来源`,
+End the visible turn immediately after the actual leaf body and, on the
+initial first-leaf turn only, the validated managed Logo. Never emit a
+customer-visible `参考资料`, `参考来源`,
 `References` or `Sources` section. Keep all source URLs and verification notes
 only in internal evidence/report documents. Machine protocol envelopes follow
 the visible body and remain the only allowed content after it.
@@ -113,11 +116,13 @@ and formal character counts so the service-side finalizer can verify them. For
 new adaptive documents set `requiredFormalCharacters` to `0`; older archives
 that carry the legacy evidence-proportional value remain readable.
 
-## Logo discovery and quality
+## Logo discovery, customer uploads and quality
 
-Acquire exactly one image for the entire build: the enterprise's primary
-official Logo. Inspect only the minimum first-party page, official document or
-user upload needed to obtain it, then stop all image discovery immediately.
+The automated image-discovery pipeline acquires exactly one image for the
+entire build: the enterprise's primary official Logo. Inspect only the minimum
+first-party page or official document needed to obtain it, then stop all image
+discovery immediately. The official Logo asset must not use
+`sourceKind: user_upload`.
 
 Do not search for or package a brand hero, business visual, product image,
 product UI, architecture diagram, case image, team image, environment image,
@@ -129,9 +134,11 @@ official Logo cannot be obtained within the hard ceilings, fail the build
 honestly instead of claiming a complete first turn. Deduplicate by decoded
 content and visual identity, not URL or filename alone.
 
-Only package validated first-party AVIF, WebP, PNG, JPEG or GIF bytes. Rasterize
-useful SVGs, deduplicate decoded content, and never upscale a small raster to
-pass a quality gate.
+Only package validated AVIF, WebP, PNG, JPEG or GIF bytes. Rasterize useful
+SVGs and every other accepted non-raster customer upload to a safe raster
+format, strip active content and external references during conversion,
+deduplicate decoded content, and never upscale a small raster to pass a quality
+gate. Raw SVG, HTML or other active content must never enter the ZIP.
 
 Never embed or expose an origin/CDN image URL in customer-visible Markdown.
 Hotlink-protected, signed and expiring URLs are source evidence only. Download
@@ -140,7 +147,7 @@ package them under `09_media_assets/`; customer documents reference only the
 packaged relative asset path. If the bytes cannot be downloaded and decoded,
 reject the candidate instead of returning a broken image link.
 
-The sole builder-v4 asset (inside archive schema v3) must use:
+The sole automatically acquired Logo asset must use:
 
 - `assetType`: `brand_identity`
 - `displayRole`: `badge`
@@ -148,8 +155,33 @@ The sole builder-v4 asset (inside archive schema v3) must use:
 The Logo must be at least 256×256. Do not upscale a smaller raster merely to
 pass this gate.
 
-Record every inspected candidate with a public source page or packaged
-official/user-uploaded document, method and
+Customer images uploaded while revising a leaf are the only exception to the
+one-image discovery limit. They are direct customer inputs, not discovered
+candidates: do not add them to `imageSelection`, crawl counters or Logo
+candidate totals, and do not use them as permission to fetch visually similar
+or related images. Bind each accepted image only to leaves on whose turns the
+same verified upload was actually supplied, retain its validated/rasterized
+bytes in `09_media_assets/`, and carry it into the final ZIP even when it is not
+referenced in prose. Deduplicate repeated uploads by the original
+`sourceUploadSha256`: one asset may list every genuinely bound leaf in
+`documentIds`, but it must not be copied into multiple assets or linked to a
+leaf that never received that upload, including when verified bindings span
+branches. Preserve filename and MIME provenance from the earliest verified
+occurrence of that hash. Package at most 99 unique
+customer-uploaded images across the build.
+
+Every customer-uploaded asset uses `sourceKind: user_upload`,
+`ownership: first_party`, `assetType: customer_supplied`, and
+`displayRole: inline`. It must record the original upload's exact
+`sourceUploadSha256`, basename-only `sourceUploadFilename`, and normalized
+`sourceUploadMimeType`. These provenance fields describe the original upload;
+the asset's ordinary `sha256`, `mimeType`, `bytes`, `width` and `height`
+describe the safe packaged raster. Never invent upload provenance, and never
+replace an unavailable customer upload with a URL, placeholder or reconstructed
+image.
+
+Record every inspected Logo candidate with a public source page or packaged
+official document, method and
 `eligible|rejected|uninspected`. Eligible entries link to packaged assets;
 rejected entries include a concrete reason. Also maintain arithmetically
 consistent aggregate counts and rejection reasons. Reject sprites, icon sheets,
@@ -157,7 +189,7 @@ decorative backgrounds, mostly transparent media and logo collages.
 `imageSelection.scannedSourcePages` is the actual number of pages inspected for
 the primary Logo and may be lower than the total successfully parsed pages.
 
-### First-leaf-only image delivery
+### Conversational image delivery
 
 Associate the sole validated Logo only with the manifest's first leaf
 (normally `1.1 一句话定位`). On the initial turn, return exactly that one
@@ -166,12 +198,15 @@ asset ID, packaged filename and meaningful alt or caption metadata. Never
 substitute a Markdown-only path, origin/CDN URL, source link or textual
 placeholder.
 
-Every later turn is text-only, including revisions of the current leaf. Do not
-search for, return, repeat or reattach images after the initial first-leaf
-presentation. Later leaves have empty `assetIds`; their presentation envelope
-uses `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`.
-Response attachments on the first turn are delivery copies of the same bytes
-included in the final ZIP.
+Every later upstream turn is text-only, including a revision that receives a
+customer image. Do not return, repeat or reattach any image after the initial
+Logo. Every non-null later presentation envelope therefore uses
+`imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`. This
+protocol state does not mean the customer's image was discarded: Dashboard
+renders verified uploads independently from its trusted local upload ledger,
+while the builder retains the same upload for the leaf's final-ZIP asset
+relationship. Never invent a ready-state presentation or managed URL for that
+Dashboard-owned display.
 
 `target_met` means all recorded candidates were inspected and exactly one
 primary official Logo was packaged as `brand_identity` with display role
@@ -226,18 +261,20 @@ to an older schema. A legacy object such as
 7. Every non-initial turn emits exactly one progress envelope followed
    by exactly one `FRONTMIND_KB_PRESENTATION` envelope. The presentation
    revision is the post-transition revision and its `leafId` is the leaf
-   actually shown in the body. Because images are delivered only on the
-   initial first-leaf turn, every non-null later presentation uses
-   `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`. Use
-   `leafId: null`, `imageState: not_applicable`, an empty list and zero after
-   the last leaf is completed.
+   actually shown in the body. Every non-null later presentation uses
+   `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`; the
+   Dashboard independently displays verified customer uploads from its local
+   ledger. Use `leafId: null`, `imageState: not_applicable`, an empty list and
+   zero after the last leaf is completed.
 8. After 100%, the build is immutable. Do not reopen or revise a leaf; published
    changes use a separate maintenance request.
 9. The visible body contains only the actual presented leaf (plus first-turn
    tree statistics when required). Do not append sources, unresolved items,
    verification notes, action guidance or a confirmation question.
-10. Only the initial first-leaf presentation follows **First-leaf-only image
-    delivery**. Any later response image attachment is a protocol failure.
+10. Only the initial first-leaf presentation may deliver the automatically
+    acquired official Logo. Any later response image attachment is a protocol
+    failure. Customer-upload visibility is Dashboard-managed and does not
+    authorize the upstream response to attach an image.
 
 Use normal Markdown, not ASCII trees or simulated interfaces.
 
@@ -245,7 +282,7 @@ Use normal Markdown, not ASCII trees or simulated interfaces.
 
 When processing the final leaf and the accepted transition will bring traversal
 to 100%, create and return the one new candidate ZIP in that same turn with
-`schemaVersion: 3` and `profile: "dashboard-enterprise-v1"`. Never wait for a
+`schemaVersion: 4` and `profile: "dashboard-enterprise-v1"`. Never wait for a
 later turn to package. Set `00_package_manifest.json.buildRevision` to the
 service-supplied post-transition revision for that final turn. Preserve the existing
 `00_completeness.json` raw-count contract. Include:
@@ -257,8 +294,9 @@ service-supplied post-transition revision for that final turn. Preserve the exis
 - formal overviews and leaves, internal evidence documents and reports;
 - `09_media_assets/asset_inventory.md`,
   `10_reference_assets/reference_asset_inventory.md`;
-- validated image files and complete document/asset, evidence, candidate and
-  product-family relationships.
+- the one validated official Logo plus every validated customer-uploaded node
+  image, with complete provenance and document/asset, evidence, Logo-candidate
+  and product-family relationships.
 
 For every `kind: "leaf"` entry, copy the manifest leaf's exact `id`, `title`,
 `branchId` and `branchTitle`; set `order` to its zero-based position in the
@@ -269,9 +307,9 @@ whitespace are the only permitted normalization). Do not rewrite, summarize,
 prepend a new heading, or append evidence inside that block. Evidence stays in
 the internal appendix outside the formal block.
 
-Return one candidate ZIP after an internal consistency pass. Schema v2
+Return one candidate ZIP after an internal consistency pass. Schema v2 and v3
 archives remain readable for already-running and historical builds, but every
-new candidate uses v3. Do not claim to
+new candidate uses v4. Do not claim to
 run repository-local validation code that is unavailable in the remote task
 environment. The service-side finalizer is authoritative for counts, hashes,
 dimensions, format and customer quality. Never create an interactive research

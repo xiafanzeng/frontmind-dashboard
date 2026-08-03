@@ -20,6 +20,7 @@ import {
   type KnowledgeBaseAttachmentManifestItem,
   type Message,
   type ResponseLogicTaskContext,
+  type TaskResponse,
 } from "@/lib/frontmind-api";
 import {
   useConversation,
@@ -30,6 +31,8 @@ import {
   prepareUploadFiles,
   ZIP_REFERENCE_PROMPT,
   isImageUpload,
+  normalizedKnowledgeBaseUploadFilename,
+  normalizedKnowledgeBaseUploadMimeType,
   sha256UploadFile,
   type PreparedUploadFiles,
 } from "@/lib/attachment-files";
@@ -466,7 +469,12 @@ export function useSendMessage() {
       sendInFlightRef.current = true;
 
       try {
-        if (!(await requireCurrentFrontMindBuild(text))) {
+        const isKnowledgeBaseSubmission =
+          options?.syncKnowledgeBaseSnapshot === true;
+        if (
+          !isKnowledgeBaseSubmission &&
+          !(await requireCurrentFrontMindBuild(text))
+        ) {
           toast.info("检测到新版本，正在刷新后继续");
           return false;
         }
@@ -537,7 +545,13 @@ export function useSendMessage() {
 
         let preparedUploads: PreparedUploadFiles;
         try {
-          preparedUploads = await prepareUploadFiles(files);
+          preparedUploads = options?.syncKnowledgeBaseSnapshot
+            ? {
+                files: files.map((file) => ({ file })),
+                didZipLargeImages: false,
+                zippedImages: [],
+              }
+            : await prepareUploadFiles(files);
         } catch (err: any) {
           toast.error("图片 ZIP 打包失败", {
             description:
@@ -555,21 +569,22 @@ export function useSendMessage() {
           });
         }
 
-        let legacyAttachmentManifest:
+        let knowledgeBaseAttachmentManifest:
           | KnowledgeBaseAttachmentManifestItem[]
           | undefined;
         if (
-          resumingLegacyKnowledgeBaseAttachmentTurn &&
+          options?.syncKnowledgeBaseSnapshot &&
           preparedUploads.files.length > 0
         ) {
           try {
-            // This is an identity check for the old durable reservation, not
-            // a storage read-back or a timed upload verification window.
-            legacyAttachmentManifest = await Promise.all(
+            // Hash the browser bytes once. Knowledge-base uploads are captured
+            // by the Dashboard during the same proxy upload, so the server can
+            // compare this manifest without a timed remote read-back window.
+            knowledgeBaseAttachmentManifest = await Promise.all(
               preparedUploads.files.map(async ({ file }) => ({
-                filename: file.name,
+                filename: normalizedKnowledgeBaseUploadFilename(file.name),
                 sizeBytes: file.size,
-                mimeType: file.type || "application/octet-stream",
+                mimeType: normalizedKnowledgeBaseUploadMimeType(file),
                 lastModified: Math.max(0, Number(file.lastModified || 0)),
                 sha256: await sha256UploadFile(file),
               })),
@@ -602,6 +617,9 @@ export function useSendMessage() {
         for (let i = 0; i < preparedUploads.files.length; i++) {
           const prepared = preparedUploads.files[i];
           const file = prepared.file;
+          const knowledgeBaseFilename = options?.syncKnowledgeBaseSnapshot
+            ? normalizedKnowledgeBaseUploadFilename(file.name)
+            : undefined;
 
           setUploadProgress({
             currentFileIndex: i,
@@ -650,6 +668,14 @@ export function useSendMessage() {
                 });
               },
               retryConfig,
+              {
+                captureLocalCopy: options?.syncKnowledgeBaseSnapshot === true,
+                ...(options?.syncKnowledgeBaseSnapshot
+                  ? {
+                      captureFilename: knowledgeBaseFilename!,
+                    }
+                  : {}),
+              },
             );
 
             console.log("[SendMessage] Uploaded file attachment", {
@@ -660,7 +686,7 @@ export function useSendMessage() {
             contentItems.push({
               type: "input_file",
               file_id: result.fileId,
-              filename: result.filename,
+              filename: knowledgeBaseFilename || result.filename,
               mime_type: file.type || "application/octet-stream",
             });
             attachments.push({
@@ -780,34 +806,61 @@ export function useSendMessage() {
           // Ordinary task creation remains single-shot because POST /v1/tasks is
           // non-idempotent. The knowledge-base route owns its bounded replay by
           // the same durable clientRequestId and exact request body.
-          const response = options?.syncKnowledgeBaseSnapshot
-            ? await createKnowledgeBaseTurnTask(input, {
-                conversationId: convId,
-                clientRequestId: knowledgeBaseClientRequestId!,
-                expectedRevision: options.knowledgeBaseExpectedRevision,
-                expectedLeafId: options.knowledgeBaseExpectedLeafId,
-                ...(legacyAttachmentManifest
-                  ? {
-                      legacyAttachmentTakeover: {
-                        attachmentManifest: legacyAttachmentManifest,
-                      },
-                    }
-                  : {}),
-              })
-            : options?.responseLogicContext
-              ? await createResponseLogicTask(input, {
-                  ...options.responseLogicContext,
-                  conversationId: convId,
-                  ...(isMultiTurn && conv?.previousResponseId
-                    ? { taskId: conv.previousResponseId }
-                    : {}),
-                })
-              : await createTask(input, taskOptions);
+          let response: TaskResponse;
+          if (isKnowledgeBaseSubmission) {
+            // Lock the normal processing UI before waiting for the HTTP
+            // response. The POST is replay-safe by clientRequestId, so start
+            // the authoritative coordinator alongside it instead of showing
+            // request latency as an unknown/recovery failure.
+            updateStatus(convId, "running", {
+              startedAt: responseStartedAt,
+            });
+            const responsePromise = createKnowledgeBaseTurnTask(input, {
+              conversationId: convId,
+              clientRequestId: knowledgeBaseClientRequestId!,
+              expectedGeneration: options?.knowledgeBaseExpectedGeneration,
+              expectedRevision: options?.knowledgeBaseExpectedRevision,
+              expectedLeafId: options?.knowledgeBaseExpectedLeafId,
+              ...(knowledgeBaseAttachmentManifest
+                ? {
+                    attachmentManifest: knowledgeBaseAttachmentManifest,
+                    ...(resumingLegacyKnowledgeBaseAttachmentTurn
+                      ? {
+                          legacyAttachmentTakeover: {
+                            attachmentManifest: knowledgeBaseAttachmentManifest,
+                          },
+                        }
+                      : {}),
+                  }
+                : {}),
+            });
+            wakeKnowledgeBaseConversation(convId);
+            response = await responsePromise;
+
+            // Version freshness is non-authoritative. Run its bounded,
+            // fail-open check only after the durable turn POST is acknowledged
+            // so a slow version.json/CDN (or a reload) cannot delay or cancel
+            // confirmation receipt.
+            // The turn is already durably accepted. A later version mismatch
+            // may reload to the authoritative observation, but must not restore
+            // the submitted "确认" or supplement as a draft on the next node.
+            void requireCurrentFrontMindBuild();
+          } else if (options?.responseLogicContext) {
+            response = await createResponseLogicTask(input, {
+              ...options.responseLogicContext,
+              conversationId: convId,
+              ...(isMultiTurn && conv?.previousResponseId
+                ? { taskId: conv.previousResponseId }
+                : {}),
+            });
+          } else {
+            response = await createTask(input, taskOptions);
+          }
 
           setRetryCount(0);
           setIsRetrying(false);
 
-          if (options?.syncKnowledgeBaseSnapshot) {
+          if (isKnowledgeBaseSubmission) {
             if (response.knowledgeObservation) {
               commitKnowledgeBaseObservation(
                 convId,
@@ -970,6 +1023,12 @@ export function useSendMessage() {
             if (err?.knowledgeObservation) {
               commitKnowledgeBaseObservation(convId, err.knowledgeObservation);
             }
+            if (
+              (status === 409 || deterministicFailure) &&
+              !err?.knowledgeObservation
+            ) {
+              updateStatus(convId, conv?.status ?? "awaiting_input");
+            }
             if (requestOutcomeUnknown) {
               updateStatus(convId, "running", {
                 startedAt: responseStartedAt,
@@ -989,10 +1048,13 @@ export function useSendMessage() {
             } else {
               // A disconnected browser response does not mean the accepted
               // durable turn failed. Keep the user on the normal processing
-              // path while the coordinator observes the same request id.
+              // path while the coordinator observes the same request id. The
+              // composer must clear this already-submitted text/attachment set
+              // so it cannot be repeated against the next leaf.
               toast.info("本轮已提交", {
                 description: "正在处理当前节点，请稍候。",
               });
+              return true;
             }
             return false;
           }

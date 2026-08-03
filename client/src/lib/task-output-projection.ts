@@ -241,7 +241,9 @@ export function outputForKnowledgeProgress(
 /**
  * A provider can reuse an output ID or replace a same-length cumulative array.
  * Render only the protocol message matching the server-approved revision and
- * leaf, plus its following resources. This prevents a stale previous turn from
+ * leaf. Knowledge-base images and the final package are projected only from
+ * the server-owned observation ledger; raw provider resources are never a
+ * display authority. This prevents a stale previous turn or crawled image from
  * flashing before the current envelope is complete.
  */
 export function outputForKnowledgePresentation(
@@ -271,20 +273,7 @@ export function outputForKnowledgePresentation(
     );
   if (!authoritative) return [];
 
-  const resourceTypes = new Set([
-    "output_image",
-    "image",
-    "output_file",
-    "file",
-  ]);
-
-  return dedupeStableOutput(
-    output
-      .slice(authoritative.index)
-      .filter(
-        (item, offset) => offset === 0 || resourceTypes.has(item.type || ""),
-      ),
-  );
+  return [output[authoritative.index]!];
 }
 
 export function projectTaskOutputMessages({

@@ -34,7 +34,10 @@ const mocks = vi.hoisted(() => ({
   useConversation: vi.fn(),
   prepareUploadFiles: vi.fn(),
   isImageUpload: vi.fn(),
+  normalizedKnowledgeBaseUploadFilename: vi.fn(),
+  normalizedKnowledgeBaseUploadMimeType: vi.fn(),
   sha256UploadFile: vi.fn(),
+  requireCurrentFrontMindBuild: vi.fn(),
 }));
 
 vi.mock("@/lib/frontmind-api", () => ({
@@ -56,6 +59,10 @@ vi.mock("@/lib/frontmind-api", () => ({
 vi.mock("@/lib/attachment-files", () => ({
   prepareUploadFiles: mocks.prepareUploadFiles,
   isImageUpload: mocks.isImageUpload,
+  normalizedKnowledgeBaseUploadFilename:
+    mocks.normalizedKnowledgeBaseUploadFilename,
+  normalizedKnowledgeBaseUploadMimeType:
+    mocks.normalizedKnowledgeBaseUploadMimeType,
   sha256UploadFile: mocks.sha256UploadFile,
   ZIP_REFERENCE_PROMPT:
     "附件 ZIP 中包含用户上传的原始参考图片，请解压后读取图片内容作为参考。",
@@ -70,6 +77,10 @@ vi.mock("@/contexts/ConversationContext", () => ({
 
 vi.mock("@/lib/knowledge-progress", () => ({
   reconcileKnowledgeBaseProgress: mocks.reconcileKnowledgeBaseProgress,
+}));
+
+vi.mock("@/lib/build-version", () => ({
+  requireCurrentFrontMindBuild: mocks.requireCurrentFrontMindBuild,
 }));
 
 function mockConversationContext(overrides = {}) {
@@ -175,7 +186,7 @@ describe("outputForKnowledgePresentation", () => {
         revision: 4,
         leafId: "2.4",
       }),
-    ).toEqual([current, image]);
+    ).toEqual([current]);
   });
 });
 
@@ -199,6 +210,7 @@ describe("useSendMessage", () => {
     mocks.sha256UploadFile.mockImplementation(async (file: File) =>
       file.name === "facts.pdf" ? "a".repeat(64) : "b".repeat(64),
     );
+    mocks.requireCurrentFrontMindBuild.mockResolvedValue(true);
     mocks.createKnowledgeBaseTurnTask.mockResolvedValue({
       id: "test-kb-task-id",
       status: "running",
@@ -246,6 +258,12 @@ describe("useSendMessage", () => {
     }));
     mocks.fileToBase64.mockResolvedValue("data:text/plain;base64,dGVzdA==");
     mocks.isImageUpload.mockReturnValue(false);
+    mocks.normalizedKnowledgeBaseUploadFilename.mockImplementation(
+      (filename: string) => filename,
+    );
+    mocks.normalizedKnowledgeBaseUploadMimeType.mockImplementation(
+      (file: File) => file.type || "application/octet-stream",
+    );
     mocks.createConversation.mockReturnValue("test-conv-id");
     mocks.parseOutputMessages.mockReturnValue([]);
     mocks.useConversation.mockReturnValue(mockConversationContext());
@@ -333,6 +351,79 @@ describe("useSendMessage", () => {
     expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
   });
 
+  it("dispatches a knowledge confirmation without waiting for the version freshness check", async () => {
+    mocks.requireCurrentFrontMindBuild.mockReturnValueOnce(
+      new Promise<boolean>(() => undefined),
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+    let submitted = false;
+    await act(async () => {
+      submitted = await result.current.sendMessage("确认", [], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedRevision: 0,
+        knowledgeBaseExpectedLeafId: "1.1",
+      });
+    });
+
+    expect(submitted).toBe(true);
+    expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledTimes(1);
+    expect(
+      mocks.createKnowledgeBaseTurnTask.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      mocks.requireCurrentFrontMindBuild.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("enters normal processing and wakes reconciliation while the turn POST is pending", async () => {
+    let resolveTurn!: (value: any) => void;
+    mocks.createKnowledgeBaseTurnTask.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveTurn = resolve;
+      }),
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+    let submission!: Promise<boolean>;
+    act(() => {
+      submission = result.current.sendMessage("确认", [], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedRevision: 0,
+        knowledgeBaseExpectedLeafId: "1.1",
+      });
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "running",
+      expect.objectContaining({ startedAt: expect.any(Number) }),
+    );
+    expect(mocks.wakeKnowledgeBaseConversation).toHaveBeenCalledWith(
+      "test-conv-id",
+    );
+    expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledTimes(1);
+    expect(mocks.updateStatus.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.createKnowledgeBaseTurnTask.mock.invocationCallOrder[0],
+    );
+    expect(
+      mocks.createKnowledgeBaseTurnTask.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      mocks.wakeKnowledgeBaseConversation.mock.invocationCallOrder[0],
+    );
+
+    resolveTurn({
+      id: "test-kb-task-id",
+      status: "running",
+      output: [],
+    });
+    await act(async () => {
+      await submission;
+    });
+  });
+
   it("rolls back a deterministically rejected knowledge confirmation instead of pretending to recover it", async () => {
     mocks.createKnowledgeBaseTurnTask.mockRejectedValueOnce(
       Object.assign(new Error("当前知识节点版本无效"), {
@@ -354,12 +445,7 @@ describe("useSendMessage", () => {
       "test-conv-id",
       expect.any(String),
     );
-    expect(mocks.updateStatus).not.toHaveBeenCalledWith(
-      "test-conv-id",
-      "running",
-      expect.anything(),
-    );
-    expect(mocks.wakeKnowledgeBaseConversation).not.toHaveBeenCalled();
+    expect(mocks.wakeKnowledgeBaseConversation).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a disconnected accepted confirmation on the normal processing path", async () => {
@@ -368,14 +454,16 @@ describe("useSendMessage", () => {
     );
 
     const { result } = renderHook(() => useSendMessage());
+    let submitted = false;
     await act(async () => {
-      await result.current.sendMessage("确认", [], {
+      submitted = await result.current.sendMessage("确认", [], {
         syncKnowledgeBaseSnapshot: true,
         knowledgeBaseExpectedRevision: 0,
         knowledgeBaseExpectedLeafId: "1.1",
       });
     });
 
+    expect(submitted).toBe(true);
     expect(mocks.rollbackPendingKnowledgeBaseTurn).not.toHaveBeenCalled();
     expect(mocks.updateStatus).toHaveBeenCalledWith(
       "test-conv-id",
@@ -481,6 +569,50 @@ describe("useSendMessage", () => {
       expect.not.objectContaining({ attachmentReservation: expect.anything() }),
     );
     expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses one normalized filename for capture, manifest and the knowledge turn body", async () => {
+    const file = new File(["image"], `${"a".repeat(159)}😀tail.png`, {
+      type: "image/png",
+      lastModified: 30,
+    });
+    const normalized = `${"a".repeat(159)}😀`;
+    mockPreparedFiles([file]);
+    mocks.normalizedKnowledgeBaseUploadFilename.mockReturnValue(normalized);
+
+    const { result } = renderHook(() => useSendMessage());
+    await act(async () => {
+      await result.current.sendMessage("补充图片", [file], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedGeneration: 3,
+        knowledgeBaseExpectedRevision: 7,
+        knowledgeBaseExpectedLeafId: "2.1",
+      });
+    });
+
+    expect(mocks.uploadFile).toHaveBeenCalledWith(
+      file,
+      expect.any(Function),
+      expect.any(Object),
+      { captureLocalCopy: true, captureFilename: normalized },
+    );
+    expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledWith(
+      [
+        {
+          role: "user",
+          content: expect.arrayContaining([
+            expect.objectContaining({
+              type: "input_file",
+              filename: normalized,
+            }),
+          ]),
+        },
+      ],
+      expect.objectContaining({
+        expectedGeneration: 3,
+        attachmentManifest: [expect.objectContaining({ filename: normalized })],
+      }),
+    );
   });
 
   it("silently completes an old browser attachment reservation through the upload-first turn route", async () => {

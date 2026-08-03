@@ -9,6 +9,8 @@ interface CoordinatorSlot {
   timer: ReturnType<typeof setTimeout> | null;
   startedAt: number;
   notFoundSince: number | null;
+  pendingClientRequestId: string | null;
+  pendingRequestStartedAt: number | null;
 }
 
 export interface KnowledgeBaseCoordinatorOptions {
@@ -26,7 +28,12 @@ export interface KnowledgeBaseCoordinatorOptions {
   setTimer?: typeof setTimeout;
   clearTimer?: typeof clearTimeout;
   notFoundGraceMs?: number;
+  pendingRequestGraceMs?: number;
 }
+
+// Stay beyond the 5-minute /turn fetch timeout so a browser that loses the
+// response still observes a reservation completed at the timeout boundary.
+export const KNOWLEDGE_BASE_PENDING_REQUEST_GRACE_MS = 6 * 60 * 1000;
 
 export function getKnowledgeBasePollDelay(elapsedMs: number) {
   if (elapsedMs < 5 * 60 * 1000) return 3_000;
@@ -81,6 +88,8 @@ export class KnowledgeBasePollingCoordinator {
       timer: null,
       startedAt: (this.options.now ?? Date.now)(),
       notFoundSince: null,
+      pendingClientRequestId: null,
+      pendingRequestStartedAt: null,
     });
   }
 
@@ -88,10 +97,19 @@ export class KnowledgeBasePollingCoordinator {
     return this.slots.get(conversationId)?.registered === true;
   }
 
-  wake(conversationId: string) {
+  wake(conversationId: string, pendingClientRequestId?: string | null) {
     if (!conversationId || this.disposed) return;
     this.register(conversationId);
     const slot = this.slots.get(conversationId)!;
+    if (pendingClientRequestId !== undefined) {
+      const normalizedRequestId = pendingClientRequestId?.trim() || null;
+      if (normalizedRequestId !== slot.pendingClientRequestId) {
+        const now = (this.options.now ?? Date.now)();
+        slot.pendingClientRequestId = normalizedRequestId;
+        slot.pendingRequestStartedAt = normalizedRequestId ? now : null;
+        if (normalizedRequestId) slot.startedAt = now;
+      }
+    }
     if (slot.timer) {
       (this.options.clearTimer ?? clearTimeout)(slot.timer);
       slot.timer = null;
@@ -101,6 +119,18 @@ export class KnowledgeBasePollingCoordinator {
       return;
     }
     void this.run(conversationId, slot);
+  }
+
+  clearPendingRequest(conversationId: string, clientRequestId?: string) {
+    const slot = this.slots.get(conversationId);
+    if (
+      !slot ||
+      (clientRequestId && slot.pendingClientRequestId !== clientRequestId)
+    ) {
+      return;
+    }
+    slot.pendingClientRequestId = null;
+    slot.pendingRequestStartedAt = null;
   }
 
   wakeAll() {
@@ -144,6 +174,42 @@ export class KnowledgeBasePollingCoordinator {
     );
   }
 
+  private pendingRequestNeedsPolling(
+    slot: CoordinatorSlot,
+    observation: KnowledgeBaseObservationDto,
+  ) {
+    const clientRequestId = slot.pendingClientRequestId;
+    const startedAt = slot.pendingRequestStartedAt;
+    if (!clientRequestId || startedAt === null) return false;
+
+    const acknowledged =
+      observation.activeTurn?.clientRequestId === clientRequestId ||
+      observation.approvedPresentation?.clientRequestId === clientRequestId;
+    if (acknowledged) {
+      slot.pendingClientRequestId = null;
+      slot.pendingRequestStartedAt = null;
+      return false;
+    }
+
+    const now = (this.options.now ?? Date.now)();
+    const graceMs =
+      this.options.pendingRequestGraceMs ??
+      KNOWLEDGE_BASE_PENDING_REQUEST_GRACE_MS;
+    if (now - startedAt < graceMs) return true;
+    return false;
+  }
+
+  private pendingRequestIsWithinGrace(slot: CoordinatorSlot, now: number) {
+    if (!slot.pendingClientRequestId || slot.pendingRequestStartedAt === null) {
+      return false;
+    }
+    return (
+      now - slot.pendingRequestStartedAt <
+      (this.options.pendingRequestGraceMs ??
+        KNOWLEDGE_BASE_PENDING_REQUEST_GRACE_MS)
+    );
+  }
+
   private async run(conversationId: string, slot: CoordinatorSlot) {
     if (this.disposed || !slot.registered || slot.running) return;
     slot.running = true;
@@ -167,7 +233,11 @@ export class KnowledgeBasePollingCoordinator {
       }
       slot.notFoundSince = null;
       this.options.apply(conversationId, observation);
-      if (observationNeedsPolling(observation)) {
+      const pendingRequestNeedsPolling = this.pendingRequestNeedsPolling(
+        slot,
+        observation,
+      );
+      if (observationNeedsPolling(observation) || pendingRequestNeedsPolling) {
         this.schedule(conversationId, slot);
       }
     } catch (error) {
@@ -179,8 +249,9 @@ export class KnowledgeBasePollingCoordinator {
         }
         const notFoundWithinGrace =
           status === 404 &&
-          now - (slot.notFoundSince ?? now) <
-            (this.options.notFoundGraceMs ?? 15_000);
+          (now - (slot.notFoundSince ?? now) <
+            (this.options.notFoundGraceMs ?? 15_000) ||
+            this.pendingRequestIsWithinGrace(slot, now));
         const retryable =
           !status ||
           status === 408 ||

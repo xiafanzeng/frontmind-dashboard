@@ -1253,9 +1253,10 @@ async function reserveKnowledgeBaseTurnInTransaction(
       "Deferred dispatch requires a non-empty customer attachment manifest",
     );
   }
-  const clientAttachmentManifestHash = deferredClientAttachments
-    ? hashKnowledgeBaseTurnRequest(input.clientAttachmentManifest)
-    : null;
+  const clientAttachmentManifestHash =
+    input.clientAttachmentManifest === undefined
+      ? null
+      : hashKnowledgeBaseTurnRequest(input.clientAttachmentManifest);
   const attachmentFileIds = normalizeAttachmentFileIds(
     input.attachmentFileIds ?? [],
   );
@@ -1802,7 +1803,9 @@ async function reserveKnowledgeBaseTurnInTransaction(
           clientAttachmentManifestHash: clientAttachmentManifestHash!,
           clientStagedAttachments: [],
         }
-      : {}),
+      : clientAttachmentManifestHash
+        ? { clientAttachmentManifestHash }
+        : {}),
     recovery: sanitizeKnowledgeBaseRecoveryMetadata(input.recoveryMetadata),
   };
   const row: ConversationTurn = {

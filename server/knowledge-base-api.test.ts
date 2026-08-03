@@ -21,6 +21,8 @@ import {
   buildKnowledgeBasePrefillEvidenceArchive,
   buildKnowledgePrefillExcerpt,
   canonicalKnowledgeBaseUpstreamTask,
+  assertKnowledgeBaseAttachmentManifestPresent,
+  assertKnowledgeBaseExpectedGeneration,
   classifyKnowledgeBaseUpstreamCreateFailure,
   classifyKnowledgeBaseOpenRecoveryFailure,
   createFrontMindTask,
@@ -192,6 +194,17 @@ describe("knowledge base execution contract", () => {
         sha256: "a".repeat(64),
       },
     ]);
+    expect(
+      normalizeKnowledgeBaseClientAttachmentManifest([
+        {
+          filename: "FrontMind_logo.svg",
+          sizeBytes: 42,
+          mimeType: "application/octet-stream",
+          lastModified: 11,
+          sha256: "b".repeat(64),
+        },
+      ])[0]?.mimeType,
+    ).toBe("image/svg+xml");
     expect(() =>
       normalizeKnowledgeBaseClientAttachmentManifest([
         { filename: "facts.pdf", mimeType: "application/pdf" },
@@ -207,6 +220,59 @@ describe("knowledge base execution contract", () => {
         },
       ]),
     ).toThrow("manifest entry 1 is invalid");
+  });
+
+  it("requires the exact browser-byte manifest for every v4 attachment", () => {
+    expect(() =>
+      assertKnowledgeBaseAttachmentManifestPresent({
+        skillVersion: "4",
+        attachmentCount: 1,
+        attachmentManifest: undefined,
+      }),
+    ).toThrow("必须完成浏览器原始字节校验");
+    expect(() =>
+      assertKnowledgeBaseAttachmentManifestPresent({
+        skillVersion: "4",
+        attachmentCount: 1,
+        attachmentManifest: [
+          {
+            filename: "proof.jpg",
+            sizeBytes: 12,
+            mimeType: "image/jpeg",
+            lastModified: 10,
+            sha256: "a".repeat(64),
+          },
+        ],
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertKnowledgeBaseAttachmentManifestPresent({
+        skillVersion: "3",
+        attachmentCount: 1,
+        attachmentManifest: undefined,
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects a stale optional generation before reserving a turn", () => {
+    expect(() =>
+      assertKnowledgeBaseExpectedGeneration({
+        expectedGeneration: 3,
+        actualGeneration: 4,
+      }),
+    ).toThrow("已重置或进入新一代构建");
+    expect(() =>
+      assertKnowledgeBaseExpectedGeneration({
+        expectedGeneration: 4,
+        actualGeneration: 4,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertKnowledgeBaseExpectedGeneration({
+        expectedGeneration: undefined,
+        actualGeneration: 4,
+      }),
+    ).not.toThrow();
   });
 
   it("routes only unrecoverable ready packages to explicit rebind", () => {
@@ -373,8 +439,10 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("可见正文结束后直接附机器信封");
     expect(prompt).toContain("只采集并返回一张企业官方主 Logo");
     expect(prompt).toContain("不得采集或打包品牌主视觉、业务图");
-    expect(prompt).toContain("取得合格 Logo 后立即停止所有图片发现");
-    expect(prompt).toContain("后续所有节点与当前节点修订轮次一律纯文字");
+    expect(prompt).toContain("取得合格 Logo 后立即停止所有网页图片发现");
+    expect(prompt).toContain("客户在后续节点主动上传的图片是唯一例外");
+    expect(prompt).toContain("由 Dashboard 本地受管通道回显");
+    expect(prompt).toContain("上游后续回复仍一律纯文字");
     expect(prompt).toContain("资料采集状态只由 Dashboard 展示");
     expect(prompt).toContain("不得复述、输出或以“正在采集”“处理中”");
     expect(prompt).toContain("不得先发送或以“已收到”“好的”“开始处理”");
@@ -403,7 +471,7 @@ describe("knowledge base execution contract", () => {
       "3,000,000",
       "limited_evidence",
       "evidenceDocumentIds",
-      "schemaVersion: 3",
+      "schemaVersion: 4",
       "1,500 ZIP files",
       "30 MiB",
       "00_package_manifest.json",
@@ -417,7 +485,7 @@ describe("knowledge base execution contract", () => {
       "Never create an interactive",
       "verification_gaps",
       "00_web_intelligence_report.md",
-      "First-leaf-only image delivery",
+      "Conversational image delivery",
       "validated local Logo byte attachment",
     ]) {
       expect(skill).toContain(invariant);

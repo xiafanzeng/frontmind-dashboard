@@ -11,6 +11,7 @@ import {
 } from "./knowledge-base-package-validation";
 
 const logoSha256 = "a".repeat(64);
+const customerSha256 = "c".repeat(64);
 
 function fixture() {
   return {
@@ -211,5 +212,136 @@ describe("knowledge-base final package binding", () => {
         ],
       }),
     ).toThrow("未唯一标记官方主 Logo");
+  });
+
+  it("binds schema v4 to the exact customer-upload hash and leaf set", () => {
+    const input = fixture();
+    input.assets[0]!.sourceKind = "official_web";
+    input.assets.push({
+      id: "customer-office",
+      key: "customer-office.png",
+      path: "09_media_assets/customer-office.png",
+      mimeType: "image/png",
+      size: 88,
+      sha256: customerSha256,
+      branchId: "identity",
+      documentIds: ["1.2"],
+      sourceKind: "user_upload",
+      sourceUploadSha256: customerSha256,
+      sourceUploadFilename: "office.png",
+      sourceUploadMimeType: "image/png",
+      ownership: "first_party",
+      assetType: "customer_supplied",
+      displayRole: "inline",
+    });
+
+    expect(
+      assertKnowledgeBasePackageMatchesBuild({
+        ...input,
+        packageSchemaVersion: 4,
+        expectedCustomerUploads: [
+          {
+            sourceSha256: customerSha256,
+            leafIds: ["1.2"],
+            filenames: ["office.png"],
+            mimeTypes: ["image/png"],
+          },
+        ],
+      }),
+    ).toMatchObject({ customerUploadCount: 1 });
+  });
+
+  it("rejects a schema v3 archive when the server ledger contains customer images", () => {
+    const input = fixture();
+    input.assets[0]!.sourceKind = "official_web";
+
+    expect(() =>
+      assertKnowledgeBasePackageMatchesBuild({
+        ...input,
+        packageSchemaVersion: 3,
+        expectedCustomerUploads: [
+          {
+            sourceSha256: customerSha256,
+            leafIds: ["1.2"],
+            filenames: ["office.png"],
+            mimeTypes: ["image/png"],
+          },
+        ],
+      }),
+    ).toThrow("旧版最终 ZIP 合同不能绑定客户上传图片");
+  });
+
+  it.each([
+    ["missing", (input: ReturnType<typeof fixture>) => input.assets.pop()],
+    [
+      "wrong leaf",
+      (input: ReturnType<typeof fixture>) => {
+        input.assets[1]!.documentIds = ["1.1"];
+      },
+    ],
+    [
+      "wrong source hash",
+      (input: ReturnType<typeof fixture>) => {
+        input.assets[1]!.sourceUploadSha256 = "d".repeat(64);
+      },
+    ],
+  ])("rejects schema v4 customer-upload %s", (_label, mutate) => {
+    const input = fixture();
+    input.assets[0]!.sourceKind = "official_web";
+    input.assets.push({
+      id: "customer-office",
+      key: "customer-office.png",
+      path: "09_media_assets/customer-office.png",
+      mimeType: "image/png",
+      size: 88,
+      sha256: customerSha256,
+      branchId: "identity",
+      documentIds: ["1.2"],
+      sourceKind: "user_upload",
+      sourceUploadSha256: customerSha256,
+      sourceUploadFilename: "office.png",
+      sourceUploadMimeType: "image/png",
+      ownership: "first_party",
+      assetType: "customer_supplied",
+      displayRole: "inline",
+    });
+    mutate(input);
+
+    expect(() =>
+      assertKnowledgeBasePackageMatchesBuild({
+        ...input,
+        packageSchemaVersion: 4,
+        expectedCustomerUploads: [
+          {
+            sourceSha256: customerSha256,
+            leafIds: ["1.2"],
+            filenames: ["office.png"],
+            mimeTypes: ["image/png"],
+          },
+        ],
+      }),
+    ).toThrow(KnowledgeBasePackageBindingError);
+  });
+
+  it("rejects an additional crawled image under schema v4", () => {
+    const input = fixture();
+    input.assets[0]!.sourceKind = "official_web";
+    input.assets.push({
+      ...input.assets[0]!,
+      id: "crawled-office",
+      key: "crawled-office.png",
+      path: "09_media_assets/crawled-office.png",
+      sha256: "f".repeat(64),
+      assetType: "environment_photo",
+      displayRole: "inline",
+    });
+
+    expect(() =>
+      assertKnowledgeBasePackageMatchesBuild({
+        ...input,
+        packageSchemaVersion: 4,
+        expectedCustomerUploads: [],
+      }),
+    ).toThrow("必须只包含首轮已绑定的同一张官方主 Logo");
   });
 });

@@ -17,6 +17,7 @@ import {
   canonicalKnowledgeBaseMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
+import { knowledgeBaseExpectedCustomerUploadsFromTurns } from "./knowledge-base-customer-upload";
 import {
   knowledgeBuildArtifactStorageKeyBelongsTo,
   readKnowledgeBuildArtifact,
@@ -538,6 +539,11 @@ export function findKnowledgeBaseRolloutViolations(
         });
       } else {
         try {
+          const expectedCustomerUploads =
+            knowledgeBaseExpectedCustomerUploadsFromTurns(generationTurns);
+          const customerUploadContract =
+            expectedCustomerUploads.length > 0 ||
+            snapshotAssets.some((asset) => asset.sourceKind === "user_upload");
           assertKnowledgeBasePackageMatchesBuild({
             nodes: nodes.map((node) => ({
               leafId: node.leafId,
@@ -556,6 +562,8 @@ export function findKnowledgeBaseRolloutViolations(
               typeof assertKnowledgeBasePackageMatchesBuild
             >[0]["assets"],
             expectedLogoSha256: String(build.logoSha256 || ""),
+            packageSchemaVersion: customerUploadContract ? 4 : 3,
+            expectedCustomerUploads,
             legacyV3Compatibility: false,
           });
         } catch {

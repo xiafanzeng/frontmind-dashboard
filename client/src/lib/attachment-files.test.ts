@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import JSZip from "jszip";
-import { prepareUploadFiles, sha256UploadFile } from "./attachment-files";
+import {
+  normalizedKnowledgeBaseUploadFilename,
+  normalizedKnowledgeBaseUploadMimeType,
+  prepareUploadFiles,
+  sha256UploadFile,
+} from "./attachment-files";
 
 const mocks = vi.hoisted(() => ({
   inspectImageFile: vi.fn(),
@@ -29,6 +34,18 @@ describe("attachment-files", () => {
     });
   });
 
+  it("normalizes filenames identically before capture and manifest", () => {
+    expect(normalizedKnowledgeBaseUploadFilename("  客户/补充😀.jpg  ")).toBe(
+      "客户_补充😀.jpg",
+    );
+    expect(normalizedKnowledgeBaseUploadFilename("...")).toBe(
+      "company_material",
+    );
+    expect(normalizedKnowledgeBaseUploadFilename("a".repeat(200))).toHaveLength(
+      160,
+    );
+  });
+
   it("keeps ordinary images as normal file uploads", async () => {
     const image = new File(["image-bytes"], "normal.png", {
       type: "image/png",
@@ -54,6 +71,17 @@ describe("attachment-files", () => {
     expect(await sha256UploadFile(first)).not.toBe(
       await sha256UploadFile(second),
     );
+  });
+
+  it("normalizes image MIME from the filename when the browser leaves it empty", () => {
+    expect(
+      normalizedKnowledgeBaseUploadMimeType(
+        new File(["svg"], "FrontMind_logo.svg"),
+      ),
+    ).toBe("image/svg+xml");
+    expect(
+      normalizedKnowledgeBaseUploadMimeType(new File(["jpeg"], "office.JPG")),
+    ).toBe("image/jpeg");
   });
 
   it("packs oversized images into a lossless ZIP with original names", async () => {

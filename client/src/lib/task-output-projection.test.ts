@@ -91,7 +91,7 @@ describe("task output projection", () => {
     expect(messages[0]?.content).not.toContain("cdn.example.com");
   });
 
-  it("selects the latest assistant item and its following resources", () => {
+  it("selects only the latest assistant item and strips raw provider images", () => {
     const old = assistantOutput(
       "reused-output",
       `旧回复\n${presentation(1, "1.2")}`,
@@ -119,7 +119,7 @@ describe("task output projection", () => {
           leafId: "1.3",
         },
       ),
-    ).toEqual([current, duplicateImage]);
+    ).toEqual([current]);
   });
 
   it("keeps the newest content when a cumulative response repeats an ID", () => {

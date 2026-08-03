@@ -31,6 +31,7 @@ import {
 } from "./upstream-config";
 import {
   getEffectiveDecryptedCredentialForAccount,
+  getCredentialForUpstreamResource,
   recordUpstreamResource,
 } from "./auth-service";
 import { getAccountMonthlyCreditUsage } from "./dashboard-service";
@@ -49,6 +50,10 @@ import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
 import { collectUpstreamOutputFileIds } from "./upstream-output-resources";
+import {
+  stagePresalesFileContent,
+  type StagedPresalesFile,
+} from "./presales-file-store";
 
 const router = Router();
 
@@ -77,6 +82,7 @@ const downloadTokenCache = new Map<
 >();
 const DOWNLOAD_TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
 export const MAX_EXTERNAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+const MAX_CAPTURED_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 export class ExternalDownloadTooLargeError extends Error {
   readonly code = "EXTERNAL_DOWNLOAD_TOO_LARGE";
@@ -2257,6 +2263,7 @@ async function sanitizeFileBuffer(
  * instead of buffering the complete file in Node memory.
  */
 router.put("/proxy-upload", async (req: Request, res: Response) => {
+  let stagedCapture: StagedPresalesFile | null = null;
   try {
     const rawTarget = req.query.target as string;
     if (!rawTarget) {
@@ -2278,7 +2285,77 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
     }
     const controller = new AbortController();
     req.on("aborted", () => controller.abort());
-    const response = await axios.put(target, req, {
+    const captureFileId = String(req.query.capture_file_id || "").trim();
+    let captureFilename = captureFileId;
+    let uploadBody:
+      | Request
+      | ReturnType<StagedPresalesFile["createReadStream"]> = req;
+    if (captureFileId) {
+      if (!req.frontmindUser || !req.frontmindCredential) {
+        return res.status(401).json({
+          error: { message: "请先登录", code: "UNAUTHORIZED" },
+        });
+      }
+      const credential = await getCredentialForUpstreamResource(
+        req.frontmindUser.id,
+        "file",
+        captureFileId,
+        req.frontmindDeliveryProjectContext?.projectAssignmentId,
+      );
+      if (!credential || credential.id !== req.frontmindCredential.id) {
+        return res.status(403).json({
+          error: {
+            message: "上传文件不属于当前账号",
+            code: "UPLOAD_CAPTURE_FORBIDDEN",
+          },
+        });
+      }
+      const declaredBytes = Number(req.headers["content-length"] || 0);
+      if (
+        Number.isFinite(declaredBytes) &&
+        declaredBytes > MAX_CAPTURED_UPLOAD_BYTES
+      ) {
+        return res.status(413).json({
+          error: {
+            message: "单个文件不能超过 100 MB",
+            code: "FILE_TOO_LARGE",
+          },
+        });
+      }
+      const encodedCaptureFilename = String(
+        req.headers["x-frontmind-capture-filename-utf8"] || "",
+      ).trim();
+      captureFilename = String(
+        req.headers["x-frontmind-capture-filename"] || captureFileId,
+      );
+      if (encodedCaptureFilename) {
+        try {
+          captureFilename = decodeURIComponent(encodedCaptureFilename);
+        } catch {
+          return res.status(400).json({
+            error: {
+              message: "上传文件名编码无效",
+              code: "INVALID_CAPTURE_FILENAME",
+            },
+          });
+        }
+      }
+      stagedCapture = await stagePresalesFileContent({
+        fileId: captureFileId,
+        stream: req,
+        maxBytes: MAX_CAPTURED_UPLOAD_BYTES,
+      });
+      if (stagedCapture.sizeBytes < 1) {
+        await stagedCapture.discard();
+        stagedCapture = null;
+        return res.status(400).json({
+          error: { message: "文件内容为空", code: "FILE_EMPTY" },
+        });
+      }
+      uploadBody = stagedCapture.createReadStream();
+      uploadHeaders["Content-Length"] = String(stagedCapture.sizeBytes);
+    }
+    const response = await axios.put(target, uploadBody, {
       ...safeExternalRequestOptions,
       headers: uploadHeaders,
       timeout: 300000,
@@ -2293,9 +2370,18 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
 
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response.status}`);
     if (response.status >= 200 && response.status < 300) {
+      if (stagedCapture) {
+        await stagedCapture.commit({
+          filename: captureFilename,
+          mimeType: realContentType,
+        });
+        stagedCapture = null;
+      }
       res.status(response.status).send("");
       return;
     }
+    await stagedCapture?.discard();
+    stagedCapture = null;
     res.status(response.status).json({
       error: {
         message:
@@ -2306,6 +2392,7 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
       },
     });
   } catch (error: any) {
+    await stagedCapture?.discard().catch(() => undefined);
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {

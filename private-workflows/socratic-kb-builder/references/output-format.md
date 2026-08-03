@@ -63,7 +63,7 @@ Use this exact top-level contract. Extra fields are forbidden:
 
 ```json
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "profile": "dashboard-enterprise-v1",
   "buildRevision": 66,
   "documents": [
@@ -95,7 +95,7 @@ Use this exact top-level contract. Extra fields are forbidden:
       "evidenceStatus": "verified_first_party",
       "sourceIds": ["source-official-products"],
       "evidenceDocumentIds": ["evidence-official-products"],
-      "assetIds": ["asset-company-logo"],
+      "assetIds": ["asset-company-logo", "asset-user-office"],
       "customerVisible": true,
       "evidenceCharacters": 24000,
       "requiredFormalCharacters": 500,
@@ -128,16 +128,37 @@ Use this exact top-level contract. Extra fields are forbidden:
       "documentIds": ["leaf-product-family-a"],
       "sourcePageUrl": "https://official.example/",
       "sourceAssetUrl": "https://official.example/media/logo.png",
+      "sourceKind": "official_web",
       "ownership": "first_party",
       "assetType": "brand_identity",
       "displayRole": "badge"
+    },
+    {
+      "id": "asset-user-office",
+      "path": "09_media_assets/user-upload-office.png",
+      "sha256": "64-lowercase-hex-characters-for-packaged-raster",
+      "mimeType": "image/png",
+      "bytes": 234567,
+      "width": 1600,
+      "height": 900,
+      "caption": "客户补充的办公地点图片",
+      "alt": "办公地点",
+      "branchId": "products",
+      "documentIds": ["leaf-product-family-a"],
+      "sourceKind": "user_upload",
+      "sourceUploadSha256": "64-lowercase-hex-characters-for-original-upload",
+      "sourceUploadFilename": "office-photo.svg",
+      "sourceUploadMimeType": "image/svg+xml",
+      "ownership": "first_party",
+      "assetType": "customer_supplied",
+      "displayRole": "inline"
     }
   ],
   "counts": {
     "totalFiles": 400,
     "customerVisibleCharacters": 120000,
     "evidenceCharacters": 1800000,
-    "packagedImages": 1
+    "packagedImages": 2
   },
   "imageSelection": {
     "status": "target_met",
@@ -214,13 +235,18 @@ Document and asset IDs are stable and unique. Every `assetIds` and
 
 ## Conversational presentation assets
 
-Associate the archive's sole official company Logo only with the manifest's
-first leaf. Return that one validated local byte as an actual response
-image/file attachment on the initial first-leaf turn. Do not return source
-hotlinks or only write a relative Markdown path. Every later turn is text-only. Each
-non-null `FRONTMIND_KB_PRESENTATION` envelope therefore uses
+Associate the archive's sole automatically acquired official company Logo only
+with the manifest's first leaf. Return that one validated local byte as an
+actual response image/file attachment on the initial first-leaf turn. Do not
+return source hotlinks or only write a relative Markdown path. Every later
+upstream turn is text-only, even when it receives a customer upload. Each
+non-null later `FRONTMIND_KB_PRESENTATION` envelope uses
 `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`;
-`not_applicable` is reserved for `leafId: null` after completion.
+`not_applicable` is reserved for `leafId: null` after completion. Dashboard
+independently displays customer uploads from its trusted local upload ledger;
+that display is not an upstream response attachment. The builder must still
+retain the verified upload in the final ZIP and bind it to the proper leaf or
+leaves. No other web-discovered image may be returned or packaged.
 
 For schema version 2, compute `requiredFormalCharacters` exactly:
 
@@ -236,7 +262,9 @@ For schema version 2, compute `requiredFormalCharacters` exactly:
   evidence; otherwise use `limited_evidence`. Formal content must meet the
   computed requirement, but must not be padded to reach the target.
 
-`imageSelection` is an auditable Logo-discovery funnel. `inspectedCandidateImages`
+`imageSelection` is an auditable Logo-only discovery funnel. Customer-uploaded
+images never enter this object or any candidate aggregate.
+`inspectedCandidateImages`
 equals eligible plus rejected candidates and cannot exceed discovered
 candidates. Rejection-reason counts sum to rejected candidates. List every
 discovery method actually checked. Every product/service leaf must still carry
@@ -247,7 +275,8 @@ declare it.
 
 List every inspected candidate with URL, source page, actual method and
 `eligible`, `rejected`, or `uninspected` status. Use `target_met` only when all
-candidates were inspected and exactly one official company Logo is packaged as
+candidates were inspected and exactly one non-`user_upload` official company
+Logo is packaged as
 `brand_identity` with display role `badge`. Use
 `source_limited` after inspecting
 every candidate when a concrete coverage gap remains, or `budget_limited` when
@@ -262,7 +291,8 @@ The manifest counts must match the actual ZIP:
 - `customerVisibleCharacters`: validator-counted formal characters.
 - `evidenceCharacters`: retained deduplicated evidence characters, maximum
   3,000,000.
-- `packagedImages`: unique validated first-party image files, exactly 1.
+- `packagedImages`: all unique validated raster files: exactly one official
+  Logo plus 0–99 customer-uploaded node images, for a total of 1–100.
 
 Keep all existing `00_completeness.json` fields, evidence statuses, and
 completeness calculations unchanged. Do not derive completeness from resource
@@ -281,10 +311,34 @@ use or target attainment.
 - Ownership must be exactly `first_party`.
 - Every asset must belong to a branch and at least one customer-visible
   document.
-- The sole builder-v4 asset (inside archive schema v3) declares
-  `assetType: brand_identity` and
-  `displayRole: badge`, and is at least 256×256. No business, hero, product,
-  UI, architecture, case, team, environment, certificate or other image may be
+- The sole automatically acquired official Logo declares
+  `sourceKind: official_web|official_document`,
+  `assetType: brand_identity` and `displayRole: badge`, is at least 256×256,
+  and links only to the first leaf.
+- Customer-uploaded images are the sole exception to the no-other-image rule.
+  Each declares `sourceKind: user_upload`, `assetType: customer_supplied`,
+  `displayRole: inline`, links only to leaves where that verified upload was
+  supplied, and
+  includes `sourceUploadSha256`, `sourceUploadFilename`, and
+  `sourceUploadMimeType` for the original upload. These fields are mandatory
+  even when conversion changes the packaged hash, MIME type or filename.
+- Deduplicate customer uploads by original `sourceUploadSha256`. If the same
+  original image is supplied on multiple leaves, package one asset and list
+  every genuinely bound leaf once in `documentIds`; never create duplicate
+  assets and never add a leaf that did not receive that verified upload. The
+  asset's singular `branchId` is its primary branch and must match at least one
+  linked leaf; `documentIds` may retain verified bindings in other branches.
+  Keep filename and MIME provenance from the earliest verified occurrence of
+  the hash when later duplicates use another local filename.
+- `sourceUploadFilename` is a non-empty basename with no path separators or
+  control characters. `sourceUploadSha256` is 64 lowercase hex characters.
+  `sourceUploadMimeType` is the verified original image MIME type, including
+  `image/svg+xml` when the original was SVG.
+- Raw SVG and other non-raster uploads are never packaged. Rasterize them to a
+  supported output format, strip active/external content, validate and fully
+  decode the result, then record the original upload provenance separately.
+- No other automatically discovered business, hero, product, UI,
+  architecture, case, team, environment, certificate or other image may be
   packaged.
 - `imageSelection.scannedSourcePages` must not exceed successfully parsed
   official pages; only pages actually inspected for the primary official Logo
@@ -294,7 +348,9 @@ use or target attainment.
 
 The crawl report records actual discovered/succeeded/failed/skipped pages,
 links, cleaned/deduplicated characters, image discovery/download/deduplication
-and bytes, document parsing, upload processing, and budget stops.
+and bytes, document parsing, upload processing, and budget stops. Report the
+saved official-Logo count separately from the deduplicated customer-upload
+count; do not combine customer uploads into Logo discovery/download totals.
 
 The public-web report records every query, language, result domain,
 selected/rejected source, conflict, and unresolved gap. The media-gap report
@@ -318,7 +374,7 @@ Keep the established object shape unchanged and use no extra fields:
   },
   "acquisition": {
     "officialPages": { "completed": OFFICIAL_PAGES_COMPLETED, "total": OFFICIAL_PAGES_DISCOVERED },
-    "images": { "completed": PACKAGED_IMAGES, "total": IMAGES_DISCOVERED },
+    "images": { "completed": OFFICIAL_LOGOS_PACKAGED, "total": LOGO_CANDIDATES_DISCOVERED },
     "documents": { "completed": DOCUMENTS_PARSED, "total": DOCUMENTS_DISCOVERED },
     "webQueries": { "completed": WEB_QUERIES_EXECUTED, "total": WEB_QUERIES_PLANNED }
   },
@@ -331,7 +387,9 @@ Replace every uppercase token with the current run's actual value.
 `totalLeaves` is the 8–115 true leaf count,
 not the overview count. The six evidence-state counts must be non-negative,
 sum to `totalLeaves`, and match the leaf manifests. `images.completed` must
-equal the actual deduplicated packaged image count. Each acquisition
+equal 1 for a valid new archive and records only the official Logo acquired by
+the automated discovery pipeline. `images.total` records only Logo candidates
+discovered; neither field includes customer uploads. Each acquisition
 `completed` value is no greater than `total`. Do not calculate or store a
 completeness score, grade, percentage, or resource-consumption proxy.
 

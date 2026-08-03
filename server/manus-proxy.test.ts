@@ -1,9 +1,27 @@
+import { createHash } from "node:crypto";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Readable } from "node:stream";
 import axios from "axios";
 import express from "express";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const authMocks = vi.hoisted(() => ({
+  getCredentialForUpstreamResource: vi.fn(),
+}));
+
+vi.mock("./auth-service", async () => {
+  const actual =
+    await vi.importActual<typeof import("./auth-service")>("./auth-service");
+  return {
+    ...actual,
+    getCredentialForUpstreamResource:
+      authMocks.getCredentialForUpstreamResource,
+  };
+});
 
 import manusProxy, {
   MAX_EXTERNAL_DOWNLOAD_BYTES,
@@ -16,9 +34,30 @@ import manusProxy, {
   publicUpstreamTaskPayload,
   readBoundedExternalDownload,
 } from "./manus-proxy";
+import { readStoredPresalesFile } from "./presales-file-store";
 
-async function withManusProxyServer(run: (baseUrl: string) => Promise<void>) {
+async function withManusProxyServer(
+  run: (baseUrl: string) => Promise<void>,
+  options: { authenticated?: boolean } = {},
+) {
   const app = express();
+  app.use((req: any, _res, next) => {
+    if (options.authenticated) {
+      req.frontmindUser = {
+        id: 42,
+        username: "capture-test-user",
+        role: "user",
+        isActive: true,
+      };
+      req.frontmindCredential = {
+        id: "credential-capture-test",
+        userId: 42,
+        version: 1,
+        apiKey: "test-only-credential",
+      };
+    }
+    next();
+  });
   app.use("/api/frontmind", manusProxy);
   const server = createServer(app);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -33,8 +72,37 @@ async function withManusProxyServer(run: (baseUrl: string) => Promise<void>) {
 }
 
 afterEach(() => {
+  authMocks.getCredentialForUpstreamResource.mockReset();
   vi.restoreAllMocks();
 });
+
+async function readAll(stream: NodeJS.ReadableStream) {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+async function withCaptureAssetDirectory(
+  run: (assetDirectory: string) => Promise<void>,
+) {
+  const previousAssetDirectory = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+  const assetDirectory = await mkdtemp(
+    path.join(tmpdir(), "frontmind-proxy-capture-test-"),
+  );
+  process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetDirectory;
+  try {
+    await run(assetDirectory);
+  } finally {
+    if (previousAssetDirectory === undefined) {
+      delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+    } else {
+      process.env.FRONTMIND_DASHBOARD_ASSET_DIR = previousAssetDirectory;
+    }
+    await rm(assetDirectory, { recursive: true, force: true });
+  }
+}
 
 describe("isPrivateUpstreamCollectionRequest", () => {
   it.each([
@@ -134,9 +202,7 @@ describe("publicUpstreamPayload", () => {
     expect(result.upload_url).toBe(signedUrl);
     expect(result).not.toHaveProperty("Authorization");
     expect(isPublicFilePayloadRequest("POST", "/v1/files")).toBe(true);
-    expect(
-      isPublicFilePayloadRequest("GET", "/v1/files/file-safe"),
-    ).toBe(true);
+    expect(isPublicFilePayloadRequest("GET", "/v1/files/file-safe")).toBe(true);
     expect(isPublicFilePayloadRequest("GET", "/v1/files")).toBe(false);
   });
 });
@@ -166,9 +232,7 @@ describe("proxy upload", () => {
 
       expect(response.status).toBe(400);
       expect(responseText).toContain("上传地址无效或已失效");
-      expect(responseText).not.toContain(
-        "AuthorizationQueryParametersError",
-      );
+      expect(responseText).not.toContain("AuthorizationQueryParametersError");
     });
 
     expect(put).toHaveBeenCalledWith(
@@ -179,6 +243,126 @@ describe("proxy upload", () => {
         headers: expect.objectContaining({ "Content-Type": "image/png" }),
       }),
     );
+  });
+
+  it("commits authenticated captured bytes and exact metadata only after upstream success", async () => {
+    await withCaptureAssetDirectory(async () => {
+      const signedUrl =
+        "https://uploads.example.test/customer-logo.png?X-Amz-Signature=capture-success";
+      const fileId = "file-customer-logo-success";
+      const filename = "客户补充图😀.png";
+      const mimeType = "image/png";
+      const sourceBytes = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4,
+      ]);
+      let upstreamBytes = Buffer.alloc(0);
+      authMocks.getCredentialForUpstreamResource.mockResolvedValue({
+        id: "credential-capture-test",
+      });
+      const put = vi
+        .spyOn(axios, "put")
+        .mockImplementation(async (_target, body) => {
+          upstreamBytes = await readAll(body as NodeJS.ReadableStream);
+          return { status: 200, data: "" };
+        });
+
+      await withManusProxyServer(
+        async (baseUrl) => {
+          const response = await fetch(
+            `${baseUrl}/proxy-upload?target=${encodeURIComponent(signedUrl)}&capture_file_id=${encodeURIComponent(fileId)}`,
+            {
+              method: "PUT",
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "X-Original-Content-Type": mimeType,
+                "X-FrontMind-Capture-Filename-UTF8":
+                  encodeURIComponent(filename),
+              },
+              body: sourceBytes,
+            },
+          );
+
+          expect(response.status).toBe(200);
+          expect(await response.text()).toBe("");
+        },
+        { authenticated: true },
+      );
+
+      expect(authMocks.getCredentialForUpstreamResource).toHaveBeenCalledWith(
+        42,
+        "file",
+        fileId,
+        undefined,
+      );
+      expect(put).toHaveBeenCalledWith(
+        signedUrl,
+        expect.anything(),
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            "Content-Length": String(sourceBytes.length),
+            "Content-Type": mimeType,
+          }),
+        }),
+      );
+      expect(upstreamBytes).toEqual(sourceBytes);
+
+      const stored = await readStoredPresalesFile(fileId);
+      expect(stored).not.toBeNull();
+      expect(stored).toMatchObject({
+        filename,
+        mimeType,
+        sizeBytes: sourceBytes.length,
+        sha256: createHash("sha256").update(sourceBytes).digest("hex"),
+      });
+      expect(await readAll(stored!.createReadStream())).toEqual(sourceBytes);
+    });
+  });
+
+  it("discards captured bytes when the upstream upload rejects them", async () => {
+    await withCaptureAssetDirectory(async (assetDirectory) => {
+      const signedUrl =
+        "https://uploads.example.test/customer-logo.png?X-Amz-Signature=capture-failure";
+      const fileId = "file-customer-logo-failure";
+      const sourceBytes = Buffer.from("customer image bytes");
+      authMocks.getCredentialForUpstreamResource.mockResolvedValue({
+        id: "credential-capture-test",
+      });
+      vi.spyOn(axios, "put").mockImplementation(async (_target, body) => {
+        expect(await readAll(body as NodeJS.ReadableStream)).toEqual(
+          sourceBytes,
+        );
+        return { status: 503, data: "upstream unavailable" };
+      });
+
+      await withManusProxyServer(
+        async (baseUrl) => {
+          const response = await fetch(
+            `${baseUrl}/proxy-upload?target=${encodeURIComponent(signedUrl)}&capture_file_id=${encodeURIComponent(fileId)}`,
+            {
+              method: "PUT",
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "X-Original-Content-Type": "image/png",
+                "X-FrontMind-Capture-Filename-UTF8":
+                  encodeURIComponent("客户补充图😀.png"),
+              },
+              body: sourceBytes,
+            },
+          );
+
+          expect(response.status).toBe(503);
+          expect(await response.json()).toMatchObject({
+            error: { code: "UPSTREAM_UPLOAD_REJECTED" },
+          });
+        },
+        { authenticated: true },
+      );
+
+      expect(await readStoredPresalesFile(fileId)).toBeNull();
+      expect(
+        await readdir(path.join(assetDirectory, "presales-files")),
+      ).toEqual([]);
+    });
   });
 });
 

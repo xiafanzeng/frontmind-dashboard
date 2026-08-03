@@ -8,9 +8,15 @@ import {
   messages,
 } from "../drizzle/schema";
 
-const dependencies = vi.hoisted(() => ({ getDb: vi.fn() }));
+const dependencies = vi.hoisted(() => ({
+  getDb: vi.fn(),
+  customerUploadResources: vi.fn().mockResolvedValue([]),
+}));
 
 vi.mock("./db", () => ({ getDb: dependencies.getDb }));
+vi.mock("./knowledge-base-customer-upload", () => ({
+  knowledgeBaseCustomerUploadResources: dependencies.customerUploadResources,
+}));
 
 import { getKnowledgeBaseObservationProjection } from "./knowledge-base-progress-service";
 
@@ -156,6 +162,306 @@ function node(overrides: Record<string, unknown> = {}) {
 }
 
 describe("knowledge-base observation consistency", () => {
+  it("shows the official logo only on the initial revision-zero first node", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const initialTurn = {
+      id: "turn-initial",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-initial",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-initial",
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      attachmentFileIds: [],
+      metadata: {},
+      status: "completed",
+      upstreamTaskId: "task-initial",
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.customerUploadResources.mockClear();
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              revision: 0,
+              logoStorageKey: "knowledge-base/build-snapshot/logo.png",
+              logoSha256: "a".repeat(64),
+              logoBytes: 345,
+              logoFilename: "official-logo.png",
+              logoMimeType: "image/png",
+            }),
+            nodes: [node({ sourceTurnId: initialTurn.id })],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [initialTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(dependencies.customerUploadResources).not.toHaveBeenCalled();
+    expect(observation?.approvedPresentation).toMatchObject({
+      revision: 0,
+      leafId: "1.1",
+      imageState: "attached",
+      resources: [
+        {
+          kind: "logo",
+          filename: "official-logo.png",
+        },
+      ],
+    });
+  });
+
+  it("shows a revised first node's verified customer upload without repeating the logo", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const presentationTurn = {
+      id: "turn-customer-image",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-customer-image",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-customer-image",
+      operationType: "revise",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      attachmentFileIds: ["file-customer-image"],
+      metadata: {},
+      status: "completed",
+      upstreamTaskId: "task-customer-image",
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.customerUploadResources.mockResolvedValueOnce([
+      {
+        kind: "customer_upload",
+        outputItemId: null,
+        fileId: null,
+        sameOriginUrl:
+          "/api/knowledge-base/artifacts/build-snapshot/customer-uploads/turn-customer-image/0/" +
+          "c".repeat(64),
+        filename: "customer.jpg",
+        mimeType: "image/jpeg",
+        sha256: "c".repeat(64),
+        sizeBytes: 1234,
+      },
+    ]);
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              logoStorageKey: "knowledge-base/build-snapshot/logo.png",
+              logoSha256: "a".repeat(64),
+              logoBytes: 345,
+              logoFilename: "official-logo.png",
+              logoMimeType: "image/png",
+            }),
+            nodes: [
+              node({
+                sourceTurnId: presentationTurn.id,
+                imageUrls: ["https://crawler.invalid/never-display.jpg"],
+              }),
+            ],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [presentationTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.approvedPresentation).toMatchObject({
+      imageState: "attached",
+      resources: [
+        {
+          kind: "customer_upload",
+          filename: "customer.jpg",
+        },
+      ],
+    });
+    expect(
+      observation?.approvedPresentation?.resources.some((resource) =>
+        resource.sameOriginUrl.startsWith("https://"),
+      ),
+    ).toBe(false);
+  });
+
+  it("never carries a customer upload onto a different leaf", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const presentationTurn = {
+      id: "turn-prior-leaf",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-prior-leaf",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-prior-leaf",
+      operationType: "confirm",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      attachmentFileIds: ["file-customer-image"],
+      metadata: {},
+      status: "completed",
+      upstreamTaskId: "task-prior-leaf",
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({ currentLeafId: "1.2" }),
+            nodes: [
+              node({
+                leafId: "1.2",
+                ordinal: 1,
+                sourceTurnId: presentationTurn.id,
+                imageUrls: ["https://crawler.invalid/never-display.jpg"],
+              }),
+            ],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [presentationTurn],
+          }),
+        );
+      },
+    });
+    dependencies.customerUploadResources.mockClear();
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(dependencies.customerUploadResources).not.toHaveBeenCalled();
+    expect(observation?.approvedPresentation).toMatchObject({
+      leafId: "1.2",
+      imageState: "no_eligible_asset",
+      resources: [],
+    });
+  });
+
+  it("shows a later leaf's customer upload without repeating the official logo", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const presentationTurn = {
+      id: "turn-later-customer-image",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-later-customer-image",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-later-customer-image",
+      operationType: "revise",
+      expectedRevision: 1,
+      expectedLeafId: "1.2",
+      attachmentFileIds: ["file-later-customer-image"],
+      metadata: {},
+      status: "completed",
+      upstreamTaskId: "task-later-customer-image",
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.customerUploadResources.mockResolvedValueOnce([
+      {
+        kind: "customer_upload",
+        outputItemId: null,
+        fileId: null,
+        sameOriginUrl:
+          "/api/knowledge-base/artifacts/build-snapshot/customer-uploads/turn-later-customer-image/0/" +
+          "d".repeat(64),
+        filename: "later-customer.png",
+        mimeType: "image/png",
+        sha256: "d".repeat(64),
+        sizeBytes: 222,
+      },
+    ]);
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              currentLeafId: "1.2",
+              logoStorageKey: "knowledge-base/build-snapshot/logo.png",
+              logoSha256: "a".repeat(64),
+              logoBytes: 345,
+              logoFilename: "official-logo.png",
+              logoMimeType: "image/png",
+            }),
+            nodes: [
+              node({
+                leafId: "1.2",
+                ordinal: 1,
+                sourceTurnId: presentationTurn.id,
+                imageUrls: ["https://crawler.invalid/never-display.jpg"],
+              }),
+            ],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [presentationTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.approvedPresentation).toMatchObject({
+      leafId: "1.2",
+      imageState: "attached",
+      resources: [
+        {
+          kind: "customer_upload",
+          filename: "later-customer.png",
+        },
+      ],
+    });
+    expect(
+      observation?.approvedPresentation?.resources.some(
+        (resource) => resource.kind === "logo",
+      ),
+    ).toBe(false);
+  });
+
   it("does not expose the completed parent task while an accepted turn is unbound", async () => {
     const now = new Date("2026-08-01T00:00:05.000Z");
     const acceptedTurn = {

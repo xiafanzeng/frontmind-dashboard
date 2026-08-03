@@ -7,6 +7,7 @@ import {
   attachments,
   conversations,
   conversationTurns,
+  knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
   knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
@@ -31,6 +32,7 @@ import {
 } from "./auth-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getDb } from "./db";
+import { knowledgeBaseCustomerUploadResources } from "./knowledge-base-customer-upload";
 import { knowledgeBaseMarkdownSha256 } from "./knowledge-base-package-validation";
 import { protectedProcedure, router } from "./_core/trpc";
 import { getUpstreamBaseUrl } from "./upstream-config";
@@ -90,10 +92,32 @@ type ServerOwnedTurnIdentity = {
   expectedLeafId: string | null;
 };
 
+type ServerOwnedTurnResourceIdentity = ServerOwnedTurnIdentity &
+  Pick<
+    typeof conversationTurns.$inferSelect,
+    "operationType" | "attachmentFileIds" | "metadata" | "status"
+  >;
+
 type ServerOwnedBuildIdentity = {
   id: string;
   userId: number;
   conversationId: string;
+};
+
+type ServerOwnedBuildResourceIdentity = ServerOwnedBuildIdentity &
+  Pick<
+    typeof knowledgeBaseBuilds.$inferSelect,
+    | "logoStorageKey"
+    | "logoSha256"
+    | "logoBytes"
+    | "logoFilename"
+    | "logoMimeType"
+  >;
+
+type ServerOwnedBuildNodeIdentity = {
+  buildId: string;
+  leafId: string;
+  ordinal: number;
 };
 
 function knowledgeBasePresentationKey(input: {
@@ -1054,9 +1078,15 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
       : [];
   });
   const verified = new Map<string, KnowledgeBaseMessageMetadata>();
+  const inlineImages = new Map<
+    string,
+    NonNullable<MessageMetadata["inlineImages"]>
+  >();
   // Knowledge-base state is account-owned. Project snapshots must never gain
   // immutable messages merely by carrying another user's metadata marker.
-  if (projectAssignmentId || candidates.length === 0) return verified;
+  if (projectAssignmentId || candidates.length === 0) {
+    return { verified, inlineImages };
+  }
 
   const turnIds = Array.from(
     new Set(candidates.map(({ message }) => message.turnId!)),
@@ -1070,8 +1100,12 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
       buildId: conversationTurns.buildId,
       buildGeneration: conversationTurns.buildGeneration,
       operationKey: conversationTurns.operationKey,
+      operationType: conversationTurns.operationType,
       expectedRevision: conversationTurns.expectedRevision,
       expectedLeafId: conversationTurns.expectedLeafId,
+      attachmentFileIds: conversationTurns.attachmentFileIds,
+      metadata: conversationTurns.metadata,
+      status: conversationTurns.status,
     })
     .from(conversationTurns)
     .where(
@@ -1079,7 +1113,7 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
         eq(conversationTurns.userId, userId),
         inArray(conversationTurns.id, turnIds),
       ),
-    )) as ServerOwnedTurnIdentity[];
+    )) as ServerOwnedTurnResourceIdentity[];
   const turnsById = new Map(turnRows.map((turn) => [turn.id, turn]));
   const buildIds = Array.from(
     new Set(
@@ -1096,6 +1130,11 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
             id: knowledgeBaseBuilds.id,
             userId: knowledgeBaseBuilds.userId,
             conversationId: knowledgeBaseBuilds.conversationId,
+            logoStorageKey: knowledgeBaseBuilds.logoStorageKey,
+            logoSha256: knowledgeBaseBuilds.logoSha256,
+            logoBytes: knowledgeBaseBuilds.logoBytes,
+            logoFilename: knowledgeBaseBuilds.logoFilename,
+            logoMimeType: knowledgeBaseBuilds.logoMimeType,
           })
           .from(knowledgeBaseBuilds)
           .where(
@@ -1103,8 +1142,24 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
               eq(knowledgeBaseBuilds.userId, userId),
               inArray(knowledgeBaseBuilds.id, buildIds),
             ),
-          )) as ServerOwnedBuildIdentity[]);
+          )) as ServerOwnedBuildResourceIdentity[]);
   const buildsById = new Map(buildRows.map((build) => [build.id, build]));
+  const nodeRows =
+    buildIds.length === 0
+      ? []
+      : ((await executor
+          .select({
+            buildId: knowledgeBaseBuildNodes.buildId,
+            leafId: knowledgeBaseBuildNodes.leafId,
+            ordinal: knowledgeBaseBuildNodes.ordinal,
+          })
+          .from(knowledgeBaseBuildNodes)
+          .where(
+            inArray(knowledgeBaseBuildNodes.buildId, buildIds),
+          )) as ServerOwnedBuildNodeIdentity[]);
+  const nodesByBuildAndLeaf = new Map(
+    nodeRows.map((node) => [`${node.buildId}\u0000${node.leafId}`, node]),
+  );
 
   for (const { message, knowledgeBase } of candidates) {
     const turn = turnsById.get(message.turnId!);
@@ -1124,9 +1179,23 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
       })
     ) {
       verified.set(message.id, knowledgeBase);
+      const reconstructedImages =
+        await reconstructKnowledgeBasePresentationInlineImages({
+          build: build!,
+          node: knowledgeBase.leafId
+            ? nodesByBuildAndLeaf.get(
+                `${build!.id}\u0000${knowledgeBase.leafId}`,
+              )
+            : undefined,
+          knowledgeBase,
+          turn: turn!,
+        });
+      if (reconstructedImages) {
+        inlineImages.set(message.id, reconstructedImages);
+      }
     }
   }
-  return verified;
+  return { verified, inlineImages };
 }
 
 function persistedKnowledgeBaseMetadata(
@@ -1140,7 +1209,65 @@ function persistedKnowledgeBaseMetadata(
   return authoritative.get(message.id);
 }
 
-async function loadPersistedMessages(
+export async function reconstructKnowledgeBasePresentationInlineImages(
+  input: {
+    build: ServerOwnedBuildResourceIdentity;
+    node: ServerOwnedBuildNodeIdentity | undefined;
+    knowledgeBase: Pick<KnowledgeBaseMessageMetadata, "kind" | "leafId">;
+    turn: Pick<
+      ServerOwnedTurnResourceIdentity,
+      | "id"
+      | "operationType"
+      | "expectedRevision"
+      | "expectedLeafId"
+      | "attachmentFileIds"
+      | "metadata"
+      | "status"
+    >;
+  },
+  loadResources: typeof knowledgeBaseCustomerUploadResources = knowledgeBaseCustomerUploadResources,
+) {
+  if (input.knowledgeBase.kind !== "presentation" || !input.node) {
+    return undefined;
+  }
+  const images: NonNullable<MessageMetadata["inlineImages"]> = [];
+  const isInitialLogoPresentation =
+    input.turn.operationType === "start" &&
+    input.turn.expectedRevision === 0 &&
+    input.node.buildId === input.build.id &&
+    input.node.ordinal === 0;
+  if (
+    isInitialLogoPresentation &&
+    input.build.logoStorageKey &&
+    input.build.logoSha256 &&
+    input.build.logoBytes &&
+    input.build.logoFilename &&
+    input.build.logoMimeType
+  ) {
+    images.push({
+      src: `/api/knowledge-base/artifacts/${encodeURIComponent(input.build.id)}/logo`,
+      alt: input.build.logoFilename,
+    });
+  }
+
+  const isExactCustomerUploadPresentation =
+    Boolean(input.knowledgeBase.leafId) &&
+    input.node.buildId === input.build.id &&
+    input.node.leafId === input.knowledgeBase.leafId &&
+    input.turn.expectedLeafId === input.node.leafId;
+  if (isExactCustomerUploadPresentation) {
+    const resources = await loadResources(input.build.id, input.turn);
+    images.push(
+      ...resources.map((resource) => ({
+        src: resource.sameOriginUrl,
+        alt: resource.filename,
+      })),
+    );
+  }
+  return images.length > 0 ? images : undefined;
+}
+
+export async function loadPersistedMessages(
   executor: any,
   userId: number,
   conversationId: string,
@@ -1190,8 +1317,13 @@ async function loadPersistedMessages(
     const metadata = (message.metadata ?? {}) as MessageMetadata;
     const knowledgeBase = persistedKnowledgeBaseMetadata(
       message,
-      authoritativeKnowledgeBase,
+      authoritativeKnowledgeBase.verified,
     );
+    const claimedServerOwnedKnowledgeBase =
+      parsedKnowledgeBaseMessageMetadata(metadata)?.serverOwned === true;
+    const inlineImages = claimedServerOwnedKnowledgeBase
+      ? authoritativeKnowledgeBase.inlineImages.get(message.id)
+      : metadata.inlineImages;
     return {
       id: publicId(userId, message.id, projectAssignmentId),
       serverSequence: message.sequence,
@@ -1215,7 +1347,7 @@ async function loadPersistedMessages(
         }),
       ),
       ...(metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {}),
-      ...(metadata.inlineImages ? { inlineImages: metadata.inlineImages } : {}),
+      ...(inlineImages ? { inlineImages } : {}),
       ...(metadata.elapsedTime !== undefined
         ? { elapsedTime: metadata.elapsedTime }
         : {}),
@@ -1348,28 +1480,21 @@ function assistantProjectionScore(projected: SnapshotMessage[]) {
 }
 
 function compareMessageTurnOrder(left: MessageTurn, right: MessageTurn) {
-  if (
-    left.user.serverSequence !== undefined &&
-    right.user.serverSequence !== undefined &&
-    left.user.serverSequence !== right.user.serverSequence
-  ) {
-    return left.user.serverSequence - right.user.serverSequence;
+  return compareAuthoritativeMessageOrder(left.user, right.user);
+}
+
+function compareAuthoritativeMessageOrder(
+  left: SnapshotMessage,
+  right: SnapshotMessage,
+) {
+  const leftSequence = left.serverSequence;
+  const rightSequence = right.serverSequence;
+  if (leftSequence !== undefined || rightSequence !== undefined) {
+    if (leftSequence === undefined) return 1;
+    if (rightSequence === undefined) return -1;
+    if (leftSequence !== rightSequence) return leftSequence - rightSequence;
   }
-  const timestampOrder = left.user.timestamp - right.user.timestamp;
-  if (timestampOrder !== 0) return timestampOrder;
-  if (
-    left.user.serverSequence !== undefined &&
-    right.user.serverSequence === undefined
-  ) {
-    return -1;
-  }
-  if (
-    left.user.serverSequence === undefined &&
-    right.user.serverSequence !== undefined
-  ) {
-    return 1;
-  }
-  return left.user.id.localeCompare(right.user.id);
+  return left.timestamp - right.timestamp || left.id.localeCompare(right.id);
 }
 
 /**
@@ -1454,10 +1579,7 @@ export function mergeConversationMessages(
 
   const mergedPrelude = Array.from(prelude.values())
     .filter((message) => !deleted.has(message.id))
-    .sort(
-      (left, right) =>
-        left.timestamp - right.timestamp || left.id.localeCompare(right.id),
-    );
+    .sort(compareAuthoritativeMessageOrder);
   const mergedTurns = Array.from(turns.values())
     .filter((turn) => !deleted.has(turn.user.id))
     .sort(compareMessageTurnOrder);
@@ -2032,11 +2154,12 @@ async function prepareLegacyImport(
   };
 }
 
-async function listSnapshots(
+export async function listSnapshots(
   userId: number,
   projectAssignmentId: string | null = null,
+  database?: NonNullable<Awaited<ReturnType<typeof getDb>>>,
 ): Promise<ConversationSnapshot[]> {
-  const db = requireDb(await getDb());
+  const db = database ?? requireDb(await getDb());
   const conversationRows = await db
     .select()
     .from(conversations)
@@ -2110,8 +2233,13 @@ async function listSnapshots(
       const metadata = (message.metadata ?? {}) as MessageMetadata;
       const knowledgeBase = persistedKnowledgeBaseMetadata(
         message,
-        authoritativeKnowledgeBase,
+        authoritativeKnowledgeBase.verified,
       );
+      const claimedServerOwnedKnowledgeBase =
+        parsedKnowledgeBaseMessageMetadata(metadata)?.serverOwned === true;
+      const inlineImages = claimedServerOwnedKnowledgeBase
+        ? authoritativeKnowledgeBase.inlineImages.get(message.id)
+        : metadata.inlineImages;
       return {
         id: publicId(userId, message.id, projectAssignmentId),
         serverSequence: message.sequence,
@@ -2135,9 +2263,7 @@ async function listSnapshots(
           }),
         ),
         ...(metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {}),
-        ...(metadata.inlineImages
-          ? { inlineImages: metadata.inlineImages }
-          : {}),
+        ...(inlineImages ? { inlineImages } : {}),
         ...(metadata.elapsedTime !== undefined
           ? { elapsedTime: metadata.elapsedTime }
           : {}),

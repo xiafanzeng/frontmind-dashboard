@@ -156,7 +156,7 @@ export interface KnowledgeBaseActiveTurnDto {
 
 /** A server-owned resource that is safe for the customer UI to render. */
 export interface KnowledgeBaseApprovedResourceDto {
-  kind: "logo";
+  kind: "logo" | "customer_upload";
   outputItemId: string | null;
   fileId: string | null;
   sameOriginUrl: string;

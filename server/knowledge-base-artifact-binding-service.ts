@@ -32,6 +32,10 @@ import {
   selectLegacyKnowledgeBaseLogoAsset,
 } from "./knowledge-base-package-validation";
 import {
+  assertKnowledgeBaseCustomerUploadVisualBindings,
+  verifiedKnowledgeBaseCustomerUploadsForBuild,
+} from "./knowledge-base-customer-upload";
+import {
   KnowledgeBuildArtifactError,
   persistKnowledgeBuildArtifact,
   listStaleKnowledgeBuildArtifactCandidates,
@@ -813,7 +817,7 @@ export async function bindKnowledgeBaseFinalPackage(input: {
         build.skillVersion === "1"
           ? undefined
           : build.skillVersion === "4"
-            ? [3]
+            ? [3, 4]
             : [2, 3],
     },
   );
@@ -903,6 +907,14 @@ export async function bindKnowledgeBaseFinalPackage(input: {
         sha256,
       };
     }
+    const expectedCustomerUploads =
+      build.skillVersion === "4"
+        ? await verifiedKnowledgeBaseCustomerUploadsForBuild({
+            userId: input.userId,
+            buildId: build.id,
+            generation: build.generation,
+          })
+        : [];
     assertKnowledgeBasePackageMatchesBuild({
       nodes: nodes.map((node) => ({
         leafId: node.leafId,
@@ -917,8 +929,17 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       documents: parsed.documents,
       assets: parsed.assets,
       expectedLogoSha256: build.logoSha256 || recoveredLogo!.sha256,
+      packageSchemaVersion: parsed.packageSchemaVersion,
+      expectedCustomerUploads,
       legacyV3Compatibility: build.skillVersion === "3",
     });
+    if (parsed.packageSchemaVersion === 4) {
+      await assertKnowledgeBaseCustomerUploadVisualBindings({
+        assets: parsed.assets,
+        expectedUploads: expectedCustomerUploads,
+        readPackagedAssetBytes: readStoredKnowledgeAssetBytes,
+      });
+    }
   } finally {
     await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
   }
@@ -1233,7 +1254,7 @@ export async function bindKnowledgeBaseReadyPackage(input: {
         build.skillVersion === "1"
           ? undefined
           : build.skillVersion === "4"
-            ? [3]
+            ? [3, 4]
             : [2, 3],
     },
   );
@@ -1288,6 +1309,14 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       .select()
       .from(knowledgeBaseBuildNodes)
       .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
+    const expectedCustomerUploads =
+      build.skillVersion === "4"
+        ? await verifiedKnowledgeBaseCustomerUploadsForBuild({
+            userId: input.userId,
+            buildId: build.id,
+            generation: build.generation,
+          })
+        : [];
     assertKnowledgeBasePackageMatchesBuild({
       nodes: nodes.map((node) => ({
         leafId: node.leafId,
@@ -1302,8 +1331,17 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       documents: parsed.documents,
       assets: parsed.assets,
       expectedLogoSha256: validLogoSha256 || recoveredLogo!.sha256,
+      packageSchemaVersion: parsed.packageSchemaVersion,
+      expectedCustomerUploads,
       legacyV3Compatibility: build.skillVersion === "3",
     });
+    if (parsed.packageSchemaVersion === 4) {
+      await assertKnowledgeBaseCustomerUploadVisualBindings({
+        assets: parsed.assets,
+        expectedUploads: expectedCustomerUploads,
+        readPackagedAssetBytes: readStoredKnowledgeAssetBytes,
+      });
+    }
   } finally {
     await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
   }

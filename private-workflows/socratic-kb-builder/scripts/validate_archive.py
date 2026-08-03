@@ -25,7 +25,9 @@ MAX_COMPRESSED_BYTES = 250 * MIB
 MAX_UNCOMPRESSED_BYTES = 200 * MIB
 MAX_IMAGE_BYTES = 30 * MIB
 MAX_FILES = 1_500
-MAX_IMAGES = 1
+REQUIRED_LOGO_IMAGES = 1
+MAX_USER_UPLOAD_IMAGES = 99
+MAX_IMAGES = REQUIRED_LOGO_IMAGES + MAX_USER_UPLOAD_IMAGES
 MIN_LEAVES = 8
 MAX_LEAVES = 115
 TARGET_FORMAL_CHARACTERS_MIN = 80_000
@@ -126,8 +128,22 @@ CUSTOMER_FORMAL_LEAKAGE = (
         ),
     ),
 )
-ASSET_TYPES = {"brand_identity"}
-DISPLAY_ROLES = {"badge"}
+ASSET_TYPES = {"brand_identity", "customer_supplied"}
+DISPLAY_ROLES = {"badge", "inline"}
+USER_UPLOAD_SOURCE_MIME_TYPES = {
+    "image/avif",
+    "image/bmp",
+    "image/gif",
+    "image/heic",
+    "image/heif",
+    "image/jpeg",
+    "image/png",
+    "image/svg+xml",
+    "image/tiff",
+    "image/vnd.microsoft.icon",
+    "image/webp",
+    "image/x-icon",
+}
 MANIFEST_KEYS = {
     "schemaVersion",
     "profile",
@@ -180,6 +196,9 @@ ASSET_KEYS = {
     "sourceAssetUrl",
     "sourceDocumentPath",
     "sourceKind",
+    "sourceUploadSha256",
+    "sourceUploadFilename",
+    "sourceUploadMimeType",
     "ownership",
     "assetType",
     "displayRole",
@@ -195,6 +214,7 @@ ASSET_REQUIRED_KEYS = {
     "caption",
     "branchId",
     "documentIds",
+    "sourceKind",
     "ownership",
     "assetType",
     "displayRole",
@@ -645,8 +665,8 @@ def validate_archive(path: Path) -> list[str]:
             validation=validation,
         )
         validation.require(
-            manifest.get("schemaVersion") == 3,
-            "00_package_manifest.json schemaVersion must be 3",
+            manifest.get("schemaVersion") == 4,
+            "00_package_manifest.json schemaVersion must be 4",
         )
         validation.require(
             manifest.get("profile") == "dashboard-enterprise-v1",
@@ -1046,7 +1066,7 @@ def validate_archive(path: Path) -> list[str]:
 
         validation.require(
             bool(product_family_ids),
-            "schema v2 must declare at least one product/service family",
+            "schema v4 must declare at least one product/service family",
         )
         validation.require(
             "" not in product_branch_ids,
@@ -1118,7 +1138,7 @@ def validate_archive(path: Path) -> list[str]:
                 validation.require(
                     raw_document.get("customerVisible") is False
                     and doc_id in referenced_evidence_ids,
-                    f"v2 evidence document must be referenced by at least one "
+                    f"v4 evidence document must be referenced by at least one "
                     f"overview/leaf: {raw_document.get('path', doc_id)}",
                 )
 
@@ -1330,8 +1350,11 @@ def validate_archive(path: Path) -> list[str]:
         asset_ids: set[str] = set()
         asset_paths: set[str] = set()
         asset_hashes: set[str] = set()
+        source_upload_hashes: set[str] = set()
         image_bytes_total = 0
         assets: dict[str, dict[str, Any]] = {}
+        official_logo_asset_ids: set[str] = set()
+        user_upload_asset_ids: set[str] = set()
         for index, raw_asset in enumerate(assets_value):
             where = f"manifest.assets[{index}]"
             if not isinstance(raw_asset, dict):
@@ -1379,8 +1402,28 @@ def validate_archive(path: Path) -> list[str]:
                 "sourceKind",
                 where,
                 validation,
+            )
+            source_upload_sha256 = require_string(
+                raw_asset,
+                "sourceUploadSha256",
+                where,
+                validation,
+                optional=True,
+            ).lower()
+            source_upload_filename = require_string(
+                raw_asset,
+                "sourceUploadFilename",
+                where,
+                validation,
                 optional=True,
             )
+            source_upload_mime_type = require_string(
+                raw_asset,
+                "sourceUploadMimeType",
+                where,
+                validation,
+                optional=True,
+            ).lower()
             ownership = require_string(raw_asset, "ownership", where, validation)
             asset_type = require_string(raw_asset, "assetType", where, validation)
             display_role = require_string(
@@ -1393,37 +1436,86 @@ def validate_archive(path: Path) -> list[str]:
                 ownership == "first_party",
                 f"{where}.ownership must be first_party",
             )
+            is_user_upload = source_kind == "user_upload"
             validation.require(
-                bool(source_page_url)
-                or (
-                    bool(source_document_path)
-                    and source_document_path in entries
-                ),
-                f"{where} requires a public source page or packaged source document",
+                source_kind
+                in {"official_web", "official_document", "user_upload"},
+                f"{where}.sourceKind is invalid",
             )
-            if source_kind:
+            if is_user_upload:
                 validation.require(
-                    source_kind
-                    in {"official_web", "official_document", "user_upload"},
-                    f"{where}.sourceKind is invalid",
+                    not source_page_url
+                    and not source_asset_url
+                    and not source_document_path,
+                    f"{where} user_upload must not claim a discovered URL or source document",
+                )
+                validation.require(
+                    {"sourceUploadSha256", "sourceUploadFilename", "sourceUploadMimeType"}
+                    <= set(raw_asset),
+                    f"{where} user_upload requires sourceUploadSha256, "
+                    "sourceUploadFilename and sourceUploadMimeType",
+                )
+                validation.require(
+                    raw_asset.get("sourceUploadSha256") == source_upload_sha256
+                    and bool(re.fullmatch(r"[0-9a-f]{64}", source_upload_sha256)),
+                    f"{where}.sourceUploadSha256 must be 64 lowercase hexadecimal characters",
+                )
+                if source_upload_sha256:
+                    validation.require(
+                        source_upload_sha256 not in source_upload_hashes,
+                        f"duplicate original customer upload hash: {source_upload_sha256}",
+                    )
+                    source_upload_hashes.add(source_upload_sha256)
+                validation.require(
+                    bool(source_upload_filename)
+                    and raw_asset.get("sourceUploadFilename") == source_upload_filename
+                    and source_upload_filename not in {".", ".."}
+                    and "/" not in source_upload_filename
+                    and "\\" not in source_upload_filename
+                    and len(source_upload_filename) <= 255
+                    and not any(
+                        ord(character) < 32 or ord(character) == 127
+                        for character in source_upload_filename
+                    ),
+                    f"{where}.sourceUploadFilename must be a safe basename",
+                )
+                validation.require(
+                    raw_asset.get("sourceUploadMimeType") == source_upload_mime_type
+                    and source_upload_mime_type in USER_UPLOAD_SOURCE_MIME_TYPES,
+                    f"{where}.sourceUploadMimeType must be a normalized supported image MIME type",
+                )
+                validation.require(
+                    asset_type == "customer_supplied" and display_role == "inline",
+                    f"{where} user_upload must use customer_supplied/inline",
+                )
+            else:
+                validation.require(
+                    bool(source_page_url)
+                    or (
+                        bool(source_document_path)
+                        and source_document_path in entries
+                    ),
+                    f"{where} official Logo requires a public source page or packaged source document",
+                )
+                validation.require(
+                    not {
+                        "sourceUploadSha256",
+                        "sourceUploadFilename",
+                        "sourceUploadMimeType",
+                    }
+                    & set(raw_asset),
+                    f"{where} official Logo must not carry user-upload provenance",
+                )
+                validation.require(
+                    source_kind in {"official_web", "official_document"},
+                    f"{where} non-upload asset must be an official Logo source",
+                )
+                validation.require(
+                    asset_type == "brand_identity" and display_role == "badge",
+                    f"{where} official Logo must use brand_identity/badge",
                 )
             validation.require(
-                asset_type in ASSET_TYPES,
-                f"{where}.assetType must be brand_identity",
-            )
-            validation.require(
-                display_role in DISPLAY_ROLES,
-                f"{where}.displayRole must be badge",
-            )
-            badge_type = asset_type in {"brand_identity", "certificate_badge"}
-            validation.require(
-                not (
-                    (display_role == "badge" and not badge_type)
-                    or (
-                        asset_type == "certificate_badge"
-                        and display_role != "badge"
-                    )
-                ),
+                asset_type in ASSET_TYPES and display_role in DISPLAY_ROLES,
                 f"{where} has an invalid assetType/displayRole combination",
             )
             for key, url in (
@@ -1459,6 +1551,10 @@ def validate_archive(path: Path) -> list[str]:
                 )
                 asset_ids.add(asset_id)
                 assets[asset_id] = raw_asset
+                if is_user_upload:
+                    user_upload_asset_ids.add(asset_id)
+                else:
+                    official_logo_asset_ids.add(asset_id)
             if asset_path:
                 validation.require(
                     safe_relative_name(asset_path), f"unsafe asset path: {asset_path}"
@@ -1506,27 +1602,42 @@ def validate_archive(path: Path) -> list[str]:
                     and raw_asset.get("height") == dimensions[1],
                     f"declared dimensions do not match {asset_path}",
                 )
-                if display_role == "hero":
-                    minimum_met = dimensions[0] >= 1200 and dimensions[1] >= 600
-                elif display_role == "badge":
-                    minimum_met = dimensions[0] >= 256 and dimensions[1] >= 256
-                else:
-                    minimum_met = dimensions[0] >= 800 and dimensions[1] >= 450
-                validation.require(
-                    minimum_met,
-                    f"{asset_path} does not meet the {display_role} image "
-                    "quality minimum",
-                )
+                if not is_user_upload:
+                    validation.require(
+                        dimensions[0] >= 256 and dimensions[1] >= 256,
+                        f"{asset_path} does not meet the badge image quality minimum",
+                    )
             validation.require(
                 actual_digest not in asset_hashes,
                 f"duplicate image content hash: {asset_path}",
             )
             asset_hashes.add(actual_digest)
             image_bytes_total += len(data)
-            validation.require(
-                related_documents == [first_leaf_id],
-                f"{where}.documentIds must contain only the first leaf",
-            )
+            if is_user_upload:
+                validation.require(
+                    bool(related_documents)
+                    and len(set(related_documents)) == len(related_documents)
+                    and all(
+                        document_id in documents
+                        and documents[document_id].get("kind") == "leaf"
+                        for document_id in related_documents
+                    ),
+                    f"{where}.documentIds must contain one or more unique supplemented leaves",
+                )
+                validation.require(
+                    any(
+                        document_id in documents
+                        and documents[document_id].get("branchId")
+                        == asset_branch_id
+                        for document_id in related_documents
+                    ),
+                    f"{where}.branchId must match at least one supplemented leaf",
+                )
+            else:
+                validation.require(
+                    related_documents == [first_leaf_id],
+                    f"{where}.documentIds must contain only the first leaf",
+                )
             for document_id in related_documents:
                 validation.require(
                     document_id in documents,
@@ -1537,12 +1648,13 @@ def validate_archive(path: Path) -> list[str]:
                         documents[document_id].get("customerVisible") is True,
                         f"{where} may only link packaged images to customer-visible documents",
                     )
-                    validation.require(
-                        documents[document_id].get("branchId")
-                        == asset_branch_id,
-                        f"{where}.branchId must match linked document "
-                        f"{document_id}",
-                    )
+                    if not is_user_upload:
+                        validation.require(
+                            documents[document_id].get("branchId")
+                            == asset_branch_id,
+                            f"{where}.branchId must match linked document "
+                            f"{document_id}",
+                        )
 
         actual_image_paths = {
             name
@@ -1567,8 +1679,16 @@ def validate_archive(path: Path) -> list[str]:
             f"missing={sorted(asset_paths - actual_image_paths)[:8]}",
         )
         validation.require(
-            len(asset_paths) == MAX_IMAGES,
-            f"archive must contain exactly {MAX_IMAGES} real packaged images",
+            len(official_logo_asset_ids) == REQUIRED_LOGO_IMAGES,
+            "archive must contain exactly one non-user_upload official company Logo",
+        )
+        validation.require(
+            len(user_upload_asset_ids) <= MAX_USER_UPLOAD_IMAGES,
+            f"archive contains more than {MAX_USER_UPLOAD_IMAGES} customer-uploaded images",
+        )
+        validation.require(
+            1 <= len(asset_paths) <= MAX_IMAGES,
+            f"archive must contain 1–{MAX_IMAGES} real packaged images",
         )
         validation.require(
             image_bytes_total <= MAX_IMAGE_BYTES,
@@ -1649,8 +1769,8 @@ def validate_archive(path: Path) -> list[str]:
                 "inspectedCandidateImages must equal eligible plus rejected candidates",
             )
             validation.require(
-                len(asset_paths) <= eligible,
-                "packaged image count cannot exceed eligibleFirstPartyImages",
+                len(official_logo_asset_ids) <= eligible,
+                "official Logo count cannot exceed eligibleFirstPartyImages",
             )
         validation.require(
             isinstance(candidates, list),
@@ -1798,8 +1918,9 @@ def validate_archive(path: Path) -> list[str]:
                     for candidate in eligible_candidates
                     if candidate.get("assetId")
                 }
-                == asset_ids,
-                "every packaged image must appear exactly once as eligible",
+                == official_logo_asset_ids,
+                "the official Logo must appear exactly once as eligible; "
+                "customer uploads must not enter imageSelection",
             )
         validation.require(
             isinstance(discovery_methods, list)
@@ -1870,12 +1991,13 @@ def validate_archive(path: Path) -> list[str]:
             if selection_status == "target_met":
                 validation.require(
                     len(uninspected_candidates) == 0
-                    and len(asset_paths) == MAX_IMAGES
+                    and len(official_logo_asset_ids) == REQUIRED_LOGO_IMAGES
                     and all(
                         asset.get("assetType") == "brand_identity"
                         and asset.get("displayRole") == "badge"
                         and asset.get("documentIds") == [first_leaf_id]
-                        for asset in assets.values()
+                        for asset_id, asset in assets.items()
+                        if asset_id in official_logo_asset_ids
                     ),
                     "target_met requires exactly one official company Logo "
                     "linked only to the first leaf",
@@ -1886,8 +2008,8 @@ def validate_archive(path: Path) -> list[str]:
                 )
             else:
                 validation.require(
-                    len(asset_paths) == eligible,
-                    "limited image status must package every eligible image",
+                    len(official_logo_asset_ids) == eligible,
+                    "limited image status must package every eligible Logo",
                 )
                 validation.require(
                     isinstance(shortfall, str) and bool(shortfall.strip()),
@@ -1920,9 +2042,9 @@ def validate_archive(path: Path) -> list[str]:
             else None
         )
         validation.require(
-            packaged_completed == len(asset_paths),
+            packaged_completed == len(official_logo_asset_ids),
             "00_completeness.json acquisition.images.completed must equal "
-            "the actual packaged image count",
+            "the official Logo count; customer uploads are excluded",
         )
         crawl_report_info = entries.get("00_crawl_coverage_report.md")
         if crawl_report_info is not None:
@@ -1930,24 +2052,38 @@ def validate_archive(path: Path) -> list[str]:
                 crawl_report = archive.read(crawl_report_info).decode("utf-8")
             except UnicodeDecodeError:
                 crawl_report = ""
-            reported_image_count: int | None = None
+            reported_logo_count: int | None = None
             for pattern in (
-                r"(?:成功下载|已下载|已保存|保存并打包|downloaded|packaged|saved)"
-                r"[^\n|]{0,30}(?:图片|图像|images?|assets?)[^\d]{0,12}([\d,]+)",
-                r"(?:图片|图像|images?|assets?)[^\n|]{0,30}"
+                r"(?:企业)?官方\s*Logo[^\n|]{0,30}"
                 r"(?:成功下载|已下载|已保存|保存并打包|downloaded|packaged|saved)"
                 r"[^\d]{0,12}([\d,]+)",
-                r"第一方图片资源[^\d\n|]{0,20}([\d,]+)",
+                r"(?:成功下载|已下载|已保存|保存并打包|downloaded|packaged|saved)"
+                r"[^\n|]{0,30}(?:企业)?官方\s*Logo[^\d]{0,12}([\d,]+)",
             ):
                 match = re.search(pattern, crawl_report, flags=re.IGNORECASE)
                 if match:
-                    reported_image_count = int(match.group(1).replace(",", ""))
+                    reported_logo_count = int(match.group(1).replace(",", ""))
                     break
-            if reported_image_count is not None:
+            if reported_logo_count is not None:
                 validation.require(
-                    reported_image_count == len(asset_paths),
-                    "crawl report saved-image count does not match actual "
-                    "packaged images",
+                    reported_logo_count == len(official_logo_asset_ids),
+                    "crawl report saved-Logo count does not match the official Logo asset",
+                )
+            reported_upload_count: int | None = None
+            for pattern in (
+                r"(?:客户|用户)(?:补充)?上传(?:图片|图像)[^\n|]{0,30}"
+                r"(?:已保留|已保存|已打包|packaged|saved)[^\d]{0,12}([\d,]+)",
+                r"(?:已保留|已保存|已打包|packaged|saved)[^\n|]{0,30}"
+                r"(?:客户|用户)(?:补充)?上传(?:图片|图像)[^\d]{0,12}([\d,]+)",
+            ):
+                match = re.search(pattern, crawl_report, flags=re.IGNORECASE)
+                if match:
+                    reported_upload_count = int(match.group(1).replace(",", ""))
+                    break
+            if reported_upload_count is not None:
+                validation.require(
+                    reported_upload_count == len(user_upload_asset_ids),
+                    "crawl report customer-upload count does not match packaged user uploads",
                 )
 
         expected_counts = {
