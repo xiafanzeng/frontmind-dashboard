@@ -1007,6 +1007,7 @@ mysqlDescribe(
         pathname: "/start" | "/turn",
         body: Record<string, unknown>,
       ) => {
+        const requestBody = JSON.stringify(body);
         let lastPayload: unknown;
         for (let attempt = 0; attempt < 400; attempt += 1) {
           const response = await fetch(
@@ -1017,11 +1018,23 @@ mysqlDescribe(
                 "content-type": "application/json",
                 "x-test-auth": "user",
               },
-              body: JSON.stringify(body),
+              body: requestBody,
             },
           );
           const payload = (await response.json()) as any;
           lastPayload = payload;
+          if (
+            pathname === "/turn" &&
+            response.status === 200 &&
+            payload.idempotent === true &&
+            payload.task?.status === "running"
+          ) {
+            // Binding the single upstream task is progress, not completion.
+            // Keep replaying the same logical request until reconciliation has
+            // atomically completed the turn and advanced the build.
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            continue;
+          }
           if (response.status === 200) return payload;
           if (
             pathname === "/turn" &&
@@ -1173,6 +1186,7 @@ mysqlDescribe(
       );
       expect(uploadedFileSequence).toBe(uploadCountAfterStart);
 
+      let finalTurnOperationKey: string | null = null;
       for (let index = 0; index < fixture.leaves.length; index += 1) {
         const leaf = fixture.leaves[index]!;
         const isFinal = index === fixture.leaves.length - 1;
@@ -1199,7 +1213,10 @@ mysqlDescribe(
           expectedLeafId: leaf.id,
           status: "completed",
           upstreamTaskId: result.task.id,
+          completedAt: expect.any(Date),
+          leaseExpiresAt: null,
         });
+        if (isFinal) finalTurnOperationKey = turn.operationKey;
         if (isFinal) {
           expect(result.observation).toMatchObject({
             authoritativeTaskId: finalTaskId,
@@ -1322,6 +1339,8 @@ mysqlDescribe(
       )[0];
       expect(finalBuild).toMatchObject({
         status: "ready_to_publish",
+        activeTurnId: null,
+        lastAppliedOperationKey: finalTurnOperationKey,
         revision: FINAL_REVISION,
         currentLeafId: null,
         confirmedCount: FINAL_REVISION,
