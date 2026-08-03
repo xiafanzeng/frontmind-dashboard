@@ -1064,6 +1064,22 @@ function knowledgeBaseMessageIsAtLeastAsNew(
   return true;
 }
 
+function retainKnowledgeBaseUserAttachments(
+  preferred: LocalMessage,
+  fallback: LocalMessage,
+) {
+  if (
+    preferred.role !== "user" ||
+    preferred.knowledgeBase?.kind !== "pending_user" ||
+    fallback.knowledgeBase?.kind !== "pending_user" ||
+    preferred.attachments?.length ||
+    !fallback.attachments?.length
+  ) {
+    return preferred;
+  }
+  return { ...preferred, attachments: fallback.attachments };
+}
+
 function compareHydratedMessageOrder(left: LocalMessage, right: LocalMessage) {
   const leftIsServerOwned = isServerOwnedKnowledgeBaseMessage(left);
   const rightIsServerOwned = isServerOwnedKnowledgeBaseMessage(right);
@@ -1156,16 +1172,38 @@ export function mergeServerOwnedKnowledgeBaseMessages(
       (isServerOwnedKnowledgeBaseMessage(remoteMessage) &&
         knowledgeBaseMessageIsAtLeastAsNew(remoteMessage, existing))
     ) {
-      merged[existingIndex] = remoteMessage;
+      merged[existingIndex] = retainKnowledgeBaseUserAttachments(
+        remoteMessage,
+        existing,
+      );
       identityToIndex.set(identity, existingIndex);
       idToIndex.set(remoteMessage.id, existingIndex);
+    } else {
+      merged[existingIndex] = retainKnowledgeBaseUserAttachments(
+        existing,
+        remoteMessage,
+      );
     }
   }
   for (const localMessage of localMessages) {
-    if (!isServerOwnedKnowledgeBaseMessage(localMessage)) continue;
     const identity = knowledgeBaseMessageIdentity(localMessage);
     const existingIndex =
       identityToIndex.get(identity) ?? idToIndex.get(localMessage.id);
+    if (!isServerOwnedKnowledgeBaseMessage(localMessage)) {
+      // An observation/list response can win the race with the browser's
+      // optimistic promotion. Copy only the upload chips onto the exact
+      // accepted request identity; never append or authorize the local row.
+      if (
+        existingIndex !== undefined &&
+        isServerOwnedKnowledgeBaseMessage(merged[existingIndex]!)
+      ) {
+        merged[existingIndex] = retainKnowledgeBaseUserAttachments(
+          merged[existingIndex]!,
+          localMessage,
+        );
+      }
+      continue;
+    }
     if (existingIndex === undefined) {
       identityToIndex.set(identity, merged.length);
       idToIndex.set(localMessage.id, merged.length);
@@ -1177,9 +1215,17 @@ export function mergeServerOwnedKnowledgeBaseMessages(
       !isServerOwnedKnowledgeBaseMessage(existing) ||
       knowledgeBaseMessageIsAtLeastAsNew(localMessage, existing)
     ) {
-      merged[existingIndex] = localMessage;
+      merged[existingIndex] = retainKnowledgeBaseUserAttachments(
+        localMessage,
+        existing,
+      );
       identityToIndex.set(identity, existingIndex);
       idToIndex.set(localMessage.id, existingIndex);
+    } else {
+      merged[existingIndex] = retainKnowledgeBaseUserAttachments(
+        existing,
+        localMessage,
+      );
     }
   }
   return repairConversationMessageIds(

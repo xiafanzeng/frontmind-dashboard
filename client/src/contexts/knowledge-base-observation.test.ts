@@ -623,6 +623,56 @@ describe("authoritative KB observation reducer", () => {
     expect(merged[0]?.content).toContain("服务器正文");
   });
 
+  it("keeps uploaded file chips when the authoritative turn replaces the optimistic request", () => {
+    const uploadedAttachment = {
+      id: "optimistic-attachment",
+      type: "file" as const,
+      name: "企业事实确认表.pdf",
+      fileId: "customer-file-1",
+    };
+    const optimistic: Conversation["messages"][number] = {
+      id: "optimistic-user-message",
+      role: "user",
+      content: "请参考这份资料",
+      attachments: [uploadedAttachment],
+      timestamp: 10,
+      knowledgeBase: {
+        kind: "pending_user",
+        clientRequestId: "request-turn-upload",
+      },
+    };
+    const authoritative: Conversation["messages"][number] = {
+      id: knowledgeBaseUserMessagePublicId("turn-upload"),
+      serverSequence: 4,
+      role: "user",
+      content: "请参考这份资料",
+      timestamp: 20,
+      knowledgeBase: {
+        schemaVersion: 1,
+        kind: "pending_user",
+        clientRequestId: "request-turn-upload",
+        turnId: "turn-upload",
+        generation: 1,
+        revision: 1,
+        leafId: "1.2",
+        serverOwned: true,
+      },
+    };
+
+    const merged = mergeServerOwnedKnowledgeBaseMessages(
+      [optimistic],
+      [authoritative],
+    );
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      id: knowledgeBaseUserMessagePublicId("turn-upload"),
+      serverSequence: 4,
+      attachments: [uploadedAttachment],
+      knowledgeBase: { serverOwned: true, turnId: "turn-upload" },
+    });
+  });
+
   it("preserves server-owned history even before client KB state is restored", () => {
     const approved = applyKnowledgeBaseObservation(
       conversation(),

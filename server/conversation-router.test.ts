@@ -26,6 +26,7 @@ import {
   mergeConversationMessages,
   mergeConversationTaskPointers,
   permanentlyDeleteConversation,
+  reconstructKnowledgeBaseUserMessageAttachments,
   reconstructKnowledgeBasePresentationInlineImages,
   repairSnapshotMessageIds,
   retryConversationSyncTransaction,
@@ -148,6 +149,273 @@ function createSelectExecutor(rowsForTable: (table: unknown) => unknown[]) {
 }
 
 describe("conversation multi-device merge", () => {
+  it("reconstructs only customer upload chips from a durable knowledge-base turn", () => {
+    const attachments = reconstructKnowledgeBaseUserMessageAttachments({
+      knowledgeBase: { kind: "pending_user" },
+      turn: {
+        id: "turn-upload",
+        status: "completed",
+        attachmentFileIds: [
+          "generated-skill-file",
+          "customer-pdf",
+          "customer-image",
+        ],
+        metadata: {
+          attachmentsFrozen: true,
+          userAttachmentCount: 2,
+          recovery: {
+            capturedClientAttachments: true,
+            attachments: [
+              { file_id: "customer-pdf", filename: "企业事实.pdf" },
+              { file_id: "customer-image", filename: "门店照片.png" },
+            ],
+            attachmentManifest: [
+              {
+                filename: "企业事实.pdf",
+                sizeBytes: 123,
+                mimeType: "application/pdf",
+                lastModified: 1,
+                sha256: "a".repeat(64),
+              },
+              {
+                filename: "门店照片.png",
+                sizeBytes: 456,
+                mimeType: "image/png",
+                lastModified: 2,
+                sha256: "b".repeat(64),
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    expect(attachments).toEqual([
+      {
+        id: "kb-user-attachment-turn-upload-1",
+        type: "file",
+        name: "企业事实.pdf",
+        fileId: "customer-pdf",
+      },
+      {
+        id: "kb-user-attachment-turn-upload-2",
+        type: "file",
+        name: "门店照片.png",
+        fileId: "customer-image",
+      },
+    ]);
+    expect(
+      attachments?.some((item) => item.fileId === "generated-skill-file"),
+    ).toBe(false);
+  });
+
+  it("reconstructs an initial-build upload from its completed turn binding", () => {
+    expect(
+      reconstructKnowledgeBaseUserMessageAttachments({
+        knowledgeBase: { kind: "pending_user" },
+        turn: {
+          id: "turn-start",
+          status: "completed",
+          attachmentFileIds: ["generated-skill", "initial-brochure"],
+          metadata: {
+            userAttachmentCount: 1,
+            recovery: {
+              attachments: [
+                {
+                  file_id: "initial-brochure",
+                  filename: "企业宣传册.pdf",
+                },
+              ],
+            },
+          },
+        },
+      }),
+    ).toEqual([
+      {
+        id: "kb-user-attachment-turn-start-1",
+        type: "file",
+        name: "企业宣传册.pdf",
+        fileId: "initial-brochure",
+      },
+    ]);
+  });
+
+  it("fails closed when the durable customer upload ledger is inconsistent", () => {
+    const baseTurn = {
+      id: "turn-upload",
+      status: "completed" as const,
+      attachmentFileIds: ["customer-pdf"],
+      metadata: {
+        userAttachmentCount: 1,
+        recovery: {
+          attachments: [
+            { file_id: "customer-pdf", filename: "企业事实确认表.pdf" },
+          ],
+          attachmentManifest: [
+            {
+              filename: "另一份资料.pdf",
+              sizeBytes: 123,
+              mimeType: "application/pdf",
+              lastModified: 1,
+              sha256: "a".repeat(64),
+            },
+          ],
+        },
+      },
+    };
+
+    expect(
+      reconstructKnowledgeBaseUserMessageAttachments({
+        knowledgeBase: { kind: "pending_user" },
+        turn: baseTurn,
+      }),
+    ).toBeUndefined();
+    expect(
+      reconstructKnowledgeBaseUserMessageAttachments({
+        knowledgeBase: { kind: "pending_user" },
+        turn: {
+          ...baseTurn,
+          attachmentFileIds: [],
+          metadata: {
+            ...baseTurn.metadata,
+            recovery: {
+              ...baseTurn.metadata.recovery,
+              attachmentManifest: [
+                {
+                  ...baseTurn.metadata.recovery.attachmentManifest[0],
+                  filename: "企业事实确认表.pdf",
+                },
+              ],
+            },
+          },
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("hydrates durable upload chips after processing and on a fresh conversation list", async () => {
+    const knowledgeBase = {
+      schemaVersion: 1 as const,
+      serverOwned: true,
+      kind: "pending_user" as const,
+      buildId: "build-1",
+      generation: 1,
+      operationKey: "operation-upload",
+      clientRequestId: "request-upload",
+      turnId: "turn-upload",
+      revision: 1,
+      leafId: "1.2",
+    };
+    const userMessage: typeof messages.$inferSelect = {
+      id: "u7:msg-kb-user-turn-upload",
+      conversationId: "u7:conversation-1",
+      turnId: "turn-upload",
+      userId: 7,
+      role: "user",
+      content: "请参考这份 PDF",
+      sequence: 4,
+      metadata: { knowledgeBase },
+      sentAt: new Date(2_000),
+      createdAt: new Date(2_000),
+      updatedAt: new Date(2_000),
+      deletedAt: null,
+    };
+    const turn = {
+      id: "turn-upload",
+      conversationId: "u7:conversation-1",
+      userId: 7,
+      clientRequestId: "request-upload",
+      buildId: "build-1",
+      buildGeneration: 1,
+      operationKey: "operation-upload",
+      operationType: "revise",
+      expectedRevision: 1,
+      expectedLeafId: "1.2",
+      attachmentFileIds: ["generated-skill-file", "customer-pdf"],
+      metadata: {
+        attachmentsFrozen: true,
+        userAttachmentCount: 1,
+        recovery: {
+          capturedClientAttachments: true,
+          attachments: [
+            { file_id: "customer-pdf", filename: "企业事实确认表.pdf" },
+          ],
+          attachmentManifest: [
+            {
+              filename: "企业事实确认表.pdf",
+              sizeBytes: 123,
+              mimeType: "application/pdf",
+              lastModified: 1,
+              sha256: "a".repeat(64),
+            },
+          ],
+        },
+      },
+      status: "completed",
+    };
+    const build = {
+      id: "build-1",
+      userId: 7,
+      conversationId: "conversation-1",
+      logoStorageKey: null,
+      logoSha256: null,
+      logoBytes: null,
+      logoFilename: null,
+      logoMimeType: null,
+    };
+    const conversation = {
+      id: "u7:conversation-1",
+      userId: 7,
+      projectAssignmentId: null,
+      title: "知识库",
+      status: "awaiting_input",
+      upstreamTaskId: "task-upload",
+      previousResponseId: "task-upload",
+      taskUrl: null,
+      createdAt: new Date(1_000),
+      updatedAt: new Date(3_000),
+      startedAt: new Date(1_500),
+      completedAt: null,
+      deletedAt: null,
+      lastKnownOutputLength: 0,
+      deletedMessageIds: [],
+    };
+    const rowsForTable = (table: unknown) => {
+      if (table === conversations) return [conversation];
+      if (table === messages) return [userMessage];
+      if (table === attachments) return [];
+      if (table === conversationTurns) return [turn];
+      if (table === knowledgeBaseBuilds) return [build];
+      if (table === knowledgeBaseBuildNodes) return [];
+      return [];
+    };
+    const expectedAttachment = {
+      id: "kb-user-attachment-turn-upload-1",
+      type: "file",
+      name: "企业事实确认表.pdf",
+      fileId: "customer-pdf",
+    };
+
+    const { executor: historyExecutor } = createSelectExecutor(rowsForTable);
+    const history = await loadPersistedMessages(
+      historyExecutor,
+      7,
+      "u7:conversation-1",
+      null,
+    );
+    expect(history[0]?.attachments).toEqual([expectedAttachment]);
+
+    const { executor: listExecutor } = createSelectExecutor(rowsForTable);
+    const snapshots = await listSnapshots(
+      7,
+      null,
+      listExecutor as Parameters<typeof listSnapshots>[2],
+    );
+    expect(snapshots[0]?.messages[0]?.attachments).toEqual([
+      expectedAttachment,
+    ]);
+  });
+
   it("reconstructs durable customer images only for their authoritative presentation leaf", async () => {
     const loadResources = vi.fn().mockResolvedValue([
       {

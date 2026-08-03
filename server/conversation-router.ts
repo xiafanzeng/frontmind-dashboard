@@ -19,6 +19,7 @@ import {
   type MessageMetadata,
 } from "../drizzle/schema";
 import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
+import { normalizeKnowledgeBaseAttachmentFilename } from "../shared/knowledge-base-attachment";
 import {
   knowledgeBasePresentationMessagePublicId,
   knowledgeBaseUserMessagePublicId,
@@ -272,6 +273,121 @@ export const conversationSnapshotSchema = z.object({
 });
 
 export type ConversationSnapshot = z.infer<typeof conversationSnapshotSchema>;
+
+type KnowledgeBaseUserMessageAttachment = NonNullable<
+  ConversationSnapshot["messages"][number]["attachments"]
+>[number];
+
+function plainRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * Rebuild the customer-visible upload chips from the durable turn ledger.
+ * Generated Skill/prefill files are deliberately excluded: recovery.attachments
+ * contains only files selected by the customer for this logical turn.
+ */
+export function reconstructKnowledgeBaseUserMessageAttachments(input: {
+  knowledgeBase: Pick<KnowledgeBaseMessageMetadata, "kind">;
+  turn: Pick<
+    ServerOwnedTurnResourceIdentity,
+    "id" | "attachmentFileIds" | "metadata" | "status"
+  >;
+}): KnowledgeBaseUserMessageAttachment[] | undefined {
+  if (input.knowledgeBase.kind !== "pending_user") return undefined;
+
+  const metadata = plainRecord(input.turn.metadata) ?? {};
+  const recovery = plainRecord(metadata.recovery);
+  const uploaded = Array.isArray(recovery?.attachments)
+    ? recovery.attachments
+    : [];
+  const manifest = Array.isArray(recovery?.attachmentManifest)
+    ? recovery.attachmentManifest
+    : [];
+  const staged = Array.isArray(metadata.clientStagedAttachments)
+    ? metadata.clientStagedAttachments
+    : [];
+  const expectedCount = Number(metadata.userAttachmentCount ?? 0);
+  if (
+    !Number.isSafeInteger(expectedCount) ||
+    expectedCount < 1 ||
+    uploaded.length !== expectedCount ||
+    (manifest.length > 0 && manifest.length !== expectedCount)
+  ) {
+    return undefined;
+  }
+
+  const boundFileIds = new Set(
+    Array.isArray(input.turn.attachmentFileIds)
+      ? input.turn.attachmentFileIds
+      : [],
+  );
+  const capturedByDashboard = recovery?.capturedClientAttachments === true;
+  const attachments: KnowledgeBaseUserMessageAttachment[] = [];
+  const seenFileIds = new Set<string>();
+
+  for (let index = 0; index < expectedCount; index += 1) {
+    const uploadedItem = plainRecord(uploaded[index]);
+    const manifestItem = plainRecord(manifest[index]);
+    const stagedItem = plainRecord(staged[index]);
+    const fileId = String(uploadedItem?.file_id || "").trim();
+    const uploadedFilename = normalizeKnowledgeBaseAttachmentFilename(
+      uploadedItem?.filename,
+      "",
+    );
+    const filename = normalizeKnowledgeBaseAttachmentFilename(
+      manifestItem?.filename ?? uploadedFilename,
+      "",
+    );
+    const stagedMatches =
+      stagedItem?.index === index &&
+      stagedItem.file_id === fileId &&
+      stagedItem.filename === filename;
+    const boundToTurn = boundFileIds.has(fileId);
+    const trustedUpload =
+      input.turn.status === "completed"
+        ? boundToTurn
+        : capturedByDashboard || boundToTurn || stagedMatches;
+
+    if (
+      !fileId ||
+      !filename ||
+      uploadedFilename !== filename ||
+      seenFileIds.has(fileId) ||
+      !trustedUpload
+    ) {
+      return undefined;
+    }
+
+    if (manifestItem) {
+      const sizeBytes = Number(manifestItem.sizeBytes);
+      const sha256 = String(manifestItem.sha256 || "")
+        .trim()
+        .toLowerCase();
+      if (
+        !Number.isSafeInteger(sizeBytes) ||
+        sizeBytes < 0 ||
+        !/^[a-f0-9]{64}$/u.test(sha256)
+      ) {
+        return undefined;
+      }
+    }
+
+    seenFileIds.add(fileId);
+    attachments.push({
+      id: `kb-user-attachment-${input.turn.id}-${index + 1}`,
+      // Knowledge-base uploads intentionally stay on the file-chip path, even
+      // for images, so history never re-enters the oversized direct-image path.
+      type: "file",
+      name: filename,
+      ...(fileId.length <= 255 ? { fileId } : {}),
+    });
+  }
+
+  return attachments;
+}
 
 type UpstreamResourceRef = { kind: "task" | "file"; id: string };
 const LEGACY_IMPORT_MAX_RESOURCES = 200;
@@ -1082,10 +1198,14 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
     string,
     NonNullable<MessageMetadata["inlineImages"]>
   >();
+  const userAttachments = new Map<
+    string,
+    KnowledgeBaseUserMessageAttachment[]
+  >();
   // Knowledge-base state is account-owned. Project snapshots must never gain
   // immutable messages merely by carrying another user's metadata marker.
   if (projectAssignmentId || candidates.length === 0) {
-    return { verified, inlineImages };
+    return { verified, inlineImages, userAttachments };
   }
 
   const turnIds = Array.from(
@@ -1193,9 +1313,17 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
       if (reconstructedImages) {
         inlineImages.set(message.id, reconstructedImages);
       }
+      const reconstructedAttachments =
+        reconstructKnowledgeBaseUserMessageAttachments({
+          knowledgeBase,
+          turn: turn!,
+        });
+      if (reconstructedAttachments) {
+        userAttachments.set(message.id, reconstructedAttachments);
+      }
     }
   }
-  return { verified, inlineImages };
+  return { verified, inlineImages, userAttachments };
 }
 
 function persistedKnowledgeBaseMetadata(
@@ -1324,6 +1452,9 @@ export async function loadPersistedMessages(
     const inlineImages = claimedServerOwnedKnowledgeBase
       ? authoritativeKnowledgeBase.inlineImages.get(message.id)
       : metadata.inlineImages;
+    const reconstructedAttachments = claimedServerOwnedKnowledgeBase
+      ? authoritativeKnowledgeBase.userAttachments.get(message.id)
+      : undefined;
     return {
       id: publicId(userId, message.id, projectAssignmentId),
       serverSequence: message.sequence,
@@ -1336,16 +1467,18 @@ export async function loadPersistedMessages(
           : ("user" as const),
       content: normalizeKnowledgeCollectionCopy(message.content),
       timestamp: message.sentAt.getTime(),
-      attachments: (attachmentsByMessage.get(message.id) ?? []).map(
-        (attachment: typeof attachments.$inferSelect) => ({
-          id: publicId(userId, attachment.id, projectAssignmentId),
-          type: attachment.kind,
-          name: attachment.fileName,
-          ...(attachment.upstreamFileId
-            ? { fileId: attachment.upstreamFileId }
-            : {}),
-        }),
-      ),
+      attachments:
+        reconstructedAttachments ??
+        (attachmentsByMessage.get(message.id) ?? []).map(
+          (attachment: typeof attachments.$inferSelect) => ({
+            id: publicId(userId, attachment.id, projectAssignmentId),
+            type: attachment.kind,
+            name: attachment.fileName,
+            ...(attachment.upstreamFileId
+              ? { fileId: attachment.upstreamFileId }
+              : {}),
+          }),
+        ),
       ...(metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {}),
       ...(inlineImages ? { inlineImages } : {}),
       ...(metadata.elapsedTime !== undefined
@@ -2240,6 +2373,9 @@ export async function listSnapshots(
       const inlineImages = claimedServerOwnedKnowledgeBase
         ? authoritativeKnowledgeBase.inlineImages.get(message.id)
         : metadata.inlineImages;
+      const reconstructedAttachments = claimedServerOwnedKnowledgeBase
+        ? authoritativeKnowledgeBase.userAttachments.get(message.id)
+        : undefined;
       return {
         id: publicId(userId, message.id, projectAssignmentId),
         serverSequence: message.sequence,
@@ -2252,16 +2388,16 @@ export async function listSnapshots(
             : ("user" as const),
         content: normalizeKnowledgeCollectionCopy(message.content),
         timestamp: message.sentAt.getTime(),
-        attachments: (attachmentsByMessage.get(message.id) ?? []).map(
-          (attachment) => ({
+        attachments:
+          reconstructedAttachments ??
+          (attachmentsByMessage.get(message.id) ?? []).map((attachment) => ({
             id: publicId(userId, attachment.id, projectAssignmentId),
             type: attachment.kind,
             name: attachment.fileName,
             ...(attachment.upstreamFileId
               ? { fileId: attachment.upstreamFileId }
               : {}),
-          }),
-        ),
+          })),
         ...(metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {}),
         ...(inlineImages ? { inlineImages } : {}),
         ...(metadata.elapsedTime !== undefined
