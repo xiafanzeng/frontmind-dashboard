@@ -2719,6 +2719,8 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
                 "必须在结束本轮前，把恰好一个 type=output_file、MIME=application/zip 的最终知识库 ZIP 实际加入任务 output；不得只输出文件名、路径、下载承诺或“即将生成/稍后生成”的文字。",
                 `ZIP 必须与本轮 operationId=${input.protocolOperation?.operationId || ""}、turnId=${input.protocolOperation?.turnId || ""} 属于同一 assistant output item，或在资源描述中显式携带完全相同的 operationId 与 turnId。`,
                 `ZIP 内 00_package_manifest.json 的 buildRevision 必须为 ${postRevision}，并完整绑定当前知识树、首轮 Logo 原始字节与全部客户上传资源。`,
+                `ZIP 中每个 kind=leaf 文档 id 必须逐字使用当前知识树原始节点 id（${leaves.map((leaf) => leaf.id).join("、")}），不得添加 leaf-、node- 等前后缀；所有素材 documentIds 必须引用同一组原始 id。`,
+                "schemaVersion=4 只属于 ZIP 内 00_package_manifest.json；本轮 FRONTMIND_KB_PROGRESS 与 FRONTMIND_KB_PRESENTATION 仍必须保留下面服务端给定的 schemaVersion=2、operationId、turnId 和字段层级。不得用 action=final_package、packageSha256、packageBytes 或 VALID 摘要替代这两个信封。",
                 "在 ZIP 文件资源已经进入任务 output 之前不得结束任务；Progress 和 Presentation 文本信封不能替代 ZIP 文件。",
               ]
             : []),

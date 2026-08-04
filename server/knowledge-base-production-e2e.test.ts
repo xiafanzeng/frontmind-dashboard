@@ -28,6 +28,7 @@ import {
   canonicalPackagedKnowledgeBaseLeafMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
+import { canonicalizeKnowledgeBaseFinalArchive } from "./knowledge-base-package-canonicalization";
 import {
   formatKnowledgeBaseManifestEnvelope,
   formatKnowledgeBasePresentationEnvelope,
@@ -478,7 +479,13 @@ ${narrative}
 }
 
 async function createFinalPackageFixture(
-  input: { leafCount?: number; buildRevision?: number } = {},
+  input: {
+    leafCount?: number;
+    buildRevision?: number;
+    schemaVersion?: 3 | 4;
+    archiveLeafIdPrefix?: string;
+    driftLastPackagedLeaf?: boolean;
+  } = {},
 ) {
   const leafCount = input.leafCount ?? FINAL_REVISION;
   const buildRevision = input.buildRevision ?? leafCount;
@@ -550,13 +557,21 @@ async function createFinalPackageFixture(
   }> = [];
   for (let index = 0; index < leafCount; index += 1) {
     const id = `1.${index + 1}`;
+    const archiveId = `${input.archiveLeafIdPrefix || ""}${id}`;
     const title = `知识节点 ${index + 1}`;
     const narrative = `FrontMind超前智能${String.fromCodePoint(0x7532 + index).repeat(55)}`;
     const raw = formalDocument(`${id} ${title}`, narrative);
+    const packagedRaw =
+      input.driftLastPackagedLeaf && index === leafCount - 1
+        ? formalDocument(
+            `${id} ${title}`,
+            `FrontMind超前智能${"异".repeat(55)}`,
+          )
+        : raw;
     const relativePath = `branches/products/leaf-${index + 1}.md`;
-    zip.file(`${root}/${relativePath}`, raw);
+    zip.file(`${root}/${relativePath}`, packagedRaw);
     documents.push({
-      id,
+      id: archiveId,
       path: relativePath,
       kind: "leaf",
       title,
@@ -594,7 +609,7 @@ async function createFinalPackageFixture(
     caption: "FrontMind超前智能官方主 Logo",
     alt: "FrontMind超前智能 Logo",
     branchId: "products",
-    documentIds: ["1.1"],
+    documentIds: [`${input.archiveLeafIdPrefix || ""}1.1`],
     sourcePageUrl: "https://www.frontmind.net/",
     sourceAssetUrl: "https://www.frontmind.net/frontmind-logo.png",
     sourceKind: "official_web",
@@ -636,7 +651,7 @@ async function createFinalPackageFixture(
   zip.file(
     `${root}/00_package_manifest.json`,
     JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: input.schemaVersion ?? 3,
       profile: "dashboard-enterprise-v1",
       buildRevision,
       documents,
@@ -2296,9 +2311,28 @@ describe("knowledge-base production final-package acceptance", () => {
     const fixture = await createFinalPackageFixture({
       leafCount: finalRevision,
       buildRevision: finalRevision,
+      schemaVersion: 4,
+      archiveLeafIdPrefix: "leaf-",
+      driftLastPackagedLeaf: true,
     });
+    const sealedArchive = await canonicalizeKnowledgeBaseFinalArchive({
+      buffer: fixture.archive,
+      nodes: fixture.leaves.map((leaf, ordinal) => ({
+        leafId: leaf.id,
+        title: leaf.title,
+        branchId: "products",
+        branchTitle: "产品与服务",
+        ordinal,
+        status: "confirmed",
+        contentMarkdown: leaf.contentMarkdown,
+        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
+      })),
+      buildRevision: finalRevision,
+    });
+    expect(sealedArchive.changed).toBe(true);
+    expect(sealedArchive.buffer.equals(fixture.archive)).toBe(false);
     const archiveSha256 = createHash("sha256")
-      .update(fixture.archive)
+      .update(sealedArchive.buffer)
       .digest("hex");
     const artifactStore = await import("./knowledge-build-artifact-store");
     const persistedLogo = await artifactStore.persistKnowledgeBuildArtifact({
@@ -2677,7 +2711,7 @@ describe("knowledge-base production final-package acceptance", () => {
           revision: finalRevision,
           fileId: "file-late-final-package",
           sha256: archiveSha256,
-          sizeBytes: fixture.archive.length,
+          sizeBytes: sealedArchive.buffer.length,
         },
       });
       expect(taskReads).toBe(1);
@@ -2712,7 +2746,7 @@ describe("knowledge-base production final-package acceptance", () => {
         packageDescriptorHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
         packageStorageKey: expect.any(String),
         packageArchiveSha256: archiveSha256,
-        packageSizeBytes: fixture.archive.length,
+        packageSizeBytes: sealedArchive.buffer.length,
         protocolError: null,
         protocolErrorCode: null,
       });
@@ -2732,9 +2766,9 @@ describe("knowledge-base production final-package acceptance", () => {
           kind: "package",
           storageKey: state.builds[0]!.packageStorageKey,
           expectedSha256: archiveSha256,
-          expectedBytes: fixture.archive.length,
+          expectedBytes: sealedArchive.buffer.length,
         }),
-      ).resolves.toEqual(fixture.archive);
+      ).resolves.toEqual(sealedArchive.buffer);
 
       const stableEpoch = state.builds[0]!.stateEpoch;
       const repeatedResponse = await reconcile();
@@ -2780,9 +2814,28 @@ describe("knowledge-base production final-package acceptance", () => {
     const fixture = await createFinalPackageFixture({
       leafCount: finalRevision,
       buildRevision: finalRevision,
+      schemaVersion: 4,
+      archiveLeafIdPrefix: "leaf-",
+      driftLastPackagedLeaf: true,
     });
+    const sealedArchive = await canonicalizeKnowledgeBaseFinalArchive({
+      buffer: fixture.archive,
+      nodes: fixture.leaves.map((leaf, ordinal) => ({
+        leafId: leaf.id,
+        title: leaf.title,
+        branchId: "products",
+        branchTitle: "产品与服务",
+        ordinal,
+        status: "confirmed",
+        contentMarkdown: leaf.contentMarkdown,
+        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
+      })),
+      buildRevision: finalRevision,
+    });
+    expect(sealedArchive.changed).toBe(true);
+    expect(sealedArchive.buffer.equals(fixture.archive)).toBe(false);
     const archiveSha256 = createHash("sha256")
-      .update(fixture.archive)
+      .update(sealedArchive.buffer)
       .digest("hex");
     const artifactStore = await import("./knowledge-build-artifact-store");
     const persistedLogo = await artifactStore.persistKnowledgeBuildArtifact({
@@ -2852,30 +2905,6 @@ describe("knowledge-base production final-package acceptance", () => {
       expect(req.header("idempotency-key")).toBe(
         createKnowledgeBaseUpstreamIdempotencyKey(retryOperationKey),
       );
-      const progressText = formatKnowledgeBaseProgressEnvelope({
-        kind: "frontmind.knowledge-base.progress",
-        schemaVersion: 2,
-        operationId: retryOperationKey,
-        turnId: retryTurnId,
-        revision: priorRevision,
-        transition: {
-          leafId: `1.${finalRevision}`,
-          from: "current",
-          to: "confirmed",
-          reason: "重试轮确认最后节点",
-        },
-      });
-      const presentationText = formatKnowledgeBasePresentationEnvelope({
-        kind: "frontmind.knowledge-base.presentation",
-        schemaVersion: 2,
-        operationId: retryOperationKey,
-        turnId: retryTurnId,
-        revision: finalRevision,
-        leafId: null,
-        imageState: "not_applicable",
-        assetIds: [],
-        imageCount: 0,
-      });
       retryTaskOutput = [
         {
           id: "assistant-final-package-retry",
@@ -2887,8 +2916,7 @@ describe("knowledge-base production final-package acceptance", () => {
               text: {
                 value: [
                   `1.${finalRevision} 已确认。`,
-                  progressText,
-                  presentationText,
+                  '<!-- FRONTMIND_KB_PROGRESS\n{"revision":45,"node":"1.45","nodeTitle":"知识节点 45","status":"confirmed","action":"final_package","totalLeaves":45,"confirmedLeaves":45,"pendingLeaves":0,"currentLeafOrder":44,"schemaVersion":4,"buildProfile":"dashboard-enterprise-v1","validationResult":"VALID"}\n-->',
                 ].join("\n"),
               },
             },
@@ -3178,7 +3206,7 @@ describe("knowledge-base production final-package acceptance", () => {
             revision: finalRevision,
             fileId: "file-final-package-retry",
             sha256: archiveSha256,
-            sizeBytes: fixture.archive.length,
+            sizeBytes: sealedArchive.buffer.length,
           },
         },
       });
@@ -3231,7 +3259,7 @@ describe("knowledge-base production final-package acceptance", () => {
         packageDescriptorHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
         packageStorageKey: expect.any(String),
         packageArchiveSha256: archiveSha256,
-        packageSizeBytes: fixture.archive.length,
+        packageSizeBytes: sealedArchive.buffer.length,
         protocolError: null,
         protocolErrorCode: null,
       });
@@ -3252,9 +3280,9 @@ describe("knowledge-base production final-package acceptance", () => {
           kind: "package",
           storageKey: state.builds[0]!.packageStorageKey,
           expectedSha256: archiveSha256,
-          expectedBytes: fixture.archive.length,
+          expectedBytes: sealedArchive.buffer.length,
         }),
-      ).resolves.toEqual(fixture.archive);
+      ).resolves.toEqual(sealedArchive.buffer);
 
       const stableEpoch = state.builds[0]!.stateEpoch;
       const repeatedReconcile = await fetch(

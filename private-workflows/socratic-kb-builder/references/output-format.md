@@ -85,8 +85,8 @@ Use this exact top-level contract. Extra fields are forbidden:
       "contentStatus": "complete"
     },
     {
-      "id": "leaf-product-family-a",
-      "path": "branches/products/family-a.md",
+      "id": "3.1",
+      "path": "branches/products/3.1_family-a.md",
       "kind": "leaf",
       "title": "产品族 A",
       "branchId": "products",
@@ -125,7 +125,7 @@ Use this exact top-level contract. Extra fields are forbidden:
       "caption": "企业官方 Logo",
       "alt": "企业 Logo",
       "branchId": "products",
-      "documentIds": ["leaf-product-family-a"],
+      "documentIds": ["3.1"],
       "sourcePageUrl": "https://official.example/",
       "sourceAssetUrl": "https://official.example/media/logo.png",
       "sourceKind": "official_web",
@@ -144,7 +144,7 @@ Use this exact top-level contract. Extra fields are forbidden:
       "caption": "客户补充的办公地点图片",
       "alt": "办公地点",
       "branchId": "products",
-      "documentIds": ["leaf-product-family-a"],
+      "documentIds": ["3.1"],
       "sourceKind": "user_upload",
       "sourceUploadSha256": "64-lowercase-hex-characters-for-original-upload",
       "sourceUploadFilename": "office-photo.svg",
@@ -233,9 +233,19 @@ evidence and index documents do not participate in this sequence. The one
 formal-content block in each leaf file must be the exact server-approved leaf
 Markdown, not a rewritten final-report variant.
 
+The leaf document `id` must be the byte-exact `id` from the original
+`FRONTMIND_KB_MANIFEST` leaf, for example `3.1`. Never add `leaf-`, `node-` or
+any other prefix/suffix and never invent an archive-only alias. Every asset
+`documentIds` value must use those same exact manifest leaf IDs. `assetIds` and
+`documentIds` remain bidirectional.
+
 `buildRevision` is not an example to copy blindly. On the final turn it must
 equal the service-supplied post-transition revision in that turn's
 `FRONTMIND_KB_PROGRESS` and `FRONTMIND_KB_PRESENTATION` envelopes.
+The conversational envelopes always retain their service-supplied
+`schemaVersion: 2`; archive `schemaVersion: 4` appears only inside
+`00_package_manifest.json` and must never be copied into a progress or
+presentation envelope.
 
 Allowed document kinds are `overview`, `leaf`, `evidence`, `report`, and
 `index`. Allowed evidence states are `verified_first_party`,

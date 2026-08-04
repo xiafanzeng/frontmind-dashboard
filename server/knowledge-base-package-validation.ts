@@ -141,6 +141,17 @@ export function canonicalPackagedKnowledgeBaseLeafMarkdown(value: string) {
 }
 
 /**
+ * Initial v4 presentations from some providers already contain the package's
+ * formal-content markers. Treat the single marked body as the approved leaf;
+ * later presentations, which normally have no markers, remain byte-bound as
+ * the complete projected Markdown. This prevents an impossible nested-marker
+ * requirement while retaining the durable hash check for the stored value.
+ */
+export function canonicalApprovedKnowledgeBaseLeafMarkdown(value: string) {
+  return canonicalPackagedKnowledgeBaseLeafMarkdown(value);
+}
+
+/**
  * Bind a validated enterprise archive to the exact build that the customer
  * confirmed. Package self-consistency is not enough: a model could otherwise
  * replace one leaf with another while keeping counts and manifest hashes valid.
@@ -196,6 +207,27 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
     documentsById.set(id, document);
   }
 
+  const documentIdByLeafId = new Map<string, string>();
+  const leafIdByDocumentId = new Map<string, string>();
+  for (const node of handledNodes) {
+    const leafId = normalizedIdentity(node.leafId);
+    const acceptedDocumentIds =
+      input.packageSchemaVersion === 4 ? [leafId, `leaf-${leafId}`] : [leafId];
+    const matches = acceptedDocumentIds.filter((id) => documentsById.has(id));
+    if (matches.length === 0) {
+      throw new KnowledgeBasePackageBindingError(
+        `最终 ZIP 缺少已确认节点：${node.leafId}`,
+      );
+    }
+    if (matches.length !== 1 || leafIdByDocumentId.has(matches[0]!)) {
+      throw new KnowledgeBasePackageBindingError(
+        `最终 ZIP 节点标识无法与已确认版本唯一对应：${node.leafId}`,
+      );
+    }
+    documentIdByLeafId.set(node.leafId, matches[0]!);
+    leafIdByDocumentId.set(matches[0]!, node.leafId);
+  }
+
   if (input.legacyV3Compatibility) {
     const orderedDocuments = [...leafDocuments].sort((left, right) => {
       const leftOrder = left.order;
@@ -221,7 +253,8 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
   }
 
   for (const node of handledNodes) {
-    const document = documentsById.get(node.leafId);
+    const documentId = documentIdByLeafId.get(node.leafId);
+    const document = documentId ? documentsById.get(documentId) : undefined;
     if (!document) {
       throw new KnowledgeBasePackageBindingError(
         `最终 ZIP 缺少已确认节点：${node.leafId}`,
@@ -251,20 +284,23 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
     const packagedContent = canonicalPackagedKnowledgeBaseLeafMarkdown(
       document.content,
     );
-    const acceptedContent = canonicalKnowledgeBaseMarkdown(
+    const storedContent = canonicalKnowledgeBaseMarkdown(
       node.contentMarkdown || "",
     );
+    const acceptedContent =
+      canonicalApprovedKnowledgeBaseLeafMarkdown(storedContent);
     if (!packagedContent || !acceptedContent) {
       throw new KnowledgeBasePackageBindingError(
         `最终 ZIP 或已确认节点正文为空：${node.leafId}`,
       );
     }
-    const acceptedHash = knowledgeBaseMarkdownSha256(acceptedContent);
-    if (node.contentSha256 && node.contentSha256 !== acceptedHash) {
+    const storedHash = knowledgeBaseMarkdownSha256(storedContent);
+    if (node.contentSha256 && node.contentSha256 !== storedHash) {
       throw new KnowledgeBasePackageBindingError(
         `数据库节点正文哈希无效：${node.leafId}`,
       );
     }
+    const acceptedHash = knowledgeBaseMarkdownSha256(acceptedContent);
     if (
       input.requireExactContent !== false &&
       knowledgeBaseMarkdownSha256(packagedContent) !== acceptedHash
@@ -441,7 +477,13 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
         .filter(Boolean)
         .sort();
       const packagedLeafIds = [
-        ...new Set((asset.documentIds || []).map(normalizedIdentity)),
+        ...new Set(
+          (asset.documentIds || [])
+            .map(normalizedIdentity)
+            .map(
+              (documentId) => leafIdByDocumentId.get(documentId) || documentId,
+            ),
+        ),
       ]
         .filter(Boolean)
         .sort();

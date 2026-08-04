@@ -280,6 +280,71 @@ describe("knowledge-base final package binding", () => {
     ).toMatchObject({ customerUploadCount: 1 });
   });
 
+  it("safely maps the exact legacy leaf- alias without rewriting asset references", () => {
+    const input = fixture();
+    input.documents[0]!.id = "leaf-1.1";
+    input.documents[1]!.id = "leaf-1.2";
+    input.assets[0]!.sourceKind = "official_web";
+    input.assets.push({
+      id: "customer-office",
+      key: "customer-office.png",
+      path: "09_media_assets/customer-office.png",
+      mimeType: "image/png",
+      size: 88,
+      sha256: customerSha256,
+      branchId: "identity",
+      documentIds: ["leaf-1.2"],
+      sourceKind: "user_upload",
+      sourceUploadSha256: customerSha256,
+      sourceUploadFilename: "office.png",
+      sourceUploadMimeType: "image/png",
+      ownership: "first_party",
+      assetType: "customer_supplied",
+      displayRole: "inline",
+    });
+
+    expect(
+      assertKnowledgeBasePackageMatchesBuild({
+        ...input,
+        packageSchemaVersion: 4,
+        expectedCustomerUploads: [
+          {
+            sourceSha256: customerSha256,
+            leafIds: ["1.2"],
+            filenames: ["office.png"],
+            mimeTypes: ["image/png"],
+          },
+        ],
+      }),
+    ).toMatchObject({ leafCount: 2, customerUploadCount: 1 });
+    expect(input.documents.map((document) => document.id)).toEqual([
+      "leaf-1.1",
+      "leaf-1.2",
+    ]);
+    expect(input.assets[1]!.documentIds).toEqual(["leaf-1.2"]);
+  });
+
+  it("rejects an ambiguous raw-plus-prefixed v4 leaf identity", () => {
+    const input = fixture();
+    input.documents[1] = { ...input.documents[0]!, id: "leaf-1.1" };
+    expect(() =>
+      assertKnowledgeBasePackageMatchesBuild({
+        ...input,
+        packageSchemaVersion: 4,
+      }),
+    ).toThrow("节点标识无法与已确认版本唯一对应：1.1");
+  });
+
+  it("accepts one formal block already stored in the approved presentation", () => {
+    const input = fixture();
+    const stored = `# 外层首轮展示\n\n<!-- FRONTMIND_FORMAL_CONTENT_START -->\n\n## 1.1 一句话定位\n\nFrontMind 超前智能。\n\n<!-- FRONTMIND_FORMAL_CONTENT_END -->\n\n## 内部证据`;
+    input.nodes[0]!.contentMarkdown = stored;
+    input.nodes[0]!.contentSha256 = knowledgeBaseMarkdownSha256(stored);
+    input.documents[0]!.content = `# 成品外壳\n\n<!-- FRONTMIND_FORMAL_CONTENT_START -->\n\n## 1.1 一句话定位\n\nFrontMind 超前智能。\n\n<!-- FRONTMIND_FORMAL_CONTENT_END -->\n\n## 另一份内部证据`;
+
+    expect(() => assertKnowledgeBasePackageMatchesBuild(input)).not.toThrow();
+  });
+
   it("binds a dedicated official Logo upload without counting it as a customer image", () => {
     expect(
       assertKnowledgeBasePackageMatchesBuild(officialLogoUploadFixture()),

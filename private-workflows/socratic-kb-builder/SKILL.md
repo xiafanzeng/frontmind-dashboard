@@ -345,6 +345,13 @@ generated soon or later is not a deliverable. Set
 post-transition revision for that final turn. Preserve the existing
 `00_completeness.json` raw-count contract. Include:
 
+Archive `schemaVersion: 4` applies only to `00_package_manifest.json`. The
+same final response must still copy the service-generated
+`FRONTMIND_KB_PROGRESS` and `FRONTMIND_KB_PRESENTATION` envelopes exactly with
+their `schemaVersion: 2`, operation identity and revisions. Never replace that
+pair with an archive summary, `action: final_package`, package hash/byte fields
+or any other invented top-level progress fields.
+
 - `README.md`, `00_knowledge_tree.md`, `00_completeness.json`,
   `00_package_manifest.json`, `00_crawl_coverage_report.md`,
   `00_web_intelligence_report.md`, `00_source_index.md`,
@@ -358,7 +365,10 @@ post-transition revision for that final turn. Preserve the existing
 
 For every `kind: "leaf"` entry, copy the manifest leaf's exact `id`, `title`,
 `branchId` and `branchTitle`; set `order` to its zero-based position in the
-original manifest `leaves` array. Inside the leaf file, the one
+original manifest `leaves` array. The document `id` and every asset
+`documentIds` reference must use that byte-exact manifest leaf ID (for example
+`3.1`), never `leaf-3.1`, `node-3.1` or another archive-only alias. Inside the
+leaf file, the one
 `FRONTMIND_FORMAL_CONTENT_START/END` block must contain the exact
 server-approved Markdown for that leaf (canonical line endings and trailing
 whitespace are the only permitted normalization). Do not rewrite, summarize,

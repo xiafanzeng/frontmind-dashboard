@@ -42,6 +42,12 @@ import {
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
 import {
+  createKnowledgeBaseAuthoritativeFinalOutput,
+  deriveKnowledgeBaseAuthoritativeFinalizationPlan,
+  hasKnowledgeBaseCompleteFinalProtocol,
+  selectKnowledgeBaseAuthoritativeFinalDescriptor,
+} from "./knowledge-base-finalization";
+import {
   knowledgeBaseCustomerUploadResources,
   knowledgeBaseOfficialLogoUploadFromTurn,
 } from "./knowledge-base-customer-upload";
@@ -2355,7 +2361,40 @@ export async function resumeKnowledgeBaseFinalPackageMissing(input: {
       },
       { requireExplicitResourceOperation: true },
     );
-    if (collectKnowledgeArchiveDescriptors(operationOutput).length === 0) {
+    const action = classifyKnowledgeBaseUserAction(
+      build.lastTurnUserText || "",
+      build.lastTurnAttachmentCount || 0,
+    );
+    const transitionTarget =
+      action === "confirm"
+        ? ("confirmed" as const)
+        : action === "direct_prefill"
+          ? ("direct_prefilled" as const)
+          : undefined;
+    const rows = await loadNodes(tx, build.id);
+    const finalizationPlan = deriveKnowledgeBaseAuthoritativeFinalizationPlan({
+      build: { ...build, status: "confirming" },
+      activeTurn: { ...turn, status: "running" },
+      nodes: rows.map((node) => ({
+        leafId: node.leafId,
+        title: node.title,
+        branchId: node.branchId,
+        branchTitle: node.branchTitle,
+        ordinal: node.ordinal,
+        status: node.status,
+        contentMarkdown: node.contentMarkdown,
+        contentSha256: node.contentSha256,
+      })),
+      transitionTarget,
+    });
+    if (
+      !finalizationPlan ||
+      !selectKnowledgeBaseAuthoritativeFinalDescriptor({
+        output: input.output,
+        scopedOutput: operationOutput,
+        plan: finalizationPlan,
+      })
+    ) {
       // Cumulative provider output may still contain an older operation's ZIP.
       // It is never authority to revive this failed final turn.
       return false;
@@ -2791,12 +2830,22 @@ export async function reconcileKnowledgeBaseProgress(input: {
         );
       }
 
+      const userText =
+        input.userText !== undefined
+          ? String(input.userText)
+          : String(build.lastTurnUserText || "");
+      const attachmentCount =
+        input.attachmentCount !== undefined
+          ? Math.max(0, Math.trunc(input.attachmentCount || 0))
+          : Math.max(0, build.lastTurnAttachmentCount || 0);
+      const action = classifyKnowledgeBaseUserAction(userText, attachmentCount);
+
       // Providers may return the complete task history in any poll. Select
       // only the active operation/turn window before extracting Markdown,
       // resources or calculating the semantic reconciliation hash. Later
       // turns require explicit image ownership so an unscoped Logo from the
       // initial Manifest can never be attributed to a confirmation turn.
-      const authoritativeOutput =
+      const protocolScopedOutput =
         build.skillVersion === "4" && activeTurn?.operationKey
           ? selectKnowledgeBaseProtocolOperationOutput(
               Array.isArray(input.output) ? input.output : [],
@@ -2819,17 +2868,57 @@ export async function reconcileKnowledgeBaseProgress(input: {
               },
             )
           : input.output;
+      const transitionTarget =
+        action === "confirm"
+          ? ("confirmed" as const)
+          : action === "direct_prefill"
+            ? ("direct_prefilled" as const)
+            : undefined;
+      const finalizationPlan = deriveKnowledgeBaseAuthoritativeFinalizationPlan(
+        {
+          build,
+          activeTurn,
+          nodes: rows.map((node) => ({
+            leafId: node.leafId,
+            title: node.title,
+            branchId: node.branchId,
+            branchTitle: node.branchTitle,
+            ordinal: node.ordinal,
+            status: node.status,
+            contentMarkdown: node.contentMarkdown,
+            contentSha256: node.contentSha256,
+          })),
+          transitionTarget,
+        },
+      );
+      const finalDescriptor =
+        finalizationPlan && input.stagedArtifacts?.package
+          ? selectKnowledgeBaseAuthoritativeFinalDescriptor({
+              output: input.output,
+              scopedOutput: protocolScopedOutput,
+              plan: finalizationPlan,
+            })
+          : null;
+      const scopedProtocolComplete = finalizationPlan
+        ? hasKnowledgeBaseCompleteFinalProtocol({
+            assistantText:
+              extractFinalKnowledgeBaseAssistantText(protocolScopedOutput),
+            plan: finalizationPlan,
+          })
+        : false;
+      const authoritativeOutput =
+        finalizationPlan &&
+        finalDescriptor &&
+        !scopedProtocolComplete &&
+        input.stagedArtifacts?.package?.sourceDescriptorHash ===
+          knowledgeArchivePhysicalDescriptorHash(finalDescriptor)
+          ? createKnowledgeBaseAuthoritativeFinalOutput({
+              descriptor: finalDescriptor,
+              plan: finalizationPlan,
+            })
+          : protocolScopedOutput;
       const text = assertKnowledgeBaseCustomerOutput(authoritativeOutput);
       const audit = modelOutputAudit(text);
-      const userText =
-        input.userText !== undefined
-          ? String(input.userText)
-          : String(build.lastTurnUserText || "");
-      const attachmentCount =
-        input.attachmentCount !== undefined
-          ? Math.max(0, Math.trunc(input.attachmentCount || 0))
-          : Math.max(0, build.lastTurnAttachmentCount || 0);
-      const action = classifyKnowledgeBaseUserAction(userText, attachmentCount);
       const hash = reconciliationHash({
         taskId: input.taskId || build.upstreamTaskId || undefined,
         assistantText: text,

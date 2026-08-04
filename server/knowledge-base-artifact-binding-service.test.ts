@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import {
   assertKnowledgeBaseOfficialLogoMimeMatches,
   collectKnowledgeBaseLogoDescriptors,
+  knowledgeBaseRecoveredPackageMatchesStoredHash,
   knowledgeBaseStagedArtifactCleanupDecision,
   selectKnowledgeBaseRecoveryLogoAsset,
   selectKnowledgeBaseReadyPackageDescriptor,
@@ -318,5 +321,36 @@ describe("historical ready-package backfill selection", () => {
         identity,
       }),
     ).toThrowError(expect.objectContaining({ code: "PACKAGE_AMBIGUOUS" }));
+  });
+});
+
+describe("historical v4 package hash recovery", () => {
+  const providerBuffer = Buffer.from("provider-v4-archive\r\n", "utf8");
+  const authoritativeBuffer = Buffer.from("provider-v4-archive\n", "utf8");
+  const sha256 = (buffer: Buffer) =>
+    createHash("sha256").update(buffer).digest("hex");
+
+  it("accepts either the legacy provider hash or the newly sealed hash", () => {
+    expect(
+      knowledgeBaseRecoveredPackageMatchesStoredHash({
+        expectedSha256: sha256(providerBuffer),
+        providerBuffer,
+        authoritativeBuffer,
+      }),
+    ).toBe(true);
+    expect(
+      knowledgeBaseRecoveredPackageMatchesStoredHash({
+        expectedSha256: sha256(authoritativeBuffer),
+        providerBuffer,
+        authoritativeBuffer,
+      }),
+    ).toBe(true);
+    expect(
+      knowledgeBaseRecoveredPackageMatchesStoredHash({
+        expectedSha256: "0".repeat(64),
+        providerBuffer,
+        authoritativeBuffer,
+      }),
+    ).toBe(false);
   });
 });

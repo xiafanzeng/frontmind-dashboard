@@ -32,6 +32,13 @@ import {
   assertKnowledgeBasePackageMatchesBuild,
   selectLegacyKnowledgeBaseLogoAsset,
 } from "./knowledge-base-package-validation";
+import { canonicalizeKnowledgeBaseFinalArchive } from "./knowledge-base-package-canonicalization";
+import {
+  createKnowledgeBaseAuthoritativeFinalOutput,
+  deriveKnowledgeBaseAuthoritativeFinalizationPlan,
+  hasKnowledgeBaseCompleteFinalProtocol,
+  selectKnowledgeBaseAuthoritativeFinalDescriptor,
+} from "./knowledge-base-finalization";
 import {
   assertKnowledgeBaseCustomerUploadVisualBindings,
   verifiedKnowledgeBaseCustomerUploadsForBuild,
@@ -57,6 +64,7 @@ import {
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
 import {
+  classifyKnowledgeBaseUserAction,
   collectTrustedKnowledgeBaseOutputImageDescriptors,
   extractFinalKnowledgeBaseAssistantText,
   knowledgeBaseOutputImageDescriptorHash,
@@ -248,6 +256,21 @@ export function selectKnowledgeBaseReadyPackageDescriptor(input: {
     );
   }
   return candidates[0]!;
+}
+
+export function knowledgeBaseRecoveredPackageMatchesStoredHash(input: {
+  expectedSha256: string;
+  providerBuffer: Buffer;
+  authoritativeBuffer: Buffer;
+}) {
+  const providerSha256 = createHash("sha256")
+    .update(input.providerBuffer)
+    .digest("hex");
+  if (input.expectedSha256 === providerSha256) return true;
+  const authoritativeSha256 = createHash("sha256")
+    .update(input.authoritativeBuffer)
+    .digest("hex");
+  return input.expectedSha256 === authoritativeSha256;
 }
 
 export function knowledgeBaseStagedArtifactCleanupDecision(input: {
@@ -1076,7 +1099,37 @@ export async function bindKnowledgeBaseFinalPackage(input: {
   baseUrl: string;
 }) {
   const { db, build, activeTurn } = await loadBoundBuild(input);
-  const operationOutput =
+  const nodes = await db
+    .select()
+    .from(knowledgeBaseBuildNodes)
+    .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
+  const transitionTarget = (() => {
+    const action = classifyKnowledgeBaseUserAction(
+      build.lastTurnUserText || "",
+      build.lastTurnAttachmentCount || 0,
+    );
+    return action === "confirm" || action === "direct_prefill"
+      ? action === "confirm"
+        ? ("confirmed" as const)
+        : ("direct_prefilled" as const)
+      : undefined;
+  })();
+  const finalizationPlan = deriveKnowledgeBaseAuthoritativeFinalizationPlan({
+    build,
+    activeTurn,
+    nodes: nodes.map((node) => ({
+      leafId: node.leafId,
+      title: node.title,
+      branchId: node.branchId,
+      branchTitle: node.branchTitle,
+      ordinal: node.ordinal,
+      status: node.status,
+      contentMarkdown: node.contentMarkdown,
+      contentSha256: node.contentSha256,
+    })),
+    transitionTarget,
+  });
+  const scopedOperationOutput =
     build.skillVersion === "4"
       ? selectKnowledgeBaseProtocolOperationOutput(
           Array.isArray(input.output) ? input.output : [],
@@ -1090,7 +1143,40 @@ export async function bindKnowledgeBaseFinalPackage(input: {
           { requireExplicitResourceOperation: true },
         )
       : input.output;
+  const authoritativeDescriptor = finalizationPlan
+    ? selectKnowledgeBaseAuthoritativeFinalDescriptor({
+        output: input.output,
+        scopedOutput: scopedOperationOutput,
+        plan: finalizationPlan,
+      })
+    : null;
+  const scopedProtocolComplete = finalizationPlan
+    ? hasKnowledgeBaseCompleteFinalProtocol({
+        assistantText: extractFinalKnowledgeBaseAssistantText(
+          scopedOperationOutput,
+        ),
+        plan: finalizationPlan,
+      })
+    : false;
+  const operationOutput =
+    finalizationPlan && authoritativeDescriptor && !scopedProtocolComplete
+      ? createKnowledgeBaseAuthoritativeFinalOutput({
+          descriptor: authoritativeDescriptor,
+          plan: finalizationPlan,
+        })
+      : scopedOperationOutput;
   const descriptors = collectKnowledgeArchiveDescriptors(operationOutput);
+  if (
+    build.skillVersion === "4" &&
+    !finalizationPlan &&
+    descriptors.length === 0 &&
+    collectKnowledgeArchiveDescriptors(input.output).length > 0
+  ) {
+    throw new KnowledgeBaseArtifactBindingError(
+      "BUILD_CHANGED",
+      "累计输出中的 ZIP 不属于当前最终确认操作，已安全忽略",
+    );
+  }
   if (descriptors.length === 0) {
     throw new KnowledgeBaseArtifactBindingError(
       "PACKAGE_NOT_READY",
@@ -1171,7 +1257,8 @@ export async function bindKnowledgeBaseFinalPackage(input: {
     baseUrl: input.baseUrl,
   });
   const validationSnapshotId = randomUUID();
-  const parsed = await readKnowledgeArchive(
+  let authoritativeArchiveBuffer: Buffer = Buffer.from(downloaded.buffer);
+  let parsed = await readKnowledgeArchive(
     downloaded.buffer,
     downloaded.filename,
     validationSnapshotId,
@@ -1186,6 +1273,7 @@ export async function bindKnowledgeBaseFinalPackage(input: {
             : [2, 3],
     },
   );
+  const storedAssetKeys = [...parsed.storedAssetKeys];
   let packageRevision = build.revision;
   let recoveredLogo:
     | {
@@ -1196,10 +1284,6 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       }
     | undefined;
   try {
-    const nodes = await db
-      .select()
-      .from(knowledgeBaseBuildNodes)
-      .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
     const state: KnowledgeBaseProgressState = {
       schemaVersion: 1,
       revision: build.revision,
@@ -1218,6 +1302,37 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       state,
       progressEnvelope,
     );
+    if (parsed.packageSchemaVersion === 4) {
+      const canonical = await canonicalizeKnowledgeBaseFinalArchive({
+        buffer: authoritativeArchiveBuffer,
+        nodes: nodes.map((node) => ({
+          leafId: node.leafId,
+          title: node.title,
+          branchId: node.branchId,
+          branchTitle: node.branchTitle,
+          ordinal: node.ordinal,
+          status:
+            nextState.leaves.find((leaf) => leaf.id === node.leafId)?.status ||
+            node.status,
+          contentMarkdown: node.contentMarkdown,
+          contentSha256: node.contentSha256,
+        })),
+        buildRevision: nextState.revision,
+      });
+      if (canonical.changed) {
+        authoritativeArchiveBuffer = canonical.buffer;
+        parsed = await readKnowledgeArchive(
+          authoritativeArchiveBuffer,
+          downloaded.filename,
+          randomUUID(),
+          {
+            validationProfile: "dashboard-enterprise-v1",
+            archiveContractVersions: [4],
+          },
+        );
+        storedAssetKeys.push(...parsed.storedAssetKeys);
+      }
+    }
     if (
       build.skillVersion === "4" &&
       parsed.packageBuildRevision !== nextState.revision
@@ -1316,7 +1431,7 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       });
     }
   } finally {
-    await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
+    await removeStoredKnowledgeAssets(storedAssetKeys);
   }
   if (build.skillVersion === "4") {
     if (!activeTurn?.operationKey) {
@@ -1336,7 +1451,7 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       operationKey: activeTurn.operationKey,
       descriptorHash: sourceDescriptorHash,
       kind: "package",
-      buffer: downloaded.buffer,
+      buffer: authoritativeArchiveBuffer,
     });
     return assertStagedCandidateStillAuthoritative({
       staged: true,
@@ -1613,17 +1728,9 @@ export async function bindKnowledgeBaseReadyPackage(input: {
     apiKey: input.apiKey,
     baseUrl: input.baseUrl,
   });
-  const downloadedSha256 = createHash("sha256")
-    .update(downloaded.buffer)
-    .digest("hex");
-  if (validPackageSha256 && validPackageSha256 !== downloadedSha256) {
-    throw new KnowledgeBaseArtifactBindingError(
-      "BUILD_CHANGED",
-      "历史知识库 ZIP 字节与持久化权威哈希不一致",
-    );
-  }
-  const parsed = await readKnowledgeArchive(
-    downloaded.buffer,
+  let authoritativeArchiveBuffer: Buffer = Buffer.from(downloaded.buffer);
+  let parsed = await readKnowledgeArchive(
+    authoritativeArchiveBuffer,
     downloaded.filename,
     randomUUID(),
     {
@@ -1637,6 +1744,7 @@ export async function bindKnowledgeBaseReadyPackage(input: {
             : [2, 3],
     },
   );
+  const storedAssetKeys = [...parsed.storedAssetKeys];
   let recoveredLogo:
     | {
         buffer: Buffer;
@@ -1646,6 +1754,52 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       }
     | undefined;
   try {
+    const nodes = await db
+      .select()
+      .from(knowledgeBaseBuildNodes)
+      .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
+    if (parsed.packageSchemaVersion === 4) {
+      const canonical = await canonicalizeKnowledgeBaseFinalArchive({
+        buffer: authoritativeArchiveBuffer,
+        nodes: nodes.map((node) => ({
+          leafId: node.leafId,
+          title: node.title,
+          branchId: node.branchId,
+          branchTitle: node.branchTitle,
+          ordinal: node.ordinal,
+          status: node.status,
+          contentMarkdown: node.contentMarkdown,
+          contentSha256: node.contentSha256,
+        })),
+        buildRevision: build.revision,
+      });
+      if (canonical.changed) {
+        authoritativeArchiveBuffer = canonical.buffer;
+        parsed = await readKnowledgeArchive(
+          authoritativeArchiveBuffer,
+          downloaded.filename,
+          randomUUID(),
+          {
+            validationProfile: "dashboard-enterprise-v1",
+            archiveContractVersions: [4],
+          },
+        );
+        storedAssetKeys.push(...parsed.storedAssetKeys);
+      }
+    }
+    if (
+      validPackageSha256 &&
+      !knowledgeBaseRecoveredPackageMatchesStoredHash({
+        expectedSha256: validPackageSha256,
+        providerBuffer: downloaded.buffer,
+        authoritativeBuffer: authoritativeArchiveBuffer,
+      })
+    ) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "BUILD_CHANGED",
+        "历史知识库 ZIP 字节与持久化权威哈希不一致",
+      );
+    }
     if (
       build.skillVersion === "4" &&
       parsed.packageBuildRevision !== build.revision
@@ -1679,10 +1833,6 @@ export async function bindKnowledgeBaseReadyPackage(input: {
         sha256,
       };
     }
-    const nodes = await db
-      .select()
-      .from(knowledgeBaseBuildNodes)
-      .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
     const expectedCustomerUploads =
       build.skillVersion === "4"
         ? await verifiedKnowledgeBaseCustomerUploadsForBuild({
@@ -1727,7 +1877,7 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       });
     }
   } finally {
-    await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
+    await removeStoredKnowledgeAssets(storedAssetKeys);
   }
 
   let persistedLogo:
@@ -1752,7 +1902,7 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       buildId: input.buildId,
       generation: input.generation,
       kind: "package",
-      buffer: downloaded.buffer,
+      buffer: authoritativeArchiveBuffer,
     });
   } catch (error) {
     if (persistedLogo) {
