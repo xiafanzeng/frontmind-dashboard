@@ -194,7 +194,7 @@ describe("ResponseLogicWorkspace", () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
     const fetchMock = vi.fn().mockResolvedValue(
-      new Response(new Blob(["image"], { type: "image/png" }), {
+      new Response("image", {
         status: 200,
         headers: { "Content-Type": "image/png" },
       }),
