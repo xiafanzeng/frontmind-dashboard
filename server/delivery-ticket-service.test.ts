@@ -679,6 +679,22 @@ describe("customer delivery-ticket DTO boundary", () => {
     expect(value).not.toHaveProperty("deliveryLinks");
   });
 
+  it("labels the monitoring engineer's question catalog ticket in Chinese", () => {
+    const value = toPublicDeliveryTicketSummary({
+      ...internalTicket,
+      type: "website_operation",
+      category: "question_catalog",
+      operation: "question_catalog",
+      workflowDomain: "monitoring_optimization_engineer",
+    } as any);
+
+    expect(value).toMatchObject({
+      type: "website_operation",
+      category: "question_catalog",
+      categoryLabel: "品牌词库与问题目录",
+    });
+  });
+
   it("validates public dialogue details for website and content tickets", () => {
     const websiteTicket = toPublicDeliveryTicketSummary({
       ...internalTicket,

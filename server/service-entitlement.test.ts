@@ -725,7 +725,7 @@ describe("service portal derivation", () => {
           authenticatedKnowledgeVersion: 2,
         }),
       ).nextAction.kind,
-    ).toBe("generate_question_candidates");
+    ).toBe("await_question_catalog");
     expect(
       deriveServicePortalState(
         state("advanced", {

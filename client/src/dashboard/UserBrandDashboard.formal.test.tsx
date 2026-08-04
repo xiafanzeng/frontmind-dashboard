@@ -1150,6 +1150,40 @@ describe("UserBrandDashboard formal workspace", () => {
   });
 
   it("renders the managed keyword module without exposing the retired content-system page", () => {
+    deliveryListUseInfiniteQuery.mockImplementation((input) => ({
+      data: {
+        pages: [
+          {
+            tickets:
+              input?.type === "website_operation"
+                ? [
+                    {
+                      id: "bd6251d8-991a-4b79-a2d7-7cfd82a12a4e",
+                      type: "website_operation",
+                      category: "question_catalog",
+                      categoryLabel: "品牌词库与问题目录",
+                      topic: "配置品牌词库与问题目录",
+                      publicStatus: "pending",
+                      publicStatusLabel: "待受理",
+                      publicStage: "processing",
+                      publicStageLabel: "处理中",
+                      publicSummary: null,
+                    },
+                  ]
+                : [],
+            nextCursor: null,
+            hasMore: false,
+          },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+      error: null,
+      hasNextPage: false,
+      isFetchingNextPage: false,
+      fetchNextPage: deliveryListFetchNextPage,
+      refetch: vi.fn(),
+    }));
     render(<UserBrandDashboard />);
 
     expect(
@@ -1161,6 +1195,15 @@ describe("UserBrandDashboard formal workspace", () => {
     expect(
       screen.getByRole("heading", { name: "企业问题词库" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("AI 监控与优化工程师正在配置")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", {
+        name: "AI 监控与优化工程师发布的正式词表",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /生成候选问题/ }),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("如何选择新企业？")).toBeInTheDocument();
     expect(screen.queryByText(/香港中文大学/)).toBeNull();
   });

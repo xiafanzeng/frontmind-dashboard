@@ -339,6 +339,40 @@ function assetSource(asset: KnowledgeDisplayAsset) {
   return asset.sourcePageUrl || asset.source;
 }
 
+const KNOWLEDGE_BRANCH_LABELS: Record<string, string> = {
+  identity: "企业身份",
+  company: "企业信息",
+  "company-identity": "企业身份",
+  team: "团队与组织",
+  products: "产品与服务",
+  product: "产品与服务",
+  capabilities: "能力体系",
+  "core-capabilities": "核心能力",
+  industries: "行业与场景",
+  "customers-industries": "客户与行业",
+  cases: "案例与成果",
+  differentiation: "品牌差异化",
+  cooperation: "合作与支持",
+};
+
+function knowledgeDocumentCategory(document: KnowledgeDocument) {
+  const branchTitle = document.branchTitle?.trim();
+  if (branchTitle && /\p{Script=Han}/u.test(branchTitle)) return branchTitle;
+
+  const branchId = document.branchId?.trim().toLowerCase();
+  if (branchId) {
+    const normalizedBranchId = branchId
+      .replace(/^\d+[_-]*/, "")
+      .replace(/_/g, "-");
+    const localized =
+      KNOWLEDGE_BRANCH_LABELS[branchId] ||
+      KNOWLEDGE_BRANCH_LABELS[normalizedBranchId];
+    if (localized) return localized;
+  }
+
+  return document.kind === "overview" ? "分支综述" : "正式知识";
+}
+
 function KnowledgeImageGrid({
   assets,
   ariaLabel,
@@ -407,13 +441,13 @@ function KnowledgeImageGrid({
 export default function KnowledgeBaseViewer({
   snapshot,
   loading = false,
+  showArchiveDownload = true,
 }: {
   snapshot?: KnowledgeSnapshotView | null;
   loading?: boolean;
+  showArchiveDownload?: boolean;
 }) {
-  const [view, setView] = useState<"knowledge" | "evidence" | "assets">(
-    "knowledge",
-  );
+  const [view, setView] = useState<"knowledge" | "assets">("knowledge");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [assetPage, setAssetPage] = useState(0);
@@ -427,16 +461,6 @@ export default function KnowledgeBaseViewer({
       ) || [],
     [snapshot],
   );
-  const evidenceDocuments = useMemo(
-    () =>
-      snapshot?.documents.filter(
-        (document) =>
-          document.customerVisible === false ||
-          ["evidence", "report", "index"].includes(document.kind || ""),
-      ) || [],
-    [snapshot],
-  );
-
   useEffect(() => {
     setView("knowledge");
     setSelectedPath(
@@ -450,12 +474,7 @@ export default function KnowledgeBaseViewer({
 
   const filteredDocuments = useMemo(() => {
     if (!snapshot) return [];
-    const documents =
-      view === "evidence"
-        ? evidenceDocuments
-        : formalDocuments.length > 0
-          ? formalDocuments
-          : snapshot.documents;
+    const documents = formalDocuments;
     const keyword = search.trim().toLowerCase();
     if (!keyword) return documents;
     return documents.filter(
@@ -464,12 +483,12 @@ export default function KnowledgeBaseViewer({
         document.path.toLowerCase().includes(keyword) ||
         document.content.toLowerCase().includes(keyword),
     );
-  }, [evidenceDocuments, formalDocuments, search, snapshot, view]);
+  }, [formalDocuments, search, snapshot]);
 
   const selectedDocument =
-    snapshot?.documents.find((document) => document.path === selectedPath) ||
+    filteredDocuments.find((document) => document.path === selectedPath) ||
     filteredDocuments[0] ||
-    (view === "knowledge" ? formalDocuments[0] : evidenceDocuments[0]);
+    formalDocuments[0];
   const documentSections = useMemo(
     () =>
       selectedDocument ? splitMarkdownSections(selectedDocument.content) : [],
@@ -526,8 +545,9 @@ export default function KnowledgeBaseViewer({
   }
 
   return (
-    <div className="space-y-4">
-      {snapshot.sourceFileName.toLowerCase().endsWith(".zip") &&
+    <div className="space-y-3">
+      {showArchiveDownload &&
+        snapshot.sourceFileName.toLowerCase().endsWith(".zip") &&
         snapshot.archiveAvailable === true &&
         /^[a-f0-9]{64}$/i.test(snapshot.archiveHash || "") && (
           <div className="flex justify-end">
@@ -565,7 +585,6 @@ export default function KnowledgeBaseViewer({
         {(
           [
             ["knowledge", "正式知识"],
-            ["evidence", "证据与来源"],
             ["assets", `图片素材 ${snapshot.imageCount}`],
           ] as const
         ).map(([id, label]) => (
@@ -585,8 +604,6 @@ export default function KnowledgeBaseViewer({
                     formalDocuments[0]?.path ??
                     null,
                 );
-              } else if (id === "evidence") {
-                setSelectedPath(evidenceDocuments[0]?.path ?? null);
               }
             }}
             className={`rounded-full border px-4 py-2 text-sm font-medium transition ${
@@ -631,11 +648,6 @@ export default function KnowledgeBaseViewer({
                       <span className="block break-words font-medium text-[#51495d]">
                         {displayName}
                       </span>
-                      {asset.branchId && (
-                        <span className="block text-[#8c8498]">
-                          分支：{asset.branchId}
-                        </span>
-                      )}
                     </figcaption>
                   </figure>
                 );
@@ -682,7 +694,7 @@ export default function KnowledgeBaseViewer({
               />
             </div>
             <p className="mb-2 mt-5 px-2 text-xs font-semibold uppercase tracking-[0.08em] text-[#9a94a8]">
-              {view === "knowledge" ? "分支综述与知识叶子" : "证据与来源目录"}
+              正式知识目录
             </p>
             <div className="max-h-[510px] space-y-1 overflow-y-auto pr-1 custom-scrollbar">
               {filteredDocuments.map((document) => (
@@ -708,20 +720,7 @@ export default function KnowledgeBaseViewer({
                           : "text-[#9a94a8]"
                       }`}
                     >
-                      {[
-                        document.branchTitle || document.branchId,
-                        document.kind === "overview"
-                          ? "分支综述"
-                          : document.kind === "leaf"
-                            ? "知识叶子"
-                            : document.kind === "report"
-                              ? "采集报告"
-                              : document.kind === "index"
-                                ? "来源索引"
-                                : document.path,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
+                      {knowledgeDocumentCategory(document)}
                     </span>
                   </span>
                 </button>
@@ -732,32 +731,13 @@ export default function KnowledgeBaseViewer({
           <article className="min-w-0 p-5 sm:p-8 lg:p-10">
             {selectedDocument ? (
               <>
-                <div className="mb-8 border-b border-[#e8e1ee] pb-5">
+                <div className="mb-6">
                   <p className="text-xs font-semibold text-[#5b2a86]">
-                    {view === "knowledge" ? "正式知识" : "证据与来源"}
+                    正式知识
                   </p>
                   <h2 className="mt-2 text-2xl font-semibold tracking-tight text-[#171321]">
                     {selectedDocument.title}
                   </h2>
-                  {selectedDocument.contentStatus === "limited_evidence" && (
-                    <p
-                      className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-900"
-                      role="status"
-                    >
-                      公开证据有限：本章节已整理当前可核验信息，并保留待企业补充的资料缺口。
-                    </p>
-                  )}
-                  {selectedDocument.contentStatus === "needs_verification" && (
-                    <p
-                      className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm leading-6 text-slate-700"
-                      role="status"
-                    >
-                      暂无可确认公开证据：本章节列出已检查来源与后续需要补充的资料。
-                    </p>
-                  )}
-                  <p className="mt-2 break-all text-xs text-[#9a94a8]">
-                    {selectedDocument.path}
-                  </p>
                 </div>
                 <div className="space-y-6">
                   {documentSections.map((section, index) => {

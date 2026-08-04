@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   resetRefetch: vi.fn(),
   knowledgeRefetch: vi.fn(),
+  deliveryTicketCreate: vi.fn(),
   progressRefetch: vi.fn(),
   setProgressData: vi.fn(),
   createConversation: vi.fn(),
@@ -12,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   resetIsError: false,
   progressIsError: false,
   progressData: { progress: null } as any,
+  knowledgeData: { snapshot: null } as any,
   resetStatus: {
     revision: 0,
     hasKnowledge: false,
@@ -27,7 +29,9 @@ vi.mock("@/_core/hooks/useAuth", () => ({
 }));
 vi.mock("@/contexts/ConversationContext", () => ({
   useConversation: () => ({
-    state: { conversations: [] },
+    state: {
+      conversations: mocks.activeConversation ? [mocks.activeConversation] : [],
+    },
     activeConversation: mocks.activeConversation,
     hydrated: true,
     createConversation: mocks.createConversation,
@@ -62,10 +66,18 @@ vi.mock("@/lib/trpc", () => ({
       },
       knowledge: {
         useQuery: () => ({
-          data: { snapshot: null },
+          data: mocks.knowledgeData,
           isLoading: false,
           refetch: mocks.knowledgeRefetch,
         }),
+      },
+      deliveryTickets: {
+        create: {
+          useMutation: () => ({
+            mutateAsync: mocks.deliveryTicketCreate,
+            isPending: false,
+          }),
+        },
       },
       knowledgeReset: {
         status: {
@@ -93,6 +105,7 @@ import EmbeddedKnowledgeBasePanel, {
 beforeEach(() => {
   mocks.resetRefetch.mockReset().mockResolvedValue(undefined);
   mocks.knowledgeRefetch.mockReset().mockResolvedValue(undefined);
+  mocks.deliveryTicketCreate.mockReset().mockResolvedValue(undefined);
   mocks.progressRefetch.mockReset().mockResolvedValue(undefined);
   mocks.setProgressData.mockReset();
   mocks.createConversation
@@ -102,6 +115,7 @@ beforeEach(() => {
   mocks.resetIsError = false;
   mocks.progressIsError = false;
   mocks.progressData = { progress: null };
+  mocks.knowledgeData = { snapshot: null };
   mocks.activeConversation = null;
   mocks.resetStatus = {
     revision: 0,
@@ -158,10 +172,11 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     expect(mocks.createConversation).not.toHaveBeenCalled();
   });
 
-  it("keeps the reset action visible before completion and refreshes it when build progress starts", () => {
-    render(
+  it("keeps reset on the build page only and refreshes it when build progress starts", () => {
+    mocks.progressIsError = true;
+    const { rerender } = render(
       <EmbeddedKnowledgeBasePanel
-        page="display"
+        page="build"
         onPageChange={() => undefined}
       />,
     );
@@ -172,12 +187,110 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     expect(resetButton).toBeDisabled();
     expect(resetButton).toHaveAttribute("title", "当前没有可重置的知识库记录");
 
+    rerender(
+      <EmbeddedKnowledgeBasePanel
+        page="display"
+        onPageChange={() => undefined}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "申请重置知识库" })).toBeNull();
+
     act(() => {
       window.dispatchEvent(
         new CustomEvent("frontmind:knowledge-progress-updated"),
       );
     });
     expect(mocks.resetRefetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows only maintenance and ZIP actions on the published display page", () => {
+    mocks.knowledgeData = {
+      snapshot: {
+        id: "snapshot-1",
+        sourceFileName: "企业知识库.zip",
+        archiveHash: "a".repeat(64),
+        archiveAvailable: true,
+      },
+    };
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="display"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "提交维护工单" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "下载成品 ZIP" })).toHaveAttribute(
+      "href",
+      "/api/dashboard/knowledge/snapshots/snapshot-1/archive",
+    );
+    expect(screen.queryByRole("button", { name: "申请重置知识库" })).toBeNull();
+  });
+
+  it("does not replace a completed build action with a maintenance ticket", () => {
+    mocks.activeConversation = {
+      id: "knowledge-conversation",
+      status: "completed",
+    };
+    mocks.knowledgeData = {
+      snapshot: {
+        id: "snapshot-1",
+        sourceFileName: "企业知识库.zip",
+        archiveHash: null,
+        archiveAvailable: false,
+      },
+    };
+    mocks.progressData = {
+      progress: {
+        packageAllowed: true,
+        build: {
+          status: "published",
+          conversationId: "knowledge-conversation",
+        },
+      },
+    };
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "提交维护工单" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "申请重置知识库" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the 100 percent update notice on one line", () => {
+    mocks.activeConversation = {
+      id: "knowledge-conversation",
+      status: "completed",
+    };
+    mocks.progressData = {
+      progress: {
+        packageAllowed: true,
+        build: {
+          status: "ready_to_publish",
+          conversationId: "knowledge-conversation",
+        },
+      },
+    };
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText(/知识库已达到\s+100%/)).toHaveClass(
+      "whitespace-nowrap",
+    );
   });
 
   it("discards established local KB state when first mounted after a completed reset", () => {

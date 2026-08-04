@@ -3,20 +3,15 @@ import {
   Clock3,
   Loader2,
   RefreshCw,
-  Sparkles,
+  Search,
+  Wrench,
+  X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { toast } from "sonner";
+import { useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { trpc } from "@/lib/trpc";
 
-import {
-  isTerminalBrandQuestionTaskFailure,
-  parseStoredBrandQuestionTask,
-  serializeStoredBrandQuestionTask,
-  type StoredBrandQuestionTask,
-} from "./brand-question-task";
 import type { ServicePortalView } from "./service-portal";
 
 type PortfolioQuestion = {
@@ -46,6 +41,18 @@ export type BrandQuestionSelectionDraft = Pick<
   "id" | "question" | "category" | "revision" | "status"
 >;
 
+type QuestionCatalogTicket = {
+  id: string;
+  category?: string | null;
+  publicStage?:
+    | "awaiting_service"
+    | "processing"
+    | "action_required"
+    | "completed"
+    | "closed";
+  publicStageLabel?: string | null;
+};
+
 const CATEGORY_META = {
   industry: {
     title: "行业词",
@@ -72,50 +79,27 @@ const CATEGORY_ORDER = [
   "product_scenario",
 ] as const;
 
-async function readApiError(response: Response) {
-  try {
-    const body = await response.json();
-    return {
-      code: String(body?.error?.code || body?.code || ""),
-      message: body?.error?.message || body?.message || "请求失败",
-    };
-  } catch {
-    return { code: "", message: `请求失败 (${response.status})` };
-  }
-}
-
-function formatDuration(milliseconds: number) {
-  const seconds = Math.max(0, Math.floor(milliseconds / 1_000));
-  const minutes = Math.floor(seconds / 60);
-  return minutes ? `${minutes} 分 ${seconds % 60} 秒` : `${seconds} 秒`;
-}
-
 export default function BrandQuestionPortfolioWorkspace({
   portal,
   onPortalRefresh,
   onUseQuestion,
+  questionCatalogTicket,
+  hasPublishedKeywordTables = false,
+  ticketLoading = false,
+  onTicketRefresh,
 }: {
   portal: ServicePortalView;
   onPortalRefresh?: () => void;
   onUseQuestion: (question: BrandQuestionSelectionDraft) => void;
+  questionCatalogTicket?: QuestionCatalogTicket | null;
+  hasPublishedKeywordTables?: boolean;
+  ticketLoading?: boolean;
+  onTicketRefresh?: () => Promise<unknown> | unknown;
 }) {
-  const taskStorageKey = `frontmind:brand-question-task:${
-    portal.account.username || "current"
-  }`;
-  const [taskState, setTaskState] = useState<StoredBrandQuestionTask | null>(
-    () => {
-      if (typeof window === "undefined") return null;
-      return parseStoredBrandQuestionTask(
-        window.sessionStorage.getItem(taskStorageKey),
-      );
-    },
-  );
-  const taskId = taskState?.taskId ?? "";
-  const startedAt = taskState?.startedAt ?? null;
-  const [elapsed, setElapsed] = useState(0);
-  const [starting, setStarting] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const syncInFlightRef = useRef(false);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [refreshing, setRefreshing] = useState(false);
   const portfolioQuery = (trpc.workspace as any).questionPortfolio.useQuery(
     undefined,
     {
@@ -133,135 +117,106 @@ export default function BrandQuestionPortfolioWorkspace({
   };
   const visibleQuestions = portfolioQuery.data?.questions ?? [];
 
-  useEffect(() => {
-    if (!taskState) {
-      window.sessionStorage.removeItem(taskStorageKey);
-      return;
-    }
-    window.sessionStorage.setItem(
-      taskStorageKey,
-      serializeStoredBrandQuestionTask(taskState),
-    );
-    const timer = window.setInterval(() => {
-      if (startedAt) setElapsed(Date.now() - startedAt);
-    }, 1_000);
-    return () => window.clearInterval(timer);
-  }, [startedAt, taskState, taskStorageKey]);
-
-  const clearTask = () => {
-    window.sessionStorage.removeItem(taskStorageKey);
-    setTaskState(null);
-    setElapsed(0);
-  };
-
-  const syncTask = async (silent = false) => {
-    if (!taskState || syncInFlightRef.current) return;
-    syncInFlightRef.current = true;
-    setSyncing(true);
-    try {
-      const response = await fetch("/api/brand-question-portfolio/sync", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          taskId: taskState.taskId,
-          contextToken: taskState.contextToken,
-        }),
-      });
-      if (response.status === 202) return;
-      if (!response.ok) {
-        const failure = await readApiError(response);
-        if (
-          isTerminalBrandQuestionTaskFailure({
-            status: response.status,
-            code: failure.code,
-          })
-        ) {
-          clearTask();
-          toast.error("候选问题任务未完成", {
-            description: `${failure.message}，现在可以重新生成。`,
-          });
-          return;
-        }
-        throw new Error(failure.message);
+  const filteredQuestions = useMemo(() => {
+    const keyword = searchTerm.trim().toLowerCase();
+    return visibleQuestions.filter((question) => {
+      if (categoryFilter !== "all" && question.category !== categoryFilter) {
+        return false;
       }
-      await response.json();
-      clearTask();
-      await portfolioQuery.refetch();
-      onPortalRefresh?.();
-      toast.success("候选问题已更新", {
-        description: "请按当前服务额度确认本周期问题。",
-      });
-    } catch (error) {
-      if (!silent) {
-        toast.error("候选问题同步失败", {
-          description: error instanceof Error ? error.message : "请稍后重试",
-        });
+      const selectionState =
+        question.status === "selected"
+          ? "selected"
+          : question.selectionApprovalStatus === "pending"
+            ? "pending"
+            : "candidate";
+      if (statusFilter !== "all" && selectionState !== statusFilter) {
+        return false;
       }
-    } finally {
-      syncInFlightRef.current = false;
-      setSyncing(false);
-    }
-  };
-
-  useEffect(() => {
-    if (!taskId) return;
-    const timer = window.setInterval(() => void syncTask(true), 4_000);
-    void syncTask(true);
-    return () => window.clearInterval(timer);
-    // The ref prevents overlapping reads while retaining one polling timer per
-    // task identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId]);
-
-  const startGeneration = async () => {
-    setStarting(true);
-    try {
-      const response = await fetch("/api/brand-question-portfolio/start", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-      });
-      if (!response.ok) {
-        const failure = await readApiError(response);
-        throw new Error(failure.message);
-      }
-      const body = await response.json();
-      const nextTaskId = String(body?.task?.id || "");
-      const contextToken = String(body?.contextToken || "");
-      if (!nextTaskId) throw new Error("候选问题任务未返回标识");
-      if (!contextToken) throw new Error("候选问题任务未返回安全上下文");
-      const nextStartedAt = Number(body?.startedAt) || Date.now();
-      const nextTask = {
-        taskId: nextTaskId,
-        contextToken,
-        startedAt: nextStartedAt,
-      };
-      setTaskState(nextTask);
-      setElapsed(Date.now() - nextStartedAt);
-      window.sessionStorage.setItem(
-        taskStorageKey,
-        serializeStoredBrandQuestionTask(nextTask),
+      if (!keyword) return true;
+      return [question.question, question.intent, question.rationale].some(
+        (value) => value?.toLowerCase().includes(keyword),
       );
-      toast.success("候选问题生成已开始");
-    } catch (error) {
-      toast.error("无法生成候选问题", {
-        description: error instanceof Error ? error.message : "请稍后重试",
-      });
+    });
+  }, [categoryFilter, searchTerm, statusFilter, visibleQuestions]);
+
+  const selectedCount = visibleQuestions.filter(
+    (question) => question.status === "selected",
+  ).length;
+  const catalogPublished =
+    questionCatalogTicket?.publicStage === "completed" ||
+    visibleQuestions.length > 0 ||
+    hasPublishedKeywordTables;
+
+  const ticketStatus = (() => {
+    if (ticketLoading) {
+      return {
+        title: "正在读取配置工单",
+        description: "正在同步品牌词库与问题目录的交付状态。",
+        tone: "text-[#5b2a86]",
+      };
+    }
+    if (!questionCatalogTicket && catalogPublished) {
+      return {
+        title: "品牌词库与问题目录已发布",
+        description:
+          "AI 监控与优化工程师已完成本阶段配置，可在下方查看正式词表并选择问题。",
+        tone: "text-emerald-700",
+      };
+    }
+    if (!questionCatalogTicket) {
+      return {
+        title: "等待配置工单同步",
+        description:
+          "知识库发布后，系统会自动向 AI 监控与优化工程师提交品牌词库与问题目录工单，无需客户重复操作。",
+        tone: "text-amber-700",
+      };
+    }
+    if (questionCatalogTicket.publicStage === "completed") {
+      return {
+        title: "品牌词库与问题目录已发布",
+        description:
+          "AI 监控与优化工程师已完成本阶段配置，可在下方查看正式词表并选择问题。",
+        tone: "text-emerald-700",
+      };
+    }
+    if (questionCatalogTicket.publicStage === "action_required") {
+      return {
+        title: "配置工单待补充资料",
+        description:
+          "AI 监控与优化工程师需要补充信息，请前往工单详情按提示回复。",
+        tone: "text-amber-700",
+      };
+    }
+    if (questionCatalogTicket.publicStage === "closed") {
+      return {
+        title: "配置工单已结束",
+        description: "如仍需配置品牌词库，请联系交付管理员核查工单状态。",
+        tone: "text-slate-600",
+      };
+    }
+    return {
+      title:
+        questionCatalogTicket.publicStage === "processing"
+          ? "AI 监控与优化工程师正在配置"
+          : "配置工单已提交",
+      description:
+        "品牌词库与问题目录工单已交由 AI 监控与优化工程师处理，完成后会在本页发布正式词表与候选问题。",
+      tone: "text-[#5b2a86]",
+    };
+  })();
+
+  const refreshWorkspace = async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([
+        portfolioQuery.refetch(),
+        Promise.resolve(onTicketRefresh?.()),
+        Promise.resolve(onPortalRefresh?.()),
+      ]);
     } finally {
-      setStarting(false);
+      setRefreshing(false);
     }
   };
-
-  const selectedByCategory = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const question of visibleQuestions) {
-      if (question.status === "selected") {
-        counts.set(question.category, (counts.get(question.category) ?? 0) + 1);
-      }
-    }
-    return counts;
-  }, [visibleQuestions]);
 
   return (
     <section className="page-shell brand-deep-page">
@@ -275,187 +230,225 @@ export default function BrandQuestionPortfolioWorkspace({
               品牌全域词库
             </h1>
             <p className="mt-3 max-w-3xl text-sm leading-7 text-[#716a80]">
-              候选问题只基于当前已发布的企业知识库生成。选择问题后会进入专业审核，由 AI 监控与优化工程师确认启动；确认后才会锁定并占用额度。
+              品牌词库与候选问题由 AI
+              监控与优化工程师基于当前已发布的企业知识库配置。选择问题后进入专业审核，确认启动后才会锁定并占用额度。
             </p>
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              disabled={portfolioQuery.isFetching}
-              onClick={() => void portfolioQuery.refetch()}
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${
-                  portfolioQuery.isFetching ? "animate-spin" : ""
-                }`}
-              />
-              刷新
-            </Button>
-            <Button
-              className="bg-[#5b2a86] hover:bg-[#49216c]"
-              disabled={starting || Boolean(taskId)}
-              onClick={() => void startGeneration()}
-            >
-              {starting ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Sparkles className="h-4 w-4" />
-              )}
-              {visibleQuestions.length ? "重新生成候选问题" : "生成候选问题"}
-            </Button>
-          </div>
+          <Button
+            variant="outline"
+            disabled={refreshing || portfolioQuery.isFetching}
+            onClick={() => void refreshWorkspace()}
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${
+                refreshing || portfolioQuery.isFetching ? "animate-spin" : ""
+              }`}
+            />
+            刷新工单与词库
+          </Button>
         </div>
 
-        {taskId && (
-          <div
-            className="flex flex-col gap-3 rounded-2xl border border-[#d9c8e5] bg-[#f8f3fb] p-4 sm:flex-row sm:items-center sm:justify-between"
-            role="status"
-          >
-            <div className="flex items-center gap-3">
-              <Loader2 className="h-5 w-5 animate-spin text-[#5b2a86]" />
-              <div>
-                <p className="text-sm font-semibold text-[#332842]">
-                  正在分析知识库并生成企业专属候选问题
-                </p>
-                <p className="mt-1 text-xs text-[#716a80]">
-                  执行时间 {formatDuration(elapsed)}
-                </p>
-              </div>
+        <div
+          className="flex flex-col gap-3 rounded-2xl border border-[#d9c8e5] bg-[#f8f3fb] p-4 sm:flex-row sm:items-center sm:justify-between"
+          role="status"
+        >
+          <div className="flex items-start gap-3">
+            {catalogPublished ? (
+              <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
+            ) : ticketLoading ? (
+              <Loader2 className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-[#5b2a86]" />
+            ) : (
+              <Wrench className="mt-0.5 h-5 w-5 shrink-0 text-[#5b2a86]" />
+            )}
+            <div>
+              <p className={`text-sm font-semibold ${ticketStatus.tone}`}>
+                {ticketStatus.title}
+              </p>
+              <p className="mt-1 text-xs leading-5 text-[#716a80]">
+                {ticketStatus.description}
+              </p>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={syncing}
-              onClick={() => void syncTask()}
-            >
-              {syncing && <Loader2 className="h-4 w-4 animate-spin" />}
-              检查结果
-            </Button>
           </div>
-        )}
+          {questionCatalogTicket?.publicStageLabel && (
+            <span className="shrink-0 rounded-full border border-[#d8c9e3] bg-white px-3 py-1 text-xs font-semibold text-[#5b2a86]">
+              {questionCatalogTicket.publicStageLabel}
+            </span>
+          )}
+        </div>
       </div>
 
-      <div className="mt-5 grid gap-5 xl:grid-cols-2">
-        {CATEGORY_ORDER.map((category) => {
-          const meta = CATEGORY_META[category];
-          const categoryQuestions = visibleQuestions.filter(
-            (question) => question.category === category,
-          );
-          const selectedCount = selectedByCategory.get(category) ?? 0;
-          return (
-            <section
-              key={category}
-              className="overflow-hidden rounded-[22px] border border-[#e6ddea] bg-white shadow-sm"
+      <div className="saas-toolbar keyword-toolbar-saas mt-5">
+        <div className="saas-search">
+          <Search size={16} />
+          <input
+            type="search"
+            placeholder="搜索问题、意图或说明..."
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+          />
+          {searchTerm && (
+            <button
+              type="button"
+              className="clear-btn"
+              aria-label="清空搜索"
+              onClick={() => setSearchTerm("")}
             >
-              <header className="border-b border-[#eee8f2] p-5">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <h2 className="text-lg font-semibold text-[#251d33]">
-                      {meta.title}
-                    </h2>
-                    <p className="mt-1 text-xs leading-5 text-[#857e91]">
-                      {meta.description}
-                    </p>
-                  </div>
-                  {selectedCount > 0 && (
-                    <span className="text-xs font-semibold text-[#16794f]">
-                      已确认 {selectedCount}
-                    </span>
-                  )}
-                </div>
-              </header>
-              <div className="divide-y divide-[#f0ebf3]">
-                {portfolioQuery.isLoading ? (
-                  <div className="flex items-center justify-center gap-2 p-8 text-sm text-[#716a80]">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    读取候选问题中…
-                  </div>
-                ) : categoryQuestions.length === 0 ? (
-                  <div className="p-8 text-center text-sm leading-6 text-[#857e91]">
-                    当前没有可展示的{meta.title}候选项。
-                  </div>
-                ) : (
-                  categoryQuestions.map((question) => {
-                    const selected = question.status === "selected";
-                    const pending =
-                      question.selectionApprovalStatus === "pending";
-                    return (
-                      <article key={question.id} className="p-5">
-                        <div className="flex items-start gap-3">
-                          <div className="mt-0.5 text-[#6b378f]">
-                            {selected ? (
-                              <CheckCircle2 className="h-5 w-5 text-[#16794f]" />
-                            ) : (
-                              <Clock3 className="h-5 w-5" />
-                            )}
-                          </div>
-                          <div className="min-w-0 flex-1">
-                            <h3 className="text-sm font-semibold leading-6 text-[#30263e]">
-                              {question.question}
-                            </h3>
-                            {question.rationale && (
-                              <p className="mt-2 text-xs leading-5 text-[#716a80]">
-                                {question.rationale}
-                              </p>
-                            )}
-                            {question.evidence.length > 0 && (
-                              <details className="mt-3 rounded-xl bg-[#faf8fb] p-3">
-                                <summary className="cursor-pointer text-xs font-semibold text-[#5b2a86]">
-                                  查看知识库依据
-                                </summary>
-                                <div className="mt-3 space-y-3">
-                                  {question.evidence.map((evidence, index) => (
-                                    <div
-                                      key={`${evidence.documentPath}-${index}`}
-                                    >
-                                      <p className="break-all text-xs font-semibold text-[#61586f]">
-                                        {evidence.documentPath}
-                                      </p>
-                                      <p className="mt-1 text-xs leading-5 text-[#857e91]">
-                                        {evidence.excerpt}
-                                      </p>
-                                    </div>
-                                  ))}
-                                </div>
-                              </details>
-                            )}
-                            <div className="mt-4">
-                              <Button
-                                size="sm"
-                                variant={
-                                  selected || pending ? "outline" : "default"
-                                }
-                                className={
-                                  selected
-                                    ? "border-emerald-200 text-emerald-700"
-                                    : pending
-                                      ? "border-amber-200 text-amber-700"
-                                      : "bg-[#5b2a86] hover:bg-[#49216c]"
-                                }
-                                disabled={
-                                  pending ||
-                                  !portal.capabilities.questionSelection.allowed
-                                }
-                                onClick={() => onUseQuestion(question)}
-                              >
-                                {selected
-                                  ? "进入问题优化"
-                                  : pending
-                                    ? "待监控工程师确认"
-                                    : "选择并进入问题优化"}
-                              </Button>
-                            </div>
-                          </div>
-                        </div>
-                      </article>
-                    );
-                  })
-                )}
-              </div>
-            </section>
-          );
-        })}
+              <X size={14} />
+            </button>
+          )}
+        </div>
+        <div className="filter-group">
+          <div className="filter-item">
+            <label htmlFor="brand-question-category">分类</label>
+            <select
+              id="brand-question-category"
+              value={categoryFilter}
+              onChange={(event) => setCategoryFilter(event.target.value)}
+            >
+              <option value="all">全部分类</option>
+              {CATEGORY_ORDER.map((category) => (
+                <option key={category} value={category}>
+                  {CATEGORY_META[category].title}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="filter-item">
+            <label htmlFor="brand-question-status">状态</label>
+            <select
+              id="brand-question-status"
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value)}
+            >
+              <option value="all">全部状态</option>
+              <option value="candidate">待选择</option>
+              <option value="pending">待工程师确认</option>
+              <option value="selected">已确认</option>
+            </select>
+          </div>
+        </div>
       </div>
+
+      <div className="keyword-stats-bar">
+        <span>
+          共 <strong>{visibleQuestions.length}</strong> 个候选问题
+        </span>
+        <span>
+          当前显示 <strong>{filteredQuestions.length}</strong> 个
+        </span>
+        <span>
+          已确认 <strong>{selectedCount}</strong> 个
+        </span>
+      </div>
+
+      <section className="panel global-keyword-panel">
+        <div className="panel-head">
+          <div>
+            <h3>候选问题目录</h3>
+            <p className="panel-subtitle">
+              按分类筛选问题，并提交给 AI 监控与优化工程师确认。
+            </p>
+          </div>
+        </div>
+        <div className="keyword-table-wrap">
+          <table className="keyword-table">
+            <thead>
+              <tr>
+                <th>问题</th>
+                <th>用户意图</th>
+                <th>分类</th>
+                <th>选题状态</th>
+                <th>问题优化</th>
+              </tr>
+            </thead>
+            <tbody>
+              {portfolioQuery.isLoading ? (
+                <tr>
+                  <td colSpan={5}>
+                    <span className="flex items-center justify-center gap-2 py-5">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      读取候选问题中…
+                    </span>
+                  </td>
+                </tr>
+              ) : filteredQuestions.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="text-center text-[#857e91]">
+                    {visibleQuestions.length
+                      ? "没有符合当前筛选条件的候选问题。"
+                      : "AI 监控与优化工程师发布问题目录后将在这里展示。"}
+                  </td>
+                </tr>
+              ) : (
+                filteredQuestions.map((question) => {
+                  const selected = question.status === "selected";
+                  const pending =
+                    question.selectionApprovalStatus === "pending";
+                  return (
+                    <tr key={question.id}>
+                      <td className="keyword-question-cell">
+                        <strong className="text-[#30263e]">
+                          {question.question}
+                        </strong>
+                        {question.rationale && (
+                          <small className="mt-1 block max-w-2xl text-[#857e91]">
+                            {question.rationale}
+                          </small>
+                        )}
+                      </td>
+                      <td>{question.intent || "待工程师补充"}</td>
+                      <td>
+                        <span className="keyword-pill">
+                          {CATEGORY_META[question.category].title}
+                        </span>
+                      </td>
+                      <td>
+                        <span
+                          className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${
+                            selected
+                              ? "bg-emerald-50 text-emerald-700"
+                              : pending
+                                ? "bg-amber-50 text-amber-700"
+                                : "bg-[#f3edf8] text-[#5b2a86]"
+                          }`}
+                        >
+                          {selected ? (
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                          ) : (
+                            <Clock3 className="h-3.5 w-3.5" />
+                          )}
+                          {selected
+                            ? "已确认"
+                            : pending
+                              ? "待工程师确认"
+                              : "待选择"}
+                        </span>
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="keyword-optimize-button disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={
+                            pending ||
+                            !portal.capabilities.questionSelection.allowed
+                          }
+                          onClick={() => onUseQuestion(question)}
+                        >
+                          {selected
+                            ? "进入问题优化"
+                            : pending
+                              ? "待监控工程师确认"
+                              : "选择并进入问题优化"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
     </section>
   );
 }

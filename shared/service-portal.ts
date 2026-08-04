@@ -237,6 +237,8 @@ export const serviceNextActionKindSchema = z.enum([
   "resume_knowledge_build",
   "start_knowledge_build",
   "await_question_import",
+  "await_question_catalog",
+  // Retained for parsing responses issued by older deployments.
   "generate_question_candidates",
   "select_service_questions",
   "await_question_confirmation",

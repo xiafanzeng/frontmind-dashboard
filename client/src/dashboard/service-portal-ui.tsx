@@ -144,6 +144,7 @@ function ServiceActionButton({
           return;
         }
         if (
+          action.kind === "await_question_catalog" ||
           action.kind === "generate_question_candidates" ||
           action.kind === "select_service_questions"
         ) {
@@ -278,7 +279,8 @@ const WORKFLOW_JOURNEY_META: Record<
   },
   question: {
     title: "品牌全域词库与选题",
-    description: "基于已发布知识库生成候选词，并按当期额度选择服务问题。",
+    description:
+      "知识库发布后，由 AI 监控与优化工程师通过工单配置并发布品牌词库与问题目录，再按当期额度完成选题。",
     route: { section: "brand", sub: "global-keywords" },
   },
   intent_optimization: {
@@ -506,7 +508,7 @@ export function ServiceHome({
                   ? "在系统内通过对话逐节点补齐并确认企业资料，全部完成后发布知识库。"
                   : "查看官网购买流程已同步到当前账号的图文知识库。"
                 : isQuestion && usesInteractiveKnowledgeFlow
-                  ? "知识库发布后，由模型生成企业专属候选词，再按本期额度完成选题。"
+                  ? "知识库发布后，由 AI 监控与优化工程师通过工单配置并发布品牌词库与问题目录，再按本期额度完成选题。"
                   : isMonitoring
                     ? "查看跨平台真实回答，并在同一页面核验媒体信源与渠道分发记录。"
                     : meta.description,

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  Download,
   Loader2,
   PanelRightOpen,
   RefreshCw,
@@ -169,6 +170,15 @@ export default function EmbeddedKnowledgeBasePanel({
     resetQuery.data?.revision,
   ]);
 
+  const displayedSnapshot = previewMode
+    ? previewData?.snapshot
+    : knowledgeQuery.data?.snapshot;
+  const archiveDownloadAvailable = Boolean(
+    displayedSnapshot?.sourceFileName.toLowerCase().endsWith(".zip") &&
+      displayedSnapshot.archiveAvailable === true &&
+      /^[a-f0-9]{64}$/i.test(displayedSnapshot.archiveHash || ""),
+  );
+
   return (
     <section
       className={
@@ -182,7 +192,7 @@ export default function EmbeddedKnowledgeBasePanel({
         className={
           mode === "workspace"
             ? "flex min-h-16 shrink-0 items-center justify-between gap-4 border-b border-[#e8e1ee] bg-white px-5 py-3 pl-16 min-[769px]:pl-5"
-            : "page-header flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between"
+            : "page-header flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"
         }
       >
         <div>
@@ -206,52 +216,61 @@ export default function EmbeddedKnowledgeBasePanel({
             </p>
           )}
         </div>
-        {page === "build" &&
-          (previewMode ? (
-            <Button
-              className="w-fit shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
-              onClick={() => {
-                if (!previewProgress?.packageAllowed) {
-                  toast.warning("尚未达到知识库更新条件", {
-                    description: previewProgress
-                      ? `当前进度为 ${previewProgress.summary.handled}/${previewProgress.summary.total}，请继续完成当前节点。`
-                      : "当前预览未配置知识库进度。",
-                  });
-                  return;
-                }
-                toast.success("知识库展示已更新");
-                onPageChange("display");
-              }}
-            >
-              <RefreshCw className="h-4 w-4" />
-              更新知识库
-            </Button>
-          ) : (
-            <ManualKnowledgeUpdateButton
-              publishedSnapshotId={knowledgeQuery.data?.snapshot?.id}
-              knowledgeEngineerAssigned={knowledgeEngineerAssigned}
-              unavailableReason={resetQuery.data?.unavailableReason ?? null}
-              onUpdated={async () => {
-                await knowledgeQuery.refetch();
-                onPageChange("display");
-              }}
+        <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-3 overflow-x-auto">
+          {page === "build" &&
+            (previewMode ? (
+              <Button
+                className="w-fit shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
+                onClick={() => {
+                  if (!previewProgress?.packageAllowed) {
+                    toast.warning("尚未达到知识库更新条件", {
+                      description: previewProgress
+                        ? `当前进度为 ${previewProgress.summary.handled}/${previewProgress.summary.total}，请继续完成当前节点。`
+                        : "当前预览未配置知识库进度。",
+                    });
+                    return;
+                  }
+                  toast.success("知识库展示已更新");
+                  onPageChange("display");
+                }}
+              >
+                <RefreshCw className="h-4 w-4" />
+                更新知识库
+              </Button>
+            ) : (
+              <ManualKnowledgeUpdateButton
+                onUpdated={async () => {
+                  await knowledgeQuery.refetch();
+                  onPageChange("display");
+                }}
+              />
+            ))}
+          {page === "build" && !previewMode && resetQuery.data && (
+            <KnowledgeResetButton
+              status={resetQuery.data}
+              onSubmitted={() => resetQuery.refetch()}
             />
-          ))}
-        {page === "display" &&
-          !previewMode &&
-          knowledgeQuery.data?.snapshot?.id && (
+          )}
+          {page === "display" && !previewMode && displayedSnapshot?.id && (
             <KnowledgeMaintenanceTicketButton
-              snapshotId={knowledgeQuery.data.snapshot.id}
+              snapshotId={displayedSnapshot.id}
               enabled={knowledgeEngineerAssigned}
               unavailableReason={resetQuery.data?.unavailableReason ?? null}
             />
           )}
-        {!previewMode && resetQuery.data && (
-          <KnowledgeResetButton
-            status={resetQuery.data}
-            onSubmitted={() => resetQuery.refetch()}
-          />
-        )}
+          {page === "display" &&
+            displayedSnapshot &&
+            archiveDownloadAvailable && (
+              <a
+                href={`/api/dashboard/knowledge/snapshots/${encodeURIComponent(displayedSnapshot.id)}/archive`}
+                download={displayedSnapshot.sourceFileName}
+                className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-xl bg-[#5b2a86] px-4 text-sm font-medium text-white shadow-sm transition hover:bg-[#49216c] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b2a86] focus-visible:ring-offset-2"
+              >
+                <Download className="h-4 w-4" />
+                下载成品 ZIP
+              </a>
+            )}
+        </div>
       </header>
 
       {page === "display" ? (
@@ -261,12 +280,9 @@ export default function EmbeddedKnowledgeBasePanel({
           }
         >
           <KnowledgeBaseViewer
-            snapshot={
-              previewMode
-                ? previewData?.snapshot
-                : knowledgeQuery.data?.snapshot
-            }
+            snapshot={displayedSnapshot}
             loading={!previewMode && knowledgeQuery.isLoading}
+            showArchiveDownload={false}
           />
         </div>
       ) : previewMode && previewProgress ? (
@@ -439,14 +455,8 @@ function KnowledgeResetButton({
 
 function ManualKnowledgeUpdateButton({
   onUpdated,
-  publishedSnapshotId,
-  knowledgeEngineerAssigned,
-  unavailableReason,
 }: {
   onUpdated: () => Promise<void>;
-  publishedSnapshotId?: string;
-  knowledgeEngineerAssigned: boolean;
-  unavailableReason: string | null;
 }) {
   const { activeConversation, updateStatus } = useConversation();
   const [updating, setUpdating] = useState(false);
@@ -526,27 +536,15 @@ function ManualKnowledgeUpdateButton({
 
   const progress = progressQuery.data?.progress;
   if (progress?.build.status === "published") {
-    return publishedSnapshotId ? (
-      <KnowledgeMaintenanceTicketButton
-        snapshotId={publishedSnapshotId}
-        enabled={knowledgeEngineerAssigned}
-        unavailableReason={unavailableReason}
-      />
-    ) : null;
+    return null;
   }
   if (!progress?.packageAllowed) {
-    return publishedSnapshotId ? (
-      <KnowledgeMaintenanceTicketButton
-        snapshotId={publishedSnapshotId}
-        enabled={knowledgeEngineerAssigned}
-        unavailableReason={unavailableReason}
-      />
-    ) : null;
+    return null;
   }
 
   return (
-    <div className="flex max-w-xl flex-col items-start gap-2">
-      <p className="text-xs leading-5 text-amber-700">
+    <div className="flex flex-col items-start gap-2">
+      <p className="max-w-full whitespace-nowrap text-xs leading-5 text-amber-700">
         知识库已达到
         100%：这是唯一一次直接更新；更新成功后当前会话和入口将锁定，后续修改需提交维护工单。
       </p>

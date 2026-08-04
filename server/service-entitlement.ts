@@ -801,8 +801,8 @@ function deriveNextAction(input: {
       };
     }
     return {
-      kind: "generate_question_candidates",
-      label: "生成品牌全域词库",
+      kind: "await_question_catalog",
+      label: "查看品牌词库配置进度",
       href: "/brand-question-portfolio",
     };
   }

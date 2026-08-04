@@ -28,6 +28,7 @@ const snapshot: KnowledgeSnapshotView = {
       mimeType: "image/jpeg",
       size: 2_048,
       url: "/api/dashboard/knowledge/assets/snapshot-1/0",
+      branchId: "identity",
     },
     {
       key: "asset-2",
@@ -90,10 +91,25 @@ describe("KnowledgeBaseViewer", () => {
     expect(screen.queryByRole("link", { name: "下载成品 ZIP" })).toBeNull();
   });
 
+  it("can leave the ZIP action to the containing page header", () => {
+    render(
+      <KnowledgeBaseViewer
+        snapshot={{
+          ...snapshot,
+          archiveHash: "a".repeat(64),
+          archiveAvailable: true,
+        }}
+        showArchiveDownload={false}
+      />,
+    );
+
+    expect(screen.queryByRole("link", { name: "下载成品 ZIP" })).toBeNull();
+  });
+
   it("keeps authoritative snapshot metrics but omits a decorative directory count", () => {
     render(<KnowledgeBaseViewer snapshot={snapshot} />);
 
-    expect(screen.getByText("分支综述与知识叶子")).toBeTruthy();
+    expect(screen.getByText("正式知识目录")).toBeTruthy();
     expect(screen.queryByText(/文档目录\s*·\s*2/)).toBeNull();
     expect(screen.getByText("2 篇")).toBeTruthy();
     expect(screen.getByText("2 张")).toBeTruthy();
@@ -197,7 +213,7 @@ describe("KnowledgeBaseViewer", () => {
     expect(screen.queryByRole("region", { name: "相关图片" })).toBeNull();
   });
 
-  it("defaults to a formal overview and keeps reports in the evidence tab", () => {
+  it("omits internal evidence controls and document metadata from formal knowledge", () => {
     render(
       <KnowledgeBaseViewer
         snapshot={{
@@ -209,8 +225,7 @@ describe("KnowledgeBaseViewer", () => {
               title: "企业正式综述",
               content: "## 企业正式综述\n可直接面向客户展示的内容。",
               kind: "overview",
-              branchId: "company",
-              branchTitle: "企业身份",
+              branchId: "identity",
               customerVisible: true,
               contentStatus: "limited_evidence",
             },
@@ -220,8 +235,7 @@ describe("KnowledgeBaseViewer", () => {
               title: "企业定位",
               content: "## 企业定位\n正式知识叶子。",
               kind: "leaf",
-              branchId: "company",
-              branchTitle: "企业身份",
+              branchId: "identity",
               customerVisible: true,
             },
             {
@@ -241,15 +255,22 @@ describe("KnowledgeBaseViewer", () => {
       screen.getAllByRole("heading", { name: "企业正式综述" }).length,
     ).toBeGreaterThan(0);
     expect(screen.queryByText("仅供证据核验。")).toBeNull();
+    expect(screen.queryByRole("tab", { name: "证据与来源" })).toBeNull();
     expect(
-      screen.getByText(/公开证据有限：本章节已整理当前可核验信息/),
-    ).toBeTruthy();
+      screen.queryByText(/公开证据有限：本章节已整理当前可核验信息/),
+    ).toBeNull();
+    expect(screen.queryByText("branches/company/00_overview.md")).toBeNull();
+    expect(screen.getAllByText("企业身份").length).toBeGreaterThan(0);
+    expect(screen.queryByText("identity")).toBeNull();
+    expect(screen.queryByText(/·/)).toBeNull();
+  });
 
-    fireEvent.click(screen.getByRole("tab", { name: "证据与来源" }));
-    expect(
-      screen.getAllByRole("heading", { name: "官网采集报告" }).length,
-    ).toBeGreaterThan(0);
-    expect(screen.getByText("仅供证据核验。")).toBeTruthy();
+  it("does not show internal branch identifiers in the image gallery", () => {
+    render(<KnowledgeBaseViewer snapshot={snapshot} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "图片素材 2" }));
+
+    expect(screen.queryByText("分支：identity")).toBeNull();
   });
 
   it("uses one manifest asset on every explicitly linked document", () => {
@@ -298,7 +319,7 @@ describe("KnowledgeBaseViewer", () => {
     expect(screen.getByRole("img", { name: "产品族 A 官方图片" })).toBeTruthy();
   });
 
-  it("shows sparse public evidence as a valid knowledge state", () => {
+  it("shows sparse formal knowledge without an internal evidence notice", () => {
     render(
       <KnowledgeBaseViewer
         snapshot={{
@@ -319,8 +340,8 @@ describe("KnowledgeBaseViewer", () => {
     );
 
     expect(
-      screen.getByText(/公开证据有限：本章节已整理当前可核验信息/),
-    ).toBeInTheDocument();
+      screen.queryByText(/公开证据有限：本章节已整理当前可核验信息/),
+    ).toBeNull();
     expect(screen.getByText("当前仅能确认企业名称与官网。")).toBeTruthy();
   });
 });

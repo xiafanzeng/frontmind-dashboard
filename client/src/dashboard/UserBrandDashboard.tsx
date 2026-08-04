@@ -39,6 +39,7 @@ import ResponseLogicWorkspace, {
 import ManagedCitationWorkbench, {
   PreviewCitationWorkbench,
 } from "./ManagedCitationWorkbench";
+import ManagedKeywordTables from "./ManagedKeywordTables";
 import BrandQuestionPortfolioWorkspace from "./BrandQuestionPortfolioWorkspace";
 import ProgressReportWorkspace from "./ProgressReportWorkspace";
 import HistoricalResultsReadOnly from "./HistoricalResultsReadOnly";
@@ -64,6 +65,8 @@ import {
   ServiceQuotaOverview,
 } from "./service-portal-ui";
 import "./dashboard-styles.css";
+
+export { ManagedKeywordTables };
 
 const EmbeddedKnowledgeBasePanel = lazy(
   () => import("@/components/EmbeddedKnowledgeBasePanel"),
@@ -982,6 +985,9 @@ function UserBrandDashboardContent({
     : allDeliveryTickets.filter(
         (ticket) => ticket?.type === "website_operation",
       );
+  const questionCatalogTicket = websiteOperationTickets.find(
+    (ticket) => ticket?.category === "question_catalog",
+  );
   const selectedDeliveryTicketQuota =
     deliveryTicketDetailPayload?.ticket?.type === "website_operation"
       ? websiteOperationQuota
@@ -1271,6 +1277,15 @@ function UserBrandDashboardContent({
                       portal={servicePortal}
                       onPortalRefresh={onRefreshServicePortal}
                       onUseQuestion={useBrandQuestion}
+                      questionCatalogTicket={questionCatalogTicket}
+                      hasPublishedKeywordTables={
+                        (managedPayload?.keywordTables || []).length > 0
+                      }
+                      ticketLoading={
+                        deliveryWorkspaceLoading ||
+                        Boolean(websiteTicketList?.loading)
+                      }
+                      onTicketRefresh={onRefreshDeliveryWorkspace}
                     />
                     {(managedPayload?.keywordTables || []).length > 0 && (
                       <ManagedKeywordTables
@@ -1831,110 +1846,6 @@ export function ManagedDashboardSection({
               </p>
             </div>
           </section>
-        )}
-      </div>
-    </section>
-  );
-}
-
-export function ManagedKeywordTables({
-  tables,
-  loading,
-  error,
-  embedded = false,
-}) {
-  const [searchTerm, setSearchTerm] = useState("");
-  const keyword = searchTerm.trim().toLowerCase();
-  const visibleTables = useMemo(() => {
-    if (!keyword) return tables;
-    return tables
-      .map((table) => ({
-        ...table,
-        rows: table.rows.filter((row) =>
-          row.some((cell) => String(cell).toLowerCase().includes(keyword)),
-        ),
-      }))
-      .filter(
-        (table) =>
-          table.title.toLowerCase().includes(keyword) ||
-          table.columns.some((column) =>
-            column.toLowerCase().includes(keyword),
-          ) ||
-          table.rows.length > 0,
-      );
-  }, [keyword, tables]);
-
-  if (loading) {
-    return (
-      <ManagedModuleEmpty
-        title="品牌全域词库"
-        description="正在载入当前企业已发布的词库数据。"
-      />
-    );
-  }
-  if (error) {
-    return (
-      <ManagedModuleEmpty
-        title="品牌全域词库"
-        description="当前企业词库暂时无法载入，请稍后刷新。"
-      />
-    );
-  }
-
-  return (
-    <section className="page-shell brand-deep-page">
-      {embedded ? (
-        <div className="managed-keyword-heading">
-          <span>企业词库资料</span>
-          <h2>管理员发布的补充词表</h2>
-          <p>品牌词、场景词、问题词与平台反馈数据会在这里同步更新。</p>
-        </div>
-      ) : (
-        <PageHeader
-          eyebrow="MindPromise智诺 / 品牌建设"
-          title="品牌全域词库"
-          desc="展示由管理员发布的品牌词、场景词、问题词与平台反馈数据。"
-        />
-      )}
-      <div className="saas-toolbar">
-        <div className="saas-search">
-          <Search size={16} />
-          <input
-            type="search"
-            placeholder="搜索词库内容..."
-            value={searchTerm}
-            onChange={(event) => setSearchTerm(event.target.value)}
-          />
-          {searchTerm && (
-            <button
-              type="button"
-              className="clear-btn"
-              aria-label="清空搜索"
-              onClick={() => setSearchTerm("")}
-            >
-              <X size={14} />
-            </button>
-          )}
-        </div>
-      </div>
-      <div className="saas-content-area" style={{ marginTop: 20 }}>
-        {visibleTables.map((table) => (
-          <Panel title={table.title} key={table.id}>
-            {table.description && (
-              <p className="panel-subtitle">{safeText(table.description)}</p>
-            )}
-            <DataTable headers={table.columns} rows={table.rows} />
-          </Panel>
-        ))}
-        {visibleTables.length === 0 && (
-          <ManagedModuleEmpty
-            title="品牌全域词库"
-            description={
-              keyword
-                ? "没有找到匹配的词库内容。"
-                : "当前账号尚无已发布词库。管理员上传词库表格后会在这里展示。"
-            }
-          />
         )}
       </div>
     </section>

@@ -706,6 +706,7 @@ function publicDeliveryCategoryLabel(ticket: InternalDeliveryTicketDto) {
   if (category === "domain_application") return "域名申请";
   if (category === "icp_filing") return "域名注册与 ICP 备案结果";
   if (category === "knowledge_base_maintenance") return "知识库维护";
+  if (category === "question_catalog") return "品牌词库与问题目录";
   return (
     WEBSITE_CONTENT_CATALOG.find((item) => item.value === category)?.label ??
     category
