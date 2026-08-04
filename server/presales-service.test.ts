@@ -400,6 +400,7 @@ describe("presales credential revocation", () => {
 });
 
 function createPresalesFileRetentionExecutor(input?: {
+  parentTaskId?: string | null;
   contentSource?: "user_upload" | "assistant_output" | null;
   uploadReservedAt?: Date | null;
   uploadedAt?: Date | null;
@@ -412,7 +413,7 @@ function createPresalesFileRetentionExecutor(input?: {
     apiCredentialId: "credential-1",
     kind: "file" as const,
     upstreamId: "file-1",
-    parentTaskId: null as string | null,
+    parentTaskId: input?.parentTaskId ?? null,
     contentSource: input?.contentSource ?? null,
     uploadReservedAt: input?.uploadReservedAt ?? null,
     uploadedAt: input?.uploadedAt ?? null,
@@ -716,6 +717,137 @@ describe("presales file retention ledger", () => {
     );
     expect(stillUnknown.contentSource).toBeNull();
   });
+
+  it("upgrades only an explicitly verified lifecycle-free historical file bound to the exact task", async () => {
+    const historical = createPresalesFileRetentionExecutor({
+      parentTaskId: "task-assessment",
+      contentSource: null,
+    });
+
+    const upgraded = await recordPresalesUpstreamResource(
+      {
+        apiCredentialId: "credential-1",
+        kind: "file",
+        upstreamId: "file-1",
+        parentTaskId: "task-assessment",
+        contentSource: "assistant_output",
+        verifiedAssistantOutput: true,
+      },
+      historical,
+    );
+
+    expect(upgraded).toMatchObject({
+      parentTaskId: "task-assessment",
+      contentSource: "assistant_output",
+      uploadReservedAt: null,
+      uploadedAt: null,
+      contentExpiresAt: null,
+      contentDeletedAt: null,
+    });
+  });
+
+  it.each([
+    {
+      name: "an unbound historical file",
+      existingParentTaskId: null,
+      requestedParentTaskId: "task-assessment",
+      verifiedAssistantOutput: true,
+      lifecycle: {},
+      rejects: false,
+    },
+    {
+      name: "a historical file observed without a current parent task",
+      existingParentTaskId: "task-assessment",
+      requestedParentTaskId: null,
+      verifiedAssistantOutput: true,
+      lifecycle: {},
+      rejects: false,
+    },
+    {
+      name: "a file bound to a different task",
+      existingParentTaskId: "task-other",
+      requestedParentTaskId: "task-assessment",
+      verifiedAssistantOutput: true,
+      lifecycle: {},
+      rejects: true,
+    },
+    {
+      name: "a matching file without explicit verification",
+      existingParentTaskId: "task-assessment",
+      requestedParentTaskId: "task-assessment",
+      verifiedAssistantOutput: undefined,
+      lifecycle: {},
+      rejects: false,
+    },
+    {
+      name: "a matching file with an upload reservation",
+      existingParentTaskId: "task-assessment",
+      requestedParentTaskId: "task-assessment",
+      verifiedAssistantOutput: true,
+      lifecycle: {
+        uploadReservedAt: new Date("2026-08-04T08:00:00.000Z"),
+      },
+      rejects: false,
+    },
+    {
+      name: "a matching uploaded file",
+      existingParentTaskId: "task-assessment",
+      requestedParentTaskId: "task-assessment",
+      verifiedAssistantOutput: true,
+      lifecycle: {
+        uploadReservedAt: new Date("2026-08-04T08:00:00.000Z"),
+        uploadedAt: new Date("2026-08-04T08:00:00.000Z"),
+        contentExpiresAt: new Date("2026-09-03T08:00:00.000Z"),
+      },
+      rejects: false,
+    },
+    {
+      name: "a matching deleted file",
+      existingParentTaskId: "task-assessment",
+      requestedParentTaskId: "task-assessment",
+      verifiedAssistantOutput: true,
+      lifecycle: {
+        contentDeletedAt: new Date("2026-08-04T08:00:00.000Z"),
+      },
+      rejects: false,
+    },
+  ])(
+    "does not upgrade $name",
+    async ({
+      existingParentTaskId,
+      requestedParentTaskId,
+      verifiedAssistantOutput,
+      lifecycle,
+      rejects,
+    }) => {
+      const historical = createPresalesFileRetentionExecutor({
+        parentTaskId: existingParentTaskId,
+        contentSource: null,
+        ...lifecycle,
+      });
+      const operation = recordPresalesUpstreamResource(
+        {
+          apiCredentialId: "credential-1",
+          kind: "file",
+          upstreamId: "file-1",
+          parentTaskId: requestedParentTaskId,
+          contentSource: "assistant_output",
+          ...(verifiedAssistantOutput === undefined
+            ? {}
+            : { verifiedAssistantOutput }),
+        },
+        historical,
+      );
+
+      if (rejects) {
+        await expect(operation).rejects.toMatchObject({ code: "CONFLICT" });
+      } else {
+        await operation;
+      }
+      expect(historical.resource.contentSource).toBeNull();
+      expect(historical.resource.parentTaskId).toBe(existingParentTaskId);
+    },
+  );
 });
 
 function createIdempotencyExecutor() {

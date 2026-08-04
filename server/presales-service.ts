@@ -1112,6 +1112,7 @@ export async function recordPresalesUpstreamResource(
     upstreamId: string;
     parentTaskId?: string | null;
     contentSource?: PresalesFileContentSource | null;
+    verifiedAssistantOutput?: boolean;
   },
   executor?: any,
 ) {
@@ -1162,12 +1163,38 @@ export async function recordPresalesUpstreamResource(
       );
     }
     const updates: Partial<PresalesUpstreamResource> = {};
-    if (!existing[0].parentTaskId && input.parentTaskId) {
+    const mayUpgradeHistoricalAssistantOutput =
+      input.verifiedAssistantOutput === true &&
+      input.kind === "file" &&
+      contentSource === "assistant_output" &&
+      Boolean(input.parentTaskId) &&
+      existing[0].parentTaskId === input.parentTaskId &&
+      existing[0].contentSource === null &&
+      existing[0].uploadReservedAt === null &&
+      existing[0].uploadedAt === null &&
+      existing[0].contentExpiresAt === null &&
+      existing[0].contentDeletedAt === null;
+    const ambiguousHistoricalFile =
+      input.verifiedAssistantOutput === true &&
+      input.kind === "file" &&
+      contentSource === "assistant_output" &&
+      existing[0].contentSource === null &&
+      existing[0].parentTaskId === null;
+    if (
+      !existing[0].parentTaskId &&
+      input.parentTaskId &&
+      !ambiguousHistoricalFile
+    ) {
       updates.parentTaskId = input.parentTaskId;
     }
-    // A historical null source is deliberately unknown. A later task output
-    // can echo a user attachment, so neither artifact discovery nor another
-    // create response is sufficient evidence to classify an existing row.
+    // Pre-provenance output rows were already bound to the exact task that
+    // exposed them. Re-observing that same typed output under the same API-key
+    // version can safely classify those rows without a bulk data migration.
+    // Unbound historical files remain unknown so echoed user uploads stay
+    // fail-closed across repeated retrievals.
+    if (mayUpgradeHistoricalAssistantOutput) {
+      updates.contentSource = "assistant_output";
+    }
     if (Object.keys(updates).length > 0) {
       await db
         .update(presalesUpstreamResources)

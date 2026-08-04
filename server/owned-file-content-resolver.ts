@@ -60,6 +60,8 @@ type OwnedResourceCredential = {
   id: string;
   apiKey: string;
   resource: {
+    parentTaskId?: string | null;
+    contentSource?: "user_upload" | "assistant_output" | null;
     createdAt?: Date | string | number | null;
     uploadedAt?: Date | string | number | null;
     contentExpiresAt?: Date | string | number | null;
@@ -106,6 +108,7 @@ export type OwnedFileAuthorization = {
   credentialId: string;
   apiKey: string;
   expiresAt?: number;
+  isTaskBoundAssistantOutput: boolean;
 };
 
 export type ResolvedOwnedFileContent = {
@@ -374,10 +377,16 @@ export class OwnedFileContentResolver {
       );
     }
 
+    const isTaskBoundAssistantOutput =
+      credential.resource.contentSource === "assistant_output" &&
+      typeof credential.resource.parentTaskId === "string" &&
+      credential.resource.parentTaskId.trim().length > 0;
+
     return {
       credentialId: credential.id,
       apiKey: credential.apiKey,
       expiresAt,
+      isTaskBoundAssistantOutput,
     };
   }
 
@@ -493,7 +502,13 @@ export class OwnedFileContentResolver {
     const mimeType =
       headerValue(response.headers, "content-type").split(";")[0]?.trim() ||
       "application/octet-stream";
-    if (mimeType.toLowerCase() === "application/json") {
+    // A JSON response from /content can be an API error envelope returned with
+    // an incorrect 2xx status. Only the immutable task-output ledger can prove
+    // that JSON is the expected file payload rather than an untrusted response.
+    if (
+      mimeType.toLowerCase() === "application/json" &&
+      !authorization.isTaskBoundAssistantOutput
+    ) {
       destroyResponseStream(response.data);
       throw new OwnedFileContentError(
         "SOURCE_CONTENT_INVALID",

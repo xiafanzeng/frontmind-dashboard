@@ -45,6 +45,8 @@ function createDependencies(input?: {
   createdAt?: Date;
   uploadedAt?: Date | null;
   expiresAt?: Date | null;
+  parentTaskId?: string | null;
+  contentSource?: "user_upload" | "assistant_output" | null;
 }) {
   let currentStored = input?.initialStored ?? null;
   const removeStoredFile = vi.fn(async () => {
@@ -77,6 +79,8 @@ function createDependencies(input?: {
       id: "credential-1",
       apiKey: "secret-api-key",
       resource: {
+        parentTaskId: input?.parentTaskId,
+        contentSource: input?.contentSource,
         createdAt: input?.createdAt ?? new Date("2026-08-01T00:00:00Z"),
         uploadedAt: input?.uploadedAt ?? null,
         contentExpiresAt:
@@ -330,6 +334,8 @@ describe("OwnedFileContentResolver", () => {
       createdAt: new Date("2020-01-01T00:00:00Z"),
       uploadedAt: null,
       expiresAt: null,
+      parentTaskId: "task-generated",
+      contentSource: "assistant_output",
       request,
     });
     const resolver = new OwnedFileContentResolver(dependencies);
@@ -347,6 +353,90 @@ describe("OwnedFileContentResolver", () => {
       expiresAt: undefined,
     });
     expect(await readAll(resolved.stream)).toEqual(generated);
+    expect(stageStoredFile).not.toHaveBeenCalled();
+  });
+
+  it("streams JSON for a task-bound assistant output without persisting it", async () => {
+    const generated = Buffer.from('{"schemaVersion":2,"status":"ok"}');
+    const request = vi.fn(async () => ({
+      status: 200,
+      data: Readable.from([generated]),
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": String(generated.length),
+        "content-disposition": 'attachment; filename="raw-output.json"',
+      },
+    }));
+    const { dependencies, stageStoredFile } = createDependencies({
+      uploadedAt: null,
+      expiresAt: null,
+      parentTaskId: "task-assessment",
+      contentSource: "assistant_output",
+      request,
+    });
+    const resolver = new OwnedFileContentResolver(dependencies);
+
+    const resolved = await resolver.resolve({
+      ownerUserId: 7,
+      fileId: "assessment-output",
+      now: Date.parse("2026-08-04T00:00:00Z"),
+    });
+
+    expect(resolved).toMatchObject({
+      source: "upstream",
+      filename: "raw-output.json",
+      mimeType: "application/json",
+      expiresAt: undefined,
+    });
+    expect(await readAll(resolved.stream)).toEqual(generated);
+    expect(stageStoredFile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "an unbound assistant output",
+      contentSource: "assistant_output" as const,
+      parentTaskId: null,
+    },
+    {
+      name: "a user upload even when it carries a task id",
+      contentSource: "user_upload" as const,
+      parentTaskId: "task-assessment",
+    },
+    {
+      name: "a legacy resource without provenance",
+      contentSource: null,
+      parentTaskId: "task-assessment",
+    },
+  ])("rejects JSON for $name", async ({ contentSource, parentTaskId }) => {
+    const upstream = Readable.from(['{"error":"not a trusted output"}']);
+    const request = vi.fn(async () => ({
+      status: 200,
+      data: upstream,
+      headers: { "content-type": "application/json" },
+    }));
+    const { dependencies, stageStoredFile } = createDependencies({
+      uploadedAt: null,
+      expiresAt: null,
+      contentSource,
+      parentTaskId,
+      request,
+    });
+    const resolver = new OwnedFileContentResolver(dependencies);
+
+    await expect(
+      resolver.resolve({
+        ownerUserId: 7,
+        fileId: "untrusted-json",
+        now: Date.parse("2026-08-04T00:00:00Z"),
+      }),
+    ).rejects.toMatchObject({
+      code: "SOURCE_CONTENT_INVALID",
+      statusCode: 422,
+      retryable: false,
+      recoveryAction: "reupload",
+    });
+    expect(upstream.destroyed).toBe(true);
     expect(stageStoredFile).not.toHaveBeenCalled();
   });
 

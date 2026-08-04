@@ -267,6 +267,7 @@ describe("presales upstream contract", () => {
     });
 
     expect([...artifacts.fileIds]).toEqual(["file-1", "file-2", "file-3"]);
+    expect([...artifacts.strictOutputFileIds]).toEqual(["file-1", "file-3"]);
     expect([...artifacts.urls]).toEqual([
       "https://objects.example.com/result.zip?signature=1",
       "https://cdn.example.com/a.md",

@@ -439,6 +439,8 @@ const presalesOwnedFileContentResolver = new OwnedFileContentResolver({
         apiKey: credential.apiKey,
         resource: {
           createdAt: credential.resource.createdAt,
+          parentTaskId: credential.resource.parentTaskId,
+          contentSource,
         },
       };
     }
@@ -478,6 +480,8 @@ const presalesOwnedFileContentResolver = new OwnedFileContentResolver({
       apiKey: credential.apiKey,
       resource: {
         createdAt: credential.resource.createdAt,
+        parentTaskId: credential.resource.parentTaskId,
+        contentSource,
         uploadedAt,
         contentExpiresAt,
         contentDeletedAt: credential.resource.contentDeletedAt,
@@ -632,6 +636,7 @@ export function redactUpstreamPayload(
 
 export type TaskArtifacts = {
   fileIds: Set<string>;
+  strictOutputFileIds: Set<string>;
   urls: Set<string>;
   truncated: boolean;
 };
@@ -664,6 +669,7 @@ function trustedFileIdFromUrl(value: string) {
 export function collectTaskArtifacts(value: unknown): TaskArtifacts {
   const result: TaskArtifacts = {
     fileIds: new Set(),
+    strictOutputFileIds: new Set(),
     urls: new Set(),
     truncated: false,
   };
@@ -704,7 +710,12 @@ export function collectTaskArtifacts(value: unknown): TaskArtifacts {
     const rawFileId = candidate.file_id ?? candidate.fileId;
     const fileIdValue = typeof rawFileId === "string" ? rawFileId.trim() : "";
     const fileId = fileIdValue.length <= 255 ? fileIdValue : "";
-    if (fileId) result.fileIds.add(fileId);
+    if (fileId) {
+      result.fileIds.add(fileId);
+      if (String(candidate.type ?? "").toLowerCase() === "output_file") {
+        result.strictOutputFileIds.add(fileId);
+      }
+    }
 
     const rawUrl =
       candidate.fileUrl ??
@@ -718,7 +729,12 @@ export function collectTaskArtifacts(value: unknown): TaskArtifacts {
       result.fileIds.size + result.urls.size < MAX_TRUSTED_TASK_ARTIFACTS
     ) {
       const inferredFileId = trustedFileIdFromUrl(url);
-      if (inferredFileId) result.fileIds.add(inferredFileId);
+      if (inferredFileId) {
+        result.fileIds.add(inferredFileId);
+        if (String(candidate.type ?? "").toLowerCase() === "output_file") {
+          result.strictOutputFileIds.add(inferredFileId);
+        }
+      }
     }
     if (
       url.length <= 4096 &&
@@ -729,6 +745,43 @@ export function collectTaskArtifacts(value: unknown): TaskArtifacts {
     }
   }
   return result;
+}
+
+async function registerTaskArtifacts(
+  taskId: string,
+  task: unknown,
+  credential: DecryptedPresalesCredential,
+) {
+  const artifacts = collectTaskArtifacts(task);
+  for (const fileId of artifacts.fileIds) {
+    // A model cannot authorize an arbitrary identifier by printing it: the
+    // authenticated upstream API must also confirm that the file exists under
+    // the exact credential version bound to this task.
+    await fetchFileMetadata(fileId, credential);
+    await recordPresalesUpstreamResource({
+      apiCredentialId: credential.id,
+      kind: "file",
+      upstreamId: fileId,
+      parentTaskId: taskId,
+      contentSource: "assistant_output",
+      verifiedAssistantOutput: artifacts.strictOutputFileIds.has(fileId),
+    });
+  }
+  const normalizedUrls = new Set<string>();
+  for (const value of artifacts.urls) {
+    const target = assertSafeExternalUrl(value);
+    normalizedUrls.add(target);
+  }
+  await syncPresalesOutputUrlGrants({
+    apiCredentialId: credential.id,
+    parentTaskId: taskId,
+    urls: [...normalizedUrls].map((url) => ({
+      url,
+      hostname: new URL(url).hostname,
+    })),
+  });
+  artifacts.urls = normalizedUrls;
+  return artifacts;
 }
 
 async function retrieveTask(
@@ -758,34 +811,7 @@ async function retrieveTask(
   const task = normalizeTask(
     redactUpstreamPayload(response.data, credential.apiKey),
   );
-  const artifacts = collectTaskArtifacts(task);
-  for (const fileId of artifacts.fileIds) {
-    // A model cannot authorize an arbitrary identifier by printing it: the
-    // authenticated upstream API must also confirm that the file exists under
-    // the exact credential version bound to this task.
-    await fetchFileMetadata(fileId, credential);
-    await recordPresalesUpstreamResource({
-      apiCredentialId: credential.id,
-      kind: "file",
-      upstreamId: fileId,
-      parentTaskId: taskId,
-      contentSource: "assistant_output",
-    });
-  }
-  const normalizedUrls = new Set<string>();
-  for (const value of artifacts.urls) {
-    const target = assertSafeExternalUrl(value);
-    normalizedUrls.add(target);
-  }
-  await syncPresalesOutputUrlGrants({
-    apiCredentialId: credential.id,
-    parentTaskId: taskId,
-    urls: [...normalizedUrls].map((url) => ({
-      url,
-      hostname: new URL(url).hostname,
-    })),
-  });
-  artifacts.urls = normalizedUrls;
+  const artifacts = await registerTaskArtifacts(taskId, task, credential);
   return { task, artifacts };
 }
 
@@ -1335,6 +1361,7 @@ router.post("/tasks", taskJsonParser, async (req, res) => {
         upstreamId: id,
       });
     }
+    await registerTaskArtifacts(id, task, credential);
     res.status(201).json(task);
   } catch (error) {
     sendKnownError(res, error);

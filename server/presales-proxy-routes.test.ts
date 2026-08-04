@@ -381,6 +381,54 @@ describe("presales create-time upload capability", () => {
     expect(get).not.toHaveBeenCalled();
   });
 
+  it("streams JSON only when the assistant output is bound to its parent task", async () => {
+    const fileId = "assessment-json-output";
+    const body = Buffer.from('{"schemaVersion":2,"status":"ok"}');
+    vi.mocked(getPresalesCredentialForResource).mockResolvedValue({
+      id: "credential-1",
+      version: 1,
+      apiKey: "sk-upload-file",
+      fingerprint: "fingerprint",
+      status: "active",
+      verifiedAt: new Date(),
+      resource: {
+        id: "resource-assessment-output",
+        apiCredentialId: "credential-1",
+        kind: "file",
+        upstreamId: fileId,
+        parentTaskId: "task-assessment",
+        contentSource: "assistant_output",
+        uploadReservedAt: null,
+        uploadedAt: null,
+        contentExpiresAt: null,
+        contentDeletedAt: null,
+        createdAt: new Date(),
+      },
+    });
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": String(body.length),
+        "content-disposition": 'attachment; filename="raw-output.json"',
+      },
+      data: Readable.from([body]),
+    });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("application/json");
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(body);
+    });
+
+    expect(get).toHaveBeenCalledOnce();
+    expect(await readStoredPresalesFile(fileId)).toBeNull();
+  });
+
   it("uploads with the create-time signed URL and never renews the original 30-day clock on retry", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-04T00:00:00.000Z"));
@@ -1541,6 +1589,7 @@ describe("presales idempotent task route", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.mocked(recordPresalesUpstreamResource).mockReset();
     if (originalServiceToken === undefined) {
       delete process.env.FRONTMIND_PRESALES_SERVICE_TOKEN;
     } else {
@@ -1599,6 +1648,99 @@ describe("presales idempotent task route", () => {
         upstreamTaskId: "task-1",
       }),
     );
+  });
+
+  it("registers a synchronously completed typed output file before returning the created task", async () => {
+    const keyHash = "d".repeat(64);
+    vi.mocked(acquirePresalesTaskReservation).mockResolvedValue({
+      state: "acquired",
+      reservationId: "reservation-completed-output",
+      attemptId: "attempt-completed-output",
+      keyHash,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+    });
+    vi.spyOn(axios, "post").mockResolvedValue({
+      status: 201,
+      data: {
+        id: "task-completed-output",
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [
+              {
+                type: "output_file",
+                file_id: "file-assessment-json",
+                filename: "raw-output.json",
+                mime_type: "application/json",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        id: "file-assessment-json",
+        filename: "raw-output.json",
+        mime_type: "application/json",
+      },
+    });
+
+    let releaseRegistration!: () => void;
+    const registrationGate = new Promise<void>((resolve) => {
+      releaseRegistration = resolve;
+    });
+    let registrationStarted!: () => void;
+    const registrationStartedPromise = new Promise<void>((resolve) => {
+      registrationStarted = resolve;
+    });
+    vi.mocked(recordPresalesUpstreamResource).mockImplementation(
+      async (input) => {
+        if (input.kind === "file") {
+          registrationStarted();
+          await registrationGate;
+        }
+        return undefined as never;
+      },
+    );
+
+    let responseSettled = false;
+    const responsePromise = withServer(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/tasks`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-frontmind-service-token": token,
+        },
+        body: JSON.stringify({
+          prompt: "evaluate current GEO state",
+          idempotencyKey: "project-123:assessment:create",
+        }),
+      });
+      responseSettled = true;
+      expect(response.status).toBe(201);
+      await expect(response.json()).resolves.toMatchObject({
+        id: "task-completed-output",
+        status: "completed",
+      });
+    });
+
+    await registrationStartedPromise;
+    expect(responseSettled).toBe(false);
+    expect(recordPresalesUpstreamResource).toHaveBeenCalledWith({
+      apiCredentialId: "credential-1",
+      kind: "file",
+      upstreamId: "file-assessment-json",
+      parentTaskId: "task-completed-output",
+      contentSource: "assistant_output",
+      verifiedAssistantOutput: true,
+    });
+
+    releaseRegistration();
+    await responsePromise;
   });
 
   it("returns a completed reservation without calling upstream", async () => {
