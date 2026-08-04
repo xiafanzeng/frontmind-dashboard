@@ -42,7 +42,7 @@ describe("migration manifest", () => {
       dialect: "mysql",
       count: journal.entries.length,
       latestTag: journal.entries.at(-1)?.tag,
-      schemaSnapshot: "meta/0053_snapshot.json",
+      schemaSnapshot: "meta/0054_snapshot.json",
       schemaTableCount: 59,
       schemaHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });

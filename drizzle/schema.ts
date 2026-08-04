@@ -402,6 +402,18 @@ export const presalesUpstreamResources = mysqlTable(
     kind: mysqlEnum("kind", ["task", "file"]).notNull(),
     upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
     parentTaskId: varchar("parentTaskId", { length: 255 }),
+    /**
+     * Explicit provenance for file bytes. Legacy rows remain null until an
+     * authenticated upload or task-output path can classify them safely.
+     */
+    contentSource: mysqlEnum("contentSource", [
+      "user_upload",
+      "assistant_output",
+    ]),
+    uploadReservedAt: timestamp("uploadReservedAt"),
+    uploadedAt: timestamp("uploadedAt"),
+    contentExpiresAt: timestamp("contentExpiresAt"),
+    contentDeletedAt: timestamp("contentDeletedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
   (table) => [
@@ -415,6 +427,14 @@ export const presalesUpstreamResources = mysqlTable(
       table.upstreamId,
     ),
     index("presales_upstream_resources_parent_task_idx").on(table.parentTaskId),
+    index("presales_upstream_resources_content_expiry_idx").on(
+      table.kind,
+      table.contentSource,
+      table.uploadReservedAt,
+      table.contentExpiresAt,
+      table.contentDeletedAt,
+      table.id,
+    ),
   ],
 );
 
@@ -2902,6 +2922,7 @@ export const conversations = mysqlTable(
       table.projectAssignmentId,
       table.updatedAt,
     ),
+    index("conversations_updated_idx").on(table.updatedAt, table.id),
     index("conversations_upstream_task_idx").on(table.upstreamTaskId),
     foreignKey({
       name: "conversations_project_assignment_fk",
@@ -3088,6 +3109,14 @@ export const upstreamResources = mysqlTable(
       { onDelete: "set null" },
     ),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    /**
+     * Immutable content-retention clock for user-uploaded files. Task rows and
+     * assistant/external files leave these fields null. Conversation snapshots
+     * must never refresh this clock.
+     */
+    uploadedAt: timestamp("uploadedAt"),
+    contentExpiresAt: timestamp("contentExpiresAt"),
+    contentDeletedAt: timestamp("contentDeletedAt"),
   },
   (table) => [
     uniqueIndex("upstream_resources_kind_id_uq").on(
@@ -3102,6 +3131,16 @@ export const upstreamResources = mysqlTable(
     index("upstream_resources_user_project_idx").on(
       table.userId,
       table.projectAssignmentId,
+    ),
+    index("upstream_resources_content_expiry_idx").on(
+      table.kind,
+      table.contentExpiresAt,
+      table.contentDeletedAt,
+      table.id,
+    ),
+    index("upstream_resources_conversation_kind_idx").on(
+      table.conversationId,
+      table.kind,
     ),
     foreignKey({
       name: "upstream_resources_project_assignment_fk",

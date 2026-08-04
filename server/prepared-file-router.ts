@@ -1,33 +1,44 @@
-import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import { Router, type Request, type Response } from "express";
-import {
-  getCredentialForUpstreamResource,
-  getEffectiveDecryptedCredentialForAccount,
-} from "./auth-service";
+import { getEffectiveDecryptedCredentialForAccount } from "./auth-service";
 import {
   PreparedFileError,
+  preparedFilePublicStatus,
   preparedFileService,
   type PreparedFileManifest,
 } from "./prepared-file-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
+import {
+  OwnedFileContentError,
+  ownedFileContentResolver,
+} from "./owned-file-content-resolver";
+import {
+  bindDownloadUrlToProject,
+  createSignedDownloadToken,
+  resolveDownloadProjectContext,
+  SignedDownloadTokenError,
+  verifySignedDownloadToken,
+} from "./signed-download-token";
 
 const router = Router();
 const DOWNLOAD_TOKEN_TTL_MS = 5 * 60 * 1000;
 
-const downloadTokens = new Map<
-  string,
-  {
-    assetId: string;
-    ownerUserId: number;
-    projectAssignmentId: string | null;
-    expiresAt: number;
-  }
->();
+router.use((_req, res, next) => {
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  next();
+});
 
 function requestProjectAssignmentId(req: Request) {
   return req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null;
+}
+
+function downloadProjectAssignmentId(req: Request) {
+  return resolveDownloadProjectContext({
+    middleware: req.frontmindDeliveryProjectContext?.projectAssignmentId,
+    query: req.query.projectAssignmentId,
+    header: req.headers["x-delivery-project-assignment-id"],
+  });
 }
 
 export interface ByteRange {
@@ -89,17 +100,53 @@ function contentDisposition(
 }
 
 function sendPreparedError(res: Response, error: unknown) {
+  if (error instanceof SignedDownloadTokenError) {
+    const secretUnavailable =
+      error.code === "DOWNLOAD_TOKEN_SECRET_UNAVAILABLE";
+    res.status(secretUnavailable ? 503 : 410).json({
+      error: {
+        message: secretUnavailable
+          ? "下载服务签名配置不可用，请联系管理员"
+          : "下载链接已失效",
+        code: secretUnavailable
+          ? "DOWNLOAD_TOKEN_SERVICE_UNAVAILABLE"
+          : "DOWNLOAD_LINK_EXPIRED",
+      },
+    });
+    return;
+  }
+  if (error instanceof OwnedFileContentError) {
+    res.status(error.statusCode).json({
+      error: {
+        message: error.message,
+        code: error.code,
+        retryable: error.retryable,
+        recoveryAction: error.recoveryAction,
+        expiresAt: error.expiresAt,
+      },
+    });
+    return;
+  }
   if (error instanceof PreparedFileError) {
     const status =
-      error.code === "ASSET_NOT_FOUND"
+      error.options.statusCode ??
+      (error.code === "ASSET_NOT_FOUND"
         ? 404
-        : error.code === "INSUFFICIENT_STORAGE"
-          ? 507
-          : error.code === "SOURCE_FORBIDDEN"
-            ? 403
-            : 400;
+        : error.code === "SOURCE_EXPIRED" || error.code === "ASSET_EXPIRED"
+          ? 410
+          : error.code === "INSUFFICIENT_STORAGE"
+            ? 507
+            : error.code === "SOURCE_FORBIDDEN"
+              ? 403
+              : 400);
     res.status(status).json({
-      error: { message: error.message, code: error.code },
+      error: {
+        message: error.message,
+        code: error.code,
+        retryable: error.retryable,
+        recoveryAction: error.recoveryAction,
+        expiresAt: error.expiresAt,
+      },
     });
     return;
   }
@@ -112,16 +159,20 @@ function sendPreparedError(res: Response, error: unknown) {
   });
 }
 
-function extractSource(fileUrl: string) {
+export function extractPreparedSource(fileUrl: string) {
   const parsed = new URL(fileUrl, "http://frontmind.local");
   const fileMatch = parsed.pathname.match(
     /(?:\/api\/frontmind)?\/v1\/files\/([^/]+)/,
   );
   if (fileMatch?.[1]) {
-    return {
-      kind: "file" as const,
-      fileId: decodeURIComponent(fileMatch[1]),
-    };
+    try {
+      return {
+        kind: "file" as const,
+        fileId: decodeURIComponent(fileMatch[1]),
+      };
+    } catch {
+      throw new PreparedFileError("INVALID_FILE_SOURCE", "文件地址编码无效");
+    }
   }
   if (parsed.pathname.endsWith("/api/frontmind/proxy-download")) {
     const externalUrl = parsed.searchParams.get("url");
@@ -135,6 +186,40 @@ function extractSource(fileUrl: string) {
   throw new PreparedFileError("INVALID_FILE_SOURCE", "无法识别 PDF 文件来源");
 }
 
+export function resolvePreparedSourceInput(body: unknown) {
+  const value =
+    body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  // fileId is opaque. Preserve the exact identifier and use trim only for the
+  // empty-value check.
+  const fileId = String(value.fileId ?? "");
+  const fileUrl = String(value.fileUrl || "").trim();
+  const hasFileId = Boolean(fileId.trim());
+  if (hasFileId && fileUrl) {
+    throw new PreparedFileError(
+      "AMBIGUOUS_FILE_SOURCE",
+      "fileId 与 fileUrl 只能提供一个",
+    );
+  }
+  if (hasFileId) {
+    if (fileId.length > 255 || /[\0\r\n]/.test(fileId)) {
+      throw new PreparedFileError("INVALID_FILE_SOURCE", "文件 ID 无效");
+    }
+    return { kind: "file" as const, fileId };
+  }
+  if (fileUrl) return extractPreparedSource(fileUrl);
+  throw new PreparedFileError("MISSING_FILE_SOURCE", "缺少 fileId 或 fileUrl");
+}
+
+export function boundedPreparedDownloadExpiry(
+  now: number,
+  sourceExpiresAt?: number,
+) {
+  return Math.min(
+    now + DOWNLOAD_TOKEN_TTL_MS,
+    sourceExpiresAt ?? Number.POSITIVE_INFINITY,
+  );
+}
+
 router.post("/prepare", async (req, res) => {
   try {
     const ownerUserId = req.frontmindUser?.id;
@@ -144,41 +229,24 @@ router.post("/prepare", async (req, res) => {
         .json({ error: { message: "请先登录", code: "UNAUTHORIZED" } });
       return;
     }
-    const fileUrl = String(req.body?.fileUrl || "");
     const filename = sanitizeFilename(
       String(req.body?.fileName || "document.pdf"),
     );
-    if (!fileUrl) {
-      res.status(400).json({
-        error: { message: "缺少文件地址", code: "MISSING_FILE_URL" },
-      });
-      return;
-    }
-
-    const source = extractSource(fileUrl);
+    const source = resolvePreparedSourceInput(req.body);
     if (source.kind === "file") {
-      const credential = await getCredentialForUpstreamResource(
+      const authorization = await ownedFileContentResolver.authorize({
         ownerUserId,
-        "file",
-        source.fileId,
-        requestProjectAssignmentId(req) ?? undefined,
-      );
-      if (!credential) {
-        res.status(403).json({
-          error: {
-            message: "该文件不属于当前账号，或其原 API Key 已删除",
-            code: "UPSTREAM_RESOURCE_FORBIDDEN",
-          },
-        });
-        return;
-      }
+        fileId: source.fileId,
+        projectAssignmentId: requestProjectAssignmentId(req),
+      });
       res.json(
         await preparedFileService.registerFile({
           ownerUserId,
-          credentialId: credential.id,
+          credentialId: authorization.credentialId,
           projectAssignmentId: requestProjectAssignmentId(req),
           fileId: source.fileId,
           filename,
+          expiresAt: authorization.expiresAt,
         }),
       );
       return;
@@ -242,16 +310,8 @@ router.post("/:assetId/retry", async (req, res) => {
   }
 });
 
-function cleanupDownloadTokens() {
-  const now = Date.now();
-  for (const [token, value] of downloadTokens) {
-    if (value.expiresAt <= now) downloadTokens.delete(token);
-  }
-}
-
 router.post("/:assetId/download-token", async (req, res) => {
   try {
-    cleanupDownloadTokens();
     const ownerUserId = req.frontmindUser?.id;
     if (!ownerUserId) {
       res
@@ -275,16 +335,35 @@ router.post("/:assetId/download-token", async (req, res) => {
       });
       return;
     }
-    const token = randomUUID();
-    const expiresAt = Date.now() + DOWNLOAD_TOKEN_TTL_MS;
-    downloadTokens.set(token, {
+    const expiresAt = boundedPreparedDownloadExpiry(
+      Date.now(),
+      manifest.expiresAt,
+    );
+    if (expiresAt <= Date.now()) {
+      throw new PreparedFileError(
+        "SOURCE_EXPIRED",
+        "文件已超过 30 天，请重新上传",
+        {
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: manifest.expiresAt,
+          statusCode: 410,
+        },
+      );
+    }
+    const token = createSignedDownloadToken({
+      kind: "prepared_file",
       assetId: manifest.id,
-      ownerUserId,
+      userId: ownerUserId,
+      credentialId: manifest.credentialId,
       projectAssignmentId: requestProjectAssignmentId(req),
-      expiresAt,
+      exp: expiresAt,
     });
     res.json({
-      downloadUrl: `/api/frontmind/assets/download/${token}`,
+      downloadUrl: bindDownloadUrlToProject(
+        `/api/frontmind/assets/download/${token}`,
+        manifest.projectAssignmentId,
+      ),
       expiresAt,
     });
   } catch (error) {
@@ -307,7 +386,9 @@ async function streamPreparedFile(
 
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Accept-Ranges", "bytes");
-  res.setHeader("Cache-Control", "private, max-age=3600, must-revalidate");
+  // A fresh max-age response can bypass server authorization after the source
+  // hard deadline. Prepared bytes therefore must never enter browser caches.
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
   res.setHeader(
     "Content-Disposition",
     contentDisposition(disposition, manifest.filename),
@@ -375,10 +456,8 @@ async function streamPreparedFile(
 
 router.get("/download/:token", async (req, res) => {
   try {
-    cleanupDownloadTokens();
     const ownerUserId = req.frontmindUser?.id;
-    const token = downloadTokens.get(req.params.token);
-    if (!ownerUserId || !token || token.expiresAt <= Date.now()) {
+    if (!ownerUserId) {
       res.status(410).json({
         error: {
           message: "下载链接已失效",
@@ -387,11 +466,21 @@ router.get("/download/:token", async (req, res) => {
       });
       return;
     }
-    if (token.ownerUserId !== ownerUserId) {
+    const token = verifySignedDownloadToken(req.params.token, "prepared_file");
+    if (token.userId !== ownerUserId) {
       res.status(403).json({
         error: {
           message: "下载链接不属于当前账号",
           code: "DOWNLOAD_FORBIDDEN",
+        },
+      });
+      return;
+    }
+    if (token.projectAssignmentId !== downloadProjectAssignmentId(req)) {
+      res.status(403).json({
+        error: {
+          message: "下载链接不属于当前客户项目",
+          code: "DELIVERY_PROJECT_CONTEXT_FORBIDDEN",
         },
       });
       return;
@@ -411,12 +500,17 @@ router.get("/download/:token", async (req, res) => {
         projectAssignmentId: token.projectAssignmentId,
       });
     }
-    downloadTokens.delete(req.params.token);
     const manifest = await preparedFileService.getReadyManifest(
       token.assetId,
       ownerUserId,
       token.projectAssignmentId,
     );
+    if (manifest.credentialId !== token.credentialId) {
+      throw new SignedDownloadTokenError(
+        "DOWNLOAD_TOKEN_INVALID",
+        "下载链接对应的文件凭据已变化",
+      );
+    }
     if (manifest.status !== "ready") {
       res.status(409).json({
         error: { message: "文件尚未准备完成", code: "FILE_NOT_READY" },
@@ -444,14 +538,7 @@ router.get("/:assetId/content", async (req, res) => {
       requestProjectAssignmentId(req),
     );
     if (manifest.status !== "ready") {
-      res.status(202).json({
-        assetId: manifest.id,
-        status: manifest.status,
-        phase: manifest.phase,
-        errorCode: manifest.errorCode,
-        errorMessage: manifest.errorMessage,
-        retryAfterMs: 2_000,
-      });
+      res.status(202).json(preparedFilePublicStatus(manifest));
       return;
     }
     await streamPreparedFile(

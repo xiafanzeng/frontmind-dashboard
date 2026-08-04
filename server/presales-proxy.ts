@@ -14,12 +14,15 @@ import { AuthServiceError } from "./auth-service";
 import {
   acquirePresalesTaskReservation,
   completePresalesTaskReservation,
+  finalizePresalesFileUploadRetention,
   getActivePresalesCredential,
   getPresalesCredentialForResource,
   hashPresalesTaskPayload,
   hasPresalesOutputUrlGrant,
+  markPresalesFileContentDeleted,
   recordPresalesUpstreamResource,
   releasePresalesTaskReservation,
+  reservePresalesFileUploadRetention,
   resolvePresalesTaskCredentialForFiles,
   syncPresalesOutputUrlGrants,
   type DecryptedPresalesCredential,
@@ -39,14 +42,20 @@ import {
   acquirePresalesFileCreateReservation,
   completePresalesFileCreateReservation,
   hashPresalesFileCreatePayload,
+  readPresalesFileLifecycle,
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
   releasePresalesFileCreateReservation,
   removePresalesFileCreateReservation,
   removeStoredPresalesFile,
+  removeStoredPresalesFileContent,
   stagePresalesFileContent,
-  type StoredPresalesFile,
 } from "./presales-file-store";
+import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
+import {
+  OwnedFileContentError,
+  OwnedFileContentResolver,
+} from "./owned-file-content-resolver";
 
 const router = Router();
 const SERVICE_TOKEN_HEADER = "x-frontmind-service-token";
@@ -86,10 +95,7 @@ const attachmentSchema = z.object({
   filename: z.string().trim().min(1).max(512),
 });
 
-const presalesAgentProfileSchema = z.enum([
-  "frontmind-base",
-  "frontmind-pro",
-]);
+const presalesAgentProfileSchema = z.enum(["frontmind-base", "frontmind-pro"]);
 
 const taskCreateSchema = z
   .object({
@@ -117,9 +123,7 @@ export function buildPresalesTaskBody(input: {
   agentProfile?: z.infer<typeof presalesAgentProfileSchema>;
 }) {
   const agentProfile =
-    input.agentProfile === "frontmind-pro"
-      ? "frontmind-pro"
-      : "frontmind-base";
+    input.agentProfile === "frontmind-pro" ? "frontmind-pro" : "frontmind-base";
   return {
     prompt: input.prompt,
     attachments: input.attachments ?? [],
@@ -322,29 +326,176 @@ function upstreamHeaders(apiKey: string) {
   };
 }
 
+const presalesOwnedFileContentResolver = new OwnedFileContentResolver({
+  getCredential: async (_ownerUserId, kind, fileId) => {
+    const credential = await getPresalesCredentialForResource(kind, fileId);
+    if (!credential) return null;
+    const contentSource = credential.resource.contentSource;
+    if (!contentSource) {
+      throw new OwnedFileContentError(
+        "SOURCE_UNAVAILABLE",
+        "文件来源台账缺失，请联系管理员",
+        {
+          statusCode: 410,
+          retryable: false,
+          recoveryAction: "contact_admin",
+        },
+      );
+    }
+    const uploadedAt = credential.resource.uploadedAt;
+    const contentExpiresAt = credential.resource.contentExpiresAt;
+    const uploadReservedAt = credential.resource.uploadReservedAt;
+    const hasUploadReservedAt = uploadReservedAt !== null;
+    const hasUploadedAt = uploadedAt !== null;
+    const hasContentExpiresAt = contentExpiresAt !== null;
+    if (
+      contentSource === "assistant_output" &&
+      (hasUploadReservedAt || hasUploadedAt || hasContentExpiresAt)
+    ) {
+      throw new OwnedFileContentError(
+        "SOURCE_UNAVAILABLE",
+        "文件来源与数据库生命周期台账不一致，请联系管理员",
+        {
+          statusCode: 410,
+          retryable: false,
+          recoveryAction: "contact_admin",
+        },
+      );
+    }
+    if (
+      contentSource === "user_upload" &&
+      !(
+        (!hasUploadReservedAt && !hasUploadedAt && !hasContentExpiresAt) ||
+        (hasUploadReservedAt && !hasUploadedAt && !hasContentExpiresAt) ||
+        (uploadReservedAt &&
+          uploadedAt &&
+          contentExpiresAt &&
+          Number.isFinite(uploadReservedAt.getTime()) &&
+          uploadReservedAt.getTime() === uploadedAt.getTime() &&
+          Number.isFinite(contentExpiresAt.getTime()) &&
+          contentExpiresAt.getTime() - uploadedAt.getTime() ===
+            FILE_CONTENT_RETENTION_MS)
+      )
+    ) {
+      throw new OwnedFileContentError(
+        "SOURCE_UNAVAILABLE",
+        "文件生命周期数据库台账无效，请联系管理员",
+        {
+          statusCode: 410,
+          retryable: false,
+          recoveryAction: "contact_admin",
+        },
+      );
+    }
+    if (credential.resource.contentDeletedAt) {
+      throw new OwnedFileContentError(
+        contentSource === "user_upload"
+          ? "SOURCE_EXPIRED"
+          : "SOURCE_UNAVAILABLE",
+        contentSource === "user_upload"
+          ? "文件已超过 30 天或已删除，请重新上传"
+          : "文件已删除，无法继续读取",
+        {
+          statusCode: 410,
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: credential.resource.contentExpiresAt?.getTime(),
+        },
+      );
+    }
+    if (contentSource === "assistant_output") {
+      let lifecycle;
+      try {
+        lifecycle = await readPresalesFileLifecycle(fileId);
+      } catch {
+        throw new OwnedFileContentError(
+          "SOURCE_UNAVAILABLE",
+          "本地文件生命周期记录损坏，请联系管理员",
+          {
+            statusCode: 410,
+            retryable: false,
+            recoveryAction: "contact_admin",
+          },
+        );
+      }
+      if (
+        lifecycle?.uploadedAt ||
+        lifecycle?.contentExpiresAt ||
+        lifecycle?.contentDeletedAt ||
+        lifecycle?.state === "expired"
+      ) {
+        throw new OwnedFileContentError(
+          "SOURCE_UNAVAILABLE",
+          "文件来源与本地生命周期台账不一致，请联系管理员",
+          {
+            statusCode: 410,
+            retryable: false,
+            recoveryAction: "contact_admin",
+          },
+        );
+      }
+      return {
+        id: credential.id,
+        apiKey: credential.apiKey,
+        resource: {
+          createdAt: credential.resource.createdAt,
+        },
+      };
+    }
+
+    if (!uploadReservedAt || !uploadedAt || !contentExpiresAt) {
+      throw new OwnedFileContentError(
+        "SOURCE_UNAVAILABLE",
+        "文件尚未上传成功，请重新上传",
+        {
+          statusCode: 410,
+          retryable: false,
+          recoveryAction: "reupload",
+        },
+      );
+    }
+    let lifecycle;
+    try {
+      lifecycle = await readPresalesFileLifecycle(fileId);
+    } catch {
+      // DB is authoritative. A broken manifest is only a damaged cache and
+      // must be removed in full so /content can be recaptured with the DB clock.
+      await removeStoredPresalesFile(fileId);
+      lifecycle = null;
+    }
+    if (
+      lifecycle?.state === "expired" ||
+      (lifecycle?.uploadedAt &&
+        lifecycle.uploadedAt.getTime() !== uploadedAt.getTime()) ||
+      (lifecycle?.contentExpiresAt &&
+        lifecycle.contentExpiresAt.getTime() !== contentExpiresAt.getTime())
+    ) {
+      await removeStoredPresalesFile(fileId);
+      lifecycle = null;
+    }
+    return {
+      id: credential.id,
+      apiKey: credential.apiKey,
+      resource: {
+        createdAt: credential.resource.createdAt,
+        uploadedAt,
+        contentExpiresAt,
+        contentDeletedAt: credential.resource.contentDeletedAt,
+      },
+    };
+  },
+  readStoredFile: readStoredPresalesFile,
+  removeStoredFile: removeStoredPresalesFileContent,
+  stageStoredFile: stagePresalesFileContent,
+  getBaseUrl: getUpstreamBaseUrl,
+  request: (url, options) => axios.get(url, options),
+});
+
 function safeFilename(value: unknown, fallback = "download") {
   const filename = String(value || fallback)
     .replace(/[\\/\0\r\n]/g, "_")
     .trim();
   return filename || fallback;
-}
-
-function filenameFromContentDisposition(value: unknown, fallback: string) {
-  const disposition = String(value || "");
-  const encoded = disposition.match(
-    /filename\*\s*=\s*(?:"?UTF-8''([^";\r\n]+)"?)/i,
-  )?.[1];
-  if (encoded) {
-    try {
-      return safeFilename(decodeURIComponent(encoded.trim()), fallback);
-    } catch {
-      // Fall through to the plain filename or the file id.
-    }
-  }
-  const plain = disposition.match(
-    /filename\s*=\s*(?:"([^"\r\n]+)"|([^;\s\r\n]+))/i,
-  );
-  return safeFilename(plain?.[1] || plain?.[2], fallback);
 }
 
 function upstreamErrorDetail(data: any, fallback: string, apiKey?: string) {
@@ -365,9 +516,7 @@ function forwardedStatus(value: unknown, fallback = 502) {
 
 function isDefinitiveFileCreateRejection(status: number) {
   return (
-    status >= 400 &&
-    status < 500 &&
-    ![408, 409, 425, 429].includes(status)
+    status >= 400 && status < 500 && ![408, 409, 425, 429].includes(status)
   );
 }
 
@@ -620,6 +769,7 @@ async function retrieveTask(
       kind: "file",
       upstreamId: fileId,
       parentTaskId: taskId,
+      contentSource: "assistant_output",
     });
   }
   const normalizedUrls = new Set<string>();
@@ -724,19 +874,14 @@ router.post("/files", fileJsonParser, async (req, res) => {
         headers: {
           ...upstreamHeaders(credential.apiKey),
           "Content-Type": "application/json",
-          ...(reservation
-            ? { "Idempotency-Key": reservation.keyHash }
-            : {}),
+          ...(reservation ? { "Idempotency-Key": reservation.keyHash } : {}),
         },
         timeout: 120_000,
         validateStatus: () => true,
       },
     );
     if (response.status < 200 || response.status >= 300) {
-      if (
-        reservation &&
-        isDefinitiveFileCreateRejection(response.status)
-      ) {
+      if (reservation && isDefinitiveFileCreateRejection(response.status)) {
         await releasePresalesFileCreateReservation(reservation);
       }
       return res.status(forwardedStatus(response.status)).json({
@@ -761,6 +906,7 @@ router.post("/files", fileJsonParser, async (req, res) => {
       apiCredentialId: credential.id,
       kind: "file",
       upstreamId: id,
+      contentSource: "user_upload",
     });
     await recordPresalesFileDescriptor({
       fileId: id,
@@ -866,6 +1012,68 @@ router.put("/files/:fileId/content", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
     const credential = await requireResourceCredential("file", fileId);
+    const resource = credential.resource;
+    const uploadReservedAtMs = resource.uploadReservedAt?.getTime();
+    const uploadedAtMs = resource.uploadedAt?.getTime();
+    const contentExpiresAtMs = resource.contentExpiresAt?.getTime();
+    if (resource.contentSource !== "user_upload") {
+      throw new OwnedFileContentError(
+        "SOURCE_FORBIDDEN",
+        "文件不是可上传的用户文件，请重新创建文件",
+        {
+          statusCode: 403,
+          retryable: false,
+          recoveryAction: "reupload",
+        },
+      );
+    }
+    const isUnreserved =
+      uploadReservedAtMs === undefined &&
+      uploadedAtMs === undefined &&
+      contentExpiresAtMs === undefined;
+    const isReserved =
+      uploadReservedAtMs !== undefined &&
+      Number.isFinite(uploadReservedAtMs) &&
+      uploadedAtMs === undefined &&
+      contentExpiresAtMs === undefined;
+    const isCompleted =
+      uploadReservedAtMs !== undefined &&
+      uploadedAtMs !== undefined &&
+      contentExpiresAtMs !== undefined &&
+      Number.isFinite(uploadReservedAtMs) &&
+      uploadReservedAtMs === uploadedAtMs &&
+      Number.isFinite(contentExpiresAtMs) &&
+      contentExpiresAtMs - uploadedAtMs === FILE_CONTENT_RETENTION_MS;
+    if (!isUnreserved && !isReserved && !isCompleted) {
+      throw new OwnedFileContentError(
+        "SOURCE_UNAVAILABLE",
+        "文件生命周期数据库台账无效，请联系管理员",
+        {
+          statusCode: 410,
+          retryable: false,
+          recoveryAction: "contact_admin",
+        },
+      );
+    }
+    if (
+      resource.contentDeletedAt ||
+      (contentExpiresAtMs ??
+        (uploadReservedAtMs === undefined
+          ? undefined
+          : uploadReservedAtMs + FILE_CONTENT_RETENTION_MS) ??
+        Infinity) <= Date.now()
+    ) {
+      throw new OwnedFileContentError(
+        "SOURCE_EXPIRED",
+        "文件已超过 30 天或已删除，请重新上传",
+        {
+          statusCode: 410,
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: contentExpiresAtMs,
+        },
+      );
+    }
     const contentLength = Number(req.headers["content-length"] ?? 0);
     if (
       Number.isFinite(contentLength) &&
@@ -879,13 +1087,9 @@ router.put("/files/:fileId/content", async (req, res) => {
     const uploadTicket = Array.isArray(ticketHeader)
       ? ticketHeader[0]
       : ticketHeader;
-    const target = uploadTicket
+    const ticketTarget = uploadTicket
       ? openPresalesUploadTicket(uploadTicket, fileId)
-      : assertSafeExternalUrl(
-          String(
-            (await fetchFileMetadata(fileId, credential)).upload_url ?? "",
-          ),
-        );
+      : null;
     const staged = await stagePresalesFileContent({
       fileId,
       stream: req,
@@ -902,7 +1106,22 @@ router.put("/files/:fileId/content", async (req, res) => {
       String(req.headers["content-type"] ?? "") ||
       "application/octet-stream";
     let response;
+    let reservation;
     try {
+      reservation = await reservePresalesFileUploadRetention({
+        fileId,
+        apiCredentialId: credential.id,
+        // The completed staged copy is the conservative first-attempt clock.
+        // It is persisted before the external PUT and every retry reuses it.
+        now: new Date(),
+      });
+      const target =
+        ticketTarget ??
+        assertSafeExternalUrl(
+          String(
+            (await fetchFileMetadata(fileId, credential)).upload_url ?? "",
+          ),
+        );
       response = await axios.put(target, staged.createReadStream(), {
         ...safeExternalRequestOptions,
         // SigV4 authenticates the exact request URL; following a redirect would
@@ -934,13 +1153,43 @@ router.put("/files/:fileId/content", async (req, res) => {
         },
       });
     }
-    await staged.commit({ mimeType: originalContentType });
+    let retention;
+    try {
+      retention = await finalizePresalesFileUploadRetention({
+        fileId,
+        apiCredentialId: credential.id,
+        now: new Date(),
+      });
+      await staged.commit({
+        mimeType: originalContentType,
+        uploadedAt: retention.uploadedAt,
+        contentExpiresAt: retention.contentExpiresAt,
+      });
+    } catch {
+      await staged.discard().catch(() => undefined);
+      throw new OwnedFileContentError(
+        "SOURCE_CAPTURE_FAILED",
+        "上游已接收文件，但本地持久化失败，请重试",
+        {
+          statusCode: 503,
+          retryable: true,
+          recoveryAction: "retry",
+          expiresAt:
+            retention?.contentExpiresAt.getTime() ??
+            reservation.uploadReservedAt.getTime() + FILE_CONTENT_RETENTION_MS,
+        },
+      );
+    }
     res.status(200).json(buildProxyUploadSuccess(response.status));
   } catch (error) {
     if (error instanceof Error && error.message === "FILE_TOO_LARGE") {
       res.status(413).json({
         error: { code: "FILE_TOO_LARGE", message: "File exceeds 100 MB" },
       });
+      return;
+    }
+    if (error instanceof OwnedFileContentError) {
+      sendOwnedPresalesFileError(res, error);
       return;
     }
     sendKnownError(res, error);
@@ -951,6 +1200,13 @@ router.delete("/files/:fileId", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
     const credential = await requireResourceCredential("file", fileId);
+    if (credential.resource.contentSource === "user_upload") {
+      await markPresalesFileContentDeleted({
+        fileId,
+        apiCredentialId: credential.id,
+        now: new Date(),
+      });
+    }
     const response = await axios.delete(
       `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
       {
@@ -1149,186 +1405,133 @@ async function streamExternalOutput(
   response.data.pipe(res);
 }
 
-function sendFileContentDownloadFailure(
-  res: Response,
-  input: {
-    fileId: string;
-    upstreamStatus?: number;
-    errorCode:
-      | "UPSTREAM_FILE_CONTENT_FAILED"
-      | "UPSTREAM_FILE_CONTENT_EMPTY"
-      | "UPSTREAM_FILE_CONTENT_TOO_LARGE"
-      | "UPSTREAM_FILE_CONTENT_STREAM_FAILED"
-      | "LOCAL_FILE_CONTENT_FAILED";
-  },
-) {
-  console.warn("[Presales Proxy] File content download failed", {
-    phase: "file_content_download",
-    fileId: input.fileId,
-    upstreamStatus: input.upstreamStatus,
-    errorCode: input.errorCode,
-  });
+function sendOwnedPresalesFileError(res: Response, error: unknown) {
   if (res.headersSent) {
     res.destroy();
     return;
   }
-  res
-    .status(
-      input.upstreamStatus && input.upstreamStatus >= 400
-        ? forwardedStatus(input.upstreamStatus)
-        : 502,
-    )
-    .json({
+  if (error instanceof OwnedFileContentError) {
+    res.status(error.statusCode).json({
       error: {
-        code: input.errorCode,
-        message: "File content download failed",
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+        recoveryAction: error.recoveryAction,
+        ...(error.expiresAt !== undefined
+          ? { expiresAt: error.expiresAt }
+          : {}),
       },
     });
+    return;
+  }
+  sendKnownError(res, error);
 }
 
-async function streamStoredPresalesFile(
+async function streamResolvedPresalesFile(
   res: Response,
-  fileId: string,
-  stored: StoredPresalesFile,
+  resolved: Awaited<ReturnType<OwnedFileContentResolver["resolve"]>>,
 ) {
-  let streamedBytes = 0;
-  try {
+  if (
+    resolved.sizeBytes !== undefined &&
+    (!Number.isSafeInteger(resolved.sizeBytes) ||
+      resolved.sizeBytes < 1 ||
+      resolved.sizeBytes > MAX_PROXY_UPLOAD_BYTES)
+  ) {
+    resolved.stream.destroy();
+    throw new OwnedFileContentError(
+      "SOURCE_CONTENT_TOO_LARGE",
+      "文件超过 100 MB，无法下载",
+      {
+        statusCode: 413,
+        retryable: false,
+        recoveryAction: "reupload",
+        expiresAt: resolved.expiresAt,
+      },
+    );
+  }
+
+  const writeHeaders = () => {
     res.status(200);
-    res.setHeader("Content-Type", stored.mimeType);
-    res.setHeader("Content-Length", String(stored.sizeBytes));
-    const encoded = encodeURIComponent(stored.filename || fileId);
+    res.setHeader(
+      "Content-Type",
+      resolved.mimeType || "application/octet-stream",
+    );
+    if (resolved.sizeBytes !== undefined) {
+      res.setHeader("Content-Length", String(resolved.sizeBytes));
+    }
+    const encoded = encodeURIComponent(
+      safeFilename(resolved.filename, resolved.fileId),
+    );
     res.setHeader(
       "Content-Disposition",
       `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`,
     );
-    for await (const value of stored.createReadStream()) {
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      if (!chunk.length) continue;
-      streamedBytes += chunk.length;
-      if (!res.write(chunk)) await once(res, "drain");
+  };
+
+  let streamedBytes = 0;
+  for await (const value of resolved.stream) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    if (!chunk.length) continue;
+    if (streamedBytes + chunk.length > MAX_PROXY_UPLOAD_BYTES) {
+      resolved.stream.destroy();
+      throw new OwnedFileContentError(
+        "SOURCE_CONTENT_TOO_LARGE",
+        "文件超过 100 MB，无法下载",
+        {
+          statusCode: 413,
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: resolved.expiresAt,
+        },
+      );
     }
-    if (streamedBytes !== stored.sizeBytes) throw new Error("SHORT_READ");
-    res.end();
-  } catch {
-    sendFileContentDownloadFailure(res, {
-      fileId,
-      errorCode: "LOCAL_FILE_CONTENT_FAILED",
-    });
+    if (streamedBytes === 0) writeHeaders();
+    streamedBytes += chunk.length;
+    if (!res.write(chunk)) await once(res, "drain");
   }
+  if (streamedBytes < 1) {
+    throw new OwnedFileContentError(
+      "SOURCE_CONTENT_INVALID",
+      "上游未返回有效文件内容，请重新上传",
+      {
+        statusCode: 422,
+        retryable: false,
+        recoveryAction: "reupload",
+        expiresAt: resolved.expiresAt,
+      },
+    );
+  }
+  if (
+    resolved.sizeBytes !== undefined &&
+    streamedBytes !== resolved.sizeBytes
+  ) {
+    throw new OwnedFileContentError(
+      "SOURCE_DOWNLOAD_FAILED",
+      "文件内容读取不完整，请重试",
+      {
+        statusCode: 503,
+        retryable: true,
+        recoveryAction: "retry",
+        expiresAt: resolved.expiresAt,
+      },
+    );
+  }
+  res.end();
 }
 
 router.get("/files/:fileId/content", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
-    const credential = await requireResourceCredential("file", fileId);
-    const stored = await readStoredPresalesFile(fileId);
-    if (stored) {
-      await streamStoredPresalesFile(res, fileId, stored);
-      return;
-    }
-    const response = await axios.get(
-      `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}/content`,
-      {
-        headers: upstreamHeaders(credential.apiKey),
-        responseType: "stream",
-        timeout: UPSTREAM_TIMEOUT_MS,
-        maxContentLength: Infinity,
-        validateStatus: () => true,
-      },
-    );
-    if (response.status < 200 || response.status >= 300) {
-      sendFileContentDownloadFailure(res, {
-        fileId,
-        upstreamStatus: response.status,
-        errorCode: "UPSTREAM_FILE_CONTENT_FAILED",
-      });
-      return;
-    }
-    const declaredLengthHeader = response.headers["content-length"];
-    const declaredLength =
-      declaredLengthHeader === undefined
-        ? undefined
-        : Number(declaredLengthHeader);
-    if (declaredLength === 0) {
-      sendFileContentDownloadFailure(res, {
-        fileId,
-        upstreamStatus: response.status,
-        errorCode: "UPSTREAM_FILE_CONTENT_EMPTY",
-      });
-      return;
-    }
-    if (
-      declaredLength !== undefined &&
-      (!Number.isSafeInteger(declaredLength) ||
-        declaredLength < 0 ||
-        declaredLength > MAX_PROXY_UPLOAD_BYTES)
-    ) {
-      sendFileContentDownloadFailure(res, {
-        fileId,
-        upstreamStatus: response.status,
-        errorCode: "UPSTREAM_FILE_CONTENT_TOO_LARGE",
-      });
-      return;
-    }
-
-    const filename = filenameFromContentDisposition(
-      response.headers["content-disposition"],
+    const resolved = await presalesOwnedFileContentResolver.resolve({
+      // The service-token boundary owns presales access; the resolver's
+      // credential adapter ignores this sentinel and verifies the immutable
+      // presales resource/credential binding instead.
+      ownerUserId: 0,
       fileId,
-    );
-    let streamedBytes = 0;
-    try {
-      for await (const value of response.data as AsyncIterable<unknown>) {
-        const chunk = Buffer.isBuffer(value)
-          ? value
-          : Buffer.from(value as any);
-        if (!chunk.length) continue;
-        if (streamedBytes + chunk.length > MAX_PROXY_UPLOAD_BYTES) {
-          sendFileContentDownloadFailure(res, {
-            fileId,
-            upstreamStatus: response.status,
-            errorCode: "UPSTREAM_FILE_CONTENT_TOO_LARGE",
-          });
-          return;
-        }
-        if (streamedBytes === 0) {
-          res.status(200);
-          res.setHeader(
-            "Content-Type",
-            String(
-              response.headers["content-type"] ?? "application/octet-stream",
-            ),
-          );
-          if (declaredLength !== undefined) {
-            res.setHeader("Content-Length", String(declaredLength));
-          }
-          const encoded = encodeURIComponent(filename);
-          res.setHeader(
-            "Content-Disposition",
-            `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`,
-          );
-        }
-        streamedBytes += chunk.length;
-        if (!res.write(chunk)) await once(res, "drain");
-      }
-    } catch {
-      sendFileContentDownloadFailure(res, {
-        fileId,
-        upstreamStatus: response.status,
-        errorCode: "UPSTREAM_FILE_CONTENT_STREAM_FAILED",
-      });
-      return;
-    }
-    if (!streamedBytes) {
-      sendFileContentDownloadFailure(res, {
-        fileId,
-        upstreamStatus: response.status,
-        errorCode: "UPSTREAM_FILE_CONTENT_EMPTY",
-      });
-      return;
-    }
-    res.end();
+    });
+    await streamResolvedPresalesFile(res, resolved);
   } catch (error) {
-    sendKnownError(res, error);
+    sendOwnedPresalesFileError(res, error);
   }
 });
 

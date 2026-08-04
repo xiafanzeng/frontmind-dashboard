@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import axios from "axios";
 import ExcelJS from "exceljs";
 import { and, eq } from "drizzle-orm";
 
@@ -11,7 +10,6 @@ import {
   deliveryTickets,
 } from "../drizzle/schema";
 import type { AuthenticatedUser } from "./auth-service";
-import { getCredentialForUpstreamResource } from "./auth-service";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { assertWorkspaceAccess } from "./dashboard-service";
 import {
@@ -20,11 +18,10 @@ import {
 } from "./delivery-ticket-service";
 import { getDb } from "./db";
 import { getServicePortal } from "./service-entitlement";
-import { getUpstreamBaseUrl } from "./upstream-config";
 import {
-  assertSafeExternalUrl,
-  safeExternalRequestOptions,
-} from "./_core/safe-external-url";
+  OwnedFileContentError,
+  ownedFileContentResolver,
+} from "./owned-file-content-resolver";
 
 export type RedirectPreviewError = { row: number; message: string };
 export type RedirectPreviewRow = {
@@ -265,73 +262,42 @@ async function requireDb() {
   return db;
 }
 
-async function downloadOwnedFile(ownerUserId: number, fileId: string) {
-  const credential = await getCredentialForUpstreamResource(
-    ownerUserId,
-    "file",
-    fileId,
-  );
-  if (!credential) {
-    throw new DeliveryTicketError(
-      "ATTACHMENT_FORBIDDEN",
-      "上传文件不属于当前管理员。",
-      403,
-    );
+export async function downloadOwnedRedirectFile(
+  ownerUserId: number,
+  fileId: string,
+) {
+  let resolved;
+  try {
+    resolved = await ownedFileContentResolver.resolve({ ownerUserId, fileId });
+  } catch (error) {
+    if (error instanceof OwnedFileContentError) {
+      throw new DeliveryTicketError(
+        error.code === "SOURCE_FORBIDDEN"
+          ? "ATTACHMENT_FORBIDDEN"
+          : "ATTACHMENT_UNAVAILABLE",
+        error.message,
+        error.statusCode,
+      );
+    }
+    throw error;
   }
-  const baseUrl = getUpstreamBaseUrl().replace(/\/$/, "");
-  const headers = {
-    API_KEY: credential.apiKey,
-    Authorization: `Bearer ${credential.apiKey}`,
-  };
-  const metadata = await axios.get(
-    `${baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
-    {
-      headers,
-      timeout: 30_000,
-      maxRedirects: 0,
-      maxContentLength: 1024 * 1024,
-      validateStatus: () => true,
-    },
-  );
-  if (metadata.status !== 200) {
-    throw new DeliveryTicketError(
-      "ATTACHMENT_UNAVAILABLE",
-      "无法读取上传文件。",
-      400,
-    );
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const value of resolved.stream) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    size += chunk.length;
+    if (size > MAX_REDIRECT_FILE_BYTES) {
+      resolved.stream.destroy();
+      throw new DeliveryTicketError(
+        "ATTACHMENT_TOO_LARGE",
+        "批量跳转文件不能超过 25MB。",
+        400,
+      );
+    }
+    chunks.push(chunk);
   }
-  const uploadUrl =
-    typeof metadata.data?.upload_url === "string" &&
-    metadata.data.upload_url.trim()
-      ? metadata.data.upload_url
-      : null;
-  const url = uploadUrl
-    ? assertSafeExternalUrl(uploadUrl)
-    : `${baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`;
-  const response = await axios.get(url, {
-    ...(uploadUrl ? safeExternalRequestOptions : { headers, maxRedirects: 0 }),
-    responseType: "arraybuffer",
-    timeout: 120_000,
-    maxContentLength: MAX_REDIRECT_FILE_BYTES,
-    maxBodyLength: MAX_REDIRECT_FILE_BYTES,
-    validateStatus: () => true,
-  });
-  if (response.status !== 200) {
-    throw new DeliveryTicketError(
-      "ATTACHMENT_UNAVAILABLE",
-      "无法下载上传文件。",
-      400,
-    );
-  }
-  const buffer = Buffer.from(response.data);
-  if (buffer.length > MAX_REDIRECT_FILE_BYTES) {
-    throw new DeliveryTicketError(
-      "ATTACHMENT_TOO_LARGE",
-      "批量跳转文件不能超过 25MB。",
-      400,
-    );
-  }
-  return buffer;
+  return Buffer.concat(chunks, size);
 }
 
 export async function previewRedirectWorkbook(input: {
@@ -342,7 +308,7 @@ export async function previewRedirectWorkbook(input: {
 }) {
   await assertWorkspaceAccess(input.actor, input.userId);
   assertDeliveryTicketServiceEligibility(await getServicePortal(input.userId));
-  const buffer = await downloadOwnedFile(input.actor.id, input.fileId);
+  const buffer = await downloadOwnedRedirectFile(input.actor.id, input.fileId);
   const fileHash = createHash("sha256").update(buffer).digest("hex");
   const now = new Date();
   const db = await requireDb();

@@ -119,6 +119,7 @@ describe("service portal migration chain", () => {
       "0051_delivery_ticket_retention",
       "0052_delivery_ticket_retention_guards",
       "0053_low_dorian_gray",
+      "0054_file_content_retention",
     ]);
   });
 
@@ -191,6 +192,23 @@ describe("service portal migration chain", () => {
     expect(migrationSql).not.toMatch(
       /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
     );
+  });
+
+  it("adds independent file-content and conversation-idle retention scans", async () => {
+    const migrationSql = await migration("0054_file_content_retention.sql");
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
+    for (const statement of [
+      "ADD `uploadedAt` timestamp",
+      "ADD `contentExpiresAt` timestamp",
+      "ADD `contentDeletedAt` timestamp",
+      "`conversations` (`updatedAt`,`id`)",
+      "`upstream_resources` (`kind`,`contentExpiresAt`,`contentDeletedAt`,`id`)",
+      "`upstream_resources` (`conversationId`,`kind`)",
+    ]) {
+      expect(migrationSql).toContain(statement);
+    }
   });
 
   it("adds an immutable task usage ledger and coverage proof without destructive changes", async () => {

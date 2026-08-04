@@ -75,6 +75,10 @@ describe("socratic knowledge-base Skill packaging", () => {
     expect(outputContract).toContain('"sourceKind": "user_upload"');
     expect(validator).toContain("MAX_USER_UPLOAD_IMAGES = 99");
     expect(validator).toContain("duplicate original customer upload hash");
+    expect(validator).not.toContain("CUSTOMER_FORMAL_LEAKAGE");
+    expect(validator).not.toContain("CUSTOMER_OR_PROCUREMENT_ADVICE");
+    expect(skill).toContain("not a vocabulary-based runtime gate");
+    expect(outputContract).toContain("does not screen formal prose");
   });
 
   it("pins reference-only changes and preserves canonical plus legacy aliases", async () => {

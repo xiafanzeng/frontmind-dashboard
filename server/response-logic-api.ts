@@ -20,6 +20,10 @@ import {
   recordUpstreamResource,
 } from "./auth-service";
 import {
+  fileResourceContentExpiry,
+  isFileResourceContentExpired,
+} from "./file-content-retention";
+import {
   getDashboardQuestion,
   getLatestKnowledgeSnapshot,
 } from "./dashboard-service";
@@ -52,7 +56,10 @@ import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
 const router = Router();
 
 const attachmentSchema = z.object({
-  file_id: z.string().trim().min(1).max(255),
+  file_id: z
+    .string()
+    .max(255)
+    .refine((value) => value.trim().length > 0, "file_id不能为空"),
   filename: z.string().trim().min(1).max(512),
   mime_type: z.string().trim().min(1).max(255).optional(),
 });
@@ -334,10 +341,30 @@ function normalizedAttachmentMimeType(filename: string, claimed?: string) {
  */
 export function buildVerifiedResponseLogicAttachments(
   attachments: ResponseLogicStartInput["attachments"],
-  uploadedAt = new Date(),
+  lifecycleByFileId:
+    | ReadonlyMap<
+        string,
+        {
+          uploadedAt?: Date | string | number | null;
+          contentExpiresAt?: Date | string | number | null;
+          contentDeletedAt?: Date | string | number | null;
+        }
+      >
+    | Date = new Date(),
 ): ResponseLogicAttachment[] {
-  const timestamp = uploadedAt.toISOString();
+  const fallbackUploadedAt =
+    lifecycleByFileId instanceof Date ? lifecycleByFileId : new Date();
   return attachments.map((attachment) => {
+    const lifecycle =
+      lifecycleByFileId instanceof Date
+        ? undefined
+        : lifecycleByFileId.get(attachment.file_id);
+    const lifecycleUploadedAt = lifecycle?.uploadedAt
+      ? new Date(lifecycle.uploadedAt)
+      : fallbackUploadedAt;
+    const expiresAt = lifecycle
+      ? fileResourceContentExpiry(lifecycle)
+      : undefined;
     const mimeType = normalizedAttachmentMimeType(
       attachment.filename,
       attachment.mime_type,
@@ -347,7 +374,11 @@ export function buildVerifiedResponseLogicAttachments(
       filename: attachment.filename,
       mimeType,
       kind: mimeType.startsWith("image/") ? "image" : "file",
-      uploadedAt: timestamp,
+      uploadedAt: lifecycleUploadedAt.toISOString(),
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(lifecycle
+        ? { expired: isFileResourceContentExpired(lifecycle) }
+        : {}),
     };
   });
 }
@@ -1048,6 +1079,12 @@ router.post(["/start", "/turn"], async (req, res) => {
       logSecret = taskApiKey;
     }
 
+    const verifiedFileLifecycles = new Map<
+      string,
+      NonNullable<
+        Awaited<ReturnType<typeof getCredentialForUpstreamResource>>
+      >["resource"]
+    >();
     for (const attachment of value.attachments) {
       const fileCredential = await getCredentialForUpstreamResource(
         req.frontmindUser.id,
@@ -1056,6 +1093,7 @@ router.post(["/start", "/turn"], async (req, res) => {
       );
       if (
         !fileCredential ||
+        isFileResourceContentExpired(fileCredential.resource) ||
         !credentialsUseSameUpstreamApiKey(fileCredential, taskCredential)
       ) {
         res.status(403).json({
@@ -1066,9 +1104,11 @@ router.post(["/start", "/turn"], async (req, res) => {
         });
         return;
       }
+      verifiedFileLifecycles.set(attachment.file_id, fileCredential.resource);
     }
     const verifiedAttachments = buildVerifiedResponseLogicAttachments(
       value.attachments,
+      verifiedFileLifecycles,
     );
 
     const skillDescriptor = await getResponseLogicSkillDescriptor();

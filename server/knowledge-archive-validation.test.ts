@@ -6,7 +6,6 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   KnowledgeArchiveValidationError,
-  customerFormalContentViolation,
   readKnowledgeArchive,
   removeStoredKnowledgeAssets,
 } from "./dashboard-api";
@@ -770,26 +769,7 @@ async function parseWebsiteArchive(buffer: Buffer) {
 }
 
 describe("versioned knowledge archive quality gates", () => {
-  it.each([
-    [
-      "其余荣誉图片因本轮没有形成可逐项核验的证书名称与有效期，不在正文中扩写。采购或合规审查仍应向企业索取证书编号，不能仅凭网页图标替代正式查验。",
-      "任务或采集过程",
-    ],
-    [
-      "这些内容属于企业自我定义，适合说明组织意图与品牌取向，不宜直接转换为已经量化达成的社会影响。对客户而言，可将其落实为开放模型生态。",
-      "客户或采购建议",
-    ],
-  ] as const)("detects customer-facing semantic leakage", (text, label) => {
-    expect(customerFormalContentViolation(text)).toBe(label);
-  });
-
-  it("allows neutral negative facts and audit language outside the formal block", async () => {
-    expect(
-      customerFormalContentViolation(
-        "2025 年毛利率为 -24.0%，公司当期仍处于亏损状态。",
-      ),
-    ).toBeUndefined();
-
+  it("allows audit language in internal completeness metadata", async () => {
     const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
     const root = "深度企业_knowledge_base";
     const completeness = JSON.parse(
@@ -810,13 +790,14 @@ describe("versioned knowledge archive quality gates", () => {
     expect(result.documents).toHaveLength(50);
   });
 
-  it("rejects audit language inside dashboard customer formal content", async () => {
+  it("does not reject customer formal content based on semantic style", async () => {
     const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
     const root = "深度企业_knowledge_base";
-    const narrative = "本轮没有形成可逐项核验的证书名称与有效期".padEnd(
-      80,
-      "甲",
-    );
+    const semanticProse =
+      "第一方页面摘录显示本轮没有形成可逐项核验的证书名称与有效期";
+    const narrative = `${semanticProse}${"甲".repeat(
+      80 - semanticProse.length,
+    )}`;
     zip.file(
       `${root}/branches/products/leaf-1.md`,
       `# 知识叶子 1
@@ -835,14 +816,14 @@ ${narrative}
 `,
     );
 
-    await expect(
-      readKnowledgeArchive(
-        Buffer.from(await zip.generateAsync({ type: "uint8array" })),
-        "客户正文泄漏.zip",
-        "deep-leakage-test",
-        { validationProfile: "dashboard-enterprise-v1" },
-      ),
-    ).rejects.toThrow(/客户不可见的核验过程、建议或内部推理/i);
+    const result = await readKnowledgeArchive(
+      Buffer.from(await zip.generateAsync({ type: "uint8array" })),
+      "语义风格不阻断.zip",
+      "deep-semantic-style-test",
+      { validationProfile: "dashboard-enterprise-v1" },
+    );
+    storedKeys.push(...result.storedAssetKeys);
+    expect(result.documents).toHaveLength(50);
   });
 
   it("accepts a deep v2 archive and stores only the marked formal prose", async () => {

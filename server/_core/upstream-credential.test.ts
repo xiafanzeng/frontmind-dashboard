@@ -242,4 +242,34 @@ describe("resolveUpstreamCredential attachment API Key policy", () => {
       },
     });
   });
+
+  it("lets read-only file routes resolve an expired ledger row so the content resolver can return 410", async () => {
+    const fileCredential = credential({
+      id: "credential-file",
+      userId: 7,
+      apiKey: "sk-file-key",
+    });
+    authMocks.getCredentialForUpstreamResource.mockResolvedValue(
+      fileCredential,
+    );
+    const req = {
+      method: "GET",
+      originalUrl: "/api/frontmind/v1/files/file%2Fexpired/content",
+      body: {},
+      frontmindUser: user(7),
+    } as FrontMindRequest;
+    const res = response();
+    const next = vi.fn();
+
+    await resolveUpstreamCredential(req, res as never, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    expect(authMocks.getCredentialForUpstreamResource).toHaveBeenCalledWith(
+      7,
+      "file",
+      "file/expired",
+      undefined,
+      { allowExpiredFileContent: true },
+    );
+  });
 });

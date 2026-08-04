@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import ChatInput from "./ChatInput";
@@ -273,6 +274,28 @@ describe("knowledge-base ChatInput actions", () => {
     expect(screen.getByText("企业资料.pdf")).toBeInTheDocument();
     expect(screen.getByText("5 B")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
+  });
+
+  it("rejects files larger than 100 MB at selection time", () => {
+    const { container } = render(
+      <ChatInput fixedAgentProfile="frontmind-pro" />,
+    );
+    const oversized = new File(["x"], "oversized.pdf", {
+      type: "application/pdf",
+    });
+    Object.defineProperty(oversized, "size", {
+      configurable: true,
+      value: 100 * 1024 * 1024 + 1,
+    });
+
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [oversized] },
+    });
+
+    expect(screen.queryByText("oversized.pdf")).not.toBeInTheDocument();
+    expect(toast.error).toHaveBeenCalledWith("文件过大", {
+      description: "文件“oversized.pdf”不能超过 100 MB",
+    });
   });
 
   it("grows with the message and caps the composer at eight rows", () => {

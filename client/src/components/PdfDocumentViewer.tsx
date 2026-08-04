@@ -24,6 +24,7 @@ import "pdfjs-dist/web/pdf_viewer.css";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { deliveryProjectHeaders, sanitizeBrandText } from "@/lib/frontmind-api";
+import type { FilePreviewSource } from "@/lib/file-preview-source";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -35,6 +36,14 @@ type PreparedPhase =
   | "optimizing"
   | "ready"
   | "failed";
+type PreparedRecoveryAction = "retry" | "reupload" | "contact_admin" | null;
+export const PDF_PREPARATION_RETRY_DELAYS_MS = [2_000, 10_000, 60_000] as const;
+export const PDF_READY_CONTENT_RETRY_DELAYS_MS = [
+  2_000, 10_000, 60_000,
+] as const;
+export const PDF_DOWNLOAD_TOKEN_RETRY_DELAYS_MS = [
+  2_000, 10_000, 60_000,
+] as const;
 
 interface PreparedPdfAsset {
   assetId: string;
@@ -48,15 +57,85 @@ interface PreparedPdfAsset {
   errorCode?: string;
   errorMessage?: string;
   retryAfterMs?: number;
+  retryable?: boolean;
+  recoveryAction?: PreparedRecoveryAction;
+  expiresAt?: number;
   contentUrl: string;
   downloadTokenUrl: string;
 }
 
 interface PdfDocumentViewerProps {
   fileName: string;
-  sourceUrl?: string;
-  sourceFile?: Blob;
+  source: FilePreviewSource;
   onClose?: () => void;
+  onExpired?: (expiresAt?: number) => void;
+}
+
+export interface PreparedFailure {
+  errorCode?: string;
+  failureScope?: "prepare" | "content" | "download";
+  retryable?: boolean;
+  recoveryAction?: PreparedRecoveryAction;
+  expiresAt?: number;
+}
+
+function terminalPreparedFailure(
+  errorCode: string | undefined,
+):
+  | { retryable: false; recoveryAction: "reupload" | "contact_admin" }
+  | undefined {
+  if (
+    errorCode === "SOURCE_EXPIRED" ||
+    errorCode === "SOURCE_UNAVAILABLE" ||
+    errorCode === "INVALID_PDF"
+  ) {
+    return { retryable: false, recoveryAction: "reupload" };
+  }
+  if (errorCode === "SOURCE_FORBIDDEN") {
+    return { retryable: false, recoveryAction: "contact_admin" };
+  }
+  return undefined;
+}
+
+export function preferredPreparedPdfFailure(
+  asset: PreparedFailure | null,
+  requestFailure: PreparedFailure | null,
+): PreparedFailure {
+  const merged: PreparedFailure = {
+    errorCode: requestFailure?.errorCode ?? asset?.errorCode,
+    failureScope: requestFailure?.failureScope ?? asset?.failureScope,
+    retryable: requestFailure?.retryable ?? asset?.retryable,
+    recoveryAction:
+      requestFailure?.recoveryAction ?? asset?.recoveryAction ?? null,
+    expiresAt: requestFailure?.expiresAt ?? asset?.expiresAt,
+  };
+  return { ...merged, ...terminalPreparedFailure(merged.errorCode) };
+}
+
+function isAbortRequestError(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    error.name === "AbortError"
+  );
+}
+
+class PreparedPdfRequestError extends Error implements PreparedFailure {
+  errorCode?: string;
+  retryable?: boolean;
+  recoveryAction?: PreparedRecoveryAction;
+  expiresAt?: number;
+
+  constructor(message: string, failure: PreparedFailure = {}) {
+    super(message);
+    this.name = "PreparedPdfRequestError";
+    this.errorCode = failure.errorCode;
+    const terminal = terminalPreparedFailure(failure.errorCode);
+    this.retryable = terminal?.retryable ?? failure.retryable;
+    this.recoveryAction = terminal?.recoveryAction ?? failure.recoveryAction;
+    this.expiresAt = failure.expiresAt;
+  }
 }
 
 const phaseLabels: Record<PreparedPhase, string> = {
@@ -79,46 +158,239 @@ function nativeDownload(url: string, fileName: string) {
 }
 
 async function readApiError(response: Response) {
+  const transientStatus =
+    response.status === 408 ||
+    response.status === 429 ||
+    response.status >= 500;
+  const defaultRecoveryAction: PreparedRecoveryAction =
+    response.status === 404 || response.status === 410
+      ? "reupload"
+      : response.status === 401 || response.status === 403
+        ? "contact_admin"
+        : transientStatus
+          ? "retry"
+          : null;
   try {
     const value = await response.json();
-    return (
+    const errorCode =
+      typeof value?.error?.code === "string"
+        ? value.error.code
+        : response.status === 410
+          ? "SOURCE_EXPIRED"
+          : response.status === 404
+            ? "SOURCE_UNAVAILABLE"
+            : response.status === 401 || response.status === 403
+              ? "SOURCE_FORBIDDEN"
+              : undefined;
+    const recoveryAction = value?.error?.recoveryAction;
+    const suppliedMessage =
       value?.error?.message ||
       value?.message ||
-      `请求失败 (HTTP ${response.status})`
+      `请求失败 (HTTP ${response.status})`;
+    return new PreparedPdfRequestError(
+      errorCode === "SOURCE_EXPIRED"
+        ? "文件已超过 30 天，请重新上传"
+        : errorCode === "SOURCE_UNAVAILABLE"
+          ? "文件内容已不可用，请重新上传"
+          : suppliedMessage,
+      {
+        errorCode,
+        retryable:
+          typeof value?.error?.retryable === "boolean"
+            ? value.error.retryable
+            : transientStatus,
+        recoveryAction:
+          recoveryAction === "retry" ||
+          recoveryAction === "reupload" ||
+          recoveryAction === "contact_admin"
+            ? recoveryAction
+            : defaultRecoveryAction,
+        expiresAt:
+          typeof value?.error?.expiresAt === "number"
+            ? value.error.expiresAt
+            : undefined,
+      },
     );
   } catch {
-    return `请求失败 (HTTP ${response.status})`;
+    return new PreparedPdfRequestError(`请求失败 (HTTP ${response.status})`, {
+      errorCode:
+        response.status === 410
+          ? "SOURCE_EXPIRED"
+          : response.status === 404
+            ? "SOURCE_UNAVAILABLE"
+            : response.status === 401 || response.status === 403
+              ? "SOURCE_FORBIDDEN"
+              : undefined,
+      retryable: transientStatus,
+      recoveryAction: defaultRecoveryAction,
+    });
   }
 }
 
-async function prepareRemotePdf(
-  fileUrl: string,
+export function preparedPdfRequestFailure(
+  error: unknown,
+  fallbackMessage = "PDF 文件读取网络异常，请稍后重试",
+): PreparedPdfRequestError | null {
+  if (isAbortRequestError(error)) return null;
+  if (error instanceof PreparedPdfRequestError) return error;
+  return new PreparedPdfRequestError(
+    error instanceof Error && error.message
+      ? `${fallbackMessage}（${error.message}）`
+      : fallbackMessage,
+    { retryable: true, recoveryAction: "retry" },
+  );
+}
+
+export function preparedPdfDocumentFailure(
+  error: unknown,
+): PreparedPdfRequestError | null {
+  if (isAbortRequestError(error)) return null;
+  const name =
+    typeof error === "object" && error !== null && "name" in error
+      ? String(error.name)
+      : "";
+  const status =
+    typeof error === "object" && error !== null && "status" in error
+      ? Number(error.status)
+      : 0;
+  if (name === "InvalidPDFException") {
+    return new PreparedPdfRequestError("文件不是有效的 PDF，请重新上传", {
+      errorCode: "INVALID_PDF",
+      retryable: false,
+      recoveryAction: "reupload",
+    });
+  }
+  if (status === 410) {
+    return new PreparedPdfRequestError("文件已超过 30 天，请重新上传", {
+      errorCode: "SOURCE_EXPIRED",
+      retryable: false,
+      recoveryAction: "reupload",
+    });
+  }
+  if (status === 404) {
+    return new PreparedPdfRequestError("文件内容已不可用，请重新上传", {
+      errorCode: "SOURCE_UNAVAILABLE",
+      retryable: false,
+      recoveryAction: "reupload",
+    });
+  }
+  if (status === 401 || status === 403) {
+    return new PreparedPdfRequestError(
+      "当前账号或客户项目无权读取此文件，请联系管理员",
+      {
+        errorCode: "SOURCE_FORBIDDEN",
+        retryable: false,
+        recoveryAction: "contact_admin",
+      },
+    );
+  }
+  return new PreparedPdfRequestError(
+    error instanceof Error && error.message
+      ? `PDF 内容读取网络异常（${error.message}）`
+      : "PDF 内容读取网络异常，请稍后重试",
+    { retryable: true, recoveryAction: "retry" },
+  );
+}
+
+export async function prepareRemotePdf(
+  source: { fileUrl?: string; fileId?: string },
   fileName: string,
   signal?: AbortSignal,
 ) {
-  const response = await fetch("/api/frontmind/assets/prepare", {
-    method: "POST",
-    credentials: "include",
-    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ fileUrl, fileName }),
-    signal,
-  });
-  if (!response.ok) throw new Error(await readApiError(response));
+  let response: Response;
+  try {
+    response = await fetch("/api/frontmind/assets/prepare", {
+      method: "POST",
+      credentials: "include",
+      headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ ...source, fileName }),
+      signal,
+    });
+  } catch (error) {
+    throw (
+      preparedPdfRequestFailure(error, "PDF 文件准备网络异常，请稍后重试") ??
+      error
+    );
+  }
+  if (!response.ok) throw await readApiError(response);
   return (await response.json()) as PreparedPdfAsset;
 }
 
 async function fetchPreparedStatus(assetId: string, signal?: AbortSignal) {
-  const response = await fetch(
-    `/api/frontmind/assets/${encodeURIComponent(assetId)}/status`,
-    {
-      credentials: "include",
-      cache: "no-store",
-      signal,
-      headers: deliveryProjectHeaders(),
-    },
-  );
-  if (!response.ok) throw new Error(await readApiError(response));
+  let response: Response;
+  try {
+    response = await fetch(
+      `/api/frontmind/assets/${encodeURIComponent(assetId)}/status`,
+      {
+        credentials: "include",
+        cache: "no-store",
+        signal,
+        headers: deliveryProjectHeaders(),
+      },
+    );
+  } catch (error) {
+    throw (
+      preparedPdfRequestFailure(error, "PDF 状态查询网络异常，请稍后重试") ??
+      error
+    );
+  }
+  if (!response.ok) throw await readApiError(response);
   return (await response.json()) as PreparedPdfAsset;
+}
+
+function waitForPdfRetry(delayMs: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(resolve, delayMs);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timer);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
+}
+
+/** Resolve a ready PDF download token with the shared 2s/10s/60s policy. */
+export async function requestPreparedPdfDownloadUrl(
+  downloadTokenUrl: string,
+  signal?: AbortSignal,
+) {
+  let retryIndex = 0;
+  while (true) {
+    try {
+      const response = await fetch(downloadTokenUrl, {
+        method: "POST",
+        credentials: "include",
+        headers: deliveryProjectHeaders(),
+        signal,
+      });
+      if (!response.ok) throw await readApiError(response);
+      const value = await response.json();
+      if (typeof value?.downloadUrl !== "string" || !value.downloadUrl) {
+        throw new PreparedPdfRequestError("下载链接无效", {
+          retryable: false,
+          recoveryAction: "contact_admin",
+        });
+      }
+      return value.downloadUrl as string;
+    } catch (error) {
+      const failure = preparedPdfRequestFailure(
+        error,
+        "PDF 下载链接请求网络异常，请稍后重试",
+      );
+      if (!failure) throw error;
+      const retryDelay = PDF_DOWNLOAD_TOKEN_RETRY_DELAYS_MS[retryIndex];
+      if (failure.retryable !== true || retryDelay === undefined) throw failure;
+      retryIndex += 1;
+      await waitForPdfRetry(retryDelay, signal);
+    }
+  }
 }
 
 function PageCanvas({
@@ -297,10 +569,14 @@ function PageCanvas({
 
 export default function PdfDocumentViewer({
   fileName,
-  sourceUrl,
-  sourceFile,
+  source,
   onClose,
+  onExpired,
 }: PdfDocumentViewerProps) {
+  const sourceFile = source.kind === "local" ? source.file : undefined;
+  const sourceFileId = source.kind === "owned_file" ? source.fileId : undefined;
+  const sourceUrl = source.kind === "external" ? source.url : undefined;
+  const expiresAt = source.kind === "external" ? undefined : source.expiresAt;
   const displayName = sanitizeBrandText(fileName || "document.pdf");
   const [localUrl, setLocalUrl] = useState<string | null>(null);
   const [asset, setAsset] = useState<PreparedPdfAsset | null>(null);
@@ -313,7 +589,16 @@ export default function PdfDocumentViewer({
   const [pageInput, setPageInput] = useState("1");
   const [isDownloading, setIsDownloading] = useState(false);
   const [prepareAttempt, setPrepareAttempt] = useState(0);
+  const [documentLoadAttempt, setDocumentLoadAttempt] = useState(0);
+  const [expiryNow, setExpiryNow] = useState(() => Date.now());
+  const [requestFailure, setRequestFailure] = useState<PreparedFailure | null>(
+    null,
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
+  const automaticRetryCountRef = useRef(0);
+  const documentRetryCountRef = useRef(0);
+  const documentRetrySourceRef = useRef<string | null>(null);
+  const expiredNotificationRef = useRef<string | null>(null);
 
   const isLocalSource =
     Boolean(sourceFile) ||
@@ -340,19 +625,31 @@ export default function PdfDocumentViewer({
       setPdfDocument(null);
       setAsset(null);
       setDocumentUrl(null);
+      setRequestFailure(null);
+
+      if (expiresAt !== undefined && expiresAt <= Date.now()) {
+        setRequestFailure({
+          failureScope: "prepare",
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt,
+        });
+        setLoadingError("文件已超过 30 天，请重新上传");
+        return;
+      }
 
       if (isLocalSource) {
         setDocumentUrl(localUrl || sourceUrl || null);
         return;
       }
-      if (!sourceUrl) {
+      if (!sourceUrl && !sourceFileId) {
         setLoadingError("没有可用的 PDF 文件地址");
         return;
       }
 
       try {
         let next = await prepareRemotePdf(
-          sourceUrl,
+          sourceFileId ? { fileId: sourceFileId } : { fileUrl: sourceUrl },
           displayName,
           controller.signal,
         );
@@ -381,8 +678,24 @@ export default function PdfDocumentViewer({
               await poll();
             } catch (error) {
               if (!cancelled) {
+                const failure = preparedPdfRequestFailure(
+                  error,
+                  "PDF 状态查询网络异常，请稍后重试",
+                );
+                if (failure) {
+                  setRequestFailure({
+                    errorCode: failure.errorCode,
+                    failureScope: "prepare",
+                    retryable: failure.retryable,
+                    recoveryAction: failure.recoveryAction,
+                    expiresAt: failure.expiresAt,
+                  });
+                }
                 setLoadingError(
-                  error instanceof Error ? error.message : "查询文件状态失败",
+                  failure?.message ||
+                    (error instanceof Error
+                      ? error.message
+                      : "查询文件状态失败"),
                 );
               }
             }
@@ -391,8 +704,22 @@ export default function PdfDocumentViewer({
         await poll();
       } catch (error) {
         if (!cancelled && !controller.signal.aborted) {
+          const failure = preparedPdfRequestFailure(
+            error,
+            "PDF 文件准备网络异常，请稍后重试",
+          );
+          if (failure) {
+            setRequestFailure({
+              errorCode: failure.errorCode,
+              failureScope: "prepare",
+              retryable: failure.retryable,
+              recoveryAction: failure.recoveryAction,
+              expiresAt: failure.expiresAt,
+            });
+          }
           setLoadingError(
-            error instanceof Error ? error.message : "PDF 文件准备失败",
+            failure?.message ||
+              (error instanceof Error ? error.message : "PDF 文件准备失败"),
           );
         }
       }
@@ -404,10 +731,22 @@ export default function PdfDocumentViewer({
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [displayName, isLocalSource, localUrl, prepareAttempt, sourceUrl]);
+  }, [
+    displayName,
+    expiresAt,
+    isLocalSource,
+    localUrl,
+    prepareAttempt,
+    sourceFileId,
+    sourceUrl,
+  ]);
 
   useEffect(() => {
     if (!documentUrl) return;
+    if (documentRetrySourceRef.current !== documentUrl) {
+      documentRetrySourceRef.current = documentUrl;
+      documentRetryCountRef.current = 0;
+    }
     setLoadingError(null);
     const loadingTask = getDocument({
       url: documentUrl,
@@ -416,6 +755,7 @@ export default function PdfDocumentViewer({
       rangeChunkSize: 256 * 1024,
     });
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     void loadingTask.promise
       .then((document) => {
         if (cancelled) {
@@ -423,20 +763,40 @@ export default function PdfDocumentViewer({
           return;
         }
         setPdfDocument(document);
+        setRequestFailure(null);
         setCurrentPage(1);
         setPageInput("1");
       })
       .catch((error) => {
-        if (!cancelled) {
-          setLoadingError(error?.message || "PDF 解析失败");
+        if (cancelled) return;
+        const failure = preparedPdfDocumentFailure(error);
+        if (!failure) return;
+        setRequestFailure({
+          errorCode: failure.errorCode,
+          failureScope: "content",
+          retryable: failure.retryable,
+          recoveryAction: failure.recoveryAction,
+          expiresAt: failure.expiresAt,
+        });
+        const retryIndex = documentRetryCountRef.current;
+        const retryDelay = PDF_READY_CONTENT_RETRY_DELAYS_MS[retryIndex];
+        if (failure.retryable && retryDelay !== undefined) {
+          documentRetryCountRef.current += 1;
+          retryTimer = setTimeout(
+            () => setDocumentLoadAttempt((value) => value + 1),
+            retryDelay,
+          );
+          return;
         }
+        setLoadingError(failure.message);
       });
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       setPdfDocument(null);
       void loadingTask.destroy();
     };
-  }, [documentUrl]);
+  }, [documentLoadAttempt, documentUrl]);
 
   const visiblePageChanged = useCallback((page: number) => {
     setCurrentPage(page);
@@ -456,28 +816,135 @@ export default function PdfDocumentViewer({
     [pdfDocument],
   );
 
-  const retryPreparation = useCallback(async () => {
-    if (!asset) return;
-    setLoadingError(null);
-    const response = await fetch(
-      `/api/frontmind/assets/${encodeURIComponent(asset.assetId)}/retry`,
-      {
-        method: "POST",
-        credentials: "include",
-        headers: deliveryProjectHeaders(),
-      },
-    );
-    if (!response.ok) {
-      setLoadingError(await readApiError(response));
+  // A network failure while the last successful asset snapshot is still
+  // `processing` must control recovery. The stale processing response must not
+  // hide the current request failure.
+  const preferredFailure = preferredPreparedPdfFailure(asset, requestFailure);
+  const recoveryAction = preferredFailure.recoveryAction ?? null;
+  const retryable = preferredFailure.retryable;
+  const canRetryPreparation =
+    requestFailure?.failureScope && requestFailure.failureScope !== "prepare"
+      ? false
+      : recoveryAction === "retry"
+        ? retryable !== false
+        : recoveryAction === null && asset?.status === "failed";
+  const canRetryContent =
+    requestFailure?.failureScope === "content" && retryable !== false;
+  const mustReupload = recoveryAction === "reupload";
+  const effectiveExpiresAt = preferredFailure.expiresAt ?? expiresAt;
+  const effectiveErrorCode = preferredFailure.errorCode ?? undefined;
+  const contentExpired =
+    effectiveErrorCode === "SOURCE_EXPIRED" ||
+    (effectiveExpiresAt !== undefined && effectiveExpiresAt <= expiryNow);
+
+  useEffect(() => {
+    if (effectiveExpiresAt === undefined || contentExpired) return;
+    const remaining = effectiveExpiresAt - Date.now();
+    if (remaining <= 0) {
+      setExpiryNow(Date.now());
       return;
     }
-    const next = (await response.json()) as PreparedPdfAsset;
-    setAsset(next);
-    setPrepareAttempt((value) => value + 1);
-  }, [asset]);
+    const timer = window.setTimeout(
+      () => setExpiryNow(Date.now()),
+      Math.min(remaining, 2_147_000_000),
+    );
+    return () => window.clearTimeout(timer);
+  }, [contentExpired, effectiveExpiresAt, expiryNow]);
+
+  useEffect(() => {
+    if (!contentExpired) {
+      expiredNotificationRef.current = null;
+      return;
+    }
+    setPdfDocument(null);
+    setDocumentUrl(null);
+    setLoadingError("文件已超过 30 天，请重新上传");
+    const notificationKey = `${sourceFileId || sourceUrl || displayName}:${effectiveExpiresAt || "expired"}`;
+    if (expiredNotificationRef.current !== notificationKey) {
+      expiredNotificationRef.current = notificationKey;
+      onExpired?.(effectiveExpiresAt);
+    }
+  }, [
+    contentExpired,
+    displayName,
+    effectiveExpiresAt,
+    onExpired,
+    sourceFileId,
+    sourceUrl,
+  ]);
+
+  const retryPreparation = useCallback(async () => {
+    if (!canRetryPreparation) return;
+    setLoadingError(null);
+    setRequestFailure(null);
+    if (!asset) {
+      setPrepareAttempt((value) => value + 1);
+      return;
+    }
+    try {
+      const response = await fetch(
+        `/api/frontmind/assets/${encodeURIComponent(asset.assetId)}/retry`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: deliveryProjectHeaders(),
+        },
+      );
+      if (!response.ok) {
+        throw await readApiError(response);
+      }
+      const next = (await response.json()) as PreparedPdfAsset;
+      setAsset(next);
+      setPrepareAttempt((value) => value + 1);
+    } catch (error) {
+      const failure = preparedPdfRequestFailure(
+        error,
+        "PDF 重试请求网络异常，请稍后重试",
+      );
+      if (!failure) return;
+      setRequestFailure({
+        errorCode: failure.errorCode,
+        failureScope: "prepare",
+        retryable: failure.retryable,
+        recoveryAction: failure.recoveryAction,
+        expiresAt: failure.expiresAt,
+      });
+      setLoadingError(failure.message);
+    }
+  }, [asset, canRetryPreparation]);
+
+  const retryContent = useCallback(() => {
+    if (!canRetryContent || !documentUrl) return;
+    documentRetryCountRef.current = 0;
+    setLoadingError(null);
+    setRequestFailure(null);
+    setDocumentLoadAttempt((value) => value + 1);
+  }, [canRetryContent, documentUrl]);
+
+  useEffect(() => {
+    automaticRetryCountRef.current = 0;
+  }, [sourceFile, sourceFileId, sourceUrl]);
+
+  useEffect(() => {
+    if (!loadingError || !canRetryPreparation) return;
+    const retryIndex = automaticRetryCountRef.current;
+    const delay = PDF_PREPARATION_RETRY_DELAYS_MS[retryIndex];
+    if (delay === undefined) return;
+    automaticRetryCountRef.current += 1;
+    const timer = window.setTimeout(() => {
+      void retryPreparation();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [canRetryPreparation, loadingError, retryPreparation]);
 
   const handleDownload = useCallback(async () => {
+    if (contentExpired) {
+      setLoadingError("文件已超过 30 天，请重新上传");
+      return;
+    }
     setIsDownloading(true);
+    setLoadingError(null);
+    setRequestFailure(null);
     try {
       if (isLocalSource) {
         const url = localUrl || sourceUrl;
@@ -488,21 +955,33 @@ export default function PdfDocumentViewer({
       if (!asset || asset.status !== "ready") {
         throw new Error("文件仍在准备中");
       }
-      const response = await fetch(asset.downloadTokenUrl, {
-        method: "POST",
-        credentials: "include",
-        headers: deliveryProjectHeaders(),
-      });
-      if (!response.ok) throw new Error(await readApiError(response));
-      const value = await response.json();
-      if (!value.downloadUrl) throw new Error("下载链接无效");
-      nativeDownload(value.downloadUrl, displayName);
+      const downloadUrl = await requestPreparedPdfDownloadUrl(
+        asset.downloadTokenUrl,
+      );
+      setRequestFailure(null);
+      nativeDownload(downloadUrl, displayName);
     } catch (error) {
-      setLoadingError(error instanceof Error ? error.message : "文件下载失败");
+      const failure = preparedPdfRequestFailure(
+        error,
+        "PDF 下载链接请求网络异常，请稍后重试",
+      );
+      if (failure) {
+        setRequestFailure({
+          errorCode: failure.errorCode,
+          failureScope: "download",
+          retryable: failure.retryable,
+          recoveryAction: failure.recoveryAction,
+          expiresAt: failure.expiresAt,
+        });
+      }
+      setLoadingError(
+        failure?.message ||
+          (error instanceof Error ? error.message : "文件下载失败"),
+      );
     } finally {
       setIsDownloading(false);
     }
-  }, [asset, displayName, isLocalSource, localUrl, sourceUrl]);
+  }, [asset, contentExpired, displayName, isLocalSource, localUrl, sourceUrl]);
 
   const pageNumbers = useMemo(
     () =>
@@ -597,7 +1076,11 @@ export default function PdfDocumentViewer({
           size="sm"
           className="h-8 gap-1 text-xs"
           onClick={() => void handleDownload()}
-          disabled={isDownloading || Boolean(asset && asset.status !== "ready")}
+          disabled={
+            contentExpired ||
+            isDownloading ||
+            (!isLocalSource && asset?.status !== "ready")
+          }
         >
           {isDownloading ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -627,7 +1110,14 @@ export default function PdfDocumentViewer({
             <p className="max-w-md text-xs text-muted-foreground">
               {loadingError}
             </p>
-            {asset?.status === "failed" && (
+            {mustReupload &&
+              !contentExpired &&
+              loadingError !== "文件已超过 30 天，请重新上传" && (
+                <p className="max-w-md text-xs font-medium text-amber-700">
+                  请重新上传原文件后再试
+                </p>
+              )}
+            {canRetryPreparation && (
               <Button
                 variant="outline"
                 size="sm"
@@ -635,6 +1125,12 @@ export default function PdfDocumentViewer({
               >
                 <RotateCcw className="mr-1 h-4 w-4" />
                 重新准备
+              </Button>
+            )}
+            {canRetryContent && (
+              <Button variant="outline" size="sm" onClick={retryContent}>
+                <RotateCcw className="mr-1 h-4 w-4" />
+                重新读取
               </Button>
             )}
           </div>

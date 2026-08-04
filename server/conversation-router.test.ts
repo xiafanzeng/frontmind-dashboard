@@ -380,6 +380,8 @@ describe("conversation multi-device merge", () => {
       lastKnownOutputLength: 0,
       deletedMessageIds: [],
     };
+    const uploadedAt = new Date("2026-08-01T00:00:00.000Z");
+    const contentExpiresAt = new Date("2026-08-31T00:00:00.000Z");
     const rowsForTable = (table: unknown) => {
       if (table === conversations) return [conversation];
       if (table === messages) return [userMessage];
@@ -387,6 +389,16 @@ describe("conversation multi-device merge", () => {
       if (table === conversationTurns) return [turn];
       if (table === knowledgeBaseBuilds) return [build];
       if (table === knowledgeBaseBuildNodes) return [];
+      if (table === upstreamResources)
+        return [
+          {
+            upstreamId: "customer-pdf",
+            createdAt: uploadedAt,
+            uploadedAt,
+            contentExpiresAt,
+            contentDeletedAt: null,
+          },
+        ];
       return [];
     };
     const expectedAttachment = {
@@ -394,6 +406,8 @@ describe("conversation multi-device merge", () => {
       type: "file",
       name: "企业事实确认表.pdf",
       fileId: "customer-pdf",
+      expiresAt: contentExpiresAt.getTime(),
+      expired: false,
     };
 
     const { executor: historyExecutor } = createSelectExecutor(rowsForTable);

@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -20,11 +21,14 @@ vi.mock("./presales-service", async () => {
     ...actual,
     acquirePresalesTaskReservation: vi.fn(),
     completePresalesTaskReservation: vi.fn(),
+    finalizePresalesFileUploadRetention: vi.fn(),
     getActivePresalesCredential: vi.fn(),
     getPresalesCredentialForResource: vi.fn(),
     hasPresalesOutputUrlGrant: vi.fn(),
+    markPresalesFileContentDeleted: vi.fn(),
     recordPresalesUpstreamResource: vi.fn(),
     releasePresalesTaskReservation: vi.fn(),
+    reservePresalesFileUploadRetention: vi.fn(),
     resolvePresalesTaskCredentialForFiles: vi.fn(),
     syncPresalesOutputUrlGrants: vi.fn(),
   };
@@ -33,13 +37,22 @@ vi.mock("./presales-service", async () => {
 import presalesProxy from "./presales-proxy";
 import { AuthServiceError } from "./auth-service";
 import {
+  readPresalesFileLifecycle,
+  readStoredPresalesFile,
+  removeStoredPresalesFileContent,
+  stagePresalesFileContent,
+} from "./presales-file-store";
+import {
   acquirePresalesTaskReservation,
   completePresalesTaskReservation,
+  finalizePresalesFileUploadRetention,
   getActivePresalesCredential,
   getPresalesCredentialForResource,
   hasPresalesOutputUrlGrant,
+  markPresalesFileContentDeleted,
   recordPresalesUpstreamResource,
   releasePresalesTaskReservation,
+  reservePresalesFileUploadRetention,
   resolvePresalesTaskCredentialForFiles,
   syncPresalesOutputUrlGrants,
 } from "./presales-service";
@@ -50,6 +63,13 @@ const originalMonitorKey = process.env.FRONTMIND_MONITOR_API_KEY;
 const originalPublicUrl = process.env.FRONTMIND_PUBLIC_URL;
 const originalDashboardAssetDir = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
 let dashboardAssetDir = "";
+let presalesContentState: {
+  contentSource: "user_upload" | "assistant_output" | null;
+  uploadReservedAt: Date | null;
+  uploadedAt: Date | null;
+  contentExpiresAt: Date | null;
+  contentDeletedAt: Date | null;
+};
 const websiteBrokerPath = path.resolve(
   siblingWebsiteRepositoryRoot(),
   "server/geo/broker.ts",
@@ -100,6 +120,40 @@ async function withServer(run: (baseUrl: string) => Promise<void>) {
       server.close((error) => (error ? reject(error) : resolve())),
     );
   }
+}
+
+async function storePresalesTestFile(input: {
+  fileId: string;
+  body: Buffer;
+  filename?: string;
+  mimeType?: string;
+  uploadedAt: Date;
+  contentExpiresAt: Date;
+}) {
+  const staged = await stagePresalesFileContent({
+    fileId: input.fileId,
+    stream: Readable.from([input.body]),
+    maxBytes: 100 * 1024 * 1024,
+  });
+  await staged.commit({
+    filename: input.filename,
+    mimeType: input.mimeType,
+    uploadedAt: input.uploadedAt,
+    contentExpiresAt: input.contentExpiresAt,
+  });
+}
+
+function presalesContentPath(fileId: string) {
+  const storageKey = createHash("sha256").update(fileId).digest("hex");
+  return path.join(
+    dashboardAssetDir,
+    "presales-files",
+    `${storageKey}.content`,
+  );
+}
+
+function presalesManifestPath(fileId: string) {
+  return presalesContentPath(fileId).replace(/\.content$/u, ".json");
 }
 
 describe("presales readiness status", () => {
@@ -170,33 +224,95 @@ describe("presales create-time upload capability", () => {
       status: "active",
       verifiedAt: new Date(),
     });
-    vi.mocked(getPresalesCredentialForResource).mockResolvedValue({
-      id: "credential-1",
-      version: 1,
-      apiKey: "sk-upload-file",
-      fingerprint: "fingerprint",
-      status: "active",
-      verifiedAt: new Date(),
-      resource: {
-        id: "resource-1",
-        apiCredentialId: "credential-1",
-        kind: "file",
-        upstreamId: "file-1",
-        parentTaskId: null,
-        createdAt: new Date(),
+    presalesContentState = {
+      contentSource: "assistant_output",
+      uploadReservedAt: null,
+      uploadedAt: null,
+      contentExpiresAt: null,
+      contentDeletedAt: null,
+    };
+    vi.mocked(getPresalesCredentialForResource).mockImplementation(
+      async (kind, upstreamId) => ({
+        id: "credential-1",
+        version: 1,
+        apiKey: "sk-upload-file",
+        fingerprint: "fingerprint",
+        status: "active",
+        verifiedAt: new Date(),
+        resource: {
+          id: "resource-1",
+          apiCredentialId: "credential-1",
+          kind,
+          upstreamId,
+          parentTaskId: null,
+          createdAt: new Date(),
+          ...presalesContentState,
+        },
+      }),
+    );
+    vi.mocked(recordPresalesUpstreamResource).mockImplementation(
+      async (input) => {
+        if (input.kind === "file" && input.contentSource) {
+          presalesContentState.contentSource = input.contentSource;
+        }
+        return undefined as never;
       },
-    });
-    vi.mocked(recordPresalesUpstreamResource).mockResolvedValue(undefined);
+    );
+    vi.mocked(reservePresalesFileUploadRetention).mockImplementation(
+      async ({ now }) => {
+        if (presalesContentState.contentDeletedAt) {
+          throw new AuthServiceError("CONFLICT", "文件已删除，不能重新上传");
+        }
+        if (!presalesContentState.uploadReservedAt) {
+          presalesContentState.contentSource = "user_upload";
+          presalesContentState.uploadReservedAt = now;
+        }
+        return {
+          ...presalesContentState,
+          uploadReservedAt: presalesContentState.uploadReservedAt,
+        } as never;
+      },
+    );
+    vi.mocked(finalizePresalesFileUploadRetention).mockImplementation(
+      async () => {
+        if (!presalesContentState.uploadReservedAt) {
+          throw new AuthServiceError("CONFLICT", "文件上传时钟尚未预留");
+        }
+        if (!presalesContentState.uploadedAt) {
+          presalesContentState.uploadedAt =
+            presalesContentState.uploadReservedAt;
+          presalesContentState.contentExpiresAt = new Date(
+            presalesContentState.uploadReservedAt.getTime() +
+              30 * 24 * 60 * 60 * 1_000,
+          );
+        }
+        return {
+          ...presalesContentState,
+          uploadedAt: presalesContentState.uploadedAt,
+          contentExpiresAt: presalesContentState.contentExpiresAt,
+        } as never;
+      },
+    );
+    vi.mocked(markPresalesFileContentDeleted).mockImplementation(
+      async ({ now }) => {
+        presalesContentState.contentDeletedAt = now;
+        return undefined as never;
+      },
+    );
     vi.mocked(hasPresalesOutputUrlGrant).mockResolvedValue(true);
     vi.mocked(syncPresalesOutputUrlGrants).mockResolvedValue(undefined);
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.mocked(getActivePresalesCredential).mockReset();
     vi.mocked(getPresalesCredentialForResource).mockReset();
     vi.mocked(hasPresalesOutputUrlGrant).mockReset();
     vi.mocked(recordPresalesUpstreamResource).mockReset();
+    vi.mocked(reservePresalesFileUploadRetention).mockReset();
+    vi.mocked(finalizePresalesFileUploadRetention).mockReset();
+    vi.mocked(markPresalesFileContentDeleted).mockReset();
     vi.mocked(syncPresalesOutputUrlGrants).mockReset();
     if (originalServiceToken === undefined) {
       delete process.env.FRONTMIND_PRESALES_SERVICE_TOKEN;
@@ -211,7 +327,63 @@ describe("presales create-time upload capability", () => {
     await rm(dashboardAssetDir, { recursive: true, force: true });
   });
 
-  it("uploads with the signed URL returned by file creation even when details omit it", async () => {
+  it("authenticates file reads before ownership lookup or upstream access", async () => {
+    const get = vi.spyOn(axios, "get");
+
+    await withServer(async (baseUrl) => {
+      for (const headers of [
+        {},
+        { "x-frontmind-service-token": "wrong-service-token" },
+      ]) {
+        const response = await fetch(`${baseUrl}/files/file-1/content`, {
+          headers,
+        });
+        expect(response.status).toBe(401);
+        await expect(response.json()).resolves.toMatchObject({
+          error: { code: "INVALID_SERVICE_TOKEN" },
+        });
+      }
+    });
+
+    expect(getPresalesCredentialForResource).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("does not distinguish an unknown file from a file outside the service credential binding", async () => {
+    vi.mocked(getPresalesCredentialForResource).mockResolvedValue(null);
+    const get = vi.spyOn(axios, "get");
+    const responses: Array<{ status: number; body: unknown }> = [];
+
+    await withServer(async (baseUrl) => {
+      for (const fileId of ["unknown-file", "other-credential-file"]) {
+        const response = await fetch(
+          `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+          { headers: { "x-frontmind-service-token": token } },
+        );
+        responses.push({
+          status: response.status,
+          body: await response.json(),
+        });
+      }
+    });
+
+    expect(responses[0]).toEqual(responses[1]);
+    expect(responses[0]).toMatchObject({
+      status: 403,
+      body: {
+        error: {
+          code: "SOURCE_FORBIDDEN",
+          retryable: false,
+          recoveryAction: "contact_admin",
+        },
+      },
+    });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("uploads with the create-time signed URL and never renews the original 30-day clock on retry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-04T00:00:00.000Z"));
     const signedUrl =
       "https://uploads.example.test/catalog.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abcdef0123456789";
     vi.spyOn(axios, "post").mockResolvedValue({
@@ -258,6 +430,32 @@ describe("presales create-time upload capability", () => {
         body: Buffer.from("pdf"),
       });
       expect(uploaded.status).toBe(200);
+
+      const initialLifecycle = await readPresalesFileLifecycle("file-1");
+      expect(initialLifecycle).toMatchObject({
+        state: "stored",
+        uploadedAt: new Date("2026-08-04T00:00:00.000Z"),
+        contentExpiresAt: new Date("2026-09-03T00:00:00.000Z"),
+        contentDeletedAt: null,
+      });
+
+      vi.setSystemTime(new Date("2026-08-04T00:01:00.000Z"));
+      const retried = await fetch(`${baseUrl}/files/file-1/content`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": "3",
+          "x-original-content-type": "application/pdf",
+          "x-frontmind-service-token": token,
+          "x-frontmind-upload-ticket": file.proxy_upload_ticket,
+        },
+        body: Buffer.from("pdf"),
+      });
+      expect(retried.status).toBe(200);
+      expect(await readPresalesFileLifecycle("file-1")).toMatchObject({
+        uploadedAt: initialLifecycle?.uploadedAt,
+        contentExpiresAt: initialLifecycle?.contentExpiresAt,
+      });
     });
 
     expect(metadataLookup).not.toHaveBeenCalled();
@@ -266,6 +464,494 @@ describe("presales create-time upload capability", () => {
       expect.anything(),
       expect.objectContaining({ maxRedirects: 0 }),
     );
+  });
+
+  it("keeps the DB-reserved clock when the upstream PUT succeeds but local commit fails", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-04T02:00:00.000Z"));
+    const fileId = "commit-failure-file";
+    const signedUrl =
+      "https://uploads.example.test/commit-failure.pdf?sig=fixed";
+    vi.spyOn(axios, "post").mockResolvedValue({
+      status: 201,
+      data: {
+        id: fileId,
+        filename: "commit-failure.pdf",
+        upload_url: signedUrl,
+        upload_expires_at: new Date(Date.now() + 180_000).toISOString(),
+      },
+    });
+    const put = vi.spyOn(axios, "put").mockImplementationOnce(async () => {
+      await mkdir(presalesContentPath(fileId));
+      return { status: 204, data: "" };
+    });
+
+    await withServer(async (baseUrl) => {
+      const created = await fetch(`${baseUrl}/files`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-frontmind-service-token": token,
+        },
+        body: JSON.stringify({
+          filename: "commit-failure.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 3,
+        }),
+      });
+      expect(created.status).toBe(201);
+      const ticket = String((await created.json()).proxy_upload_ticket);
+
+      const first = await fetch(`${baseUrl}/files/${fileId}/content`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/pdf",
+          "x-frontmind-service-token": token,
+          "x-frontmind-upload-ticket": ticket,
+        },
+        body: Buffer.from("pdf"),
+      });
+      expect(first.status).toBe(503);
+      await expect(first.json()).resolves.toMatchObject({
+        error: {
+          code: "SOURCE_CAPTURE_FAILED",
+          retryable: true,
+          recoveryAction: "retry",
+        },
+      });
+      const reservedUploadedAt = presalesContentState.uploadedAt;
+      const reservedExpiresAt = presalesContentState.contentExpiresAt;
+      expect(reservedUploadedAt).toEqual(new Date("2026-08-04T02:00:00.000Z"));
+
+      await rm(presalesContentPath(fileId), { recursive: true, force: true });
+      // The signed upload ticket is intentionally short lived. Retry before
+      // that capability expires so this assertion isolates retention-clock
+      // reuse from ticket-expiry behavior.
+      vi.setSystemTime(new Date("2026-08-04T02:02:00.000Z"));
+      put.mockResolvedValueOnce({ status: 204, data: "" });
+      const retried = await fetch(`${baseUrl}/files/${fileId}/content`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/pdf",
+          "x-frontmind-service-token": token,
+          "x-frontmind-upload-ticket": ticket,
+        },
+        body: Buffer.from("pdf"),
+      });
+      expect(retried.status).toBe(200);
+      expect(presalesContentState).toMatchObject({
+        uploadedAt: reservedUploadedAt,
+        contentExpiresAt: reservedExpiresAt,
+      });
+      expect(await readPresalesFileLifecycle(fileId)).toMatchObject({
+        uploadedAt: reservedUploadedAt,
+        contentExpiresAt: reservedExpiresAt,
+      });
+    });
+  });
+
+  it("rejects reads and upload retries at the immutable deadline without contacting upstream", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-03T00:00:00.000Z"));
+    const fileId = "expired-file";
+    const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
+    const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
+    await storePresalesTestFile({
+      fileId,
+      body: Buffer.from("expired bytes"),
+      filename: "expired.pdf",
+      mimeType: "application/pdf",
+      uploadedAt,
+      contentExpiresAt,
+    });
+    presalesContentState = {
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+      uploadedAt,
+      contentExpiresAt,
+      contentDeletedAt: null,
+    };
+    const get = vi.spyOn(axios, "get");
+    const put = vi.spyOn(axios, "put");
+
+    await withServer(async (baseUrl) => {
+      const downloaded = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(downloaded.status).toBe(410);
+      await expect(downloaded.json()).resolves.toMatchObject({
+        error: {
+          code: "SOURCE_EXPIRED",
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: contentExpiresAt.getTime(),
+        },
+      });
+
+      const retried = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        {
+          method: "PUT",
+          headers: {
+            "content-type": "application/pdf",
+            "x-frontmind-service-token": token,
+          },
+          body: Buffer.from("replacement bytes"),
+        },
+      );
+      expect(retried.status).toBe(410);
+      await expect(retried.json()).resolves.toMatchObject({
+        error: { code: "SOURCE_EXPIRED" },
+      });
+    });
+
+    expect(get).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+    expect(await readPresalesFileLifecycle(fileId)).toMatchObject({
+      uploadedAt,
+      contentExpiresAt,
+    });
+  });
+
+  it("uses the DB user-upload deadline when the local manifest is missing", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-05T00:00:00.000Z"));
+    const fileId = "manifest-missing-user-upload";
+    const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
+    const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
+    const body = Buffer.from("recovered from authoritative content endpoint");
+    presalesContentState = {
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+      uploadedAt,
+      contentExpiresAt,
+      contentDeletedAt: null,
+    };
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: {
+        "content-type": "application/pdf",
+        "content-length": String(body.length),
+      },
+      data: Readable.from([body]),
+    });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(response.status).toBe(200);
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(body);
+    });
+
+    expect(get.mock.calls[0]?.[0]).toContain(
+      `/v1/files/${encodeURIComponent(fileId)}/content`,
+    );
+    expect(await readPresalesFileLifecycle(fileId)).toMatchObject({
+      state: "stored",
+      uploadedAt,
+      contentExpiresAt,
+    });
+  });
+
+  it("fails closed for a historical resource with no provenance and no manifest", async () => {
+    presalesContentState = {
+      contentSource: null,
+      uploadReservedAt: null,
+      uploadedAt: null,
+      contentExpiresAt: null,
+      contentDeletedAt: null,
+    };
+    const get = vi.spyOn(axios, "get");
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/files/historical-unknown/content`,
+        {
+          headers: { "x-frontmind-service-token": token },
+        },
+      );
+      expect(response.status).toBe(410);
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: "SOURCE_UNAVAILABLE",
+          retryable: false,
+          recoveryAction: "contact_admin",
+        },
+      });
+    });
+
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("isolates a partial local ledger and recovers with the valid DB deadline", async () => {
+    const fileId = "partial-retention-ledger";
+    const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
+    const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
+    await storePresalesTestFile({
+      fileId,
+      body: Buffer.from("locally valid bytes"),
+      uploadedAt,
+      contentExpiresAt,
+    });
+    presalesContentState = {
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+      uploadedAt,
+      contentExpiresAt,
+      contentDeletedAt: null,
+    };
+    const manifestPath = presalesManifestPath(fileId);
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    delete manifest.contentExpiresAt;
+    await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+    const recovered = Buffer.from("recovered after ledger isolation");
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: {
+        "content-type": "application/pdf",
+        "content-length": String(recovered.length),
+      },
+      data: Readable.from([recovered]),
+    });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(response.status).toBe(200);
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(recovered);
+    });
+
+    expect(get).toHaveBeenCalledOnce();
+    expect(await readPresalesFileLifecycle(fileId)).toMatchObject({
+      state: "stored",
+      uploadedAt,
+      contentExpiresAt,
+    });
+  });
+
+  it("recovers a SHA-damaged local copy only from encoded /content and strips auth on HTTPS redirects", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-05T00:00:00.000Z"));
+    const fileId = "file # 中文 📄";
+    const original = Buffer.from("original durable bytes");
+    const recovered = Buffer.from("recovered authoritative bytes");
+    const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
+    const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
+    await storePresalesTestFile({
+      fileId,
+      body: original,
+      filename: "原始 文件.pdf",
+      mimeType: "application/pdf",
+      uploadedAt,
+      contentExpiresAt,
+    });
+    // Preserve the recorded size but alter every byte, forcing SHA-256
+    // validation (rather than the cheaper size check) to trigger recovery.
+    await writeFile(
+      presalesContentPath(fileId),
+      Buffer.alloc(original.length, 0x78),
+    );
+    vi.mocked(getPresalesCredentialForResource).mockImplementation(
+      async (kind, requestedFileId) => {
+        expect(kind).toBe("file");
+        expect(requestedFileId).toBe(fileId);
+        return {
+          id: "credential-1",
+          version: 1,
+          apiKey: "sk-upload-file",
+          fingerprint: "fingerprint",
+          status: "active",
+          verifiedAt: new Date(),
+          resource: {
+            id: "resource-special",
+            apiCredentialId: "credential-1",
+            kind: "file",
+            upstreamId: fileId,
+            parentTaskId: null,
+            createdAt: uploadedAt,
+            contentSource: "user_upload",
+            uploadReservedAt: uploadedAt,
+            uploadedAt,
+            contentExpiresAt,
+            contentDeletedAt: null,
+          },
+        };
+      },
+    );
+    const redirectUrl = "https://objects.example.test/recovered.pdf";
+    const get = vi
+      .spyOn(axios, "get")
+      .mockResolvedValueOnce({
+        status: 302,
+        headers: { location: redirectUrl },
+        data: Readable.from([]),
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {
+          "content-type": "application/pdf",
+          "content-length": String(recovered.length),
+          "content-disposition":
+            "attachment; filename*=UTF-8''recovered%20document.pdf",
+        },
+        data: Readable.from([recovered]),
+      });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(response.status).toBe(200);
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(recovered);
+      expect(response.headers.get("content-disposition")).toContain(
+        "recovered%20document.pdf",
+      );
+    });
+
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(get.mock.calls[0]?.[0]).toMatch(
+      new RegExp(
+        `/v1/files/${encodeURIComponent(fileId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/content$`,
+      ),
+    );
+    expect(get.mock.calls[0]?.[1]).toMatchObject({
+      maxRedirects: 0,
+      headers: {
+        API_KEY: "sk-upload-file",
+        Authorization: "Bearer sk-upload-file",
+      },
+    });
+    expect(get.mock.calls[1]?.[0]).toBe(redirectUrl);
+    expect(get.mock.calls[1]?.[1]).toMatchObject({ maxRedirects: 0 });
+    expect(get.mock.calls[1]?.[1]).not.toHaveProperty("headers.API_KEY");
+    expect(get.mock.calls[1]?.[1]).not.toHaveProperty("headers.Authorization");
+    expect(get.mock.calls.map(([url]) => String(url)).join("\n")).not.toContain(
+      "upload_url",
+    );
+
+    const stored = await readStoredPresalesFile(fileId);
+    expect(stored).toMatchObject({
+      filename: "recovered document.pdf",
+      sizeBytes: recovered.length,
+      uploadedAt,
+      contentExpiresAt,
+    });
+    const storedChunks: Buffer[] = [];
+    for await (const chunk of stored!.createReadStream()) {
+      storedChunks.push(Buffer.from(chunk));
+    }
+    expect(Buffer.concat(storedChunks)).toEqual(recovered);
+  });
+
+  it("keeps a DB deletion tombstone so GET cannot recover a deleted user upload", async () => {
+    const fileId = "deleted-user-upload";
+    const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
+    const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
+    await storePresalesTestFile({
+      fileId,
+      body: Buffer.from("delete me"),
+      uploadedAt,
+      contentExpiresAt,
+    });
+    presalesContentState = {
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+      uploadedAt,
+      contentExpiresAt,
+      contentDeletedAt: null,
+    };
+    vi.spyOn(axios, "delete").mockResolvedValue({ status: 204, data: "" });
+    const get = vi.spyOn(axios, "get");
+
+    await withServer(async (baseUrl) => {
+      const deleted = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}`,
+        {
+          method: "DELETE",
+          headers: { "x-frontmind-service-token": token },
+        },
+      );
+      expect(deleted.status).toBe(204);
+
+      const downloaded = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(downloaded.status).toBe(410);
+      await expect(downloaded.json()).resolves.toMatchObject({
+        error: { code: "SOURCE_EXPIRED", retryable: false },
+      });
+    });
+
+    expect(markPresalesFileContentDeleted).toHaveBeenCalledWith(
+      expect.objectContaining({ fileId, apiCredentialId: "credential-1" }),
+    );
+    expect(get).not.toHaveBeenCalled();
+    expect(await readPresalesFileLifecycle(fileId)).toBeNull();
+  });
+
+  it("keeps GET and PUT blocked when the upstream DELETE fails after the DB tombstone", async () => {
+    const fileId = "delete-upstream-failure";
+    const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
+    const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
+    presalesContentState = {
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+      uploadedAt,
+      contentExpiresAt,
+      contentDeletedAt: null,
+    };
+    vi.spyOn(axios, "delete").mockResolvedValue({
+      status: 503,
+      data: { message: "storage unavailable" },
+    });
+    const get = vi.spyOn(axios, "get");
+    const put = vi.spyOn(axios, "put");
+
+    await withServer(async (baseUrl) => {
+      const deleted = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}`,
+        {
+          method: "DELETE",
+          headers: { "x-frontmind-service-token": token },
+        },
+      );
+      expect(deleted.status).toBe(503);
+      const deletedAt = presalesContentState.contentDeletedAt;
+      expect(deletedAt).toBeInstanceOf(Date);
+
+      const downloaded = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(downloaded.status).toBe(410);
+
+      const uploaded = await fetch(
+        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
+        {
+          method: "PUT",
+          headers: {
+            "content-type": "application/pdf",
+            "x-frontmind-service-token": token,
+          },
+          body: Buffer.from("must remain blocked"),
+        },
+      );
+      expect(uploaded.status).toBe(410);
+      expect(presalesContentState.contentDeletedAt).toBe(deletedAt);
+    });
+
+    expect(get).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
   });
 
   it("replays one durable file id after the create response is lost, then tombstones cleanup", async () => {
@@ -500,17 +1186,52 @@ describe("presales create-time upload capability", () => {
       const downloaded = await fetch(`${baseUrl}/files/file-1/content`, {
         headers: { "x-frontmind-service-token": token },
       });
-      expect(downloaded.status).toBe(404);
+      expect(downloaded.status).toBe(410);
+      await expect(downloaded.json()).resolves.toMatchObject({
+        error: {
+          code: "SOURCE_UNAVAILABLE",
+          retryable: false,
+          recoveryAction: "reupload",
+        },
+      });
     });
 
-    expect(get).toHaveBeenCalledOnce();
+    expect(get).not.toHaveBeenCalled();
   });
 
-  it.each([403, 404, 503])(
-    "returns a controlled file-content error for upstream status %s",
-    async (status) => {
+  it.each([
+    {
+      upstreamStatus: 403,
+      responseStatus: 403,
+      code: "SOURCE_FORBIDDEN",
+      retryable: false,
+      recoveryAction: "contact_admin",
+    },
+    {
+      upstreamStatus: 404,
+      responseStatus: 410,
+      code: "SOURCE_UNAVAILABLE",
+      retryable: false,
+      recoveryAction: "reupload",
+    },
+    {
+      upstreamStatus: 503,
+      responseStatus: 503,
+      code: "SOURCE_DOWNLOAD_FAILED",
+      retryable: true,
+      recoveryAction: "retry",
+    },
+  ])(
+    "returns $code for upstream status $upstreamStatus",
+    async ({
+      upstreamStatus,
+      responseStatus,
+      code,
+      retryable,
+      recoveryAction,
+    }) => {
       vi.spyOn(axios, "get").mockResolvedValue({
-        status,
+        status: upstreamStatus,
         headers: {},
         data: { secret: "must-not-leak" },
       });
@@ -519,13 +1240,12 @@ describe("presales create-time upload capability", () => {
         const response = await fetch(`${baseUrl}/files/file-1/content`, {
           headers: { "x-frontmind-service-token": token },
         });
-        expect(response.status).toBe(status);
-        await expect(response.json()).resolves.toEqual({
-          error: {
-            code: "UPSTREAM_FILE_CONTENT_FAILED",
-            message: "File content download failed",
-          },
+        expect(response.status).toBe(responseStatus);
+        const body = await response.json();
+        expect(body).toMatchObject({
+          error: { code, retryable, recoveryAction },
         });
+        expect(JSON.stringify(body)).not.toContain("must-not-leak");
       });
     },
   );
@@ -541,11 +1261,12 @@ describe("presales create-time upload capability", () => {
       const response = await fetch(`${baseUrl}/files/file-1/content`, {
         headers: { "x-frontmind-service-token": token },
       });
-      expect(response.status).toBe(502);
-      await expect(response.json()).resolves.toEqual({
+      expect(response.status).toBe(422);
+      await expect(response.json()).resolves.toMatchObject({
         error: {
-          code: "UPSTREAM_FILE_CONTENT_EMPTY",
-          message: "File content download failed",
+          code: "SOURCE_CONTENT_INVALID",
+          retryable: false,
+          recoveryAction: "reupload",
         },
       });
     });
@@ -565,11 +1286,12 @@ describe("presales create-time upload capability", () => {
       const response = await fetch(`${baseUrl}/files/file-1/content`, {
         headers: { "x-frontmind-service-token": token },
       });
-      expect(response.status).toBe(502);
-      await expect(response.json()).resolves.toEqual({
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toMatchObject({
         error: {
-          code: "UPSTREAM_FILE_CONTENT_TOO_LARGE",
-          message: "File content download failed",
+          code: "SOURCE_CONTENT_TOO_LARGE",
+          retryable: false,
+          recoveryAction: "reupload",
         },
       });
     });
@@ -634,6 +1356,7 @@ describe("presales create-time upload capability", () => {
 
 describe("presales deletion routes", () => {
   beforeEach(() => {
+    let uploadReservedAt: Date | null = null;
     process.env.FRONTMIND_PRESALES_SERVICE_TOKEN = token;
     vi.mocked(getPresalesCredentialForResource).mockResolvedValue({
       id: "credential-1",
@@ -648,9 +1371,39 @@ describe("presales deletion routes", () => {
         kind: "file",
         upstreamId: "file-1",
         parentTaskId: null,
+        contentSource: "user_upload",
+        uploadReservedAt: null,
+        uploadedAt: null,
+        contentExpiresAt: null,
+        contentDeletedAt: null,
         createdAt: new Date(),
       },
     });
+    vi.mocked(reservePresalesFileUploadRetention).mockImplementation(
+      async ({ now }) => {
+        uploadReservedAt ??= now;
+        return {
+          uploadReservedAt,
+          uploadedAt: null,
+          contentExpiresAt: null,
+        } as never;
+      },
+    );
+    vi.mocked(finalizePresalesFileUploadRetention).mockImplementation(
+      async () => {
+        if (!uploadReservedAt) throw new Error("reservation missing");
+        return {
+          uploadReservedAt,
+          uploadedAt: uploadReservedAt,
+          contentExpiresAt: new Date(
+            uploadReservedAt.getTime() + 30 * 24 * 60 * 60 * 1_000,
+          ),
+        } as never;
+      },
+    );
+    vi.mocked(markPresalesFileContentDeleted).mockResolvedValue(
+      undefined as never,
+    );
     vi.mocked(resolvePresalesTaskCredentialForFiles).mockResolvedValue({
       id: "credential-1",
       version: 1,

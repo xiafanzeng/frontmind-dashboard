@@ -30,8 +30,11 @@ import {
 } from "react";
 
 import Home from "@/pages/Home";
+import FilePreview from "@/components/FilePreview";
+import ImagePreview from "@/components/ImagePreview";
 import {
   useConversation,
+  type Attachment,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
 import { trpc } from "@/lib/trpc";
@@ -227,6 +230,31 @@ function responseLogicAttachmentUrl(fileId: string) {
   return `/api/frontmind/v1/files/${encodeURIComponent(fileId)}`;
 }
 
+function responseLogicChatAttachment(
+  attachment: ResponseLogicAttachment,
+): Attachment {
+  return {
+    id: `response-logic-source-${attachment.fileId}`,
+    type: attachment.kind === "image" ? "image" : "file",
+    name: attachment.filename,
+    fileId: attachment.fileId,
+    expiresAt: attachment.expiresAt,
+    expired: attachment.expired,
+  };
+}
+
+export function isResponseLogicAttachmentExpired(
+  attachment: Pick<ResponseLogicAttachment, "expired" | "expiresAt">,
+  now = Date.now(),
+) {
+  return (
+    attachment.expired === true ||
+    (typeof attachment.expiresAt === "number" &&
+      Number.isFinite(attachment.expiresAt) &&
+      attachment.expiresAt <= now)
+  );
+}
+
 export function mergeResponseLogicAttachmentsIntoDraft(
   draft: LogicDraft,
   attachments: ResponseLogicAttachment[],
@@ -236,8 +264,21 @@ export function mergeResponseLogicAttachmentsIntoDraft(
     mergedAttachments.set(attachment.fileId, attachment);
   }
   const authoritativeAttachments = [...mergedAttachments.values()];
+  const expiredUploadImageIds = new Set(
+    authoritativeAttachments
+      .filter(
+        (attachment) =>
+          attachment.kind === "image" &&
+          isResponseLogicAttachmentExpired(attachment),
+      )
+      .map((attachment) => `response-logic-upload-${attachment.fileId}`),
+  );
   const uploadedImages: LogicImage[] = authoritativeAttachments
-    .filter((attachment) => attachment.kind === "image")
+    .filter(
+      (attachment) =>
+        attachment.kind === "image" &&
+        !isResponseLogicAttachmentExpired(attachment),
+    )
     .map((attachment) => ({
       id: `response-logic-upload-${attachment.fileId}`,
       name: attachment.filename,
@@ -252,7 +293,7 @@ export function mergeResponseLogicAttachmentsIntoDraft(
     ...draft,
     attachments: authoritativeAttachments,
     images: [
-      ...draft.images,
+      ...draft.images.filter((image) => !expiredUploadImageIds.has(image.id)),
       ...uploadedImages.filter(
         (candidate) =>
           !draft.images.some(
@@ -1560,7 +1601,17 @@ function LogicEditor({
   onUpdate: () => void;
 }) {
   const sourceFiles = draft.attachments.filter(
-    (attachment) => attachment.kind === "file",
+    (attachment) =>
+      attachment.kind === "file" ||
+      isResponseLogicAttachmentExpired(attachment),
+  );
+  const uploadedImageAttachments = new Map<string, ResponseLogicAttachment>(
+    draft.attachments
+      .filter((attachment) => attachment.kind === "image")
+      .map(
+        (attachment) =>
+          [`response-logic-upload-${attachment.fileId}`, attachment] as const,
+      ),
   );
 
   return (
@@ -1659,78 +1710,91 @@ function LogicEditor({
             <div className="rl-source-files" aria-label="已核验上传资料">
               <strong>服务端已核验资料</strong>
               {sourceFiles.map((attachment) => (
-                <a
+                <FilePreview
                   key={attachment.fileId}
-                  href={responseLogicAttachmentUrl(attachment.fileId)}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  <FileText size={14} />
-                  <span>{attachment.filename}</span>
-                </a>
+                  file={responseLogicChatAttachment(attachment)}
+                  className="w-full"
+                />
               ))}
             </div>
           )}
           {draft.images.length > 0 && (
             <div className="rl-image-editor-list">
-              {draft.images.map((image) => (
-                <div className="rl-image-editor" key={image.id}>
-                  <img src={image.url} alt={image.caption || image.name} />
-                  <div className="rl-image-meta-editor">
-                    <input
-                      value={image.caption}
-                      aria-label={`${image.name} 图注`}
-                      placeholder="图注"
-                      onChange={(event) =>
-                        onPatchImage(image.id, { caption: event.target.value })
-                      }
-                    />
-                    <input
-                      value={image.source}
-                      aria-label={`${image.name} 来源`}
-                      placeholder="来源材料"
-                      onChange={(event) =>
-                        onPatchImage(image.id, { source: event.target.value })
-                      }
-                    />
-                    <div>
+              {draft.images.map((image) => {
+                const uploadedAttachment = uploadedImageAttachments.get(
+                  image.id,
+                );
+                return (
+                  <div className="rl-image-editor" key={image.id}>
+                    {uploadedAttachment ? (
+                      <ImagePreview
+                        fileId={uploadedAttachment.fileId}
+                        alt={image.caption || image.name}
+                        expiresAt={uploadedAttachment.expiresAt}
+                        expired={uploadedAttachment.expired}
+                        className="rl-owned-image-preview-editor"
+                      />
+                    ) : (
+                      <img src={image.url} alt={image.caption || image.name} />
+                    )}
+                    <div className="rl-image-meta-editor">
                       <input
-                        value={image.section}
-                        aria-label={`${image.name} 对应逻辑段落`}
-                        placeholder="对应逻辑段落"
+                        value={image.caption}
+                        aria-label={`${image.name} 图注`}
+                        placeholder="图注"
                         onChange={(event) =>
                           onPatchImage(image.id, {
-                            section: event.target.value,
+                            caption: event.target.value,
                           })
                         }
                       />
-                      <select
-                        value={image.authorization}
-                        aria-label={`${image.name} 授权状态`}
+                      <input
+                        value={image.source}
+                        aria-label={`${image.name} 来源`}
+                        placeholder="来源材料"
                         onChange={(event) =>
-                          onPatchImage(image.id, {
-                            authorization: event.target
-                              .value as LogicImage["authorization"],
-                          })
+                          onPatchImage(image.id, { source: event.target.value })
                         }
-                      >
-                        <option>待确认</option>
-                        <option>公开可用</option>
-                        <option>已获授权</option>
-                        <option>仅内部参考</option>
-                      </select>
+                      />
+                      <div>
+                        <input
+                          value={image.section}
+                          aria-label={`${image.name} 对应逻辑段落`}
+                          placeholder="对应逻辑段落"
+                          onChange={(event) =>
+                            onPatchImage(image.id, {
+                              section: event.target.value,
+                            })
+                          }
+                        />
+                        <select
+                          value={image.authorization}
+                          aria-label={`${image.name} 授权状态`}
+                          onChange={(event) =>
+                            onPatchImage(image.id, {
+                              authorization: event.target
+                                .value as LogicImage["authorization"],
+                            })
+                          }
+                        >
+                          <option>待确认</option>
+                          <option>公开可用</option>
+                          <option>已获授权</option>
+                          <option>仅内部参考</option>
+                        </select>
+                      </div>
                     </div>
+                    <button
+                      type="button"
+                      className="rl-delete-image"
+                      aria-label={`删除 ${image.name}`}
+                      onClick={() => onRemoveImage(image.id)}
+                    >
+                      <Trash2 size={15} />
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    className="rl-delete-image"
-                    aria-label={`删除 ${image.name}`}
-                    onClick={() => onRemoveImage(image.id)}
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -1813,7 +1877,17 @@ export function ResponseLogicConfirmationPanel({
   const boundaries = textLines(logic.boundaries);
   const references = textLines(logic.references);
   const sourceFiles = (logic.attachments ?? []).filter(
-    (attachment) => attachment.kind === "file",
+    (attachment) =>
+      attachment.kind === "file" ||
+      isResponseLogicAttachmentExpired(attachment),
+  );
+  const uploadedImageAttachments = new Map<string, ResponseLogicAttachment>(
+    (logic.attachments ?? [])
+      .filter((attachment) => attachment.kind === "image")
+      .map(
+        (attachment) =>
+          [`response-logic-upload-${attachment.fileId}`, attachment] as const,
+      ),
   );
   const versionLabel = logic.version > 0 ? `V${logic.version}.0` : "V0.1";
 
@@ -1910,29 +1984,44 @@ export function ResponseLogicConfirmationPanel({
               {sourceFiles.map((attachment) => (
                 <li key={attachment.fileId}>
                   <Paperclip size={15} />
-                  <a
-                    href={responseLogicAttachmentUrl(attachment.fileId)}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {attachment.filename}
-                  </a>
+                  <FilePreview
+                    file={responseLogicChatAttachment(attachment)}
+                    className="w-full"
+                  />
                 </li>
               ))}
             </ul>
             <div className="rl-confirmed-images">
               {(logic.images ?? []).length > 0 ? (
-                (logic.images ?? []).map((image) => (
-                  <figure key={image.id}>
-                    <img src={image.url} alt={image.caption || image.name} />
-                    <figcaption>
-                      <strong>{image.caption || image.name}</strong>
-                      <span>来源：{image.source || "待补充"}</span>
-                      <span>对应段落：{image.section || "待补充"}</span>
-                      <span>使用权限：{image.authorization}</span>
-                    </figcaption>
-                  </figure>
-                ))
+                (logic.images ?? []).map((image) => {
+                  const uploadedAttachment = uploadedImageAttachments.get(
+                    image.id,
+                  );
+                  return (
+                    <figure key={image.id}>
+                      {uploadedAttachment ? (
+                        <ImagePreview
+                          fileId={uploadedAttachment.fileId}
+                          alt={image.caption || image.name}
+                          expiresAt={uploadedAttachment.expiresAt}
+                          expired={uploadedAttachment.expired}
+                          className="rl-owned-image-preview-confirmed"
+                        />
+                      ) : (
+                        <img
+                          src={image.url}
+                          alt={image.caption || image.name}
+                        />
+                      )}
+                      <figcaption>
+                        <strong>{image.caption || image.name}</strong>
+                        <span>来源：{image.source || "待补充"}</span>
+                        <span>对应段落：{image.section || "待补充"}</span>
+                        <span>使用权限：{image.authorization}</span>
+                      </figcaption>
+                    </figure>
+                  );
+                })
               ) : (
                 <div className="rl-empty-image">
                   <ImagePlus size={23} />

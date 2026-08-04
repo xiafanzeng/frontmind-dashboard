@@ -33,6 +33,10 @@ import {
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
 import { KnowledgeBasePollingCoordinator } from "@/lib/knowledge-base-coordinator";
+import {
+  isAttachmentExpired,
+  localAttachmentPayloadExpiresAt,
+} from "@/lib/attachment-expiry";
 
 // Types for local conversation management
 export interface Attachment {
@@ -43,6 +47,10 @@ export interface Attachment {
   base64?: string; // for image/small file preview (data URL)
   blobUrl?: string; // in-memory blob URL for large files (not persisted to localStorage)
   file?: File;
+  /** Absolute millisecond epoch after which the attachment must be re-uploaded. */
+  expiresAt?: number;
+  /** Authoritative expiry flag returned by the file service. */
+  expired?: boolean;
 }
 
 /**
@@ -201,6 +209,107 @@ function hasServerOwnedKnowledgeBaseMessages(conversation: Conversation) {
 interface ConversationState {
   conversations: Conversation[];
   activeConversationId: string | null;
+}
+
+function attachmentHasBrowserPayload(attachment: Attachment) {
+  return Boolean(attachment.file || attachment.blobUrl || attachment.base64);
+}
+
+function expireConversationAttachmentPayloads(
+  state: ConversationState,
+  now = Date.now(),
+): ConversationState {
+  let stateChanged = false;
+  const conversations = state.conversations.map((conversation) => {
+    let conversationChanged = false;
+    const messages = conversation.messages.map((message) => {
+      if (!message.attachments?.length) return message;
+      let messageChanged = false;
+      const attachments = message.attachments.map((attachment) => {
+        const payloadDeadline = attachmentHasBrowserPayload(attachment)
+          ? localAttachmentPayloadExpiresAt(attachment, message.timestamp)
+          : undefined;
+        const expired =
+          isAttachmentExpired(attachment, now) ||
+          (payloadDeadline !== undefined && payloadDeadline <= now);
+        if (!expired) return attachment;
+        const {
+          file: _file,
+          blobUrl: _blobUrl,
+          base64: _base64,
+          ...metadata
+        } = attachment;
+        if (
+          attachment.expired === true &&
+          !attachmentHasBrowserPayload(attachment)
+        ) {
+          return attachment;
+        }
+        messageChanged = true;
+        return { ...metadata, expired: true };
+      });
+      if (!messageChanged) return message;
+      conversationChanged = true;
+      return { ...message, attachments };
+    });
+    if (!conversationChanged) return conversation;
+    stateChanged = true;
+    return { ...conversation, messages };
+  });
+  return stateChanged ? { ...state, conversations } : state;
+}
+
+function collectAttachmentBlobUrls(state: ConversationState): Set<string> {
+  const urls = new Set<string>();
+  for (const conversation of state.conversations) {
+    for (const message of conversation.messages) {
+      for (const attachment of message.attachments ?? []) {
+        if (attachment.blobUrl?.startsWith("blob:")) {
+          urls.add(attachment.blobUrl);
+        }
+      }
+    }
+  }
+  return urls;
+}
+
+function revokeReleasedAttachmentBlobUrls(
+  previous: ConversationState,
+  incoming: ConversationState,
+  retained: ConversationState,
+) {
+  if (typeof URL.revokeObjectURL !== "function") return;
+  const candidates = new Set([
+    ...collectAttachmentBlobUrls(previous),
+    ...collectAttachmentBlobUrls(incoming),
+  ]);
+  const retainedUrls = collectAttachmentBlobUrls(retained);
+  for (const url of candidates) {
+    if (!retainedUrls.has(url)) URL.revokeObjectURL(url);
+  }
+}
+
+function nextAttachmentPayloadExpiry(state: ConversationState, now: number) {
+  let nextExpiry: number | undefined;
+  for (const conversation of state.conversations) {
+    for (const message of conversation.messages) {
+      for (const attachment of message.attachments ?? []) {
+        if (attachment.expired) continue;
+        const deadline =
+          typeof attachment.expiresAt === "number" &&
+          Number.isFinite(attachment.expiresAt)
+            ? attachment.expiresAt
+            : attachmentHasBrowserPayload(attachment)
+              ? localAttachmentPayloadExpiresAt(attachment, message.timestamp)
+              : undefined;
+        if (deadline === undefined) continue;
+        if (deadline <= now) return now;
+        nextExpiry =
+          nextExpiry === undefined ? deadline : Math.min(nextExpiry, deadline);
+      }
+    }
+  }
+  return nextExpiry;
 }
 
 type Action =
@@ -1072,12 +1181,51 @@ function retainKnowledgeBaseUserAttachments(
     preferred.role !== "user" ||
     preferred.knowledgeBase?.kind !== "pending_user" ||
     fallback.knowledgeBase?.kind !== "pending_user" ||
-    preferred.attachments?.length ||
     !fallback.attachments?.length
   ) {
     return preferred;
   }
-  return { ...preferred, attachments: fallback.attachments };
+  if (!preferred.attachments?.length) {
+    return preferred;
+  }
+
+  const usedFallbackIndexes = new Set<number>();
+  const attachments = preferred.attachments.map((authoritativeAttachment) => {
+    // Browser bytes are capabilities, not display metadata. Reattach them
+    // only when the authoritative message names the exact same opaque
+    // upstream file ID. ID/name/index similarity is never sufficient.
+    if (
+      !authoritativeAttachment.fileId ||
+      !authoritativeAttachment.fileId.trim()
+    ) {
+      return authoritativeAttachment;
+    }
+    const fallbackIndex = fallback.attachments!.findIndex(
+      (candidate, candidateIndex) =>
+        !usedFallbackIndexes.has(candidateIndex) &&
+        candidate.fileId === authoritativeAttachment.fileId,
+    );
+
+    if (fallbackIndex < 0) return authoritativeAttachment;
+    usedFallbackIndexes.add(fallbackIndex);
+    const browserAttachment = fallback.attachments![fallbackIndex]!;
+    return {
+      ...authoritativeAttachment,
+      ...(authoritativeAttachment.file === undefined &&
+      browserAttachment.file !== undefined
+        ? { file: browserAttachment.file }
+        : {}),
+      ...(authoritativeAttachment.blobUrl === undefined &&
+      browserAttachment.blobUrl !== undefined
+        ? { blobUrl: browserAttachment.blobUrl }
+        : {}),
+      ...(authoritativeAttachment.base64 === undefined &&
+      browserAttachment.base64 !== undefined
+        ? { base64: browserAttachment.base64 }
+        : {}),
+    };
+  });
+  return { ...preferred, attachments };
 }
 
 function compareHydratedMessageOrder(left: LocalMessage, right: LocalMessage) {
@@ -1485,8 +1633,11 @@ export function ConversationProvider({
   }
 
   const replaceState = useCallback((nextState: ConversationState) => {
-    stateRef.current = nextState;
-    dispatch({ type: "LOAD_STATE", payload: nextState });
+    const previousState = stateRef.current;
+    const retainedState = expireConversationAttachmentPayloads(nextState);
+    stateRef.current = retainedState;
+    dispatch({ type: "LOAD_STATE", payload: retainedState });
+    revokeReleasedAttachmentBlobUrls(previousState, nextState, retainedState);
   }, []);
 
   const commit = useCallback(
@@ -1809,6 +1960,53 @@ export function ConversationProvider({
     canSyncRef.current = hydrated && userId !== null;
   }, [hydrated, userId]);
 
+  useEffect(() => {
+    let timer: number | undefined;
+    let disposed = false;
+
+    const expireAndReschedule = () => {
+      if (disposed) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+
+      const now = Date.now();
+      const previousState = stateRef.current;
+      const expiredState = expireConversationAttachmentPayloads(
+        previousState,
+        now,
+      );
+      if (expiredState !== previousState) {
+        replaceState(expiredState);
+      }
+
+      const nextExpiry = nextAttachmentPayloadExpiry(stateRef.current, now);
+      if (nextExpiry === undefined) {
+        timer = undefined;
+        return;
+      }
+      // A 30-day deadline is longer than the maximum reliable signed 32-bit
+      // browser timer. Keep the same callback alive across intermediate wakes;
+      // relying on a React render here would lose the final five-day segment
+      // when no attachment has expired and the state reference is unchanged.
+      const delay = Math.min(Math.max(0, nextExpiry - now), 2_147_000_000);
+      timer = window.setTimeout(expireAndReschedule, delay);
+    };
+
+    const handleFocus = () => expireAndReschedule();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") expireAndReschedule();
+    };
+
+    expireAndReschedule();
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [replaceState, state]);
+
   const createConversation = useCallback(
     (options?: { title?: string; reuseEmpty?: boolean }) => {
       const title = options?.title?.trim() || "新内容流程";
@@ -2000,6 +2198,11 @@ export function ConversationProvider({
   useEffect(
     () => () => {
       syncQueueRef.current?.reset();
+      if (typeof URL.revokeObjectURL === "function") {
+        for (const url of collectAttachmentBlobUrls(stateRef.current)) {
+          URL.revokeObjectURL(url);
+        }
+      }
     },
     [],
   );

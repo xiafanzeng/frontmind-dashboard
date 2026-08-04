@@ -53,9 +53,9 @@ The validator counts only effective non-whitespace characters inside these
 markers. Customer-visible content targets 80,000–120,000 characters and must
 not exceed 180,000. It has no fixed global minimum: each overview and leaf
 must instead satisfy its evidence-proportional requirement declared in the
-manifest. Do not use “第一方原始快照” or
-“第一方页面摘录”, “原始快照”, “页面摘录”, `raw evidence`, or
-`page excerpt` inside the formal block.
+manifest. As an editorial practice, keep raw excerpts in non-customer evidence
+documents. The validator does not screen formal prose with a vocabulary or
+phrase blacklist.
 
 ## `00_package_manifest.json`
 

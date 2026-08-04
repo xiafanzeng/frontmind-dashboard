@@ -33,6 +33,7 @@ import {
 } from "./auth-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getDb } from "./db";
+import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
 import { knowledgeBaseCustomerUploadResources } from "./knowledge-base-customer-upload";
 import { knowledgeBaseMarkdownSha256 } from "./knowledge-base-package-validation";
 import { protectedProcedure, router } from "./_core/trpc";
@@ -43,6 +44,8 @@ const attachmentSchema = z.object({
   type: z.enum(["file", "image"]),
   name: z.string().min(1).max(512),
   fileId: z.string().min(1).max(255).optional(),
+  expiresAt: z.number().finite().nonnegative().optional(),
+  expired: z.boolean().optional(),
 });
 
 const outputFileSchema = z.object({
@@ -393,6 +396,85 @@ type UpstreamResourceRef = { kind: "task" | "file"; id: string };
 const LEGACY_IMPORT_MAX_RESOURCES = 200;
 const LEGACY_IMPORT_VALIDATION_CONCURRENCY = 4;
 const LEGACY_IMPORT_VALIDATION_TIMEOUT_MS = 30_000;
+type AttachmentRetention = {
+  expiresAt: number;
+  expired: boolean;
+};
+
+async function attachmentRetentionByFileId(
+  executor: any,
+  userId: number,
+  fileIds: string[],
+  projectAssignmentId: string | null,
+  now = Date.now(),
+) {
+  const uniqueFileIds = [...new Set(fileIds.filter(Boolean))];
+  if (uniqueFileIds.length === 0) return new Map<string, AttachmentRetention>();
+  const rows = await executor
+    .select({
+      upstreamId: upstreamResources.upstreamId,
+      createdAt: upstreamResources.createdAt,
+      uploadedAt: upstreamResources.uploadedAt,
+      contentExpiresAt: upstreamResources.contentExpiresAt,
+      contentDeletedAt: upstreamResources.contentDeletedAt,
+    })
+    .from(upstreamResources)
+    .where(
+      and(
+        eq(upstreamResources.kind, "file"),
+        inArray(upstreamResources.upstreamId, uniqueFileIds),
+        projectAssignmentId
+          ? eq(upstreamResources.projectAssignmentId, projectAssignmentId)
+          : and(
+              eq(upstreamResources.userId, userId),
+              isNull(upstreamResources.projectAssignmentId),
+            ),
+      ),
+    );
+  return new Map<string, AttachmentRetention>(
+    rows.map(
+      (row: {
+        upstreamId: string;
+        createdAt: Date;
+        uploadedAt: Date | null;
+        contentExpiresAt: Date | null;
+        contentDeletedAt: Date | null;
+      }) => {
+        // Legacy user attachments predate the explicit retention columns. The
+        // immutable resource creation time is the only trustworthy fallback;
+        // a later conversation snapshot must never extend it.
+        const expiresAt = (
+          row.contentExpiresAt ??
+          new Date(
+            (row.uploadedAt ?? row.createdAt).getTime() +
+              FILE_CONTENT_RETENTION_MS,
+          )
+        ).getTime();
+        return [
+          row.upstreamId,
+          {
+            expiresAt,
+            expired: Boolean(row.contentDeletedAt) || expiresAt <= now,
+          },
+        ];
+      },
+    ),
+  );
+}
+
+function applyAttachmentRetention<T extends { fileId?: string }>(
+  attachment: T,
+  retention: ReadonlyMap<string, AttachmentRetention>,
+) {
+  if (!attachment.fileId) return attachment;
+  const lifecycle = retention.get(attachment.fileId);
+  // Hydrated attachments are server-authoritative. If their ownership ledger
+  // is missing, fail closed instead of rendering a clickable card that later
+  // turns into a confusing 403/404 in the PDF reader.
+  return lifecycle
+    ? { ...attachment, ...lifecycle }
+    : { ...attachment, expired: true };
+}
 
 function upstreamResourceKey(kind: "task" | "file", id: string) {
   return JSON.stringify([kind, id]);
@@ -713,12 +795,15 @@ async function assertResourceOwnership(
   projectAssignmentId: string | null,
   kind: "task" | "file",
   upstreamId: string,
+  forUpdate = false,
 ) {
-  const rows = await executor
+  let query = executor
     .select({
+      id: upstreamResources.id,
       userId: upstreamResources.userId,
       projectAssignmentId: upstreamResources.projectAssignmentId,
       apiCredentialId: upstreamResources.apiCredentialId,
+      conversationId: upstreamResources.conversationId,
     })
     .from(upstreamResources)
     .where(
@@ -728,6 +813,8 @@ async function assertResourceOwnership(
       ),
     )
     .limit(1);
+  if (forUpdate) query = query.for("update");
+  const rows = await query;
   const owned = projectAssignmentId
     ? rows[0]?.projectAssignmentId === projectAssignmentId
     : rows[0]?.userId === userId && rows[0]?.projectAssignmentId == null;
@@ -1118,8 +1205,22 @@ async function persistResource(
     input.projectAssignmentId,
     input.kind,
     input.upstreamId,
+    true,
   );
-  if (existing) return;
+  if (existing) {
+    if (existing.id && !existing.conversationId) {
+      await executor
+        .update(upstreamResources)
+        .set({ conversationId: input.conversationId })
+        .where(
+          and(
+            eq(upstreamResources.id, existing.id),
+            isNull(upstreamResources.conversationId),
+          ),
+        );
+    }
+    return;
+  }
   if (
     !validatedResourceKeys?.has(
       upstreamResourceKey(input.kind, input.upstreamId),
@@ -1440,6 +1541,21 @@ export async function loadPersistedMessages(
       messageRows,
       projectAssignmentId,
     );
+  const retentionByFileId = await attachmentRetentionByFileId(
+    executor,
+    userId,
+    [
+      ...attachmentRows.flatMap(
+        (attachment: typeof attachments.$inferSelect) =>
+          attachment.upstreamFileId ? [attachment.upstreamFileId] : [],
+      ),
+      ...[...authoritativeKnowledgeBase.userAttachments.values()].flatMap(
+        (items) =>
+          items?.flatMap((item) => (item.fileId ? [item.fileId] : [])) ?? [],
+      ),
+    ],
+    projectAssignmentId,
+  );
 
   return messageRows.map((message: typeof messages.$inferSelect) => {
     const metadata = (message.metadata ?? {}) as MessageMetadata;
@@ -1467,7 +1583,7 @@ export async function loadPersistedMessages(
           : ("user" as const),
       content: normalizeKnowledgeCollectionCopy(message.content),
       timestamp: message.sentAt.getTime(),
-      attachments:
+      attachments: (
         reconstructedAttachments ??
         (attachmentsByMessage.get(message.id) ?? []).map(
           (attachment: typeof attachments.$inferSelect) => ({
@@ -1478,7 +1594,10 @@ export async function loadPersistedMessages(
               ? { fileId: attachment.upstreamFileId }
               : {}),
           }),
-        ),
+        )
+      ).map((attachment: KnowledgeBaseUserMessageAttachment) =>
+        applyAttachmentRetention(attachment, retentionByFileId),
+      ),
       ...(metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {}),
       ...(inlineImages ? { inlineImages } : {}),
       ...(metadata.elapsedTime !== undefined
@@ -2074,16 +2193,6 @@ async function persistSnapshot(
             ? (options.importCredentialId ?? apiCredentialId)
             : apiCredentialId))
         : apiCredentialId;
-      await executor.insert(attachments).values({
-        id: storageId(userId, attachment.id, projectAssignmentId),
-        userId,
-        conversationId: persistedConversationId,
-        messageId: storageId(userId, message.id, projectAssignmentId),
-        apiCredentialId: attachmentCredentialId,
-        kind: attachment.type,
-        fileName: attachment.name,
-        upstreamFileId: attachment.fileId ?? null,
-      });
       if (attachment.fileId && attachmentCredentialId) {
         await persistResource(
           executor,
@@ -2098,6 +2207,20 @@ async function persistSnapshot(
           options.validatedResourceKeys,
         );
       }
+      // Lock/bind the ownership row before publishing the reference. The idle
+      // cleanup worker takes the same row lock before deciding a file is
+      // unreferenced, so a concurrent reuse either wins and is observed or
+      // waits until the cleanup decision is durable.
+      await executor.insert(attachments).values({
+        id: storageId(userId, attachment.id, projectAssignmentId),
+        userId,
+        conversationId: persistedConversationId,
+        messageId: storageId(userId, message.id, projectAssignmentId),
+        apiCredentialId: attachmentCredentialId,
+        kind: attachment.type,
+        fileName: attachment.name,
+        upstreamFileId: attachment.fileId ?? null,
+      });
     }
   }
 
@@ -2358,6 +2481,20 @@ export async function listSnapshots(
       messageRows,
       projectAssignmentId,
     );
+  const retentionByFileId = await attachmentRetentionByFileId(
+    db,
+    userId,
+    [
+      ...attachmentRows.flatMap((attachment) =>
+        attachment.upstreamFileId ? [attachment.upstreamFileId] : [],
+      ),
+      ...[...authoritativeKnowledgeBase.userAttachments.values()].flatMap(
+        (items) =>
+          items?.flatMap((item) => (item.fileId ? [item.fileId] : [])) ?? [],
+      ),
+    ],
+    projectAssignmentId,
+  );
 
   return conversationRows.map((row) => ({
     id: publicId(userId, row.id, projectAssignmentId),
@@ -2388,7 +2525,7 @@ export async function listSnapshots(
             : ("user" as const),
         content: normalizeKnowledgeCollectionCopy(message.content),
         timestamp: message.sentAt.getTime(),
-        attachments:
+        attachments: (
           reconstructedAttachments ??
           (attachmentsByMessage.get(message.id) ?? []).map((attachment) => ({
             id: publicId(userId, attachment.id, projectAssignmentId),
@@ -2397,7 +2534,10 @@ export async function listSnapshots(
             ...(attachment.upstreamFileId
               ? { fileId: attachment.upstreamFileId }
               : {}),
-          })),
+          }))
+        ).map((attachment: KnowledgeBaseUserMessageAttachment) =>
+          applyAttachmentRetention(attachment, retentionByFileId),
+        ),
         ...(metadata.outputFiles ? { outputFiles: metadata.outputFiles } : {}),
         ...(inlineImages ? { inlineImages } : {}),
         ...(metadata.elapsedTime !== undefined

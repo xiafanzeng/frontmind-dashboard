@@ -1,7 +1,23 @@
 import ExcelJS from "exceljs";
-import { describe, expect, it } from "vitest";
+import { Readable } from "node:stream";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { parseRedirectWorkbook } from "./delivery-redirect-service";
+const resolverMocks = vi.hoisted(() => ({ resolve: vi.fn() }));
+
+vi.mock("./owned-file-content-resolver", async () => {
+  const actual = await vi.importActual<
+    typeof import("./owned-file-content-resolver")
+  >("./owned-file-content-resolver");
+  return {
+    ...actual,
+    ownedFileContentResolver: { resolve: resolverMocks.resolve },
+  };
+});
+
+import {
+  downloadOwnedRedirectFile,
+  parseRedirectWorkbook,
+} from "./delivery-redirect-service";
 
 async function workbookBuffer(rows: Array<[string, string, number | string]>) {
   const workbook = new ExcelJS.Workbook();
@@ -12,6 +28,27 @@ async function workbookBuffer(rows: Array<[string, string, number | string]>) {
 }
 
 describe("batch redirect workbook parser", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("reads the owned workbook through the shared content resolver", async () => {
+    const bytes = Buffer.from("redirect workbook bytes");
+    resolverMocks.resolve.mockResolvedValue({
+      stream: Readable.from([bytes]),
+      mimeType:
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+
+    await expect(
+      downloadOwnedRedirectFile(42, "file-redirects"),
+    ).resolves.toEqual(bytes);
+    expect(resolverMocks.resolve).toHaveBeenCalledWith({
+      ownerUserId: 42,
+      fileId: "file-redirects",
+    });
+  });
+
   it("normalizes a valid redirect file without inventing rows", async () => {
     const result = await parseRedirectWorkbook(
       await workbookBuffer([

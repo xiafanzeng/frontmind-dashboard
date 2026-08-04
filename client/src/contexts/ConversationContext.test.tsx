@@ -1,9 +1,10 @@
 import React from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { knowledgeBaseUserMessagePublicId } from "@shared/knowledge-base-message";
 import {
   ConversationProvider,
+  mergeServerOwnedKnowledgeBaseMessages,
   parseOutputMessages,
   prepareConversationForCloud,
   sanitizeKnowledgeBaseCustomerMarkdown,
@@ -11,6 +12,133 @@ import {
   useConversation,
   type Conversation,
 } from "./ConversationContext";
+
+describe("knowledge-base attachment payload reconciliation", () => {
+  function pendingUserMessage(input: {
+    id: string;
+    serverOwned: boolean;
+    attachments?: Conversation["messages"][number]["attachments"];
+  }): Conversation["messages"][number] {
+    return {
+      id: input.id,
+      role: "user",
+      content: "上传资料",
+      timestamp: input.serverOwned ? 2 : 1,
+      attachments: input.attachments,
+      knowledgeBase: {
+        kind: "pending_user",
+        clientRequestId: "request-attachment",
+        ...(input.serverOwned
+          ? { turnId: "turn-attachment", serverOwned: true }
+          : { serverOwned: false }),
+      },
+    };
+  }
+
+  it("reattaches browser bytes only for an exact opaque fileId match", () => {
+    const localFile = new File(["local"], "same.pdf", {
+      type: "application/pdf",
+    });
+    const [merged] = mergeServerOwnedKnowledgeBaseMessages(
+      [
+        pendingUserMessage({
+          id: "optimistic",
+          serverOwned: false,
+          attachments: [
+            {
+              id: "optimistic-attachment",
+              type: "file",
+              name: "same.pdf",
+              fileId: " folder/%2F?# ",
+              file: localFile,
+              blobUrl: "blob:exact",
+            },
+          ],
+        }),
+      ],
+      [
+        pendingUserMessage({
+          id: "canonical",
+          serverOwned: true,
+          attachments: [
+            {
+              id: "canonical-attachment",
+              type: "file",
+              name: "server-name.pdf",
+              fileId: " folder/%2F?# ",
+            },
+          ],
+        }),
+      ],
+    );
+
+    expect(merged.attachments?.[0]).toMatchObject({
+      id: "canonical-attachment",
+      fileId: " folder/%2F?# ",
+      file: localFile,
+      blobUrl: "blob:exact",
+    });
+  });
+
+  it("never copies payloads when the authoritative attachment is absent or has no exact fileId", () => {
+    const localFile = new File(["local"], "same.pdf", {
+      type: "application/pdf",
+    });
+    const optimistic = pendingUserMessage({
+      id: "optimistic",
+      serverOwned: false,
+      attachments: [
+        {
+          id: "same-id",
+          type: "file",
+          name: "same.pdf",
+          fileId: "local-file-id",
+          file: localFile,
+          blobUrl: "blob:wrong",
+        },
+      ],
+    });
+
+    const [withoutAttachments] = mergeServerOwnedKnowledgeBaseMessages(
+      [optimistic],
+      [pendingUserMessage({ id: "canonical-empty", serverOwned: true })],
+    );
+    expect(withoutAttachments.attachments).toBeUndefined();
+
+    const [withoutFileId] = mergeServerOwnedKnowledgeBaseMessages(
+      [optimistic],
+      [
+        pendingUserMessage({
+          id: "canonical-no-file-id",
+          serverOwned: true,
+          attachments: [{ id: "same-id", type: "file", name: "same.pdf" }],
+        }),
+      ],
+    );
+    expect(withoutFileId.attachments?.[0]?.file).toBeUndefined();
+    expect(withoutFileId.attachments?.[0]?.blobUrl).toBeUndefined();
+
+    const [differentFileId] = mergeServerOwnedKnowledgeBaseMessages(
+      [optimistic],
+      [
+        pendingUserMessage({
+          id: "canonical-other-file",
+          serverOwned: true,
+          attachments: [
+            {
+              id: "same-id",
+              type: "file",
+              name: "same.pdf",
+              fileId: "different-file-id",
+            },
+          ],
+        }),
+      ],
+    );
+    expect(differentFileId.attachments?.[0]?.file).toBeUndefined();
+    expect(differentFileId.attachments?.[0]?.blobUrl).toBeUndefined();
+  });
+});
 
 const mocks = vi.hoisted(() => ({
   auth: {
@@ -71,6 +199,10 @@ describe("ConversationProvider cloud hydration", () => {
     mocks.deleteConversation.mockResolvedValue({ success: true });
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("hydrates conversations from the database", async () => {
     const { result } = renderHook(() => useConversation(), { wrapper });
 
@@ -79,6 +211,185 @@ describe("ConversationProvider cloud hydration", () => {
     expect(result.current.state.conversations.map((item) => item.id)).toEqual([
       "account-1",
     ]);
+  });
+
+  it("revokes and removes an attachment blob only after it expires", async () => {
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    let conversationId = "";
+    act(() => {
+      conversationId = result.current.createConversation();
+      result.current.addMessage(conversationId, {
+        id: "live-message",
+        role: "user",
+        content: "live",
+        timestamp: Date.now(),
+        attachments: [
+          {
+            id: "live-attachment",
+            type: "file",
+            name: "live.pdf",
+            fileId: "live-file",
+            blobUrl: "blob:live-file",
+            expiresAt: Date.now() + 60_000,
+          },
+        ],
+      });
+    });
+
+    const liveAttachment = result.current.state.conversations.find(
+      (item) => item.id === conversationId,
+    )?.messages[0]?.attachments?.[0];
+    expect(liveAttachment?.blobUrl).toBe("blob:live-file");
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+
+    act(() => {
+      result.current.addMessage(conversationId, {
+        id: "expired-message",
+        role: "user",
+        content: "expired",
+        timestamp: Date.now(),
+        attachments: [
+          {
+            id: "expired-attachment",
+            type: "file",
+            name: "expired.pdf",
+            fileId: "expired-file",
+            blobUrl: "blob:expired-file",
+            expiresAt: Date.now() - 1,
+          },
+        ],
+      });
+    });
+
+    const attachment = result.current.state.conversations.find(
+      (item) => item.id === conversationId,
+    )?.messages[1]?.attachments?.[0];
+    expect(attachment).toMatchObject({
+      fileId: "expired-file",
+      expired: true,
+    });
+    expect(attachment?.blobUrl).toBeUndefined();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:expired-file");
+  });
+
+  it("keeps scheduling through the browser timer ceiling until the 30-day hard deadline", async () => {
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    const uploadedAt = Date.parse("2026-08-04T00:00:00.000Z");
+    const retentionMs = 30 * 24 * 60 * 60 * 1_000;
+    const browserTimerCeilingMs = 2_147_000_000;
+    vi.useFakeTimers();
+    vi.setSystemTime(uploadedAt);
+
+    let conversationId = "";
+    act(() => {
+      conversationId = result.current.createConversation();
+      result.current.addMessage(conversationId, {
+        id: "thirty-day-message",
+        role: "user",
+        content: "hard deadline",
+        timestamp: uploadedAt,
+        attachments: [
+          {
+            id: "thirty-day-attachment",
+            type: "file",
+            name: "retained.pdf",
+            fileId: "retained-file",
+            file: new File(["pdf"], "retained.pdf"),
+            blobUrl: "blob:retained-file",
+            expiresAt: uploadedAt + retentionMs,
+          },
+        ],
+      });
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(browserTimerCeilingMs);
+    });
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(
+        retentionMs - browserTimerCeilingMs - 1,
+      );
+    });
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    const attachment = result.current.state.conversations.find(
+      (item) => item.id === conversationId,
+    )?.messages[0]?.attachments?.[0];
+    expect(attachment).toMatchObject({
+      fileId: "retained-file",
+      expired: true,
+    });
+    expect(attachment?.file).toBeUndefined();
+    expect(attachment?.blobUrl).toBeUndefined();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:retained-file");
+  });
+
+  it("rechecks attachment hard deadlines when the tab regains focus", async () => {
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    const uploadedAt = Date.parse("2026-08-04T00:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(uploadedAt);
+    let conversationId = "";
+    act(() => {
+      conversationId = result.current.createConversation();
+      result.current.addMessage(conversationId, {
+        id: "focus-message",
+        role: "user",
+        content: "focus expiry",
+        timestamp: uploadedAt,
+        attachments: [
+          {
+            id: "focus-attachment",
+            type: "file",
+            name: "focus.pdf",
+            fileId: "focus-file",
+            blobUrl: "blob:focus-file",
+            expiresAt: uploadedAt + 1_000,
+          },
+        ],
+      });
+    });
+
+    vi.setSystemTime(uploadedAt + 1_001);
+    mocks.listRefetch.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const attachment = result.current.state.conversations.find(
+      (item) => item.id === conversationId,
+    )?.messages[0]?.attachments?.[0];
+    expect(attachment?.expired).toBe(true);
+    expect(attachment?.blobUrl).toBeUndefined();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:focus-file");
   });
 
   it("single-flights creation of the same blank knowledge-base conversation", async () => {
@@ -456,6 +767,8 @@ describe("prepareConversationForCloud", () => {
               base64: "secret",
               blobUrl: "blob:secret",
               file: new File(["secret"], "report.pdf"),
+              expiresAt: 2_592_000_001,
+              expired: false,
             },
           ],
           inlineImages: [
@@ -473,6 +786,8 @@ describe("prepareConversationForCloud", () => {
         type: "file",
         name: "report.pdf",
         fileId: "upstream-file",
+        expiresAt: 2_592_000_001,
+        expired: false,
       },
     ]);
     expect(clean.messages[0].inlineImages).toEqual([

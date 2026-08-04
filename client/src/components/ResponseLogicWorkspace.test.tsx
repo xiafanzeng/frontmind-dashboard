@@ -1,9 +1,17 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import ResponseLogicWorkspace, {
   ResponseLogicConfirmationBoard,
+  ResponseLogicConfirmationPanel,
   fetchResponseLogicStructuredDraft,
+  isResponseLogicAttachmentExpired,
   mergeResponseLogicAttachmentsIntoDraft,
   parseResponseLogicReply,
   useResponseLogicWorkspaceState,
@@ -70,6 +78,7 @@ function WorkspaceHarness({
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -134,6 +143,131 @@ describe("ResponseLogicWorkspace", () => {
         authorization: "待确认",
       }),
     ]);
+  });
+
+  it("keeps authoritative expiry metadata and removes expired upload images", () => {
+    const expiredAt = Date.now() - 1;
+    const result = mergeResponseLogicAttachmentsIntoDraft(
+      {
+        concern: "",
+        conclusion: "",
+        facts: "",
+        pending: "",
+        boundaries: "",
+        references: "",
+        images: [
+          {
+            id: "response-logic-upload-file-old-image",
+            name: "旧图片.png",
+            url: "/api/frontmind/v1/files/file-old-image",
+            caption: "旧图片",
+            source: "企业交流上传：旧图片.png",
+            section: "事实依据",
+            authorization: "待确认",
+          },
+        ],
+        attachments: [],
+      },
+      [
+        {
+          fileId: "file-old-image",
+          filename: "旧图片.png",
+          mimeType: "image/png",
+          kind: "image",
+          uploadedAt: "2026-07-01T00:00:00.000Z",
+          expiresAt: expiredAt,
+          expired: true,
+        },
+      ],
+    );
+
+    expect(result.images).toEqual([]);
+    expect(result.attachments[0]).toMatchObject({
+      expiresAt: expiredAt,
+      expired: true,
+    });
+    expect(isResponseLogicAttachmentExpired(result.attachments[0]!)).toBe(true);
+  });
+
+  it("uses owned-file previews and unloads an uploaded image at its hard deadline", async () => {
+    const now = Date.parse("2026-08-04T00:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Blob(["image"], { type: "image/png" }), {
+        status: 200,
+        headers: { "Content-Type": "image/png" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <ResponseLogicConfirmationPanel
+        group={intentQuestionGroups[0]}
+        question={intentQuestionGroups[0].questions[0]}
+        logic={{
+          concern: "可信度",
+          conclusion: "结论",
+          facts: "事实",
+          pending: "待补充",
+          boundaries: "边界",
+          references: "引用",
+          version: 1,
+          updatedAt: "2026-08-04T00:00:00.000Z",
+          images: [
+            {
+              id: "response-logic-upload-image/中文 #1",
+              name: "现场 图.png",
+              url: "/legacy-url-must-not-be-used",
+              caption: "现场图",
+              source: "企业交流上传",
+              section: "事实依据",
+              authorization: "待确认",
+            },
+          ],
+          attachments: [
+            {
+              fileId: "image/中文 #1",
+              filename: "现场 图.png",
+              mimeType: "image/png",
+              kind: "image",
+              uploadedAt: "2026-08-04T00:00:00.000Z",
+              expiresAt: now + 1_000,
+            },
+            {
+              fileId: "document/中文 #1",
+              filename: "企业资料.pdf",
+              mimeType: "application/pdf",
+              kind: "file",
+              uploadedAt: "2026-08-04T00:00:00.000Z",
+              expiresAt: now + 10_000,
+            },
+          ],
+        }}
+      />,
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/frontmind/v1/files/image%2F%E4%B8%AD%E6%96%87%20%231",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(
+      screen.getByText("企业资料.pdf").closest('[role="button"]'),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('a[href*="/api/frontmind/v1/files/"]'),
+    ).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(
+      screen.getByText("文件已超过 30 天，请重新上传"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "现场图" })).toBeNull();
   });
 
   it("maps the dedicated Skill output into the editable response fields", () => {

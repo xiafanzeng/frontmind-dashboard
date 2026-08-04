@@ -8,6 +8,7 @@ import {
   KNOWLEDGE_BASE_PROTOCOL_PROBE_OPERATION_ID,
   KNOWLEDGE_BASE_PROTOCOL_PROBE_TURN_ID,
   rehydratedConfirmationProgressState,
+  selectKnowledgeBasePreviewDownloadUrl,
   selectInitialKnowledgeBaseLiveTask,
 } from "./knowledge-base-live-preview-api";
 
@@ -47,6 +48,21 @@ function manifest() {
 }
 
 describe("analyzeKnowledgeBaseLiveTask", () => {
+  it("never treats upload_url as a readable preview fallback", () => {
+    expect(
+      selectKnowledgeBasePreviewDownloadUrl({
+        upload_url: "https://uploads.example.test/write-only",
+      }),
+    ).toBe("");
+    expect(
+      selectKnowledgeBasePreviewDownloadUrl({
+        upload_url: "https://uploads.example.test/write-only",
+        download_url: "https://downloads.example.test/image.webp",
+        file_url: "https://files.example.test/image.webp",
+      }),
+    ).toBe("https://downloads.example.test/image.webp");
+  });
+
   it("normalizes URL-only image descriptors to preview file IDs", () => {
     expect(
       collectKnowledgeBasePreviewFileIds([

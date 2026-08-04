@@ -23,11 +23,16 @@ export const responseLogicImageSchema = z.object({
  * values are deliberately not stored here.
  */
 export const responseLogicAttachmentSchema = z.object({
-  fileId: z.string().trim().min(1).max(255),
+  fileId: z
+    .string()
+    .max(255)
+    .refine((value) => value.trim().length > 0, "fileId不能为空"),
   filename: z.string().trim().min(1).max(512),
   mimeType: z.string().trim().min(1).max(255),
   kind: z.enum(["image", "file"]),
   uploadedAt: z.string().datetime(),
+  expiresAt: z.number().finite().optional(),
+  expired: z.boolean().optional(),
 });
 
 export const responseLogicDraftSchema = z.object({

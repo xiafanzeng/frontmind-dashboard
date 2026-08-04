@@ -31,6 +31,8 @@ import provisioningRouter, {
   assertProvisioningConfigured,
 } from "../provisioning-router";
 import { preparedFileService } from "../prepared-file-service";
+import { resolveDownloadTokenSecret } from "../signed-download-token";
+import { assertPresalesFileStorageWritable } from "../presales-file-store";
 import {
   attachOptionalActiveCredential,
   requireExpressAuth,
@@ -45,6 +47,18 @@ import { assertCredentialEncryptionConfigured } from "../auth-service";
 import { getDb } from "../db";
 import deliveryTicketAttachmentRouter from "../delivery-ticket-attachment-router";
 import { startDeliveryTicketRetentionScheduler } from "../delivery-ticket-retention";
+import { startConversationRetentionScheduler } from "../conversation-retention";
+import {
+  cleanupExpiredFileContent,
+  prepareFileContentRetentionForServing,
+  runFileContentRetentionCleanup,
+  startFileContentRetentionScheduler,
+} from "../file-content-retention";
+import {
+  assertFileRetentionPreflightReady,
+  createFileRetentionPreflightEvidenceCache,
+  inspectFileRetentionPreflight,
+} from "../file-retention-preflight";
 import { startApiUsageSnapshotScheduler } from "../api-usage-snapshot-service";
 import {
   assertDedicatedMonitorCredentialConfigured,
@@ -91,6 +105,8 @@ declare const __FRONTMIND_BUILD_SHA__: string | undefined;
 
 const paymentReceiptLedgerReadiness = createPaymentReceiptLedgerService();
 const projectOrderRegistryReadiness = createProjectOrderRegistryService();
+const fileRetentionPreflightEvidence =
+  createFileRetentionPreflightEvidenceCache();
 const compiledBuildSha =
   typeof __FRONTMIND_BUILD_SHA__ === "string"
     ? __FRONTMIND_BUILD_SHA__.trim().toLowerCase()
@@ -119,6 +135,10 @@ function assertProductionConfiguration() {
   assertUpstreamBaseUrlConfigured();
   assertDashboardAssetStorageConfigured();
   assertDashboardImportPreflightConfigured();
+  // Download URLs are stateless and may be redeemed on any replica. Refuse to
+  // bind the production listener unless every instance can share a strong
+  // signing secret.
+  resolveDownloadTokenSecret();
 }
 
 async function getRuntimeSkillReadiness() {
@@ -167,7 +187,27 @@ async function startServer() {
     await getRuntimeSkillReadiness();
   }
   if (process.env.NODE_ENV === "production") {
-    await preparedFileService.health();
+    await Promise.all([
+      preparedFileService.health(),
+      assertPresalesFileStorageWritable(),
+    ]);
+    const fileRetentionStartup = await prepareFileContentRetentionForServing();
+    console.info(
+      "[File content retention] Startup lifecycle backfill complete",
+      JSON.stringify(fileRetentionStartup),
+    );
+    // The release migrator must have applied 0054 before the candidate starts.
+    // Run the read-only inventory only after the immutable lifecycle ledger is
+    // complete, and before the listener or either cleanup scheduler exists.
+    const fileRetentionPreflight = await inspectFileRetentionPreflight();
+    const fileRetentionEvidence = fileRetentionPreflightEvidence.store(
+      fileRetentionPreflight,
+    );
+    console.info(
+      "[File content retention] Startup preflight complete",
+      JSON.stringify(fileRetentionEvidence),
+    );
+    assertFileRetentionPreflightReady(fileRetentionPreflight);
   } else {
     await preparedFileService.initialize();
   }
@@ -232,6 +272,7 @@ async function startServer() {
         db,
         migrationManifest,
       );
+      const fileRetention = fileRetentionPreflightEvidence.read();
       const [
         preparedFiles,
         skills,
@@ -253,6 +294,7 @@ async function startServer() {
         }),
       ]);
       const ready =
+        fileRetention?.ready === true &&
         knowledgeBaseReadinessHttpStatus(knowledgeBase) === 200 &&
         migrationState.journal.status === "exact" &&
         migrationState.schema.status === "exact";
@@ -287,6 +329,7 @@ async function startServer() {
           queueLength: preparedFiles.queueLength,
           activeWorkers: preparedFiles.activeWorkers,
         },
+        fileRetention,
         internalLedgers: {
           paymentReceipts,
           projectOrders,
@@ -303,6 +346,7 @@ async function startServer() {
           code: "READINESS_UNAVAILABLE",
           migrationStatus: migrationState.journal.status,
           schemaStatus: migrationState.schema.status,
+          fileRetentionReady: fileRetention?.ready ?? false,
         });
         res.status(status).json({
           ...response,
@@ -440,6 +484,28 @@ async function startServer() {
     console.log(`Server running on http://0.0.0.0:${port}/`);
     if (process.env.NODE_ENV === "production") {
       startDeliveryTicketRetentionScheduler();
+      startConversationRetentionScheduler();
+      startFileContentRetentionScheduler({
+        // Let the conversation transaction finish its initial pass before the
+        // file worker reconciles newly orphaned resources.
+        initialDelayMs: 2 * 60_000,
+        run: () =>
+          runFileContentRetentionCleanup({
+            cleanup: async () => {
+              const result = await cleanupExpiredFileContent({
+                removePreparedAssets: (resource) =>
+                  preparedFileService.deleteByOwnedFileSource({
+                    ownerUserId: resource.userId,
+                    fileId: resource.upstreamId,
+                    projectAssignmentId: resource.projectAssignmentId,
+                  }),
+                removePreparedAssetsByFileId: (fileId) =>
+                  preparedFileService.deleteByFileSource(fileId),
+              });
+              return result;
+            },
+          }),
+      });
       const recoverKnowledgeBaseState = createKnowledgeBaseRecoverySweep({
         recoverExpiredTurns: () => recoverExpiredKnowledgeBaseTurns(),
         recoverOpenBuilds: (options) => recoverOpenKnowledgeBaseTasks(options),

@@ -522,6 +522,21 @@ export function collectKnowledgeBasePreviewFileIds(output: unknown) {
   return ids;
 }
 
+export function selectKnowledgeBasePreviewDownloadUrl(metadata: unknown) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return "";
+  }
+  const value = metadata as Record<string, unknown>;
+  for (const key of ["download_url", "file_url"] as const) {
+    if (typeof value[key] === "string" && value[key].trim()) {
+      return value[key].trim();
+    }
+  }
+  // upload_url is intentionally excluded: it is a write capability and is
+  // never a valid fallback for preview reads.
+  return "";
+}
+
 export function buildKnowledgeBaseProtocolProbePrompt() {
   const sourceRows = KNOWLEDGE_BASE_PROTOCOL_PROBE_LEAVES.map(
     (leaf) => `${leaf.id}|${leaf.title}|${leaf.branchId}|${leaf.branchTitle}`,
@@ -1238,12 +1253,7 @@ router.get("/:sessionId/files/:fileId", async (req, res) => {
           validateStatus: () => true,
         },
       );
-      const downloadUrl = String(
-        metadata.data?.upload_url ||
-          metadata.data?.download_url ||
-          metadata.data?.file_url ||
-          "",
-      );
+      const downloadUrl = selectKnowledgeBasePreviewDownloadUrl(metadata.data);
       if (metadata.status < 200 || metadata.status >= 300 || !downloadUrl) {
         res.status(404).end();
         return;

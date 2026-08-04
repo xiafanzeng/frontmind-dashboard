@@ -332,6 +332,71 @@ describe("dashboard enterprise Skill archive validator", () => {
     });
   });
 
+  it("allows customer-role business terms that are not advice", async () => {
+    const files = await validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const allowedTerms = [
+      "客户可根据业务需求",
+      "客户应用",
+      "客户响应",
+      "采购方需求",
+      "客户可按需调整",
+      "支持合规审查与正式尽调材料管理",
+    ].join("。");
+    const effectiveLength = allowedTerms.replaceAll("。", "").length;
+    const narrative = `${allowedTerms}${"甲".repeat(
+      Math.max(0, 80 - effectiveLength),
+    )}`;
+    files[`${root}/branches/products/leaf-1.md`] = `# 知识叶子 1
+
+<!-- FRONTMIND_FORMAL_CONTENT_START -->
+
+## 正式正文
+
+${narrative}
+
+<!-- FRONTMIND_FORMAL_CONTENT_END -->
+
+## 证据与核验
+
+- source-official
+`;
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result).toMatchObject({
+      code: 0,
+      stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
+    });
+  });
+
+  it("does not reject explicit advice based on semantic style", async () => {
+    const files = await validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const semanticProse = "采购方应先核验供应商资质并向企业索取证明";
+    files[`${root}/branches/products/leaf-1.md`] = `# 知识叶子 1
+
+<!-- FRONTMIND_FORMAL_CONTENT_START -->
+
+## 正式正文
+
+${semanticProse}${"甲".repeat(80 - semanticProse.length)}
+
+<!-- FRONTMIND_FORMAL_CONTENT_END -->
+
+## 证据与核验
+
+- source-official
+`;
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result).toMatchObject({
+      code: 0,
+      stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
+    });
+  });
+
   it("deduplicates one rasterized customer upload across bound leaves without counting it as a Logo candidate", async () => {
     const files = await validDeepArchiveFiles();
     const { manifest } = await addCustomerUploadImage(files, [
@@ -647,16 +712,18 @@ describe("dashboard enterprise Skill archive validator", () => {
     expect(result.code).toBe(0);
   });
 
-  it("rejects customer-facing audit language while allowing it in internal gaps", async () => {
+  it("does not reject customer-facing audit language based on semantics", async () => {
     const files = await validDeepArchiveFiles();
     const root = "fixture_knowledge_base";
+    const semanticProse =
+      "第一方页面摘录显示这些内容属于企业自我定义不宜直接转换为已量化达成的影响对客户而言可将其落实为可观察行动";
     files[`${root}/branches/products/leaf-1.md`] = `# 知识叶子 1
 
 <!-- FRONTMIND_FORMAL_CONTENT_START -->
 
 ## 正式正文
 
-${"这些内容属于企业自我定义，不宜直接转换为已量化达成的影响。对客户而言，可将其落实为可观察行动。".repeat(4)}
+${semanticProse}${"甲".repeat(80 - semanticProse.length)}
 
 <!-- FRONTMIND_FORMAL_CONTENT_END -->
 
@@ -674,10 +741,10 @@ ${"这些内容属于企业自我定义，不宜直接转换为已量化达成�
 
     const result = await runValidator(await writeArchive(files));
 
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain(
-      "customer-facing audit language or internal reasoning",
-    );
+    expect(result).toMatchObject({
+      code: 0,
+      stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
+    });
   });
 
   it("rejects a rich evidence relationship reported as zero characters", async () => {

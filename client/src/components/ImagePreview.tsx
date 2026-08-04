@@ -13,10 +13,73 @@ import { cn } from "@/lib/utils";
 import { deliveryProjectHeaders } from "@/lib/frontmind-api";
 
 interface ImagePreviewProps {
-  src: string;
+  src?: string;
+  /** Opaque ID for an authenticated Dashboard-owned upload. */
+  fileId?: string;
   alt?: string;
   className?: string;
   showDownload?: boolean;
+  /** Server-authoritative hard content deadline for uploaded files. */
+  expiresAt?: number;
+  /** Server-authoritative deletion/expiry state. */
+  expired?: boolean;
+}
+
+export const IMAGE_OWNED_FILE_RETRY_DELAYS_MS = [
+  2_000, 10_000, 60_000,
+] as const;
+
+type ImageLoadFailure = {
+  message: string;
+  code?: string;
+  retryable: boolean;
+  recoveryAction?: "retry" | "reupload" | "contact_admin";
+  expiresAt?: number;
+};
+
+export class ImageContentRequestError
+  extends Error
+  implements ImageLoadFailure
+{
+  code?: string;
+  retryable: boolean;
+  recoveryAction?: "retry" | "reupload" | "contact_admin";
+  expiresAt?: number;
+
+  constructor(message: string, failure: Omit<ImageLoadFailure, "message">) {
+    super(message);
+    this.name = "ImageContentRequestError";
+    this.code = failure.code;
+    const terminal = terminalImageFailure(failure.code);
+    this.retryable = terminal ? false : failure.retryable;
+    this.recoveryAction = terminal?.recoveryAction ?? failure.recoveryAction;
+    this.expiresAt = failure.expiresAt;
+  }
+}
+
+function terminalImageFailure(
+  code: string | undefined,
+): { recoveryAction: "reupload" | "contact_admin" } | undefined {
+  if (
+    code === "SOURCE_EXPIRED" ||
+    code === "SOURCE_UNAVAILABLE" ||
+    code === "INVALID_PDF"
+  ) {
+    return { recoveryAction: "reupload" };
+  }
+  if (code === "SOURCE_FORBIDDEN") {
+    return { recoveryAction: "contact_admin" };
+  }
+  return undefined;
+}
+
+function isAbortRequestError(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    error.name === "AbortError"
+  );
 }
 
 /**
@@ -26,100 +89,249 @@ function needsAuthHeaders(url: string): boolean {
   return url.startsWith("/api/frontmind/");
 }
 
+async function readImageContentError(response: Response) {
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    // Fall through to status-derived behavior.
+  }
+  const code =
+    typeof payload?.error?.code === "string"
+      ? payload.error.code
+      : response.status === 410
+        ? "SOURCE_EXPIRED"
+        : response.status === 404
+          ? "SOURCE_UNAVAILABLE"
+          : response.status === 401 || response.status === 403
+            ? "SOURCE_FORBIDDEN"
+            : undefined;
+  const transient =
+    response.status === 408 ||
+    response.status === 429 ||
+    response.status >= 500;
+  const message =
+    code === "SOURCE_EXPIRED"
+      ? "文件已超过 30 天，请重新上传"
+      : code === "SOURCE_UNAVAILABLE"
+        ? "图片内容已不可用，请重新上传"
+        : typeof payload?.error?.message === "string"
+          ? payload.error.message
+          : `图片读取失败（HTTP ${response.status}）`;
+  return new ImageContentRequestError(message, {
+    code,
+    retryable:
+      typeof payload?.error?.retryable === "boolean"
+        ? payload.error.retryable
+        : transient,
+    recoveryAction:
+      payload?.error?.recoveryAction === "retry" ||
+      payload?.error?.recoveryAction === "reupload" ||
+      payload?.error?.recoveryAction === "contact_admin"
+        ? payload.error.recoveryAction
+        : code === "SOURCE_EXPIRED" || code === "SOURCE_UNAVAILABLE"
+          ? "reupload"
+          : transient
+            ? "retry"
+            : undefined,
+    expiresAt:
+      typeof payload?.error?.expiresAt === "number"
+        ? payload.error.expiresAt
+        : undefined,
+  });
+}
+
+function normalizeImageContentError(
+  error: unknown,
+): ImageContentRequestError | null {
+  if (isAbortRequestError(error)) return null;
+  if (error instanceof ImageContentRequestError) return error;
+  return new ImageContentRequestError(
+    error instanceof Error && error.message
+      ? `图片读取网络异常（${error.message}）`
+      : "图片读取网络异常",
+    { retryable: true, recoveryAction: "retry" },
+  );
+}
+
 /**
  * Fetch image with auth headers and return blob URL
  */
-async function fetchImageWithAuth(url: string): Promise<string> {
+export async function fetchImageWithAuth(
+  url: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const response = await fetch(url, {
     credentials: "include",
     headers: deliveryProjectHeaders(),
+    signal,
   });
 
   if (!response.ok) {
-    throw new Error(`图片读取失败（HTTP ${response.status}）`);
+    throw await readImageContentError(response);
   }
 
   const contentType = response.headers.get("content-type") || "";
 
-  // Check if we accidentally got JSON instead of binary (metadata fallback)
+  // upload_url is a PUT-only capability. Metadata is never a valid image
+  // download fallback; the authenticated content route must return bytes.
   if (contentType.includes("application/json")) {
-    const text = await response.text();
-    try {
-      const data = JSON.parse(text);
-      // If the response is file metadata with upload_url, fetch via proxy to avoid CORS
-      if (data.upload_url) {
-        const proxyUrl = `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
-        const proxyResponse = await fetch(proxyUrl, {
-          credentials: "include",
-          headers: deliveryProjectHeaders(),
-        });
-        if (!proxyResponse.ok) {
-          throw new Error(`图片代理读取失败（HTTP ${proxyResponse.status}）`);
-        }
-        const blob = await proxyResponse.blob();
-        return URL.createObjectURL(blob);
-      }
-    } catch (e) {
-      // Not JSON or no upload_url - rethrow if it was a fetch error
-      if (e instanceof Error && e.message.includes("读取失败")) throw e;
-    }
-    throw new Error("服务返回的不是有效图片");
+    await response.body?.cancel().catch(() => undefined);
+    throw new ImageContentRequestError("服务返回的不是有效图片", {
+      retryable: false,
+      recoveryAction: "contact_admin",
+    });
   }
 
   const blob = await response.blob();
   return URL.createObjectURL(blob);
 }
 
+function waitForImageRetry(delayMs: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(resolve, delayMs);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timer);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
+}
+
+/** Initial request plus three bounded retries for authenticated file bytes. */
+export async function fetchImageWithRetry(
+  url: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  let retryIndex = 0;
+  while (true) {
+    try {
+      return await fetchImageWithAuth(url, signal);
+    } catch (error) {
+      const failure = normalizeImageContentError(error);
+      if (!failure) throw error;
+      const retryDelay = IMAGE_OWNED_FILE_RETRY_DELAYS_MS[retryIndex];
+      if (!failure.retryable || retryDelay === undefined) throw failure;
+      retryIndex += 1;
+      await waitForImageRetry(retryDelay, signal);
+    }
+  }
+}
+
 export default function ImagePreview({
   src,
+  fileId,
   alt = "预览图片",
   className,
   showDownload = true,
+  expiresAt,
+  expired = false,
 }: ImagePreviewProps) {
+  const sourceUrl = fileId
+    ? `/api/frontmind/v1/files/${encodeURIComponent(fileId)}`
+    : src || "";
   const [isOpen, setIsOpen] = useState(false);
   const [scale, setScale] = useState(1);
   const [rotation, setRotation] = useState(0);
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState(false);
+  const [loadError, setLoadError] = useState<ImageLoadFailure | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [expiryNow, setExpiryNow] = useState(() => Date.now());
+  const declaredExpired =
+    expired ||
+    (typeof expiresAt === "number" &&
+      Number.isFinite(expiresAt) &&
+      expiresAt <= expiryNow);
+  const contentExpired =
+    declaredExpired || loadError?.code === "SOURCE_EXPIRED";
+
+  useEffect(() => {
+    if (expired || expiresAt === undefined) return;
+    const remaining = expiresAt - Date.now();
+    if (remaining <= 0) {
+      setExpiryNow(Date.now());
+      return;
+    }
+    const timer = window.setTimeout(
+      () => setExpiryNow(Date.now()),
+      Math.min(remaining, 2_147_000_000),
+    );
+    return () => window.clearTimeout(timer);
+  }, [expired, expiresAt, expiryNow]);
+
+  useEffect(() => {
+    if (contentExpired) setIsOpen(false);
+  }, [contentExpired]);
 
   // Fetch blob URL when component mounts or src changes (for API/proxy URLs)
   // Data URLs and blob URLs are used directly without fetching
   useEffect(() => {
     let cancelled = false;
+    let ownedBlobUrl: string | null = null;
+    const controller = new AbortController();
 
-    if (src && needsAuthHeaders(src)) {
+    if (declaredExpired) {
+      setBlobUrl(null);
+      setLoading(false);
+      setLoadError({
+        message: "文件已超过 30 天，请重新上传",
+        code: "SOURCE_EXPIRED",
+        retryable: false,
+        recoveryAction: "reupload",
+        expiresAt,
+      });
+      return () => controller.abort();
+    }
+
+    if (sourceUrl && needsAuthHeaders(sourceUrl)) {
+      setBlobUrl(null);
       setLoading(true);
-      setLoadError(false);
-      fetchImageWithAuth(src)
-        .then((url) => {
+      setLoadError(null);
+      const load = async () => {
+        try {
+          const url = await fetchImageWithRetry(sourceUrl, controller.signal);
+          if (cancelled) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          ownedBlobUrl = url;
+          setBlobUrl(url);
+          setLoading(false);
+        } catch (error) {
+          const failure = normalizeImageContentError(error);
+          if (!failure) return;
+          console.error("Failed to load image:", error);
           if (!cancelled) {
-            setBlobUrl(url);
+            setLoadError(failure);
             setLoading(false);
           }
-        })
-        .catch((err) => {
-          console.error("Failed to load image:", err);
-          if (!cancelled) {
-            setLoadError(true);
-            setLoading(false);
-          }
-        });
+        }
+      };
+      void load();
     } else {
       // For data: URLs, blob: URLs, and regular URLs - use directly
       setBlobUrl(null);
-      setLoadError(false);
+      setLoadError(null);
       setLoading(false);
     }
 
     // Cleanup blob URL on unmount
     return () => {
       cancelled = true;
-      if (blobUrl && blobUrl.startsWith("blob:")) {
-        URL.revokeObjectURL(blobUrl);
+      controller.abort();
+      if (ownedBlobUrl?.startsWith("blob:")) {
+        URL.revokeObjectURL(ownedBlobUrl);
       }
     };
-  }, [src]);
+  }, [declaredExpired, expiresAt, loadAttempt, sourceUrl]);
 
   const handleZoomIn = useCallback(() => {
     setScale((s) => Math.min(s + 0.25, 4));
@@ -139,6 +351,16 @@ export default function ImagePreview({
   }, []);
 
   const handleDownload = useCallback(async () => {
+    if (contentExpired) {
+      setLoadError({
+        message: "文件已超过 30 天，请重新上传",
+        code: "SOURCE_EXPIRED",
+        retryable: false,
+        recoveryAction: "reupload",
+        expiresAt,
+      });
+      return;
+    }
     try {
       let downloadUrl: string;
 
@@ -154,9 +376,9 @@ export default function ImagePreview({
         return;
       }
 
-      if (needsAuthHeaders(src)) {
+      if (needsAuthHeaders(sourceUrl)) {
         // Fetch with auth for download
-        const fetchedUrl = await fetchImageWithAuth(src);
+        const fetchedUrl = await fetchImageWithRetry(sourceUrl);
         const a = document.createElement("a");
         a.href = fetchedUrl;
         a.download = alt || "image";
@@ -168,7 +390,7 @@ export default function ImagePreview({
       }
 
       // Direct download for data URLs or regular URLs
-      const response = await fetch(src);
+      const response = await fetch(sourceUrl);
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -180,11 +402,21 @@ export default function ImagePreview({
       URL.revokeObjectURL(url);
     } catch (err) {
       console.error("Download failed:", err);
+      const failure = normalizeImageContentError(err);
+      if (failure) setLoadError(failure);
     }
-  }, [src, blobUrl, alt]);
+  }, [alt, blobUrl, contentExpired, expiresAt, sourceUrl]);
+
+  const handleNativeImageError = useCallback(() => {
+    setLoadError({
+      message: "图片加载失败，请检查网络后重试",
+      retryable: false,
+      recoveryAction: "retry",
+    });
+  }, []);
 
   // Image source for the img tag: blob URL if available, otherwise original src
-  const imgSrc = blobUrl || src;
+  const imgSrc = blobUrl || sourceUrl;
 
   return (
     <>
@@ -194,10 +426,15 @@ export default function ImagePreview({
           "hover:border-primary/30 transition-all duration-200 hover:shadow-md",
           className,
         )}
-        onClick={() => setIsOpen(true)}
+        onClick={() => {
+          if (!contentExpired) setIsOpen(true);
+        }}
         role="button"
-        tabIndex={0}
-        onKeyDown={(e) => e.key === "Enter" && setIsOpen(true)}
+        aria-disabled={contentExpired}
+        tabIndex={contentExpired ? -1 : 0}
+        onKeyDown={(e) =>
+          e.key === "Enter" && !contentExpired && setIsOpen(true)
+        }
       >
         {loading ? (
           <div className="w-full h-full flex items-center justify-center bg-muted/30 min-h-[100px]">
@@ -205,8 +442,20 @@ export default function ImagePreview({
           </div>
         ) : loadError ? (
           <div className="w-full h-full flex flex-col items-center justify-center bg-muted/30 min-h-[100px] p-4">
-            <p className="text-xs text-muted-foreground/60">图片加载失败</p>
-            {showDownload && (
+            <p className="text-xs text-muted-foreground/70 text-center">
+              {loadError.message}
+            </p>
+            {loadError.retryable ? (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setLoadAttempt((value) => value + 1);
+                }}
+                className="mt-2 text-xs text-primary hover:underline"
+              >
+                重试
+              </button>
+            ) : showDownload && loadError.recoveryAction !== "reupload" ? (
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -216,7 +465,7 @@ export default function ImagePreview({
               >
                 点击下载
               </button>
-            )}
+            ) : null}
           </div>
         ) : (
           <img
@@ -224,12 +473,15 @@ export default function ImagePreview({
             alt={alt}
             className="w-full h-auto object-cover transition-transform duration-200 hover:scale-[1.02]"
             loading="lazy"
-            onError={() => setLoadError(true)}
+            onError={handleNativeImageError}
           />
         )}
       </div>
 
-      <Dialog open={isOpen} onOpenChange={setIsOpen}>
+      <Dialog
+        open={isOpen && !contentExpired}
+        onOpenChange={(open) => setIsOpen(contentExpired ? false : open)}
+      >
         <DialogContent
           showCloseButton={false}
           className="max-w-[90vw] max-h-[90vh] p-0 bg-black/95 border-none"
@@ -325,7 +577,7 @@ export default function ImagePreview({
                   transform: `scale(${scale}) rotate(${rotation}deg)`,
                 }}
                 draggable={false}
-                onError={() => setLoadError(true)}
+                onError={handleNativeImageError}
               />
             )}
           </div>

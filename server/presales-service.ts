@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { and, desc, eq, gte, inArray, ne } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, ne, sql } from "drizzle-orm";
 
 import {
   presalesApiCredentials,
@@ -39,6 +39,7 @@ import {
   usagePageReachedCutoff,
 } from "./upstream-task-usage";
 import { getManusRollingCreditUsage } from "./manus-usage-service";
+import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
 
 const PRESALES_CREDENTIAL_SLOT = "website";
 export const PRESALES_REVOKABLE_STATUSES = ["active"] as const;
@@ -46,6 +47,43 @@ const CREDIT_USAGE_LOOKBACK_DAYS = 30;
 const CREDIT_USAGE_PAGE_LIMIT = 100;
 const CREDIT_USAGE_MAX_PAGES = 100;
 const PRESALES_TASK_LEASE_MS = 3 * 60 * 1000;
+
+export type PresalesFileContentSource = "user_upload" | "assistant_output";
+
+export type ReservedPresalesFileUpload = PresalesUpstreamResource & {
+  kind: "file";
+  contentSource: "user_upload";
+  uploadReservedAt: Date;
+  contentDeletedAt: null;
+};
+
+export type CompletedPresalesFileUpload = ReservedPresalesFileUpload & {
+  uploadedAt: Date;
+  contentExpiresAt: Date;
+};
+
+export type DeletedPresalesFileContent = PresalesUpstreamResource & {
+  kind: "file";
+  contentSource: "user_upload";
+  contentDeletedAt: Date;
+};
+
+function validatePresalesResourceContentSource(
+  kind: "task" | "file",
+  value: unknown,
+): PresalesFileContentSource | null {
+  if (value === undefined || value === null) return null;
+  if (
+    kind !== "file" ||
+    (value !== "user_upload" && value !== "assistant_output")
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Presales resource content source is invalid",
+    );
+  }
+  return value;
+}
 
 export type PresalesCredentialStatus = {
   configured: boolean;
@@ -439,6 +477,264 @@ export async function getPresalesCredentialForResource(
   };
 }
 
+function validPresalesRetentionNow(value: Date | undefined) {
+  const now = value ?? new Date();
+  if (!Number.isFinite(now.getTime())) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Presales file retention timestamp is invalid",
+    );
+  }
+  return now;
+}
+
+function assertReservedPresalesFileUpload(
+  resource: PresalesUpstreamResource | undefined,
+  now: Date,
+): ReservedPresalesFileUpload {
+  if (!resource) {
+    throw new AuthServiceError("NOT_FOUND", "Presales file resource not found");
+  }
+  if (resource.contentSource === "assistant_output") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Assistant output cannot be used as a user-upload destination",
+    );
+  }
+  if (resource.contentDeletedAt) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Presales file content has already been deleted",
+    );
+  }
+  if (resource.contentSource !== "user_upload") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Presales file upload retention could not be reserved",
+    );
+  }
+  if (!resource.uploadReservedAt) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Presales file upload reservation is incomplete",
+    );
+  }
+  const reservationAtMs = resource.uploadReservedAt.getTime();
+  const reservationDeadlineMs = reservationAtMs + FILE_CONTENT_RETENTION_MS;
+  if (
+    !Number.isFinite(reservationAtMs) ||
+    !Number.isFinite(reservationDeadlineMs)
+  ) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Presales file upload reservation is invalid",
+    );
+  }
+  if (reservationDeadlineMs <= now.getTime()) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Presales file upload retention has expired",
+    );
+  }
+  const hasUploadedAt = resource.uploadedAt !== null;
+  const hasContentExpiresAt = resource.contentExpiresAt !== null;
+  if (hasUploadedAt !== hasContentExpiresAt) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Presales file upload state is invalid",
+    );
+  }
+  if (resource.uploadedAt && resource.contentExpiresAt) {
+    const uploadedAtMs = resource.uploadedAt.getTime();
+    const contentExpiresAtMs = resource.contentExpiresAt.getTime();
+    if (
+      !Number.isFinite(uploadedAtMs) ||
+      !Number.isFinite(contentExpiresAtMs) ||
+      uploadedAtMs !== reservationAtMs ||
+      contentExpiresAtMs !== reservationDeadlineMs
+    ) {
+      throw new AuthServiceError(
+        "DATABASE_UNAVAILABLE",
+        "Presales file upload retention is invalid",
+      );
+    }
+  }
+  return resource as ReservedPresalesFileUpload;
+}
+
+/**
+ * Reserves the immutable upload origin before the upstream PUT. A reservation
+ * alone is deliberately unreadable: uploadedAt/contentExpiresAt remain null
+ * until finalizePresalesFileUploadRetention observes a successful 2xx PUT.
+ */
+export async function reservePresalesFileUploadRetention(
+  input: {
+    fileId: string;
+    apiCredentialId: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const now = validPresalesRetentionNow(input.now);
+  const locator = and(
+    eq(presalesUpstreamResources.kind, "file"),
+    eq(presalesUpstreamResources.upstreamId, input.fileId),
+    eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+  );
+  await db
+    .update(presalesUpstreamResources)
+    .set({
+      uploadReservedAt: sql`COALESCE(${presalesUpstreamResources.uploadReservedAt}, ${now})`,
+    })
+    .where(
+      and(
+        locator,
+        eq(presalesUpstreamResources.contentSource, "user_upload"),
+        sql`${presalesUpstreamResources.contentDeletedAt} IS NULL`,
+        sql`(
+          (
+            ${presalesUpstreamResources.uploadReservedAt} IS NULL
+            AND ${presalesUpstreamResources.uploadedAt} IS NULL
+            AND ${presalesUpstreamResources.contentExpiresAt} IS NULL
+          )
+          OR
+          (
+            ${presalesUpstreamResources.uploadReservedAt} IS NOT NULL
+            AND ${presalesUpstreamResources.uploadedAt} IS NULL
+            AND ${presalesUpstreamResources.contentExpiresAt} IS NULL
+            AND DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY) > ${now}
+          )
+          OR
+          (
+            ${presalesUpstreamResources.uploadedAt} = ${presalesUpstreamResources.uploadReservedAt}
+            AND ${presalesUpstreamResources.contentExpiresAt} = DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY)
+            AND ${presalesUpstreamResources.contentExpiresAt} > ${now}
+          )
+        )`,
+      ),
+    );
+  const rows = await db
+    .select()
+    .from(presalesUpstreamResources)
+    .where(locator)
+    .limit(1);
+  return assertReservedPresalesFileUpload(
+    rows[0] as PresalesUpstreamResource | undefined,
+    now,
+  );
+}
+
+/**
+ * Completes the immutable lifecycle only after the external PUT returned 2xx.
+ * Retries reuse the reservation; neither timestamp can move.
+ */
+export async function finalizePresalesFileUploadRetention(
+  input: {
+    fileId: string;
+    apiCredentialId: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const now = validPresalesRetentionNow(input.now);
+  const locator = and(
+    eq(presalesUpstreamResources.kind, "file"),
+    eq(presalesUpstreamResources.upstreamId, input.fileId),
+    eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+  );
+  await db
+    .update(presalesUpstreamResources)
+    .set({
+      uploadedAt: sql`COALESCE(${presalesUpstreamResources.uploadedAt}, ${presalesUpstreamResources.uploadReservedAt})`,
+      contentExpiresAt: sql`COALESCE(${presalesUpstreamResources.contentExpiresAt}, DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY))`,
+    })
+    .where(
+      and(
+        locator,
+        eq(presalesUpstreamResources.contentSource, "user_upload"),
+        sql`${presalesUpstreamResources.contentDeletedAt} IS NULL`,
+        sql`${presalesUpstreamResources.uploadReservedAt} IS NOT NULL`,
+        sql`DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY) > ${now}`,
+        sql`(
+          (${presalesUpstreamResources.uploadedAt} IS NULL AND ${presalesUpstreamResources.contentExpiresAt} IS NULL)
+          OR
+          (
+            ${presalesUpstreamResources.uploadedAt} = ${presalesUpstreamResources.uploadReservedAt}
+            AND ${presalesUpstreamResources.contentExpiresAt} = DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY)
+          )
+        )`,
+      ),
+    );
+  const rows = await db
+    .select()
+    .from(presalesUpstreamResources)
+    .where(locator)
+    .limit(1);
+  const resource = assertReservedPresalesFileUpload(
+    rows[0] as PresalesUpstreamResource | undefined,
+    now,
+  );
+  if (!resource.uploadedAt || !resource.contentExpiresAt) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Presales file upload was not finalized",
+    );
+  }
+  return resource as CompletedPresalesFileUpload;
+}
+
+/** Records physical removal without ever moving the first deletion time. */
+export async function markPresalesFileContentDeleted(
+  input: {
+    fileId: string;
+    apiCredentialId?: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const now = validPresalesRetentionNow(input.now);
+  const locator = and(
+    eq(presalesUpstreamResources.kind, "file"),
+    eq(presalesUpstreamResources.upstreamId, input.fileId),
+    input.apiCredentialId
+      ? eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId)
+      : undefined,
+  );
+  await db
+    .update(presalesUpstreamResources)
+    .set({
+      contentDeletedAt: sql`COALESCE(${presalesUpstreamResources.contentDeletedAt}, ${now})`,
+    })
+    .where(
+      and(locator, eq(presalesUpstreamResources.contentSource, "user_upload")),
+    );
+  const rows = await db
+    .select()
+    .from(presalesUpstreamResources)
+    .where(locator)
+    .limit(1);
+  const resource = rows[0] as PresalesUpstreamResource | undefined;
+  if (!resource) {
+    throw new AuthServiceError("NOT_FOUND", "Presales file resource not found");
+  }
+  if (resource.contentSource !== "user_upload") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Only user-upload content can be marked deleted",
+    );
+  }
+  if (!resource.contentDeletedAt) {
+    throw new AuthServiceError(
+      "DATABASE_UNAVAILABLE",
+      "Presales file deletion was not recorded",
+    );
+  }
+  return resource as DeletedPresalesFileContent;
+}
+
 type PresalesResourceCredential = DecryptedPresalesCredential & {
   resource: PresalesUpstreamResource;
 };
@@ -809,13 +1105,21 @@ export async function completePresalesTaskReservation(
   });
 }
 
-export async function recordPresalesUpstreamResource(input: {
-  apiCredentialId: string;
-  kind: "task" | "file";
-  upstreamId: string;
-  parentTaskId?: string | null;
-}) {
-  const db = await requireDb();
+export async function recordPresalesUpstreamResource(
+  input: {
+    apiCredentialId: string;
+    kind: "task" | "file";
+    upstreamId: string;
+    parentTaskId?: string | null;
+    contentSource?: PresalesFileContentSource | null;
+  },
+  executor?: any,
+) {
+  const contentSource = validatePresalesResourceContentSource(
+    input.kind,
+    input.contentSource,
+  );
+  const db = executor ?? (await requireDb());
   const existing = await db
     .select()
     .from(presalesUpstreamResources)
@@ -843,12 +1147,33 @@ export async function recordPresalesUpstreamResource(input: {
         "Upstream file is already bound to a different presales task",
       );
     }
+    if (
+      contentSource &&
+      existing[0].contentSource &&
+      existing[0].contentSource !== contentSource &&
+      !(
+        existing[0].contentSource === "user_upload" &&
+        contentSource === "assistant_output"
+      )
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Upstream file already has a different content source",
+      );
+    }
+    const updates: Partial<PresalesUpstreamResource> = {};
     if (!existing[0].parentTaskId && input.parentTaskId) {
+      updates.parentTaskId = input.parentTaskId;
+    }
+    // A historical null source is deliberately unknown. A later task output
+    // can echo a user attachment, so neither artifact discovery nor another
+    // create response is sufficient evidence to classify an existing row.
+    if (Object.keys(updates).length > 0) {
       await db
         .update(presalesUpstreamResources)
-        .set({ parentTaskId: input.parentTaskId })
+        .set(updates)
         .where(eq(presalesUpstreamResources.id, existing[0].id));
-      return { ...existing[0], parentTaskId: input.parentTaskId };
+      return { ...existing[0], ...updates };
     }
     return existing[0];
   }
@@ -876,6 +1201,11 @@ export async function recordPresalesUpstreamResource(input: {
     kind: input.kind,
     upstreamId: input.upstreamId,
     parentTaskId: input.parentTaskId ?? null,
+    contentSource,
+    uploadReservedAt: null,
+    uploadedAt: null,
+    contentExpiresAt: null,
+    contentDeletedAt: null,
     createdAt: new Date(),
   };
   try {
@@ -895,7 +1225,33 @@ export async function recordPresalesUpstreamResource(input: {
         ),
       )
       .limit(1);
-    if (raced[0]) return raced[0];
+    if (raced[0]) {
+      if (
+        input.parentTaskId &&
+        raced[0].parentTaskId &&
+        raced[0].parentTaskId !== input.parentTaskId
+      ) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "Upstream file is already bound to a different presales task",
+        );
+      }
+      if (
+        contentSource &&
+        raced[0].contentSource &&
+        raced[0].contentSource !== contentSource &&
+        !(
+          raced[0].contentSource === "user_upload" &&
+          contentSource === "assistant_output"
+        )
+      ) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "Upstream file already has a different content source",
+        );
+      }
+      return raced[0];
+    }
     throw new AuthServiceError("CONFLICT", "Upstream resource already exists");
   }
 }

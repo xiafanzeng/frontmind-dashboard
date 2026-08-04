@@ -52,6 +52,7 @@ import {
   type User,
 } from "../drizzle/schema";
 import { getDb } from "./db";
+import { isFileResourceContentExpired } from "./file-content-retention";
 import { getUpstreamBaseUrl } from "./upstream-config";
 
 export const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -2217,6 +2218,7 @@ export async function getCredentialForUpstreamResource(
   kind: "task" | "file",
   upstreamId: string,
   projectAssignmentId?: string,
+  options?: { allowExpiredFileContent?: boolean },
 ): Promise<(DecryptedCredential & { resource: UpstreamResource }) | null> {
   const db = await requireDb();
   const rows = await db
@@ -2242,6 +2244,13 @@ export async function getCredentialForUpstreamResource(
     .limit(1);
   const row = rows[0];
   if (!row || row.credential.status === "deleted") return null;
+  if (
+    kind === "file" &&
+    !options?.allowExpiredFileContent &&
+    isFileResourceContentExpired(row.resource)
+  ) {
+    return null;
+  }
 
   return {
     id: row.credential.id,
@@ -2265,7 +2274,13 @@ export async function getOwnedUpstreamResourceIds(
   if (uniqueIds.length === 0) return new Set<string>();
   const db = await requireDb();
   const rows = await db
-    .select({ upstreamId: upstreamResources.upstreamId })
+    .select({
+      upstreamId: upstreamResources.upstreamId,
+      createdAt: upstreamResources.createdAt,
+      uploadedAt: upstreamResources.uploadedAt,
+      contentExpiresAt: upstreamResources.contentExpiresAt,
+      contentDeletedAt: upstreamResources.contentDeletedAt,
+    })
     .from(upstreamResources)
     .where(
       and(
@@ -2279,7 +2294,11 @@ export async function getOwnedUpstreamResourceIds(
         inArray(upstreamResources.upstreamId, uniqueIds),
       ),
     );
-  return new Set(rows.map((row) => row.upstreamId));
+  return new Set(
+    rows
+      .filter((row) => kind !== "file" || !isFileResourceContentExpired(row))
+      .map((row) => row.upstreamId),
+  );
 }
 
 export async function isUpstreamApiKeyShared(
@@ -2426,6 +2445,9 @@ export async function recordUpstreamResource(input: {
     upstreamId: input.upstreamId,
     conversationId: input.conversationId ?? null,
     createdAt: new Date(),
+    uploadedAt: null,
+    contentExpiresAt: null,
+    contentDeletedAt: null,
   };
   try {
     await db.insert(upstreamResources).values(resource);

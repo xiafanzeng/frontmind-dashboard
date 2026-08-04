@@ -623,7 +623,7 @@ describe("authoritative KB observation reducer", () => {
     expect(merged[0]?.content).toContain("服务器正文");
   });
 
-  it("keeps uploaded file chips when the authoritative turn replaces the optimistic request", () => {
+  it("keeps uploaded file chips by exact fileId when the authoritative turn replaces the optimistic request", () => {
     const uploadedAttachment = {
       id: "optimistic-attachment",
       type: "file" as const,
@@ -646,6 +646,14 @@ describe("authoritative KB observation reducer", () => {
       serverSequence: 4,
       role: "user",
       content: "请参考这份资料",
+      attachments: [
+        {
+          id: "canonical-attachment",
+          type: "file",
+          name: "企业事实确认表.pdf",
+          fileId: "customer-file-1",
+        },
+      ],
       timestamp: 20,
       knowledgeBase: {
         schemaVersion: 1,
@@ -668,8 +676,138 @@ describe("authoritative KB observation reducer", () => {
     expect(merged[0]).toMatchObject({
       id: knowledgeBaseUserMessagePublicId("turn-upload"),
       serverSequence: 4,
-      attachments: [uploadedAttachment],
+      attachments: [
+        {
+          id: "canonical-attachment",
+          type: "file",
+          name: "企业事实确认表.pdf",
+          fileId: "customer-file-1",
+        },
+      ],
       knowledgeBase: { serverOwned: true, turnId: "turn-upload" },
+    });
+  });
+
+  it("keeps browser payloads only on the matching authoritative file ID", () => {
+    const localFile = new File(["local-pdf"], "企业事实确认表.pdf", {
+      type: "application/pdf",
+    });
+    const optimistic: Conversation["messages"][number] = {
+      id: "optimistic-user-message",
+      role: "user",
+      content: "请参考这份资料",
+      attachments: [
+        {
+          id: "optimistic-attachment",
+          type: "file",
+          name: "企业事实确认表.pdf",
+          fileId: "customer-file-1",
+          file: localFile,
+          blobUrl: "blob:customer-file-1",
+          base64: "data:application/pdf;base64,bG9jYWwtcGRm",
+        },
+      ],
+      timestamp: 10,
+      knowledgeBase: {
+        kind: "pending_user",
+        clientRequestId: "request-turn-upload",
+      },
+    };
+    const authoritative: Conversation["messages"][number] = {
+      id: knowledgeBaseUserMessagePublicId("turn-upload"),
+      serverSequence: 4,
+      role: "user",
+      content: "请参考这份资料",
+      attachments: [
+        {
+          id: "canonical-attachment",
+          type: "file",
+          name: "企业事实确认表（规范名）.pdf",
+          fileId: "customer-file-1",
+        },
+      ],
+      timestamp: 20,
+      knowledgeBase: {
+        schemaVersion: 1,
+        kind: "pending_user",
+        clientRequestId: "request-turn-upload",
+        turnId: "turn-upload",
+        generation: 1,
+        revision: 1,
+        leafId: "1.2",
+        serverOwned: true,
+      },
+    };
+
+    const [merged] = mergeServerOwnedKnowledgeBaseMessages(
+      [optimistic],
+      [authoritative],
+    );
+
+    expect(merged?.attachments?.[0]).toMatchObject({
+      id: "canonical-attachment",
+      name: "企业事实确认表（规范名）.pdf",
+      fileId: "customer-file-1",
+      file: localFile,
+      blobUrl: "blob:customer-file-1",
+      base64: "data:application/pdf;base64,bG9jYWwtcGRm",
+    });
+  });
+
+  it("does not copy browser payloads across mismatched authoritative file IDs", () => {
+    const optimistic: Conversation["messages"][number] = {
+      id: "optimistic-user-message",
+      role: "user",
+      content: "请参考这份资料",
+      attachments: [
+        {
+          id: "same-chip-id",
+          type: "file",
+          name: "同名.pdf",
+          fileId: "customer-file-a",
+          file: new File(["a"], "同名.pdf"),
+          blobUrl: "blob:customer-file-a",
+          base64: "data:application/pdf;base64,YQ==",
+        },
+      ],
+      timestamp: 10,
+      knowledgeBase: {
+        kind: "pending_user",
+        clientRequestId: "request-turn-upload",
+      },
+    };
+    const authoritative: Conversation["messages"][number] = {
+      id: knowledgeBaseUserMessagePublicId("turn-upload"),
+      serverSequence: 4,
+      role: "user",
+      content: "请参考这份资料",
+      attachments: [
+        {
+          id: "same-chip-id",
+          type: "file",
+          name: "同名.pdf",
+          fileId: "customer-file-b",
+        },
+      ],
+      timestamp: 20,
+      knowledgeBase: {
+        kind: "pending_user",
+        clientRequestId: "request-turn-upload",
+        turnId: "turn-upload",
+        serverOwned: true,
+      },
+    };
+
+    const [merged] = mergeServerOwnedKnowledgeBaseMessages(
+      [optimistic],
+      [authoritative],
+    );
+
+    expect(merged?.attachments?.[0]).toEqual({
+      id: "same-chip-id",
+      type: "file",
+      name: "同名.pdf",
+      fileId: "customer-file-b",
     });
   });
 

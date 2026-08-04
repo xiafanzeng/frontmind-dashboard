@@ -34,6 +34,7 @@ import {
   normalizedKnowledgeBaseUploadFilename,
   normalizedKnowledgeBaseUploadMimeType,
   sha256UploadFile,
+  assertChatAttachmentSizes,
   type PreparedUploadFiles,
 } from "@/lib/attachment-files";
 import { requireCurrentFrontMindBuild } from "@/lib/build-version";
@@ -535,6 +536,21 @@ export function useSendMessage() {
         const contentItems: ContentItem[] = [];
         const attachments: Attachment[] = [];
 
+        try {
+          // This guard is intentionally repeated after preparation below. The
+          // composer provides early feedback, while this hook is the shared
+          // enforcement point for every chat entry and programmatic caller.
+          assertChatAttachmentSizes(files);
+        } catch (error) {
+          toast.error("文件过大", {
+            description:
+              error instanceof Error
+                ? error.message
+                : "单个文件不能超过 100 MB",
+          });
+          return false;
+        }
+
         // Add text
         if (knowledgeBaseSubmissionText.trim()) {
           contentItems.push({
@@ -556,6 +572,22 @@ export function useSendMessage() {
           toast.error("图片 ZIP 打包失败", {
             description:
               err?.message || "请手动将原图压缩为 ZIP 后通过上传文件发送。",
+          });
+          return false;
+        }
+
+        try {
+          // Image preparation can replace multiple source images with a ZIP;
+          // the generated upload must obey the same per-file contract.
+          assertChatAttachmentSizes(
+            preparedUploads.files.map(({ file }) => file),
+          );
+        } catch (error) {
+          toast.error("文件过大", {
+            description:
+              error instanceof Error
+                ? error.message
+                : "单个文件不能超过 100 MB",
           });
           return false;
         }
@@ -669,7 +701,10 @@ export function useSendMessage() {
               },
               retryConfig,
               {
-                captureLocalCopy: options?.syncKnowledgeBaseSnapshot === true,
+                // Every chat upload is retained through the authenticated
+                // Dashboard proxy so it remains reopenable for its retention
+                // window, regardless of which agent entry created it.
+                captureLocalCopy: true,
                 ...(options?.syncKnowledgeBaseSnapshot
                   ? {
                       captureFilename: knowledgeBaseFilename!,
@@ -697,8 +732,18 @@ export function useSendMessage() {
               base64: fileBase64,
               blobUrl: fileBlobUrl,
               file,
+              expiresAt: result.expiresAt,
+              expired: false,
             });
           } catch (uploadErr: any) {
+            // The attachment never reached ConversationContext, so its normal
+            // lifecycle cleanup cannot see this optimistic URL.
+            if (fileBlobUrl) URL.revokeObjectURL(fileBlobUrl);
+            for (const uploadedAttachment of attachments) {
+              if (uploadedAttachment.blobUrl) {
+                URL.revokeObjectURL(uploadedAttachment.blobUrl);
+              }
+            }
             console.warn(
               `File upload failed for "${file.name}":`,
               uploadErr.message,

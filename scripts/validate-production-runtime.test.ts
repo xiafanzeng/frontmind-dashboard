@@ -32,6 +32,7 @@ function productionEnvironment() {
     FRONTMIND_PROVISIONING_SERVICE_TOKEN: "q".repeat(32),
     FRONTMIND_DASHBOARD_IMPORT_PREFLIGHT_SECRET: "r".repeat(32),
     FRONTMIND_MONITOR_API_KEY: "s".repeat(32),
+    FRONTMIND_DOWNLOAD_TOKEN_SECRET: "t".repeat(32),
   };
 }
 
@@ -62,5 +63,30 @@ describe("production runtime preflight", () => {
     expect(() => validateProductionRuntimeEnvironment(missingSource)).toThrow(
       "FRONTMIND_BUILD_SHA_VALUE_INVALID",
     );
+  });
+
+  it("requires the download-token resolver secret before rollout", () => {
+    const {
+      FRONTMIND_DOWNLOAD_TOKEN_SECRET: _missingDownloadSecret,
+      ...missingDownloadSecret
+    } = productionEnvironment();
+    expect(() =>
+      validateProductionRuntimeEnvironment(missingDownloadSecret),
+    ).toThrow("FRONTMIND_DOWNLOAD_TOKEN_SECRET_VALUE_INVALID");
+
+    expect(
+      validateProductionRuntimeEnvironment({
+        ...missingDownloadSecret,
+        JWT_SECRET: "j".repeat(32),
+      }),
+    ).toMatchObject({ buildSourceSha: "a".repeat(40) });
+
+    expect(() =>
+      validateProductionRuntimeEnvironment({
+        ...productionEnvironment(),
+        FRONTMIND_DOWNLOAD_TOKEN_SECRET: "short",
+        JWT_SECRET: "j".repeat(32),
+      }),
+    ).toThrow("FRONTMIND_DOWNLOAD_TOKEN_SECRET_VALUE_INVALID");
   });
 });

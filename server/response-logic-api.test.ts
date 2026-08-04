@@ -375,6 +375,39 @@ describe("response logic execution contract", () => {
     ]);
   });
 
+  it("projects the immutable server file deadline into response-logic attachments", () => {
+    const uploadedAt = new Date("2026-07-01T00:00:00.000Z");
+    const contentExpiresAt = new Date("2026-07-31T00:00:00.000Z");
+    const attachments = buildVerifiedResponseLogicAttachments(
+      [
+        {
+          file_id: " file/opaque?# ",
+          filename: "证据.pdf",
+          mime_type: "application/pdf",
+        },
+      ],
+      new Map([
+        [
+          " file/opaque?# ",
+          {
+            uploadedAt,
+            contentExpiresAt,
+            contentDeletedAt: new Date("2026-07-31T01:00:00.000Z"),
+          },
+        ],
+      ]),
+    );
+
+    expect(attachments).toEqual([
+      expect.objectContaining({
+        fileId: " file/opaque?# ",
+        uploadedAt: uploadedAt.toISOString(),
+        expiresAt: contentExpiresAt.getTime(),
+        expired: true,
+      }),
+    ]);
+  });
+
   it("does not publish an incomplete response logic draft", () => {
     expect(() =>
       assertResponseLogicDraftPublishable({

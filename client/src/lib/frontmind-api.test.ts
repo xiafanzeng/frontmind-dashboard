@@ -740,6 +740,9 @@ describe("retrieveTask", () => {
 });
 
 describe("uploadFile", () => {
+  const uploadedAt = Date.parse("2026-08-04T00:00:00.000Z");
+  const expiresAt = Date.parse("2026-09-03T00:00:00.000Z");
+
   it("aborts a half-open upload only after a long no-progress watchdog", async () => {
     vi.useFakeTimers();
     class MockXMLHttpRequest {
@@ -813,6 +816,7 @@ describe("uploadFile", () => {
       }
       send() {
         this.status = 200;
+        this.responseText = JSON.stringify({ uploadedAt, expiresAt });
         queueMicrotask(() => this.listeners.get("load")?.());
       }
     }
@@ -839,7 +843,7 @@ describe("uploadFile", () => {
     );
   });
 
-  it("creates one file record and reuses its URL across transient PUT retries", async () => {
+  it("creates one file record and reuses the durable proxy across transient PUT retries", async () => {
     const signedUrl =
       "https://uploads.example/signed-one?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Signature=abcdef0123456789";
     const fetchMock = vi.fn().mockResolvedValue({
@@ -880,7 +884,10 @@ describe("uploadFile", () => {
       send() {
         requests.push({ method: this.method, url: this.url });
         const outcome = outcomes[nextOutcome++];
-        if (outcome === "load") this.status = 200;
+        if (outcome === "load") {
+          this.status = 200;
+          this.responseText = JSON.stringify({ uploadedAt, expiresAt });
+        }
         queueMicrotask(() => this.listeners.get(outcome)?.());
       }
     }
@@ -900,6 +907,8 @@ describe("uploadFile", () => {
     ).resolves.toEqual({
       fileId: "file-one",
       filename: "report.pdf",
+      uploadedAt,
+      expiresAt,
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -907,17 +916,30 @@ describe("uploadFile", () => {
       "/api/frontmind/v1/files",
       expect.objectContaining({ method: "POST" }),
     );
-    expect(requests).toEqual([
-      { method: "PUT", url: signedUrl },
-      {
+    const durableProxyUrl = `/api/frontmind/proxy-upload?target=${encodeURIComponent(signedUrl)}&capture_file_id=file-one`;
+    expect(requests).toEqual(
+      Array.from({ length: 3 }, () => ({
         method: "PUT",
-        url: `/api/frontmind/proxy-upload?target=${encodeURIComponent(signedUrl)}`,
-      },
-      {
-        method: "PUT",
-        url: `/api/frontmind/proxy-upload?target=${encodeURIComponent(signedUrl)}`,
-      },
-    ]);
+        url: durableProxyUrl,
+      })),
+    );
+  });
+
+  it("rejects a file over 100 MB before creating an upstream record", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const oversized = new File(["x"], "oversized.pdf", {
+      type: "application/pdf",
+    });
+    Object.defineProperty(oversized, "size", {
+      configurable: true,
+      value: 100 * 1024 * 1024 + 1,
+    });
+
+    await expect(uploadFile(oversized)).rejects.toThrow(
+      "文件“oversized.pdf”不能超过 100 MB",
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("does not retry or expose raw storage XML after a permanent proxy rejection", async () => {

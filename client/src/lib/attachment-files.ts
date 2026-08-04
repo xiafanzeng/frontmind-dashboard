@@ -13,7 +13,27 @@ import {
 export const ZIP_REFERENCE_PROMPT =
   "附件 ZIP 中包含用户上传的原始参考图片，请解压后读取图片内容作为参考。";
 
-export const MAX_KNOWLEDGE_BASE_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+/**
+ * The chat upload contract is shared by every agent entry point. Keep the
+ * browser-side limit in one place so picker, drag-and-drop and the defensive
+ * send path cannot disagree.
+ */
+export const MAX_CHAT_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+export const MAX_KNOWLEDGE_BASE_ATTACHMENT_BYTES = MAX_CHAT_ATTACHMENT_BYTES;
+
+export function chatAttachmentSizeError(file: Pick<File, "name" | "size">) {
+  if (file.size <= MAX_CHAT_ATTACHMENT_BYTES) return null;
+  return `文件“${file.name || "未命名文件"}”不能超过 100 MB`;
+}
+
+export function assertChatAttachmentSizes(
+  files: readonly Pick<File, "name" | "size">[],
+) {
+  for (const file of files) {
+    const error = chatAttachmentSizeError(file);
+    if (error) throw new Error(error);
+  }
+}
 
 export interface ZippedImageInfo {
   name: string;
@@ -74,9 +94,7 @@ async function readFileBytes(file: File): Promise<ArrayBuffer> {
  * not merely to a filename/size/timestamp tuple that another file can mimic.
  */
 export async function sha256UploadFile(file: File): Promise<string> {
-  if (file.size > MAX_KNOWLEDGE_BASE_ATTACHMENT_BYTES) {
-    throw new Error("单个知识库附件不能超过 100 MB");
-  }
+  assertChatAttachmentSizes([file]);
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) throw new Error("当前浏览器无法校验附件完整性，请升级后重试");
   const digest = await subtle.digest("SHA-256", await readFileBytes(file));

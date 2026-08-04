@@ -45,6 +45,7 @@ import { toast } from "sonner";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import { consumePendingFrontMindBuildDraft } from "@/lib/build-version";
 import { useComposition } from "@/hooks/useComposition";
+import { chatAttachmentSizeError } from "@/lib/attachment-files";
 
 interface FilePreview {
   file: File;
@@ -232,10 +233,17 @@ export default function ChatInput({
   const addFiles = useCallback(async (newFiles: File[]) => {
     const previews: FilePreview[] = [];
     for (const file of newFiles) {
+      const sizeError = chatAttachmentSizeError(file);
+      if (sizeError) {
+        toast.error("文件过大", { description: sizeError });
+        continue;
+      }
       const id = `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       previews.push({ file, id });
     }
-    setFiles((prev) => [...prev, ...previews]);
+    if (previews.length > 0) {
+      setFiles((prev) => [...prev, ...previews]);
+    }
   }, []);
 
   const removeFile = useCallback((id: string) => {

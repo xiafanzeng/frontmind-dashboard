@@ -7,6 +7,7 @@ import {
   conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
+  knowledgeBaseConversationRetentionTombstones,
   messages,
   type ConversationTurn,
   type KnowledgeBaseBuild,
@@ -41,7 +42,6 @@ import {
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
 import { knowledgeBaseCustomerUploadResources } from "./knowledge-base-customer-upload";
-import { customerFormalContentViolation } from "./knowledge-customer-content";
 import {
   markKnowledgeBaseConversationCompletedInTransaction,
   markKnowledgeBaseConversationFailedInTransaction,
@@ -907,18 +907,7 @@ export const KNOWLEDGE_BASE_ACKNOWLEDGEMENT_FAILURE_MESSAGE =
   "上游智能体仅返回了确认回执，未生成知识库正文；本轮未写入，现可安全重试";
 
 export function assertKnowledgeBaseCustomerOutput(output: unknown) {
-  const text = extractFinalKnowledgeBaseAssistantText(output);
-  const customerVisibleText = stripKnowledgeBaseReferenceAppendix(
-    stripKnowledgeBaseProtocolPayloads(text),
-  );
-  const violation = customerFormalContentViolation(customerVisibleText);
-  if (violation) {
-    throw new KnowledgeBaseBuildError(
-      "PROGRESS_PROTOCOL_INVALID",
-      `客户可见知识库回复包含核验过程、建议或内部推理：${violation}`,
-    );
-  }
-  return text;
+  return extractFinalKnowledgeBaseAssistantText(output);
 }
 
 function reconciliationHash(input: {
@@ -1351,6 +1340,28 @@ export async function createKnowledgeBaseBuild(input: {
     );
   }
   const build = await db.transaction(async (tx) => {
+    const retentionTombstone = (
+      await tx
+        .select({ id: knowledgeBaseConversationRetentionTombstones.id })
+        .from(knowledgeBaseConversationRetentionTombstones)
+        .where(
+          and(
+            eq(knowledgeBaseConversationRetentionTombstones.userId, input.userId),
+            eq(
+              knowledgeBaseConversationRetentionTombstones.publicConversationId,
+              conversationId,
+            ),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (retentionTombstone) {
+      throw new KnowledgeBaseBuildError(
+        "BUILD_NOT_FOUND",
+        "该知识库会话已过期，请使用新会话重新构建",
+      );
+    }
     const existing = await loadBuild(tx, input.userId, conversationId, true);
     if (existing) {
       // `/start` is an at-least-once client operation. Replaying it must never

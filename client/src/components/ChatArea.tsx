@@ -7,6 +7,7 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import {
   useConversation,
+  type Attachment,
   type KnowledgeBaseClientNotice,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
@@ -70,6 +71,12 @@ import {
   retryKnowledgeBaseTurn,
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
+import {
+  assertChatAttachmentSizes,
+  chatAttachmentSizeError,
+  normalizedKnowledgeBaseUploadFilename,
+} from "@/lib/attachment-files";
+import { isAttachmentExpired } from "@/lib/attachment-expiry";
 
 export const KNOWLEDGE_BASE_FOUNDATION_COPY =
   "企业知识库是品牌事实与产品信息的统一底稿，也是构建 AI 专用友好官网、生成内容与准确回答客户问题的基础。";
@@ -329,29 +336,9 @@ async function fetchWithAuth(
     contentType.includes("application/json") &&
     normalizedUrl.includes("/v1/files/")
   ) {
-    const text = await response.text();
-    try {
-      const data = JSON.parse(text);
-      if (data.upload_url) {
-        // Got metadata instead of binary - fetch from S3 URL via proxy
-        const proxyUrl =
-          buildProxyDownloadUrl(data.upload_url, fileName, false) ||
-          `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
-        const s3Response = await fetch(proxyUrl, {
-          credentials: "include",
-          headers: deliveryProjectHeaders(),
-        });
-        if (!s3Response.ok) {
-          throw new Error(
-            `S3 proxy download failed: HTTP ${s3Response.status}`,
-          );
-        }
-        const blob = await s3Response.blob();
-        return URL.createObjectURL(blob);
-      }
-    } catch (err) {
-      // Not valid JSON or no upload_url
-    }
+    // upload_url is a PUT-only capability. Treat metadata here as a server
+    // contract failure; never turn it into an unauthenticated GET fallback.
+    await response.body?.cancel().catch(() => undefined);
     throw new Error("服务返回了文件信息，但未返回文件内容");
   }
 
@@ -457,15 +444,29 @@ export default function ChatArea({
       let requestDispatched = false;
 
       try {
+        assertChatAttachmentSizes(files);
         const uploadedAttachments: Array<{
           file_id: string;
           filename: string;
         }> = [];
+        const messageAttachments: Attachment[] = [];
         for (const file of files) {
-          const uploaded = await uploadFile(file);
+          const uploaded = await uploadFile(file, undefined, undefined, {
+            captureLocalCopy: true,
+            captureFilename: normalizedKnowledgeBaseUploadFilename(file.name),
+          });
           uploadedAttachments.push({
             file_id: uploaded.fileId,
             filename: uploaded.filename,
+          });
+          messageAttachments.push({
+            id: `att-${responseStartedAt}-${messageAttachments.length + 1}`,
+            type: "file",
+            name: file.name,
+            fileId: uploaded.fileId,
+            file,
+            expiresAt: uploaded.expiresAt,
+            expired: false,
           });
         }
 
@@ -475,6 +476,9 @@ export default function ChatArea({
           id: `msg-kb-start-${responseStartedAt}`,
           role: "user",
           content: "开始构建企业知识库",
+          ...(messageAttachments.length > 0
+            ? { attachments: messageAttachments }
+            : {}),
           timestamp: responseStartedAt,
           knowledgeBase: {
             kind: "pending_user",
@@ -537,7 +541,9 @@ export default function ChatArea({
         creditEventBus.emit();
       } catch (error: any) {
         const errorMessage = error?.message || "启动失败";
-        if (error?.observation) {
+        if (errorMessage.includes("不能超过 100 MB")) {
+          toast.error("文件过大", { description: errorMessage });
+        } else if (error?.observation) {
           settleKnowledgeBaseStartFailure(conversationId, clientRequestId);
           commitKnowledgeBaseObservation(conversationId, error.observation);
           wakeKnowledgeBaseConversation(conversationId);
@@ -1003,7 +1009,12 @@ export function EmptyConversationHint({
   const [isStarting, setIsStarting] = useState(false);
 
   const addFiles = useCallback((fileList: FileList | File[]) => {
-    const incoming = Array.from(fileList);
+    const incoming = Array.from(fileList).filter((file) => {
+      const sizeError = chatAttachmentSizeError(file);
+      if (!sizeError) return true;
+      toast.error("文件过大", { description: sizeError });
+      return false;
+    });
     setFiles((current) => {
       const seen = new Set(
         current.map((file) => `${file.name}:${file.size}:${file.lastModified}`),
@@ -1347,37 +1358,15 @@ function MarkdownFileReader({
           if (!res.ok) {
             throw new Error(`HTTP ${res.status}`);
           }
-          const text = await res.text();
-
-          // Safety: check if we got JSON metadata instead of markdown content
           const ct = res.headers.get("content-type") || "";
           if (
             ct.includes("application/json") &&
             fileUrl.includes("/v1/files/")
           ) {
-            try {
-              const data = JSON.parse(text);
-              if (data.upload_url) {
-                // Fetch actual content from S3 via proxy
-                const proxyUrl =
-                  buildProxyDownloadUrl(data.upload_url, displayName, false) ||
-                  `/api/frontmind/proxy-download?url=${encodeURIComponent(data.upload_url)}`;
-                const s3Res = await fetch(proxyUrl, {
-                  credentials: "include",
-                  headers: deliveryProjectHeaders(),
-                });
-                if (!s3Res.ok) {
-                  throw new Error(`S3 download failed: HTTP ${s3Res.status}`);
-                }
-                return s3Res.text();
-              }
-            } catch (err) {
-              if ((err as Error)?.message?.includes("download failed"))
-                throw err;
-              // Not valid JSON or no upload_url - use text as-is
-            }
+            await res.body?.cancel().catch(() => undefined);
+            throw new Error("服务返回了文件信息，但未返回文件内容");
           }
-          return text;
+          return res.text();
         })
         .then((text) => {
           // FIX #4: Sanitize FrontMind references in file content before display
@@ -1593,7 +1582,7 @@ function PdfViewer({
           >
             <PdfDocumentViewer
               fileName={fileName}
-              sourceUrl={fileUrl}
+              source={{ kind: "external", url: fileUrl }}
               onClose={onClose}
             />
           </React.Suspense>
@@ -1859,6 +1848,33 @@ function HtmlFileViewer({
   );
 }
 
+function UserAttachmentImage({ attachment }: { attachment: Attachment }) {
+  const [localUrl, setLocalUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (attachment.base64 || attachment.blobUrl || !attachment.file) {
+      setLocalUrl(null);
+      return;
+    }
+    const nextUrl = URL.createObjectURL(attachment.file);
+    setLocalUrl(nextUrl);
+    return () => URL.revokeObjectURL(nextUrl);
+  }, [attachment.base64, attachment.blobUrl, attachment.file]);
+
+  const source = attachment.base64 || attachment.blobUrl || localUrl || "";
+
+  if (!source && !attachment.fileId) return null;
+  return (
+    <ImagePreview
+      {...(source ? { src: source } : { fileId: attachment.fileId! })}
+      alt={sanitizeBrandText(attachment.name)}
+      className="max-w-[200px] max-h-[200px]"
+      expiresAt={attachment.expiresAt}
+      expired={attachment.expired}
+    />
+  );
+}
+
 function MessageBubble({
   message,
   isRunning,
@@ -2065,91 +2081,15 @@ function MessageBubble({
               >
                 {message.attachments.map((att) => (
                   <div key={att.id}>
-                    {/* Image attachment: show ImagePreview with proper src */}
-                    {att.type === "image" &&
-                      (() => {
-                        // Determine image src: base64 > file (local object) > fileId (API proxy)
-                        let imageSrc = "";
-                        if (att.base64) {
-                          imageSrc = att.base64;
-                        } else if (att.file) {
-                          imageSrc = URL.createObjectURL(att.file);
-                        } else if (att.fileId) {
-                          // Fallback: try API proxy URL (works for AI-generated files)
-                          imageSrc = `/api/frontmind/v1/files/${att.fileId}`;
-                        }
-                        if (!imageSrc) return null;
-                        return (
-                          <ImagePreview
-                            src={imageSrc}
-                            alt={sanitizeBrandText(att.name)}
-                            className="max-w-[200px] max-h-[200px]"
-                          />
-                        );
-                      })()}
-                    {att.type !== "image" &&
-                    (isPdfFile(att.name, att.file?.type) ||
-                      isHtmlFile(att.name, att.file?.type)) ? (
-                      <div
-                        onClick={() => {
-                          // Priority: blobUrl > File > base64 (convert to blob) > fileId
-                          let fileViewUrl = "";
-                          if (att.blobUrl) {
-                            fileViewUrl = att.blobUrl;
-                          } else if (att.file) {
-                            fileViewUrl = URL.createObjectURL(att.file);
-                          } else if (att.base64) {
-                            // Convert base64 to blob URL for PDF rendering
-                            try {
-                              const parts = att.base64.split(",");
-                              const mimeMatch = parts[0]?.match(/:(.*?);/);
-                              const mime = mimeMatch
-                                ? mimeMatch[1]
-                                : "application/octet-stream";
-                              const binaryStr = atob(parts[1]);
-                              const bytes = new Uint8Array(binaryStr.length);
-                              for (let j = 0; j < binaryStr.length; j++) {
-                                bytes[j] = binaryStr.charCodeAt(j);
-                              }
-                              const blob = new Blob([bytes], { type: mime });
-                              fileViewUrl = URL.createObjectURL(blob);
-                            } catch (e) {
-                              console.error(
-                                "Failed to convert base64 to blob:",
-                                e,
-                              );
-                            }
-                          } else if (att.fileId) {
-                            fileViewUrl = `/api/frontmind/v1/files/${att.fileId}`;
-                          }
-                          if (fileViewUrl) {
-                            openPdfViewer(
-                              fileViewUrl,
-                              sanitizeBrandText(att.name),
-                              isPdfFile(att.name, att.file?.type),
-                            );
-                          }
-                        }}
-                        className="flex items-center gap-2.5 px-3 py-2.5 rounded-2xl bg-card/80 hover:bg-secondary/70 transition-all group border border-border/70 cursor-pointer shadow-sm"
-                      >
-                        <div className="w-8 h-8 rounded-lg bg-red-500/10 flex items-center justify-center flex-shrink-0">
-                          <FileText className="w-4 h-4 text-red-500/60" />
-                        </div>
-                        <div className="flex-1 overflow-hidden">
-                          <p className="text-xs font-medium text-foreground/70 truncate">
-                            {sanitizeBrandText(att.name)}
-                          </p>
-                          <p className="text-xs text-muted-foreground/50">
-                            {isPdfFile(att.name, att.file?.type)
-                              ? "点击查看 PDF"
-                              : "点击查看文件"}
-                          </p>
-                        </div>
-                        <BookOpen className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-                      </div>
-                    ) : att.type !== "image" ? (
+                    {att.type === "image" && !isAttachmentExpired(att) ? (
+                      <UserAttachmentImage attachment={att} />
+                    ) : (
+                      // PDF, HTML and every other user file share one source
+                      // resolver. In particular, local PDFs reach
+                      // PdfDocumentViewer through sourceFile instead of being
+                      // forced through the remote preparation endpoint.
                       <FilePreview file={att} />
-                    ) : null}
+                    )}
                   </div>
                 ))}
               </div>

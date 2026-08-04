@@ -2046,6 +2046,32 @@ export async function reserveKnowledgeBaseStartBuild(
         "Knowledge-base build could not be reserved",
       );
     }
+    // A retention worker may have held the build unique-key gap while this
+    // transaction was waiting to insert. Recheck after acquiring the build row
+    // lock so a pre-check from a stale browser cannot win after the old
+    // conversation and build were atomically retired.
+    const postLockRetentionTombstone = (
+      await tx
+        .select({ id: knowledgeBaseConversationRetentionTombstones.id })
+        .from(knowledgeBaseConversationRetentionTombstones)
+        .where(
+          and(
+            eq(knowledgeBaseConversationRetentionTombstones.userId, input.userId),
+            eq(
+              knowledgeBaseConversationRetentionTombstones.publicConversationId,
+              conversationId,
+            ),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (postLockRetentionTombstone) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONVERSATION_RESET",
+        "该知识库会话已过期，请使用新会话重新构建",
+      );
+    }
     const createdBuild = build.id === candidateBuildId;
 
     const requestPayload = pinnedStartPayload(build, input.requestPayload);

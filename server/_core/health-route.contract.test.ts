@@ -26,4 +26,33 @@ describe("runtime health route contract", () => {
       /\bgetDb\(\)[\s\S]*\bevaluateReleaseReadiness\(/u,
     );
   });
+
+  it("runs and caches file-retention evidence before binding the listener", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/_core/index.ts"),
+      "utf8",
+    );
+    const lifecycleBackfill = source.indexOf(
+      "prepareFileContentRetentionForServing()",
+    );
+    const retentionPreflight = source.indexOf(
+      "inspectFileRetentionPreflight()",
+      lifecycleBackfill,
+    );
+    const listener = source.indexOf("server.listen(", retentionPreflight);
+    const cleanupScheduler = source.indexOf(
+      "startFileContentRetentionScheduler(",
+      listener,
+    );
+    const readinessStart = source.indexOf('app.get("/readyz"');
+
+    expect(lifecycleBackfill).toBeGreaterThan(-1);
+    expect(retentionPreflight).toBeGreaterThan(lifecycleBackfill);
+    expect(listener).toBeGreaterThan(retentionPreflight);
+    expect(cleanupScheduler).toBeGreaterThan(listener);
+    expect(source.slice(readinessStart, listener)).toContain(
+      "fileRetentionPreflightEvidence.read()",
+    );
+    expect(source.slice(readinessStart, listener)).toContain("fileRetention,");
+  });
 });

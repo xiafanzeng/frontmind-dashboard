@@ -12,6 +12,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const authMocks = vi.hoisted(() => ({
   getCredentialForUpstreamResource: vi.fn(),
 }));
+const retentionMocks = vi.hoisted(() => ({
+  markUploadedFileRetention: vi.fn(async () => ({
+    uploadedAt: new Date("2026-08-04T00:00:00Z"),
+    contentExpiresAt: new Date("2026-09-03T00:00:00Z"),
+    contentDeletedAt: null,
+  })),
+}));
 
 vi.mock("./auth-service", async () => {
   const actual =
@@ -23,8 +30,19 @@ vi.mock("./auth-service", async () => {
   };
 });
 
+vi.mock("./file-content-retention", async () => {
+  const actual = await vi.importActual<
+    typeof import("./file-content-retention")
+  >("./file-content-retention");
+  return {
+    ...actual,
+    markUploadedFileRetention: retentionMocks.markUploadedFileRetention,
+  };
+});
+
 import manusProxy, {
   MAX_EXTERNAL_DOWNLOAD_BYTES,
+  boundedFileDownloadTokenExpiry,
   isPrivateUpstreamCollectionRequest,
   isRetainedUpstreamTaskDeleteRequest,
   isPublicFilePayloadRequest,
@@ -34,7 +52,10 @@ import manusProxy, {
   publicUpstreamTaskPayload,
   readBoundedExternalDownload,
 } from "./manus-proxy";
-import { readStoredPresalesFile } from "./presales-file-store";
+import {
+  readStoredPresalesFile,
+  stagePresalesFileContent,
+} from "./presales-file-store";
 
 async function withManusProxyServer(
   run: (baseUrl: string) => Promise<void>,
@@ -73,6 +94,7 @@ async function withManusProxyServer(
 
 afterEach(() => {
   authMocks.getCredentialForUpstreamResource.mockReset();
+  retentionMocks.markUploadedFileRetention.mockClear();
   vi.restoreAllMocks();
 });
 
@@ -126,6 +148,14 @@ describe("isPrivateUpstreamCollectionRequest", () => {
     ["POST", "/v1/files"],
   ])("allows %s access to scoped endpoint %s", (method, targetPath) => {
     expect(isPrivateUpstreamCollectionRequest(method, targetPath)).toBe(false);
+  });
+});
+
+describe("owned file download token expiry", () => {
+  it("never outlives either five minutes or the source retention deadline", () => {
+    const now = 10_000;
+    expect(boundedFileDownloadTokenExpiry(now)).toBe(now + 5 * 60 * 1_000);
+    expect(boundedFileDownloadTokenExpiry(now, now + 1_000)).toBe(now + 1_000);
   });
 });
 
@@ -283,7 +313,10 @@ describe("proxy upload", () => {
           );
 
           expect(response.status).toBe(200);
-          expect(await response.text()).toBe("");
+          expect(await response.json()).toEqual({
+            uploadedAt: Date.parse("2026-08-04T00:00:00Z"),
+            expiresAt: Date.parse("2026-09-03T00:00:00Z"),
+          });
         },
         { authenticated: true },
       );
@@ -315,6 +348,113 @@ describe("proxy upload", () => {
         sha256: createHash("sha256").update(sourceBytes).digest("hex"),
       });
       expect(await readAll(stored!.createReadStream())).toEqual(sourceBytes);
+      expect(retentionMocks.markUploadedFileRetention).toHaveBeenCalledWith({
+        userId: 42,
+        fileId,
+        uploadedAt: expect.any(Date),
+      });
+      const markedUploadedAt = retentionMocks.markUploadedFileRetention.mock
+        .calls[0]?.[0]?.uploadedAt as Date;
+      expect(stored?.uploadedAt).toEqual(markedUploadedAt);
+      expect(
+        Number(stored?.contentExpiresAt) - Number(stored?.uploadedAt),
+      ).toBe(30 * 24 * 60 * 60 * 1_000);
+    });
+  });
+
+  it("returns an explicit error when retention registration fails after capture", async () => {
+    await withCaptureAssetDirectory(async () => {
+      const signedUrl =
+        "https://uploads.example.test/customer.pdf?X-Amz-Signature=retention-failure";
+      const fileId = "file-retention-registration-failure";
+      authMocks.getCredentialForUpstreamResource.mockResolvedValue({
+        id: "credential-capture-test",
+      });
+      vi.spyOn(axios, "put").mockResolvedValue({ status: 200, data: "" });
+      retentionMocks.markUploadedFileRetention.mockRejectedValueOnce(
+        new Error("DATABASE_UNAVAILABLE"),
+      );
+
+      await withManusProxyServer(
+        async (baseUrl) => {
+          const response = await fetch(
+            `${baseUrl}/proxy-upload?target=${encodeURIComponent(signedUrl)}&capture_file_id=${encodeURIComponent(fileId)}`,
+            {
+              method: "PUT",
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "X-Original-Content-Type": "application/pdf",
+              },
+              body: Buffer.from("%PDF-retention-test"),
+            },
+          );
+
+          expect(response.status).toBe(503);
+          expect(await response.json()).toMatchObject({
+            error: { code: "FILE_RETENTION_MARK_FAILED" },
+          });
+        },
+        { authenticated: true },
+      );
+
+      // The upstream PUT and local commit both succeeded. Keep the immutable
+      // manifest as the repair ledger so the hourly reconciliation can fill
+      // the missing DB lifecycle instead of turning this into a lost file.
+      expect(await readStoredPresalesFile(fileId)).toMatchObject({
+        filename: fileId,
+        mimeType: "application/pdf",
+        sizeBytes: Buffer.byteLength("%PDF-retention-test"),
+        uploadedAt: expect.any(Date),
+        contentExpiresAt: expect.any(Date),
+      });
+    });
+  });
+
+  it("reuses the first manifest upload clock when the same fileId is retried", async () => {
+    await withCaptureAssetDirectory(async () => {
+      const fileId = "file-retried-after-lost-response";
+      const firstUploadedAt = new Date("2026-07-01T00:00:00.000Z");
+      const staged = await stagePresalesFileContent({
+        fileId,
+        stream: Readable.from(["first upload"]),
+        maxBytes: 1_024,
+      });
+      await staged.commit({
+        filename: "first.pdf",
+        mimeType: "application/pdf",
+        uploadedAt: firstUploadedAt,
+        contentExpiresAt: new Date("2026-07-31T00:00:00.000Z"),
+      });
+      authMocks.getCredentialForUpstreamResource.mockResolvedValue({
+        id: "credential-capture-test",
+      });
+      vi.spyOn(axios, "put").mockResolvedValue({ status: 200, data: "" });
+
+      await withManusProxyServer(
+        async (baseUrl) => {
+          const target =
+            "https://uploads.example.test/retry.pdf?signature=test";
+          const response = await fetch(
+            `${baseUrl}/proxy-upload?target=${encodeURIComponent(target)}&capture_file_id=${encodeURIComponent(fileId)}`,
+            {
+              method: "PUT",
+              headers: { "X-Original-Content-Type": "application/pdf" },
+              body: Buffer.from("retry bytes"),
+            },
+          );
+          expect(response.status).toBe(200);
+        },
+        { authenticated: true },
+      );
+
+      expect(retentionMocks.markUploadedFileRetention).toHaveBeenCalledWith({
+        userId: 42,
+        fileId,
+        uploadedAt: firstUploadedAt,
+      });
+      expect((await readStoredPresalesFile(fileId))?.uploadedAt).toEqual(
+        firstUploadedAt,
+      );
     });
   });
 
@@ -362,6 +502,100 @@ describe("proxy upload", () => {
       expect(
         await readdir(path.join(assetDirectory, "presales-files")),
       ).toEqual([]);
+    });
+  });
+});
+
+describe("owned file content download", () => {
+  function ownedCredential() {
+    return {
+      id: "credential-capture-test",
+      apiKey: "test-only-credential",
+      resource: {
+        createdAt: new Date(),
+        contentExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1_000),
+        contentDeletedAt: null,
+      },
+    };
+  }
+
+  it("serves the durable local copy without any upstream GET", async () => {
+    await withCaptureAssetDirectory(async () => {
+      const fileId = "owned-local-file";
+      const bytes = Buffer.from("durable local content");
+      const staged = await stagePresalesFileContent({
+        fileId,
+        stream: Readable.from([bytes]),
+        maxBytes: 100 * 1024 * 1024,
+      });
+      await staged.commit({ filename: "local.txt", mimeType: "text/plain" });
+      authMocks.getCredentialForUpstreamResource.mockResolvedValue(
+        ownedCredential(),
+      );
+      const get = vi.spyOn(axios, "get");
+
+      await withManusProxyServer(
+        async (baseUrl) => {
+          const response = await fetch(
+            `${baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`,
+          );
+          expect(response.status).toBe(200);
+          expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+        },
+        { authenticated: true },
+      );
+
+      expect(get).not.toHaveBeenCalled();
+    });
+  });
+
+  it("uses only authenticated /content and durably recaptures a legacy file", async () => {
+    await withCaptureAssetDirectory(async () => {
+      const fileId = "legacy-upstream-file";
+      const bytes = Buffer.from("legacy upstream content");
+      authMocks.getCredentialForUpstreamResource.mockResolvedValue(
+        ownedCredential(),
+      );
+      const get = vi.spyOn(axios, "get").mockResolvedValue({
+        status: 200,
+        data: Readable.from([bytes]),
+        headers: {
+          "content-type": "text/plain",
+          "content-length": String(bytes.length),
+          "content-disposition": "attachment; filename=legacy.txt",
+        },
+      });
+
+      await withManusProxyServer(
+        async (baseUrl) => {
+          const response = await fetch(
+            `${baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`,
+          );
+          expect(response.status).toBe(200);
+          expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+        },
+        { authenticated: true },
+      );
+
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(get.mock.calls[0]?.[0]).toMatch(
+        new RegExp(`/v1/files/${fileId}/content$`),
+      );
+      expect(get.mock.calls[0]?.[1]).toMatchObject({
+        maxRedirects: 0,
+        headers: {
+          API_KEY: "test-only-credential",
+          Authorization: "Bearer test-only-credential",
+        },
+      });
+      expect(get.mock.calls[0]?.[0]).not.toContain("upload_url");
+      const captured = await readStoredPresalesFile(fileId);
+      expect(captured).toMatchObject({
+        filename: "legacy.txt",
+        mimeType: "text/plain",
+        sizeBytes: bytes.length,
+      });
+      expect(await readAll(captured!.createReadStream())).toEqual(bytes);
     });
   });
 });

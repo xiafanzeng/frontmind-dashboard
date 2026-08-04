@@ -78,7 +78,6 @@ import {
   knowledgeArchiveFileIdFromUrl,
   type KnowledgeArchiveDescriptor,
 } from "./knowledge-base-artifact";
-import { customerFormalContentViolation } from "./knowledge-customer-content";
 import { assertKnowledgeBasePublishable } from "./knowledge-base-progress-service";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import {
@@ -1743,8 +1742,6 @@ function markedFormalContent(content: string) {
   return content.slice(start + startMarker.length, end);
 }
 
-export { customerFormalContentViolation } from "./knowledge-customer-content";
-
 function profileFormalKnowledgeText(
   content: string,
   profile: Exclude<KnowledgeBaseValidationProfile, "historical">,
@@ -3113,23 +3110,6 @@ function validateProfilePackage(input: {
       }
     }
     const formal = profileFormalKnowledgeText(document.content, input.profile);
-    if (
-      /第一方原始快照|第一方页面摘录|页面摘录|raw evidence|page excerpt/i.test(
-        formal,
-      )
-    ) {
-      throw new KnowledgeArchiveValidationError(
-        "content",
-        `正式正文包含原始快照或页面摘录表述：${document.path}`,
-      );
-    }
-    const formalViolation = customerFormalContentViolation(formal);
-    if (formalViolation) {
-      throw new KnowledgeArchiveValidationError(
-        "content",
-        `正式正文包含客户不可见的核验过程、建议或内部推理（${formalViolation}）：${document.path}`,
-      );
-    }
     if (
       manifest.schemaVersion !== 1 &&
       (document.kind === "overview" || document.kind === "leaf")

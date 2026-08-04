@@ -1,4 +1,3 @@
-import axios from "axios";
 import { and, eq } from "drizzle-orm";
 import { Router, type Response } from "express";
 
@@ -20,11 +19,10 @@ import {
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getDb } from "./db";
 import {
-  assertSafeExternalUrl,
-  safeExternalRequestOptions,
-} from "./_core/safe-external-url";
+  OwnedFileContentError,
+  ownedFileContentResolver,
+} from "./owned-file-content-resolver";
 import type { FrontMindRequest } from "./_core/express-auth";
-import { getUpstreamBaseUrl } from "./upstream-config";
 
 const router = Router();
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
@@ -191,10 +189,20 @@ export async function resolveAuthorizedTicketAttachment(input: {
       410,
     );
   }
-  return { ...row, credential };
+  const usesProjectCredential = Boolean(projectCredential);
+  return {
+    ...row,
+    credential,
+    credentialOwnerUserId: usesProjectCredential
+      ? input.actor.id
+      : row.attachment.ownerUserId,
+    credentialProjectAssignmentId: usesProjectCredential
+      ? credentialProjectAssignmentId
+      : null,
+  };
 }
 
-async function downloadAttachment(
+export async function downloadAuthorizedTicketAttachment(
   attachment: Awaited<ReturnType<typeof resolveAuthorizedTicketAttachment>>,
 ) {
   const upstreamFileId = attachment.attachment.upstreamFileId;
@@ -205,64 +213,47 @@ async function downloadAttachment(
       410,
     );
   }
-  const baseUrl = getUpstreamBaseUrl().replace(/\/$/, "");
-  const headers = {
-    API_KEY: attachment.credential.apiKey,
-    Authorization: `Bearer ${attachment.credential.apiKey}`,
-  };
-  const metadataResponse = await axios.get(
-    `${baseUrl}/v1/files/${encodeURIComponent(upstreamFileId)}`,
-    {
-      headers,
-      timeout: 30_000,
-      maxRedirects: 0,
-      maxContentLength: 1024 * 1024,
-      validateStatus: () => true,
-    },
-  );
-  if (metadataResponse.status !== 200) {
-    throw new DeliveryTicketError(
-      "ATTACHMENT_UNAVAILABLE",
-      "附件暂时无法下载。",
-      502,
-    );
+  let resolved;
+  try {
+    resolved = await ownedFileContentResolver.resolve({
+      ownerUserId: attachment.credentialOwnerUserId,
+      fileId: upstreamFileId,
+      projectAssignmentId: attachment.credentialProjectAssignmentId,
+      expectedCredentialId: attachment.credential.id,
+    });
+  } catch (error) {
+    if (error instanceof OwnedFileContentError) {
+      throw new DeliveryTicketError(
+        error.code,
+        error.message,
+        error.statusCode,
+      );
+    }
+    throw error;
   }
-  const uploadUrl =
-    typeof metadataResponse.data?.upload_url === "string" &&
-    metadataResponse.data.upload_url
-      ? assertSafeExternalUrl(metadataResponse.data.upload_url)
-      : null;
-  const contentUrl =
-    uploadUrl ??
-    `${baseUrl}/v1/files/${encodeURIComponent(upstreamFileId)}/content`;
-  const response = await axios.get<ArrayBuffer>(contentUrl, {
-    ...(uploadUrl ? safeExternalRequestOptions : { headers, maxRedirects: 0 }),
-    responseType: "arraybuffer",
-    timeout: 120_000,
-    maxContentLength: MAX_ATTACHMENT_BYTES,
-    maxBodyLength: MAX_ATTACHMENT_BYTES,
-    validateStatus: () => true,
-  });
-  if (response.status !== 200) {
-    throw new DeliveryTicketError(
-      "ATTACHMENT_UNAVAILABLE",
-      "附件暂时无法下载。",
-      502,
-    );
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const value of resolved.stream) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    size += chunk.length;
+    if (size > MAX_ATTACHMENT_BYTES) {
+      resolved.stream.destroy();
+      throw new DeliveryTicketError(
+        "ATTACHMENT_TOO_LARGE",
+        "附件超过 100MB，无法在线下载。",
+        413,
+      );
+    }
+    chunks.push(chunk);
   }
-  const content = Buffer.from(response.data);
-  if (content.byteLength > MAX_ATTACHMENT_BYTES) {
-    throw new DeliveryTicketError(
-      "ATTACHMENT_TOO_LARGE",
-      "附件超过 100MB，无法在线下载。",
-      413,
-    );
-  }
+  const content = Buffer.concat(chunks, size);
   return {
     content,
     contentType:
       attachment.attachment.mimeType ||
-      String(response.headers["content-type"] || "application/octet-stream"),
+      resolved.mimeType ||
+      "application/octet-stream",
   };
 }
 
@@ -303,7 +294,7 @@ router.get("/:attachmentId/content", async (req: FrontMindRequest, res) => {
       projectAssignmentId:
         req.frontmindDeliveryProjectContext?.projectAssignmentId,
     });
-    const result = await downloadAttachment(attachment);
+    const result = await downloadAuthorizedTicketAttachment(attachment);
     res.setHeader("Cache-Control", "private, no-store");
     res.setHeader("Content-Type", result.contentType);
     res.setHeader(

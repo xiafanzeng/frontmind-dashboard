@@ -325,16 +325,13 @@ describe("knowledge-base model output boundary", () => {
   it.each([
     "其余荣誉图片因本轮没有形成可逐项核验的证书名称与有效期，不在正文中扩写。采购或合规审查仍应向企业索取证书编号，不能仅凭网页图标替代正式查验。",
     "这些内容属于企业自我定义，适合说明组织意图与品牌取向，不宜直接转换为已经量化达成的社会影响。对客户而言，可将其落实为开放模型生态。",
-  ])(
-    "rejects audit reasoning before a turn can be shown to customers",
-    (text) => {
-      expect(() =>
-        assertKnowledgeBaseCustomerOutput([
-          { role: "assistant", type: "message", content: text },
-        ]),
-      ).toThrow("客户可见知识库回复包含核验过程、建议或内部推理");
-    },
-  );
+  ])("does not apply a semantic style gate to node prose", (text) => {
+    expect(
+      assertKnowledgeBaseCustomerOutput([
+        { role: "assistant", type: "message", content: text },
+      ]),
+    ).toBe(text);
+  });
 
   it("allows neutral negative facts in a customer-facing turn", () => {
     expect(
@@ -346,6 +343,16 @@ describe("knowledge-base model output boundary", () => {
         },
       ]),
     ).toContain("毛利率");
+  });
+
+  it("allows ordinary product copy containing customer business needs", () => {
+    const text =
+      "客户可根据业务需求选择不同规格的实例类型，并按需调整预留实例数量。";
+    expect(
+      assertKnowledgeBaseCustomerOutput([
+        { role: "assistant", type: "message", content: text },
+      ]),
+    ).toBe(text);
   });
 });
 

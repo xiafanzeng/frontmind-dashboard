@@ -16,10 +16,14 @@ import {
   deletePresalesApiCredential,
   decryptPresalesApiKey,
   encryptPresalesApiKey,
+  finalizePresalesFileUploadRetention,
   hashPresalesOutputUrl,
   hashPresalesIdempotencyKey,
   hashPresalesTaskPayload,
+  markPresalesFileContentDeleted,
+  recordPresalesUpstreamResource,
   releasePresalesTaskReservation,
+  reservePresalesFileUploadRetention,
   resolvePresalesTaskCredentialForFiles,
   syncPresalesOutputUrlGrants,
 } from "./presales-service";
@@ -169,6 +173,11 @@ function resourceCredential(id: string, status: "active" | "retired") {
       kind: "file" as const,
       upstreamId: `file-${id}`,
       parentTaskId: null,
+      contentSource: "user_upload" as const,
+      uploadReservedAt: new Date("2026-07-22T00:00:00.000Z"),
+      uploadedAt: new Date("2026-07-22T00:00:00.000Z"),
+      contentExpiresAt: new Date("2026-08-21T00:00:00.000Z"),
+      contentDeletedAt: null,
       createdAt: new Date("2026-07-22T00:00:00.000Z"),
     },
   };
@@ -387,6 +396,325 @@ describe("presales credential revocation", () => {
       executor,
     );
     expect(operations).toEqual(["delete"]);
+  });
+});
+
+function createPresalesFileRetentionExecutor(input?: {
+  contentSource?: "user_upload" | "assistant_output" | null;
+  uploadReservedAt?: Date | null;
+  uploadedAt?: Date | null;
+  contentExpiresAt?: Date | null;
+  contentDeletedAt?: Date | null;
+}) {
+  let observedNow = new Date("2026-08-04T08:00:00.000Z");
+  const resource = {
+    id: "presales-file-resource-1",
+    apiCredentialId: "credential-1",
+    kind: "file" as const,
+    upstreamId: "file-1",
+    parentTaskId: null as string | null,
+    contentSource: input?.contentSource ?? null,
+    uploadReservedAt: input?.uploadReservedAt ?? null,
+    uploadedAt: input?.uploadedAt ?? null,
+    contentExpiresAt: input?.contentExpiresAt ?? null,
+    contentDeletedAt: input?.contentDeletedAt ?? null,
+    createdAt: new Date("2026-08-04T07:59:00.000Z"),
+  };
+  const update = (table: unknown) => ({
+    set: (values: Record<string, unknown>) => ({
+      where: async () => {
+        if (table !== presalesUpstreamResources) return;
+        if ("uploadReservedAt" in values) {
+          const lifecycleIsValid =
+            (resource.uploadReservedAt === null &&
+              resource.uploadedAt === null &&
+              resource.contentExpiresAt === null) ||
+            (resource.uploadReservedAt !== null &&
+              resource.uploadedAt === null &&
+              resource.contentExpiresAt === null &&
+              resource.uploadReservedAt.getTime() + 30 * 24 * 60 * 60 * 1_000 >
+                observedNow.getTime()) ||
+            (resource.uploadReservedAt !== null &&
+              resource.uploadedAt?.getTime() ===
+                resource.uploadReservedAt.getTime() &&
+              resource.contentExpiresAt?.getTime() ===
+                resource.uploadReservedAt.getTime() +
+                  30 * 24 * 60 * 60 * 1_000 &&
+              resource.contentExpiresAt.getTime() > observedNow.getTime());
+          if (
+            resource.contentSource === "user_upload" &&
+            resource.contentDeletedAt === null &&
+            lifecycleIsValid
+          ) {
+            resource.uploadReservedAt ??= new Date(observedNow);
+          }
+          return;
+        }
+        if ("uploadedAt" in values && "contentExpiresAt" in values) {
+          if (
+            resource.contentSource === "user_upload" &&
+            resource.contentDeletedAt === null &&
+            resource.uploadReservedAt &&
+            resource.uploadReservedAt.getTime() + 30 * 24 * 60 * 60 * 1_000 >
+              observedNow.getTime() &&
+            ((resource.uploadedAt === null &&
+              resource.contentExpiresAt === null) ||
+              (resource.uploadedAt?.getTime() ===
+                resource.uploadReservedAt.getTime() &&
+                resource.contentExpiresAt?.getTime() ===
+                  resource.uploadReservedAt.getTime() +
+                    30 * 24 * 60 * 60 * 1_000))
+          ) {
+            resource.uploadedAt ??= new Date(resource.uploadReservedAt);
+            resource.contentExpiresAt ??= new Date(
+              resource.uploadReservedAt.getTime() + 30 * 24 * 60 * 60 * 1_000,
+            );
+          }
+          return;
+        }
+        if ("contentDeletedAt" in values) {
+          if (resource.contentSource === "user_upload") {
+            resource.contentDeletedAt ??= new Date(observedNow);
+          }
+          return;
+        }
+        if (typeof values.contentSource === "string") {
+          resource.contentSource = values.contentSource as
+            | "user_upload"
+            | "assistant_output";
+        }
+        if (typeof values.parentTaskId === "string") {
+          resource.parentTaskId = values.parentTaskId;
+        }
+      },
+    }),
+  });
+  const select = () => ({
+    from: () => ({
+      where: () => ({ limit: async () => [resource] }),
+    }),
+  });
+  return {
+    update,
+    select,
+    resource,
+    setNow(now: Date) {
+      observedNow = now;
+    },
+  };
+}
+
+describe("presales file retention ledger", () => {
+  it("reserves before PUT, finalizes after 2xx, and never moves the clock", async () => {
+    const executor = createPresalesFileRetentionExecutor({
+      contentSource: "user_upload",
+    });
+    const uploadedAt = new Date("2026-08-04T08:00:00.000Z");
+    executor.setNow(uploadedAt);
+
+    const first = await reservePresalesFileUploadRetention(
+      {
+        fileId: "file-1",
+        apiCredentialId: "credential-1",
+        now: uploadedAt,
+      },
+      executor,
+    );
+    expect(first).toMatchObject({
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+      uploadedAt: null,
+      contentExpiresAt: null,
+      contentDeletedAt: null,
+    });
+
+    const finalized = await finalizePresalesFileUploadRetention(
+      {
+        fileId: "file-1",
+        apiCredentialId: "credential-1",
+        now: new Date("2026-08-04T08:01:00.000Z"),
+      },
+      executor,
+    );
+    expect(finalized).toMatchObject({
+      uploadReservedAt: uploadedAt,
+      uploadedAt,
+      contentExpiresAt: new Date("2026-09-03T08:00:00.000Z"),
+    });
+
+    const retryAt = new Date("2026-08-14T08:00:00.000Z");
+    executor.setNow(retryAt);
+    const retry = await reservePresalesFileUploadRetention(
+      {
+        fileId: "file-1",
+        apiCredentialId: "credential-1",
+        now: retryAt,
+      },
+      executor,
+    );
+    expect(retry.uploadReservedAt).toEqual(uploadedAt);
+    expect(retry.uploadedAt).toEqual(uploadedAt);
+    expect(retry.contentExpiresAt).toEqual(
+      new Date("2026-09-03T08:00:00.000Z"),
+    );
+  });
+
+  it("rejects expired, deleted, and assistant-output rows without renewing them", async () => {
+    const uploadedAt = new Date("2026-07-05T08:00:00.000Z");
+    const contentExpiresAt = new Date("2026-08-04T08:00:00.000Z");
+    const expired = createPresalesFileRetentionExecutor({
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+      uploadedAt,
+      contentExpiresAt,
+    });
+    expired.setNow(contentExpiresAt);
+    await expect(
+      reservePresalesFileUploadRetention(
+        {
+          fileId: "file-1",
+          apiCredentialId: "credential-1",
+          now: contentExpiresAt,
+        },
+        expired,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(expired.resource).toMatchObject({ uploadedAt, contentExpiresAt });
+
+    const expiredReservation = createPresalesFileRetentionExecutor({
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+    });
+    expiredReservation.setNow(contentExpiresAt);
+    await expect(
+      reservePresalesFileUploadRetention(
+        {
+          fileId: "file-1",
+          apiCredentialId: "credential-1",
+          now: contentExpiresAt,
+        },
+        expiredReservation,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(expiredReservation.resource).toMatchObject({
+      uploadReservedAt: uploadedAt,
+      uploadedAt: null,
+      contentExpiresAt: null,
+    });
+
+    const deleted = createPresalesFileRetentionExecutor({
+      contentSource: "user_upload",
+      uploadReservedAt: uploadedAt,
+      uploadedAt,
+      contentExpiresAt: new Date("2026-09-03T08:00:00.000Z"),
+      contentDeletedAt: new Date("2026-08-04T07:00:00.000Z"),
+    });
+    await expect(
+      reservePresalesFileUploadRetention(
+        {
+          fileId: "file-1",
+          apiCredentialId: "credential-1",
+          now: new Date("2026-08-04T08:00:00.000Z"),
+        },
+        deleted,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+
+    const output = createPresalesFileRetentionExecutor({
+      contentSource: "assistant_output",
+    });
+    await expect(
+      reservePresalesFileUploadRetention(
+        {
+          fileId: "file-1",
+          apiCredentialId: "credential-1",
+          now: new Date("2026-08-04T08:00:00.000Z"),
+        },
+        output,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(output.resource.contentSource).toBe("assistant_output");
+    expect(output.resource.uploadedAt).toBeNull();
+  });
+
+  it("records the first physical deletion time without moving it", async () => {
+    const executor = createPresalesFileRetentionExecutor({
+      contentSource: "user_upload",
+      uploadReservedAt: new Date("2026-07-05T08:00:00.000Z"),
+      uploadedAt: new Date("2026-07-05T08:00:00.000Z"),
+      contentExpiresAt: new Date("2026-08-04T08:00:00.000Z"),
+    });
+    const firstDeletedAt = new Date("2026-08-04T08:05:00.000Z");
+    executor.setNow(firstDeletedAt);
+    const first = await markPresalesFileContentDeleted(
+      {
+        fileId: "file-1",
+        apiCredentialId: "credential-1",
+        now: firstDeletedAt,
+      },
+      executor,
+    );
+    expect(first.contentDeletedAt).toEqual(firstDeletedAt);
+
+    const retryAt = new Date("2026-08-04T09:00:00.000Z");
+    executor.setNow(retryAt);
+    const retry = await markPresalesFileContentDeleted(
+      { fileId: "file-1", now: retryAt },
+      executor,
+    );
+    expect(retry.contentDeletedAt).toEqual(firstDeletedAt);
+  });
+
+  it("accepts only file provenance and never changes an existing source", async () => {
+    await expect(
+      recordPresalesUpstreamResource(
+        {
+          apiCredentialId: "credential-1",
+          kind: "task",
+          upstreamId: "task-1",
+          contentSource: "user_upload",
+        },
+        {},
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(
+      recordPresalesUpstreamResource(
+        {
+          apiCredentialId: "credential-1",
+          kind: "file",
+          upstreamId: "file-1",
+          contentSource: "invalid" as never,
+        },
+        {},
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+
+    const output = createPresalesFileRetentionExecutor({
+      contentSource: "assistant_output",
+    });
+    await expect(
+      recordPresalesUpstreamResource(
+        {
+          apiCredentialId: "credential-1",
+          kind: "file",
+          upstreamId: "file-1",
+          contentSource: "user_upload",
+        },
+        output,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+
+    const unclassified = createPresalesFileRetentionExecutor();
+    const stillUnknown = await recordPresalesUpstreamResource(
+      {
+        apiCredentialId: "credential-1",
+        kind: "file",
+        upstreamId: "file-1",
+        contentSource: "assistant_output",
+      },
+      unclassified,
+    );
+    expect(stillUnknown.contentSource).toBeNull();
   });
 });
 
@@ -612,6 +940,26 @@ describe("presales migrations", () => {
     );
     expect(idempotencySql).toContain(
       "CONSTRAINT `presales_task_requests_key_uq` UNIQUE(`keyHash`)",
+    );
+    const retentionSql = readFileSync(
+      resolve(process.cwd(), "drizzle", "0054_file_content_retention.sql"),
+      "utf8",
+    );
+    expect(retentionSql).toContain(
+      "ALTER TABLE `presales_upstream_resources` ADD `contentSource` enum('user_upload','assistant_output')",
+    );
+    for (const column of [
+      "uploadReservedAt",
+      "uploadedAt",
+      "contentExpiresAt",
+      "contentDeletedAt",
+    ]) {
+      expect(retentionSql).toContain(
+        `ALTER TABLE \`presales_upstream_resources\` ADD \`${column}\` timestamp`,
+      );
+    }
+    expect(retentionSql).toContain(
+      "CREATE INDEX `presales_upstream_resources_content_expiry_idx` ON `presales_upstream_resources` (`kind`,`contentSource`,`uploadReservedAt`,`contentExpiresAt`,`contentDeletedAt`,`id`)",
     );
   });
 });

@@ -119,7 +119,23 @@ export function validateProductionRuntimeEnvironment(env = process.env) {
     }
   }
 
-  const secrets = secretNames.map((name) => env[name]);
+  // Keep this precedence identical to resolveDownloadTokenSecret(). A short
+  // dedicated value must not be silently rescued by JWT_SECRET because the
+  // runtime resolver would select the dedicated value and fail after rollout.
+  const downloadTokenSecret =
+    (env.FRONTMIND_DOWNLOAD_TOKEN_SECRET || "").trim() ||
+    (env.JWT_SECRET || "").trim();
+  if (
+    downloadTokenSecret.length < 32 ||
+    /^(?:replace|placeholder|changeme|test|example)/iu.test(downloadTokenSecret)
+  ) {
+    fail("FRONTMIND_DOWNLOAD_TOKEN_SECRET_VALUE_INVALID");
+  }
+
+  const secrets = [
+    ...secretNames.map((name) => env[name]),
+    downloadTokenSecret,
+  ];
   if (new Set(secrets).size !== secrets.length) {
     fail("PRODUCTION_SECRETS_NOT_UNIQUE");
   }

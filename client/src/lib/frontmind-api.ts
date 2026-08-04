@@ -17,6 +17,7 @@ import type { ResponseLogicDraft } from "@shared/response-logic";
 import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progress";
 import { stripKnowledgeBaseProtocolPayloads } from "@shared/knowledge-base-output";
 import { userFacingErrorMessage } from "@/lib/user-facing-error";
+import { assertChatAttachmentSizes } from "@/lib/attachment-files";
 import {
   knowledgeBaseObservationFromPayload,
   type KnowledgeBaseObservationDto,
@@ -1133,7 +1134,17 @@ export async function uploadFile(
     maxDelay: 10000,
   },
   options: { captureLocalCopy?: boolean; captureFilename?: string } = {},
-): Promise<{ fileId: string; filename: string }> {
+): Promise<{
+  fileId: string;
+  filename: string;
+  uploadedAt?: number;
+  expiresAt?: number;
+}> {
+  // This is the single browser upload boundary, including non-chat product
+  // surfaces. Reject before creating the upstream record so an oversized
+  // selection cannot leave an upstream-only orphan.
+  assertChatAttachmentSizes([file]);
+  const captureLocalCopy = options.captureLocalCopy ?? true;
   if (onProgress) onProgress(0);
   // File-record creation is intentionally outside the retry loop. Repeating
   // POST /v1/files would orphan records and could bind retries to different
@@ -1148,9 +1159,10 @@ export async function uploadFile(
     throw new Error(`创建文件记录失败：未获取到文件 ID`);
   }
 
+  let retentionReceipt: UploadRetentionReceipt | undefined;
   try {
-    if (options.captureLocalCopy) {
-      await uploadFileToUrlViaProxy(
+    if (captureLocalCopy) {
+      retentionReceipt = await uploadFileToUrlViaProxy(
         fileRecord.upload_url,
         file,
         onProgress,
@@ -1169,11 +1181,11 @@ export async function uploadFile(
     let lastProxyError: unknown = directErr;
     for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt += 1) {
       try {
-        await uploadFileToUrlViaProxy(
+        retentionReceipt = await uploadFileToUrlViaProxy(
           fileRecord.upload_url,
           file,
           onProgress,
-          options.captureLocalCopy ? fileRecord.id : undefined,
+          captureLocalCopy ? fileRecord.id : undefined,
           options.captureFilename,
         );
         lastProxyError = undefined;
@@ -1202,8 +1214,14 @@ export async function uploadFile(
   return {
     fileId: fileRecord.id,
     filename: file.name,
+    ...retentionReceipt,
   };
 }
+
+type UploadRetentionReceipt = {
+  uploadedAt: number;
+  expiresAt: number;
+};
 
 /**
  * Fallback: upload file through server proxy when direct S3 CORS fails.
@@ -1214,7 +1232,7 @@ async function uploadFileToUrlViaProxy(
   onProgress?: (percent: number) => void,
   captureFileId?: string,
   captureFilename?: string,
-): Promise<void> {
+): Promise<UploadRetentionReceipt | undefined> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const params = new URLSearchParams({ target: uploadUrl });
@@ -1255,7 +1273,35 @@ async function uploadFileToUrlViaProxy(
     xhr.addEventListener("load", () => {
       watchdog.clear();
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve();
+        if (!captureFileId) {
+          resolve(undefined);
+          return;
+        }
+        try {
+          const value = JSON.parse(xhr.responseText || "{}") as {
+            uploadedAt?: unknown;
+            expiresAt?: unknown;
+          };
+          if (
+            typeof value.uploadedAt !== "number" ||
+            !Number.isFinite(value.uploadedAt) ||
+            typeof value.expiresAt !== "number" ||
+            !Number.isFinite(value.expiresAt) ||
+            value.expiresAt <= value.uploadedAt
+          ) {
+            throw new Error("文件保留期限响应无效");
+          }
+          resolve({
+            uploadedAt: value.uploadedAt,
+            expiresAt: value.expiresAt,
+          });
+        } catch (error) {
+          reject(
+            error instanceof Error
+              ? error
+              : new Error("文件保留期限响应无效"),
+          );
+        }
       } else {
         const upstreamMessage = (() => {
           try {

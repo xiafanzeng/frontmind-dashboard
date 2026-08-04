@@ -37,6 +37,7 @@ const mocks = vi.hoisted(() => ({
   normalizedKnowledgeBaseUploadFilename: vi.fn(),
   normalizedKnowledgeBaseUploadMimeType: vi.fn(),
   sha256UploadFile: vi.fn(),
+  assertChatAttachmentSizes: vi.fn(),
   requireCurrentFrontMindBuild: vi.fn(),
 }));
 
@@ -64,6 +65,7 @@ vi.mock("@/lib/attachment-files", () => ({
   normalizedKnowledgeBaseUploadMimeType:
     mocks.normalizedKnowledgeBaseUploadMimeType,
   sha256UploadFile: mocks.sha256UploadFile,
+  assertChatAttachmentSizes: mocks.assertChatAttachmentSizes,
   ZIP_REFERENCE_PROMPT:
     "附件 ZIP 中包含用户上传的原始参考图片，请解压后读取图片内容作为参考。",
 }));
@@ -210,6 +212,7 @@ describe("useSendMessage", () => {
     mocks.sha256UploadFile.mockImplementation(async (file: File) =>
       file.name === "facts.pdf" ? "a".repeat(64) : "b".repeat(64),
     );
+    mocks.assertChatAttachmentSizes.mockImplementation(() => undefined);
     mocks.requireCurrentFrontMindBuild.mockResolvedValue(true);
     mocks.createKnowledgeBaseTurnTask.mockResolvedValue({
       id: "test-kb-task-id",
@@ -255,6 +258,8 @@ describe("useSendMessage", () => {
     mocks.uploadFile.mockImplementation(async (file: File) => ({
       fileId: `file-${file.name}`,
       filename: file.name,
+      uploadedAt: 1_000,
+      expiresAt: 2_593_000_000,
     }));
     mocks.fileToBase64.mockResolvedValue("data:text/plain;base64,dGVzdA==");
     mocks.isImageUpload.mockReturnValue(false);
@@ -613,6 +618,45 @@ describe("useSendMessage", () => {
         attachmentManifest: [expect.objectContaining({ filename: normalized })],
       }),
     );
+  });
+
+  it("captures local copies for ordinary agent uploads", async () => {
+    const file = new File(["report"], "report.pdf", {
+      type: "application/pdf",
+    });
+    mockPreparedFiles([file]);
+
+    const { result } = renderHook(() => useSendMessage());
+    await act(async () => {
+      await result.current.sendMessage("请阅读", [file]);
+    });
+
+    expect(mocks.uploadFile).toHaveBeenCalledWith(
+      file,
+      expect.any(Function),
+      expect.any(Object),
+      { captureLocalCopy: true },
+    );
+  });
+
+  it("rejects an oversized attachment before preparation or upload", async () => {
+    const file = new File(["x"], "oversized.pdf", {
+      type: "application/pdf",
+    });
+    mocks.assertChatAttachmentSizes.mockImplementationOnce(() => {
+      throw new Error("文件“oversized.pdf”不能超过 100 MB");
+    });
+
+    const { result } = renderHook(() => useSendMessage());
+    let sent = true;
+    await act(async () => {
+      sent = await result.current.sendMessage("请阅读", [file]);
+    });
+
+    expect(sent).toBe(false);
+    expect(mocks.prepareUploadFiles).not.toHaveBeenCalled();
+    expect(mocks.uploadFile).not.toHaveBeenCalled();
+    expect(mocks.createTask).not.toHaveBeenCalled();
   });
 
   it("silently completes an old browser attachment reservation through the upload-first turn route", async () => {

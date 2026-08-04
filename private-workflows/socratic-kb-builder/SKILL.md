@@ -80,23 +80,16 @@ status and related `assetIds`. Product leaves also record one
 Formal prose uses natural declarative facts, useful headings, tables and lists.
 Supported negative facts and service restrictions remain when stated neutrally.
 
-Never put any of the following in formal prose or in the customer-facing turn:
+The customer-facing turn contains only the complete current leaf body. Keep
+collection progress, standalone acknowledgements, internal reasoning, tool or
+prompt narration, source/reference appendices, verification notes,
+confirmation questions and workflow instructions outside that body.
 
-- task or collection process, including “本轮”“本次采集”“本包”“本知识库”,
-  extraction failures, evidence sufficiency, verification status or source
-  selection;
-- standalone collection/progress acknowledgements such as “正在采集”, “处理中”
-  or “稍后生成”; the initial turn may end only after the first complete leaf,
-  full manifest and validated official Logo have all been returned;
-- filler or intermediate wording, including “补充说明”“第 N 个内容节点” and
-  “本轮整理结果”;
-- reader, customer, buyer or compliance advice, including “客户应”“采购方应”,
-  “仍应”“建议”“尽调”“合规审查”“不能仅凭”“不宜直接转换”“不能外推”;
-- reasoning about how company claims should be interpreted, converted,
-  observed, audited or verified;
-- internal thought, tool plans, prompt descriptions or writing decisions.
-- source/reference lists, numbered citation markers, external citation links,
-  unresolved-item appendices, confirmation questions or action instructions.
+This is authoring guidance, not a vocabulary-based runtime gate. Ordinary
+customer-facing prose is never accepted or rejected because it contains a
+particular word or phrase. Runtime progression depends on the typed protocol
+envelopes, active operation identity, revision, current leaf and non-empty
+projected body.
 
 End the visible turn immediately after the actual leaf body and, on the
 initial first-leaf turn only, the validated managed Logo. Never emit a

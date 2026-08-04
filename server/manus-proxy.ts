@@ -6,7 +6,7 @@
  * Also provides:
  * - /proxy-upload: forwards file uploads to S3 presigned URLs
  * - /proxy-download: proxies binary download from any external URL (S3 etc.)
- * - /v1/files/:fileId: resolves file metadata then downloads binary from S3
+ * - /v1/files/:fileId: resolves owned local/upstream file content
  * - /v1/files/:fileId/content: same as above (compat alias)
  *
  * SANITIZATION:
@@ -23,7 +23,6 @@
 import { Router, Request, Response } from "express";
 import axios from "axios";
 import zlib from "zlib";
-import { randomUUID } from "crypto";
 import fs from "node:fs/promises";
 import {
   getFrontMindCredentials,
@@ -51,35 +50,29 @@ import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
 import { collectUpstreamOutputFileIds } from "./upstream-output-resources";
 import {
+  readStoredPresalesFile,
   stagePresalesFileContent,
   type StagedPresalesFile,
 } from "./presales-file-store";
+import {
+  OwnedFileContentError,
+  ownedFileContentResolver,
+  type ResolvedOwnedFileContent,
+} from "./owned-file-content-resolver";
+import {
+  fileContentExpiryFromUpload,
+  markUploadedFileRetention,
+} from "./file-content-retention";
+import {
+  bindDownloadUrlToProject,
+  createSignedDownloadToken,
+  resolveDownloadProjectContext,
+  SignedDownloadTokenError,
+  verifySignedDownloadToken,
+} from "./signed-download-token";
 
 const router = Router();
 
-// In-memory cache for file metadata (fileId -> { upload_url, filename })
-// TTL: 10 minutes
-const fileMetaCache = new Map<
-  string,
-  { upload_url: string; filename: string; cachedAt: number }
->();
-const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
-
-// Short-lived direct download token cache. This lets the browser download via a
-// normal same-origin URL, avoiding slow fetch->Blob->ObjectURL downloads and
-// reducing browser "unsafe download" prompts caused by blob/data URLs.
-const downloadTokenCache = new Map<
-  string,
-  {
-    fileId: string;
-    userId: number;
-    credentialId: string;
-    projectAssignmentId: string | null;
-    apiKey: string;
-    baseUrl: string;
-    createdAt: number;
-  }
->();
 const DOWNLOAD_TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
 export const MAX_EXTERNAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 const MAX_CAPTURED_UPLOAD_BYTES = 100 * 1024 * 1024;
@@ -91,6 +84,16 @@ export class ExternalDownloadTooLargeError extends Error {
     super("External download exceeds the permitted size");
     this.name = "ExternalDownloadTooLargeError";
   }
+}
+
+export function boundedFileDownloadTokenExpiry(
+  now: number,
+  sourceExpiresAt?: number,
+) {
+  return Math.min(
+    now + DOWNLOAD_TOKEN_TTL,
+    sourceExpiresAt ?? Number.POSITIVE_INFINITY,
+  );
 }
 
 export function isPrivateUpstreamCollectionRequest(
@@ -118,33 +121,6 @@ function safeUrlForLog(value: string) {
   } catch {
     return "[invalid URL]";
   }
-}
-
-function cleanupExpiredDownloadTokens() {
-  const now = Date.now();
-  downloadTokenCache.forEach((data, token) => {
-    if (now - data.createdAt > DOWNLOAD_TOKEN_TTL) {
-      downloadTokenCache.delete(token);
-    }
-  });
-}
-
-function getCachedMeta(
-  fileId: string,
-): { upload_url: string; filename: string } | null {
-  const entry = fileMetaCache.get(fileId);
-  if (entry && Date.now() - entry.cachedAt < CACHE_TTL) {
-    return { upload_url: entry.upload_url, filename: entry.filename };
-  }
-  fileMetaCache.delete(fileId);
-  return null;
-}
-
-function setCachedMeta(
-  fileId: string,
-  meta: { upload_url: string; filename: string },
-) {
-  fileMetaCache.set(fileId, { ...meta, cachedAt: Date.now() });
 }
 
 /**
@@ -2371,11 +2347,72 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
     console.log(`[FrontMind Proxy] Proxy-upload response: ${response.status}`);
     if (response.status >= 200 && response.status < 300) {
       if (stagedCapture) {
-        await stagedCapture.commit({
-          filename: captureFilename,
-          mimeType: realContentType,
+        const uploadedAt = new Date();
+        let retentionUploadedAt = uploadedAt;
+        let localCommitError: unknown;
+        let retentionLifecycle:
+          | Awaited<ReturnType<typeof markUploadedFileRetention>>
+          | undefined;
+        try {
+          await stagedCapture.commit({
+            filename: captureFilename,
+            mimeType: realContentType,
+            uploadedAt,
+            contentExpiresAt: fileContentExpiryFromUpload(uploadedAt),
+          });
+          stagedCapture = null;
+        } catch (error) {
+          // The upstream PUT has already succeeded. Register its hard deadline
+          // even when the local volume fails so the ownership row can never
+          // remain an immortal null-retention orphan; a later read may recover
+          // the bytes through the authenticated /content endpoint.
+          localCommitError = error;
+        }
+        try {
+          // A retry can PUT the same opaque fileId after the first response or
+          // DB mark was lost. The manifest is the immutable local ledger, so a
+          // later attempt must inherit its original clock instead of receiving
+          // another 30 days.
+          const storedLifecycle = await readStoredPresalesFile(captureFileId);
+          retentionUploadedAt = storedLifecycle?.uploadedAt ?? uploadedAt;
+        } catch {
+          // A damaged local copy is handled by the authenticated resolver. The
+          // DB clock still starts at this successful PUT when no usable
+          // manifest lifecycle can be recovered.
+        }
+        try {
+          retentionLifecycle = await markUploadedFileRetention({
+            userId: req.frontmindUser!.id,
+            fileId: captureFileId,
+            uploadedAt: retentionUploadedAt,
+          });
+        } catch (error) {
+          // The committed manifest already carries the immutable upload clock.
+          // Keep it as a durable repair ledger: the hourly filesystem sweep
+          // will COALESCE the missing DB fields before the file can be removed.
+          // Deleting it here would leave an upstream-only, null-retention row.
+          console.error(
+            "[FrontMind Proxy] Uploaded file retention registration failed",
+            error,
+          );
+          return res.status(503).json({
+            error: {
+              message: "文件已上传，但保留期限登记失败，请稍后重试",
+              code: "FILE_RETENTION_MARK_FAILED",
+            },
+          });
+        }
+        if (localCommitError) throw localCommitError;
+        if (
+          !retentionLifecycle?.uploadedAt ||
+          !retentionLifecycle.contentExpiresAt
+        ) {
+          throw new Error("FILE_RETENTION_LIFECYCLE_MISSING");
+        }
+        return res.status(200).json({
+          uploadedAt: retentionLifecycle.uploadedAt.getTime(),
+          expiresAt: retentionLifecycle.contentExpiresAt.getTime(),
         });
-        stagedCapture = null;
       }
       res.status(response.status).send("");
       return;
@@ -2398,6 +2435,23 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
         error: {
           message: "外部文件链接不可用",
           code: "INVALID_EXTERNAL_URL",
+        },
+      });
+    }
+    const storageFailure =
+      error?.message === "PRESALES_FILE_STORAGE_INSUFFICIENT" ||
+      error?.message === "PRESALES_FILE_STORAGE_NOT_WRITABLE" ||
+      error?.code === "ENOSPC" ||
+      error?.code === "EACCES";
+    if (storageFailure) {
+      console.error(
+        "[FrontMind Proxy] ALERT durable upload storage unavailable",
+        safeErrorForLog(error),
+      );
+      return res.status(507).json({
+        error: {
+          message: "文件持久存储空间不足或不可写，请联系管理员",
+          code: "UPLOAD_STORAGE_UNAVAILABLE",
         },
       });
     }
@@ -2545,174 +2599,112 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
   }
 });
 
-/**
- * Fetch file metadata from the FrontMind API.
- * Returns { upload_url, filename } or null if not found.
- */
-async function fetchFileMetadata(
-  baseUrl: string,
-  fileId: string,
-  apiKey: string,
-): Promise<{ upload_url: string; filename: string } | null> {
-  // Check cache first
-  const cached = getCachedMeta(fileId);
-  if (cached) {
-    console.log(`[FrontMind Proxy] File metadata cache hit for ${fileId}`);
-    return cached;
-  }
-
-  const cleanBaseUrl = baseUrl.replace(/\/$/, "");
-  const metadataUrl = `${cleanBaseUrl}/v1/files/${fileId}`;
-
-  console.log(`[FrontMind Proxy] Fetching file metadata: GET ${metadataUrl}`);
-
-  const response = await axios.get(metadataUrl, {
-    headers: {
-      API_KEY: apiKey,
-      Authorization: `Bearer ${apiKey}`,
-    },
-    timeout: 30000,
-    validateStatus: () => true,
-  });
-
-  if (response.status !== 200) {
-    console.error(
-      `[FrontMind Proxy] File metadata request failed: ${response.status}`,
-    );
-    return null;
-  }
-
-  const data = response.data;
-  console.log(
-    `[FrontMind Proxy] File metadata: id=${data.id}, filename=${data.filename}, status=${data.status}, has_upload_url=${!!data.upload_url}`,
-  );
-
-  if (data.upload_url) {
-    const meta = {
-      upload_url: data.upload_url,
-      filename: data.filename || fileId,
-    };
-    setCachedMeta(fileId, meta);
-    return meta;
-  }
-
-  // If no upload_url in metadata, return filename at least
-  return { upload_url: "", filename: data.filename || fileId };
-}
-
-/**
- * Download binary file content from S3 URL and stream to response.
- * Text-based files and PDFs are sanitized to replace Manus -> FrontMind.
- */
-async function downloadFromS3(
+function sendOwnedFileContentError(
   res: Response,
-  s3Url: string,
-  filename: string,
-  disposition: "inline" | "attachment" = "inline",
-): Promise<void> {
-  const safeS3Url = assertSafeExternalUrl(s3Url);
-  console.log(
-    `[FrontMind Proxy] Downloading from object storage: ${safeUrlForLog(safeS3Url)}`,
-  );
-
-  const response = await fetchBoundedExternalDownload(safeS3Url, {
-    ...safeExternalRequestOptions,
-    timeout: 120000,
-    validateStatus: () => true,
+  error: OwnedFileContentError,
+) {
+  return res.status(error.statusCode).json({
+    error: {
+      message: error.message,
+      code: error.code,
+      retryable: error.retryable,
+      recoveryAction: error.recoveryAction,
+      expiresAt: error.expiresAt,
+    },
   });
-
-  console.log(
-    `[FrontMind Proxy] S3 download response: ${response.status}, content-type: ${response.headers["content-type"]}, size: ${response.data?.length || 0}`,
-  );
-
-  if (response.status !== 200) {
-    res.status(response.status);
-    res.json({
-      error: {
-        message: `S3 download failed with status ${response.status}`,
-        code: "S3_DOWNLOAD_ERROR",
-      },
-    });
-    return;
-  }
-
-  res.status(200);
-
-  // Sanitize file content (text files and PDFs - with magic byte detection)
-  const rawBuffer = Buffer.from(response.data);
-  const upstreamContentType = responseHeaderValue(
-    response.headers["content-type"],
-  );
-  const finalFilename = ensureFilenameMatchesContent(
-    filename,
-    rawBuffer,
-    upstreamContentType,
-  );
-  const finalContentType = normalizeContentTypeForBuffer(
-    finalFilename,
-    rawBuffer,
-    upstreamContentType,
-  );
-
-  // Forward safe cache validators only. Content-Type and Content-Disposition are
-  // controlled locally so PDF previews remain inline even when S3 says attachment,
-  // and UUID-like filenames are repaired to include .pdf when magic bytes prove it.
-  for (const header of ["cache-control", "etag", "last-modified"]) {
-    const value = responseHeaderValue(response.headers[header]);
-    if (value) res.setHeader(header, value);
-  }
-  res.setHeader("content-type", finalContentType);
-  setSafeContentDisposition(res, disposition, finalFilename);
-
-  const { buffer: sanitizedBuffer } = await sanitizeFileBuffer(
-    rawBuffer,
-    finalFilename,
-    finalContentType,
-  );
-
-  // Update content-length after sanitization
-  res.setHeader("content-length", String(sanitizedBuffer.length));
-
-  res.send(sanitizedBuffer);
 }
 
-/**
- * Core file download handler.
- * Strategy:
- * 1. GET /v1/files/:fileId to get metadata (JSON with upload_url)
- * 2. Use upload_url (S3 presigned URL) to download binary content
- * 3. Stream binary content back to the client with correct content-type
- */
+async function readResolvedOwnedContent(resolved: ResolvedOwnedFileContent) {
+  const rawBuffer = await readBoundedExternalDownload(
+    resolved.stream,
+    resolved.sizeBytes === undefined
+      ? {}
+      : { "content-length": String(resolved.sizeBytes) },
+    MAX_CAPTURED_UPLOAD_BYTES,
+  );
+  if (rawBuffer.length < 1) {
+    throw new OwnedFileContentError(
+      "SOURCE_CONTENT_INVALID",
+      "文件内容为空，请重新上传",
+      {
+        statusCode: 422,
+        retryable: false,
+        recoveryAction: "reupload",
+        expiresAt: resolved.expiresAt,
+      },
+    );
+  }
+  if (
+    resolved.sizeBytes !== undefined &&
+    rawBuffer.length !== resolved.sizeBytes
+  ) {
+    throw new OwnedFileContentError(
+      "SOURCE_DOWNLOAD_FAILED",
+      "文件内容读取不完整，请重试",
+      {
+        statusCode: 503,
+        retryable: true,
+        recoveryAction: "retry",
+        expiresAt: resolved.expiresAt,
+      },
+    );
+  }
+  return rawBuffer;
+}
+
+/** Local captured bytes first, then the authenticated upstream /content API. */
 async function handleFileDownload(
   res: Response,
-  baseUrl: string,
   fileId: string,
-  apiKey: string,
   disposition: "inline" | "attachment" = "inline",
   ownerUserId?: number,
   credentialId?: string,
   projectAssignmentId?: string | null,
 ): Promise<void> {
-  // Step 1: Get file metadata
-  const meta = await fetchFileMetadata(baseUrl, fileId, apiKey);
-
-  if (!meta) {
-    res.status(404).json({
-      error: {
-        message: `File not found: ${fileId}`,
-        code: "FILE_NOT_FOUND",
+  // Owned bytes and prepared redirects share the immutable source deadline;
+  // cached responses must never remain reusable past that authorization point.
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  if (!ownerUserId || !credentialId) {
+    throw new OwnedFileContentError(
+      "SOURCE_FORBIDDEN",
+      "文件不属于当前账号或客户项目",
+      {
+        statusCode: 403,
+        retryable: false,
+        recoveryAction: "contact_admin",
       },
-    });
-    return;
+    );
   }
+  const resolved = await ownedFileContentResolver.resolve({
+    ownerUserId,
+    fileId,
+    projectAssignmentId,
+    expectedCredentialId: credentialId,
+  });
+  const rawBuffer = await readResolvedOwnedContent(resolved);
+  const finalFilename = ensureFilenameMatchesContent(
+    resolved.filename || fileId,
+    rawBuffer,
+    resolved.mimeType,
+  );
+  const finalContentType = normalizeContentTypeForBuffer(
+    finalFilename,
+    rawBuffer,
+    resolved.mimeType,
+  );
 
-  if (isPdfFile(meta.filename) && ownerUserId && credentialId) {
+  if (
+    (isPdfFile(finalFilename) || finalContentType === "application/pdf") &&
+    ownerUserId &&
+    credentialId
+  ) {
     const asset = await preparedFileService.registerFile({
       ownerUserId,
       credentialId,
       projectAssignmentId,
       fileId,
-      filename: meta.filename,
+      filename: finalFilename,
+      expiresAt: resolved.expiresAt,
     });
     if (asset.status !== "ready") {
       res.status(202).json(asset);
@@ -2722,94 +2714,16 @@ async function handleFileDownload(
     res.redirect(307, `${asset.contentUrl}${suffix}`);
     return;
   }
-
-  if (!meta.upload_url) {
-    // No S3 URL available - try a direct download from the API as last resort
-    console.warn(
-      `[FrontMind Proxy] No upload_url for file ${fileId}, trying direct API download`,
-    );
-
-    // Try the /content endpoint as a last resort (some API versions may support it)
-    const cleanBaseUrl = baseUrl.replace(/\/$/, "");
-    const contentUrl = `${cleanBaseUrl}/v1/files/${fileId}/content`;
-
-    try {
-      const response = await fetchBoundedExternalDownload(contentUrl, {
-        headers: {
-          API_KEY: apiKey,
-          Authorization: `Bearer ${apiKey}`,
-        },
-        timeout: 120000,
-        validateStatus: () => true,
-      });
-
-      const upstreamContentType = responseHeaderValue(
-        response.headers["content-type"],
-      );
-      if (
-        response.status === 200 &&
-        upstreamContentType !== "application/json"
-      ) {
-        console.log(
-          `[FrontMind Proxy] Direct /content download succeeded: ${response.status}`,
-        );
-        res.status(200);
-
-        for (const header of ["content-type", "content-disposition"]) {
-          const value = responseHeaderValue(response.headers[header]);
-          if (value) {
-            if (header === "content-disposition") {
-              res.setHeader(header, sanitizeText(value));
-            } else {
-              res.setHeader(header, value);
-            }
-          }
-        }
-
-        // Sanitize file content (text files and PDFs - with magic byte detection)
-        const rawBuffer = Buffer.from(response.data);
-        const finalFilename = ensureFilenameMatchesContent(
-          meta.filename,
-          rawBuffer,
-          upstreamContentType,
-        );
-        const finalContentType = normalizeContentTypeForBuffer(
-          finalFilename,
-          rawBuffer,
-          upstreamContentType,
-        );
-        res.setHeader("content-type", finalContentType);
-        setSafeContentDisposition(res, disposition, finalFilename);
-
-        const { buffer: sanitizedBuffer } = await sanitizeFileBuffer(
-          rawBuffer,
-          finalFilename,
-          finalContentType,
-        );
-
-        res.setHeader("content-length", String(sanitizedBuffer.length));
-        res.send(sanitizedBuffer);
-        return;
-      }
-    } catch (e: any) {
-      if (isExternalDownloadTooLarge(e)) throw e;
-      console.warn(
-        "[FrontMind Proxy] Direct /content download failed:",
-        safeErrorForLog(e, { secrets: [apiKey] }),
-      );
-    }
-
-    res.status(404).json({
-      error: {
-        message: `No download URL available for file ${fileId}`,
-        code: "NO_DOWNLOAD_URL",
-      },
-    });
-    return;
-  }
-
-  // Step 2: Download binary from S3
-  await downloadFromS3(res, meta.upload_url, meta.filename, disposition);
+  res.status(200);
+  res.setHeader("content-type", finalContentType);
+  setSafeContentDisposition(res, disposition, finalFilename);
+  const { buffer: sanitizedBuffer } = await sanitizeFileBuffer(
+    rawBuffer,
+    finalFilename,
+    finalContentType,
+  );
+  res.setHeader("content-length", String(sanitizedBuffer.length));
+  res.send(sanitizedBuffer);
 }
 
 /**
@@ -2817,9 +2731,9 @@ async function handleFileDownload(
  * The API key stays server-side in memory and is never placed into the URL.
  */
 router.post("/download-token", async (req: Request, res: Response) => {
-  const { apiKey, baseUrl } = getFrontMindCredentials(req);
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  const { apiKey } = getFrontMindCredentials(req);
   try {
-    cleanupExpiredDownloadTokens();
     const fileId = (req.body?.fileId as string) || "";
 
     if (!apiKey) {
@@ -2833,27 +2747,64 @@ router.post("/download-token", async (req: Request, res: Response) => {
       });
     }
 
-    const token = randomUUID();
     if (!req.frontmindUser || !req.frontmindCredential) {
       return res
         .status(401)
         .json({ error: { message: "请先登录", code: "UNAUTHORIZED" } });
     }
-    downloadTokenCache.set(token, {
+    const authorization = await ownedFileContentResolver.authorize({
+      ownerUserId: req.frontmindUser.id,
+      fileId,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+      expectedCredentialId: req.frontmindCredential.id,
+    });
+    const expiresAt = boundedFileDownloadTokenExpiry(
+      Date.now(),
+      authorization.expiresAt,
+    );
+    if (expiresAt <= Date.now()) {
+      throw new OwnedFileContentError(
+        "SOURCE_EXPIRED",
+        "文件已超过 30 天，请重新上传",
+        {
+          statusCode: 410,
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: authorization.expiresAt,
+        },
+      );
+    }
+    const token = createSignedDownloadToken({
+      kind: "owned_file",
       fileId,
       userId: req.frontmindUser.id,
       credentialId: req.frontmindCredential.id,
       projectAssignmentId:
         req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
-      apiKey,
-      baseUrl,
-      createdAt: Date.now(),
+      exp: expiresAt,
     });
+    const projectAssignmentId =
+      req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null;
     res.json({
-      downloadUrl: `/api/frontmind/download/${token}`,
-      expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL,
+      downloadUrl: bindDownloadUrlToProject(
+        `/api/frontmind/download/${token}`,
+        projectAssignmentId,
+      ),
+      expiresAt,
     });
   } catch (error: any) {
+    if (error instanceof SignedDownloadTokenError) {
+      return res.status(503).json({
+        error: {
+          message: "下载服务签名配置不可用，请联系管理员",
+          code: "DOWNLOAD_TOKEN_SERVICE_UNAVAILABLE",
+        },
+      });
+    }
+    if (error instanceof OwnedFileContentError) {
+      return sendOwnedFileContentError(res, error);
+    }
     console.error(
       "[FrontMind Proxy] Create download token error:",
       safeErrorForLog(error, { secrets: [apiKey] }),
@@ -2872,12 +2823,19 @@ router.post("/download-token", async (req: Request, res: Response) => {
  * download manager. It avoids client-side blob generation for AI output files.
  */
 router.get("/download/:token", async (req: Request, res: Response) => {
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
   let logSecret = "";
   try {
-    cleanupExpiredDownloadTokens();
-    const token = req.params.token;
-    const data = downloadTokenCache.get(token);
-    if (!data) {
+    let data;
+    try {
+      data = verifySignedDownloadToken(req.params.token, "owned_file");
+    } catch (error) {
+      if (
+        error instanceof SignedDownloadTokenError &&
+        error.code === "DOWNLOAD_TOKEN_SECRET_UNAVAILABLE"
+      ) {
+        throw error;
+      }
       return res.status(410).json({
         error: {
           message: "Download link expired",
@@ -2885,13 +2843,26 @@ router.get("/download/:token", async (req: Request, res: Response) => {
         },
       });
     }
-    logSecret = data.apiKey;
+    logSecret = req.frontmindCredential?.apiKey || "";
 
     if (!req.frontmindUser || req.frontmindUser.id !== data.userId) {
       return res.status(403).json({
         error: {
           message: "下载链接不属于当前账号",
           code: "DOWNLOAD_FORBIDDEN",
+        },
+      });
+    }
+    const downloadProjectAssignmentId = resolveDownloadProjectContext({
+      middleware: req.frontmindDeliveryProjectContext?.projectAssignmentId,
+      query: req.query.projectAssignmentId,
+      header: req.headers["x-delivery-project-assignment-id"],
+    });
+    if (data.projectAssignmentId !== downloadProjectAssignmentId) {
+      return res.status(403).json({
+        error: {
+          message: "下载链接不属于当前客户项目",
+          code: "DELIVERY_PROJECT_CONTEXT_FORBIDDEN",
         },
       });
     }
@@ -2910,19 +2881,32 @@ router.get("/download/:token", async (req: Request, res: Response) => {
       });
     }
 
-    // One-time use reduces accidental link sharing risk while keeping UX fast.
-    downloadTokenCache.delete(token);
     await handleFileDownload(
       res,
-      data.baseUrl,
       data.fileId,
-      data.apiKey,
       "attachment",
       data.userId,
       data.credentialId,
       data.projectAssignmentId,
     );
   } catch (error: any) {
+    if (error instanceof SignedDownloadTokenError) {
+      const secretUnavailable =
+        error.code === "DOWNLOAD_TOKEN_SECRET_UNAVAILABLE";
+      return res.status(secretUnavailable ? 503 : 410).json({
+        error: {
+          message: secretUnavailable
+            ? "下载服务签名配置不可用，请联系管理员"
+            : "下载链接已失效",
+          code: secretUnavailable
+            ? "DOWNLOAD_TOKEN_SERVICE_UNAVAILABLE"
+            : "DOWNLOAD_LINK_EXPIRED",
+        },
+      });
+    }
+    if (error instanceof OwnedFileContentError) {
+      return sendOwnedFileContentError(res, error);
+    }
     if (isExternalDownloadTooLarge(error)) {
       return sendExternalDownloadTooLarge(res);
     }
@@ -2941,27 +2925,26 @@ router.get("/download/:token", async (req: Request, res: Response) => {
 
 /**
  * Binary-safe file download endpoint.
- * Handles /v1/files/:fileId requests by:
- * 1. Fetching file metadata from the API
- * 2. Using the upload_url (S3) to download binary content
- * 3. Streaming binary content with correct headers
+ * Reads the authenticated local capture first and uses the upstream /content
+ * endpoint only as a recovery source. upload_url is an upload-only capability.
  */
 router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
-  const { apiKey, baseUrl } = getFrontMindCredentials(req);
+  const { apiKey } = getFrontMindCredentials(req);
   try {
     const fileId = req.params.fileId;
 
     await handleFileDownload(
       res,
-      baseUrl,
       fileId,
-      apiKey,
       "inline",
       req.frontmindUser?.id,
       req.frontmindCredential?.id,
       req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
     );
   } catch (error: any) {
+    if (error instanceof OwnedFileContentError) {
+      return sendOwnedFileContentError(res, error);
+    }
     if (isExternalDownloadTooLarge(error)) {
       return sendExternalDownloadTooLarge(res);
     }
@@ -2983,21 +2966,22 @@ router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
  * Handles /v1/files/:fileId/content requests.
  */
 router.get("/v1/files/:fileId/content", async (req: Request, res: Response) => {
-  const { apiKey, baseUrl } = getFrontMindCredentials(req);
+  const { apiKey } = getFrontMindCredentials(req);
   try {
     const fileId = req.params.fileId;
 
     await handleFileDownload(
       res,
-      baseUrl,
       fileId,
-      apiKey,
       "inline",
       req.frontmindUser?.id,
       req.frontmindCredential?.id,
       req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
     );
   } catch (error: any) {
+    if (error instanceof OwnedFileContentError) {
+      return sendOwnedFileContentError(res, error);
+    }
     if (isExternalDownloadTooLarge(error)) {
       return sendExternalDownloadTooLarge(res);
     }

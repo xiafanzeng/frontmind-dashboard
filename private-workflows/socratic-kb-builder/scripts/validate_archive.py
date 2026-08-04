@@ -89,45 +89,6 @@ REQUIRED_ROOT_FILES = {
     "09_media_assets/asset_inventory.md",
     "10_reference_assets/reference_asset_inventory.md",
 }
-FORBIDDEN_FORMAL_PHRASES = (
-    "第一方原始快照",
-    "第一方页面摘录",
-    "原始快照",
-    "页面摘录",
-    "raw evidence",
-    "page excerpt",
-)
-CUSTOMER_FORMAL_LEAKAGE = (
-    (
-        "intermediate or bulk filler wording",
-        re.compile(r"补充说明|第\s*[一二三四五六七八九十百\d]+\s*个内容节点|本轮整理结果", re.I),
-    ),
-    (
-        "task or collection process",
-        re.compile(
-            r"本轮|本次(?:采集|任务|构建|处理|检索|核验)|本包|本知识库|"
-            r"抽取失败|采集失败|已核验|证据不足|未形成.{0,16}核验",
-            re.I,
-        ),
-    ),
-    (
-        "customer or procurement advice",
-        re.compile(
-            r"(?:客户|采购方|读者|使用方|合作方).{0,12}(?:应|需|建议|可将)|"
-            r"仍应|采购(?:或|与)?合规审查|合规审查|正式尽调|不能仅凭|"
-            r"不宜(?:直接)?(?:转换|认定|视为)?|不能外推",
-            re.I,
-        ),
-    ),
-    (
-        "company-claim interpretation or model reasoning",
-        re.compile(
-            r"这些内容属于企业自我定义|企业自我定义|对客户而言|"
-            r"可将其落实为|说明组织意图与品牌取向",
-            re.I,
-        ),
-    ),
-)
 ASSET_TYPES = {"brand_identity", "customer_supplied"}
 DISPLAY_ROLES = {"badge", "inline"}
 USER_UPLOAD_SOURCE_MIME_TYPES = {
@@ -992,20 +953,6 @@ def validate_archive(path: Path) -> list[str]:
                         f"{doc_path} has {formal_count} formal characters; "
                         f"evidence-proportional requirement is "
                         f"{required_formal_characters}",
-                    )
-                normalized_formal_lower = unicodedata.normalize(
-                    "NFKC", countable_formal
-                ).lower()
-                for phrase in FORBIDDEN_FORMAL_PHRASES:
-                    validation.require(
-                        phrase.lower() not in normalized_formal_lower,
-                        f"{doc_path} formal content contains forbidden phrase: {phrase}",
-                    )
-                for label, pattern in CUSTOMER_FORMAL_LEAKAGE:
-                    validation.require(
-                        not bool(pattern.search(normalized_formal_lower)),
-                        f"{doc_path} formal content contains customer-facing "
-                        f"audit language or internal reasoning: {label}",
                     )
                 normalized_formal = re.sub(
                     r"\s+",

@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import JSZip from "jszip";
 import {
+  assertChatAttachmentSizes,
+  chatAttachmentSizeError,
+  MAX_CHAT_ATTACHMENT_BYTES,
   normalizedKnowledgeBaseUploadFilename,
   normalizedKnowledgeBaseUploadMimeType,
   prepareUploadFiles,
@@ -43,6 +46,23 @@ describe("attachment-files", () => {
     );
     expect(normalizedKnowledgeBaseUploadFilename("a".repeat(200))).toHaveLength(
       160,
+    );
+  });
+
+  it("enforces the shared 100 MB chat attachment boundary", () => {
+    const atLimit = { name: "at-limit.pdf", size: MAX_CHAT_ATTACHMENT_BYTES };
+    const oversized = {
+      name: "oversized.pdf",
+      size: MAX_CHAT_ATTACHMENT_BYTES + 1,
+    };
+
+    expect(chatAttachmentSizeError(atLimit)).toBeNull();
+    expect(chatAttachmentSizeError(oversized)).toBe(
+      "文件“oversized.pdf”不能超过 100 MB",
+    );
+    expect(() => assertChatAttachmentSizes([atLimit])).not.toThrow();
+    expect(() => assertChatAttachmentSizes([atLimit, oversized])).toThrow(
+      "文件“oversized.pdf”不能超过 100 MB",
     );
   });
 

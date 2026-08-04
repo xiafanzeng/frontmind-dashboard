@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Readable } from "node:stream";
 
 const dependencies = vi.hoisted(() => ({
   assertDeliveryProjectContext: vi.fn(),
   assertWorkspaceAccess: vi.fn(),
   getCredentialForUpstreamResource: vi.fn(),
   getDb: vi.fn(),
+  resolveOwnedFile: vi.fn(),
 }));
 
 vi.mock("./db", () => ({ getDb: dependencies.getDb }));
@@ -23,9 +25,19 @@ vi.mock("./auth-service", async () => {
       dependencies.getCredentialForUpstreamResource,
   };
 });
+vi.mock("./owned-file-content-resolver", async () => {
+  const actual = await vi.importActual<
+    typeof import("./owned-file-content-resolver")
+  >("./owned-file-content-resolver");
+  return {
+    ...actual,
+    ownedFileContentResolver: { resolve: dependencies.resolveOwnedFile },
+  };
+});
 
 import {
   canCustomerDownloadTicketAttachment,
+  downloadAuthorizedTicketAttachment,
   resolveAuthorizedTicketAttachment,
 } from "./delivery-ticket-attachment-router";
 
@@ -188,8 +200,40 @@ describe("delivery ticket attachment authorization", () => {
       assignedMemberId: engineer.id,
     });
     expect(dependencies.assertDeliveryProjectContext).not.toHaveBeenCalled();
-    expect(
-      dependencies.getCredentialForUpstreamResource,
-    ).toHaveBeenCalledWith(engineer.id, "file", "file-1", "project-a");
+    expect(dependencies.getCredentialForUpstreamResource).toHaveBeenCalledWith(
+      engineer.id,
+      "file",
+      "file-1",
+      "project-a",
+    );
+  });
+
+  it("downloads authorized bytes through the shared resolver with exact scope", async () => {
+    const bytes = Buffer.from("ticket attachment bytes");
+    dependencies.resolveOwnedFile.mockResolvedValue({
+      stream: Readable.from([bytes]),
+      mimeType: "application/pdf",
+    });
+
+    const result = await downloadAuthorizedTicketAttachment({
+      attachment: {
+        upstreamFileId: "file-1",
+        mimeType: null,
+      },
+      credential: { id: "credential-1" },
+      credentialOwnerUserId: engineer.id,
+      credentialProjectAssignmentId: "project-a",
+    } as Awaited<ReturnType<typeof resolveAuthorizedTicketAttachment>>);
+
+    expect(result).toEqual({
+      content: bytes,
+      contentType: "application/pdf",
+    });
+    expect(dependencies.resolveOwnedFile).toHaveBeenCalledWith({
+      ownerUserId: engineer.id,
+      fileId: "file-1",
+      projectAssignmentId: "project-a",
+      expectedCredentialId: "credential-1",
+    });
   });
 });

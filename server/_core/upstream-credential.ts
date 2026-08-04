@@ -94,12 +94,20 @@ export async function resolveUpstreamCredential(
       user.role === "delivery_member"
         ? req.frontmindDeliveryProjectContext?.projectAssignmentId
         : undefined;
+    const allowExpiredFileContent =
+      primaryResource?.kind === "file" &&
+      ((["GET", "HEAD"].includes(req.method) &&
+        /^\/v1\/files\/[^/]+(?:\/content)?$/.test(requestPath)) ||
+        (req.method === "POST" && requestPath === "/download-token"));
     const credential = primaryResource
       ? await getCredentialForUpstreamResource(
           user.id,
           primaryResource.kind,
           primaryResource.id,
           projectAssignmentId,
+          allowExpiredFileContent
+            ? { allowExpiredFileContent: true }
+            : undefined,
         )
       : await getEffectiveDecryptedCredentialForAccount(user.id);
 
