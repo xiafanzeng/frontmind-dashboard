@@ -1,8 +1,16 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, hkdfSync, timingSafeEqual } from "node:crypto";
 
 const TOKEN_VERSION = 1 as const;
 const DEVELOPMENT_TOKEN_SECRET =
   "frontmind-development-download-token-secret-do-not-use-in-production";
+const DOWNLOAD_TOKEN_DERIVATION_SALT = Buffer.from(
+  "frontmind-dashboard/download-token/salt/v1",
+  "utf8",
+);
+const DOWNLOAD_TOKEN_DERIVATION_INFO = Buffer.from(
+  "frontmind-dashboard/download-token-signing/v1",
+  "utf8",
+);
 
 export type OwnedFileDownloadClaims = {
   v: typeof TOKEN_VERSION;
@@ -41,6 +49,55 @@ export class SignedDownloadTokenError extends Error {
   }
 }
 
+function decodeProductionCredentialMasterKey(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("base64:")) {
+    throw new SignedDownloadTokenError(
+      "DOWNLOAD_TOKEN_SECRET_UNAVAILABLE",
+      "下载令牌派生主密钥格式无效",
+    );
+  }
+  const encoded = trimmed.slice("base64:".length);
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    throw new SignedDownloadTokenError(
+      "DOWNLOAD_TOKEN_SECRET_UNAVAILABLE",
+      "下载令牌派生主密钥格式无效",
+    );
+  }
+  const decoded = Buffer.from(encoded, "base64");
+  if (
+    decoded.length !== 32 ||
+    decoded.toString("base64").replace(/=+$/u, "") !==
+      encoded.replace(/=+$/u, "")
+  ) {
+    throw new SignedDownloadTokenError(
+      "DOWNLOAD_TOKEN_SECRET_UNAVAILABLE",
+      "下载令牌派生主密钥格式无效",
+    );
+  }
+  return decoded;
+}
+
+/**
+ * Existing production replicas already share this 32-byte credential master
+ * key. HKDF creates an independent signing sub-key, so the AES key bytes are
+ * never reused directly for download-token HMACs.
+ */
+export function deriveDownloadTokenSecretFromCredentialMasterKey(
+  encodedMasterKey: string,
+) {
+  const masterKey = decodeProductionCredentialMasterKey(encodedMasterKey);
+  return Buffer.from(
+    hkdfSync(
+      "sha256",
+      masterKey,
+      DOWNLOAD_TOKEN_DERIVATION_SALT,
+      DOWNLOAD_TOKEN_DERIVATION_INFO,
+      32,
+    ),
+  ).toString("base64url");
+}
+
 /**
  * Every application instance must use the same signing secret. Production is
  * deliberately fail-closed: silently generating an in-memory secret would
@@ -62,9 +119,8 @@ export function resolveDownloadTokenSecret(explicitSecret?: string) {
     return configured;
   }
   if (process.env.NODE_ENV === "production") {
-    throw new SignedDownloadTokenError(
-      "DOWNLOAD_TOKEN_SECRET_UNAVAILABLE",
-      "下载令牌签名密钥未配置",
+    return deriveDownloadTokenSecretFromCredentialMasterKey(
+      process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY ?? "",
     );
   }
   return DEVELOPMENT_TOKEN_SECRET;

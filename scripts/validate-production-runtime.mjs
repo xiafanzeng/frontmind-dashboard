@@ -1,5 +1,15 @@
 import path from "node:path";
+import { hkdfSync } from "node:crypto";
 import { fileURLToPath } from "node:url";
+
+const DOWNLOAD_TOKEN_DERIVATION_SALT = Buffer.from(
+  "frontmind-dashboard/download-token/salt/v1",
+  "utf8",
+);
+const DOWNLOAD_TOKEN_DERIVATION_INFO = Buffer.from(
+  "frontmind-dashboard/download-token-signing/v1",
+  "utf8",
+);
 
 const fail = (code) => {
   throw new Error(code);
@@ -48,7 +58,19 @@ const decodeBase64Key = (env, name) => {
   ) {
     fail(`${name}_FORMAT_INVALID`);
   }
+  return decoded;
 };
+
+export const deriveDownloadTokenSecretFromCredentialMasterKey = (masterKey) =>
+  Buffer.from(
+    hkdfSync(
+      "sha256",
+      masterKey,
+      DOWNLOAD_TOKEN_DERIVATION_SALT,
+      DOWNLOAD_TOKEN_DERIVATION_INFO,
+      32,
+    ),
+  ).toString("base64url");
 
 export function validateProductionRuntimeEnvironment(env = process.env) {
   const configuredBuildSourceSha = env.FRONTMIND_BUILD_SHA || "";
@@ -108,7 +130,10 @@ export function validateProductionRuntimeEnvironment(env = process.env) {
     fail("DATABASE_URL_TARGET_INVALID");
   }
 
-  decodeBase64Key(env, "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY");
+  const credentialMasterKey = decodeBase64Key(
+    env,
+    "FRONTMIND_CREDENTIAL_ENCRYPTION_KEY",
+  );
   for (const name of secretNames.slice(1)) {
     const value = env[name] || "";
     if (
@@ -122,19 +147,26 @@ export function validateProductionRuntimeEnvironment(env = process.env) {
   // Keep this precedence identical to resolveDownloadTokenSecret(). A short
   // dedicated value must not be silently rescued by JWT_SECRET because the
   // runtime resolver would select the dedicated value and fail after rollout.
-  const downloadTokenSecret =
+  const configuredDownloadTokenSecret =
     (env.FRONTMIND_DOWNLOAD_TOKEN_SECRET || "").trim() ||
     (env.JWT_SECRET || "").trim();
-  if (
-    downloadTokenSecret.length < 32 ||
-    /^(?:replace|placeholder|changeme|test|example)/iu.test(downloadTokenSecret)
-  ) {
-    fail("FRONTMIND_DOWNLOAD_TOKEN_SECRET_VALUE_INVALID");
+  const downloadTokenSecret =
+    configuredDownloadTokenSecret ||
+    deriveDownloadTokenSecretFromCredentialMasterKey(credentialMasterKey);
+  if (configuredDownloadTokenSecret) {
+    if (
+      downloadTokenSecret.length < 32 ||
+      /^(?:replace|placeholder|changeme|test|example)/iu.test(
+        downloadTokenSecret,
+      )
+    ) {
+      fail("FRONTMIND_DOWNLOAD_TOKEN_SECRET_VALUE_INVALID");
+    }
   }
 
   const secrets = [
     ...secretNames.map((name) => env[name]),
-    downloadTokenSecret,
+    ...(configuredDownloadTokenSecret ? [downloadTokenSecret] : []),
   ];
   if (new Set(secrets).size !== secrets.length) {
     fail("PRODUCTION_SECRETS_NOT_UNIQUE");

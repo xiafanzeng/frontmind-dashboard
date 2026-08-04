@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { validateProductionRuntimeEnvironment } from "./validate-production-runtime.mjs";
+import { deriveDownloadTokenSecretFromCredentialMasterKey as deriveRuntimeDownloadTokenSecret } from "../server/signed-download-token";
+import {
+  deriveDownloadTokenSecretFromCredentialMasterKey,
+  validateProductionRuntimeEnvironment,
+} from "./validate-production-runtime.mjs";
 
 function productionEnvironment() {
   return {
@@ -65,14 +69,27 @@ describe("production runtime preflight", () => {
     );
   });
 
-  it("requires the download-token resolver secret before rollout", () => {
+  it("resolves strong download-token signing material before rollout", () => {
     const {
       FRONTMIND_DOWNLOAD_TOKEN_SECRET: _missingDownloadSecret,
       ...missingDownloadSecret
     } = productionEnvironment();
-    expect(() =>
+    expect(
       validateProductionRuntimeEnvironment(missingDownloadSecret),
-    ).toThrow("FRONTMIND_DOWNLOAD_TOKEN_SECRET_VALUE_INVALID");
+    ).toMatchObject({ buildSourceSha: "a".repeat(40) });
+
+    const encodedMasterKey =
+      missingDownloadSecret.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY;
+    const decodedMasterKey = Buffer.from(
+      encodedMasterKey.slice("base64:".length),
+      "base64",
+    );
+    expect(
+      deriveDownloadTokenSecretFromCredentialMasterKey(decodedMasterKey),
+    ).toBe(deriveRuntimeDownloadTokenSecret(encodedMasterKey));
+    expect(
+      deriveDownloadTokenSecretFromCredentialMasterKey(decodedMasterKey),
+    ).toBe("nLfOXdehQatNHP_VNGaWs5rj--pTmMZDMCcbXxNOPaQ");
 
     expect(
       validateProductionRuntimeEnvironment({
@@ -86,6 +103,13 @@ describe("production runtime preflight", () => {
         ...productionEnvironment(),
         FRONTMIND_DOWNLOAD_TOKEN_SECRET: "short",
         JWT_SECRET: "j".repeat(32),
+      }),
+    ).toThrow("FRONTMIND_DOWNLOAD_TOKEN_SECRET_VALUE_INVALID");
+
+    expect(() =>
+      validateProductionRuntimeEnvironment({
+        ...missingDownloadSecret,
+        JWT_SECRET: "short",
       }),
     ).toThrow("FRONTMIND_DOWNLOAD_TOKEN_SECRET_VALUE_INVALID");
   });
