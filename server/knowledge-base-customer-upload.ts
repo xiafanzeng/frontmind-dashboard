@@ -47,6 +47,108 @@ export type KnowledgeBaseCustomerUploadImage = {
   sourceSha256: string;
 };
 
+export type KnowledgeBaseOfficialLogoUpload = {
+  turnId: string;
+  leafId: string;
+  index: number;
+  fileId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  sourceSha256: string;
+};
+
+export function knowledgeBaseOfficialLogoUploadFromTurn(
+  turn: Pick<
+    ConversationTurn,
+    "id" | "expectedLeafId" | "attachmentFileIds" | "metadata" | "status"
+  >,
+): KnowledgeBaseOfficialLogoUpload | null {
+  if (turn.status !== "completed") return null;
+  const metadata = record(turn.metadata) || {};
+  const recovery = record(metadata.recovery);
+  const upload = record(recovery?.officialLogoUpload);
+  const manifest = Array.isArray(recovery?.attachmentManifest)
+    ? recovery!.attachmentManifest
+    : [];
+  const attachments = Array.isArray(recovery?.attachments)
+    ? recovery!.attachments
+    : [];
+  const prepared = record(metadata.preparedDispatch);
+  const requestBody = record(prepared?.requestBody);
+  const dispatchedAttachments = Array.isArray(requestBody?.attachments)
+    ? requestBody!.attachments
+    : [];
+  const index = Number(upload?.index);
+  const fileId = String(upload?.fileId || "").trim();
+  const filename = normalizeKnowledgeBaseAttachmentFilename(
+    upload?.filename,
+    "official-logo",
+  );
+  const mimeType = normalizeKnowledgeBaseAttachmentMimeType(
+    filename,
+    upload?.mimeType,
+  );
+  const sizeBytes = Number(upload?.sizeBytes);
+  const sourceSha256 = String(upload?.sourceSha256 || "")
+    .trim()
+    .toLowerCase();
+  const leafId = String(turn.expectedLeafId || "").trim();
+  const manifestItem = record(manifest[index]);
+  const attachment = record(attachments[index]);
+  const manifestFilename = normalizeKnowledgeBaseAttachmentFilename(
+    manifestItem?.filename,
+    "official-logo",
+  );
+  const manifestMimeType = normalizeKnowledgeBaseAttachmentMimeType(
+    manifestFilename,
+    manifestItem?.mimeType,
+  );
+  if (
+    upload?.verified !== true ||
+    index !== 0 ||
+    !fileId ||
+    !leafId ||
+    !mimeType.startsWith("image/") ||
+    !Number.isSafeInteger(sizeBytes) ||
+    sizeBytes < 1 ||
+    !/^[a-f0-9]{64}$/u.test(sourceSha256) ||
+    metadata.attachmentsFrozen !== true ||
+    recovery?.capturedClientAttachments !== true ||
+    Number(metadata.userAttachmentCount) !== 1 ||
+    manifest.length !== 1 ||
+    attachments.length !== 1 ||
+    manifestFilename !== filename ||
+    manifestMimeType !== mimeType ||
+    Number(manifestItem?.sizeBytes) !== sizeBytes ||
+    String(manifestItem?.sha256 || "")
+      .trim()
+      .toLowerCase() !== sourceSha256 ||
+    String(attachment?.file_id || "").trim() !== fileId ||
+    String(attachment?.filename || "") !== filename ||
+    !Array.isArray(turn.attachmentFileIds) ||
+    !turn.attachmentFileIds.includes(fileId) ||
+    !dispatchedAttachments.some((candidate) => {
+      const dispatched = record(candidate);
+      return (
+        dispatched?.file_id === fileId && dispatched?.filename === filename
+      );
+    })
+  ) {
+    return null;
+  }
+  return {
+    turnId: turn.id,
+    leafId,
+    index,
+    fileId,
+    filename,
+    mimeType,
+    sizeBytes,
+    sourceSha256,
+  };
+}
+
 /**
  * Parse only the browser-upload ledger frozen into a knowledge-base turn.
  * Provider output images and node.imageUrls are deliberately outside this
@@ -89,6 +191,7 @@ export function knowledgeBaseCustomerUploadImagesFromTurn(
 
   const images: KnowledgeBaseCustomerUploadImage[] = [];
   const seenHashes = new Set<string>();
+  const officialLogoUpload = knowledgeBaseOfficialLogoUploadFromTurn(turn);
   for (let index = 0; index < expectedCount; index += 1) {
     const source = record(manifest[index]);
     const attachment = record(attachments[index]);
@@ -105,6 +208,17 @@ export function knowledgeBaseCustomerUploadImagesFromTurn(
     const sourceSha256 = String(source?.sha256 || "")
       .trim()
       .toLowerCase();
+    if (
+      officialLogoUpload &&
+      officialLogoUpload.index === index &&
+      officialLogoUpload.fileId === fileId &&
+      officialLogoUpload.filename === filename &&
+      officialLogoUpload.mimeType === mimeType &&
+      officialLogoUpload.sizeBytes === sizeBytes &&
+      officialLogoUpload.sourceSha256 === sourceSha256
+    ) {
+      continue;
+    }
     if (
       !fileId ||
       String(attachment?.filename || "") !== filename ||
@@ -310,7 +424,11 @@ export const MAX_KNOWLEDGE_BASE_CUSTOMER_UPLOAD_IMAGES = 99;
 
 function groupKnowledgeBaseCustomerUploads(
   images: readonly KnowledgeBaseCustomerUploadImage[],
+  options: { excludedSourceSha256?: string | null } = {},
 ): KnowledgeBaseExpectedCustomerUpload[] {
+  const excludedSourceSha256 = String(options.excludedSourceSha256 || "")
+    .trim()
+    .toLowerCase();
   const grouped = new Map<
     string,
     {
@@ -321,6 +439,9 @@ function groupKnowledgeBaseCustomerUploads(
     }
   >();
   for (const image of images) {
+    if (excludedSourceSha256 && image.sourceSha256 === excludedSourceSha256) {
+      continue;
+    }
     const current = grouped.get(image.sourceSha256) || {
       leafIds: new Set<string>(),
       filenames: new Set<string>(),
@@ -348,10 +469,12 @@ export function knowledgeBaseExpectedCustomerUploadsFromTurns(
   turns: readonly Parameters<
     typeof knowledgeBaseCustomerUploadImagesFromTurn
   >[0][],
+  options: { excludedSourceSha256?: string | null } = {},
 ) {
   turns.forEach(assertKnowledgeBaseCustomerUploadLedgerComplete);
   return groupKnowledgeBaseCustomerUploads(
     turns.flatMap(knowledgeBaseCustomerUploadImagesFromTurn),
+    options,
   );
 }
 
@@ -364,6 +487,7 @@ export async function verifiedKnowledgeBaseCustomerUploadsFromTurns(
   turns: readonly Parameters<
     typeof knowledgeBaseCustomerUploadImagesFromTurn
   >[0][],
+  options: { excludedSourceSha256?: string | null } = {},
 ): Promise<KnowledgeBaseExpectedCustomerUpload[]> {
   const verified = (
     await Promise.all(
@@ -372,13 +496,14 @@ export async function verifiedKnowledgeBaseCustomerUploadsFromTurns(
       ),
     )
   ).flat();
-  return groupKnowledgeBaseCustomerUploads(verified);
+  return groupKnowledgeBaseCustomerUploads(verified, options);
 }
 
 export async function verifiedKnowledgeBaseCustomerUploadsForBuild(input: {
   userId: number;
   buildId: string;
   generation: number;
+  officialLogoSha256?: string | null;
 }) {
   const db = await getDb();
   if (!db) throw new Error("数据库暂不可用，无法核验客户上传图片");
@@ -399,13 +524,60 @@ export async function verifiedKnowledgeBaseCustomerUploadsForBuild(input: {
         eq(conversationTurns.status, "completed"),
       ),
     );
-  return verifiedKnowledgeBaseCustomerUploadsFromTurns(turns);
+  return verifiedKnowledgeBaseCustomerUploadsFromTurns(turns, {
+    excludedSourceSha256: input.officialLogoSha256,
+  });
+}
+
+export async function verifiedKnowledgeBaseOfficialLogoUploadForBuild(input: {
+  userId: number;
+  buildId: string;
+  generation: number;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("数据库暂不可用，无法核验客户上传 Logo");
+  const turns = await db
+    .select({
+      id: conversationTurns.id,
+      expectedLeafId: conversationTurns.expectedLeafId,
+      attachmentFileIds: conversationTurns.attachmentFileIds,
+      metadata: conversationTurns.metadata,
+      status: conversationTurns.status,
+    })
+    .from(conversationTurns)
+    .where(
+      and(
+        eq(conversationTurns.userId, input.userId),
+        eq(conversationTurns.buildId, input.buildId),
+        eq(conversationTurns.buildGeneration, input.generation),
+        eq(conversationTurns.status, "completed"),
+      ),
+    );
+  const declared = turns
+    .map(knowledgeBaseOfficialLogoUploadFromTurn)
+    .filter(
+      (upload): upload is KnowledgeBaseOfficialLogoUpload => upload !== null,
+    );
+  if (declared.length === 0) return undefined;
+  if (declared.length !== 1) {
+    throw new KnowledgeBasePackageBindingError(
+      "企业官方主 Logo 上传账本不唯一，不能验证最终 ZIP",
+    );
+  }
+  const upload = declared[0]!;
+  // Binding copied and hashed the exact upload into the build's immutable
+  // Logo artifact in the same transaction that wrote this verified marker.
+  // The short-lived presales capture may expire after 30 days; final-package
+  // validation therefore binds against the durable build hash and packaged
+  // bytes instead of making that temporary copy a permanent dependency.
+  return upload;
 }
 
 export async function declaredKnowledgeBaseCustomerUploadsForBuild(input: {
   userId: number;
   buildId: string;
   generation: number;
+  officialLogoSha256?: string | null;
 }) {
   const db = await getDb();
   if (!db) throw new Error("数据库暂不可用，无法读取客户上传图片账本");
@@ -426,7 +598,9 @@ export async function declaredKnowledgeBaseCustomerUploadsForBuild(input: {
         eq(conversationTurns.status, "completed"),
       ),
     );
-  return knowledgeBaseExpectedCustomerUploadsFromTurns(turns);
+  return knowledgeBaseExpectedCustomerUploadsFromTurns(turns, {
+    excludedSourceSha256: input.officialLogoSha256,
+  });
 }
 
 const CUSTOMER_UPLOAD_VISUAL_MAX_BYTES = 100 * 1024 * 1024;
@@ -530,6 +704,8 @@ async function normalizedCustomerImagePixels(bytes: Buffer, svg: boolean) {
     .toBuffer();
   return {
     pixels,
+    width: metadata.width,
+    height: metadata.height,
     aspectRatio: metadata.width / metadata.height,
   };
 }
@@ -566,7 +742,7 @@ export async function assertCapturedKnowledgeBaseCustomerImage(input: {
       "客户 SVG 超过 10 MB 安全预览上限",
     );
   }
-  await normalizedCustomerImagePixels(bytes, sourceIsSvg);
+  return normalizedCustomerImagePixels(bytes, sourceIsSvg);
 }
 
 /**

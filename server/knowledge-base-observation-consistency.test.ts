@@ -11,11 +11,19 @@ import {
 const dependencies = vi.hoisted(() => ({
   getDb: vi.fn(),
   customerUploadResources: vi.fn().mockResolvedValue([]),
+  officialLogoUploadFromTurn: vi.fn(
+    (turn: { expectedLeafId?: string; metadata?: Record<string, any> }) =>
+      turn.metadata?.recovery?.officialLogoUpload?.verified === true
+        ? { leafId: turn.expectedLeafId }
+        : null,
+  ),
 }));
 
 vi.mock("./db", () => ({ getDb: dependencies.getDb }));
 vi.mock("./knowledge-base-customer-upload", () => ({
   knowledgeBaseCustomerUploadResources: dependencies.customerUploadResources,
+  knowledgeBaseOfficialLogoUploadFromTurn:
+    dependencies.officialLogoUploadFromTurn,
 }));
 
 import { getKnowledgeBaseObservationProjection } from "./knowledge-base-progress-service";
@@ -217,6 +225,75 @@ describe("knowledge-base observation consistency", () => {
     expect(dependencies.customerUploadResources).not.toHaveBeenCalled();
     expect(observation?.approvedPresentation).toMatchObject({
       revision: 0,
+      leafId: "1.1",
+      imageState: "attached",
+      resources: [
+        {
+          kind: "logo",
+          filename: "official-logo.png",
+        },
+      ],
+    });
+  });
+
+  it("shows the exact official Logo on the revised first node that bound its upload", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const logoTurn = {
+      id: "turn-official-logo",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-official-logo",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-official-logo",
+      operationType: "revise",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      attachmentFileIds: ["file-official-logo"],
+      metadata: {
+        recovery: {
+          officialLogoUpload: { verified: true },
+        },
+      },
+      status: "completed",
+      upstreamTaskId: "task-official-logo",
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.customerUploadResources.mockResolvedValueOnce([]);
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              revision: 1,
+              logoStorageKey: "knowledge-base/build-snapshot/logo.png",
+              logoSha256: "a".repeat(64),
+              logoBytes: 345,
+              logoFilename: "official-logo.png",
+              logoMimeType: "image/png",
+            }),
+            nodes: [node({ sourceTurnId: logoTurn.id })],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [logoTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.approvedPresentation).toMatchObject({
+      revision: 1,
       leafId: "1.1",
       imageState: "attached",
       resources: [

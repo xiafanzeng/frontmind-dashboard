@@ -46,7 +46,10 @@ Create one branch overview plus the associated leaf documents. The overview:
 - Synthesizes the branch into coherent customer-ready prose.
 - Connects facts rather than enumerating page titles.
 - Has no image asset. The sole official company Logo belongs only to the first
-  leaf and must not be repeated in an overview.
+  leaf and must not be repeated in an overview. If that Logo is initially
+  unavailable, the manifest and first leaf still exist, but the first leaf
+  remains current and cannot advance until Dashboard receives a qualifying Logo
+  upload.
 - Points to leaves for detail without copying their full text.
 
 Assign every overview and leaf `complete`, `limited_evidence`, or

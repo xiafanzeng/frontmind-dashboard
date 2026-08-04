@@ -757,6 +757,97 @@ ${narrative}
   return zip.generateAsync({ type: "nodebuffer" });
 }
 
+async function dashboardV4OfficialLogoUploadArchive() {
+  const root = "深度企业_knowledge_base";
+  const zip = await JSZip.loadAsync(await dashboardEnterpriseArchive());
+  const manifestPath = `${root}/00_package_manifest.json`;
+  const manifest = JSON.parse(await zip.file(manifestPath)!.async("string"));
+  const logoPath = "09_media_assets/company-logo.png";
+  const logoBytes = await sharp({
+    create: {
+      width: 256,
+      height: 256,
+      channels: 3,
+      background: "#173c36",
+    },
+  })
+    .png()
+    .toBuffer();
+  const logoSha256 = createHash("sha256").update(logoBytes).digest("hex");
+  zip.file(`${root}/${logoPath}`, logoBytes);
+  manifest.schemaVersion = 4;
+  manifest.buildRevision = 7;
+  const leaves = manifest.documents.filter(
+    (document: { kind?: string }) => document.kind === "leaf",
+  );
+  leaves.forEach(
+    (document: { order?: number; branchTitle?: string }, index: number) => {
+      document.order = index;
+      document.branchTitle = "产品与服务";
+    },
+  );
+  leaves[0].assetIds = ["asset-company-logo"];
+  manifest.assets = [
+    {
+      id: "asset-company-logo",
+      path: logoPath,
+      sha256: logoSha256,
+      mimeType: "image/png",
+      bytes: logoBytes.length,
+      width: 256,
+      height: 256,
+      caption: "客户上传的企业官方 Logo",
+      alt: "企业 Logo",
+      branchId: "products",
+      documentIds: ["leaf-1"],
+      sourceKind: "official_logo_upload",
+      sourceUploadIndex: 0,
+      sourceUploadFileId: "file-official-logo",
+      sourceUploadFilename: "company-logo.png",
+      sourceUploadMimeType: "image/png",
+      sourceUploadSizeBytes: logoBytes.length,
+      sourceUploadSha256: logoSha256,
+      ownership: "first_party",
+      assetType: "brand_identity",
+      displayRole: "badge",
+    },
+  ];
+  manifest.counts.totalFiles += 1;
+  manifest.counts.packagedImages = 1;
+  manifest.imageSelection = {
+    status: "target_met",
+    discoveredCandidateImages: 1,
+    inspectedCandidateImages: 1,
+    eligibleFirstPartyImages: 1,
+    rejectedCandidateImages: 0,
+    scannedSourcePages: 0,
+    discoveryMethods: ["customer_upload"],
+    candidates: [
+      {
+        sourceKind: "official_logo_upload",
+        method: "customer_upload",
+        status: "eligible",
+        assetId: "asset-company-logo",
+      },
+    ],
+    rejectionReasons: [],
+    stopReason: "客户已上传并指定企业官方主 Logo",
+  };
+  zip.file(manifestPath, JSON.stringify(manifest));
+  const completenessPath = `${root}/00_completeness.json`;
+  const completeness = JSON.parse(
+    await zip.file(completenessPath)!.async("string"),
+  );
+  completeness.acquisition.images = { completed: 1, total: 1 };
+  completeness.gaps = [];
+  zip.file(completenessPath, JSON.stringify(completeness));
+  return {
+    buffer: await zip.generateAsync({ type: "nodebuffer" }),
+    logoSha256,
+    logoSizeBytes: logoBytes.length,
+  };
+}
+
 async function parseWebsiteArchive(buffer: Buffer) {
   const result = await readKnowledgeArchive(
     buffer,
@@ -938,6 +1029,59 @@ ${narrative}
     expect(
       result.documents.filter((document) => document.customerVisible),
     ).toHaveLength(41);
+  });
+
+  it("accepts Dashboard v4 dedicated official Logo upload provenance", async () => {
+    const archive = await dashboardV4OfficialLogoUploadArchive();
+    const result = await readKnowledgeArchive(
+      archive.buffer,
+      "深度企业知识库-v4-uploaded-logo.zip",
+      "deep-v4-uploaded-logo-test",
+      {
+        validationProfile: "dashboard-enterprise-v1",
+        archiveContractVersion: 4,
+      },
+    );
+    storedKeys.push(...result.storedAssetKeys);
+
+    expect(result.assets).toHaveLength(1);
+    expect(result.assets[0]).toMatchObject({
+      sourceKind: "official_logo_upload",
+      sourceUploadIndex: 0,
+      sourceUploadFileId: "file-official-logo",
+      sourceUploadFilename: "company-logo.png",
+      sourceUploadMimeType: "image/png",
+      sourceUploadSizeBytes: archive.logoSizeBytes,
+      sourceUploadSha256: archive.logoSha256,
+      sha256: archive.logoSha256,
+      ownership: "first_party",
+      assetType: "brand_identity",
+      displayRole: "badge",
+    });
+  });
+
+  it("rejects an uploaded official Logo candidate without customer_upload method", async () => {
+    const archive = await dashboardV4OfficialLogoUploadArchive();
+    const zip = await JSZip.loadAsync(archive.buffer);
+    const manifestPath = "深度企业_knowledge_base/00_package_manifest.json";
+    const manifest = JSON.parse(await zip.file(manifestPath)!.async("string"));
+    manifest.imageSelection.discoveryMethods = ["img"];
+    manifest.imageSelection.candidates[0].method = "img";
+    zip.file(manifestPath, JSON.stringify(manifest));
+
+    await expect(
+      readKnowledgeArchive(
+        await zip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库-v4-uploaded-logo-invalid.zip",
+        "deep-v4-uploaded-logo-invalid-test",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 4,
+        },
+      ),
+    ).rejects.toMatchObject<Partial<KnowledgeArchiveValidationError>>({
+      category: "media",
+    });
   });
 
   it("rejects a v2 document that understates its packaged evidence", async () => {

@@ -34,7 +34,10 @@ import {
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getDb } from "./db";
 import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
-import { knowledgeBaseCustomerUploadResources } from "./knowledge-base-customer-upload";
+import {
+  knowledgeBaseCustomerUploadResources,
+  knowledgeBaseOfficialLogoUploadFromTurn,
+} from "./knowledge-base-customer-upload";
 import { knowledgeBaseMarkdownSha256 } from "./knowledge-base-package-validation";
 import { protectedProcedure, router } from "./_core/trpc";
 import { getUpstreamBaseUrl } from "./upstream-config";
@@ -122,6 +125,7 @@ type ServerOwnedBuildNodeIdentity = {
   buildId: string;
   leafId: string;
   ordinal: number;
+  sourceTurnId: string | null;
 };
 
 function knowledgeBasePresentationKey(input: {
@@ -1373,6 +1377,7 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
             buildId: knowledgeBaseBuildNodes.buildId,
             leafId: knowledgeBaseBuildNodes.leafId,
             ordinal: knowledgeBaseBuildNodes.ordinal,
+            sourceTurnId: knowledgeBaseBuildNodes.sourceTurnId,
           })
           .from(knowledgeBaseBuildNodes)
           .where(
@@ -1460,13 +1465,18 @@ export async function reconstructKnowledgeBasePresentationInlineImages(
     return undefined;
   }
   const images: NonNullable<MessageMetadata["inlineImages"]> = [];
-  const isInitialLogoPresentation =
-    input.turn.operationType === "start" &&
-    input.turn.expectedRevision === 0 &&
+  const officialLogoUpload = knowledgeBaseOfficialLogoUploadFromTurn(
+    input.turn,
+  );
+  const isOfficialLogoPresentation =
     input.node.buildId === input.build.id &&
-    input.node.ordinal === 0;
+    input.node.ordinal === 0 &&
+    input.node.sourceTurnId === input.turn.id &&
+    ((input.turn.operationType === "start" &&
+      input.turn.expectedRevision === 0) ||
+      officialLogoUpload?.leafId === input.node.leafId);
   if (
-    isInitialLogoPresentation &&
+    isOfficialLogoPresentation &&
     input.build.logoStorageKey &&
     input.build.logoSha256 &&
     input.build.logoBytes &&

@@ -34,6 +34,9 @@ export interface KnowledgeBaseCoordinatorOptions {
 // Stay beyond the 5-minute /turn fetch timeout so a browser that loses the
 // response still observes a reservation completed at the timeout boundary.
 export const KNOWLEDGE_BASE_PENDING_REQUEST_GRACE_MS = 6 * 60 * 1000;
+export const KNOWLEDGE_BASE_FINAL_PACKAGE_MISSING_NOTICE_CODE =
+  "FINAL_PACKAGE_MISSING";
+export const KNOWLEDGE_BASE_LATE_PACKAGE_POLL_GRACE_MS = 5 * 60 * 1000;
 
 export function getKnowledgeBasePollDelay(elapsedMs: number) {
   if (elapsedMs < 5 * 60 * 1000) return 3_000;
@@ -43,7 +46,21 @@ export function getKnowledgeBasePollDelay(elapsedMs: number) {
 
 export function observationNeedsPolling(
   observation: KnowledgeBaseObservationDto,
+  now = Date.now(),
 ): boolean {
+  if (
+    observation.notice?.code ===
+    KNOWLEDGE_BASE_FINAL_PACKAGE_MISSING_NOTICE_CODE
+  ) {
+    // A provider can publish the typed ZIP shortly after its terminal text.
+    // Continue rereading the exact authoritative task so the server can bind
+    // the late resource without a new billable turn. The visible retry button
+    // remains available if the file never arrives.
+    return (
+      now - observation.notice.createdAt <
+      KNOWLEDGE_BASE_LATE_PACKAGE_POLL_GRACE_MS
+    );
+  }
   const state = observation.interaction?.interactionState;
   if (state === "queued" || state === "executing") return true;
   if (state !== "awaiting_input") return false;
@@ -237,7 +254,12 @@ export class KnowledgeBasePollingCoordinator {
         slot,
         observation,
       );
-      if (observationNeedsPolling(observation) || pendingRequestNeedsPolling) {
+      if (
+        observationNeedsPolling(
+          observation,
+          (this.options.now ?? Date.now)(),
+        ) || pendingRequestNeedsPolling
+      ) {
         this.schedule(conversationId, slot);
       }
     } catch (error) {

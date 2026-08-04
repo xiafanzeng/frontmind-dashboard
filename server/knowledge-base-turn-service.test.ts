@@ -16,6 +16,7 @@ import {
 } from "../drizzle/schema";
 import {
   KnowledgeBaseTurnReservationError,
+  cancelUnpreparedKnowledgeBaseTurn,
   completeKnowledgeBaseGeneratedAttachment,
   createKnowledgeBaseGeneratedAttachmentIdempotencyKey,
   createKnowledgeBaseOperationKey,
@@ -32,6 +33,7 @@ import {
   reserveKnowledgeBaseRetryTurn,
   reserveKnowledgeBaseStartBuild,
   reserveKnowledgeBaseTurn,
+  stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseDeferredTurnAttachment,
   sanitizeKnowledgeBaseRecoveryMetadata,
 } from "./knowledge-base-turn-service";
@@ -1406,6 +1408,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
         userMessage: "请结合附件修订",
         attachments: [],
         attachmentManifest: manifest,
+        capturedClientAttachments: true,
         deferredClientAttachments: true,
         skillVersion: "4",
       },
@@ -1649,6 +1652,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
         awaitingClientAttachments: false,
       },
       recoveryMetadata: {
+        capturedClientAttachments: true,
         attachments: [
           { file_id: "file-facts", filename: "facts.pdf" },
           { file_id: "file-logo-notes", filename: "logo-notes.txt" },
@@ -1656,6 +1660,436 @@ describe("knowledge-base attachment-first turn reservation", () => {
       },
     });
   });
+
+  it("atomically claims the deferred turn when the final customer attachment is staged", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      build: { ...build },
+      conversation: { ...conversation },
+      turnSelections: [
+        [[], []],
+        [(current) => current.turns],
+        [(current) => current.turns, (current) => current.turns],
+      ],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+    const firstStagedAt = new Date("2026-08-01T00:00:10.000Z");
+    const first = await stageAndClaimKnowledgeBaseDeferredTurnAttachment(
+      {
+        userId: 1,
+        buildId: build.id,
+        turnId: reserved.turn.id,
+        clientRequestId: reserved.turn.clientRequestId,
+        clientAttachmentManifest: manifest,
+        index: 0,
+        attachment: { file_id: "file-facts", filename: "facts.pdf" },
+        now: firstStagedAt,
+        leaseMs: 60_000,
+      },
+      executor,
+    );
+
+    expect(first).toMatchObject({
+      state: "awaiting_attachments",
+      turn: {
+        attachmentFileIds: ["file-facts"],
+        stagedUserAttachmentCount: 1,
+        expectedUserAttachmentCount: 2,
+        awaitingClientAttachments: true,
+        leaseExpiresAt: null,
+      },
+    });
+    expect(store.turns[0]).toMatchObject({
+      attachmentFileIds: ["file-facts"],
+      leaseExpiresAt: null,
+      metadata: {
+        awaitingClientAttachments: true,
+        clientStagedAttachments: [
+          { index: 0, file_id: "file-facts", filename: "facts.pdf" },
+        ],
+      },
+    });
+
+    const finalStagedAt = new Date("2026-08-01T00:00:20.000Z");
+    const claimed = await stageAndClaimKnowledgeBaseDeferredTurnAttachment(
+      {
+        userId: 1,
+        buildId: build.id,
+        turnId: reserved.turn.id,
+        clientRequestId: reserved.turn.clientRequestId,
+        clientAttachmentManifest: manifest,
+        index: 1,
+        attachment: {
+          file_id: "file-logo-notes",
+          filename: "logo-notes.txt",
+        },
+        now: finalStagedAt,
+        leaseMs: 60_000,
+      },
+      executor,
+    );
+
+    expect(claimed).toMatchObject({
+      state: "acquired",
+      turn: {
+        attachmentFileIds: ["file-facts", "file-logo-notes"],
+        stagedUserAttachmentCount: 2,
+        expectedUserAttachmentCount: 2,
+        awaitingClientAttachments: false,
+        leaseExpiresAt: new Date("2026-08-01T00:01:20.000Z"),
+      },
+      recoveryMetadata: {
+        capturedClientAttachments: true,
+        attachments: [
+          { file_id: "file-facts", filename: "facts.pdf" },
+          { file_id: "file-logo-notes", filename: "logo-notes.txt" },
+        ],
+      },
+    });
+    expect(claimed.state === "acquired" && claimed.leaseToken).toMatch(
+      /^[0-9a-f-]{36}$/u,
+    );
+    expect(store.turns[0]).toMatchObject({
+      attachmentFileIds: ["file-facts", "file-logo-notes"],
+      leaseExpiresAt: new Date("2026-08-01T00:01:20.000Z"),
+      metadata: {
+        awaitingClientAttachments: false,
+        clientStagedAttachments: [
+          { index: 0, file_id: "file-facts", filename: "facts.pdf" },
+          {
+            index: 1,
+            file_id: "file-logo-notes",
+            filename: "logo-notes.txt",
+          },
+        ],
+      },
+    });
+    expect((store.turns[0]!.metadata as any).leaseOwnerHash).toMatch(
+      /^[a-f0-9]{64}$/u,
+    );
+  });
+
+  it("cancels a queued Logo upload before dispatch without moving the authoritative leaf", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      build: { ...build },
+      conversation: { ...conversation },
+      turnSelections: [[[], []], [(current) => current.turns]],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+    const buildBeforeCancellation = { ...store.build };
+    const cancelledAt = new Date("2026-08-01T00:00:30.000Z");
+
+    expect(reserved).toMatchObject({
+      state: "awaiting_attachments",
+      turn: {
+        status: "queued",
+        awaitingClientAttachments: true,
+      },
+    });
+    expect(buildBeforeCancellation).toMatchObject({
+      status: "confirming",
+      revision: build.revision,
+      currentLeafId: build.currentLeafId,
+      activeTurnId: reserved.turn.id,
+    });
+
+    const cancelled = await cancelUnpreparedKnowledgeBaseTurn(
+      {
+        userId: 1,
+        turnId: reserved.turn.id,
+        clientRequestId: reserved.turn.clientRequestId,
+        code: "INVALID_OFFICIAL_LOGO_UPLOAD",
+        message: "请上传有效的 Logo 图片后重试",
+        now: cancelledAt,
+      },
+      executor,
+    );
+
+    expect(cancelled).toMatchObject({
+      id: reserved.turn.id,
+      status: "cancelled",
+      completedAt: cancelledAt,
+      leaseExpiresAt: null,
+      awaitingClientAttachments: false,
+    });
+    expect(store.turns[0]).toMatchObject({
+      id: reserved.turn.id,
+      status: "cancelled",
+      upstreamTaskId: null,
+      errorCode: "INVALID_OFFICIAL_LOGO_UPLOAD",
+      completedAt: cancelledAt,
+      leaseExpiresAt: null,
+      metadata: {
+        awaitingClientAttachments: false,
+        recovery: { capturedClientAttachments: true },
+      },
+    });
+    expect(store.build).toMatchObject({
+      status: "confirming",
+      stateEpoch: buildBeforeCancellation.stateEpoch + 1,
+      revision: buildBeforeCancellation.revision,
+      currentLeafId: buildBeforeCancellation.currentLeafId,
+      activeTurnId: null,
+      awaitingResponseSince: null,
+      protocolErrorCode: null,
+      protocolError: null,
+    });
+    expect(store.conversation).toMatchObject({
+      status: "awaiting_input",
+      upstreamTaskId: build.upstreamTaskId,
+      previousResponseId: build.upstreamTaskId,
+      version: conversation.version + 2,
+    });
+  });
+
+  it("deduplicates the exact unprepared cancellation replay and rejects conflicting replay identities", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      build: { ...build },
+      conversation: { ...conversation },
+      turnSelections: [
+        [[], []],
+        [(current) => current.turns],
+        [(current) => current.turns],
+        [(current) => current.turns],
+        [(current) => current.turns],
+      ],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+    const cancellation = {
+      userId: 1,
+      turnId: reserved.turn.id,
+      clientRequestId: reserved.turn.clientRequestId,
+      code: "INVALID_OFFICIAL_LOGO_UPLOAD",
+      message: "请上传有效的 Logo 图片后重试",
+      now: new Date("2026-08-01T00:00:30.000Z"),
+    };
+    const first = await cancelUnpreparedKnowledgeBaseTurn(
+      cancellation,
+      executor,
+    );
+    const stateAfterFirstCancellation = structuredClone(store);
+
+    const replay = await cancelUnpreparedKnowledgeBaseTurn(
+      {
+        ...cancellation,
+        now: new Date("2026-08-01T00:00:31.000Z"),
+      },
+      executor,
+    );
+    expect(replay).toMatchObject({
+      id: first.id,
+      status: "cancelled",
+      completedAt: cancellation.now,
+      leaseExpiresAt: null,
+    });
+    expect(store).toEqual(stateAfterFirstCancellation);
+
+    await expect(
+      cancelUnpreparedKnowledgeBaseTurn(
+        {
+          ...cancellation,
+          clientRequestId: "different-client-request",
+          now: new Date("2026-08-01T00:00:32.000Z"),
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store).toEqual(stateAfterFirstCancellation);
+
+    await expect(
+      cancelUnpreparedKnowledgeBaseTurn(
+        {
+          ...cancellation,
+          code: "DIFFERENT_CANCELLATION_CODE",
+          now: new Date("2026-08-01T00:00:33.000Z"),
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store).toEqual(stateAfterFirstCancellation);
+  });
+
+  it("releases the canonical slot for a replacement upload while old-request replay stays terminal", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      build: { ...build },
+      conversation: { ...conversation },
+      turnSelections: [
+        [[], []],
+        [(current) => current.turns],
+        [[], []],
+        [(current) => [current.turns[0]!], (current) => [current.turns[1]!]],
+      ],
+    });
+    const originalInput = reserveInput();
+    const original = await reserveKnowledgeBaseTurn(originalInput, executor);
+    const canonicalOperationKey = original.turn.operationKey;
+
+    await cancelUnpreparedKnowledgeBaseTurn(
+      {
+        userId: 1,
+        turnId: original.turn.id,
+        clientRequestId: original.turn.clientRequestId,
+        code: "INVALID_OFFICIAL_LOGO_UPLOAD",
+        message: "请上传有效的 Logo 图片后重试",
+      },
+      executor,
+    );
+    expect(store.turns[0]).toMatchObject({
+      id: original.turn.id,
+      status: "cancelled",
+      metadata: {
+        unpreparedCancellation: true,
+        cancelledOperationKey: canonicalOperationKey,
+      },
+    });
+    expect(store.turns[0]!.operationKey).not.toBe(canonicalOperationKey);
+
+    const replacementManifest = manifest.map((entry, index) =>
+      index === 1
+        ? {
+            ...entry,
+            filename: "official-logo.png",
+            mimeType: "image/png",
+            sizeBytes: 24,
+            lastModified: 3,
+            sha256: "c".repeat(64),
+          }
+        : entry,
+    );
+    const replacementInput = {
+      ...reserveInput(),
+      clientRequestId: "deferred-request-2",
+      requestPayload: {
+        ...reserveInput().requestPayload,
+        userMessage: "已补充官方 Logo，请继续",
+        attachmentManifest: replacementManifest,
+      },
+      userText: "已补充官方 Logo，请继续",
+      clientAttachmentManifest: replacementManifest,
+      recoveryMetadata: {
+        ...reserveInput().recoveryMetadata,
+        userMessage: "已补充官方 Logo，请继续",
+        attachmentManifest: replacementManifest,
+      },
+      now: new Date("2026-08-01T00:01:00.000Z"),
+    };
+    const replacement = await reserveKnowledgeBaseTurn(
+      replacementInput,
+      executor,
+    );
+    expect(replacement).toMatchObject({
+      state: "awaiting_attachments",
+      turn: {
+        clientRequestId: "deferred-request-2",
+        operationKey: canonicalOperationKey,
+        awaitingClientAttachments: true,
+      },
+    });
+    expect(replacement.turn.id).not.toBe(original.turn.id);
+    expect(store.build).toMatchObject({ activeTurnId: replacement.turn.id });
+    expect(store.turns).toHaveLength(2);
+
+    const activeBuildBeforeOldReplay = { ...store.build };
+    const oldReplay = await reserveKnowledgeBaseTurn(
+      {
+        ...originalInput,
+        now: new Date("2026-08-01T00:01:01.000Z"),
+      },
+      executor,
+    );
+    expect(oldReplay).toMatchObject({
+      state: "terminal",
+      turn: {
+        id: original.turn.id,
+        status: "cancelled",
+      },
+    });
+    expect(store.build).toEqual(activeBuildBeforeOldReplay);
+    expect(store.build).toMatchObject({ activeTurnId: replacement.turn.id });
+    expect(store.turns).toHaveLength(2);
+  });
+
+  it.each(["preparedDispatch", "upstreamTaskId"] as const)(
+    "refuses cancellation once %s proves dispatch has started",
+    async (dispatchEvidence) => {
+      const { executor, store } = createTurnServiceExecutor({
+        build: { ...build },
+        conversation: { ...conversation },
+        turnSelections: [[[], []], [(current) => current.turns]],
+      });
+      const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+      if (dispatchEvidence === "preparedDispatch") {
+        store.turns[0] = {
+          ...store.turns[0]!,
+          metadata: {
+            ...(store.turns[0]!.metadata as Record<string, unknown>),
+            preparedDispatch: { schemaVersion: 1 },
+          },
+        };
+      } else {
+        store.turns[0] = {
+          ...store.turns[0]!,
+          upstreamTaskId: "already-created-task",
+        };
+      }
+      const buildBeforeCancellation = { ...store.build };
+
+      await expect(
+        cancelUnpreparedKnowledgeBaseTurn(
+          {
+            userId: 1,
+            turnId: reserved.turn.id,
+            clientRequestId: reserved.turn.clientRequestId,
+            code: "INVALID_OFFICIAL_LOGO_UPLOAD",
+            message: "请上传有效的 Logo 图片后重试",
+          },
+          executor,
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(store.turns[0]).toMatchObject({
+        id: reserved.turn.id,
+        status: "queued",
+      });
+      expect(store.build).toEqual(buildBeforeCancellation);
+    },
+  );
+
+  it.each(["clientRequestId", "leaseToken"] as const)(
+    "refuses cancellation with the wrong %s",
+    async (mismatchedIdentity) => {
+      const { executor, store } = createTurnServiceExecutor({
+        build: { ...build },
+        conversation: { ...conversation },
+        turnSelections: [[[], []], [(current) => current.turns]],
+      });
+      const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+      const buildBeforeCancellation = { ...store.build };
+
+      await expect(
+        cancelUnpreparedKnowledgeBaseTurn(
+          {
+            userId: 1,
+            turnId: reserved.turn.id,
+            clientRequestId:
+              mismatchedIdentity === "clientRequestId"
+                ? "wrong-client-request"
+                : reserved.turn.clientRequestId,
+            ...(mismatchedIdentity === "leaseToken"
+              ? { leaseToken: "wrong-lease-token" }
+              : {}),
+            code: "INVALID_OFFICIAL_LOGO_UPLOAD",
+            message: "请上传有效的 Logo 图片后重试",
+          },
+          executor,
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(store.turns[0]).toMatchObject({
+        id: reserved.turn.id,
+        status: "queued",
+        metadata: { awaitingClientAttachments: true },
+      });
+      expect(store.build).toEqual(buildBeforeCancellation);
+    },
+  );
 
   it("atomically takes over without local text and coalesces a lost-202 replay", async () => {
     const { executor, store } = createTurnServiceExecutor({

@@ -2416,7 +2416,17 @@ export type KnowledgeAssetRecord = {
   sourcePageUrl?: string;
   sourceAssetUrl?: string;
   sourceDocumentPath?: string;
-  sourceKind?: "official_web" | "official_document" | "user_upload";
+  sourceKind?:
+    | "official_web"
+    | "official_document"
+    | "official_logo_upload"
+    | "user_upload";
+  sourceUploadIndex?: number;
+  sourceUploadFileId?: string;
+  sourceUploadSha256?: string;
+  sourceUploadFilename?: string;
+  sourceUploadMimeType?: string;
+  sourceUploadSizeBytes?: number;
   ownership?: "first_party" | "third_party" | "unknown";
 };
 

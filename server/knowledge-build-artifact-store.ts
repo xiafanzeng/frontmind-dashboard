@@ -241,12 +241,18 @@ async function validateArtifactBytes(
       "企业官方主 Logo 不是可解码图片",
     );
   }
+  const normalizedFormat =
+    metadata.format === "heif" &&
+    metadata.mediaType === "image/avif" &&
+    metadata.compression === "av1"
+      ? "avif"
+      : metadata.format;
   if (
     !metadata.width ||
     !metadata.height ||
     metadata.width * metadata.height > MAX_LOGO_PIXELS ||
     !["png", "jpeg", "webp", "avif", "gif"].includes(
-      String(metadata.format || ""),
+      String(normalizedFormat || ""),
     )
   ) {
     throw new KnowledgeBuildArtifactError(
@@ -257,7 +263,7 @@ async function validateArtifactBytes(
   return {
     width: metadata.width,
     height: metadata.height,
-    format: metadata.format,
+    format: normalizedFormat,
   };
 }
 

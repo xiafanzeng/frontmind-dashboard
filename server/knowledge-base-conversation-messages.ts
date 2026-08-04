@@ -301,3 +301,32 @@ export async function markKnowledgeBaseConversationFailedInTransaction(input: {
       ),
     );
 }
+
+export async function markKnowledgeBaseConversationAwaitingInputInTransaction(
+  input: {
+    tx: any;
+    userId: number;
+    conversationId: string;
+    authoritativeTaskId: string | null;
+    updatedAt: Date;
+  },
+) {
+  const conversation = await lockedConversation(input.tx, input);
+  await input.tx
+    .update(conversations)
+    .set({
+      status: "awaiting_input",
+      upstreamTaskId: input.authoritativeTaskId,
+      previousResponseId: input.authoritativeTaskId,
+      version: conversation.version + 1,
+      completedAt: null,
+      updatedAt: input.updatedAt,
+    })
+    .where(
+      and(
+        eq(conversations.id, input.conversationId),
+        eq(conversations.userId, input.userId),
+        eq(conversations.version, conversation.version),
+      ),
+    );
+}

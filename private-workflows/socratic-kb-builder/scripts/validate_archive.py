@@ -48,7 +48,14 @@ REQUIRED_IMAGE_DISCOVERY_METHODS = {
     "open_graph",
     "gallery",
     "official_document",
+    "customer_upload",
 }
+OFFICIAL_LOGO_SOURCE_KINDS = {
+    "official_web",
+    "official_document",
+    "official_logo_upload",
+}
+UPLOAD_SOURCE_KINDS = {"official_logo_upload", "user_upload"}
 
 FORMAL_START = "<!-- FRONTMIND_FORMAL_CONTENT_START -->"
 FORMAL_END = "<!-- FRONTMIND_FORMAL_CONTENT_END -->"
@@ -157,9 +164,12 @@ ASSET_KEYS = {
     "sourceAssetUrl",
     "sourceDocumentPath",
     "sourceKind",
+    "sourceUploadIndex",
+    "sourceUploadFileId",
     "sourceUploadSha256",
     "sourceUploadFilename",
     "sourceUploadMimeType",
+    "sourceUploadSizeBytes",
     "ownership",
     "assetType",
     "displayRole",
@@ -333,6 +343,123 @@ def require_exact_keys(
     missing = sorted(required - actual)
     validation.require(not unexpected, f"{where} has unexpected fields: {unexpected}")
     validation.require(not missing, f"{where} is missing fields: {missing}")
+
+
+def validate_source_upload_provenance(
+    obj: dict[str, Any],
+    where: str,
+    validation: Validation,
+    *,
+    source_label: str = "customer upload",
+) -> tuple[str, str, str]:
+    required = {
+        "sourceUploadSha256",
+        "sourceUploadFilename",
+        "sourceUploadMimeType",
+    }
+    validation.require(
+        required <= set(obj),
+        f"{where} {source_label} requires sourceUploadSha256, "
+        "sourceUploadFilename and sourceUploadMimeType",
+    )
+    digest = require_string(
+        obj, "sourceUploadSha256", where, validation, optional=True
+    ).lower()
+    filename = require_string(
+        obj, "sourceUploadFilename", where, validation, optional=True
+    )
+    mime_type = require_string(
+        obj, "sourceUploadMimeType", where, validation, optional=True
+    ).lower()
+    validation.require(
+        obj.get("sourceUploadSha256") == digest
+        and bool(re.fullmatch(r"[0-9a-f]{64}", digest)),
+        f"{where}.sourceUploadSha256 must be 64 lowercase hexadecimal characters",
+    )
+    validation.require(
+        bool(filename)
+        and obj.get("sourceUploadFilename") == filename
+        and filename not in {".", ".."}
+        and "/" not in filename
+        and "\\" not in filename
+        and len(filename) <= 255
+        and not any(
+            ord(character) < 32 or ord(character) == 127
+            for character in filename
+        ),
+        f"{where}.sourceUploadFilename must be a safe basename",
+    )
+    validation.require(
+        obj.get("sourceUploadMimeType") == mime_type
+        and mime_type in USER_UPLOAD_SOURCE_MIME_TYPES,
+        f"{where}.sourceUploadMimeType must be a normalized supported image MIME type",
+    )
+    return digest, filename, mime_type
+
+
+def validate_official_logo_upload_provenance(
+    obj: dict[str, Any],
+    where: str,
+    validation: Validation,
+    *,
+    packaged_sha256: str,
+    packaged_mime_type: str,
+    packaged_bytes: Any,
+) -> str:
+    digest, _, mime_type = validate_source_upload_provenance(
+        obj,
+        where,
+        validation,
+        source_label="official_logo_upload",
+    )
+    required = {
+        "sourceUploadIndex",
+        "sourceUploadFileId",
+        "sourceUploadSizeBytes",
+    }
+    validation.require(
+        required <= set(obj),
+        f"{where} official_logo_upload requires sourceUploadIndex, "
+        "sourceUploadFileId and sourceUploadSizeBytes in addition to the "
+        "standard upload provenance fields",
+    )
+    upload_index = obj.get("sourceUploadIndex")
+    upload_file_id = obj.get("sourceUploadFileId")
+    upload_size_bytes = obj.get("sourceUploadSizeBytes")
+    validation.require(
+        isinstance(upload_index, int)
+        and not isinstance(upload_index, bool)
+        and upload_index == 0,
+        f"{where}.sourceUploadIndex must equal 0",
+    )
+    validation.require(
+        isinstance(upload_file_id, str)
+        and bool(upload_file_id.strip())
+        and upload_file_id == upload_file_id.strip()
+        and len(upload_file_id) <= 512
+        and not any(
+            ord(character) < 32 or ord(character) == 127
+            for character in upload_file_id
+        ),
+        f"{where}.sourceUploadFileId must be a safe non-empty identifier",
+    )
+    validation.require(
+        isinstance(upload_size_bytes, int)
+        and not isinstance(upload_size_bytes, bool)
+        and upload_size_bytes > 0
+        and upload_size_bytes == packaged_bytes,
+        f"{where}.sourceUploadSizeBytes must equal the packaged Logo byte length",
+    )
+    validation.require(
+        digest == packaged_sha256,
+        f"{where}.sourceUploadSha256 must equal the packaged Logo SHA-256",
+    )
+    validation.require(
+        mime_type == packaged_mime_type
+        and mime_type in set(IMAGE_TYPES.values()),
+        f"{where}.sourceUploadMimeType must equal the packaged AVIF, GIF, JPEG, PNG or WebP MIME type",
+    )
+    return digest
 
 
 def image_magic_matches(data: bytes, mime: str) -> bool:
@@ -1350,27 +1477,6 @@ def validate_archive(path: Path) -> list[str]:
                 where,
                 validation,
             )
-            source_upload_sha256 = require_string(
-                raw_asset,
-                "sourceUploadSha256",
-                where,
-                validation,
-                optional=True,
-            ).lower()
-            source_upload_filename = require_string(
-                raw_asset,
-                "sourceUploadFilename",
-                where,
-                validation,
-                optional=True,
-            )
-            source_upload_mime_type = require_string(
-                raw_asset,
-                "sourceUploadMimeType",
-                where,
-                validation,
-                optional=True,
-            ).lower()
             ownership = require_string(raw_asset, "ownership", where, validation)
             asset_type = require_string(raw_asset, "assetType", where, validation)
             display_role = require_string(
@@ -1384,57 +1490,67 @@ def validate_archive(path: Path) -> list[str]:
                 f"{where}.ownership must be first_party",
             )
             is_user_upload = source_kind == "user_upload"
+            is_official_logo_upload = source_kind == "official_logo_upload"
+            is_customer_upload = source_kind in UPLOAD_SOURCE_KINDS
             validation.require(
-                source_kind
-                in {"official_web", "official_document", "user_upload"},
+                source_kind in OFFICIAL_LOGO_SOURCE_KINDS | {"user_upload"},
                 f"{where}.sourceKind is invalid",
             )
-            if is_user_upload:
+            if is_customer_upload:
                 validation.require(
                     not source_page_url
                     and not source_asset_url
                     and not source_document_path,
-                    f"{where} user_upload must not claim a discovered URL or source document",
+                    f"{where} customer upload must not claim a discovered URL "
+                    "or source document",
                 )
-                validation.require(
-                    {"sourceUploadSha256", "sourceUploadFilename", "sourceUploadMimeType"}
-                    <= set(raw_asset),
-                    f"{where} user_upload requires sourceUploadSha256, "
-                    "sourceUploadFilename and sourceUploadMimeType",
-                )
-                validation.require(
-                    raw_asset.get("sourceUploadSha256") == source_upload_sha256
-                    and bool(re.fullmatch(r"[0-9a-f]{64}", source_upload_sha256)),
-                    f"{where}.sourceUploadSha256 must be 64 lowercase hexadecimal characters",
-                )
+                if is_official_logo_upload:
+                    source_upload_sha256 = (
+                        validate_official_logo_upload_provenance(
+                            raw_asset,
+                            where,
+                            validation,
+                            packaged_sha256=digest,
+                            packaged_mime_type=mime,
+                            packaged_bytes=raw_asset.get("bytes"),
+                        )
+                    )
+                else:
+                    source_upload_sha256, _, _ = (
+                        validate_source_upload_provenance(
+                            raw_asset,
+                            where,
+                            validation,
+                            source_label=source_kind,
+                        )
+                    )
                 if source_upload_sha256:
                     validation.require(
                         source_upload_sha256 not in source_upload_hashes,
                         f"duplicate original customer upload hash: {source_upload_sha256}",
                     )
                     source_upload_hashes.add(source_upload_sha256)
-                validation.require(
-                    bool(source_upload_filename)
-                    and raw_asset.get("sourceUploadFilename") == source_upload_filename
-                    and source_upload_filename not in {".", ".."}
-                    and "/" not in source_upload_filename
-                    and "\\" not in source_upload_filename
-                    and len(source_upload_filename) <= 255
-                    and not any(
-                        ord(character) < 32 or ord(character) == 127
-                        for character in source_upload_filename
-                    ),
-                    f"{where}.sourceUploadFilename must be a safe basename",
-                )
-                validation.require(
-                    raw_asset.get("sourceUploadMimeType") == source_upload_mime_type
-                    and source_upload_mime_type in USER_UPLOAD_SOURCE_MIME_TYPES,
-                    f"{where}.sourceUploadMimeType must be a normalized supported image MIME type",
-                )
-                validation.require(
-                    asset_type == "customer_supplied" and display_role == "inline",
-                    f"{where} user_upload must use customer_supplied/inline",
-                )
+                if is_user_upload:
+                    validation.require(
+                        asset_type == "customer_supplied"
+                        and display_role == "inline",
+                        f"{where} user_upload must use customer_supplied/inline",
+                    )
+                    validation.require(
+                        not {
+                            "sourceUploadIndex",
+                            "sourceUploadFileId",
+                            "sourceUploadSizeBytes",
+                        }
+                        & set(raw_asset),
+                        f"{where} user_upload must not carry official Logo "
+                        "upload ledger fields",
+                    )
+                if is_official_logo_upload:
+                    validation.require(
+                        asset_type == "brand_identity" and display_role == "badge",
+                        f"{where} official_logo_upload must use brand_identity/badge",
+                    )
             else:
                 validation.require(
                     bool(source_page_url)
@@ -1449,6 +1565,9 @@ def validate_archive(path: Path) -> list[str]:
                         "sourceUploadSha256",
                         "sourceUploadFilename",
                         "sourceUploadMimeType",
+                        "sourceUploadIndex",
+                        "sourceUploadFileId",
+                        "sourceUploadSizeBytes",
                     }
                     & set(raw_asset),
                     f"{where} official Logo must not carry user-upload provenance",
@@ -1771,11 +1890,23 @@ def validate_archive(path: Path) -> list[str]:
                     validation,
                     optional=True,
                 )
+                candidate_source_kind = require_string(
+                    candidate,
+                    "sourceKind",
+                    where,
+                    validation,
+                    optional=True,
+                )
                 method = require_string(candidate, "method", where, validation)
                 validation.require(
                     method in REQUIRED_IMAGE_DISCOVERY_METHODS,
                     f"{where}.method is invalid",
                 )
+                if candidate_source_kind:
+                    validation.require(
+                        candidate_source_kind in OFFICIAL_LOGO_SOURCE_KINDS,
+                        f"{where}.sourceKind is invalid",
+                    )
                 for key, candidate_url in (
                     ("url", url),
                     ("sourcePageUrl", source_page),
@@ -1794,20 +1925,43 @@ def validate_archive(path: Path) -> list[str]:
                         not in candidate_url.split("://", 1)[-1].split("/", 1)[0],
                         f"{where}.{key} must be a credential-free HTTP(S) URL",
                     )
-                validation.require(
-                    bool(url)
-                    or (
-                        bool(source_document)
-                        and source_document in entries
-                    ),
-                    f"{where} requires a source URL or packaged source document",
-                )
+                if method == "customer_upload":
+                    validation.require(
+                        candidate_source_kind == "official_logo_upload",
+                        f"{where} customer_upload must use "
+                        "sourceKind official_logo_upload",
+                    )
+                    validation.require(
+                        not url and not source_page and not source_document,
+                        f"{where} customer_upload must not claim a source URL "
+                        "or packaged source document",
+                    )
+                    candidate_upload_key = (
+                        "official_logo_upload:"
+                        f"{candidate.get('assetId') or candidate.get('rejectionReason') or status}"
+                    )
+                else:
+                    candidate_upload_key = ""
+                    validation.require(
+                        candidate_source_kind != "official_logo_upload",
+                        f"{where} official_logo_upload must use method "
+                        "customer_upload",
+                    )
+                    validation.require(
+                        bool(url)
+                        or (
+                            bool(source_document)
+                            and source_document in entries
+                        ),
+                        f"{where} requires a source URL or packaged source document",
+                    )
                 validation.require(
                     status in {"eligible", "rejected", "uninspected"},
                     f"{where}.status is invalid",
                 )
                 candidate_key = (
-                    url
+                    candidate_upload_key
+                    or url
                     or f"{source_document}:{candidate.get('assetId') or candidate.get('rejectionReason') or status}"
                 )
                 validation.require(
@@ -1821,16 +1975,33 @@ def validate_archive(path: Path) -> list[str]:
                         candidate, "assetId", where, validation
                     )
                     asset = assets.get(asset_id)
-                    validation.require(
-                        asset is not None
-                        and candidate.get("rejectionReason") is None
-                        and asset.get("sourceAssetUrl") == candidate.get("url")
-                        and asset.get("sourcePageUrl")
-                        == candidate.get("sourcePageUrl")
-                        and asset.get("sourceDocumentPath")
-                        == candidate.get("sourceDocumentPath"),
-                        f"{where} does not match its packaged asset",
-                    )
+                    if method == "customer_upload":
+                        validation.require(
+                            asset is not None
+                            and candidate.get("rejectionReason") is None
+                            and asset.get("sourceKind")
+                            == "official_logo_upload"
+                            and candidate_source_kind
+                            == "official_logo_upload",
+                            f"{where} does not match its packaged uploaded Logo",
+                        )
+                    else:
+                        validation.require(
+                            asset is not None
+                            and candidate.get("rejectionReason") is None
+                            and asset.get("sourceAssetUrl")
+                            == candidate.get("url")
+                            and asset.get("sourcePageUrl")
+                            == candidate.get("sourcePageUrl")
+                            and asset.get("sourceDocumentPath")
+                            == candidate.get("sourceDocumentPath")
+                            and (
+                                not candidate_source_kind
+                                or asset.get("sourceKind")
+                                == candidate_source_kind
+                            ),
+                            f"{where} does not match its packaged asset",
+                        )
                 elif status == "rejected":
                     rejected_candidates.append(candidate)
                     validation.require(
@@ -1867,7 +2038,7 @@ def validate_archive(path: Path) -> list[str]:
                 }
                 == official_logo_asset_ids,
                 "the official Logo must appear exactly once as eligible; "
-                "customer uploads must not enter imageSelection",
+                "generic user_upload images must not enter imageSelection",
             )
         validation.require(
             isinstance(discovery_methods, list)
@@ -1991,7 +2162,7 @@ def validate_archive(path: Path) -> list[str]:
         validation.require(
             packaged_completed == len(official_logo_asset_ids),
             "00_completeness.json acquisition.images.completed must equal "
-            "the official Logo count; customer uploads are excluded",
+            "the official Logo count; generic user_upload images are excluded",
         )
         crawl_report_info = entries.get("00_crawl_coverage_report.md")
         if crawl_report_info is not None:

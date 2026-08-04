@@ -14,6 +14,7 @@ import {
   isAmbiguousKnowledgeBaseAdvance,
   isKnowledgeBaseAcknowledgementOnlyOutput,
   knowledgeBaseObservationConversationStorageId,
+  knowledgeBaseProtocolErrorAllowsSameTaskRecovery,
   knowledgeBaseProtocolErrorIsRetryable,
   knowledgeBaseStagedArtifactMatchesAuthority,
   knowledgeBaseSuccessfulTurnIdentity,
@@ -62,6 +63,24 @@ describe("knowledge-base notice recovery contract", () => {
         code: "PROGRESS_PROTOCOL_INVALID",
         activeTurnId: null,
       }),
+    ).toBe(false);
+  });
+
+  it("only rereads the original task for recoverable package states", () => {
+    expect(
+      knowledgeBaseProtocolErrorAllowsSameTaskRecovery(
+        "FINAL_PACKAGE_MISSING",
+      ),
+    ).toBe(true);
+    expect(
+      knowledgeBaseProtocolErrorAllowsSameTaskRecovery(
+        "PACKAGE_REBIND_REQUIRED",
+      ),
+    ).toBe(true);
+    expect(
+      knowledgeBaseProtocolErrorAllowsSameTaskRecovery(
+        "PROGRESS_PROTOCOL_INVALID",
+      ),
     ).toBe(false);
   });
 });
@@ -894,6 +913,29 @@ describe("knowledge-base first-leaf-only image delivery", () => {
         image("logo"),
         image("business-visual"),
       ]),
+    ).toThrow("必须只展示一张企业官方主 Logo");
+    expect(() =>
+      assertKnowledgeBaseInitialImageDelivery([
+        { role: "assistant", type: "message", content: "1.1 正文" },
+      ]),
+    ).toThrow("必须只展示一张企业官方主 Logo");
+    expect(
+      assertKnowledgeBaseInitialImageDelivery(
+        [{ role: "assistant", type: "message", content: "1.1 正文" }],
+        undefined,
+        { allowMissing: true },
+      ),
+    ).toBe(0);
+    expect(() =>
+      assertKnowledgeBaseInitialImageDelivery(
+        [
+          { role: "assistant", type: "message", content: "1.1 正文" },
+          image("logo"),
+          image("business-visual"),
+        ],
+        undefined,
+        { allowMissing: true },
+      ),
     ).toThrow("必须只展示一张企业官方主 Logo");
   });
 

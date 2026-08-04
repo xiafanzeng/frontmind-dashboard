@@ -60,6 +60,22 @@ function formatFileSize(bytes: number) {
 
 const AMBIGUOUS_ADVANCE_PATTERN =
   /^(继续|下一步|下一个|继续吧|请继续|next)[。！!]*$/i;
+const OFFICIAL_LOGO_MIME_TYPES = new Set([
+  "image/avif",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+const OFFICIAL_LOGO_EXTENSION = /\.(?:avif|gif|jpe?g|png|webp)$/iu;
+
+function isSupportedOfficialLogoFile(file: File) {
+  const mimeType = file.type.trim().toLowerCase();
+  return (
+    OFFICIAL_LOGO_MIME_TYPES.has(mimeType) ||
+    (!mimeType && OFFICIAL_LOGO_EXTENSION.test(file.name))
+  );
+}
 
 const AGENT_COMPOSER_MAX_ROWS = 8;
 const AGENT_COMPOSER_FALLBACK_LINE_HEIGHT_PX = 24;
@@ -208,6 +224,17 @@ export default function ChatInput({
     syncKnowledgeBaseSnapshot &&
     Boolean(knowledgeBaseProgress?.packageAllowed) &&
     !currentKnowledgeLeaf;
+  const officialLogoRequired =
+    syncKnowledgeBaseSnapshot &&
+    knowledgeBaseProgress?.build.logoRequired === true;
+
+  useEffect(() => {
+    if (!officialLogoRequired) return;
+    // The Logo gate accepts one dedicated image only. Do not carry a stale
+    // composer draft or pre-gate attachments into this special turn.
+    setText("");
+    setFiles([]);
+  }, [officialLogoRequired]);
 
   const clearSelectedFiles = useCallback(() => {
     setFiles([]);
@@ -230,21 +257,40 @@ export default function ChatInput({
     }
   }, [modelMenuOpen]);
 
-  const addFiles = useCallback(async (newFiles: File[]) => {
-    const previews: FilePreview[] = [];
-    for (const file of newFiles) {
-      const sizeError = chatAttachmentSizeError(file);
-      if (sizeError) {
-        toast.error("文件过大", { description: sizeError });
-        continue;
+  const addFiles = useCallback(
+    async (newFiles: File[]) => {
+      if (officialLogoRequired && newFiles.length !== 1) {
+        toast.error("请只选择一张企业主 Logo");
+        return;
       }
-      const id = `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      previews.push({ file, id });
-    }
-    if (previews.length > 0) {
-      setFiles((prev) => [...prev, ...previews]);
-    }
-  }, []);
+      if (
+        officialLogoRequired &&
+        newFiles[0] &&
+        !isSupportedOfficialLogoFile(newFiles[0])
+      ) {
+        toast.error("Logo 图片格式不支持", {
+          description: "请上传 PNG、JPEG、WebP、AVIF 或 GIF 原图。",
+        });
+        return;
+      }
+      const previews: FilePreview[] = [];
+      for (const file of newFiles) {
+        const sizeError = chatAttachmentSizeError(file);
+        if (sizeError) {
+          toast.error("文件过大", { description: sizeError });
+          continue;
+        }
+        const id = `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        previews.push({ file, id });
+      }
+      if (previews.length > 0) {
+        setFiles((prev) =>
+          officialLogoRequired ? previews.slice(0, 1) : [...prev, ...previews],
+        );
+      }
+    },
+    [officialLogoRequired],
+  );
 
   const removeFile = useCallback((id: string) => {
     setFiles((prev) => prev.filter((f) => f.id !== id));
@@ -259,6 +305,20 @@ export default function ChatInput({
         knowledgeBaseNotStarted
       ) {
         return;
+      }
+      if (officialLogoRequired) {
+        if (selectedFiles.length !== 1) {
+          toast.error("请先上传一张企业官方主 Logo", {
+            description: "上传并校验成功后，才可以确认第一个知识节点。",
+          });
+          return;
+        }
+        if (!isSupportedOfficialLogoFile(selectedFiles[0]!.file)) {
+          toast.error("Logo 图片格式不支持", {
+            description: "请上传 PNG、JPEG、WebP、AVIF 或 GIF 原图。",
+          });
+          return;
+        }
       }
       if (
         syncKnowledgeBaseSnapshot &&
@@ -315,6 +375,7 @@ export default function ChatInput({
       inputLocked,
       isSending,
       knowledgeBaseNotStarted,
+      officialLogoRequired,
       knowledgeBaseProgress,
       currentKnowledgeLeaf,
       responseLogicContext,
@@ -390,6 +451,7 @@ export default function ChatInput({
     inputLocked ||
     isUploading ||
     knowledgeBaseNotStarted ||
+    officialLogoRequired ||
     (syncKnowledgeBaseSnapshot &&
       Boolean(currentKnowledgeLeaf) &&
       !currentNodePresentationReady);
@@ -432,7 +494,9 @@ export default function ChatInput({
                 "mb-3 rounded-2xl border px-4 py-3 shadow-sm",
                 knowledgeBaseComplete
                   ? "border-emerald-200 bg-emerald-50/90"
-                  : "border-violet-200 bg-violet-50/90",
+                  : officialLogoRequired
+                    ? "border-amber-300 bg-amber-50/95"
+                    : "border-violet-200 bg-violet-50/90",
               )}
               data-testid="knowledge-node-action-card"
             >
@@ -449,15 +513,40 @@ export default function ChatInput({
                 <>
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0">
-                      <p className="text-xs font-semibold tracking-wide text-violet-700">
-                        当前待确认
+                      <p
+                        className={cn(
+                          "text-xs font-semibold tracking-wide",
+                          officialLogoRequired
+                            ? "text-amber-700"
+                            : "text-violet-700",
+                        )}
+                      >
+                        {officialLogoRequired
+                          ? "需要上传企业主 Logo"
+                          : "当前待确认"}
                       </p>
-                      <p className="mt-1 truncate text-sm font-semibold text-violet-950">
+                      <p
+                        className={cn(
+                          "mt-1 truncate text-sm font-semibold",
+                          officialLogoRequired
+                            ? "text-amber-950"
+                            : "text-violet-950",
+                        )}
+                      >
                         {currentKnowledgeLeaf!.branchTitle} /{" "}
                         {currentKnowledgeLeaf!.title}
                       </p>
-                      <p className="mt-1 text-xs leading-5 text-violet-800/80">
-                        {currentNodePresentationReady
+                      <p
+                        className={cn(
+                          "mt-1 text-xs leading-5",
+                          officialLogoRequired
+                            ? "text-amber-900/80"
+                            : "text-violet-800/80",
+                        )}
+                      >
+                        {officialLogoRequired
+                          ? "官网、公开来源和初始资料中未找到可验证的官方主 Logo。请上传一张原图后继续；透明背景 PNG 最佳，宽高均需至少 256 像素。"
+                          : currentNodePresentationReady
                           ? "可直接确认，也可以输入修改意见或上传补充资料。"
                           : "正在处理当前节点内容，显示完整后才可确认。"}
                       </p>
@@ -466,17 +555,45 @@ export default function ChatInput({
                       <Button
                         type="button"
                         size="sm"
-                        onClick={() => void confirmCurrentContent()}
-                        disabled={quickActionsDisabled}
+                        onClick={() => {
+                          if (officialLogoRequired) {
+                            if (files.length === 1) void handleSubmit();
+                            else fileInputRef.current?.click();
+                            return;
+                          }
+                          void confirmCurrentContent();
+                        }}
+                        disabled={
+                          officialLogoRequired
+                            ? inputLocked || isSending || isUploading
+                            : quickActionsDisabled
+                        }
                         className="rounded-xl"
                       >
-                        <Check className="h-4 w-4" />
-                        确认当前内容
+                        {officialLogoRequired ? (
+                          <Upload className="h-4 w-4" />
+                        ) : (
+                          <Check className="h-4 w-4" />
+                        )}
+                        {officialLogoRequired
+                          ? files.length === 1
+                            ? "提交 Logo 并继续"
+                            : "选择 Logo 原图"
+                          : "确认当前内容"}
                       </Button>
                     </div>
                   </div>
-                  <p className="mt-2 text-xs text-violet-700/75">
-                    如需修改，请在下方输入意见或上传资料；建议尽量上传与当前部分相关的补充图片，以丰富知识库内容。系统返回修订稿后，再确认当前内容。
+                  <p
+                    className={cn(
+                      "mt-2 text-xs",
+                      officialLogoRequired
+                        ? "text-amber-800/80"
+                        : "text-violet-700/75",
+                    )}
+                  >
+                    {officialLogoRequired
+                      ? "Logo 上传轮不会推进节点。系统校验并重新呈现当前节点后，才会恢复“确认当前内容”。"
+                      : "如需修改，请在下方输入意见或上传资料；建议尽量上传与当前部分相关的补充图片，以丰富知识库内容。系统返回修订稿后，再确认当前内容。"}
                   </p>
                 </>
               )}
@@ -582,7 +699,9 @@ export default function ChatInput({
                     <Paperclip className="w-4 h-4" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>上传文件</TooltipContent>
+                <TooltipContent>
+                  {officialLogoRequired ? "上传企业主 Logo" : "上传文件"}
+                </TooltipContent>
               </Tooltip>
             </div>
 
@@ -605,6 +724,8 @@ export default function ChatInput({
                       : "FrontMind 正在编排内容制作流程..."
                     : knowledgeBaseNotStarted
                       ? "请先点击上方“构建企业知识库”完成资料采集设置"
+                      : officialLogoRequired
+                        ? "请使用左侧按钮上传企业主 Logo，上传后才可继续"
                       : syncKnowledgeBaseSnapshot
                         ? "输入修改意见，或上传资料；提交后仍停留当前节点"
                         : "输入你的内容需求，按 Enter 开始编排..."
@@ -613,7 +734,8 @@ export default function ChatInput({
                 inputLocked ||
                 isSending ||
                 isUploading ||
-                knowledgeBaseNotStarted
+                knowledgeBaseNotStarted ||
+                officialLogoRequired
               }
               rows={1}
               data-max-rows={AGENT_COMPOSER_MAX_ROWS}
@@ -728,7 +850,9 @@ export default function ChatInput({
           {/* Hint text */}
           <div className="px-4 pb-2">
             <p className="text-xs text-muted-foreground/40">
-              {syncKnowledgeBaseSnapshot
+              {officialLogoRequired
+                ? "仅接受一张 PNG、JPEG、WebP、AVIF 或 GIF 原图 · 宽高均至少 256 像素"
+                : syncKnowledgeBaseSnapshot
                 ? "Enter 提交修订 · Shift+Enter 换行 · 支持多文件选择与拖拽上传"
                 : "Enter 发送 · Shift+Enter 换行 · 支持资料、图片与交付文件上传"}
             </p>
@@ -740,7 +864,12 @@ export default function ChatInput({
       <input
         ref={fileInputRef}
         type="file"
-        multiple
+        multiple={!officialLogoRequired}
+        accept={
+          officialLogoRequired
+            ? "image/png,image/jpeg,image/webp,image/avif,image/gif"
+            : undefined
+        }
         disabled={
           inputLocked || isSending || isUploading || knowledgeBaseNotStarted
         }

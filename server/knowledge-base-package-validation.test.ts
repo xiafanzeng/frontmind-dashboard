@@ -12,6 +12,13 @@ import {
 
 const logoSha256 = "a".repeat(64);
 const customerSha256 = "c".repeat(64);
+const expectedOfficialLogoUpload = {
+  sourceSha256: logoSha256,
+  fileId: "file-official-logo",
+  filename: "company-logo.png",
+  mimeType: "image/png",
+  sizeBytes: 42,
+};
 
 function fixture() {
   return {
@@ -78,6 +85,28 @@ function fixture() {
       },
     ] as KnowledgeAsset[],
     expectedLogoSha256: logoSha256,
+  };
+}
+
+function officialLogoUploadFixture() {
+  const input = fixture();
+  Object.assign(input.assets[0]!, {
+    sourceKind: "official_logo_upload" as const,
+    sourceUploadIndex: 0,
+    sourceUploadFileId: expectedOfficialLogoUpload.fileId,
+    sourceUploadFilename: expectedOfficialLogoUpload.filename,
+    sourceUploadMimeType: expectedOfficialLogoUpload.mimeType,
+    sourceUploadSizeBytes: expectedOfficialLogoUpload.sizeBytes,
+    sourceUploadSha256: expectedOfficialLogoUpload.sourceSha256,
+    ownership: "first_party" as const,
+    assetType: "brand_identity" as const,
+    displayRole: "badge" as const,
+  });
+  return {
+    ...input,
+    packageSchemaVersion: 4 as const,
+    expectedCustomerUploads: [],
+    expectedOfficialLogoUpload,
   };
 }
 
@@ -249,6 +278,68 @@ describe("knowledge-base final package binding", () => {
         ],
       }),
     ).toMatchObject({ customerUploadCount: 1 });
+  });
+
+  it("binds a dedicated official Logo upload without counting it as a customer image", () => {
+    expect(
+      assertKnowledgeBasePackageMatchesBuild(officialLogoUploadFixture()),
+    ).toMatchObject({
+      logoSha256,
+      customerUploadCount: 0,
+    });
+  });
+
+  it.each([
+    [
+      "index",
+      (input: ReturnType<typeof officialLogoUploadFixture>) => {
+        input.assets[0]!.sourceUploadIndex = 1;
+      },
+    ],
+    [
+      "file id",
+      (input: ReturnType<typeof officialLogoUploadFixture>) => {
+        input.assets[0]!.sourceUploadFileId = "another-file";
+      },
+    ],
+    [
+      "filename",
+      (input: ReturnType<typeof officialLogoUploadFixture>) => {
+        input.assets[0]!.sourceUploadFilename = "another-logo.png";
+      },
+    ],
+    [
+      "MIME type",
+      (input: ReturnType<typeof officialLogoUploadFixture>) => {
+        input.assets[0]!.sourceUploadMimeType = "image/webp";
+      },
+    ],
+    [
+      "size",
+      (input: ReturnType<typeof officialLogoUploadFixture>) => {
+        input.assets[0]!.sourceUploadSizeBytes = 43;
+      },
+    ],
+    [
+      "source hash",
+      (input: ReturnType<typeof officialLogoUploadFixture>) => {
+        input.assets[0]!.sourceUploadSha256 = "d".repeat(64);
+      },
+    ],
+  ])("rejects a mismatched official Logo upload %s", (_label, mutate) => {
+    const input = officialLogoUploadFixture();
+    mutate(input);
+    expect(() => assertKnowledgeBasePackageMatchesBuild(input)).toThrow(
+      "官方主 Logo 与服务端原始上传账本不一致",
+    );
+  });
+
+  it("rejects an uploaded-Logo provenance claim without a server ledger", () => {
+    const { expectedOfficialLogoUpload: _ledger, ...input } =
+      officialLogoUploadFixture();
+    expect(() => assertKnowledgeBasePackageMatchesBuild(input)).toThrow(
+      "服务端没有对应上传账本",
+    );
   });
 
   it("rejects a schema v3 archive when the server ledger contains customer images", () => {

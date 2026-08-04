@@ -107,6 +107,8 @@ export interface KnowledgeBaseProgressDto {
     status: KnowledgeBaseBuildStatus;
     revision: number;
     currentLeafId: string | null;
+    /** True while the first knowledge leaf is waiting for an official Logo upload. */
+    logoRequired?: boolean;
     protocolError: string | null;
     awaitingResponseSince?: number | null;
     updatedAt: number;

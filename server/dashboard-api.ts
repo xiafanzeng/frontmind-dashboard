@@ -137,6 +137,14 @@ import {
   imageMimeByExtension,
   validateProgressReportScreenshot,
 } from "./knowledge-archive-image-validation";
+import {
+  decodeKnowledgeArchiveHeader as decodeHeader,
+  knowledgeArchiveTitleFromPath as titleFromPath,
+  normalizeKnowledgeArchiveTextDocument as normalizeTextDocument,
+  parseDashboardRevisionHeader as dashboardRevisionHeader,
+  safeKnowledgeArchivePath as safeArchivePath,
+  validateKnowledgeArchiveEntryPath as validateArchiveEntryPath,
+} from "./knowledge-archive-text-utils";
 
 export { validateProgressReportScreenshot } from "./knowledge-archive-image-validation";
 
@@ -835,7 +843,23 @@ const internalPackageManifestSchema = z
             sourceAssetUrl: packageSourceUrlSchema.optional(),
             sourceDocumentPath: z.string().trim().min(1).max(600).optional(),
             sourceKind: z
-              .enum(["official_web", "official_document", "user_upload"])
+              .enum([
+                "official_web",
+                "official_document",
+                "official_logo_upload",
+                "user_upload",
+              ])
+              .optional(),
+            sourceUploadIndex: z.number().int().min(0).max(99).optional(),
+            sourceUploadFileId: z
+              .string()
+              .trim()
+              .min(1)
+              .max(512)
+              .refine(
+                (value) => !/[\u0000-\u001f\u007f]/u.test(value),
+                "source upload file ID must not contain control characters",
+              )
               .optional(),
             sourceUploadSha256: z
               .string()
@@ -869,6 +893,12 @@ const internalPackageManifestSchema = z
                 "image/webp",
                 "image/x-icon",
               ])
+              .optional(),
+            sourceUploadSizeBytes: z
+              .number()
+              .int()
+              .positive()
+              .max(MAX_IMAGE_BYTES)
               .optional(),
             ownership: packageAssetOwnershipSchema,
             assetType: packageAssetTypeSchema.optional(),
@@ -965,7 +995,12 @@ const internalPackageManifestSchema = z
                   .max(600)
                   .optional(),
                 sourceKind: z
-                  .enum(["official_web", "official_document", "user_upload"])
+                  .enum([
+                    "official_web",
+                    "official_document",
+                    "official_logo_upload",
+                    "user_upload",
+                  ])
                   .optional(),
                 method: z.string().trim().min(1).max(100),
                 status: z.enum(["eligible", "rejected", "uninspected"]),
@@ -1164,14 +1199,23 @@ const internalPackageManifestSchema = z
             });
           }
           if (value.schemaVersion !== 4) return;
-          const provenanceFields = [
+          const customerUploadProvenanceFields = [
             asset.sourceUploadSha256,
             asset.sourceUploadFilename,
             asset.sourceUploadMimeType,
           ];
+          const officialLogoUploadProvenanceFields = [
+            asset.sourceUploadIndex,
+            asset.sourceUploadFileId,
+            ...customerUploadProvenanceFields,
+            asset.sourceUploadSizeBytes,
+          ];
           if (asset.sourceKind === "user_upload") {
             if (
-              provenanceFields.some((field) => !field) ||
+              customerUploadProvenanceFields.some((field) => !field) ||
+              asset.sourceUploadIndex !== undefined ||
+              asset.sourceUploadFileId !== undefined ||
+              asset.sourceUploadSizeBytes !== undefined ||
               asset.sourcePageUrl !== undefined ||
               asset.sourceAssetUrl !== undefined ||
               asset.sourceDocumentPath !== undefined ||
@@ -1185,11 +1229,35 @@ const internalPackageManifestSchema = z
                   "Dashboard v4 customer upload requires exact upload provenance and customer_supplied/inline without discovered sources",
               });
             }
+          } else if (asset.sourceKind === "official_logo_upload") {
+            if (
+              officialLogoUploadProvenanceFields.some(
+                (field) => field === undefined,
+              ) ||
+              asset.sourceUploadIndex !== 0 ||
+              asset.sourcePageUrl !== undefined ||
+              asset.sourceAssetUrl !== undefined ||
+              asset.sourceDocumentPath !== undefined ||
+              asset.sourceUploadSha256 !== asset.sha256.toLowerCase() ||
+              asset.sourceUploadSizeBytes !== asset.bytes ||
+              asset.ownership !== "first_party" ||
+              asset.assetType !== "brand_identity" ||
+              asset.displayRole !== "badge"
+            ) {
+              context.addIssue({
+                code: "custom",
+                path: ["assets", index],
+                message:
+                  "Dashboard v4 official Logo upload requires all six upload provenance fields and first_party/brand_identity/badge without discovered sources",
+              });
+            }
           } else if (
             !["official_web", "official_document"].includes(
               asset.sourceKind || "",
             ) ||
-            provenanceFields.some((field) => field !== undefined) ||
+            officialLogoUploadProvenanceFields.some(
+              (field) => field !== undefined,
+            ) ||
             asset.assetType !== "brand_identity" ||
             asset.displayRole !== "badge"
           ) {
@@ -1524,97 +1592,6 @@ const executableArchiveExtensions = new Set([
   ".sh",
   ".so",
 ]);
-
-function decodeHeader(value: string | undefined, fallback: string) {
-  if (!value) return fallback;
-  try {
-    return decodeURIComponent(value).slice(0, 512);
-  } catch {
-    return value.slice(0, 512);
-  }
-}
-
-function dashboardRevisionHeader(value: string | undefined) {
-  if (value === undefined || value.trim() === "") return undefined;
-  if (!/^\d+$/.test(value.trim())) {
-    throw new Error("看板版本号无效，请刷新后重试");
-  }
-  return Number(value);
-}
-
-function safeArchivePath(value: string) {
-  return value
-    .replaceAll("\\", "/")
-    .split("/")
-    .filter((part) => part && part !== "." && part !== "..")
-    .join("/")
-    .slice(0, 512);
-}
-
-function validateArchiveEntryPath(value: string) {
-  if (
-    !value ||
-    value.includes("\0") ||
-    value.includes("\\") ||
-    value.startsWith("/") ||
-    /^[a-z]:/i.test(value)
-  ) {
-    throw new Error("知识库 ZIP 包含不安全的文件路径");
-  }
-  const parts = value.split("/");
-  if (parts.some((part) => !part || part === "." || part === "..")) {
-    throw new Error("知识库 ZIP 包含不安全的文件路径");
-  }
-  const normalized = parts.join("/");
-  if (normalized.length > 512) {
-    throw new Error("知识库 ZIP 中的文件路径过长");
-  }
-  return normalized;
-}
-
-function titleFromPath(filePath: string) {
-  return (
-    path
-      .basename(filePath, path.extname(filePath))
-      .replace(/^\d+[._-]*/, "")
-      .replace(/[-_]+/g, " ")
-      .trim() || "知识文档"
-  );
-}
-
-function htmlToMarkdownLikeText(html: string) {
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
-    .replace(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi, "# $1\n")
-    .replace(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi, "## $1\n")
-    .replace(/<h3\b[^>]*>([\s\S]*?)<\/h3>/gi, "### $1\n")
-    .replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "- $1\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function normalizeTextDocument(filePath: string, content: string) {
-  const extension = path.extname(filePath).toLowerCase();
-  if (extension === ".html" || extension === ".htm") {
-    return htmlToMarkdownLikeText(content);
-  }
-  if (extension === ".json") {
-    try {
-      return `\`\`\`json\n${JSON.stringify(JSON.parse(content), null, 2)}\n\`\`\``;
-    } catch {
-      return content;
-    }
-  }
-  return content.replace(/^\uFEFF/, "").trim();
-}
 
 function packageRelativePath(value: string) {
   return validateArchiveEntryPath(value.normalize("NFKC"));
@@ -2220,9 +2197,12 @@ function validateProfilePackage(input: {
       sourceAssetUrl: metadata.sourceAssetUrl,
       sourceDocumentPath: metadata.sourceDocumentPath,
       sourceKind: metadata.sourceKind,
+      sourceUploadIndex: metadata.sourceUploadIndex,
+      sourceUploadFileId: metadata.sourceUploadFileId,
       sourceUploadSha256: metadata.sourceUploadSha256,
       sourceUploadFilename: metadata.sourceUploadFilename,
       sourceUploadMimeType: metadata.sourceUploadMimeType,
+      sourceUploadSizeBytes: metadata.sourceUploadSizeBytes,
       ownership: metadata.ownership,
       assetType: metadata.assetType,
       displayRole: metadata.displayRole,
@@ -2287,6 +2267,7 @@ function validateProfilePackage(input: {
     for (const asset of enrichedAssets) {
       if (
         asset.sourceKind !== "user_upload" &&
+        asset.sourceKind !== "official_logo_upload" &&
         !asset.sourcePageUrl &&
         !asset.sourceDocumentPath
       ) {
@@ -2436,12 +2417,26 @@ function validateProfilePackage(input: {
             `${candidate.sourceDocumentPath || "unknown"}:${candidate.assetId || candidate.rejectionReason || candidate.status}`,
         ),
       ).size !== candidates.length ||
-      candidates.some(
-        (candidate) =>
+      candidates.some((candidate) => {
+        const isOfficialLogoUploadCandidate =
+          isCustomerUploadDashboardV4 &&
+          candidate.sourceKind === "official_logo_upload";
+        if (isOfficialLogoUploadCandidate) {
+          return (
+            candidate.method !== "customer_upload" ||
+            candidate.url !== undefined ||
+            candidate.sourcePageUrl !== undefined ||
+            candidate.sourceDocumentPath !== undefined
+          );
+        }
+        return (
           (!candidate.url && !candidate.sourceDocumentPath) ||
           (!candidate.sourcePageUrl && !candidate.sourceDocumentPath) ||
-          (isDashboardLogoContract && candidate.sourceKind === "user_upload"),
-      ) ||
+          (isDashboardLogoContract &&
+            (candidate.sourceKind === "user_upload" ||
+              candidate.method === "customer_upload"))
+        );
+      }) ||
       eligibleCandidates.length !== selection.eligibleFirstPartyImages ||
       rejectedCandidates.length !== rejected ||
       eligibleCandidates.length + rejectedCandidates.length !== inspected ||
@@ -2453,6 +2448,11 @@ function validateProfilePackage(input: {
         return (
           !asset ||
           (isDashboardLogoContract && asset.sourceKind === "user_upload") ||
+          ((asset?.sourceKind === "official_logo_upload" ||
+            candidate.sourceKind === "official_logo_upload") &&
+            (asset?.sourceKind !== "official_logo_upload" ||
+              candidate.sourceKind !== "official_logo_upload" ||
+              candidate.method !== "customer_upload")) ||
           candidate.rejectionReason !== undefined ||
           asset.sourceAssetUrl !== candidate.url ||
           asset.sourcePageUrl !== candidate.sourcePageUrl ||

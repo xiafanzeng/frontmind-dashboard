@@ -21,6 +21,7 @@ import type {
 import { knowledgeBaseOperationTypes } from "../shared/knowledge-base-progress";
 import { AuthServiceError } from "./auth-service";
 import {
+  markKnowledgeBaseConversationAwaitingInputInTransaction,
   markKnowledgeBaseConversationFailedInTransaction,
   persistKnowledgeBaseUserMessageInTransaction,
 } from "./knowledge-base-conversation-messages";
@@ -40,6 +41,9 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   expectedAttachmentCount?: number;
   userAttachmentCount?: number;
   awaitingClientAttachments?: boolean;
+  /** Safe tombstone for a browser upload rejected before any upstream POST. */
+  unpreparedCancellation?: boolean;
+  cancelledOperationKey?: string;
   /** The former browser reservation was atomically adopted by upload-first. */
   legacyUploadFirstTakeover?: boolean;
   clientAttachmentManifestHash?: string;
@@ -1123,9 +1127,10 @@ function existingResult(
 
 /**
  * Creates the durable turn before any attachment upload or upstream POST.
- * There is deliberately no corresponding release/delete operation: an
- * unknown network outcome remains reserved until the same operation is
- * recovered with its original upstream idempotency key.
+ * Unknown network outcomes remain reserved until recovery with the original
+ * upstream idempotency key. The only release path is a proven browser-upload
+ * rejection before a request body or upstream task exists; that path retains
+ * a cancelled tombstone and moves it off the canonical operation slot.
  */
 export async function reserveKnowledgeBaseTurn(
   input: ReserveKnowledgeBaseTurnInput,
@@ -1362,6 +1367,17 @@ async function reserveKnowledgeBaseTurnInTransaction(
     .for("update");
   const byClient = clientRows[0] as ConversationTurn | undefined;
   const byOperation = operationRows[0] as ConversationTurn | undefined;
+  if (
+    byClient?.status === "cancelled" &&
+    metadataOf(byClient).unpreparedCancellation === true &&
+    (!byOperation || byOperation.id !== byClient.id)
+  ) {
+    // The cancelled row deliberately moved off the canonical operation slot
+    // so a new clientRequestId can upload a replacement. A delayed replay of
+    // the old browser request remains terminal and must not conflict with or
+    // seize the new active operation.
+    return existingResult(byClient, { state: "terminal" });
+  }
   if (byClient && byOperation && byClient.id !== byOperation.id) {
     throw new KnowledgeBaseTurnReservationError(
       "CONFLICT",
@@ -2056,7 +2072,10 @@ export async function reserveKnowledgeBaseStartBuild(
         .from(knowledgeBaseConversationRetentionTombstones)
         .where(
           and(
-            eq(knowledgeBaseConversationRetentionTombstones.userId, input.userId),
+            eq(
+              knowledgeBaseConversationRetentionTombstones.userId,
+              input.userId,
+            ),
             eq(
               knowledgeBaseConversationRetentionTombstones.publicConversationId,
               conversationId,
@@ -2407,19 +2426,30 @@ function normalizeDeferredUserAttachments(
   return normalized;
 }
 
-/** Append one successfully uploaded customer file to the reservation ledger. */
-export async function stageKnowledgeBaseDeferredTurnAttachment(
-  input: {
-    userId: number;
-    buildId: string;
-    turnId: string;
-    clientRequestId: string;
-    clientAttachmentManifest: unknown;
-    index: number;
-    attachment: { file_id: string; filename: string };
-    now?: Date;
-  },
-  executor?: any,
+type StageKnowledgeBaseDeferredTurnAttachmentInput = {
+  userId: number;
+  buildId: string;
+  turnId: string;
+  clientRequestId: string;
+  clientAttachmentManifest: unknown;
+  index: number;
+  attachment: { file_id: string; filename: string };
+  now?: Date;
+};
+
+type ClaimKnowledgeBaseDeferredTurnDispatchInput = {
+  userId: number;
+  buildId: string;
+  turnId: string;
+  clientRequestId: string;
+  clientAttachmentManifest: unknown;
+  now?: Date;
+  leaseMs?: number;
+};
+
+async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
+  input: StageKnowledgeBaseDeferredTurnAttachmentInput,
+  tx: any,
 ) {
   assertInteger(input.userId, "userId", 1);
   assertInteger(input.index, "attachment index", 0);
@@ -2432,104 +2462,112 @@ export async function stageKnowledgeBaseDeferredTurnAttachment(
     input.clientAttachmentManifest,
   );
   const attachment = normalizeDeferredUserAttachments([input.attachment])[0]!;
-  const db = executor ?? (await requireDb());
-  return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
-    await assertActiveBuild(tx, turn);
-    if (turn.buildId !== normalizeRequiredId(input.buildId, "buildId", 36)) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "The attachment reservation belongs to another knowledge-base build",
-      );
-    }
-    const metadata = metadataOf(turn);
+  const turn = await lockedOwnedTurn(tx, input);
+  await assertActiveBuild(tx, turn);
+  if (turn.buildId !== normalizeRequiredId(input.buildId, "buildId", 36)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The attachment reservation belongs to another knowledge-base build",
+    );
+  }
+  const metadata = metadataOf(turn);
+  if (
+    turn.clientRequestId !== clientRequestId ||
+    metadata.clientAttachmentManifestHash !== manifestHash
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The uploaded file does not match its logical turn reservation",
+    );
+  }
+  if (
+    turn.status === "completed" ||
+    turn.status === "failed" ||
+    turn.status === "cancelled"
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "TERMINAL",
+      "Knowledge-base turn is already terminal",
+    );
+  }
+  const expectedCount = Number(metadata.userAttachmentCount ?? 0);
+  if (
+    !Number.isSafeInteger(expectedCount) ||
+    expectedCount < 1 ||
+    input.index >= expectedCount
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Uploaded file index exceeds the reserved attachment manifest",
+    );
+  }
+  const staged = Array.isArray(metadata.clientStagedAttachments)
+    ? [...metadata.clientStagedAttachments]
+    : [];
+  const prior = staged[input.index];
+  if (prior) {
     if (
-      turn.clientRequestId !== clientRequestId ||
-      metadata.clientAttachmentManifestHash !== manifestHash
+      prior.index !== input.index ||
+      prior.file_id !== attachment.file_id ||
+      prior.filename !== attachment.filename
     ) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
-        "The uploaded file does not match its logical turn reservation",
+        "A different file is already staged at this manifest index",
       );
     }
-    if (
-      turn.status === "completed" ||
-      turn.status === "failed" ||
-      turn.status === "cancelled"
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "TERMINAL",
-        "Knowledge-base turn is already terminal",
-      );
-    }
-    const expectedCount = Number(metadata.userAttachmentCount ?? 0);
-    if (
-      !Number.isSafeInteger(expectedCount) ||
-      expectedCount < 1 ||
-      input.index >= expectedCount
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "Uploaded file index exceeds the reserved attachment manifest",
-      );
-    }
-    const staged = Array.isArray(metadata.clientStagedAttachments)
-      ? [...metadata.clientStagedAttachments]
-      : [];
-    const prior = staged[input.index];
-    if (prior) {
-      if (
-        prior.index !== input.index ||
-        prior.file_id !== attachment.file_id ||
-        prior.filename !== attachment.filename
-      ) {
-        throw new KnowledgeBaseTurnReservationError(
-          "CONFLICT",
-          "A different file is already staged at this manifest index",
-        );
-      }
-      return turnRecord(turn);
-    }
-    if (
-      metadata.awaitingClientAttachments !== true ||
-      input.index !== staged.length ||
-      staged.some((item) => item.file_id === attachment.file_id)
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "Customer files must be staged once in manifest order",
-      );
-    }
-    staged.push({ index: input.index, ...attachment });
-    const recovery = sanitizeKnowledgeBaseRecoveryMetadata({
-      ...(metadata.recovery || {}),
-      attachments: staged.map(({ file_id, filename }) => ({
-        file_id,
-        filename,
-      })),
-      attachmentManifest: input.clientAttachmentManifest,
-    });
-    const now = input.now ?? new Date();
-    const nextMetadata: KnowledgeBaseTurnMetadata = {
-      ...metadata,
-      clientStagedAttachments: staged,
-      recovery,
-    };
-    await tx
-      .update(conversationTurns)
-      .set({
-        attachmentFileIds: staged.map((item) => item.file_id),
-        metadata: nextMetadata,
-        updatedAt: now,
-      })
-      .where(eq(conversationTurns.id, turn.id));
-    return turnRecord({
-      ...turn,
+    return turnRecord(turn);
+  }
+  if (
+    metadata.awaitingClientAttachments !== true ||
+    input.index !== staged.length ||
+    staged.some((item) => item.file_id === attachment.file_id)
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Customer files must be staged once in manifest order",
+    );
+  }
+  staged.push({ index: input.index, ...attachment });
+  const recovery = sanitizeKnowledgeBaseRecoveryMetadata({
+    ...(metadata.recovery || {}),
+    attachments: staged.map(({ file_id, filename }) => ({
+      file_id,
+      filename,
+    })),
+    attachmentManifest: input.clientAttachmentManifest,
+  });
+  const now = input.now ?? new Date();
+  const nextMetadata: KnowledgeBaseTurnMetadata = {
+    ...metadata,
+    clientStagedAttachments: staged,
+    recovery,
+  };
+  await tx
+    .update(conversationTurns)
+    .set({
       attachmentFileIds: staged.map((item) => item.file_id),
       metadata: nextMetadata,
       updatedAt: now,
-    });
+    })
+    .where(eq(conversationTurns.id, turn.id));
+  return turnRecord({
+    ...turn,
+    attachmentFileIds: staged.map((item) => item.file_id),
+    metadata: nextMetadata,
+    updatedAt: now,
   });
+}
+
+/** Append one successfully uploaded customer file to the reservation ledger. */
+export async function stageKnowledgeBaseDeferredTurnAttachment(
+  input: StageKnowledgeBaseDeferredTurnAttachmentInput,
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  return db.transaction((tx: any) =>
+    stageKnowledgeBaseDeferredTurnAttachmentInTransaction(input, tx),
+  );
 }
 
 /**
@@ -2538,17 +2576,9 @@ export async function stageKnowledgeBaseDeferredTurnAttachment(
  * replacements are rejected before any generated Skill upload or upstream
  * task creation can occur.
  */
-export async function claimKnowledgeBaseDeferredTurnDispatch(
-  input: {
-    userId: number;
-    buildId: string;
-    turnId: string;
-    clientRequestId: string;
-    clientAttachmentManifest: unknown;
-    now?: Date;
-    leaseMs?: number;
-  },
-  executor?: any,
+async function claimKnowledgeBaseDeferredTurnDispatchInTransaction(
+  input: ClaimKnowledgeBaseDeferredTurnDispatchInput,
+  tx: any,
 ): Promise<KnowledgeBaseDeferredDispatchClaim> {
   assertInteger(input.userId, "userId", 1);
   const clientRequestId = normalizeRequiredId(
@@ -2562,135 +2592,167 @@ export async function claimKnowledgeBaseDeferredTurnDispatch(
   const now = input.now ?? new Date();
   const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
   assertInteger(leaseMs, "leaseMs", 1_000);
-  const db = executor ?? (await requireDb());
+  const turn = await lockedOwnedTurn(tx, input);
+  await assertActiveBuild(tx, turn);
+  if (turn.buildId !== normalizeRequiredId(input.buildId, "buildId", 36)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The attachment dispatch belongs to another knowledge-base build",
+    );
+  }
+  const metadata = metadataOf(turn);
+  if (
+    turn.clientRequestId !== clientRequestId ||
+    !metadata.clientAttachmentManifestHash ||
+    metadata.clientAttachmentManifestHash !== manifestHash
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The attachment dispatch does not match its logical turn reservation",
+    );
+  }
+  const userAttachmentCount = Number(metadata.userAttachmentCount ?? 0);
+  const stagedAttachments = Array.isArray(metadata.clientStagedAttachments)
+    ? metadata.clientStagedAttachments
+    : [];
+  const attachments = stagedAttachments.map(({ file_id, filename }) => ({
+    file_id,
+    filename,
+  }));
+  if (
+    !Number.isSafeInteger(userAttachmentCount) ||
+    userAttachmentCount < 1 ||
+    attachments.length !== userAttachmentCount ||
+    stagedAttachments.some((item, index) => item.index !== index) ||
+    turn.attachmentFileIds.length < attachments.length ||
+    turn.attachmentFileIds.length > attachments.length + 1 ||
+    attachments.some(
+      (attachment, index) =>
+        turn.attachmentFileIds[index] !== attachment.file_id,
+    ) ||
+    (metadata.awaitingClientAttachments === true &&
+      turn.attachmentFileIds.length !== attachments.length)
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Uploaded customer files do not match the reserved attachment count",
+    );
+  }
 
-  return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
-    await assertActiveBuild(tx, turn);
-    if (turn.buildId !== normalizeRequiredId(input.buildId, "buildId", 36)) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "The attachment dispatch belongs to another knowledge-base build",
-      );
-    }
-    const metadata = metadataOf(turn);
-    if (
-      turn.clientRequestId !== clientRequestId ||
-      !metadata.clientAttachmentManifestHash ||
-      metadata.clientAttachmentManifestHash !== manifestHash
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "The attachment dispatch does not match its logical turn reservation",
-      );
-    }
-    const userAttachmentCount = Number(metadata.userAttachmentCount ?? 0);
-    const stagedAttachments = Array.isArray(metadata.clientStagedAttachments)
-      ? metadata.clientStagedAttachments
-      : [];
-    const attachments = stagedAttachments.map(({ file_id, filename }) => ({
-      file_id,
-      filename,
-    }));
-    if (
-      !Number.isSafeInteger(userAttachmentCount) ||
-      userAttachmentCount < 1 ||
-      attachments.length !== userAttachmentCount ||
-      stagedAttachments.some((item, index) => item.index !== index) ||
-      turn.attachmentFileIds.length < attachments.length ||
-      turn.attachmentFileIds.length > attachments.length + 1 ||
-      attachments.some(
-        (attachment, index) =>
-          turn.attachmentFileIds[index] !== attachment.file_id,
-      ) ||
-      (metadata.awaitingClientAttachments === true &&
-        turn.attachmentFileIds.length !== attachments.length)
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "Uploaded customer files do not match the reserved attachment count",
-      );
-    }
-
-    if (turn.status === "completed") {
-      return {
-        state: "completed",
-        turn: turnRecord(turn),
-        upstreamTaskId: turn.upstreamTaskId,
-      };
-    }
-    if (turn.status === "failed" || turn.status === "cancelled") {
-      return { state: "terminal", turn: turnRecord(turn) };
-    }
-    if (turn.upstreamTaskId) {
-      return {
-        state: "bound",
-        turn: turnRecord(turn),
-        upstreamTaskId: turn.upstreamTaskId,
-      };
-    }
-
-    const recovery = sanitizeKnowledgeBaseRecoveryMetadata({
-      ...(metadata.recovery || {}),
-      attachments,
-      attachmentManifest: input.clientAttachmentManifest,
-    });
-    if (metadata.awaitingClientAttachments !== true) {
-      const existingAttachments = Array.isArray(metadata.recovery?.attachments)
-        ? metadata.recovery.attachments
-        : [];
-      if (
-        hashKnowledgeBaseTurnRequest(existingAttachments) !==
-        hashKnowledgeBaseTurnRequest(attachments)
-      ) {
-        throw new KnowledgeBaseTurnReservationError(
-          "CONFLICT",
-          "Customer attachment ids are already bound to different files",
-        );
-      }
-      const remainingMs = (turn.leaseExpiresAt?.getTime() ?? 0) - now.getTime();
-      if (remainingMs > 0) {
-        return {
-          state: "pending",
-          turn: turnRecord(turn),
-          retryAfterMs: Math.max(250, Math.min(remainingMs, 5_000)),
-        };
-      }
-    }
-
-    const leaseToken = randomUUID();
-    const leaseExpiresAt = new Date(now.getTime() + leaseMs);
-    const nextMetadata: KnowledgeBaseTurnMetadata = {
-      ...metadata,
-      awaitingClientAttachments: false,
-      leaseOwnerHash: leaseOwnerHash(leaseToken),
-      recovery,
+  if (turn.status === "completed") {
+    return {
+      state: "completed",
+      turn: turnRecord(turn),
+      upstreamTaskId: turn.upstreamTaskId,
     };
-    await tx
-      .update(conversationTurns)
-      .set({
-        metadata: nextMetadata,
-        leaseExpiresAt,
-        updatedAt: now,
-      })
-      .where(eq(conversationTurns.id, turn.id));
-    const claimedTurn = turnRecord({
-      ...turn,
+  }
+  if (turn.status === "failed" || turn.status === "cancelled") {
+    return { state: "terminal", turn: turnRecord(turn) };
+  }
+  if (turn.upstreamTaskId) {
+    return {
+      state: "bound",
+      turn: turnRecord(turn),
+      upstreamTaskId: turn.upstreamTaskId,
+    };
+  }
+
+  const recovery = sanitizeKnowledgeBaseRecoveryMetadata({
+    ...(metadata.recovery || {}),
+    attachments,
+    attachmentManifest: input.clientAttachmentManifest,
+  });
+  if (metadata.awaitingClientAttachments !== true) {
+    const existingAttachments = Array.isArray(metadata.recovery?.attachments)
+      ? metadata.recovery.attachments
+      : [];
+    if (
+      hashKnowledgeBaseTurnRequest(existingAttachments) !==
+      hashKnowledgeBaseTurnRequest(attachments)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Customer attachment ids are already bound to different files",
+      );
+    }
+    const remainingMs = (turn.leaseExpiresAt?.getTime() ?? 0) - now.getTime();
+    if (remainingMs > 0) {
+      return {
+        state: "pending",
+        turn: turnRecord(turn),
+        retryAfterMs: Math.max(250, Math.min(remainingMs, 5_000)),
+      };
+    }
+  }
+
+  const leaseToken = randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+  const nextMetadata: KnowledgeBaseTurnMetadata = {
+    ...metadata,
+    awaitingClientAttachments: false,
+    leaseOwnerHash: leaseOwnerHash(leaseToken),
+    recovery,
+  };
+  await tx
+    .update(conversationTurns)
+    .set({
       metadata: nextMetadata,
       leaseExpiresAt,
       updatedAt: now,
-    });
-    return {
-      state: "acquired",
-      turn: claimedTurn,
-      leaseToken,
-      leaseExpiresAt,
-      upstreamIdempotencyKey: createKnowledgeBaseUpstreamIdempotencyKey(
-        String(turn.operationKey),
-      ),
-      recoveryMetadata: recovery,
-      preparedDispatch: nextMetadata.preparedDispatch ?? null,
-    };
+    })
+    .where(eq(conversationTurns.id, turn.id));
+  const claimedTurn = turnRecord({
+    ...turn,
+    metadata: nextMetadata,
+    leaseExpiresAt,
+    updatedAt: now,
+  });
+  return {
+    state: "acquired",
+    turn: claimedTurn,
+    leaseToken,
+    leaseExpiresAt,
+    upstreamIdempotencyKey: createKnowledgeBaseUpstreamIdempotencyKey(
+      String(turn.operationKey),
+    ),
+    recoveryMetadata: recovery,
+    preparedDispatch: nextMetadata.preparedDispatch ?? null,
+  };
+}
+
+export async function claimKnowledgeBaseDeferredTurnDispatch(
+  input: ClaimKnowledgeBaseDeferredTurnDispatchInput,
+  executor?: any,
+): Promise<KnowledgeBaseDeferredDispatchClaim> {
+  const db = executor ?? (await requireDb());
+  return db.transaction((tx: any) =>
+    claimKnowledgeBaseDeferredTurnDispatchInTransaction(input, tx),
+  );
+}
+
+/**
+ * Stages one browser-uploaded file and, when it completes the manifest,
+ * grants the worker lease in the same transaction. This closes the crash gap
+ * where a complete attachment ledger could otherwise remain awaiting forever.
+ */
+export async function stageAndClaimKnowledgeBaseDeferredTurnAttachment(
+  input: StageKnowledgeBaseDeferredTurnAttachmentInput & { leaseMs?: number },
+  executor?: any,
+): Promise<KnowledgeBaseDeferredDispatchClaim> {
+  const db = executor ?? (await requireDb());
+  const now = input.now ?? new Date();
+  return db.transaction(async (tx: any) => {
+    const turn = await stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
+      { ...input, now },
+      tx,
+    );
+    if (turn.stagedUserAttachmentCount < turn.expectedUserAttachmentCount) {
+      return { state: "awaiting_attachments", turn };
+    }
+    return claimKnowledgeBaseDeferredTurnDispatchInTransaction(
+      { ...input, now },
+      tx,
+    );
   });
 }
 
@@ -3631,6 +3693,151 @@ export async function markKnowledgeBaseTurnOutcomeUnknown(
       status: "running",
       leaseExpiresAt,
       metadata,
+      updatedAt: now,
+    });
+  });
+}
+
+/**
+ * Release a browser-upload turn that was rejected before any upstream request
+ * was prepared. This is intentionally narrower than deterministic failure:
+ * the build returns to the same authoritative leaf without a protocol-error
+ * retry that would require a prepared request body.
+ */
+export async function cancelUnpreparedKnowledgeBaseTurn(
+  input: {
+    userId: number;
+    turnId: string;
+    clientRequestId?: string;
+    leaseToken?: string;
+    code: string;
+    message: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const code = normalizeRequiredId(input.code, "cancellation code", 128);
+  const message = String(input.message || "")
+    .trim()
+    .slice(0, 10_000);
+  if (!message) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Cancellation message is required",
+    );
+  }
+  return db.transaction(async (tx: any) => {
+    const turn = await lockedOwnedTurn(tx, input);
+    const metadata = metadataOf(turn);
+    if (
+      turn.status === "cancelled" &&
+      metadata.unpreparedCancellation === true
+    ) {
+      if (
+        (!input.clientRequestId ||
+          turn.clientRequestId === input.clientRequestId) &&
+        turn.errorCode === code &&
+        turn.errorMessage === message
+      ) {
+        return turnRecord(turn);
+      }
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The upload turn was already cancelled by another request",
+      );
+    }
+    const build = await assertActiveBuild(tx, turn);
+    if (
+      (input.clientRequestId &&
+        turn.clientRequestId !== input.clientRequestId) ||
+      (input.leaseToken &&
+        metadata.leaseOwnerHash !== leaseOwnerHash(input.leaseToken)) ||
+      (!input.leaseToken && metadata.awaitingClientAttachments !== true) ||
+      (turn.status !== "queued" && turn.status !== "running") ||
+      turn.upstreamTaskId ||
+      metadata.preparedDispatch ||
+      build.status !== "confirming"
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Only an unprepared active upload turn can be cancelled",
+      );
+    }
+    const now = input.now ?? new Date();
+    const {
+      leaseOwnerHash: _leaseOwnerHash,
+      outcomeUnknownAt: _outcomeUnknownAt,
+      outcomeUnknownCode: _outcomeUnknownCode,
+      ...metadataWithoutLease
+    } = metadata;
+    const cancelledOperationKey = String(turn.operationKey);
+    const tombstoneOperationKey = createHash("sha256")
+      .update(
+        `frontmind-kb-unprepared-cancellation:${turn.id}:${cancelledOperationKey}`,
+        "utf8",
+      )
+      .digest("hex");
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadataWithoutLease,
+      awaitingClientAttachments: false,
+      unpreparedCancellation: true,
+      cancelledOperationKey,
+    };
+    await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status: "confirming",
+        stateEpoch: build.stateEpoch + 1,
+        activeTurnId: null,
+        awaitingResponseSince: null,
+        protocolErrorCode: null,
+        protocolError: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+        ),
+      );
+    await tx
+      .update(conversationTurns)
+      .set({
+        operationKey: tombstoneOperationKey,
+        upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+          createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
+        ),
+        status: "cancelled",
+        errorCode: code,
+        errorMessage: message,
+        completedAt: now,
+        leaseExpiresAt: null,
+        metadata: nextMetadata,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    await markKnowledgeBaseConversationAwaitingInputInTransaction({
+      tx,
+      userId: input.userId,
+      conversationId: turn.conversationId,
+      authoritativeTaskId: build.upstreamTaskId,
+      updatedAt: now,
+    });
+    return turnRecord({
+      ...turn,
+      operationKey: tombstoneOperationKey,
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
+      ),
+      status: "cancelled",
+      errorCode: code,
+      errorMessage: message,
+      completedAt: now,
+      leaseExpiresAt: null,
+      metadata: nextMetadata,
       updatedAt: now,
     });
   });

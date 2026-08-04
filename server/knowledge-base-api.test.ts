@@ -437,12 +437,14 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("(confirmed + direct_prefilled) / total");
     expect(prompt).toContain("不得输出参考资料、参考来源");
     expect(prompt).toContain("可见正文结束后直接附机器信封");
-    expect(prompt).toContain("只采集并返回一张企业官方主 Logo");
+    expect(prompt).toContain("有界全网搜索中寻找企业官方主 Logo");
     expect(prompt).toContain("不得采集或打包品牌主视觉、业务图");
     expect(prompt).toContain("取得合格 Logo 后立即停止所有网页图片发现");
-    expect(prompt).toContain("客户在后续节点主动上传的图片是唯一例外");
-    expect(prompt).toContain("由 Dashboard 本地受管通道回显");
-    expect(prompt).toContain("上游后续回复仍一律纯文字");
+    expect(prompt).toContain("仍没有合格真实 Logo");
+    expect(prompt).toContain("完整 Manifest 和第一个叶子正文，但返回零张图片");
+    expect(prompt).toContain("等待用户上传企业主 Logo");
+    expect(prompt).toContain("Dashboard 绑定原始字节");
+    expect(prompt).toContain("official_logo_upload");
     expect(prompt).toContain("资料采集状态只由 Dashboard 展示");
     expect(prompt).toContain("不得复述、输出或以“正在采集”“处理中”");
     expect(prompt).toContain("不得先发送或以“已收到”“好的”“开始处理”");
@@ -492,6 +494,72 @@ describe("knowledge base execution contract", () => {
     }
   });
 
+  it("keeps an uploaded official Logo on the first leaf with exact provenance", async () => {
+    const sha256 = "a".repeat(64);
+    const prompt = await buildKnowledgeBaseTurnPrompt({
+      userId: 0,
+      conversationId: "official-logo-supplement",
+      userMessage: "",
+      attachments: [
+        { file_id: "file-official-logo", filename: "brand-logo.png" },
+      ],
+      attachmentManifest: [
+        {
+          filename: "brand-logo.png",
+          mimeType: "image/png",
+          sizeBytes: 4096,
+          sha256,
+        },
+      ],
+      officialLogoUpload: {
+        verified: true,
+        index: 0,
+        fileId: "file-official-logo",
+        filename: "brand-logo.png",
+        mimeType: "image/png",
+        sizeBytes: 4096,
+        sourceSha256: sha256,
+      },
+      skillVersion: "4",
+      protocolOperation: {
+        operationId: "logo-operation",
+        turnId: "logo-turn",
+      },
+      progressOverride: {
+        build: { revision: 0, currentLeafId: "1.1" },
+        branches: [
+          {
+            leaves: [
+              {
+                id: "1.1",
+                title: "一句话定位",
+                branchTitle: "企业身份",
+                status: "current",
+              },
+              {
+                id: "1.2",
+                title: "企业名称",
+                branchTitle: "企业身份",
+                status: "pending",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(prompt).toContain("首节点 Logo 补料轮");
+    expect(prompt).toContain("保持当前首节点为 needs_verification");
+    expect(prompt).toContain("不得确认或前进");
+    expect(prompt).toContain("sourceKind=official_logo_upload");
+    expect(prompt).toContain("imageSelection.method 必须为 customer_upload");
+    expect(prompt).toContain(`sourceUploadSha256=${sha256}`);
+    expect(prompt).toContain("sourceUploadFileId=file-official-logo");
+    expect(prompt).toContain('"leafId":"1.1"');
+    expect(prompt).toContain('"to":"needs_verification"');
+    expect(prompt).not.toContain('"to":"confirmed"');
+  });
+
   it("pins every confirmation to the exact canonical transition envelopes", async () => {
     const prompt = await buildKnowledgeBaseTurnPrompt({
       userId: 0,
@@ -539,6 +607,55 @@ describe("knowledge base execution contract", () => {
     ).toBe(true);
     expect(prompt).toContain("旧 Skill、旧回复或旧协议示例");
     expect(prompt).toContain("最终输出锁（最高优先级");
+  });
+
+  it("forces the last confirmation to attach one scoped ZIP before ending", async () => {
+    const prompt = await buildKnowledgeBaseTurnPrompt({
+      userId: 0,
+      conversationId: "final-package-contract",
+      userMessage: "确认",
+      attachments: [],
+      skillVersion: "4",
+      protocolOperation: {
+        operationId: "final-package-operation",
+        turnId: "final-package-turn",
+      },
+      progressOverride: {
+        build: { revision: 46, currentLeafId: "7.2" },
+        branches: [
+          {
+            leaves: [
+              {
+                id: "7.2",
+                title: "技术支持与服务体系",
+                branchTitle: "合作、交付与支持",
+                status: "current",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(prompt).toContain("这是最终交付轮，不是纯文字轮次");
+    expect(prompt).toContain("application/zip 的 typed output_file");
+    expect(prompt).toContain("type=output_file、MIME=application/zip");
+    expect(prompt).toContain("恰好一个");
+    expect(prompt).toContain(
+      "operationId=final-package-operation、turnId=final-package-turn",
+    );
+    expect(prompt).toContain("00_package_manifest.json 的 buildRevision 必须为 47");
+    expect(prompt).toContain("文件资源已经进入任务 output 之前不得结束任务");
+    expect(prompt).toContain("不能替代 ZIP 文件");
+    expect(prompt).toContain("不得只说“即将生成”“稍后生成”");
+    expect(prompt).not.toContain("这是非首轮知识节点回复，必须纯文字返回");
+    expect(
+      prompt
+        .trim()
+        .endsWith(
+          '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":2,"operationId":"final-package-operation","turnId":"final-package-turn","revision":47,"leafId":null,"imageState":"not_applicable","assetIds":[],"imageCount":0}\n-->',
+        ),
+    ).toBe(true);
   });
 
   it("formats a retry with only the new operation and turn envelope identity", async () => {

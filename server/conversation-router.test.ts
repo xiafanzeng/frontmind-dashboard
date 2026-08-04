@@ -467,6 +467,7 @@ describe("conversation multi-device merge", () => {
       buildId: "build-1",
       leafId: "1.2",
       ordinal: 1,
+      sourceTurnId: "turn-1",
     };
 
     await expect(
@@ -547,6 +548,7 @@ describe("conversation multi-device merge", () => {
             buildId: "build-1",
             leafId: "1.2",
             ordinal: 1,
+            sourceTurnId: "turn-later",
           },
           knowledgeBase: { kind: "presentation", leafId: "1.2" },
           turn,
@@ -580,6 +582,7 @@ describe("conversation multi-device merge", () => {
       buildId: "build-1",
       leafId: "1.1",
       ordinal: 0,
+      sourceTurnId: "turn-initial",
     };
     const initialTurn = {
       id: "turn-initial",
@@ -613,7 +616,7 @@ describe("conversation multi-device merge", () => {
       reconstructKnowledgeBasePresentationInlineImages(
         {
           build,
-          node,
+          node: { ...node, sourceTurnId: "turn-revise" },
           knowledgeBase: { kind: "presentation", leafId: "1.1" },
           turn: {
             ...initialTurn,
@@ -625,6 +628,69 @@ describe("conversation multi-device merge", () => {
         loadResources,
       ),
     ).resolves.toBeUndefined();
+
+    await expect(
+      reconstructKnowledgeBasePresentationInlineImages(
+        {
+          build,
+          node: { ...node, sourceTurnId: "turn-logo-upload" },
+          knowledgeBase: { kind: "presentation", leafId: "1.1" },
+          turn: {
+            ...initialTurn,
+            id: "turn-logo-upload",
+            operationType: "revise",
+            expectedLeafId: "1.1",
+            attachmentFileIds: ["file-official-logo"],
+            metadata: {
+              attachmentsFrozen: true,
+              userAttachmentCount: 1,
+              recovery: {
+                capturedClientAttachments: true,
+                attachmentManifest: [
+                  {
+                    filename: "official-logo.png",
+                    mimeType: "image/png",
+                    sizeBytes: 123,
+                    sha256: "c".repeat(64),
+                  },
+                ],
+                attachments: [
+                  {
+                    file_id: "file-official-logo",
+                    filename: "official-logo.png",
+                  },
+                ],
+                officialLogoUpload: {
+                  verified: true,
+                  index: 0,
+                  fileId: "file-official-logo",
+                  filename: "official-logo.png",
+                  mimeType: "image/png",
+                  sizeBytes: 123,
+                  sourceSha256: "c".repeat(64),
+                },
+              },
+              preparedDispatch: {
+                requestBody: {
+                  attachments: [
+                    {
+                      file_id: "file-official-logo",
+                      filename: "official-logo.png",
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+        loadResources,
+      ),
+    ).resolves.toEqual([
+      {
+        src: "/api/knowledge-base/artifacts/build-1/logo",
+        alt: "official-logo.png",
+      },
+    ]);
   });
 
   it("hydrates only the authoritative initial-node logo in history and list snapshots", async () => {
@@ -694,6 +760,7 @@ describe("conversation multi-device merge", () => {
       buildId: "build-1",
       leafId: "1.1",
       ordinal: 0,
+      sourceTurnId: "turn-initial",
     };
     const conversation = {
       id: "u7:conversation-1",

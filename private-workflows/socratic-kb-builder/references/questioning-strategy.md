@@ -26,8 +26,16 @@ The first customer-visible answer must:
 
 - Display branch counts and the true 8–115 leaf total.
 - Present the first leaf as polished formal content.
-- Show exactly one official company Logo whose bytes were downloaded,
-  validated, assigned a stable asset ID and associated only with the first leaf.
+- When an official-web or official-document Logo is available, show exactly one
+  whose bytes were validated, assigned a stable asset ID and associated only
+  with the first leaf. A Logo extracted from initial enterprise material uses
+  `official_document`; `official_logo_upload` is reserved for Dashboard's later
+  post-manifest Logo-required upload control.
+- If no eligible Logo exists after bounded discovery and the initial task has no
+  qualifying official-document Logo material, show no image but still emit the
+  full first leaf and complete manifest. The Dashboard requests a Logo outside
+  the leaf body and blocks confirmation/direct prefill until that requirement
+  is satisfied.
 - End the visible body after the first leaf. Do not add citations, source
   lists, unresolved items, action guidance or a confirmation question.
 - End with exactly one valid `FRONTMIND_KB_MANIFEST` envelope. The application
@@ -41,8 +49,13 @@ Do not dump raw snapshots, page excerpts, crawl logs, or internal planning.
 For the current leaf, show only:
 
 1. The publication-ready draft.
-2. On the initial first-leaf turn only, exactly one official company Logo.
-   Every later turn is text-only.
+2. On the initial first-leaf turn only, at most one available official company
+   Logo. Every later upstream turn is image-free; Dashboard independently shows
+   a later customer-supplied Logo from its trusted upload ledger. The final
+   completion turn is the only resource exception: it must actually attach
+   exactly one `application/zip` typed `output_file`. That turn must not end
+   until the typed ZIP item is present in the task `output`; saying that the ZIP
+   will be generated now, soon or later is not delivery.
 
 Do not add a `参考资料`, `参考来源`, `References` or `Sources` section. Do not
 use numbered citation markers or external citation links in the visible body.
@@ -59,6 +72,10 @@ Interpret user input narrowly:
 - Any correction, supplement, question, or upload →
   `needs_verification`; update and re-present the same leaf. A turn containing
   a file never advances, even when its text contains confirmation language.
+- While the first-leaf Logo requirement is unresolved, confirmation and direct
+  prefill do not advance. A qualifying Logo upload resolves only that
+  requirement, remains on the same first leaf as `needs_verification`, and must
+  be followed by a separate attachment-free confirmation turn.
 - On every non-initial turn, append exactly one progress envelope and one
   `FRONTMIND_KB_PRESENTATION` envelope. The latter uses the post-transition
   revision and the leaf actually displayed; use `leafId: null` only when the
@@ -78,12 +95,15 @@ benchmarks until confirmed. An absence of evidence is not a negative claim.
 
 ## Images in the interaction
 
-Only the initial first-leaf answer may show a packaged, validated first-party
-asset. Select exactly one primary official company Logo and do not select a
-business, hero, product, UI, architecture, case or other image. Use its caption
-and alt text from `00_package_manifest.json`. Never show a filename or remote
-URL as if it were a successfully packaged image. Never return an image
-attachment on a later confirmation or current-leaf revision turn.
+Only the initial first-leaf answer may show an upstream packaged, validated
+first-party asset. Select at most one primary official company Logo and do not
+select a business, hero, product, UI, architecture, case or other image. If none
+is eligible, return no image and rely on the Dashboard's external Logo-required
+state. Use an available Logo's caption and alt text from
+`00_package_manifest.json`. Never show a filename or remote URL as if it were a
+successfully packaged image. Never return an image attachment on a later
+confirmation or current-leaf revision turn; a later `official_logo_upload` is
+Dashboard-rendered and retained only for the final archive.
 
 ## Final turn
 
@@ -92,7 +112,10 @@ When the service says every leaf is handled:
 - Apply all confirmed changes to overviews and leaves.
 - Reconcile every document-to-asset link.
 - Run the bundled archive validator.
-- Return one newly generated ZIP in the same turn.
+- Actually attach one newly generated ZIP in the same turn as exactly one
+  `application/zip` typed `output_file`.
 
 Do not ask whether to generate, offer A/B/C delivery choices, reuse an old ZIP,
-or generate HTML/interactive output.
+or generate HTML/interactive output. Do not end the turn until that typed ZIP
+item is present in the task `output`, and do not substitute a statement that
+the ZIP is being generated or will be generated soon or later.

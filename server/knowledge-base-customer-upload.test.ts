@@ -5,11 +5,13 @@ import sharp from "sharp";
 
 const dependencies = vi.hoisted(() => ({
   readStoredPresalesFile: vi.fn(),
+  getDb: vi.fn(),
 }));
 
 vi.mock("./presales-file-store", () => ({
   readStoredPresalesFile: dependencies.readStoredPresalesFile,
 }));
+vi.mock("./db", () => ({ getDb: dependencies.getDb }));
 
 import {
   assertCapturedKnowledgeBaseCustomerImage,
@@ -17,6 +19,7 @@ import {
   knowledgeBaseExpectedCustomerUploadsFromTurns,
   knowledgeBaseCustomerUploadImagesFromTurn,
   knowledgeBaseCustomerUploadResources,
+  verifiedKnowledgeBaseOfficialLogoUploadForBuild,
 } from "./knowledge-base-customer-upload";
 
 function capturedImageTurn(overrides: Record<string, unknown> = {}) {
@@ -98,6 +101,144 @@ describe("knowledge-base customer upload provenance", () => {
         sizeBytes: 1234,
       },
     ]);
+  });
+
+  it("excludes a verified recovery officialLogoUpload from the ordinary customer-upload manifest", () => {
+    const turn = capturedImageTurn({
+      recovery: {
+        capturedClientAttachments: true,
+        attachments: [
+          {
+            file_id: "file-customer-image",
+            filename: "customer-proof.jpg",
+          },
+        ],
+        attachmentManifest: [
+          {
+            filename: "customer-proof.jpg",
+            mimeType: "image/jpeg",
+            sizeBytes: 1234,
+            sha256: "a".repeat(64),
+          },
+        ],
+        officialLogoUpload: {
+          verified: true,
+          index: 0,
+          fileId: "file-customer-image",
+          filename: "customer-proof.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 1234,
+          sourceSha256: "a".repeat(64),
+        },
+      },
+    });
+
+    expect(knowledgeBaseCustomerUploadImagesFromTurn(turn)).toEqual([]);
+    expect(knowledgeBaseExpectedCustomerUploadsFromTurns([turn])).toEqual([]);
+  });
+
+  it("does not exclude an unverified recovery officialLogoUpload declaration", () => {
+    const turn = capturedImageTurn({
+      recovery: {
+        capturedClientAttachments: true,
+        attachments: [
+          {
+            file_id: "file-customer-image",
+            filename: "customer-proof.jpg",
+          },
+        ],
+        attachmentManifest: [
+          {
+            filename: "customer-proof.jpg",
+            mimeType: "image/jpeg",
+            sizeBytes: 1234,
+            sha256: "a".repeat(64),
+          },
+        ],
+        officialLogoUpload: {
+          verified: false,
+          index: 0,
+          fileId: "file-customer-image",
+          filename: "customer-proof.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 1234,
+          sourceSha256: "a".repeat(64),
+        },
+      },
+    });
+
+    expect(knowledgeBaseCustomerUploadImagesFromTurn(turn)).toEqual([
+      expect.objectContaining({
+        fileId: "file-customer-image",
+        sourceSha256: "a".repeat(64),
+      }),
+    ]);
+  });
+
+  it("excludes the bound official Logo hash from every later ordinary upload", () => {
+    const turn = capturedImageTurn();
+    expect(
+      knowledgeBaseExpectedCustomerUploadsFromTurns([turn], {
+        excludedSourceSha256: "a".repeat(64),
+      }),
+    ).toEqual([]);
+  });
+
+  it("keeps the verified Logo ledger usable after its temporary upload copy expires", async () => {
+    const turn = capturedImageTurn({
+      recovery: {
+        capturedClientAttachments: true,
+        attachments: [
+          {
+            file_id: "file-customer-image",
+            filename: "customer-proof.jpg",
+          },
+        ],
+        attachmentManifest: [
+          {
+            filename: "customer-proof.jpg",
+            mimeType: "image/jpeg",
+            sizeBytes: 1234,
+            sha256: "a".repeat(64),
+          },
+        ],
+        officialLogoUpload: {
+          verified: true,
+          index: 0,
+          fileId: "file-customer-image",
+          filename: "customer-proof.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 1234,
+          sourceSha256: "a".repeat(64),
+        },
+      },
+    });
+    dependencies.readStoredPresalesFile.mockClear();
+    dependencies.getDb.mockResolvedValueOnce({
+      select() {
+        return {
+          from() {
+            return {
+              async where() {
+                return [turn];
+              },
+            };
+          },
+        };
+      },
+    });
+
+    await expect(
+      verifiedKnowledgeBaseOfficialLogoUploadForBuild({
+        userId: 7,
+        buildId: "build-1",
+        generation: 1,
+      }),
+    ).resolves.toMatchObject({
+      fileId: "file-customer-image",
+      sourceSha256: "a".repeat(64),
+    });
+    expect(dependencies.readStoredPresalesFile).not.toHaveBeenCalled();
   });
 
   it("fails closed when a declared customer image no longer matches local bytes", async () => {

@@ -80,6 +80,37 @@ describe("KnowledgeBasePollingCoordinator", () => {
     expect(observationNeedsPolling(awaitingInputObservation())).toBe(false);
   });
 
+  it("keeps polling the same task when its final ZIP can still arrive late", () => {
+    const now = Date.now();
+    const observation = {
+      ...executingObservation(),
+      interaction: {
+        ...executingObservation().interaction,
+        interactionState: "failed" as const,
+      },
+      notice: {
+        key: "build:turn:final-package-missing",
+        code: "FINAL_PACKAGE_MISSING",
+        severity: "error" as const,
+        message: "最终 ZIP 尚未随当前任务返回",
+        retryable: true,
+        turnId: "turn-1",
+        createdAt: now,
+      },
+    };
+
+    expect(observationNeedsPolling(observation, now)).toBe(true);
+    expect(observationNeedsPolling(observation, now + 5 * 60 * 1000)).toBe(
+      false,
+    );
+    expect(
+      observationNeedsPolling({
+        ...observation,
+        notice: { ...observation.notice, code: "PROGRESS_PROTOCOL_INVALID" },
+      }),
+    ).toBe(false);
+  });
+
   it("keeps polling an old stable observation until the pending request id is acknowledged", async () => {
     let scheduled: (() => void) | undefined;
     const oldObservation = awaitingInputObservation("request-older");

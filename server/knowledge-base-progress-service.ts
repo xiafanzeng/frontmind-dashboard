@@ -41,7 +41,10 @@ import {
   canonicalKnowledgeBaseMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
-import { knowledgeBaseCustomerUploadResources } from "./knowledge-base-customer-upload";
+import {
+  knowledgeBaseCustomerUploadResources,
+  knowledgeBaseOfficialLogoUploadFromTurn,
+} from "./knowledge-base-customer-upload";
 import {
   markKnowledgeBaseConversationCompletedInTransaction,
   markKnowledgeBaseConversationFailedInTransaction,
@@ -118,6 +121,7 @@ export class KnowledgeBaseBuildError extends Error {
   constructor(
     public readonly code:
       | "BUILD_NOT_FOUND"
+      | "FINAL_PACKAGE_MISSING"
       | "PROGRESS_PROTOCOL_INVALID"
       | "PUBLISH_BLOCKED",
     message: string,
@@ -498,6 +502,7 @@ export function assertKnowledgeBaseNodeImageDelivery(input: {
 export function assertKnowledgeBaseInitialImageDelivery(
   output: unknown,
   operation?: KnowledgeBaseProtocolOperationIdentity,
+  options: { allowMissing?: boolean } = {},
 ) {
   const scopedOutput = operation
     ? selectKnowledgeBaseProtocolOperationOutput(output, {
@@ -507,12 +512,14 @@ export function assertKnowledgeBaseInitialImageDelivery(
     : latestKnowledgeBasePresentationOutput(output);
   assertKnowledgeBaseOutputHasNoInlineImages(scopedOutput);
   const imageCount = collectKnowledgeBaseOutputImageKeys(scopedOutput).size;
+  if (imageCount === 0 && options.allowMissing === true) return imageCount;
   if (imageCount !== 1) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
       `首个知识节点必须只展示一张企业官方主 Logo，实际返回 ${imageCount} 张`,
     );
   }
+  return imageCount;
 }
 
 function assertKnowledgeBaseOutputHasNoInlineImages(output: unknown) {
@@ -1198,6 +1205,9 @@ function buildDto(
   build: KnowledgeBaseBuild,
   rows: KnowledgeBaseBuildNode[],
 ): KnowledgeBaseProgressDto {
+  const currentBuildRow = rows.find(
+    (row) => row.leafId === build.currentLeafId,
+  );
   const leaves: KnowledgeBaseProgressLeafDto[] = rows.map((row) => ({
     id: row.leafId,
     title: row.title,
@@ -1263,6 +1273,14 @@ function buildDto(
       status: build.status as KnowledgeBaseBuildStatus,
       revision: build.revision,
       currentLeafId: build.currentLeafId,
+      logoRequired:
+        build.skillVersion === "4" &&
+        build.status === "confirming" &&
+        build.revision === 0 &&
+        build.confirmedCount === 0 &&
+        build.directPrefilledCount === 0 &&
+        currentBuildRow?.ordinal === 0 &&
+        !build.logoSha256,
       protocolError: build.protocolError,
       awaitingResponseSince: build.awaitingResponseSince?.getTime() ?? null,
       updatedAt: build.updatedAt.getTime(),
@@ -1286,7 +1304,11 @@ function buildDto(
       build.packageRevision === build.revision &&
       build.packageTaskId === build.upstreamTaskId &&
       Boolean(build.packageOutputItemId) &&
-      Boolean(build.packageDescriptorHash),
+      Boolean(build.packageDescriptorHash) &&
+      Boolean(build.packageStorageKey) &&
+      /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || "")) &&
+      Number.isSafeInteger(build.packageSizeBytes) &&
+      Number(build.packageSizeBytes) > 0,
   };
 }
 
@@ -1346,7 +1368,10 @@ export async function createKnowledgeBaseBuild(input: {
         .from(knowledgeBaseConversationRetentionTombstones)
         .where(
           and(
-            eq(knowledgeBaseConversationRetentionTombstones.userId, input.userId),
+            eq(
+              knowledgeBaseConversationRetentionTombstones.userId,
+              input.userId,
+            ),
             eq(
               knowledgeBaseConversationRetentionTombstones.publicConversationId,
               conversationId,
@@ -1593,6 +1618,12 @@ export function knowledgeBaseProtocolErrorIsRetryable(input: {
   return Boolean(input.activeTurnId);
 }
 
+export function knowledgeBaseProtocolErrorAllowsSameTaskRecovery(
+  code?: string | null,
+) {
+  return code === "PACKAGE_REBIND_REQUIRED" || code === "FINAL_PACKAGE_MISSING";
+}
+
 /**
  * Reconstruct the exact server-approved presentation from durable state. GET
  * and reconcile use this same projection, so the UI never renders a different
@@ -1825,9 +1856,14 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     };
   }
 
+  const presentationOfficialLogoUpload = presentationTurnRow
+    ? knowledgeBaseOfficialLogoUploadFromTurn(presentationTurnRow)
+    : null;
   const logoResources =
-    build.revision === 0 &&
     currentRow?.ordinal === 0 &&
+    (build.revision === 0 ||
+      (presentationTurnRow?.id === currentRow.sourceTurnId &&
+        presentationOfficialLogoUpload?.leafId === currentRow.leafId)) &&
     build.logoStorageKey &&
     build.logoSha256 &&
     build.logoBytes &&
@@ -1919,6 +1955,21 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       retryable: false,
       turnId: activeTurnRow.id,
       createdAt: activeTurnRow.updatedAt.getTime(),
+    };
+  } else if (
+    progress.build.logoRequired === true &&
+    currentRow?.ordinal === 0 &&
+    !activeTurnRow
+  ) {
+    notice = {
+      key: `${build.id}:${build.generation}:official-logo-required`,
+      code: "KNOWLEDGE_BASE_LOGO_REQUIRED",
+      severity: "warning",
+      message:
+        "未找到可用的企业官方主 Logo。请上传一张主 Logo 原图后继续；推荐透明 PNG，位图宽高均需至少 256 像素。",
+      retryable: false,
+      turnId: null,
+      createdAt: build.updatedAt.getTime(),
     };
   } else if (build.protocolError) {
     const code = build.protocolErrorCode || "PROGRESS_PROTOCOL_INVALID";
@@ -2236,6 +2287,191 @@ export async function observeKnowledgeBaseProtocolFailure(input: {
       failedAt: observedAt,
     });
     return true;
+  });
+}
+
+/**
+ * Re-open only the exact failed final turn when its provider task later gains
+ * a ZIP resource. The caller must first observe an archive descriptor in the
+ * same task snapshot. This does not accept the final node or package: it only
+ * restores the original authority long enough for the normal download,
+ * schema, hash, operation, revision and immutable-storage checks to run.
+ */
+export async function resumeKnowledgeBaseFinalPackageMissing(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+  output: unknown;
+  resumedAt?: Date;
+}): Promise<boolean> {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  const taskId = String(input.taskId || "").trim();
+  if (!taskId) return false;
+  const resumedAt = input.resumedAt ?? new Date();
+  return db.transaction(async (tx) => {
+    const build = await loadBuild(tx, input.userId, conversationId, true);
+    if (
+      !build ||
+      build.status !== "protocol_error" ||
+      build.protocolErrorCode !== "FINAL_PACKAGE_MISSING" ||
+      !build.activeTurnId ||
+      build.upstreamTaskId !== taskId
+    ) {
+      return false;
+    }
+    const turn = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, build.activeTurnId),
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, build.id),
+            eq(conversationTurns.buildGeneration, build.generation),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as ConversationTurn | undefined;
+    if (
+      !turn ||
+      turn.status !== "failed" ||
+      turn.errorCode !== "FINAL_PACKAGE_MISSING" ||
+      turn.upstreamTaskId !== taskId ||
+      !turn.operationKey
+    ) {
+      return false;
+    }
+    const operationOutput = selectKnowledgeBaseProtocolOperationOutput(
+      Array.isArray(input.output) ? input.output : [],
+      {
+        operationId: turn.operationKey,
+        turnId: turn.id,
+        taskId,
+        generation: build.generation,
+        stateKind: "frontmind.knowledge-base.progress",
+      },
+      { requireExplicitResourceOperation: true },
+    );
+    if (collectKnowledgeArchiveDescriptors(operationOutput).length === 0) {
+      // Cumulative provider output may still contain an older operation's ZIP.
+      // It is never authority to revive this failed final turn.
+      return false;
+    }
+
+    const metadata = isRecord(turn.metadata) ? turn.metadata : {};
+    const recovery = isRecord(metadata.recovery) ? metadata.recovery : {};
+    const { protocolFailureObservation: _discarded, ...nextRecovery } =
+      recovery;
+    const nextMetadata = { ...metadata, recovery: nextRecovery };
+
+    await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status: "confirming",
+        stateEpoch: build.stateEpoch + 1,
+        protocolErrorCode: null,
+        protocolError: null,
+        awaitingResponseSince: resumedAt,
+        completedAt: null,
+        updatedAt: resumedAt,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.stateEpoch, build.stateEpoch),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          eq(knowledgeBaseBuilds.upstreamTaskId, taskId),
+          eq(knowledgeBaseBuilds.status, "protocol_error"),
+          eq(knowledgeBaseBuilds.protocolErrorCode, "FINAL_PACKAGE_MISSING"),
+        ),
+      );
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: nextMetadata,
+        status: "running",
+        errorCode: null,
+        errorMessage: null,
+        completedAt: null,
+        leaseExpiresAt: null,
+        updatedAt: resumedAt,
+      })
+      .where(
+        and(
+          eq(conversationTurns.id, turn.id),
+          eq(conversationTurns.status, "failed"),
+          eq(conversationTurns.errorCode, "FINAL_PACKAGE_MISSING"),
+          eq(conversationTurns.upstreamTaskId, taskId),
+        ),
+      );
+
+    const persistedConversationId =
+      knowledgeBaseObservationConversationStorageId(
+        input.userId,
+        conversationId,
+      );
+    const conversation = (
+      await tx
+        .select()
+        .from(conversations)
+        .where(
+          and(
+            eq(conversations.id, persistedConversationId),
+            eq(conversations.userId, input.userId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (conversation) {
+      await tx
+        .update(conversations)
+        .set({
+          status: "running",
+          upstreamTaskId: taskId,
+          previousResponseId: taskId,
+          version: conversation.version + 1,
+          completedAt: null,
+          updatedAt: resumedAt,
+        })
+        .where(
+          and(
+            eq(conversations.id, persistedConversationId),
+            eq(conversations.userId, input.userId),
+            eq(conversations.version, conversation.version),
+          ),
+        );
+    }
+
+    const reboundBuild = await loadBuild(
+      tx,
+      input.userId,
+      conversationId,
+      true,
+    );
+    const reboundTurn = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(eq(conversationTurns.id, turn.id))
+        .limit(1)
+        .for("update")
+    )[0] as ConversationTurn | undefined;
+    return Boolean(
+      reboundBuild?.status === "confirming" &&
+        reboundBuild.stateEpoch === build.stateEpoch + 1 &&
+        reboundBuild.activeTurnId === turn.id &&
+        reboundBuild.upstreamTaskId === taskId &&
+        !reboundBuild.protocolErrorCode &&
+        reboundTurn?.status === "running" &&
+        reboundTurn.upstreamTaskId === taskId &&
+        !reboundTurn.errorCode,
+    );
   });
 }
 
@@ -2629,7 +2865,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
           activeTurn,
           envelope: manifest,
         });
-        assertKnowledgeBaseInitialImageDelivery(
+        const initialImageCount = assertKnowledgeBaseInitialImageDelivery(
           authoritativeOutput,
           build.skillVersion === "4"
             ? {
@@ -2639,6 +2875,12 @@ export async function reconcileKnowledgeBaseProgress(input: {
                 generation: build.generation,
               }
             : undefined,
+          {
+            allowMissing:
+              build.skillVersion === "4" &&
+              classifyKnowledgeBaseUpstreamTaskStatus(input.upstreamStatus)
+                .settled,
+          },
         );
         const stagedLogo = input.stagedArtifacts?.logo;
         if (build.skillVersion === "4") {
@@ -2647,14 +2889,21 @@ export async function reconcileKnowledgeBaseProgress(input: {
               authoritativeOutput,
             );
           if (
-            !stagedLogo ||
-            descriptors.length !== 1 ||
-            stagedLogo.descriptorHash !==
-              knowledgeBaseOutputImageDescriptorHash(descriptors[0]!)
+            initialImageCount === 1 &&
+            (!stagedLogo ||
+              descriptors.length !== 1 ||
+              stagedLogo.descriptorHash !==
+                knowledgeBaseOutputImageDescriptorHash(descriptors[0]!))
           ) {
             throw new KnowledgeBaseBuildError(
               "PROGRESS_PROTOCOL_INVALID",
               "首轮官方主 Logo 尚未完成当前操作级暂存与字节校验",
+            );
+          }
+          if (initialImageCount === 0 && stagedLogo) {
+            throw new KnowledgeBaseBuildError(
+              "PROGRESS_PROTOCOL_INVALID",
+              "首轮 Logo 暂存结果与当前操作输出不一致",
             );
           }
         }
@@ -3019,10 +3268,12 @@ export async function reconcileKnowledgeBaseProgress(input: {
         : [];
       if (packageAllowed && packageDescriptors.length !== 1) {
         throw new KnowledgeBaseBuildError(
-          "PROGRESS_PROTOCOL_INVALID",
+          packageDescriptors.length === 0
+            ? "FINAL_PACKAGE_MISSING"
+            : "PROGRESS_PROTOCOL_INVALID",
           packageDescriptors.length === 0
             ? build.skillVersion === "4"
-              ? "所有节点已完成，但最终知识库 ZIP 尚未完成不可变持久化与版本绑定"
+              ? "上游已确认最后节点，但未返回当前操作唯一的最终知识库 ZIP；本轮未提交，仍停留在最后节点"
               : "所有节点已完成，但本轮尚未生成唯一的最终知识库 ZIP"
             : "本轮返回了多个知识库 ZIP，无法确认唯一发布版本",
         );
@@ -3344,7 +3595,12 @@ export async function reconcileKnowledgeBaseProgress(input: {
         error,
       }),
       message,
-      code: acknowledgementOnly ? "UPSTREAM_ACKNOWLEDGEMENT_ONLY" : undefined,
+      code: acknowledgementOnly
+        ? "UPSTREAM_ACKNOWLEDGEMENT_ONLY"
+        : error instanceof KnowledgeBaseBuildError &&
+            error.code === "FINAL_PACKAGE_MISSING"
+          ? error.code
+          : undefined,
       definitive: acknowledgementOnly,
     });
     const progress = await getKnowledgeBaseProgress({
@@ -3392,7 +3648,11 @@ export async function assertKnowledgeBasePublishable(input: {
     build.packageRevision !== build.revision ||
     build.packageTaskId !== build.upstreamTaskId ||
     !build.packageOutputItemId ||
-    !build.packageDescriptorHash
+    !build.packageDescriptorHash ||
+    !build.packageStorageKey ||
+    !/^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || "")) ||
+    !Number.isSafeInteger(build.packageSizeBytes) ||
+    Number(build.packageSizeBytes) <= 0
   ) {
     throw new KnowledgeBaseBuildError(
       "PUBLISH_BLOCKED",

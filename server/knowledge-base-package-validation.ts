@@ -13,6 +13,14 @@ export type KnowledgeBasePackageNode = {
   contentSha256?: string | null;
 };
 
+export type KnowledgeBaseExpectedOfficialLogoUpload = {
+  sourceSha256: string;
+  fileId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+};
+
 export class KnowledgeBasePackageBindingError extends Error {
   constructor(message: string) {
     super(message);
@@ -149,6 +157,7 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
     filenames: readonly string[];
     mimeTypes: readonly string[];
   }[];
+  expectedOfficialLogoUpload?: KnowledgeBaseExpectedOfficialLogoUpload;
   requireExactContent?: boolean;
   /**
    * Builder v3 used sparse document orders (10, 20, ...) and could package
@@ -294,12 +303,90 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
   if (
     (input.legacyV3Compatibility && logoMatches.length !== 1) ||
     (!input.legacyV3Compatibility &&
-      (officialHashes.length !== 1 || officialHashes[0] !== expectedLogoSha256))
+      (officialAssets.length !== 1 ||
+        officialHashes.length !== 1 ||
+        officialHashes[0] !== expectedLogoSha256))
   ) {
     throw new KnowledgeBasePackageBindingError(
       input.legacyV3Compatibility
         ? "历史最终 ZIP 未包含首轮已绑定的唯一官方主 Logo"
         : "最终 ZIP 必须只包含首轮已绑定的同一张官方主 Logo",
+    );
+  }
+
+  const officialLogoUploadAssets = officialAssets.filter(
+    (asset) => asset.sourceKind === "official_logo_upload",
+  );
+  const expectedOfficialLogoUpload = input.expectedOfficialLogoUpload;
+  if (expectedOfficialLogoUpload) {
+    if (!isCustomerUploadContract) {
+      throw new KnowledgeBasePackageBindingError(
+        "客户上传的官方主 Logo 必须使用 Dashboard v4 最终 ZIP 合同",
+      );
+    }
+    const expectedSourceSha256 = normalizedIdentity(
+      expectedOfficialLogoUpload.sourceSha256,
+    ).toLowerCase();
+    const expectedFileId = normalizedIdentity(
+      expectedOfficialLogoUpload.fileId,
+    );
+    const expectedFilename = normalizedIdentity(
+      expectedOfficialLogoUpload.filename,
+    );
+    const expectedMimeType = normalizedIdentity(
+      expectedOfficialLogoUpload.mimeType,
+    ).toLowerCase();
+    const expectedSizeBytes = expectedOfficialLogoUpload.sizeBytes;
+    if (
+      expectedSourceSha256 !== expectedLogoSha256 ||
+      !expectedFileId ||
+      !expectedFilename ||
+      !expectedMimeType.startsWith("image/") ||
+      !Number.isSafeInteger(expectedSizeBytes) ||
+      expectedSizeBytes < 1
+    ) {
+      throw new KnowledgeBasePackageBindingError(
+        "服务端官方主 Logo 上传账本无效或未与已绑定 Logo 字节对齐",
+      );
+    }
+    const uploadedLogo = officialLogoUploadAssets[0];
+    if (
+      officialLogoUploadAssets.length !== 1 ||
+      !uploadedLogo ||
+      normalizedIdentity(uploadedLogo.sha256).toLowerCase() !==
+        expectedLogoSha256 ||
+      uploadedLogo.size !== expectedSizeBytes ||
+      uploadedLogo.sourceUploadIndex !== 0 ||
+      normalizedIdentity(uploadedLogo.sourceUploadFileId) !== expectedFileId ||
+      normalizedIdentity(uploadedLogo.sourceUploadFilename) !==
+        expectedFilename ||
+      normalizedIdentity(uploadedLogo.sourceUploadMimeType).toLowerCase() !==
+        expectedMimeType ||
+      uploadedLogo.sourceUploadSizeBytes !== expectedSizeBytes ||
+      normalizedIdentity(uploadedLogo.sourceUploadSha256).toLowerCase() !==
+        expectedSourceSha256 ||
+      uploadedLogo.ownership !== "first_party" ||
+      uploadedLogo.assetType !== "brand_identity" ||
+      uploadedLogo.displayRole !== "badge" ||
+      uploadedLogo.sourcePageUrl !== undefined ||
+      uploadedLogo.sourceAssetUrl !== undefined ||
+      uploadedLogo.sourceDocumentPath !== undefined
+    ) {
+      throw new KnowledgeBasePackageBindingError(
+        "最终 ZIP 的客户上传官方主 Logo 与服务端原始上传账本不一致",
+      );
+    }
+  } else if (
+    isCustomerUploadContract &&
+    (officialLogoUploadAssets.length > 0 ||
+      officialAssets.some(
+        (asset) =>
+          asset.sourceKind !== "official_web" &&
+          asset.sourceKind !== "official_document",
+      ))
+  ) {
+    throw new KnowledgeBasePackageBindingError(
+      "最终 ZIP 声明了客户上传官方主 Logo，但服务端没有对应上传账本",
     );
   }
 

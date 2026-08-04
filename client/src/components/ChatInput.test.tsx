@@ -142,6 +142,67 @@ const progress: KnowledgeBaseProgressDto = {
   packageAllowed: false,
 };
 
+const logoRequiredProgress: KnowledgeBaseProgressDto = {
+  ...progress,
+  build: {
+    ...progress.build,
+    revision: 0,
+    currentLeafId: "identity.role",
+    logoRequired: true,
+  },
+  summary: {
+    ...progress.summary,
+    handled: 0,
+    confirmed: 0,
+    pending: 1,
+    current: 1,
+    overallPercent: 0,
+  },
+  branches: [
+    {
+      ...progress.branches[0]!,
+      handled: 0,
+      confirmed: 0,
+      pending: 1,
+      current: 1,
+      leaves: [
+        {
+          ...progress.branches[0]!.leaves[0]!,
+          status: "current",
+        },
+        {
+          ...progress.branches[0]!.leaves[1]!,
+          status: "pending",
+        },
+      ],
+    },
+  ],
+};
+
+function showLogoRequiredPresentation() {
+  mocks.activeConversation.messages = [
+    { id: "user", role: "user", content: "开始构建", timestamp: 1 },
+    {
+      id: "assistant-logo-required",
+      role: "assistant",
+      content: "## 企业定位与核心角色\n正文",
+      timestamp: 2,
+      knowledgeBase: {
+        kind: "presentation",
+        turnId: "turn-logo-required",
+        presentationKey: "presentation-logo-required",
+        revision: 0,
+        leafId: "identity.role",
+      },
+    },
+  ];
+  mocks.activeConversation.knowledgeBase.activeTurnId = "turn-logo-required";
+  mocks.activeConversation.knowledgeBase.presentationKey =
+    "presentation-logo-required";
+  mocks.activeConversation.knowledgeBase.revision = 0;
+  mocks.activeConversation.knowledgeBase.leafId = "identity.role";
+}
+
 describe("knowledge-base ChatInput actions", () => {
   beforeEach(() => {
     mocks.sendMessage.mockClear();
@@ -163,8 +224,98 @@ describe("knowledge-base ChatInput actions", () => {
       },
     ];
     mocks.activeConversation.status = "awaiting_input";
+    mocks.activeConversation.knowledgeBase.activeTurnId = "turn-2";
+    mocks.activeConversation.knowledgeBase.presentationKey = "presentation-2";
+    mocks.activeConversation.knowledgeBase.revision = 2;
+    mocks.activeConversation.knowledgeBase.leafId = "identity.legal";
     mocks.activeConversation.knowledgeBase.canReply = true;
     mocks.activeConversation.knowledgeBase.notice = null;
+  });
+
+  it("replaces confirmation with an official Logo picker while Logo input is required", () => {
+    showLogoRequiredPresentation();
+
+    const { container } = render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={logoRequiredProgress}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "确认当前内容" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "选择 Logo 原图" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("需要上传企业主 Logo")).toBeInTheDocument();
+    expect(container.querySelector('input[type="file"]')).toHaveAttribute(
+      "accept",
+      "image/png,image/jpeg,image/webp,image/avif,image/gif",
+    );
+    expect(container.querySelector('input[type="file"]')).not.toHaveAttribute(
+      "multiple",
+    );
+  });
+
+  it("does not send text while the official Logo upload gate is active", () => {
+    showLogoRequiredPresentation();
+
+    render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={logoRequiredProgress}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox");
+    expect(textarea).toBeDisabled();
+    fireEvent.change(textarea, { target: { value: "先确认正文" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("submits one supported image without advancing or confirming the current leaf", async () => {
+    showLogoRequiredPresentation();
+
+    const { container } = render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={logoRequiredProgress}
+      />,
+    );
+    const logo = new File(["official-logo"], "official-logo.png", {
+      type: "image/png",
+    });
+
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [logo] },
+    });
+    expect(screen.getByText("official-logo.png")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "提交 Logo 并继续" }),
+    );
+
+    await waitFor(() =>
+      expect(mocks.sendMessage).toHaveBeenCalledWith(
+        "",
+        [logo],
+        expect.objectContaining({
+          syncKnowledgeBaseSnapshot: true,
+          knowledgeBaseExpectedGeneration: 1,
+          knowledgeBaseExpectedRevision: 0,
+          knowledgeBaseExpectedLeafId: "identity.role",
+        }),
+      ),
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalledWith(
+      "确认",
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it("does not allow another confirmation until the current presentation renders", () => {

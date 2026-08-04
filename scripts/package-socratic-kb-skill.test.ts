@@ -64,13 +64,31 @@ describe("socratic knowledge-base Skill packaging", () => {
     const outputContract = await archive
       .file("references/output-format.md")!
       .async("string");
+    const questioningStrategy = await archive
+      .file("references/questioning-strategy.md")!
+      .async("string");
     const validator = await archive
       .file("scripts/validate_archive.py")!
       .async("string");
 
     expect(skill).toContain("`schemaVersion: 4`");
     expect(skill).toContain("sourceUploadSha256");
-    expect(skill).toContain("Every later upstream turn is text-only");
+    for (const instructions of [
+      skill,
+      outputContract,
+      questioningStrategy,
+    ]) {
+      const normalizedInstructions = instructions.replace(/\s+/g, " ");
+      expect(normalizedInstructions).toContain("image-free");
+      expect(normalizedInstructions).toContain(
+        "actually attach exactly one `application/zip` typed `output_file`",
+      );
+      expect(normalizedInstructions).toContain("present in the task `output`");
+      expect(normalizedInstructions).toContain(
+        "will be generated now, soon or later",
+      );
+      expect(normalizedInstructions).not.toContain("text-only");
+    }
     expect(outputContract).toContain('"schemaVersion": 4');
     expect(outputContract).toContain('"sourceKind": "user_upload"');
     expect(validator).toContain("MAX_USER_UPLOAD_IMAGES = 99");

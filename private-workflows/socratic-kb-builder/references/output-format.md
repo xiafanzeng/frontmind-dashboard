@@ -199,6 +199,34 @@ Use this exact top-level contract. Extra fields are forbidden:
 }
 ```
 
+When the required Logo is supplied through Dashboard's post-manifest first-leaf
+Logo control, replace the web-specific source fields on that one asset and use
+this provenance shape; do not apply it to initial attachments or generic inline
+uploads:
+
+```json
+{
+  "asset": {
+    "sourceKind": "official_logo_upload",
+    "sourceUploadIndex": 0,
+    "sourceUploadFileId": "dashboard-managed-file-id",
+    "sourceUploadSha256": "64-lowercase-hex-characters-for-original-upload",
+    "sourceUploadFilename": "primary-logo.png",
+    "sourceUploadMimeType": "image/png",
+    "sourceUploadSizeBytes": 123456,
+    "ownership": "first_party",
+    "assetType": "brand_identity",
+    "displayRole": "badge"
+  },
+  "candidate": {
+    "sourceKind": "official_logo_upload",
+    "method": "customer_upload",
+    "status": "eligible",
+    "assetId": "asset-company-logo"
+  }
+}
+```
+
 For `kind: "leaf"`, `branchTitle` and `order` are mandatory. `order` is the
 zero-based position of that leaf in the original protocol manifest; overview,
 evidence and index documents do not participate in this sequence. The one
@@ -235,12 +263,22 @@ Document and asset IDs are stable and unique. Every `assetIds` and
 
 ## Conversational presentation assets
 
-Associate the archive's sole automatically acquired official company Logo only
-with the manifest's first leaf. Return that one validated local byte as an
-actual response image/file attachment on the initial first-leaf turn. Do not
-return source hotlinks or only write a relative Markdown path. Every later
-upstream turn is text-only, even when it receives a customer upload. Each
-non-null later `FRONTMIND_KB_PRESENTATION` envelope uses
+Associate the archive's sole official company Logo only with the manifest's
+first leaf. When an eligible official-web or official-document Logo exists on
+the initial first-leaf turn, return that one validated local byte as an actual
+response image/file attachment. When none exists, return the complete manifest
+and first-leaf body without an image; Dashboard requests a Logo outside the
+formal body and blocks confirmation/direct prefill while that first leaf remains
+current. Do not return source hotlinks or only write a relative Markdown path.
+Every later upstream turn is image-free, even when it receives an
+`official_logo_upload`: Dashboard shows that upload from its trusted local
+ledger, the builder retains it for the archive, and the upload turn remains on
+the first leaf as `needs_verification`. The final completion turn is the only
+resource exception: it must actually attach exactly one `application/zip`
+typed `output_file`. That turn must not end until the typed ZIP item is present
+in the task `output`; saying that the ZIP will be generated now, soon or later
+is not delivery. Each non-null later
+`FRONTMIND_KB_PRESENTATION` envelope uses
 `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`;
 `not_applicable` is reserved for `leafId: null` after completion. Dashboard
 independently displays customer uploads from its trusted local upload ledger;
@@ -262,8 +300,11 @@ For schema version 2, compute `requiredFormalCharacters` exactly:
   evidence; otherwise use `limited_evidence`. Formal content must meet the
   computed requirement, but must not be padded to reach the target.
 
-`imageSelection` is an auditable Logo-only discovery funnel. Customer-uploaded
-images never enter this object or any candidate aggregate.
+`imageSelection` is an auditable Logo-only acquisition funnel. Generic
+`sourceKind: user_upload` inline node images never enter this object or any
+candidate aggregate. A primary Logo supplied through Dashboard's post-manifest
+Logo control does enter it with `sourceKind: official_logo_upload` and
+`method: customer_upload`.
 `inspectedCandidateImages`
 equals eligible plus rejected candidates and cannot exceed discovered
 candidates. Rejection-reason counts sum to rejected candidates. List every
@@ -273,17 +314,23 @@ branches independently of image selection. At least one family is required. If
 one leaf in a branch has `productFamilyId`, every leaf in that branch must
 declare it.
 
-List every inspected candidate with URL, source page, actual method and
-`eligible`, `rejected`, or `uninspected` status. Use `target_met` only when all
-candidates were inspected and exactly one non-`user_upload` official company
-Logo is packaged as
-`brand_identity` with display role `badge`. Use
-`source_limited` after inspecting
-every candidate when a concrete coverage gap remains, or `budget_limited` when
-real candidates remain uninspected. Both limited statuses require a non-empty
+List every inspected candidate with its actual method and
+`eligible`, `rejected`, or `uninspected` status. A web candidate carries its URL
+and source page, an official-document candidate carries its packaged document
+path, and a customer Logo candidate carries `sourceKind: official_logo_upload`
+plus `method: customer_upload` and its asset ID. Candidate objects never carry
+`sourceUpload*`; the referenced asset carries all six fields. Use `target_met`
+only when all candidates were inspected and exactly one official company Logo
+from `official_web`, `official_document`, or `official_logo_upload` is packaged
+as `brand_identity` with display role `badge`. Use `source_limited` after
+inspecting every candidate when a concrete coverage gap remains, or
+`budget_limited` when real candidates remain uninspected. Both limited statuses
+require a non-empty
 `shortfallReason` and `stopReason`. Stop image discovery immediately after
 the first eligible official company Logo. Never reduce a counter to make a
-shortfall pass.
+shortfall pass. A post-manifest first-leaf Logo block may temporarily reflect a
+real source shortfall in conversational state, but no final archive may use a
+limited image status.
 
 The manifest counts must match the actual ZIP:
 
@@ -311,18 +358,31 @@ use or target attainment.
 - Ownership must be exactly `first_party`.
 - Every asset must belong to a branch and at least one customer-visible
   document.
-- The sole automatically acquired official Logo declares
-  `sourceKind: official_web|official_document`,
+- The sole official Logo declares
+  `sourceKind: official_web|official_document|official_logo_upload`,
   `assetType: brand_identity` and `displayRole: badge`, is at least 256×256,
   and links only to the first leaf.
-- Customer-uploaded images are the sole exception to the no-other-image rule.
-  Each declares `sourceKind: user_upload`, `assetType: customer_supplied`,
+- An `official_logo_upload` is valid only for Dashboard's post-manifest
+  first-leaf Logo-required upload. It declares `ownership: first_party` and
+  preserves all six server-ledger fields exactly: `sourceUploadIndex: 0`,
+  non-empty `sourceUploadFileId`, lowercase `sourceUploadSha256`, safe
+  basename-only `sourceUploadFilename`, normalized `sourceUploadMimeType`, and
+  positive `sourceUploadSizeBytes`. The source hash, MIME type and byte size
+  equal the packaged asset's `sha256`, `mimeType`, and `bytes`. It carries no
+  `sourcePageUrl`, `sourceAssetUrl`, or `sourceDocumentPath`, counts as the one
+  required Logo, and does not consume an inline node-image slot. Only AVIF, GIF,
+  JPEG, PNG, or WebP is allowed for this exact-byte fallback; do not use SVG or
+  another converted source.
+- Generic customer-uploaded inline images are the sole non-Logo exception to
+  the no-other-image rule. Each declares `sourceKind: user_upload`,
+  `assetType: customer_supplied`,
   `displayRole: inline`, links only to leaves where that verified upload was
   supplied, and
   includes `sourceUploadSha256`, `sourceUploadFilename`, and
   `sourceUploadMimeType` for the original upload. These fields are mandatory
   even when conversion changes the packaged hash, MIME type or filename.
-- Deduplicate customer uploads by original `sourceUploadSha256`. If the same
+- Deduplicate every customer upload, including `official_logo_upload`, by
+  original `sourceUploadSha256`. If the same
   original image is supplied on multiple leaves, package one asset and list
   every genuinely bound leaf once in `documentIds`; never create duplicate
   assets and never add a leaf that did not receive that verified upload. The
@@ -334,9 +394,11 @@ use or target attainment.
   control characters. `sourceUploadSha256` is 64 lowercase hex characters.
   `sourceUploadMimeType` is the verified original image MIME type, including
   `image/svg+xml` when the original was SVG.
-- Raw SVG and other non-raster uploads are never packaged. Rasterize them to a
-  supported output format, strip active/external content, validate and fully
-  decode the result, then record the original upload provenance separately.
+- Raw SVG and other non-raster generic inline uploads are never packaged.
+  Rasterize them to a supported output format, strip active/external content,
+  validate and fully decode the result, then record the original upload
+  provenance separately. This conversion path never applies to
+  `official_logo_upload`, whose input and packaged bytes must be identical.
 - No other automatically discovered business, hero, product, UI,
   architecture, case, team, environment, certificate or other image may be
   packaged.
@@ -349,8 +411,9 @@ use or target attainment.
 The crawl report records actual discovered/succeeded/failed/skipped pages,
 links, cleaned/deduplicated characters, image discovery/download/deduplication
 and bytes, document parsing, upload processing, and budget stops. Report the
-saved official-Logo count separately from the deduplicated customer-upload
-count; do not combine customer uploads into Logo discovery/download totals.
+saved official-Logo count, including an `official_logo_upload`, separately from
+the deduplicated generic inline `user_upload` count. Only a Logo upload enters
+Logo acquisition totals; generic customer uploads do not.
 
 The public-web report records every query, language, result domain,
 selected/rejected source, conflict, and unresolved gap. The media-gap report
@@ -387,9 +450,11 @@ Replace every uppercase token with the current run's actual value.
 `totalLeaves` is the 8–115 true leaf count,
 not the overview count. The six evidence-state counts must be non-negative,
 sum to `totalLeaves`, and match the leaf manifests. `images.completed` must
-equal 1 for a valid new archive and records only the official Logo acquired by
-the automated discovery pipeline. `images.total` records only Logo candidates
-discovered; neither field includes customer uploads. Each acquisition
+equal 1 for a valid new archive and records the one official Logo, whether it
+came from the web, an official document, or `official_logo_upload`.
+`images.total` records only Logo candidates and therefore includes a customer
+upload only when it is inspected as the primary Logo; generic inline uploads
+remain excluded. Each acquisition
 `completed` value is no greater than `total`. Do not calculate or store a
 completeness score, grade, percentage, or resource-consumption proxy.
 

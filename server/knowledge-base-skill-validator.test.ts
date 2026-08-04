@@ -320,6 +320,42 @@ async function addCustomerUploadImage(
   return { asset, manifest, packagedBytes, sourceUpload };
 }
 
+function replaceOfficialLogoWithVerifiedUpload(
+  files: Record<string, string | Uint8Array>,
+) {
+  const root = "fixture_knowledge_base";
+  const manifest = JSON.parse(
+    String(files[`${root}/00_package_manifest.json`]),
+  );
+  const asset = manifest.assets[0] as Record<string, unknown>;
+  delete asset.sourcePageUrl;
+  delete asset.sourceAssetUrl;
+  delete asset.sourceDocumentPath;
+  Object.assign(asset, {
+    sourceKind: "official_logo_upload",
+    sourceUploadIndex: 0,
+    sourceUploadFileId: "file-official-logo-upload",
+    sourceUploadSha256: asset.sha256,
+    sourceUploadFilename: "brand-logo.png",
+    sourceUploadMimeType: "image/png",
+    sourceUploadSizeBytes: asset.bytes,
+  });
+  manifest.imageSelection.scannedSourcePages = 0;
+  manifest.imageSelection.discoveryMethods = ["customer_upload"];
+  manifest.imageSelection.candidates = [
+    {
+      sourceKind: "official_logo_upload",
+      method: "customer_upload",
+      status: "eligible",
+      assetId: asset.id,
+    },
+  ];
+  manifest.imageSelection.stopReason =
+    "客户已上传并确认企业官方主 Logo 原图";
+  files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+  return { asset, manifest };
+}
+
 describe("dashboard enterprise Skill archive validator", () => {
   it("accepts a complete deep archive with exactly one official Logo", async () => {
     const archivePath = await writeArchive(await validDeepArchiveFiles());
@@ -330,6 +366,46 @@ describe("dashboard enterprise Skill archive validator", () => {
       code: 0,
       stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
     });
+  });
+
+  it("accepts a schema v4 official_logo_upload with the exact upload ledger and strict candidate shape", async () => {
+    const files = await validDeepArchiveFiles();
+    const { asset, manifest } = replaceOfficialLogoWithVerifiedUpload(files);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result).toMatchObject({
+      code: 0,
+      stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
+    });
+    expect(manifest.schemaVersion).toBe(4);
+    expect(asset).toMatchObject({
+      sourceKind: "official_logo_upload",
+      sourceUploadIndex: 0,
+      sourceUploadFileId: "file-official-logo-upload",
+      sourceUploadSha256: asset.sha256,
+      sourceUploadFilename: "brand-logo.png",
+      sourceUploadMimeType: "image/png",
+      sourceUploadSizeBytes: asset.bytes,
+    });
+    expect(Object.keys(manifest.imageSelection.candidates[0]).sort()).toEqual(
+      ["assetId", "method", "sourceKind", "status"].sort(),
+    );
+  });
+
+  it("rejects an official_logo_upload asset missing one required ledger field", async () => {
+    const files = await validDeepArchiveFiles();
+    const { asset, manifest } = replaceOfficialLogoWithVerifiedUpload(files);
+    delete asset.sourceUploadFileId;
+    files["fixture_knowledge_base/00_package_manifest.json"] =
+      JSON.stringify(manifest);
+
+    const result = await runValidator(await writeArchive(files));
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "official_logo_upload requires sourceUploadIndex, sourceUploadFileId and sourceUploadSizeBytes",
+    );
   });
 
   it("allows customer-role business terms that are not advice", async () => {

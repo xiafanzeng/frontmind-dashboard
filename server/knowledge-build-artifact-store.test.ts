@@ -72,6 +72,33 @@ describe("knowledge build immutable artifacts", () => {
     ).toEqual(logo);
   });
 
+  it("normalizes sharp's HEIF container metadata for a real AVIF Logo", async () => {
+    const logo = await sharp({
+      create: {
+        width: 256,
+        height: 256,
+        channels: 4,
+        background: "#582080",
+      },
+    })
+      .avif()
+      .toBuffer();
+    const stored = await persistKnowledgeBuildArtifact({
+      userId: 7,
+      buildId,
+      generation: 5,
+      kind: "logo",
+      buffer: logo,
+    });
+
+    expect(stored).toMatchObject({
+      bytes: logo.length,
+      width: 256,
+      height: 256,
+      format: "avif",
+    });
+  });
+
   it("persists the final ZIP idempotently and rejects changed bytes", async () => {
     const zip = new JSZip();
     zip.file("manifest.json", "{}");

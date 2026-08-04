@@ -6,8 +6,9 @@ description: Build a deep enterprise encyclopedia with one official company logo
 # Socratic Enterprise Knowledge Base Builder
 
 Build a reusable Chinese enterprise encyclopedia with deep evidence coverage,
-exactly one automatically acquired official company Logo, preserved
-customer-uploaded node images and one-leaf-at-a-time confirmation.
+exactly one official company Logo acquired from an official source or supplied
+by the customer, preserved customer-uploaded node images and one-leaf-at-a-time
+confirmation.
 
 ## Execution mode
 
@@ -91,9 +92,11 @@ particular word or phrase. Runtime progression depends on the typed protocol
 envelopes, active operation identity, revision, current leaf and non-empty
 projected body.
 
-End the visible turn immediately after the actual leaf body and, on the
-initial first-leaf turn only, the validated managed Logo. Never emit a
-customer-visible `参考资料`, `参考来源`,
+End the visible turn immediately after the actual leaf body and, when an
+official-web or official-document Logo is available on the initial first-leaf
+turn, that validated managed Logo. When that turn has no eligible Logo, emit the
+leaf body and complete manifest without an image. Dashboard requests the Logo
+outside the leaf body. Never emit a customer-visible `参考资料`, `参考来源`,
 `References` or `Sources` section. Keep all source URLs and verification notes
 only in internal evidence/report documents. Machine protocol envelopes follow
 the visible body and remain the only allowed content after it.
@@ -111,25 +114,44 @@ that carry the legacy evidence-proportional value remain readable.
 
 ## Logo discovery, customer uploads and quality
 
-The automated image-discovery pipeline acquires exactly one image for the
-entire build: the enterprise's primary official Logo. Inspect only the minimum
-first-party page or official document needed to obtain it, then stop all image
-discovery immediately. The official Logo asset must not use
-`sourceKind: user_upload`.
+The Logo-acquisition pipeline acquires exactly one image for the entire build:
+the enterprise's primary official Logo. Treat a validated Logo extracted from
+initial enterprise material as `official_document`; otherwise inspect only the
+minimum first-party pages needed to obtain it and stop image discovery
+immediately. Reserve `official_logo_upload` exclusively for a later upload made
+through Dashboard's post-manifest first-leaf Logo-required control.
+The official Logo asset uses `sourceKind: official_web`,
+`sourceKind: official_document`, or `sourceKind: official_logo_upload`; it never
+uses the generic node-image value `sourceKind: user_upload`.
 
 Do not search for or package a brand hero, business visual, product image,
 product UI, architecture diagram, case image, team image, environment image,
-certificate image or any other non-Logo visual. Do not emit a successful
-initial manifest until the Logo is backed by downloaded and decoded
-first-party bytes. Never substitute a favicon, app icon, badge, logo collage,
-decorative background, stock image, placeholder or hotlink. If the primary
-official Logo cannot be obtained within the hard ceilings, fail the build
-honestly instead of claiming a complete first turn. Deduplicate by decoded
-content and visual identity, not URL or filename alone.
+certificate image or any other non-Logo visual. Never substitute a favicon, app
+icon, badge, logo collage, decorative background, stock image, placeholder or
+hotlink. Deduplicate by decoded content and visual identity, not URL or filename
+alone.
+
+If bounded official-source and public discovery finds no eligible Logo and the
+initial task has no qualifying official-document Logo material, still emit the
+complete initial manifest and the complete first-leaf body, but emit no image
+attachment. This is a post-manifest first-leaf Logo block: the first leaf
+remains `current`, the Dashboard renders the upload request outside formal
+knowledge content, and no
+confirmation, direct prefill, traversal progress or packaging may occur until a
+qualifying primary Logo is supplied. Do not put the upload request, Logo gap or
+workflow instruction inside the leaf body, and do not fail or restart the build
+merely because the Logo is initially unavailable.
+
+While the Logo block is active, an absent or invalid upload leaves the first
+leaf current. A corrupt file, non-image, favicon/app icon, collage, non-Logo or
+undersized raster does not satisfy the block. A qualifying upload resolves the
+Logo requirement but is still a supplement: update and re-present the same
+first leaf as `needs_verification`; never confirm it or advance in the upload
+turn. Ordinary confirmation may advance only on a later attachment-free turn.
 
 Only package validated AVIF, WebP, PNG, JPEG or GIF bytes. Rasterize useful
-SVGs and every other accepted non-raster customer upload to a safe raster
-format, strip active content and external references during conversion,
+SVGs and every other accepted non-raster generic customer upload to a safe
+raster format, strip active content and external references during conversion,
 deduplicate decoded content, and never upscale a small raster to pass a quality
 gate. Raw SVG, HTML or other active content must never enter the ZIP.
 
@@ -140,7 +162,7 @@ package them under `09_media_assets/`; customer documents reference only the
 packaged relative asset path. If the bytes cannot be downloaded and decoded,
 reject the candidate instead of returning a broken image link.
 
-The sole automatically acquired Logo asset must use:
+The sole official Logo asset must use:
 
 - `assetType`: `brand_identity`
 - `displayRole`: `badge`
@@ -148,13 +170,13 @@ The sole automatically acquired Logo asset must use:
 The Logo must be at least 256×256. Do not upscale a smaller raster merely to
 pass this gate.
 
-Customer images uploaded while revising a leaf are the only exception to the
-one-image discovery limit. They are direct customer inputs, not discovered
-candidates: do not add them to `imageSelection`, crawl counters or Logo
-candidate totals, and do not use them as permission to fetch visually similar
-or related images. Bind each accepted image only to leaves on whose turns the
-same verified upload was actually supplied, retain its validated/rasterized
-bytes in `09_media_assets/`, and carry it into the final ZIP even when it is not
+Customer-uploaded inline node images are the only non-Logo exception to the
+one-image discovery limit. They are direct customer inputs, not Logo candidates:
+do not add them to `imageSelection`, crawl counters or Logo candidate totals,
+and do not use them as permission to fetch visually similar or related images.
+Bind each accepted image only to leaves on whose turns the same verified upload
+was actually supplied, retain its validated/rasterized bytes in
+`09_media_assets/`, and carry it into the final ZIP even when it is not
 referenced in prose. Deduplicate repeated uploads by the original
 `sourceUploadSha256`: one asset may list every genuinely bound leaf in
 `documentIds`, but it must not be copied into multiple assets or linked to a
@@ -163,7 +185,7 @@ branches. Preserve filename and MIME provenance from the earliest verified
 occurrence of that hash. Package at most 99 unique
 customer-uploaded images across the build.
 
-Every customer-uploaded asset uses `sourceKind: user_upload`,
+Every generic customer-uploaded inline node asset uses `sourceKind: user_upload`,
 `ownership: first_party`, `assetType: customer_supplied`, and
 `displayRole: inline`. It must record the original upload's exact
 `sourceUploadSha256`, basename-only `sourceUploadFilename`, and normalized
@@ -173,27 +195,58 @@ describe the safe packaged raster. Never invent upload provenance, and never
 replace an unavailable customer upload with a URL, placeholder or reconstructed
 image.
 
-Record every inspected Logo candidate with a public source page or packaged
-official document, method and
-`eligible|rejected|uninspected`. Eligible entries link to packaged assets;
+A customer Logo supplied through Dashboard while the post-manifest first-leaf
+Logo block is active uses `sourceKind: official_logo_upload`,
+`ownership: first_party`, `assetType: brand_identity`, and
+`displayRole: badge`. This dedicated source kind is invalid for ordinary initial
+attachments because they have no server-verified Logo-required upload marker;
+an eligible Logo from initial enterprise material instead uses
+`sourceKind: official_document`.
+
+The `official_logo_upload` asset preserves all six server-ledger fields exactly:
+`sourceUploadIndex` equal to `0`, non-empty `sourceUploadFileId`, lowercase
+`sourceUploadSha256`, safe basename-only `sourceUploadFilename`, normalized
+`sourceUploadMimeType`, and positive `sourceUploadSizeBytes`. Its source hash,
+MIME type and byte size equal the packaged Logo's `sha256`, `mimeType` and
+`bytes`; no conversion or reconstruction is allowed. The Logo-required control
+accepts only AVIF, GIF, JPEG, PNG or WebP, so SVG and other convertible generic
+upload formats are invalid for this dedicated fallback. The asset carries no
+invented `sourcePageUrl`, `sourceAssetUrl` or `sourceDocumentPath`, links only to
+the manifest's first leaf, counts as the one required official Logo, and does
+not consume one of the 99 inline node-image slots.
+
+Record every inspected Logo candidate with either a public source page, a
+packaged official document, or the dedicated `official_logo_upload` source kind,
+plus its method and `eligible|rejected|uninspected` status. Use
+`method: customer_upload` only for `sourceKind: official_logo_upload`; that
+candidate carries no URL, document path or `sourceUpload*` fields and links to
+the six-field asset by `assetId`. Eligible entries link to packaged assets;
 rejected entries include a concrete reason. Also maintain arithmetically
-consistent aggregate counts and rejection reasons. Reject sprites, icon sheets,
-decorative backgrounds, mostly transparent media and logo collages.
+consistent aggregate counts and rejection reasons. Generic `user_upload` node
+images never enter this ledger. Reject sprites, icon sheets, decorative
+backgrounds, mostly transparent media and logo collages.
 `imageSelection.scannedSourcePages` is the actual number of pages inspected for
 the primary Logo and may be lower than the total successfully parsed pages.
 
 ### Conversational image delivery
 
 Associate the sole validated Logo only with the manifest's first leaf
-(normally `1.1 一句话定位`). On the initial turn, return exactly that one
-validated local Logo byte attachment below the first-leaf body. Use a stable
-asset ID, packaged filename and meaningful alt or caption metadata. Never
-substitute a Markdown-only path, origin/CDN URL, source link or textual
-placeholder.
+(normally `1.1 一句话定位`). When an official-web or official-document Logo
+is available on the initial turn, return exactly one
+validated local Logo byte attachment below the first-leaf body. If it is
+unavailable, return no image; never substitute a Markdown-only path, origin/CDN
+URL, source link or textual placeholder. A later `official_logo_upload` remains
+visible through the
+Dashboard's trusted local upload ledger and must not be reattached by the
+upstream response.
 
-Every later upstream turn is text-only, including a revision that receives a
+Every later upstream turn is image-free, including a revision that receives a
 customer image. Do not return, repeat or reattach any image after the initial
-Logo. Every non-null later presentation envelope therefore uses
+Logo. The final completion turn is the only resource exception: it must
+actually attach exactly one `application/zip` typed `output_file`. That turn
+must not end until the typed ZIP item is present in the task `output`; saying
+that the ZIP will be generated now, soon or later is not delivery. Every
+non-null later presentation envelope therefore uses
 `imageState: no_eligible_asset`, `assetIds: []`, and `imageCount: 0`. This
 protocol state does not mean the customer's image was discarded: Dashboard
 renders verified uploads independently from its trusted local upload ledger,
@@ -202,10 +255,11 @@ relationship. Never invent a ready-state presentation or managed URL for that
 Dashboard-owned display.
 
 `target_met` means all recorded candidates were inspected and exactly one
-primary official Logo was packaged as `brand_identity` with display role
-`badge`. A new successful build must use `target_met`; a
-`source_limited` or `budget_limited` result is an internal failure diagnostic,
-not a deliverable initial turn.
+primary official Logo, including an eligible `official_logo_upload` fallback,
+was packaged as `brand_identity` with display role `badge`. The temporary
+post-manifest first-leaf block may remain source-limited while waiting for the
+customer, but every final candidate ZIP must use `target_met`;
+`source_limited` or `budget_limited` is never a deliverable archive state.
 
 ## Confirmation state
 
@@ -236,19 +290,24 @@ to an older schema. A legacy object such as
 `{"action":"confirm","leafId":"1.1","status":"confirmed"}` is invalid.
 
 1. The first turn researches, builds the full tree and all prefilled formal
-   drafts, then presents only the first leaf and one manifest envelope.
+   drafts, then presents only the first leaf and one manifest envelope. If no
+   eligible Logo exists, it returns no image and leaves that first leaf blocked
+   as described above; the missing image never suppresses the manifest.
 2. A later turn processes the pre-turn current leaf but presents the
    post-transition current leaf. After confirming or directly prefilling A,
    acknowledge A in one short sentence and make the customer-visible body a
    complete presentation of B. Never leave A as the body after advancing.
-3. Only explicit confirmation becomes `confirmed`.
+3. Only explicit confirmation becomes `confirmed`, and confirmation or direct
+   prefill is invalid while the first-leaf Logo block remains unresolved.
 4. Only explicit “跳过/直接预填/采用预填/保留预填” becomes
    `direct_prefilled` for protocol compatibility. Do not proactively offer
    direct prefill or skip as a customer-facing action; the normal choice is to
    confirm, or to submit corrections/uploads and confirm the revised draft.
 5. Corrections, supplements, questions and uploads remain
    `needs_verification`; update and re-present the same leaf. Any turn with an
-   attachment is a supplement even if its text says “确认”.
+   attachment is a supplement even if its text says “确认”. A qualifying
+   `official_logo_upload` resolves only the Logo block and still leaves the first
+   leaf current for a later explicit confirmation.
 6. Never bulk-confirm, skip a branch, fabricate progress or offer early
    packaging. Progress is `(confirmed + direct_prefilled) / total`.
 7. Every non-initial turn emits exactly one progress envelope followed
@@ -264,20 +323,26 @@ to an older schema. A legacy object such as
 9. The visible body contains only the actual presented leaf (plus first-turn
    tree statistics when required). Do not append sources, unresolved items,
    verification notes, action guidance or a confirmation question.
-10. Only the initial first-leaf presentation may deliver the automatically
-    acquired official Logo. Any later response image attachment is a protocol
-    failure. Customer-upload visibility is Dashboard-managed and does not
-    authorize the upstream response to attach an image.
+10. Only the initial first-leaf presentation may deliver an automatically
+    acquired official-web or official-document Logo. Any later response image
+    attachment is a protocol failure. Customer-upload visibility, including an
+    `official_logo_upload`, is Dashboard-managed and does not authorize the
+    upstream response to attach an image.
 
 Use normal Markdown, not ASCII trees or simulated interfaces.
 
 ## Final ZIP
 
 When processing the final leaf and the accepted transition will bring traversal
-to 100%, create and return the one new candidate ZIP in that same turn with
-`schemaVersion: 4` and `profile: "dashboard-enterprise-v1"`. Never wait for a
-later turn to package. Set `00_package_manifest.json.buildRevision` to the
-service-supplied post-transition revision for that final turn. Preserve the existing
+to 100%, create and actually attach the one new candidate ZIP in that same turn
+as exactly one `application/zip` typed `output_file`, with `schemaVersion: 4`
+and `profile: "dashboard-enterprise-v1"`. This mandatory ZIP is the only
+non-image resource exception after the initial turn. Never wait for a later turn
+to package, and never end the final turn before the typed ZIP item is present in
+the task `output`. A statement that the ZIP is being generated or will be
+generated soon or later is not a deliverable. Set
+`00_package_manifest.json.buildRevision` to the service-supplied
+post-transition revision for that final turn. Preserve the existing
 `00_completeness.json` raw-count contract. Include:
 
 - `README.md`, `00_knowledge_tree.md`, `00_completeness.json`,

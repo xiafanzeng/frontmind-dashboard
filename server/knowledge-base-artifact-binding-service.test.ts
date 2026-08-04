@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  assertKnowledgeBaseOfficialLogoMimeMatches,
   collectKnowledgeBaseLogoDescriptors,
   knowledgeBaseStagedArtifactCleanupDecision,
+  selectKnowledgeBaseRecoveryLogoAsset,
   selectKnowledgeBaseReadyPackageDescriptor,
   type KnowledgeBaseStagedArtifactCandidate,
 } from "./knowledge-base-artifact-binding-service";
@@ -12,6 +14,40 @@ import {
 } from "./knowledge-base-artifact";
 
 describe("knowledge-base Logo descriptor normalization", () => {
+  it("rejects a declared Logo MIME that disagrees with the decoded bytes", () => {
+    expect(
+      assertKnowledgeBaseOfficialLogoMimeMatches({
+        declaredMimeType: "image/jpeg",
+        detectedFormat: "jpeg",
+      }),
+    ).toBe("image/jpeg");
+    expect(() =>
+      assertKnowledgeBaseOfficialLogoMimeMatches({
+        declaredMimeType: "image/jpeg",
+        detectedFormat: "png",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "LOGO_UPLOAD_INVALID" }));
+  });
+
+  it("recovers the v4 official Logo without treating ordinary upload assets as candidates", () => {
+    const official = {
+      sha256: "a".repeat(64),
+      sourceKind: "official_logo_upload",
+    } as any;
+    const customer = {
+      sha256: "b".repeat(64),
+      sourceKind: "user_upload",
+    } as any;
+
+    expect(
+      selectKnowledgeBaseRecoveryLogoAsset({
+        skillVersion: "4",
+        assets: [customer, official],
+        expectedLogoSha256: "a".repeat(64),
+      }),
+    ).toBe(official);
+  });
+
   it("deduplicates nested and top-level projections of one physical Logo", () => {
     const descriptors = collectKnowledgeBaseLogoDescriptors([
       {

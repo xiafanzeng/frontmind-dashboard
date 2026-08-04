@@ -11,9 +11,6 @@ import {
   or,
 } from "drizzle-orm";
 import { Router } from "express";
-import fs from "fs/promises";
-import JSZip from "jszip";
-import path from "path";
 import { createHash } from "node:crypto";
 import {
   getFrontMindCredentials,
@@ -39,8 +36,10 @@ import {
   isAmbiguousKnowledgeBaseAdvance,
   isIdempotentKnowledgeBaseReconcileError,
   isKnowledgeBaseAcknowledgementOnlyOutput,
+  knowledgeBaseProtocolErrorAllowsSameTaskRecovery,
   observeKnowledgeBaseProtocolFailure,
   reconcileKnowledgeBaseProgress,
+  resumeKnowledgeBaseFinalPackageMissing,
 } from "./knowledge-base-progress-service";
 import {
   getDashboardWorkspace,
@@ -59,13 +58,8 @@ import type {
 import { knowledgeBaseBuilds } from "../drizzle/schema";
 import { getDb } from "./db";
 import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
-import { buildDeterministicTaskAttachmentArchive } from "./task-attachment-package";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import { extractKnowledgeBaseProtocolObjects } from "../shared/knowledge-base-output";
-import {
-  canonicalKnowledgeBaseSkillArchiveHash,
-  legacyKnowledgeBaseSkillInstructionHash,
-} from "../shared/knowledge-base-skill-archive-hash.js";
 import { collectUpstreamOutputFileIds } from "./upstream-output-resources";
 import {
   classifyKnowledgeBaseUpstreamTaskStatus,
@@ -80,15 +74,18 @@ import {
 import {
   bindKnowledgeBaseFinalPackage,
   bindKnowledgeBaseInitialLogo,
+  bindKnowledgeBaseOfficialLogoUpload,
   bindKnowledgeBaseReadyPackage,
   cleanupKnowledgeBaseStagedArtifactCandidate,
   collectKnowledgeBaseLogoDescriptors,
   KnowledgeBaseArtifactBindingError,
+  type KnowledgeBaseOfficialLogoUpload,
   type KnowledgeBaseStagedArtifactCandidate,
 } from "./knowledge-base-artifact-binding-service";
 import { collectKnowledgeArchiveDescriptors } from "./knowledge-base-artifact";
 import {
   bindKnowledgeBaseTurnUpstreamTask,
+  cancelUnpreparedKnowledgeBaseTurn,
   claimKnowledgeBaseDeferredTurnDispatch,
   claimKnowledgeBaseTurnForRecovery,
   completeKnowledgeBaseGeneratedAttachment,
@@ -104,7 +101,7 @@ import {
   reserveKnowledgeBaseStartBuild,
   reserveKnowledgeBaseTurn,
   renewKnowledgeBaseTurnLease,
-  stageKnowledgeBaseDeferredTurnAttachment,
+  stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseTurnAttachments,
   KnowledgeBaseTurnReservationError,
   type KnowledgeBasePreparedDispatch,
@@ -133,10 +130,29 @@ import {
 } from "./knowledge-base-client-attachment-manifest";
 import { assertKnowledgeBaseExpectedGeneration } from "./knowledge-base-turn-coordinates";
 import { logKnowledgeBaseRuntimeFailure } from "./knowledge-base-runtime-log";
+import {
+  getKnowledgeBaseSkillDescriptor,
+  loadKnowledgeBaseSkillArchive as loadSkillArchive,
+  KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
+  readKnowledgeBaseSkillArchiveAttachment,
+} from "./knowledge-base-skill-runtime";
+import {
+  buildKnowledgeBasePrefillEvidenceArchive,
+  buildKnowledgeBasePrompt,
+  KnowledgeBaseEnterpriseIdentityError,
+  KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
+  resolveKnowledgeBaseEnterpriseIdentity,
+} from "./knowledge-base-prompt-contract";
 
 export * from "./knowledge-base-client-attachment-manifest";
 export * from "./knowledge-base-turn-coordinates";
 export * from "./knowledge-base-runtime-log";
+export * from "./knowledge-base-prompt-contract";
+export {
+  getKnowledgeBaseSkillDescriptor,
+  KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
+  readKnowledgeBaseSkillArchiveAttachment,
+} from "./knowledge-base-skill-runtime";
 
 const router = Router();
 
@@ -244,58 +260,6 @@ async function loadKnowledgeBaseBuildRecord(
 
 function reservationRetryAfterMs(reservation: KnowledgeBaseTurnReservation) {
   return reservation.state === "pending" ? reservation.retryAfterMs : 1_000;
-}
-
-export type KnowledgeBaseEnterpriseIdentityErrorCode =
-  | "ENTERPRISE_NOT_CONFIGURED"
-  | "ENTERPRISE_IDENTITY_MISMATCH";
-
-export class KnowledgeBaseEnterpriseIdentityError extends Error {
-  readonly code: KnowledgeBaseEnterpriseIdentityErrorCode;
-
-  constructor(code: KnowledgeBaseEnterpriseIdentityErrorCode, message: string) {
-    super(message);
-    this.name = "KnowledgeBaseEnterpriseIdentityError";
-    this.code = code;
-  }
-}
-
-function normalizedEnterpriseName(value: string) {
-  return value.normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase();
-}
-
-/**
- * A knowledge-base build belongs to the enterprise name already assigned to
- * the authenticated account. Publishing an otherwise empty dashboard is not a
- * prerequisite. Browser input may repeat the name for compatibility, but it
- * can neither establish nor replace the identity.
- */
-export function resolveKnowledgeBaseEnterpriseIdentity(input: {
-  sourceName: string | null;
-  brandName: string;
-  requestedCompanyName?: string;
-}) {
-  const companyName = input.brandName.normalize("NFKC").trim();
-  if (!companyName) {
-    throw new KnowledgeBaseEnterpriseIdentityError(
-      "ENTERPRISE_NOT_CONFIGURED",
-      "当前账号尚未由管理员配置企业名称，无法启动知识库构建",
-    );
-  }
-
-  const requestedCompanyName = String(input.requestedCompanyName || "").trim();
-  if (
-    requestedCompanyName &&
-    normalizedEnterpriseName(requestedCompanyName) !==
-      normalizedEnterpriseName(companyName)
-  ) {
-    throw new KnowledgeBaseEnterpriseIdentityError(
-      "ENTERPRISE_IDENTITY_MISMATCH",
-      "输入的企业名称与当前账号绑定企业不一致，请刷新后重试",
-    );
-  }
-
-  return companyName;
 }
 
 function outputItemIds(output: unknown[]) {
@@ -589,6 +553,7 @@ export async function getKnowledgeBaseObservation(input: {
       (progress.build.skillVersion === "4" &&
         progress.build.revision === 0 &&
         progress.summary.handled === 0 &&
+        progress.build.logoRequired !== true &&
         (observation.approvedPresentation.imageState !== "attached" ||
           observation.approvedPresentation.resources.filter(
             (resource) => resource.kind === "logo",
@@ -657,6 +622,52 @@ export function shouldBindKnowledgeBaseInitialLogo(
   descriptorCount: number,
 ) {
   return descriptorCount > 0 && skillVersion !== "3";
+}
+
+function knowledgeBaseBuildRequiresOfficialLogo(build: {
+  skillVersion: string;
+  status: string;
+  revision: number;
+  currentLeafId: string | null;
+  totalNodeCount: number;
+  confirmedCount: number;
+  directPrefilledCount: number;
+  logoSha256: string | null;
+}) {
+  return (
+    build.skillVersion === "4" &&
+    build.status === "confirming" &&
+    build.revision === 0 &&
+    Boolean(build.currentLeafId) &&
+    build.totalNodeCount > 0 &&
+    build.confirmedCount === 0 &&
+    build.directPrefilledCount === 0 &&
+    !build.logoSha256
+  );
+}
+
+function knowledgeBaseManifestRepeatsOfficialLogo(
+  build: { logoSha256: string | null },
+  manifest: readonly KnowledgeBaseClientAttachmentManifestItem[],
+) {
+  const logoSha256 = String(build.logoSha256 || "")
+    .trim()
+    .toLowerCase();
+  return Boolean(
+    logoSha256 && manifest.some((item) => item.sha256 === logoSha256),
+  );
+}
+
+function assertKnowledgeBaseManifestDoesNotRepeatOfficialLogo(
+  build: { logoSha256: string | null },
+  manifest: readonly KnowledgeBaseClientAttachmentManifestItem[],
+) {
+  if (knowledgeBaseManifestRepeatsOfficialLogo(build, manifest)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "该图片与已绑定的企业主 Logo 完全相同，无需作为普通补图再次上传",
+    );
+  }
 }
 
 async function cleanupUnpromotedKnowledgeBaseArtifactCandidates(
@@ -748,13 +759,35 @@ async function reconcileAvailableKnowledgeOutput(input: {
           }
           throw error;
         }
+        const finalPackageMissing =
+          boundBuild.status === "protocol_error" &&
+          boundBuild.protocolErrorCode === "FINAL_PACKAGE_MISSING";
+        const archiveDescriptorCount =
+          collectKnowledgeArchiveDescriptors(unreconciled).length;
+        if (finalPackageMissing && archiveDescriptorCount === 0) {
+          // A provider may publish the typed file after the terminal text
+          // snapshot. Keep the exact failed turn recoverable and re-read this
+          // same task; never replay the final Progress transition by itself.
+          return progress;
+        }
+        if (finalPackageMissing) {
+          const resumed = await resumeKnowledgeBaseFinalPackageMissing({
+            userId: input.userId,
+            conversationId: input.conversationId,
+            taskId: input.taskId,
+            output: unreconciled,
+          });
+          if (!resumed) return progress;
+          boundBuild = await assertKnowledgeBaseTaskBinding({
+            userId: input.userId,
+            conversationId: input.conversationId,
+            taskId: input.taskId,
+          });
+        }
         const packageRebindRequired =
           boundBuild.status === "protocol_error" &&
           boundBuild.protocolErrorCode === "PACKAGE_REBIND_REQUIRED";
-        if (
-          packageRebindRequired &&
-          collectKnowledgeArchiveDescriptors(unreconciled).length === 0
-        ) {
+        if (packageRebindRequired && archiveDescriptorCount === 0) {
           // The historical task remains the sole authority. A partial provider
           // snapshot must keep the rebind notice intact instead of replaying the
           // already-applied final Progress transition or creating a new turn.
@@ -765,7 +798,7 @@ async function reconcileAvailableKnowledgeOutput(input: {
             collectKnowledgeBaseLogoDescriptors(unreconciled);
           if (
             boundBuild.skillVersion === "4"
-              ? boundBuild.totalNodeCount === 0
+              ? boundBuild.totalNodeCount === 0 && logoDescriptors.length > 0
               : shouldBindKnowledgeBaseInitialLogo(
                   boundBuild.skillVersion,
                   logoDescriptors.length,
@@ -1269,6 +1302,40 @@ function recoveryString(
   return typeof value === "string" ? value : fallback;
 }
 
+function recoveryOfficialLogoUpload(
+  metadata: Record<string, unknown>,
+): KnowledgeBaseOfficialLogoUpload | undefined {
+  const value = metadata.officialLogoUpload;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const upload = value as Record<string, unknown>;
+  const index = Number(upload.index);
+  const fileId = String(upload.fileId || "");
+  const filename = String(upload.filename || "");
+  const mimeType = String(upload.mimeType || "");
+  const sizeBytes = Number(upload.sizeBytes);
+  const sourceSha256 = String(upload.sourceSha256 || "").toLowerCase();
+  return upload.verified === true &&
+    index === 0 &&
+    fileId &&
+    filename &&
+    mimeType.startsWith("image/") &&
+    Number.isSafeInteger(sizeBytes) &&
+    sizeBytes > 0 &&
+    /^[a-f0-9]{64}$/u.test(sourceSha256)
+    ? {
+        verified: true,
+        index,
+        fileId,
+        filename,
+        mimeType,
+        sizeBytes,
+        sourceSha256,
+      }
+    : undefined;
+}
+
 function recoveredAssistantOutput(value: unknown): unknown[] {
   if (typeof value === "string") {
     return [
@@ -1474,8 +1541,56 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
           recovery.attachmentManifest,
         )
       : undefined;
+    let officialLogoUpload = recoveryOfficialLogoUpload(recovery);
     if (!conversationId || !parentTaskId) {
       throw new Error("Turn recovery metadata is incomplete");
+    }
+    if (!officialLogoUpload) {
+      const recoveryBuild = await loadKnowledgeBaseBuildRecord(
+        claim.turn.userId,
+        conversationId,
+      );
+      if (
+        recoveryBuild?.id === claim.turn.buildId &&
+        recoveryBuild.generation === claim.turn.buildGeneration &&
+        knowledgeBaseBuildRequiresOfficialLogo(recoveryBuild)
+      ) {
+        const manifestItem = attachmentManifest?.[0];
+        const attachment = userAttachments[0];
+        if (
+          attachmentManifest?.length !== 1 ||
+          userAttachments.length !== 1 ||
+          !manifestItem ||
+          !attachment ||
+          !claim.turn.expectedLeafId
+        ) {
+          throw new KnowledgeBaseArtifactBindingError(
+            "LOGO_UPLOAD_INVALID",
+            "企业官方主 Logo 恢复账本不完整，请重新上传",
+          );
+        }
+        officialLogoUpload = await bindKnowledgeBaseOfficialLogoUpload({
+          userId: claim.turn.userId,
+          buildId: claim.turn.buildId,
+          generation: claim.turn.buildGeneration,
+          turnId: claim.turn.id,
+          operationKey: claim.turn.operationKey,
+          expectedRevision: claim.turn.expectedRevision,
+          expectedLeafId: claim.turn.expectedLeafId,
+          upload: {
+            index: 0,
+            fileId: attachment.file_id,
+            filename: manifestItem.filename,
+            mimeType: manifestItem.mimeType,
+            sizeBytes: manifestItem.sizeBytes,
+            sourceSha256: manifestItem.sha256,
+          },
+        });
+        claim.recoveryMetadata = {
+          ...claim.recoveryMetadata,
+          officialLogoUpload,
+        };
+      }
     }
     const deferredClientAttachments =
       recovery.deferredClientAttachments === true;
@@ -1543,6 +1658,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       attachmentManifest,
       skillVersion,
       skillContentHash,
+      officialLogoUpload,
       protocolOperation: {
         operationId: claim.turn.operationKey,
         turnId: claim.turn.id,
@@ -1969,518 +2085,6 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
   return result;
 }
 
-const configuredKnowledgeBaseSkillPath =
-  process.env.FRONTMIND_KB_SKILL_PATH?.trim();
-if (
-  configuredKnowledgeBaseSkillPath &&
-  !path.isAbsolute(configuredKnowledgeBaseSkillPath)
-) {
-  throw new Error("FRONTMIND_KB_SKILL_PATH must be an absolute path");
-}
-const skillArchiveCandidates = configuredKnowledgeBaseSkillPath
-  ? [configuredKnowledgeBaseSkillPath]
-  : [
-      path.resolve(
-        import.meta.dirname,
-        "private-workflows",
-        "socratic-kb-builder.skill",
-      ),
-      path.resolve(
-        process.cwd(),
-        "private-workflows",
-        "socratic-kb-builder.skill",
-      ),
-      path.resolve(
-        import.meta.dirname,
-        "..",
-        "private-workflows",
-        "socratic-kb-builder.skill",
-      ),
-      path.resolve(
-        import.meta.dirname,
-        "..",
-        "..",
-        "private-workflows",
-        "socratic-kb-builder.skill",
-      ),
-    ];
-
-const legacySkillArchiveCandidates = configuredKnowledgeBaseSkillPath
-  ? [
-      path.join(
-        path.dirname(configuredKnowledgeBaseSkillPath),
-        "socratic-kb-builder-v1.skill",
-      ),
-    ]
-  : skillArchiveCandidates.map((candidate) =>
-      path.join(path.dirname(candidate), "socratic-kb-builder-v1.skill"),
-    );
-const v3SkillArchiveCandidates = skillArchiveCandidates.map((candidate) =>
-  path.join(path.dirname(candidate), "socratic-kb-builder-v3.skill"),
-);
-const v4SkillArchiveCandidates = skillArchiveCandidates.map((candidate) =>
-  path.join(path.dirname(candidate), "socratic-kb-builder-v4.skill"),
-);
-
-interface KnowledgeBaseSkillSelection {
-  version: string;
-  contentHash?: string | null;
-}
-
-interface LoadedKnowledgeBaseSkill {
-  instructions: string;
-  contentHash: string;
-  archivePath: string;
-}
-
-const skillArchiveCache = new Map<string, LoadedKnowledgeBaseSkill>();
-export const KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME =
-  "socratic-kb-builder.skill.zip";
-
-async function loadSkillArchive(
-  selection: KnowledgeBaseSkillSelection = { version: "4" },
-) {
-  const version =
-    selection.version === "1"
-      ? "1"
-      : selection.version === "2"
-        ? "2"
-        : selection.version === "3"
-          ? "3"
-          : "4";
-  const cacheKey = `${version}:${selection.contentHash || "latest"}`;
-  const cached = skillArchiveCache.get(cacheKey);
-  if (cached) {
-    if (selection.contentHash && selection.contentHash !== cached.contentHash) {
-      throw new Error(
-        `Knowledge-base Skill v${version} content hash does not match the active build`,
-      );
-    }
-    return cached;
-  }
-
-  let lastError: unknown;
-  let contentHashMismatchError: Error | null = null;
-  const candidates =
-    version === "1"
-      ? legacySkillArchiveCandidates
-      : version === "2"
-        ? skillArchiveCandidates
-        : version === "3"
-          ? [
-              ...(selection.contentHash
-                ? v3SkillArchiveCandidates.map((candidate) =>
-                    path.join(
-                      path.dirname(candidate),
-                      `socratic-kb-builder-v3-${selection.contentHash}.skill`,
-                    ),
-                  )
-                : []),
-              ...v3SkillArchiveCandidates,
-            ]
-          : [
-              ...(selection.contentHash
-                ? v4SkillArchiveCandidates.map((candidate) =>
-                    path.join(
-                      path.dirname(candidate),
-                      `socratic-kb-builder-v4-${selection.contentHash}.skill`,
-                    ),
-                  )
-                : []),
-              ...v4SkillArchiveCandidates,
-            ];
-  for (const candidate of candidates) {
-    try {
-      const archive = await fs.readFile(candidate);
-      const zip = await JSZip.loadAsync(archive);
-      const entries =
-        version !== "1"
-          ? ([["SKILL.md", "Skill"]] as const)
-          : ([
-              ["SKILL.md", "Skill"],
-              ["references/knowledge-tree.md", "Knowledge Tree"],
-              ["references/questioning-strategy.md", "Questioning Strategy"],
-              ["references/output-format.md", "Output Format"],
-            ] as const);
-
-      const sections: string[] = [];
-      for (const [entryName, title] of entries) {
-        const entry = zip.file(entryName);
-        if (!entry) {
-          throw new Error(`Missing ${entryName} in socratic-kb-builder.skill`);
-        }
-        const content = await entry.async("string");
-        sections.push(`# ${title}\n\n${content.trim()}`);
-      }
-
-      const instructions = sections.join("\n\n---\n\n");
-      const canonicalArchiveHash =
-        version === "3" || version === "4"
-          ? await canonicalKnowledgeBaseSkillArchiveHash(archive)
-          : null;
-      const legacyInstructionHash =
-        version === "3" || version === "4"
-          ? await legacyKnowledgeBaseSkillInstructionHash(archive)
-          : null;
-      const historicalInstructionHash = createHash("sha256")
-        .update(instructions)
-        .digest("hex");
-      const acceptedHashes = new Set(
-        [
-          canonicalArchiveHash,
-          legacyInstructionHash,
-          version === "3" || version === "4" ? null : historicalInstructionHash,
-        ].filter(Boolean),
-      );
-      const exactHistoricalAlias = Boolean(
-        selection.contentHash &&
-          path.basename(candidate) ===
-            `socratic-kb-builder-v${version}-${selection.contentHash}.skill`,
-      );
-      if (
-        selection.contentHash &&
-        !acceptedHashes.has(selection.contentHash) &&
-        !exactHistoricalAlias
-      ) {
-        contentHashMismatchError = new Error(
-          `Knowledge-base Skill v${version} content hash does not match the active build`,
-        );
-        continue;
-      }
-      const loaded = {
-        instructions,
-        // New v3/v4 builds pin the full logical archive. Old deployments used
-        // more than one hash algorithm; an exact immutable historical alias is
-        // therefore an explicit compatibility mapping. Keep returning the
-        // selected pin so recovery never rewrites durable build identity.
-        contentHash:
-          selection.contentHash ||
-          canonicalArchiveHash ||
-          historicalInstructionHash,
-        archivePath: candidate,
-      };
-      skillArchiveCache.set(cacheKey, loaded);
-      return loaded;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  if (contentHashMismatchError) {
-    throw contentHashMismatchError;
-  }
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`Could not load socratic-kb-builder Skill v${version}`);
-}
-
-async function readSkillArchive(
-  selection: KnowledgeBaseSkillSelection = { version: "4" },
-) {
-  return (await loadSkillArchive(selection)).instructions;
-}
-
-export async function readKnowledgeBaseSkillArchiveAttachment(
-  selection: KnowledgeBaseSkillSelection = { version: "4" },
-) {
-  const loaded = await loadSkillArchive(selection);
-  const bytes = await fs.readFile(loaded.archivePath);
-  return {
-    filename: KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
-    bytes,
-    contentHash: loaded.contentHash,
-  };
-}
-
-export async function getKnowledgeBaseSkillDescriptor(
-  selection: KnowledgeBaseSkillSelection = { version: "4" },
-) {
-  const version =
-    selection.version === "1"
-      ? "1"
-      : selection.version === "2"
-        ? "2"
-        : selection.version === "3"
-          ? "3"
-          : "4";
-  const loaded = await loadSkillArchive({
-    version,
-    contentHash: selection.contentHash,
-  });
-  return {
-    name: "socratic-kb-builder",
-    version,
-    contentHash: loaded.contentHash,
-  };
-}
-
-const KNOWLEDGE_PREFILL_MAX_CHARACTERS = 80_000;
-const KNOWLEDGE_PREFILL_MAX_DOCUMENT_CHARACTERS = 12_000;
-
-type KnowledgePrefillDocument = {
-  path: string;
-  title: string;
-  content: string;
-};
-
-type KnowledgePrefillSnapshot = {
-  version: number;
-  sourceFileName: string;
-  archiveHash: string | null;
-  documentCount: number;
-  imageCount: number;
-  characterCount: number;
-  documents: KnowledgePrefillDocument[];
-};
-
-export const KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME =
-  "knowledge-base-prefill-evidence.zip";
-
-function knowledgePrefillBranch(pathname: string) {
-  return pathname.normalize("NFKC").split("/").filter(Boolean)[0] || "root";
-}
-
-function isKnowledgePrefillOverview(document: KnowledgePrefillDocument) {
-  return /(?:^|[/_-])(?:overview|readme|00[_-])|概览|总览|综述/i.test(
-    `${document.path} ${document.title}`,
-  );
-}
-
-function isKnowledgePrefillProduct(document: KnowledgePrefillDocument) {
-  return /(?:^|[/_-])03(?:[/_-]|$)|products?|services?|产品|服务/i.test(
-    `${document.path} ${document.title}`,
-  );
-}
-
-export function buildKnowledgePrefillExcerpt(
-  documents: KnowledgePrefillDocument[],
-) {
-  const ordered = [...documents].sort((left, right) =>
-    left.path.localeCompare(right.path),
-  );
-  const groups = new Map<string, KnowledgePrefillDocument[]>();
-  for (const document of ordered) {
-    const branch = knowledgePrefillBranch(document.path);
-    const values = groups.get(branch) || [];
-    values.push(document);
-    groups.set(branch, values);
-  }
-
-  const selected: KnowledgePrefillDocument[] = [];
-  const selectedPaths = new Set<string>();
-  const add = (document: KnowledgePrefillDocument | undefined) => {
-    if (!document || selectedPaths.has(document.path)) return;
-    selected.push(document);
-    selectedPaths.add(document.path);
-  };
-
-  for (const branch of [...groups.keys()].sort()) {
-    const values = groups.get(branch) || [];
-    add(values.find(isKnowledgePrefillOverview) || values[0]);
-  }
-  ordered.filter(isKnowledgePrefillProduct).forEach(add);
-
-  let added = true;
-  while (added) {
-    added = false;
-    for (const branch of [...groups.keys()].sort()) {
-      const next = (groups.get(branch) || []).find(
-        (document) => !selectedPaths.has(document.path),
-      );
-      if (next) {
-        add(next);
-        added = true;
-      }
-    }
-  }
-
-  let excerpt = "";
-  for (const document of selected) {
-    const prefix = [
-      `### ${document.title || document.path}`,
-      `documentPath: ${document.path}`,
-      "",
-    ].join("\n");
-    const remaining = KNOWLEDGE_PREFILL_MAX_CHARACTERS - excerpt.length;
-    if (remaining <= prefix.length) break;
-    const content = document.content.slice(
-      0,
-      Math.min(
-        KNOWLEDGE_PREFILL_MAX_DOCUMENT_CHARACTERS,
-        remaining - prefix.length,
-      ),
-    );
-    excerpt += `${excerpt ? "\n\n" : ""}${prefix}${content}`;
-    if (excerpt.length >= KNOWLEDGE_PREFILL_MAX_CHARACTERS) break;
-  }
-  return excerpt.slice(0, KNOWLEDGE_PREFILL_MAX_CHARACTERS);
-}
-
-export async function buildKnowledgeBasePrefillEvidenceArchive(
-  snapshot: KnowledgePrefillSnapshot,
-) {
-  return buildDeterministicTaskAttachmentArchive({
-    name: "knowledge-base-prefill-evidence",
-    entrypoint: "knowledge.md",
-    files: [
-      {
-        path: "context.json",
-        content: `${JSON.stringify(
-          {
-            schemaVersion: 1,
-            knowledgeSnapshot: {
-              version: snapshot.version,
-              sourceFileName: snapshot.sourceFileName,
-              archiveHash: snapshot.archiveHash,
-              documentCount: snapshot.documentCount,
-              imageCount: snapshot.imageCount,
-              characterCount: snapshot.characterCount,
-            },
-          },
-          null,
-          2,
-        )}\n`,
-      },
-      {
-        path: "knowledge.md",
-        content:
-          buildKnowledgePrefillExcerpt(snapshot.documents) ||
-          "当前版本没有可读取的正文。",
-      },
-    ],
-  });
-}
-
-export async function buildKnowledgeBasePrompt({
-  conversationId,
-  companyName,
-  companyWebsite,
-  operatorNotes,
-  attachments,
-  prefillKnowledgeSnapshot,
-  protocolOperation,
-}: {
-  conversationId?: string;
-  companyName: string;
-  companyWebsite: string;
-  operatorNotes: string;
-  attachments: Array<{ file_id: string; filename: string }>;
-  prefillKnowledgeSnapshot?: KnowledgePrefillSnapshot | null;
-  protocolOperation?: {
-    skillVersion: string;
-    operationId: string;
-    turnId: string;
-  };
-}) {
-  const isV4 = protocolOperation?.skillVersion === "4";
-  const protocolIdentity = isV4
-    ? {
-        operationId: protocolOperation.operationId,
-        turnId: protocolOperation.turnId,
-      }
-    : {};
-  const manifestExample = formatKnowledgeBaseManifestEnvelope({
-    kind: KNOWLEDGE_BASE_MANIFEST_KIND,
-    schemaVersion: isV4 ? KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION : 1,
-    ...protocolIdentity,
-    leaves: Array.from({ length: 8 }, (_, index) => ({
-      id: `1.${index + 1}`,
-      title: index === 0 ? "一句话定位" : `示例节点 ${index + 1}`,
-      branchId: "identity",
-      branchTitle: "企业身份",
-    })),
-  });
-  const progressExample = formatKnowledgeBaseProgressEnvelope({
-    kind: KNOWLEDGE_BASE_PROGRESS_KIND,
-    schemaVersion: isV4 ? KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION : 1,
-    ...protocolIdentity,
-    revision: 0,
-    transition: {
-      leafId: "1.1",
-      from: "current",
-      to: "confirmed",
-      reason: "用户明确确认",
-    },
-  });
-  const presentationExample = formatKnowledgeBasePresentationEnvelope({
-    kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
-    schemaVersion: isV4 ? KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION : 1,
-    ...protocolIdentity,
-    revision: 1,
-    leafId: "1.2",
-    imageState: "no_eligible_asset",
-    assetIds: [],
-    imageCount: 0,
-  });
-  const attachmentList =
-    attachments.length > 0
-      ? attachments.map((attachment) => `- ${attachment.filename}`).join("\n")
-      : "- 未上传附件，请优先使用企业官网与全网公开资料进行预填";
-  return [
-    `严格执行随任务附带的 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}。先解压 ZIP 并完整读取根目录 SKILL.md，再开始工作。`,
-    `该 ZIP 是本任务唯一的 socratic-kb-builder v${protocolOperation?.skillVersion || "3"} 工作规约；本段仅提供企业输入和服务端状态约束。`,
-    "不得开启、调用、切换或推荐 Wide Research / Deep Research；只使用当前 Pro Agent 模式下的普通浏览、搜索和文件工具。",
-    "客户可见正文与本轮对话只能呈现百科事实，不得呈现任务过程、核验判断、采购/合规建议、读者指令、工具计划或模型推理。",
-    "客户可见回复只输出知识树统计（仅首轮需要）和实际展示节点的完整正文/合规配图。不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题；所有来源只进入内部证据文件。可见正文结束后直接附机器信封。",
-    "客户可见正文不得嵌入官网或 CDN 图片外链。图片必须先下载真实字节、解码校验并打入最终 ZIP，再以包内相对路径引用；防盗链、签名、过期或无法下载的地址只能进入内部来源记录，绝不能作为客户图片返回。",
-    "首轮必须只采集并返回一张企业官方主 Logo；取得合格 Logo 后立即停止所有网页图片发现。不得采集或打包品牌主视觉、业务图、产品/UI/架构图、案例图、团队图或其他网页图片。只有首轮清单第一个叶子（通常为 1.1 一句话定位）可把已下载验证的本地 Logo 字节作为 output_image 或 image MIME output_file 返回。不得用 favicon、图标、占位图、库存图、官网/CDN 热链或文字说明替代；无法取得合格真实 Logo 字节时不得伪造成功。客户在后续节点主动上传的图片是唯一例外：必须按原始 SHA、文件名、MIME 与绑定叶子保留进 schema v4 最终 ZIP，但由 Dashboard 本地受管通道回显；上游后续回复仍一律纯文字，不得搜索、重复或新增响应图片附件。首轮附件与最终 ZIP 必须使用同一 Logo 字节。",
-    "资料采集状态只由 Dashboard 展示。不得复述、输出或以“正在采集”“处理中”“稍后生成”等过程回执结束任务；首轮只有在返回第一个叶子的完整正文、完整 Manifest 和一张经校验的官方主 Logo 后才可结束。",
-    "",
-    "## 本次任务输入",
-    `构建会话标识：${conversationId || "未提供"}`,
-    `企业名称（账号正式绑定）：${companyName}`,
-    `企业官网入口（可多个）：${companyWebsite || "未填写"}`,
-    "用户上传资料：",
-    attachmentList,
-    operatorNotes ? `操作者备注：\n${operatorNotes}` : "操作者备注：未填写",
-    "",
-    "## 官网已迁移的初步知识库预填证据",
-    prefillKnowledgeSnapshot
-      ? [
-          `知识库版本：V${prefillKnowledgeSnapshot.version}`,
-          `来源文件：${prefillKnowledgeSnapshot.sourceFileName}`,
-          `产物哈希：${prefillKnowledgeSnapshot.archiveHash || "未记录"}`,
-          `已解析文档：${prefillKnowledgeSnapshot.documentCount}；图片：${prefillKnowledgeSnapshot.imageCount}；字符：${prefillKnowledgeSnapshot.characterCount}`,
-          `完整预填证据见任务附件 ${KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME}。先解压并读取 knowledge.md 与 context.json；这些证据不代表节点已确认，也不得据此伪造 100% 对话进度。`,
-        ].join("\n")
-      : "当前账号没有已迁移的初步知识库，将从官网、全网与上传资料开始预填。",
-    "## 必须执行的机器可验证进度协议",
-    "这是服务端状态机协议，优先级高于 skill 中任何会自动跨节点的表述。可读正文照常输出：首轮末尾只能附一个清单信封；后续轮末尾必须依次附一个状态信封和一个展示信封。",
-    "信封的 `<!-- FRONTMIND_KB_...` 开头与 `-->` 结尾都是协议必填内容，必须原样保留；禁止输出裸 JSON，禁止输出 SOCRATIC_KB_STATE，禁止用 frontmind.workflow-state、frontmind.knowledge-base.message 或其他自创对象替代规定信封。",
-    "",
-    "### 首轮研究与知识树建立",
-    "完成官网、公开来源、上传资料研究和正式图文预填后，按企业实际资料量建立自适应一级分支和 8-115 个真实叶子节点。白牌企业或只有宣传单时只保留有事实价值或明确缺口的必要叶子，不得为数量、字数或图片数填充内容。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
-    manifestExample,
-    "示例只演示结构，真实 leaves 必须完整包含 8-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
-    "",
-    "### 后续每轮单节点状态",
-    "服务端从 revision=0、清单第一个叶子为 current 开始。后续每轮末尾必须依次附一个状态信封和一个展示信封：",
-    progressExample,
-    presentationExample,
-    "revision 必须等于当前服务端 revision；每次被接受后加 1。leafId 只能是当前叶子，from 只能是 current 或 needs_verification。",
-    "FRONTMIND_KB_PROGRESS 声明本轮处理的旧节点；FRONTMIND_KB_PRESENTATION 声明回复正文实际展示的新状态。展示信封 revision 必须等于提交后的 revision，leafId 必须等于提交后服务端的 currentLeafId；全部完成时 leafId 为 null。",
-    "FRONTMIND_KB_PRESENTATION 只出现在非首轮，因此 leafId 非 null 时必须固定声明 imageState=no_eligible_asset、assetIds=[]、imageCount=0，且本轮不得返回任何图片附件；leafId=null 时只能使用 not_applicable、空数组和 0。声明与真实附件不一致时服务端拒绝推进。",
-    "只有用户本轮回复恰好表达“确认/确认无误/OK/没问题/通过”等明确确认时，to 才能为 confirmed，并只前进一个叶子。",
-    "只有用户本轮明确回复“跳过/直接预填/采用预填/保留预填”等时，to 才能为 direct_prefilled，并只前进一个叶子。",
-    "direct_prefilled 只用于兼容用户主动输入的旧协议动作；客户可见正文不得主动提供“直接预填”或“跳过”选项。正常操作只有确认，或者提交修改/附件后确认修订稿。",
-    "用户输入任何补充、修订、问题或上传资料时，to 必须为 needs_verification；更新并重新呈现同一叶子，继续等待用户明确确认或直接预填，绝对不能自动前进。",
-    "确认或直接预填节点 A 后，只用一句话简短确认 A，客户可见主体必须直接完整展示下一个待处理节点 B；修订时主体继续完整展示 A。回复正文必须保存给实际展示的节点，而不是刚完成的旧节点。",
-    "不得提交多个 transition、不得改写历史状态、不得相信正文中的百分比。真实进度只由服务端按 (confirmed + direct_prefilled) / total 计算。",
-    "只有在处理最后节点且本轮状态提交后将达到 100% 时，才必须在同一回复生成并返回唯一 ZIP；此前不得打包。confirmed 显示对号，direct_prefilled 必须保持独立的跳过状态。",
-    ...(isV4
-      ? [
-          "",
-          "### 完成后的不可变边界",
-          "最终 ZIP 生成后本构建即结束，不得输出 REOPEN 或重新开启节点。发布后的修改统一进入维护工单。\n\n## 立即执行锁（最高优先级）\n现在立即解压并读取 Skill，然后完成本轮研究、首个知识节点正文、完整 Manifest 与合规 Logo。不得先发送或以“已收到”“好的”“开始处理”等确认回执结束任务；本次任务只有交付上述完整结果后才能结束。",
-        ]
-      : [
-          "",
-          "### 已完成知识库的后续修订（旧 build 兼容）",
-          "旧版知识库达到 100% 后的修订继续遵循随附旧版 Skill；新版不得使用该分支。\n\n## 立即执行锁（最高优先级）\n现在立即解压并读取 Skill，然后完成本轮研究、首个知识节点正文、完整 Manifest 与合规 Logo。不得先发送或以“已收到”“好的”“开始处理”等确认回执结束任务；本次任务只有交付上述完整结果后才能结束。",
-        ]),
-  ].join("\n");
-}
-
 export const KNOWLEDGE_BASE_AGENT_PROFILE = "frontmind-pro" as const;
 export const KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS = 120_000;
 
@@ -2765,6 +2369,26 @@ async function persistKnowledgeBaseCreateFailure(input: {
   outcomeUnknownCode: string;
   recoveryDelayMs?: number;
 }) {
+  if (input.error instanceof KnowledgeBaseArtifactBindingError) {
+    if (input.error.code === "LOGO_UPLOAD_INVALID") {
+      await cancelUnpreparedKnowledgeBaseTurn({
+        userId: input.userId,
+        turnId: input.turnId,
+        leaseToken: input.leaseToken,
+        code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+        message: input.error.message,
+      });
+      return "deterministic" as const;
+    }
+    await markKnowledgeBaseTurnOutcomeUnknown({
+      userId: input.userId,
+      turnId: input.turnId,
+      leaseToken: input.leaseToken,
+      code: input.error.code,
+      recoveryDelayMs: input.recoveryDelayMs ?? 30_000,
+    });
+    return "retriable" as const;
+  }
   const createError =
     input.error instanceof KnowledgeBaseUpstreamCreateError
       ? input.error
@@ -2894,6 +2518,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
   attachmentManifest?: KnowledgeBaseClientAttachmentManifestItem[];
   skillVersion?: string;
   skillContentHash?: string | null;
+  officialLogoUpload?: KnowledgeBaseOfficialLogoUpload;
   protocolOperation?: {
     operationId: string;
     turnId: string;
@@ -2952,6 +2577,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
   );
   const postRevision = progress.build.revision + 1;
   const isV4 = input.skillVersion === "4";
+  const isOfficialLogoUpload = isV4 && Boolean(input.officialLogoUpload);
   const requiresPresentation = (input.skillVersion || "3") === "3" || isV4;
   const protocolIdentity = isV4
     ? {
@@ -2969,6 +2595,11 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     action === "confirm" || action === "direct_prefill"
       ? nextPending?.id || null
       : current?.id || null;
+  const finalPackageRequired = Boolean(
+    current &&
+      !nextPending &&
+      (action === "confirm" || action === "direct_prefill"),
+  );
   const progressEnvelopeExample = current
     ? formatKnowledgeBaseProgressEnvelope({
         kind: KNOWLEDGE_BASE_PROGRESS_KIND,
@@ -3010,14 +2641,16 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
         `当前且唯一可处理节点：${current.id}｜${current.branchTitle} / ${current.title}`,
         `当前节点状态：${current.status}`,
         `服务端判定本轮动作：${action}`,
-        "只要本轮包含附件，无论文字是否包含“确认”，都必须按补充/修订处理，保持 needs_verification。",
+        isOfficialLogoUpload
+          ? "本轮唯一附件是 Dashboard 已完成原始字节、SHA-256、MIME、尺寸及首节点绑定校验的企业官方主 Logo。必须按补充/修订处理，保持当前首节点为 needs_verification；不得确认或前进。"
+          : "只要本轮包含附件，无论文字是否包含“确认”，都必须按补充/修订处理，保持 needs_verification。",
         "回复末尾只能附一个 FRONTMIND_KB_PROGRESS 信封；HTML 注释开头和结尾是信封的一部分，不得省略或改成裸 JSON。",
         "FRONTMIND_KB_PROGRESS 必须逐字段使用下面这个当轮唯一结构；不得把 action、leafId、status 放在顶层，不得把 revision 改成提交后的值：",
         progressEnvelopeExample,
         action === "confirm" || action === "direct_prefill"
           ? nextPending
             ? `先简短确认已处理 ${current.id}，正文主体随后完整展示下一节点 ${nextPending.id}｜${nextPending.branchTitle} / ${nextPending.title}。不得再次把 ${current.id} 作为主体。`
-            : `这是最后一个节点。简短确认 ${current.id} 后直接生成唯一最终 ZIP，不再展示节点正文。`
+            : `这是最后一个节点。简短确认 ${current.id} 后必须在本轮实际创建并返回唯一最终 ZIP，不再展示节点正文；不得只说“即将生成”“稍后生成”或“进入交付阶段”。`
           : `更新并完整重新展示当前节点 ${current.id}；不得展示或推进到后续节点。`,
         requiresPresentation
           ? `回复末尾还必须附且只能附一个 FRONTMIND_KB_PRESENTATION 信封：revision=${postRevision}，leafId=${
@@ -3044,7 +2677,11 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     "客户可见回复不得主动提供“直接预填”或“跳过”选项；用户正常操作只有确认当前内容，或者提交修改/附件后确认修订稿。",
     "客户可见回复只输出实际展示节点的完整正文，不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题。所有来源只进入内部证据文件；可见正文结束后直接附机器信封。",
     "机器信封必须保留完整的 `<!-- FRONTMIND_KB_...` 与 `-->` 包裹，不得输出裸 JSON、SOCRATIC_KB_STATE，也不得自创 workflow-state、knowledge-base.message 或其他状态对象。",
-    "这是非首轮知识节点回复，必须纯文字返回：不得继续搜索图片，不得返回、重复或重新附加任何 output_image、image MIME output_file、包内图片路径或官网/CDN 热链。恰好一张企业官方主 Logo 只允许在首轮第一个叶子展示；客户主动上传的节点图片由 Dashboard 从受管原始字节自行回显，你只负责把它按 customer_upload_sha256 与绑定节点保留进 schema v4 最终 ZIP。",
+    finalPackageRequired
+      ? "这是最终交付轮，不是纯文字轮次：不得返回图片，但必须实际创建并返回恰好一个 application/zip 的 typed output_file；该 ZIP 是本轮唯一允许的非文本资源。恰好一张企业官方主 Logo 必须使用 Dashboard 已绑定字节，客户上传图片必须按 customer_upload_sha256 与绑定节点保留进 schema v4 最终 ZIP。"
+      : isOfficialLogoUpload
+        ? "这是首节点 Logo 补料轮。Dashboard 已自行保存并展示受管 Logo 原始字节；上游回复必须纯文字，不得返回或重复附加任何图片资源。必须完整修订并重新展示同一个首节点，等待用户下一轮明确确认。最终 schema v4 ZIP 中该 Logo 必须使用 sourceKind=official_logo_upload、ownership=first_party、assetType=brand_identity、displayRole=badge，并逐字段保留本轮 sourceUploadIndex/FileId/Filename/MimeType/SizeBytes/Sha256；imageSelection.method 必须为 customer_upload。该 Logo 不属于普通 user_upload 节点配图。"
+        : "这是非首轮知识节点回复，客户可见正文必须纯文字且不得附资源：不得继续搜索图片，不得返回、重复或重新附加任何 output_image、image MIME output_file、包内图片路径或官网/CDN 热链。恰好一张企业官方主 Logo 只允许在首轮第一个叶子展示；客户主动上传的节点图片由 Dashboard 从受管原始字节自行回显，你只负责把它按 customer_upload_sha256 与绑定节点保留进 schema v4 最终 ZIP。",
     "",
     "# 当前知识库状态",
     stateReminder,
@@ -3055,7 +2692,10 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
           .map((file, index) => {
             const manifest = input.attachmentManifest?.[index];
             return manifest
-              ? `- ${file.filename}｜customer_upload_sha256=${manifest.sha256}｜mime=${manifest.mimeType}｜bytes=${manifest.sizeBytes}｜绑定节点=${current?.id || "unknown"}`
+              ? isOfficialLogoUpload &&
+                index === input.officialLogoUpload?.index
+                ? `- ${file.filename}｜用途=企业官方主 Logo｜sourceUploadIndex=${input.officialLogoUpload.index}｜sourceUploadFileId=${input.officialLogoUpload.fileId}｜sourceUploadFilename=${input.officialLogoUpload.filename}｜sourceUploadMimeType=${input.officialLogoUpload.mimeType}｜sourceUploadSizeBytes=${input.officialLogoUpload.sizeBytes}｜sourceUploadSha256=${input.officialLogoUpload.sourceSha256}｜绑定节点=${current?.id || "unknown"}`
+                : `- ${file.filename}｜customer_upload_sha256=${manifest.sha256}｜mime=${manifest.mimeType}｜bytes=${manifest.sizeBytes}｜绑定节点=${current?.id || "unknown"}`
               : `- ${file.filename}`;
           })
           .join("\n")
@@ -3073,6 +2713,15 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
               ? `可见正文主体必须是 ${nextPending.id}｜${nextPending.title}，不得再次把 ${current.id} 作为主体。`
               : `只简短确认 ${current.id} 并完成最终交付，不得再次输出 ${current.id} 正文。`
             : `可见正文主体必须继续是 ${current.id}｜${current.title}。`,
+          ...(finalPackageRequired
+            ? [
+                "# 最终 ZIP 文件锁（同级最高优先级）",
+                "必须在结束本轮前，把恰好一个 type=output_file、MIME=application/zip 的最终知识库 ZIP 实际加入任务 output；不得只输出文件名、路径、下载承诺或“即将生成/稍后生成”的文字。",
+                `ZIP 必须与本轮 operationId=${input.protocolOperation?.operationId || ""}、turnId=${input.protocolOperation?.turnId || ""} 属于同一 assistant output item，或在资源描述中显式携带完全相同的 operationId 与 turnId。`,
+                `ZIP 内 00_package_manifest.json 的 buildRevision 必须为 ${postRevision}，并完整绑定当前知识树、首轮 Logo 原始字节与全部客户上传资源。`,
+                "在 ZIP 文件资源已经进入任务 output 之前不得结束任务；Progress 和 Presentation 文本信封不能替代 ZIP 文件。",
+              ]
+            : []),
           "可见正文结束后，FRONTMIND_KB_PROGRESS 必须逐字采用下面的字段层级和值；旧版顶层 action、leafId、status 一律无效：",
           progressEnvelopeExample,
           ...(requiresPresentation
@@ -3627,6 +3276,26 @@ router.post("/turn/reserve", async (req, res) => {
       conversationId,
       taskId: parentTaskId,
     });
+    assertKnowledgeBaseManifestDoesNotRepeatOfficialLogo(
+      boundBuild,
+      attachmentManifest,
+    );
+    if (
+      knowledgeBaseBuildRequiresOfficialLogo(boundBuild) &&
+      (attachmentManifest.length !== 1 ||
+        ![
+          "image/avif",
+          "image/gif",
+          "image/jpeg",
+          "image/png",
+          "image/webp",
+        ].includes(attachmentManifest[0]!.mimeType))
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "INVALID_REQUEST",
+        "当前知识库正在等待企业主 Logo。请只上传一张 PNG、JPEG、WebP、AVIF 或 GIF 原图",
+      );
+    }
     const taskCredential = await getCredentialForUpstreamResource(
       req.frontmindUser.id,
       "task",
@@ -3675,6 +3344,7 @@ router.post("/turn/reserve", async (req, res) => {
         userMessage,
         attachments: [],
         attachmentManifest,
+        capturedClientAttachments: true,
         deferredClientAttachments: true,
         skillVersion,
         skillContentHash,
@@ -3850,35 +3520,145 @@ router.post("/turn/attachments/stage", async (req, res) => {
       });
       return;
     }
+    const deferredOfficialLogoRequired =
+      knowledgeBaseBuildRequiresOfficialLogo(build);
+    if (knowledgeBaseManifestRepeatsOfficialLogo(build, manifest)) {
+      const message =
+        "该图片与已绑定的企业主 Logo 完全相同，无需作为普通补图再次上传";
+      await cancelUnpreparedKnowledgeBaseTurn({
+        userId: req.frontmindUser.id,
+        turnId,
+        clientRequestId,
+        code: "KNOWLEDGE_BASE_DUPLICATE_LOGO_UPLOAD",
+        message,
+      });
+      throw new KnowledgeBaseTurnReservationError("INVALID_REQUEST", message);
+    }
+    if (deferredOfficialLogoRequired) {
+      const rejectDeferredLogo = async (message: string) => {
+        await cancelUnpreparedKnowledgeBaseTurn({
+          userId: req.frontmindUser!.id,
+          turnId,
+          clientRequestId,
+          code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+          message,
+        });
+        throw new KnowledgeBaseTurnReservationError("INVALID_REQUEST", message);
+      };
+      if (
+        manifest.length !== 1 ||
+        index !== 0 ||
+        ![
+          "image/avif",
+          "image/gif",
+          "image/jpeg",
+          "image/png",
+          "image/webp",
+        ].includes(manifestItem.mimeType)
+      ) {
+        await rejectDeferredLogo(
+          "当前知识库正在等待企业主 Logo，请只上传一张受支持的图片原文件",
+        );
+      }
+      let image: { width: number; height: number };
+      try {
+        image = await assertCapturedKnowledgeBaseCustomerImage({
+          fileId: attachment.file_id,
+          filename: manifestItem.filename,
+          mimeType: manifestItem.mimeType,
+          sizeBytes: manifestItem.sizeBytes,
+          sourceSha256: manifestItem.sha256,
+        });
+      } catch {
+        await rejectDeferredLogo(
+          "上传文件不是可安全解码的企业主 Logo 图片，请重新选择原文件",
+        );
+        return;
+      }
+      if (image.width < 256 || image.height < 256) {
+        await rejectDeferredLogo(
+          `企业主 Logo 位图宽高均需至少 256 像素；当前为 ${image.width}×${image.height}`,
+        );
+      }
+    }
     // uploadFile only calls this route after the signed PUT has completed.
     // Bind that already-owned file id immediately, as the OEM client does.
     // Re-downloading the entire object here made submission time depend on
     // object-store read-after-write visibility and incorrectly rejected slow
     // or large uploads after an arbitrary verification window.
-    const turn = await stageKnowledgeBaseDeferredTurnAttachment({
-      userId: req.frontmindUser.id,
-      buildId: build.id,
-      turnId,
-      clientRequestId,
-      clientAttachmentManifest: manifest,
-      index,
-      attachment,
-    });
-    if (turn.stagedUserAttachmentCount >= turn.expectedUserAttachmentCount) {
-      const dispatchClaim = await claimKnowledgeBaseDeferredTurnDispatch({
+    const dispatchClaim =
+      await stageAndClaimKnowledgeBaseDeferredTurnAttachment({
         userId: req.frontmindUser.id,
         buildId: build.id,
         turnId,
         clientRequestId,
         clientAttachmentManifest: manifest,
+        index,
+        attachment,
       });
-      const observation = await getKnowledgeBaseObservation({
-        userId: req.frontmindUser.id,
-        conversationId,
-        upstreamStatus:
-          dispatchClaim.state === "completed" ? "completed" : "running",
-      }).catch(() => null);
+    const turn = dispatchClaim.turn;
+    if (dispatchClaim.state !== "awaiting_attachments") {
       if (dispatchClaim.state === "acquired") {
+        let acceptedClaim: KnowledgeBaseRecoveryClaim = dispatchClaim;
+        if (deferredOfficialLogoRequired) {
+          let verifiedLogo: KnowledgeBaseOfficialLogoUpload;
+          try {
+            verifiedLogo = await bindKnowledgeBaseOfficialLogoUpload({
+              userId: req.frontmindUser.id,
+              buildId: build.id,
+              generation: dispatchClaim.turn.buildGeneration,
+              turnId: dispatchClaim.turn.id,
+              operationKey: dispatchClaim.turn.operationKey,
+              expectedRevision: dispatchClaim.turn.expectedRevision,
+              expectedLeafId: dispatchClaim.turn.expectedLeafId!,
+              upload: {
+                index: 0,
+                fileId: attachment.file_id,
+                filename: manifestItem.filename,
+                mimeType: manifestItem.mimeType,
+                sizeBytes: manifestItem.sizeBytes,
+                sourceSha256: manifestItem.sha256,
+              },
+            });
+          } catch (error) {
+            const message =
+              error instanceof Error
+                ? error.message
+                : "企业官方主 Logo 校验失败，请重新上传";
+            if (
+              error instanceof KnowledgeBaseArtifactBindingError &&
+              error.code === "LOGO_UPLOAD_INVALID"
+            ) {
+              await cancelUnpreparedKnowledgeBaseTurn({
+                userId: req.frontmindUser.id,
+                turnId: dispatchClaim.turn.id,
+                clientRequestId,
+                leaseToken: dispatchClaim.leaseToken,
+                code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+                message,
+              });
+            }
+            throw new KnowledgeBaseTurnReservationError(
+              error instanceof KnowledgeBaseArtifactBindingError &&
+              error.code === "LOGO_UPLOAD_INVALID"
+                ? "INVALID_REQUEST"
+                : "CONFLICT",
+              message,
+            );
+          }
+          acceptedClaim = {
+            ...dispatchClaim,
+            recoveryMetadata: {
+              ...dispatchClaim.recoveryMetadata,
+              officialLogoUpload: verifiedLogo,
+            },
+          };
+        }
+        const observation = await getKnowledgeBaseObservation({
+          userId: req.frontmindUser.id,
+          conversationId,
+          upstreamStatus: "running",
+        }).catch(() => null);
         res.status(202).json({
           reservation: {
             state: "pending",
@@ -3894,12 +3674,18 @@ router.post("/turn/attachments/stage", async (req, res) => {
           accepted: true,
         });
         launchAcceptedKnowledgeBaseClaim({
-          claim: dispatchClaim,
+          claim: acceptedClaim,
           credential: taskCredential,
           outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
         });
         return;
       }
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus:
+          dispatchClaim.state === "completed" ? "completed" : "running",
+      }).catch(() => null);
       res
         .status(dispatchClaim.state === "pending" ? 202 : 200)
         .setHeader(
@@ -4080,6 +3866,106 @@ router.post("/turn/dispatch", async (req, res) => {
       return;
     }
 
+    const officialLogoRequired = knowledgeBaseBuildRequiresOfficialLogo(build);
+    if (
+      !officialLogoRequired &&
+      knowledgeBaseManifestRepeatsOfficialLogo(build, attachmentManifest)
+    ) {
+      const message =
+        "该图片与已绑定的企业主 Logo 完全相同，无需作为普通补图再次上传";
+      await cancelUnpreparedKnowledgeBaseTurn({
+        userId: req.frontmindUser.id,
+        turnId: acquiredClaim.turn.id,
+        clientRequestId,
+        leaseToken: acquiredClaim.leaseToken,
+        code: "KNOWLEDGE_BASE_DUPLICATE_LOGO_UPLOAD",
+        message,
+      });
+      throw new KnowledgeBaseTurnReservationError("INVALID_REQUEST", message);
+    }
+
+    let acceptedClaim: KnowledgeBaseRecoveryClaim = acquiredClaim;
+    if (officialLogoRequired) {
+      const stagedAttachments = normalizeKnowledgeBaseUserAttachments(
+        Array.isArray(acquiredClaim.recoveryMetadata.attachments)
+          ? (acquiredClaim.recoveryMetadata
+              .attachments as KnowledgeBaseAttachment[])
+          : [],
+      );
+      const manifestItem = attachmentManifest[0];
+      const attachment = stagedAttachments[0];
+      if (
+        attachmentManifest.length !== 1 ||
+        stagedAttachments.length !== 1 ||
+        !manifestItem ||
+        !attachment
+      ) {
+        await cancelUnpreparedKnowledgeBaseTurn({
+          userId: req.frontmindUser.id,
+          turnId: acquiredClaim.turn.id,
+          clientRequestId,
+          leaseToken: acquiredClaim.leaseToken,
+          code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+          message: "企业官方主 Logo 上传账本不完整，请重新上传",
+        });
+        throw new KnowledgeBaseTurnReservationError(
+          "INVALID_REQUEST",
+          "企业官方主 Logo 上传账本不完整，请重新上传",
+        );
+      }
+      try {
+        const verifiedLogo = await bindKnowledgeBaseOfficialLogoUpload({
+          userId: req.frontmindUser.id,
+          buildId: build.id,
+          generation: acquiredClaim.turn.buildGeneration,
+          turnId: acquiredClaim.turn.id,
+          operationKey: acquiredClaim.turn.operationKey,
+          expectedRevision: acquiredClaim.turn.expectedRevision,
+          expectedLeafId: acquiredClaim.turn.expectedLeafId!,
+          upload: {
+            index: 0,
+            fileId: attachment.file_id,
+            filename: manifestItem.filename,
+            mimeType: manifestItem.mimeType,
+            sizeBytes: manifestItem.sizeBytes,
+            sourceSha256: manifestItem.sha256,
+          },
+        });
+        acceptedClaim = {
+          ...acquiredClaim,
+          recoveryMetadata: {
+            ...acquiredClaim.recoveryMetadata,
+            officialLogoUpload: verifiedLogo,
+          },
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "企业官方主 Logo 校验失败，请重新上传";
+        if (
+          error instanceof KnowledgeBaseArtifactBindingError &&
+          error.code === "LOGO_UPLOAD_INVALID"
+        ) {
+          await cancelUnpreparedKnowledgeBaseTurn({
+            userId: req.frontmindUser.id,
+            turnId: acquiredClaim.turn.id,
+            clientRequestId,
+            leaseToken: acquiredClaim.leaseToken,
+            code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+            message,
+          });
+        }
+        throw new KnowledgeBaseTurnReservationError(
+          error instanceof KnowledgeBaseArtifactBindingError &&
+          error.code === "LOGO_UPLOAD_INVALID"
+            ? "INVALID_REQUEST"
+            : "CONFLICT",
+          message,
+        );
+      }
+    }
+
     const observation = await getKnowledgeBaseObservation({
       userId: req.frontmindUser.id,
       conversationId,
@@ -4096,7 +3982,7 @@ router.post("/turn/dispatch", async (req, res) => {
       startedAt: acquiredClaim.turn.createdAt.getTime(),
     });
     launchAcceptedKnowledgeBaseClaim({
-      claim: acquiredClaim,
+      claim: acceptedClaim,
       credential: taskCredential,
       outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
     });
@@ -4292,6 +4178,10 @@ router.post("/turn", async (req, res) => {
         return;
       }
     }
+    const capturedImageMetadata = new Map<
+      number,
+      { width: number; height: number }
+    >();
     if (attachmentManifest) {
       for (let index = 0; index < attachments.length; index += 1) {
         const attachment = attachments[index]!;
@@ -4310,12 +4200,16 @@ router.post("/turn", async (req, res) => {
         }
         if (expected.mimeType.startsWith("image/")) {
           try {
-            await assertCapturedKnowledgeBaseCustomerImage({
+            const image = await assertCapturedKnowledgeBaseCustomerImage({
               fileId: attachment.file_id,
               filename: expected.filename,
               mimeType: expected.mimeType,
               sizeBytes: expected.sizeBytes,
               sourceSha256: expected.sha256,
+            });
+            capturedImageMetadata.set(index, {
+              width: image.width,
+              height: image.height,
             });
           } catch {
             throw new KnowledgeBaseTurnReservationError(
@@ -4326,8 +4220,48 @@ router.post("/turn", async (req, res) => {
         }
       }
 
+      const officialLogoRequired =
+        knowledgeBaseBuildRequiresOfficialLogo(boundBuild);
+      if (
+        officialLogoRequired &&
+        (attachments.length !== 1 ||
+          attachmentManifest.length !== 1 ||
+          ![
+            "image/avif",
+            "image/gif",
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+          ].includes(attachmentManifest[0]!.mimeType))
+      ) {
+        throw new KnowledgeBaseTurnReservationError(
+          "INVALID_REQUEST",
+          "当前知识库正在等待企业主 Logo。请只上传一张 PNG、JPEG、WebP、AVIF 或 GIF 原图",
+        );
+      }
+      if (officialLogoRequired) {
+        const image = capturedImageMetadata.get(0);
+        if (!image || image.width < 256 || image.height < 256) {
+          throw new KnowledgeBaseTurnReservationError(
+            "INVALID_REQUEST",
+            `企业主 Logo 位图宽高均需至少 256 像素；当前为 ${image?.width || 0}×${image?.height || 0}`,
+          );
+        }
+      }
+      assertKnowledgeBaseManifestDoesNotRepeatOfficialLogo(
+        boundBuild,
+        attachmentManifest,
+      );
+
       const incomingImageHashes = attachmentManifest
-        .filter((entry) => entry.mimeType.startsWith("image/"))
+        .filter(
+          (entry) =>
+            entry.mimeType.startsWith("image/") &&
+            !(
+              officialLogoRequired &&
+              entry.sha256 === attachmentManifest[0]?.sha256
+            ),
+        )
         .map((entry) => entry.sha256);
       if (incomingImageHashes.length > 0) {
         const existingCustomerUploads =
@@ -4335,6 +4269,7 @@ router.post("/turn", async (req, res) => {
             userId: req.frontmindUser!.id,
             buildId: boundBuild.id,
             generation: boundBuild.generation,
+            officialLogoSha256: boundBuild.logoSha256,
           });
         const uniqueHashes = new Set(
           existingCustomerUploads.map((entry) => entry.sourceSha256),
@@ -4347,6 +4282,31 @@ router.post("/turn", async (req, res) => {
           );
         }
       }
+    }
+
+    const officialLogoUploadCandidate:
+      | Omit<KnowledgeBaseOfficialLogoUpload, "verified">
+      | undefined =
+      knowledgeBaseBuildRequiresOfficialLogo(boundBuild) &&
+      attachmentManifest?.length === 1 &&
+      attachments.length === 1
+        ? {
+            index: 0,
+            fileId: attachments[0]!.file_id,
+            filename: attachmentManifest[0]!.filename,
+            mimeType: attachmentManifest[0]!.mimeType,
+            sizeBytes: attachmentManifest[0]!.sizeBytes,
+            sourceSha256: attachmentManifest[0]!.sha256,
+          }
+        : undefined;
+    if (
+      knowledgeBaseBuildRequiresOfficialLogo(boundBuild) &&
+      !officialLogoUploadCandidate
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "INVALID_REQUEST",
+        "请先上传一张合格的企业官方主 Logo，再继续确认第一个知识节点",
+      );
     }
 
     const action = classifyKnowledgeBaseUserAction(
@@ -4369,6 +4329,14 @@ router.post("/turn", async (req, res) => {
         ? {
             attachmentManifest,
             capturedClientAttachments: true,
+            ...(officialLogoUploadCandidate
+              ? {
+                  officialLogoUpload: {
+                    ...officialLogoUploadCandidate,
+                    verified: false,
+                  },
+                }
+              : {}),
             ...(resumeLegacyAttachments
               ? { legacyUploadFirstTakeover: true }
               : {}),
@@ -4431,6 +4399,53 @@ router.post("/turn", async (req, res) => {
         });
       return;
     }
+    let verifiedOfficialLogoUpload: KnowledgeBaseOfficialLogoUpload | undefined;
+    if (officialLogoUploadCandidate) {
+      try {
+        verifiedOfficialLogoUpload = await bindKnowledgeBaseOfficialLogoUpload({
+          userId: req.frontmindUser!.id,
+          buildId: boundBuild.id,
+          generation: reservation.turn.buildGeneration,
+          turnId: reservation.turn.id,
+          operationKey: reservation.turn.operationKey,
+          expectedRevision: reservation.turn.expectedRevision,
+          expectedLeafId: reservation.turn.expectedLeafId!,
+          upload: officialLogoUploadCandidate,
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "企业官方主 Logo 校验失败，请重新上传";
+        if (
+          error instanceof KnowledgeBaseArtifactBindingError &&
+          error.code === "LOGO_UPLOAD_INVALID"
+        ) {
+          await cancelUnpreparedKnowledgeBaseTurn({
+            userId: req.frontmindUser!.id,
+            turnId: reservation.turn.id,
+            clientRequestId,
+            leaseToken: reservation.leaseToken,
+            code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+            message,
+          });
+          const observation = await getKnowledgeBaseObservation({
+            userId: req.frontmindUser!.id,
+            conversationId,
+            upstreamStatus: "awaiting_input",
+          }).catch(() => null);
+          res.status(422).json({
+            error: {
+              code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+              message,
+            },
+            ...(observation ? { observation } : {}),
+          });
+          return;
+        }
+        throw error;
+      }
+    }
     const observation = await getKnowledgeBaseObservation({
       userId: req.frontmindUser!.id,
       conversationId,
@@ -4452,7 +4467,12 @@ router.post("/turn", async (req, res) => {
         leaseToken: reservation.leaseToken,
         leaseExpiresAt: reservation.leaseExpiresAt,
         upstreamIdempotencyKey: reservation.upstreamIdempotencyKey,
-        recoveryMetadata: reservation.recoveryMetadata ?? recoveryMetadata,
+        recoveryMetadata: verifiedOfficialLogoUpload
+          ? {
+              ...(reservation.recoveryMetadata ?? recoveryMetadata),
+              officialLogoUpload: verifiedOfficialLogoUpload,
+            }
+          : (reservation.recoveryMetadata ?? recoveryMetadata),
         preparedDispatch: null,
       },
       credential: taskCredential,
@@ -4726,15 +4746,17 @@ router.post("/progress/reconcile", async (req, res) => {
     });
     const immutableStatus =
       currentObservation?.interaction.progress?.build.status;
-    const packageRebindRequired =
-      currentObservation?.notice?.code === "PACKAGE_REBIND_REQUIRED";
+    const recoverableArtifactNotice =
+      knowledgeBaseProtocolErrorAllowsSameTaskRecovery(
+        currentObservation?.notice?.code,
+      );
     const immutableProjection =
       immutableStatus === "ready_to_publish" ||
       immutableStatus === "published" ||
-      (!packageRebindRequired &&
+      (!recoverableArtifactNotice &&
         (immutableStatus === "protocol_error" || immutableStatus === "failed"));
-    const preservePackageRebindObservation = () => {
-      if (!packageRebindRequired || !currentObservation) return false;
+    const preserveRecoverableArtifactObservation = () => {
+      if (!recoverableArtifactNotice || !currentObservation) return false;
       res.json({
         progress: currentObservation.interaction.progress,
         interaction: currentObservation.interaction,
@@ -4820,7 +4842,7 @@ router.post("/progress/reconcile", async (req, res) => {
       taskId,
     );
     if (!credential) {
-      if (preservePackageRebindObservation()) return;
+      if (preserveRecoverableArtifactObservation()) return;
       const failure = await observeKnowledgeBaseUpstreamFailure({
         userId: req.frontmindUser!.id,
         conversationId,
@@ -4862,7 +4884,7 @@ router.post("/progress/reconcile", async (req, res) => {
       taskResponse = null;
     }
     if (!taskResponse) {
-      if (preservePackageRebindObservation()) return;
+      if (preserveRecoverableArtifactObservation()) return;
       const failure = await observeKnowledgeBaseUpstreamFailure({
         userId: req.frontmindUser!.id,
         conversationId,
@@ -4887,7 +4909,7 @@ router.post("/progress/reconcile", async (req, res) => {
       return;
     }
     if (taskResponse.status < 200 || taskResponse.status >= 300) {
-      if (preservePackageRebindObservation()) return;
+      if (preserveRecoverableArtifactObservation()) return;
       const credentialFailure = [401, 403].includes(taskResponse.status);
       const failure = await observeKnowledgeBaseUpstreamFailure({
         userId: req.frontmindUser!.id,
