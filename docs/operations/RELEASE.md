@@ -29,8 +29,9 @@ main
 
 ### 1.1 工作区清洁门禁
 
-每次发布必须把 Dashboard 与 Website 两个工作区中本次有意完成的修改全部提交；
-`main` 上的源码提交是唯一 source SHA，不能把“本地已完成但未提交”的文件留到下一次
+每次发布必须把 Dashboard 与 Website 两个工作区中本次有意完成的修改全部提交到各自发布分支，
+通过同仓 PR 后再合并；`main` 上最终的双亲 merge commit 是唯一 source SHA，不能把
+“本地已完成但未提交”的文件留到下一次
 发布。推送前和发布完成后都执行：
 
 ```bash
@@ -51,12 +52,14 @@ Schema contract，Schema 状态必须为 `exact`，否则运行服务拒绝就�
 
 ### 1.2 最快上线与 1Panel 边界
 
-常规发布的操作入口只有 `main`，不需要登录 1Panel 或 SSH：
+常规发布的操作入口只有“同仓 PR 合并到 `main`”这条路径，不需要登录 1Panel 或 SSH：
 
 ```text
 Dashboard / Website 工作区 0 changes
--> 分别提交并推送 main
--> 各自 CI 全绿并签名镜像 digest
+-> 分别推送发布分支并完成同仓 PR CI
+-> 以 --merge --match-head-commit 合并审阅过的 head
+-> main push 的 prebuild gate 复核 PR、tree 与最新精确 run
+-> 各自 CI 签名镜像 digest
 -> 受限 SSH forced-command 调用固定服务 controller
 -> /readyz 同时核对 source SHA 与 image digest
 -> 成功原子更新 current / previous，失败自动回滚
@@ -90,7 +93,39 @@ Dashboard 的 [dashboard-ci.yml](../../.github/workflows/dashboard-ci.yml) 在 P
 `information_schema` 与最新 Drizzle snapshot 生成的稳定 Schema contract 比较；
 仅 ledger 数量正确但表结构漂移同样使 CI 失败。
 
-PR 永远不会 push、签名或部署。`main` 全绿后才构建、推送、签名和自动发布。
+PR 永远不会 push、签名或部署。合并后的 `main` 在任何应用构建、签名、SSH、数据库
+controller、deployment marker 或激活步骤之前，必须先通过仓库内的 exact-PR prebuild
+gate。gate 重新核对实际 checkout、双亲和完整 tree、同仓 PR、候选 trailers，以及该 PR
+在本 workflow 上的精确成功 run 与 attempt 专属 merge-proof artifact。GitHub Actions API 的
+`run.head_sha` 是 PR head，不是 test-merge；PR workflow 在全部必要测试成功后，从实际 checkout
+写出严格 JSON，绑定 repository、workflow/run/attempt、PR/base/head 和 test-merge SHA/双亲/tree，
+再上传为有限保留期的临时 artifact。gate 不依赖 PR 关闭后可能为空的 `run.pull_requests`，而是
+下载唯一 artifact，复核 GitHub 元数据、ZIP 长度、SHA-256 digest 和严格内容。对同一 PR head
+重复触发 workflow 时，只把 run ID 最新的精确 configured-workflow run 当作权威；旧 run 的
+过期或重复 artifact 不再污染新 run。最终竞态检查会重新列举最新精确 run；若期间出现更新 run，
+即使旧 run 成功也必须停止。最新 run 自身错误、未完成、失败、artifact 过期/重复/冲突，或
+head/base/tree 移动仍失败关闭。
+
+普通生产变更和 Dev 晋级都必须通过同仓 PR；待合并 head 必须已经包含当前 `main`，并统一使用
+`gh pr merge --merge --match-head-commit <reviewed-head-sha>`。普通单亲 direct push、squash
+或 rebase merge，以及双亲或 tree 与 PR 不匹配的 merge 都无法满足合同。
+
+这套 gate 不依赖 GitHub Branch Protection、Rulesets 或 commit status，适用于当前私有仓
+配置；它能阻止误操作和错误晋级，但信任边界仍包含仓库管理员：管理员既可修改
+workflow/gate，也可能构造在 GitHub PR 元数据、双亲和完整 tree 上与正常 PR merge 等价的提交。
+gate 依据可观察的 Git/GitHub 事实，不能把这样的受信任管理员行为与正常 merge 做密码学区分。
+因此晋级前仍必须评审 gate diff，并由本地 exact-PR verifier 在 merge 前再次读取 head、base、
+test-merge、workflow run 和 artifact，最终只允许 `--merge --match-head-commit` 合并。artifact
+只是单次 run 的临时证明，不进入数据库、不提交 Git，也不构成永久晋级账本。
+
+`push` 永远不能以历史发布结果绕过上述 PR artifact。Dashboard 的 `workflow_dispatch` 与
+`repository_dispatch` 可以复用同一个仍为当前 `main` 的已激活 source：gate 在同一 configured
+workflow 的 `push / workflow_dispatch / repository_dispatch` run 中选择最新一条真正完成且其
+`Build, sign and deploy immutable image` job 成功的记录，并在返回前再次读取 current main、
+该 run 与同一 attempt 的 job。pending、failed、cancelled、skipped、缺 job 或身份不符的 run
+都不构成“已激活”，但也不会建立失败状态或阻止独立的完整 PR proof；没有合格成功记录时直接
+回到最新精确 PR run + artifact 路径。只有成功激活证据可在旧 PR artifact 到期后支持同源恢复；
+否则 artifact 缺失或到期仍失败关闭。整个恢复路径不新增数据库、账本或状态桥。
 
 PDF runtime 仅在 `deploy/1panel-node-pdf/**`、其
 [workflow](../../.github/workflows/pdf-runtime.yml)、revision gate 或晋级脚本变化
@@ -148,7 +183,8 @@ root-only 的 `/run` 临时 Docker 配置，镜像拉取后立即删除，不把
 Compose、容器环境、日志或长期 `/root/.docker/config.json`。Dashboard/Website 私钥必须
 独立；服务器 `authorized_keys` 分别把它们固定到对应服务，无法选择或切换服务。
 
-任何提交进入 `main` 后，在 CI 全绿时自动构建、签名并发布，不再设置
+任何通过上述同仓 PR merge 进入 `main` 的提交，在 prebuild gate 与 CI 全绿后自动构建、签名
+并发布，不再设置
 `*_AUTO_DEPLOY_ENABLED` 开关或增加普通发布人工审批。服务器在 `state.json` 不存在时只开放
 一次受限的“首次签名镜像接管”：仍从 stdin 使用本次 job 的
 临时 GHCR 凭据，严格验证仓库、digest、Cosign workflow identity 与 OCI revision；随后
@@ -243,7 +279,8 @@ source SHA 与精确 image digest；只匹配 SHA 不足以证明公网返回的
 
 ## 5. 普通更新（journal exact）
 
-开发者只需合并到 `main`。服务器依次完成验签、pull、镜像 revision label 校验和
+开发者只需完成同仓 PR 并按精确 head 合并到 `main`；不要直接推送 `main`。服务器依次完成
+验签、pull、镜像 revision label 校验和
 只读 `release-db plan --json`。若 ledger 状态为 `exact`，该命令继续只读验证 Schema，
 只有 `schema.status=exact` 才允许发布；列、约束或引擎漂移会在重建容器前失败关闭。
 `plan` 是事实观察接口，因此 ledger exact 但 Schema diverged 时仍返回完整 JSON 与零退出；
@@ -408,8 +445,9 @@ Codex 已安装本机 Skill：
 使用 $frontmind-release 把当前 FrontMind 修改验证、提交并上线；expand 自动，删表/contract 先让我审核。
 ```
 
-Skill 会检查两个仓库的实际 diff 和 migration journal，验证发生变化的仓库，提交并推送
-`main`，等待精确 SHA 对应的 CI、签名镜像和自动部署，再核对本机/公网 readiness、原子
+Skill 会检查两个仓库的实际 diff 和 migration journal，验证发生变化的仓库，推送发布分支、
+创建同仓 PR，并用 `--merge --match-head-commit` 合并审阅过的精确 head；随后等待 merge SHA
+对应的 prebuild gate、CI、签名镜像和自动部署，再核对本机/公网 readiness、原子
 state 与回滚 digest。完成条件不是“已经 commit”，而是两个本地工作区都无 Changes、均与
 `origin/main` 同步，且生产运行精确签名 digest。
 
