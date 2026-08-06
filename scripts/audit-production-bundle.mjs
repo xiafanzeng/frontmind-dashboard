@@ -11,6 +11,7 @@ import {
   createMigrationManifest,
   readMigrationManifest,
 } from "./migration-manifest.mjs";
+import { withoutValidatedProductionBundleBuildSourceSha } from "./production-bundle-policy-content.mjs";
 
 const projectRoot = resolve(import.meta.dirname, "..");
 const buildRoot = resolve(projectRoot, process.argv[2] || "dist");
@@ -628,7 +629,10 @@ for (const file of await collectTextFiles(buildRoot)) {
   ) {
     continue;
   }
-  const content = withoutApprovedBranding(await readFile(file, "utf8"));
+  const content = withoutValidatedProductionBundleBuildSourceSha(
+    withoutApprovedBranding(await readFile(file, "utf8")),
+    artifactManifest.buildSourceSha,
+  );
   for (const rule of forbiddenPatterns) {
     if (rule.pattern.test(content)) {
       violations.push({

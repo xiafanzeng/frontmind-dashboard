@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { assertCleanProductionBuildSource } from "./assert-clean-build-source.mjs";
+import { releasePresentation } from "./release-channel.mjs";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const buildRoot = path.join(projectRoot, "dist");
@@ -23,6 +24,9 @@ if ((await readdir(buildRoot)).length !== 0) {
 
 const releaseEnvironment = {
   ...process.env,
+  FRONTMIND_RELEASE_CHANNEL: releasePresentation.releaseChannel,
+  VITE_FRONTMIND_RELEASE_CHANNEL: releasePresentation.releaseChannel,
+  VITE_FRONTMIND_WEBSITE_URL: releasePresentation.websiteUrl,
   FRONTMIND_BUILD_SHA: buildSourceSha,
   BUILD_SHA: buildSourceSha,
 };
@@ -50,7 +54,9 @@ run("pnpm", [
   "--entry-names=[name]",
   "--outdir=dist",
   '--define:process.env.NODE_ENV="production"',
+  `--define:process.env.FRONTMIND_RELEASE_CHANNEL=${JSON.stringify(releasePresentation.releaseChannel)}`,
   `--define:__FRONTMIND_BUILD_SHA__=${JSON.stringify(buildSourceSha)}`,
+  `--define:__FRONTMIND_RELEASE_CHANNEL__=${JSON.stringify(releasePresentation.releaseChannel)}`,
 ]);
 run(process.execPath, ["scripts/copy-runtime-skills.mjs"]);
 run(process.execPath, ["scripts/copy-runtime-migrations.mjs"]);
