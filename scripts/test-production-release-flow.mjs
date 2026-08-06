@@ -19,6 +19,20 @@ const testRoot = await mkdtemp(
 );
 const releaseRepository = path.join(testRoot, "release");
 
+execFileSync(
+  process.execPath,
+  ["--test", path.join(projectRoot, "scripts/promotion-prebuild-gate.node-test.mjs")],
+  { cwd: projectRoot, stdio: "inherit" },
+);
+execFileSync(
+  process.execPath,
+  [
+    "--test",
+    path.join(projectRoot, "scripts/promotion-prebuild-gate-runtime.node-test.mjs"),
+  ],
+  { cwd: projectRoot, stdio: "inherit" },
+);
+
 function git(args) {
   return execFileSync("git", args, {
     cwd: releaseRepository,

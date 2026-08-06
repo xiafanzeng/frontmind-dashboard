@@ -15,6 +15,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  promotion-gate:
+    name: Verify exact production source before build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      source_sha: ${{ steps.verify.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - id: verify
+        name: Verify PR, merge tree and exact successful PR workflow
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/verify-promotion-main-push.sh
+          echo "source_sha=$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+
   changes:
     name: Detect PDF base changes
     if: github.event_name == 'push'
@@ -159,16 +185,50 @@ jobs:
           FRONTMIND_AUTH_MYSQL_ACCEPTANCE_REQUIRED: 1
         run: pnpm exec vitest run scripts/auth-mysql-transaction-acceptance.test.ts
 
+  promotion-merge-proof:
+    name: Bind successful PR run to its exact test merge
+    if: github.event_name == 'pull_request'
+    needs:
+      - quality
+      - mysql-acceptance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create canonical PR merge proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          node .github/scripts/write-promotion-merge-proof.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-name "Dashboard CI and release" \
+            --workflow-path ".github/workflows/dashboard-ci.yml" \
+            --output "$RUNNER_TEMP/promotion-merge-proof.json"
+      - name: Upload exact PR merge proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontmind-production-merge-proof-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/promotion-merge-proof.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
   build-sign-deploy:
     name: Build, sign and deploy immutable image
     needs:
       - changes
+      - promotion-gate
       - quality
       - mysql-acceptance
     if: >-
       always() &&
       needs.quality.result == 'success' &&
       needs.mysql-acceptance.result == 'success' &&
+      needs.promotion-gate.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       (
         github.event_name == 'repository_dispatch' ||
@@ -188,16 +248,21 @@ jobs:
     outputs:
       image: ${{ steps.image.outputs.repository }}
       digest: ${{ steps.build.outputs.digest }}
+      source_sha: ${{ needs.promotion-gate.outputs.source_sha }}
+    env:
+      FRONTMIND_RELEASE_SOURCE_SHA: ${{ needs.promotion-gate.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ needs.promotion-gate.outputs.source_sha }}
       - name: Verify immutable source checkout
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$FRONTMIND_RELEASE_SOURCE_SHA"
+          test "$GITHUB_SHA" = "$FRONTMIND_RELEASE_SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - uses: docker/setup-buildx-action@v3
       - uses: sigstore/cosign-installer@v3
@@ -273,13 +338,13 @@ jobs:
           context: .
           file: deploy/production/dashboard/Dockerfile
           push: true
-          tags: ${{ steps.image.outputs.repository }}:sha-${{ github.sha }}
+          tags: ${{ steps.image.outputs.repository }}:sha-${{ needs.promotion-gate.outputs.source_sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.promotion-gate.outputs.source_sha }}
           build-args: |
-            SOURCE_SHA=${{ github.sha }}
-            IMAGE_VERSION=sha-${{ github.sha }}
+            SOURCE_SHA=${{ needs.promotion-gate.outputs.source_sha }}
+            IMAGE_VERSION=sha-${{ needs.promotion-gate.outputs.source_sha }}
             FRONTMIND_PDF_RUNTIME_IMAGE=${{ steps.pdf.outputs.image }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -320,7 +385,7 @@ jobs:
               -o IdentitiesOnly=yes \
               -o StrictHostKeyChecking=yes \
               "$DEPLOY_USER@$DEPLOY_HOST" \
-              "$IMAGE@$DIGEST $GITHUB_SHA"
+              "$IMAGE@$DIGEST $FRONTMIND_RELEASE_SOURCE_SHA"
       - name: Record immutable successful-deployment marker
         env:
           IMAGE: ${{ steps.image.outputs.repository }}
