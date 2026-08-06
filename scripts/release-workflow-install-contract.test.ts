@@ -80,9 +80,11 @@ describe("release workflow source-ordering contracts", () => {
     expect(deployStep).toContain(
       `printf '%s\\n%s\\n' "$GHCR_USERNAME" "$GHCR_TOKEN" |`,
     );
-    expect(deployStep).toContain('"$IMAGE@$DIGEST $GITHUB_SHA"');
+    expect(deployStep).toContain(
+      '"$IMAGE@$DIGEST $FRONTMIND_RELEASE_SOURCE_SHA"',
+    );
     expect(deployStep).not.toContain(
-      '"$IMAGE@$DIGEST $GITHUB_SHA $GHCR_TOKEN"',
+      '"$IMAGE@$DIGEST $FRONTMIND_RELEASE_SOURCE_SHA $GHCR_TOKEN"',
     );
   });
 
