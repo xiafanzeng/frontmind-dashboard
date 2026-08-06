@@ -1060,6 +1060,57 @@ ${narrative}
     });
   });
 
+  it("allows only the v4 binder to repair a derived formal character count", async () => {
+    const archive = await dashboardV4OfficialLogoUploadArchive();
+    const zip = await JSZip.loadAsync(archive.buffer);
+    const manifestPath = "深度企业_knowledge_base/00_package_manifest.json";
+    const manifest = JSON.parse(await zip.file(manifestPath)!.async("string"));
+    manifest.counts.customerVisibleCharacters += 615;
+    zip.file(manifestPath, JSON.stringify(manifest));
+    const mismatched = await zip.generateAsync({ type: "nodebuffer" });
+
+    await expect(
+      readKnowledgeArchive(
+        mismatched,
+        "深度企业知识库-v4-count-mismatch.zip",
+        "deep-v4-count-strict-test",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 4,
+        },
+      ),
+    ).rejects.toThrow("package manifest 正式正文字数与服务端复算结果不一致");
+
+    const repairable = await readKnowledgeArchive(
+      mismatched,
+      "深度企业知识库-v4-count-mismatch.zip",
+      "deep-v4-count-repairable-test",
+      {
+        validationProfile: "dashboard-enterprise-v1",
+        archiveContractVersion: 4,
+        allowV4CustomerVisibleCharacterCountRepair: true,
+      },
+    );
+    storedKeys.push(...repairable.storedAssetKeys);
+    expect(repairable.packageSchemaVersion).toBe(4);
+
+    const evidenceMismatchZip = await JSZip.loadAsync(mismatched);
+    manifest.counts.evidenceCharacters += 1;
+    evidenceMismatchZip.file(manifestPath, JSON.stringify(manifest));
+    await expect(
+      readKnowledgeArchive(
+        await evidenceMismatchZip.generateAsync({ type: "nodebuffer" }),
+        "深度企业知识库-v4-other-count-mismatch.zip",
+        "deep-v4-other-count-strict-test",
+        {
+          validationProfile: "dashboard-enterprise-v1",
+          archiveContractVersion: 4,
+          allowV4CustomerVisibleCharacterCountRepair: true,
+        },
+      ),
+    ).rejects.toThrow("package manifest 证据文字数与服务端复算结果不一致");
+  });
+
   it("rejects an uploaded official Logo candidate without customer_upload method", async () => {
     const archive = await dashboardV4OfficialLogoUploadArchive();
     const zip = await JSZip.loadAsync(archive.buffer);

@@ -1,5 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -17,13 +24,22 @@ import mysql, {
   type RowDataPacket,
 } from "mysql2/promise";
 import sharp from "sharp";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import {
   apiCredentials,
   conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
+  knowledgeImportReceipts,
   knowledgeBaseSnapshots,
   messages,
   userDashboardContents,
@@ -33,6 +49,12 @@ import {
   canonicalPackagedKnowledgeBaseLeafMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "../server/knowledge-base-package-validation";
+import {
+  collectKnowledgeArchiveDescriptors,
+  knowledgeArchiveDescriptorHash,
+} from "../server/knowledge-base-artifact";
+import { KNOWLEDGE_BASE_FINALIZATION_INPUT_FILENAME_PREFIX } from "../server/knowledge-base-finalization-input";
+import { KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME } from "../server/knowledge-base-prompt-delivery";
 import {
   formatKnowledgeBaseManifestEnvelope,
   formatKnowledgeBasePresentationEnvelope,
@@ -50,6 +72,21 @@ const dependencies = vi.hoisted(() => ({
   userId: 0,
   credentialId: "",
   credentialFingerprint: "",
+  createKnowledgeSnapshotHook: undefined as
+    | ((actual: (input: any) => Promise<any>, input: any) => Promise<any>)
+    | undefined,
+  readKnowledgeArchiveHook: undefined as
+    | ((
+        actual: (...args: any[]) => Promise<any>,
+        ...args: any[]
+      ) => Promise<any>)
+    | undefined,
+  getPresalesCredentialForResourceHook: undefined as
+    | ((...args: any[]) => Promise<any>)
+    | undefined,
+  getPresalesTaskProjectBindingHook: undefined as
+    | ((...args: any[]) => Promise<any>)
+    | undefined,
 }));
 
 vi.mock("../server/db", () => ({ getDb: dependencies.getDb }));
@@ -137,12 +174,62 @@ vi.mock("../server/upstream-config", async (importOriginal) => {
   };
 });
 
+vi.mock("../server/dashboard-service", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../server/dashboard-service")>();
+  return {
+    ...actual,
+    createKnowledgeSnapshot: (input: any) =>
+      dependencies.createKnowledgeSnapshotHook
+        ? dependencies.createKnowledgeSnapshotHook(
+            actual.createKnowledgeSnapshot,
+            input,
+          )
+        : actual.createKnowledgeSnapshot(input),
+  };
+});
+
+vi.mock("../server/dashboard-api", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../server/dashboard-api")>();
+  return {
+    ...actual,
+    readKnowledgeArchive: (...args: any[]) =>
+      dependencies.readKnowledgeArchiveHook
+        ? dependencies.readKnowledgeArchiveHook(
+            actual.readKnowledgeArchive,
+            ...args,
+          )
+        : actual.readKnowledgeArchive(...args),
+  };
+});
+
+vi.mock("../server/presales-service", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../server/presales-service")>();
+  return {
+    ...actual,
+    getPresalesCredentialForResource: (...args: any[]) =>
+      dependencies.getPresalesCredentialForResourceHook
+        ? dependencies.getPresalesCredentialForResourceHook(...args)
+        : actual.getPresalesCredentialForResource(...args),
+    getPresalesTaskProjectBinding: (...args: any[]) =>
+      dependencies.getPresalesTaskProjectBindingHook
+        ? dependencies.getPresalesTaskProjectBindingHook(...args)
+        : actual.getPresalesTaskProjectBinding(...args),
+  };
+});
+
 const ACCEPTANCE_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_DATABASE_URL";
 const REQUIRED_ENV = "FRONTMIND_KB_MYSQL_ACCEPTANCE_REQUIRED";
 const DATABASE_MARKER = "frontmind_kb_acceptance";
 const REPOSITORY_ROOT = path.resolve(process.cwd());
 const PUBLIC_CONVERSATION_ID_PREFIX = "kb-mysql-e2e";
 const FINAL_REVISION = 8;
+const FINALIZATION_INPUT_FILENAME_PATTERN = new RegExp(
+  `^${KNOWLEDGE_BASE_FINALIZATION_INPUT_FILENAME_PREFIX}-[a-f0-9]{16}\\.zip$`,
+  "u",
+);
 
 type AcceptanceTarget = { url: string; databaseName: string };
 
@@ -191,6 +278,16 @@ function sha256(value: Buffer | string) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function effectiveCharacterCount(value: string) {
   return Array.from(
     value
@@ -215,7 +312,9 @@ ${narrative}
 `;
 }
 
-async function createFinalPackageFixture() {
+async function createFinalPackageFixture(input?: {
+  officialLogoSourceAssetUrl?: string;
+}) {
   const root = "FrontMind超前智能_knowledge_base";
   const zip = new JSZip();
   const logo = await sharp({
@@ -332,12 +431,15 @@ async function createFinalPackageFixture() {
     branchId: "products",
     documentIds: ["1.1"],
     sourcePageUrl: "https://www.frontmind.net/",
-    sourceAssetUrl: "https://www.frontmind.net/frontmind-logo.png",
+    sourceAssetUrl:
+      input?.officialLogoSourceAssetUrl ||
+      "https://www.frontmind.net/frontmind-logo.png",
     sourceKind: "official_web",
     ownership: "first_party",
     assetType: "brand_identity",
     displayRole: "badge",
   };
+  const assets = [asset];
   const customerVisibleCharacters =
     effectiveCharacterCount(overviewNarrative) +
     leaves.reduce((total, _leaf, index) => {
@@ -372,13 +474,13 @@ async function createFinalPackageFixture() {
   zip.file(
     `${root}/00_package_manifest.json`,
     JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: 4,
       profile: "dashboard-enterprise-v1",
       buildRevision: FINAL_REVISION,
       documents,
-      assets: [asset],
+      assets,
       counts: {
-        totalFiles: documents.length + 3,
+        totalFiles: documents.length + assets.length + 2,
         customerVisibleCharacters,
         evidenceCharacters: effectiveCharacterCount(supporting[0][1]),
         packagedImages: 1,
@@ -474,6 +576,166 @@ mysqlDescribe(
     const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
     const previousRolloutPercent = process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT;
     const previousAxiosAdapter = axios.defaults.adapter;
+    const stagedImportAssets = new Map<string, string>();
+
+    async function createCompletedWebsiteProvision(projectId: string) {
+      const identity = sha256(projectId);
+      await pool.execute(
+        `INSERT INTO website_user_provisions
+           (id, idempotencyKeyHash, requestHash, projectId, companyName,
+            orderId, tradeNo, amountFen, paidAt, serviceCategory,
+            questionId, question, contractTemplateVersion,
+            contractDocumentSha256, requestedUsername,
+            requestedDisplayName, userId, status, completedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), 'product_scenario',
+                 ?, ?, 'mysql-e2e-v1', ?, ?, ?, ?, 'completed', NOW())`,
+        [
+          randomUUID(),
+          identity,
+          sha256(`request:${projectId}`),
+          projectId,
+          "FrontMind超前智能",
+          `order-${identity.slice(0, 24)}`,
+          `trade-${identity.slice(0, 48)}`,
+          `question-${identity.slice(0, 24)}`,
+          "知识库导入并发验收",
+          sha256(`contract:${projectId}`),
+          `kb_${identity.slice(0, 20)}`,
+          "FrontMind超前智能",
+          userId,
+        ],
+      );
+    }
+
+    async function createKnowledgeImportHarness(label: string) {
+      const projectId = `kb-import-${label}-${runId}`.slice(0, 80);
+      const taskId = `task-${label}-${runId}`;
+      const outputItemId = `output-${label}`;
+      const fileId = `file-${label}`;
+      const filename = `${label}.zip`;
+      const zip = new JSZip();
+      zip.file("fixture.txt", `FrontMind ${label}`);
+      const archive = await zip.generateAsync({ type: "nodebuffer" });
+      const output = [
+        {
+          id: outputItemId,
+          type: "output_file",
+          file_id: fileId,
+          filename,
+          mime_type: "application/zip",
+        },
+      ];
+      const descriptor = collectKnowledgeArchiveDescriptors(output)[0]!;
+      const descriptorHash = knowledgeArchiveDescriptorHash(descriptor);
+
+      await createCompletedWebsiteProvision(projectId);
+      const upstream = express();
+      upstream.get("/v1/tasks/:taskId", (req, res) => {
+        res.json({
+          task: {
+            id: req.params.taskId,
+            status: "completed",
+            output,
+          },
+        });
+      });
+      upstream.get("/v1/files/:fileId/content", (_req, res) => {
+        res.setHeader("Content-Type", "application/zip");
+        res.setHeader("Content-Length", String(archive.length));
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="${filename}"`,
+        );
+        res.send(archive);
+      });
+      const listener = await listen(upstream);
+      dependencies.upstreamBaseUrl = listener.baseUrl;
+      dependencies.getPresalesTaskProjectBindingHook = async (
+        requestedTaskId: string,
+      ) =>
+        requestedTaskId === taskId
+          ? {
+              projectId,
+              apiCredentialId: credentialId,
+              credentialVersion: 1,
+              taskId,
+            }
+          : null;
+      dependencies.getPresalesCredentialForResourceHook = async (
+        resourceType: string,
+        requestedTaskId: string,
+      ) =>
+        resourceType === "task" && requestedTaskId === taskId
+          ? {
+              id: credentialId,
+              version: 1,
+              apiKey: upstreamApiKey,
+            }
+          : null;
+      dependencies.readKnowledgeArchiveHook = async (
+        _actual,
+        _buffer: Buffer,
+        _sourceFileName: string,
+        snapshotId: string,
+      ) => {
+        const assetKey = `mysql-import-${snapshotId}.bin`;
+        const bytes = Buffer.from(`asset:${snapshotId}`, "utf8");
+        await mkdir(assetRoot, { recursive: true });
+        await writeFile(path.join(assetRoot, assetKey), bytes);
+        stagedImportAssets.set(snapshotId, assetKey);
+        return {
+          storedAssetKeys: [assetKey],
+          documents: [
+            {
+              id: `readme-${snapshotId}`,
+              path: "README.md",
+              title: "FrontMind超前智能",
+              content: "FrontMind超前智能知识库导入并发验收",
+              kind: "overview",
+              customerVisible: true,
+            },
+          ],
+          assets: [
+            {
+              id: `asset-${snapshotId}`,
+              key: assetKey,
+              path: "assets/fixture.bin",
+              mimeType: "application/octet-stream",
+              size: bytes.length,
+              sha256: sha256(bytes),
+            },
+          ],
+        };
+      };
+
+      return {
+        projectId,
+        taskId,
+        archive,
+        request: {
+          projectId,
+          idempotencyKey: `idempotency-${label}-${runId}`,
+          value: {
+            schemaVersion: 2 as const,
+            companyName: "FrontMind超前智能",
+            taskId,
+            outputItemId,
+            fileId,
+            descriptorHash,
+            artifactSha256: sha256(archive),
+            filename,
+          },
+        },
+        close: () => close(listener.server),
+      };
+    }
+
+    afterEach(() => {
+      dependencies.createKnowledgeSnapshotHook = undefined;
+      dependencies.readKnowledgeArchiveHook = undefined;
+      dependencies.getPresalesCredentialForResourceHook = undefined;
+      dependencies.getPresalesTaskProjectBindingHook = undefined;
+    });
 
     beforeAll(async () => {
       const target = parseKnowledgeBaseMysqlE2eAcceptanceTarget(acceptanceUrl);
@@ -697,7 +959,15 @@ mysqlDescribe(
 
     it("runs the real start/turn/reconcile/publish/view/download path for all eight leaves", async () => {
       expect(userId).not.toBeNull();
-      const fixture = await createFinalPackageFixture();
+      const upstream = express();
+      upstream.use(express.json({ limit: "5mb" }));
+      const upstreamListener = await listen(upstream);
+      upstreamServer = upstreamListener.server;
+      const upstreamBaseUrl = upstreamListener.baseUrl;
+      dependencies.upstreamBaseUrl = upstreamBaseUrl;
+      const fixture = await createFinalPackageFixture({
+        officialLogoSourceAssetUrl: `${upstreamBaseUrl}/v1/files/file-official-logo/content`,
+      });
       const archiveSha256 = sha256(fixture.archive);
       const finalTaskId = `task-final-package-${runId}`;
       const taskResults = new Map<
@@ -714,20 +984,28 @@ mysqlDescribe(
         }
       >();
       const uploadedFileBytes = new Map<string, number>();
+      const uploadedFileNames = new Map<string, string>();
       let uploadedFileSequence = 0;
       let authoritativeTaskReads = 0;
       let logoDownloads = 0;
       let packageDownloads = 0;
       let initialOperationId = "";
       let initialTurnId = "";
-      let upstreamBaseUrl = "";
-
-      const upstream = express();
-      upstream.use(express.json({ limit: "5mb" }));
       upstream.post("/v1/files", (req, res) => {
         expect(req.header("authorization")).toBe(`Bearer ${upstreamApiKey}`);
-        expect(req.body.filename).toBe("socratic-kb-builder.skill.zip");
-        const fileId = `uploaded-skill-${++uploadedFileSequence}`;
+        const filename = String(req.body.filename || "");
+        expect(
+          filename === "socratic-kb-builder.skill.zip" ||
+            filename === KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME ||
+            FINALIZATION_INPUT_FILENAME_PATTERN.test(filename),
+        ).toBe(true);
+        const kind = filename.startsWith("socratic-")
+          ? "skill"
+          : filename.includes("finalization")
+            ? "finalization"
+            : "instructions";
+        const fileId = `uploaded-${kind}-${++uploadedFileSequence}`;
+        uploadedFileNames.set(fileId, filename);
         res.json({
           id: fileId,
           upload_url: `${upstreamBaseUrl}/uploads/${fileId}`,
@@ -748,8 +1026,13 @@ mysqlDescribe(
         try {
           expect(req.header("authorization")).toBe(`Bearer ${upstreamApiKey}`);
           const prompt = String(req.body.prompt || "");
-          const operationId = prompt.match(/"operationId":"([^"]+)"/u)?.[1];
-          const turnId = prompt.match(/"turnId":"([^"]+)"/u)?.[1];
+          expect(Array.from(prompt).length).toBeLessThanOrEqual(3_000);
+          const operationId =
+            prompt.match(/"operationId":"([^"]+)"/u)?.[1] ||
+            prompt.match(/operationId=([^；;\s]+)/u)?.[1];
+          const turnId =
+            prompt.match(/"turnId":"([^"]+)"/u)?.[1] ||
+            prompt.match(/turnId=([^。；;\s]+)/u)?.[1];
           expect(operationId).toBeTruthy();
           expect(turnId).toBeTruthy();
           const turn = (
@@ -767,6 +1050,15 @@ mysqlDescribe(
           expect(turn.attachmentFileIds).toEqual(
             req.body.attachments.map((attachment: any) => attachment.file_id),
           );
+          const systemInputAttachment = req.body.attachments.find(
+            (attachment: any) =>
+              attachment.filename === KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME ||
+              FINALIZATION_INPUT_FILENAME_PATTERN.test(attachment.filename),
+          );
+          expect(systemInputAttachment).toBeTruthy();
+          expect(
+            uploadedFileBytes.get(systemInputAttachment.file_id),
+          ).toBeGreaterThan(0);
 
           const idempotencyKey = String(req.header("idempotency-key") || "");
           expect(idempotencyKey).toBe(`frontmind-kb-v2:${operationId}`);
@@ -810,6 +1102,11 @@ mysqlDescribe(
               schemaVersion: 2,
               operationId: operationId!,
               turnId: turnId!,
+              officialLogo: {
+                sourceKind: "official_web",
+                sourcePageUrl: "https://www.frontmind.net/",
+                sourceAssetUrl: `${upstreamBaseUrl}/v1/files/file-official-logo/content`,
+              },
               leaves: fixture.leaves.map((leaf) => ({
                 id: leaf.id,
                 title: leaf.title,
@@ -970,11 +1267,6 @@ mysqlDescribe(
         },
       );
 
-      const upstreamListener = await listen(upstream);
-      upstreamServer = upstreamListener.server;
-      upstreamBaseUrl = upstreamListener.baseUrl;
-      dependencies.upstreamBaseUrl = upstreamBaseUrl;
-
       const { default: dashboardRouter, readKnowledgeArchive } = await import(
         "../server/dashboard-api"
       );
@@ -1008,8 +1300,7 @@ mysqlDescribe(
         body: Record<string, unknown>,
       ) => {
         const requestBody = JSON.stringify(body);
-        let lastPayload: unknown;
-        for (let attempt = 0; attempt < 400; attempt += 1) {
+        const send = async () => {
           const response = await fetch(
             `${dashboardListener.baseUrl}/api/knowledge-base${pathname}`,
             {
@@ -1022,37 +1313,85 @@ mysqlDescribe(
             },
           );
           const payload = (await response.json()) as any;
-          lastPayload = payload;
           if (
-            pathname === "/turn" &&
             response.status === 200 &&
-            payload.idempotent === true &&
-            payload.task?.status === "running"
+            payload.observation?.interaction?.interactionState === "failed"
           ) {
-            // Binding the single upstream task is progress, not completion.
-            // Keep replaying the same logical request until reconciliation has
-            // atomically completed the turn and advanced the build.
-            await new Promise((resolve) => setTimeout(resolve, 25));
-            continue;
+            throw new Error(
+              `${pathname} projection failed: ${JSON.stringify(payload.observation.notice)}`,
+            );
           }
-          if (response.status === 200) return payload;
           if (
-            pathname === "/turn" &&
-            response.status === 202 &&
-            (payload.accepted === true || payload.idempotent === true)
+            response.status !== 200 &&
+            !(
+              pathname === "/turn" &&
+              response.status === 202 &&
+              (payload.accepted === true || payload.idempotent === true)
+            )
           ) {
-            // The public contract acknowledges the durable turn before the
-            // upstream POST. Replaying these exact bytes models a lost 202 and
-            // must converge on the same turn/task without a second dispatch.
-            await new Promise((resolve) => setTimeout(resolve, 25));
-            continue;
+            throw new Error(
+              `${pathname} returned ${response.status}: ${JSON.stringify(payload)}`,
+            );
           }
-          throw new Error(
-            `${pathname} returned ${response.status}: ${JSON.stringify(payload)}`,
+          return { response, payload };
+        };
+
+        let { response, payload } = await send();
+        const projectionPending = () =>
+          pathname === "/turn" &&
+          (response.status === 202 ||
+            payload.task?.status === "running" ||
+            payload.observation?.interaction?.interactionState ===
+              "executing");
+        if (!projectionPending()) return payload;
+
+        // Model one disconnected/lost accepted response exactly as the real
+        // client does: back off, then replay the same serialized bytes once.
+        // Subsequent waiting is observation-only, so this test exercises
+        // idempotency without creating an artificial hot-POST lock storm.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        ({ response, payload } = await send());
+        if (!projectionPending()) return payload;
+
+        const deadline = Date.now() + 30_000;
+        let lastObserved: any = payload;
+        do {
+          const observationResponse = await fetch(
+            `${dashboardListener.baseUrl}/api/knowledge-base/progress/${encodeURIComponent(String(body.conversationId || ""))}`,
+            { headers: { "x-test-auth": "user" } },
           );
-        }
+          expect(observationResponse.status).toBe(200);
+          const observed = (await observationResponse.json()) as any;
+          lastObserved = observed;
+          if (
+            observed.observation?.interaction?.interactionState === "failed"
+          ) {
+            throw new Error(
+              `${pathname} projection failed: ${JSON.stringify(observed.observation.notice)}`,
+            );
+          }
+          if (
+            observed.observation?.interaction?.interactionState !==
+              "executing" &&
+            observed.observation?.authoritativeTaskId
+          ) {
+            return {
+              ...payload,
+              task: {
+                id: observed.observation.authoritativeTaskId,
+                status: "running",
+              },
+              observation: observed.observation,
+              progress: observed.progress,
+              interaction: observed.interaction,
+            };
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        } while (Date.now() < deadline);
+
         throw new Error(
-          `${pathname} did not settle after an accepted response: ${JSON.stringify(lastPayload)}`,
+          `${pathname} did not settle after an accepted response: ${JSON.stringify(lastObserved)}`,
         );
       };
       const reconcileKnowledgeBase = async (taskId?: string) => {
@@ -1166,7 +1505,10 @@ mysqlDescribe(
       expect(
         initialNodes.slice(1).every((node) => node.status === "pending"),
       ).toBe(true);
-      expect(logoDownloads).toBe(1);
+      // v4 intentionally reads the Logo once as the returned image descriptor
+      // and once more from the declared official-web source to prove that the
+      // provenance URL resolves to the exact same bytes.
+      expect(logoDownloads).toBe(2);
 
       const startTurn = (
         await executor
@@ -1177,6 +1519,16 @@ mysqlDescribe(
           )
           .limit(1)
       )[0];
+      expect(startTurn).toMatchObject({
+        status: "completed",
+        upstreamTaskId: initial.task.id,
+        attachmentFileIds: expect.arrayContaining([
+          expect.stringMatching(/^uploaded-skill-/u),
+          expect.stringMatching(/^uploaded-instructions-/u),
+        ]),
+        metadata: expect.objectContaining({ attachmentsFrozen: true }),
+      });
+      expect(startTurn.attachmentFileIds).toHaveLength(2);
       const startPostCount = operationTaskPosts.get(startTurn.operationKey!);
       const uploadCountAfterStart = uploadedFileSequence;
       const repeatedStart = await postKnowledgeBase("/start", startRequest);
@@ -1213,9 +1565,17 @@ mysqlDescribe(
           expectedLeafId: leaf.id,
           status: "completed",
           upstreamTaskId: result.task.id,
+          attachmentFileIds: expect.arrayContaining([
+            expect.stringMatching(/^uploaded-skill-/u),
+            expect.stringMatching(
+              isFinal ? /^uploaded-finalization-/u : /^uploaded-instructions-/u,
+            ),
+          ]),
+          metadata: expect.objectContaining({ attachmentsFrozen: true }),
           completedAt: expect.any(Date),
           leaseExpiresAt: null,
         });
+        expect(turn.attachmentFileIds).toHaveLength(2);
         if (isFinal) finalTurnOperationKey = turn.operationKey;
         if (isFinal) {
           expect(result.observation).toMatchObject({
@@ -1305,14 +1665,37 @@ mysqlDescribe(
       });
       expect(authoritativeTaskReads).toBe(readsBeforeImmutableReconcile);
 
-      expect(logoDownloads).toBe(1);
+      expect(logoDownloads).toBe(2);
       expect(packageDownloads).toBe(1);
-      // The helper above replays an accepted 202 until the durable local
-      // projection settles. Focus/online reconcile wakes after that point must
-      // remain local immutable reads, not redundant provider GETs.
+      // Every operation projects the provider's create-task response directly.
+      // Later focus/online reconcile calls are immutable local reads.
       expect(authoritativeTaskReads).toBe(0);
-      expect(uploadedFileSequence).toBe(1);
-      expect(uploadedFileBytes.size).toBe(1);
+      // The Skill is build-scoped and reused once. Every operation gets one
+      // operation-bound server input file; the last uses finalization ZIP.
+      expect(uploadedFileSequence).toBe(FINAL_REVISION + 2);
+      expect(uploadedFileBytes.size).toBe(FINAL_REVISION + 2);
+      expect(
+        [...uploadedFileNames.values()].filter(
+          (filename) => filename === "socratic-kb-builder.skill.zip",
+        ),
+      ).toHaveLength(1);
+      expect(
+        [...uploadedFileNames.values()].filter(
+          (filename) => filename === KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
+        ),
+      ).toHaveLength(FINAL_REVISION);
+      expect(
+        [...uploadedFileNames.values()].filter((filename) =>
+          FINALIZATION_INPUT_FILENAME_PATTERN.test(filename),
+        ),
+      ).toHaveLength(1);
+      expect(
+        new Set(
+          (await executor.select().from(conversationTurns))
+            .flatMap((turn) => turn.attachmentFileIds || [])
+            .filter((fileId) => /^uploaded-skill-/u.test(fileId)),
+        ),
+      ).toEqual(new Set(["uploaded-skill-1"]));
       expect(operationTaskPosts.size).toBe(FINAL_REVISION + 1);
       expect([...operationTaskPosts.values()]).toEqual(
         Array(FINAL_REVISION + 1).fill(1),
@@ -1326,8 +1709,12 @@ mysqlDescribe(
          WHERE userId = ?`,
         [userId],
       );
-      expect(Number(resourceLedgerRows[0]?.resourceCount || 0)).toBe(1);
-      expect(Number(resourceLedgerRows[0]?.fileResourceCount || 0)).toBe(1);
+      expect(Number(resourceLedgerRows[0]?.resourceCount || 0)).toBe(
+        FINAL_REVISION + 2,
+      );
+      expect(Number(resourceLedgerRows[0]?.fileResourceCount || 0)).toBe(
+        FINAL_REVISION + 2,
+      );
       expect(Number(resourceLedgerRows[0]?.credentialCount || 0)).toBe(1);
 
       const finalBuild = (
@@ -1524,7 +1911,7 @@ mysqlDescribe(
         randomUUID(),
         {
           validationProfile: "dashboard-enterprise-v1",
-          archiveContractVersions: [3],
+          archiveContractVersions: [4],
         },
       );
       const unpackedLeaves = unpacked.documents
@@ -1580,5 +1967,261 @@ mysqlDescribe(
       });
       acceptancePassed = true;
     }, 300_000);
+
+    it("lets only the newest receipt claimant commit and confines loser cleanup to its own files", async () => {
+      const harness = await createKnowledgeImportHarness("claim-takeover");
+      try {
+        const { importWebsiteKnowledgeArtifact } = await import(
+          "../server/knowledge-import-service"
+        );
+        const { isKnowledgeSnapshotArchiveAvailable } = await import(
+          "../server/knowledge-snapshot-archive-store"
+        );
+        const firstClaimStaged = deferred();
+        const releaseFirstClaim = deferred();
+        let createAttempts = 0;
+        let losingSnapshotId = "";
+        let winningSnapshotId = "";
+        dependencies.createKnowledgeSnapshotHook = async (actual, input) => {
+          createAttempts += 1;
+          if (createAttempts === 1) {
+            losingSnapshotId = input.snapshotId;
+            firstClaimStaged.resolve();
+            await releaseFirstClaim.promise;
+          } else {
+            winningSnapshotId = input.snapshotId;
+          }
+          return actual(input);
+        };
+
+        const firstWorker = importWebsiteKnowledgeArtifact(harness.request);
+        void firstWorker.catch((error) => firstClaimStaged.reject(error));
+        await firstClaimStaged.promise;
+        await pool.execute(
+          `UPDATE knowledge_import_receipts
+              SET updatedAt = '2000-01-01 00:00:00'
+            WHERE idempotencyKeyHash = ?`,
+          [sha256(harness.request.idempotencyKey)],
+        );
+
+        const secondWorker = await importWebsiteKnowledgeArtifact({
+          ...harness.request,
+          now: new Date(),
+        });
+        releaseFirstClaim.resolve();
+        const firstWorkerReplay = await firstWorker;
+
+        expect(createAttempts).toBe(2);
+        expect(losingSnapshotId).not.toBe(winningSnapshotId);
+        expect(secondWorker).toMatchObject({
+          replayed: false,
+          snapshot: { id: winningSnapshotId },
+        });
+        expect(firstWorkerReplay).toMatchObject({
+          replayed: true,
+          snapshot: { id: winningSnapshotId },
+        });
+        const receipt = (
+          await executor
+            .select()
+            .from(knowledgeImportReceipts)
+            .where(
+              eq(
+                knowledgeImportReceipts.idempotencyKeyHash,
+                sha256(harness.request.idempotencyKey),
+              ),
+            )
+            .limit(1)
+        )[0];
+        expect(receipt).toMatchObject({
+          status: "completed",
+          revision: 2,
+          snapshotId: winningSnapshotId,
+        });
+        const [snapshotRows] = await pool.query<RowDataPacket[]>(
+          "SELECT id FROM knowledge_base_snapshots WHERE id IN (?, ?)",
+          [losingSnapshotId, winningSnapshotId],
+        );
+        expect(snapshotRows.map((row) => row.id)).toEqual([winningSnapshotId]);
+        await expect(
+          isKnowledgeSnapshotArchiveAvailable({
+            userId: userId!,
+            snapshotId: winningSnapshotId,
+          }),
+        ).resolves.toBe(true);
+        await expect(
+          isKnowledgeSnapshotArchiveAvailable({
+            userId: userId!,
+            snapshotId: losingSnapshotId,
+          }),
+        ).resolves.toBe(false);
+        await expect(
+          access(
+            path.join(assetRoot, stagedImportAssets.get(winningSnapshotId)!),
+          ),
+        ).resolves.toBeUndefined();
+        await expect(
+          access(
+            path.join(assetRoot, stagedImportAssets.get(losingSnapshotId)!),
+          ),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await harness.close();
+      }
+    }, 120_000);
+
+    it("retries safely after an archive write followed by a pre-commit failure", async () => {
+      const harness = await createKnowledgeImportHarness("precommit-retry");
+      try {
+        const { importWebsiteKnowledgeArtifact } = await import(
+          "../server/knowledge-import-service"
+        );
+        const { isKnowledgeSnapshotArchiveAvailable } = await import(
+          "../server/knowledge-snapshot-archive-store"
+        );
+        let failedSnapshotId = "";
+        dependencies.createKnowledgeSnapshotHook = async (_actual, input) => {
+          failedSnapshotId = input.snapshotId;
+          throw new Error("MYSQL_E2E_PRECOMMIT_FAULT");
+        };
+
+        await expect(
+          importWebsiteKnowledgeArtifact(harness.request),
+        ).rejects.toThrow("MYSQL_E2E_PRECOMMIT_FAULT");
+        expect(failedSnapshotId).not.toBe("");
+        await expect(
+          isKnowledgeSnapshotArchiveAvailable({
+            userId: userId!,
+            snapshotId: failedSnapshotId,
+          }),
+        ).resolves.toBe(false);
+        await expect(
+          access(
+            path.join(assetRoot, stagedImportAssets.get(failedSnapshotId)!),
+          ),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+
+        dependencies.createKnowledgeSnapshotHook = undefined;
+        const retried = await importWebsiteKnowledgeArtifact(harness.request);
+        expect(retried).toMatchObject({
+          replayed: false,
+          snapshot: { id: expect.any(String) },
+        });
+        expect(retried.snapshot.id).not.toBe(failedSnapshotId);
+        const receipt = (
+          await executor
+            .select()
+            .from(knowledgeImportReceipts)
+            .where(
+              eq(
+                knowledgeImportReceipts.idempotencyKeyHash,
+                sha256(harness.request.idempotencyKey),
+              ),
+            )
+            .limit(1)
+        )[0];
+        expect(receipt).toMatchObject({
+          status: "completed",
+          revision: 2,
+          snapshotId: retried.snapshot.id,
+        });
+      } finally {
+        await harness.close();
+      }
+    }, 120_000);
+
+    it("replays the exact receipt snapshot after commit succeeds but its response is lost", async () => {
+      const harness = await createKnowledgeImportHarness("postcommit-replay");
+      try {
+        const { importWebsiteKnowledgeArtifact } = await import(
+          "../server/knowledge-import-service"
+        );
+        let committedSnapshotId = "";
+        let loseResponse = true;
+        dependencies.createKnowledgeSnapshotHook = async (actual, input) => {
+          const snapshot = await actual(input);
+          committedSnapshotId = snapshot.id;
+          if (loseResponse) {
+            loseResponse = false;
+            throw new Error("MYSQL_E2E_POSTCOMMIT_RESPONSE_LOST");
+          }
+          return snapshot;
+        };
+
+        const recovered = await importWebsiteKnowledgeArtifact(harness.request);
+        expect(recovered).toMatchObject({
+          replayed: true,
+          snapshot: { id: committedSnapshotId },
+        });
+        dependencies.createKnowledgeSnapshotHook = undefined;
+        const replayed = await importWebsiteKnowledgeArtifact(harness.request);
+        expect(replayed).toMatchObject({
+          replayed: true,
+          snapshot: { id: committedSnapshotId },
+        });
+        const [rows] = await pool.query<RowDataPacket[]>(
+          "SELECT id FROM knowledge_base_snapshots WHERE id = ?",
+          [committedSnapshotId],
+        );
+        expect(rows).toHaveLength(1);
+        const receipt = (
+          await executor
+            .select()
+            .from(knowledgeImportReceipts)
+            .where(
+              eq(
+                knowledgeImportReceipts.idempotencyKeyHash,
+                sha256(harness.request.idempotencyKey),
+              ),
+            )
+            .limit(1)
+        )[0];
+        expect(receipt).toMatchObject({
+          status: "completed",
+          snapshotId: committedSnapshotId,
+        });
+      } finally {
+        await harness.close();
+      }
+    }, 120_000);
+
+    it("returns each caller's explicit snapshot ID under concurrent creation", async () => {
+      const { createKnowledgeSnapshot } = await import(
+        "../server/dashboard-service"
+      );
+      const leftId = randomUUID();
+      const rightId = randomUUID();
+      const create = (snapshotId: string, marker: string) =>
+        createKnowledgeSnapshot({
+          snapshotId,
+          userId: userId!,
+          actorUserId: userId!,
+          sourceFileName: `${marker}.zip`,
+          documents: [
+            {
+              id: marker,
+              path: `${marker}.md`,
+              title: marker,
+              content: marker,
+              kind: "other" as const,
+              customerVisible: true,
+            },
+          ],
+          assets: [],
+          totalBytes: marker.length,
+        });
+
+      const [left, right] = await Promise.all([
+        create(leftId, "left-concurrent-snapshot"),
+        create(rightId, "right-concurrent-snapshot"),
+      ]);
+      expect(left.id).toBe(leftId);
+      expect(right.id).toBe(rightId);
+      const [rows] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM knowledge_base_snapshots WHERE id IN (?, ?) ORDER BY id",
+        [leftId, rightId],
+      );
+      expect(rows.map((row) => row.id)).toEqual([leftId, rightId].sort());
+    }, 120_000);
   },
 );

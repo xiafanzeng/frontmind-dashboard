@@ -1002,7 +1002,9 @@ export const serviceContracts = mysqlTable(
 );
 
 /**
- * Immutable quota snapshots generated from the purchased plan terms.
+ * Period-bound quota snapshots generated from the purchased plan terms.
+ * Controlled administrator/engineer overrides are revisioned and audited;
+ * later contract revisions never rewrite historical periods.
  * Luxury contracts receive three monthly periods for one quarterly prepay;
  * advanced and basic contracts receive one period for their complete term.
  */

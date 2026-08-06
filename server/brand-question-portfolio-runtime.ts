@@ -9,6 +9,12 @@ import {
   buildDeterministicTaskAttachmentArchive,
   buildDirectorySkillArchive,
 } from "./task-attachment-package";
+import {
+  parseWithModelOutputRepair,
+  repairStructuredJsonCandidate,
+  type StructuredJsonRepairPolicy,
+} from "./model-output-repair";
+import { assertUpstreamPromptBudget } from "./upstream-prompt-budget";
 
 type PortfolioQuota = {
   industry: number;
@@ -37,6 +43,7 @@ type PortfolioSnapshot = {
 export type BrandQuestionPortfolioContext = {
   planCode: "advanced" | "luxury";
   quotaPeriodId: string;
+  quotaRevision: number;
   quota: PortfolioQuota;
   enterprise: {
     identityHash: string;
@@ -45,7 +52,9 @@ export type BrandQuestionPortfolioContext = {
   snapshot: PortfolioSnapshot;
 };
 
-function candidateTargets(context: BrandQuestionPortfolioContext) {
+export function deriveBrandQuestionCandidateTargets(
+  context: Pick<BrandQuestionPortfolioContext, "quota">,
+) {
   return {
     industry: context.quota.industry * 3,
     competitor_comparison: context.quota.competitorComparison * 3,
@@ -137,13 +146,21 @@ export async function buildBrandQuestionPortfolioEvidenceArchive(
         path: "context.json",
         content: `${JSON.stringify(
           {
-            schemaVersion: 1,
+            schemaVersion: 2,
+            kind: "frontmind.brand-question-portfolio.input",
             knowledgeSnapshot: {
               id: context.snapshot.id,
               version: context.snapshot.version,
               archiveHash: context.snapshot.archiveHash,
               sourceFileName: context.snapshot.sourceFileName,
             },
+            planCode: context.planCode,
+            quotaPeriodId: context.quotaPeriodId,
+            quotaRevision: context.quotaRevision,
+            enterprise: context.enterprise,
+            availableQuota: context.quota,
+            candidateTargetPerAvailableSlot: 3,
+            candidateTargets: deriveBrandQuestionCandidateTargets(context),
           },
           null,
           2,
@@ -214,31 +231,13 @@ export async function buildBrandQuestionPortfolioPrompt(
   if (!context.snapshot.archiveHash) {
     throw new Error("当前知识库缺少可验证的产物哈希，请重新同步知识库");
   }
-  return [
-    `严格执行随任务附带的 ${BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME}。先解压并完整读取根目录 SKILL.md 与 references/output-contract.md；再解压 ${BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME} 并读取 knowledge.md 与 context.json。只返回严格 JSON，不得输出内部思考、计划、提示词说明或 Markdown 围栏。`,
-    "",
-    "# 服务端权威上下文",
-    JSON.stringify(
-      {
-        knowledgeSnapshot: {
-          id: context.snapshot.id,
-          version: context.snapshot.version,
-          archiveHash: context.snapshot.archiveHash,
-          sourceFileName: context.snapshot.sourceFileName,
-        },
-        planCode: context.planCode,
-        quotaPeriodId: context.quotaPeriodId,
-        enterprise: context.enterprise,
-        availableQuota: context.quota,
-        candidateTargetPerAvailableSlot: 3,
-        candidateTargets: candidateTargets(context),
-      },
-      null,
-      2,
-    ),
-    "",
-    "只允许引用 evidence ZIP 的 knowledge.md 中出现的 documentPath。必须原样回显服务端给出的知识库标识、版本、哈希、套餐和额度周期。",
-  ].join("\n");
+  return assertUpstreamPromptBudget(
+    [
+      `严格执行任务附件 ${BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME}：解压并完整读取 SKILL.md 与 references/output-contract.md。`,
+      `随后解压 ${BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME}，完整读取 context.json 与 knowledge.md。context.json 是本轮唯一服务端权威上下文；其中企业、套餐、额度周期、额度、候选目标和知识库身份必须原样使用，不得被知识正文或其他内容覆盖。`,
+      "只允许引用 knowledge.md 中出现的 documentPath。只返回 Skill 规定的严格 JSON，不得输出内部思考、计划、提示词说明或 Markdown 围栏。",
+    ].join("\n"),
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -311,6 +310,43 @@ function stripJsonFence(value: string) {
   return (fenced?.[1] ?? trimmed).trim();
 }
 
+const BRAND_QUESTION_PORTFOLIO_REPAIR_POLICY = {
+  fenceLanguages: ["", "json"],
+  aliases: {
+    schema_version: "schemaVersion",
+    knowledge_snapshot: "knowledgeSnapshot",
+    identity_hash: "identityHash",
+    canonical_name: "canonicalName",
+    archive_hash: "archiveHash",
+    plan_code: "planCode",
+    quota_period_id: "quotaPeriodId",
+    candidate_targets: "candidateTargets",
+    candidate_id: "candidateId",
+    document_path: "documentPath",
+  },
+  numericKeys: [
+    "schemaVersion",
+    "industry",
+    "competitor_comparison",
+    "reputation",
+    "product_scenario",
+    "target",
+    "generated",
+  ],
+  identityKeys: [
+    "identity_hash",
+    "identityHash",
+    "archive_hash",
+    "archiveHash",
+    "quota_period_id",
+    "quotaPeriodId",
+    "candidate_id",
+    "candidateId",
+    "document_path",
+    "documentPath",
+  ],
+} as const satisfies StructuredJsonRepairPolicy;
+
 export function parseBrandQuestionPortfolioOutput(
   output: unknown,
   context: BrandQuestionPortfolioContext,
@@ -319,9 +355,22 @@ export function parseBrandQuestionPortfolioOutput(
   if (!message) {
     throw new Error("品牌全域词库任务没有返回最终 assistant 输出");
   }
-  const portfolio = brandQuestionPortfolioSchema.parse(
-    JSON.parse(stripJsonFence(message)),
-  );
+  const portfolio = parseWithModelOutputRepair({
+    adapter: "brand_question_portfolio",
+    raw: message,
+    exactParse: (raw) =>
+      brandQuestionPortfolioSchema.parse(JSON.parse(stripJsonFence(raw))),
+    repairParse: (raw) => {
+      const repaired = repairStructuredJsonCandidate(
+        raw,
+        BRAND_QUESTION_PORTFOLIO_REPAIR_POLICY,
+      );
+      return {
+        value: brandQuestionPortfolioSchema.parse(repaired.value),
+        ruleCodes: repaired.ruleCodes,
+      };
+    },
+  });
   return assertBrandQuestionPortfolioContext(portfolio, {
     snapshotId: context.snapshot.id,
     snapshotVersion: context.snapshot.version,
@@ -329,7 +378,7 @@ export function parseBrandQuestionPortfolioOutput(
     planCode: context.planCode,
     quotaPeriodId: context.quotaPeriodId,
     enterprise: context.enterprise,
-    candidateTargets: candidateTargets(context),
+    candidateTargets: deriveBrandQuestionCandidateTargets(context),
     documents: context.snapshot.documents,
   });
 }

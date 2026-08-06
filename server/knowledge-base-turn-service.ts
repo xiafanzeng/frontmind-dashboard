@@ -29,7 +29,9 @@ import { getDb } from "./db";
 
 /** Longer than every configured 120s upstream create/upload timeout. */
 const DEFAULT_LEASE_MS = 300_000;
-const MAX_ATTACHMENT_COUNT = 100;
+// 99 customer uploads plus Skill, instructions and optional prefill input.
+const MAX_ATTACHMENT_COUNT = 102;
+const MAX_USER_ATTACHMENT_COUNT = 99;
 const MAX_ATTACHMENT_ID_LENGTH = 512;
 const MAX_RECOVERY_METADATA_DEPTH = 20;
 const SECRET_KEY_PATTERN =
@@ -63,7 +65,11 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   >;
 };
 
-export type KnowledgeBaseGeneratedAttachmentRole = "skill" | "prefill";
+export type KnowledgeBaseGeneratedAttachmentRole =
+  | "skill"
+  | "prefill"
+  | "instructions"
+  | "finalization";
 
 export interface KnowledgeBaseGeneratedAttachmentReservation {
   schemaVersion: 1;
@@ -276,6 +282,8 @@ export interface ReserveKnowledgeBaseRetryTurnInput {
   expectedGeneration: number;
   expectedRevision: number;
   expectedLeafId: string | null;
+  /** Exact logical hash of the currently packaged v4 Skill. */
+  latestV4SkillContentHash?: string;
   now?: Date;
   leaseMs?: number;
 }
@@ -519,7 +527,12 @@ function normalizeGeneratedAttachmentInput(input: {
   sizeBytes: number;
   contentSha256: string;
 }) {
-  if (input.role !== "skill" && input.role !== "prefill") {
+  if (
+    input.role !== "skill" &&
+    input.role !== "prefill" &&
+    input.role !== "instructions" &&
+    input.role !== "finalization"
+  ) {
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
       "Generated attachment role is invalid",
@@ -686,9 +699,22 @@ export function inspectKnowledgeBaseRetryAuthority(
     ) {
       return null;
     }
+    const finalDeliverySkillUpgrade =
+      recovery.kind === "turn" &&
+      recovery.finalPackageRequired === true &&
+      knowledgeBaseRetryRequiresFreshFinalDelivery({
+        ...build,
+        operationType,
+        finalPackageRequired: recovery.finalPackageRequired === true,
+      }) &&
+      recovery.skillVersion === "4" &&
+      typeof recovery.skillContentHash === "string" &&
+      /^[a-f0-9]{64}$/u.test(recovery.skillContentHash);
     if (
       recovery.skillVersion !== build.skillVersion ||
-      (recovery.skillContentHash ?? null) !== (build.skillContentHash ?? null)
+      (!finalDeliverySkillUpgrade &&
+        (recovery.skillContentHash ?? null) !==
+          (build.skillContentHash ?? null))
     ) {
       return null;
     }
@@ -1241,6 +1267,12 @@ async function reserveKnowledgeBaseTurnInTransaction(
   const userAttachmentCount =
     input.userAttachmentCount ?? expectedAttachmentCount;
   assertInteger(userAttachmentCount, "userAttachmentCount", 0);
+  if (userAttachmentCount > MAX_USER_ATTACHMENT_COUNT) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      `Too many customer attachments (maximum ${MAX_USER_ATTACHMENT_COUNT})`,
+    );
+  }
   if (userAttachmentCount > expectedAttachmentCount) {
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
@@ -2183,6 +2215,29 @@ function assertRetrySource(
   return authority;
 }
 
+export function knowledgeBaseRetryRequiresFreshFinalDelivery(input: {
+  skillVersion: string;
+  currentLeafId: string | null;
+  totalNodeCount: number;
+  confirmedCount: number;
+  directPrefilledCount: number;
+  operationType: KnowledgeBaseOperationType;
+  finalPackageRequired?: boolean;
+}) {
+  const retriesFinalAction =
+    input.operationType === "confirm" ||
+    input.operationType === "direct_prefill" ||
+    (input.operationType === "retry" && input.finalPackageRequired === true);
+  return Boolean(
+    input.skillVersion === "4" &&
+      input.currentLeafId &&
+      input.totalNodeCount > 0 &&
+      retriesFinalAction &&
+      input.confirmedCount + input.directPrefilledCount + 1 ===
+        input.totalNodeCount,
+  );
+}
+
 /**
  * Atomically replaces one failed active turn with a new retry operation. The
  * previous task id is intentionally never copied; only frozen file ids,
@@ -2206,6 +2261,18 @@ export async function reserveKnowledgeBaseRetryTurn(
     128,
   );
   const expectedLeafId = normalizeOptionalLeafId(input.expectedLeafId);
+  const latestV4SkillContentHash = String(input.latestV4SkillContentHash || "")
+    .trim()
+    .toLowerCase();
+  if (
+    latestV4SkillContentHash &&
+    !/^[a-f0-9]{64}$/u.test(latestV4SkillContentHash)
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Current v4 Skill hash is invalid",
+    );
+  }
   const db = executor ?? (await requireDb());
   return db.transaction(async (tx: any) => {
     // Discover the candidate historical credential without taking row locks,
@@ -2320,14 +2387,50 @@ export async function reserveKnowledgeBaseRetryTurn(
         "Knowledge-base retry authority changed while acquiring its credential lock",
       );
     }
+    const refreshFinalDelivery = knowledgeBaseRetryRequiresFreshFinalDelivery({
+      ...build,
+      operationType: source.operationType as KnowledgeBaseOperationType,
+      finalPackageRequired: sourceState.recovery.finalPackageRequired === true,
+    });
+    if (refreshFinalDelivery && !latestV4SkillContentHash) {
+      throw new KnowledgeBaseTurnReservationError(
+        "INVALID_REQUEST",
+        "Current v4 Skill hash is required for final-delivery retry",
+      );
+    }
+    const sourceUserAttachmentCount = Array.isArray(
+      sourceState.recovery.attachments,
+    )
+      ? sourceState.recovery.attachments.length
+      : 0;
+    const retryGeneratedAttachmentCount = refreshFinalDelivery
+      ? 2
+      : sourceState.recovery.kind === "start"
+        ? 2 + (sourceState.recovery.includePrefill === true ? 1 : 0)
+        : 2;
     const recoveryMetadata = {
       ...sourceState.recovery,
+      ...(refreshFinalDelivery
+        ? {
+            // A failed final delivery must pick up the current complete v4
+            // contract and a fresh server-owned finalization input bundle.
+            // Reusing the historical Skill/output attachment list would
+            // deterministically reproduce the same malformed ZIP.
+            skillContentHash: latestV4SkillContentHash,
+            finalPackageRequired: true,
+          }
+        : {}),
+      deferredClientAttachments: false,
+      instructionsAttachmentRequired: !refreshFinalDelivery,
       retryOfTurnId: source.id,
       originalOperationKey: source.operationKey,
       originalRequestHash: source.requestHash,
       retryBaseUrl: sourceState.preparedDispatch.baseUrl,
       retryAgentProfile: sourceState.preparedDispatch.requestBody.agentProfile,
-      retryAttachments: sourceState.preparedDispatch.requestBody.attachments,
+      // Every retry receives freshly generated, operation-bound system input.
+      // Historical prepared attachments may contain an oversized inline prompt
+      // and must never be replayed under the new operation id.
+      retryAttachments: [],
       retryParentTaskId:
         sourceState.preparedDispatch.requestBody.taskId || null,
     };
@@ -2349,11 +2452,10 @@ export async function reserveKnowledgeBaseRetryTurn(
           sourceState.recovery.kind === "turn"
             ? String(sourceState.recovery.userMessage || "")
             : "开始构建企业知识库",
-        expectedAttachmentCount: source.attachmentFileIds.length,
-        userAttachmentCount: Array.isArray(sourceState.recovery.attachments)
-          ? sourceState.recovery.attachments.length
-          : 0,
-        attachmentFileIds: source.attachmentFileIds,
+        expectedAttachmentCount:
+          sourceUserAttachmentCount + retryGeneratedAttachmentCount,
+        userAttachmentCount: sourceUserAttachmentCount,
+        attachmentFileIds: undefined,
         recoveryMetadata,
         replacesTurnId: source.id,
         now: input.now,
@@ -2404,10 +2506,10 @@ async function lockedOwnedTurn(
 function normalizeDeferredUserAttachments(
   values: ReadonlyArray<{ file_id: string; filename: string }>,
 ) {
-  if (values.length > MAX_ATTACHMENT_COUNT) {
+  if (values.length > MAX_USER_ATTACHMENT_COUNT) {
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
-      `Too many customer attachments (maximum ${MAX_ATTACHMENT_COUNT})`,
+      `Too many customer attachments (maximum ${MAX_USER_ATTACHMENT_COUNT})`,
     );
   }
   const normalized = values.map((value) => ({
@@ -2946,7 +3048,12 @@ export async function completeKnowledgeBaseGeneratedAttachment(
   },
   executor?: any,
 ) {
-  if (input.role !== "skill" && input.role !== "prefill") {
+  if (
+    input.role !== "skill" &&
+    input.role !== "prefill" &&
+    input.role !== "instructions" &&
+    input.role !== "finalization"
+  ) {
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
       "Generated attachment role is invalid",

@@ -47,6 +47,11 @@ import AiWebsiteManagementWorkspace from "./AiWebsiteManagementWorkspace";
 import { trpc } from "@/lib/trpc";
 import { uploadFile } from "@/lib/frontmind-api";
 import {
+  KEYWORD_CATEGORY_OPTIONS,
+  keywordCategoryKey,
+  keywordCategoryLabel,
+} from "@shared/keyword-categories";
+import {
   getCapability,
   getPreviewPlanCode,
   getRouteCapability,
@@ -100,7 +105,7 @@ const geoIntentMeta = {
   ranking: {
     label: "行业排名",
     short: "行业排名",
-    desc: "围绕行业词与品牌优胜，监测出现率、答案位次、权威引用与品类入口覆盖。",
+    desc: "围绕行业排名词与品牌优胜，监测出现率、答案位次、权威引用与品类入口覆盖。",
     tone: "gold",
   },
 };
@@ -460,7 +465,7 @@ function buildServiceQuestionGroups(purchasedQuestions, managedGroups) {
     },
     industry: {
       id: "ranking",
-      title: "行业词",
+      title: "行业排名词",
       subtitle: "行业入口与品牌优胜问题",
       tone: "amber",
     },
@@ -2179,7 +2184,8 @@ function BrandKnowledgeSystem({ data }) {
 function previewQuestionCategory(item) {
   const category = String(item["核心词分类"] || "");
   const scene = String(item["GEO场景"] || "");
-  if (category.includes("品类") || category.includes("行业")) return "industry";
+  const mapped = keywordCategoryKey(category);
+  if (mapped) return mapped;
   if (category.includes("竞品") || scene.includes("竞品"))
     return "competitor_comparison";
   if (category.includes("场景") || scene.includes("场景"))
@@ -2188,14 +2194,16 @@ function previewQuestionCategory(item) {
 }
 
 function BrandGlobalKeywords({ onUseQuestion, bank }) {
-  const [category, setCategory] = useState("全部");
+  const [category, setCategory] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
   const [sortBy, setSortBy] = useState("热度");
   const [priorityFilter, setPriorityFilter] = useState("全部");
   const filteredQuestions = useMemo(() => {
     let items = bank.questions;
-    if (category !== "全部")
-      items = items.filter((item) => item["核心词分类"] === category);
+    if (category !== "all")
+      items = items.filter(
+        (item) => keywordCategoryKey(item["核心词分类"]) === category,
+      );
     if (priorityFilter !== "全部")
       items = items.filter((item) => item["优先级"] === priorityFilter);
     if (searchTerm)
@@ -2210,10 +2218,6 @@ function BrandGlobalKeywords({ onUseQuestion, bank }) {
   }, [bank.questions, category, searchTerm, sortBy, priorityFilter]);
 
   const topRows = filteredQuestions.slice(0, 160);
-  const categoryOptions = [
-    "全部",
-    ...bank.categories.map((item) => item["核心词分类"]),
-  ];
   const priorityOptions = ["全部", "高热必答", "重点覆盖", "口径治理"];
 
   return (
@@ -2247,9 +2251,10 @@ function BrandGlobalKeywords({ onUseQuestion, bank }) {
               value={category}
               onChange={(e) => setCategory(e.target.value)}
             >
-              {categoryOptions.map((opt) => (
-                <option key={opt} value={opt}>
-                  {opt}
+              <option value="all">全部分类</option>
+              {KEYWORD_CATEGORY_OPTIONS.map((option) => (
+                <option key={option.key} value={option.key}>
+                  {option.label}
                 </option>
               ))}
             </select>
@@ -2309,7 +2314,8 @@ function BrandGlobalKeywords({ onUseQuestion, bank }) {
                   <td>{safeText(item["核心词"])}</td>
                   <td>
                     <span className="keyword-pill">
-                      {safeText(item["核心词分类"])}
+                      {keywordCategoryLabel(item["核心词分类"]) ||
+                        safeText(item["核心词分类"])}
                     </span>
                   </td>
                   <td>{safeText(item["GEO场景"])}</td>
@@ -2352,7 +2358,7 @@ function BrandGlobalKeywords({ onUseQuestion, bank }) {
 
 // ==================== INTENT SECTION ====================
 const questionCategoryOptions = [
-  { value: "industry", label: "行业词", quotaKey: "industry" },
+  { value: "industry", label: "行业排名词", quotaKey: "industry" },
   {
     value: "competitor_comparison",
     label: "竞品对比词",

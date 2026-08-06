@@ -29,6 +29,11 @@ import {
 import { getDb } from "./db";
 import { knowledgeBaseWritesAreEmergencyBlocked } from "./knowledge-base-runtime-guard";
 import {
+  optionalKnowledgeBaseUploadEvidenceStorageKey,
+  parseKnowledgeBaseUploadEvidenceStorageKey,
+  removeKnowledgeBaseUploadEvidenceIfOrphaned,
+} from "./knowledge-base-upload-evidence-lifecycle";
+import {
   assertDeliveryProjectContext,
   deliveryExecutionActorRole,
 } from "./delivery-role-service";
@@ -66,6 +71,7 @@ function persistedConversationId(userId: number, publicId: string) {
 type KnowledgeCounts = {
   builds: Array<{
     id: string;
+    generation: number;
     conversationId: string;
     upstreamTaskId: string | null;
     logoStorageKey: string | null;
@@ -99,6 +105,11 @@ export function knowledgeSnapshotCleanupStorageKeys(
         ...builds.flatMap((build) => [
           build.logoStorageKey,
           build.packageStorageKey,
+          optionalKnowledgeBaseUploadEvidenceStorageKey({
+            userId,
+            buildId: build.id,
+            generation: build.generation,
+          }),
         ]),
       ].filter((key): key is string => Boolean(key)),
     ),
@@ -128,6 +139,7 @@ async function getKnowledgeCounts(
     executor
       .select({
         id: knowledgeBaseBuilds.id,
+        generation: knowledgeBaseBuilds.generation,
         conversationId: knowledgeBaseBuilds.conversationId,
         upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
         logoStorageKey: knowledgeBaseBuilds.logoStorageKey,
@@ -946,17 +958,27 @@ export async function processKnowledgeResetCleanupJobs() {
   for (const job of jobs) {
     try {
       if (job.kind === "local_asset") {
-        const assetPath = path.resolve(
-          dashboardAssetRoot,
-          job.localAssetKey || job.upstreamId,
-        );
-        if (!assetPath.startsWith(`${dashboardAssetRoot}${path.sep}`)) {
-          throw new Error("知识库本地资源路径无效");
-        }
-        try {
-          await unlink(assetPath);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        const localAssetKey = job.localAssetKey || job.upstreamId;
+        if (parseKnowledgeBaseUploadEvidenceStorageKey(localAssetKey)) {
+          const removal = await removeKnowledgeBaseUploadEvidenceIfOrphaned({
+            storageKey: localAssetKey,
+            expectedUserId: job.userId,
+            db,
+            assetRoot: dashboardAssetRoot,
+          });
+          if (removal === "active") {
+            throw new Error("活跃知识库构建仍引用上传证据目录");
+          }
+        } else {
+          const assetPath = path.resolve(dashboardAssetRoot, localAssetKey);
+          if (!assetPath.startsWith(`${dashboardAssetRoot}${path.sep}`)) {
+            throw new Error("知识库本地资源路径无效");
+          }
+          try {
+            await unlink(assetPath);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
         }
       } else if (shouldDeleteKnowledgeResetUpstreamResource(job.kind)) {
         const credential = await getCredentialForUpstreamResource(

@@ -19,6 +19,7 @@ import {
   buildResponseLogicImportPreview,
   buildOptimizationReportImportPreview,
   dashboardFromCsv,
+  dashboardImportEnterpriseIdentityBinding,
   dashboardPayloadWithServiceQuestionCatalog,
   dashboardQuestionCatalogFromService,
   dashboardKnowledgePublishErrorForLog,
@@ -186,6 +187,88 @@ describe("dashboard enterprise identity", () => {
         createDefaultDashboardPayload("另一家企业"),
       ),
     ).toThrow(DashboardEnterpriseMismatchError);
+  });
+});
+
+describe("dashboard module enterprise identity migration", () => {
+  const matchingKnowledgeSnapshot = {
+    documents: [
+      {
+        path: "硅基流动知识库/README.md",
+        title: "知识库说明",
+        content: "# 硅基流动企业知识库",
+      },
+    ],
+  };
+
+  it("accepts a matching active knowledge snapshot and requests an atomic backfill", () => {
+    expect(
+      dashboardImportEnterpriseIdentityBinding({
+        module: "keywords",
+        enterpriseIdentityBoundAt: null,
+        brandName: "硅基流动",
+        knowledgeAuthenticatedForCurrentService: true,
+        knowledgeSnapshot: matchingKnowledgeSnapshot,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps rejecting an unbound workspace without matching knowledge proof", () => {
+    expect(() =>
+      dashboardImportEnterpriseIdentityBinding({
+        module: "keywords",
+        enterpriseIdentityBoundAt: null,
+        brandName: "硅基流动",
+        knowledgeAuthenticatedForCurrentService: false,
+        knowledgeSnapshot: null,
+      }),
+    ).toThrow("请先由管理员确认并发布当前账号的企业名称");
+
+    expect(() =>
+      dashboardImportEnterpriseIdentityBinding({
+        module: "keywords",
+        enterpriseIdentityBoundAt: null,
+        brandName: "另一家企业",
+        knowledgeAuthenticatedForCurrentService: true,
+        knowledgeSnapshot: matchingKnowledgeSnapshot,
+      }),
+    ).toThrow("另一家企业");
+  });
+
+  it("does not need a backfill once the workspace identity is bound", () => {
+    expect(
+      dashboardImportEnterpriseIdentityBinding({
+        module: "keywords",
+        enterpriseIdentityBoundAt: Date.parse("2026-07-01T00:00:00Z"),
+        brandName: "硅基流动",
+        knowledgeAuthenticatedForCurrentService: false,
+        knowledgeSnapshot: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not use the knowledge bootstrap for unrelated modules", () => {
+    expect(() =>
+      dashboardImportEnterpriseIdentityBinding({
+        module: "metrics",
+        enterpriseIdentityBoundAt: null,
+        brandName: "硅基流动",
+        knowledgeAuthenticatedForCurrentService: true,
+        knowledgeSnapshot: matchingKnowledgeSnapshot,
+      }),
+    ).toThrow("请先由管理员确认并发布当前账号的企业名称");
+  });
+
+  it("preserves the original profile import as the explicit binding path", () => {
+    expect(
+      dashboardImportEnterpriseIdentityBinding({
+        module: "profile",
+        enterpriseIdentityBoundAt: null,
+        brandName: "硅基流动",
+        knowledgeAuthenticatedForCurrentService: false,
+        knowledgeSnapshot: null,
+      }),
+    ).toBe(true);
   });
 });
 
@@ -438,7 +521,7 @@ describe("authoritative formal-question current-content template", () => {
       expect.objectContaining({
         id: "question-1",
         groupId: "ranking",
-        groupTitle: "行业词",
+        groupTitle: "行业排名词",
         tone: "amber",
         question: currentQuestions[0].question,
         intent: "核验行业位置",
@@ -1875,9 +1958,12 @@ describe("dashboard monitoring normalization", () => {
         questions: [question],
       },
       sourceFileName: "dashboard.json",
+      bindEnterpriseIdentity: true,
       dependencies: { updateWorkspace, replaceMonitoring },
     });
-    expect(updateWorkspace).toHaveBeenCalledOnce();
+    expect(updateWorkspace).toHaveBeenCalledWith(
+      expect.objectContaining({ bindEnterpriseIdentity: true }),
+    );
     expect(replaceMonitoring).not.toHaveBeenCalled();
   });
 

@@ -187,6 +187,7 @@ export type ServiceEntitlementErrorCode =
   | "QUESTION_CATEGORY_QUOTA_EXCEEDED"
   | "QUESTION_TOTAL_QUOTA_EXCEEDED"
   | "QUESTION_GENERATION_CONFLICT"
+  | "QUESTION_GENERATION_CONTEXT_STALE"
   | "UPGRADE_RECONCILIATION_REQUIRED"
   | "KNOWLEDGE_SNAPSHOT_NOT_FOUND"
   | "SERVICE_WORKFLOW_PREREQUISITE_REQUIRED";
@@ -477,7 +478,9 @@ export function partitionSelectedQuestionsForPortal(input: {
 }
 
 export function countSelectedQuestionUsage(
-  questions: ServicePortalStateInput["selectedQuestions"] = [],
+  questions: Array<
+    Pick<WorkspaceQuestion, "status" | "quotaPeriodId" | "category">
+  > = [],
   quotaPeriodId?: string,
 ): ServiceQuotaUsage {
   const usage: ServiceQuotaUsage = { ...EMPTY_SERVICE_QUOTA_USAGE };
@@ -2016,7 +2019,53 @@ export type ReplaceGeneratedQuestionCandidatesInput = {
   candidates: GeneratedQuestionCandidate[];
   sourceTaskId: string;
   knowledgeSnapshotId?: string | null;
+  expectedQuotaContext: {
+    revision: number;
+    remaining: {
+      industry: number;
+      competitorComparison: number;
+      reputation: number;
+      productScenario: number;
+    };
+  };
 };
+
+export function assertGeneratedQuestionQuotaContextCurrent(input: {
+  period: Pick<
+    ServicePortalQuotaPeriodRecord,
+    | "revision"
+    | "industryLimit"
+    | "competitorComparisonLimit"
+    | "reputationLimit"
+    | "productScenarioLimit"
+    | "totalQuestionLimit"
+  >;
+  selectedUsage: ServiceQuotaUsage;
+  expected: ReplaceGeneratedQuestionCandidatesInput["expectedQuotaContext"];
+}) {
+  const limits: ServiceQuotaLimits = {
+    industryLimit: input.period.industryLimit,
+    competitorComparisonLimit: input.period.competitorComparisonLimit,
+    reputationLimit: input.period.reputationLimit,
+    productScenarioLimit: input.period.productScenarioLimit,
+    totalQuestionLimit: input.period.totalQuestionLimit,
+  };
+  const remaining = remainingQuota(limits, input.selectedUsage);
+  if (
+    input.period.revision !== input.expected.revision ||
+    remaining.industry !== input.expected.remaining.industry ||
+    remaining.competitorComparison !==
+      input.expected.remaining.competitorComparison ||
+    remaining.reputation !== input.expected.remaining.reputation ||
+    remaining.productScenario !== input.expected.remaining.productScenario
+  ) {
+    throw new ServiceEntitlementError(
+      "QUESTION_GENERATION_CONTEXT_STALE",
+      "问题额度或可选问题数量已变化，请重新生成品牌全域候选词。",
+    );
+  }
+  return remaining;
+}
 
 function normalizeCandidateText(value: string, field: string, max: number) {
   const normalized = String(value ?? "")
@@ -2212,6 +2261,26 @@ export async function replaceGeneratedQuestionCandidates(
         404,
       );
     }
+    const selectedRows = await tx
+      .select({
+        quotaPeriodId: workspaceQuestions.quotaPeriodId,
+        category: workspaceQuestions.category,
+        status: workspaceQuestions.status,
+      })
+      .from(workspaceQuestions)
+      .where(
+        and(
+          eq(workspaceQuestions.userId, input.userId),
+          eq(workspaceQuestions.quotaPeriodId, input.quotaPeriodId),
+          eq(workspaceQuestions.status, "selected"),
+        ),
+      )
+      .for("update");
+    assertGeneratedQuestionQuotaContextCurrent({
+      period,
+      selectedUsage: countSelectedQuestionUsage(selectedRows, period.id),
+      expected: input.expectedQuotaContext,
+    });
     if (input.knowledgeSnapshotId) {
       const snapshots = await tx
         .select({ id: knowledgeBaseSnapshots.id })

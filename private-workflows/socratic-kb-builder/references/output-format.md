@@ -57,6 +57,14 @@ manifest. As an editorial practice, keep raw excerpts in non-customer evidence
 documents. The validator does not screen formal prose with a vocabulary or
 phrase blacklist.
 
+Business tables remain formal prose even when a body cell naturally contains
+phrases such as “不同来源模型”, “社区活力来源” or “收入来源”. Do not exclude those
+tables from `customerVisibleCharacters`. A table is a forbidden source
+inventory only when one of its header cells is explicitly a source/link field
+such as `来源`, `数据来源`, `证据链接`, `Source URL`, `References` or `URL`; keep
+that table outside the formal block. The bundled validator and Dashboard use
+this same header-based rule.
+
 ## `00_package_manifest.json`
 
 Use this exact top-level contract. Extra fields are forbidden:
@@ -383,6 +391,15 @@ use or target attainment.
   required Logo, and does not consume an inline node-image slot. Only AVIF, GIF,
   JPEG, PNG, or WebP is allowed for this exact-byte fallback; do not use SVG or
   another converted source.
+- On a Dashboard final-delivery turn, the Skill archive,
+  the uniquely named `frontmind-kb-finalization-input-<digest>.zip`, and every
+  file inside it are
+  server-owned system inputs, not customer uploads. For each final asset, copy
+  `FINALIZATION_INPUT.json.assets[].requiredManifest` field-for-field. Never
+  add, omit, infer, recover or substitute a provenance field. A
+  `sourceUpload*` field is legal only when that exact field and value are
+  present in the matching `requiredManifest`; task history and input filenames
+  cannot authorize one.
 - Generic customer-uploaded inline images are the sole non-Logo exception to
   the no-other-image rule. Each declares `sourceKind: user_upload`,
   `assetType: customer_supplied`,
@@ -470,7 +487,13 @@ completeness score, grade, percentage, or resource-consumption proxy.
 
 ## Final gate
 
-Run `python3 scripts/validate_archive.py FINAL.zip`. A non-zero exit forbids
-delivery. Fix structure, formal content, manifest relationships, image bytes,
-or budget violations with existing evidence and rerun. Never silence the
-validator or edit counts to match a false claim.
+For a Dashboard final-delivery turn, run
+the exact `python3 scripts/validate_archive.py FINAL.zip --finalization-input ...`
+command stated in the current turn prompt, including its required input
+SHA-256, operationId and turnId flags.
+The `--finalization-input` cross-check is mandatory and proves the exact nodes,
+asset bytes and server-authored `requiredManifest`; the standalone archive
+check alone is insufficient. A non-zero exit forbids delivery. Fix structure,
+formal content, manifest relationships, image bytes, provenance or budget
+violations with existing evidence and rerun. Never silence the validator or
+edit counts to match a false claim.

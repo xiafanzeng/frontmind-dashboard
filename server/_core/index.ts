@@ -43,6 +43,7 @@ import {
   enforceFrontMindProxyAccess,
 } from "./frontmind-proxy-policy";
 import { processKnowledgeResetCleanupJobs } from "../knowledge-base-reset-service";
+import { sweepOrphanedKnowledgeBaseUploadEvidence } from "../knowledge-base-upload-evidence-lifecycle";
 import { assertCredentialEncryptionConfigured } from "../auth-service";
 import { getDb } from "../db";
 import deliveryTicketAttachmentRouter from "../delivery-ticket-attachment-router";
@@ -62,7 +63,7 @@ import {
 import { startApiUsageSnapshotScheduler } from "../api-usage-snapshot-service";
 import {
   assertDedicatedMonitorCredentialConfigured,
-  isDedicatedMonitorCredentialConfigured,
+  getDedicatedMonitorCredentialReadiness,
   monitorBaseUrl,
 } from "../presales-monitor";
 import {
@@ -98,8 +99,12 @@ import {
   loadMigrationManifest,
   type MigrationManifest,
 } from "./migration-journal";
-import { validateProductionRuntimeEnvironment } from "../../scripts/validate-production-runtime.mjs";
 import { evaluateDatabaseSchema } from "../../scripts/schema-contract.mjs";
+import {
+  applicationReleaseChannel,
+  applyReleaseChannelHeaders,
+  validateReleaseRuntimeEnvironment,
+} from "./release-channel-adapter";
 
 declare const __FRONTMIND_BUILD_SHA__: string | undefined;
 
@@ -172,10 +177,7 @@ async function evaluateReleaseReadiness(
 async function startServer() {
   let migrationManifest: MigrationManifest | null = null;
   if (process.env.NODE_ENV === "production") {
-    const runtimeIdentity = validateProductionRuntimeEnvironment(process.env);
-    if (runtimeIdentity.buildSourceSha !== applicationBuildSha) {
-      throw new Error("FRONTMIND_RUNTIME_BUILD_SOURCE_SHA_MISMATCH");
-    }
+    validateReleaseRuntimeEnvironment(process.env, applicationBuildSha);
     migrationManifest = await loadMigrationManifest(
       process.env.FRONTMIND_MIGRATION_MANIFEST_PATH ||
         bundledMigrationManifestPath(runtimeBuildRoot),
@@ -228,6 +230,7 @@ async function startServer() {
       "Content-Security-Policy",
       "object-src 'none'; worker-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
     );
+    applyReleaseChannelHeaders(res);
     if (process.env.NODE_ENV === "production") {
       res.setHeader(
         "Strict-Transport-Security",
@@ -251,6 +254,7 @@ async function startServer() {
   app.get("/healthz", (_req, res) => {
     res.status(200).json({
       status: "ok",
+      channel: applicationReleaseChannel,
       build: {
         sha: applicationBuildSha,
         imageDigest: applicationImageDigest,
@@ -279,6 +283,7 @@ async function startServer() {
         paymentReceipts,
         projectOrders,
         knowledgeBase,
+        monitorCredential,
       ] = await Promise.all([
         preparedFileService.health(),
         getRuntimeSkillReadiness(),
@@ -292,6 +297,7 @@ async function startServer() {
           recoveryRequired: process.env.NODE_ENV === "production",
           assetRootRequired: process.env.NODE_ENV === "production",
         }),
+        getDedicatedMonitorCredentialReadiness(),
       ]);
       const ready =
         fileRetention?.ready === true &&
@@ -301,6 +307,7 @@ async function startServer() {
       const status = ready ? 200 : 503;
       const response = {
         status: "ok",
+        channel: applicationReleaseChannel,
         build: {
           sha: applicationBuildSha,
           imageDigest: applicationImageDigest,
@@ -317,7 +324,8 @@ async function startServer() {
           schema: migrationState.schema,
         },
         configuration: {
-          monitorCredentialConfigured: isDedicatedMonitorCredentialConfigured(),
+          monitorCredentialConfigured: monitorCredential.configured,
+          monitorCredentialAuthenticated: monitorCredential.authenticated,
           monitorApiBaseUrlConfigured: true,
           publicUrlConfigured: isFrontMindPublicUrlConfigured(),
           upstreamBaseUrlConfigured: isUpstreamBaseUrlConfigured(),
@@ -563,12 +571,23 @@ async function startServer() {
       );
       knowledgeInvariantTimer.unref();
       const runResetCleanup = () => {
-        void processKnowledgeResetCleanupJobs().catch((error) => {
-          console.error(
-            "[KnowledgeBaseReset] cleanup_retry_failed",
-            runtimeErrorForLog(error),
-          );
-        });
+        void Promise.all([
+          processKnowledgeResetCleanupJobs(),
+          sweepOrphanedKnowledgeBaseUploadEvidence(),
+        ])
+          .then(([, evidence]) => {
+            if (!evidence.scanned && !evidence.failed) return;
+            console.info(
+              "[KnowledgeBaseEvidence] orphan_sweep_complete",
+              JSON.stringify(evidence),
+            );
+          })
+          .catch((error) => {
+            console.error(
+              "[KnowledgeBaseReset] cleanup_retry_failed",
+              runtimeErrorForLog(error),
+            );
+          });
       };
       runResetCleanup();
       const resetCleanupTimer = setInterval(runResetCleanup, 15 * 60 * 1000);

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   knowledgeBaseObservationFromPayload,
   reconcileKnowledgeBaseObservation,
+  repairKnowledgeBaseLogoProvenance,
 } from "./knowledge-progress";
 
 afterEach(() => {
@@ -94,5 +95,112 @@ describe("reconcileKnowledgeBaseObservation", () => {
       "/api/knowledge-base/progress/conversation-1",
       { credentials: "include", signal: undefined },
     );
+  });
+});
+
+describe("repairKnowledgeBaseLogoProvenance", () => {
+  const observation = {
+    stateEpoch: 8,
+    generation: 1,
+    authoritativeTaskId: "task-1",
+    activeTurn: null,
+    interaction: {
+      progress: null,
+      interactionState: "failed",
+      canReply: false,
+      canPublish: false,
+      lockReason: "FINAL_PACKAGE_INVALID",
+    },
+    approvedPresentation: null,
+    package: null,
+    notice: {
+      key: "kb:final-retry",
+      code: "FINAL_PACKAGE_INVALID",
+      severity: "error",
+      message: "请重试本轮",
+      retryable: true,
+      turnId: "turn-50",
+      createdAt: 8,
+    },
+    conversationVersion: 8,
+  };
+  const input = {
+    conversationId: "conversation-1",
+    clientRequestId: "logo-repair-1",
+    expectedGeneration: 1,
+    expectedRevision: 50,
+    expectedLeafId: "7.5",
+    attachmentManifest: [
+      {
+        filename: "official-logo.png",
+        sizeBytes: 9556,
+        mimeType: "image/png",
+        lastModified: 123,
+        sha256: "a".repeat(64),
+      },
+    ] as [
+      {
+        filename: string;
+        sizeBytes: number;
+        mimeType: string;
+        lastModified: number;
+        sha256: string;
+      },
+    ],
+    attachment: {
+      file_id: "file-logo-1",
+      filename: "official-logo.png",
+    },
+  };
+
+  it("posts the exact captured file and one-item browser manifest", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ repaired: true, observation }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      repairKnowledgeBaseLogoProvenance(input),
+    ).resolves.toMatchObject({
+      stateEpoch: 8,
+      notice: { code: "FINAL_PACKAGE_INVALID", retryable: true },
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/knowledge-base/logo-provenance/repair",
+      {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      },
+    );
+  });
+
+  it("preserves the byte-mismatch error code for explicit UI guidance", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "KNOWLEDGE_BASE_LOGO_REPAIR_UPLOAD_INVALID",
+              message: "Logo bytes do not match",
+            },
+          }),
+          { status: 422, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    await expect(
+      repairKnowledgeBaseLogoProvenance(input),
+    ).rejects.toMatchObject({
+      message: "Logo bytes do not match",
+      status: 422,
+      code: "KNOWLEDGE_BASE_LOGO_REPAIR_UPLOAD_INVALID",
+    });
   });
 });

@@ -172,6 +172,29 @@ describe("website knowledge import v2/v3 contract", () => {
     ).toThrow();
   });
 
+  it.each([
+    [2, "taskId"],
+    [2, "outputItemId"],
+    [2, "fileId"],
+    [4, "candidate.taskId"],
+    [4, "candidate.outputItemId"],
+    [4, "candidate.fileId"],
+    [4, "finalArtifact.fileId"],
+  ] as const)(
+    "rejects whitespace rewriting of v%s opaque identity %s",
+    (schemaVersion, field) => {
+      const request = knowledgeImportRequest(schemaVersion) as any;
+      const path = field.split(".");
+      const owner = path
+        .slice(0, -1)
+        .reduce<Record<string, any>>((value, key) => value[key], request);
+      const key = path.at(-1)!;
+      owner[key] = ` ${owner[key]} `;
+
+      expect(() => websiteKnowledgeImportSchema.parse(request)).toThrow();
+    },
+  );
+
   it("recognizes the same artifact descriptor when a caller rotates only the idempotency key", () => {
     const value = websiteKnowledgeImportSchema.parse({
       schemaVersion: 2,
@@ -288,6 +311,29 @@ describe("website knowledge import v2/v3 contract", () => {
         value: v1,
       }),
     );
+  });
+
+  it("hashes long v2 source coordinates instead of truncating them into collisions", () => {
+    const value = websiteKnowledgeImportSchema.parse({
+      ...knowledgeImportRequest(2),
+      taskId: `${"task-prefix-".repeat(20)}A`,
+    });
+    const other = websiteKnowledgeImportSchema.parse({
+      ...value,
+      taskId: `${"task-prefix-".repeat(20)}B`,
+    });
+    const first = knowledgeImportReceiptSourceReference({
+      projectId: "project-1",
+      value,
+    });
+    const second = knowledgeImportReceiptSourceReference({
+      projectId: "project-1",
+      value: other,
+    });
+
+    expect(first).toMatch(/^website-kb:v2:[a-f0-9]{64}$/u);
+    expect(first.length).toBeLessThanOrEqual(191);
+    expect(first).not.toBe(second);
   });
 
   it("binds v4 receipts to candidate, final artifact, manifest, and finalizer", () => {

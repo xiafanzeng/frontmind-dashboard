@@ -164,7 +164,7 @@ export default function Home({
       )}
 
       {/* Main content */}
-      <main className="flex-1 flex flex-col relative z-10">
+      <main className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <ChatArea
           fixedAgentProfile={fixedAgentProfile}
           syncKnowledgeBaseSnapshot={syncKnowledgeBaseSnapshot}

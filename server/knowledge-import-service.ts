@@ -21,7 +21,7 @@ import {
 import {
   createKnowledgeSnapshot,
   getDashboardWorkspace,
-  getLatestKnowledgeSnapshot,
+  getKnowledgeSnapshotById,
 } from "./dashboard-service";
 import { createKnowledgeMonitoringHandoff } from "./delivery-role-service";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
@@ -39,17 +39,27 @@ import {
   persistKnowledgeSnapshotArchive,
   removeKnowledgeSnapshotArchive,
 } from "./knowledge-snapshot-archive-store";
+import { classifyKnowledgeBaseUpstreamTaskStatus } from "./knowledge-base-progress";
+import { assertExpectedUpstreamTaskId } from "./upstream-task-adapter";
 
 const sha256Schema = z
   .string()
   .trim()
   .regex(/^[a-f0-9]{64}$/i);
 
+const opaqueImportIdentitySchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .refine((value) => value === value.trim(), {
+    message: "opaque identity must not contain leading or trailing whitespace",
+  });
+
 const websiteKnowledgeImportBaseSchema = z.object({
   companyName: z.string().trim().min(1).max(200),
-  taskId: z.string().trim().min(1).max(255),
-  outputItemId: z.string().trim().min(1).max(255),
-  fileId: z.string().trim().min(1).max(255).optional(),
+  taskId: opaqueImportIdentitySchema,
+  outputItemId: opaqueImportIdentitySchema,
+  fileId: opaqueImportIdentitySchema.optional(),
   descriptorHash: sha256Schema,
   artifactSha256: sha256Schema,
   filename: z.string().trim().min(1).max(512),
@@ -57,9 +67,9 @@ const websiteKnowledgeImportBaseSchema = z.object({
 
 const websiteKnowledgeImportCandidateSchema = z
   .object({
-    taskId: z.string().trim().min(1).max(255),
-    outputItemId: z.string().trim().min(1).max(255),
-    fileId: z.string().trim().min(1).max(255).optional(),
+    taskId: opaqueImportIdentitySchema,
+    outputItemId: opaqueImportIdentitySchema,
+    fileId: opaqueImportIdentitySchema.optional(),
     descriptorHash: sha256Schema,
     sha256: sha256Schema,
   })
@@ -67,7 +77,7 @@ const websiteKnowledgeImportCandidateSchema = z
 
 const websiteKnowledgeImportFinalArtifactSchema = z
   .object({
-    fileId: z.string().trim().min(1).max(255),
+    fileId: opaqueImportIdentitySchema,
     filename: z.string().trim().min(1).max(512),
     sha256: sha256Schema,
     archiveContractVersion: z.literal(3),
@@ -119,6 +129,7 @@ export type KnowledgeImportErrorCode =
   | "ARTIFACT_HASH_MISMATCH"
   | "IDEMPOTENCY_CONFLICT"
   | "IDEMPOTENCY_PENDING"
+  | "RECEIPT_DATA_INCOMPLETE"
   | "SERVICE_NOT_WRITABLE"
   | "DATABASE_UNAVAILABLE"
   | "KNOWLEDGE_IMPORT_FAILED";
@@ -282,7 +293,9 @@ export function knowledgeImportReceiptSourceReference(input: {
       input.value.packageManifestSha256.toLowerCase(),
     ].join(":");
   }
-  return `${input.projectId}:${input.value.taskId}`.slice(0, 191);
+  return `website-kb:v2:${idempotencyHash(
+    `${input.projectId}\u0000${input.value.taskId}`,
+  )}`;
 }
 
 function knowledgeArtifactReceiptDescriptorMatchesRequest(
@@ -348,9 +361,24 @@ type ReceiptReservation =
   | {
       state: "completed";
       receiptId: string;
-      snapshot: Awaited<ReturnType<typeof getLatestKnowledgeSnapshot>>;
+      snapshotId: string;
     }
-  | { state: "acquired"; receiptId: string };
+  | { state: "acquired"; receiptId: string; claimRevision: number };
+
+function importAffectedRows(result: unknown) {
+  const direct = result as { affectedRows?: unknown } | undefined;
+  const tuple = result as Array<{ affectedRows?: unknown }> | undefined;
+  const value = direct?.affectedRows ?? tuple?.[0]?.affectedRows;
+  return value === undefined ? undefined : Number(value);
+}
+
+function incompleteReceiptError() {
+  return new KnowledgeImportError(
+    "RECEIPT_DATA_INCOMPLETE",
+    "知识库导入回执已完成，但缺少精确快照绑定",
+    409,
+  );
+}
 
 async function reserveReceipt(input: {
   userId: number;
@@ -386,15 +414,19 @@ async function reserveReceipt(input: {
         existing,
         input,
       );
-      if (
-        sameRequest &&
-        existing.status === "completed" &&
-        existing.snapshotId
-      ) {
+      if (!sameRequest) {
+        throw new KnowledgeImportError(
+          "IDEMPOTENCY_CONFLICT",
+          "该幂等键已用于不同的知识库导入请求",
+          409,
+        );
+      }
+      if (existing.status === "completed") {
+        if (!existing.snapshotId) throw incompleteReceiptError();
         return {
           state: "completed",
           receiptId: existing.id,
-          snapshot: await getLatestKnowledgeSnapshot(input.userId),
+          snapshotId: existing.snapshotId,
         };
       }
       const ageMs = input.now.getTime() - existing.updatedAt.getTime();
@@ -409,18 +441,33 @@ async function reserveReceipt(input: {
           2_000,
         );
       }
-      await tx
+      const claimRevision = existing.revision + 1;
+      const result = await tx
         .update(knowledgeImportReceipts)
         .set({
           status: "processing",
           attemptCount: existing.attemptCount + 1,
+          revision: claimRevision,
           errorCode: null,
           errorMessage: null,
           sourceReference: knowledgeImportReceiptSourceReference(input),
           updatedAt: input.now,
         })
-        .where(eq(knowledgeImportReceipts.id, existing.id));
-      return { state: "acquired", receiptId: existing.id };
+        .where(
+          and(
+            eq(knowledgeImportReceipts.id, existing.id),
+            eq(knowledgeImportReceipts.revision, existing.revision),
+          ),
+        );
+      if (importAffectedRows(result) === 0) {
+        throw new KnowledgeImportError(
+          "IDEMPOTENCY_PENDING",
+          "相同知识库已由其他请求接管",
+          425,
+          2_000,
+        );
+      }
+      return { state: "acquired", receiptId: existing.id, claimRevision };
     }
 
     const artifactRows = await tx
@@ -455,35 +502,20 @@ async function reserveReceipt(input: {
         existingArtifact,
         input,
       );
-      if (
-        sameArtifactRequest &&
-        existingArtifact.status === "completed" &&
-        existingArtifact.snapshotId
-      ) {
+      if (!sameArtifactRequest) {
+        throw new KnowledgeImportError(
+          "IDEMPOTENCY_CONFLICT",
+          "相同知识库产物已由另一份来源合同导入，不能重新绑定",
+          409,
+        );
+      }
+      if (existingArtifact.status === "completed") {
+        if (!existingArtifact.snapshotId) throw incompleteReceiptError();
         return {
           state: "completed",
           receiptId: existingArtifact.id,
-          snapshot: await getLatestKnowledgeSnapshot(input.userId),
+          snapshotId: existingArtifact.snapshotId,
         };
-      }
-      if (
-        input.value.schemaVersion >= 3 &&
-        !sameArtifactRequest &&
-        existingArtifact.status === "completed" &&
-        existingArtifact.snapshotId
-      ) {
-        await tx
-          .update(knowledgeImportReceipts)
-          .set({
-            status: "processing",
-            attemptCount: existingArtifact.attemptCount + 1,
-            errorCode: null,
-            errorMessage: null,
-            sourceReference: knowledgeImportReceiptSourceReference(input),
-            updatedAt: input.now,
-          })
-          .where(eq(knowledgeImportReceipts.id, existingArtifact.id));
-        return { state: "acquired", receiptId: existingArtifact.id };
       }
       if (
         existingArtifact.status === "pending" ||
@@ -538,11 +570,15 @@ async function reserveReceipt(input: {
       }
       throw error;
     }
-    return { state: "acquired", receiptId };
+    return { state: "acquired", receiptId, claimRevision: 1 };
   });
 }
 
-async function markReceiptFailed(receiptId: string, error: unknown) {
+async function markReceiptFailed(
+  receiptId: string,
+  claimRevision: number,
+  error: unknown,
+) {
   const db = await requireImportDb();
   await db
     .update(knowledgeImportReceipts)
@@ -558,7 +594,28 @@ async function markReceiptFailed(receiptId: string, error: unknown) {
       ).slice(0, 2000),
       updatedAt: new Date(),
     })
-    .where(eq(knowledgeImportReceipts.id, receiptId));
+    .where(
+      and(
+        eq(knowledgeImportReceipts.id, receiptId),
+        eq(knowledgeImportReceipts.status, "processing"),
+        eq(knowledgeImportReceipts.revision, claimRevision),
+      ),
+    );
+}
+
+async function readImportReceiptState(receiptId: string) {
+  const db = await requireImportDb();
+  const rows = await db
+    .select({
+      userId: knowledgeImportReceipts.userId,
+      status: knowledgeImportReceipts.status,
+      revision: knowledgeImportReceipts.revision,
+      snapshotId: knowledgeImportReceipts.snapshotId,
+    })
+    .from(knowledgeImportReceipts)
+    .where(eq(knowledgeImportReceipts.id, receiptId))
+    .limit(1);
+  return rows[0] ?? null;
 }
 
 export async function importWebsiteKnowledgeArtifact(input: {
@@ -599,51 +656,42 @@ export async function importWebsiteKnowledgeArtifact(input: {
     now: input.now ?? new Date(),
   });
   if (reservation.state === "completed") {
+    const snapshot = await getKnowledgeSnapshotById({
+      userId: provision.userId,
+      snapshotId: reservation.snapshotId,
+    });
+    if (!snapshot) throw incompleteReceiptError();
+    // Snapshot + receipt commit atomically, while the monitoring handoff is a
+    // post-commit side effect. A worker can exit in that narrow interval, so
+    // every completed-receipt replay must also repair the handoff. The handoff
+    // service is snapshot-keyed/idempotent; failure remains non-fatal because
+    // the knowledge snapshot is already durable and a later replay can retry.
+    await createKnowledgeMonitoringHandoff({
+      userId: provision.userId,
+      actorUserId: provision.userId,
+      knowledgeSnapshotId: reservation.snapshotId,
+    }).catch((handoffError) => {
+      console.error(
+        "[KnowledgeImport] Completed receipt replay could not ensure monitoring handoff",
+        handoffError,
+      );
+    });
     return {
       status: "completed" as const,
       replayed: true,
       receiptId: reservation.receiptId,
-      snapshot: reservation.snapshot,
+      snapshot,
     };
   }
 
   let storedAssetKeys: string[] = [];
   let snapshotCommitted = false;
+  let snapshotCommitAttempted = false;
   let storedArchive: { userId: number; snapshotId: string } | undefined;
   let committedSnapshot: Awaited<
     ReturnType<typeof createKnowledgeSnapshot>
   > | null = null;
   let committedSnapshotId = "";
-  let committedSourceFileName = "";
-  let receiptCompleted = false;
-  const completeReceipt = async () => {
-    const result = await db
-      .update(knowledgeImportReceipts)
-      .set({
-        status: "completed",
-        snapshotId: committedSnapshotId,
-        sourceFileName: committedSourceFileName,
-        completedAt: new Date(),
-        errorCode: null,
-        errorMessage: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(knowledgeImportReceipts.id, reservation.receiptId),
-          eq(knowledgeImportReceipts.status, "processing"),
-        ),
-      );
-    const affectedRows = Number(
-      (result as { affectedRows?: unknown } | undefined)?.affectedRows ??
-        (result as Array<{ affectedRows?: unknown }> | undefined)?.[0]
-          ?.affectedRows,
-    );
-    if (affectedRows === 0) {
-      throw new Error("知识库导入回执状态已变化，无法写入完成状态");
-    }
-    receiptCompleted = true;
-  };
   try {
     await assertKnowledgeBaseWritable(provision.userId);
     try {
@@ -681,23 +729,25 @@ export async function importWebsiteKnowledgeArtifact(input: {
         validateStatus: () => true,
       },
     );
-    if (taskResponse.status !== 200) {
+    if (taskResponse.status < 200 || taskResponse.status >= 300) {
       throw new KnowledgeImportError(
         "KNOWLEDGE_IMPORT_FAILED",
         `读取知识库任务失败 (${taskResponse.status})`,
         502,
       );
     }
-    const task = taskResponse.data?.task || taskResponse.data || {};
-    const returnedTaskId = String(task.id || task.task_id || "");
-    if (returnedTaskId !== taskId) {
+    let task: Record<string, unknown>;
+    try {
+      task = assertExpectedUpstreamTaskId(taskResponse.data, taskId);
+    } catch {
       throw new KnowledgeImportError(
         "TASK_PROJECT_MISMATCH",
         "读取到的知识库任务标识不匹配",
         409,
       );
     }
-    if (task.status !== "completed") {
+    const taskStatus = classifyKnowledgeBaseUpstreamTaskStatus(task.status);
+    if (taskStatus.phase !== "succeeded") {
       throw new KnowledgeImportError(
         "TASK_NOT_COMPLETED",
         "知识库任务尚未完成",
@@ -790,6 +840,7 @@ export async function importWebsiteKnowledgeArtifact(input: {
       expectedSha256: archiveHash,
     });
     storedArchive = { userId: provision.userId, snapshotId };
+    snapshotCommitAttempted = true;
     const snapshot = await createKnowledgeSnapshot({
       snapshotId,
       userId: provision.userId,
@@ -801,12 +852,14 @@ export async function importWebsiteKnowledgeArtifact(input: {
       documents: parsed.documents,
       assets: parsed.assets,
       totalBytes: downloaded.buffer.length,
+      importReceiptClaim: {
+        receiptId: reservation.receiptId,
+        claimRevision: reservation.claimRevision,
+      },
     });
     committedSnapshot = snapshot;
     committedSnapshotId = snapshot?.id ?? snapshotId;
-    committedSourceFileName = downloaded.filename;
     snapshotCommitted = true;
-    await completeReceipt();
     await createKnowledgeMonitoringHandoff({
       userId: provision.userId,
       actorUserId: provision.userId,
@@ -819,15 +872,60 @@ export async function importWebsiteKnowledgeArtifact(input: {
       snapshot,
     };
   } catch (error) {
-    if (snapshotCommitted) {
-      if (!receiptCompleted) {
-        await completeReceipt().catch((receiptError) => {
+    if (!snapshotCommitted && snapshotCommitAttempted) {
+      let receiptState:
+        | Awaited<ReturnType<typeof readImportReceiptState>>
+        | undefined;
+      try {
+        receiptState = await readImportReceiptState(reservation.receiptId);
+      } catch (receiptReadError) {
+        console.error(
+          "[KnowledgeImport] Snapshot commit outcome is unknown; preserving claimant files for replay",
+          receiptReadError,
+        );
+      }
+      if (receiptState?.status === "completed" && receiptState.snapshotId) {
+        const durableSnapshot = await getKnowledgeSnapshotById({
+          userId: provision.userId,
+          snapshotId: receiptState.snapshotId,
+        });
+        if (!durableSnapshot) throw incompleteReceiptError();
+        if (storedArchive?.snapshotId !== receiptState.snapshotId) {
+          await removeStoredKnowledgeAssets(storedAssetKeys);
+          if (storedArchive) {
+            await removeKnowledgeSnapshotArchive(storedArchive).catch(
+              () => undefined,
+            );
+          }
+        }
+        await createKnowledgeMonitoringHandoff({
+          userId: provision.userId,
+          actorUserId: provision.userId,
+          knowledgeSnapshotId: receiptState.snapshotId,
+        }).catch((handoffError) => {
           console.error(
-            "[KnowledgeImport] Snapshot committed but receipt completion retry failed",
-            receiptError,
+            "[KnowledgeImport] Replayed committed snapshot but monitoring handoff failed",
+            handoffError,
           );
         });
+        return {
+          status: "completed" as const,
+          replayed: true,
+          receiptId: reservation.receiptId,
+          snapshot: durableSnapshot,
+        };
       }
+      if (receiptState === undefined) {
+        throw error instanceof KnowledgeImportError
+          ? error
+          : new KnowledgeImportError(
+              "KNOWLEDGE_IMPORT_FAILED",
+              "知识库快照提交结果暂时无法确认，请使用原幂等键重试",
+              503,
+            );
+      }
+    }
+    if (snapshotCommitted) {
       await createKnowledgeMonitoringHandoff({
         userId: provision.userId,
         actorUserId: provision.userId,
@@ -857,7 +955,11 @@ export async function importWebsiteKnowledgeArtifact(input: {
         );
       }
     }
-    await markReceiptFailed(reservation.receiptId, error);
+    await markReceiptFailed(
+      reservation.receiptId,
+      reservation.claimRevision,
+      error,
+    );
     throw error instanceof KnowledgeImportError
       ? error
       : new KnowledgeImportError(

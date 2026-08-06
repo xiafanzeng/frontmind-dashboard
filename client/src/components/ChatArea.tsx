@@ -66,11 +66,13 @@ import { Textarea } from "@/components/ui/textarea";
 import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progress";
 import { trpc } from "@/lib/trpc";
 import {
+  KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE,
   knowledgeBaseObservationFromPayload,
   reconcileKnowledgeBaseObservation,
   retryKnowledgeBaseTurn,
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
+import KnowledgeBaseLogoProvenanceRepair from "./KnowledgeBaseLogoProvenanceRepair";
 import {
   assertChatAttachmentSizes,
   chatAttachmentSizeError,
@@ -87,6 +89,15 @@ export function runningAssistantStatusText(syncKnowledgeBaseSnapshot: boolean) {
     : "FrontMind AI 正在处理...";
 }
 
+export function scrollChatViewportToBottom(
+  viewport: Pick<HTMLElement, "scrollHeight" | "scrollTo">,
+) {
+  viewport.scrollTo({
+    top: viewport.scrollHeight,
+    behavior: "auto",
+  });
+}
+
 export const KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE =
   "PACKAGE_REBIND_REQUIRED";
 export const KNOWLEDGE_BASE_INTERNAL_ATTACHMENT_NOTICE_CODE =
@@ -101,9 +112,13 @@ export function shouldRenderKnowledgeBaseNotice(
 export function knowledgeBaseNoticeRecoveryMode(
   notice: Pick<KnowledgeBaseClientNotice, "code">,
 ) {
-  return notice.code === KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE
-    ? ("reconcile" as const)
-    : ("new_turn" as const);
+  if (notice.code === KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE) {
+    return "reconcile" as const;
+  }
+  if (notice.code === KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE) {
+    return "logo_repair" as const;
+  }
+  return "new_turn" as const;
 }
 
 export function knowledgeBaseNoticeRetryLabel(
@@ -111,7 +126,15 @@ export function knowledgeBaseNoticeRetryLabel(
 ) {
   return knowledgeBaseNoticeRecoveryMode(notice) === "reconcile"
     ? "重新绑定成品"
-    : "重试本轮";
+    : knowledgeBaseNoticeRecoveryMode(notice) === "logo_repair"
+      ? "重新上传 Logo 原图"
+      : "重试本轮";
+}
+
+export function knowledgeBaseNoticeRequiresLogoProvenanceRepair(
+  notice: Pick<KnowledgeBaseClientNotice, "code">,
+) {
+  return notice.code === KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE;
 }
 
 export function knowledgeBasePackageRebindResolved(
@@ -146,6 +169,9 @@ export async function recoverKnowledgeBaseNotice(
     return (dependencies.reconcile ?? reconcileKnowledgeBaseObservation)({
       conversationId: input.conversationId,
     });
+  }
+  if (knowledgeBaseNoticeRecoveryMode(input.notice) === "logo_repair") {
+    throw new Error("请通过专用入口重新上传当前知识库使用的同一张 Logo 原图");
   }
   return (dependencies.retry ?? retryKnowledgeBaseTurn)({
     conversationId: input.conversationId,
@@ -384,7 +410,7 @@ export default function ChatArea({
     refetchOnWindowFocus: true,
     staleTime: 30_000,
   });
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const messagesViewportRef = useRef<HTMLDivElement>(null);
 
   const [, setTick] = useState(0);
   const [retryingKnowledgeBase, setRetryingKnowledgeBase] = useState(false);
@@ -411,7 +437,8 @@ export default function ChatArea({
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     const timer = setTimeout(() => {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      const viewport = messagesViewportRef.current;
+      if (viewport) scrollChatViewportToBottom(viewport);
     }, 100);
     return () => clearTimeout(timer);
   }, [activeConversation?.messages?.length, status]);
@@ -680,7 +707,7 @@ export default function ChatArea({
       ?.modelName;
 
   return (
-    <div className="flex-1 flex flex-col h-full relative">
+    <div className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       {/* Header bar */}
       <div className="flex items-center justify-between gap-4 border-b border-border/60 bg-background/85 px-4 py-3 sm:px-6 backdrop-blur-xl">
         <div
@@ -740,7 +767,11 @@ export default function ChatArea({
       </div>
 
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto custom-scrollbar">
+      <div
+        ref={messagesViewportRef}
+        className="min-h-0 flex-1 overflow-y-auto custom-scrollbar"
+        data-testid="chat-messages-viewport"
+      >
         <div className="max-w-4xl mx-auto px-3 py-6 space-y-6 sm:px-5 sm:py-8 sm:space-y-7">
           {messages.length === 0 &&
             status === "idle" &&
@@ -809,9 +840,33 @@ export default function ChatArea({
                   activeConversation.knowledgeBase.notice.errorKey
                 }
               >
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <span>{activeConversation.knowledgeBase.notice.message}</span>
-                  {activeConversation.knowledgeBase.notice.retryable && (
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <span className="min-w-0 flex-1">
+                    {activeConversation.knowledgeBase.notice.message}
+                  </span>
+                  {knowledgeBaseNoticeRequiresLogoProvenanceRepair(
+                    activeConversation.knowledgeBase.notice,
+                  ) ? (
+                    activeConversation.knowledgeBase.revision !== null ? (
+                      <KnowledgeBaseLogoProvenanceRepair
+                        conversationId={activeConversation.id}
+                        expectedGeneration={
+                          activeConversation.knowledgeBase.generation
+                        }
+                        expectedRevision={
+                          activeConversation.knowledgeBase.revision
+                        }
+                        expectedLeafId={activeConversation.knowledgeBase.leafId}
+                        onObservation={(observation) => {
+                          commitKnowledgeBaseObservation(
+                            activeConversation.id,
+                            observation,
+                          );
+                          wakeKnowledgeBaseConversation(activeConversation.id);
+                        }}
+                      />
+                    ) : null
+                  ) : activeConversation.knowledgeBase.notice.retryable ? (
                     <Button
                       type="button"
                       size="sm"
@@ -826,7 +881,7 @@ export default function ChatArea({
                         activeConversation.knowledgeBase.notice,
                       )}
                     </Button>
-                  )}
+                  ) : null}
                 </div>
               </div>
             )}
@@ -856,7 +911,7 @@ export default function ChatArea({
               />
             )}
 
-          <div ref={bottomRef} />
+          <div aria-hidden="true" />
         </div>
       </div>
 

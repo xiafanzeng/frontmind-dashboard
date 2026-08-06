@@ -387,9 +387,11 @@ const importCards: ImportCardDefinition[] = [
   {
     module: "keywords",
     title: "品牌全域词库",
-    description: "上传问题、场景、优先级等关键词表格，独立替换词库页面。",
-    accept: ".json,application/json",
-    format: "JSON 当前模板",
+    description:
+      "上传问题列表 XLSX/CSV，按核心词分类自动映射四类标签并独立替换词库页面。",
+    accept:
+      ".xlsx,.csv,.json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,application/json",
+    format: "XLSX / CSV / JSON",
     icon: Table2,
   },
   {

@@ -34,7 +34,7 @@ import {
 } from "./_core/safe-external-url";
 import { getUpstreamBaseUrl, toUpstreamAgentProfile } from "./upstream-config";
 import {
-  isDedicatedMonitorCredentialConfigured,
+  getDedicatedMonitorCredentialReadiness,
   presalesMonitorRouter,
 } from "./presales-monitor";
 import { isFrontMindPublicUrlConfigured } from "./public-url";
@@ -56,6 +56,11 @@ import {
   OwnedFileContentError,
   OwnedFileContentResolver,
 } from "./owned-file-content-resolver";
+import {
+  assertUpstreamPromptBudget,
+  FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
+  upstreamPromptCharacterCount,
+} from "./upstream-prompt-budget";
 
 const router = Router();
 const SERVICE_TOKEN_HEADER = "x-frontmind-service-token";
@@ -99,7 +104,7 @@ const presalesAgentProfileSchema = z.enum(["frontmind-base", "frontmind-pro"]);
 
 const taskCreateSchema = z
   .object({
-    prompt: z.string().trim().min(1).max(2_000_000),
+    prompt: z.string().trim().min(1),
     attachments: z.array(attachmentSchema).max(20).optional().default([]),
     idempotencyKey: z.string().trim().min(16).max(512).optional(),
     projectId: z.string().trim().min(8).max(80).optional(),
@@ -108,6 +113,16 @@ const taskCreateSchema = z
       .default("frontmind-base"),
   })
   .superRefine((value, context) => {
+    if (
+      upstreamPromptCharacterCount(value.prompt) >
+      FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["prompt"],
+        message: `Task prompt must not exceed ${FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS} Unicode characters`,
+      });
+    }
     if (value.projectId && !value.idempotencyKey) {
       context.addIssue({
         code: "custom",
@@ -122,10 +137,11 @@ export function buildPresalesTaskBody(input: {
   attachments?: Array<{ file_id: string; filename: string }>;
   agentProfile?: z.infer<typeof presalesAgentProfileSchema>;
 }) {
+  const prompt = assertUpstreamPromptBudget(input.prompt);
   const agentProfile =
     input.agentProfile === "frontmind-pro" ? "frontmind-pro" : "frontmind-base";
   return {
-    prompt: input.prompt,
+    prompt,
     attachments: input.attachments ?? [],
     agentProfile: toUpstreamAgentProfile(agentProfile),
     taskMode: "agent" as const,
@@ -818,13 +834,24 @@ async function retrieveTask(
 router.use(requirePresalesServiceToken);
 router.use("/monitor-runs", presalesMonitorRouter);
 
-router.get("/status", async (_req, res) => {
+router.get("/status", async (req, res) => {
   try {
-    const credential = await getActivePresalesCredential();
+    const forceMonitorCredentialRefresh =
+      req.query.monitorCredentialProbe === "fresh";
+    const [credential, monitorCredential] = await Promise.all([
+      getActivePresalesCredential(),
+      getDedicatedMonitorCredentialReadiness(process.env, {
+        forceRefresh: forceMonitorCredentialRefresh,
+      }),
+    ]);
     res.json({
-      ok: true,
+      // Keep legacy Website builds fail-closed during the rolling upgrade:
+      // they understand `ok` but not the new authenticated field. The
+      // configured boolean below now retains its literal meaning.
+      ok: monitorCredential.authenticated,
       credentialConfigured: Boolean(credential),
-      monitorCredentialConfigured: isDedicatedMonitorCredentialConfigured(),
+      monitorCredentialConfigured: monitorCredential.configured,
+      monitorCredentialAuthenticated: monitorCredential.authenticated,
       publicUrlConfigured: isFrontMindPublicUrlConfigured(),
     });
   } catch (error) {

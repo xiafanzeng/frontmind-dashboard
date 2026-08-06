@@ -46,6 +46,7 @@ import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import { consumePendingFrontMindBuildDraft } from "@/lib/build-version";
 import { useComposition } from "@/hooks/useComposition";
 import { chatAttachmentSizeError } from "@/lib/attachment-files";
+import { KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE } from "@/lib/knowledge-progress";
 
 interface FilePreview {
   file: File;
@@ -203,6 +204,10 @@ export default function ChatInput({
     syncKnowledgeBaseSnapshot &&
     activeConversation?.knowledgeBase?.notice?.code ===
       "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED";
+  const knowledgeBaseLogoProvenanceRepairRequired =
+    syncKnowledgeBaseSnapshot &&
+    activeConversation?.knowledgeBase?.notice?.code ===
+      KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE;
   const knowledgeBaseNotStarted =
     syncKnowledgeBaseSnapshot && !activeConversation?.taskId;
   const knowledgeInteractionLocked =
@@ -210,8 +215,9 @@ export default function ChatInput({
     Boolean(activeConversation?.taskId) &&
     activeConversation?.status !== "awaiting_input";
   const inputLocked =
-    (isRunning || knowledgeInteractionLocked) &&
-    !knowledgeBaseAttachmentResumeRequired;
+    knowledgeBaseLogoProvenanceRepairRequired ||
+    ((isRunning || knowledgeInteractionLocked) &&
+      !knowledgeBaseAttachmentResumeRequired);
   const currentKnowledgeLeaf = knowledgeBaseProgress?.branches
     .flatMap((branch) => branch.leaves)
     .find((leaf) => leaf.id === knowledgeBaseProgress.build.currentLeafId);
@@ -488,6 +494,7 @@ export default function ChatInput({
 
       <div className="max-w-4xl mx-auto">
         {syncKnowledgeBaseSnapshot &&
+          !knowledgeBaseLogoProvenanceRepairRequired &&
           (currentKnowledgeLeaf || knowledgeBaseComplete) && (
             <div
               className={cn(
@@ -547,8 +554,8 @@ export default function ChatInput({
                         {officialLogoRequired
                           ? "官网、公开来源和初始资料中未找到可验证的官方主 Logo。请上传一张原图后继续；透明背景 PNG 最佳，宽高均需至少 256 像素。"
                           : currentNodePresentationReady
-                          ? "可直接确认，也可以输入修改意见或上传补充资料。"
-                          : "正在处理当前节点内容，显示完整后才可确认。"}
+                            ? "可直接确认，也可以输入修改意见或上传补充资料。"
+                            : "正在处理当前节点内容，显示完整后才可确认。"}
                       </p>
                     </div>
                     <div className="shrink-0">
@@ -726,9 +733,9 @@ export default function ChatInput({
                       ? "请先点击上方“构建企业知识库”完成资料采集设置"
                       : officialLogoRequired
                         ? "请使用左侧按钮上传企业主 Logo，上传后才可继续"
-                      : syncKnowledgeBaseSnapshot
-                        ? "输入修改意见，或上传资料；提交后仍停留当前节点"
-                        : "输入你的内容需求，按 Enter 开始编排..."
+                        : syncKnowledgeBaseSnapshot
+                          ? "输入修改意见，或上传资料；提交后仍停留当前节点"
+                          : "输入你的内容需求，按 Enter 开始编排..."
               }
               disabled={
                 inputLocked ||
@@ -853,8 +860,8 @@ export default function ChatInput({
               {officialLogoRequired
                 ? "仅接受一张 PNG、JPEG、WebP、AVIF 或 GIF 原图 · 宽高均至少 256 像素"
                 : syncKnowledgeBaseSnapshot
-                ? "Enter 提交修订 · Shift+Enter 换行 · 支持多文件选择与拖拽上传"
-                : "Enter 发送 · Shift+Enter 换行 · 支持资料、图片与交付文件上传"}
+                  ? "Enter 提交修订 · Shift+Enter 换行 · 支持多文件选择与拖拽上传"
+                  : "Enter 发送 · Shift+Enter 换行 · 支持资料、图片与交付文件上传"}
             </p>
           </div>
         </div>

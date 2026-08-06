@@ -73,11 +73,7 @@ describe("socratic knowledge-base Skill packaging", () => {
 
     expect(skill).toContain("`schemaVersion: 4`");
     expect(skill).toContain("sourceUploadSha256");
-    for (const instructions of [
-      skill,
-      outputContract,
-      questioningStrategy,
-    ]) {
+    for (const instructions of [skill, outputContract, questioningStrategy]) {
       const normalizedInstructions = instructions.replace(/\s+/g, " ");
       expect(normalizedInstructions).toContain("image-free");
       expect(normalizedInstructions).toContain(
@@ -93,6 +89,19 @@ describe("socratic knowledge-base Skill packaging", () => {
     expect(outputContract).toContain('"sourceKind": "user_upload"');
     expect(validator).toContain("MAX_USER_UPLOAD_IMAGES = 99");
     expect(validator).toContain("duplicate original customer upload hash");
+    expect(validator).toContain("table_is_source_inventory");
+    expect(validator).toContain("--finalization-input");
+    expect(validator).toContain("validate_finalization_binding");
+    expect(skill.replace(/\s+/g, " ")).toContain(
+      "copy every `assets[].requiredManifest` field exactly",
+    );
+    expect(skill).toContain("--finalization-input ...");
+    expect(skill).toContain("SHA-256, operationId and turnId flags");
+    expect(outputContract).toContain(
+      "`FINALIZATION_INPUT.json.assets[].requiredManifest` field-for-field",
+    );
+    expect(outputContract).toContain("不同来源模型");
+    expect(outputContract).toContain("same header-based rule");
     expect(validator).not.toContain("CUSTOMER_FORMAL_LEAKAGE");
     expect(validator).not.toContain("CUSTOMER_OR_PROCUREMENT_ADVICE");
     expect(skill).toContain("not a vocabulary-based runtime gate");

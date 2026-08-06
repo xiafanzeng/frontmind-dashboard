@@ -29,6 +29,7 @@ const mocks = vi.hoisted(() => ({
   refetchTickets: vi.fn(),
   refetchWorkbench: vi.fn(),
   workbenchData: { customers: [], tickets: [] } as any,
+  adjustQuestionQuotaMutation: vi.fn(),
   updateTicketMutation: vi.fn(),
   ticketsData: {
     items: [],
@@ -140,6 +141,12 @@ vi.mock("@/lib/trpc", () => ({
             mutateAsync: vi.fn(),
           }),
         },
+        adjustQuestionQuota: {
+          useMutation: () => ({
+            isPending: false,
+            mutateAsync: mocks.adjustQuestionQuotaMutation,
+          }),
+        },
         updateTicket: {
           useMutation: () => ({
             isPending: false,
@@ -210,6 +217,52 @@ import DeliveryMemberDashboard, {
   ROLE_DASHBOARD_SECTIONS,
 } from "./DeliveryMemberDashboard";
 
+const MONITORING_PROJECT_ID = "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f";
+const QUESTION_QUOTA_PERIOD_ID = "065593df-4fd7-4512-8b1d-babfdf8af81d";
+
+const monitoringAssignment = {
+  projectAssignmentId: MONITORING_PROJECT_ID,
+  customerUserId: 101,
+  customerName: "示例客户",
+  customerUsername: "example.customer",
+  roleType: "monitoring_optimization_engineer" as const,
+};
+
+const questionQuotaFixture = {
+  periodId: QUESTION_QUOTA_PERIOD_ID,
+  revision: 3,
+  validFrom: Date.parse("2026-07-01T00:00:00.000Z"),
+  validUntil: Date.parse("2026-10-01T00:00:00.000Z"),
+  limits: {
+    industryLimit: 1,
+    competitorComparisonLimit: 1,
+    reputationLimit: 1,
+    productScenarioLimit: 5,
+    totalQuestionLimit: 8,
+  },
+  selectedUsage: {
+    industry: 1,
+    competitorComparison: 0,
+    reputation: 0,
+    productScenario: 1,
+    total: 2,
+  },
+  reservedUsage: {
+    industry: 1,
+    competitorComparison: 0,
+    reputation: 0,
+    productScenario: 2,
+    total: 3,
+  },
+  remaining: {
+    industry: 0,
+    competitorComparison: 1,
+    reputation: 1,
+    productScenario: 3,
+    total: 5,
+  },
+};
+
 describe("DeliveryMemberDashboard project context", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -224,6 +277,7 @@ describe("DeliveryMemberDashboard project context", () => {
       limit: 50,
     };
     mocks.detailData = null;
+    mocks.adjustQuestionQuotaMutation.mockResolvedValue({ success: true });
     mocks.updateTicketMutation.mockResolvedValue({
       success: true,
       handoffTicketIds: [],
@@ -1064,6 +1118,10 @@ describe("DeliveryMemberDashboard project context", () => {
 
     render(<DeliveryMemberDashboard />);
 
+    expect(await screen.findByLabelText("上传品牌词库")).toHaveAttribute(
+      "accept",
+      expect.stringContaining(".xlsx"),
+    );
     const fileInput = await screen.findByLabelText("上传问题目录");
     fireEvent.change(fileInput, {
       target: {
@@ -1101,6 +1159,108 @@ describe("DeliveryMemberDashboard project context", () => {
     confirmSpy.mockRestore();
     promptSpy.mockRestore();
     fetchSpy.mockRestore();
+  });
+
+  it.each([
+    { actorLabel: "工程师", systemAdminMode: false },
+    { actorLabel: "系统管理员", systemAdminMode: true },
+  ])(
+    "$actorLabel can adjust the current customer's four question quotas",
+    async ({ systemAdminMode }) => {
+      mocks.assignments = [monitoringAssignment];
+      mocks.workbenchData = {
+        customers: [],
+        counts: {
+          submitted: 0,
+          scheduled: 0,
+          in_progress: 0,
+          needs_information: 0,
+          completed: 0,
+        },
+        tickets: [],
+        customerQuestions: [],
+        dashboard: null,
+        questionQuota: questionQuotaFixture,
+      };
+      if (systemAdminMode) {
+        window.history.replaceState(
+          {},
+          "",
+          `/admin/delivery-workbench?projectAssignmentId=${MONITORING_PROJECT_ID}`,
+        );
+      }
+
+      render(
+        <DeliveryMemberDashboard
+          customerWorkbench
+          systemAdminMode={systemAdminMode}
+        />,
+      );
+
+      const editor = await screen.findByTestId("question-quota-editor");
+      expect(within(editor).getByText("行业排名词")).toBeInTheDocument();
+      expect(
+        within(editor).getByText("已确认 1 · 待审核预留 1"),
+      ).toBeInTheDocument();
+      fireEvent.click(within(editor).getByRole("button", { name: "修改额度" }));
+
+      const productScenarioInput =
+        within(editor).getByLabelText("产品场景词额度");
+      expect(productScenarioInput).toHaveValue(5);
+      fireEvent.change(productScenarioInput, { target: { value: "1" } });
+      expect(within(editor).getByRole("alert")).toHaveTextContent(
+        "产品场景词额度不能低于已确认与待审核预留数量 2",
+      );
+      expect(
+        within(editor).getByRole("button", { name: "保存额度" }),
+      ).toBeDisabled();
+
+      fireEvent.change(productScenarioInput, { target: { value: "6" } });
+      fireEvent.change(within(editor).getByLabelText("调整原因"), {
+        target: { value: "根据客户本期需求调整" },
+      });
+      fireEvent.click(within(editor).getByRole("button", { name: "保存额度" }));
+
+      await waitFor(() =>
+        expect(mocks.adjustQuestionQuotaMutation).toHaveBeenCalledWith({
+          projectAssignmentId: MONITORING_PROJECT_ID,
+          quotaPeriodId: QUESTION_QUOTA_PERIOD_ID,
+          expectedRevision: 3,
+          industryLimit: 1,
+          competitorComparisonLimit: 1,
+          reputationLimit: 1,
+          productScenarioLimit: 6,
+          reason: "根据客户本期需求调整",
+        }),
+      );
+      expect(
+        mocks.adjustQuestionQuotaMutation.mock.calls[0]?.[0],
+      ).not.toHaveProperty("userId");
+      await waitFor(() => expect(mocks.refetchWorkbench).toHaveBeenCalled());
+    },
+  );
+
+  it("hides the question quota editor from non-monitoring assignments", async () => {
+    mocks.assignments = [
+      {
+        ...monitoringAssignment,
+        roleType: "ai_operations_engineer",
+      },
+    ];
+    mocks.workbenchData = {
+      customers: [],
+      tickets: [],
+      customerQuestions: [],
+      dashboard: null,
+      questionQuota: questionQuotaFixture,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    await screen.findByTestId("current-delivery-target");
+    expect(
+      screen.queryByTestId("question-quota-editor"),
+    ).not.toBeInTheDocument();
   });
 
   it("does not let an engineer bypass customer style selection", async () => {
