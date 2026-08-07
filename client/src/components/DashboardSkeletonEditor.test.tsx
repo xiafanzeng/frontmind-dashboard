@@ -657,6 +657,10 @@ describe("DashboardSkeletonEditor", () => {
     const fileInput =
       card!.querySelector<HTMLInputElement>('input[type="file"]');
     expect(fileInput).not.toBeNull();
+    expect(fileInput).toHaveAttribute(
+      "accept",
+      expect.stringContaining(".xlsx"),
+    );
     const file = new File(["workbook"], "关键词.xlsx", {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     });

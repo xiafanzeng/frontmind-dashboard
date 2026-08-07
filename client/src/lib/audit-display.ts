@@ -30,6 +30,7 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   "delivery_ticket.redirects_applied": "应用跳转配置",
   "delivery_ticket.public_summary_updated": "更新工单公开摘要",
   "service_quota_period.delivery_limits_adjusted": "调整交付额度",
+  "service_quota_period.question_limits_adjusted": "调整问题额度",
   "presales.credential.replaced": "更新官网 API Key",
   "presales.credential.deleted": "删除官网 API Key",
   "delivery.engineer_credential.replaced": "更新工程师 API Key",

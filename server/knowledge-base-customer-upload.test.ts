@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import sharp from "sharp";
 
 const dependencies = vi.hoisted(() => ({
@@ -19,6 +22,9 @@ import {
   knowledgeBaseExpectedCustomerUploadsFromTurns,
   knowledgeBaseCustomerUploadImagesFromTurn,
   knowledgeBaseCustomerUploadResources,
+  knowledgeBaseOfficialLogoUploadFromTurn,
+  persistedKnowledgeBaseCustomerUploadBytesForBuild,
+  verifiedKnowledgeBasePackageUploadEvidenceForBuild,
   verifiedKnowledgeBaseOfficialLogoUploadForBuild,
 } from "./knowledge-base-customer-upload";
 
@@ -67,6 +73,170 @@ function capturedImageTurn(overrides: Record<string, unknown> = {}) {
 }
 
 describe("knowledge-base customer upload provenance", () => {
+  it("seals final upload evidence so source expiry cannot break publish, download or display", async () => {
+    const assetRoot = await mkdtemp(
+      path.join(tmpdir(), "frontmind-kb-upload-evidence-"),
+    );
+    const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
+    const bytes = Buffer.from("durable-customer-image-bytes");
+    const sourceSha256 = createHash("sha256").update(bytes).digest("hex");
+    const packageArchiveSha256 = "b".repeat(64);
+    const retriedPackageArchiveSha256 = "c".repeat(64);
+    const buildId = "10000000-0000-4000-8000-000000000099";
+    const turn = capturedImageTurn({
+      recovery: {
+        capturedClientAttachments: true,
+        attachments: [
+          {
+            file_id: "file-customer-image",
+            filename: "customer-proof.jpg",
+          },
+        ],
+        attachmentManifest: [
+          {
+            filename: "customer-proof.jpg",
+            mimeType: "image/jpeg",
+            sizeBytes: bytes.length,
+            sha256: sourceSha256,
+          },
+        ],
+      },
+    });
+    dependencies.getDb.mockResolvedValue({
+      select() {
+        return {
+          from() {
+            return {
+              where() {
+                return {
+                  async orderBy() {
+                    return [turn];
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+    });
+    dependencies.readStoredPresalesFile.mockResolvedValue({
+      filename: "customer-proof.jpg",
+      mimeType: "image/jpeg",
+      sizeBytes: bytes.length,
+      sha256: sourceSha256,
+      createReadStream: () => Readable.from(bytes),
+    });
+
+    try {
+      const first = await verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+        userId: 7,
+        buildId,
+        generation: 1,
+        packageArchiveSha256,
+      });
+      expect(first.expectedCustomerUploads).toEqual([
+        expect.objectContaining({ sourceSha256, leafIds: ["1.2"] }),
+      ]);
+
+      // Simulate the 30-day presales object expiring after final binding.
+      dependencies.readStoredPresalesFile.mockReset();
+      dependencies.readStoredPresalesFile.mockResolvedValue(null);
+      dependencies.getDb.mockClear();
+
+      await expect(
+        verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+          userId: 7,
+          buildId,
+          generation: 1,
+          packageArchiveSha256,
+        }),
+      ).resolves.toEqual(first);
+      const retried = await verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+        userId: 7,
+        buildId,
+        generation: 1,
+        packageArchiveSha256: retriedPackageArchiveSha256,
+      });
+      expect(retried).toEqual(first);
+      expect(dependencies.getDb).toHaveBeenCalled();
+      dependencies.getDb.mockClear();
+      await expect(
+        persistedKnowledgeBaseCustomerUploadBytesForBuild({
+          userId: 7,
+          buildId,
+          generation: 1,
+          packageArchiveSha256,
+          sourceSha256,
+        }),
+      ).resolves.toEqual(bytes);
+      await expect(
+        persistedKnowledgeBaseCustomerUploadBytesForBuild({
+          userId: 7,
+          buildId,
+          generation: 1,
+          packageArchiveSha256: retriedPackageArchiveSha256,
+          sourceSha256,
+        }),
+      ).resolves.toEqual(bytes);
+      await expect(
+        knowledgeBaseCustomerUploadResources(buildId, turn, {
+          persistedEvidence: {
+            userId: 7,
+            generation: 1,
+            packageArchiveSha256,
+          },
+        }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          kind: "customer_upload",
+          sha256: sourceSha256,
+        }),
+      ]);
+      expect(dependencies.getDb).not.toHaveBeenCalled();
+      expect(dependencies.readStoredPresalesFile).not.toHaveBeenCalled();
+
+      await expect(
+        persistedKnowledgeBaseCustomerUploadBytesForBuild({
+          userId: 7,
+          buildId: "10000000-0000-4000-8000-000000000098",
+          generation: 1,
+          packageArchiveSha256: retriedPackageArchiveSha256,
+          sourceSha256,
+        }),
+      ).rejects.toThrow("尚未永久封存");
+
+      await writeFile(
+        path.join(
+          assetRoot,
+          "knowledge-builds",
+          "7",
+          buildId,
+          "generation-1",
+          "upload-evidence",
+          "customer-uploads",
+          `${sourceSha256}.bin`,
+        ),
+        Buffer.alloc(bytes.length, 0x78),
+      );
+      await expect(
+        verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+          userId: 7,
+          buildId,
+          generation: 1,
+          packageArchiveSha256: "d".repeat(64),
+        }),
+      ).rejects.toThrow("永久证据字节完整性不一致");
+    } finally {
+      if (previousAssetRoot === undefined) {
+        delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+      } else {
+        process.env.FRONTMIND_DASHBOARD_ASSET_DIR = previousAssetRoot;
+      }
+      await rm(assetRoot, { recursive: true, force: true });
+    }
+  });
+
   it("projects only a byte-verified captured browser image", async () => {
     const turn = capturedImageTurn();
     dependencies.readStoredPresalesFile.mockResolvedValueOnce({
@@ -135,6 +305,56 @@ describe("knowledge-base customer upload provenance", () => {
 
     expect(knowledgeBaseCustomerUploadImagesFromTurn(turn)).toEqual([]);
     expect(knowledgeBaseExpectedCustomerUploadsFromTurns([turn])).toEqual([]);
+  });
+
+  it("accepts only an immutable build-bound Logo provenance repair ledger", () => {
+    const turn = {
+      id: "turn-logo-repair",
+      operationType: "logo_provenance_repair",
+      buildId: "build-1",
+      buildGeneration: 7,
+      expectedRevision: 50,
+      expectedLeafId: "7.5",
+      attachmentFileIds: ["file-logo-repair"],
+      status: "completed" as const,
+      metadata: {
+        logoProvenanceRepair: {
+          kind: "frontmind.knowledge-base.logo-provenance-repair",
+          schemaVersion: 1,
+          immutable: true,
+          buildId: "build-1",
+          generation: 7,
+          revision: 50,
+          leafId: "7.5",
+          officialLogoUpload: {
+            verified: true,
+            index: 0,
+            fileId: "file-logo-repair",
+            filename: "siliconflow.png",
+            mimeType: "image/png",
+            sizeBytes: 9556,
+            sourceSha256: "b".repeat(64),
+          },
+        },
+      },
+    };
+    expect(knowledgeBaseOfficialLogoUploadFromTurn(turn)).toMatchObject({
+      turnId: "turn-logo-repair",
+      leafId: "7.5",
+      fileId: "file-logo-repair",
+      sourceSha256: "b".repeat(64),
+    });
+    expect(
+      knowledgeBaseOfficialLogoUploadFromTurn({
+        ...turn,
+        metadata: {
+          logoProvenanceRepair: {
+            ...turn.metadata.logoProvenanceRepair,
+            revision: 49,
+          },
+        },
+      }),
+    ).toBeNull();
   });
 
   it("does not exclude an unverified recovery officialLogoUpload declaration", () => {
@@ -219,8 +439,12 @@ describe("knowledge-base customer upload provenance", () => {
         return {
           from() {
             return {
-              async where() {
-                return [turn];
+              where() {
+                return {
+                  async orderBy() {
+                    return [turn];
+                  },
+                };
               },
             };
           },
@@ -239,6 +463,70 @@ describe("knowledge-base customer upload provenance", () => {
       sourceSha256: "a".repeat(64),
     });
     expect(dependencies.readStoredPresalesFile).not.toHaveBeenCalled();
+  });
+
+  it("loads one customer-upload Logo ledger for reconcile, publish and download without duplicating it as customer media", async () => {
+    const turn = capturedImageTurn({
+      recovery: {
+        capturedClientAttachments: true,
+        attachments: [
+          {
+            file_id: "file-customer-image",
+            filename: "customer-proof.jpg",
+          },
+        ],
+        attachmentManifest: [
+          {
+            filename: "customer-proof.jpg",
+            mimeType: "image/jpeg",
+            sizeBytes: 1234,
+            sha256: "a".repeat(64),
+          },
+        ],
+        officialLogoUpload: {
+          verified: true,
+          index: 0,
+          fileId: "file-customer-image",
+          filename: "customer-proof.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 1234,
+          sourceSha256: "a".repeat(64),
+        },
+      },
+    });
+    dependencies.getDb.mockResolvedValue({
+      select() {
+        return {
+          from() {
+            return {
+              where() {
+                return {
+                  async orderBy() {
+                    return [turn];
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+    });
+
+    await expect(
+      verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+        userId: 7,
+        buildId: "build-1",
+        generation: 1,
+        officialLogoSha256: "a".repeat(64),
+      }),
+    ).resolves.toEqual({
+      expectedCustomerUploads: [],
+      expectedOfficialLogoUpload: expect.objectContaining({
+        fileId: "file-customer-image",
+        sourceSha256: "a".repeat(64),
+      }),
+      expectedOfficialLogoProvenance: undefined,
+    });
   });
 
   it("fails closed when a declared customer image no longer matches local bytes", async () => {

@@ -39,6 +39,8 @@ import {
   stripKnowledgeBaseProtocolPayloads,
   stripKnowledgeBaseReferenceAppendix,
 } from "../shared/knowledge-base-output";
+import { buildKnowledgeBaseInstructionDelivery } from "./knowledge-base-prompt-delivery";
+import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
 
 const router = Router();
 const SESSION_TTL_MS = 3 * 60 * 60 * 1_000;
@@ -132,12 +134,44 @@ type LivePreviewSession = {
   skillVersion: string;
   skillContentHash: string | null;
   skillAttachment: { file_id: string; filename: string } | null;
-  removeSkill: () => Promise<void>;
-  skillRemoved: boolean;
+  attachmentCleanup: ReturnType<
+    typeof createKnowledgeBaseLivePreviewAttachmentCleanup
+  >;
   finalAnalysis: ReturnType<typeof analyzeKnowledgeBaseLiveTask> | null;
 };
 
 const livePreviewSessions = new Map<string, LivePreviewSession>();
+
+/**
+ * Live preview files are intentionally short-lived and have no database
+ * ownership ledger. Keep every generated system file in one idempotent
+ * cleanup scope so failed task creation and session expiry cannot leak them.
+ */
+export function createKnowledgeBaseLivePreviewAttachmentCleanup() {
+  const removers = new Set<() => Promise<void>>();
+  let cleaned = false;
+  return {
+    add(remove: () => Promise<void>) {
+      if (cleaned) {
+        throw new Error("LIVE_PREVIEW_ATTACHMENT_SCOPE_ALREADY_CLEANED");
+      }
+      removers.add(remove);
+    },
+    async removeAll() {
+      if (cleaned) return;
+      cleaned = true;
+      const pending = [...removers];
+      removers.clear();
+      await Promise.allSettled(pending.map((remove) => remove()));
+    },
+    get pendingCount() {
+      return removers.size;
+    },
+    get cleaned() {
+      return cleaned;
+    },
+  };
+}
 
 function remoteAddress(req: Request) {
   return String(req.socket.remoteAddress || "").toLowerCase();
@@ -157,10 +191,7 @@ function cleanupExpiredSessions() {
   for (const [sessionId, session] of livePreviewSessions) {
     if (session.createdAt >= expiresBefore) continue;
     livePreviewSessions.delete(sessionId);
-    if (!session.skillRemoved) {
-      session.skillRemoved = true;
-      void session.removeSkill().catch(() => undefined);
-    }
+    void session.attachmentCleanup.removeAll().catch(() => undefined);
   }
 }
 
@@ -623,6 +654,25 @@ export function rehydratedConfirmationProgressState(input: {
   };
 }
 
+/**
+ * The real v4 final turn is built from database-approved node Markdown and
+ * byte-bound Logo/customer assets. Live preview deliberately has neither
+ * authority, so its last confirmation must stop locally instead of asking the
+ * model to reconstruct a package from conversational memory.
+ */
+export function knowledgeBaseLivePreviewNeedsAuthoritativeFinalization(
+  state: KnowledgeBaseProgressState,
+) {
+  if (!state.currentLeafId) return false;
+  const currentIndex = state.leaves.findIndex(
+    (leaf) => leaf.id === state.currentLeafId,
+  );
+  if (currentIndex < 0) return false;
+  return !state.leaves
+    .slice(currentIndex + 1)
+    .some((leaf) => leaf.status === "pending");
+}
+
 export function selectInitialKnowledgeBaseLiveTask(task: unknown) {
   const taskRecord =
     task && typeof task === "object" && !Array.isArray(task)
@@ -774,6 +824,7 @@ router.post("/start", async (req, res) => {
   }
 
   const baseUrl = getUpstreamBaseUrl();
+  const attachmentCleanup = createKnowledgeBaseLivePreviewAttachmentCleanup();
   let skill:
     | Awaited<ReturnType<typeof uploadKnowledgeBaseSkillArchive>>
     | undefined;
@@ -781,9 +832,9 @@ router.post("/start", async (req, res) => {
     const descriptor = await getKnowledgeBaseSkillDescriptor();
     const sessionId = randomUUID();
     const initialOperationId = `live-preview:${sessionId}:start`;
-    const prompt =
+    const fullInstructions =
       mode === "protocol_probe"
-        ? buildKnowledgeBaseProtocolProbePrompt()
+        ? null
         : await buildKnowledgeBasePrompt({
             conversationId: `live-preview-${Date.now()}`,
             companyName,
@@ -798,21 +849,49 @@ router.post("/start", async (req, res) => {
               turnId: sessionId,
             },
           });
+    const instructionDelivery = fullInstructions
+      ? buildKnowledgeBaseInstructionDelivery({
+          instructions: fullInstructions,
+          skillVersion: descriptor.version,
+          operationId: initialOperationId,
+          turnId: sessionId,
+        })
+      : null;
+    const prompt = instructionDelivery
+      ? instructionDelivery.prompt
+      : buildKnowledgeBaseProtocolProbePrompt();
     skill = await uploadKnowledgeBaseSkillArchive({
       baseUrl,
       apiKey,
       skillVersion: descriptor.version,
       skillContentHash: descriptor.contentHash,
     });
+    attachmentCleanup.add(skill.removeOrphan);
+    const instructionsUpload = instructionDelivery
+      ? await uploadUpstreamTaskAttachment({
+          baseUrl,
+          apiKey,
+          filename: instructionDelivery.filename,
+          bytes: instructionDelivery.bytes,
+          mimeType: instructionDelivery.mimeType,
+          idempotencyKey: `${initialOperationId}:instructions`,
+        })
+      : null;
+    if (instructionsUpload) {
+      attachmentCleanup.add(instructionsUpload.removeOrphan);
+    }
     const created = await createFrontMindTask({
       baseUrl,
       apiKey,
       prompt,
-      attachments: [skill.attachment],
+      attachments: [
+        skill.attachment,
+        ...(instructionsUpload ? [instructionsUpload.attachment] : []),
+      ],
       idempotencyKey: initialOperationId,
     });
     if (!created.ok) {
-      await skill.removeOrphan().catch(() => undefined);
+      await attachmentCleanup.removeAll();
       res.status(created.status).json({
         error: {
           code: "UPSTREAM_TASK_CREATE_FAILED",
@@ -825,7 +904,7 @@ router.post("/start", async (req, res) => {
     let analysis = analyzeKnowledgeBaseLiveTask(created.task, { mode });
     const terminal = analysis.terminal;
     if (terminal && mode === "protocol_probe") {
-      await skill.removeOrphan().catch(() => undefined);
+      await attachmentCleanup.removeAll();
     }
     let progressState: KnowledgeBaseProgressState | null = null;
     if (terminal && mode === "full" && analysis.issues.length === 0) {
@@ -849,8 +928,7 @@ router.post("/start", async (req, res) => {
       skillVersion: descriptor.version,
       skillContentHash: descriptor.contentHash,
       skillAttachment: skill.attachment,
-      removeSkill: skill.removeOrphan,
-      skillRemoved: terminal && mode === "protocol_probe",
+      attachmentCleanup,
       finalAnalysis: terminal ? analysis : null,
     });
     console.info("[KnowledgeBaseLivePreview] task started", {
@@ -866,7 +944,7 @@ router.post("/start", async (req, res) => {
       analysis,
     });
   } catch (error) {
-    if (skill) await skill.removeOrphan().catch(() => undefined);
+    await attachmentCleanup.removeAll().catch(() => undefined);
     res.status(502).json({
       error: {
         code: "LIVE_PREVIEW_START_FAILED",
@@ -966,8 +1044,7 @@ router.post("/recover", async (req, res) => {
       skillVersion: recoveredSkill.version,
       skillContentHash: recoveredSkill.contentHash,
       skillAttachment: null,
-      removeSkill: async () => undefined,
-      skillRemoved: true,
+      attachmentCleanup: createKnowledgeBaseLivePreviewAttachmentCleanup(),
       finalAnalysis: analysis,
     });
     console.info("[KnowledgeBaseLivePreview] task recovered", {
@@ -996,6 +1073,7 @@ router.post("/confirm", async (req, res) => {
     : undefined;
   let sessionId = requestedSessionId;
   const rehydrating = !session;
+  let upstreamContinuationAccepted = false;
 
   try {
     if (!session) {
@@ -1043,8 +1121,7 @@ router.post("/confirm", async (req, res) => {
             : "3",
         skillContentHash: null,
         skillAttachment: null,
-        removeSkill: async () => undefined,
-        skillRemoved: true,
+        attachmentCleanup: createKnowledgeBaseLivePreviewAttachmentCleanup(),
         finalAnalysis: null,
       };
     }
@@ -1063,6 +1140,20 @@ router.post("/confirm", async (req, res) => {
         error: {
           code: "LIVE_PREVIEW_TURN_RUNNING",
           message: "上一轮确认仍在运行",
+        },
+      });
+      return;
+    }
+    if (
+      knowledgeBaseLivePreviewNeedsAuthoritativeFinalization(
+        session.progressState,
+      )
+    ) {
+      res.status(409).json({
+        error: {
+          code: "LIVE_PREVIEW_FINALIZATION_REQUIRES_AUTHORITATIVE_STATE",
+          message:
+            "本地预览不持有服务端已确认正文、官方 Logo 与客户素材原始字节，不能安全生成最终知识库 ZIP；请在 Dashboard 正式知识库流程中确认最后节点",
         },
       });
       return;
@@ -1095,20 +1186,13 @@ router.post("/confirm", async (req, res) => {
         skillVersion: descriptor.version,
         skillContentHash: descriptor.contentHash,
       });
-      const previousRemoveSkill = session.removeSkill;
       session.skillAttachment = currentSkill.attachment;
-      session.removeSkill = async () => {
-        await Promise.allSettled([
-          previousRemoveSkill(),
-          currentSkill.removeOrphan(),
-        ]);
-      };
-      session.skillRemoved = false;
+      session.attachmentCleanup.add(currentSkill.removeOrphan);
     }
 
     const turnId = randomUUID();
     const operationId = `live-preview:${sessionId}:confirm:${session.confirmationCount + 1}`;
-    const prompt = await buildKnowledgeBaseTurnPrompt({
+    const fullInstructions = await buildKnowledgeBaseTurnPrompt({
       userId: 0,
       conversationId: `live-preview-${sessionId}`,
       userMessage: "确认",
@@ -1119,15 +1203,38 @@ router.post("/confirm", async (req, res) => {
       protocolOperation:
         session.skillVersion === "4" ? { operationId, turnId } : undefined,
     });
+    const instructionDelivery = buildKnowledgeBaseInstructionDelivery({
+      instructions: fullInstructions,
+      skillVersion: session.skillVersion,
+      operationId,
+      turnId,
+    });
+    const instructionsUpload = await uploadUpstreamTaskAttachment({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey,
+      filename: instructionDelivery.filename,
+      bytes: instructionDelivery.bytes,
+      mimeType: instructionDelivery.mimeType,
+      idempotencyKey: `${operationId}:instructions`,
+    });
+    const skillAttachment = session.skillAttachment;
+    if (!skillAttachment) {
+      await instructionsUpload.removeOrphan().catch(() => undefined);
+      throw new Error("LIVE_PREVIEW_SKILL_ATTACHMENT_MISSING");
+    }
     const created = await createFrontMindTask({
       baseUrl: getUpstreamBaseUrl(),
       apiKey,
-      prompt,
-      attachments: [session.skillAttachment],
+      prompt: instructionDelivery.prompt,
+      attachments: [skillAttachment, instructionsUpload.attachment],
       taskId: session.taskId,
       idempotencyKey: operationId,
     });
     if (!created.ok) {
+      await instructionsUpload.removeOrphan().catch(() => undefined);
+      if (rehydrating) {
+        await session.attachmentCleanup.removeAll().catch(() => undefined);
+      }
       res.status(created.status).json({
         error: {
           code: "LIVE_PREVIEW_CONFIRM_FAILED",
@@ -1137,11 +1244,19 @@ router.post("/confirm", async (req, res) => {
       return;
     }
 
+    // Once the provider has accepted the task, retain this exact instruction
+    // file until the preview session expires so an asynchronous agent can
+    // continue reading it. The session cleanup remains idempotent.
+    session.attachmentCleanup.add(instructionsUpload.removeOrphan);
+    upstreamContinuationAccepted = true;
     session.taskId = created.task.id;
     session.apiKey = apiKey;
     session.mode = "continuation";
     session.createdAt = Date.now();
     session.finalAnalysis = null;
+    // Store immediately after provider acceptance. If local response analysis
+    // ever throws, the accepted task's system files still have an expiry owner.
+    livePreviewSessions.set(sessionId, session);
     let analysis = analyzeKnowledgeBaseLiveTask(created.task, {
       mode: "continuation",
       progressState: session.progressState,
@@ -1163,6 +1278,9 @@ router.post("/confirm", async (req, res) => {
     });
     res.status(201).json({ sessionId, analysis });
   } catch (error) {
+    if (rehydrating && !upstreamContinuationAccepted && session) {
+      await session.attachmentCleanup.removeAll().catch(() => undefined);
+    }
     res.status(422).json({
       error: {
         code: "LIVE_PREVIEW_CONFIRM_FAILED",
@@ -1353,9 +1471,8 @@ router.get("/:sessionId", async (req, res) => {
       if (session.mode === "protocol_probe") {
         session.apiKey = null;
       }
-      if (session.mode === "protocol_probe" && !session.skillRemoved) {
-        session.skillRemoved = true;
-        void session.removeSkill().catch(() => undefined);
+      if (session.mode === "protocol_probe") {
+        void session.attachmentCleanup.removeAll().catch(() => undefined);
       }
     }
     res.json({ sessionId: req.params.sessionId, analysis });

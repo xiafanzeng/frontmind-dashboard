@@ -295,9 +295,7 @@ describe("knowledge-base ChatInput actions", () => {
       target: { files: [logo] },
     });
     expect(screen.getByText("official-logo.png")).toBeInTheDocument();
-    fireEvent.click(
-      screen.getByRole("button", { name: "提交 Logo 并继续" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "提交 Logo 并继续" }));
 
     await waitFor(() =>
       expect(mocks.sendMessage).toHaveBeenCalledWith(
@@ -568,5 +566,30 @@ describe("knowledge-base ChatInput actions", () => {
     const sendIcon = container.querySelector("svg.lucide-send")!;
     expect(sendIcon).toBeInTheDocument();
     expect(sendIcon.closest("button")).not.toBeDisabled();
+  });
+
+  it("locks the ordinary composer while dedicated Logo provenance repair is required", () => {
+    mocks.activeConversation.knowledgeBase.notice = {
+      errorKey: "logo-provenance-required",
+      code: "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED",
+      message: "请重新上传同一张 Logo",
+      severity: "warning" as const,
+      retryable: false,
+      turnId: "turn-50",
+    };
+
+    const { container } = render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={progress}
+      />,
+    );
+
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    expect(container.querySelector('input[type="file"]')).toBeDisabled();
+    expect(
+      screen.queryByTestId("knowledge-node-action-card"),
+    ).not.toBeInTheDocument();
   });
 });

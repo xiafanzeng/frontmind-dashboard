@@ -29,6 +29,8 @@ import {
   deriveKnowledgeBaseInteraction,
   getKnowledgeBaseSkillDescriptor,
   isApprovedKnowledgeBaseAwaitingInputObservation,
+  knowledgeBaseArtifactFailureNotice,
+  loadKnowledgeBaseTurnAuthority,
   logKnowledgeBaseRuntimeFailure,
   normalizeRecoveredTaskOutput,
   normalizeKnowledgeBaseClientAttachmentManifest,
@@ -42,6 +44,9 @@ import {
   uploadKnowledgeBaseSkillArchive,
   withKnowledgeBaseOpenRecoveryLeaseHeartbeat,
 } from "./knowledge-base-api";
+import { KnowledgeBaseArtifactBindingError } from "./knowledge-base-artifact-binding-service";
+import { knowledgeBaseLogoRepairFileIsOwned } from "./knowledge-base-logo-provenance-api";
+import { applyKnowledgeBaseFinalLogoProvenanceObservation } from "./knowledge-base-logo-provenance-repair";
 
 function expectEnterpriseIdentityError(
   action: () => unknown,
@@ -108,6 +113,69 @@ describe("knowledge base execution contract", () => {
 
   it("keeps dashboard knowledge-base builds on the Pro model", () => {
     expect(KNOWLEDGE_BASE_AGENT_PROFILE).toBe("frontmind-pro");
+  });
+
+  it("projects missing final Logo provenance as a dedicated non-retryable repair notice", () => {
+    const progress = {
+      build: {
+        id: "build-final",
+        conversationId: "conversation-final",
+        companyName: "企业",
+        skillVersion: "4",
+        status: "protocol_error" as const,
+        revision: 50,
+        currentLeafId: "7.5",
+        protocolError: "旧的最终 ZIP 错误",
+        awaitingResponseSince: null,
+        updatedAt: 123,
+      },
+      summary: {
+        total: 50,
+        handled: 49,
+        confirmed: 49,
+        directPrefilled: 0,
+        pending: 0,
+        current: 1,
+        needsVerification: 0,
+      },
+      branches: [],
+      packageAllowed: false,
+    };
+    const ordinary = deriveKnowledgeBaseInteraction(progress, "failed");
+    const projected = applyKnowledgeBaseFinalLogoProvenanceObservation({
+      state: "missing",
+      progress,
+      interaction: ordinary,
+      observation: {
+        generation: 3,
+        activeTurn: null,
+        notice: {
+          key: "old",
+          code: "FINAL_PACKAGE_INVALID",
+          severity: "error",
+          message: "旧错误",
+          retryable: true,
+          turnId: null,
+          createdAt: 1,
+        },
+      },
+    });
+    expect(projected.notice).toMatchObject({
+      code: "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED",
+      retryable: false,
+    });
+    expect(projected.interaction).toMatchObject({
+      interactionState: "failed",
+      canReply: false,
+      canPublish: false,
+    });
+  });
+
+  it("authorizes a newly owned repair upload without comparing its credential to the historical task", () => {
+    expect(
+      knowledgeBaseLogoRepairFileIsOwned({ id: "fresh-credential-version" }),
+    ).toBe(true);
+    expect(knowledgeBaseLogoRepairFileIsOwned(null)).toBe(false);
   });
 
   it("treats an exact approved awaiting-input projection as observation-only", () => {
@@ -273,6 +341,39 @@ describe("knowledge base execution contract", () => {
         actualGeneration: 4,
       }),
     ).not.toThrow();
+  });
+
+  it("derives a turn build and parent task from one server-owned snapshot", async () => {
+    let currentBuild = {
+      id: "build-1",
+      userId: 7,
+      conversationId: "conversation-1",
+      upstreamTaskId: "task-parent",
+      revision: 3,
+    };
+    const loadBuild = vi.fn(async () => ({ ...currentBuild }) as any);
+
+    const pendingAuthority = loadKnowledgeBaseTurnAuthority(
+      { userId: 7, conversationId: "conversation-1" },
+      loadBuild,
+    );
+    currentBuild = {
+      ...currentBuild,
+      upstreamTaskId: "task-newly-bound",
+    };
+
+    await expect(pendingAuthority).resolves.toMatchObject({
+      build: {
+        id: "build-1",
+        userId: 7,
+        conversationId: "conversation-1",
+        upstreamTaskId: "task-parent",
+        revision: 3,
+      },
+      taskId: "task-parent",
+    });
+    expect(loadBuild).toHaveBeenCalledOnce();
+    expect(loadBuild).toHaveBeenCalledWith(7, "conversation-1");
   });
 
   it("routes only unrecoverable ready packages to explicit rebind", () => {
@@ -489,6 +590,10 @@ describe("knowledge base execution contract", () => {
       "00_web_intelligence_report.md",
       "Conversational image delivery",
       "validated local Logo byte attachment",
+      "references/output-format.md",
+      "python3 scripts/validate_archive.py FINAL.zip",
+      "VALID dashboard-enterprise-v1 archive",
+      "README/TXT marker",
     ]) {
       expect(skill).toContain(invariant);
     }
@@ -553,8 +658,8 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("不得确认或前进");
     expect(prompt).toContain("sourceKind=official_logo_upload");
     expect(prompt).toContain("imageSelection.method 必须为 customer_upload");
-    expect(prompt).toContain(`sourceUploadSha256=${sha256}`);
-    expect(prompt).toContain("sourceUploadFileId=file-official-logo");
+    expect(prompt).toContain(`"sourceUploadSha256":"${sha256}"`);
+    expect(prompt).toContain('"sourceUploadFileId":"file-official-logo"');
     expect(prompt).toContain('"leafId":"1.1"');
     expect(prompt).toContain('"to":"needs_verification"');
     expect(prompt).not.toContain('"to":"confirmed"');
@@ -620,6 +725,11 @@ describe("knowledge base execution contract", () => {
         operationId: "final-package-operation",
         turnId: "final-package-turn",
       },
+      finalizationInput: {
+        filename: "frontmind-kb-finalization-input-aaaaaaaaaaaaaaaa.zip",
+        sha256: "a".repeat(64),
+        assetCount: 2,
+      },
       progressOverride: {
         build: { revision: 46, currentLeafId: "7.2" },
         branches: [
@@ -627,8 +737,8 @@ describe("knowledge base execution contract", () => {
             leaves: [
               {
                 id: "7.2",
-                title: "技术支持与服务体系",
-                branchTitle: "合作、交付与支持",
+                title: "极长节点标题".repeat(2_000),
+                branchTitle: "极长分支标题".repeat(2_000),
                 status: "current",
               },
             ],
@@ -637,18 +747,41 @@ describe("knowledge base execution contract", () => {
       },
     });
 
-    expect(prompt).toContain("这是最终交付轮，不是纯文字轮次");
-    expect(prompt).toContain("application/zip 的 typed output_file");
-    expect(prompt).toContain("type=output_file、MIME=application/zip");
-    expect(prompt).toContain("恰好一个");
+    expect(prompt.length).toBeLessThanOrEqual(3_000);
+    expect(prompt).not.toContain("极长节点标题");
+    expect(prompt).not.toContain("极长分支标题");
+    expect(prompt).toContain("最终交付专用短指令");
+    expect(prompt).toContain("系统附件，不是客户补料");
+    expect(prompt).toContain("不得据此把动作改为 revise/needs_verification");
+    expect(prompt).toContain("application/zip");
     expect(prompt).toContain(
-      "operationId=final-package-operation、turnId=final-package-turn",
+      "frontmind-kb-finalization-input-aaaaaaaaaaaaaaaa.zip",
     );
-    expect(prompt).toContain("00_package_manifest.json 的 buildRevision 必须为 47");
-    expect(prompt).toContain("文件资源已经进入任务 output 之前不得结束任务");
-    expect(prompt).toContain("不能替代 ZIP 文件");
-    expect(prompt).toContain("不得只说“即将生成”“稍后生成”");
-    expect(prompt).not.toContain("这是非首轮知识节点回复，必须纯文字返回");
+    expect(prompt).toContain(`SHA-256=${"a".repeat(64)}`);
+    expect(prompt).toContain("2 个必须物理打包的图片素材");
+    expect(prompt).toContain("references/output-format.md");
+    expect(prompt).toContain("python3 scripts/validate_archive.py FINAL.zip");
+    expect(prompt).toContain(
+      "--finalization-input frontmind-kb-finalization-input-aaaaaaaaaaaaaaaa.zip",
+    );
+    expect(prompt).toContain(
+      `--expected-finalization-sha256 ${"a".repeat(64)}`,
+    );
+    expect(prompt).toContain("--expected-operation-id final-package-operation");
+    expect(prompt).toContain("--expected-turn-id final-package-turn");
+    expect(prompt).toContain("requiredManifest 必须逐字段原样复制");
+    expect(prompt).toContain("不得从任务历史生成 sourceUpload*");
+    expect(prompt).not.toContain("内部证据工作区");
+    expect(prompt).toContain("VALID dashboard-enterprise-v1 archive");
+    expect(prompt).toContain("README/TXT 素材占位");
+    expect(prompt).toContain("唯一一个 type=output_file、MIME=application/zip");
+    expect(prompt).toContain("operationId=final-package-operation");
+    expect(prompt).toContain("turnId=final-package-turn");
+    expect(prompt).toContain("成品 buildRevision=47");
+    expect(prompt).toContain("资源进入 output 前不得结束");
+    expect(prompt.match(/<!-- FRONTMIND_KB_PROGRESS/gu)).toHaveLength(1);
+    expect(prompt.match(/<!-- FRONTMIND_KB_PRESENTATION/gu)).toHaveLength(1);
+    expect(prompt).not.toContain("# 本轮上传资料");
     expect(
       prompt
         .trim()
@@ -656,6 +789,21 @@ describe("knowledge base execution contract", () => {
           '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":2,"operationId":"final-package-operation","turnId":"final-package-turn","revision":47,"leafId":null,"imageState":"not_applicable","assetIds":[],"imageCount":0}\n-->',
         ),
     ).toBe(true);
+  });
+
+  it("preserves the actionable v4 archive failure instead of hiding it", () => {
+    expect(
+      knowledgeBaseArtifactFailureNotice(
+        new KnowledgeBaseArtifactBindingError(
+          "PACKAGE_INVALID",
+          "新版知识库 ZIP 包含不支持的文件类型：assets/official_logo_README.txt",
+        ),
+      ),
+    ).toEqual({
+      code: "FINAL_PACKAGE_INVALID",
+      message:
+        "最终知识库 ZIP 不符合 Dashboard v4 归档合同：新版知识库 ZIP 包含不支持的文件类型：assets/official_logo_README.txt。本轮未推进；请重试本轮，系统会重新提供权威正文与全部素材，并要求生成端通过同一校验器后再交付。",
+    });
   });
 
   it("formats a retry with only the new operation and turn envelope identity", async () => {

@@ -138,7 +138,7 @@ describe("service portal adapter", () => {
     expect(portal.quotas).toEqual([
       {
         key: "industry",
-        label: "行业词",
+        label: "行业排名词",
         limit: 1,
         used: 1,
         unit: "个词",
@@ -189,6 +189,30 @@ describe("service portal adapter", () => {
         label: "先确认本周期服务问题",
       },
     });
+  });
+
+  it("does not expose legacy keyword labels from an array-shaped API response", () => {
+    const portal = normalizeServicePortal({
+      schemaVersion: 1,
+      service: {
+        planCode: "advanced",
+        planName: "进阶版",
+        status: "active",
+      },
+      quotas: [
+        { key: "industry", label: "行业词", limit: 1, used: 0 },
+        { key: "competitor", label: "竞品", limit: 1, used: 0 },
+        { key: "reputation", label: "舆情", limit: 1, used: 0 },
+        { key: "scenario", label: "场景", limit: 5, used: 0 },
+      ],
+    });
+
+    expect(portal.quotas.map(({ label }) => label)).toEqual([
+      "行业排名词",
+      "竞品对比词",
+      "美誉舆情词",
+      "产品场景词",
+    ]);
   });
 
   it("defensively locks knowledge building for a basic plan", () => {

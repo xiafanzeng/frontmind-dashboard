@@ -49,6 +49,7 @@ import {
 import type { FrontMindRequest } from "./_core/express-auth";
 import { requireExpressAuth } from "./_core/express-auth";
 import { safeErrorForLog } from "./_core/sensitive-data";
+import { parseUploadedJsonWithRepair } from "./model-output-repair";
 import {
   assertSafeExternalUrl,
   safeExternalRequestOptions,
@@ -80,6 +81,10 @@ import {
 } from "./knowledge-base-artifact";
 import { assertKnowledgeBasePublishable } from "./knowledge-base-progress-service";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
+import {
+  knowledgeBaseArchiveReadContractVersions,
+  knowledgeBaseArchiveRequiresV4UploadEvidence,
+} from "./knowledge-base-archive-contract";
 import {
   assertServiceCapability,
   ServiceEntitlementError,
@@ -126,8 +131,12 @@ import {
 import { readKnowledgeBuildArtifact } from "./knowledge-build-artifact-store";
 import { assertKnowledgeBasePackageMatchesBuild } from "./knowledge-base-package-validation";
 import {
+  importedKeywordCategoryCounts,
+  normalizeImportedKeywordTables,
+} from "./keyword-table-import";
+import {
   assertKnowledgeBaseCustomerUploadVisualBindings,
-  verifiedKnowledgeBaseCustomerUploadsForBuild,
+  verifiedKnowledgeBasePackageUploadEvidenceForBuild,
 } from "./knowledge-base-customer-upload";
 import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
 import {
@@ -140,7 +149,10 @@ import {
 import {
   decodeKnowledgeArchiveHeader as decodeHeader,
   effectiveKnowledgeArchiveCharacterCount as effectiveCharacterCount,
+  knowledgeArchiveContainsSourceInventoryHeading,
+  knowledgeArchiveContainsSourceInventoryTable,
   knowledgeArchiveFormalText as formalKnowledgeText,
+  knowledgeArchiveHeadingIsSourceInventory,
   knowledgeArchiveTitleFromPath as titleFromPath,
   markedKnowledgeArchiveFormalContent as markedFormalContent,
   normalizeKnowledgeArchiveTextDocument as normalizeTextDocument,
@@ -1612,11 +1624,7 @@ function customerDisplayMarkdown(markdown: string) {
       if (excludedSectionDepth !== undefined && depth <= excludedSectionDepth) {
         excludedSectionDepth = undefined;
       }
-      if (
-        /(?:原始|证据|引用|参考)?来源|素材清单|展示素材|机器清单|证据状态|状态头|sources?|references?|asset inventory/i.test(
-          heading[2] || "",
-        )
-      ) {
+      if (knowledgeArchiveHeadingIsSourceInventory(heading[2] || "")) {
         excludedSectionDepth = depth;
         continue;
       }
@@ -1854,6 +1862,12 @@ function validateProfilePackage(input: {
   profile: Exclude<KnowledgeBaseValidationProfile, "historical">;
   archiveContractVersion?: 1 | 2 | 3 | 4;
   archiveContractVersions?: readonly (1 | 2 | 3 | 4)[];
+  /**
+   * The v4 final-package binder can repair this one manifest field from the
+   * already validated formal document bytes, then immediately run the full
+   * validator again on the rewritten archive. No other validation is relaxed.
+   */
+  allowV4CustomerVisibleCharacterCountRepair?: boolean;
   packagePaths: string[];
   unpackedBytes: number;
   rawTextByRelativePath: Map<string, string>;
@@ -3006,9 +3020,8 @@ function validateProfilePackage(input: {
         );
       }
       if (
-        /^(?:#{1,6})\s+.*(?:(?:原始|证据|引用|参考)?来源|素材清单|展示素材|机器清单|证据状态|状态头|sources?|references?|asset inventory).*$/im.test(
-          markedContent,
-        ) ||
+        knowledgeArchiveContainsSourceInventoryHeading(markedContent) ||
+        knowledgeArchiveContainsSourceInventoryTable(markedContent) ||
         /^\s*>\s*.*(?:状态|status)\s*[:：].*(?:来源|source)\s*[:：]/im.test(
           markedContent,
         )
@@ -3154,7 +3167,14 @@ function validateProfilePackage(input: {
         : `正式正文不得超过 ${limits.maxCharacters} 个有效字符`,
     );
   }
-  if (manifest.counts.customerVisibleCharacters !== formalCharacters) {
+  if (
+    manifest.counts.customerVisibleCharacters !== formalCharacters &&
+    !(
+      input.allowV4CustomerVisibleCharacterCountRepair === true &&
+      manifest.schemaVersion === 4 &&
+      input.profile === "dashboard-enterprise-v1"
+    )
+  ) {
     throw new KnowledgeArchiveValidationError(
       "content",
       "package manifest 正式正文字数与服务端复算结果不一致",
@@ -3727,7 +3747,7 @@ function dashboardPayloadFromModuleJson(input: {
   module: Exclude<DashboardImportModule, "section-table" | "response-logic">;
   currentRevision?: number;
 }) {
-  const raw = JSON.parse(input.text);
+  const raw = parseUploadedJsonWithRepair(input.text);
   if (input.module === "full") return dashboardPayloadSchema.parse(raw);
   if (input.currentRevision === undefined) {
     throw new DashboardTemplateRevisionError(
@@ -4038,6 +4058,19 @@ export function buildDashboardModuleImportPreview(input: {
         key: (table) => table.id,
       }),
     );
+    const categoryCounts = importedKeywordCategoryCounts(
+      input.incoming.keywordTables,
+    );
+    if (categoryCounts) {
+      changedFields.push({
+        field: "keywordCategories",
+        label: "四类标签映射",
+        before: "按原词表分类",
+        after: Object.entries(categoryCounts)
+          .map(([label, count]) => `${label} ${count} 条`)
+          .join(" · "),
+      });
+    }
   } else if (input.module === "questions") {
     recordStatsList.push(
       recordStats({
@@ -4181,7 +4214,7 @@ type AuthoritativeServiceQuestion = {
 const DASHBOARD_QUESTION_GROUPS = {
   industry: {
     groupId: "ranking",
-    groupTitle: "行业词",
+    groupTitle: "行业排名词",
     tone: "amber" as const,
   },
   competitor_comparison: {
@@ -5226,7 +5259,7 @@ async function responseLogicImportsFromFile(input: {
 }) {
   const extension = path.extname(input.sourceFileName).toLowerCase();
   if (extension === ".json") {
-    const raw = JSON.parse(input.buffer.toString("utf8"));
+    const raw = parseUploadedJsonWithRepair(input.buffer.toString("utf8"));
     const source =
       raw && typeof raw === "object" && !Array.isArray(raw)
         ? (raw as Record<string, unknown>)
@@ -5274,7 +5307,7 @@ async function responseLogicImportsFromFile(input: {
   });
 }
 
-async function tabularTablesFromFile(input: {
+export async function tabularTablesFromFile(input: {
   buffer: Buffer;
   sourceFileName: string;
 }) {
@@ -5813,6 +5846,7 @@ export async function readKnowledgeArchive(
     validationProfile?: KnowledgeBaseValidationProfile;
     archiveContractVersion?: 1 | 2 | 3 | 4;
     archiveContractVersions?: readonly (1 | 2 | 3 | 4)[];
+    allowV4CustomerVisibleCharacterCountRepair?: boolean;
   } = {},
 ) {
   const validationProfile = options.validationProfile ?? "historical";
@@ -6064,6 +6098,8 @@ export async function readKnowledgeArchive(
             profile: validationProfile,
             archiveContractVersion: options.archiveContractVersion,
             archiveContractVersions: options.archiveContractVersions,
+            allowV4CustomerVisibleCharacterCountRepair:
+              options.allowV4CustomerVisibleCharacterCountRepair,
             packagePaths,
             unpackedBytes,
             rawTextByRelativePath,
@@ -6239,6 +6275,40 @@ export function assertKnowledgeArchiveEnterpriseIdentity(input: {
       `知识库包未声明当前账号绑定企业“${input.brandName}”，请核对目标用户后重新上传`,
     );
   }
+}
+
+/**
+ * A knowledge snapshot authenticated for the current service is durable proof
+ * of the same enterprise identity: every snapshot passes
+ * assertKnowledgeArchiveEnterpriseIdentity before it becomes active. Older
+ * workspaces did not persist enterpriseIdentityBoundAt during publication, so
+ * the first keyword import accepts the matching snapshot and backfills the
+ * flag in the same dashboard write.
+ */
+export function dashboardImportEnterpriseIdentityBinding(input: {
+  module: DashboardAdminImportModule;
+  enterpriseIdentityBoundAt?: number | null;
+  brandName: string;
+  knowledgeAuthenticatedForCurrentService: boolean;
+  knowledgeSnapshot: { documents: KnowledgeDocument[] } | null;
+}) {
+  if (input.module === "profile") return true;
+  if (input.enterpriseIdentityBoundAt) return false;
+  if (
+    input.module !== "keywords" ||
+    !input.knowledgeAuthenticatedForCurrentService ||
+    !input.knowledgeSnapshot
+  ) {
+    throw new Error(
+      "请先由管理员确认并发布当前账号的企业名称，再上传其他内容板块",
+    );
+  }
+  assertKnowledgeArchiveEnterpriseIdentity({
+    enterpriseIdentityConfirmed: false,
+    brandName: input.brandName,
+    documents: input.knowledgeSnapshot.documents,
+  });
+  return true;
 }
 
 function upstreamHeaders(apiKey: string) {
@@ -6714,12 +6784,9 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       {
         validationProfile:
           build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
-        archiveContractVersions:
-          build.skillVersion === "1"
-            ? undefined
-            : build.skillVersion === "4"
-              ? [3, 4]
-              : [2, 3],
+        archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
+          build.skillVersion,
+        ),
       },
     );
     storedAssetKeys = parsed.storedAssetKeys;
@@ -6738,14 +6805,26 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
         .select()
         .from(knowledgeBaseBuildNodes)
         .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
-      const expectedCustomerUploads =
-        build.skillVersion === "4"
-          ? await verifiedKnowledgeBaseCustomerUploadsForBuild({
-              userId: targetUserId,
-              buildId: build.id,
-              generation: build.generation,
-            })
-          : [];
+      const {
+        expectedCustomerUploads,
+        expectedOfficialLogoUpload,
+        expectedOfficialLogoProvenance,
+      } = knowledgeBaseArchiveRequiresV4UploadEvidence(
+        build.skillVersion,
+        parsed.packageSchemaVersion,
+      )
+        ? await verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+            userId: targetUserId,
+            buildId: build.id,
+            generation: build.generation,
+            officialLogoSha256: build.logoSha256,
+            packageArchiveSha256: build.packageArchiveSha256,
+          })
+        : {
+            expectedCustomerUploads: [],
+            expectedOfficialLogoUpload: undefined,
+            expectedOfficialLogoProvenance: undefined,
+          };
       assertKnowledgeBasePackageMatchesBuild({
         nodes: nodes.map((node) => ({
           leafId: node.leafId,
@@ -6762,7 +6841,10 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
         expectedLogoSha256: String(build.logoSha256 || ""),
         packageSchemaVersion: parsed.packageSchemaVersion,
         expectedCustomerUploads,
+        expectedOfficialLogoUpload,
+        expectedOfficialLogoProvenance,
         legacyV3Compatibility: build.skillVersion === "3",
+        legacyV4ReadCompatibility: build.skillVersion === "4",
       });
       if (parsed.packageSchemaVersion === 4) {
         await assertKnowledgeBaseCustomerUploadVisualBindings({
@@ -6944,7 +7026,6 @@ router.put(
             "profile",
             "metrics",
             "sections",
-            "keywords",
             "questions",
             "response-logic",
             "content-assets",
@@ -6956,15 +7037,24 @@ router.put(
         if (importModule === "optimization-report" && extension !== ".json") {
           throw new Error("进度报告仅支持带修订号的 JSON 当前内容模板");
         }
-        if (!existing.enterpriseIdentityBoundAt && importModule !== "profile") {
-          throw new Error(
-            "请先由管理员确认并发布当前账号的企业名称，再上传其他内容板块",
-          );
-        }
+        const knowledgeIdentitySnapshot =
+          !existing.enterpriseIdentityBoundAt && importModule === "keywords"
+            ? await getLatestKnowledgeSnapshot(targetUserId)
+            : null;
+        const bindEnterpriseIdentity = dashboardImportEnterpriseIdentityBinding(
+          {
+            module: importModule,
+            enterpriseIdentityBoundAt: existing.enterpriseIdentityBoundAt,
+            brandName: existing.payload.brandName,
+            knowledgeAuthenticatedForCurrentService:
+              servicePortal.knowledge.authenticatedForCurrentService,
+            knowledgeSnapshot: knowledgeIdentitySnapshot,
+          },
+        );
         if (importModule === "response-logic") {
           if (extension === ".json") {
             parseDashboardModuleTemplateMetadata({
-              raw: JSON.parse(buffer.toString("utf8")),
+              raw: parseUploadedJsonWithRepair(buffer.toString("utf8")),
               expectedModule: "response-logic",
               currentRevision: existing.revision,
             });
@@ -7075,7 +7165,7 @@ router.put(
             );
           }
           const template = parseAuthoritativeQuestionsTemplate({
-            raw: JSON.parse(buffer.toString("utf8")),
+            raw: parseUploadedJsonWithRepair(buffer.toString("utf8")),
             currentRevision: existing.revision,
             currentQuestions: servicePortal.purchasedQuestions,
           });
@@ -7174,7 +7264,7 @@ router.put(
           });
           const { template, changedBatchCount } =
             parseMonitoringCurrentTemplate({
-              raw: JSON.parse(buffer.toString("utf8")),
+              raw: parseUploadedJsonWithRepair(buffer.toString("utf8")),
               currentRevision: existing.revision,
               workspaceUserId: targetUserId,
               currentBatches,
@@ -7332,10 +7422,12 @@ router.put(
             importModule === "keywords" && extension !== ".json"
               ? dashboardPayloadSchema.parse({
                   ...existing.payload,
-                  keywordTables: await tabularTablesFromFile({
-                    buffer,
-                    sourceFileName,
-                  }),
+                  keywordTables: normalizeImportedKeywordTables(
+                    await tabularTablesFromFile({
+                      buffer,
+                      sourceFileName,
+                    }),
+                  ),
                 })
               : await dashboardPayloadFromFile({
                   buffer,
@@ -7638,7 +7730,7 @@ router.put(
           targetUserId,
           payload,
           sourceFileName,
-          bindEnterpriseIdentity: importModule === "profile",
+          bindEnterpriseIdentity,
           expectedRevision,
           progressReportPeriods:
             importModule === "optimization-report"

@@ -21,8 +21,10 @@ import {
 } from "./knowledge-base-package-validation";
 import {
   assertKnowledgeBaseCustomerUploadVisualBindings,
+  declaredKnowledgeBaseCustomerUploadImagesFromTurn,
+  persistedKnowledgeBaseCustomerUploadBytesForBuild,
   verifiedKnowledgeBaseCustomerUploadImagesFromTurn,
-  verifiedKnowledgeBaseCustomerUploadsForBuild,
+  verifiedKnowledgeBasePackageUploadEvidenceForBuild,
 } from "./knowledge-base-customer-upload";
 import {
   KnowledgeBuildArtifactError,
@@ -31,6 +33,10 @@ import {
   type KnowledgeBuildArtifactKind,
 } from "./knowledge-build-artifact-store";
 import { readStoredPresalesFile } from "./presales-file-store";
+import {
+  knowledgeBaseArchiveReadContractVersions,
+  knowledgeBaseArchiveRequiresV4UploadEvidence,
+} from "./knowledge-base-archive-contract";
 
 const router = Router();
 const MAX_CUSTOMER_UPLOAD_SOURCE_BYTES = 100 * 1024 * 1024;
@@ -283,12 +289,9 @@ async function serveBuildArtifact(
         expectedBytes: descriptor.bytes,
         validationProfile:
           build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
-        archiveContractVersions:
-          build.skillVersion === "1"
-            ? undefined
-            : build.skillVersion === "4"
-              ? [3, 4]
-              : [2, 3],
+        archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
+          build.skillVersion,
+        ),
         ...(build.skillVersion === "3" || build.skillVersion === "4"
           ? {
               validateParsed: async (parsed) => {
@@ -301,14 +304,26 @@ async function serveBuildArtifact(
                     "知识库最终 ZIP buildRevision 与已绑定版本不一致",
                   );
                 }
-                const expectedCustomerUploads =
-                  build.skillVersion === "4"
-                    ? await verifiedKnowledgeBaseCustomerUploadsForBuild({
-                        userId,
-                        buildId: build.id,
-                        generation: build.generation,
-                      })
-                    : [];
+                const {
+                  expectedCustomerUploads,
+                  expectedOfficialLogoUpload,
+                  expectedOfficialLogoProvenance,
+                } = knowledgeBaseArchiveRequiresV4UploadEvidence(
+                  build.skillVersion,
+                  parsed.packageSchemaVersion,
+                )
+                  ? await verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+                      userId,
+                      buildId: build.id,
+                      generation: build.generation,
+                      officialLogoSha256: build.logoSha256,
+                      packageArchiveSha256: build.packageArchiveSha256,
+                    })
+                  : {
+                      expectedCustomerUploads: [],
+                      expectedOfficialLogoUpload: undefined,
+                      expectedOfficialLogoProvenance: undefined,
+                    };
                 assertKnowledgeBasePackageMatchesBuild({
                   nodes: nodes.map((node) => ({
                     leafId: node.leafId,
@@ -325,7 +340,10 @@ async function serveBuildArtifact(
                   expectedLogoSha256: String(build.logoSha256 || ""),
                   packageSchemaVersion: parsed.packageSchemaVersion,
                   expectedCustomerUploads,
+                  expectedOfficialLogoUpload,
+                  expectedOfficialLogoProvenance,
                   legacyV3Compatibility: build.skillVersion === "3",
+                  legacyV4ReadCompatibility: build.skillVersion === "4",
                 });
                 if (parsed.packageSchemaVersion === 4) {
                   await assertKnowledgeBaseCustomerUploadVisualBindings({
@@ -650,8 +668,14 @@ async function serveCustomerUploadPreview(
   }
 
   try {
+    const usePersistedEvidence =
+      build.skillVersion === "4" &&
+      (build.status === "ready_to_publish" || build.status === "published") &&
+      /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || ""));
     const image = (
-      await verifiedKnowledgeBaseCustomerUploadImagesFromTurn(turn)
+      usePersistedEvidence
+        ? declaredKnowledgeBaseCustomerUploadImagesFromTurn(turn)
+        : await verifiedKnowledgeBaseCustomerUploadImagesFromTurn(turn)
     ).find(
       (candidate) =>
         candidate.turnId === turnId &&
@@ -665,20 +689,30 @@ async function serveCustomerUploadPreview(
         "补充图片不存在",
       );
     }
-    const stored = await readStoredPresalesFile(image.fileId);
-    if (
-      !stored ||
-      stored.filename !== image.filename ||
-      stored.sizeBytes !== image.sizeBytes ||
-      stored.sha256?.toLowerCase() !== image.sourceSha256
-    ) {
-      throw new CustomerUploadPreviewError(
-        409,
-        "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
-        "补充图片完整性校验未通过",
-      );
-    }
-    const sourceBytes = await readCustomerUploadBytes(stored);
+    const sourceBytes = usePersistedEvidence
+      ? await persistedKnowledgeBaseCustomerUploadBytesForBuild({
+          userId,
+          buildId: build.id,
+          generation: build.generation,
+          packageArchiveSha256: build.packageArchiveSha256!,
+          sourceSha256: image.sourceSha256,
+        })
+      : await (async () => {
+          const stored = await readStoredPresalesFile(image.fileId);
+          if (
+            !stored ||
+            stored.filename !== image.filename ||
+            stored.sizeBytes !== image.sizeBytes ||
+            stored.sha256?.toLowerCase() !== image.sourceSha256
+          ) {
+            throw new CustomerUploadPreviewError(
+              409,
+              "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
+              "补充图片完整性校验未通过",
+            );
+          }
+          return readCustomerUploadBytes(stored);
+        })();
     if (
       createHash("sha256").update(sourceBytes).digest("hex") !==
       image.sourceSha256

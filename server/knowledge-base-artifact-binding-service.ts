@@ -16,12 +16,16 @@ import {
 import { getDb } from "./db";
 import {
   downloadArchiveBytes,
+  KnowledgeArchiveValidationError,
   readKnowledgeArchive,
   readStoredKnowledgeAssetBytes,
   removeStoredKnowledgeAssets,
 } from "./dashboard-api";
 import {
+  assertKnowledgeBaseArtifactIdentity,
   collectKnowledgeArchiveDescriptors,
+  KnowledgeBaseArtifactIdentityError,
+  KnowledgeBaseFinalOutputResourceContractError,
   knowledgeArchiveBoundDescriptorHash,
   knowledgeArchiveDescriptorHash,
   knowledgeArchiveFileIdFromUrl,
@@ -30,9 +34,13 @@ import {
 } from "./knowledge-base-artifact";
 import {
   assertKnowledgeBasePackageMatchesBuild,
+  KnowledgeBasePackageBindingError,
   selectLegacyKnowledgeBaseLogoAsset,
 } from "./knowledge-base-package-validation";
-import { canonicalizeKnowledgeBaseFinalArchive } from "./knowledge-base-package-canonicalization";
+import {
+  canonicalizeKnowledgeBaseFinalArchive,
+  KnowledgeBasePackageCanonicalizationError,
+} from "./knowledge-base-package-canonicalization";
 import {
   createKnowledgeBaseAuthoritativeFinalOutput,
   deriveKnowledgeBaseAuthoritativeFinalizationPlan,
@@ -41,8 +49,7 @@ import {
 } from "./knowledge-base-finalization";
 import {
   assertKnowledgeBaseCustomerUploadVisualBindings,
-  verifiedKnowledgeBaseCustomerUploadsForBuild,
-  verifiedKnowledgeBaseOfficialLogoUploadForBuild,
+  verifiedKnowledgeBasePackageUploadEvidenceForBuild,
 } from "./knowledge-base-customer-upload";
 import {
   KnowledgeBuildArtifactError,
@@ -61,6 +68,7 @@ import {
   canPackageKnowledgeBase,
   parseKnowledgeBaseManifestEnvelope,
   parseKnowledgeBaseProgressEnvelope,
+  type KnowledgeBaseOfficialLogoProvenance,
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
 import {
@@ -70,6 +78,13 @@ import {
   knowledgeBaseOutputImageDescriptorHash,
   selectKnowledgeBaseProtocolOperationOutput,
 } from "./knowledge-base-progress-service";
+import { getKnowledgeBaseSkillDescriptor } from "./knowledge-base-skill-runtime";
+import {
+  knowledgeBaseArchiveRequiresV4UploadEvidence,
+  knowledgeBaseArchiveReadContractVersions,
+  knowledgeBaseArchiveWriteContractVersions,
+} from "./knowledge-base-archive-contract";
+import { runKnowledgePackageLiveShadow } from "./knowledge-base-package-shadow-live";
 
 const MAX_LOGO_DOWNLOAD_BYTES = 15 * 1024 * 1024;
 const OFFICIAL_LOGO_UPLOAD_MIME_TYPES = new Set([
@@ -79,6 +94,12 @@ const OFFICIAL_LOGO_UPLOAD_MIME_TYPES = new Set([
   "image/png",
   "image/webp",
 ]);
+
+export {
+  knowledgeBaseArchiveRequiresV4UploadEvidence,
+  knowledgeBaseArchiveReadContractVersions,
+  knowledgeBaseArchiveWriteContractVersions,
+} from "./knowledge-base-archive-contract";
 
 type KnowledgeBaseLogoDescriptor = {
   fileId?: string;
@@ -94,14 +115,139 @@ export class KnowledgeBaseArtifactBindingError extends Error {
       | "LOGO_AMBIGUOUS"
       | "LOGO_UPLOAD_INVALID"
       | "PACKAGE_NOT_READY"
+      | "PACKAGE_INVALID"
       | "PACKAGE_AMBIGUOUS"
       | "BUILD_CHANGED"
+      | "ARTIFACT_IDENTITY_INVALID"
       | "ARTIFACT_DOWNLOAD_FAILED",
     message: string,
   ) {
     super(message);
     this.name = "KnowledgeBaseArtifactBindingError";
   }
+}
+
+function assertKnowledgeBaseBindingIdentity(
+  value: unknown,
+  label: string,
+  required = true,
+) {
+  try {
+    const identity = assertKnowledgeBaseArtifactIdentity({
+      value,
+      label,
+      required,
+    });
+    if (identity !== undefined && identity !== String(value)) {
+      throw new KnowledgeBaseArtifactIdentityError(
+        `${label} 含首尾空白，拒绝改写后继续绑定`,
+      );
+    }
+    return identity;
+  } catch (error) {
+    if (error instanceof KnowledgeBaseArtifactIdentityError) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "ARTIFACT_IDENTITY_INVALID",
+        error.message,
+      );
+    }
+    throw error;
+  }
+}
+
+function collectKnowledgeArchiveDescriptorsForBinding(value: unknown) {
+  try {
+    return collectKnowledgeArchiveDescriptors(value);
+  } catch (error) {
+    if (error instanceof KnowledgeBaseArtifactIdentityError) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "PACKAGE_INVALID",
+        error.message,
+      );
+    }
+    throw error;
+  }
+}
+
+async function readKnowledgeArchiveForBinding(
+  ...args: Parameters<typeof readKnowledgeArchive>
+) {
+  try {
+    return await readKnowledgeArchive(...args);
+  } catch (error) {
+    if (error instanceof KnowledgeArchiveValidationError) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "PACKAGE_INVALID",
+        error.message,
+      );
+    }
+    throw error;
+  }
+}
+
+async function observeValidatedV4PackageShadow(input: {
+  buildId: string;
+  generation: number;
+  archiveBytes: Buffer;
+  parsed: Awaited<ReturnType<typeof readKnowledgeArchive>>;
+  nodes: ReadonlyArray<{
+    leafId: string;
+    contentMarkdown: string | null;
+  }>;
+}) {
+  try {
+    await runKnowledgePackageLiveShadow({
+      buildId: input.buildId,
+      generation: input.generation,
+      archiveBytes: input.archiveBytes,
+      validatedArchive: input.parsed,
+      serverLeafMarkdownById: new Map(
+        input.nodes.flatMap((node) =>
+          typeof node.contentMarkdown === "string"
+            ? [[node.leafId, node.contentMarkdown] as const]
+            : [],
+        ),
+      ),
+      readDashboardAssetBytes: (asset) =>
+        readStoredKnowledgeAssetBytes(asset.key),
+      validateArchive: async (bytes) => {
+        const candidate = await readKnowledgeArchiveForBinding(
+          bytes,
+          "FINAL.shadow.zip",
+          randomUUID(),
+          {
+            validationProfile: "dashboard-enterprise-v1",
+            archiveContractVersions: [4],
+          },
+        );
+        try {
+          return candidate;
+        } finally {
+          await removeStoredKnowledgeAssets(candidate.storedAssetKeys);
+        }
+      },
+      // The current v4 transport deliberately permits one physical FINAL.zip
+      // only. Until the provider transport gains an independently reviewed
+      // text supplement contract, Shadow B records the safe missing reason.
+      supplementText: undefined,
+    });
+  } catch {
+    // Keep a second failure-isolation boundary at the authoritative caller so
+    // a future shadow implementation regression cannot block FINAL.zip.
+  }
+}
+
+function rethrowKnowledgeBasePackageContentError(error: unknown): never {
+  if (
+    error instanceof KnowledgeBasePackageBindingError ||
+    error instanceof KnowledgeBasePackageCanonicalizationError
+  ) {
+    throw new KnowledgeBaseArtifactBindingError(
+      "PACKAGE_INVALID",
+      error.message,
+    );
+  }
+  throw error;
 }
 
 export function assertKnowledgeBaseOfficialLogoMimeMatches(input: {
@@ -169,6 +315,7 @@ export interface KnowledgeBaseStagedArtifactCandidate {
   packageRevision?: number;
   outputItemId?: string;
   fileId?: string;
+  officialLogoProvenance?: KnowledgeBaseOfficialLogoProvenance;
 }
 
 type ReadyPackageIdentity = Pick<
@@ -551,6 +698,87 @@ async function downloadLogoBytes(input: {
   return buffer;
 }
 
+async function assertInitialLogoProvenanceMatchesBytes(input: {
+  provenance: KnowledgeBaseOfficialLogoProvenance;
+  logoBytes: Buffer;
+  companyWebsite: string | null;
+  activeTurnMetadata: unknown;
+  apiKey: string;
+  baseUrl: string;
+}) {
+  if (input.provenance.sourceKind === "official_web") {
+    const officialHosts = String(input.companyWebsite || "")
+      .split(/[\s,，;；]+/u)
+      .flatMap((candidate) => {
+        try {
+          return [new URL(candidate).hostname.toLowerCase()];
+        } catch {
+          return [];
+        }
+      });
+    const pageHost = new URL(
+      input.provenance.sourcePageUrl,
+    ).hostname.toLowerCase();
+    if (
+      officialHosts.length === 0 ||
+      !officialHosts.some(
+        (host) =>
+          pageHost === host ||
+          pageHost.endsWith(`.${host}`) ||
+          host.endsWith(`.${pageHost}`),
+      )
+    ) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "LOGO_UPLOAD_INVALID",
+        "首轮 Logo 来源页不属于账号绑定的企业官网",
+      );
+    }
+    const sourceBytes = await downloadLogoBytes({
+      descriptor: {
+        url: input.provenance.sourceAssetUrl,
+        filename: "official-logo-source",
+        mimeType: "application/octet-stream",
+      },
+      apiKey: input.apiKey,
+      baseUrl: input.baseUrl,
+    });
+    if (!sourceBytes.equals(input.logoBytes)) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "LOGO_UPLOAD_INVALID",
+        "首轮 Logo 来源 URL 的字节与实际返回 Logo 不一致",
+      );
+    }
+    return;
+  }
+
+  const metadata = isRecord(input.activeTurnMetadata)
+    ? input.activeTurnMetadata
+    : {};
+  const recovery = isRecord(metadata.recovery) ? metadata.recovery : {};
+  const attachments = Array.isArray(recovery.attachments)
+    ? recovery.attachments
+    : [];
+  const sourceBasename = path
+    .basename(input.provenance.sourceDocumentPath)
+    .normalize("NFKC")
+    .toLowerCase();
+  const matchesInitialUpload = attachments.some((attachment) => {
+    const value = isRecord(attachment) ? attachment : {};
+    return (
+      path
+        .basename(String(value.filename || ""))
+        .normalize("NFKC")
+        .toLowerCase() === sourceBasename
+    );
+  });
+  if (!matchesInitialUpload) {
+    throw new KnowledgeBaseArtifactBindingError(
+      "LOGO_UPLOAD_INVALID",
+      "首轮 Logo 的 sourceDocumentPath 未匹配本轮初始上传资料",
+    );
+  }
+}
+
 async function requiredDb() {
   const db = await getDb();
   if (!db) {
@@ -655,6 +883,50 @@ export type KnowledgeBaseOfficialLogoUpload = {
   sourceSha256: string;
 };
 
+export function knowledgeBaseExistingLogoUploadBindingDecision(input: {
+  buildLogoSha256: string | null;
+  buildLogoBytes: number | null;
+  buildLogoMimeType: string | null;
+  stagedSha256: string;
+  stagedBytes: number;
+  stagedMimeType: string;
+  existingUpload: Record<string, unknown> | null;
+  verifiedUpload: KnowledgeBaseOfficialLogoUpload;
+}) {
+  const sameExistingUpload = input.existingUpload
+    ? (
+        Object.keys(input.verifiedUpload) as Array<
+          keyof KnowledgeBaseOfficialLogoUpload
+        >
+      ).every(
+        (key) => input.existingUpload?.[key] === input.verifiedUpload[key],
+      ) &&
+      Object.keys(input.existingUpload).every((key) =>
+        Object.prototype.hasOwnProperty.call(input.verifiedUpload, key),
+      )
+    : false;
+  if (input.existingUpload && !sameExistingUpload) {
+    throw new KnowledgeBaseArtifactBindingError(
+      "BUILD_CHANGED",
+      "当前轮次已绑定另一份企业官方主 Logo 上传账本",
+    );
+  }
+  if (!input.buildLogoSha256) return "bind_artifact" as const;
+  if (
+    input.buildLogoSha256 !== input.stagedSha256 ||
+    input.buildLogoBytes !== input.stagedBytes ||
+    input.buildLogoMimeType !== input.stagedMimeType
+  ) {
+    throw new KnowledgeBaseArtifactBindingError(
+      "BUILD_CHANGED",
+      "企业官方主 Logo 已由另一轮操作绑定，请刷新后继续",
+    );
+  }
+  return input.existingUpload
+    ? ("already_complete" as const)
+    : ("repair_provenance" as const);
+}
+
 async function readOfficialLogoUploadBytes(input: {
   fileId: string;
   filename: string;
@@ -717,8 +989,13 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
   expectedLeafId: string;
   upload: Omit<KnowledgeBaseOfficialLogoUpload, "verified">;
 }) {
+  const uploadFileId = assertKnowledgeBaseBindingIdentity(
+    input.upload.fileId,
+    "客户上传文件标识",
+  )!;
   const upload = {
     ...input.upload,
+    fileId: uploadFileId,
     filename: String(input.upload.filename || "").trim(),
     mimeType: String(input.upload.mimeType || "")
       .trim()
@@ -816,8 +1093,9 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
     verified: true,
     ...upload,
   };
+  let duplicateBuildArtifact = false;
   try {
-    return await db.transaction(async (tx) => {
+    const result = await db.transaction(async (tx) => {
       const build = (
         await tx
           .select()
@@ -880,17 +1158,21 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
           "当前首个知识节点状态已变化，请刷新后重新上传 Logo",
         );
       }
-      if (build.logoSha256) {
-        if (build.logoSha256 !== staged.sha256) {
-          throw new KnowledgeBaseArtifactBindingError(
-            "BUILD_CHANGED",
-            "企业官方主 Logo 已由另一轮操作绑定，请刷新后继续",
-          );
-        }
-        return verifiedUpload;
-      }
       const metadata = isRecord(turn.metadata) ? turn.metadata : {};
       const recovery = isRecord(metadata.recovery) ? metadata.recovery : {};
+      const existingUpload = isRecord(recovery.officialLogoUpload)
+        ? recovery.officialLogoUpload
+        : null;
+      const bindingDecision = knowledgeBaseExistingLogoUploadBindingDecision({
+        buildLogoSha256: build.logoSha256,
+        buildLogoBytes: build.logoBytes,
+        buildLogoMimeType: build.logoMimeType,
+        stagedSha256: staged.sha256,
+        stagedBytes: staged.bytes,
+        stagedMimeType,
+        existingUpload,
+        verifiedUpload,
+      });
       const nextMetadata = {
         ...metadata,
         recovery: {
@@ -898,6 +1180,19 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
           officialLogoUpload: verifiedUpload,
         },
       };
+      if (build.logoSha256) {
+        // A crash/replay may have committed the immutable artifact before the
+        // turn provenance marker. Same bytes are not enough: repair the exact
+        // active turn ledger before reporting success.
+        if (bindingDecision === "repair_provenance") {
+          await tx
+            .update(conversationTurns)
+            .set({ metadata: nextMetadata, updatedAt: new Date() })
+            .where(eq(conversationTurns.id, input.turnId));
+        }
+        duplicateBuildArtifact = staged.storageKey !== build.logoStorageKey;
+        return verifiedUpload;
+      }
       await tx
         .update(knowledgeBaseBuilds)
         .set({
@@ -924,6 +1219,8 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
         .where(eq(conversationTurns.id, input.turnId));
       return verifiedUpload;
     });
+    if (duplicateBuildArtifact) await removeStaged();
+    return result;
   } catch (error) {
     await removeStaged();
     throw error;
@@ -939,6 +1236,7 @@ export async function bindKnowledgeBaseInitialLogo(input: {
   apiKey: string;
   baseUrl: string;
 }) {
+  assertKnowledgeBaseBindingIdentity(input.taskId, "上游任务标识");
   const { db, build, activeTurn } = await loadBoundBuild(input);
   const operationOutput =
     build.skillVersion === "4"
@@ -958,7 +1256,18 @@ export async function bindKnowledgeBaseInitialLogo(input: {
     activeTurn,
     envelope: manifest,
   });
-  const descriptors = collectKnowledgeBaseLogoDescriptors(operationOutput);
+  let descriptors: KnowledgeBaseLogoDescriptor[];
+  try {
+    descriptors = collectKnowledgeBaseLogoDescriptors(operationOutput);
+  } catch (error) {
+    if (error instanceof KnowledgeBaseArtifactIdentityError) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "LOGO_UPLOAD_INVALID",
+        error.message,
+      );
+    }
+    throw error;
+  }
   if (descriptors.length === 0) {
     throw new KnowledgeBaseArtifactBindingError(
       "LOGO_NOT_READY",
@@ -979,11 +1288,33 @@ export async function bindKnowledgeBaseInitialLogo(input: {
       );
     }
     const descriptor = descriptors[0]!;
+    const latestV4Skill = await getKnowledgeBaseSkillDescriptor({
+      version: "4",
+    });
+    if (
+      !manifest.officialLogo &&
+      build.skillContentHash === latestV4Skill.contentHash
+    ) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "LOGO_UPLOAD_INVALID",
+        "首轮官方主 Logo 缺少精确来源账本",
+      );
+    }
     const buffer = await downloadLogoBytes({
       descriptor,
       apiKey: input.apiKey,
       baseUrl: input.baseUrl,
     });
+    if (manifest.officialLogo) {
+      await assertInitialLogoProvenanceMatchesBytes({
+        provenance: manifest.officialLogo,
+        logoBytes: buffer,
+        companyWebsite: build.companyWebsite,
+        activeTurnMetadata: activeTurn.metadata,
+        apiKey: input.apiKey,
+        baseUrl: input.baseUrl,
+      });
+    }
     const descriptorHash = knowledgeBaseOutputImageDescriptorHash({
       fileId: descriptor.fileId || "",
       url: descriptor.url || "",
@@ -1023,6 +1354,9 @@ export async function bindKnowledgeBaseInitialLogo(input: {
       bytes: staged.bytes,
       filename: descriptor.filename.slice(0, 512),
       mimeType: mimeType.slice(0, 255),
+      ...(manifest.officialLogo
+        ? { officialLogoProvenance: manifest.officialLogo }
+        : {}),
     });
   }
   if (build.logoStorageKey && build.logoSha256 && build.logoBytes) {
@@ -1098,6 +1432,7 @@ export async function bindKnowledgeBaseFinalPackage(input: {
   apiKey: string;
   baseUrl: string;
 }) {
+  assertKnowledgeBaseBindingIdentity(input.taskId, "上游任务标识");
   const { db, build, activeTurn } = await loadBoundBuild(input);
   const nodes = await db
     .select()
@@ -1143,13 +1478,34 @@ export async function bindKnowledgeBaseFinalPackage(input: {
           { requireExplicitResourceOperation: true },
         )
       : input.output;
-  const authoritativeDescriptor = finalizationPlan
-    ? selectKnowledgeBaseAuthoritativeFinalDescriptor({
-        output: input.output,
-        scopedOutput: scopedOperationOutput,
-        plan: finalizationPlan,
-      })
-    : null;
+  let authoritativeDescriptor: KnowledgeArchiveDescriptor | null = null;
+  try {
+    authoritativeDescriptor = finalizationPlan
+      ? selectKnowledgeBaseAuthoritativeFinalDescriptor({
+          output: input.output,
+          scopedOutput: scopedOperationOutput,
+          plan: finalizationPlan,
+        })
+      : null;
+  } catch (error) {
+    if (error instanceof KnowledgeBaseArtifactIdentityError) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "PACKAGE_INVALID",
+        error.message,
+      );
+    }
+    if (error instanceof KnowledgeBaseFinalOutputResourceContractError) {
+      throw new KnowledgeBaseArtifactBindingError(
+        error.code === "AMBIGUOUS"
+          ? "PACKAGE_AMBIGUOUS"
+          : error.code === "INVALID"
+            ? "PACKAGE_INVALID"
+            : "PACKAGE_NOT_READY",
+        error.message,
+      );
+    }
+    throw error;
+  }
   const scopedProtocolComplete = finalizationPlan
     ? hasKnowledgeBaseCompleteFinalProtocol({
         assistantText: extractFinalKnowledgeBaseAssistantText(
@@ -1165,12 +1521,16 @@ export async function bindKnowledgeBaseFinalPackage(input: {
           plan: finalizationPlan,
         })
       : scopedOperationOutput;
-  const descriptors = collectKnowledgeArchiveDescriptors(operationOutput);
+  const descriptors = finalizationPlan
+    ? authoritativeDescriptor
+      ? [authoritativeDescriptor]
+      : []
+    : collectKnowledgeArchiveDescriptorsForBinding(operationOutput);
   if (
     build.skillVersion === "4" &&
     !finalizationPlan &&
     descriptors.length === 0 &&
-    collectKnowledgeArchiveDescriptors(input.output).length > 0
+    collectKnowledgeArchiveDescriptorsForBinding(input.output).length > 0
   ) {
     throw new KnowledgeBaseArtifactBindingError(
       "BUILD_CHANGED",
@@ -1258,19 +1618,20 @@ export async function bindKnowledgeBaseFinalPackage(input: {
   });
   const validationSnapshotId = randomUUID();
   let authoritativeArchiveBuffer: Buffer = Buffer.from(downloaded.buffer);
-  let parsed = await readKnowledgeArchive(
+  let parsed = await readKnowledgeArchiveForBinding(
     downloaded.buffer,
     downloaded.filename,
     validationSnapshotId,
     {
       validationProfile:
         build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
-      archiveContractVersions:
-        build.skillVersion === "1"
-          ? undefined
-          : build.skillVersion === "4"
-            ? [3, 4]
-            : [2, 3],
+      archiveContractVersions: knowledgeBaseArchiveWriteContractVersions(
+        build.skillVersion,
+      ),
+      // v4 customerVisibleCharacters is derived entirely from the packaged
+      // formal bytes. Let the binder reach its canonicalizer for this field
+      // only; canonicalization is followed by another strict read below.
+      allowV4CustomerVisibleCharacterCountRepair: build.skillVersion === "4",
     },
   );
   const storedAssetKeys = [...parsed.storedAssetKeys];
@@ -1321,7 +1682,7 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       });
       if (canonical.changed) {
         authoritativeArchiveBuffer = canonical.buffer;
-        parsed = await readKnowledgeArchive(
+        parsed = await readKnowledgeArchiveForBinding(
           authoritativeArchiveBuffer,
           downloaded.filename,
           randomUUID(),
@@ -1387,23 +1748,28 @@ export async function bindKnowledgeBaseFinalPackage(input: {
         sha256,
       };
     }
-    const expectedCustomerUploads =
-      build.skillVersion === "4"
-        ? await verifiedKnowledgeBaseCustomerUploadsForBuild({
-            userId: input.userId,
-            buildId: build.id,
-            generation: build.generation,
-            officialLogoSha256: build.logoSha256,
-          })
-        : [];
-    const expectedOfficialLogoUpload =
-      build.skillVersion === "4"
-        ? await verifiedKnowledgeBaseOfficialLogoUploadForBuild({
-            userId: input.userId,
-            buildId: build.id,
-            generation: build.generation,
-          })
-        : undefined;
+    const {
+      expectedCustomerUploads,
+      expectedOfficialLogoUpload,
+      expectedOfficialLogoProvenance,
+    } = knowledgeBaseArchiveRequiresV4UploadEvidence(
+      build.skillVersion,
+      parsed.packageSchemaVersion,
+    )
+      ? await verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+          userId: input.userId,
+          buildId: build.id,
+          generation: build.generation,
+          officialLogoSha256: build.logoSha256,
+          packageArchiveSha256: createHash("sha256")
+            .update(authoritativeArchiveBuffer)
+            .digest("hex"),
+        })
+      : {
+          expectedCustomerUploads: [],
+          expectedOfficialLogoUpload: undefined,
+          expectedOfficialLogoProvenance: undefined,
+        };
     assertKnowledgeBasePackageMatchesBuild({
       nodes: nodes.map((node) => ({
         leafId: node.leafId,
@@ -1421,6 +1787,7 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       packageSchemaVersion: parsed.packageSchemaVersion,
       expectedCustomerUploads,
       expectedOfficialLogoUpload,
+      expectedOfficialLogoProvenance,
       legacyV3Compatibility: build.skillVersion === "3",
     });
     if (parsed.packageSchemaVersion === 4) {
@@ -1429,7 +1796,16 @@ export async function bindKnowledgeBaseFinalPackage(input: {
         expectedUploads: expectedCustomerUploads,
         readPackagedAssetBytes: readStoredKnowledgeAssetBytes,
       });
+      await observeValidatedV4PackageShadow({
+        buildId: build.id,
+        generation: build.generation,
+        archiveBytes: authoritativeArchiveBuffer,
+        parsed,
+        nodes,
+      });
     }
+  } catch (error) {
+    rethrowKnowledgeBasePackageContentError(error);
   } finally {
     await removeStoredKnowledgeAssets(storedAssetKeys);
   }
@@ -1475,8 +1851,15 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       filename: path.basename(downloaded.filename).slice(0, 512),
       mimeType: "application/zip",
       packageRevision,
-      outputItemId: descriptor.outputItemId.slice(0, 255),
-      fileId: descriptor.fileId?.slice(0, 255),
+      outputItemId: assertKnowledgeBaseBindingIdentity(
+        descriptor.outputItemId,
+        "上游输出项标识",
+      ),
+      fileId: assertKnowledgeBaseBindingIdentity(
+        descriptor.fileId,
+        "上游文件标识",
+        false,
+      ),
     });
   }
   let persistedLogo:
@@ -1517,9 +1900,17 @@ export async function bindKnowledgeBaseFinalPackage(input: {
     .update(knowledgeBaseBuilds)
     .set({
       packageRevision,
-      packageTaskId: input.taskId.slice(0, 255),
-      packageOutputItemId: descriptor.outputItemId.slice(0, 255),
-      packageFileId: descriptor.fileId?.slice(0, 255) || null,
+      packageTaskId: input.taskId,
+      packageOutputItemId: assertKnowledgeBaseBindingIdentity(
+        descriptor.outputItemId,
+        "上游输出项标识",
+      ),
+      packageFileId:
+        assertKnowledgeBaseBindingIdentity(
+          descriptor.fileId,
+          "上游文件标识",
+          false,
+        ) || null,
       packageFilename: path.basename(downloaded.filename).slice(0, 512),
       packageDescriptorHash: knowledgeArchiveDescriptorHash(descriptor),
       packageStorageKey: persisted.storageKey,
@@ -1580,6 +1971,7 @@ export async function bindKnowledgeBaseReadyPackage(input: {
   apiKey: string;
   baseUrl: string;
 }) {
+  assertKnowledgeBaseBindingIdentity(input.taskId, "上游任务标识");
   const { db, build } = await loadBoundBuild(input);
   const packageRebindRequired =
     build.status === "protocol_error" &&
@@ -1590,7 +1982,9 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       "知识库不再处于等待发布状态，历史 ZIP 已忽略",
     );
   }
-  const descriptors = collectKnowledgeArchiveDescriptors(input.output);
+  const descriptors = collectKnowledgeArchiveDescriptorsForBinding(
+    input.output,
+  );
   const descriptor = selectKnowledgeBaseReadyPackageDescriptor({
     descriptors,
     identity: build,
@@ -1729,19 +2123,20 @@ export async function bindKnowledgeBaseReadyPackage(input: {
     baseUrl: input.baseUrl,
   });
   let authoritativeArchiveBuffer: Buffer = Buffer.from(downloaded.buffer);
-  let parsed = await readKnowledgeArchive(
+  let parsed = await readKnowledgeArchiveForBinding(
     authoritativeArchiveBuffer,
     downloaded.filename,
     randomUUID(),
     {
       validationProfile:
         build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
-      archiveContractVersions:
-        build.skillVersion === "1"
-          ? undefined
-          : build.skillVersion === "4"
-            ? [3, 4]
-            : [2, 3],
+      archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
+        build.skillVersion,
+      ),
+      // Match the final-turn binder: this derived v4 manifest field is
+      // repaired from validated formal bytes, then the canonical archive is
+      // immediately read again without this allowance below.
+      allowV4CustomerVisibleCharacterCountRepair: build.skillVersion === "4",
     },
   );
   const storedAssetKeys = [...parsed.storedAssetKeys];
@@ -1772,10 +2167,11 @@ export async function bindKnowledgeBaseReadyPackage(input: {
           contentSha256: node.contentSha256,
         })),
         buildRevision: build.revision,
+        legacyV4ReadCompatibility: build.skillVersion === "4",
       });
       if (canonical.changed) {
         authoritativeArchiveBuffer = canonical.buffer;
-        parsed = await readKnowledgeArchive(
+        parsed = await readKnowledgeArchiveForBinding(
           authoritativeArchiveBuffer,
           downloaded.filename,
           randomUUID(),
@@ -1833,23 +2229,30 @@ export async function bindKnowledgeBaseReadyPackage(input: {
         sha256,
       };
     }
-    const expectedCustomerUploads =
-      build.skillVersion === "4"
-        ? await verifiedKnowledgeBaseCustomerUploadsForBuild({
-            userId: input.userId,
-            buildId: build.id,
-            generation: build.generation,
-            officialLogoSha256: validLogoSha256,
-          })
-        : [];
-    const expectedOfficialLogoUpload =
-      build.skillVersion === "4"
-        ? await verifiedKnowledgeBaseOfficialLogoUploadForBuild({
-            userId: input.userId,
-            buildId: build.id,
-            generation: build.generation,
-          })
-        : undefined;
+    const {
+      expectedCustomerUploads,
+      expectedOfficialLogoUpload,
+      expectedOfficialLogoProvenance,
+    } = knowledgeBaseArchiveRequiresV4UploadEvidence(
+      build.skillVersion,
+      parsed.packageSchemaVersion,
+    )
+      ? await verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+          userId: input.userId,
+          buildId: build.id,
+          generation: build.generation,
+          officialLogoSha256: validLogoSha256,
+          packageArchiveSha256:
+            validPackageSha256 ||
+            createHash("sha256")
+              .update(authoritativeArchiveBuffer)
+              .digest("hex"),
+        })
+      : {
+          expectedCustomerUploads: [],
+          expectedOfficialLogoUpload: undefined,
+          expectedOfficialLogoProvenance: undefined,
+        };
     assertKnowledgeBasePackageMatchesBuild({
       nodes: nodes.map((node) => ({
         leafId: node.leafId,
@@ -1867,7 +2270,9 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       packageSchemaVersion: parsed.packageSchemaVersion,
       expectedCustomerUploads,
       expectedOfficialLogoUpload,
+      expectedOfficialLogoProvenance,
       legacyV3Compatibility: build.skillVersion === "3",
+      legacyV4ReadCompatibility: build.skillVersion === "4",
     });
     if (parsed.packageSchemaVersion === 4) {
       await assertKnowledgeBaseCustomerUploadVisualBindings({
@@ -1875,7 +2280,16 @@ export async function bindKnowledgeBaseReadyPackage(input: {
         expectedUploads: expectedCustomerUploads,
         readPackagedAssetBytes: readStoredKnowledgeAssetBytes,
       });
+      await observeValidatedV4PackageShadow({
+        buildId: build.id,
+        generation: build.generation,
+        archiveBytes: authoritativeArchiveBuffer,
+        parsed,
+        nodes,
+      });
     }
+  } catch (error) {
+    rethrowKnowledgeBasePackageContentError(error);
   } finally {
     await removeStoredKnowledgeAssets(storedAssetKeys);
   }
@@ -1932,9 +2346,17 @@ export async function bindKnowledgeBaseReadyPackage(input: {
           }
         : {}),
       packageRevision: build.revision,
-      packageTaskId: input.taskId.slice(0, 255),
-      packageOutputItemId: descriptor.outputItemId.slice(0, 255),
-      packageFileId: descriptor.fileId?.slice(0, 255) || null,
+      packageTaskId: input.taskId,
+      packageOutputItemId: assertKnowledgeBaseBindingIdentity(
+        descriptor.outputItemId,
+        "上游输出项标识",
+      ),
+      packageFileId:
+        assertKnowledgeBaseBindingIdentity(
+          descriptor.fileId,
+          "上游文件标识",
+          false,
+        ) || null,
       packageFilename: path.basename(downloaded.filename).slice(0, 512),
       packageDescriptorHash:
         build.skillVersion === "4"

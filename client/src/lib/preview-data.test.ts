@@ -7,6 +7,15 @@ import {
 } from "./preview-data";
 
 describe("preview service portal fixtures", () => {
+  it.each(["advanced", "luxury"] as const)(
+    "uses the canonical four keyword labels in the %s API preview",
+    (plan) => {
+      expect(
+        getPreviewServicePortal(plan).quotas.map(({ label }) => label),
+      ).toEqual(["行业排名词", "竞品对比词", "美誉舆情词", "产品场景词"]);
+    },
+  );
+
   it("uses the expected purchase and advisor actions for each plan", () => {
     expect(getPreviewServicePortal("basic").purchaseActions).toEqual([
       {

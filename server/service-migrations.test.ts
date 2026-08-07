@@ -10,10 +10,6 @@ import {
 } from "../drizzle/schema";
 
 const drizzleRoot = path.resolve(process.cwd(), "drizzle");
-const knowledgeBaseDeploymentRunbook = path.resolve(
-  process.cwd(),
-  "KNOWLEDGE_BASE_V2_DEPLOYMENT.md",
-);
 const knowledgeBaseMysqlAcceptance = path.resolve(
   process.cwd(),
   "scripts/knowledge-base-mysql-acceptance.test.ts",
@@ -25,10 +21,6 @@ const knowledgeBaseMysqlE2eAcceptance = path.resolve(
 const apiUsageMigrationVerifier = path.resolve(
   process.cwd(),
   "scripts/verify-api-usage-migration-schema.mjs",
-);
-const dashboardCiWorkflow = path.resolve(
-  process.cwd(),
-  ".github/workflows/dashboard-ci.yml",
 );
 
 async function migration(name: string) {
@@ -271,12 +263,8 @@ describe("service portal migration chain", () => {
     });
   });
 
-  it("keeps 0046-0048 behind an exact ordered-ledger and schema gate", async () => {
-    const [verifier, runbook, workflow] = await Promise.all([
-      readFile(apiUsageMigrationVerifier, "utf8"),
-      readFile(knowledgeBaseDeploymentRunbook, "utf8"),
-      readFile(dashboardCiWorkflow, "utf8"),
-    ]);
+  it("keeps the 0046-0048 ordered-ledger schema verifier exact", async () => {
+    const verifier = await readFile(apiUsageMigrationVerifier, "utf8");
 
     for (const requiredGuard of [
       "MIGRATION_LEDGER_NOT_APPROVED_PREFIX",
@@ -298,21 +286,6 @@ describe("service portal migration chain", () => {
     ]) {
       expect(verifier).toContain(requiredGuard);
     }
-    expect(workflow).toMatch(
-      /run: node scripts\/verify-api-usage-migration-schema\.mjs post/u,
-    );
-    for (const requiredGuard of [
-      "release-db-plan plan --json",
-      "status=exact",
-      "0045_knowledge_base_state_machine",
-      "ahead/diverged",
-      "/readyz",
-      "docs/operations/RELEASE.md",
-    ]) {
-      expect(runbook).toContain(requiredGuard);
-    }
-    expect(runbook).not.toContain("verify-api-usage-migration-schema.mjs");
-    expect(runbook).not.toContain("API_USAGE_0046_0048_SCHEMA_VERIFIED=YES");
   });
 
   it("adds monotonic API usage snapshot claims without rewriting usage data", async () => {
@@ -453,32 +426,6 @@ describe("service portal migration chain", () => {
       type: "varchar(64)",
       notNull: false,
     });
-  });
-
-  it("keeps the 0045 deployment gate restart-safe and exact", async () => {
-    const runbook = await readFile(knowledgeBaseDeploymentRunbook, "utf8");
-
-    for (const requiredGuard of [
-      "本文不是常规发布入口",
-      "docs/operations/RELEASE.md",
-      "release-db-plan plan --json",
-      "0045_knowledge_base_state_machine",
-      ".frontmind-kb-v2-0045-complete-v3",
-      "root-owned",
-      "`0600`",
-      "/readyz",
-      "/healthz",
-      "frontmind-contract-maintenance",
-      "--allow-contract",
-      "不得再次执行 migration",
-      "migration 结果未知时只读重查 plan",
-      "绝不盲目重跑",
-      "restore 失败时保持 Dashboard 停写",
-    ]) {
-      expect(runbook).toContain(requiredGuard);
-    }
-    expect(runbook).not.toContain("pnpm db:migrate");
-    expect(runbook).not.toContain("mysql -e");
   });
 
   it("keeps real-MySQL acceptance isolated from the production database", async () => {

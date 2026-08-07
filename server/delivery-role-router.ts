@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { deliveryRoleTypeSchema } from "../shared/delivery-roles";
+import { adjustQuestionQuotaSchema } from "../shared/service-portal";
 import { toTrpcError } from "./auth-router";
 import {
   approveMyCustomerQuestionSelection,
@@ -19,6 +20,7 @@ import {
   decideKnowledgeReset,
   previewKnowledgeReset,
 } from "./knowledge-base-reset-service";
+import { adjustMyCustomerQuestionQuota } from "./question-quota-service";
 
 function serviceCall<T>(callback: () => Promise<T>) {
   return callback().catch((error) => {
@@ -89,6 +91,16 @@ export const deliveryRoleRouter = router({
           approveMyCustomerQuestionSelection({
             actor: ctx.user,
             ...input,
+          }),
+        ),
+      ),
+    adjustQuestionQuota: protectedProcedure
+      .input(adjustQuestionQuotaSchema)
+      .mutation(({ ctx, input }) =>
+        serviceCall(() =>
+          adjustMyCustomerQuestionQuota({
+            actor: ctx.user,
+            value: input,
           }),
         ),
       ),

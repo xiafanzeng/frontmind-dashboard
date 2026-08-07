@@ -1,8 +1,9 @@
 import type { Server } from "node:http";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import axios from "axios";
 import express from "express";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   InsertPresalesMonitorRun,
@@ -13,11 +14,17 @@ import {
   buildMonitorRequestUrl,
   createPresalesMonitorRouter,
   assertDedicatedMonitorCredentialConfigured,
+  AxiosMonitorTransport,
+  getDedicatedMonitorCredentialReadiness,
+  isMonitorDuplicateReservationError,
   isDedicatedMonitorCredentialConfigured,
   MONITOR_POLL_INTERVAL_MS,
   MONITOR_REPEAT_PER_PLATFORM,
+  monitorResponseExplicitlyRejectsSubmission,
   monitorBaseUrl,
   monitorCredentialFromEnv,
+  MonitorRemoteError,
+  probeDedicatedMonitorCredential,
   PresalesMonitorError,
   PresalesMonitorService,
   sanitizeMonitorAnswerText,
@@ -42,6 +49,10 @@ const credential: DecryptedPresalesCredential = {
   status: "active",
   verifiedAt: new Date("2026-01-01T00:00:00Z"),
 };
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 function upstreamPlatform(platform: MonitorPlatform) {
   return platform;
@@ -150,11 +161,7 @@ class MemoryMonitorRepository implements MonitorRepository {
     const existingId = this.keyToRun.get(input.idempotencyKeyHash);
     if (existingId) {
       const existing = this.runs.get(existingId)!;
-      if (
-        existing.requestHash !== input.requestHash ||
-        existing.apiCredentialId !== input.credential.id ||
-        existing.credentialVersion !== input.credential.version
-      ) {
+      if (existing.requestHash !== input.requestHash) {
         throw new PresalesMonitorError(
           "IDEMPOTENCY_CONFLICT",
           409,
@@ -166,6 +173,31 @@ class MemoryMonitorRepository implements MonitorRepository {
           "IDEMPOTENCY_RETIRED",
           409,
           "retired monitor idempotency key",
+        );
+      }
+      const credentialChanged =
+        existing.apiCredentialId !== input.credential.id ||
+        existing.credentialVersion !== input.credential.version;
+      if (
+        credentialChanged &&
+        existing.status === "remote_failed" &&
+        !existing.upstreamTaskId
+      ) {
+        const retried = this.patch(existing.id, {
+          apiCredentialId: input.credential.id,
+          credentialVersion: input.credential.version,
+          status: "submission_in_progress",
+          lastError: null,
+          completedAt: null,
+          updatedAt: input.now,
+        });
+        return { state: "acquired", run: retried };
+      }
+      if (credentialChanged) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_CONFLICT",
+          409,
+          "conflicting monitor credential",
         );
       }
       return { state: "replay", run: existing };
@@ -219,6 +251,15 @@ class MemoryMonitorRepository implements MonitorRepository {
     return this.patch(runId, {
       status: "submission_unknown",
       lastError: error,
+      updatedAt: now,
+    });
+  }
+
+  async markSubmissionRejected(runId: string, error: string, now: Date) {
+    return this.patch(runId, {
+      status: "remote_failed",
+      lastError: error,
+      completedAt: now,
       updatedAt: now,
     });
   }
@@ -423,6 +464,43 @@ describe("presales monitor transport configuration", () => {
 });
 
 describe("presales monitor payload and reservation", () => {
+  it("recognizes a Drizzle-wrapped duplicate reservation without unbounded cause traversal", () => {
+    expect(
+      isMonitorDuplicateReservationError({
+        name: "DrizzleQueryError",
+        cause: { cause: { code: "ER_DUP_ENTRY", errno: 1062 } },
+      }),
+    ).toBe(true);
+    expect(
+      isMonitorDuplicateReservationError({
+        name: "DrizzleQueryError",
+        cause: { errno: 1062 },
+      }),
+    ).toBe(true);
+    const cyclic: { cause?: unknown } = {};
+    cyclic.cause = cyclic;
+    expect(isMonitorDuplicateReservationError(cyclic)).toBe(false);
+    expect(
+      isMonitorDuplicateReservationError({
+        cause: {
+          cause: {
+            cause: {
+              cause: {
+                cause: {
+                  cause: {
+                    cause: {
+                      cause: { code: "ER_DUP_ENTRY" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("hard-codes one textual question, five repeats, search mode and no screenshots", () => {
     const payload = buildMonitorSubmitPayload({
       question: QUESTION,
@@ -594,6 +672,126 @@ describe("presales monitor payload and reservation", () => {
     expect(harness.transport.submitCalls).toBe(1);
   });
 
+  it("records an explicit provider rejection as failed, never as submission_unknown", async () => {
+    const harness = makeHarness(["deepseek"]);
+    harness.transport.submitError = new MonitorRemoteError("Token失效", false);
+    await expect(harness.service.create(createInput())).rejects.toMatchObject({
+      code: "MONITOR_SUBMISSION_REJECTED",
+      status: 502,
+    });
+    const [run] = [...harness.repository.runs.values()];
+    expect(run).toMatchObject({
+      status: "remote_failed",
+      upstreamTaskId: null,
+      lastError: "Token失效",
+      completedAt: expect.any(Date),
+    });
+    await expect(harness.service.create(createInput())).rejects.toMatchObject({
+      code: "MONITOR_SUBMISSION_REJECTED",
+    });
+    expect(harness.transport.submitCalls).toBe(1);
+  });
+
+  it("treats only a credential rejection without a task identity as definite", () => {
+    expect(
+      monitorResponseExplicitlyRejectsSubmission({
+        success: false,
+        message: "Token失效",
+      }),
+    ).toBe(true);
+    expect(
+      monitorResponseExplicitlyRejectsSubmission({
+        success: false,
+        message: "系统繁忙",
+      }),
+    ).toBe(false);
+    expect(
+      monitorResponseExplicitlyRejectsSubmission({
+        success: false,
+        message: "Token失效",
+        data: { taskId: TASK_ID },
+      }),
+    ).toBe(false);
+    expect(monitorResponseExplicitlyRejectsSubmission(undefined)).toBe(false);
+    expect(monitorResponseExplicitlyRejectsSubmission("")).toBe(false);
+    expect(monitorResponseExplicitlyRejectsSubmission({})).toBe(false);
+    expect(
+      monitorResponseExplicitlyRejectsSubmission({ success: "false" }),
+    ).toBe(false);
+  });
+
+  it.each([
+    {
+      name: "credential rejection",
+      data: { success: false, message: "Token失效" },
+      expectedCode: "MONITOR_SUBMISSION_REJECTED",
+      expectedStatus: "remote_failed",
+    },
+    {
+      name: "generic success false",
+      data: { success: false, message: "系统繁忙" },
+      expectedCode: "MONITOR_SUBMISSION_UNKNOWN",
+      expectedStatus: "submission_unknown",
+    },
+    {
+      name: "malformed success response",
+      data: {},
+      expectedCode: "MONITOR_SUBMISSION_UNKNOWN",
+      expectedStatus: "submission_unknown",
+    },
+  ])(
+    "classifies the real Axios transport response: $name",
+    async ({ data, expectedCode, expectedStatus }) => {
+      vi.spyOn(axios, "request").mockResolvedValue({ status: 200, data });
+      const repository = new MemoryMonitorRepository();
+      const service = new PresalesMonitorService(
+        repository,
+        new AxiosMonitorTransport(),
+        async () => credential,
+        async () => credential,
+      );
+
+      await expect(service.create(createInput())).rejects.toMatchObject({
+        code: expectedCode,
+      });
+      expect([...repository.runs.values()][0]).toMatchObject({
+        status: expectedStatus,
+        upstreamTaskId: null,
+      });
+      expect(axios.request).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("safely reacquires an explicitly rejected reservation only after credential rotation", async () => {
+    const repository = new MemoryMonitorRepository();
+    const transport = new FakeMonitorTransport(["deepseek"]);
+    let activeCredential = credential;
+    const service = new PresalesMonitorService(
+      repository,
+      transport,
+      async () => activeCredential,
+      async (id) => (id === activeCredential.id ? activeCredential : null),
+    );
+    transport.submitError = new MonitorRemoteError("Token失效", false);
+    await expect(service.create(createInput())).rejects.toMatchObject({
+      code: "MONITOR_SUBMISSION_REJECTED",
+    });
+    activeCredential = {
+      ...credential,
+      id: "credential-2",
+      version: 2,
+      apiKey: "sk-valid-rotated-monitor-test",
+    };
+    transport.submitError = null;
+    const retried = await service.create(createInput());
+    expect(retried).toMatchObject({
+      replayed: false,
+      run: { status: "submitted" },
+    });
+    expect(transport.submitCalls).toBe(2);
+    expect(repository.runs.size).toBe(1);
+  });
+
   it("rejects reusing one idempotency key for a different request", async () => {
     const harness = makeHarness(["deepseek"]);
     await harness.service.create(createInput());
@@ -639,6 +837,123 @@ describe("presales monitor payload and reservation", () => {
         FRONTMIND_MONITOR_API_KEY: "",
       }),
     ).toThrow("FRONTMIND_MONITOR_API_KEY");
+  });
+
+  it("uses a read-only provider probe so a random-looking invalid key cannot pass readiness", async () => {
+    const invalid = await probeDedicatedMonitorCredential({
+      env: {
+        FRONTMIND_MONITOR_API_KEY: "a".repeat(64),
+        FRONTMIND_MONITOR_API_BASE_URL: "https://monitor.frontmind.test/api",
+      },
+      request: async (input) => {
+        expect(input.url).toContain("/task/status/");
+        expect(input.url).not.toContain("batch");
+        expect(input.apiKey).toBe("a".repeat(64));
+        return { status: 200, data: { success: false, message: "Token失效" } };
+      },
+    });
+    expect(invalid).toEqual({
+      configured: true,
+      authenticated: false,
+      ready: false,
+      status: "rejected",
+    });
+
+    const authenticated = await probeDedicatedMonitorCredential({
+      env: {
+        FRONTMIND_MONITOR_API_KEY: "provider-issued-dev-monitor-key",
+        FRONTMIND_MONITOR_API_BASE_URL: "https://monitor.frontmind.test/api",
+      },
+      request: async () => ({
+        status: 200,
+        data: { success: false, message: "任务不存在" },
+      }),
+    });
+    expect(authenticated).toEqual({
+      configured: true,
+      authenticated: true,
+      ready: true,
+      status: "authenticated",
+    });
+  });
+
+  it("fails monitor readiness closed when the read-only probe is unavailable", async () => {
+    await expect(
+      probeDedicatedMonitorCredential({
+        env: {
+          FRONTMIND_MONITOR_API_KEY: "provider-issued-dev-monitor-key",
+          FRONTMIND_MONITOR_API_BASE_URL: "https://monitor.frontmind.test/api",
+        },
+        request: async () => {
+          throw new Error("network unavailable");
+        },
+      }),
+    ).resolves.toEqual({
+      configured: true,
+      authenticated: false,
+      ready: false,
+      status: "unavailable",
+    });
+  });
+
+  it("caches authenticated read-only probes instead of hitting readiness upstream repeatedly", async () => {
+    const env = {
+      FRONTMIND_MONITOR_API_KEY: "provider-issued-dev-monitor-cache-key",
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor-cache.frontmind.test/api",
+    };
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      return {
+        status: 200,
+        data: { success: false, message: "任务不存在" },
+      };
+    };
+    const first = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 1_000,
+    });
+    const second = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 2_000,
+    });
+    expect(first.ready).toBe(true);
+    expect(second).toEqual(first);
+    expect(calls).toBe(1);
+  });
+
+  it("bypasses the readiness cache when a payment preflight requires a fresh probe", async () => {
+    const env = {
+      FRONTMIND_MONITOR_API_KEY: "provider-issued-dev-monitor-fresh-key",
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor-fresh.frontmind.test/api",
+    };
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      return calls === 1
+        ? {
+            status: 200,
+            data: { success: false, message: "任务不存在" },
+          }
+        : {
+            status: 200,
+            data: { success: false, message: "Token失效" },
+          };
+    };
+    const cached = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 1_000,
+    });
+    const fresh = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 2_000,
+      forceRefresh: true,
+    });
+    expect(cached).toMatchObject({ authenticated: true, ready: true });
+    expect(fresh).toMatchObject({ authenticated: false, ready: false });
+    expect(calls).toBe(2);
   });
 
   it("does not fall back to an ordinary presales credential in production", async () => {

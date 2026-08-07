@@ -34,6 +34,17 @@ vi.mock("./presales-service", async () => {
   };
 });
 
+vi.mock("./presales-monitor", async () => {
+  const actual =
+    await vi.importActual<typeof import("./presales-monitor")>(
+      "./presales-monitor",
+    );
+  return {
+    ...actual,
+    getDedicatedMonitorCredentialReadiness: vi.fn(),
+  };
+});
+
 import presalesProxy from "./presales-proxy";
 import { AuthServiceError } from "./auth-service";
 import {
@@ -56,6 +67,7 @@ import {
   resolvePresalesTaskCredentialForFiles,
   syncPresalesOutputUrlGrants,
 } from "./presales-service";
+import { getDedicatedMonitorCredentialReadiness } from "./presales-monitor";
 
 const token = "4UT1aQh7tFzS0I8NDkcM8Gv7r5d9ZLr0shF9xXfPjYg";
 const originalServiceToken = process.env.FRONTMIND_PRESALES_SERVICE_TOKEN;
@@ -174,6 +186,7 @@ describe("presales readiness status", () => {
       process.env.FRONTMIND_PUBLIC_URL = originalPublicUrl;
     }
     vi.mocked(getActivePresalesCredential).mockReset();
+    vi.mocked(getDedicatedMonitorCredentialReadiness).mockReset();
   });
 
   it("returns only non-secret readiness booleans for paid monitoring", async () => {
@@ -189,6 +202,12 @@ describe("presales readiness status", () => {
       status: "active",
       verifiedAt: new Date(),
     });
+    vi.mocked(getDedicatedMonitorCredentialReadiness).mockResolvedValue({
+      configured: true,
+      authenticated: true,
+      ready: true,
+      status: "authenticated",
+    });
 
     await withServer(async (baseUrl) => {
       const response = await fetch(`${baseUrl}/status`, {
@@ -200,10 +219,55 @@ describe("presales readiness status", () => {
         ok: true,
         credentialConfigured: true,
         monitorCredentialConfigured: true,
+        monitorCredentialAuthenticated: true,
         publicUrlConfigured: true,
       });
+      expect(getDedicatedMonitorCredentialReadiness).toHaveBeenCalledWith(
+        process.env,
+        { forceRefresh: false },
+      );
       expect(JSON.stringify(body)).not.toContain(
         process.env.FRONTMIND_MONITOR_API_KEY,
+      );
+    });
+  });
+
+  it("forces a fresh provider probe and distinguishes configured from authenticated", async () => {
+    process.env.FRONTMIND_PRESALES_SERVICE_TOKEN = token;
+    process.env.FRONTMIND_MONITOR_API_KEY =
+      "configured-but-rejected-monitor-credential";
+    process.env.FRONTMIND_PUBLIC_URL = "https://agent.frontmind.test";
+    vi.mocked(getActivePresalesCredential).mockResolvedValue({
+      id: "credential-1",
+      version: 1,
+      apiKey: "ordinary-presales-test-key",
+      fingerprint: "fingerprint",
+      status: "active",
+      verifiedAt: new Date(),
+    });
+    vi.mocked(getDedicatedMonitorCredentialReadiness).mockResolvedValue({
+      configured: true,
+      authenticated: false,
+      ready: false,
+      status: "rejected",
+    });
+
+    await withServer(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/status?monitorCredentialProbe=fresh`,
+        { headers: { "x-frontmind-service-token": token } },
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: false,
+        credentialConfigured: true,
+        monitorCredentialConfigured: true,
+        monitorCredentialAuthenticated: false,
+        publicUrlConfigured: true,
+      });
+      expect(getDedicatedMonitorCredentialReadiness).toHaveBeenCalledWith(
+        process.env,
+        { forceRefresh: true },
       );
     });
   });

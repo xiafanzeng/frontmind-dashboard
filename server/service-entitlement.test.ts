@@ -8,6 +8,7 @@ import {
 } from "../shared/service-portal";
 import {
   ServiceEntitlementError,
+  assertGeneratedQuestionQuotaContextCurrent,
   assertQuestionSelectionWithinQuota,
   assertServiceCapability,
   createServiceQuotaWindows,
@@ -1133,6 +1134,59 @@ describe("question lifecycle rules", () => {
       ],
       risks: ["不要把额定值描述为实测极限"],
     });
+  });
+
+  it("rejects candidate persistence after quota revision or remaining slots change", () => {
+    const period = {
+      revision: 4,
+      industryLimit: 1,
+      competitorComparisonLimit: 1,
+      reputationLimit: 1,
+      productScenarioLimit: 5,
+      totalQuestionLimit: 8,
+    };
+    const selectedUsage = {
+      industry: 0,
+      competitorComparison: 0,
+      reputation: 0,
+      productScenario: 0,
+      total: 0,
+    };
+    const expected = {
+      revision: 4,
+      remaining: {
+        industry: 1,
+        competitorComparison: 1,
+        reputation: 1,
+        productScenario: 5,
+      },
+    };
+
+    expect(
+      assertGeneratedQuestionQuotaContextCurrent({
+        period,
+        selectedUsage,
+        expected,
+      }),
+    ).toMatchObject(expected.remaining);
+    for (const stale of [
+      { period: { ...period, revision: 5 }, selectedUsage },
+      {
+        period,
+        selectedUsage: { ...selectedUsage, productScenario: 1, total: 1 },
+      },
+    ]) {
+      expect(() =>
+        assertGeneratedQuestionQuotaContextCurrent({
+          ...stale,
+          expected,
+        }),
+      ).toThrowError(
+        expect.objectContaining({
+          code: "QUESTION_GENERATION_CONTEXT_STALE",
+        }),
+      );
+    }
   });
 
   it("recognizes legacy missing-table errors through wrapped causes", () => {

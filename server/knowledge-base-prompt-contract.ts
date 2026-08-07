@@ -298,7 +298,9 @@ export async function buildKnowledgeBasePrompt({
     "### 首轮研究与知识树建立",
     "完成官网、公开来源、上传资料研究和正式图文预填后，按企业实际资料量建立自适应一级分支和 8-115 个真实叶子节点。白牌企业或只有宣传单时只保留有事实价值或明确缺口的必要叶子，不得为数量、字数或图片数填充内容。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
     manifestExample,
-    "示例只演示结构，真实 leaves 必须完整包含 8-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
+    isV4
+      ? "示例只演示结构，禁止复制示例域名。真实 leaves 必须完整包含 8-115 项；若同时返回 Logo 图片，officialLogo 必须逐字记录该图片的真实来源：官网 Logo 用 official_web + 精确 sourcePageUrl/sourceAssetUrl，初始上传文档内 Logo 用 official_document + 精确 sourceDocumentPath。若未返回 Logo 图片则省略 officialLogo。首轮不得同时输出 FRONTMIND_KB_PROGRESS。"
+      : "示例只演示结构，真实 leaves 必须完整包含 8-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
     "",
     "### 后续每轮单节点状态",
     "服务端从 revision=0、清单第一个叶子为 current 开始。后续每轮末尾必须依次附一个状态信封和一个展示信封：",

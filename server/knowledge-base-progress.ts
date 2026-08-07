@@ -188,7 +188,19 @@ export interface KnowledgeBaseManifestEnvelope {
   operationId?: string;
   turnId?: string;
   leaves: KnowledgeBaseLeafManifestEntry[];
+  officialLogo?: KnowledgeBaseOfficialLogoProvenance;
 }
+
+export type KnowledgeBaseOfficialLogoProvenance =
+  | {
+      sourceKind: "official_web";
+      sourcePageUrl: string;
+      sourceAssetUrl: string;
+    }
+  | {
+      sourceKind: "official_document";
+      sourceDocumentPath: string;
+    };
 
 export interface KnowledgeBaseReopenEnvelope {
   kind: typeof KNOWLEDGE_BASE_REOPEN_KIND;
@@ -486,9 +498,14 @@ function parseManifestEnvelopeObject(
   }
   const unexpectedKeys = Object.keys(input).filter(
     (key) =>
-      !["kind", "schemaVersion", "operationId", "turnId", "leaves"].includes(
-        key,
-      ),
+      ![
+        "kind",
+        "schemaVersion",
+        "operationId",
+        "turnId",
+        "leaves",
+        "officialLogo",
+      ].includes(key),
   );
   if (unexpectedKeys.length > 0) {
     fail(
@@ -511,12 +528,77 @@ function parseManifestEnvelopeObject(
   if (!Array.isArray(input.leaves)) {
     fail("INVALID_MANIFEST", "Manifest envelope leaves must be an array");
   }
+  let officialLogo: KnowledgeBaseOfficialLogoProvenance | undefined;
+  if (input.officialLogo !== undefined) {
+    if (
+      identity.schemaVersion !== KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION ||
+      !isPlainObject(input.officialLogo)
+    ) {
+      fail("INVALID_MANIFEST", "Manifest officialLogo is invalid");
+    }
+    const value = input.officialLogo as Record<string, unknown>;
+    const sourceKind = value.sourceKind;
+    const validHttpUrl = (candidate: unknown) => {
+      try {
+        const parsed = new URL(String(candidate || ""));
+        return (
+          (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+          !parsed.username &&
+          !parsed.password
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (sourceKind === "official_web") {
+      assertOnlyKeys(
+        value,
+        ["sourceKind", "sourcePageUrl", "sourceAssetUrl"],
+        "Manifest officialLogo",
+      );
+      if (
+        !validHttpUrl(value.sourcePageUrl) ||
+        !validHttpUrl(value.sourceAssetUrl)
+      ) {
+        fail(
+          "INVALID_MANIFEST",
+          "Manifest official-web Logo requires exact page and asset URLs",
+        );
+      }
+      officialLogo = {
+        sourceKind,
+        sourcePageUrl: String(value.sourcePageUrl),
+        sourceAssetUrl: String(value.sourceAssetUrl),
+      };
+    } else if (sourceKind === "official_document") {
+      assertOnlyKeys(
+        value,
+        ["sourceKind", "sourceDocumentPath"],
+        "Manifest officialLogo",
+      );
+      const sourceDocumentPath = String(value.sourceDocumentPath || "").trim();
+      if (
+        !sourceDocumentPath ||
+        sourceDocumentPath.length > 1_024 ||
+        /[\0\r\n]/u.test(sourceDocumentPath)
+      ) {
+        fail(
+          "INVALID_MANIFEST",
+          "Manifest official-document Logo requires one exact document path",
+        );
+      }
+      officialLogo = { sourceKind, sourceDocumentPath };
+    } else {
+      fail("INVALID_MANIFEST", "Manifest officialLogo sourceKind is invalid");
+    }
+  }
   return {
     kind: KNOWLEDGE_BASE_MANIFEST_KIND,
     ...identity,
     leaves: validateProductionKnowledgeBaseLeafManifest(
       input.leaves as KnowledgeBaseLeafManifestEntry[],
     ),
+    ...(officialLogo ? { officialLogo } : {}),
   };
 }
 

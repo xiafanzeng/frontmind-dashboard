@@ -28,6 +28,8 @@ import {
   claimKnowledgeBaseTurnForRecovery,
   hashKnowledgeBaseTurnRequest,
   hashKnowledgeBaseUpstreamIdempotencyKey,
+  inspectKnowledgeBaseRetryAuthority,
+  knowledgeBaseRetryRequiresFreshFinalDelivery,
   prepareKnowledgeBaseTurnDispatch,
   reserveKnowledgeBaseGeneratedAttachment,
   reserveKnowledgeBaseRetryTurn,
@@ -2447,6 +2449,109 @@ describe("knowledge-base deterministic dispatch failure", () => {
 });
 
 describe("knowledge-base safe retry reservation", () => {
+  it("refreshes the Skill and finalization bundle only at the failed v4 last leaf", () => {
+    expect(
+      knowledgeBaseRetryRequiresFreshFinalDelivery({
+        skillVersion: "4",
+        currentLeafId: "7.5",
+        totalNodeCount: 50,
+        confirmedCount: 49,
+        directPrefilledCount: 0,
+        operationType: "confirm",
+      }),
+    ).toBe(true);
+    expect(
+      knowledgeBaseRetryRequiresFreshFinalDelivery({
+        skillVersion: "4",
+        currentLeafId: "7.4",
+        totalNodeCount: 50,
+        confirmedCount: 48,
+        directPrefilledCount: 0,
+        operationType: "confirm",
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBaseRetryRequiresFreshFinalDelivery({
+        skillVersion: "4",
+        currentLeafId: "7.5",
+        totalNodeCount: 50,
+        confirmedCount: 49,
+        directPrefilledCount: 0,
+        operationType: "revise",
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts a pinned final-delivery Skill upgrade across repeated retries", () => {
+    const upgradedHash = "d".repeat(64);
+    const source = retryableFailedTurn();
+    const recovery = {
+      kind: "turn",
+      conversationId: "conversation-1",
+      parentTaskId: "successful-parent-task",
+      userMessage: "确认",
+      attachments: [],
+      skillVersion: "4",
+      skillContentHash: upgradedHash,
+      finalPackageRequired: true,
+    };
+    const requestBody = {
+      prompt: "compact final retry prompt",
+      agentProfile: "manus-1.6-max",
+      taskMode: "agent" as const,
+      taskId: "successful-parent-task",
+      attachments: [
+        { file_id: "skill-new", filename: "skill.zip" },
+        { file_id: "finalization-input", filename: "finalization.zip" },
+      ],
+    };
+    source.attachmentFileIds = ["skill-new", "finalization-input"];
+    source.metadata = {
+      attachmentsFrozen: true,
+      expectedAttachmentCount: 2,
+      userAttachmentCount: 0,
+      recovery,
+      preparedDispatch: {
+        schemaVersion: 1,
+        baseUrl: "https://api.example.test",
+        requestBody,
+        bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+        preparedAt: "2026-08-01T00:00:10.000Z",
+      },
+    };
+    source.requestHash = hashKnowledgeBaseTurnRequest({
+      operationType: "confirm",
+      generation: 3,
+      revision: 7,
+      leafId: "1.8",
+      expectedAttachmentCount: 2,
+      userAttachmentCount: 0,
+      payload: {
+        userMessage: recovery.userMessage,
+        attachments: recovery.attachments,
+        skillVersion: recovery.skillVersion,
+        skillContentHash: recovery.skillContentHash,
+      },
+    });
+    const build = {
+      id: source.buildId,
+      userId: source.userId,
+      conversationId: "conversation-1",
+      skillVersion: "4",
+      skillContentHash: "c".repeat(64),
+      generation: 3,
+      revision: 7,
+      currentLeafId: "1.8",
+      totalNodeCount: 8,
+      confirmedCount: 7,
+      directPrefilledCount: 0,
+    } as any;
+
+    expect(inspectKnowledgeBaseRetryAuthority(source, build)).not.toBeNull();
+    (source.metadata as any).recovery.finalPackageRequired = false;
+    expect(inspectKnowledgeBaseRetryAuthority(source, build)).toBeNull();
+  });
+
   it("coalesces two tabs, clears the failed task and allocates a new slot per failed attempt", async () => {
     const source = retryableFailedTurn();
     const build = {
@@ -2534,10 +2639,13 @@ describe("knowledge-base safe retry reservation", () => {
     expect(first.reservation.state).toBe("acquired");
     expect(first.reservation.turn.id).not.toBe(source.id);
     expect(first.reservation.turn.upstreamTaskId).toBeNull();
-    expect(first.reservation.turn.attachmentFileIds).toEqual([
-      "skill-file",
-      "facts-file",
-    ]);
+    expect(first.reservation.turn.attachmentFileIds).toEqual([]);
+    expect(
+      store.turns.find((item) => item.id === first.reservation.turn.id)
+        ?.metadata,
+    ).toMatchObject({ expectedAttachmentCount: 3, userAttachmentCount: 1 });
+    expect(first.recoveryMetadata.retryAttachments).toEqual([]);
+    expect(first.recoveryMetadata.instructionsAttachmentRequired).toBe(true);
     expect(second.reservation.state).toBe("pending");
     expect(second.reservation.turn.id).toBe(first.reservation.turn.id);
     expect(second.reservation.turn.operationKey).toBe(
@@ -2584,12 +2692,25 @@ describe("knowledge-base safe retry reservation", () => {
       taskMode: "agent" as const,
       taskId: "successful-parent-task",
       attachments: [
-        { file_id: "skill-file", filename: "skill.zip" },
+        {
+          file_id: "skill-file",
+          filename: "socratic-kb-builder.skill.zip",
+        },
+        {
+          file_id: "instructions-file",
+          filename: "frontmind-kb-server-instructions.txt",
+        },
         { file_id: "facts-file", filename: "facts.pdf" },
       ],
     };
+    failedRetry.attachmentFileIds = [
+      "skill-file",
+      "instructions-file",
+      "facts-file",
+    ];
     failedRetry.metadata = {
       ...(failedRetry.metadata || {}),
+      attachmentsFrozen: true,
       preparedDispatch: {
         schemaVersion: 1,
         baseUrl: "https://api.example.test",

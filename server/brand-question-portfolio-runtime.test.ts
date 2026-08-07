@@ -1,5 +1,5 @@
 import JSZip from "jszip";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME,
@@ -10,10 +10,15 @@ import {
   parseBrandQuestionPortfolioOutput,
   type BrandQuestionPortfolioContext,
 } from "./brand-question-portfolio-runtime";
+import {
+  FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
+  upstreamPromptCharacterCount,
+} from "./upstream-prompt-budget";
 
 const context: BrandQuestionPortfolioContext = {
   planCode: "advanced",
   quotaPeriodId: "period-1",
+  quotaRevision: 2,
   quota: {
     industry: 1,
     competitorComparison: 0,
@@ -98,16 +103,20 @@ function result() {
 }
 
 describe("brand question portfolio runtime", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
   it("pins the authoritative plan, quota period and Pro skill", async () => {
     const prompt = await buildBrandQuestionPortfolioPrompt(context);
-    expect(prompt).toContain('"planCode": "advanced"');
-    expect(prompt).toContain('"quotaPeriodId": "period-1"');
     expect(prompt).toContain(BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME);
     expect(prompt).toContain(BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME);
     expect(prompt).not.toContain("documentPath: README.md");
-    expect(prompt).toContain('"canonicalName": "示例企业"');
-    expect(prompt).toContain('"industry": 3');
-    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThan(4 * 1024);
+    expect(prompt).not.toContain("示例企业");
+    expect(upstreamPromptCharacterCount(prompt)).toBeLessThanOrEqual(
+      FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
+    );
 
     const [skillArchive, evidenceArchive] = await Promise.all([
       buildBrandQuestionPortfolioSkillArchive(),
@@ -125,6 +134,67 @@ describe("brand question portfolio runtime", () => {
     );
     expect(await evidenceZip.file("knowledge.md")!.async("string")).toContain(
       "documentPath: README.md",
+    );
+    expect(
+      JSON.parse(await evidenceZip.file("context.json")!.async("string")),
+    ).toMatchObject({
+      schemaVersion: 2,
+      kind: "frontmind.brand-question-portfolio.input",
+      planCode: "advanced",
+      quotaPeriodId: "period-1",
+      quotaRevision: 2,
+      enterprise: context.enterprise,
+      availableQuota: context.quota,
+      candidateTargets: {
+        industry: 3,
+        competitor_comparison: 0,
+        reputation: 0,
+        product_scenario: 0,
+      },
+      knowledgeSnapshot: {
+        id: "snapshot-1",
+        version: 1,
+        archiveHash: "a".repeat(64),
+        sourceFileName: "company.zip",
+      },
+    });
+  });
+
+  it("keeps the outbound prompt bounded when every dynamic field is very large", async () => {
+    const oversizedContext: BrandQuestionPortfolioContext = {
+      ...context,
+      quotaPeriodId: "期".repeat(50_000),
+      enterprise: {
+        identityHash: "b".repeat(64),
+        canonicalName: "企业".repeat(100_000),
+      },
+      snapshot: {
+        ...context.snapshot,
+        sourceFileName: `${"知识库".repeat(100_000)}.zip`,
+      },
+    };
+
+    const [prompt, evidenceArchive] = await Promise.all([
+      buildBrandQuestionPortfolioPrompt(oversizedContext),
+      buildBrandQuestionPortfolioEvidenceArchive(oversizedContext),
+    ]);
+    expect(upstreamPromptCharacterCount(prompt)).toBeLessThanOrEqual(
+      FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
+    );
+    expect(prompt).not.toContain(oversizedContext.enterprise.canonicalName);
+
+    const evidenceZip = await JSZip.loadAsync(evidenceArchive.bytes);
+    const authoritativeInput = JSON.parse(
+      await evidenceZip.file("context.json")!.async("string"),
+    );
+    expect(authoritativeInput.enterprise.canonicalName).toBe(
+      oversizedContext.enterprise.canonicalName,
+    );
+    expect(authoritativeInput.quotaPeriodId).toBe(
+      oversizedContext.quotaPeriodId,
+    );
+    expect(authoritativeInput.knowledgeSnapshot.sourceFileName).toBe(
+      oversizedContext.snapshot.sourceFileName,
     );
   });
 
@@ -146,6 +216,52 @@ describe("brand question portfolio runtime", () => {
     expect(parsed.categories.industry[0]?.candidateId).toBe(
       "industrial-solution-category",
     );
+  });
+
+  it("keeps JSON recovery in shadow until this adapter is explicitly active", () => {
+    const candidate = `模型输出如下：\n${JSON.stringify(result())}`;
+    const output = [{ role: "assistant", text: candidate }];
+    const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    vi.stubEnv("FRONTMIND_BRAND_QUESTION_PORTFOLIO_OUTPUT_REPAIR", "shadow");
+    expect(() => parseBrandQuestionPortfolioOutput(output, context)).toThrow();
+    expect(log).toHaveBeenCalledWith(
+      "[Model Output Repair]",
+      expect.stringContaining("unique_balanced_value_extracted"),
+    );
+
+    vi.stubEnv("FRONTMIND_BRAND_QUESTION_PORTFOLIO_OUTPUT_REPAIR", "active");
+    expect(parseBrandQuestionPortfolioOutput(output, context)).toMatchObject({
+      schemaVersion: 1,
+      knowledgeSnapshot: { id: context.snapshot.id },
+    });
+  });
+
+  it("runs strict schema and snapshot binding after an active repair", () => {
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
+    vi.stubEnv("FRONTMIND_BRAND_QUESTION_PORTFOLIO_OUTPUT_REPAIR", "active");
+
+    const unknownSchema = { ...result(), unknownField: "must be rejected" };
+    expect(() =>
+      parseBrandQuestionPortfolioOutput(
+        [
+          {
+            role: "assistant",
+            text: `result: ${JSON.stringify(unknownSchema)}`,
+          },
+        ],
+        context,
+      ),
+    ).toThrow();
+
+    const stale = result();
+    stale.knowledgeSnapshot.id = "snapshot-from-another-workspace";
+    expect(() =>
+      parseBrandQuestionPortfolioOutput(
+        [{ role: "assistant", text: `result: ${JSON.stringify(stale)}` }],
+        context,
+      ),
+    ).toThrow("不匹配");
   });
 
   it("rejects a stale snapshot echo", () => {

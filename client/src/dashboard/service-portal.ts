@@ -34,6 +34,15 @@ export type ServiceQuota = {
   unit: string;
 };
 
+const CANONICAL_KEYWORD_QUOTA_LABELS: Partial<
+  Record<ServiceQuota["key"], string>
+> = {
+  industry: "行业排名词",
+  competitor: "竞品对比词",
+  reputation: "美誉舆情词",
+  scenario: "产品场景词",
+};
+
 export type PurchasedServiceQuestion = {
   id: string;
   question: string;
@@ -439,7 +448,7 @@ function normalizeQuotas(
     return [
       {
         key: "industry",
-        label: "行业词",
+        label: "行业排名词",
         limit: limit("industryLimit"),
         used: used("industry"),
         unit: "个词",
@@ -486,10 +495,11 @@ function normalizeQuotas(
       return {
         ...quotaFromRecord(
           key,
-          textValue(
-            firstValue(record, ["label", "name"]),
-            `服务配额 ${index + 1}`,
-          ),
+          CANONICAL_KEYWORD_QUOTA_LABELS[key] ??
+            textValue(
+              firstValue(record, ["label", "name"]),
+              `服务配额 ${index + 1}`,
+            ),
           record,
         ),
       };
@@ -508,7 +518,7 @@ function normalizeQuotas(
     },
     {
       key: "industry",
-      label: "行业词",
+      label: "行业排名词",
       aliases: ["industry", "industryKeywords", "industry_keywords"],
     },
     {

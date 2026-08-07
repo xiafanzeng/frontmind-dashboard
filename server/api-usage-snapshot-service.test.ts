@@ -15,6 +15,7 @@ import {
   bulkPreviousCredentialGroups,
   claimUsageSnapshotRefresh,
   createManagedApiUsageRefreshQueue,
+  finalizeApiUsageSnapshotClaim,
   isDuplicateApiUsageSnapshotError,
   isRollingUsageSnapshotCurrent,
   latestUsageSnapshotByPolicy,
@@ -248,6 +249,64 @@ describe("API usage snapshot duplicate-key detection", () => {
         updatedAt: now,
       }),
     });
+  });
+});
+
+describe("API usage snapshot claim finalization", () => {
+  function executorForFinalize(affectedRows: number) {
+    const selectQuery = {
+      from: () => selectQuery,
+      where: () => selectQuery,
+      limit: async () => [
+        {
+          policyId: "policy-1",
+          used: 10,
+          accountUsed: 5,
+          syncStatus: "pending",
+        },
+      ],
+    };
+    const updateQuery = {
+      set: () => updateQuery,
+      where: vi.fn().mockResolvedValue([{ affectedRows }]),
+    };
+    return {
+      select: () => selectQuery,
+      update: () => updateQuery,
+      where: updateQuery.where,
+    };
+  }
+
+  it("reports a lost opaque token instead of claiming synchronization success", async () => {
+    const executor = executorForFinalize(0);
+    await expect(
+      finalizeApiUsageSnapshotClaim({
+        executor,
+        policy: { id: "policy-1" } as any,
+        credentialFingerprint: "fingerprint-1",
+        used: 20,
+        accountUsed: 8,
+        status: "ok",
+        now: new Date("2026-08-03T01:00:00.000Z"),
+        syncToken: "lost-token",
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it("reports success only when the token-guarded update changes a row", async () => {
+    const executor = executorForFinalize(1);
+    await expect(
+      finalizeApiUsageSnapshotClaim({
+        executor,
+        policy: { id: "policy-1" } as any,
+        credentialFingerprint: "fingerprint-1",
+        used: 20,
+        accountUsed: 8,
+        status: "ok",
+        now: new Date("2026-08-03T01:00:00.000Z"),
+        syncToken: "winning-token",
+      }),
+    ).resolves.toBe(true);
   });
 });
 
