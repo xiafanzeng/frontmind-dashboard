@@ -5,7 +5,6 @@ import {
   mkdir,
   mkdtemp,
   readlink,
-  rename,
   rm,
   symlink,
   writeFile,
@@ -17,7 +16,8 @@ const projectRoot = path.resolve(import.meta.dirname, "..");
 const testRoot = await mkdtemp(
   path.join(tmpdir(), "frontmind-dashboard-single-release-"),
 );
-const releaseRepository = path.join(testRoot, "release");
+const gitRepository = path.join(testRoot, "git-source");
+const archiveRepository = path.join(testRoot, "archive-source");
 
 execFileSync(
   process.execPath,
@@ -35,23 +35,23 @@ execFileSync(
 
 function git(args) {
   return execFileSync("git", args, {
-    cwd: releaseRepository,
+    cwd: gitRepository,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
 }
 
-function run(command, args, env) {
+function run(command, args, env, repositoryRoot) {
   execFileSync(command, args, {
-    cwd: releaseRepository,
+    cwd: repositoryRoot,
     env,
     stdio: "inherit",
   });
 }
 
-function expectFailure(command, args, env, pattern) {
+function expectFailure(command, args, env, pattern, repositoryRoot) {
   const result = spawnSync(command, args, {
-    cwd: releaseRepository,
+    cwd: repositoryRoot,
     env,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -64,13 +64,18 @@ function expectFailure(command, args, env, pattern) {
   }
 }
 
-async function copySource() {
-  await mkdir(releaseRepository, { recursive: true });
+async function copySource(sourceRoot, destinationRoot, includeUntracked) {
+  await mkdir(destinationRoot, { recursive: true });
   const files = execFileSync(
     "git",
-    ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    [
+      "ls-files",
+      "-z",
+      "--cached",
+      ...(includeUntracked ? ["--others", "--exclude-standard"] : []),
+    ],
     {
-      cwd: projectRoot,
+      cwd: sourceRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -81,10 +86,10 @@ async function copySource() {
         relativePath &&
         relativePath !== "dist" &&
         !relativePath.startsWith("dist/"),
-    );
+  );
   for (const relativePath of files) {
-    const sourcePath = path.join(projectRoot, relativePath);
-    const destinationPath = path.join(releaseRepository, relativePath);
+    const sourcePath = path.join(sourceRoot, relativePath);
+    const destinationPath = path.join(destinationRoot, relativePath);
     let sourceStat;
     try {
       sourceStat = await lstat(sourcePath);
@@ -103,15 +108,15 @@ async function copySource() {
   }
   await symlink(
     path.join(projectRoot, "node_modules"),
-    path.join(releaseRepository, "node_modules"),
+    path.join(destinationRoot, "node_modules"),
   );
 }
 
 try {
-  await copySource();
+  await copySource(projectRoot, gitRepository, true);
   git(["init", "-q"]);
   await writeFile(
-    path.join(releaseRepository, ".git", "info", "exclude"),
+    path.join(gitRepository, ".git", "info", "exclude"),
     "/node_modules\n",
     { flag: "a" },
   );
@@ -120,6 +125,7 @@ try {
   git(["add", "-A"]);
   git(["commit", "-qm", "single immutable release source"]);
   const sourceSha = git(["rev-parse", "HEAD"]);
+  await copySource(gitRepository, archiveRepository, false);
   const environment = {
     ...process.env,
     // The production Docker builder installs devDependencies under this outer
@@ -132,17 +138,14 @@ try {
     GITHUB_SHA: sourceSha,
     COMMIT_SHA: sourceSha,
   };
+  const gitEnvironment = { ...environment };
+  delete gitEnvironment.FRONTMIND_ARCHIVE_BUILD;
 
-  const repositoryGitMetadata = path.join(releaseRepository, ".git");
-  const archivedGitMetadata = path.join(testRoot, "release-git-metadata");
-  await rename(repositoryGitMetadata, archivedGitMetadata);
-  try {
-    run("pnpm", ["build"], environment);
-    run("pnpm", ["audit:production"], environment);
-  } finally {
-    await rename(archivedGitMetadata, repositoryGitMetadata);
-  }
+  run("pnpm", ["build"], environment, archiveRepository);
+  run("pnpm", ["audit:production"], environment, archiveRepository);
   const statusAfterBuild = git([
+    `--git-dir=${path.join(gitRepository, ".git")}`,
+    `--work-tree=${archiveRepository}`,
     "status",
     "--porcelain=v1",
     "--untracked-files=all",
@@ -152,7 +155,7 @@ try {
   }
 
   await writeFile(
-    path.join(releaseRepository, "dist", "index.js"),
+    path.join(archiveRepository, "dist", "index.js"),
     "tampered after image build\n",
   );
   expectFailure(
@@ -160,17 +163,19 @@ try {
     ["audit:production"],
     environment,
     /BUILD_ARTIFACT_BYTES_MISMATCH/u,
+    archiveRepository,
   );
 
   await writeFile(
-    path.join(releaseRepository, "server", "release-dirty-fixture.ts"),
+    path.join(gitRepository, "server", "release-dirty-fixture.ts"),
     "export {};\n",
   );
   expectFailure(
     "pnpm",
     ["build"],
-    environment,
+    gitEnvironment,
     /BUILD_SOURCE_NOT_COMMITTED:server\/release-dirty-fixture\.ts/u,
+    gitRepository,
   );
 
   console.log(`SINGLE_COMMIT_PRODUCTION_RELEASE_FLOW_OK source=${sourceSha}`);
