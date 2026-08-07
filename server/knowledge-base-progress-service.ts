@@ -33,6 +33,9 @@ import { AuthServiceError } from "./auth-service";
 import { getDb } from "./db";
 import {
   collectKnowledgeArchiveDescriptors,
+  collectKnowledgeBaseOutputResourceProjections,
+  knowledgeBaseArtifactAliasedIdentity,
+  KnowledgeBaseArtifactIdentityError,
   knowledgeArchiveDescriptorHash,
   knowledgeArchiveFileIdFromUrl,
   knowledgeArchivePhysicalDescriptorHash,
@@ -156,6 +159,55 @@ function normalizeConversationId(value: string) {
   return normalized;
 }
 
+export function assertKnowledgeBaseUpstreamTaskIdentity(
+  value: unknown,
+  required = true,
+) {
+  if (value === undefined || value === null || value === "") {
+    if (!required) return undefined;
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "上游任务标识缺失",
+    );
+  }
+  if (typeof value !== "string" && typeof value !== "number") {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "上游任务标识格式无效",
+    );
+  }
+  if (
+    typeof value === "number" &&
+    (!Number.isFinite(value) || !Number.isSafeInteger(value))
+  ) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "上游任务标识数字格式无法无损表示",
+    );
+  }
+  const taskId = String(value);
+  if (taskId !== taskId.trim()) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "上游任务标识含首尾空白，拒绝改写后继续绑定",
+    );
+  }
+  if (!taskId.trim()) {
+    if (!required) return undefined;
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "上游任务标识缺失",
+    );
+  }
+  if (taskId.length > 255) {
+    throw new KnowledgeBaseBuildError(
+      "PROGRESS_PROTOCOL_INVALID",
+      "上游任务标识超过 255 个字符，拒绝截断后继续绑定",
+    );
+  }
+  return taskId;
+}
+
 export function knowledgeBaseObservationConversationStorageId(
   userId: number,
   publicConversationId: string,
@@ -247,7 +299,12 @@ function trustedKnowledgeBaseImageDescriptor(value: unknown) {
   const fileName = stringValue(
     value.fileName || value.file_name || value.filename || value.name,
   );
-  const rawResourceId = stringValue(value.fileId || value.file_id);
+  const rawResourceId =
+    knowledgeBaseArtifactAliasedIdentity({
+      value,
+      aliases: ["fileId", "file_id"],
+      label: "上游图片文件标识",
+    }) || "";
   const resourceUrl = stringValue(
     value.fileUrl ||
       value.file_url ||
@@ -255,9 +312,19 @@ function trustedKnowledgeBaseImageDescriptor(value: unknown) {
       value.image_url ||
       value.url,
   );
-  const resourceId =
-    rawResourceId ||
-    (resourceUrl ? knowledgeArchiveFileIdFromUrl(resourceUrl) || "" : "");
+  const resourceIdFromUrl = resourceUrl
+    ? knowledgeArchiveFileIdFromUrl(resourceUrl) || ""
+    : "";
+  const resourceId = rawResourceId || resourceIdFromUrl;
+  if (
+    rawResourceId &&
+    resourceIdFromUrl &&
+    rawResourceId !== resourceIdFromUrl
+  ) {
+    throw new KnowledgeBaseArtifactIdentityError(
+      "上游图片文件标识与图片 URL 中的标识相互冲突",
+    );
+  }
   const isImage =
     type === "output_image" ||
     type === "image" ||
@@ -662,8 +729,10 @@ function knowledgeBaseProtocolAnchors(
       )
       .map((value) => ({
         kind: String(value.kind || ""),
-        operationId: String(value.operationId || "").trim(),
-        turnId: String(value.turnId || "").trim(),
+        // Identity claims are compared byte-for-byte. Trimming here could bind
+        // a malformed provider claim to a different durable operation.
+        operationId: String(value.operationId || ""),
+        turnId: String(value.turnId || ""),
       }));
     return identities.length > 0 ? [{ ...entry, identities }] : [];
   });
@@ -696,13 +765,13 @@ function collectKnowledgeBaseOutputIdentityClaims(
   if (!isRecord(value)) return claims;
   for (const [key, raw] of Object.entries(value)) {
     const normalizedKey = key.replace(/_/gu, "").toLowerCase();
-    if (typeof raw === "string" && raw.trim()) {
+    if (typeof raw === "string" && raw.length > 0) {
       if (normalizedKey === "operationid") {
-        claims.operationIds.add(raw.trim());
+        claims.operationIds.add(raw);
       } else if (normalizedKey === "turnid") {
-        claims.turnIds.add(raw.trim());
+        claims.turnIds.add(raw);
       } else if (normalizedKey === "taskid") {
-        claims.taskIds.add(raw.trim());
+        claims.taskIds.add(raw);
       }
     } else if (
       typeof raw === "number" &&
@@ -770,12 +839,12 @@ export function selectKnowledgeBaseProtocolOperationOutput(
   return output.filter((item, index) => {
     const claims = collectKnowledgeBaseOutputIdentityClaims(item);
     const containsImage = collectKnowledgeBaseOutputImageKeys(item).size > 0;
-    const containsArchive =
-      collectKnowledgeArchiveDescriptors([item]).length > 0;
+    const containsResource =
+      collectKnowledgeBaseOutputResourceProjections([item]).length > 0;
     if (
       (options.requireExplicitImageOperation && containsImage) ||
       (options.requireExplicitResourceOperation &&
-        (containsImage || containsArchive))
+        (containsImage || containsResource))
     ) {
       // A resource nested in the exact matching protocol item is scoped by
       // that item's operation/turn envelope. This still rejects a forbidden
@@ -1425,9 +1494,10 @@ export async function attachKnowledgeBaseBuildTask(input: {
 }) {
   const db = await requireDb();
   const conversationId = normalizeConversationId(input.conversationId);
+  const taskId = assertKnowledgeBaseUpstreamTaskIdentity(input.taskId)!;
   await db
     .update(knowledgeBaseBuilds)
-    .set({ upstreamTaskId: String(input.taskId).slice(0, 255) })
+    .set({ upstreamTaskId: taskId })
     .where(
       and(
         eq(knowledgeBaseBuilds.userId, input.userId),
@@ -1445,10 +1515,11 @@ export async function recordKnowledgeBaseTurn(input: {
 }) {
   const db = await requireDb();
   const conversationId = normalizeConversationId(input.conversationId);
+  const taskId = assertKnowledgeBaseUpstreamTaskIdentity(input.taskId)!;
   const result = await db
     .update(knowledgeBaseBuilds)
     .set({
-      upstreamTaskId: String(input.taskId).slice(0, 255),
+      upstreamTaskId: taskId,
       lastTurnUserText: String(input.userText || "").slice(0, 2_000_000),
       lastTurnAttachmentCount: Math.max(
         0,
@@ -1762,6 +1833,18 @@ async function readKnowledgeBaseObservationProjection(
       ? await knowledgeBaseCustomerUploadResources(
           build.id,
           presentationTurnRow,
+          build.skillVersion === "4" &&
+            (build.status === "ready_to_publish" ||
+              build.status === "published") &&
+            /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || ""))
+            ? {
+                persistedEvidence: {
+                  userId: input.userId,
+                  generation: build.generation,
+                  packageArchiveSha256: build.packageArchiveSha256!,
+                },
+              }
+            : undefined,
         )
       : [];
 
@@ -2312,7 +2395,7 @@ export async function resumeKnowledgeBaseFinalPackageMissing(input: {
 }): Promise<boolean> {
   const db = await requireDb();
   const conversationId = normalizeConversationId(input.conversationId);
-  const taskId = String(input.taskId || "").trim();
+  const taskId = assertKnowledgeBaseUpstreamTaskIdentity(input.taskId, false);
   if (!taskId) return false;
   const resumedAt = input.resumedAt ?? new Date();
   return db.transaction(async (tx) => {
@@ -2724,6 +2807,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
 }) {
   const db = await requireDb();
   const conversationId = normalizeConversationId(input.conversationId);
+  const taskId = assertKnowledgeBaseUpstreamTaskIdentity(input.taskId, false);
   const outputLedger = {
     lastOutputLength: Math.max(
       0,
@@ -2981,6 +3065,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
             initialImageCount === 1 &&
             (!stagedLogo ||
               descriptors.length !== 1 ||
+              !stagedLogo.officialLogoProvenance ||
               stagedLogo.descriptorHash !==
                 knowledgeBaseOutputImageDescriptorHash(descriptors[0]!))
           ) {
@@ -3040,7 +3125,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
                   lastUserInput: userText || null,
                   sourceUrls: audit.sourceUrls,
                   imageUrls: audit.imageUrls,
-                  lastTaskId: input.taskId?.slice(0, 255) || null,
+                  lastTaskId: taskId || null,
                   lastResponseAt: new Date(),
                 }
               : {}),
@@ -3062,15 +3147,14 @@ export async function reconcileKnowledgeBaseProgress(input: {
             revision: state.revision,
             leafId: state.currentLeafId!,
             content: initialContent,
-            authoritativeTaskId:
-              input.taskId?.slice(0, 255) || build.upstreamTaskId,
+            authoritativeTaskId: taskId || build.upstreamTaskId,
             sentAt: new Date(),
           });
         }
         const initialBuildUpdate = await tx
           .update(knowledgeBaseBuilds)
           .set({
-            upstreamTaskId: input.taskId?.slice(0, 255) || build.upstreamTaskId,
+            upstreamTaskId: taskId || build.upstreamTaskId,
             status: "confirming",
             stateEpoch: build.stateEpoch + 1,
             activeTurnId: successfulTurnIdentity.activeTurnId,
@@ -3124,6 +3208,9 @@ export async function reconcileKnowledgeBaseProgress(input: {
           );
         }
         if (activeTurn) {
+          const activeTurnMetadata = isRecord(activeTurn.metadata)
+            ? activeTurn.metadata
+            : {};
           await tx
             .update(conversationTurns)
             .set({
@@ -3132,6 +3219,15 @@ export async function reconcileKnowledgeBaseProgress(input: {
               leaseExpiresAt: null,
               errorCode: null,
               errorMessage: null,
+              ...(stagedLogo?.officialLogoProvenance
+                ? {
+                    metadata: {
+                      ...activeTurnMetadata,
+                      boundOfficialLogoProvenance:
+                        stagedLogo.officialLogoProvenance,
+                    },
+                  }
+                : {}),
             })
             .where(eq(conversationTurns.id, activeTurn.id));
         }
@@ -3233,7 +3329,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
             lastUserInput: userText || null,
             sourceUrls: mergeAuditUrls(target.sourceUrls, audit.sourceUrls),
             imageUrls: mergeAuditUrls(target.imageUrls, audit.imageUrls),
-            lastTaskId: input.taskId?.slice(0, 255) || build.upstreamTaskId,
+            lastTaskId: taskId || build.upstreamTaskId,
             lastResponseAt: new Date(),
             confirmedAt: null,
           })
@@ -3264,15 +3360,14 @@ export async function reconcileKnowledgeBaseProgress(input: {
             revision: reopenedState.revision,
             leafId: target.leafId,
             content: reopenedContent,
-            authoritativeTaskId:
-              input.taskId?.slice(0, 255) || build.upstreamTaskId,
+            authoritativeTaskId: taskId || build.upstreamTaskId,
             sentAt: new Date(),
           });
         }
         await tx
           .update(knowledgeBaseBuilds)
           .set({
-            upstreamTaskId: input.taskId?.slice(0, 255) || build.upstreamTaskId,
+            upstreamTaskId: taskId || build.upstreamTaskId,
             status: "confirming",
             stateEpoch: build.stateEpoch + 1,
             activeTurnId: successfulTurnIdentity.activeTurnId,
@@ -3469,8 +3564,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
                     previous.imageUrls,
                     audit.imageUrls,
                   ),
-                  lastTaskId:
-                    input.taskId?.slice(0, 255) || build.upstreamTaskId,
+                  lastTaskId: taskId || build.upstreamTaskId,
                   lastResponseAt: new Date(),
                 }
               : {}),
@@ -3482,8 +3576,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
           .where(eq(knowledgeBaseBuildNodes.id, previous.id));
       }
 
-      const authoritativeTaskId =
-        input.taskId?.slice(0, 255) || build.upstreamTaskId;
+      const authoritativeTaskId = taskId || build.upstreamTaskId;
       if (activeTurn?.operationKey) {
         const persistedConversationId =
           knowledgeBaseObservationConversationStorageId(
@@ -3544,9 +3637,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
           awaitingResponseSince: null,
           completedAt: packageAllowed ? new Date() : null,
           packageRevision: packageAllowed ? nextState.revision : null,
-          packageTaskId: packageAllowed
-            ? input.taskId?.slice(0, 255) || build.upstreamTaskId
-            : null,
+          packageTaskId: packageAllowed ? taskId || build.upstreamTaskId : null,
           packageOutputItemId: packageAllowed
             ? stagedPackage?.outputItemId ||
               packageDescriptor?.outputItemId ||

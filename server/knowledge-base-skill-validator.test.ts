@@ -350,8 +350,7 @@ function replaceOfficialLogoWithVerifiedUpload(
       assetId: asset.id,
     },
   ];
-  manifest.imageSelection.stopReason =
-    "客户已上传并确认企业官方主 Logo 原图";
+  manifest.imageSelection.stopReason = "客户已上传并确认企业官方主 Logo 原图";
   files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
   return { asset, manifest };
 }
@@ -366,6 +365,59 @@ describe("dashboard enterprise Skill archive validator", () => {
       code: 0,
       stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
     });
+  });
+
+  it("keeps business source headings and tables in the formal count across both validators", async () => {
+    const files = await validDeepArchiveFiles();
+    const root = "fixture_knowledge_base";
+    const businessTable = [
+      "| 类型 | 平台价值 |",
+      "| --- | --- |",
+      `| 收入来源 | ${"乙".repeat(593)} |`,
+      "| 社区活力来源 | 不同来源模型 |",
+    ].join("\n");
+    files[`${root}/branches/products/leaf-1.md`] = [
+      "# 知识叶子 1",
+      "",
+      "<!-- FRONTMIND_FORMAL_CONTENT_START -->",
+      "",
+      "## 收入来源",
+      "",
+      businessTable,
+      "",
+      "<!-- FRONTMIND_FORMAL_CONTENT_END -->",
+      "",
+      "## 原始来源",
+      "",
+      "- source-official-1",
+    ].join("\n");
+    const manifest = JSON.parse(
+      String(files[`${root}/00_package_manifest.json`]),
+    );
+    manifest.counts.customerVisibleCharacters = 3_855;
+    files[`${root}/00_package_manifest.json`] = JSON.stringify(manifest);
+    const archivePath = await writeArchive(files);
+
+    await expect(runValidator(archivePath)).resolves.toMatchObject({
+      code: 0,
+      stdout: expect.stringContaining("VALID dashboard-enterprise-v1"),
+    });
+    const parsed = await readKnowledgeArchive(
+      await fs.readFile(archivePath),
+      "business-source-table.zip",
+      "24444444-4444-4444-8444-444444444444",
+      {
+        validationProfile: "dashboard-enterprise-v1",
+        archiveContractVersions: [4],
+      },
+    );
+    try {
+      expect(
+        parsed.documents.find((document) => document.id === "leaf-1")?.content,
+      ).toContain("社区活力来源");
+    } finally {
+      await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
+    }
   });
 
   it("accepts a schema v4 official_logo_upload with the exact upload ledger and strict candidate shape", async () => {

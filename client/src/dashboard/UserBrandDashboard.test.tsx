@@ -43,7 +43,7 @@ const previewQuestionCategoryLabels = Array.from(
   new Set(
     luxuryPreviewPortal.purchasedQuestions.map((question) =>
       question.kind === "industry"
-        ? "行业词"
+        ? "行业排名词"
         : question.kind === "competitor"
           ? "竞品对比词"
           : question.kind === "reputation"
@@ -52,9 +52,7 @@ const previewQuestionCategoryLabels = Array.from(
     ),
   ),
 );
-const previewReportCategoryLabels = previewQuestionCategoryLabels.map(
-  (category) => (category === "行业词" ? "行业排名词" : category),
-);
+const previewReportCategoryLabels = previewQuestionCategoryLabels;
 const previewScenarioBaseline =
   userPreviewFixtures.optimizationReport.questionBaselines.find(
     (baseline) => baseline.category === "产品场景词",

@@ -9,6 +9,23 @@ export type KnowledgeBaseObservationDto = SharedKnowledgeBaseObservationDto & {
   progress?: KnowledgeBaseProgressDto | null;
 };
 
+export const KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE =
+  "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED";
+
+export interface KnowledgeBaseLogoProvenanceRepairManifestItem {
+  filename: string;
+  sizeBytes: number;
+  mimeType: string;
+  lastModified: number;
+  sha256: string;
+}
+
+export type KnowledgeBaseLogoProvenanceRepairError = Error & {
+  status?: number;
+  code?: string;
+  knowledgeObservation?: KnowledgeBaseObservationDto;
+};
+
 async function readErrorMessage(response: Response) {
   try {
     const payload = await response.json();
@@ -154,6 +171,48 @@ export async function retryKnowledgeBaseTurn(input: {
     throw error;
   }
   return normalizeObservation(await response.json());
+}
+
+/**
+ * Repairs only the immutable provenance ledger for an already-bound Logo.
+ * This endpoint never creates an upstream turn and never advances a leaf.
+ */
+export async function repairKnowledgeBaseLogoProvenance(input: {
+  conversationId: string;
+  clientRequestId: string;
+  expectedGeneration: number;
+  expectedRevision: number;
+  expectedLeafId: string | null;
+  attachmentManifest: [KnowledgeBaseLogoProvenanceRepairManifestItem];
+  attachment: { file_id: string; filename: string };
+}): Promise<KnowledgeBaseObservationDto> {
+  const response = await fetch("/api/knowledge-base/logo-provenance/repair", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(
+      payload?.error?.message ||
+        payload?.error ||
+        payload?.message ||
+        `请求失败 (${response.status})`,
+    ) as KnowledgeBaseLogoProvenanceRepairError;
+    error.status = response.status;
+    error.code =
+      String(payload?.error?.code || payload?.code || "").trim() || undefined;
+    if (payload?.observation) {
+      try {
+        error.knowledgeObservation = normalizeObservation(payload);
+      } catch {
+        // Preserve the actionable HTTP error even if an optional projection is malformed.
+      }
+    }
+    throw error;
+  }
+  return normalizeObservation(payload);
 }
 
 /**

@@ -69,9 +69,13 @@ Interpret user input narrowly:
   the old leaf, then fully present the next leaf as the body.
 - “跳过 / 直接预填 / 采用预填 / 保留预填” →
   `direct_prefilled`.
-- Any correction, supplement, question, or upload →
-  `needs_verification`; update and re-present the same leaf. A turn containing
-  a file never advances, even when its text contains confirmation language.
+- Any correction, supplement, question, or customer upload →
+  `needs_verification`; update and re-present the same leaf. Only files the
+  server-owned instructions/finalization ledger explicitly classifies as
+  `customerAttachments` or `customer_upload` are customer uploads. Skill,
+  instructions, prefill, evidence and finalization files are system inputs and
+  never change the declared action. A turn containing a customer upload never
+  advances, even when its text contains confirmation language.
 - While the first-leaf Logo requirement is unresolved, confirmation and direct
   prefill do not advance. A qualifying Logo upload resolves only that
   requirement, remains on the same first leaf as `needs_verification`, and must

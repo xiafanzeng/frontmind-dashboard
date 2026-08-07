@@ -207,4 +207,98 @@ describe("response logic task persistence", () => {
       }),
     ).toThrow(ResponseLogicTaskActiveError);
   });
+
+  it("does not relabel an existing task with a newer Skill during continuation", async () => {
+    const now = new Date("2026-08-05T00:00:00.000Z");
+    const draft = {
+      concern: "",
+      conclusion: "",
+      facts: "",
+      pending: "",
+      boundaries: "",
+      references: "",
+      images: [],
+      attachments: [],
+    };
+    const existingEntry = {
+      id: "entry-1",
+      userId: 42,
+      questionId: "question-1",
+      groupId: "basic",
+      groupTitle: "产品场景",
+      question: "企业有什么核心产品？",
+      intent: "核验产品事实",
+      summary: "给出可核验的产品口径",
+      conversationId: "conversation-1",
+      lastTaskId: "task-1",
+      skillName: "response-logic-builder",
+      skillVersion: "1",
+      skillContentHash: "a".repeat(64),
+      draft,
+      confirmed: null,
+      revision: 1,
+      version: 0,
+      status: "draft",
+      createdAt: now,
+      updatedAt: now,
+    };
+    let updatedValues: Record<string, unknown> | null = null;
+    const executor = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => ({
+            limit: () =>
+              awaitedRows(
+                table === apiCredentials
+                  ? [{ id: "credential-1" }]
+                  : table === upstreamResources
+                    ? [{ userId: 42, upstreamId: "task-1" }]
+                    : table === responseLogicEntries
+                      ? [existingEntry]
+                      : [],
+              ),
+          }),
+        }),
+      }),
+      insert: () => ({ values: async () => undefined }),
+      update: () => ({
+        set: (values: Record<string, unknown>) => {
+          updatedValues = values;
+          return { where: async () => undefined };
+        },
+      }),
+    };
+    mocks.getDb.mockResolvedValue({
+      ...executor,
+      transaction: async (callback: (tx: typeof executor) => unknown) =>
+        callback(executor),
+    });
+
+    await recordResponseLogicTaskStart({
+      userId: 42,
+      apiCredentialId: "credential-1",
+      value: {
+        questionId: "question-1",
+        groupId: "basic",
+        groupTitle: "产品场景",
+        question: "企业有什么核心产品？",
+        intent: "核验产品事实",
+        summary: "给出可核验的产品口径",
+        conversationId: "conversation-1",
+        draft,
+      },
+      taskId: "task-1",
+      skillName: "response-logic-builder",
+      skillVersion: "2",
+      skillContentHash: "b".repeat(64),
+      preserveExistingSkillBinding: true,
+      verifiedAttachments: [],
+    });
+
+    expect(updatedValues).toMatchObject({
+      skillName: "response-logic-builder",
+      skillVersion: "1",
+      skillContentHash: "a".repeat(64),
+    });
+  });
 });

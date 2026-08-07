@@ -45,6 +45,13 @@ export const MONITOR_REPEAT_PER_PLATFORM = 5;
 export const MONITOR_POLL_INTERVAL_MS = 10_000;
 const MONITOR_POLL_LEASE_MS = 120_000;
 const MONITOR_HTTP_TIMEOUT_MS = 60_000;
+// Readiness reports this optional provider dependency but does not gate the
+// Dashboard. Keep a cold probe comfortably below the deploy controller's
+// five-second local readiness timeout.
+const MONITOR_CREDENTIAL_PROBE_TIMEOUT_MS = 1_500;
+const MONITOR_CREDENTIAL_PROBE_TASK_ID = "00000000-0000-4000-8000-000000000000";
+const MONITOR_CREDENTIAL_READY_CACHE_MS = 5 * 60_000;
+const MONITOR_CREDENTIAL_FAILED_CACHE_MS = 15_000;
 const MAX_MONITOR_RESPONSE_BYTES = 12 * 1024 * 1024;
 const MAX_ANSWER_CHARACTERS = 200_000;
 const MAX_SOURCE_ITEMS = 200;
@@ -171,7 +178,7 @@ export class PresalesMonitorError extends Error {
   }
 }
 
-class MonitorRemoteError extends Error {
+export class MonitorRemoteError extends Error {
   constructor(
     message: string,
     public readonly recoverable: boolean,
@@ -221,6 +228,11 @@ export interface MonitorRepository {
     error: string,
     now: Date,
   ): Promise<PresalesMonitorRun>;
+  markSubmissionRejected(
+    runId: string,
+    error: string,
+    now: Date,
+  ): Promise<PresalesMonitorRun>;
   markSubmitted(
     runId: string,
     input: {
@@ -257,6 +269,30 @@ function canonicalJson(value: unknown): string {
 
 function sha256(value: string) {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/**
+ * MySQL errors thrown through Drizzle are commonly wrapped in one or more
+ * `cause` objects. Keep this deliberately bounded and cycle-safe so an
+ * idempotent replay cannot be mistaken for a new upstream submission merely
+ * because the driver error was wrapped.
+ */
+export function isMonitorDuplicateReservationError(error: unknown) {
+  const visited = new Set<object>();
+  let candidate: unknown = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (!candidate || typeof candidate !== "object") return false;
+    if (visited.has(candidate)) return false;
+    visited.add(candidate);
+    const record = candidate as {
+      code?: unknown;
+      errno?: unknown;
+      cause?: unknown;
+    };
+    if (record.code === "ER_DUP_ENTRY" || record.errno === 1062) return true;
+    candidate = record.cause;
+  }
+  return false;
 }
 
 /**
@@ -305,6 +341,243 @@ export function assertDedicatedMonitorCredentialConfigured(
       "FRONTMIND_MONITOR_API_KEY must be configured with a dedicated non-placeholder credential in production",
     );
   }
+}
+
+export type DedicatedMonitorCredentialReadiness = {
+  configured: boolean;
+  authenticated: boolean;
+  ready: boolean;
+  status: "missing" | "authenticated" | "rejected" | "unavailable";
+};
+
+export type MonitorCredentialProbeRequester = (input: {
+  url: string;
+  apiKey: string;
+  timeoutMs: number;
+}) => Promise<{ status: number; data: unknown }>;
+
+const requestMonitorCredentialProbe: MonitorCredentialProbeRequester = async (
+  input,
+) => {
+  const response = await axios.request({
+    method: "GET",
+    url: input.url,
+    headers: {
+      Authorization: `Bearer ${input.apiKey}`,
+      Accept: "application/json",
+    },
+    timeout: input.timeoutMs,
+    maxRedirects: 0,
+    maxContentLength: 64 * 1024,
+    validateStatus: () => true,
+  });
+  return { status: response.status, data: response.data };
+};
+
+function probeResponseRejectsCredential(status: number, data: unknown) {
+  if (status === 401 || status === 403) return true;
+  if (!isRecord(data)) return false;
+  const code = normalizedText(data.code).toLowerCase();
+  if (
+    [
+      "401",
+      "403",
+      "invalid_token",
+      "token_invalid",
+      "token_expired",
+      "unauthorized",
+      "forbidden",
+    ].includes(code)
+  ) {
+    return true;
+  }
+  const error = isRecord(data.error) ? data.error : null;
+  const text = [
+    data.message,
+    data.msg,
+    typeof data.error === "string" ? data.error : undefined,
+    error?.code,
+    error?.message,
+  ]
+    .map(normalizedText)
+    .filter(Boolean)
+    .join(" ");
+  return (
+    /(token|api[\s_-]*key|credential|authorization|auth|鉴权|认证|密钥|凭据)/iu.test(
+      text,
+    ) &&
+    /(invalid|expired|revoked|unauthori[sz]ed|forbidden|missing|失效|无效|过期|撤销|错误|未授权|禁止|缺失|不存在)/iu.test(
+      text,
+    )
+  );
+}
+
+function probeResponseProvesAuthentication(data: Record<string, unknown>) {
+  const error = isRecord(data.error) ? data.error : null;
+  const text = [data.code, data.message, data.msg, error?.code, error?.message]
+    .map(normalizedText)
+    .filter(Boolean)
+    .join(" ");
+  return /(?:任务.{0,12}(?:不存在|未找到)|task.{0,16}(?:not[\s_-]*found|does[\s_-]*not[\s_-]*exist)|task[\s_-]*not[\s_-]*found)/iu.test(
+    text,
+  );
+}
+
+function monitorResponseContainsTaskIdentity(
+  value: unknown,
+  seen = new Set<object>(),
+  depth = 0,
+): boolean {
+  if (!value || typeof value !== "object" || depth > 8) return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.some((item) =>
+      monitorResponseContainsTaskIdentity(item, seen, depth + 1),
+    );
+  }
+  for (const [key, child] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (
+      (normalizedKey === "taskid" || normalizedKey === "subtaskid") &&
+      normalizedText(child)
+    ) {
+      return true;
+    }
+    if (monitorResponseContainsTaskIdentity(child, seen, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * A paid POST is safe to reacquire only when the response proves that
+ * authentication was rejected before a task identity existed. Generic
+ * `success:false` responses remain unknown because the provider has no
+ * upstream idempotency key and could have created work before responding.
+ */
+export function monitorResponseExplicitlyRejectsSubmission(data: unknown) {
+  return (
+    isRecord(data) &&
+    data.success === false &&
+    !monitorResponseContainsTaskIdentity(data) &&
+    probeResponseRejectsCredential(200, data)
+  );
+}
+
+/**
+ * Verify the dedicated credential with a read-only lookup against an
+ * intentionally nonexistent task. A structured "task not found" response is
+ * sufficient proof that authentication ran; no task or billable work is ever
+ * created by this probe.
+ */
+export async function probeDedicatedMonitorCredential(
+  options: {
+    env?: NodeJS.ProcessEnv;
+    request?: MonitorCredentialProbeRequester;
+  } = {},
+): Promise<DedicatedMonitorCredentialReadiness> {
+  const env = options.env ?? process.env;
+  const credential = monitorCredentialFromEnv(env);
+  if (!credential) {
+    return {
+      configured: false,
+      authenticated: false,
+      ready: false,
+      status: "missing",
+    };
+  }
+  try {
+    const response = await (options.request ?? requestMonitorCredentialProbe)({
+      url: buildMonitorRequestUrl(
+        `/task/status/${MONITOR_CREDENTIAL_PROBE_TASK_ID}`,
+        env,
+      ),
+      apiKey: credential.apiKey,
+      timeoutMs: MONITOR_CREDENTIAL_PROBE_TIMEOUT_MS,
+    });
+    if (probeResponseRejectsCredential(response.status, response.data)) {
+      return {
+        configured: true,
+        authenticated: false,
+        ready: false,
+        status: "rejected",
+      };
+    }
+    if (
+      !(
+        (response.status >= 200 && response.status < 300) ||
+        response.status === 404
+      ) ||
+      !isRecord(response.data) ||
+      !probeResponseProvesAuthentication(response.data)
+    ) {
+      return {
+        configured: true,
+        authenticated: false,
+        ready: false,
+        status: "unavailable",
+      };
+    }
+    return {
+      configured: true,
+      authenticated: true,
+      ready: true,
+      status: "authenticated",
+    };
+  } catch {
+    return {
+      configured: true,
+      authenticated: false,
+      ready: false,
+      status: "unavailable",
+    };
+  }
+}
+
+let monitorCredentialReadinessCache:
+  | {
+      binding: string;
+      expiresAt: number;
+      value: DedicatedMonitorCredentialReadiness;
+    }
+  | undefined;
+
+export async function getDedicatedMonitorCredentialReadiness(
+  env: NodeJS.ProcessEnv = process.env,
+  options: {
+    request?: MonitorCredentialProbeRequester;
+    now?: () => number;
+    forceRefresh?: boolean;
+  } = {},
+) {
+  const credential = monitorCredentialFromEnv(env);
+  if (!credential)
+    return probeDedicatedMonitorCredential({ env, request: options.request });
+  const binding = `${credential.id}:${credential.version}:${env.FRONTMIND_MONITOR_API_BASE_URL ?? "default"}`;
+  const now = (options.now ?? Date.now)();
+  if (
+    options.forceRefresh !== true &&
+    monitorCredentialReadinessCache?.binding === binding &&
+    monitorCredentialReadinessCache.expiresAt > now
+  ) {
+    return monitorCredentialReadinessCache.value;
+  }
+  const value = await probeDedicatedMonitorCredential({
+    env,
+    request: options.request,
+  });
+  monitorCredentialReadinessCache = {
+    binding,
+    expiresAt:
+      now +
+      (value.ready
+        ? MONITOR_CREDENTIAL_READY_CACHE_MS
+        : MONITOR_CREDENTIAL_FAILED_CACHE_MS),
+    value,
+  };
+  return value;
 }
 
 async function getActiveMonitorCredential() {
@@ -1686,44 +1959,74 @@ export class DrizzleMonitorRepository implements MonitorRepository {
       if (!inserted) throw new Error("Inserted monitor run was not found");
       return { state: "acquired", run: inserted };
     } catch (error) {
-      const mysqlError = error as { code?: string };
-      if (mysqlError.code !== "ER_DUP_ENTRY") throw error;
+      if (!isMonitorDuplicateReservationError(error)) throw error;
     }
-    const existing = await db
-      .select()
-      .from(presalesMonitorRuns)
-      .where(
-        eq(presalesMonitorRuns.idempotencyKeyHash, input.idempotencyKeyHash),
-      )
-      .limit(1);
-    const row = existing[0];
-    if (!row) {
-      throw new PresalesMonitorError(
-        "IDEMPOTENCY_PENDING",
-        425,
-        "监控幂等预留正在建立，请稍后重试",
-        1_000,
-      );
-    }
-    if (
-      row.requestHash !== input.requestHash ||
-      row.apiCredentialId !== input.credential.id ||
-      row.credentialVersion !== input.credential.version
-    ) {
-      throw new PresalesMonitorError(
-        "IDEMPOTENCY_CONFLICT",
-        409,
-        "该幂等键已绑定另一组监控问题、平台或凭据版本",
-      );
-    }
-    if (row.deletedAt) {
-      throw new PresalesMonitorError(
-        "IDEMPOTENCY_RETIRED",
-        409,
-        "该幂等键对应的监控任务已删除，不能再次用于付费提交",
-      );
-    }
-    return { state: "replay", run: row };
+    return db.transaction(async (tx: any) => {
+      const existing = await tx
+        .select()
+        .from(presalesMonitorRuns)
+        .where(
+          eq(presalesMonitorRuns.idempotencyKeyHash, input.idempotencyKeyHash),
+        )
+        .limit(1)
+        .for("update");
+      const row = existing[0] as PresalesMonitorRun | undefined;
+      if (!row) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_PENDING",
+          425,
+          "监控幂等预留正在建立，请稍后重试",
+          1_000,
+        );
+      }
+      if (row.requestHash !== input.requestHash) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_CONFLICT",
+          409,
+          "该幂等键已绑定另一组监控问题或平台",
+        );
+      }
+      if (row.deletedAt) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_RETIRED",
+          409,
+          "该幂等键对应的监控任务已删除，不能再次用于付费提交",
+        );
+      }
+      const credentialChanged =
+        row.apiCredentialId !== input.credential.id ||
+        row.credentialVersion !== input.credential.version;
+      if (
+        credentialChanged &&
+        row.status === "remote_failed" &&
+        !row.upstreamTaskId
+      ) {
+        const retryPatch: Partial<InsertPresalesMonitorRun> = {
+          apiCredentialId: input.credential.id,
+          credentialVersion: input.credential.version,
+          status: "submission_in_progress",
+          lastError: null,
+          completedAt: null,
+          updatedAt: input.now,
+        };
+        await tx
+          .update(presalesMonitorRuns)
+          .set(retryPatch)
+          .where(eq(presalesMonitorRuns.id, row.id));
+        return {
+          state: "acquired" as const,
+          run: { ...row, ...retryPatch } as PresalesMonitorRun,
+        };
+      }
+      if (credentialChanged) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_CONFLICT",
+          409,
+          "该幂等键已绑定另一监控凭据版本",
+        );
+      }
+      return { state: "replay" as const, run: row };
+    });
   }
 
   async get(runId: string) {
@@ -1745,6 +2048,15 @@ export class DrizzleMonitorRepository implements MonitorRepository {
     return this.updateAndRead(runId, {
       status: "submission_unknown",
       lastError: error,
+      updatedAt: now,
+    });
+  }
+
+  async markSubmissionRejected(runId: string, error: string, now: Date) {
+    return this.updateAndRead(runId, {
+      status: "remote_failed",
+      lastError: error,
+      completedAt: now,
       updatedAt: now,
     });
   }
@@ -1933,7 +2245,7 @@ export function buildMonitorRequestUrl(
   return new URL(normalizedPath, `${monitorBaseUrl(env)}/`).toString();
 }
 
-class AxiosMonitorTransport implements MonitorTransport {
+export class AxiosMonitorTransport implements MonitorTransport {
   private async request(
     method: "POST" | "GET",
     path: string,
@@ -1975,12 +2287,18 @@ class AxiosMonitorTransport implements MonitorTransport {
     if (response.status < 200 || response.status >= 300) {
       throw new MonitorRemoteError(
         message,
-        method === "GET" &&
-          [408, 425, 429, 500, 502, 503, 504].includes(response.status),
+        [408, 425, 429, 500, 502, 503, 504].includes(response.status),
       );
     }
     if (!isRecord(response.data) || response.data.success !== true) {
-      throw new MonitorRemoteError(message, false);
+      // A malformed/empty or generic failure response does not prove that a
+      // POST was rejected: the provider may have accepted it before losing
+      // the response envelope. Only a credential rejection with no task
+      // identity is safe to retry after credential rotation.
+      throw new MonitorRemoteError(
+        message,
+        !monitorResponseExplicitlyRejectsSubmission(response.data),
+      );
     }
     return redactExactSecret(response.data, credential.apiKey);
   }
@@ -2061,6 +2379,16 @@ export class PresalesMonitorService {
       now: this.now(),
     });
     if (reservation.state === "replay") {
+      if (
+        reservation.run.status === "remote_failed" &&
+        !reservation.run.upstreamTaskId
+      ) {
+        throw new PresalesMonitorError(
+          "MONITOR_SUBMISSION_REJECTED",
+          502,
+          "监控服务已明确拒绝本次提交，未创建任务；修复服务配置后可安全重试",
+        );
+      }
       return { replayed: true, run: publicMonitorRun(reservation.run, false) };
     }
 
@@ -2088,7 +2416,19 @@ export class PresalesMonitorService {
         error instanceof Error
           ? safeError(error.message, "监控提交结果未知")
           : "监控提交结果未知";
-      const run = await this.repository.markSubmissionUnknown(
+      if (error instanceof MonitorRemoteError && !error.recoverable) {
+        await this.repository.markSubmissionRejected(
+          reservation.run.id,
+          message,
+          this.now(),
+        );
+        throw new PresalesMonitorError(
+          "MONITOR_SUBMISSION_REJECTED",
+          502,
+          "监控服务已明确拒绝本次提交，未创建任务；修复服务配置后可安全重试",
+        );
+      }
+      await this.repository.markSubmissionUnknown(
         reservation.run.id,
         message,
         this.now(),

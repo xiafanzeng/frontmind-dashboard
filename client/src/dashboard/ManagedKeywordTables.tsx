@@ -1,5 +1,12 @@
 import { Database, Search, X } from "lucide-react";
 import { useMemo, useState, type ReactNode } from "react";
+import {
+  KEYWORD_CATEGORY_OPTIONS,
+  isKeywordCategoryColumn,
+  keywordCategoryColumnIndex,
+  keywordCategoryKey,
+  keywordCategoryLabel,
+} from "@shared/keyword-categories";
 
 export type ManagedKeywordTable = {
   id: string;
@@ -107,29 +114,57 @@ export default function ManagedKeywordTables({
 }: ManagedKeywordTablesProps) {
   const [searchTerm, setSearchTerm] = useState("");
   const [tableFilter, setTableFilter] = useState("all");
+  const [categoryFilter, setCategoryFilter] = useState("all");
   const keyword = searchTerm.trim().toLowerCase();
+  const hasKeywordCategories = useMemo(
+    () =>
+      tables.some((table) => {
+        const categoryColumnIndex = keywordCategoryColumnIndex(table.columns);
+        return (
+          categoryColumnIndex >= 0 &&
+          table.rows.some((row) =>
+            Boolean(keywordCategoryKey(row[categoryColumnIndex])),
+          )
+        );
+      }),
+    [tables],
+  );
   const visibleTables = useMemo(() => {
     const selectedTables =
       tableFilter === "all"
         ? tables
         : tables.filter((table) => table.id === tableFilter);
-    if (!keyword) return selectedTables;
     return selectedTables
-      .map((table) => ({
-        ...table,
-        rows: table.rows.filter((row) =>
-          row.some((cell) => String(cell).toLowerCase().includes(keyword)),
-        ),
-      }))
+      .map((table) => {
+        const categoryColumnIndex = keywordCategoryColumnIndex(table.columns);
+        const rows = table.rows.filter((row) => {
+          if (
+            categoryFilter !== "all" &&
+            (categoryColumnIndex < 0 ||
+              keywordCategoryKey(row[categoryColumnIndex]) !== categoryFilter)
+          ) {
+            return false;
+          }
+          if (!keyword) return true;
+          return row.some((cell, cellIndex) => {
+            const text = String(cell).toLowerCase();
+            const mappedCategory =
+              cellIndex === categoryColumnIndex
+                ? keywordCategoryLabel(cell)?.toLowerCase()
+                : null;
+            return (
+              text.includes(keyword) ||
+              Boolean(mappedCategory?.includes(keyword))
+            );
+          });
+        });
+        return { ...table, rows };
+      })
       .filter(
         (table) =>
-          table.title.toLowerCase().includes(keyword) ||
-          table.columns.some((column) =>
-            column.toLowerCase().includes(keyword),
-          ) ||
-          table.rows.length > 0,
+          (!keyword && categoryFilter === "all") || table.rows.length > 0,
       );
-  }, [keyword, tableFilter, tables]);
+  }, [categoryFilter, keyword, tableFilter, tables]);
   const totalRows = useMemo(
     () => tables.reduce((total, table) => total + table.rows.length, 0),
     [tables],
@@ -191,23 +226,42 @@ export default function ManagedKeywordTables({
             </button>
           )}
         </div>
-        {tables.length > 1 && (
+        {(tables.length > 1 || hasKeywordCategories) && (
           <div className="filter-group">
-            <div className="filter-item">
-              <label htmlFor="managed-keyword-table">词表</label>
-              <select
-                id="managed-keyword-table"
-                value={tableFilter}
-                onChange={(event) => setTableFilter(event.target.value)}
-              >
-                <option value="all">全部词表</option>
-                {tables.map((table) => (
-                  <option key={table.id} value={table.id}>
-                    {safeText(table.title)}
-                  </option>
-                ))}
-              </select>
-            </div>
+            {hasKeywordCategories && (
+              <div className="filter-item">
+                <label htmlFor="managed-keyword-category">分类</label>
+                <select
+                  id="managed-keyword-category"
+                  value={categoryFilter}
+                  onChange={(event) => setCategoryFilter(event.target.value)}
+                >
+                  <option value="all">全部分类</option>
+                  {KEYWORD_CATEGORY_OPTIONS.map((category) => (
+                    <option key={category.key} value={category.key}>
+                      {category.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {tables.length > 1 && (
+              <div className="filter-item">
+                <label htmlFor="managed-keyword-table">词表</label>
+                <select
+                  id="managed-keyword-table"
+                  value={tableFilter}
+                  onChange={(event) => setTableFilter(event.target.value)}
+                >
+                  <option value="all">全部词表</option>
+                  {tables.map((table) => (
+                    <option key={table.id} value={table.id}>
+                      {safeText(table.title)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -249,7 +303,12 @@ export default function ManagedKeywordTables({
                         const column = String(table.columns[cellIndex] || "");
                         const normalizedColumn = column.replace(/\s+/g, "");
                         const value = safeText(cell);
-                        const isCategory = normalizedColumn.includes("分类");
+                        const isCategory =
+                          isKeywordCategoryColumn(column) ||
+                          normalizedColumn.includes("分类");
+                        const displayValue = isKeywordCategoryColumn(column)
+                          ? keywordCategoryLabel(value) || value
+                          : value;
                         const isPriority = normalizedColumn.includes("优先级");
                         const isHeat = normalizedColumn.includes("热度");
                         const priorityTone = value.includes("高")
@@ -267,17 +326,19 @@ export default function ManagedKeywordTables({
                             }
                           >
                             {isCategory ? (
-                              <span className="keyword-pill">{value}</span>
+                              <span className="keyword-pill">
+                                {displayValue}
+                              </span>
                             ) : isPriority ? (
                               <span
                                 className={`priority-pill priority-${priorityTone}`}
                               >
-                                {value}
+                                {displayValue}
                               </span>
                             ) : isHeat ? (
-                              <strong>{value}</strong>
+                              <strong>{displayValue}</strong>
                             ) : (
-                              value
+                              displayValue
                             )}
                           </td>
                         );

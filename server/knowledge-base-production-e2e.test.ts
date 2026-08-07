@@ -485,6 +485,8 @@ async function createFinalPackageFixture(
     schemaVersion?: 3 | 4;
     archiveLeafIdPrefix?: string;
     driftLastPackagedLeaf?: boolean;
+    officialLogoSourcePageUrl?: string;
+    officialLogoSourceAssetUrl?: string;
   } = {},
 ) {
   const leafCount = input.leafCount ?? FINAL_REVISION;
@@ -610,8 +612,11 @@ async function createFinalPackageFixture(
     alt: "FrontMind超前智能 Logo",
     branchId: "products",
     documentIds: [`${input.archiveLeafIdPrefix || ""}1.1`],
-    sourcePageUrl: "https://www.frontmind.net/",
-    sourceAssetUrl: "https://www.frontmind.net/frontmind-logo.png",
+    sourcePageUrl:
+      input.officialLogoSourcePageUrl || "https://www.frontmind.net/",
+    sourceAssetUrl:
+      input.officialLogoSourceAssetUrl ||
+      "https://www.frontmind.net/frontmind-logo.png",
     sourceKind: "official_web",
     ownership: "first_party",
     assetType: "brand_identity",
@@ -751,6 +756,46 @@ function initialState() {
     snapshots: [],
     resources: [],
   } satisfies MemoryState;
+}
+
+function completedOfficialLogoProvenanceTurn(input: {
+  id: string;
+  buildId: string;
+  generation: number;
+  now: Date;
+}) {
+  return {
+    id: input.id,
+    conversationId: STORED_CONVERSATION_ID,
+    userId: USER_ID,
+    apiCredentialId: "credential-e2e",
+    clientRequestId: `request-${input.id}`,
+    buildId: input.buildId,
+    buildGeneration: input.generation,
+    operationKey: `operation-${input.id}`,
+    operationType: "start",
+    expectedRevision: 0,
+    expectedLeafId: null,
+    requestHash: "8".repeat(64),
+    upstreamIdempotencyKeyHash: "9".repeat(64),
+    attachmentFileIds: [],
+    metadata: {
+      boundOfficialLogoProvenance: {
+        sourceKind: "official_web",
+        sourcePageUrl: "https://www.frontmind.net/",
+        sourceAssetUrl: "https://www.frontmind.net/frontmind-logo.png",
+      },
+    },
+    leaseExpiresAt: null,
+    status: "completed",
+    upstreamTaskId: `task-${input.id}`,
+    errorCode: null,
+    errorMessage: null,
+    startedAt: input.now,
+    completedAt: input.now,
+    createdAt: input.now,
+    updatedAt: input.now,
+  };
 }
 
 async function listen(app: express.Express) {
@@ -1005,7 +1050,52 @@ describe("knowledge-base production final-package acceptance", () => {
   });
 
   it("runs all 8 leaves from manifest and Logo through publish, Viewer and immutable ZIP download", async () => {
-    const fixture = await createFinalPackageFixture();
+    const upstream = express();
+    upstream.use(express.json({ limit: "5mb" }));
+    const upstreamListener = await listen(upstream);
+    upstreamServer = upstreamListener.server;
+    const upstreamBaseUrl = upstreamListener.baseUrl;
+    dependencies.upstreamBaseUrl = upstreamBaseUrl;
+    const fixture = await createFinalPackageFixture({
+      schemaVersion: 4,
+      officialLogoSourcePageUrl: "https://www.frontmind.net/",
+      officialLogoSourceAssetUrl: `${upstreamBaseUrl}/v1/files/file-official-logo/content`,
+    });
+    const countMismatchZip = await JSZip.loadAsync(fixture.archive);
+    const countMismatchManifestEntry = Object.values(
+      countMismatchZip.files,
+    ).find((entry) => entry.name.endsWith("/00_package_manifest.json"));
+    expect(countMismatchManifestEntry).toBeTruthy();
+    const countMismatchManifest = JSON.parse(
+      await countMismatchManifestEntry!.async("string"),
+    );
+    countMismatchManifest.counts.customerVisibleCharacters += 615;
+    countMismatchZip.file(
+      countMismatchManifestEntry!.name,
+      JSON.stringify(countMismatchManifest),
+    );
+    const countMismatchedArchive = await countMismatchZip.generateAsync({
+      type: "nodebuffer",
+    });
+    expect(countMismatchedArchive.equals(fixture.archive)).toBe(false);
+    const canonicalRebindArchive = await canonicalizeKnowledgeBaseFinalArchive({
+      buffer: countMismatchedArchive,
+      nodes: fixture.leaves.map((leaf, ordinal) => ({
+        leafId: leaf.id,
+        title: leaf.title,
+        branchId: "products",
+        branchTitle: "产品与服务",
+        ordinal,
+        status: "confirmed",
+        contentMarkdown: leaf.contentMarkdown,
+        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
+      })),
+      buildRevision: fixture.leaves.length,
+    });
+    expect(canonicalRebindArchive.changed).toBe(true);
+    const canonicalRebindArchiveSha256 = createHash("sha256")
+      .update(canonicalRebindArchive.buffer)
+      .digest("hex");
     const state = initialState();
     dependencies.getDb.mockResolvedValue(memoryDatabase(state));
     const archiveSha256 = createHash("sha256")
@@ -1032,9 +1122,6 @@ describe("knowledge-base production final-package acceptance", () => {
       string,
       { status: "awaiting_input" | "completed"; output: unknown[] }
     >();
-    const upstream = express();
-    upstream.use(express.json({ limit: "5mb" }));
-    let upstreamBaseUrl = "";
     let uploadedFileSequence = 0;
     let authoritativeTaskReads = 0;
     let logoDownloads = 0;
@@ -1042,7 +1129,8 @@ describe("knowledge-base production final-package acceptance", () => {
     let currentLogoBytes = rejectedLogo;
     let currentPackageBytes = rejectedArchive;
     let includeFinalPackage = true;
-    const uploadedFileBytes = new Map<string, number>();
+    const uploadedFileBytes = new Map<string, Buffer>();
+    const uploadedFileNames = new Map<string, string>();
     const operationTaskPosts = new Map<string, number>();
     let rawTaskPosts = 0;
     let transientConfirmationFailuresRemaining = 1;
@@ -1053,8 +1141,19 @@ describe("knowledge-base production final-package acceptance", () => {
 
     upstream.post("/v1/files", (req, res) => {
       expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
-      expect(req.body.filename).toBe("socratic-kb-builder.skill.zip");
-      const fileId = `uploaded-skill-${++uploadedFileSequence}`;
+      const filename = String(req.body.filename || "");
+      expect(
+        filename === "socratic-kb-builder.skill.zip" ||
+          filename === "frontmind-kb-server-instructions.txt" ||
+          /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u.test(filename),
+      ).toBe(true);
+      const kind = filename.startsWith("socratic-")
+        ? "skill"
+        : filename.includes("finalization")
+          ? "finalization"
+          : "instructions";
+      const fileId = `uploaded-${kind}-${++uploadedFileSequence}`;
+      uploadedFileNames.set(fileId, filename);
       res.json({
         id: fileId,
         upload_url: `${upstreamBaseUrl}/uploads/${fileId}`,
@@ -1065,9 +1164,9 @@ describe("knowledge-base production final-package acceptance", () => {
       express.raw({ type: "*/*", limit: "50mb" }),
       (req, res) => {
         expect(req.header("authorization")).toBeUndefined();
-        const bytes = Buffer.isBuffer(req.body) ? req.body.length : 0;
-        expect(bytes).toBeGreaterThan(0);
-        uploadedFileBytes.set(req.params.fileId, bytes);
+        const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        expect(bytes.length).toBeGreaterThan(0);
+        uploadedFileBytes.set(req.params.fileId, Buffer.from(bytes));
         res.status(200).end();
       },
     );
@@ -1075,8 +1174,13 @@ describe("knowledge-base production final-package acceptance", () => {
       rawTaskPosts += 1;
       expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
       const prompt = String(req.body.prompt || "");
-      const operationId = prompt.match(/"operationId":"([^"]+)"/u)?.[1];
-      const turnId = prompt.match(/"turnId":"([^"]+)"/u)?.[1];
+      expect(Array.from(prompt).length).toBeLessThanOrEqual(3_000);
+      const operationId =
+        prompt.match(/"operationId":"([^"]+)"/u)?.[1] ||
+        prompt.match(/operationId=([^；;\s]+)/u)?.[1];
+      const turnId =
+        prompt.match(/"turnId":"([^"]+)"/u)?.[1] ||
+        prompt.match(/turnId=([^。；;\s]+)/u)?.[1];
       expect(operationId).toBeTruthy();
       expect(turnId).toBeTruthy();
       const turn = state.turns.find((candidate) => candidate.id === turnId);
@@ -1088,6 +1192,17 @@ describe("knowledge-base production final-package acceptance", () => {
       expect(turn?.attachmentFileIds).toEqual(
         req.body.attachments.map((attachment: any) => attachment.file_id),
       );
+      const systemInputAttachment = req.body.attachments.find(
+        (attachment: any) =>
+          attachment.filename === "frontmind-kb-server-instructions.txt" ||
+          /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u.test(
+            attachment.filename,
+          ),
+      );
+      expect(systemInputAttachment).toBeTruthy();
+      expect(
+        uploadedFileBytes.get(systemInputAttachment.file_id)?.length,
+      ).toBeGreaterThan(0);
       const idempotencyKey = String(req.header("idempotency-key") || "");
       expect(idempotencyKey).toBe(`frontmind-kb-v2:${operationId}`);
       const replay = idempotentTaskResponses.get(idempotencyKey);
@@ -1125,6 +1240,11 @@ describe("knowledge-base production final-package acceptance", () => {
           schemaVersion: 2,
           operationId: operationId!,
           turnId: turnId!,
+          officialLogo: {
+            sourceKind: "official_web",
+            sourcePageUrl: "https://www.frontmind.net/",
+            sourceAssetUrl: `${upstreamBaseUrl}/v1/files/file-official-logo/content`,
+          },
           leaves: fixture.leaves.map((leaf) => ({
             id: leaf.id,
             title: leaf.title,
@@ -1299,11 +1419,6 @@ describe("knowledge-base production final-package acceptance", () => {
       );
       res.send(currentPackageBytes);
     });
-    const upstreamListener = await listen(upstream);
-    upstreamServer = upstreamListener.server;
-    upstreamBaseUrl = upstreamListener.baseUrl;
-    dependencies.upstreamBaseUrl = upstreamListener.baseUrl;
-
     const { default: dashboardRouter } = await import("./dashboard-api");
     const { default: knowledgeBaseRouter } = await import(
       "./knowledge-base-api"
@@ -1403,7 +1518,7 @@ describe("knowledge-base production final-package acceptance", () => {
       logoStorageKey: null,
       logoSha256: null,
     });
-    expect(logoDownloads).toBe(1);
+    expect(logoDownloads).toBe(2);
 
     // The provider replaces the same file ID with corrected bytes and a valid
     // first-node body. The rejected candidate must not poison this generation.
@@ -1474,13 +1589,17 @@ describe("knowledge-base production final-package acceptance", () => {
     expect(
       state.nodes.slice(1).every((node) => node.status === "pending"),
     ).toBe(true);
-    expect(logoDownloads).toBe(2);
+    expect(logoDownloads).toBe(4);
     expect(startTurn).toMatchObject({
       status: "completed",
       upstreamTaskId: initialTaskId,
-      attachmentFileIds: [expect.stringMatching(/^uploaded-skill-/u)],
+      attachmentFileIds: expect.arrayContaining([
+        expect.stringMatching(/^uploaded-skill-/u),
+        expect.stringMatching(/^uploaded-instructions-/u),
+      ]),
       metadata: expect.objectContaining({ attachmentsFrozen: true }),
     });
+    expect(startTurn.attachmentFileIds).toHaveLength(2);
     const startTaskPostCount = operationTaskPosts.get(startTurn.operationKey);
     const uploadedCountAfterStart = uploadedFileSequence;
     const repeatedStart = await postKnowledgeBase("/start", startRequest);
@@ -1543,7 +1662,7 @@ describe("knowledge-base production final-package acceptance", () => {
       };
       let result = await postKnowledgeBase("/turn", turnRequest);
       const expectedRevision = index + 1;
-      const turn = state.turns.find(
+      let turn = state.turns.find(
         (candidate) =>
           candidate.clientRequestId === turnRequest.clientRequestId,
       )!;
@@ -1556,7 +1675,9 @@ describe("knowledge-base production final-package acceptance", () => {
           currentLeafId: leaf.id,
           packageStorageKey: null,
         });
-        expect(packageDownloads).toBe(1);
+        // The malformed final output also carries a forbidden image. The v4
+        // resource gate must reject that shape before downloading any ZIP.
+        expect(packageDownloads).toBe(0);
         const finalTask = taskResults.get(TASK_ID)!;
         const finalAssistant = finalTask.output.find(
           (item: any) => item.id === `assistant-confirm-${index + 1}`,
@@ -1590,6 +1711,10 @@ describe("knowledge-base production final-package acceptance", () => {
         );
         expect(response.status).toBe(200);
         result = await response.json();
+        turn = state.turns.find(
+          (candidate) =>
+            candidate.clientRequestId === turnRequest.clientRequestId,
+        )!;
       }
       expect(turn).toMatchObject({
         operationType: "confirm",
@@ -1597,9 +1722,15 @@ describe("knowledge-base production final-package acceptance", () => {
         expectedLeafId: leaf.id,
         status: "completed",
         upstreamTaskId: turnTaskId,
-        attachmentFileIds: [expect.stringMatching(/^uploaded-skill-/u)],
+        attachmentFileIds: expect.arrayContaining([
+          expect.stringMatching(/^uploaded-skill-/u),
+          expect.stringMatching(
+            isFinal ? /^uploaded-finalization-/u : /^uploaded-instructions-/u,
+          ),
+        ]),
         metadata: expect.objectContaining({ attachmentsFrozen: true }),
       });
+      expect(turn.attachmentFileIds).toHaveLength(2);
       if (isFinal) {
         expect(result.observation).toMatchObject({
           authoritativeTaskId: TASK_ID,
@@ -1751,12 +1882,27 @@ describe("knowledge-base production final-package acceptance", () => {
     }
 
     expect(authoritativeTaskReads).toBe(2);
-    expect(logoDownloads).toBe(2);
-    expect(packageDownloads).toBe(2);
-    // The Skill is a build-scoped immutable asset: upload it once at start,
-    // then reuse the same owned file id for every confirmed leaf.
-    expect(uploadedFileSequence).toBe(1);
-    expect(uploadedFileBytes.size).toBe(1);
+    expect(logoDownloads).toBe(4);
+    expect(packageDownloads).toBe(1);
+    // The Skill is build-scoped and reused once. Every operation gets one
+    // operation-bound server input file; the last uses finalization ZIP.
+    expect(uploadedFileSequence).toBe(10);
+    expect(uploadedFileBytes.size).toBe(10);
+    expect(
+      [...uploadedFileNames.values()].filter(
+        (filename) => filename === "socratic-kb-builder.skill.zip",
+      ),
+    ).toHaveLength(1);
+    expect(
+      [...uploadedFileNames.values()].filter(
+        (filename) => filename === "frontmind-kb-server-instructions.txt",
+      ),
+    ).toHaveLength(8);
+    expect(
+      [...uploadedFileNames.values()].filter((filename) =>
+        /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u.test(filename),
+      ),
+    ).toHaveLength(1);
     expect(
       new Set(
         state.turns
@@ -1835,8 +1981,8 @@ describe("knowledge-base production final-package acceptance", () => {
         limit: 100,
       });
     expect(orphanCleanup).toEqual({
-      scanned: 4,
-      deleted: 2,
+      scanned: 3,
+      deleted: 1,
       retained: 2,
       failed: 0,
     });
@@ -1978,6 +2124,11 @@ describe("knowledge-base production final-package acceptance", () => {
     expect(state.turns).toHaveLength(turnCountBeforeRebind);
 
     includeFinalPackage = true;
+    // A historical provider may return the same authoritative formal bytes
+    // with only a stale derived manifest count. Ready-package recovery must
+    // canonicalize that field and then pass the strict reread without creating
+    // a new upstream turn.
+    currentPackageBytes = countMismatchedArchive;
     const rebindResponse = await fetch(
       `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
       {
@@ -2000,8 +2151,8 @@ describe("knowledge-base production final-package acceptance", () => {
       },
       package: {
         revision: FINAL_REVISION,
-        sha256: archiveSha256,
-        sizeBytes: fixture.archive.length,
+        sha256: canonicalRebindArchiveSha256,
+        sizeBytes: canonicalRebindArchive.buffer.length,
       },
     });
     expect(authoritativeTaskReads).toBe(readsBeforeRebind + 2);
@@ -2011,7 +2162,7 @@ describe("knowledge-base production final-package acceptance", () => {
       stateEpoch: rebindStateEpoch + 1,
       packageRevision: FINAL_REVISION,
       packageTaskId: TASK_ID,
-      packageArchiveSha256: archiveSha256,
+      packageArchiveSha256: canonicalRebindArchiveSha256,
       protocolError: null,
       protocolErrorCode: null,
     });
@@ -2121,7 +2272,7 @@ describe("knowledge-base production final-package acceptance", () => {
       observation: {
         notice: null,
         interaction: { interactionState: "ready_to_publish" },
-        package: { sha256: archiveSha256 },
+        package: { sha256: canonicalRebindArchiveSha256 },
       },
     });
     expect(state.builds[0]).toMatchObject({
@@ -2184,8 +2335,8 @@ describe("knowledge-base production final-package acceptance", () => {
       sourceBuildId: buildId,
       sourceBuildRevision: FINAL_REVISION,
       sourceTaskId: TASK_ID,
-      sourceArtifactHash: archiveSha256,
-      archiveHash: archiveSha256,
+      sourceArtifactHash: canonicalRebindArchiveSha256,
+      archiveHash: canonicalRebindArchiveSha256,
       archiveAvailable: true,
       imageCount: 1,
     });
@@ -2211,7 +2362,7 @@ describe("knowledge-base production final-package acceptance", () => {
       id: published.snapshot.id,
       sourceBuildId: buildId,
       sourceBuildRevision: FINAL_REVISION,
-      archiveHash: archiveSha256,
+      archiveHash: canonicalRebindArchiveSha256,
       archiveAvailable: true,
     });
     const viewerLeaves = viewerSnapshot!.documents
@@ -2262,9 +2413,9 @@ describe("knowledge-base production final-package acceptance", () => {
       "private, no-store",
     );
     const downloaded = Buffer.from(await downloadResponse.arrayBuffer());
-    expect(downloaded).toEqual(fixture.archive);
+    expect(downloaded).toEqual(canonicalRebindArchive.buffer);
     expect(createHash("sha256").update(downloaded).digest("hex")).toBe(
-      archiveSha256,
+      canonicalRebindArchiveSha256,
     );
 
     const { readKnowledgeArchive } = await import("./dashboard-api");
@@ -2274,7 +2425,7 @@ describe("knowledge-base production final-package acceptance", () => {
       "33333333-3333-4333-8333-333333333333",
       {
         validationProfile: "dashboard-enterprise-v1",
-        archiveContractVersions: [3],
+        archiveContractVersions: [4],
       },
     );
     expect(unpacked.packageBuildRevision).toBe(FINAL_REVISION);
@@ -2300,6 +2451,233 @@ describe("knowledge-base production final-package acceptance", () => {
     );
   }, 120_000);
 
+  it("rebinds, downloads and publishes a real historical Skill-v4/schema-v3 archive without v4 upload evidence", async () => {
+    const buildId = "13131313-1313-4131-8131-131313131313";
+    const taskId = "task-historical-v4-schema3";
+    const fileId = "file-historical-v4-schema3";
+    const now = new Date("2026-08-05T00:00:00.000Z");
+    const fixture = await createFinalPackageFixture({
+      leafCount: FINAL_REVISION,
+      buildRevision: FINAL_REVISION,
+      schemaVersion: 3,
+    });
+    const fixtureSha256 = createHash("sha256")
+      .update(fixture.archive)
+      .digest("hex");
+    const state = initialState();
+    state.builds.push({
+      id: buildId,
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: "FrontMind超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "3".repeat(64),
+      status: "protocol_error",
+      generation: 1,
+      stateEpoch: 7,
+      revision: FINAL_REVISION,
+      currentLeafId: null,
+      totalNodeCount: FINAL_REVISION,
+      confirmedCount: FINAL_REVISION,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      activeTurnId: null,
+      upstreamTaskId: taskId,
+      lastAppliedOperationKey: "operation-historical-v4-schema3",
+      currentPresentationKey: null,
+      lastReconciledHash: null,
+      lastOutputLength: 1,
+      lastOutputItemIds: ["assistant-historical-v4-schema3"],
+      lastTurnUserText: "确认",
+      lastTurnAttachmentCount: 0,
+      awaitingResponseSince: null,
+      packageRevision: FINAL_REVISION,
+      packageTaskId: taskId,
+      packageOutputItemId: null,
+      packageFileId: fileId,
+      packageFilename: "historical-v4-schema3.zip",
+      packageDescriptorHash: null,
+      packageStorageKey: null,
+      packageArchiveSha256: null,
+      packageSizeBytes: null,
+      logoStorageKey: null,
+      logoSha256: null,
+      logoBytes: null,
+      logoFilename: null,
+      logoMimeType: null,
+      protocolErrorCode: "PACKAGE_REBIND_REQUIRED",
+      protocolError: "历史成品需要重新绑定",
+      publishedSnapshotId: null,
+      completedAt: now,
+      publishedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    state.nodes.push(
+      ...fixture.leaves.map((leaf, ordinal) => ({
+        id: `13131313-1313-4131-8131-${String(ordinal + 1).padStart(12, "0")}`,
+        buildId,
+        leafId: leaf.id,
+        branchId: "products",
+        branchTitle: "产品与服务",
+        title: leaf.title,
+        ordinal,
+        status: "confirmed",
+        transitionReason: "历史生产版本已确认",
+        contentMarkdown: leaf.contentMarkdown,
+        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
+        lastUserInput: null,
+        sourceUrls: [],
+        imageUrls: [],
+        lastTaskId: taskId,
+        sourceTurnId: null,
+        presentationKey: `historical-presentation-${ordinal + 1}`,
+        lastResponseAt: now,
+        confirmedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      })),
+    );
+    const provenanceTurn = completedOfficialLogoProvenanceTurn({
+      id: "14141414-1414-4141-8141-141414141414",
+      buildId,
+      generation: 1,
+      now,
+    });
+    provenanceTurn.metadata.boundOfficialLogoProvenance = {
+      sourceKind: "official_web",
+      sourcePageUrl: "https://new-ledger.example.com/",
+      sourceAssetUrl: "https://new-ledger.example.com/logo.png",
+    };
+    state.turns.push(provenanceTurn);
+    dependencies.getDb.mockResolvedValue(
+      memoryDatabase(state, { cloneSelectedRows: true }),
+    );
+
+    const providerOutput = [
+      {
+        id: "assistant-historical-v4-schema3",
+        role: "assistant",
+        type: "output_message",
+        content: [
+          {
+            type: "output_file",
+            file_id: fileId,
+            file_name: "historical-v4-schema3.zip",
+            mime_type: "application/zip",
+          },
+        ],
+      },
+    ];
+    const upstream = express();
+    upstream.get(`/v1/files/${fileId}/content`, (req, res) => {
+      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Length", String(fixture.archive.length));
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="historical-v4-schema3.zip"',
+      );
+      res.send(fixture.archive);
+    });
+    const upstreamListener = await listen(upstream);
+    dependencies.upstreamBaseUrl = upstreamListener.baseUrl;
+
+    let dashboardListener: Awaited<ReturnType<typeof listen>> | undefined;
+    try {
+      const { bindKnowledgeBaseReadyPackage } = await import(
+        "./knowledge-base-artifact-binding-service"
+      );
+      const rebound = await bindKnowledgeBaseReadyPackage({
+        userId: USER_ID,
+        buildId,
+        generation: 1,
+        taskId,
+        output: providerOutput,
+        apiKey: "sk-e2e-only",
+        baseUrl: upstreamListener.baseUrl,
+      });
+      expect(rebound).toMatchObject({
+        idempotent: false,
+        sha256: fixtureSha256,
+        bytes: fixture.archive.length,
+      });
+      expect(state.builds[0]).toMatchObject({
+        status: "ready_to_publish",
+        protocolError: null,
+        protocolErrorCode: null,
+        revision: FINAL_REVISION,
+        packageRevision: FINAL_REVISION,
+        packageArchiveSha256: fixtureSha256,
+        packageSizeBytes: fixture.archive.length,
+        packageStorageKey: expect.any(String),
+        logoSha256: fixture.logoSha256,
+        logoBytes: fixture.logo.length,
+        logoStorageKey: expect.any(String),
+      });
+
+      const { default: artifactRouter } = await import(
+        "./knowledge-base-artifact-api"
+      );
+      const { default: dashboardRouter } = await import("./dashboard-api");
+      const { requireExpressAuth } = await import("./_core/express-auth");
+      const dashboard = express();
+      dashboard.use(express.json());
+      dashboard.use(
+        "/api/knowledge-base/artifacts",
+        requireExpressAuth,
+        artifactRouter,
+      );
+      dashboard.use("/api/dashboard", dashboardRouter);
+      dashboardListener = await listen(dashboard);
+
+      const artifactResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/knowledge-base/artifacts/${buildId}/package`,
+        { headers: { "x-test-auth": "user" } },
+      );
+      expect(artifactResponse.status).toBe(200);
+      expect(Buffer.from(await artifactResponse.arrayBuffer())).toEqual(
+        fixture.archive,
+      );
+
+      const publishResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/dashboard/knowledge/publish`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
+        },
+      );
+      expect(publishResponse.status).toBe(200);
+      const published = (await publishResponse.json()) as any;
+      expect(published.snapshot).toMatchObject({
+        sourceBuildId: buildId,
+        sourceBuildRevision: FINAL_REVISION,
+        archiveHash: fixtureSha256,
+        imageCount: 1,
+      });
+      expect(state.builds[0]).toMatchObject({
+        status: "published",
+        publishedSnapshotId: published.snapshot.id,
+      });
+      expect(
+        state.snapshots[0]!.documents.filter(
+          (document: any) => document.kind === "leaf",
+        ).map((document: any) => document.id),
+      ).toEqual(fixture.leaves.map((leaf) => leaf.id));
+    } finally {
+      await Promise.all([
+        close(dashboardListener?.server),
+        close(upstreamListener.server),
+      ]);
+    }
+  }, 60_000);
+
   it("recovers the original final turn when the same settled task appends its ZIP", async () => {
     const finalRevision = 45;
     const priorRevision = finalRevision - 1;
@@ -2312,7 +2690,6 @@ describe("knowledge-base production final-package acceptance", () => {
       leafCount: finalRevision,
       buildRevision: finalRevision,
       schemaVersion: 4,
-      archiveLeafIdPrefix: "leaf-",
       driftLastPackagedLeaf: true,
     });
     const sealedArchive = await canonicalizeKnowledgeBaseFinalArchive({
@@ -2449,6 +2826,14 @@ describe("knowledge-base production final-package acceptance", () => {
       createdAt: now,
       updatedAt: now,
     });
+    state.turns.push(
+      completedOfficialLogoProvenanceTurn({
+        id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        buildId,
+        generation: 1,
+        now,
+      }),
+    );
     // Real database reads return snapshots. Clone selected rows here so the
     // recovery CAS compares its pre-update stateEpoch with the rebound row,
     // rather than observing this in-memory adapter's Object.assign mutation.
@@ -2552,7 +2937,7 @@ describe("knowledge-base production final-package acceptance", () => {
       packageArchiveSha256: null,
       packageSizeBytes: null,
     });
-    expect(state.turns).toHaveLength(1);
+    expect(state.turns).toHaveLength(2);
     expect(state.turns[0]).toMatchObject({
       id: turnId,
       operationKey,
@@ -2716,7 +3101,7 @@ describe("knowledge-base production final-package acceptance", () => {
       });
       expect(taskReads).toBe(1);
       expect(packageDownloads).toBe(1);
-      expect(state.turns).toHaveLength(1);
+      expect(state.turns).toHaveLength(2);
       expect(state.turns[0]).toMatchObject({
         id: turnId,
         operationKey,
@@ -2788,7 +3173,7 @@ describe("knowledge-base production final-package acceptance", () => {
         },
       });
       expect(state.builds[0]!.stateEpoch).toBe(stableEpoch);
-      expect(state.turns).toHaveLength(1);
+      expect(state.turns).toHaveLength(2);
       expect(taskReads).toBe(1);
       expect(packageDownloads).toBe(1);
     } finally {
@@ -2799,7 +3184,7 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   }, 60_000);
 
-  it("retries a failed final-package turn through a new provider task and publishes its scoped ZIP", async () => {
+  it("retries a failed final package and repairs only its derived visible-character count", async () => {
     const finalRevision = 45;
     const priorRevision = finalRevision - 1;
     const buildId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -2815,11 +3200,26 @@ describe("knowledge-base production final-package acceptance", () => {
       leafCount: finalRevision,
       buildRevision: finalRevision,
       schemaVersion: 4,
-      archiveLeafIdPrefix: "leaf-",
       driftLastPackagedLeaf: true,
     });
+    const providerArchiveZip = await JSZip.loadAsync(fixture.archive);
+    const providerManifestEntry = Object.values(providerArchiveZip.files).find(
+      (entry) => entry.name.endsWith("/00_package_manifest.json"),
+    );
+    expect(providerManifestEntry).toBeTruthy();
+    const providerManifest = JSON.parse(
+      await providerManifestEntry!.async("string"),
+    );
+    providerManifest.counts.customerVisibleCharacters += 615;
+    providerArchiveZip.file(
+      providerManifestEntry!.name,
+      JSON.stringify(providerManifest),
+    );
+    const providerArchive = await providerArchiveZip.generateAsync({
+      type: "nodebuffer",
+    });
     const sealedArchive = await canonicalizeKnowledgeBaseFinalArchive({
-      buffer: fixture.archive,
+      buffer: providerArchive,
       nodes: fixture.leaves.map((leaf, ordinal) => ({
         leafId: leaf.id,
         title: leaf.title,
@@ -2833,7 +3233,7 @@ describe("knowledge-base production final-package acceptance", () => {
       buildRevision: finalRevision,
     });
     expect(sealedArchive.changed).toBe(true);
-    expect(sealedArchive.buffer.equals(fixture.archive)).toBe(false);
+    expect(sealedArchive.buffer.equals(providerArchive)).toBe(false);
     const archiveSha256 = createHash("sha256")
       .update(sealedArchive.buffer)
       .digest("hex");
@@ -2884,20 +3284,69 @@ describe("knowledge-base production final-package acceptance", () => {
     let providerTaskPosts = 0;
     let providerTaskReads = 0;
     let packageDownloads = 0;
+    let uploadedFileSequence = 0;
     let retryOperationKey = "";
     let retryTurnId = "";
     let retryTaskOutput: unknown[] = [];
+    const uploadedFileBytes = new Map<string, Buffer>();
+    const uploadedFileNames = new Map<string, string>();
     const upstream = express();
     upstream.use(express.json({ limit: "5mb" }));
+    let upstreamBaseUrl = "";
+    upstream.post("/v1/files", (req, res) => {
+      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+      const filename = String(req.body.filename || "");
+      expect(
+        filename === "socratic-kb-builder.skill.zip" ||
+          /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u.test(filename),
+      ).toBe(true);
+      const kind = filename.startsWith("socratic-") ? "skill" : "finalization";
+      const fileId = `uploaded-${kind}-retry-${++uploadedFileSequence}`;
+      uploadedFileNames.set(fileId, filename);
+      res.json({
+        id: fileId,
+        upload_url: `${upstreamBaseUrl}/uploads/${fileId}`,
+      });
+    });
+    upstream.put(
+      "/uploads/:fileId",
+      express.raw({ type: "*/*", limit: "100mb" }),
+      (req, res) => {
+        expect(req.header("authorization")).toBeUndefined();
+        const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        expect(bytes.length).toBeGreaterThan(0);
+        uploadedFileBytes.set(req.params.fileId, Buffer.from(bytes));
+        res.status(200).end();
+      },
+    );
     upstream.post("/v1/tasks", (req, res) => {
       providerTaskPosts += 1;
       expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
       expect(req.body.taskId).toBe(parentTaskId);
       expect(req.body.taskId).not.toBe(oldTaskId);
-      expect(req.body.attachments).toEqual(sourceRequestBody.attachments);
+      const attachmentFilenames = req.body.attachments.map(
+        (attachment: any) => attachment.filename,
+      );
+      expect(attachmentFilenames[0]).toBe("socratic-kb-builder.skill.zip");
+      expect(attachmentFilenames[1]).toMatch(
+        /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u,
+      );
+      expect(req.body.attachments).toHaveLength(2);
+      for (const attachment of req.body.attachments) {
+        expect(
+          uploadedFileBytes.get(attachment.file_id)?.length,
+        ).toBeGreaterThan(0);
+      }
       const prompt = String(req.body.prompt || "");
-      retryOperationKey = prompt.match(/"operationId":"([^"]+)"/u)?.[1] || "";
-      retryTurnId = prompt.match(/"turnId":"([^"]+)"/u)?.[1] || "";
+      expect(Array.from(prompt).length).toBeLessThanOrEqual(3_000);
+      retryOperationKey =
+        prompt.match(/"operationId":"([^"]+)"/u)?.[1] ||
+        prompt.match(/operationId=([^；;\s]+)/u)?.[1] ||
+        "";
+      retryTurnId =
+        prompt.match(/"turnId":"([^"]+)"/u)?.[1] ||
+        prompt.match(/turnId=([^。；;\s]+)/u)?.[1] ||
+        "";
       expect(retryOperationKey).toBeTruthy();
       expect(retryOperationKey).not.toBe(sourceOperationKey);
       expect(retryTurnId).toBeTruthy();
@@ -2916,7 +3365,30 @@ describe("knowledge-base production final-package acceptance", () => {
               text: {
                 value: [
                   `1.${finalRevision} 已确认。`,
-                  '<!-- FRONTMIND_KB_PROGRESS\n{"revision":45,"node":"1.45","nodeTitle":"知识节点 45","status":"confirmed","action":"final_package","totalLeaves":45,"confirmedLeaves":45,"pendingLeaves":0,"currentLeafOrder":44,"schemaVersion":4,"buildProfile":"dashboard-enterprise-v1","validationResult":"VALID"}\n-->',
+                  `<!-- FRONTMIND_KB_PROGRESS\n${JSON.stringify({
+                    kind: "frontmind.knowledge-base.progress",
+                    schemaVersion: 2,
+                    operationId: retryOperationKey,
+                    turnId: retryTurnId,
+                    revision: priorRevision,
+                    transition: {
+                      leafId: `1.${finalRevision}`,
+                      from: "current",
+                      to: "confirmed",
+                      reason: "用户明确确认",
+                    },
+                  })}\n-->`,
+                  `<!-- FRONTMIND_KB_PRESENTATION\n${JSON.stringify({
+                    kind: "frontmind.knowledge-base.presentation",
+                    schemaVersion: 2,
+                    operationId: retryOperationKey,
+                    turnId: retryTurnId,
+                    revision: finalRevision,
+                    leafId: null,
+                    imageState: "not_applicable",
+                    assetIds: [],
+                    imageCount: 0,
+                  })}\n-->`,
                 ].join("\n"),
               },
             },
@@ -2948,14 +3420,15 @@ describe("knowledge-base production final-package acceptance", () => {
       packageDownloads += 1;
       expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
       res.setHeader("Content-Type", "application/zip");
-      res.setHeader("Content-Length", String(fixture.archive.length));
+      res.setHeader("Content-Length", String(providerArchive.length));
       res.setHeader(
         "Content-Disposition",
         'attachment; filename="frontmind-knowledge-base.zip"',
       );
-      res.send(fixture.archive);
+      res.send(providerArchive);
     });
     const upstreamListener = await listen(upstream);
+    upstreamBaseUrl = upstreamListener.baseUrl;
     dependencies.upstreamBaseUrl = upstreamListener.baseUrl;
 
     const state = initialState();
@@ -3100,6 +3573,14 @@ describe("knowledge-base production final-package acceptance", () => {
       createdAt: now,
       updatedAt: now,
     });
+    state.turns.push(
+      completedOfficialLogoProvenanceTurn({
+        id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        buildId,
+        generation: 1,
+        now,
+      }),
+    );
     dependencies.getDb.mockResolvedValue(
       memoryDatabase(state, { cloneSelectedRows: true }),
     );
@@ -3213,10 +3694,17 @@ describe("knowledge-base production final-package acceptance", () => {
       expect(providerTaskPosts).toBe(1);
       expect(providerTaskReads).toBe(0);
       expect(packageDownloads).toBe(1);
+      expect(uploadedFileSequence).toBe(2);
+      const uploadedNames = [...uploadedFileNames.values()];
+      expect(uploadedNames[0]).toBe("socratic-kb-builder.skill.zip");
+      expect(uploadedNames[1]).toMatch(
+        /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u,
+      );
+      expect(uploadedFileBytes.size).toBe(2);
       expect(retryOperationKey).toBeTruthy();
       expect(retryTurnId).toBeTruthy();
 
-      expect(state.turns).toHaveLength(2);
+      expect(state.turns).toHaveLength(3);
       expect(
         state.turns.find((turn) => turn.id === sourceTurnId),
       ).toMatchObject({
@@ -3233,7 +3721,10 @@ describe("knowledge-base production final-package acceptance", () => {
         expectedLeafId: `1.${finalRevision}`,
         status: "completed",
         upstreamTaskId: newTaskId,
-        attachmentFileIds: [skillFileId],
+        attachmentFileIds: [
+          expect.stringMatching(/^uploaded-skill-retry-/u),
+          expect.stringMatching(/^uploaded-finalization-retry-/u),
+        ],
         errorCode: null,
         metadata: expect.objectContaining({
           attachmentsFrozen: true,
@@ -3314,7 +3805,7 @@ describe("knowledge-base production final-package acceptance", () => {
         },
       });
       expect(state.builds[0]!.stateEpoch).toBe(stableEpoch);
-      expect(state.turns).toHaveLength(2);
+      expect(state.turns).toHaveLength(3);
       expect(providerTaskPosts).toBe(1);
       expect(providerTaskReads).toBe(0);
       expect(packageDownloads).toBe(1);

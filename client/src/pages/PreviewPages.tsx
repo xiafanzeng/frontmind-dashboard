@@ -1188,15 +1188,15 @@ function PreviewServiceManager({
   const planMeta = {
     basic: {
       name: "普通版",
-      quota: "每个订单 1 个非行业词问题，可在同一账号累加",
+      quota: "每个订单 1 个非行业类问题，可在同一账号累加",
     },
     advanced: {
       name: "进阶版",
-      quota: "1 行业词 · 1 竞品对比词 · 1 美誉舆情词 · 5 产品场景词",
+      quota: "1 行业排名词 · 1 竞品对比词 · 1 美誉舆情词 · 5 产品场景词",
     },
     luxury: {
       name: "豪华版",
-      quota: "4 行业词 · 4 竞品对比词 · 4 美誉舆情词 · 20 产品场景词",
+      quota: "4 行业排名词 · 4 竞品对比词 · 4 美誉舆情词 · 20 产品场景词",
     },
   }[plan];
   return (

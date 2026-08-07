@@ -4,8 +4,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertKnowledgeBaseOfficialLogoMimeMatches,
+  bindKnowledgeBaseInitialLogo,
+  bindKnowledgeBaseOfficialLogoUpload,
   collectKnowledgeBaseLogoDescriptors,
   knowledgeBaseRecoveredPackageMatchesStoredHash,
+  knowledgeBaseArchiveRequiresV4UploadEvidence,
+  knowledgeBaseArchiveReadContractVersions,
+  knowledgeBaseArchiveWriteContractVersions,
+  knowledgeBaseExistingLogoUploadBindingDecision,
   knowledgeBaseStagedArtifactCleanupDecision,
   selectKnowledgeBaseRecoveryLogoAsset,
   selectKnowledgeBaseReadyPackageDescriptor,
@@ -17,6 +23,50 @@ import {
 } from "./knowledge-base-artifact";
 
 describe("knowledge-base Logo descriptor normalization", () => {
+  it("rejects overlong task and upload file identities before any binding I/O", async () => {
+    await expect(
+      bindKnowledgeBaseInitialLogo({
+        userId: 7,
+        buildId: "10000000-0000-4000-8000-000000000001",
+        generation: 1,
+        taskId: "t".repeat(256),
+        output: [],
+        apiKey: "unused",
+        baseUrl: "https://api.example",
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_INVALID" });
+    await expect(
+      bindKnowledgeBaseOfficialLogoUpload({
+        userId: 7,
+        buildId: "10000000-0000-4000-8000-000000000001",
+        generation: 1,
+        turnId: "turn-1",
+        operationKey: "operation-1",
+        expectedRevision: 0,
+        expectedLeafId: "1.1",
+        upload: {
+          index: 0,
+          fileId: "f".repeat(256),
+          filename: "logo.png",
+          mimeType: "image/png",
+          sizeBytes: 100,
+          sourceSha256: "a".repeat(64),
+        },
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_INVALID" });
+  });
+
+  it("keeps new v4 writes strict while reading archives accepted by production", () => {
+    expect(knowledgeBaseArchiveWriteContractVersions("4")).toEqual([4]);
+    expect(knowledgeBaseArchiveReadContractVersions("4")).toEqual([3, 4]);
+    expect(knowledgeBaseArchiveWriteContractVersions("3")).toEqual([2, 3]);
+    expect(knowledgeBaseArchiveReadContractVersions("3")).toEqual([2, 3]);
+    expect(knowledgeBaseArchiveWriteContractVersions("1")).toBeUndefined();
+    expect(knowledgeBaseArchiveReadContractVersions("1")).toBeUndefined();
+    expect(knowledgeBaseArchiveRequiresV4UploadEvidence("4", 4)).toBe(true);
+    expect(knowledgeBaseArchiveRequiresV4UploadEvidence("4", 3)).toBe(false);
+    expect(knowledgeBaseArchiveRequiresV4UploadEvidence("3", 4)).toBe(false);
+  });
   it("rejects a declared Logo MIME that disagrees with the decoded bytes", () => {
     expect(
       assertKnowledgeBaseOfficialLogoMimeMatches({
@@ -30,6 +80,42 @@ describe("knowledge-base Logo descriptor normalization", () => {
         detectedFormat: "png",
       }),
     ).toThrowError(expect.objectContaining({ code: "LOGO_UPLOAD_INVALID" }));
+  });
+
+  it("repairs provenance instead of treating an existing same-hash Logo as complete", () => {
+    const verifiedUpload = {
+      verified: true as const,
+      index: 0,
+      fileId: "file-logo",
+      filename: "logo.png",
+      mimeType: "image/png",
+      sizeBytes: 100,
+      sourceSha256: "a".repeat(64),
+    };
+    expect(
+      knowledgeBaseExistingLogoUploadBindingDecision({
+        buildLogoSha256: "a".repeat(64),
+        buildLogoBytes: 100,
+        buildLogoMimeType: "image/png",
+        stagedSha256: "a".repeat(64),
+        stagedBytes: 100,
+        stagedMimeType: "image/png",
+        existingUpload: null,
+        verifiedUpload,
+      }),
+    ).toBe("repair_provenance");
+    expect(
+      knowledgeBaseExistingLogoUploadBindingDecision({
+        buildLogoSha256: "a".repeat(64),
+        buildLogoBytes: 100,
+        buildLogoMimeType: "image/png",
+        stagedSha256: "a".repeat(64),
+        stagedBytes: 100,
+        stagedMimeType: "image/png",
+        existingUpload: { ...verifiedUpload },
+        verifiedUpload,
+      }),
+    ).toBe("already_complete");
   });
 
   it("recovers the v4 official Logo without treating ordinary upload assets as candidates", () => {

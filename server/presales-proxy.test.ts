@@ -170,6 +170,15 @@ describe("presales upload capability", () => {
 });
 
 describe("presales upstream contract", () => {
+  it("enforces the 3000 Unicode-character prompt boundary before upstream dispatch", () => {
+    expect(buildPresalesTaskBody({ prompt: "😀".repeat(3_000) }).prompt).toBe(
+      "😀".repeat(3_000),
+    );
+    expect(() => buildPresalesTaskBody({ prompt: "😀".repeat(3_001) })).toThrow(
+      "UPSTREAM_PROMPT_EXCEEDS_3000_CHARACTERS",
+    );
+  });
+
   it("defaults website tasks to Base agent mode", () => {
     const body = buildPresalesTaskBody({
       prompt: "build the knowledge base",

@@ -1,10 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray } from "drizzle-orm";
 
-import {
-  responseLogicEntries,
-  upstreamResources,
-} from "../drizzle/schema";
+import { responseLogicEntries, upstreamResources } from "../drizzle/schema";
 import type {
   ConfirmedResponseLogic,
   ResponseLogicAttachment,
@@ -12,10 +9,7 @@ import type {
   ResponseLogicRecordDto,
   SaveResponseLogicInput,
 } from "../shared/response-logic";
-import {
-  AuthServiceError,
-  credentialMayServeAccount,
-} from "./auth-service";
+import { AuthServiceError, credentialMayServeAccount } from "./auth-service";
 import { getDb } from "./db";
 
 async function requireDb() {
@@ -180,10 +174,7 @@ export function assertResponseLogicTaskSlotAvailable(input: {
   currentTaskId?: string | null;
   incomingTaskId: string;
 }) {
-  if (
-    input.currentTaskId &&
-    input.currentTaskId !== input.incomingTaskId
-  ) {
+  if (input.currentTaskId && input.currentTaskId !== input.incomingTaskId) {
     throw new ResponseLogicTaskActiveError();
   }
 }
@@ -507,6 +498,7 @@ export async function recordResponseLogicTaskStart(input: {
   skillName: string;
   skillVersion: string;
   skillContentHash: string;
+  preserveExistingSkillBinding?: boolean;
   verifiedAttachments: ResponseLogicAttachment[];
 }) {
   const db = await requireDb();
@@ -585,9 +577,18 @@ export async function recordResponseLogicTaskStart(input: {
       conversationId:
         input.value.conversationId ?? existing?.conversationId ?? null,
       lastTaskId: input.taskId,
-      skillName: input.skillName,
-      skillVersion: input.skillVersion,
-      skillContentHash: input.skillContentHash,
+      skillName:
+        input.preserveExistingSkillBinding && existing?.skillName
+          ? existing.skillName
+          : input.skillName,
+      skillVersion:
+        input.preserveExistingSkillBinding && existing?.skillVersion
+          ? existing.skillVersion
+          : input.skillVersion,
+      skillContentHash:
+        input.preserveExistingSkillBinding && existing?.skillContentHash
+          ? existing.skillContentHash
+          : input.skillContentHash,
       draft,
       confirmed: existing?.confirmed ?? null,
       version: existing?.version ?? 0,

@@ -4,10 +4,12 @@ import {
   assertKnowledgeBaseInitialImageDelivery,
   assertKnowledgeBaseNodeImageDelivery,
   assertKnowledgeBaseCustomerOutput,
+  assertKnowledgeBaseUpstreamTaskIdentity,
   advanceKnowledgeBaseProtocolFailureObservation,
   classifyKnowledgeBaseUserAction,
   collectKnowledgeBaseOutputImageKeys,
   collectKnowledgeBaseOutputImageResourceAliases,
+  collectTrustedKnowledgeBaseOutputImageDescriptors,
   extractAuthoritativeKnowledgeBaseAssistantText,
   extractFinalKnowledgeBaseAssistantText,
   isIdempotentKnowledgeBaseReconcileError,
@@ -68,9 +70,7 @@ describe("knowledge-base notice recovery contract", () => {
 
   it("only rereads the original task for recoverable package states", () => {
     expect(
-      knowledgeBaseProtocolErrorAllowsSameTaskRecovery(
-        "FINAL_PACKAGE_MISSING",
-      ),
+      knowledgeBaseProtocolErrorAllowsSameTaskRecovery("FINAL_PACKAGE_MISSING"),
     ).toBe(true);
     expect(
       knowledgeBaseProtocolErrorAllowsSameTaskRecovery(
@@ -82,6 +82,45 @@ describe("knowledge-base notice recovery contract", () => {
         "PROGRESS_PROTOCOL_INVALID",
       ),
     ).toBe(false);
+  });
+});
+
+describe("knowledge-base persisted identity boundaries", () => {
+  it("preserves a 255-character task identity and rejects 256 characters", () => {
+    const maximum = "t".repeat(255);
+    expect(assertKnowledgeBaseUpstreamTaskIdentity(maximum)).toBe(maximum);
+    expect(() =>
+      assertKnowledgeBaseUpstreamTaskIdentity("t".repeat(256)),
+    ).toThrow("拒绝截断");
+    expect(() => assertKnowledgeBaseUpstreamTaskIdentity(" task-1 ")).toThrow(
+      "首尾空白",
+    );
+    expect(() => assertKnowledgeBaseUpstreamTaskIdentity("   ", false)).toThrow(
+      "首尾空白",
+    );
+    expect(() =>
+      assertKnowledgeBaseUpstreamTaskIdentity(Number.MAX_SAFE_INTEGER + 1),
+    ).toThrow("无法无损表示");
+  });
+
+  it("rejects overlong or conflicting image file identities", () => {
+    expect(() =>
+      collectTrustedKnowledgeBaseOutputImageDescriptors({
+        type: "output_image",
+        file_id: "f".repeat(256),
+        filename: "logo.png",
+        mime_type: "image/png",
+      }),
+    ).toThrow("超过 255 个字符");
+    expect(() =>
+      collectTrustedKnowledgeBaseOutputImageDescriptors({
+        type: "output_image",
+        file_id: "file-a",
+        fileId: "file-b",
+        filename: "logo.png",
+        mime_type: "image/png",
+      }),
+    ).toThrow("别名字段相互冲突");
   });
 });
 
@@ -577,6 +616,45 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     ).not.toThrow();
   });
 
+  it("rejects padded protocol and resource identity claims instead of trimming them", () => {
+    const paddedAnchorOutput = [
+      {
+        type: "output_image",
+        file_id: "logo-before-padded-anchor",
+        file_name: "logo.png",
+      },
+      manifestMessage(` ${operation.operationId}`, operation.turnId),
+    ];
+    expect(
+      selectKnowledgeBaseProtocolOperationOutput(paddedAnchorOutput, {
+        ...operation,
+        stateKind: "frontmind.knowledge-base.manifest",
+      }),
+    ).toEqual([]);
+
+    const paddedResourceOutput = [
+      manifestMessage(operation.operationId, operation.turnId),
+      {
+        role: "assistant",
+        type: "output_image",
+        operationId: operation.operationId,
+        turnId: operation.turnId,
+        taskId: ` ${operation.taskId}`,
+        buildGeneration: operation.generation,
+        file_id: "logo-with-padded-task",
+        file_name: "logo.png",
+      },
+    ];
+    expect(
+      collectKnowledgeBaseOutputImageKeys(
+        selectKnowledgeBaseProtocolOperationOutput(paddedResourceOutput, {
+          ...operation,
+          stateKind: "frontmind.knowledge-base.manifest",
+        }),
+      ),
+    ).toEqual(new Set());
+  });
+
   it("selects only the active final ZIP when a cumulative snapshot contains an older operation", () => {
     const oldOperation = {
       operationId: "operation-old-final",
@@ -639,6 +717,56 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     expect(scoped).toHaveLength(1);
     expect(JSON.stringify(scoped)).toContain("file-active-final-package");
     expect(JSON.stringify(scoped)).not.toContain("file-old-final-package");
+  });
+
+  it("keeps an explicitly scoped non-ZIP resource in the final operation window", () => {
+    const progress = formatKnowledgeBaseProgressEnvelope({
+      kind: "frontmind.knowledge-base.progress",
+      schemaVersion: 2,
+      operationId: operation.operationId,
+      turnId: operation.turnId,
+      revision: 8,
+      transition: {
+        leafId: "leaf-8",
+        from: "current",
+        to: "confirmed",
+        reason: "用户明确确认",
+      },
+    });
+    const output = [
+      {
+        role: "assistant",
+        type: "output_message",
+        content: [
+          { type: "output_text", text: progress },
+          {
+            type: "output_file",
+            file_id: "file-current-final-package",
+            file_name: "current.zip",
+            mime_type: "application/zip",
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        type: "output_file",
+        operationId: operation.operationId,
+        turnId: operation.turnId,
+        file_id: "file-extra-pdf",
+        file_name: "extra.pdf",
+        mime_type: "application/pdf",
+      },
+    ];
+
+    const scoped = selectKnowledgeBaseProtocolOperationOutput(
+      output,
+      {
+        ...operation,
+        stateKind: "frontmind.knowledge-base.progress",
+      },
+      { requireExplicitResourceOperation: true },
+    );
+    expect(JSON.stringify(scoped)).toContain("file-extra-pdf");
   });
 
   it("does not attribute a late unscoped ZIP by proximity", () => {

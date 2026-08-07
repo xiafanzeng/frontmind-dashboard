@@ -72,6 +72,7 @@ import {
   getDeliveryTicketWorkspace,
 } from "./delivery-ticket-service";
 import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
+import { getQuestionQuotaState } from "./question-quota-service";
 import {
   approveWorkspaceQuestionSelection,
   deriveEffectiveServiceStatus,
@@ -1867,6 +1868,7 @@ export async function getMyDeliveryWorkbench(input: {
     websiteWorkspace,
     knowledgeProgress,
     knowledgeSnapshot,
+    questionQuota,
   ] = await Promise.all([
     customerIds.length
       ? db
@@ -1919,6 +1921,12 @@ export async function getMyDeliveryWorkbench(input: {
     role.roleType === "ai_operations_engineer"
       ? getLatestKnowledgeSnapshot(role.customerUserId)
       : null,
+    role.roleType === "monitoring_optimization_engineer"
+      ? getQuestionQuotaState({
+          executor: db,
+          customerUserId: role.customerUserId,
+        })
+      : null,
   ]);
   const dashboardRecord = dashboards.find(
     (dashboard) => dashboard.userId === role.customerUserId,
@@ -1950,6 +1958,7 @@ export async function getMyDeliveryWorkbench(input: {
             knowledgeSnapshot,
           }
         : null,
+    questionQuota,
   };
 }
 

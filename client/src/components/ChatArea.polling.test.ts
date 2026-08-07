@@ -2,14 +2,33 @@ import { describe, expect, it, vi } from "vitest";
 import {
   KNOWLEDGE_BASE_FOUNDATION_COPY,
   knowledgeBaseNoticeRecoveryMode,
+  knowledgeBaseNoticeRequiresLogoProvenanceRepair,
   knowledgeBaseNoticeRetryLabel,
   knowledgeBasePackageRebindResolved,
   readKnowledgeBaseStartRequestError,
   recoverKnowledgeBaseNotice,
   runningAssistantStatusText,
+  scrollChatViewportToBottom,
   shouldRenderKnowledgeBaseNotice,
   shouldRecoverKnowledgeBaseStartFailure,
 } from "./ChatArea";
+
+describe("chat message viewport", () => {
+  it("scrolls only the message viewport instead of every scrollable ancestor", () => {
+    const scrollTo = vi.fn();
+
+    scrollChatViewportToBottom({
+      scrollHeight: 4_800,
+      scrollTo,
+    } as unknown as Pick<HTMLElement, "scrollHeight" | "scrollTo">);
+
+    expect(scrollTo).toHaveBeenCalledOnce();
+    expect(scrollTo).toHaveBeenCalledWith({
+      top: 4_800,
+      behavior: "auto",
+    });
+  });
+});
 
 describe("knowledge-base starter", () => {
   it("explains why the knowledge base must be built before the first task", () => {
@@ -171,5 +190,46 @@ describe("knowledge-base notice recovery", () => {
     expect(
       knowledgeBaseNoticeRetryLabel({ code: "PROGRESS_PROTOCOL_INVALID" }),
     ).toBe("重试本轮");
+  });
+
+  it("routes missing Logo provenance to the dedicated upload repair instead of retry", () => {
+    expect(
+      knowledgeBaseNoticeRequiresLogoProvenanceRepair({
+        code: "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED",
+      }),
+    ).toBe(true);
+    expect(
+      knowledgeBaseNoticeRecoveryMode({
+        code: "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED",
+      }),
+    ).toBe("logo_repair");
+    expect(
+      knowledgeBaseNoticeRetryLabel({
+        code: "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED",
+      }),
+    ).toBe("重新上传 Logo 原图");
+    expect(
+      knowledgeBaseNoticeRequiresLogoProvenanceRepair({
+        code: "FINAL_PACKAGE_INVALID",
+      }),
+    ).toBe(false);
+  });
+
+  it("never sends Logo provenance recovery through the ordinary retry endpoint", async () => {
+    const reconcile = vi.fn();
+    const retry = vi.fn();
+
+    await expect(
+      recoverKnowledgeBaseNotice(
+        {
+          ...input,
+          notice: { code: "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED" },
+        },
+        { reconcile, retry },
+      ),
+    ).rejects.toThrow("专用入口");
+
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(retry).not.toHaveBeenCalled();
   });
 });

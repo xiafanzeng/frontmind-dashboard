@@ -6,6 +6,7 @@ import {
   conversations,
   conversationTurns,
   knowledgeBaseBuilds,
+  knowledgeImportReceipts,
   knowledgeBaseSnapshots,
   serviceContracts,
   serviceProgressReports,
@@ -21,12 +22,20 @@ import {
 } from "../drizzle/schema";
 import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
 import {
+  effectiveKnowledgeArchiveCharacterCount,
+  knowledgeArchiveFormalText,
+  markedKnowledgeArchiveFormalContent,
+} from "./knowledge-archive-text-utils";
+import {
   createDefaultDashboardPayload,
   dashboardPayloadSchema,
   type DashboardPayload,
 } from "../shared/dashboard";
 import { isExplicitAdminAccessLevel } from "../shared/admin-access";
-import type { ServicePortal } from "../shared/service-portal";
+import type {
+  ServicePortal,
+  WorkspaceQuestionCategory,
+} from "../shared/service-portal";
 import {
   AuthServiceError,
   decryptApiKey,
@@ -353,16 +362,22 @@ export function selectEditableServiceQuestion(
   return serviceQuestion ?? null;
 }
 
+export function dashboardQuestionGroupForCategory(
+  category: WorkspaceQuestionCategory,
+) {
+  return {
+    industry: { id: "ranking", title: "行业排名词" },
+    competitor_comparison: { id: "comparison", title: "竞品对比词" },
+    reputation: { id: "reputation", title: "美誉舆情词" },
+    product_scenario: { id: "basic", title: "产品场景词" },
+  }[category];
+}
+
 export async function getDashboardQuestion(userId: number, questionId: string) {
   const portal = await getServicePortal(userId);
   const serviceQuestion = selectEditableServiceQuestion(portal, questionId);
   if (!serviceQuestion) return null;
-  const group = {
-    industry: { id: "ranking", title: "行业排名" },
-    competitor_comparison: { id: "comparison", title: "竞品对比" },
-    reputation: { id: "reputation", title: "美誉舆情" },
-    product_scenario: { id: "basic", title: "产品场景" },
-  }[serviceQuestion.category];
+  const group = dashboardQuestionGroupForCategory(serviceQuestion.category);
   return {
     questionId: serviceQuestion.id,
     groupId: group.id,
@@ -1031,6 +1046,27 @@ export async function getKnowledgeAssetById(input: {
   return snapshot && asset ? { snapshot, asset } : null;
 }
 
+export function knowledgeSnapshotFormalCharacterCount(
+  documents: readonly Pick<
+    KnowledgeDocumentRecord,
+    "content" | "customerVisible"
+  >[],
+) {
+  return documents.reduce(
+    (total, document) =>
+      total +
+      (document.customerVisible === false
+        ? 0
+        : effectiveKnowledgeArchiveCharacterCount(
+            knowledgeArchiveFormalText(
+              markedKnowledgeArchiveFormalContent(document.content) ??
+                document.content,
+            ),
+          )),
+    0,
+  );
+}
+
 export async function createKnowledgeSnapshot(input: {
   snapshotId?: string;
   userId: number;
@@ -1046,15 +1082,14 @@ export async function createKnowledgeSnapshot(input: {
   documents: KnowledgeDocumentRecord[];
   assets: KnowledgeAssetRecord[];
   totalBytes: number;
+  importReceiptClaim?: {
+    receiptId: string;
+    claimRevision: number;
+  };
 }) {
   const db = await requireDb();
   const id = input.snapshotId ?? randomUUID();
-  const characterCount = input.documents.reduce(
-    (total, document) =>
-      total +
-      (document.customerVisible === false ? 0 : document.content.length),
-    0,
-  );
+  const characterCount = knowledgeSnapshotFormalCharacterCount(input.documents);
   await db.transaction(async (tx) => {
     let publicationUsesArchiveHash = false;
     let publicationStateEpoch: number | null = null;
@@ -1066,6 +1101,30 @@ export async function createKnowledgeSnapshot(input: {
       .for("update");
     if (!lockedUsers[0]) {
       throw new Error("用户不存在");
+    }
+    if (input.importReceiptClaim) {
+      const receiptRows = await tx
+        .select({
+          id: knowledgeImportReceipts.id,
+          userId: knowledgeImportReceipts.userId,
+          status: knowledgeImportReceipts.status,
+          revision: knowledgeImportReceipts.revision,
+        })
+        .from(knowledgeImportReceipts)
+        .where(
+          eq(knowledgeImportReceipts.id, input.importReceiptClaim.receiptId),
+        )
+        .limit(1)
+        .for("update");
+      const receipt = receiptRows[0];
+      if (
+        !receipt ||
+        receipt.userId !== input.userId ||
+        receipt.status !== "processing" ||
+        receipt.revision !== input.importReceiptClaim.claimRevision
+      ) {
+        throw new Error("知识库导入回执已由其他请求接管");
+      }
     }
     if (input.sourceBuildId) {
       const builds = await tx
@@ -1149,6 +1208,34 @@ export async function createKnowledgeSnapshot(input: {
       status: "active",
       createdByUserId: input.actorUserId,
     });
+    if (input.importReceiptClaim) {
+      const completedAt = new Date();
+      const result = await tx
+        .update(knowledgeImportReceipts)
+        .set({
+          status: "completed",
+          snapshotId: id,
+          sourceFileName: input.sourceFileName,
+          completedAt,
+          errorCode: null,
+          errorMessage: null,
+          updatedAt: completedAt,
+        })
+        .where(
+          and(
+            eq(knowledgeImportReceipts.id, input.importReceiptClaim.receiptId),
+            eq(knowledgeImportReceipts.userId, input.userId),
+            eq(knowledgeImportReceipts.status, "processing"),
+            eq(
+              knowledgeImportReceipts.revision,
+              input.importReceiptClaim.claimRevision,
+            ),
+          ),
+        );
+      if (!result[0]?.affectedRows) {
+        throw new Error("知识库导入回执已由其他请求接管");
+      }
+    }
     if (input.sourceBuildId) {
       const publicationHashColumn = publicationUsesArchiveHash
         ? eq(
@@ -1185,7 +1272,14 @@ export async function createKnowledgeSnapshot(input: {
       }
     }
   });
-  return getLatestKnowledgeSnapshot(input.userId);
+  const snapshot = await getKnowledgeSnapshotById({
+    userId: input.userId,
+    snapshotId: id,
+  });
+  if (!snapshot) {
+    throw new Error("知识库快照已写入但无法按标识读取");
+  }
+  return snapshot;
 }
 
 export async function listManagedWorkspaceUsers(actor: AuthenticatedUser) {

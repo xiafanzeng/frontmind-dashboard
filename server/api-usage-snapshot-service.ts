@@ -2005,27 +2005,17 @@ export async function finalizeApiUsageSnapshotClaim(input: {
     eq(apiUsageSnapshots.policyId, input.policy.id),
     eq(apiUsageSnapshots.syncToken, input.syncToken),
   ];
-  if (existing[0]) {
-    await input.executor
-      .update(apiUsageSnapshots)
-      .set(values)
-      .where(and(...finalizeConditions));
-  } else {
-    try {
-      await input.executor.insert(apiUsageSnapshots).values({
-        id: randomUUID(),
-        policyId: input.policy.id,
-        ...values,
-        createdAt: input.now,
-      });
-    } catch (error) {
-      if (!isDuplicateApiUsageSnapshotError(error)) throw error;
-      await input.executor
-        .update(apiUsageSnapshots)
-        .set(values)
-        .where(and(...finalizeConditions));
-    }
-  }
+  const result = await input.executor
+    .update(apiUsageSnapshots)
+    .set(values)
+    .where(and(...finalizeConditions));
+  const affectedRows = Number(
+    (result as { affectedRows?: unknown } | undefined)?.affectedRows ??
+      (result as Array<{ affectedRows?: unknown }> | undefined)?.[0]
+        ?.affectedRows ??
+      0,
+  );
+  return affectedRows > 0;
 }
 
 export async function claimUsageSnapshotRefresh(input: {
@@ -2245,7 +2235,7 @@ async function syncApiUsageSnapshotsUnlocked(
           attributionComplete: usage.attributionComplete,
           attributionErrorCode: "PARTIAL_WEBSITE_ATTRIBUTION",
         });
-        await finalizeApiUsageSnapshotClaim({
+        const finalized = await finalizeApiUsageSnapshotClaim({
           executor: db,
           policy,
           credentialFingerprint: fingerprints.website,
@@ -2262,8 +2252,13 @@ async function syncApiUsageSnapshotsUnlocked(
           now,
           syncToken: websiteSyncToken,
         });
-        synced += 1;
-        if (!usage.complete || !usage.attributionComplete) failed += 1;
+        if (finalized) {
+          synced += 1;
+          if (!usage.complete || !usage.attributionComplete) failed += 1;
+        } else {
+          failed += 1;
+          retryableFailed += 1;
+        }
       } catch (error) {
         await finalizeApiUsageSnapshotClaim({
           executor: db,
@@ -2438,7 +2433,7 @@ async function syncApiUsageSnapshotsUnlocked(
           attributionComplete: usage.attributionComplete,
           attributionErrorCode: "PARTIAL_ACCOUNT_ATTRIBUTION",
         });
-        await Promise.all(
+        const finalizedClaims = await Promise.all(
           groupedAccountIds.map((accountId) =>
             finalizeApiUsageSnapshotClaim({
               executor: db,
@@ -2454,8 +2449,13 @@ async function syncApiUsageSnapshotsUnlocked(
             }),
           ),
         );
-        synced += 1;
-        if (!usage.complete || !usage.attributionComplete) failed += 1;
+        if (finalizedClaims.every(Boolean)) {
+          synced += 1;
+          if (!usage.complete || !usage.attributionComplete) failed += 1;
+        } else {
+          failed += 1;
+          retryableFailed += 1;
+        }
       } catch (error) {
         await Promise.all(
           groupedAccountIds.map((accountId) =>

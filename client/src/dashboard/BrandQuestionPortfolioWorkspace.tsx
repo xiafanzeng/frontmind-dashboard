@@ -55,7 +55,7 @@ type QuestionCatalogTicket = {
 
 const CATEGORY_META = {
   industry: {
-    title: "行业词",
+    title: "行业排名词",
     description: "行业入口与品类决策问题",
   },
   competitor_comparison: {

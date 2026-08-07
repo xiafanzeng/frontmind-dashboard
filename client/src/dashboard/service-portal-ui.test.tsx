@@ -145,7 +145,7 @@ describe("service workflow UI gates", () => {
     const quotaOverview = screen.getByRole("region", {
       name: "套餐配额",
     });
-    expect(within(quotaOverview).getByText("行业词")).toBeInTheDocument();
+    expect(within(quotaOverview).getByText("行业排名词")).toBeInTheDocument();
     expect(within(quotaOverview).getByText("1 / 1")).toBeInTheDocument();
     expect(within(quotaOverview).getByText("产品场景词")).toBeInTheDocument();
     expect(within(quotaOverview).getByText("0 / 5")).toBeInTheDocument();

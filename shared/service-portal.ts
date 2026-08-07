@@ -57,6 +57,47 @@ export const serviceQuotaUsageSchema = z.object({
 });
 export type ServiceQuotaUsage = z.infer<typeof serviceQuotaUsageSchema>;
 
+// The question portfolio generates three candidates per available slot and
+// currently supports at most 200 candidates per category.
+export const QUESTION_QUOTA_CATEGORY_MAX = 66;
+
+/**
+ * A question-quota override is always anchored to the engineer's assigned
+ * customer project and to one concrete service period. The server derives the
+ * customer account from `projectAssignmentId`; callers never choose a userId.
+ */
+export const adjustQuestionQuotaSchema = z
+  .object({
+    projectAssignmentId: z.string().uuid(),
+    quotaPeriodId: z.string().uuid(),
+    expectedRevision: z.number().int().positive(),
+    industryLimit: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(QUESTION_QUOTA_CATEGORY_MAX),
+    competitorComparisonLimit: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(QUESTION_QUOTA_CATEGORY_MAX),
+    reputationLimit: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(QUESTION_QUOTA_CATEGORY_MAX),
+    productScenarioLimit: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(QUESTION_QUOTA_CATEGORY_MAX),
+    reason: z.string().trim().min(2).max(2_000),
+  })
+  .strict();
+export type AdjustQuestionQuotaInput = z.infer<
+  typeof adjustQuestionQuotaSchema
+>;
+
 export const EMPTY_SERVICE_QUOTA_USAGE: ServiceQuotaUsage = Object.freeze({
   industry: 0,
   competitorComparison: 0,

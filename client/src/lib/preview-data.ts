@@ -715,7 +715,13 @@ export const previewServicePortals = {
       validUntil: "2026-10-17",
     },
     quotas: [
-      { key: "industry", label: "行业词", limit: 1, used: 0, unit: "个词" },
+      {
+        key: "industry",
+        label: "行业排名词",
+        limit: 1,
+        used: 0,
+        unit: "个词",
+      },
       {
         key: "competitor",
         label: "竞品对比词",
@@ -805,7 +811,13 @@ export const previewServicePortals = {
       validUntil: "2026-10-17",
     },
     quotas: [
-      { key: "industry", label: "行业词", limit: 4, used: 4, unit: "个词" },
+      {
+        key: "industry",
+        label: "行业排名词",
+        limit: 4,
+        used: 4,
+        unit: "个词",
+      },
       {
         key: "competitor",
         label: "竞品对比词",

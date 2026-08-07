@@ -14,7 +14,7 @@ const report = dashboardOptimizationReportSchema.parse({
       id: "question-1",
       questionId: "question-1",
       question: "企业如何建立权威知识库？",
-      category: "行业词",
+      category: "行业排名词",
       title: "知识库问题优化前基准",
       totalScore: 61,
       grade: "C",
@@ -51,7 +51,7 @@ const report = dashboardOptimizationReportSchema.parse({
   questionReports: [
     {
       id: "question-1",
-      category: "行业词",
+      category: "行业排名词",
       question: "企业如何建立权威知识库？",
       summary: "第一题独立结论",
       metrics: [
@@ -187,6 +187,7 @@ describe("ProgressReportWorkspace", () => {
     ]) {
       expect(screen.getByRole("tab", { name: category })).toBeInTheDocument();
     }
+    expect(screen.queryByRole("tab", { name: "行业词" })).toBeNull();
     expect(screen.getAllByText("优化前基准").length).toBeGreaterThan(0);
     expect(screen.queryByText("PRE-OPTIMIZATION BASELINE")).toBeNull();
     expect(screen.queryByText("SEMANTIC ASSET DIMENSIONS")).toBeNull();
