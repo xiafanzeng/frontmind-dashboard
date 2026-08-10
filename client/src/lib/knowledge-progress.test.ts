@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  isKnowledgeBaseProgressCoordinateOlder,
   knowledgeBaseObservationFromPayload,
+  readKnowledgeBaseProgressEventDetail,
   reconcileKnowledgeBaseObservation,
+  replaceKnowledgeBaseTurnAttachments,
   repairKnowledgeBaseLogoProvenance,
 } from "./knowledge-progress";
 
@@ -11,6 +14,43 @@ afterEach(() => {
 });
 
 describe("reconcileKnowledgeBaseObservation", () => {
+  it("orders progress coordinates by generation and then state epoch", () => {
+    expect(
+      isKnowledgeBaseProgressCoordinateOlder(
+        { generation: 2, stateEpoch: 99 },
+        { generation: 3, stateEpoch: 1 },
+      ),
+    ).toBe(true);
+    expect(
+      isKnowledgeBaseProgressCoordinateOlder(
+        { generation: 3, stateEpoch: 8 },
+        { generation: 3, stateEpoch: 9 },
+      ),
+    ).toBe(true);
+    expect(
+      isKnowledgeBaseProgressCoordinateOlder(
+        { generation: 4, stateEpoch: 0 },
+        { generation: 3, stateEpoch: 99 },
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps generation coordinates on current progress events and accepts legacy projections", () => {
+    const progress = { build: { id: "build-1" } } as any;
+    expect(
+      readKnowledgeBaseProgressEventDetail({
+        progress,
+        generation: 3,
+        stateEpoch: 9,
+      }),
+    ).toEqual({ progress, generation: 3, stateEpoch: 9 });
+    expect(readKnowledgeBaseProgressEventDetail(progress)).toEqual({
+      progress,
+      generation: -1,
+      stateEpoch: -1,
+    });
+  });
+
   it("preserves an explicit unbound authority instead of adopting a placeholder task id", () => {
     const observation = knowledgeBaseObservationFromPayload({
       task: { id: "turn-placeholder", status: "running" },
@@ -202,5 +242,62 @@ describe("repairKnowledgeBaseLogoProvenance", () => {
       status: 422,
       code: "KNOWLEDGE_BASE_LOGO_REPAIR_UPLOAD_INVALID",
     });
+  });
+});
+
+describe("replaceKnowledgeBaseTurnAttachments", () => {
+  it("sends the replacement manifest to the dedicated same-turn continuation endpoint", async () => {
+    const observation = {
+      stateEpoch: 9,
+      generation: 2,
+      authoritativeTaskId: null,
+      activeTurn: { id: "turn-413", status: "running" },
+      interaction: {
+        progress: null,
+        interactionState: "executing",
+        canReply: false,
+        canPublish: false,
+        lockReason: null,
+      },
+      approvedPresentation: null,
+      package: null,
+      notice: null,
+      conversationVersion: 5,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ observation }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const input = {
+      conversationId: "conversation-1",
+      clientRequestId: "attachment-repair-1",
+      expectedGeneration: 2,
+      expectedRevision: 4,
+      expectedLeafId: "1.4",
+      attachmentManifest: [
+        {
+          filename: "smaller.pdf",
+          sizeBytes: 100,
+          mimeType: "application/pdf",
+          lastModified: 1,
+          sha256: "a".repeat(64),
+        },
+      ],
+      attachments: [{ file_id: "file-smaller", filename: "smaller.pdf" }],
+    };
+
+    await expect(
+      replaceKnowledgeBaseTurnAttachments(input),
+    ).resolves.toMatchObject({ activeTurn: { id: "turn-413" } });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/knowledge-base/turn/replace-attachments",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    );
   });
 });

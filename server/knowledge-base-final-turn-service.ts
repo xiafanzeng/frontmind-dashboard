@@ -235,6 +235,7 @@ export async function buildFinalizationInputForTurn(input: {
     operationId: input.operationId,
     turnId: input.turnId,
     buildRevision: input.buildRevision,
+    treePolicyVersion: build.treePolicyVersion,
     nodes: nodes.map((node) => {
       const storedMarkdown = canonicalKnowledgeBaseMarkdown(
         node.contentMarkdown || "",

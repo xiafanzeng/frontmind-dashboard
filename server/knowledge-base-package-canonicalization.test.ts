@@ -47,6 +47,7 @@ function nodes() {
 async function candidateArchive(options?: {
   firstId?: string;
   secondId?: string;
+  manifestBom?: boolean;
 }) {
   const zip = new JSZip();
   const documents = [
@@ -95,7 +96,7 @@ async function candidateArchive(options?: {
   };
   zip.file(
     `${root}00_package_manifest.json`,
-    `${JSON.stringify(manifest, null, 2)}\n`,
+    `${options?.manifestBom ? "\uFEFF" : ""}${JSON.stringify(manifest, null, 2).replace(/\n/gu, "\r\n")}\r\n`,
   );
   zip.file(
     `${root}${leafOnePath}`,
@@ -119,6 +120,19 @@ async function readCanonical(buffer: Buffer) {
 }
 
 describe("knowledge-base final archive canonicalization", () => {
+  it("canonicalizes a BOM/CRLF manifest while preserving strict schema validation", async () => {
+    const result = await canonicalizeKnowledgeBaseFinalArchive({
+      buffer: await candidateArchive({ manifestBom: true }),
+      nodes: nodes(),
+      buildRevision: 47,
+    });
+
+    expect(result.changed).toBe(true);
+    const { manifest } = await readCanonical(result.buffer);
+    expect(manifest.schemaVersion).toBe(4);
+    expect(manifest.documents).toHaveLength(2);
+  });
+
   it("seals approved bodies deterministically while preserving raw node IDs and bytes", async () => {
     const candidate = await candidateArchive();
     const first = await canonicalizeKnowledgeBaseFinalArchive({

@@ -79,6 +79,54 @@ export type KnowledgePrefillSnapshot = {
 export const KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME =
   "knowledge-base-prefill-evidence.zip";
 
+const KNOWLEDGE_BASE_DEEP_MANIFEST_EXAMPLE_LEAVES = [
+  ["1.1", "一句话定位", "identity", "企业身份"],
+  ["1.2", "企业名称与品牌", "identity", "企业身份"],
+  ["1.3", "发展历程", "identity", "企业身份"],
+  ["1.4", "区域与经营范围", "identity", "企业身份"],
+  ["1.5", "资质与基本信息", "identity", "企业身份"],
+  ["2.1", "核心团队", "team", "团队与组织"],
+  ["2.2", "组织分工", "team", "团队与组织"],
+  ["2.3", "研发与专业人才", "team", "团队与组织"],
+  ["2.4", "服务与支持团队", "team", "团队与组织"],
+  ["3.1", "产品与服务全景", "offerings", "产品与服务"],
+  ["3.2", "核心产品族一", "offerings", "产品与服务"],
+  ["3.3", "产品族一关键能力", "offerings", "产品与服务"],
+  ["3.4", "产品族一应用", "offerings", "产品与服务"],
+  ["3.5", "核心产品族二", "offerings", "产品与服务"],
+  ["3.6", "产品族二关键能力", "offerings", "产品与服务"],
+  ["3.7", "产品族二应用", "offerings", "产品与服务"],
+  ["3.8", "服务组合", "offerings", "产品与服务"],
+  ["3.9", "部署与交付形态", "offerings", "产品与服务"],
+  ["3.10", "产品与服务边界", "offerings", "产品与服务"],
+  ["4.1", "核心技术", "capabilities", "能力与交付"],
+  ["4.2", "研发体系", "capabilities", "能力与交付"],
+  ["4.3", "制造或实施能力", "capabilities", "能力与交付"],
+  ["4.4", "质量管理", "capabilities", "能力与交付"],
+  ["4.5", "安全与合规", "capabilities", "能力与交付"],
+  ["4.6", "交付流程", "capabilities", "能力与交付"],
+  ["4.7", "运维与保障", "capabilities", "能力与交付"],
+  ["5.1", "目标行业", "markets", "行业场景与案例"],
+  ["5.2", "核心使用场景", "markets", "行业场景与案例"],
+  ["5.3", "代表客户", "markets", "行业场景与案例"],
+  ["5.4", "代表案例", "markets", "行业场景与案例"],
+  ["5.5", "客户结果与证明", "markets", "行业场景与案例"],
+  ["6.1", "差异化定位", "differentiation", "差异化与证据"],
+  ["6.2", "竞争优势", "differentiation", "差异化与证据"],
+  ["6.3", "可信证据", "differentiation", "差异化与证据"],
+  ["6.4", "适用与不适用边界", "differentiation", "差异化与证据"],
+  ["7.1", "合作模式", "cooperation", "合作交付与支持"],
+  ["7.2", "商务与采购流程", "cooperation", "合作交付与支持"],
+  ["7.3", "渠道与生态伙伴", "cooperation", "合作交付与支持"],
+  ["7.4", "客户成功与培训", "cooperation", "合作交付与支持"],
+  ["7.5", "售后与联系路径", "cooperation", "合作交付与支持"],
+].map(([id, title, branchId, branchTitle]) => ({
+  id,
+  title,
+  branchId,
+  branchTitle,
+}));
+
 function knowledgePrefillBranch(pathname: string) {
   return pathname.normalize("NFKC").split("/").filter(Boolean)[0] || "root";
 }
@@ -202,6 +250,7 @@ export async function buildKnowledgeBasePrompt({
   attachments,
   prefillKnowledgeSnapshot,
   protocolOperation,
+  treePolicyVersion,
 }: {
   conversationId?: string;
   companyName: string;
@@ -214,8 +263,10 @@ export async function buildKnowledgeBasePrompt({
     operationId: string;
     turnId: string;
   };
+  treePolicyVersion?: number;
 }) {
   const isV4 = protocolOperation?.skillVersion === "4";
+  const isDeepTree = isV4 && treePolicyVersion === 2;
   const protocolIdentity = isV4
     ? {
         operationId: protocolOperation.operationId,
@@ -226,12 +277,80 @@ export async function buildKnowledgeBasePrompt({
     kind: KNOWLEDGE_BASE_MANIFEST_KIND,
     schemaVersion: isV4 ? KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION : 1,
     ...protocolIdentity,
-    leaves: Array.from({ length: 8 }, (_, index) => ({
-      id: `1.${index + 1}`,
-      title: index === 0 ? "一句话定位" : `示例节点 ${index + 1}`,
-      branchId: "identity",
-      branchTitle: "企业身份",
-    })),
+    leaves: isDeepTree
+      ? KNOWLEDGE_BASE_DEEP_MANIFEST_EXAMPLE_LEAVES
+      : Array.from({ length: 8 }, (_, index) => ({
+          id: `1.${index + 1}`,
+          title: index === 0 ? "一句话定位" : `示例节点 ${index + 1}`,
+          branchId: "identity",
+          branchTitle: "企业身份",
+        })),
+    ...(isDeepTree
+      ? {
+          researchCoverage: {
+            officialPages: {
+              discovered: 18,
+              attempted: 16,
+              succeeded: 14,
+              failed: 2,
+            },
+            publicQueries: 6,
+            officialDocuments: 4,
+            uploadsRead: attachments.length,
+            sourceCount: 24,
+            productFamilies: [
+              {
+                id: "family-core-a",
+                name: "核心产品族一",
+                leafIds: ["3.2", "3.3", "3.4"],
+              },
+              {
+                id: "family-core-b",
+                name: "核心产品族二",
+                leafIds: ["3.5", "3.6", "3.7"],
+              },
+            ],
+            dimensions: [
+              {
+                id: "enterprise_identity" as const,
+                status: "covered" as const,
+                leafIds: ["1.1", "1.2"],
+              },
+              {
+                id: "team_and_organization" as const,
+                status: "covered" as const,
+                leafIds: ["2.1", "2.2"],
+              },
+              {
+                id: "products_and_services" as const,
+                status: "covered" as const,
+                leafIds: ["3.1", "3.2", "3.5"],
+              },
+              {
+                id: "capabilities_and_delivery" as const,
+                status: "covered" as const,
+                leafIds: ["4.1", "4.6"],
+              },
+              {
+                id: "industries_scenarios_and_cases" as const,
+                status: "covered" as const,
+                leafIds: ["5.1", "5.4"],
+              },
+              {
+                id: "differentiation_and_evidence" as const,
+                status: "covered" as const,
+                leafIds: ["6.1", "6.3"],
+              },
+              {
+                id: "cooperation_delivery_and_support" as const,
+                status: "covered" as const,
+                leafIds: ["7.1", "7.5"],
+              },
+            ],
+            stopReason: "coverage_complete" as const,
+          },
+        }
+      : {}),
   });
   const progressExample = formatKnowledgeBaseProgressEnvelope({
     kind: KNOWLEDGE_BASE_PROGRESS_KIND,
@@ -289,7 +408,7 @@ export async function buildKnowledgeBasePrompt({
           `来源文件：${prefillKnowledgeSnapshot.sourceFileName}`,
           `产物哈希：${prefillKnowledgeSnapshot.archiveHash || "未记录"}`,
           `已解析文档：${prefillKnowledgeSnapshot.documentCount}；图片：${prefillKnowledgeSnapshot.imageCount}；字符：${prefillKnowledgeSnapshot.characterCount}`,
-          `完整预填证据见任务附件 ${KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME}。先解压并读取 knowledge.md 与 context.json；这些证据不代表节点已确认，也不得据此伪造 100% 对话进度。`,
+          `完整预填证据见任务附件 ${KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME}。先解压并读取 knowledge.md 与 context.json；这些内容只作为事实证据，不代表节点已确认。不得继承 Website 的浅层树、分支/叶子 ID、顺序、10–20 节点深度或遍历状态，也不得据此伪造 100% 对话进度。`,
         ].join("\n")
       : "当前账号没有已迁移的初步知识库，将从官网、全网与上传资料开始预填。",
     "## 必须执行的机器可验证进度协议",
@@ -297,11 +416,18 @@ export async function buildKnowledgeBasePrompt({
     "信封的 `<!-- FRONTMIND_KB_...` 开头与 `-->` 结尾都是协议必填内容，必须原样保留；禁止输出裸 JSON，禁止输出 SOCRATIC_KB_STATE，禁止用 frontmind.workflow-state、frontmind.knowledge-base.message 或其他自创对象替代规定信封。",
     "",
     "### 首轮研究与知识树建立",
-    "完成官网、公开来源、上传资料研究和正式图文预填后，按企业实际资料量建立自适应一级分支和 8-115 个真实叶子节点。白牌企业或只有宣传单时只保留有事实价值或明确缺口的必要叶子，不得为数量、字数或图片数填充内容。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
+    isDeepTree
+      ? "创建 Manifest 前必须完整读取 Skill 内 references/knowledge-tree.md。完成上传资料、官网、公开来源研究和正式图文预填后，按七个业务维度建立自适应一级分支和 30-115 个真实叶子节点，普通企业目标 40-55。稀疏企业也必须以不同且适用的业务问题建立至少 30 个节点；资料缺失时写具体 needs_verification gap，禁止造事实、机械拆分、复制正文或重复通用免责声明，不得为数量、字数或图片数填充内容。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。"
+      : "完成官网、公开来源、上传资料研究和正式图文预填后，按企业实际资料量建立自适应一级分支和 8-115 个真实叶子节点。白牌企业或只有宣传单时只保留有事实价值或明确缺口的必要叶子，不得为数量、字数或图片数填充内容。一级分支数量不设固定值；每个叶子必须有全局唯一且后续不变的 id、title、branchId、branchTitle。",
+    isDeepTree
+      ? "researchCoverage 必须记录真实研究账本。正常完成须读取全部初始上传、至少成功解析 12 个官网页面并执行 6 次公开查询；官网不足 12 页时，只有耗尽已发现官网队列并说明具体限制才可使用 source_limited，且仍须完成 6 次查询。七个维度均须关联事实或具体 gap 节点，每个产品/服务族至少关联一个叶子。硬上限为 120 个成功官网页、200 个访问链接、30 次公开查询和 30 份官网文档，禁止截断或伪造计数。首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附："
+      : "首轮正文展示完整分支统计并呈现第一个叶子节点，然后仅在回复末尾附：",
     manifestExample,
-    isV4
-      ? "示例只演示结构，禁止复制示例域名。真实 leaves 必须完整包含 8-115 项；若同时返回 Logo 图片，officialLogo 必须逐字记录所选官方来源：官网 Logo 用 official_web + 精确 sourcePageUrl/sourceAssetUrl，初始上传文档内 Logo 用 official_document + 精确 sourceDocumentPath。官网 URL 只作 provenance，不表示远程源文件与返回栅格字节相同。若未返回 Logo 图片则省略 officialLogo。首轮不得同时输出 FRONTMIND_KB_PROGRESS。"
-      : "示例只演示结构，真实 leaves 必须完整包含 8-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
+    isDeepTree
+      ? "示例以七个维度和 40 个叶子展示生产结构，不得复制示例标题或 family。真实 leaves 必须完整包含 30-115 项并提交完整 researchCoverage；若同时返回 Logo 图片，officialLogo 必须逐字记录所选官方来源：官网 Logo 用 official_web + 精确 sourcePageUrl/sourceAssetUrl，初始上传文档内 Logo 用 official_document + 精确 sourceDocumentPath。官网 URL 只作 provenance，不表示远程源文件与返回栅格字节相同。若未返回 Logo 图片则省略 officialLogo。首轮不得同时输出 FRONTMIND_KB_PROGRESS。"
+      : isV4
+        ? "示例只演示历史 v4 构建结构。真实 leaves 必须完整包含 8-115 项；若同时返回 Logo 图片，officialLogo 必须逐字记录所选官方来源：官网 Logo 用 official_web + 精确 sourcePageUrl/sourceAssetUrl，初始上传文档内 Logo 用 official_document + 精确 sourceDocumentPath。官网 URL 只作 provenance，不表示远程源文件与返回栅格字节相同。若未返回 Logo 图片则省略 officialLogo。首轮不得同时输出 FRONTMIND_KB_PROGRESS。"
+        : "示例只演示结构，真实 leaves 必须完整包含 8-115 项并覆盖基于当前企业证据形成的全部一级分支。首轮不得同时输出 FRONTMIND_KB_PROGRESS。",
     "",
     "### 后续每轮单节点状态",
     "服务端从 revision=0、清单第一个叶子为 current 开始。后续每轮末尾必须依次附一个状态信封和一个展示信封：",
@@ -328,5 +454,6 @@ export async function buildKnowledgeBasePrompt({
           "### 已完成知识库的后续修订（旧 build 兼容）",
           "旧版知识库达到 100% 后的修订继续使用该构建随附的工作流版本；新版不得使用该分支。\n\n## 本轮交付要求\n现在解压并读取 Skill，然后完成本轮研究、首个知识节点正文、完整 Manifest 与合规 Logo。不得先发送或以“已收到”“好的”“开始处理”等确认回执结束任务；本次任务只有交付上述完整结果后才能结束。",
         ]),
+    "输出前先自行解析每个机器信封，并按给定 schema、operationId 与 turnId 范围完成校验；只输出一次唯一合法结构。自检不得补造、转换或改写业务值，服务端严格校验仍为最终权威。",
   ].join("\n");
 }

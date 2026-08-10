@@ -785,7 +785,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     });
   });
 
-  it("rejects a successful Logo response that has no real upstream task id", async () => {
+  it("rejects a successful response only when it has neither a task nor an authoritative observation", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -800,13 +800,10 @@ describe("createKnowledgeBaseTurnTask", () => {
         clientRequestId: "request-logo-missing-task",
         submissionKind: "logo",
       }),
-    ).rejects.toMatchObject({
-      status: 502,
-      code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
-    });
+    ).rejects.toThrow("任务创建失败：未返回权威任务状态");
   });
 
-  it("preserves the authoritative observation when a Logo response is missing its task id", async () => {
+  it("accepts a recovering Logo observation without inventing a task id", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -844,9 +841,9 @@ describe("createKnowledgeBaseTurnTask", () => {
         clientRequestId: "request-logo-pending-task-id",
         submissionKind: "logo",
       }),
-    ).rejects.toMatchObject({
-      status: 502,
-      code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
+    ).resolves.toMatchObject({
+      id: "",
+      status: "running",
       knowledgeObservation: {
         stateEpoch: 4,
         generation: 1,
@@ -892,7 +889,7 @@ describe("createKnowledgeBaseTurnTask", () => {
         },
       ),
     ).resolves.toMatchObject({
-      id: "kb-observation-2-8",
+      id: "",
       knowledgeObservation: { stateEpoch: 8, generation: 2 },
     });
   });

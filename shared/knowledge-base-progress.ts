@@ -56,6 +56,41 @@ export const knowledgeBaseTurnStatuses = [
 export type KnowledgeBaseTurnStatus =
   (typeof knowledgeBaseTurnStatuses)[number];
 
+export const knowledgeBaseDispatchStates = [
+  "reserved",
+  "recovering",
+  "bound",
+  "completed",
+  "failed",
+] as const;
+
+export type KnowledgeBaseDispatchState =
+  (typeof knowledgeBaseDispatchStates)[number];
+
+export const knowledgeBaseFailureClasses = [
+  "recoverable_same_turn",
+  "requires_user_fix",
+  "terminal_requires_regeneration",
+  "terminal_nonregenerable",
+] as const;
+
+export type KnowledgeBaseFailureClass =
+  (typeof knowledgeBaseFailureClasses)[number];
+
+export const knowledgeBaseRecoveryActions = [
+  "wait",
+  "reconcile",
+  "top_up",
+  "update_credential",
+  "fix_attachments",
+  "reupload_logo",
+  "regenerate_turn",
+  "contact_support",
+] as const;
+
+export type KnowledgeBaseRecoveryAction =
+  (typeof knowledgeBaseRecoveryActions)[number];
+
 export const knowledgeBaseNoticeSeverities = [
   "info",
   "warning",
@@ -98,12 +133,39 @@ export interface KnowledgeBaseProgressSummaryDto {
   overallPercent: number;
 }
 
+export interface KnowledgeBaseDepthPolicyDto {
+  version: 1 | 2;
+  minLeaves: number;
+  maxLeaves: number;
+  targetMinLeaves: number;
+  targetMaxLeaves: number;
+}
+
+export interface KnowledgeBaseResearchSummaryDto {
+  officialPages: {
+    discovered: number;
+    attempted: number;
+    succeeded: number;
+    failed: number;
+  };
+  publicQueries: number;
+  officialDocuments: number;
+  uploadsRead: number;
+  sourceCount: number;
+  productFamilyCount: number;
+  coveredDimensionCount: number;
+  gapDimensionCount: number;
+  stopReason: "coverage_complete" | "source_limited" | "budget_reached";
+}
+
 export interface KnowledgeBaseProgressDto {
   build: {
     id: string;
     conversationId: string;
     companyName: string;
     skillVersion?: string;
+    depthPolicy: KnowledgeBaseDepthPolicyDto;
+    researchSummary: KnowledgeBaseResearchSummaryDto | null;
     status: KnowledgeBaseBuildStatus;
     revision: number;
     currentLeafId: string | null;
@@ -150,6 +212,12 @@ export interface KnowledgeBaseActiveTurnDto {
   startedAt: number | null;
   completedAt: number | null;
   updatedAt: number;
+  /** Durable dispatch/recovery authority. Optional only during fleet rollout. */
+  dispatchState?: KnowledgeBaseDispatchState;
+  upstreamTaskId?: string | null;
+  failureClass?: KnowledgeBaseFailureClass | null;
+  recoveryAction?: KnowledgeBaseRecoveryAction | null;
+  canRegenerate?: boolean;
   /** True only while the logical turn exists but browser files are not frozen. */
   requiresAttachmentReselection?: boolean;
   stagedAttachmentCount?: number;
@@ -226,6 +294,9 @@ export interface KnowledgeBaseNoticeDto {
   severity: KnowledgeBaseNoticeSeverity;
   message: string;
   retryable: boolean;
+  failureClass?: KnowledgeBaseFailureClass | null;
+  recoveryAction?: KnowledgeBaseRecoveryAction | null;
+  canRegenerate?: boolean;
   turnId: string | null;
   createdAt: number;
 }

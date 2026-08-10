@@ -258,16 +258,14 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
     ]);
   });
 
-  it("reports duplicate canonical manifests after terminal completion", () => {
+  it("deduplicates identical canonical manifests after terminal completion", () => {
     const rawManifest = JSON.stringify(manifest());
     const analysis = analyzeKnowledgeBaseLiveTask(
       taskWithText(`节点正文\n${rawManifest}\n${rawManifest}`),
     );
 
-    expect(analysis.manifest).toBeNull();
-    expect(analysis.issues.join("\n")).toContain(
-      "Model output must contain exactly one FRONTMIND_KB_MANIFEST envelope",
-    );
+    expect(analysis.manifest).toMatchObject({ leafCount: 8, branchCount: 8 });
+    expect(analysis.issues).toEqual([]);
   });
 
   it("reports a malformed documented manifest instead of treating it as absent", () => {

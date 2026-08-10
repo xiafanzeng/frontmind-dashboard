@@ -9,6 +9,77 @@ export type KnowledgeBaseObservationDto = SharedKnowledgeBaseObservationDto & {
   progress?: KnowledgeBaseProgressDto | null;
 };
 
+export interface KnowledgeBaseProgressEventDetail {
+  progress: KnowledgeBaseProgressDto;
+  generation: number;
+  stateEpoch: number;
+}
+
+export type KnowledgeBaseProgressCoordinate = Pick<
+  KnowledgeBaseProgressEventDetail,
+  "generation" | "stateEpoch"
+>;
+
+export function isKnowledgeBaseProgressCoordinateOlder(
+  candidate: KnowledgeBaseProgressCoordinate,
+  current: KnowledgeBaseProgressCoordinate,
+) {
+  return (
+    candidate.generation < current.generation ||
+    (candidate.generation === current.generation &&
+      candidate.stateEpoch < current.stateEpoch)
+  );
+}
+
+/**
+ * Progress events used to carry only the projection, so a delayed response
+ * could overwrite a newer generation in the embedded panel. Keep accepting
+ * that legacy shape while all current producers include monotonic coordinates.
+ */
+export function readKnowledgeBaseProgressEventDetail(
+  value: unknown,
+): KnowledgeBaseProgressEventDetail | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<KnowledgeBaseProgressEventDetail> &
+    Partial<KnowledgeBaseProgressDto>;
+  if (candidate.progress?.build) {
+    const generation = Number(candidate.generation);
+    const stateEpoch = Number(candidate.stateEpoch);
+    return {
+      progress: candidate.progress,
+      generation: Number.isSafeInteger(generation) ? generation : -1,
+      stateEpoch: Number.isSafeInteger(stateEpoch) ? stateEpoch : -1,
+    };
+  }
+  if (candidate.build) {
+    return {
+      progress: candidate as KnowledgeBaseProgressDto,
+      generation: -1,
+      stateEpoch: -1,
+    };
+  }
+  return null;
+}
+
+export function dispatchKnowledgeBaseProgressUpdated(
+  observation: KnowledgeBaseObservationDto,
+) {
+  const progress = observation.progress ?? observation.interaction.progress;
+  if (!progress) return;
+  window.dispatchEvent(
+    new CustomEvent<KnowledgeBaseProgressEventDetail>(
+      "frontmind:knowledge-progress-updated",
+      {
+        detail: {
+          progress,
+          generation: observation.generation,
+          stateEpoch: observation.stateEpoch,
+        },
+      },
+    ),
+  );
+}
+
 export const KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE =
   "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED";
 
@@ -19,6 +90,9 @@ export interface KnowledgeBaseLogoProvenanceRepairManifestItem {
   lastModified: number;
   sha256: string;
 }
+
+export type KnowledgeBaseAttachmentRepairManifestItem =
+  KnowledgeBaseLogoProvenanceRepairManifestItem;
 
 export type KnowledgeBaseLogoProvenanceRepairError = Error & {
   status?: number;
@@ -159,6 +233,31 @@ export async function retryKnowledgeBaseTurn(input: {
   expectedLeafId: string | null;
 }): Promise<KnowledgeBaseObservationDto> {
   const response = await fetch("/api/knowledge-base/retry", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    const error = new Error(await readErrorMessage(response)) as Error & {
+      status?: number;
+    };
+    error.status = response.status;
+    throw error;
+  }
+  return normalizeObservation(await response.json());
+}
+
+export async function replaceKnowledgeBaseTurnAttachments(input: {
+  conversationId: string;
+  clientRequestId: string;
+  expectedGeneration: number;
+  expectedRevision: number;
+  expectedLeafId: string | null;
+  attachmentManifest: KnowledgeBaseAttachmentRepairManifestItem[];
+  attachments: Array<{ file_id: string; filename: string }>;
+}): Promise<KnowledgeBaseObservationDto> {
+  const response = await fetch("/api/knowledge-base/turn/replace-attachments", {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },

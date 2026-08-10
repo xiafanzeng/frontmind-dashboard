@@ -99,6 +99,7 @@ vi.mock("@/lib/trpc", () => ({
 }));
 
 import EmbeddedKnowledgeBasePanel, {
+  isKnowledgeBaseProgressProjectionOlder,
   shouldDiscardConversationAfterKnowledgeReset,
 } from "./EmbeddedKnowledgeBasePanel";
 
@@ -125,6 +126,43 @@ beforeEach(() => {
     unavailableReason: "当前没有可重置的知识库记录",
     pending: null,
   };
+});
+
+describe("knowledge-base progress projection ordering", () => {
+  const progress = (input: {
+    id?: string;
+    revision: number;
+    updatedAt: number;
+  }) =>
+    ({
+      build: {
+        id: input.id || "build-1",
+        revision: input.revision,
+        updatedAt: input.updatedAt,
+      },
+    }) as any;
+
+  it("rejects an older revision or older replacement build", () => {
+    const current = progress({ revision: 3, updatedAt: 300 });
+    expect(
+      isKnowledgeBaseProgressProjectionOlder(
+        progress({ revision: 2, updatedAt: 400 }),
+        current,
+      ),
+    ).toBe(true);
+    expect(
+      isKnowledgeBaseProgressProjectionOlder(
+        progress({ id: "build-2", revision: 0, updatedAt: 200 }),
+        current,
+      ),
+    ).toBe(true);
+    expect(
+      isKnowledgeBaseProgressProjectionOlder(
+        progress({ revision: 4, updatedAt: 250 }),
+        current,
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("EmbeddedKnowledgeBasePanel reset action", () => {

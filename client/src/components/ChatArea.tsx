@@ -79,6 +79,7 @@ import {
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
 import KnowledgeBaseLogoProvenanceRepair from "./KnowledgeBaseLogoProvenanceRepair";
+import KnowledgeBaseAttachmentRepair from "./KnowledgeBaseAttachmentRepair";
 import {
   assertChatAttachmentSizes,
   chatAttachmentSizeError,
@@ -116,7 +117,10 @@ export function shouldRenderKnowledgeBaseNotice(
 }
 
 export function knowledgeBaseNoticeRecoveryMode(
-  notice: Pick<KnowledgeBaseClientNotice, "code">,
+  notice: Pick<
+    KnowledgeBaseClientNotice,
+    "code" | "recoveryAction" | "canRegenerate"
+  >,
 ) {
   if (notice.code === KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE) {
     return "reconcile" as const;
@@ -124,23 +128,62 @@ export function knowledgeBaseNoticeRecoveryMode(
   if (notice.code === KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE) {
     return "logo_repair" as const;
   }
-  return "new_turn" as const;
+  if (
+    notice.recoveryAction === "reconcile" ||
+    notice.recoveryAction === "update_credential" ||
+    notice.recoveryAction === "top_up"
+  ) {
+    return "reconcile" as const;
+  }
+  if (
+    notice.canRegenerate === true &&
+    notice.recoveryAction === "regenerate_turn"
+  ) {
+    return "regenerate" as const;
+  }
+  return "none" as const;
 }
 
 export function knowledgeBaseNoticeRetryLabel(
-  notice: Pick<KnowledgeBaseClientNotice, "code">,
+  notice: Pick<
+    KnowledgeBaseClientNotice,
+    "code" | "recoveryAction" | "canRegenerate"
+  >,
 ) {
   return knowledgeBaseNoticeRecoveryMode(notice) === "reconcile"
-    ? "重新绑定成品"
+    ? notice.code === KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE
+      ? "重新绑定成品"
+      : notice.recoveryAction === "update_credential"
+        ? "更新凭证后继续本轮"
+        : notice.recoveryAction === "top_up"
+          ? "补充额度后继续本轮"
+          : "继续恢复本轮"
     : knowledgeBaseNoticeRecoveryMode(notice) === "logo_repair"
       ? "重新上传 Logo 原图"
-      : "重试本轮";
+      : knowledgeBaseNoticeRecoveryMode(notice) === "regenerate"
+        ? "重新生成本轮（将创建一次新的 API 任务）"
+        : "";
+}
+
+export function knowledgeBaseNoticeHasRecoveryAction(
+  notice: Pick<
+    KnowledgeBaseClientNotice,
+    "code" | "recoveryAction" | "canRegenerate"
+  >,
+) {
+  return knowledgeBaseNoticeRecoveryMode(notice) !== "none";
 }
 
 export function knowledgeBaseNoticeRequiresLogoProvenanceRepair(
   notice: Pick<KnowledgeBaseClientNotice, "code">,
 ) {
   return notice.code === KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE;
+}
+
+export function knowledgeBaseNoticeRequiresAttachmentRepair(
+  notice: Pick<KnowledgeBaseClientNotice, "recoveryAction">,
+) {
+  return notice.recoveryAction === "fix_attachments";
 }
 
 export function knowledgeBasePackageRebindResolved(
@@ -160,7 +203,10 @@ export function knowledgeBasePackageRebindResolved(
 export async function recoverKnowledgeBaseNotice(
   input: {
     conversationId: string;
-    notice: Pick<KnowledgeBaseClientNotice, "code">;
+    notice: Pick<
+      KnowledgeBaseClientNotice,
+      "code" | "recoveryAction" | "canRegenerate"
+    >;
     clientRequestId: string;
     expectedGeneration: number;
     expectedRevision: number;
@@ -178,6 +224,9 @@ export async function recoverKnowledgeBaseNotice(
   }
   if (knowledgeBaseNoticeRecoveryMode(input.notice) === "logo_repair") {
     throw new Error("请通过专用入口重新上传当前知识库使用的同一张 Logo 原图");
+  }
+  if (knowledgeBaseNoticeRecoveryMode(input.notice) !== "regenerate") {
+    throw new Error("当前失败不允许创建新的 API 任务，系统会保留并恢复本轮");
   }
   return (dependencies.retry ?? retryKnowledgeBaseTurn)({
     conversationId: input.conversationId,
@@ -619,9 +668,13 @@ export default function ChatArea({
   const retryCurrentKnowledgeBaseTurn = useCallback(async () => {
     const conversation = activeConversation;
     const knowledgeBase = conversation?.knowledgeBase;
+    const recoveryMode = knowledgeBase?.notice
+      ? knowledgeBaseNoticeRecoveryMode(knowledgeBase.notice)
+      : "none";
     if (
       !conversation ||
-      !knowledgeBase?.notice?.retryable ||
+      !knowledgeBase?.notice ||
+      recoveryMode === "none" ||
       knowledgeBase.revision === null ||
       retryingKnowledgeBase
     ) {
@@ -632,7 +685,6 @@ export default function ChatArea({
       typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
         : `kb-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const recoveryMode = knowledgeBaseNoticeRecoveryMode(knowledgeBase.notice);
     try {
       const observation = await recoverKnowledgeBaseNotice({
         conversationId: conversation.id,
@@ -880,7 +932,31 @@ export default function ChatArea({
                         }}
                       />
                     ) : null
-                  ) : activeConversation.knowledgeBase.notice.retryable ? (
+                  ) : knowledgeBaseNoticeRequiresAttachmentRepair(
+                      activeConversation.knowledgeBase.notice,
+                    ) ? (
+                    activeConversation.knowledgeBase.revision !== null ? (
+                      <KnowledgeBaseAttachmentRepair
+                        conversationId={activeConversation.id}
+                        expectedGeneration={
+                          activeConversation.knowledgeBase.generation
+                        }
+                        expectedRevision={
+                          activeConversation.knowledgeBase.revision
+                        }
+                        expectedLeafId={activeConversation.knowledgeBase.leafId}
+                        onObservation={(observation) => {
+                          commitKnowledgeBaseObservation(
+                            activeConversation.id,
+                            observation,
+                          );
+                          wakeKnowledgeBaseConversation(activeConversation.id);
+                        }}
+                      />
+                    ) : null
+                  ) : knowledgeBaseNoticeHasRecoveryAction(
+                      activeConversation.knowledgeBase.notice,
+                    ) ? (
                     <Button
                       type="button"
                       size="sm"

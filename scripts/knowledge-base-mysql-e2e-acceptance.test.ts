@@ -60,6 +60,7 @@ import {
   formatKnowledgeBasePresentationEnvelope,
   formatKnowledgeBaseProgressEnvelope,
 } from "../server/knowledge-base-progress";
+import { KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH } from "../server/knowledge-base-tree-policy-rollout";
 
 const dependencies = vi.hoisted(() => ({
   getDb: vi.fn(),
@@ -530,6 +531,34 @@ async function close(server: Server | undefined) {
   );
 }
 
+async function waitForMysqlRowLockWaiters(
+  pool: Pool,
+  minimum: number,
+  timeoutMs = 5_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT CAST(w.REQUESTING_ENGINE_TRANSACTION_ID AS CHAR) AS transactionId,
+              requested.OBJECT_NAME AS objectName,
+              requested.INDEX_NAME AS indexName,
+              requested.LOCK_MODE AS lockMode,
+              requested.LOCK_DATA AS lockData
+         FROM performance_schema.data_lock_waits w
+         JOIN performance_schema.data_locks requested
+           ON requested.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID
+        WHERE requested.OBJECT_SCHEMA = DATABASE()
+          AND requested.OBJECT_NAME = 'knowledge_base_builds'`,
+    );
+    const transactionIds = new Set(
+      rows.map((row) => String(row.transactionId || "")).filter(Boolean),
+    );
+    if (transactionIds.size >= minimum) return rows;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`MYSQL_ROW_LOCK_BARRIER_TIMEOUT:${minimum}`);
+}
+
 describe("knowledge-base MySQL E2E acceptance URL guard", () => {
   it("accepts only an explicitly named disposable MySQL acceptance database", () => {
     expect(
@@ -575,6 +604,8 @@ mysqlDescribe(
     const credentialFingerprint = `fp_${sha256(upstreamApiKey).slice(0, 16)}`;
     const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
     const previousRolloutPercent = process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT;
+    const previousTreePolicyWriter =
+      process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER;
     const previousAxiosAdapter = axios.defaults.adapter;
     const stagedImportAssets = new Map<string, string>();
 
@@ -857,6 +888,7 @@ mysqlDescribe(
       assetRoot = await mkdtemp(path.join(tmpdir(), "frontmind-kb-mysql-e2e-"));
       process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
       process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT = "100";
+      process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER = "false";
       axios.defaults.adapter = "http";
     }, 300_000);
 
@@ -951,13 +983,19 @@ mysqlDescribe(
       } else {
         process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT = previousRolloutPercent;
       }
+      if (previousTreePolicyWriter === undefined) {
+        delete process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER;
+      } else {
+        process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER =
+          previousTreePolicyWriter;
+      }
       if (cleanupError) throw cleanupError;
       if (acceptancePassed) {
         console.log("KB_MYSQL_E2E_ACCEPTANCE_COMPLETE");
       }
     }, 120_000);
 
-    it("runs the real start/turn/reconcile/publish/view/download path for all eight leaves", async () => {
+    it("runs the legacy v1 start/turn/reconcile/publish/view/download path for all eight leaves", async () => {
       expect(userId).not.toBeNull();
       const upstream = express();
       upstream.use(express.json({ limit: "5mb" }));
@@ -1321,14 +1359,29 @@ mysqlDescribe(
               `${pathname} projection failed: ${JSON.stringify(payload.observation.notice)}`,
             );
           }
-          if (
-            response.status !== 200 &&
-            !(
-              pathname === "/turn" &&
-              response.status === 202 &&
-              (payload.accepted === true || payload.idempotent === true)
-            )
-          ) {
+          if (response.status === 202) {
+            expect(
+              payload.accepted === true || payload.idempotent === true,
+            ).toBe(true);
+            expect(payload.reservation).toEqual(
+              expect.objectContaining({
+                state: "pending",
+                turnId: expect.any(String),
+              }),
+            );
+            expect(payload.reservation).toHaveProperty("upstreamTaskId");
+            expect(["bound", "recovering"]).toContain(
+              payload.reservation.dispatchState,
+            );
+            if (payload.reservation.dispatchState === "bound") {
+              expect(typeof payload.reservation.upstreamTaskId).toBe("string");
+              expect(payload.reservation.upstreamTaskId.length).toBeGreaterThan(
+                0,
+              );
+            } else {
+              expect(payload.reservation.upstreamTaskId).toBeNull();
+            }
+          } else if (response.status !== 200) {
             throw new Error(
               `${pathname} returned ${response.status}: ${JSON.stringify(payload)}`,
             );
@@ -1338,10 +1391,9 @@ mysqlDescribe(
 
         let { response, payload } = await send();
         const projectionPending = () =>
-          pathname === "/turn" &&
-          (response.status === 202 ||
-            payload.task?.status === "running" ||
-            payload.observation?.interaction?.interactionState === "executing");
+          response.status === 202 ||
+          payload.task?.status === "running" ||
+          payload.observation?.interaction?.interactionState === "executing";
         if (!projectionPending()) return payload;
 
         // Model one disconnected/lost accepted response exactly as the real
@@ -1432,6 +1484,10 @@ mysqlDescribe(
           .limit(1)
       )[0];
       expect(build).toBeTruthy();
+      expect(build).toMatchObject({
+        treePolicyVersion: 1,
+        skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
+      });
       expect(initial.observation).toMatchObject({
         generation: 1,
         notice: null,
@@ -2222,6 +2278,254 @@ mysqlDescribe(
         [leftId, rightId],
       );
       expect(rows.map((row) => row.id)).toEqual([leftId, rightId].sort());
+    }, 120_000);
+
+    it("serializes same-build task binding with browser snapshot sync without deadlock or KB ghost rewrites", async () => {
+      const {
+        bindKnowledgeBaseTurnUpstreamTask,
+        reserveKnowledgeBaseStartBuild,
+      } = await import("../server/knowledge-base-turn-service");
+      const { persistSnapshot } = await import("../server/conversation-router");
+      const { knowledgeBaseNewBuildPolicyBinding } = await import(
+        "../server/knowledge-base-tree-policy-rollout"
+      );
+      const policy = knowledgeBaseNewBuildPolicyBinding({
+        FRONTMIND_KB_TREE_POLICY_V2_WRITER: "true",
+      } as NodeJS.ProcessEnv);
+      const publicBarrierConversationId = `kb-barrier-${runId}`;
+      const started = await reserveKnowledgeBaseStartBuild(
+        {
+          userId: userId!,
+          conversationId: publicBarrierConversationId,
+          clientRequestId: `kb-barrier-start-${runId}`,
+          companyName: "FrontMind MySQL Barrier",
+          companyWebsite: "https://barrier.invalid",
+          skillName: "socratic-kb-builder",
+          skillVersion: policy.skillVersion,
+          skillContentHash: policy.skillContentHash,
+          treePolicyVersion: policy.treePolicyVersion,
+          apiCredentialId: credentialId,
+          userText: "开始构建企业知识库",
+          expectedAttachmentCount: 0,
+          requestPayload: { kind: "mysql-bind-snapshot-barrier", runId },
+          recoveryMetadata: {
+            kind: "start",
+            conversationId: publicBarrierConversationId,
+            skillVersion: policy.skillVersion,
+            skillContentHash: policy.skillContentHash,
+          },
+          leaseMs: 30_000,
+        },
+        executor,
+      );
+      if (started.reservation.state !== "acquired") {
+        throw new Error("MYSQL_BARRIER_START_RESERVATION_NOT_ACQUIRED");
+      }
+      const { build, reservation } = started;
+      const storageConversationId = reservation.turn.conversationId;
+      const [serverRowsBefore] = await pool.query<RowDataPacket[]>(
+        `SELECT id, turnId, content, sequence, metadata
+           FROM messages WHERE conversationId = ? AND turnId = ?`,
+        [storageConversationId, reservation.turn.id],
+      );
+      expect(serverRowsBefore).toHaveLength(1);
+      const serverMessageBefore = structuredClone(serverRowsBefore[0]);
+
+      // Reproduce the production sequence shape: an ordinary browser row at
+      // seq 0 and an immutable server-owned KB row at seq 1. Snapshot sync may
+      // delete/reinsert only the former and must allocate new rows above the
+      // full conversation maximum.
+      await pool.execute("UPDATE messages SET sequence = 1 WHERE id = ?", [
+        serverMessageBefore.id,
+      ]);
+      const existingOrdinaryPublicId = `ordinary-before-${runId}`;
+      const existingOrdinaryStorageId = `u${userId}:${existingOrdinaryPublicId}`;
+      await pool.execute(
+        `INSERT INTO messages
+           (id, conversationId, turnId, userId, role, content, sequence,
+            sentAt, createdAt, updatedAt)
+         VALUES (?, ?, NULL, ?, 'user', ?, 0, NOW(), NOW(), NOW())`,
+        [
+          existingOrdinaryStorageId,
+          storageConversationId,
+          userId,
+          "existing ordinary browser message",
+        ],
+      );
+
+      const nextOrdinaryPublicId = `ordinary-after-${runId}`;
+      const snapshot = {
+        id: publicBarrierConversationId,
+        title: "MySQL bind/snapshot barrier",
+        messages: [
+          {
+            id: existingOrdinaryPublicId,
+            role: "user" as const,
+            content: "existing ordinary browser message",
+            timestamp: Date.now() - 1_000,
+          },
+          {
+            id: nextOrdinaryPublicId,
+            role: "assistant" as const,
+            content: "new ordinary browser message",
+            timestamp: Date.now(),
+          },
+        ],
+        status: "running" as const,
+        createdAt: Date.now() - 5_000,
+        updatedAt: Date.now(),
+        deletedMessageIds: [],
+      };
+      const providerTaskId = `provider-barrier-${runId}`;
+      const blocker = await pool.getConnection();
+      let blockerReleased = false;
+      let barrierFailure: unknown;
+      const operations: Promise<unknown>[] = [];
+      try {
+        await blocker.beginTransaction();
+        await blocker.execute(
+          "SELECT id FROM knowledge_base_builds WHERE id = ? FOR UPDATE",
+          [build.id],
+        );
+
+        // Deliberately bypass the retry wrapper here: a real 1213/1205 must be
+        // observable and fail this release gate instead of succeeding on a
+        // hidden second attempt.
+        const syncing = executor.transaction(
+          (tx) => persistSnapshot(tx, userId!, snapshot),
+          { isolationLevel: "read committed", accessMode: "read write" },
+        );
+        operations.push(syncing);
+        const snapshotWaiters = await waitForMysqlRowLockWaiters(pool, 1);
+        const snapshotTransactions = new Set(
+          snapshotWaiters.map((row) => String(row.transactionId)),
+        );
+        expect(snapshotTransactions.size).toBe(1);
+
+        const binding = bindKnowledgeBaseTurnUpstreamTask(
+          {
+            userId: userId!,
+            turnId: reservation.turn.id,
+            leaseToken: reservation.leaseToken,
+            upstreamTaskId: providerTaskId,
+          },
+          executor,
+        );
+        operations.push(binding);
+        const allWaiters = await waitForMysqlRowLockWaiters(pool, 2);
+        const allTransactions = new Set(
+          allWaiters.map((row) => String(row.transactionId)),
+        );
+        expect(allTransactions.size).toBe(2);
+        const bindingTransactions = [...allTransactions].filter(
+          (transactionId) => !snapshotTransactions.has(transactionId),
+        );
+        expect(bindingTransactions).toHaveLength(1);
+
+        // This is the lock-order proof, not merely an eventual-success check.
+        // The historical turn -> build implementation would already own an X
+        // record lock on this turn while waiting behind the snapshot's build
+        // request, and this assertion would fail before the blocker is freed.
+        const [prematureTurnLocks] = await pool.query<RowDataPacket[]>(
+          `SELECT OBJECT_NAME AS objectName, LOCK_TYPE AS lockType,
+                  LOCK_MODE AS lockMode, LOCK_STATUS AS lockStatus,
+                  LOCK_DATA AS lockData
+             FROM performance_schema.data_locks
+            WHERE OBJECT_SCHEMA = DATABASE()
+              AND OBJECT_NAME = 'conversation_turns'
+              AND ENGINE_TRANSACTION_ID = ?
+              AND LOCK_TYPE = 'RECORD'
+              AND LOCK_STATUS = 'GRANTED'
+              AND LOCK_MODE LIKE 'X%'`,
+          [bindingTransactions[0]],
+        );
+        expect(prematureTurnLocks).toEqual([]);
+
+        await blocker.commit();
+        blockerReleased = true;
+      } catch (error) {
+        barrierFailure = error;
+      } finally {
+        if (!blockerReleased) await blocker.rollback().catch(() => undefined);
+        blocker.release();
+      }
+      const settled = await Promise.allSettled(operations);
+      if (barrierFailure) throw barrierFailure;
+      const rejected = settled.filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      );
+      expect(
+        rejected.map((result) => {
+          const reason = result.reason as {
+            code?: unknown;
+            errno?: unknown;
+            cause?: { code?: unknown; errno?: unknown };
+          };
+          return String(
+            reason?.code ||
+              reason?.cause?.code ||
+              reason?.errno ||
+              reason?.cause?.errno ||
+              "UNKNOWN",
+          );
+        }),
+      ).toEqual([]);
+
+      const [boundRows] = await pool.query<RowDataPacket[]>(
+        `SELECT t.upstreamTaskId AS turnTaskId,
+                b.upstreamTaskId AS buildTaskId, b.activeTurnId
+           FROM conversation_turns t
+           JOIN knowledge_base_builds b ON b.id = t.buildId
+          WHERE t.id = ?`,
+        [reservation.turn.id],
+      );
+      expect(boundRows).toEqual([
+        expect.objectContaining({
+          turnTaskId: providerTaskId,
+          buildTaskId: providerTaskId,
+          activeTurnId: reservation.turn.id,
+        }),
+      ]);
+
+      const [messageRowsAfter] = await pool.query<RowDataPacket[]>(
+        `SELECT id, turnId, content, sequence, metadata
+           FROM messages WHERE conversationId = ? ORDER BY sequence`,
+        [storageConversationId],
+      );
+      expect(
+        messageRowsAfter.map((row) => ({
+          id: row.id,
+          turnId: row.turnId,
+          sequence: Number(row.sequence),
+        })),
+      ).toEqual([
+        {
+          id: existingOrdinaryStorageId,
+          turnId: null,
+          sequence: 0,
+        },
+        {
+          id: serverMessageBefore.id,
+          turnId: reservation.turn.id,
+          sequence: 1,
+        },
+        {
+          id: `u${userId}:${nextOrdinaryPublicId}`,
+          turnId: null,
+          sequence: 2,
+        },
+      ]);
+      const serverMessageAfter = messageRowsAfter[1]!;
+      expect(serverMessageAfter).toMatchObject({
+        id: serverMessageBefore.id,
+        turnId: serverMessageBefore.turnId,
+        content: serverMessageBefore.content,
+        metadata: serverMessageBefore.metadata,
+      });
+      expect(
+        messageRowsAfter.filter((row) => row.turnId === reservation.turn.id),
+      ).toHaveLength(1);
     }, 120_000);
   },
 );

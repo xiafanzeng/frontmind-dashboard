@@ -421,6 +421,13 @@
       "when": 1786260864532,
       "tag": "0059_delivery_ticket_workflow_contracts",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "5",
+      "when": 1786354308771,
+      "tag": "0060_knowledge_base_tree_policy",
+      "breakpoints": true
     }
   ]
 }

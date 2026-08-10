@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   KNOWLEDGE_BASE_FOUNDATION_COPY,
   knowledgeBaseNoticeRecoveryMode,
+  knowledgeBaseNoticeRequiresAttachmentRepair,
   knowledgeBaseNoticeRequiresLogoProvenanceRepair,
   knowledgeBaseNoticeRetryLabel,
   knowledgeBasePackageRebindResolved,
@@ -163,7 +164,7 @@ describe("knowledge-base notice recovery", () => {
     ).toBe(true);
   });
 
-  it("keeps ordinary retryable protocol failures on the new-turn path", async () => {
+  it("never creates a new task from a legacy retryable flag alone", async () => {
     const observation = { interaction: { progress: null } } as any;
     const reconcile = vi.fn();
     const retry = vi.fn().mockResolvedValue(observation);
@@ -174,6 +175,33 @@ describe("knowledge-base notice recovery", () => {
           ...input,
           expectedLeafId: "1.4",
           notice: { code: "PROGRESS_PROTOCOL_INVALID" },
+        },
+        { reconcile, retry },
+      ),
+    ).rejects.toThrow("不允许创建新的 API 任务");
+
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(retry).not.toHaveBeenCalled();
+    expect(
+      knowledgeBaseNoticeRetryLabel({ code: "PROGRESS_PROTOCOL_INVALID" }),
+    ).toBe("");
+  });
+
+  it("creates a new task only from the authoritative regeneration contract", async () => {
+    const observation = { interaction: { progress: null } } as any;
+    const reconcile = vi.fn();
+    const retry = vi.fn().mockResolvedValue(observation);
+
+    await expect(
+      recoverKnowledgeBaseNotice(
+        {
+          ...input,
+          expectedLeafId: "1.4",
+          notice: {
+            code: "PROGRESS_PROTOCOL_INVALID",
+            recoveryAction: "regenerate_turn",
+            canRegenerate: true,
+          },
         },
         { reconcile, retry },
       ),
@@ -188,8 +216,64 @@ describe("knowledge-base notice recovery", () => {
       expectedLeafId: "1.4",
     });
     expect(
-      knowledgeBaseNoticeRetryLabel({ code: "PROGRESS_PROTOCOL_INVALID" }),
-    ).toBe("重试本轮");
+      knowledgeBaseNoticeRetryLabel({
+        code: "PROGRESS_PROTOCOL_INVALID",
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
+      }),
+    ).toBe("重新生成本轮（将创建一次新的 API 任务）");
+  });
+
+  it("continues the same bound task after a credential update", async () => {
+    const observation = { interaction: { progress: null } } as any;
+    const reconcile = vi.fn().mockResolvedValue(observation);
+    const retry = vi.fn();
+    const notice = {
+      code: "UPSTREAM_CREDENTIAL_REJECTED",
+      recoveryAction: "update_credential" as const,
+      canRegenerate: false,
+    };
+
+    await expect(
+      recoverKnowledgeBaseNotice({ ...input, notice }, { reconcile, retry }),
+    ).resolves.toBe(observation);
+    expect(reconcile).toHaveBeenCalledWith({
+      conversationId: "knowledge-conversation",
+    });
+    expect(retry).not.toHaveBeenCalled();
+    expect(knowledgeBaseNoticeRetryLabel(notice)).toBe("更新凭证后继续本轮");
+  });
+
+  it("continues a pre-create quota failure without exposing regeneration", async () => {
+    const observation = { interaction: { progress: null } } as any;
+    const reconcile = vi.fn().mockResolvedValue(observation);
+    const retry = vi.fn();
+    const notice = {
+      code: "UPSTREAM_CREATE_HTTP_402",
+      recoveryAction: "top_up" as const,
+      canRegenerate: false,
+    };
+
+    await expect(
+      recoverKnowledgeBaseNotice({ ...input, notice }, { reconcile, retry }),
+    ).resolves.toBe(observation);
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(retry).not.toHaveBeenCalled();
+    expect(knowledgeBaseNoticeRetryLabel(notice)).toBe("补充额度后继续本轮");
+  });
+
+  it("routes a 413 failure to the dedicated attachment replacement entrance", () => {
+    const notice = {
+      recoveryAction: "fix_attachments" as const,
+      canRegenerate: false,
+    };
+    expect(knowledgeBaseNoticeRequiresAttachmentRepair(notice)).toBe(true);
+    expect(
+      knowledgeBaseNoticeRecoveryMode({ code: "HTTP_413", ...notice }),
+    ).toBe("none");
+    expect(
+      knowledgeBaseNoticeRetryLabel({ code: "HTTP_413", ...notice }),
+    ).not.toContain("重新生成");
   });
 
   it("routes missing Logo provenance to the dedicated upload repair instead of retry", () => {

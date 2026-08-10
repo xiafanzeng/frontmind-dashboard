@@ -89,6 +89,7 @@ import knowledgeBaseLivePreviewApi from "../knowledge-base-live-preview-api";
 import knowledgeBaseArtifactApi from "../knowledge-base-artifact-api";
 import { auditKnowledgeBaseStateInvariants } from "../knowledge-base-invariant-audit";
 import { runtimeErrorForLog } from "./runtime-error-log";
+import { knowledgeBaseNewBuildPolicyBinding } from "../knowledge-base-tree-policy-rollout";
 import {
   evaluateKnowledgeBaseReadiness,
   knowledgeBaseReadinessHttpStatus,
@@ -150,8 +151,12 @@ function assertProductionConfiguration() {
 }
 
 async function getRuntimeSkillReadiness() {
+  const knowledgeBasePolicy = knowledgeBaseNewBuildPolicyBinding();
   const [knowledgeBase, brandQuestions, responseLogic] = await Promise.all([
-    getKnowledgeBaseSkillDescriptor(),
+    getKnowledgeBaseSkillDescriptor({
+      version: knowledgeBasePolicy.skillVersion,
+      contentHash: knowledgeBasePolicy.skillContentHash,
+    }),
     getBrandQuestionPortfolioSkillDescriptor(),
     getResponseLogicSkillDescriptor(),
   ]);
@@ -179,6 +184,13 @@ async function evaluateReleaseReadiness(
 
 async function startServer() {
   let migrationManifest: MigrationManifest | null = null;
+  const knowledgeBaseTreePolicyWriter = knowledgeBaseNewBuildPolicyBinding();
+  console.info("[KnowledgeBase] tree_policy_writer", {
+    enabled: knowledgeBaseTreePolicyWriter.treePolicyVersion === 2,
+    treePolicyVersion: knowledgeBaseTreePolicyWriter.treePolicyVersion,
+    skillVersion: knowledgeBaseTreePolicyWriter.skillVersion,
+    skillContentHash: knowledgeBaseTreePolicyWriter.skillContentHash,
+  });
   if (process.env.NODE_ENV === "production") {
     validateReleaseRuntimeEnvironment(process.env, applicationBuildSha);
     migrationManifest = await loadMigrationManifest(
@@ -332,6 +344,12 @@ async function startServer() {
           monitorApiBaseUrlConfigured: true,
           publicUrlConfigured: isFrontMindPublicUrlConfigured(),
           upstreamBaseUrlConfigured: isUpstreamBaseUrlConfigured(),
+          knowledgeBaseTreePolicyWriter: {
+            enabled: knowledgeBaseTreePolicyWriter.treePolicyVersion === 2,
+            treePolicyVersion: knowledgeBaseTreePolicyWriter.treePolicyVersion,
+            skillVersion: knowledgeBaseTreePolicyWriter.skillVersion,
+            skillContentHash: knowledgeBaseTreePolicyWriter.skillContentHash,
+          },
         },
         preparedFiles: {
           status: "ok",

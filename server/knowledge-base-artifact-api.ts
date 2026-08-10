@@ -37,6 +37,7 @@ import {
   knowledgeBaseArchiveReadContractVersions,
   knowledgeBaseArchiveRequiresV4UploadEvidence,
 } from "./knowledge-base-archive-contract";
+import { knowledgeBaseTreePolicy } from "./knowledge-base-progress";
 
 const router = Router();
 const MAX_CUSTOMER_UPLOAD_SOURCE_BYTES = 100 * 1024 * 1024;
@@ -292,6 +293,10 @@ async function serveBuildArtifact(
         archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
           build.skillVersion,
         ),
+        dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+          build.treePolicyVersion,
+        ).minLeaves,
+        requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
         ...(build.skillVersion === "3" || build.skillVersion === "4"
           ? {
               validateParsed: async (parsed) => {

@@ -117,6 +117,7 @@ describe("service portal migration chain", () => {
       "0057_productive_kang",
       "0058_jenova_brand_tracking",
       "0059_delivery_ticket_workflow_contracts",
+      "0060_knowledge_base_tree_policy",
     ]);
   });
 

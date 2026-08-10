@@ -12,6 +12,9 @@ confirmation.
 
 ## Execution mode
 
+- Before creating the first `FRONTMIND_KB_MANIFEST`, **read
+  `references/knowledge-tree.md` completely**. Use its seven business
+  questions to audit coverage before fixing any branch or leaf inventory.
 - Before creating any final archive, **read
   `references/output-format.md` completely**. That file is the exact and
   exhaustive archive contract; this summary never authorizes a smaller custom
@@ -33,9 +36,9 @@ confirmation.
 - Maintain actual counters. Never invent a source, fact, image, resource count
   or completeness value.
 
-Hard ceilings: 1,200 official HTML attempts, 1,800 visited links, 120 useful
-official documents, 100 cumulative uploads, 120 public queries, 3,000,000
-retained evidence characters, 180,000 customer-visible characters, 8–115
+Hard ceilings: 120 successfully parsed official pages, 200 visited links, 30
+useful official documents, 100 cumulative uploads, 30 public queries, 3,000,000
+retained evidence characters, 180,000 customer-visible characters, 30–115
 leaves, 1,500 ZIP files, 100 images (one official Logo plus at most 99 unique
 customer-uploaded images) and 30 MiB of total image bytes. Stop duplicate
 SKUs, pagination, translated copies and low-value news before they displace
@@ -62,13 +65,20 @@ It never creates, confirms, replaces or publishes an enterprise knowledge base.
 
 ## Knowledge and evidence layers
 
-Create an adaptive 8–115 leaf tree covering enterprise identity, team,
+Create an adaptive 30–115 leaf tree covering enterprise identity, team,
 products/services, capabilities, industries/cases, differentiation and
 cooperation/support. Preserve every material product/service family while
-consolidating repeated models. A white-label company or a company represented
-only by a brochure may use a compact tree: keep only evidence-backed facts and
-necessary explicit gaps. Never invent or repeat content to satisfy leaf, word
-or image counts.
+consolidating repeated models. A typical enterprise with one to three
+product/service families should contain 40–55 leaves. A white-label company or
+a company represented only by a brochure must still contain at least 30
+non-duplicative business-question leaves: use distinct `needs_verification`
+gaps for applicable unanswered questions, without inventing facts, copying
+formal prose or repeating a generic disclaimer.
+
+A Website knowledge-base prefill is evidence only. Read and cite useful facts
+from it, but never inherit its shallow tree, branch IDs, leaf IDs, ordering,
+10–20-leaf depth or traversal state. Independently derive the Dashboard tree
+from the current enterprise evidence and this deep-tree contract.
 
 Before confirmation, write one formal overview for every top-level branch and a
 complete draft for every leaf. Use exactly one formal block in each
@@ -120,9 +130,19 @@ generic gap or disclaimer across leaves.
 
 Do not target a global minimum character count. A concise supported fact or
 clear `needs_verification` gap is preferable to padding. Record actual evidence
-and formal character counts so the service-side finalizer can verify them. For
-new adaptive documents set `requiredFormalCharacters` to `0`; older archives
-that carry the legacy evidence-proportional value remain readable.
+and formal character counts and apply these exact evidence-adaptive minimums:
+
+- overview with evidence:
+  `max(120, min(target, floor(evidenceCharacters * 0.25)))`, where `target` is
+  5,000 for a product/service branch and 2,500 for every other branch;
+- leaf with evidence:
+  `max(80, min(500, floor(evidenceCharacters * 0.20)))`;
+- overview with zero evidence: 60; leaf with zero evidence: 40, both using a
+  gap evidence status and `contentStatus: needs_verification`.
+
+Set `requiredFormalCharacters` to that exact computed value and make the formal
+block meet it. Never use `0` to bypass the writing gate and never pad one topic
+with another topic's facts.
 
 ## Logo discovery, customer uploads and quality
 
@@ -302,10 +322,35 @@ conversational state protocols. Never emit `FRONTMIND_KB_REOPEN`,
 The first turn must end with exactly one complete manifest envelope generated
 by the service prompt, even when all research and drafts are already complete.
 Copy its `schemaVersion: 2`, `operationId` and `turnId` exactly. The actual
-`leaves` array must contain every one of the adaptive 8–115 leaves, with the
+`leaves` array must contain every one of the adaptive 30–115 leaves, with the
 final stable `id`, `title`, `branchId`, and `branchTitle` of each leaf. A
 branch/leaf count, the current leaf, an internal tree object, or a state summary
 never substitutes for the complete manifest.
+
+Every normal production first manifest (never the development protocol probe)
+must also carry the exact `researchCoverage` object shown in the service
+prompt. Record real counters only:
+
+- `officialPages`: discovered, attempted, succeeded and failed official pages;
+- `publicQueries`, `officialDocuments`, `uploadsRead`, and deduplicated
+  `sourceCount`;
+- `productFamilies`: every material family with `id`, `name`, and at least one
+  real manifest `leafId`;
+- `dimensions`: exactly the seven knowledge-tree business dimensions, each
+  marked `covered` or `gap` and linked to one or more real manifest leaves;
+- `stopReason`: `coverage_complete`, `source_limited`, or `budget_reached`, and
+  a concrete `limitationReason` whenever the stop reason is not complete.
+
+For `coverage_complete`, read every initial upload, execute at least six public
+queries, successfully parse at least 12 official pages, cover all seven
+dimensions with facts or specific gaps, and link every product family to a
+leaf. `source_limited` may have fewer than 12 successful official pages only
+after the discovered official queue is exhausted and the limitation is
+explained; it still requires six public queries, all uploads read, seven
+dimension entries and product-family coverage. `budget_reached` is truthful
+only when a hard ceiling was actually reached and never excuses missing
+uploads, queries, dimensions or product-family leaves. Do not lower, truncate
+or estimate a counter to make the manifest pass.
 
 When the initial turn also returns a Logo image, add an `officialLogo` object
 with exact provenance for the selected official source. An official-web Logo
@@ -439,3 +484,9 @@ candidate uses v4. The service-side finalizer will independently rerun the
 contract and remains authoritative for counts, hashes, dimensions, format and
 customer quality. Never create an interactive research webpage or HTML
 deliverable.
+
+Before returning any conversational response, parse every generated protocol
+JSON object yourself and validate it against the supplied schema plus the exact
+operationId and turnId scope. Emit the one valid protocol set once only. This
+self-check must never invent, coerce or rewrite business values, and the
+service-side validator remains authoritative.

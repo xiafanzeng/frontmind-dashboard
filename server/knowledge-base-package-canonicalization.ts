@@ -119,7 +119,9 @@ export async function canonicalizeKnowledgeBaseFinalArchive(input: {
   );
   let manifest: JsonRecord;
   try {
-    manifest = JSON.parse(await manifestEntry.async("string")) as JsonRecord;
+    manifest = JSON.parse(
+      (await manifestEntry.async("string")).replace(/^\uFEFF/u, ""),
+    ) as JsonRecord;
   } catch {
     throw new KnowledgeBasePackageCanonicalizationError(
       "最终 ZIP package manifest 不是有效 JSON",

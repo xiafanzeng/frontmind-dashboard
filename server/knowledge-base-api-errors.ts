@@ -75,7 +75,10 @@ export function classifyKnowledgeBaseUpstreamCreateFailure(input: {
   missingTaskId?: boolean;
   transportError?: boolean;
 }): KnowledgeBaseUpstreamCreateFailureClass {
-  if (input.missingTaskId) return "deterministic";
+  // A successful HTTP response without a readable id may have created the
+  // task while returning a partial body. Preserve the same idempotency key and
+  // let recovery reconcile it; never invite a second logical turn.
+  if (input.missingTaskId) return "unknown";
   if (input.transportError) return "unknown";
   const status = Number(input.status);
   if (!Number.isInteger(status) || status <= 0) return "unknown";

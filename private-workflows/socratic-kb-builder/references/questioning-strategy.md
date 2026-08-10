@@ -18,13 +18,17 @@ page and direct asset URLs for every third-party lead.
 ## First research turn
 
 Complete bounded research and the adaptive manifest before the first
-confirmation. Respect the 1,200 HTML, 1,800 total-link, 1-image,
-120-document, 100-upload, 120-query, 3-million-evidence-character, and
-330/360-minute gates from `SKILL.md`.
+confirmation. Respect the 120-successful-official-page, 200-total-link,
+1-image, 30-official-document, 100-upload, 30-query and
+3-million-evidence-character ceilings from `SKILL.md`. Read every initial
+upload. A normal complete run requires at least 12 successful official pages
+and six public queries; a smaller official site may use `source_limited` only
+after its discovered official queue is exhausted.
 
 The first customer-visible answer must:
 
-- Display branch counts and the true 8–115 leaf total.
+- Display branch counts and the true 30–115 leaf total. A typical enterprise
+  with one to three product/service families should contain 40–55 leaves.
 - Present the first leaf as polished formal content.
 - When an official-web or official-document Logo is available, show exactly one
   whose bytes were validated, assigned a stable asset ID and associated only
@@ -41,8 +45,11 @@ The first customer-visible answer must:
 - End the visible body after the first leaf. Do not add citations, source
   lists, unresolved items, action guidance or a confirmation question.
 - End with exactly one valid `FRONTMIND_KB_MANIFEST` envelope. The application
-  always requires it on the first turn. Include the complete 8–115 item
-  `leaves` array; a count or `SOCRATIC_KB_STATE` summary is invalid.
+  always requires it on the first turn. Include the complete 30–115 item
+  `leaves` array and the exact `researchCoverage` ledger from the service
+  prompt; a count or `SOCRATIC_KB_STATE` summary is invalid. The development
+  protocol probe remains the sole eight-row exception and never includes a
+  production research ledger.
 
 Do not dump raw snapshots, page excerpts, crawl logs, or internal planning.
 

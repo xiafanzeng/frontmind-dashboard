@@ -19,6 +19,7 @@ import { stripKnowledgeBaseProtocolPayloads } from "@shared/knowledge-base-outpu
 import { userFacingErrorMessage } from "@/lib/user-facing-error";
 import { assertChatAttachmentSizes } from "@/lib/attachment-files";
 import {
+  dispatchKnowledgeBaseProgressUpdated,
   knowledgeBaseObservationFromPayload,
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
@@ -926,33 +927,12 @@ export async function createKnowledgeBaseTurnTask(
         ? knowledgeBaseObservationFromPayload(payload)
         : undefined;
       const returnedTaskId = data?.id || data?.task_id || "";
-      if (context.submissionKind === "logo" && !returnedTaskId) {
-        throw Object.assign(
-          new Error("Logo 已上传，但服务端尚未返回 FrontMind 真实任务编号"),
-          {
-            status: 502,
-            code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
-            ...(observation ? { knowledgeObservation: observation } : {}),
-          },
-        );
-      }
       const taskId =
-        returnedTaskId ||
-        observation?.authoritativeTaskId ||
-        observation?.activeTurn?.id ||
-        (observation
-          ? `kb-observation-${observation.generation}-${observation.stateEpoch}`
-          : "");
+        returnedTaskId || observation?.authoritativeTaskId || "";
       if (!observation && !data?.id && !data?.task_id) {
         throw new Error("任务创建失败：未返回权威任务状态");
       }
-      if (payload?.progress) {
-        window.dispatchEvent(
-          new CustomEvent("frontmind:knowledge-progress-updated", {
-            detail: payload.progress,
-          }),
-        );
-      }
+      if (observation) dispatchKnowledgeBaseProgressUpdated(observation);
       return {
         ...data,
         id: taskId,

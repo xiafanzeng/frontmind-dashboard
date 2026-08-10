@@ -67,6 +67,26 @@ export interface KnowledgeBaseSkillSelection {
   contentHash?: string | null;
 }
 
+/**
+ * Final delivery for a v4 build must use the exact immutable archive selected
+ * at build creation. Falling back to `latest` would silently turn an 8–115
+ * historical build into a 30–115 build during confirm, retry or recovery.
+ */
+export function knowledgeBasePinnedV4SkillSelection(input: {
+  skillVersion: string;
+  skillContentHash?: string | null;
+}): KnowledgeBaseSkillSelection & { version: "4"; contentHash: string } {
+  const contentHash = String(input.skillContentHash || "")
+    .trim()
+    .toLowerCase();
+  if (input.skillVersion !== "4" || !/^[a-f0-9]{64}$/u.test(contentHash)) {
+    throw new Error(
+      "Knowledge-base v4 build is missing its immutable Skill content hash",
+    );
+  }
+  return { version: "4", contentHash };
+}
+
 interface LoadedKnowledgeBaseSkill {
   instructions: string;
   contentHash: string;
