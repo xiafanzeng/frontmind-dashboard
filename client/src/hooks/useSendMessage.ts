@@ -750,7 +750,7 @@ export function useSendMessage() {
             }
             console.warn(
               `File upload failed for "${file.name}":`,
-              uploadErr.message,
+              sanitizeBrandText(uploadErr?.message || "上传失败"),
             );
             // A terminal upload failure must release the composer immediately.
             // uploadFile already performs its bounded retries; keeping progress
@@ -764,7 +764,9 @@ export function useSendMessage() {
               wakeKnowledgeBaseConversation(convId);
             }
             toast.error(`文件 "${file.name}" 上传失败`, {
-              description: uploadErr?.message || "请稍后重试。",
+              description: sanitizeBrandText(
+                uploadErr?.message || "请稍后重试。",
+              ),
             });
             return false;
           }
@@ -946,7 +948,7 @@ export function useSendMessage() {
             toast.success("本轮已提交", {
               description:
                 options.submissionKind === "logo"
-                  ? "Manus 已接收 Logo，正在重新呈现当前知识节点。"
+                  ? "FrontMind 已接收 Logo，正在重新呈现当前知识节点。"
                   : "FrontMind 正在生成并校验当前知识节点。",
               duration: 3200,
             });
@@ -1070,17 +1072,20 @@ export function useSendMessage() {
           }
         } catch (err: any) {
           if (options?.syncKnowledgeBaseSnapshot) {
+            const status = Number(err?.status || 0);
+            const code = String(err?.code || "");
+            const isLogoSubmission = options.submissionKind === "logo";
             const acknowledgedObservation =
-              options.submissionKind !== "logo" &&
               err?.knowledgeObservation &&
               knowledgeBaseObservationAcknowledgesClientRequest(
                 err.knowledgeObservation,
                 knowledgeBaseClientRequestId,
                 {
-                  // Legacy upload-first recovery deliberately reuses the old
-                  // reservation id. Its already-present activeTurn cannot prove
-                  // that this takeover attempt succeeded.
-                  allowActiveTurn: !resumingLegacyKnowledgeBaseAttachmentTurn,
+                  // A final presentation/completion proves that this exact
+                  // request was accepted even when the HTTP response failed.
+                  // An active reservation alone cannot overrule a terminal
+                  // 4xx: it may be a stale Logo reservation or legacy upload.
+                  allowActiveTurn: false,
                 },
               )
                 ? err.knowledgeObservation
@@ -1092,34 +1097,48 @@ export function useSendMessage() {
               commitKnowledgeBaseObservation(convId, acknowledgedObservation);
               wakeKnowledgeBaseConversation(convId);
               toast.success("本轮已提交", {
-                description: "FrontMind 正在生成并校验当前知识节点。",
+                description: isLogoSubmission
+                  ? "FrontMind 已接收 Logo，正在重新呈现当前知识节点。"
+                  : "FrontMind 正在生成并校验当前知识节点。",
                 duration: 3200,
               });
               return true;
             }
-            const status = Number(err?.status || 0);
-            const code = String(err?.code || "");
-            // A Logo upload has one visible action and is accepted only after
-            // the server returns the real upstream task id. A transport error
-            // or a malformed 2xx response must leave the chosen image in place
-            // for a clear retry instead of claiming that submission succeeded.
-            const logoTaskWasNotAcknowledged =
-              options.submissionKind === "logo";
             const requestOutcomeUnknown =
-              !logoTaskWasNotAcknowledged &&
-              (!status ||
-                status === 408 ||
-                status === 425 ||
-                status === 429 ||
-                status >= 500 ||
-                code === "IDEMPOTENCY_PENDING");
-            const deterministicFailure =
-              logoTaskWasNotAcknowledged ||
-              (!requestOutcomeUnknown && status !== 409);
-            if (
-              (status === 409 || deterministicFailure) &&
-              knowledgeBaseClientRequestId
-            ) {
+              !status ||
+              status === 408 ||
+              status === 425 ||
+              status === 429 ||
+              status >= 500 ||
+              code === "IDEMPOTENCY_PENDING";
+            const pendingAcknowledgedObservation =
+              requestOutcomeUnknown &&
+              err?.knowledgeObservation &&
+              knowledgeBaseObservationAcknowledgesClientRequest(
+                err.knowledgeObservation,
+                knowledgeBaseClientRequestId,
+                { allowActiveTurn: true },
+              )
+                ? err.knowledgeObservation
+                : null;
+            if (pendingAcknowledgedObservation) {
+              // A matching active turn proves the Dashboard durably reserved
+              // this exact request even when the upstream task id is still
+              // pending. It is now safe for the composer to clear the file.
+              commitKnowledgeBaseObservation(
+                convId,
+                pendingAcknowledgedObservation,
+              );
+              wakeKnowledgeBaseConversation(convId);
+              toast.info("本轮已提交", {
+                description: isLogoSubmission
+                  ? "FrontMind 已接收 Logo，正在重新呈现当前知识节点。"
+                  : "正在处理当前节点，请稍候。",
+              });
+              return true;
+            }
+            const deterministicFailure = !requestOutcomeUnknown;
+            if (deterministicFailure && knowledgeBaseClientRequestId) {
               rollbackPendingKnowledgeBaseTurn(
                 convId,
                 knowledgeBaseClientRequestId,
@@ -1128,14 +1147,10 @@ export function useSendMessage() {
             if (err?.knowledgeObservation) {
               commitKnowledgeBaseObservation(convId, err.knowledgeObservation);
             }
-            if (
-              (status === 409 || deterministicFailure) &&
-              (!err?.knowledgeObservation ||
-                (deterministicFailure && options.submissionKind === "logo"))
-            ) {
+            if (deterministicFailure && !err?.knowledgeObservation) {
               updateStatus(convId, conv?.status ?? "awaiting_input");
             }
-            if (requestOutcomeUnknown) {
+            if (requestOutcomeUnknown && !err?.knowledgeObservation) {
               updateStatus(convId, "running", {
                 startedAt: responseStartedAt,
               });
@@ -1143,24 +1158,31 @@ export function useSendMessage() {
             if (!deterministicFailure || err?.knowledgeObservation) {
               wakeKnowledgeBaseConversation(convId);
             }
-            if (status === 409) {
-              toast.info("当前节点已更新", {
-                description: "已同步服务端最新节点，请按当前内容继续。",
-              });
-            } else if (deterministicFailure) {
+            if (deterministicFailure) {
               toast.error("本轮未能提交", {
-                description: err?.message || "请检查当前内容后重新提交。",
+                description: sanitizeBrandText(
+                  err?.message || "请检查当前内容后重新提交。",
+                ),
               });
             } else {
-              // A disconnected browser response does not mean the accepted
-              // durable turn failed. Keep the user on the normal processing
-              // path while the coordinator observes the same request id. The
-              // composer must clear this already-submitted text/attachment set
-              // so it cannot be repeated against the next leaf.
-              toast.info("本轮已提交", {
-                description: "正在处理当前节点，请稍候。",
+              if (!isLogoSubmission) {
+                // Preserve the established text-confirmation behavior: the
+                // optimistic message remains the durable browser-side source
+                // while the coordinator reconciles the same request id.
+                toast.info("本轮已提交", {
+                  description: "正在处理当前节点，请稍候。",
+                });
+                return true;
+              }
+              // A disconnected browser response is outcome-unknown: the POST
+              // may never have reached Dashboard. Keep reconciliation active,
+              // but do not claim acceptance or clear the selected Logo until
+              // a matching durable observation proves the reservation exists.
+              toast.info("正在确认提交结果", {
+                description:
+                  "网络响应中断，已保留所选 Logo；系统正在按同一请求继续核对。",
               });
-              return true;
+              return false;
             }
             return false;
           }

@@ -45,6 +45,14 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   awaitingClientAttachments?: boolean;
   /** Safe tombstone for a browser upload rejected before any upstream POST. */
   unpreparedCancellation?: boolean;
+  /** Safe tombstone for a manual Logo turn rejected after provider acknowledgement. */
+  acknowledgedManualLogoCancellation?: boolean;
+  /** Hash of the lease authority that committed the acknowledged cancellation. */
+  acknowledgedManualLogoCancellationAuthorityHash?: string;
+  /** Safe tombstone for a manual Logo turn rejected before any task id existed. */
+  unacknowledgedManualLogoCancellation?: boolean;
+  /** Hash of the lease authority that committed the pre-ack cancellation. */
+  unacknowledgedManualLogoCancellationAuthorityHash?: string;
   cancelledOperationKey?: string;
   /** The former browser reservation was atomically adopted by upload-first. */
   legacyUploadFirstTakeover?: boolean;
@@ -233,6 +241,12 @@ export interface ReserveKnowledgeBaseTurnInput {
    * selection because those values can change after the turn commits.
    */
   clientIntent?: unknown;
+  /**
+   * Distinguishes repeated externally acknowledged attempts at one coordinate.
+   * Manual Logo submissions use clientRequestId so replacement bytes never
+   * reuse a provider idempotency key from a rejected Logo task.
+   */
+  operationInstanceId?: string;
   apiCredentialId?: string | null;
   userText?: string;
   /** Customer-supplied files only; excludes generated Skill/prefill files. */
@@ -537,6 +551,7 @@ export function createKnowledgeBaseOperationKey(input: {
   expectedRevision: number;
   expectedLeafId: string | null;
   retryOfTurnId?: string | null;
+  operationInstanceId?: string;
 }) {
   const phase =
     input.operationType === "start"
@@ -553,6 +568,15 @@ export function createKnowledgeBaseOperationKey(input: {
     phase,
     revision: input.expectedRevision,
     leafId: input.expectedLeafId,
+    ...(input.operationInstanceId
+      ? {
+          instanceId: normalizeRequiredId(
+            input.operationInstanceId,
+            "operationInstanceId",
+            128,
+          ),
+        }
+      : {}),
     ...(input.operationType === "retry"
       ? {
           retryOfTurnId: normalizeRequiredId(
@@ -887,7 +911,7 @@ export function inspectKnowledgeBaseRetryAuthority(
 
     const retryOfTurnId =
       operationType === "retry" ? String(recovery.retryOfTurnId || "") : null;
-    const expectedOperationKey = createKnowledgeBaseOperationKey({
+    const legacyOperationKey = createKnowledgeBaseOperationKey({
       buildId: source.buildId,
       buildGeneration: source.buildGeneration,
       operationType,
@@ -895,11 +919,23 @@ export function inspectKnowledgeBaseRetryAuthority(
       expectedLeafId: source.expectedLeafId,
       ...(operationType === "retry" ? { retryOfTurnId } : {}),
     });
+    const expectedOperationKey =
+      recovery.manualLogoSubmission === true && operationType !== "retry"
+        ? createKnowledgeBaseOperationKey({
+            buildId: source.buildId,
+            buildGeneration: source.buildGeneration,
+            operationType,
+            expectedRevision: source.expectedRevision,
+            expectedLeafId: source.expectedLeafId,
+            operationInstanceId: source.clientRequestId,
+          })
+        : legacyOperationKey;
     if (
-      source.operationKey !== expectedOperationKey ||
+      (source.operationKey !== expectedOperationKey &&
+        source.operationKey !== legacyOperationKey) ||
       source.upstreamIdempotencyKeyHash !==
         hashKnowledgeBaseUpstreamIdempotencyKey(
-          createKnowledgeBaseUpstreamIdempotencyKey(expectedOperationKey),
+          createKnowledgeBaseUpstreamIdempotencyKey(source.operationKey),
         )
     ) {
       return null;
@@ -981,6 +1017,14 @@ function metadataOf(row: Pick<ConversationTurn, "metadata">) {
   return (
     row.metadata && typeof row.metadata === "object" ? row.metadata : {}
   ) as KnowledgeBaseTurnMetadata;
+}
+
+function releasedOperationTombstone(metadata: KnowledgeBaseTurnMetadata) {
+  return (
+    metadata.unpreparedCancellation === true ||
+    metadata.acknowledgedManualLogoCancellation === true ||
+    metadata.unacknowledgedManualLogoCancellation === true
+  );
 }
 
 function leaseOwnerHash(leaseToken: string) {
@@ -1364,13 +1408,15 @@ export async function inspectKnowledgeBaseTurnReplay(
             : eq(conversationTurns.expectedLeafId, expectedLeafId),
           sql`JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.clientIntentHash')) = ${clientIntentHash}`,
           sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.unpreparedCancellation')), 'false') <> 'true'`,
+          sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.acknowledgedManualLogoCancellation')), 'false') <> 'true'`,
+          sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.unacknowledgedManualLogoCancellation')), 'false') <> 'true'`,
         ),
       )
       .orderBy(desc(conversationTurns.createdAt))
       .limit(1);
     const operationWinner = coordinateRows[0] as ConversationTurn | undefined;
     return operationWinner &&
-      metadataOf(operationWinner).unpreparedCancellation !== true
+      !releasedOperationTombstone(metadataOf(operationWinner))
       ? passiveExistingResult(operationWinner, now)
       : null;
   });
@@ -1863,6 +1909,7 @@ async function reserveKnowledgeBaseTurnInTransaction(
     expectedRevision: input.expectedRevision,
     expectedLeafId,
     retryOfTurnId: replacesTurnId,
+    operationInstanceId: input.operationInstanceId,
   });
   const upstreamIdempotencyKey =
     createKnowledgeBaseUpstreamIdempotencyKey(operationKey);
@@ -1942,7 +1989,7 @@ async function reserveKnowledgeBaseTurnInTransaction(
   const byOperation = operationRows[0] as ConversationTurn | undefined;
   if (
     byClient?.status === "cancelled" &&
-    metadataOf(byClient).unpreparedCancellation === true &&
+    releasedOperationTombstone(metadataOf(byClient)) &&
     (!byOperation || byOperation.id !== byClient.id)
   ) {
     // The cancelled row deliberately moved off the canonical operation slot
@@ -4492,6 +4539,438 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
       upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
         createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
       ),
+      status: "cancelled",
+      errorCode: code,
+      errorMessage: message,
+      completedAt: now,
+      leaseExpiresAt: null,
+      metadata: nextMetadata,
+      updatedAt: now,
+    });
+  });
+}
+
+/**
+ * Release a prepared manual Logo continuation when the provider explicitly
+ * rejects task creation before returning any task id. Unlike a transport
+ * timeout, that response proves there is no child task to reconcile. The
+ * build therefore returns to its exact parent presentation and the customer
+ * can immediately choose another file.
+ */
+export async function rejectUnacknowledgedKnowledgeBaseManualLogoTurn(
+  input: {
+    userId: number;
+    buildId: string;
+    buildGeneration: number;
+    turnId: string;
+    clientRequestId: string;
+    leaseToken: string;
+    code: string;
+    message: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const buildId = normalizeRequiredId(input.buildId, "buildId", 36);
+  assertInteger(input.buildGeneration, "buildGeneration", 1);
+  const code = normalizeRequiredId(input.code, "cancellation code", 128);
+  const message = String(input.message || "")
+    .trim()
+    .slice(0, 10_000);
+  if (!message) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Cancellation message is required",
+    );
+  }
+  return db.transaction(async (tx: any) => {
+    const build = (
+      await tx
+        .select()
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, buildId),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+            eq(knowledgeBaseBuilds.generation, input.buildGeneration),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as KnowledgeBaseBuild | undefined;
+    const turn = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, input.turnId),
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, buildId),
+            eq(conversationTurns.buildGeneration, input.buildGeneration),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as ConversationTurn | undefined;
+    if (!build || !turn) {
+      throw new KnowledgeBaseTurnReservationError(
+        "RESERVATION_NOT_FOUND",
+        "The unacknowledged manual Logo turn was not found",
+      );
+    }
+    const metadata = metadataOf(turn);
+    if (
+      turn.status === "cancelled" &&
+      metadata.unacknowledgedManualLogoCancellation === true
+    ) {
+      if (
+        turn.clientRequestId === input.clientRequestId &&
+        turn.errorCode === code &&
+        turn.errorMessage === message &&
+        metadata.unacknowledgedManualLogoCancellationAuthorityHash ===
+          leaseOwnerHash(input.leaseToken)
+      ) {
+        return turnRecord(turn);
+      }
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The unacknowledged manual Logo turn was already cancelled by another request",
+      );
+    }
+
+    const recovery = retryAuthorityRecord(metadata.recovery);
+    const stagedUpload = retryAuthorityRecord(recovery?.officialLogoUpload);
+    const preparedDispatch = metadata.preparedDispatch;
+    const parentTaskId = normalizeRequiredId(
+      String(recovery?.parentTaskId || ""),
+      "manual Logo parentTaskId",
+      255,
+    );
+    if (
+      turn.clientRequestId !== input.clientRequestId ||
+      build.activeTurnId !== turn.id ||
+      metadata.leaseOwnerHash !== leaseOwnerHash(input.leaseToken) ||
+      recovery?.kind !== "turn" ||
+      recovery?.manualLogoSubmission !== true ||
+      !stagedUpload ||
+      stagedUpload.verified !== false ||
+      metadata.attachmentsFrozen !== true ||
+      !preparedDispatch ||
+      preparedDispatch.requestBody.taskId !== parentTaskId ||
+      (turn.status !== "queued" && turn.status !== "running") ||
+      Boolean(turn.upstreamTaskId) ||
+      build.upstreamTaskId !== parentTaskId ||
+      build.skillVersion !== "4" ||
+      build.status !== "confirming" ||
+      build.revision !== turn.expectedRevision ||
+      (build.currentLeafId ?? null) !== (turn.expectedLeafId ?? null) ||
+      (typeof metadata.expectedPresentationKey === "string" &&
+        build.currentPresentationKey !== metadata.expectedPresentationKey) ||
+      build.confirmedCount !== 0 ||
+      build.directPrefilledCount !== 0
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Only an unacknowledged active manual Logo turn can be cancelled",
+      );
+    }
+
+    const now = input.now ?? new Date();
+    const {
+      leaseOwnerHash: _leaseOwnerHash,
+      dispatchingAt: _dispatchingAt,
+      outcomeUnknownAt: _outcomeUnknownAt,
+      outcomeUnknownCode: _outcomeUnknownCode,
+      ...metadataWithoutLease
+    } = metadata;
+    const cancelledOperationKey = normalizeRequiredId(
+      String(turn.operationKey || ""),
+      "manual Logo operationKey",
+      128,
+    );
+    const tombstoneOperationKey = createHash("sha256")
+      .update(
+        `frontmind-kb-unacknowledged-manual-logo-cancellation:${turn.id}:${cancelledOperationKey}`,
+        "utf8",
+      )
+      .digest("hex");
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadataWithoutLease,
+      unacknowledgedManualLogoCancellation: true,
+      unacknowledgedManualLogoCancellationAuthorityHash:
+        metadata.leaseOwnerHash,
+      cancelledOperationKey,
+    };
+    const tombstoneIdempotencyKeyHash = hashKnowledgeBaseUpstreamIdempotencyKey(
+      createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
+    );
+
+    await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        upstreamTaskId: parentTaskId,
+        status: "confirming",
+        stateEpoch: build.stateEpoch + 1,
+        activeTurnId: null,
+        awaitingResponseSince: null,
+        protocolErrorCode: null,
+        protocolError: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          eq(knowledgeBaseBuilds.upstreamTaskId, parentTaskId),
+        ),
+      );
+    await tx
+      .update(conversationTurns)
+      .set({
+        operationKey: tombstoneOperationKey,
+        upstreamIdempotencyKeyHash: tombstoneIdempotencyKeyHash,
+        status: "cancelled",
+        errorCode: code,
+        errorMessage: message,
+        completedAt: now,
+        leaseExpiresAt: null,
+        metadata: nextMetadata,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    await markKnowledgeBaseConversationAwaitingInputInTransaction({
+      tx,
+      userId: input.userId,
+      conversationId: turn.conversationId,
+      authoritativeTaskId: parentTaskId,
+      updatedAt: now,
+    });
+    return turnRecord({
+      ...turn,
+      operationKey: tombstoneOperationKey,
+      upstreamIdempotencyKeyHash: tombstoneIdempotencyKeyHash,
+      status: "cancelled",
+      errorCode: code,
+      errorMessage: message,
+      completedAt: now,
+      leaseExpiresAt: null,
+      metadata: nextMetadata,
+      updatedAt: now,
+    });
+  });
+}
+
+/**
+ * Reject a manual Logo continuation after the provider returned a real task id
+ * but before the uploaded bytes were promoted into the build Logo slot. The
+ * child task remains on the cancelled turn for audit; the build resumes from
+ * its exact parent task and unchanged first-leaf presentation.
+ */
+export async function rejectAcknowledgedKnowledgeBaseManualLogoTurn(
+  input: {
+    userId: number;
+    buildId: string;
+    buildGeneration: number;
+    turnId: string;
+    clientRequestId: string;
+    leaseToken: string;
+    code:
+      | "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID"
+      | "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT";
+    message: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const buildId = normalizeRequiredId(input.buildId, "buildId", 36);
+  assertInteger(input.buildGeneration, "buildGeneration", 1);
+  const code = normalizeRequiredId(input.code, "cancellation code", 128);
+  const message = String(input.message || "")
+    .trim()
+    .slice(0, 10_000);
+  if (!message) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Cancellation message is required",
+    );
+  }
+  return db.transaction(async (tx: any) => {
+    // Keep the same build -> turn lock order used by reservation. A new Logo
+    // request can race this rollback without deadlocking or clearing a newer
+    // authoritative turn.
+    const build = (
+      await tx
+        .select()
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, buildId),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+            eq(knowledgeBaseBuilds.generation, input.buildGeneration),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as KnowledgeBaseBuild | undefined;
+    const turn = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, input.turnId),
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, buildId),
+            eq(conversationTurns.buildGeneration, input.buildGeneration),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as ConversationTurn | undefined;
+    if (!build || !turn) {
+      throw new KnowledgeBaseTurnReservationError(
+        "RESERVATION_NOT_FOUND",
+        "The acknowledged manual Logo turn was not found",
+      );
+    }
+    const metadata = metadataOf(turn);
+    if (
+      turn.status === "cancelled" &&
+      metadata.acknowledgedManualLogoCancellation === true
+    ) {
+      if (
+        turn.clientRequestId === input.clientRequestId &&
+        turn.errorCode === code &&
+        turn.errorMessage === message &&
+        metadata.acknowledgedManualLogoCancellationAuthorityHash ===
+          leaseOwnerHash(input.leaseToken)
+      ) {
+        return turnRecord(turn);
+      }
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The acknowledged manual Logo turn was already cancelled by another request",
+      );
+    }
+
+    const recovery = retryAuthorityRecord(metadata.recovery);
+    const promotedUpload = retryAuthorityRecord(recovery?.officialLogoUpload);
+    const preparedDispatch = metadata.preparedDispatch;
+    const parentTaskId = normalizeRequiredId(
+      String(recovery?.parentTaskId || ""),
+      "manual Logo parentTaskId",
+      255,
+    );
+    if (
+      turn.clientRequestId !== input.clientRequestId ||
+      build.activeTurnId !== turn.id ||
+      metadata.leaseOwnerHash !== leaseOwnerHash(input.leaseToken) ||
+      recovery?.kind !== "turn" ||
+      recovery?.manualLogoSubmission !== true ||
+      !promotedUpload ||
+      promotedUpload.verified !== false ||
+      metadata.attachmentsFrozen !== true ||
+      !preparedDispatch ||
+      preparedDispatch.requestBody.taskId !== parentTaskId ||
+      turn.status !== "running" ||
+      !turn.upstreamTaskId ||
+      parentTaskId === turn.upstreamTaskId ||
+      build.upstreamTaskId !== turn.upstreamTaskId ||
+      build.skillVersion !== "4" ||
+      build.status !== "confirming" ||
+      build.revision !== turn.expectedRevision ||
+      (build.currentLeafId ?? null) !== (turn.expectedLeafId ?? null) ||
+      (typeof metadata.expectedPresentationKey === "string" &&
+        build.currentPresentationKey !== metadata.expectedPresentationKey) ||
+      build.confirmedCount !== 0 ||
+      build.directPrefilledCount !== 0
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Only an acknowledged active manual Logo turn can be cancelled",
+      );
+    }
+
+    const now = input.now ?? new Date();
+    const {
+      leaseOwnerHash: _leaseOwnerHash,
+      dispatchingAt: _dispatchingAt,
+      outcomeUnknownAt: _outcomeUnknownAt,
+      outcomeUnknownCode: _outcomeUnknownCode,
+      ...metadataWithoutLease
+    } = metadata;
+    const cancelledOperationKey = normalizeRequiredId(
+      String(turn.operationKey || ""),
+      "manual Logo operationKey",
+      128,
+    );
+    const tombstoneOperationKey = createHash("sha256")
+      .update(
+        `frontmind-kb-acknowledged-manual-logo-cancellation:${turn.id}:${cancelledOperationKey}`,
+        "utf8",
+      )
+      .digest("hex");
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadataWithoutLease,
+      acknowledgedManualLogoCancellation: true,
+      acknowledgedManualLogoCancellationAuthorityHash: metadata.leaseOwnerHash,
+      cancelledOperationKey,
+    };
+    const tombstoneIdempotencyKeyHash = hashKnowledgeBaseUpstreamIdempotencyKey(
+      createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
+    );
+
+    await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        upstreamTaskId: parentTaskId,
+        status: "confirming",
+        stateEpoch: build.stateEpoch + 1,
+        activeTurnId: null,
+        awaitingResponseSince: null,
+        protocolErrorCode: null,
+        protocolError: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          eq(knowledgeBaseBuilds.upstreamTaskId, turn.upstreamTaskId),
+        ),
+      );
+    await tx
+      .update(conversationTurns)
+      .set({
+        operationKey: tombstoneOperationKey,
+        upstreamIdempotencyKeyHash: tombstoneIdempotencyKeyHash,
+        status: "cancelled",
+        errorCode: code,
+        errorMessage: message,
+        completedAt: now,
+        leaseExpiresAt: null,
+        metadata: nextMetadata,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    await markKnowledgeBaseConversationAwaitingInputInTransaction({
+      tx,
+      userId: input.userId,
+      conversationId: turn.conversationId,
+      authoritativeTaskId: parentTaskId,
+      updatedAt: now,
+    });
+    return turnRecord({
+      ...turn,
+      operationKey: tombstoneOperationKey,
+      upstreamIdempotencyKeyHash: tombstoneIdempotencyKeyHash,
       status: "cancelled",
       errorCode: code,
       errorMessage: message,

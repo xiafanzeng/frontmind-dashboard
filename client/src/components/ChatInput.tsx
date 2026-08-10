@@ -691,7 +691,7 @@ export default function ChatInput({
                         )}
                         {officialLogoRequired
                           ? isSending || isUploading
-                            ? "正在发送至 Manus"
+                            ? "正在发送至 FrontMind"
                             : files.length === 1
                               ? "使用此图并继续"
                               : "选择 Logo 原图"
@@ -708,7 +708,7 @@ export default function ChatInput({
                     )}
                   >
                     {officialLogoRequired
-                      ? "Logo 提交轮不会推进节点；Manus 接收后会重新呈现当前节点。"
+                      ? "Logo 提交轮不会推进节点；FrontMind 接收后会重新呈现当前节点。"
                       : "如需修改，请在下方输入意见或上传资料；建议尽量上传与当前部分相关的补充图片，以丰富知识库内容。系统返回修订稿后，再确认当前内容。"}
                   </p>
                 </>
@@ -730,7 +730,7 @@ export default function ChatInput({
                 <span className="text-xs text-muted-foreground">
                   {officialLogoRequired
                     ? uploadProgress.phase === "verifying"
-                      ? "文件已上传，正在发送至 Manus"
+                      ? "文件已上传，正在发送至 FrontMind"
                       : "正在上传 Logo"
                     : uploadProgress.phase === "verifying"
                       ? "正在校验并提交"

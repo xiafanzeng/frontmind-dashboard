@@ -7,7 +7,6 @@ import {
   CircleUserRound,
   Clock3,
   Database,
-  FileClock,
   KeyRound,
   Loader2,
   LockKeyhole,
@@ -923,7 +922,6 @@ export function ServiceLockedPage({
   title,
   access,
   portal,
-  historyAction,
   onRefresh,
   onOpenAccount,
   onNavigate,
@@ -931,10 +929,6 @@ export function ServiceLockedPage({
   title: string;
   access: ServiceCapability;
   portal: ServicePortalView;
-  historyAction?: {
-    label?: string;
-    onClick: () => void;
-  };
   onRefresh?: () => void;
   onOpenAccount?: () => void;
   onNavigate?: (section: string, sub?: string | null) => void;
@@ -978,16 +972,6 @@ export function ServiceLockedPage({
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            {historyAction && (
-              <Button
-                type="button"
-                variant="outline"
-                onClick={historyAction.onClick}
-              >
-                <FileClock className="h-4 w-4" />
-                {historyAction.label || "需求记录"}
-              </Button>
-            )}
             {!pending && (
               <Button variant="outline" onClick={onOpenAccount}>
                 <Settings2 className="h-4 w-4" />

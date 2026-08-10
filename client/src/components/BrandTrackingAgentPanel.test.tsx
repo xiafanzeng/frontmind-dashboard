@@ -245,9 +245,29 @@ describe("BrandTrackingAgentPanel", () => {
     expect(screen.getByText("持续对话")).toBeInTheDocument();
     expect(screen.getByText("趋势分析")).toBeInTheDocument();
     expect(screen.getByText("信源核验")).toBeInTheDocument();
-    expect(screen.getByText("10,000积分")).toBeInTheDocument();
+    expect(screen.getByText("10,000")).toBeInTheDocument();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain("近期的品牌评价");
+  });
+
+  it("omits the unit only from the three rolling usage statistics", () => {
+    render(<BrandTrackingAgentPanel brandName="示例品牌" />);
+
+    expect(screen.getByText("积分上限").nextElementSibling).toHaveTextContent(
+      /^10,000$/u,
+    );
+    expect(screen.getByText("已使用").nextElementSibling).toHaveTextContent(
+      /^1,250$/u,
+    );
+    expect(screen.getByText("剩余").nextElementSibling).toHaveTextContent(
+      /^8,750$/u,
+    );
+    expect(screen.getByLabelText("滚动30天品牌追踪剩余额度")).toHaveTextContent(
+      "剩余 8,750积分",
+    );
+    expect(screen.getByText("账号累计积分").parentElement).toHaveTextContent(
+      "账号累计积分4,875积分",
+    );
   });
 
   it("opens a fieldless confirmation and streams the hidden-start response once", async () => {
@@ -647,7 +667,7 @@ describe("BrandTrackingAgentPanel", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "已达到滚动 30 天积分上限",
     );
-    expect(screen.getByText("10,125积分")).toBeInTheDocument();
+    expect(screen.getByText("10,125")).toBeInTheDocument();
     expect(screen.getByText("已超出上限 125积分")).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/\$|美元|费用/u);
     expect(fetchMock).not.toHaveBeenCalled();

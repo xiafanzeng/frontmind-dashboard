@@ -31,7 +31,14 @@ describe("brand tracking credit conversion", () => {
     expect(formatBrandTrackingCredits("0.39200000")).toBe("392积分");
     expect(formatBrandTrackingCredits("1.00000001")).toBe("1,000.00001积分");
     expect(formatBrandTrackingCredits("-0.00500000")).toBe("-5积分");
+    expect(
+      formatBrandTrackingCredits("10.00000000", { includeUnit: false }),
+    ).toBe("10,000");
+    expect(
+      formatBrandTrackingCredits("1.00000001", { includeUnit: false }),
+    ).toBe("1,000.00001");
     expect(formatBrandTrackingCredits(null)).toBe("—");
+    expect(formatBrandTrackingCredits(null, { includeUnit: false })).toBe("—");
     expect(formatBrandTrackingCredits("invalid")).toBe("—");
   });
 

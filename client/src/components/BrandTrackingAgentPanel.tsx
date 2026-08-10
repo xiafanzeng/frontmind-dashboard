@@ -1056,7 +1056,9 @@ export default function BrandTrackingAgentPanel({
                   <div className="rounded-xl bg-[#faf8fc] px-2 py-3">
                     <dt className="text-[11px] text-[#82758f]">积分上限</dt>
                     <dd className="mt-1 text-sm font-semibold text-[#30273a]">
-                      {formatBrandTrackingCredits(overview.usage.limit)}
+                      {formatBrandTrackingCredits(overview.usage.limit, {
+                        includeUnit: false,
+                      })}
                     </dd>
                   </div>
                   <div className="rounded-xl bg-[#faf8fc] px-2 py-3">
@@ -1064,13 +1066,16 @@ export default function BrandTrackingAgentPanel({
                     <dd className="mt-1 text-sm font-semibold text-[#30273a]">
                       {formatBrandTrackingCredits(
                         overview.usage.rolling30DayCost,
+                        { includeUnit: false },
                       )}
                     </dd>
                   </div>
                   <div className="rounded-xl bg-[#f4eff8] px-2 py-3">
                     <dt className="text-[11px] text-[#765b87]">剩余</dt>
                     <dd className="mt-1 text-sm font-semibold text-[#5b2a86]">
-                      {formatBrandTrackingCredits(overview.usage.remaining)}
+                      {formatBrandTrackingCredits(overview.usage.remaining, {
+                        includeUnit: false,
+                      })}
                     </dd>
                   </div>
                 </dl>
