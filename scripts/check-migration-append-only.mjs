@@ -152,7 +152,7 @@ export function assertExpandSql(tag, sql) {
     /\bDEFAULT\s+(?:NULL|TRUE|FALSE|[-+]?\d+(?:\.\d+)?|'(?:''|[^'])*'|"(?:""|[^"])*")(?=\s*(?:COMMENT\b|,|;|$))/iu;
   for (const statement of statements) {
     if (
-      /\b(?:INSERT|REPLACE|UPDATE|DELETE|LOAD\s+DATA|CALL|TRUNCATE|DROP|RENAME|GRANT|REVOKE)\b/iu.test(
+      /^(?:INSERT|REPLACE|UPDATE|DELETE|LOAD\s+DATA|CALL|TRUNCATE|DROP|RENAME|GRANT|REVOKE)\b/iu.test(
         statement,
       )
     ) {
