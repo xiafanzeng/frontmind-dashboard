@@ -31,6 +31,7 @@ import {
   dashboardPayloadSchema,
   type DashboardPayload,
 } from "../shared/dashboard";
+import { lockActiveWebsiteProjectLifecycle } from "./website-project-lifecycle";
 import { isExplicitAdminAccessLevel } from "../shared/admin-access";
 import type {
   ServicePortal,
@@ -385,6 +386,11 @@ export async function getDashboardQuestion(userId: number, questionId: string) {
     question: serviceQuestion.question,
     intent: serviceQuestion.intent ?? "",
     summary: serviceQuestion.rationale ?? "",
+    writeScope: {
+      revision: serviceQuestion.revision,
+      contractId: serviceQuestion.contractId,
+      quotaPeriodId: serviceQuestion.quotaPeriodId,
+    },
   };
 }
 
@@ -1090,7 +1096,22 @@ export async function createKnowledgeSnapshot(input: {
   const db = await requireDb();
   const id = input.snapshotId ?? randomUUID();
   const characterCount = knowledgeSnapshotFormalCharacterCount(input.documents);
+  const importProjectBindings = input.importReceiptClaim
+    ? await db
+        .select({ projectId: knowledgeImportReceipts.projectId })
+        .from(knowledgeImportReceipts)
+        .where(
+          eq(knowledgeImportReceipts.id, input.importReceiptClaim.receiptId),
+        )
+        .limit(1)
+    : [];
   await db.transaction(async (tx) => {
+    if (importProjectBindings[0]?.projectId) {
+      await lockActiveWebsiteProjectLifecycle(
+        tx,
+        importProjectBindings[0].projectId,
+      );
+    }
     let publicationUsesArchiveHash = false;
     let publicationStateEpoch: number | null = null;
     const lockedUsers = await tx

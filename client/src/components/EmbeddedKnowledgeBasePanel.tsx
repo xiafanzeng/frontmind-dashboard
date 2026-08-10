@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   Download,
+  FileClock,
   Loader2,
   PanelRightOpen,
   RefreshCw,
@@ -13,6 +14,7 @@ import { toast } from "sonner";
 
 import { useAuth } from "@/_core/hooks/useAuth";
 import KnowledgeBaseProgressPanel from "@/components/KnowledgeBaseProgressPanel";
+import CustomerRequestHistoryDialog from "@/components/CustomerRequestHistoryDialog";
 import KnowledgeBaseViewer, {
   type KnowledgeSnapshotView,
 } from "@/components/KnowledgeBaseViewer";
@@ -98,6 +100,7 @@ export default function EmbeddedKnowledgeBasePanel({
   const [previewProgress, setPreviewProgress] = useState(
     previewData?.progress ?? null,
   );
+  const [requestHistoryOpen, setRequestHistoryOpen] = useState(false);
   const knowledgeQuery = trpc.workspace.knowledge.useQuery(undefined, {
     enabled: !previewMode && user?.role === "user",
     retry: false,
@@ -258,6 +261,17 @@ export default function EmbeddedKnowledgeBasePanel({
               unavailableReason={resetQuery.data?.unavailableReason ?? null}
             />
           )}
+          {!previewMode && (
+            <Button
+              type="button"
+              variant="outline"
+              className="w-fit shrink-0"
+              onClick={() => setRequestHistoryOpen(true)}
+            >
+              <FileClock className="h-4 w-4" />
+              需求记录
+            </Button>
+          )}
           {page === "display" &&
             displayedSnapshot &&
             archiveDownloadAvailable && (
@@ -272,6 +286,17 @@ export default function EmbeddedKnowledgeBasePanel({
             )}
         </div>
       </header>
+
+      <CustomerRequestHistoryDialog
+        open={requestHistoryOpen}
+        onOpenChange={setRequestHistoryOpen}
+        title="知识库需求记录"
+        description="知识库重置申请与已发布知识库维护需求统一显示在这里。"
+        surface="knowledge_management"
+        preview={previewMode}
+        {...(previewMode ? { tickets: [] } : {})}
+        emptyText="暂无知识库重置或维护需求。"
+      />
 
       {page === "display" ? (
         <div
@@ -319,7 +344,7 @@ export default function EmbeddedKnowledgeBasePanel({
             <Loader2 className="mx-auto h-7 w-7 animate-spin text-primary" />
             <p className="mt-4 font-medium">知识库重置申请正在审批</p>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              工单 {resetQuery.data.pending?.ticketId} 已由
+              需求 {resetQuery.data.pending?.ticketId} 已由
               {resetQuery.data.pending?.engineerName}{" "}
               负责。审批期间不能继续回复、上传、发布或启动新构建。
             </p>
@@ -502,7 +527,7 @@ function ManualKnowledgeUpdateButton({
     }
     if (
       !window.confirm(
-        "这是唯一一次直接更新。更新成功后当前会话和更新入口将永久锁定；后续修改需要提交维护工单。确认现在更新吗？",
+        "这是唯一一次直接更新。更新成功后当前会话和更新入口将永久锁定；后续修改需要提交维护需求。确认现在更新吗？",
       )
     ) {
       return;
@@ -546,7 +571,7 @@ function ManualKnowledgeUpdateButton({
     <div className="flex flex-col items-start gap-2">
       <p className="max-w-full whitespace-nowrap text-xs leading-5 text-amber-700">
         知识库已达到
-        100%：这是唯一一次直接更新；更新成功后当前会话和入口将锁定，后续修改需提交维护工单。
+        100%：这是唯一一次直接更新；更新成功后当前会话和入口将锁定，后续修改需提交维护需求。
       </p>
       <Button
         className="w-fit shrink-0 bg-[#5b2a86] hover:bg-[#49216c]"
@@ -591,7 +616,7 @@ function KnowledgeMaintenanceTicketButton({
         type: "website_operation",
         category: "knowledge_base_maintenance",
         topic: "已发布知识库维护",
-        title: "知识库维护工单",
+        title: "知识库维护需求",
         description: request,
         knowledgeSnapshotId: snapshotId,
         materialUrls: [],
@@ -599,11 +624,11 @@ function KnowledgeMaintenanceTicketButton({
       });
       setDescription("");
       setOpen(false);
-      toast.success("知识库维护工单已提交", {
-        description: "服务团队会在工单中处理后续知识库更新。",
+      toast.success("知识库维护需求已提交", {
+        description: "服务团队会在需求中处理后续知识库更新。",
       });
     } catch (error) {
-      toast.error("维护工单提交失败", {
+      toast.error("维护需求提交失败", {
         description: error instanceof Error ? error.message : "请稍后重试",
       });
     }
@@ -618,7 +643,7 @@ function KnowledgeMaintenanceTicketButton({
           onClick={() => enabled && setOpen(true)}
         >
           <Wrench className="h-4 w-4" />
-          提交维护工单
+          提交维护需求
         </Button>
         {!enabled && (
           <p className="text-xs leading-5 text-amber-700">
@@ -632,7 +657,7 @@ function KnowledgeMaintenanceTicketButton({
       >
         <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>提交知识库维护工单</DialogTitle>
+            <DialogTitle>提交知识库维护需求</DialogTitle>
             <DialogDescription>
               当前知识库已锁定。请说明需要补充、修订或替换的内容，服务团队将基于已发布版本处理。
             </DialogDescription>
@@ -657,7 +682,7 @@ function KnowledgeMaintenanceTicketButton({
               {createMutation.isPending && (
                 <Loader2 className="h-4 w-4 animate-spin" />
               )}
-              提交工单
+              提交需求
             </Button>
           </DialogFooter>
         </DialogContent>

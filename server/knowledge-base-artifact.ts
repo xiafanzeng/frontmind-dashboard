@@ -259,6 +259,22 @@ function resourceProjectionFromTypedValue(
   };
 }
 
+function isKnowledgeBaseImageResourceProjection(value: unknown) {
+  const item = asObject(value);
+  if (!item) return false;
+  const type = String(item.type ?? "")
+    .trim()
+    .toLowerCase();
+  const mimeType = String(
+    item.mimeType ?? item.mime_type ?? item.content_type ?? "",
+  )
+    .trim()
+    .toLowerCase();
+  return (
+    type === "output_image" || type === "image" || mimeType.startsWith("image/")
+  );
+}
+
 /**
  * Enumerates only provider resource projections at the same trust boundary as
  * the ZIP and image collectors: direct assistant output items and direct
@@ -267,6 +283,9 @@ function resourceProjectionFromTypedValue(
  */
 export function collectKnowledgeBaseOutputResourceProjections(
   output: unknown,
+  options: {
+    ignoreInvalidImageProjections?: boolean;
+  } = {},
 ): KnowledgeBaseOutputResourceProjection[] {
   if (!Array.isArray(output)) return [];
   const projections: KnowledgeBaseOutputResourceProjection[] = [];
@@ -294,10 +313,21 @@ export function collectKnowledgeBaseOutputResourceProjections(
     let resolvedParentId: string | undefined;
     const parentId = () =>
       (resolvedParentId ??= knowledgeBaseParentOutputItemId(item, outputIndex));
-    const topLevel =
-      !role || role === "assistant"
-        ? resourceProjectionFromTypedValue(item, parentId)
-        : null;
+    let topLevel: KnowledgeBaseOutputResourceProjection | null = null;
+    try {
+      topLevel =
+        !role || role === "assistant"
+          ? resourceProjectionFromTypedValue(item, parentId)
+          : null;
+    } catch (error) {
+      if (
+        !(error instanceof KnowledgeBaseArtifactIdentityError) ||
+        !options.ignoreInvalidImageProjections ||
+        !isKnowledgeBaseImageResourceProjection(item)
+      ) {
+        throw error;
+      }
+    }
     if (topLevel) projections.push(topLevel);
 
     if (
@@ -312,10 +342,21 @@ export function collectKnowledgeBaseOutputResourceProjections(
       contentIndex < item.content.length;
       contentIndex += 1
     ) {
-      const projection = resourceProjectionFromTypedValue(
-        item.content[contentIndex],
-        () => knowledgeBaseChildOutputItemId(parentId(), contentIndex),
-      );
+      let projection: KnowledgeBaseOutputResourceProjection | null = null;
+      try {
+        projection = resourceProjectionFromTypedValue(
+          item.content[contentIndex],
+          () => knowledgeBaseChildOutputItemId(parentId(), contentIndex),
+        );
+      } catch (error) {
+        if (
+          !(error instanceof KnowledgeBaseArtifactIdentityError) ||
+          !options.ignoreInvalidImageProjections ||
+          !isKnowledgeBaseImageResourceProjection(item.content[contentIndex])
+        ) {
+          throw error;
+        }
+      }
       if (projection) projections.push(projection);
     }
   }

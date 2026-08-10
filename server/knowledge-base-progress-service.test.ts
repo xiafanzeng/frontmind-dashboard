@@ -7,6 +7,7 @@ import {
   assertKnowledgeBaseUpstreamTaskIdentity,
   advanceKnowledgeBaseProtocolFailureObservation,
   classifyKnowledgeBaseUserAction,
+  collectKnowledgeBaseInitialOutputImageDescriptors,
   collectKnowledgeBaseOutputImageKeys,
   collectKnowledgeBaseOutputImageResourceAliases,
   collectTrustedKnowledgeBaseOutputImageDescriptors,
@@ -18,12 +19,16 @@ import {
   knowledgeBaseObservationConversationStorageId,
   knowledgeBaseProtocolErrorAllowsSameTaskRecovery,
   knowledgeBaseProtocolErrorIsRetryable,
+  knowledgeBaseRejectedInitialLogoMatchesAuthority,
   knowledgeBaseStagedArtifactMatchesAuthority,
   knowledgeBaseSuccessfulTurnIdentity,
   projectKnowledgeBasePresentationMarkdown,
   selectKnowledgeBaseProtocolOperationOutput,
 } from "./knowledge-base-progress-service";
-import type { KnowledgeBaseStagedArtifactCandidate } from "./knowledge-base-artifact-binding-service";
+import type {
+  KnowledgeBaseRejectedInitialLogoDisposition,
+  KnowledgeBaseStagedArtifactCandidate,
+} from "./knowledge-base-artifact-binding-service";
 import {
   formatKnowledgeBasePresentationEnvelope,
   formatKnowledgeBaseProgressEnvelope,
@@ -1067,6 +1072,88 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     ).toThrow("必须只展示一张企业官方主 Logo");
   });
 
+  it("discards only a server-rejected typed Logo while retaining text safety checks", () => {
+    const rejectedImage = {
+      type: "output_image",
+      file_id: "invalid-logo",
+      file_name: "logo.png",
+    };
+    expect(
+      assertKnowledgeBaseInitialImageDelivery(
+        [
+          { role: "assistant", type: "message", content: "1.1 正文" },
+          rejectedImage,
+        ],
+        undefined,
+        { allowMissing: true, discardRejectedImages: true },
+      ),
+    ).toBe(0);
+    expect(() =>
+      assertKnowledgeBaseInitialImageDelivery(
+        [
+          {
+            role: "assistant",
+            type: "message",
+            content: "![inline](https://example.com/logo.png)",
+          },
+          rejectedImage,
+        ],
+        undefined,
+        { allowMissing: true, discardRejectedImages: true },
+      ),
+    ).toThrow("不得包含 Markdown、HTML 或 data URL 图片");
+  });
+
+  it("discards a conflicting typed Logo identity only with its explicit rejection", () => {
+    const conflictingIdentityOutput = [
+      {
+        role: "assistant",
+        type: "output_message",
+        content: [
+          {
+            type: "output_image",
+            file_id: "file-logo-a",
+            file_url: "https://api.example/v1/files/file-logo-b/content",
+            file_name: "logo.png",
+            mime_type: "image/png",
+          },
+        ],
+      },
+    ];
+    const rejectedLogo: KnowledgeBaseRejectedInitialLogoDisposition = {
+      rejected: true,
+      kind: "logo",
+      userId: 42,
+      buildId: "build-logo-identity",
+      generation: 1,
+      turnId: "turn-logo-identity",
+      operationKey: "operation-logo-identity",
+      taskId: "task-logo-identity",
+      expectedStateEpoch: 2,
+      expectedRevision: 0,
+      descriptorHashes: [],
+      rejectionCode: "LOGO_UPLOAD_INVALID",
+    };
+
+    expect(() =>
+      collectKnowledgeBaseInitialOutputImageDescriptors(
+        conflictingIdentityOutput,
+      ),
+    ).toThrow("相互冲突");
+    expect(
+      collectKnowledgeBaseInitialOutputImageDescriptors(
+        conflictingIdentityOutput,
+        rejectedLogo,
+      ),
+    ).toEqual([]);
+    expect(() =>
+      collectKnowledgeBaseInitialOutputImageDescriptors(
+        conflictingIdentityOutput,
+        { ...rejectedLogo, rejectionCode: "ARTIFACT_DOWNLOAD_FAILED" },
+      ),
+    ).toThrow("相互冲突");
+  });
+
   it("does not count an earlier turn's image in the current presentation", () => {
     expect(() =>
       assertKnowledgeBaseNodeImageDelivery({
@@ -1188,6 +1275,55 @@ describe("knowledge-base staged artifact authority", () => {
     mimeType: "application/zip",
     packageRevision: 8,
   };
+
+  const rejectedLogo: KnowledgeBaseRejectedInitialLogoDisposition = {
+    rejected: true,
+    kind: "logo",
+    userId: 42,
+    buildId: candidate.buildId,
+    generation: candidate.generation,
+    turnId: candidate.turnId,
+    operationKey: candidate.operationKey,
+    taskId: candidate.taskId,
+    expectedStateEpoch: candidate.expectedStateEpoch,
+    expectedRevision: candidate.expectedRevision,
+    descriptorHashes: ["d".repeat(64)],
+    rejectionCode: "LOGO_UPLOAD_INVALID",
+  };
+
+  it("accepts a rejected Logo disposition only for its exact authority and output", () => {
+    const build = {
+      id: candidate.buildId,
+      generation: candidate.generation,
+      stateEpoch: candidate.expectedStateEpoch,
+      revision: candidate.expectedRevision,
+      activeTurnId: candidate.turnId,
+      upstreamTaskId: candidate.taskId,
+    };
+    const activeTurn = {
+      id: candidate.turnId,
+      operationKey: candidate.operationKey,
+      upstreamTaskId: candidate.taskId,
+      status: "running" as const,
+    };
+    const matches = (overrides: Record<string, unknown> = {}) =>
+      knowledgeBaseRejectedInitialLogoMatchesAuthority({
+        disposition: rejectedLogo,
+        userId: 42,
+        build,
+        activeTurn,
+        taskId: candidate.taskId,
+        descriptorHashes: ["d".repeat(64)],
+        ...overrides,
+      });
+
+    expect(matches()).toBe(true);
+    expect(matches({ descriptorHashes: ["e".repeat(64)] })).toBe(false);
+    expect(matches({ build: { ...build, stateEpoch: 10 } })).toBe(false);
+    expect(matches({ activeTurn: { ...activeTurn, status: "failed" } })).toBe(
+      false,
+    );
+  });
 
   it("accepts only the exact active operation that staged the bytes", () => {
     expect(

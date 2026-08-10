@@ -20,18 +20,51 @@ import {
   extractFinalResponseLogicAssistantReply,
   normalizeResponseLogicTaskStatus,
   parseCompletedResponseLogicTask,
+  parseCompletedResponseLogicTaskWithFileFallback,
   publicResponseLogicTask,
   responseLogicEvidenceAttachmentFilename,
   responseLogicRecordMatchesConfiguredQuestion,
+  responseLogicTextOutputDescriptor,
   responseLogicTurnInputAttachmentFilename,
 } from "./response-logic-api";
 import { assertResponseLogicDraftPublishable } from "./response-logic-service";
+import {
+  normalizeResponseLogicPublicProvenance,
+  projectResponseLogicAssistantMarkdown,
+} from "@shared/response-logic";
 import {
   FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
   upstreamPromptCharacterCount,
 } from "./upstream-prompt-budget";
 
 const validStructuredReply = `## 用户真实关心
+采购方需要判断方案是否可信。
+
+## 核心结论/执行口径
+先给出结论，再按证据解释。
+
+## 企业材料/官方依据
+- 企业知识库 V3
+
+## 回答边界/禁止表达
+- 不使用绝对化排名`;
+
+const legacyFiveStructuredReply = `## 用户真实关心
+采购方需要判断方案是否可信。
+
+## 核心结论/执行口径
+先给出结论，再按证据解释。
+
+## 企业材料/官方依据
+- 企业知识库 V3
+
+## 回答边界/禁止表达
+- 不使用绝对化排名
+
+## 引用与核验规则
+引自知识库文档。`;
+
+const legacyStructuredReply = `## 用户真实关心
 采购方需要判断方案是否可信。
 
 ## 核心结论/执行口径
@@ -51,6 +84,25 @@ const validStructuredReply = `## 用户真实关心
 
 ## 本轮确认
 请确认案例是否可公开。`;
+
+const siliconFlowStructuredReply = `## 用户真实关心
+
+用户希望了解硅基流动的核心产品线、服务形态和适用客群。
+
+## 核心结论/执行口径
+
+核心产品体系围绕公有云服务和本地部署解决方案构建。
+
+## 企业材料/官方依据
+
+- 产品体系总览（来源路径：硅基流动*knowledge\_base/branches/products\_products/3.1*.md）——公有云与本地部署两类产品。
+- 客户附件：images.jpeg 已纳入图文依据。
+- 知识库版本：V1，来源文件：FINAL.zip
+- 引用文档：products_products/00_overview.md、products_products/3.1_.md
+
+## 回答边界/禁止表达
+
+- 不承诺可能变化的绝对价格`;
 
 describe("response logic execution contract", () => {
   afterEach(() => {
@@ -193,6 +245,12 @@ describe("response logic execution contract", () => {
       "SKILL.md",
       "references/output-contract.md",
     ]);
+    expect(await skillZip.file("SKILL.md")!.async("string")).toContain(
+      "complete four-section Markdown directly in the final assistant",
+    );
+    expect(
+      await skillZip.file("references/output-contract.md")!.async("string"),
+    ).toContain("output file must never be the only copy");
     expect(await evidenceZip.file("knowledge.md")!.async("string")).toContain(
       "这里是已经确认的企业事实",
     );
@@ -227,11 +285,10 @@ describe("response logic execution contract", () => {
           "用户真实关心",
           "核心结论/执行口径",
           "企业材料/官方依据",
-          "待补充/待确认",
           "回答边界/禁止表达",
-          "引用与核验规则",
-          "本轮确认",
         ],
+        publicProvenance: "引自知识库文档。",
+        followUpConfirmationForbidden: true,
       },
     });
 
@@ -421,7 +478,7 @@ describe("response logic execution contract", () => {
     expect(post).not.toHaveBeenCalled();
   });
 
-  it("accepts only a completed Pro assistant reply with all seven ordered sections", () => {
+  it("accepts only a completed Pro assistant reply with all four ordered sections", () => {
     const structured = parseCompletedResponseLogicTask({
       id: "task-1",
       status: "completed",
@@ -441,11 +498,8 @@ describe("response logic execution contract", () => {
     expect(structured).toEqual({
       concern: "采购方需要判断方案是否可信。",
       conclusion: "先给出结论，再按证据解释。",
-      facts: "- 企业知识库 V3",
-      pending: "- 客户案例公开授权",
+      facts: "- 企业知识库文档",
       boundaries: "- 不使用绝对化排名",
-      references: "- 企业事实确认表.pdf",
-      roundConfirmation: "请确认案例是否可公开。",
     });
     expect(
       extractFinalResponseLogicAssistantReply({
@@ -461,7 +515,7 @@ describe("response logic execution contract", () => {
     ).toBe(validStructuredReply);
   });
 
-  it("observes fenced recovery without changing behavior until explicitly active", () => {
+  it("always applies the existing one-pass deterministic fence recovery", () => {
     const task = {
       status: "completed",
       output: [
@@ -474,30 +528,228 @@ describe("response logic execution contract", () => {
     };
     const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
     vi.stubEnv("FRONTMIND_RESPONSE_LOGIC_OUTPUT_REPAIR", "shadow");
-    expect(() => parseCompletedResponseLogicTask(task)).toThrow();
+    expect(parseCompletedResponseLogicTask(task)).toMatchObject({
+      concern: "采购方需要判断方案是否可信。",
+      boundaries: "- 不使用绝对化排名",
+    });
     expect(log).toHaveBeenCalledWith(
       "[Model Output Repair]",
       expect.stringContaining("known_fence_removed"),
     );
+  });
 
-    vi.stubEnv("FRONTMIND_RESPONSE_LOGIC_OUTPUT_REPAIR", "active");
-    expect(parseCompletedResponseLogicTask(task)).toMatchObject({
+  it("removes internal provenance from the user's product response", () => {
+    const structured = parseCompletedResponseLogicTask({
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: siliconFlowStructuredReply,
+        },
+      ],
+    });
+    expect(structured).toMatchObject({
+      concern: "用户希望了解硅基流动的核心产品线、服务形态和适用客群。",
+      conclusion: "核心产品体系围绕公有云服务和本地部署解决方案构建。",
+      facts:
+        "- 产品体系总览（引自知识库文档）——公有云与本地部署两类产品。\n- 客户附件：用户上传图片 已纳入图文依据。",
+    });
+    const serialized = JSON.stringify(structured);
+    expect(serialized).not.toContain("knowledge_base/");
+    expect(serialized).not.toContain(".md");
+    expect(serialized).not.toContain(".zip");
+    expect(serialized).not.toContain("images.jpeg");
+    expect(serialized).not.toContain("来源路径");
+    expect(serialized).not.toContain("来源文件");
+    expect(serialized).not.toContain("引用文档");
+  });
+
+  it("sanitizes every public field without deleting facts after a source marker", () => {
+    const publicDraft = normalizeResponseLogicPublicProvenance({
+      concern: "先查看 FINAL.zip，再判断用户需求。",
+      conclusion: "产品口径见 knowledge_base/products/3.2.md。",
+      facts:
+        "- 来源文件：FINAL.zip；平台支持 **200 个模型**。\n- 产品手册：硅基流动产品介绍.pdf 证明公司拥有五条产品线。\n- 支持 AI/ML、API/SDK 工作负载，同比增长 1.1/2.3。",
+      boundaries:
+        "不要公开 sources/private.json 或 https://example.com/spec.md?rev=1。",
+      references: "引用文档：products/3.2.md",
+    });
+
+    const serialized = JSON.stringify(publicDraft);
+    expect(publicDraft.facts).toContain("平台支持 **200 个模型**");
+    expect(publicDraft.facts).toContain("证明公司拥有五条产品线");
+    expect(publicDraft.facts).toContain(
+      "支持 AI/ML、API/SDK 工作负载，同比增长 1.1/2.3",
+    );
+    expect(publicDraft.references).toBe("");
+    expect(serialized).not.toMatch(
+      /FINAL\.zip|knowledge_base|products\/3\.2\.md|private\.json|example\.com|产品介绍\.pdf/u,
+    );
+  });
+
+  it("projects a legacy assistant bubble to four public sections", () => {
+    const projected = projectResponseLogicAssistantMarkdown(
+      legacyStructuredReply,
+    );
+
+    expect(projected).toContain("## 用户真实关心");
+    expect(projected).not.toContain("引用与核验规则");
+    expect(projected).not.toContain("待补充/待确认");
+    expect(projected).not.toContain("本轮确认");
+    expect(projected).not.toContain("企业事实确认表.pdf");
+  });
+
+  it("accepts the exact legacy five-section shape without retaining references", () => {
+    expect(
+      parseCompletedResponseLogicTask({
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: legacyFiveStructuredReply,
+          },
+        ],
+      }),
+    ).toEqual({
       concern: "采购方需要判断方案是否可信。",
-      roundConfirmation: "请确认案例是否可公开。",
+      conclusion: "先给出结论，再按证据解释。",
+      facts: "- 企业知识库文档",
+      boundaries: "- 不使用绝对化排名",
+    });
+  });
+
+  it("accepts the exact legacy seven-section shape without retaining pending prompts", () => {
+    expect(
+      parseCompletedResponseLogicTask({
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: legacyStructuredReply,
+          },
+        ],
+      }),
+    ).toEqual({
+      concern: "采购方需要判断方案是否可信。",
+      conclusion: "先给出结论，再按证据解释。",
+      facts: "- 企业知识库文档",
+      boundaries: "- 不使用绝对化排名",
+    });
+  });
+
+  it("downloads and parses the only trusted typed Markdown output file", async () => {
+    const task = {
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: "已生成应答逻辑文件。",
+        },
+        {
+          type: "output_file",
+          file_id: "file-response-logic",
+          filename: "用户真实关心.md",
+          mime_type: "text/markdown",
+        },
+      ],
+    };
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: { "content-type": "text/markdown; charset=utf-8" },
+      data: Buffer.from(siliconFlowStructuredReply, "utf8"),
+    });
+
+    expect(responseLogicTextOutputDescriptor(task)).toEqual({
+      fileId: "file-response-logic",
+      filename: "用户真实关心.md",
+      mimeType: "text/markdown",
+    });
+    await expect(
+      parseCompletedResponseLogicTaskWithFileFallback({
+        task,
+        baseUrl: "https://api.example.test/",
+        apiKey: "secret-key",
+      }),
+    ).resolves.toMatchObject({
+      conclusion: "核心产品体系围绕公有云服务和本地部署解决方案构建。",
+    });
+    expect(get).toHaveBeenCalledWith(
+      "https://api.example.test/v1/files/file-response-logic/content",
+      expect.objectContaining({
+        maxRedirects: 0,
+        proxy: false,
+        headers: {
+          API_KEY: "secret-key",
+          Authorization: "Bearer secret-key",
+        },
+      }),
+    );
+  });
+
+  it("does not download untyped, ambiguous or non-assistant output files", () => {
+    const file = {
+      type: "output_file",
+      file_id: "file-one",
+      filename: "logic.md",
+      mime_type: "text/markdown",
+    };
+    expect(
+      responseLogicTextOutputDescriptor({
+        output: [{ ...file, role: "user" }],
+      }),
+    ).toBeNull();
+    expect(
+      responseLogicTextOutputDescriptor({
+        output: [file, { ...file, file_id: "file-two" }],
+      }),
+    ).toBeNull();
+    expect(
+      responseLogicTextOutputDescriptor({
+        output: [{ ...file, mime_type: "application/octet-stream" }],
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps the single typed Markdown fallback when the assistant also returns an image", () => {
+    expect(
+      responseLogicTextOutputDescriptor({
+        output: [
+          {
+            type: "output_image",
+            file_id: "file-image",
+            filename: "product.png",
+            mime_type: "image/png",
+          },
+          {
+            type: "output_file",
+            file_id: "file-logic",
+            filename: "response.md",
+            mime_type: "text/markdown",
+          },
+        ],
+      }),
+    ).toEqual({
+      fileId: "file-logic",
+      filename: "response.md",
+      mimeType: "text/markdown",
     });
   });
 
   it("rejects missing, reordered, duplicate, extra and empty model sections", () => {
     const invalidOutputs = [
-      validStructuredReply.replace(/## 本轮确认[\s\S]*$/, ""),
+      validStructuredReply.replace(/## 回答边界\/禁止表达[\s\S]*$/, ""),
       validStructuredReply.replace(
         "## 核心结论/执行口径",
         "## 企业材料/官方依据",
       ),
       `${validStructuredReply}\n\n## 额外说明\n不允许`,
       validStructuredReply.replace(
-        "## 待补充/待确认\n- 客户案例公开授权",
-        "## 待补充/待确认\n",
+        "## 企业材料/官方依据\n- 企业知识库 V3",
+        "## 企业材料/官方依据\n",
       ),
       `模型前言\n${validStructuredReply}`,
     ];
@@ -584,6 +836,43 @@ describe("response logic execution contract", () => {
         configuredQuestion,
       }),
     ).not.toThrow();
+
+    const releasedRecord = { ...record, lastTaskId: undefined };
+    expect(() =>
+      assertResponseLogicTaskBinding({
+        authenticatedUserId: 7,
+        workspaceUserId: 7,
+        questionId: "question-1",
+        conversationId: "conversation-1",
+        taskId: "task-1",
+        record: releasedRecord,
+        configuredQuestion,
+      }),
+    ).toThrow(ResponseLogicTaskBindingError);
+    expect(() =>
+      assertResponseLogicTaskBinding({
+        authenticatedUserId: 7,
+        workspaceUserId: 7,
+        questionId: "question-1",
+        conversationId: "conversation-1",
+        taskId: "task-1",
+        record: releasedRecord,
+        configuredQuestion,
+        releasedContinuationVerified: true,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertResponseLogicTaskBinding({
+        authenticatedUserId: 7,
+        workspaceUserId: 7,
+        questionId: "question-1",
+        conversationId: "conversation-1",
+        taskId: "task-new",
+        record,
+        configuredQuestion,
+        releasedContinuationVerified: true,
+      }),
+    ).toThrow(ResponseLogicTaskBindingError);
 
     for (const invalid of [
       { workspaceUserId: 8 },
@@ -695,5 +984,20 @@ describe("response logic execution contract", () => {
         attachments: [],
       }),
     ).toThrow("请先补齐以下应答逻辑内容");
+  });
+
+  it("publishes a complete four-section draft without legacy references", () => {
+    expect(() =>
+      assertResponseLogicDraftPublishable({
+        concern: "用户需要判断服务是否适配",
+        conclusion: "先给出可核验结论",
+        facts: "企业事实引自知识库文档",
+        pending: "",
+        boundaries: "不使用绝对化表达",
+        references: "",
+        images: [],
+        attachments: [],
+      }),
+    ).not.toThrow();
   });
 });

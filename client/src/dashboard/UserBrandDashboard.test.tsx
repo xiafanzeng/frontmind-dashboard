@@ -30,15 +30,20 @@ vi.mock("@/components/EmbeddedKnowledgeBasePanel", () => ({
   },
 }));
 
-import { PreviewUserBrandDashboard } from "./UserBrandDashboard";
+vi.mock("@/components/QuestionMaintenanceRequestDialog", () => ({
+  default: () => null,
+}));
+
+import {
+  getRouteRequestHistoryConfig,
+  PreviewUserBrandDashboard,
+} from "./UserBrandDashboard";
 import { userPreviewFixtures } from "@/lib/development-preview-fixtures";
 
 const basicPreviewPortal = userPreviewFixtures.getServicePortal("basic");
 const luxuryPreviewPortal = userPreviewFixtures.getServicePortal("luxury");
 const basicPurchasedQuestion =
   basicPreviewPortal.purchasedQuestions[0]?.question ?? "";
-const firstPreviewKeywordQuestion =
-  userPreviewFixtures.globalKeywordBank.questions[0]?.问题 ?? "";
 const previewQuestionCategoryLabels = Array.from(
   new Set(
     luxuryPreviewPortal.purchasedQuestions.map((question) =>
@@ -80,6 +85,52 @@ describe("UserBrandDashboard service experience", () => {
     setPreviewPlan("basic");
   });
 
+  it.each([
+    [
+      "问题优化",
+      "intent",
+      "question-optimization",
+      "knowledge_base",
+      "question_management",
+    ],
+    [
+      "应答逻辑",
+      "response-logic",
+      "agent",
+      "knowledge_base",
+      "response_logic_management",
+    ],
+    [
+      "知识库构建",
+      "knowledge-agent",
+      "build",
+      undefined,
+      "knowledge_management",
+    ],
+    [
+      "知识库展示",
+      "knowledge-agent",
+      "display",
+      undefined,
+      "knowledge_management",
+    ],
+    [
+      "官网",
+      "semantic",
+      "website-management",
+      "website_operation",
+      "website_management",
+    ],
+    ["内容", "semantic", "content-assets", "content_asset", undefined],
+  ])(
+    "maps the %s request history to its exact server scope",
+    (_label, section, sub, type, surface) => {
+      const config = getRouteRequestHistoryConfig(section, sub);
+      expect(config?.type).toBe(type);
+      expect(config?.surface).toBe(surface);
+    },
+  );
+
   it("opens on a service home and exposes the merged navigation without invented metrics", () => {
     render(<UserBrandDashboard preview />);
 
@@ -91,9 +142,25 @@ describe("UserBrandDashboard service experience", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByLabelText("当前服务版本：普通版")).toBeInTheDocument();
     expect(screen.getByText("已生效 · 30 天单题服务")).toBeInTheDocument();
-    const packageScope = screen.getByText("套餐范围").closest("div");
-    expect(packageScope).toHaveTextContent("已购问题");
-    expect(packageScope).toHaveTextContent("1 个问题");
+    const packageScope = screen.getByTestId("service-plan-scope");
+    expect(
+      within(packageScope)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      "知识库展示",
+      "问题优化",
+      "应答逻辑智能体",
+      "问题监控",
+      "进度报告",
+      "AI 友好内容资产",
+    ]);
+    expect(
+      within(packageScope).queryByText("知识库智能体"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(packageScope).queryByText("已购问题"),
+    ).not.toBeInTheDocument();
 
     for (const item of [
       "服务首页",
@@ -158,6 +225,17 @@ describe("UserBrandDashboard service experience", () => {
     const globalKeywords = screen.getByRole("button", {
       name: "品牌全域词库",
     });
+    const contentAssets = screen.getByRole("button", {
+      name: "内容资产运营",
+    });
+    const websiteManagement = screen.getByRole("button", {
+      name: "AI 友好官网管理",
+    });
+    expect(knowledgeAgent.querySelector("svg")).toBeInTheDocument();
+    expect(globalKeywords.querySelector("svg")).toBeInTheDocument();
+    expect(knowledgeDisplay.querySelector("svg")).not.toBeInTheDocument();
+    expect(contentAssets.querySelector("svg")).not.toBeInTheDocument();
+    expect(websiteManagement.querySelector("svg")).not.toBeInTheDocument();
     expect(
       knowledgeAgent.compareDocumentPosition(knowledgeDisplay) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -267,7 +345,7 @@ describe("UserBrandDashboard service experience", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "选择品牌聚合榜单" }));
     expect(
-      screen.getByRole("heading", { name: "提交内容需求工单" }),
+      screen.getByRole("heading", { name: "提交内容需求" }),
     ).toBeInTheDocument();
     expect(screen.getByText("剩余 1 次")).toBeInTheDocument();
 
@@ -291,14 +369,14 @@ describe("UserBrandDashboard service experience", () => {
     expect(
       screen.getAllByText("阿里云域名注册与 ICP 备案").length,
     ).toBeGreaterThan(0);
-    expect(screen.queryByText("购买域名并提交 AI 运维工单")).toBeNull();
+    expect(screen.queryByText("购买域名并提交 AI 运维需求")).toBeNull();
     expect(screen.queryByText("领取服务码并完成 ICP 备案")).toBeNull();
     expect(screen.queryByText("ICP 备案与主体材料")).not.toBeInTheDocument();
     expect(
       screen.getAllByText("AI专用官网构建与内容运营").length,
     ).toBeGreaterThan(0);
     expect(
-      screen.getByRole("heading", { name: "提交官网内容运营工单" }),
+      screen.getByRole("heading", { name: "提交官网内容运营需求" }),
     ).toBeInTheDocument();
     expect(screen.getByText("企业资料与品牌事实")).toBeInTheDocument();
     expect(screen.queryByText("官网检查项")).not.toBeInTheDocument();
@@ -316,7 +394,7 @@ describe("UserBrandDashboard service experience", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        /普通版已包含官网生成的初步知识库展示，不包含对话式知识库构建/,
+        "普通版不包含知识库智能体；知识库由 Website 流程自动同步至本账号，服务团队可补录。升级进阶版或豪华版后可解锁知识库智能体。",
       ),
     ).toBeInTheDocument();
     expect(
@@ -327,6 +405,12 @@ describe("UserBrandDashboard service experience", () => {
     ).not.toBeInTheDocument();
     expect(embeddedKnowledgeBasePanel).not.toHaveBeenCalled();
 
+    fireEvent.click(screen.getByRole("button", { name: "需求记录" }));
+    expect(
+      screen.getByRole("dialog", { name: "知识库需求记录" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
     fireEvent.click(screen.getByRole("button", { name: "知识库展示" }));
     expect(
       await screen.findByTestId("embedded-knowledge-base-panel"),
@@ -334,6 +418,29 @@ describe("UserBrandDashboard service experience", () => {
     expect(embeddedKnowledgeBasePanel).toHaveBeenCalledWith(
       expect.objectContaining({ preview: true, page: "display" }),
     );
+  });
+
+  it("keeps response-logic request history available with no purchased questions", () => {
+    setPreviewPlan("luxury");
+    render(
+      <PreviewUserBrandDashboard
+        fixtures={{
+          ...userPreviewFixtures,
+          getServicePortal: () => ({
+            ...luxuryPreviewPortal,
+            purchasedQuestions: [],
+          }),
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "应答逻辑智能体" }));
+
+    expect(screen.getByText("暂无已发布内容")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "需求记录" }));
+    expect(
+      screen.getByRole("dialog", { name: "应答逻辑需求记录" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps the user knowledge builder on one conversation without a switcher", () => {
@@ -409,9 +516,33 @@ describe("UserBrandDashboard service experience", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("prefills a brand keyword in problem optimization without consuming quota immediately", () => {
+  it("locks a brand keyword, confirms it, and reflects preview quota usage", async () => {
     setPreviewPlan("luxury");
-    render(<UserBrandDashboard preview />);
+    const novelPreviewKeywordQuestion = "验收企业有哪些全新的落地场景？";
+    render(
+      <PreviewUserBrandDashboard
+        fixtures={{
+          ...userPreviewFixtures,
+          globalKeywordBank: {
+            ...userPreviewFixtures.globalKeywordBank,
+            questions: [
+              {
+                ...userPreviewFixtures.globalKeywordBank.questions[0],
+                问题: novelPreviewKeywordQuestion,
+              },
+              ...userPreviewFixtures.globalKeywordBank.questions.slice(1),
+            ],
+          },
+          getServicePortal: () => ({
+            ...luxuryPreviewPortal,
+            quotas: luxuryPreviewPortal.quotas.map((quota) => ({
+              ...quota,
+              used: 0,
+            })),
+          }),
+        }}
+      />,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
     const selectedQuestion = screen.getAllByRole("button", {
@@ -425,16 +556,44 @@ describe("UserBrandDashboard service experience", () => {
     const questionInput = screen.getByRole("textbox", {
       name: "目标问题",
     });
-    expect(questionInput).toHaveValue(firstPreviewKeywordQuestion);
-    expect(screen.getByText("已从品牌全域词库带入")).toBeInTheDocument();
+    expect(questionInput).toHaveValue(novelPreviewKeywordQuestion);
+    expect(questionInput).toHaveAttribute("readonly");
+    expect(screen.getByRole("textbox", { name: "问题来源" })).toHaveValue(
+      "品牌全域词库",
+    );
 
-    expect(
-      screen.getByRole("button", { name: "提交专业审核" }),
-    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认优化问题" }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(
+      "确认后开启进度将不可修改。",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "返回检查" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(screen.queryByText("待监控工程师确认")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认优化问题" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认并开启进度" }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+    const quotaOverview = screen.getByRole("region", { name: "套餐配额" });
+    const scenarioQuota = within(quotaOverview)
+      .getByText("产品场景词")
+      .closest("article");
+    expect(scenarioQuota).not.toBeNull();
+    expect(within(scenarioQuota!).getByText("1 / 20")).toBeInTheDocument();
+    const questionDirectory = screen.getByRole("complementary", {
+      name: "问题目录",
+    });
+    fireEvent.click(
+      within(questionDirectory).getByRole("button", { name: "产品场景词" }),
+    );
+    expect(
+      within(questionDirectory).getByText(novelPreviewKeywordQuestion),
+    ).toBeInTheDocument();
   });
 
-  it("uses compact single-line intake controls and links back to the brand question library", () => {
+  it("leaves direct-question classification to the service team and links back to the brand question library", () => {
     setPreviewPlan("luxury");
     render(<UserBrandDashboard preview />);
 
@@ -442,7 +601,7 @@ describe("UserBrandDashboard service experience", () => {
 
     expect(
       screen.getByRole("heading", {
-        name: "从品牌全域词库选择或直接输入需要优化的问题",
+        name: "从品牌全域词库选择或自主填写需要优化的问题",
       }),
     ).toBeInTheDocument();
     const questionInput = screen.getByRole("textbox", {
@@ -450,14 +609,60 @@ describe("UserBrandDashboard service experience", () => {
     });
     expect(questionInput.tagName).toBe("INPUT");
     expect(questionInput).toHaveAttribute("type", "text");
+    expect(questionInput).not.toHaveAttribute("readonly");
     expect(
-      screen.getByRole("combobox", { name: "问题类别" }),
-    ).not.toHaveAttribute("multiple");
+      screen.queryByRole("combobox", { name: "问题类别" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "品牌词库问题确认后会立即锁定并进入服务；自主填写的问题将提交专业审核，由后台分配问题类型。",
+      ),
+    ).toBeInTheDocument();
+    const sourceInput = screen.getByRole("textbox", { name: "问题来源" });
+    expect(sourceInput).toHaveValue("自主填写");
+    expect(sourceInput).toHaveAttribute("readonly");
 
     fireEvent.click(screen.getByRole("button", { name: "前往品牌全域词库" }));
     expect(
       screen.getByRole("heading", { name: "品牌全域词库" }),
     ).toBeInTheDocument();
+  });
+
+  it("keeps a visible history entry for a self-entered review request", async () => {
+    setPreviewPlan("luxury");
+    render(
+      <PreviewUserBrandDashboard
+        fixtures={{
+          ...userPreviewFixtures,
+          getServicePortal: () => ({
+            ...luxuryPreviewPortal,
+            quotas: luxuryPreviewPortal.quotas.map((quota) => ({
+              ...quota,
+              used: 0,
+            })),
+          }),
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "问题优化" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "目标问题" }), {
+      target: { value: "验收企业如何证明复杂项目交付能力？" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "提交专业审核" }));
+    await waitFor(() =>
+      expect(screen.getByText("待监控工程师确认")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getAllByRole("button", { name: "需求记录" })[0]!);
+
+    const historyDialog = screen.getByRole("dialog", {
+      name: "问题需求记录",
+    });
+    expect(historyDialog).toHaveTextContent(
+      "验收企业如何证明复杂项目交付能力？",
+    );
+    expect(historyDialog).toHaveTextContent("问题审核");
+    expect(historyDialog).toHaveTextContent("待处理");
   });
 
   it("keeps luxury questions split into their authoritative category blocks on both optimization pages", async () => {
@@ -659,6 +864,22 @@ describe("UserBrandDashboard service experience", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("keeps Advanced semantic assets locked until the knowledge agent publishes", () => {
+    setPreviewPlan("advanced");
+    render(<UserBrandDashboard preview />);
+
+    fireEvent.click(screen.getByRole("button", { name: "内容资产运营" }));
+
+    expect(
+      screen.getByText(
+        "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "提交内容需求" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("keeps knowledge versions and read-only history out of account settings", async () => {
     setPreviewPlan("advanced");
     render(<UserBrandDashboard preview />);
@@ -709,6 +930,26 @@ describe("UserBrandDashboard service experience", () => {
         expect(screen.getByText(deliveryNote)).toBeInTheDocument();
       }
       expect(screen.getByText(purchasedQuestionCount)).toBeInTheDocument();
+      const packageScope = screen.getByTestId("service-plan-scope");
+      expect(
+        within(packageScope)
+          .getAllByRole("listitem")
+          .map((item) => item.textContent),
+      ).toEqual([
+        "知识库智能体",
+        "品牌全域词库与选题",
+        "问题优化",
+        "应答逻辑智能体",
+        "问题监控",
+        "进度报告",
+        "AI 友好内容资产",
+      ]);
+      expect(
+        within(packageScope).queryByText("知识库展示"),
+      ).not.toBeInTheDocument();
+      expect(
+        within(packageScope).queryByText("舆情监控·品牌追踪"),
+      ).not.toBeInTheDocument();
       for (const item of [
         "知识库智能体",
         "知识库展示",
@@ -723,6 +964,7 @@ describe("UserBrandDashboard service experience", () => {
         const navigationItem = screen.getByRole("button", { name: item });
         expect(navigationItem).not.toBeDisabled();
         expect(navigationItem).not.toHaveAttribute("title");
+        expect(navigationItem.querySelector("svg")).not.toBeInTheDocument();
       }
       expect(
         screen.queryByRole("button", { name: "渠道分发" }),

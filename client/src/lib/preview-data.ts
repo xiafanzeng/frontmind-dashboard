@@ -466,6 +466,18 @@ function locked(reason: string, label = "查看升级方案"): ServiceCapability
   };
 }
 
+function workflowPrerequisite(
+  reason: string,
+  nextAction: ServiceAction,
+): ServiceCapability {
+  return {
+    allowed: false,
+    effectiveStatus: "pending",
+    reason,
+    nextAction,
+  };
+}
+
 function capabilitySet(
   values: Partial<Record<ServiceCapabilityKey, ServiceCapability>>,
 ): Record<ServiceCapabilityKey, ServiceCapability> {
@@ -653,12 +665,12 @@ export const previewServicePortals = {
       status: "ready",
       statusLabel: "可查看",
       version: "V1",
-      sourceLabel: "官网初步知识库",
+      sourceLabel: "Website 流程同步知识库",
       updatedAt: "2026-07-18",
     },
     capabilities: capabilitySet({
       knowledgeBuild: locked(
-        "普通版已包含官网生成的初步知识库展示，不包含对话式知识库构建。升级进阶版或豪华版后可解锁。",
+        "普通版不包含知识库智能体；知识库由 Website 流程自动同步至本账号，服务团队可补录。升级进阶版或豪华版后可解锁知识库智能体。",
       ),
       knowledgeDisplay: available(),
       globalKeywords: locked(
@@ -775,7 +787,14 @@ export const previewServicePortals = {
       monitoring: available(),
       channelDistribution: available(),
       progressReport: available(),
-      contentAssets: available(),
+      contentAssets: workflowPrerequisite(
+        "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。",
+        {
+          kind: "resume_knowledge_build",
+          label: "继续知识库智能体",
+          href: "/knowledge-base",
+        },
+      ),
     }),
     primaryNextAction: {
       kind: "resume_knowledge_build",

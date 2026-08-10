@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { knowledgeBaseUserMessagePublicId } from "@shared/knowledge-base-message";
 import {
   ConversationProvider,
+  applyKnowledgeBaseObservation,
+  currentKnowledgeBaseReplySnapshot,
   mergeServerOwnedKnowledgeBaseMessages,
   parseOutputMessages,
   prepareConversationForCloud,
@@ -189,6 +191,83 @@ function wrapper({ children }: { children: React.ReactNode }) {
   return <ConversationProvider>{children}</ConversationProvider>;
 }
 
+describe("knowledge-base reply snapshots", () => {
+  it("returns all reply coordinates from one rendered presentation", () => {
+    const value: Conversation = {
+      ...conversation("reply-snapshot"),
+      status: "awaiting_input",
+      messages: [
+        {
+          id: "presentation",
+          role: "assistant",
+          content: "## 当前节点\n正文",
+          timestamp: 1,
+          knowledgeBase: {
+            kind: "presentation",
+            turnId: "turn-7",
+            presentationKey: "presentation-7",
+            generation: 3,
+            revision: 7,
+            leafId: "1.8",
+            serverOwned: true,
+          },
+        },
+      ],
+      knowledgeBase: {
+        initialized: true,
+        generation: 3,
+        stateEpoch: 9,
+        activeTurnId: null,
+        activeClientRequestId: null,
+        presentationTurnId: "turn-7",
+        interactionState: "awaiting_input",
+        canReply: true,
+        presentationKey: "presentation-7",
+        revision: 7,
+        leafId: "1.8",
+        notice: null,
+      },
+    };
+    expect(currentKnowledgeBaseReplySnapshot(value)).toEqual({
+      generation: 3,
+      stateEpoch: 9,
+      revision: 7,
+      leafId: "1.8",
+      presentationKey: "presentation-7",
+      presentationTurnId: "turn-7",
+    });
+  });
+
+  it("clears stale task pointers when the authoritative id is explicitly null", () => {
+    const next = applyKnowledgeBaseObservation(
+      {
+        ...conversation("released-kb-task"),
+        taskId: "stale-task",
+        previousResponseId: "stale-task",
+      },
+      {
+        generation: 1,
+        stateEpoch: 1,
+        authoritativeTaskId: null,
+        activeTurn: null,
+        completedTurn: null,
+        approvedPresentation: null,
+        progress: null,
+        notice: null,
+        interaction: {
+          interactionState: "executing",
+          canReply: false,
+          canPublish: false,
+          lockReason: "任务仍在执行",
+          progress: null,
+        },
+      } as any,
+    );
+    expect(next.taskId).toBeUndefined();
+    expect(next.previousResponseId).toBeUndefined();
+  });
+});
+
 describe("ConversationProvider cloud hydration", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -211,6 +290,36 @@ describe("ConversationProvider cloud hydration", () => {
     expect(result.current.state.conversations.map((item) => item.id)).toEqual([
       "account-1",
     ]);
+  });
+
+  it("clears a released response-logic task pointer so the next turn can start fresh", async () => {
+    mocks.listRefetch.mockResolvedValue({
+      data: [
+        {
+          ...conversation("response-logic-released"),
+          status: "completed",
+          taskId: "task-gone",
+          taskUrl: "https://tasks.example/task-gone",
+          previousResponseId: "task-gone",
+        },
+      ],
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    act(() => {
+      result.current.updateStatus("response-logic-released", "error", {
+        clearTaskPointer: true,
+        completedAt: Date.now(),
+      });
+    });
+
+    const released = result.current.state.conversations.find(
+      (item) => item.id === "response-logic-released",
+    );
+    expect(released?.taskId).toBeUndefined();
+    expect(released?.taskUrl).toBeUndefined();
+    expect(released?.previousResponseId).toBeUndefined();
   });
 
   it("revokes and removes an attachment blob only after it expires", async () => {

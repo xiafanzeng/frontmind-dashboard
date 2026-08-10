@@ -649,6 +649,97 @@ describe("knowledge-base observation consistency", () => {
       requestMessageSequence: 2,
       messageSequence: 3,
     });
+    expect(observation?.completedTurn).toEqual({
+      turnId: presentationTurn.id,
+      clientRequestId: presentationTurn.clientRequestId,
+      messageSequence: 2,
+    });
+  });
+
+  it("projects the terminal completed turn after a fast finalizer releases the active turn", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const staleSameSecondTurn = {
+      id: "turn-stale-same-second",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-stale",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-stale",
+      operationType: "confirm",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      status: "completed",
+      upstreamTaskId: "task-old",
+      metadata: {},
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const terminalTurn = {
+      id: "turn-final",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-final",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-final",
+      operationType: "confirm",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      status: "completed",
+      upstreamTaskId: null,
+      metadata: {},
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              status: "ready_to_publish",
+              currentLeafId: null,
+              activeTurnId: null,
+              lastAppliedOperationKey: terminalTurn.operationKey,
+            }),
+            nodes: [node({ status: "confirmed" })],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 13,
+            },
+            // Deliberately put the stale row first with identical timestamps;
+            // query adapters and database ordering must not choose it.
+            turns: [staleSameSecondTurn, terminalTurn],
+            messages: [
+              {
+                turnId: staleSameSecondTurn.id,
+                role: "user",
+                sequence: 6,
+              },
+              { turnId: terminalTurn.id, role: "user", sequence: 8 },
+            ],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.activeTurn).toBeNull();
+    expect(observation?.approvedPresentation).toBeNull();
+    expect(observation?.completedTurn).toEqual({
+      turnId: terminalTurn.id,
+      clientRequestId: terminalTurn.clientRequestId,
+      messageSequence: 8,
+    });
   });
 
   it("returns one transactional snapshot while a newer build commits concurrently", async () => {

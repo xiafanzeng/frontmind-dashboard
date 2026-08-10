@@ -7,11 +7,13 @@ import {
   bindKnowledgeBaseInitialLogo,
   bindKnowledgeBaseOfficialLogoUpload,
   collectKnowledgeBaseLogoDescriptors,
+  KnowledgeBaseArtifactBindingError,
   knowledgeBaseRecoveredPackageMatchesStoredHash,
   knowledgeBaseArchiveRequiresV4UploadEvidence,
   knowledgeBaseArchiveReadContractVersions,
   knowledgeBaseArchiveWriteContractVersions,
   knowledgeBaseExistingLogoUploadBindingDecision,
+  knowledgeBaseInitialLogoRejectionCode,
   knowledgeBaseStagedArtifactCleanupDecision,
   selectKnowledgeBaseRecoveryLogoAsset,
   selectKnowledgeBaseReadyPackageDescriptor,
@@ -82,6 +84,34 @@ describe("knowledge-base Logo descriptor normalization", () => {
     ).toThrowError(expect.objectContaining({ code: "LOGO_UPLOAD_INVALID" }));
   });
 
+  it("accepts a rasterized PNG returned from an SVG source", () => {
+    expect(
+      assertKnowledgeBaseOfficialLogoMimeMatches({
+        declaredMimeType: "image/png",
+        detectedFormat: "png",
+      }),
+    ).toBe("image/png");
+  });
+
+  it("degrades only Logo-local failures and never infrastructure or stale-build failures", () => {
+    expect(
+      knowledgeBaseInitialLogoRejectionCode(
+        new KnowledgeBaseArtifactBindingError(
+          "LOGO_UPLOAD_INVALID",
+          "invalid image",
+        ),
+      ),
+    ).toBe("LOGO_UPLOAD_INVALID");
+    expect(
+      knowledgeBaseInitialLogoRejectionCode(
+        new KnowledgeBaseArtifactBindingError("BUILD_CHANGED", "stale build"),
+      ),
+    ).toBeNull();
+    expect(
+      knowledgeBaseInitialLogoRejectionCode(new Error("database unavailable")),
+    ).toBeNull();
+  });
+
   it("repairs provenance instead of treating an existing same-hash Logo as complete", () => {
     const verifiedUpload = {
       verified: true as const,
@@ -116,6 +146,55 @@ describe("knowledge-base Logo descriptor normalization", () => {
         verifiedUpload,
       }),
     ).toBe("already_complete");
+
+    expect(
+      knowledgeBaseExistingLogoUploadBindingDecision({
+        buildLogoSha256: "a".repeat(64),
+        buildLogoBytes: 100,
+        buildLogoMimeType: "image/png",
+        stagedSha256: "a".repeat(64),
+        stagedBytes: 100,
+        stagedMimeType: "image/png",
+        existingUpload: { ...verifiedUpload, verified: false },
+        verifiedUpload,
+      }),
+    ).toBe("repair_provenance");
+
+    expect(() =>
+      knowledgeBaseExistingLogoUploadBindingDecision({
+        buildLogoSha256: "a".repeat(64),
+        buildLogoBytes: 100,
+        buildLogoMimeType: "image/png",
+        stagedSha256: "a".repeat(64),
+        stagedBytes: 100,
+        stagedMimeType: "image/png",
+        existingUpload: {
+          ...verifiedUpload,
+          verified: false,
+          fileId: "different-file",
+        },
+        verifiedUpload,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "BUILD_CHANGED" }));
+
+    const replacementUpload = {
+      ...verifiedUpload,
+      fileId: "replacement-file",
+      sourceSha256: "b".repeat(64),
+    };
+    expect(
+      knowledgeBaseExistingLogoUploadBindingDecision({
+        buildLogoSha256: "a".repeat(64),
+        buildLogoBytes: 100,
+        buildLogoMimeType: "image/png",
+        stagedSha256: "b".repeat(64),
+        stagedBytes: 100,
+        stagedMimeType: "image/png",
+        existingUpload: { ...replacementUpload, verified: false },
+        verifiedUpload: replacementUpload,
+        allowReplacement: true,
+      }),
+    ).toBe("replace_artifact");
   });
 
   it("recovers the v4 official Logo without treating ordinary upload assets as candidates", () => {

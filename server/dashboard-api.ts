@@ -102,6 +102,7 @@ import {
 import {
   assertResponseLogicDraftPublishable,
   listResponseLogicEntries,
+  ResponseLogicConfirmedError,
   ResponseLogicRevisionConflictError,
   saveResponseLogicEntriesBatch,
 } from "./response-logic-service";
@@ -219,10 +220,6 @@ const DELIVERY_IMPORT_MODULE_ACCESS: Partial<
     roleType: "monitoring_optimization_engineer",
     operations: ["question_catalog"],
   },
-  questions: {
-    roleType: "monitoring_optimization_engineer",
-    operations: ["question_catalog"],
-  },
   monitoring: {
     roleType: "monitoring_optimization_engineer",
     operations: [
@@ -260,7 +257,7 @@ async function assertDeliveryModuleImport(input: {
 }) {
   const access = DELIVERY_IMPORT_MODULE_ACCESS[input.importModule];
   if (!access) {
-    throw new Error("当前模块不属于交付成员工作台");
+    throw new Error("当前模块不属于工程师工作台");
   }
   const role = await assertRoleScopedWorkspaceExecution({
     req: input.req,
@@ -272,7 +269,7 @@ async function assertDeliveryModuleImport(input: {
     input.req.header("x-delivery-ticket-id") || "",
   ).trim();
   if (!ticketId || !role) {
-    throw new Error("缺少当前交付工单标识");
+    throw new Error("缺少当前交付需求标识");
   }
   const db = await getDb();
   if (!db) throw new Error("数据库暂时不可用");
@@ -300,7 +297,7 @@ async function assertDeliveryModuleImport(input: {
     )
     .limit(1);
   if (!rows[0]) {
-    throw new Error("当前工单无权发布该业务模块");
+    throw new Error("当前需求无权发布该业务模块");
   }
 }
 const MAX_UNPACKED_BYTES = 220 * 1024 * 1024;
@@ -2184,7 +2181,10 @@ function validateProfilePackage(input: {
       "企业知识库图片总量超过 160 MB",
     );
   }
-  if (input.profile === "dashboard-enterprise-v1") {
+  if (
+    input.profile === "dashboard-enterprise-v1" &&
+    !isCustomerUploadDashboardV4
+  ) {
     const packagedDocumentPaths = new Set(
       input.documents.map((document) => packageRelativePath(document.path)),
     );
@@ -4588,9 +4588,67 @@ function csvTextFromRows(rows: string[][]) {
   return rows.map((row) => row.map(cell).join(",")).join("\n");
 }
 
-async function workbookRows(buffer: Buffer) {
+function spreadsheetMlElementPrefix(value: string) {
+  const match = value.match(
+    /xmlns:([A-Za-z_][\w.-]*)=(["'])http:\/\/schemas\.openxmlformats\.org\/spreadsheetml\/2006\/main\2/,
+  );
+  return match?.[1] ?? null;
+}
+
+function withoutSpreadsheetMlElementPrefix(value: string) {
+  const prefix = spreadsheetMlElementPrefix(value);
+  if (!prefix) return value;
+  const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return value.replace(new RegExp(`<(/?)${escapedPrefix}:`, "g"), "<$1");
+}
+
+async function excelJsCompatibleWorkbookBuffer(buffer: Buffer) {
+  let archive: JSZip;
+  try {
+    archive = await JSZip.loadAsync(buffer);
+  } catch {
+    return null;
+  }
+  const workbookXml = archive.file("xl/workbook.xml");
+  if (!workbookXml) return null;
+  const workbookText = await workbookXml.async("string");
+  if (!spreadsheetMlElementPrefix(workbookText)) return null;
+
+  let changed = false;
+  await Promise.all(
+    Object.values(archive.files).map(async (entry) => {
+      if (entry.dir || !entry.name.toLowerCase().endsWith(".xml")) return;
+      const source = await entry.async("string");
+      const normalized = withoutSpreadsheetMlElementPrefix(source);
+      if (normalized === source) return;
+      archive.file(entry.name, normalized);
+      changed = true;
+    }),
+  );
+  return changed ? archive.generateAsync({ type: "nodebuffer" }) : null;
+}
+
+async function loadTabularWorkbook(buffer: Buffer) {
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.load(buffer as unknown as ExcelJS.Buffer);
+  try {
+    await workbook.xlsx.load(buffer as unknown as ExcelJS.Buffer);
+    return workbook;
+  } catch (error) {
+    // Some valid spreadsheet generators qualify SpreadsheetML elements as
+    // <x:workbook>, <x:worksheet>, and so on. ExcelJS 4.4 reads element names
+    // literally and misses those roots, so retry with only that prefix removed.
+    const compatibleBuffer = await excelJsCompatibleWorkbookBuffer(buffer);
+    if (!compatibleBuffer) throw error;
+    const compatibleWorkbook = new ExcelJS.Workbook();
+    await compatibleWorkbook.xlsx.load(
+      compatibleBuffer as unknown as ExcelJS.Buffer,
+    );
+    return compatibleWorkbook;
+  }
+}
+
+async function workbookRows(buffer: Buffer) {
+  const workbook = await loadTabularWorkbook(buffer);
   return workbook.worksheets.map((worksheet) => {
     const rows: string[][] = [];
     // ExcelJS derives worksheet.columnCount by scanning rows. Cache it once
@@ -6977,7 +7035,7 @@ router.put(
         );
         if (actor.role === "delivery_member") {
           if (importModule === "full") {
-            throw new Error("交付成员不能执行整合看板导入");
+            throw new Error("工程师不能执行整合看板导入");
           }
           await assertDeliveryModuleImport({
             req,
@@ -7771,7 +7829,7 @@ router.put(
       if (existingSnapshot && !maintenanceTicketId) {
         throw new KnowledgeArchiveValidationError(
           "structure",
-          "已发布知识库只能通过开放的维护工单替换",
+          "已发布知识库只能通过开放的维护需求替换",
         );
       }
       if (maintenanceTicketId) {
@@ -7897,6 +7955,8 @@ router.put(
         error instanceof DashboardImportPreflightError;
       const responseLogicRevisionConflict =
         error instanceof ResponseLogicRevisionConflictError;
+      const responseLogicConfirmed =
+        error instanceof ResponseLogicConfirmedError;
       res
         .status(
           error instanceof ServiceEntitlementError
@@ -7911,9 +7971,11 @@ router.put(
                     ? error.statusCode
                     : responseLogicRevisionConflict
                       ? error.statusCode
-                      : enterpriseMismatch || revisionConflict
-                        ? 409
-                        : 400,
+                      : responseLogicConfirmed
+                        ? error.statusCode
+                        : enterpriseMismatch || revisionConflict
+                          ? 409
+                          : 400,
         )
         .json({
           error: {
@@ -7934,9 +7996,11 @@ router.put(
                           : dashboardImportPreflightConflict
                             ? error.code
                             : responseLogicRevisionConflict
-                              ? error.code
-                              : knowledgeArchiveErrorCode(error) ||
-                                "IMPORT_FAILED",
+                              ? error.responseLogicCode
+                              : responseLogicConfirmed
+                                ? error.responseLogicCode
+                                : knowledgeArchiveErrorCode(error) ||
+                                  "IMPORT_FAILED",
           },
         });
     }

@@ -58,6 +58,7 @@ import {
   updateWorkspaceQuestionBySystemAdmin,
   upsertServiceContract,
 } from "./service-entitlement";
+import { completeQuestionReviewRequest } from "./question-maintenance-service";
 import {
   decideWebsitePurchase,
   listPendingWebsitePurchases,
@@ -90,6 +91,7 @@ import {
   adminAddDeliveryTicketMessageSchema,
   adminDeliveryTicketListInputSchema,
   confirmRedirectWorkbookSchema,
+  deleteDeliveryTicketInputSchema,
   deliveryTicketDetailInputSchema,
   previewRedirectWorkbookSchema,
   recordDeliveryOperationSchema,
@@ -99,6 +101,7 @@ import {
 } from "../shared/delivery-ticket";
 import {
   addDeliveryTicketMessage,
+  deleteManagedDeliveryTicket,
   DeliveryTicketError,
   getDeliveryTicketDetail,
   getDeliveryTicketWorkspaceMetadata,
@@ -127,6 +130,7 @@ import {
   servicePlanCodeSchema,
   toPublicServicePortal,
   toPublicServicePortalQuestion,
+  workspaceQuestionCategorySchema,
   type ServicePortal,
   type ServicePortalQuestion,
 } from "../shared/service-portal";
@@ -137,6 +141,15 @@ import {
   completeManagedServiceUserProvisioning,
   createManagedServiceUser,
 } from "./managed-user-onboarding-service";
+import {
+  bulkAssignJenovaBrandTrackingCredential,
+  configureJenovaBrandTrackingCredential,
+  JenovaBrandTrackingError,
+  listJenovaBrandTrackingCredentialAssignments,
+  revokeJenovaBrandTrackingCredentialAssignment,
+  syncJenovaBrandTrackingCredentialBalance,
+  toJenovaBrandTrackingAuthError,
+} from "./jenova-brand-tracking-service";
 
 const manualServiceOrders = createManualServiceOrderService();
 
@@ -206,6 +219,20 @@ function throwServiceAdminError(error: unknown): never {
   throw toTrpcError(error);
 }
 
+function throwJenovaBrandTrackingAdminError(error: unknown): never {
+  if (
+    error instanceof JenovaBrandTrackingError &&
+    ["UNAUTHORIZED", "FORBIDDEN", "INELIGIBLE"].includes(error.code)
+  ) {
+    throw new TRPCError({
+      code: error.code === "UNAUTHORIZED" ? "UNAUTHORIZED" : "FORBIDDEN",
+      message: error.message,
+      cause: error,
+    });
+  }
+  throw toTrpcError(toJenovaBrandTrackingAuthError(error));
+}
+
 const usernameSchema = z
   .string()
   .trim()
@@ -270,6 +297,92 @@ export function managedMonitoringCitationSummaryValue(input: {
 }
 
 export const adminRouter = router({
+  brandTrackingCredentials: router({
+    list: adminProcedure.query(async ({ ctx }) => {
+      requireSystemAdmin(ctx.user);
+      try {
+        return await listJenovaBrandTrackingCredentialAssignments({
+          actor: ctx.user,
+        });
+      } catch (error) {
+        throwJenovaBrandTrackingAdminError(error);
+      }
+    }),
+    configure: adminProcedure
+      .input(
+        z
+          .object({
+            userId: z.number().int().positive(),
+            apiKey: presalesApiKeySchema,
+            relatedTicketId: z.string().uuid().optional(),
+          })
+          .strict(),
+      )
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await configureJenovaBrandTrackingCredential({
+            actor: ctx.user,
+            ...input,
+          });
+        } catch (error) {
+          throwJenovaBrandTrackingAdminError(error);
+        }
+      }),
+    bulkAssign: adminProcedure
+      .input(
+        z
+          .object({
+            userIds: z
+              .array(z.number().int().positive())
+              .min(1)
+              .max(5_000)
+              .refine(
+                (userIds) => new Set(userIds).size === userIds.length,
+                "海外客户账号不能重复",
+              ),
+            apiKey: presalesApiKeySchema,
+          })
+          .strict(),
+      )
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await bulkAssignJenovaBrandTrackingCredential({
+            actor: ctx.user,
+            ...input,
+          });
+        } catch (error) {
+          throwJenovaBrandTrackingAdminError(error);
+        }
+      }),
+    revoke: adminProcedure
+      .input(z.object({ userId: z.number().int().positive() }).strict())
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await revokeJenovaBrandTrackingCredentialAssignment({
+            actor: ctx.user,
+            userId: input.userId,
+          });
+        } catch (error) {
+          throwJenovaBrandTrackingAdminError(error);
+        }
+      }),
+    refreshBalance: adminProcedure
+      .input(z.object({ credentialId: z.string().uuid() }).strict())
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await syncJenovaBrandTrackingCredentialBalance({
+            actor: ctx.user,
+            credentialId: input.credentialId,
+          });
+        } catch (error) {
+          throwJenovaBrandTrackingAdminError(error);
+        }
+      }),
+  }),
   apiKeyUsageAlerts: router({
     hierarchy: adminProcedure.query(async ({ ctx }) => {
       requireSystemAdmin(ctx.user);
@@ -368,6 +481,7 @@ export const adminRouter = router({
             reason: z.string().trim().min(1).max(2_000),
             confirmation: z.literal("REPLACE_API_KEY"),
             allowIncompleteHistory: z.boolean().optional().default(false),
+            relatedTicketId: z.string().uuid().optional(),
           })
           .strict(),
       )
@@ -382,6 +496,7 @@ export const adminRouter = router({
             expectedVersion: input.expectedVersion,
             reason: input.reason,
             allowIncompleteHistory: input.allowIncompleteHistory,
+            relatedTicketId: input.relatedTicketId,
           });
         } catch (error) {
           throw toTrpcError(error);
@@ -511,6 +626,21 @@ export const adminRouter = router({
             userId: input.userId,
             ticketId: input.ticketId,
             includeInternal: true,
+          });
+        } catch (error) {
+          throwServiceAdminError(error);
+        }
+      }),
+    delete: adminProcedure
+      .input(deleteDeliveryTicketInputSchema)
+      .mutation(async ({ ctx, input }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await deleteManagedDeliveryTicket({
+            actor: ctx.user,
+            userId: input.userId,
+            ticketId: input.ticketId,
+            expectedRevision: input.expectedRevision,
           });
         } catch (error) {
           throwServiceAdminError(error);
@@ -859,6 +989,7 @@ export const adminRouter = router({
           userId: z.number().int().positive(),
           questionId: z.string().trim().min(1).max(64),
           expectedRevision: z.number().int().positive(),
+          category: workspaceQuestionCategorySchema.optional(),
           reason: z.string().trim().max(2_000).optional(),
         }),
       )
@@ -867,10 +998,24 @@ export const adminRouter = router({
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
           await assertServiceCapability(input.userId, "questionSelection");
-          const question = await approveWorkspaceQuestionSelection({
-            ...input,
-            actorUserId: ctx.user.id,
-          });
+          const question = await approveWorkspaceQuestionSelection(
+            {
+              ...input,
+              actorUserId: ctx.user.id,
+            },
+            {
+              afterWrite: async (executor, approvedQuestion) => {
+                await completeQuestionReviewRequest({
+                  executor,
+                  userId: input.userId,
+                  questionId: approvedQuestion.id,
+                  actorUserId: ctx.user.id,
+                  actorRole: "admin",
+                  message: "自主填写问题已完成专业审核。",
+                });
+              },
+            },
+          );
           await writeWorkspaceAuditEvent({
             actor: ctx.user,
             action: "workspace.question.selection_confirmed",

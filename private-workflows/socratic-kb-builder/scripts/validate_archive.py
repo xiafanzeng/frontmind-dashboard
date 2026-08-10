@@ -2667,7 +2667,7 @@ def validate_finalization_binding(
                     if kind == "official_logo":
                         validation.require(
                             packaged_asset_bytes == source_bytes,
-                            "generated official Logo bytes must exactly equal the server-bound input Logo",
+                            "generated official Logo bytes must exactly equal the Dashboard-bound raster input Logo",
                         )
             else:
                 validation.errors.append(

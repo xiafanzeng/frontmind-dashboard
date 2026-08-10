@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   and,
   asc,
@@ -51,6 +51,14 @@ import {
 } from "../shared/delivery-roles";
 import { hasExplicitAdminRole } from "../shared/admin-access";
 import { dashboardPayloadSchema } from "../shared/dashboard";
+import { contentAssetMediaOptionsForMarketEdition } from "../shared/delivery-catalog";
+import {
+  deliveryOperationAllowedEvidence,
+  getDeliveryOperationSpec,
+} from "../shared/delivery-operation-spec";
+import { deliveryTicketPresentationTitle } from "../shared/delivery-ticket-presentation";
+import { deliverySummaryLooksLikeCredentialSecret } from "../shared/delivery-ticket-security";
+import type { WorkspaceQuestionCategory } from "../shared/service-portal";
 import {
   AuthServiceError,
   createManagedUser,
@@ -63,6 +71,10 @@ import {
   hasSystemAdminAccess,
   writeWorkspaceAuditEvent,
 } from "./admin-control-plane-service";
+import {
+  getJenovaBrandTrackingUsageForProject,
+  updateJenovaBrandTrackingLimit,
+} from "./jenova-brand-tracking-service";
 import { getLatestKnowledgeSnapshot } from "./dashboard-service";
 import { getDb } from "./db";
 import {
@@ -73,9 +85,12 @@ import {
 } from "./delivery-ticket-service";
 import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
 import { getQuestionQuotaState } from "./question-quota-service";
+import { questionCategoryForPublic } from "./question-selection-policy";
+import { listResponseLogicEntriesByQuestionIds } from "./response-logic-service";
 import {
   approveWorkspaceQuestionSelection,
   deriveEffectiveServiceStatus,
+  getServicePortal,
   ServiceEntitlementError,
   selectPortalContract,
   type ServicePortalContractRecord,
@@ -177,6 +192,30 @@ function requiredRolesForPlan(planCode: string | null | undefined) {
     roles.unshift("ai_operations_engineer");
   }
   return roles;
+}
+
+function requiredRolesForCustomer(
+  planCode: string | null | undefined,
+  marketEdition: "domestic" | "overseas",
+) {
+  const roles = requiredRolesForPlan(planCode);
+  if (
+    marketEdition === "overseas" &&
+    !roles.includes("ai_operations_engineer")
+  ) {
+    roles.unshift("ai_operations_engineer");
+  }
+  return roles;
+}
+
+function deliveryRoleEnabledForCustomer(input: {
+  roleType: DeliveryRoleType;
+  planCode: string | null | undefined;
+  marketEdition: "domestic" | "overseas";
+}) {
+  return requiredRolesForCustomer(input.planCode, input.marketEdition).includes(
+    input.roleType,
+  );
 }
 
 async function assertCanManageProject(input: {
@@ -292,6 +331,7 @@ export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
         id: users.id,
         username: users.username,
         displayName: users.displayName,
+        marketEdition: users.marketEdition,
         isActive: users.isActive,
       })
       .from(users)
@@ -436,7 +476,10 @@ export async function listDeliveryRoleManagement(actor: AuthenticatedUser) {
       managerId: manager?.id ?? null,
       managerUsername: manager?.username ?? null,
       managerDisplayName: manager?.displayName ?? null,
-      requiredRoleTypes: requiredRolesForPlan(contract?.planCode),
+      requiredRoleTypes: requiredRolesForCustomer(
+        contract?.planCode,
+        customer.marketEdition,
+      ),
     };
   });
   const assignments = assignmentRows.map((assignment) => {
@@ -586,11 +629,12 @@ export function deliveryTicketDependencyState(input: {
   operation: string | null;
   status: string;
   hasCompletedQuestionCatalog: boolean;
+  hasApprovedQuestion: boolean;
 }) {
   const blocked =
     input.operation === "initial_monitoring" &&
-    input.status !== "completed" &&
-    !input.hasCompletedQuestionCatalog;
+    ACTIVE_DELIVERY_STATUSES.includes(input.status as any) &&
+    (!input.hasCompletedQuestionCatalog || !input.hasApprovedQuestion);
   return {
     dependencySatisfied: !blocked,
     dependencyBlockReason: blocked
@@ -605,6 +649,74 @@ export function deliveryTicketStatusGroup(status: string) {
     : (["completed", "rejected", "cancelled"] as const).includes(status as any)
       ? ("completed" as const)
       : null;
+}
+
+export function knowledgeMonitoringHandoffOperations() {
+  return ["question_catalog"] as const;
+}
+
+export function knowledgeMonitoringHandoffReusableTicketStatuses() {
+  return [...ACTIVE_DELIVERY_STATUSES, "completed"] as const;
+}
+
+export function visibleInitialMonitoringTicketScope() {
+  return sql<boolean>`(
+    ${deliveryTickets.operation} IS NULL
+    OR ${deliveryTickets.operation} <> 'initial_monitoring'
+    OR ${deliveryTickets.status} NOT IN ('submitted', 'needs_information', 'scheduled', 'in_progress')
+    OR (
+      (
+        EXISTS (
+          SELECT 1
+          FROM delivery_tickets AS completed_catalog
+          WHERE completed_catalog.userId = ${deliveryTickets.userId}
+            AND completed_catalog.quotaPeriodId = ${deliveryTickets.quotaPeriodId}
+            AND completed_catalog.operation = 'question_catalog'
+            AND completed_catalog.status = 'completed'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM delivery_workflow_milestones AS archived_catalog
+          WHERE archived_catalog.userId = ${deliveryTickets.userId}
+            AND archived_catalog.operation = 'question_catalog'
+        )
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM workspace_questions AS approved_question
+        WHERE approved_question.userId = ${deliveryTickets.userId}
+          AND approved_question.quotaPeriodId = ${deliveryTickets.quotaPeriodId}
+          AND approved_question.status = 'selected'
+          AND approved_question.selectionApprovalStatus = 'approved'
+      )
+    )
+  )`;
+}
+
+export function reusableInitialMonitoringTicketScope(input: {
+  userId: number;
+}) {
+  return and(
+    eq(deliveryTickets.userId, input.userId),
+    eq(deliveryTickets.operation, "initial_monitoring"),
+    inArray(deliveryTickets.status, [...ACTIVE_DELIVERY_STATUSES, "completed"]),
+  );
+}
+
+export function initialMonitoringExistingTicketAction(input: {
+  status: string;
+  ticketQuotaPeriodId: string;
+  sourceQuotaPeriodId: string;
+  dependencySatisfied: boolean;
+}) {
+  if (
+    input.status === "completed" ||
+    input.ticketQuotaPeriodId === input.sourceQuotaPeriodId ||
+    input.dependencySatisfied
+  ) {
+    return "reuse" as const;
+  }
+  return "replace_stale" as const;
 }
 
 /**
@@ -624,11 +736,16 @@ export async function getMyDeliveryTickets(input: {
   if (!deliveryExecutionActorRole(input.actor)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "该工单池仅对工程师或系统管理员开放",
+      "该需求池仅对工程师或系统管理员开放",
     );
   }
   const db = await requireDb();
   const actorTicketScope = deliveryRoleTicketScope(input.actor);
+  const visibleInitialMonitoringScope = visibleInitialMonitoringTicketScope();
+  const visibleActorTicketScope = and(
+    actorTicketScope,
+    visibleInitialMonitoringScope,
+  );
   const statusFilter =
     input.statusGroup === "pending"
       ? ACTIVE_DELIVERY_STATUSES
@@ -636,7 +753,7 @@ export async function getMyDeliveryTickets(input: {
         ? TERMINAL_DELIVERY_STATUSES
         : [...ACTIVE_DELIVERY_STATUSES, ...TERMINAL_DELIVERY_STATUSES];
   const ownershipFilter = and(
-    actorTicketScope,
+    visibleActorTicketScope,
     inArray(deliveryTickets.status, statusFilter),
     input.customerUserId
       ? eq(deliveryTickets.userId, input.customerUserId)
@@ -701,14 +818,14 @@ export async function getMyDeliveryTickets(input: {
         })
         .from(deliveryTickets)
         .innerJoin(users, eq(users.id, deliveryTickets.userId))
-        .where(actorTicketScope)
+        .where(visibleActorTicketScope)
         .orderBy(asc(users.displayName), asc(users.username), asc(users.id)),
       db
         .select({ status: deliveryTickets.status, value: count() })
         .from(deliveryTickets)
         .where(
           and(
-            actorTicketScope,
+            visibleActorTicketScope,
             inArray(deliveryTickets.status, [
               ...ACTIVE_DELIVERY_STATUSES,
               ...TERMINAL_DELIVERY_STATUSES,
@@ -735,7 +852,7 @@ export async function getMyDeliveryTickets(input: {
         .innerJoin(users, eq(users.id, deliveryTickets.userId))
         .where(
           and(
-            actorTicketScope,
+            visibleActorTicketScope,
             inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
             input.customerUserId
               ? eq(deliveryTickets.userId, input.customerUserId)
@@ -753,19 +870,23 @@ export async function getMyDeliveryTickets(input: {
           desc(deliveryTickets.updatedAt),
           desc(deliveryTickets.id),
         )
-        .limit(1),
+        .limit(MY_DELIVERY_TICKET_LIMIT),
     ]);
 
   const hasMore = ticketRows.length > pageLimit;
   const selectedRows = ticketRows.slice(0, pageLimit);
   const customerIds = [
-    ...new Set(selectedRows.map((row) => row.ticket.userId)),
+    ...new Set([
+      ...selectedRows.map((row) => row.ticket.userId),
+      ...nextPendingRows.map((row) => row.ticket.userId),
+    ]),
   ];
   const [
     dashboardRows,
     styleWorkflowRows,
     completedCatalogRows,
     archivedCatalogRows,
+    approvedQuestionRows,
   ] = customerIds.length
     ? await Promise.all([
         db
@@ -784,7 +905,10 @@ export async function getMyDeliveryTickets(input: {
           .from(websiteStyleWorkflows)
           .where(inArray(websiteStyleWorkflows.userId, customerIds)),
         db
-          .selectDistinct({ userId: deliveryTickets.userId })
+          .selectDistinct({
+            userId: deliveryTickets.userId,
+            quotaPeriodId: deliveryTickets.quotaPeriodId,
+          })
           .from(deliveryTickets)
           .where(
             and(
@@ -802,17 +926,54 @@ export async function getMyDeliveryTickets(input: {
               eq(deliveryWorkflowMilestones.operation, "question_catalog"),
             ),
           ),
+        db
+          .selectDistinct({
+            userId: workspaceQuestions.userId,
+            quotaPeriodId: workspaceQuestions.quotaPeriodId,
+          })
+          .from(workspaceQuestions)
+          .where(
+            and(
+              inArray(workspaceQuestions.userId, customerIds),
+              eq(workspaceQuestions.status, "selected"),
+              eq(workspaceQuestions.selectionApprovalStatus, "approved"),
+            ),
+          ),
       ])
-    : [[], [], [], []];
+    : [[], [], [], [], []];
   const dashboardRevisionByUser = new Map(
     dashboardRows.map((row) => [row.userId, row.revision]),
   );
   const styleWorkflowByUser = new Map(
     styleWorkflowRows.map((row) => [row.userId, row]),
   );
-  const customersWithCompletedCatalog = new Set(
-    [...completedCatalogRows, ...archivedCatalogRows].map((row) => row.userId),
+  const catalogScopeKey = (userId: number, quotaPeriodId: string) =>
+    `${userId}:${quotaPeriodId}`;
+  const completedCatalogScopes = new Set(
+    completedCatalogRows.map((row) =>
+      catalogScopeKey(row.userId, row.quotaPeriodId),
+    ),
   );
+  const customersWithArchivedCatalog = new Set(
+    archivedCatalogRows.map((row) => row.userId),
+  );
+  const approvedQuestionScopes = new Set(
+    approvedQuestionRows.map((row) =>
+      catalogScopeKey(row.userId, row.quotaPeriodId),
+    ),
+  );
+  const dependencyForTicket = (ticket: typeof deliveryTickets.$inferSelect) =>
+    deliveryTicketDependencyState({
+      operation: ticket.operation,
+      status: ticket.status,
+      hasCompletedQuestionCatalog:
+        completedCatalogScopes.has(
+          catalogScopeKey(ticket.userId, ticket.quotaPeriodId),
+        ) || customersWithArchivedCatalog.has(ticket.userId),
+      hasApprovedQuestion: approvedQuestionScopes.has(
+        catalogScopeKey(ticket.userId, ticket.quotaPeriodId),
+      ),
+    });
   const counts = { pending: 0, completed: 0 };
   for (const row of countRows) {
     const group = deliveryTicketStatusGroup(row.status);
@@ -832,18 +993,14 @@ export async function getMyDeliveryTickets(input: {
         websiteStyleWorkflowRevision: styleWorkflow?.revision ?? 0,
         websiteStyleState: styleWorkflow?.status ?? null,
         marketEdition: customerMarketEdition ?? null,
-        ...deliveryTicketDependencyState({
-          operation: ticket.operation,
-          status: ticket.status,
-          hasCompletedQuestionCatalog: customersWithCompletedCatalog.has(
-            ticket.userId,
-          ),
-        }),
+        ...dependencyForTicket(ticket),
       };
     },
   );
   const last = selectedRows.at(-1)?.ticket;
-  const nextPendingRow = nextPendingRows[0];
+  const nextPendingRow = nextPendingRows.find(
+    (row) => dependencyForTicket(row.ticket).dependencySatisfied,
+  );
   return {
     items,
     nextPending: nextPendingRow
@@ -949,7 +1106,11 @@ export async function setProjectEngineer(input: {
   try {
     result = await db.transaction(async (tx) => {
       const customerRows = await tx
-        .select({ role: users.role, isActive: users.isActive })
+        .select({
+          role: users.role,
+          marketEdition: users.marketEdition,
+          isActive: users.isActive,
+        })
         .from(users)
         .where(eq(users.id, input.customerUserId))
         .limit(1)
@@ -971,9 +1132,11 @@ export async function setProjectEngineer(input: {
       );
       if (
         input.engineerUserId != null &&
-        !requiredRolesForPlan(currentContract?.planCode).includes(
-          input.roleType,
-        )
+        !deliveryRoleEnabledForCustomer({
+          roleType: input.roleType,
+          planCode: currentContract?.planCode,
+          marketEdition: customerRows[0].marketEdition,
+        })
       ) {
         throw new AuthServiceError("CONFLICT", "当前套餐未启用该工程师岗位");
       }
@@ -1207,6 +1370,8 @@ export async function listMyProjectAssignments(actor: AuthenticatedUser) {
       customerUsername: users.username,
       customerName: users.displayName,
       roleType: deliveryProjectAssignments.roleType,
+      engineerUserId: deliveryProjectAssignments.engineerUserId,
+      marketEdition: users.marketEdition,
     })
     .from(deliveryProjectAssignments)
     .innerJoin(users, eq(users.id, deliveryProjectAssignments.customerUserId))
@@ -1265,9 +1430,11 @@ export async function listMyProjectAssignments(actor: AuthenticatedUser) {
         ) as ServicePortalContractRecord[],
       );
       return (
-        requiredRolesForPlan(currentContract?.planCode).includes(
-          row.roleType,
-        ) || activeAssignmentIds.has(row.projectAssignmentId)
+        deliveryRoleEnabledForCustomer({
+          roleType: row.roleType,
+          planCode: currentContract?.planCode,
+          marketEdition: row.marketEdition,
+        }) || activeAssignmentIds.has(row.projectAssignmentId)
       );
     })
     .map((row) => ({
@@ -1302,6 +1469,15 @@ export function deliveryHistoryTimestamp(value: unknown): number {
     );
   }
   return timestamp;
+}
+
+export function deliveryHistoryTicketTitle(input: {
+  title?: string | null;
+  type?: string | null;
+  operation?: string | null;
+  category?: string | null;
+}) {
+  return deliveryTicketPresentationTitle(input);
 }
 
 export async function getMyDeliveryHistory(input: {
@@ -1397,7 +1573,12 @@ export async function getMyDeliveryHistory(input: {
       customerName: customerName || customerUsername || `客户 ${ticket.userId}`,
       customerUsername,
       projectAssignmentId: ticket.assignedProjectAssignmentId,
-      title: ticket.title || ticket.operation || ticket.category || "交付工单",
+      title: deliveryHistoryTicketTitle({
+        title: ticket.title,
+        type: ticket.type,
+        operation: ticket.operation,
+        category: ticket.category,
+      }),
       operation: ticket.operation,
       status: ticket.status,
       publicSummary: ticket.publicSummary,
@@ -1455,7 +1636,6 @@ export async function getMyDeliveryTicketDetail(input: {
       and(
         eq(deliveryTickets.id, input.ticketId),
         deliveryRoleTicketScope(input.actor),
-        inArray(deliveryTickets.status, TERMINAL_DELIVERY_STATUSES),
       ),
     )
     .limit(1);
@@ -1463,26 +1643,50 @@ export async function getMyDeliveryTicketDetail(input: {
   if (!row) {
     throw new AuthServiceError("NOT_FOUND", "任务记录不存在");
   }
-  const [events, attachments, resetRows] = await Promise.all([
-    db
-      .select()
-      .from(deliveryTicketEvents)
-      .where(eq(deliveryTicketEvents.ticketId, row.ticket.id))
-      .orderBy(asc(deliveryTicketEvents.createdAt)),
-    db
-      .select()
-      .from(deliveryTicketAttachments)
-      .where(eq(deliveryTicketAttachments.ticketId, row.ticket.id))
-      .orderBy(asc(deliveryTicketAttachments.createdAt)),
-    row.ticket.operation === "knowledge_reset"
-      ? db
-          .select()
-          .from(knowledgeBaseResetRequests)
-          .where(eq(knowledgeBaseResetRequests.ticketId, row.ticket.id))
-          .limit(1)
-      : Promise.resolve([]),
-  ]);
+  const [events, attachments, resetRows, rootRows, rootAttachmentRows] =
+    await Promise.all([
+      db
+        .select()
+        .from(deliveryTicketEvents)
+        .where(eq(deliveryTicketEvents.ticketId, row.ticket.id))
+        .orderBy(asc(deliveryTicketEvents.createdAt)),
+      db
+        .select()
+        .from(deliveryTicketAttachments)
+        .where(eq(deliveryTicketAttachments.ticketId, row.ticket.id))
+        .orderBy(asc(deliveryTicketAttachments.createdAt)),
+      row.ticket.operation === "knowledge_reset"
+        ? db
+            .select()
+            .from(knowledgeBaseResetRequests)
+            .where(eq(knowledgeBaseResetRequests.ticketId, row.ticket.id))
+            .limit(1)
+        : Promise.resolve([]),
+      row.ticket.rootTicketId
+        ? db
+            .select()
+            .from(deliveryTickets)
+            .where(
+              and(
+                eq(deliveryTickets.id, row.ticket.rootTicketId),
+                eq(deliveryTickets.userId, row.ticket.userId),
+                eq(deliveryTickets.isWorkflowContainer, true),
+              ),
+            )
+            .limit(1)
+        : Promise.resolve([]),
+      row.ticket.rootTicketId
+        ? db
+            .select()
+            .from(deliveryTicketAttachments)
+            .where(
+              eq(deliveryTicketAttachments.ticketId, row.ticket.rootTicketId),
+            )
+            .orderBy(asc(deliveryTicketAttachments.createdAt))
+        : Promise.resolve([]),
+    ]);
   const reset = resetRows[0];
+  const rootTicket = rootRows[0];
   return {
     ticket: {
       ...row.ticket,
@@ -1506,6 +1710,33 @@ export async function getMyDeliveryTicketDetail(input: {
       createdAt: attachment.createdAt.getTime(),
       downloadUrl: `/api/delivery-ticket-attachments/${attachment.id}/content`,
     })),
+    rootContext: rootTicket
+      ? {
+          ticket: {
+            id: rootTicket.id,
+            type: rootTicket.type,
+            category: rootTicket.category,
+            topic: rootTicket.topic,
+            title: rootTicket.title,
+            description: rootTicket.description,
+            preferredMedia: rootTicket.preferredMedia,
+            targetPage: rootTicket.targetPage,
+            materialUrls: rootTicket.materialUrls,
+            createdAt: rootTicket.createdAt.getTime(),
+            updatedAt: rootTicket.updatedAt.getTime(),
+          },
+          attachments: rootAttachmentRows.map((attachment) => ({
+            id: attachment.id,
+            filename: attachment.filename,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.sizeBytes,
+            purpose: attachment.purpose,
+            authorization: attachment.authorization,
+            copyrightNote: attachment.copyrightNote,
+            createdAt: attachment.createdAt.getTime(),
+          })),
+        }
+      : null,
     knowledgeReset: reset
       ? {
           id: reset.id,
@@ -1790,6 +2021,7 @@ export async function assertDeliveryProjectContext(input: {
       roleType: deliveryProjectAssignments.roleType,
       customerUsername: users.username,
       customerName: users.displayName,
+      marketEdition: users.marketEdition,
     })
     .from(deliveryProjectAssignments)
     .innerJoin(users, eq(users.id, deliveryProjectAssignments.customerUserId))
@@ -1826,7 +2058,11 @@ export async function assertDeliveryProjectContext(input: {
     contractRows as ServicePortalContractRecord[],
   );
   if (
-    !requiredRolesForPlan(currentContract?.planCode).includes(role.roleType)
+    !deliveryRoleEnabledForCustomer({
+      roleType: role.roleType,
+      planCode: currentContract?.planCode,
+      marketEdition: role.marketEdition,
+    })
   ) {
     const activeTicketRows = await db
       .select({ id: deliveryTickets.id })
@@ -1854,6 +2090,49 @@ export async function assertDeliveryProjectContext(input: {
   };
 }
 
+export function formalMonitoringBatchOptionsScope(userId: number) {
+  return and(
+    eq(monitoringBatches.userId, userId),
+    gt(monitoringBatches.sampleCount, 0),
+  );
+}
+
+export async function listFormalMonitoringBatchOptions(input: {
+  executor: any;
+  userId: number;
+}) {
+  const rows = await input.executor
+    .select({
+      batchKey: monitoringBatches.batchKey,
+      sourceName: monitoringBatches.sourceName,
+      collectedAt: monitoringBatches.collectedAt,
+      sampleCount: monitoringBatches.sampleCount,
+    })
+    .from(monitoringBatches)
+    .where(formalMonitoringBatchOptionsScope(input.userId))
+    .orderBy(desc(monitoringBatches.collectedAt), desc(monitoringBatches.id));
+  const seenBatchKeys = new Set<string>();
+  return rows.flatMap(
+    (row: {
+      batchKey: string;
+      sourceName: string;
+      collectedAt: unknown;
+      sampleCount: number;
+    }) => {
+      if (seenBatchKeys.has(row.batchKey)) return [];
+      seenBatchKeys.add(row.batchKey);
+      return [
+        {
+          batchKey: row.batchKey,
+          sourceName: row.sourceName,
+          collectedAt: deliveryHistoryTimestamp(row.collectedAt),
+          sampleCount: row.sampleCount,
+        },
+      ];
+    },
+  );
+}
+
 export async function getMyDeliveryWorkbench(input: {
   actor: AuthenticatedUser;
   projectAssignmentId: string;
@@ -1869,6 +2148,9 @@ export async function getMyDeliveryWorkbench(input: {
     knowledgeProgress,
     knowledgeSnapshot,
     questionQuota,
+    servicePortal,
+    brandTrackingUsage,
+    formalMonitoringBatches,
   ] = await Promise.all([
     customerIds.length
       ? db
@@ -1886,6 +2168,9 @@ export async function getMyDeliveryWorkbench(input: {
           .select({
             id: workspaceQuestions.id,
             userId: workspaceQuestions.userId,
+            externalQuestionId: workspaceQuestions.externalQuestionId,
+            sourceQuestionId: workspaceQuestions.sourceQuestionId,
+            candidateKey: workspaceQuestions.candidateKey,
             category: workspaceQuestions.category,
             question: workspaceQuestions.question,
             intent: workspaceQuestions.intent,
@@ -1927,10 +2212,53 @@ export async function getMyDeliveryWorkbench(input: {
           customerUserId: role.customerUserId,
         })
       : null,
+    getServicePortal(role.customerUserId),
+    role.roleType === "ai_operations_engineer" &&
+    role.marketEdition === "overseas"
+      ? getJenovaBrandTrackingUsageForProject({
+          actor: input.actor,
+          projectAssignmentId: input.projectAssignmentId,
+        })
+      : null,
+    role.roleType === "monitoring_optimization_engineer"
+      ? listFormalMonitoringBatchOptions({
+          executor: db,
+          userId: role.customerUserId,
+        })
+      : [],
   ]);
   const dashboardRecord = dashboards.find(
     (dashboard) => dashboard.userId === role.customerUserId,
   );
+  const authoritativeQuestionIds = questions
+    .filter(
+      (question) =>
+        question.status === "selected" &&
+        question.selectionApprovalStatus === "approved" &&
+        Boolean(question.category),
+    )
+    .map((question) => question.id);
+  const responseLogicRecords =
+    role.roleType === "monitoring_optimization_engineer" &&
+    authoritativeQuestionIds.length
+      ? (
+          await listResponseLogicEntriesByQuestionIds(
+            role.customerUserId,
+            authoritativeQuestionIds,
+          )
+        ).flatMap((record) =>
+          record.confirmed
+            ? [
+                {
+                  ...record,
+                  // The embedded delivery view is read-only. Never expose a
+                  // newer unpublished draft alongside the confirmed version.
+                  draft: record.confirmed,
+                },
+              ]
+            : [],
+        )
+      : [];
   const parsedDashboard = dashboardRecord
     ? dashboardPayloadSchema.safeParse(dashboardRecord.payload)
     : null;
@@ -1939,8 +2267,10 @@ export async function getMyDeliveryWorkbench(input: {
     customers,
     customerQuestions: questions.map((question) => ({
       ...question,
+      category: questionCategoryForPublic(question),
       selectionRequestedAt: question.selectionRequestedAt?.getTime?.() ?? null,
     })),
+    responseLogicRecords,
     dashboard:
       dashboardRecord && parsedDashboard?.success
         ? {
@@ -1959,14 +2289,33 @@ export async function getMyDeliveryWorkbench(input: {
           }
         : null,
     questionQuota,
+    servicePortal,
+    monitoringBatches: formalMonitoringBatches,
+    brandTrackingUsage: brandTrackingUsage?.usage ?? null,
   };
 }
 
+export async function getMyCustomerBrandTrackingUsage(input: {
+  actor: AuthenticatedUser;
+  projectAssignmentId: string;
+}) {
+  return getJenovaBrandTrackingUsageForProject(input);
+}
+
+export async function updateMyCustomerBrandTrackingLimit(input: {
+  actor: AuthenticatedUser;
+  projectAssignmentId: string;
+  limit: string;
+}) {
+  const result = await updateJenovaBrandTrackingLimit(input);
+  return { success: true as const, ...result };
+}
 export async function approveMyCustomerQuestionSelection(input: {
   actor: AuthenticatedUser;
   projectAssignmentId: string;
   questionId: string;
   expectedRevision: number;
+  category?: WorkspaceQuestionCategory;
 }) {
   const role = await assertDeliveryProjectContext(input);
   if (role.roleType !== "monitoring_optimization_engineer") {
@@ -1994,22 +2343,244 @@ export async function approveMyCustomerQuestionSelection(input: {
   if (!activeCatalogTickets[0]) {
     throw new AuthServiceError(
       "CONFLICT",
-      "品牌词库与问题目录工单尚未解锁或已经结束",
+      "品牌词库与问题目录需求尚未解锁或已经结束",
     );
   }
   try {
-    return await approveWorkspaceQuestionSelection({
-      userId: role.customerUserId,
-      questionId: input.questionId,
-      expectedRevision: input.expectedRevision,
-      actorUserId: input.actor.id,
-    });
+    return await db.transaction(async (tx) =>
+      approveWorkspaceQuestionSelection(
+        {
+          userId: role.customerUserId,
+          questionId: input.questionId,
+          expectedRevision: input.expectedRevision,
+          category: input.category,
+          actorUserId: input.actor.id,
+        },
+        {
+          executor: tx,
+          afterWrite: async (executor, approvedQuestion) => {
+            const reviewRows = await executor
+              .select()
+              .from(deliveryTickets)
+              .where(
+                and(
+                  eq(deliveryTickets.userId, role.customerUserId),
+                  eq(deliveryTickets.sourceQuestionId, approvedQuestion.id),
+                  eq(deliveryTickets.operation, "question_maintenance"),
+                  eq(deliveryTickets.category, "question_review"),
+                  inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+                ),
+              )
+              .limit(1)
+              .for("update");
+            const review = reviewRows[0];
+            if (!review) return;
+            const now = new Date();
+            const message = "自主填写问题已通过专业审核并进入当前服务。";
+            await executor
+              .update(deliveryTickets)
+              .set({
+                status: "completed",
+                publicSummary: message,
+                technicalDedupeKey: null,
+                resolvedAt: now,
+                revision: sql`${deliveryTickets.revision} + 1`,
+                updatedByUserId: input.actor.id,
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(deliveryTickets.id, review.id),
+                  eq(deliveryTickets.revision, review.revision),
+                ),
+              );
+            await executor.insert(deliveryTicketEvents).values({
+              id: randomUUID(),
+              ticketId: review.id,
+              userId: role.customerUserId,
+              actorUserId: input.actor.id,
+              actorRole:
+                input.actor.role === "admin" ? "admin" : "delivery_member",
+              actorContext: {
+                projectAssignmentId: role.projectAssignmentId,
+                customerUserId: role.customerUserId,
+                roleType: role.roleType,
+              },
+              kind: "status_change",
+              visibility: "customer",
+              message,
+              fromStatus: review.status,
+              toStatus: "completed",
+              createdAt: now,
+            });
+          },
+        },
+      ),
+    );
   } catch (error) {
     if (error instanceof ServiceEntitlementError) {
       throw new AuthServiceError("CONFLICT", error.message);
     }
     throw error;
   }
+}
+
+export async function rejectMyCustomerQuestionSelection(input: {
+  actor: AuthenticatedUser;
+  projectAssignmentId: string;
+  questionId: string;
+  expectedRevision: number;
+  reason: string;
+}) {
+  const reason = input.reason.trim();
+  if (!reason) {
+    throw new AuthServiceError("CONFLICT", "拒绝时必须填写原因");
+  }
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    // Keep the assignment authorization and the rejection write in one lock
+    // scope. Otherwise a reassigned engineer could race the authorization
+    // read and still end the customer's review ticket afterward.
+    await tx
+      .select({ id: deliveryProjectAssignments.id })
+      .from(deliveryProjectAssignments)
+      .where(eq(deliveryProjectAssignments.id, input.projectAssignmentId))
+      .limit(1)
+      .for("update");
+    const role = await assertDeliveryProjectContext({
+      actor: input.actor,
+      projectAssignmentId: input.projectAssignmentId,
+      expectedRoleType: "monitoring_optimization_engineer",
+      executor: tx,
+    });
+    const catalogRows = await tx
+      .select({ id: deliveryTickets.id })
+      .from(deliveryTickets)
+      .where(
+        and(
+          eq(
+            deliveryTickets.assignedProjectAssignmentId,
+            role.projectAssignmentId,
+          ),
+          eq(deliveryTickets.userId, role.customerUserId),
+          eq(deliveryTickets.operation, "question_catalog"),
+          inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!catalogRows[0]) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "品牌词库与问题目录需求尚未解锁或已经结束",
+      );
+    }
+    const questionRows = await tx
+      .select()
+      .from(workspaceQuestions)
+      .where(
+        and(
+          eq(workspaceQuestions.id, input.questionId),
+          eq(workspaceQuestions.userId, role.customerUserId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    const question = questionRows[0];
+    if (
+      !question ||
+      question.status !== "candidate" ||
+      question.selectionApprovalStatus !== "pending" ||
+      question.revision !== input.expectedRevision
+    ) {
+      throw new AuthServiceError("CONFLICT", "待审核问题已变化，请刷新后重试");
+    }
+    const reviewRows = await tx
+      .select()
+      .from(deliveryTickets)
+      .where(
+        and(
+          eq(deliveryTickets.userId, role.customerUserId),
+          eq(deliveryTickets.sourceQuestionId, question.id),
+          eq(deliveryTickets.operation, "question_maintenance"),
+          eq(deliveryTickets.category, "question_review"),
+          inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    const review = reviewRows[0];
+    if (!review) {
+      throw new AuthServiceError("NOT_FOUND", "对应的问题审核需求不存在");
+    }
+    const now = new Date();
+    const publicSummary = `自主填写问题未通过专业审核：${reason}`;
+    await tx
+      .update(workspaceQuestions)
+      .set({
+        status: "archived",
+        selectionApprovalStatus: "not_requested",
+        locked: false,
+        revision: sql`${workspaceQuestions.revision} + 1`,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(workspaceQuestions.id, question.id),
+          eq(workspaceQuestions.revision, input.expectedRevision),
+        ),
+      );
+    await tx
+      .update(deliveryTickets)
+      .set({
+        status: "rejected",
+        publicSummary,
+        technicalDedupeKey: null,
+        resolvedAt: now,
+        revision: sql`${deliveryTickets.revision} + 1`,
+        updatedByUserId: input.actor.id,
+        updatedAt: now,
+      })
+      .where(eq(deliveryTickets.id, review.id));
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID(),
+      ticketId: review.id,
+      userId: role.customerUserId,
+      actorUserId: input.actor.id,
+      actorRole: input.actor.role === "admin" ? "admin" : "delivery_member",
+      actorContext: {
+        projectAssignmentId: role.projectAssignmentId,
+        customerUserId: role.customerUserId,
+        roleType: role.roleType,
+      },
+      kind: "status_change",
+      visibility: "customer",
+      message: publicSummary,
+      fromStatus: review.status,
+      toStatus: "rejected",
+      createdAt: now,
+    });
+    if (input.actor.role === "admin") {
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "delivery_ticket.system_admin_override",
+          targetType: "delivery_ticket",
+          targetId: review.id,
+          workspaceUserId: role.customerUserId,
+          metadata: {
+            command: "reject_question_selection",
+            projectAssignmentId: role.projectAssignmentId,
+            questionId: question.id,
+            reason,
+          },
+          now,
+        },
+        tx,
+      );
+    }
+    return { success: true as const, revision: question.revision + 1 };
+  });
 }
 
 const MEMBER_TICKET_TRANSITIONS: Record<string, readonly string[]> = {
@@ -2031,12 +2602,36 @@ export function assertGenericDeliveryTicketTransition(input: {
   nextStatus: DeliveryExecutionTransitionStatus;
 }) {
   if (
+    input.operation === "brand_tracking_setup" &&
+    ["rejected", "cancelled"].includes(input.nextStatus)
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "舆情监控启用需求不能拒绝或取消；请完成客户独立凭证配置后显式完成",
+    );
+  }
+  if (input.operation === "question_maintenance") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "问题与应答逻辑维护必须使用专用审批操作",
+    );
+  }
+  if (
     input.operation === "website_style_samples" &&
     input.nextStatus === "completed"
   ) {
     throw new AuthServiceError(
       "CONFLICT",
-      "官网风格样例必须由客户通过专用选择操作确认，不能直接完成工单",
+      "官网风格样例必须由客户通过专用选择操作确认，不能直接完成需求",
+    );
+  }
+  if (
+    input.operation === "website_build" &&
+    (input.nextStatus === "rejected" || input.nextStatus === "cancelled")
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "官网构建工单不能拒绝或取消；如需客户补充资料，请设为等待补充后继续处理",
     );
   }
 }
@@ -2048,7 +2643,265 @@ export function assertDeliveryCompletionSummary(input: {
   if (input.nextStatus === "completed" && !input.message?.trim()) {
     throw new AuthServiceError(
       "CONFLICT",
-      "完成工单前必须填写客户可见的结果摘要",
+      "完成需求前必须填写客户可见的结果摘要",
+    );
+  }
+  if (
+    input.nextStatus === "completed" &&
+    input.message &&
+    deliverySummaryLooksLikeCredentialSecret(input.message)
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "结果摘要疑似包含密钥或令牌，请仅填写已配置、已验证等非敏感结论",
+    );
+  }
+}
+
+export function assertLegacyDeliverySummaryClose(input: {
+  nextStatus: DeliveryExecutionTransitionStatus;
+  message?: string;
+  publicUrl?: string;
+  previewVerified?: boolean;
+  handoff?: DeliveryTicketHandoff;
+}) {
+  const message = input.message?.trim() || "";
+  if (input.nextStatus !== "completed") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "历史需求只支持填写非敏感摘要后关闭",
+    );
+  }
+  if (
+    input.publicUrl !== undefined ||
+    input.previewVerified !== undefined ||
+    input.handoff !== undefined
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "历史需求关闭时不能提交链接、验收标记或结构化交接数据",
+    );
+  }
+  if (!message) {
+    throw new AuthServiceError("CONFLICT", "关闭历史需求时必须填写结果摘要");
+  }
+  if (deliverySummaryLooksLikeCredentialSecret(message)) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "结果摘要疑似包含密钥或令牌，请仅填写已配置、已验证等非敏感结论",
+    );
+  }
+}
+
+function submittedDeliveryHandoffKeys(
+  handoff: DeliveryTicketHandoff | undefined,
+) {
+  if (!handoff) return [] as Array<keyof DeliveryTicketHandoff>;
+  return (Object.keys(handoff) as Array<keyof DeliveryTicketHandoff>).filter(
+    (key) => handoff[key] !== undefined,
+  );
+}
+
+function submittedDeliveryEvidencePaths(input: {
+  message?: string;
+  publicUrl?: string;
+  previewVerified?: boolean;
+  handoff?: DeliveryTicketHandoff;
+}) {
+  const paths: string[] = [];
+  if (input.message !== undefined) paths.push("message");
+  if (input.publicUrl !== undefined) paths.push("publicUrl");
+  if (input.previewVerified !== undefined) paths.push("previewVerified");
+  for (const key of submittedDeliveryHandoffKeys(input.handoff)) {
+    paths.push(`handoff.${key}`);
+  }
+  return paths;
+}
+
+export function assertDeliveryCompletionContract(input: {
+  operation: string | null;
+  nextStatus: DeliveryExecutionTransitionStatus;
+  message?: string;
+  publicUrl?: string;
+  previewVerified?: boolean;
+  handoff?: DeliveryTicketHandoff;
+}) {
+  const handoffKeys = submittedDeliveryHandoffKeys(input.handoff);
+  const spec = getDeliveryOperationSpec(input.operation);
+  if (!spec) {
+    assertLegacyDeliverySummaryClose(input);
+    return;
+  }
+  if (spec.completion.mode === "system_readonly") {
+    throw new AuthServiceError("CONFLICT", "该记录只能由系统流程关闭");
+  }
+  if (input.nextStatus !== "completed") {
+    if (
+      input.publicUrl !== undefined ||
+      input.previewVerified !== undefined ||
+      handoffKeys.length
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "处理中、待补充、拒绝或取消时只能填写说明，不能提交交付结果字段",
+      );
+    }
+    return;
+  }
+  if (spec.completion.mode !== "form") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "该需求必须使用专用处理流程，不能通过普通完成操作关闭",
+    );
+  }
+  const allowedEvidence = new Set<string>(
+    deliveryOperationAllowedEvidence(input.operation),
+  );
+  const disallowedPaths = submittedDeliveryEvidencePaths(input).filter(
+    (path) => !allowedEvidence.has(path),
+  );
+  if (disallowedPaths.length) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      `当前需求不接收以下交付字段：${disallowedPaths.join("、")}`,
+    );
+  }
+  const publicUrl = input.publicUrl?.trim();
+  if (spec.completion.publicUrl === "hidden" && publicUrl) {
+    throw new AuthServiceError("CONFLICT", "当前需求不接收公开链接");
+  }
+  if (spec.completion.publicUrl === "required" && !publicUrl) {
+    throw new AuthServiceError("CONFLICT", "发布完成时必须登记公开链接");
+  }
+  if (
+    spec.completion.previewVerification === "hidden" &&
+    input.previewVerified
+  ) {
+    throw new AuthServiceError("CONFLICT", "当前需求不接收页面验收标记");
+  }
+  if (
+    spec.completion.previewVerification === "required" &&
+    input.previewVerified !== true
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "完成官网构建前必须确认已核验用户实际页面",
+    );
+  }
+  if (
+    input.operation === "channel_distribution" &&
+    !input.handoff?.targetMedia?.trim()
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "完成渠道分发前必须选择实际发布媒体",
+    );
+  }
+  if (
+    ["initial_monitoring", "monitoring_import", "monitoring_retest"].includes(
+      input.operation || "",
+    ) &&
+    !input.handoff?.monitoringBatchKey?.trim()
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "完成监控需求前必须绑定已发布的正式监控批次",
+    );
+  }
+  if (
+    input.operation === "stage_report" &&
+    typeof input.handoff?.needsFurtherOptimization !== "boolean"
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "完成阶段报告前必须明确是否需要继续优化",
+    );
+  }
+  if (
+    input.operation === "response_logic" &&
+    (!Number.isInteger(input.handoff?.responseLogicRevision) ||
+      Number(input.handoff?.responseLogicRevision) < 1)
+  ) {
+    throw new AuthServiceError("CONFLICT", "完成应答逻辑前必须登记正式版本");
+  }
+  if (
+    (input.operation === "content_asset_publish" ||
+      [
+        "company_facts",
+        "product_case_docs",
+        "industry_news",
+        "company_news",
+        "faq_content",
+      ].includes(input.operation || "")) &&
+    !input.handoff?.contentAssetIds?.some((id) => id.trim())
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "完成内容交付前必须绑定正式内容资产 ID",
+    );
+  }
+  if (
+    input.operation === "domain_application" &&
+    !input.handoff?.domain?.trim()
+  ) {
+    throw new AuthServiceError("CONFLICT", "完成域名需求前必须填写客户域名");
+  }
+  if (
+    input.operation === "icp_filing" &&
+    typeof input.handoff?.icpNotRequired !== "boolean"
+  ) {
+    throw new AuthServiceError("CONFLICT", "完成 ICP 备案前必须明确备案结果");
+  }
+  if (
+    input.operation === "site_check" &&
+    !input.handoff?.siteCheck?.source?.trim()
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "站点检查必须登记被检查页面或检查来源",
+    );
+  }
+  assertDeliveryCompletionEvidence({
+    operation: input.operation,
+    nextStatus: input.nextStatus,
+    linkRequired: spec.completion.publicUrl === "required",
+    publicUrl,
+    previewVerified: input.previewVerified,
+  });
+}
+
+export function assertDeliveryCompletionEvidence(input: {
+  operation: string | null;
+  nextStatus: DeliveryExecutionTransitionStatus;
+  linkRequired: boolean;
+  publicUrl?: string;
+  previewVerified?: boolean;
+}) {
+  if (input.nextStatus !== "completed") return;
+  if (input.linkRequired && !input.publicUrl) {
+    throw new AuthServiceError("CONFLICT", "发布完成时必须登记公开链接");
+  }
+  if (input.publicUrl) {
+    let parsed: URL;
+    try {
+      parsed = new URL(input.publicUrl);
+    } catch {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "公开链接必须是有效的 http(s) 地址",
+      );
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "公开链接必须是有效的 http(s) 地址",
+      );
+    }
+  }
+  if (input.operation === "website_build" && input.previewVerified !== true) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "完成官网构建前必须确认已核验用户实际页面",
     );
   }
 }
@@ -2085,12 +2938,26 @@ export function deriveDeliveryExecutionTransition(input: {
   };
 }
 
-async function createMonitoringRetestTicket(input: {
+export function monitoringRetestTechnicalDedupeKey(sourceQuestionId: string) {
+  const normalizedSourceQuestionId = sourceQuestionId.trim();
+  if (!normalizedSourceQuestionId) {
+    throw new AuthServiceError("CONFLICT", "效果复测必须绑定来源问题 ID");
+  }
+  return `monitoring-retest:${createHash("sha256")
+    .update(normalizedSourceQuestionId)
+    .digest("hex")
+    .slice(0, 46)}`;
+}
+
+export async function createMonitoringRetestTicket(input: {
   executor: any;
   sourceTicket: typeof deliveryTickets.$inferSelect;
   actorUserId: number;
 }) {
-  if (!input.sourceTicket.sourceQuestionId) return null;
+  const sourceQuestionId = input.sourceTicket.sourceQuestionId?.trim();
+  if (!sourceQuestionId) return null;
+  const technicalDedupeKey =
+    monitoringRetestTechnicalDedupeKey(sourceQuestionId);
   const owner = await getActiveDeliveryProjectOwner(
     input.executor,
     input.sourceTicket.userId,
@@ -2104,14 +2971,12 @@ async function createMonitoringRetestTicket(input: {
       and(
         eq(deliveryTickets.userId, input.sourceTicket.userId),
         eq(deliveryTickets.operation, "monitoring_retest"),
-        eq(
-          deliveryTickets.sourceQuestionId,
-          input.sourceTicket.sourceQuestionId,
-        ),
+        eq(deliveryTickets.sourceQuestionId, sourceQuestionId),
         inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
       ),
     )
-    .limit(1);
+    .limit(1)
+    .for("update");
   if (existingRows[0]) return existingRows[0].id;
   const periods = await input.executor
     .select({
@@ -2124,32 +2989,60 @@ async function createMonitoringRetestTicket(input: {
     .limit(1);
   const period = periods[0];
   if (!period) return null;
-  const id = randomUUID();
-  await input.executor.insert(deliveryTickets).values({
-    id,
-    userId: input.sourceTicket.userId,
-    contractId: period.contractId,
-    quotaPeriodId: period.id,
-    type: "website_operation",
-    quotaPool: null,
-    ordinal: 0,
-    clientRequestId: randomUUID(),
-    category: "monitoring_retest",
-    title: "发布效果复测",
-    description: "内容或官网页面已发布，请按原问题完成效果复测。",
-    workflowDomain: "monitoring_optimization_engineer",
-    operation: "monitoring_retest",
-    assignedProjectAssignmentId: owner.projectAssignmentId,
-    assignedMemberId: owner.engineerUserId,
-    sourceQuestionId: input.sourceTicket.sourceQuestionId,
-    monitoringBatchKey: input.sourceTicket.monitoringBatchKey,
-    responseLogicRevision: input.sourceTicket.responseLogicRevision,
-    contentAssetIds: input.sourceTicket.contentAssetIds,
-    quotaState: "consumed",
-    status: "submitted",
-    createdByUserId: input.actorUserId,
-    updatedByUserId: input.actorUserId,
-  });
+  const proposedId = randomUUID();
+  await input.executor
+    .insert(deliveryTickets)
+    .values({
+      id: proposedId,
+      userId: input.sourceTicket.userId,
+      contractId: period.contractId,
+      quotaPeriodId: period.id,
+      type: "website_operation",
+      quotaPool: null,
+      ordinal: 0,
+      clientRequestId: randomUUID(),
+      category: "monitoring_retest",
+      title: "发布效果复测",
+      description: "内容或官网页面已发布，请按原问题完成效果复测。",
+      workflowDomain: "monitoring_optimization_engineer",
+      operation: "monitoring_retest",
+      assignedProjectAssignmentId: owner.projectAssignmentId,
+      assignedMemberId: owner.engineerUserId,
+      sourceQuestionId,
+      monitoringBatchKey: input.sourceTicket.monitoringBatchKey,
+      responseLogicRevision: input.sourceTicket.responseLogicRevision,
+      contentAssetIds: input.sourceTicket.contentAssetIds,
+      technicalDedupeKey,
+      quotaState: "consumed",
+      status: "submitted",
+      createdByUserId: input.actorUserId,
+      updatedByUserId: input.actorUserId,
+    })
+    .onDuplicateKeyUpdate({
+      set: {
+        technicalDedupeKey: sql`${deliveryTickets.technicalDedupeKey}`,
+      },
+    });
+  const winnerRows = await input.executor
+    .select({ id: deliveryTickets.id })
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.userId, input.sourceTicket.userId),
+        eq(deliveryTickets.technicalDedupeKey, technicalDedupeKey),
+        inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const id = winnerRows[0]?.id;
+  if (!id) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "效果复测需求并发创建失败，请刷新后重试",
+    );
+  }
+  if (id !== proposedId) return id;
   await input.executor.insert(deliveryTicketEvents).values({
     id: randomUUID(),
     ticketId: id,
@@ -2158,7 +3051,7 @@ async function createMonitoringRetestTicket(input: {
     actorRole: "system",
     kind: "created",
     visibility: "customer",
-    message: "发布结果已登记，系统自动创建对应问题的效果复测工单。",
+    message: "发布结果已登记，系统自动创建对应问题的效果复测需求。",
     toStatus: "submitted",
     createdAt: new Date(),
   });
@@ -2170,6 +3063,7 @@ type DeliveryTicketHandoff = {
   optimizationQuestionIds?: string[];
   responseLogicRevision?: number;
   contentAssetIds?: string[];
+  targetMedia?: string;
   publishTargets?: Array<"media" | "website">;
   websiteOperation?:
     | "company_facts"
@@ -2193,7 +3087,109 @@ type DeliveryTicketHandoff = {
   };
 };
 
-async function createAssignedWorkflowTicket(input: {
+type WorkflowBillingTicket = Pick<
+  typeof deliveryTickets.$inferSelect,
+  | "id"
+  | "rootTicketId"
+  | "isWorkflowContainer"
+  | "userId"
+  | "contractId"
+  | "quotaPeriodId"
+>;
+
+export function resolveAssignedWorkflowBillingScope(input: {
+  sourceTicket: WorkflowBillingTicket;
+  rootTicket?: WorkflowBillingTicket | null;
+  latestPeriod?: { id: string; contractId: string } | null;
+}) {
+  const expectedRootTicketId =
+    input.sourceTicket.rootTicketId ||
+    (input.sourceTicket.isWorkflowContainer ? input.sourceTicket.id : null);
+  if (!expectedRootTicketId) {
+    if (!input.latestPeriod) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "客户服务周期尚未配置，不能创建下游需求",
+      );
+    }
+    return {
+      rootTicketId: null,
+      contractId: input.latestPeriod.contractId,
+      quotaPeriodId: input.latestPeriod.id,
+    };
+  }
+
+  const root = input.rootTicket;
+  const sourceBelongsToRoot = input.sourceTicket.isWorkflowContainer
+    ? input.sourceTicket.id === expectedRootTicketId
+    : input.sourceTicket.rootTicketId === expectedRootTicketId;
+  if (
+    !root ||
+    root.id !== expectedRootTicketId ||
+    !root.isWorkflowContainer ||
+    root.userId !== input.sourceTicket.userId ||
+    !sourceBelongsToRoot
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "工单工作流根关系无效，请联系系统管理员修复后重试",
+    );
+  }
+  return {
+    rootTicketId: root.id,
+    contractId: root.contractId,
+    quotaPeriodId: root.quotaPeriodId,
+  };
+}
+
+type WorkflowRootAttachmentMetadata = Pick<
+  typeof deliveryTicketAttachments.$inferSelect,
+  | "workspaceUserId"
+  | "ownerUserId"
+  | "kind"
+  | "upstreamFileId"
+  | "filename"
+  | "mimeType"
+  | "sizeBytes"
+  | "sha256"
+  | "purpose"
+  | "authorization"
+  | "copyrightNote"
+>;
+
+export function workflowChildAttachmentMetadataRows(input: {
+  attachments: readonly WorkflowRootAttachmentMetadata[];
+  ticketId: string;
+  eventId: string;
+  createdAt: Date;
+}) {
+  return input.attachments.map((attachment) => ({
+    id: randomUUID(),
+    ticketId: input.ticketId,
+    eventId: input.eventId,
+    workspaceUserId: attachment.workspaceUserId,
+    ownerUserId: attachment.ownerUserId,
+    kind: attachment.kind,
+    upstreamFileId: attachment.upstreamFileId,
+    filename: attachment.filename,
+    mimeType: attachment.mimeType,
+    sizeBytes: attachment.sizeBytes,
+    sha256: attachment.sha256,
+    purpose: attachment.purpose,
+    authorization: attachment.authorization,
+    copyrightNote: attachment.copyrightNote,
+    createdAt: input.createdAt,
+  }));
+}
+
+export function deliveryWorkflowStageKey(
+  operation: string,
+  discriminator?: string | null,
+) {
+  return `${operation}:${discriminator?.trim() || "default"}`;
+}
+
+export async function createAssignedWorkflowTicket(input: {
   executor: any;
   sourceTicket: typeof deliveryTickets.$inferSelect;
   actorUserId: number;
@@ -2230,13 +3226,43 @@ async function createAssignedWorkflowTicket(input: {
   if (!owner) {
     throw new AuthServiceError(
       "CONFLICT",
-      `${DELIVERY_ROLE_LABELS[input.workflowDomain]}尚未配置主负责人，不能创建下游工单`,
+      `${DELIVERY_ROLE_LABELS[input.workflowDomain]}尚未配置主负责人，不能创建下游需求`,
     );
   }
   const sourceQuestionId =
     input.sourceQuestionId?.trim() ||
     input.sourceTicket.sourceQuestionId ||
     null;
+  const rootTicketId =
+    input.sourceTicket.rootTicketId ||
+    (input.sourceTicket.isWorkflowContainer ? input.sourceTicket.id : null);
+  const relationshipScoped = Boolean(rootTicketId);
+  const workflowStageKey = deliveryWorkflowStageKey(
+    input.operation,
+    sourceQuestionId,
+  );
+  let billingScope: ReturnType<
+    typeof resolveAssignedWorkflowBillingScope
+  > | null = null;
+  if (rootTicketId) {
+    const rootRows = await input.executor
+      .select({
+        id: deliveryTickets.id,
+        rootTicketId: deliveryTickets.rootTicketId,
+        isWorkflowContainer: deliveryTickets.isWorkflowContainer,
+        userId: deliveryTickets.userId,
+        contractId: deliveryTickets.contractId,
+        quotaPeriodId: deliveryTickets.quotaPeriodId,
+      })
+      .from(deliveryTickets)
+      .where(eq(deliveryTickets.id, rootTicketId))
+      .limit(1)
+      .for("update");
+    billingScope = resolveAssignedWorkflowBillingScope({
+      sourceTicket: input.sourceTicket,
+      rootTicket: rootRows[0] ?? null,
+    });
+  }
   const existingRows = await input.executor
     .select({ id: deliveryTickets.id })
     .from(deliveryTickets)
@@ -2244,39 +3270,48 @@ async function createAssignedWorkflowTicket(input: {
       and(
         eq(deliveryTickets.userId, input.sourceTicket.userId),
         eq(deliveryTickets.operation, input.operation),
+        ...(relationshipScoped
+          ? [eq(deliveryTickets.parentTicketId, input.sourceTicket.id)]
+          : []),
         sourceQuestionId
           ? eq(deliveryTickets.sourceQuestionId, sourceQuestionId)
           : isNull(deliveryTickets.sourceQuestionId),
-        inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+        ...(relationshipScoped
+          ? []
+          : [inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)]),
       ),
     )
     .limit(1);
   if (existingRows[0]) return existingRows[0].id;
 
-  const periodRows = await input.executor
-    .select({
-      id: serviceQuotaPeriods.id,
-      contractId: serviceQuotaPeriods.contractId,
-    })
-    .from(serviceQuotaPeriods)
-    .where(eq(serviceQuotaPeriods.userId, input.sourceTicket.userId))
-    .orderBy(desc(serviceQuotaPeriods.endsAt))
-    .limit(1);
-  const period = periodRows[0];
-  if (!period) {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "客户服务周期尚未配置，不能创建下游工单",
-    );
+  if (!billingScope) {
+    const periodRows = await input.executor
+      .select({
+        id: serviceQuotaPeriods.id,
+        contractId: serviceQuotaPeriods.contractId,
+      })
+      .from(serviceQuotaPeriods)
+      .where(eq(serviceQuotaPeriods.userId, input.sourceTicket.userId))
+      .orderBy(desc(serviceQuotaPeriods.endsAt))
+      .limit(1);
+    billingScope = resolveAssignedWorkflowBillingScope({
+      sourceTicket: input.sourceTicket,
+      latestPeriod: periodRows[0] ?? null,
+    });
   }
 
   const id = randomUUID();
+  const eventId = randomUUID();
   const now = new Date();
   await input.executor.insert(deliveryTickets).values({
     id,
+    parentTicketId: input.sourceTicket.id,
+    rootTicketId,
+    workflowStageKey,
+    isWorkflowContainer: false,
     userId: input.sourceTicket.userId,
-    contractId: period.contractId,
-    quotaPeriodId: period.id,
+    contractId: billingScope.contractId,
+    quotaPeriodId: billingScope.quotaPeriodId,
     type:
       input.workflowDomain === "content_distribution_engineer"
         ? "content_asset"
@@ -2300,6 +3335,16 @@ async function createAssignedWorkflowTicket(input: {
       null,
     contentAssetIds:
       input.contentAssetIds ?? input.sourceTicket.contentAssetIds ?? [],
+    preferredMedia:
+      input.operation === "channel_distribution"
+        ? input.sourceTicket.preferredMedia
+        : null,
+    targetPage:
+      input.operation === "site_check"
+        ? input.sourceTicket.deliveryLinks?.[0]?.url ||
+          input.sourceTicket.targetPage ||
+          null
+        : null,
     quotaState: "consumed",
     status: "submitted",
     createdByUserId: input.actorUserId,
@@ -2308,13 +3353,13 @@ async function createAssignedWorkflowTicket(input: {
     updatedAt: now,
   });
   await input.executor.insert(deliveryTicketEvents).values({
-    id: randomUUID(),
+    id: eventId,
     ticketId: id,
     userId: input.sourceTicket.userId,
     actorUserId: input.actorUserId,
     actorRole: input.actorRoleContext.eventActorRole,
     kind: "created",
-    visibility: "customer",
+    visibility: "internal",
     message: input.description,
     toStatus: "submitted",
     actorContext: {
@@ -2327,7 +3372,515 @@ async function createAssignedWorkflowTicket(input: {
     },
     createdAt: now,
   });
+  if (rootTicketId) {
+    const rootAttachments = await input.executor
+      .select({
+        workspaceUserId: deliveryTicketAttachments.workspaceUserId,
+        ownerUserId: deliveryTicketAttachments.ownerUserId,
+        kind: deliveryTicketAttachments.kind,
+        upstreamFileId: deliveryTicketAttachments.upstreamFileId,
+        filename: deliveryTicketAttachments.filename,
+        mimeType: deliveryTicketAttachments.mimeType,
+        sizeBytes: deliveryTicketAttachments.sizeBytes,
+        sha256: deliveryTicketAttachments.sha256,
+        purpose: deliveryTicketAttachments.purpose,
+        authorization: deliveryTicketAttachments.authorization,
+        copyrightNote: deliveryTicketAttachments.copyrightNote,
+      })
+      .from(deliveryTicketAttachments)
+      .where(
+        and(
+          eq(deliveryTicketAttachments.ticketId, rootTicketId),
+          eq(
+            deliveryTicketAttachments.workspaceUserId,
+            input.sourceTicket.userId,
+          ),
+        ),
+      )
+      .orderBy(asc(deliveryTicketAttachments.createdAt));
+    const childAttachments = workflowChildAttachmentMetadataRows({
+      attachments: rootAttachments,
+      ticketId: id,
+      eventId,
+      createdAt: now,
+    });
+    if (childAttachments.length) {
+      await input.executor
+        .insert(deliveryTicketAttachments)
+        .values(childAttachments);
+    }
+  }
   return id;
+}
+
+type WorkflowAggregateStatus = (typeof deliveryTickets.$inferSelect)["status"];
+
+export function deriveWorkflowContainerStatus(
+  statuses: readonly WorkflowAggregateStatus[],
+): WorkflowAggregateStatus {
+  if (!statuses.length) return "submitted";
+  if (statuses.includes("rejected")) return "rejected";
+  if (statuses.includes("cancelled")) return "cancelled";
+  if (statuses.every((status) => status === "completed")) return "completed";
+  if (statuses.includes("needs_information")) return "needs_information";
+  if (statuses.includes("in_progress") || statuses.includes("completed")) {
+    return "in_progress";
+  }
+  if (statuses.includes("scheduled")) return "scheduled";
+  return "submitted";
+}
+
+function mergeWorkflowDeliveryLinks(
+  values: Array<Array<{ label: string; url: string }> | null | undefined>,
+) {
+  const links = new Map<string, { label: string; url: string }>();
+  for (const value of values) {
+    for (const link of value ?? []) {
+      const label = link?.label?.trim();
+      const url = link?.url?.trim();
+      if (label && url && !links.has(url)) links.set(url, { label, url });
+    }
+  }
+  return [...links.values()];
+}
+
+type WorkflowGraphTicket = Pick<
+  typeof deliveryTickets.$inferSelect,
+  "id" | "parentTicketId" | "rootTicketId" | "isWorkflowContainer" | "userId"
+>;
+
+export function workflowContainerChildrenScope(input: {
+  rootTicketId: string;
+  userId: number;
+}) {
+  return and(
+    eq(deliveryTickets.rootTicketId, input.rootTicketId),
+    eq(deliveryTickets.userId, input.userId),
+  );
+}
+
+export function assertWorkflowGraphIntegrity(input: {
+  root: WorkflowGraphTicket;
+  sourceTicket: Pick<WorkflowGraphTicket, "id" | "rootTicketId" | "userId">;
+  children: readonly WorkflowGraphTicket[];
+}) {
+  const invalidRoot =
+    !input.root.isWorkflowContainer ||
+    input.sourceTicket.rootTicketId !== input.root.id ||
+    input.sourceTicket.userId !== input.root.userId;
+  const childIds = new Set(input.children.map((child) => child.id));
+  const invalidChildren =
+    childIds.size !== input.children.length ||
+    !childIds.has(input.sourceTicket.id) ||
+    input.children.some(
+      (child) =>
+        child.id === input.root.id ||
+        child.isWorkflowContainer ||
+        child.rootTicketId !== input.root.id ||
+        child.userId !== input.root.userId ||
+        !child.parentTicketId ||
+        (child.parentTicketId !== input.root.id &&
+          !childIds.has(child.parentTicketId)),
+    );
+  if (invalidRoot || invalidChildren) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "工单工作流根关系无效，请联系系统管理员修复后重试",
+    );
+  }
+}
+
+async function syncWorkflowContainer(input: {
+  executor: any;
+  sourceTicket: typeof deliveryTickets.$inferSelect;
+  actorUserId: number;
+  actorRole: "admin" | "delivery_member";
+  actorContext: {
+    projectAssignmentId: string;
+    customerUserId: number;
+    roleType: DeliveryRoleType;
+  };
+  message?: string;
+  now: Date;
+}) {
+  const rootTicketId = input.sourceTicket.rootTicketId;
+  if (!rootTicketId) return null;
+  const rootRows = await input.executor
+    .select()
+    .from(deliveryTickets)
+    .where(eq(deliveryTickets.id, rootTicketId))
+    .limit(1)
+    .for("update");
+  const root = rootRows[0];
+  if (
+    !root ||
+    !root.isWorkflowContainer ||
+    root.userId !== input.sourceTicket.userId
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "工单工作流根关系无效，请联系系统管理员修复后重试",
+    );
+  }
+  const children = await input.executor
+    .select({
+      id: deliveryTickets.id,
+      parentTicketId: deliveryTickets.parentTicketId,
+      rootTicketId: deliveryTickets.rootTicketId,
+      isWorkflowContainer: deliveryTickets.isWorkflowContainer,
+      userId: deliveryTickets.userId,
+      status: deliveryTickets.status,
+      publicSummary: deliveryTickets.publicSummary,
+      deliveryLinks: deliveryTickets.deliveryLinks,
+      contentAssetIds: deliveryTickets.contentAssetIds,
+    })
+    .from(deliveryTickets)
+    .where(
+      workflowContainerChildrenScope({
+        rootTicketId: root.id,
+        userId: root.userId,
+      }),
+    );
+  assertWorkflowGraphIntegrity({
+    root,
+    sourceTicket: input.sourceTicket,
+    children,
+  });
+  const nextStatus = deriveWorkflowContainerStatus(
+    children.map((child: { status: WorkflowAggregateStatus }) => child.status),
+  );
+  const deliveryLinks = mergeWorkflowDeliveryLinks([
+    root.deliveryLinks,
+    ...children.map(
+      (child: { deliveryLinks: Array<{ label: string; url: string }> }) =>
+        child.deliveryLinks,
+    ),
+  ]);
+  const contentAssetIds = Array.from(
+    new Set(
+      children.flatMap(
+        (child: { contentAssetIds: string[] }) => child.contentAssetIds ?? [],
+      ),
+    ),
+  );
+  const summary =
+    input.message?.trim() ||
+    [...children]
+      .reverse()
+      .find((child: { publicSummary: string | null }) =>
+        Boolean(child.publicSummary?.trim()),
+      )
+      ?.publicSummary?.trim() ||
+    root.publicSummary;
+  const quotaState = deriveTicketQuotaTransition({
+    currentState: root.quotaState,
+    scheduledAt: root.scheduledAt,
+    nextStatus,
+  });
+  const terminal = ["completed", "rejected", "cancelled"].includes(nextStatus);
+  const started = ["in_progress", "completed"].includes(nextStatus);
+  await input.executor
+    .update(deliveryTickets)
+    .set({
+      status: nextStatus,
+      quotaState,
+      publicSummary: summary,
+      deliveryLinks,
+      contentAssetIds,
+      scheduledAt: started && !root.scheduledAt ? input.now : root.scheduledAt,
+      resolvedAt: terminal ? input.now : null,
+      quotaReleasedAt:
+        quotaState === "released" && root.quotaState !== "released"
+          ? input.now
+          : root.quotaReleasedAt,
+      revision: sql`${deliveryTickets.revision} + 1`,
+      updatedByUserId: input.actorUserId,
+      updatedAt: input.now,
+    })
+    .where(eq(deliveryTickets.id, root.id));
+  await input.executor.insert(deliveryTicketEvents).values({
+    id: randomUUID(),
+    ticketId: root.id,
+    userId: root.userId,
+    actorUserId: input.actorUserId,
+    actorRole: input.actorRole,
+    kind: root.status === nextStatus ? "delivery_result" : "status_change",
+    visibility: "customer",
+    message: summary,
+    fromStatus: root.status,
+    toStatus: nextStatus,
+    actorContext: {
+      ...input.actorContext,
+      sourceTicketId: input.sourceTicket.id,
+    },
+    createdAt: input.now,
+  });
+  return { rootTicketId: root.id, status: nextStatus };
+}
+
+async function ensureInitialMonitoringWorkflowTicket(input: {
+  executor: any;
+  sourceTicket: typeof deliveryTickets.$inferSelect;
+  actorUserId: number;
+}) {
+  const projectAssignmentId = input.sourceTicket.assignedProjectAssignmentId;
+  if (!projectAssignmentId) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "问题目录已完成，但监控优化项目负责人尚未配置",
+    );
+  }
+  const assignmentRows = await input.executor
+    .select({ id: deliveryProjectAssignments.id })
+    .from(deliveryProjectAssignments)
+    .where(
+      and(
+        eq(deliveryProjectAssignments.id, projectAssignmentId),
+        eq(
+          deliveryProjectAssignments.customerUserId,
+          input.sourceTicket.userId,
+        ),
+        eq(
+          deliveryProjectAssignments.roleType,
+          "monitoring_optimization_engineer",
+        ),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const owner = await getActiveDeliveryProjectOwner(
+    input.executor,
+    input.sourceTicket.userId,
+    "monitoring_optimization_engineer",
+  );
+  if (
+    !assignmentRows[0] ||
+    owner?.projectAssignmentId !== projectAssignmentId
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "问题目录已完成，但当前监控优化项目负责人已变化，请刷新后重试",
+    );
+  }
+
+  const now = new Date();
+  const [existingTickets, existingMilestones] = await Promise.all([
+    input.executor
+      .select({
+        id: deliveryTickets.id,
+        quotaPeriodId: deliveryTickets.quotaPeriodId,
+        status: deliveryTickets.status,
+        revision: deliveryTickets.revision,
+      })
+      .from(deliveryTickets)
+      .where(
+        reusableInitialMonitoringTicketScope({
+          userId: input.sourceTicket.userId,
+        }),
+      )
+      .orderBy(desc(deliveryTickets.updatedAt), desc(deliveryTickets.id))
+      .limit(10)
+      .for("update"),
+    input.executor
+      .select({ id: deliveryWorkflowMilestones.id })
+      .from(deliveryWorkflowMilestones)
+      .where(
+        and(
+          eq(deliveryWorkflowMilestones.userId, input.sourceTicket.userId),
+          eq(deliveryWorkflowMilestones.operation, "initial_monitoring"),
+        ),
+      )
+      .limit(1),
+  ]);
+  if (existingMilestones[0]) return { id: null, created: false as const };
+
+  const completedTicket = existingTickets.find(
+    (ticket: (typeof existingTickets)[number]) => ticket.status === "completed",
+  );
+  if (completedTicket) {
+    return { id: completedTicket.id, created: false as const };
+  }
+
+  const crossPeriodTickets = existingTickets.filter(
+    (ticket: (typeof existingTickets)[number]) =>
+      ticket.quotaPeriodId !== input.sourceTicket.quotaPeriodId,
+  );
+  const crossPeriodIds: string[] = [
+    ...new Set<string>(
+      crossPeriodTickets.map((ticket: (typeof existingTickets)[number]) =>
+        String(ticket.quotaPeriodId),
+      ),
+    ),
+  ];
+  const [completedCatalogRows, archivedCatalogRows, approvedQuestionRows] =
+    crossPeriodIds.length
+      ? await Promise.all([
+          input.executor
+            .selectDistinct({ quotaPeriodId: deliveryTickets.quotaPeriodId })
+            .from(deliveryTickets)
+            .where(
+              and(
+                eq(deliveryTickets.userId, input.sourceTicket.userId),
+                inArray(deliveryTickets.quotaPeriodId, crossPeriodIds),
+                eq(deliveryTickets.operation, "question_catalog"),
+                eq(deliveryTickets.status, "completed"),
+              ),
+            ),
+          input.executor
+            .select({ id: deliveryWorkflowMilestones.id })
+            .from(deliveryWorkflowMilestones)
+            .where(
+              and(
+                eq(
+                  deliveryWorkflowMilestones.userId,
+                  input.sourceTicket.userId,
+                ),
+                eq(deliveryWorkflowMilestones.operation, "question_catalog"),
+              ),
+            )
+            .limit(1),
+          input.executor
+            .selectDistinct({
+              quotaPeriodId: workspaceQuestions.quotaPeriodId,
+            })
+            .from(workspaceQuestions)
+            .where(
+              and(
+                eq(workspaceQuestions.userId, input.sourceTicket.userId),
+                inArray(workspaceQuestions.quotaPeriodId, crossPeriodIds),
+                eq(workspaceQuestions.status, "selected"),
+                eq(workspaceQuestions.selectionApprovalStatus, "approved"),
+              ),
+            ),
+        ])
+      : [[], [], []];
+  const completedCatalogPeriods = new Set(
+    completedCatalogRows.map(
+      (row: (typeof completedCatalogRows)[number]) => row.quotaPeriodId,
+    ),
+  );
+  const approvedQuestionPeriods = new Set(
+    approvedQuestionRows.map(
+      (row: (typeof approvedQuestionRows)[number]) => row.quotaPeriodId,
+    ),
+  );
+  const hasArchivedCatalog = Boolean(archivedCatalogRows[0]);
+  const reusableTicket = existingTickets.find(
+    (ticket: (typeof existingTickets)[number]) =>
+      initialMonitoringExistingTicketAction({
+        status: ticket.status,
+        ticketQuotaPeriodId: ticket.quotaPeriodId,
+        sourceQuotaPeriodId: input.sourceTicket.quotaPeriodId,
+        dependencySatisfied:
+          (completedCatalogPeriods.has(ticket.quotaPeriodId) ||
+            hasArchivedCatalog) &&
+          approvedQuestionPeriods.has(ticket.quotaPeriodId),
+      }) === "reuse",
+  );
+  const staleTickets = existingTickets.filter(
+    (ticket: (typeof existingTickets)[number]) =>
+      initialMonitoringExistingTicketAction({
+        status: ticket.status,
+        ticketQuotaPeriodId: ticket.quotaPeriodId,
+        sourceQuotaPeriodId: input.sourceTicket.quotaPeriodId,
+        dependencySatisfied:
+          (completedCatalogPeriods.has(ticket.quotaPeriodId) ||
+            hasArchivedCatalog) &&
+          approvedQuestionPeriods.has(ticket.quotaPeriodId),
+      }) === "replace_stale",
+  );
+  for (const staleTicket of staleTickets) {
+    await input.executor
+      .update(deliveryTickets)
+      .set({
+        status: "cancelled",
+        technicalDedupeKey: null,
+        resolvedAt: now,
+        revision: sql`${deliveryTickets.revision} + 1`,
+        updatedByUserId: input.actorUserId,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(deliveryTickets.id, staleTicket.id),
+          eq(deliveryTickets.revision, staleTicket.revision),
+          inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+        ),
+      );
+    await input.executor.insert(deliveryTicketEvents).values({
+      id: randomUUID(),
+      ticketId: staleTicket.id,
+      userId: input.sourceTicket.userId,
+      actorUserId: input.actorUserId,
+      actorRole: "system",
+      kind: "status_change",
+      visibility: "customer",
+      message:
+        "旧周期提前创建的首次问题监控需求已关闭；当前周期满足前置条件后已重新创建。",
+      fromStatus: staleTicket.status,
+      toStatus: "cancelled",
+      actorContext: {
+        projectAssignmentId: owner.projectAssignmentId,
+        customerUserId: input.sourceTicket.userId,
+        roleType: "monitoring_optimization_engineer",
+        sourceTicketId: input.sourceTicket.id,
+        assignedProjectAssignmentId: owner.projectAssignmentId,
+        assignedMemberId: owner.engineerUserId,
+      },
+      createdAt: now,
+    });
+  }
+  if (reusableTicket) {
+    return { id: reusableTicket.id, created: false as const };
+  }
+
+  const ticketId = randomUUID();
+  await input.executor.insert(deliveryTickets).values({
+    id: ticketId,
+    userId: input.sourceTicket.userId,
+    contractId: input.sourceTicket.contractId,
+    quotaPeriodId: input.sourceTicket.quotaPeriodId,
+    type: "website_operation",
+    quotaPool: null,
+    ordinal: 0,
+    clientRequestId: randomUUID(),
+    category: "initial_monitoring",
+    title: "执行首次问题监控",
+    description:
+      "品牌词库与问题目录已经完成，且至少一条优化问题已确认；请执行首次问题监控。",
+    workflowDomain: "monitoring_optimization_engineer",
+    operation: "initial_monitoring",
+    assignedProjectAssignmentId: owner.projectAssignmentId,
+    assignedMemberId: owner.engineerUserId,
+    technicalDedupeKey: "initial-monitoring",
+    quotaState: "consumed",
+    status: "submitted",
+    createdByUserId: input.actorUserId,
+    updatedByUserId: input.actorUserId,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await input.executor.insert(deliveryTicketEvents).values({
+    id: randomUUID(),
+    ticketId,
+    userId: input.sourceTicket.userId,
+    actorUserId: input.actorUserId,
+    actorRole: "system",
+    kind: "created",
+    visibility: "customer",
+    message: "优化问题已确认且问题目录已完成，首次问题监控需求现已创建。",
+    toStatus: "submitted",
+    actorContext: {
+      projectAssignmentId: owner.projectAssignmentId,
+      customerUserId: input.sourceTicket.userId,
+      roleType: "monitoring_optimization_engineer",
+      sourceTicketId: input.sourceTicket.id,
+      assignedProjectAssignmentId: owner.projectAssignmentId,
+      assignedMemberId: owner.engineerUserId,
+    },
+    createdAt: now,
+  });
+  return { id: ticketId, created: true as const };
 }
 
 async function ensureWebsiteStyleWorkflowTicket(input: {
@@ -2335,6 +3888,8 @@ async function ensureWebsiteStyleWorkflowTicket(input: {
   sourceTicket: typeof deliveryTickets.$inferSelect;
   actorUserId: number;
 }) {
+  const overseasDomainConfirmed =
+    input.sourceTicket.operation === "domain_application";
   const existingWorkflow = await input.executor
     .select()
     .from(websiteStyleWorkflows)
@@ -2351,7 +3906,9 @@ async function ensureWebsiteStyleWorkflowTicket(input: {
   if (!owner) {
     throw new AuthServiceError(
       "CONFLICT",
-      "备案已通过，但尚未分配 AI 运维工程师，无法创建官网风格样例任务",
+      overseasDomainConfirmed
+        ? "域名已确认，但尚未分配 AI 运维工程师，无法创建官网风格样例任务"
+        : "备案已通过，但尚未分配 AI 运维工程师，无法创建官网风格样例任务",
     );
   }
   const now = new Date();
@@ -2378,8 +3935,9 @@ async function ensureWebsiteStyleWorkflowTicket(input: {
     clientRequestId: randomUUID(),
     category: "website_style_samples",
     title: "提供 AI 专用官网图片风格样例",
-    description:
-      "ICP备案已确认，请提供三张图片风格样例供客户选择；客户确认后再开始官网构建与内容运营。",
+    description: overseasDomainConfirmed
+      ? "海外版企业域名已确认，请提供三张图片风格样例供客户选择；客户确认后系统会创建官网构建工单。"
+      : "ICP备案已确认，请提供三张图片风格样例供客户选择；客户确认后系统会创建官网构建工单。",
     workflowDomain: "ai_operations_engineer",
     operation: "website_style_samples",
     assignedProjectAssignmentId: owner.projectAssignmentId,
@@ -2400,7 +3958,9 @@ async function ensureWebsiteStyleWorkflowTicket(input: {
     actorRole: "system",
     kind: "created",
     visibility: "customer",
-    message: "备案结果已确认，正在等待工程师提供三张官网图片风格样例。",
+    message: overseasDomainConfirmed
+      ? "海外版企业域名已确认，正在等待工程师提供三张官网图片风格样例。"
+      : "备案结果已确认，正在等待工程师提供三张官网图片风格样例。",
     toStatus: "submitted",
     createdAt: now,
   });
@@ -2420,6 +3980,7 @@ export async function updateMyDeliveryTicket(input: {
     | "cancelled";
   message?: string;
   publicUrl?: string;
+  previewVerified?: boolean;
   handoff?: DeliveryTicketHandoff;
 }) {
   const eventActorRole = deliveryExecutionActorRole(input.actor);
@@ -2447,11 +4008,11 @@ export async function updateMyDeliveryTicket(input: {
     ) {
       throw new AuthServiceError(
         "NOT_FOUND",
-        "工单不属于当前项目岗位或无权处理",
+        "需求不属于当前项目岗位或无权处理",
       );
     }
     if (ticket.assignedProjectAssignmentId !== input.projectAssignmentId) {
-      throw new AuthServiceError("NOT_FOUND", "工单不属于当前客户项目岗位");
+      throw new AuthServiceError("NOT_FOUND", "需求不属于当前客户项目岗位");
     }
     const role = await assertDeliveryProjectContext({
       actor: input.actor,
@@ -2461,22 +4022,33 @@ export async function updateMyDeliveryTicket(input: {
       executor: tx,
     });
     if (ticket.assignedProjectAssignmentId !== role.projectAssignmentId) {
-      throw new AuthServiceError("NOT_FOUND", "工单不属于当前客户项目岗位");
+      throw new AuthServiceError("NOT_FOUND", "需求不属于当前客户项目岗位");
     }
     const operation = deliveryWorkflowOperationSchema.safeParse(
       ticket.operation,
     );
-    if (
-      !operation.success ||
-      !deliveryRoleOwnsOperation(role.roleType, operation.data)
-    ) {
+    if (ticket.credentialTargetUserId) {
       throw new AuthServiceError(
         "CONFLICT",
-        "旧版技术工单仅供只读查看，不能执行交付操作",
+        "凭据异常需求只能由系统管理员在统一 API Key 管理入口完成配置后自动关闭",
       );
     }
+    if (ticket.operation === "knowledge_delivery") {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "知识库交付记录只能由系统发布流程创建和关闭",
+      );
+    }
+    if (operation.success) {
+      if (!deliveryRoleOwnsOperation(role.roleType, operation.data)) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "需求不属于当前项目岗位，不能执行交付操作",
+        );
+      }
+    }
     if (ticket.revision !== input.expectedRevision) {
-      throw new AuthServiceError("CONFLICT", "工单已被更新，请刷新后重试");
+      throw new AuthServiceError("CONFLICT", "需求已被更新，请刷新后重试");
     }
     if (ticket.operation === "knowledge_reset") {
       throw new AuthServiceError("CONFLICT", "知识库重置必须使用专用审批操作");
@@ -2488,12 +4060,37 @@ export async function updateMyDeliveryTicket(input: {
     if (
       !(MEMBER_TICKET_TRANSITIONS[ticket.status] ?? []).includes(input.status)
     ) {
-      throw new AuthServiceError("CONFLICT", "当前工单状态不能执行该操作");
+      throw new AuthServiceError("CONFLICT", "当前需求状态不能执行该操作");
     }
     assertDeliveryCompletionSummary({
       nextStatus: input.status,
       message: input.message,
     });
+    assertDeliveryCompletionContract({
+      operation: ticket.operation,
+      nextStatus: input.status,
+      message: input.message,
+      publicUrl: input.publicUrl,
+      previewVerified: input.previewVerified,
+      handoff: input.handoff,
+    });
+    if (
+      input.handoff?.targetMedia &&
+      ticket.operation !== "channel_distribution"
+    ) {
+      throw new AuthServiceError("CONFLICT", "发布媒体只允许用于渠道分发需求");
+    }
+    if (
+      ticket.operation === "content_asset_publish" &&
+      (input.publicUrl ||
+        input.handoff?.publishTargets?.length ||
+        input.handoff?.websiteOperation)
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "内容资产发布只登记正式资产，不接收公开链接或人工指定下游路径",
+      );
+    }
     try {
       await assertExistingDeliveryTicketSettlementScope({
         executor: tx,
@@ -2509,27 +4106,18 @@ export async function updateMyDeliveryTicket(input: {
       }
       throw error;
     }
-    const linkRequired =
-      input.status === "completed" &&
-      (ticket.operation === "content_asset_publish" ||
-        ticket.operation === "channel_distribution" ||
-        [
-          "company_facts",
-          "product_case_docs",
-          "industry_news",
-          "company_news",
-          "faq_content",
-        ].includes(ticket.operation || ""));
-    if (linkRequired && !input.publicUrl) {
-      throw new AuthServiceError("CONFLICT", "发布完成时必须登记公开链接");
-    }
     const now = new Date();
+    const siteCheckFailed =
+      input.status === "completed" &&
+      ticket.operation === "site_check" &&
+      input.handoff?.siteCheck?.status === "failed";
+    const effectiveStatus: DeliveryExecutionTransitionStatus = input.status;
     const transition = deriveDeliveryExecutionTransition({
       currentQuotaState: ticket.quotaState,
       scheduledAt: ticket.scheduledAt,
       quotaReleasedAt: ticket.quotaReleasedAt,
       technicalDedupeKey: ticket.technicalDedupeKey,
-      nextStatus: input.status,
+      nextStatus: effectiveStatus,
       now,
     });
     const deliveryLinks = input.publicUrl
@@ -2550,6 +4138,8 @@ export async function updateMyDeliveryTicket(input: {
           .filter(Boolean),
       ),
     );
+    const targetMedia =
+      input.handoff?.targetMedia?.trim() || ticket.preferredMedia || null;
     let publishedDashboard:
       | ReturnType<typeof dashboardPayloadSchema.parse>
       | null
@@ -2578,6 +4168,7 @@ export async function updateMyDeliveryTicket(input: {
         .where(
           and(
             eq(workspaceQuestions.userId, ticket.userId),
+            eq(workspaceQuestions.quotaPeriodId, ticket.quotaPeriodId),
             eq(workspaceQuestions.status, "selected"),
             eq(workspaceQuestions.selectionApprovalStatus, "approved"),
           ),
@@ -2587,7 +4178,7 @@ export async function updateMyDeliveryTicket(input: {
       if (!questionRows[0] || !dashboard?.keywordTables.length) {
         throw new AuthServiceError(
           "CONFLICT",
-          "完成问题目录工单前必须先发布品牌词库，并至少审核通过一条客户选择的问题",
+          "完成问题目录需求前必须先发布品牌词库，并至少审核通过一条客户选择的问题",
         );
       }
     }
@@ -2604,6 +4195,7 @@ export async function updateMyDeliveryTicket(input: {
             .where(
               and(
                 eq(deliveryTickets.userId, ticket.userId),
+                eq(deliveryTickets.quotaPeriodId, ticket.quotaPeriodId),
                 eq(deliveryTickets.operation, "question_catalog"),
                 eq(deliveryTickets.status, "completed"),
               ),
@@ -2625,6 +4217,7 @@ export async function updateMyDeliveryTicket(input: {
             .where(
               and(
                 eq(workspaceQuestions.userId, ticket.userId),
+                eq(workspaceQuestions.quotaPeriodId, ticket.quotaPeriodId),
                 eq(workspaceQuestions.status, "selected"),
                 eq(workspaceQuestions.selectionApprovalStatus, "approved"),
               ),
@@ -2637,7 +4230,7 @@ export async function updateMyDeliveryTicket(input: {
       ) {
         throw new AuthServiceError(
           "CONFLICT",
-          "请先完成品牌词库与问题目录工单，并审核通过客户选择的问题",
+          "请先完成品牌词库与问题目录需求，并审核通过客户选择的问题",
         );
       }
     }
@@ -2651,7 +4244,7 @@ export async function updateMyDeliveryTicket(input: {
       if (!monitoringBatchKey) {
         throw new AuthServiceError(
           "CONFLICT",
-          "完成监控工单前必须绑定已发布的正式监控批次",
+          "完成监控需求前必须绑定已发布的正式监控批次",
         );
       }
       if (
@@ -2701,6 +4294,7 @@ export async function updateMyDeliveryTicket(input: {
               and(
                 eq(workspaceQuestions.userId, ticket.userId),
                 eq(workspaceQuestions.status, "selected"),
+                eq(workspaceQuestions.selectionApprovalStatus, "approved"),
                 inArray(workspaceQuestions.id, optimizationQuestionIds),
               ),
             ),
@@ -2789,13 +4383,40 @@ export async function updateMyDeliveryTicket(input: {
         );
       }
     }
+    if (
+      input.status === "completed" &&
+      ticket.operation === "channel_distribution"
+    ) {
+      if (!targetMedia) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "完成渠道分发前必须选择实际发布媒体",
+        );
+      }
+      const accountRows = await tx
+        .select({ marketEdition: users.marketEdition })
+        .from(users)
+        .where(eq(users.id, ticket.userId))
+        .limit(1);
+      const allowedMedia = new Set<string>(
+        contentAssetMediaOptionsForMarketEdition(
+          accountRows[0]?.marketEdition ?? "domestic",
+        ),
+      );
+      if (!allowedMedia.has(targetMedia)) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "所选发布媒体不属于当前客户版本，请刷新后重新选择",
+        );
+      }
+    }
 
     if (input.status === "completed" && ticket.operation === "stage_report") {
       const dashboard = await loadPublishedDashboard();
       if (!dashboard?.optimizationReport) {
         throw new AuthServiceError(
           "CONFLICT",
-          "完成阶段报告工单前必须先发布客户可见的正式优化报告",
+          "完成阶段报告需求前必须先发布客户可见的正式优化报告",
         );
       }
     }
@@ -2890,7 +4511,7 @@ export async function updateMyDeliveryTicket(input: {
       if (!replacementRows[0]) {
         throw new AuthServiceError(
           "CONFLICT",
-          "完成维护工单前必须先上传并发布通过校验的新知识库版本",
+          "完成维护需求前必须先上传并发布通过校验的新知识库版本",
         );
       }
     }
@@ -2902,7 +4523,7 @@ export async function updateMyDeliveryTicket(input: {
       if (!domainApplicationOverseas && !icpServiceCode) {
         throw new AuthServiceError(
           "CONFLICT",
-          "完成域名工单前必须填写要返回给客户的备案服务码",
+          "完成域名需求前必须填写要返回给客户的备案服务码",
         );
       }
       let domain: string;
@@ -2915,13 +4536,13 @@ export async function updateMyDeliveryTicket(input: {
       } catch {
         throw new AuthServiceError(
           "CONFLICT",
-          "完成域名申请前必须填写有效域名",
+          "完成域名核验前必须填写有效域名",
         );
       }
       if (!domain) {
         throw new AuthServiceError(
           "CONFLICT",
-          "完成域名申请前必须填写有效域名",
+          "完成域名核验前必须填写有效域名",
         );
       }
       const profileRows = await tx
@@ -2976,6 +4597,11 @@ export async function updateMyDeliveryTicket(input: {
       }
     }
     if (input.status === "completed" && ticket.operation === "icp_filing") {
+      const accountRows = await tx
+        .select({ marketEdition: users.marketEdition })
+        .from(users)
+        .where(eq(users.id, ticket.userId))
+        .limit(1);
       const profileRows = await tx
         .select()
         .from(workspaceSiteProfiles)
@@ -2986,10 +4612,16 @@ export async function updateMyDeliveryTicket(input: {
       if (!profile || profile.domainStatus !== "completed") {
         throw new AuthServiceError(
           "CONFLICT",
-          "必须先完成域名核验，才能完成 ICP 备案工单",
+          "必须先完成域名核验，才能完成 ICP 备案需求",
         );
       }
       const notRequired = input.handoff?.icpNotRequired === true;
+      if (notRequired && accountRows[0]?.marketEdition !== "overseas") {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "国内版官网必须填写已通过的 ICP 备案结果",
+        );
+      }
       const icpNumber = input.handoff?.icpNumber?.trim() || null;
       if (!notRequired && !icpNumber) {
         throw new AuthServiceError(
@@ -3024,10 +4656,10 @@ export async function updateMyDeliveryTicket(input: {
           "完成站点检查前必须登记检查结果",
         );
       }
-      if (check.status === "failed") {
+      if (!check.source?.trim()) {
         throw new AuthServiceError(
           "CONFLICT",
-          "站点检查未通过时不能完成工单；请先修正页面，或将工单设为等待补充后继续处理",
+          "站点检查必须登记被检查页面或检查来源",
         );
       }
       const checkRows = await tx
@@ -3047,7 +4679,7 @@ export async function updateMyDeliveryTicket(input: {
         status: check.status,
         summary: check.summary?.trim() || null,
         evidence: check.evidence?.trim() || null,
-        source: check.source?.trim() || null,
+        source: check.source?.trim() || ticket.targetPage?.trim() || null,
         checkedAt: now,
         revision: (current?.revision ?? 0) + 1,
         updatedByUserId: input.actor.id,
@@ -3071,10 +4703,10 @@ export async function updateMyDeliveryTicket(input: {
     await tx
       .update(deliveryTickets)
       .set({
-        status: input.status,
+        status: effectiveStatus,
         quotaState: transition.quotaState,
         publicSummary:
-          input.status === "completed" &&
+          effectiveStatus === "completed" &&
           ticket.operation === "domain_application"
             ? domainApplicationOverseas
               ? "海外版域名已核验；中国香港或海外节点无需办理工信部 ICP 备案。"
@@ -3084,6 +4716,7 @@ export async function updateMyDeliveryTicket(input: {
         monitoringBatchKey,
         responseLogicRevision,
         contentAssetIds,
+        preferredMedia: targetMedia,
         scheduledAt: transition.scheduledAt,
         quotaReleasedAt: transition.quotaReleasedAt,
         resolvedAt: transition.resolvedAt,
@@ -3100,14 +4733,18 @@ export async function updateMyDeliveryTicket(input: {
       actorUserId: input.actor.id,
       actorRole: eventActorRole,
       kind: "status_change",
-      visibility: "customer",
+      visibility: ticket.rootTicketId ? "internal" : "customer",
       message: input.message?.trim() || null,
       fromStatus: ticket.status,
-      toStatus: input.status,
+      toStatus: effectiveStatus,
       actorContext: {
         projectAssignmentId: input.projectAssignmentId,
         customerUserId: role.customerUserId,
         roleType: role.roleType,
+        ...(effectiveStatus === "completed" &&
+        ticket.operation === "website_build"
+          ? { previewVerified: input.previewVerified === true }
+          : {}),
       },
       createdAt: now,
     });
@@ -3116,6 +4753,8 @@ export async function updateMyDeliveryTicket(input: {
       monitoringBatchKey,
       responseLogicRevision,
       contentAssetIds,
+      deliveryLinks,
+      preferredMedia: targetMedia,
     };
     const actorRoleContext = {
       projectAssignmentId: input.projectAssignmentId,
@@ -3124,8 +4763,18 @@ export async function updateMyDeliveryTicket(input: {
       eventActorRole,
     };
     const handoffTicketIds: string[] = [];
-    if (input.status === "completed") {
-      if (
+    if (effectiveStatus === "completed") {
+      if (ticket.operation === "question_catalog") {
+        const initialMonitoringHandoff =
+          await ensureInitialMonitoringWorkflowTicket({
+            executor: tx,
+            sourceTicket: ticket,
+            actorUserId: input.actor.id,
+          });
+        if (initialMonitoringHandoff.created && initialMonitoringHandoff.id) {
+          handoffTicketIds.push(initialMonitoringHandoff.id);
+        }
+      } else if (
         ticket.operation === "initial_monitoring" ||
         ticket.operation === "monitoring_import"
       ) {
@@ -3170,10 +4819,32 @@ export async function updateMyDeliveryTicket(input: {
           }),
         );
       } else if (ticket.operation === "content_asset_publish") {
-        const targets: Array<"media" | "website"> = input.handoff
-          ?.publishTargets?.length
-          ? Array.from(new Set(input.handoff.publishTargets))
-          : ["media"];
+        const rootRows = ticket.rootTicketId
+          ? await tx
+              .select({
+                id: deliveryTickets.id,
+                type: deliveryTickets.type,
+                category: deliveryTickets.category,
+                isWorkflowContainer: deliveryTickets.isWorkflowContainer,
+              })
+              .from(deliveryTickets)
+              .where(eq(deliveryTickets.id, ticket.rootTicketId))
+              .limit(1)
+          : [];
+        const workflowRoot = rootRows[0];
+        const rootWebsiteOperation =
+          workflowRoot?.isWorkflowContainer &&
+          workflowRoot.type === "website_operation" &&
+          websiteContentOperations.includes(workflowRoot.category || "")
+            ? (workflowRoot.category as DeliveryTicketHandoff["websiteOperation"])
+            : undefined;
+        const targets: Array<"media" | "website"> = workflowRoot
+          ? workflowRoot.type === "website_operation"
+            ? ["website"]
+            : ["media"]
+          : input.handoff?.publishTargets?.length
+            ? Array.from(new Set(input.handoff.publishTargets))
+            : ["media"];
         if (targets.includes("media")) {
           handoffTicketIds.push(
             await createAssignedWorkflowTicket({
@@ -3193,11 +4864,13 @@ export async function updateMyDeliveryTicket(input: {
           if (!contentAssetIds.length) {
             throw new AuthServiceError(
               "CONFLICT",
-              "创建官网发布工单前必须绑定已确认的内容资产 ID",
+              "创建官网发布需求前必须绑定已确认的内容资产 ID",
             );
           }
-          if (!input.handoff?.websiteOperation) {
-            throw new AuthServiceError("CONFLICT", "请选择官网内容工单类型");
+          const websiteOperation =
+            rootWebsiteOperation || input.handoff?.websiteOperation;
+          if (!websiteOperation) {
+            throw new AuthServiceError("CONFLICT", "请选择官网内容需求类型");
           }
           handoffTicketIds.push(
             await createAssignedWorkflowTicket({
@@ -3206,7 +4879,7 @@ export async function updateMyDeliveryTicket(input: {
               actorUserId: input.actor.id,
               actorRoleContext,
               workflowDomain: "ai_operations_engineer",
-              operation: input.handoff.websiteOperation,
+              operation: websiteOperation,
               title: "将已确认内容发布到客户官网",
               description:
                 "内容资产已经确认，请按绑定资产发布官网页面并登记公开链接。",
@@ -3269,11 +4942,49 @@ export async function updateMyDeliveryTicket(input: {
             contentAssetIds,
           }),
         );
+      } else if (ticket.operation === "site_check" && siteCheckFailed) {
+        const parentRows = ticket.parentTicketId
+          ? await tx
+              .select()
+              .from(deliveryTickets)
+              .where(eq(deliveryTickets.id, ticket.parentTicketId))
+              .limit(1)
+          : [];
+        const websiteParent = parentRows[0];
+        if (
+          !websiteParent ||
+          !websiteContentOperations.includes(websiteParent.operation || "")
+        ) {
+          throw new AuthServiceError(
+            "CONFLICT",
+            "站点检查未通过，但无法定位需修正的官网发布子任务",
+          );
+        }
+        handoffTicketIds.push(
+          await createAssignedWorkflowTicket({
+            executor: tx,
+            sourceTicket,
+            actorUserId: input.actor.id,
+            actorRoleContext,
+            workflowDomain: "ai_operations_engineer",
+            operation: websiteParent.operation as
+              | "company_facts"
+              | "product_case_docs"
+              | "industry_news"
+              | "company_news"
+              | "faq_content",
+            title: "修正未通过站点检查的官网内容",
+            description:
+              "站点检查已记录为失败，请修正原官网页面并重新登记可访问链接；完成后系统会再次创建站点检查。",
+            contentAssetIds,
+          }),
+        );
       }
     }
     let retestTicketId: string | null = null;
     if (
-      input.status === "completed" &&
+      effectiveStatus === "completed" &&
+      !siteCheckFailed &&
       operation.success &&
       deliveryOperationTriggersMonitoringRetest(operation.data)
     ) {
@@ -3283,6 +4994,24 @@ export async function updateMyDeliveryTicket(input: {
         actorUserId: input.actor.id,
       });
     }
+    const containerUpdate = await syncWorkflowContainer({
+      executor: tx,
+      sourceTicket: {
+        ...sourceTicket,
+        status: effectiveStatus,
+        publicSummary: input.message?.trim() || sourceTicket.publicSummary,
+        deliveryLinks,
+      },
+      actorUserId: input.actor.id,
+      actorRole: eventActorRole,
+      actorContext: {
+        projectAssignmentId: input.projectAssignmentId,
+        customerUserId: role.customerUserId,
+        roleType: role.roleType,
+      },
+      message: input.message,
+      now,
+    });
     if (systemAdmin) {
       await writeWorkspaceAuditEvent(
         {
@@ -3298,11 +5027,13 @@ export async function updateMyDeliveryTicket(input: {
             assignedMemberId: ticket.assignedMemberId,
             operation: ticket.operation,
             fromStatus: ticket.status,
-            toStatus: input.status,
+            toStatus: effectiveStatus,
             fromRevision: ticket.revision,
             toRevision: ticket.revision + 1,
             handoffTicketIds,
             retestTicketId,
+            rootTicketId: containerUpdate?.rootTicketId ?? null,
+            rootStatus: containerUpdate?.status ?? null,
           },
           now,
         },
@@ -3314,6 +5045,8 @@ export async function updateMyDeliveryTicket(input: {
       revision: ticket.revision + 1,
       retestTicketId,
       handoffTicketIds,
+      rootTicketId: containerUpdate?.rootTicketId ?? null,
+      rootStatus: containerUpdate?.status ?? null,
     };
   });
 }
@@ -3442,7 +5175,12 @@ export async function createKnowledgeMonitoringHandoff(input: {
       input.userId,
       "monitoring_optimization_engineer",
     );
-    const operations = ["question_catalog", "initial_monitoring"] as const;
+    // Publishing the knowledge base unlocks only the catalog work. The first
+    // monitoring ticket is created later, atomically with successful catalog
+    // completion, after at least one optimization question is confirmed.
+    const operations = knowledgeMonitoringHandoffOperations();
+    const reusableTicketStatuses =
+      knowledgeMonitoringHandoffReusableTicketStatuses();
     const [existingTickets, existingMilestones] = await Promise.all([
       tx
         .select({ operation: deliveryTickets.operation })
@@ -3451,6 +5189,7 @@ export async function createKnowledgeMonitoringHandoff(input: {
           and(
             eq(deliveryTickets.userId, input.userId),
             inArray(deliveryTickets.operation, [...operations]),
+            inArray(deliveryTickets.status, [...reusableTicketStatuses]),
           ),
         ),
       tx
@@ -3481,10 +5220,7 @@ export async function createKnowledgeMonitoringHandoff(input: {
         ordinal: 0,
         clientRequestId: randomUUID(),
         category: operation,
-        title:
-          operation === "question_catalog"
-            ? "配置品牌词库与问题目录"
-            : "执行首次问题监控",
+        title: "配置品牌词库与问题目录",
         workflowDomain: "monitoring_optimization_engineer",
         operation,
         assignedProjectAssignmentId: owner?.projectAssignmentId ?? null,
@@ -3502,10 +5238,7 @@ export async function createKnowledgeMonitoringHandoff(input: {
         actorRole: "system",
         kind: "created",
         visibility: "customer",
-        message:
-          operation === "question_catalog"
-            ? "知识库已发布，品牌词库与问题目录配置工单已解锁。"
-            : "首次问题监控工单已创建；完成问题目录并审核客户选题后自动解锁。",
+        message: "知识库已发布，品牌词库与问题目录配置需求已解锁。",
         toStatus: "submitted",
         createdAt: new Date(),
       });

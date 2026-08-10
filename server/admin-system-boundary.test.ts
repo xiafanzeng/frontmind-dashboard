@@ -31,7 +31,46 @@ function ordinaryAdminContext(): TrpcContext {
   };
 }
 
+function nonAdminContext(role: "user" | "delivery_member"): TrpcContext {
+  const now = new Date("2026-07-26T08:00:00.000Z");
+  const user: AuthenticatedUser = {
+    id: role === "delivery_member" ? 84 : 85,
+    openId: null,
+    username: role === "delivery_member" ? "monitor.engineer" : "customer",
+    displayName: role === "delivery_member" ? "监控工程师" : "客户",
+    name: role === "delivery_member" ? "监控工程师" : "客户",
+    email: null,
+    loginMethod: "password",
+    role,
+    adminAccessLevel: null,
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+    lastSignedIn: now,
+  };
+  return {
+    user,
+    req: {} as TrpcContext["req"],
+    res: {} as TrpcContext["res"],
+  };
+}
+
 describe("system administrator boundary", () => {
+  it.each(["delivery_member", "user"] as const)(
+    "forbids %s accounts from permanently deleting customer demands",
+    async (role) => {
+      const caller = adminRouter.createCaller(nonAdminContext(role));
+      await expect(
+        caller.deliveryTickets.delete({
+          userId: 7,
+          ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+          expectedRevision: 1,
+          confirmation: "DELETE_TICKET",
+        }),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    },
+  );
+
   it("keeps the administrator citation summary in the selected platform and date scope", () => {
     expect(
       managedMonitoringCitationSummaryValue({
@@ -92,6 +131,16 @@ describe("system administrator boundary", () => {
           expectedRevision: 1,
           status: "completed",
           publicSummary: "已完成并核对交付结果。",
+        }),
+    ],
+    [
+      "permanently delete a customer demand",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.deliveryTickets.delete({
+          userId: 7,
+          ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
+          expectedRevision: 1,
+          confirmation: "DELETE_TICKET",
         }),
     ],
     [

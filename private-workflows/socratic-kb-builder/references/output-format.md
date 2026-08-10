@@ -135,7 +135,7 @@ Use this exact top-level contract. Extra fields are forbidden:
       "branchId": "products",
       "documentIds": ["3.1"],
       "sourcePageUrl": "https://official.example/",
-      "sourceAssetUrl": "https://official.example/media/logo.png",
+      "sourceAssetUrl": "https://official.example/media/logo.svg",
       "sourceKind": "official_web",
       "ownership": "first_party",
       "assetType": "brand_identity",
@@ -304,6 +304,16 @@ that display is not an upstream response attachment. The builder must still
 retain the verified upload in the final ZIP and bind it to the proper leaf or
 leaves. No other web-discovered image may be returned or packaged.
 
+For `sourceKind: official_web`, the initial `sourcePageUrl` and
+`sourceAssetUrl` are official provenance only. `sourceAssetUrl` may point to an
+SVG while the response contains a proportionally rendered, fully decodable PNG
+or WebP. Dashboard binds the returned raster bytes; the final ZIP copies those
+bound bytes exactly. The asset's `path`, `sha256`, `mimeType`, `bytes`, `width`
+and `height` therefore describe the returned/bound raster, not necessarily the
+remote source payload. Do not require raw-byte equality with the URL payload.
+This allowance never applies to `official_logo_upload`, which retains the
+exact original Dashboard-uploaded raster bytes.
+
 For schema version 2, compute `requiredFormalCharacters` exactly:
 
 - Overview with evidence: `max(120, min(target, floor(evidence * 0.25)))`,
@@ -380,6 +390,13 @@ use or target attainment.
   `sourceKind: official_web|official_document|official_logo_upload`,
   `assetType: brand_identity` and `displayRole: badge`, is at least 256×256,
   and links only to the first leaf.
+- For `official_web`, `sourcePageUrl` and `sourceAssetUrl` are provenance
+  fields, not packaged-byte identifiers. The source asset may be SVG. A
+  proportional PNG/WebP rendering is valid when it is fully decodable and
+  otherwise satisfies the raster gates. The ordinary asset hash, MIME, byte
+  length, dimensions and path describe the returned Dashboard-bound raster;
+  the final ZIP must copy that bound raster exactly rather than reproduce or
+  byte-compare the remote payload.
 - An `official_logo_upload` is valid only for Dashboard's post-manifest
   first-leaf Logo-required upload. It declares `ownership: first_party` and
   preserves all six server-ledger fields exactly: `sourceUploadIndex: 0`,
@@ -394,12 +411,16 @@ use or target attainment.
 - On a Dashboard final-delivery turn, the Skill archive,
   the uniquely named `frontmind-kb-finalization-input-<digest>.zip`, and every
   file inside it are
-  server-owned system inputs, not customer uploads. For each final asset, copy
+  application-managed workflow inputs, not customer uploads. For each final asset, copy
   `FINALIZATION_INPUT.json.assets[].requiredManifest` field-for-field. Never
   add, omit, infer, recover or substitute a provenance field. A
   `sourceUpload*` field is legal only when that exact field and value are
   present in the matching `requiredManifest`; task history and input filenames
   cannot authorize one.
+  The finalization input's `official_logo` file is the Dashboard-bound raster
+  to copy byte-for-byte. For `official_web`, that exact final-ZIP binding is
+  independent of the remote `sourceAssetUrl` payload; the URL remains
+  provenance only.
 - Generic customer-uploaded inline images are the sole non-Logo exception to
   the no-other-image rule. Each declares `sourceKind: user_upload`,
   `assetType: customer_supplied`,

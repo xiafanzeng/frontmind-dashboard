@@ -49,6 +49,10 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   /** The former browser reservation was atomically adopted by upload-first. */
   legacyUploadFirstTakeover?: boolean;
   clientAttachmentManifestHash?: string;
+  /** Hash of the browser-visible intent, excluding mutable server derivations. */
+  clientIntentHash?: string;
+  /** Presentation the customer actually saw before creating this operation. */
+  expectedPresentationKey?: string;
   clientStagedAttachments?: Array<{
     index: number;
     file_id: string;
@@ -113,6 +117,10 @@ export type KnowledgeBaseTurnReservationErrorCode =
   | "BUILD_NOT_FOUND"
   | "CONVERSATION_RESET"
   | "CONFLICT"
+  | "STALE_KNOWLEDGE_BASE_PRESENTATION"
+  | "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH"
+  | "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID"
+  | "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT"
   | "IDEMPOTENCY_PENDING"
   | "RESERVATION_NOT_FOUND"
   | "LEASE_LOST"
@@ -210,10 +218,21 @@ export interface ReserveKnowledgeBaseTurnInput {
   expectedRevision: number;
   expectedLeafId: string | null;
   /**
+   * Immutable identity of the approved presentation being answered. Optional
+   * only for pre-rollout callers and non-presentation maintenance operations.
+   */
+  expectedPresentationKey?: string;
+  /**
    * The exact logical request, excluding credentials. It is hashed and never
    * persisted verbatim. Array order is significant.
    */
   requestPayload: unknown;
+  /**
+   * Browser-visible request identity used by route-level replay detection.
+   * It deliberately excludes current task, credential, Logo gate and Skill
+   * selection because those values can change after the turn commits.
+   */
+  clientIntent?: unknown;
   apiCredentialId?: string | null;
   userText?: string;
   /** Customer-supplied files only; excludes generated Skill/prefill files. */
@@ -314,6 +333,76 @@ export interface KnowledgeBaseRecoveryClaim {
 export type KnowledgeBaseDeferredDispatchClaim =
   | ({ state: "acquired" } & KnowledgeBaseRecoveryClaim)
   | Exclude<KnowledgeBaseTurnReservation, { state: "acquired" }>;
+
+export type KnowledgeBaseTurnReplayReceipt = Exclude<
+  KnowledgeBaseTurnReservation,
+  { state: "acquired" }
+>;
+
+export interface InspectKnowledgeBaseTurnReplayInput {
+  userId: number;
+  /** Public Dashboard conversation id. */
+  conversationId: string;
+  clientRequestId: string;
+  /** Browser-visible intent only; see ReserveKnowledgeBaseTurnInput. */
+  clientIntent: unknown;
+  /** Optional fallback coordinates for a remounted tab with a new request id. */
+  expectedGeneration?: number;
+  expectedRevision?: number;
+  expectedLeafId?: string | null;
+  now?: Date;
+}
+
+export interface InspectKnowledgeBaseDeferredAttachmentReplayInput {
+  userId: number;
+  /** Public Dashboard conversation id. */
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+  clientAttachmentManifest: unknown;
+  index: number;
+  attachment: { file_id: string; filename: string };
+  now?: Date;
+}
+
+export interface InspectKnowledgeBaseDeferredDispatchReplayInput {
+  userId: number;
+  /** Public Dashboard conversation id. */
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+  clientAttachmentManifest: unknown;
+  now?: Date;
+}
+
+export interface InspectKnowledgeBaseLegacyDeferredReservationReplayInput {
+  userId: number;
+  /** Public Dashboard conversation id. */
+  conversationId: string;
+  clientRequestId: string;
+  clientAttachmentManifest: unknown;
+  operationType: KnowledgeBaseOperationType;
+  expectedGeneration: number;
+  expectedRevision: number;
+  expectedLeafId: string | null;
+  expectedPresentationKey?: string;
+  now?: Date;
+}
+
+export interface InspectKnowledgeBaseLegacyAttachmentTakeoverReplayInput {
+  userId: number;
+  /** Public Dashboard conversation id. */
+  conversationId: string;
+  clientRequestId: string;
+  clientAttachmentManifest: unknown;
+  attachments: ReadonlyArray<{ file_id: string; filename: string }>;
+  operationType: KnowledgeBaseOperationType;
+  expectedGeneration: number;
+  expectedRevision: number;
+  expectedLeafId: string | null;
+  expectedPresentationKey?: string;
+  now?: Date;
+}
 
 type ReservationReplayDecision =
   | { state: "conflict" }
@@ -1011,6 +1100,15 @@ function assertOperationMatchesBuild(
       "Knowledge-base current leaf has changed",
     );
   }
+  if (
+    input.expectedPresentationKey !== undefined &&
+    (build.currentPresentationKey ?? null) !== input.expectedPresentationKey
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "STALE_KNOWLEDGE_BASE_PRESENTATION",
+      "Knowledge-base presentation has changed",
+    );
+  }
   if (build.status === "ready_to_publish" || build.status === "published") {
     throw new KnowledgeBaseTurnReservationError(
       "TERMINAL",
@@ -1152,6 +1250,437 @@ function existingResult(
 }
 
 /**
+ * Convert a durable turn into a passive receipt. Unlike reservation replay,
+ * this function never takes over an expired lease: HTTP replay must observe
+ * the original operation and leave recovery as its sole dispatcher.
+ */
+function passiveExistingResult(
+  row: ConversationTurn,
+  now: Date,
+): KnowledgeBaseTurnReplayReceipt {
+  if (row.status === "completed") {
+    return {
+      state: "completed",
+      turn: turnRecord(row),
+      upstreamTaskId: row.upstreamTaskId,
+    };
+  }
+  if (row.status === "failed" || row.status === "cancelled") {
+    return { state: "terminal", turn: turnRecord(row) };
+  }
+  if (row.upstreamTaskId) {
+    return {
+      state: "bound",
+      turn: turnRecord(row),
+      upstreamTaskId: row.upstreamTaskId,
+    };
+  }
+  if (metadataOf(row).awaitingClientAttachments === true) {
+    return { state: "awaiting_attachments", turn: turnRecord(row) };
+  }
+  const remainingMs = (row.leaseExpiresAt?.getTime() ?? 0) - now.getTime();
+  return {
+    state: "pending",
+    turn: turnRecord(row),
+    retryAfterMs:
+      remainingMs > 0 ? Math.max(250, Math.min(remainingMs, 5_000)) : 1_000,
+  };
+}
+
+/**
+ * Read-only, state-independent replay lookup for an HTTP request whose first
+ * response may have been lost. A matching receipt is returned before routes
+ * inspect mutable Logo/finalization/Skill state. Different content under the
+ * same client request id is a stable conflict.
+ */
+export async function inspectKnowledgeBaseTurnReplay(
+  input: InspectKnowledgeBaseTurnReplayInput,
+  executor?: any,
+): Promise<KnowledgeBaseTurnReplayReceipt | null> {
+  assertInteger(input.userId, "userId", 1);
+  const conversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    input.conversationId,
+  );
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const clientIntentHash = hashKnowledgeBaseTurnRequest(input.clientIntent);
+  const expectedGeneration = input.expectedGeneration;
+  const expectedRevision = input.expectedRevision;
+  const expectedLeafId =
+    input.expectedLeafId === undefined
+      ? undefined
+      : normalizeOptionalLeafId(input.expectedLeafId);
+  if (expectedGeneration !== undefined) {
+    assertInteger(expectedGeneration, "expectedGeneration", 1);
+  }
+  if (expectedRevision !== undefined) {
+    assertInteger(expectedRevision, "expectedRevision", 0);
+  }
+  const now = input.now ?? new Date();
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const rows = await tx
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.conversationId, conversationId),
+          eq(conversationTurns.clientRequestId, clientRequestId),
+        ),
+      )
+      .limit(1);
+    const row = rows[0] as ConversationTurn | undefined;
+    if (row && metadataOf(row).clientIntentHash !== clientIntentHash) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+        "The client request id was already used for different content",
+      );
+    }
+    if (row) return passiveExistingResult(row, now);
+
+    if (
+      expectedGeneration === undefined ||
+      expectedRevision === undefined ||
+      expectedLeafId === undefined
+    ) {
+      return null;
+    }
+    const coordinateRows = await tx
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.conversationId, conversationId),
+          eq(conversationTurns.buildGeneration, expectedGeneration),
+          eq(conversationTurns.expectedRevision, expectedRevision),
+          expectedLeafId === null
+            ? isNull(conversationTurns.expectedLeafId)
+            : eq(conversationTurns.expectedLeafId, expectedLeafId),
+          sql`JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.clientIntentHash')) = ${clientIntentHash}`,
+          sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.unpreparedCancellation')), 'false') <> 'true'`,
+        ),
+      )
+      .orderBy(desc(conversationTurns.createdAt))
+      .limit(1);
+    const operationWinner = coordinateRows[0] as ConversationTurn | undefined;
+    return operationWinner &&
+      metadataOf(operationWinner).unpreparedCancellation !== true
+      ? passiveExistingResult(operationWinner, now)
+      : null;
+  });
+}
+
+/**
+ * Read-only replay lookup for a completed browser attachment-stage request.
+ * The staged ledger remains durable after the final file claims a worker
+ * lease, so a lost HTTP response can be replayed without consulting current
+ * Logo or build gates and without dispatching twice.
+ */
+export async function inspectKnowledgeBaseDeferredAttachmentReplay(
+  input: InspectKnowledgeBaseDeferredAttachmentReplayInput,
+  executor?: any,
+): Promise<KnowledgeBaseTurnReplayReceipt | null> {
+  assertInteger(input.userId, "userId", 1);
+  assertInteger(input.index, "attachment index", 0);
+  const conversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    input.conversationId,
+  );
+  const turnId = normalizeRequiredId(input.turnId, "turnId", 36);
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const manifestHash = hashKnowledgeBaseTurnRequest(
+    input.clientAttachmentManifest,
+  );
+  const attachment = normalizeDeferredUserAttachments([input.attachment])[0]!;
+  const now = input.now ?? new Date();
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const rows = await tx
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.id, turnId),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.conversationId, conversationId),
+        ),
+      )
+      .limit(1);
+    const row = rows[0] as ConversationTurn | undefined;
+    if (!row) return null;
+    const metadata = metadataOf(row);
+    if (
+      row.clientRequestId !== clientRequestId ||
+      metadata.clientAttachmentManifestHash !== manifestHash
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+        "The attachment request does not match its logical turn reservation",
+      );
+    }
+    const staged = Array.isArray(metadata.clientStagedAttachments)
+      ? metadata.clientStagedAttachments
+      : [];
+    const prior = staged[input.index];
+    if (!prior) return null;
+    if (
+      prior.index !== input.index ||
+      prior.file_id !== attachment.file_id ||
+      prior.filename !== attachment.filename
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+        "A different file is already staged at this manifest index",
+      );
+    }
+    return passiveExistingResult(row, now);
+  });
+}
+
+/**
+ * Read-only dispatch receipt lookup. A reservation which is still awaiting
+ * browser files is not yet a dispatch replay; every later state is durable and
+ * must be returned before consulting the mutable build/task authority.
+ */
+export async function inspectKnowledgeBaseDeferredDispatchReplay(
+  input: InspectKnowledgeBaseDeferredDispatchReplayInput,
+  executor?: any,
+): Promise<KnowledgeBaseTurnReplayReceipt | null> {
+  assertInteger(input.userId, "userId", 1);
+  const conversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    input.conversationId,
+  );
+  const turnId = normalizeRequiredId(input.turnId, "turnId", 36);
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const manifestHash = hashKnowledgeBaseTurnRequest(
+    input.clientAttachmentManifest,
+  );
+  const now = input.now ?? new Date();
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const row = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, turnId),
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.conversationId, conversationId),
+          ),
+        )
+        .limit(1)
+    )[0] as ConversationTurn | undefined;
+    if (!row) return null;
+    const metadata = metadataOf(row);
+    if (
+      row.clientRequestId !== clientRequestId ||
+      metadata.clientAttachmentManifestHash !== manifestHash
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+        "The attachment dispatch does not match its logical turn reservation",
+      );
+    }
+    if (
+      metadata.awaitingClientAttachments === true &&
+      row.status !== "completed" &&
+      row.status !== "failed" &&
+      row.status !== "cancelled" &&
+      !row.upstreamTaskId
+    ) {
+      return null;
+    }
+    return passiveExistingResult(row, now);
+  });
+}
+
+/**
+ * A rollout-only `/turn/reserve` resume never changes customer intent. The
+ * original client id, coordinate and manifest hash are therefore sufficient
+ * immutable authority to return its existing receipt without current gates.
+ */
+export async function inspectKnowledgeBaseLegacyDeferredReservationReplay(
+  input: InspectKnowledgeBaseLegacyDeferredReservationReplayInput,
+  executor?: any,
+): Promise<KnowledgeBaseTurnReplayReceipt | null> {
+  assertInteger(input.userId, "userId", 1);
+  assertInteger(input.expectedGeneration, "expectedGeneration", 1);
+  assertInteger(input.expectedRevision, "expectedRevision", 0);
+  if (!knowledgeBaseOperationTypes.includes(input.operationType)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Knowledge-base operation type is invalid",
+    );
+  }
+  const conversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    input.conversationId,
+  );
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const expectedLeafId = normalizeOptionalLeafId(input.expectedLeafId);
+  const expectedPresentationKey =
+    input.expectedPresentationKey === undefined
+      ? undefined
+      : normalizeRequiredId(
+          input.expectedPresentationKey,
+          "expectedPresentationKey",
+          191,
+        );
+  const manifestHash = hashKnowledgeBaseTurnRequest(
+    input.clientAttachmentManifest,
+  );
+  const now = input.now ?? new Date();
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const row = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.conversationId, conversationId),
+            eq(conversationTurns.clientRequestId, clientRequestId),
+          ),
+        )
+        .limit(1)
+    )[0] as ConversationTurn | undefined;
+    if (!row) return null;
+    const metadata = metadataOf(row);
+    if (
+      row.buildGeneration !== input.expectedGeneration ||
+      row.expectedRevision !== input.expectedRevision ||
+      (row.expectedLeafId ?? null) !== expectedLeafId ||
+      row.operationType !== input.operationType ||
+      metadata.clientAttachmentManifestHash !== manifestHash ||
+      (metadata.expectedPresentationKey !== undefined &&
+        metadata.expectedPresentationKey !== expectedPresentationKey)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+        "The deferred reservation resume does not match its immutable turn",
+      );
+    }
+    return passiveExistingResult(row, now);
+  });
+}
+
+/**
+ * The first upload-first legacy request must still perform the atomic takeover.
+ * Only a row already marked as taken over, with the exact frozen file ledger,
+ * is a replay which may bypass current Logo/finalization/Skill checks.
+ */
+export async function inspectKnowledgeBaseLegacyAttachmentTakeoverReplay(
+  input: InspectKnowledgeBaseLegacyAttachmentTakeoverReplayInput,
+  executor?: any,
+): Promise<KnowledgeBaseTurnReplayReceipt | null> {
+  assertInteger(input.userId, "userId", 1);
+  assertInteger(input.expectedGeneration, "expectedGeneration", 1);
+  assertInteger(input.expectedRevision, "expectedRevision", 0);
+  if (!knowledgeBaseOperationTypes.includes(input.operationType)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Knowledge-base operation type is invalid",
+    );
+  }
+  const conversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    input.conversationId,
+  );
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const expectedLeafId = normalizeOptionalLeafId(input.expectedLeafId);
+  const expectedPresentationKey =
+    input.expectedPresentationKey === undefined
+      ? undefined
+      : normalizeRequiredId(
+          input.expectedPresentationKey,
+          "expectedPresentationKey",
+          191,
+        );
+  const manifestHash = hashKnowledgeBaseTurnRequest(
+    input.clientAttachmentManifest,
+  );
+  const attachments = normalizeDeferredUserAttachments(input.attachments);
+  const now = input.now ?? new Date();
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const row = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.conversationId, conversationId),
+            eq(conversationTurns.clientRequestId, clientRequestId),
+          ),
+        )
+        .limit(1)
+    )[0] as ConversationTurn | undefined;
+    if (!row) return null;
+    const metadata = metadataOf(row);
+    if (metadata.legacyUploadFirstTakeover !== true) return null;
+    const recovery = retryAuthorityRecord(metadata.recovery);
+    const recoveredAttachments = Array.isArray(recovery?.attachments)
+      ? recovery.attachments
+      : [];
+    const immutableMatch =
+      recovery?.kind === "turn" &&
+      recovery.conversationId === input.conversationId &&
+      row.buildGeneration === input.expectedGeneration &&
+      row.expectedRevision === input.expectedRevision &&
+      (row.expectedLeafId ?? null) === expectedLeafId &&
+      row.operationType === input.operationType &&
+      metadata.clientAttachmentManifestHash === manifestHash &&
+      (metadata.expectedPresentationKey === undefined ||
+        metadata.expectedPresentationKey === expectedPresentationKey) &&
+      Array.isArray(recovery?.attachmentManifest) &&
+      hashKnowledgeBaseTurnRequest(recovery.attachmentManifest) ===
+        manifestHash &&
+      recoveredAttachments.length === attachments.length &&
+      Number(metadata.userAttachmentCount) === attachments.length &&
+      recoveredAttachments.every((value, index) => {
+        const record = retryAuthorityRecord(value);
+        return (
+          record?.file_id === attachments[index]?.file_id &&
+          record?.filename === attachments[index]?.filename
+        );
+      });
+    if (!immutableMatch) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+        "The legacy attachment takeover was replayed with different content",
+      );
+    }
+    return passiveExistingResult(row, now);
+  });
+}
+
+/**
  * Creates the durable turn before any attachment upload or upstream POST.
  * Unknown network outcomes remain reserved until recovery with the original
  * upstream idempotency key. The only release path is a proven browser-upload
@@ -1245,6 +1774,18 @@ async function reserveKnowledgeBaseTurnInTransaction(
   assertInteger(input.expectedGeneration, "expectedGeneration", 1);
   assertInteger(input.expectedRevision, "expectedRevision", 0);
   const expectedLeafId = normalizeOptionalLeafId(input.expectedLeafId);
+  const expectedPresentationKey =
+    input.expectedPresentationKey === undefined
+      ? undefined
+      : normalizeRequiredId(
+          input.expectedPresentationKey,
+          "expectedPresentationKey",
+          191,
+        );
+  const clientIntentHash =
+    input.clientIntent === undefined
+      ? null
+      : hashKnowledgeBaseTurnRequest(input.clientIntent);
   const replacesTurnId = input.replacesTurnId
     ? normalizeRequiredId(input.replacesTurnId, "replacesTurnId", 36)
     : null;
@@ -1428,6 +1969,15 @@ async function reserveKnowledgeBaseTurnInTransaction(
       );
     }
     const existingMetadata = metadataOf(existing);
+    if (clientIntentHash) {
+      if (existingMetadata.clientIntentHash !== clientIntentHash) {
+        throw new KnowledgeBaseTurnReservationError(
+          "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+          "The client request id was already used for different content",
+        );
+      }
+      return passiveExistingResult(existing, now);
+    }
     if (
       !deferredClientAttachments &&
       input.resumeLegacyAttachmentTakeover === true &&
@@ -1794,6 +2344,7 @@ async function reserveKnowledgeBaseTurnInTransaction(
     ...input,
     buildId,
     expectedLeafId,
+    expectedPresentationKey,
   });
   if (build.activeTurnId) {
     const activeRows = await tx
@@ -1854,6 +2405,8 @@ async function reserveKnowledgeBaseTurnInTransaction(
       : clientAttachmentManifestHash
         ? { clientAttachmentManifestHash }
         : {}),
+    ...(clientIntentHash ? { clientIntentHash } : {}),
+    ...(expectedPresentationKey ? { expectedPresentationKey } : {}),
     recovery: sanitizeKnowledgeBaseRecoveryMetadata(input.recoveryMetadata),
   };
   const row: ConversationTurn = {
@@ -2614,7 +3167,7 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
       prior.filename !== attachment.filename
     ) {
       throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
+        "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
         "A different file is already staged at this manifest index",
       );
     }

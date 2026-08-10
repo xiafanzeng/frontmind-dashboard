@@ -3,6 +3,7 @@ import {
   bigint,
   boolean,
   check,
+  decimal,
   foreignKey,
   index,
   int,
@@ -59,6 +60,13 @@ export const users = mysqlTable(
     marketEdition: mysqlEnum("marketEdition", ["domestic", "overseas"])
       .default("domestic")
       .notNull(),
+    /**
+     * @deprecated Legacy Monitor-based brand-tracking quota retained only for
+     * schema compatibility. Jenova spend enforcement never reads this field.
+     */
+    brandTrackingMonthlyLimit: int("brandTrackingMonthlyLimit", {
+      unsigned: true,
+    }),
     isActive: boolean("isActive").default(true).notNull(),
     passwordChangedAt: timestamp("passwordChangedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -398,6 +406,7 @@ export const presalesUpstreamResources = mysqlTable(
   "presales_upstream_resources",
   {
     id: varchar("id", { length: 36 }).primaryKey(),
+    projectId: varchar("projectId", { length: 80 }),
     apiCredentialId: varchar("apiCredentialId", { length: 36 }).notNull(),
     kind: mysqlEnum("kind", ["task", "file"]).notNull(),
     upstreamId: varchar("upstreamId", { length: 255 }).notNull(),
@@ -427,6 +436,7 @@ export const presalesUpstreamResources = mysqlTable(
       table.upstreamId,
     ),
     index("presales_upstream_resources_parent_task_idx").on(table.parentTaskId),
+    index("presales_upstream_resources_project_idx").on(table.projectId),
     index("presales_upstream_resources_content_expiry_idx").on(
       table.kind,
       table.contentSource,
@@ -520,6 +530,7 @@ export const presalesMonitorRuns = mysqlTable(
   "presales_monitor_runs",
   {
     id: varchar("id", { length: 36 }).primaryKey(),
+    projectId: varchar("projectId", { length: 80 }),
     idempotencyKeyHash: varchar("idempotencyKeyHash", { length: 64 })
       .notNull()
       .unique(),
@@ -574,6 +585,7 @@ export const presalesMonitorRuns = mysqlTable(
       table.status,
     ),
     index("presales_monitor_poll_idx").on(table.status, table.nextPollAt),
+    index("presales_monitor_project_idx").on(table.projectId),
   ],
 );
 
@@ -625,6 +637,35 @@ export const websitePaymentReceipts = mysqlTable(
     check(
       "website_payment_receipts_authorization_digest_ck",
       sql`${table.authorizationDigest} REGEXP '^[a-f0-9]{64}$'`,
+    ),
+  ],
+);
+
+/**
+ * Compact permanent barrier for physically deleted Website projects. It keeps
+ * no order, payment, company, question, or account data; the sole projectId
+ * key prevents a delayed checkout callback from recreating deleted rows.
+ */
+export const websiteProjectDeletionTombstones = mysqlTable(
+  "website_project_deletion_tombstones",
+  {
+    projectId: varchar("projectId", { length: 80 }).primaryKey(),
+    schemaVersion: int("schemaVersion", { unsigned: true })
+      .default(1)
+      .notNull(),
+    status: mysqlEnum("status", ["active", "deleting", "deleted"])
+      .default("active")
+      .notNull(),
+    createdAt: timestamp("createdAt", { fsp: 3 })
+      .default(sql`CURRENT_TIMESTAMP(3)`)
+      .notNull(),
+    deletionRequestedAt: timestamp("deletionRequestedAt", { fsp: 3 }),
+    completedAt: timestamp("completedAt", { fsp: 3 }),
+  },
+  (table) => [
+    check(
+      "website_project_deletion_tombstones_schema_version_ck",
+      sql`${table.schemaVersion} = 1`,
     ),
   ],
 );
@@ -731,6 +772,9 @@ export const websiteUserProvisions = mysqlTable(
     requestHash: varchar("requestHash", { length: 64 }).notNull(),
     projectId: varchar("projectId", { length: 80 }).notNull(),
     companyName: varchar("companyName", { length: 200 }).notNull(),
+    marketEdition: mysqlEnum("marketEdition", ["domestic", "overseas"])
+      .default("domestic")
+      .notNull(),
     orderId: varchar("orderId", { length: 64 }).notNull().unique(),
     tradeNo: varchar("tradeNo", { length: 128 }).notNull().unique(),
     amountFen: int("amountFen", { unsigned: true }).notNull(),
@@ -824,6 +868,9 @@ export const websiteManualServiceOrders = mysqlTable(
     requestHash: varchar("requestHash", { length: 64 }).notNull(),
     projectId: varchar("projectId", { length: 80 }).notNull(),
     companyName: varchar("companyName", { length: 200 }).notNull(),
+    marketEdition: mysqlEnum("marketEdition", ["domestic", "overseas"])
+      .default("domestic")
+      .notNull(),
     contractProfile: json("contractProfile")
       .$type<ManualServiceContractProfile>()
       .notNull(),
@@ -1085,6 +1132,12 @@ export const deliveryTickets = mysqlTable(
   "delivery_tickets",
   {
     id: varchar("id", { length: 36 }).primaryKey(),
+    parentTicketId: varchar("parentTicketId", { length: 36 }),
+    rootTicketId: varchar("rootTicketId", { length: 36 }),
+    workflowStageKey: varchar("workflowStageKey", { length: 255 }),
+    isWorkflowContainer: boolean("isWorkflowContainer")
+      .default(false)
+      .notNull(),
     userId: int("userId")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
@@ -1135,6 +1188,14 @@ export const deliveryTickets = mysqlTable(
     assignedMemberId: int("assignedMemberId").references(() => users.id, {
       onDelete: "set null",
     }),
+    credentialTargetUserId: int("credentialTargetUserId").references(
+      () => users.id,
+      { onDelete: "set null" },
+    ),
+    credentialRequestKind: mysqlEnum("credentialRequestKind", [
+      "managed_api",
+      "jenova_brand_tracking",
+    ]),
     sourceQuestionId: varchar("sourceQuestionId", { length: 191 }),
     monitoringBatchKey: varchar("monitoringBatchKey", { length: 191 }),
     responseLogicRevision: int("responseLogicRevision"),
@@ -1194,9 +1255,27 @@ export const deliveryTickets = mysqlTable(
       table.userId,
       table.technicalDedupeKey,
     ),
+    uniqueIndex("delivery_tickets_parent_stage_uq").on(
+      table.parentTicketId,
+      table.workflowStageKey,
+    ),
     index("delivery_tickets_user_created_idx").on(
       table.userId,
       table.createdAt,
+    ),
+    index("delivery_tickets_parent_operation_idx").on(
+      table.parentTicketId,
+      table.operation,
+    ),
+    index("delivery_tickets_root_status_idx").on(
+      table.rootTicketId,
+      table.status,
+    ),
+    index("delivery_tickets_user_container_updated_idx").on(
+      table.userId,
+      table.isWorkflowContainer,
+      table.updatedAt,
+      table.id,
     ),
     index("delivery_tickets_period_pool_state_idx").on(
       table.quotaPeriodId,
@@ -1234,6 +1313,11 @@ export const deliveryTickets = mysqlTable(
       table.assignedMemberId,
       table.status,
     ),
+    index("delivery_tickets_credential_target_status_idx").on(
+      table.credentialRequestKind,
+      table.credentialTargetUserId,
+      table.status,
+    ),
     index("delivery_tickets_member_status_resolved_id_idx").on(
       table.assignedMemberId,
       table.status,
@@ -1245,6 +1329,16 @@ export const deliveryTickets = mysqlTable(
       columns: [table.assignedProjectAssignmentId],
       foreignColumns: [deliveryProjectAssignments.id],
     }).onDelete("set null"),
+    foreignKey({
+      name: "delivery_tickets_parent_ticket_fk",
+      columns: [table.parentTicketId],
+      foreignColumns: [table.id],
+    }).onDelete("set null"),
+    foreignKey({
+      name: "delivery_tickets_root_ticket_fk",
+      columns: [table.rootTicketId],
+      foreignColumns: [table.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -1310,6 +1404,7 @@ export const deliveryTicketEvents = mysqlTable(
       sourceTicketId?: string;
       assignedProjectAssignmentId?: string;
       assignedMemberId?: number;
+      previewVerified?: boolean;
     }>(),
     kind: mysqlEnum("kind", [
       "created",
@@ -3162,6 +3257,224 @@ export const upstreamResources = mysqlTable(
   ],
 );
 
+/**
+ * Physical Jenova API keys are stored once and may be assigned to several
+ * overseas workspaces. The encrypted secret is deliberately independent from
+ * the generic Agent credential hierarchy.
+ */
+export const jenovaBrandTrackingCredentials = mysqlTable(
+  "jenova_brand_tracking_credentials",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    encryptionVersion: int("encryptionVersion").default(1).notNull(),
+    encryptedKey: text("encryptedKey").notNull(),
+    encryptionIv: varchar("encryptionIv", { length: 32 }).notNull(),
+    encryptionAuthTag: varchar("encryptionAuthTag", { length: 32 }).notNull(),
+    fingerprint: varchar("fingerprint", { length: 32 }).notNull(),
+    status: mysqlEnum("status", ["active", "revoked"])
+      .default("active")
+      .notNull(),
+    validationStatus: mysqlEnum("validationStatus", [
+      "unverified",
+      "verified",
+      "invalid",
+    ])
+      .default("unverified")
+      .notNull(),
+    lastBalance: decimal("lastBalance", {
+      precision: 20,
+      scale: 8,
+      mode: "string",
+    }),
+    validatedAt: timestamp("validatedAt"),
+    balanceSyncedAt: timestamp("balanceSyncedAt"),
+    revokedAt: timestamp("revokedAt"),
+    createdByUserId: int("createdByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("jenova_bt_credentials_fingerprint_uq").on(table.fingerprint),
+    index("jenova_bt_credentials_status_idx").on(table.status),
+  ],
+);
+
+/** Exactly one explicit Brand Tracker key assignment per overseas user. */
+export const jenovaBrandTrackingAssignments = mysqlTable(
+  "jenova_brand_tracking_assignments",
+  {
+    userId: int("userId")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    credentialId: varchar("credentialId", { length: 36 }).notNull(),
+    assignedByUserId: int("assignedByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    index("jenova_bt_assignments_credential_idx").on(table.credentialId),
+    foreignKey({
+      name: "jenova_bt_assignments_credential_fk",
+      columns: [table.credentialId],
+      foreignColumns: [jenovaBrandTrackingCredentials.id],
+    }).onDelete("restrict"),
+  ],
+);
+
+/** Per-user rolling 30-day spend ceiling. Absence also means the $10 default. */
+export const jenovaBrandTrackingPolicies = mysqlTable(
+  "jenova_brand_tracking_policies",
+  {
+    userId: int("userId")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    rolling30DayLimit: decimal("rolling30DayLimit", {
+      precision: 20,
+      scale: 8,
+      mode: "string",
+    })
+      .default("10.00000000")
+      .notNull(),
+    updatedByUserId: int("updatedByUserId").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+);
+
+/** Local ownership and lifecycle record for a persistent Jenova session. */
+export const jenovaBrandTrackingSessions = mysqlTable(
+  "jenova_brand_tracking_sessions",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: int("userId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    credentialId: varchar("credentialId", { length: 36 }).notNull(),
+    clientRequestId: varchar("clientRequestId", { length: 36 }).notNull(),
+    upstreamSessionId: varchar("upstreamSessionId", { length: 255 }),
+    title: varchar("title", { length: 255 }).default("品牌追踪会话").notNull(),
+    status: mysqlEnum("status", ["active", "archived"])
+      .default("active")
+      .notNull(),
+    archivedReason: varchar("archivedReason", { length: 64 }),
+    archivedAt: timestamp("archivedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("jenova_bt_sessions_user_request_uq").on(
+      table.userId,
+      table.clientRequestId,
+    ),
+    index("jenova_bt_sessions_user_status_updated_idx").on(
+      table.userId,
+      table.status,
+      table.updatedAt,
+    ),
+    index("jenova_bt_sessions_upstream_idx").on(table.upstreamSessionId),
+    foreignKey({
+      name: "jenova_bt_sessions_credential_fk",
+      columns: [table.credentialId],
+      foreignColumns: [jenovaBrandTrackingCredentials.id],
+    }).onDelete("restrict"),
+  ],
+);
+
+/**
+ * One append-only local turn per browser request. Cost fields use fixed-point
+ * strings; a null usageCost with unknown costState must never be treated as 0.
+ */
+export const jenovaBrandTrackingTurns = mysqlTable(
+  "jenova_brand_tracking_turns",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    sessionId: varchar("sessionId", { length: 36 }).notNull(),
+    userId: int("userId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    credentialId: varchar("credentialId", { length: 36 }).notNull(),
+    clientRequestId: varchar("clientRequestId", { length: 36 }).notNull(),
+    idempotencyKey: varchar("idempotencyKey", { length: 191 }).notNull(),
+    upstreamRunId: varchar("upstreamRunId", { length: 255 }),
+    hiddenKickoff: boolean("hiddenKickoff").default(false).notNull(),
+    userContent: longtext("userContent").notNull(),
+    assistantContent: longtext("assistantContent").notNull(),
+    status: mysqlEnum("status", [
+      "pending",
+      "streaming",
+      "completed",
+      "failed",
+      "recovering",
+    ])
+      .default("pending")
+      .notNull(),
+    costState: mysqlEnum("costState", ["pending", "confirmed", "unknown"])
+      .default("pending")
+      .notNull(),
+    usageCost: decimal("usageCost", {
+      precision: 20,
+      scale: 8,
+      mode: "string",
+    }),
+    sessionFee: decimal("sessionFee", {
+      precision: 20,
+      scale: 8,
+      mode: "string",
+    })
+      .default("0.00000000")
+      .notNull(),
+    progress: json("progress").$type<Record<string, unknown>[]>(),
+    warnings: json("warnings").$type<Record<string, unknown>[]>(),
+    stopReason: varchar("stopReason", { length: 255 }),
+    errorCode: varchar("errorCode", { length: 128 }),
+    errorMessage: text("errorMessage"),
+    startedAt: timestamp("startedAt"),
+    completedAt: timestamp("completedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("jenova_bt_turns_user_request_uq").on(
+      table.userId,
+      table.clientRequestId,
+    ),
+    uniqueIndex("jenova_bt_turns_idempotency_uq").on(table.idempotencyKey),
+    index("jenova_bt_turns_session_created_idx").on(
+      table.sessionId,
+      table.createdAt,
+    ),
+    index("jenova_bt_turns_user_cost_created_idx").on(
+      table.userId,
+      table.costState,
+      table.createdAt,
+    ),
+    index("jenova_bt_turns_credential_cost_idx").on(
+      table.credentialId,
+      table.costState,
+    ),
+    index("jenova_bt_turns_status_updated_idx").on(
+      table.status,
+      table.updatedAt,
+    ),
+    foreignKey({
+      name: "jenova_bt_turns_session_fk",
+      columns: [table.sessionId],
+      foreignColumns: [jenovaBrandTrackingSessions.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "jenova_bt_turns_credential_fk",
+      columns: [table.credentialId],
+      foreignColumns: [jenovaBrandTrackingCredentials.id],
+    }).onDelete("restrict"),
+  ],
+);
+
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
 export type Session = typeof sessions.$inferSelect;
@@ -3294,3 +3607,23 @@ export type Attachment = typeof attachments.$inferSelect;
 export type InsertAttachment = typeof attachments.$inferInsert;
 export type UpstreamResource = typeof upstreamResources.$inferSelect;
 export type InsertUpstreamResource = typeof upstreamResources.$inferInsert;
+export type JenovaBrandTrackingCredential =
+  typeof jenovaBrandTrackingCredentials.$inferSelect;
+export type InsertJenovaBrandTrackingCredential =
+  typeof jenovaBrandTrackingCredentials.$inferInsert;
+export type JenovaBrandTrackingAssignment =
+  typeof jenovaBrandTrackingAssignments.$inferSelect;
+export type InsertJenovaBrandTrackingAssignment =
+  typeof jenovaBrandTrackingAssignments.$inferInsert;
+export type JenovaBrandTrackingPolicy =
+  typeof jenovaBrandTrackingPolicies.$inferSelect;
+export type InsertJenovaBrandTrackingPolicy =
+  typeof jenovaBrandTrackingPolicies.$inferInsert;
+export type JenovaBrandTrackingSession =
+  typeof jenovaBrandTrackingSessions.$inferSelect;
+export type InsertJenovaBrandTrackingSession =
+  typeof jenovaBrandTrackingSessions.$inferInsert;
+export type JenovaBrandTrackingTurn =
+  typeof jenovaBrandTrackingTurns.$inferSelect;
+export type InsertJenovaBrandTrackingTurn =
+  typeof jenovaBrandTrackingTurns.$inferInsert;

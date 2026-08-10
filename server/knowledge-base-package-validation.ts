@@ -550,6 +550,7 @@ export function assertKnowledgeBasePackageMatchesBuild(input: {
     (officialLogoUploadAssets.length > 0 ||
       officialAssets.some(
         (asset) =>
+          asset.sourceKind !== undefined &&
           asset.sourceKind !== "official_web" &&
           asset.sourceKind !== "official_document",
       ))

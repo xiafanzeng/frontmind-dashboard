@@ -44,13 +44,8 @@ export type BrandQuestionSelectionDraft = Pick<
 type QuestionCatalogTicket = {
   id: string;
   category?: string | null;
-  publicStage?:
-    | "awaiting_service"
-    | "processing"
-    | "action_required"
-    | "completed"
-    | "closed";
-  publicStageLabel?: string | null;
+  publicStatus?: "pending" | "completed" | null;
+  publicStatusLabel?: string | null;
 };
 
 const CATEGORY_META = {
@@ -143,21 +138,21 @@ export default function BrandQuestionPortfolioWorkspace({
     (question) => question.status === "selected",
   ).length;
   const catalogPublished =
-    questionCatalogTicket?.publicStage === "completed" ||
+    questionCatalogTicket?.publicStatus === "completed" ||
     visibleQuestions.length > 0 ||
     hasPublishedKeywordTables;
 
   const ticketStatus = (() => {
     if (ticketLoading) {
       return {
-        title: "正在读取配置工单",
-        description: "正在同步品牌词库与问题目录的交付状态。",
+        title: "正在读取配置需求",
+        description: "正在同步品牌全域词库的配置状态。",
         tone: "text-[#5b2a86]",
       };
     }
     if (!questionCatalogTicket && catalogPublished) {
       return {
-        title: "品牌词库与问题目录已发布",
+        title: "品牌全域词库已发布",
         description:
           "AI 监控与优化工程师已完成本阶段配置，可在下方查看正式词表并选择问题。",
         tone: "text-emerald-700",
@@ -165,43 +160,24 @@ export default function BrandQuestionPortfolioWorkspace({
     }
     if (!questionCatalogTicket) {
       return {
-        title: "等待配置工单同步",
+        title: "等待配置需求同步",
         description:
-          "知识库发布后，系统会自动向 AI 监控与优化工程师提交品牌词库与问题目录工单，无需客户重复操作。",
+          "知识库发布后，系统会自动向 AI 监控与优化工程师提交品牌词库配置需求，无需客户重复操作。",
         tone: "text-amber-700",
       };
     }
-    if (questionCatalogTicket.publicStage === "completed") {
+    if (questionCatalogTicket.publicStatus === "completed") {
       return {
-        title: "品牌词库与问题目录已发布",
+        title: "品牌全域词库已发布",
         description:
           "AI 监控与优化工程师已完成本阶段配置，可在下方查看正式词表并选择问题。",
         tone: "text-emerald-700",
       };
     }
-    if (questionCatalogTicket.publicStage === "action_required") {
-      return {
-        title: "配置工单待补充资料",
-        description:
-          "AI 监控与优化工程师需要补充信息，请前往工单详情按提示回复。",
-        tone: "text-amber-700",
-      };
-    }
-    if (questionCatalogTicket.publicStage === "closed") {
-      return {
-        title: "配置工单已结束",
-        description: "如仍需配置品牌词库，请联系交付管理员核查工单状态。",
-        tone: "text-slate-600",
-      };
-    }
     return {
-      title:
-        questionCatalogTicket.publicStage === "processing"
-          ? "AI 监控与优化工程师正在配置"
-          : "配置工单已提交",
-      description:
-        "品牌词库与问题目录工单已交由 AI 监控与优化工程师处理，完成后会在本页发布正式词表与候选问题。",
-      tone: "text-[#5b2a86]",
+      title: "配置需求待处理",
+      description: "配置完成后会在本页发布正式词库。",
+      tone: "text-red-700",
     };
   })();
 
@@ -244,7 +220,7 @@ export default function BrandQuestionPortfolioWorkspace({
                 refreshing || portfolioQuery.isFetching ? "animate-spin" : ""
               }`}
             />
-            刷新工单与词库
+            刷新需求与词库
           </Button>
         </div>
 
@@ -269,9 +245,17 @@ export default function BrandQuestionPortfolioWorkspace({
               </p>
             </div>
           </div>
-          {questionCatalogTicket?.publicStageLabel && (
-            <span className="shrink-0 rounded-full border border-[#d8c9e3] bg-white px-3 py-1 text-xs font-semibold text-[#5b2a86]">
-              {questionCatalogTicket.publicStageLabel}
+          {questionCatalogTicket && (
+            <span
+              className={`shrink-0 rounded-full border px-3 py-1 text-xs font-semibold ${
+                questionCatalogTicket.publicStatus === "completed"
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                  : "border-red-200 bg-red-50 text-red-700"
+              }`}
+            >
+              {questionCatalogTicket.publicStatus === "completed"
+                ? "已完成"
+                : "待处理"}
             </span>
           )}
         </div>
@@ -398,7 +382,10 @@ export default function BrandQuestionPortfolioWorkspace({
                       </td>
                       <td>{question.intent || "待工程师补充"}</td>
                       <td>
-                        <span className="keyword-pill">
+                        <span
+                          className="keyword-pill fm-question-category-pill"
+                          data-category={question.category}
+                        >
                           {CATEGORY_META[question.category].title}
                         </span>
                       </td>

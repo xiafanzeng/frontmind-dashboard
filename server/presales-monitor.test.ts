@@ -10,10 +10,15 @@ import type {
   PresalesMonitorRun,
 } from "../drizzle/schema";
 import {
+  presalesMonitorRuns,
+  websiteProjectDeletionTombstones,
+} from "../drizzle/schema";
+import {
   buildMonitorSubmitPayload,
   buildMonitorRequestUrl,
   createPresalesMonitorRouter,
   assertDedicatedMonitorCredentialConfigured,
+  assertWorkspaceMonitorQuotaAvailable,
   AxiosMonitorTransport,
   getDedicatedMonitorCredentialReadiness,
   isMonitorDuplicateReservationError,
@@ -27,6 +32,7 @@ import {
   probeDedicatedMonitorCredential,
   PresalesMonitorError,
   PresalesMonitorService,
+  purgePresalesProjectMonitorRuns,
   sanitizeMonitorAnswerText,
   sanitizeMonitorErrorText,
   sanitizeMonitorMedia,
@@ -36,7 +42,9 @@ import {
   type MonitorRepository,
   type MonitorReservation,
   type MonitorTransport,
+  workspaceMonitorProjectId,
 } from "./presales-monitor";
+import { WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED } from "./website-project-lifecycle";
 import type { DecryptedPresalesCredential } from "./presales-service";
 
 const QUESTION = "FrontMind 的 GEO 服务适合科研企业吗？";
@@ -153,6 +161,7 @@ function resultResponse(
 class MemoryMonitorRepository implements MonitorRepository {
   readonly runs = new Map<string, PresalesMonitorRun>();
   readonly keyToRun = new Map<string, string>();
+  readonly workspaceLimits = new Map<number, number | null>();
   private sequence = 0;
 
   async reserve(
@@ -161,6 +170,13 @@ class MemoryMonitorRepository implements MonitorRepository {
     const existingId = this.keyToRun.get(input.idempotencyKeyHash);
     if (existingId) {
       const existing = this.runs.get(existingId)!;
+      if (
+        input.workspaceQuota &&
+        existing.projectId !==
+          workspaceMonitorProjectId(input.workspaceQuota.userId)
+      ) {
+        throw new PresalesMonitorError("NOT_FOUND", 404, "not found");
+      }
       if (existing.requestHash !== input.requestHash) {
         throw new PresalesMonitorError(
           "IDEMPOTENCY_CONFLICT",
@@ -183,12 +199,24 @@ class MemoryMonitorRepository implements MonitorRepository {
         existing.status === "remote_failed" &&
         !existing.upstreamTaskId
       ) {
+        if (input.workspaceQuota) {
+          const limit = this.workspaceLimits.get(input.workspaceQuota.userId);
+          if (!this.workspaceLimits.has(input.workspaceQuota.userId)) {
+            throw new PresalesMonitorError("NOT_FOUND", 404, "not found");
+          }
+          assertWorkspaceMonitorQuotaAvailable({
+            limit: limit ?? null,
+            used: this.workspaceUsed(input.workspaceQuota),
+            expectedItems: input.expectedItems,
+          });
+        }
         const retried = this.patch(existing.id, {
           apiCredentialId: input.credential.id,
           credentialVersion: input.credential.version,
           status: "submission_in_progress",
           lastError: null,
           completedAt: null,
+          ...(input.workspaceQuota ? { createdAt: input.now } : {}),
           updatedAt: input.now,
         });
         return { state: "acquired", run: retried };
@@ -202,9 +230,21 @@ class MemoryMonitorRepository implements MonitorRepository {
       }
       return { state: "replay", run: existing };
     }
+    if (input.workspaceQuota) {
+      const limit = this.workspaceLimits.get(input.workspaceQuota.userId);
+      if (!this.workspaceLimits.has(input.workspaceQuota.userId)) {
+        throw new PresalesMonitorError("NOT_FOUND", 404, "not found");
+      }
+      assertWorkspaceMonitorQuotaAvailable({
+        limit: limit ?? null,
+        used: this.workspaceUsed(input.workspaceQuota),
+        expectedItems: input.expectedItems,
+      });
+    }
     const id = `00000000-0000-4000-8000-${String(++this.sequence).padStart(12, "0")}`;
     const run = {
       id,
+      projectId: input.projectId ?? null,
       idempotencyKeyHash: input.idempotencyKeyHash,
       requestHash: input.requestHash,
       apiCredentialId: input.credential.id,
@@ -247,9 +287,43 @@ class MemoryMonitorRepository implements MonitorRepository {
     return run && !run.deletedAt ? run : null;
   }
 
+  async getLatestByProject(projectId: string) {
+    return (
+      [...this.runs.values()]
+        .filter((run) => run.projectId === projectId && !run.deletedAt)
+        .sort(
+          (left, right) => right.createdAt.getTime() - left.createdAt.getTime(),
+        )[0] ?? null
+    );
+  }
+
+  async getWorkspaceQuota(
+    input: Parameters<MonitorRepository["getWorkspaceQuota"]>[0],
+  ) {
+    if (!this.workspaceLimits.has(input.userId)) return null;
+    return {
+      limit: this.workspaceLimits.get(input.userId) ?? null,
+      used: this.workspaceUsed(input),
+    };
+  }
+
   async markSubmissionUnknown(runId: string, error: string, now: Date) {
     return this.patch(runId, {
       status: "submission_unknown",
+      lastError: error,
+      updatedAt: now,
+    });
+  }
+
+  async markSubmissionCleanupPending(
+    runId: string,
+    upstreamTaskId: string,
+    error: string,
+    now: Date,
+  ) {
+    return this.patch(runId, {
+      status: "submission_unknown",
+      upstreamTaskId,
       lastError: error,
       updatedAt: now,
     });
@@ -338,16 +412,33 @@ class MemoryMonitorRepository implements MonitorRepository {
     this.runs.set(runId, next);
     return next;
   }
+
+  private workspaceUsed(
+    input: Parameters<MonitorRepository["getWorkspaceQuota"]>[0],
+  ) {
+    const projectId = workspaceMonitorProjectId(input.userId);
+    return [...this.runs.values()]
+      .filter(
+        (run) =>
+          run.projectId === projectId &&
+          run.createdAt >= input.windowStartedAt &&
+          run.createdAt < input.windowEndsAt &&
+          (run.status !== "remote_failed" || Boolean(run.upstreamTaskId)),
+      )
+      .reduce((used, run) => used + run.expectedItems, 0);
+  }
 }
 
 class FakeMonitorTransport implements MonitorTransport {
   submitCalls = 0;
   statusCalls = 0;
   resultCalls = 0;
+  stopCalls = 0;
   submitValue: unknown;
   statusValues: unknown[];
   resultValues: unknown[];
   submitError: Error | null = null;
+  stopError: Error | null = null;
 
   constructor(platforms: readonly MonitorPlatform[]) {
     this.submitValue = submitResponse(platforms);
@@ -374,6 +465,12 @@ class FakeMonitorTransport implements MonitorTransport {
       Math.min(this.resultCalls - 1, this.resultValues.length - 1)
     ];
   }
+
+  async stop() {
+    this.stopCalls += 1;
+    if (this.stopError) throw this.stopError;
+    return { success: true };
+  }
 }
 
 function makeHarness(platforms: MonitorPlatform[] = ["deepseek"]) {
@@ -394,6 +491,54 @@ function makeHarness(platforms: MonitorPlatform[] = ["deepseek"]) {
     advance(ms: number) {
       clock = new Date(clock.getTime() + ms);
     },
+  };
+}
+
+function monitorPurgeExecutor(rows: PresalesMonitorRun[]) {
+  const tx = {
+    select() {
+      return {
+        from(table: unknown) {
+          if (table === websiteProjectDeletionTombstones) {
+            return {
+              where() {
+                return {
+                  limit() {
+                    return {
+                      for: async () => [{ status: "deleting" }],
+                    };
+                  },
+                };
+              },
+            };
+          }
+          if (table !== presalesMonitorRuns) {
+            throw new Error("unexpected monitor purge table");
+          }
+          return {
+            where() {
+              return { for: async () => [...rows] };
+            },
+          };
+        },
+      };
+    },
+    delete(table: unknown) {
+      if (table !== presalesMonitorRuns) {
+        throw new Error("unexpected monitor purge delete table");
+      }
+      return {
+        where: async () => {
+          rows.splice(0, rows.length);
+          return [{ affectedRows: 1 }];
+        },
+      };
+    },
+  };
+  return {
+    rows,
+    transaction: async <T>(operation: (value: typeof tx) => Promise<T>) =>
+      operation(tx),
   };
 }
 
@@ -511,10 +656,11 @@ describe("presales monitor payload and reservation", () => {
         "baiduai",
         "qianwen",
         "kimi",
+        "chatgpt",
       ],
     });
     expect(payload.prompts).toEqual(Array(5).fill(QUESTION));
-    expect(payload.platforms).toHaveLength(6);
+    expect(payload.platforms).toHaveLength(7);
     expect(payload.platforms).toSatisfy((items) =>
       items.every((item) => item.mode === "search" && item.screenshot === 0),
     );
@@ -525,6 +671,7 @@ describe("presales monitor payload and reservation", () => {
       "baiduai",
       "qianwen",
       "kimi",
+      "chatgpt",
     ]);
     expect(JSON.stringify(payload)).not.toContain("reasoning");
     expect(JSON.stringify(payload)).not.toContain("image");
@@ -761,6 +908,95 @@ describe("presales monitor payload and reservation", () => {
       expect(axios.request).toHaveBeenCalledTimes(1);
     },
   );
+
+  it("stops provider tasks through the official PUT endpoint", async () => {
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      data: { success: true },
+    });
+
+    await new AxiosMonitorTransport().stop(TASK_ID, credential);
+
+    expect(axios.request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "PUT",
+        url: expect.stringContaining(`/task/${TASK_ID}/stop`),
+        headers: expect.objectContaining({
+          Authorization: `Bearer ${credential.apiKey}`,
+        }),
+      }),
+    );
+  });
+
+  it("treats an already terminal provider task as an idempotent stop", async () => {
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 409,
+      data: { success: false, message: "任务已结束" },
+    });
+
+    await expect(
+      new AxiosMonitorTransport().stop(TASK_ID, credential),
+    ).resolves.toMatchObject({ success: true, alreadyTerminal: true });
+  });
+
+  it("treats a bodyless provider 404 as an idempotent stop", async () => {
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 404,
+      data: null,
+    });
+
+    await expect(
+      new AxiosMonitorTransport().stop(TASK_ID, credential),
+    ).resolves.toMatchObject({ success: true, alreadyTerminal: true });
+  });
+
+  it("stops a known provider task when its local submission write loses a project-delete race", async () => {
+    class DeletedDuringSubmitRepository extends MemoryMonitorRepository {
+      override async markSubmitted() {
+        throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+      }
+    }
+    const repository = new DeletedDuringSubmitRepository();
+    const transport = new FakeMonitorTransport(["deepseek"]);
+    const service = new PresalesMonitorService(
+      repository,
+      transport,
+      async () => credential,
+      async () => credential,
+    );
+
+    await expect(service.create(createInput())).rejects.toMatchObject({
+      code: "PROJECT_DELETED",
+      status: 410,
+    });
+    expect(transport.stopCalls).toBe(1);
+  });
+
+  it("keeps the known provider task ID retryable when compensation stop fails", async () => {
+    class FailedLocalWriteRepository extends MemoryMonitorRepository {
+      override async markSubmitted() {
+        throw new Error("local write failed");
+      }
+    }
+    const repository = new FailedLocalWriteRepository();
+    const transport = new FakeMonitorTransport(["deepseek"]);
+    transport.stopError = new Error("provider unavailable");
+    const service = new PresalesMonitorService(
+      repository,
+      transport,
+      async () => credential,
+      async () => credential,
+    );
+
+    await expect(service.create(createInput())).rejects.toMatchObject({
+      code: "MONITOR_STOP_FAILED",
+      status: 502,
+    });
+    expect([...repository.runs.values()][0]).toMatchObject({
+      status: "submission_unknown",
+      upstreamTaskId: TASK_ID,
+    });
+  });
 
   it("safely reacquires an explicitly rejected reservation only after credential rotation", async () => {
     const repository = new MemoryMonitorRepository();
@@ -1010,6 +1246,266 @@ describe("presales monitor payload and reservation", () => {
     expect(result.status).toBe("remote_failed");
     expect(transport.statusCalls).toBe(0);
     expect(transport.resultCalls).toBe(0);
+  });
+});
+
+describe("workspace-owned brand tracking monitor", () => {
+  const windowStartedAt = new Date("2025-12-31T16:00:00.000Z");
+  const windowEndsAt = new Date("2026-01-31T16:00:00.000Z");
+
+  function workspaceInput(
+    userId: number,
+    idempotencyKey: string,
+    reservationAt = new Date("2026-01-01T00:00:00.000Z"),
+  ) {
+    return {
+      userId,
+      question: QUESTION,
+      idempotencyKey,
+      reservationAt,
+      windowStartedAt,
+      windowEndsAt,
+    };
+  }
+
+  it("keeps an authoritative pre-boundary reservation in its original month and replays it after the boundary", async () => {
+    const repository = new MemoryMonitorRepository();
+    repository.workspaceLimits.set(7, null);
+    const transport = new FakeMonitorTransport(["chatgpt"]);
+    const reservationAt = new Date("2026-01-31T15:59:59.900Z");
+    let clock = new Date(reservationAt);
+    const afterBoundary = new Date("2026-01-31T16:00:00.100Z");
+    const service = new PresalesMonitorService(
+      repository,
+      transport,
+      async () => {
+        clock = new Date(afterBoundary);
+        return credential;
+      },
+      async (id) => (id === credential.id ? credential : null),
+      () => new Date(clock),
+    );
+    const idempotencyKey = "brand-tracking-boundary-request-0001";
+
+    const first = await service.createForWorkspace({
+      userId: 7,
+      question: QUESTION,
+      idempotencyKey,
+      reservationAt,
+      windowStartedAt,
+      windowEndsAt,
+    });
+    expect(first.run.createdAt).toBe(reservationAt.toISOString());
+    await expect(
+      service.getWorkspaceQuota({ userId: 7, windowStartedAt, windowEndsAt }),
+    ).resolves.toEqual({ limit: null, used: 5 });
+
+    const nextWindowEndsAt = new Date("2026-02-28T16:00:00.000Z");
+    const replay = await service.createForWorkspace({
+      userId: 7,
+      question: QUESTION,
+      idempotencyKey,
+      reservationAt: afterBoundary,
+      windowStartedAt: windowEndsAt,
+      windowEndsAt: nextWindowEndsAt,
+    });
+    expect(replay).toMatchObject({
+      replayed: true,
+      run: {
+        runId: first.run.runId,
+        createdAt: reservationAt.toISOString(),
+      },
+    });
+    await expect(
+      service.getWorkspaceQuota({
+        userId: 7,
+        windowStartedAt: windowEndsAt,
+        windowEndsAt: nextWindowEndsAt,
+      }),
+    ).resolves.toEqual({ limit: null, used: 0 });
+    expect(transport.submitCalls).toBe(1);
+  });
+
+  it("moves a rotated-credential rejected retry into the current quota window", async () => {
+    const repository = new MemoryMonitorRepository();
+    repository.workspaceLimits.set(7, null);
+    const transport = new FakeMonitorTransport(["chatgpt"]);
+    const rotatedCredential: DecryptedPresalesCredential = {
+      ...credential,
+      id: "credential-2",
+      version: 2,
+      fingerprint: "fingerprint-2",
+    };
+    let activeCredential = credential;
+    let clock = new Date("2026-01-01T00:00:00.000Z");
+    const service = new PresalesMonitorService(
+      repository,
+      transport,
+      async () => activeCredential,
+      async (id) =>
+        [credential, rotatedCredential].find((item) => item.id === id) ?? null,
+      () => new Date(clock),
+    );
+    const idempotencyKey = "brand-tracking-rotated-retry-0001";
+    transport.submitError = new MonitorRemoteError(
+      "credential rejected",
+      false,
+    );
+
+    await expect(
+      service.createForWorkspace({
+        userId: 7,
+        question: QUESTION,
+        idempotencyKey,
+        reservationAt: new Date(clock),
+        windowStartedAt,
+        windowEndsAt,
+      }),
+    ).rejects.toMatchObject({ code: "MONITOR_SUBMISSION_REJECTED" });
+    const rejectedRun = [...repository.runs.values()][0];
+    expect(rejectedRun).toMatchObject({
+      status: "remote_failed",
+      upstreamTaskId: null,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+
+    const currentWindowStartedAt = windowEndsAt;
+    const currentWindowEndsAt = new Date("2026-02-28T16:00:00.000Z");
+    const currentReservationAt = new Date("2026-02-01T00:00:00.000Z");
+    activeCredential = rotatedCredential;
+    clock = new Date(currentReservationAt);
+    transport.submitError = null;
+    const submitCallsBeforeRetry = transport.submitCalls;
+
+    const retried = await service.createForWorkspace({
+      userId: 7,
+      question: QUESTION,
+      idempotencyKey,
+      reservationAt: currentReservationAt,
+      windowStartedAt: currentWindowStartedAt,
+      windowEndsAt: currentWindowEndsAt,
+    });
+    expect(retried).toMatchObject({
+      replayed: false,
+      run: {
+        runId: rejectedRun.id,
+        createdAt: currentReservationAt.toISOString(),
+        status: "submitted",
+      },
+    });
+    expect(transport.submitCalls).toBe(submitCallsBeforeRetry + 1);
+    await expect(
+      service.getWorkspaceQuota({
+        userId: 7,
+        windowStartedAt,
+        windowEndsAt,
+      }),
+    ).resolves.toEqual({ limit: null, used: 0 });
+    await expect(
+      service.getWorkspaceQuota({
+        userId: 7,
+        windowStartedAt: currentWindowStartedAt,
+        windowEndsAt: currentWindowEndsAt,
+      }),
+    ).resolves.toEqual({ limit: null, used: 5 });
+  });
+
+  it("rejects a workspace reservation timestamp outside its quota window", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    harness.repository.workspaceLimits.set(7, null);
+
+    await expect(
+      harness.service.createForWorkspace({
+        ...workspaceInput(7, "brand-tracking-invalid-window-0001"),
+        reservationAt: windowEndsAt,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_REQUEST", status: 400 });
+    expect(harness.transport.submitCalls).toBe(0);
+  });
+
+  it("treats a null monthly limit as unlimited and counts expected items", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    harness.repository.workspaceLimits.set(7, null);
+
+    await harness.service.createForWorkspace(
+      workspaceInput(7, "brand-tracking-request-0001"),
+    );
+    harness.advance(1);
+    const second = await harness.service.createForWorkspace(
+      workspaceInput(
+        7,
+        "brand-tracking-request-0002",
+        new Date("2026-01-01T00:00:00.001Z"),
+      ),
+    );
+
+    await expect(
+      harness.service.getWorkspaceQuota({
+        userId: 7,
+        windowStartedAt,
+        windowEndsAt,
+      }),
+    ).resolves.toEqual({ limit: null, used: 10 });
+    await expect(harness.service.latestForWorkspace(7)).resolves.toMatchObject({
+      runId: second.run.runId,
+      platforms: ["chatgpt"],
+      expectedItems: 5,
+    });
+    expect(harness.transport.submitCalls).toBe(2);
+  });
+
+  it("rejects before the provider POST when fewer than five items remain", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    harness.repository.workspaceLimits.set(7, 4);
+
+    await expect(
+      harness.service.createForWorkspace(
+        workspaceInput(7, "brand-tracking-request-0003"),
+      ),
+    ).rejects.toMatchObject({
+      code: "MONITOR_QUOTA_EXCEEDED",
+      status: 429,
+    });
+    expect(harness.transport.submitCalls).toBe(0);
+  });
+
+  it("replays the same reservation after a quota decrease without charging or submitting twice", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    harness.repository.workspaceLimits.set(7, 5);
+    const input = workspaceInput(7, "brand-tracking-request-0004");
+
+    const first = await harness.service.createForWorkspace(input);
+    harness.repository.workspaceLimits.set(7, 0);
+    const replay = await harness.service.createForWorkspace(input);
+
+    expect(first.replayed).toBe(false);
+    expect(replay).toMatchObject({
+      replayed: true,
+      run: { runId: first.run.runId },
+    });
+    await expect(
+      harness.service.getWorkspaceQuota({
+        userId: 7,
+        windowStartedAt,
+        windowEndsAt,
+      }),
+    ).resolves.toEqual({ limit: 0, used: 5 });
+    expect(harness.transport.submitCalls).toBe(1);
+  });
+
+  it("returns NOT_FOUND for a run owned by another workspace", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    harness.repository.workspaceLimits.set(7, null);
+    const created = await harness.service.createForWorkspace(
+      workspaceInput(7, "brand-tracking-request-0005"),
+    );
+
+    await expect(
+      harness.service.getForWorkspace(8, created.run.runId),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
+    await expect(
+      harness.service.resultForWorkspace(8, created.run.runId),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
   });
 });
 
@@ -1448,6 +1944,19 @@ describe("presales monitor polling and public result", () => {
     expect(JSON.stringify(result)).toContain('"platform":"baiduai"');
   });
 
+  it("returns ChatGPT under the public chatgpt contract", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    const created = await harness.service.create(createInput(["chatgpt"]));
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const result = await harness.service.result(created.run.runId);
+    expect(result.platforms).toEqual(["chatgpt"]);
+    expect(result.records).toHaveLength(5);
+    expect(
+      result.records?.every((record) => record.platform === "chatgpt"),
+    ).toBe(true);
+    expect(JSON.stringify(result)).toContain('"platform":"chatgpt"');
+  });
+
   it("fails closed when a result reports a different platform", async () => {
     const harness = makeHarness(["baiduai"]);
     const created = await harness.service.create(createInput(["baiduai"]));
@@ -1559,6 +2068,116 @@ describe("presales monitor polling and public result", () => {
     expect(second.records).toHaveLength(4);
   });
 });
+
+describe.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
+  "physical project monitor purge",
+  () => {
+    async function submittedProjectRun() {
+      const repository = new MemoryMonitorRepository();
+      const reserved = await repository.reserve({
+        projectId: "project-20260728-0001",
+        idempotencyKeyHash: "a".repeat(64),
+        requestHash: "b".repeat(64),
+        credential,
+        question: QUESTION,
+        platforms: ["deepseek"],
+        expectedItems: 5,
+        now: new Date("2026-01-01T00:00:00Z"),
+      });
+      return repository.markSubmitted(reserved.run.id, {
+        upstreamTaskId: TASK_ID,
+        submitTotalItems: 5,
+        initialSubtaskIds: submittedChildren(["deepseek"]).map(
+          (item) => item.subTaskId,
+        ),
+        subtaskScopes: {},
+        now: new Date("2026-01-01T00:00:01Z"),
+      });
+    }
+
+    it("stops every known provider task before physically deleting its local row", async () => {
+      const rows = [await submittedProjectRun()];
+      const executor = monitorPurgeExecutor(rows);
+      const transport = new FakeMonitorTransport(["deepseek"]);
+
+      await expect(
+        purgePresalesProjectMonitorRuns(
+          { projectId: "project-20260728-0001" },
+          {
+            executor,
+            transport,
+            credentialById: async () => credential,
+            now: () => new Date("2026-01-01T00:03:00Z"),
+          },
+        ),
+      ).resolves.toEqual({ deletedRuns: 1, pendingRuns: 0 });
+      expect(transport.stopCalls).toBe(1);
+      expect(rows).toHaveLength(0);
+    });
+
+    it("keeps the local retry target when provider stop fails", async () => {
+      const rows = [await submittedProjectRun()];
+      const executor = monitorPurgeExecutor(rows);
+      const transport = new FakeMonitorTransport(["deepseek"]);
+      transport.stopError = new Error("provider unavailable");
+
+      await expect(
+        purgePresalesProjectMonitorRuns(
+          { projectId: "project-20260728-0001" },
+          {
+            executor,
+            transport,
+            credentialById: async () => credential,
+            now: () => new Date("2026-01-01T00:03:00Z"),
+          },
+        ),
+      ).rejects.toMatchObject({ code: "MONITOR_STOP_FAILED", status: 502 });
+      expect(rows).toHaveLength(1);
+    });
+
+    it("keeps a fresh no-ID submission pending until its request window closes", async () => {
+      const repository = new MemoryMonitorRepository();
+      const reserved = await repository.reserve({
+        projectId: "project-20260728-0001",
+        idempotencyKeyHash: "c".repeat(64),
+        requestHash: "d".repeat(64),
+        credential,
+        question: QUESTION,
+        platforms: ["deepseek"],
+        expectedItems: 5,
+        now: new Date("2026-01-01T00:00:00Z"),
+      });
+      const rows = [reserved.run];
+      const executor = monitorPurgeExecutor(rows);
+
+      await expect(
+        purgePresalesProjectMonitorRuns(
+          { projectId: "project-20260728-0001" },
+          {
+            executor,
+            transport: new FakeMonitorTransport(["deepseek"]),
+            credentialById: async () => credential,
+            now: () => new Date("2026-01-01T00:01:00Z"),
+          },
+        ),
+      ).resolves.toEqual({ deletedRuns: 0, pendingRuns: 1 });
+      expect(rows).toHaveLength(1);
+    });
+  },
+);
+
+describe.runIf(!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
+  "Wave D0 project monitor deletion gate",
+  () => {
+    it("rejects before resolving a database or provider transport", async () => {
+      await expect(
+        purgePresalesProjectMonitorRuns({
+          projectId: "project-20260728-0001",
+        }),
+      ).rejects.toThrow("physical deletion is disabled");
+    });
+  },
+);
 
 async function listen(router: express.Router) {
   const app = express();
@@ -1726,18 +2345,31 @@ describe("presales monitor HTTP contract", () => {
     }
   });
 
-  it("rejects browser-controlled mode, screenshot, repeat and unknown platforms", async () => {
-    const harness = makeHarness(["deepseek"]);
+  it("accepts ChatGPT while rejecting browser-controlled execution fields and unknown platforms", async () => {
+    const harness = makeHarness(["chatgpt"]);
     const { server, baseUrl } = await listen(
       createPresalesMonitorRouter(harness.service),
     );
     try {
+      const accepted = await fetch(baseUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(createInput(["chatgpt"])),
+      });
+      expect(accepted.status).toBe(201);
+      await expect(accepted.json()).resolves.toMatchObject({
+        run: {
+          platforms: ["chatgpt"],
+          repeatPerPlatform: 5,
+          expectedItems: 5,
+        },
+      });
+
       for (const body of [
         { ...createInput(), mode: "standard" },
         { ...createInput(), screenshot: 1 },
         { ...createInput(), repeat: 1 },
         { ...createInput(), platforms: ["unknown"] },
-        { ...createInput(), platforms: ["chatgpt"] },
       ]) {
         const response = await fetch(baseUrl, {
           method: "POST",
@@ -1746,7 +2378,7 @@ describe("presales monitor HTTP contract", () => {
         });
         expect(response.status).toBe(400);
       }
-      expect(harness.transport.submitCalls).toBe(0);
+      expect(harness.transport.submitCalls).toBe(1);
     } finally {
       await close(server);
     }

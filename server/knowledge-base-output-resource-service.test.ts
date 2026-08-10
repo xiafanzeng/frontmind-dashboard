@@ -21,31 +21,55 @@ describe("recordKnowledgeBaseOutputFiles identity boundary", () => {
     mocks.logKnowledgeBaseRuntimeFailure.mockReset();
   });
 
-  it("validates the complete output before writing any ownership row", async () => {
+  it("skips a malformed image while recording valid provider output", async () => {
+    await recordKnowledgeBaseOutputFiles({
+      userId: 17,
+      apiCredentialId: "credential-1",
+      output: [
+        {
+          id: "valid-output",
+          type: "output_file",
+          file_id: "valid-file",
+          filename: "report.pdf",
+          mime_type: "application/pdf",
+        },
+        {
+          id: "conflicting-output",
+          type: "output_image",
+          file_id: "image-a",
+          fileId: "image-b",
+          filename: "image.webp",
+          mime_type: "image/webp",
+        },
+      ],
+    });
+
+    expect(mocks.recordUpstreamResource).toHaveBeenCalledTimes(1);
+    expect(mocks.recordUpstreamResource).toHaveBeenCalledWith({
+      userId: 17,
+      apiCredentialId: "credential-1",
+      kind: "file",
+      upstreamId: "valid-file",
+    });
+  });
+
+  it("still rejects malformed non-image resources", async () => {
     await expect(
       recordKnowledgeBaseOutputFiles({
         userId: 17,
         apiCredentialId: "credential-1",
         output: [
           {
-            id: "valid-output",
+            id: "conflicting-document",
             type: "output_file",
-            file_id: "valid-file",
+            file_id: "document-a",
+            fileId: "document-b",
             filename: "report.pdf",
             mime_type: "application/pdf",
           },
-          {
-            id: "conflicting-output",
-            type: "output_image",
-            file_id: "image-a",
-            fileId: "image-b",
-            filename: "image.webp",
-            mime_type: "image/webp",
-          },
         ],
       }),
-    ).rejects.toBeInstanceOf(Error);
-
+    ).rejects.toThrow("上游文件标识 的别名字段相互冲突");
     expect(mocks.recordUpstreamResource).not.toHaveBeenCalled();
   });
 

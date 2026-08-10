@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { websiteProjectDeletionTombstones } from "../drizzle/schema";
 
 const mocks = vi.hoisted(() => ({
   getDb: vi.fn(),
@@ -104,17 +105,34 @@ function importDatabase(transactionResults: unknown[][] = [[], []]) {
     where: vi.fn().mockResolvedValue(undefined),
   };
   const tx = {
-    select: () => queryResult(transactionResults.shift() ?? []),
-    insert: () => ({
-      values: vi.fn().mockResolvedValue(undefined),
+    select: () => ({
+      from: (table: unknown) =>
+        table === websiteProjectDeletionTombstones
+          ? queryResult([{ status: "active" }])
+          : queryResult(transactionResults.shift() ?? []),
+    }),
+    insert: (table: unknown) => ({
+      values:
+        table === websiteProjectDeletionTombstones
+          ? () => ({
+              onDuplicateKeyUpdate: vi.fn().mockResolvedValue(undefined),
+            })
+          : vi.fn().mockResolvedValue(undefined),
     }),
     update: () => transactionUpdateQuery,
   };
   const provisionQuery = {
     from: () => provisionQuery,
-    where: async () => [
-      { userId: 7, companyName: "示例企业", status: "completed" },
-    ],
+    where: () => {
+      const rows = [
+        { userId: 7, companyName: "示例企业", status: "completed" },
+      ];
+      const result = Promise.resolve(rows) as Promise<typeof rows> & {
+        limit: () => Promise<typeof rows>;
+      };
+      result.limit = async () => rows;
+      return result;
+    },
   };
   const updateQuery = {
     set: () => updateQuery,
@@ -333,7 +351,9 @@ describe("website knowledge import v3 manifest binding", () => {
           fileId: originalValue.finalArtifact.fileId,
           descriptorHash: originalValue.candidate.descriptorHash,
           artifactHash: finalSha256,
-          sourceReference: `website-kb:v4:${originalValue.finalArtifact.finalizerVersion}:${createHash("sha256")
+          sourceReference: `website-kb:v4:${originalValue.finalArtifact.finalizerVersion}:${createHash(
+            "sha256",
+          )
             .update(
               [
                 originalValue.candidate.sha256,

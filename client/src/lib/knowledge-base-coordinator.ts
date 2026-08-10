@@ -79,6 +79,32 @@ export function observationNeedsPolling(
   );
 }
 
+export interface KnowledgeBaseAcknowledgementOptions {
+  /**
+   * An ordinary reply creates a new active turn, so seeing that request id is
+   * durable acknowledgement. A legacy attachment takeover reuses an active
+   * request id that already existed before the upload attempt and must disable
+   * this signal; only a later presentation/completion proves new progress.
+   */
+  allowActiveTurn?: boolean;
+}
+
+/** A durable server observation is the acknowledgement, independent of HTTP. */
+export function knowledgeBaseObservationAcknowledgesClientRequest(
+  observation: KnowledgeBaseObservationDto | null | undefined,
+  clientRequestId: string | null | undefined,
+  options: KnowledgeBaseAcknowledgementOptions = {},
+) {
+  const requestId = clientRequestId?.trim();
+  if (!observation || !requestId) return false;
+  return (
+    (options.allowActiveTurn !== false &&
+      observation.activeTurn?.clientRequestId === requestId) ||
+    observation.approvedPresentation?.clientRequestId === requestId ||
+    observation.completedTurn?.clientRequestId === requestId
+  );
+}
+
 /**
  * One instance is owned by one ConversationProvider. Repeated wake calls are
  * coalesced and never create overlapping reconcile requests for a conversation.
@@ -199,9 +225,10 @@ export class KnowledgeBasePollingCoordinator {
     const startedAt = slot.pendingRequestStartedAt;
     if (!clientRequestId || startedAt === null) return false;
 
-    const acknowledged =
-      observation.activeTurn?.clientRequestId === clientRequestId ||
-      observation.approvedPresentation?.clientRequestId === clientRequestId;
+    const acknowledged = knowledgeBaseObservationAcknowledgesClientRequest(
+      observation,
+      clientRequestId,
+    );
     if (acknowledged) {
       slot.pendingClientRequestId = null;
       slot.pendingRequestStartedAt = null;
@@ -258,7 +285,8 @@ export class KnowledgeBasePollingCoordinator {
         observationNeedsPolling(
           observation,
           (this.options.now ?? Date.now)(),
-        ) || pendingRequestNeedsPolling
+        ) ||
+        pendingRequestNeedsPolling
       ) {
         this.schedule(conversationId, slot);
       }

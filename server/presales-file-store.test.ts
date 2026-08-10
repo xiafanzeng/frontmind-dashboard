@@ -19,9 +19,11 @@ import {
   hashPresalesFileIdempotencyKey,
   markStoredPresalesFileRetention,
   readPresalesFileLifecycle,
+  readPresalesProjectFileCreateReservations,
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
   removePresalesFileCreateReservation,
+  purgePresalesFileCreateReservation,
   stagePresalesFileContent,
   sweepPresalesFileStorageRetention,
 } from "./presales-file-store";
@@ -241,6 +243,88 @@ describe("durable presales file-create reservations", () => {
     if (first.state === "acquired" && recovered.state === "acquired") {
       expect(recovered.attemptId).not.toBe(first.attemptId);
     }
+  });
+
+  it("keeps the default file-create lease beyond the upstream timeout", async () => {
+    const input = {
+      idempotencyKey: "geo-custom-file:timeout-window:archive:v1",
+      requestHash: hashPresalesFileCreatePayload({ filename: "archive.zip" }),
+      apiCredentialId: "credential-1",
+      credentialVersion: 1,
+    };
+    await acquirePresalesFileCreateReservation({
+      ...input,
+      now: new Date("2026-08-02T08:00:00.000Z"),
+    });
+    await expect(
+      acquirePresalesFileCreateReservation({
+        ...input,
+        now: new Date("2026-08-02T08:02:01.000Z"),
+      }),
+    ).resolves.toMatchObject({ state: "pending" });
+  });
+
+  it("binds a legacy reservation to its project and physically clears project cleanup state", async () => {
+    const idempotencyKey = "geo-custom-file:legacy-project:archive:v1";
+    const legacyHash = hashPresalesFileCreatePayload({
+      filename: "archive.zip",
+    });
+    await acquirePresalesFileCreateReservation({
+      idempotencyKey,
+      requestHash: legacyHash,
+      apiCredentialId: "credential-1",
+      credentialVersion: 1,
+      now: new Date("2026-08-02T08:00:00.000Z"),
+      leaseMs: 1_000,
+    });
+    await expect(
+      acquirePresalesFileCreateReservation({
+        idempotencyKey,
+        requestHash: hashPresalesFileCreatePayload({
+          filename: "archive.zip",
+          projectId: "project-20260728-0001",
+        }),
+        compatibleRequestHashes: [legacyHash],
+        projectId: "project-20260728-0001",
+        apiCredentialId: "credential-1",
+        credentialVersion: 1,
+        now: new Date("2026-08-02T08:00:00.500Z"),
+      }),
+    ).resolves.toMatchObject({ state: "pending" });
+    await expect(
+      readPresalesProjectFileCreateReservations(
+        "project-20260728-0001",
+        new Date("2026-08-02T08:00:00.500Z"),
+      ),
+    ).resolves.toMatchObject({ pendingReservations: 1, files: [] });
+    await expect(
+      readPresalesProjectFileCreateReservations(
+        "project-20260728-0001",
+        new Date("2026-08-02T08:00:02.000Z"),
+      ),
+    ).resolves.toMatchObject({ pendingReservations: 0, files: [] });
+
+    const completed = await acquirePresalesFileCreateReservation({
+      idempotencyKey: "geo-custom-file:project-cleanup:archive:v1",
+      requestHash: hashPresalesFileCreatePayload({
+        filename: "result.zip",
+        projectId: "project-20260728-0001",
+      }),
+      projectId: "project-20260728-0001",
+      apiCredentialId: "credential-1",
+      credentialVersion: 1,
+    });
+    if (completed.state !== "acquired") throw new Error("not acquired");
+    await completePresalesFileCreateReservation({
+      ...completed,
+      upstreamFileId: "project-file-1",
+    });
+    await purgePresalesFileCreateReservation("project-file-1");
+    const root = path.join(assetDir, "presales-files", "create-reservations");
+    const entries = await readdir(root);
+    expect(entries).not.toContain(
+      `${hashPresalesFileIdempotencyKey("geo-custom-file:project-cleanup:archive:v1")}.json`,
+    );
   });
 
   it("rejects reusing one operation key for different file metadata", async () => {

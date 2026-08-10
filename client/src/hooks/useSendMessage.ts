@@ -44,6 +44,7 @@ import {
   sliceNewOutput,
 } from "@/lib/task-output-projection";
 import { toast } from "sonner";
+import { knowledgeBaseObservationAcknowledgesClientRequest } from "@/lib/knowledge-base-coordinator";
 
 export {
   collectAssistantOutputIds,
@@ -459,6 +460,8 @@ export function useSendMessage() {
         knowledgeBaseExpectedGeneration?: number;
         knowledgeBaseExpectedRevision?: number;
         knowledgeBaseExpectedLeafId?: string;
+        knowledgeBaseExpectedPresentationKey?: string;
+        submissionKind?: "message" | "logo";
         responseLogicContext?: ResponseLogicTaskContext;
       },
     ) => {
@@ -606,6 +609,7 @@ export function useSendMessage() {
           | undefined;
         if (
           options?.syncKnowledgeBaseSnapshot &&
+          options.submissionKind !== "logo" &&
           preparedUploads.files.length > 0
         ) {
           try {
@@ -857,15 +861,22 @@ export function useSendMessage() {
             // response. The POST is replay-safe by clientRequestId, so start
             // the authoritative coordinator alongside it instead of showing
             // request latency as an unknown/recovery failure.
-            updateStatus(convId, "running", {
-              startedAt: responseStartedAt,
-            });
+            const waitForAcknowledgedLogoTask =
+              options?.submissionKind === "logo";
+            if (!waitForAcknowledgedLogoTask) {
+              updateStatus(convId, "running", {
+                startedAt: responseStartedAt,
+              });
+            }
             const responsePromise = createKnowledgeBaseTurnTask(input, {
               conversationId: convId,
               clientRequestId: knowledgeBaseClientRequestId!,
               expectedGeneration: options?.knowledgeBaseExpectedGeneration,
               expectedRevision: options?.knowledgeBaseExpectedRevision,
               expectedLeafId: options?.knowledgeBaseExpectedLeafId,
+              expectedPresentationKey:
+                options?.knowledgeBaseExpectedPresentationKey,
+              submissionKind: options?.submissionKind ?? "message",
               ...(knowledgeBaseAttachmentManifest
                 ? {
                     attachmentManifest: knowledgeBaseAttachmentManifest,
@@ -879,7 +890,9 @@ export function useSendMessage() {
                   }
                 : {}),
             });
-            wakeKnowledgeBaseConversation(convId);
+            if (!waitForAcknowledgedLogoTask) {
+              wakeKnowledgeBaseConversation(convId);
+            }
             response = await responsePromise;
 
             // Version freshness is non-authoritative. Run its bounded,
@@ -906,6 +919,15 @@ export function useSendMessage() {
           setIsRetrying(false);
 
           if (isKnowledgeBaseSubmission) {
+            if (
+              response.adoptedClientRequestId &&
+              response.adoptedClientRequestId !== knowledgeBaseClientRequestId
+            ) {
+              rollbackPendingKnowledgeBaseTurn(
+                convId,
+                knowledgeBaseClientRequestId!,
+              );
+            }
             if (response.knowledgeObservation) {
               commitKnowledgeBaseObservation(
                 convId,
@@ -922,7 +944,10 @@ export function useSendMessage() {
             }
             wakeKnowledgeBaseConversation(convId);
             toast.success("本轮已提交", {
-              description: "FrontMind 正在生成并校验当前知识节点。",
+              description:
+                options.submissionKind === "logo"
+                  ? "Manus 已接收 Logo，正在重新呈现当前知识节点。"
+                  : "FrontMind 正在生成并校验当前知识节点。",
               duration: 3200,
             });
             return true;
@@ -1045,17 +1070,52 @@ export function useSendMessage() {
           }
         } catch (err: any) {
           if (options?.syncKnowledgeBaseSnapshot) {
+            const acknowledgedObservation =
+              options.submissionKind !== "logo" &&
+              err?.knowledgeObservation &&
+              knowledgeBaseObservationAcknowledgesClientRequest(
+                err.knowledgeObservation,
+                knowledgeBaseClientRequestId,
+                {
+                  // Legacy upload-first recovery deliberately reuses the old
+                  // reservation id. Its already-present activeTurn cannot prove
+                  // that this takeover attempt succeeded.
+                  allowActiveTurn: !resumingLegacyKnowledgeBaseAttachmentTurn,
+                },
+              )
+                ? err.knowledgeObservation
+                : null;
+            if (acknowledgedObservation) {
+              // The durable observation outranks the transport status. A proxy
+              // can fail after the reservation commits; never restore that
+              // accepted answer as a draft against the next presentation.
+              commitKnowledgeBaseObservation(convId, acknowledgedObservation);
+              wakeKnowledgeBaseConversation(convId);
+              toast.success("本轮已提交", {
+                description: "FrontMind 正在生成并校验当前知识节点。",
+                duration: 3200,
+              });
+              return true;
+            }
             const status = Number(err?.status || 0);
             const code = String(err?.code || "");
+            // A Logo upload has one visible action and is accepted only after
+            // the server returns the real upstream task id. A transport error
+            // or a malformed 2xx response must leave the chosen image in place
+            // for a clear retry instead of claiming that submission succeeded.
+            const logoTaskWasNotAcknowledged =
+              options.submissionKind === "logo";
             const requestOutcomeUnknown =
-              !status ||
-              status === 408 ||
-              status === 425 ||
-              status === 429 ||
-              status >= 500 ||
-              code === "IDEMPOTENCY_PENDING";
+              !logoTaskWasNotAcknowledged &&
+              (!status ||
+                status === 408 ||
+                status === 425 ||
+                status === 429 ||
+                status >= 500 ||
+                code === "IDEMPOTENCY_PENDING");
             const deterministicFailure =
-              !requestOutcomeUnknown && status !== 409;
+              logoTaskWasNotAcknowledged ||
+              (!requestOutcomeUnknown && status !== 409);
             if (
               (status === 409 || deterministicFailure) &&
               knowledgeBaseClientRequestId
@@ -1070,7 +1130,8 @@ export function useSendMessage() {
             }
             if (
               (status === 409 || deterministicFailure) &&
-              !err?.knowledgeObservation
+              (!err?.knowledgeObservation ||
+                (deterministicFailure && options.submissionKind === "logo"))
             ) {
               updateStatus(convId, conv?.status ?? "awaiting_input");
             }

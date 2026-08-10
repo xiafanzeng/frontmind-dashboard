@@ -5,11 +5,14 @@ import {
   Check,
   CircleDot,
   ChevronRight,
+  FileClock,
   FileText,
   ImagePlus,
   Layers3,
   Loader2,
+  Maximize2,
   MessageSquareText,
+  Minimize2,
   Paperclip,
   RefreshCw,
   Search,
@@ -32,6 +35,20 @@ import {
 import Home from "@/pages/Home";
 import FilePreview from "@/components/FilePreview";
 import ImagePreview from "@/components/ImagePreview";
+import MarkdownRenderer from "@/components/MarkdownRenderer";
+import QuestionMaintenanceRequestDialog from "@/components/QuestionMaintenanceRequestDialog";
+import CustomerRequestHistoryDialog from "@/components/CustomerRequestHistoryDialog";
+import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   useConversation,
   type Attachment,
@@ -39,6 +56,10 @@ import {
 } from "@/contexts/ConversationContext";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
+import {
+  keywordCategoryKey,
+  keywordCategoryTone,
+} from "@shared/keyword-categories";
 import type {
   ConfirmedResponseLogic,
   ResponseLogicAttachment,
@@ -48,7 +69,10 @@ import type {
   SaveResponseLogicInput,
 } from "@shared/response-logic";
 import {
+  normalizeResponseLogicPublicProvenance,
+  normalizeResponseLogicPublicText,
   parseResponseLogicStructuredDraft,
+  projectResponseLogicAssistantMarkdown,
   responseLogicStructuredDraftSchema,
   type ResponseLogicStructuredDraft,
 } from "@shared/response-logic";
@@ -160,16 +184,28 @@ function createEmptyDraft(question: IntentQuestion): LogicDraft {
 }
 
 /**
- * Converts only a server-compatible seven-section Pro response into editable
+ * Converts only a server-compatible four-section Pro response into editable
  * fields. Invalid or partial model text is rejected instead of being copied
  * into an arbitrary draft field.
  */
 export function parseResponseLogicReply(
   reply: string,
 ): Pick<LogicDraft, LogicTextField> {
-  const { roundConfirmation: _roundConfirmation, ...draftFields } =
-    parseResponseLogicStructuredDraft(reply);
-  return draftFields;
+  return {
+    ...parseResponseLogicStructuredDraft(reply),
+    pending: "",
+    references: "",
+  };
+}
+
+export class ResponseLogicTaskStatusError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ResponseLogicTaskStatusError";
+  }
 }
 
 export async function fetchResponseLogicStructuredDraft(input: {
@@ -196,17 +232,23 @@ export async function fetchResponseLogicStructuredDraft(input: {
     payload = null;
   }
   if (!response.ok) {
-    const message =
+    const apiError =
       payload &&
       typeof payload === "object" &&
       "error" in payload &&
       payload.error &&
-      typeof payload.error === "object" &&
-      "message" in payload.error &&
-      typeof payload.error.message === "string"
-        ? payload.error.message
+      typeof payload.error === "object"
+        ? payload.error
+        : null;
+    const message =
+      apiError && "message" in apiError && typeof apiError.message === "string"
+        ? apiError.message
         : `读取应答逻辑任务失败（${response.status}）`;
-    throw new Error(message);
+    const code =
+      apiError && "code" in apiError && typeof apiError.code === "string"
+        ? apiError.code
+        : "RESPONSE_LOGIC_TASK_READ_FAILED";
+    throw new ResponseLogicTaskStatusError(code, message);
   }
   if (
     !payload ||
@@ -221,7 +263,7 @@ export async function fetchResponseLogicStructuredDraft(input: {
     payload.structuredDraft,
   );
   if (!parsed.success) {
-    throw new Error("服务端返回的应答逻辑草稿未通过七栏目校验");
+    throw new Error("服务端返回的应答逻辑草稿未通过四栏目校验");
   }
   return parsed.data;
 }
@@ -255,6 +297,74 @@ export function isResponseLogicAttachmentExpired(
   );
 }
 
+/**
+ * Only provider-owned assistant outputs may feed the response-logic draft.
+ * Local error/help bubbles have no provider id, files, or response start time.
+ */
+export function isAuthoritativeResponseLogicAssistantMessage(
+  message: LocalMessage,
+) {
+  return (
+    message.role === "assistant" &&
+    !message.isStepsPlaceholder &&
+    Boolean(
+      message.upstreamOutputId ||
+        message.outputFiles?.length ||
+        message.responseStartedAt !== undefined,
+    ) &&
+    Boolean(message.content.trim() || message.outputFiles?.length)
+  );
+}
+
+export function projectResponseLogicConversationMessage(
+  message: LocalMessage,
+): LocalMessage {
+  if (message.role !== "assistant") return message;
+  const publicOutputFileName = (fileName: string, mimeType: string) => {
+    const extension = fileName.match(/\.([A-Za-z0-9]+)$/u)?.[1]?.toLowerCase();
+    const image = mimeType.startsWith("image/");
+    return `${image ? "模型输出图片" : "模型输出资料"}${extension ? `.${extension}` : ""}`;
+  };
+  const publicStepText = (value?: string) =>
+    value ? normalizeResponseLogicPublicText(value) : undefined;
+
+  return {
+    ...message,
+    content: message.content
+      ? projectResponseLogicAssistantMarkdown(message.content)
+      : message.content,
+    attachments: message.attachments?.map((attachment) => ({
+      ...attachment,
+      name: attachment.type === "image" ? "模型输出图片" : "模型输出资料",
+    })),
+    outputFiles: message.outputFiles?.map((file) => ({
+      ...file,
+      fileName: publicOutputFileName(file.fileName, file.mimeType),
+    })),
+    inlineImages: message.inlineImages?.map((image) => ({
+      ...image,
+      alt: "模型输出图片",
+    })),
+    intermediateSteps: message.intermediateSteps?.map((step) => ({
+      ...step,
+      label: publicStepText(step.label) || "正在整理应答逻辑",
+      description: publicStepText(step.description),
+      details: publicStepText(step.details),
+    })),
+    stepGroups: message.stepGroups?.map((group) => ({
+      ...group,
+      title: publicStepText(group.title) || "正在整理应答逻辑",
+      description: publicStepText(group.description),
+      steps: group.steps.map((step) => ({
+        ...step,
+        label: publicStepText(step.label) || "正在整理应答逻辑",
+        description: publicStepText(step.description),
+        details: publicStepText(step.details),
+      })),
+    })),
+  };
+}
+
 export function mergeResponseLogicAttachmentsIntoDraft(
   draft: LogicDraft,
   attachments: ResponseLogicAttachment[],
@@ -285,8 +395,8 @@ export function mergeResponseLogicAttachmentsIntoDraft(
       url: responseLogicAttachmentUrl(attachment.fileId),
       caption: attachment.filename.replace(/\.[^.]+$/, ""),
       source: `企业交流上传：${attachment.filename}`,
-      section: "事实依据",
-      authorization: "待确认",
+      section: "图文依据",
+      authorization: "本次应答可用",
     }));
 
   return {
@@ -338,13 +448,6 @@ export function useResponseLogicWorkspaceState(
   };
 }
 
-function textLines(value: string) {
-  return value
-    .split(/\n+/)
-    .map((item) => item.replace(/^\s*(?:[-•]|\d+[.、])\s*/, "").trim())
-    .filter(Boolean);
-}
-
 function formatConfirmedAt(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -365,6 +468,18 @@ function groupIcon(tone: IntentQuestionGroup["tone"]) {
   return MessageSquareText;
 }
 
+function semanticGroupCategory(group: IntentQuestionGroup) {
+  return keywordCategoryKey(group.id) || keywordCategoryKey(group.title);
+}
+
+function semanticGroupTone(group: IntentQuestionGroup) {
+  return (
+    keywordCategoryTone(group.id) ||
+    keywordCategoryTone(group.title) ||
+    group.tone
+  );
+}
+
 type ResponseLogicPersistence = {
   records?: ResponseLogicRecordDto[];
   loading: boolean;
@@ -376,6 +491,82 @@ type ResponseLogicPersistence = {
     input: SaveResponseLogicInput,
   ) => Promise<{ record: ResponseLogicRecordDto }>;
 };
+
+export function responseLogicPersistenceAvailability(input: {
+  isLoading: boolean;
+  isFetching: boolean;
+  isSuccess: boolean;
+  isError: boolean;
+  hasData: boolean;
+  errorMessage?: string;
+}) {
+  return {
+    // Background fetching must not unmount the live conversation/editor.
+    loading: input.isLoading,
+    // Keep cached content interactive when a background refresh fails. The
+    // next successful poll can reconcile it without flashing back to loading.
+    ready: input.isSuccess || input.hasData,
+    error:
+      input.isError && !input.hasData
+        ? input.errorMessage || "应答逻辑数据载入失败"
+        : undefined,
+  };
+}
+
+export function reconcileResponseLogicDrafts(
+  current: Record<string, LogicDraft>,
+  records: ResponseLogicRecordDto[],
+  previousRecordIds: ReadonlySet<string> | null,
+) {
+  if (previousRecordIds === null) {
+    return Object.fromEntries(
+      records.map((record) => [record.questionId, record.draft]),
+    );
+  }
+  const nextRecordIds = new Set(records.map((record) => record.questionId));
+  const next = { ...current };
+  previousRecordIds.forEach((questionId) => {
+    if (!nextRecordIds.has(questionId)) delete next[questionId];
+  });
+  records.forEach((record) => {
+    // A confirmation made in another tab is authoritative and immutable.
+    // Draft records keep any possibly unsaved local edit during refresh.
+    if (record.confirmed || !next[record.questionId]) {
+      next[record.questionId] = record.draft;
+    }
+  });
+  return next;
+}
+
+export function shouldUseResponseLogicInitialPrompt(
+  conversation: {
+    taskId?: string;
+    previousResponseId?: string;
+    messages: Array<Pick<LocalMessage, "role">>;
+  },
+  readOnly: boolean,
+) {
+  return (
+    !readOnly &&
+    !conversation.taskId &&
+    !conversation.previousResponseId &&
+    !conversation.messages.some((message) => message.role === "user")
+  );
+}
+
+export function shouldHydrateResponseLogicTask(input: {
+  authoritativeTaskId?: string;
+  localTaskId?: string;
+  localPreviousResponseId?: string;
+  unavailableTaskIds: ReadonlySet<string>;
+}) {
+  return Boolean(
+    input.authoritativeTaskId &&
+      !input.unavailableTaskIds.has(input.authoritativeTaskId) &&
+      (input.localTaskId !== input.authoritativeTaskId ||
+        input.localPreviousResponseId !== input.authoritativeTaskId),
+  );
+}
 
 export default function ResponseLogicWorkspace(
   props: ResponseLogicWorkspaceProps,
@@ -427,7 +618,7 @@ export type ResponseLogicConfirmationBoardProps = {
   initialQuestionId?: string | null;
   questionGroups?: IntentQuestionGroup[];
   previewPublished?: boolean;
-  onOpenAgent: (questionId: string) => void;
+  onOpenAgent?: (questionId: string) => void;
 };
 
 export function ResponseLogicConfirmationBoard(
@@ -444,6 +635,25 @@ export function ResponseLogicConfirmationBoard(
     );
   }
   return <PersistentResponseLogicConfirmationBoard {...props} />;
+}
+
+export function ResponseLogicReadOnlyConfirmationBoard({
+  questionGroups,
+  records,
+}: {
+  questionGroups: IntentQuestionGroup[];
+  records: ResponseLogicRecordDto[];
+}) {
+  return (
+    <ResponseLogicConfirmationBoardContent
+      preview={false}
+      questionGroups={questionGroups}
+      records={records}
+      loading={false}
+      error=""
+      onRetry={() => undefined}
+    />
+  );
 }
 
 function DevelopmentResponseLogicConfirmationBoard(
@@ -487,7 +697,7 @@ function PersistentResponseLogicConfirmationBoard(
       records={recordsQuery.data?.records ?? []}
       loading={recordsQuery.isLoading}
       error={
-        recordsQuery.isError
+        recordsQuery.isError && !recordsQuery.data
           ? recordsQuery.error.message || "应答逻辑成果载入失败"
           : ""
       }
@@ -656,15 +866,19 @@ function ResponseLogicConfirmationBoardContent({
           question={selectedEntry.question}
           logic={confirmed}
           showPublicationMeta={false}
-          actionLabel="进入应答逻辑智能体更新"
-          onAction={() => onOpenAgent(activeQuestionId)}
+          actionLabel={onOpenAgent ? "查看已确认应答逻辑" : undefined}
+          onAction={
+            onOpenAgent ? () => onOpenAgent(activeQuestionId) : undefined
+          }
         />
       ) : (
         <ResponseLogicConfirmationState
           title="尚未形成已确认的应答逻辑"
           description={`“${selectedEntry.question.question}”还没有从应答逻辑智能体发布的正式内容；草稿和预填内容不会在这里展示。`}
-          actionLabel="进入应答逻辑智能体"
-          onAction={() => onOpenAgent(activeQuestionId)}
+          actionLabel={onOpenAgent ? "进入应答逻辑智能体" : undefined}
+          onAction={
+            onOpenAgent ? () => onOpenAgent(activeQuestionId) : undefined
+          }
         />
       )}
     </div>
@@ -729,16 +943,20 @@ function PersistentResponseLogicWorkspace(props: ResponseLogicWorkspaceProps) {
       });
     },
   });
+  const availability = responseLogicPersistenceAvailability({
+    isLoading: recordsQuery.isLoading,
+    isFetching: recordsQuery.isFetching,
+    isSuccess: recordsQuery.isSuccess,
+    isError: recordsQuery.isError,
+    hasData: Boolean(recordsQuery.data),
+    errorMessage: recordsQuery.error?.message,
+  });
   return (
     <ResponseLogicWorkspaceContent
       {...props}
       persistence={{
         records: recordsQuery.data?.records,
-        loading: recordsQuery.isLoading || recordsQuery.isFetching,
-        ready: recordsQuery.isSuccess && !recordsQuery.isFetching,
-        error: recordsQuery.isError
-          ? recordsQuery.error.message || "应答逻辑数据载入失败"
-          : undefined,
+        ...availability,
         retry: () => {
           void recordsQuery.refetch();
         },
@@ -794,8 +1012,11 @@ function ResponseLogicWorkspaceContent({
     setUpdateNotice,
   } = workspaceState ?? internalState;
   const objectUrls = useRef(new Set<string>());
-  const hydratedRecordsRef = useRef(false);
+  const syncedRecordIdsRef = useRef<Set<string> | null>(null);
   const [isPublishing, setIsPublishing] = useState(false);
+  const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
+  const [requestHistoryOpen, setRequestHistoryOpen] = useState(false);
+  const [dialogueExpanded, setDialogueExpanded] = useState(false);
 
   useEffect(
     () => () => {
@@ -805,35 +1026,62 @@ function ResponseLogicWorkspaceContent({
   );
 
   useEffect(() => {
-    if (
-      preview ||
-      hydratedRecordsRef.current ||
-      !persistence?.ready ||
-      !persistence.records
-    ) {
+    if (preview || !persistence?.ready || !persistence.records) {
       return;
     }
-    hydratedRecordsRef.current = true;
     const records = persistence.records;
-    setDrafts(
-      Object.fromEntries(
-        records.map((record) => [record.questionId, record.draft]),
-      ),
+    const previousRecordIds = syncedRecordIdsRef.current;
+    const nextRecordIds = new Set(records.map((record) => record.questionId));
+
+    if (previousRecordIds === null) {
+      setDrafts((current) =>
+        reconcileResponseLogicDrafts(current, records, previousRecordIds),
+      );
+      setConfirmations(
+        Object.fromEntries(
+          records
+            .filter((record) => Boolean(record.confirmed))
+            .map((record) => [record.questionId, record.confirmed!]),
+        ),
+      );
+      setConversationIds(
+        Object.fromEntries(
+          records
+            .filter((record) => Boolean(record.conversationId))
+            .map((record) => [record.questionId, record.conversationId!]),
+        ),
+      );
+      syncedRecordIdsRef.current = nextRecordIds;
+      return;
+    }
+
+    const removedRecordIds = [...previousRecordIds].filter(
+      (questionId) => !nextRecordIds.has(questionId),
     );
-    setConfirmations(
-      Object.fromEntries(
-        records
-          .filter((record) => Boolean(record.confirmed))
-          .map((record) => [record.questionId, record.confirmed!]),
-      ),
+    if (removedRecordIds.length > 0) setUpdateNotice("");
+    setDrafts((current) =>
+      reconcileResponseLogicDrafts(current, records, previousRecordIds),
     );
-    setConversationIds(
-      Object.fromEntries(
-        records
-          .filter((record) => Boolean(record.conversationId))
-          .map((record) => [record.questionId, record.conversationId!]),
-      ),
-    );
+    setConfirmations((current) => {
+      const next = { ...current };
+      removedRecordIds.forEach((questionId) => delete next[questionId]);
+      records.forEach((record) => {
+        if (record.confirmed) next[record.questionId] = record.confirmed;
+        else delete next[record.questionId];
+      });
+      return next;
+    });
+    setConversationIds((current) => {
+      const next = { ...current };
+      removedRecordIds.forEach((questionId) => delete next[questionId]);
+      records.forEach((record) => {
+        if (record.conversationId && !next[record.questionId]) {
+          next[record.questionId] = record.conversationId;
+        }
+      });
+      return next;
+    });
+    syncedRecordIdsRef.current = nextRecordIds;
   }, [
     preview,
     persistence?.records,
@@ -841,6 +1089,7 @@ function ResponseLogicWorkspaceContent({
     setConfirmations,
     setConversationIds,
     setDrafts,
+    setUpdateNotice,
   ]);
 
   useEffect(() => {
@@ -915,6 +1164,7 @@ function ResponseLogicWorkspaceContent({
   };
 
   const patchDraft = (patch: Partial<LogicDraft>) => {
+    if (confirmed) return;
     setDrafts((current) => ({
       ...current,
       [activeQuestionId]: {
@@ -929,6 +1179,7 @@ function ResponseLogicWorkspaceContent({
     options?: {
       conversationId?: string;
       publish?: boolean;
+      expectedRevision?: number;
     },
   ) => {
     if (preview) return null;
@@ -940,6 +1191,8 @@ function ResponseLogicWorkspaceContent({
       question: selectedEntry.question.question,
       intent: selectedEntry.question.intent,
       summary: selectedEntry.question.summary,
+      expectedRevision:
+        options?.expectedRevision ?? persistedRecord?.revision ?? 0,
       conversationId: options?.conversationId ?? conversationId,
       draft: nextDraft,
       publish: options?.publish ?? false,
@@ -948,6 +1201,7 @@ function ResponseLogicWorkspaceContent({
   };
 
   const bindConversation = async (nextConversationId: string) => {
+    if (confirmed) return;
     setConversationIds((current) => ({
       ...current,
       [activeQuestionId]: nextConversationId,
@@ -966,8 +1220,11 @@ function ResponseLogicWorkspaceContent({
     reply: string,
     message?: LocalMessage,
     taskId?: string,
+    onTaskUnavailable?: () => void,
   ) => {
+    if (confirmed) return;
     let draftWithVerifiedAttachments = draft;
+    let authoritativeRevision = persistedRecord?.revision ?? 0;
     if (!preview && persistence) {
       try {
         const records = await persistence.refresh();
@@ -983,6 +1240,7 @@ function ResponseLogicWorkspaceContent({
             "当前模型输出与服务端记录的最新任务不一致，请重新打开问题",
           );
         }
+        authoritativeRevision = authoritativeRecord?.revision ?? 0;
         draftWithVerifiedAttachments = mergeResponseLogicAttachmentsIntoDraft(
           draft,
           authoritativeRecord?.draft.attachments ?? [],
@@ -999,7 +1257,6 @@ function ResponseLogicWorkspaceContent({
     }
 
     let parsed: Pick<LogicDraft, LogicTextField>;
-    let roundConfirmation = "";
     try {
       if (preview) {
         parsed = parseResponseLogicReply(reply);
@@ -1012,14 +1269,23 @@ function ResponseLogicWorkspaceContent({
           conversationId,
           taskId,
         });
-        ({ roundConfirmation, ...parsed } = structuredDraft);
+        parsed = { ...structuredDraft, pending: "", references: "" };
       }
     } catch (error) {
+      if (
+        error instanceof ResponseLogicTaskStatusError &&
+        [
+          "RESPONSE_LOGIC_TASK_UNAVAILABLE",
+          "RESPONSE_LOGIC_TASK_FAILED",
+        ].includes(error.code)
+      ) {
+        onTaskUnavailable?.();
+      }
       toast.error("模型输出未载入", {
         description:
           error instanceof Error
             ? error.message
-            : "模型输出未通过七栏目校验，请重新生成",
+            : "模型输出未通过四栏目校验，请重新生成",
       });
       return;
     }
@@ -1030,8 +1296,8 @@ function ResponseLogicWorkspaceContent({
         url: image.src,
         caption: image.alt || `应答配图 ${index + 1}`,
         source: "智能体任务输出",
-        section: "事实依据",
-        authorization: "待确认" as const,
+        section: "图文依据",
+        authorization: "本次应答可用" as const,
       })),
       ...(message?.outputFiles || [])
         .filter((file) => file.mimeType.startsWith("image/"))
@@ -1041,8 +1307,8 @@ function ResponseLogicWorkspaceContent({
           url: file.fileUrl,
           caption: file.fileName,
           source: "智能体任务输出",
-          section: "事实依据",
-          authorization: "待确认" as const,
+          section: "图文依据",
+          authorization: "本次应答可用" as const,
         })),
     ];
     const nextDraft: LogicDraft = {
@@ -1067,10 +1333,10 @@ function ResponseLogicWorkspaceContent({
     }));
     if (!preview) {
       try {
-        await persistDraft(nextDraft);
-        toast.success("模型输出已载入应答草稿", {
-          description: roundConfirmation || undefined,
+        await persistDraft(nextDraft, {
+          expectedRevision: authoritativeRevision,
         });
+        toast.success("模型输出已载入应答草稿");
       } catch (error) {
         toast.error("草稿保存失败", {
           description: error instanceof Error ? error.message : "请稍后重试",
@@ -1080,6 +1346,7 @@ function ResponseLogicWorkspaceContent({
   };
 
   const addImages = (event: ChangeEvent<HTMLInputElement>) => {
+    if (confirmed) return;
     const files = Array.from(event.target.files ?? []);
     if (!files.length) return;
 
@@ -1092,28 +1359,21 @@ function ResponseLogicWorkspaceContent({
         url,
         caption: file.name.replace(/\.[^.]+$/, ""),
         source: "本次企业交流上传",
-        section: "事实依据",
-        authorization: "待确认",
+        section: "图文依据",
+        authorization: "本次应答可用",
       };
     });
     patchDraft({ images: [...draft.images, ...images] });
     event.target.value = "";
   };
 
-  const patchImage = (id: string, patch: Partial<LogicImage>) => {
-    patchDraft({
-      images: draft.images.map((image) =>
-        image.id === id ? { ...image, ...patch } : image,
-      ),
-    });
-  };
-
   const removeImage = (id: string) => {
+    if (confirmed) return;
     patchDraft({ images: draft.images.filter((image) => image.id !== id) });
   };
 
   const updateConfirmation = async () => {
-    if (isPublishing) return;
+    if (isPublishing || confirmed) return;
     setIsPublishing(true);
     try {
       let nextConfirmed: ConfirmedLogic;
@@ -1121,7 +1381,7 @@ function ResponseLogicWorkspaceContent({
         nextConfirmed = {
           ...draft,
           images: draft.images.map((image) => ({ ...image })),
-          version: Math.max(confirmed?.version ?? 0, 0) + 1,
+          version: 1,
           updatedAt: new Date().toISOString(),
         };
       } else {
@@ -1136,8 +1396,9 @@ function ResponseLogicWorkspaceContent({
         [activeQuestionId]: nextConfirmed,
       }));
       setUpdateNotice(
-        `“${selectedEntry.question.question}”的应答逻辑已更新，可在问题优化中查看。`,
+        `“${selectedEntry.question.question}”的应答逻辑已确认，可在问题优化中查看。`,
       );
+      setConfirmDialogOpen(false);
       onPublished?.(activeQuestionId);
     } catch (error) {
       toast.error("应答逻辑更新失败", {
@@ -1150,7 +1411,7 @@ function ResponseLogicWorkspaceContent({
 
   return (
     <section className="response-logic-workspace page-shell">
-      <header className="rl-page-header">
+      <header className="rl-page-header rl-page-header-with-action">
         <div>
           <span className="rl-eyebrow">MindPromise 智诺 · 应答逻辑智能体</span>
           <h2>应答逻辑智能体</h2>
@@ -1158,7 +1419,46 @@ function ResponseLogicWorkspaceContent({
             围绕每个核心问题沉淀可核验的回答口径、证据来源、表达边界与配图材料；完成更新后返回问题优化查看正式版本。
           </p>
         </div>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="rl-page-header-action"
+            onClick={() => setRequestHistoryOpen(true)}
+          >
+            <FileClock className="h-4 w-4" aria-hidden="true" />
+            需求记录
+          </Button>
+          <QuestionMaintenanceRequestDialog
+            mode="response_logic"
+            questions={
+              confirmed
+                ? [
+                    {
+                      id: selectedEntry.question.id,
+                      question: selectedEntry.question.question,
+                    },
+                  ]
+                : []
+            }
+            selectedQuestionId={confirmed ? activeQuestionId : null}
+            disabled={preview || !confirmed}
+          />
+        </div>
       </header>
+
+      <CustomerRequestHistoryDialog
+        open={requestHistoryOpen}
+        onOpenChange={setRequestHistoryOpen}
+        title="应答逻辑需求记录"
+        description="仅显示已确认应答逻辑的重置与重新编辑申请。"
+        type="knowledge_base"
+        surface="response_logic_management"
+        preview={preview}
+        {...(preview ? { tickets: [] } : {})}
+        emptyText="暂无应答逻辑修改需求。"
+      />
 
       {updateNotice && (
         <div className="rl-update-notice" role="status">
@@ -1182,7 +1482,9 @@ function ResponseLogicWorkspaceContent({
             group={selectedEntry.group}
             question={selectedEntry.question}
           />
-          <div className="rl-work-columns">
+          <div
+            className={`rl-work-columns ${dialogueExpanded ? "dialogue-expanded" : ""}`}
+          >
             <DialoguePanel
               preview={preview}
               PreviewDialogueComponent={previewAdapter?.Dialogue}
@@ -1196,22 +1498,58 @@ function ResponseLogicWorkspaceContent({
               onRetryRecords={() => persistence?.retry()}
               lastTaskId={persistedRecord?.lastTaskId}
               lastTaskRecordedAt={persistedRecord?.updatedAt}
+              readOnly={Boolean(confirmed)}
+              expanded={dialogueExpanded}
+              onToggleExpanded={() =>
+                setDialogueExpanded((expanded) => !expanded)
+              }
               onConversationIdChange={bindConversation}
               onLoadLatestReply={loadModelReply}
             />
             <LogicEditor
               draft={draft}
+              readOnly={Boolean(confirmed)}
               allowLocalImageUpload={preview}
               isPublishing={isPublishing}
               onPatch={patchDraft}
               onAddImages={addImages}
-              onPatchImage={patchImage}
               onRemoveImage={removeImage}
-              onUpdate={() => void updateConfirmation()}
+              onUpdate={() => setConfirmDialogOpen(true)}
             />
           </div>
         </div>
       </div>
+      <AlertDialog
+        open={confirmDialogOpen}
+        onOpenChange={(open) => {
+          if (!isPublishing) setConfirmDialogOpen(open);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认当前应答逻辑？</AlertDialogTitle>
+            <AlertDialogDescription>
+              确认后将作为“{selectedEntry.question.question}
+              ”的正式应答逻辑，不能直接修改；如需调整，请提交应答逻辑修改需求。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isPublishing}>
+              继续检查
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={isPublishing}
+              onClick={(event) => {
+                event.preventDefault();
+                void updateConfirmation();
+              }}
+            >
+              {isPublishing && <Loader2 className="h-4 w-4 animate-spin" />}
+              确认并锁定
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </section>
   );
 }
@@ -1235,9 +1573,16 @@ function QuestionNavigator({
 }) {
   const selectedGroup =
     groups.find((group) => group.id === selectedGroupId) ?? groups[0];
+  const selectedTone = semanticGroupTone(selectedGroup);
+  const selectedCategory = semanticGroupCategory(selectedGroup);
 
   return (
-    <aside className="rl-question-nav" aria-label={navTitle}>
+    <aside
+      className="rl-question-nav"
+      aria-label={navTitle}
+      data-tone={selectedTone}
+      data-category={selectedCategory || undefined}
+    >
       <div className="rl-question-nav-head">
         <div>
           <strong>{navTitle}</strong>
@@ -1247,13 +1592,16 @@ function QuestionNavigator({
 
       <div className="rl-group-tabs">
         {groups.map((group) => {
-          const Icon = groupIcon(group.tone);
+          const tone = semanticGroupTone(group);
+          const category = semanticGroupCategory(group);
+          const Icon = groupIcon(tone);
           return (
             <button
               key={group.id}
               type="button"
               aria-label={group.title}
-              data-tone={group.tone}
+              data-tone={tone}
+              data-category={category || undefined}
               className={group.id === selectedGroup.id ? "active" : ""}
               onClick={() => onSelectGroup(group)}
             >
@@ -1305,9 +1653,15 @@ function QuestionContext({
   group: IntentQuestionGroup;
   question: IntentQuestion;
 }) {
-  const Icon = groupIcon(group.tone);
+  const tone = semanticGroupTone(group);
+  const category = semanticGroupCategory(group);
+  const Icon = groupIcon(tone);
   return (
-    <section className="rl-question-context" data-tone={group.tone}>
+    <section
+      className="rl-question-context"
+      data-tone={tone}
+      data-category={category || undefined}
+    >
       <span className="rl-context-icon">
         <Icon size={20} />
       </span>
@@ -1333,6 +1687,9 @@ function DialoguePanel({
   onRetryRecords,
   lastTaskId,
   lastTaskRecordedAt,
+  readOnly,
+  expanded,
+  onToggleExpanded,
   onConversationIdChange,
   onLoadLatestReply,
 }: {
@@ -1348,11 +1705,15 @@ function DialoguePanel({
   onRetryRecords: () => void;
   lastTaskId?: string;
   lastTaskRecordedAt?: number;
+  readOnly: boolean;
+  expanded: boolean;
+  onToggleExpanded: () => void;
   onConversationIdChange: (conversationId: string) => Promise<void>;
   onLoadLatestReply: (
     reply: string,
     message?: LocalMessage,
     taskId?: string,
+    onTaskUnavailable?: () => void,
   ) => Promise<void>;
 }) {
   return (
@@ -1367,12 +1728,28 @@ function DialoguePanel({
             <p>结合企业知识库与补充资料，生成可核验的应答口径。</p>
           </div>
         </div>
+        <button
+          type="button"
+          className="rl-dialogue-expand"
+          aria-label={expanded ? "退出对话全屏" : "全屏显示对话区"}
+          aria-pressed={expanded}
+          title={expanded ? "退出对话全屏" : "全屏显示对话区"}
+          onClick={onToggleExpanded}
+        >
+          {expanded ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
+        </button>
       </div>
       {preview && PreviewDialogueComponent ? (
-        <PreviewDialogueComponent
-          question={question}
-          onLoadLatestReply={onLoadLatestReply}
-        />
+        <fieldset
+          className="rl-preview-fieldset"
+          disabled={readOnly}
+          aria-label={readOnly ? "已确认应答逻辑对话（只读）" : undefined}
+        >
+          <PreviewDialogueComponent
+            question={question}
+            onLoadLatestReply={onLoadLatestReply}
+          />
+        </fieldset>
       ) : (
         <RealResponseLogicDialogue
           group={group}
@@ -1385,6 +1762,7 @@ function DialoguePanel({
           onRetryRecords={onRetryRecords}
           lastTaskId={lastTaskId}
           lastTaskRecordedAt={lastTaskRecordedAt}
+          readOnly={readOnly}
           onConversationIdChange={onConversationIdChange}
           onLoadLatestReply={onLoadLatestReply}
         />
@@ -1404,6 +1782,7 @@ function RealResponseLogicDialogue({
   onRetryRecords,
   lastTaskId,
   lastTaskRecordedAt,
+  readOnly,
   onConversationIdChange,
   onLoadLatestReply,
 }: {
@@ -1417,11 +1796,13 @@ function RealResponseLogicDialogue({
   onRetryRecords: () => void;
   lastTaskId?: string;
   lastTaskRecordedAt?: number;
+  readOnly: boolean;
   onConversationIdChange: (conversationId: string) => Promise<void>;
   onLoadLatestReply: (
     reply: string,
     message?: LocalMessage,
     taskId?: string,
+    onTaskUnavailable?: () => void,
   ) => Promise<void>;
 }) {
   const {
@@ -1436,6 +1817,7 @@ function RealResponseLogicDialogue({
   const initializationRef = useRef<string | null>(null);
   const callbackRef = useRef(onConversationIdChange);
   callbackRef.current = onConversationIdChange;
+  const unavailableTaskIdsRef = useRef(new Set<string>());
   const [loadingOutput, setLoadingOutput] = useState(false);
 
   const scopedConversation = conversationId
@@ -1449,9 +1831,12 @@ function RealResponseLogicDialogue({
     if (scopedConversation) {
       initializationRef.current = null;
       if (
-        lastTaskId &&
-        (scopedConversation.taskId !== lastTaskId ||
-          scopedConversation.previousResponseId !== lastTaskId)
+        shouldHydrateResponseLogicTask({
+          authoritativeTaskId: lastTaskId,
+          localTaskId: scopedConversation.taskId,
+          localPreviousResponseId: scopedConversation.previousResponseId,
+          unavailableTaskIds: unavailableTaskIdsRef.current,
+        })
       ) {
         updateStatus(scopedConversation.id, "pending", {
           taskId: lastTaskId,
@@ -1466,6 +1851,8 @@ function RealResponseLogicDialogue({
       }
       return;
     }
+
+    if (readOnly) return;
 
     const key = `${question.id}:${conversationId || "new"}`;
     if (initializationRef.current === key) return;
@@ -1484,6 +1871,7 @@ function RealResponseLogicDialogue({
     lastTaskRecordedAt,
     question.id,
     question.question,
+    readOnly,
     recordsError,
     recordsLoading,
     recordsReady,
@@ -1509,8 +1897,9 @@ function RealResponseLogicDialogue({
     recordsLoading ||
     !recordsReady ||
     !hydrated ||
-    !scopedConversation ||
-    activeConversation?.id !== scopedConversation.id
+    (!scopedConversation
+      ? !readOnly
+      : activeConversation?.id !== scopedConversation.id)
   ) {
     return (
       <div className="rl-home-frame rl-home-loading">
@@ -1520,27 +1909,84 @@ function RealResponseLogicDialogue({
     );
   }
 
+  if (!scopedConversation) {
+    return (
+      <div className="rl-home-frame rl-home-loading rl-home-read-only">
+        <ShieldCheck size={22} />
+        <span>应答逻辑已确认；本设备没有保留此前对话记录。</span>
+      </div>
+    );
+  }
+
   const latestAssistantMessage = [...scopedConversation.messages]
     .reverse()
-    .find(
-      (message) =>
-        message.role === "assistant" &&
-        !message.isStepsPlaceholder &&
-        Boolean(message.content.trim()),
-    );
+    .find(isAuthoritativeResponseLogicAssistantMessage);
   const taskActive =
     scopedConversation.status === "running" ||
     scopedConversation.status === "pending";
 
   return (
     <>
-      <div className="rl-home-frame">
+      <button
+        type="button"
+        className="rl-load-reply"
+        disabled={
+          readOnly || !latestAssistantMessage || taskActive || loadingOutput
+        }
+        onClick={async () => {
+          if (!latestAssistantMessage) return;
+          setLoadingOutput(true);
+          try {
+            await onLoadLatestReply(
+              latestAssistantMessage.content,
+              latestAssistantMessage,
+              scopedConversation.taskId,
+              () => {
+                const unavailableTaskId =
+                  scopedConversation.taskId || lastTaskId;
+                if (unavailableTaskId) {
+                  unavailableTaskIdsRef.current.add(unavailableTaskId);
+                }
+                updateStatus(scopedConversation.id, "error", {
+                  clearTaskPointer: true,
+                  completedAt: Date.now(),
+                });
+                onRetryRecords();
+              },
+            );
+          } finally {
+            setLoadingOutput(false);
+          }
+        }}
+      >
+        {loadingOutput ? (
+          <Loader2 size={14} className="animate-spin" />
+        ) : readOnly ? (
+          <Check size={14} />
+        ) : (
+          <RefreshCw size={14} />
+        )}
+        {loadingOutput
+          ? "正在载入"
+          : readOnly
+            ? "应答逻辑已确认"
+            : "载入模型最新输出到应答草稿"}
+      </button>
+      <fieldset
+        className="rl-home-frame rl-home-fieldset"
+        disabled={readOnly}
+        aria-label={readOnly ? "已确认应答逻辑对话（只读）" : undefined}
+      >
         <Home
           key={scopedConversation.id}
           embedded
           hideSidebar
           fixedAgentProfile="frontmind-pro"
-          composerPrefill={`请基于最新企业知识库，为“${question.question}”生成可核验的应答逻辑。`}
+          composerPrefill={
+            shouldUseResponseLogicInitialPrompt(scopedConversation, readOnly)
+              ? `请基于最新企业知识库，为“${question.question}”生成可核验的应答逻辑。`
+              : undefined
+          }
           responseLogicContext={{
             questionId: question.id,
             groupId: group.id,
@@ -1550,53 +1996,29 @@ function RealResponseLogicDialogue({
             summary: question.summary,
             draft,
           }}
+          messageProjection={projectResponseLogicConversationMessage}
         />
-      </div>
-      <button
-        type="button"
-        className="rl-load-reply"
-        disabled={!latestAssistantMessage || taskActive || loadingOutput}
-        onClick={async () => {
-          if (!latestAssistantMessage) return;
-          setLoadingOutput(true);
-          try {
-            await onLoadLatestReply(
-              latestAssistantMessage.content,
-              latestAssistantMessage,
-              scopedConversation.taskId,
-            );
-          } finally {
-            setLoadingOutput(false);
-          }
-        }}
-      >
-        {loadingOutput ? (
-          <Loader2 size={14} className="animate-spin" />
-        ) : (
-          <RefreshCw size={14} />
-        )}
-        {loadingOutput ? "正在载入" : "载入模型最新输出到应答草稿"}
-      </button>
+      </fieldset>
     </>
   );
 }
 
 function LogicEditor({
   draft,
+  readOnly,
   allowLocalImageUpload,
   isPublishing,
   onPatch,
   onAddImages,
-  onPatchImage,
   onRemoveImage,
   onUpdate,
 }: {
   draft: LogicDraft;
+  readOnly: boolean;
   allowLocalImageUpload: boolean;
   isPublishing: boolean;
   onPatch: (patch: Partial<LogicDraft>) => void;
   onAddImages: (event: ChangeEvent<HTMLInputElement>) => void;
-  onPatchImage: (id: string, patch: Partial<LogicImage>) => void;
   onRemoveImage: (id: string) => void;
   onUpdate: () => void;
 }) {
@@ -1613,7 +2035,6 @@ function LogicEditor({
           [`response-logic-upload-${attachment.fileId}`, attachment] as const,
       ),
   );
-
   return (
     <section className="rl-editor-card">
       <div className="rl-card-title">
@@ -1623,11 +2044,34 @@ function LogicEditor({
           </span>
           <div>
             <h3>应答参考草稿</h3>
-            <p>预填内容可修改；未手动更新前不会进入确认页。</p>
+            <p>
+              {readOnly
+                ? "当前版本已经正式确认，如需修改请提交需求。"
+                : "预填内容可修改；确认前不会进入问题优化正式展示。"}
+            </p>
           </div>
         </div>
+        <button
+          type="button"
+          className="rl-primary-button rl-card-action"
+          disabled={isPublishing || readOnly}
+          onClick={onUpdate}
+        >
+          {isPublishing ? (
+            <Loader2 size={16} className="animate-spin" />
+          ) : readOnly ? (
+            <Check size={16} />
+          ) : (
+            <RefreshCw size={16} />
+          )}
+          {isPublishing
+            ? "正在确认"
+            : readOnly
+              ? "应答逻辑已确认"
+              : "更新应答逻辑"}
+        </button>
       </div>
-      <div className="rl-editor-scroll">
+      <fieldset className="rl-editor-scroll" disabled={readOnly}>
         <EditorField
           index="01"
           label="用户真实关心"
@@ -1652,34 +2096,22 @@ function LogicEditor({
         />
         <EditorField
           index="04"
-          label="待补充/待确认"
-          value={draft.pending}
-          onChange={(pending) => onPatch({ pending })}
-          rows={5}
-        />
-        <EditorField
-          index="05"
           label="回答边界/禁止表达"
           value={draft.boundaries}
           onChange={(boundaries) => onPatch({ boundaries })}
           rows={5}
         />
-        <EditorField
-          index="06"
-          label="引用与核验规则"
-          value={draft.references}
-          onChange={(references) => onPatch({ references })}
-          rows={5}
-        />
         <div className="rl-editor-field rl-image-field">
           <div className="rl-editor-label">
-            <span>07</span>
+            <span>05</span>
             <div>
               <strong>图文依据</strong>
-              <small>图片直接挂到当前问题，并记录图注、来源与授权状态。</small>
+              <small>
+                图片上传后直接加入当前问题，无需另行确认位置或权限。
+              </small>
             </div>
           </div>
-          {allowLocalImageUpload ? (
+          {allowLocalImageUpload && !readOnly ? (
             <label className="rl-image-upload">
               <input
                 hidden
@@ -1691,7 +2123,7 @@ function LogicEditor({
               <ImagePlus size={20} />
               <span>
                 <strong>上传参考图片</strong>
-                <small>支持多张图片；请逐张补充使用信息</small>
+                <small>支持多张图片；上传后直接加入当前应答逻辑</small>
               </span>
               <Upload size={16} />
             </label>
@@ -1738,51 +2170,8 @@ function LogicEditor({
                       <img src={image.url} alt={image.caption || image.name} />
                     )}
                     <div className="rl-image-meta-editor">
-                      <input
-                        value={image.caption}
-                        aria-label={`${image.name} 图注`}
-                        placeholder="图注"
-                        onChange={(event) =>
-                          onPatchImage(image.id, {
-                            caption: event.target.value,
-                          })
-                        }
-                      />
-                      <input
-                        value={image.source}
-                        aria-label={`${image.name} 来源`}
-                        placeholder="来源材料"
-                        onChange={(event) =>
-                          onPatchImage(image.id, { source: event.target.value })
-                        }
-                      />
-                      <div>
-                        <input
-                          value={image.section}
-                          aria-label={`${image.name} 对应逻辑段落`}
-                          placeholder="对应逻辑段落"
-                          onChange={(event) =>
-                            onPatchImage(image.id, {
-                              section: event.target.value,
-                            })
-                          }
-                        />
-                        <select
-                          value={image.authorization}
-                          aria-label={`${image.name} 授权状态`}
-                          onChange={(event) =>
-                            onPatchImage(image.id, {
-                              authorization: event.target
-                                .value as LogicImage["authorization"],
-                            })
-                          }
-                        >
-                          <option>待确认</option>
-                          <option>公开可用</option>
-                          <option>已获授权</option>
-                          <option>仅内部参考</option>
-                        </select>
-                      </div>
+                      <strong>{image.caption || image.name}</strong>
+                      <span>已加入当前应答逻辑</span>
                     </div>
                     <button
                       type="button"
@@ -1798,25 +2187,14 @@ function LogicEditor({
             </div>
           )}
         </div>
-      </div>
+      </fieldset>
       <div className="rl-editor-footer">
         <p>
           <ShieldCheck size={15} />
-          更新只作用于当前问题，其他问题草稿保持不变。
+          {readOnly
+            ? "当前确认版本不可直接修改；需求通过后可重新生成并确认。"
+            : "确认只作用于当前问题，其他问题草稿保持不变。"}
         </p>
-        <button
-          type="button"
-          className="rl-primary-button"
-          disabled={isPublishing}
-          onClick={onUpdate}
-        >
-          {isPublishing ? (
-            <Loader2 size={16} className="animate-spin" />
-          ) : (
-            <RefreshCw size={16} />
-          )}
-          {isPublishing ? "正在更新" : "更新应答逻辑"}
-        </button>
       </div>
     </section>
   );
@@ -1870,30 +2248,35 @@ export function ResponseLogicConfirmationPanel({
   actionLabel?: string;
   onAction?: () => void;
 }) {
-  const Icon = groupIcon(group.tone);
-  const conclusionLines = textLines(logic.conclusion);
-  const facts = textLines(logic.facts);
-  const pending = textLines(logic.pending);
-  const boundaries = textLines(logic.boundaries);
-  const references = textLines(logic.references);
-  const sourceFiles = (logic.attachments ?? []).filter(
+  const tone = semanticGroupTone(group);
+  const category = semanticGroupCategory(group);
+  const Icon = groupIcon(tone);
+  const publicLogic = normalizeResponseLogicPublicProvenance(logic);
+  const sourceFiles = (publicLogic.attachments ?? []).filter(
     (attachment) =>
       attachment.kind === "file" ||
       isResponseLogicAttachmentExpired(attachment),
   );
   const uploadedImageAttachments = new Map<string, ResponseLogicAttachment>(
-    (logic.attachments ?? [])
+    (publicLogic.attachments ?? [])
       .filter((attachment) => attachment.kind === "image")
       .map(
         (attachment) =>
           [`response-logic-upload-${attachment.fileId}`, attachment] as const,
       ),
   );
-  const versionLabel = logic.version > 0 ? `V${logic.version}.0` : "V0.1";
+  const hasSupportingAssets =
+    sourceFiles.length > 0 || (publicLogic.images ?? []).length > 0;
+  const versionLabel =
+    publicLogic.version > 0 ? `V${publicLogic.version}.0` : "V0.1";
 
   return (
     <article className="rl-confirmation">
-      <header className="rl-confirmation-head" data-tone={group.tone}>
+      <header
+        className="rl-confirmation-head"
+        data-tone={tone}
+        data-category={category || undefined}
+      >
         <div className="rl-confirmation-heading">
           <span className="rl-context-icon">
             <Icon size={21} />
@@ -1910,7 +2293,9 @@ export function ResponseLogicConfirmationPanel({
             {showPublicationMeta && (
               <>
                 <span>已发布应答逻辑 {versionLabel}</span>
-                <span>发布时间：{formatConfirmedAt(logic.updatedAt)}</span>
+                <span>
+                  发布时间：{formatConfirmedAt(publicLogic.updatedAt)}
+                </span>
               </>
             )}
             {actionLabel && onAction && (
@@ -1927,7 +2312,11 @@ export function ResponseLogicConfirmationPanel({
         )}
       </header>
 
-      <section className="rl-answer-hero" data-tone={group.tone}>
+      <section
+        className="rl-answer-hero"
+        data-tone={tone}
+        data-category={category || undefined}
+      >
         <div className="rl-answer-visual">
           <span>
             <Sparkles size={22} />
@@ -1938,10 +2327,10 @@ export function ResponseLogicConfirmationPanel({
         </div>
         <div className="rl-answer-summary">
           <span>用户真实关心</span>
-          <p>{logic.concern}</p>
-          <blockquote>
-            {conclusionLines[0] || "请在上方草稿中补充核心结论。"}
-          </blockquote>
+          <MarkdownRenderer
+            content={publicLogic.concern}
+            className="rl-confirmation-markdown rl-concern-markdown"
+          />
         </div>
       </section>
 
@@ -1949,93 +2338,83 @@ export function ResponseLogicConfirmationPanel({
         <LogicSection
           number="01"
           title="核心结论与执行口径"
-          items={conclusionLines.slice(1)}
+          content={publicLogic.conclusion}
           wide
         />
-        <LogicSection number="02" title="事实依据" items={facts} />
+        <LogicSection
+          number="02"
+          title="事实依据"
+          content={publicLogic.facts}
+        />
         <LogicSection
           number="03"
-          title="待补充/待确认"
-          items={pending}
-          variant="pending"
-        />
-        <LogicSection
-          number="04"
           title="回答边界/禁止表达"
-          items={boundaries}
+          content={publicLogic.boundaries}
           variant="boundary"
         />
-        <section className="rl-logic-section rl-reference-section wide">
-          <div className="rl-logic-section-title">
-            <span>05</span>
-            <div>
-              <h4>引用与核验规则及图文依据</h4>
-              <p>材料与图片都归属于当前问题，不拆分为独立图片库。</p>
+        {hasSupportingAssets && (
+          <section className="rl-logic-section rl-reference-section wide">
+            <div className="rl-logic-section-title">
+              <span>04</span>
+              <div>
+                <h4>图文依据</h4>
+                <p>材料与图片都归属于当前问题，不拆分为独立图片库。</p>
+              </div>
             </div>
-          </div>
-          <div className="rl-reference-content">
-            <ul>
-              {references.map((item) => (
-                <li key={item}>
-                  <FileText size={15} />
-                  <span>{item}</span>
-                </li>
-              ))}
-              {sourceFiles.map((attachment) => (
-                <li key={attachment.fileId}>
-                  <Paperclip size={15} />
-                  <FilePreview
-                    file={responseLogicChatAttachment(attachment)}
-                    className="w-full"
-                  />
-                </li>
-              ))}
-            </ul>
-            <div className="rl-confirmed-images">
-              {(logic.images ?? []).length > 0 ? (
-                (logic.images ?? []).map((image) => {
-                  const uploadedAttachment = uploadedImageAttachments.get(
-                    image.id,
-                  );
-                  return (
-                    <figure key={image.id}>
-                      {uploadedAttachment ? (
-                        <ImagePreview
-                          fileId={uploadedAttachment.fileId}
-                          alt={image.caption || image.name}
-                          expiresAt={uploadedAttachment.expiresAt}
-                          expired={uploadedAttachment.expired}
-                          className="rl-owned-image-preview-confirmed"
-                        />
-                      ) : (
-                        <img
-                          src={image.url}
-                          alt={image.caption || image.name}
-                        />
-                      )}
-                      <figcaption>
-                        <strong>{image.caption || image.name}</strong>
-                        <span>来源：{image.source || "待补充"}</span>
-                        <span>对应段落：{image.section || "待补充"}</span>
-                        <span>使用权限：{image.authorization}</span>
-                      </figcaption>
-                    </figure>
-                  );
-                })
-              ) : (
-                <div className="rl-empty-image">
-                  <ImagePlus size={23} />
-                  <div>
-                    <strong>当前问题尚未添加参考图片</strong>
-                    <p>
-                      建议补充流程图、证据截图或授权场景图，并标注图注、来源、对应逻辑段落与公开权限。
-                    </p>
+            <div className="rl-reference-content">
+              <div className="rl-reference-list">
+                {sourceFiles.map((attachment) => (
+                  <div key={attachment.fileId} className="rl-reference-file">
+                    <Paperclip size={15} />
+                    <FilePreview
+                      file={{
+                        ...responseLogicChatAttachment(attachment),
+                        name: "用户上传资料",
+                      }}
+                      className="w-full"
+                    />
                   </div>
+                ))}
+              </div>
+              {(publicLogic.images ?? []).length > 0 && (
+                <div className="rl-confirmed-images">
+                  {(publicLogic.images ?? []).map((image) => {
+                    const uploadedAttachment = uploadedImageAttachments.get(
+                      image.id,
+                    );
+                    return (
+                      <figure key={image.id}>
+                        {uploadedAttachment ? (
+                          <ImagePreview
+                            fileId={uploadedAttachment.fileId}
+                            alt="用户上传图片"
+                            expiresAt={uploadedAttachment.expiresAt}
+                            expired={uploadedAttachment.expired}
+                            className="rl-owned-image-preview-confirmed"
+                          />
+                        ) : (
+                          <img
+                            src={image.url}
+                            alt={image.caption || image.name}
+                          />
+                        )}
+                        <figcaption>
+                          <strong>
+                            {uploadedAttachment
+                              ? "用户上传图片"
+                              : normalizeResponseLogicPublicText(
+                                  image.caption || image.name,
+                                ) || "应答逻辑配图"}
+                          </strong>
+                        </figcaption>
+                      </figure>
+                    );
+                  })}
                 </div>
               )}
             </div>
-          </div>
-        </section>
+          </section>
+        )}
       </div>
     </article>
   );
@@ -2044,15 +2423,15 @@ export function ResponseLogicConfirmationPanel({
 function LogicSection({
   number,
   title,
-  items,
+  content,
   wide = false,
   variant = "default",
 }: {
   number: string;
   title: string;
-  items: string[];
+  content: string;
   wide?: boolean;
-  variant?: "default" | "pending" | "boundary";
+  variant?: "default" | "boundary";
 }) {
   return (
     <section className={`rl-logic-section ${wide ? "wide" : ""} ${variant}`}>
@@ -2060,24 +2439,14 @@ function LogicSection({
         <span>{number}</span>
         <h4>{title}</h4>
       </div>
-      <ul>
-        {items.length > 0 ? (
-          items.map((item) => (
-            <li key={item}>
-              {variant === "boundary" ? (
-                <ShieldCheck size={16} />
-              ) : variant === "pending" ? (
-                <RefreshCw size={16} />
-              ) : (
-                <Check size={16} />
-              )}
-              <span>{item}</span>
-            </li>
-          ))
-        ) : (
-          <li className="rl-empty-line">待企业交流补充</li>
-        )}
-      </ul>
+      {content.trim() ? (
+        <MarkdownRenderer
+          content={content}
+          className="rl-confirmation-markdown rl-logic-markdown"
+        />
+      ) : (
+        <p className="rl-empty-line">暂无内容</p>
+      )}
     </section>
   );
 }

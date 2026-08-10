@@ -113,10 +113,7 @@ export function knowledgeBaseOfficialLogoUploadFromTurn(
   const metadata = record(turn.metadata) || {};
   const repair = record(metadata.logoProvenanceRepair);
   const repairUpload = record(repair?.officialLogoUpload);
-  if (
-    turn.operationType === "logo_provenance_repair" ||
-    repair !== null
-  ) {
+  if (turn.operationType === "logo_provenance_repair" || repair !== null) {
     const index = Number(repairUpload?.index);
     const fileId = String(repairUpload?.fileId || "").trim();
     const filename = normalizeKnowledgeBaseAttachmentFilename(
@@ -749,6 +746,7 @@ export async function verifiedKnowledgeBaseOfficialLogoUploadForBuild(input: {
   userId: number;
   buildId: string;
   generation: number;
+  expectedLogoSha256?: string | null;
 }) {
   const db = await getDb();
   if (!db) throw new Error("数据库暂不可用，无法核验客户上传 Logo");
@@ -784,10 +782,7 @@ export async function verifiedKnowledgeBaseOfficialLogoUploadForBuild(input: {
     const recovery = record(metadata?.recovery);
     return Boolean(
       (recovery &&
-        Object.prototype.hasOwnProperty.call(
-          recovery,
-          "officialLogoUpload",
-        )) ||
+        Object.prototype.hasOwnProperty.call(recovery, "officialLogoUpload")) ||
         (metadata &&
           Object.prototype.hasOwnProperty.call(
             metadata,
@@ -801,12 +796,24 @@ export async function verifiedKnowledgeBaseOfficialLogoUploadForBuild(input: {
     );
   }
   if (declared.length === 0) return undefined;
-  if (declared.length !== 1) {
+  const expectedLogoSha256 = String(input.expectedLogoSha256 || "")
+    .trim()
+    .toLowerCase();
+  if (!expectedLogoSha256 && declared.length !== 1) {
     throw new KnowledgeBasePackageBindingError(
-      "企业官方主 Logo 上传账本不唯一，不能验证最终 ZIP",
+      "企业官方主 Logo 上传账本不唯一且缺少当前 Logo 哈希，不能验证最终 ZIP",
     );
   }
-  const upload = declared[0]!;
+  const upload = expectedLogoSha256
+    ? [...declared]
+        .reverse()
+        .find((candidate) => candidate.sourceSha256 === expectedLogoSha256)
+    : declared[0];
+  if (!upload) {
+    throw new KnowledgeBasePackageBindingError(
+      "当前企业官方主 Logo 与已完成的上传账本不匹配，不能验证最终 ZIP",
+    );
+  }
   // Binding copied and hashed the exact upload into the build's immutable
   // Logo artifact in the same transaction that wrote this verified marker.
   // The short-lived presales capture may expire after 30 days; final-package
@@ -895,8 +902,7 @@ export async function verifiedKnowledgeBasePackageUploadEvidenceForBuild(input: 
       return {
         expectedCustomerUploads: persisted.expectedCustomerUploads,
         expectedOfficialLogoUpload: persisted.expectedOfficialLogoUpload,
-        expectedOfficialLogoProvenance:
-          persisted.expectedOfficialLogoProvenance,
+        expectedOfficialLogoProvenance: undefined,
       };
     } catch (error) {
       if (
@@ -914,16 +920,14 @@ export async function verifiedKnowledgeBasePackageUploadEvidenceForBuild(input: 
       // exists. Once written, all later reads use only build-owned evidence.
     }
   }
-  const [expectedOfficialLogoUpload, expectedOfficialLogoProvenance] =
-    await Promise.all([
-      verifiedKnowledgeBaseOfficialLogoUploadForBuild(input),
-      persistedKnowledgeBaseOfficialLogoProvenanceForBuild(input),
-    ]);
-  if (expectedOfficialLogoUpload && expectedOfficialLogoProvenance) {
-    throw new KnowledgeBasePackageBindingError(
-      "企业官方主 Logo 同时声明了上传与外部来源，不能验证最终 ZIP",
-    );
-  }
+  const expectedOfficialLogoUpload =
+    await verifiedKnowledgeBaseOfficialLogoUploadForBuild({
+      userId: input.userId,
+      buildId: input.buildId,
+      generation: input.generation,
+      expectedLogoSha256: input.officialLogoSha256,
+    });
+  const expectedOfficialLogoProvenance = undefined;
   const expectedCustomerUploads = packageArchiveSha256
     ? await declaredKnowledgeBaseCustomerUploadsForBuild(input)
     : await verifiedKnowledgeBaseCustomerUploadsForBuild(input);

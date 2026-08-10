@@ -177,6 +177,35 @@ describe("isRetainedUpstreamTaskDeleteRequest", () => {
 });
 
 describe("publicUpstreamPayload", () => {
+  it("rebrands alternate provider names in every visible payload string", () => {
+    const sourceBrand = ["Jeno", "va"].join("");
+    const result = publicUpstreamPayload(
+      {
+        title: `${sourceBrand} Brand Tracker`,
+        output: [
+          {
+            type: "message",
+            content: `正在验证独立 ${sourceBrand} 凭证`,
+          },
+        ],
+      },
+      "current-api-key",
+    );
+
+    expect(result).toMatchObject({
+      title: "FrontMind Brand Tracker",
+      output: [
+        {
+          type: "message",
+          content: "正在验证独立 FrontMind 凭证",
+        },
+      ],
+    });
+    expect(JSON.stringify(result).toLowerCase()).not.toContain(
+      sourceBrand.toLowerCase(),
+    );
+  });
+
   it("strips nested auth fields and exact current credentials", () => {
     const credential = "sentinel-proxy-credential-do-not-expose";
     const result = publicUpstreamPayload(

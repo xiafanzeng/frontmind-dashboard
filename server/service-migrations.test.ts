@@ -112,7 +112,116 @@ describe("service portal migration chain", () => {
       "0052_delivery_ticket_retention_guards",
       "0053_low_dorian_gray",
       "0054_file_content_retention",
+      "0055_provisioning_market_edition",
+      "0056_project_order_deletion_tombstones",
+      "0057_productive_kang",
+      "0058_jenova_brand_tracking",
+      "0059_delivery_ticket_workflow_contracts",
     ]);
+  });
+
+  it("adds an optional unsigned overseas brand-tracking quota as an expand migration", async () => {
+    const migrationSql = await migration("0057_productive_kang.sql");
+    expect(migrationSql.trim()).toBe(
+      "ALTER TABLE `users` ADD `brandTrackingMonthlyLimit` int unsigned;",
+    );
+    expect(migrationSql).not.toMatch(
+      /\b(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/iu,
+    );
+  });
+
+  it("adds an independent fixed-point Jenova tracking ledger without migrating Monitor data", async () => {
+    const migrationSql = await migration("0058_jenova_brand_tracking.sql");
+    for (const table of [
+      "jenova_brand_tracking_credentials",
+      "jenova_brand_tracking_assignments",
+      "jenova_brand_tracking_policies",
+      "jenova_brand_tracking_sessions",
+      "jenova_brand_tracking_turns",
+    ]) {
+      expect(migrationSql).toContain(`CREATE TABLE \`${table}\``);
+    }
+    expect(migrationSql).toContain(
+      "`rolling30DayLimit` decimal(20,8) NOT NULL DEFAULT '10.00000000'",
+    );
+    expect(migrationSql).toContain("`usageCost` decimal(20,8)");
+    expect(migrationSql).toContain(
+      "`sessionFee` decimal(20,8) NOT NULL DEFAULT '0.00000000'",
+    );
+    expect(migrationSql).not.toMatch(
+      /(?:^|-->\s*statement-breakpoint\s*)(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/imu,
+    );
+    expect(migrationSql).not.toMatch(
+      /presales_monitor_runs|monitoring_(?:batches|samples)/iu,
+    );
+    expect(migrationSql).not.toMatch(
+      /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM|RENAME\s+TABLE/iu,
+    );
+    for (const statement of migrationSql.split("--> statement-breakpoint")) {
+      expect(
+        (statement.match(/\bCREATE\s+(?:TABLE|INDEX)\b/giu) ?? []).length,
+      ).toBeLessThanOrEqual(1);
+    }
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0058_snapshot.json"),
+        "utf8",
+      ),
+    );
+    expect(
+      snapshot.tables.jenova_brand_tracking_credentials.indexes
+        .jenova_bt_credentials_fingerprint_uq,
+    ).toMatchObject({ isUnique: true, columns: ["fingerprint"] });
+    expect(
+      snapshot.tables.jenova_brand_tracking_turns.columns.usageCost,
+    ).toMatchObject({ type: "decimal(20,8)", notNull: false });
+  });
+
+  it("adds delivery workflow relationships and credential linkage without rewriting tickets", async () => {
+    const migrationSql = await migration(
+      "0059_delivery_ticket_workflow_contracts.sql",
+    );
+    for (const column of [
+      "parentTicketId",
+      "rootTicketId",
+      "workflowStageKey",
+      "isWorkflowContainer",
+      "credentialTargetUserId",
+      "credentialRequestKind",
+    ]) {
+      expect(migrationSql).toContain(
+        `ALTER TABLE \`delivery_tickets\` ADD \`${column}\``,
+      );
+    }
+    for (const relation of [
+      "delivery_tickets_parent_stage_uq",
+      "delivery_tickets_parent_ticket_fk",
+      "delivery_tickets_root_ticket_fk",
+      "delivery_tickets_credentialTargetUserId_users_id_fk",
+    ]) {
+      expect(migrationSql).toContain(relation);
+    }
+    expect(migrationSql).toContain("ON DELETE cascade");
+    expect(migrationSql).not.toMatch(
+      /(?:^|-->\s*statement-breakpoint\s*)(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/imu,
+    );
+  });
+
+  it("adds domestic-by-default purchase edition fields as an expand migration", async () => {
+    const migrationSql = await migration(
+      "0055_provisioning_market_edition.sql",
+    );
+    for (const table of [
+      "website_user_provisions",
+      "website_manual_service_orders",
+    ]) {
+      expect(migrationSql).toContain(
+        `ALTER TABLE \`${table}\` ADD \`marketEdition\` enum('domestic','overseas') NOT NULL DEFAULT 'domestic'`,
+      );
+    }
+    expect(migrationSql).not.toMatch(
+      /\b(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/iu,
+    );
   });
 
   it("adds external contract authorization evidence without replacing legacy signing columns", async () => {
@@ -1096,6 +1205,41 @@ describe("service portal migration chain", () => {
     );
     expect(orders).toContain(
       "CONSTRAINT `website_project_orders_fulfilled_time_ck`",
+    );
+  });
+
+  it("creates a compact permanent project-deletion barrier", async () => {
+    const tombstones = await migration(
+      "0056_project_order_deletion_tombstones.sql",
+    );
+    expect(tombstones).toContain(
+      "CREATE TABLE `website_project_deletion_tombstones`",
+    );
+    for (const column of [
+      "projectId",
+      "schemaVersion",
+      "status",
+      "createdAt",
+      "deletionRequestedAt",
+      "completedAt",
+    ]) {
+      expect(tombstones).toContain(`\`${column}\``);
+    }
+    expect(tombstones).toContain("enum('active','deleting','deleted')");
+    expect(tombstones).toContain(
+      "ALTER TABLE `presales_upstream_resources` ADD `projectId`",
+    );
+    expect(tombstones).toContain(
+      "ALTER TABLE `presales_monitor_runs` ADD `projectId`",
+    );
+    expect(tombstones).toContain("CREATE INDEX `presales_monitor_project_idx`");
+    expect(tombstones).toContain(
+      "CREATE INDEX `presales_upstream_resources_project_idx`",
+    );
+    expect(tombstones).not.toMatch(/CREATE\s+TRIGGER/i);
+    expect(tombstones).not.toMatch(/DROP\s+(?:TABLE|COLUMN|INDEX)/i);
+    expect(tombstones).not.toMatch(
+      /`(?:orderId|tradeNo|authorizationDigest|userId|companyName|question|content)`/i,
     );
   });
 

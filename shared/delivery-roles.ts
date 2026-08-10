@@ -10,7 +10,7 @@ export type DeliveryRoleType = z.infer<typeof deliveryRoleTypeSchema>;
 export const DELIVERY_ROLE_LABELS: Record<DeliveryRoleType, string> = {
   ai_operations_engineer: "AI 运维工程师",
   monitoring_optimization_engineer: "AI 监控与优化工程师",
-  content_distribution_engineer: "AI 内容分发工程师",
+  content_distribution_engineer: "AI 内容制作工程师",
 };
 
 export const deliveryWorkflowOperationSchema = z.enum([
@@ -18,6 +18,7 @@ export const deliveryWorkflowOperationSchema = z.enum([
   "knowledge_maintenance",
   "knowledge_reset",
   "question_catalog",
+  "question_maintenance",
   "initial_monitoring",
   "monitoring_import",
   "monitoring_retest",
@@ -28,6 +29,7 @@ export const deliveryWorkflowOperationSchema = z.enum([
   "domain_application",
   "icp_filing",
   "website_style_samples",
+  "website_build",
   "company_facts",
   "product_case_docs",
   "industry_news",
@@ -37,6 +39,25 @@ export const deliveryWorkflowOperationSchema = z.enum([
 ]);
 export type DeliveryWorkflowOperation = z.infer<
   typeof deliveryWorkflowOperationSchema
+>;
+
+/**
+ * System-authored delivery records share the delivery-ticket table but never
+ * enter an engineer's executable workflow. Keep them separate from
+ * `deliveryWorkflowOperationSchema` so role ownership remains exhaustive and
+ * an accidental cast cannot make a system record actionable.
+ */
+export const systemDeliveryOperationSchema = z.enum(["knowledge_delivery"]);
+export type SystemDeliveryOperation = z.infer<
+  typeof systemDeliveryOperationSchema
+>;
+
+export const knownDeliveryOperationSchema = z.union([
+  deliveryWorkflowOperationSchema,
+  systemDeliveryOperationSchema,
+]);
+export type KnownDeliveryOperation = z.infer<
+  typeof knownDeliveryOperationSchema
 >;
 
 const OPERATIONS_BY_ROLE: Record<
@@ -50,6 +71,7 @@ const OPERATIONS_BY_ROLE: Record<
     "domain_application",
     "icp_filing",
     "website_style_samples",
+    "website_build",
     "company_facts",
     "product_case_docs",
     "industry_news",
@@ -59,6 +81,7 @@ const OPERATIONS_BY_ROLE: Record<
   ],
   monitoring_optimization_engineer: [
     "question_catalog",
+    "question_maintenance",
     "initial_monitoring",
     "monitoring_import",
     "monitoring_retest",

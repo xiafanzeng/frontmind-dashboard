@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
       | "ai_operations_engineer"
       | "monitoring_optimization_engineer"
       | "content_distribution_engineer";
+    marketEdition?: "domestic" | "overseas";
   }>,
   workbenchUseQuery: vi.fn(),
   ticketsUseQuery: vi.fn(),
@@ -29,8 +30,11 @@ const mocks = vi.hoisted(() => ({
   refetchTickets: vi.fn(),
   refetchWorkbench: vi.fn(),
   workbenchData: { customers: [], tickets: [] } as any,
+  approveQuestionSelectionMutation: vi.fn(),
   adjustQuestionQuotaMutation: vi.fn(),
+  updateBrandTrackingLimitMutation: vi.fn(),
   updateTicketMutation: vi.fn(),
+  decideQuestionMaintenanceMutation: vi.fn(),
   ticketsData: {
     items: [],
     filters: { customers: [] },
@@ -138,7 +142,7 @@ vi.mock("@/lib/trpc", () => ({
         approveQuestionSelection: {
           useMutation: () => ({
             isPending: false,
-            mutateAsync: vi.fn(),
+            mutateAsync: mocks.approveQuestionSelectionMutation,
           }),
         },
         adjustQuestionQuota: {
@@ -147,10 +151,22 @@ vi.mock("@/lib/trpc", () => ({
             mutateAsync: mocks.adjustQuestionQuotaMutation,
           }),
         },
+        updateBrandTrackingLimit: {
+          useMutation: () => ({
+            isPending: false,
+            mutateAsync: mocks.updateBrandTrackingLimitMutation,
+          }),
+        },
         updateTicket: {
           useMutation: () => ({
             isPending: false,
             mutateAsync: mocks.updateTicketMutation,
+          }),
+        },
+        decideQuestionMaintenance: {
+          useMutation: () => ({
+            isPending: false,
+            mutateAsync: mocks.decideQuestionMaintenanceMutation,
           }),
         },
         publishWebsiteStyleSamples: {
@@ -178,6 +194,7 @@ vi.mock("@/components/PortalShell", () => ({
     navItems,
     roleLabel,
     toolbar,
+    mode,
     children,
   }: {
     eyebrow?: string;
@@ -185,9 +202,10 @@ vi.mock("@/components/PortalShell", () => ({
     navItems?: Array<{ label: string }>;
     roleLabel?: string;
     toolbar?: React.ReactNode;
+    mode?: "standard" | "fullscreen";
     children?: React.ReactNode;
   }) => (
-    <main>
+    <main data-mode={mode || "standard"}>
       <span>{eyebrow}</span>
       <h1>{title}</h1>
       <span data-testid="portal-nav-labels">
@@ -213,11 +231,14 @@ vi.mock("@/pages/AdminDashboard", () => ({
 }));
 
 import DeliveryMemberDashboard, {
+  deliveryDashboardSectionsForAssignment,
+  deliveryWorkbenchHref,
   deliveryMemberNavForRole,
   ROLE_DASHBOARD_SECTIONS,
 } from "./DeliveryMemberDashboard";
 
 const MONITORING_PROJECT_ID = "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f";
+const AI_OPERATIONS_PROJECT_ID = "7e9f33bc-40e2-4a8e-9bda-40d92a94b77f";
 const QUESTION_QUOTA_PERIOD_ID = "065593df-4fd7-4512-8b1d-babfdf8af81d";
 
 const monitoringAssignment = {
@@ -226,6 +247,28 @@ const monitoringAssignment = {
   customerName: "示例客户",
   customerUsername: "example.customer",
   roleType: "monitoring_optimization_engineer" as const,
+};
+
+const aiOperationsAssignment = {
+  ...monitoringAssignment,
+  projectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+  roleType: "ai_operations_engineer" as const,
+  marketEdition: "overseas" as const,
+};
+
+const brandTrackingUsageFixture = {
+  rolling30DayCost: "2.50000000",
+  lifetimeCost: "12.50000000",
+  limit: "10.00000000",
+  remaining: "7.50000000",
+  exceededBy: "0.00000000",
+  windowStartedAt: "2026-07-10T00:00:00.000Z",
+  windowEndsAt: "2026-08-09T00:00:00.000Z",
+  pendingReconciliationCount: 0,
+  hasUnknownUsage: false,
+  keyConfigured: true,
+  blocked: false,
+  blockReason: null,
 };
 
 const questionQuotaFixture = {
@@ -277,10 +320,15 @@ describe("DeliveryMemberDashboard project context", () => {
       limit: 50,
     };
     mocks.detailData = null;
+    mocks.approveQuestionSelectionMutation.mockResolvedValue({ success: true });
     mocks.adjustQuestionQuotaMutation.mockResolvedValue({ success: true });
+    mocks.updateBrandTrackingLimitMutation.mockResolvedValue({ success: true });
     mocks.updateTicketMutation.mockResolvedValue({
       success: true,
       handoffTicketIds: [],
+    });
+    mocks.decideQuestionMaintenanceMutation.mockResolvedValue({
+      decision: "approved",
     });
     vi.mocked(sessionStorage.getItem).mockReturnValue(null);
     window.history.replaceState({}, "", "/");
@@ -291,17 +339,17 @@ describe("DeliveryMemberDashboard project context", () => {
       deliveryMemberNavForRole("ai_operations_engineer").map(
         (item) => item.label,
       ),
-    ).toEqual(["我的工单", "客户工作台", "通用智能体"]);
+    ).toEqual(["客户工作台", "通用智能体"]);
     expect(
       deliveryMemberNavForRole("monitoring_optimization_engineer").map(
         (item) => item.label,
       ),
-    ).toEqual(["我的工单", "客户工作台", "问题监控", "通用智能体"]);
+    ).toEqual(["客户工作台", "问题监控", "通用智能体"]);
     expect(
       deliveryMemberNavForRole("content_distribution_engineer").map(
         (item) => item.label,
       ),
-    ).toEqual(["我的工单", "客户工作台", "渠道分发", "通用智能体"]);
+    ).toEqual(["客户工作台", "渠道分发", "通用智能体"]);
     expect(
       deliveryMemberNavForRole("ai_operations_engineer").map(
         (item) => item.label,
@@ -311,12 +359,32 @@ describe("DeliveryMemberDashboard project context", () => {
       deliveryMemberNavForRole("monitoring_optimization_engineer").map(
         (item) => item.group,
       ),
-    ).toEqual(["工作台", "工作台", "工具", "工具"]);
+    ).toEqual(["工作台", "工具", "工具"]);
   });
+
+  it.each([
+    ["question_maintenance", "questions"],
+    ["knowledge_reset", "knowledge-build"],
+    ["question_catalog", "keywords"],
+  ] as const)(
+    "routes a %s demand to the %s customer-dashboard module",
+    (operation, section) => {
+      expect(
+        deliveryWorkbenchHref({
+          projectAssignmentId: MONITORING_PROJECT_ID,
+          ticketId: "8a67e445-37bb-45ed-9268-4ca9437e4d75",
+          operation,
+        }),
+      ).toBe(
+        `/delivery/workbench?projectAssignmentId=${MONITORING_PROJECT_ID}&section=${section}&ticketId=8a67e445-37bb-45ed-9268-4ca9437e4d75&focus=1`,
+      );
+    },
+  );
 
   it("limits every engineer preview to customer-facing output owned by that role", () => {
     expect(ROLE_DASHBOARD_SECTIONS.ai_operations_engineer).toEqual([
       "knowledge-build",
+      "brand-tracking",
       "knowledge",
       "website",
     ]);
@@ -327,15 +395,28 @@ describe("DeliveryMemberDashboard project context", () => {
       "report",
     ]);
     expect(ROLE_DASHBOARD_SECTIONS.content_distribution_engineer).toEqual([
+      "response-logic",
       "content",
     ]);
 
     for (const sections of Object.values(ROLE_DASHBOARD_SECTIONS)) {
       expect(sections).not.toContain("brand");
     }
+    expect(
+      deliveryDashboardSectionsForAssignment(
+        "ai_operations_engineer",
+        "domestic",
+      ),
+    ).not.toContain("brand-tracking");
+    expect(
+      deliveryDashboardSectionsForAssignment(
+        "ai_operations_engineer",
+        "overseas",
+      ),
+    ).toContain("brand-tracking");
   });
 
-  it("keeps the customer workbench action panel scoped and leaves history in My Tickets", () => {
+  it("merges current-project demands and history into one customer workbench", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/DeliveryMemberDashboard.tsx"),
       "utf8",
@@ -345,22 +426,21 @@ describe("DeliveryMemberDashboard project context", () => {
       source.indexOf("const TERMINAL_STATUS_LABELS"),
     );
 
-    expect(workbenchSource).toContain('statusGroup: "pending"');
     expect(workbenchSource).toContain("limit: 50");
     expect(workbenchSource).toContain("ticket.assignedProjectAssignmentId ===");
     expect(workbenchSource).toContain("<DeliveryTicketActions");
     expect(workbenchSource).toContain("<KnowledgeResetDecision");
-    expect(workbenchSource).toContain('href="#customer-content-actions"');
-    expect(workbenchSource).not.toContain("DeliveryHistoryDetailDialog");
-    expect(workbenchSource).not.toContain('aria-label="按状态筛选"');
-    expect(workbenchSource).toContain("customerActionTickets.fetchNextPage");
-    expect(workbenchSource).toContain("加载更多可操作内容");
-    expect(workbenchSource).not.toContain(
-      "href={`/?customerUserId=${currentAssignment.customerUserId}`}",
-    );
+    expect(workbenchSource).toContain("DeliveryHistoryDetailDialog");
+    expect(workbenchSource).toContain('aria-label="按状态筛选"');
+    expect(workbenchSource).toContain("customerTickets.fetchNextPage");
+    expect(workbenchSource).toContain("加载更多需求");
+    expect(workbenchSource).toContain('mode="fullscreen"');
+    expect(workbenchSource).toContain('layout="workspace"');
+    expect(workbenchSource).not.toContain("customer-delivery-preview");
+    expect(source).not.toContain("function MyTicketsView(");
   });
 
-  it("loads every assigned customer's tickets by default and filters only after a customer click", async () => {
+  it("switches the unified workbench between assigned customers", async () => {
     mocks.assignments = [
       {
         projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
@@ -384,7 +464,7 @@ describe("DeliveryMemberDashboard project context", () => {
           userId: 101,
           customerName: "客户甲",
           customerUsername: "customer-a",
-          title: "甲公司工单",
+          title: "甲公司需求",
           operation: "site_check",
           status: "submitted",
           statusGroup: "pending",
@@ -396,7 +476,7 @@ describe("DeliveryMemberDashboard project context", () => {
           userId: 202,
           customerName: "客户乙",
           customerUsername: "customer-b",
-          title: "乙公司工单",
+          title: "乙公司需求",
           operation: "site_check",
           status: "completed",
           statusGroup: "completed",
@@ -417,7 +497,7 @@ describe("DeliveryMemberDashboard project context", () => {
         userId: 101,
         customerName: "客户甲",
         customerUsername: "customer-a",
-        title: "甲公司工单",
+        title: "甲公司需求",
         operation: "site_check",
         status: "submitted",
       },
@@ -427,27 +507,39 @@ describe("DeliveryMemberDashboard project context", () => {
 
     render(<DeliveryMemberDashboard />);
 
-    expect(screen.getAllByText("甲公司工单").length).toBeGreaterThan(0);
-    expect(screen.getByText("乙公司工单")).toBeInTheDocument();
-    expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({ limit: 50 });
-    expect(mocks.workbenchUseQuery).not.toHaveBeenCalled();
+    const selector = await screen.findByRole("combobox", {
+      name: "当前客户",
+    });
+    expect(selector).toHaveValue("1e9f33bc-40e2-4a8e-9bda-40d92a94b11f");
+    expect(screen.getByText("甲公司需求")).toBeInTheDocument();
+    expect(screen.queryByText("乙公司需求")).not.toBeInTheDocument();
+    expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({
+      customerUserId: 101,
+      projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+      limit: 50,
+    });
 
-    fireEvent.click(
-      within(screen.getByLabelText("客户快捷筛选")).getByRole("button", {
-        name: "客户乙",
-      }),
-    );
+    fireEvent.change(selector, {
+      target: { value: "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f" },
+    });
 
     await waitFor(() =>
       expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({
         customerUserId: 202,
+        projectAssignmentId: "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
         limit: 50,
       }),
     );
-    expect(sessionStorage.setItem).not.toHaveBeenCalled();
+    expect(screen.queryByText("甲公司需求")).not.toBeInTheDocument();
+    expect(screen.getByText("乙公司需求")).toBeInTheDocument();
+    expect(sessionStorage.setItem).toHaveBeenLastCalledWith(
+      DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+      "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
+    );
   });
 
   it("uses the server dependency decision even when the completed prerequisite is outside the visible page", () => {
+    mocks.assignments = [monitoringAssignment];
     mocks.ticketsData = {
       items: [
         {
@@ -481,28 +573,88 @@ describe("DeliveryMemberDashboard project context", () => {
       limit: 50,
     };
 
-    render(<DeliveryMemberDashboard />);
+    render(<DeliveryMemberDashboard customerWorkbench />);
 
-    expect(screen.queryByText("等待前置工单")).not.toBeInTheDocument();
+    expect(screen.queryByText("等待前置需求")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "开始处理" }),
     ).toBeInTheDocument();
   });
 
-  it("loads subsequent ticket pages through the stable server cursor", () => {
+  it("uses the dedicated approval action for a customer question modification", async () => {
+    mocks.assignments = [monitoringAssignment];
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "8a67e445-37bb-45ed-9268-4ca9437e4d75",
+          userId: 101,
+          customerName: "客户甲",
+          title: "修改问题申请",
+          operation: "question_maintenance",
+          category: "question_modify",
+          topic: "旧问题是什么？",
+          description: JSON.stringify({
+            questionSnapshot: "完整的原问题正文，不应使用截断的 topic。",
+            proposedQuestion: "修改后的问题是什么？",
+            reason: "旧问题表达不准确",
+          }),
+          status: "submitted",
+          statusGroup: "pending",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          assignedProjectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+          revision: 2,
+        },
+      ],
+      filters: {
+        customers: [{ id: 101, name: "客户甲", username: "customer-a" }],
+      },
+      counts: { pending: 1, completed: 0 },
+      nextPending: null,
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    fireEvent.click(screen.getByRole("button", { name: "审批修改问题" }));
+    expect(
+      screen.getByText("完整的原问题正文，不应使用截断的 topic。"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("修改后的问题是什么？")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "我已核对目标问题与变更内容，确认通过后立即执行。",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "通过并执行" }));
+
+    await waitFor(() =>
+      expect(mocks.decideQuestionMaintenanceMutation).toHaveBeenCalledWith({
+        projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+        ticketId: "8a67e445-37bb-45ed-9268-4ca9437e4d75",
+        expectedRevision: 2,
+        decision: "approve",
+      }),
+    );
+    expect(mocks.updateTicketMutation).not.toHaveBeenCalled();
+  });
+
+  it("loads subsequent current-project ticket pages", async () => {
+    mocks.assignments = [monitoringAssignment];
     mocks.ticketsData = {
       items: [
         {
           id: "7a67e445-37bb-45ed-9268-4ca9437e4d74",
           userId: 101,
           customerName: "客户甲",
-          title: "待处理工单",
+          title: "待处理需求",
           operation: "site_check",
           status: "submitted",
           statusGroup: "pending",
           dependencySatisfied: true,
           dependencyBlockReason: null,
-          assignedProjectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+          assignedProjectAssignmentId: MONITORING_PROJECT_ID,
           revision: 1,
         },
       ],
@@ -515,7 +667,7 @@ describe("DeliveryMemberDashboard project context", () => {
         userId: 101,
         customerName: "客户甲",
         customerUsername: "customer-a",
-        title: "待处理工单",
+        title: "待处理需求",
         operation: "site_check",
         status: "submitted",
       },
@@ -528,12 +680,15 @@ describe("DeliveryMemberDashboard project context", () => {
     };
 
     render(<DeliveryMemberDashboard />);
-    fireEvent.click(screen.getByRole("button", { name: "加载更多工单" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "加载更多需求" }),
+    );
 
     expect(mocks.fetchNextTickets).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the authoritative next pending ticket visible while filtering completed history", async () => {
+  it("filters current-project history without leaving the workbench", async () => {
+    mocks.assignments = [monitoringAssignment];
     mocks.ticketsData = {
       items: [
         {
@@ -546,6 +701,7 @@ describe("DeliveryMemberDashboard project context", () => {
           statusGroup: "completed",
           dependencySatisfied: true,
           dependencyBlockReason: null,
+          assignedProjectAssignmentId: MONITORING_PROJECT_ID,
           revision: 2,
           updatedAt: Date.parse("2026-08-01T00:00:00.000Z"),
         },
@@ -554,32 +710,28 @@ describe("DeliveryMemberDashboard project context", () => {
         customers: [{ id: 101, name: "客户甲", username: "customer-a" }],
       },
       counts: { pending: 3, completed: 1 },
-      nextPending: {
-        id: "9a67e445-37bb-45ed-9268-4ca9437e4d76",
-        userId: 101,
-        customerName: "客户甲",
-        customerUsername: "customer-a",
-        title: "服务端优先工单",
-        operation: "site_check",
-        status: "in_progress",
-      },
+      nextPending: null,
       nextCursor: null,
       limit: 50,
     };
 
     render(<DeliveryMemberDashboard />);
-    fireEvent.change(screen.getByRole("combobox", { name: "按状态筛选" }), {
-      target: { value: "completed" },
-    });
+    fireEvent.change(
+      await screen.findByRole("combobox", { name: "按状态筛选" }),
+      { target: { value: "completed" } },
+    );
 
     await waitFor(() =>
       expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({
+        customerUserId: 101,
+        projectAssignmentId: MONITORING_PROJECT_ID,
         statusGroup: "completed",
         limit: 50,
       }),
     );
-    expect(screen.getByText("服务端优先工单")).toBeInTheDocument();
-    expect(screen.queryByText("当前没有待处理工单")).not.toBeInTheDocument();
+    expect(screen.getByText("已完成历史")).toBeInTheDocument();
+    expect(screen.getByText("待处理 3")).toHaveClass("text-red-600");
+    expect(screen.getByText("已完成 1")).toBeInTheDocument();
   });
 
   it("shows the project-assignment empty state and clears a stale selection", async () => {
@@ -590,7 +742,7 @@ describe("DeliveryMemberDashboard project context", () => {
     render(<DeliveryMemberDashboard customerWorkbench />);
 
     expect(
-      screen.getByRole("heading", { name: "我的客户工作台" }),
+      screen.getByRole("heading", { name: "客户工作台" }),
     ).toBeInTheDocument();
     expect(
       screen.getByText("尚未分配客户项目，请联系交付管理员"),
@@ -617,23 +769,23 @@ describe("DeliveryMemberDashboard project context", () => {
     render(<DeliveryMemberDashboard customerWorkbench />);
 
     const projectSelector = await screen.findByRole("combobox", {
-      name: "当前客户项目",
+      name: "当前客户",
     });
     expect(screen.queryByTestId("portal-toolbar")).not.toBeInTheDocument();
     expect(
       within(screen.getByTestId("current-delivery-target")).getByRole(
         "combobox",
-        { name: "当前客户项目" },
+        { name: "当前客户" },
       ),
     ).toBe(projectSelector);
     expect(projectSelector).toHaveValue("1e9f33bc-40e2-4a8e-9bda-40d92a94b11f");
     expect(
       screen.getByRole("option", {
-        name: "示例客户 · AI 运维工程师",
+        name: "示例客户",
       }),
     ).toBeInTheDocument();
     expect(screen.getByTestId("project-role-label")).toHaveTextContent(
-      "示例客户 · AI 运维工程师",
+      "工程师",
     );
     await waitFor(() =>
       expect(mocks.workbenchUseQuery).toHaveBeenLastCalledWith(
@@ -653,16 +805,16 @@ describe("DeliveryMemberDashboard project context", () => {
     mocks.assignments = [
       {
         projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
-        customerUserId: 101,
-        customerName: "客户甲",
-        customerUsername: "customer-a",
+        customerUserId: 202,
+        customerName: "同一客户",
+        customerUsername: "same-customer",
         roleType: "ai_operations_engineer",
       },
       {
         projectAssignmentId: "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
         customerUserId: 202,
-        customerName: "客户乙",
-        customerUsername: "customer-b",
+        customerName: "同一客户",
+        customerUsername: "same-customer",
         roleType: "content_distribution_engineer",
       },
     ];
@@ -678,22 +830,29 @@ describe("DeliveryMemberDashboard project context", () => {
     render(<DeliveryMemberDashboard customerWorkbench systemAdminMode />);
 
     expect(
-      screen.getByRole("heading", { name: "系统管理员处理工作台" }),
+      screen.getByRole("heading", { name: "系统管理员工作台" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("系统管理员 · 工单处理")).toBeInTheDocument();
+    expect(screen.getByText("系统管理员 · 需求处理")).toBeInTheDocument();
     expect(screen.getByTestId("portal-nav-labels")).toHaveTextContent(
       "客户交付工作台",
     );
     expect(screen.getByTestId("portal-nav-labels")).not.toHaveTextContent(
-      "我的工单",
+      "我的需求",
     );
-    expect(screen.getByRole("link", { name: "返回客户工单" })).toHaveAttribute(
-      "href",
-      "/admin/workspace",
-    );
-    expect(screen.getByRole("combobox", { name: "当前客户项目" })).toHaveValue(
+    expect(
+      screen.getByRole("link", { name: "返回客户工作台" }),
+    ).toHaveAttribute("href", "/admin/customers/202/workspace");
+    expect(screen.getByRole("combobox", { name: "当前客户" })).toHaveValue(
       "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
     );
+    expect(
+      screen.getByRole("option", { name: "同一客户 · AI 运维工程师" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", {
+        name: "同一客户 · AI 内容制作工程师",
+      }),
+    ).toBeInTheDocument();
     expect(sessionStorage.setItem).toHaveBeenCalledWith(
       DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
       "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f",
@@ -706,6 +865,56 @@ describe("DeliveryMemberDashboard project context", () => {
         { enabled: true },
       ),
     );
+  });
+
+  it("rejects a focused ticket that belongs to another customer assignment", () => {
+    const projectA = "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f";
+    const projectB = "2e9f33bc-40e2-4a8e-9bda-40d92a94b22f";
+    const ticketB = "4a67e445-37bb-45ed-9268-4ca9437e4d72";
+    mocks.assignments = [
+      {
+        projectAssignmentId: projectA,
+        customerUserId: 101,
+        customerName: "客户 A",
+        customerUsername: "customer-a",
+        roleType: "ai_operations_engineer",
+      },
+      {
+        projectAssignmentId: projectB,
+        customerUserId: 202,
+        customerName: "客户 B",
+        customerUsername: "customer-b",
+        roleType: "ai_operations_engineer",
+      },
+    ];
+    mocks.detailData = {
+      ticket: {
+        id: ticketB,
+        userId: 202,
+        assignedProjectAssignmentId: projectB,
+        title: "客户 B 的知识库需求",
+        operation: "knowledge_maintenance",
+        status: "submitted",
+        createdByUserId: 202,
+        revision: 1,
+        updatedAt: Date.parse("2026-08-08T00:00:00.000Z"),
+      },
+    };
+    window.history.replaceState(
+      {},
+      "",
+      `/admin/delivery-workbench?projectAssignmentId=${projectA}&section=knowledge&ticketId=${ticketB}&focus=1`,
+    );
+
+    render(<DeliveryMemberDashboard customerWorkbench systemAdminMode />);
+
+    expect(
+      screen.getByText(
+        "当前需求不属于所选客户岗位，请返回客户工作台重新选择。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("客户 B 的知识库需求")).not.toBeInTheDocument();
+    expect(mocks.updateTicketMutation).not.toHaveBeenCalled();
   });
 
   it("keeps the customer workbench focused on preview and only exposes the selected project's actions", async () => {
@@ -731,7 +940,7 @@ describe("DeliveryMemberDashboard project context", () => {
         {
           id: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
           userId: 101,
-          title: "客户新提交的官网工单",
+          title: "客户新提交的官网需求",
           operation: "site_check",
           status: "submitted",
           createdByUserId: 101,
@@ -785,7 +994,7 @@ describe("DeliveryMemberDashboard project context", () => {
           id: "4a67e445-37bb-45ed-9268-4ca9437e4d71",
           userId: 101,
           customerName: "示例客户",
-          title: "客户新提交的官网工单",
+          title: "客户新提交的官网需求",
           operation: "site_check",
           status: "submitted",
           statusGroup: "pending",
@@ -799,7 +1008,7 @@ describe("DeliveryMemberDashboard project context", () => {
           id: "5a67e445-37bb-45ed-9268-4ca9437e4d72",
           userId: 101,
           customerName: "示例客户",
-          title: "同客户其他岗位工单",
+          title: "同客户其他岗位需求",
           operation: "site_check",
           status: "submitted",
           statusGroup: "pending",
@@ -812,7 +1021,7 @@ describe("DeliveryMemberDashboard project context", () => {
           id: "6a67e445-37bb-45ed-9268-4ca9437e4d73",
           userId: 101,
           customerName: "示例客户",
-          title: "当前岗位历史工单",
+          title: "当前岗位历史需求",
           operation: "site_check",
           status: "completed",
           statusGroup: "completed",
@@ -840,13 +1049,13 @@ describe("DeliveryMemberDashboard project context", () => {
     render(<DeliveryMemberDashboard customerWorkbench />);
 
     expect(
-      await screen.findByRole("heading", { name: "我的客户工作台" }),
+      await screen.findByRole("heading", { name: "客户工作台" }),
     ).toBeInTheDocument();
     expect(screen.getByTestId("project-role-label")).toHaveTextContent(
-      "AI 运维工程师",
+      "工程师",
     );
     expect(screen.queryByText("AI 监控与优化工程师")).not.toBeInTheDocument();
-    expect(screen.queryByText("AI 内容分发工程师")).not.toBeInTheDocument();
+    expect(screen.queryByText("AI 内容制作工程师")).not.toBeInTheDocument();
     expect(
       screen.queryByText("客户", { selector: "h3" }),
     ).not.toBeInTheDocument();
@@ -856,29 +1065,33 @@ describe("DeliveryMemberDashboard project context", () => {
     ).toBeNull();
     expect(screen.queryByRole("tab", { name: "品牌建设" })).toBeNull();
     expect(screen.queryByRole("tab", { name: "AI 友好内容" })).toBeNull();
-    expect(screen.queryByText("我的未结束工单")).toBeNull();
+    expect(screen.queryByText("我的未结束需求")).toBeNull();
     expect(screen.queryByText("现在优先处理")).toBeNull();
     expect(
       within(screen.getByTestId("customer-content-actions")).getByText(
-        "内容提交与修改",
+        "客户需求",
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText("客户新提交的官网工单")).toBeInTheDocument();
-    expect(screen.queryByText("同客户其他岗位工单")).not.toBeInTheDocument();
-    expect(screen.queryByText("当前岗位历史工单")).not.toBeInTheDocument();
+    expect(screen.getByText("客户新提交的官网需求")).toBeInTheDocument();
+    const pendingTicket = screen
+      .getByText("客户新提交的官网需求")
+      .closest("[data-pending-ticket='true']");
+    expect(pendingTicket).toHaveClass("border-red-500", "bg-red-50/80");
     expect(
-      screen.queryByRole("combobox", { name: "按状态筛选" }),
-    ).not.toBeInTheDocument();
+      within(pendingTicket as HTMLElement).getByText("已提交"),
+    ).toHaveClass("bg-destructive");
+    expect(screen.queryByText("同客户其他岗位需求")).not.toBeInTheDocument();
+    expect(screen.getByText("当前岗位历史需求")).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "按状态筛选" }),
+    ).toBeInTheDocument();
     expect(mocks.ticketsUseQuery).toHaveBeenLastCalledWith({
       customerUserId: 101,
       projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
-      statusGroup: "pending",
       limit: 50,
     });
-    expect(
-      screen.getByRole("link", { name: "提交或修改当前客户内容" }),
-    ).toHaveAttribute("href", "#customer-content-actions");
-    fireEvent.click(screen.getByRole("button", { name: "加载更多可操作内容" }));
+    expect(screen.queryByLabelText("客户看板")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多需求" }));
     expect(mocks.fetchNextTickets).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "开始处理" }));
@@ -898,17 +1111,27 @@ describe("DeliveryMemberDashboard project context", () => {
   });
 
   it("shows customer names and opens the full knowledge-reset history detail", () => {
+    mocks.assignments = [
+      {
+        projectAssignmentId: "3e9f33bc-40e2-4a8e-9bda-40d92a94b33f",
+        customerUserId: 12,
+        customerName: "星河科技",
+        customerUsername: "xinghe",
+        roleType: "ai_operations_engineer",
+      },
+    ];
     mocks.ticketsData = {
       items: [
         {
           id: "297769f5-9ec5-4d64-9c3a-9abdb603632d",
-          customerUserId: 12,
+          userId: 12,
           customerName: "星河科技",
           customerUsername: "xinghe",
           title: "知识库重置申请",
           operation: "knowledge_reset",
           status: "completed",
           statusGroup: "completed",
+          assignedProjectAssignmentId: "3e9f33bc-40e2-4a8e-9bda-40d92a94b33f",
           publicSummary: "已批准并完成清理，共清理 8 项。",
           resolvedAt: Date.parse("2026-07-30T12:00:00.000Z"),
         },
@@ -927,6 +1150,7 @@ describe("DeliveryMemberDashboard project context", () => {
     mocks.detailData = {
       ticket: {
         title: "知识库重置申请",
+        operation: "knowledge_reset",
         status: "completed",
         resolvedAt: Date.parse("2026-07-30T12:00:00.000Z"),
         updatedAt: Date.parse("2026-07-30T12:00:00.000Z"),
@@ -936,8 +1160,31 @@ describe("DeliveryMemberDashboard project context", () => {
         deliveryLinks: [],
       },
       customer: { id: 12, name: "星河科技", username: "xinghe" },
-      events: [],
+      events: [
+        {
+          id: "event-status-transition",
+          actorRole: "delivery_member",
+          kind: "status_changed",
+          message: null,
+          fromStatus: "submitted",
+          toStatus: "in_progress",
+          createdAt: Date.parse("2026-07-30T10:00:00.000Z"),
+        },
+      ],
       attachments: [],
+      rootContext: {
+        ticket: {
+          type: "website_operation",
+          category: "company_news",
+          title: "发布客户官网新闻",
+          topic: "新品发布",
+          description: "请使用客户提供的正式新闻稿。",
+          preferredMedia: "官网",
+          targetPage: "/news",
+          materialUrls: ["https://example.com/brief"],
+        },
+        attachments: [{ id: "root-file", filename: "正式新闻稿.docx" }],
+      },
       knowledgeReset: {
         reasonCode: "upload_error",
         reasonNote: "上传了错误文件",
@@ -951,10 +1198,7 @@ describe("DeliveryMemberDashboard project context", () => {
     render(<DeliveryMemberDashboard />);
 
     expect(
-      screen.getByRole("option", { name: /星河科技/ }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("option", { name: /远山制造/ }),
+      screen.getByRole("option", { name: "星河科技" }),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /知识库重置申请/ }));
 
@@ -962,8 +1206,39 @@ describe("DeliveryMemberDashboard project context", () => {
     expect(screen.getByText(/上传了错误文件/)).toBeInTheDocument();
     expect(screen.getByText(/审批结果：已批准/)).toBeInTheDocument();
     expect(screen.getByText(/确认可重置/)).toBeInTheDocument();
-    expect(screen.getByText(/snapshots 3/)).toBeInTheDocument();
+    expect(screen.getByText(/知识库快照 3/)).toBeInTheDocument();
+    expect(screen.getByText("已提交 → 处理中")).toBeInTheDocument();
+    expect(screen.queryByText("submitted → in_progress")).toBeNull();
+    expect(screen.getByText("原始客户需求")).toBeInTheDocument();
+    expect(screen.getByText("发布客户官网新闻")).toBeInTheDocument();
+    expect(
+      screen.getByText("请使用客户提供的正式新闻稿。"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/正式新闻稿\.docx/)).toBeInTheDocument();
     expect(screen.getAllByText(/完成时间/)).toHaveLength(2);
+
+    const openCustomerDashboardButton = screen.getByRole("button", {
+      name: "进入客户看板",
+    });
+    expect(openCustomerDashboardButton).toHaveClass(
+      "bg-blue-600",
+      "text-white",
+    );
+    fireEvent.click(openCustomerDashboardButton);
+    expect(
+      document.querySelector('main[data-mode="fullscreen"]'),
+    ).not.toBeNull();
+    expect(screen.getByLabelText("客户看板")).toHaveAttribute(
+      "data-layout",
+      "workspace",
+    );
+    expect(
+      screen.getByRole("button", { name: "返回客户工作台" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "知识库智能体" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("uses one structured delivery confirmation instead of prompt-driven handoff", async () => {
@@ -982,7 +1257,7 @@ describe("DeliveryMemberDashboard project context", () => {
           id: 101,
           username: "example.customer",
           displayName: "示例客户",
-          details: ["内容工单 1", "已完成 0", "待处理 1"],
+          details: ["内容需求 1", "已完成 0", "待处理 1"],
         },
       ],
       counts: {
@@ -1008,30 +1283,32 @@ describe("DeliveryMemberDashboard project context", () => {
       dashboard: null,
     };
 
-    render(<DeliveryMemberDashboard />);
+    render(<DeliveryMemberDashboard customerWorkbench />);
 
     fireEvent.click(
       await screen.findByRole("button", { name: "填写交付结果" }),
     );
 
     expect(screen.getByText("完成交付并确认下游交接")).toBeInTheDocument();
-    expect(screen.getByText(/系统会按所选发布目标/)).toBeInTheDocument();
-    expect(screen.queryByText("media、website")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/按客户原始入口自动生成媒体分发或官网发布子任务/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: /公开链接/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: /用户侧验收/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("下一步发布目标")).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByPlaceholderText(/已完成首轮问题监控/), {
+    fireEvent.change(screen.getByRole("textbox", { name: /交付结果摘要/ }), {
       target: { value: "内容资产已经发布并完成用户侧核验。" },
-    });
-    fireEvent.change(screen.getByPlaceholderText("https://"), {
-      target: { value: "https://example.com/asset/1" },
     });
     fireEvent.change(
       screen.getByRole("textbox", { name: /已确认内容资产 ID/ }),
       {
         target: { value: "asset-1" },
       },
-    );
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: /我已完成用户侧验收/ }),
     );
     fireEvent.click(screen.getByRole("button", { name: "完成并交接" }));
 
@@ -1042,11 +1319,478 @@ describe("DeliveryMemberDashboard project context", () => {
         expectedRevision: 3,
         status: "completed",
         message: "内容资产已经发布并完成用户侧核验。",
-        publicUrl: "https://example.com/asset/1",
         handoff: {
           contentAssetIds: ["asset-1"],
-          publishTargets: ["media"],
         },
+      }),
+    );
+  });
+
+  it("routes an active API-key ticket to the system administrator without engineer inputs", async () => {
+    mocks.assignments = [aiOperationsAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      counts: {
+        submitted: 0,
+        scheduled: 0,
+        in_progress: 1,
+        needs_information: 0,
+        completed: 0,
+      },
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d80",
+          userId: 101,
+          title: "配置 Jenova 平台 API 密钥",
+          operation: "build_exception",
+          status: "in_progress",
+          credentialTargetUserId: 101,
+          revision: 1,
+        },
+      ],
+      customerQuestions: [],
+      dashboard: null,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    expect(
+      await screen.findByText("等待系统管理员配置 API Key"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/API与人员管理/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "填写交付结果" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "等待用户补充" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("closes an unknown historical operation with summary only", async () => {
+    mocks.assignments = [aiOperationsAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      counts: {
+        submitted: 0,
+        scheduled: 0,
+        in_progress: 1,
+        needs_information: 0,
+        completed: 0,
+      },
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d81",
+          userId: 101,
+          title: "历史自定义交付事项",
+          operation: "legacy_custom_operation",
+          status: "in_progress",
+          revision: 2,
+        },
+      ],
+      customerQuestions: [],
+      dashboard: null,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "填写交付结果" }),
+    );
+
+    expect(screen.getByText(/只保存交付摘要/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: /公开链接/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: /用户侧验收/ }),
+    ).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: /交付结果摘要/ }), {
+      target: { value: "历史事项已经核对并处理。" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "完成并交接" }));
+
+    await waitFor(() =>
+      expect(mocks.updateTicketMutation).toHaveBeenCalledWith({
+        projectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+        ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d81",
+        expectedRevision: 2,
+        status: "completed",
+        message: "历史事项已经核对并处理。",
+      }),
+    );
+  });
+
+  it("selects a formal monitoring batch and approved optimization questions without hand-entered ids", async () => {
+    mocks.assignments = [monitoringAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d91",
+          userId: 101,
+          title: "完成首次监控",
+          operation: "initial_monitoring",
+          status: "in_progress",
+          revision: 5,
+        },
+      ],
+      monitoringBatches: [
+        {
+          batchKey: "formal-batch-2026-08",
+          sourceName: "首次监控正式数据.xlsx",
+          collectedAt: Date.parse("2026-08-08T03:00:00.000Z"),
+          sampleCount: 24,
+        },
+      ],
+      customerQuestions: [
+        {
+          id: "approved-question-1",
+          category: "industry",
+          question: "该品牌在行业中的优势是什么？",
+          status: "selected",
+          selectionApprovalStatus: "approved",
+          revision: 3,
+        },
+        {
+          id: "pending-question-2",
+          category: "reputation",
+          question: "这条问题仍在待审核吗？",
+          status: "candidate",
+          selectionApprovalStatus: "pending",
+          revision: 1,
+        },
+      ],
+      dashboard: null,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "填写交付结果" }),
+    );
+
+    const batchSelect = screen.getByRole("combobox", {
+      name: "正式监控批次",
+    });
+    expect(
+      within(batchSelect).getByRole("option", {
+        name: /formal-batch-2026-08.*24 条答案/,
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: /问题 ID/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: "这条问题仍在待审核吗？" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(batchSelect, {
+      target: { value: "formal-batch-2026-08" },
+    });
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /该品牌在行业中的优势是什么/,
+      }),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: /交付结果摘要/ }), {
+      target: { value: "首次监控已完成并核对正式结果。" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "完成并交接" }));
+
+    await waitFor(() =>
+      expect(mocks.updateTicketMutation).toHaveBeenCalledWith({
+        projectAssignmentId: MONITORING_PROJECT_ID,
+        ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d91",
+        expectedRevision: 5,
+        status: "completed",
+        message: "首次监控已完成并核对正式结果。",
+        handoff: {
+          monitoringBatchKey: "formal-batch-2026-08",
+          optimizationQuestionIds: ["approved-question-1"],
+        },
+      }),
+    );
+  });
+
+  it("excludes the retest baseline from the formal batch selector", async () => {
+    mocks.assignments = [monitoringAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d92",
+          userId: 101,
+          title: "效果复测",
+          operation: "monitoring_retest",
+          status: "in_progress",
+          monitoringBatchKey: "baseline-batch",
+          revision: 2,
+        },
+      ],
+      monitoringBatches: [
+        {
+          batchKey: "baseline-batch",
+          sourceName: "基线.xlsx",
+          collectedAt: Date.parse("2026-07-01T03:00:00.000Z"),
+          sampleCount: 12,
+        },
+        {
+          batchKey: "retest-batch",
+          sourceName: "复测.xlsx",
+          collectedAt: Date.parse("2026-08-08T03:00:00.000Z"),
+          sampleCount: 12,
+        },
+      ],
+      customerQuestions: [],
+      dashboard: null,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "填写交付结果" }),
+    );
+
+    const batchSelect = screen.getByRole("combobox", {
+      name: "本次复测的新监控批次",
+    });
+    expect(
+      within(batchSelect).queryByRole("option", { name: /baseline-batch/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(batchSelect).getByRole("option", { name: /retest-batch/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/复测前基线：baseline-batch/)).toBeInTheDocument();
+  });
+
+  it("shows question-catalog evidence as read-only and blocks completion until it is formal", async () => {
+    mocks.assignments = [monitoringAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d93",
+          userId: 101,
+          title: "发布品牌词库与问题目录",
+          operation: "question_catalog",
+          status: "in_progress",
+          revision: 2,
+        },
+      ],
+      monitoringBatches: [],
+      customerQuestions: [],
+      dashboard: null,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "填写交付结果" }),
+    );
+
+    expect(
+      screen.getByText("当前正式数据尚不满足完成条件"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("尚未发布")).toBeInTheDocument();
+    expect(screen.getByText("审核通过的问题（0条）")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "完成并交接" })).toBeDisabled();
+    expect(
+      screen.queryByRole("textbox", { name: /词库|问题 ID/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("allows question-catalog completion after the published lexicon and approved questions are visible", async () => {
+    mocks.assignments = [monitoringAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d94",
+          userId: 101,
+          title: "发布品牌词库与问题目录",
+          operation: "question_catalog",
+          status: "in_progress",
+          revision: 3,
+        },
+      ],
+      monitoringBatches: [],
+      customerQuestions: [
+        {
+          id: "approved-catalog-question",
+          category: "product_scenario",
+          question: "产品适合哪些正式使用场景？",
+          status: "selected",
+          selectionApprovalStatus: "approved",
+          revision: 2,
+        },
+      ],
+      dashboard: {
+        revision: 4,
+        payload: {
+          brandName: "示例客户",
+          headline: "",
+          summary: "",
+          metrics: [],
+          sections: [],
+          keywordTables: [
+            {
+              id: "published-keywords",
+              title: "正式品牌词库",
+              columns: ["关键词"],
+              rows: [["示例品牌"]],
+            },
+          ],
+          questions: [],
+          monitoringAnswers: [],
+          citations: [],
+          contentAssets: [],
+          optimizationReport: null,
+          progressReports: [],
+        },
+      },
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "填写交付结果" }),
+    );
+
+    expect(screen.getByText("已发布")).toBeInTheDocument();
+    expect(screen.getByText("审核通过的问题（1条）")).toBeInTheDocument();
+    expect(screen.getByText("产品适合哪些正式使用场景？")).toBeInTheDocument();
+    expect(
+      screen.queryByText("当前正式数据尚不满足完成条件"),
+    ).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: /交付结果摘要/ }), {
+      target: { value: "正式词库已发布，问题目录审核完成。" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "完成并交接" }));
+
+    await waitFor(() =>
+      expect(mocks.updateTicketMutation).toHaveBeenCalledWith({
+        projectAssignmentId: MONITORING_PROJECT_ID,
+        ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d94",
+        expectedRevision: 3,
+        status: "completed",
+        message: "正式词库已发布，问题目录审核完成。",
+      }),
+    );
+  });
+
+  it("locks the requested channel media and sends it as structured handoff", async () => {
+    mocks.assignments = [
+      {
+        ...monitoringAssignment,
+        roleType: "content_distribution_engineer",
+      },
+    ];
+    mocks.workbenchData = {
+      customers: [],
+      counts: {
+        submitted: 0,
+        scheduled: 0,
+        in_progress: 1,
+        needs_information: 0,
+        completed: 0,
+      },
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d82",
+          userId: 101,
+          title: "登记媒体渠道分发结果",
+          operation: "channel_distribution",
+          status: "in_progress",
+          preferredMedia: "知乎",
+          revision: 3,
+        },
+      ],
+      customerQuestions: [],
+      dashboard: null,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "填写交付结果" }),
+    );
+
+    const targetMedia = screen.getByRole("combobox", {
+      name: /目标媒体或渠道/,
+    });
+    expect(targetMedia).toHaveValue("知乎");
+    expect(targetMedia).toBeDisabled();
+    fireEvent.change(screen.getByRole("textbox", { name: /交付结果摘要/ }), {
+      target: { value: "渠道发布已完成。" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: /公开链接/ }), {
+      target: { value: "https://www.zhihu.com/question/1" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "完成并交接" }));
+
+    await waitFor(() =>
+      expect(mocks.updateTicketMutation).toHaveBeenCalledWith({
+        projectAssignmentId: MONITORING_PROJECT_ID,
+        ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d82",
+        expectedRevision: 3,
+        status: "completed",
+        message: "渠道发布已完成。",
+        publicUrl: "https://www.zhihu.com/question/1",
+        handoff: { targetMedia: "知乎" },
+      }),
+    );
+  });
+
+  it("shows inherited website content assets as read-only completion context", async () => {
+    mocks.assignments = [aiOperationsAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      counts: {
+        submitted: 0,
+        scheduled: 0,
+        in_progress: 1,
+        needs_information: 0,
+        completed: 0,
+      },
+      tickets: [
+        {
+          id: "4a67e445-37bb-45ed-9268-4ca9437e4d83",
+          userId: 101,
+          title: "发布企业事实页面",
+          operation: "company_facts",
+          status: "in_progress",
+          contentAssetIds: ["asset-inherited-1"],
+          revision: 4,
+        },
+      ],
+      customerQuestions: [],
+      dashboard: null,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "填写交付结果" }),
+    );
+
+    expect(screen.getByText("asset-inherited-1")).toBeInTheDocument();
+    expect(screen.getByText(/不能在完成时改写/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: /本页面绑定的内容资产 ID/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: /用户侧验收/ }),
+    ).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: /交付结果摘要/ }), {
+      target: { value: "企业事实页面已发布。" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: /公开链接/ }), {
+      target: { value: "https://example.com/about" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "完成并交接" }));
+
+    await waitFor(() =>
+      expect(mocks.updateTicketMutation).toHaveBeenCalledWith({
+        projectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+        ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d83",
+        expectedRevision: 4,
+        status: "completed",
+        message: "企业事实页面已发布。",
+        publicUrl: "https://example.com/about",
+        handoff: { contentAssetIds: ["asset-inherited-1"] },
       }),
     );
   });
@@ -1116,7 +1860,7 @@ describe("DeliveryMemberDashboard project context", () => {
         json: async () => ({ success: true }),
       } as Response);
 
-    render(<DeliveryMemberDashboard />);
+    render(<DeliveryMemberDashboard customerWorkbench />);
 
     expect(await screen.findByLabelText("上传品牌词库")).toHaveAttribute(
       "accept",
@@ -1199,6 +1943,16 @@ describe("DeliveryMemberDashboard project context", () => {
 
       const editor = await screen.findByTestId("question-quota-editor");
       expect(within(editor).getByText("行业排名词")).toBeInTheDocument();
+      for (const [label, category] of [
+        ["行业排名词", "industry"],
+        ["竞品对比词", "competitor_comparison"],
+        ["美誉舆情词", "reputation"],
+        ["产品场景词", "product_scenario"],
+      ] as const) {
+        expect(
+          within(editor).getByText(label).closest("[data-category]"),
+        ).toHaveAttribute("data-category", category);
+      }
       expect(
         within(editor).getByText("已确认 1 · 待审核预留 1"),
       ).toBeInTheDocument();
@@ -1239,6 +1993,231 @@ describe("DeliveryMemberDashboard project context", () => {
       await waitFor(() => expect(mocks.refetchWorkbench).toHaveBeenCalled());
     },
   );
+
+  it.each([
+    { actorLabel: "AI 运维工程师", systemAdminMode: false },
+    { actorLabel: "系统管理员", systemAdminMode: true },
+  ])(
+    "$actorLabel can adjust only the overseas brand-tracking usage quota",
+    async ({ systemAdminMode }) => {
+      mocks.assignments = [aiOperationsAssignment];
+      mocks.workbenchData = {
+        customers: [
+          {
+            id: 101,
+            displayName: "示例客户",
+            marketEdition: "overseas",
+          },
+        ],
+        tickets: [],
+        customerQuestions: [],
+        dashboard: null,
+        brandTrackingUsage: brandTrackingUsageFixture,
+      };
+      if (systemAdminMode) {
+        window.history.replaceState(
+          {},
+          "",
+          `/admin/delivery-workbench?projectAssignmentId=${AI_OPERATIONS_PROJECT_ID}`,
+        );
+      }
+
+      render(
+        <DeliveryMemberDashboard
+          customerWorkbench
+          systemAdminMode={systemAdminMode}
+        />,
+      );
+
+      const openCustomerDashboardButton = await screen.findByRole("button", {
+        name: "进入客户看板",
+      });
+      expect(openCustomerDashboardButton).toHaveClass(
+        "bg-blue-600",
+        "text-white",
+      );
+      fireEvent.click(openCustomerDashboardButton);
+      fireEvent.click(
+        await screen.findByRole("tab", { name: "品牌追踪智能体" }),
+      );
+
+      const editor = await screen.findByTestId("brand-tracking-usage-editor");
+      expect(within(editor).getByText("2,500积分")).toBeInTheDocument();
+      expect(within(editor).getByText("10,000积分")).toBeInTheDocument();
+      expect(within(editor).getByText("7,500积分")).toBeInTheDocument();
+      expect(editor).toHaveTextContent("不提供对话内容或凭据配置能力");
+      expect(editor).not.toHaveTextContent("会话");
+      expect(editor.textContent).not.toMatch(/\$|美元|费用/u);
+
+      fireEvent.click(within(editor).getByRole("button", { name: "修改额度" }));
+      const limitInput =
+        within(editor).getByLabelText("品牌追踪滚动 30 天积分上限");
+      expect(limitInput).toHaveValue("10000");
+      fireEvent.change(limitInput, { target: { value: "1.000001" } });
+      expect(within(editor).getByRole("alert")).toHaveTextContent(
+        "最多 15 位整数和 5 位小数",
+      );
+      expect(
+        within(editor).getByRole("button", { name: "保存积分上限" }),
+      ).toBeDisabled();
+      fireEvent.change(limitInput, { target: { value: "25000" } });
+      fireEvent.click(
+        within(editor).getByRole("button", { name: "保存积分上限" }),
+      );
+
+      await waitFor(() =>
+        expect(mocks.updateBrandTrackingLimitMutation).toHaveBeenCalledWith({
+          projectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+          limitCredits: "25000",
+        }),
+      );
+      expect(
+        mocks.updateBrandTrackingLimitMutation.mock.calls[0]?.[0],
+      ).not.toHaveProperty("userId");
+      await waitFor(() => expect(mocks.refetchWorkbench).toHaveBeenCalled());
+    },
+  );
+
+  it("requires the engineer to classify a self-entered question before approval", async () => {
+    const question = {
+      id: "pending-direct-question",
+      category: null,
+      source: "user",
+      status: "candidate",
+      selectionApprovalStatus: "pending",
+      question: "新企业如何验证产品交付能力？",
+      intent: null,
+      revision: 4,
+    };
+    mocks.assignments = [monitoringAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      tickets: [],
+      customerQuestions: [question],
+      dashboard: null,
+      questionQuota: questionQuotaFixture,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    expect(await screen.findByText("问题来源：自主填写")).toBeInTheDocument();
+    const categorySelect = screen.getByRole("combobox", {
+      name: `“${question.question}”的问题类型`,
+    });
+    expect(categorySelect).toHaveValue("");
+    expect(
+      within(categorySelect).getByRole("option", {
+        name: "行业排名词（额度已满）",
+      }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText("行业排名词额度已满，请选择仍有额度的问题类型。"),
+    ).toBeInTheDocument();
+
+    const approveButton = screen.getByRole("button", { name: "审核通过" });
+    expect(approveButton).toBeDisabled();
+
+    fireEvent.change(categorySelect, {
+      target: { value: "competitor_comparison" },
+    });
+    expect(approveButton).toBeEnabled();
+    fireEvent.click(approveButton);
+
+    await waitFor(() =>
+      expect(mocks.approveQuestionSelectionMutation).toHaveBeenCalledWith({
+        projectAssignmentId: MONITORING_PROJECT_ID,
+        questionId: question.id,
+        expectedRevision: 4,
+        category: "competitor_comparison",
+      }),
+    );
+    expect(mocks.refetchWorkbench).toHaveBeenCalled();
+  });
+
+  it("keeps an existing question category as a Chinese badge without forcing reassignment", async () => {
+    const question = {
+      id: "pending-categorized-question",
+      category: "product_scenario",
+      source: "admin",
+      status: "candidate",
+      selectionApprovalStatus: "pending",
+      question: "产品适合哪些使用场景？",
+      intent: null,
+      revision: 7,
+    };
+    mocks.assignments = [monitoringAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      tickets: [],
+      customerQuestions: [question],
+      dashboard: null,
+      questionQuota: questionQuotaFixture,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    expect(await screen.findByText(question.question)).toBeInTheDocument();
+    expect(screen.getAllByText("产品场景词").length).toBeGreaterThan(0);
+    expect(
+      screen.queryByRole("combobox", {
+        name: `“${question.question}”的问题类型`,
+      }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "审核通过" }));
+
+    await waitFor(() =>
+      expect(mocks.approveQuestionSelectionMutation).toHaveBeenCalledWith({
+        projectAssignmentId: MONITORING_PROJECT_ID,
+        questionId: question.id,
+        expectedRevision: 7,
+      }),
+    );
+  });
+
+  it("blocks approval when every category quota is full", async () => {
+    const question = {
+      id: "pending-total-full-question",
+      category: null,
+      source: "user",
+      status: "candidate",
+      selectionApprovalStatus: "pending",
+      question: "这个问题应该归到哪一类？",
+      intent: null,
+      revision: 2,
+    };
+    mocks.assignments = [monitoringAssignment];
+    mocks.workbenchData = {
+      customers: [],
+      tickets: [],
+      customerQuestions: [question],
+      dashboard: null,
+      questionQuota: {
+        ...questionQuotaFixture,
+        remaining: {
+          industry: 0,
+          competitorComparison: 0,
+          reputation: 0,
+          productScenario: 0,
+          total: 0,
+        },
+      },
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    const categorySelect = await screen.findByRole("combobox", {
+      name: `“${question.question}”的问题类型`,
+    });
+    expect(categorySelect).toBeEnabled();
+    expect(
+      screen.getByText(
+        "行业排名词、竞品对比词、美誉舆情词、产品场景词额度已满，请选择仍有额度的问题类型。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "审核通过" })).toBeDisabled();
+    expect(mocks.approveQuestionSelectionMutation).not.toHaveBeenCalled();
+  });
 
   it("hides the question quota editor from non-monitoring assignments", async () => {
     mocks.assignments = [
@@ -1297,7 +2276,7 @@ describe("DeliveryMemberDashboard project context", () => {
       dashboard: null,
     };
 
-    render(<DeliveryMemberDashboard />);
+    render(<DeliveryMemberDashboard customerWorkbench />);
 
     expect(
       await screen.findByText(

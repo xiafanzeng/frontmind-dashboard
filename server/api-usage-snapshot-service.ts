@@ -8,6 +8,8 @@ import {
   apiUsageCredentialCoverage,
   apiUsagePolicies,
   apiUsageSnapshots,
+  deliveryTicketEvents,
+  deliveryTickets,
   presalesApiCredentials,
   userAdminAssignments,
   userUsageOwners,
@@ -884,6 +886,7 @@ export async function replaceManagedApiKeyTarget(input: {
   expectedVersion: number;
   reason?: string;
   allowIncompleteHistory?: boolean;
+  relatedTicketId?: string;
 }) {
   if (!isSystemAdmin(input.actor)) {
     throw new AuthServiceError(
@@ -988,6 +991,32 @@ export async function replaceManagedApiKeyTarget(input: {
       actualVersion,
       expectedVersion: input.expectedVersion,
     });
+    const relatedTicketRows = input.relatedTicketId
+      ? await tx
+          .select()
+          .from(deliveryTickets)
+          .where(eq(deliveryTickets.id, input.relatedTicketId))
+          .limit(1)
+          .for("update")
+      : [];
+    const relatedTicket = relatedTicketRows[0];
+    if (
+      input.relatedTicketId &&
+      (!relatedTicket ||
+        relatedTicket.credentialTargetUserId !== input.userId ||
+        relatedTicket.credentialRequestKind !== "managed_api" ||
+        ![
+          "submitted",
+          "needs_information",
+          "scheduled",
+          "in_progress",
+        ].includes(relatedTicket.status))
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "关联凭据需求不存在、目标账号不匹配或已经关闭",
+      );
+    }
     // Deleted credentials are version tombstones for CAS only. They are not
     // readable old Keys and must never require a coverage proof before the
     // account can be configured again.
@@ -1032,6 +1061,36 @@ export async function replaceManagedApiKeyTarget(input: {
       userId: input.userId,
       apiKey: input.apiKey,
     });
+    if (relatedTicket) {
+      const completedAt = new Date();
+      const summary = "目标账号 API Key 已由系统管理员完成配置并通过连接验证。";
+      await tx
+        .update(deliveryTickets)
+        .set({
+          status: "completed",
+          quotaState: "consumed",
+          publicSummary: summary,
+          resolvedAt: completedAt,
+          technicalDedupeKey: null,
+          revision: sql`${deliveryTickets.revision} + 1`,
+          updatedByUserId: input.actor.id,
+          updatedAt: completedAt,
+        })
+        .where(eq(deliveryTickets.id, relatedTicket.id));
+      await tx.insert(deliveryTicketEvents).values({
+        id: randomUUID(),
+        ticketId: relatedTicket.id,
+        userId: relatedTicket.userId,
+        actorUserId: input.actor.id,
+        actorRole: "admin",
+        kind: "status_change",
+        visibility: "customer",
+        message: summary,
+        fromStatus: relatedTicket.status,
+        toStatus: "completed",
+        createdAt: completedAt,
+      });
+    }
     await writeWorkspaceAuditEvent(
       {
         actor: input.actor,
@@ -1049,6 +1108,7 @@ export async function replaceManagedApiKeyTarget(input: {
           emergencyReplacement: Boolean(
             transactionHistoryIncomplete && input.allowIncompleteHistory,
           ),
+          relatedTicketId: relatedTicket?.id ?? null,
         },
       },
       tx,

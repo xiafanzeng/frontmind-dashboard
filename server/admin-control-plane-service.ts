@@ -376,7 +376,7 @@ export function buildAdminControlPlaneOverview(input: {
         description: "尚未发布可校验的企业看板内容。",
         status: "unconfigured",
         updatedAt: user.createdAt.getTime(),
-        href: `/admin/customers/${user.id}/service`,
+        href: `/admin/customers/${user.id}/workspace`,
       });
     }
     if (user.isActive && (serviceStatus !== "active" || serviceExpiringSoon)) {
@@ -401,7 +401,7 @@ export function buildAdminControlPlaneOverview(input: {
         updatedAt: currentContract?.createdAt
           ? new Date(currentContract.createdAt).getTime()
           : user.createdAt.getTime(),
-        href: `/admin/customers/${user.id}/service`,
+        href: `/admin/customers/${user.id}/workspace`,
       });
     }
     if (
@@ -421,7 +421,7 @@ export function buildAdminControlPlaneOverview(input: {
             : `当前 Key 校验状态：${status}`,
         status,
         updatedAt: credential?.verifiedAt?.getTime() ?? null,
-        href: `/admin/customers/${user.id}/credential`,
+        href: `/?credentialType=managed_api&credentialUserId=${user.id}&credentialKind=customer`,
       });
     }
   }
@@ -455,7 +455,7 @@ export function buildAdminControlPlaneOverview(input: {
             : `构建状态：${build.status}`),
         status: build.status,
         updatedAt: build.updatedAt.getTime(),
-        href: `/admin/customers/${build.userId}/knowledge`,
+        href: `/admin/customers/${build.userId}/workspace`,
       });
     }
   }
@@ -472,7 +472,7 @@ export function buildAdminControlPlaneOverview(input: {
         description: "存在失败的智能体执行记录，请进入客户工作区检查并重试。",
         status: "failed",
         updatedAt: row.updatedAt?.getTime() ?? null,
-        href: `/admin/customers/${row.userId}/knowledge`,
+        href: `/admin/customers/${row.userId}/workspace`,
       });
     }
   }

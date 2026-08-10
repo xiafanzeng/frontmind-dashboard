@@ -28,6 +28,11 @@ import {
   claimKnowledgeBaseTurnForRecovery,
   hashKnowledgeBaseTurnRequest,
   hashKnowledgeBaseUpstreamIdempotencyKey,
+  inspectKnowledgeBaseDeferredAttachmentReplay,
+  inspectKnowledgeBaseDeferredDispatchReplay,
+  inspectKnowledgeBaseLegacyAttachmentTakeoverReplay,
+  inspectKnowledgeBaseLegacyDeferredReservationReplay,
+  inspectKnowledgeBaseTurnReplay,
   inspectKnowledgeBaseRetryAuthority,
   knowledgeBaseRetryRequiresFreshFinalDelivery,
   prepareKnowledgeBaseTurnDispatch,
@@ -482,6 +487,355 @@ describe("knowledge-base turn replay decisions", () => {
         now,
       ),
     ).toEqual({ state: "expired" });
+  });
+});
+
+describe("knowledge-base HTTP replay receipts", () => {
+  const intent = {
+    schemaVersion: 1,
+    flow: "direct",
+    userMessage: "确认",
+    expectedGeneration: 3,
+    expectedRevision: 7,
+    expectedLeafId: "1.8",
+    expectedPresentationKey: "presentation-7",
+  };
+
+  function replayExecutor(selections: ConversationTurn[][]) {
+    let selection = 0;
+    return {
+      transaction: async (run: (tx: any) => Promise<unknown>) =>
+        run({
+          select: () => ({
+            from: () => ({
+              where: () => ({
+                limit: async () => selections[selection++] || [],
+                orderBy: () => ({
+                  limit: async () => selections[selection++] || [],
+                }),
+              }),
+            }),
+          }),
+        }),
+    };
+  }
+
+  function replayTurn(overrides: Partial<ConversationTurn> = {}) {
+    return turn({
+      metadata: {
+        clientIntentHash: hashKnowledgeBaseTurnRequest(intent),
+        expectedPresentationKey: "presentation-7",
+      },
+      ...overrides,
+    });
+  }
+
+  it("returns the original passive receipt before mutable build checks", async () => {
+    await expect(
+      inspectKnowledgeBaseTurnReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          clientRequestId: "request-1",
+          clientIntent: intent,
+          expectedGeneration: 3,
+          expectedRevision: 7,
+          expectedLeafId: "1.8",
+          now: new Date("2026-08-01T00:00:30.000Z"),
+        },
+        replayExecutor([[replayTurn()]]),
+      ),
+    ).resolves.toMatchObject({ state: "pending", turn: { id: turn().id } });
+  });
+
+  it("rejects different content under the same request id with a stable code", async () => {
+    await expect(
+      inspectKnowledgeBaseTurnReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          clientRequestId: "request-1",
+          clientIntent: { ...intent, userMessage: "修改公司名称" },
+        },
+        replayExecutor([[replayTurn()]]),
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+    });
+  });
+
+  it("adopts the operation winner after a tab remounts with a new request id", async () => {
+    const receipt = await inspectKnowledgeBaseTurnReplay(
+      {
+        userId: 1,
+        conversationId: "conversation-1",
+        clientRequestId: "request-from-remounted-tab",
+        clientIntent: intent,
+        expectedGeneration: 3,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+      },
+      replayExecutor([[], [replayTurn()]]),
+    );
+    expect(receipt).toMatchObject({
+      state: "pending",
+      turn: { clientRequestId: "request-1" },
+    });
+  });
+
+  it("never lets coordinate fallback adopt an unprepared cancellation tombstone", async () => {
+    const receipt = await inspectKnowledgeBaseTurnReplay(
+      {
+        userId: 1,
+        conversationId: "conversation-1",
+        clientRequestId: "replacement-request",
+        clientIntent: intent,
+        expectedGeneration: 3,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+      },
+      replayExecutor([
+        [],
+        [
+          replayTurn({
+            status: "cancelled",
+            metadata: {
+              clientIntentHash: hashKnowledgeBaseTurnRequest(intent),
+              unpreparedCancellation: true,
+            },
+          }),
+        ],
+      ]),
+    );
+    expect(receipt).toBeNull();
+  });
+
+  it("replays an already staged file without consulting current Logo state", async () => {
+    const manifest = [{ filename: "logo.png", sha256: "a".repeat(64) }];
+    const staged = replayTurn({
+      metadata: {
+        clientAttachmentManifestHash: hashKnowledgeBaseTurnRequest(manifest),
+        clientStagedAttachments: [
+          { index: 0, file_id: "file-logo", filename: "logo.png" },
+        ],
+        userAttachmentCount: 1,
+      },
+    });
+    await expect(
+      inspectKnowledgeBaseDeferredAttachmentReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          turnId: staged.id,
+          clientRequestId: staged.clientRequestId,
+          clientAttachmentManifest: manifest,
+          index: 0,
+          attachment: { file_id: "file-logo", filename: "logo.png" },
+        },
+        replayExecutor([[staged]]),
+      ),
+    ).resolves.toMatchObject({ state: "pending", turn: { id: staged.id } });
+  });
+
+  it("replays a claimed deferred dispatch before consulting the active build", async () => {
+    const manifest = [{ filename: "logo.png", sha256: "a".repeat(64) }];
+    const claimed = replayTurn({
+      metadata: {
+        awaitingClientAttachments: false,
+        clientAttachmentManifestHash: hashKnowledgeBaseTurnRequest(manifest),
+        clientStagedAttachments: [
+          { index: 0, file_id: "file-logo", filename: "logo.png" },
+        ],
+        userAttachmentCount: 1,
+      },
+    });
+    await expect(
+      inspectKnowledgeBaseDeferredDispatchReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          turnId: claimed.id,
+          clientRequestId: claimed.clientRequestId,
+          clientAttachmentManifest: manifest,
+        },
+        replayExecutor([[claimed]]),
+      ),
+    ).resolves.toMatchObject({ state: "pending", turn: { id: claimed.id } });
+  });
+
+  it("does not treat a still-awaiting deferred reservation as a dispatch replay", async () => {
+    const manifest = [{ filename: "logo.png", sha256: "a".repeat(64) }];
+    const awaiting = replayTurn({
+      leaseExpiresAt: null,
+      metadata: {
+        awaitingClientAttachments: true,
+        clientAttachmentManifestHash: hashKnowledgeBaseTurnRequest(manifest),
+        clientStagedAttachments: [
+          { index: 0, file_id: "file-logo", filename: "logo.png" },
+        ],
+        userAttachmentCount: 1,
+      },
+    });
+    await expect(
+      inspectKnowledgeBaseDeferredDispatchReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          turnId: awaiting.id,
+          clientRequestId: awaiting.clientRequestId,
+          clientAttachmentManifest: manifest,
+        },
+        replayExecutor([[awaiting]]),
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("replays a legacy deferred reservation from immutable coordinates and manifest", async () => {
+    const manifest = [{ filename: "brief.txt", sha256: "b".repeat(64) }];
+    const awaiting = replayTurn({
+      operationType: "revise",
+      leaseExpiresAt: null,
+      metadata: {
+        awaitingClientAttachments: true,
+        clientAttachmentManifestHash: hashKnowledgeBaseTurnRequest(manifest),
+        userAttachmentCount: 1,
+      },
+    });
+    await expect(
+      inspectKnowledgeBaseLegacyDeferredReservationReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          clientRequestId: awaiting.clientRequestId,
+          clientAttachmentManifest: manifest,
+          operationType: "revise",
+          expectedGeneration: 3,
+          expectedRevision: 7,
+          expectedLeafId: "1.8",
+        },
+        replayExecutor([[awaiting]]),
+      ),
+    ).resolves.toMatchObject({
+      state: "awaiting_attachments",
+      turn: { id: awaiting.id },
+    });
+  });
+
+  it("only replays a legacy upload-first request after its exact takeover ledger is durable", async () => {
+    const manifest = [{ filename: "logo.png", sha256: "c".repeat(64) }];
+    const attachments = [{ file_id: "file-logo", filename: "logo.png" }];
+    const beforeTakeover = replayTurn({
+      operationType: "revise",
+      leaseExpiresAt: null,
+      metadata: {
+        awaitingClientAttachments: true,
+        clientAttachmentManifestHash: hashKnowledgeBaseTurnRequest(manifest),
+        recovery: { attachmentManifest: manifest, attachments: [] },
+      },
+    });
+    const input = {
+      userId: 1,
+      conversationId: "conversation-1",
+      clientRequestId: beforeTakeover.clientRequestId,
+      clientAttachmentManifest: manifest,
+      attachments,
+      operationType: "revise" as const,
+      expectedGeneration: 3,
+      expectedRevision: 7,
+      expectedLeafId: "1.8",
+    };
+    await expect(
+      inspectKnowledgeBaseLegacyAttachmentTakeoverReplay(
+        input,
+        replayExecutor([[beforeTakeover]]),
+      ),
+    ).resolves.toBeNull();
+
+    const afterTakeover = replayTurn({
+      operationType: "revise",
+      metadata: {
+        awaitingClientAttachments: false,
+        legacyUploadFirstTakeover: true,
+        clientAttachmentManifestHash: hashKnowledgeBaseTurnRequest(manifest),
+        userAttachmentCount: 1,
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          attachmentManifest: manifest,
+          attachments,
+        },
+      },
+    });
+    await expect(
+      inspectKnowledgeBaseLegacyAttachmentTakeoverReplay(
+        input,
+        replayExecutor([[afterTakeover]]),
+      ),
+    ).resolves.toMatchObject({
+      state: "pending",
+      turn: { id: afterTakeover.id },
+    });
+    await expect(
+      inspectKnowledgeBaseLegacyAttachmentTakeoverReplay(
+        { ...input, attachments: [{ ...attachments[0]!, file_id: "other" }] },
+        replayExecutor([[afterTakeover]]),
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+    });
+  });
+
+  it("rejects a new reservation against a stale presentation key", async () => {
+    const build = {
+      id: "00000000-0000-4000-8000-000000000099",
+      userId: 1,
+      conversationId: "conversation-stale-presentation",
+      companyName: "FrontMind 超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "a".repeat(64),
+      status: "confirming",
+      generation: 3,
+      stateEpoch: 8,
+      revision: 7,
+      currentLeafId: "1.8",
+      currentPresentationKey: "presentation-current",
+      activeTurnId: null,
+      upstreamTaskId: "parent-task",
+      protocolErrorCode: null,
+      protocolError: null,
+    };
+    const { executor } = createTurnServiceExecutor({
+      build,
+      conversation: {
+        id: "u1:conversation-stale-presentation",
+        userId: 1,
+        projectAssignmentId: null,
+        deletedAt: null,
+      },
+      turnSelections: [[[], []]],
+    });
+    await expect(
+      reserveKnowledgeBaseTurn(
+        {
+          userId: 1,
+          buildId: build.id,
+          clientRequestId: "stale-presentation-request",
+          operationType: "confirm",
+          expectedGeneration: 3,
+          expectedRevision: 7,
+          expectedLeafId: "1.8",
+          expectedPresentationKey: "presentation-stale",
+          requestPayload: { userMessage: "确认" },
+          clientIntent: intent,
+          apiCredentialId: "credential-1",
+          userText: "确认",
+          expectedAttachmentCount: 0,
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "STALE_KNOWLEDGE_BASE_PRESENTATION" });
   });
 });
 

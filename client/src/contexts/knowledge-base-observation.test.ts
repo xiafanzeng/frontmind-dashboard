@@ -122,6 +122,43 @@ function conversation(): Conversation {
 }
 
 describe("authoritative KB observation reducer", () => {
+  it("upgrades a final optimistic confirmation from completedTurn without inventing a presentation", () => {
+    const finalObservation = {
+      ...observation(3, "turn-final", 3, "1.3", null),
+      activeTurn: null,
+      completedTurn: {
+        turnId: "turn-final",
+        clientRequestId: "request-turn-1",
+        messageSequence: 21,
+      },
+      interaction: {
+        progress: null,
+        interactionState: "ready_to_publish" as const,
+        canReply: false,
+        canPublish: true,
+        lockReason: null,
+      },
+      approvedPresentation: null,
+    };
+
+    const next = applyKnowledgeBaseObservation(
+      conversation(),
+      finalObservation,
+    );
+
+    expect(next.status).toBe("completed");
+    expect(next.messages).toHaveLength(1);
+    expect(next.messages[0]).toMatchObject({
+      id: knowledgeBaseUserMessagePublicId("turn-final"),
+      serverSequence: 21,
+      knowledgeBase: {
+        clientRequestId: "request-turn-1",
+        turnId: "turn-final",
+        serverOwned: true,
+      },
+    });
+  });
+
   it("keeps awaiting_input locked when the server has not approved a body", () => {
     const next = applyKnowledgeBaseObservation(
       conversation(),

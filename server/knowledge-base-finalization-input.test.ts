@@ -161,6 +161,37 @@ describe("knowledge-base finalization input", () => {
     ).rejects.toThrow("FINALIZATION_INPUT_LOGO_REQUIRED");
   });
 
+  it("carries an automatically bound Logo without external provenance", async () => {
+    const logo = Buffer.from("managed-auto-logo-bytes");
+    const result = await buildKnowledgeBaseFinalizationInput({
+      companyName: "企业",
+      operationId: "operation",
+      turnId: "turn",
+      buildRevision: 51,
+      nodes: approvedNodes(),
+      assets: [
+        {
+          kind: "official_logo",
+          filename: "logo.png",
+          mimeType: "image/png",
+          sha256: sha256(logo),
+          bytes: logo,
+          documentIds: ["1.1"],
+        },
+      ],
+    });
+    const zip = await JSZip.loadAsync(result.bytes, { checkCRC32: true });
+    const ledger = JSON.parse(
+      await zip.file("FINALIZATION_INPUT.json")!.async("string"),
+    );
+    expect(ledger.assets[0].requiredManifest).not.toHaveProperty("sourceKind");
+    expect(ledger.assets[0].requiredManifest).toMatchObject({
+      assetType: "brand_identity",
+      displayRole: "badge",
+      documentIds: ["1.1"],
+    });
+  });
+
   it("rejects a legacy Logo whose provenance would have to be guessed", async () => {
     const logo = Buffer.from("logo-image-bytes");
     await expect(

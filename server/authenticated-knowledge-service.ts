@@ -23,6 +23,7 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
     | "sourceTaskId"
     | "sourceArtifactHash"
     | "archiveHash"
+    | "status"
     | "createdAt"
   >;
   build: Pick<
@@ -51,6 +52,7 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
   const handled = build.confirmedCount + build.directPrefilledCount;
   const publicationBindingHash = knowledgeBasePublicationBindingHash(build);
   return (
+    snapshot.status === "active" &&
     snapshot.createdAt.getTime() >= input.notBefore.getTime() &&
     build.createdAt.getTime() >= input.notBefore.getTime() &&
     snapshot.userId === build.userId &&
@@ -98,6 +100,7 @@ export async function getLatestAuthenticatedKnowledgeSnapshot(input: {
     .where(
       and(
         eq(knowledgeBaseSnapshots.userId, input.userId),
+        eq(knowledgeBaseSnapshots.status, "active"),
         gte(knowledgeBaseSnapshots.createdAt, input.notBefore),
       ),
     )

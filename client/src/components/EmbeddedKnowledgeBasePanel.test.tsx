@@ -221,7 +221,7 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "提交维护工单" }),
+      screen.getByRole("button", { name: "提交维护需求" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "下载成品 ZIP" })).toHaveAttribute(
       "href",
@@ -260,7 +260,7 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
       />,
     );
 
-    expect(screen.queryByRole("button", { name: "提交维护工单" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "提交维护需求" })).toBeNull();
     expect(
       screen.getByRole("button", { name: "申请重置知识库" }),
     ).toBeInTheDocument();

@@ -41,6 +41,10 @@ import {
 } from "./knowledge-snapshot-archive-store";
 import { classifyKnowledgeBaseUpstreamTaskStatus } from "./knowledge-base-progress";
 import { assertExpectedUpstreamTaskId } from "./upstream-task-adapter";
+import {
+  lockActiveWebsiteProjectLifecycle,
+  WebsiteProjectInactiveError,
+} from "./website-project-lifecycle";
 
 const sha256Schema = z
   .string()
@@ -131,6 +135,7 @@ export type KnowledgeImportErrorCode =
   | "IDEMPOTENCY_PENDING"
   | "RECEIPT_DATA_INCOMPLETE"
   | "SERVICE_NOT_WRITABLE"
+  | "PROJECT_DELETED"
   | "DATABASE_UNAVAILABLE"
   | "KNOWLEDGE_IMPORT_FAILED";
 
@@ -143,6 +148,19 @@ export class KnowledgeImportError extends Error {
   ) {
     super(message);
     this.name = "KnowledgeImportError";
+  }
+}
+
+async function lockActiveKnowledgeImportProject(tx: any, projectId: string) {
+  try {
+    await lockActiveWebsiteProjectLifecycle(tx, projectId);
+  } catch (error) {
+    if (!(error instanceof WebsiteProjectInactiveError)) throw error;
+    throw new KnowledgeImportError(
+      "PROJECT_DELETED",
+      "项目已被永久删除，不能再写入知识库导入回执",
+      410,
+    );
   }
 }
 
@@ -390,6 +408,7 @@ async function reserveReceipt(input: {
   const db = await requireImportDb();
   const keyHash = idempotencyHash(input.idempotencyKey);
   return db.transaction(async (tx) => {
+    await lockActiveKnowledgeImportProject(tx, input.projectId);
     const rows = await tx
       .select()
       .from(knowledgeImportReceipts)
@@ -580,27 +599,37 @@ async function markReceiptFailed(
   error: unknown,
 ) {
   const db = await requireImportDb();
-  await db
-    .update(knowledgeImportReceipts)
-    .set({
-      status: "failed",
-      errorCode:
-        error instanceof KnowledgeImportError
-          ? error.code
-          : "KNOWLEDGE_IMPORT_FAILED",
-      errorMessage: (error instanceof Error
-        ? error.message
-        : "知识库同步失败"
-      ).slice(0, 2000),
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(knowledgeImportReceipts.id, receiptId),
-        eq(knowledgeImportReceipts.status, "processing"),
-        eq(knowledgeImportReceipts.revision, claimRevision),
-      ),
-    );
+  const bindings = await db
+    .select({ projectId: knowledgeImportReceipts.projectId })
+    .from(knowledgeImportReceipts)
+    .where(eq(knowledgeImportReceipts.id, receiptId))
+    .limit(1);
+  await db.transaction(async (tx) => {
+    if (bindings[0]?.projectId) {
+      await lockActiveKnowledgeImportProject(tx, bindings[0].projectId);
+    }
+    await tx
+      .update(knowledgeImportReceipts)
+      .set({
+        status: "failed",
+        errorCode:
+          error instanceof KnowledgeImportError
+            ? error.code
+            : "KNOWLEDGE_IMPORT_FAILED",
+        errorMessage: (error instanceof Error
+          ? error.message
+          : "知识库同步失败"
+        ).slice(0, 2000),
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(knowledgeImportReceipts.id, receiptId),
+          eq(knowledgeImportReceipts.status, "processing"),
+          eq(knowledgeImportReceipts.revision, claimRevision),
+        ),
+      );
+  });
 }
 
 async function readImportReceiptState(receiptId: string) {

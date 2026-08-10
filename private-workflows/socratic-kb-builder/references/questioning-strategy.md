@@ -30,7 +30,9 @@ The first customer-visible answer must:
   whose bytes were validated, assigned a stable asset ID and associated only
   with the first leaf. A Logo extracted from initial enterprise material uses
   `official_document`; `official_logo_upload` is reserved for Dashboard's later
-  post-manifest Logo-required upload control.
+  post-manifest Logo-required upload control. For an `official_web` SVG source,
+  use the returned supported raster as Dashboard's bound asset according to
+  `references/output-format.md`; the source URLs remain provenance.
 - If no eligible Logo exists after bounded discovery and the initial task has no
   qualifying official-document Logo material, show no image but still emit the
   full first leaf and complete manifest. The Dashboard requests a Logo outside
@@ -71,11 +73,13 @@ Interpret user input narrowly:
   `direct_prefilled`.
 - Any correction, supplement, question, or customer upload →
   `needs_verification`; update and re-present the same leaf. Only files the
-  server-owned instructions/finalization ledger explicitly classifies as
+  application-managed workflow ledger explicitly classifies as
   `customerAttachments` or `customer_upload` are customer uploads. Skill,
-  instructions, prefill, evidence and finalization files are system inputs and
-  never change the declared action. A turn containing a customer upload never
-  advances, even when its text contains confirmation language.
+  instructions, prefill, evidence and finalization files are
+  application-managed workflow inputs, not customer uploads, and do not change
+  the action recorded in the current state coordinates. A turn containing a
+  customer upload never advances, even when its text contains confirmation
+  language.
 - While the first-leaf Logo requirement is unresolved, confirmation and direct
   prefill do not advance. A qualifying Logo upload resolves only that
   requirement, remains on the same first leaf as `needs_verification`, and must
@@ -105,9 +109,10 @@ select a business, hero, product, UI, architecture, case or other image. If none
 is eligible, return no image and rely on the Dashboard's external Logo-required
 state. Use an available Logo's caption and alt text from
 `00_package_manifest.json`. Never show a filename or remote URL as if it were a
-successfully packaged image. Never return an image attachment on a later
+successfully packaged image. Apply the official-web conversion contract in
+`references/output-format.md`. Never return an image attachment on a later
 confirmation or current-leaf revision turn; a later `official_logo_upload` is
-Dashboard-rendered and retained only for the final archive.
+Dashboard-rendered and retained byte-identically only for the final archive.
 
 ## Final turn
 

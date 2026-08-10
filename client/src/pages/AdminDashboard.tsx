@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   Activity,
   Bot,
@@ -45,6 +45,7 @@ import {
   previewAdminWorkspaceHref,
 } from "@/lib/preview-navigation";
 import { isSystemAdminAccount } from "@/lib/admin-access";
+import { formatBrandTrackingCredits } from "@shared/brand-tracking-credits";
 import {
   DELIVERY_ROLE_LABELS,
   type DeliveryRoleType,
@@ -417,7 +418,7 @@ export const adminNav: PortalNavItem[] = [
     href: "/admin/workspace",
     icon: UserCog,
     group: "客户与服务",
-    activePrefixes: ["/admin/customers"],
+    activePrefixes: ["/admin/customers", "/admin/delivery-workbench"],
   },
   {
     label: "客户项目团队",
@@ -426,7 +427,7 @@ export const adminNav: PortalNavItem[] = [
     group: "客户与服务",
   },
   {
-    label: "工单管理",
+    label: "需求管理",
     href: "/admin/dispatch",
     icon: ClipboardList,
     group: "客户与服务",
@@ -472,7 +473,7 @@ export function getAdminNav(systemAdmin: boolean) {
       group: "交付管理",
     },
     {
-      label: "工单",
+      label: "需求",
       href: "/admin/dispatch",
       icon: ClipboardList,
       group: "交付管理",
@@ -757,7 +758,127 @@ type OverviewApiKeyTarget = {
   username: string;
   configured: boolean;
   version: number;
+  relatedTicketId?: string;
 };
+
+export type JenovaBrandTrackingCredentialRow = {
+  userId: number;
+  username: string;
+  displayName: string;
+  keyConfigured: boolean;
+  credentialId: string | null;
+  fingerprint: string | null;
+  rolling30DayCost: string;
+  lifetimeCost: string;
+  sharedKeyAttributedCost: string;
+  sharedAccountCount: number;
+  balance: string | null;
+  balanceSyncedAt: number | string | Date | null;
+  limit: string;
+  status: string;
+};
+
+function moneyString(value: unknown, fallback = "0.00000000") {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return /^\d+(?:\.\d{1,8})?$/.test(normalized) ? normalized : fallback;
+}
+
+export function normalizeJenovaBrandTrackingCredentialRows(
+  value: unknown,
+): JenovaBrandTrackingCredentialRow[] {
+  const source = Array.isArray((value as any)?.users)
+    ? (value as any).users
+    : [];
+  return source.flatMap((entry: any) => {
+    const userId = Number(entry?.userId);
+    if (!Number.isSafeInteger(userId) || userId <= 0) return [];
+    return [
+      {
+        userId,
+        username: String(entry?.username || `customer-${userId}`),
+        displayName: String(
+          entry?.displayName || entry?.username || `客户 ${userId}`,
+        ),
+        keyConfigured: entry?.keyConfigured === true,
+        credentialId:
+          typeof entry?.credentialId === "string" && entry.credentialId
+            ? entry.credentialId
+            : null,
+        fingerprint:
+          typeof entry?.fingerprint === "string" && entry.fingerprint
+            ? entry.fingerprint
+            : null,
+        rolling30DayCost: moneyString(entry?.rolling30DayCost),
+        lifetimeCost: moneyString(entry?.lifetimeCost),
+        sharedKeyAttributedCost: moneyString(entry?.sharedKeyAttributedCost),
+        sharedAccountCount: Math.max(
+          0,
+          Number.isSafeInteger(Number(entry?.sharedAccountCount))
+            ? Number(entry.sharedAccountCount)
+            : 0,
+        ),
+        balance:
+          entry?.balance === null || entry?.balance === undefined
+            ? null
+            : moneyString(entry.balance),
+        balanceSyncedAt: entry?.balanceSyncedAt ?? null,
+        limit: moneyString(entry?.limit, "10.00000000"),
+        status: String(
+          entry?.status || (entry?.keyConfigured ? "active" : "unconfigured"),
+        ),
+      },
+    ];
+  });
+}
+
+export function formatJenovaCredits(value: string | null) {
+  return formatBrandTrackingCredits(value);
+}
+
+export type CredentialManagementDeepLink = {
+  credentialType: "managed_api" | "jenova_brand_tracking";
+  kind: OverviewApiKeyTarget["kind"];
+  userId: number;
+  relatedTicketId?: string;
+};
+
+export function parseCredentialManagementDeepLink(
+  search: string,
+): CredentialManagementDeepLink | null {
+  const params = new URLSearchParams(search);
+  const userId = Number(params.get("credentialUserId"));
+  const credentialType = params.get("credentialType") || "managed_api";
+  const requestedKind = params.get("credentialKind");
+  const kind =
+    credentialType === "jenova_brand_tracking" && !requestedKind
+      ? "customer"
+      : requestedKind;
+  if (
+    !Number.isInteger(userId) ||
+    userId <= 0 ||
+    !["managed_api", "jenova_brand_tracking"].includes(credentialType) ||
+    !["customer", "delivery_admin", "system_admin", "engineer"].includes(
+      kind || "",
+    ) ||
+    (credentialType === "jenova_brand_tracking" && kind !== "customer")
+  ) {
+    return null;
+  }
+  const relatedTicketId = params.get("relatedTicketId")?.trim() || undefined;
+  if (
+    relatedTicketId &&
+    !/^[0-9a-f]{8}-[0-9a-f-]{27}$/iu.test(relatedTicketId)
+  ) {
+    return null;
+  }
+  return {
+    credentialType:
+      credentialType as CredentialManagementDeepLink["credentialType"],
+    kind: kind as OverviewApiKeyTarget["kind"],
+    userId,
+    ...(relatedTicketId ? { relatedTicketId } : {}),
+  };
+}
 
 export type KeyManagementRow = OverviewApiKeyTarget & {
   typeLabel: string;
@@ -876,6 +997,9 @@ function AdminOverviewApiKeyDialog({
         reason: "API与人员管理统一入口替换账号 API Key",
         confirmation: "REPLACE_API_KEY",
         allowIncompleteHistory,
+        ...(target.relatedTicketId
+          ? { relatedTicketId: target.relatedTicketId }
+          : {}),
       });
       await onSaved();
       toast.success(
@@ -929,6 +1053,9 @@ function AdminOverviewApiKeyDialog({
             <DialogDescription>
               {target?.displayName} · @{target?.username}。Key
               仅在服务端加密保存，不会在页面返回明文。
+              {target?.relatedTicketId
+                ? " 配置并验证成功后，关联的历史工单会自动以非敏感结果关闭。"
+                : ""}
             </DialogDescription>
           </DialogHeader>
           <form className="space-y-4" onSubmit={requestSaveConfirmation}>
@@ -1512,6 +1639,516 @@ function AdminBulkApiKeyDialog({
   );
 }
 
+export function AdminJenovaBrandTrackingKeyManager({
+  previewMode,
+  deepLink,
+  restrictedUserId,
+}: {
+  previewMode: boolean;
+  deepLink?: Pick<CredentialManagementDeepLink, "userId" | "relatedTicketId">;
+  restrictedUserId?: number;
+}) {
+  const listQuery = (trpc.admin as any).brandTrackingCredentials.list.useQuery(
+    undefined,
+    {
+      enabled: !previewMode,
+      retry: false,
+      refetchOnWindowFocus: false,
+    },
+  );
+  const configureMutation = (
+    trpc.admin as any
+  ).brandTrackingCredentials.configure.useMutation();
+  const bulkAssignMutation = (
+    trpc.admin as any
+  ).brandTrackingCredentials.bulkAssign.useMutation();
+  const revokeMutation = (
+    trpc.admin as any
+  ).brandTrackingCredentials.revoke.useMutation();
+  const refreshBalanceMutation = (
+    trpc.admin as any
+  ).brandTrackingCredentials.refreshBalance.useMutation();
+  const [search, setSearch] = useState("");
+  const [target, setTarget] = useState<JenovaBrandTrackingCredentialRow | null>(
+    null,
+  );
+  const [deepLinkOpened, setDeepLinkOpened] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkApiKey, setBulkApiKey] = useState("");
+  const [selectedUserIds, setSelectedUserIds] = useState<number[]>([]);
+  const allRows = normalizeJenovaBrandTrackingCredentialRows(listQuery.data);
+  const rows = restrictedUserId
+    ? allRows.filter((row) => row.userId === restrictedUserId)
+    : allRows;
+  const normalizedSearch = search.trim().toLocaleLowerCase();
+  const visibleRows = rows.filter((row) =>
+    `${row.displayName} ${row.username}`
+      .toLocaleLowerCase()
+      .includes(normalizedSearch),
+  );
+  const busy =
+    configureMutation.isPending ||
+    bulkAssignMutation.isPending ||
+    revokeMutation.isPending;
+
+  const closeTarget = () => {
+    if (busy) return;
+    setTarget(null);
+    setApiKey("");
+  };
+  const closeBulk = () => {
+    if (busy) return;
+    setBulkOpen(false);
+    setBulkApiKey("");
+    setSelectedUserIds([]);
+  };
+  const refresh = async () => {
+    await listQuery.refetch();
+  };
+
+  useEffect(() => {
+    if (previewMode || !deepLink || deepLinkOpened) return;
+    const linkedTarget = rows.find((row) => row.userId === deepLink.userId);
+    if (!linkedTarget) return;
+    setSearch("");
+    setTarget(linkedTarget);
+    setDeepLinkOpened(true);
+  }, [deepLink, deepLinkOpened, previewMode, rows]);
+
+  return (
+    <div data-testid="jenova-brand-tracking-key-manager">
+      <div className="flex flex-col gap-3 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
+        {!restrictedUserId && (
+          <Input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="搜索海外客户账号或企业名称"
+            aria-label="搜索品牌追踪 Key 管理账号"
+            className="h-9 bg-white lg:w-80"
+          />
+        )}
+        <div className="flex flex-wrap gap-2">
+          {!restrictedUserId && (
+            <Button
+              type="button"
+              size="sm"
+              disabled={previewMode || rows.length === 0}
+              onClick={() => {
+                setSelectedUserIds([]);
+                setBulkOpen(true);
+              }}
+            >
+              <UsersRound className="h-4 w-4" />
+              批量分配品牌追踪 Key
+            </Button>
+          )}
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={
+              previewMode ||
+              refreshBalanceMutation.isPending ||
+              !rows.some((row) => row.credentialId)
+            }
+            onClick={async () => {
+              const credentialIds = Array.from(
+                new Set(
+                  rows.flatMap((row) =>
+                    row.credentialId ? [row.credentialId] : [],
+                  ),
+                ),
+              );
+              try {
+                await Promise.all(
+                  credentialIds.map((credentialId) =>
+                    refreshBalanceMutation.mutateAsync({ credentialId }),
+                  ),
+                );
+                await refresh();
+                toast.success(
+                  `已刷新 ${credentialIds.length} 把唯一 Key 的积分余额`,
+                );
+              } catch (error) {
+                toast.error("Jenova 积分余额刷新失败", {
+                  description:
+                    error instanceof Error ? error.message : "请稍后重试",
+                });
+              }
+            }}
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${
+                refreshBalanceMutation.isPending ? "animate-spin" : ""
+              }`}
+            />
+            {refreshBalanceMutation.isPending
+              ? "刷新中"
+              : "刷新唯一 Key 积分余额"}
+          </Button>
+        </div>
+      </div>
+
+      {previewMode ? (
+        <div className="p-6 text-sm text-[#716a80]">
+          品牌追踪 Key 仅在真实系统管理员环境中配置。
+        </div>
+      ) : listQuery.isLoading ? (
+        <div className="p-6 text-sm text-[#716a80]">
+          正在读取海外客户的 Jenova Key 与积分…
+        </div>
+      ) : listQuery.error ? (
+        <div className="p-6 text-sm text-[#a02652]">
+          品牌追踪 Key 管理数据暂时无法读取。
+        </div>
+      ) : visibleRows.length === 0 ? (
+        <div className="p-6 text-sm text-[#716a80]">
+          没有符合条件的海外客户账号。
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <div className="min-w-[1240px]">
+            <div className="grid grid-cols-[minmax(190px,1.2fr)_170px_130px_130px_150px_130px_160px] gap-4 border-b border-[#eee8f2] px-5 py-3 text-xs font-medium text-[#716a80] sm:px-6">
+              <span>海外客户</span>
+              <span>Key 状态</span>
+              <span>近 30 天积分</span>
+              <span>累计积分</span>
+              <span>共享 Key 归因积分</span>
+              <span>Jenova 积分余额</span>
+              <span>操作</span>
+            </div>
+            {visibleRows.map((row) => (
+              <div
+                key={row.userId}
+                className="grid grid-cols-[minmax(190px,1.2fr)_170px_130px_130px_150px_130px_160px] items-center gap-4 border-b border-[#eee8f2] px-5 py-4 last:border-b-0 sm:px-6"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-[#332842]">
+                    {row.displayName}
+                  </p>
+                  <p className="mt-1 truncate text-xs text-[#857e91]">
+                    @{row.username} · 上限 {formatJenovaCredits(row.limit)}
+                  </p>
+                </div>
+                <div className="text-xs">
+                  <p
+                    className={
+                      row.keyConfigured
+                        ? "font-medium text-[#16794f]"
+                        : "font-medium text-[#a02652]"
+                    }
+                  >
+                    {row.keyConfigured
+                      ? "Jenova Key 已配置"
+                      : "Jenova Key 待配置"}
+                  </p>
+                  {row.keyConfigured && (
+                    <p className="mt-1 text-[#857e91]">
+                      {row.sharedAccountCount > 1
+                        ? `同一 Key 供 ${row.sharedAccountCount} 个账号使用`
+                        : "当前账号独享"}
+                    </p>
+                  )}
+                </div>
+                <p className="text-sm font-semibold tabular-nums text-[#5b2a86]">
+                  {formatJenovaCredits(row.rolling30DayCost)}
+                </p>
+                <p className="text-sm font-semibold tabular-nums text-[#332842]">
+                  {formatJenovaCredits(row.lifetimeCost)}
+                </p>
+                <div>
+                  <p className="text-sm font-semibold tabular-nums text-[#332842]">
+                    {formatJenovaCredits(row.sharedKeyAttributedCost)}
+                  </p>
+                  <p className="mt-1 text-xs text-[#857e91]">
+                    Dashboard 可归因积分
+                  </p>
+                </div>
+                <div>
+                  <p className="text-sm font-semibold tabular-nums text-[#332842]">
+                    {formatJenovaCredits(row.balance)}
+                  </p>
+                  <p className="mt-1 text-xs text-[#857e91]">
+                    {row.balanceSyncedAt ? "上游已同步" : "尚未刷新"}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={row.keyConfigured ? "outline" : "default"}
+                    onClick={() => setTarget(row)}
+                  >
+                    <KeyRound className="h-3.5 w-3.5" />
+                    {row.keyConfigured ? "更换" : "配置"}
+                  </Button>
+                  {row.credentialId && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      aria-label={`刷新 ${row.displayName} 的 Jenova Key 积分余额`}
+                      disabled={refreshBalanceMutation.isPending}
+                      onClick={async () => {
+                        try {
+                          await refreshBalanceMutation.mutateAsync({
+                            credentialId: row.credentialId,
+                          });
+                          await refresh();
+                        } catch (error) {
+                          toast.error("Jenova 积分余额刷新失败", {
+                            description:
+                              error instanceof Error
+                                ? error.message
+                                : "请稍后重试",
+                          });
+                        }
+                      }}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <Dialog
+        open={Boolean(target)}
+        onOpenChange={(open) => !open && closeTarget()}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>
+              {target?.keyConfigured ? "更换" : "配置"}品牌追踪 Jenova Key
+            </DialogTitle>
+            <DialogDescription>
+              {target?.displayName} · @{target?.username}。系统会验证
+              brand-tracker Agent 和当前积分余额，明文 Key 不会返回浏览器。
+              {deepLink?.relatedTicketId
+                ? " 配置并验证成功后，关联的历史工单会自动以非敏感结果关闭。"
+                : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            className="space-y-4"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (!target || apiKey.trim().length < 8) return;
+              try {
+                await configureMutation.mutateAsync({
+                  userId: target.userId,
+                  apiKey: apiKey.trim(),
+                  ...(deepLink?.relatedTicketId
+                    ? { relatedTicketId: deepLink.relatedTicketId }
+                    : {}),
+                });
+                await refresh();
+                toast.success("品牌追踪 Jenova Key 已配置");
+                closeTarget();
+              } catch (error) {
+                toast.error("Jenova Key 配置失败", {
+                  description:
+                    error instanceof Error ? error.message : "请稍后重试",
+                });
+              }
+            }}
+          >
+            <div className="space-y-2">
+              <Label htmlFor="jenova-brand-tracking-key">Jenova API Key</Label>
+              <Input
+                id="jenova-brand-tracking-key"
+                type="password"
+                autoComplete="off"
+                value={apiKey}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder="输入后验证并加密保存"
+                disabled={busy}
+              />
+            </div>
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
+              <Button
+                type="button"
+                variant="outline"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                disabled={busy || !target?.keyConfigured}
+                onClick={async () => {
+                  if (!target) return;
+                  try {
+                    await revokeMutation.mutateAsync({ userId: target.userId });
+                    await refresh();
+                    toast.success("品牌追踪 Jenova Key 分配已撤销");
+                    closeTarget();
+                  } catch (error) {
+                    toast.error("Jenova Key 撤销失败", {
+                      description:
+                        error instanceof Error ? error.message : "请稍后重试",
+                    });
+                  }
+                }}
+              >
+                撤销分配
+              </Button>
+              <div className="flex justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={closeTarget}
+                >
+                  取消
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={busy || apiKey.trim().length < 8}
+                >
+                  {configureMutation.isPending && (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  )}
+                  验证并保存
+                </Button>
+              </div>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={bulkOpen} onOpenChange={(open) => !open && closeBulk()}>
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>批量分配品牌追踪 Jenova Key</DialogTitle>
+            <DialogDescription>
+              同一把物理 Key
+              只保存一份，可明确分配给多个海外客户；个人积分仍按每轮实际使用分别归因。
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            className="space-y-4"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (!selectedUserIds.length || bulkApiKey.trim().length < 8)
+                return;
+              try {
+                await bulkAssignMutation.mutateAsync({
+                  userIds: selectedUserIds,
+                  apiKey: bulkApiKey.trim(),
+                });
+                await refresh();
+                toast.success(
+                  `已为 ${selectedUserIds.length} 个海外账号分配 Jenova Key`,
+                );
+                closeBulk();
+              } catch (error) {
+                toast.error("Jenova Key 批量分配失败", {
+                  description:
+                    error instanceof Error ? error.message : "请稍后重试",
+                });
+              }
+            }}
+          >
+            <div className="flex items-center justify-between">
+              <Label>选择海外客户</Label>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  setSelectedUserIds(
+                    selectedUserIds.length === rows.length
+                      ? []
+                      : rows.map((row) => row.userId),
+                  )
+                }
+              >
+                {selectedUserIds.length === rows.length
+                  ? "取消全选"
+                  : "选择全部"}
+              </Button>
+            </div>
+            <div className="max-h-72 space-y-2 overflow-y-auto rounded-xl border p-2">
+              {rows.map((row) => (
+                <label
+                  key={row.userId}
+                  className="flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2 hover:bg-muted/50"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedUserIds.includes(row.userId)}
+                    onChange={(event) =>
+                      setSelectedUserIds((current) =>
+                        event.target.checked
+                          ? [...current, row.userId]
+                          : current.filter((userId) => userId !== row.userId),
+                      )
+                    }
+                  />
+                  <span className="min-w-0 flex-1">
+                    <strong className="block truncate text-sm">
+                      {row.displayName}
+                    </strong>
+                    <small className="text-muted-foreground">
+                      @{row.username}
+                    </small>
+                  </span>
+                  <small
+                    className={
+                      row.keyConfigured
+                        ? "text-amber-700"
+                        : "text-muted-foreground"
+                    }
+                  >
+                    {row.keyConfigured ? "将替换现有分配" : "待配置"}
+                  </small>
+                </label>
+              ))}
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="bulk-jenova-brand-tracking-key">
+                Jenova API Key
+              </Label>
+              <Input
+                id="bulk-jenova-brand-tracking-key"
+                type="password"
+                autoComplete="off"
+                value={bulkApiKey}
+                onChange={(event) => setBulkApiKey(event.target.value)}
+                placeholder="同一 Key 分配给所有已选账号"
+                disabled={busy}
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={busy}
+                onClick={closeBulk}
+              >
+                取消
+              </Button>
+              <Button
+                type="submit"
+                disabled={
+                  busy ||
+                  !selectedUserIds.length ||
+                  bulkApiKey.trim().length < 8
+                }
+              >
+                {bulkAssignMutation.isPending && (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                )}
+                验证并分配给 {selectedUserIds.length} 个账号
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
 export default function AdminDashboard({
   preview = false,
   previewAccessLevel = "system_admin",
@@ -1564,10 +2201,21 @@ export default function AdminDashboard({
     null,
   );
   const [bulkApiKeyOpen, setBulkApiKeyOpen] = useState(false);
+  const [apiKeyManagementTab, setApiKeyManagementTab] = useState<
+    "general" | "brand_tracking"
+  >("general");
   const [keyAccountType, setKeyAccountType] = useState<
     "all" | OverviewApiKeyTarget["kind"]
   >("all");
   const [keyAccountSearch, setKeyAccountSearch] = useState("");
+  const [credentialDeepLink] = useState<CredentialManagementDeepLink | null>(
+    () =>
+      previewMode || typeof window === "undefined"
+        ? null
+        : parseCredentialManagementDeepLink(window.location.search),
+  );
+  const [credentialDeepLinkOpened, setCredentialDeepLinkOpened] =
+    useState(false);
   const navItems = previewMode
     ? getPreviewAdminNav(systemAdmin)
     : getAdminNav(systemAdmin);
@@ -1773,6 +2421,53 @@ export default function AdminDashboard({
     (row) => !row.configured,
   ).length;
 
+  useEffect(() => {
+    if (
+      systemAdmin &&
+      credentialDeepLink?.credentialType === "jenova_brand_tracking"
+    ) {
+      setApiKeyManagementTab("brand_tracking");
+    }
+  }, [credentialDeepLink, systemAdmin]);
+
+  useEffect(() => {
+    if (
+      previewMode ||
+      !systemAdmin ||
+      !credentialDeepLink ||
+      credentialDeepLink.credentialType !== "managed_api" ||
+      credentialDeepLinkOpened
+    ) {
+      return;
+    }
+    const target = keyManagementRows.find(
+      (row) =>
+        row.kind === credentialDeepLink.kind &&
+        row.userId === credentialDeepLink.userId,
+    );
+    if (!target) return;
+    setKeyAccountType(target.kind);
+    setKeyAccountSearch("");
+    setApiKeyTarget({
+      kind: target.kind,
+      userId: target.userId,
+      displayName: target.displayName,
+      username: target.username,
+      configured: target.configured,
+      version: target.version,
+      ...(credentialDeepLink.relatedTicketId
+        ? { relatedTicketId: credentialDeepLink.relatedTicketId }
+        : {}),
+    });
+    setCredentialDeepLinkOpened(true);
+  }, [
+    credentialDeepLink,
+    credentialDeepLinkOpened,
+    keyManagementRows,
+    previewMode,
+    systemAdmin,
+  ]);
+
   return (
     <PortalShell
       eyebrow="FrontMind 管理中心"
@@ -1799,238 +2494,288 @@ export default function AdminDashboard({
                   <h2 className="font-semibold text-[#171321]">
                     统一 API Key 管理
                   </h2>
-                  <span
-                    className={`rounded-full px-2.5 py-1 text-xs font-medium ${
-                      missingKeyCount > 0
-                        ? "bg-[#fff1f4] text-[#a02652]"
-                        : "bg-[#eaf7f0] text-[#16794f]"
-                    }`}
-                  >
-                    {missingKeyCount > 0
-                      ? `${missingKeyCount} 个待配置`
-                      : "全部已配置"}
-                  </span>
+                  {apiKeyManagementTab === "general" && (
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+                        missingKeyCount > 0
+                          ? "bg-[#fff1f4] text-[#a02652]"
+                          : "bg-[#eaf7f0] text-[#16794f]"
+                      }`}
+                    >
+                      {missingKeyCount > 0
+                        ? `${missingKeyCount} 个待配置`
+                        : "全部已配置"}
+                    </span>
+                  )}
                 </div>
                 <p className="mt-1 text-sm leading-6 text-[#716a80]">
-                  客户、系统管理员、交付管理员和工程师使用同一套管理入口；交付管理员端不展示
-                  Key 配置能力。相同物理 Key 或属于同一上游账号的 Key
-                  可能共享同一积分池总额；账号自用量单独归因，无法完整归因时不会误显示为
-                  0。
+                  {apiKeyManagementTab === "general"
+                    ? "客户、系统管理员、交付管理员和工程师使用同一套管理入口；通用 Agent Key 由系统管理员统一维护，账号自用量单独归因，无法完整归因时不会误显示为 0。"
+                    : "只为海外客户分配 Jenova Brand Tracker Key。不同客户可以共享同一 Key，个人积分仍按每轮实际用量分别归因。"}
                 </p>
               </div>
-              {previewMode ? (
-                <span className="rounded-full border border-[#ddd4e5] bg-white px-3 py-1.5 text-xs font-medium text-[#716a80]">
-                  只读验收预览 · 近 30 天
-                </span>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    disabled={
-                      usageHierarchyQuery.isLoading ||
-                      deliveryRoleOverviewQuery.isLoading ||
-                      keyManagementRows.length === 0
-                    }
-                    onClick={() => setBulkApiKeyOpen(true)}
-                  >
-                    <UsersRound className="h-4 w-4" />
-                    批量配置 Key
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={
-                      usageHierarchyQuery.isFetching ||
-                      usageSyncMutation.isPending
-                    }
-                    onClick={() => usageSyncMutation.mutate()}
-                  >
-                    <RefreshCw
-                      className={`h-4 w-4 ${
+              {apiKeyManagementTab === "general" &&
+                (previewMode ? (
+                  <span className="rounded-full border border-[#ddd4e5] bg-white px-3 py-1.5 text-xs font-medium text-[#716a80]">
+                    只读验收预览 · 近 30 天
+                  </span>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={
+                        usageHierarchyQuery.isLoading ||
+                        deliveryRoleOverviewQuery.isLoading ||
+                        keyManagementRows.length === 0
+                      }
+                      onClick={() => setBulkApiKeyOpen(true)}
+                    >
+                      <UsersRound className="h-4 w-4" />
+                      批量配置 Key
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={
                         usageHierarchyQuery.isFetching ||
                         usageSyncMutation.isPending
-                          ? "animate-spin"
-                          : ""
-                      }`}
-                    />
-                    {usageHierarchyQuery.isFetching ||
-                    usageSyncMutation.isPending
-                      ? "同步中"
-                      : "刷新用量"}
-                  </Button>
-                </div>
-              )}
-            </div>
-
-            <div className="flex flex-col gap-3 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex flex-wrap gap-2">
-                {[
-                  ["all", "全部"],
-                  ["customer", "客户"],
-                  ["delivery_admin", "交付管理员"],
-                  ["system_admin", "系统管理员"],
-                  ["engineer", "工程师"],
-                ].map(([value, label]) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() =>
-                      setKeyAccountType(
-                        value as "all" | OverviewApiKeyTarget["kind"],
-                      )
-                    }
-                    className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
-                      keyAccountType === value
-                        ? "border-[#6f3a98] bg-[#6f3a98] text-white"
-                        : "border-[#ddd4e5] bg-white text-[#5f576c] hover:border-[#a98cbd]"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <Input
-                value={keyAccountSearch}
-                onChange={(event) => setKeyAccountSearch(event.target.value)}
-                placeholder="搜索账号、名称或负责人"
-                aria-label="搜索 Key 管理账号"
-                className="h-9 bg-white lg:w-72"
-              />
-            </div>
-
-            {usageHierarchyQuery.isLoading ||
-            deliveryRoleOverviewQuery.isLoading ? (
-              <div className="p-6 text-sm text-[#716a80]">
-                正在读取账号 Key 与积分…
-              </div>
-            ) : usageHierarchyQuery.error || deliveryRoleOverviewQuery.error ? (
-              <div className="p-6 text-sm text-[#a02652]">
-                Key 管理数据暂时无法读取。
-              </div>
-            ) : visibleKeyManagementRows.length === 0 ? (
-              <div className="p-6 text-sm text-[#716a80]">
-                没有符合当前筛选条件的账号。
-              </div>
-            ) : (
-              <div className="overflow-x-auto">
-                <div className="min-w-[1050px]">
-                  <div className="grid grid-cols-[minmax(200px,1.2fr)_110px_minmax(210px,1.2fr)_170px_130px_130px_140px] gap-4 border-b border-[#eee8f2] px-5 py-3 text-xs font-medium text-[#716a80] sm:px-6">
-                    <span>账号</span>
-                    <span>类型</span>
-                    <span>归属范围</span>
-                    <span>Key 状态</span>
-                    <span>近 30 天自用</span>
-                    <span>积分池总额</span>
-                    <span>操作</span>
-                  </div>
-                  {visibleKeyManagementRows.map((row) => (
-                    <div
-                      key={`${row.kind}-${row.userId}`}
-                      className="grid grid-cols-[minmax(200px,1.2fr)_110px_minmax(210px,1.2fr)_170px_130px_130px_140px] items-center gap-4 border-b border-[#eee8f2] px-5 py-4 last:border-b-0 sm:px-6"
+                      }
+                      onClick={() => usageSyncMutation.mutate()}
                     >
-                      <div className="min-w-0">
-                        <p className="truncate text-sm font-semibold text-[#332842]">
-                          {row.displayName}
-                        </p>
-                        <p className="mt-1 truncate text-xs text-[#857e91]">
-                          @{row.username}
-                        </p>
-                      </div>
-                      <span className="w-fit rounded-full bg-[#f3edf7] px-2.5 py-1 text-xs font-medium text-[#6a338f]">
-                        {row.typeLabel}
-                      </span>
-                      <p className="truncate text-sm text-[#5f576c]">
-                        {row.scopeLabel}
-                      </p>
-                      <div className="text-xs">
-                        <p
-                          className={
-                            row.configured
-                              ? "font-medium text-[#16794f]"
-                              : "font-medium text-[#a02652]"
-                          }
-                        >
-                          {row.configured
-                            ? (row.sharedKeyAccountCount ?? 0) > 1
-                              ? `共享 Key 已配置 · ${row.sharedKeyAccountCount} 个账号`
-                              : "账号 Key 已配置"
-                            : row.inherited
-                              ? "使用历史共享 Key"
-                              : "Key 待配置"}
-                        </p>
-                        {row.inherited && (
-                          <p className="mt-1 text-[#946800]">
-                            建议配置独立 Key
-                          </p>
-                        )}
-                      </div>
-                      <div>
-                        <p className="text-sm font-semibold text-[#5b2a86]">
-                          {row.syncStatus === "ok" && row.accountUsageComplete
-                            ? row.ownAgentMonthUsed.toLocaleString()
-                            : "—"}
-                        </p>
-                        {row.syncStatus === "ok" &&
-                          !row.accountUsageComplete && (
-                            <p className="mt-1 text-xs text-[#946800]">
-                              账号归因不完整
-                            </p>
-                          )}
-                      </div>
-                      <div>
-                        <p className="text-sm font-semibold text-[#332842]">
-                          {row.syncStatus === "ok"
-                            ? row.keyTotalUsed.toLocaleString()
-                            : "—"}
-                        </p>
-                        {row.syncStatus !== "ok" ? (
-                          <p className="mt-1 text-xs text-[#946800]">
-                            {row.syncStatus === "unconfigured"
-                              ? "尚未配置"
-                              : row.syncStatus === "pending"
-                                ? "等待同步"
-                                : "同步不完整"}
-                          </p>
-                        ) : !row.accountUsageComplete ? (
-                          <p className="mt-1 text-xs text-[#857e91]">
-                            上游总额完整
-                          </p>
-                        ) : row.keyTotalUsed > row.ownAgentMonthUsed ? (
-                          <p className="mt-1 text-xs text-[#857e91]">
-                            其他 {row.otherOrUnattributedUsed.toLocaleString()}
-                          </p>
-                        ) : null}
-                      </div>
-                      <Button
+                      <RefreshCw
+                        className={`h-4 w-4 ${
+                          usageHierarchyQuery.isFetching ||
+                          usageSyncMutation.isPending
+                            ? "animate-spin"
+                            : ""
+                        }`}
+                      />
+                      {usageHierarchyQuery.isFetching ||
+                      usageSyncMutation.isPending
+                        ? "同步中"
+                        : "刷新用量"}
+                    </Button>
+                  </div>
+                ))}
+            </div>
+
+            <div
+              className="flex gap-2 border-b border-[#eee8f2] px-5 py-3 sm:px-6"
+              role="tablist"
+              aria-label="API Key 管理类型"
+            >
+              {[
+                ["general", "通用 Agent Key"],
+                ["brand_tracking", "品牌追踪 Key"],
+              ].map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="tab"
+                  aria-selected={apiKeyManagementTab === value}
+                  onClick={() =>
+                    setApiKeyManagementTab(
+                      value as "general" | "brand_tracking",
+                    )
+                  }
+                  className={`rounded-full border px-4 py-2 text-sm font-medium transition ${
+                    apiKeyManagementTab === value
+                      ? "border-[#6f3a98] bg-[#6f3a98] text-white"
+                      : "border-[#ddd4e5] bg-white text-[#5f576c] hover:border-[#a98cbd]"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {apiKeyManagementTab === "general" ? (
+              <>
+                <div className="flex flex-col gap-3 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="flex flex-wrap gap-2">
+                    {[
+                      ["all", "全部"],
+                      ["customer", "客户"],
+                      ["delivery_admin", "交付管理员"],
+                      ["system_admin", "系统管理员"],
+                      ["engineer", "工程师"],
+                    ].map(([value, label]) => (
+                      <button
+                        key={value}
                         type="button"
-                        size="sm"
-                        variant={row.configured ? "outline" : "default"}
-                        disabled={previewMode}
-                        onClick={() => {
-                          if (previewMode) return;
-                          setApiKeyTarget({
-                            kind: row.kind,
-                            userId: row.userId,
-                            displayName: row.displayName,
-                            username: row.username,
-                            configured: row.configured,
-                            version: row.version,
-                          });
-                        }}
+                        onClick={() =>
+                          setKeyAccountType(
+                            value as "all" | OverviewApiKeyTarget["kind"],
+                          )
+                        }
+                        className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                          keyAccountType === value
+                            ? "border-[#6f3a98] bg-[#6f3a98] text-white"
+                            : "border-[#ddd4e5] bg-white text-[#5f576c] hover:border-[#a98cbd]"
+                        }`}
                       >
-                        <KeyRound className="h-3.5 w-3.5" />
-                        {previewMode
-                          ? "只读"
-                          : row.configured
-                            ? "更换 Key"
-                            : "配置 Key"}
-                      </Button>
-                    </div>
-                  ))}
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <Input
+                    value={keyAccountSearch}
+                    onChange={(event) =>
+                      setKeyAccountSearch(event.target.value)
+                    }
+                    placeholder="搜索账号、名称或负责人"
+                    aria-label="搜索 Key 管理账号"
+                    className="h-9 bg-white lg:w-72"
+                  />
                 </div>
-              </div>
+
+                {usageHierarchyQuery.isLoading ||
+                deliveryRoleOverviewQuery.isLoading ? (
+                  <div className="p-6 text-sm text-[#716a80]">
+                    正在读取账号 Key 与积分…
+                  </div>
+                ) : usageHierarchyQuery.error ||
+                  deliveryRoleOverviewQuery.error ? (
+                  <div className="p-6 text-sm text-[#a02652]">
+                    Key 管理数据暂时无法读取。
+                  </div>
+                ) : visibleKeyManagementRows.length === 0 ? (
+                  <div className="p-6 text-sm text-[#716a80]">
+                    没有符合当前筛选条件的账号。
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <div className="min-w-[1050px]">
+                      <div className="grid grid-cols-[minmax(200px,1.2fr)_110px_minmax(210px,1.2fr)_170px_130px_130px_140px] gap-4 border-b border-[#eee8f2] px-5 py-3 text-xs font-medium text-[#716a80] sm:px-6">
+                        <span>账号</span>
+                        <span>类型</span>
+                        <span>归属范围</span>
+                        <span>Key 状态</span>
+                        <span>近 30 天自用</span>
+                        <span>积分池总额</span>
+                        <span>操作</span>
+                      </div>
+                      {visibleKeyManagementRows.map((row) => (
+                        <div
+                          key={`${row.kind}-${row.userId}`}
+                          className="grid grid-cols-[minmax(200px,1.2fr)_110px_minmax(210px,1.2fr)_170px_130px_130px_140px] items-center gap-4 border-b border-[#eee8f2] px-5 py-4 last:border-b-0 sm:px-6"
+                        >
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-[#332842]">
+                              {row.displayName}
+                            </p>
+                            <p className="mt-1 truncate text-xs text-[#857e91]">
+                              @{row.username}
+                            </p>
+                          </div>
+                          <span className="w-fit rounded-full bg-[#f3edf7] px-2.5 py-1 text-xs font-medium text-[#6a338f]">
+                            {row.typeLabel}
+                          </span>
+                          <p className="truncate text-sm text-[#5f576c]">
+                            {row.scopeLabel}
+                          </p>
+                          <div className="text-xs">
+                            <p
+                              className={
+                                row.configured
+                                  ? "font-medium text-[#16794f]"
+                                  : "font-medium text-[#a02652]"
+                              }
+                            >
+                              {row.configured
+                                ? (row.sharedKeyAccountCount ?? 0) > 1
+                                  ? `共享 Key 已配置 · ${row.sharedKeyAccountCount} 个账号`
+                                  : "账号 Key 已配置"
+                                : row.inherited
+                                  ? "使用历史共享 Key"
+                                  : "Key 待配置"}
+                            </p>
+                            {row.inherited && (
+                              <p className="mt-1 text-[#946800]">
+                                建议配置独立 Key
+                              </p>
+                            )}
+                          </div>
+                          <div>
+                            <p className="text-sm font-semibold text-[#5b2a86]">
+                              {row.syncStatus === "ok" &&
+                              row.accountUsageComplete
+                                ? row.ownAgentMonthUsed.toLocaleString()
+                                : "—"}
+                            </p>
+                            {row.syncStatus === "ok" &&
+                              !row.accountUsageComplete && (
+                                <p className="mt-1 text-xs text-[#946800]">
+                                  账号归因不完整
+                                </p>
+                              )}
+                          </div>
+                          <div>
+                            <p className="text-sm font-semibold text-[#332842]">
+                              {row.syncStatus === "ok"
+                                ? row.keyTotalUsed.toLocaleString()
+                                : "—"}
+                            </p>
+                            {row.syncStatus !== "ok" ? (
+                              <p className="mt-1 text-xs text-[#946800]">
+                                {row.syncStatus === "unconfigured"
+                                  ? "尚未配置"
+                                  : row.syncStatus === "pending"
+                                    ? "等待同步"
+                                    : "同步不完整"}
+                              </p>
+                            ) : !row.accountUsageComplete ? (
+                              <p className="mt-1 text-xs text-[#857e91]">
+                                上游总额完整
+                              </p>
+                            ) : row.keyTotalUsed > row.ownAgentMonthUsed ? (
+                              <p className="mt-1 text-xs text-[#857e91]">
+                                其他{" "}
+                                {row.otherOrUnattributedUsed.toLocaleString()}
+                              </p>
+                            ) : null}
+                          </div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={row.configured ? "outline" : "default"}
+                            disabled={previewMode}
+                            onClick={() => {
+                              if (previewMode) return;
+                              setApiKeyTarget({
+                                kind: row.kind,
+                                userId: row.userId,
+                                displayName: row.displayName,
+                                username: row.username,
+                                configured: row.configured,
+                                version: row.version,
+                              });
+                            }}
+                          >
+                            <KeyRound className="h-3.5 w-3.5" />
+                            {previewMode
+                              ? "只读"
+                              : row.configured
+                                ? "更换 Key"
+                                : "配置 Key"}
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <AdminJenovaBrandTrackingKeyManager
+                previewMode={previewMode}
+                deepLink={
+                  credentialDeepLink?.credentialType === "jenova_brand_tracking"
+                    ? credentialDeepLink
+                    : undefined
+                }
+              />
             )}
           </PortalCard>
         )}

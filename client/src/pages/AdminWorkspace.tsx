@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import {
-  ClipboardList,
+  ArrowLeft,
   Loader2,
   PackageCheck,
+  PanelRightOpen,
   RefreshCw,
   UserCog,
 } from "lucide-react";
@@ -24,23 +25,13 @@ import {
   type WorkspaceTab,
 } from "@/lib/admin-workspace-tabs";
 import { trpc } from "@/lib/trpc";
-import { getAdminNav } from "@/pages/AdminDashboard";
+import {
+  AdminJenovaBrandTrackingKeyManager,
+  getAdminNav,
+} from "@/pages/AdminDashboard";
 
 export { ADMIN_WORKSPACE_TAB_IDS };
 export type { WorkspaceTab };
-
-export const ADMIN_WORKSPACE_TABS = [
-  { value: "service", label: "用户流程", icon: PackageCheck },
-  { value: "tickets", label: "工单", icon: ClipboardList },
-] as const satisfies ReadonlyArray<{
-  value: WorkspaceTab;
-  label: string;
-  icon: typeof PackageCheck;
-}>;
-
-export function adminWorkspaceTabsForAccess() {
-  return ADMIN_WORKSPACE_TABS;
-}
 
 function toDateTimeLocal(value?: number | string | Date | null) {
   if (!value) return "";
@@ -99,7 +90,6 @@ async function uploadWorkspaceFile(input: {
 
 export default function AdminWorkspace({
   initialUserId = null,
-  initialTab = "service",
 }: {
   initialUserId?: number | null;
   initialTab?: WorkspaceTab;
@@ -110,7 +100,7 @@ export default function AdminWorkspace({
   const [selectedUserId, setSelectedUserId] = useState<number | null>(
     initialUserId,
   );
-  const [tab, setTab] = useState<WorkspaceTab>(initialTab);
+  const [dashboardOpen, setDashboardOpen] = useState(false);
   const [servicePlan, setServicePlan] = useState<
     "basic" | "advanced" | "luxury"
   >("basic");
@@ -133,12 +123,10 @@ export default function AdminWorkspace({
     (item) => item.id === selectedUserId,
   );
   const isSystemAdmin = Boolean(workspaceQuery.data?.isSystemAdmin);
-  const availableTabs = adminWorkspaceTabsForAccess();
-
   useEffect(() => {
     setSelectedUserId(initialUserId);
-    setTab(initialTab);
-  }, [initialTab, initialUserId]);
+    setDashboardOpen(false);
+  }, [initialUserId]);
 
   const queryInput = { userId: selectedUserId || 1 };
   const dashboardQuery = trpc.admin.workspace.dashboard.useQuery(queryInput, {
@@ -331,6 +319,148 @@ export default function AdminWorkspace({
     }
   };
 
+  const customerKnowledgePreview = {
+    progress: knowledgeProgressQuery.data?.progress,
+    snapshot: knowledgeQuery.data?.snapshot,
+    activity: knowledgeActivityQuery.data,
+    activityLoading: knowledgeActivityQuery.isLoading,
+    activityError: knowledgeActivityQuery.error?.message ?? null,
+    progressLoading: knowledgeProgressQuery.isLoading,
+    progressError: knowledgeProgressQuery.error?.message ?? null,
+    snapshotLoading: knowledgeQuery.isLoading,
+    snapshotError: knowledgeQuery.error?.message ?? null,
+  };
+
+  const refreshDashboardWorkspace = async () => {
+    await Promise.all([
+      dashboardQuery.refetch(),
+      workspaceQuery.refetch(),
+      serviceQuery.refetch(),
+      questionPortfolioQuery.refetch(),
+      deliveryPreviewQuery.refetch(),
+    ]);
+  };
+  const brandTrackingManagement =
+    selectedUser?.marketEdition === "overseas" ? (
+      isSystemAdmin ? (
+        <AdminJenovaBrandTrackingKeyManager
+          previewMode={false}
+          restrictedUserId={selectedUser.id}
+        />
+      ) : (
+        <PortalCard className="p-6 text-sm leading-6 text-[#716a80]">
+          舆情监控由当前客户的 AI
+          运维工程师或系统管理员启用；交付管理员可在这里核对启用状态。
+        </PortalCard>
+      )
+    ) : undefined;
+
+  if (dashboardOpen && selectedUser) {
+    const customerName =
+      selectedUser.enterpriseName ||
+      selectedUser.displayName ||
+      selectedUser.username;
+
+    return (
+      <PortalShell
+        mode="fullscreen"
+        eyebrow="管理中心 · 客户与服务"
+        title={`${customerName} · 客户看板`}
+        navItems={getAdminNav(Boolean(workspaceQuery.data?.isSystemAdmin))}
+      >
+        {dashboardQuery.error ? (
+          <div className="grid h-full place-items-center overflow-y-auto p-5">
+            <PortalCard className="w-full max-w-xl border-[#ebc8d4] bg-[#fff8fa] p-6 text-sm text-[#a02652]">
+              <p className="font-semibold">客户看板暂时无法载入</p>
+              <p className="mt-1 leading-6">
+                {dashboardQuery.error.message || "请刷新后重试。"}
+              </p>
+              <Button
+                className="mt-4"
+                size="sm"
+                variant="operatorOutline"
+                onClick={() => setDashboardOpen(false)}
+              >
+                <ArrowLeft className="h-4 w-4" />
+                返回工作台
+              </Button>
+            </PortalCard>
+          </div>
+        ) : isSystemAdmin ? (
+          <DashboardSkeletonEditor
+            userId={selectedUser.id}
+            workspace={dashboardQuery.data}
+            loading={dashboardQuery.isLoading}
+            dashboardLayout="workspace"
+            marketEdition={selectedUser.marketEdition}
+            brandTrackingManagement={brandTrackingManagement}
+            onExitDashboard={() => setDashboardOpen(false)}
+            knowledgePreview={customerKnowledgePreview}
+            websiteWorkspace={websiteWorkspacePreview}
+            servicePortal={serviceQuery.data}
+            servicePortalLoading={serviceQuery.isLoading}
+            servicePortalError={serviceQuery.isError}
+            onRefreshServicePortal={() => serviceQuery.refetch()}
+            knowledgeUploading={uploading === "knowledge"}
+            onUploadKnowledge={handleUpload}
+            onOpenWebsiteWorkspace={() => setDashboardOpen(false)}
+            authoritativeQuestions={serviceQuery.data?.purchasedQuestions}
+            authoritativeQuestionsLoading={serviceQuery.isLoading}
+            authoritativeQuestionsError={serviceQuery.error?.message ?? null}
+            onWorkspaceChanged={refreshDashboardWorkspace}
+          />
+        ) : dashboardQuery.isLoading ? (
+          <div className="grid h-full place-items-center bg-white text-sm text-[#716a80]">
+            <div className="flex items-center gap-2">
+              <Loader2 className="h-5 w-5 animate-spin" />
+              正在读取客户看板…
+            </div>
+          </div>
+        ) : dashboardQuery.data?.payload ? (
+          <CustomerDashboardMirror
+            layout="workspace"
+            payload={dashboardQuery.data.payload}
+            websiteWorkspace={websiteWorkspacePreview}
+            servicePortal={serviceQuery.data}
+            servicePortalLoading={serviceQuery.isLoading}
+            servicePortalError={serviceQuery.isError}
+            marketEdition={selectedUser.marketEdition}
+            allowBrandTrackingManagement={Boolean(brandTrackingManagement)}
+            brandTrackingManagement={brandTrackingManagement}
+            onRefreshServicePortal={() => serviceQuery.refetch()}
+            knowledgePreview={customerKnowledgePreview}
+            heading={`${customerName} · 客户看板`}
+            editActions={
+              <Button
+                size="sm"
+                variant="operatorOutline"
+                onClick={() => setDashboardOpen(false)}
+              >
+                <ArrowLeft className="h-4 w-4" />
+                返回工作台
+              </Button>
+            }
+          />
+        ) : (
+          <div className="grid h-full place-items-center overflow-y-auto p-5">
+            <PortalCard className="w-full max-w-xl p-8 text-center text-sm text-[#716a80]">
+              <p>该客户尚未发布正式用户页面。</p>
+              <Button
+                className="mt-4"
+                size="sm"
+                variant="operatorOutline"
+                onClick={() => setDashboardOpen(false)}
+              >
+                <ArrowLeft className="h-4 w-4" />
+                返回工作台
+              </Button>
+            </PortalCard>
+          </div>
+        )}
+      </PortalShell>
+    );
+  }
+
   return (
     <PortalShell
       eyebrow="管理中心 · 客户与服务"
@@ -392,8 +522,9 @@ export default function AdminWorkspace({
                   key={account.id}
                   type="button"
                   onClick={() => {
+                    setDashboardOpen(false);
                     setSelectedUserId(account.id);
-                    setLocation(`/admin/customers/${account.id}/${tab}`);
+                    setLocation(`/admin/customers/${account.id}/workspace`);
                   }}
                   className={`w-full p-4 text-left transition ${
                     selectedUserId === account.id
@@ -431,7 +562,7 @@ export default function AdminWorkspace({
                     <Badge variant="secondary" className="text-xs">
                       {account.marketEdition === "overseas"
                         ? "海外版"
-                        : "海内版"}
+                        : "国内版"}
                     </Badge>
                     <Badge variant="secondary" className="text-xs">
                       管理员 {account.assignedAdmins.length}
@@ -564,30 +695,19 @@ export default function AdminWorkspace({
               )}
 
               <div className="mt-6 flex flex-wrap gap-2 border-t border-[#eee8f2] pt-4">
-                {availableTabs.map(({ value, label, icon: Icon }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => {
-                      setTab(value);
-                      setLocation(
-                        `/admin/customers/${selectedUser.id}/${value}`,
-                      );
-                    }}
-                    className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition ${
-                      tab === value
-                        ? "bg-[#5b2a86] text-white"
-                        : "bg-[#f3eef6] text-[#716a80] hover:text-[#5b2a86]"
-                    }`}
-                  >
-                    <Icon className="h-4 w-4" />
-                    {label}
-                  </button>
-                ))}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="operatorOutline"
+                  onClick={() => setDashboardOpen(true)}
+                >
+                  进入客户看板
+                  <PanelRightOpen className="h-4 w-4" />
+                </Button>
               </div>
             </PortalCard>
 
-            {tab === "service" && (
+            <>
               <div className="space-y-5">
                 <PortalCard className="p-5 sm:p-6">
                   <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
@@ -751,7 +871,7 @@ export default function AdminWorkspace({
 
                         <div className="lg:col-span-3 flex justify-end">
                           <Button
-                            className="bg-[#5b2a86] hover:bg-[#49216c]"
+                            variant="operator"
                             disabled={
                               !serviceStartsAt ||
                               updateServiceMutation.isPending
@@ -844,116 +964,11 @@ export default function AdminWorkspace({
                     )}
                 </PortalCard>
               </div>
-            )}
+            </>
 
-            {tab === "service" &&
-              (dashboardQuery.error ? (
-                <PortalCard className="border-[#ebc8d4] bg-[#fff8fa] p-6 text-sm text-[#a02652]">
-                  <p className="font-semibold">交付内容暂时无法载入</p>
-                  <p className="mt-1 leading-6">
-                    {dashboardQuery.error.message || "请刷新后重试。"}
-                  </p>
-                </PortalCard>
-              ) : (
-                <div className="space-y-5">
-                  {isSystemAdmin ? (
-                    <>
-                      <DashboardSkeletonEditor
-                        userId={selectedUser.id}
-                        workspace={dashboardQuery.data}
-                        loading={dashboardQuery.isLoading}
-                        knowledgePreview={{
-                          progress: knowledgeProgressQuery.data?.progress,
-                          snapshot: knowledgeQuery.data?.snapshot,
-                          activity: knowledgeActivityQuery.data,
-                          activityLoading: knowledgeActivityQuery.isLoading,
-                          activityError:
-                            knowledgeActivityQuery.error?.message ?? null,
-                          progressLoading: knowledgeProgressQuery.isLoading,
-                          progressError:
-                            knowledgeProgressQuery.error?.message ?? null,
-                          snapshotLoading: knowledgeQuery.isLoading,
-                          snapshotError: knowledgeQuery.error?.message ?? null,
-                        }}
-                        websiteWorkspace={websiteWorkspacePreview}
-                        servicePortal={serviceQuery.data}
-                        servicePortalLoading={serviceQuery.isLoading}
-                        servicePortalError={serviceQuery.isError}
-                        onRefreshServicePortal={() => serviceQuery.refetch()}
-                        knowledgeUploading={uploading === "knowledge"}
-                        onUploadKnowledge={handleUpload}
-                        onOpenWebsiteWorkspace={() => {
-                          setTab("tickets");
-                          setLocation(
-                            `/admin/customers/${selectedUser.id}/tickets`,
-                          );
-                        }}
-                        authoritativeQuestions={
-                          serviceQuery.data?.purchasedQuestions
-                        }
-                        authoritativeQuestionsLoading={serviceQuery.isLoading}
-                        authoritativeQuestionsError={
-                          serviceQuery.error?.message ?? null
-                        }
-                        onWorkspaceChanged={async () => {
-                          await Promise.all([
-                            dashboardQuery.refetch(),
-                            workspaceQuery.refetch(),
-                            serviceQuery.refetch(),
-                            questionPortfolioQuery.refetch(),
-                            deliveryPreviewQuery.refetch(),
-                          ]);
-                        }}
-                      />
-                      <DashboardVersionHistory
-                        userId={selectedUser.id}
-                        onWorkspaceChanged={async () => {
-                          await Promise.all([
-                            dashboardQuery.refetch(),
-                            workspaceQuery.refetch(),
-                          ]);
-                        }}
-                      />
-                    </>
-                  ) : dashboardQuery.isLoading ? (
-                    <PortalCard className="p-8 text-center text-sm text-[#716a80]">
-                      <Loader2 className="mx-auto mb-3 h-5 w-5 animate-spin" />
-                      正在读取客户正式页面…
-                    </PortalCard>
-                  ) : dashboardQuery.data?.payload ? (
-                    <CustomerDashboardMirror
-                      payload={dashboardQuery.data.payload}
-                      websiteWorkspace={websiteWorkspacePreview}
-                      servicePortal={serviceQuery.data}
-                      servicePortalLoading={serviceQuery.isLoading}
-                      servicePortalError={serviceQuery.isError}
-                      onRefreshServicePortal={() => serviceQuery.refetch()}
-                      knowledgePreview={{
-                        progress: knowledgeProgressQuery.data?.progress,
-                        snapshot: knowledgeQuery.data?.snapshot,
-                        activity: knowledgeActivityQuery.data,
-                        activityLoading: knowledgeActivityQuery.isLoading,
-                        activityError:
-                          knowledgeActivityQuery.error?.message ?? null,
-                        progressLoading: knowledgeProgressQuery.isLoading,
-                        progressError:
-                          knowledgeProgressQuery.error?.message ?? null,
-                        snapshotLoading: knowledgeQuery.isLoading,
-                        snapshotError: knowledgeQuery.error?.message ?? null,
-                      }}
-                    />
-                  ) : (
-                    <PortalCard className="p-8 text-center text-sm text-[#716a80]">
-                      {isSystemAdmin
-                        ? "该客户尚未发布正式用户页面；请先确认项目岗位是否已配齐，也可在客户工单中进入系统管理员处理工作台接管。"
-                        : "该客户尚未发布正式用户页面；请先确认项目岗位是否已配齐，并协调对应工程师处理。"}
-                    </PortalCard>
-                  )}
-                </div>
-              ))}
-
-            {tab === "tickets" && (
+            <>
               <AdminDeliveryTicketWorkspace
+                key={selectedUser.id}
                 userId={selectedUser.id}
                 enterpriseName={
                   selectedUser.enterpriseName ||
@@ -966,7 +981,18 @@ export default function AdminWorkspace({
                 canAdjustQuota={isSystemAdmin}
                 canExecuteDelivery={isSystemAdmin}
               />
-            )}
+              {isSystemAdmin && (
+                <DashboardVersionHistory
+                  userId={selectedUser.id}
+                  onWorkspaceChanged={async () => {
+                    await Promise.all([
+                      dashboardQuery.refetch(),
+                      workspaceQuery.refetch(),
+                    ]);
+                  }}
+                />
+              )}
+            </>
           </div>
         )}
       </div>

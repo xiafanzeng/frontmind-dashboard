@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   getCapability,
   getRouteCapability,
+  isCapabilityIncludedInPlan,
   normalizeServicePortal,
   type ServiceCapabilityKey,
 } from "./service-portal";
@@ -88,6 +89,7 @@ describe("service portal adapter", () => {
           category: "reputation",
           question: "品牌口碑有哪些可核验证据？",
           status: "selected",
+          responseLogicConfirmed: true,
         },
       ],
       historicalQuestions: [
@@ -174,6 +176,7 @@ describe("service portal adapter", () => {
       id: "question-1",
       kind: "reputation",
       sourceQuestionId: "question-old",
+      responseLogicConfirmed: true,
     });
     expect(portal.historicalQuestions[0]).toMatchObject({
       id: "question-old",
@@ -222,6 +225,7 @@ describe("service portal adapter", () => {
         planCode: "basic",
         planName: "普通版",
         status: "active",
+        source: "website",
       },
       capabilities: availableCapabilities(),
       knowledge: {
@@ -234,9 +238,44 @@ describe("service portal adapter", () => {
       allowed: false,
       effectiveStatus: "locked",
     });
-    expect(getCapability(portal, "knowledgeBuild").reason).toContain(
-      "不包含对话式知识库构建",
+    expect(getCapability(portal, "knowledgeBuild").reason).toBe(
+      "普通版不包含知识库智能体；知识库由 Website 流程自动同步至本账号，服务团队可补录。升级进阶版或豪华版后可解锁知识库智能体。",
     );
+    expect(portal.knowledgeBase.sourceLabel).toBe("Website 流程同步知识库");
+    expect(isCapabilityIncludedInPlan("basic", "knowledgeBuild")).toBe(false);
+    expect(isCapabilityIncludedInPlan("basic", "globalKeywords")).toBe(false);
+    expect(isCapabilityIncludedInPlan("basic", "knowledgeDisplay")).toBe(true);
+    expect(isCapabilityIncludedInPlan("basic", "contentAssets")).toBe(true);
+    expect(isCapabilityIncludedInPlan("unknown", "knowledgeBuild")).toBe(true);
+  });
+
+  it("defensively locks content assets while the knowledge workflow is unfinished", () => {
+    const portal = normalizeServicePortal({
+      schemaVersion: 1,
+      service: {
+        planCode: "advanced",
+        planName: "进阶版",
+        status: "active",
+      },
+      capabilities: availableCapabilities(),
+      knowledge: { status: "missing" },
+      workflowSteps: [
+        {
+          id: "knowledge",
+          label: "知识库智能体",
+          status: "ready",
+          lockedReason: null,
+          href: "/knowledge-base",
+        },
+      ],
+    });
+
+    expect(getCapability(portal, "contentAssets")).toMatchObject({
+      allowed: false,
+      effectiveStatus: "pending",
+      reason: expect.stringContaining("当前服务的认证知识库"),
+    });
+    expect(isCapabilityIncludedInPlan("advanced", "contentAssets")).toBe(true);
   });
 
   it("never promotes an unavailable capability because a question exists", () => {

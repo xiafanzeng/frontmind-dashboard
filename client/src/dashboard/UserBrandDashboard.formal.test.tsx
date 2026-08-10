@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
@@ -8,6 +14,7 @@ const {
   questionPortfolioUseQuery,
   requestQuestionSelectionUseMutation,
   requestQuestionSelectionMutateAsync,
+  questionMaintenanceSubmitUseMutation,
   purchaseIntentMutateAsync,
   purchaseIntentUseMutation,
   changePasswordUseMutation,
@@ -29,6 +36,7 @@ const {
   deliveryCancelUseMutation,
   deliveryCancelMutateAsync,
   uploadFileMock,
+  authState,
 } = vi.hoisted(() => ({
   dashboardUseQuery: vi.fn(),
   portalUseQuery: vi.fn(),
@@ -36,6 +44,10 @@ const {
   questionPortfolioUseQuery: vi.fn(),
   requestQuestionSelectionUseMutation: vi.fn(),
   requestQuestionSelectionMutateAsync: vi.fn(),
+  questionMaintenanceSubmitUseMutation: vi.fn(() => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  })),
   purchaseIntentMutateAsync: vi.fn(),
   purchaseIntentUseMutation: vi.fn(),
   changePasswordUseMutation: vi.fn(),
@@ -61,6 +73,9 @@ const {
   deliveryCancelUseMutation: vi.fn(),
   deliveryCancelMutateAsync: vi.fn(),
   uploadFileMock: vi.fn(),
+  authState: {
+    marketEdition: "domestic" as "domestic" | "overseas",
+  },
 }));
 
 vi.mock("@/lib/frontmind-api", async (importOriginal) => {
@@ -73,6 +88,7 @@ vi.mock("@/lib/frontmind-api", async (importOriginal) => {
 
 vi.mock("@/_core/hooks/useAuth", () => ({
   useAuth: () => ({
+    user: { marketEdition: authState.marketEdition },
     logout: vi.fn(),
     loading: false,
   }),
@@ -100,6 +116,11 @@ vi.mock("@/lib/trpc", () => ({
       },
       requestQuestionSelection: {
         useMutation: requestQuestionSelectionUseMutation,
+      },
+      questionMaintenance: {
+        submit: {
+          useMutation: questionMaintenanceSubmitUseMutation,
+        },
       },
       purchaseIntent: {
         useMutation: purchaseIntentUseMutation,
@@ -194,8 +215,10 @@ const managedPayload = {
       id: "enterprise-keywords",
       title: "企业问题词库",
       description: "管理员上传",
-      columns: ["问题", "场景"],
-      rows: [["如何选择新企业？", "产品场景"]],
+      columns: ["序号", "问题", "核心词", "核心词分类", "热度", "创建日期"],
+      rows: [
+        ["1", "如何选择新企业？", "新企业", "场景痛点词", "1200", "2026-07-27"],
+      ],
     },
   ],
   questions: [],
@@ -331,6 +354,7 @@ describe("UserBrandDashboard formal workspace", () => {
   });
 
   beforeEach(() => {
+    authState.marketEdition = "domestic";
     purchaseIntentMutateAsync.mockReset();
     purchaseIntentUseMutation.mockReset();
     changePasswordUseMutation.mockReset();
@@ -518,7 +542,7 @@ describe("UserBrandDashboard formal workspace", () => {
       filename: "企业资料.pdf",
     });
     dashboardUseQuery.mockReturnValue({
-      data: { payload: managedPayload },
+      data: { payload: managedPayload, revision: 7 },
       isLoading: false,
       isError: false,
     });
@@ -558,7 +582,11 @@ describe("UserBrandDashboard formal workspace", () => {
       }),
     );
     expect(deliveryListUseInfiniteQuery).toHaveBeenCalledWith(
-      { type: "website_operation", limit: 20 },
+      {
+        type: "website_operation",
+        surface: "website_management",
+        limit: 20,
+      },
       expect.objectContaining({
         getNextPageParam: expect.any(Function),
       }),
@@ -577,26 +605,165 @@ describe("UserBrandDashboard formal workspace", () => {
     expect(screen.queryByText(/港中大/)).toBeNull();
   });
 
-  it("renders the administrator-published overview, cards, and tables on the service home", () => {
+  it("does not mount semantic assets but keeps delivery history available before knowledge publication", () => {
+    const knowledgeReason =
+      "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。";
+    portalUseQuery.mockReturnValue({
+      data: {
+        portal: {
+          ...portalPayload,
+          service: {
+            ...portalPayload.service,
+            planCode: "advanced",
+            planName: "进阶版",
+          },
+          knowledge: {
+            status: "missing",
+            latestImportStatus: null,
+            version: null,
+          },
+          workflowSteps: [
+            {
+              id: "knowledge",
+              label: "知识库智能体",
+              status: "ready",
+              lockedReason: null,
+              href: "/knowledge-base",
+            },
+          ],
+          capabilities: {
+            ...portalPayload.capabilities,
+            contentAssets: {
+              allowed: false,
+              effectiveStatus: "workflow_prerequisite",
+              reason: knowledgeReason,
+            },
+          },
+        },
+      },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    });
+
+    render(<UserBrandDashboard />);
+    const contentAssetsNavigation = screen.getByRole("button", {
+      name: "内容资产运营",
+    });
+    const websiteManagementNavigation = screen.getByRole("button", {
+      name: "AI 友好官网管理",
+    });
+    expect(contentAssetsNavigation).not.toHaveAttribute("title");
+    expect(
+      contentAssetsNavigation.querySelector("svg"),
+    ).not.toBeInTheDocument();
+    expect(websiteManagementNavigation).not.toHaveAttribute("title");
+    expect(
+      websiteManagementNavigation.querySelector("svg"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(contentAssetsNavigation);
+
+    expect(screen.getByText(/服务准备中/)).toBeInTheDocument();
+    expect(screen.getByText(knowledgeReason)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "提交内容需求" }),
+    ).not.toBeInTheDocument();
+    expect(dashboardUseQuery).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ enabled: false }),
+    );
+    expect(deliveryWorkspaceUseQuery).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ enabled: true }),
+    );
+  });
+
+  it("shows brand tracking navigation only for overseas accounts", () => {
+    const domesticView = render(<UserBrandDashboard />);
+
+    const domesticPlanScope = screen.getByTestId("service-plan-scope");
+    expect(
+      within(domesticPlanScope)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      "知识库智能体",
+      "品牌全域词库与选题",
+      "问题优化",
+      "应答逻辑智能体",
+      "问题监控",
+      "进度报告",
+      "AI 友好内容资产",
+    ]);
+    expect(
+      within(domesticPlanScope).queryByText("舆情监控·品牌追踪"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("舆情监控")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "品牌追踪智能体" }),
+    ).not.toBeInTheDocument();
+    domesticView.unmount();
+
+    authState.marketEdition = "overseas";
     render(<UserBrandDashboard />);
 
+    const overseasPlanScope = screen.getByTestId("service-plan-scope");
     expect(
-      screen.getByRole("heading", { name: "新企业内容体系" }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("由管理员发布的正式数据")).toBeInTheDocument();
-    expect(screen.getByText("事实条目")).toBeInTheDocument();
-    expect(screen.getByText("12 项")).toBeInTheDocument();
+      within(overseasPlanScope)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      "知识库智能体",
+      "品牌全域词库与选题",
+      "问题优化",
+      "应答逻辑智能体",
+      "问题监控",
+      "进度报告",
+      "AI 友好内容资产",
+      "舆情监控·品牌追踪",
+    ]);
+    expect(screen.getAllByText("舆情监控").length).toBeGreaterThanOrEqual(2);
     expect(
-      screen.getByRole("heading", { name: "企业事实" }),
+      screen.getByRole("button", { name: "品牌追踪智能体" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("由管理员发布的板块正文")).toBeInTheDocument();
+  });
+
+  it("keeps the website workflow on the authenticated overseas edition while workspace metadata is legacy", () => {
+    authState.marketEdition = "overseas";
+    render(<UserBrandDashboard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
+
+    const progress = screen
+      .getByRole("heading", { name: "官网开通进度" })
+      .closest("section");
+    expect(progress).not.toBeNull();
     expect(
-      screen.getByText("核验证书、本部关系与学校性质"),
+      within(progress as HTMLElement).getByText("企业域名注册与确认"),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "分阶段路线" }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("形成该说与不要说清单")).toBeInTheDocument();
+      within(progress as HTMLElement).queryByText("阿里云域名注册与 ICP 备案"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(progress as HTMLElement)
+        .getByText("AI专用官网构建与内容运营")
+        .closest("li"),
+    ).toHaveTextContent("已开放");
+  });
+
+  it("does not duplicate the administrator-published customer dashboard on the service home", () => {
+    render(<UserBrandDashboard />);
+
+    expect(screen.queryByText("新企业内容体系")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("由管理员发布的正式数据"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("事实条目")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("由管理员发布的板块正文"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("形成该说与不要说清单")).not.toBeInTheDocument();
     expect(screen.queryByText(/香港中文大学/)).toBeNull();
   });
 
@@ -684,7 +851,7 @@ describe("UserBrandDashboard formal workspace", () => {
                         type: "content_asset",
                         category: "B3",
                         title: "用户案例与成功故事",
-                        topic: "第一批真实内容工单",
+                        topic: "第一批真实内容需求",
                         status: "in_progress",
                         revision: 1,
                         submittedAt: "2026-07-27T08:00:00+08:00",
@@ -711,8 +878,10 @@ describe("UserBrandDashboard formal workspace", () => {
     render(<UserBrandDashboard />);
 
     fireEvent.click(screen.getByRole("button", { name: "内容资产运营" }));
-    expect(screen.getByText("第一批真实内容工单")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "加载更多工单" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /^选择/ })[0]!);
+    fireEvent.click(screen.getByRole("button", { name: "需求记录" }));
+    expect(screen.getByText("第一批真实内容需求")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
 
     expect(fetchContentNextPage).toHaveBeenCalledTimes(1);
   });
@@ -735,10 +904,10 @@ describe("UserBrandDashboard formal workspace", () => {
     fireEvent.change(screen.getByLabelText("话题"), {
       target: { value: "更新企业资料与品牌事实" },
     });
-    fireEvent.change(screen.getByLabelText("上传官网工单附件"), {
+    fireEvent.change(screen.getByLabelText("上传官网需求附件"), {
       target: { files: [sourceFile] },
     });
-    fireEvent.click(screen.getByRole("button", { name: "提交工单" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交需求" }));
 
     await waitFor(() =>
       expect(uploadFileMock).toHaveBeenCalledWith(sourceFile),
@@ -1149,7 +1318,7 @@ describe("UserBrandDashboard formal workspace", () => {
     expect(purchaseIntentMutateAsync).not.toHaveBeenCalled();
   });
 
-  it("renders the managed keyword module without exposing the retired content-system page", () => {
+  it("replaces the submitted ticket workspace with the published customer word bank", () => {
     deliveryListUseInfiniteQuery.mockImplementation((input) => ({
       data: {
         pages: [
@@ -1164,9 +1333,7 @@ describe("UserBrandDashboard formal workspace", () => {
                       categoryLabel: "品牌词库与问题目录",
                       topic: "配置品牌词库与问题目录",
                       publicStatus: "pending",
-                      publicStatusLabel: "待受理",
-                      publicStage: "processing",
-                      publicStageLabel: "处理中",
+                      publicStatusLabel: "待处理",
                       publicSummary: null,
                     },
                   ]
@@ -1193,51 +1360,85 @@ describe("UserBrandDashboard formal workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
 
     expect(
-      screen.getByRole("heading", { name: "企业问题词库" }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("AI 监控与优化工程师正在配置")).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", {
-        name: "AI 监控与优化工程师发布的正式词表",
-      }),
+      screen.getByRole("heading", { name: "品牌全域词库" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /生成候选问题/ }),
+      screen.getByText(
+        "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合反馈的真实热度呈现 GEO 优化问题。",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "全域词库" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/配置工单|AI 监控与优化工程师|正式词表/),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "候选问题目录" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/个候选问题|已确认/)).not.toBeInTheDocument();
     expect(screen.getByText("如何选择新企业？")).toBeInTheDocument();
+    const keywordTable = screen.getByRole("table");
+    expect(
+      within(keywordTable)
+        .getAllByRole("columnheader")
+        .map((header) => header.textContent),
+    ).toEqual(["问题", "主分类", "热度", "问题优化"]);
+    expect(
+      within(keywordTable).queryByRole("columnheader", { name: "核心词" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(keywordTable).queryByRole("columnheader", { name: "创建日期" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(keywordTable).queryByRole("columnheader", { name: "序号" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(keywordTable).getByRole("columnheader", { name: "问题优化" }),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/香港中文大学/)).toBeNull();
   });
 
-  it("carries a real candidate into problem optimization before requesting administrator confirmation", async () => {
+  it("shows only a neutral word-bank waiting state before an upload exists", () => {
+    dashboardUseQuery.mockReturnValue({
+      data: {
+        payload: {
+          ...managedPayload,
+          keywordTables: [],
+        },
+      },
+      isLoading: false,
+      isError: false,
+    });
+    render(<UserBrandDashboard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
+
+    expect(
+      screen.getByRole("heading", { name: "品牌全域词库正在准备中" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("内容发布后会自动显示在这里。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/配置工单|候选问题目录|AI 监控与优化工程师/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("locks and confirms an authoritative word-bank question before it enters service", async () => {
     const refetch = vi.fn().mockResolvedValue(undefined);
     questionPortfolioUseQuery.mockReturnValue({
-      data: {
-        quotaPeriodId: "formal-period",
-        questions: [
-          {
-            id: "candidate-1",
-            quotaPeriodId: "formal-period",
-            category: "product_scenario",
-            question: "新企业的产品适合哪些业务场景？",
-            intent: null,
-            rationale: "来自当前企业知识库",
-            evidence: [],
-            risks: [],
-            status: "candidate",
-            selectionApprovalStatus: "not_requested",
-            locked: false,
-            revision: 3,
-          },
-        ],
-      },
+      data: { quotaPeriodId: "formal-period", questions: [] },
       isLoading: false,
       isFetching: false,
       refetch,
     });
     requestQuestionSelectionMutateAsync.mockResolvedValue({
       question: {
-        id: "candidate-1",
-        selectionApprovalStatus: "pending",
+        id: "selected-question-from-word-bank",
+        status: "selected",
+        selectionApprovalStatus: "approved",
+        locked: true,
       },
     });
     render(<UserBrandDashboard />);
@@ -1245,19 +1446,54 @@ describe("UserBrandDashboard formal workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
     fireEvent.click(screen.getByRole("button", { name: "选择并进入问题优化" }));
 
-    expect(screen.getByRole("textbox", { name: "目标问题" })).toHaveValue(
-      "新企业的产品适合哪些业务场景？",
+    const questionInput = screen.getByRole("textbox", { name: "目标问题" });
+    expect(questionInput).toHaveValue("如何选择新企业？");
+    expect(questionInput).toHaveAttribute("readonly");
+    expect(screen.getByRole("textbox", { name: "问题来源" })).toHaveValue(
+      "品牌全域词库",
     );
-    fireEvent.click(screen.getByRole("button", { name: "提交专业审核" }));
+    expect(
+      screen.queryByRole("combobox", { name: "问题类别" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认优化问题" }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(
+      "确认后开启进度将不可修改。",
+    );
+    expect(requestQuestionSelectionMutateAsync).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "确认并开启进度" }));
 
     await waitFor(() =>
       expect(requestQuestionSelectionMutateAsync).toHaveBeenCalledWith({
-        mode: "candidate",
-        questionId: "candidate-1",
-        expectedRevision: 3,
+        mode: "brand_keyword_library",
+        dashboardRevision: 7,
+        tableId: "enterprise-keywords",
+        rowIndex: 0,
       }),
     );
     expect(refetch).toHaveBeenCalled();
+  });
+
+  it("keeps the word-bank warning open when confirmation fails", async () => {
+    requestQuestionSelectionMutateAsync.mockRejectedValueOnce(
+      new Error("额度刚刚发生变化"),
+    );
+    render(<UserBrandDashboard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择并进入问题优化" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认优化问题" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认并开启进度" }));
+
+    await waitFor(() =>
+      expect(requestQuestionSelectionMutateAsync).toHaveBeenCalledTimes(1),
+    );
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(
+      "确认后开启进度将不可修改。",
+    );
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(
+      "如何选择新企业？",
+    );
   });
 
   it("submits a directly entered target question for administrator confirmation", async () => {
@@ -1270,6 +1506,12 @@ describe("UserBrandDashboard formal workspace", () => {
     render(<UserBrandDashboard />);
 
     fireEvent.click(screen.getByRole("button", { name: "问题优化" }));
+    expect(screen.getByRole("textbox", { name: "问题来源" })).toHaveValue(
+      "自主填写",
+    );
+    expect(
+      screen.queryByRole("combobox", { name: "问题类别" }),
+    ).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: "目标问题" }), {
       target: { value: "新企业如何验证产品交付能力？" },
     });
@@ -1279,9 +1521,38 @@ describe("UserBrandDashboard formal workspace", () => {
       expect(requestQuestionSelectionMutateAsync).toHaveBeenCalledWith({
         mode: "direct",
         question: "新企业如何验证产品交付能力？",
-        category: "industry",
+        classificationVersion: 2,
       }),
     );
+  });
+
+  it("blocks another submission when pending reviews reserve every remaining total slot", () => {
+    questionPortfolioUseQuery.mockReturnValue({
+      data: {
+        quotaPeriodId: "formal-period",
+        questions: Array.from({ length: 23 }, (_, index) => ({
+          id: `pending-question-${index}`,
+          question: `等待分类的问题 ${index + 1}`,
+          category: null,
+          source: "user",
+          status: "candidate",
+          selectionApprovalStatus: "pending",
+        })),
+      },
+      isLoading: false,
+      isFetching: false,
+      refetch: vi.fn(),
+    });
+    render(<UserBrandDashboard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "问题优化" }));
+
+    expect(screen.getByRole("button", { name: "提交专业审核" })).toBeDisabled();
+    expect(
+      screen.getByText(
+        "当前服务的问题额度已用满，请联系服务管理员调整当前服务问题。",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("renders the administrator-published phased roadmap in the formal progress report", () => {
@@ -1334,6 +1605,14 @@ describe("UserBrandDashboard formal workspace", () => {
       data: {
         portal: {
           ...portalPayload,
+          capabilities: {
+            ...portalPayload.capabilities,
+            questionSelection: {
+              allowed: false,
+              status: "locked",
+              reason: "本期新增问题已锁定。",
+            },
+          },
           purchasedQuestions: [question],
           workflowSteps: [
             {
@@ -1414,13 +1693,22 @@ describe("UserBrandDashboard formal workspace", () => {
     expect(
       screen.getByText("企业希望确认官网能否成为稳定、可追溯的 AI 信源。"),
     ).toBeInTheDocument();
-    expect(screen.getByText("先核验企业身份与核心能力。")).toBeInTheDocument();
-    expect(screen.getByText("企业官网正式资料")).toBeInTheDocument();
-    expect(screen.getByText("客户案例公开授权")).toBeInTheDocument();
+    expect(screen.getByText(/先核验企业身份与核心能力。/)).toBeInTheDocument();
+    expect(screen.getByText(/企业官网正式资料/)).toBeInTheDocument();
+    expect(screen.queryByText("客户案例公开授权")).toBeNull();
+    expect(screen.queryByText("引自知识库文档。")).toBeNull();
     expect(
       screen.getByText("不使用无法核验的行业第一表述"),
     ).toBeInTheDocument();
     expect(screen.getByAltText("官网事实证据")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "申请修改" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "申请删除" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", {
+        name: `查看“${question.question}”的需求记录`,
+      }),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "需求记录" })).toHaveLength(1);
 
     for (const redundantCopy of [
       "建议的优化方向",

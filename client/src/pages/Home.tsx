@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { CloudOff, Loader2, RefreshCw, X } from "lucide-react";
 import type { ResponseLogicTaskContext } from "@/lib/frontmind-api";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
+import type { LocalMessage } from "@/contexts/ConversationContext";
 
 export default function Home({
   embedded = false,
@@ -28,6 +29,7 @@ export default function Home({
   showSettings = true,
   standardWelcomeVariant = "simple",
   responseLogicContext,
+  messageProjection,
   knowledgeBaseProgress,
 }: {
   embedded?: boolean;
@@ -41,6 +43,7 @@ export default function Home({
   showSettings?: boolean;
   standardWelcomeVariant?: "simple" | "workflow";
   responseLogicContext?: ResponseLogicTaskContext;
+  messageProjection?: (message: LocalMessage) => LocalMessage;
   knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
 } = {}) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -170,6 +173,7 @@ export default function Home({
           syncKnowledgeBaseSnapshot={syncKnowledgeBaseSnapshot}
           composerPrefill={composerPrefill}
           responseLogicContext={responseLogicContext}
+          messageProjection={messageProjection}
           knowledgeBaseProgress={knowledgeBaseProgress}
           showKnowledgeBaseStarter={showKnowledgeBaseStarter}
           standardWelcomeVariant={standardWelcomeVariant}

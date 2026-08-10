@@ -47,4 +47,32 @@ describe("admin API Key mutation boundary", () => {
     expect(credentialSource).not.toContain("deleteActiveApiCredential(");
     expect(credentialSource).toContain("API 与人员管理");
   });
+
+  it("keeps Jenova brand-tracking credentials behind the system-admin boundary", async () => {
+    const source = await readFile(
+      path.resolve(process.cwd(), "server/admin-router.ts"),
+      "utf8",
+    );
+
+    expect(source).toContain("brandTrackingCredentials: router({");
+    const namespace = source.slice(
+      source.indexOf("brandTrackingCredentials: router({"),
+      source.indexOf("apiKeyUsageAlerts: router({"),
+    );
+    for (const operation of [
+      "list",
+      "configure",
+      "bulkAssign",
+      "revoke",
+      "refreshBalance",
+    ]) {
+      expect(namespace).toContain(`${operation}: adminProcedure`);
+    }
+    expect(namespace.match(/requireSystemAdmin\(ctx\.user\)/gu)).toHaveLength(
+      5,
+    );
+    expect(source).toContain("listJenovaBrandTrackingCredentialAssignments");
+    expect(source).toContain("bulkAssignJenovaBrandTrackingCredential");
+    expect(source).not.toContain("Jenova API Key 由工程师");
+  });
 });

@@ -18,6 +18,13 @@ export type WorkspaceQuestionCategory = z.infer<
   typeof workspaceQuestionCategorySchema
 >;
 
+/**
+ * Two-phase rollout gate for customer-authored questions. The compatibility
+ * release kept this false; this follow-up release flips the one shared value
+ * after every automatic rollback target understands the v2 marker.
+ */
+export const QUESTION_CLASSIFICATION_V2_WRITES_ENABLED = true;
+
 export const serviceContractSourceSchema = z.enum([
   "website",
   "offline",
@@ -239,6 +246,7 @@ export const serviceCapabilityAccessSchema = z.object({
   allowed: z.boolean(),
   effectiveStatus: z.enum([
     "available",
+    "workflow_prerequisite",
     "not_in_plan",
     "service_unconfigured",
     "service_pending_confirmation",
@@ -323,13 +331,17 @@ export const servicePortalQuestionSchema = z.object({
   quotaPeriodId: z.string(),
   externalQuestionId: z.string().nullable(),
   sourceQuestionId: z.string().nullable(),
-  category: workspaceQuestionCategorySchema,
+  // User-authored questions remain unclassified until a delivery engineer
+  // approves them. Selected questions must always have a concrete category;
+  // that invariant is enforced by the selection service.
+  category: workspaceQuestionCategorySchema.nullable(),
   question: z.string(),
   intent: z.string().nullable(),
   intentRevision: z.number().int().positive(),
   intentConfirmedRevision: z.number().int().positive().nullable(),
   intentConfirmedAt: z.number().int().nonnegative().nullable(),
   intentConfirmed: z.boolean(),
+  responseLogicConfirmed: z.boolean().optional(),
   rationale: z.string().nullable(),
   evidence: z.array(
     z.object({
@@ -348,6 +360,14 @@ export const servicePortalQuestionSchema = z.object({
   revision: z.number().int().positive(),
 });
 export type ServicePortalQuestion = z.infer<typeof servicePortalQuestionSchema>;
+
+export const selectedServicePortalQuestionSchema =
+  servicePortalQuestionSchema.extend({
+    category: workspaceQuestionCategorySchema,
+  });
+export type SelectedServicePortalQuestion = z.infer<
+  typeof selectedServicePortalQuestionSchema
+>;
 
 export const servicePortalQuotaPeriodSchema = z.object({
   periodId: z.string(),
@@ -426,8 +446,8 @@ export const servicePortalSchema = z.object({
       .enum(["pending", "processing", "completed", "failed"])
       .nullable(),
   }),
-  purchasedQuestions: z.array(servicePortalQuestionSchema),
-  historicalQuestions: z.array(servicePortalQuestionSchema),
+  purchasedQuestions: z.array(selectedServicePortalQuestionSchema),
+  historicalQuestions: z.array(selectedServicePortalQuestionSchema),
   capabilities: serviceCapabilitiesSchema,
   workflowSteps: z.array(serviceWorkflowStepSchema),
   nextAction: serviceNextActionSchema,

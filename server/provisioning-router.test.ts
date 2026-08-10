@@ -370,6 +370,30 @@ describe("provisioning service-token boundary", () => {
     expect(provisionUser).not.toHaveBeenCalled();
   });
 
+  it("maps lifecycle-guarded project writes to a stable 410 without leaking database details", async () => {
+    const databaseError = Object.assign(new Error("insert rejected"), {
+      sqlMessage: "WEBSITE_PROJECT_DELETED",
+    });
+    const url = await startApp(vi.fn().mockRejectedValue(databaseError));
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": "website-order-zpay-000001",
+        "x-frontmind-provisioning-token": SERVICE_TOKEN,
+      },
+      body: JSON.stringify(requestBody()),
+    });
+
+    expect(response.status).toBe(410);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "PROJECT_DELETED",
+        message: "项目已进入永久删除流程，不能再写入履约记录",
+      },
+    });
+  });
+
   it("rejects role injection before provisioning", async () => {
     const provisionUser = vi.fn();
     const url = await startApp(provisionUser);

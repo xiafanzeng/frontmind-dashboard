@@ -6,6 +6,7 @@ import {
   createResponseLogicTask,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
   FILE_UPLOAD_STALL_TIMEOUT_MS,
+  getModelDisplayName,
   retrieveTask,
   sanitizeBrandText,
   uploadFile,
@@ -19,6 +20,19 @@ afterEach(() => {
 });
 
 describe("sanitizeBrandText", () => {
+  it("rebrands alternate provider copy before it reaches the interface", () => {
+    const sourceBrand = ["Jeno", "va"].join("");
+    const visible = sanitizeBrandText(
+      `独立 ${sourceBrand} 凭证 · ${sourceBrand.toLowerCase()} Brand Tracker · https://api.${sourceBrand.toLowerCase()}.ai`,
+    );
+
+    expect(visible).toBe(
+      "独立 FrontMind 凭证 · FrontMind Brand Tracker · https://api.frontmind.ai",
+    );
+    expect(visible.toLowerCase()).not.toContain(sourceBrand.toLowerCase());
+    expect(getModelDisplayName(`${sourceBrand} Pro`)).toBe("FrontMind Pro");
+  });
+
   it("removes knowledge-base protocol envelopes from visible assistant text", () => {
     const visible = sanitizeBrandText(
       [
@@ -152,6 +166,7 @@ describe("createKnowledgeBaseTurnTask", () => {
         expectedGeneration: 2,
         expectedRevision: 5,
         expectedLeafId: "1.6",
+        expectedPresentationKey: "presentation-5",
         attachmentManifest: [],
       }),
     ).rejects.toMatchObject({
@@ -183,6 +198,7 @@ describe("createKnowledgeBaseTurnTask", () => {
         expectedGeneration: 2,
         expectedRevision: 5,
         expectedLeafId: "1.6",
+        expectedPresentationKey: "presentation-5",
       },
     );
 
@@ -198,6 +214,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       expectedGeneration: 2,
       expectedRevision: 5,
       expectedLeafId: "1.6",
+      expectedPresentationKey: "presentation-5",
       userMessage: "确认",
     });
   });
@@ -401,6 +418,7 @@ describe("createKnowledgeBaseTurnTask", () => {
         expectedGeneration: 2,
         expectedRevision: 5,
         expectedLeafId: "1.6",
+        expectedPresentationKey: "presentation-5",
         attachmentManifest: manifest,
       },
     );
@@ -412,6 +430,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       expectedGeneration: 2,
       expectedRevision: 5,
       expectedLeafId: "1.6",
+      expectedPresentationKey: "presentation-5",
       userMessage: "修订",
       attachmentManifest: manifest,
       resumeExisting: false,
@@ -607,6 +626,66 @@ describe("createKnowledgeBaseTurnTask", () => {
       userMessage: "确认",
       expectedRevision: 45,
       expectedLeafId: "5.5",
+    });
+  });
+
+  it("marks a dedicated Logo submission and accepts only the returned upstream task id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        task: { id: "manus-logo-task", status: "running" },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      createKnowledgeBaseTurnTask(
+        [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_file",
+                file_id: "file-logo",
+                filename: "logo.png",
+              },
+            ],
+          },
+        ],
+        {
+          conversationId: "conv-kb",
+          clientRequestId: "request-logo-1",
+          expectedRevision: 1,
+          expectedLeafId: "1.1",
+          submissionKind: "logo",
+        },
+      ),
+    ).resolves.toMatchObject({ id: "manus-logo-task" });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      submissionKind: "logo",
+      clientRequestId: "request-logo-1",
+      attachments: [{ file_id: "file-logo", filename: "logo.png" }],
+    });
+  });
+
+  it("rejects a successful Logo response that has no real upstream task id", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ accepted: true }),
+      }),
+    );
+
+    await expect(
+      createKnowledgeBaseTurnTask([], {
+        conversationId: "conv-kb",
+        clientRequestId: "request-logo-missing-task",
+        submissionKind: "logo",
+      }),
+    ).rejects.toMatchObject({
+      status: 502,
+      code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
     });
   });
 

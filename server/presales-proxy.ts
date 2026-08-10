@@ -13,20 +13,32 @@ import { z } from "zod";
 import { AuthServiceError } from "./auth-service";
 import {
   acquirePresalesTaskReservation,
+  completePresalesProjectTaskPurge,
   completePresalesTaskReservation,
+  countPresalesProjectPendingFileUploads,
+  deletePresalesFileEvidence,
+  deletePresalesTaskEvidence,
   finalizePresalesFileUploadRetention,
   getActivePresalesCredential,
+  getPresalesCredentialById,
   getPresalesCredentialForResource,
   hashPresalesTaskPayload,
   hasPresalesOutputUrlGrant,
   markPresalesFileContentDeleted,
   recordPresalesUpstreamResource,
   releasePresalesTaskReservation,
+  readPresalesProjectTaskPurgeSnapshot,
+  readPresalesProjectFileTargets,
+  readPresalesTaskEvidenceFileIds,
+  retainPresalesProjectFilePurgeTarget,
+  retainPresalesTaskPurgeTarget,
   reservePresalesFileUploadRetention,
   resolvePresalesTaskCredentialForFiles,
   syncPresalesOutputUrlGrants,
+  withPresalesProjectFileCreateGuard,
   type DecryptedPresalesCredential,
 } from "./presales-service";
+import { projectOrderProjectIdSchema } from "../shared/project-order-registry";
 import {
   assertSafeExternalUrl,
   ExternalUrlRejectedError,
@@ -36,13 +48,16 @@ import { getUpstreamBaseUrl, toUpstreamAgentProfile } from "./upstream-config";
 import {
   getDedicatedMonitorCredentialReadiness,
   presalesMonitorRouter,
+  purgePresalesProjectMonitorRuns,
 } from "./presales-monitor";
 import { isFrontMindPublicUrlConfigured } from "./public-url";
 import {
   acquirePresalesFileCreateReservation,
   completePresalesFileCreateReservation,
   hashPresalesFileCreatePayload,
+  purgePresalesFileCreateReservation,
   readPresalesFileLifecycle,
+  readPresalesProjectFileCreateReservations,
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
   releasePresalesFileCreateReservation,
@@ -61,6 +76,7 @@ import {
   FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
   upstreamPromptCharacterCount,
 } from "./upstream-prompt-budget";
+import { WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED } from "./website-project-lifecycle";
 
 const router = Router();
 const SERVICE_TOKEN_HEADER = "x-frontmind-service-token";
@@ -83,17 +99,28 @@ const PUBLIC_PLACEHOLDER_MARKERS = [
   "change-me",
 ];
 
-const fileCreateSchema = z.object({
-  filename: z.string().trim().min(1).max(512),
-  mimeType: z.string().trim().max(255).optional(),
-  sizeBytes: z
-    .number()
-    .int()
-    .nonnegative()
-    .max(MAX_PROXY_UPLOAD_BYTES)
-    .optional(),
-  idempotencyKey: z.string().trim().min(16).max(512).optional(),
-});
+const fileCreateSchema = z
+  .object({
+    filename: z.string().trim().min(1).max(512),
+    projectId: projectOrderProjectIdSchema.optional(),
+    mimeType: z.string().trim().max(255).optional(),
+    sizeBytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(MAX_PROXY_UPLOAD_BYTES)
+      .optional(),
+    idempotencyKey: z.string().trim().min(16).max(512).optional(),
+  })
+  .superRefine((value, context) => {
+    if (value.projectId && !value.idempotencyKey) {
+      context.addIssue({
+        code: "custom",
+        path: ["idempotencyKey"],
+        message: "Project-bound files require an idempotency key",
+      });
+    }
+  });
 
 const attachmentSchema = z.object({
   file_id: z.string().trim().min(1).max(255),
@@ -560,15 +587,17 @@ function sendKnownError(res: Response, error: unknown) {
     const status =
       error.code === "NOT_FOUND"
         ? 404
-        : error.code === "CONFLICT"
-          ? 409
-          : error.code === "INVALID_CREDENTIAL"
-            ? 428
-            : error.code === "IDEMPOTENCY_PENDING"
-              ? 425
-              : error.code === "UPSTREAM_UNAVAILABLE"
-                ? 502
-                : 503;
+        : error.code === "PROJECT_DELETED"
+          ? 410
+          : error.code === "CONFLICT"
+            ? 409
+            : error.code === "INVALID_CREDENTIAL"
+              ? 428
+              : error.code === "IDEMPOTENCY_PENDING"
+                ? 425
+                : error.code === "UPSTREAM_UNAVAILABLE"
+                  ? 502
+                  : 503;
     res.status(status).json({
       error: { code: error.code, message: error.message },
     });
@@ -767,6 +796,7 @@ async function registerTaskArtifacts(
   taskId: string,
   task: unknown,
   credential: DecryptedPresalesCredential,
+  projectId?: string,
 ) {
   const artifacts = collectTaskArtifacts(task);
   for (const fileId of artifacts.fileIds) {
@@ -774,14 +804,62 @@ async function registerTaskArtifacts(
     // authenticated upstream API must also confirm that the file exists under
     // the exact credential version bound to this task.
     await fetchFileMetadata(fileId, credential);
-    await recordPresalesUpstreamResource({
-      apiCredentialId: credential.id,
-      kind: "file",
-      upstreamId: fileId,
-      parentTaskId: taskId,
-      contentSource: "assistant_output",
-      verifiedAssistantOutput: artifacts.strictOutputFileIds.has(fileId),
-    });
+    try {
+      await recordPresalesUpstreamResource({
+        ...(projectId ? { projectId } : {}),
+        apiCredentialId: credential.id,
+        kind: "file",
+        upstreamId: fileId,
+        parentTaskId: taskId,
+        contentSource: "assistant_output",
+        verifiedAssistantOutput: artifacts.strictOutputFileIds.has(fileId),
+      });
+    } catch (error) {
+      if (
+        !(error instanceof AuthServiceError) ||
+        error.code !== "PROJECT_DELETED" ||
+        !artifacts.strictOutputFileIds.has(fileId)
+      ) {
+        throw error;
+      }
+      if (projectId) {
+        await retainPresalesProjectFilePurgeTarget({
+          projectId,
+          fileId,
+          apiCredentialId: credential.id,
+        });
+      }
+      const cleanup = await axios.delete(
+        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
+        {
+          headers: upstreamHeaders(credential.apiKey),
+          timeout: 60_000,
+          validateStatus: () => true,
+        },
+      );
+      const outcome = buildPresalesFileDeleteOutcome(
+        cleanup.status,
+        cleanup.data,
+        credential.apiKey,
+      );
+      if (!outcome.ok) {
+        throw new AuthServiceError(
+          "UPSTREAM_UNAVAILABLE",
+          "任务删除期间产生的输出文件无法同步清理",
+        );
+      }
+      await Promise.all([
+        removeStoredPresalesFile(fileId),
+        purgePresalesFileCreateReservation(fileId),
+      ]);
+      if (projectId) {
+        await deletePresalesFileEvidence({
+          fileId,
+          apiCredentialId: credential.id,
+        });
+      }
+      throw error;
+    }
   }
   const normalizedUrls = new Set<string>();
   for (const value of artifacts.urls) {
@@ -827,7 +905,17 @@ async function retrieveTask(
   const task = normalizeTask(
     redactUpstreamPayload(response.data, credential.apiKey),
   );
-  const artifacts = await registerTaskArtifacts(taskId, task, credential);
+  const projectId = (
+    credential as DecryptedPresalesCredential & {
+      resource?: { projectId?: string | null };
+    }
+  ).resource?.projectId;
+  const artifacts = await registerTaskArtifacts(
+    taskId,
+    task,
+    credential,
+    projectId ?? undefined,
+  );
   return { task, artifacts };
 }
 
@@ -868,12 +956,23 @@ router.post("/files", fileJsonParser, async (req, res) => {
       attemptId: string;
     } | null = null;
     if (input.idempotencyKey) {
-      const acquired = await acquirePresalesFileCreateReservation({
+      const reservationInput = {
         idempotencyKey: input.idempotencyKey,
         requestHash: hashPresalesFileCreatePayload(input),
+        compatibleRequestHashes: input.projectId
+          ? [hashPresalesFileCreatePayload({ ...input, projectId: undefined })]
+          : [],
+        projectId: input.projectId,
         apiCredentialId: credential.id,
         credentialVersion: credential.version,
-      });
+      };
+      const acquired = input.projectId
+        ? await withPresalesProjectFileCreateGuard(
+            input.projectId,
+            credential.id,
+            () => acquirePresalesFileCreateReservation(reservationInput),
+          )
+        : await acquirePresalesFileCreateReservation(reservationInput);
       if (acquired.state === "conflict") {
         throw new AuthServiceError(
           "CONFLICT",
@@ -897,6 +996,15 @@ router.post("/files", fileJsonParser, async (req, res) => {
         return;
       }
       if (acquired.state === "completed") {
+        if (input.projectId) {
+          await recordPresalesUpstreamResource({
+            projectId: input.projectId,
+            apiCredentialId: credential.id,
+            kind: "file",
+            upstreamId: acquired.upstreamFileId,
+            contentSource: "user_upload",
+          });
+        }
         const proxyUploadTicket = acquired.uploadUrl
           ? createPresalesUploadTicket({
               fileId: acquired.upstreamFileId,
@@ -955,30 +1063,11 @@ router.post("/files", fileJsonParser, async (req, res) => {
         "File creation response did not include an id",
       );
     }
-    await recordPresalesUpstreamResource({
-      apiCredentialId: credential.id,
-      kind: "file",
-      upstreamId: id,
-      contentSource: "user_upload",
-    });
-    await recordPresalesFileDescriptor({
-      fileId: id,
-      filename: input.filename,
-      mimeType: input.mimeType,
-      sizeBytes: input.sizeBytes,
-    });
     const payload = redactUpstreamPayload(response.data, credential.apiKey) as
       | Record<string, unknown>
       | undefined;
     const uploadUrl =
       typeof payload?.upload_url === "string" ? payload.upload_url : "";
-    const proxyUploadTicket = uploadUrl
-      ? createPresalesUploadTicket({
-          fileId: id,
-          target: uploadUrl,
-          upstreamExpiresAt: payload?.upload_expires_at,
-        })
-      : undefined;
     if (reservation) {
       await completePresalesFileCreateReservation({
         ...reservation,
@@ -996,6 +1085,56 @@ router.post("/files", fileJsonParser, async (req, res) => {
           : {}),
       });
     }
+    try {
+      await recordPresalesUpstreamResource({
+        projectId: input.projectId,
+        apiCredentialId: credential.id,
+        kind: "file",
+        upstreamId: id,
+        contentSource: "user_upload",
+      });
+    } catch (error) {
+      if (
+        !(error instanceof AuthServiceError) ||
+        error.code !== "PROJECT_DELETED" ||
+        !reservation
+      ) {
+        throw error;
+      }
+      const cleanup = await axios.delete(
+        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(id)}`,
+        {
+          headers: upstreamHeaders(credential.apiKey),
+          timeout: 60_000,
+          validateStatus: () => true,
+        },
+      );
+      const cleanupOutcome = buildPresalesFileDeleteOutcome(
+        cleanup.status,
+        cleanup.data,
+        credential.apiKey,
+      );
+      if (cleanupOutcome.ok) {
+        await Promise.all([
+          removeStoredPresalesFile(id),
+          purgePresalesFileCreateReservation(id),
+        ]);
+      }
+      throw error;
+    }
+    await recordPresalesFileDescriptor({
+      fileId: id,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes,
+    });
+    const proxyUploadTicket = uploadUrl
+      ? createPresalesUploadTicket({
+          fileId: id,
+          target: uploadUrl,
+          upstreamExpiresAt: payload?.upload_expires_at,
+        })
+      : undefined;
     res.status(201).json({
       ...(payload ?? {}),
       id,
@@ -1056,6 +1195,29 @@ export function buildPresalesFileDeleteOutcome(
       error: {
         code: "UPSTREAM_FILE_DELETE_FAILED",
         message: upstreamErrorDetail(data, "File deletion failed", apiKey),
+      },
+    },
+  };
+}
+
+export function buildPresalesTaskDeleteOutcome(
+  upstreamStatus: number,
+  data?: unknown,
+  apiKey?: string,
+) {
+  if (
+    upstreamStatus === 404 ||
+    (upstreamStatus >= 200 && upstreamStatus < 300)
+  ) {
+    return { ok: true as const, status: 204, body: null };
+  }
+  return {
+    ok: false as const,
+    status: forwardedStatus(upstreamStatus),
+    body: {
+      error: {
+        code: "UPSTREAM_TASK_DELETE_FAILED",
+        message: upstreamErrorDetail(data, "Task deletion failed", apiKey),
       },
     },
   };
@@ -1161,13 +1323,24 @@ router.put("/files/:fileId/content", async (req, res) => {
     let response;
     let reservation;
     try {
-      reservation = await reservePresalesFileUploadRetention({
-        fileId,
-        apiCredentialId: credential.id,
-        // The completed staged copy is the conservative first-attempt clock.
-        // It is persisted before the external PUT and every retry reuses it.
-        now: new Date(),
-      });
+      const reserveUpload = (executor?: any) =>
+        reservePresalesFileUploadRetention(
+          {
+            fileId,
+            apiCredentialId: credential.id,
+            // The completed staged copy is the conservative first-attempt clock.
+            // It is persisted before the external PUT and every retry reuses it.
+            now: new Date(),
+          },
+          executor,
+        );
+      reservation = resource.projectId
+        ? await withPresalesProjectFileCreateGuard(
+            resource.projectId,
+            credential.id,
+            (tx) => reserveUpload(tx),
+          )
+        : await reserveUpload();
       const target =
         ticketTarget ??
         assertSafeExternalUrl(
@@ -1252,7 +1425,32 @@ router.put("/files/:fileId/content", async (req, res) => {
 router.delete("/files/:fileId", async (req, res) => {
   try {
     const fileId = String(req.params.fileId || "");
-    const credential = await requireResourceCredential("file", fileId);
+    const credential = WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED
+      ? await getPresalesCredentialForResource("file", fileId)
+      : await requireResourceCredential("file", fileId);
+    if (!credential) {
+      res.setHeader("Idempotent-Replayed", "true");
+      res.status(204).end();
+      return;
+    }
+    if (
+      WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED &&
+      credential.resource.contentSource === "user_upload" &&
+      credential.resource.uploadReservedAt &&
+      !credential.resource.uploadedAt &&
+      credential.resource.uploadReservedAt.getTime() + UPSTREAM_TIMEOUT_MS >
+        Date.now()
+    ) {
+      res.setHeader("Retry-After", "2");
+      res.status(425).json({
+        error: {
+          code: "FILE_DELETE_PENDING",
+          message: "文件正在上传，请稍后重试项目删除",
+        },
+        retryAfterMs: 2_000,
+      });
+      return;
+    }
     if (credential.resource.contentSource === "user_upload") {
       await markPresalesFileContentDeleted({
         fileId,
@@ -1278,6 +1476,12 @@ router.delete("/files/:fileId", async (req, res) => {
         removeStoredPresalesFile(fileId),
         removePresalesFileCreateReservation(fileId),
       ]);
+      if (WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED) {
+        await deletePresalesFileEvidence({
+          fileId,
+          apiCredentialId: credential.id,
+        });
+      }
       res.status(outcome.status).end();
       return;
     }
@@ -1323,13 +1527,36 @@ router.post("/tasks", taskJsonParser, async (req, res) => {
           projectId: input.projectId ?? null,
           task: taskBody,
         }),
+        compatibleRequestHashes: input.projectId
+          ? [hashPresalesTaskPayload(taskBody)]
+          : [],
         projectId: input.projectId,
         apiCredentialId: credential.id,
         credentialVersion: credential.version,
       });
       if (acquired.state === "completed") {
+        if (input.projectId) {
+          for (const attachment of input.attachments) {
+            await recordPresalesUpstreamResource({
+              projectId: input.projectId,
+              apiCredentialId: credential.id,
+              kind: "file",
+              upstreamId: attachment.file_id,
+              contentSource: "user_upload",
+            });
+          }
+        }
+        // The reservation proves which immutable upstream task belongs to this
+        // operation; it does not know the task's execution state. Refresh the
+        // task before replaying so a finished translation (including typed
+        // assistant output) is not downgraded forever to a synthetic `queued`
+        // response.
+        const { task } = await retrieveTask(
+          acquired.upstreamTaskId,
+          credential,
+        );
         res.setHeader("Idempotent-Replayed", "true");
-        res.status(200).json(acquired.task);
+        res.status(200).json(task);
         return;
       }
       reservation = acquired;
@@ -1375,20 +1602,77 @@ router.post("/tasks", taskJsonParser, async (req, res) => {
       );
     }
     if (reservation) {
-      await completePresalesTaskReservation({
-        reservationId: reservation.reservationId,
-        attemptId: reservation.attemptId,
-        apiCredentialId: credential.id,
-        upstreamTaskId: id,
-      });
+      try {
+        await completePresalesTaskReservation({
+          reservationId: reservation.reservationId,
+          attemptId: reservation.attemptId,
+          apiCredentialId: credential.id,
+          upstreamTaskId: id,
+          attachmentFileIds: input.attachments.map((item) => item.file_id),
+        });
+      } catch (error) {
+        let cleanup;
+        try {
+          cleanup = await axios.delete(
+            `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(id)}`,
+            {
+              headers: upstreamHeaders(credential.apiKey),
+              timeout: 60_000,
+              validateStatus: () => true,
+            },
+          );
+        } catch {
+          await retainPresalesTaskPurgeTarget({
+            reservationId: reservation.reservationId,
+            attemptId: reservation.attemptId,
+            apiCredentialId: credential.id,
+            upstreamTaskId: id,
+          });
+          throw new AuthServiceError(
+            "UPSTREAM_UNAVAILABLE",
+            "项目删除期间产生的任务无法同步清理",
+          );
+        }
+        const outcome = buildPresalesTaskDeleteOutcome(
+          cleanup.status,
+          cleanup.data,
+          credential.apiKey,
+        );
+        if (!outcome.ok) {
+          await retainPresalesTaskPurgeTarget({
+            reservationId: reservation.reservationId,
+            attemptId: reservation.attemptId,
+            apiCredentialId: credential.id,
+            upstreamTaskId: id,
+          });
+          throw new AuthServiceError(
+            "UPSTREAM_UNAVAILABLE",
+            "项目删除期间产生的任务无法同步清理",
+          );
+        }
+        await releaseTaskReservationSafely(reservation);
+        throw error;
+      }
     } else {
       await recordPresalesUpstreamResource({
+        projectId: input.projectId,
         apiCredentialId: credential.id,
         kind: "task",
         upstreamId: id,
       });
+      if (input.projectId) {
+        for (const attachment of input.attachments) {
+          await recordPresalesUpstreamResource({
+            projectId: input.projectId,
+            apiCredentialId: credential.id,
+            kind: "file",
+            upstreamId: attachment.file_id,
+            contentSource: "user_upload",
+          });
+        }
+      }
     }
-    await registerTaskArtifacts(id, task, credential);
+    await registerTaskArtifacts(id, task, credential, input.projectId);
     res.status(201).json(task);
   } catch (error) {
     sendKnownError(res, error);
@@ -1412,11 +1696,355 @@ router.get("/tasks/:taskId/result", sendTask);
 router.delete("/tasks/:taskId", async (req, res) => {
   try {
     const taskId = String(req.params.taskId || "");
-    await requireResourceCredential("task", taskId);
-    // Rolling compatibility for older Website releases: acknowledge their
-    // cleanup call, but retain both the upstream task and its local evidence.
-    res.setHeader("X-FrontMind-Task-Retention", "retained");
+    if (!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED) {
+      await requireResourceCredential("task", taskId);
+      // Rolling compatibility for older Website releases: acknowledge their
+      // cleanup call, but retain both the upstream task and its local evidence.
+      res.setHeader("X-FrontMind-Task-Retention", "retained");
+      res.status(204).end();
+      return;
+    }
+    const credential = await getPresalesCredentialForResource("task", taskId);
+    if (!credential) {
+      res.setHeader("Idempotent-Replayed", "true");
+      res.status(204).end();
+      return;
+    }
+    const response = await axios.delete(
+      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
+      {
+        headers: upstreamHeaders(credential.apiKey),
+        timeout: 60_000,
+        validateStatus: () => true,
+      },
+    );
+    const outcome = buildPresalesTaskDeleteOutcome(
+      response.status,
+      response.data,
+      credential.apiKey,
+    );
+    if (!outcome.ok) {
+      res.status(outcome.status).json(outcome.body);
+      return;
+    }
+    const fileIds = await readPresalesTaskEvidenceFileIds({
+      taskId,
+      apiCredentialId: credential.id,
+    });
+    for (const fileId of fileIds) {
+      const fileResponse = await axios.delete(
+        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
+        {
+          headers: upstreamHeaders(credential.apiKey),
+          timeout: 60_000,
+          validateStatus: () => true,
+        },
+      );
+      const fileOutcome = buildPresalesFileDeleteOutcome(
+        fileResponse.status,
+        fileResponse.data,
+        credential.apiKey,
+      );
+      if (!fileOutcome.ok) {
+        res.status(fileOutcome.status).json(fileOutcome.body);
+        return;
+      }
+    }
+    await Promise.all(
+      fileIds.flatMap((fileId: string) => [
+        removeStoredPresalesFile(fileId),
+        removePresalesFileCreateReservation(fileId),
+      ]),
+    );
+    await deletePresalesTaskEvidence({
+      taskId,
+      apiCredentialId: credential.id,
+      deletedFileIds: fileIds,
+    });
     res.status(204).end();
+  } catch (error) {
+    sendKnownError(res, error);
+  }
+});
+
+router.delete("/projects/:projectId/monitor-runs/:runId", async (req, res) => {
+  if (!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED) {
+    res.status(503).json({
+      error: {
+        code: "PROJECT_DELETE_DISABLED",
+        message: "Website project physical deletion is not enabled",
+      },
+    });
+    return;
+  }
+  try {
+    const projectId = projectOrderProjectIdSchema.parse(req.params.projectId);
+    const runId = z.string().uuid().parse(req.params.runId);
+    const result = await purgePresalesProjectMonitorRuns({
+      projectId,
+      runIds: [runId],
+    });
+    if (result.pendingRuns > 0) {
+      res.setHeader("Retry-After", "2");
+      res.status(425).json({
+        error: {
+          code: "MONITOR_DELETE_PENDING",
+          message: "监控任务正在提交，请稍后重试项目删除",
+        },
+        retryAfterMs: 2_000,
+      });
+      return;
+    }
+    if (result.deletedRuns === 0) {
+      res.setHeader("Idempotent-Replayed", "true");
+    }
+    res.status(204).end();
+  } catch (error) {
+    sendKnownError(res, error);
+  }
+});
+
+router.delete("/projects/:projectId/tasks", async (req, res) => {
+  if (!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED) {
+    res.status(503).json({
+      error: {
+        code: "PROJECT_DELETE_DISABLED",
+        message: "Website project physical deletion is not enabled",
+      },
+    });
+    return;
+  }
+  try {
+    const projectId = projectOrderProjectIdSchema.parse(req.params.projectId);
+    const snapshot = await readPresalesProjectTaskPurgeSnapshot(projectId);
+    let deletedTasks = 0;
+    let deletedFiles = 0;
+    for (const task of snapshot.tasks) {
+      const credential = await getPresalesCredentialById(task.apiCredentialId);
+      if (!credential) {
+        throw new AuthServiceError(
+          "DATABASE_UNAVAILABLE",
+          "项目任务的 API Key 版本不可用，无法确认上游物理删除",
+        );
+      }
+      const response = await axios.delete(
+        `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(task.taskId)}`,
+        {
+          headers: upstreamHeaders(credential.apiKey),
+          timeout: 60_000,
+          validateStatus: () => true,
+        },
+      );
+      const outcome = buildPresalesTaskDeleteOutcome(
+        response.status,
+        response.data,
+        credential.apiKey,
+      );
+      if (!outcome.ok) {
+        res.status(outcome.status).json(outcome.body);
+        return;
+      }
+      const fileIds = await readPresalesTaskEvidenceFileIds({
+        taskId: task.taskId,
+        apiCredentialId: task.apiCredentialId,
+      });
+      for (const fileId of fileIds) {
+        const fileResponse = await axios.delete(
+          `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
+          {
+            headers: upstreamHeaders(credential.apiKey),
+            timeout: 60_000,
+            validateStatus: () => true,
+          },
+        );
+        const fileOutcome = buildPresalesFileDeleteOutcome(
+          fileResponse.status,
+          fileResponse.data,
+          credential.apiKey,
+        );
+        if (!fileOutcome.ok) {
+          res.status(fileOutcome.status).json(fileOutcome.body);
+          return;
+        }
+      }
+      await Promise.all(
+        fileIds.flatMap((fileId: string) => [
+          removeStoredPresalesFile(fileId),
+          purgePresalesFileCreateReservation(fileId),
+        ]),
+      );
+      try {
+        await deletePresalesTaskEvidence({
+          taskId: task.taskId,
+          apiCredentialId: task.apiCredentialId,
+          deletedFileIds: fileIds,
+        });
+      } catch (error) {
+        if (
+          error instanceof AuthServiceError &&
+          error.code === "IDEMPOTENCY_PENDING"
+        ) {
+          res.setHeader("Retry-After", "2");
+          res.status(202).json({
+            schemaVersion: 1,
+            projectId,
+            status: "deleting",
+            deletedTasks,
+            deletedFiles,
+            pendingReservations: snapshot.pendingReservations + 1,
+            remainingTasks: snapshot.tasks.length,
+            retryAfterMs: 2_000,
+          });
+          return;
+        }
+        throw error;
+      }
+      deletedTasks += 1;
+    }
+
+    const files = await readPresalesProjectFileTargets(projectId);
+    const pendingFileUploads = await countPresalesProjectPendingFileUploads(
+      projectId,
+      { graceMs: UPSTREAM_TIMEOUT_MS },
+    );
+    if (pendingFileUploads > 0) {
+      res.setHeader("Retry-After", "2");
+      res.status(202).json({
+        schemaVersion: 1,
+        projectId,
+        status: "deleting",
+        deletedTasks,
+        deletedFiles,
+        pendingReservations: snapshot.pendingReservations + pendingFileUploads,
+        remainingTasks: snapshot.tasks.length,
+        retryAfterMs: 2_000,
+      });
+      return;
+    }
+    for (const file of files) {
+      const credential = await getPresalesCredentialById(file.apiCredentialId);
+      if (!credential) {
+        throw new AuthServiceError(
+          "DATABASE_UNAVAILABLE",
+          "项目文件的 API Key 版本不可用，无法确认上游物理删除",
+        );
+      }
+      const response = await axios.delete(
+        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(file.fileId)}`,
+        {
+          headers: upstreamHeaders(credential.apiKey),
+          timeout: 60_000,
+          validateStatus: () => true,
+        },
+      );
+      const outcome = buildPresalesFileDeleteOutcome(
+        response.status,
+        response.data,
+        credential.apiKey,
+      );
+      if (!outcome.ok) {
+        res.status(outcome.status).json(outcome.body);
+        return;
+      }
+      await Promise.all([
+        removeStoredPresalesFile(file.fileId),
+        purgePresalesFileCreateReservation(file.fileId),
+      ]);
+      await deletePresalesFileEvidence(file);
+      deletedFiles += 1;
+    }
+
+    const fileReservations =
+      await readPresalesProjectFileCreateReservations(projectId);
+    for (const file of fileReservations.files) {
+      const credential = await getPresalesCredentialById(file.apiCredentialId);
+      if (!credential) {
+        throw new AuthServiceError(
+          "DATABASE_UNAVAILABLE",
+          "项目文件预留的 API Key 版本不可用，无法确认上游物理删除",
+        );
+      }
+      const response = await axios.delete(
+        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(file.fileId)}`,
+        {
+          headers: upstreamHeaders(credential.apiKey),
+          timeout: 60_000,
+          validateStatus: () => true,
+        },
+      );
+      const outcome = buildPresalesFileDeleteOutcome(
+        response.status,
+        response.data,
+        credential.apiKey,
+      );
+      if (!outcome.ok) {
+        res.status(outcome.status).json(outcome.body);
+        return;
+      }
+      await Promise.all([
+        removeStoredPresalesFile(file.fileId),
+        purgePresalesFileCreateReservation(file.fileId),
+      ]);
+      await deletePresalesFileEvidence(file);
+      deletedFiles += 1;
+    }
+
+    if (fileReservations.pendingReservations > 0) {
+      res.setHeader("Retry-After", "2");
+      res.status(202).json({
+        schemaVersion: 1,
+        projectId,
+        status: "deleting",
+        deletedTasks,
+        deletedFiles,
+        pendingReservations:
+          snapshot.pendingReservations + fileReservations.pendingReservations,
+        remainingTasks: snapshot.tasks.length,
+        retryAfterMs: 2_000,
+      });
+      return;
+    }
+
+    const monitors = await purgePresalesProjectMonitorRuns({ projectId });
+    if (monitors.pendingRuns > 0) {
+      res.setHeader("Retry-After", "2");
+      res.status(202).json({
+        schemaVersion: 1,
+        projectId,
+        status: "deleting",
+        deletedTasks,
+        deletedFiles,
+        pendingReservations:
+          snapshot.pendingReservations + monitors.pendingRuns,
+        remainingTasks: snapshot.tasks.length,
+        retryAfterMs: 2_000,
+      });
+      return;
+    }
+
+    const completion = await completePresalesProjectTaskPurge(projectId);
+    if (!completion.completed) {
+      res.setHeader("Retry-After", "2");
+      res.status(202).json({
+        schemaVersion: 1,
+        projectId,
+        status: "deleting",
+        deletedTasks,
+        deletedFiles,
+        pendingReservations: completion.pendingReservations,
+        remainingTasks: completion.remainingTasks,
+        retryAfterMs: 2_000,
+      });
+      return;
+    }
+    res.json({
+      schemaVersion: 1,
+      projectId,
+      status: "deleted",
+      deletedTasks,
+      deletedFiles,
+      pendingReservations: 0,
+    });
   } catch (error) {
     sendKnownError(res, error);
   }

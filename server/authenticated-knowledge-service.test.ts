@@ -22,6 +22,7 @@ function publication(
       sourceTaskId: "task-1",
       sourceArtifactHash: ARCHIVE_HASH,
       archiveHash: ARCHIVE_HASH,
+      status: "active" as const,
       createdAt: PUBLISHED_AT,
       ...overrides.snapshot,
     },
@@ -94,6 +95,14 @@ describe("authenticated advanced knowledge publication", () => {
             sourceArtifactHash: null,
           },
         }),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not authenticate an archived publication", () => {
+    expect(
+      isAuthenticatedAdvancedKnowledgePublication(
+        publication({ snapshot: { status: "archived" } }),
       ),
     ).toBe(false);
   });

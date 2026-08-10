@@ -12,18 +12,73 @@ import {
   filterApiKeyUsageForAdmin,
   filterPreviewApiKeyUsageForAdmin,
   filterPreviewTicketsForAdmin,
+  formatJenovaCredits,
   getAdminNav,
   getPreviewAdminNav,
   getPreviewAdminWorkspaceHref,
   issueMonitorUrl,
   normalizeApiKeyUsageAlerts,
+  normalizeJenovaBrandTrackingCredentialRows,
   normalizeUsageHierarchy,
+  parseCredentialManagementDeepLink,
   usageHierarchyNeedsPolling,
   type KeyManagementRow,
 } from "./AdminDashboard";
 import { previewAdminNav } from "@/lib/preview-navigation";
 
 describe("administrator channel navigation", () => {
+  it("opens only validated API-management deep links", () => {
+    expect(
+      parseCredentialManagementDeepLink(
+        "?credentialUserId=42&credentialKind=customer&relatedTicketId=00000000-0000-4000-8000-000000000001",
+      ),
+    ).toEqual({
+      credentialType: "managed_api",
+      kind: "customer",
+      userId: 42,
+      relatedTicketId: "00000000-0000-4000-8000-000000000001",
+    });
+    expect(
+      parseCredentialManagementDeepLink(
+        "?credentialUserId=42&credentialKind=customer",
+      ),
+    ).toEqual({
+      credentialType: "managed_api",
+      kind: "customer",
+      userId: 42,
+    });
+    expect(
+      parseCredentialManagementDeepLink(
+        "?credentialType=jenova_brand_tracking&credentialUserId=42&relatedTicketId=00000000-0000-4000-8000-000000000001",
+      ),
+    ).toEqual({
+      credentialType: "jenova_brand_tracking",
+      kind: "customer",
+      userId: 42,
+      relatedTicketId: "00000000-0000-4000-8000-000000000001",
+    });
+    expect(
+      parseCredentialManagementDeepLink(
+        "?credentialType=jenova_brand_tracking&credentialUserId=42&credentialKind=engineer",
+      ),
+    ).toBeNull();
+    expect(
+      parseCredentialManagementDeepLink(
+        "?credentialType=unknown&credentialUserId=42&credentialKind=customer",
+      ),
+    ).toBeNull();
+    expect(
+      parseCredentialManagementDeepLink(
+        "?credentialUserId=42&credentialKind=customer&relatedTicketId=Jenova",
+      ),
+    ).toBeNull();
+    expect(
+      parseCredentialManagementDeepLink(
+        "?credentialUserId=0&credentialKind=customer",
+      ),
+    ).toBeNull();
+  });
+
   it.each([
     ["real", adminNav],
     ["preview", previewAdminNav],
@@ -35,7 +90,7 @@ describe("administrator channel navigation", () => {
         "官网任务与积分",
         "客户交付工作台",
         "客户项目团队",
-        "工单管理",
+        "需求管理",
         "账号与权限",
         "问题监控",
         "渠道分发",
@@ -100,7 +155,7 @@ describe("administrator channel navigation", () => {
     expect(deliveryAdminNavigation.map((item) => item.label)).toEqual([
       "客户管理",
       "客户项目团队",
-      "工单",
+      "需求",
       "FrontMind Agent",
       "账号与权限",
     ]);
@@ -136,7 +191,7 @@ describe("administrator channel navigation", () => {
     expect(deliveryNavigation.map((item) => item.label)).toEqual([
       "客户管理",
       "客户项目团队",
-      "工单",
+      "需求",
       "FrontMind Agent",
       "账号与权限",
     ]);
@@ -205,6 +260,14 @@ describe("administrator channel navigation", () => {
       "trpc.admin.apiKeyUsageAlerts.bulkReplaceTargetCredentials.useMutation()",
     );
     expect(source).toContain("批量配置 Key");
+    expect(source).toContain("通用 Agent Key");
+    expect(source).toContain("品牌追踪 Key");
+    expect(source).toContain("批量分配品牌追踪 Key");
+    expect(source).toContain("共享 Key 归因积分");
+    expect(source).toContain("刷新唯一 Key 积分余额");
+    expect(source).not.toContain("近 30 天费用");
+    expect(source).not.toContain("个人费用");
+    expect(source).not.toContain("美元");
     expect(source).toContain('confirmation: "BULK_REPLACE_API_KEYS"');
     expect(source).toContain("任一账号发生版本冲突都会全部回滚");
     expect(source).toContain('confirmation: "REPLACE_API_KEY"');
@@ -227,6 +290,40 @@ describe("administrator channel navigation", () => {
     expect(source).not.toContain("交付工单总览");
     expect(source).not.toContain("四角色交付状态");
     expect(source).not.toContain("stats?.pendingAssignment");
+  });
+
+  it("keeps Jenova accounting exact while presenting it as credits", () => {
+    const rows = normalizeJenovaBrandTrackingCredentialRows({
+      users: [
+        {
+          userId: 7,
+          username: "overseas.customer",
+          displayName: "海外客户",
+          keyConfigured: true,
+          credentialId: "00000000-0000-4000-8000-000000000001",
+          fingerprint: "shared-fingerprint",
+          rolling30DayCost: "1.00000001",
+          lifetimeCost: "12.50000000",
+          sharedKeyAttributedCost: "25.00000000",
+          sharedAccountCount: 2,
+          balance: "74.99999999",
+          limit: "10.00000000",
+          status: "active",
+        },
+      ],
+    });
+
+    expect(rows[0]).toMatchObject({
+      rolling30DayCost: "1.00000001",
+      sharedKeyAttributedCost: "25.00000000",
+      balance: "74.99999999",
+      sharedAccountCount: 2,
+    });
+    expect(formatJenovaCredits(rows[0]!.rolling30DayCost)).toBe(
+      "1,000.00001积分",
+    );
+    expect(formatJenovaCredits(rows[0]!.lifetimeCost)).toBe("12,500积分");
+    expect(formatJenovaCredits(rows[0]!.balance)).toBe("74,999.99999积分");
   });
 
   it("keeps system administrators and non-ok usage states in the unified hierarchy", () => {

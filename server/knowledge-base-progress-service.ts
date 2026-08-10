@@ -17,6 +17,7 @@ import type {
   KnowledgeBaseBuildStatus,
   KnowledgeBaseActiveTurnDto,
   KnowledgeBaseApprovedPresentationDto,
+  KnowledgeBaseCompletedTurnDto,
   KnowledgeBaseNoticeDto,
   KnowledgeBaseObservationDto,
   KnowledgeBasePackageDto,
@@ -76,7 +77,11 @@ import {
   type KnowledgeBasePresentationEnvelope,
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
-import type { KnowledgeBaseStagedArtifactCandidate } from "./knowledge-base-artifact-binding-service";
+import type {
+  KnowledgeBaseInitialLogoDisposition,
+  KnowledgeBaseRejectedInitialLogoDisposition,
+  KnowledgeBaseStagedArtifactCandidate,
+} from "./knowledge-base-artifact-binding-service";
 
 export type KnowledgeBaseUserAction =
   | "initial"
@@ -85,7 +90,7 @@ export type KnowledgeBaseUserAction =
   | "revise";
 
 type KnowledgeBaseStagedArtifacts = {
-  logo?: KnowledgeBaseStagedArtifactCandidate;
+  logo?: KnowledgeBaseInitialLogoDisposition;
   package?: KnowledgeBaseStagedArtifactCandidate;
 };
 
@@ -123,6 +128,53 @@ export function knowledgeBaseStagedArtifactMatchesAuthority(input: {
       candidate.taskId === (input.taskId || build.upstreamTaskId) &&
       candidate.taskId === activeTurn?.upstreamTaskId &&
       (activeTurn?.status === "queued" || activeTurn?.status === "running"),
+  );
+}
+
+export function knowledgeBaseRejectedInitialLogoMatchesAuthority(input: {
+  disposition: KnowledgeBaseRejectedInitialLogoDisposition;
+  userId: number;
+  build: Pick<
+    KnowledgeBaseBuild,
+    | "id"
+    | "generation"
+    | "stateEpoch"
+    | "revision"
+    | "activeTurnId"
+    | "upstreamTaskId"
+  >;
+  activeTurn?: Pick<
+    ConversationTurn,
+    "id" | "operationKey" | "upstreamTaskId" | "status"
+  >;
+  taskId?: string;
+  descriptorHashes?: readonly string[];
+}) {
+  const { disposition, build, activeTurn } = input;
+  if (!Array.isArray(disposition.descriptorHashes)) return false;
+  const expectedDescriptorHashes = [...disposition.descriptorHashes].sort();
+  const actualDescriptorHashes = input.descriptorHashes
+    ? [...input.descriptorHashes].sort()
+    : undefined;
+  return Boolean(
+    disposition.rejected === true &&
+      disposition.kind === "logo" &&
+      disposition.userId === input.userId &&
+      disposition.buildId === build.id &&
+      disposition.generation === build.generation &&
+      disposition.expectedStateEpoch === build.stateEpoch &&
+      disposition.expectedRevision === build.revision &&
+      disposition.turnId === build.activeTurnId &&
+      disposition.turnId === activeTurn?.id &&
+      disposition.operationKey === activeTurn?.operationKey &&
+      disposition.taskId === (input.taskId || build.upstreamTaskId) &&
+      disposition.taskId === activeTurn?.upstreamTaskId &&
+      (activeTurn?.status === "queued" || activeTurn?.status === "running") &&
+      (!actualDescriptorHashes ||
+        (actualDescriptorHashes.length === expectedDescriptorHashes.length &&
+          actualDescriptorHashes.every(
+            (hash, index) => hash === expectedDescriptorHashes[index],
+          ))),
   );
 }
 
@@ -348,6 +400,7 @@ function trustedKnowledgeBaseImageDescriptor(value: unknown) {
  */
 export function collectTrustedKnowledgeBaseOutputImageDescriptors(
   output: unknown,
+  options: { ignoreInvalidDescriptors?: boolean } = {},
 ) {
   const items = Array.isArray(output)
     ? output
@@ -370,7 +423,17 @@ export function collectTrustedKnowledgeBaseOutputImageDescriptors(
     ) {
       continue;
     }
-    const topLevel = trustedKnowledgeBaseImageDescriptor(rawItem);
+    let topLevel: KnowledgeBaseOutputImageDescriptor | null = null;
+    try {
+      topLevel = trustedKnowledgeBaseImageDescriptor(rawItem);
+    } catch (error) {
+      if (
+        !options.ignoreInvalidDescriptors ||
+        !(error instanceof KnowledgeBaseArtifactIdentityError)
+      ) {
+        throw error;
+      }
+    }
     if (topLevel && (!role || role === "assistant")) result.push(topLevel);
 
     if (
@@ -381,7 +444,17 @@ export function collectTrustedKnowledgeBaseOutputImageDescriptors(
       continue;
     }
     for (const content of rawItem.content) {
-      const descriptor = trustedKnowledgeBaseImageDescriptor(content);
+      let descriptor: KnowledgeBaseOutputImageDescriptor | null = null;
+      try {
+        descriptor = trustedKnowledgeBaseImageDescriptor(content);
+      } catch (error) {
+        if (
+          !options.ignoreInvalidDescriptors ||
+          !(error instanceof KnowledgeBaseArtifactIdentityError)
+        ) {
+          throw error;
+        }
+      }
       if (descriptor) result.push(descriptor);
     }
   }
@@ -420,8 +493,12 @@ export function collectTrustedKnowledgeBaseOutputImageDescriptors(
 export function collectKnowledgeBaseOutputImageKeys(
   value: unknown,
   result = new Set<string>(),
+  options: { ignoreInvalidDescriptors?: boolean } = {},
 ) {
-  const descriptors = collectTrustedKnowledgeBaseOutputImageDescriptors(value);
+  const descriptors = collectTrustedKnowledgeBaseOutputImageDescriptors(
+    value,
+    options,
+  );
   const physicalImages: Array<{
     aliases: Set<string>;
     fileId: string;
@@ -575,7 +652,11 @@ export function assertKnowledgeBaseNodeImageDelivery(input: {
 export function assertKnowledgeBaseInitialImageDelivery(
   output: unknown,
   operation?: KnowledgeBaseProtocolOperationIdentity,
-  options: { allowMissing?: boolean } = {},
+  options: {
+    allowMissing?: boolean;
+    allowMultiple?: boolean;
+    discardRejectedImages?: boolean;
+  } = {},
 ) {
   const scopedOutput = operation
     ? selectKnowledgeBaseProtocolOperationOutput(output, {
@@ -584,8 +665,14 @@ export function assertKnowledgeBaseInitialImageDelivery(
       })
     : latestKnowledgeBasePresentationOutput(output);
   assertKnowledgeBaseOutputHasNoInlineImages(scopedOutput);
-  const imageCount = collectKnowledgeBaseOutputImageKeys(scopedOutput).size;
+  if (options.discardRejectedImages === true) return 0;
+  const imageCount = options.allowMultiple
+    ? collectTrustedKnowledgeBaseOutputImageDescriptors(scopedOutput, {
+        ignoreInvalidDescriptors: true,
+      }).length
+    : collectKnowledgeBaseOutputImageKeys(scopedOutput).size;
   if (imageCount === 0 && options.allowMissing === true) return imageCount;
+  if (imageCount > 0 && options.allowMultiple === true) return imageCount;
   if (imageCount !== 1) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
@@ -593,6 +680,28 @@ export function assertKnowledgeBaseInitialImageDelivery(
     );
   }
   return imageCount;
+}
+
+export function collectKnowledgeBaseInitialOutputImageDescriptors(
+  output: unknown,
+  rejectedLogo?: KnowledgeBaseRejectedInitialLogoDisposition,
+  options: { ignoreInvalidDescriptors?: boolean } = {},
+) {
+  try {
+    return collectTrustedKnowledgeBaseOutputImageDescriptors(output, options);
+  } catch (error) {
+    if (
+      !rejectedLogo ||
+      rejectedLogo.rejectionCode !== "LOGO_UPLOAD_INVALID" ||
+      rejectedLogo.descriptorHashes.length !== 0 ||
+      !(error instanceof KnowledgeBaseArtifactIdentityError)
+    ) {
+      throw error;
+    }
+    // A conflicting typed resource identity is itself the reason this Logo
+    // was rejected. It must not prevent a valid Manifest/body from advancing.
+    return [];
+  }
 }
 
 function assertKnowledgeBaseOutputHasNoInlineImages(output: unknown) {
@@ -838,9 +947,14 @@ export function selectKnowledgeBaseProtocolOperationOutput(
 
   return output.filter((item, index) => {
     const claims = collectKnowledgeBaseOutputIdentityClaims(item);
-    const containsImage = collectKnowledgeBaseOutputImageKeys(item).size > 0;
-    const containsResource =
-      collectKnowledgeBaseOutputResourceProjections([item]).length > 0;
+    const containsImage =
+      collectTrustedKnowledgeBaseOutputImageDescriptors(item, {
+        ignoreInvalidDescriptors:
+          expected.stateKind === "frontmind.knowledge-base.manifest",
+      }).length > 0;
+    const containsResource = options.requireExplicitResourceOperation
+      ? collectKnowledgeBaseOutputResourceProjections([item]).length > 0
+      : false;
     if (
       (options.requireExplicitImageOperation && containsImage) ||
       (options.requireExplicitResourceOperation &&
@@ -998,9 +1112,12 @@ function reconciliationHash(input: {
   output: unknown;
   userText: string;
   attachmentCount: number;
+  ignoreInvalidImageDescriptors?: boolean;
 }) {
   const imageKeys = [
-    ...collectKnowledgeBaseOutputImageKeys(input.output),
+    ...collectKnowledgeBaseOutputImageKeys(input.output, new Set<string>(), {
+      ignoreInvalidDescriptors: input.ignoreInvalidImageDescriptors,
+    }),
   ].sort();
   const archiveKeys = collectKnowledgeArchiveDescriptors(input.output)
     .map((descriptor) => ({
@@ -1339,6 +1456,12 @@ function buildDto(
   ).length;
   const handled = confirmed + directPrefilled;
   const total = leaves.length;
+  const logoCanChange =
+    build.skillVersion === "4" &&
+    build.status === "confirming" &&
+    build.confirmedCount === 0 &&
+    build.directPrefilledCount === 0 &&
+    currentBuildRow?.ordinal === 0;
   return {
     build: {
       id: build.id,
@@ -1348,14 +1471,8 @@ function buildDto(
       status: build.status as KnowledgeBaseBuildStatus,
       revision: build.revision,
       currentLeafId: build.currentLeafId,
-      logoRequired:
-        build.skillVersion === "4" &&
-        build.status === "confirming" &&
-        build.revision === 0 &&
-        build.confirmedCount === 0 &&
-        build.directPrefilledCount === 0 &&
-        currentBuildRow?.ordinal === 0 &&
-        !build.logoSha256,
+      logoRequired: logoCanChange && !build.logoSha256,
+      logoAvailable: logoCanChange && Boolean(build.logoSha256),
       protocolError: build.protocolError,
       awaitingResponseSince: build.awaitingResponseSince?.getTime() ?? null,
       updatedAt: build.updatedAt.getTime(),
@@ -1735,11 +1852,73 @@ async function readKnowledgeBaseObservationProjection(
   const currentRow = build.currentLeafId
     ? rows.find((row) => row.leafId === build.currentLeafId) || null
     : null;
+  let terminalCompletedTurnRow: typeof conversationTurns.$inferSelect | null =
+    null;
+  if (
+    !build.activeTurnId &&
+    !currentRow &&
+    (build.status === "ready_to_publish" || build.status === "published")
+  ) {
+    if (build.lastAppliedOperationKey) {
+      // This is the exact durable operation that advanced the build. Do not
+      // guess from second-resolution timestamps: two turns can complete in the
+      // same second, and a later maintenance turn must not acknowledge the
+      // user's final optimistic request. operationKey is globally unique.
+      terminalCompletedTurnRow = await db
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, build.id),
+            eq(conversationTurns.buildGeneration, build.generation),
+            eq(conversationTurns.status, "completed"),
+            eq(conversationTurns.operationKey, build.lastAppliedOperationKey),
+          ),
+        )
+        .then(
+          (values: Array<typeof conversationTurns.$inferSelect>) =>
+            values.find(
+              (turn) =>
+                turn.status === "completed" &&
+                turn.operationKey === build.lastAppliedOperationKey,
+            ) || null,
+        );
+    } else {
+      // Legacy builds may predate operation provenance. Keep their historical
+      // fallback deterministic by adding the immutable turn id as a final
+      // tie-break; new builds never use this heuristic path.
+      terminalCompletedTurnRow = await db
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, build.id),
+            eq(conversationTurns.buildGeneration, build.generation),
+            eq(conversationTurns.status, "completed"),
+          ),
+        )
+        .orderBy(
+          desc(conversationTurns.completedAt),
+          desc(conversationTurns.updatedAt),
+          desc(conversationTurns.createdAt),
+          desc(conversationTurns.id),
+        )
+        .limit(1)
+        .then(
+          (values: Array<typeof conversationTurns.$inferSelect>) =>
+            values[0] || null,
+        );
+    }
+  }
   const relevantTurnIds = [
     ...new Set(
-      [build.activeTurnId, currentRow?.sourceTurnId].filter(
-        (turnId): turnId is string => Boolean(turnId),
-      ),
+      [
+        build.activeTurnId,
+        currentRow?.sourceTurnId,
+        terminalCompletedTurnRow?.id,
+      ].filter((turnId): turnId is string => Boolean(turnId)),
     ),
   ];
   const [activeTurnRow, presentationTurnRow, conversationRow, messageRows] =
@@ -1854,6 +2033,7 @@ async function readKnowledgeBaseObservationProjection(
     currentRow,
     activeTurnRow,
     presentationTurnRow,
+    terminalCompletedTurnRow,
     customerUploadResources,
     conversationRow,
     messageRows,
@@ -1874,6 +2054,10 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     | "metadata"
     | "status"
   > | null;
+  terminalCompletedTurnRow: Pick<
+    typeof conversationTurns.$inferSelect,
+    "id" | "clientRequestId" | "status"
+  > | null;
   customerUploadResources: KnowledgeBaseApprovedPresentationDto["resources"];
   conversationRow: { version: number } | null;
   messageRows: Array<{
@@ -1888,6 +2072,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     currentRow,
     activeTurnRow,
     presentationTurnRow,
+    terminalCompletedTurnRow,
     customerUploadResources,
     conversationRow,
     messageRows,
@@ -1944,6 +2129,27 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       messageSequence: messageSequence(activeTurnRow.id, "user"),
     };
   }
+
+  const completedTurnRow =
+    activeTurnRow?.status === "completed"
+      ? activeTurnRow
+      : presentationTurnRow?.status === "completed"
+        ? presentationTurnRow
+        : terminalCompletedTurnRow?.status === "completed"
+          ? terminalCompletedTurnRow
+          : null;
+  const completedMessageSequence = messageSequence(
+    completedTurnRow?.id,
+    "user",
+  );
+  const completedTurn: KnowledgeBaseCompletedTurnDto | null =
+    completedTurnRow?.clientRequestId && completedMessageSequence !== undefined
+      ? {
+          turnId: completedTurnRow.id,
+          clientRequestId: completedTurnRow.clientRequestId,
+          messageSequence: completedMessageSequence,
+        }
+      : null;
 
   const presentationOfficialLogoUpload = presentationTurnRow
     ? knowledgeBaseOfficialLogoUploadFromTurn(presentationTurnRow)
@@ -2055,7 +2261,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       code: "KNOWLEDGE_BASE_LOGO_REQUIRED",
       severity: "warning",
       message:
-        "未找到可用的企业官方主 Logo。请上传一张主 Logo 原图后继续；推荐透明 PNG，位图宽高均需至少 256 像素。",
+        "本轮未能绑定可下载并解码的企业主 Logo 图片。请上传一张 Logo 原图后继续；推荐透明 PNG。",
       retryable: false,
       turnId: null,
       createdAt: build.updatedAt.getTime(),
@@ -2090,6 +2296,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       ? activeTurnRow.upstreamTaskId
       : build.upstreamTaskId,
     activeTurn,
+    completedTurn,
     approvedPresentation,
     package: packageDto,
     notice,
@@ -2607,7 +2814,12 @@ function knowledgeBaseProtocolFailureObservationKey(input: {
     input.output,
   );
   const imageKeys = [
-    ...collectKnowledgeBaseOutputImageKeys(input.output),
+    ...collectKnowledgeBaseOutputImageKeys(input.output, new Set<string>(), {
+      // This hash is diagnostic/idempotency metadata only. A malformed image
+      // candidate must never replace the original protocol failure or prevent
+      // a later readable candidate in the same provider output from recovery.
+      ignoreInvalidDescriptors: true,
+    }),
   ].sort();
   const archiveKeys = collectKnowledgeArchiveDescriptors(input.output)
     .map((descriptor) => ({
@@ -2843,9 +3055,18 @@ export async function reconcileKnowledgeBaseProgress(input: {
               .for("update")
           )[0]
         : undefined;
+      const logoDisposition = input.stagedArtifacts?.logo;
+      const stagedLogo =
+        logoDisposition && "staged" in logoDisposition
+          ? logoDisposition
+          : undefined;
+      const rejectedLogo =
+        logoDisposition && "rejected" in logoDisposition
+          ? logoDisposition
+          : undefined;
       const stagedEntries = (
         [
-          ["logo", input.stagedArtifacts?.logo],
+          ["logo", stagedLogo],
           ["package", input.stagedArtifacts?.package],
         ] as const
       ).filter(
@@ -2872,6 +3093,18 @@ export async function reconcileKnowledgeBaseProgress(input: {
         // Download can race a retry/reset in another process. A candidate from
         // the superseded operation is only an orphan file; it has no authority
         // to parse or mutate the current turn.
+        return buildDto(build, rows);
+      }
+      if (
+        rejectedLogo &&
+        !knowledgeBaseRejectedInitialLogoMatchesAuthority({
+          disposition: rejectedLogo,
+          userId: input.userId,
+          build,
+          activeTurn,
+          taskId: input.taskId,
+        })
+      ) {
         return buildDto(build, rows);
       }
       const successfulTurnIdentity = knowledgeBaseSuccessfulTurnIdentity({
@@ -3009,6 +3242,8 @@ export async function reconcileKnowledgeBaseProgress(input: {
         output: authoritativeOutput,
         userText,
         attachmentCount,
+        ignoreInvalidImageDescriptors:
+          build.skillVersion === "4" && rows.length === 0,
       });
       if (build.lastReconciledHash === hash) {
         if (
@@ -3053,21 +3288,39 @@ export async function reconcileKnowledgeBaseProgress(input: {
               build.skillVersion === "4" &&
               classifyKnowledgeBaseUpstreamTaskStatus(input.upstreamStatus)
                 .settled,
+            allowMultiple: build.skillVersion === "4",
+            discardRejectedImages: Boolean(rejectedLogo),
           },
         );
-        const stagedLogo = input.stagedArtifacts?.logo;
         if (build.skillVersion === "4") {
-          const descriptors =
-            collectTrustedKnowledgeBaseOutputImageDescriptors(
-              authoritativeOutput,
-            );
+          const descriptors = collectKnowledgeBaseInitialOutputImageDescriptors(
+            authoritativeOutput,
+            rejectedLogo,
+            { ignoreInvalidDescriptors: true },
+          );
           if (
-            initialImageCount === 1 &&
+            rejectedLogo &&
+            !knowledgeBaseRejectedInitialLogoMatchesAuthority({
+              disposition: rejectedLogo,
+              userId: input.userId,
+              build,
+              activeTurn,
+              taskId: input.taskId,
+              descriptorHashes: descriptors.map((descriptor) =>
+                knowledgeBaseOutputImageDescriptorHash(descriptor),
+              ),
+            })
+          ) {
+            return buildDto(build, rows);
+          }
+          if (
+            initialImageCount > 0 &&
             (!stagedLogo ||
-              descriptors.length !== 1 ||
-              !stagedLogo.officialLogoProvenance ||
-              stagedLogo.descriptorHash !==
-                knowledgeBaseOutputImageDescriptorHash(descriptors[0]!))
+              !descriptors.some(
+                (descriptor) =>
+                  stagedLogo.descriptorHash ===
+                  knowledgeBaseOutputImageDescriptorHash(descriptor),
+              ))
           ) {
             throw new KnowledgeBaseBuildError(
               "PROGRESS_PROTOCOL_INVALID",
@@ -3219,15 +3472,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
               leaseExpiresAt: null,
               errorCode: null,
               errorMessage: null,
-              ...(stagedLogo?.officialLogoProvenance
-                ? {
-                    metadata: {
-                      ...activeTurnMetadata,
-                      boundOfficialLogoProvenance:
-                        stagedLogo.officialLogoProvenance,
-                    },
-                  }
-                : {}),
+              metadata: activeTurnMetadata,
             })
             .where(eq(conversationTurns.id, activeTurn.id));
         }

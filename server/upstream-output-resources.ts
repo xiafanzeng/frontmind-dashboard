@@ -22,10 +22,16 @@ function assertLedgerFileId(fileId: string) {
  * ledger collector on that same boundary prevents untrusted model-shaped JSON
  * from claiming or pinning an upstream file resource.
  */
-export function collectUpstreamOutputFileIds(value: unknown) {
+export function collectUpstreamOutputFileIds(
+  value: unknown,
+  options: { ignoreInvalidImageResources?: boolean } = {},
+) {
   const ids = new Set<string>();
   for (const projection of collectKnowledgeBaseOutputResourceProjections(
     value,
+    {
+      ignoreInvalidImageProjections: options.ignoreInvalidImageResources,
+    },
   )) {
     if (projection.fileId) ids.add(assertLedgerFileId(projection.fileId));
   }

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { and, asc, desc, eq, gt, inArray, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, or } from "drizzle-orm";
 
 import {
   knowledgeBaseBuilds,
@@ -21,6 +21,7 @@ import {
 } from "../drizzle/schema";
 import {
   EMPTY_SERVICE_QUOTA_USAGE,
+  QUESTION_CLASSIFICATION_V2_WRITES_ENABLED,
   SERVICE_PLAN_CATALOG,
   SERVICE_QUESTION_CATEGORY_LIMIT_KEYS,
   serviceCapabilityKeySchema,
@@ -32,14 +33,25 @@ import {
   type ServicePlanCode,
   type ServicePortal,
   type ServicePortalQuestion,
+  type SelectedServicePortalQuestion,
   type ServiceQuotaLimits,
   type ServiceQuotaUsage,
   type WorkspaceQuestionCategory,
 } from "../shared/service-portal";
 import { DELIVERY_TICKET_LIMITS } from "../shared/delivery-ticket";
 import { dashboardPayloadSchema } from "../shared/dashboard";
+import {
+  resolveBrandKeywordSelection,
+  type BrandKeywordSelectionReference,
+} from "./brand-keyword-selection";
 import { getDb } from "./db";
 import { getLatestAuthenticatedKnowledgeSnapshot } from "./authenticated-knowledge-service";
+import {
+  isUserQuestionPendingClassification,
+  questionCategoryForPublic,
+  UNCLASSIFIED_QUESTION_CANDIDATE_KEY,
+  UNCLASSIFIED_QUESTION_STORAGE_CATEGORY,
+} from "./question-selection-policy";
 
 export type PersistedServiceContractStatus =
   | "pending_confirmation"
@@ -99,6 +111,7 @@ type ServicePortalQuestionRecord = Pick<
   WorkspaceQuestion,
   | "id"
   | "quotaPeriodId"
+  | "candidateKey"
   | "category"
   | "question"
   | "source"
@@ -398,6 +411,7 @@ export function selectCurrentServiceContractIds(
 
 function publicQuestion(
   row: NonNullable<ServicePortalStateInput["selectedQuestions"]>[number],
+  confirmedResponseLogicQuestionIds: ReadonlySet<string> = new Set(),
 ): ServicePortalQuestion {
   return {
     id: row.id,
@@ -405,7 +419,10 @@ function publicQuestion(
     quotaPeriodId: row.quotaPeriodId,
     externalQuestionId: row.externalQuestionId ?? null,
     sourceQuestionId: row.sourceQuestionId ?? null,
-    category: workspaceQuestionCategorySchema.parse(row.category),
+    category: questionCategoryForPublic({
+      ...row,
+      category: workspaceQuestionCategorySchema.parse(row.category),
+    }),
     question: row.question,
     intent: row.intent ?? null,
     intentRevision: Math.max(1, row.intentRevision ?? 1),
@@ -414,15 +431,17 @@ function publicQuestion(
       ? epoch(row.intentConfirmedAt)
       : null,
     intentConfirmed: isWorkspaceQuestionIntentExplicitlyConfirmed(row),
+    // A replacement question is a new delivery unit. `sourceQuestionId` is
+    // lineage metadata for the historical page, never an output alias: using
+    // it here would make the replacement inherit the archived question's
+    // confirmed response logic.
+    responseLogicConfirmed: confirmedResponseLogicQuestionIds.has(row.id),
     rationale: row.rationale ?? null,
     evidence: row.evidence ?? [],
     risks: row.risks ?? [],
     source: row.source,
     status: row.status,
-    selectionApprovalStatus:
-      row.status === "selected"
-        ? "approved"
-        : (row.selectionApprovalStatus ?? "not_requested"),
+    selectionApprovalStatus: row.selectionApprovalStatus ?? "not_requested",
     selectionRequestedAt: row.selectionRequestedAt
       ? epoch(row.selectionRequestedAt)
       : null,
@@ -431,6 +450,22 @@ function publicQuestion(
       : null,
     locked: row.locked,
     revision: Math.max(1, row.revision),
+  };
+}
+
+function publicSelectedQuestion(
+  row: NonNullable<ServicePortalStateInput["selectedQuestions"]>[number],
+  confirmedResponseLogicQuestionIds: ReadonlySet<string> = new Set(),
+): SelectedServicePortalQuestion {
+  if (!["selected", "archived"].includes(row.status) || row.category === null) {
+    throw new ServiceEntitlementError(
+      "QUESTION_GENERATION_CONFLICT",
+      "已确认的问题缺少有效分类，请联系服务团队处理。",
+    );
+  }
+  return {
+    ...publicQuestion(row, confirmedResponseLogicQuestionIds),
+    category: workspaceQuestionCategorySchema.parse(row.category),
   };
 }
 
@@ -457,6 +492,15 @@ export function partitionSelectedQuestionsForPortal(input: {
   const historical: ServicePortalQuestionRecord[] = [];
 
   for (const question of input.questions) {
+    if (question.status === "archived") {
+      if (
+        question.selectionApprovalStatus === "approved" &&
+        question.category !== null
+      ) {
+        historical.push(question);
+      }
+      continue;
+    }
     if (question.status !== "selected") continue;
     const belongsToCurrentContract = Boolean(
       question.contractId && currentContractIds.has(question.contractId),
@@ -491,12 +535,21 @@ export function countSelectedQuestionUsage(
     ) {
       continue;
     }
-    if (question.category === "industry") usage.industry += 1;
-    if (question.category === "competitor_comparison") {
+    const category = workspaceQuestionCategorySchema.safeParse(
+      question.category,
+    );
+    if (!category.success) {
+      throw new ServiceEntitlementError(
+        "QUESTION_GENERATION_CONFLICT",
+        "已确认的问题缺少有效分类，请联系服务团队处理。",
+      );
+    }
+    if (category.data === "industry") usage.industry += 1;
+    if (category.data === "competitor_comparison") {
       usage.competitorComparison += 1;
     }
-    if (question.category === "reputation") usage.reputation += 1;
-    if (question.category === "product_scenario") {
+    if (category.data === "reputation") usage.reputation += 1;
+    if (category.data === "product_scenario") {
       usage.productScenario += 1;
     }
     usage.total += 1;
@@ -608,6 +661,7 @@ function deriveWorkflowSteps(input: {
   planCode: ServicePlanCode | null;
   hasKnowledge: boolean;
   questionSelectionComplete: boolean;
+  responseLogicStarted: boolean;
   responseLogicComplete: boolean;
   monitoringComplete: boolean;
   channelDistributionComplete: boolean;
@@ -643,17 +697,13 @@ function deriveWorkflowSteps(input: {
         : null;
   const monitoringReason =
     responseReason ??
-    (!input.responseLogicComplete
-      ? "请先在应答逻辑智能体逐题发布确认。"
+    (!input.responseLogicStarted
+      ? "请先在应答逻辑智能体确认至少一个问题。"
       : null);
   const distributionReason =
     monitoringReason ??
     (!input.monitoringComplete ? "请等待真实问题监控数据写入。" : null);
-  const reportReason =
-    distributionReason ??
-    (!input.channelDistributionComplete
-      ? "请等待可核验的渠道引用数据写入。"
-      : null);
+  const reportReason = monitoringReason;
   const item = (
     id: ServicePortal["workflowSteps"][number]["id"],
     label: string,
@@ -844,23 +894,16 @@ function deriveNextAction(input: {
   };
 }
 
-function questionIdentityKeys(question: ServicePortalQuestion): string[] {
-  return [
-    question.id,
-    question.externalQuestionId,
-    question.sourceQuestionId,
-  ].filter((value): value is string => Boolean(value));
-}
-
 function everyQuestionHasOutput(
   questions: ServicePortalQuestion[],
   outputQuestionIds: string[] | undefined,
 ) {
   if (questions.length === 0) return false;
   const ids = new Set(outputQuestionIds ?? []);
-  return questions.every((question) =>
-    questionIdentityKeys(question).some((id) => ids.has(id)),
-  );
+  // Output tables are normalized to the authoritative workspace-question id.
+  // External/source ids identify provenance only and must not carry old
+  // response logic or monitoring results into a replacement question.
+  return questions.every((question) => ids.has(question.id));
 }
 
 export function everyActiveQuotaPeriodHasProgressReport(
@@ -887,12 +930,17 @@ export function deriveServicePortalState(
     mode: "enforced" as const,
     pendingUserCount: 0,
   };
-  const selectedQuestions = (input.selectedQuestions ?? []).map(publicQuestion);
+  const confirmedResponseLogicQuestionIds = new Set(
+    input.confirmedResponseLogicQuestionIds ?? [],
+  );
+  const selectedQuestions = (input.selectedQuestions ?? []).map((question) =>
+    publicSelectedQuestion(question, confirmedResponseLogicQuestionIds),
+  );
   const selectedQuestionIds = new Set(
     selectedQuestions.map((question) => question.id),
   );
   const historicalQuestions = (input.historicalQuestions ?? [])
-    .map(publicQuestion)
+    .map((question) => publicSelectedQuestion(question))
     .filter((question) => !selectedQuestionIds.has(question.id));
   const periods =
     input.quotaPeriods ?? (input.quotaPeriod ? [input.quotaPeriod] : []);
@@ -932,6 +980,20 @@ export function deriveServicePortalState(
       ? hasDisplayKnowledge
       : Number.isInteger(authenticatedKnowledgeVersion);
   const capabilities = deriveCapabilities(status, planCode);
+  if (
+    status === "active" &&
+    capabilities.contentAssets.allowed &&
+    !hasKnowledge
+  ) {
+    capabilities.contentAssets = {
+      allowed: false,
+      effectiveStatus: "workflow_prerequisite",
+      reason:
+        planCode === "basic"
+          ? "请先等待 Website 流程自动同步或服务团队补录知识库；知识库展示完成后解锁 AI 友好内容资产。"
+          : "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。",
+    };
+  }
   const effectivelyReplacedContractIds = new Set(
     contracts.flatMap((value) =>
       deriveEffectiveServiceStatus(value, now) === "active"
@@ -1008,6 +1070,9 @@ export function deriveServicePortalState(
   // purchased slot remains possible throughout the period, but it must not
   // block work already approved by an administrator.
   const questionSelectionComplete = selectedQuestions.length > 0;
+  const responseLogicStarted = selectedQuestions.some(
+    (question) => question.responseLogicConfirmed,
+  );
   const responseLogicComplete =
     questionSelectionComplete &&
     everyQuestionHasOutput(
@@ -1024,7 +1089,7 @@ export function deriveServicePortalState(
       input.channelDistributionQuestionIds,
     );
   const progressReportComplete =
-    channelDistributionComplete && Boolean(input.hasProgressReport);
+    responseLogicStarted && Boolean(input.hasProgressReport);
   const nextAction = deriveNextAction({
     status,
     planCode,
@@ -1044,6 +1109,7 @@ export function deriveServicePortalState(
     planCode,
     hasKnowledge,
     questionSelectionComplete,
+    responseLogicStarted,
     responseLogicComplete,
     monitoringComplete,
     channelDistributionComplete,
@@ -1298,7 +1364,13 @@ async function loadPortalStateFromDatabase(
         .where(
           and(
             eq(workspaceQuestions.userId, userId),
-            eq(workspaceQuestions.status, "selected"),
+            or(
+              eq(workspaceQuestions.status, "selected"),
+              and(
+                eq(workspaceQuestions.status, "archived"),
+                eq(workspaceQuestions.selectionApprovalStatus, "approved"),
+              ),
+            ),
           ),
         )
         .orderBy(
@@ -1546,6 +1618,18 @@ export async function assertServiceCapability(
     await getServicePortal(userId, options),
   );
   if (
+    capability === "contentAssets" &&
+    !servicePortalHasRequiredKnowledge(portal)
+  ) {
+    throw new ServiceEntitlementError(
+      "KNOWLEDGE_SNAPSHOT_NOT_FOUND",
+      portal.service.planCode === "basic"
+        ? "请先等待 Website 流程自动同步或服务团队补录知识库；知识库展示完成后解锁 AI 友好内容资产。"
+        : "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。",
+      409,
+    );
+  }
+  if (
     portal.service.status === "unconfigured" &&
     portal.entitlementRollout.mode === "compatibility"
   ) {
@@ -1598,6 +1682,26 @@ export async function assertServiceCapability(
     );
   }
   return portal;
+}
+
+/**
+ * Basic uses the administrator-published display snapshot, while Advanced
+ * and Luxury require the knowledge-agent snapshot authenticated for the
+ * current service. The knowledge workflow step already projects that exact
+ * product distinction, so it is the primary source of truth.
+ */
+export function servicePortalHasRequiredKnowledge(portal: ServicePortal) {
+  if (portal.knowledge?.status !== "display_ready") return false;
+  const knowledgeStep = portal.workflowSteps?.find(
+    (step) => step.id === "knowledge",
+  );
+  if (portal.service.planCode === "basic") {
+    return !knowledgeStep || knowledgeStep.status === "complete";
+  }
+  return (
+    portal.knowledge.authenticatedForCurrentService === true &&
+    (!knowledgeStep || knowledgeStep.status === "complete")
+  );
 }
 
 async function requireServiceDb() {
@@ -1798,17 +1902,20 @@ export async function upsertServiceContract(
     const carryUsage: ServiceQuotaUsage = { ...EMPTY_SERVICE_QUOTA_USAGE };
     try {
       for (const question of carryoverQuestions) {
+        const category = workspaceQuestionCategorySchema.parse(
+          question.category,
+        );
         assertQuestionSelectionWithinQuota({
           limits: targetLimits,
           usage: carryUsage,
-          category: question.category,
+          category,
         });
-        if (question.category === "industry") carryUsage.industry += 1;
-        if (question.category === "competitor_comparison") {
+        if (category === "industry") carryUsage.industry += 1;
+        if (category === "competitor_comparison") {
           carryUsage.competitorComparison += 1;
         }
-        if (question.category === "reputation") carryUsage.reputation += 1;
-        if (question.category === "product_scenario") {
+        if (category === "reputation") carryUsage.reputation += 1;
+        if (category === "product_scenario") {
           carryUsage.productScenario += 1;
         }
         carryUsage.total += 1;
@@ -1929,7 +2036,7 @@ export async function upsertServiceContract(
         externalQuestionId: question.externalQuestionId,
         sourceQuestionId: question.sourceQuestionId ?? question.id,
         candidateKey: `carryover:${newContractId}:${question.id}`,
-        category: question.category,
+        category: workspaceQuestionCategorySchema.parse(question.category),
         question: question.question,
         intent: question.intent,
         rationale:
@@ -2956,6 +3063,7 @@ type WorkspaceQuestionSelectionRequest =
       expectedRevision: number;
       question?: never;
       category?: never;
+      classificationVersion?: never;
       now?: Date;
     }
   | {
@@ -2963,17 +3071,43 @@ type WorkspaceQuestionSelectionRequest =
       actorUserId: number;
       question: string;
       category: WorkspaceQuestionCategory;
+      classificationVersion?: never;
+      questionId?: never;
+      expectedRevision?: never;
+      now?: Date;
+    }
+  | {
+      userId: number;
+      actorUserId: number;
+      question: string;
+      classificationVersion: 2;
+      category?: never;
       questionId?: never;
       expectedRevision?: never;
       now?: Date;
     };
 
+export type WorkspaceQuestionTransactionHook = (
+  executor: any,
+  question: WorkspaceQuestion,
+) => Promise<void>;
+
 function comparableQuestionText(value: string) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
 
-function countReservedQuestionUsage(
-  questions: WorkspaceQuestion[],
+export function countReservedQuestionUsage(
+  questions: Array<
+    Pick<
+      WorkspaceQuestion,
+      | "quotaPeriodId"
+      | "status"
+      | "selectionApprovalStatus"
+      | "candidateKey"
+      | "category"
+      | "source"
+    >
+  >,
   quotaPeriodId: string,
 ): ServiceQuotaUsage {
   const usage: ServiceQuotaUsage = { ...EMPTY_SERVICE_QUOTA_USAGE };
@@ -2986,15 +3120,57 @@ function countReservedQuestionUsage(
       continue;
     }
     usage.total += 1;
+    if (isUserQuestionPendingClassification(question)) continue;
     if (question.category === "competitor_comparison") {
       usage.competitorComparison += 1;
     } else if (question.category === "product_scenario") {
       usage.productScenario += 1;
-    } else {
+    } else if (
+      question.category === "industry" ||
+      question.category === "reputation"
+    ) {
       usage[question.category] += 1;
     }
   }
   return usage;
+}
+
+export function resolveWorkspaceQuestionApprovalCategory(input: {
+  currentCategory: WorkspaceQuestionCategory | null;
+  requestedCategory?: WorkspaceQuestionCategory;
+}): WorkspaceQuestionCategory {
+  if (
+    input.currentCategory &&
+    input.requestedCategory &&
+    input.currentCategory !== input.requestedCategory
+  ) {
+    throw new ServiceEntitlementError(
+      "QUESTION_GENERATION_CONFLICT",
+      "已分类问题不能在审核时改为其他问题类型。",
+      409,
+    );
+  }
+  const category = input.currentCategory ?? input.requestedCategory;
+  if (!category) {
+    throw new ServiceEntitlementError(
+      "QUESTION_SELECTION_CONFIRMATION_REQUIRED",
+      "自主填写的问题必须先由服务团队选择问题类型。",
+      409,
+    );
+  }
+  return category;
+}
+
+function assertQuestionSelectionWithinTotalQuota(input: {
+  limits: ServiceQuotaLimits;
+  usage: ServiceQuotaUsage;
+}) {
+  if (input.usage.total >= input.limits.totalQuestionLimit) {
+    throw new ServiceEntitlementError(
+      "QUESTION_TOTAL_QUOTA_EXCEEDED",
+      "已达到当前服务周期的问题总额度。",
+    );
+  }
 }
 
 /**
@@ -3005,7 +3181,19 @@ function countReservedQuestionUsage(
  */
 export async function requestWorkspaceQuestionSelection(
   input: WorkspaceQuestionSelectionRequest,
+  options?: { afterWrite?: WorkspaceQuestionTransactionHook },
 ): Promise<ServicePortalQuestion> {
+  if (
+    "question" in input &&
+    input.classificationVersion === 2 &&
+    !QUESTION_CLASSIFICATION_V2_WRITES_ENABLED
+  ) {
+    throw new ServiceEntitlementError(
+      "QUESTION_NOT_CURRENT",
+      "问题分类能力正在升级，请稍后重试。",
+      503,
+    );
+  }
   const now = input.now ?? new Date();
   const portal = await assertServiceCapability(
     input.userId,
@@ -3023,6 +3211,8 @@ export async function requestWorkspaceQuestionSelection(
 
   const db = await requireServiceDb();
   return db.transaction(async (tx) => {
+    const pendingClassificationV2 =
+      "question" in input && input.classificationVersion === 2;
     const targetUsers = await tx
       .select({ id: users.id })
       .from(users)
@@ -3115,6 +3305,7 @@ export async function requestWorkspaceQuestionSelection(
         return toPublicWorkspaceQuestion(question);
       }
       if (question.selectionApprovalStatus === "pending") {
+        await options?.afterWrite?.(tx, question);
         return toPublicWorkspaceQuestion(question);
       }
       if (question.revision !== input.expectedRevision) {
@@ -3136,13 +3327,16 @@ export async function requestWorkspaceQuestionSelection(
       if (duplicate?.status === "selected") {
         return toPublicWorkspaceQuestion(duplicate);
       }
-      if (duplicate?.selectionApprovalStatus === "pending") {
+      if (
+        duplicate?.selectionApprovalStatus === "pending" &&
+        duplicate.source === "user"
+      ) {
+        await options?.afterWrite?.(tx, duplicate);
         return toPublicWorkspaceQuestion(duplicate);
       }
       if (duplicate) {
         question = duplicate;
       } else {
-        const category = workspaceQuestionCategorySchema.parse(input.category);
         question = {
           id: randomUUID(),
           userId: input.userId,
@@ -3150,8 +3344,12 @@ export async function requestWorkspaceQuestionSelection(
           quotaPeriodId: period.id,
           externalQuestionId: null,
           sourceQuestionId: null,
-          candidateKey: null,
-          category,
+          candidateKey: pendingClassificationV2
+            ? UNCLASSIFIED_QUESTION_CANDIDATE_KEY
+            : null,
+          category: pendingClassificationV2
+            ? UNCLASSIFIED_QUESTION_STORAGE_CATEGORY
+            : workspaceQuestionCategorySchema.parse(input.category),
           question: normalizedQuestion,
           intent: null,
           intentRevision: 1,
@@ -3189,17 +3387,53 @@ export async function requestWorkspaceQuestionSelection(
       productScenarioLimit: period.productScenarioLimit,
       totalQuestionLimit: period.totalQuestionLimit,
     };
-    assertQuestionSelectionWithinQuota({
-      limits,
-      usage: countReservedQuestionUsage(activeRows, period.id),
-      category: question.category,
-    });
+    const questionAlreadyExists = activeRows.some(
+      (row) => row.id === question!.id,
+    );
+    const reservedUsage = countReservedQuestionUsage(
+      questionAlreadyExists
+        ? activeRows.filter((row) => row.id !== question!.id)
+        : activeRows,
+      period.id,
+    );
+    if ("questionId" in input) {
+      const category = workspaceQuestionCategorySchema.parse(question.category);
+      assertQuestionSelectionWithinQuota({
+        limits,
+        usage: reservedUsage,
+        category,
+      });
+    } else if (pendingClassificationV2) {
+      assertQuestionSelectionWithinTotalQuota({ limits, usage: reservedUsage });
+    } else {
+      assertQuestionSelectionWithinQuota({
+        limits,
+        usage: reservedUsage,
+        category: workspaceQuestionCategorySchema.parse(input.category),
+      });
+    }
 
-    if (activeRows.some((row) => row.id === question!.id)) {
+    if (questionAlreadyExists) {
       const revision = question.revision + 1;
       await tx
         .update(workspaceQuestions)
         .set({
+          ...("question" in input
+            ? {
+                candidateKey: pendingClassificationV2
+                  ? UNCLASSIFIED_QUESTION_CANDIDATE_KEY
+                  : null,
+                category: pendingClassificationV2
+                  ? UNCLASSIFIED_QUESTION_STORAGE_CATEGORY
+                  : workspaceQuestionCategorySchema.parse(input.category),
+                question: normalizeCandidateText(
+                  input.question!,
+                  "目标问题",
+                  4_000,
+                ),
+                source: "user" as const,
+              }
+            : {}),
           selectionApprovalStatus: "pending",
           selectionRequestedAt: now,
           selectionRequestedByUserId: input.actorUserId,
@@ -3214,14 +3448,32 @@ export async function requestWorkspaceQuestionSelection(
             eq(workspaceQuestions.revision, question.revision),
           ),
         );
-      return toPublicWorkspaceQuestion({
+      const updatedQuestion: WorkspaceQuestion = {
         ...question,
+        ...("question" in input
+          ? {
+              candidateKey: pendingClassificationV2
+                ? UNCLASSIFIED_QUESTION_CANDIDATE_KEY
+                : null,
+              category: pendingClassificationV2
+                ? UNCLASSIFIED_QUESTION_STORAGE_CATEGORY
+                : workspaceQuestionCategorySchema.parse(input.category),
+              question: normalizeCandidateText(
+                input.question!,
+                "目标问题",
+                4_000,
+              ),
+              source: "user" as const,
+            }
+          : {}),
         selectionApprovalStatus: "pending",
         selectionRequestedAt: now,
         selectionRequestedByUserId: input.actorUserId,
         revision,
         updatedAt: now,
-      });
+      };
+      await options?.afterWrite?.(tx, updatedQuestion);
+      return toPublicWorkspaceQuestion(updatedQuestion);
     }
 
     const pendingQuestion: WorkspaceQuestion = {
@@ -3231,20 +3483,279 @@ export async function requestWorkspaceQuestionSelection(
       selectionRequestedByUserId: input.actorUserId,
     };
     await tx.insert(workspaceQuestions).values(pendingQuestion);
+    await options?.afterWrite?.(tx, pendingQuestion);
     return toPublicWorkspaceQuestion(pendingQuestion);
   });
 }
 
-export async function approveWorkspaceQuestionSelection(input: {
-  userId: number;
-  questionId: string;
-  expectedRevision: number;
-  actorUserId: number;
-  now?: Date;
-}): Promise<ServicePortalQuestion> {
-  const db = await requireServiceDb();
+/**
+ * Confirms one question from the immutable coordinates of the currently
+ * published brand keyword library. The published row is re-read while the
+ * quota period is locked, so neither question text nor category is trusted
+ * from the browser and selection is atomic with quota consumption.
+ */
+export async function confirmWorkspaceBrandKeywordSelection(
+  input: BrandKeywordSelectionReference & {
+    userId: number;
+    actorUserId: number;
+    expectedQuestion: string;
+    expectedCategory: WorkspaceQuestionCategory;
+    now?: Date;
+  },
+): Promise<ServicePortalQuestion> {
   const now = input.now ?? new Date();
+  const portal = await assertServiceCapability(
+    input.userId,
+    "questionSelection",
+    { now },
+  );
+  const currentPeriod = portal.quotas;
+  if (!currentPeriod || !portal.service.contractId) {
+    throw new ServiceEntitlementError(
+      "QUOTA_PERIOD_NOT_FOUND",
+      "当前服务周期尚未建立问题额度。",
+      404,
+    );
+  }
+
+  const db = await requireServiceDb();
   return db.transaction(async (tx) => {
+    const targetUsers = await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.id, input.userId))
+      .limit(1)
+      .for("update");
+    if (!targetUsers[0]) {
+      throw new ServiceEntitlementError(
+        "SERVICE_PLAN_UNCONFIGURED",
+        "用户不存在。",
+        404,
+      );
+    }
+
+    const periodRows = await tx
+      .select()
+      .from(serviceQuotaPeriods)
+      .where(
+        and(
+          eq(serviceQuotaPeriods.id, currentPeriod.periodId),
+          eq(serviceQuotaPeriods.userId, input.userId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    const period = periodRows[0];
+    if (!period) {
+      throw new ServiceEntitlementError(
+        "QUOTA_PERIOD_NOT_FOUND",
+        "当前问题额度周期不存在。",
+        404,
+      );
+    }
+
+    const contractRows = await tx
+      .select()
+      .from(serviceContracts)
+      .where(
+        and(
+          eq(serviceContracts.id, period.contractId),
+          eq(serviceContracts.userId, input.userId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    const contract = contractRows[0];
+    if (
+      !contract ||
+      deriveEffectiveServiceStatus(
+        contract as ServicePortalContractRecord,
+        now,
+      ) !== "active" ||
+      period.startsAt.getTime() > now.getTime() ||
+      period.endsAt.getTime() <= now.getTime()
+    ) {
+      throw new ServiceEntitlementError(
+        "QUESTION_NOT_CURRENT",
+        "当前问题额度周期已失效，请刷新服务状态后重试。",
+        403,
+      );
+    }
+
+    const dashboardRows = await tx
+      .select({
+        revision: userDashboardContents.revision,
+        payload: userDashboardContents.payload,
+      })
+      .from(userDashboardContents)
+      .where(eq(userDashboardContents.userId, input.userId))
+      .limit(1)
+      .for("update");
+    const dashboard = dashboardRows[0];
+    const parsedPayload = dashboardPayloadSchema.safeParse(dashboard?.payload);
+    if (!dashboard || !parsedPayload.success) {
+      throw new ServiceEntitlementError(
+        "QUESTION_NOT_CURRENT",
+        "品牌全域词库尚未发布，请刷新后重试。",
+        409,
+      );
+    }
+    const resolved = resolveBrandKeywordSelection({
+      workspace: {
+        revision: dashboard.revision,
+        payload: parsedPayload.data,
+      },
+      reference: input,
+    });
+    if (!resolved.ok) {
+      throw new ServiceEntitlementError(
+        "QUESTION_NOT_CURRENT",
+        resolved.message,
+      );
+    }
+    if (
+      comparableQuestionText(resolved.selection.question) !==
+        comparableQuestionText(input.expectedQuestion) ||
+      resolved.selection.category !== input.expectedCategory
+    ) {
+      throw new ServiceEntitlementError(
+        "QUESTION_NOT_CURRENT",
+        "品牌全域词库已更新，请刷新后重新选择。",
+      );
+    }
+
+    const activeRows = await tx
+      .select()
+      .from(workspaceQuestions)
+      .where(
+        and(
+          eq(workspaceQuestions.userId, input.userId),
+          eq(workspaceQuestions.quotaPeriodId, period.id),
+          inArray(workspaceQuestions.status, ["candidate", "selected"]),
+        ),
+      )
+      .for("update");
+    const comparable = comparableQuestionText(resolved.selection.question);
+    const existing = activeRows.find(
+      (row) => comparableQuestionText(row.question) === comparable,
+    );
+    if (existing?.status === "selected") {
+      if (existing.category !== resolved.selection.category) {
+        throw new ServiceEntitlementError(
+          "QUESTION_GENERATION_CONFLICT",
+          "该问题已按其他类型进入服务，请联系服务团队处理。",
+        );
+      }
+      return toPublicWorkspaceQuestion(existing);
+    }
+
+    const limits: ServiceQuotaLimits = {
+      industryLimit: period.industryLimit,
+      competitorComparisonLimit: period.competitorComparisonLimit,
+      reputationLimit: period.reputationLimit,
+      productScenarioLimit: period.productScenarioLimit,
+      totalQuestionLimit: period.totalQuestionLimit,
+    };
+    const reservedUsage = countReservedQuestionUsage(
+      existing
+        ? activeRows.filter((question) => question.id !== existing.id)
+        : activeRows,
+      period.id,
+    );
+    assertQuestionSelectionWithinQuota({
+      limits,
+      usage: reservedUsage,
+      category: resolved.selection.category,
+    });
+
+    const selectedAt = now;
+    if (existing) {
+      const revision = existing.revision + 1;
+      const values = {
+        category: resolved.selection.category,
+        question: resolved.selection.question,
+        source: "admin" as const,
+        status: "selected" as const,
+        selectionApprovalStatus: "approved" as const,
+        selectionRequestedAt: existing.selectionRequestedAt ?? selectedAt,
+        selectionRequestedByUserId:
+          existing.selectionRequestedByUserId ?? input.actorUserId,
+        selectionApprovedAt: selectedAt,
+        selectionApprovedByUserId: input.actorUserId,
+        locked: true,
+        selectedAt,
+        revision,
+        updatedAt: selectedAt,
+      };
+      await tx
+        .update(workspaceQuestions)
+        .set(values)
+        .where(
+          and(
+            eq(workspaceQuestions.id, existing.id),
+            eq(workspaceQuestions.revision, existing.revision),
+          ),
+        );
+      return toPublicWorkspaceQuestion({ ...existing, ...values });
+    }
+
+    const question: WorkspaceQuestion = {
+      id: randomUUID(),
+      userId: input.userId,
+      contractId: period.contractId,
+      quotaPeriodId: period.id,
+      externalQuestionId: null,
+      sourceQuestionId: null,
+      candidateKey: `brand-keyword:${input.tableId}:${input.rowIndex}`,
+      category: resolved.selection.category,
+      question: resolved.selection.question,
+      intent: null,
+      intentRevision: 1,
+      intentConfirmedRevision: null,
+      intentConfirmedAt: null,
+      intentConfirmedByUserId: null,
+      rationale: null,
+      evidence: [],
+      risks: [],
+      source: "admin",
+      status: "selected",
+      selectionApprovalStatus: "approved",
+      selectionRequestedAt: selectedAt,
+      selectionRequestedByUserId: input.actorUserId,
+      selectionApprovedAt: selectedAt,
+      selectionApprovedByUserId: input.actorUserId,
+      locked: true,
+      sourceTaskId: `dashboard:${input.dashboardRevision}`,
+      knowledgeSnapshotId: null,
+      ordinal: activeRows.length,
+      revision: 1,
+      selectedAt,
+      archivedAt: null,
+      createdByUserId: input.actorUserId,
+      createdAt: selectedAt,
+      updatedAt: selectedAt,
+    };
+    await tx.insert(workspaceQuestions).values(question);
+    return toPublicWorkspaceQuestion(question);
+  });
+}
+
+export async function approveWorkspaceQuestionSelection(
+  input: {
+    userId: number;
+    questionId: string;
+    expectedRevision: number;
+    actorUserId: number;
+    category?: WorkspaceQuestionCategory;
+    now?: Date;
+  },
+  options?: {
+    executor?: any;
+    afterWrite?: WorkspaceQuestionTransactionHook;
+  },
+): Promise<ServicePortalQuestion> {
+  const now = input.now ?? new Date();
+  const execute = async (tx: any) => {
     const targetUsers = await tx
       .select({ id: users.id })
       .from(users)
@@ -3276,16 +3787,6 @@ export async function approveWorkspaceQuestionSelection(input: {
         404,
       );
     }
-    if (candidate.status === "selected") {
-      return toPublicWorkspaceQuestion(candidate);
-    }
-    if (candidate.selectionApprovalStatus !== "pending") {
-      throw new ServiceEntitlementError(
-        "QUESTION_SELECTION_CONFIRMATION_REQUIRED",
-        "该问题尚未由用户提交专业审核。",
-        409,
-      );
-    }
     const periodRows = await tx
       .select()
       .from(serviceQuotaPeriods)
@@ -3305,21 +3806,42 @@ export async function approveWorkspaceQuestionSelection(input: {
         404,
       );
     }
-    // All candidate replacement and selection paths lock the quota period
-    // before question rows, preventing the inverse-order deadlock.
-    const rows = await tx
+    const contractRows = await tx
       .select()
-      .from(workspaceQuestions)
+      .from(serviceContracts)
       .where(
         and(
-          eq(workspaceQuestions.id, input.questionId),
-          eq(workspaceQuestions.userId, input.userId),
+          eq(serviceContracts.id, period.contractId),
+          eq(serviceContracts.userId, input.userId),
         ),
       )
       .limit(1)
       .for("update");
-    const question = rows[0];
-    if (!question || question.status === "archived") {
+    const contract = contractRows[0];
+    if (!contract) {
+      throw new ServiceEntitlementError(
+        "QUOTA_PERIOD_NOT_FOUND",
+        "当前问题额度周期不存在。",
+        404,
+      );
+    }
+    // Selection requests, trusted keyword confirmation and approval all lock
+    // user -> quota period -> contract -> active questions in the same order.
+    const activeRows = await tx
+      .select()
+      .from(workspaceQuestions)
+      .where(
+        and(
+          eq(workspaceQuestions.userId, input.userId),
+          eq(workspaceQuestions.quotaPeriodId, period.id),
+          inArray(workspaceQuestions.status, ["candidate", "selected"]),
+        ),
+      )
+      .for("update");
+    const question = activeRows.find(
+      (row: WorkspaceQuestion) => row.id === input.questionId,
+    );
+    if (!question || question.contractId !== period.contractId) {
       throw new ServiceEntitlementError(
         "QUESTION_NOT_FOUND",
         "候选问题不存在或已被替换。",
@@ -3327,6 +3849,7 @@ export async function approveWorkspaceQuestionSelection(input: {
       );
     }
     if (question.status === "selected") {
+      await options?.afterWrite?.(tx, question);
       return toPublicWorkspaceQuestion(question);
     }
     if (question.selectionApprovalStatus !== "pending") {
@@ -3342,36 +3865,18 @@ export async function approveWorkspaceQuestionSelection(input: {
         "候选问题已更新，请刷新后重试。",
       );
     }
-    const contractRows = await tx
-      .select()
-      .from(serviceContracts)
-      .where(
-        and(
-          eq(serviceContracts.id, question.contractId),
-          eq(serviceContracts.userId, input.userId),
-        ),
-      )
-      .limit(1)
-      .for("update");
-    const selectedRows = await tx
-      .select()
-      .from(workspaceQuestions)
-      .where(
-        and(
-          eq(workspaceQuestions.userId, input.userId),
-          eq(workspaceQuestions.quotaPeriodId, question.quotaPeriodId),
-          eq(workspaceQuestions.status, "selected"),
-        ),
-      )
-      .for("update");
-    const contract = contractRows[0];
-    if (!contract) {
-      throw new ServiceEntitlementError(
-        "QUOTA_PERIOD_NOT_FOUND",
-        "当前问题额度周期不存在。",
-        404,
-      );
-    }
+    const parsedCategory = isUserQuestionPendingClassification(question)
+      ? null
+      : workspaceQuestionCategorySchema.safeParse(question.category);
+    const category = resolveWorkspaceQuestionApprovalCategory({
+      currentCategory:
+        parsedCategory === null
+          ? null
+          : parsedCategory.success
+            ? parsedCategory.data
+            : null,
+      requestedCategory: input.category,
+    });
     const status = deriveEffectiveServiceStatus(
       contract as ServicePortalContractRecord,
       now,
@@ -3409,17 +3914,25 @@ export async function approveWorkspaceQuestionSelection(input: {
       productScenarioLimit: period.productScenarioLimit,
       totalQuestionLimit: period.totalQuestionLimit,
     };
-    const usage = countSelectedQuestionUsage(selectedRows, period.id);
+    const usage = countReservedQuestionUsage(
+      activeRows.filter(
+        (activeQuestion: WorkspaceQuestion) =>
+          activeQuestion.id !== question.id,
+      ),
+      period.id,
+    );
     assertQuestionSelectionWithinQuota({
       limits,
       usage,
-      category: question.category,
+      category,
     });
     const selectedAt = now;
     const revision = question.revision + 1;
     await tx
       .update(workspaceQuestions)
       .set({
+        candidateKey: null,
+        category,
         status: "selected",
         selectionApprovalStatus: "approved",
         selectionApprovedAt: selectedAt,
@@ -3435,8 +3948,10 @@ export async function approveWorkspaceQuestionSelection(input: {
           eq(workspaceQuestions.revision, question.revision),
         ),
       );
-    return toPublicWorkspaceQuestion({
+    const updatedQuestion: WorkspaceQuestion = {
       ...question,
+      candidateKey: null,
+      category,
       status: "selected",
       selectionApprovalStatus: "approved",
       selectionApprovedAt: selectedAt,
@@ -3445,6 +3960,11 @@ export async function approveWorkspaceQuestionSelection(input: {
       selectedAt,
       revision,
       updatedAt: selectedAt,
-    });
-  });
+    };
+    await options?.afterWrite?.(tx, updatedQuestion);
+    return toPublicWorkspaceQuestion(updatedQuestion);
+  };
+  if (options?.executor) return execute(options.executor);
+  const db = await requireServiceDb();
+  return db.transaction(execute);
 }
