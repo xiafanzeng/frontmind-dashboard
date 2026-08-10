@@ -1052,8 +1052,11 @@ export const serviceContracts = mysqlTable(
  * Period-bound quota snapshots generated from the purchased plan terms.
  * Controlled administrator/engineer overrides are revisioned and audited;
  * later contract revisions never rewrite historical periods.
- * Luxury contracts receive three monthly periods for one quarterly prepay;
- * advanced and basic contracts receive one period for their complete term.
+ * Legacy Luxury contracts receive three monthly periods for one quarterly
+ * term. Progressive Luxury contracts keep monthly operational periods across
+ * a twelve-month entitlement so publishing/reporting cadence remains monthly
+ * while question limits unlock cumulatively by service quarter. Advanced and
+ * Basic contracts receive one period for their complete term.
  */
 export const serviceQuotaPeriods = mysqlTable(
   "service_quota_periods",

@@ -33,6 +33,146 @@ import {
 export { ADMIN_WORKSPACE_TAB_IDS };
 export type { WorkspaceTab };
 
+type AdminServicePlanCode = "basic" | "advanced" | "luxury";
+
+type AdminServicePurchase = {
+  id: string;
+  planCode: AdminServicePlanCode;
+  status: string;
+  validFrom?: number | null;
+  validUntil?: number | null;
+};
+
+function shanghaiServiceDateInput(value: number) {
+  return new Date(value + 8 * 60 * 60 * 1_000).toISOString().slice(0, 10);
+}
+
+export function resolveAdminServiceStartsAtEpoch(input: {
+  dateInput: string;
+  sourcePlanCode?: AdminServicePlanCode | null;
+  targetPlanCode: AdminServicePlanCode;
+  currentContractId?: string | null;
+  purchases?: AdminServicePurchase[];
+}) {
+  const midnight = new Date(`${input.dateInput}T00:00:00+08:00`).getTime();
+  if (!Number.isFinite(midnight)) return null;
+  const source = input.purchases?.find(
+    (purchase) => purchase.id === input.currentContractId,
+  );
+  if (
+    input.sourcePlanCode === "luxury" &&
+    input.targetPlanCode === "luxury" &&
+    source?.planCode === "luxury" &&
+    Number.isFinite(source.validUntil) &&
+    shanghaiServiceDateInput(source.validUntil!) === input.dateInput
+  ) {
+    return source.validUntil!;
+  }
+  if (
+    source &&
+    source.planCode === input.sourcePlanCode &&
+    input.targetPlanCode === input.sourcePlanCode &&
+    Number.isFinite(source.validFrom) &&
+    shanghaiServiceDateInput(source.validFrom!) === input.dateInput
+  ) {
+    return source.validFrom!;
+  }
+  return midnight;
+}
+
+export function isAdminProgressiveLuxuryRenewal(input: {
+  sourcePlanCode?: AdminServicePlanCode | null;
+  targetPlanCode: AdminServicePlanCode;
+  currentContractId?: string | null;
+  targetStartsAt?: number | null;
+  purchases?: AdminServicePurchase[];
+}) {
+  if (
+    input.sourcePlanCode !== "luxury" ||
+    input.targetPlanCode !== "luxury" ||
+    !Number.isFinite(input.targetStartsAt)
+  ) {
+    return false;
+  }
+  const source = input.purchases?.find(
+    (purchase) => purchase.id === input.currentContractId,
+  );
+  return Boolean(
+    source?.planCode === "luxury" &&
+      Number.isFinite(source.validUntil) &&
+      input.targetStartsAt! >= source.validUntil!,
+  );
+}
+
+export function resolveAdminTargetLuxuryPlanVersion(input: {
+  sourcePlanCode?: AdminServicePlanCode | null;
+  sourcePlanVersion?: number | null;
+  sourceValidUntil?: number | null;
+  targetStartsAt?: number | null;
+}) {
+  return input.sourcePlanCode === "luxury" &&
+    (input.sourcePlanVersion ?? 1) < 2 &&
+    Number.isFinite(input.sourceValidUntil) &&
+    Number.isFinite(input.targetStartsAt) &&
+    input.targetStartsAt! < input.sourceValidUntil!
+    ? 1
+    : 2;
+}
+
+export function isFutureDatedServiceCancellation(input: {
+  status: string;
+  startsAt: number | null;
+  now?: number;
+}) {
+  return (
+    input.status === "cancelled" &&
+    Number.isFinite(input.startsAt) &&
+    input.startsAt! > (input.now ?? Date.now())
+  );
+}
+
+export function defaultAdminServiceCarryQuestionIds(input: {
+  sourcePlanCode?: AdminServicePlanCode | null;
+  targetPlanCode: AdminServicePlanCode;
+  currentContractId?: string | null;
+  targetStartsAt?: number | null;
+  purchases?: AdminServicePurchase[];
+  questions?: Array<{
+    id: string;
+    contractId?: string | null;
+    status: string;
+  }>;
+}) {
+  if (isAdminProgressiveLuxuryRenewal(input)) {
+    return [];
+  }
+  const activeBasicIds =
+    input.sourcePlanCode === "basic"
+      ? (input.purchases ?? [])
+          .filter(
+            (purchase) =>
+              purchase.planCode === "basic" &&
+              (purchase.status === "active" || purchase.status === "scheduled"),
+          )
+          .map((purchase) => purchase.id)
+      : [];
+  const sourceContractIds = activeBasicIds.length
+    ? activeBasicIds
+    : input.currentContractId
+      ? [input.currentContractId]
+      : [];
+  return (input.questions ?? [])
+    .filter(
+      (question) =>
+        question.status === "selected" &&
+        Boolean(
+          question.contractId &&
+            sourceContractIds.includes(question.contractId),
+        ),
+    )
+    .map((question) => question.id);
+}
+
 function toDateTimeLocal(value?: number | string | Date | null) {
   if (!value) return "";
   const date = new Date(value);
@@ -101,9 +241,7 @@ export default function AdminWorkspace({
     initialUserId,
   );
   const [dashboardOpen, setDashboardOpen] = useState(false);
-  const [servicePlan, setServicePlan] = useState<
-    "basic" | "advanced" | "luxury"
-  >("basic");
+  const [servicePlan, setServicePlan] = useState<AdminServicePlanCode>("basic");
   const [serviceStatus, setServiceStatus] = useState<
     "pending_confirmation" | "scheduled" | "active" | "suspended" | "cancelled"
   >("active");
@@ -242,34 +380,20 @@ export default function AdminWorkspace({
     );
     setServiceSignedAt(toDateTimeLocal(currentPurchase?.signedAt));
     setServiceSignatory(currentPurchase?.signatoryId ?? "");
-    const activeBasicIds =
-      service?.planCode === "basic"
-        ? (serviceQuery.data?.purchases ?? [])
-            .filter(
-              (purchase: any) =>
-                purchase.planCode === "basic" &&
-                (purchase.status === "active" ||
-                  purchase.status === "scheduled"),
-            )
-            .map((purchase: any) => purchase.id)
-        : [];
-    const sourceContractIds = activeBasicIds.length
-      ? activeBasicIds
-      : service?.contractId
-        ? [service.contractId]
-        : [];
     setCarryQuestionIds(
-      (questionPortfolioQuery.data?.questions ?? [])
-        .filter(
-          (question: any) =>
-            question.status === "selected" &&
-            sourceContractIds.includes(question.contractId),
-        )
-        .map((question: any) => question.id),
+      defaultAdminServiceCarryQuestionIds({
+        sourcePlanCode: service?.planCode,
+        targetPlanCode: nextPlan ?? "basic",
+        currentContractId: service?.contractId,
+        targetStartsAt: service?.validFrom,
+        purchases: serviceQuery.data?.purchases,
+        questions: questionPortfolioQuery.data?.questions,
+      }),
     );
   }, [
     questionPortfolioQuery.data?.questions,
     selectedUserId,
+    serviceQuery.data?.purchases,
     serviceQuery.data?.service,
   ]);
 
@@ -330,6 +454,34 @@ export default function AdminWorkspace({
     snapshotLoading: knowledgeQuery.isLoading,
     snapshotError: knowledgeQuery.error?.message ?? null,
   };
+
+  const serviceStartsAtEpoch = serviceStartsAt
+    ? resolveAdminServiceStartsAtEpoch({
+        dateInput: serviceStartsAt,
+        sourcePlanCode: serviceQuery.data?.service?.planCode,
+        targetPlanCode: servicePlan,
+        currentContractId: serviceQuery.data?.service?.contractId,
+        purchases: serviceQuery.data?.purchases,
+      })
+    : null;
+  const progressiveLuxuryRenewal = isAdminProgressiveLuxuryRenewal({
+    sourcePlanCode: serviceQuery.data?.service?.planCode,
+    targetPlanCode: servicePlan,
+    currentContractId: serviceQuery.data?.service?.contractId,
+    targetStartsAt: serviceStartsAtEpoch,
+    purchases: serviceQuery.data?.purchases,
+  });
+  const serviceTermination = serviceStatus === "cancelled";
+  const currentServicePurchase = serviceQuery.data?.purchases?.find(
+    (purchase: AdminServicePurchase) =>
+      purchase.id === serviceQuery.data?.service?.contractId,
+  );
+  const targetLuxuryPlanVersion = resolveAdminTargetLuxuryPlanVersion({
+    sourcePlanCode: serviceQuery.data?.service?.planCode,
+    sourcePlanVersion: serviceQuery.data?.service?.planVersion,
+    sourceValidUntil: currentServicePurchase?.validUntil,
+    targetStartsAt: serviceStartsAtEpoch,
+  });
 
   const refreshDashboardWorkspace = async () => {
     await Promise.all([
@@ -761,6 +913,19 @@ export default function AdminWorkspace({
                                 | "advanced"
                                 | "luxury";
                               setServicePlan(nextPlan);
+                              setCarryQuestionIds(
+                                defaultAdminServiceCarryQuestionIds({
+                                  sourcePlanCode:
+                                    serviceQuery.data?.service?.planCode,
+                                  targetPlanCode: nextPlan,
+                                  currentContractId:
+                                    serviceQuery.data?.service?.contractId,
+                                  targetStartsAt: serviceStartsAtEpoch,
+                                  purchases: serviceQuery.data?.purchases,
+                                  questions:
+                                    questionPortfolioQuery.data?.questions,
+                                }),
+                              );
                             }}
                             className="mt-2 h-10 w-full rounded-xl border border-[#ddd3e4] bg-white px-3 text-sm text-[#332842]"
                           >
@@ -768,6 +933,13 @@ export default function AdminWorkspace({
                             <option value="advanced">进阶版</option>
                             <option value="luxury">豪华版</option>
                           </select>
+                          {servicePlan === "luxury" && (
+                            <span className="mt-2 block text-[11px] font-normal leading-5 text-[#8b8496]">
+                              {targetLuxuryPlanVersion >= 2
+                                ? "豪华版 v2 为 12 个月权益，按季度自动解锁问题额度；预付月份仍按 3 个月记录。"
+                                : "当前为豪华版 v1 重叠修正：继续沿用原 3 个月合同与完整问题额度；到期续费时才进入 v2 季度解锁。"}
+                            </span>
+                          )}
                         </label>
                         <label className="text-xs font-semibold text-[#716a80]">
                           生效日期
@@ -775,9 +947,34 @@ export default function AdminWorkspace({
                             type="date"
                             className="mt-2"
                             value={serviceStartsAt}
-                            onChange={(event) =>
-                              setServiceStartsAt(event.target.value)
-                            }
+                            onChange={(event) => {
+                              const nextStartsAt = event.target.value;
+                              setServiceStartsAt(nextStartsAt);
+                              setCarryQuestionIds(
+                                defaultAdminServiceCarryQuestionIds({
+                                  sourcePlanCode:
+                                    serviceQuery.data?.service?.planCode,
+                                  targetPlanCode: servicePlan,
+                                  currentContractId:
+                                    serviceQuery.data?.service?.contractId,
+                                  targetStartsAt: nextStartsAt
+                                    ? resolveAdminServiceStartsAtEpoch({
+                                        dateInput: nextStartsAt,
+                                        sourcePlanCode:
+                                          serviceQuery.data?.service?.planCode,
+                                        targetPlanCode: servicePlan,
+                                        currentContractId:
+                                          serviceQuery.data?.service
+                                            ?.contractId,
+                                        purchases: serviceQuery.data?.purchases,
+                                      })
+                                    : null,
+                                  purchases: serviceQuery.data?.purchases,
+                                  questions:
+                                    questionPortfolioQuery.data?.questions,
+                                }),
+                              );
+                            }}
                           />
                         </label>
                         <label className="text-xs font-semibold text-[#716a80]">
@@ -825,11 +1022,21 @@ export default function AdminWorkspace({
                         ) && (
                           <div className="lg:col-span-3 rounded-2xl border border-[#e7dced] bg-[#fbf9fd] p-4">
                             <p className="text-sm font-semibold text-[#332842]">
-                              升级后继续服务的问题
+                              新合同中继续服务的问题
                             </p>
                             <p className="mt-1 text-xs leading-5 text-[#857e91]">
-                              已勾选问题会复制到新套餐并计入对应分类额度；若超额，保存会被服务端拒绝，必须先明确保留项。
+                              豪华版年度续费默认不结转，旧问题保留为历史；其他套餐与跨套餐升级沿用当前选择，也可手动调整。已勾选问题会复制到新套餐并计入额度，超额时保存会被拒绝。
                             </p>
+                            {progressiveLuxuryRenewal && (
+                              <p className="mt-2 text-xs font-medium text-[#7a4aa1]">
+                                当前生效日期属于豪华版年度续费，旧问题仅保留为历史，不能勾选结转。
+                              </p>
+                            )}
+                            {serviceTermination && (
+                              <p className="mt-2 text-xs font-medium text-[#7a4aa1]">
+                                取消合同会立即终止当前问题工作流，旧问题不会结转。
+                              </p>
+                            )}
                             <div className="mt-3 space-y-2">
                               {(questionPortfolioQuery.data?.questions ?? [])
                                 .filter(
@@ -844,6 +1051,10 @@ export default function AdminWorkspace({
                                     <input
                                       type="checkbox"
                                       className="mt-1"
+                                      disabled={
+                                        progressiveLuxuryRenewal ||
+                                        serviceTermination
+                                      }
                                       checked={carryQuestionIds.includes(
                                         question.id,
                                       )}
@@ -891,9 +1102,20 @@ export default function AdminWorkspace({
                                 });
                                 return;
                               }
-                              const startsAt = new Date(
-                                `${serviceStartsAt}T00:00:00+08:00`,
-                              ).getTime();
+                              if (serviceStartsAtEpoch === null) return;
+                              const startsAt = serviceStartsAtEpoch;
+                              if (
+                                isFutureDatedServiceCancellation({
+                                  status: serviceStatus,
+                                  startsAt,
+                                })
+                              ) {
+                                toast.error("暂不支持预约取消", {
+                                  description:
+                                    "请在合同需要终止的当天执行取消，避免提前影响仍在处理的问题与交付需求。",
+                                });
+                                return;
+                              }
                               const currentContractId =
                                 serviceQuery.data?.service?.contractId;
                               const activeBasicIds =
@@ -940,9 +1162,13 @@ export default function AdminWorkspace({
                                   signatoryId:
                                     serviceSignatory.trim() || undefined,
                                   sourceContractIds,
-                                  carryQuestionIds: carryQuestionIds.filter(
-                                    (id) => allowedCarryIds.has(id),
-                                  ),
+                                  carryQuestionIds:
+                                    progressiveLuxuryRenewal ||
+                                    serviceTermination
+                                      ? []
+                                      : carryQuestionIds.filter((id) =>
+                                          allowedCarryIds.has(id),
+                                        ),
                                 });
                               } catch (error) {
                                 toast.error("服务版本更新失败", {

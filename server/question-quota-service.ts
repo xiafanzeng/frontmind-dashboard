@@ -19,7 +19,13 @@ import {
 } from "./admin-control-plane-service";
 import { getDb } from "./db";
 import {
+  SERVICE_QUESTION_QUOTA_ANCHOR_ORDINAL,
   deriveEffectiveServiceStatus,
+  isOperationalServiceQuotaPeriod,
+  isProgressiveLuxuryContract,
+  resolveEffectiveServiceQuestionQuotaLimits,
+  resolveServiceQuestionQuotaScope,
+  resolveServiceQuestionQuotaUnlockMetadata,
   selectPortalContract,
   type ServicePortalContractRecord,
 } from "./service-entitlement";
@@ -50,6 +56,10 @@ export type QuestionQuotaState = {
   validFrom: number;
   validUntil: number;
   limits: ServiceQuotaLimits;
+  unlockedLimits: ServiceQuotaLimits;
+  unlockStage: { current: number; total: number };
+  nextUnlockAt: number | null;
+  progressiveUnlock: boolean;
   selectedUsage: ServiceQuotaUsage;
   reservedUsage: ServiceQuotaUsage;
   remaining: ServiceQuotaUsage;
@@ -80,7 +90,10 @@ function addQuestionUsage(
 }
 
 /** Selected rows are consumed; pending approvals are an additional soft hold. */
-export function countQuestionQuotaUsage(rows: QuestionQuotaUsageRow[]) {
+export function countQuestionQuotaUsage(
+  rows: QuestionQuotaUsageRow[],
+  options?: { reserveUnclassifiedAcrossCategories?: boolean },
+) {
   const selectedUsage = emptyUsage();
   const reservedUsage = emptyUsage();
   for (const row of rows) {
@@ -100,6 +113,12 @@ export function countQuestionQuotaUsage(rows: QuestionQuotaUsageRow[]) {
           }))
       ) {
         reservedUsage.total += 1;
+        if (options?.reserveUnclassifiedAcrossCategories) {
+          reservedUsage.industry += 1;
+          reservedUsage.competitorComparison += 1;
+          reservedUsage.reputation += 1;
+          reservedUsage.productScenario += 1;
+        }
       } else {
         addQuestionUsage(reservedUsage, row.category);
       }
@@ -147,19 +166,41 @@ function quotaRemaining(
 }
 
 function toQuestionQuotaState(input: {
+  contract: ServicePortalContractRecord;
   period: typeof serviceQuotaPeriods.$inferSelect;
   rows: QuestionQuotaUsageRow[];
-  limits?: ServiceQuotaLimits;
+  now: Date;
+  storedLimits?: ServiceQuotaLimits;
   revision?: number;
 }): QuestionQuotaState {
-  const limits = input.limits ?? quotaLimits(input.period);
-  const usage = countQuestionQuotaUsage(input.rows);
+  const period = input.storedLimits
+    ? { ...input.period, ...input.storedLimits }
+    : input.period;
+  const limits = resolveEffectiveServiceQuestionQuotaLimits({
+    contract: input.contract,
+    period,
+    now: input.now,
+  });
+  const unlock = resolveServiceQuestionQuotaUnlockMetadata({
+    contract: input.contract,
+    period,
+    now: input.now,
+  });
+  const usage = countQuestionQuotaUsage(input.rows, {
+    reserveUnclassifiedAcrossCategories: isProgressiveLuxuryContract(
+      input.contract,
+    ),
+  });
   return {
     periodId: input.period.id,
     revision: input.revision ?? input.period.revision,
     validFrom: input.period.startsAt.getTime(),
     validUntil: input.period.endsAt.getTime(),
     limits,
+    unlockedLimits: unlock.unlockedLimits,
+    unlockStage: unlock.unlockStage,
+    nextUnlockAt: unlock.nextUnlockAt,
+    progressiveUnlock: isProgressiveLuxuryContract(input.contract),
     selectedUsage: usage.selectedUsage,
     reservedUsage: usage.reservedUsage,
     remaining: quotaRemaining(limits, usage.reservedUsage),
@@ -180,6 +221,7 @@ export function validateQuestionQuotaAdjustment(input: {
   expectedRevision: number;
   currentRevision: number;
   limits: Omit<ServiceQuotaLimits, "totalQuestionLimit">;
+  maximumLimits?: ServiceQuotaLimits;
   reservedUsage: ServiceQuotaUsage;
 }) {
   if (input.expectedRevision !== input.currentRevision) {
@@ -205,6 +247,12 @@ export function validateQuestionQuotaAdjustment(input: {
     ["totalQuestionLimit", "问题总数"],
   ];
   for (const [key, label] of labels) {
+    if (input.maximumLimits && limits[key] > input.maximumLimits[key]) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        `${label}额度不能超过当前已解锁上限 ${input.maximumLimits[key]}`,
+      );
+    }
     if (limits[key] < minimums[key]) {
       throw new AuthServiceError(
         "CONFLICT",
@@ -215,7 +263,11 @@ export function validateQuestionQuotaAdjustment(input: {
   return { limits, revision: input.currentRevision + 1 };
 }
 
-function questionUsageRows(executor: any, userId: number, periodId: string) {
+function questionUsageRows(
+  executor: any,
+  userId: number,
+  scope: ReturnType<typeof resolveServiceQuestionQuotaScope>,
+) {
   return executor
     .select({
       category: workspaceQuestions.category,
@@ -228,7 +280,9 @@ function questionUsageRows(executor: any, userId: number, periodId: string) {
     .where(
       and(
         eq(workspaceQuestions.userId, userId),
-        eq(workspaceQuestions.quotaPeriodId, periodId),
+        scope.kind === "contract"
+          ? eq(workspaceQuestions.contractId, scope.contractId)
+          : eq(workspaceQuestions.quotaPeriodId, scope.periodId),
         inArray(workspaceQuestions.status, ["candidate", "selected"]),
         or(
           eq(workspaceQuestions.status, "selected"),
@@ -268,20 +322,22 @@ export async function getQuestionQuotaState(input: {
       and(
         eq(serviceQuotaPeriods.userId, input.customerUserId),
         eq(serviceQuotaPeriods.contractId, contract.id),
+        gt(serviceQuotaPeriods.ordinal, SERVICE_QUESTION_QUOTA_ANCHOR_ORDINAL),
         lte(serviceQuotaPeriods.startsAt, now),
         gt(serviceQuotaPeriods.endsAt, now),
       ),
     )
     .orderBy(asc(serviceQuotaPeriods.ordinal))
     .limit(1);
-  const period = periodRows[0];
+  const period = periodRows.find(isOperationalServiceQuotaPeriod);
   if (!period) return null;
+  const scope = resolveServiceQuestionQuotaScope(contract, period);
   const rows = (await questionUsageRows(
     input.executor,
     input.customerUserId,
-    period.id,
+    scope,
   )) as QuestionQuotaUsageRow[];
-  return toQuestionQuotaState({ period, rows });
+  return toQuestionQuotaState({ contract, period, rows, now });
 }
 
 type QuestionQuotaDependencies = {
@@ -393,6 +449,8 @@ export async function adjustMyCustomerQuestionQuota(input: {
       currentContract.id !== period.contractId ||
       deriveEffectiveServiceStatus(currentContract, now) !== "active" ||
       !isEditableQuestionPlan(currentContract.planCode) ||
+      (isProgressiveLuxuryContract(currentContract) &&
+        !isOperationalServiceQuotaPeriod(period)) ||
       period.startsAt.getTime() > now.getTime() ||
       period.endsAt.getTime() <= now.getTime()
     ) {
@@ -402,12 +460,21 @@ export async function adjustMyCustomerQuestionQuota(input: {
       );
     }
 
+    const scope = resolveServiceQuestionQuotaScope(currentContract, period);
     const rows = (await questionUsageRows(
       tx,
       assignment.customerUserId,
-      period.id,
+      scope,
     ).for("update")) as QuestionQuotaUsageRow[];
-    const usage = countQuestionQuotaUsage(rows);
+    const usage = countQuestionQuotaUsage(rows, {
+      reserveUnclassifiedAcrossCategories:
+        isProgressiveLuxuryContract(currentContract),
+    });
+    const unlock = resolveServiceQuestionQuotaUnlockMetadata({
+      contract: currentContract,
+      period,
+      now,
+    });
     const next = validateQuestionQuotaAdjustment({
       expectedRevision: input.value.expectedRevision,
       currentRevision: period.revision,
@@ -417,6 +484,9 @@ export async function adjustMyCustomerQuestionQuota(input: {
         reputationLimit: input.value.reputationLimit,
         productScenarioLimit: input.value.productScenarioLimit,
       },
+      maximumLimits: isProgressiveLuxuryContract(currentContract)
+        ? unlock.unlockedLimits
+        : undefined,
       reservedUsage: usage.reservedUsage,
     });
 
@@ -455,6 +525,7 @@ export async function adjustMyCustomerQuestionQuota(input: {
           previousRevision: period.revision,
           revision: next.revision,
           previousLimits: quotaLimits(period),
+          unlockedLimits: unlock.unlockedLimits,
           limits: next.limits,
           selectedUsage: usage.selectedUsage,
           reservedUsage: usage.reservedUsage,
@@ -466,9 +537,11 @@ export async function adjustMyCustomerQuestionQuota(input: {
     return {
       success: true as const,
       questionQuota: toQuestionQuotaState({
+        contract: currentContract,
         period,
         rows,
-        limits: next.limits,
+        now,
+        storedLimits: next.limits,
         revision: next.revision,
       }),
     };

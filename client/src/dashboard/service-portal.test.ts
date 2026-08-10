@@ -218,6 +218,116 @@ describe("service portal adapter", () => {
     ]);
   });
 
+  it("keeps the authoritative luxury unlock schedule separate from the unlocked cap", () => {
+    const nextUnlockAt = Date.parse("2026-10-01T00:00:00+08:00");
+    const portal = normalizeServicePortal({
+      schemaVersion: 1,
+      service: {
+        planCode: "luxury",
+        planName: "豪华版",
+        status: "active",
+      },
+      quotas: {
+        limits: {
+          industryLimit: 1,
+          competitorComparisonLimit: 1,
+          reputationLimit: 1,
+          productScenarioLimit: 5,
+          totalQuestionLimit: 8,
+        },
+        entitlementLimits: {
+          industryLimit: 4,
+          competitorComparisonLimit: 4,
+          reputationLimit: 4,
+          productScenarioLimit: 20,
+          totalQuestionLimit: 32,
+        },
+        usage: {
+          industry: 1,
+          competitorComparison: 1,
+          reputation: 1,
+          productScenario: 5,
+          total: 8,
+        },
+        unlockStage: { current: 1, total: 4 },
+        nextUnlockAt,
+        capacityState: "awaiting_unlock",
+      },
+    });
+
+    expect(portal.quotaUnlock).toEqual({
+      current: 1,
+      total: 4,
+      nextUnlockAt: String(nextUnlockAt),
+      capacityState: "awaiting_unlock",
+    });
+    expect(
+      portal.quotas.map(({ limit, entitlementLimit }) => ({
+        limit,
+        entitlementLimit,
+      })),
+    ).toEqual([
+      { limit: 1, entitlementLimit: 4 },
+      { limit: 1, entitlementLimit: 4 },
+      { limit: 1, entitlementLimit: 4 },
+      { limit: 5, entitlementLimit: 20 },
+    ]);
+  });
+
+  it("keeps an already-normalized quota unlock view idempotent", () => {
+    const portal = normalizeServicePortal({
+      plan: { code: "luxury", name: "豪华版" },
+      quotas: [
+        {
+          key: "scenario",
+          label: "产品场景词",
+          limit: 5,
+          entitlementLimit: 20,
+          used: 1,
+          unit: "个词",
+        },
+      ],
+      quotaUnlock: {
+        current: 1,
+        total: 4,
+        nextUnlockAt: "2026-10-18",
+        capacityState: "available",
+      },
+    });
+
+    expect(portal.quotaUnlock).toEqual({
+      current: 1,
+      total: 4,
+      nextUnlockAt: "2026-10-18",
+      capacityState: "available",
+    });
+    expect(portal.quotas[0]).toMatchObject({
+      limit: 5,
+      entitlementLimit: 20,
+      used: 1,
+    });
+  });
+
+  it("ignores an unknown capacity state and preserves legacy quota behavior", () => {
+    const portal = normalizeServicePortal({
+      service: { planCode: "luxury", status: "active" },
+      quotas: {
+        limits: {
+          industryLimit: 1,
+          competitorComparisonLimit: 1,
+          reputationLimit: 1,
+          productScenarioLimit: 5,
+          totalQuestionLimit: 8,
+        },
+        usage: {},
+        capacityState: "provider_paused",
+      },
+    });
+
+    expect(portal.quotaUnlock).toBeUndefined();
+    expect(portal.quotas[0]).not.toHaveProperty("entitlementLimit");
+  });
+
   it("defensively locks knowledge building for a basic plan", () => {
     const portal = normalizeServicePortal({
       schemaVersion: 1,

@@ -1245,16 +1245,33 @@ function PreviewServiceManager({
       },
       luxury: {
         name: "豪华版",
-        quota: "4 行业排名词 · 4 竞品对比词 · 4 美誉舆情词 · 20 产品场景词",
+        quota:
+          "第一服务季度开放 1 行业排名词 · 1 竞品对比词 · 1 美誉舆情词 · 5 产品场景词",
         quotaItems: [
-          { category: "industry", label: "行业排名词", limit: 4 },
+          {
+            category: "industry",
+            label: "行业排名词",
+            limit: 1,
+            entitlementLimit: 4,
+          },
           {
             category: "competitor_comparison",
             label: "竞品对比词",
-            limit: 4,
+            limit: 1,
+            entitlementLimit: 4,
           },
-          { category: "reputation", label: "美誉舆情词", limit: 4 },
-          { category: "product_scenario", label: "产品场景词", limit: 20 },
+          {
+            category: "reputation",
+            label: "美誉舆情词",
+            limit: 1,
+            entitlementLimit: 4,
+          },
+          {
+            category: "product_scenario",
+            label: "产品场景词",
+            limit: 5,
+            entitlementLimit: 20,
+          },
         ],
       },
     } as const
@@ -1317,6 +1334,12 @@ function PreviewServiceManager({
           data-testid="preview-service-plan-quota"
         >
           <p className="text-xs font-semibold text-[#716a80]">当前权益</p>
+          {plan === "luxury" && (
+            <p className="mt-2 text-xs leading-5 text-[#716a80]">
+              第 1/4 服务季度 · 当前已解锁 8 / 全年 32
+              个问题；以后每个服务季度新增 1、1、1、5 个额度。
+            </p>
+          )}
           {planMeta.quotaItems ? (
             <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               {planMeta.quotaItems.map((item) => (
@@ -1331,6 +1354,11 @@ function PreviewServiceManager({
                   <strong className="fm-question-category-ink text-base">
                     {item.limit} 个词
                   </strong>
+                  {"entitlementLimit" in item && (
+                    <small className="text-xs text-[#857e91]">
+                      全年 {item.entitlementLimit} 个词
+                    </small>
+                  )}
                 </span>
               ))}
             </div>

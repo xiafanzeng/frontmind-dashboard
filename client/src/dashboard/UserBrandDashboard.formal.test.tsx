@@ -348,6 +348,37 @@ const portalPayload = {
   purchaseActions: [],
 };
 
+function progressiveLuxuryQuotas(
+  capacityState: "available" | "awaiting_unlock" | "exhausted",
+) {
+  return {
+    limits: {
+      industryLimit: 1,
+      competitorComparisonLimit: 1,
+      reputationLimit: 1,
+      productScenarioLimit: 5,
+      totalQuestionLimit: 8,
+    },
+    entitlementLimits: {
+      industryLimit: 4,
+      competitorComparisonLimit: 4,
+      reputationLimit: 4,
+      productScenarioLimit: 20,
+      totalQuestionLimit: 32,
+    },
+    usage: {
+      industry: 1,
+      competitorComparison: 1,
+      reputation: 1,
+      productScenario: 5,
+      total: 8,
+    },
+    unlockStage: { current: 1, total: 4 },
+    nextUnlockAt: "2026-10-01T00:00:00+08:00",
+    capacityState,
+  };
+}
+
 describe("UserBrandDashboard formal workspace", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -1553,6 +1584,58 @@ describe("UserBrandDashboard formal workspace", () => {
         "当前服务的问题额度已用满，请联系服务管理员调整当前服务问题。",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("keeps new questions disabled until the next authoritative luxury unlock", () => {
+    portalUseQuery.mockReturnValue({
+      data: {
+        portal: {
+          ...portalPayload,
+          quotas: progressiveLuxuryQuotas("awaiting_unlock"),
+        },
+      },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    });
+    render(<UserBrandDashboard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "问题优化" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "目标问题" }), {
+      target: { value: "下一季度可以新增这个问题吗？" },
+    });
+
+    expect(screen.getByRole("button", { name: "下一季度开放" })).toBeDisabled();
+    expect(
+      screen.getByText(/本季度已解锁的问题额度已用完，下一季度额度将于/),
+    ).toHaveTextContent("2026");
+    expect(
+      screen.queryByText(/联系服务管理员调整当前服务问题/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("marks formal word-bank candidates as opening next quarter", () => {
+    portalUseQuery.mockReturnValue({
+      data: {
+        portal: {
+          ...portalPayload,
+          quotas: progressiveLuxuryQuotas("awaiting_unlock"),
+        },
+      },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    });
+    render(<UserBrandDashboard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
+
+    const candidate = screen.getByRole("button", { name: "下一季度开放" });
+    expect(candidate).toBeDisabled();
+    fireEvent.click(candidate);
+    expect(
+      screen.queryByRole("textbox", { name: "目标问题" }),
+    ).not.toBeInTheDocument();
   });
 
   it("renders the administrator-published phased roadmap in the formal progress report", () => {

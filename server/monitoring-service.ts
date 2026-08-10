@@ -565,6 +565,7 @@ export function deriveMonitoringReadQuotaPeriodIds(input: {
   capabilityAllowed: boolean;
   compatibilityMode: boolean;
   currentQuotaPeriodIds: readonly string[];
+  compatibilityQuotaPeriodIds?: readonly string[];
   historicalQuotaPeriodIds?: readonly (string | null)[];
 }): string[] | undefined {
   if (input.serviceStatus === "unconfigured" && input.compatibilityMode) {
@@ -586,7 +587,12 @@ export function deriveMonitoringReadQuotaPeriodIds(input: {
     ];
   }
 
-  return [...new Set(input.currentQuotaPeriodIds)];
+  return [
+    ...new Set([
+      ...input.currentQuotaPeriodIds,
+      ...(input.compatibilityQuotaPeriodIds ?? []),
+    ]),
+  ];
 }
 
 export async function resolveMonitoringReadQuotaPeriodIds(
@@ -613,6 +619,14 @@ export async function resolveMonitoringReadQuotaPeriodIds(
     capabilityAllowed: portal.capabilities.monitoring.allowed,
     compatibilityMode,
     currentQuotaPeriodIds: portal.quotaPeriods.map((period) => period.periodId),
+    // During a rollback, image 6dd200ca binds monitoring imports to the
+    // question's annual ordinal-0 anchor. Keep that persisted output readable
+    // after roll-forward without ever using the anchor for new writes.
+    compatibilityQuotaPeriodIds:
+      portal.service.planCode === "luxury" &&
+      (portal.service.planVersion ?? 1) >= 2
+        ? portal.purchasedQuestions.map((question) => question.quotaPeriodId)
+        : [],
     historicalQuotaPeriodIds,
   });
 }
@@ -1158,6 +1172,56 @@ export async function replaceMonitoringCurrentTemplateBatches(input: {
   });
 }
 
+export function resolveMonitoringBatchQuotaScope(input: {
+  portal: Pick<ServicePortal, "service" | "quotas" | "quotaPeriods">;
+  referencedQuestions: Array<
+    Pick<
+      ServicePortal["purchasedQuestions"][number],
+      "contractId" | "quotaPeriodId"
+    >
+  >;
+}) {
+  const contractIds = new Set(
+    input.referencedQuestions
+      .map((question) => question.contractId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const quotaPeriodIds = new Set(
+    input.referencedQuestions
+      .map((question) => question.quotaPeriodId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const contractId = [...contractIds][0] ?? null;
+  const progressiveLuxury =
+    input.portal.service.planCode === "luxury" &&
+    (input.portal.service.planVersion ?? 1) >= 2 &&
+    contractId === input.portal.service.contractId;
+  const quotaPeriodId = progressiveLuxury
+    ? (input.portal.quotas?.periodId ?? null)
+    : ([...quotaPeriodIds][0] ?? null);
+  const legacyScopeIsActive = Boolean(
+    contractId &&
+      quotaPeriodId &&
+      input.portal.quotaPeriods.some(
+        (period) =>
+          period.contractId === contractId && period.periodId === quotaPeriodId,
+      ),
+  );
+  if (
+    contractIds.size !== 1 ||
+    !quotaPeriodId ||
+    (progressiveLuxury
+      ? contractId !== input.portal.service.contractId
+      : quotaPeriodIds.size !== 1 || !legacyScopeIsActive)
+  ) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "一次监控导入只能包含同一合同与有效额度周期内的当前服务问题",
+    );
+  }
+  return { contractId, quotaPeriodId, progressiveLuxury };
+}
+
 export async function replaceMonitoringBatch(input: {
   actor: AuthenticatedUser;
   value: ReplaceMonitoringBatchInput;
@@ -1186,24 +1250,10 @@ export async function replaceMonitoringBatch(input: {
       .filter((id): id is string => Boolean(id))
       .some((id) => referencedQuestionIds.has(id)),
   );
-  const contractIds = new Set(
-    referencedQuestions
-      .map((question) => question.contractId)
-      .filter((id): id is string => Boolean(id)),
-  );
-  const quotaPeriodIds = new Set(
-    referencedQuestions
-      .map((question) => question.quotaPeriodId)
-      .filter((id): id is string => Boolean(id)),
-  );
-  if (contractIds.size !== 1 || quotaPeriodIds.size !== 1) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "一次监控导入只能包含同一合同与额度周期内的当前服务问题",
-    );
-  }
-  const contractId = [...contractIds][0]!;
-  const quotaPeriodId = [...quotaPeriodIds][0]!;
+  const { contractId, quotaPeriodId } = resolveMonitoringBatchQuotaScope({
+    portal,
+    referencedQuestions,
+  });
   const questions = [
     ...new Map(
       portal.purchasedQuestions.flatMap((question) =>

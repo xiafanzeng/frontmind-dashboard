@@ -84,6 +84,7 @@ import {
 } from "../upstream-config";
 import { createPaymentReceiptLedgerService } from "../payment-receipt-ledger-service";
 import { createProjectOrderRegistryService } from "../project-order-registry-service";
+import { startServiceContractLifecycleReconciliationScheduler } from "../service-entitlement";
 import knowledgeBaseLivePreviewApi from "../knowledge-base-live-preview-api";
 import knowledgeBaseArtifactApi from "../knowledge-base-artifact-api";
 import { auditKnowledgeBaseStateInvariants } from "../knowledge-base-invariant-audit";
@@ -499,6 +500,7 @@ async function startServer() {
       startDeliveryTicketRetentionScheduler();
       startConversationRetentionScheduler();
       startJenovaBrandTrackingRecoveryScheduler();
+      startServiceContractLifecycleReconciliationScheduler();
       startFileContentRetentionScheduler({
         // Let the conversation transaction finish its initial pass before the
         // file worker reconciles newly orphaned resources.

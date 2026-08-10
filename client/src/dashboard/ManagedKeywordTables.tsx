@@ -18,6 +18,16 @@ export type ManagedKeywordTable = {
   rows: unknown[][];
 };
 
+export type ManagedKeywordQuotaAvailability = Partial<
+  Record<
+    KeywordCategoryKey,
+    {
+      available: boolean;
+      unavailableLabel?: string;
+    }
+  >
+>;
+
 type ManagedKeywordTablesProps = {
   tables: ManagedKeywordTable[];
   loading?: boolean;
@@ -28,6 +38,7 @@ type ManagedKeywordTablesProps = {
     tableId: string;
     rowIndex: number;
   }) => void;
+  quotaAvailability?: ManagedKeywordQuotaAvailability;
 };
 
 const KEYWORD_SOURCE_DESCRIPTION =
@@ -150,6 +161,7 @@ export default function ManagedKeywordTables({
   loading = false,
   error,
   onUseQuestion,
+  quotaAvailability,
 }: ManagedKeywordTablesProps) {
   const [searchTerm, setSearchTerm] = useState("");
   const [tableFilter, setTableFilter] = useState("all");
@@ -437,6 +449,9 @@ export default function ManagedKeywordTables({
                           const category = keywordCategoryKey(
                             row[tableCategoryColumnIndex],
                           );
+                          const quotaAccess = category
+                            ? quotaAvailability?.[category]
+                            : undefined;
                           return (
                             <tr key={`${table.id}-${rowIndex}`}>
                               {table.displayColumns.map(
@@ -499,7 +514,11 @@ export default function ManagedKeywordTables({
                                   <button
                                     type="button"
                                     className="keyword-optimize-button disabled:cursor-not-allowed disabled:opacity-50"
-                                    disabled={!question || !category}
+                                    disabled={
+                                      !question ||
+                                      !category ||
+                                      quotaAccess?.available === false
+                                    }
                                     onClick={() =>
                                       category &&
                                       onUseQuestion({
@@ -510,7 +529,10 @@ export default function ManagedKeywordTables({
                                       })
                                     }
                                   >
-                                    选择并进入问题优化
+                                    {quotaAccess?.available === false
+                                      ? quotaAccess.unavailableLabel ||
+                                        "该类额度已满"
+                                      : "选择并进入问题优化"}
                                   </button>
                                 </td>
                               )}

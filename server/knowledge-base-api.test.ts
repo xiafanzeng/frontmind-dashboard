@@ -14,7 +14,9 @@ import {
   KnowledgeBaseOpenRecoveryLeaseError,
   KnowledgeBaseUpstreamCreateError,
   KNOWLEDGE_BASE_AGENT_PROFILE,
+  KNOWLEDGE_BASE_MANUAL_LOGO_DISPLAY_MESSAGE,
   KNOWLEDGE_BASE_MANUAL_LOGO_PENDING_MESSAGE,
+  KNOWLEDGE_BASE_MANUAL_LOGO_USER_INSTRUCTION,
   KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
   KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
   KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS,
@@ -34,6 +36,7 @@ import {
   isApprovedKnowledgeBaseAwaitingInputObservation,
   knowledgeBaseArtifactFailureNotice,
   knowledgeBaseManualLogoCreateFailureForPersistence,
+  knowledgeBaseManualLogoUnclassifiedFailureResponse,
   knowledgeBaseManualLogoPendingResponse,
   knowledgeBaseManualLogoDeterministicCreateFailureStatus,
   knowledgeBaseManualLogoTerminalFailure,
@@ -149,6 +152,56 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(JSON.stringify(response.body)).not.toMatch(/manus/iu);
   });
 
+  it("keeps the upstream Logo instruction out of the customer-visible message", () => {
+    expect(KNOWLEDGE_BASE_MANUAL_LOGO_DISPLAY_MESSAGE).toBe(
+      "已提交新的企业官方主 Logo，正在重新呈现当前知识节点。",
+    );
+    expect(KNOWLEDGE_BASE_MANUAL_LOGO_DISPLAY_MESSAGE).not.toContain(
+      "不得确认或推进节点",
+    );
+    expect(KNOWLEDGE_BASE_MANUAL_LOGO_USER_INSTRUCTION).toContain(
+      "不得确认或推进节点",
+    );
+  });
+
+  it("keeps unclassified manual Logo failures recoverable without claiming a pre-reservation submit", () => {
+    const observation = { generation: 4, stateEpoch: 9 } as any;
+    expect(
+      knowledgeBaseManualLogoUnclassifiedFailureResponse({
+        reservationAcquired: true,
+        observation,
+        retryAfterMs: 1_250,
+      }),
+    ).toEqual({
+      status: 425,
+      retryAfterSeconds: "2",
+      body: {
+        error: {
+          code: "IDEMPOTENCY_PENDING",
+          message: "FrontMind 已接收 Logo，正在重新呈现当前知识节点",
+        },
+        observation,
+      },
+    });
+    expect(
+      knowledgeBaseManualLogoUnclassifiedFailureResponse({
+        reservationAcquired: false,
+        observation,
+        retryAfterMs: 1_250,
+      }),
+    ).toEqual({
+      status: 503,
+      retryAfterSeconds: "2",
+      body: {
+        error: {
+          code: "KNOWLEDGE_BASE_LOGO_SUBMISSION_UNCERTAIN",
+          message: "Logo 提交结果暂未确认，系统将按同一请求自动重试",
+        },
+        observation,
+      },
+    });
+  });
+
   it("keeps deterministic manual Logo validation and coordinate failures terminal", () => {
     expect(
       knowledgeBaseManualLogoTerminalFailure(
@@ -208,17 +261,20 @@ describe("knowledge-base turn HTTP outcomes", () => {
     },
   );
 
-  it("does not map recoverable manual Logo provider failures to terminal statuses", () => {
-    expect(
-      knowledgeBaseManualLogoDeterministicCreateFailureStatus(
-        new KnowledgeBaseUpstreamCreateError(
-          "retriable",
-          "UPSTREAM_CREATE_HTTP_503",
-          503,
+  it.each([
+    [425, "UPSTREAM_CREATE_HTTP_425"],
+    [409, "UPSTREAM_CREATE_HTTP_409"],
+    [503, "UPSTREAM_CREATE_HTTP_503"],
+  ])(
+    "does not map recoverable manual Logo provider status %i to a terminal response",
+    (status, code) => {
+      expect(
+        knowledgeBaseManualLogoDeterministicCreateFailureStatus(
+          new KnowledgeBaseUpstreamCreateError("retriable", code, status),
         ),
-      ),
-    ).toBeNull();
-  });
+      ).toBeNull();
+    },
+  );
 
   it("keeps a successful create response without a task id pending for manual Logo reconciliation", () => {
     const missingTaskId = new KnowledgeBaseUpstreamCreateError(
@@ -715,11 +771,23 @@ describe("knowledge base execution contract", () => {
         "deterministic",
       );
     }
-    for (const status of [408, 429, 500, 502, 503]) {
+    for (const status of [408, 425, 429, 500, 502, 503]) {
       expect(classifyKnowledgeBaseUpstreamCreateFailure({ status })).toBe(
         "retriable",
       );
     }
+    expect(
+      classifyKnowledgeBaseUpstreamCreateFailure({
+        status: 409,
+        code: "idempotency_pending",
+      }),
+    ).toBe("retriable");
+    expect(
+      classifyKnowledgeBaseUpstreamCreateFailure({
+        status: 422,
+        code: "IDEMPOTENCY_PENDING",
+      }),
+    ).toBe("retriable");
     expect(
       classifyKnowledgeBaseUpstreamCreateFailure({ transportError: true }),
     ).toBe("unknown");
@@ -1463,6 +1531,53 @@ describe("knowledge base execution contract", () => {
     expect(post).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    {
+      status: 425,
+      data: { error: { code: "IDEMPOTENCY_PENDING" } },
+      expectedFailureClass: "retriable",
+    },
+    {
+      status: 409,
+      data: { error: { code: "IDEMPOTENCY_PENDING" } },
+      expectedFailureClass: "retriable",
+    },
+    {
+      status: 409,
+      data: { error: { code: "TASK_STATE_CONFLICT" } },
+      expectedFailureClass: "deterministic",
+    },
+    {
+      status: 422,
+      data: { error: { code: "IDEMPOTENCY_PENDING" } },
+      expectedFailureClass: "retriable",
+    },
+    {
+      status: 422,
+      data: { error: { code: "INVALID_ATTACHMENT" } },
+      expectedFailureClass: "deterministic",
+    },
+  ] as const)(
+    "classifies upstream HTTP $status as $expectedFailureClass only from its explicit contract",
+    async ({ status, data, expectedFailureClass }) => {
+      vi.spyOn(axios, "post").mockResolvedValue({ status, data });
+
+      await expect(
+        createFrontMindTask({
+          baseUrl: "https://api.example.test",
+          apiKey: "credential-value",
+          prompt: "manual Logo",
+          idempotencyKey: "frontmind-kb-v2:manual-logo-operation",
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        status,
+        failureClass: expectedFailureClass,
+        failureCode: `UPSTREAM_CREATE_HTTP_${status}`,
+      });
+    },
+  );
+
   it("recovers a POST accepted before bind without creating a second logical task", async () => {
     const calls: string[] = [];
     const dispatch = {
@@ -1511,6 +1626,69 @@ describe("knowledge base execution contract", () => {
       "register:original-task",
       "reconcile:original-task",
     ]);
+  });
+
+  it("retries an upstream 425 with the same manual Logo reservation and provider idempotency key", async () => {
+    const dispatch = {
+      schemaVersion: 1 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "manual Logo",
+        agentProfile: "manus-1.6-max",
+        taskMode: "agent" as const,
+        attachments: [],
+      },
+      bodySha256: "c".repeat(64),
+      preparedAt: "2026-08-10T03:00:00.000Z",
+    };
+    const claim = {
+      turn: { upstreamTaskId: null },
+      upstreamIdempotencyKey: "frontmind-kb-v2:manual-logo-stable-request",
+    } as any;
+    const createTask = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new KnowledgeBaseUpstreamCreateError(
+          "retriable",
+          "UPSTREAM_CREATE_HTTP_425",
+          425,
+        ),
+      )
+      .mockResolvedValueOnce({ taskId: "manual-logo-task" });
+    const bindTask = vi.fn().mockImplementation(async (taskId: string) => {
+      claim.turn.upstreamTaskId = taskId;
+    });
+    const registerTask = vi.fn().mockResolvedValue(undefined);
+    const reconcileTask = vi.fn().mockResolvedValue(false);
+    const recover = () =>
+      recoverKnowledgeBaseTurnClaimTask({
+        claim,
+        ensureDispatch: async () => dispatch,
+        createTask,
+        bindTask,
+        registerTask,
+        reconcileTask,
+      });
+
+    await expect(recover()).rejects.toMatchObject({
+      failureClass: "retriable",
+      failureCode: "UPSTREAM_CREATE_HTTP_425",
+      status: 425,
+    });
+    await expect(recover()).resolves.toEqual({
+      taskId: "manual-logo-task",
+      rebound: true,
+      reconciled: false,
+    });
+    expect(createTask).toHaveBeenCalledTimes(2);
+    expect(createTask.mock.calls.map((call) => call[1])).toEqual([
+      claim.upstreamIdempotencyKey,
+      claim.upstreamIdempotencyKey,
+    ]);
+    expect(createTask.mock.calls[0]?.[0]).toBe(dispatch);
+    expect(createTask.mock.calls[1]?.[0]).toBe(dispatch);
+    expect(bindTask).toHaveBeenCalledOnce();
+    expect(registerTask).toHaveBeenCalledWith("manual-logo-task");
   });
 
   it("runs manual Logo promotion only after the real task is created, bound, and registered", async () => {

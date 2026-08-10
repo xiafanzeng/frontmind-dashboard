@@ -98,6 +98,33 @@ type PendingQuestion = Pick<
   "id" | "question" | "category" | "source"
 >;
 
+export function pendingQuestionQuotaReservations(
+  pendingQuestions: Array<Pick<PendingQuestion, "category">>,
+  progressive: boolean,
+) {
+  const counts = new Map<WorkspaceQuestionCategory, number>();
+  for (const pendingQuestion of pendingQuestions) {
+    const categories = pendingQuestion.category
+      ? [pendingQuestion.category]
+      : progressive
+        ? questionCategoryOptions.map((option) => option.value)
+        : [];
+    for (const category of categories) {
+      counts.set(category, (counts.get(category) || 0) + 1);
+    }
+  }
+  return counts;
+}
+
+export function directQuestionQuotaHasCapacity(
+  categoryCapacity: boolean[],
+  progressive: boolean,
+) {
+  return progressive
+    ? categoryCapacity.every(Boolean)
+    : categoryCapacity.some(Boolean);
+}
+
 type QuestionRequestHistoryItem = {
   id: string;
   category: string | null;
@@ -111,6 +138,101 @@ type QuestionRequestHistoryItem = {
 
 function normalizeQuestionHistoryText(value: string) {
   return value.normalize("NFKC").replace(/\s+/g, " ").trim();
+}
+
+function quotaUnlockDate(value: string | null | undefined) {
+  if (!value) return "";
+  const source = /^\d{10,13}$/.test(value) ? Number(value) : value;
+  const date = new Date(source);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+export function questionQuotaUnavailableMessage(
+  portal: ServicePortalView,
+  fromBrandKeywordLibrary: boolean,
+) {
+  const unlock =
+    portal.plan.code === "luxury" &&
+    portal.quotaUnlock?.total !== null &&
+    portal.quotaUnlock?.total !== undefined &&
+    portal.quotaUnlock.total > 1
+      ? portal.quotaUnlock
+      : undefined;
+  const nextUnlockLabel = quotaUnlockDate(unlock?.nextUnlockAt);
+  const hasFutureUnlock = Boolean(
+    unlock &&
+      unlock.capacityState === "available" &&
+      unlock.current !== null &&
+      unlock.total !== null &&
+      unlock.current < unlock.total,
+  );
+  const finalUnlockStage = Boolean(
+    unlock &&
+      unlock.capacityState === "available" &&
+      unlock.current !== null &&
+      unlock.total !== null &&
+      unlock.current >= unlock.total,
+  );
+
+  if (unlock?.capacityState === "exhausted") {
+    return fromBrandKeywordLibrary
+      ? "该类问题的全年额度已用完，不能继续新增。"
+      : "豪华版全年问题额度已用完，不能继续新增。";
+  }
+  if (finalUnlockStage) {
+    return fromBrandKeywordLibrary
+      ? "该类问题的全年额度已用完，不能继续新增。"
+      : "至少一个问题分类的全年额度已用完；自主填写暂不可提交，请从品牌全域词库选择仍有额度的分类。";
+  }
+  if (unlock?.capacityState === "awaiting_unlock" || hasFutureUnlock) {
+    const subject = fromBrandKeywordLibrary
+      ? "该类问题本季度已解锁额度已用完"
+      : "本季度已解锁的问题额度已用完";
+    return nextUnlockLabel
+      ? `${subject}，下一季度额度将于 ${nextUnlockLabel} 开放。`
+      : `${subject}，请等待下一服务季度开放。`;
+  }
+  return fromBrandKeywordLibrary
+    ? "该词库问题对应的问题额度已用满，请选择其他问题或联系服务管理员。"
+    : "当前服务的问题额度已用满，请联系服务管理员调整当前服务问题。";
+}
+
+function questionQuotaUnavailableActionLabel(portal: ServicePortalView) {
+  const unlock =
+    portal.plan.code === "luxury" &&
+    portal.quotaUnlock?.total !== null &&
+    portal.quotaUnlock?.total !== undefined &&
+    portal.quotaUnlock.total > 1
+      ? portal.quotaUnlock
+      : undefined;
+  const finalUnlockStage = Boolean(
+    unlock &&
+      unlock.capacityState === "available" &&
+      unlock.current !== null &&
+      unlock.total !== null &&
+      unlock.current >= unlock.total,
+  );
+  if (unlock?.capacityState === "exhausted") {
+    return "全年额度已用完";
+  }
+  if (finalUnlockStage) return "分类额度已用完";
+  if (
+    unlock?.capacityState === "awaiting_unlock" ||
+    (unlock &&
+      unlock.capacityState === "available" &&
+      unlock.current !== null &&
+      unlock.total !== null &&
+      unlock.current < unlock.total)
+  ) {
+    return "下一季度开放";
+  }
+  return null;
 }
 
 export function questionHistoryItemMatchesTarget(
@@ -206,14 +328,14 @@ function QuestionIntakePanelView({
   const fromBrandKeywordLibrary = origin === "brand_keyword_library";
   const selectionAccess = portal.capabilities.questionSelection;
   const selectionEnabled = selectionAccess.allowed;
-  const pendingCountByCategory = new Map<WorkspaceQuestionCategory, number>();
-  for (const pendingQuestion of pendingQuestions) {
-    if (!pendingQuestion.category) continue;
-    pendingCountByCategory.set(
-      pendingQuestion.category,
-      (pendingCountByCategory.get(pendingQuestion.category) || 0) + 1,
-    );
-  }
+  const progressiveQuotaUnlock =
+    portal.quotaUnlock?.total !== null &&
+    portal.quotaUnlock?.total !== undefined &&
+    portal.quotaUnlock.total > 1;
+  const pendingCountByCategory = pendingQuestionQuotaReservations(
+    pendingQuestions,
+    progressiveQuotaUnlock,
+  );
   const selectionQuotas = questionCategoryOptions.map((option) => ({
     ...option,
     quota: portal.quotas.find((item) => item.key === option.quotaKey),
@@ -223,6 +345,8 @@ function QuestionIntakePanelView({
   );
   const totalQuotaAvailable = Boolean(
     totalQuotaSynchronized &&
+      portal.quotaUnlock?.capacityState !== "awaiting_unlock" &&
+      portal.quotaUnlock?.capacityState !== "exhausted" &&
       selectionQuotas.reduce(
         (total, { quota }) => total + Number(quota?.used || 0),
         0,
@@ -257,8 +381,11 @@ function QuestionIntakePanelView({
     : QUESTION_CLASSIFICATION_V2_WRITES_ENABLED
       ? Boolean(
           totalQuotaAvailable &&
-            selectionQuotas.some(({ value, quota }) =>
-              quotaHasCapacity(quota, value),
+            directQuestionQuotaHasCapacity(
+              selectionQuotas.map(({ value, quota }) =>
+                Boolean(quotaHasCapacity(quota, value)),
+              ),
+              progressiveQuotaUnlock,
             ),
         )
       : Boolean(
@@ -267,6 +394,9 @@ function QuestionIntakePanelView({
             selectedOption &&
             quotaHasCapacity(brandQuota, category),
         );
+  const quotaUnavailableActionLabel = !quotaAvailable
+    ? questionQuotaUnavailableActionLabel(portal)
+    : null;
 
   const updateAsDirectEntry = (nextQuestion: string) => {
     const nextCategory = QUESTION_CLASSIFICATION_V2_WRITES_ENABLED
@@ -428,9 +558,11 @@ function QuestionIntakePanelView({
             >
               {submitting
                 ? "正在提交…"
-                : fromBrandKeywordLibrary
-                  ? "确认优化问题"
-                  : "提交专业审核"}
+                : quotaUnavailableActionLabel
+                  ? quotaUnavailableActionLabel
+                  : fromBrandKeywordLibrary
+                    ? "确认优化问题"
+                    : "提交专业审核"}
             </button>
           </div>
         </div>
@@ -448,9 +580,7 @@ function QuestionIntakePanelView({
       )}
       {selectionEnabled && !quotaAvailable && (
         <p className="question-intake-quota-note" role="status">
-          {fromBrandKeywordLibrary
-            ? "该词库问题对应的问题额度已用满，请选择其他问题或联系服务管理员。"
-            : "当前服务的问题额度已用满，请联系服务管理员调整当前服务问题。"}
+          {questionQuotaUnavailableMessage(portal, fromBrandKeywordLibrary)}
         </p>
       )}
       {pendingQuestions.length > 0 && (

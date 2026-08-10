@@ -642,7 +642,12 @@ describe("UserBrandDashboard service experience", () => {
       .getByText("产品场景词")
       .closest("article");
     expect(scenarioQuota).not.toBeNull();
-    expect(within(scenarioQuota!).getByText("1 / 20")).toBeInTheDocument();
+    expect(
+      within(scenarioQuota!).getByText("已用 1 / 已解锁 5"),
+    ).toBeInTheDocument();
+    expect(
+      within(scenarioQuota!).getByText("全年 20 个词"),
+    ).toBeInTheDocument();
     const questionDirectory = screen.getByRole("complementary", {
       name: "问题目录",
     });
@@ -966,7 +971,7 @@ describe("UserBrandDashboard service experience", () => {
     [
       "luxury",
       "豪华版",
-      "已生效 · 季度服务",
+      "已生效 · 年度服务 · 按季度解锁",
       `${luxuryPreviewPortal.purchasedQuestions.length} 个已购问题`,
       "",
     ],

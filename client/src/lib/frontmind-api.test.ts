@@ -806,6 +806,58 @@ describe("createKnowledgeBaseTurnTask", () => {
     });
   });
 
+  it("preserves the authoritative observation when a Logo response is missing its task id", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          accepted: true,
+          observation: {
+            stateEpoch: 4,
+            generation: 1,
+            authoritativeTaskId: null,
+            activeTurn: {
+              id: "logo-turn-pending-task-id",
+              clientRequestId: "request-logo-pending-task-id",
+            },
+            interaction: {
+              progress: null,
+              interactionState: "executing",
+              canReply: false,
+              canPublish: false,
+              lockReason: "Logo 正在处理中",
+            },
+            approvedPresentation: null,
+            completedTurn: null,
+            package: null,
+            notice: null,
+            conversationVersion: 4,
+          },
+        }),
+      }),
+    );
+
+    await expect(
+      createKnowledgeBaseTurnTask([], {
+        conversationId: "conv-kb",
+        clientRequestId: "request-logo-pending-task-id",
+        submissionKind: "logo",
+      }),
+    ).rejects.toMatchObject({
+      status: 502,
+      code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
+      knowledgeObservation: {
+        stateEpoch: 4,
+        generation: 1,
+        activeTurn: {
+          id: "logo-turn-pending-task-id",
+          clientRequestId: "request-logo-pending-task-id",
+        },
+      },
+    });
+  });
+
   it("accepts a complete terminal observation without a task pointer", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
