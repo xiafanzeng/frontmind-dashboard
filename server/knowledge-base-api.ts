@@ -267,6 +267,10 @@ function knowledgeBaseReservationReceipt(
 
 export const KNOWLEDGE_BASE_MANUAL_LOGO_PENDING_MESSAGE =
   "FrontMind 已接收 Logo，正在重新呈现当前知识节点";
+export const KNOWLEDGE_BASE_MANUAL_LOGO_USER_INSTRUCTION =
+  "用户已明确提交一张企业官方主 Logo。请只更新并重新展示当前首节点，不得确认或推进节点。";
+export const KNOWLEDGE_BASE_MANUAL_LOGO_DISPLAY_MESSAGE =
+  "已提交新的企业官方主 Logo，正在重新呈现当前知识节点。";
 
 export function knowledgeBaseManualLogoPendingResponse(input: {
   observation?: KnowledgeBaseObservationDto | null;
@@ -281,6 +285,29 @@ export function knowledgeBaseManualLogoPendingResponse(input: {
       error: {
         code: "IDEMPOTENCY_PENDING" as const,
         message: KNOWLEDGE_BASE_MANUAL_LOGO_PENDING_MESSAGE,
+      },
+      ...(input.observation ? { observation: input.observation } : {}),
+    },
+  };
+}
+
+export function knowledgeBaseManualLogoUnclassifiedFailureResponse(input: {
+  reservationAcquired: boolean;
+  observation?: KnowledgeBaseObservationDto | null;
+  retryAfterMs?: number;
+}) {
+  if (input.reservationAcquired) {
+    return knowledgeBaseManualLogoPendingResponse(input);
+  }
+  return {
+    status: 503 as const,
+    retryAfterSeconds: String(
+      Math.max(1, Math.ceil((input.retryAfterMs ?? 1_000) / 1_000)),
+    ),
+    body: {
+      error: {
+        code: "KNOWLEDGE_BASE_LOGO_SUBMISSION_UNCERTAIN" as const,
+        message: "Logo 提交结果暂未确认，系统将按同一请求自动重试",
       },
       ...(input.observation ? { observation: input.observation } : {}),
     },
@@ -372,6 +399,17 @@ function respondKnowledgeBaseManualLogoPending(input: {
   res: import("express").Response;
 }) {
   const response = knowledgeBaseManualLogoPendingResponse(input);
+  input.res.setHeader("Retry-After", response.retryAfterSeconds);
+  input.res.status(response.status).json(response.body);
+}
+
+function respondKnowledgeBaseManualLogoUnclassifiedFailure(input: {
+  reservationAcquired: boolean;
+  observation?: KnowledgeBaseObservationDto | null;
+  retryAfterMs?: number;
+  res: import("express").Response;
+}) {
+  const response = knowledgeBaseManualLogoUnclassifiedFailureResponse(input);
   input.res.setHeader("Retry-After", response.retryAfterSeconds);
   input.res.status(response.status).json(response.body);
 }
@@ -2889,6 +2927,8 @@ export async function createFrontMindTask({
   });
 
   if (taskResponse.status < 200 || taskResponse.status >= 300) {
+    const upstreamErrorCode =
+      taskResponse.data?.error?.code || taskResponse.data?.code;
     const detail =
       taskResponse.data?.error?.message ||
       taskResponse.data?.message ||
@@ -2899,6 +2939,7 @@ export async function createFrontMindTask({
       detail,
       failureClass: classifyKnowledgeBaseUpstreamCreateFailure({
         status: taskResponse.status,
+        code: upstreamErrorCode,
       }),
       failureCode: `UPSTREAM_CREATE_HTTP_${taskResponse.status}`,
     };
@@ -4654,8 +4695,11 @@ router.post("/turn", async (req, res) => {
   const submissionKind = String(body.submissionKind || "message").trim();
   const manualLogoSubmission = submissionKind === "logo";
   const turnUserMessage = manualLogoSubmission
-    ? "用户已明确提交一张企业官方主 Logo。请只更新并重新展示当前首节点，不得确认或推进节点。"
+    ? KNOWLEDGE_BASE_MANUAL_LOGO_USER_INSTRUCTION
     : userMessage;
+  const turnDisplayMessage = manualLogoSubmission
+    ? KNOWLEDGE_BASE_MANUAL_LOGO_DISPLAY_MESSAGE
+    : turnUserMessage;
   if (
     !conversationId ||
     !clientRequestId ||
@@ -4743,6 +4787,7 @@ router.post("/turn", async (req, res) => {
 
   let replayAfterMutableFailure: (() => Promise<boolean>) | null = null;
   let reservationAcquiredByThisRequest = false;
+  let acquiredManualLogoClaim: KnowledgeBaseRecoveryClaim | null = null;
   try {
     await assertKnowledgeBaseWritable(req.frontmindUser!.id);
     const attachments = normalizeKnowledgeBaseUserAttachments(body.attachments);
@@ -5108,7 +5153,7 @@ router.post("/turn", async (req, res) => {
       clientIntent: resumeLegacyAttachments ? undefined : clientIntent,
       operationInstanceId: manualLogoSubmission ? clientRequestId : undefined,
       apiCredentialId: taskCredential.id,
-      userText: turnUserMessage,
+      userText: turnDisplayMessage,
       userAttachmentCount: attachments.length,
       expectedAttachmentCount: attachments.length + 2,
       clientAttachmentManifest: attachmentManifest,
@@ -5213,6 +5258,7 @@ router.post("/turn", async (req, res) => {
       preparedDispatch: null,
     };
     if (manualLogoSubmission) {
+      acquiredManualLogoClaim = acceptedClaim;
       let dispatched: Awaited<
         ReturnType<typeof dispatchAcceptedKnowledgeBaseClaim>
       >;
@@ -5528,11 +5574,97 @@ router.post("/turn", async (req, res) => {
       });
       return;
     }
-    const status =
-      error instanceof KnowledgeBaseBuildError &&
-      error.code === "BUILD_NOT_FOUND"
-        ? 404
-        : 422;
+    const terminalManualLogoFailure = manualLogoSubmission
+      ? knowledgeBaseManualLogoTerminalFailure(error)
+      : null;
+    if (terminalManualLogoFailure) {
+      const observation = req.frontmindUser
+        ? await getKnowledgeBaseObservation({
+            userId: req.frontmindUser.id,
+            conversationId,
+            upstreamStatus: "awaiting_input",
+          }).catch(() => null)
+        : null;
+      res.status(terminalManualLogoFailure.status).json({
+        error: {
+          code: terminalManualLogoFailure.code,
+          message: terminalManualLogoFailure.message,
+        },
+        ...(observation ? { observation } : {}),
+      });
+      return;
+    }
+    if (error instanceof KnowledgeBaseBuildError) {
+      const status = error.code === "BUILD_NOT_FOUND" ? 404 : 422;
+      const observation = req.frontmindUser
+        ? await getKnowledgeBaseObservation({
+            userId: req.frontmindUser.id,
+            conversationId,
+            upstreamStatus: "running",
+          }).catch(() => null)
+        : null;
+      res.status(status).json({
+        error: { code: error.code, message: error.message },
+        ...(observation ? { observation } : {}),
+      });
+      return;
+    }
+    if (manualLogoSubmission) {
+      logKnowledgeBaseRuntimeFailure({
+        level: "warn",
+        event: reservationAcquiredByThisRequest
+          ? "[KnowledgeBaseManualLogo] post_reservation_unclassified_failure"
+          : "[KnowledgeBaseManualLogo] pre_reservation_unclassified_failure",
+        userId: req.frontmindUser?.id,
+        error,
+      });
+      if (reservationAcquiredByThisRequest && acquiredManualLogoClaim) {
+        try {
+          await markKnowledgeBaseTurnOutcomeUnknown({
+            userId: acquiredManualLogoClaim.turn.userId,
+            turnId: acquiredManualLogoClaim.turn.id,
+            leaseToken: acquiredManualLogoClaim.leaseToken,
+            code: "MANUAL_LOGO_UNCLASSIFIED_FAILURE",
+            recoveryDelayMs: 1_000,
+          });
+        } catch (persistenceError) {
+          logKnowledgeBaseRuntimeFailure({
+            level: "warn",
+            event:
+              "[KnowledgeBaseManualLogo] unclassified_failure_persistence_deferred",
+            userId: req.frontmindUser?.id,
+            turnId: acquiredManualLogoClaim.turn.id,
+            error: persistenceError,
+          });
+        }
+      }
+      if (reservationAcquiredByThisRequest && replayAfterMutableFailure) {
+        try {
+          if (await replayAfterMutableFailure()) return;
+        } catch (replayError) {
+          logKnowledgeBaseRuntimeFailure({
+            level: "warn",
+            event: "[KnowledgeBaseManualLogo] post_reservation_replay_deferred",
+            userId: req.frontmindUser?.id,
+            error: replayError,
+          });
+        }
+      }
+      const observation = req.frontmindUser
+        ? await getKnowledgeBaseObservation({
+            userId: req.frontmindUser.id,
+            conversationId,
+            upstreamStatus: "running",
+          }).catch(() => null)
+        : null;
+      respondKnowledgeBaseManualLogoUnclassifiedFailure({
+        reservationAcquired: reservationAcquiredByThisRequest,
+        observation,
+        retryAfterMs: 1_000,
+        res,
+      });
+      return;
+    }
     const observation = req.frontmindUser
       ? await getKnowledgeBaseObservation({
           userId: req.frontmindUser.id,
@@ -5540,12 +5672,9 @@ router.post("/turn", async (req, res) => {
           upstreamStatus: "running",
         }).catch(() => null)
       : null;
-    res.status(status).json({
+    res.status(422).json({
       error: {
-        code:
-          error instanceof KnowledgeBaseBuildError
-            ? error.code
-            : "KNOWLEDGE_BASE_TURN_FAILED",
+        code: "KNOWLEDGE_BASE_TURN_FAILED",
         message:
           error instanceof Error
             ? error.message

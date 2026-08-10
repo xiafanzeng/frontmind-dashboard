@@ -83,6 +83,62 @@ import "./dashboard-styles.css";
 
 export { ManagedKeywordTables };
 
+const QUESTION_QUOTA_KEY_BY_CATEGORY = {
+  industry: "industry",
+  competitor_comparison: "competitor",
+  reputation: "reputation",
+  product_scenario: "scenario",
+};
+
+export function buildKeywordQuotaAvailability(portal) {
+  const unlock =
+    portal.plan.code === "luxury" &&
+    portal.quotaUnlock?.total !== null &&
+    portal.quotaUnlock?.total !== undefined &&
+    portal.quotaUnlock.total > 1
+      ? portal.quotaUnlock
+      : undefined;
+  const futureUnlock = Boolean(
+    unlock &&
+      unlock.capacityState === "available" &&
+      unlock.current !== null &&
+      unlock.total !== null &&
+      unlock.current < unlock.total,
+  );
+  return Object.fromEntries(
+    Object.entries(QUESTION_QUOTA_KEY_BY_CATEGORY).flatMap(
+      ([category, quotaKey]) => {
+        const quota = portal.quotas.find((item) => item.key === quotaKey);
+        if (!quota || quota.limit === null || quota.used === null) return [];
+        const blockedBySchedule =
+          unlock?.capacityState === "awaiting_unlock" ||
+          unlock?.capacityState === "exhausted";
+        const available = !blockedBySchedule && quota.used < quota.limit;
+        const annualExhausted =
+          unlock?.capacityState === "exhausted" ||
+          (unlock?.capacityState !== null &&
+            unlock?.capacityState !== undefined &&
+            quota.entitlementLimit !== undefined &&
+            quota.entitlementLimit !== null &&
+            quota.used >= quota.entitlementLimit);
+        return [
+          [
+            category,
+            {
+              available,
+              unavailableLabel: annualExhausted
+                ? "全年额度已用完"
+                : unlock?.capacityState === "awaiting_unlock" || futureUnlock
+                  ? "下一季度开放"
+                  : "该类额度已满",
+            },
+          ],
+        ];
+      },
+    ),
+  );
+}
+
 const EmbeddedKnowledgeBasePanel = lazy(
   () => import("@/components/EmbeddedKnowledgeBasePanel"),
 );
@@ -748,10 +804,15 @@ export function PreviewUserBrandDashboard({
       onCloseDeliveryTicket={() => setSelectedDeliveryTicketId(null)}
       deliveryTicketDetailPayload={ticketDetail}
       previewBrandName={fixtures.overview.brand}
-      renderPreviewBrandSection={({ sub, onUseQuestion }) => (
+      renderPreviewBrandSection={({
+        sub,
+        onUseQuestion,
+        quotaAvailability,
+      }) => (
         <BrandSection
           sub={sub}
           onUseQuestion={onUseQuestion}
+          quotaAvailability={quotaAvailability}
           brandBuildingData={fixtures.brandBuilding}
           globalKeywordData={fixtures.globalKeywordBank}
         />
@@ -1042,6 +1103,10 @@ function UserBrandDashboardContent({
   const servicePortal = useMemo(
     () => normalizeServicePortal(servicePortalPayload),
     [servicePortalPayload],
+  );
+  const keywordQuotaAvailability = useMemo(
+    () => buildKeywordQuotaAvailability(servicePortal),
+    [servicePortal],
   );
   const deliveryWorkspace = deliveryWorkspacePayload || {};
   const contentAssetCatalog = useMemo(
@@ -1391,6 +1456,7 @@ function UserBrandDashboardContent({
                   renderPreviewBrandSection?.({
                     sub: route.sub,
                     onUseQuestion: useBrandQuestion,
+                    quotaAvailability: keywordQuotaAvailability,
                   }) || (
                     <ManagedModuleEmpty
                       title="品牌建设"
@@ -1403,6 +1469,7 @@ function UserBrandDashboardContent({
                     loading={dashboardLoading}
                     error={dashboardError}
                     onUseQuestion={useBrandQuestion}
+                    quotaAvailability={keywordQuotaAvailability}
                   />
                 ))}
               {route.section === "intent" && (
@@ -2076,6 +2143,7 @@ function TokenCloud({ items }) {
 function BrandSection({
   sub,
   onUseQuestion,
+  quotaAvailability,
   brandBuildingData,
   globalKeywordData,
 }) {
@@ -2083,6 +2151,7 @@ function BrandSection({
     return (
       <BrandGlobalKeywords
         onUseQuestion={onUseQuestion}
+        quotaAvailability={quotaAvailability}
         bank={globalKeywordData}
       />
     );
@@ -2351,7 +2420,7 @@ function previewQuestionCategory(item) {
   return "reputation";
 }
 
-function BrandGlobalKeywords({ onUseQuestion, bank }) {
+function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
   const [category, setCategory] = useState("all");
   const [subdivision, setSubdivision] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
@@ -2481,47 +2550,57 @@ function BrandGlobalKeywords({ onUseQuestion, bank }) {
               </tr>
             </thead>
             <tbody>
-              {topRows.map((item) => (
-                <tr key={`${item["序号"]}-${item["问题"]}`}>
-                  <td className="keyword-question-cell">
-                    {safeText(item["问题"])}
-                  </td>
-                  <td>
-                    <span
-                      className="keyword-pill fm-question-category-pill"
-                      data-category={
-                        keywordCategoryKey(item["核心词分类"]) || undefined
-                      }
-                    >
-                      {keywordCategoryLabel(item["核心词分类"]) ||
-                        safeText(item["核心词分类"])}
-                    </span>
-                  </td>
-                  <td>{safeText(item["问题细分"])}</td>
-                  <td>
-                    <strong>{formatNumber(item["热度"])}</strong>
-                  </td>
-                  <td>
-                    <button
-                      type="button"
-                      className="keyword-optimize-button"
-                      onClick={() =>
-                        onUseQuestion({
-                          id: `preview-keyword-${item["序号"]}`,
-                          question: safeText(item["问题"]),
-                          category: previewQuestionCategory(item),
-                          tableId: "preview-brand-keywords",
-                          rowIndex: Math.max(0, Number(item["序号"] || 1) - 1),
-                          revision: 1,
-                          status: "candidate",
-                        })
-                      }
-                    >
-                      选择并进入问题优化
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {topRows.map((item) => {
+                const category = previewQuestionCategory(item);
+                const quotaAccess = quotaAvailability?.[category];
+                return (
+                  <tr key={`${item["序号"]}-${item["问题"]}`}>
+                    <td className="keyword-question-cell">
+                      {safeText(item["问题"])}
+                    </td>
+                    <td>
+                      <span
+                        className="keyword-pill fm-question-category-pill"
+                        data-category={
+                          keywordCategoryKey(item["核心词分类"]) || undefined
+                        }
+                      >
+                        {keywordCategoryLabel(item["核心词分类"]) ||
+                          safeText(item["核心词分类"])}
+                      </span>
+                    </td>
+                    <td>{safeText(item["问题细分"])}</td>
+                    <td>
+                      <strong>{formatNumber(item["热度"])}</strong>
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="keyword-optimize-button"
+                        disabled={quotaAccess?.available === false}
+                        onClick={() =>
+                          onUseQuestion({
+                            id: `preview-keyword-${item["序号"]}`,
+                            question: safeText(item["问题"]),
+                            category,
+                            tableId: "preview-brand-keywords",
+                            rowIndex: Math.max(
+                              0,
+                              Number(item["序号"] || 1) - 1,
+                            ),
+                            revision: 1,
+                            status: "candidate",
+                          })
+                        }
+                      >
+                        {quotaAccess?.available === false
+                          ? quotaAccess.unavailableLabel || "该类额度已满"
+                          : "选择并进入问题优化"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

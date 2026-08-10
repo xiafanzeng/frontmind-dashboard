@@ -1051,7 +1051,9 @@ export const adminRouter = router({
             message:
               input.planCode === "basic"
                 ? "普通版为连续 30 天单题服务，不设置预付月份"
-                : "进阶版与豪华版合同均按 3 个月服务周期建立",
+                : input.planCode === "advanced"
+                  ? "进阶版按 3 个月服务周期建立"
+                  : "豪华版为 12 个月权益周期，预付月份按 3 个月记录，并按季度自动解锁额度",
           });
         }
         if (

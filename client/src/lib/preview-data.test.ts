@@ -58,6 +58,21 @@ describe("preview service portal fixtures", () => {
     ]);
   });
 
+  it("previews luxury in its first quarterly unlock without hiding the annual entitlement", () => {
+    const luxury = getPreviewServicePortal("luxury");
+
+    expect(luxury.quotas.map(({ limit }) => limit)).toEqual([1, 1, 1, 5]);
+    expect(
+      luxury.quotas.map(({ entitlementLimit }) => entitlementLimit),
+    ).toEqual([4, 4, 4, 20]);
+    expect(luxury.quotaUnlock).toEqual({
+      current: 1,
+      total: 4,
+      nextUnlockAt: "2026-10-18",
+      capacityState: "available",
+    });
+  });
+
   it("moves selected questions directly into response logic", () => {
     const basic = getPreviewServicePortal("basic");
 

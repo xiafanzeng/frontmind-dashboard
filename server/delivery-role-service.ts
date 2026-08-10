@@ -5,11 +5,13 @@ import {
   count,
   desc,
   eq,
+  gte,
   gt,
   inArray,
   isNotNull,
   isNull,
   lt,
+  lte,
   or,
   sql,
 } from "drizzle-orm";
@@ -88,10 +90,15 @@ import { getQuestionQuotaState } from "./question-quota-service";
 import { questionCategoryForPublic } from "./question-selection-policy";
 import { listResponseLogicEntriesByQuestionIds } from "./response-logic-service";
 import {
+  SERVICE_QUESTION_QUOTA_ANCHOR_ORDINAL,
   approveWorkspaceQuestionSelection,
   deriveEffectiveServiceStatus,
   getServicePortal,
+  isOperationalServiceQuotaPeriod,
+  isProgressiveLuxuryContract,
+  resolveCurrentServiceQuotaScope,
   ServiceEntitlementError,
+  selectCurrentServiceContractIds,
   selectPortalContract,
   type ServicePortalContractRecord,
 } from "./service-entitlement";
@@ -610,6 +617,252 @@ export const MY_DELIVERY_TICKET_LIMIT = 50;
 const INITIAL_MONITORING_DEPENDENCY_MESSAGE =
   "请先完成“品牌词库与问题目录”：至少一条客户选择的问题需要审核通过，随后才能开始首次监控。";
 
+type CurrentDeliveryQuotaScope = NonNullable<
+  Awaited<ReturnType<typeof resolveCurrentServiceQuotaScope>>
+>;
+
+type ActiveDeliveryQuotaSelection = {
+  primaryContract: ServicePortalContractRecord;
+  scopes: CurrentDeliveryQuotaScope[];
+};
+
+async function resolveActiveDeliveryQuotaScopes(input: {
+  executor: any;
+  userId: number;
+  now?: Date;
+}): Promise<ActiveDeliveryQuotaSelection | null> {
+  const now = input.now ?? new Date();
+  const contractRows = (await input.executor
+    .select()
+    .from(serviceContracts)
+    .where(eq(serviceContracts.userId, input.userId))
+    .orderBy(desc(serviceContracts.revision))) as ServicePortalContractRecord[];
+  const { contract: primaryContract, contractIds } =
+    selectCurrentServiceContractIds(contractRows, now);
+  if (
+    !primaryContract ||
+    deriveEffectiveServiceStatus(primaryContract, now) !== "active"
+  ) {
+    return null;
+  }
+  const periodRows = await input.executor
+    .select()
+    .from(serviceQuotaPeriods)
+    .where(
+      and(
+        eq(serviceQuotaPeriods.userId, input.userId),
+        inArray(serviceQuotaPeriods.contractId, contractIds),
+        gt(serviceQuotaPeriods.ordinal, SERVICE_QUESTION_QUOTA_ANCHOR_ORDINAL),
+        lte(serviceQuotaPeriods.startsAt, now),
+        gt(serviceQuotaPeriods.endsAt, now),
+      ),
+    )
+    .orderBy(asc(serviceQuotaPeriods.ordinal));
+  const contractById = new Map(contractRows.map((row) => [row.id, row]));
+  const scopes = periodRows
+    .filter(isOperationalServiceQuotaPeriod)
+    .flatMap((period: typeof serviceQuotaPeriods.$inferSelect) => {
+      const contract = contractById.get(period.contractId);
+      return contract ? [{ contract, period }] : [];
+    });
+  return scopes.length ? { primaryContract, scopes } : null;
+}
+
+function effectiveActiveDeliveryQuotaScopes(
+  selection: ActiveDeliveryQuotaSelection,
+) {
+  return selection.scopes;
+}
+
+function selectActiveDeliveryQuotaScope(input: {
+  selection: ActiveDeliveryQuotaSelection;
+  record?: { contractId: string; quotaPeriodId: string } | null;
+}) {
+  const scopes = effectiveActiveDeliveryQuotaScopes(input.selection);
+  if (input.record) {
+    const exact = findActiveDeliveryQuotaScope({
+      selection: input.selection,
+      record: input.record,
+    });
+    if (exact) return exact;
+  }
+  return (
+    scopes.find(
+      (scope) => scope.contract.id === input.selection.primaryContract.id,
+    ) ??
+    scopes[0] ??
+    null
+  );
+}
+
+function findActiveDeliveryQuotaScope(input: {
+  selection: ActiveDeliveryQuotaSelection;
+  record: { contractId: string; quotaPeriodId: string };
+}) {
+  return effectiveActiveDeliveryQuotaScopes(input.selection).find((scope) =>
+    isProgressiveLuxuryContract(scope.contract)
+      ? scope.contract.id === input.record.contractId
+      : scope.contract.id === input.record.contractId &&
+        scope.period.id === input.record.quotaPeriodId,
+  );
+}
+
+type DeliveryQuestionWorkflowScope = {
+  progressiveLuxury: boolean;
+  contractId: string;
+  quotaPeriodId: string;
+  startsAt: Date;
+  endsAt: Date;
+};
+
+function deliveryQuestionWorkflowScope(
+  scope: CurrentDeliveryQuotaScope,
+): DeliveryQuestionWorkflowScope {
+  const progressiveLuxury = isProgressiveLuxuryContract(scope.contract);
+  return {
+    progressiveLuxury,
+    contractId: scope.contract.id,
+    quotaPeriodId: scope.period.id,
+    startsAt: progressiveLuxury
+      ? new Date(scope.contract.startsAt)
+      : new Date(scope.period.startsAt),
+    endsAt: progressiveLuxury
+      ? new Date(scope.contract.endsAt)
+      : new Date(scope.period.endsAt),
+  };
+}
+
+export function deliveryQuestionWorkflowScopeKey(input: {
+  progressiveLuxury: boolean;
+  contractId: string;
+  quotaPeriodId: string;
+}) {
+  return input.progressiveLuxury
+    ? `contract:${input.contractId}`
+    : `period:${input.quotaPeriodId}`;
+}
+
+export function deliveryWorkflowMilestoneIsReusable(input: {
+  completedAt: Date;
+  startsAt: Date;
+  endsAt: Date;
+}) {
+  const completedAt = input.completedAt.getTime();
+  return (
+    input.startsAt.getTime() <= completedAt &&
+    completedAt < input.endsAt.getTime()
+  );
+}
+
+export function questionCatalogReviewAllowed(input: {
+  progressiveLuxury: boolean;
+  hasActiveCatalog: boolean;
+  hasCompletedCatalog: boolean;
+  hasReusableCatalogMilestone: boolean;
+}) {
+  return (
+    input.hasActiveCatalog ||
+    (input.progressiveLuxury &&
+      (input.hasCompletedCatalog || input.hasReusableCatalogMilestone))
+  );
+}
+
+function deliveryTicketQuestionScopeCondition(
+  scope: DeliveryQuestionWorkflowScope,
+) {
+  return scope.progressiveLuxury
+    ? eq(deliveryTickets.contractId, scope.contractId)
+    : eq(deliveryTickets.quotaPeriodId, scope.quotaPeriodId);
+}
+
+function workspaceQuestionDeliveryScopeCondition(
+  scope: DeliveryQuestionWorkflowScope,
+) {
+  return scope.progressiveLuxury
+    ? eq(workspaceQuestions.contractId, scope.contractId)
+    : eq(workspaceQuestions.quotaPeriodId, scope.quotaPeriodId);
+}
+
+function workspaceQuestionDeliveryScopesCondition(
+  scopes: DeliveryQuestionWorkflowScope[],
+) {
+  return or(
+    ...scopes.map((scope) => workspaceQuestionDeliveryScopeCondition(scope)),
+  );
+}
+
+function deliveryRecordMatchesQuestionWorkflowScope(
+  record: { contractId: string; quotaPeriodId: string },
+  scope: DeliveryQuestionWorkflowScope,
+) {
+  return scope.progressiveLuxury
+    ? record.contractId === scope.contractId
+    : record.quotaPeriodId === scope.quotaPeriodId;
+}
+
+function deliveryWorkflowMilestoneScopeCondition(
+  scope: DeliveryQuestionWorkflowScope,
+) {
+  return and(
+    gte(deliveryWorkflowMilestones.completedAt, scope.startsAt),
+    lt(deliveryWorkflowMilestones.completedAt, scope.endsAt),
+  );
+}
+
+async function resolveDeliveryTicketQuestionWorkflowScope(input: {
+  executor: any;
+  ticket: Pick<
+    typeof deliveryTickets.$inferSelect,
+    "userId" | "contractId" | "quotaPeriodId"
+  >;
+}) {
+  const [contractRows, periodRows] = await Promise.all([
+    input.executor
+      .select({
+        id: serviceContracts.id,
+        planCode: serviceContracts.planCode,
+        planVersion: serviceContracts.planVersion,
+        startsAt: serviceContracts.startsAt,
+        endsAt: serviceContracts.endsAt,
+      })
+      .from(serviceContracts)
+      .where(
+        and(
+          eq(serviceContracts.id, input.ticket.contractId),
+          eq(serviceContracts.userId, input.ticket.userId),
+        ),
+      )
+      .limit(1),
+    input.executor
+      .select({
+        id: serviceQuotaPeriods.id,
+        contractId: serviceQuotaPeriods.contractId,
+        startsAt: serviceQuotaPeriods.startsAt,
+        endsAt: serviceQuotaPeriods.endsAt,
+      })
+      .from(serviceQuotaPeriods)
+      .where(
+        and(
+          eq(serviceQuotaPeriods.id, input.ticket.quotaPeriodId),
+          eq(serviceQuotaPeriods.userId, input.ticket.userId),
+          eq(serviceQuotaPeriods.contractId, input.ticket.contractId),
+        ),
+      )
+      .limit(1),
+  ]);
+  const contract = contractRows[0];
+  const period = periodRows[0];
+  if (!contract || !period) return null;
+  const progressiveLuxury = isProgressiveLuxuryContract(contract);
+  return {
+    progressiveLuxury,
+    contractId: contract.id,
+    quotaPeriodId: period.id,
+    startsAt: progressiveLuxury ? contract.startsAt : period.startsAt,
+    endsAt: progressiveLuxury ? contract.endsAt : period.endsAt,
+  } satisfies DeliveryQuestionWorkflowScope;
+}
+
 export function deliveryTicketActionRank(status: string) {
   switch (status) {
     case "in_progress":
@@ -665,29 +918,74 @@ export function visibleInitialMonitoringTicketScope() {
     OR ${deliveryTickets.operation} <> 'initial_monitoring'
     OR ${deliveryTickets.status} NOT IN ('submitted', 'needs_information', 'scheduled', 'in_progress')
     OR (
-      (
-        EXISTS (
-          SELECT 1
-          FROM delivery_tickets AS completed_catalog
-          WHERE completed_catalog.userId = ${deliveryTickets.userId}
-            AND completed_catalog.quotaPeriodId = ${deliveryTickets.quotaPeriodId}
-            AND completed_catalog.operation = 'question_catalog'
-            AND completed_catalog.status = 'completed'
-        )
-        OR EXISTS (
-          SELECT 1
-          FROM delivery_workflow_milestones AS archived_catalog
-          WHERE archived_catalog.userId = ${deliveryTickets.userId}
-            AND archived_catalog.operation = 'question_catalog'
-        )
-      )
-      AND EXISTS (
+      EXISTS (
         SELECT 1
-        FROM workspace_questions AS approved_question
-        WHERE approved_question.userId = ${deliveryTickets.userId}
-          AND approved_question.quotaPeriodId = ${deliveryTickets.quotaPeriodId}
-          AND approved_question.status = 'selected'
-          AND approved_question.selectionApprovalStatus = 'approved'
+        FROM service_contracts AS dependency_contract
+        WHERE dependency_contract.id = ${deliveryTickets.contractId}
+          AND dependency_contract.planCode = 'luxury'
+          AND dependency_contract.planVersion >= 2
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM delivery_tickets AS completed_catalog
+              WHERE completed_catalog.userId = ${deliveryTickets.userId}
+                AND completed_catalog.contractId = ${deliveryTickets.contractId}
+                AND completed_catalog.operation = 'question_catalog'
+                AND completed_catalog.status = 'completed'
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM delivery_workflow_milestones AS archived_catalog
+              WHERE archived_catalog.userId = ${deliveryTickets.userId}
+                AND archived_catalog.operation = 'question_catalog'
+                AND archived_catalog.completedAt >= dependency_contract.startsAt
+                AND archived_catalog.completedAt < dependency_contract.endsAt
+            )
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM workspace_questions AS approved_question
+            WHERE approved_question.userId = ${deliveryTickets.userId}
+              AND approved_question.contractId = ${deliveryTickets.contractId}
+              AND approved_question.status = 'selected'
+              AND approved_question.selectionApprovalStatus = 'approved'
+          )
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM service_quota_periods AS dependency_period
+        WHERE dependency_period.id = ${deliveryTickets.quotaPeriodId}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM service_contracts AS progressive_contract
+            WHERE progressive_contract.id = ${deliveryTickets.contractId}
+              AND progressive_contract.planCode = 'luxury'
+              AND progressive_contract.planVersion >= 2
+          )
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM delivery_tickets AS completed_catalog
+              WHERE completed_catalog.userId = ${deliveryTickets.userId}
+                AND completed_catalog.quotaPeriodId = ${deliveryTickets.quotaPeriodId}
+                AND completed_catalog.operation = 'question_catalog'
+                AND completed_catalog.status = 'completed'
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM delivery_workflow_milestones AS archived_catalog
+              WHERE archived_catalog.userId = ${deliveryTickets.userId}
+                AND archived_catalog.operation = 'question_catalog'
+            )
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM workspace_questions AS approved_question
+            WHERE approved_question.userId = ${deliveryTickets.userId}
+              AND approved_question.quotaPeriodId = ${deliveryTickets.quotaPeriodId}
+              AND approved_question.status = 'selected'
+              AND approved_question.selectionApprovalStatus = 'approved'
+          )
       )
     )
   )`;
@@ -695,10 +993,12 @@ export function visibleInitialMonitoringTicketScope() {
 
 export function reusableInitialMonitoringTicketScope(input: {
   userId: number;
+  scope?: DeliveryQuestionWorkflowScope;
 }) {
   return and(
     eq(deliveryTickets.userId, input.userId),
     eq(deliveryTickets.operation, "initial_monitoring"),
+    input.scope ? deliveryTicketQuestionScopeCondition(input.scope) : undefined,
     inArray(deliveryTickets.status, [...ACTIVE_DELIVERY_STATUSES, "completed"]),
   );
 }
@@ -884,6 +1184,8 @@ export async function getMyDeliveryTickets(input: {
   const [
     dashboardRows,
     styleWorkflowRows,
+    contractRows,
+    quotaPeriodRows,
     completedCatalogRows,
     archivedCatalogRows,
     approvedQuestionRows,
@@ -905,8 +1207,27 @@ export async function getMyDeliveryTickets(input: {
           .from(websiteStyleWorkflows)
           .where(inArray(websiteStyleWorkflows.userId, customerIds)),
         db
+          .select({
+            id: serviceContracts.id,
+            planCode: serviceContracts.planCode,
+            planVersion: serviceContracts.planVersion,
+            startsAt: serviceContracts.startsAt,
+            endsAt: serviceContracts.endsAt,
+          })
+          .from(serviceContracts)
+          .where(inArray(serviceContracts.userId, customerIds)),
+        db
+          .select({
+            id: serviceQuotaPeriods.id,
+            startsAt: serviceQuotaPeriods.startsAt,
+            endsAt: serviceQuotaPeriods.endsAt,
+          })
+          .from(serviceQuotaPeriods)
+          .where(inArray(serviceQuotaPeriods.userId, customerIds)),
+        db
           .selectDistinct({
             userId: deliveryTickets.userId,
+            contractId: deliveryTickets.contractId,
             quotaPeriodId: deliveryTickets.quotaPeriodId,
           })
           .from(deliveryTickets)
@@ -918,7 +1239,10 @@ export async function getMyDeliveryTickets(input: {
             ),
           ),
         db
-          .select({ userId: deliveryWorkflowMilestones.userId })
+          .select({
+            userId: deliveryWorkflowMilestones.userId,
+            completedAt: deliveryWorkflowMilestones.completedAt,
+          })
           .from(deliveryWorkflowMilestones)
           .where(
             and(
@@ -929,6 +1253,7 @@ export async function getMyDeliveryTickets(input: {
         db
           .selectDistinct({
             userId: workspaceQuestions.userId,
+            contractId: workspaceQuestions.contractId,
             quotaPeriodId: workspaceQuestions.quotaPeriodId,
           })
           .from(workspaceQuestions)
@@ -940,40 +1265,65 @@ export async function getMyDeliveryTickets(input: {
             ),
           ),
       ])
-    : [[], [], [], [], []];
+    : [[], [], [], [], [], [], []];
   const dashboardRevisionByUser = new Map(
     dashboardRows.map((row) => [row.userId, row.revision]),
   );
   const styleWorkflowByUser = new Map(
     styleWorkflowRows.map((row) => [row.userId, row]),
   );
-  const catalogScopeKey = (userId: number, quotaPeriodId: string) =>
-    `${userId}:${quotaPeriodId}`;
+  const contractById = new Map(contractRows.map((row) => [row.id, row]));
+  const quotaPeriodById = new Map(quotaPeriodRows.map((row) => [row.id, row]));
+  const catalogScopeKey = (input: {
+    userId: number;
+    contractId: string;
+    quotaPeriodId: string;
+  }) => {
+    const contract = contractById.get(input.contractId);
+    return `${input.userId}:${deliveryQuestionWorkflowScopeKey({
+      progressiveLuxury: isProgressiveLuxuryContract(contract),
+      contractId: input.contractId,
+      quotaPeriodId: input.quotaPeriodId,
+    })}`;
+  };
   const completedCatalogScopes = new Set(
-    completedCatalogRows.map((row) =>
-      catalogScopeKey(row.userId, row.quotaPeriodId),
-    ),
+    completedCatalogRows.map((row) => catalogScopeKey(row)),
   );
-  const customersWithArchivedCatalog = new Set(
-    archivedCatalogRows.map((row) => row.userId),
-  );
+  const catalogMilestonesByUser = new Map<number, Date[]>();
+  for (const row of archivedCatalogRows) {
+    const milestones = catalogMilestonesByUser.get(row.userId) ?? [];
+    milestones.push(row.completedAt);
+    catalogMilestonesByUser.set(row.userId, milestones);
+  }
   const approvedQuestionScopes = new Set(
-    approvedQuestionRows.map((row) =>
-      catalogScopeKey(row.userId, row.quotaPeriodId),
-    ),
+    approvedQuestionRows.map((row) => catalogScopeKey(row)),
   );
-  const dependencyForTicket = (ticket: typeof deliveryTickets.$inferSelect) =>
-    deliveryTicketDependencyState({
+  const dependencyForTicket = (ticket: typeof deliveryTickets.$inferSelect) => {
+    const contract = contractById.get(ticket.contractId);
+    const period = quotaPeriodById.get(ticket.quotaPeriodId);
+    const progressiveLuxury = isProgressiveLuxuryContract(contract);
+    const milestoneWindow = progressiveLuxury ? contract : period;
+    const hasReusableCatalogMilestone = Boolean(
+      progressiveLuxury
+        ? milestoneWindow &&
+            catalogMilestonesByUser.get(ticket.userId)?.some((completedAt) =>
+              deliveryWorkflowMilestoneIsReusable({
+                completedAt,
+                startsAt: milestoneWindow.startsAt,
+                endsAt: milestoneWindow.endsAt,
+              }),
+            )
+        : catalogMilestonesByUser.get(ticket.userId)?.length,
+    );
+    const key = catalogScopeKey(ticket);
+    return deliveryTicketDependencyState({
       operation: ticket.operation,
       status: ticket.status,
       hasCompletedQuestionCatalog:
-        completedCatalogScopes.has(
-          catalogScopeKey(ticket.userId, ticket.quotaPeriodId),
-        ) || customersWithArchivedCatalog.has(ticket.userId),
-      hasApprovedQuestion: approvedQuestionScopes.has(
-        catalogScopeKey(ticket.userId, ticket.quotaPeriodId),
-      ),
+        completedCatalogScopes.has(key) || hasReusableCatalogMilestone,
+      hasApprovedQuestion: approvedQuestionScopes.has(key),
     });
+  };
   const counts = { pending: 0, completed: 0 };
   for (const row of countRows) {
     const group = deliveryTicketStatusGroup(row.status);
@@ -2090,9 +2440,20 @@ export async function assertDeliveryProjectContext(input: {
   };
 }
 
-export function formalMonitoringBatchOptionsScope(userId: number) {
+export function formalMonitoringBatchOptionsScope(input: {
+  userId: number;
+  scopes: Array<{ contractId: string; quotaPeriodId: string }>;
+}) {
   return and(
-    eq(monitoringBatches.userId, userId),
+    eq(monitoringBatches.userId, input.userId),
+    or(
+      ...input.scopes.map((scope) =>
+        and(
+          eq(monitoringBatches.contractId, scope.contractId),
+          eq(monitoringBatches.quotaPeriodId, scope.quotaPeriodId),
+        ),
+      ),
+    ),
     gt(monitoringBatches.sampleCount, 0),
   );
 }
@@ -2100,7 +2461,18 @@ export function formalMonitoringBatchOptionsScope(userId: number) {
 export async function listFormalMonitoringBatchOptions(input: {
   executor: any;
   userId: number;
+  activeQuotaSelection?: ActiveDeliveryQuotaSelection | null;
 }) {
+  const activeQuotaSelection =
+    input.activeQuotaSelection === undefined
+      ? await resolveActiveDeliveryQuotaScopes({
+          executor: input.executor,
+          userId: input.userId,
+        })
+      : input.activeQuotaSelection;
+  if (!activeQuotaSelection) return [];
+  const activeScopes = effectiveActiveDeliveryQuotaScopes(activeQuotaSelection);
+  if (!activeScopes.length) return [];
   const rows = await input.executor
     .select({
       batchKey: monitoringBatches.batchKey,
@@ -2109,7 +2481,15 @@ export async function listFormalMonitoringBatchOptions(input: {
       sampleCount: monitoringBatches.sampleCount,
     })
     .from(monitoringBatches)
-    .where(formalMonitoringBatchOptionsScope(input.userId))
+    .where(
+      formalMonitoringBatchOptionsScope({
+        userId: input.userId,
+        scopes: activeScopes.map((scope) => ({
+          contractId: scope.contract.id,
+          quotaPeriodId: scope.period.id,
+        })),
+      }),
+    )
     .orderBy(desc(monitoringBatches.collectedAt), desc(monitoringBatches.id));
   const seenBatchKeys = new Set<string>();
   return rows.flatMap(
@@ -2140,6 +2520,15 @@ export async function getMyDeliveryWorkbench(input: {
   const role = await assertDeliveryProjectContext(input);
   const db = await requireDb();
   const customerIds = [role.customerUserId];
+  const activeQuotaSelection = await resolveActiveDeliveryQuotaScopes({
+    executor: db,
+    userId: role.customerUserId,
+  });
+  const questionScopes = activeQuotaSelection
+    ? effectiveActiveDeliveryQuotaScopes(activeQuotaSelection).map(
+        deliveryQuestionWorkflowScope,
+      )
+    : [];
   const [
     customers,
     questions,
@@ -2163,7 +2552,7 @@ export async function getMyDeliveryWorkbench(input: {
           .from(users)
           .where(inArray(users.id, customerIds))
       : [],
-    customerIds.length
+    customerIds.length && questionScopes.length
       ? db
           .select({
             id: workspaceQuestions.id,
@@ -2183,7 +2572,12 @@ export async function getMyDeliveryWorkbench(input: {
             revision: workspaceQuestions.revision,
           })
           .from(workspaceQuestions)
-          .where(inArray(workspaceQuestions.userId, customerIds))
+          .where(
+            and(
+              inArray(workspaceQuestions.userId, customerIds),
+              workspaceQuestionDeliveryScopesCondition(questionScopes),
+            ),
+          )
       : [],
     customerIds.length
       ? db
@@ -2224,6 +2618,7 @@ export async function getMyDeliveryWorkbench(input: {
       ? listFormalMonitoringBatchOptions({
           executor: db,
           userId: role.customerUserId,
+          activeQuotaSelection,
         })
       : [],
   ]);
@@ -2310,6 +2705,89 @@ export async function updateMyCustomerBrandTrackingLimit(input: {
   const result = await updateJenovaBrandTrackingLimit(input);
   return { success: true as const, ...result };
 }
+
+async function resolveQuestionCatalogReviewAccess(input: {
+  executor: any;
+  userId: number;
+  questionId: string;
+  lock?: boolean;
+}) {
+  const activeQuotaSelection = await resolveActiveDeliveryQuotaScopes({
+    executor: input.executor,
+    userId: input.userId,
+  });
+  if (!activeQuotaSelection) {
+    return { allowed: false, questionScope: null } as const;
+  }
+  let questionQuery = input.executor
+    .select({
+      contractId: workspaceQuestions.contractId,
+      quotaPeriodId: workspaceQuestions.quotaPeriodId,
+    })
+    .from(workspaceQuestions)
+    .where(
+      and(
+        eq(workspaceQuestions.userId, input.userId),
+        eq(workspaceQuestions.id, input.questionId),
+      ),
+    )
+    .limit(1);
+  if (input.lock) questionQuery = questionQuery.for("update");
+  const questionRows = await questionQuery;
+  const activeQuestionScope = questionRows[0]
+    ? findActiveDeliveryQuotaScope({
+        selection: activeQuotaSelection,
+        record: questionRows[0],
+      })
+    : null;
+  if (!activeQuestionScope) {
+    return { allowed: false, questionScope: null } as const;
+  }
+  const questionScope = deliveryQuestionWorkflowScope(activeQuestionScope);
+  let ticketQuery = input.executor
+    .select({ status: deliveryTickets.status })
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.userId, input.userId),
+        deliveryTicketQuestionScopeCondition(questionScope),
+        eq(deliveryTickets.operation, "question_catalog"),
+        inArray(deliveryTickets.status, [
+          ...ACTIVE_DELIVERY_STATUSES,
+          "completed",
+        ]),
+      ),
+    );
+  if (input.lock) ticketQuery = ticketQuery.for("update");
+  const ticketRows = await ticketQuery;
+  const milestoneRows = questionScope.progressiveLuxury
+    ? await input.executor
+        .select({ id: deliveryWorkflowMilestones.id })
+        .from(deliveryWorkflowMilestones)
+        .where(
+          and(
+            eq(deliveryWorkflowMilestones.userId, input.userId),
+            eq(deliveryWorkflowMilestones.operation, "question_catalog"),
+            deliveryWorkflowMilestoneScopeCondition(questionScope),
+          ),
+        )
+        .limit(1)
+    : [];
+  return {
+    allowed: questionCatalogReviewAllowed({
+      progressiveLuxury: questionScope.progressiveLuxury,
+      hasActiveCatalog: ticketRows.some((row: { status: string }) =>
+        ACTIVE_DELIVERY_STATUSES.includes(row.status as any),
+      ),
+      hasCompletedCatalog: ticketRows.some(
+        (row: { status: string }) => row.status === "completed",
+      ),
+      hasReusableCatalogMilestone: Boolean(milestoneRows[0]),
+    }),
+    questionScope,
+  } as const;
+}
+
 export async function approveMyCustomerQuestionSelection(input: {
   actor: AuthenticatedUser;
   projectAssignmentId: string;
@@ -2325,30 +2803,21 @@ export async function approveMyCustomerQuestionSelection(input: {
     );
   }
   const db = await requireDb();
-  const activeCatalogTickets = await db
-    .select({ id: deliveryTickets.id })
-    .from(deliveryTickets)
-    .where(
-      and(
-        eq(
-          deliveryTickets.assignedProjectAssignmentId,
-          role.projectAssignmentId,
-        ),
-        eq(deliveryTickets.userId, role.customerUserId),
-        eq(deliveryTickets.operation, "question_catalog"),
-        inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
-      ),
-    )
-    .limit(1);
-  if (!activeCatalogTickets[0]) {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "品牌词库与问题目录需求尚未解锁或已经结束",
-    );
-  }
   try {
-    return await db.transaction(async (tx) =>
-      approveWorkspaceQuestionSelection(
+    return await db.transaction(async (tx) => {
+      const catalogAccess = await resolveQuestionCatalogReviewAccess({
+        executor: tx,
+        userId: role.customerUserId,
+        questionId: input.questionId,
+        lock: true,
+      });
+      if (!catalogAccess.allowed) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "品牌词库与问题目录需求尚未解锁或已经结束",
+        );
+      }
+      return approveWorkspaceQuestionSelection(
         {
           userId: role.customerUserId,
           questionId: input.questionId,
@@ -2415,8 +2884,8 @@ export async function approveMyCustomerQuestionSelection(input: {
             });
           },
         },
-      ),
-    );
+      );
+    });
   } catch (error) {
     if (error instanceof ServiceEntitlementError) {
       throw new AuthServiceError("CONFLICT", error.message);
@@ -2453,23 +2922,13 @@ export async function rejectMyCustomerQuestionSelection(input: {
       expectedRoleType: "monitoring_optimization_engineer",
       executor: tx,
     });
-    const catalogRows = await tx
-      .select({ id: deliveryTickets.id })
-      .from(deliveryTickets)
-      .where(
-        and(
-          eq(
-            deliveryTickets.assignedProjectAssignmentId,
-            role.projectAssignmentId,
-          ),
-          eq(deliveryTickets.userId, role.customerUserId),
-          eq(deliveryTickets.operation, "question_catalog"),
-          inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
-        ),
-      )
-      .limit(1)
-      .for("update");
-    if (!catalogRows[0]) {
+    const catalogAccess = await resolveQuestionCatalogReviewAccess({
+      executor: tx,
+      userId: role.customerUserId,
+      questionId: input.questionId,
+      lock: true,
+    });
+    if (!catalogAccess.allowed || !catalogAccess.questionScope) {
       throw new AuthServiceError(
         "CONFLICT",
         "品牌词库与问题目录需求尚未解锁或已经结束",
@@ -2482,6 +2941,7 @@ export async function rejectMyCustomerQuestionSelection(input: {
         and(
           eq(workspaceQuestions.id, input.questionId),
           eq(workspaceQuestions.userId, role.customerUserId),
+          workspaceQuestionDeliveryScopeCondition(catalogAccess.questionScope),
         ),
       )
       .limit(1)
@@ -2938,13 +3398,20 @@ export function deriveDeliveryExecutionTransition(input: {
   };
 }
 
-export function monitoringRetestTechnicalDedupeKey(sourceQuestionId: string) {
+export function monitoringRetestTechnicalDedupeKey(
+  sourceQuestionId: string,
+  quotaScopeKey?: string,
+) {
   const normalizedSourceQuestionId = sourceQuestionId.trim();
   if (!normalizedSourceQuestionId) {
     throw new AuthServiceError("CONFLICT", "效果复测必须绑定来源问题 ID");
   }
   return `monitoring-retest:${createHash("sha256")
-    .update(normalizedSourceQuestionId)
+    .update(
+      quotaScopeKey
+        ? `${quotaScopeKey}\u0000${normalizedSourceQuestionId}`
+        : normalizedSourceQuestionId,
+    )
     .digest("hex")
     .slice(0, 46)}`;
 }
@@ -2956,8 +3423,24 @@ export async function createMonitoringRetestTicket(input: {
 }) {
   const sourceQuestionId = input.sourceTicket.sourceQuestionId?.trim();
   if (!sourceQuestionId) return null;
-  const technicalDedupeKey =
-    monitoringRetestTechnicalDedupeKey(sourceQuestionId);
+  const activeQuotaSelection = await resolveActiveDeliveryQuotaScopes({
+    executor: input.executor,
+    userId: input.sourceTicket.userId,
+  });
+  const currentScope = activeQuotaSelection
+    ? selectActiveDeliveryQuotaScope({
+        selection: activeQuotaSelection,
+        record: input.sourceTicket,
+      })
+    : null;
+  if (!currentScope) return null;
+  const questionScope = deliveryQuestionWorkflowScope(currentScope);
+  const technicalDedupeKey = monitoringRetestTechnicalDedupeKey(
+    sourceQuestionId,
+    questionScope.progressiveLuxury
+      ? deliveryQuestionWorkflowScopeKey(questionScope)
+      : undefined,
+  );
   const owner = await getActiveDeliveryProjectOwner(
     input.executor,
     input.sourceTicket.userId,
@@ -2972,30 +3455,23 @@ export async function createMonitoringRetestTicket(input: {
         eq(deliveryTickets.userId, input.sourceTicket.userId),
         eq(deliveryTickets.operation, "monitoring_retest"),
         eq(deliveryTickets.sourceQuestionId, sourceQuestionId),
+        questionScope.progressiveLuxury
+          ? deliveryTicketQuestionScopeCondition(questionScope)
+          : undefined,
         inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
       ),
     )
     .limit(1)
     .for("update");
   if (existingRows[0]) return existingRows[0].id;
-  const periods = await input.executor
-    .select({
-      id: serviceQuotaPeriods.id,
-      contractId: serviceQuotaPeriods.contractId,
-    })
-    .from(serviceQuotaPeriods)
-    .where(eq(serviceQuotaPeriods.userId, input.sourceTicket.userId))
-    .orderBy(desc(serviceQuotaPeriods.endsAt))
-    .limit(1);
-  const period = periods[0];
-  if (!period) return null;
+  const { contract, period } = currentScope;
   const proposedId = randomUUID();
   await input.executor
     .insert(deliveryTickets)
     .values({
       id: proposedId,
       userId: input.sourceTicket.userId,
-      contractId: period.contractId,
+      contractId: contract.id,
       quotaPeriodId: period.id,
       type: "website_operation",
       quotaPool: null,
@@ -3030,6 +3506,9 @@ export async function createMonitoringRetestTicket(input: {
       and(
         eq(deliveryTickets.userId, input.sourceTicket.userId),
         eq(deliveryTickets.technicalDedupeKey, technicalDedupeKey),
+        questionScope.progressiveLuxury
+          ? deliveryTicketQuestionScopeCondition(questionScope)
+          : undefined,
         inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
       ),
     )
@@ -3244,6 +3723,7 @@ export async function createAssignedWorkflowTicket(input: {
   let billingScope: ReturnType<
     typeof resolveAssignedWorkflowBillingScope
   > | null = null;
+  let fallbackQuestionScope: DeliveryQuestionWorkflowScope | null = null;
   if (rootTicketId) {
     const rootRows = await input.executor
       .select({
@@ -3262,6 +3742,29 @@ export async function createAssignedWorkflowTicket(input: {
       sourceTicket: input.sourceTicket,
       rootTicket: rootRows[0] ?? null,
     });
+  } else {
+    const activeQuotaSelection = await resolveActiveDeliveryQuotaScopes({
+      executor: input.executor,
+      userId: input.sourceTicket.userId,
+    });
+    const currentScope = activeQuotaSelection
+      ? selectActiveDeliveryQuotaScope({
+          selection: activeQuotaSelection,
+          record: input.sourceTicket,
+        })
+      : null;
+    fallbackQuestionScope = currentScope
+      ? deliveryQuestionWorkflowScope(currentScope)
+      : null;
+    billingScope = resolveAssignedWorkflowBillingScope({
+      sourceTicket: input.sourceTicket,
+      latestPeriod: currentScope
+        ? {
+            id: currentScope.period.id,
+            contractId: currentScope.contract.id,
+          }
+        : null,
+    });
   }
   const existingRows = await input.executor
     .select({ id: deliveryTickets.id })
@@ -3278,28 +3781,16 @@ export async function createAssignedWorkflowTicket(input: {
           : isNull(deliveryTickets.sourceQuestionId),
         ...(relationshipScoped
           ? []
-          : [inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES)]),
+          : [
+              fallbackQuestionScope
+                ? deliveryTicketQuestionScopeCondition(fallbackQuestionScope)
+                : undefined,
+              inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+            ]),
       ),
     )
     .limit(1);
   if (existingRows[0]) return existingRows[0].id;
-
-  if (!billingScope) {
-    const periodRows = await input.executor
-      .select({
-        id: serviceQuotaPeriods.id,
-        contractId: serviceQuotaPeriods.contractId,
-      })
-      .from(serviceQuotaPeriods)
-      .where(eq(serviceQuotaPeriods.userId, input.sourceTicket.userId))
-      .orderBy(desc(serviceQuotaPeriods.endsAt))
-      .limit(1);
-    billingScope = resolveAssignedWorkflowBillingScope({
-      sourceTicket: input.sourceTicket,
-      latestPeriod: periodRows[0] ?? null,
-    });
-  }
-
   const id = randomUUID();
   const eventId = randomUUID();
   const now = new Date();
@@ -3664,10 +4155,48 @@ async function ensureInitialMonitoringWorkflowTicket(input: {
   }
 
   const now = new Date();
-  const [existingTickets, existingMilestones] = await Promise.all([
+  const activeQuotaSelection = await resolveActiveDeliveryQuotaScopes({
+    executor: input.executor,
+    userId: input.sourceTicket.userId,
+    now,
+  });
+  const currentScope = activeQuotaSelection
+    ? selectActiveDeliveryQuotaScope({
+        selection: activeQuotaSelection,
+        record: input.sourceTicket,
+      })
+    : null;
+  if (!currentScope) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "当前服务合同或运营周期不可用，不能创建首次问题监控需求",
+    );
+  }
+  const questionScope = deliveryQuestionWorkflowScope(currentScope);
+  if (
+    questionScope.progressiveLuxury &&
+    input.sourceTicket.contractId !== questionScope.contractId
+  ) {
+    return { id: null, created: false as const };
+  }
+  const sourceQuestionScope = await resolveDeliveryTicketQuestionWorkflowScope({
+    executor: input.executor,
+    ticket: input.sourceTicket,
+  });
+  const dependencyScope = questionScope.progressiveLuxury
+    ? questionScope
+    : (sourceQuestionScope ?? questionScope);
+  const [
+    existingTickets,
+    completedCatalogRows,
+    initialMonitoringMilestoneRows,
+    catalogMilestoneRows,
+    approvedQuestionRows,
+  ] = await Promise.all([
     input.executor
       .select({
         id: deliveryTickets.id,
+        contractId: deliveryTickets.contractId,
         quotaPeriodId: deliveryTickets.quotaPeriodId,
         status: deliveryTickets.status,
         revision: deliveryTickets.revision,
@@ -3682,112 +4211,104 @@ async function ensureInitialMonitoringWorkflowTicket(input: {
       .limit(10)
       .for("update"),
     input.executor
-      .select({ id: deliveryWorkflowMilestones.id })
+      .select({ id: deliveryTickets.id })
+      .from(deliveryTickets)
+      .where(
+        and(
+          eq(deliveryTickets.userId, input.sourceTicket.userId),
+          deliveryTicketQuestionScopeCondition(dependencyScope),
+          eq(deliveryTickets.operation, "question_catalog"),
+          eq(deliveryTickets.status, "completed"),
+        ),
+      )
+      .limit(1),
+    input.executor
+      .select({
+        id: deliveryWorkflowMilestones.id,
+        completedAt: deliveryWorkflowMilestones.completedAt,
+      })
       .from(deliveryWorkflowMilestones)
       .where(
         and(
           eq(deliveryWorkflowMilestones.userId, input.sourceTicket.userId),
           eq(deliveryWorkflowMilestones.operation, "initial_monitoring"),
+          questionScope.progressiveLuxury
+            ? deliveryWorkflowMilestoneScopeCondition(questionScope)
+            : undefined,
+        ),
+      )
+      .limit(1),
+    input.executor
+      .select({
+        id: deliveryWorkflowMilestones.id,
+        completedAt: deliveryWorkflowMilestones.completedAt,
+      })
+      .from(deliveryWorkflowMilestones)
+      .where(
+        and(
+          eq(deliveryWorkflowMilestones.userId, input.sourceTicket.userId),
+          eq(deliveryWorkflowMilestones.operation, "question_catalog"),
+          dependencyScope.progressiveLuxury
+            ? deliveryWorkflowMilestoneScopeCondition(dependencyScope)
+            : undefined,
+        ),
+      )
+      .limit(1),
+    input.executor
+      .select({ id: workspaceQuestions.id })
+      .from(workspaceQuestions)
+      .where(
+        and(
+          eq(workspaceQuestions.userId, input.sourceTicket.userId),
+          workspaceQuestionDeliveryScopeCondition(dependencyScope),
+          eq(workspaceQuestions.status, "selected"),
+          eq(workspaceQuestions.selectionApprovalStatus, "approved"),
         ),
       )
       .limit(1),
   ]);
-  if (existingMilestones[0]) return { id: null, created: false as const };
+  if (initialMonitoringMilestoneRows[0]) {
+    return { id: null, created: false as const };
+  }
 
-  const completedTicket = existingTickets.find(
-    (ticket: (typeof existingTickets)[number]) => ticket.status === "completed",
+  const ticketMatchesCurrentScope = (
+    ticket: (typeof existingTickets)[number],
+  ) =>
+    questionScope.progressiveLuxury
+      ? ticket.contractId === questionScope.contractId
+      : true;
+  const scopedExistingTickets = existingTickets.filter(
+    ticketMatchesCurrentScope,
+  );
+  const completedTicket = scopedExistingTickets.find(
+    (ticket: (typeof scopedExistingTickets)[number]) =>
+      ticket.status === "completed",
   );
   if (completedTicket) {
     return { id: completedTicket.id, created: false as const };
   }
-
-  const crossPeriodTickets = existingTickets.filter(
-    (ticket: (typeof existingTickets)[number]) =>
-      ticket.quotaPeriodId !== input.sourceTicket.quotaPeriodId,
-  );
-  const crossPeriodIds: string[] = [
-    ...new Set<string>(
-      crossPeriodTickets.map((ticket: (typeof existingTickets)[number]) =>
-        String(ticket.quotaPeriodId),
-      ),
-    ),
-  ];
-  const [completedCatalogRows, archivedCatalogRows, approvedQuestionRows] =
-    crossPeriodIds.length
-      ? await Promise.all([
-          input.executor
-            .selectDistinct({ quotaPeriodId: deliveryTickets.quotaPeriodId })
-            .from(deliveryTickets)
-            .where(
-              and(
-                eq(deliveryTickets.userId, input.sourceTicket.userId),
-                inArray(deliveryTickets.quotaPeriodId, crossPeriodIds),
-                eq(deliveryTickets.operation, "question_catalog"),
-                eq(deliveryTickets.status, "completed"),
-              ),
-            ),
-          input.executor
-            .select({ id: deliveryWorkflowMilestones.id })
-            .from(deliveryWorkflowMilestones)
-            .where(
-              and(
-                eq(
-                  deliveryWorkflowMilestones.userId,
-                  input.sourceTicket.userId,
-                ),
-                eq(deliveryWorkflowMilestones.operation, "question_catalog"),
-              ),
-            )
-            .limit(1),
-          input.executor
-            .selectDistinct({
-              quotaPeriodId: workspaceQuestions.quotaPeriodId,
-            })
-            .from(workspaceQuestions)
-            .where(
-              and(
-                eq(workspaceQuestions.userId, input.sourceTicket.userId),
-                inArray(workspaceQuestions.quotaPeriodId, crossPeriodIds),
-                eq(workspaceQuestions.status, "selected"),
-                eq(workspaceQuestions.selectionApprovalStatus, "approved"),
-              ),
-            ),
-        ])
-      : [[], [], []];
-  const completedCatalogPeriods = new Set(
-    completedCatalogRows.map(
-      (row: (typeof completedCatalogRows)[number]) => row.quotaPeriodId,
-    ),
-  );
-  const approvedQuestionPeriods = new Set(
-    approvedQuestionRows.map(
-      (row: (typeof approvedQuestionRows)[number]) => row.quotaPeriodId,
-    ),
-  );
-  const hasArchivedCatalog = Boolean(archivedCatalogRows[0]);
-  const reusableTicket = existingTickets.find(
-    (ticket: (typeof existingTickets)[number]) =>
+  const dependencySatisfied =
+    Boolean(completedCatalogRows[0] || catalogMilestoneRows[0]) &&
+    Boolean(approvedQuestionRows[0]);
+  const reusableTicket = scopedExistingTickets.find(
+    (ticket: (typeof scopedExistingTickets)[number]) =>
       initialMonitoringExistingTicketAction({
         status: ticket.status,
         ticketQuotaPeriodId: ticket.quotaPeriodId,
-        sourceQuotaPeriodId: input.sourceTicket.quotaPeriodId,
-        dependencySatisfied:
-          (completedCatalogPeriods.has(ticket.quotaPeriodId) ||
-            hasArchivedCatalog) &&
-          approvedQuestionPeriods.has(ticket.quotaPeriodId),
+        sourceQuotaPeriodId: dependencyScope.quotaPeriodId,
+        dependencySatisfied,
       }) === "reuse",
   );
   const staleTickets = existingTickets.filter(
     (ticket: (typeof existingTickets)[number]) =>
-      initialMonitoringExistingTicketAction({
-        status: ticket.status,
-        ticketQuotaPeriodId: ticket.quotaPeriodId,
-        sourceQuotaPeriodId: input.sourceTicket.quotaPeriodId,
-        dependencySatisfied:
-          (completedCatalogPeriods.has(ticket.quotaPeriodId) ||
-            hasArchivedCatalog) &&
-          approvedQuestionPeriods.has(ticket.quotaPeriodId),
-      }) === "replace_stale",
+      ACTIVE_DELIVERY_STATUSES.includes(ticket.status as any) &&
+      (!ticketMatchesCurrentScope(ticket) ||
+        initialMonitoringExistingTicketAction({
+          status: ticket.status,
+          ticketQuotaPeriodId: ticket.quotaPeriodId,
+          sourceQuotaPeriodId: dependencyScope.quotaPeriodId,
+          dependencySatisfied,
+        }) === "replace_stale"),
   );
   for (const staleTicket of staleTickets) {
     await input.executor
@@ -3838,8 +4359,8 @@ async function ensureInitialMonitoringWorkflowTicket(input: {
   await input.executor.insert(deliveryTickets).values({
     id: ticketId,
     userId: input.sourceTicket.userId,
-    contractId: input.sourceTicket.contractId,
-    quotaPeriodId: input.sourceTicket.quotaPeriodId,
+    contractId: currentScope.contract.id,
+    quotaPeriodId: currentScope.period.id,
     type: "website_operation",
     quotaPool: null,
     ordinal: 0,
@@ -4107,6 +4628,24 @@ export async function updateMyDeliveryTicket(input: {
       throw error;
     }
     const now = new Date();
+    let currentQuotaScope:
+      | Awaited<ReturnType<typeof resolveCurrentServiceQuotaScope>>
+      | undefined;
+    const loadCurrentQuotaScope = async () => {
+      if (currentQuotaScope !== undefined) return currentQuotaScope;
+      const activeQuotaSelection = await resolveActiveDeliveryQuotaScopes({
+        executor: tx,
+        userId: ticket.userId,
+        now,
+      });
+      currentQuotaScope = activeQuotaSelection
+        ? (findActiveDeliveryQuotaScope({
+            selection: activeQuotaSelection,
+            record: ticket,
+          }) ?? null)
+        : null;
+      return currentQuotaScope;
+    };
     const siteCheckFailed =
       input.status === "completed" &&
       ticket.operation === "site_check" &&
@@ -4162,20 +4701,30 @@ export async function updateMyDeliveryTicket(input: {
       input.status === "completed" &&
       ticket.operation === "question_catalog"
     ) {
+      const questionScope = await resolveDeliveryTicketQuestionWorkflowScope({
+        executor: tx,
+        ticket,
+      });
       const questionRows = await tx
         .select({ id: workspaceQuestions.id })
         .from(workspaceQuestions)
         .where(
           and(
             eq(workspaceQuestions.userId, ticket.userId),
-            eq(workspaceQuestions.quotaPeriodId, ticket.quotaPeriodId),
+            questionScope
+              ? workspaceQuestionDeliveryScopeCondition(questionScope)
+              : sql<boolean>`FALSE`,
             eq(workspaceQuestions.status, "selected"),
             eq(workspaceQuestions.selectionApprovalStatus, "approved"),
           ),
         )
         .limit(1);
       const dashboard = await loadPublishedDashboard();
-      if (!questionRows[0] || !dashboard?.keywordTables.length) {
+      if (
+        !questionScope ||
+        !questionRows[0] ||
+        !dashboard?.keywordTables.length
+      ) {
         throw new AuthServiceError(
           "CONFLICT",
           "完成问题目录需求前必须先发布品牌词库，并至少审核通过一条客户选择的问题",
@@ -4187,6 +4736,10 @@ export async function updateMyDeliveryTicket(input: {
       ["in_progress", "completed"].includes(input.status) &&
       ticket.operation === "initial_monitoring"
     ) {
+      const questionScope = await resolveDeliveryTicketQuestionWorkflowScope({
+        executor: tx,
+        ticket,
+      });
       const [completedCatalogRows, archivedCatalogRows, approvedQuestionRows] =
         await Promise.all([
           tx
@@ -4195,7 +4748,9 @@ export async function updateMyDeliveryTicket(input: {
             .where(
               and(
                 eq(deliveryTickets.userId, ticket.userId),
-                eq(deliveryTickets.quotaPeriodId, ticket.quotaPeriodId),
+                questionScope
+                  ? deliveryTicketQuestionScopeCondition(questionScope)
+                  : sql<boolean>`FALSE`,
                 eq(deliveryTickets.operation, "question_catalog"),
                 eq(deliveryTickets.status, "completed"),
               ),
@@ -4208,6 +4763,11 @@ export async function updateMyDeliveryTicket(input: {
               and(
                 eq(deliveryWorkflowMilestones.userId, ticket.userId),
                 eq(deliveryWorkflowMilestones.operation, "question_catalog"),
+                questionScope?.progressiveLuxury
+                  ? deliveryWorkflowMilestoneScopeCondition(questionScope)
+                  : questionScope
+                    ? undefined
+                    : sql<boolean>`FALSE`,
               ),
             )
             .limit(1),
@@ -4217,7 +4777,9 @@ export async function updateMyDeliveryTicket(input: {
             .where(
               and(
                 eq(workspaceQuestions.userId, ticket.userId),
-                eq(workspaceQuestions.quotaPeriodId, ticket.quotaPeriodId),
+                questionScope
+                  ? workspaceQuestionDeliveryScopeCondition(questionScope)
+                  : sql<boolean>`FALSE`,
                 eq(workspaceQuestions.status, "selected"),
                 eq(workspaceQuestions.selectionApprovalStatus, "approved"),
               ),
@@ -4225,6 +4787,7 @@ export async function updateMyDeliveryTicket(input: {
             .limit(1),
         ]);
       if (
+        !questionScope ||
         (!completedCatalogRows[0] && !archivedCatalogRows[0]) ||
         !approvedQuestionRows[0]
       ) {
@@ -4241,6 +4804,10 @@ export async function updateMyDeliveryTicket(input: {
         ticket.operation || "",
       )
     ) {
+      const quotaScope = await loadCurrentQuotaScope();
+      const questionScope = quotaScope
+        ? deliveryQuestionWorkflowScope(quotaScope)
+        : null;
       if (!monitoringBatchKey) {
         throw new AuthServiceError(
           "CONFLICT",
@@ -4266,12 +4833,23 @@ export async function updateMyDeliveryTicket(input: {
           and(
             eq(monitoringBatches.userId, ticket.userId),
             eq(monitoringBatches.batchKey, monitoringBatchKey),
+            quotaScope
+              ? eq(monitoringBatches.contractId, quotaScope.contract.id)
+              : sql<boolean>`FALSE`,
+            quotaScope
+              ? eq(monitoringBatches.quotaPeriodId, quotaScope.period.id)
+              : sql<boolean>`FALSE`,
           ),
         )
         .orderBy(desc(monitoringBatches.collectedAt))
         .limit(1);
       const monitoringBatch = batchRows[0];
-      if (!monitoringBatch || monitoringBatch.sampleCount < 1) {
+      if (
+        !questionScope ||
+        !deliveryRecordMatchesQuestionWorkflowScope(ticket, questionScope) ||
+        !monitoringBatch ||
+        monitoringBatch.sampleCount < 1
+      ) {
         throw new AuthServiceError(
           "CONFLICT",
           "所填监控批次尚未发布正式答案，请先完成导入并在用户预览中核对",
@@ -4293,6 +4871,7 @@ export async function updateMyDeliveryTicket(input: {
             .where(
               and(
                 eq(workspaceQuestions.userId, ticket.userId),
+                workspaceQuestionDeliveryScopeCondition(questionScope),
                 eq(workspaceQuestions.status, "selected"),
                 eq(workspaceQuestions.selectionApprovalStatus, "approved"),
                 inArray(workspaceQuestions.id, optimizationQuestionIds),
@@ -5058,23 +5637,25 @@ export async function createKnowledgeMonitoringHandoff(input: {
 }) {
   const db = await requireDb();
   return db.transaction(async (tx) => {
-    const periodRows = await tx
-      .select({
-        id: serviceQuotaPeriods.id,
-        contractId: serviceQuotaPeriods.contractId,
-      })
-      .from(serviceQuotaPeriods)
-      .where(eq(serviceQuotaPeriods.userId, input.userId))
-      .orderBy(desc(serviceQuotaPeriods.endsAt))
-      .limit(1);
-    const period = periodRows[0];
-    if (!period) {
+    const activeQuotaSelection = await resolveActiveDeliveryQuotaScopes({
+      executor: tx,
+      userId: input.userId,
+    });
+    const currentScope = activeQuotaSelection
+      ? (activeQuotaSelection.scopes.find(
+          (scope) =>
+            scope.contract.id === activeQuotaSelection.primaryContract.id,
+        ) ?? null)
+      : null;
+    if (!currentScope) {
       return {
         created: [] as string[],
         assigned: false as const,
         knowledgeTicketId: null,
       };
     }
+    const { contract, period } = currentScope;
+    const questionScope = deliveryQuestionWorkflowScope(currentScope);
     const snapshotRows = input.knowledgeSnapshotId
       ? await tx
           .select({
@@ -5131,7 +5712,7 @@ export async function createKnowledgeMonitoringHandoff(input: {
         await tx.insert(deliveryTickets).values({
           id: knowledgeTicketId,
           userId: input.userId,
-          contractId: period.contractId,
+          contractId: contract.id,
           quotaPeriodId: period.id,
           type: "knowledge_base",
           quotaPool: null,
@@ -5189,6 +5770,9 @@ export async function createKnowledgeMonitoringHandoff(input: {
           and(
             eq(deliveryTickets.userId, input.userId),
             inArray(deliveryTickets.operation, [...operations]),
+            questionScope.progressiveLuxury
+              ? deliveryTicketQuestionScopeCondition(questionScope)
+              : undefined,
             inArray(deliveryTickets.status, [...reusableTicketStatuses]),
           ),
         ),
@@ -5199,6 +5783,9 @@ export async function createKnowledgeMonitoringHandoff(input: {
           and(
             eq(deliveryWorkflowMilestones.userId, input.userId),
             inArray(deliveryWorkflowMilestones.operation, [...operations]),
+            questionScope.progressiveLuxury
+              ? deliveryWorkflowMilestoneScopeCondition(questionScope)
+              : undefined,
           ),
         ),
     ]);
@@ -5213,7 +5800,7 @@ export async function createKnowledgeMonitoringHandoff(input: {
       await tx.insert(deliveryTickets).values({
         id,
         userId: input.userId,
-        contractId: period.contractId,
+        contractId: contract.id,
         quotaPeriodId: period.id,
         type: "website_operation",
         quotaPool: null,

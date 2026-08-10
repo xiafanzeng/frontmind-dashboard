@@ -129,7 +129,7 @@ export type ServicePlanDefinition = {
   code: ServicePlanCode;
   name: string;
   description: string;
-  planVersion: 1;
+  planVersion: 1 | 2;
   contractTerm: { unit: "day" | "month"; count: number };
   quotaCadence: "contract" | "quarter" | "month";
   prepaidMonths: number | null;
@@ -206,9 +206,9 @@ export const SERVICE_PLAN_CATALOG: Readonly<
   luxury: {
     code: "luxury",
     name: "豪华版",
-    description: "提供豪华版完整服务。",
-    planVersion: 1,
-    contractTerm: { unit: "month", count: 3 },
+    description: "提供按服务季度渐进解锁问题额度的豪华版完整服务。",
+    planVersion: 2,
+    contractTerm: { unit: "month", count: 12 },
     quotaCadence: "month",
     prepaidMonths: 3,
     billingLabel: "季度服务",
@@ -376,6 +376,17 @@ export const servicePortalQuotaPeriodSchema = z.object({
   validUntil: z.number().int(),
   revision: z.number().int().positive(),
   limits: serviceQuotaLimitsSchema,
+  entitlementLimits: serviceQuotaLimitsSchema.optional(),
+  unlockStage: z
+    .object({
+      current: z.number().int().positive(),
+      total: z.number().int().positive(),
+    })
+    .optional(),
+  nextUnlockAt: z.number().int().nullable().optional(),
+  capacityState: z
+    .enum(["available", "awaiting_unlock", "exhausted"])
+    .optional(),
   usage: serviceQuotaUsageSchema,
   remaining: serviceQuotaUsageSchema,
 });
@@ -400,6 +411,7 @@ export const servicePortalSchema = z.object({
   service: z.object({
     contractId: z.string().nullable(),
     planCode: servicePlanCodeSchema.nullable(),
+    planVersion: z.number().int().positive().nullable().optional(),
     planName: z.string(),
     status: effectiveServiceStatusSchema,
     validFrom: z.number().int().nullable(),
@@ -491,6 +503,7 @@ export const publicServicePortalSchema = servicePortalSchema
   .extend({
     service: servicePortalSchema.shape.service.omit({
       contractId: true,
+      planVersion: true,
       source: true,
     }),
     quotas: publicServicePortalQuotaPeriodSchema.nullable(),

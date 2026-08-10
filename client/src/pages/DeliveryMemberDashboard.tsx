@@ -230,6 +230,10 @@ type WorkbenchQuestionQuota = {
   validFrom: number;
   validUntil: number;
   limits: ServiceQuotaLimits;
+  unlockedLimits?: ServiceQuotaLimits;
+  unlockStage?: { current: number; total: number };
+  nextUnlockAt?: number | null;
+  progressiveUnlock?: boolean;
   selectedUsage: ServiceQuotaUsage;
   reservedUsage: ServiceQuotaUsage;
   remaining: ServiceQuotaUsage;
@@ -589,12 +593,22 @@ function QuestionQuotaEditor({
       const raw = draft[field.limitKey].trim();
       const value = Number(raw);
       const minimum = quota.reservedUsage[field.usageKey];
+      const maximum = quota.progressiveUnlock
+        ? (quota.unlockedLimits?.[field.limitKey] ??
+          quota.limits[field.limitKey])
+        : QUESTION_QUOTA_CATEGORY_MAX;
       if (!raw || !Number.isInteger(value)) {
         return { message: `${field.label}额度必须是整数`, values: null };
       }
       if (value < minimum) {
         return {
           message: `${field.label}额度不能低于已确认与待审核预留数量 ${minimum}`,
+          values: null,
+        };
+      }
+      if (value > maximum) {
+        return {
+          message: `${field.label}额度不能超过当前已解锁上限 ${maximum}`,
           values: null,
         };
       }
@@ -607,7 +621,13 @@ function QuestionQuotaEditor({
       values[field.limitKey] = value;
     }
     return { message: "", values };
-  }, [draft, quota.reservedUsage]);
+  }, [
+    draft,
+    quota.limits,
+    quota.progressiveUnlock,
+    quota.reservedUsage,
+    quota.unlockedLimits,
+  ]);
 
   const resetDraft = () => {
     setDraft(questionQuotaDraft(quota.limits));
@@ -624,8 +644,19 @@ function QuestionQuotaEditor({
         <div>
           <CardTitle>客户问题额度</CardTitle>
           <p className="mt-1 text-sm leading-6 text-muted-foreground">
-            当前额度按四类问题分别管理；已确认与待审核预留中的问题不会因下调额度而被挤出。
+            {quota.progressiveUnlock
+              ? `豪华版按季度自动解锁，当前第 ${quota.unlockStage?.current ?? 1}/${quota.unlockStage?.total ?? 4} 档；可下调但不能超过当前已解锁上限。`
+              : "当前额度按四类问题分别管理；已确认与待审核预留中的问题不会因下调额度而被挤出。"}
           </p>
+          {quota.progressiveUnlock && quota.nextUnlockAt && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              下一档将于{" "}
+              {new Date(quota.nextUnlockAt).toLocaleDateString("zh-CN", {
+                timeZone: "Asia/Shanghai",
+              })}{" "}
+              自动解锁。
+            </p>
+          )}
         </div>
         <Button
           type="button"
@@ -650,6 +681,10 @@ function QuestionQuotaEditor({
             const selected = quota.selectedUsage[field.usageKey];
             const reserved = quota.reservedUsage[field.usageKey];
             const pending = Math.max(0, reserved - selected);
+            const maximum = quota.progressiveUnlock
+              ? (quota.unlockedLimits?.[field.limitKey] ??
+                quota.limits[field.limitKey])
+              : QUESTION_QUOTA_CATEGORY_MAX;
             return (
               <div
                 key={field.limitKey}
@@ -669,7 +704,7 @@ function QuestionQuotaEditor({
                     type="number"
                     inputMode="numeric"
                     min={reserved}
-                    max={QUESTION_QUOTA_CATEGORY_MAX}
+                    max={maximum}
                     step={1}
                     value={draft[field.limitKey]}
                     aria-label={`${field.label}额度`}
@@ -734,7 +769,9 @@ function QuestionQuotaEditor({
                 role={formMessage ? "alert" : undefined}
               >
                 {formMessage ||
-                  `每类最多 ${QUESTION_QUOTA_CATEGORY_MAX} 个问题，保存后立即用于当前客户本周期。`}
+                  (quota.progressiveUnlock
+                    ? "保存后立即用于当前客户；系统会继续按权益周期自动解锁后续额度。"
+                    : `每类最多 ${QUESTION_QUOTA_CATEGORY_MAX} 个问题，保存后立即用于当前客户本周期。`)}
               </p>
               <Button
                 type="button"

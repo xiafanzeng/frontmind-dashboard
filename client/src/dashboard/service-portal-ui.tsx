@@ -65,6 +65,7 @@ function displayDate(value: string) {
   const date = new Date(epochValue);
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -78,6 +79,59 @@ function validityLabel(portal: ServicePortalView) {
   if (until) return `有效至 ${until}`;
   if (portal.plan.code === "basic") return "单次交付，账号内长期可查看";
   return "有效期待服务配置同步";
+}
+
+function progressiveQuotaDetails(portal: ServicePortalView) {
+  const unlock = portal.quotaUnlock;
+  if (
+    portal.plan.code !== "luxury" ||
+    !unlock ||
+    unlock.current === null ||
+    unlock.total === null ||
+    unlock.total <= 1
+  ) {
+    return null;
+  }
+  const unlocked = portal.quotas.reduce(
+    (sum, quota) => sum + (quota.limit ?? 0),
+    0,
+  );
+  const entitlement = portal.quotas.reduce(
+    (sum, quota) => sum + (quota.entitlementLimit ?? quota.limit ?? 0),
+    0,
+  );
+  return {
+    ...unlock,
+    unlocked,
+    entitlement,
+    nextUnlockLabel: unlock.nextUnlockAt
+      ? displayDate(unlock.nextUnlockAt)
+      : "",
+  };
+}
+
+function ProgressiveQuotaSummary({ portal }: { portal: ServicePortalView }) {
+  const details = progressiveQuotaDetails(portal);
+  if (!details) return null;
+  return (
+    <div
+      className="mt-4 flex flex-col gap-1 rounded-xl border border-[#dfd2e8] bg-[#faf7fc] px-4 py-3 text-xs leading-5 text-[#716a80] sm:flex-row sm:items-center sm:justify-between"
+      data-testid="quota-unlock-summary"
+    >
+      <span>
+        <strong className="font-semibold text-[#5b2a86]">
+          第 {details.current}/{details.total} 服务季度
+        </strong>
+        <span className="mx-2 text-[#c0b5c8]">·</span>
+        当前已解锁 {details.unlocked} / 全年 {details.entitlement} 个问题
+      </span>
+      {details.capacityState === "exhausted" ? (
+        <span>全年问题额度已用完</span>
+      ) : details.nextUnlockLabel ? (
+        <span>下一季度额度将于 {details.nextUnlockLabel} 开放</span>
+      ) : null}
+    </div>
+  );
 }
 
 function actionHref(action: ServiceAction | undefined) {
@@ -364,6 +418,7 @@ export function ServiceQuotaOverview({
   portal: ServicePortalView;
   className?: string;
 }) {
+  const progressiveQuota = progressiveQuotaDetails(portal) !== null;
   return (
     <section
       className={`rounded-[22px] border border-[#e8e1ee] bg-white p-5 shadow-[0_14px_36px_rgba(33,19,58,.05)] md:p-6 ${className}`}
@@ -377,6 +432,8 @@ export function ServiceQuotaOverview({
           <h3 className="m-0 text-lg font-semibold text-[#171321]">套餐配额</h3>
         </div>
       </div>
+
+      <ProgressiveQuotaSummary portal={portal} />
 
       {portal.quotas.length > 0 ? (
         <div className="mt-5 grid grid-cols-2 gap-3">
@@ -394,13 +451,24 @@ export function ServiceQuotaOverview({
                   {quota.label}
                 </span>
                 <strong className="fm-question-category-ink mt-2 block text-xl">
-                  {synchronized ? `${quota.used} / ${quota.limit}` : "待同步"}
+                  {synchronized
+                    ? progressiveQuota && quota.entitlementLimit !== undefined
+                      ? `已用 ${quota.used} / 已解锁 ${quota.limit}`
+                      : `${quota.used} / ${quota.limit}`
+                    : "待同步"}
                   {synchronized && (
                     <small className="ml-1 text-xs font-medium text-[#8d8496]">
                       {quota.unit}
                     </small>
                   )}
                 </strong>
+                {synchronized &&
+                  progressiveQuota &&
+                  quota.entitlementLimit !== undefined && (
+                    <p className="m-0 mt-1 text-xs text-[#8d8496]">
+                      全年 {quota.entitlementLimit} {quota.unit}
+                    </p>
+                  )}
                 {!synchronized && (
                   <p className="m-0 mt-2 text-xs text-[#8d8496]">
                     等待服务配置同步
@@ -426,6 +494,7 @@ function ServiceCycleOverview({
   portal: ServicePortalView;
   onNavigate: (section: string, sub?: string | null) => void;
 }) {
+  const progressiveQuota = progressiveQuotaDetails(portal) !== null;
   const purchasedQuestionLabel =
     portal.purchasedQuestions.length > 0
       ? `${portal.purchasedQuestions.length} 个已购问题`
@@ -467,6 +536,8 @@ function ServiceCycleOverview({
         </div>
       </div>
 
+      <ProgressiveQuotaSummary portal={portal} />
+
       {portal.quotas.length > 0 ? (
         <div className="mt-4 grid min-w-0 grid-cols-2 gap-2">
           {portal.quotas.map((quota) => {
@@ -483,8 +554,19 @@ function ServiceCycleOverview({
                   {quota.label}
                 </span>
                 <strong className="fm-question-category-ink mt-1 block text-base">
-                  {synchronized ? `${quota.used} / ${quota.limit}` : "待同步"}
+                  {synchronized
+                    ? progressiveQuota && quota.entitlementLimit !== undefined
+                      ? `已用 ${quota.used} / 已解锁 ${quota.limit}`
+                      : `${quota.used} / ${quota.limit}`
+                    : "待同步"}
                 </strong>
+                {synchronized &&
+                  progressiveQuota &&
+                  quota.entitlementLimit !== undefined && (
+                    <small className="mt-0.5 block text-xs text-[#8d8496]">
+                      全年 {quota.entitlementLimit} {quota.unit}
+                    </small>
+                  )}
               </article>
             );
           })}
@@ -1146,6 +1228,13 @@ export function SalesAdvisorDialog({
             {planLabel}
             需要由专员确认企业需求、服务周期与交付范围，请使用企业微信扫码联系。
           </DialogDescription>
+          {targetPlan === "luxury" && (
+            <p className="mb-0 mt-3 rounded-xl border border-[#dfd2e8] bg-white px-3 py-2 text-xs leading-5 text-[#5f5668]">
+              豪华版全年包含 4 个行业排名词、4 个竞品对比词、4 个美誉舆情词和 20
+              个产品场景词；额度按四个服务季度逐步开放，每季度新增 1、1、1、5
+              个。
+            </p>
+          )}
         </DialogHeader>
         <div className="px-6 pb-6 pt-5">
           <div className="overflow-hidden rounded-2xl border border-border/70 bg-white p-3">

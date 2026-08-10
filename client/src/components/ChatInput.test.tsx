@@ -466,6 +466,13 @@ describe("knowledge-base ChatInput actions", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "更换 Logo" })).toBeEnabled(),
     );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("img", { name: "待提交 Logo 预览" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText("replacement.png")).not.toBeInTheDocument();
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("does not allow another confirmation until the current presentation renders", () => {

@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 import { MySqlDialect } from "drizzle-orm/mysql-core";
 import { DELIVERY_OPERATION_SPECS } from "../shared/delivery-operation-spec";
@@ -10,6 +13,7 @@ import {
   assertWorkflowGraphIntegrity,
   createAssignedWorkflowTicket,
   createMonitoringRetestTicket,
+  deliveryQuestionWorkflowScopeKey,
   deliveryExecutionActorRole,
   deriveDeliveryExecutionTransition,
   deliveryTicketActionRank,
@@ -18,6 +22,7 @@ import {
   deliveryHistoryTimestamp,
   deliveryHistoryTicketTitle,
   deliveryTicketStatusGroup,
+  deliveryWorkflowMilestoneIsReusable,
   deriveWorkflowContainerStatus,
   formalMonitoringBatchOptionsScope,
   getMyDeliveryTickets,
@@ -27,6 +32,7 @@ import {
   listFormalMonitoringBatchOptions,
   monitoringRetestTechnicalDedupeKey,
   MY_DELIVERY_TICKET_LIMIT,
+  questionCatalogReviewAllowed,
   resolveAssignedWorkflowBillingScope,
   reusableInitialMonitoringTicketScope,
   visibleInitialMonitoringTicketScope,
@@ -130,14 +136,40 @@ describe("delivery history timestamps", () => {
 describe("formal monitoring batch completion options", () => {
   it("scopes options to the customer and batches containing formal samples", () => {
     const query = new MySqlDialect().sqlToQuery(
-      formalMonitoringBatchOptionsScope(42) as Parameters<
-        MySqlDialect["sqlToQuery"]
-      >[0],
+      formalMonitoringBatchOptionsScope({
+        userId: 42,
+        scopes: [
+          {
+            contractId: "contract-current",
+            quotaPeriodId: "period-current",
+          },
+        ],
+      }) as Parameters<MySqlDialect["sqlToQuery"]>[0],
     );
 
     expect(query.sql).toContain("`monitoring_batches`.`userId` = ?");
+    expect(query.sql).toContain("`monitoring_batches`.`contractId` = ?");
+    expect(query.sql).toContain("`monitoring_batches`.`quotaPeriodId` = ?");
     expect(query.sql).toContain("`monitoring_batches`.`sampleCount` > ?");
-    expect(query.params).toEqual([42, 0]);
+    expect(query.params).toEqual([42, "contract-current", "period-current", 0]);
+
+    const parallelBasicQuery = new MySqlDialect().sqlToQuery(
+      formalMonitoringBatchOptionsScope({
+        userId: 42,
+        scopes: [
+          { contractId: "basic-a", quotaPeriodId: "basic-period-a" },
+          { contractId: "basic-b", quotaPeriodId: "basic-period-b" },
+        ],
+      }) as Parameters<MySqlDialect["sqlToQuery"]>[0],
+    );
+    expect(parallelBasicQuery.params).toEqual([
+      42,
+      "basic-a",
+      "basic-period-a",
+      "basic-b",
+      "basic-period-b",
+      0,
+    ]);
   });
 
   it("returns only the non-sensitive fields required by the completion selector", async () => {
@@ -159,7 +191,27 @@ describe("formal monitoring batch completion options", () => {
     ]);
 
     await expect(
-      listFormalMonitoringBatchOptions({ executor, userId: 42 }),
+      listFormalMonitoringBatchOptions({
+        executor,
+        userId: 42,
+        activeQuotaSelection: {
+          primaryContract: {
+            id: "contract-current",
+            planCode: "luxury",
+            planVersion: 2,
+          },
+          scopes: [
+            {
+              contract: {
+                id: "contract-current",
+                planCode: "luxury",
+                planVersion: 2,
+              },
+              period: { id: "period-current" },
+            },
+          ],
+        } as any,
+      }),
     ).resolves.toEqual([
       {
         batchKey: "formal-batch-2026-08",
@@ -167,6 +219,77 @@ describe("formal monitoring batch completion options", () => {
         collectedAt: Date.parse("2026-08-08T03:00:00.000Z"),
         sampleCount: 24,
       },
+    ]);
+    expect(queue).toHaveLength(0);
+  });
+
+  it("keeps parallel active Basic periods in the formal batch scope", async () => {
+    const activeStart = new Date("2020-01-01T00:00:00.000Z");
+    const activeEnd = new Date("2099-01-01T00:00:00.000Z");
+    const { executor, queue } = queuedDeliveryExecutor([
+      [
+        {
+          id: "basic-a",
+          userId: 42,
+          planCode: "basic",
+          planVersion: 1,
+          status: "active",
+          startsAt: activeStart,
+          endsAt: activeEnd,
+          revision: 2,
+          replacesContractIds: [],
+        },
+        {
+          id: "basic-b",
+          userId: 42,
+          planCode: "basic",
+          planVersion: 1,
+          status: "active",
+          startsAt: activeStart,
+          endsAt: activeEnd,
+          revision: 1,
+          replacesContractIds: [],
+        },
+      ],
+      [
+        {
+          id: "basic-period-a",
+          contractId: "basic-a",
+          userId: 42,
+          ordinal: 1,
+          startsAt: activeStart,
+          endsAt: activeEnd,
+        },
+        {
+          id: "basic-period-b",
+          contractId: "basic-b",
+          userId: 42,
+          ordinal: 1,
+          startsAt: activeStart,
+          endsAt: activeEnd,
+        },
+      ],
+      [
+        {
+          batchKey: "basic-a-batch",
+          sourceName: "Basic A.xlsx",
+          collectedAt: new Date("2026-08-08T03:00:00.000Z"),
+          sampleCount: 1,
+        },
+        {
+          batchKey: "basic-b-batch",
+          sourceName: "Basic B.xlsx",
+          collectedAt: new Date("2026-08-09T03:00:00.000Z"),
+          sampleCount: 1,
+        },
+      ],
+    ]);
+
+    await expect(
+      listFormalMonitoringBatchOptions({ executor, userId: 42 }),
+    ).resolves.toEqual([
+      expect.objectContaining({ batchKey: "basic-a-batch" }),
+      expect.objectContaining({ batchKey: "basic-b-batch" }),
     ]);
     expect(queue).toHaveLength(0);
   });
@@ -329,6 +452,15 @@ describe("delivery workflow structural invariants", () => {
     contractId: "contract-stale-child",
     quotaPeriodId: "period-stale-child",
   };
+
+  it("never selects a prebuilt future period by maximum end time", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "server/delivery-role-service.ts"),
+      "utf8",
+    );
+    expect(source).not.toContain("orderBy(desc(serviceQuotaPeriods.endsAt))");
+    expect(source).toContain("resolveCurrentServiceQuotaScope");
+  });
 
   it("inherits immutable billing scope from the root and keeps non-root compatibility", () => {
     expect(
@@ -528,16 +660,104 @@ describe("delivery workflow structural invariants", () => {
     expect(queue).toHaveLength(0);
   });
 
+  it("binds a standalone workflow fallback to the active operational period", async () => {
+    const { executor, insertCalls, queue } = queuedDeliveryExecutor([
+      [{ projectAssignmentId: "assignment-owner", engineerUserId: 77 }],
+      [
+        {
+          id: "contract-current",
+          userId: 42,
+          planCode: "luxury",
+          planVersion: 2,
+          status: "active",
+          startsAt: new Date("2020-01-01T00:00:00.000Z"),
+          endsAt: new Date("2099-01-01T00:00:00.000Z"),
+          revision: 2,
+        },
+      ],
+      [
+        {
+          id: "period-current",
+          contractId: "contract-current",
+          userId: 42,
+          ordinal: 2,
+          startsAt: new Date("2020-01-01T00:00:00.000Z"),
+          endsAt: new Date("2099-01-01T00:00:00.000Z"),
+        },
+      ],
+      [],
+    ]);
+
+    await createAssignedWorkflowTicket({
+      executor,
+      sourceTicket: {
+        ...sourceTicket,
+        id: "standalone-source",
+        parentTicketId: null,
+        rootTicketId: null,
+        isWorkflowContainer: false,
+        contractId: "contract-old",
+        quotaPeriodId: "period-old",
+        sourceQuestionId: "question-1",
+        monitoringBatchKey: "batch-1",
+        responseLogicRevision: 1,
+        contentAssetIds: [],
+      } as any,
+      actorUserId: 7,
+      actorRoleContext: {
+        projectAssignmentId: "assignment-source",
+        customerUserId: 42,
+        roleType: "content_distribution_engineer",
+        eventActorRole: "delivery_member",
+      },
+      workflowDomain: "content_distribution_engineer",
+      operation: "response_logic",
+      title: "制作应答逻辑",
+      description: "按当前服务周期创建。",
+    });
+
+    expect(queue).toHaveLength(0);
+    expect(insertCalls[0]?.values).toMatchObject({
+      contractId: "contract-current",
+      quotaPeriodId: "period-current",
+    });
+  });
+
   it("deduplicates concurrent monitoring retests with the existing unique technical key", async () => {
     const key = monitoringRetestTechnicalDedupeKey(" question-1 ");
     expect(key).toBe(monitoringRetestTechnicalDedupeKey("question-1"));
     expect(key).not.toBe(monitoringRetestTechnicalDedupeKey("question-2"));
     expect(key.length).toBeLessThanOrEqual(64);
+    const scopedKey = monitoringRetestTechnicalDedupeKey(
+      "question-1",
+      "contract:contract-current",
+    );
 
     const { executor, insertCalls, queue } = queuedDeliveryExecutor([
+      [
+        {
+          id: "contract-current",
+          userId: 42,
+          planCode: "luxury",
+          planVersion: 2,
+          status: "active",
+          startsAt: new Date("2020-01-01T00:00:00.000Z"),
+          endsAt: new Date("2099-01-01T00:00:00.000Z"),
+          revision: 2,
+        },
+      ],
+      [
+        {
+          id: "period-current",
+          contractId: "contract-current",
+          userId: 42,
+          ordinal: 2,
+          startsAt: new Date("2020-01-01T00:00:00.000Z"),
+          endsAt: new Date("2099-01-01T00:00:00.000Z"),
+        },
+      ],
       [{ projectAssignmentId: "monitor-owner", engineerUserId: 88 }],
       [],
-      [{ id: "period-1", contractId: "contract-1" }],
       [{ id: "concurrent-winner" }],
     ]);
     const id = await createMonitoringRetestTicket({
@@ -557,14 +777,83 @@ describe("delivery workflow structural invariants", () => {
     expect(insertCalls).toHaveLength(1);
     expect(insertCalls[0]?.values).toMatchObject({
       sourceQuestionId: "question-1",
-      technicalDedupeKey: key,
+      technicalDedupeKey: scopedKey,
       operation: "monitoring_retest",
+      contractId: "contract-current",
+      quotaPeriodId: "period-current",
     });
     expect(insertCalls[0]?.onDuplicateKeyUpdate).toBeDefined();
   });
 });
 
 describe("my delivery ticket pool", () => {
+  it("uses a contract scope only for progressive Luxury questions", () => {
+    expect(
+      deliveryQuestionWorkflowScopeKey({
+        progressiveLuxury: true,
+        contractId: "contract-v2",
+        quotaPeriodId: "period-q1",
+      }),
+    ).toBe(
+      deliveryQuestionWorkflowScopeKey({
+        progressiveLuxury: true,
+        contractId: "contract-v2",
+        quotaPeriodId: "period-q2",
+      }),
+    );
+    expect(
+      deliveryQuestionWorkflowScopeKey({
+        progressiveLuxury: false,
+        contractId: "contract-v1",
+        quotaPeriodId: "period-1",
+      }),
+    ).not.toBe(
+      deliveryQuestionWorkflowScopeKey({
+        progressiveLuxury: false,
+        contractId: "contract-v1",
+        quotaPeriodId: "period-2",
+      }),
+    );
+  });
+
+  it("bounds progressive milestones to the half-open contract window", () => {
+    const startsAt = new Date("2026-01-01T00:00:00.000Z");
+    const endsAt = new Date("2027-01-01T00:00:00.000Z");
+    expect(
+      deliveryWorkflowMilestoneIsReusable({
+        completedAt: startsAt,
+        startsAt,
+        endsAt,
+      }),
+    ).toBe(true);
+    expect(
+      deliveryWorkflowMilestoneIsReusable({
+        completedAt: endsAt,
+        startsAt,
+        endsAt,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps catalog review active after completion only for progressive Luxury", () => {
+    expect(
+      questionCatalogReviewAllowed({
+        progressiveLuxury: true,
+        hasActiveCatalog: false,
+        hasCompletedCatalog: true,
+        hasReusableCatalogMilestone: false,
+      }),
+    ).toBe(true);
+    expect(
+      questionCatalogReviewAllowed({
+        progressiveLuxury: false,
+        hasActiveCatalog: false,
+        hasCompletedCatalog: true,
+        hasReusableCatalogMilestone: true,
+      }),
+    ).toBe(false);
+  });
+
   it("uses the two public status groups and a bounded result", () => {
     expect(deliveryTicketStatusGroup("submitted")).toBe("pending");
     expect(deliveryTicketStatusGroup("in_progress")).toBe("pending");
@@ -652,14 +941,23 @@ describe("my delivery ticket pool", () => {
 
     expect(query.params).toEqual([]);
     expect(query.sql).toContain("FROM delivery_tickets AS completed_catalog");
+    expect(query.sql).toContain("completed_catalog.contractId");
     expect(query.sql).toContain("completed_catalog.quotaPeriodId");
+    expect(query.sql).toContain("dependency_contract.planVersion");
     expect(query.sql).toContain(
       "FROM delivery_workflow_milestones AS archived_catalog",
+    );
+    expect(query.sql).toContain(
+      "archived_catalog.completedAt >= dependency_contract.startsAt",
+    );
+    expect(query.sql).not.toContain(
+      "archived_catalog.completedAt >= dependency_period.startsAt",
     );
     expect(query.sql).toContain(
       "FROM workspace_questions AS approved_question",
     );
     expect(query.sql).toContain("approved_question.quotaPeriodId");
+    expect(query.sql).toContain("approved_question.contractId");
 
     const reuseQuery = new MySqlDialect().sqlToQuery(
       reusableInitialMonitoringTicketScope({
@@ -668,6 +966,40 @@ describe("my delivery ticket pool", () => {
     );
     expect(reuseQuery.sql).not.toContain("`delivery_tickets`.`quotaPeriodId`");
     expect(reuseQuery.params).toContain(42);
+
+    const progressiveReuseQuery = new MySqlDialect().sqlToQuery(
+      reusableInitialMonitoringTicketScope({
+        userId: 42,
+        scope: {
+          progressiveLuxury: true,
+          contractId: "contract-v2",
+          quotaPeriodId: "period-q2",
+          startsAt: new Date("2026-01-01T00:00:00.000Z"),
+          endsAt: new Date("2027-01-01T00:00:00.000Z"),
+        },
+      }) as Parameters<MySqlDialect["sqlToQuery"]>[0],
+    );
+    expect(progressiveReuseQuery.sql).toContain(
+      "`delivery_tickets`.`contractId` = ?",
+    );
+    expect(progressiveReuseQuery.params).toContain("contract-v2");
+
+    const legacyReuseQuery = new MySqlDialect().sqlToQuery(
+      reusableInitialMonitoringTicketScope({
+        userId: 42,
+        scope: {
+          progressiveLuxury: false,
+          contractId: "contract-v1",
+          quotaPeriodId: "period-v1",
+          startsAt: new Date("2026-01-01T00:00:00.000Z"),
+          endsAt: new Date("2026-02-01T00:00:00.000Z"),
+        },
+      }) as Parameters<MySqlDialect["sqlToQuery"]>[0],
+    );
+    expect(legacyReuseQuery.sql).toContain(
+      "`delivery_tickets`.`quotaPeriodId` = ?",
+    );
+    expect(legacyReuseQuery.params).toContain("period-v1");
   });
 
   it("reuses the account-lifetime initial monitor and replaces only an invalid stale ticket", () => {

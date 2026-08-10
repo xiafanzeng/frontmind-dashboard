@@ -7,10 +7,25 @@ import {
   type ServiceCapabilityKey,
 } from "./service-portal";
 import {
+  SalesAdvisorDialog,
   ServiceAccountDrawer,
   ServiceHome,
   ServiceLockedPage,
 } from "./service-portal-ui";
+
+function withRuntimeTimeZone<T>(timeZone: string, run: () => T) {
+  const originalTimeZone = process.env.TZ;
+  process.env.TZ = timeZone;
+  try {
+    return run();
+  } finally {
+    if (originalTimeZone === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = originalTimeZone;
+    }
+  }
+}
 
 const capabilityKeys: ServiceCapabilityKey[] = [
   "knowledgeBuild",
@@ -269,6 +284,127 @@ describe("service workflow UI gates", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "查看已购问题" }));
     expect(onNavigate).toHaveBeenCalledWith("intent", "question-optimization");
+  });
+
+  it("shows the luxury quarterly unlock stage and Shanghai unlock date from a US runtime", () => {
+    const portal = workflowPortal();
+    portal.plan = {
+      ...portal.plan,
+      code: "luxury",
+      name: "豪华版",
+    };
+    portal.quotas = [
+      {
+        key: "industry",
+        label: "行业排名词",
+        limit: 1,
+        entitlementLimit: 4,
+        used: 1,
+        unit: "个词",
+      },
+      {
+        key: "competitor",
+        label: "竞品对比词",
+        limit: 1,
+        entitlementLimit: 4,
+        used: 0,
+        unit: "个词",
+      },
+      {
+        key: "reputation",
+        label: "美誉舆情词",
+        limit: 1,
+        entitlementLimit: 4,
+        used: 0,
+        unit: "个词",
+      },
+      {
+        key: "scenario",
+        label: "产品场景词",
+        limit: 5,
+        entitlementLimit: 20,
+        used: 2,
+        unit: "个词",
+      },
+    ];
+    portal.quotaUnlock = {
+      current: 1,
+      total: 4,
+      nextUnlockAt: "2026-10-01T00:00:00+08:00",
+      capacityState: "available",
+    };
+
+    withRuntimeTimeZone("America/Los_Angeles", () =>
+      render(
+        <ServiceHome
+          portal={portal}
+          onNavigate={vi.fn()}
+          onOpenAccount={vi.fn()}
+        />,
+      ),
+    );
+
+    const quotaOverview = screen.getByRole("region", { name: "套餐配额" });
+    expect(
+      within(quotaOverview).getByText("第 1/4 服务季度"),
+    ).toBeInTheDocument();
+    expect(
+      within(quotaOverview).getByText(/当前已解锁 8 \/ 全年 32 个问题/),
+    ).toBeInTheDocument();
+    expect(
+      within(quotaOverview).getByText(/下一季度额度将于/),
+    ).toHaveTextContent("2026/10/01");
+    expect(
+      within(quotaOverview).getByText("已用 1 / 已解锁 1"),
+    ).toBeInTheDocument();
+    expect(within(quotaOverview).getAllByText("全年 4 个词")).toHaveLength(3);
+    expect(within(quotaOverview).getByText("全年 20 个词")).toBeInTheDocument();
+  });
+
+  it("keeps legacy luxury contracts on the original quota presentation", () => {
+    const portal = workflowPortal();
+    portal.plan = { ...portal.plan, code: "luxury", name: "豪华版" };
+    portal.quotas = [
+      {
+        key: "industry",
+        label: "行业排名词",
+        limit: 4,
+        entitlementLimit: 4,
+        used: 1,
+        unit: "个词",
+      },
+    ];
+    portal.quotaUnlock = {
+      current: 1,
+      total: 1,
+      nextUnlockAt: null,
+      capacityState: "available",
+    };
+
+    render(
+      <ServiceHome
+        portal={portal}
+        onNavigate={vi.fn()}
+        onOpenAccount={vi.fn()}
+      />,
+    );
+
+    const quotaOverview = screen.getByRole("region", { name: "套餐配额" });
+    expect(
+      within(quotaOverview).queryByText(/服务季度/),
+    ).not.toBeInTheDocument();
+    expect(within(quotaOverview).getByText("1 / 4")).toBeInTheDocument();
+    expect(within(quotaOverview).queryByText(/全年 4/)).not.toBeInTheDocument();
+  });
+
+  it("explains the quarterly unlock cadence before a luxury upgrade", () => {
+    render(
+      <SalesAdvisorDialog open onOpenChange={vi.fn()} targetPlan="luxury" />,
+    );
+
+    expect(screen.getByText(/豪华版全年包含 4 个行业排名词/)).toHaveTextContent(
+      "每季度新增 1、1、1、5 个",
+    );
   });
 
   it.each([

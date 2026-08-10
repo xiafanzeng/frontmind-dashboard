@@ -1111,6 +1111,10 @@ export function useSendMessage() {
               status === 429 ||
               status >= 500 ||
               code === "IDEMPOTENCY_PENDING";
+            const dashboardReservationAcknowledged =
+              status === 425 ||
+              code === "IDEMPOTENCY_PENDING" ||
+              code === "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING";
             const pendingAcknowledgedObservation =
               requestOutcomeUnknown &&
               err?.knowledgeObservation &&
@@ -1129,6 +1133,34 @@ export function useSendMessage() {
                 convId,
                 pendingAcknowledgedObservation,
               );
+              wakeKnowledgeBaseConversation(convId);
+              toast.info("本轮已提交", {
+                description: isLogoSubmission
+                  ? "FrontMind 已接收 Logo，正在重新呈现当前知识节点。"
+                  : "正在处理当前节点，请稍候。",
+              });
+              return true;
+            }
+            if (dashboardReservationAcknowledged) {
+              // 425 / IDEMPOTENCY_PENDING and a 2xx Logo response whose task
+              // id is still being projected are Dashboard durable receipts:
+              // the logical turn already exists even when the observation read
+              // races just ahead of its activeTurn projection. Clearing the
+              // chosen Logo prevents a second click from creating another
+              // clientRequestId for the same accepted upload.
+              if (err?.knowledgeObservation) {
+                commitKnowledgeBaseObservation(
+                  convId,
+                  err.knowledgeObservation,
+                );
+              }
+              // A 425 can carry the last awaiting_input projection read just
+              // before activeTurn becomes visible. Keep the local coordinator
+              // locked in running after applying that snapshot so the Logo
+              // gate cannot flash open and invite a second upload.
+              updateStatus(convId, "running", {
+                startedAt: responseStartedAt,
+              });
               wakeKnowledgeBaseConversation(convId);
               toast.info("本轮已提交", {
                 description: isLogoSubmission

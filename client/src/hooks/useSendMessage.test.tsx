@@ -539,26 +539,120 @@ describe("useSendMessage", () => {
   });
 
   it.each([
+    [
+      "425 receipt before activeTurn projection",
+      Object.assign(new Error("预约已创建，状态仍在投影"), {
+        status: 425,
+        code: "PROJECTION_PENDING",
+        knowledgeObservation: {
+          activeTurn: null,
+          approvedPresentation: null,
+          completedTurn: null,
+        },
+      }),
+    ],
+    [
+      "IDEMPOTENCY_PENDING receipt without an observation",
+      Object.assign(new Error("同一预约仍在处理中"), {
+        status: 409,
+        code: "IDEMPOTENCY_PENDING",
+      }),
+    ],
+    [
+      "accepted Logo response before its task id is projected",
+      Object.assign(new Error("真实任务编号暂缺"), {
+        status: 502,
+        code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
+      }),
+    ],
+  ])("clears a Logo after a durable Dashboard %s", async (_label, error) => {
+    const logo = new File(["logo"], "logo.png", { type: "image/png" });
+    mockPreparedFiles([logo]);
+    mocks.createKnowledgeBaseTurnTask.mockRejectedValueOnce(error);
+
+    const { result } = renderHook(() => useSendMessage());
+    let submitted = false;
+    await act(async () => {
+      submitted = await result.current.sendMessage("", [logo], {
+        syncKnowledgeBaseSnapshot: true,
+        submissionKind: "logo",
+        knowledgeBaseExpectedGeneration: 1,
+        knowledgeBaseExpectedRevision: 0,
+        knowledgeBaseExpectedLeafId: "1.1",
+      });
+    });
+
+    expect(submitted).toBe(true);
+    expect(mocks.rollbackPendingKnowledgeBaseTurn).not.toHaveBeenCalled();
+    if ((error as any).knowledgeObservation) {
+      expect(mocks.commitKnowledgeBaseObservation).toHaveBeenCalledWith(
+        "test-conv-id",
+        (error as any).knowledgeObservation,
+      );
+    }
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "running",
+      expect.objectContaining({ startedAt: expect.any(Number) }),
+    );
+    expect(mocks.wakeKnowledgeBaseConversation).toHaveBeenCalledWith(
+      "test-conv-id",
+    );
+    expect(toast.info).toHaveBeenCalledWith("本轮已提交", {
+      description: "FrontMind 已接收 Logo，正在重新呈现当前知识节点。",
+    });
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("accepts a missing-task-id Logo response when its observation acknowledges the request", async () => {
+    const logo = new File(["logo"], "logo.png", { type: "image/png" });
+    mockPreparedFiles([logo]);
+    mocks.createKnowledgeBaseTurnTask.mockImplementationOnce(
+      async (_input: unknown, context: any) => {
+        throw Object.assign(new Error("真实任务编号暂缺"), {
+          status: 502,
+          code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
+          knowledgeObservation: {
+            activeTurn: { clientRequestId: context.clientRequestId },
+            approvedPresentation: null,
+            completedTurn: null,
+          },
+        });
+      },
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+    let submitted = false;
+    await act(async () => {
+      submitted = await result.current.sendMessage("", [logo], {
+        syncKnowledgeBaseSnapshot: true,
+        submissionKind: "logo",
+        knowledgeBaseExpectedGeneration: 1,
+        knowledgeBaseExpectedRevision: 0,
+        knowledgeBaseExpectedLeafId: "1.1",
+      });
+    });
+
+    expect(submitted).toBe(true);
+    expect(mocks.rollbackPendingKnowledgeBaseTurn).not.toHaveBeenCalled();
+    expect(mocks.commitKnowledgeBaseObservation).toHaveBeenCalledWith(
+      "test-conv-id",
+      expect.objectContaining({
+        activeTurn: expect.objectContaining({
+          clientRequestId: expect.any(String),
+        }),
+      }),
+    );
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ["network", new TypeError("Failed to fetch")],
     [
       "5xx",
       Object.assign(new Error("上游服务暂时不可用"), {
         status: 503,
         code: "TEMPORARILY_UNAVAILABLE",
-      }),
-    ],
-    [
-      "missing task id",
-      Object.assign(new Error("真实任务编号暂缺"), {
-        status: 502,
-        code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
-      }),
-    ],
-    [
-      "409 idempotency pending",
-      Object.assign(new Error("同一预约仍在处理中"), {
-        status: 409,
-        code: "IDEMPOTENCY_PENDING",
       }),
     ],
   ])(

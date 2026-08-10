@@ -3,9 +3,41 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { ADMIN_WORKSPACE_TAB_IDS } from "./AdminWorkspace";
+import {
+  ADMIN_WORKSPACE_TAB_IDS,
+  defaultAdminServiceCarryQuestionIds,
+  isAdminProgressiveLuxuryRenewal,
+  isFutureDatedServiceCancellation,
+  resolveAdminServiceStartsAtEpoch,
+  resolveAdminTargetLuxuryPlanVersion,
+} from "./AdminWorkspace";
 
 describe("admin customer workspace", () => {
+  it("allows only immediate service cancellation", () => {
+    const now = Date.parse("2026-08-10T04:00:00.000Z");
+    expect(
+      isFutureDatedServiceCancellation({
+        status: "cancelled",
+        startsAt: now + 1,
+        now,
+      }),
+    ).toBe(true);
+    expect(
+      isFutureDatedServiceCancellation({
+        status: "cancelled",
+        startsAt: now,
+        now,
+      }),
+    ).toBe(false);
+    expect(
+      isFutureDatedServiceCancellation({
+        status: "scheduled",
+        startsAt: now + 1,
+        now,
+      }),
+    ).toBe(false);
+  });
+
   it("keeps customer account creation exclusively in accounts and permissions", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
@@ -122,6 +154,184 @@ describe("admin customer workspace", () => {
       "utf8",
     );
     expect(source).not.toContain('<option value="knowledge">');
+  });
+
+  it("describes Luxury as an annual progressively unlocked entitlement", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+
+    expect(source).toContain("豪华版 v2 为 12 个月权益");
+    expect(source).toContain("按季度自动解锁问题额度");
+    expect(source).toContain("预付月份仍按 3");
+    expect(source).toContain("豪华版年度续费默认不结转");
+    expect(source).toContain("取消合同会立即终止当前问题工作流");
+    expect(source).toMatch(
+      /progressiveLuxuryRenewal\s*\|\|\s*serviceTermination/,
+    );
+    expect(source).not.toContain("进阶版与豪华版合同均按 3 个月服务周期建立");
+  });
+
+  it("defaults only Luxury-to-Luxury renewal to no question carryover", () => {
+    const currentContractId = "contract-current";
+    const validUntil = Date.parse("2027-07-01T00:00:00.000Z");
+    const purchases = [
+      {
+        id: currentContractId,
+        planCode: "luxury" as const,
+        status: "active",
+        validUntil,
+      },
+    ];
+    const questions = [
+      {
+        id: "question-current",
+        contractId: currentContractId,
+        status: "selected",
+      },
+      {
+        id: "question-candidate",
+        contractId: currentContractId,
+        status: "candidate",
+      },
+    ];
+
+    expect(
+      defaultAdminServiceCarryQuestionIds({
+        sourcePlanCode: "luxury",
+        targetPlanCode: "luxury",
+        currentContractId,
+        targetStartsAt: validUntil,
+        purchases,
+        questions,
+      }),
+    ).toEqual([]);
+    expect(
+      defaultAdminServiceCarryQuestionIds({
+        sourcePlanCode: "luxury",
+        targetPlanCode: "luxury",
+        currentContractId,
+        targetStartsAt: validUntil - 1,
+        purchases,
+        questions,
+      }),
+    ).toEqual(["question-current"]);
+    expect(
+      isAdminProgressiveLuxuryRenewal({
+        sourcePlanCode: "luxury",
+        targetPlanCode: "luxury",
+        currentContractId,
+        targetStartsAt: validUntil,
+        purchases,
+      }),
+    ).toBe(true);
+    for (const [sourcePlanCode, targetPlanCode] of [
+      ["advanced", "advanced"],
+      ["advanced", "luxury"],
+      ["luxury", "advanced"],
+    ] as const) {
+      expect(
+        defaultAdminServiceCarryQuestionIds({
+          sourcePlanCode,
+          targetPlanCode,
+          currentContractId,
+          questions,
+        }),
+      ).toEqual(["question-current"]);
+    }
+
+    expect(
+      defaultAdminServiceCarryQuestionIds({
+        sourcePlanCode: "basic",
+        targetPlanCode: "basic",
+        currentContractId,
+        purchases: [
+          { id: "basic-active", planCode: "basic", status: "active" },
+          { id: "basic-scheduled", planCode: "basic", status: "scheduled" },
+          { id: "basic-expired", planCode: "basic", status: "expired" },
+        ],
+        questions: [
+          {
+            id: "question-basic-active",
+            contractId: "basic-active",
+            status: "selected",
+          },
+          {
+            id: "question-basic-scheduled",
+            contractId: "basic-scheduled",
+            status: "selected",
+          },
+          {
+            id: "question-basic-expired",
+            contractId: "basic-expired",
+            status: "selected",
+          },
+        ],
+      }),
+    ).toEqual(["question-basic-active", "question-basic-scheduled"]);
+  });
+
+  it("snaps a Luxury renewal date to the source contract's exact Shanghai expiry instant", () => {
+    const currentContractId = "contract-current";
+    const validFrom = Date.parse("2026-08-10T04:00:00.000Z");
+    const validUntil = Date.parse("2027-08-10T04:00:00.000Z");
+    const purchases = [
+      {
+        id: currentContractId,
+        planCode: "luxury" as const,
+        status: "active",
+        validFrom,
+        validUntil,
+      },
+    ];
+    expect(
+      resolveAdminServiceStartsAtEpoch({
+        dateInput: "2027-08-10",
+        sourcePlanCode: "luxury",
+        targetPlanCode: "luxury",
+        currentContractId,
+        purchases,
+      }),
+    ).toBe(validUntil);
+    expect(
+      resolveAdminServiceStartsAtEpoch({
+        dateInput: "2027-08-09",
+        sourcePlanCode: "luxury",
+        targetPlanCode: "luxury",
+        currentContractId,
+        purchases,
+      }),
+    ).toBe(Date.parse("2027-08-08T16:00:00.000Z"));
+    expect(
+      resolveAdminServiceStartsAtEpoch({
+        dateInput: "2026-08-10",
+        sourcePlanCode: "luxury",
+        targetPlanCode: "luxury",
+        currentContractId,
+        purchases,
+      }),
+    ).toBe(validFrom);
+  });
+
+  it("labels an overlapping Luxury v1 correction separately from its v2 renewal", () => {
+    const validUntil = Date.parse("2026-10-01T00:00:00.000Z");
+    expect(
+      resolveAdminTargetLuxuryPlanVersion({
+        sourcePlanCode: "luxury",
+        sourcePlanVersion: 1,
+        sourceValidUntil: validUntil,
+        targetStartsAt: validUntil - 1,
+      }),
+    ).toBe(1);
+    expect(
+      resolveAdminTargetLuxuryPlanVersion({
+        sourcePlanCode: "luxury",
+        sourcePlanVersion: 1,
+        sourceValidUntil: validUntil,
+        targetStartsAt: validUntil,
+      }),
+    ).toBe(2);
   });
 
   it("keeps customer identity readable beside the assignment editor", () => {

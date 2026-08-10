@@ -16,7 +16,6 @@ import {
   knowledgeBaseResetStates,
   knowledgeBaseSnapshots,
   knowledgeImportReceipts,
-  serviceQuotaPeriods,
   upstreamResources,
   users,
 } from "../drizzle/schema";
@@ -38,7 +37,10 @@ import {
   deliveryExecutionActorRole,
 } from "./delivery-role-service";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
-import { getServicePortal } from "./service-entitlement";
+import {
+  getServicePortal,
+  resolveCurrentServiceQuotaScope,
+} from "./service-entitlement";
 import { getUpstreamBaseUrl } from "./upstream-config";
 import { knowledgeSnapshotArchiveStorageKey } from "./knowledge-snapshot-archive-store";
 
@@ -338,7 +340,7 @@ export async function submitKnowledgeReset(input: {
   const db = await requireDb();
   try {
     return await db.transaction(async (tx) => {
-      const [counts, owner, existing, periodRows] = await Promise.all([
+      const [counts, owner, existing, currentScope] = await Promise.all([
         getKnowledgeCounts(tx, input.actor.id),
         getKnowledgeOwner(tx, input.actor.id, { forUpdate: true }),
         tx
@@ -352,15 +354,10 @@ export async function submitKnowledgeReset(input: {
           )
           .limit(1)
           .for("update"),
-        tx
-          .select({
-            id: serviceQuotaPeriods.id,
-            contractId: serviceQuotaPeriods.contractId,
-          })
-          .from(serviceQuotaPeriods)
-          .where(eq(serviceQuotaPeriods.userId, input.actor.id))
-          .orderBy(desc(serviceQuotaPeriods.endsAt))
-          .limit(1),
+        resolveCurrentServiceQuotaScope({
+          executor: tx,
+          userId: input.actor.id,
+        }),
       ]);
       if (!counts.hasKnowledge) {
         throw new AuthServiceError("CONFLICT", "当前没有可重置的知识库记录");
@@ -374,20 +371,20 @@ export async function submitKnowledgeReset(input: {
       if (existing[0]) {
         throw new AuthServiceError("CONFLICT", "已有一张重置需求正在处理");
       }
-      const period = periodRows[0];
-      if (!period) {
+      if (!currentScope) {
         throw new AuthServiceError(
           "CONFLICT",
           "客户服务周期尚未配置，请联系交付管理员",
         );
       }
+      const { contract, period } = currentScope;
       const requestId = randomUUID();
       const ticketId = randomUUID();
       const now = new Date();
       await tx.insert(deliveryTickets).values({
         id: ticketId,
         userId: input.actor.id,
-        contractId: period.contractId,
+        contractId: contract.id,
         quotaPeriodId: period.id,
         type: "knowledge_base",
         quotaPool: null,

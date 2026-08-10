@@ -310,4 +310,22 @@ describe("preview account creation form", () => {
       "product_scenario",
     ]);
   });
+
+  it("shows the luxury first-quarter cap beside its full-year entitlement", () => {
+    render(<PreviewAdminUsers previewAccessLevel="system_admin" />);
+
+    fireEvent.click(screen.getByText("验收企业 B").closest("button")!);
+
+    expect(
+      screen.getByText(/第 1\/4 服务季度 · 当前已解锁 8 \/ 全年 32 个问题/),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("全年 4 个词")).toHaveLength(3);
+    expect(screen.getByText("全年 20 个词")).toBeInTheDocument();
+    const quota = screen.getByTestId("preview-service-plan-quota");
+    expect(
+      Array.from(quota.querySelectorAll("[data-category] strong")).map(
+        (item) => item.textContent,
+      ),
+    ).toEqual(["1 个词", "1 个词", "1 个词", "5 个词"]);
+  });
 });

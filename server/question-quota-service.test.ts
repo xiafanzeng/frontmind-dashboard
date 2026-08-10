@@ -303,6 +303,29 @@ describe("question quota input and usage", () => {
     });
   });
 
+  it("conservatively reserves every category for a progressive unclassified submission", () => {
+    expect(
+      countQuestionQuotaUsage(
+        [
+          {
+            category: "product_scenario",
+            candidateKey: UNCLASSIFIED_QUESTION_CANDIDATE_KEY,
+            source: "user",
+            status: "candidate",
+            selectionApprovalStatus: "pending",
+          },
+        ],
+        { reserveUnclassifiedAcrossCategories: true },
+      ).reservedUsage,
+    ).toEqual({
+      industry: 1,
+      competitorComparison: 1,
+      reputation: 1,
+      productScenario: 1,
+      total: 1,
+    });
+  });
+
   it("does not reinterpret a legacy pending product-scenario question", () => {
     expect(
       countQuestionQuotaUsage([
@@ -334,6 +357,7 @@ describe("question quota input and usage", () => {
           reputationLimit: 1,
           productScenarioLimit: 5,
         },
+        maximumLimits: period(),
         reservedUsage: {
           industry: 1,
           competitorComparison: 0,
@@ -362,6 +386,7 @@ describe("question quota input and usage", () => {
           reputationLimit: 1,
           productScenarioLimit: 0,
         },
+        maximumLimits: period(),
         reservedUsage: {
           industry: 1,
           competitorComparison: 0,
@@ -381,6 +406,7 @@ describe("question quota input and usage", () => {
           reputationLimit: 1,
           productScenarioLimit: 5,
         },
+        maximumLimits: period(),
         reservedUsage: {
           industry: 0,
           competitorComparison: 0,
@@ -390,6 +416,59 @@ describe("question quota input and usage", () => {
         },
       }),
     ).toThrow("问题额度已被其他人更新");
+  });
+
+  it("never lets a manual adjustment exceed the system-unlocked cap", () => {
+    expect(() =>
+      validateQuestionQuotaAdjustment({
+        expectedRevision: 3,
+        currentRevision: 3,
+        limits: {
+          industryLimit: 1,
+          competitorComparisonLimit: 1,
+          reputationLimit: 1,
+          productScenarioLimit: 6,
+        },
+        maximumLimits: {
+          industryLimit: 1,
+          competitorComparisonLimit: 1,
+          reputationLimit: 1,
+          productScenarioLimit: 5,
+          totalQuestionLimit: 8,
+        },
+        reservedUsage: {
+          industry: 0,
+          competitorComparison: 0,
+          reputation: 0,
+          productScenario: 0,
+          total: 0,
+        },
+      }),
+    ).toThrow("产品场景词额度不能超过当前已解锁上限 5");
+  });
+
+  it("keeps legacy quota adjustments independent from progressive unlock caps", () => {
+    expect(
+      validateQuestionQuotaAdjustment({
+        expectedRevision: 3,
+        currentRevision: 3,
+        limits: {
+          industryLimit: 1,
+          competitorComparisonLimit: 1,
+          reputationLimit: 1,
+          productScenarioLimit: 6,
+        },
+        reservedUsage: {
+          industry: 0,
+          competitorComparison: 0,
+          reputation: 0,
+          productScenario: 0,
+          total: 0,
+        },
+      }),
+    ).toMatchObject({
+      limits: { productScenarioLimit: 6, totalQuestionLimit: 9 },
+    });
   });
 });
 
@@ -436,6 +515,10 @@ describe("question quota service", () => {
       periodId: PERIOD_ID,
       revision: 4,
       limits: { totalQuestionLimit: 8 },
+      unlockedLimits: { totalQuestionLimit: 8 },
+      unlockStage: { current: 1, total: 1 },
+      nextUnlockAt: null,
+      progressiveUnlock: false,
       selectedUsage: { total: 1 },
       reservedUsage: { total: 2 },
       remaining: { total: 6 },
@@ -470,6 +553,43 @@ describe("question quota service", () => {
         },
       }),
     ).resolves.toMatchObject({ success: true });
+  });
+
+  it("rejects a Luxury v2 increase beyond the current quarterly unlock", async () => {
+    const luxuryContract = contract({
+      planCode: "luxury",
+      planVersion: 2,
+      startsAt: new Date("2026-07-01T00:00:00.000Z"),
+      endsAt: new Date("2027-07-01T00:00:00.000Z"),
+    });
+    const fake = fakeDatabase({
+      contractRows: [luxuryContract],
+      periodRows: [
+        period({
+          ordinal: 2,
+          startsAt: new Date("2026-08-01T00:00:00.000Z"),
+          endsAt: new Date("2026-09-01T00:00:00.000Z"),
+          industryLimit: 4,
+          competitorComparisonLimit: 4,
+          reputationLimit: 4,
+          productScenarioLimit: 20,
+          totalQuestionLimit: 32,
+        }),
+      ],
+    });
+
+    await expect(
+      adjustMyCustomerQuestionQuota({
+        actor: actor(),
+        value: { ...value, productScenarioLimit: 6 },
+        dependencies: {
+          getDatabase: vi.fn(async () => fake.database as any),
+          writeAudit: vi.fn(),
+          now: () => NOW,
+        },
+      }),
+    ).rejects.toThrow("产品场景词额度不能超过当前已解锁上限 5");
+    expect(fake.getUpdateValue()).toBeNull();
   });
 
   it("rejects wrong roles before database access and unassigned engineers inside the lock", async () => {
@@ -560,10 +680,142 @@ describe("question quota service", () => {
       periodId: PERIOD_ID,
       revision: 3,
       limits: { totalQuestionLimit: 8 },
+      unlockedLimits: { totalQuestionLimit: 8 },
+      progressiveUnlock: false,
       selectedUsage: { industry: 1, productScenario: 0, total: 1 },
       reservedUsage: { industry: 1, productScenario: 1, total: 2 },
       remaining: { industry: 0, productScenario: 4, total: 6 },
     });
     expect(state).not.toHaveProperty("contractId");
+  });
+
+  it("returns Luxury v2 quarterly metadata while aggregating contract usage", async () => {
+    const fake = fakeDatabase({
+      contractRows: [
+        contract({
+          planCode: "luxury",
+          planVersion: 2,
+          startsAt: new Date("2026-07-01T00:00:00.000Z"),
+          endsAt: new Date("2027-07-01T00:00:00.000Z"),
+        }),
+      ],
+      periodRows: [
+        period({
+          ordinal: 2,
+          startsAt: new Date("2026-08-01T00:00:00.000Z"),
+          endsAt: new Date("2026-09-01T00:00:00.000Z"),
+          industryLimit: 4,
+          competitorComparisonLimit: 4,
+          reputationLimit: 4,
+          productScenarioLimit: 20,
+          totalQuestionLimit: 32,
+        }),
+      ],
+      questions: [
+        {
+          category: "industry",
+          status: "selected",
+          selectionApprovalStatus: "approved",
+        },
+        {
+          category: "product_scenario",
+          status: "candidate",
+          selectionApprovalStatus: "pending",
+        },
+      ],
+    });
+
+    const state = await getQuestionQuotaState({
+      executor: fake.tx,
+      customerUserId: 42,
+      now: NOW,
+    });
+    expect(state).toMatchObject({
+      limits: {
+        industryLimit: 1,
+        competitorComparisonLimit: 1,
+        reputationLimit: 1,
+        productScenarioLimit: 5,
+        totalQuestionLimit: 8,
+      },
+      unlockedLimits: { totalQuestionLimit: 8 },
+      unlockStage: { current: 1, total: 4 },
+      progressiveUnlock: true,
+      selectedUsage: { total: 1 },
+      reservedUsage: { total: 2 },
+      remaining: { total: 6 },
+    });
+    expect(state?.nextUnlockAt).toBe(Date.parse("2026-10-01T00:00:00.000Z"));
+  });
+
+  it("never selects the annual Luxury v2 question anchor as the operational period", async () => {
+    const luxuryContract = contract({
+      planCode: "luxury",
+      planVersion: 2,
+      startsAt: new Date("2026-07-01T00:00:00.000Z"),
+      endsAt: new Date("2027-07-01T00:00:00.000Z"),
+    });
+    const anchor = period({
+      id: "annual-question-anchor",
+      ordinal: 0,
+      startsAt: luxuryContract.startsAt,
+      endsAt: luxuryContract.endsAt,
+      contentAssetPublishLimit: 0,
+      websiteContentPublishLimit: 0,
+    });
+    const operational = period({
+      id: "month-2-operational",
+      ordinal: 2,
+      startsAt: new Date("2026-08-01T00:00:00.000Z"),
+      endsAt: new Date("2026-09-01T00:00:00.000Z"),
+    });
+    const fake = fakeDatabase({
+      contractRows: [luxuryContract],
+      // The fake intentionally does not evaluate the SQL WHERE clause. The
+      // service's defensive in-memory selection must still skip ordinal 0.
+      periodRows: [anchor, operational],
+    });
+
+    const state = await getQuestionQuotaState({
+      executor: fake.tx,
+      customerUserId: 42,
+      now: NOW,
+    });
+    expect(state?.periodId).toBe(operational.id);
+  });
+
+  it("rejects attempts to edit the annual Luxury v2 compatibility anchor", async () => {
+    const luxuryContract = contract({
+      planCode: "luxury",
+      planVersion: 2,
+      startsAt: new Date("2026-07-01T00:00:00.000Z"),
+      endsAt: new Date("2027-07-01T00:00:00.000Z"),
+    });
+    const fake = fakeDatabase({
+      contractRows: [luxuryContract],
+      periodRows: [
+        period({
+          id: PERIOD_ID,
+          ordinal: 0,
+          startsAt: luxuryContract.startsAt,
+          endsAt: luxuryContract.endsAt,
+          contentAssetPublishLimit: 0,
+          websiteContentPublishLimit: 0,
+        }),
+      ],
+    });
+
+    await expect(
+      adjustMyCustomerQuestionQuota({
+        actor: actor(),
+        value,
+        dependencies: {
+          getDatabase: vi.fn(async () => fake.database as any),
+          writeAudit: vi.fn(),
+          now: () => NOW,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(fake.getUpdateValue()).toBeNull();
   });
 });

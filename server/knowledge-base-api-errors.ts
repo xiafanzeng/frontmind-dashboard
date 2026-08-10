@@ -71,6 +71,7 @@ export type KnowledgeBaseUpstreamCreateFailureClass =
 /** Classify whether an upstream create was rejected or may have been accepted. */
 export function classifyKnowledgeBaseUpstreamCreateFailure(input: {
   status?: unknown;
+  code?: unknown;
   missingTaskId?: boolean;
   transportError?: boolean;
 }): KnowledgeBaseUpstreamCreateFailureClass {
@@ -78,7 +79,14 @@ export function classifyKnowledgeBaseUpstreamCreateFailure(input: {
   if (input.transportError) return "unknown";
   const status = Number(input.status);
   if (!Number.isInteger(status) || status <= 0) return "unknown";
-  return status === 408 || status === 429 || status >= 500
+  const code = String(input.code || "")
+    .trim()
+    .toUpperCase();
+  return code === "IDEMPOTENCY_PENDING" ||
+    status === 408 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500
     ? "retriable"
     : "deterministic";
 }

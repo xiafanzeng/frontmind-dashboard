@@ -932,6 +932,7 @@ export async function createKnowledgeBaseTurnTask(
           {
             status: 502,
             code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
+            ...(observation ? { knowledgeObservation: observation } : {}),
           },
         );
       }

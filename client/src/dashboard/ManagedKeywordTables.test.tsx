@@ -159,6 +159,38 @@ describe("ManagedKeywordTables", () => {
     expect(onUseQuestion).not.toHaveBeenCalled();
   });
 
+  it("marks only the categories withheld until the next service quarter", () => {
+    const onUseQuestion = vi.fn();
+    render(
+      <ManagedKeywordTables
+        tables={tables}
+        onUseQuestion={onUseQuestion}
+        quotaAvailability={{
+          industry: {
+            available: false,
+            unavailableLabel: "下一季度开放",
+          },
+          product_scenario: { available: true },
+        }}
+      />,
+    );
+
+    const industryRow = screen.getByText("行业问题").closest("tr");
+    const industryAction = within(industryRow!).getByRole("button", {
+      name: "下一季度开放",
+    });
+    expect(industryAction).toBeDisabled();
+
+    const scenarioRow = screen.getByText("场景问题").closest("tr");
+    expect(
+      within(scenarioRow!).getByRole("button", {
+        name: "选择并进入问题优化",
+      }),
+    ).toBeEnabled();
+    fireEvent.click(industryAction);
+    expect(onUseQuestion).not.toHaveBeenCalled();
+  });
+
   it("shows a neutral waiting state before a word bank is published", () => {
     render(<ManagedKeywordTables tables={[]} />);
 

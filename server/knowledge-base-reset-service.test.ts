@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const dependencies = vi.hoisted(() => ({
@@ -101,6 +104,21 @@ beforeEach(() => {
 });
 
 describe("knowledge-base reset status", () => {
+  it("binds reset submissions through the authoritative current quota scope", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "server/knowledge-base-reset-service.ts"),
+      "utf8",
+    );
+    const submitSource = source.slice(
+      source.indexOf("export async function submitKnowledgeReset"),
+      source.indexOf("export async function approveKnowledgeReset"),
+    );
+    expect(submitSource).toContain("resolveCurrentServiceQuotaScope");
+    expect(submitSource).not.toContain(
+      "orderBy(desc(serviceQuotaPeriods.endsAt))",
+    );
+  });
+
   it("retains task ownership evidence while allowing file cleanup", () => {
     expect(shouldDeleteKnowledgeResetUpstreamResource("task")).toBe(false);
     expect(shouldDeleteKnowledgeResetUpstreamResource("file")).toBe(true);
